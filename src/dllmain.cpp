@@ -20,6 +20,7 @@
 #include <unordered_map>
 #include <map>
 #include <algorithm>
+#include <functional>
 #include <cmath>
 
 using namespace Microsoft::WRL;
@@ -29,7 +30,7 @@ using namespace Microsoft::WRL;
 #define MAXJS_CATEGORY  _T("MaxJS")
 
 #define SYNC_TIMER_ID     1
-#define SYNC_INTERVAL_MS  150
+#define SYNC_INTERVAL_MS  33   // ~30fps for camera
 #define WM_TOGGLE_PANEL   (WM_USER + 1)
 #define SETUP_TIMER_ID    2
 
@@ -444,12 +445,15 @@ public:
     HWND hwnd_ = nullptr;
     ComPtr<ICoreWebView2Controller> controller_;
     ComPtr<ICoreWebView2> webview_;
+    ComPtr<ICoreWebView2Environment> env_;
 
     bool jsReady_ = false;
     bool dirty_ = true;
+    bool useBinary_ = false;
     int tickCount_ = 0;
     std::unordered_set<ULONG> geomHandles_;
     std::unordered_map<ULONG, uintptr_t> mtlHashMap_;  // node handle → material state hash
+    std::unordered_map<ULONG, uint64_t> geoHashMap_;   // node handle → geometry topology hash
     std::map<std::wstring, std::wstring> texDirMap_;    // dir → host
     int texDirCount_ = 0;
 
@@ -486,6 +490,7 @@ public:
             Callback<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler>(
                 [this](HRESULT r, ICoreWebView2Environment* env) -> HRESULT {
                     if (FAILED(r) || !env) return r;
+                    env_ = env;  // Store for SharedBuffer API
                     env->CreateCoreWebView2Controller(hwnd_,
                         Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
                             [this](HRESULT r, ICoreWebView2Controller* c) -> HRESULT {
@@ -516,6 +521,12 @@ public:
                     if (json) { OnWebMessage(json); CoTaskMemFree(json); }
                     return S_OK;
                 }).Get(), nullptr);
+
+        // Check for shared buffer support (ICoreWebView2_17 + Environment12)
+        ComPtr<ICoreWebView2_17> wv17;
+        ComPtr<ICoreWebView2Environment12> env12;
+        useBinary_ = SUCCEEDED(webview_->QueryInterface(IID_PPV_ARGS(&wv17))) && wv17
+                  && SUCCEEDED(env_->QueryInterface(IID_PPV_ARGS(&env12))) && env12;
 
         RegisterCallbacks();
         LoadContent();
@@ -600,6 +611,7 @@ public:
         std::wstring msg(json);
         if (msg.find(L"\"ready\"") != std::wstring::npos) {
             jsReady_ = true; dirty_ = true;
+            geoHashMap_.clear();  // force all geometry to be sent
         }
     }
 
@@ -610,12 +622,23 @@ public:
 
         if (dirty_) {
             dirty_ = false;
-            SendFullSync();
-        } else {
+            if (useBinary_) SendFullSyncBinary(); else SendFullSync();
+        } else if (tickCount_ % 5 == 0) {
+            // Every ~165ms: full xform + material scalars
             SendTransformSync();
-            // Lightweight material change check every ~1.5s (just pointer comparisons)
-            if (tickCount_ % 10 == 0) DetectMaterialChanges();
+            if (tickCount_ % 50 == 0) DetectMaterialChanges();
+        } else {
+            // Every ~33ms: camera only (smooth tracking)
+            SendCameraSync();
         }
+    }
+
+    void SendCameraSync() {
+        std::wostringstream ss;
+        ss << L"{\"type\":\"cam\",";
+        WriteCameraJson(ss);
+        ss << L'}';
+        webview_->PostWebMessageAsJson(ss.str().c_str());
     }
 
     // Check if any material's texmap pointers changed — triggers full sync on NEXT tick
@@ -782,6 +805,169 @@ public:
         }
     }
 
+    // ── Binary scene sync via SharedBuffer ─────────────────
+
+    void SendFullSyncBinary() {
+        Interface* ip = GetCOREInterface();
+        if (!ip) return;
+        TimeValue t = ip->GetTime();
+        INode* root = ip->GetRootNode();
+        if (!root) return;
+
+        ComPtr<ICoreWebView2_17> wv17;
+        ComPtr<ICoreWebView2Environment12> env12;
+        webview_->QueryInterface(IID_PPV_ARGS(&wv17));
+        env_->QueryInterface(IID_PPV_ARGS(&env12));
+        if (!wv17 || !env12) { SendFullSync(); return; }
+
+        geomHandles_.clear();
+
+        // Collect all geometry nodes
+        struct NodeGeo {
+            ULONG handle;
+            INode* node;
+            std::vector<float> verts, uvs;
+            std::vector<int> indices;
+            bool changed;
+            size_t vOff, iOff, uvOff;
+        };
+        std::vector<NodeGeo> geos;
+        size_t totalBytes = 0;
+
+        std::function<void(INode*)> collect = [&](INode* parent) {
+            for (int i = 0; i < parent->NumberOfChildren(); i++) {
+                INode* node = parent->GetChildNode(i);
+                if (!node) continue;
+                NodeGeo ng;
+                ng.node = node;
+                ng.handle = node->GetHandle();
+                ng.changed = false;
+                if (ExtractMesh(node, t, ng.verts, ng.uvs, ng.indices)) {
+                    // Topology hash: did geometry change?
+                    uint64_t hash = ((uint64_t)ng.verts.size() << 32) ^ ng.indices.size() ^ (ng.uvs.size() << 16);
+                    auto it = geoHashMap_.find(ng.handle);
+                    ng.changed = (it == geoHashMap_.end() || it->second != hash);
+                    geoHashMap_[ng.handle] = hash;
+
+                    if (ng.changed) {
+                        ng.vOff = totalBytes;
+                        totalBytes += ng.verts.size() * sizeof(float);
+                        ng.iOff = totalBytes;
+                        totalBytes += ng.indices.size() * sizeof(int);
+                        ng.uvOff = totalBytes;
+                        if (!ng.uvs.empty())
+                            totalBytes += ng.uvs.size() * sizeof(float);
+                    }
+                    geos.push_back(std::move(ng));
+                    geomHandles_.insert(ng.handle);
+                }
+                collect(node);
+            }
+        };
+        collect(root);
+
+        // Create shared buffer
+        if (totalBytes == 0) totalBytes = 4;  // min size
+        ComPtr<ICoreWebView2SharedBuffer> sharedBuf;
+        HRESULT hr = env12->CreateSharedBuffer(totalBytes, &sharedBuf);
+        if (FAILED(hr)) { SendFullSync(); return; }
+
+        BYTE* bufPtr = nullptr;
+        sharedBuf->get_Buffer(&bufPtr);
+
+        // Build metadata JSON + copy geometry into buffer
+        std::wostringstream ss;
+        ss << L"{\"type\":\"scene_bin\",\"nodes\":[";
+        bool first = true;
+
+        for (auto& ng : geos) {
+            float xform[16]; GetTransform16(ng.node, t, xform);
+            PBRData pbr; ExtractPBR(ng.node, t, pbr);
+
+            if (!first) ss << L',';
+            ss << L"{\"h\":" << ng.handle;
+            ss << L",\"n\":\"" << EscapeJson(ng.node->GetName()) << L'"';
+            ss << L",\"s\":" << (ng.node->Selected() ? L'1' : L'0');
+            ss << L",\"t\":"; WriteFloats(ss, xform, 16);
+
+            // Geometry: byte offsets into shared buffer (or -1 if unchanged)
+            if (ng.changed) {
+                memcpy(bufPtr + ng.vOff, ng.verts.data(), ng.verts.size() * sizeof(float));
+                memcpy(bufPtr + ng.iOff, ng.indices.data(), ng.indices.size() * sizeof(int));
+                if (!ng.uvs.empty())
+                    memcpy(bufPtr + ng.uvOff, ng.uvs.data(), ng.uvs.size() * sizeof(float));
+
+                ss << L",\"geo\":{\"vOff\":" << ng.vOff;
+                ss << L",\"vN\":" << ng.verts.size();
+                ss << L",\"iOff\":" << ng.iOff;
+                ss << L",\"iN\":" << ng.indices.size();
+                if (!ng.uvs.empty()) {
+                    ss << L",\"uvOff\":" << ng.uvOff;
+                    ss << L",\"uvN\":" << ng.uvs.size();
+                }
+                ss << L'}';
+            }
+
+            // Material (same as JSON sync)
+            ss << L",\"mat\":{";
+            ss << L"\"name\":\"" << EscapeJson(pbr.mtlName.empty() ? L"default" : pbr.mtlName.c_str()) << L'"';
+            ss << L",\"color\":[" << pbr.color[0] << L',' << pbr.color[1] << L',' << pbr.color[2] << L']';
+            ss << L",\"rough\":" << pbr.roughness;
+            ss << L",\"metal\":" << pbr.metalness;
+            if (pbr.opacity < 0.999f) ss << L",\"opacity\":" << pbr.opacity;
+            if (!pbr.doubleSided) ss << L",\"side\":0";
+            ss << L",\"normScl\":" << pbr.normalScale;
+            ss << L",\"aoI\":" << pbr.aoIntensity;
+            ss << L",\"envI\":" << pbr.envIntensity;
+            if (pbr.emIntensity > 0) {
+                ss << L",\"em\":[" << pbr.emission[0] << L',' << pbr.emission[1] << L',' << pbr.emission[2] << L']';
+                ss << L",\"emI\":" << pbr.emIntensity;
+            }
+            if (pbr.lightmapIntensity > 0) {
+                ss << L",\"lmI\":" << pbr.lightmapIntensity;
+                ss << L",\"lmCh\":" << pbr.lightmapChannel;
+            }
+            auto writeMap = [&](const wchar_t* key, const std::wstring& path) {
+                if (path.empty()) return;
+                std::wstring url = MapTexturePath(path);
+                if (!url.empty())
+                    ss << L",\"" << key << L"\":\"" << EscapeJson(url.c_str()) << L'"';
+            };
+            writeMap(L"map", pbr.colorMap);
+            writeMap(L"roughMap", pbr.roughnessMap);
+            writeMap(L"metalMap", pbr.metalnessMap);
+            writeMap(L"normMap", pbr.normalMap);
+            writeMap(L"aoMap", pbr.aoMap);
+            writeMap(L"emMap", pbr.emissionMap);
+            writeMap(L"lmMap", pbr.lightmapFile);
+            writeMap(L"opMap", pbr.opacityMap);
+            ss << L'}';  // mat
+
+            ss << L'}';  // node
+            first = false;
+        }
+
+        ss << L"],";
+        WriteCameraJson(ss);
+
+        // Environment
+        EnvData envData; GetEnvironment(envData);
+        std::wstring hdriUrl = MapTexturePath(envData.hdriPath);
+        ss << L",\"env\":{";
+        if (!hdriUrl.empty()) ss << L"\"hdri\":\"" << EscapeJson(hdriUrl.c_str()) << L'"';
+        ss << L",\"rot\":" << envData.rotation;
+        ss << L",\"exp\":" << envData.exposure;
+        ss << L",\"gamma\":" << envData.gamma;
+        ss << L",\"zup\":" << envData.zup;
+        ss << L",\"flip\":" << envData.flip;
+        ss << L'}';
+        ss << L'}';
+
+        wv17->PostSharedBufferToScript(sharedBuf.Get(),
+            COREWEBVIEW2_SHARED_BUFFER_ACCESS_READ_ONLY,
+            ss.str().c_str());
+    }
+
     // ── Transform-only sync ──────────────────────────────────
 
     void SendTransformSync() {
@@ -885,6 +1071,7 @@ void TogglePanel() {
             g_panel->jsReady_ = false;
             g_panel->dirty_ = true;
             g_panel->mtlHashMap_.clear();
+            g_panel->geoHashMap_.clear();
             // Clear virtual host cache by re-mapping, then navigate fresh
             ComPtr<ICoreWebView2_3> wv3;
             g_panel->webview_->QueryInterface(IID_PPV_ARGS(&wv3));

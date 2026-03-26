@@ -192,6 +192,18 @@
                 try { bridge.dispatch(e.data); }
                 catch (err) { console.error('[MaxJS]', err); }
             });
+
+            // Binary shared buffer handler (zero-copy geometry)
+            chrome.webview.addEventListener('sharedbufferreceived', e => {
+                try {
+                    const buf = e.getBuffer();
+                    const meta = typeof e.additionalData === 'string'
+                        ? JSON.parse(e.additionalData) : e.additionalData;
+                    handleBinaryScene(buf, meta);
+                    chrome.webview.releaseBuffer(buf);
+                } catch (err) { console.error('[MaxJS binary]', err); }
+            });
+
             bridge.send('ready');
             document.getElementById('info').textContent = 'MaxJS — connected, waiting for sync...';
         } else {
@@ -246,7 +258,12 @@
             updateInfo();
         });
 
-        // ── Transform Sync (+ material scalars) ──────────────
+        // ── Camera-only sync (30fps) ─────────────────────────
+        bridge.on('cam', msg => {
+            if (msg.camera) applyCamera(msg.camera);
+        });
+
+        // ── Transform Sync (+ material scalars, ~6fps) ──────
         bridge.on('xform', msg => {
             for (const nd of msg.nodes) {
                 const mesh = nodeMap.get(nd.h);
@@ -269,6 +286,82 @@
             }
             if (msg.camera) applyCamera(msg.camera);
         });
+
+        // ── Binary Scene Handler (SharedBuffer) ──────────────
+        function handleBinaryScene(buffer, meta) {
+            if (meta.type !== 'scene_bin') return;
+            const incoming = new Set(meta.nodes.map(n => n.h));
+            materialCache.clear();
+
+            // Remove deleted
+            for (const [handle, mesh] of nodeMap) {
+                if (!incoming.has(handle)) {
+                    scene.remove(mesh);
+                    mesh.geometry.dispose();
+                    nodeMap.delete(handle);
+                }
+            }
+
+            for (const nd of meta.nodes) {
+                let mesh = nodeMap.get(nd.h);
+                const mat = nd.mat ? createMaterial(nd.mat)
+                    : new THREE.MeshStandardMaterial({ color: 0x888888, side: THREE.DoubleSide });
+
+                // Build geometry from binary buffer if geo data present
+                let geom = mesh?.geometry;
+                if (nd.geo) {
+                    console.log(`[geo] ${nd.n}: vN=${nd.geo.vN} iN=${nd.geo.iN} vOff=${nd.geo.vOff} iOff=${nd.geo.iOff} bufSize=${buffer.byteLength}`);
+                    const dv = new DataView(buffer);
+
+                    const vertsCopy = new Float32Array(nd.geo.vN);
+                    for (let j = 0; j < nd.geo.vN; j++)
+                        vertsCopy[j] = dv.getFloat32(nd.geo.vOff + j * 4, true);
+
+                    const idxCopy = new Uint32Array(nd.geo.iN);
+                    for (let j = 0; j < nd.geo.iN; j++)
+                        idxCopy[j] = dv.getUint32(nd.geo.iOff + j * 4, true);
+
+                    geom = new THREE.BufferGeometry();
+                    geom.setAttribute('position', new THREE.BufferAttribute(vertsCopy, 3));
+                    geom.setIndex(new THREE.BufferAttribute(idxCopy, 1));
+
+                    if (nd.geo.uvOff != null && nd.geo.uvN) {
+                        const uvsCopy = new Float32Array(nd.geo.uvN);
+                        for (let j = 0; j < nd.geo.uvN; j++)
+                            uvsCopy[j] = dv.getFloat32(nd.geo.uvOff + j * 4, true);
+                        geom.setAttribute('uv', new THREE.BufferAttribute(uvsCopy, 2));
+                    }
+                    geom.computeVertexNormals();
+                }
+
+                if (mesh) {
+                    if (nd.geo && geom !== mesh.geometry) {
+                        mesh.geometry.dispose();
+                        mesh.geometry = geom;
+                    }
+                    mesh.material = mat;
+                } else {
+                    if (!geom) geom = new THREE.BufferGeometry();
+                    mesh = new THREE.Mesh(geom, mat);
+                    mesh.matrixAutoUpdate = false;
+                    mesh.name = nd.n;
+                    scene.add(mesh);
+                    nodeMap.set(nd.h, mesh);
+                }
+
+                applyTransform(mesh, nd.t);
+                applySelection(mesh, nd.s);
+            }
+
+            if (meta.camera) applyCamera(meta.camera);
+            if (meta.env?.hdri) loadHDRI(meta.env);
+
+            if (firstSync && meta.nodes.length > 0) {
+                firstSync = false;
+                if (!camLock) fitCamera();
+            }
+            updateInfo();
+        }
 
         // ── Geometry Builder ────────────────────────────────
         function buildGeometry(vertices, indices, uvs) {

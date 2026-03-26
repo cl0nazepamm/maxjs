@@ -29,7 +29,7 @@
 </head>
 <body>
     <div id="hud">
-        <div id="info">MaxJS — waiting for scene...</div>
+        <div id="info">MaxJS Live — hot reload works!</div>
         <div id="controls">
             <button id="btnRefresh">Refresh</button>
             <button id="btnCamLock">Cam Lock: OFF</button>
@@ -106,35 +106,29 @@
             return tex;
         }
 
-        let currentEnvParams = null;
-
         function loadHDRI(envParams) {
             if (!envParams?.hdri) return;
-            const url = envParams.hdri;
-            const paramsKey = JSON.stringify(envParams);
-            if (paramsKey === currentEnvParams) return;
-            currentEnvParams = paramsKey;
 
-            rgbeLoader.load(url, (hdrTex) => {
+            // Exposure
+            renderer.toneMappingExposure = Math.pow(2, envParams.exp || 0) * (envParams.gamma || 1.0);
+
+            // Rotation: Z-up fix on X, OSL horizontal rotation on Z (vertical axis in Z-up)
+            const rot = (envParams.rot || 0) * Math.PI / 180;
+            const zupX = envParams.zup ? Math.PI / 2 : 0;
+            scene.environmentRotation.set(zupX, 0, rot - Math.PI / 2);
+            scene.backgroundRotation.set(zupX, 0, rot - Math.PI / 2);
+
+            // Only reload texture if URL changed
+            if (envParams.hdri === currentHdriUrl) return;
+            currentHdriUrl = envParams.hdri;
+
+            rgbeLoader.load(envParams.hdri, (hdrTex) => {
                 hdrTex.mapping = THREE.EquirectangularReflectionMapping;
                 const envMap = pmremGenerator.fromEquirectangular(hdrTex).texture;
                 scene.environment = envMap;
                 if (envVisible) scene.background = envMap;
-                hdrTex.dispose();
-
-                // Rotation: scene.environmentRotation (Three.js r152+)
-                const rot = (envParams.rot || 0) * Math.PI / 180;
-                if (envParams.zup) {
-                    scene.environmentRotation.set(Math.PI / 2, 0, rot);
-                    scene.backgroundRotation.set(Math.PI / 2, 0, rot);
-                } else {
-                    scene.environmentRotation.set(0, rot, 0);
-                    scene.backgroundRotation.set(0, rot, 0);
-                }
-
-                // Exposure
-                renderer.toneMappingExposure = Math.pow(2, envParams.exp || 0) * (envParams.gamma || 1.0);
                 defaultLights.visible = false;
+                hdrTex.dispose();
             });
         }
 
@@ -199,6 +193,9 @@
                 catch (err) { console.error('[MaxJS]', err); }
             });
             bridge.send('ready');
+            document.getElementById('info').textContent = 'MaxJS — connected, waiting for sync...';
+        } else {
+            document.getElementById('info').textContent = 'MaxJS — no bridge (standalone mode)';
         }
         window.maxJS = bridge;
 
@@ -337,7 +334,7 @@
 
         // ── UI Controls ─────────────────────────────────────
         document.getElementById('btnRefresh').onclick = () => {
-            currentEnvParams = null;
+            currentHdriUrl = null;
             materialCache.clear();
             textureCache.clear();
             firstSync = true;

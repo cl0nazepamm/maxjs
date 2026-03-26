@@ -6,6 +6,8 @@
 #include <imtl.h>
 #include <plugapi.h>
 #include <maxapi.h>
+#include <stdmat.h>
+#include <Graphics/ITextureDisplay.h>
 
 extern HINSTANCE hInstance;
 
@@ -30,12 +32,22 @@ static const MCHAR* kMapSlotNames[kNumMaps] = {
 
 // ── Material Class ────────────────────────────────────────────
 
-class ThreeJSMtl : public Mtl {
+class ThreeJSMtl : public Mtl, public MaxSDK::Graphics::ITextureDisplay {
 public:
     IParamBlock2* pblock = nullptr;
+    bool texDisplayOn_ = false;
+    TexHandle* texHandle_ = nullptr;
 
     ThreeJSMtl(BOOL loading) {
         GetThreeJSMtlDesc()->MakeAutoParamBlocks(this);
+    }
+
+    ~ThreeJSMtl() {
+        DiscardTexHandle();
+    }
+
+    void DiscardTexHandle() {
+        if (texHandle_) { texHandle_->DeleteThis(); texHandle_ = nullptr; }
     }
 
     void DeleteThis() override { delete this; }
@@ -88,6 +100,43 @@ public:
         if (pblock) pblock->SetValue(pb_roughness, t, 1.0f - v);
     }
 
+    // ── Viewport Texture Display ────────────────────────────
+    BOOL SupportTexDisplay() override { return TRUE; }
+
+    void ActivateTexDisplay(BOOL onoff) override {
+        texDisplayOn_ = (onoff != 0);
+        if (!texDisplayOn_) DiscardTexHandle();
+    }
+
+    DWORD_PTR GetActiveTexHandle(TimeValue t, TexHandleMaker& thmaker) override {
+        Texmap* colorMap = pblock ? pblock->GetTexmap(pb_color_map, t) : nullptr;
+        if (!colorMap) { DiscardTexHandle(); return 0; }
+        DiscardTexHandle();
+        Interval valid;
+        BITMAPINFO* bmi = colorMap->GetVPDisplayDIB(t, thmaker, valid);
+        if (bmi) texHandle_ = thmaker.CreateHandle(bmi);
+        return (DWORD_PTR)texHandle_;
+    }
+
+    ULONG Requirements(int subMtlNum) override {
+        return MTLREQ_UV;
+    }
+
+    // ITextureDisplay (Nitrous)
+    void SetupTextures(TimeValue t, MaxSDK::Graphics::DisplayTextureHelper& updater) override {
+        Texmap* colorMap = pblock ? pblock->GetTexmap(pb_color_map, t) : nullptr;
+        if (colorMap) {
+            updater.UpdateTextureMapInfo(t, MaxSDK::Graphics::ISimpleMaterial::UsageDiffuse, colorMap);
+        }
+    }
+
+    // ITextureDisplay interface via BaseInterface
+    BaseInterface* GetInterface(Interface_ID id) override {
+        if (id == ITEXTURE_DISPLAY_INTERFACE_ID)
+            return static_cast<MaxSDK::Graphics::ITextureDisplay*>(this);
+        return Mtl::GetInterface(id);
+    }
+
     ParamDlg* CreateParamDlg(HWND hwMtlEdit, IMtlParams* imp) override {
         return GetThreeJSMtlDesc()->CreateParamDlgs(hwMtlEdit, imp, this);
     }
@@ -129,8 +178,12 @@ public:
     float EvalDisplacement(ShadeContext&) override { return 0.0f; }
     Interval DisplacementValidity(TimeValue) override { return FOREVER; }
 
-    IOResult Save(ISave*) override { return IO_OK; }
-    IOResult Load(ILoad*) override { return IO_OK; }
+    IOResult Save(ISave* isave) override {
+        return Mtl::Save(isave);  // Let base class + paramblock handle serialization
+    }
+    IOResult Load(ILoad* iload) override {
+        return Mtl::Load(iload);
+    }
 };
 
 // ── Class Descriptor ──────────────────────────────────────────

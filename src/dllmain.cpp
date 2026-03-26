@@ -539,7 +539,10 @@ public:
                     COREWEBVIEW2_HOST_RESOURCE_ACCESS_KIND_ALLOW);
                 texDirMap_[L"c"] = L"maxjsdrvc.local";
                 texDirMap_[L"d"] = L"maxjsdrvd.local";
-                webview_->Navigate(L"https://maxjs.local/index.html");
+                // Cache-bust: append tick count to URL so WebView2 never serves stale HTML
+                wchar_t navUrl[128];
+                swprintf_s(navUrl, L"https://maxjs.local/index.html?v=%lld", GetTickCount64());
+                webview_->Navigate(navUrl);
                 return;
             }
         }
@@ -877,7 +880,25 @@ void TogglePanel() {
         ShowWindow(g_panel->hwnd_, SW_HIDE);
     } else if (g_panel->hwnd_) {
         ShowWindow(g_panel->hwnd_, SW_SHOW);
-        g_panel->dirty_ = true;
+        // Force hard reload so JS code updates without restarting Max
+        if (g_panel->webview_) {
+            g_panel->jsReady_ = false;
+            g_panel->dirty_ = true;
+            g_panel->mtlHashMap_.clear();
+            // Clear virtual host cache by re-mapping, then navigate fresh
+            ComPtr<ICoreWebView2_3> wv3;
+            g_panel->webview_->QueryInterface(IID_PPV_ARGS(&wv3));
+            if (wv3) {
+                std::wstring webDir = g_panel->GetWebDir();
+                if (!webDir.empty()) {
+                    wv3->ClearVirtualHostNameToFolderMapping(L"maxjs.local");
+                    wv3->SetVirtualHostNameToFolderMapping(
+                        L"maxjs.local", webDir.c_str(),
+                        COREWEBVIEW2_HOST_RESOURCE_ACCESS_KIND_ALLOW);
+                }
+            }
+            g_panel->LoadContent();
+        }
     } else {
         g_panel->Create(GetCOREInterface()->GetMAXHWnd());
     }

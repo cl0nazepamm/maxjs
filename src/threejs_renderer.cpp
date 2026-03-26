@@ -157,8 +157,8 @@ public:
     }
 
     // ── I/O ──────────────────────────────────────────────────
-    IOResult Save(ISave*) override { return IO_OK; }
-    IOResult Load(ILoad*) override { return IO_OK; }
+    IOResult Save(ISave* isave) override { return Renderer::Save(isave); }
+    IOResult Load(ILoad* iload) override { return Renderer::Load(iload); }
 };
 
 // ── Class Descriptor ──────────────────────────────────────────

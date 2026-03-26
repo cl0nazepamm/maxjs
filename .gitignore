@@ -1,0 +1,5 @@
+build/
+thirdparty/
+*.user
+*.suo
+.vs/

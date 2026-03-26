@@ -1,0 +1,378 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>MaxJS</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { overflow: hidden; background: #1a1a2e; }
+        canvas { display: block; }
+        #hud {
+            position: absolute; top: 10px; left: 10px;
+            color: #999; font: 13px 'Segoe UI', sans-serif;
+            pointer-events: none;
+        }
+        #info {
+            background: rgba(0,0,0,0.6); padding: 6px 10px;
+            border-radius: 4px; margin-bottom: 6px;
+        }
+        #controls { pointer-events: auto; display: flex; gap: 6px; }
+        #controls button {
+            background: rgba(40,40,60,0.8); color: #aaa; border: 1px solid #444;
+            padding: 4px 10px; border-radius: 3px; font: 12px 'Segoe UI', sans-serif;
+            cursor: pointer;
+        }
+        #controls button.active { background: rgba(60,60,120,0.9); color: #ddd; border-color: #668; }
+        #controls button:hover { background: rgba(60,60,100,0.9); color: #ccc; }
+    </style>
+</head>
+<body>
+    <div id="hud">
+        <div id="info">MaxJS — waiting for scene...</div>
+        <div id="controls">
+            <button id="btnRefresh">Refresh</button>
+            <button id="btnCamLock">Cam Lock: OFF</button>
+            <button id="btnEnv" class="active">Env: ON</button>
+        </div>
+    </div>
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+            "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+        }
+    }
+    </script>
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { RGBELoader } from 'three/addons/loaders/RGBELoader.js';
+
+        // ── Scene Setup (Z-up, matching Max) ────────────────
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x1a1a2e);
+
+        const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.1, 100000);
+        camera.up.set(0, 0, 1);  // Z-up to match Max
+        camera.position.set(200, -200, 150);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(innerWidth, innerHeight);
+        renderer.setPixelRatio(devicePixelRatio);
+        renderer.toneMapping = THREE.ACESFilmicToneMapping;
+        renderer.toneMappingExposure = 1.2;
+        document.body.appendChild(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.08;
+
+        // Grid on XY plane (Z-up)
+        const grid = new THREE.GridHelper(200, 20, 0x444466, 0x2a2a44);
+        grid.rotation.x = Math.PI / 2;  // Rotate to XY plane for Z-up
+        scene.add(grid);
+
+        // Lights (fallback, hidden when HDRI loads)
+        const defaultLights = new THREE.Group();
+        defaultLights.add(new THREE.AmbientLight(0x404060, 2));
+        const sun = new THREE.DirectionalLight(0xffffff, 3);
+        sun.position.set(50, -50, 100);
+        defaultLights.add(sun);
+        scene.add(defaultLights);
+
+        // ── Loaders & Caches ────────────────────────────────
+        const textureLoader = new THREE.TextureLoader();
+        const rgbeLoader = new RGBELoader();
+        const pmremGenerator = new THREE.PMREMGenerator(renderer);
+        pmremGenerator.compileEquirectangularShader();
+
+        const textureCache = new Map();
+        const materialCache = new Map();
+        const nodeMap = new Map();
+
+        let firstSync = true;
+        let camLock = false;
+        let envVisible = true;
+        let currentHdriUrl = null;
+
+        function loadTexture(url, colorSpace = THREE.LinearSRGBColorSpace) {
+            if (!url) return null;
+            if (textureCache.has(url)) return textureCache.get(url);
+            const tex = textureLoader.load(url);
+            tex.colorSpace = colorSpace;
+            tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+            textureCache.set(url, tex);
+            return tex;
+        }
+
+        let currentEnvParams = null;
+
+        function loadHDRI(envParams) {
+            if (!envParams?.hdri) return;
+            const url = envParams.hdri;
+            const paramsKey = JSON.stringify(envParams);
+            if (paramsKey === currentEnvParams) return;
+            currentEnvParams = paramsKey;
+
+            rgbeLoader.load(url, (hdrTex) => {
+                hdrTex.mapping = THREE.EquirectangularReflectionMapping;
+                const envMap = pmremGenerator.fromEquirectangular(hdrTex).texture;
+                scene.environment = envMap;
+                if (envVisible) scene.background = envMap;
+                hdrTex.dispose();
+
+                // Rotation: scene.environmentRotation (Three.js r152+)
+                const rot = (envParams.rot || 0) * Math.PI / 180;
+                if (envParams.zup) {
+                    scene.environmentRotation.set(Math.PI / 2, 0, rot);
+                    scene.backgroundRotation.set(Math.PI / 2, 0, rot);
+                } else {
+                    scene.environmentRotation.set(0, rot, 0);
+                    scene.backgroundRotation.set(0, rot, 0);
+                }
+
+                // Exposure
+                renderer.toneMappingExposure = Math.pow(2, envParams.exp || 0) * (envParams.gamma || 1.0);
+                defaultLights.visible = false;
+            });
+        }
+
+        // ── Material Creation ───────────────────────────────
+        function createMaterial(md) {
+            const key = md.name || 'default';
+            if (materialCache.has(key)) return materialCache.get(key).clone();
+
+            const params = {
+                color: new THREE.Color(md.color[0], md.color[1], md.color[2]),
+                roughness: md.rough ?? 0.5,
+                metalness: md.metal ?? 0.0,
+                side: md.side === 0 ? THREE.FrontSide : THREE.DoubleSide,
+                envMapIntensity: md.envI ?? 1.0,
+            };
+
+            if (md.opacity != null && md.opacity < 0.999) {
+                params.transparent = true;
+                params.opacity = md.opacity;
+            }
+
+            if (md.em && md.emI > 0) {
+                params.emissive = new THREE.Color(md.em[0], md.em[1], md.em[2]);
+                params.emissiveIntensity = md.emI;
+            }
+
+            if (md.normScl != null) params.normalScale = new THREE.Vector2(md.normScl, md.normScl);
+            if (md.aoI != null) params.aoMapIntensity = md.aoI;
+
+            const mat = new THREE.MeshStandardMaterial(params);
+
+            // Textures
+            if (md.map) mat.map = loadTexture(md.map, THREE.SRGBColorSpace);
+            if (md.roughMap) mat.roughnessMap = loadTexture(md.roughMap);
+            if (md.metalMap) mat.metalnessMap = loadTexture(md.metalMap);
+            if (md.normMap) mat.normalMap = loadTexture(md.normMap);
+            if (md.aoMap) mat.aoMap = loadTexture(md.aoMap);
+            if (md.emMap) mat.emissiveMap = loadTexture(md.emMap, THREE.SRGBColorSpace);
+            if (md.opMap) { mat.alphaMap = loadTexture(md.opMap); mat.transparent = true; }
+
+            // Lightmap
+            if (md.lmMap) {
+                mat.lightMap = loadTexture(md.lmMap);
+                mat.lightMapIntensity = md.lmI ?? 1.0;
+            }
+
+            materialCache.set(key, mat);
+            return mat.clone();
+        }
+
+        // ── Max Bridge ──────────────────────────────────────
+        const bridge = {
+            send(type, data = {}) { window.chrome?.webview?.postMessage({ type, ...data }); },
+            handlers: {},
+            on(type, fn) { (this.handlers[type] ??= []).push(fn); },
+            dispatch(msg) { (this.handlers[msg.type] || []).forEach(fn => fn(msg)); }
+        };
+
+        if (window.chrome?.webview) {
+            window.chrome.webview.addEventListener('message', e => {
+                try { bridge.dispatch(e.data); }
+                catch (err) { console.error('[MaxJS]', err); }
+            });
+            bridge.send('ready');
+        }
+        window.maxJS = bridge;
+
+        // ── Scene Sync ──────────────────────────────────────
+        bridge.on('scene', msg => {
+            const incoming = new Set(msg.nodes.map(n => n.h));
+
+            // Clear material cache so changes are picked up
+            materialCache.clear();
+
+            for (const [handle, mesh] of nodeMap) {
+                if (!incoming.has(handle)) {
+                    scene.remove(mesh);
+                    mesh.geometry.dispose();
+                    nodeMap.delete(handle);
+                }
+            }
+
+            for (const nd of msg.nodes) {
+                let mesh = nodeMap.get(nd.h);
+                const mat = nd.mat ? createMaterial(nd.mat)
+                    : new THREE.MeshStandardMaterial({ color: 0x888888, side: THREE.DoubleSide });
+
+                if (mesh) {
+                    mesh.geometry.dispose();
+                    mesh.geometry = buildGeometry(nd.v, nd.i, nd.uv);
+                    mesh.material = mat;
+                } else {
+                    const geom = buildGeometry(nd.v, nd.i, nd.uv);
+                    mesh = new THREE.Mesh(geom, mat);
+                    mesh.matrixAutoUpdate = false;
+                    mesh.name = nd.n;
+                    scene.add(mesh);
+                    nodeMap.set(nd.h, mesh);
+                }
+
+                applyTransform(mesh, nd.t);
+                applySelection(mesh, nd.s);
+            }
+
+            if (msg.camera) applyCamera(msg.camera);
+            if (msg.env?.hdri) loadHDRI(msg.env);
+
+            if (firstSync && msg.nodes.length > 0) {
+                firstSync = false;
+                if (!camLock) fitCamera();
+            }
+            updateInfo();
+        });
+
+        // ── Transform Sync (+ material scalars) ──────────────
+        bridge.on('xform', msg => {
+            for (const nd of msg.nodes) {
+                const mesh = nodeMap.get(nd.h);
+                if (!mesh) continue;
+                applyTransform(mesh, nd.t);
+                applySelection(mesh, nd.s);
+                // Live material update from scalars
+                if (nd.mat && mesh.material) {
+                    const m = mesh.material;
+                    const c = nd.mat.color;
+                    if (c) m.color.setRGB(c[0], c[1], c[2]);
+                    if (nd.mat.rough != null) m.roughness = nd.mat.rough;
+                    if (nd.mat.metal != null) m.metalness = nd.mat.metal;
+                    if (nd.mat.opacity != null) {
+                        m.opacity = nd.mat.opacity;
+                        m.transparent = nd.mat.opacity < 0.999;
+                    }
+                    m.needsUpdate = true;
+                }
+            }
+            if (msg.camera) applyCamera(msg.camera);
+        });
+
+        // ── Geometry Builder ────────────────────────────────
+        function buildGeometry(vertices, indices, uvs) {
+            const geom = new THREE.BufferGeometry();
+            geom.setAttribute('position', new THREE.Float32BufferAttribute(vertices, 3));
+            if (indices?.length) geom.setIndex(indices);
+            if (uvs?.length) geom.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
+            geom.computeVertexNormals();
+            return geom;
+        }
+
+        function applyTransform(mesh, t) {
+            mesh.matrix.fromArray(t);
+            mesh.matrixWorldNeedsUpdate = true;
+        }
+
+        function applySelection(mesh, selected) {
+            if (mesh.material?.emissive)
+                mesh.material.emissive.setHex(selected ? 0x1a1a44 : 0x000000);
+        }
+
+        // ── Camera Sync (Z-up, raw from Max) ────────────────
+        function applyCamera(cam) {
+            if (!camLock) return;
+            camera.position.set(cam.pos[0], cam.pos[1], cam.pos[2]);
+            camera.up.set(cam.up[0], cam.up[1], cam.up[2]);
+            camera.lookAt(cam.tgt[0], cam.tgt[1], cam.tgt[2]);
+
+            if (cam.persp && cam.fov > 0 && cam.fov < 170) {
+                const aspect = innerWidth / innerHeight;
+                const hRad = cam.fov * Math.PI / 180;
+                camera.fov = 2 * Math.atan(Math.tan(hRad / 2) / aspect) * 180 / Math.PI;
+            }
+            camera.updateProjectionMatrix();
+            controls.target.set(cam.tgt[0], cam.tgt[1], cam.tgt[2]);
+        }
+
+        function fitCamera() {
+            const box = new THREE.Box3();
+            for (const [, mesh] of nodeMap) box.expandByObject(mesh);
+            if (box.isEmpty()) return;
+            const center = box.getCenter(new THREE.Vector3());
+            const size = box.getSize(new THREE.Vector3());
+            const maxDim = Math.max(size.x, size.y, size.z);
+            controls.target.copy(center);
+            camera.position.set(
+                center.x + maxDim * 1.2,
+                center.y - maxDim * 1.2,
+                center.z + maxDim * 0.8
+            );
+            camera.near = maxDim * 0.001;
+            camera.far = maxDim * 100;
+            camera.updateProjectionMatrix();
+            controls.update();
+        }
+
+        function updateInfo() {
+            const n = nodeMap.size;
+            const t = textureCache.size;
+            document.getElementById('info').textContent =
+                `MaxJS \u2014 ${n} object${n !== 1 ? 's' : ''}${t ? `, ${t} tex` : ''}`;
+        }
+
+        // ── UI Controls ─────────────────────────────────────
+        document.getElementById('btnRefresh').onclick = () => {
+            currentEnvParams = null;
+            materialCache.clear();
+            textureCache.clear();
+            firstSync = true;
+            bridge.send('ready');
+        };
+
+        const btnCam = document.getElementById('btnCamLock');
+        btnCam.onclick = () => {
+            camLock = !camLock;
+            btnCam.textContent = `Cam Lock: ${camLock ? 'ON' : 'OFF'}`;
+            btnCam.classList.toggle('active', camLock);
+            controls.enabled = !camLock;
+        };
+
+        const btnEnv = document.getElementById('btnEnv');
+        btnEnv.onclick = () => {
+            envVisible = !envVisible;
+            btnEnv.textContent = `Env: ${envVisible ? 'ON' : 'OFF'}`;
+            btnEnv.classList.toggle('active', envVisible);
+            scene.background = envVisible && scene.environment
+                ? scene.environment : new THREE.Color(0x1a1a2e);
+        };
+
+        // ── Resize + Render ─────────────────────────────────
+        addEventListener('resize', () => {
+            camera.aspect = innerWidth / innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(innerWidth, innerHeight);
+        });
+
+        (function animate() {
+            requestAnimationFrame(animate);
+            controls.update();
+            renderer.render(scene, camera);
+        })();
+    </script>
+</body>
+</html>

@@ -474,6 +474,7 @@ public:
     bool dirty_ = true;
     bool useBinary_ = false;
     int tickCount_ = 0;
+    size_t geoScanCursor_ = 0;
     std::unordered_set<ULONG> geomHandles_;
     std::unordered_map<ULONG, uintptr_t> mtlHashMap_;  // node handle → material state hash
     std::unordered_map<ULONG, uint64_t> geoHashMap_;   // node handle → geometry topology hash
@@ -634,7 +635,9 @@ public:
         std::wstring msg(json);
         if (msg.find(L"\"ready\"") != std::wstring::npos) {
             jsReady_ = true; dirty_ = true;
+            mtlHashMap_.clear();
             geoHashMap_.clear();  // force all geometry to be sent
+            geoScanCursor_ = 0;
         }
     }
 
@@ -710,22 +713,41 @@ public:
         Interface* ip = GetCOREInterface();
         if (!ip) return;
         TimeValue t = ip->GetTime();
+        if (geomHandles_.empty()) return;
 
-        for (ULONG handle : geomHandles_) {
+        std::vector<ULONG> handles;
+        handles.reserve(geomHandles_.size());
+        for (ULONG h : geomHandles_) handles.push_back(h);
+        if (handles.empty()) return;
+        if (geoScanCursor_ >= handles.size()) geoScanCursor_ = 0;
+
+        // Time-sliced scan to avoid long stalls on large scenes.
+        const ULONGLONG deadlineMs = GetTickCount64() + 2; // ~2ms budget per check
+
+        size_t checked = 0;
+        size_t idx = geoScanCursor_;
+        while (checked < handles.size()) {
+            ULONG handle = handles[idx];
             INode* node = ip->GetINodeByHandle(handle);
-            if (!node) continue;
-
-            std::vector<float> verts, uvs;
-            std::vector<int> indices;
-            if (!ExtractMesh(node, t, verts, uvs, indices)) continue;
-
-            uint64_t hash = HashMeshData(verts, indices, uvs);
-            auto it = geoHashMap_.find(handle);
-            if (it == geoHashMap_.end() || it->second != hash) {
-                dirty_ = true;
-                return;
+            if (node) {
+                std::vector<float> verts, uvs;
+                std::vector<int> indices;
+                if (ExtractMesh(node, t, verts, uvs, indices)) {
+                    uint64_t hash = HashMeshData(verts, indices, uvs);
+                    auto it = geoHashMap_.find(handle);
+                    if (it == geoHashMap_.end() || it->second != hash) {
+                        dirty_ = true;
+                        return;
+                    }
+                }
             }
+
+            checked++;
+            idx = (idx + 1) % handles.size();
+            if (GetTickCount64() >= deadlineMs) break;
         }
+
+        geoScanCursor_ = idx;
     }
 
     // ── Camera JSON fragment ─────────────────────────────────
@@ -1037,9 +1059,15 @@ public:
         std::wostringstream ss;
         ss << L"{\"type\":\"xform\",\"nodes\":[";
         bool first = true;
-        for (ULONG handle : geomHandles_) {
+        for (auto it = geomHandles_.begin(); it != geomHandles_.end(); ) {
+            ULONG handle = *it;
             INode* node = ip->GetINodeByHandle(handle);
-            if (!node) continue;
+            if (!node) {
+                mtlHashMap_.erase(handle);
+                geoHashMap_.erase(handle);
+                it = geomHandles_.erase(it);
+                continue;
+            }
             float xform[16]; GetTransform16(node, t, xform);
 
             // Lightweight material scalars (no texture walks)
@@ -1069,6 +1097,7 @@ public:
             if (opac < 0.999f) ss << L",\"opacity\":" << opac;
             ss << L"}}";
             first = false;
+            ++it;
         }
         ss << L"],";
         WriteCameraJson(ss);

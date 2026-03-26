@@ -318,6 +318,7 @@
                         Number.isInteger(n) &&
                         off >= 0 &&
                         n >= 0 &&
+                        (off % 4) === 0 &&
                         (off + n * 4) <= buffer.byteLength;
 
                     if (!inRange(nd.geo.vOff, nd.geo.vN) || !inRange(nd.geo.iOff, nd.geo.iN)) {
@@ -329,24 +330,21 @@
                         continue;
                     }
 
-                    const dv = new DataView(buffer);
-
-                    const vertsCopy = new Float32Array(nd.geo.vN);
-                    for (let j = 0; j < nd.geo.vN; j++)
-                        vertsCopy[j] = dv.getFloat32(nd.geo.vOff + j * 4, true);
-
-                    const idxCopy = new Uint32Array(nd.geo.iN);
-                    for (let j = 0; j < nd.geo.iN; j++)
-                        idxCopy[j] = dv.getUint32(nd.geo.iOff + j * 4, true);
+                    const vertsCopy = new Float32Array(
+                        new Float32Array(buffer, nd.geo.vOff, nd.geo.vN)
+                    );
+                    const idxCopy = new Uint32Array(
+                        new Int32Array(buffer, nd.geo.iOff, nd.geo.iN)
+                    );
 
                     geom = new THREE.BufferGeometry();
                     geom.setAttribute('position', new THREE.BufferAttribute(vertsCopy, 3));
                     geom.setIndex(new THREE.BufferAttribute(idxCopy, 1));
 
                     if (nd.geo.uvOff != null && nd.geo.uvN) {
-                        const uvsCopy = new Float32Array(nd.geo.uvN);
-                        for (let j = 0; j < nd.geo.uvN; j++)
-                            uvsCopy[j] = dv.getFloat32(nd.geo.uvOff + j * 4, true);
+                        const uvsCopy = new Float32Array(
+                            new Float32Array(buffer, nd.geo.uvOff, nd.geo.uvN)
+                        );
                         geom.setAttribute('uv', new THREE.BufferAttribute(uvsCopy, 2));
                     }
                     geom.computeVertexNormals();

@@ -76,6 +76,29 @@ static void WriteInts(std::wostringstream& ss, const int* d, size_t n) {
     ss << L']';
 }
 
+static uint64_t HashFNV1a(const void* data, size_t bytes, uint64_t seed = 1469598103934665603ULL) {
+    const unsigned char* p = static_cast<const unsigned char*>(data);
+    uint64_t h = seed;
+    for (size_t i = 0; i < bytes; i++) {
+        h ^= static_cast<uint64_t>(p[i]);
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+static uint64_t HashMeshData(const std::vector<float>& verts,
+                             const std::vector<int>& indices,
+                             const std::vector<float>& uvs) {
+    uint64_t h = 1469598103934665603ULL;
+    if (!verts.empty())
+        h = HashFNV1a(verts.data(), verts.size() * sizeof(float), h);
+    if (!indices.empty())
+        h = HashFNV1a(indices.data(), indices.size() * sizeof(int), h);
+    if (!uvs.empty())
+        h = HashFNV1a(uvs.data(), uvs.size() * sizeof(float), h);
+    return h;
+}
+
 // ══════════════════════════════════════════════════════════════
 //  Texture Path Finder — walks any texmap tree for Bitmap files
 // ══════════════════════════════════════════════════════════════
@@ -627,6 +650,7 @@ public:
             // Every ~165ms: full xform + material scalars
             SendTransformSync();
             if (tickCount_ % 50 == 0) DetectMaterialChanges();
+            if (tickCount_ % 15 == 0) DetectGeometryChanges();
         } else {
             // Every ~33ms: camera only (smooth tracking)
             SendCameraSync();
@@ -675,6 +699,30 @@ public:
             } else if (it->second != hash) {
                 it->second = hash;
                 dirty_ = true;  // triggers full sync on next tick
+                return;
+            }
+        }
+    }
+
+    // Detect geometry edits that keep the same topology counts (e.g. deforms)
+    // and trigger a binary/full resync on the next tick.
+    void DetectGeometryChanges() {
+        Interface* ip = GetCOREInterface();
+        if (!ip) return;
+        TimeValue t = ip->GetTime();
+
+        for (ULONG handle : geomHandles_) {
+            INode* node = ip->GetINodeByHandle(handle);
+            if (!node) continue;
+
+            std::vector<float> verts, uvs;
+            std::vector<int> indices;
+            if (!ExtractMesh(node, t, verts, uvs, indices)) continue;
+
+            uint64_t hash = HashMeshData(verts, indices, uvs);
+            auto it = geoHashMap_.find(handle);
+            if (it == geoHashMap_.end() || it->second != hash) {
+                dirty_ = true;
                 return;
             }
         }
@@ -843,8 +891,8 @@ public:
                 ng.handle = node->GetHandle();
                 ng.changed = false;
                 if (ExtractMesh(node, t, ng.verts, ng.uvs, ng.indices)) {
-                    // Topology hash: did geometry change?
-                    uint64_t hash = ((uint64_t)ng.verts.size() << 32) ^ ng.indices.size() ^ (ng.uvs.size() << 16);
+                    // Content hash: catches deforms/UV edits even when counts are unchanged.
+                    uint64_t hash = HashMeshData(ng.verts, ng.indices, ng.uvs);
                     auto it = geoHashMap_.find(ng.handle);
                     ng.changed = (it == geoHashMap_.end() || it->second != hash);
                     geoHashMap_[ng.handle] = hash;
@@ -865,6 +913,16 @@ public:
             }
         };
         collect(root);
+
+        // Prevent stale hashes for deleted handles (important if handles are reused).
+        for (auto it = geoHashMap_.begin(); it != geoHashMap_.end(); ) {
+            if (geomHandles_.find(it->first) == geomHandles_.end()) it = geoHashMap_.erase(it);
+            else ++it;
+        }
+        for (auto it = mtlHashMap_.begin(); it != mtlHashMap_.end(); ) {
+            if (geomHandles_.find(it->first) == geomHandles_.end()) it = mtlHashMap_.erase(it);
+            else ++it;
+        }
 
         // Create shared buffer
         if (totalBytes == 0) totalBytes = 4;  // min size

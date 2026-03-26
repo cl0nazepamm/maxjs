@@ -195,13 +195,16 @@
 
             // Binary shared buffer handler (zero-copy geometry)
             chrome.webview.addEventListener('sharedbufferreceived', e => {
+                let buf = null;
                 try {
-                    const buf = e.getBuffer();
+                    buf = e.getBuffer();
                     const meta = typeof e.additionalData === 'string'
                         ? JSON.parse(e.additionalData) : e.additionalData;
                     handleBinaryScene(buf, meta);
-                    chrome.webview.releaseBuffer(buf);
                 } catch (err) { console.error('[MaxJS binary]', err); }
+                finally {
+                    if (buf) chrome.webview.releaseBuffer(buf);
+                }
             });
 
             bridge.send('ready');
@@ -310,7 +313,22 @@
                 // Build geometry from binary buffer if geo data present
                 let geom = mesh?.geometry;
                 if (nd.geo) {
-                    console.log(`[geo] ${nd.n}: vN=${nd.geo.vN} iN=${nd.geo.iN} vOff=${nd.geo.vOff} iOff=${nd.geo.iOff} bufSize=${buffer.byteLength}`);
+                    const inRange = (off, n) =>
+                        Number.isInteger(off) &&
+                        Number.isInteger(n) &&
+                        off >= 0 &&
+                        n >= 0 &&
+                        (off + n * 4) <= buffer.byteLength;
+
+                    if (!inRange(nd.geo.vOff, nd.geo.vN) || !inRange(nd.geo.iOff, nd.geo.iN)) {
+                        console.warn('[MaxJS binary] Invalid vertex/index range for', nd.n);
+                        continue;
+                    }
+                    if (nd.geo.uvOff != null && !inRange(nd.geo.uvOff, nd.geo.uvN || 0)) {
+                        console.warn('[MaxJS binary] Invalid UV range for', nd.n);
+                        continue;
+                    }
+
                     const dv = new DataView(buffer);
 
                     const vertsCopy = new Float32Array(nd.geo.vN);
@@ -341,7 +359,7 @@
                     }
                     mesh.material = mat;
                 } else {
-                    if (!geom) geom = new THREE.BufferGeometry();
+                    if (!geom) continue; // Never create an empty mesh entry
                     mesh = new THREE.Mesh(geom, mat);
                     mesh.matrixAutoUpdate = false;
                     mesh.name = nd.n;

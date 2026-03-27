@@ -13,6 +13,7 @@
 #include <wrl.h>
 #include <WebView2.h>
 #include <ShlObj.h>
+#include <wincodec.h>
 #include <string>
 #include <vector>
 #include <sstream>
@@ -33,6 +34,8 @@ using namespace Microsoft::WRL;
 #define SYNC_INTERVAL_MS  33   // ~30fps for camera
 #define WM_TOGGLE_PANEL   (WM_USER + 1)
 #define SETUP_TIMER_ID    2
+#define AS_TIMER_ID       3
+#define AS_INTERVAL_MS    66   // ~15fps ActiveShade
 
 extern HINSTANCE hInstance;
 HINSTANCE hInstance = nullptr;
@@ -43,7 +46,12 @@ static HWND g_helperHwnd = nullptr;
 
 // Forward — used by renderer's ActiveShade
 static void TogglePanel();
-void ToggleMaxJSPanel() { TogglePanel(); }
+void ToggleMaxJSPanel(); // defined after class
+void StartMaxJSActiveShade(Bitmap* target); // defined after class
+void StopMaxJSActiveShade(); // defined after class
+HWND GetMaxJSWebViewHWND(); // defined after class
+void ReparentMaxJSPanel(HWND newParent); // defined after class
+void RestoreMaxJSPanel(); // defined after class
 
 // ══════════════════════════════════════════════════════════════
 //  JSON Helpers
@@ -633,6 +641,10 @@ public:
 
     void OnWebMessage(const wchar_t* json) {
         std::wstring msg(json);
+        if (msg.find(L"\"undock\"") != std::wstring::npos) {
+            if (originalParent_) RestoreFromViewport();
+            return;
+        }
         if (msg.find(L"\"ready\"") != std::wstring::npos) {
             jsReady_ = true; dirty_ = true;
             mtlHashMap_.clear();
@@ -1105,6 +1117,137 @@ public:
         webview_->PostWebMessageAsJson(ss.str().c_str());
     }
 
+    // ── ActiveShade capture ─────────────────────────────────
+
+    Bitmap* asTarget_ = nullptr;
+    bool asCapturing_ = false;
+    HWND originalParent_ = nullptr;
+    LONG originalStyle_ = 0;
+    RECT originalRect_ = {};
+
+    void StartActiveShade(Bitmap* target) {
+        asTarget_ = target;
+        asCapturing_ = true;
+        if (hwnd_) SetTimer(hwnd_, AS_TIMER_ID, AS_INTERVAL_MS, nullptr);
+    }
+
+    void StopActiveShade() {
+        asCapturing_ = false;
+        asTarget_ = nullptr;
+        if (hwnd_) KillTimer(hwnd_, AS_TIMER_ID);
+    }
+
+    // Reparent WebView2 into a viewport HWND — true GPU overlay
+    void ReparentIntoViewport(HWND viewportHwnd) {
+        if (!hwnd_ || !viewportHwnd) return;
+
+        // Save original state
+        originalParent_ = GetParent(hwnd_);
+        originalStyle_ = GetWindowLong(hwnd_, GWL_STYLE);
+        GetWindowRect(hwnd_, &originalRect_);
+
+        // Strip window chrome, make it a child of the viewport
+        SetWindowLong(hwnd_, GWL_STYLE, WS_CHILD | WS_VISIBLE);
+        SetParent(hwnd_, viewportHwnd);
+
+        // Fill the viewport
+        RECT vpRect;
+        GetClientRect(viewportHwnd, &vpRect);
+        SetWindowPos(hwnd_, HWND_TOP, 0, 0,
+            vpRect.right, vpRect.bottom, SWP_SHOWWINDOW);
+        Resize();
+    }
+
+    // Restore to original floating window
+    void RestoreFromViewport() {
+        if (!hwnd_ || !originalParent_) return;
+
+        SetParent(hwnd_, originalParent_);
+        SetWindowLong(hwnd_, GWL_STYLE, originalStyle_);
+        SetWindowPos(hwnd_, nullptr,
+            originalRect_.left, originalRect_.top,
+            originalRect_.right - originalRect_.left,
+            originalRect_.bottom - originalRect_.top,
+            SWP_NOZORDER | SWP_SHOWWINDOW | SWP_FRAMECHANGED);
+        originalParent_ = nullptr;
+        Resize();
+    }
+
+    void CaptureActiveShadeFrame() {
+        if (!webview_ || !asTarget_ || !asCapturing_) return;
+
+        ComPtr<IStream> stream;
+        CreateStreamOnHGlobal(NULL, TRUE, &stream);
+
+        webview_->CapturePreview(
+            COREWEBVIEW2_CAPTURE_PREVIEW_IMAGE_FORMAT_JPEG,
+            stream.Get(),
+            Callback<ICoreWebView2CapturePreviewCompletedHandler>(
+                [this, stream](HRESULT hr) -> HRESULT {
+                    if (FAILED(hr) || !asTarget_) return S_OK;
+
+                    // Reset stream
+                    LARGE_INTEGER zero = {};
+                    stream->Seek(zero, STREAM_SEEK_SET, nullptr);
+
+                    // Decode JPEG via WIC
+                    ComPtr<IWICImagingFactory> wic;
+                    CoCreateInstance(CLSID_WICImagingFactory, nullptr,
+                        CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic));
+                    if (!wic) return S_OK;
+
+                    ComPtr<IWICBitmapDecoder> decoder;
+                    wic->CreateDecoderFromStream(stream.Get(), nullptr,
+                        WICDecodeMetadataCacheOnLoad, &decoder);
+                    if (!decoder) return S_OK;
+
+                    ComPtr<IWICBitmapFrameDecode> frame;
+                    decoder->GetFrame(0, &frame);
+                    if (!frame) return S_OK;
+
+                    UINT srcW, srcH;
+                    frame->GetSize(&srcW, &srcH);
+
+                    // Scale to target bitmap size
+                    int dstW = asTarget_->Width();
+                    int dstH = asTarget_->Height();
+
+                    ComPtr<IWICBitmapScaler> scaler;
+                    wic->CreateBitmapScaler(&scaler);
+                    scaler->Initialize(frame.Get(), dstW, dstH,
+                        WICBitmapInterpolationModeLinear);
+
+                    // Convert to BGRA
+                    ComPtr<IWICFormatConverter> converter;
+                    wic->CreateFormatConverter(&converter);
+                    converter->Initialize(scaler.Get(),
+                        GUID_WICPixelFormat32bppBGRA,
+                        WICBitmapDitherTypeNone, nullptr, 0,
+                        WICBitmapPaletteTypeCustom);
+
+                    // Read pixels
+                    std::vector<BYTE> pixels(dstW * dstH * 4);
+                    converter->CopyPixels(nullptr, dstW * 4,
+                        (UINT)pixels.size(), pixels.data());
+
+                    // Write to Max Bitmap
+                    BMM_Color_64 line;
+                    for (int y = 0; y < dstH; y++) {
+                        for (int x = 0; x < dstW; x++) {
+                            int idx = (y * dstW + x) * 4;
+                            line.b = pixels[idx + 0] << 8;
+                            line.g = pixels[idx + 1] << 8;
+                            line.r = pixels[idx + 2] << 8;
+                            line.a = 0xFFFF;
+                            asTarget_->PutPixels(x, y, 1, &line);
+                        }
+                    }
+                    asTarget_->RefreshWindow();
+
+                    return S_OK;
+                }).Get());
+    }
+
     // ── Window management ────────────────────────────────────
 
     void Resize() {
@@ -1129,8 +1272,18 @@ public:
         }
         switch (msg) {
         case WM_SIZE:  if (p) p->Resize(); return 0;
-        case WM_TIMER: if (wParam == SYNC_TIMER_ID && p) p->OnTimer(); return 0;
+        case WM_TIMER:
+            if (wParam == SYNC_TIMER_ID && p) p->OnTimer();
+            if (wParam == AS_TIMER_ID && p) p->CaptureActiveShadeFrame();
+            return 0;
         case WM_CLOSE: ShowWindow(hwnd, SW_HIDE); return 0;
+        case WM_KEYDOWN:
+            // Escape exits ActiveShade viewport mode
+            if (wParam == VK_ESCAPE && p && p->originalParent_) {
+                p->RestoreFromViewport();
+                return 0;
+            }
+            break;
         }
         return DefWindowProc(hwnd, msg, wParam, lParam);
     }
@@ -1176,6 +1329,25 @@ void TogglePanel() {
     } else {
         g_panel->Create(GetCOREInterface()->GetMAXHWnd());
     }
+}
+
+void ToggleMaxJSPanel() { TogglePanel(); }
+void StartMaxJSActiveShade(Bitmap* target) {
+    if (!g_panel) TogglePanel();
+    if (g_panel) g_panel->StartActiveShade(target);
+}
+void StopMaxJSActiveShade() {
+    if (g_panel) g_panel->StopActiveShade();
+}
+HWND GetMaxJSWebViewHWND() {
+    return g_panel ? g_panel->hwnd_ : nullptr;
+}
+void ReparentMaxJSPanel(HWND newParent) {
+    if (!g_panel) TogglePanel();
+    if (g_panel) g_panel->ReparentIntoViewport(newParent);
+}
+void RestoreMaxJSPanel() {
+    if (g_panel) g_panel->RestoreFromViewport();
 }
 
 static void RegisterMaxScript() {

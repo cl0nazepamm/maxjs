@@ -7,8 +7,13 @@
 
 extern HINSTANCE hInstance;
 
-// Forward — toggle panel from dllmain.cpp
+// Forward — panel access from dllmain.cpp
 extern void ToggleMaxJSPanel();
+extern void StartMaxJSActiveShade(Bitmap* target);
+extern void StopMaxJSActiveShade();
+extern HWND GetMaxJSWebViewHWND();
+extern void ReparentMaxJSPanel(HWND newParent);
+extern void RestoreMaxJSPanel();
 
 // ══════════════════════════════════════════════════════════════
 //  ThreeJS Interactive Render (ActiveShade)
@@ -29,9 +34,16 @@ class ThreeJSInteractiveRender : public IInteractiveRender {
 public:
     void BeginSession() override {
         rendering_ = true;
+        // Ensure panel exists
         ToggleMaxJSPanel();
+        // Reparent WebView2 into the viewport — true GPU compositing
+        if (ownerWnd_)
+            ReparentMaxJSPanel(ownerWnd_);
     }
-    void EndSession() override { rendering_ = false; }
+    void EndSession() override {
+        rendering_ = false;
+        RestoreMaxJSPanel();
+    }
 
     void SetOwnerWnd(HWND h) override { ownerWnd_ = h; }
     HWND GetOwnerWnd() const override { return ownerWnd_; }

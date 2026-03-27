@@ -31,6 +31,7 @@
     <div id="hud">
         <div id="info">MaxJS Live — hot reload works!</div>
         <div id="controls">
+            <button id="btnUndock">Undock</button>
             <button id="btnRefresh">Refresh</button>
             <button id="btnCamLock">Cam Lock: OFF</button>
             <button id="btnEnv" class="active">Env: ON</button>
@@ -442,6 +443,10 @@
         }
 
         // ── UI Controls ─────────────────────────────────────
+        document.getElementById('btnUndock').onclick = () => {
+            bridge.send('undock');
+        };
+
         document.getElementById('btnRefresh').onclick = () => {
             currentHdriUrl = null;
             materialCache.clear();

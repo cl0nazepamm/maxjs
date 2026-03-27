@@ -380,6 +380,15 @@ static Mtl* FindMultiSubMtl(Mtl* mtl) {
     return nullptr;
 }
 
+static Mtl* GetSubMtlFromMatID(Mtl* multiMtl, int matID) {
+    if (!multiMtl) return nullptr;
+    const int subCount = multiMtl->NumSubMtls();
+    if (subCount <= 0) return nullptr;
+    int idx = matID % subCount;
+    if (idx < 0) idx += subCount;
+    return multiMtl->GetSubMtl(idx);
+}
+
 static void ExtractPBR(INode* node, TimeValue t, MaxJSPBR& d) {
     Mtl* mtl = node->GetMtl();
 
@@ -427,12 +436,20 @@ static bool ExtractMesh(INode* node, TimeValue t,
 
     bool hasUVs = mesh.getNumTVerts() > 0;
 
-    // Collect face order sorted by matID for Multi/Sub support
-    std::vector<int> faceOrder(nf);
-    std::iota(faceOrder.begin(), faceOrder.end(), 0);
-    std::sort(faceOrder.begin(), faceOrder.end(), [&](int a, int b) {
-        return mesh.faces[a].getMatID() < mesh.faces[b].getMatID();
-    });
+    // Collect face order sorted by matID only when multiple IDs exist.
+    std::vector<int> faceOrder;
+    faceOrder.reserve(nf);
+    int firstMatID = (int)mesh.faces[0].getMatID();
+    bool multiMatIDs = false;
+    for (int f = 0; f < nf; f++) {
+        faceOrder.push_back(f);
+        if ((int)mesh.faces[f].getMatID() != firstMatID) multiMatIDs = true;
+    }
+    if (multiMatIDs) {
+        std::sort(faceOrder.begin(), faceOrder.end(), [&](int a, int b) {
+            return mesh.faces[a].getMatID() < mesh.faces[b].getMatID();
+        });
+    }
 
     // Build indexed mesh with split vertices at UV seams
     std::unordered_map<uint64_t, int> vertMap;
@@ -849,11 +866,11 @@ public:
             uintptr_t hash = 0;
             Mtl* rawMtl = node->GetMtl();
             hash ^= (uintptr_t)rawMtl;
-            Mtl* foundMtl = FindSupportedMaterial(rawMtl);
-            if (foundMtl) {
-                // Hash all texmap pointers from all paramblocks
-                for (int b = 0; b < foundMtl->NumParamBlocks(); b++) {
-                    IParamBlock2* pb = foundMtl->GetParamBlock(b);
+            std::function<void(Mtl*)> hashMtlTree = [&](Mtl* mtl) {
+                if (!mtl) return;
+                hash ^= (uintptr_t)mtl * 11400714819323198485ull;
+                for (int b = 0; b < mtl->NumParamBlocks(); b++) {
+                    IParamBlock2* pb = mtl->GetParamBlock(b);
                     if (!pb) continue;
                     for (int i = 0; i < pb->NumParams(); i++) {
                         ParamID pid = pb->IndextoID(i);
@@ -862,7 +879,11 @@ public:
                             hash ^= (uintptr_t)pb->GetTexmap(pid, t) * 2654435761ULL;
                     }
                 }
-            }
+                for (int i = 0; i < mtl->NumSubMtls(); i++) {
+                    hashMtlTree(mtl->GetSubMtl(i));
+                }
+            };
+            hashMtlTree(rawMtl);
 
             auto it = mtlHashMap_.find(handle);
             if (it == mtlHashMap_.end()) {
@@ -1035,7 +1056,7 @@ public:
 
                 // Multi/Sub material support
                 Mtl* multiMtl = FindMultiSubMtl(node->GetMtl());
-                if (multiMtl && groups.size() > 1) {
+                if (multiMtl && multiMtl->NumSubMtls() > 0 && groups.size() > 1) {
                     // Groups: [[start, count, groupIdx], ...]
                     ss << L",\"groups\":[";
                     for (size_t g = 0; g < groups.size(); g++) {
@@ -1047,8 +1068,7 @@ public:
                     ss << L",\"mats\":[";
                     for (size_t g = 0; g < groups.size(); g++) {
                         if (g) ss << L',';
-                        int subIdx = groups[g].matID % multiMtl->NumSubMtls();
-                        Mtl* subMtl = multiMtl->GetSubMtl(subIdx);
+                        Mtl* subMtl = GetSubMtlFromMatID(multiMtl, groups[g].matID);
                         MaxJSPBR subPBR;
                         ExtractPBRFromMtl(subMtl, node, t, subPBR);
                         WriteMaterialFull(ss, subPBR);
@@ -1187,7 +1207,7 @@ public:
 
             // Multi/Sub material support
             Mtl* multiMtl = FindMultiSubMtl(ng.node->GetMtl());
-            if (multiMtl && ng.groups.size() > 1) {
+            if (multiMtl && multiMtl->NumSubMtls() > 0 && ng.groups.size() > 1) {
                 ss << L",\"groups\":[";
                 for (size_t g = 0; g < ng.groups.size(); g++) {
                     if (g) ss << L',';
@@ -1196,8 +1216,7 @@ public:
                 ss << L"],\"mats\":[";
                 for (size_t g = 0; g < ng.groups.size(); g++) {
                     if (g) ss << L',';
-                    int subIdx = ng.groups[g].matID % multiMtl->NumSubMtls();
-                    Mtl* subMtl = multiMtl->GetSubMtl(subIdx);
+                    Mtl* subMtl = GetSubMtlFromMatID(multiMtl, ng.groups[g].matID);
                     MaxJSPBR subPBR;
                     ExtractPBRFromMtl(subMtl, ng.node, t, subPBR);
                     WriteMaterialFull(ss, subPBR);
@@ -1282,11 +1301,17 @@ public:
             ss << L"{\"h\":" << handle;
             ss << L",\"s\":" << (node->Selected() ? L'1' : L'0');
             ss << L",\"t\":"; WriteFloats(ss, xform, 16);
-            ss << L",\"mat\":{\"color\":[" << col[0] << L',' << col[1] << L',' << col[2] << L']';
-            ss << L",\"rough\":" << rough;
-            ss << L",\"metal\":" << metal;
-            if (opac < 0.999f) ss << L",\"opacity\":" << opac;
-            ss << L"}}";
+            // For Multi/Sub objects, skip scalar material pushes to avoid
+            // corrupting material arrays on the web side.
+            Mtl* multiMtl = FindMultiSubMtl(node->GetMtl());
+            if (!(multiMtl && multiMtl->NumSubMtls() > 1)) {
+                ss << L",\"mat\":{\"color\":[" << col[0] << L',' << col[1] << L',' << col[2] << L']';
+                ss << L",\"rough\":" << rough;
+                ss << L",\"metal\":" << metal;
+                if (opac < 0.999f) ss << L",\"opacity\":" << opac;
+                ss << L"}";
+            }
+            ss << L"}";
             first = false;
             ++it;
         }

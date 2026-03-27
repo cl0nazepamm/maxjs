@@ -292,16 +292,19 @@
                 applySelection(mesh, nd.s);
                 // Live material update from scalars
                 if (nd.mat && mesh.material) {
-                    const m = mesh.material;
                     const c = nd.mat.color;
-                    if (c) m.color.setRGB(c[0], c[1], c[2]);
-                    if (nd.mat.rough != null) m.roughness = nd.mat.rough;
-                    if (nd.mat.metal != null) m.metalness = nd.mat.metal;
-                    if (nd.mat.opacity != null) {
-                        m.opacity = nd.mat.opacity;
-                        m.transparent = nd.mat.opacity < 0.999;
+                    const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+                    for (const m of mats) {
+                        if (!m) continue;
+                        if (c && m.color) m.color.setRGB(c[0], c[1], c[2]);
+                        if (nd.mat.rough != null && 'roughness' in m) m.roughness = nd.mat.rough;
+                        if (nd.mat.metal != null && 'metalness' in m) m.metalness = nd.mat.metal;
+                        if (nd.mat.opacity != null) {
+                            m.opacity = nd.mat.opacity;
+                            m.transparent = nd.mat.opacity < 0.999;
+                        }
+                        m.needsUpdate = true;
                     }
-                    m.needsUpdate = true;
                 }
             }
             if (msg.camera) applyCamera(msg.camera);
@@ -378,6 +381,12 @@
                         for (const [start, count, idx] of nd.groups) {
                             geom.addGroup(start, count, idx);
                         }
+                    }
+                } else if (geom && nd.groups) {
+                    // Geometry unchanged, but keep groups/material indexing synced.
+                    geom.clearGroups();
+                    for (const [start, count, idx] of nd.groups) {
+                        geom.addGroup(start, count, idx);
                     }
                 }
 

@@ -21,6 +21,7 @@
 #include <unordered_map>
 #include <map>
 #include <algorithm>
+#include <numeric>
 #include <functional>
 #include <cmath>
 
@@ -151,7 +152,9 @@ static std::wstring FindBitmapFile(Texmap* map) {
     return {};
 }
 
-// ── Wire Color helper ─────────────────────────────────────────
+// WriteMaterialFull is a member function of MaxJSPanel
+
+// ── Wire Color helper ──────────────────────────────────────────
 
 static void GetWireColor3f(INode* node, float out[3]) {
     COLORREF wc = node->GetWireColor();
@@ -163,7 +166,7 @@ static void GetWireColor3f(INode* node, float out[3]) {
 //  Priority: ThreeJS Material (direct) > Shell viewport sub > wire color
 // ══════════════════════════════════════════════════════════════
 
-struct PBRData {
+struct MaxJSPBR {
     float color[3]    = {0.8f, 0.8f, 0.8f};
     float roughness   = 0.5f;
     float metalness   = 0.0f;
@@ -183,30 +186,36 @@ struct PBRData {
 
 // Shell Material Class_ID = (597, 0)
 #define SHELL_MTL_CLASS_ID Class_ID(597, 0)
+// glTF Material Class_ID = (943849874, 1174294043)
+#define GLTF_MTL_CLASS_ID Class_ID(943849874, 1174294043)
 
-// Find ThreeJS Material in material tree — uses ClassID only, no GetClassName
-static Mtl* FindThreeJSMaterial(Mtl* mtl) {
+static bool IsSupportedMaterial(Mtl* mtl) {
+    if (!mtl) return false;
+    Class_ID cid = mtl->ClassID();
+    return cid == THREEJS_MTL_CLASS_ID || cid == GLTF_MTL_CLASS_ID;
+}
+
+// Find ThreeJS or glTF Material in material tree — uses ClassID only
+static Mtl* FindSupportedMaterial(Mtl* mtl) {
     if (!mtl) return nullptr;
 
     Class_ID cid = mtl->ClassID();
 
-    // Direct ThreeJS Material
-    if (cid == THREEJS_MTL_CLASS_ID) return mtl;
+    // Direct match
+    if (IsSupportedMaterial(mtl)) return mtl;
 
-    // Shell Material
+    // Shell Material — check both subs
     if (cid == SHELL_MTL_CLASS_ID && mtl->NumSubMtls() >= 2) {
-        // Check both subs for ThreeJS Material
         for (int i = 0; i < mtl->NumSubMtls(); i++) {
             Mtl* sub = mtl->GetSubMtl(i);
-            if (sub && sub->ClassID() == THREEJS_MTL_CLASS_ID)
-                return sub;
+            if (IsSupportedMaterial(sub)) return sub;
         }
     }
 
     // Multi/Sub
     if (mtl->NumSubMtls() > 0 && cid != SHELL_MTL_CLASS_ID) {
         for (int i = 0; i < mtl->NumSubMtls(); i++) {
-            Mtl* found = FindThreeJSMaterial(mtl->GetSubMtl(i));
+            Mtl* found = FindSupportedMaterial(mtl->GetSubMtl(i));
             if (found) return found;
         }
     }
@@ -214,7 +223,10 @@ static Mtl* FindThreeJSMaterial(Mtl* mtl) {
     return nullptr;
 }
 
-static void ExtractThreeJSMtl(Mtl* mtl, TimeValue t, PBRData& d) {
+// Keep old name working for transform sync
+static Mtl* FindThreeJSMaterial(Mtl* mtl) { return FindSupportedMaterial(mtl); }
+
+static void ExtractThreeJSMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
     IParamBlock2* pb = mtl->GetParamBlockByID(threejs_params);
     if (!pb) return;
 
@@ -253,13 +265,131 @@ static void ExtractThreeJSMtl(Mtl* mtl, TimeValue t, PBRData& d) {
     d.aoMap        = getMap(pb_ao_map);
 }
 
-static void ExtractPBR(INode* node, TimeValue t, PBRData& d) {
+// Extract PBR from glTF Material — generic paramblock reader
+static void ExtractGltfMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
+    MSTR name = mtl->GetName();
+    d.mtlName = name.data();
+
+    // glTF colors are 0-255 in Max, need /255
+    auto readColor = [&](const MCHAR* pname, float out[3]) {
+        for (int b = 0; b < mtl->NumParamBlocks(); b++) {
+            IParamBlock2* pb = mtl->GetParamBlock(b);
+            if (!pb) continue;
+            for (int i = 0; i < pb->NumParams(); i++) {
+                ParamID pid = pb->IndextoID(i);
+                const ParamDef& pd = pb->GetParamDef(pid);
+                if (pd.int_name && _tcsicmp(pd.int_name, pname) == 0) {
+                    if (pd.type == TYPE_RGBA || pd.type == TYPE_FRGBA) {
+                        Color c = pb->GetColor(pid, t);
+                        out[0] = c.r; out[1] = c.g; out[2] = c.b;
+                    }
+                    return;
+                }
+            }
+        }
+    };
+    auto readFloat = [&](const MCHAR* pname, float def) -> float {
+        for (int b = 0; b < mtl->NumParamBlocks(); b++) {
+            IParamBlock2* pb = mtl->GetParamBlock(b);
+            if (!pb) continue;
+            for (int i = 0; i < pb->NumParams(); i++) {
+                ParamID pid = pb->IndextoID(i);
+                const ParamDef& pd = pb->GetParamDef(pid);
+                if (pd.int_name && _tcsicmp(pd.int_name, pname) == 0 && pd.type == TYPE_FLOAT)
+                    return pb->GetFloat(pid, t);
+            }
+        }
+        return def;
+    };
+    auto readInt = [&](const MCHAR* pname, int def) -> int {
+        for (int b = 0; b < mtl->NumParamBlocks(); b++) {
+            IParamBlock2* pb = mtl->GetParamBlock(b);
+            if (!pb) continue;
+            for (int i = 0; i < pb->NumParams(); i++) {
+                ParamID pid = pb->IndextoID(i);
+                const ParamDef& pd = pb->GetParamDef(pid);
+                if (pd.int_name && _tcsicmp(pd.int_name, pname) == 0 &&
+                    (pd.type == TYPE_INT || pd.type == TYPE_BOOL))
+                    return pb->GetInt(pid, t);
+            }
+        }
+        return def;
+    };
+    auto readMap = [&](const MCHAR* pname) -> std::wstring {
+        for (int b = 0; b < mtl->NumParamBlocks(); b++) {
+            IParamBlock2* pb = mtl->GetParamBlock(b);
+            if (!pb) continue;
+            for (int i = 0; i < pb->NumParams(); i++) {
+                ParamID pid = pb->IndextoID(i);
+                const ParamDef& pd = pb->GetParamDef(pid);
+                if (pd.int_name && _tcsicmp(pd.int_name, pname) == 0 && pd.type == TYPE_TEXMAP) {
+                    Texmap* map = pb->GetTexmap(pid, t);
+                    return FindBitmapFile(map);
+                }
+            }
+        }
+        return {};
+    };
+
+    readColor(_T("baseColor"), d.color);
+
+    d.roughness   = readFloat(_T("roughness"), 0.5f);
+    d.metalness   = readFloat(_T("metalness"), 0.0f);
+    d.normalScale = readFloat(_T("normal"), 1.0f);
+    d.aoIntensity = readFloat(_T("ambientOcclusion"), 1.0f);
+    d.opacity     = 1.0f;  // glTF uses alphaMode, not direct opacity
+    d.doubleSided = readInt(_T("DoubleSided"), 0) != 0;
+
+    readColor(_T("emissionColor"), d.emission);
+    d.emIntensity = (d.emission[0] + d.emission[1] + d.emission[2] > 0) ? 1.0f : 0.0f;
+
+    d.colorMap     = readMap(_T("baseColorMap"));
+    d.roughnessMap = readMap(_T("roughnessMap"));
+    d.metalnessMap = readMap(_T("metalnessMap"));
+    d.normalMap    = readMap(_T("normalMap"));
+    d.aoMap        = readMap(_T("ambientOcclusionMap"));
+    d.emissionMap  = readMap(_T("emissionMap"));
+    d.opacityMap   = readMap(_T("AlphaMap"));
+}
+
+// Extract PBR from a single material (ThreeJS, glTF, or wire color fallback)
+static void ExtractPBRFromMtl(Mtl* mtl, INode* node, TimeValue t, MaxJSPBR& d) {
+    if (mtl) {
+        Mtl* found = FindSupportedMaterial(mtl);
+        if (found) {
+            if (found->ClassID() == THREEJS_MTL_CLASS_ID)
+                ExtractThreeJSMtl(found, t, d);
+            else
+                ExtractGltfMtl(found, t, d);
+            return;
+        }
+    }
+    if (node) GetWireColor3f(node, d.color);
+}
+
+// Find the Multi/Sub material if any (unwrap Shell if needed)
+static Mtl* FindMultiSubMtl(Mtl* mtl) {
+    if (!mtl) return nullptr;
+    if (mtl->IsMultiMtl()) return mtl;
+    if (mtl->ClassID() == SHELL_MTL_CLASS_ID) {
+        for (int i = 0; i < mtl->NumSubMtls(); i++) {
+            Mtl* sub = mtl->GetSubMtl(i);
+            if (sub && sub->IsMultiMtl()) return sub;
+        }
+    }
+    return nullptr;
+}
+
+static void ExtractPBR(INode* node, TimeValue t, MaxJSPBR& d) {
     Mtl* mtl = node->GetMtl();
 
-    // Priority 1: ThreeJS Material (direct or inside Shell)
-    Mtl* tjsMtl = FindThreeJSMaterial(mtl);
-    if (tjsMtl) {
-        ExtractThreeJSMtl(tjsMtl, t, d);
+    // Priority 1: ThreeJS Material or glTF Material (direct or inside Shell)
+    Mtl* found = FindSupportedMaterial(mtl);
+    if (found) {
+        if (found->ClassID() == THREEJS_MTL_CLASS_ID)
+            ExtractThreeJSMtl(found, t, d);
+        else
+            ExtractGltfMtl(found, t, d);
         return;
     }
 
@@ -268,13 +398,16 @@ static void ExtractPBR(INode* node, TimeValue t, PBRData& d) {
 }
 
 // ══════════════════════════════════════════════════════════════
-//  Mesh Extraction with UV coordinates
+//  Mesh Extraction with UV coordinates + Multi/Sub material groups
 // ══════════════════════════════════════════════════════════════
+
+struct MatGroup { int matID; int start; int count; };
 
 static bool ExtractMesh(INode* node, TimeValue t,
                         std::vector<float>& verts,
                         std::vector<float>& uvs,
-                        std::vector<int>& indices) {
+                        std::vector<int>& indices,
+                        std::vector<MatGroup>& groups) {
     ObjectState os = node->EvalWorldState(t);
     if (!os.obj || os.obj->SuperClassID() != GEOMOBJECT_CLASS_ID) return false;
     if (!os.obj->CanConvertToType(Class_ID(TRIOBJ_CLASS_ID, 0))) return false;
@@ -294,13 +427,30 @@ static bool ExtractMesh(INode* node, TimeValue t,
 
     bool hasUVs = mesh.getNumTVerts() > 0;
 
+    // Collect face order sorted by matID for Multi/Sub support
+    std::vector<int> faceOrder(nf);
+    std::iota(faceOrder.begin(), faceOrder.end(), 0);
+    std::sort(faceOrder.begin(), faceOrder.end(), [&](int a, int b) {
+        return mesh.faces[a].getMatID() < mesh.faces[b].getMatID();
+    });
+
     // Build indexed mesh with split vertices at UV seams
     std::unordered_map<uint64_t, int> vertMap;
     verts.reserve(nv * 3);
     if (hasUVs) uvs.reserve(nv * 2);
     indices.reserve(nf * 3);
 
-    for (int f = 0; f < nf; f++) {
+    int curMatID = -1;
+    for (int fi = 0; fi < nf; fi++) {
+        int f = faceOrder[fi];
+        int matID = (int)mesh.faces[f].getMatID();
+
+        // Track material groups
+        if (matID != curMatID) {
+            curMatID = matID;
+            groups.push_back({ matID, (int)indices.size(), 0 });
+        }
+
         for (int v = 0; v < 3; v++) {
             DWORD posIdx = mesh.faces[f].v[v];
             DWORD uvIdx  = hasUVs ? mesh.tvFace[f].t[v] : 0;
@@ -327,6 +477,7 @@ static bool ExtractMesh(INode* node, TimeValue t,
                 indices.push_back(newIdx);
             }
         }
+        groups.back().count += 3;
     }
 
     if (tri != os.obj) tri->DeleteThis();
@@ -627,6 +778,8 @@ public:
         RegisterNotification(OnSceneChanged, this, NOTIFY_FILE_POST_OPEN);
         RegisterNotification(OnSceneChanged, this, NOTIFY_SYSTEM_POST_RESET);
         RegisterNotification(OnSceneChanged, this, NOTIFY_SELECTIONSET_CHANGED);
+        RegisterNotification(OnSceneChanged, this, NOTIFY_NODE_HIDE);
+        RegisterNotification(OnSceneChanged, this, NOTIFY_NODE_UNHIDE);
         SetTimer(hwnd_, SYNC_TIMER_ID, SYNC_INTERVAL_MS, nullptr);
     }
 
@@ -637,6 +790,8 @@ public:
         UnRegisterNotification(OnSceneChanged, this, NOTIFY_FILE_POST_OPEN);
         UnRegisterNotification(OnSceneChanged, this, NOTIFY_SYSTEM_POST_RESET);
         UnRegisterNotification(OnSceneChanged, this, NOTIFY_SELECTIONSET_CHANGED);
+        UnRegisterNotification(OnSceneChanged, this, NOTIFY_NODE_HIDE);
+        UnRegisterNotification(OnSceneChanged, this, NOTIFY_NODE_UNHIDE);
     }
 
     void OnWebMessage(const wchar_t* json) {
@@ -694,17 +849,18 @@ public:
             uintptr_t hash = 0;
             Mtl* rawMtl = node->GetMtl();
             hash ^= (uintptr_t)rawMtl;
-            Mtl* tjsMtl = FindThreeJSMaterial(rawMtl);
-            if (tjsMtl) {
-                IParamBlock2* pb = tjsMtl->GetParamBlockByID(threejs_params);
-                if (pb) {
-                    static const ParamID mapIDs[] = {
-                        pb_color_map, pb_roughness_map, pb_metalness_map,
-                        pb_normal_map, pb_emissive_map, pb_opacity_map,
-                        pb_lightmap, pb_ao_map
-                    };
-                    for (ParamID mid : mapIDs)
-                        hash ^= (uintptr_t)pb->GetTexmap(mid, t) * 2654435761ULL;
+            Mtl* foundMtl = FindSupportedMaterial(rawMtl);
+            if (foundMtl) {
+                // Hash all texmap pointers from all paramblocks
+                for (int b = 0; b < foundMtl->NumParamBlocks(); b++) {
+                    IParamBlock2* pb = foundMtl->GetParamBlock(b);
+                    if (!pb) continue;
+                    for (int i = 0; i < pb->NumParams(); i++) {
+                        ParamID pid = pb->IndextoID(i);
+                        const ParamDef& pd = pb->GetParamDef(pid);
+                        if (pd.type == TYPE_TEXMAP)
+                            hash ^= (uintptr_t)pb->GetTexmap(pid, t) * 2654435761ULL;
+                    }
                 }
             }
 
@@ -744,7 +900,8 @@ public:
             if (node) {
                 std::vector<float> verts, uvs;
                 std::vector<int> indices;
-                if (ExtractMesh(node, t, verts, uvs, indices)) {
+                std::vector<MatGroup> groups;
+                if (ExtractMesh(node, t, verts, uvs, indices, groups)) {
                     uint64_t hash = HashMeshData(verts, indices, uvs);
                     auto it = geoHashMap_.find(handle);
                     if (it == geoHashMap_.end() || it->second != hash) {
@@ -763,6 +920,45 @@ public:
     }
 
     // ── Camera JSON fragment ─────────────────────────────────
+
+    void WriteMaterialTextures(std::wostringstream& ss, const MaxJSPBR& pbr) {
+        auto writeMap = [&](const wchar_t* key, const std::wstring& path) {
+            if (path.empty()) return;
+            std::wstring url = MapTexturePath(path);
+            if (!url.empty())
+                ss << L",\"" << key << L"\":\"" << EscapeJson(url.c_str()) << L'"';
+        };
+        writeMap(L"map", pbr.colorMap);
+        writeMap(L"roughMap", pbr.roughnessMap);
+        writeMap(L"metalMap", pbr.metalnessMap);
+        writeMap(L"normMap", pbr.normalMap);
+        writeMap(L"aoMap", pbr.aoMap);
+        writeMap(L"emMap", pbr.emissionMap);
+        writeMap(L"lmMap", pbr.lightmapFile);
+        writeMap(L"opMap", pbr.opacityMap);
+        ss << L'}';
+    }
+
+    void WriteMaterialFull(std::wostringstream& ss, const MaxJSPBR& pbr) {
+        ss << L"{\"name\":\"" << EscapeJson(pbr.mtlName.empty() ? L"default" : pbr.mtlName.c_str()) << L'"';
+        ss << L",\"color\":[" << pbr.color[0] << L',' << pbr.color[1] << L',' << pbr.color[2] << L']';
+        ss << L",\"rough\":" << pbr.roughness;
+        ss << L",\"metal\":" << pbr.metalness;
+        if (pbr.opacity < 0.999f) ss << L",\"opacity\":" << pbr.opacity;
+        if (!pbr.doubleSided) ss << L",\"side\":0";
+        ss << L",\"normScl\":" << pbr.normalScale;
+        ss << L",\"aoI\":" << pbr.aoIntensity;
+        ss << L",\"envI\":" << pbr.envIntensity;
+        if (pbr.emIntensity > 0) {
+            ss << L",\"em\":[" << pbr.emission[0] << L',' << pbr.emission[1] << L',' << pbr.emission[2] << L']';
+            ss << L",\"emI\":" << pbr.emIntensity;
+        }
+        if (pbr.lightmapIntensity > 0) {
+            ss << L",\"lmI\":" << pbr.lightmapIntensity;
+            ss << L",\"lmCh\":" << pbr.lightmapChannel;
+        }
+        WriteMaterialTextures(ss, pbr);
+    }
 
     void WriteCameraJson(std::wostringstream& ss) {
         CameraData cam = {};
@@ -818,16 +1014,13 @@ public:
                          std::wostringstream& ss, bool& first) {
         for (int i = 0; i < parent->NumberOfChildren(); i++) {
             INode* node = parent->GetChildNode(i);
-            if (!node) continue;
+            if (!node || node->IsNodeHidden(TRUE)) continue;
 
             std::vector<float> verts, uvs;
             std::vector<int> indices;
-            if (ExtractMesh(node, t, verts, uvs, indices)) {
+            std::vector<MatGroup> groups;
+            if (ExtractMesh(node, t, verts, uvs, indices, groups)) {
                 float xform[16]; GetTransform16(node, t, xform);
-
-                // Material
-                PBRData pbr;
-                ExtractPBR(node, t, pbr);
 
                 if (!first) ss << L',';
                 ss << L"{\"h\":" << node->GetHandle();
@@ -840,44 +1033,35 @@ public:
                     ss << L",\"uv\":"; WriteFloats(ss, uvs.data(), uvs.size());
                 }
 
-                // Material data
-                ss << L",\"mat\":{";
-                ss << L"\"name\":\"" << EscapeJson(pbr.mtlName.empty() ? L"default" : pbr.mtlName.c_str()) << L'"';
-                ss << L",\"color\":[" << pbr.color[0] << L',' << pbr.color[1] << L',' << pbr.color[2] << L']';
-                ss << L",\"rough\":" << pbr.roughness;
-                ss << L",\"metal\":" << pbr.metalness;
-                if (pbr.opacity < 0.999f) ss << L",\"opacity\":" << pbr.opacity;
-                if (!pbr.doubleSided) ss << L",\"side\":0";
-                ss << L",\"normScl\":" << pbr.normalScale;
-                ss << L",\"aoI\":" << pbr.aoIntensity;
-                ss << L",\"envI\":" << pbr.envIntensity;
-                if (pbr.emIntensity > 0) {
-                    ss << L",\"em\":[" << pbr.emission[0] << L',' << pbr.emission[1] << L',' << pbr.emission[2] << L']';
-                    ss << L",\"emI\":" << pbr.emIntensity;
-                }
-                // Lightmap
-                if (pbr.lightmapIntensity > 0) {
-                    ss << L",\"lmI\":" << pbr.lightmapIntensity;
-                    ss << L",\"lmCh\":" << pbr.lightmapChannel;
+                // Multi/Sub material support
+                Mtl* multiMtl = FindMultiSubMtl(node->GetMtl());
+                if (multiMtl && groups.size() > 1) {
+                    // Groups: [[start, count, groupIdx], ...]
+                    ss << L",\"groups\":[";
+                    for (size_t g = 0; g < groups.size(); g++) {
+                        if (g) ss << L',';
+                        ss << L'[' << groups[g].start << L',' << groups[g].count << L',' << g << L']';
+                    }
+                    ss << L"]";
+                    // Materials array: one PBR per group
+                    ss << L",\"mats\":[";
+                    for (size_t g = 0; g < groups.size(); g++) {
+                        if (g) ss << L',';
+                        int subIdx = groups[g].matID % multiMtl->NumSubMtls();
+                        Mtl* subMtl = multiMtl->GetSubMtl(subIdx);
+                        MaxJSPBR subPBR;
+                        ExtractPBRFromMtl(subMtl, node, t, subPBR);
+                        WriteMaterialFull(ss, subPBR);
+                    }
+                    ss << L"]";
+                } else {
+                    // Single material
+                    MaxJSPBR pbr;
+                    ExtractPBR(node, t, pbr);
+                    ss << L",\"mat\":";
+                    WriteMaterialFull(ss, pbr);
                 }
 
-                // Texture URLs
-                auto writeMap = [&](const wchar_t* key, const std::wstring& path) {
-                    if (path.empty()) return;
-                    std::wstring url = MapTexturePath(path);
-                    if (!url.empty())
-                        ss << L",\"" << key << L"\":\"" << EscapeJson(url.c_str()) << L'"';
-                };
-                writeMap(L"map", pbr.colorMap);
-                writeMap(L"roughMap", pbr.roughnessMap);
-                writeMap(L"metalMap", pbr.metalnessMap);
-                writeMap(L"normMap", pbr.normalMap);
-                writeMap(L"aoMap", pbr.aoMap);
-                writeMap(L"emMap", pbr.emissionMap);
-                writeMap(L"lmMap", pbr.lightmapFile);
-                writeMap(L"opMap", pbr.opacityMap);
-
-                ss << L'}';  // end mat
                 ss << L'}';  // end node
                 first = false;
                 geomHandles_.insert(node->GetHandle());
@@ -910,6 +1094,7 @@ public:
             INode* node;
             std::vector<float> verts, uvs;
             std::vector<int> indices;
+            std::vector<MatGroup> groups;
             bool changed;
             size_t vOff, iOff, uvOff;
         };
@@ -919,12 +1104,12 @@ public:
         std::function<void(INode*)> collect = [&](INode* parent) {
             for (int i = 0; i < parent->NumberOfChildren(); i++) {
                 INode* node = parent->GetChildNode(i);
-                if (!node) continue;
+                if (!node || node->IsNodeHidden(TRUE)) continue;
                 NodeGeo ng;
                 ng.node = node;
                 ng.handle = node->GetHandle();
                 ng.changed = false;
-                if (ExtractMesh(node, t, ng.verts, ng.uvs, ng.indices)) {
+                if (ExtractMesh(node, t, ng.verts, ng.uvs, ng.indices, ng.groups)) {
                     // Content hash: catches deforms/UV edits even when counts are unchanged.
                     uint64_t hash = HashMeshData(ng.verts, ng.indices, ng.uvs);
                     auto it = geoHashMap_.find(ng.handle);
@@ -974,7 +1159,7 @@ public:
 
         for (auto& ng : geos) {
             float xform[16]; GetTransform16(ng.node, t, xform);
-            PBRData pbr; ExtractPBR(ng.node, t, pbr);
+            MaxJSPBR pbr; ExtractPBR(ng.node, t, pbr);
 
             if (!first) ss << L',';
             ss << L"{\"h\":" << ng.handle;
@@ -1000,40 +1185,9 @@ public:
                 ss << L'}';
             }
 
-            // Material (same as JSON sync)
-            ss << L",\"mat\":{";
-            ss << L"\"name\":\"" << EscapeJson(pbr.mtlName.empty() ? L"default" : pbr.mtlName.c_str()) << L'"';
-            ss << L",\"color\":[" << pbr.color[0] << L',' << pbr.color[1] << L',' << pbr.color[2] << L']';
-            ss << L",\"rough\":" << pbr.roughness;
-            ss << L",\"metal\":" << pbr.metalness;
-            if (pbr.opacity < 0.999f) ss << L",\"opacity\":" << pbr.opacity;
-            if (!pbr.doubleSided) ss << L",\"side\":0";
-            ss << L",\"normScl\":" << pbr.normalScale;
-            ss << L",\"aoI\":" << pbr.aoIntensity;
-            ss << L",\"envI\":" << pbr.envIntensity;
-            if (pbr.emIntensity > 0) {
-                ss << L",\"em\":[" << pbr.emission[0] << L',' << pbr.emission[1] << L',' << pbr.emission[2] << L']';
-                ss << L",\"emI\":" << pbr.emIntensity;
-            }
-            if (pbr.lightmapIntensity > 0) {
-                ss << L",\"lmI\":" << pbr.lightmapIntensity;
-                ss << L",\"lmCh\":" << pbr.lightmapChannel;
-            }
-            auto writeMap = [&](const wchar_t* key, const std::wstring& path) {
-                if (path.empty()) return;
-                std::wstring url = MapTexturePath(path);
-                if (!url.empty())
-                    ss << L",\"" << key << L"\":\"" << EscapeJson(url.c_str()) << L'"';
-            };
-            writeMap(L"map", pbr.colorMap);
-            writeMap(L"roughMap", pbr.roughnessMap);
-            writeMap(L"metalMap", pbr.metalnessMap);
-            writeMap(L"normMap", pbr.normalMap);
-            writeMap(L"aoMap", pbr.aoMap);
-            writeMap(L"emMap", pbr.emissionMap);
-            writeMap(L"lmMap", pbr.lightmapFile);
-            writeMap(L"opMap", pbr.opacityMap);
-            ss << L'}';  // mat
+            // Material
+            ss << L",\"mat\":";
+            WriteMaterialFull(ss, pbr);
 
             ss << L'}';  // node
             first = false;
@@ -1085,9 +1239,9 @@ public:
             // Lightweight material scalars (no texture walks)
             float col[3] = {0.8f,0.8f,0.8f};
             float rough = 0.5f, metal = 0.0f, opac = 1.0f;
-            Mtl* tjsMtl = FindThreeJSMaterial(node->GetMtl());
-            if (tjsMtl) {
-                IParamBlock2* pb = tjsMtl->GetParamBlockByID(threejs_params);
+            Mtl* foundMtl = FindSupportedMaterial(node->GetMtl());
+            if (foundMtl && foundMtl->ClassID() == THREEJS_MTL_CLASS_ID) {
+                IParamBlock2* pb = foundMtl->GetParamBlockByID(threejs_params);
                 if (pb) {
                     Color c = pb->GetColor(pb_color, t);
                     col[0] = c.r; col[1] = c.g; col[2] = c.b;
@@ -1095,6 +1249,12 @@ public:
                     metal = pb->GetFloat(pb_metalness, t);
                     opac  = pb->GetFloat(pb_opacity, t);
                 }
+            } else if (foundMtl && foundMtl->ClassID() == GLTF_MTL_CLASS_ID) {
+                // Read glTF params via generic paramblock scan
+                MaxJSPBR tmp;
+                ExtractGltfMtl(foundMtl, t, tmp);
+                col[0] = tmp.color[0]; col[1] = tmp.color[1]; col[2] = tmp.color[2];
+                rough = tmp.roughness; metal = tmp.metalness; opac = tmp.opacity;
             } else {
                 GetWireColor3f(node, col);
             }

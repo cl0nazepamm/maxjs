@@ -35,6 +35,7 @@
             <button id="btnRefresh">Refresh</button>
             <button id="btnCamLock">Cam Lock: OFF</button>
             <button id="btnEnv" class="active">Env: ON</button>
+            <button id="btnSel" class="active">Sel: ON</button>
         </div>
     </div>
     <script type="importmap">
@@ -232,15 +233,30 @@
 
             for (const nd of msg.nodes) {
                 let mesh = nodeMap.get(nd.h);
-                const mat = nd.mat ? createMaterial(nd.mat)
-                    : new THREE.MeshStandardMaterial({ color: 0x888888, side: THREE.DoubleSide });
+
+                // Build material: single or multi-sub array
+                let mat;
+                if (nd.mats && nd.groups) {
+                    mat = nd.mats.map(m => createMaterial(m));
+                } else {
+                    mat = nd.mat ? createMaterial(nd.mat)
+                        : new THREE.MeshStandardMaterial({ color: 0x888888, side: THREE.DoubleSide });
+                }
+
+                const geom = buildGeometry(nd.v, nd.i, nd.uv);
+
+                // Add material groups for Multi/Sub
+                if (nd.groups) {
+                    for (const [start, count, idx] of nd.groups) {
+                        geom.addGroup(start, count, idx);
+                    }
+                }
 
                 if (mesh) {
                     mesh.geometry.dispose();
-                    mesh.geometry = buildGeometry(nd.v, nd.i, nd.uv);
+                    mesh.geometry = geom;
                     mesh.material = mat;
                 } else {
-                    const geom = buildGeometry(nd.v, nd.i, nd.uv);
                     mesh = new THREE.Mesh(geom, mat);
                     mesh.matrixAutoUpdate = false;
                     mesh.name = nd.n;
@@ -395,9 +411,14 @@
             mesh.matrixWorldNeedsUpdate = true;
         }
 
+        let selHighlight = true;
+
         function applySelection(mesh, selected) {
-            if (mesh.material?.emissive)
-                mesh.material.emissive.setHex(selected ? 0x1a1a44 : 0x000000);
+            if (!selHighlight) return;
+            const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+            for (const m of mats) {
+                if (m?.emissive) m.emissive.setHex(selected ? 0x1a1a44 : 0x000000);
+            }
         }
 
         // ── Camera Sync (Z-up, raw from Max) ────────────────
@@ -470,6 +491,20 @@
             btnEnv.classList.toggle('active', envVisible);
             scene.background = envVisible && scene.environment
                 ? scene.environment : new THREE.Color(0x1a1a2e);
+        };
+
+        const btnSel = document.getElementById('btnSel');
+        btnSel.onclick = () => {
+            selHighlight = !selHighlight;
+            btnSel.textContent = `Sel: ${selHighlight ? 'ON' : 'OFF'}`;
+            btnSel.classList.toggle('active', selHighlight);
+            // Clear existing highlights
+            if (!selHighlight) {
+                for (const [, mesh] of nodeMap) {
+                    const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+                    for (const m of mats) { if (m?.emissive) m.emissive.setHex(0x000000); }
+                }
+            }
         };
 
         // ── Resize + Render ─────────────────────────────────

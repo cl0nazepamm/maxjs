@@ -24,6 +24,7 @@
 #include <numeric>
 #include <functional>
 #include <cmath>
+#include <locale>
 
 using namespace Microsoft::WRL;
 
@@ -73,9 +74,22 @@ static std::wstring EscapeJson(const wchar_t* s) {
     return out;
 }
 
+static float SafeJsonFloat(float value, float fallback = 0.0f) {
+    if (!std::isfinite(value)) return fallback;
+    if (std::fabs(value) > 1.0e15f) return fallback;
+    return value;
+}
+
+static void WriteFloatValue(std::wostringstream& ss, float value, float fallback = 0.0f) {
+    ss << SafeJsonFloat(value, fallback);
+}
+
 static void WriteFloats(std::wostringstream& ss, const float* d, size_t n) {
     ss << L'[';
-    for (size_t i = 0; i < n; i++) { if (i) ss << L','; ss << d[i]; }
+    for (size_t i = 0; i < n; i++) {
+        if (i) ss << L',';
+        WriteFloatValue(ss, d[i]);
+    }
     ss << L']';
 }
 
@@ -722,7 +736,7 @@ public:
                     return S_OK;
                 }).Get(), nullptr);
 
-        // Check for shared buffer support (ICoreWebView2_17 + Environment12)
+        // Prefer shared-buffer transport when the runtime supports it.
         ComPtr<ICoreWebView2_17> wv17;
         ComPtr<ICoreWebView2Environment12> env12;
         useBinary_ = SUCCEEDED(webview_->QueryInterface(IID_PPV_ARGS(&wv17))) && wv17
@@ -846,6 +860,7 @@ public:
 
     void SendCameraSync() {
         std::wostringstream ss;
+        ss.imbue(std::locale::classic());
         ss << L"{\"type\":\"cam\",";
         WriteCameraJson(ss);
         ss << L'}';
@@ -962,20 +977,36 @@ public:
 
     void WriteMaterialFull(std::wostringstream& ss, const MaxJSPBR& pbr) {
         ss << L"{\"name\":\"" << EscapeJson(pbr.mtlName.empty() ? L"default" : pbr.mtlName.c_str()) << L'"';
-        ss << L",\"color\":[" << pbr.color[0] << L',' << pbr.color[1] << L',' << pbr.color[2] << L']';
-        ss << L",\"rough\":" << pbr.roughness;
-        ss << L",\"metal\":" << pbr.metalness;
-        if (pbr.opacity < 0.999f) ss << L",\"opacity\":" << pbr.opacity;
+        ss << L",\"color\":[";
+        WriteFloatValue(ss, pbr.color[0], 0.8f); ss << L',';
+        WriteFloatValue(ss, pbr.color[1], 0.8f); ss << L',';
+        WriteFloatValue(ss, pbr.color[2], 0.8f); ss << L']';
+        ss << L",\"rough\":";
+        WriteFloatValue(ss, pbr.roughness, 0.5f);
+        ss << L",\"metal\":";
+        WriteFloatValue(ss, pbr.metalness, 0.0f);
+        if (pbr.opacity < 0.999f) {
+            ss << L",\"opacity\":";
+            WriteFloatValue(ss, pbr.opacity, 1.0f);
+        }
         if (!pbr.doubleSided) ss << L",\"side\":0";
-        ss << L",\"normScl\":" << pbr.normalScale;
-        ss << L",\"aoI\":" << pbr.aoIntensity;
-        ss << L",\"envI\":" << pbr.envIntensity;
+        ss << L",\"normScl\":";
+        WriteFloatValue(ss, pbr.normalScale, 1.0f);
+        ss << L",\"aoI\":";
+        WriteFloatValue(ss, pbr.aoIntensity, 1.0f);
+        ss << L",\"envI\":";
+        WriteFloatValue(ss, pbr.envIntensity, 1.0f);
         if (pbr.emIntensity > 0) {
-            ss << L",\"em\":[" << pbr.emission[0] << L',' << pbr.emission[1] << L',' << pbr.emission[2] << L']';
-            ss << L",\"emI\":" << pbr.emIntensity;
+            ss << L",\"em\":[";
+            WriteFloatValue(ss, pbr.emission[0], 0.0f); ss << L',';
+            WriteFloatValue(ss, pbr.emission[1], 0.0f); ss << L',';
+            WriteFloatValue(ss, pbr.emission[2], 0.0f); ss << L']';
+            ss << L",\"emI\":";
+            WriteFloatValue(ss, pbr.emIntensity, 0.0f);
         }
         if (pbr.lightmapIntensity > 0) {
-            ss << L",\"lmI\":" << pbr.lightmapIntensity;
+            ss << L",\"lmI\":";
+            WriteFloatValue(ss, pbr.lightmapIntensity, 1.0f);
             ss << L",\"lmCh\":" << pbr.lightmapChannel;
         }
         WriteMaterialTextures(ss, pbr);
@@ -985,10 +1016,20 @@ public:
         CameraData cam = {};
         GetViewportCamera(cam);
         ss << L"\"camera\":{";
-        ss << L"\"pos\":[" << cam.pos[0] << L',' << cam.pos[1] << L',' << cam.pos[2] << L']';
-        ss << L",\"tgt\":[" << cam.target[0] << L',' << cam.target[1] << L',' << cam.target[2] << L']';
-        ss << L",\"up\":[" << cam.up[0] << L',' << cam.up[1] << L',' << cam.up[2] << L']';
-        ss << L",\"fov\":" << cam.fov;
+        ss << L"\"pos\":[";
+        WriteFloatValue(ss, cam.pos[0]); ss << L',';
+        WriteFloatValue(ss, cam.pos[1]); ss << L',';
+        WriteFloatValue(ss, cam.pos[2]); ss << L']';
+        ss << L",\"tgt\":[";
+        WriteFloatValue(ss, cam.target[0]); ss << L',';
+        WriteFloatValue(ss, cam.target[1]); ss << L',';
+        WriteFloatValue(ss, cam.target[2]); ss << L']';
+        ss << L",\"up\":[";
+        WriteFloatValue(ss, cam.up[0], 0.0f); ss << L',';
+        WriteFloatValue(ss, cam.up[1], 0.0f); ss << L',';
+        WriteFloatValue(ss, cam.up[2], 1.0f); ss << L']';
+        ss << L",\"fov\":";
+        WriteFloatValue(ss, cam.fov, 60.0f);
         ss << L",\"persp\":" << (cam.perspective ? L"true" : L"false");
         ss << L'}';
     }
@@ -1005,6 +1046,7 @@ public:
         geomHandles_.clear();
 
         std::wostringstream ss;
+        ss.imbue(std::locale::classic());
         ss << L"{\"type\":\"scene\",\"nodes\":[";
         bool first = true;
         WriteSceneNodes(root, t, ss, first);
@@ -1018,16 +1060,22 @@ public:
         GetEnvironment(envData);
         std::wstring hdriUrl = MapTexturePath(envData.hdriPath);
         ss << L",\"env\":{";
-        if (!hdriUrl.empty())
+        if (!hdriUrl.empty()) {
             ss << L"\"hdri\":\"" << EscapeJson(hdriUrl.c_str()) << L'"';
-        ss << L",\"rot\":" << envData.rotation;
-        ss << L",\"exp\":" << envData.exposure;
-        ss << L",\"gamma\":" << envData.gamma;
+            ss << L',';
+        }
+        ss << L"\"rot\":";
+        WriteFloatValue(ss, envData.rotation, 0.0f);
+        ss << L",\"exp\":";
+        WriteFloatValue(ss, envData.exposure, 0.0f);
+        ss << L",\"gamma\":";
+        WriteFloatValue(ss, envData.gamma, 1.0f);
         ss << L",\"zup\":" << envData.zup;
         ss << L",\"flip\":" << envData.flip;
         ss << L'}';
 
         ss << L'}';
+
         webview_->PostWebMessageAsJson(ss.str().c_str());
     }
 
@@ -1174,6 +1222,7 @@ public:
 
         // Build metadata JSON + copy geometry into buffer
         std::wostringstream ss;
+        ss.imbue(std::locale::classic());
         ss << L"{\"type\":\"scene_bin\",\"nodes\":[";
         bool first = true;
 
@@ -1238,10 +1287,16 @@ public:
         EnvData envData; GetEnvironment(envData);
         std::wstring hdriUrl = MapTexturePath(envData.hdriPath);
         ss << L",\"env\":{";
-        if (!hdriUrl.empty()) ss << L"\"hdri\":\"" << EscapeJson(hdriUrl.c_str()) << L'"';
-        ss << L",\"rot\":" << envData.rotation;
-        ss << L",\"exp\":" << envData.exposure;
-        ss << L",\"gamma\":" << envData.gamma;
+        if (!hdriUrl.empty()) {
+            ss << L"\"hdri\":\"" << EscapeJson(hdriUrl.c_str()) << L'"';
+            ss << L',';
+        }
+        ss << L"\"rot\":";
+        WriteFloatValue(ss, envData.rotation, 0.0f);
+        ss << L",\"exp\":";
+        WriteFloatValue(ss, envData.exposure, 0.0f);
+        ss << L",\"gamma\":";
+        WriteFloatValue(ss, envData.gamma, 1.0f);
         ss << L",\"zup\":" << envData.zup;
         ss << L",\"flip\":" << envData.flip;
         ss << L'}';
@@ -1261,6 +1316,7 @@ public:
         TimeValue t = ip->GetTime();
 
         std::wostringstream ss;
+        ss.imbue(std::locale::classic());
         ss << L"{\"type\":\"xform\",\"nodes\":[";
         bool first = true;
         for (auto it = geomHandles_.begin(); it != geomHandles_.end(); ) {
@@ -1305,10 +1361,18 @@ public:
             // corrupting material arrays on the web side.
             Mtl* multiMtl = FindMultiSubMtl(node->GetMtl());
             if (!(multiMtl && multiMtl->NumSubMtls() > 1)) {
-                ss << L",\"mat\":{\"color\":[" << col[0] << L',' << col[1] << L',' << col[2] << L']';
-                ss << L",\"rough\":" << rough;
-                ss << L",\"metal\":" << metal;
-                if (opac < 0.999f) ss << L",\"opacity\":" << opac;
+                ss << L",\"mat\":{\"color\":[";
+                WriteFloatValue(ss, col[0], 0.8f); ss << L',';
+                WriteFloatValue(ss, col[1], 0.8f); ss << L',';
+                WriteFloatValue(ss, col[2], 0.8f); ss << L']';
+                ss << L",\"rough\":";
+                WriteFloatValue(ss, rough, 0.5f);
+                ss << L",\"metal\":";
+                WriteFloatValue(ss, metal, 0.0f);
+                if (opac < 0.999f) {
+                    ss << L",\"opacity\":";
+                    WriteFloatValue(ss, opac, 1.0f);
+                }
                 ss << L"}";
             }
             ss << L"}";

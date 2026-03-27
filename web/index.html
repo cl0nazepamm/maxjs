@@ -189,10 +189,75 @@
             dispatch(msg) { (this.handlers[msg.type] || []).forEach(fn => fn(msg)); }
         };
 
+        let hasInitialSync = false;
+        let readyRetryTimer = 0;
+        let transportMode = 'waiting';
+
+        function setInfoText(text) {
+            document.getElementById('info').textContent = text;
+        }
+
+        function setTransportMode(mode) {
+            transportMode = mode;
+            if (hasInitialSync) updateInfo();
+        }
+
+        function scheduleReadyRetry() {
+            if (!window.chrome?.webview || readyRetryTimer) return;
+            readyRetryTimer = setInterval(() => {
+                if (hasInitialSync) {
+                    clearInterval(readyRetryTimer);
+                    readyRetryTimer = 0;
+                    return;
+                }
+                bridge.send('ready');
+            }, 1000);
+        }
+
+        function stopReadyRetry() {
+            if (!readyRetryTimer) return;
+            clearInterval(readyRetryTimer);
+            readyRetryTimer = 0;
+        }
+
+        function markInitialSync() {
+            if (hasInitialSync) return;
+            hasInitialSync = true;
+            stopReadyRetry();
+        }
+
+        function startBridgeHandshake() {
+            if (!window.chrome?.webview) return;
+            setInfoText('MaxJS - connected, waiting for sync...');
+            bridge.send('ready');
+            scheduleReadyRetry();
+        }
+
+        function reportBridgeError(prefix, err) {
+            const message = err?.message || String(err);
+            console.error(`[MaxJS ${prefix}]`, err);
+            setInfoText(`MaxJS - ${prefix}: ${message}`);
+        }
+
+        bridge.on('debug', msg => {
+            if (!hasInitialSync) {
+                setInfoText('MaxJS - ' + (msg.msg || 'debug'));
+            } else {
+                console.log('[MaxJS debug]', msg.msg || 'debug');
+            }
+        });
+
+        window.addEventListener('error', e => {
+            reportBridgeError('runtime error', e.error || e.message);
+        });
+        window.addEventListener('unhandledrejection', e => {
+            reportBridgeError('promise error', e.reason);
+        });
+
         if (window.chrome?.webview) {
             window.chrome.webview.addEventListener('message', e => {
                 try { bridge.dispatch(e.data); }
-                catch (err) { console.error('[MaxJS]', err); }
+                catch (err) { reportBridgeError('message error', err); }
             });
 
             // Binary shared buffer handler (zero-copy geometry)
@@ -203,21 +268,19 @@
                     const meta = typeof e.additionalData === 'string'
                         ? JSON.parse(e.additionalData) : e.additionalData;
                     handleBinaryScene(buf, meta);
-                } catch (err) { console.error('[MaxJS binary]', err); }
+                } catch (err) { reportBridgeError('binary sync error', err); }
                 finally {
                     if (buf) chrome.webview.releaseBuffer(buf);
                 }
             });
-
-            bridge.send('ready');
-            document.getElementById('info').textContent = 'MaxJS — connected, waiting for sync...';
         } else {
-            document.getElementById('info').textContent = 'MaxJS — no bridge (standalone mode)';
+            setInfoText('MaxJS - no bridge (standalone mode)');
         }
         window.maxJS = bridge;
 
         // ── Scene Sync ──────────────────────────────────────
         bridge.on('scene', msg => {
+            setTransportMode('json');
             const incoming = new Set(msg.nodes.map(n => n.h));
 
             // Clear material cache so changes are picked up
@@ -260,9 +323,13 @@
                     mesh = new THREE.Mesh(geom, mat);
                     mesh.matrixAutoUpdate = false;
                     mesh.name = nd.n;
+                    mesh.frustumCulled = false;
                     scene.add(mesh);
                     nodeMap.set(nd.h, mesh);
                 }
+
+                mesh.visible = true;
+                mesh.frustumCulled = false;
 
                 applyTransform(mesh, nd.t);
                 applySelection(mesh, nd.s);
@@ -270,11 +337,13 @@
 
             if (msg.camera) applyCamera(msg.camera);
             if (msg.env?.hdri) loadHDRI(msg.env);
+            scene.updateMatrixWorld(true);
 
             if (firstSync && msg.nodes.length > 0) {
                 firstSync = false;
                 if (!camLock) fitCamera();
             }
+            markInitialSync();
             updateInfo();
         });
 
@@ -313,6 +382,7 @@
         // ── Binary Scene Handler (SharedBuffer) ──────────────
         function handleBinaryScene(buffer, meta) {
             if (meta.type !== 'scene_bin') return;
+            setTransportMode('binary');
             const incoming = new Set(meta.nodes.map(n => n.h));
             materialCache.clear();
 
@@ -401,9 +471,13 @@
                     mesh = new THREE.Mesh(geom, mat);
                     mesh.matrixAutoUpdate = false;
                     mesh.name = nd.n;
+                    mesh.frustumCulled = false;
                     scene.add(mesh);
                     nodeMap.set(nd.h, mesh);
                 }
+
+                mesh.visible = true;
+                mesh.frustumCulled = false;
 
                 applyTransform(mesh, nd.t);
                 applySelection(mesh, nd.s);
@@ -411,11 +485,13 @@
 
             if (meta.camera) applyCamera(meta.camera);
             if (meta.env?.hdri) loadHDRI(meta.env);
+            scene.updateMatrixWorld(true);
 
             if (firstSync && meta.nodes.length > 0) {
                 firstSync = false;
                 if (!camLock) fitCamera();
             }
+            markInitialSync();
             updateInfo();
         }
 
@@ -426,12 +502,28 @@
             if (indices?.length) geom.setIndex(indices);
             if (uvs?.length) geom.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
             geom.computeVertexNormals();
+            geom.computeBoundingBox();
+            geom.computeBoundingSphere();
             return geom;
         }
 
+        function isFiniteArray(values, expectedLength) {
+            return Array.isArray(values) &&
+                values.length === expectedLength &&
+                values.every(Number.isFinite);
+        }
+
         function applyTransform(mesh, t) {
+            if (!isFiniteArray(t, 16)) {
+                mesh.matrix.identity();
+                mesh.position.set(0, 0, 0);
+                mesh.quaternion.identity();
+                mesh.scale.set(1, 1, 1);
+                return false;
+            }
             mesh.matrix.fromArray(t);
             mesh.matrixWorldNeedsUpdate = true;
+            return true;
         }
 
         let selHighlight = true;
@@ -447,11 +539,14 @@
         // ── Camera Sync (Z-up, raw from Max) ────────────────
         function applyCamera(cam) {
             if (!camLock) return;
+            if (!isFiniteArray(cam?.pos, 3) || !isFiniteArray(cam?.tgt, 3) || !isFiniteArray(cam?.up, 3)) {
+                return;
+            }
             camera.position.set(cam.pos[0], cam.pos[1], cam.pos[2]);
             camera.up.set(cam.up[0], cam.up[1], cam.up[2]);
             camera.lookAt(cam.tgt[0], cam.tgt[1], cam.tgt[2]);
 
-            if (cam.persp && cam.fov > 0 && cam.fov < 170) {
+            if (Number.isFinite(cam.fov) && cam.persp && cam.fov > 0 && cam.fov < 170) {
                 const aspect = innerWidth / innerHeight;
                 const hRad = cam.fov * Math.PI / 180;
                 camera.fov = 2 * Math.atan(Math.tan(hRad / 2) / aspect) * 180 / Math.PI;
@@ -461,6 +556,7 @@
         }
 
         function fitCamera() {
+            scene.updateMatrixWorld(true);
             const box = new THREE.Box3();
             for (const [, mesh] of nodeMap) box.expandByObject(mesh);
             if (box.isEmpty()) return;
@@ -483,7 +579,7 @@
             const n = nodeMap.size;
             const t = textureCache.size;
             document.getElementById('info').textContent =
-                `MaxJS \u2014 ${n} object${n !== 1 ? 's' : ''}${t ? `, ${t} tex` : ''}`;
+                `MaxJS \u2014 ${n} object${n !== 1 ? 's' : ''}${t ? `, ${t} tex` : ''} [${transportMode}]`;
         }
 
         // ── UI Controls ─────────────────────────────────────
@@ -496,7 +592,9 @@
             materialCache.clear();
             textureCache.clear();
             firstSync = true;
-            bridge.send('ready');
+            hasInitialSync = false;
+            transportMode = 'waiting';
+            startBridgeHandshake();
         };
 
         const btnCam = document.getElementById('btnCamLock');
@@ -542,6 +640,8 @@
             controls.update();
             renderer.render(scene, camera);
         })();
+
+        startBridgeHandshake();
     </script>
 </body>
 </html>

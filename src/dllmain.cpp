@@ -18,6 +18,7 @@
 #include <wincodec.h>
 #include <string>
 #include <vector>
+#include <array>
 #include <sstream>
 #include <unordered_set>
 #include <unordered_map>
@@ -35,7 +36,7 @@ using namespace Microsoft::WRL;
 #define MAXJS_CATEGORY  _T("MaxJS")
 
 #define SYNC_TIMER_ID     1
-#define SYNC_INTERVAL_MS  33   // ~30fps for camera
+#define SYNC_INTERVAL_MS  33   // background structural/material timer
 #define WM_TOGGLE_PANEL   (WM_USER + 1)
 #define WM_FAST_FLUSH     (WM_USER + 2)
 #define SETUP_TIMER_ID    2
@@ -532,6 +533,13 @@ static void GetTransform16(INode* node, TimeValue t, float out[16]) {
     out[12]=tr.x; out[13]=tr.y; out[14]=tr.z; out[15]=1;
 }
 
+static bool TransformEquals16(const float* a, const float* b, float epsilon = 1.0e-4f) {
+    for (int i = 0; i < 16; ++i) {
+        if (std::fabs(a[i] - b[i]) > epsilon) return false;
+    }
+    return true;
+}
+
 // ══════════════════════════════════════════════════════════════
 //  Viewport Camera Extraction
 // ══════════════════════════════════════════════════════════════
@@ -719,6 +727,7 @@ public:
     size_t geoScanCursor_ = 0;
     std::unordered_set<ULONG> geomHandles_;
     std::unordered_set<ULONG> fastDirtyHandles_;
+    std::unordered_map<ULONG, std::array<float, 16>> lastSentTransforms_;
     std::unordered_map<ULONG, uintptr_t> mtlHashMap_;  // node handle → material state hash
     std::unordered_map<ULONG, uint64_t> geoHashMap_;   // node handle → geometry topology hash
     std::map<std::wstring, std::wstring> texDirMap_;    // dir → host
@@ -887,6 +896,12 @@ public:
         haveLastSentCamera_ = true;
     }
 
+    void RememberSentTransform(ULONG handle, const float* xform) {
+        std::array<float, 16> cached = {};
+        std::copy(xform, xform + 16, cached.begin());
+        lastSentTransforms_[handle] = cached;
+    }
+
     void ResetFastPathState(bool refreshCameraState = false) {
         fastDirtyHandles_.clear();
         fastCameraDirty_ = false;
@@ -907,6 +922,35 @@ public:
         for (int i = 0; i < nodes.Count(); ++i) {
             MarkTrackedNodeDirty(NodeEventNamespace::GetNodeByKey(nodes[i]));
         }
+    }
+
+    void MarkSelectedTransformsDirty() {
+        Interface* ip = GetCOREInterface();
+        if (!ip) return;
+
+        const int selCount = ip->GetSelNodeCount();
+        if (selCount <= 0) return;
+
+        TimeValue t = ip->GetTime();
+        bool changed = false;
+        for (int i = 0; i < selCount; ++i) {
+            INode* node = ip->GetSelNode(i);
+            if (!node) continue;
+
+            const ULONG handle = node->GetHandle();
+            if (!IsTrackedHandle(handle)) continue;
+
+            float xform[16];
+            GetTransform16(node, t, xform);
+
+            auto it = lastSentTransforms_.find(handle);
+            if (it == lastSentTransforms_.end() || !TransformEquals16(xform, it->second.data())) {
+                fastDirtyHandles_.insert(handle);
+                changed = true;
+            }
+        }
+
+        if (changed) QueueFastFlush();
     }
 
     void MarkVisibilityNodesDirty(const NodeEventNamespace::NodeKeyTab& nodes) {
@@ -999,6 +1043,7 @@ public:
             jsReady_ = true; dirty_ = true;
             mtlHashMap_.clear();
             geoHashMap_.clear();  // force all geometry to be sent
+            lastSentTransforms_.clear();
             geoScanCursor_ = 0;
             ResetFastPathState(false);
         }
@@ -1067,12 +1112,14 @@ public:
                 mtlHashMap_.erase(handle);
                 geoHashMap_.erase(handle);
                 geomHandles_.erase(handle);
+                lastSentTransforms_.erase(handle);
                 dirty_ = true;
                 continue;
             }
 
             float xform[16];
             GetTransform16(node, t, xform);
+            RememberSentTransform(handle, xform);
             frame.UpdateTransform(static_cast<std::uint32_t>(handle), xform);
             frame.UpdateSelection(static_cast<std::uint32_t>(handle), node->Selected() != 0);
             frame.UpdateVisibility(static_cast<std::uint32_t>(handle), !node->IsNodeHidden(TRUE));
@@ -1415,6 +1462,7 @@ public:
         const std::uint32_t frameId = AllocateFrameId();
 
         geomHandles_.clear();
+        lastSentTransforms_.clear();
 
         std::wostringstream ss;
         ss.imbue(std::locale::classic());
@@ -1468,6 +1516,7 @@ public:
                 ss << L",\"n\":\"" << EscapeJson(node->GetName()) << L'"';
                 ss << L",\"s\":" << (node->Selected() ? L'1' : L'0');
                 ss << L",\"t\":"; WriteFloats(ss, xform, 16);
+                RememberSentTransform(node->GetHandle(), xform);
                 ss << L",\"v\":"; WriteFloats(ss, verts.data(), verts.size());
                 ss << L",\"i\":"; WriteInts(ss, indices.data(), indices.size());
                 if (!uvs.empty()) {
@@ -1528,6 +1577,7 @@ public:
         if (!wv17 || !env12) { SendFullSync(); return; }
 
         geomHandles_.clear();
+        lastSentTransforms_.clear();
 
         // Collect all geometry nodes
         struct NodeGeo {
@@ -1603,6 +1653,7 @@ public:
 
         for (auto& ng : geos) {
             float xform[16]; GetTransform16(ng.node, t, xform);
+            RememberSentTransform(ng.handle, xform);
             MaxJSPBR pbr; ExtractPBR(ng.node, t, pbr);
 
             if (!first) ss << L',';
@@ -1702,10 +1753,12 @@ public:
             if (!node) {
                 mtlHashMap_.erase(handle);
                 geoHashMap_.erase(handle);
+                lastSentTransforms_.erase(handle);
                 it = geomHandles_.erase(it);
                 continue;
             }
             float xform[16]; GetTransform16(node, t, xform);
+            RememberSentTransform(handle, xform);
 
             // Lightweight material scalars (no texture walks)
             float col[3] = {0.8f,0.8f,0.8f};
@@ -1958,7 +2011,9 @@ void MaxJSFastNodeEventCallback::HideChanged(NodeKeyTab& nodes) {
 }
 
 void MaxJSFastRedrawCallback::proc(Interface*) {
-    if (owner_) owner_->MarkCameraDirtyIfChanged();
+    if (!owner_) return;
+    owner_->MarkSelectedTransformsDirty();
+    owner_->MarkCameraDirtyIfChanged();
 }
 
 void MaxJSFastTimeChangeCallback::TimeChanged(TimeValue) {
@@ -1990,6 +2045,7 @@ void TogglePanel() {
             g_panel->dirty_ = true;
             g_panel->mtlHashMap_.clear();
             g_panel->geoHashMap_.clear();
+            g_panel->lastSentTransforms_.clear();
             g_panel->ResetFastPathState(false);
             // Clear virtual host cache by re-mapping, then navigate fresh
             ComPtr<ICoreWebView2_3> wv3;

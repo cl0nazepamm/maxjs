@@ -31,7 +31,7 @@ if(NOT EXISTS "${WEBVIEW2_DIR}/include/WebView2.h")
 endif()
 
 # ── Sources ──────────────────────────────────────────────────────
-file(GLOB_RECURSE SOURCES "src/*.cpp" "src/*.rc")
+file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS "src/*.cpp" "src/*.rc")
 add_library(${PLUGIN_NAME} SHARED ${SOURCES})
 
 # ── Output as plugin extension ───────────────────────────────────

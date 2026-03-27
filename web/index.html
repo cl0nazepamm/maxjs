@@ -50,6 +50,8 @@
         import * as THREE from 'three';
         import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
         import { RGBELoader } from 'three/addons/loaders/RGBELoader.js';
+        import { applyDeltaFrame } from './js/protocol.js';
+        import { createPerfHud } from './js/perf_hud.js';
 
         // ── Scene Setup (Z-up, matching Max) ────────────────
         const scene = new THREE.Scene();
@@ -92,6 +94,7 @@
         const textureCache = new Map();
         const materialCache = new Map();
         const nodeMap = new Map();
+        const perfHud = createPerfHud(document.getElementById('info'));
 
         let firstSync = true;
         let camLock = false;
@@ -194,12 +197,23 @@
         let transportMode = 'waiting';
 
         function setInfoText(text) {
-            document.getElementById('info').textContent = text;
+            perfHud.setStatus(text);
         }
 
         function setTransportMode(mode) {
             transportMode = mode;
-            if (hasInitialSync) updateInfo();
+        }
+
+        function updateSyncHud(partial = {}) {
+            perfHud.updateSync({
+                transport: partial.transport ?? transportMode,
+                frameId: partial.frameId ?? 0,
+                producerBytes: partial.producerBytes ?? 0,
+                decodeMs: partial.decodeMs ?? 0,
+                applyMs: partial.applyMs ?? 0,
+                nodeCount: nodeMap.size,
+                textureCount: textureCache.size,
+            });
         }
 
         function scheduleReadyRetry() {
@@ -267,7 +281,11 @@
                     buf = e.getBuffer();
                     const meta = typeof e.additionalData === 'string'
                         ? JSON.parse(e.additionalData) : e.additionalData;
-                    handleBinaryScene(buf, meta);
+                    if (meta?.type === 'delta_bin') {
+                        handleBinaryDelta(buf, meta);
+                    } else {
+                        handleBinaryScene(buf, meta);
+                    }
                 } catch (err) { reportBridgeError('binary sync error', err); }
                 finally {
                     if (buf) chrome.webview.releaseBuffer(buf);
@@ -281,6 +299,7 @@
         // ── Scene Sync ──────────────────────────────────────
         bridge.on('scene', msg => {
             setTransportMode('json');
+            const applyStart = performance.now();
             const incoming = new Set(msg.nodes.map(n => n.h));
 
             // Clear material cache so changes are picked up
@@ -343,46 +362,58 @@
                 firstSync = false;
                 if (!camLock) fitCamera();
             }
+            const applyMs = performance.now() - applyStart;
             markInitialSync();
-            updateInfo();
+            updateSyncHud({
+                transport: 'json',
+                frameId: msg.frame ?? 0,
+                producerBytes: msg.stats?.producerBytes ?? 0,
+                decodeMs: 0,
+                applyMs,
+            });
         });
 
         // ── Camera-only sync (30fps) ─────────────────────────
         bridge.on('cam', msg => {
             if (msg.camera) applyCamera(msg.camera);
+            if (msg.frame || msg.stats) {
+                updateSyncHud({
+                    transport: 'json',
+                    frameId: msg.frame ?? 0,
+                    producerBytes: msg.stats?.producerBytes ?? 0,
+                    decodeMs: 0,
+                    applyMs: 0,
+                });
+            }
         });
 
         // ── Transform Sync (+ material scalars, ~6fps) ──────
         bridge.on('xform', msg => {
+            const applyStart = performance.now();
             for (const nd of msg.nodes) {
                 const mesh = nodeMap.get(nd.h);
                 if (!mesh) continue;
                 applyTransform(mesh, nd.t);
                 applySelection(mesh, nd.s);
                 // Live material update from scalars
-                if (nd.mat && mesh.material) {
-                    const c = nd.mat.color;
-                    const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
-                    for (const m of mats) {
-                        if (!m) continue;
-                        if (c && m.color) m.color.setRGB(c[0], c[1], c[2]);
-                        if (nd.mat.rough != null && 'roughness' in m) m.roughness = nd.mat.rough;
-                        if (nd.mat.metal != null && 'metalness' in m) m.metalness = nd.mat.metal;
-                        if (nd.mat.opacity != null) {
-                            m.opacity = nd.mat.opacity;
-                            m.transparent = nd.mat.opacity < 0.999;
-                        }
-                        m.needsUpdate = true;
-                    }
-                }
+                if (nd.mat && mesh.material) applyMaterialScalar(mesh, nd.mat);
             }
             if (msg.camera) applyCamera(msg.camera);
+            const applyMs = performance.now() - applyStart;
+            updateSyncHud({
+                transport: 'json',
+                frameId: msg.frame ?? 0,
+                producerBytes: msg.stats?.producerBytes ?? 0,
+                decodeMs: 0,
+                applyMs,
+            });
         });
 
         // ── Binary Scene Handler (SharedBuffer) ──────────────
         function handleBinaryScene(buffer, meta) {
             if (meta.type !== 'scene_bin') return;
-            setTransportMode('binary');
+            setTransportMode('binary-scene');
+            const applyStart = performance.now();
             const incoming = new Set(meta.nodes.map(n => n.h));
             materialCache.clear();
 
@@ -491,8 +522,49 @@
                 firstSync = false;
                 if (!camLock) fitCamera();
             }
+            const applyMs = performance.now() - applyStart;
             markInitialSync();
-            updateInfo();
+            updateSyncHud({
+                transport: 'binary-scene',
+                frameId: meta.frame ?? 0,
+                producerBytes: meta.stats?.producerBytes ?? buffer.byteLength,
+                decodeMs: 0,
+                applyMs,
+            });
+        }
+
+        function handleBinaryDelta(buffer, meta) {
+            const result = applyDeltaFrame(buffer, {
+                onTransform(nodeHandle, matrix) {
+                    const mesh = nodeMap.get(nodeHandle);
+                    if (mesh) applyTransform(mesh, matrix);
+                },
+                onMaterialScalar(nodeHandle, material) {
+                    const mesh = nodeMap.get(nodeHandle);
+                    if (mesh) applyMaterialScalar(mesh, material);
+                },
+                onSelection(nodeHandle, selected) {
+                    const mesh = nodeMap.get(nodeHandle);
+                    if (mesh) applySelection(mesh, selected);
+                },
+                onVisibility(nodeHandle, visible) {
+                    const mesh = nodeMap.get(nodeHandle);
+                    if (mesh) mesh.visible = visible;
+                },
+                onCamera(cameraState) {
+                    applyCamera(cameraState);
+                },
+            });
+            scene.updateMatrixWorld(true);
+            markInitialSync();
+            setTransportMode('binary-delta');
+            updateSyncHud({
+                transport: 'binary-delta',
+                frameId: meta.frame ?? result.frameId,
+                producerBytes: meta.stats?.producerBytes ?? result.bytes,
+                decodeMs: result.decodeMs,
+                applyMs: result.applyMs,
+            });
         }
 
         // ── Geometry Builder ────────────────────────────────
@@ -508,9 +580,12 @@
         }
 
         function isFiniteArray(values, expectedLength) {
-            return Array.isArray(values) &&
-                values.length === expectedLength &&
-                values.every(Number.isFinite);
+            const isArrayLike = Array.isArray(values) || ArrayBuffer.isView(values);
+            if (!isArrayLike || values.length !== expectedLength) return false;
+            for (let i = 0; i < values.length; i++) {
+                if (!Number.isFinite(values[i])) return false;
+            }
+            return true;
         }
 
         function applyTransform(mesh, t) {
@@ -533,6 +608,22 @@
             const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
             for (const m of mats) {
                 if (m?.emissive) m.emissive.setHex(selected ? 0x1a1a44 : 0x000000);
+            }
+        }
+
+        function applyMaterialScalar(mesh, material) {
+            const c = material?.color;
+            const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+            for (const m of mats) {
+                if (!m) continue;
+                if (c && m.color) m.color.setRGB(c[0], c[1], c[2]);
+                if (material?.rough != null && 'roughness' in m) m.roughness = material.rough;
+                if (material?.metal != null && 'metalness' in m) m.metalness = material.metal;
+                if (material?.opacity != null) {
+                    m.opacity = material.opacity;
+                    m.transparent = material.opacity < 0.999;
+                }
+                m.needsUpdate = true;
             }
         }
 
@@ -573,13 +664,6 @@
             camera.far = maxDim * 100;
             camera.updateProjectionMatrix();
             controls.update();
-        }
-
-        function updateInfo() {
-            const n = nodeMap.size;
-            const t = textureCache.size;
-            document.getElementById('info').textContent =
-                `MaxJS \u2014 ${n} object${n !== 1 ? 's' : ''}${t ? `, ${t} tex` : ''} [${transportMode}]`;
         }
 
         // ── UI Controls ─────────────────────────────────────
@@ -638,7 +722,9 @@
         (function animate() {
             requestAnimationFrame(animate);
             controls.update();
+            const renderStart = performance.now();
             renderer.render(scene, camera);
+            perfHud.updateRender(performance.now() - renderStart, renderer.info.render);
         })();
 
         startBridgeHandshake();

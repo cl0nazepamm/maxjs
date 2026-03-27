@@ -7,6 +7,7 @@
 #include <notify.h>
 #include <stdmat.h>
 #include <maxscript/maxscript.h>
+#include "sync_protocol.h"
 #include "threejs_material.h"
 #include "threejs_renderer.h"
 
@@ -663,6 +664,7 @@ public:
     bool jsReady_ = false;
     bool dirty_ = true;
     bool useBinary_ = false;
+    std::uint32_t nextFrameId_ = 1;
     int tickCount_ = 0;
     size_t geoScanCursor_ = 0;
     std::unordered_set<ULONG> geomHandles_;
@@ -847,24 +849,134 @@ public:
         if (dirty_) {
             dirty_ = false;
             if (useBinary_) SendFullSyncBinary(); else SendFullSync();
+        } else if (useBinary_) {
+            // Every tick: transforms/selection/visibility + camera.
+            // Material scalars stay throttled to keep the fast path light.
+            SendBinaryDeltaSync((tickCount_ % 5) == 0);
+            if (tickCount_ % 50 == 0) DetectMaterialChanges();
+            if (tickCount_ % 15 == 0) DetectGeometryChanges();
         } else if (tickCount_ % 5 == 0) {
-            // Every ~165ms: full xform + material scalars
+            // JSON fallback remains throttled because it is materially heavier.
             SendTransformSync();
             if (tickCount_ % 50 == 0) DetectMaterialChanges();
             if (tickCount_ % 15 == 0) DetectGeometryChanges();
         } else {
-            // Every ~33ms: camera only (smooth tracking)
             SendCameraSync();
         }
     }
 
     void SendCameraSync() {
+        const std::uint32_t frameId = AllocateFrameId();
         std::wostringstream ss;
         ss.imbue(std::locale::classic());
-        ss << L"{\"type\":\"cam\",";
+        ss << L"{\"type\":\"cam\",\"frame\":" << frameId << L",";
         WriteCameraJson(ss);
         ss << L'}';
         webview_->PostWebMessageAsJson(ss.str().c_str());
+    }
+
+    void SendBinaryDeltaSync(bool includeMaterialScalars) {
+        if (!webview_ || !env_) return;
+
+        ComPtr<ICoreWebView2_17> wv17;
+        ComPtr<ICoreWebView2Environment12> env12;
+        webview_->QueryInterface(IID_PPV_ARGS(&wv17));
+        env_->QueryInterface(IID_PPV_ARGS(&env12));
+        if (!wv17 || !env12) {
+            if (geomHandles_.empty()) SendCameraSync();
+            else SendTransformSync();
+            return;
+        }
+
+        Interface* ip = GetCOREInterface();
+        if (!ip) return;
+
+        TimeValue t = ip->GetTime();
+        const std::uint32_t frameId = AllocateFrameId();
+        maxjs::sync::DeltaFrameBuilder frame(frameId);
+        frame.BeginFrame();
+
+        for (auto it = geomHandles_.begin(); it != geomHandles_.end(); ) {
+            ULONG handle = *it;
+            INode* node = ip->GetINodeByHandle(handle);
+            if (!node) {
+                mtlHashMap_.erase(handle);
+                geoHashMap_.erase(handle);
+                it = geomHandles_.erase(it);
+                continue;
+            }
+
+            float xform[16];
+            GetTransform16(node, t, xform);
+            frame.UpdateTransform(static_cast<std::uint32_t>(handle), xform);
+            frame.UpdateSelection(static_cast<std::uint32_t>(handle), node->Selected() != 0);
+            frame.UpdateVisibility(static_cast<std::uint32_t>(handle), !node->IsNodeHidden(TRUE));
+
+            if (includeMaterialScalars) {
+                float col[3] = {0.8f, 0.8f, 0.8f};
+                float rough = 0.5f;
+                float metal = 0.0f;
+                float opac = 1.0f;
+
+                Mtl* foundMtl = FindSupportedMaterial(node->GetMtl());
+                if (foundMtl && foundMtl->ClassID() == THREEJS_MTL_CLASS_ID) {
+                    IParamBlock2* pb = foundMtl->GetParamBlockByID(threejs_params);
+                    if (pb) {
+                        Color c = pb->GetColor(pb_color, t);
+                        col[0] = c.r; col[1] = c.g; col[2] = c.b;
+                        rough = pb->GetFloat(pb_roughness, t);
+                        metal = pb->GetFloat(pb_metalness, t);
+                        opac = pb->GetFloat(pb_opacity, t);
+                    }
+                } else if (foundMtl && foundMtl->ClassID() == GLTF_MTL_CLASS_ID) {
+                    MaxJSPBR tmp;
+                    ExtractGltfMtl(foundMtl, t, tmp);
+                    col[0] = tmp.color[0]; col[1] = tmp.color[1]; col[2] = tmp.color[2];
+                    rough = tmp.roughness; metal = tmp.metalness; opac = tmp.opacity;
+                } else {
+                    GetWireColor3f(node, col);
+                }
+
+                Mtl* multiMtl = FindMultiSubMtl(node->GetMtl());
+                if (!(multiMtl && multiMtl->NumSubMtls() > 1)) {
+                    frame.UpdateMaterialScalar(static_cast<std::uint32_t>(handle), col, rough, metal, opac);
+                }
+            }
+
+            ++it;
+        }
+
+        CameraData cam = {};
+        GetViewportCamera(cam);
+        frame.UpdateCamera(cam.pos, cam.target, cam.up, cam.fov, cam.perspective);
+        frame.EndFrame();
+
+        const auto& frameBytes = frame.bytes();
+        const size_t totalBytes = frameBytes.empty() ? 4 : frameBytes.size();
+
+        ComPtr<ICoreWebView2SharedBuffer> sharedBuf;
+        HRESULT hr = env12->CreateSharedBuffer(totalBytes, &sharedBuf);
+        if (FAILED(hr) || !sharedBuf) {
+            if (geomHandles_.empty()) SendCameraSync();
+            else SendTransformSync();
+            return;
+        }
+
+        BYTE* bufPtr = nullptr;
+        sharedBuf->get_Buffer(&bufPtr);
+        if (bufPtr && !frameBytes.empty()) {
+            memcpy(bufPtr, frameBytes.data(), frameBytes.size());
+        }
+
+        std::wostringstream meta;
+        meta.imbue(std::locale::classic());
+        meta << L"{\"type\":\"delta_bin\",\"frame\":" << frameId;
+        meta << L",\"stats\":{\"producerBytes\":" << frameBytes.size();
+        meta << L",\"commandCount\":" << frame.command_count() << L"}}";
+
+        wv17->PostSharedBufferToScript(sharedBuf.Get(),
+            COREWEBVIEW2_SHARED_BUFFER_ACCESS_READ_ONLY,
+            meta.str().c_str());
     }
 
     // Check if any material's texmap pointers changed — triggers full sync on NEXT tick
@@ -1034,6 +1146,10 @@ public:
         ss << L'}';
     }
 
+    std::uint32_t AllocateFrameId() {
+        return nextFrameId_++;
+    }
+
     // ── Full scene sync ──────────────────────────────────────
 
     void SendFullSync() {
@@ -1042,12 +1158,13 @@ public:
         TimeValue t = ip->GetTime();
         INode* root = ip->GetRootNode();
         if (!root) return;
+        const std::uint32_t frameId = AllocateFrameId();
 
         geomHandles_.clear();
 
         std::wostringstream ss;
         ss.imbue(std::locale::classic());
-        ss << L"{\"type\":\"scene\",\"nodes\":[";
+        ss << L"{\"type\":\"scene\",\"frame\":" << frameId << L",\"nodes\":[";
         bool first = true;
         WriteSceneNodes(root, t, ss, first);
         ss << L"],";
@@ -1147,6 +1264,7 @@ public:
         TimeValue t = ip->GetTime();
         INode* root = ip->GetRootNode();
         if (!root) return;
+        const std::uint32_t frameId = AllocateFrameId();
 
         ComPtr<ICoreWebView2_17> wv17;
         ComPtr<ICoreWebView2Environment12> env12;
@@ -1223,7 +1341,9 @@ public:
         // Build metadata JSON + copy geometry into buffer
         std::wostringstream ss;
         ss.imbue(std::locale::classic());
-        ss << L"{\"type\":\"scene_bin\",\"nodes\":[";
+        ss << L"{\"type\":\"scene_bin\",\"frame\":" << frameId;
+        ss << L",\"stats\":{\"producerBytes\":" << totalBytes << L"}";
+        ss << L",\"nodes\":[";
         bool first = true;
 
         for (auto& ng : geos) {
@@ -1314,10 +1434,11 @@ public:
         Interface* ip = GetCOREInterface();
         if (!ip) return;
         TimeValue t = ip->GetTime();
+        const std::uint32_t frameId = AllocateFrameId();
 
         std::wostringstream ss;
         ss.imbue(std::locale::classic());
-        ss << L"{\"type\":\"xform\",\"nodes\":[";
+        ss << L"{\"type\":\"xform\",\"frame\":" << frameId << L",\"nodes\":[";
         bool first = true;
         for (auto it = geomHandles_.begin(); it != geomHandles_.end(); ) {
             ULONG handle = *it;

@@ -324,8 +324,15 @@
 
             for (const nd of meta.nodes) {
                 let mesh = nodeMap.get(nd.h);
-                const mat = nd.mat ? createMaterial(nd.mat)
-                    : new THREE.MeshStandardMaterial({ color: 0x888888, side: THREE.DoubleSide });
+
+                // Build material: single or multi-sub array
+                let mat;
+                if (nd.mats && nd.groups) {
+                    mat = nd.mats.map(m => createMaterial(m));
+                } else {
+                    mat = nd.mat ? createMaterial(nd.mat)
+                        : new THREE.MeshStandardMaterial({ color: 0x888888, side: THREE.DoubleSide });
+                }
 
                 // Build geometry from binary buffer if geo data present
                 let geom = mesh?.geometry;
@@ -365,6 +372,13 @@
                         geom.setAttribute('uv', new THREE.BufferAttribute(uvsCopy, 2));
                     }
                     geom.computeVertexNormals();
+
+                    // Add material groups for Multi/Sub
+                    if (nd.groups) {
+                        for (const [start, count, idx] of nd.groups) {
+                            geom.addGroup(start, count, idx);
+                        }
+                    }
                 }
 
                 if (mesh) {

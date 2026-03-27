@@ -1185,9 +1185,28 @@ public:
                 ss << L'}';
             }
 
-            // Material
-            ss << L",\"mat\":";
-            WriteMaterialFull(ss, pbr);
+            // Multi/Sub material support
+            Mtl* multiMtl = FindMultiSubMtl(ng.node->GetMtl());
+            if (multiMtl && ng.groups.size() > 1) {
+                ss << L",\"groups\":[";
+                for (size_t g = 0; g < ng.groups.size(); g++) {
+                    if (g) ss << L',';
+                    ss << L'[' << ng.groups[g].start << L',' << ng.groups[g].count << L',' << g << L']';
+                }
+                ss << L"],\"mats\":[";
+                for (size_t g = 0; g < ng.groups.size(); g++) {
+                    if (g) ss << L',';
+                    int subIdx = ng.groups[g].matID % multiMtl->NumSubMtls();
+                    Mtl* subMtl = multiMtl->GetSubMtl(subIdx);
+                    MaxJSPBR subPBR;
+                    ExtractPBRFromMtl(subMtl, ng.node, t, subPBR);
+                    WriteMaterialFull(ss, subPBR);
+                }
+                ss << L"]";
+            } else {
+                ss << L",\"mat\":";
+                WriteMaterialFull(ss, pbr);
+            }
 
             ss << L'}';  // node
             first = false;

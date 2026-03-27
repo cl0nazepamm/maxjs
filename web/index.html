@@ -31,7 +31,7 @@
     <div id="hud">
         <div id="info">MaxJS Live — hot reload works!</div>
         <div id="controls">
-            <button id="btnUndock">Undock</button>
+            <button id="btnKill">Kill</button>
             <button id="btnRefresh">Refresh</button>
             <button id="btnCamLock">Cam Lock: OFF</button>
             <button id="btnEnv" class="active">Env: ON</button>
@@ -117,11 +117,25 @@
             // Exposure
             renderer.toneMappingExposure = Math.pow(2, envParams.exp || 0) * (envParams.gamma || 1.0);
 
-            // Rotation: Z-up fix on X, OSL horizontal rotation on Z (vertical axis in Z-up)
+            // Autodesk HDRIenv:
+            //   u = rot + atan2( x, y )
+            //   v sample = 1 - ( 0.5 + asin( z ) / PI )
+            // Three.js equirect:
+            //   u = atan2( z, x )
+            //   v = 0.5 + asin( y ) / PI
+            // So the lookup direction remap is:
+            //   (x, y, z)_three = ( y, -z, x )_max
+            // with Autodesk rotation applied around Max's Z axis before the basis remap.
             const rot = (envParams.rot || 0) * Math.PI / 180;
-            const zupX = envParams.zup ? Math.PI / 2 : 0;
-            scene.environmentRotation.set(zupX, 0, rot - Math.PI / 2);
-            scene.backgroundRotation.set(zupX, 0, rot - Math.PI / 2);
+            const envBasis = new THREE.Matrix4().makeBasis(
+                new THREE.Vector3(0, 0, 1),
+                new THREE.Vector3(1, 0, 0),
+                new THREE.Vector3(0, -1, 0)
+            );
+            const envYaw = new THREE.Matrix4().makeRotationZ(-rot);
+            const envRotation = new THREE.Matrix4().multiplyMatrices(envBasis, envYaw);
+            scene.environmentRotation.setFromRotationMatrix(envRotation);
+            scene.backgroundRotation.copy(scene.environmentRotation);
 
             // Only reload texture if URL changed
             if (envParams.hdri === currentHdriUrl) return;
@@ -325,7 +339,7 @@
                         : new THREE.MeshStandardMaterial({ color: 0x888888, side: THREE.DoubleSide });
                 }
 
-                const geom = buildGeometry(nd.v, nd.i, nd.uv);
+                const geom = buildGeometry(nd.v, nd.i, nd.uv, nd.norm);
 
                 // Add material groups for Multi/Sub
                 if (nd.groups) {
@@ -457,7 +471,6 @@
                         console.warn('[MaxJS binary] Invalid UV range for', nd.n);
                         continue;
                     }
-
                     const vertsCopy = new Float32Array(
                         new Float32Array(buffer, nd.geo.vOff, nd.geo.vN)
                     );
@@ -475,8 +488,14 @@
                         );
                         geom.setAttribute('uv', new THREE.BufferAttribute(uvsCopy, 2));
                     }
-                    geom.computeVertexNormals();
-
+                    if (nd.geo.nOff != null && inRange(nd.geo.nOff, nd.geo.nN || 0)) {
+                        const normalsCopy = new Float32Array(
+                            new Float32Array(buffer, nd.geo.nOff, nd.geo.nN)
+                        );
+                        geom.setAttribute('normal', new THREE.BufferAttribute(normalsCopy, 3));
+                    } else {
+                        geom.computeVertexNormals();
+                    }
                     // Add material groups for Multi/Sub
                     if (nd.groups) {
                         for (const [start, count, idx] of nd.groups) {
@@ -568,12 +587,13 @@
         }
 
         // ── Geometry Builder ────────────────────────────────
-        function buildGeometry(vertices, indices, uvs) {
+        function buildGeometry(vertices, indices, uvs, normals) {
             const geom = new THREE.BufferGeometry();
             geom.setAttribute('position', new THREE.Float32BufferAttribute(vertices, 3));
             if (indices?.length) geom.setIndex(indices);
             if (uvs?.length) geom.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
-            geom.computeVertexNormals();
+            if (normals?.length) geom.setAttribute('normal', new THREE.Float32BufferAttribute(normals, 3));
+            else geom.computeVertexNormals();
             geom.computeBoundingBox();
             geom.computeBoundingSphere();
             return geom;
@@ -667,8 +687,8 @@
         }
 
         // ── UI Controls ─────────────────────────────────────
-        document.getElementById('btnUndock').onclick = () => {
-            bridge.send('undock');
+        document.getElementById('btnKill').onclick = () => {
+            bridge.send('kill');
         };
 
         document.getElementById('btnRefresh').onclick = () => {

@@ -39,6 +39,7 @@ using namespace Microsoft::WRL;
 #define SYNC_INTERVAL_MS  33   // background structural/material timer
 #define WM_TOGGLE_PANEL   (WM_USER + 1)
 #define WM_FAST_FLUSH     (WM_USER + 2)
+#define WM_KILL_PANEL     (WM_USER + 3)
 #define SETUP_TIMER_ID    2
 #define AS_TIMER_ID       3
 #define AS_INTERVAL_MS    66   // ~15fps ActiveShade
@@ -52,6 +53,7 @@ static HWND g_helperHwnd = nullptr;
 
 // Forward — used by renderer's ActiveShade
 static void TogglePanel();
+static void KillPanel();
 void ToggleMaxJSPanel(); // defined after class
 void StartMaxJSActiveShade(Bitmap* target); // defined after class
 void StopMaxJSActiveShade(); // defined after class
@@ -430,6 +432,27 @@ static void ExtractPBR(INode* node, TimeValue t, MaxJSPBR& d) {
 
 struct MatGroup { int matID; int start; int count; };
 
+struct MeshCornerKey {
+    DWORD posIdx = 0;
+    DWORD uvIdx = 0;
+    DWORD smGroup = 0;
+
+    bool operator==(const MeshCornerKey& other) const {
+        return posIdx == other.posIdx &&
+               uvIdx == other.uvIdx &&
+               smGroup == other.smGroup;
+    }
+};
+
+struct MeshCornerKeyHash {
+    size_t operator()(const MeshCornerKey& key) const noexcept {
+        size_t h = static_cast<size_t>(key.posIdx);
+        h = h * 16777619u ^ static_cast<size_t>(key.uvIdx);
+        h = h * 16777619u ^ static_cast<size_t>(key.smGroup);
+        return h;
+    }
+};
+
 static bool ExtractMesh(INode* node, TimeValue t,
                         std::vector<float>& verts,
                         std::vector<float>& uvs,
@@ -470,7 +493,7 @@ static bool ExtractMesh(INode* node, TimeValue t,
     }
 
     // Build indexed mesh with split vertices at UV seams
-    std::unordered_map<uint64_t, int> vertMap;
+    std::unordered_map<MeshCornerKey, int, MeshCornerKeyHash> vertMap;
     verts.reserve(nv * 3);
     if (hasUVs) uvs.reserve(nv * 2);
     indices.reserve(nf * 3);
@@ -489,7 +512,11 @@ static bool ExtractMesh(INode* node, TimeValue t,
         for (int v = 0; v < 3; v++) {
             DWORD posIdx = mesh.faces[f].v[v];
             DWORD uvIdx  = hasUVs ? mesh.tvFace[f].t[v] : 0;
-            uint64_t key = ((uint64_t)posIdx << 32) | uvIdx;
+            MeshCornerKey key = {
+                posIdx,
+                uvIdx,
+                mesh.faces[f].getSmGroup()
+            };
 
             auto it = vertMap.find(key);
             if (it != vertMap.end()) {
@@ -910,12 +937,23 @@ public:
         else haveLastSentCamera_ = false;
     }
 
-    void MarkTrackedNodeDirty(INode* node) {
+    template <typename Fn>
+    void VisitNodeSubtree(INode* node, Fn&& fn) {
         if (!node) return;
-        const ULONG handle = node->GetHandle();
-        if (!IsTrackedHandle(handle)) return;
-        fastDirtyHandles_.insert(handle);
-        QueueFastFlush();
+        fn(node);
+        for (int i = 0; i < node->NumberOfChildren(); ++i) {
+            VisitNodeSubtree(node->GetChildNode(i), std::forward<Fn>(fn));
+        }
+    }
+
+    void MarkTrackedNodeDirty(INode* node) {
+        bool changed = false;
+        VisitNodeSubtree(node, [this, &changed](INode* current) {
+            const ULONG handle = current->GetHandle();
+            if (!IsTrackedHandle(handle)) return;
+            if (fastDirtyHandles_.insert(handle).second) changed = true;
+        });
+        if (changed) QueueFastFlush();
     }
 
     void MarkTrackedNodesDirty(const NodeEventNamespace::NodeKeyTab& nodes) {
@@ -937,39 +975,43 @@ public:
             INode* node = ip->GetSelNode(i);
             if (!node) continue;
 
-            const ULONG handle = node->GetHandle();
-            if (!IsTrackedHandle(handle)) continue;
+            VisitNodeSubtree(node, [this, t, &changed](INode* current) {
+                const ULONG handle = current->GetHandle();
+                if (!IsTrackedHandle(handle)) return;
 
-            float xform[16];
-            GetTransform16(node, t, xform);
+                float xform[16];
+                GetTransform16(current, t, xform);
 
-            auto it = lastSentTransforms_.find(handle);
-            if (it == lastSentTransforms_.end() || !TransformEquals16(xform, it->second.data())) {
-                fastDirtyHandles_.insert(handle);
-                changed = true;
-            }
+                auto it = lastSentTransforms_.find(handle);
+                if (it == lastSentTransforms_.end() || !TransformEquals16(xform, it->second.data())) {
+                    if (fastDirtyHandles_.insert(handle).second) changed = true;
+                }
+            });
         }
 
         if (changed) QueueFastFlush();
     }
 
     void MarkVisibilityNodesDirty(const NodeEventNamespace::NodeKeyTab& nodes) {
+        bool changed = false;
         for (int i = 0; i < nodes.Count(); ++i) {
             INode* node = NodeEventNamespace::GetNodeByKey(nodes[i]);
             if (!node) continue;
 
-            const ULONG handle = node->GetHandle();
-            if (IsTrackedHandle(handle)) {
-                fastDirtyHandles_.insert(handle);
-                continue;
-            }
+            VisitNodeSubtree(node, [this, &changed](INode* current) {
+                const ULONG handle = current->GetHandle();
+                if (IsTrackedHandle(handle)) {
+                    if (fastDirtyHandles_.insert(handle).second) changed = true;
+                    return;
+                }
 
-            // A node that becomes visible after being absent from the last full sync
-            // needs geometry/bootstrap data, not just a transform delta.
-            if (!node->IsNodeHidden(TRUE)) dirty_ = true;
+                // A node that becomes visible after being absent from the last full sync
+                // needs geometry/bootstrap data, not just a transform delta.
+                if (!current->IsNodeHidden(TRUE)) dirty_ = true;
+            });
         }
 
-        if (!dirty_ && !fastDirtyHandles_.empty()) QueueFastFlush();
+        if (!dirty_ && changed) QueueFastFlush();
     }
 
     void MarkAllTrackedNodesDirty() {
@@ -1035,8 +1077,8 @@ public:
 
     void OnWebMessage(const wchar_t* json) {
         std::wstring msg(json);
-        if (msg.find(L"\"undock\"") != std::wstring::npos) {
-            if (originalParent_) RestoreFromViewport();
+        if (msg.find(L"\"kill\"") != std::wstring::npos) {
+            if (hwnd_) PostMessage(hwnd_, WM_KILL_PANEL, 0, 0);
             return;
         }
         if (msg.find(L"\"ready\"") != std::wstring::npos) {
@@ -1953,9 +1995,20 @@ public:
     }
 
     void Destroy() {
+        StopActiveShade();
+        if (originalParent_) RestoreFromViewport();
         UnregisterCallbacks();
         if (controller_) { controller_->Close(); controller_ = nullptr; }
-        webview_ = nullptr; jsReady_ = false;
+        webview_ = nullptr;
+        env_ = nullptr;
+        jsReady_ = false;
+        useBinary_ = false;
+        dirty_ = true;
+        fastDirtyHandles_.clear();
+        lastSentTransforms_.clear();
+        geomHandles_.clear();
+        mtlHashMap_.clear();
+        geoHashMap_.clear();
         if (hwnd_) { HWND h = hwnd_; hwnd_ = nullptr; DestroyWindow(h); }
     }
 
@@ -1976,6 +2029,9 @@ public:
         case WM_TIMER:
             if (wParam == SYNC_TIMER_ID && p) p->OnTimer();
             if (wParam == AS_TIMER_ID && p) p->CaptureActiveShadeFrame();
+            return 0;
+        case WM_KILL_PANEL:
+            KillPanel();
             return 0;
         case WM_CLOSE: ShowWindow(hwnd, SW_HIDE); return 0;
         case WM_KEYDOWN:
@@ -2031,37 +2087,23 @@ static void OnSceneChanged(void* param, NotifyInfo*) {
 //  Panel toggle + MAXScript bridge
 // ══════════════════════════════════════════════════════════════
 
+static void KillPanel() {
+    if (!g_panel) return;
+    g_panel->Destroy();
+    delete g_panel;
+    g_panel = nullptr;
+}
+
 void TogglePanel() {
     if (!g_panel) {
         g_panel = new MaxJSPanel();
         g_panel->Create(GetCOREInterface()->GetMAXHWnd());
     } else if (g_panel->hwnd_ && IsWindowVisible(g_panel->hwnd_)) {
         ShowWindow(g_panel->hwnd_, SW_HIDE);
-    } else if (g_panel->hwnd_) {
-        ShowWindow(g_panel->hwnd_, SW_SHOW);
-        // Force hard reload so JS code updates without restarting Max
-        if (g_panel->webview_) {
-            g_panel->jsReady_ = false;
-            g_panel->dirty_ = true;
-            g_panel->mtlHashMap_.clear();
-            g_panel->geoHashMap_.clear();
-            g_panel->lastSentTransforms_.clear();
-            g_panel->ResetFastPathState(false);
-            // Clear virtual host cache by re-mapping, then navigate fresh
-            ComPtr<ICoreWebView2_3> wv3;
-            g_panel->webview_->QueryInterface(IID_PPV_ARGS(&wv3));
-            if (wv3) {
-                std::wstring webDir = g_panel->GetWebDir();
-                if (!webDir.empty()) {
-                    wv3->ClearVirtualHostNameToFolderMapping(L"maxjs.local");
-                    wv3->SetVirtualHostNameToFolderMapping(
-                        L"maxjs.local", webDir.c_str(),
-                        COREWEBVIEW2_HOST_RESOURCE_ACCESS_KIND_ALLOW);
-                }
-            }
-            g_panel->LoadContent();
-        }
     } else {
+        // Recreate the panel from scratch on reopen so web asset changes are guaranteed to load.
+        KillPanel();
+        g_panel = new MaxJSPanel();
         g_panel->Create(GetCOREInterface()->GetMAXHWnd());
     }
 }
@@ -2133,7 +2175,7 @@ public:
     }
 
     void Stop() override {
-        if (g_panel) { g_panel->Destroy(); delete g_panel; g_panel = nullptr; }
+        KillPanel();
         if (g_helperHwnd) { DestroyWindow(g_helperHwnd); g_helperHwnd = nullptr; }
     }
 

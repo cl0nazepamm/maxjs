@@ -6,6 +6,7 @@
 #include <triobj.h>
 #include <notify.h>
 #include <stdmat.h>
+#include <ISceneEventManager.h>
 #include <maxscript/maxscript.h>
 #include "sync_protocol.h"
 #include "threejs_material.h"
@@ -36,6 +37,7 @@ using namespace Microsoft::WRL;
 #define SYNC_TIMER_ID     1
 #define SYNC_INTERVAL_MS  33   // ~30fps for camera
 #define WM_TOGGLE_PANEL   (WM_USER + 1)
+#define WM_FAST_FLUSH     (WM_USER + 2)
 #define SETUP_TIMER_ID    2
 #define AS_TIMER_ID       3
 #define AS_INTERVAL_MS    66   // ~15fps ActiveShade
@@ -565,6 +567,20 @@ static void GetViewportCamera(CameraData& cam) {
     cam.up[0] = up.x;      cam.up[1] = up.y;       cam.up[2] = up.z;
 }
 
+static bool NearlyEqualFloat(float a, float b, float epsilon = 1.0e-4f) {
+    return std::fabs(a - b) <= epsilon;
+}
+
+static bool CameraEquals(const CameraData& a, const CameraData& b) {
+    for (int i = 0; i < 3; ++i) {
+        if (!NearlyEqualFloat(a.pos[i], b.pos[i])) return false;
+        if (!NearlyEqualFloat(a.target[i], b.target[i])) return false;
+        if (!NearlyEqualFloat(a.up[i], b.up[i])) return false;
+    }
+    if (!NearlyEqualFloat(a.fov, b.fov, 1.0e-3f)) return false;
+    return a.perspective == b.perspective;
+}
+
 // ══════════════════════════════════════════════════════════════
 //  Environment HDRI — full param extraction
 // ══════════════════════════════════════════════════════════════
@@ -648,6 +664,40 @@ static void GetEnvironment(EnvData& env) {
 
 static void OnSceneChanged(void* param, NotifyInfo*);
 
+class MaxJSFastNodeEventCallback : public INodeEventCallback {
+public:
+    explicit MaxJSFastNodeEventCallback(MaxJSPanel* owner) : owner_(owner) {}
+
+    void ControllerStructured(NodeKeyTab& nodes) override;
+    void ControllerOtherEvent(NodeKeyTab& nodes) override;
+    void LinkChanged(NodeKeyTab& nodes) override;
+    void SelectionChanged(NodeKeyTab& nodes) override;
+    void HideChanged(NodeKeyTab& nodes) override;
+
+private:
+    MaxJSPanel* owner_;
+};
+
+class MaxJSFastRedrawCallback : public RedrawViewsCallback {
+public:
+    explicit MaxJSFastRedrawCallback(MaxJSPanel* owner) : owner_(owner) {}
+
+    void proc(Interface* ip) override;
+
+private:
+    MaxJSPanel* owner_;
+};
+
+class MaxJSFastTimeChangeCallback : public TimeChangeCallback {
+public:
+    explicit MaxJSFastTimeChangeCallback(MaxJSPanel* owner) : owner_(owner) {}
+
+    void TimeChanged(TimeValue t) override;
+
+private:
+    MaxJSPanel* owner_;
+};
+
 // ══════════════════════════════════════════════════════════════
 //  WebView2 Panel
 // ══════════════════════════════════════════════════════════════
@@ -668,10 +718,25 @@ public:
     int tickCount_ = 0;
     size_t geoScanCursor_ = 0;
     std::unordered_set<ULONG> geomHandles_;
+    std::unordered_set<ULONG> fastDirtyHandles_;
     std::unordered_map<ULONG, uintptr_t> mtlHashMap_;  // node handle → material state hash
     std::unordered_map<ULONG, uint64_t> geoHashMap_;   // node handle → geometry topology hash
     std::map<std::wstring, std::wstring> texDirMap_;    // dir → host
     int texDirCount_ = 0;
+    bool fastCameraDirty_ = false;
+    bool fastFlushPosted_ = false;
+    bool haveLastSentCamera_ = false;
+    CameraData lastSentCamera_ = {};
+    SceneEventNamespace::CallbackKey fastNodeEventCallbackKey_ = 0;
+    MaxJSFastNodeEventCallback fastNodeEvents_;
+    MaxJSFastRedrawCallback fastRedrawCallback_;
+    MaxJSFastTimeChangeCallback fastTimeChangeCallback_;
+
+    MaxJSPanel()
+        : fastNodeEvents_(this)
+        , fastRedrawCallback_(this)
+        , fastTimeChangeCallback_(this) {
+    }
 
     bool Create(HWND parent) {
         WNDCLASSEXW wc = {};
@@ -805,26 +870,123 @@ public:
 
     // ── Callbacks & sync ─────────────────────────────────────
 
+    bool IsTrackedHandle(ULONG handle) const {
+        return geomHandles_.find(handle) != geomHandles_.end();
+    }
+
+    void QueueFastFlush() {
+        if (!hwnd_ || dirty_ || fastFlushPosted_) return;
+        fastFlushPosted_ = true;
+        if (!PostMessage(hwnd_, WM_FAST_FLUSH, 0, 0)) {
+            fastFlushPosted_ = false;
+        }
+    }
+
+    void CaptureCurrentCameraState() {
+        GetViewportCamera(lastSentCamera_);
+        haveLastSentCamera_ = true;
+    }
+
+    void ResetFastPathState(bool refreshCameraState = false) {
+        fastDirtyHandles_.clear();
+        fastCameraDirty_ = false;
+        fastFlushPosted_ = false;
+        if (refreshCameraState) CaptureCurrentCameraState();
+        else haveLastSentCamera_ = false;
+    }
+
+    void MarkTrackedNodeDirty(INode* node) {
+        if (!node) return;
+        const ULONG handle = node->GetHandle();
+        if (!IsTrackedHandle(handle)) return;
+        fastDirtyHandles_.insert(handle);
+        QueueFastFlush();
+    }
+
+    void MarkTrackedNodesDirty(const NodeEventNamespace::NodeKeyTab& nodes) {
+        for (int i = 0; i < nodes.Count(); ++i) {
+            MarkTrackedNodeDirty(NodeEventNamespace::GetNodeByKey(nodes[i]));
+        }
+    }
+
+    void MarkVisibilityNodesDirty(const NodeEventNamespace::NodeKeyTab& nodes) {
+        for (int i = 0; i < nodes.Count(); ++i) {
+            INode* node = NodeEventNamespace::GetNodeByKey(nodes[i]);
+            if (!node) continue;
+
+            const ULONG handle = node->GetHandle();
+            if (IsTrackedHandle(handle)) {
+                fastDirtyHandles_.insert(handle);
+                continue;
+            }
+
+            // A node that becomes visible after being absent from the last full sync
+            // needs geometry/bootstrap data, not just a transform delta.
+            if (!node->IsNodeHidden(TRUE)) dirty_ = true;
+        }
+
+        if (!dirty_ && !fastDirtyHandles_.empty()) QueueFastFlush();
+    }
+
+    void MarkAllTrackedNodesDirty() {
+        if (geomHandles_.empty()) return;
+        fastDirtyHandles_.insert(geomHandles_.begin(), geomHandles_.end());
+        QueueFastFlush();
+    }
+
+    void MarkCameraDirty() {
+        fastCameraDirty_ = true;
+        QueueFastFlush();
+    }
+
+    void MarkCameraDirtyIfChanged() {
+        CameraData current = {};
+        GetViewportCamera(current);
+        if (!haveLastSentCamera_ || !CameraEquals(lastSentCamera_, current)) {
+            fastCameraDirty_ = true;
+            QueueFastFlush();
+        }
+    }
+
     void RegisterCallbacks() {
         RegisterNotification(OnSceneChanged, this, NOTIFY_SCENE_ADDED_NODE);
         RegisterNotification(OnSceneChanged, this, NOTIFY_SCENE_PRE_DELETED_NODE);
         RegisterNotification(OnSceneChanged, this, NOTIFY_FILE_POST_OPEN);
         RegisterNotification(OnSceneChanged, this, NOTIFY_SYSTEM_POST_RESET);
-        RegisterNotification(OnSceneChanged, this, NOTIFY_SELECTIONSET_CHANGED);
-        RegisterNotification(OnSceneChanged, this, NOTIFY_NODE_HIDE);
-        RegisterNotification(OnSceneChanged, this, NOTIFY_NODE_UNHIDE);
+
+        Interface* ip = GetCOREInterface();
+        if (ip) {
+            ip->RegisterRedrawViewsCallback(&fastRedrawCallback_);
+            ip->RegisterTimeChangeCallback(&fastTimeChangeCallback_);
+        }
+
+        ISceneEventManager* sceneEvents = GetISceneEventManager();
+        if (sceneEvents && !fastNodeEventCallbackKey_) {
+            fastNodeEventCallbackKey_ = sceneEvents->RegisterCallback(&fastNodeEvents_, FALSE, 0, FALSE);
+        }
+
         SetTimer(hwnd_, SYNC_TIMER_ID, SYNC_INTERVAL_MS, nullptr);
     }
 
     void UnregisterCallbacks() {
         KillTimer(hwnd_, SYNC_TIMER_ID);
+
+        ISceneEventManager* sceneEvents = GetISceneEventManager();
+        if (sceneEvents && fastNodeEventCallbackKey_) {
+            sceneEvents->UnRegisterCallback(fastNodeEventCallbackKey_);
+            fastNodeEventCallbackKey_ = 0;
+        }
+
+        Interface* ip = GetCOREInterface();
+        if (ip) {
+            ip->UnRegisterRedrawViewsCallback(&fastRedrawCallback_);
+            ip->UnRegisterTimeChangeCallback(&fastTimeChangeCallback_);
+        }
+
         UnRegisterNotification(OnSceneChanged, this, NOTIFY_SCENE_ADDED_NODE);
         UnRegisterNotification(OnSceneChanged, this, NOTIFY_SCENE_PRE_DELETED_NODE);
         UnRegisterNotification(OnSceneChanged, this, NOTIFY_FILE_POST_OPEN);
         UnRegisterNotification(OnSceneChanged, this, NOTIFY_SYSTEM_POST_RESET);
-        UnRegisterNotification(OnSceneChanged, this, NOTIFY_SELECTIONSET_CHANGED);
-        UnRegisterNotification(OnSceneChanged, this, NOTIFY_NODE_HIDE);
-        UnRegisterNotification(OnSceneChanged, this, NOTIFY_NODE_UNHIDE);
     }
 
     void OnWebMessage(const wchar_t* json) {
@@ -838,6 +1000,7 @@ public:
             mtlHashMap_.clear();
             geoHashMap_.clear();  // force all geometry to be sent
             geoScanCursor_ = 0;
+            ResetFastPathState(false);
         }
     }
 
@@ -849,20 +1012,111 @@ public:
         if (dirty_) {
             dirty_ = false;
             if (useBinary_) SendFullSyncBinary(); else SendFullSync();
-        } else if (useBinary_) {
-            // Every tick: transforms/selection/visibility + camera.
-            // Material scalars stay throttled to keep the fast path light.
-            SendBinaryDeltaSync((tickCount_ % 5) == 0);
-            if (tickCount_ % 50 == 0) DetectMaterialChanges();
-            if (tickCount_ % 15 == 0) DetectGeometryChanges();
-        } else if (tickCount_ % 5 == 0) {
-            // JSON fallback remains throttled because it is materially heavier.
-            SendTransformSync();
-            if (tickCount_ % 50 == 0) DetectMaterialChanges();
-            if (tickCount_ % 15 == 0) DetectGeometryChanges();
         } else {
-            SendCameraSync();
+            if (tickCount_ % 50 == 0) DetectMaterialChanges();
+            if (tickCount_ % 15 == 0) DetectGeometryChanges();
         }
+    }
+
+    void FlushFastPath() {
+        fastFlushPosted_ = false;
+
+        if (!jsReady_ || !webview_ || dirty_) return;
+        if (!hwnd_ || !IsWindowVisible(hwnd_)) return;
+
+        std::vector<ULONG> dirtyHandles;
+        dirtyHandles.reserve(fastDirtyHandles_.size());
+        for (ULONG handle : fastDirtyHandles_) dirtyHandles.push_back(handle);
+
+        const bool hasDirtyNodes = !dirtyHandles.empty();
+        const bool hasDirtyCamera = fastCameraDirty_;
+        if (!hasDirtyNodes && !hasDirtyCamera) return;
+
+        fastDirtyHandles_.clear();
+        fastCameraDirty_ = false;
+
+        if (!useBinary_) {
+            if (hasDirtyNodes) SendTransformSync();
+            else SendCameraSync();
+            CaptureCurrentCameraState();
+            return;
+        }
+
+        ComPtr<ICoreWebView2_17> wv17;
+        ComPtr<ICoreWebView2Environment12> env12;
+        webview_->QueryInterface(IID_PPV_ARGS(&wv17));
+        env_->QueryInterface(IID_PPV_ARGS(&env12));
+        if (!wv17 || !env12) {
+            if (hasDirtyNodes) SendTransformSync();
+            else SendCameraSync();
+            CaptureCurrentCameraState();
+            return;
+        }
+
+        Interface* ip = GetCOREInterface();
+        if (!ip) return;
+
+        TimeValue t = ip->GetTime();
+        const std::uint32_t frameId = AllocateFrameId();
+        maxjs::sync::DeltaFrameBuilder frame(frameId);
+        frame.BeginFrame();
+
+        for (ULONG handle : dirtyHandles) {
+            INode* node = ip->GetINodeByHandle(handle);
+            if (!node) {
+                mtlHashMap_.erase(handle);
+                geoHashMap_.erase(handle);
+                geomHandles_.erase(handle);
+                dirty_ = true;
+                continue;
+            }
+
+            float xform[16];
+            GetTransform16(node, t, xform);
+            frame.UpdateTransform(static_cast<std::uint32_t>(handle), xform);
+            frame.UpdateSelection(static_cast<std::uint32_t>(handle), node->Selected() != 0);
+            frame.UpdateVisibility(static_cast<std::uint32_t>(handle), !node->IsNodeHidden(TRUE));
+        }
+
+        if (hasDirtyCamera) {
+            CameraData cam = {};
+            GetViewportCamera(cam);
+            frame.UpdateCamera(cam.pos, cam.target, cam.up, cam.fov, cam.perspective);
+            lastSentCamera_ = cam;
+            haveLastSentCamera_ = true;
+        }
+
+        frame.EndFrame();
+        if (frame.command_count() == 0) return;
+
+        const auto& frameBytes = frame.bytes();
+        const size_t totalBytes = frameBytes.empty() ? 4 : frameBytes.size();
+
+        ComPtr<ICoreWebView2SharedBuffer> sharedBuf;
+        HRESULT hr = env12->CreateSharedBuffer(totalBytes, &sharedBuf);
+        if (FAILED(hr) || !sharedBuf) {
+            if (hasDirtyNodes) SendTransformSync();
+            else SendCameraSync();
+            CaptureCurrentCameraState();
+            return;
+        }
+
+        BYTE* bufPtr = nullptr;
+        sharedBuf->get_Buffer(&bufPtr);
+        if (bufPtr && !frameBytes.empty()) {
+            memcpy(bufPtr, frameBytes.data(), frameBytes.size());
+        }
+
+        std::wostringstream meta;
+        meta.imbue(std::locale::classic());
+        meta << L"{\"type\":\"delta_bin\",\"frame\":" << frameId;
+        meta << L",\"stats\":{\"producerBytes\":" << frameBytes.size();
+        meta << L",\"commandCount\":" << frame.command_count() << L"}}";
+
+        wv17->PostSharedBufferToScript(
+            sharedBuf.Get(),
+            COREWEBVIEW2_SHARED_BUFFER_ACCESS_READ_ONLY,
+            meta.str().c_str());
     }
 
     void SendCameraSync() {
@@ -1194,6 +1448,7 @@ public:
         ss << L'}';
 
         webview_->PostWebMessageAsJson(ss.str().c_str());
+        ResetFastPathState(true);
     }
 
     void WriteSceneNodes(INode* parent, TimeValue t,
@@ -1425,6 +1680,7 @@ public:
         wv17->PostSharedBufferToScript(sharedBuf.Get(),
             COREWEBVIEW2_SHARED_BUFFER_ACCESS_READ_ONLY,
             ss.str().c_str());
+        ResetFastPathState(true);
     }
 
     // ── Transform-only sync ──────────────────────────────────
@@ -1661,6 +1917,9 @@ public:
         }
         switch (msg) {
         case WM_SIZE:  if (p) p->Resize(); return 0;
+        case WM_FAST_FLUSH:
+            if (p) p->FlushFastPath();
+            return 0;
         case WM_TIMER:
             if (wParam == SYNC_TIMER_ID && p) p->OnTimer();
             if (wParam == AS_TIMER_ID && p) p->CaptureActiveShadeFrame();
@@ -1677,6 +1936,36 @@ public:
         return DefWindowProc(hwnd, msg, wParam, lParam);
     }
 };
+
+void MaxJSFastNodeEventCallback::ControllerStructured(NodeKeyTab& nodes) {
+    if (owner_) owner_->MarkTrackedNodesDirty(nodes);
+}
+
+void MaxJSFastNodeEventCallback::ControllerOtherEvent(NodeKeyTab& nodes) {
+    if (owner_) owner_->MarkTrackedNodesDirty(nodes);
+}
+
+void MaxJSFastNodeEventCallback::LinkChanged(NodeKeyTab& nodes) {
+    if (owner_) owner_->MarkTrackedNodesDirty(nodes);
+}
+
+void MaxJSFastNodeEventCallback::SelectionChanged(NodeKeyTab& nodes) {
+    if (owner_) owner_->MarkTrackedNodesDirty(nodes);
+}
+
+void MaxJSFastNodeEventCallback::HideChanged(NodeKeyTab& nodes) {
+    if (owner_) owner_->MarkVisibilityNodesDirty(nodes);
+}
+
+void MaxJSFastRedrawCallback::proc(Interface*) {
+    if (owner_) owner_->MarkCameraDirtyIfChanged();
+}
+
+void MaxJSFastTimeChangeCallback::TimeChanged(TimeValue) {
+    if (!owner_) return;
+    owner_->MarkAllTrackedNodesDirty();
+    owner_->MarkCameraDirty();
+}
 
 static void OnSceneChanged(void* param, NotifyInfo*) {
     auto* p = static_cast<MaxJSPanel*>(param);
@@ -1701,6 +1990,7 @@ void TogglePanel() {
             g_panel->dirty_ = true;
             g_panel->mtlHashMap_.clear();
             g_panel->geoHashMap_.clear();
+            g_panel->ResetFastPathState(false);
             // Clear virtual host cache by re-mapping, then navigate fresh
             ComPtr<ICoreWebView2_3> wv3;
             g_panel->webview_->QueryInterface(IID_PPV_ARGS(&wv3));

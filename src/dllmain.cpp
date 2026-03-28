@@ -482,7 +482,7 @@ static void ExtractThreeJSMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
     MSTR name = mtl->GetName();
     d.mtlName = name.data();
     d.materialModel = (mtl->ClassID() == THREEJS_ADV_MTL_CLASS_ID)
-        ? L"MeshStandardNodeMaterial"
+        ? L"MeshPhysicalMaterial"
         : L"MeshStandardMaterial";
 
     Color c = pb->GetColor(pb_color, t);

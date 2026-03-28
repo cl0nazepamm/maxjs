@@ -186,19 +186,6 @@
     </script>
     <script type="module">
         import * as THREE from 'three';
-        import {
-            bumpMap as tslBumpMap,
-            float as tslFloat,
-            materialColor,
-            materialMetalness,
-            materialOpacity,
-            materialRoughness,
-            normalMap as tslNormalMap,
-            parallaxUV,
-            texture as tslTexture,
-            uv,
-            vec2 as tslVec2,
-        } from 'three/tsl';
         import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
         import { HDRLoader } from 'three/addons/loaders/HDRLoader.js';
         import { LightProbeGenerator } from 'three/addons/lights/LightProbeGenerator.js';
@@ -533,53 +520,6 @@
                 : 1.0;
         }
 
-        function applyAdvancedMaterialNodes(material, md) {
-            if (!material?.isMeshStandardNodeMaterial) return;
-
-            const parallaxScale = Number.isFinite(md.parallaxS) ? md.parallaxS : 0;
-            if (!md.parallaxMap || Math.abs(parallaxScale) < 1.0e-6) return;
-
-            const heightTexture = loadTexture(md.parallaxMap, THREE.NoColorSpace, md.parallaxMapXf, fallbackHeightTexture);
-            const baseUv = uv();
-            const heightNode = tslTexture(heightTexture, baseUv).r.sub(0.5);
-            const heightOffset = heightNode.mul(parallaxScale);
-            const displacedUv = parallaxUV(baseUv, tslVec2(heightOffset, heightOffset));
-
-            material.userData ??= {};
-            material.userData.maxjsParallaxMap = heightTexture;
-            material.userData.maxjsParallaxScale = parallaxScale;
-
-            if (material.map) {
-                material.colorNode = materialColor.mul(tslTexture(material.map, displacedUv));
-            }
-
-            if (material.roughnessMap) {
-                material.roughnessNode = materialRoughness.mul(tslTexture(material.roughnessMap, displacedUv).g);
-            }
-
-            if (material.metalnessMap) {
-                material.metalnessNode = materialMetalness.mul(tslTexture(material.metalnessMap, displacedUv).b);
-            }
-
-            if (material.normalMap) {
-                material.normalNode = tslNormalMap(
-                    tslTexture(material.normalMap, displacedUv),
-                    tslVec2(material.normalScale?.x ?? 1, material.normalScale?.y ?? 1)
-                );
-            } else if (material.bumpMap) {
-                material.normalNode = tslBumpMap(
-                    tslTexture(material.bumpMap, displacedUv).r,
-                    tslFloat(material.bumpScale ?? 1.0)
-                );
-            }
-
-            if (material.alphaMap) {
-                material.opacityNode = materialOpacity.mul(tslTexture(material.alphaMap, displacedUv).g);
-            }
-
-            material.needsUpdate = true;
-        }
-
         function applyMaterialSelectionState(material, selected) {
             // Selection is now handled by outline post-processing pass
             // Just restore base emissive
@@ -601,16 +541,13 @@
         function createMaterial(md) {
             const requestedModelName = md.model || 'MeshStandardMaterial';
             const wantsToonMaterial = requestedModelName === 'MeshToonMaterial';
-            const wantsAdvancedMaterial = requestedModelName === 'MeshStandardNodeMaterial';
-            const wantsParallax = !!md.parallaxMap && Math.abs(Number(md.parallaxS) || 0) >= 1.0e-6;
+            const wantsAdvancedMaterial =
+                requestedModelName === 'MeshPhysicalMaterial' ||
+                requestedModelName === 'MeshStandardNodeMaterial';
             const canUseToonMaterial = wantsToonMaterial && typeof THREE.MeshToonMaterial === 'function';
-            const useNodeMaterial = wantsAdvancedMaterial &&
-                rendererBackendLabel === 'WebGPU' &&
-                typeof THREE.MeshStandardNodeMaterial === 'function' &&
-                wantsParallax;
             const runtimeModelName = canUseToonMaterial
                 ? 'MeshToonMaterial'
-                : (useNodeMaterial ? 'MeshStandardNodeMaterial' : 'MeshStandardMaterial');
+                : (wantsAdvancedMaterial ? 'MeshPhysicalMaterial' : 'MeshStandardMaterial');
             const key = `${requestedModelName}::${runtimeModelName}::${md.name || 'default'}`;
             let template = materialCache.get(key);
 
@@ -658,16 +595,14 @@
 
                 if (canUseToonMaterial) {
                     template = new THREE.MeshToonMaterial(params);
-                } else if (useNodeMaterial) {
-                    template = new THREE.MeshStandardNodeMaterial(params);
+                } else if (wantsAdvancedMaterial) {
+                    template = new THREE.MeshPhysicalMaterial(params);
                 } else {
                     template = new THREE.MeshStandardMaterial(params);
                 }
                 template.userData ??= {};
                 template.userData.maxjsRequestedMaterialModel = requestedModelName;
                 template.userData.maxjsMaterialModel = runtimeModelName;
-                template.userData.maxjsNodeMaterialFallback =
-                    wantsAdvancedMaterial && !useNodeMaterial;
                 template.userData.maxjsToonMaterialFallback =
                     wantsToonMaterial && !canUseToonMaterial;
 
@@ -691,10 +626,6 @@
                 if (md.lmMap) {
                     template.lightMap = loadTexture(md.lmMap, THREE.LinearSRGBColorSpace, md.lmMapXf, fallbackWhiteTexture);
                     template.lightMapIntensity = md.lmI ?? 1.0;
-                }
-
-                if (useNodeMaterial) {
-                    applyAdvancedMaterialNodes(template, md);
                 }
 
                 rememberMaterialEmissiveBase(template);

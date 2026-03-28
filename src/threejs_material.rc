@@ -99,7 +99,7 @@ BEGIN
     LTEXT           "Model: MeshStandardMaterial", IDC_MTL_MODEL_LABEL, 8, 304, 120, 8
 END
 
-IDD_THREEJS_ADV_MTL DIALOG 0, 0, 170, 352
+IDD_THREEJS_ADV_MTL DIALOG 0, 0, 170, 338
 STYLE DS_SETFONT | WS_CHILD | WS_VISIBLE
 FONT 8, "Segoe UI"
 BEGIN
@@ -168,7 +168,7 @@ BEGIN
     CONTROL         "",  IDC_AO_INT_EDIT, "CustEdit",      WS_TABSTOP, 144,201, 12, 10
     CONTROL         "",  IDC_AO_INT_SPIN, "SpinnerControl", 0,         158,201,  7, 10
 
-    GROUPBOX        "Surface Relief", -1,  2, 226, 166, 64
+    GROUPBOX        "Surface Relief", -1,  2, 226, 166, 48
     LTEXT           "Bump",        -1,   8, 239, 30,   8
     CONTROL         "",  IDC_BUMP_MAP,    "CustButton",    WS_TABSTOP, 40, 237, 68, 12
     LTEXT           "Scale",       -1, 114, 239, 18,   8
@@ -182,16 +182,10 @@ BEGIN
     LTEXT           "Bias",        -1, 114, 267, 18,   8
     CONTROL         "",  IDC_DISP_BIAS_EDIT,"CustEdit",    WS_TABSTOP, 136,265, 12, 10
     CONTROL         "",  IDC_DISP_BIAS_SPIN,"SpinnerControl",0,        150,265,  7, 10
-    LTEXT           "Parallax",    -1,   8, 279, 30,   8
-    CONTROL         "",  IDC_PARALLAX_MAP, "CustButton",   WS_TABSTOP, 40, 277, 68, 12
-    LTEXT           "Scale",       -1, 114, 279, 18,   8
-    CONTROL         "",  IDC_PARALLAX_EDIT,"CustEdit",     WS_TABSTOP, 136,277, 12, 10
-    CONTROL         "",  IDC_PARALLAX_SPIN,"SpinnerControl",0,         150,277,  7, 10
-
-    GROUPBOX        "Options",     -1,   2, 294, 166, 44
-    CONTROL         "Double Sided",IDC_DOUBLE_SIDED,"Button",BS_AUTOCHECKBOX | WS_TABSTOP, 8, 306, 68, 10
-    LTEXT           "Env",         -1, 108, 306, 14,   8
-    CONTROL         "",  IDC_ENV_INT_EDIT,"CustEdit",      WS_TABSTOP, 126,304, 16, 10
-    CONTROL         "",  IDC_ENV_INT_SPIN,"SpinnerControl", 0,         144,304,  7, 10
-    LTEXT           "Model: MeshStandardNodeMaterial", IDC_MTL_MODEL_LABEL, 8, 320, 132, 8
+    GROUPBOX        "Options",     -1,   2, 278, 166, 44
+    CONTROL         "Double Sided",IDC_DOUBLE_SIDED,"Button",BS_AUTOCHECKBOX | WS_TABSTOP, 8, 290, 68, 10
+    LTEXT           "Env",         -1, 108, 290, 14,   8
+    CONTROL         "",  IDC_ENV_INT_EDIT,"CustEdit",      WS_TABSTOP, 126,288, 16, 10
+    CONTROL         "",  IDC_ENV_INT_SPIN,"SpinnerControl", 0,         144,288,  7, 10
+    LTEXT           "Model: MeshPhysicalMaterial", IDC_MTL_MODEL_LABEL, 8, 304, 132, 8
 END

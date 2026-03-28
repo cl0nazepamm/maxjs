@@ -168,6 +168,7 @@
             <button id="btnRefresh">Refresh</button>
             <button id="btnCamLock">Cam Lock: OFF</button>
             <button id="btnEnv" class="active">Env: ON</button>
+            <button id="btnLightProbe" class="active">Probe: ON</button>
             <button id="btnSel" class="active">Sel: ON</button>
             <button id="btnPostFxPanel">Post FX</button>
         </div>
@@ -187,6 +188,7 @@
         import * as THREE from 'three';
         import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
         import { HDRLoader } from 'three/addons/loaders/HDRLoader.js';
+        import { LightProbeGenerator } from 'three/addons/lights/LightProbeGenerator.js';
         import { applyDeltaFrame } from './js/protocol.js';
         import { createPerfHud } from './js/perf_hud.js';
         import { createSSGIController } from './js/ssgi_fx.js';
@@ -253,6 +255,8 @@
         sun.position.set(50, -50, 100);
         defaultLights.add(sun);
         scene.add(defaultLights);
+        const lightProbe = new THREE.LightProbe();
+        scene.add(lightProbe);
 
         // ── Loaders & Caches ────────────────────────────────
         const textureLoader = new THREE.TextureLoader();
@@ -291,7 +295,43 @@
         let firstSync = true;
         let camLock = false;
         let envVisible = true;
+        let lightProbeEnabled = true;
+        const lightProbeIntensity = 1.0;
         let currentHdriUrl = null;
+        let currentHdriProbeSignature = '';
+        let hdriLoadGeneration = 0;
+
+        function applyLightProbeState() {
+            lightProbe.intensity = lightProbeEnabled ? lightProbeIntensity : 0.0;
+        }
+
+        async function updateLightProbeFromHDRI(hdrTex, probeSignature, loadGeneration) {
+            const captureScene = new THREE.Scene();
+            captureScene.background = hdrTex;
+            captureScene.backgroundRotation.copy(scene.environmentRotation);
+
+            const cubeRenderTarget = new THREE.CubeRenderTarget(128, {
+                type: hdrTex.type ?? THREE.HalfFloatType,
+                colorSpace: hdrTex.colorSpace ?? THREE.LinearSRGBColorSpace,
+            });
+            const cubeCamera = new THREE.CubeCamera(0.1, 10, cubeRenderTarget);
+
+            try {
+                cubeCamera.update(renderer, captureScene);
+                const nextProbe = await LightProbeGenerator.fromCubeRenderTarget(renderer, cubeRenderTarget);
+
+                if (loadGeneration !== hdriLoadGeneration || probeSignature !== currentHdriProbeSignature) {
+                    return;
+                }
+
+                lightProbe.copy(nextProbe);
+                applyLightProbeState();
+            } catch (error) {
+                console.warn('MaxJS light probe generation failed:', error);
+            } finally {
+                cubeRenderTarget.dispose();
+            }
+        }
 
         function normalizeTextureTransform(xf) {
             if (!xf) return null;
@@ -400,17 +440,30 @@
             const envRotation = new THREE.Matrix4().multiplyMatrices(envBasis, envYaw);
             scene.environmentRotation.setFromRotationMatrix(envRotation);
             scene.backgroundRotation.copy(scene.environmentRotation);
+            const probeSignature = JSON.stringify([envParams.hdri, envParams.rot || 0, envParams.flip || 0, envParams.zup || 0]);
+            const shouldRefreshTexture = envParams.hdri !== currentHdriUrl;
+            const shouldRefreshProbe = probeSignature !== currentHdriProbeSignature;
 
-            // Only reload texture if URL changed
-            if (envParams.hdri === currentHdriUrl) return;
+            if (!shouldRefreshTexture && !shouldRefreshProbe) return;
+
             currentHdriUrl = envParams.hdri;
+            currentHdriProbeSignature = probeSignature;
+            hdriLoadGeneration += 1;
+            const loadGeneration = hdriLoadGeneration;
 
-            rgbeLoader.load(envParams.hdri, (hdrTex) => {
+            rgbeLoader.load(envParams.hdri, async (hdrTex) => {
+                if (loadGeneration !== hdriLoadGeneration) {
+                    hdrTex.dispose();
+                    return;
+                }
                 hdrTex.mapping = THREE.EquirectangularReflectionMapping;
                 const envMap = pmremGenerator.fromEquirectangular(hdrTex).texture;
                 scene.environment = envMap;
                 if (envVisible) scene.background = envMap;
                 defaultLights.visible = false;
+                if (lightProbeEnabled || shouldRefreshProbe) {
+                    await updateLightProbeFromHDRI(hdrTex, probeSignature, loadGeneration);
+                }
                 hdrTex.dispose();
             });
         }
@@ -1036,6 +1089,14 @@
             btnEnv.classList.toggle('active', envVisible);
             scene.background = envVisible && scene.environment
                 ? scene.environment : new THREE.Color(0x1a1a2e);
+        };
+
+        const btnLightProbe = document.getElementById('btnLightProbe');
+        btnLightProbe.onclick = () => {
+            lightProbeEnabled = !lightProbeEnabled;
+            btnLightProbe.textContent = `Probe: ${lightProbeEnabled ? 'ON' : 'OFF'}`;
+            btnLightProbe.classList.toggle('active', lightProbeEnabled);
+            applyLightProbeState();
         };
 
         const btnSel = document.getElementById('btnSel');

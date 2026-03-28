@@ -89,6 +89,55 @@ static std::wstring Utf8ToWide(const std::string& s) {
     return out;
 }
 
+static bool DirectoryExists(const std::wstring& path) {
+    if (path.empty()) return false;
+    const DWORD attrs = GetFileAttributesW(path.c_str());
+    return attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+static std::wstring GetEnvironmentString(const wchar_t* name) {
+    DWORD needed = GetEnvironmentVariableW(name, nullptr, 0);
+    if (needed == 0) return {};
+
+    std::wstring value(static_cast<size_t>(needed), L'\0');
+    const DWORD written = GetEnvironmentVariableW(name, value.data(), needed);
+    if (written == 0) return {};
+    value.resize(written);
+    return value;
+}
+
+static std::uint64_t FileTimeToUint64(const FILETIME& ft) {
+    ULARGE_INTEGER value = {};
+    value.LowPart = ft.dwLowDateTime;
+    value.HighPart = ft.dwHighDateTime;
+    return value.QuadPart;
+}
+
+static std::uint64_t GetDirectoryWriteStamp(const std::wstring& dirPath) {
+    if (!DirectoryExists(dirPath)) return 0;
+
+    std::uint64_t latest = 0;
+    WIN32_FIND_DATAW findData = {};
+    const std::wstring pattern = dirPath + L"\\*";
+    HANDLE findHandle = FindFirstFileW(pattern.c_str(), &findData);
+    if (findHandle == INVALID_HANDLE_VALUE) return 0;
+
+    do {
+        if (wcscmp(findData.cFileName, L".") == 0 || wcscmp(findData.cFileName, L"..") == 0) {
+            continue;
+        }
+
+        latest = std::max(latest, FileTimeToUint64(findData.ftLastWriteTime));
+
+        if (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            latest = std::max(latest, GetDirectoryWriteStamp(dirPath + L"\\" + findData.cFileName));
+        }
+    } while (FindNextFileW(findHandle, &findData));
+
+    FindClose(findHandle);
+    return latest;
+}
+
 static std::wstring UrlEncodePath(const std::wstring& path) {
     if (path.empty()) return {};
 
@@ -942,6 +991,8 @@ public:
     std::unordered_map<ULONG, uint64_t> geoHashMap_;   // node handle → geometry topology hash
     std::map<std::wstring, std::wstring> texDirMap_;    // dir → host
     int texDirCount_ = 0;
+    std::wstring activeWebDir_;
+    std::uint64_t activeWebStamp_ = 0;
     bool fastCameraDirty_ = false;
     bool fastFlushPosted_ = false;
     bool haveLastSentCamera_ = false;
@@ -1034,6 +1085,10 @@ public:
 
     void LoadContent() {
         std::wstring webDir = GetWebDir();
+        activeWebDir_ = webDir;
+        activeWebStamp_ = GetDirectoryWriteStamp(webDir);
+        texDirMap_.clear();
+
         if (!webDir.empty()) {
             ComPtr<ICoreWebView2_3> wv3;
             webview_->QueryInterface(IID_PPV_ARGS(&wv3));
@@ -1063,11 +1118,70 @@ public:
     }
 
     std::wstring GetWebDir() {
+        std::wstring envWebDir = GetEnvironmentString(L"MAXJS_WEB_DIR");
+        if (!envWebDir.empty() && DirectoryExists(envWebDir)) {
+            return envWebDir;
+        }
+
+#ifdef MAXJS_SOURCE_WEB_DIR
+        std::wstring sourceWebDir = Utf8ToWide(MAXJS_SOURCE_WEB_DIR);
+        std::replace(sourceWebDir.begin(), sourceWebDir.end(), L'/', L'\\');
+        if (DirectoryExists(sourceWebDir)) {
+            return sourceWebDir;
+        }
+#endif
+
         wchar_t p[MAX_PATH];
         GetModuleFileNameW(hInstance, p, MAX_PATH);
         std::wstring d(p); d = d.substr(0, d.find_last_of(L"\\/"));
         std::wstring w = d + L"\\maxjs_web";
-        return GetFileAttributesW(w.c_str()) != INVALID_FILE_ATTRIBUTES ? w : std::wstring{};
+        return DirectoryExists(w) ? w : std::wstring{};
+    }
+
+    void ClearWebMappings() {
+        if (!webview_) return;
+
+        ComPtr<ICoreWebView2_3> wv3;
+        webview_->QueryInterface(IID_PPV_ARGS(&wv3));
+        if (!wv3) return;
+
+        wv3->ClearVirtualHostNameToFolderMapping(L"maxjs.local");
+        wv3->ClearVirtualHostNameToFolderMapping(L"maxjsdrvc.local");
+        wv3->ClearVirtualHostNameToFolderMapping(L"maxjsdrvd.local");
+    }
+
+    void PrepareForWebReload() {
+        jsReady_ = false;
+        dirty_ = true;
+        tickCount_ = 0;
+        geoScanCursor_ = 0;
+        geomHandles_.clear();
+        fastDirtyHandles_.clear();
+        lastSentTransforms_.clear();
+        mtlHashMap_.clear();
+        geoHashMap_.clear();
+        ResetFastPathState(false);
+    }
+
+    void ReloadWebContent() {
+        if (!webview_) return;
+        PrepareForWebReload();
+        ClearWebMappings();
+        LoadContent();
+    }
+
+    void CheckWebContentChanges() {
+        if (!webview_ || !jsReady_) return;
+
+        const std::wstring webDir = GetWebDir();
+        if (webDir.empty()) return;
+
+        const std::uint64_t nextStamp = GetDirectoryWriteStamp(webDir);
+        if (nextStamp == 0) return;
+
+        if (activeWebDir_ != webDir || activeWebStamp_ == 0 || nextStamp != activeWebStamp_) {
+            ReloadWebContent();
+        }
     }
 
     // ── Texture serving — drives pre-mapped in LoadContent ──
@@ -1266,6 +1380,10 @@ public:
             if (hwnd_) PostMessage(hwnd_, WM_KILL_PANEL, 0, 0);
             return;
         }
+        if (msg.find(L"\"refresh\"") != std::wstring::npos || msg.find(L"\"reload\"") != std::wstring::npos) {
+            ReloadWebContent();
+            return;
+        }
         if (msg.find(L"\"ready\"") != std::wstring::npos) {
             jsReady_ = true; dirty_ = true;
             mtlHashMap_.clear();
@@ -1285,6 +1403,7 @@ public:
             dirty_ = false;
             if (useBinary_) SendFullSyncBinary(); else SendFullSync();
         } else {
+            if (tickCount_ % 15 == 0) CheckWebContentChanges();
             if (tickCount_ % 50 == 0) DetectMaterialChanges();
             if (tickCount_ % 15 == 0) DetectGeometryChanges();
         }
@@ -2342,10 +2461,10 @@ void TogglePanel() {
         g_panel->Create(GetCOREInterface()->GetMAXHWnd());
     } else if (g_panel->hwnd_ && IsWindowVisible(g_panel->hwnd_)) {
         ShowWindow(g_panel->hwnd_, SW_HIDE);
+    } else if (g_panel->hwnd_) {
+        ShowWindow(g_panel->hwnd_, SW_SHOW);
+        g_panel->ReloadWebContent();
     } else {
-        // Recreate the panel from scratch on reopen so web asset changes are guaranteed to load.
-        KillPanel();
-        g_panel = new MaxJSPanel();
         g_panel->Create(GetCOREInterface()->GetMAXHWnd());
     }
 }

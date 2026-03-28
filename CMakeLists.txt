@@ -10,6 +10,7 @@ project(${PLUGIN_NAME} VERSION 1.0.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+string(REPLACE "\\" "/" MAXJS_SOURCE_WEB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/web")
 
 # ── Max SDK ──────────────────────────────────────────────────────
 if(NOT DEFINED MAXSDK_PATH)
@@ -58,6 +59,7 @@ target_compile_definitions(${PLUGIN_NAME} PRIVATE
     WIN32 _WIN32
     _USRDLL
     _CRT_SECURE_NO_WARNINGS
+    MAXJS_SOURCE_WEB_DIR="${MAXJS_SOURCE_WEB_DIR}"
 )
 
 # ── Link ─────────────────────────────────────────────────────────

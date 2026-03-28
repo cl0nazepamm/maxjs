@@ -829,13 +829,11 @@
         };
 
         document.getElementById('btnRefresh').onclick = () => {
-            currentHdriUrl = null;
-            materialCache.clear();
-            textureCache.clear();
-            firstSync = true;
-            hasInitialSync = false;
-            transportMode = 'waiting';
-            startBridgeHandshake();
+            if (window.chrome?.webview) {
+                bridge.send('refresh');
+            } else {
+                location.reload();
+            }
         };
 
         const btnCam = document.getElementById('btnCamLock');

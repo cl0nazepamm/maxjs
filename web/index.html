@@ -37,6 +37,8 @@
             <button id="btnEnv" class="active">Env: ON</button>
             <button id="btnSel" class="active">Sel: ON</button>
             <button id="btnSSGI">SSGI: OFF</button>
+            <button id="btnSSR">SSR: OFF</button>
+            <button id="btnBloom">Bloom: OFF</button>
         </div>
     </div>
     <script type="importmap">
@@ -868,21 +870,60 @@
         };
 
         const btnSSGI = document.getElementById('btnSSGI');
+        const btnSSR = document.getElementById('btnSSR');
+        const btnBloom = document.getElementById('btnBloom');
+
         function syncSSGIButton() {
             const enabled = ssgiFx.isEnabled();
             btnSSGI.textContent = `SSGI: ${enabled ? 'ON' : 'OFF'}`;
             btnSSGI.classList.toggle('active', enabled);
         }
 
+        function syncSSRButton() {
+            const enabled = ssgiFx.isSSREnabled();
+            btnSSR.textContent = `SSR: ${enabled ? 'ON' : 'OFF'}`;
+            btnSSR.classList.toggle('active', enabled);
+        }
+
+        function syncBloomButton() {
+            const enabled = ssgiFx.isBloomEnabled();
+            btnBloom.textContent = `Bloom: ${enabled ? 'ON' : 'OFF'}`;
+            btnBloom.classList.toggle('active', enabled);
+        }
+
+        function syncPostFXButtons() {
+            syncSSGIButton();
+            syncSSRButton();
+            syncBloomButton();
+        }
+
         btnSSGI.onclick = () => {
             const enabled = ssgiFx.setEnabled(!ssgiFx.isEnabled());
-            syncSSGIButton();
+            syncPostFXButtons();
             if (!enabled && !ssgiFx.isAvailable()) {
                 const message = ssgiFx.getLastError();
                 if (message) perfHud.setStatus(`MaxJS - SSGI unavailable: ${message}`);
             }
         };
-        syncSSGIButton();
+
+        btnSSR.onclick = () => {
+            const enabled = ssgiFx.setSSREnabled(!ssgiFx.isSSREnabled());
+            syncPostFXButtons();
+            if (!enabled && !ssgiFx.isAvailable()) {
+                const message = ssgiFx.getLastError();
+                if (message) perfHud.setStatus(`MaxJS - SSR unavailable: ${message}`);
+            }
+        };
+
+        btnBloom.onclick = () => {
+            const enabled = ssgiFx.setBloomEnabled(!ssgiFx.isBloomEnabled());
+            syncPostFXButtons();
+            if (!enabled && !ssgiFx.isAvailable()) {
+                const message = ssgiFx.getLastError();
+                if (message) perfHud.setStatus(`MaxJS - Bloom unavailable: ${message}`);
+            }
+        };
+        syncPostFXButtons();
 
         // ── Resize + Render ─────────────────────────────────
         addEventListener('resize', () => {
@@ -896,7 +937,7 @@
             controls.update();
             const renderStart = performance.now();
             ssgiFx.render();
-            syncSSGIButton();
+            syncPostFXButtons();
             perfHud.updateRender(performance.now() - renderStart, renderer.info?.render);
         }
 

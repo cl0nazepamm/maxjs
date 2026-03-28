@@ -1,16 +1,22 @@
 import * as THREE from 'three';
 import {
     add,
+    blendColor,
     colorToDirection,
     diffuseColor,
     directionToColor,
+    metalness,
     mrt,
     normalView,
     output,
     pass,
+    roughness,
     sample,
+    vec2,
     vec4,
 } from 'three/tsl';
+import { bloom } from 'three/addons/tsl/display/BloomNode.js';
+import { ssr } from 'three/addons/tsl/display/SSRNode.js';
 import { ssgi } from 'three/addons/tsl/display/SSGINode.js';
 
 function setTexturePrecision(scenePass) {
@@ -19,20 +25,39 @@ function setTexturePrecision(scenePass) {
 
     const normalTexture = scenePass.getTexture('normal');
     if (normalTexture) normalTexture.type = THREE.UnsignedByteType;
+
+    const metalRoughTexture = scenePass.getTexture('metalrough');
+    if (metalRoughTexture) metalRoughTexture.type = THREE.UnsignedByteType;
 }
 
 export function createSSGIController({ renderer, scene, camera, onError = () => {} }) {
     const postProcessing = new THREE.PostProcessing(renderer);
     const state = {
-        enabled: false,
-        radius: 8,
-        thickness: 1.5,
-        aoIntensity: 1.0,
-        giIntensity: 1.5,
-        expFactor: 1.5,
-        sliceCount: 2,
-        stepCount: 8,
-        temporal: false,
+        ssgi: {
+            enabled: false,
+            radius: 8,
+            thickness: 1.5,
+            aoIntensity: 1.0,
+            giIntensity: 1.5,
+            expFactor: 1.5,
+            sliceCount: 2,
+            stepCount: 8,
+            temporal: false,
+        },
+        ssr: {
+            enabled: false,
+            quality: 0.45,
+            blurQuality: 2,
+            maxDistance: 0.5,
+            opacity: 0.9,
+            thickness: 0.015,
+        },
+        bloom: {
+            enabled: false,
+            strength: 0.4,
+            radius: 0.2,
+            threshold: 0.75,
+        },
     };
 
     let available = true;
@@ -52,7 +77,9 @@ export function createSSGIController({ renderer, scene, camera, onError = () => 
     function disableWithError(prefix, error) {
         lastError = error?.message || String(error);
         available = false;
-        state.enabled = false;
+        state.ssgi.enabled = false;
+        state.ssr.enabled = false;
+        state.bloom.enabled = false;
         pipelineReady = false;
         clearNodes();
         postProcessing.outputNode = null;
@@ -60,8 +87,12 @@ export function createSSGIController({ renderer, scene, camera, onError = () => 
         onError(`${prefix}: ${lastError}`);
     }
 
+    function hasAnyEffectEnabled() {
+        return state.ssgi.enabled || state.ssr.enabled || state.bloom.enabled;
+    }
+
     function rebuildPipeline() {
-        if (!state.enabled || !available) {
+        if (!hasAnyEffectEnabled() || !available) {
             pipelineReady = false;
             clearNodes();
             postProcessing.outputNode = null;
@@ -79,6 +110,7 @@ export function createSSGIController({ renderer, scene, camera, onError = () => 
                 output,
                 diffuseColor,
                 normal: directionToColor(normalView),
+                metalrough: vec2(metalness, roughness),
             }));
 
             setTexturePrecision(scenePass);
@@ -87,26 +119,61 @@ export function createSSGIController({ renderer, scene, camera, onError = () => 
             const scenePassDiffuse = scenePass.getTextureNode('diffuseColor');
             const scenePassDepth = scenePass.getTextureNode('depth');
             const scenePassNormalColor = scenePass.getTextureNode('normal');
+            const scenePassMetalRough = scenePass.getTextureNode('metalrough');
             const sceneNormal = sample((uvNode) => colorToDirection(scenePassNormalColor.sample(uvNode)));
+            let beauty = scenePassColor;
 
-            const ssgiPass = ssgi(scenePassColor, scenePassDepth, sceneNormal, camera);
-            ssgiPass.sliceCount.value = state.sliceCount;
-            ssgiPass.stepCount.value = state.stepCount;
-            ssgiPass.radius.value = state.radius;
-            ssgiPass.thickness.value = state.thickness;
-            ssgiPass.aoIntensity.value = state.aoIntensity;
-            ssgiPass.giIntensity.value = state.giIntensity;
-            ssgiPass.expFactor.value = state.expFactor;
-            ssgiPass.useTemporalFiltering = state.temporal;
-            activeNodes.push(ssgiPass);
+            if (state.ssgi.enabled) {
+                const ssgiPass = ssgi(scenePassColor, scenePassDepth, sceneNormal, camera);
+                ssgiPass.sliceCount.value = state.ssgi.sliceCount;
+                ssgiPass.stepCount.value = state.ssgi.stepCount;
+                ssgiPass.radius.value = state.ssgi.radius;
+                ssgiPass.thickness.value = state.ssgi.thickness;
+                ssgiPass.aoIntensity.value = state.ssgi.aoIntensity;
+                ssgiPass.giIntensity.value = state.ssgi.giIntensity;
+                ssgiPass.expFactor.value = state.ssgi.expFactor;
+                ssgiPass.useTemporalFiltering = state.ssgi.temporal;
+                activeNodes.push(ssgiPass);
 
-            postProcessing.outputNode = vec4(
-                add(
-                    scenePassColor.rgb.mul(ssgiPass.a),
-                    scenePassDiffuse.rgb.mul(ssgiPass.rgb)
-                ),
-                scenePassColor.a
-            );
+                beauty = vec4(
+                    add(
+                        beauty.rgb.mul(ssgiPass.a),
+                        scenePassDiffuse.rgb.mul(ssgiPass.rgb)
+                    ),
+                    beauty.a
+                );
+            }
+
+            if (state.ssr.enabled) {
+                const ssrPass = ssr(
+                    beauty,
+                    scenePassDepth,
+                    sceneNormal,
+                    scenePassMetalRough.r,
+                    scenePassMetalRough.g,
+                    camera
+                );
+                ssrPass.quality.value = state.ssr.quality;
+                ssrPass.blurQuality.value = state.ssr.blurQuality;
+                ssrPass.maxDistance.value = state.ssr.maxDistance;
+                ssrPass.opacity.value = state.ssr.opacity;
+                ssrPass.thickness.value = state.ssr.thickness;
+                activeNodes.push(ssrPass);
+                beauty = blendColor(beauty, ssrPass);
+            }
+
+            if (state.bloom.enabled) {
+                const bloomPass = bloom(
+                    beauty,
+                    state.bloom.strength,
+                    state.bloom.radius,
+                    state.bloom.threshold
+                );
+                activeNodes.push(bloomPass);
+                beauty = beauty.add(bloomPass);
+            }
+
+            postProcessing.outputNode = beauty;
             postProcessing.needsUpdate = true;
             pipelineReady = true;
             lastError = '';
@@ -117,7 +184,7 @@ export function createSSGIController({ renderer, scene, camera, onError = () => 
 
     return {
         isEnabled() {
-            return state.enabled;
+            return state.ssgi.enabled;
         },
         isAvailable() {
             return available;
@@ -126,12 +193,28 @@ export function createSSGIController({ renderer, scene, camera, onError = () => 
             return lastError;
         },
         setEnabled(enabled) {
-            state.enabled = !!enabled && available;
+            state.ssgi.enabled = !!enabled && available;
             rebuildPipeline();
-            return state.enabled;
+            return state.ssgi.enabled;
+        },
+        isSSREnabled() {
+            return state.ssr.enabled;
+        },
+        setSSREnabled(enabled) {
+            state.ssr.enabled = !!enabled && available;
+            rebuildPipeline();
+            return state.ssr.enabled;
+        },
+        isBloomEnabled() {
+            return state.bloom.enabled;
+        },
+        setBloomEnabled(enabled) {
+            state.bloom.enabled = !!enabled && available;
+            rebuildPipeline();
+            return state.bloom.enabled;
         },
         render() {
-            if (!state.enabled || !pipelineReady) {
+            if (!hasAnyEffectEnabled() || !pipelineReady) {
                 renderer.render(scene, camera);
                 return;
             }
@@ -144,7 +227,7 @@ export function createSSGIController({ renderer, scene, camera, onError = () => 
             }
         },
         resize() {
-            if (state.enabled) {
+            if (hasAnyEffectEnabled()) {
                 postProcessing.needsUpdate = true;
             }
         },

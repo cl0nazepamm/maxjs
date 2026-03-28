@@ -6,102 +6,85 @@ BEGIN
     IDS_PARAMS "ThreeJS Material"
 END
 
-IDD_THREEJS_MTL DIALOG 0, 0, 108, 378
+IDD_THREEJS_MTL DIALOG 0, 0, 170, 300
 STYLE DS_SETFONT | WS_CHILD | WS_VISIBLE
-FONT 8, "MS Sans Serif"
+FONT 8, "Segoe UI"
 BEGIN
-    // ── PBR Core ──────────────────────────────
-    LTEXT           "Color",     -1,   4,  4, 36,  8
-    CONTROL         "",  IDC_COLOR,    "ColorSwatch",  WS_TABSTOP, 42,  2, 40, 12
-    CONTROL         "",  IDC_COLOR_MAP,"CustButton",   WS_TABSTOP, 86,  2, 18, 12
-    LTEXT           "Map Amt",   -1,   4, 14, 36,  8
-    CONTROL         "",  IDC_MAPSTR_EDIT,"CustEdit",   WS_TABSTOP, 42, 12, 36, 10
-    CONTROL         "",  IDC_MAPSTR_SPIN,"SpinnerControl",0,       78, 12,  7, 10
+    GROUPBOX        "Base Surface", -1,   2,   2, 166, 102
+    LTEXT           "Color",         -1,   8,  15, 20,   8
+    CONTROL         "",  IDC_COLOR,      "ColorSwatch",    WS_TABSTOP, 30,  13, 24, 12
+    CONTROL         "",  IDC_COLOR_MAP,  "CustButton",     WS_TABSTOP, 60,  13, 48, 12
+    LTEXT           "Amt",           -1, 114,  15, 14,   8
+    CONTROL         "",  IDC_MAPSTR_EDIT,"CustEdit",      WS_TABSTOP, 130, 13, 16, 10
+    CONTROL         "",  IDC_MAPSTR_SPIN,"SpinnerControl", 0,         148, 13,  7, 10
 
-    LTEXT           "Roughness", -1,   4, 30, 36,  8
-    CONTROL         "",  IDC_ROUGH_EDIT,"CustEdit",    WS_TABSTOP, 42, 28, 36, 10
-    CONTROL         "",  IDC_ROUGH_SPIN,"SpinnerControl",0,        78, 28,  7, 10
-    CONTROL         "",  IDC_ROUGH_MAP, "CustButton",  WS_TABSTOP, 86, 28, 18, 10
-    LTEXT           "Rough Amt", -1,   4, 42, 36,  8
-    CONTROL         "",  IDC_RMAPSTR_EDIT,"CustEdit",  WS_TABSTOP, 42, 40, 36, 10
-    CONTROL         "",  IDC_RMAPSTR_SPIN,"SpinnerControl",0,      78, 40,  7, 10
+    LTEXT           "Rough",         -1,   8,  31, 22,   8
+    CONTROL         "",  IDC_ROUGH_EDIT, "CustEdit",      WS_TABSTOP, 30,  29, 18, 10
+    CONTROL         "",  IDC_ROUGH_SPIN, "SpinnerControl", 0,         50,  29,  7, 10
+    CONTROL         "",  IDC_ROUGH_MAP,  "CustButton",    WS_TABSTOP, 60,  29, 48, 10
+    LTEXT           "Amt",           -1, 114,  31, 14,   8
+    CONTROL         "",  IDC_RMAPSTR_EDIT,"CustEdit",     WS_TABSTOP, 130, 29, 16, 10
+    CONTROL         "",  IDC_RMAPSTR_SPIN,"SpinnerControl",0,         148, 29,  7, 10
 
-    LTEXT           "Metalness", -1,   4, 54, 36,  8
-    CONTROL         "",  IDC_METAL_EDIT,"CustEdit",    WS_TABSTOP, 42, 52, 36, 10
-    CONTROL         "",  IDC_METAL_SPIN,"SpinnerControl",0,        78, 52,  7, 10
-    CONTROL         "",  IDC_METAL_MAP, "CustButton",  WS_TABSTOP, 86, 52, 18, 10
-    LTEXT           "Metal Amt", -1,   4, 66, 36,  8
-    CONTROL         "",  IDC_MMAPSTR_EDIT,"CustEdit",  WS_TABSTOP, 42, 64, 36, 10
-    CONTROL         "",  IDC_MMAPSTR_SPIN,"SpinnerControl",0,      78, 64,  7, 10
+    LTEXT           "Metal",         -1,   8,  47, 22,   8
+    CONTROL         "",  IDC_METAL_EDIT, "CustEdit",      WS_TABSTOP, 30,  45, 18, 10
+    CONTROL         "",  IDC_METAL_SPIN, "SpinnerControl", 0,         50,  45,  7, 10
+    CONTROL         "",  IDC_METAL_MAP,  "CustButton",    WS_TABSTOP, 60,  45, 48, 10
+    LTEXT           "Amt",           -1, 114,  47, 14,   8
+    CONTROL         "",  IDC_MMAPSTR_EDIT,"CustEdit",     WS_TABSTOP, 130, 45, 16, 10
+    CONTROL         "",  IDC_MMAPSTR_SPIN,"SpinnerControl",0,         148, 45,  7, 10
 
-    LTEXT           "Normal Map",-1,   4, 78, 36,  8
-    CONTROL         "",  IDC_NORMAL_MAP,"CustButton",  WS_TABSTOP, 42, 76, 62, 10
-    LTEXT           "Normal Scale",-1, 4, 90, 42,  8
-    CONTROL         "",  IDC_NORMSCL_EDIT,"CustEdit",  WS_TABSTOP, 48, 88, 30, 10
-    CONTROL         "",  IDC_NORMSCL_SPIN,"SpinnerControl",0,      78, 88,  7, 10
+    LTEXT           "Normal",        -1,   8,  63, 22,   8
+    CONTROL         "",  IDC_NORMAL_MAP, "CustButton",    WS_TABSTOP, 30,  61, 78, 10
+    LTEXT           "Scale",         -1, 114,  63, 18,   8
+    CONTROL         "",  IDC_NORMSCL_EDIT,"CustEdit",     WS_TABSTOP, 136, 61, 12, 10
+    CONTROL         "",  IDC_NORMSCL_SPIN,"SpinnerControl",0,         150, 61,  7, 10
 
-    LTEXT           "Opacity",   -1,   4,102, 36,  8
-    CONTROL         "",  IDC_OPACITY_EDIT,"CustEdit",  WS_TABSTOP, 42,100, 36, 10
-    CONTROL         "",  IDC_OPACITY_SPIN,"SpinnerControl",0,      78,100,  7, 10
-    CONTROL         "",  IDC_OPACITY_MAP, "CustButton",WS_TABSTOP, 86,100, 18, 10
-    LTEXT           "Alpha Amt", -1,   4,114, 36,  8
-    CONTROL         "",  IDC_OPMAPSTR_EDIT,"CustEdit", WS_TABSTOP, 42,112, 36, 10
-    CONTROL         "",  IDC_OPMAPSTR_SPIN,"SpinnerControl",0,     78,112,  7, 10
+    LTEXT           "Opacity",       -1,   8,  79, 22,   8
+    CONTROL         "",  IDC_OPACITY_EDIT,"CustEdit",     WS_TABSTOP, 30,  77, 18, 10
+    CONTROL         "",  IDC_OPACITY_SPIN,"SpinnerControl",0,         50,  77,  7, 10
+    CONTROL         "",  IDC_OPACITY_MAP, "CustButton",   WS_TABSTOP, 60,  77, 48, 10
+    LTEXT           "Amt",           -1, 114,  79, 14,   8
+    CONTROL         "",  IDC_OPMAPSTR_EDIT,"CustEdit",    WS_TABSTOP, 130, 77, 16, 10
+    CONTROL         "",  IDC_OPMAPSTR_SPIN,"SpinnerControl",0,        148, 77,  7, 10
 
-    // ── Emission ──────────────────────────────
-    GROUPBOX        "Emission",  -1,   2,126,104, 54
-    LTEXT           "Color",     -1,   6,138, 24,  8
-    CONTROL         "",  IDC_EM_COLOR,  "ColorSwatch", WS_TABSTOP, 32,136, 30, 12
-    CONTROL         "",  IDC_EM_MAP,    "CustButton",  WS_TABSTOP, 64,136, 38, 12
-    LTEXT           "Intensity", -1,   6,152, 36,  8
-    CONTROL         "",  IDC_EM_INT_EDIT,"CustEdit",   WS_TABSTOP, 42,150, 36, 10
-    CONTROL         "",  IDC_EM_INT_SPIN,"SpinnerControl",0,       78,150,  7, 10
-    LTEXT           "Map Amt",   -1,   6,164, 36,  8
-    CONTROL         "",  IDC_EMMAPSTR_EDIT,"CustEdit", WS_TABSTOP, 42,162, 36, 10
-    CONTROL         "",  IDC_EMMAPSTR_SPIN,"SpinnerControl",0,     78,162,  7, 10
+    GROUPBOX        "Emission",     -1,   2, 108, 166, 46
+    LTEXT           "Color",        -1,   8, 121, 20,   8
+    CONTROL         "",  IDC_EM_COLOR,    "ColorSwatch",   WS_TABSTOP, 30, 119, 24, 12
+    CONTROL         "",  IDC_EM_MAP,      "CustButton",    WS_TABSTOP, 60, 119, 48, 12
+    LTEXT           "Intensity",    -1,   8, 137, 30,   8
+    CONTROL         "",  IDC_EM_INT_EDIT, "CustEdit",      WS_TABSTOP, 40, 135, 20, 10
+    CONTROL         "",  IDC_EM_INT_SPIN, "SpinnerControl", 0,         62, 135,  7, 10
+    LTEXT           "Amt",          -1, 104, 137, 14,   8
+    CONTROL         "",  IDC_EMMAPSTR_EDIT,"CustEdit",    WS_TABSTOP, 120,135, 16, 10
+    CONTROL         "",  IDC_EMMAPSTR_SPIN,"SpinnerControl",0,        138,135,  7, 10
 
-    // ── Lightmap ──────────────────────────────
-    GROUPBOX        "Lightmap",  -1,   2,184,104, 54
-    LTEXT           "Map",       -1,   6,196, 24,  8
-    CONTROL         "",  IDC_LM_MAP,    "CustButton",  WS_TABSTOP, 32,194, 70, 12
-    LTEXT           "Intensity", -1,   6,210, 36,  8
-    CONTROL         "",  IDC_LM_INT_EDIT,"CustEdit",   WS_TABSTOP, 42,208, 36, 10
-    CONTROL         "",  IDC_LM_INT_SPIN,"SpinnerControl",0,       78,208,  7, 10
-    LTEXT           "UV Channel",-1,   6,222, 36,  8
-    CONTROL         "",  IDC_LM_CH_EDIT, "CustEdit",   WS_TABSTOP, 42,220, 36, 10
-    CONTROL         "",  IDC_LM_CH_SPIN, "SpinnerControl",0,       78,220,  7, 10
+    GROUPBOX        "Utility Maps", -1,   2, 158, 166, 64
+    LTEXT           "Lightmap",     -1,   8, 171, 26,   8
+    CONTROL         "",  IDC_LM_MAP,      "CustButton",    WS_TABSTOP, 38, 169, 116, 12
+    LTEXT           "Intensity",    -1,   8, 187, 30,   8
+    CONTROL         "",  IDC_LM_INT_EDIT, "CustEdit",      WS_TABSTOP, 40, 185, 20, 10
+    CONTROL         "",  IDC_LM_INT_SPIN, "SpinnerControl", 0,         62, 185,  7, 10
+    LTEXT           "UV Ch",        -1, 104, 187, 20,   8
+    CONTROL         "",  IDC_LM_CH_EDIT,  "CustEdit",      WS_TABSTOP, 128,185, 12, 10
+    CONTROL         "",  IDC_LM_CH_SPIN,  "SpinnerControl", 0,         142,185,  7, 10
 
-    // ── AO ────────────────────────────────────
-    GROUPBOX        "Ambient Occlusion",-1, 2,240,104, 30
-    LTEXT           "Map",       -1,   6,252, 18,  8
-    CONTROL         "",  IDC_AO_MAP,    "CustButton",  WS_TABSTOP, 24,250, 30, 12
-    LTEXT           "Int",       -1,  58,252, 12,  8
-    CONTROL         "",  IDC_AO_INT_EDIT,"CustEdit",   WS_TABSTOP, 72,250, 22, 10
-    CONTROL         "",  IDC_AO_INT_SPIN,"SpinnerControl",0,       94,250,  7, 10
+    LTEXT           "AO",           -1,   8, 203, 14,   8
+    CONTROL         "",  IDC_AO_MAP,      "CustButton",    WS_TABSTOP, 38, 201, 70, 12
+    LTEXT           "Intensity",    -1, 114, 203, 30,   8
+    CONTROL         "",  IDC_AO_INT_EDIT, "CustEdit",      WS_TABSTOP, 144,201, 12, 10
+    CONTROL         "",  IDC_AO_INT_SPIN, "SpinnerControl", 0,         158,201,  7, 10
 
-    // ── Surface Detail ────────────────────────
-    GROUPBOX        "Surface Detail",-1, 2,272,104, 54
-    LTEXT           "Bump",      -1,   6,284, 18,  8
-    CONTROL         "",  IDC_BUMP_MAP,   "CustButton", WS_TABSTOP, 24,282, 38, 12
-    LTEXT           "Scale",     -1,  66,284, 18,  8
-    CONTROL         "",  IDC_BUMP_EDIT,  "CustEdit",   WS_TABSTOP, 84,282, 10, 10
-    CONTROL         "",  IDC_BUMP_SPIN,  "SpinnerControl",0,       94,282,  7, 10
-    LTEXT           "Disp",      -1,   6,296, 18,  8
-    CONTROL         "",  IDC_DISP_MAP,   "CustButton", WS_TABSTOP, 24,294, 38, 12
-    LTEXT           "S",         -1,  66,296,  6,  8
-    CONTROL         "",  IDC_DISP_EDIT,  "CustEdit",   WS_TABSTOP, 72,294, 10, 10
-    CONTROL         "",  IDC_DISP_SPIN,  "SpinnerControl",0,       82,294,  7, 10
-    LTEXT           "B",         -1,  90,296,  6,  8
-    CONTROL         "",  IDC_DISP_BIAS_EDIT,"CustEdit",WS_TABSTOP, 96,294,  8, 10
-    CONTROL         "",  IDC_DISP_BIAS_SPIN,"SpinnerControl",0,    104,294,  4, 10
+    GROUPBOX        "Surface Relief", -1,  2, 226, 166, 32
+    LTEXT           "Parallax",    -1,   8, 239, 30,   8
+    CONTROL         "",  IDC_BUMP_MAP,    "CustButton",    WS_TABSTOP, 40, 237, 68, 12
+    LTEXT           "Scale",       -1, 114, 239, 18,   8
+    CONTROL         "",  IDC_BUMP_EDIT,   "CustEdit",      WS_TABSTOP, 136,237, 12, 10
+    CONTROL         "",  IDC_BUMP_SPIN,   "SpinnerControl", 0,         150,237,  7, 10
 
-    // ── Options ───────────────────────────────
-    GROUPBOX        "Options",   -1,   2,328,104, 30
-    CONTROL         "Double Sided",IDC_DOUBLE_SIDED,"Button",BS_AUTOCHECKBOX|WS_TABSTOP, 6,340, 56, 10
-    LTEXT           "Env",       -1,  64,340, 14,  8
-    CONTROL         "",  IDC_ENV_INT_EDIT,"CustEdit",  WS_TABSTOP, 78,338, 16, 10
-    CONTROL         "",  IDC_ENV_INT_SPIN,"SpinnerControl",0,      94,338,  7, 10
-
-    // ── Bottom padding ────────────────────────
-    LTEXT           "",  -1,   0,372,  0,  0
+    GROUPBOX        "Options",     -1,   2, 262, 166, 28
+    CONTROL         "Double Sided",IDC_DOUBLE_SIDED,"Button",BS_AUTOCHECKBOX | WS_TABSTOP, 8, 274, 68, 10
+    LTEXT           "Env",         -1, 108, 274, 14,   8
+    CONTROL         "",  IDC_ENV_INT_EDIT,"CustEdit",      WS_TABSTOP, 126,272, 16, 10
+    CONTROL         "",  IDC_ENV_INT_SPIN,"SpinnerControl", 0,         144,272,  7, 10
 END

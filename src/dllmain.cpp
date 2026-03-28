@@ -216,9 +216,7 @@ struct MaxJSPBR {
     float roughnessMapStrength = 1.0f;
     float metalnessMapStrength = 1.0f;
     float normalScale = 1.0f;
-    float bumpScale = 1.0f;
-    float displacementScale = 0.0f;
-    float displacementBias = 0.0f;
+    float parallaxScale = 0.0f;
     float emissiveMapStrength = 1.0f;
     float opacityMapStrength = 1.0f;
     float aoIntensity = 1.0f;
@@ -227,10 +225,10 @@ struct MaxJSPBR {
     bool  doubleSided = true;
     float envIntensity = 1.0f;
     std::wstring colorMap, roughnessMap, metalnessMap, normalMap;
-    std::wstring bumpMap, displacementMap;
+    std::wstring parallaxMap;
     std::wstring aoMap, emissionMap, lightmapFile, opacityMap;
     TexTransform colorMapTransform, roughnessMapTransform, metalnessMapTransform, normalMapTransform;
-    TexTransform bumpMapTransform, displacementMapTransform;
+    TexTransform parallaxMapTransform;
     TexTransform aoMapTransform, emissionMapTransform, lightmapTransform, opacityMapTransform;
     std::wstring mtlName;
 };
@@ -391,9 +389,7 @@ static void ExtractThreeJSMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
     d.roughnessMapStrength = pb->GetFloat(pb_roughness_map_strength, t);
     d.metalnessMapStrength = pb->GetFloat(pb_metalness_map_strength, t);
     d.normalScale = pb->GetFloat(pb_normal_scale, t);
-    d.bumpScale = pb->GetFloat(pb_bump_scale, t);
-    d.displacementScale = pb->GetFloat(pb_displacement_scale, t);
-    d.displacementBias = pb->GetFloat(pb_displacement_bias, t);
+    d.parallaxScale = pb->GetFloat(pb_bump_scale, t) * 0.1f;
     d.doubleSided = pb->GetInt(pb_double_sided, t) != 0;
     d.envIntensity = pb->GetFloat(pb_env_intensity, t);
 
@@ -417,8 +413,7 @@ static void ExtractThreeJSMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
     readMap(pb_roughness_map, d.roughnessMap, d.roughnessMapTransform);
     readMap(pb_metalness_map, d.metalnessMap, d.metalnessMapTransform);
     readMap(pb_normal_map, d.normalMap, d.normalMapTransform);
-    readMap(pb_bump_map, d.bumpMap, d.bumpMapTransform);
-    readMap(pb_displacement_map, d.displacementMap, d.displacementMapTransform);
+    readMap(pb_bump_map, d.parallaxMap, d.parallaxMapTransform);
     readMap(pb_emissive_map, d.emissionMap, d.emissionMapTransform);
     readMap(pb_opacity_map, d.opacityMap, d.opacityMapTransform);
     readMap(pb_lightmap, d.lightmapFile, d.lightmapTransform);
@@ -475,7 +470,9 @@ static void ExtractGltfMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
         }
         return def;
     };
-    auto readMap = [&](const MCHAR* pname) -> std::wstring {
+    auto readMap = [&](const MCHAR* pname, std::wstring& outPath, MaxJSPBR::TexTransform& outXf) {
+        outPath.clear();
+        outXf = {};
         for (int b = 0; b < mtl->NumParamBlocks(); b++) {
             IParamBlock2* pb = mtl->GetParamBlock(b);
             if (!pb) continue;
@@ -484,11 +481,11 @@ static void ExtractGltfMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
                 const ParamDef& pd = pb->GetParamDef(pid);
                 if (pd.int_name && _tcsicmp(pd.int_name, pname) == 0 && pd.type == TYPE_TEXMAP) {
                     Texmap* map = pb->GetTexmap(pid, t);
-                    return FindBitmapFile(map);
+                    ExtractMaterialTexture(map, outPath, outXf);
+                    return;
                 }
             }
         }
-        return {};
     };
 
     readColor(_T("baseColor"), d.color);
@@ -503,13 +500,13 @@ static void ExtractGltfMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
     readColor(_T("emissionColor"), d.emission);
     d.emIntensity = (d.emission[0] + d.emission[1] + d.emission[2] > 0) ? 1.0f : 0.0f;
 
-    d.colorMap     = readMap(_T("baseColorMap"));
-    d.roughnessMap = readMap(_T("roughnessMap"));
-    d.metalnessMap = readMap(_T("metalnessMap"));
-    d.normalMap    = readMap(_T("normalMap"));
-    d.aoMap        = readMap(_T("ambientOcclusionMap"));
-    d.emissionMap  = readMap(_T("emissionMap"));
-    d.opacityMap   = readMap(_T("AlphaMap"));
+    readMap(_T("baseColorMap"), d.colorMap, d.colorMapTransform);
+    readMap(_T("roughnessMap"), d.roughnessMap, d.roughnessMapTransform);
+    readMap(_T("metalnessMap"), d.metalnessMap, d.metalnessMapTransform);
+    readMap(_T("normalMap"), d.normalMap, d.normalMapTransform);
+    readMap(_T("ambientOcclusionMap"), d.aoMap, d.aoMapTransform);
+    readMap(_T("emissionMap"), d.emissionMap, d.emissionMapTransform);
+    readMap(_T("AlphaMap"), d.opacityMap, d.opacityMapTransform);
 }
 
 // Extract PBR from a single material (ThreeJS, glTF, or wire color fallback)
@@ -1588,8 +1585,7 @@ public:
         writeMap(L"roughMap", L"roughMapXf", pbr.roughnessMap, pbr.roughnessMapTransform);
         writeMap(L"metalMap", L"metalMapXf", pbr.metalnessMap, pbr.metalnessMapTransform);
         writeMap(L"normMap", L"normMapXf", pbr.normalMap, pbr.normalMapTransform);
-        writeMap(L"bumpMap", L"bumpMapXf", pbr.bumpMap, pbr.bumpMapTransform);
-        writeMap(L"dispMap", L"dispMapXf", pbr.displacementMap, pbr.displacementMapTransform);
+        writeMap(L"parallaxMap", L"parallaxMapXf", pbr.parallaxMap, pbr.parallaxMapTransform);
         writeMap(L"aoMap", L"aoMapXf", pbr.aoMap, pbr.aoMapTransform);
         writeMap(L"emMap", L"emMapXf", pbr.emissionMap, pbr.emissionMapTransform);
         writeMap(L"lmMap", L"lmMapXf", pbr.lightmapFile, pbr.lightmapTransform);
@@ -1625,17 +1621,9 @@ public:
         }
         ss << L",\"normScl\":";
         WriteFloatValue(ss, pbr.normalScale, 1.0f);
-        if (!pbr.bumpMap.empty() || pbr.bumpScale < 0.999f || pbr.bumpScale > 1.001f) {
-            ss << L",\"bumpS\":";
-            WriteFloatValue(ss, pbr.bumpScale, 1.0f);
-        }
-        if (!pbr.displacementMap.empty() || std::fabs(pbr.displacementScale) > 1.0e-6f) {
-            ss << L",\"dispS\":";
-            WriteFloatValue(ss, pbr.displacementScale, 0.0f);
-        }
-        if (!pbr.displacementMap.empty() || std::fabs(pbr.displacementBias) > 1.0e-6f) {
-            ss << L",\"dispB\":";
-            WriteFloatValue(ss, pbr.displacementBias, 0.0f);
+        if (!pbr.parallaxMap.empty() || std::fabs(pbr.parallaxScale) > 1.0e-6f) {
+            ss << L",\"parallaxS\":";
+            WriteFloatValue(ss, pbr.parallaxScale, 0.0f);
         }
         ss << L",\"aoI\":";
         WriteFloatValue(ss, pbr.aoIntensity, 1.0f);

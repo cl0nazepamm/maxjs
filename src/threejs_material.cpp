@@ -28,7 +28,7 @@ static const ParamID kMapParamIDs[kNumMaps] = {
 
 static const MCHAR* kMapSlotNames[kNumMaps] = {
     _T("Color Map"), _T("Roughness Map"), _T("Metalness Map"), _T("Normal Map"),
-    _T("Bump Map"), _T("Displacement Map"), _T("Emissive Map"),
+    _T("Parallax Map"), _T("Displacement Map"), _T("Emissive Map"),
     _T("Opacity Map"), _T("Light Map"), _T("AO Map")
 };
 
@@ -266,28 +266,25 @@ static ParamBlockDesc2 threejs_pb_desc(
         p_range, 0.0f, 5.0f,
         p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_NORMSCL_EDIT, IDC_NORMSCL_SPIN, 0.01f,
         p_end,
-    pb_bump_map, _T("bumpMap"), TYPE_TEXMAP, 0, 0,
+    pb_bump_map, _T("parallaxMap"), TYPE_TEXMAP, 0, 0,
         p_subtexno, kMap_Bump,
         p_ui, TYPE_TEXMAPBUTTON, IDC_BUMP_MAP,
         p_end,
-    pb_bump_scale, _T("bumpScale"), TYPE_FLOAT, P_ANIMATABLE, 0,
+    pb_bump_scale, _T("parallaxScale"), TYPE_FLOAT, P_ANIMATABLE, 0,
         p_default, 1.0f,
         p_range, 0.0f, 5.0f,
         p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_BUMP_EDIT, IDC_BUMP_SPIN, 0.01f,
         p_end,
     pb_displacement_map, _T("displacementMap"), TYPE_TEXMAP, 0, 0,
         p_subtexno, kMap_Displacement,
-        p_ui, TYPE_TEXMAPBUTTON, IDC_DISP_MAP,
         p_end,
     pb_displacement_scale, _T("displacementScale"), TYPE_FLOAT, P_ANIMATABLE, 0,
         p_default, 0.0f,
         p_range, -1000.0f, 1000.0f,
-        p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_DISP_EDIT, IDC_DISP_SPIN, 0.01f,
         p_end,
     pb_displacement_bias, _T("displacementBias"), TYPE_FLOAT, P_ANIMATABLE, 0,
         p_default, 0.0f,
         p_range, -1000.0f, 1000.0f,
-        p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_DISP_BIAS_EDIT, IDC_DISP_BIAS_SPIN, 0.01f,
         p_end,
 
     // ═══ Emission ═════════════════════════════════════════════

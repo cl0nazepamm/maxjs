@@ -36,6 +36,7 @@
             <button id="btnCamLock">Cam Lock: OFF</button>
             <button id="btnEnv" class="active">Env: ON</button>
             <button id="btnSel" class="active">Sel: ON</button>
+            <button id="btnSSGI">SSGI: OFF</button>
         </div>
     </div>
     <script type="importmap">
@@ -54,6 +55,7 @@
         import { HDRLoader } from 'three/addons/loaders/HDRLoader.js';
         import { applyDeltaFrame } from './js/protocol.js';
         import { createPerfHud } from './js/perf_hud.js';
+        import { createSSGIController } from './js/ssgi_fx.js';
 
         // ── Scene Setup (Z-up, matching Max) ────────────────
         const scene = new THREE.Scene();
@@ -129,6 +131,14 @@
         const nodeMap = new Map();
         const perfHud = createPerfHud(document.getElementById('info'));
         perfHud.setStatus(`MaxJS - ${rendererBackendLabel} renderer ready`);
+        const ssgiFx = createSSGIController({
+            renderer,
+            scene,
+            camera,
+            onError(message) {
+                perfHud.setStatus(`MaxJS - ${message}`);
+            },
+        });
         function createSolidTexture(r, g, b, a = 255) {
             const tex = new THREE.DataTexture(new Uint8Array([r, g, b, a]), 1, 1);
             tex.colorSpace = THREE.NoColorSpace;
@@ -859,17 +869,36 @@
             }
         };
 
+        const btnSSGI = document.getElementById('btnSSGI');
+        function syncSSGIButton() {
+            const enabled = ssgiFx.isEnabled();
+            btnSSGI.textContent = `SSGI: ${enabled ? 'ON' : 'OFF'}`;
+            btnSSGI.classList.toggle('active', enabled);
+        }
+
+        btnSSGI.onclick = () => {
+            const enabled = ssgiFx.setEnabled(!ssgiFx.isEnabled());
+            syncSSGIButton();
+            if (!enabled && !ssgiFx.isAvailable()) {
+                const message = ssgiFx.getLastError();
+                if (message) perfHud.setStatus(`MaxJS - SSGI unavailable: ${message}`);
+            }
+        };
+        syncSSGIButton();
+
         // ── Resize + Render ─────────────────────────────────
         addEventListener('resize', () => {
             camera.aspect = innerWidth / innerHeight;
             camera.updateProjectionMatrix();
             renderer.setSize(innerWidth, innerHeight);
+            ssgiFx.resize();
         });
 
         function renderFrame() {
             controls.update();
             const renderStart = performance.now();
-            renderer.render(scene, camera);
+            ssgiFx.render();
+            syncSSGIButton();
             perfHud.updateRender(performance.now() - renderStart, renderer.info?.render);
         }
 

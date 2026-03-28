@@ -6,12 +6,24 @@
     <title>MaxJS</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { overflow: hidden; background: #1a1a2e; }
+        body { overflow: hidden; background: #1a1a2e; position: relative; width: 100vw; height: 100vh; }
         canvas { display: block; }
+        #splatLayer {
+            position: absolute;
+            inset: 0;
+            z-index: 5;
+            pointer-events: none;
+        }
+        #splatLayer canvas {
+            position: absolute;
+            inset: 0;
+            pointer-events: none;
+        }
         #hud {
             position: absolute; top: 10px; left: 10px;
             color: #999; font: 13px 'Segoe UI', sans-serif;
             pointer-events: none;
+            z-index: 20;
         }
         #info {
             background: rgba(0,0,0,0.6); padding: 6px 10px;
@@ -50,6 +62,7 @@
             pointer-events: none;
             transform: translateX(24px);
             transition: opacity 0.18s ease, transform 0.18s ease;
+            z-index: 30;
         }
         .sidepanel.visible {
             opacity: 1;
@@ -174,22 +187,32 @@
         </div>
     </div>
     <aside id="postPanel" class="sidepanel" aria-hidden="true" inert></aside>
+    <div id="splatLayer" aria-hidden="true"></div>
     <script type="importmap">
     {
         "imports": {
-            "three": "https://cdn.jsdelivr.net/npm/three@0.182.0/build/three.webgpu.js",
-            "three/webgpu": "https://cdn.jsdelivr.net/npm/three@0.182.0/build/three.webgpu.js",
-            "three/tsl": "https://cdn.jsdelivr.net/npm/three@0.182.0/build/three.tsl.js",
-            "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.182.0/examples/jsm/"
+            "three": "https://cdn.jsdelivr.net/npm/three@0.183.2/build/three.webgpu.js",
+            "three-std": "https://cdn.jsdelivr.net/npm/three@0.183.2/build/three.module.js",
+            "three/webgpu": "https://cdn.jsdelivr.net/npm/three@0.183.2/build/three.webgpu.js",
+            "three/tsl": "https://cdn.jsdelivr.net/npm/three@0.183.2/build/three.tsl.js",
+            "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.183.2/examples/jsm/",
+            "gaussian-splats-3d": "https://cdn.jsdelivr.net/npm/@mkkellogg/gaussian-splats-3d@0.4.7/build/gaussian-splats-3d.module.js"
+        },
+        "scopes": {
+            "https://cdn.jsdelivr.net/npm/@mkkellogg/gaussian-splats-3d@0.4.7/": {
+                "three": "https://cdn.jsdelivr.net/npm/three@0.183.2/build/three.module.js"
+            }
         }
     }
     </script>
     <script type="module">
         import * as THREE from 'three';
+        import * as THREE_STD from 'three-std';
         import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
         import { HDRLoader } from 'three/addons/loaders/HDRLoader.js';
         import { LightProbeGenerator } from 'three/addons/lights/LightProbeGenerator.js';
         import { RectAreaLightTexturesLib } from 'three/addons/lights/RectAreaLightTexturesLib.js';
+        import { DropInViewer as GaussianSplatDropInViewer } from 'gaussian-splats-3d';
         import { color as tslColor, float as tslFloat, texture as tslTexture } from 'three/tsl';
         import { applyDeltaFrame } from './js/protocol.js';
         import { createPerfHud } from './js/perf_hud.js';
@@ -209,6 +232,9 @@
             nextRenderer.toneMapping = THREE.ACESFilmicToneMapping;
             nextRenderer.toneMappingExposure = 1.2;
             nextRenderer.shadowMap.enabled = true;
+            nextRenderer.domElement.style.position = 'absolute';
+            nextRenderer.domElement.style.inset = '0';
+            nextRenderer.domElement.style.zIndex = '0';
             document.body.appendChild(nextRenderer.domElement);
         }
 
@@ -275,6 +301,14 @@
         const textureCache = new Map();
         const materialCache = new Map();
         const nodeMap = new Map();
+        const splatLayer = document.getElementById('splatLayer');
+        const splatHandleMap = new Map();
+        const splatMatrix = new THREE_STD.Matrix4();
+        const splatPosition = new THREE_STD.Vector3();
+        const splatQuaternion = new THREE_STD.Quaternion();
+        const splatScale = new THREE_STD.Vector3();
+        let splatOverlay = null;
+        let splatMutationQueue = Promise.resolve();
         const perfHud = createPerfHud(document.getElementById('info'));
         perfHud.setStatus(`MaxJS - ${rendererBackendLabel} renderer ready`);
         const ssgiFx = createSSGIController({
@@ -286,6 +320,198 @@
                 perfHud.setStatus(`MaxJS - ${message}`);
             },
         });
+
+        function queueSplatMutation(work) {
+            splatMutationQueue = splatMutationQueue
+                .then(() => work())
+                .catch(error => {
+                    reportBridgeError('splat sync error', error);
+                });
+            return splatMutationQueue;
+        }
+
+        function syncSplatLayerVisibility() {
+            const visible = splatHandleMap.size > 0;
+            splatLayer.style.display = visible ? 'block' : 'none';
+            if (splatOverlay?.renderer?.domElement) {
+                splatOverlay.renderer.domElement.style.display = visible ? 'block' : 'none';
+            }
+        }
+
+        function ensureSplatOverlay() {
+            if (splatOverlay) return splatOverlay;
+
+            const overlayRenderer = new THREE_STD.WebGLRenderer({
+                antialias: true,
+                alpha: true,
+                premultipliedAlpha: true,
+            });
+            overlayRenderer.setPixelRatio(devicePixelRatio);
+            overlayRenderer.setSize(innerWidth, innerHeight, false);
+            overlayRenderer.setClearColor(0x000000, 0);
+            overlayRenderer.domElement.style.position = 'absolute';
+            overlayRenderer.domElement.style.inset = '0';
+            overlayRenderer.domElement.style.pointerEvents = 'none';
+            overlayRenderer.domElement.style.zIndex = '5';
+            overlayRenderer.outputColorSpace = THREE_STD.SRGBColorSpace;
+            splatLayer.appendChild(overlayRenderer.domElement);
+
+            const overlayScene = new THREE_STD.Scene();
+            const overlayCamera = new THREE_STD.PerspectiveCamera(camera.fov, camera.aspect, camera.near, camera.far);
+            overlayCamera.up.set(0, 0, 1);
+
+            const viewer = new GaussianSplatDropInViewer({
+                gpuAcceleratedSort: false,
+                sharedMemoryForWorkers: false,
+            });
+            viewer.frustumCulled = false;
+            overlayScene.add(viewer);
+
+            splatOverlay = {
+                renderer: overlayRenderer,
+                scene: overlayScene,
+                camera: overlayCamera,
+                viewer,
+            };
+            syncSplatLayerVisibility();
+            return splatOverlay;
+        }
+
+        function updateSplatViewerTransforms() {
+            const mesh = splatOverlay?.viewer?.getSplatMesh?.();
+            mesh?.updateTransforms?.();
+        }
+
+        function updateSplatCamera() {
+            if (!splatOverlay) return;
+
+            const overlayCamera = splatOverlay.camera;
+            overlayCamera.position.set(camera.position.x, camera.position.y, camera.position.z);
+            overlayCamera.quaternion.set(camera.quaternion.x, camera.quaternion.y, camera.quaternion.z, camera.quaternion.w);
+            overlayCamera.scale.set(camera.scale.x, camera.scale.y, camera.scale.z);
+            overlayCamera.up.set(camera.up.x, camera.up.y, camera.up.z);
+            overlayCamera.near = Math.max(camera.near, 0.01);
+            overlayCamera.far = Math.max(camera.far, overlayCamera.near + 1.0);
+            overlayCamera.aspect = camera.aspect;
+            overlayCamera.fov = camera.fov;
+            overlayCamera.updateProjectionMatrix();
+            overlayCamera.updateMatrixWorld(true);
+        }
+
+        function applySplatTransform(sceneRef, splat) {
+            if (!sceneRef) return;
+
+            if (isFiniteArray(splat?.t, 16)) {
+                splatMatrix.fromArray(splat.t);
+                splatMatrix.decompose(splatPosition, splatQuaternion, splatScale);
+                sceneRef.position.copy(splatPosition);
+                sceneRef.quaternion.copy(splatQuaternion);
+                sceneRef.scale.copy(splatScale);
+            } else {
+                sceneRef.position.set(0, 0, 0);
+                sceneRef.quaternion.identity();
+                sceneRef.scale.set(1, 1, 1);
+            }
+
+            sceneRef.visible = splat?.v == null ? true : !!splat.v;
+            sceneRef.updateMatrixWorld(true);
+            updateSplatViewerTransforms();
+        }
+
+        function findSplatSceneIndex(sceneRef) {
+            const viewer = splatOverlay?.viewer;
+            if (!viewer || !sceneRef) return -1;
+
+            const sceneCount = viewer.getSceneCount();
+            for (let i = 0; i < sceneCount; i++) {
+                if (viewer.getSplatScene(i) === sceneRef) return i;
+            }
+            return -1;
+        }
+
+        async function removeTrackedSplat(handle) {
+            const entry = splatHandleMap.get(handle);
+            if (!entry) return;
+
+            splatHandleMap.delete(handle);
+
+            if (splatOverlay) {
+                const index = findSplatSceneIndex(entry.scene);
+                if (index >= 0) {
+                    await splatOverlay.viewer.removeSplatScene(index, false);
+                }
+            }
+
+            syncSplatLayerVisibility();
+        }
+
+        async function upsertTrackedSplat(splat) {
+            const handle = splat?.h;
+            if (handle == null) return;
+
+            const url = typeof splat.url === 'string' ? splat.url : '';
+            if (!url) {
+                await removeTrackedSplat(handle);
+                return;
+            }
+
+            const overlay = ensureSplatOverlay();
+            const existing = splatHandleMap.get(handle);
+
+            if (existing && existing.url === url) {
+                applySplatTransform(existing.scene, splat);
+                syncSplatLayerVisibility();
+                return;
+            }
+
+            if (existing) {
+                await removeTrackedSplat(handle);
+            }
+
+            await overlay.viewer.addSplatScene(url, {
+                showLoadingUI: false,
+                position: [0, 0, 0],
+                rotation: [0, 0, 0, 1],
+                scale: [1, 1, 1],
+            });
+
+            const sceneRef = overlay.viewer.getSplatScene(overlay.viewer.getSceneCount() - 1);
+            if (!sceneRef) return;
+
+            sceneRef.name = splat.n || `Splat ${handle}`;
+            splatHandleMap.set(handle, { url, scene: sceneRef });
+            applySplatTransform(sceneRef, splat);
+            syncSplatLayerVisibility();
+        }
+
+        function reconcileSplats(splats = []) {
+            return queueSplatMutation(async () => {
+                const incomingHandles = new Set(splats.map(splat => splat.h));
+                const staleHandles = [];
+
+                for (const handle of splatHandleMap.keys()) {
+                    if (!incomingHandles.has(handle)) staleHandles.push(handle);
+                }
+
+                for (const handle of staleHandles) {
+                    await removeTrackedSplat(handle);
+                }
+
+                for (const splat of splats) {
+                    await upsertTrackedSplat(splat);
+                }
+            });
+        }
+
+        function applySplatUpdates(splats = []) {
+            if (!splats.length) return;
+
+            return queueSplatMutation(async () => {
+                for (const splat of splats) {
+                    await upsertTrackedSplat(splat);
+                }
+            });
+        }
         function createSolidTexture(r, g, b, a = 255) {
             const tex = new THREE.DataTexture(new Uint8Array([r, g, b, a]), 1, 1);
             tex.colorSpace = THREE.NoColorSpace;
@@ -959,6 +1185,7 @@
             if (msg.camera) applyCamera(msg.camera);
             if (msg.env?.hdri) loadHDRI(msg.env);
             if (msg.lights) applyLights(msg.lights);
+            reconcileSplats(msg.splats ?? []);
             scene.updateMatrixWorld(true);
 
             if (firstSync && msg.nodes.length > 0) {
@@ -1002,6 +1229,7 @@
                 if (nd.mat && mesh.material) applyMaterialScalar(mesh, nd.mat);
             }
             if (msg.lights) applyLightUpdates(msg.lights);
+            if (msg.splats) applySplatUpdates(msg.splats);
             if (msg.camera) applyCamera(msg.camera);
             scene.updateMatrixWorld(true);
             const applyMs = performance.now() - applyStart;
@@ -1128,6 +1356,7 @@
             if (meta.camera) applyCamera(meta.camera);
             if (meta.env?.hdri) loadHDRI(meta.env);
             if (meta.lights) applyLights(meta.lights);
+            reconcileSplats(meta.splats ?? []);
             scene.updateMatrixWorld(true);
 
             if (firstSync && meta.nodes.length > 0) {
@@ -1652,6 +1881,25 @@
                     { key: 'temporal', label: 'Temporal', type: 'checkbox' },
                 ],
             },
+            {
+                key: 'retro',
+                title: 'Retro / CRT',
+                copy: 'PS1-style posterization, scanlines, barrel distortion, and CRT effects.',
+                note: 'Works on WebGPU and WebGL fallback.',
+                requiresWebGPU: false,
+                isEnabled: () => ssgiFx.isRetroEnabled(),
+                setEnabled: (enabled) => ssgiFx.setRetroEnabled(enabled),
+                getValues: (state) => state.retro,
+                setValues: (patch) => ssgiFx.setRetroOptions(patch),
+                controls: [
+                    { key: 'colorDepth', label: 'Color Depth', min: 2, max: 64, step: 1, integer: true },
+                    { key: 'scanlineIntensity', label: 'Scanlines', min: 0, max: 1, step: 0.01 },
+                    { key: 'scanlineDensity', label: 'Scan Density', min: 0.02, max: 1, step: 0.01 },
+                    { key: 'vignetteIntensity', label: 'Vignette', min: 0, max: 1, step: 0.01 },
+                    { key: 'bleeding', label: 'Color Bleed', min: 0, max: 0.01, step: 0.001 },
+                    { key: 'curvature', label: 'Curvature', min: 0, max: 0.2, step: 0.01 },
+                ],
+            },
         ];
 
         function formatControlValue(control, value) {
@@ -1855,12 +2103,22 @@
             camera.updateProjectionMatrix();
             renderer.setSize(innerWidth, innerHeight);
             ssgiFx.resize();
+            if (splatOverlay) {
+                splatOverlay.renderer.setPixelRatio(devicePixelRatio);
+                splatOverlay.renderer.setSize(innerWidth, innerHeight, false);
+                splatOverlay.camera.aspect = camera.aspect;
+                splatOverlay.camera.updateProjectionMatrix();
+            }
         });
 
         function renderFrame() {
             controls.update();
             const renderStart = performance.now();
             ssgiFx.render();
+            if (splatOverlay && splatHandleMap.size > 0) {
+                updateSplatCamera();
+                splatOverlay.renderer.render(splatOverlay.scene, splatOverlay.camera);
+            }
             syncPostFxPanel();
             perfHud.updateRender(performance.now() - renderStart, renderer.info?.render);
         }

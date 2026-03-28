@@ -1,0 +1,23 @@
+#include "threejs_splat_res.h"
+#include <windows.h>
+
+STRINGTABLE
+BEGIN
+    IDS_SPLAT_PARAMS "Splat Origin"
+    IDS_SPLAT_DISPLAY_SIZE "Display Size"
+    IDS_SPLAT_FILE "Splat File"
+END
+
+IDD_THREEJS_SPLAT DIALOG 0, 0, 182, 52
+STYLE DS_SETFONT | WS_CHILD | WS_VISIBLE
+FONT 8, "Segoe UI"
+BEGIN
+    LTEXT           "File", -1, 4, 6, 16, 8
+    EDITTEXT        IDC_SPLAT_PATH, 24, 4, 110, 12, ES_AUTOHSCROLL | ES_READONLY
+    PUSHBUTTON      "Load...", IDC_SPLAT_LOAD, 138, 4, 40, 12
+    PUSHBUTTON      "Clear", IDC_SPLAT_CLEAR, 138, 20, 40, 12
+
+    LTEXT           "Display", -1, 4, 24, 20, 8
+    CONTROL         "", IDC_SPLAT_SIZE_EDIT, "CustEdit", WS_TABSTOP, 24, 22, 42, 10
+    CONTROL         "", IDC_SPLAT_SIZE_SPIN, "SpinnerControl", 0, 46, 22, 7, 10
+END

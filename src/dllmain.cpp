@@ -12,6 +12,7 @@
 #include "sync_protocol.h"
 #include "threejs_material.h"
 #include "threejs_lights.h"
+#include "threejs_splat.h"
 #include "threejs_toon.h"
 #include "threejs_renderer.h"
 
@@ -858,6 +859,7 @@ static bool ExtractMesh(INode* node, TimeValue t,
                         std::vector<MatGroup>& groups) {
     ObjectState os = node->EvalWorldState(t);
     if (!os.obj || os.obj->SuperClassID() != GEOMOBJECT_CLASS_ID) return false;
+    if (IsThreeJSSplatClassID(os.obj->ClassID())) return false;
     if (!os.obj->CanConvertToType(Class_ID(TRIOBJ_CLASS_ID, 0))) return false;
 
     TriObject* tri = static_cast<TriObject*>(
@@ -1152,10 +1154,12 @@ public:
     size_t geoScanCursor_ = 0;
     std::unordered_set<ULONG> geomHandles_;
     std::unordered_set<ULONG> lightHandles_;
+    std::unordered_set<ULONG> splatHandles_;
     std::unordered_set<ULONG> fastDirtyHandles_;
     std::unordered_map<ULONG, std::array<float, 16>> lastSentTransforms_;
     std::unordered_map<ULONG, uintptr_t> mtlHashMap_;  // node handle → material state hash
     std::unordered_map<ULONG, uint64_t> lightHashMap_; // node handle → light state hash
+    std::unordered_map<ULONG, uint64_t> splatHashMap_; // node handle → splat source state hash
     std::unordered_map<ULONG, uint64_t> geoHashMap_;   // node handle → geometry topology hash
     std::map<std::wstring, std::wstring> texDirMap_;    // dir → host
     int texDirCount_ = 0;
@@ -1325,10 +1329,12 @@ public:
         geoScanCursor_ = 0;
         geomHandles_.clear();
         lightHandles_.clear();
+        splatHandles_.clear();
         fastDirtyHandles_.clear();
         lastSentTransforms_.clear();
         mtlHashMap_.clear();
         lightHashMap_.clear();
+        splatHashMap_.clear();
         geoHashMap_.clear();
         ResetFastPathState(false);
     }
@@ -1379,11 +1385,12 @@ public:
 
     bool IsTrackedHandle(ULONG handle) const {
         return geomHandles_.find(handle) != geomHandles_.end()
-            || lightHandles_.find(handle) != lightHandles_.end();
+            || lightHandles_.find(handle) != lightHandles_.end()
+            || splatHandles_.find(handle) != splatHandles_.end();
     }
 
     bool HasTrackedNodes() const {
-        return !geomHandles_.empty() || !lightHandles_.empty();
+        return !geomHandles_.empty() || !lightHandles_.empty() || !splatHandles_.empty();
     }
 
     void QueueFastFlush() {
@@ -1493,6 +1500,31 @@ public:
         if (changed) QueueFastFlush();
     }
 
+    void MarkTrackedSplatTransformsDirty() {
+        if (splatHandles_.empty()) return;
+
+        Interface* ip = GetCOREInterface();
+        if (!ip) return;
+
+        TimeValue t = ip->GetTime();
+        bool changed = false;
+
+        for (ULONG handle : splatHandles_) {
+            INode* node = ip->GetINodeByHandle(handle);
+            if (!node) continue;
+
+            float xform[16];
+            GetTransform16(node, t, xform);
+
+            auto it = lastSentTransforms_.find(handle);
+            if (it == lastSentTransforms_.end() || !TransformEquals16(xform, it->second.data())) {
+                if (fastDirtyHandles_.insert(handle).second) changed = true;
+            }
+        }
+
+        if (changed) QueueFastFlush();
+    }
+
     void MarkVisibilityNodesDirty(const NodeEventNamespace::NodeKeyTab& nodes) {
         bool changed = false;
         for (int i = 0; i < nodes.Count(); ++i) {
@@ -1519,6 +1551,7 @@ public:
         if (!HasTrackedNodes()) return;
         fastDirtyHandles_.insert(geomHandles_.begin(), geomHandles_.end());
         fastDirtyHandles_.insert(lightHandles_.begin(), lightHandles_.end());
+        fastDirtyHandles_.insert(splatHandles_.begin(), splatHandles_.end());
         QueueFastFlush();
     }
 
@@ -1591,9 +1624,11 @@ public:
             jsReady_ = true; dirty_ = true;
             mtlHashMap_.clear();
             lightHashMap_.clear();
+            splatHashMap_.clear();
             geoHashMap_.clear();  // force all geometry to be sent
             lastSentTransforms_.clear();
             lightHandles_.clear();
+            splatHandles_.clear();
             geoScanCursor_ = 0;
             ResetFastPathState(false);
         }
@@ -1610,7 +1645,10 @@ public:
         } else {
             if (tickCount_ % 15 == 0) CheckWebContentChanges();
             if (tickCount_ % MATERIAL_DETECT_TICKS == 0) DetectMaterialChanges();
-            if (tickCount_ % LIGHT_DETECT_TICKS == 0) DetectLightChanges();
+            if (tickCount_ % LIGHT_DETECT_TICKS == 0) {
+                DetectLightChanges();
+                DetectSplatChanges();
+            }
             if (tickCount_ % 15 == 0) DetectGeometryChanges();
         }
     }
@@ -1630,17 +1668,20 @@ public:
         if (!hasDirtyNodes && !hasDirtyCamera) return;
 
         bool hasDirtyLights = false;
+        bool hasDirtySplats = false;
         for (ULONG handle : dirtyHandles) {
             if (lightHandles_.find(handle) != lightHandles_.end()) {
                 hasDirtyLights = true;
-                break;
+            }
+            if (splatHandles_.find(handle) != splatHandles_.end()) {
+                hasDirtySplats = true;
             }
         }
 
         fastDirtyHandles_.clear();
         fastCameraDirty_ = false;
 
-        if (!useBinary_ || hasDirtyLights) {
+        if (!useBinary_ || hasDirtyLights || hasDirtySplats) {
             if (hasDirtyNodes) SendTransformSync();
             else SendCameraSync();
             CaptureCurrentCameraState();
@@ -1671,9 +1712,11 @@ public:
             if (!node) {
                 mtlHashMap_.erase(handle);
                 lightHashMap_.erase(handle);
+                splatHashMap_.erase(handle);
                 geoHashMap_.erase(handle);
                 geomHandles_.erase(handle);
                 lightHandles_.erase(handle);
+                splatHandles_.erase(handle);
                 lastSentTransforms_.erase(handle);
                 dirty_ = true;
                 continue;
@@ -1874,6 +1917,27 @@ public:
         return HashFNV1a(payload.data(), payload.size() * sizeof(wchar_t));
     }
 
+    uint64_t ComputeSplatStateHash(INode* node, TimeValue t) {
+        if (!node) return 0;
+
+        ObjectState os = node->EvalWorldState(t);
+        if (!os.obj || !IsThreeJSSplatClassID(os.obj->ClassID())) {
+            const std::wstring payload = L"null";
+            return HashFNV1a(payload.data(), payload.size() * sizeof(wchar_t));
+        }
+
+        IParamBlock2* pb = os.obj->GetParamBlockByID(threejs_splat_params);
+        const MCHAR* rawPath = pb ? pb->GetStr(ps_splat_file) : nullptr;
+        std::wstring mappedPath = rawPath ? MapTexturePath(rawPath) : std::wstring{};
+
+        std::wostringstream ss;
+        ss.imbue(std::locale::classic());
+        ss << L"{\"v\":" << (node->IsNodeHidden(TRUE) ? L'0' : L'1');
+        ss << L",\"url\":\"" << EscapeJson(mappedPath.c_str()) << L"\"}";
+        const std::wstring payload = ss.str();
+        return HashFNV1a(payload.data(), payload.size() * sizeof(wchar_t));
+    }
+
     // Check if any material's serialized state changed — triggers full sync on NEXT tick
     void DetectMaterialChanges() {
         Interface* ip = GetCOREInterface();
@@ -1915,6 +1979,30 @@ public:
             auto it = lightHashMap_.find(handle);
             if (it == lightHashMap_.end()) {
                 lightHashMap_[handle] = hash;
+            } else if (it->second != hash) {
+                it->second = hash;
+                if (fastDirtyHandles_.insert(handle).second) changed = true;
+            }
+        }
+
+        if (changed) QueueFastFlush();
+    }
+
+    void DetectSplatChanges() {
+        Interface* ip = GetCOREInterface();
+        if (!ip || splatHandles_.empty()) return;
+
+        TimeValue t = ip->GetTime();
+        bool changed = false;
+
+        for (ULONG handle : splatHandles_) {
+            INode* node = ip->GetINodeByHandle(handle);
+            if (!node) continue;
+
+            const uint64_t hash = ComputeSplatStateHash(node, t);
+            auto it = splatHashMap_.find(handle);
+            if (it == splatHashMap_.end()) {
+                splatHashMap_[handle] = hash;
             } else if (it->second != hash) {
                 it->second = hash;
                 if (fastDirtyHandles_.insert(handle).second) changed = true;
@@ -2229,6 +2317,58 @@ public:
         return true;
     }
 
+    bool WriteSplatJson(std::wostringstream& ss, INode* node, TimeValue t,
+                        bool includeHandle = false, bool includeVisibility = false,
+                        bool trackHandle = false) {
+        if (!node) return false;
+
+        ObjectState os = node->EvalWorldState(t);
+        if (!os.obj || !IsThreeJSSplatClassID(os.obj->ClassID())) return false;
+
+        IParamBlock2* pb = os.obj->GetParamBlockByID(threejs_splat_params);
+        if (!pb) return false;
+
+        const MCHAR* rawPath = pb->GetStr(ps_splat_file);
+        std::wstring url = rawPath ? MapTexturePath(rawPath) : std::wstring{};
+
+        const ULONG handle = node->GetHandle();
+        float xform[16];
+        GetTransform16(node, t, xform);
+        if (trackHandle) {
+            splatHandles_.insert(handle);
+            RememberSentTransform(handle, xform);
+        }
+
+        ss << L'{';
+        bool needsComma = false;
+        auto appendComma = [&]() {
+            if (needsComma) ss << L',';
+            needsComma = true;
+        };
+
+        if (includeHandle) {
+            appendComma();
+            ss << L"\"h\":" << handle;
+        }
+
+        appendComma();
+        ss << L"\"n\":\"" << EscapeJson(node->GetName()) << L'"';
+
+        if (includeVisibility) {
+            appendComma();
+            ss << L"\"v\":" << (node->IsNodeHidden(TRUE) ? L'0' : L'1');
+        }
+
+        appendComma();
+        ss << L"\"t\":";
+        WriteFloats(ss, xform, 16);
+
+        appendComma();
+        ss << L"\"url\":\"" << EscapeJson(url.c_str()) << L"\"";
+        ss << L'}';
+        return true;
+    }
+
     void WriteLightsJson(std::wostringstream& ss, Interface* ip, TimeValue t,
                          bool includeHandle = false, bool includeVisibility = false,
                          bool trackHandles = false) {
@@ -2261,6 +2401,38 @@ public:
         ss << L']';
     }
 
+    void WriteSplatsJson(std::wostringstream& ss, Interface* ip, TimeValue t,
+                         bool includeHandle = false, bool includeVisibility = false,
+                         bool trackHandles = false) {
+        ss << L"\"splats\":[";
+        bool firstSplat = true;
+        INode* root = ip ? ip->GetRootNode() : nullptr;
+        if (root) {
+            std::function<void(INode*)> collectSplats = [&](INode* parent) {
+                for (int i = 0; i < parent->NumberOfChildren(); i++) {
+                    INode* node = parent->GetChildNode(i);
+                    if (!node) continue;
+                    if (node->IsNodeHidden(TRUE) && !includeVisibility) {
+                        collectSplats(node);
+                        continue;
+                    }
+
+                    std::wostringstream splatJson;
+                    splatJson.imbue(std::locale::classic());
+                    if (WriteSplatJson(splatJson, node, t, includeHandle, includeVisibility, trackHandles)) {
+                        if (!firstSplat) ss << L',';
+                        ss << splatJson.str();
+                        firstSplat = false;
+                    }
+
+                    collectSplats(node);
+                }
+            };
+            collectSplats(root);
+        }
+        ss << L']';
+    }
+
     std::uint32_t AllocateFrameId() {
         return nextFrameId_++;
     }
@@ -2277,6 +2449,7 @@ public:
 
         geomHandles_.clear();
         lightHandles_.clear();
+        splatHandles_.clear();
         lastSentTransforms_.clear();
 
         std::wostringstream ss;
@@ -2310,6 +2483,8 @@ public:
 
         ss << L",";
         WriteLightsJson(ss, ip, t, true, false, true);
+        ss << L",";
+        WriteSplatsJson(ss, ip, t, true, false, true);
 
         ss << L'}';
 
@@ -2322,6 +2497,11 @@ public:
         for (int i = 0; i < parent->NumberOfChildren(); i++) {
             INode* node = parent->GetChildNode(i);
             if (!node || node->IsNodeHidden(TRUE)) continue;
+            ObjectState os = node->EvalWorldState(t);
+            if (os.obj && IsThreeJSSplatClassID(os.obj->ClassID())) {
+                WriteSceneNodes(node, t, ss, first);
+                continue;
+            }
 
             std::vector<float> verts, uvs;
             std::vector<int> indices;
@@ -2396,6 +2576,7 @@ public:
 
         geomHandles_.clear();
         lightHandles_.clear();
+        splatHandles_.clear();
         lastSentTransforms_.clear();
 
         // Collect all geometry nodes
@@ -2415,6 +2596,11 @@ public:
             for (int i = 0; i < parent->NumberOfChildren(); i++) {
                 INode* node = parent->GetChildNode(i);
                 if (!node || node->IsNodeHidden(TRUE)) continue;
+                ObjectState os = node->EvalWorldState(t);
+                if (os.obj && IsThreeJSSplatClassID(os.obj->ClassID())) {
+                    collect(node);
+                    continue;
+                }
                 NodeGeo ng;
                 ng.node = node;
                 ng.handle = node->GetHandle();
@@ -2454,6 +2640,10 @@ public:
         }
         for (auto it = lightHashMap_.begin(); it != lightHashMap_.end(); ) {
             if (lightHandles_.find(it->first) == lightHandles_.end()) it = lightHashMap_.erase(it);
+            else ++it;
+        }
+        for (auto it = splatHashMap_.begin(); it != splatHashMap_.end(); ) {
+            if (splatHandles_.find(it->first) == splatHandles_.end()) it = splatHashMap_.erase(it);
             else ++it;
         }
 
@@ -2551,6 +2741,8 @@ public:
         ss << L'}';
         ss << L",";
         WriteLightsJson(ss, ip, t, true, false, true);
+        ss << L",";
+        WriteSplatsJson(ss, ip, t, true, false, true);
         ss << L'}';
 
         wv17->PostSharedBufferToScript(sharedBuf.Get(),
@@ -2620,6 +2812,8 @@ public:
         }
         ss << L"],";
         WriteLightsJson(ss, ip, t, true, true, true);
+        ss << L",";
+        WriteSplatsJson(ss, ip, t, true, true, true);
         ss << L",";
         WriteCameraJson(ss);
         ss << L'}';
@@ -2777,8 +2971,10 @@ public:
         lastSentTransforms_.clear();
         geomHandles_.clear();
         lightHandles_.clear();
+        splatHandles_.clear();
         mtlHashMap_.clear();
         lightHashMap_.clear();
+        splatHashMap_.clear();
         geoHashMap_.clear();
         if (hwnd_) { HWND h = hwnd_; hwnd_ = nullptr; DestroyWindow(h); }
     }
@@ -2841,6 +3037,7 @@ void MaxJSFastRedrawCallback::proc(Interface*) {
     if (!owner_) return;
     owner_->MarkSelectedTransformsDirty();
     owner_->MarkTrackedLightTransformsDirty();
+    owner_->MarkTrackedSplatTransformsDirty();
     owner_->MarkCameraDirtyIfChanged();
 }
 
@@ -2977,7 +3174,7 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, ULONG fdwReason, LPVOID) {
 }
 
 __declspec(dllexport) const TCHAR* LibDescription()   { return MAXJS_NAME; }
-__declspec(dllexport) int LibNumberClasses()           { return 14; }
+__declspec(dllexport) int LibNumberClasses()           { return 15; }
 __declspec(dllexport) ClassDesc* LibClassDesc(int i) {
     switch (i) {
         case 0: return &maxJSDesc;
@@ -2994,6 +3191,7 @@ __declspec(dllexport) ClassDesc* LibClassDesc(int i) {
         case 11: return GetThreeJSHemisphereLightDesc();
         case 12: return GetThreeJSAmbientLightDesc();
         case 13: return GetThreeJSToonDesc();
+        case 14: return GetThreeJSSplatDesc();
         default: return nullptr;
     }
 }

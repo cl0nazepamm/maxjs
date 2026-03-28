@@ -190,6 +190,7 @@
         import { HDRLoader } from 'three/addons/loaders/HDRLoader.js';
         import { LightProbeGenerator } from 'three/addons/lights/LightProbeGenerator.js';
         import { RectAreaLightTexturesLib } from 'three/addons/lights/RectAreaLightTexturesLib.js';
+        import { color as tslColor, float as tslFloat, texture as tslTexture } from 'three/tsl';
         import { applyDeltaFrame } from './js/protocol.js';
         import { createPerfHud } from './js/perf_hud.js';
         import { createSSGIController } from './js/ssgi_fx.js';
@@ -538,17 +539,47 @@
             mesh.receiveShadow = true;
         }
 
+        function applySSSMaterialNodes(material, md) {
+            if (!material || typeof material !== 'object') return;
+
+            const sssColor = Array.isArray(md.sssColor) && md.sssColor.length === 3
+                ? new THREE.Color(md.sssColor[0], md.sssColor[1], md.sssColor[2])
+                : new THREE.Color(1, 1, 1);
+            let thicknessColorNode = tslColor(sssColor);
+
+            if (md.sssMap) {
+                const sssMap = loadTexture(md.sssMap, THREE.SRGBColorSpace, md.sssMapXf, fallbackWhiteTexture);
+                thicknessColorNode = tslTexture(sssMap).rgb.mul(thicknessColorNode);
+            }
+
+            material.thicknessColorNode = thicknessColorNode;
+            material.thicknessDistortionNode = tslFloat(md.sssDistortion ?? 0.1);
+            material.thicknessAmbientNode = tslFloat(md.sssAmbient ?? 0.0);
+            material.thicknessAttenuationNode = tslFloat(md.sssAttenuation ?? 0.1);
+            material.thicknessPowerNode = tslFloat(md.sssPower ?? 2.0);
+            material.thicknessScaleNode = tslFloat(md.sssScale ?? 10.0);
+        }
+
         function createMaterial(md) {
             const requestedModelName = md.model || 'MeshStandardMaterial';
             const wantsToonMaterial = requestedModelName === 'MeshToonMaterial';
+            const wantsSSSMaterial = requestedModelName === 'MeshSSSNodeMaterial';
             const wantsAdvancedMaterial =
                 requestedModelName === 'MeshPhysicalMaterial' ||
                 requestedModelName === 'MeshStandardNodeMaterial';
             const canUseToonMaterial = wantsToonMaterial && typeof THREE.MeshToonMaterial === 'function';
+            const canUseSSSMaterial =
+                wantsSSSMaterial &&
+                typeof THREE.MeshSSSNodeMaterial === 'function' &&
+                typeof tslColor === 'function' &&
+                typeof tslFloat === 'function' &&
+                typeof tslTexture === 'function';
             const runtimeModelName = canUseToonMaterial
                 ? 'MeshToonMaterial'
-                : (wantsAdvancedMaterial ? 'MeshPhysicalMaterial' : 'MeshStandardMaterial');
-            const key = `${requestedModelName}::${runtimeModelName}::${md.name || 'default'}`;
+                : (canUseSSSMaterial
+                    ? 'MeshSSSNodeMaterial'
+                    : ((wantsAdvancedMaterial || wantsSSSMaterial) ? 'MeshPhysicalMaterial' : 'MeshStandardMaterial'));
+            const key = JSON.stringify([requestedModelName, runtimeModelName, md]);
             let template = materialCache.get(key);
 
             if (!template) {
@@ -595,7 +626,11 @@
 
                 if (canUseToonMaterial) {
                     template = new THREE.MeshToonMaterial(params);
+                } else if (canUseSSSMaterial) {
+                    template = new THREE.MeshSSSNodeMaterial(params);
                 } else if (wantsAdvancedMaterial) {
+                    template = new THREE.MeshPhysicalMaterial(params);
+                } else if (wantsSSSMaterial) {
                     template = new THREE.MeshPhysicalMaterial(params);
                 } else {
                     template = new THREE.MeshStandardMaterial(params);
@@ -605,6 +640,8 @@
                 template.userData.maxjsMaterialModel = runtimeModelName;
                 template.userData.maxjsToonMaterialFallback =
                     wantsToonMaterial && !canUseToonMaterial;
+                template.userData.maxjsSSSMaterialFallback =
+                    wantsSSSMaterial && !canUseSSSMaterial;
 
                 // Textures
                 if (md.map) template.map = loadTexture(md.map, THREE.SRGBColorSpace, md.mapXf, fallbackWhiteTexture);
@@ -626,6 +663,10 @@
                 if (md.lmMap) {
                     template.lightMap = loadTexture(md.lmMap, THREE.LinearSRGBColorSpace, md.lmMapXf, fallbackWhiteTexture);
                     template.lightMapIntensity = md.lmI ?? 1.0;
+                }
+
+                if (canUseSSSMaterial) {
+                    applySSSMaterialNodes(template, md);
                 }
 
                 rememberMaterialEmissiveBase(template);

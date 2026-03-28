@@ -23,19 +23,25 @@ extern HINSTANCE hInstance;
 static const ParamID kMapParamIDs[kNumMaps] = {
     pb_color_map, pb_roughness_map, pb_metalness_map, pb_normal_map,
     pb_bump_map, pb_displacement_map, pb_parallax_map, pb_emissive_map,
-    pb_opacity_map, pb_lightmap, pb_ao_map
+    pb_opacity_map, pb_lightmap, pb_ao_map, pb_sss_color_map
 };
 
 static const MCHAR* kMapSlotNames[kNumMaps] = {
     _T("Color Map"), _T("Roughness Map"), _T("Metalness Map"), _T("Normal Map"),
     _T("Bump Map"), _T("Displacement Map"), _T("Parallax Map"), _T("Emissive Map"),
-    _T("Opacity Map"), _T("Light Map"), _T("AO Map")
+    _T("Opacity Map"), _T("Light Map"), _T("AO Map"), _T("SSS Color Map")
+};
+
+enum class ThreeJSMaterialKind {
+    Standard,
+    Physical,
+    SSS,
 };
 
 class ThreeJSMtl : public Mtl, public MaxSDK::Graphics::ITextureDisplay {
 public:
-    explicit ThreeJSMtl(BOOL loading, bool advanced)
-        : advanced_(advanced) {
+    explicit ThreeJSMtl(BOOL loading, ThreeJSMaterialKind kind)
+        : kind_(kind) {
         GetDescriptor()->MakeAutoParamBlocks(this);
     }
 
@@ -44,10 +50,22 @@ public:
     }
 
     void DeleteThis() override { delete this; }
-    Class_ID ClassID() override { return advanced_ ? THREEJS_ADV_MTL_CLASS_ID : THREEJS_MTL_CLASS_ID; }
+    Class_ID ClassID() override {
+        switch (kind_) {
+            case ThreeJSMaterialKind::Physical: return THREEJS_ADV_MTL_CLASS_ID;
+            case ThreeJSMaterialKind::SSS: return THREEJS_SSS_MTL_CLASS_ID;
+            case ThreeJSMaterialKind::Standard:
+            default: return THREEJS_MTL_CLASS_ID;
+        }
+    }
     SClass_ID SuperClassID() override { return MATERIAL_CLASS_ID; }
     void GetClassName(MSTR& s, bool localized) const override {
-        s = advanced_ ? _T("ThreeJS Adv") : _T("ThreeJS Material");
+        switch (kind_) {
+            case ThreeJSMaterialKind::Physical: s = _T("ThreeJS Adv"); break;
+            case ThreeJSMaterialKind::SSS: s = _T("ThreeJS SSS"); break;
+            case ThreeJSMaterialKind::Standard:
+            default: s = _T("ThreeJS Material"); break;
+        }
     }
 
     int NumRefs() override { return 1; }
@@ -61,7 +79,7 @@ public:
     }
 
     RefTargetHandle Clone(RemapDir& remap) override {
-        ThreeJSMtl* m = new ThreeJSMtl(FALSE, advanced_);
+        ThreeJSMtl* m = new ThreeJSMtl(FALSE, kind_);
         *static_cast<MtlBase*>(m) = *static_cast<MtlBase*>(this);
         BaseClone(this, m, remap);
         m->ReplaceReference(0, remap.CloneRef(pblock));
@@ -172,21 +190,26 @@ private:
     }
 
     ClassDesc2* GetDescriptor() const {
-        return advanced_ ? GetThreeJSAdvMtlDesc() : GetThreeJSMtlDesc();
+        switch (kind_) {
+            case ThreeJSMaterialKind::Physical: return GetThreeJSAdvMtlDesc();
+            case ThreeJSMaterialKind::SSS: return GetThreeJSSSSMtlDesc();
+            case ThreeJSMaterialKind::Standard:
+            default: return GetThreeJSMtlDesc();
+        }
     }
 
     bool texDisplayOn_ = false;
     TexHandle* texHandle_ = nullptr;
-    bool advanced_ = false;
+    ThreeJSMaterialKind kind_ = ThreeJSMaterialKind::Standard;
 };
 
 class ThreeJSMtlClassDesc : public ClassDesc2 {
 public:
-    ThreeJSMtlClassDesc(bool advanced, Class_ID classID, const TCHAR* className, const TCHAR* internalName)
-        : advanced_(advanced), classID_(classID), className_(className), internalName_(internalName) {}
+    ThreeJSMtlClassDesc(ThreeJSMaterialKind kind, Class_ID classID, const TCHAR* className, const TCHAR* internalName)
+        : kind_(kind), classID_(classID), className_(className), internalName_(internalName) {}
 
     int IsPublic() override { return TRUE; }
-    void* Create(BOOL loading) override { return new ThreeJSMtl(loading, advanced_); }
+    void* Create(BOOL loading) override { return new ThreeJSMtl(loading, kind_); }
     const TCHAR* ClassName() override { return className_; }
     const TCHAR* NonLocalizedClassName() override { return className_; }
     SClass_ID SuperClassID() override { return MATERIAL_CLASS_ID; }
@@ -196,19 +219,22 @@ public:
     HINSTANCE HInstance() override { return hInstance; }
 
 private:
-    bool advanced_ = false;
+    ThreeJSMaterialKind kind_ = ThreeJSMaterialKind::Standard;
     Class_ID classID_;
     const TCHAR* className_ = nullptr;
     const TCHAR* internalName_ = nullptr;
 };
 
 static ThreeJSMtlClassDesc threeJSMtlDesc(
-    false, THREEJS_MTL_CLASS_ID, _T("ThreeJS Material"), _T("ThreeJSMaterial"));
+    ThreeJSMaterialKind::Standard, THREEJS_MTL_CLASS_ID, _T("ThreeJS Material"), _T("ThreeJSMaterial"));
 static ThreeJSMtlClassDesc threeJSAdvMtlDesc(
-    true, THREEJS_ADV_MTL_CLASS_ID, _T("ThreeJS Adv"), _T("ThreeJSAdvMaterial"));
+    ThreeJSMaterialKind::Physical, THREEJS_ADV_MTL_CLASS_ID, _T("ThreeJS Adv"), _T("ThreeJSAdvMaterial"));
+static ThreeJSMtlClassDesc threeJSSSSMtlDesc(
+    ThreeJSMaterialKind::SSS, THREEJS_SSS_MTL_CLASS_ID, _T("ThreeJS SSS"), _T("ThreeJSSSSMaterial"));
 
 ClassDesc2* GetThreeJSMtlDesc() { return &threeJSMtlDesc; }
 ClassDesc2* GetThreeJSAdvMtlDesc() { return &threeJSAdvMtlDesc; }
+ClassDesc2* GetThreeJSSSSMtlDesc() { return &threeJSSSSMtlDesc; }
 
 #define THREEJS_COMMON_PARAM_ITEMS \
     pb_color, _T("color"), TYPE_RGBA, P_ANIMATABLE, 0, \
@@ -349,7 +375,7 @@ ClassDesc2* GetThreeJSAdvMtlDesc() { return &threeJSAdvMtlDesc; }
         p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_ENV_INT_EDIT, IDC_ENV_INT_SPIN, 0.1f, \
         p_end
 
-#define THREEJS_HIDDEN_ADV_PARAM_ITEMS \
+#define THREEJS_HIDDEN_LEGACY_PARAM_ITEMS \
     pb_parallax_map, _T("parallaxMap"), TYPE_TEXMAP, 0, 0, \
         p_subtexno, kMap_Parallax, \
         p_end, \
@@ -358,15 +384,39 @@ ClassDesc2* GetThreeJSAdvMtlDesc() { return &threeJSAdvMtlDesc; }
         p_range, -1.0f, 1.0f, \
         p_end
 
-#define THREEJS_ADV_PARAM_ITEMS \
-    pb_parallax_map, _T("parallaxMap"), TYPE_TEXMAP, 0, 0, \
-        p_subtexno, kMap_Parallax, \
-        p_ui, TYPE_TEXMAPBUTTON, IDC_PARALLAX_MAP, \
+#define THREEJS_SSS_PARAM_ITEMS \
+    pb_sss_color, _T("sssColor"), TYPE_RGBA, P_ANIMATABLE, 0, \
+        p_default, Color(1.0f, 1.0f, 1.0f), \
+        p_ui, TYPE_COLORSWATCH, IDC_SSS_COLOR, \
         p_end, \
-    pb_parallax_scale, _T("parallaxScale"), TYPE_FLOAT, P_ANIMATABLE, 0, \
+    pb_sss_color_map, _T("sssColorMap"), TYPE_TEXMAP, 0, 0, \
+        p_subtexno, kMap_SSSColor, \
+        p_ui, TYPE_TEXMAPBUTTON, IDC_SSS_COLOR_MAP, \
+        p_end, \
+    pb_sss_distortion, _T("sssDistortion"), TYPE_FLOAT, P_ANIMATABLE, 0, \
+        p_default, 0.1f, \
+        p_range, 0.0f, 4.0f, \
+        p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_SSS_DIST_EDIT, IDC_SSS_DIST_SPIN, 0.01f, \
+        p_end, \
+    pb_sss_ambient, _T("sssAmbient"), TYPE_FLOAT, P_ANIMATABLE, 0, \
         p_default, 0.0f, \
-        p_range, -1.0f, 1.0f, \
-        p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_PARALLAX_EDIT, IDC_PARALLAX_SPIN, 0.001f, \
+        p_range, 0.0f, 4.0f, \
+        p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_SSS_AMB_EDIT, IDC_SSS_AMB_SPIN, 0.01f, \
+        p_end, \
+    pb_sss_attenuation, _T("sssAttenuation"), TYPE_FLOAT, P_ANIMATABLE, 0, \
+        p_default, 0.1f, \
+        p_range, 0.0f, 4.0f, \
+        p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_SSS_ATT_EDIT, IDC_SSS_ATT_SPIN, 0.01f, \
+        p_end, \
+    pb_sss_power, _T("sssPower"), TYPE_FLOAT, P_ANIMATABLE, 0, \
+        p_default, 2.0f, \
+        p_range, 0.0f, 16.0f, \
+        p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_SSS_PWR_EDIT, IDC_SSS_PWR_SPIN, 0.05f, \
+        p_end, \
+    pb_sss_scale, _T("sssScale"), TYPE_FLOAT, P_ANIMATABLE, 0, \
+        p_default, 10.0f, \
+        p_range, 0.0f, 100.0f, \
+        p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_SSS_SCALE_EDIT, IDC_SSS_SCALE_SPIN, 0.1f, \
         p_end
 
 static ParamBlockDesc2 threejs_pb_desc(
@@ -378,7 +428,7 @@ static ParamBlockDesc2 threejs_pb_desc(
     0,
     IDD_THREEJS_MTL, IDS_PARAMS, 0, 0, nullptr,
     THREEJS_COMMON_PARAM_ITEMS,
-    THREEJS_HIDDEN_ADV_PARAM_ITEMS,
+    THREEJS_HIDDEN_LEGACY_PARAM_ITEMS,
     p_end
 );
 
@@ -391,6 +441,20 @@ static ParamBlockDesc2 threejs_adv_pb_desc(
     0,
     IDD_THREEJS_ADV_MTL, IDS_ADV_PARAMS, 0, 0, nullptr,
     THREEJS_COMMON_PARAM_ITEMS,
-    THREEJS_ADV_PARAM_ITEMS,
+    THREEJS_HIDDEN_LEGACY_PARAM_ITEMS,
+    p_end
+);
+
+static ParamBlockDesc2 threejs_sss_pb_desc(
+    threejs_params,
+    _T("ThreeJS SSS Parameters"),
+    IDS_SSS_PARAMS,
+    &threeJSSSSMtlDesc,
+    P_AUTO_CONSTRUCT + P_AUTO_UI,
+    0,
+    IDD_THREEJS_SSS_MTL, IDS_SSS_PARAMS, 0, 0, nullptr,
+    THREEJS_COMMON_PARAM_ITEMS,
+    THREEJS_HIDDEN_LEGACY_PARAM_ITEMS,
+    THREEJS_SSS_PARAM_ITEMS,
     p_end
 );

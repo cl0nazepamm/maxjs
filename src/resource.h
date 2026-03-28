@@ -4,6 +4,8 @@
 #define IDS_PARAMS          102
 #define IDD_THREEJS_ADV_MTL 103
 #define IDS_ADV_PARAMS      104
+#define IDD_THREEJS_SSS_MTL 105
+#define IDS_SSS_PARAMS      106
 
 // PBR Core
 #define IDC_COLOR           1001
@@ -65,3 +67,15 @@
 #define IDC_PARALLAX_MAP    1072
 #define IDC_PARALLAX_EDIT   1073
 #define IDC_PARALLAX_SPIN   1074
+#define IDC_SSS_COLOR       1075
+#define IDC_SSS_COLOR_MAP   1076
+#define IDC_SSS_DIST_EDIT   1077
+#define IDC_SSS_DIST_SPIN   1078
+#define IDC_SSS_AMB_EDIT    1079
+#define IDC_SSS_AMB_SPIN    1080
+#define IDC_SSS_ATT_EDIT    1081
+#define IDC_SSS_ATT_SPIN    1082
+#define IDC_SSS_PWR_EDIT    1083
+#define IDC_SSS_PWR_SPIN    1084
+#define IDC_SSS_SCALE_EDIT  1085
+#define IDC_SSS_SCALE_SPIN  1086

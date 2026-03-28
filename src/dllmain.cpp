@@ -320,11 +320,17 @@ struct MaxJSPBR {
     int   lightmapChannel = 2;
     bool  doubleSided = true;
     float envIntensity = 1.0f;
+    float sssColor[3] = {1.0f, 1.0f, 1.0f};
+    float sssDistortion = 0.1f;
+    float sssAmbient = 0.0f;
+    float sssAttenuation = 0.1f;
+    float sssPower = 2.0f;
+    float sssScale = 10.0f;
     std::wstring colorMap, gradientMap, roughnessMap, metalnessMap, normalMap;
-    std::wstring bumpMap, displacementMap, parallaxMap;
+    std::wstring bumpMap, displacementMap, parallaxMap, sssColorMap;
     std::wstring aoMap, emissionMap, lightmapFile, opacityMap;
     TexTransform colorMapTransform, gradientMapTransform, roughnessMapTransform, metalnessMapTransform, normalMapTransform;
-    TexTransform bumpMapTransform, displacementMapTransform, parallaxMapTransform;
+    TexTransform bumpMapTransform, displacementMapTransform, parallaxMapTransform, sssColorMapTransform;
     TexTransform aoMapTransform, emissionMapTransform, lightmapTransform, opacityMapTransform;
     std::wstring mtlName;
     std::wstring materialModel = L"MeshStandardMaterial";
@@ -340,14 +346,16 @@ static std::wstring FindPBString(Texmap* map, const MCHAR* name);
 // glTF Material Class_ID = (943849874, 1174294043)
 #define GLTF_MTL_CLASS_ID Class_ID(943849874, 1174294043)
 
-static bool IsThreeJSStandardMaterialClass(const Class_ID& cid) {
-    return cid == THREEJS_MTL_CLASS_ID || cid == THREEJS_ADV_MTL_CLASS_ID;
+static bool IsThreeJSMaterialClass(const Class_ID& cid) {
+    return cid == THREEJS_MTL_CLASS_ID ||
+           cid == THREEJS_ADV_MTL_CLASS_ID ||
+           cid == THREEJS_SSS_MTL_CLASS_ID;
 }
 
 static bool IsSupportedMaterial(Mtl* mtl) {
     if (!mtl) return false;
     Class_ID cid = mtl->ClassID();
-    return IsThreeJSStandardMaterialClass(cid) || cid == THREEJS_TOON_CLASS_ID || cid == GLTF_MTL_CLASS_ID;
+    return IsThreeJSMaterialClass(cid) || cid == THREEJS_TOON_CLASS_ID || cid == GLTF_MTL_CLASS_ID;
 }
 
 // Find ThreeJS or glTF Material in material tree — uses ClassID only
@@ -481,9 +489,14 @@ static void ExtractThreeJSMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
 
     MSTR name = mtl->GetName();
     d.mtlName = name.data();
-    d.materialModel = (mtl->ClassID() == THREEJS_ADV_MTL_CLASS_ID)
-        ? L"MeshPhysicalMaterial"
-        : L"MeshStandardMaterial";
+    const Class_ID cid = mtl->ClassID();
+    if (cid == THREEJS_ADV_MTL_CLASS_ID) {
+        d.materialModel = L"MeshPhysicalMaterial";
+    } else if (cid == THREEJS_SSS_MTL_CLASS_ID) {
+        d.materialModel = L"MeshSSSNodeMaterial";
+    } else {
+        d.materialModel = L"MeshStandardMaterial";
+    }
 
     Color c = pb->GetColor(pb_color, t);
     d.color[0] = c.r; d.color[1] = c.g; d.color[2] = c.b;
@@ -511,6 +524,16 @@ static void ExtractThreeJSMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
     d.lightmapIntensity = pb->GetFloat(pb_lightmap_intensity, t);
     d.lightmapChannel = pb->GetInt(pb_lightmap_channel, t);
 
+    if (cid == THREEJS_SSS_MTL_CLASS_ID) {
+        Color sss = pb->GetColor(pb_sss_color, t);
+        d.sssColor[0] = sss.r; d.sssColor[1] = sss.g; d.sssColor[2] = sss.b;
+        d.sssDistortion = pb->GetFloat(pb_sss_distortion, t);
+        d.sssAmbient = pb->GetFloat(pb_sss_ambient, t);
+        d.sssAttenuation = pb->GetFloat(pb_sss_attenuation, t);
+        d.sssPower = pb->GetFloat(pb_sss_power, t);
+        d.sssScale = pb->GetFloat(pb_sss_scale, t);
+    }
+
     auto readMap = [&](ParamID pid, std::wstring& outPath, MaxJSPBR::TexTransform& outXf) {
         Texmap* map = pb->GetTexmap(pid, t);
         outPath.clear();
@@ -528,6 +551,9 @@ static void ExtractThreeJSMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
     readMap(pb_opacity_map, d.opacityMap, d.opacityMapTransform);
     readMap(pb_lightmap, d.lightmapFile, d.lightmapTransform);
     readMap(pb_ao_map, d.aoMap, d.aoMapTransform);
+    if (cid == THREEJS_SSS_MTL_CLASS_ID) {
+        readMap(pb_sss_color_map, d.sssColorMap, d.sssColorMapTransform);
+    }
 }
 
 static void ExtractThreeJSToonMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
@@ -666,7 +692,7 @@ static void ExtractPBRFromMtl(Mtl* mtl, INode* node, TimeValue t, MaxJSPBR& d) {
         Mtl* found = FindSupportedMaterial(mtl);
         if (found) {
             const Class_ID cid = found->ClassID();
-            if (IsThreeJSStandardMaterialClass(cid))
+            if (IsThreeJSMaterialClass(cid))
                 ExtractThreeJSMtl(found, t, d);
             else if (cid == THREEJS_TOON_CLASS_ID)
                 ExtractThreeJSToonMtl(found, t, d);
@@ -707,7 +733,7 @@ static void ExtractPBR(INode* node, TimeValue t, MaxJSPBR& d) {
     Mtl* found = FindSupportedMaterial(mtl);
     if (found) {
         const Class_ID cid = found->ClassID();
-        if (IsThreeJSStandardMaterialClass(cid))
+        if (IsThreeJSMaterialClass(cid))
             ExtractThreeJSMtl(found, t, d);
         else if (cid == THREEJS_TOON_CLASS_ID)
             ExtractThreeJSToonMtl(found, t, d);
@@ -727,7 +753,7 @@ static void ExtractMaterialScalarPreview(Mtl* foundMtl, INode* node, TimeValue t
     }
 
     const Class_ID cid = foundMtl->ClassID();
-    if (IsThreeJSStandardMaterialClass(cid)) {
+    if (IsThreeJSMaterialClass(cid)) {
         IParamBlock2* pb = foundMtl->GetParamBlockByID(threejs_params);
         if (pb) {
             Color c = pb->GetColor(pb_color, t);
@@ -1899,6 +1925,7 @@ public:
         writeMap(L"dispMap", L"dispMapXf", pbr.displacementMap, pbr.displacementMapTransform);
         writeMap(L"parallaxMap", L"parallaxMapXf", pbr.parallaxMap, pbr.parallaxMapTransform);
         writeMap(L"aoMap", L"aoMapXf", pbr.aoMap, pbr.aoMapTransform);
+        writeMap(L"sssMap", L"sssMapXf", pbr.sssColorMap, pbr.sssColorMapTransform);
         writeMap(L"emMap", L"emMapXf", pbr.emissionMap, pbr.emissionMapTransform);
         writeMap(L"lmMap", L"lmMapXf", pbr.lightmapFile, pbr.lightmapTransform);
         writeMap(L"opMap", L"opMapXf", pbr.opacityMap, pbr.opacityMapTransform);
@@ -1952,6 +1979,22 @@ public:
         WriteFloatValue(ss, pbr.aoIntensity, 1.0f);
         ss << L",\"envI\":";
         WriteFloatValue(ss, pbr.envIntensity, 1.0f);
+        if (pbr.materialModel == L"MeshSSSNodeMaterial") {
+            ss << L",\"sssColor\":[";
+            WriteFloatValue(ss, pbr.sssColor[0], 1.0f); ss << L',';
+            WriteFloatValue(ss, pbr.sssColor[1], 1.0f); ss << L',';
+            WriteFloatValue(ss, pbr.sssColor[2], 1.0f); ss << L']';
+            ss << L",\"sssDistortion\":";
+            WriteFloatValue(ss, pbr.sssDistortion, 0.1f);
+            ss << L",\"sssAmbient\":";
+            WriteFloatValue(ss, pbr.sssAmbient, 0.0f);
+            ss << L",\"sssAttenuation\":";
+            WriteFloatValue(ss, pbr.sssAttenuation, 0.1f);
+            ss << L",\"sssPower\":";
+            WriteFloatValue(ss, pbr.sssPower, 2.0f);
+            ss << L",\"sssScale\":";
+            WriteFloatValue(ss, pbr.sssScale, 10.0f);
+        }
         if (pbr.emIntensity > 0) {
             ss << L",\"em\":[";
             WriteFloatValue(ss, pbr.emission[0], 0.0f); ss << L',';
@@ -2830,21 +2873,22 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, ULONG fdwReason, LPVOID) {
 }
 
 __declspec(dllexport) const TCHAR* LibDescription()   { return MAXJS_NAME; }
-__declspec(dllexport) int LibNumberClasses()           { return 12; }
+__declspec(dllexport) int LibNumberClasses()           { return 13; }
 __declspec(dllexport) ClassDesc* LibClassDesc(int i) {
     switch (i) {
         case 0: return &maxJSDesc;
         case 1: return GetThreeJSMtlDesc();
         case 2: return GetThreeJSAdvMtlDesc();
-        case 3: return GetThreeJSRendererDesc();
-        case 4: return GetThreeJSLightLegacyDesc();
-        case 5: return GetThreeJSDirectionalLightDesc();
-        case 6: return GetThreeJSPointLightDesc();
-        case 7: return GetThreeJSSpotLightDesc();
-        case 8: return GetThreeJSRectAreaLightDesc();
-        case 9: return GetThreeJSHemisphereLightDesc();
-        case 10: return GetThreeJSAmbientLightDesc();
-        case 11: return GetThreeJSToonDesc();
+        case 3: return GetThreeJSSSSMtlDesc();
+        case 4: return GetThreeJSRendererDesc();
+        case 5: return GetThreeJSLightLegacyDesc();
+        case 6: return GetThreeJSDirectionalLightDesc();
+        case 7: return GetThreeJSPointLightDesc();
+        case 8: return GetThreeJSSpotLightDesc();
+        case 9: return GetThreeJSRectAreaLightDesc();
+        case 10: return GetThreeJSHemisphereLightDesc();
+        case 11: return GetThreeJSAmbientLightDesc();
+        case 12: return GetThreeJSToonDesc();
         default: return nullptr;
     }
 }

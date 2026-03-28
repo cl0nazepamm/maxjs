@@ -5,6 +5,7 @@
 
 #define THREEJS_MTL_CLASS_ID Class_ID(0x7F3A9B10, 0x4E2D8C10)
 #define THREEJS_ADV_MTL_CLASS_ID Class_ID(0x7F3A9B11, 0x4E2D8C10)
+#define THREEJS_SSS_MTL_CLASS_ID Class_ID(0x7F3A9B12, 0x4E2D8C10)
 
 enum { threejs_params };
 
@@ -29,6 +30,10 @@ enum ThreeJSParamIDs {
     pb_double_sided,
     // Environment
     pb_env_intensity,
+    // SSS
+    pb_sss_color, pb_sss_color_map,
+    pb_sss_distortion, pb_sss_ambient, pb_sss_attenuation,
+    pb_sss_power, pb_sss_scale,
 };
 
 // Texmap slot indices (for SubTexmap)
@@ -44,8 +49,10 @@ enum ThreeJSMapSlots {
     kMap_Opacity,
     kMap_Lightmap,
     kMap_AO,
+    kMap_SSSColor,
     kNumMaps
 };
 
 ClassDesc2* GetThreeJSMtlDesc();
 ClassDesc2* GetThreeJSAdvMtlDesc();
+ClassDesc2* GetThreeJSSSSMtlDesc();

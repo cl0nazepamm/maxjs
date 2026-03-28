@@ -18,185 +18,185 @@ BEGIN
     IDS_LIGHT_TYPE_AMBIENT "Ambient"
 END
 
-IDD_THREEJS_LIGHT_LEGACY DIALOG 0, 0, 170, 148
+IDD_THREEJS_LIGHT_LEGACY DIALOG 0, 0, 140, 236
 STYLE DS_SETFONT | WS_CHILD | WS_VISIBLE
 FONT 8, "Segoe UI"
 BEGIN
-    LTEXT           "Type", -1, 4, 4, 20, 8
-    COMBOBOX        IDC_LIGHT_TYPE, 32, 2, 78, 70, CBS_DROPDOWNLIST | WS_TABSTOP
-
-    LTEXT           "Color", -1, 4, 20, 22, 8
-    CONTROL         "", IDC_LIGHT_COLOR, "ColorSwatch", WS_TABSTOP, 32, 18, 28, 12
-    LTEXT           "Intensity", -1, 64, 20, 28, 8
-    CONTROL         "", IDC_LIGHT_INT_EDIT, "CustEdit", WS_TABSTOP, 94, 18, 40, 10
-    CONTROL         "", IDC_LIGHT_INT_SPIN, "SpinnerControl", 0, 106, 18, 7, 10
-
-    LTEXT           "Distance", -1, 4, 36, 28, 8
-    CONTROL         "", IDC_DIST_EDIT, "CustEdit", WS_TABSTOP, 32, 34, 40, 10
-    CONTROL         "", IDC_DIST_SPIN, "SpinnerControl", 0, 54, 34, 7, 10
-    LTEXT           "Decay", -1, 64, 36, 18, 8
-    CONTROL         "", IDC_DECAY_EDIT, "CustEdit", WS_TABSTOP, 82, 34, 40, 10
-    CONTROL         "", IDC_DECAY_SPIN, "SpinnerControl", 0, 106, 34, 7, 10
-
-    LTEXT           "Angle", -1, 4, 52, 22, 8
-    CONTROL         "", IDC_ANGLE_EDIT, "CustEdit", WS_TABSTOP, 32, 50, 40, 10
-    CONTROL         "", IDC_ANGLE_SPIN, "SpinnerControl", 0, 54, 50, 7, 10
-    LTEXT           "Penumbra", -1, 64, 52, 30, 8
-    CONTROL         "", IDC_PENUM_EDIT, "CustEdit", WS_TABSTOP, 94, 50, 40, 10
-    CONTROL         "", IDC_PENUM_SPIN, "SpinnerControl", 0, 106, 50, 7, 10
-
-    LTEXT           "Width", -1, 4, 68, 22, 8
-    CONTROL         "", IDC_WIDTH_EDIT, "CustEdit", WS_TABSTOP, 32, 66, 40, 10
-    CONTROL         "", IDC_WIDTH_SPIN, "SpinnerControl", 0, 54, 66, 7, 10
-    LTEXT           "Height", -1, 64, 68, 24, 8
-    CONTROL         "", IDC_HEIGHT_EDIT, "CustEdit", WS_TABSTOP, 88, 66, 40, 10
-    CONTROL         "", IDC_HEIGHT_SPIN, "SpinnerControl", 0, 106, 66, 7, 10
-
-    LTEXT           "Ground", -1, 4, 84, 24, 8
-    CONTROL         "", IDC_GROUND_COLOR, "ColorSwatch", WS_TABSTOP, 32, 82, 28, 12
-
-    GROUPBOX        "Shadows", -1, 2, 98, 110, 46
-    CONTROL         "Cast Shadow", IDC_CAST_SHADOW, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 8, 110, 50, 10
-    LTEXT           "Bias", -1, 8, 124, 14, 8
-    CONTROL         "", IDC_SHBIAS_EDIT, "CustEdit", WS_TABSTOP, 24, 122, 40, 10
-    CONTROL         "", IDC_SHBIAS_SPIN, "SpinnerControl", 0, 48, 122, 7, 10
-    LTEXT           "Radius", -1, 60, 124, 22, 8
-    CONTROL         "", IDC_SHRAD_EDIT, "CustEdit", WS_TABSTOP, 82, 122, 40, 10
-    CONTROL         "", IDC_SHRAD_SPIN, "SpinnerControl", 0, 100, 122, 7, 10
-    LTEXT           "Map", -1, 8, 136, 14, 8
-    CONTROL         "", IDC_SHMAP_EDIT, "CustEdit", WS_TABSTOP, 24, 134, 40, 10
-    CONTROL         "", IDC_SHMAP_SPIN, "SpinnerControl", 0, 48, 134, 7, 10
+    LTEXT           "Type", -1, 8, 6, 160, 8
+    COMBOBOX        IDC_LIGHT_TYPE, 52, 18, 80, 80, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    
+    LTEXT           "Color", -1, 8, 36, 42, 8
+    CONTROL         "", IDC_LIGHT_COLOR, "ColorSwatch", WS_TABSTOP, 52, 34, 34, 12
+    LTEXT           "Intensity", -1, 8, 50, 42, 8
+    CONTROL         "", IDC_LIGHT_INT_EDIT, "CustEdit", WS_TABSTOP, 52, 48, 30, 10
+    CONTROL         "", IDC_LIGHT_INT_SPIN, "SpinnerControl", 0, 82, 48, 11, 10
+    
+    LTEXT           "Distance", -1, 8, 64, 42, 8
+    CONTROL         "", IDC_DIST_EDIT, "CustEdit", WS_TABSTOP, 52, 62, 30, 10
+    CONTROL         "", IDC_DIST_SPIN, "SpinnerControl", 0, 82, 62, 11, 10
+    LTEXT           "Decay", -1, 8, 78, 42, 8
+    CONTROL         "", IDC_DECAY_EDIT, "CustEdit", WS_TABSTOP, 52, 76, 30, 10
+    CONTROL         "", IDC_DECAY_SPIN, "SpinnerControl", 0, 82, 76, 11, 10
+    
+    LTEXT           "Angle", -1, 8, 92, 42, 8
+    CONTROL         "", IDC_ANGLE_EDIT, "CustEdit", WS_TABSTOP, 52, 90, 30, 10
+    CONTROL         "", IDC_ANGLE_SPIN, "SpinnerControl", 0, 82, 90, 11, 10
+    LTEXT           "Penumbra", -1, 8, 106, 42, 8
+    CONTROL         "", IDC_PENUM_EDIT, "CustEdit", WS_TABSTOP, 52, 104, 30, 10
+    CONTROL         "", IDC_PENUM_SPIN, "SpinnerControl", 0, 82, 104, 11, 10
+    
+    LTEXT           "Width", -1, 8, 120, 42, 8
+    CONTROL         "", IDC_WIDTH_EDIT, "CustEdit", WS_TABSTOP, 52, 118, 30, 10
+    CONTROL         "", IDC_WIDTH_SPIN, "SpinnerControl", 0, 82, 118, 11, 10
+    LTEXT           "Height", -1, 8, 134, 42, 8
+    CONTROL         "", IDC_HEIGHT_EDIT, "CustEdit", WS_TABSTOP, 52, 132, 30, 10
+    CONTROL         "", IDC_HEIGHT_SPIN, "SpinnerControl", 0, 82, 132, 11, 10
+    
+    LTEXT           "Ground", -1, 8, 148, 42, 8
+    CONTROL         "", IDC_GROUND_COLOR, "ColorSwatch", WS_TABSTOP, 52, 146, 34, 12
+    
+    GROUPBOX        "Shadows", -1, 2, 160, 136, 86
+    CONTROL         "Cast Shadow", IDC_CAST_SHADOW, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 8, 172, 80, 10
+    LTEXT           "Bias", -1, 8, 188, 42, 8
+    CONTROL         "", IDC_SHBIAS_EDIT, "CustEdit", WS_TABSTOP, 52, 186, 30, 10
+    CONTROL         "", IDC_SHBIAS_SPIN, "SpinnerControl", 0, 82, 186, 11, 10
+    LTEXT           "Radius", -1, 8, 202, 42, 8
+    CONTROL         "", IDC_SHRAD_EDIT, "CustEdit", WS_TABSTOP, 52, 200, 30, 10
+    CONTROL         "", IDC_SHRAD_SPIN, "SpinnerControl", 0, 82, 200, 11, 10
+    LTEXT           "Map", -1, 8, 216, 42, 8
+    CONTROL         "", IDC_SHMAP_EDIT, "CustEdit", WS_TABSTOP, 52, 214, 30, 10
+    CONTROL         "", IDC_SHMAP_SPIN, "SpinnerControl", 0, 82, 214, 11, 10
 END
 
-IDD_THREEJS_DIRECTIONAL_LIGHT DIALOG 0, 0, 170, 80
+IDD_THREEJS_DIRECTIONAL_LIGHT DIALOG 0, 0, 102, 108
 STYLE DS_SETFONT | WS_CHILD | WS_VISIBLE
 FONT 8, "Segoe UI"
 BEGIN
-    LTEXT           "Color", -1, 4, 6, 22, 8
-    CONTROL         "", IDC_LIGHT_COLOR, "ColorSwatch", WS_TABSTOP, 32, 4, 28, 12
-    LTEXT           "Intensity", -1, 64, 6, 28, 8
-    CONTROL         "", IDC_LIGHT_INT_EDIT, "CustEdit", WS_TABSTOP, 94, 4, 40, 10
-    CONTROL         "", IDC_LIGHT_INT_SPIN, "SpinnerControl", 0, 106, 4, 7, 10
-
-    GROUPBOX        "Shadows", -1, 2, 22, 110, 54
-    CONTROL         "Cast Shadow", IDC_CAST_SHADOW, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 8, 34, 52, 10
-    LTEXT           "Bias", -1, 8, 48, 14, 8
-    CONTROL         "", IDC_SHBIAS_EDIT, "CustEdit", WS_TABSTOP, 24, 46, 40, 10
-    CONTROL         "", IDC_SHBIAS_SPIN, "SpinnerControl", 0, 48, 46, 7, 10
-    LTEXT           "Radius", -1, 60, 48, 22, 8
-    CONTROL         "", IDC_SHRAD_EDIT, "CustEdit", WS_TABSTOP, 82, 46, 40, 10
-    CONTROL         "", IDC_SHRAD_SPIN, "SpinnerControl", 0, 100, 46, 7, 10
-    LTEXT           "Map", -1, 8, 60, 14, 8
-    CONTROL         "", IDC_SHMAP_EDIT, "CustEdit", WS_TABSTOP, 24, 58, 40, 10
-    CONTROL         "", IDC_SHMAP_SPIN, "SpinnerControl", 0, 48, 58, 7, 10
+    LTEXT           "Color", -1, 8, 6, 42, 8
+    CONTROL         "", IDC_LIGHT_COLOR, "ColorSwatch", WS_TABSTOP, 52, 4, 34, 12
+    LTEXT           "Intensity", -1, 8, 20, 42, 8
+    CONTROL         "", IDC_LIGHT_INT_EDIT, "CustEdit", WS_TABSTOP, 52, 18, 30, 10
+    CONTROL         "", IDC_LIGHT_INT_SPIN, "SpinnerControl", 0, 82, 18, 11, 10
+    
+    GROUPBOX        "Shadows", -1, 2, 32, 98, 86
+    CONTROL         "Cast Shadow", IDC_CAST_SHADOW, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 8, 44, 80, 10
+    LTEXT           "Bias", -1, 8, 60, 42, 8
+    CONTROL         "", IDC_SHBIAS_EDIT, "CustEdit", WS_TABSTOP, 52, 58, 30, 10
+    CONTROL         "", IDC_SHBIAS_SPIN, "SpinnerControl", 0, 82, 58, 11, 10
+    LTEXT           "Radius", -1, 8, 74, 42, 8
+    CONTROL         "", IDC_SHRAD_EDIT, "CustEdit", WS_TABSTOP, 52, 72, 30, 10
+    CONTROL         "", IDC_SHRAD_SPIN, "SpinnerControl", 0, 82, 72, 11, 10
+    LTEXT           "Map", -1, 8, 88, 42, 8
+    CONTROL         "", IDC_SHMAP_EDIT, "CustEdit", WS_TABSTOP, 52, 86, 30, 10
+    CONTROL         "", IDC_SHMAP_SPIN, "SpinnerControl", 0, 82, 86, 11, 10
 END
 
-IDD_THREEJS_POINT_LIGHT DIALOG 0, 0, 170, 94
+IDD_THREEJS_POINT_LIGHT DIALOG 0, 0, 102, 136
 STYLE DS_SETFONT | WS_CHILD | WS_VISIBLE
 FONT 8, "Segoe UI"
 BEGIN
-    LTEXT           "Color", -1, 4, 6, 22, 8
-    CONTROL         "", IDC_LIGHT_COLOR, "ColorSwatch", WS_TABSTOP, 32, 4, 28, 12
-    LTEXT           "Intensity", -1, 64, 6, 28, 8
-    CONTROL         "", IDC_LIGHT_INT_EDIT, "CustEdit", WS_TABSTOP, 94, 4, 40, 10
-    CONTROL         "", IDC_LIGHT_INT_SPIN, "SpinnerControl", 0, 106, 4, 7, 10
-
-    LTEXT           "Distance", -1, 4, 24, 28, 8
-    CONTROL         "", IDC_DIST_EDIT, "CustEdit", WS_TABSTOP, 32, 22, 40, 10
-    CONTROL         "", IDC_DIST_SPIN, "SpinnerControl", 0, 54, 22, 7, 10
-    LTEXT           "Decay", -1, 64, 24, 18, 8
-    CONTROL         "", IDC_DECAY_EDIT, "CustEdit", WS_TABSTOP, 82, 22, 40, 10
-    CONTROL         "", IDC_DECAY_SPIN, "SpinnerControl", 0, 106, 22, 7, 10
-
-    GROUPBOX        "Shadows", -1, 2, 40, 110, 50
-    CONTROL         "Cast Shadow", IDC_CAST_SHADOW, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 8, 52, 52, 10
-    LTEXT           "Bias", -1, 8, 66, 14, 8
-    CONTROL         "", IDC_SHBIAS_EDIT, "CustEdit", WS_TABSTOP, 24, 64, 40, 10
-    CONTROL         "", IDC_SHBIAS_SPIN, "SpinnerControl", 0, 48, 64, 7, 10
-    LTEXT           "Radius", -1, 60, 66, 22, 8
-    CONTROL         "", IDC_SHRAD_EDIT, "CustEdit", WS_TABSTOP, 82, 64, 40, 10
-    CONTROL         "", IDC_SHRAD_SPIN, "SpinnerControl", 0, 100, 64, 7, 10
-    LTEXT           "Map", -1, 8, 78, 14, 8
-    CONTROL         "", IDC_SHMAP_EDIT, "CustEdit", WS_TABSTOP, 24, 76, 40, 10
-    CONTROL         "", IDC_SHMAP_SPIN, "SpinnerControl", 0, 48, 76, 7, 10
+    LTEXT           "Color", -1, 8, 6, 42, 8
+    CONTROL         "", IDC_LIGHT_COLOR, "ColorSwatch", WS_TABSTOP, 52, 4, 34, 12
+    LTEXT           "Intensity", -1, 8, 20, 42, 8
+    CONTROL         "", IDC_LIGHT_INT_EDIT, "CustEdit", WS_TABSTOP, 52, 18, 30, 10
+    CONTROL         "", IDC_LIGHT_INT_SPIN, "SpinnerControl", 0, 82, 18, 11, 10
+    
+    LTEXT           "Distance", -1, 8, 34, 42, 8
+    CONTROL         "", IDC_DIST_EDIT, "CustEdit", WS_TABSTOP, 52, 32, 30, 10
+    CONTROL         "", IDC_DIST_SPIN, "SpinnerControl", 0, 82, 32, 11, 10
+    LTEXT           "Decay", -1, 8, 48, 42, 8
+    CONTROL         "", IDC_DECAY_EDIT, "CustEdit", WS_TABSTOP, 52, 46, 30, 10
+    CONTROL         "", IDC_DECAY_SPIN, "SpinnerControl", 0, 82, 46, 11, 10
+    
+    GROUPBOX        "Shadows", -1, 2, 60, 98, 86
+    CONTROL         "Cast Shadow", IDC_CAST_SHADOW, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 8, 72, 80, 10
+    LTEXT           "Bias", -1, 8, 88, 42, 8
+    CONTROL         "", IDC_SHBIAS_EDIT, "CustEdit", WS_TABSTOP, 52, 86, 30, 10
+    CONTROL         "", IDC_SHBIAS_SPIN, "SpinnerControl", 0, 82, 86, 11, 10
+    LTEXT           "Radius", -1, 8, 102, 42, 8
+    CONTROL         "", IDC_SHRAD_EDIT, "CustEdit", WS_TABSTOP, 52, 100, 30, 10
+    CONTROL         "", IDC_SHRAD_SPIN, "SpinnerControl", 0, 82, 100, 11, 10
+    LTEXT           "Map", -1, 8, 116, 42, 8
+    CONTROL         "", IDC_SHMAP_EDIT, "CustEdit", WS_TABSTOP, 52, 114, 30, 10
+    CONTROL         "", IDC_SHMAP_SPIN, "SpinnerControl", 0, 82, 114, 11, 10
 END
 
-IDD_THREEJS_SPOT_LIGHT DIALOG 0, 0, 170, 110
+IDD_THREEJS_SPOT_LIGHT DIALOG 0, 0, 102, 164
 STYLE DS_SETFONT | WS_CHILD | WS_VISIBLE
 FONT 8, "Segoe UI"
 BEGIN
-    LTEXT           "Color", -1, 4, 6, 22, 8
-    CONTROL         "", IDC_LIGHT_COLOR, "ColorSwatch", WS_TABSTOP, 32, 4, 28, 12
-    LTEXT           "Intensity", -1, 64, 6, 28, 8
-    CONTROL         "", IDC_LIGHT_INT_EDIT, "CustEdit", WS_TABSTOP, 94, 4, 40, 10
-    CONTROL         "", IDC_LIGHT_INT_SPIN, "SpinnerControl", 0, 106, 4, 7, 10
-
-    LTEXT           "Distance", -1, 4, 24, 28, 8
-    CONTROL         "", IDC_DIST_EDIT, "CustEdit", WS_TABSTOP, 32, 22, 40, 10
-    CONTROL         "", IDC_DIST_SPIN, "SpinnerControl", 0, 54, 22, 7, 10
-    LTEXT           "Decay", -1, 64, 24, 18, 8
-    CONTROL         "", IDC_DECAY_EDIT, "CustEdit", WS_TABSTOP, 82, 22, 40, 10
-    CONTROL         "", IDC_DECAY_SPIN, "SpinnerControl", 0, 106, 22, 7, 10
-
-    LTEXT           "Angle", -1, 4, 40, 22, 8
-    CONTROL         "", IDC_ANGLE_EDIT, "CustEdit", WS_TABSTOP, 32, 38, 40, 10
-    CONTROL         "", IDC_ANGLE_SPIN, "SpinnerControl", 0, 54, 38, 7, 10
-    LTEXT           "Penumbra", -1, 64, 40, 30, 8
-    CONTROL         "", IDC_PENUM_EDIT, "CustEdit", WS_TABSTOP, 94, 38, 40, 10
-    CONTROL         "", IDC_PENUM_SPIN, "SpinnerControl", 0, 106, 38, 7, 10
-
-    GROUPBOX        "Shadows", -1, 2, 56, 110, 50
-    CONTROL         "Cast Shadow", IDC_CAST_SHADOW, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 8, 68, 52, 10
-    LTEXT           "Bias", -1, 8, 82, 14, 8
-    CONTROL         "", IDC_SHBIAS_EDIT, "CustEdit", WS_TABSTOP, 24, 80, 40, 10
-    CONTROL         "", IDC_SHBIAS_SPIN, "SpinnerControl", 0, 48, 80, 7, 10
-    LTEXT           "Radius", -1, 60, 82, 22, 8
-    CONTROL         "", IDC_SHRAD_EDIT, "CustEdit", WS_TABSTOP, 82, 80, 40, 10
-    CONTROL         "", IDC_SHRAD_SPIN, "SpinnerControl", 0, 100, 80, 7, 10
-    LTEXT           "Map", -1, 8, 94, 14, 8
-    CONTROL         "", IDC_SHMAP_EDIT, "CustEdit", WS_TABSTOP, 24, 92, 40, 10
-    CONTROL         "", IDC_SHMAP_SPIN, "SpinnerControl", 0, 48, 92, 7, 10
+    LTEXT           "Color", -1, 8, 6, 42, 8
+    CONTROL         "", IDC_LIGHT_COLOR, "ColorSwatch", WS_TABSTOP, 52, 4, 34, 12
+    LTEXT           "Intensity", -1, 8, 20, 42, 8
+    CONTROL         "", IDC_LIGHT_INT_EDIT, "CustEdit", WS_TABSTOP, 52, 18, 30, 10
+    CONTROL         "", IDC_LIGHT_INT_SPIN, "SpinnerControl", 0, 82, 18, 11, 10
+    
+    LTEXT           "Distance", -1, 8, 34, 42, 8
+    CONTROL         "", IDC_DIST_EDIT, "CustEdit", WS_TABSTOP, 52, 32, 30, 10
+    CONTROL         "", IDC_DIST_SPIN, "SpinnerControl", 0, 82, 32, 11, 10
+    LTEXT           "Decay", -1, 8, 48, 42, 8
+    CONTROL         "", IDC_DECAY_EDIT, "CustEdit", WS_TABSTOP, 52, 46, 30, 10
+    CONTROL         "", IDC_DECAY_SPIN, "SpinnerControl", 0, 82, 46, 11, 10
+    
+    LTEXT           "Angle", -1, 8, 62, 42, 8
+    CONTROL         "", IDC_ANGLE_EDIT, "CustEdit", WS_TABSTOP, 52, 60, 30, 10
+    CONTROL         "", IDC_ANGLE_SPIN, "SpinnerControl", 0, 82, 60, 11, 10
+    LTEXT           "Penumbra", -1, 8, 76, 42, 8
+    CONTROL         "", IDC_PENUM_EDIT, "CustEdit", WS_TABSTOP, 52, 74, 30, 10
+    CONTROL         "", IDC_PENUM_SPIN, "SpinnerControl", 0, 82, 74, 11, 10
+    
+    GROUPBOX        "Shadows", -1, 2, 88, 98, 86
+    CONTROL         "Cast Shadow", IDC_CAST_SHADOW, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 8, 100, 80, 10
+    LTEXT           "Bias", -1, 8, 116, 42, 8
+    CONTROL         "", IDC_SHBIAS_EDIT, "CustEdit", WS_TABSTOP, 52, 114, 30, 10
+    CONTROL         "", IDC_SHBIAS_SPIN, "SpinnerControl", 0, 82, 114, 11, 10
+    LTEXT           "Radius", -1, 8, 130, 42, 8
+    CONTROL         "", IDC_SHRAD_EDIT, "CustEdit", WS_TABSTOP, 52, 128, 30, 10
+    CONTROL         "", IDC_SHRAD_SPIN, "SpinnerControl", 0, 82, 128, 11, 10
+    LTEXT           "Map", -1, 8, 144, 42, 8
+    CONTROL         "", IDC_SHMAP_EDIT, "CustEdit", WS_TABSTOP, 52, 142, 30, 10
+    CONTROL         "", IDC_SHMAP_SPIN, "SpinnerControl", 0, 82, 142, 11, 10
 END
 
-IDD_THREEJS_RECT_AREA_LIGHT DIALOG 0, 0, 170, 44
+IDD_THREEJS_RECT_AREA_LIGHT DIALOG 0, 0, 102, 68
 STYLE DS_SETFONT | WS_CHILD | WS_VISIBLE
 FONT 8, "Segoe UI"
 BEGIN
-    LTEXT           "Color", -1, 4, 6, 22, 8
-    CONTROL         "", IDC_LIGHT_COLOR, "ColorSwatch", WS_TABSTOP, 32, 4, 28, 12
-    LTEXT           "Intensity", -1, 64, 6, 28, 8
-    CONTROL         "", IDC_LIGHT_INT_EDIT, "CustEdit", WS_TABSTOP, 94, 4, 40, 10
-    CONTROL         "", IDC_LIGHT_INT_SPIN, "SpinnerControl", 0, 106, 4, 7, 10
-
-    LTEXT           "Width", -1, 4, 24, 22, 8
-    CONTROL         "", IDC_WIDTH_EDIT, "CustEdit", WS_TABSTOP, 32, 22, 40, 10
-    CONTROL         "", IDC_WIDTH_SPIN, "SpinnerControl", 0, 54, 22, 7, 10
-    LTEXT           "Height", -1, 64, 24, 24, 8
-    CONTROL         "", IDC_HEIGHT_EDIT, "CustEdit", WS_TABSTOP, 88, 22, 40, 10
-    CONTROL         "", IDC_HEIGHT_SPIN, "SpinnerControl", 0, 106, 22, 7, 10
+    LTEXT           "Color", -1, 8, 6, 42, 8
+    CONTROL         "", IDC_LIGHT_COLOR, "ColorSwatch", WS_TABSTOP, 52, 4, 34, 12
+    LTEXT           "Intensity", -1, 8, 20, 42, 8
+    CONTROL         "", IDC_LIGHT_INT_EDIT, "CustEdit", WS_TABSTOP, 52, 18, 30, 10
+    CONTROL         "", IDC_LIGHT_INT_SPIN, "SpinnerControl", 0, 82, 18, 11, 10
+    
+    LTEXT           "Width", -1, 8, 34, 42, 8
+    CONTROL         "", IDC_WIDTH_EDIT, "CustEdit", WS_TABSTOP, 52, 32, 30, 10
+    CONTROL         "", IDC_WIDTH_SPIN, "SpinnerControl", 0, 82, 32, 11, 10
+    LTEXT           "Height", -1, 8, 48, 42, 8
+    CONTROL         "", IDC_HEIGHT_EDIT, "CustEdit", WS_TABSTOP, 52, 46, 30, 10
+    CONTROL         "", IDC_HEIGHT_SPIN, "SpinnerControl", 0, 82, 46, 11, 10
 END
 
-IDD_THREEJS_HEMISPHERE_LIGHT DIALOG 0, 0, 170, 44
+IDD_THREEJS_HEMISPHERE_LIGHT DIALOG 0, 0, 102, 54
 STYLE DS_SETFONT | WS_CHILD | WS_VISIBLE
 FONT 8, "Segoe UI"
 BEGIN
-    LTEXT           "Sky", -1, 4, 6, 22, 8
-    CONTROL         "", IDC_LIGHT_COLOR, "ColorSwatch", WS_TABSTOP, 32, 4, 28, 12
-    LTEXT           "Intensity", -1, 64, 6, 28, 8
-    CONTROL         "", IDC_LIGHT_INT_EDIT, "CustEdit", WS_TABSTOP, 94, 4, 40, 10
-    CONTROL         "", IDC_LIGHT_INT_SPIN, "SpinnerControl", 0, 106, 4, 7, 10
-
-    LTEXT           "Ground", -1, 4, 24, 24, 8
-    CONTROL         "", IDC_GROUND_COLOR, "ColorSwatch", WS_TABSTOP, 32, 22, 28, 12
+    LTEXT           "Sky", -1, 8, 6, 42, 8
+    CONTROL         "", IDC_LIGHT_COLOR, "ColorSwatch", WS_TABSTOP, 52, 4, 34, 12
+    LTEXT           "Intensity", -1, 8, 20, 42, 8
+    CONTROL         "", IDC_LIGHT_INT_EDIT, "CustEdit", WS_TABSTOP, 52, 18, 30, 10
+    CONTROL         "", IDC_LIGHT_INT_SPIN, "SpinnerControl", 0, 82, 18, 11, 10
+    
+    LTEXT           "Ground", -1, 8, 34, 42, 8
+    CONTROL         "", IDC_GROUND_COLOR, "ColorSwatch", WS_TABSTOP, 52, 32, 34, 12
 END
 
-IDD_THREEJS_AMBIENT_LIGHT DIALOG 0, 0, 170, 22
+IDD_THREEJS_AMBIENT_LIGHT DIALOG 0, 0, 102, 40
 STYLE DS_SETFONT | WS_CHILD | WS_VISIBLE
 FONT 8, "Segoe UI"
 BEGIN
-    LTEXT           "Color", -1, 4, 6, 22, 8
-    CONTROL         "", IDC_LIGHT_COLOR, "ColorSwatch", WS_TABSTOP, 32, 4, 28, 12
-    LTEXT           "Intensity", -1, 64, 6, 28, 8
-    CONTROL         "", IDC_LIGHT_INT_EDIT, "CustEdit", WS_TABSTOP, 94, 4, 40, 10
-    CONTROL         "", IDC_LIGHT_INT_SPIN, "SpinnerControl", 0, 106, 4, 7, 10
+    LTEXT           "Color", -1, 8, 6, 42, 8
+    CONTROL         "", IDC_LIGHT_COLOR, "ColorSwatch", WS_TABSTOP, 52, 4, 34, 12
+    LTEXT           "Intensity", -1, 8, 20, 42, 8
+    CONTROL         "", IDC_LIGHT_INT_EDIT, "CustEdit", WS_TABSTOP, 52, 18, 30, 10
+    CONTROL         "", IDC_LIGHT_INT_SPIN, "SpinnerControl", 0, 82, 18, 11, 10
 END

@@ -6,79 +6,79 @@ BEGIN
     IDS_TOON_PARAMS "ThreeJS Toon"
 END
 
-IDD_THREEJS_TOON DIALOG 0, 0, 170, 310
+IDD_THREEJS_TOON DIALOG 0, 0, 170, 368
 STYLE DS_SETFONT | WS_CHILD | WS_VISIBLE
 FONT 8, "Segoe UI"
 BEGIN
     // ── Color ─────────────────────────────────
-    LTEXT           "Color",     -1,   4,  4, 22,  8
-    CONTROL         "",  IDC_TOON_COLOR,    "ColorSwatch",    WS_TABSTOP, 28,  2, 30, 12
-    CONTROL         "",  IDC_TOON_COLOR_MAP,"CustButton",     WS_TABSTOP, 60,  2, 44, 12
-
+    LTEXT           "Color", -1, 8, 6, 42, 8
+    CONTROL         "", IDC_TOON_COLOR, "ColorSwatch", WS_TABSTOP, 52, 4, 34, 12
+    CONTROL         "", IDC_TOON_COLOR_MAP, "CustButton", WS_TABSTOP, 52, 18, 70, 12
+    
     // ── Gradient Map (key toon feature) ───────
-    LTEXT           "Gradient",  -1,   4, 18, 30,  8
-    CONTROL         "",  IDC_TOON_GRAD_MAP, "CustButton",     WS_TABSTOP, 36, 16, 68, 12
-
+    LTEXT           "Gradient", -1, 8, 34, 42, 8
+    CONTROL         "", IDC_TOON_GRAD_MAP, "CustButton", WS_TABSTOP, 52, 32, 70, 12
+    
     // ── Normal ────────────────────────────────
-    LTEXT           "Normal",    -1,   4, 34, 24,  8
-    CONTROL         "",  IDC_TOON_NORM_MAP, "CustButton",     WS_TABSTOP, 30, 32, 44, 10
-    LTEXT           "Scl",       -1,  76, 34, 12,  8
-    CONTROL         "",  IDC_TOON_NORMSCL_E,"CustEdit", WS_TABSTOP, 88, 32, 40, 10
-    CONTROL         "",  IDC_TOON_NORMSCL_S,"SpinnerControl",  0,        100, 32,  7, 10
-
+    LTEXT           "Normal", -1, 8, 48, 42, 8
+    CONTROL         "", IDC_TOON_NORM_MAP, "CustButton", WS_TABSTOP, 52, 46, 70, 12
+    LTEXT           "Scl", -1, 8, 62, 42, 8
+    CONTROL         "", IDC_TOON_NORMSCL_E, "CustEdit", WS_TABSTOP, 52, 60, 30, 10
+    CONTROL         "", IDC_TOON_NORMSCL_S, "SpinnerControl", 0, 82, 60, 11, 10
+    
     // ── Bump ──────────────────────────────────
-    LTEXT           "Bump",      -1,   4, 48, 22,  8
-    CONTROL         "",  IDC_TOON_BUMP_MAP, "CustButton",     WS_TABSTOP, 30, 46, 44, 10
-    LTEXT           "Scl",       -1,  76, 48, 12,  8
-    CONTROL         "",  IDC_TOON_BUMP_E,   "CustEdit", WS_TABSTOP, 88, 46, 40, 10
-    CONTROL         "",  IDC_TOON_BUMP_S,   "SpinnerControl",  0,        100, 46,  7, 10
-
+    LTEXT           "Bump", -1, 8, 76, 42, 8
+    CONTROL         "", IDC_TOON_BUMP_MAP, "CustButton", WS_TABSTOP, 52, 74, 70, 12
+    LTEXT           "Scl", -1, 8, 90, 42, 8
+    CONTROL         "", IDC_TOON_BUMP_E, "CustEdit", WS_TABSTOP, 52, 88, 30, 10
+    CONTROL         "", IDC_TOON_BUMP_S, "SpinnerControl", 0, 82, 88, 11, 10
+    
     // ── Opacity ───────────────────────────────
-    LTEXT           "Opacity",   -1,   4, 62, 28,  8
-    CONTROL         "",  IDC_TOON_OPAC_E,   "CustEdit", WS_TABSTOP, 34, 60, 40, 10
-    CONTROL         "",  IDC_TOON_OPAC_S,   "SpinnerControl",  0,         52, 60,  7, 10
-    CONTROL         "",  IDC_TOON_OPAC_MAP, "CustButton",     WS_TABSTOP, 60, 60, 44, 10
-
+    LTEXT           "Opacity", -1, 8, 104, 42, 8
+    CONTROL         "", IDC_TOON_OPAC_E, "CustEdit", WS_TABSTOP, 52, 102, 30, 10
+    CONTROL         "", IDC_TOON_OPAC_S, "SpinnerControl", 0, 82, 102, 11, 10
+    CONTROL         "", IDC_TOON_OPAC_MAP, "CustButton", WS_TABSTOP, 52, 116, 70, 12
+    
     // ── Emission ──────────────────────────────
-    GROUPBOX        "Emission",  -1,   2, 76,104, 42
-    LTEXT           "Color",     -1,   6, 88, 20,  8
-    CONTROL         "",  IDC_TOON_EM_COLOR, "ColorSwatch",    WS_TABSTOP, 28, 86, 30, 12
-    CONTROL         "",  IDC_TOON_EM_MAP,   "CustButton",     WS_TABSTOP, 60, 86, 42, 12
-    LTEXT           "Int",       -1,   6,102, 12,  8
-    CONTROL         "",  IDC_TOON_EM_INT_E, "CustEdit", WS_TABSTOP, 20, 100, 40, 10
-    CONTROL         "",  IDC_TOON_EM_INT_S, "SpinnerControl",  0,         44,100,  7, 10
-
+    GROUPBOX        "Emission", -1, 2, 130, 166, 65
+    LTEXT           "Color", -1, 8, 144, 42, 8
+    CONTROL         "", IDC_TOON_EM_COLOR, "ColorSwatch", WS_TABSTOP, 52, 142, 34, 12
+    CONTROL         "", IDC_TOON_EM_MAP, "CustButton", WS_TABSTOP, 52, 156, 70, 12
+    LTEXT           "Int", -1, 8, 172, 42, 8
+    CONTROL         "", IDC_TOON_EM_INT_E, "CustEdit", WS_TABSTOP, 52, 170, 30, 10
+    CONTROL         "", IDC_TOON_EM_INT_S, "SpinnerControl", 0, 82, 170, 11, 10
+    
     // ── Lightmap ──────────────────────────────
-    GROUPBOX        "Lightmap",  -1,   2,122,104, 42
-    LTEXT           "Map",       -1,   6,134, 16,  8
-    CONTROL         "",  IDC_TOON_LM_MAP,   "CustButton",     WS_TABSTOP, 24,132, 78, 12
-    LTEXT           "Int",       -1,   6,148, 12,  8
-    CONTROL         "",  IDC_TOON_LM_INT_E, "CustEdit", WS_TABSTOP, 20, 146, 40, 10
-    CONTROL         "",  IDC_TOON_LM_INT_S, "SpinnerControl",  0,         44,146,  7, 10
-    LTEXT           "UV",        -1,  56,148, 12,  8
-    CONTROL         "",  IDC_TOON_LM_CH_E,  "CustEdit", WS_TABSTOP, 70, 146, 40, 10
-    CONTROL         "",  IDC_TOON_LM_CH_S,  "SpinnerControl",  0,         86,146,  7, 10
-
+    GROUPBOX        "Lightmap", -1, 2, 184, 166, 79
+    LTEXT           "Map", -1, 8, 198, 42, 8
+    CONTROL         "", IDC_TOON_LM_MAP, "CustButton", WS_TABSTOP, 52, 196, 70, 12
+    LTEXT           "Int", -1, 8, 212, 42, 8
+    CONTROL         "", IDC_TOON_LM_INT_E, "CustEdit", WS_TABSTOP, 52, 210, 30, 10
+    CONTROL         "", IDC_TOON_LM_INT_S, "SpinnerControl", 0, 82, 210, 11, 10
+    LTEXT           "UV", -1, 8, 226, 42, 8
+    CONTROL         "", IDC_TOON_LM_CH_E, "CustEdit", WS_TABSTOP, 52, 224, 30, 10
+    CONTROL         "", IDC_TOON_LM_CH_S, "SpinnerControl", 0, 82, 224, 11, 10
+    
     // ── AO ────────────────────────────────────
-    GROUPBOX        "AO",        -1,   2,168,104, 28
-    CONTROL         "",  IDC_TOON_AO_MAP,   "CustButton",     WS_TABSTOP,  6,180, 44, 12
-    LTEXT           "Int",       -1,  54,182, 12,  8
-    CONTROL         "",  IDC_TOON_AO_INT_E, "CustEdit", WS_TABSTOP, 68, 180, 40, 10
-    CONTROL         "",  IDC_TOON_AO_INT_S, "SpinnerControl",  0,         90,180,  7, 10
-
+    GROUPBOX        "AO", -1, 2, 238, 166, 51
+    CONTROL         "", IDC_TOON_AO_MAP, "CustButton", WS_TABSTOP, 52, 250, 70, 12
+    LTEXT           "Int", -1, 8, 266, 42, 8
+    CONTROL         "", IDC_TOON_AO_INT_E, "CustEdit", WS_TABSTOP, 52, 264, 30, 10
+    CONTROL         "", IDC_TOON_AO_INT_S, "SpinnerControl", 0, 82, 264, 11, 10
+    
     // ── Displacement ──────────────────────────
-    GROUPBOX        "Displacement",-1, 2,200,104, 42
-    CONTROL         "",  IDC_TOON_DISP_MAP, "CustButton",     WS_TABSTOP,  6,212, 44, 12
-    LTEXT           "Scl",       -1,  54,214, 12,  8
-    CONTROL         "",  IDC_TOON_DISP_E,   "CustEdit", WS_TABSTOP, 68, 212, 40, 10
-    CONTROL         "",  IDC_TOON_DISP_S,   "SpinnerControl",  0,         90,212,  7, 10
-    LTEXT           "Bias",      -1,   6,228, 16,  8
-    CONTROL         "",  IDC_TOON_DISP_B_E, "CustEdit", WS_TABSTOP, 24, 226, 40, 10
-    CONTROL         "",  IDC_TOON_DISP_B_S, "SpinnerControl",  0,         48,226,  7, 10
-
+    GROUPBOX        "Displacement", -1, 2, 278, 166, 93
+    CONTROL         "", IDC_TOON_DISP_MAP, "CustButton", WS_TABSTOP, 52, 290, 70, 12
+    LTEXT           "Scl", -1, 8, 306, 42, 8
+    CONTROL         "", IDC_TOON_DISP_E, "CustEdit", WS_TABSTOP, 52, 304, 30, 10
+    CONTROL         "", IDC_TOON_DISP_S, "SpinnerControl", 0, 82, 304, 11, 10
+    LTEXT           "Bias", -1, 8, 320, 42, 8
+    CONTROL         "", IDC_TOON_DISP_B_E, "CustEdit", WS_TABSTOP, 52, 318, 30, 10
+    CONTROL         "", IDC_TOON_DISP_B_S, "SpinnerControl", 0, 82, 318, 11, 10
+    
     // ── Options ───────────────────────────────
-    CONTROL         "Double Sided",IDC_TOON_DBLSIDE,"Button",BS_AUTOCHECKBOX|WS_TABSTOP, 4,248, 56, 10
-    LTEXT           "Model: MeshToonMaterial", -1, 4, 262, 96, 8
-
+    CONTROL         "Double Sided", IDC_TOON_DBLSIDE, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 8, 332, 80, 10
+    LTEXT           "Model: MeshToonMaterial", -1, 8, 348, 160, 8
+    
     LTEXT           "",  -1,   0,300,  0,  0
 END

@@ -202,6 +202,7 @@
         import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
         import { HDRLoader } from 'three/addons/loaders/HDRLoader.js';
         import { LightProbeGenerator } from 'three/addons/lights/LightProbeGenerator.js';
+        import { RectAreaLightTexturesLib } from 'three/addons/lights/RectAreaLightTexturesLib.js';
         import { applyDeltaFrame } from './js/protocol.js';
         import { createPerfHud } from './js/perf_hud.js';
         import { createSSGIController } from './js/ssgi_fx.js';
@@ -250,6 +251,10 @@
             const message = error?.message || String(error);
             document.getElementById('info').textContent = `MaxJS - renderer init failed: ${message}`;
             throw error;
+        }
+
+        if (THREE.RectAreaLightNode?.setLTC) {
+            THREE.RectAreaLightNode.setLTC(RectAreaLightTexturesLib.init());
         }
 
         const controls = new OrbitControls(camera, renderer.domElement);

@@ -1,7 +1,6 @@
 import * as THREE from 'three';
 import {
     add,
-    blendColor,
     colorToDirection,
     diffuseColor,
     directionToColor,
@@ -30,8 +29,9 @@ function setTexturePrecision(scenePass) {
     if (metalRoughTexture) metalRoughTexture.type = THREE.UnsignedByteType;
 }
 
-export function createSSGIController({ renderer, scene, camera, onError = () => {} }) {
-    const postProcessing = new THREE.PostProcessing(renderer);
+export function createSSGIController({ renderer, scene, camera, backendLabel = '', onError = () => {} }) {
+    const renderPipeline = new THREE.RenderPipeline(renderer);
+    const supportsScreenSpaceEffects = backendLabel === 'WebGPU';
     const state = {
         ssgi: {
             enabled: false,
@@ -82,8 +82,8 @@ export function createSSGIController({ renderer, scene, camera, onError = () => 
         state.bloom.enabled = false;
         pipelineReady = false;
         clearNodes();
-        postProcessing.outputNode = null;
-        postProcessing.needsUpdate = true;
+        renderPipeline.outputNode = null;
+        renderPipeline.needsUpdate = true;
         onError(`${prefix}: ${lastError}`);
     }
 
@@ -95,8 +95,8 @@ export function createSSGIController({ renderer, scene, camera, onError = () => 
         if (!hasAnyEffectEnabled() || !available) {
             pipelineReady = false;
             clearNodes();
-            postProcessing.outputNode = null;
-            postProcessing.needsUpdate = true;
+            renderPipeline.outputNode = null;
+            renderPipeline.needsUpdate = true;
             return;
         }
 
@@ -159,7 +159,7 @@ export function createSSGIController({ renderer, scene, camera, onError = () => 
                 ssrPass.opacity.value = state.ssr.opacity;
                 ssrPass.thickness.value = state.ssr.thickness;
                 activeNodes.push(ssrPass);
-                beauty = blendColor(beauty, ssrPass);
+                beauty = vec4(beauty.rgb.add(ssrPass.rgb), beauty.a);
             }
 
             if (state.bloom.enabled) {
@@ -173,8 +173,8 @@ export function createSSGIController({ renderer, scene, camera, onError = () => 
                 beauty = beauty.add(bloomPass);
             }
 
-            postProcessing.outputNode = beauty;
-            postProcessing.needsUpdate = true;
+            renderPipeline.outputNode = beauty;
+            renderPipeline.needsUpdate = true;
             pipelineReady = true;
             lastError = '';
         } catch (error) {
@@ -192,7 +192,16 @@ export function createSSGIController({ renderer, scene, camera, onError = () => 
         getLastError() {
             return lastError;
         },
+        supportsScreenSpaceEffects() {
+            return supportsScreenSpaceEffects;
+        },
         setEnabled(enabled) {
+            if (enabled && !supportsScreenSpaceEffects) {
+                lastError = 'SSGI requires the real WebGPU backend';
+                state.ssgi.enabled = false;
+                onError(lastError);
+                return false;
+            }
             state.ssgi.enabled = !!enabled && available;
             rebuildPipeline();
             return state.ssgi.enabled;
@@ -201,6 +210,12 @@ export function createSSGIController({ renderer, scene, camera, onError = () => 
             return state.ssr.enabled;
         },
         setSSREnabled(enabled) {
+            if (enabled && !supportsScreenSpaceEffects) {
+                lastError = 'SSR requires the real WebGPU backend';
+                state.ssr.enabled = false;
+                onError(lastError);
+                return false;
+            }
             state.ssr.enabled = !!enabled && available;
             rebuildPipeline();
             return state.ssr.enabled;
@@ -220,15 +235,15 @@ export function createSSGIController({ renderer, scene, camera, onError = () => 
             }
 
             try {
-                postProcessing.render();
+                renderPipeline.render();
             } catch (error) {
-                disableWithError('SSGI render failed', error);
+                disableWithError('Post pipeline render failed', error);
                 renderer.render(scene, camera);
             }
         },
         resize() {
             if (hasAnyEffectEnabled()) {
-                postProcessing.needsUpdate = true;
+                renderPipeline.needsUpdate = true;
             }
         },
     };

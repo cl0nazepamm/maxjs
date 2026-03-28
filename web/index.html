@@ -41,7 +41,9 @@
     <script type="importmap">
     {
         "imports": {
-            "three": "https://cdn.jsdelivr.net/npm/three@0.182.0/build/three.module.js",
+            "three": "https://cdn.jsdelivr.net/npm/three@0.182.0/build/three.webgpu.js",
+            "three/webgpu": "https://cdn.jsdelivr.net/npm/three@0.182.0/build/three.webgpu.js",
+            "three/tsl": "https://cdn.jsdelivr.net/npm/three@0.182.0/build/three.tsl.js",
             "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.182.0/examples/jsm/"
         }
     }
@@ -61,12 +63,43 @@
         camera.up.set(0, 0, 1);  // Z-up to match Max
         camera.position.set(200, -200, 150);
 
-        const renderer = new THREE.WebGLRenderer({ antialias: true });
-        renderer.setSize(innerWidth, innerHeight);
-        renderer.setPixelRatio(devicePixelRatio);
-        renderer.toneMapping = THREE.ACESFilmicToneMapping;
-        renderer.toneMappingExposure = 1.2;
-        document.body.appendChild(renderer.domElement);
+        function configureRenderer(nextRenderer) {
+            nextRenderer.setSize(innerWidth, innerHeight);
+            nextRenderer.setPixelRatio(devicePixelRatio);
+            nextRenderer.toneMapping = THREE.ACESFilmicToneMapping;
+            nextRenderer.toneMappingExposure = 1.2;
+            document.body.appendChild(nextRenderer.domElement);
+        }
+
+        async function createRenderer() {
+            let nextRenderer = new THREE.WebGPURenderer({ antialias: true });
+            let backendLabel = 'WebGPU';
+
+            try {
+                configureRenderer(nextRenderer);
+                await nextRenderer.init();
+            } catch (error) {
+                console.warn('MaxJS WebGPU init failed, retrying with forced WebGL2 backend.', error);
+                nextRenderer.domElement.remove();
+                nextRenderer.dispose?.();
+                nextRenderer = new THREE.WebGPURenderer({ antialias: true, forceWebGL: true });
+                backendLabel = 'WebGL2 fallback';
+                configureRenderer(nextRenderer);
+                await nextRenderer.init();
+            }
+
+            return { renderer: nextRenderer, backendLabel };
+        }
+
+        let renderer = null;
+        let rendererBackendLabel = 'WebGPU';
+        try {
+            ({ renderer, backendLabel: rendererBackendLabel } = await createRenderer());
+        } catch (error) {
+            const message = error?.message || String(error);
+            document.getElementById('info').textContent = `MaxJS - renderer init failed: ${message}`;
+            throw error;
+        }
 
         const controls = new OrbitControls(camera, renderer.domElement);
         controls.enableDamping = true;
@@ -95,6 +128,7 @@
         const materialCache = new Map();
         const nodeMap = new Map();
         const perfHud = createPerfHud(document.getElementById('info'));
+        perfHud.setStatus(`MaxJS - ${rendererBackendLabel} renderer ready`);
         function createSolidTexture(r, g, b, a = 255) {
             const tex = new THREE.DataTexture(new Uint8Array([r, g, b, a]), 1, 1);
             tex.colorSpace = THREE.NoColorSpace;
@@ -832,13 +866,14 @@
             renderer.setSize(innerWidth, innerHeight);
         });
 
-        (function animate() {
-            requestAnimationFrame(animate);
+        function renderFrame() {
             controls.update();
             const renderStart = performance.now();
             renderer.render(scene, camera);
-            perfHud.updateRender(performance.now() - renderStart, renderer.info.render);
-        })();
+            perfHud.updateRender(performance.now() - renderStart, renderer.info?.render);
+        }
+
+        renderer.setAnimationLoop(renderFrame);
 
         startBridgeHandshake();
     </script>

@@ -16,11 +16,13 @@ import {
     sample,
     sub,
     vec2,
+    vec3,
     vec4,
 } from 'three/tsl';
 import { bloom } from 'three/addons/tsl/display/BloomNode.js';
 import { ssr } from 'three/addons/tsl/display/SSRNode.js';
 import { ssgi } from 'three/addons/tsl/display/SSGINode.js';
+import { outline } from 'three/addons/tsl/display/OutlineNode.js';
 
 function setTexturePrecision(scenePass) {
     const diffuseTexture = scenePass.getTexture('diffuseColor');
@@ -64,7 +66,17 @@ export function createSSGIController({ renderer, scene, camera, backendLabel = '
             radius: 0.2,
             threshold: 0.75,
         },
+        outline: {
+            enabled: true,
+            edgeStrength: 3.0,
+            edgeGlow: 0.0,
+            edgeThickness: 1.0,
+            visibleEdgeColor: [1, 1, 1],
+            hiddenEdgeColor: [0.3, 0.2, 0.2],
+        },
     };
+
+    let selectedObjects = [];
 
     let available = true;
     let lastError = '';
@@ -130,7 +142,7 @@ export function createSSGIController({ renderer, scene, camera, backendLabel = '
     }
 
     function hasAnyEffectEnabled() {
-        return state.ssgi.enabled || state.ssr.enabled || state.bloom.enabled;
+        return state.ssgi.enabled || state.ssr.enabled || state.bloom.enabled || (state.outline.enabled && selectedObjects.length > 0);
     }
 
     function computeSceneReferenceSize() {
@@ -171,6 +183,7 @@ export function createSSGIController({ renderer, scene, camera, backendLabel = '
             ssgi: { ...state.ssgi },
             ssr: { ...state.ssr },
             bloom: { ...state.bloom },
+            outline: { ...state.outline, selectedCount: selectedObjects.length },
         };
     }
 
@@ -273,6 +286,23 @@ export function createSSGIController({ renderer, scene, camera, backendLabel = '
                 beauty = beauty.add(bloomPass);
             }
 
+            if (state.outline.enabled && selectedObjects.length > 0) {
+                const outlinePass = outline(scene, camera, {
+                    selectedObjects,
+                    edgeGlow: float(state.outline.edgeGlow),
+                    edgeThickness: float(state.outline.edgeThickness),
+                });
+                activeNodes.push(outlinePass);
+
+                const visC = state.outline.visibleEdgeColor;
+                const hidC = state.outline.hiddenEdgeColor;
+                const outlineColor = outlinePass.visibleEdge
+                    .mul(vec3(visC[0], visC[1], visC[2]))
+                    .add(outlinePass.hiddenEdge.mul(vec3(hidC[0], hidC[1], hidC[2])))
+                    .mul(state.outline.edgeStrength);
+                beauty = beauty.add(vec4(outlineColor, 0));
+            }
+
             postProcessing.outputNode = beauty;
             postProcessing.needsUpdate = true;
             pipelineReady = true;
@@ -364,6 +394,30 @@ export function createSSGIController({ renderer, scene, camera, backendLabel = '
             assignFinite(state.bloom, 'threshold', options.threshold);
             rebuildPipeline();
             return { ...state.bloom };
+        },
+        isOutlineEnabled() {
+            return state.outline.enabled;
+        },
+        setOutlineEnabled(enabled) {
+            state.outline.enabled = !!enabled;
+            rebuildPipeline();
+            return state.outline.enabled;
+        },
+        setSelectedObjects(objects) {
+            // Mutate the array in place — OutlineNode holds a reference to it
+            selectedObjects.length = 0;
+            if (objects) selectedObjects.push(...objects);
+            // Only rebuild if outline just became relevant (first selection) or lost all selection
+            if (state.outline.enabled && !pipelineReady) rebuildPipeline();
+        },
+        setOutlineOptions(options = {}) {
+            assignFinite(state.outline, 'edgeStrength', options.edgeStrength);
+            assignFinite(state.outline, 'edgeGlow', options.edgeGlow);
+            assignFinite(state.outline, 'edgeThickness', options.edgeThickness);
+            if (Array.isArray(options.visibleEdgeColor)) state.outline.visibleEdgeColor = options.visibleEdgeColor;
+            if (Array.isArray(options.hiddenEdgeColor)) state.outline.hiddenEdgeColor = options.hiddenEdgeColor;
+            rebuildPipeline();
+            return { ...state.outline };
         },
         render() {
             if (!hasAnyEffectEnabled() || !pipelineReady) {

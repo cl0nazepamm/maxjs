@@ -169,7 +169,7 @@
             <button id="btnCamLock" class="active">Cam Lock: ON</button>
             <button id="btnEnv">Env: OFF</button>
             <button id="btnLightProbe" class="active">Probe: ON</button>
-            <button id="btnSel" class="active">Sel: ON</button>
+            <button id="btnSel" class="active">Outline: ON</button>
             <button id="btnPostFxPanel">Post FX</button>
         </div>
     </div>
@@ -531,21 +531,15 @@
         }
 
         function applyMaterialSelectionState(material, selected) {
+            // Selection is now handled by outline post-processing pass
+            // Just restore base emissive
             if (!material?.emissive) return;
-
             const base = material.userData?.maxjsBaseEmissive || [0, 0, 0];
             const baseIntensity = Number.isFinite(material.userData?.maxjsBaseEmissiveIntensity)
                 ? material.userData.maxjsBaseEmissiveIntensity
                 : 1.0;
-
             material.emissive.setRGB(base[0], base[1], base[2]);
             material.emissiveIntensity = baseIntensity;
-
-            if (selected && selHighlight) {
-                material.emissive.r = Math.min(1.0, material.emissive.r + 0.05);
-                material.emissive.g = Math.min(1.0, material.emissive.g + 0.05);
-                material.emissive.b = Math.min(1.0, material.emissive.b + 0.20);
-            }
         }
 
         function createMaterial(md) {
@@ -1056,10 +1050,20 @@
 
         function applySelection(mesh, selected) {
             mesh.userData.maxjsSelected = !!selected;
-            const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
-            for (const m of mats) {
-                applyMaterialSelectionState(m, !!selected);
+            // Update outline pass with current selection
+            updateOutlineSelection();
+        }
+
+        function updateOutlineSelection() {
+            if (!selHighlight) {
+                ssgiFx.setSelectedObjects([]);
+                return;
             }
+            const selected = [];
+            for (const [, mesh] of nodeMap) {
+                if (mesh.userData.maxjsSelected) selected.push(mesh);
+            }
+            ssgiFx.setSelectedObjects(selected);
         }
 
         function applyMaterialScalar(mesh, material) {
@@ -1160,11 +1164,10 @@
         const btnSel = document.getElementById('btnSel');
         btnSel.onclick = () => {
             selHighlight = !selHighlight;
-            btnSel.textContent = `Sel: ${selHighlight ? 'ON' : 'OFF'}`;
+            btnSel.textContent = `Outline: ${selHighlight ? 'ON' : 'OFF'}`;
             btnSel.classList.toggle('active', selHighlight);
-            for (const [, mesh] of nodeMap) {
-                applySelection(mesh, !!mesh.userData.maxjsSelected);
-            }
+            ssgiFx.setOutlineEnabled(selHighlight);
+            updateOutlineSelection();
         };
 
         const btnPostFxPanel = document.getElementById('btnPostFxPanel');

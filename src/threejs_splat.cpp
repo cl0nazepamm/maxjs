@@ -204,13 +204,13 @@ CreateMouseCallBack* ThreeJSSplatOrigin::GetCreateMouseCallBack() {
 }
 
 void ThreeJSSplatOrigin::BeginEditParams(IObjParam* ip, ULONG flags, Animatable* prev) {
-    SimpleObject2::BeginEditParams(ip, flags, prev);
+    g_splatDesc.BeginEditParams(ip, this, flags, prev);
     GetSplatParamDesc()->SetUserDlgProc(new ThreeJSSplatDlgProc(this));
 }
 
 void ThreeJSSplatOrigin::EndEditParams(IObjParam* ip, ULONG flags, Animatable* next) {
     GetSplatParamDesc()->SetUserDlgProc(nullptr);
-    SimpleObject2::EndEditParams(ip, flags, next);
+    g_splatDesc.EndEditParams(ip, this, flags, next);
 }
 
 void ThreeJSSplatOrigin::BrowseForSplatFile(HWND owner) {

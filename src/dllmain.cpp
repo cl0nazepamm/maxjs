@@ -3,6 +3,7 @@
 #include <iparamb2.h>
 #include <plugapi.h>
 #include <maxapi.h>
+#include <units.h>
 #include <triobj.h>
 #include <notify.h>
 #include <stdmat.h>
@@ -2004,7 +2005,7 @@ public:
         if (!node) return false;
 
         ObjectState os = node->EvalWorldState(t);
-        if (!os.obj || os.obj->ClassID() != THREEJS_LIGHT_CLASS_ID) return false;
+        if (!os.obj || !IsThreeJSLightClassID(os.obj->ClassID())) return false;
 
         IParamBlock2* pb = os.obj->GetParamBlockByID(threejs_light_params);
         if (!pb) return false;
@@ -2018,10 +2019,23 @@ public:
             RememberSentTransform(handle, xform);
         }
 
-        const int ltype = pb->GetInt(pl_type);
+        const Class_ID classId = os.obj->ClassID();
+        ThreeJSLightType ltype = GetThreeJSLightTypeFromClassID(classId);
+        if (ThreeJSLightClassUsesTypeParam(classId)) {
+            int rawType = pb->GetInt(pl_type);
+            if (rawType < 0) rawType = 0;
+            if (rawType >= kLight_COUNT) rawType = kLight_Directional;
+            ltype = static_cast<ThreeJSLightType>(rawType);
+        }
+        const bool supportsShadows =
+            ltype == kLight_Directional || ltype == kLight_Point || ltype == kLight_Spot;
+        const double metersPerUnit = GetSystemUnitScale(UNITS_METERS);
+        const double pointSpotScale = metersPerUnit > 1.0e-9 ? 1.0 / (metersPerUnit * metersPerUnit) : 1.0;
         Point3 pos = tm.GetTrans();
         Point3 dir = -Normalize(tm.GetRow(1));
         Color c = pb->GetColor(pl_color, t);
+        double intensity = pb->GetFloat(pl_intensity, t);
+        if (ltype == kLight_Point || ltype == kLight_Spot) intensity *= pointSpotScale;
 
         ss << L'{';
         bool needsComma = false;
@@ -2040,11 +2054,11 @@ public:
         }
 
         appendComma();
-        ss << L"\"type\":" << ltype;
+        ss << L"\"type\":" << static_cast<int>(ltype);
         ss << L",\"pos\":[" << pos.x << L',' << pos.y << L',' << pos.z << L']';
         ss << L",\"dir\":[" << dir.x << L',' << dir.y << L',' << dir.z << L']';
         ss << L",\"color\":[" << c.r << L',' << c.g << L',' << c.b << L']';
-        ss << L",\"intensity\":" << pb->GetFloat(pl_intensity, t);
+        ss << L",\"intensity\":" << intensity;
 
         if (ltype == kLight_Point || ltype == kLight_Spot) {
             ss << L",\"distance\":" << pb->GetFloat(pl_distance, t);
@@ -2063,16 +2077,11 @@ public:
             ss << L",\"groundColor\":[" << gc.r << L',' << gc.g << L',' << gc.b << L']';
         }
 
-        if (pb->GetInt(pl_cast_shadow)) {
+        if (supportsShadows && pb->GetInt(pl_cast_shadow)) {
             ss << L",\"castShadow\":true";
             ss << L",\"shadowBias\":" << pb->GetFloat(pl_shadow_bias, t);
             ss << L",\"shadowRadius\":" << pb->GetFloat(pl_shadow_radius, t);
             ss << L",\"shadowMapSize\":" << pb->GetInt(pl_shadow_mapsize);
-        }
-
-        if (pb->GetInt(pl_volumetric)) {
-            ss << L",\"volumetric\":true";
-            ss << L",\"volDensity\":" << pb->GetFloat(pl_vol_density, t);
         }
 
         ss << L'}';
@@ -2821,15 +2830,21 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, ULONG fdwReason, LPVOID) {
 }
 
 __declspec(dllexport) const TCHAR* LibDescription()   { return MAXJS_NAME; }
-__declspec(dllexport) int LibNumberClasses()           { return 6; }
+__declspec(dllexport) int LibNumberClasses()           { return 12; }
 __declspec(dllexport) ClassDesc* LibClassDesc(int i) {
     switch (i) {
         case 0: return &maxJSDesc;
         case 1: return GetThreeJSMtlDesc();
         case 2: return GetThreeJSAdvMtlDesc();
         case 3: return GetThreeJSRendererDesc();
-        case 4: return GetThreeJSLightDesc();
-        case 5: return GetThreeJSToonDesc();
+        case 4: return GetThreeJSLightLegacyDesc();
+        case 5: return GetThreeJSDirectionalLightDesc();
+        case 6: return GetThreeJSPointLightDesc();
+        case 7: return GetThreeJSSpotLightDesc();
+        case 8: return GetThreeJSRectAreaLightDesc();
+        case 9: return GetThreeJSHemisphereLightDesc();
+        case 10: return GetThreeJSAmbientLightDesc();
+        case 11: return GetThreeJSToonDesc();
         default: return nullptr;
     }
 }

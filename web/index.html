@@ -1164,7 +1164,7 @@
         const lightGroup = new THREE.Group();
         lightGroup.name = '__maxjs_lights';
         scene.add(lightGroup);
-        const LIGHT_TYPES = ['DirectionalLight', 'PointLight', 'SpotLight', 'RectAreaLight', 'HemisphereLight'];
+        const LIGHT_TYPES = ['DirectionalLight', 'PointLight', 'SpotLight', 'RectAreaLight', 'HemisphereLight', 'AmbientLight'];
         const lightHandleMap = new Map();
 
         function clearLights() {
@@ -1239,6 +1239,8 @@
                     ld.groundColor?.[2] ?? 0.2666666667
                 );
                 break;
+            case 5:
+                break;
             }
 
             if (light.shadow) {
@@ -1273,6 +1275,9 @@
                 break;
             case 4:
                 light = new THREE.HemisphereLight(0xffffff, 0x444444, 1);
+                break;
+            case 5:
+                light = new THREE.AmbientLight(0xffffff, 1);
                 break;
             default:
                 return null;

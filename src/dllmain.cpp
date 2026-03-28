@@ -11,6 +11,7 @@
 #include "sync_protocol.h"
 #include "threejs_material.h"
 #include "threejs_lights.h"
+#include "threejs_toon.h"
 #include "threejs_renderer.h"
 
 #include <wrl.h>
@@ -994,6 +995,7 @@ public:
     int tickCount_ = 0;
     size_t geoScanCursor_ = 0;
     std::unordered_set<ULONG> geomHandles_;
+    std::unordered_set<ULONG> lightHandles_;
     std::unordered_set<ULONG> fastDirtyHandles_;
     std::unordered_map<ULONG, std::array<float, 16>> lastSentTransforms_;
     std::unordered_map<ULONG, uintptr_t> mtlHashMap_;  // node handle → material state hash
@@ -1165,6 +1167,7 @@ public:
         tickCount_ = 0;
         geoScanCursor_ = 0;
         geomHandles_.clear();
+        lightHandles_.clear();
         fastDirtyHandles_.clear();
         lastSentTransforms_.clear();
         mtlHashMap_.clear();
@@ -1217,7 +1220,12 @@ public:
     // ── Callbacks & sync ─────────────────────────────────────
 
     bool IsTrackedHandle(ULONG handle) const {
-        return geomHandles_.find(handle) != geomHandles_.end();
+        return geomHandles_.find(handle) != geomHandles_.end()
+            || lightHandles_.find(handle) != lightHandles_.end();
+    }
+
+    bool HasTrackedNodes() const {
+        return !geomHandles_.empty() || !lightHandles_.empty();
     }
 
     void QueueFastFlush() {
@@ -1325,8 +1333,9 @@ public:
     }
 
     void MarkAllTrackedNodesDirty() {
-        if (geomHandles_.empty()) return;
+        if (!HasTrackedNodes()) return;
         fastDirtyHandles_.insert(geomHandles_.begin(), geomHandles_.end());
+        fastDirtyHandles_.insert(lightHandles_.begin(), lightHandles_.end());
         QueueFastFlush();
     }
 
@@ -1400,6 +1409,7 @@ public:
             mtlHashMap_.clear();
             geoHashMap_.clear();  // force all geometry to be sent
             lastSentTransforms_.clear();
+            lightHandles_.clear();
             geoScanCursor_ = 0;
             ResetFastPathState(false);
         }
@@ -1434,10 +1444,18 @@ public:
         const bool hasDirtyCamera = fastCameraDirty_;
         if (!hasDirtyNodes && !hasDirtyCamera) return;
 
+        bool hasDirtyLights = false;
+        for (ULONG handle : dirtyHandles) {
+            if (lightHandles_.find(handle) != lightHandles_.end()) {
+                hasDirtyLights = true;
+                break;
+            }
+        }
+
         fastDirtyHandles_.clear();
         fastCameraDirty_ = false;
 
-        if (!useBinary_) {
+        if (!useBinary_ || hasDirtyLights) {
             if (hasDirtyNodes) SendTransformSync();
             else SendCameraSync();
             CaptureCurrentCameraState();
@@ -1469,6 +1487,7 @@ public:
                 mtlHashMap_.erase(handle);
                 geoHashMap_.erase(handle);
                 geomHandles_.erase(handle);
+                lightHandles_.erase(handle);
                 lastSentTransforms_.erase(handle);
                 dirty_ = true;
                 continue;
@@ -1541,7 +1560,7 @@ public:
         webview_->QueryInterface(IID_PPV_ARGS(&wv17));
         env_->QueryInterface(IID_PPV_ARGS(&env12));
         if (!wv17 || !env12) {
-            if (geomHandles_.empty()) SendCameraSync();
+            if (!HasTrackedNodes()) SendCameraSync();
             else SendTransformSync();
             return;
         }
@@ -1615,7 +1634,7 @@ public:
         ComPtr<ICoreWebView2SharedBuffer> sharedBuf;
         HRESULT hr = env12->CreateSharedBuffer(totalBytes, &sharedBuf);
         if (FAILED(hr) || !sharedBuf) {
-            if (geomHandles_.empty()) SendCameraSync();
+            if (!HasTrackedNodes()) SendCameraSync();
             else SendTransformSync();
             return;
         }
@@ -1879,7 +1898,90 @@ public:
         ss << L'}';
     }
 
-    void WriteLightsJson(std::wostringstream& ss, Interface* ip, TimeValue t) {
+    bool WriteLightJson(std::wostringstream& ss, INode* node, TimeValue t,
+                        bool includeHandle = false, bool includeVisibility = false,
+                        bool trackHandle = false) {
+        if (!node) return false;
+
+        ObjectState os = node->EvalWorldState(t);
+        if (!os.obj || os.obj->ClassID() != THREEJS_LIGHT_CLASS_ID) return false;
+
+        IParamBlock2* pb = os.obj->GetParamBlockByID(threejs_light_params);
+        if (!pb) return false;
+
+        const ULONG handle = node->GetHandle();
+        Matrix3 tm = node->GetObjectTM(t);
+        float xform[16];
+        GetTransform16(node, t, xform);
+        if (trackHandle) {
+            lightHandles_.insert(handle);
+            RememberSentTransform(handle, xform);
+        }
+
+        const int ltype = pb->GetInt(pl_type);
+        Point3 pos = tm.GetTrans();
+        Point3 dir = -Normalize(tm.GetRow(1));
+        Color c = pb->GetColor(pl_color, t);
+
+        ss << L'{';
+        bool needsComma = false;
+        auto appendComma = [&]() {
+            if (needsComma) ss << L',';
+            needsComma = true;
+        };
+
+        if (includeHandle) {
+            appendComma();
+            ss << L"\"h\":" << handle;
+        }
+        if (includeVisibility) {
+            appendComma();
+            ss << L"\"v\":" << (node->IsNodeHidden(TRUE) ? L'0' : L'1');
+        }
+
+        appendComma();
+        ss << L"\"type\":" << ltype;
+        ss << L",\"pos\":[" << pos.x << L',' << pos.y << L',' << pos.z << L']';
+        ss << L",\"dir\":[" << dir.x << L',' << dir.y << L',' << dir.z << L']';
+        ss << L",\"color\":[" << c.r << L',' << c.g << L',' << c.b << L']';
+        ss << L",\"intensity\":" << pb->GetFloat(pl_intensity, t);
+
+        if (ltype == kLight_Point || ltype == kLight_Spot) {
+            ss << L",\"distance\":" << pb->GetFloat(pl_distance, t);
+            ss << L",\"decay\":" << pb->GetFloat(pl_decay, t);
+        }
+        if (ltype == kLight_Spot) {
+            ss << L",\"angle\":" << (pb->GetFloat(pl_angle, t) * 3.14159265f / 180.f);
+            ss << L",\"penumbra\":" << pb->GetFloat(pl_penumbra, t);
+        }
+        if (ltype == kLight_RectArea) {
+            ss << L",\"width\":" << pb->GetFloat(pl_width, t);
+            ss << L",\"height\":" << pb->GetFloat(pl_height, t);
+        }
+        if (ltype == kLight_Hemisphere) {
+            Color gc = pb->GetColor(pl_ground_color, t);
+            ss << L",\"groundColor\":[" << gc.r << L',' << gc.g << L',' << gc.b << L']';
+        }
+
+        if (pb->GetInt(pl_cast_shadow)) {
+            ss << L",\"castShadow\":true";
+            ss << L",\"shadowBias\":" << pb->GetFloat(pl_shadow_bias, t);
+            ss << L",\"shadowRadius\":" << pb->GetFloat(pl_shadow_radius, t);
+            ss << L",\"shadowMapSize\":" << pb->GetInt(pl_shadow_mapsize);
+        }
+
+        if (pb->GetInt(pl_volumetric)) {
+            ss << L",\"volumetric\":true";
+            ss << L",\"volDensity\":" << pb->GetFloat(pl_vol_density, t);
+        }
+
+        ss << L'}';
+        return true;
+    }
+
+    void WriteLightsJson(std::wostringstream& ss, Interface* ip, TimeValue t,
+                         bool includeHandle = false, bool includeVisibility = false,
+                         bool trackHandles = false) {
         ss << L"\"lights\":[";
         bool firstLight = true;
         INode* root = ip ? ip->GetRootNode() : nullptr;
@@ -1887,58 +1989,18 @@ public:
             std::function<void(INode*)> collectLights = [&](INode* parent) {
                 for (int i = 0; i < parent->NumberOfChildren(); i++) {
                     INode* node = parent->GetChildNode(i);
-                    if (!node || node->IsNodeHidden(TRUE)) continue;
+                    if (!node) continue;
+                    if (node->IsNodeHidden(TRUE) && !includeVisibility) {
+                        collectLights(node);
+                        continue;
+                    }
 
-                    ObjectState os = node->EvalWorldState(t);
-                    if (os.obj && os.obj->ClassID() == THREEJS_LIGHT_CLASS_ID) {
-                        IParamBlock2* pb = os.obj->GetParamBlockByID(threejs_light_params);
-                        if (pb) {
-                            if (!firstLight) ss << L',';
-                            ss << L"{\"type\":" << pb->GetInt(pl_type);
-
-                            Matrix3 tm = node->GetObjectTM(t);
-                            Point3 pos = tm.GetTrans();
-                            Point3 dir = -Normalize(tm.GetRow(1));
-                            ss << L",\"pos\":[" << pos.x << L',' << pos.y << L',' << pos.z << L']';
-                            ss << L",\"dir\":[" << dir.x << L',' << dir.y << L',' << dir.z << L']';
-
-                            Color c = pb->GetColor(pl_color, t);
-                            ss << L",\"color\":[" << c.r << L',' << c.g << L',' << c.b << L']';
-                            ss << L",\"intensity\":" << pb->GetFloat(pl_intensity, t);
-
-                            const int ltype = pb->GetInt(pl_type);
-                            if (ltype == kLight_Point || ltype == kLight_Spot) {
-                                ss << L",\"distance\":" << pb->GetFloat(pl_distance, t);
-                                ss << L",\"decay\":" << pb->GetFloat(pl_decay, t);
-                            }
-                            if (ltype == kLight_Spot) {
-                                ss << L",\"angle\":" << (pb->GetFloat(pl_angle, t) * 3.14159265f / 180.f);
-                                ss << L",\"penumbra\":" << pb->GetFloat(pl_penumbra, t);
-                            }
-                            if (ltype == kLight_RectArea) {
-                                ss << L",\"width\":" << pb->GetFloat(pl_width, t);
-                                ss << L",\"height\":" << pb->GetFloat(pl_height, t);
-                            }
-                            if (ltype == kLight_Hemisphere) {
-                                Color gc = pb->GetColor(pl_ground_color, t);
-                                ss << L",\"groundColor\":[" << gc.r << L',' << gc.g << L',' << gc.b << L']';
-                            }
-
-                            if (pb->GetInt(pl_cast_shadow)) {
-                                ss << L",\"castShadow\":true";
-                                ss << L",\"shadowBias\":" << pb->GetFloat(pl_shadow_bias, t);
-                                ss << L",\"shadowRadius\":" << pb->GetFloat(pl_shadow_radius, t);
-                                ss << L",\"shadowMapSize\":" << pb->GetInt(pl_shadow_mapsize);
-                            }
-
-                            if (pb->GetInt(pl_volumetric)) {
-                                ss << L",\"volumetric\":true";
-                                ss << L",\"volDensity\":" << pb->GetFloat(pl_vol_density, t);
-                            }
-
-                            ss << L'}';
-                            firstLight = false;
-                        }
+                    std::wostringstream lightJson;
+                    lightJson.imbue(std::locale::classic());
+                    if (WriteLightJson(lightJson, node, t, includeHandle, includeVisibility, trackHandles)) {
+                        if (!firstLight) ss << L',';
+                        ss << lightJson.str();
+                        firstLight = false;
                     }
 
                     collectLights(node);
@@ -1964,6 +2026,7 @@ public:
         const std::uint32_t frameId = AllocateFrameId();
 
         geomHandles_.clear();
+        lightHandles_.clear();
         lastSentTransforms_.clear();
 
         std::wostringstream ss;
@@ -1996,7 +2059,7 @@ public:
         ss << L'}';
 
         ss << L",";
-        WriteLightsJson(ss, ip, t);
+        WriteLightsJson(ss, ip, t, true, false, true);
 
         ss << L'}';
 
@@ -2082,6 +2145,7 @@ public:
         if (!wv17 || !env12) { SendFullSync(); return; }
 
         geomHandles_.clear();
+        lightHandles_.clear();
         lastSentTransforms_.clear();
 
         // Collect all geometry nodes
@@ -2232,7 +2296,7 @@ public:
         ss << L",\"flip\":" << envData.flip;
         ss << L'}';
         ss << L",";
-        WriteLightsJson(ss, ip, t);
+        WriteLightsJson(ss, ip, t, true, false, true);
         ss << L'}';
 
         wv17->PostSharedBufferToScript(sharedBuf.Get(),
@@ -2244,7 +2308,7 @@ public:
     // ── Transform-only sync ──────────────────────────────────
 
     void SendTransformSync() {
-        if (geomHandles_.empty()) return;
+        if (!HasTrackedNodes()) return;
         Interface* ip = GetCOREInterface();
         if (!ip) return;
         TimeValue t = ip->GetTime();
@@ -2317,6 +2381,8 @@ public:
             ++it;
         }
         ss << L"],";
+        WriteLightsJson(ss, ip, t, true, true, true);
+        ss << L",";
         WriteCameraJson(ss);
         ss << L'}';
         webview_->PostWebMessageAsJson(ss.str().c_str());
@@ -2472,6 +2538,7 @@ public:
         fastDirtyHandles_.clear();
         lastSentTransforms_.clear();
         geomHandles_.clear();
+        lightHandles_.clear();
         mtlHashMap_.clear();
         geoHashMap_.clear();
         if (hwnd_) { HWND h = hwnd_; hwnd_ = nullptr; DestroyWindow(h); }
@@ -2670,7 +2737,7 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, ULONG fdwReason, LPVOID) {
 }
 
 __declspec(dllexport) const TCHAR* LibDescription()   { return MAXJS_NAME; }
-__declspec(dllexport) int LibNumberClasses()           { return 5; }
+__declspec(dllexport) int LibNumberClasses()           { return 6; }
 __declspec(dllexport) ClassDesc* LibClassDesc(int i) {
     switch (i) {
         case 0: return &maxJSDesc;
@@ -2678,6 +2745,7 @@ __declspec(dllexport) ClassDesc* LibClassDesc(int i) {
         case 2: return GetThreeJSAdvMtlDesc();
         case 3: return GetThreeJSRendererDesc();
         case 4: return GetThreeJSLightDesc();
+        case 5: return GetThreeJSToonDesc();
         default: return nullptr;
     }
 }

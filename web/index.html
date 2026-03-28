@@ -220,6 +220,7 @@
             nextRenderer.setPixelRatio(devicePixelRatio);
             nextRenderer.toneMapping = THREE.ACESFilmicToneMapping;
             nextRenderer.toneMappingExposure = 1.2;
+            nextRenderer.shadowMap.enabled = true;
             document.body.appendChild(nextRenderer.domElement);
         }
 
@@ -591,6 +592,12 @@
             material.emissiveIntensity = baseIntensity;
         }
 
+        function applyMeshShadowState(mesh) {
+            if (!mesh?.isMesh) return;
+            mesh.castShadow = true;
+            mesh.receiveShadow = true;
+        }
+
         function createMaterial(md) {
             const requestedModelName = md.model || 'MeshStandardMaterial';
             const wantsToonMaterial = requestedModelName === 'MeshToonMaterial';
@@ -865,6 +872,7 @@
 
                 mesh.visible = true;
                 mesh.frustumCulled = false;
+                applyMeshShadowState(mesh);
 
                 applyTransform(mesh, nd.t);
                 applySelection(mesh, nd.s);
@@ -1033,6 +1041,7 @@
 
                 mesh.visible = true;
                 mesh.frustumCulled = false;
+                applyMeshShadowState(mesh);
 
                 applyTransform(mesh, nd.t);
                 applySelection(mesh, nd.s);
@@ -1171,6 +1180,56 @@
         scene.add(lightGroup);
         const LIGHT_TYPES = ['DirectionalLight', 'PointLight', 'SpotLight', 'RectAreaLight', 'HemisphereLight', 'AmbientLight'];
         const lightHandleMap = new Map();
+        const shadowBounds = new THREE.Box3();
+        const shadowCenter = new THREE.Vector3();
+        const shadowSize = new THREE.Vector3();
+        const shadowTarget = new THREE.Vector3();
+
+        function getShadowSceneFocus() {
+            shadowBounds.makeEmpty();
+            for (const [, mesh] of nodeMap) {
+                if (!mesh?.isMesh || !mesh.visible) continue;
+                shadowBounds.expandByObject(mesh);
+            }
+
+            if (shadowBounds.isEmpty()) {
+                shadowBounds.min.set(-100, -100, -100);
+                shadowBounds.max.set(100, 100, 100);
+            }
+
+            shadowBounds.getCenter(shadowCenter);
+            shadowBounds.getSize(shadowSize);
+            const radius = Math.max(shadowSize.x, shadowSize.y, shadowSize.z, 50);
+            return { center: shadowCenter, radius };
+        }
+
+        function updateLightShadowCamera(light, ld) {
+            if (!light?.shadow || !light.castShadow) return;
+
+            const { center, radius } = getShadowSceneFocus();
+            const shadowCamera = light.shadow.camera;
+
+            if (ld.type === 0 && shadowCamera?.isOrthographicCamera) {
+                shadowCamera.left = -radius;
+                shadowCamera.right = radius;
+                shadowCamera.top = radius;
+                shadowCamera.bottom = -radius;
+                shadowCamera.near = 0.1;
+                shadowCamera.far = Math.max(radius * 8, light.position.distanceTo(shadowTarget), 200);
+                shadowCamera.updateProjectionMatrix();
+            } else if (ld.type === 1 && shadowCamera?.isPerspectiveCamera) {
+                shadowCamera.near = Math.max(radius * 0.01, 0.1);
+                shadowCamera.far = ld.distance > 0 ? ld.distance : Math.max(radius * 6, 200);
+                shadowCamera.updateProjectionMatrix();
+            } else if (ld.type === 2 && shadowCamera?.isPerspectiveCamera) {
+                shadowCamera.near = Math.max(radius * 0.01, 0.1);
+                shadowCamera.far = ld.distance > 0 ? ld.distance : Math.max(radius * 6, 200);
+                shadowCamera.fov = THREE.MathUtils.radToDeg((ld.angle ?? Math.PI / 4) * 2);
+                shadowCamera.updateProjectionMatrix();
+            }
+
+            light.shadow.needsUpdate = true;
+        }
 
         function clearLights() {
             lightHandleMap.clear();
@@ -1184,12 +1243,15 @@
         function setLightTargetFromData(light, ld) {
             const target = light.userData?.maxjsTarget;
             if (!target) return;
+            const { radius } = getShadowSceneFocus();
+            const targetDistance = Math.max(radius * 2, 100);
             target.position.set(
-                ld.pos[0] + ld.dir[0] * 100,
-                ld.pos[1] + ld.dir[1] * 100,
-                ld.pos[2] + ld.dir[2] * 100
+                ld.pos[0] + ld.dir[0] * targetDistance,
+                ld.pos[1] + ld.dir[1] * targetDistance,
+                ld.pos[2] + ld.dir[2] * targetDistance
             );
             target.updateMatrixWorld();
+            shadowTarget.copy(target.position);
         }
 
         function applyLightData(light, ld) {
@@ -1255,6 +1317,7 @@
                     light.shadow.radius = ld.shadowRadius ?? 1;
                     const mapSz = ld.shadowMapSize ?? 1024;
                     light.shadow.mapSize.set(mapSz, mapSz);
+                    updateLightShadowCamera(light, ld);
                 }
             }
         }

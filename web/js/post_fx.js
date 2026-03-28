@@ -182,6 +182,14 @@ export function createPostFXController({
     }
 
     function ensureAsciiEffect() {
+        if (!state.ascii.enabled) {
+            if (asciiEffect) {
+                asciiEffect.domElement.remove();
+                asciiEffect = null;
+            }
+            return;
+        }
+
         if (asciiEffect) {
             asciiEffect.domElement.remove();
             asciiEffect = null;
@@ -338,11 +346,15 @@ export function createPostFXController({
             outlinePass.selectedObjects = getSelectedObjects();
         }
 
-        if (state.ascii.enabled && asciiEffect) {
-            renderer.domElement.style.opacity = '0';
-            asciiEffect.domElement.style.display = 'block';
-            asciiEffect.render(scene, camera);
-            return;
+        if (state.ascii.enabled) {
+            if (!asciiEffect) ensureAsciiEffect();
+
+            if (asciiEffect) {
+                renderer.domElement.style.opacity = '0';
+                asciiEffect.domElement.style.display = 'block';
+                asciiEffect.render(scene, camera);
+                return;
+            }
         }
 
         renderer.domElement.style.opacity = '1';
@@ -462,7 +474,6 @@ export function createPostFXController({
     }
 
     addSidebar();
-    ensureAsciiEffect();
     rebuildPipeline();
 
     return {

@@ -1231,6 +1231,24 @@
                     { key: 'threshold', label: 'Threshold', min: 0, max: 2, step: 0.01 },
                 ],
             },
+            {
+                key: 'contactShadow',
+                title: 'Contact Shadows',
+                copy: 'Screen-space shadows for detailed close-range shadowing.',
+                note: 'Requires WebGPU and a DirectionalLight.',
+                requiresWebGPU: true,
+                isEnabled: () => ssgiFx.isContactShadowEnabled(),
+                setEnabled: (enabled) => ssgiFx.setContactShadowEnabled(enabled),
+                getValues: (state) => state.contactShadow,
+                setValues: (patch) => ssgiFx.setContactShadowOptions(patch),
+                controls: [
+                    { key: 'maxDistance', label: 'Max Distance', min: 0.01, max: 1, step: 0.01 },
+                    { key: 'thickness', label: 'Thickness', min: 0.001, max: 0.1, step: 0.001 },
+                    { key: 'shadowIntensity', label: 'Intensity', min: 0, max: 1, step: 0.01 },
+                    { key: 'quality', label: 'Quality', min: 0, max: 1, step: 0.01 },
+                    { key: 'temporal', label: 'Temporal', type: 'checkbox' },
+                ],
+            },
         ];
 
         function formatControlValue(control, value) {

@@ -18,11 +18,14 @@ import {
     vec2,
     vec3,
     vec4,
+    screenUV,
+    builtinShadowContext,
 } from 'three/tsl';
 import { bloom } from 'three/addons/tsl/display/BloomNode.js';
 import { ssr } from 'three/addons/tsl/display/SSRNode.js';
 import { ssgi } from 'three/addons/tsl/display/SSGINode.js';
 import { outline } from 'three/addons/tsl/display/OutlineNode.js';
+import { sss } from 'three/addons/tsl/display/SSSNode.js';
 
 function setTexturePrecision(scenePass) {
     const diffuseTexture = scenePass.getTexture('diffuseColor');
@@ -74,9 +77,18 @@ export function createSSGIController({ renderer, scene, camera, backendLabel = '
             visibleEdgeColor: [1, 1, 1],
             hiddenEdgeColor: [0.3, 0.2, 0.2],
         },
+        contactShadow: {
+            enabled: false,
+            maxDistance: 0.15,
+            thickness: 0.01,
+            shadowIntensity: 1.0,
+            quality: 0.5,
+            temporal: true,
+        },
     };
 
     let selectedObjects = [];
+    let mainLight = null;  // DirectionalLight for contact shadows
 
     let available = true;
     let lastError = '';
@@ -142,7 +154,9 @@ export function createSSGIController({ renderer, scene, camera, backendLabel = '
     }
 
     function hasAnyEffectEnabled() {
-        return state.ssgi.enabled || state.ssr.enabled || state.bloom.enabled || (state.outline.enabled && selectedObjects.length > 0);
+        return state.ssgi.enabled || state.ssr.enabled || state.bloom.enabled
+            || (state.outline.enabled && selectedObjects.length > 0)
+            || (state.contactShadow.enabled && mainLight);
     }
 
     function computeSceneReferenceSize() {
@@ -184,6 +198,7 @@ export function createSSGIController({ renderer, scene, camera, backendLabel = '
             ssr: { ...state.ssr },
             bloom: { ...state.bloom },
             outline: { ...state.outline, selectedCount: selectedObjects.length },
+            contactShadow: { ...state.contactShadow },
         };
     }
 
@@ -210,8 +225,29 @@ export function createSSGIController({ renderer, scene, camera, backendLabel = '
         clearNodes();
 
         try {
+            // Contact shadows need a depth pre-pass
+            let sssContext = null;
+            if (state.contactShadow.enabled && mainLight) {
+                const prePass = pass(scene, camera);
+                activeNodes.push(prePass);
+                const prePassDepth = prePass.getTextureNode('depth');
+
+                const sssPass = sss(prePassDepth, camera, mainLight);
+                sssPass.maxDistance.value = state.contactShadow.maxDistance;
+                sssPass.thickness.value = state.contactShadow.thickness;
+                sssPass.shadowIntensity.value = state.contactShadow.shadowIntensity;
+                sssPass.quality.value = state.contactShadow.quality;
+                sssPass.useTemporalFiltering = state.contactShadow.temporal;
+                activeNodes.push(sssPass);
+
+                const sssSample = sssPass.getTextureNode().sample(screenUV).r;
+                sssContext = builtinShadowContext(sssSample, mainLight);
+            }
+
             const scenePass = pass(scene, camera);
             activeNodes.push(scenePass);
+
+            if (sssContext) scenePass.contextNode = sssContext;
 
             scenePass.setMRT(mrt({
                 output,
@@ -418,6 +454,37 @@ export function createSSGIController({ renderer, scene, camera, backendLabel = '
             if (Array.isArray(options.hiddenEdgeColor)) state.outline.hiddenEdgeColor = options.hiddenEdgeColor;
             rebuildPipeline();
             return { ...state.outline };
+        },
+        isContactShadowEnabled() {
+            return state.contactShadow.enabled;
+        },
+        setContactShadowEnabled(enabled) {
+            if (enabled && !mainLight) {
+                // Auto-find a directional light in the scene
+                scene.traverse(obj => {
+                    if (!mainLight && obj.isDirectionalLight) mainLight = obj;
+                });
+            }
+            if (enabled && !mainLight) {
+                lastError = 'Contact shadows require a DirectionalLight';
+                onError(lastError);
+                return false;
+            }
+            state.contactShadow.enabled = !!enabled && available;
+            rebuildPipeline();
+            return state.contactShadow.enabled;
+        },
+        setContactShadowOptions(options = {}) {
+            assignFinite(state.contactShadow, 'maxDistance', options.maxDistance);
+            assignFinite(state.contactShadow, 'thickness', options.thickness);
+            assignFinite(state.contactShadow, 'shadowIntensity', options.shadowIntensity);
+            assignFinite(state.contactShadow, 'quality', options.quality);
+            if (typeof options.temporal === 'boolean') state.contactShadow.temporal = options.temporal;
+            rebuildPipeline();
+            return { ...state.contactShadow };
+        },
+        setMainLight(light) {
+            mainLight = light;
         },
         render() {
             if (!hasAnyEffectEnabled() || !pipelineReady) {

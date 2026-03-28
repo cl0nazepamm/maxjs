@@ -12,6 +12,7 @@ import {
     pass,
     roughness,
     sample,
+    uniform,
     vec2,
     vec4,
     velocity,
@@ -141,20 +142,20 @@ export function createPostFXController({
 
     const state = {
         ascii: { enabled: false, resolution: 0.16, scale: 1, color: false, invert: false },
-        ssgi: { enabled: true, temporal: true, sliceCount: 2, stepCount: 8, radius: 8, thickness: 1.5, aoIntensity: 1.0, giIntensity: 1.75, expFactor: 1.5 },
+        ssgi: { enabled: false, temporal: true, sliceCount: 2, stepCount: 8, radius: 8, thickness: 1.5, aoIntensity: 1.0, giIntensity: 1.75, expFactor: 1.5 },
         ssr: { enabled: false, quality: 0.45, blurQuality: 2, maxDistance: 0.5, opacity: 0.9, thickness: 0.015 },
         gtao: { enabled: false, temporal: false, radius: 0.25, samples: 12, intensity: 1.0, thickness: 1.0 },
         bloom: { enabled: false, strength: 0.4, radius: 0.2, threshold: 0.75 },
         anamorphic: { enabled: false, threshold: 0.82, scale: 3.0, samples: 24 },
         dof: { enabled: false, focusDistance: 8.0, focalLength: 5.0, bokehScale: 2.0 },
-        outline: { enabled: true, thickness: 1.25, glow: 0.2 },
+        outline: { enabled: false, thickness: 1.25, glow: 0.2, strength: 2.0 },
         rgbShift: { enabled: false, amount: 0.0015, angle: 0.0 },
         chromatic: { enabled: false, strength: 0.3, scale: 1.05 },
         dot: { enabled: false, angle: 1.57, scale: 0.35 },
         film: { enabled: false, intensity: 0.18 },
         sobel: { enabled: false },
         afterImage: { enabled: false, damp: 0.92 },
-        aa: { mode: 'traa' },
+        aa: { mode: 'fxaa' },
     };
 
     let outlinePass = null;
@@ -281,7 +282,15 @@ export function createPostFXController({
                 edgeGlow: state.outline.glow,
                 downSampleRatio: 2,
             });
-            beauty = blendColor(beauty, outlinePass);
+
+            const visibleEdgeColor = uniform(new THREE.Color(0xe8f3ff));
+            const hiddenEdgeColor = uniform(new THREE.Color(0x2e4d85));
+            const outlineColor = outlinePass.visibleEdge
+                .mul(visibleEdgeColor)
+                .add(outlinePass.hiddenEdge.mul(hiddenEdgeColor))
+                .mul(state.outline.strength);
+
+            beauty = vec4(beauty.rgb.add(outlineColor), beauty.a);
             activeNodes.push(outlinePass);
         }
 
@@ -403,7 +412,7 @@ export function createPostFXController({
         });
         sidebarEl.appendChild(global);
 
-        const lighting = createSection('GI + Reflections', 'SSGI is enabled by default. Outline follows current Max selection.');
+        const lighting = createSection('GI + Reflections', 'Depth-based passes start off by default. Enable them per scene after the base render is stable.');
         createCheckbox(lighting, 'SSGI', state.ssgi.enabled, (value) => { state.ssgi.enabled = value; queueRebuild(); });
         createRange(lighting, 'SSGI slices', 1, 4, 1, state.ssgi.sliceCount, (value) => { state.ssgi.sliceCount = value; queueRebuild(); });
         createRange(lighting, 'SSGI steps', 1, 16, 1, state.ssgi.stepCount, (value) => { state.ssgi.stepCount = value; queueRebuild(); });
@@ -431,6 +440,7 @@ export function createPostFXController({
         createCheckbox(lighting, 'Outline selection', state.outline.enabled, (value) => { state.outline.enabled = value; queueRebuild(); });
         createRange(lighting, 'Outline thickness', 0.5, 5, 0.1, state.outline.thickness, (value) => { state.outline.thickness = value; queueRebuild(); });
         createRange(lighting, 'Outline glow', 0, 2, 0.05, state.outline.glow, (value) => { state.outline.glow = value; queueRebuild(); });
+        createRange(lighting, 'Outline strength', 0.25, 6, 0.05, state.outline.strength, (value) => { state.outline.strength = value; queueRebuild(); });
         sidebarEl.appendChild(lighting);
 
         const cinematic = createSection('Cinematic');

@@ -35,14 +35,15 @@ using namespace Microsoft::WRL;
 #define MAXJS_NAME      _T("MaxJS")
 #define MAXJS_CATEGORY  _T("MaxJS")
 
-#define SYNC_TIMER_ID     1
-#define SYNC_INTERVAL_MS  33   // background structural/material timer
-#define WM_TOGGLE_PANEL   (WM_USER + 1)
-#define WM_FAST_FLUSH     (WM_USER + 2)
-#define WM_KILL_PANEL     (WM_USER + 3)
-#define SETUP_TIMER_ID    2
-#define AS_TIMER_ID       3
-#define AS_INTERVAL_MS    66   // ~15fps ActiveShade
+#define SYNC_TIMER_ID             1
+#define SYNC_INTERVAL_MS          33   // background structural/material timer
+#define MATERIAL_DETECT_TICKS     6    // ~200ms material refresh cadence
+#define WM_TOGGLE_PANEL           (WM_USER + 1)
+#define WM_FAST_FLUSH             (WM_USER + 2)
+#define WM_KILL_PANEL             (WM_USER + 3)
+#define SETUP_TIMER_ID            2
+#define AS_TIMER_ID               3
+#define AS_INTERVAL_MS            66   // ~15fps ActiveShade
 
 extern HINSTANCE hInstance;
 HINSTANCE hInstance = nullptr;
@@ -1404,7 +1405,7 @@ public:
             if (useBinary_) SendFullSyncBinary(); else SendFullSync();
         } else {
             if (tickCount_ % 15 == 0) CheckWebContentChanges();
-            if (tickCount_ % 50 == 0) DetectMaterialChanges();
+            if (tickCount_ % MATERIAL_DETECT_TICKS == 0) DetectMaterialChanges();
             if (tickCount_ % 15 == 0) DetectGeometryChanges();
         }
     }
@@ -1626,7 +1627,40 @@ public:
             meta.str().c_str());
     }
 
-    // Check if any material's texmap pointers changed — triggers full sync on NEXT tick
+    uint64_t ComputeMaterialStateHash(INode* node, TimeValue t) {
+        if (!node) return 0;
+
+        std::wostringstream ss;
+        ss.imbue(std::locale::classic());
+
+        Mtl* rawMtl = node->GetMtl();
+        if (!rawMtl) {
+            ss << L"null";
+            const std::wstring payload = ss.str();
+            return HashFNV1a(payload.data(), payload.size() * sizeof(wchar_t));
+        }
+
+        Mtl* multiMtl = FindMultiSubMtl(rawMtl);
+        if (multiMtl && multiMtl->NumSubMtls() > 0) {
+            ss << L"{\"multi\":true,\"count\":" << multiMtl->NumSubMtls() << L",\"mats\":[";
+            for (int i = 0; i < multiMtl->NumSubMtls(); ++i) {
+                if (i) ss << L',';
+                MaxJSPBR subPBR;
+                ExtractPBRFromMtl(multiMtl->GetSubMtl(i), node, t, subPBR);
+                WriteMaterialFull(ss, subPBR);
+            }
+            ss << L"]}";
+        } else {
+            MaxJSPBR pbr;
+            ExtractPBR(node, t, pbr);
+            WriteMaterialFull(ss, pbr);
+        }
+
+        const std::wstring payload = ss.str();
+        return HashFNV1a(payload.data(), payload.size() * sizeof(wchar_t));
+    }
+
+    // Check if any material's serialized state changed — triggers full sync on NEXT tick
     void DetectMaterialChanges() {
         Interface* ip = GetCOREInterface();
         if (!ip) return;
@@ -1636,28 +1670,7 @@ public:
             INode* node = ip->GetINodeByHandle(handle);
             if (!node) continue;
 
-            // Build a quick hash from material identity + texmap pointers
-            uintptr_t hash = 0;
-            Mtl* rawMtl = node->GetMtl();
-            hash ^= (uintptr_t)rawMtl;
-            std::function<void(Mtl*)> hashMtlTree = [&](Mtl* mtl) {
-                if (!mtl) return;
-                hash ^= (uintptr_t)mtl * 11400714819323198485ull;
-                for (int b = 0; b < mtl->NumParamBlocks(); b++) {
-                    IParamBlock2* pb = mtl->GetParamBlock(b);
-                    if (!pb) continue;
-                    for (int i = 0; i < pb->NumParams(); i++) {
-                        ParamID pid = pb->IndextoID(i);
-                        const ParamDef& pd = pb->GetParamDef(pid);
-                        if (pd.type == TYPE_TEXMAP)
-                            hash ^= (uintptr_t)pb->GetTexmap(pid, t) * 2654435761ULL;
-                    }
-                }
-                for (int i = 0; i < mtl->NumSubMtls(); i++) {
-                    hashMtlTree(mtl->GetSubMtl(i));
-                }
-            };
-            hashMtlTree(rawMtl);
+            const uintptr_t hash = static_cast<uintptr_t>(ComputeMaterialStateHash(node, t));
 
             auto it = mtlHashMap_.find(handle);
             if (it == mtlHashMap_.end()) {

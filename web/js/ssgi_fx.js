@@ -33,6 +33,7 @@ function setTexturePrecision(scenePass) {
 export function createSSGIController({ renderer, scene, camera, backendLabel = '', onError = () => {} }) {
     const postProcessing = new THREE.PostProcessing(renderer);
     const supportsScreenSpaceEffects = backendLabel === 'WebGPU';
+    const SSR_REFERENCE_SIZE = 6.0;
     const state = {
         ssgi: {
             enabled: false,
@@ -65,6 +66,7 @@ export function createSSGIController({ renderer, scene, camera, backendLabel = '
     let lastError = '';
     let pipelineReady = false;
     let activeNodes = [];
+    let activeSSRPass = null;
     let hiddenDuringPost = [];
 
     function prepareSceneForPostPass() {
@@ -101,6 +103,7 @@ export function createSSGIController({ renderer, scene, camera, backendLabel = '
     }
 
     function clearNodes() {
+        activeSSRPass = null;
         for (const node of activeNodes) {
             if (node && typeof node.dispose === 'function') {
                 node.dispose();
@@ -126,12 +129,52 @@ export function createSSGIController({ renderer, scene, camera, backendLabel = '
         return state.ssgi.enabled || state.ssr.enabled || state.bloom.enabled;
     }
 
+    function computeSceneReferenceSize() {
+        const box = new THREE.Box3();
+        let foundMesh = false;
+
+        scene.traverse((object) => {
+            if (!object?.visible || !object.isMesh || !object.geometry) return;
+            const position = object.geometry.getAttribute?.('position');
+            if (!position || position.count === 0) return;
+            box.expandByObject(object);
+            foundMesh = true;
+        });
+
+        if (!foundMesh || box.isEmpty()) return SSR_REFERENCE_SIZE;
+
+        const size = box.getSize(new THREE.Vector3());
+        const maxDimension = Math.max(size.x, size.y, size.z);
+        return Number.isFinite(maxDimension) && maxDimension > 1.0e-3
+            ? maxDimension
+            : SSR_REFERENCE_SIZE;
+    }
+
+    function computeDerivedState() {
+        const sceneReferenceSize = computeSceneReferenceSize();
+        const ssrUnitScale = Math.max(1, sceneReferenceSize / SSR_REFERENCE_SIZE);
+
+        return {
+            sceneReferenceSize,
+            ssrUnitScale,
+            effectiveSSRMaxDistance: state.ssr.maxDistance * ssrUnitScale,
+            effectiveSSRThickness: state.ssr.thickness * ssrUnitScale,
+        };
+    }
+
     function snapshotState() {
         return {
             ssgi: { ...state.ssgi },
             ssr: { ...state.ssr },
             bloom: { ...state.bloom },
         };
+    }
+
+    function updateActiveScreenSpaceParams() {
+        if (!activeSSRPass) return;
+        const derived = computeDerivedState();
+        activeSSRPass.maxDistance.value = derived.effectiveSSRMaxDistance;
+        activeSSRPass.thickness.value = derived.effectiveSSRThickness;
     }
 
     function assignFinite(target, key, value) {
@@ -192,6 +235,7 @@ export function createSSGIController({ renderer, scene, camera, backendLabel = '
             }
 
             if (state.ssr.enabled) {
+                const derived = computeDerivedState();
                 const ssrPass = ssr(
                     scenePassColor,
                     scenePassDepth,
@@ -202,10 +246,11 @@ export function createSSGIController({ renderer, scene, camera, backendLabel = '
                 );
                 ssrPass.quality.value = state.ssr.quality;
                 ssrPass.blurQuality.value = state.ssr.blurQuality;
-                ssrPass.maxDistance.value = state.ssr.maxDistance;
+                ssrPass.maxDistance.value = derived.effectiveSSRMaxDistance;
                 ssrPass.opacity.value = state.ssr.opacity;
-                ssrPass.thickness.value = state.ssr.thickness;
+                ssrPass.thickness.value = derived.effectiveSSRThickness;
                 activeNodes.push(ssrPass);
+                activeSSRPass = ssrPass;
                 beauty = blendColor(beauty, ssrPass);
             }
 
@@ -232,6 +277,9 @@ export function createSSGIController({ renderer, scene, camera, backendLabel = '
     return {
         getState() {
             return snapshotState();
+        },
+        getDerivedState() {
+            return computeDerivedState();
         },
         hasEnabledEffects() {
             return hasAnyEffectEnabled();
@@ -316,6 +364,7 @@ export function createSSGIController({ renderer, scene, camera, backendLabel = '
             }
 
             try {
+                updateActiveScreenSpaceParams();
                 prepareSceneForPostPass();
                 postProcessing.render();
                 restoreSceneAfterPostPass();

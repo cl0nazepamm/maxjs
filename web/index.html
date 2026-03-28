@@ -416,6 +416,37 @@
         }
 
         // ── Material Creation ───────────────────────────────
+        function rememberMaterialEmissiveBase(material) {
+            if (!material?.emissive) return;
+            material.userData ??= {};
+            material.userData.maxjsBaseEmissive = [
+                material.emissive.r,
+                material.emissive.g,
+                material.emissive.b,
+            ];
+            material.userData.maxjsBaseEmissiveIntensity = Number.isFinite(material.emissiveIntensity)
+                ? material.emissiveIntensity
+                : 1.0;
+        }
+
+        function applyMaterialSelectionState(material, selected) {
+            if (!material?.emissive) return;
+
+            const base = material.userData?.maxjsBaseEmissive || [0, 0, 0];
+            const baseIntensity = Number.isFinite(material.userData?.maxjsBaseEmissiveIntensity)
+                ? material.userData.maxjsBaseEmissiveIntensity
+                : 1.0;
+
+            material.emissive.setRGB(base[0], base[1], base[2]);
+            material.emissiveIntensity = baseIntensity;
+
+            if (selected && selHighlight) {
+                material.emissive.r = Math.min(1.0, material.emissive.r + 0.05);
+                material.emissive.g = Math.min(1.0, material.emissive.g + 0.05);
+                material.emissive.b = Math.min(1.0, material.emissive.b + 0.20);
+            }
+        }
+
         function createMaterial(md) {
             const key = md.name || 'default';
             let template = materialCache.get(key);
@@ -434,9 +465,23 @@
                     params.opacity = md.opacity;
                 }
 
+                const hasEmissiveColor = Array.isArray(md.em) && md.em.length === 3 &&
+                    md.em.some(value => Math.abs(value) > 1.0e-5);
+
                 if (md.em && md.emI > 0) {
                     params.emissive = new THREE.Color(md.em[0], md.em[1], md.em[2]);
                     params.emissiveIntensity = md.emI;
+                }
+
+                if (md.emMap) {
+                    if (!params.emissive) {
+                        params.emissive = hasEmissiveColor
+                            ? new THREE.Color(md.em[0], md.em[1], md.em[2])
+                            : new THREE.Color(1, 1, 1);
+                    }
+                    if (params.emissiveIntensity == null || params.emissiveIntensity <= 0) {
+                        params.emissiveIntensity = md.emMapS ?? 1.0;
+                    }
                 }
 
                 if (md.normScl != null) params.normalScale = new THREE.Vector2(md.normScl, md.normScl);
@@ -464,10 +509,13 @@
                     template.lightMapIntensity = md.lmI ?? 1.0;
                 }
 
+                rememberMaterialEmissiveBase(template);
                 materialCache.set(key, template);
             }
 
-            return template.clone();
+            const material = template.clone();
+            rememberMaterialEmissiveBase(material);
+            return material;
         }
 
         // ── Max Bridge ──────────────────────────────────────
@@ -896,10 +944,10 @@
         let selHighlight = true;
 
         function applySelection(mesh, selected) {
-            if (!selHighlight) return;
+            mesh.userData.maxjsSelected = !!selected;
             const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
             for (const m of mats) {
-                if (m?.emissive) m.emissive.setHex(selected ? 0x1a1a44 : 0x000000);
+                applyMaterialSelectionState(m, !!selected);
             }
         }
 
@@ -915,6 +963,8 @@
                     m.opacity = material.opacity;
                     m.transparent = material.opacity < 0.999;
                 }
+                rememberMaterialEmissiveBase(m);
+                applyMaterialSelectionState(m, !!mesh.userData.maxjsSelected);
                 m.needsUpdate = true;
             }
         }
@@ -993,12 +1043,8 @@
             selHighlight = !selHighlight;
             btnSel.textContent = `Sel: ${selHighlight ? 'ON' : 'OFF'}`;
             btnSel.classList.toggle('active', selHighlight);
-            // Clear existing highlights
-            if (!selHighlight) {
-                for (const [, mesh] of nodeMap) {
-                    const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
-                    for (const m of mats) { if (m?.emissive) m.emissive.setHex(0x000000); }
-                }
+            for (const [, mesh] of nodeMap) {
+                applySelection(mesh, !!mesh.userData.maxjsSelected);
             }
         };
 
@@ -1180,6 +1226,7 @@
 
         function syncPostFxPanel(force = false) {
             const state = ssgiFx.getState();
+            const derived = postPanelVisible ? ssgiFx.getDerivedState() : null;
             const available = ssgiFx.isAvailable();
             const supportsScreenSpaceEffects = ssgiFx.supportsScreenSpaceEffects();
             const lastError = ssgiFx.getLastError();
@@ -1189,6 +1236,7 @@
                 supportsScreenSpaceEffects,
                 lastError,
                 state,
+                derived,
             });
 
             if (!force && signature === lastPostFxSignature) return;
@@ -1237,6 +1285,8 @@
                 } else if (section.requiresWebGPU && !supportsScreenSpaceEffects) {
                     note = 'Requires the real WebGPU backend.';
                     isError = true;
+                } else if (section.key === 'ssr' && derived) {
+                    note = `World distance ${derived.effectiveSSRMaxDistance.toFixed(2)} • thickness ${derived.effectiveSSRThickness.toFixed(3)}`;
                 }
 
                 section.noteEl.textContent = note;

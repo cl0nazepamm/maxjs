@@ -1,0 +1,78 @@
+#include "threejs_lights_res.h"
+#include <windows.h>
+
+STRINGTABLE
+BEGIN
+    IDS_LIGHT_PARAMS "ThreeJS Light"
+    IDS_LIGHT_TYPE_DIRECTIONAL "Directional"
+    IDS_LIGHT_TYPE_POINT "Point"
+    IDS_LIGHT_TYPE_SPOT "Spot"
+    IDS_LIGHT_TYPE_RECT_AREA "Rect Area"
+    IDS_LIGHT_TYPE_HEMISPHERE "Hemisphere"
+END
+
+IDD_THREEJS_LIGHT DIALOG 0, 0, 108, 280
+STYLE DS_SETFONT | WS_CHILD | WS_VISIBLE
+FONT 8, "MS Sans Serif"
+BEGIN
+    // ── Type ──────────────────────────────────
+    LTEXT           "Type",      -1,   4,  4, 20,  8
+    COMBOBOX        IDC_LIGHT_TYPE,   28,  2, 76, 80, CBS_DROPDOWNLIST | WS_TABSTOP
+
+    // ── Color / Intensity ─────────────────────
+    LTEXT           "Color",     -1,   4, 20, 22,  8
+    CONTROL         "",  IDC_LIGHT_COLOR, "ColorSwatch", WS_TABSTOP, 28, 18, 30, 12
+    LTEXT           "Int",       -1,  62, 20, 12,  8
+    CONTROL         "",  IDC_LIGHT_INT_EDIT,"CustEdit",  WS_TABSTOP, 76, 18, 22, 10
+    CONTROL         "",  IDC_LIGHT_INT_SPIN,"SpinnerControl",0,      98, 18,  7, 10
+
+    // ── Distance / Decay (Point, Spot) ────────
+    LTEXT           "Distance",  -1,   4, 36, 30,  8
+    CONTROL         "",  IDC_DIST_EDIT,  "CustEdit",     WS_TABSTOP, 36, 34, 22, 10
+    CONTROL         "",  IDC_DIST_SPIN,  "SpinnerControl",0,         58, 34,  7, 10
+    LTEXT           "Decay",     -1,  68, 36, 20,  8
+    CONTROL         "",  IDC_DECAY_EDIT, "CustEdit",     WS_TABSTOP, 88, 34, 12, 10
+    CONTROL         "",  IDC_DECAY_SPIN, "SpinnerControl",0,        100, 34,  7, 10
+
+    // ── Spot params ───────────────────────────
+    LTEXT           "Angle",     -1,   4, 50, 22,  8
+    CONTROL         "",  IDC_ANGLE_EDIT, "CustEdit",     WS_TABSTOP, 28, 48, 22, 10
+    CONTROL         "",  IDC_ANGLE_SPIN, "SpinnerControl",0,         50, 48,  7, 10
+    LTEXT           "Penumbra",  -1,  60, 50, 30,  8
+    CONTROL         "",  IDC_PENUM_EDIT, "CustEdit",     WS_TABSTOP, 90, 48, 10, 10
+    CONTROL         "",  IDC_PENUM_SPIN, "SpinnerControl",0,        100, 48,  7, 10
+
+    // ── RectArea params ───────────────────────
+    LTEXT           "Width",     -1,   4, 64, 22,  8
+    CONTROL         "",  IDC_WIDTH_EDIT, "CustEdit",     WS_TABSTOP, 28, 62, 24, 10
+    CONTROL         "",  IDC_WIDTH_SPIN, "SpinnerControl",0,         52, 62,  7, 10
+    LTEXT           "Height",    -1,  62, 64, 24,  8
+    CONTROL         "",  IDC_HEIGHT_EDIT,"CustEdit",     WS_TABSTOP, 86, 62, 14, 10
+    CONTROL         "",  IDC_HEIGHT_SPIN,"SpinnerControl",0,        100, 62,  7, 10
+
+    // ── Ground Color (Hemisphere) ─────────────
+    LTEXT           "Ground",    -1,   4, 78, 26,  8
+    CONTROL         "",  IDC_GROUND_COLOR,"ColorSwatch", WS_TABSTOP, 32, 76, 40, 12
+
+    // ── Shadows ───────────────────────────────
+    GROUPBOX        "Shadows",   -1,   2, 94,104, 54
+    CONTROL         "Cast Shadow",IDC_CAST_SHADOW,"Button",BS_AUTOCHECKBOX|WS_TABSTOP, 6,106, 52, 10
+    LTEXT           "Bias",      -1,   6,120, 16,  8
+    CONTROL         "",  IDC_SHBIAS_EDIT,"CustEdit",     WS_TABSTOP, 24,118, 24, 10
+    CONTROL         "",  IDC_SHBIAS_SPIN,"SpinnerControl",0,         48,118,  7, 10
+    LTEXT           "Radius",    -1,  58,120, 22,  8
+    CONTROL         "",  IDC_SHRAD_EDIT, "CustEdit",     WS_TABSTOP, 80,118, 14, 10
+    CONTROL         "",  IDC_SHRAD_SPIN, "SpinnerControl",0,         94,118,  7, 10
+    LTEXT           "Map Size",  -1,   6,132, 30,  8
+    CONTROL         "",  IDC_SHMAP_EDIT, "CustEdit",     WS_TABSTOP, 38,130, 28, 10
+    CONTROL         "",  IDC_SHMAP_SPIN, "SpinnerControl",0,         66,130,  7, 10
+
+    // ── Volumetric ────────────────────────────
+    GROUPBOX        "Volumetric",-1,   2,152,104, 30
+    CONTROL         "Enable",IDC_VOLUMETRIC,"Button",BS_AUTOCHECKBOX|WS_TABSTOP, 6,164, 36, 10
+    LTEXT           "Density",   -1,  46,164, 24,  8
+    CONTROL         "",  IDC_VOLDENS_EDIT,"CustEdit",    WS_TABSTOP, 72,162, 20, 10
+    CONTROL         "",  IDC_VOLDENS_SPIN,"SpinnerControl",0,        92,162,  7, 10
+
+    LTEXT           "",  -1,   0,270,  0,  0
+END

@@ -818,6 +818,7 @@
 
             if (msg.camera) applyCamera(msg.camera);
             if (msg.env?.hdri) loadHDRI(msg.env);
+            if (msg.lights) applyLights(msg.lights);
             scene.updateMatrixWorld(true);
 
             if (firstSync && msg.nodes.length > 0) {
@@ -983,6 +984,7 @@
 
             if (meta.camera) applyCamera(meta.camera);
             if (meta.env?.hdri) loadHDRI(meta.env);
+            if (meta.lights) applyLights(meta.lights);
             scene.updateMatrixWorld(true);
 
             if (firstSync && meta.nodes.length > 0) {
@@ -1105,6 +1107,102 @@
                 applyMaterialSelectionState(m, !!mesh.userData.maxjsSelected);
                 m.needsUpdate = true;
             }
+        }
+
+        // ── Lights Sync ──────────────────────────────────────
+        const lightGroup = new THREE.Group();
+        lightGroup.name = '__maxjs_lights';
+        scene.add(lightGroup);
+        const LIGHT_TYPES = ['DirectionalLight', 'PointLight', 'SpotLight', 'RectAreaLight', 'HemisphereLight'];
+
+        function applyLights(lightsData) {
+            // Clear old lights
+            while (lightGroup.children.length) {
+                const c = lightGroup.children[0];
+                lightGroup.remove(c);
+                if (c.dispose) c.dispose();
+            }
+
+            let appliedLightCount = 0;
+            let mainDirectionalLight = null;
+
+            for (const ld of lightsData) {
+                let light;
+                const color = new THREE.Color(ld.color[0], ld.color[1], ld.color[2]);
+
+                switch (ld.type) {
+                case 0: // Directional
+                    light = new THREE.DirectionalLight(color, ld.intensity);
+                    light.position.set(ld.pos[0], ld.pos[1], ld.pos[2]);
+                    // Target = pos + dir * 100
+                    const tgt = new THREE.Vector3(
+                        ld.pos[0] + ld.dir[0] * 100,
+                        ld.pos[1] + ld.dir[1] * 100,
+                        ld.pos[2] + ld.dir[2] * 100
+                    );
+                    light.target.position.copy(tgt);
+                    lightGroup.add(light.target);
+                    break;
+                case 1: // Point
+                    light = new THREE.PointLight(color, ld.intensity, ld.distance || 0, ld.decay ?? 2);
+                    light.position.set(ld.pos[0], ld.pos[1], ld.pos[2]);
+                    break;
+                case 2: // Spot
+                    light = new THREE.SpotLight(color, ld.intensity, ld.distance || 0, ld.angle ?? Math.PI/4, ld.penumbra ?? 0.1, ld.decay ?? 2);
+                    light.position.set(ld.pos[0], ld.pos[1], ld.pos[2]);
+                    const stgt = new THREE.Vector3(
+                        ld.pos[0] + ld.dir[0] * 100,
+                        ld.pos[1] + ld.dir[1] * 100,
+                        ld.pos[2] + ld.dir[2] * 100
+                    );
+                    light.target.position.copy(stgt);
+                    lightGroup.add(light.target);
+                    break;
+                case 3: { // RectArea
+                    light = new THREE.RectAreaLight(color, ld.intensity, ld.width || 20, ld.height || 20);
+                    light.position.set(ld.pos[0], ld.pos[1], ld.pos[2]);
+                    light.lookAt(
+                        ld.pos[0] + ld.dir[0],
+                        ld.pos[1] + ld.dir[1],
+                        ld.pos[2] + ld.dir[2]
+                    );
+                    break;
+                }
+                case 4: // Hemisphere
+                    light = new THREE.HemisphereLight(
+                        color,
+                        ld.groundColor ? new THREE.Color(ld.groundColor[0], ld.groundColor[1], ld.groundColor[2]) : 0x444444,
+                        ld.intensity
+                    );
+                    light.position.set(ld.pos[0], ld.pos[1], ld.pos[2]);
+                    break;
+                default:
+                    continue;
+                }
+
+                // Shadows
+                if (ld.castShadow && light.shadow) {
+                    light.castShadow = true;
+                    light.shadow.bias = ld.shadowBias ?? -0.0001;
+                    light.shadow.radius = ld.shadowRadius ?? 1;
+                    const mapSz = ld.shadowMapSize ?? 1024;
+                    light.shadow.mapSize.set(mapSz, mapSz);
+                }
+
+                lightGroup.add(light);
+                appliedLightCount++;
+
+                // Set main light for contact shadows
+                if (!mainDirectionalLight && ld.type === 0) {
+                    mainDirectionalLight = light;
+                }
+            }
+
+            if (ssgiFx.setMainLight) {
+                ssgiFx.setMainLight(mainDirectionalLight);
+            }
+
+            defaultLights.visible = appliedLightCount === 0 && !currentHdriUrl;
         }
 
         // ── Camera Sync (Z-up, raw from Max) ────────────────

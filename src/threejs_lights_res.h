@@ -1,0 +1,43 @@
+#pragma once
+
+#define IDD_THREEJS_LIGHT   201
+#define IDS_LIGHT_PARAMS    202
+#define IDS_LIGHT_TYPE_DIRECTIONAL 203
+#define IDS_LIGHT_TYPE_POINT 204
+#define IDS_LIGHT_TYPE_SPOT 205
+#define IDS_LIGHT_TYPE_RECT_AREA 206
+#define IDS_LIGHT_TYPE_HEMISPHERE 207
+
+#define IDC_LIGHT_TYPE      2001
+#define IDC_LIGHT_COLOR     2002
+#define IDC_LIGHT_INT_EDIT  2003
+#define IDC_LIGHT_INT_SPIN  2004
+
+#define IDC_DIST_EDIT       2010
+#define IDC_DIST_SPIN       2011
+#define IDC_DECAY_EDIT      2012
+#define IDC_DECAY_SPIN      2013
+
+#define IDC_ANGLE_EDIT      2020
+#define IDC_ANGLE_SPIN      2021
+#define IDC_PENUM_EDIT      2022
+#define IDC_PENUM_SPIN      2023
+
+#define IDC_WIDTH_EDIT      2030
+#define IDC_WIDTH_SPIN      2031
+#define IDC_HEIGHT_EDIT     2032
+#define IDC_HEIGHT_SPIN     2033
+
+#define IDC_GROUND_COLOR    2040
+
+#define IDC_CAST_SHADOW     2050
+#define IDC_SHBIAS_EDIT     2051
+#define IDC_SHBIAS_SPIN     2052
+#define IDC_SHRAD_EDIT      2053
+#define IDC_SHRAD_SPIN      2054
+#define IDC_SHMAP_EDIT      2055
+#define IDC_SHMAP_SPIN      2056
+
+#define IDC_VOLUMETRIC      2060
+#define IDC_VOLDENS_EDIT    2061
+#define IDC_VOLDENS_SPIN    2062

@@ -10,6 +10,7 @@
 #include <maxscript/maxscript.h>
 #include "sync_protocol.h"
 #include "threejs_material.h"
+#include "threejs_lights.h"
 #include "threejs_renderer.h"
 
 #include <wrl.h>
@@ -1196,6 +1197,8 @@ public:
 
     std::wstring MapTexturePath(const std::wstring& filePath) {
         if (filePath.empty() || filePath.size() < 3 || filePath[1] != L':') return {};
+        const DWORD attrs = GetFileAttributesW(filePath.c_str());
+        if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_DIRECTORY)) return {};
 
         wchar_t drive = towlower(filePath[0]);
         std::wstring driveKey(1, drive);
@@ -1922,6 +1925,79 @@ public:
         ss << L",\"flip\":" << envData.flip;
         ss << L'}';
 
+        // Lights
+        ss << L",\"lights\":[";
+        {
+            bool firstLight = true;
+            INode* root = ip->GetRootNode();
+            std::function<void(INode*)> collectLights = [&](INode* parent) {
+                for (int i = 0; i < parent->NumberOfChildren(); i++) {
+                    INode* node = parent->GetChildNode(i);
+                    if (!node || node->IsNodeHidden(TRUE)) continue;
+
+                    ObjectState os = node->EvalWorldState(t);
+                    if (os.obj && os.obj->ClassID() == THREEJS_LIGHT_CLASS_ID) {
+                        IParamBlock2* pb = os.obj->GetParamBlockByID(threejs_light_params);
+                        if (pb) {
+                            if (!firstLight) ss << L',';
+                            ss << L"{\"type\":" << pb->GetInt(pl_type);
+
+                            // Transform (position + direction from node TM)
+                            Matrix3 tm = node->GetObjectTM(t);
+                            Point3 pos = tm.GetTrans();
+                            Point3 dir = -Normalize(tm.GetRow(1)); // -Y is forward
+                            ss << L",\"pos\":[" << pos.x << L',' << pos.y << L',' << pos.z << L']';
+                            ss << L",\"dir\":[" << dir.x << L',' << dir.y << L',' << dir.z << L']';
+
+                            // Color + intensity
+                            Color c = pb->GetColor(pl_color, t);
+                            ss << L",\"color\":[" << c.r << L',' << c.g << L',' << c.b << L']';
+                            ss << L",\"intensity\":" << pb->GetFloat(pl_intensity, t);
+
+                            // Type-specific
+                            int ltype = pb->GetInt(pl_type);
+                            if (ltype == 1 || ltype == 2) { // Point or Spot
+                                ss << L",\"distance\":" << pb->GetFloat(pl_distance, t);
+                                ss << L",\"decay\":" << pb->GetFloat(pl_decay, t);
+                            }
+                            if (ltype == 2) { // Spot
+                                ss << L",\"angle\":" << (pb->GetFloat(pl_angle, t) * 3.14159265f / 180.f);
+                                ss << L",\"penumbra\":" << pb->GetFloat(pl_penumbra, t);
+                            }
+                            if (ltype == 3) { // RectArea
+                                ss << L",\"width\":" << pb->GetFloat(pl_width, t);
+                                ss << L",\"height\":" << pb->GetFloat(pl_height, t);
+                            }
+                            if (ltype == 4) { // Hemisphere
+                                Color gc = pb->GetColor(pl_ground_color, t);
+                                ss << L",\"groundColor\":[" << gc.r << L',' << gc.g << L',' << gc.b << L']';
+                            }
+
+                            // Shadows
+                            if (pb->GetInt(pl_cast_shadow)) {
+                                ss << L",\"castShadow\":true";
+                                ss << L",\"shadowBias\":" << pb->GetFloat(pl_shadow_bias, t);
+                                ss << L",\"shadowRadius\":" << pb->GetFloat(pl_shadow_radius, t);
+                                ss << L",\"shadowMapSize\":" << pb->GetInt(pl_shadow_mapsize);
+                            }
+
+                            // Volumetric
+                            if (pb->GetInt(pl_volumetric)) {
+                                ss << L",\"volumetric\":true";
+                                ss << L",\"volDensity\":" << pb->GetFloat(pl_vol_density, t);
+                            }
+
+                            ss << L'}';
+                            firstLight = false;
+                        }
+                    }
+                    collectLights(node);
+                }
+            };
+            collectLights(root);
+        }
+        ss << L']';
+
         ss << L'}';
 
         webview_->PostWebMessageAsJson(ss.str().c_str());
@@ -2592,13 +2668,14 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, ULONG fdwReason, LPVOID) {
 }
 
 __declspec(dllexport) const TCHAR* LibDescription()   { return MAXJS_NAME; }
-__declspec(dllexport) int LibNumberClasses()           { return 4; }
+__declspec(dllexport) int LibNumberClasses()           { return 5; }
 __declspec(dllexport) ClassDesc* LibClassDesc(int i) {
     switch (i) {
         case 0: return &maxJSDesc;
         case 1: return GetThreeJSMtlDesc();
         case 2: return GetThreeJSAdvMtlDesc();
         case 3: return GetThreeJSRendererDesc();
+        case 4: return GetThreeJSLightDesc();
         default: return nullptr;
     }
 }

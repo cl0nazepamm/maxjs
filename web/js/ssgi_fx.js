@@ -484,7 +484,9 @@ export function createSSGIController({ renderer, scene, camera, backendLabel = '
             return { ...state.contactShadow };
         },
         setMainLight(light) {
+            const changed = mainLight !== light;
             mainLight = light;
+            if (changed && state.contactShadow.enabled) rebuildPipeline();
         },
         render() {
             if (!hasAnyEffectEnabled() || !pipelineReady) {

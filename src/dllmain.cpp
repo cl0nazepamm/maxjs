@@ -1268,15 +1268,6 @@ public:
                 wv3->SetVirtualHostNameToFolderMapping(
                     L"maxjs.local", webDir.c_str(),
                     COREWEBVIEW2_HOST_RESOURCE_ACCESS_KIND_ALLOW);
-                // Pre-map common drive roots for texture serving
-                wv3->SetVirtualHostNameToFolderMapping(
-                    L"maxjsdrvc.local", L"C:\\",
-                    COREWEBVIEW2_HOST_RESOURCE_ACCESS_KIND_ALLOW);
-                wv3->SetVirtualHostNameToFolderMapping(
-                    L"maxjsdrvd.local", L"D:\\",
-                    COREWEBVIEW2_HOST_RESOURCE_ACCESS_KIND_ALLOW);
-                texDirMap_[L"c"] = L"maxjsdrvc.local";
-                texDirMap_[L"d"] = L"maxjsdrvd.local";
                 // Cache-bust: append tick count to URL so WebView2 never serves stale HTML
                 wchar_t navUrl[128];
                 swprintf_s(navUrl, L"https://maxjs.local/index.html?v=%lld", GetTickCount64());
@@ -1318,8 +1309,34 @@ public:
         if (!wv3) return;
 
         wv3->ClearVirtualHostNameToFolderMapping(L"maxjs.local");
-        wv3->ClearVirtualHostNameToFolderMapping(L"maxjsdrvc.local");
-        wv3->ClearVirtualHostNameToFolderMapping(L"maxjsdrvd.local");
+        for (const auto& entry : texDirMap_) {
+            wv3->ClearVirtualHostNameToFolderMapping(entry.second.c_str());
+        }
+        texDirMap_.clear();
+    }
+
+    bool EnsureDriveMapping(wchar_t drive) {
+        if (!webview_) return false;
+
+        const wchar_t normalizedDrive = static_cast<wchar_t>(towlower(drive));
+        if (normalizedDrive < L'a' || normalizedDrive > L'z') return false;
+
+        std::wstring driveKey(1, normalizedDrive);
+        if (texDirMap_.find(driveKey) != texDirMap_.end()) return true;
+
+        ComPtr<ICoreWebView2_3> wv3;
+        webview_->QueryInterface(IID_PPV_ARGS(&wv3));
+        if (!wv3) return false;
+
+        const std::wstring host = L"maxjsdrv" + driveKey + L".local";
+        const std::wstring root = std::wstring(1, static_cast<wchar_t>(towupper(normalizedDrive))) + L":\\";
+        if (FAILED(wv3->SetVirtualHostNameToFolderMapping(
+                host.c_str(), root.c_str(), COREWEBVIEW2_HOST_RESOURCE_ACCESS_KIND_ALLOW))) {
+            return false;
+        }
+
+        texDirMap_[driveKey] = host;
+        return true;
     }
 
     void PrepareForWebReload() {
@@ -1370,6 +1387,7 @@ public:
         wchar_t drive = towlower(filePath[0]);
         std::wstring driveKey(1, drive);
 
+        if (!EnsureDriveMapping(drive)) return {};
         auto it = texDirMap_.find(driveKey);
         if (it == texDirMap_.end()) return {};
 

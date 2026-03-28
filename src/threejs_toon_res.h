@@ -1,0 +1,35 @@
+#pragma once
+
+#define IDD_THREEJS_TOON    301
+#define IDS_TOON_PARAMS     302
+
+#define IDC_TOON_COLOR      3001
+#define IDC_TOON_COLOR_MAP  3002
+#define IDC_TOON_GRAD_MAP   3003
+#define IDC_TOON_NORM_MAP   3004
+#define IDC_TOON_NORMSCL_E  3005
+#define IDC_TOON_NORMSCL_S  3006
+#define IDC_TOON_BUMP_MAP   3007
+#define IDC_TOON_BUMP_E     3008
+#define IDC_TOON_BUMP_S     3009
+#define IDC_TOON_EM_COLOR   3010
+#define IDC_TOON_EM_MAP     3011
+#define IDC_TOON_EM_INT_E   3012
+#define IDC_TOON_EM_INT_S   3013
+#define IDC_TOON_OPAC_E     3014
+#define IDC_TOON_OPAC_S     3015
+#define IDC_TOON_OPAC_MAP   3016
+#define IDC_TOON_LM_MAP     3017
+#define IDC_TOON_LM_INT_E   3018
+#define IDC_TOON_LM_INT_S   3019
+#define IDC_TOON_LM_CH_E    3020
+#define IDC_TOON_LM_CH_S    3021
+#define IDC_TOON_AO_MAP     3022
+#define IDC_TOON_AO_INT_E   3023
+#define IDC_TOON_AO_INT_S   3024
+#define IDC_TOON_DISP_MAP   3025
+#define IDC_TOON_DISP_E     3026
+#define IDC_TOON_DISP_S     3027
+#define IDC_TOON_DISP_B_E   3028
+#define IDC_TOON_DISP_B_S   3029
+#define IDC_TOON_DBLSIDE    3030

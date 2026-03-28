@@ -319,10 +319,10 @@ struct MaxJSPBR {
     int   lightmapChannel = 2;
     bool  doubleSided = true;
     float envIntensity = 1.0f;
-    std::wstring colorMap, roughnessMap, metalnessMap, normalMap;
+    std::wstring colorMap, gradientMap, roughnessMap, metalnessMap, normalMap;
     std::wstring bumpMap, displacementMap, parallaxMap;
     std::wstring aoMap, emissionMap, lightmapFile, opacityMap;
-    TexTransform colorMapTransform, roughnessMapTransform, metalnessMapTransform, normalMapTransform;
+    TexTransform colorMapTransform, gradientMapTransform, roughnessMapTransform, metalnessMapTransform, normalMapTransform;
     TexTransform bumpMapTransform, displacementMapTransform, parallaxMapTransform;
     TexTransform aoMapTransform, emissionMapTransform, lightmapTransform, opacityMapTransform;
     std::wstring mtlName;
@@ -339,10 +339,14 @@ static std::wstring FindPBString(Texmap* map, const MCHAR* name);
 // glTF Material Class_ID = (943849874, 1174294043)
 #define GLTF_MTL_CLASS_ID Class_ID(943849874, 1174294043)
 
+static bool IsThreeJSStandardMaterialClass(const Class_ID& cid) {
+    return cid == THREEJS_MTL_CLASS_ID || cid == THREEJS_ADV_MTL_CLASS_ID;
+}
+
 static bool IsSupportedMaterial(Mtl* mtl) {
     if (!mtl) return false;
     Class_ID cid = mtl->ClassID();
-    return cid == THREEJS_MTL_CLASS_ID || cid == THREEJS_ADV_MTL_CLASS_ID || cid == GLTF_MTL_CLASS_ID;
+    return IsThreeJSStandardMaterialClass(cid) || cid == THREEJS_TOON_CLASS_ID || cid == GLTF_MTL_CLASS_ID;
 }
 
 // Find ThreeJS or glTF Material in material tree — uses ClassID only
@@ -525,6 +529,47 @@ static void ExtractThreeJSMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
     readMap(pb_ao_map, d.aoMap, d.aoMapTransform);
 }
 
+static void ExtractThreeJSToonMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
+    IParamBlock2* pb = mtl->GetParamBlockByID(toon_params);
+    if (!pb) return;
+
+    MSTR name = mtl->GetName();
+    d.mtlName = name.data();
+    d.materialModel = L"MeshToonMaterial";
+
+    Color c = pb->GetColor(tp_color, t);
+    d.color[0] = c.r; d.color[1] = c.g; d.color[2] = c.b;
+    d.opacity = pb->GetFloat(tp_opacity, t);
+    d.normalScale = pb->GetFloat(tp_normal_scale, t);
+    d.bumpScale = pb->GetFloat(tp_bump_scale, t);
+    d.displacementScale = pb->GetFloat(tp_displacement_scale, t);
+    d.displacementBias = pb->GetFloat(tp_displacement_bias, t);
+    d.doubleSided = pb->GetInt(tp_double_sided, t) != 0;
+    d.aoIntensity = pb->GetFloat(tp_ao_intensity, t);
+    d.lightmapIntensity = pb->GetFloat(tp_lightmap_intensity, t);
+    d.lightmapChannel = pb->GetInt(tp_lightmap_channel, t);
+
+    Color em = pb->GetColor(tp_emissive_color, t);
+    d.emission[0] = em.r; d.emission[1] = em.g; d.emission[2] = em.b;
+    d.emIntensity = pb->GetFloat(tp_emissive_intensity, t);
+
+    auto readMap = [&](ParamID pid, std::wstring& outPath, MaxJSPBR::TexTransform& outXf) {
+        Texmap* map = pb->GetTexmap(pid, t);
+        outPath.clear();
+        outXf = {};
+        ExtractMaterialTexture(map, outPath, outXf);
+    };
+    readMap(tp_color_map, d.colorMap, d.colorMapTransform);
+    readMap(tp_gradient_map, d.gradientMap, d.gradientMapTransform);
+    readMap(tp_normal_map, d.normalMap, d.normalMapTransform);
+    readMap(tp_bump_map, d.bumpMap, d.bumpMapTransform);
+    readMap(tp_emissive_map, d.emissionMap, d.emissionMapTransform);
+    readMap(tp_opacity_map, d.opacityMap, d.opacityMapTransform);
+    readMap(tp_lightmap, d.lightmapFile, d.lightmapTransform);
+    readMap(tp_ao_map, d.aoMap, d.aoMapTransform);
+    readMap(tp_displacement_map, d.displacementMap, d.displacementMapTransform);
+}
+
 // Extract PBR from glTF Material — generic paramblock reader
 static void ExtractGltfMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
     MSTR name = mtl->GetName();
@@ -619,8 +664,11 @@ static void ExtractPBRFromMtl(Mtl* mtl, INode* node, TimeValue t, MaxJSPBR& d) {
     if (mtl) {
         Mtl* found = FindSupportedMaterial(mtl);
         if (found) {
-            if (found->ClassID() == THREEJS_MTL_CLASS_ID || found->ClassID() == THREEJS_ADV_MTL_CLASS_ID)
+            const Class_ID cid = found->ClassID();
+            if (IsThreeJSStandardMaterialClass(cid))
                 ExtractThreeJSMtl(found, t, d);
+            else if (cid == THREEJS_TOON_CLASS_ID)
+                ExtractThreeJSToonMtl(found, t, d);
             else
                 ExtractGltfMtl(found, t, d);
             return;
@@ -657,8 +705,11 @@ static void ExtractPBR(INode* node, TimeValue t, MaxJSPBR& d) {
     // Priority 1: ThreeJS Material or glTF Material (direct or inside Shell)
     Mtl* found = FindSupportedMaterial(mtl);
     if (found) {
-        if (found->ClassID() == THREEJS_MTL_CLASS_ID || found->ClassID() == THREEJS_ADV_MTL_CLASS_ID)
+        const Class_ID cid = found->ClassID();
+        if (IsThreeJSStandardMaterialClass(cid))
             ExtractThreeJSMtl(found, t, d);
+        else if (cid == THREEJS_TOON_CLASS_ID)
+            ExtractThreeJSToonMtl(found, t, d);
         else
             ExtractGltfMtl(found, t, d);
         return;
@@ -666,6 +717,46 @@ static void ExtractPBR(INode* node, TimeValue t, MaxJSPBR& d) {
 
     // Priority 2: Wire color fallback (old material conversion disabled for speed)
     GetWireColor3f(node, d.color);
+}
+
+static void ExtractMaterialScalarPreview(Mtl* foundMtl, INode* node, TimeValue t, float col[3], float& rough, float& metal, float& opac) {
+    if (!foundMtl) {
+        if (node) GetWireColor3f(node, col);
+        return;
+    }
+
+    const Class_ID cid = foundMtl->ClassID();
+    if (IsThreeJSStandardMaterialClass(cid)) {
+        IParamBlock2* pb = foundMtl->GetParamBlockByID(threejs_params);
+        if (pb) {
+            Color c = pb->GetColor(pb_color, t);
+            col[0] = c.r; col[1] = c.g; col[2] = c.b;
+            rough = pb->GetFloat(pb_roughness, t);
+            metal = pb->GetFloat(pb_metalness, t);
+            opac = pb->GetFloat(pb_opacity, t);
+            return;
+        }
+    } else if (cid == THREEJS_TOON_CLASS_ID) {
+        IParamBlock2* pb = foundMtl->GetParamBlockByID(toon_params);
+        if (pb) {
+            Color c = pb->GetColor(tp_color, t);
+            col[0] = c.r; col[1] = c.g; col[2] = c.b;
+            rough = 0.0f;
+            metal = 0.0f;
+            opac = pb->GetFloat(tp_opacity, t);
+            return;
+        }
+    } else if (cid == GLTF_MTL_CLASS_ID) {
+        MaxJSPBR tmp;
+        ExtractGltfMtl(foundMtl, t, tmp);
+        col[0] = tmp.color[0]; col[1] = tmp.color[1]; col[2] = tmp.color[2];
+        rough = tmp.roughness;
+        metal = tmp.metalness;
+        opac = tmp.opacity;
+        return;
+    }
+
+    if (node) GetWireColor3f(node, col);
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -1620,24 +1711,7 @@ public:
                 float metal = 0.0f;
                 float opac = 1.0f;
 
-                Mtl* foundMtl = FindSupportedMaterial(node->GetMtl());
-                if (foundMtl && (foundMtl->ClassID() == THREEJS_MTL_CLASS_ID || foundMtl->ClassID() == THREEJS_ADV_MTL_CLASS_ID)) {
-                    IParamBlock2* pb = foundMtl->GetParamBlockByID(threejs_params);
-                    if (pb) {
-                        Color c = pb->GetColor(pb_color, t);
-                        col[0] = c.r; col[1] = c.g; col[2] = c.b;
-                        rough = pb->GetFloat(pb_roughness, t);
-                        metal = pb->GetFloat(pb_metalness, t);
-                        opac = pb->GetFloat(pb_opacity, t);
-                    }
-                } else if (foundMtl && foundMtl->ClassID() == GLTF_MTL_CLASS_ID) {
-                    MaxJSPBR tmp;
-                    ExtractGltfMtl(foundMtl, t, tmp);
-                    col[0] = tmp.color[0]; col[1] = tmp.color[1]; col[2] = tmp.color[2];
-                    rough = tmp.roughness; metal = tmp.metalness; opac = tmp.opacity;
-                } else {
-                    GetWireColor3f(node, col);
-                }
+                ExtractMaterialScalarPreview(FindSupportedMaterial(node->GetMtl()), node, t, col, rough, metal, opac);
 
                 Mtl* multiMtl = FindMultiSubMtl(node->GetMtl());
                 if (!(multiMtl && multiMtl->NumSubMtls() > 1)) {
@@ -1812,10 +1886,11 @@ public:
             std::wstring url = MapTexturePath(path);
             if (!url.empty()) {
                 ss << L",\"" << key << L"\":\"" << EscapeJson(url.c_str()) << L'"';
-                writeXf(xfKey, xf);
+                if (xfKey) writeXf(xfKey, xf);
             }
         };
         writeMap(L"map", L"mapXf", pbr.colorMap, pbr.colorMapTransform);
+        writeMap(L"gradMap", nullptr, pbr.gradientMap, pbr.gradientMapTransform);
         writeMap(L"roughMap", L"roughMapXf", pbr.roughnessMap, pbr.roughnessMapTransform);
         writeMap(L"metalMap", L"metalMapXf", pbr.metalnessMap, pbr.metalnessMapTransform);
         writeMap(L"normMap", L"normMapXf", pbr.normalMap, pbr.normalMapTransform);
@@ -2360,24 +2435,7 @@ public:
             float col[3] = {0.8f,0.8f,0.8f};
             float rough = 0.5f, metal = 0.0f, opac = 1.0f;
             Mtl* foundMtl = FindSupportedMaterial(node->GetMtl());
-            if (foundMtl && (foundMtl->ClassID() == THREEJS_MTL_CLASS_ID || foundMtl->ClassID() == THREEJS_ADV_MTL_CLASS_ID)) {
-                IParamBlock2* pb = foundMtl->GetParamBlockByID(threejs_params);
-                if (pb) {
-                    Color c = pb->GetColor(pb_color, t);
-                    col[0] = c.r; col[1] = c.g; col[2] = c.b;
-                    rough = pb->GetFloat(pb_roughness, t);
-                    metal = pb->GetFloat(pb_metalness, t);
-                    opac  = pb->GetFloat(pb_opacity, t);
-                }
-            } else if (foundMtl && foundMtl->ClassID() == GLTF_MTL_CLASS_ID) {
-                // Read glTF params via generic paramblock scan
-                MaxJSPBR tmp;
-                ExtractGltfMtl(foundMtl, t, tmp);
-                col[0] = tmp.color[0]; col[1] = tmp.color[1]; col[2] = tmp.color[2];
-                rough = tmp.roughness; metal = tmp.metalness; opac = tmp.opacity;
-            } else {
-                GetWireColor3f(node, col);
-            }
+            ExtractMaterialScalarPreview(foundMtl, node, t, col, rough, metal, opac);
 
             if (!first) ss << L',';
             ss << L"{\"h\":" << handle;

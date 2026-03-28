@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import {
     add,
+    blendColor,
     colorToDirection,
     diffuseColor,
     directionToColor,
@@ -30,7 +31,7 @@ function setTexturePrecision(scenePass) {
 }
 
 export function createSSGIController({ renderer, scene, camera, backendLabel = '', onError = () => {} }) {
-    const renderPipeline = new THREE.RenderPipeline(renderer);
+    const postProcessing = new THREE.PostProcessing(renderer);
     const supportsScreenSpaceEffects = backendLabel === 'WebGPU';
     const state = {
         ssgi: {
@@ -82,8 +83,8 @@ export function createSSGIController({ renderer, scene, camera, backendLabel = '
         state.bloom.enabled = false;
         pipelineReady = false;
         clearNodes();
-        renderPipeline.outputNode = null;
-        renderPipeline.needsUpdate = true;
+        postProcessing.outputNode = null;
+        postProcessing.needsUpdate = true;
         onError(`${prefix}: ${lastError}`);
     }
 
@@ -95,8 +96,8 @@ export function createSSGIController({ renderer, scene, camera, backendLabel = '
         if (!hasAnyEffectEnabled() || !available) {
             pipelineReady = false;
             clearNodes();
-            renderPipeline.outputNode = null;
-            renderPipeline.needsUpdate = true;
+            postProcessing.outputNode = null;
+            postProcessing.needsUpdate = true;
             return;
         }
 
@@ -159,7 +160,7 @@ export function createSSGIController({ renderer, scene, camera, backendLabel = '
                 ssrPass.opacity.value = state.ssr.opacity;
                 ssrPass.thickness.value = state.ssr.thickness;
                 activeNodes.push(ssrPass);
-                beauty = vec4(beauty.rgb.add(ssrPass.rgb), beauty.a);
+                beauty = blendColor(beauty, ssrPass);
             }
 
             if (state.bloom.enabled) {
@@ -173,8 +174,8 @@ export function createSSGIController({ renderer, scene, camera, backendLabel = '
                 beauty = beauty.add(bloomPass);
             }
 
-            renderPipeline.outputNode = beauty;
-            renderPipeline.needsUpdate = true;
+            postProcessing.outputNode = beauty;
+            postProcessing.needsUpdate = true;
             pipelineReady = true;
             lastError = '';
         } catch (error) {
@@ -235,7 +236,7 @@ export function createSSGIController({ renderer, scene, camera, backendLabel = '
             }
 
             try {
-                renderPipeline.render();
+                postProcessing.render();
             } catch (error) {
                 disableWithError('Post pipeline render failed', error);
                 renderer.render(scene, camera);
@@ -243,7 +244,7 @@ export function createSSGIController({ renderer, scene, camera, backendLabel = '
         },
         resize() {
             if (hasAnyEffectEnabled()) {
-                renderPipeline.needsUpdate = true;
+                postProcessing.needsUpdate = true;
             }
         },
     };

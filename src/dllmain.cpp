@@ -19,6 +19,7 @@
 #include <wrl.h>
 #include <WebView2.h>
 #include <ShlObj.h>
+#include <Shlwapi.h>
 #include <wincodec.h>
 #include <string>
 #include <vector>
@@ -174,6 +175,69 @@ static std::wstring UrlEncodePath(const std::wstring& path) {
     }
 
     return Utf8ToWide(encoded);
+}
+
+static int HexNibble(wchar_t c) {
+    if (c >= L'0' && c <= L'9') return static_cast<int>(c - L'0');
+    if (c >= L'a' && c <= L'f') return 10 + static_cast<int>(c - L'a');
+    if (c >= L'A' && c <= L'F') return 10 + static_cast<int>(c - L'A');
+    return -1;
+}
+
+static std::wstring UrlDecodePath(const std::wstring& path) {
+    if (path.empty()) return {};
+
+    std::string utf8;
+    utf8.reserve(path.size());
+
+    for (size_t i = 0; i < path.size(); ++i) {
+        const wchar_t c = path[i];
+        if (c == L'%' && i + 2 < path.size()) {
+            const int hi = HexNibble(path[i + 1]);
+            const int lo = HexNibble(path[i + 2]);
+            if (hi >= 0 && lo >= 0) {
+                utf8.push_back(static_cast<char>((hi << 4) | lo));
+                i += 2;
+                continue;
+            }
+        }
+
+        if (c == L'+') {
+            utf8.push_back(' ');
+        } else if (c <= 0x7F) {
+            utf8.push_back(static_cast<char>(c));
+        } else {
+            const std::wstring single(1, c);
+            int utf8Len = WideCharToMultiByte(CP_UTF8, 0, single.data(), 1, nullptr, 0, nullptr, nullptr);
+            if (utf8Len > 0) {
+                std::string tmp(static_cast<size_t>(utf8Len), '\0');
+                WideCharToMultiByte(CP_UTF8, 0, single.data(), 1, tmp.data(), utf8Len, nullptr, nullptr);
+                utf8 += tmp;
+            }
+        }
+    }
+
+    return Utf8ToWide(utf8);
+}
+
+static const wchar_t* GetMimeTypeForPath(const std::wstring& path) {
+    const wchar_t* ext = PathFindExtensionW(path.c_str());
+    if (!ext || !*ext) return L"application/octet-stream";
+    if (_wcsicmp(ext, L".png") == 0) return L"image/png";
+    if (_wcsicmp(ext, L".jpg") == 0 || _wcsicmp(ext, L".jpeg") == 0) return L"image/jpeg";
+    if (_wcsicmp(ext, L".webp") == 0) return L"image/webp";
+    if (_wcsicmp(ext, L".gif") == 0) return L"image/gif";
+    if (_wcsicmp(ext, L".bmp") == 0) return L"image/bmp";
+    if (_wcsicmp(ext, L".hdr") == 0) return L"image/vnd.radiance";
+    if (_wcsicmp(ext, L".exr") == 0) return L"image/x-exr";
+    if (_wcsicmp(ext, L".ktx2") == 0) return L"image/ktx2";
+    if (_wcsicmp(ext, L".ply") == 0) return L"application/octet-stream";
+    if (_wcsicmp(ext, L".splat") == 0) return L"application/octet-stream";
+    if (_wcsicmp(ext, L".ksplat") == 0) return L"application/octet-stream";
+    if (_wcsicmp(ext, L".spz") == 0) return L"application/octet-stream";
+    if (_wcsicmp(ext, L".json") == 0) return L"application/json";
+    if (_wcsicmp(ext, L".bin") == 0) return L"application/octet-stream";
+    return L"application/octet-stream";
 }
 
 static float SafeJsonFloat(float value, float fallback = 0.0f) {
@@ -1245,6 +1309,55 @@ public:
                     return S_OK;
                 }).Get(), nullptr);
 
+        webview_->AddWebResourceRequestedFilter(L"https://maxjs.local/__asset/*", COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL);
+        webview_->add_WebResourceRequested(
+            Callback<ICoreWebView2WebResourceRequestedEventHandler>(
+                [this](ICoreWebView2*, ICoreWebView2WebResourceRequestedEventArgs* args) -> HRESULT {
+                    if (!args || !env_) return S_OK;
+
+                    ComPtr<ICoreWebView2WebResourceRequest> request;
+                    if (FAILED(args->get_Request(&request)) || !request) return S_OK;
+
+                    LPWSTR uri = nullptr;
+                    if (FAILED(request->get_Uri(&uri)) || !uri) return S_OK;
+
+                    const std::wstring_view prefix = L"https://maxjs.local/__asset/";
+                    const std::wstring uriView(uri);
+                    CoTaskMemFree(uri);
+                    if (uriView.rfind(prefix, 0) != 0) return S_OK;
+
+                    std::wstring decodedPath = UrlDecodePath(uriView.substr(prefix.size()));
+                    std::replace(decodedPath.begin(), decodedPath.end(), L'/', L'\\');
+                    const DWORD attrs = GetFileAttributesW(decodedPath.c_str());
+                    if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+                        ComPtr<ICoreWebView2WebResourceResponse> response;
+                        env_->CreateWebResourceResponse(nullptr, 404, L"Not Found",
+                            L"Content-Type: text/plain\r\nCache-Control: no-store\r\n", &response);
+                        args->put_Response(response.Get());
+                        return S_OK;
+                    }
+
+                    ComPtr<IStream> stream;
+                    if (FAILED(SHCreateStreamOnFileEx(decodedPath.c_str(), STGM_READ | STGM_SHARE_DENY_NONE,
+                        FILE_ATTRIBUTE_NORMAL, FALSE, nullptr, &stream)) || !stream) {
+                        ComPtr<ICoreWebView2WebResourceResponse> response;
+                        env_->CreateWebResourceResponse(nullptr, 500, L"Open Failed",
+                            L"Content-Type: text/plain\r\nCache-Control: no-store\r\n", &response);
+                        args->put_Response(response.Get());
+                        return S_OK;
+                    }
+
+                    std::wstring headers = L"Content-Type: ";
+                    headers += GetMimeTypeForPath(decodedPath);
+                    headers += L"\r\nCache-Control: no-store\r\n";
+
+                    ComPtr<ICoreWebView2WebResourceResponse> response;
+                    if (SUCCEEDED(env_->CreateWebResourceResponse(stream.Get(), 200, L"OK", headers.c_str(), &response)) && response) {
+                        args->put_Response(response.Get());
+                    }
+                    return S_OK;
+                }).Get(), nullptr);
+
         // Prefer shared-buffer transport when the runtime supports it.
         ComPtr<ICoreWebView2_17> wv17;
         ComPtr<ICoreWebView2Environment12> env12;
@@ -1377,26 +1490,18 @@ public:
         }
     }
 
-    // ── Texture serving — drives pre-mapped in LoadContent ──
+    // ── Same-origin asset serving via WebResourceRequested ──
 
     std::wstring MapTexturePath(const std::wstring& filePath) {
         if (filePath.empty() || filePath.size() < 3 || filePath[1] != L':') return {};
         const DWORD attrs = GetFileAttributesW(filePath.c_str());
         if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_DIRECTORY)) return {};
 
-        wchar_t drive = towlower(filePath[0]);
-        std::wstring driveKey(1, drive);
-
-        if (!EnsureDriveMapping(drive)) return {};
-        auto it = texDirMap_.find(driveKey);
-        if (it == texDirMap_.end()) return {};
-
-        // C:\foo\bar.png → https://maxjsdrvc.local/foo/bar.png
-        std::wstring relPath = filePath.substr(3);
-        std::replace(relPath.begin(), relPath.end(), L'\\', L'/');
-        std::wstring encodedRelPath = UrlEncodePath(relPath);
-        if (encodedRelPath.empty()) return {};
-        return L"https://" + it->second + L"/" + encodedRelPath;
+        std::wstring normalizedPath = filePath;
+        std::replace(normalizedPath.begin(), normalizedPath.end(), L'\\', L'/');
+        std::wstring encodedPath = UrlEncodePath(normalizedPath);
+        if (encodedPath.empty()) return {};
+        return L"https://maxjs.local/__asset/" + encodedPath;
     }
 
     // ── Callbacks & sync ─────────────────────────────────────

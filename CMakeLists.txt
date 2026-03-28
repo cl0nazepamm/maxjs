@@ -80,6 +80,7 @@ target_link_libraries(${PLUGIN_NAME} PRIVATE
     Maxscrpt.lib
     comctl32.lib
     comdlg32.lib
+    shlwapi.lib
     # WebView2
     WebView2LoaderStatic.lib
 )

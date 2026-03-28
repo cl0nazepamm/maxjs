@@ -186,6 +186,19 @@
     </script>
     <script type="module">
         import * as THREE from 'three';
+        import {
+            bumpMap as tslBumpMap,
+            float as tslFloat,
+            materialColor,
+            materialMetalness,
+            materialOpacity,
+            materialRoughness,
+            normalMap as tslNormalMap,
+            parallaxUV,
+            texture as tslTexture,
+            uv,
+            vec2 as tslVec2,
+        } from 'three/tsl';
         import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
         import { HDRLoader } from 'three/addons/loaders/HDRLoader.js';
         import { LightProbeGenerator } from 'three/addons/lights/LightProbeGenerator.js';
@@ -490,41 +503,41 @@
             if (!md.parallaxMap || Math.abs(parallaxScale) < 1.0e-6) return;
 
             const heightTexture = loadTexture(md.parallaxMap, THREE.NoColorSpace, md.parallaxMapXf, fallbackHeightTexture);
-            const baseUv = THREE.uv();
-            const heightNode = THREE.texture(heightTexture, baseUv).r.sub(0.5);
+            const baseUv = uv();
+            const heightNode = tslTexture(heightTexture, baseUv).r.sub(0.5);
             const heightOffset = heightNode.mul(parallaxScale);
-            const displacedUv = THREE.parallaxUV(baseUv, THREE.vec2(heightOffset, heightOffset));
+            const displacedUv = parallaxUV(baseUv, tslVec2(heightOffset, heightOffset));
 
             material.userData ??= {};
             material.userData.maxjsParallaxMap = heightTexture;
             material.userData.maxjsParallaxScale = parallaxScale;
 
             if (material.map) {
-                material.colorNode = THREE.materialColor.mul(THREE.texture(material.map, displacedUv));
+                material.colorNode = materialColor.mul(tslTexture(material.map, displacedUv));
             }
 
             if (material.roughnessMap) {
-                material.roughnessNode = THREE.materialRoughness.mul(THREE.texture(material.roughnessMap, displacedUv).g);
+                material.roughnessNode = materialRoughness.mul(tslTexture(material.roughnessMap, displacedUv).g);
             }
 
             if (material.metalnessMap) {
-                material.metalnessNode = THREE.materialMetalness.mul(THREE.texture(material.metalnessMap, displacedUv).b);
+                material.metalnessNode = materialMetalness.mul(tslTexture(material.metalnessMap, displacedUv).b);
             }
 
             if (material.normalMap) {
-                material.normalNode = THREE.normalMap(
-                    THREE.texture(material.normalMap, displacedUv),
-                    THREE.vec2(material.normalScale?.x ?? 1, material.normalScale?.y ?? 1)
+                material.normalNode = tslNormalMap(
+                    tslTexture(material.normalMap, displacedUv),
+                    tslVec2(material.normalScale?.x ?? 1, material.normalScale?.y ?? 1)
                 );
             } else if (material.bumpMap) {
-                material.normalNode = THREE.bumpMap(
-                    THREE.texture(material.bumpMap, displacedUv).r,
-                    THREE.float(material.bumpScale ?? 1.0)
+                material.normalNode = tslBumpMap(
+                    tslTexture(material.bumpMap, displacedUv).r,
+                    tslFloat(material.bumpScale ?? 1.0)
                 );
             }
 
             if (material.alphaMap) {
-                material.opacityNode = THREE.materialOpacity.mul(THREE.texture(material.alphaMap, displacedUv).g);
+                material.opacityNode = materialOpacity.mul(tslTexture(material.alphaMap, displacedUv).g);
             }
 
             material.needsUpdate = true;
@@ -543,12 +556,18 @@
         }
 
         function createMaterial(md) {
-            const modelName = md.model || 'MeshStandardMaterial';
-            const key = `${modelName}::${md.name || 'default'}`;
+            const requestedModelName = md.model || 'MeshStandardMaterial';
+            const wantsAdvancedMaterial = requestedModelName === 'MeshStandardNodeMaterial';
+            const wantsParallax = !!md.parallaxMap && Math.abs(Number(md.parallaxS) || 0) >= 1.0e-6;
+            const useNodeMaterial = wantsAdvancedMaterial &&
+                rendererBackendLabel === 'WebGPU' &&
+                typeof THREE.MeshStandardNodeMaterial === 'function' &&
+                wantsParallax;
+            const runtimeModelName = useNodeMaterial ? 'MeshStandardNodeMaterial' : 'MeshStandardMaterial';
+            const key = `${requestedModelName}::${runtimeModelName}::${md.name || 'default'}`;
             let template = materialCache.get(key);
 
             if (!template) {
-                const isAdvancedMaterial = modelName === 'MeshStandardNodeMaterial';
                 const params = {
                     color: new THREE.Color(md.color[0], md.color[1], md.color[2]),
                     roughness: md.rough ?? 0.5,
@@ -587,11 +606,14 @@
                 if (md.dispB != null) params.displacementBias = md.dispB;
                 if (md.aoI != null) params.aoMapIntensity = md.aoI;
 
-                template = isAdvancedMaterial
+                template = useNodeMaterial
                     ? new THREE.MeshStandardNodeMaterial(params)
                     : new THREE.MeshStandardMaterial(params);
                 template.userData ??= {};
-                template.userData.maxjsMaterialModel = modelName;
+                template.userData.maxjsRequestedMaterialModel = requestedModelName;
+                template.userData.maxjsMaterialModel = runtimeModelName;
+                template.userData.maxjsNodeMaterialFallback =
+                    wantsAdvancedMaterial && !useNodeMaterial;
 
                 // Textures
                 if (md.map) template.map = loadTexture(md.map, THREE.SRGBColorSpace, md.mapXf, fallbackWhiteTexture);
@@ -610,11 +632,12 @@
                     template.lightMapIntensity = md.lmI ?? 1.0;
                 }
 
-                if (isAdvancedMaterial) {
+                if (useNodeMaterial) {
                     applyAdvancedMaterialNodes(template, md);
                 }
 
                 rememberMaterialEmissiveBase(template);
+                template.needsUpdate = true;
                 materialCache.set(key, template);
             }
 

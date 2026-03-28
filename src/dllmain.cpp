@@ -41,6 +41,7 @@ using namespace Microsoft::WRL;
 #define SYNC_TIMER_ID             1
 #define SYNC_INTERVAL_MS          33   // background structural/material timer
 #define MATERIAL_DETECT_TICKS     6    // ~200ms material refresh cadence
+#define LIGHT_DETECT_TICKS        3    // ~100ms light parameter refresh cadence
 #define WM_TOGGLE_PANEL           (WM_USER + 1)
 #define WM_FAST_FLUSH             (WM_USER + 2)
 #define WM_KILL_PANEL             (WM_USER + 3)
@@ -1117,6 +1118,7 @@ public:
     std::unordered_set<ULONG> fastDirtyHandles_;
     std::unordered_map<ULONG, std::array<float, 16>> lastSentTransforms_;
     std::unordered_map<ULONG, uintptr_t> mtlHashMap_;  // node handle → material state hash
+    std::unordered_map<ULONG, uint64_t> lightHashMap_; // node handle → light state hash
     std::unordered_map<ULONG, uint64_t> geoHashMap_;   // node handle → geometry topology hash
     std::map<std::wstring, std::wstring> texDirMap_;    // dir → host
     int texDirCount_ = 0;
@@ -1289,6 +1291,7 @@ public:
         fastDirtyHandles_.clear();
         lastSentTransforms_.clear();
         mtlHashMap_.clear();
+        lightHashMap_.clear();
         geoHashMap_.clear();
         ResetFastPathState(false);
     }
@@ -1550,6 +1553,7 @@ public:
         if (msg.find(L"\"ready\"") != std::wstring::npos) {
             jsReady_ = true; dirty_ = true;
             mtlHashMap_.clear();
+            lightHashMap_.clear();
             geoHashMap_.clear();  // force all geometry to be sent
             lastSentTransforms_.clear();
             lightHandles_.clear();
@@ -1569,6 +1573,7 @@ public:
         } else {
             if (tickCount_ % 15 == 0) CheckWebContentChanges();
             if (tickCount_ % MATERIAL_DETECT_TICKS == 0) DetectMaterialChanges();
+            if (tickCount_ % LIGHT_DETECT_TICKS == 0) DetectLightChanges();
             if (tickCount_ % 15 == 0) DetectGeometryChanges();
         }
     }
@@ -1628,6 +1633,7 @@ public:
             INode* node = ip->GetINodeByHandle(handle);
             if (!node) {
                 mtlHashMap_.erase(handle);
+                lightHashMap_.erase(handle);
                 geoHashMap_.erase(handle);
                 geomHandles_.erase(handle);
                 lightHandles_.erase(handle);
@@ -1721,6 +1727,7 @@ public:
             INode* node = ip->GetINodeByHandle(handle);
             if (!node) {
                 mtlHashMap_.erase(handle);
+                lightHashMap_.erase(handle);
                 geoHashMap_.erase(handle);
                 it = geomHandles_.erase(it);
                 continue;
@@ -1815,6 +1822,21 @@ public:
         return HashFNV1a(payload.data(), payload.size() * sizeof(wchar_t));
     }
 
+    uint64_t ComputeLightStateHash(INode* node, TimeValue t) {
+        if (!node) return 0;
+
+        std::wostringstream ss;
+        ss.imbue(std::locale::classic());
+
+        if (!WriteLightJson(ss, node, t, false, true, false)) {
+            const std::wstring payload = L"null";
+            return HashFNV1a(payload.data(), payload.size() * sizeof(wchar_t));
+        }
+
+        const std::wstring payload = ss.str();
+        return HashFNV1a(payload.data(), payload.size() * sizeof(wchar_t));
+    }
+
     // Check if any material's serialized state changed — triggers full sync on NEXT tick
     void DetectMaterialChanges() {
         Interface* ip = GetCOREInterface();
@@ -1836,6 +1858,33 @@ public:
                 return;
             }
         }
+    }
+
+    void DetectLightChanges() {
+        Interface* ip = GetCOREInterface();
+        if (!ip || lightHandles_.empty()) return;
+
+        TimeValue t = ip->GetTime();
+        bool changed = false;
+
+        for (ULONG handle : lightHandles_) {
+            INode* node = ip->GetINodeByHandle(handle);
+            if (!node) {
+                lightHashMap_.erase(handle);
+                continue;
+            }
+
+            const uint64_t hash = ComputeLightStateHash(node, t);
+            auto it = lightHashMap_.find(handle);
+            if (it == lightHashMap_.end()) {
+                lightHashMap_[handle] = hash;
+            } else if (it->second != hash) {
+                it->second = hash;
+                if (fastDirtyHandles_.insert(handle).second) changed = true;
+            }
+        }
+
+        if (changed) QueueFastFlush();
     }
 
     // Detect geometry edits that keep the same topology counts (e.g. deforms)
@@ -2354,6 +2403,10 @@ public:
             if (geomHandles_.find(it->first) == geomHandles_.end()) it = mtlHashMap_.erase(it);
             else ++it;
         }
+        for (auto it = lightHashMap_.begin(); it != lightHashMap_.end(); ) {
+            if (lightHandles_.find(it->first) == lightHandles_.end()) it = lightHashMap_.erase(it);
+            else ++it;
+        }
 
         // Create shared buffer
         if (totalBytes == 0) totalBytes = 4;  // min size
@@ -2475,6 +2528,7 @@ public:
             INode* node = ip->GetINodeByHandle(handle);
             if (!node) {
                 mtlHashMap_.erase(handle);
+                lightHashMap_.erase(handle);
                 geoHashMap_.erase(handle);
                 lastSentTransforms_.erase(handle);
                 it = geomHandles_.erase(it);
@@ -2675,6 +2729,7 @@ public:
         geomHandles_.clear();
         lightHandles_.clear();
         mtlHashMap_.clear();
+        lightHashMap_.clear();
         geoHashMap_.clear();
         if (hwnd_) { HWND h = hwnd_; hwnd_ = nullptr; DestroyWindow(h); }
     }

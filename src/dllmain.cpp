@@ -1879,6 +1879,76 @@ public:
         ss << L'}';
     }
 
+    void WriteLightsJson(std::wostringstream& ss, Interface* ip, TimeValue t) {
+        ss << L"\"lights\":[";
+        bool firstLight = true;
+        INode* root = ip ? ip->GetRootNode() : nullptr;
+        if (root) {
+            std::function<void(INode*)> collectLights = [&](INode* parent) {
+                for (int i = 0; i < parent->NumberOfChildren(); i++) {
+                    INode* node = parent->GetChildNode(i);
+                    if (!node || node->IsNodeHidden(TRUE)) continue;
+
+                    ObjectState os = node->EvalWorldState(t);
+                    if (os.obj && os.obj->ClassID() == THREEJS_LIGHT_CLASS_ID) {
+                        IParamBlock2* pb = os.obj->GetParamBlockByID(threejs_light_params);
+                        if (pb) {
+                            if (!firstLight) ss << L',';
+                            ss << L"{\"type\":" << pb->GetInt(pl_type);
+
+                            Matrix3 tm = node->GetObjectTM(t);
+                            Point3 pos = tm.GetTrans();
+                            Point3 dir = -Normalize(tm.GetRow(1));
+                            ss << L",\"pos\":[" << pos.x << L',' << pos.y << L',' << pos.z << L']';
+                            ss << L",\"dir\":[" << dir.x << L',' << dir.y << L',' << dir.z << L']';
+
+                            Color c = pb->GetColor(pl_color, t);
+                            ss << L",\"color\":[" << c.r << L',' << c.g << L',' << c.b << L']';
+                            ss << L",\"intensity\":" << pb->GetFloat(pl_intensity, t);
+
+                            const int ltype = pb->GetInt(pl_type);
+                            if (ltype == kLight_Point || ltype == kLight_Spot) {
+                                ss << L",\"distance\":" << pb->GetFloat(pl_distance, t);
+                                ss << L",\"decay\":" << pb->GetFloat(pl_decay, t);
+                            }
+                            if (ltype == kLight_Spot) {
+                                ss << L",\"angle\":" << (pb->GetFloat(pl_angle, t) * 3.14159265f / 180.f);
+                                ss << L",\"penumbra\":" << pb->GetFloat(pl_penumbra, t);
+                            }
+                            if (ltype == kLight_RectArea) {
+                                ss << L",\"width\":" << pb->GetFloat(pl_width, t);
+                                ss << L",\"height\":" << pb->GetFloat(pl_height, t);
+                            }
+                            if (ltype == kLight_Hemisphere) {
+                                Color gc = pb->GetColor(pl_ground_color, t);
+                                ss << L",\"groundColor\":[" << gc.r << L',' << gc.g << L',' << gc.b << L']';
+                            }
+
+                            if (pb->GetInt(pl_cast_shadow)) {
+                                ss << L",\"castShadow\":true";
+                                ss << L",\"shadowBias\":" << pb->GetFloat(pl_shadow_bias, t);
+                                ss << L",\"shadowRadius\":" << pb->GetFloat(pl_shadow_radius, t);
+                                ss << L",\"shadowMapSize\":" << pb->GetInt(pl_shadow_mapsize);
+                            }
+
+                            if (pb->GetInt(pl_volumetric)) {
+                                ss << L",\"volumetric\":true";
+                                ss << L",\"volDensity\":" << pb->GetFloat(pl_vol_density, t);
+                            }
+
+                            ss << L'}';
+                            firstLight = false;
+                        }
+                    }
+
+                    collectLights(node);
+                }
+            };
+            collectLights(root);
+        }
+        ss << L']';
+    }
+
     std::uint32_t AllocateFrameId() {
         return nextFrameId_++;
     }
@@ -1925,78 +1995,8 @@ public:
         ss << L",\"flip\":" << envData.flip;
         ss << L'}';
 
-        // Lights
-        ss << L",\"lights\":[";
-        {
-            bool firstLight = true;
-            INode* root = ip->GetRootNode();
-            std::function<void(INode*)> collectLights = [&](INode* parent) {
-                for (int i = 0; i < parent->NumberOfChildren(); i++) {
-                    INode* node = parent->GetChildNode(i);
-                    if (!node || node->IsNodeHidden(TRUE)) continue;
-
-                    ObjectState os = node->EvalWorldState(t);
-                    if (os.obj && os.obj->ClassID() == THREEJS_LIGHT_CLASS_ID) {
-                        IParamBlock2* pb = os.obj->GetParamBlockByID(threejs_light_params);
-                        if (pb) {
-                            if (!firstLight) ss << L',';
-                            ss << L"{\"type\":" << pb->GetInt(pl_type);
-
-                            // Transform (position + direction from node TM)
-                            Matrix3 tm = node->GetObjectTM(t);
-                            Point3 pos = tm.GetTrans();
-                            Point3 dir = -Normalize(tm.GetRow(1)); // -Y is forward
-                            ss << L",\"pos\":[" << pos.x << L',' << pos.y << L',' << pos.z << L']';
-                            ss << L",\"dir\":[" << dir.x << L',' << dir.y << L',' << dir.z << L']';
-
-                            // Color + intensity
-                            Color c = pb->GetColor(pl_color, t);
-                            ss << L",\"color\":[" << c.r << L',' << c.g << L',' << c.b << L']';
-                            ss << L",\"intensity\":" << pb->GetFloat(pl_intensity, t);
-
-                            // Type-specific
-                            int ltype = pb->GetInt(pl_type);
-                            if (ltype == 1 || ltype == 2) { // Point or Spot
-                                ss << L",\"distance\":" << pb->GetFloat(pl_distance, t);
-                                ss << L",\"decay\":" << pb->GetFloat(pl_decay, t);
-                            }
-                            if (ltype == 2) { // Spot
-                                ss << L",\"angle\":" << (pb->GetFloat(pl_angle, t) * 3.14159265f / 180.f);
-                                ss << L",\"penumbra\":" << pb->GetFloat(pl_penumbra, t);
-                            }
-                            if (ltype == 3) { // RectArea
-                                ss << L",\"width\":" << pb->GetFloat(pl_width, t);
-                                ss << L",\"height\":" << pb->GetFloat(pl_height, t);
-                            }
-                            if (ltype == 4) { // Hemisphere
-                                Color gc = pb->GetColor(pl_ground_color, t);
-                                ss << L",\"groundColor\":[" << gc.r << L',' << gc.g << L',' << gc.b << L']';
-                            }
-
-                            // Shadows
-                            if (pb->GetInt(pl_cast_shadow)) {
-                                ss << L",\"castShadow\":true";
-                                ss << L",\"shadowBias\":" << pb->GetFloat(pl_shadow_bias, t);
-                                ss << L",\"shadowRadius\":" << pb->GetFloat(pl_shadow_radius, t);
-                                ss << L",\"shadowMapSize\":" << pb->GetInt(pl_shadow_mapsize);
-                            }
-
-                            // Volumetric
-                            if (pb->GetInt(pl_volumetric)) {
-                                ss << L",\"volumetric\":true";
-                                ss << L",\"volDensity\":" << pb->GetFloat(pl_vol_density, t);
-                            }
-
-                            ss << L'}';
-                            firstLight = false;
-                        }
-                    }
-                    collectLights(node);
-                }
-            };
-            collectLights(root);
-        }
-        ss << L']';
+        ss << L",";
+        WriteLightsJson(ss, ip, t);
 
         ss << L'}';
 
@@ -2231,6 +2231,8 @@ public:
         ss << L",\"zup\":" << envData.zup;
         ss << L",\"flip\":" << envData.flip;
         ss << L'}';
+        ss << L",";
+        WriteLightsJson(ss, ip, t);
         ss << L'}';
 
         wv17->PostSharedBufferToScript(sharedBuf.Get(),

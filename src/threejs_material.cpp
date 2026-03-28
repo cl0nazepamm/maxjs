@@ -23,20 +23,41 @@ extern HINSTANCE hInstance;
 static const ParamID kMapParamIDs[kNumMaps] = {
     pb_color_map, pb_roughness_map, pb_metalness_map, pb_normal_map,
     pb_bump_map, pb_displacement_map, pb_parallax_map, pb_emissive_map,
-    pb_opacity_map, pb_lightmap, pb_ao_map, pb_sss_color_map
+    pb_opacity_map, pb_lightmap, pb_ao_map, pb_sss_color_map, pb_matcap_map
 };
 
 static const MCHAR* kMapSlotNames[kNumMaps] = {
     _T("Color Map"), _T("Roughness Map"), _T("Metalness Map"), _T("Normal Map"),
     _T("Bump Map"), _T("Displacement Map"), _T("Parallax Map"), _T("Emissive Map"),
-    _T("Opacity Map"), _T("Light Map"), _T("AO Map"), _T("SSS Color Map")
+    _T("Opacity Map"), _T("Light Map"), _T("AO Map"), _T("SSS Color Map"), _T("Matcap Map")
 };
 
 enum class ThreeJSMaterialKind {
     Standard,
     Physical,
     SSS,
+    Utility,
 };
+
+static bool HasParam(IParamBlock2* pb, ParamID id) {
+    if (!pb) return false;
+    for (int i = 0; i < pb->NumParams(); ++i) {
+        if (pb->IndextoID(i) == id) return true;
+    }
+    return false;
+}
+
+static float GetOptionalFloat(IParamBlock2* pb, ParamID id, TimeValue t, float def) {
+    return HasParam(pb, id) ? pb->GetFloat(id, t) : def;
+}
+
+static int GetOptionalInt(IParamBlock2* pb, ParamID id, TimeValue t, int def) {
+    return HasParam(pb, id) ? pb->GetInt(id, t) : def;
+}
+
+static Color GetOptionalColor(IParamBlock2* pb, ParamID id, TimeValue t, const Color& def) {
+    return HasParam(pb, id) ? pb->GetColor(id, t) : def;
+}
 
 class ThreeJSMtl : public Mtl, public MaxSDK::Graphics::ITextureDisplay {
 public:
@@ -54,6 +75,7 @@ public:
         switch (kind_) {
             case ThreeJSMaterialKind::Physical: return THREEJS_ADV_MTL_CLASS_ID;
             case ThreeJSMaterialKind::SSS: return THREEJS_SSS_MTL_CLASS_ID;
+            case ThreeJSMaterialKind::Utility: return THREEJS_UTILITY_MTL_CLASS_ID;
             case ThreeJSMaterialKind::Standard:
             default: return THREEJS_MTL_CLASS_ID;
         }
@@ -63,6 +85,7 @@ public:
         switch (kind_) {
             case ThreeJSMaterialKind::Physical: s = _T("ThreeJS Adv"); break;
             case ThreeJSMaterialKind::SSS: s = _T("ThreeJS SSS"); break;
+            case ThreeJSMaterialKind::Utility: s = _T("ThreeJS Utility"); break;
             case ThreeJSMaterialKind::Standard:
             default: s = _T("ThreeJS Material"); break;
         }
@@ -87,27 +110,36 @@ public:
     }
 
     Color GetAmbient(int, BOOL) override {
-        return pblock ? pblock->GetColor(pb_color, 0) * 0.2f : Color(0.1f, 0.1f, 0.1f);
+        return pblock ? GetOptionalColor(pblock, pb_color, 0, Color(0.8f, 0.8f, 0.8f)) * 0.2f : Color(0.1f, 0.1f, 0.1f);
     }
     Color GetDiffuse(int, BOOL) override {
-        return pblock ? pblock->GetColor(pb_color, 0) : Color(0.8f, 0.8f, 0.8f);
+        return pblock ? GetOptionalColor(pblock, pb_color, 0, Color(0.8f, 0.8f, 0.8f)) : Color(0.8f, 0.8f, 0.8f);
     }
-    Color GetSpecular(int, BOOL) override { return Color(1, 1, 1); }
+    Color GetSpecular(int, BOOL) override {
+        return pblock ? GetOptionalColor(pblock, pb_specular_color, 0, Color(1, 1, 1)) : Color(1, 1, 1);
+    }
     float GetShininess(int, BOOL) override {
-        return pblock ? (1.0f - pblock->GetFloat(pb_roughness, 0)) : 0.5f;
+        if (!pblock) return 0.5f;
+        if (HasParam(pblock, pb_shininess)) return GetOptionalFloat(pblock, pb_shininess, 0, 30.0f) / 100.0f;
+        return 1.0f - GetOptionalFloat(pblock, pb_roughness, 0, 0.5f);
     }
     float GetShinStr(int, BOOL) override { return 1.0f; }
     float GetXParency(int, BOOL) override {
-        return pblock ? (1.0f - pblock->GetFloat(pb_opacity, 0)) : 0.0f;
+        return pblock ? (1.0f - GetOptionalFloat(pblock, pb_opacity, 0, 1.0f)) : 0.0f;
     }
 
     void SetAmbient(Color, TimeValue) override {}
     void SetDiffuse(Color c, TimeValue t) override {
-        if (pblock) pblock->SetValue(pb_color, t, c);
+        if (pblock && HasParam(pblock, pb_color)) pblock->SetValue(pb_color, t, c);
     }
     void SetSpecular(Color, TimeValue) override {}
     void SetShininess(float v, TimeValue t) override {
-        if (pblock) pblock->SetValue(pb_roughness, t, 1.0f - v);
+        if (!pblock) return;
+        if (HasParam(pblock, pb_shininess)) {
+            pblock->SetValue(pb_shininess, t, v * 100.0f);
+        } else if (HasParam(pblock, pb_roughness)) {
+            pblock->SetValue(pb_roughness, t, 1.0f - v);
+        }
     }
 
     BOOL SupportTexDisplay() override { return FALSE; }
@@ -149,11 +181,13 @@ public:
     int NumSubTexmaps() override { return kNumMaps; }
     Texmap* GetSubTexmap(int i) override {
         if (!pblock || i < 0 || i >= kNumMaps) return nullptr;
-        return pblock->GetTexmap(kMapParamIDs[i]);
+        const ParamID pid = kMapParamIDs[i];
+        return HasParam(pblock, pid) ? pblock->GetTexmap(pid) : nullptr;
     }
     void SetSubTexmap(int i, Texmap* m) override {
         if (!pblock || i < 0 || i >= kNumMaps) return;
-        pblock->SetValue(kMapParamIDs[i], 0, m);
+        const ParamID pid = kMapParamIDs[i];
+        if (HasParam(pblock, pid)) pblock->SetValue(pid, 0, m);
     }
     MSTR GetSubTexmapSlotName(int i, bool) override {
         if (i >= 0 && i < kNumMaps) return MSTR(kMapSlotNames[i]);
@@ -169,7 +203,7 @@ public:
 
     void Shade(ShadeContext& sc) override {
         if (gbufID) sc.SetGBufferID(gbufID);
-        const Color c = pblock ? pblock->GetColor(pb_color, sc.CurTime()) : Color(0.8f, 0.8f, 0.8f);
+        const Color c = pblock ? GetOptionalColor(pblock, pb_color, sc.CurTime(), Color(0.8f, 0.8f, 0.8f)) : Color(0.8f, 0.8f, 0.8f);
         sc.out.c = c;
         sc.out.t = Color(0, 0, 0);
     }
@@ -193,6 +227,7 @@ private:
         switch (kind_) {
             case ThreeJSMaterialKind::Physical: return GetThreeJSAdvMtlDesc();
             case ThreeJSMaterialKind::SSS: return GetThreeJSSSSMtlDesc();
+            case ThreeJSMaterialKind::Utility: return GetThreeJSUtilityMtlDesc();
             case ThreeJSMaterialKind::Standard:
             default: return GetThreeJSMtlDesc();
         }
@@ -231,10 +266,13 @@ static ThreeJSMtlClassDesc threeJSAdvMtlDesc(
     ThreeJSMaterialKind::Physical, THREEJS_ADV_MTL_CLASS_ID, _T("ThreeJS Adv"), _T("ThreeJSAdvMaterial"));
 static ThreeJSMtlClassDesc threeJSSSSMtlDesc(
     ThreeJSMaterialKind::SSS, THREEJS_SSS_MTL_CLASS_ID, _T("ThreeJS SSS"), _T("ThreeJSSSSMaterial"));
+static ThreeJSMtlClassDesc threeJSUtilityMtlDesc(
+    ThreeJSMaterialKind::Utility, THREEJS_UTILITY_MTL_CLASS_ID, _T("ThreeJS Utility"), _T("ThreeJSUtilityMaterial"));
 
 ClassDesc2* GetThreeJSMtlDesc() { return &threeJSMtlDesc; }
 ClassDesc2* GetThreeJSAdvMtlDesc() { return &threeJSAdvMtlDesc; }
 ClassDesc2* GetThreeJSSSSMtlDesc() { return &threeJSSSSMtlDesc; }
+ClassDesc2* GetThreeJSUtilityMtlDesc() { return &threeJSUtilityMtlDesc; }
 
 #define THREEJS_COMMON_PARAM_ITEMS \
     pb_color, _T("color"), TYPE_RGBA, P_ANIMATABLE, 0, \
@@ -247,12 +285,12 @@ ClassDesc2* GetThreeJSSSSMtlDesc() { return &threeJSSSSMtlDesc; }
         p_end, \
     pb_color_map_strength, _T("colorMapStrength"), TYPE_FLOAT, P_ANIMATABLE, 0, \
         p_default, 1.0f, \
-        p_range, 0.0f, 1.0f, \
+        p_range, 0.0f, 99999.0f, \
         p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_MAPSTR_EDIT, IDC_MAPSTR_SPIN, 0.01f, \
         p_end, \
     pb_roughness, _T("roughness"), TYPE_FLOAT, P_ANIMATABLE, 0, \
         p_default, 0.5f, \
-        p_range, 0.0f, 1.0f, \
+        p_range, 0.0f, 99999.0f, \
         p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_ROUGH_EDIT, IDC_ROUGH_SPIN, 0.01f, \
         p_end, \
     pb_roughness_map, _T("roughnessMap"), TYPE_TEXMAP, 0, 0, \
@@ -261,12 +299,12 @@ ClassDesc2* GetThreeJSSSSMtlDesc() { return &threeJSSSSMtlDesc; }
         p_end, \
     pb_roughness_map_strength, _T("roughnessMapStrength"), TYPE_FLOAT, P_ANIMATABLE, 0, \
         p_default, 1.0f, \
-        p_range, 0.0f, 1.0f, \
+        p_range, 0.0f, 99999.0f, \
         p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_RMAPSTR_EDIT, IDC_RMAPSTR_SPIN, 0.01f, \
         p_end, \
     pb_metalness, _T("metalness"), TYPE_FLOAT, P_ANIMATABLE, 0, \
         p_default, 0.0f, \
-        p_range, 0.0f, 1.0f, \
+        p_range, 0.0f, 99999.0f, \
         p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_METAL_EDIT, IDC_METAL_SPIN, 0.01f, \
         p_end, \
     pb_metalness_map, _T("metalnessMap"), TYPE_TEXMAP, 0, 0, \
@@ -275,7 +313,7 @@ ClassDesc2* GetThreeJSSSSMtlDesc() { return &threeJSSSSMtlDesc; }
         p_end, \
     pb_metalness_map_strength, _T("metalnessMapStrength"), TYPE_FLOAT, P_ANIMATABLE, 0, \
         p_default, 1.0f, \
-        p_range, 0.0f, 1.0f, \
+        p_range, 0.0f, 99999.0f, \
         p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_MMAPSTR_EDIT, IDC_MMAPSTR_SPIN, 0.01f, \
         p_end, \
     pb_normal_map, _T("normalMap"), TYPE_TEXMAP, 0, 0, \
@@ -284,7 +322,7 @@ ClassDesc2* GetThreeJSSSSMtlDesc() { return &threeJSSSSMtlDesc; }
         p_end, \
     pb_normal_scale, _T("normalScale"), TYPE_FLOAT, P_ANIMATABLE, 0, \
         p_default, 1.0f, \
-        p_range, 0.0f, 5.0f, \
+        p_range, 0.0f, 99999.0f, \
         p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_NORMSCL_EDIT, IDC_NORMSCL_SPIN, 0.01f, \
         p_end, \
     pb_bump_map, _T("bumpMap"), TYPE_TEXMAP, 0, 0, \
@@ -293,7 +331,7 @@ ClassDesc2* GetThreeJSSSSMtlDesc() { return &threeJSSSSMtlDesc; }
         p_end, \
     pb_bump_scale, _T("bumpScale"), TYPE_FLOAT, P_ANIMATABLE, 0, \
         p_default, 1.0f, \
-        p_range, 0.0f, 5.0f, \
+        p_range, 0.0f, 99999.0f, \
         p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_BUMP_EDIT, IDC_BUMP_SPIN, 0.01f, \
         p_end, \
     pb_displacement_map, _T("displacementMap"), TYPE_TEXMAP, 0, 0, \
@@ -320,17 +358,17 @@ ClassDesc2* GetThreeJSSSSMtlDesc() { return &threeJSSSSMtlDesc; }
         p_end, \
     pb_emissive_intensity, _T("emissiveIntensity"), TYPE_FLOAT, P_ANIMATABLE, 0, \
         p_default, 0.0f, \
-        p_range, 0.0f, 100.0f, \
+        p_range, 0.0f, 99999.0f, \
         p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_EM_INT_EDIT, IDC_EM_INT_SPIN, 0.1f, \
         p_end, \
     pb_emissive_map_strength, _T("emissiveMapStrength"), TYPE_FLOAT, P_ANIMATABLE, 0, \
         p_default, 1.0f, \
-        p_range, 0.0f, 1.0f, \
+        p_range, 0.0f, 99999.0f, \
         p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_EMMAPSTR_EDIT, IDC_EMMAPSTR_SPIN, 0.01f, \
         p_end, \
     pb_opacity, _T("opacity"), TYPE_FLOAT, P_ANIMATABLE, 0, \
         p_default, 1.0f, \
-        p_range, 0.0f, 1.0f, \
+        p_range, 0.0f, 99999.0f, \
         p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_OPACITY_EDIT, IDC_OPACITY_SPIN, 0.01f, \
         p_end, \
     pb_opacity_map, _T("opacityMap"), TYPE_TEXMAP, 0, 0, \
@@ -339,7 +377,7 @@ ClassDesc2* GetThreeJSSSSMtlDesc() { return &threeJSSSSMtlDesc; }
         p_end, \
     pb_opacity_map_strength, _T("opacityMapStrength"), TYPE_FLOAT, P_ANIMATABLE, 0, \
         p_default, 1.0f, \
-        p_range, 0.0f, 1.0f, \
+        p_range, 0.0f, 99999.0f, \
         p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_OPMAPSTR_EDIT, IDC_OPMAPSTR_SPIN, 0.01f, \
         p_end, \
     pb_lightmap, _T("lightMap"), TYPE_TEXMAP, 0, 0, \
@@ -348,7 +386,7 @@ ClassDesc2* GetThreeJSSSSMtlDesc() { return &threeJSSSSMtlDesc; }
         p_end, \
     pb_lightmap_intensity, _T("lightMapIntensity"), TYPE_FLOAT, P_ANIMATABLE, 0, \
         p_default, 1.0f, \
-        p_range, 0.0f, 10.0f, \
+        p_range, 0.0f, 99999.0f, \
         p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_LM_INT_EDIT, IDC_LM_INT_SPIN, 0.1f, \
         p_end, \
     pb_lightmap_channel, _T("lightMapChannel"), TYPE_INT, 0, 0, \
@@ -362,7 +400,7 @@ ClassDesc2* GetThreeJSSSSMtlDesc() { return &threeJSSSSMtlDesc; }
         p_end, \
     pb_ao_intensity, _T("aoIntensity"), TYPE_FLOAT, P_ANIMATABLE, 0, \
         p_default, 1.0f, \
-        p_range, 0.0f, 5.0f, \
+        p_range, 0.0f, 99999.0f, \
         p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_AO_INT_EDIT, IDC_AO_INT_SPIN, 0.1f, \
         p_end, \
     pb_double_sided, _T("doubleSided"), TYPE_BOOL, 0, 0, \
@@ -371,7 +409,7 @@ ClassDesc2* GetThreeJSSSSMtlDesc() { return &threeJSSSSMtlDesc; }
         p_end, \
     pb_env_intensity, _T("envMapIntensity"), TYPE_FLOAT, P_ANIMATABLE, 0, \
         p_default, 1.0f, \
-        p_range, 0.0f, 10.0f, \
+        p_range, 0.0f, 99999.0f, \
         p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_ENV_INT_EDIT, IDC_ENV_INT_SPIN, 0.1f, \
         p_end
 
@@ -381,7 +419,7 @@ ClassDesc2* GetThreeJSSSSMtlDesc() { return &threeJSSSSMtlDesc; }
         p_end, \
     pb_parallax_scale, _T("parallaxScale"), TYPE_FLOAT, P_ANIMATABLE, 0, \
         p_default, 0.0f, \
-        p_range, -1.0f, 1.0f, \
+        p_range, -99999.0f, 99999.0f, \
         p_end
 
 #define THREEJS_SSS_PARAM_ITEMS \
@@ -395,28 +433,190 @@ ClassDesc2* GetThreeJSSSSMtlDesc() { return &threeJSSSSMtlDesc; }
         p_end, \
     pb_sss_distortion, _T("sssDistortion"), TYPE_FLOAT, P_ANIMATABLE, 0, \
         p_default, 0.1f, \
-        p_range, 0.0f, 4.0f, \
+        p_range, 0.0f, 99999.0f, \
         p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_SSS_DIST_EDIT, IDC_SSS_DIST_SPIN, 0.01f, \
         p_end, \
     pb_sss_ambient, _T("sssAmbient"), TYPE_FLOAT, P_ANIMATABLE, 0, \
         p_default, 0.0f, \
-        p_range, 0.0f, 4.0f, \
+        p_range, 0.0f, 99999.0f, \
         p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_SSS_AMB_EDIT, IDC_SSS_AMB_SPIN, 0.01f, \
         p_end, \
     pb_sss_attenuation, _T("sssAttenuation"), TYPE_FLOAT, P_ANIMATABLE, 0, \
         p_default, 0.1f, \
-        p_range, 0.0f, 4.0f, \
+        p_range, 0.0f, 99999.0f, \
         p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_SSS_ATT_EDIT, IDC_SSS_ATT_SPIN, 0.01f, \
         p_end, \
     pb_sss_power, _T("sssPower"), TYPE_FLOAT, P_ANIMATABLE, 0, \
         p_default, 2.0f, \
-        p_range, 0.0f, 16.0f, \
+        p_range, 0.0f, 99999.0f, \
         p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_SSS_PWR_EDIT, IDC_SSS_PWR_SPIN, 0.05f, \
         p_end, \
     pb_sss_scale, _T("sssScale"), TYPE_FLOAT, P_ANIMATABLE, 0, \
         p_default, 10.0f, \
-        p_range, 0.0f, 100.0f, \
+        p_range, 0.0f, 99999.0f, \
         p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_SSS_SCALE_EDIT, IDC_SSS_SCALE_SPIN, 0.1f, \
+        p_end
+
+#define THREEJS_UTILITY_PARAM_ITEMS \
+    pb_utility_model, _T("utilityModel"), TYPE_INT, 0, 0, \
+        p_default, threejs_utility_lambert, \
+        p_ui, TYPE_INT_COMBOBOX, IDC_UTILITY_MODE, 6, \
+            IDS_UTILITY_MODE_DISTANCE, IDS_UTILITY_MODE_DEPTH, IDS_UTILITY_MODE_LAMBERT, \
+            IDS_UTILITY_MODE_MATCAP, IDS_UTILITY_MODE_NORMAL, IDS_UTILITY_MODE_PHONG, \
+        p_vals, threejs_utility_distance, threejs_utility_depth, threejs_utility_lambert, \
+            threejs_utility_matcap, threejs_utility_normal, threejs_utility_phong, \
+        p_end, \
+    pb_color, _T("color"), TYPE_RGBA, P_ANIMATABLE, 0, \
+        p_default, Color(0.8f, 0.8f, 0.8f), \
+        p_ui, TYPE_COLORSWATCH, IDC_COLOR, \
+        p_end, \
+    pb_color_map, _T("colorMap"), TYPE_TEXMAP, 0, 0, \
+        p_subtexno, kMap_Color, \
+        p_ui, TYPE_TEXMAPBUTTON, IDC_COLOR_MAP, \
+        p_end, \
+    pb_color_map_strength, _T("colorMapStrength"), TYPE_FLOAT, P_ANIMATABLE, 0, \
+        p_default, 1.0f, \
+        p_range, 0.0f, 99999.0f, \
+        p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_MAPSTR_EDIT, IDC_MAPSTR_SPIN, 0.01f, \
+        p_end, \
+    pb_roughness, _T("roughness"), TYPE_FLOAT, P_ANIMATABLE, 0, \
+        p_default, 0.5f, \
+        p_range, 0.0f, 99999.0f, \
+        p_end, \
+    pb_roughness_map, _T("roughnessMap"), TYPE_TEXMAP, 0, 0, \
+        p_subtexno, kMap_Roughness, \
+        p_end, \
+    pb_roughness_map_strength, _T("roughnessMapStrength"), TYPE_FLOAT, P_ANIMATABLE, 0, \
+        p_default, 1.0f, \
+        p_range, 0.0f, 99999.0f, \
+        p_end, \
+    pb_metalness, _T("metalness"), TYPE_FLOAT, P_ANIMATABLE, 0, \
+        p_default, 0.0f, \
+        p_range, 0.0f, 99999.0f, \
+        p_end, \
+    pb_metalness_map, _T("metalnessMap"), TYPE_TEXMAP, 0, 0, \
+        p_subtexno, kMap_Metalness, \
+        p_end, \
+    pb_metalness_map_strength, _T("metalnessMapStrength"), TYPE_FLOAT, P_ANIMATABLE, 0, \
+        p_default, 1.0f, \
+        p_range, 0.0f, 99999.0f, \
+        p_end, \
+    pb_normal_map, _T("normalMap"), TYPE_TEXMAP, 0, 0, \
+        p_subtexno, kMap_Normal, \
+        p_ui, TYPE_TEXMAPBUTTON, IDC_NORMAL_MAP, \
+        p_end, \
+    pb_normal_scale, _T("normalScale"), TYPE_FLOAT, P_ANIMATABLE, 0, \
+        p_default, 1.0f, \
+        p_range, 0.0f, 99999.0f, \
+        p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_NORMSCL_EDIT, IDC_NORMSCL_SPIN, 0.01f, \
+        p_end, \
+    pb_bump_map, _T("bumpMap"), TYPE_TEXMAP, 0, 0, \
+        p_subtexno, kMap_Bump, \
+        p_ui, TYPE_TEXMAPBUTTON, IDC_BUMP_MAP, \
+        p_end, \
+    pb_bump_scale, _T("bumpScale"), TYPE_FLOAT, P_ANIMATABLE, 0, \
+        p_default, 1.0f, \
+        p_range, 0.0f, 99999.0f, \
+        p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_BUMP_EDIT, IDC_BUMP_SPIN, 0.01f, \
+        p_end, \
+    pb_displacement_map, _T("displacementMap"), TYPE_TEXMAP, 0, 0, \
+        p_subtexno, kMap_Displacement, \
+        p_ui, TYPE_TEXMAPBUTTON, IDC_DISP_MAP, \
+        p_end, \
+    pb_displacement_scale, _T("displacementScale"), TYPE_FLOAT, P_ANIMATABLE, 0, \
+        p_default, 0.0f, \
+        p_range, -1000.0f, 1000.0f, \
+        p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_DISP_EDIT, IDC_DISP_SPIN, 0.01f, \
+        p_end, \
+    pb_displacement_bias, _T("displacementBias"), TYPE_FLOAT, P_ANIMATABLE, 0, \
+        p_default, 0.0f, \
+        p_range, -1000.0f, 1000.0f, \
+        p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_DISP_BIAS_EDIT, IDC_DISP_BIAS_SPIN, 0.01f, \
+        p_end, \
+    pb_emissive_color, _T("emissiveColor"), TYPE_RGBA, P_ANIMATABLE, 0, \
+        p_default, Color(0.0f, 0.0f, 0.0f), \
+        p_ui, TYPE_COLORSWATCH, IDC_EM_COLOR, \
+        p_end, \
+    pb_emissive_map, _T("emissiveMap"), TYPE_TEXMAP, 0, 0, \
+        p_subtexno, kMap_Emissive, \
+        p_ui, TYPE_TEXMAPBUTTON, IDC_EM_MAP, \
+        p_end, \
+    pb_emissive_intensity, _T("emissiveIntensity"), TYPE_FLOAT, P_ANIMATABLE, 0, \
+        p_default, 0.0f, \
+        p_range, 0.0f, 99999.0f, \
+        p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_EM_INT_EDIT, IDC_EM_INT_SPIN, 0.1f, \
+        p_end, \
+    pb_emissive_map_strength, _T("emissiveMapStrength"), TYPE_FLOAT, P_ANIMATABLE, 0, \
+        p_default, 1.0f, \
+        p_range, 0.0f, 99999.0f, \
+        p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_EMMAPSTR_EDIT, IDC_EMMAPSTR_SPIN, 0.01f, \
+        p_end, \
+    pb_opacity, _T("opacity"), TYPE_FLOAT, P_ANIMATABLE, 0, \
+        p_default, 1.0f, \
+        p_range, 0.0f, 99999.0f, \
+        p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_OPACITY_EDIT, IDC_OPACITY_SPIN, 0.01f, \
+        p_end, \
+    pb_opacity_map, _T("opacityMap"), TYPE_TEXMAP, 0, 0, \
+        p_subtexno, kMap_Opacity, \
+        p_ui, TYPE_TEXMAPBUTTON, IDC_OPACITY_MAP, \
+        p_end, \
+    pb_opacity_map_strength, _T("opacityMapStrength"), TYPE_FLOAT, P_ANIMATABLE, 0, \
+        p_default, 1.0f, \
+        p_range, 0.0f, 99999.0f, \
+        p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_OPMAPSTR_EDIT, IDC_OPMAPSTR_SPIN, 0.01f, \
+        p_end, \
+    pb_lightmap, _T("lightMap"), TYPE_TEXMAP, 0, 0, \
+        p_subtexno, kMap_Lightmap, \
+        p_ui, TYPE_TEXMAPBUTTON, IDC_LM_MAP, \
+        p_end, \
+    pb_lightmap_intensity, _T("lightMapIntensity"), TYPE_FLOAT, P_ANIMATABLE, 0, \
+        p_default, 1.0f, \
+        p_range, 0.0f, 99999.0f, \
+        p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_LM_INT_EDIT, IDC_LM_INT_SPIN, 0.1f, \
+        p_end, \
+    pb_lightmap_channel, _T("lightMapChannel"), TYPE_INT, 0, 0, \
+        p_default, 2, \
+        p_range, 1, 8, \
+        p_ui, TYPE_SPINNER, EDITTYPE_INT, IDC_LM_CH_EDIT, IDC_LM_CH_SPIN, 1.0f, \
+        p_end, \
+    pb_ao_map, _T("aoMap"), TYPE_TEXMAP, 0, 0, \
+        p_subtexno, kMap_AO, \
+        p_ui, TYPE_TEXMAPBUTTON, IDC_AO_MAP, \
+        p_end, \
+    pb_ao_intensity, _T("aoIntensity"), TYPE_FLOAT, P_ANIMATABLE, 0, \
+        p_default, 1.0f, \
+        p_range, 0.0f, 99999.0f, \
+        p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_AO_INT_EDIT, IDC_AO_INT_SPIN, 0.1f, \
+        p_end, \
+    pb_matcap_map, _T("matcapMap"), TYPE_TEXMAP, 0, 0, \
+        p_subtexno, kMap_Matcap, \
+        p_ui, TYPE_TEXMAPBUTTON, IDC_UTILITY_MATCAP_MAP, \
+        p_end, \
+    pb_specular_color, _T("specularColor"), TYPE_RGBA, P_ANIMATABLE, 0, \
+        p_default, Color(0.0666667f, 0.0666667f, 0.0666667f), \
+        p_ui, TYPE_COLORSWATCH, IDC_UTILITY_SPECULAR, \
+        p_end, \
+    pb_shininess, _T("shininess"), TYPE_FLOAT, P_ANIMATABLE, 0, \
+        p_default, 30.0f, \
+        p_range, 0.0f, 1000.0f, \
+        p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_UTILITY_SHINE_EDIT, IDC_UTILITY_SHINE_SPIN, 1.0f, \
+        p_end, \
+    pb_flat_shading, _T("flatShading"), TYPE_BOOL, 0, 0, \
+        p_default, FALSE, \
+        p_ui, TYPE_SINGLECHEKBOX, IDC_UTILITY_FLAT, \
+        p_end, \
+    pb_wireframe, _T("wireframe"), TYPE_BOOL, 0, 0, \
+        p_default, FALSE, \
+        p_ui, TYPE_SINGLECHEKBOX, IDC_UTILITY_WIREFRAME, \
+        p_end, \
+    pb_double_sided, _T("doubleSided"), TYPE_BOOL, 0, 0, \
+        p_default, TRUE, \
+        p_ui, TYPE_SINGLECHEKBOX, IDC_DOUBLE_SIDED, \
+        p_end, \
+    pb_env_intensity, _T("envMapIntensity"), TYPE_FLOAT, P_ANIMATABLE, 0, \
+        p_default, 1.0f, \
+        p_range, 0.0f, 99999.0f, \
+        p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_ENV_INT_EDIT, IDC_ENV_INT_SPIN, 0.1f, \
         p_end
 
 static ParamBlockDesc2 threejs_pb_desc(
@@ -456,5 +656,18 @@ static ParamBlockDesc2 threejs_sss_pb_desc(
     THREEJS_COMMON_PARAM_ITEMS,
     THREEJS_HIDDEN_LEGACY_PARAM_ITEMS,
     THREEJS_SSS_PARAM_ITEMS,
+    p_end
+);
+
+static ParamBlockDesc2 threejs_utility_pb_desc(
+    threejs_params,
+    _T("ThreeJS Utility Parameters"),
+    IDS_UTILITY_PARAMS,
+    &threeJSUtilityMtlDesc,
+    P_AUTO_CONSTRUCT + P_AUTO_UI,
+    0,
+    IDD_THREEJS_UTILITY_MTL, IDS_UTILITY_PARAMS, 0, 0, nullptr,
+    THREEJS_UTILITY_PARAM_ITEMS,
+    THREEJS_HIDDEN_LEGACY_PARAM_ITEMS,
     p_end
 );

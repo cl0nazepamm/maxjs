@@ -560,13 +560,111 @@
             material.thicknessScaleNode = tslFloat(md.sssScale ?? 10.0);
         }
 
+        const utilityMaterialModels = new Set([
+            'MeshDistanceMaterial',
+            'MeshDepthMaterial',
+            'MeshLambertMaterial',
+            'MeshMatcapMaterial',
+            'MeshNormalMaterial',
+            'MeshPhongMaterial',
+        ]);
+
+        function createUtilityMaterial(runtimeModelName, md) {
+            let material;
+            switch (runtimeModelName) {
+            case 'MeshDistanceMaterial':
+                material = new THREE.MeshDistanceMaterial();
+                break;
+            case 'MeshDepthMaterial':
+                material = new THREE.MeshDepthMaterial();
+                break;
+            case 'MeshMatcapMaterial':
+                material = new THREE.MeshMatcapMaterial();
+                break;
+            case 'MeshNormalMaterial':
+                material = new THREE.MeshNormalMaterial();
+                break;
+            case 'MeshPhongMaterial':
+                material = new THREE.MeshPhongMaterial();
+                break;
+            case 'MeshLambertMaterial':
+            default:
+                material = new THREE.MeshLambertMaterial();
+                break;
+            }
+
+            material.side = md.side === 0 ? THREE.FrontSide : THREE.DoubleSide;
+            material.opacity = md.opacity ?? 1.0;
+            material.transparent = material.opacity < 0.999;
+
+            if ('color' in material && Array.isArray(md.color)) {
+                material.color.setRGB(md.color[0], md.color[1], md.color[2]);
+            }
+            if ('emissive' in material) {
+                if (Array.isArray(md.em)) {
+                    material.emissive.setRGB(md.em[0], md.em[1], md.em[2]);
+                }
+                material.emissiveIntensity = md.emI ?? material.emissiveIntensity ?? 1.0;
+            }
+            if ('envMapIntensity' in material && md.envI != null) material.envMapIntensity = md.envI;
+            if ('flatShading' in material) material.flatShading = !!md.flat;
+            if ('wireframe' in material) material.wireframe = !!md.wireframe;
+            if ('shininess' in material && md.shininess != null) material.shininess = md.shininess;
+            if ('specular' in material && Array.isArray(md.spec)) {
+                material.specular.setRGB(md.spec[0], md.spec[1], md.spec[2]);
+            }
+            if (md.normScl != null && 'normalScale' in material) {
+                material.normalScale = new THREE.Vector2(md.normScl, md.normScl);
+            }
+            if (md.bumpS != null && 'bumpScale' in material) material.bumpScale = md.bumpS;
+            if (md.dispS != null && 'displacementScale' in material) material.displacementScale = md.dispS;
+            if (md.dispB != null && 'displacementBias' in material) material.displacementBias = md.dispB;
+            if (md.aoI != null && 'aoMapIntensity' in material) material.aoMapIntensity = md.aoI;
+            if (md.lmI != null && 'lightMapIntensity' in material) material.lightMapIntensity = md.lmI;
+
+            if (md.map && 'map' in material) {
+                material.map = loadTexture(md.map, THREE.SRGBColorSpace, md.mapXf, fallbackWhiteTexture);
+            }
+            if (md.normMap && 'normalMap' in material) {
+                material.normalMap = loadTexture(md.normMap, THREE.LinearSRGBColorSpace, md.normMapXf, fallbackFlatNormalTexture);
+            }
+            if (md.bumpMap && 'bumpMap' in material) {
+                material.bumpMap = loadTexture(md.bumpMap, THREE.NoColorSpace, md.bumpMapXf, fallbackHeightTexture);
+            }
+            if (md.dispMap && 'displacementMap' in material) {
+                material.displacementMap = loadTexture(md.dispMap, THREE.NoColorSpace, md.dispMapXf, fallbackHeightTexture);
+            }
+            if (md.aoMap && 'aoMap' in material) {
+                material.aoMap = loadTexture(md.aoMap, THREE.LinearSRGBColorSpace, md.aoMapXf, fallbackWhiteTexture);
+            }
+            if (md.emMap && 'emissiveMap' in material) {
+                material.emissiveMap = loadTexture(md.emMap, THREE.SRGBColorSpace, md.emMapXf, fallbackWhiteTexture);
+            }
+            if (md.opMap && 'alphaMap' in material) {
+                material.alphaMap = loadTexture(md.opMap, THREE.LinearSRGBColorSpace, md.opMapXf, fallbackWhiteTexture);
+                material.transparent = true;
+            }
+            if (md.lmMap && 'lightMap' in material) {
+                material.lightMap = loadTexture(md.lmMap, THREE.LinearSRGBColorSpace, md.lmMapXf, fallbackWhiteTexture);
+            }
+            if (md.matcapMap && 'matcap' in material) {
+                material.matcap = loadTexture(md.matcapMap, THREE.SRGBColorSpace, md.matcapMapXf, fallbackWhiteTexture);
+            }
+
+            rememberMaterialEmissiveBase(material);
+            material.needsUpdate = true;
+            return material;
+        }
+
         function createMaterial(md) {
             const requestedModelName = md.model || 'MeshStandardMaterial';
+            const wantsUtilityMaterial = utilityMaterialModels.has(requestedModelName);
             const wantsToonMaterial = requestedModelName === 'MeshToonMaterial';
             const wantsSSSMaterial = requestedModelName === 'MeshSSSNodeMaterial';
             const wantsAdvancedMaterial =
                 requestedModelName === 'MeshPhysicalMaterial' ||
                 requestedModelName === 'MeshStandardNodeMaterial';
+            const hasUtilityCtor = wantsUtilityMaterial && typeof THREE[requestedModelName] === 'function';
             const canUseToonMaterial = wantsToonMaterial && typeof THREE.MeshToonMaterial === 'function';
             const canUseSSSMaterial =
                 wantsSSSMaterial &&
@@ -574,100 +672,108 @@
                 typeof tslColor === 'function' &&
                 typeof tslFloat === 'function' &&
                 typeof tslTexture === 'function';
-            const runtimeModelName = canUseToonMaterial
+            const runtimeModelName = wantsUtilityMaterial
+                ? (hasUtilityCtor ? requestedModelName : 'MeshLambertMaterial')
+                : (canUseToonMaterial
                 ? 'MeshToonMaterial'
                 : (canUseSSSMaterial
                     ? 'MeshSSSNodeMaterial'
-                    : ((wantsAdvancedMaterial || wantsSSSMaterial) ? 'MeshPhysicalMaterial' : 'MeshStandardMaterial'));
+                    : ((wantsAdvancedMaterial || wantsSSSMaterial) ? 'MeshPhysicalMaterial' : 'MeshStandardMaterial')));
             const key = JSON.stringify([requestedModelName, runtimeModelName, md]);
             let template = materialCache.get(key);
 
             if (!template) {
-                const params = {
-                    color: new THREE.Color(md.color[0], md.color[1], md.color[2]),
-                    side: md.side === 0 ? THREE.FrontSide : THREE.DoubleSide,
-                };
-
-                if (!wantsToonMaterial) {
-                    params.roughness = md.rough ?? 0.5;
-                    params.metalness = md.metal ?? 0.0;
-                    params.envMapIntensity = md.envI ?? 1.0;
-                }
-
-                if (md.opacity != null && md.opacity < 0.999) {
-                    params.transparent = true;
-                    params.opacity = md.opacity;
-                }
-
-                const hasEmissiveColor = Array.isArray(md.em) && md.em.length === 3 &&
-                    md.em.some(value => Math.abs(value) > 1.0e-5);
-
-                if (md.em && md.emI > 0) {
-                    params.emissive = new THREE.Color(md.em[0], md.em[1], md.em[2]);
-                    params.emissiveIntensity = md.emI;
-                }
-
-                if (md.emMap) {
-                    if (!params.emissive) {
-                        params.emissive = hasEmissiveColor
-                            ? new THREE.Color(md.em[0], md.em[1], md.em[2])
-                            : new THREE.Color(1, 1, 1);
-                    }
-                    if (params.emissiveIntensity == null || params.emissiveIntensity <= 0) {
-                        params.emissiveIntensity = md.emMapS ?? 1.0;
-                    }
-                }
-
-                if (md.normScl != null) params.normalScale = new THREE.Vector2(md.normScl, md.normScl);
-                if (md.bumpS != null) params.bumpScale = md.bumpS;
-                if (md.dispS != null) params.displacementScale = md.dispS;
-                if (md.dispB != null) params.displacementBias = md.dispB;
-                if (md.aoI != null) params.aoMapIntensity = md.aoI;
-
-                if (canUseToonMaterial) {
-                    template = new THREE.MeshToonMaterial(params);
-                } else if (canUseSSSMaterial) {
-                    template = new THREE.MeshSSSNodeMaterial(params);
-                } else if (wantsAdvancedMaterial) {
-                    template = new THREE.MeshPhysicalMaterial(params);
-                } else if (wantsSSSMaterial) {
-                    template = new THREE.MeshPhysicalMaterial(params);
+                if (wantsUtilityMaterial) {
+                    template = createUtilityMaterial(runtimeModelName, md);
                 } else {
-                    template = new THREE.MeshStandardMaterial(params);
+                    const params = {
+                        color: new THREE.Color(md.color[0], md.color[1], md.color[2]),
+                        side: md.side === 0 ? THREE.FrontSide : THREE.DoubleSide,
+                    };
+
+                    if (!wantsToonMaterial) {
+                        params.roughness = md.rough ?? 0.5;
+                        params.metalness = md.metal ?? 0.0;
+                        params.envMapIntensity = md.envI ?? 1.0;
+                    }
+
+                    if (md.opacity != null && md.opacity < 0.999) {
+                        params.transparent = true;
+                        params.opacity = md.opacity;
+                    }
+
+                    const hasEmissiveColor = Array.isArray(md.em) && md.em.length === 3 &&
+                        md.em.some(value => Math.abs(value) > 1.0e-5);
+
+                    if (md.em && md.emI > 0) {
+                        params.emissive = new THREE.Color(md.em[0], md.em[1], md.em[2]);
+                        params.emissiveIntensity = md.emI;
+                    }
+
+                    if (md.emMap) {
+                        if (!params.emissive) {
+                            params.emissive = hasEmissiveColor
+                                ? new THREE.Color(md.em[0], md.em[1], md.em[2])
+                                : new THREE.Color(1, 1, 1);
+                        }
+                        if (params.emissiveIntensity == null || params.emissiveIntensity <= 0) {
+                            params.emissiveIntensity = md.emMapS ?? 1.0;
+                        }
+                    }
+
+                    if (md.normScl != null) params.normalScale = new THREE.Vector2(md.normScl, md.normScl);
+                    if (md.bumpS != null) params.bumpScale = md.bumpS;
+                    if (md.dispS != null) params.displacementScale = md.dispS;
+                    if (md.dispB != null) params.displacementBias = md.dispB;
+                    if (md.aoI != null) params.aoMapIntensity = md.aoI;
+
+                    if (canUseToonMaterial) {
+                        template = new THREE.MeshToonMaterial(params);
+                    } else if (canUseSSSMaterial) {
+                        template = new THREE.MeshSSSNodeMaterial(params);
+                    } else if (wantsAdvancedMaterial) {
+                        template = new THREE.MeshPhysicalMaterial(params);
+                    } else if (wantsSSSMaterial) {
+                        template = new THREE.MeshPhysicalMaterial(params);
+                    } else {
+                        template = new THREE.MeshStandardMaterial(params);
+                    }
+
+                    // Textures
+                    if (md.map) template.map = loadTexture(md.map, THREE.SRGBColorSpace, md.mapXf, fallbackWhiteTexture);
+                    if (!wantsToonMaterial && md.roughMap) template.roughnessMap = loadTexture(md.roughMap, THREE.LinearSRGBColorSpace, md.roughMapXf, fallbackWhiteTexture);
+                    if (!wantsToonMaterial && md.metalMap) template.metalnessMap = loadTexture(md.metalMap, THREE.LinearSRGBColorSpace, md.metalMapXf, fallbackWhiteTexture);
+                    if (md.normMap) template.normalMap = loadTexture(md.normMap, THREE.LinearSRGBColorSpace, md.normMapXf, fallbackFlatNormalTexture);
+                    if (md.bumpMap) template.bumpMap = loadTexture(md.bumpMap, THREE.NoColorSpace, md.bumpMapXf, fallbackHeightTexture);
+                    if (md.dispMap) template.displacementMap = loadTexture(md.dispMap, THREE.NoColorSpace, md.dispMapXf, fallbackHeightTexture);
+                    if (md.aoMap) template.aoMap = loadTexture(md.aoMap, THREE.LinearSRGBColorSpace, md.aoMapXf, fallbackWhiteTexture);
+                    if (md.emMap) template.emissiveMap = loadTexture(md.emMap, THREE.SRGBColorSpace, md.emMapXf, fallbackWhiteTexture);
+                    if (md.opMap) { template.alphaMap = loadTexture(md.opMap, THREE.LinearSRGBColorSpace, md.opMapXf, fallbackWhiteTexture); template.transparent = true; }
+                    if (canUseToonMaterial) {
+                        template.gradientMap = md.gradMap
+                            ? configureGradientTexture(loadTexture(md.gradMap, THREE.NoColorSpace, null, fallbackToonGradientTexture))
+                            : fallbackToonGradientTexture;
+                    }
+
+                    // Lightmap
+                    if (md.lmMap) {
+                        template.lightMap = loadTexture(md.lmMap, THREE.LinearSRGBColorSpace, md.lmMapXf, fallbackWhiteTexture);
+                        template.lightMapIntensity = md.lmI ?? 1.0;
+                    }
+
+                    if (canUseSSSMaterial) {
+                        applySSSMaterialNodes(template, md);
+                    }
                 }
                 template.userData ??= {};
                 template.userData.maxjsRequestedMaterialModel = requestedModelName;
                 template.userData.maxjsMaterialModel = runtimeModelName;
+                template.userData.maxjsUtilityMaterialFallback =
+                    wantsUtilityMaterial && !hasUtilityCtor;
                 template.userData.maxjsToonMaterialFallback =
                     wantsToonMaterial && !canUseToonMaterial;
                 template.userData.maxjsSSSMaterialFallback =
                     wantsSSSMaterial && !canUseSSSMaterial;
-
-                // Textures
-                if (md.map) template.map = loadTexture(md.map, THREE.SRGBColorSpace, md.mapXf, fallbackWhiteTexture);
-                if (!wantsToonMaterial && md.roughMap) template.roughnessMap = loadTexture(md.roughMap, THREE.LinearSRGBColorSpace, md.roughMapXf, fallbackWhiteTexture);
-                if (!wantsToonMaterial && md.metalMap) template.metalnessMap = loadTexture(md.metalMap, THREE.LinearSRGBColorSpace, md.metalMapXf, fallbackWhiteTexture);
-                if (md.normMap) template.normalMap = loadTexture(md.normMap, THREE.LinearSRGBColorSpace, md.normMapXf, fallbackFlatNormalTexture);
-                if (md.bumpMap) template.bumpMap = loadTexture(md.bumpMap, THREE.NoColorSpace, md.bumpMapXf, fallbackHeightTexture);
-                if (md.dispMap) template.displacementMap = loadTexture(md.dispMap, THREE.NoColorSpace, md.dispMapXf, fallbackHeightTexture);
-                if (md.aoMap) template.aoMap = loadTexture(md.aoMap, THREE.LinearSRGBColorSpace, md.aoMapXf, fallbackWhiteTexture);
-                if (md.emMap) template.emissiveMap = loadTexture(md.emMap, THREE.SRGBColorSpace, md.emMapXf, fallbackWhiteTexture);
-                if (md.opMap) { template.alphaMap = loadTexture(md.opMap, THREE.LinearSRGBColorSpace, md.opMapXf, fallbackWhiteTexture); template.transparent = true; }
-                if (canUseToonMaterial) {
-                    template.gradientMap = md.gradMap
-                        ? configureGradientTexture(loadTexture(md.gradMap, THREE.NoColorSpace, null, fallbackToonGradientTexture))
-                        : fallbackToonGradientTexture;
-                }
-
-                // Lightmap
-                if (md.lmMap) {
-                    template.lightMap = loadTexture(md.lmMap, THREE.LinearSRGBColorSpace, md.lmMapXf, fallbackWhiteTexture);
-                    template.lightMapIntensity = md.lmI ?? 1.0;
-                }
-
-                if (canUseSSSMaterial) {
-                    applySSSMaterialNodes(template, md);
-                }
 
                 rememberMaterialEmissiveBase(template);
                 template.needsUpdate = true;

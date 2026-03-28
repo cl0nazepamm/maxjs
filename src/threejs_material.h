@@ -6,6 +6,7 @@
 #define THREEJS_MTL_CLASS_ID Class_ID(0x7F3A9B10, 0x4E2D8C10)
 #define THREEJS_ADV_MTL_CLASS_ID Class_ID(0x7F3A9B11, 0x4E2D8C10)
 #define THREEJS_SSS_MTL_CLASS_ID Class_ID(0x7F3A9B12, 0x4E2D8C10)
+#define THREEJS_UTILITY_MTL_CLASS_ID Class_ID(0x7F3A9B13, 0x4E2D8C10)
 
 enum { threejs_params };
 
@@ -34,6 +35,22 @@ enum ThreeJSParamIDs {
     pb_sss_color, pb_sss_color_map,
     pb_sss_distortion, pb_sss_ambient, pb_sss_attenuation,
     pb_sss_power, pb_sss_scale,
+    // Utility stack
+    pb_utility_model,
+    pb_matcap_map,
+    pb_specular_color,
+    pb_shininess,
+    pb_flat_shading,
+    pb_wireframe,
+};
+
+enum ThreeJSUtilityModel {
+    threejs_utility_distance = 0,
+    threejs_utility_depth,
+    threejs_utility_lambert,
+    threejs_utility_matcap,
+    threejs_utility_normal,
+    threejs_utility_phong,
 };
 
 // Texmap slot indices (for SubTexmap)
@@ -50,9 +67,11 @@ enum ThreeJSMapSlots {
     kMap_Lightmap,
     kMap_AO,
     kMap_SSSColor,
+    kMap_Matcap,
     kNumMaps
 };
 
 ClassDesc2* GetThreeJSMtlDesc();
 ClassDesc2* GetThreeJSAdvMtlDesc();
 ClassDesc2* GetThreeJSSSSMtlDesc();
+ClassDesc2* GetThreeJSUtilityMtlDesc();

@@ -327,12 +327,16 @@ struct MaxJSPBR {
     float sssAttenuation = 0.1f;
     float sssPower = 2.0f;
     float sssScale = 10.0f;
+    float specular[3] = {0.0666667f, 0.0666667f, 0.0666667f};
+    float shininess = 30.0f;
+    bool  flatShading = false;
+    bool  wireframe = false;
     std::wstring colorMap, gradientMap, roughnessMap, metalnessMap, normalMap;
-    std::wstring bumpMap, displacementMap, parallaxMap, sssColorMap;
+    std::wstring bumpMap, displacementMap, parallaxMap, sssColorMap, matcapMap;
     std::wstring aoMap, emissionMap, lightmapFile, opacityMap;
     TexTransform colorMapTransform, gradientMapTransform, roughnessMapTransform, metalnessMapTransform, normalMapTransform;
     TexTransform bumpMapTransform, displacementMapTransform, parallaxMapTransform, sssColorMapTransform;
-    TexTransform aoMapTransform, emissionMapTransform, lightmapTransform, opacityMapTransform;
+    TexTransform aoMapTransform, emissionMapTransform, lightmapTransform, opacityMapTransform, matcapMapTransform;
     std::wstring mtlName;
     std::wstring materialModel = L"MeshStandardMaterial";
     float parallaxScale = 0.0f;
@@ -350,7 +354,30 @@ static std::wstring FindPBString(Texmap* map, const MCHAR* name);
 static bool IsThreeJSMaterialClass(const Class_ID& cid) {
     return cid == THREEJS_MTL_CLASS_ID ||
            cid == THREEJS_ADV_MTL_CLASS_ID ||
-           cid == THREEJS_SSS_MTL_CLASS_ID;
+           cid == THREEJS_SSS_MTL_CLASS_ID ||
+           cid == THREEJS_UTILITY_MTL_CLASS_ID;
+}
+
+static std::wstring GetUtilityMaterialModelName(int utilityModel) {
+    switch (utilityModel) {
+        case threejs_utility_distance: return L"MeshDistanceMaterial";
+        case threejs_utility_depth: return L"MeshDepthMaterial";
+        case threejs_utility_matcap: return L"MeshMatcapMaterial";
+        case threejs_utility_normal: return L"MeshNormalMaterial";
+        case threejs_utility_phong: return L"MeshPhongMaterial";
+        case threejs_utility_lambert:
+        default:
+            return L"MeshLambertMaterial";
+    }
+}
+
+static bool IsUtilityMaterialModel(const std::wstring& materialModel) {
+    return materialModel == L"MeshDistanceMaterial" ||
+           materialModel == L"MeshDepthMaterial" ||
+           materialModel == L"MeshLambertMaterial" ||
+           materialModel == L"MeshMatcapMaterial" ||
+           materialModel == L"MeshNormalMaterial" ||
+           materialModel == L"MeshPhongMaterial";
 }
 
 static bool IsSupportedMaterial(Mtl* mtl) {
@@ -495,6 +522,8 @@ static void ExtractThreeJSMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
         d.materialModel = L"MeshPhysicalMaterial";
     } else if (cid == THREEJS_SSS_MTL_CLASS_ID) {
         d.materialModel = L"MeshSSSNodeMaterial";
+    } else if (cid == THREEJS_UTILITY_MTL_CLASS_ID) {
+        d.materialModel = GetUtilityMaterialModelName(pb->GetInt(pb_utility_model, t));
     } else {
         d.materialModel = L"MeshStandardMaterial";
     }
@@ -533,6 +562,12 @@ static void ExtractThreeJSMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
         d.sssAttenuation = pb->GetFloat(pb_sss_attenuation, t);
         d.sssPower = pb->GetFloat(pb_sss_power, t);
         d.sssScale = pb->GetFloat(pb_sss_scale, t);
+    } else if (cid == THREEJS_UTILITY_MTL_CLASS_ID) {
+        Color spec = pb->GetColor(pb_specular_color, t);
+        d.specular[0] = spec.r; d.specular[1] = spec.g; d.specular[2] = spec.b;
+        d.shininess = pb->GetFloat(pb_shininess, t);
+        d.flatShading = pb->GetInt(pb_flat_shading, t) != 0;
+        d.wireframe = pb->GetInt(pb_wireframe, t) != 0;
     }
 
     auto readMap = [&](ParamID pid, std::wstring& outPath, MaxJSPBR::TexTransform& outXf) {
@@ -554,6 +589,8 @@ static void ExtractThreeJSMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
     readMap(pb_ao_map, d.aoMap, d.aoMapTransform);
     if (cid == THREEJS_SSS_MTL_CLASS_ID) {
         readMap(pb_sss_color_map, d.sssColorMap, d.sssColorMapTransform);
+    } else if (cid == THREEJS_UTILITY_MTL_CLASS_ID) {
+        readMap(pb_matcap_map, d.matcapMap, d.matcapMapTransform);
     }
 }
 
@@ -1975,6 +2012,7 @@ public:
         writeMap(L"parallaxMap", L"parallaxMapXf", pbr.parallaxMap, pbr.parallaxMapTransform);
         writeMap(L"aoMap", L"aoMapXf", pbr.aoMap, pbr.aoMapTransform);
         writeMap(L"sssMap", L"sssMapXf", pbr.sssColorMap, pbr.sssColorMapTransform);
+        writeMap(L"matcapMap", L"matcapMapXf", pbr.matcapMap, pbr.matcapMapTransform);
         writeMap(L"emMap", L"emMapXf", pbr.emissionMap, pbr.emissionMapTransform);
         writeMap(L"lmMap", L"lmMapXf", pbr.lightmapFile, pbr.lightmapTransform);
         writeMap(L"opMap", L"opMapXf", pbr.opacityMap, pbr.opacityMapTransform);
@@ -2043,6 +2081,17 @@ public:
             WriteFloatValue(ss, pbr.sssPower, 2.0f);
             ss << L",\"sssScale\":";
             WriteFloatValue(ss, pbr.sssScale, 10.0f);
+        } else if (IsUtilityMaterialModel(pbr.materialModel)) {
+            if (pbr.materialModel == L"MeshPhongMaterial") {
+                ss << L",\"spec\":[";
+                WriteFloatValue(ss, pbr.specular[0], 0.0666667f); ss << L',';
+                WriteFloatValue(ss, pbr.specular[1], 0.0666667f); ss << L',';
+                WriteFloatValue(ss, pbr.specular[2], 0.0666667f); ss << L']';
+                ss << L",\"shininess\":";
+                WriteFloatValue(ss, pbr.shininess, 30.0f);
+            }
+            if (pbr.flatShading) ss << L",\"flat\":true";
+            if (pbr.wireframe) ss << L",\"wireframe\":true";
         }
         if (pbr.emIntensity > 0) {
             ss << L",\"em\":[";
@@ -2928,22 +2977,23 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, ULONG fdwReason, LPVOID) {
 }
 
 __declspec(dllexport) const TCHAR* LibDescription()   { return MAXJS_NAME; }
-__declspec(dllexport) int LibNumberClasses()           { return 13; }
+__declspec(dllexport) int LibNumberClasses()           { return 14; }
 __declspec(dllexport) ClassDesc* LibClassDesc(int i) {
     switch (i) {
         case 0: return &maxJSDesc;
         case 1: return GetThreeJSMtlDesc();
         case 2: return GetThreeJSAdvMtlDesc();
         case 3: return GetThreeJSSSSMtlDesc();
-        case 4: return GetThreeJSRendererDesc();
-        case 5: return GetThreeJSLightLegacyDesc();
-        case 6: return GetThreeJSDirectionalLightDesc();
-        case 7: return GetThreeJSPointLightDesc();
-        case 8: return GetThreeJSSpotLightDesc();
-        case 9: return GetThreeJSRectAreaLightDesc();
-        case 10: return GetThreeJSHemisphereLightDesc();
-        case 11: return GetThreeJSAmbientLightDesc();
-        case 12: return GetThreeJSToonDesc();
+        case 4: return GetThreeJSUtilityMtlDesc();
+        case 5: return GetThreeJSRendererDesc();
+        case 6: return GetThreeJSLightLegacyDesc();
+        case 7: return GetThreeJSDirectionalLightDesc();
+        case 8: return GetThreeJSPointLightDesc();
+        case 9: return GetThreeJSSpotLightDesc();
+        case 10: return GetThreeJSRectAreaLightDesc();
+        case 11: return GetThreeJSHemisphereLightDesc();
+        case 12: return GetThreeJSAmbientLightDesc();
+        case 13: return GetThreeJSToonDesc();
         default: return nullptr;
     }
 }

@@ -8,10 +8,21 @@
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { overflow: hidden; background: #1a1a2e; }
         canvas { display: block; }
+        #viewport {
+            position: fixed;
+            inset: 0;
+            overflow: hidden;
+        }
+        #viewport > canvas,
+        #viewport > .ascii-overlay {
+            position: absolute;
+            inset: 0;
+        }
         #hud {
             position: absolute; top: 10px; left: 10px;
             color: #999; font: 13px 'Segoe UI', sans-serif;
             pointer-events: none;
+            z-index: 20;
         }
         #info {
             background: rgba(0,0,0,0.6); padding: 6px 10px;
@@ -25,9 +36,90 @@
         }
         #controls button.active { background: rgba(60,60,120,0.9); color: #ddd; border-color: #668; }
         #controls button:hover { background: rgba(60,60,100,0.9); color: #ccc; }
+        #postfxSidebar {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            width: 320px;
+            max-height: calc(100vh - 20px);
+            overflow: auto;
+            padding: 14px;
+            border: 1px solid rgba(140,150,190,0.18);
+            border-radius: 12px;
+            background: rgba(12, 14, 24, 0.82);
+            backdrop-filter: blur(18px);
+            color: #d8deff;
+            font: 12px 'Segoe UI', sans-serif;
+            z-index: 30;
+        }
+        .fx-sidebar-title {
+            font-size: 18px;
+            font-weight: 700;
+            letter-spacing: 0.04em;
+            margin-bottom: 8px;
+        }
+        .fx-section {
+            margin-top: 14px;
+            padding-top: 12px;
+            border-top: 1px solid rgba(160, 170, 210, 0.12);
+        }
+        .fx-section-header {
+            font-size: 11px;
+            font-weight: 700;
+            letter-spacing: 0.1em;
+            color: #91a0d8;
+            text-transform: uppercase;
+            margin-bottom: 10px;
+        }
+        .fx-note {
+            color: #98a0c8;
+            line-height: 1.4;
+            margin-bottom: 10px;
+        }
+        .fx-row {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            margin-bottom: 10px;
+        }
+        .fx-toggle {
+            flex-direction: row;
+            align-items: center;
+            gap: 10px;
+        }
+        .fx-range-top,
+        .fx-select {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 10px;
+        }
+        .fx-row input[type="checkbox"] {
+            width: 14px;
+            height: 14px;
+            accent-color: #7dc4ff;
+        }
+        .fx-row input[type="range"] {
+            width: 100%;
+            accent-color: #7dc4ff;
+        }
+        .fx-row select {
+            min-width: 120px;
+            padding: 4px 6px;
+            border: 1px solid rgba(180, 190, 230, 0.18);
+            border-radius: 6px;
+            background: rgba(28, 32, 52, 0.95);
+            color: #eef2ff;
+        }
+        .ascii-overlay {
+            pointer-events: none;
+            color: #dfe8ff;
+            background: transparent;
+        }
     </style>
 </head>
 <body>
+    <div id="viewport"></div>
     <div id="hud">
         <div id="info">MaxJS Live — hot reload works!</div>
         <div id="controls">
@@ -38,6 +130,7 @@
             <button id="btnSel" class="active">Sel: ON</button>
         </div>
     </div>
+    <aside id="postfxSidebar"></aside>
     <script type="importmap">
     {
         "imports": {
@@ -53,7 +146,11 @@
         import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
         import { HDRLoader } from 'three/addons/loaders/HDRLoader.js';
         import { applyDeltaFrame } from './js/protocol.js';
+        import { createPostFXController } from './js/post_fx.js';
         import { createPerfHud } from './js/perf_hud.js';
+
+        const viewportEl = document.getElementById('viewport');
+        const sidebarEl = document.getElementById('postfxSidebar');
 
         // ── Scene Setup (Z-up, matching Max) ────────────────
         const scene = new THREE.Scene();
@@ -68,7 +165,7 @@
             nextRenderer.setPixelRatio(devicePixelRatio);
             nextRenderer.toneMapping = THREE.ACESFilmicToneMapping;
             nextRenderer.toneMappingExposure = 1.2;
-            document.body.appendChild(nextRenderer.domElement);
+            viewportEl.appendChild(nextRenderer.domElement);
         }
 
         async function createRenderer() {
@@ -101,7 +198,7 @@
             throw error;
         }
 
-        const controls = new OrbitControls(camera, renderer.domElement);
+        const controls = new OrbitControls(camera, viewportEl);
         controls.enableDamping = true;
         controls.dampingFactor = 0.08;
 
@@ -129,6 +226,14 @@
         const nodeMap = new Map();
         const perfHud = createPerfHud(document.getElementById('info'));
         perfHud.setStatus(`MaxJS - ${rendererBackendLabel} renderer ready`);
+        const postFx = createPostFXController({
+            renderer,
+            scene,
+            camera,
+            viewportEl,
+            sidebarEl,
+            getSelectedObjects: () => Array.from(nodeMap.values()).filter(mesh => mesh.userData.maxjsSelected),
+        });
         function createSolidTexture(r, g, b, a = 255) {
             const tex = new THREE.DataTexture(new Uint8Array([r, g, b, a]), 1, 1);
             tex.colorSpace = THREE.NoColorSpace;
@@ -751,6 +856,7 @@
         let selHighlight = true;
 
         function applySelection(mesh, selected) {
+            mesh.userData.maxjsSelected = !!selected;
             if (!selHighlight) return;
             const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
             for (const m of mats) {
@@ -864,12 +970,13 @@
             camera.aspect = innerWidth / innerHeight;
             camera.updateProjectionMatrix();
             renderer.setSize(innerWidth, innerHeight);
+            postFx.resize();
         });
 
         function renderFrame() {
             controls.update();
             const renderStart = performance.now();
-            renderer.render(scene, camera);
+            postFx.render();
             perfHud.updateRender(performance.now() - renderStart, renderer.info?.render);
         }
 

@@ -5,6 +5,8 @@ import {
     colorToDirection,
     diffuseColor,
     directionToColor,
+    float,
+    max,
     metalness,
     mrt,
     normalView,
@@ -12,6 +14,7 @@ import {
     pass,
     roughness,
     sample,
+    sub,
     vec2,
     vec4,
 } from 'three/tsl';
@@ -34,6 +37,7 @@ export function createSSGIController({ renderer, scene, camera, backendLabel = '
     const postProcessing = new THREE.PostProcessing(renderer);
     const supportsScreenSpaceEffects = backendLabel === 'WebGPU';
     const SSR_REFERENCE_SIZE = 6.0;
+    const SSR_DIELECTRIC_STRENGTH = 0.35;
     const state = {
         ssgi: {
             enabled: false,
@@ -211,6 +215,10 @@ export function createSSGIController({ renderer, scene, camera, backendLabel = '
             const scenePassNormalColor = scenePass.getTextureNode('normal');
             const scenePassMetalRough = scenePass.getTextureNode('metalrough');
             const sceneNormal = sample((uvNode) => colorToDirection(scenePassNormalColor.sample(uvNode)));
+            const ssrReflectivity = max(
+                scenePassMetalRough.r,
+                sub(float(1.0), scenePassMetalRough.g).mul(SSR_DIELECTRIC_STRENGTH)
+            );
             let beauty = scenePassColor;
 
             if (state.ssgi.enabled) {
@@ -240,7 +248,7 @@ export function createSSGIController({ renderer, scene, camera, backendLabel = '
                     scenePassColor,
                     scenePassDepth,
                     sceneNormal,
-                    scenePassMetalRough.r,
+                    ssrReflectivity,
                     scenePassMetalRough.g,
                     camera
                 );

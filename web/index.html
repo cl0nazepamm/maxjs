@@ -212,7 +212,7 @@
         import { HDRLoader } from 'three/addons/loaders/HDRLoader.js';
         import { LightProbeGenerator } from 'three/addons/lights/LightProbeGenerator.js';
         import { RectAreaLightTexturesLib } from 'three/addons/lights/RectAreaLightTexturesLib.js';
-        import { DropInViewer as GaussianSplatDropInViewer } from 'gaussian-splats-3d';
+        import * as GaussianSplats3D from 'gaussian-splats-3d';
         import { color as tslColor, float as tslFloat, texture as tslTexture } from 'three/tsl';
         import { applyDeltaFrame } from './js/protocol.js';
         import { createPerfHud } from './js/perf_hud.js';
@@ -356,20 +356,26 @@
             overlayRenderer.outputColorSpace = THREE_STD.SRGBColorSpace;
             splatLayer.appendChild(overlayRenderer.domElement);
 
-            const overlayScene = new THREE_STD.Scene();
             const overlayCamera = new THREE_STD.PerspectiveCamera(camera.fov, camera.aspect, camera.near, camera.far);
             overlayCamera.up.set(0, 0, 1);
 
-            const viewer = new GaussianSplatDropInViewer({
+            const viewer = new GaussianSplats3D.Viewer({
+                selfDrivenMode: false,
+                renderer: overlayRenderer,
+                camera: overlayCamera,
+                rootElement: splatLayer,
+                useBuiltInControls: false,
+                renderMode: GaussianSplats3D.RenderMode.Always,
+                dynamicScene: true,
                 gpuAcceleratedSort: false,
                 sharedMemoryForWorkers: false,
+                integerBasedSort: false,
+                sceneRevealMode: GaussianSplats3D.SceneRevealMode.Instant,
+                logLevel: GaussianSplats3D.LogLevel.Warn,
             });
-            viewer.frustumCulled = false;
-            overlayScene.add(viewer);
 
             splatOverlay = {
                 renderer: overlayRenderer,
-                scene: overlayScene,
                 camera: overlayCamera,
                 viewer,
             };
@@ -378,8 +384,8 @@
         }
 
         function updateSplatViewerTransforms() {
-            const mesh = splatOverlay?.viewer?.getSplatMesh?.();
-            mesh?.updateTransforms?.();
+            splatOverlay?.viewer?.getSplatMesh?.()?.updateTransforms?.();
+            splatOverlay?.viewer?.forceRenderNextFrame?.();
         }
 
         function updateSplatCamera() {
@@ -468,11 +474,23 @@
                 await removeTrackedSplat(handle);
             }
 
+            const lowerUrl = url.toLowerCase();
+            let format;
+            if (lowerUrl.endsWith('.ply')) format = GaussianSplats3D.SceneFormat.Ply;
+            else if (lowerUrl.endsWith('.splat')) format = GaussianSplats3D.SceneFormat.Splat;
+            else if (lowerUrl.endsWith('.ksplat')) format = GaussianSplats3D.SceneFormat.KSplat;
+
             await overlay.viewer.addSplatScene(url, {
-                showLoadingUI: false,
+                format,
+                showLoadingUI: true,
+                splatAlphaRemovalThreshold: 1,
                 position: [0, 0, 0],
                 rotation: [0, 0, 0, 1],
                 scale: [1, 1, 1],
+                onProgress(percent, label, stage) {
+                    const stageLabel = stage?.toString?.() ?? 'Loading';
+                    perfHud.setStatus(`MaxJS - Splat ${stageLabel} ${label ?? `${percent ?? 0}%`}`);
+                },
             });
 
             const sceneRef = overlay.viewer.getSplatScene(overlay.viewer.getSceneCount() - 1);
@@ -481,6 +499,7 @@
             sceneRef.name = splat.n || `Splat ${handle}`;
             splatHandleMap.set(handle, { url, scene: sceneRef });
             applySplatTransform(sceneRef, splat);
+            perfHud.setStatus(`MaxJS - Splat ready: ${sceneRef.name}`);
             syncSplatLayerVisibility();
         }
 
@@ -2124,7 +2143,8 @@
             ssgiFx.render();
             if (splatOverlay && splatHandleMap.size > 0) {
                 updateSplatCamera();
-                splatOverlay.renderer.render(splatOverlay.scene, splatOverlay.camera);
+                splatOverlay.viewer.update();
+                splatOverlay.viewer.render();
             }
             syncPostFxPanel();
             perfHud.updateRender(performance.now() - renderStart, renderer.info?.render);

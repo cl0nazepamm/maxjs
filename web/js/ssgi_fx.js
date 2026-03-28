@@ -65,6 +65,40 @@ export function createSSGIController({ renderer, scene, camera, backendLabel = '
     let lastError = '';
     let pipelineReady = false;
     let activeNodes = [];
+    let hiddenDuringPost = [];
+
+    function prepareSceneForPostPass() {
+        hiddenDuringPost = [];
+
+        scene.traverse((object) => {
+            if (!object?.visible) return;
+
+            if (object.isLine || object.isLineSegments || object.isPoints || object.isSprite) {
+                hiddenDuringPost.push(object);
+                object.visible = false;
+                return;
+            }
+
+            if (!object.isMesh || !object.geometry) return;
+
+            const hasNormal = !!object.geometry.getAttribute?.('normal');
+            if (!hasNormal && object.geometry.getAttribute?.('position')) {
+                try {
+                    object.geometry.computeVertexNormals();
+                } catch (error) {
+                    hiddenDuringPost.push(object);
+                    object.visible = false;
+                }
+            }
+        });
+    }
+
+    function restoreSceneAfterPostPass() {
+        for (const object of hiddenDuringPost) {
+            object.visible = true;
+        }
+        hiddenDuringPost = [];
+    }
 
     function clearNodes() {
         for (const node of activeNodes) {
@@ -147,7 +181,7 @@ export function createSSGIController({ renderer, scene, camera, backendLabel = '
 
             if (state.ssr.enabled) {
                 const ssrPass = ssr(
-                    beauty,
+                    scenePassColor,
                     scenePassDepth,
                     sceneNormal,
                     scenePassMetalRough.r,
@@ -236,8 +270,11 @@ export function createSSGIController({ renderer, scene, camera, backendLabel = '
             }
 
             try {
+                prepareSceneForPostPass();
                 postProcessing.render();
+                restoreSceneAfterPostPass();
             } catch (error) {
+                restoreSceneAfterPostPass();
                 disableWithError('Post pipeline render failed', error);
                 renderer.render(scene, camera);
             }

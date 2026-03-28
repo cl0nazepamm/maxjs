@@ -126,6 +126,18 @@ export function createSSGIController({ renderer, scene, camera, backendLabel = '
         return state.ssgi.enabled || state.ssr.enabled || state.bloom.enabled;
     }
 
+    function snapshotState() {
+        return {
+            ssgi: { ...state.ssgi },
+            ssr: { ...state.ssr },
+            bloom: { ...state.bloom },
+        };
+    }
+
+    function assignFinite(target, key, value) {
+        if (Number.isFinite(value)) target[key] = value;
+    }
+
     function rebuildPipeline() {
         if (!hasAnyEffectEnabled() || !available) {
             pipelineReady = false;
@@ -218,6 +230,12 @@ export function createSSGIController({ renderer, scene, camera, backendLabel = '
     }
 
     return {
+        getState() {
+            return snapshotState();
+        },
+        hasEnabledEffects() {
+            return hasAnyEffectEnabled();
+        },
         isEnabled() {
             return state.ssgi.enabled;
         },
@@ -241,6 +259,18 @@ export function createSSGIController({ renderer, scene, camera, backendLabel = '
             rebuildPipeline();
             return state.ssgi.enabled;
         },
+        setSSGIOptions(options = {}) {
+            assignFinite(state.ssgi, 'radius', options.radius);
+            assignFinite(state.ssgi, 'thickness', options.thickness);
+            assignFinite(state.ssgi, 'aoIntensity', options.aoIntensity);
+            assignFinite(state.ssgi, 'giIntensity', options.giIntensity);
+            assignFinite(state.ssgi, 'expFactor', options.expFactor);
+            assignFinite(state.ssgi, 'sliceCount', options.sliceCount);
+            assignFinite(state.ssgi, 'stepCount', options.stepCount);
+            if (typeof options.temporal === 'boolean') state.ssgi.temporal = options.temporal;
+            rebuildPipeline();
+            return { ...state.ssgi };
+        },
         isSSREnabled() {
             return state.ssr.enabled;
         },
@@ -255,6 +285,15 @@ export function createSSGIController({ renderer, scene, camera, backendLabel = '
             rebuildPipeline();
             return state.ssr.enabled;
         },
+        setSSROptions(options = {}) {
+            assignFinite(state.ssr, 'quality', options.quality);
+            assignFinite(state.ssr, 'blurQuality', options.blurQuality);
+            assignFinite(state.ssr, 'maxDistance', options.maxDistance);
+            assignFinite(state.ssr, 'opacity', options.opacity);
+            assignFinite(state.ssr, 'thickness', options.thickness);
+            rebuildPipeline();
+            return { ...state.ssr };
+        },
         isBloomEnabled() {
             return state.bloom.enabled;
         },
@@ -262,6 +301,13 @@ export function createSSGIController({ renderer, scene, camera, backendLabel = '
             state.bloom.enabled = !!enabled && available;
             rebuildPipeline();
             return state.bloom.enabled;
+        },
+        setBloomOptions(options = {}) {
+            assignFinite(state.bloom, 'strength', options.strength);
+            assignFinite(state.bloom, 'radius', options.radius);
+            assignFinite(state.bloom, 'threshold', options.threshold);
+            rebuildPipeline();
+            return { ...state.bloom };
         },
         render() {
             if (!hasAnyEffectEnabled() || !pipelineReady) {

@@ -17,7 +17,13 @@
             background: rgba(0,0,0,0.6); padding: 6px 10px;
             border-radius: 4px; margin-bottom: 6px;
         }
-        #controls { pointer-events: auto; display: flex; gap: 6px; }
+        #controls {
+            pointer-events: auto;
+            display: flex;
+            gap: 6px;
+            flex-wrap: wrap;
+            max-width: min(880px, calc(100vw - 32px));
+        }
         #controls button {
             background: rgba(40,40,60,0.8); color: #aaa; border: 1px solid #444;
             padding: 4px 10px; border-radius: 3px; font: 12px 'Segoe UI', sans-serif;
@@ -25,6 +31,133 @@
         }
         #controls button.active { background: rgba(60,60,120,0.9); color: #ddd; border-color: #668; }
         #controls button:hover { background: rgba(60,60,100,0.9); color: #ccc; }
+        .sidepanel {
+            position: absolute;
+            top: 12px;
+            right: 12px;
+            width: min(340px, calc(100vw - 24px));
+            max-height: calc(100vh - 24px);
+            padding: 14px;
+            border-radius: 14px;
+            border: 1px solid rgba(106, 118, 158, 0.35);
+            background: rgba(13, 17, 29, 0.92);
+            color: #cdd5e4;
+            font: 12px 'Segoe UI', sans-serif;
+            backdrop-filter: blur(16px);
+            box-shadow: 0 18px 50px rgba(0, 0, 0, 0.35);
+            overflow: auto;
+            opacity: 0;
+            pointer-events: none;
+            transform: translateX(24px);
+            transition: opacity 0.18s ease, transform 0.18s ease;
+        }
+        .sidepanel.visible {
+            opacity: 1;
+            pointer-events: auto;
+            transform: translateX(0);
+        }
+        .sidepanel-header {
+            display: flex;
+            align-items: flex-start;
+            justify-content: space-between;
+            gap: 10px;
+            margin-bottom: 12px;
+        }
+        .sidepanel-title {
+            font-size: 15px;
+            font-weight: 600;
+            color: #eef2ff;
+        }
+        .sidepanel-subtitle {
+            margin-top: 4px;
+            color: #7f8aa3;
+            font-size: 11px;
+        }
+        .sidepanel button,
+        .fx-toggle {
+            background: rgba(38, 44, 70, 0.9);
+            color: #ccd3e5;
+            border: 1px solid rgba(110, 120, 154, 0.4);
+            border-radius: 8px;
+            padding: 6px 10px;
+            font: 12px 'Segoe UI', sans-serif;
+            cursor: pointer;
+        }
+        .sidepanel button:hover,
+        .fx-toggle:hover {
+            background: rgba(58, 66, 102, 0.95);
+        }
+        .fx-toggle.active {
+            background: rgba(91, 118, 215, 0.28);
+            border-color: rgba(124, 167, 255, 0.85);
+            color: #eef3ff;
+        }
+        .sidepanel button:disabled,
+        .fx-toggle:disabled,
+        .sidepanel input:disabled {
+            opacity: 0.45;
+            cursor: not-allowed;
+        }
+        .sidepanel-body {
+            display: grid;
+            gap: 12px;
+        }
+        .fx-section {
+            border: 1px solid rgba(100, 112, 146, 0.28);
+            border-radius: 12px;
+            background: rgba(25, 31, 52, 0.7);
+            padding: 12px;
+        }
+        .fx-section-header {
+            display: flex;
+            align-items: flex-start;
+            justify-content: space-between;
+            gap: 10px;
+        }
+        .fx-section-title {
+            font-size: 13px;
+            font-weight: 600;
+            color: #eef2ff;
+        }
+        .fx-section-copy {
+            margin-top: 4px;
+            line-height: 1.35;
+            color: #8e98ad;
+            font-size: 11px;
+        }
+        .fx-grid {
+            display: grid;
+            gap: 10px;
+            margin-top: 12px;
+        }
+        .fx-control {
+            display: grid;
+            gap: 6px;
+        }
+        .fx-control-head,
+        .fx-check {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+        }
+        .fx-value {
+            color: #edf2ff;
+            font-variant-numeric: tabular-nums;
+        }
+        .fx-range {
+            width: 100%;
+            accent-color: #86a8ff;
+        }
+        .fx-note {
+            margin-top: 8px;
+            min-height: 15px;
+            color: #7e899d;
+            font-size: 11px;
+        }
+        .fx-note.error {
+            color: #ffb4b4;
+        }
     </style>
 </head>
 <body>
@@ -36,11 +169,10 @@
             <button id="btnCamLock">Cam Lock: OFF</button>
             <button id="btnEnv" class="active">Env: ON</button>
             <button id="btnSel" class="active">Sel: ON</button>
-            <button id="btnSSGI">SSGI: OFF</button>
-            <button id="btnSSR">SSR: OFF</button>
-            <button id="btnBloom">Bloom: OFF</button>
+            <button id="btnPostFxPanel">Post FX</button>
         </div>
     </div>
+    <aside id="postPanel" class="sidepanel" aria-hidden="true"></aside>
     <script type="importmap">
     {
         "imports": {
@@ -870,61 +1002,254 @@
             }
         };
 
-        const btnSSGI = document.getElementById('btnSSGI');
-        const btnSSR = document.getElementById('btnSSR');
-        const btnBloom = document.getElementById('btnBloom');
+        const btnPostFxPanel = document.getElementById('btnPostFxPanel');
+        const postPanel = document.getElementById('postPanel');
+        let postPanelVisible = false;
+        let lastPostFxSignature = '';
 
-        function syncSSGIButton() {
-            const enabled = ssgiFx.isEnabled();
-            btnSSGI.textContent = `SSGI: ${enabled ? 'ON' : 'OFF'}`;
-            btnSSGI.classList.toggle('active', enabled);
+        const postFxSections = [
+            {
+                key: 'ssgi',
+                title: 'SSGI',
+                copy: 'Diffuse bounce lighting and ambient occlusion from the current frame.',
+                note: 'Requires the real WebGPU backend.',
+                requiresWebGPU: true,
+                isEnabled: () => ssgiFx.isEnabled(),
+                setEnabled: (enabled) => ssgiFx.setEnabled(enabled),
+                getValues: (state) => state.ssgi,
+                setValues: (patch) => ssgiFx.setSSGIOptions(patch),
+                controls: [
+                    { key: 'radius', label: 'Radius', min: 1, max: 24, step: 0.5 },
+                    { key: 'thickness', label: 'Thickness', min: 0.01, max: 10, step: 0.01 },
+                    { key: 'aoIntensity', label: 'AO Intensity', min: 0, max: 4, step: 0.05 },
+                    { key: 'giIntensity', label: 'GI Intensity', min: 0, max: 12, step: 0.1 },
+                    { key: 'expFactor', label: 'Falloff', min: 1, max: 3, step: 0.05 },
+                    { key: 'sliceCount', label: 'Slices', min: 1, max: 4, step: 1, integer: true },
+                    { key: 'stepCount', label: 'Steps', min: 1, max: 24, step: 1, integer: true },
+                    { key: 'temporal', label: 'Temporal Filter', type: 'checkbox' },
+                ],
+            },
+            {
+                key: 'ssr',
+                title: 'SSR',
+                copy: 'Screen-space reflections for glossy and mirror-like surfaces.',
+                note: 'Requires the real WebGPU backend.',
+                requiresWebGPU: true,
+                isEnabled: () => ssgiFx.isSSREnabled(),
+                setEnabled: (enabled) => ssgiFx.setSSREnabled(enabled),
+                getValues: (state) => state.ssr,
+                setValues: (patch) => ssgiFx.setSSROptions(patch),
+                controls: [
+                    { key: 'quality', label: 'Quality', min: 0, max: 1, step: 0.01 },
+                    { key: 'blurQuality', label: 'Blur Quality', min: 1, max: 3, step: 1, integer: true },
+                    { key: 'maxDistance', label: 'Max Distance', min: 0.05, max: 2, step: 0.01 },
+                    { key: 'opacity', label: 'Opacity', min: 0, max: 1, step: 0.01 },
+                    { key: 'thickness', label: 'Thickness', min: 0.001, max: 0.05, step: 0.001 },
+                ],
+            },
+            {
+                key: 'bloom',
+                title: 'Bloom',
+                copy: 'Highlights bleed for emissive and high-energy surfaces.',
+                note: 'Bloom works on WebGPU and WebGL fallback.',
+                requiresWebGPU: false,
+                isEnabled: () => ssgiFx.isBloomEnabled(),
+                setEnabled: (enabled) => ssgiFx.setBloomEnabled(enabled),
+                getValues: (state) => state.bloom,
+                setValues: (patch) => ssgiFx.setBloomOptions(patch),
+                controls: [
+                    { key: 'strength', label: 'Strength', min: 0, max: 3, step: 0.01 },
+                    { key: 'radius', label: 'Radius', min: 0, max: 1, step: 0.01 },
+                    { key: 'threshold', label: 'Threshold', min: 0, max: 2, step: 0.01 },
+                ],
+            },
+        ];
+
+        function formatControlValue(control, value) {
+            if (control.type === 'checkbox') return value ? 'On' : 'Off';
+            if (!Number.isFinite(value)) return '--';
+            if (control.integer) return String(Math.round(value));
+            if (control.step >= 1) return value.toFixed(0);
+            if (control.step >= 0.1) return value.toFixed(1);
+            if (control.step >= 0.01) return value.toFixed(2);
+            return value.toFixed(3);
         }
 
-        function syncSSRButton() {
-            const enabled = ssgiFx.isSSREnabled();
-            btnSSR.textContent = `SSR: ${enabled ? 'ON' : 'OFF'}`;
-            btnSSR.classList.toggle('active', enabled);
+        function setPostPanelVisible(visible) {
+            postPanelVisible = !!visible;
+            postPanel.classList.toggle('visible', postPanelVisible);
+            postPanel.setAttribute('aria-hidden', String(!postPanelVisible));
+            syncPostFxPanel(true);
         }
 
-        function syncBloomButton() {
-            const enabled = ssgiFx.isBloomEnabled();
-            btnBloom.textContent = `Bloom: ${enabled ? 'ON' : 'OFF'}`;
-            btnBloom.classList.toggle('active', enabled);
-        }
+        function buildPostFxPanel() {
+            const sectionsHtml = postFxSections.map(section => `
+                <section class="fx-section" data-fx-section="${section.key}">
+                    <div class="fx-section-header">
+                        <div>
+                            <div class="fx-section-title">${section.title}</div>
+                            <div class="fx-section-copy">${section.copy}</div>
+                        </div>
+                        <button class="fx-toggle" type="button" id="fx-toggle-${section.key}">${section.title}: OFF</button>
+                    </div>
+                    <div class="fx-grid">
+                        ${section.controls.map(control => {
+                            const inputId = `fx-${section.key}-${control.key}`;
+                            const valueId = `fx-value-${section.key}-${control.key}`;
 
-        function syncPostFXButtons() {
-            syncSSGIButton();
-            syncSSRButton();
-            syncBloomButton();
-        }
+                            if (control.type === 'checkbox') {
+                                return `
+                                    <label class="fx-check" for="${inputId}">
+                                        <span>${control.label}</span>
+                                        <input id="${inputId}" type="checkbox">
+                                    </label>
+                                `;
+                            }
 
-        btnSSGI.onclick = () => {
-            const enabled = ssgiFx.setEnabled(!ssgiFx.isEnabled());
-            syncPostFXButtons();
-            if (!enabled && !ssgiFx.isAvailable()) {
-                const message = ssgiFx.getLastError();
-                if (message) perfHud.setStatus(`MaxJS - SSGI unavailable: ${message}`);
+                            return `
+                                <label class="fx-control" for="${inputId}">
+                                    <div class="fx-control-head">
+                                        <span>${control.label}</span>
+                                        <span class="fx-value" id="${valueId}"></span>
+                                    </div>
+                                    <input
+                                        class="fx-range"
+                                        id="${inputId}"
+                                        type="range"
+                                        min="${control.min}"
+                                        max="${control.max}"
+                                        step="${control.step}"
+                                    >
+                                </label>
+                            `;
+                        }).join('')}
+                    </div>
+                    <div class="fx-note" id="fx-note-${section.key}"></div>
+                </section>
+            `).join('');
+
+            postPanel.innerHTML = `
+                <div class="sidepanel-header">
+                    <div>
+                        <div class="sidepanel-title">Post FX</div>
+                        <div class="sidepanel-subtitle" id="postPanelStatus">${rendererBackendLabel}</div>
+                    </div>
+                    <button id="btnPostPanelClose" type="button">Hide</button>
+                </div>
+                <div class="sidepanel-body">${sectionsHtml}</div>
+            `;
+
+            document.getElementById('btnPostPanelClose').onclick = () => setPostPanelVisible(false);
+
+            for (const section of postFxSections) {
+                section.toggleEl = document.getElementById(`fx-toggle-${section.key}`);
+                section.noteEl = document.getElementById(`fx-note-${section.key}`);
+                section.controlEls = {};
+
+                section.toggleEl.onclick = () => {
+                    const enabled = section.setEnabled(!section.isEnabled());
+                    syncPostFxPanel(true);
+                    if (!enabled) {
+                        const message = ssgiFx.getLastError();
+                        if (message && (!ssgiFx.isAvailable() || section.requiresWebGPU)) {
+                            perfHud.setStatus(`MaxJS - ${section.title} unavailable: ${message}`);
+                        }
+                    }
+                };
+
+                for (const control of section.controls) {
+                    const input = document.getElementById(`fx-${section.key}-${control.key}`);
+                    const valueEl = control.type === 'checkbox'
+                        ? null
+                        : document.getElementById(`fx-value-${section.key}-${control.key}`);
+
+                    section.controlEls[control.key] = { input, valueEl };
+
+                    const eventName = control.type === 'checkbox' ? 'change' : 'input';
+                    input.addEventListener(eventName, () => {
+                        const rawValue = control.type === 'checkbox'
+                            ? input.checked
+                            : Number(input.value);
+                        const value = control.integer ? Math.round(rawValue) : rawValue;
+                        section.setValues({ [control.key]: value });
+                        syncPostFxPanel(true);
+                    });
+                }
             }
+        }
+
+        function syncPostFxPanel(force = false) {
+            const state = ssgiFx.getState();
+            const available = ssgiFx.isAvailable();
+            const supportsScreenSpaceEffects = ssgiFx.supportsScreenSpaceEffects();
+            const lastError = ssgiFx.getLastError();
+            const signature = JSON.stringify({
+                panel: postPanelVisible,
+                available,
+                supportsScreenSpaceEffects,
+                lastError,
+                state,
+            });
+
+            if (!force && signature === lastPostFxSignature) return;
+            lastPostFxSignature = signature;
+
+            const panelStatus = document.getElementById('postPanelStatus');
+            if (panelStatus) {
+                panelStatus.textContent = available
+                    ? `${rendererBackendLabel} backend`
+                    : `${rendererBackendLabel} backend • ${lastError || 'unavailable'}`;
+            }
+
+            const hasEnabledEffects = ssgiFx.hasEnabledEffects();
+            btnPostFxPanel.classList.toggle('active', postPanelVisible || hasEnabledEffects);
+
+            for (const section of postFxSections) {
+                const values = section.getValues(state);
+                const enabled = section.isEnabled();
+                const disabled = !available || (section.requiresWebGPU && !supportsScreenSpaceEffects);
+
+                section.toggleEl.textContent = `${section.title}: ${enabled ? 'ON' : 'OFF'}`;
+                section.toggleEl.classList.toggle('active', enabled);
+                section.toggleEl.disabled = disabled;
+
+                for (const control of section.controls) {
+                    const controlEl = section.controlEls[control.key];
+                    if (!controlEl) continue;
+
+                    controlEl.input.disabled = disabled;
+
+                    if (control.type === 'checkbox') {
+                        controlEl.input.checked = !!values[control.key];
+                    } else {
+                        controlEl.input.value = values[control.key];
+                        if (controlEl.valueEl) {
+                            controlEl.valueEl.textContent = formatControlValue(control, values[control.key]);
+                        }
+                    }
+                }
+
+                let note = section.note;
+                let isError = false;
+                if (!available && lastError) {
+                    note = lastError;
+                    isError = true;
+                } else if (section.requiresWebGPU && !supportsScreenSpaceEffects) {
+                    note = 'Requires the real WebGPU backend.';
+                    isError = true;
+                }
+
+                section.noteEl.textContent = note;
+                section.noteEl.classList.toggle('error', isError);
+            }
+        }
+
+        btnPostFxPanel.onclick = () => {
+            setPostPanelVisible(!postPanelVisible);
         };
 
-        btnSSR.onclick = () => {
-            const enabled = ssgiFx.setSSREnabled(!ssgiFx.isSSREnabled());
-            syncPostFXButtons();
-            if (!enabled && !ssgiFx.isAvailable()) {
-                const message = ssgiFx.getLastError();
-                if (message) perfHud.setStatus(`MaxJS - SSR unavailable: ${message}`);
-            }
-        };
-
-        btnBloom.onclick = () => {
-            const enabled = ssgiFx.setBloomEnabled(!ssgiFx.isBloomEnabled());
-            syncPostFXButtons();
-            if (!enabled && !ssgiFx.isAvailable()) {
-                const message = ssgiFx.getLastError();
-                if (message) perfHud.setStatus(`MaxJS - Bloom unavailable: ${message}`);
-            }
-        };
-        syncPostFXButtons();
+        buildPostFxPanel();
+        syncPostFxPanel(true);
 
         // ── Resize + Render ─────────────────────────────────
         addEventListener('resize', () => {
@@ -938,7 +1263,7 @@
             controls.update();
             const renderStart = performance.now();
             ssgiFx.render();
-            syncPostFXButtons();
+            syncPostFxPanel();
             perfHud.updateRender(performance.now() - renderStart, renderer.info?.render);
         }
 

@@ -4,6 +4,7 @@
 #include <imtl.h>
 
 #define THREEJS_MTL_CLASS_ID Class_ID(0x7F3A9B10, 0x4E2D8C10)
+#define THREEJS_ADV_MTL_CLASS_ID Class_ID(0x7F3A9B11, 0x4E2D8C10)
 
 enum { threejs_params };
 
@@ -15,6 +16,7 @@ enum ThreeJSParamIDs {
     pb_normal_map, pb_normal_scale,
     pb_bump_map, pb_bump_scale,
     pb_displacement_map, pb_displacement_scale, pb_displacement_bias,
+    pb_parallax_map, pb_parallax_scale,
     // Emission
     pb_emissive_color, pb_emissive_map, pb_emissive_intensity, pb_emissive_map_strength,
     // Transparency
@@ -37,6 +39,7 @@ enum ThreeJSMapSlots {
     kMap_Normal,
     kMap_Bump,
     kMap_Displacement,
+    kMap_Parallax,
     kMap_Emissive,
     kMap_Opacity,
     kMap_Lightmap,
@@ -45,3 +48,4 @@ enum ThreeJSMapSlots {
 };
 
 ClassDesc2* GetThreeJSMtlDesc();
+ClassDesc2* GetThreeJSAdvMtlDesc();

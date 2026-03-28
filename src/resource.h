@@ -2,6 +2,8 @@
 
 #define IDD_THREEJS_MTL     101
 #define IDS_PARAMS          102
+#define IDD_THREEJS_ADV_MTL 103
+#define IDS_ADV_PARAMS      104
 
 // PBR Core
 #define IDC_COLOR           1001
@@ -59,3 +61,7 @@
 #define IDC_EMMAPSTR_SPIN   1068
 #define IDC_OPMAPSTR_EDIT   1069
 #define IDC_OPMAPSTR_SPIN   1070
+#define IDC_MTL_MODEL_LABEL 1071
+#define IDC_PARALLAX_MAP    1072
+#define IDC_PARALLAX_EDIT   1073
+#define IDC_PARALLAX_SPIN   1074

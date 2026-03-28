@@ -318,12 +318,14 @@ struct MaxJSPBR {
     bool  doubleSided = true;
     float envIntensity = 1.0f;
     std::wstring colorMap, roughnessMap, metalnessMap, normalMap;
-    std::wstring bumpMap, displacementMap;
+    std::wstring bumpMap, displacementMap, parallaxMap;
     std::wstring aoMap, emissionMap, lightmapFile, opacityMap;
     TexTransform colorMapTransform, roughnessMapTransform, metalnessMapTransform, normalMapTransform;
-    TexTransform bumpMapTransform, displacementMapTransform;
+    TexTransform bumpMapTransform, displacementMapTransform, parallaxMapTransform;
     TexTransform aoMapTransform, emissionMapTransform, lightmapTransform, opacityMapTransform;
     std::wstring mtlName;
+    std::wstring materialModel = L"MeshStandardMaterial";
+    float parallaxScale = 0.0f;
 };
 
 static float FindPBFloat(Texmap* map, const MCHAR* name, float def);
@@ -338,7 +340,7 @@ static std::wstring FindPBString(Texmap* map, const MCHAR* name);
 static bool IsSupportedMaterial(Mtl* mtl) {
     if (!mtl) return false;
     Class_ID cid = mtl->ClassID();
-    return cid == THREEJS_MTL_CLASS_ID || cid == GLTF_MTL_CLASS_ID;
+    return cid == THREEJS_MTL_CLASS_ID || cid == THREEJS_ADV_MTL_CLASS_ID || cid == GLTF_MTL_CLASS_ID;
 }
 
 // Find ThreeJS or glTF Material in material tree — uses ClassID only
@@ -472,6 +474,9 @@ static void ExtractThreeJSMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
 
     MSTR name = mtl->GetName();
     d.mtlName = name.data();
+    d.materialModel = (mtl->ClassID() == THREEJS_ADV_MTL_CLASS_ID)
+        ? L"MeshStandardNodeMaterial"
+        : L"MeshStandardMaterial";
 
     Color c = pb->GetColor(pb_color, t);
     d.color[0] = c.r; d.color[1] = c.g; d.color[2] = c.b;
@@ -485,6 +490,7 @@ static void ExtractThreeJSMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
     d.bumpScale = pb->GetFloat(pb_bump_scale, t);
     d.displacementScale = pb->GetFloat(pb_displacement_scale, t);
     d.displacementBias = pb->GetFloat(pb_displacement_bias, t);
+    d.parallaxScale = pb->GetFloat(pb_parallax_scale, t);
     d.doubleSided = pb->GetInt(pb_double_sided, t) != 0;
     d.envIntensity = pb->GetFloat(pb_env_intensity, t);
 
@@ -510,6 +516,7 @@ static void ExtractThreeJSMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
     readMap(pb_normal_map, d.normalMap, d.normalMapTransform);
     readMap(pb_bump_map, d.bumpMap, d.bumpMapTransform);
     readMap(pb_displacement_map, d.displacementMap, d.displacementMapTransform);
+    readMap(pb_parallax_map, d.parallaxMap, d.parallaxMapTransform);
     readMap(pb_emissive_map, d.emissionMap, d.emissionMapTransform);
     readMap(pb_opacity_map, d.opacityMap, d.opacityMapTransform);
     readMap(pb_lightmap, d.lightmapFile, d.lightmapTransform);
@@ -610,7 +617,7 @@ static void ExtractPBRFromMtl(Mtl* mtl, INode* node, TimeValue t, MaxJSPBR& d) {
     if (mtl) {
         Mtl* found = FindSupportedMaterial(mtl);
         if (found) {
-            if (found->ClassID() == THREEJS_MTL_CLASS_ID)
+            if (found->ClassID() == THREEJS_MTL_CLASS_ID || found->ClassID() == THREEJS_ADV_MTL_CLASS_ID)
                 ExtractThreeJSMtl(found, t, d);
             else
                 ExtractGltfMtl(found, t, d);
@@ -648,7 +655,7 @@ static void ExtractPBR(INode* node, TimeValue t, MaxJSPBR& d) {
     // Priority 1: ThreeJS Material or glTF Material (direct or inside Shell)
     Mtl* found = FindSupportedMaterial(mtl);
     if (found) {
-        if (found->ClassID() == THREEJS_MTL_CLASS_ID)
+        if (found->ClassID() == THREEJS_MTL_CLASS_ID || found->ClassID() == THREEJS_ADV_MTL_CLASS_ID)
             ExtractThreeJSMtl(found, t, d);
         else
             ExtractGltfMtl(found, t, d);
@@ -1567,7 +1574,7 @@ public:
                 float opac = 1.0f;
 
                 Mtl* foundMtl = FindSupportedMaterial(node->GetMtl());
-                if (foundMtl && foundMtl->ClassID() == THREEJS_MTL_CLASS_ID) {
+                if (foundMtl && (foundMtl->ClassID() == THREEJS_MTL_CLASS_ID || foundMtl->ClassID() == THREEJS_ADV_MTL_CLASS_ID)) {
                     IParamBlock2* pb = foundMtl->GetParamBlockByID(threejs_params);
                     if (pb) {
                         Color c = pb->GetColor(pb_color, t);
@@ -1767,6 +1774,7 @@ public:
         writeMap(L"normMap", L"normMapXf", pbr.normalMap, pbr.normalMapTransform);
         writeMap(L"bumpMap", L"bumpMapXf", pbr.bumpMap, pbr.bumpMapTransform);
         writeMap(L"dispMap", L"dispMapXf", pbr.displacementMap, pbr.displacementMapTransform);
+        writeMap(L"parallaxMap", L"parallaxMapXf", pbr.parallaxMap, pbr.parallaxMapTransform);
         writeMap(L"aoMap", L"aoMapXf", pbr.aoMap, pbr.aoMapTransform);
         writeMap(L"emMap", L"emMapXf", pbr.emissionMap, pbr.emissionMapTransform);
         writeMap(L"lmMap", L"lmMapXf", pbr.lightmapFile, pbr.lightmapTransform);
@@ -1775,6 +1783,7 @@ public:
 
     void WriteMaterialFull(std::wostringstream& ss, const MaxJSPBR& pbr) {
         ss << L"{\"name\":\"" << EscapeJson(pbr.mtlName.empty() ? L"default" : pbr.mtlName.c_str()) << L'"';
+        ss << L",\"model\":\"" << EscapeJson(pbr.materialModel.c_str()) << L'"';
         ss << L",\"color\":[";
         WriteFloatValue(ss, pbr.color[0], 0.8f); ss << L',';
         WriteFloatValue(ss, pbr.color[1], 0.8f); ss << L',';
@@ -1811,6 +1820,10 @@ public:
             WriteFloatValue(ss, pbr.displacementScale, 0.0f);
             ss << L",\"dispB\":";
             WriteFloatValue(ss, pbr.displacementBias, 0.0f);
+        }
+        if (!pbr.parallaxMap.empty() || std::fabs(pbr.parallaxScale) > 1.0e-6f) {
+            ss << L",\"parallaxS\":";
+            WriteFloatValue(ss, pbr.parallaxScale, 0.0f);
         }
         ss << L",\"aoI\":";
         WriteFloatValue(ss, pbr.aoIntensity, 1.0f);
@@ -2180,7 +2193,7 @@ public:
             float col[3] = {0.8f,0.8f,0.8f};
             float rough = 0.5f, metal = 0.0f, opac = 1.0f;
             Mtl* foundMtl = FindSupportedMaterial(node->GetMtl());
-            if (foundMtl && foundMtl->ClassID() == THREEJS_MTL_CLASS_ID) {
+            if (foundMtl && (foundMtl->ClassID() == THREEJS_MTL_CLASS_ID || foundMtl->ClassID() == THREEJS_ADV_MTL_CLASS_ID)) {
                 IParamBlock2* pb = foundMtl->GetParamBlockByID(threejs_params);
                 if (pb) {
                     Color c = pb->GetColor(pb_color, t);
@@ -2579,12 +2592,13 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, ULONG fdwReason, LPVOID) {
 }
 
 __declspec(dllexport) const TCHAR* LibDescription()   { return MAXJS_NAME; }
-__declspec(dllexport) int LibNumberClasses()           { return 3; }
+__declspec(dllexport) int LibNumberClasses()           { return 4; }
 __declspec(dllexport) ClassDesc* LibClassDesc(int i) {
     switch (i) {
         case 0: return &maxJSDesc;
         case 1: return GetThreeJSMtlDesc();
-        case 2: return GetThreeJSRendererDesc();
+        case 2: return GetThreeJSAdvMtlDesc();
+        case 3: return GetThreeJSRendererDesc();
         default: return nullptr;
     }
 }

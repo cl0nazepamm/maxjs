@@ -166,8 +166,8 @@
         <div id="controls">
             <button id="btnKill">Kill</button>
             <button id="btnRefresh">Refresh</button>
-            <button id="btnCamLock">Cam Lock: OFF</button>
-            <button id="btnEnv" class="active">Env: ON</button>
+            <button id="btnCamLock" class="active">Cam Lock: ON</button>
+            <button id="btnEnv">Env: OFF</button>
             <button id="btnLightProbe" class="active">Probe: ON</button>
             <button id="btnSel" class="active">Sel: ON</button>
             <button id="btnPostFxPanel">Post FX</button>
@@ -242,6 +242,7 @@
         const controls = new OrbitControls(camera, renderer.domElement);
         controls.enableDamping = true;
         controls.dampingFactor = 0.08;
+        controls.enabled = false;  // cam lock ON by default
 
         // Grid on XY plane (Z-up)
         const grid = new THREE.GridHelper(200, 20, 0x444466, 0x2a2a44);
@@ -293,8 +294,8 @@
         const fallbackHeightTexture = createSolidTexture(255, 255, 255, 255);
 
         let firstSync = true;
-        let camLock = false;
-        let envVisible = true;
+        let camLock = true;
+        let envVisible = false;
         let lightProbeEnabled = true;
         const lightProbeIntensity = 1.0;
         let currentHdriUrl = null;
@@ -482,6 +483,53 @@
                 : 1.0;
         }
 
+        function applyAdvancedMaterialNodes(material, md) {
+            if (!material?.isMeshStandardNodeMaterial) return;
+
+            const parallaxScale = Number.isFinite(md.parallaxS) ? md.parallaxS : 0;
+            if (!md.parallaxMap || Math.abs(parallaxScale) < 1.0e-6) return;
+
+            const heightTexture = loadTexture(md.parallaxMap, THREE.NoColorSpace, md.parallaxMapXf, fallbackHeightTexture);
+            const baseUv = THREE.uv();
+            const heightNode = THREE.texture(heightTexture, baseUv).r.sub(0.5);
+            const heightOffset = heightNode.mul(parallaxScale);
+            const displacedUv = THREE.parallaxUV(baseUv, THREE.vec2(heightOffset, heightOffset));
+
+            material.userData ??= {};
+            material.userData.maxjsParallaxMap = heightTexture;
+            material.userData.maxjsParallaxScale = parallaxScale;
+
+            if (material.map) {
+                material.colorNode = THREE.materialColor.mul(THREE.texture(material.map, displacedUv));
+            }
+
+            if (material.roughnessMap) {
+                material.roughnessNode = THREE.materialRoughness.mul(THREE.texture(material.roughnessMap, displacedUv).g);
+            }
+
+            if (material.metalnessMap) {
+                material.metalnessNode = THREE.materialMetalness.mul(THREE.texture(material.metalnessMap, displacedUv).b);
+            }
+
+            if (material.normalMap) {
+                material.normalNode = THREE.normalMap(
+                    THREE.texture(material.normalMap, displacedUv),
+                    THREE.vec2(material.normalScale?.x ?? 1, material.normalScale?.y ?? 1)
+                );
+            } else if (material.bumpMap) {
+                material.normalNode = THREE.bumpMap(
+                    THREE.texture(material.bumpMap, displacedUv).r,
+                    THREE.float(material.bumpScale ?? 1.0)
+                );
+            }
+
+            if (material.alphaMap) {
+                material.opacityNode = THREE.materialOpacity.mul(THREE.texture(material.alphaMap, displacedUv).g);
+            }
+
+            material.needsUpdate = true;
+        }
+
         function applyMaterialSelectionState(material, selected) {
             if (!material?.emissive) return;
 
@@ -501,10 +549,12 @@
         }
 
         function createMaterial(md) {
-            const key = md.name || 'default';
+            const modelName = md.model || 'MeshStandardMaterial';
+            const key = `${modelName}::${md.name || 'default'}`;
             let template = materialCache.get(key);
 
             if (!template) {
+                const isAdvancedMaterial = modelName === 'MeshStandardNodeMaterial';
                 const params = {
                     color: new THREE.Color(md.color[0], md.color[1], md.color[2]),
                     roughness: md.rough ?? 0.5,
@@ -543,7 +593,11 @@
                 if (md.dispB != null) params.displacementBias = md.dispB;
                 if (md.aoI != null) params.aoMapIntensity = md.aoI;
 
-                template = new THREE.MeshStandardMaterial(params);
+                template = isAdvancedMaterial
+                    ? new THREE.MeshStandardNodeMaterial(params)
+                    : new THREE.MeshStandardMaterial(params);
+                template.userData ??= {};
+                template.userData.maxjsMaterialModel = modelName;
 
                 // Textures
                 if (md.map) template.map = loadTexture(md.map, THREE.SRGBColorSpace, md.mapXf, fallbackWhiteTexture);
@@ -560,6 +614,10 @@
                 if (md.lmMap) {
                     template.lightMap = loadTexture(md.lmMap, THREE.LinearSRGBColorSpace, md.lmMapXf, fallbackWhiteTexture);
                     template.lightMapIntensity = md.lmI ?? 1.0;
+                }
+
+                if (isAdvancedMaterial) {
+                    applyAdvancedMaterialNodes(template, md);
                 }
 
                 rememberMaterialEmissiveBase(template);

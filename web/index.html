@@ -173,7 +173,7 @@
             <button id="btnPostFxPanel">Post FX</button>
         </div>
     </div>
-    <aside id="postPanel" class="sidepanel" aria-hidden="true"></aside>
+    <aside id="postPanel" class="sidepanel" aria-hidden="true" inert></aside>
     <script type="importmap">
     {
         "imports": {
@@ -310,7 +310,7 @@
             captureScene.background = hdrTex;
             captureScene.backgroundRotation.copy(scene.environmentRotation);
 
-            const cubeRenderTarget = new THREE.CubeRenderTarget(128, {
+            const cubeRenderTarget = new THREE.WebGLCubeRenderTarget(128, {
                 type: hdrTex.type ?? THREE.HalfFloatType,
                 colorSpace: hdrTex.colorSpace ?? THREE.LinearSRGBColorSpace,
             });
@@ -1184,7 +1184,12 @@
 
         function setPostPanelVisible(visible) {
             postPanelVisible = !!visible;
+            const activeElement = document.activeElement;
+            if (!postPanelVisible && activeElement instanceof HTMLElement && postPanel.contains(activeElement)) {
+                btnPostFxPanel.focus();
+            }
             postPanel.classList.toggle('visible', postPanelVisible);
+            postPanel.toggleAttribute('inert', !postPanelVisible);
             postPanel.setAttribute('aria-hidden', String(!postPanelVisible));
             syncPostFxPanel(true);
         }

@@ -19,13 +19,20 @@ import {
     vec3,
     vec4,
     screenUV,
+    screenSize,
     builtinShadowContext,
+    posterize,
+    uniform,
+    replaceDefaultUV,
 } from 'three/tsl';
 import { bloom } from 'three/addons/tsl/display/BloomNode.js';
 import { ssr } from 'three/addons/tsl/display/SSRNode.js';
 import { ssgi } from 'three/addons/tsl/display/SSGINode.js';
 import { outline } from 'three/addons/tsl/display/OutlineNode.js';
 import { sss } from 'three/addons/tsl/display/SSSNode.js';
+import { scanlines, vignette, colorBleeding, barrelUV } from 'three/addons/tsl/display/CRT.js';
+import { bayerDither } from 'three/addons/tsl/math/Bayer.js';
+import { retroPass } from 'three/addons/tsl/display/RetroPassNode.js';
 
 function setTexturePrecision(scenePass) {
     const diffuseTexture = scenePass.getTexture('diffuseColor');
@@ -70,7 +77,7 @@ export function createSSGIController({ renderer, scene, camera, backendLabel = '
             threshold: 0.75,
         },
         outline: {
-            enabled: true,
+            enabled: false,
             edgeStrength: 3.0,
             edgeGlow: 0.0,
             edgeThickness: 1.0,
@@ -84,6 +91,22 @@ export function createSSGIController({ renderer, scene, camera, backendLabel = '
             shadowIntensity: 1.0,
             quality: 0.5,
             temporal: true,
+        },
+        retro: {
+            enabled: false,
+            wiggle: true,
+            affineDistortion: 5.0,
+            resolutionScale: 0.25,
+            filterTextures: false,
+            dither: false,
+            colorDepth: 32,
+            scanlines: false,
+            scanlineIntensity: 0.3,
+            scanlineDensity: 1.0,
+            crt: false,
+            vignetteIntensity: 0.3,
+            bleeding: 0.001,
+            curvature: 0.02,
         },
     };
 
@@ -156,7 +179,8 @@ export function createSSGIController({ renderer, scene, camera, backendLabel = '
     function hasAnyEffectEnabled() {
         return state.ssgi.enabled || state.ssr.enabled || state.bloom.enabled
             || (state.outline.enabled && selectedObjects.length > 0)
-            || (state.contactShadow.enabled && mainLight);
+            || (state.contactShadow.enabled && mainLight)
+            || state.retro.enabled;
     }
 
     function computeSceneReferenceSize() {
@@ -199,6 +223,7 @@ export function createSSGIController({ renderer, scene, camera, backendLabel = '
             bloom: { ...state.bloom },
             outline: { ...state.outline, selectedCount: selectedObjects.length },
             contactShadow: { ...state.contactShadow },
+            retro: { ...state.retro },
         };
     }
 
@@ -244,33 +269,48 @@ export function createSSGIController({ renderer, scene, camera, backendLabel = '
                 sssContext = builtinShadowContext(sssSample, mainLight);
             }
 
-            const scenePass = pass(scene, camera);
-            activeNodes.push(scenePass);
+            const useWiggle = state.retro.enabled && state.retro.wiggle;
+            let beauty;
+            let scenePassDepth, scenePassDiffuse, scenePassNormalColor, scenePassMetalRough, sceneNormal, ssrReflectivity;
 
-            if (sssContext) scenePass.contextNode = sssContext;
+            if (useWiggle) {
+                // Wiggle: retroPass replaces the normal scene pass
+                const r = state.retro;
+                const retro = retroPass(scene, camera, { affineDistortion: uniform(r.affineDistortion) });
+                retro.setResolutionScale(r.resolutionScale);
+                retro.filterTextures = r.filterTextures;
+                activeNodes.push(retro);
+                beauty = retro;
+                // No MRT — SSGI/SSR won't have depth/normals
+            } else {
+                // Normal scene pass with MRT for SSGI/SSR
+                const scenePass = pass(scene, camera);
+                activeNodes.push(scenePass);
 
-            scenePass.setMRT(mrt({
-                output,
-                diffuseColor,
-                normal: directionToColor(normalView),
-                metalrough: vec2(metalness, roughness),
-            }));
+                if (sssContext) scenePass.contextNode = sssContext;
 
-            setTexturePrecision(scenePass);
+                scenePass.setMRT(mrt({
+                    output,
+                    diffuseColor,
+                    normal: directionToColor(normalView),
+                    metalrough: vec2(metalness, roughness),
+                }));
 
-            const scenePassColor = scenePass.getTextureNode('output');
-            const scenePassDiffuse = scenePass.getTextureNode('diffuseColor');
-            const scenePassDepth = scenePass.getTextureNode('depth');
-            const scenePassNormalColor = scenePass.getTextureNode('normal');
-            const scenePassMetalRough = scenePass.getTextureNode('metalrough');
-            const sceneNormal = sample((uvNode) => colorToDirection(scenePassNormalColor.sample(uvNode)));
-            const ssrReflectivity = max(
-                scenePassMetalRough.r,
-                sub(float(1.0), scenePassMetalRough.g).mul(SSR_DIELECTRIC_STRENGTH)
-            );
-            let beauty = scenePassColor;
+                setTexturePrecision(scenePass);
 
-            if (state.ssgi.enabled) {
+                beauty = scenePass.getTextureNode('output');
+                scenePassDiffuse = scenePass.getTextureNode('diffuseColor');
+                scenePassDepth = scenePass.getTextureNode('depth');
+                scenePassNormalColor = scenePass.getTextureNode('normal');
+                scenePassMetalRough = scenePass.getTextureNode('metalrough');
+                sceneNormal = sample((uvNode) => colorToDirection(scenePassNormalColor.sample(uvNode)));
+                ssrReflectivity = max(
+                    scenePassMetalRough.r,
+                    sub(float(1.0), scenePassMetalRough.g).mul(SSR_DIELECTRIC_STRENGTH)
+                );
+            }
+
+            if (state.ssgi.enabled && !useWiggle) {
                 const ssgiPass = ssgi(scenePassColor, scenePassDepth, sceneNormal, camera);
                 ssgiPass.sliceCount.value = state.ssgi.sliceCount;
                 ssgiPass.stepCount.value = state.ssgi.stepCount;
@@ -291,7 +331,7 @@ export function createSSGIController({ renderer, scene, camera, backendLabel = '
                 );
             }
 
-            if (state.ssr.enabled) {
+            if (state.ssr.enabled && !useWiggle) {
                 const derived = computeDerivedState();
                 const ssrPass = ssr(
                     scenePassColor,
@@ -337,6 +377,34 @@ export function createSSGIController({ renderer, scene, camera, backendLabel = '
                     .add(outlinePass.hiddenEdge.mul(vec3(hidC[0], hidC[1], hidC[2])))
                     .mul(state.outline.edgeStrength);
                 beauty = beauty.add(vec4(outlineColor, 0));
+            }
+
+            if (state.retro.enabled) {
+                const r = state.retro;
+
+                // CRT barrel distortion + color bleeding
+                if (r.crt) {
+                    const distortedUV = barrelUV(uniform(r.curvature));
+                    beauty = replaceDefaultUV(distortedUV, beauty);
+                    beauty = colorBleeding(beauty, uniform(r.bleeding));
+                }
+
+                // Dither + posterize
+                if (r.dither) {
+                    const colorSteps = uniform(r.colorDepth);
+                    beauty = bayerDither(beauty, colorSteps);
+                    beauty = posterize(beauty, colorSteps);
+                }
+
+                // Vignette
+                if (r.vignetteIntensity > 0) {
+                    beauty = vignette(beauty, uniform(r.vignetteIntensity), 0.6);
+                }
+
+                // Scanlines
+                if (r.scanlines) {
+                    beauty = scanlines(beauty, uniform(r.scanlineIntensity), screenSize.y.mul(uniform(r.scanlineDensity)), 0.0);
+                }
             }
 
             postProcessing.outputNode = beauty;
@@ -487,6 +555,31 @@ export function createSSGIController({ renderer, scene, camera, backendLabel = '
             const changed = mainLight !== light;
             mainLight = light;
             if (changed && state.contactShadow.enabled) rebuildPipeline();
+        },
+        isRetroEnabled() {
+            return state.retro.enabled;
+        },
+        setRetroEnabled(enabled) {
+            state.retro.enabled = !!enabled;
+            rebuildPipeline();
+            return state.retro.enabled;
+        },
+        setRetroOptions(options = {}) {
+            if (typeof options.wiggle === 'boolean') state.retro.wiggle = options.wiggle;
+            assignFinite(state.retro, 'affineDistortion', options.affineDistortion);
+            assignFinite(state.retro, 'resolutionScale', options.resolutionScale);
+            if (typeof options.filterTextures === 'boolean') state.retro.filterTextures = options.filterTextures;
+            if (typeof options.dither === 'boolean') state.retro.dither = options.dither;
+            assignFinite(state.retro, 'colorDepth', options.colorDepth);
+            if (typeof options.scanlines === 'boolean') state.retro.scanlines = options.scanlines;
+            assignFinite(state.retro, 'scanlineIntensity', options.scanlineIntensity);
+            assignFinite(state.retro, 'scanlineDensity', options.scanlineDensity);
+            if (typeof options.crt === 'boolean') state.retro.crt = options.crt;
+            assignFinite(state.retro, 'vignetteIntensity', options.vignetteIntensity);
+            assignFinite(state.retro, 'bleeding', options.bleeding);
+            assignFinite(state.retro, 'curvature', options.curvature);
+            rebuildPipeline();
+            return { ...state.retro };
         },
         render() {
             if (!hasAnyEffectEnabled() || !pipelineReady) {

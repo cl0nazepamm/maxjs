@@ -94,43 +94,43 @@ float GetDisplayExtent(IParamBlock2* pblock, ThreeJSLightType type) {
 
 const LightClassSpec kLegacyLightSpec = {
     THREEJS_LIGHT_LEGACY_CLASS_ID, kLight_Directional,
-    _T("ThreeJS Light"), _T("ThreeJSLight"), _T("TJS_Light"),
+    _T("MaxJS Light"), _T("ThreeJSLight"), _T("TJS_Light"),
     IDS_LIGHT_PARAMS_LEGACY, IDD_THREEJS_LIGHT_LEGACY, false, true
 };
 
 const LightClassSpec kDirectionalLightSpec = {
     THREEJS_DIRECTIONAL_LIGHT_CLASS_ID, kLight_Directional,
-    _T("ThreeJS Directional Light"), _T("ThreeJSDirectionalLight"), _T("TJS_Directional"),
+    _T("Directional Light"), _T("ThreeJSDirectionalLight"), _T("TJS_Directional"),
     IDS_DIRECTIONAL_LIGHT_PARAMS, IDD_THREEJS_DIRECTIONAL_LIGHT, true, false
 };
 
 const LightClassSpec kPointLightSpec = {
     THREEJS_POINT_LIGHT_CLASS_ID, kLight_Point,
-    _T("ThreeJS Point Light"), _T("ThreeJSPointLight"), _T("TJS_Point"),
+    _T("Point Light"), _T("ThreeJSPointLight"), _T("TJS_Point"),
     IDS_POINT_LIGHT_PARAMS, IDD_THREEJS_POINT_LIGHT, true, false
 };
 
 const LightClassSpec kSpotLightSpec = {
     THREEJS_SPOT_LIGHT_CLASS_ID, kLight_Spot,
-    _T("ThreeJS Spot Light"), _T("ThreeJSSpotLight"), _T("TJS_Spot"),
+    _T("Spot Light"), _T("ThreeJSSpotLight"), _T("TJS_Spot"),
     IDS_SPOT_LIGHT_PARAMS, IDD_THREEJS_SPOT_LIGHT, true, false
 };
 
 const LightClassSpec kRectAreaLightSpec = {
     THREEJS_RECT_AREA_LIGHT_CLASS_ID, kLight_RectArea,
-    _T("ThreeJS Rect Area Light"), _T("ThreeJSRectAreaLight"), _T("TJS_RectArea"),
+    _T("Rect Area Light"), _T("ThreeJSRectAreaLight"), _T("TJS_RectArea"),
     IDS_RECT_AREA_LIGHT_PARAMS, IDD_THREEJS_RECT_AREA_LIGHT, true, false
 };
 
 const LightClassSpec kHemisphereLightSpec = {
     THREEJS_HEMISPHERE_LIGHT_CLASS_ID, kLight_Hemisphere,
-    _T("ThreeJS Hemisphere Light"), _T("ThreeJSHemisphereLight"), _T("TJS_Hemisphere"),
+    _T("Hemisphere Light"), _T("ThreeJSHemisphereLight"), _T("TJS_Hemisphere"),
     IDS_HEMISPHERE_LIGHT_PARAMS, IDD_THREEJS_HEMISPHERE_LIGHT, true, false
 };
 
 const LightClassSpec kAmbientLightSpec = {
     THREEJS_AMBIENT_LIGHT_CLASS_ID, kLight_Ambient,
-    _T("ThreeJS Ambient Light"), _T("ThreeJSAmbientLight"), _T("TJS_Ambient"),
+    _T("Ambient Light"), _T("ThreeJSAmbientLight"), _T("TJS_Ambient"),
     IDS_AMBIENT_LIGHT_PARAMS, IDD_THREEJS_AMBIENT_LIGHT, true, false
 };
 
@@ -495,7 +495,7 @@ CreateMouseCallBack* ThreeJSLight::GetCreateMouseCallBack() {
 }
 
 static ParamBlockDesc2 g_legacyLightPB(
-    threejs_light_params, _T("ThreeJS Light Parameters"), IDS_LIGHT_PARAMS_LEGACY, &g_legacyLightDesc,
+    threejs_light_params, _T("MaxJS Light Parameters"), IDS_LIGHT_PARAMS_LEGACY, &g_legacyLightDesc,
     P_AUTO_CONSTRUCT + P_AUTO_UI, 0,
     IDD_THREEJS_LIGHT_LEGACY, IDS_LIGHT_PARAMS_LEGACY, 0, 0, nullptr,
     pl_type, _T("lightType"), TYPE_INT, 0, 0,
@@ -571,7 +571,7 @@ static ParamBlockDesc2 g_legacyLightPB(
 );
 
 static ParamBlockDesc2 g_directionalLightPB(
-    threejs_light_params, _T("ThreeJS Directional Light Parameters"), IDS_DIRECTIONAL_LIGHT_PARAMS, &g_directionalLightDesc,
+    threejs_light_params, _T("Directional Light Parameters"), IDS_DIRECTIONAL_LIGHT_PARAMS, &g_directionalLightDesc,
     P_AUTO_CONSTRUCT + P_AUTO_UI, 0,
     IDD_THREEJS_DIRECTIONAL_LIGHT, IDS_DIRECTIONAL_LIGHT_PARAMS, 0, 0, nullptr,
     pl_color, _T("color"), TYPE_RGBA, P_ANIMATABLE, 0,
@@ -606,7 +606,7 @@ static ParamBlockDesc2 g_directionalLightPB(
 );
 
 static ParamBlockDesc2 g_pointLightPB(
-    threejs_light_params, _T("ThreeJS Point Light Parameters"), IDS_POINT_LIGHT_PARAMS, &g_pointLightDesc,
+    threejs_light_params, _T("Point Light Parameters"), IDS_POINT_LIGHT_PARAMS, &g_pointLightDesc,
     P_AUTO_CONSTRUCT + P_AUTO_UI, 0,
     IDD_THREEJS_POINT_LIGHT, IDS_POINT_LIGHT_PARAMS, 0, 0, nullptr,
     pl_color, _T("color"), TYPE_RGBA, P_ANIMATABLE, 0,
@@ -651,7 +651,7 @@ static ParamBlockDesc2 g_pointLightPB(
 );
 
 static ParamBlockDesc2 g_spotLightPB(
-    threejs_light_params, _T("ThreeJS Spot Light Parameters"), IDS_SPOT_LIGHT_PARAMS, &g_spotLightDesc,
+    threejs_light_params, _T("Spot Light Parameters"), IDS_SPOT_LIGHT_PARAMS, &g_spotLightDesc,
     P_AUTO_CONSTRUCT + P_AUTO_UI, 0,
     IDD_THREEJS_SPOT_LIGHT, IDS_SPOT_LIGHT_PARAMS, 0, 0, nullptr,
     pl_color, _T("color"), TYPE_RGBA, P_ANIMATABLE, 0,
@@ -706,7 +706,7 @@ static ParamBlockDesc2 g_spotLightPB(
 );
 
 static ParamBlockDesc2 g_rectAreaLightPB(
-    threejs_light_params, _T("ThreeJS Rect Area Light Parameters"), IDS_RECT_AREA_LIGHT_PARAMS, &g_rectAreaLightDesc,
+    threejs_light_params, _T("Rect Area Light Parameters"), IDS_RECT_AREA_LIGHT_PARAMS, &g_rectAreaLightDesc,
     P_AUTO_CONSTRUCT + P_AUTO_UI, 0,
     IDD_THREEJS_RECT_AREA_LIGHT, IDS_RECT_AREA_LIGHT_PARAMS, 0, 0, nullptr,
     pl_color, _T("color"), TYPE_RGBA, P_ANIMATABLE, 0,
@@ -732,7 +732,7 @@ static ParamBlockDesc2 g_rectAreaLightPB(
 );
 
 static ParamBlockDesc2 g_hemisphereLightPB(
-    threejs_light_params, _T("ThreeJS Hemisphere Light Parameters"), IDS_HEMISPHERE_LIGHT_PARAMS, &g_hemisphereLightDesc,
+    threejs_light_params, _T("Hemisphere Light Parameters"), IDS_HEMISPHERE_LIGHT_PARAMS, &g_hemisphereLightDesc,
     P_AUTO_CONSTRUCT + P_AUTO_UI, 0,
     IDD_THREEJS_HEMISPHERE_LIGHT, IDS_HEMISPHERE_LIGHT_PARAMS, 0, 0, nullptr,
     pl_color, _T("color"), TYPE_RGBA, P_ANIMATABLE, 0,
@@ -752,7 +752,7 @@ static ParamBlockDesc2 g_hemisphereLightPB(
 );
 
 static ParamBlockDesc2 g_ambientLightPB(
-    threejs_light_params, _T("ThreeJS Ambient Light Parameters"), IDS_AMBIENT_LIGHT_PARAMS, &g_ambientLightDesc,
+    threejs_light_params, _T("Ambient Light Parameters"), IDS_AMBIENT_LIGHT_PARAMS, &g_ambientLightDesc,
     P_AUTO_CONSTRUCT + P_AUTO_UI, 0,
     IDD_THREEJS_AMBIENT_LIGHT, IDS_AMBIENT_LIGHT_PARAMS, 0, 0, nullptr,
     pl_color, _T("color"), TYPE_RGBA, P_ANIMATABLE, 0,

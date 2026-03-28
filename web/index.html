@@ -182,7 +182,7 @@
             <button id="btnCamLock" class="active">Cam Lock: ON</button>
             <button id="btnEnv">Env: OFF</button>
             <button id="btnLightProbe" class="active">Probe: ON</button>
-            <button id="btnSel" class="active">Outline: ON</button>
+            <button id="btnSel">Outline: OFF</button>
             <button id="btnPostFxPanel">Post FX</button>
         </div>
     </div>
@@ -1443,7 +1443,7 @@
             return true;
         }
 
-        let selHighlight = true;
+        let selHighlight = false;
 
         function applySelection(mesh, selected) {
             mesh.userData.maxjsSelected = !!selected;
@@ -1883,7 +1883,7 @@
             },
             {
                 key: 'retro',
-                title: 'Retro / CRT',
+                title: 'Retro',
                 copy: 'PS1-style posterization, scanlines, barrel distortion, and CRT effects.',
                 note: 'Works on WebGPU and WebGL fallback.',
                 requiresWebGPU: false,
@@ -1892,12 +1892,19 @@
                 getValues: (state) => state.retro,
                 setValues: (patch) => ssgiFx.setRetroOptions(patch),
                 controls: [
+                    { key: 'wiggle', label: 'Wiggle (PS1)', type: 'checkbox' },
+                    { key: 'affineDistortion', label: 'Affine Amt', min: 0, max: 20, step: 0.5 },
+                    { key: 'resolutionScale', label: 'Resolution', min: 0.1, max: 1, step: 0.05 },
+                    { key: 'filterTextures', label: 'Filter Tex', type: 'checkbox' },
+                    { key: 'dither', label: 'Dither', type: 'checkbox' },
                     { key: 'colorDepth', label: 'Color Depth', min: 2, max: 64, step: 1, integer: true },
-                    { key: 'scanlineIntensity', label: 'Scanlines', min: 0, max: 1, step: 0.01 },
+                    { key: 'scanlines', label: 'Scanlines', type: 'checkbox' },
+                    { key: 'scanlineIntensity', label: 'Scan Intensity', min: 0, max: 1, step: 0.01 },
                     { key: 'scanlineDensity', label: 'Scan Density', min: 0.02, max: 1, step: 0.01 },
-                    { key: 'vignetteIntensity', label: 'Vignette', min: 0, max: 1, step: 0.01 },
-                    { key: 'bleeding', label: 'Color Bleed', min: 0, max: 0.01, step: 0.001 },
+                    { key: 'crt', label: 'CRT Distortion', type: 'checkbox' },
                     { key: 'curvature', label: 'Curvature', min: 0, max: 0.2, step: 0.01 },
+                    { key: 'bleeding', label: 'Color Bleed', min: 0, max: 0.01, step: 0.001 },
+                    { key: 'vignetteIntensity', label: 'Vignette', min: 0, max: 1, step: 0.01 },
                 ],
             },
         ];

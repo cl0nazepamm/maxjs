@@ -80,6 +80,47 @@ static std::wstring EscapeJson(const wchar_t* s) {
     return out;
 }
 
+static std::wstring Utf8ToWide(const std::string& s) {
+    if (s.empty()) return {};
+    int needed = MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), nullptr, 0);
+    if (needed <= 0) return {};
+    std::wstring out(static_cast<size_t>(needed), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), out.data(), needed);
+    return out;
+}
+
+static std::wstring UrlEncodePath(const std::wstring& path) {
+    if (path.empty()) return {};
+
+    int utf8Len = WideCharToMultiByte(CP_UTF8, 0, path.data(), static_cast<int>(path.size()), nullptr, 0, nullptr, nullptr);
+    if (utf8Len <= 0) return {};
+
+    std::string utf8(static_cast<size_t>(utf8Len), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, path.data(), static_cast<int>(path.size()), utf8.data(), utf8Len, nullptr, nullptr);
+
+    static constexpr char kHex[] = "0123456789ABCDEF";
+    std::string encoded;
+    encoded.reserve(utf8.size() * 3);
+
+    for (unsigned char c : utf8) {
+        const bool isUnreserved =
+            (c >= 'A' && c <= 'Z') ||
+            (c >= 'a' && c <= 'z') ||
+            (c >= '0' && c <= '9') ||
+            c == '-' || c == '_' || c == '.' || c == '~' || c == '/';
+
+        if (isUnreserved) {
+            encoded.push_back(static_cast<char>(c));
+        } else {
+            encoded.push_back('%');
+            encoded.push_back(kHex[(c >> 4) & 0xF]);
+            encoded.push_back(kHex[c & 0xF]);
+        }
+    }
+
+    return Utf8ToWide(encoded);
+}
+
 static float SafeJsonFloat(float value, float fallback = 0.0f) {
     if (!std::isfinite(value)) return fallback;
     if (std::fabs(value) > 1.0e15f) return fallback;
@@ -216,7 +257,9 @@ struct MaxJSPBR {
     float roughnessMapStrength = 1.0f;
     float metalnessMapStrength = 1.0f;
     float normalScale = 1.0f;
-    float parallaxScale = 0.0f;
+    float bumpScale = 1.0f;
+    float displacementScale = 0.0f;
+    float displacementBias = 0.0f;
     float emissiveMapStrength = 1.0f;
     float opacityMapStrength = 1.0f;
     float aoIntensity = 1.0f;
@@ -225,10 +268,10 @@ struct MaxJSPBR {
     bool  doubleSided = true;
     float envIntensity = 1.0f;
     std::wstring colorMap, roughnessMap, metalnessMap, normalMap;
-    std::wstring parallaxMap;
+    std::wstring bumpMap, displacementMap;
     std::wstring aoMap, emissionMap, lightmapFile, opacityMap;
     TexTransform colorMapTransform, roughnessMapTransform, metalnessMapTransform, normalMapTransform;
-    TexTransform parallaxMapTransform;
+    TexTransform bumpMapTransform, displacementMapTransform;
     TexTransform aoMapTransform, emissionMapTransform, lightmapTransform, opacityMapTransform;
     std::wstring mtlName;
 };
@@ -389,7 +432,9 @@ static void ExtractThreeJSMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
     d.roughnessMapStrength = pb->GetFloat(pb_roughness_map_strength, t);
     d.metalnessMapStrength = pb->GetFloat(pb_metalness_map_strength, t);
     d.normalScale = pb->GetFloat(pb_normal_scale, t);
-    d.parallaxScale = pb->GetFloat(pb_bump_scale, t) * 0.1f;
+    d.bumpScale = pb->GetFloat(pb_bump_scale, t);
+    d.displacementScale = pb->GetFloat(pb_displacement_scale, t);
+    d.displacementBias = pb->GetFloat(pb_displacement_bias, t);
     d.doubleSided = pb->GetInt(pb_double_sided, t) != 0;
     d.envIntensity = pb->GetFloat(pb_env_intensity, t);
 
@@ -413,7 +458,8 @@ static void ExtractThreeJSMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
     readMap(pb_roughness_map, d.roughnessMap, d.roughnessMapTransform);
     readMap(pb_metalness_map, d.metalnessMap, d.metalnessMapTransform);
     readMap(pb_normal_map, d.normalMap, d.normalMapTransform);
-    readMap(pb_bump_map, d.parallaxMap, d.parallaxMapTransform);
+    readMap(pb_bump_map, d.bumpMap, d.bumpMapTransform);
+    readMap(pb_displacement_map, d.displacementMap, d.displacementMapTransform);
     readMap(pb_emissive_map, d.emissionMap, d.emissionMapTransform);
     readMap(pb_opacity_map, d.opacityMap, d.opacityMapTransform);
     readMap(pb_lightmap, d.lightmapFile, d.lightmapTransform);
@@ -1038,7 +1084,9 @@ public:
         // C:\foo\bar.png → https://maxjsdrvc.local/foo/bar.png
         std::wstring relPath = filePath.substr(3);
         std::replace(relPath.begin(), relPath.end(), L'\\', L'/');
-        return L"https://" + it->second + L"/" + relPath;
+        std::wstring encodedRelPath = UrlEncodePath(relPath);
+        if (encodedRelPath.empty()) return {};
+        return L"https://" + it->second + L"/" + encodedRelPath;
     }
 
     // ── Callbacks & sync ─────────────────────────────────────
@@ -1585,7 +1633,8 @@ public:
         writeMap(L"roughMap", L"roughMapXf", pbr.roughnessMap, pbr.roughnessMapTransform);
         writeMap(L"metalMap", L"metalMapXf", pbr.metalnessMap, pbr.metalnessMapTransform);
         writeMap(L"normMap", L"normMapXf", pbr.normalMap, pbr.normalMapTransform);
-        writeMap(L"parallaxMap", L"parallaxMapXf", pbr.parallaxMap, pbr.parallaxMapTransform);
+        writeMap(L"bumpMap", L"bumpMapXf", pbr.bumpMap, pbr.bumpMapTransform);
+        writeMap(L"dispMap", L"dispMapXf", pbr.displacementMap, pbr.displacementMapTransform);
         writeMap(L"aoMap", L"aoMapXf", pbr.aoMap, pbr.aoMapTransform);
         writeMap(L"emMap", L"emMapXf", pbr.emissionMap, pbr.emissionMapTransform);
         writeMap(L"lmMap", L"lmMapXf", pbr.lightmapFile, pbr.lightmapTransform);
@@ -1621,9 +1670,15 @@ public:
         }
         ss << L",\"normScl\":";
         WriteFloatValue(ss, pbr.normalScale, 1.0f);
-        if (!pbr.parallaxMap.empty() || std::fabs(pbr.parallaxScale) > 1.0e-6f) {
-            ss << L",\"parallaxS\":";
-            WriteFloatValue(ss, pbr.parallaxScale, 0.0f);
+        if (!pbr.bumpMap.empty() || std::fabs(pbr.bumpScale - 1.0f) > 1.0e-6f) {
+            ss << L",\"bumpS\":";
+            WriteFloatValue(ss, pbr.bumpScale, 1.0f);
+        }
+        if (!pbr.displacementMap.empty() || std::fabs(pbr.displacementScale) > 1.0e-6f || std::fabs(pbr.displacementBias) > 1.0e-6f) {
+            ss << L",\"dispS\":";
+            WriteFloatValue(ss, pbr.displacementScale, 0.0f);
+            ss << L",\"dispB\":";
+            WriteFloatValue(ss, pbr.displacementBias, 0.0f);
         }
         ss << L",\"aoI\":";
         WriteFloatValue(ss, pbr.aoIntensity, 1.0f);

@@ -95,13 +95,19 @@
         const materialCache = new Map();
         const nodeMap = new Map();
         const perfHud = createPerfHud(document.getElementById('info'));
-        const fallbackHeightTexture = new THREE.DataTexture(new Uint8Array([255, 255, 255, 255]), 1, 1);
+        function createSolidTexture(r, g, b, a = 255) {
+            const tex = new THREE.DataTexture(new Uint8Array([r, g, b, a]), 1, 1);
+            tex.colorSpace = THREE.NoColorSpace;
+            tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+            tex.minFilter = tex.magFilter = THREE.LinearFilter;
+            tex.needsUpdate = true;
+            tex.updateMatrix();
+            return tex;
+        }
 
-        fallbackHeightTexture.colorSpace = THREE.NoColorSpace;
-        fallbackHeightTexture.wrapS = fallbackHeightTexture.wrapT = THREE.RepeatWrapping;
-        fallbackHeightTexture.minFilter = fallbackHeightTexture.magFilter = THREE.LinearFilter;
-        fallbackHeightTexture.needsUpdate = true;
-        fallbackHeightTexture.updateMatrix();
+        const fallbackWhiteTexture = createSolidTexture(255, 255, 255, 255);
+        const fallbackFlatNormalTexture = createSolidTexture(128, 128, 255, 255);
+        const fallbackHeightTexture = createSolidTexture(255, 255, 255, 255);
 
         let firstSync = true;
         let camLock = false;
@@ -159,15 +165,31 @@
             tex.center.set(xf.center[0], xf.center[1]);
             tex.rotation = THREE.MathUtils.degToRad(xf.rotate);
             tex.updateMatrix();
-            tex.needsUpdate = true;
         }
 
-        function loadTexture(url, colorSpace = THREE.LinearSRGBColorSpace, xf = null) {
+        function applyFallbackImage(tex, fallbackTex, colorSpace, xf, url) {
+            tex.image = fallbackTex.image;
+            tex.colorSpace = colorSpace;
+            applyTextureTransform(tex, xf);
+            tex.needsUpdate = true;
+            console.warn('MaxJS missing texture, using fallback:', url);
+        }
+
+        function loadTexture(url, colorSpace = THREE.LinearSRGBColorSpace, xf = null, fallbackTex = fallbackWhiteTexture) {
             if (!url) return null;
             const normalizedXf = normalizeTextureTransform(xf);
             const cacheKey = JSON.stringify([url, String(colorSpace), normalizedXf]);
             if (textureCache.has(cacheKey)) return textureCache.get(cacheKey);
-            const tex = textureLoader.load(url);
+            const tex = textureLoader.load(
+                url,
+                loadedTex => {
+                    loadedTex.colorSpace = colorSpace;
+                    applyTextureTransform(loadedTex, normalizedXf);
+                    loadedTex.needsUpdate = true;
+                },
+                undefined,
+                () => applyFallbackImage(tex, fallbackTex, colorSpace, normalizedXf, url)
+            );
             tex.colorSpace = colorSpace;
             applyTextureTransform(tex, normalizedXf);
             textureCache.set(cacheKey, tex);
@@ -214,252 +236,6 @@
             });
         }
 
-        function clamp01(value, fallback = 1.0) {
-            const num = Number.isFinite(value) ? value : fallback;
-            return Math.min(1.0, Math.max(0.0, num));
-        }
-
-        function installThreeJSMaterialExtensions(mat, md) {
-            const parallaxMap = md.parallaxMap
-                ? loadTexture(md.parallaxMap, THREE.NoColorSpace, md.parallaxMapXf)
-                : null;
-            const parallaxScale = Number.isFinite(md.parallaxS) ? md.parallaxS : 0.0;
-            const mapStrength = clamp01(md.mapS, 1.0);
-            const roughMapStrength = clamp01(md.roughMapS, 1.0);
-            const metalMapStrength = clamp01(md.metalMapS, 1.0);
-            const emissiveMapStrength = clamp01(md.emMapS, 1.0);
-            const opacityMapStrength = clamp01(md.opMapS, 1.0);
-
-            const needsShaderPatch =
-                !!parallaxMap ||
-                mapStrength !== 1.0 ||
-                roughMapStrength !== 1.0 ||
-                metalMapStrength !== 1.0 ||
-                emissiveMapStrength !== 1.0 ||
-                opacityMapStrength !== 1.0;
-
-            if (!needsShaderPatch) return;
-
-            mat.onBeforeCompile = shader => {
-                shader.uniforms.maxjsMapStrength = { value: mapStrength };
-                shader.uniforms.maxjsRoughnessMapStrength = { value: roughMapStrength };
-                shader.uniforms.maxjsMetalnessMapStrength = { value: metalMapStrength };
-                shader.uniforms.maxjsEmissiveMapStrength = { value: emissiveMapStrength };
-                shader.uniforms.maxjsOpacityMapStrength = { value: opacityMapStrength };
-                shader.uniforms.maxjsParallaxMap = { value: parallaxMap || fallbackHeightTexture };
-                shader.uniforms.maxjsParallaxMapTransform = { value: (parallaxMap || fallbackHeightTexture).matrix };
-                shader.uniforms.maxjsParallaxScale = { value: parallaxMap ? parallaxScale : 0.0 };
-                shader.uniforms.maxjsUseParallax = { value: parallaxMap ? 1.0 : 0.0 };
-
-                shader.fragmentShader = shader.fragmentShader.replace(
-                    '#include <common>',
-                    `#include <common>
-uniform float maxjsMapStrength;
-uniform float maxjsRoughnessMapStrength;
-uniform float maxjsMetalnessMapStrength;
-uniform float maxjsEmissiveMapStrength;
-uniform float maxjsOpacityMapStrength;
-uniform sampler2D maxjsParallaxMap;
-uniform mat3 maxjsParallaxMapTransform;
-uniform float maxjsParallaxScale;
-uniform float maxjsUseParallax;
-
-vec2 maxjsTransformUv( mat3 uvTransform, vec2 uv ) {
-	return ( uvTransform * vec3( uv, 1.0 ) ).xy;
-}
-
-vec3 maxjsSurfaceNormal() {
-#ifdef FLAT_SHADED
-	vec3 fdx = dFdx( vViewPosition );
-	vec3 fdy = dFdy( vViewPosition );
-	vec3 surfNormal = normalize( cross( fdx, fdy ) );
-#else
-	vec3 surfNormal = normalize( vNormal );
-#endif
-#ifdef DOUBLE_SIDED
-	surfNormal *= ( gl_FrontFacing ? 1.0 : - 1.0 );
-#endif
-	return surfNormal;
-}
-
-mat3 maxjsGetTangentFrame( vec3 eyePos, vec3 surfNormal, vec2 uv ) {
-	vec3 q0 = dFdx( eyePos.xyz );
-	vec3 q1 = dFdy( eyePos.xyz );
-	vec2 st0 = dFdx( uv.st );
-	vec2 st1 = dFdy( uv.st );
-	vec3 q1perp = cross( q1, surfNormal );
-	vec3 q0perp = cross( surfNormal, q0 );
-	vec3 tangent = q1perp * st0.x + q0perp * st1.x;
-	vec3 bitangent = q1perp * st0.y + q0perp * st1.y;
-	float det = max( dot( tangent, tangent ), dot( bitangent, bitangent ) );
-	float scale = det == 0.0 ? 0.0 : inversesqrt( det );
-	return mat3( tangent * scale, bitangent * scale, surfNormal );
-}
-
-vec2 maxjsParallaxUv() {
-#ifdef USE_UV
-	vec2 baseUv = vUv;
-	if ( maxjsUseParallax < 0.5 || abs( maxjsParallaxScale ) < 1.0e-6 ) return baseUv;
-
-	vec3 surfNormal = maxjsSurfaceNormal();
-	mat3 tbn = maxjsGetTangentFrame( - vViewPosition, surfNormal, baseUv );
-	vec3 viewDirTs = transpose( tbn ) * normalize( vViewPosition );
-	if ( viewDirTs.z <= 1.0e-5 ) return baseUv;
-
-	float parallaxLimit = - length( viewDirTs.xy ) / viewDirTs.z;
-	parallaxLimit *= maxjsParallaxScale;
-
-	vec2 vOffsetDir = length( viewDirTs.xy ) > 1.0e-5 ? normalize( viewDirTs.xy ) : vec2( 0.0 );
-	vec2 vMaxOffset = vOffsetDir * parallaxLimit;
-	float nNumSamples = mix( 20.0, 10.0, clamp( abs( dot( normalize( vViewPosition ), surfNormal ) ), 0.0, 1.0 ) );
-	float fStepSize = 1.0 / nNumSamples;
-
-	float fCurrRayHeight = 1.0;
-	vec2 vCurrOffset = vec2( 0.0 );
-	vec2 vLastOffset = vec2( 0.0 );
-	float fLastSampledHeight = 1.0;
-
-	for ( int nCurrSample = 0; nCurrSample < 50; nCurrSample ++ ) {
-		if ( float( nCurrSample ) > nNumSamples ) break;
-
-		float fCurrSampledHeight = texture2D(
-			maxjsParallaxMap,
-			maxjsTransformUv( maxjsParallaxMapTransform, baseUv + vCurrOffset )
-		).r;
-
-		if ( fCurrSampledHeight > fCurrRayHeight ) {
-			float delta1 = fCurrSampledHeight - fCurrRayHeight;
-			float delta2 = ( fCurrRayHeight + fStepSize ) - fLastSampledHeight;
-			float ratio = delta1 / max( delta1 + delta2, 1.0e-5 );
-			vCurrOffset = ratio * vLastOffset + ( 1.0 - ratio ) * vCurrOffset;
-			break;
-		} else {
-			fCurrRayHeight -= fStepSize;
-			vLastOffset = vCurrOffset;
-			vCurrOffset += fStepSize * vMaxOffset;
-			fLastSampledHeight = fCurrSampledHeight;
-		}
-	}
-
-	return baseUv + vCurrOffset;
-#else
-	return vec2( 0.0 );
-#endif
-}`
-                );
-
-                shader.fragmentShader = shader.fragmentShader.replace(
-                    '#include <map_fragment>',
-                    `#ifdef USE_MAP
-	vec2 maxjsMapUv = maxjsTransformUv( mapTransform, maxjsParallaxUv() );
-	vec4 sampledDiffuseColor = texture2D( map, maxjsMapUv );
-	#ifdef DECODE_VIDEO_TEXTURE
-		sampledDiffuseColor = sRGBTransferEOTF( sampledDiffuseColor );
-	#endif
-	diffuseColor *= mix( vec4( 1.0 ), sampledDiffuseColor, clamp( maxjsMapStrength, 0.0, 1.0 ) );
-#endif`
-                );
-
-                shader.fragmentShader = shader.fragmentShader.replace(
-                    '#include <roughnessmap_fragment>',
-                    `float roughnessFactor = roughness;
-#ifdef USE_ROUGHNESSMAP
-	vec2 maxjsRoughnessUv = maxjsTransformUv( roughnessMapTransform, maxjsParallaxUv() );
-	vec4 texelRoughness = texture2D( roughnessMap, maxjsRoughnessUv );
-	roughnessFactor *= mix( 1.0, texelRoughness.g, clamp( maxjsRoughnessMapStrength, 0.0, 1.0 ) );
-#endif`
-                );
-
-                shader.fragmentShader = shader.fragmentShader.replace(
-                    '#include <metalnessmap_fragment>',
-                    `float metalnessFactor = metalness;
-#ifdef USE_METALNESSMAP
-	vec2 maxjsMetalnessUv = maxjsTransformUv( metalnessMapTransform, maxjsParallaxUv() );
-	vec4 texelMetalness = texture2D( metalnessMap, maxjsMetalnessUv );
-	metalnessFactor *= mix( 1.0, texelMetalness.b, clamp( maxjsMetalnessMapStrength, 0.0, 1.0 ) );
-#endif`
-                );
-
-                shader.fragmentShader = shader.fragmentShader.replace(
-                    '#include <normal_fragment_maps>',
-                    `#ifdef USE_NORMALMAP_OBJECTSPACE
-	vec2 maxjsNormalUv = maxjsTransformUv( normalMapTransform, maxjsParallaxUv() );
-	normal = texture2D( normalMap, maxjsNormalUv ).xyz * 2.0 - 1.0;
-
-	#ifdef FLIP_SIDED
-		normal = - normal;
-	#endif
-
-	#ifdef DOUBLE_SIDED
-		normal = normal * faceDirection;
-	#endif
-
-	normal = normalize( normalMatrix * normal );
-#elif defined( USE_NORMALMAP_TANGENTSPACE )
-	vec2 maxjsNormalUv = maxjsTransformUv( normalMapTransform, maxjsParallaxUv() );
-	vec3 mapN = texture2D( normalMap, maxjsNormalUv ).xyz * 2.0 - 1.0;
-	mapN.xy *= normalScale;
-	normal = normalize( tbn * mapN );
-#endif`
-                );
-
-                shader.fragmentShader = shader.fragmentShader.replace(
-                    '#include <emissivemap_fragment>',
-                    `#ifdef USE_EMISSIVEMAP
-	vec2 maxjsEmissiveUv = maxjsTransformUv( emissiveMapTransform, maxjsParallaxUv() );
-	vec4 emissiveSample = texture2D( emissiveMap, maxjsEmissiveUv );
-	#ifdef DECODE_VIDEO_TEXTURE_EMISSIVE
-		emissiveSample = sRGBTransferEOTF( emissiveSample );
-	#endif
-	totalEmissiveRadiance *= mix( vec3( 1.0 ), emissiveSample.rgb, clamp( maxjsEmissiveMapStrength, 0.0, 1.0 ) );
-#endif`
-                );
-
-                shader.fragmentShader = shader.fragmentShader.replace(
-                    '#include <alphamap_fragment>',
-                    `#ifdef USE_ALPHAMAP
-	vec2 maxjsAlphaUv = maxjsTransformUv( alphaMapTransform, maxjsParallaxUv() );
-	diffuseColor.a *= mix( 1.0, texture2D( alphaMap, maxjsAlphaUv ).g, clamp( maxjsOpacityMapStrength, 0.0, 1.0 ) );
-#endif`
-                );
-
-                shader.fragmentShader = shader.fragmentShader.replace(
-                    '#include <aomap_fragment>',
-                    `#ifdef USE_AOMAP
-	vec2 maxjsAoUv = maxjsTransformUv( aoMapTransform, maxjsParallaxUv() );
-	float ambientOcclusion = ( texture2D( aoMap, maxjsAoUv ).r - 1.0 ) * aoMapIntensity + 1.0;
-
-	reflectedLight.indirectDiffuse *= ambientOcclusion;
-
-	#if defined( USE_CLEARCOAT )
-		clearcoatSpecularIndirect *= ambientOcclusion;
-	#endif
-
-	#if defined( USE_SHEEN )
-		sheenSpecularIndirect *= ambientOcclusion;
-	#endif
-
-	#if defined( USE_ENVMAP ) && defined( STANDARD )
-		float dotNV = saturate( dot( geometryNormal, geometryViewDir ) );
-		reflectedLight.indirectSpecular *= computeSpecularOcclusion( dotNV, ambientOcclusion, material.roughness );
-	#endif
-#endif`
-                );
-            };
-
-            mat.customProgramCacheKey = () => [
-                'maxjs-special',
-                parallaxMap ? 1 : 0,
-                parallaxMap ? parallaxScale : 0,
-                mapStrength,
-                roughMapStrength,
-                metalMapStrength,
-                emissiveMapStrength,
-                opacityMapStrength,
-            ].join('|');
-            mat.needsUpdate = true;
-        }
-
         // ── Material Creation ───────────────────────────────
         function createMaterial(md) {
             const key = md.name || 'default';
@@ -485,31 +261,34 @@ vec2 maxjsParallaxUv() {
                 }
 
                 if (md.normScl != null) params.normalScale = new THREE.Vector2(md.normScl, md.normScl);
+                if (md.bumpS != null) params.bumpScale = md.bumpS;
+                if (md.dispS != null) params.displacementScale = md.dispS;
+                if (md.dispB != null) params.displacementBias = md.dispB;
                 if (md.aoI != null) params.aoMapIntensity = md.aoI;
 
                 template = new THREE.MeshStandardMaterial(params);
 
                 // Textures
-                if (md.map) template.map = loadTexture(md.map, THREE.SRGBColorSpace, md.mapXf);
-                if (md.roughMap) template.roughnessMap = loadTexture(md.roughMap, THREE.LinearSRGBColorSpace, md.roughMapXf);
-                if (md.metalMap) template.metalnessMap = loadTexture(md.metalMap, THREE.LinearSRGBColorSpace, md.metalMapXf);
-                if (md.normMap) template.normalMap = loadTexture(md.normMap, THREE.LinearSRGBColorSpace, md.normMapXf);
-                if (md.aoMap) template.aoMap = loadTexture(md.aoMap, THREE.LinearSRGBColorSpace, md.aoMapXf);
-                if (md.emMap) template.emissiveMap = loadTexture(md.emMap, THREE.SRGBColorSpace, md.emMapXf);
-                if (md.opMap) { template.alphaMap = loadTexture(md.opMap, THREE.LinearSRGBColorSpace, md.opMapXf); template.transparent = true; }
+                if (md.map) template.map = loadTexture(md.map, THREE.SRGBColorSpace, md.mapXf, fallbackWhiteTexture);
+                if (md.roughMap) template.roughnessMap = loadTexture(md.roughMap, THREE.LinearSRGBColorSpace, md.roughMapXf, fallbackWhiteTexture);
+                if (md.metalMap) template.metalnessMap = loadTexture(md.metalMap, THREE.LinearSRGBColorSpace, md.metalMapXf, fallbackWhiteTexture);
+                if (md.normMap) template.normalMap = loadTexture(md.normMap, THREE.LinearSRGBColorSpace, md.normMapXf, fallbackFlatNormalTexture);
+                if (md.bumpMap) template.bumpMap = loadTexture(md.bumpMap, THREE.NoColorSpace, md.bumpMapXf, fallbackHeightTexture);
+                if (md.dispMap) template.displacementMap = loadTexture(md.dispMap, THREE.NoColorSpace, md.dispMapXf, fallbackHeightTexture);
+                if (md.aoMap) template.aoMap = loadTexture(md.aoMap, THREE.LinearSRGBColorSpace, md.aoMapXf, fallbackWhiteTexture);
+                if (md.emMap) template.emissiveMap = loadTexture(md.emMap, THREE.SRGBColorSpace, md.emMapXf, fallbackWhiteTexture);
+                if (md.opMap) { template.alphaMap = loadTexture(md.opMap, THREE.LinearSRGBColorSpace, md.opMapXf, fallbackWhiteTexture); template.transparent = true; }
 
                 // Lightmap
                 if (md.lmMap) {
-                    template.lightMap = loadTexture(md.lmMap, THREE.LinearSRGBColorSpace, md.lmMapXf);
+                    template.lightMap = loadTexture(md.lmMap, THREE.LinearSRGBColorSpace, md.lmMapXf, fallbackWhiteTexture);
                     template.lightMapIntensity = md.lmI ?? 1.0;
                 }
 
                 materialCache.set(key, template);
             }
 
-            const mat = template.clone();
-            installThreeJSMaterialExtensions(mat, md);
-            return mat;
+            return template.clone();
         }
 
         // ── Max Bridge ──────────────────────────────────────

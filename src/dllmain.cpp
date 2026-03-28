@@ -1310,6 +1310,31 @@ public:
         if (changed) QueueFastFlush();
     }
 
+    void MarkTrackedLightTransformsDirty() {
+        if (lightHandles_.empty()) return;
+
+        Interface* ip = GetCOREInterface();
+        if (!ip) return;
+
+        TimeValue t = ip->GetTime();
+        bool changed = false;
+
+        for (ULONG handle : lightHandles_) {
+            INode* node = ip->GetINodeByHandle(handle);
+            if (!node) continue;
+
+            float xform[16];
+            GetTransform16(node, t, xform);
+
+            auto it = lastSentTransforms_.find(handle);
+            if (it == lastSentTransforms_.end() || !TransformEquals16(xform, it->second.data())) {
+                if (fastDirtyHandles_.insert(handle).second) changed = true;
+            }
+        }
+
+        if (changed) QueueFastFlush();
+    }
+
     void MarkVisibilityNodesDirty(const NodeEventNamespace::NodeKeyTab& nodes) {
         bool changed = false;
         for (int i = 0; i < nodes.Count(); ++i) {
@@ -2601,6 +2626,7 @@ void MaxJSFastNodeEventCallback::HideChanged(NodeKeyTab& nodes) {
 void MaxJSFastRedrawCallback::proc(Interface*) {
     if (!owner_) return;
     owner_->MarkSelectedTransformsDirty();
+    owner_->MarkTrackedLightTransformsDirty();
     owner_->MarkCameraDirtyIfChanged();
 }
 

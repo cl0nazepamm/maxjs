@@ -863,6 +863,7 @@
             }
             if (msg.lights) applyLightUpdates(msg.lights);
             if (msg.camera) applyCamera(msg.camera);
+            scene.updateMatrixWorld(true);
             const applyMs = performance.now() - applyStart;
             updateSyncHud({
                 transport: 'json',

@@ -144,8 +144,9 @@ static bool IsImageFile(const wchar_t* path) {
             _wcsicmp(ext, L".psd") == 0 || _wcsicmp(ext, L".tx") == 0);
 }
 
-static std::wstring FindBitmapFile(Texmap* map) {
+static std::wstring FindBitmapFileImpl(Texmap* map, std::unordered_set<Texmap*>& visited) {
     if (!map) return {};
+    if (!visited.insert(map).second) return {};
 
     // Check paramblocks for filename-type params — skip non-image files (.osl etc)
     for (int pb = 0; pb < map->NumParamBlocks(); pb++) {
@@ -165,11 +166,16 @@ static std::wstring FindBitmapFile(Texmap* map) {
     for (int i = 0; i < map->NumSubTexmaps(); i++) {
         Texmap* sub = map->GetSubTexmap(i);
         if (sub) {
-            std::wstring f = FindBitmapFile(sub);
+            std::wstring f = FindBitmapFileImpl(sub, visited);
             if (!f.empty()) return f;
         }
     }
     return {};
+}
+
+static std::wstring FindBitmapFile(Texmap* map) {
+    std::unordered_set<Texmap*> visited;
+    return FindBitmapFileImpl(map, visited);
 }
 
 // WriteMaterialFull is a member function of MaxJSPanel
@@ -187,22 +193,51 @@ static void GetWireColor3f(INode* node, float out[3]) {
 // ══════════════════════════════════════════════════════════════
 
 struct MaxJSPBR {
+    struct TexTransform {
+        bool  isUberBitmap = false;
+        float scale = 1.0f;
+        float tiling[2] = {1.0f, 1.0f};
+        float offset[2] = {0.0f, 0.0f};
+        float rotate = 0.0f;
+        float center[2] = {0.5f, 0.5f};
+        bool  realWorld = false;
+        float realWidth = 0.2f;
+        float realHeight = 0.2f;
+        std::wstring wrapMode = L"periodic";
+    };
+
     float color[3]    = {0.8f, 0.8f, 0.8f};
     float roughness   = 0.5f;
     float metalness   = 0.0f;
     float emission[3] = {0, 0, 0};
     float emIntensity = 0.0f;
     float opacity     = 1.0f;
+    float colorMapStrength = 1.0f;
+    float roughnessMapStrength = 1.0f;
+    float metalnessMapStrength = 1.0f;
     float normalScale = 1.0f;
+    float bumpScale = 1.0f;
+    float displacementScale = 0.0f;
+    float displacementBias = 0.0f;
+    float emissiveMapStrength = 1.0f;
+    float opacityMapStrength = 1.0f;
     float aoIntensity = 1.0f;
     float lightmapIntensity = 1.0f;
     int   lightmapChannel = 2;
     bool  doubleSided = true;
     float envIntensity = 1.0f;
     std::wstring colorMap, roughnessMap, metalnessMap, normalMap;
+    std::wstring bumpMap, displacementMap;
     std::wstring aoMap, emissionMap, lightmapFile, opacityMap;
+    TexTransform colorMapTransform, roughnessMapTransform, metalnessMapTransform, normalMapTransform;
+    TexTransform bumpMapTransform, displacementMapTransform;
+    TexTransform aoMapTransform, emissionMapTransform, lightmapTransform, opacityMapTransform;
     std::wstring mtlName;
 };
+
+static float FindPBFloat(Texmap* map, const MCHAR* name, float def);
+static int FindPBInt(Texmap* map, const MCHAR* name, int def);
+static std::wstring FindPBString(Texmap* map, const MCHAR* name);
 
 // Shell Material Class_ID = (597, 0)
 #define SHELL_MTL_CLASS_ID Class_ID(597, 0)
@@ -246,6 +281,100 @@ static Mtl* FindSupportedMaterial(Mtl* mtl) {
 // Keep old name working for transform sync
 static Mtl* FindThreeJSMaterial(Mtl* mtl) { return FindSupportedMaterial(mtl); }
 
+static bool FindPBPoint3(Texmap* map, const MCHAR* name, Point3& out) {
+    if (!map) return false;
+    for (int b = 0; b < map->NumParamBlocks(); b++) {
+        IParamBlock2* pb = map->GetParamBlock(b);
+        if (!pb) continue;
+        for (int i = 0; i < pb->NumParams(); i++) {
+            ParamID pid = pb->IndextoID(i);
+            const ParamDef& pd = pb->GetParamDef(pid);
+            if (pd.int_name && _tcsicmp(pd.int_name, name) == 0 && pd.type == TYPE_POINT3) {
+                out = pb->GetPoint3(pid);
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static Texmap* FindPBMap(Texmap* map, const MCHAR* name) {
+    if (!map) return nullptr;
+    for (int b = 0; b < map->NumParamBlocks(); b++) {
+        IParamBlock2* pb = map->GetParamBlock(b);
+        if (!pb) continue;
+        for (int i = 0; i < pb->NumParams(); i++) {
+            ParamID pid = pb->IndextoID(i);
+            const ParamDef& pd = pb->GetParamDef(pid);
+            if (pd.int_name && _tcsicmp(pd.int_name, name) == 0 && pd.type == TYPE_TEXMAP)
+                return pb->GetTexmap(pid);
+        }
+    }
+    return nullptr;
+}
+
+static bool IsAutodeskUberBitmap(Texmap* map) {
+    if (!map) return false;
+
+    const std::wstring shaderName = FindPBString(map, _T("OSLShaderName"));
+    if (_wcsicmp(shaderName.c_str(), L"UberBitmap2b") == 0)
+        return true;
+
+    const std::wstring oslPath = FindPBString(map, _T("OSLpath"));
+    const wchar_t* fileName = oslPath.empty() ? nullptr : wcsrchr(oslPath.c_str(), L'\\');
+    fileName = fileName ? fileName + 1 : oslPath.c_str();
+    return fileName && _wcsicmp(fileName, L"UberBitmap2.osl") == 0;
+}
+
+static bool ExtractMaterialTexture(Texmap* map, std::wstring& filePath, MaxJSPBR::TexTransform& xf) {
+    if (!map) return false;
+
+    Texmap* resolved = map;
+    if (Texmap* sourceMap = FindPBMap(map, _T("sourceMap")))
+        resolved = sourceMap;
+
+    if (IsAutodeskUberBitmap(resolved)) {
+        const std::wstring filename = FindPBString(resolved, _T("filename"));
+        if (filename.empty() || !IsImageFile(filename.c_str()))
+            return false;
+
+        Point3 tiling(1.0f, 1.0f, 1.0f);
+        Point3 offset(0.0f, 0.0f, 0.0f);
+        Point3 center(0.5f, 0.5f, 0.0f);
+        FindPBPoint3(resolved, _T("tiling"), tiling);
+        FindPBPoint3(resolved, _T("offset"), offset);
+        FindPBPoint3(resolved, _T("RotCenter"), center);
+
+        filePath = filename;
+        xf.isUberBitmap = true;
+        xf.scale = FindPBFloat(resolved, _T("scale"), 1.0f);
+        xf.tiling[0] = tiling.x;
+        xf.tiling[1] = tiling.y;
+        xf.offset[0] = offset.x;
+        xf.offset[1] = offset.y;
+        xf.rotate = FindPBFloat(resolved, _T("Rotate"), 0.0f);
+        xf.center[0] = center.x;
+        xf.center[1] = center.y;
+        xf.realWorld = FindPBInt(resolved, _T("RealWorld"), 0) != 0;
+        xf.realWidth = FindPBFloat(resolved, _T("RealWidth"), 0.2f);
+        xf.realHeight = FindPBFloat(resolved, _T("RealHeight"), 0.2f);
+        xf.wrapMode = FindPBString(resolved, _T("WrapMode"));
+        if (xf.wrapMode.empty()) xf.wrapMode = L"periodic";
+        return true;
+    }
+
+    if (resolved->ClassID() == Class_ID(BMTEX_CLASS_ID, 0)) {
+        const std::wstring filename = FindBitmapFile(resolved);
+        if (filename.empty() || !IsImageFile(filename.c_str()))
+            return false;
+        filePath = filename;
+        xf = {};
+        return true;
+    }
+
+    return false;
+}
+
 static void ExtractThreeJSMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
     IParamBlock2* pb = mtl->GetParamBlockByID(threejs_params);
     if (!pb) return;
@@ -258,31 +387,42 @@ static void ExtractThreeJSMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
     d.roughness  = pb->GetFloat(pb_roughness, t);
     d.metalness  = pb->GetFloat(pb_metalness, t);
     d.opacity    = pb->GetFloat(pb_opacity, t);
+    d.colorMapStrength = pb->GetFloat(pb_color_map_strength, t);
+    d.roughnessMapStrength = pb->GetFloat(pb_roughness_map_strength, t);
+    d.metalnessMapStrength = pb->GetFloat(pb_metalness_map_strength, t);
     d.normalScale = pb->GetFloat(pb_normal_scale, t);
+    d.bumpScale = pb->GetFloat(pb_bump_scale, t);
+    d.displacementScale = pb->GetFloat(pb_displacement_scale, t);
+    d.displacementBias = pb->GetFloat(pb_displacement_bias, t);
     d.doubleSided = pb->GetInt(pb_double_sided, t) != 0;
     d.envIntensity = pb->GetFloat(pb_env_intensity, t);
 
     Color em = pb->GetColor(pb_emissive_color, t);
     d.emission[0] = em.r; d.emission[1] = em.g; d.emission[2] = em.b;
     d.emIntensity = pb->GetFloat(pb_emissive_intensity, t);
+    d.emissiveMapStrength = pb->GetFloat(pb_emissive_map_strength, t);
+    d.opacityMapStrength = pb->GetFloat(pb_opacity_map_strength, t);
 
     d.aoIntensity = pb->GetFloat(pb_ao_intensity, t);
     d.lightmapIntensity = pb->GetFloat(pb_lightmap_intensity, t);
     d.lightmapChannel = pb->GetInt(pb_lightmap_channel, t);
 
-    // Texture maps
-    auto getMap = [&](ParamID pid) -> std::wstring {
+    auto readMap = [&](ParamID pid, std::wstring& outPath, MaxJSPBR::TexTransform& outXf) {
         Texmap* map = pb->GetTexmap(pid, t);
-        return FindBitmapFile(map);
+        outPath.clear();
+        outXf = {};
+        ExtractMaterialTexture(map, outPath, outXf);
     };
-    d.colorMap     = getMap(pb_color_map);
-    d.roughnessMap = getMap(pb_roughness_map);
-    d.metalnessMap = getMap(pb_metalness_map);
-    d.normalMap    = getMap(pb_normal_map);
-    d.emissionMap  = getMap(pb_emissive_map);
-    d.opacityMap   = getMap(pb_opacity_map);
-    d.lightmapFile = getMap(pb_lightmap);
-    d.aoMap        = getMap(pb_ao_map);
+    readMap(pb_color_map, d.colorMap, d.colorMapTransform);
+    readMap(pb_roughness_map, d.roughnessMap, d.roughnessMapTransform);
+    readMap(pb_metalness_map, d.metalnessMap, d.metalnessMapTransform);
+    readMap(pb_normal_map, d.normalMap, d.normalMapTransform);
+    readMap(pb_bump_map, d.bumpMap, d.bumpMapTransform);
+    readMap(pb_displacement_map, d.displacementMap, d.displacementMapTransform);
+    readMap(pb_emissive_map, d.emissionMap, d.emissionMapTransform);
+    readMap(pb_opacity_map, d.opacityMap, d.opacityMapTransform);
+    readMap(pb_lightmap, d.lightmapFile, d.lightmapTransform);
+    readMap(pb_ao_map, d.aoMap, d.aoMapTransform);
 }
 
 // Extract PBR from glTF Material — generic paramblock reader
@@ -1413,21 +1553,47 @@ public:
     // ── Camera JSON fragment ─────────────────────────────────
 
     void WriteMaterialTextures(std::wostringstream& ss, const MaxJSPBR& pbr) {
-        auto writeMap = [&](const wchar_t* key, const std::wstring& path) {
+        auto writeXf = [&](const wchar_t* key, const MaxJSPBR::TexTransform& xf) {
+            if (!xf.isUberBitmap) return;
+            ss << L",\"" << key << L"\":{";
+            ss << L"\"scale\":";
+            WriteFloatValue(ss, xf.scale, 1.0f);
+            ss << L",\"tiling\":[";
+            WriteFloatValue(ss, xf.tiling[0], 1.0f); ss << L',';
+            WriteFloatValue(ss, xf.tiling[1], 1.0f); ss << L']';
+            ss << L",\"offset\":[";
+            WriteFloatValue(ss, xf.offset[0], 0.0f); ss << L',';
+            WriteFloatValue(ss, xf.offset[1], 0.0f); ss << L']';
+            ss << L",\"rotate\":";
+            WriteFloatValue(ss, xf.rotate, 0.0f);
+            ss << L",\"center\":[";
+            WriteFloatValue(ss, xf.center[0], 0.5f); ss << L',';
+            WriteFloatValue(ss, xf.center[1], 0.5f); ss << L']';
+            ss << L",\"realWorld\":" << (xf.realWorld ? L"true" : L"false");
+            ss << L",\"realWidth\":";
+            WriteFloatValue(ss, xf.realWidth, 0.2f);
+            ss << L",\"realHeight\":";
+            WriteFloatValue(ss, xf.realHeight, 0.2f);
+            ss << L",\"wrap\":\"" << EscapeJson(xf.wrapMode.c_str()) << L"\"}";
+        };
+        auto writeMap = [&](const wchar_t* key, const wchar_t* xfKey, const std::wstring& path, const MaxJSPBR::TexTransform& xf) {
             if (path.empty()) return;
             std::wstring url = MapTexturePath(path);
-            if (!url.empty())
+            if (!url.empty()) {
                 ss << L",\"" << key << L"\":\"" << EscapeJson(url.c_str()) << L'"';
+                writeXf(xfKey, xf);
+            }
         };
-        writeMap(L"map", pbr.colorMap);
-        writeMap(L"roughMap", pbr.roughnessMap);
-        writeMap(L"metalMap", pbr.metalnessMap);
-        writeMap(L"normMap", pbr.normalMap);
-        writeMap(L"aoMap", pbr.aoMap);
-        writeMap(L"emMap", pbr.emissionMap);
-        writeMap(L"lmMap", pbr.lightmapFile);
-        writeMap(L"opMap", pbr.opacityMap);
-        ss << L'}';
+        writeMap(L"map", L"mapXf", pbr.colorMap, pbr.colorMapTransform);
+        writeMap(L"roughMap", L"roughMapXf", pbr.roughnessMap, pbr.roughnessMapTransform);
+        writeMap(L"metalMap", L"metalMapXf", pbr.metalnessMap, pbr.metalnessMapTransform);
+        writeMap(L"normMap", L"normMapXf", pbr.normalMap, pbr.normalMapTransform);
+        writeMap(L"bumpMap", L"bumpMapXf", pbr.bumpMap, pbr.bumpMapTransform);
+        writeMap(L"dispMap", L"dispMapXf", pbr.displacementMap, pbr.displacementMapTransform);
+        writeMap(L"aoMap", L"aoMapXf", pbr.aoMap, pbr.aoMapTransform);
+        writeMap(L"emMap", L"emMapXf", pbr.emissionMap, pbr.emissionMapTransform);
+        writeMap(L"lmMap", L"lmMapXf", pbr.lightmapFile, pbr.lightmapTransform);
+        writeMap(L"opMap", L"opMapXf", pbr.opacityMap, pbr.opacityMapTransform);
     }
 
     void WriteMaterialFull(std::wostringstream& ss, const MaxJSPBR& pbr) {
@@ -1445,8 +1611,32 @@ public:
             WriteFloatValue(ss, pbr.opacity, 1.0f);
         }
         if (!pbr.doubleSided) ss << L",\"side\":0";
+        if (pbr.colorMapStrength < 0.999f || pbr.colorMapStrength > 1.001f) {
+            ss << L",\"mapS\":";
+            WriteFloatValue(ss, pbr.colorMapStrength, 1.0f);
+        }
+        if (pbr.roughnessMapStrength < 0.999f || pbr.roughnessMapStrength > 1.001f) {
+            ss << L",\"roughMapS\":";
+            WriteFloatValue(ss, pbr.roughnessMapStrength, 1.0f);
+        }
+        if (pbr.metalnessMapStrength < 0.999f || pbr.metalnessMapStrength > 1.001f) {
+            ss << L",\"metalMapS\":";
+            WriteFloatValue(ss, pbr.metalnessMapStrength, 1.0f);
+        }
         ss << L",\"normScl\":";
         WriteFloatValue(ss, pbr.normalScale, 1.0f);
+        if (!pbr.bumpMap.empty() || pbr.bumpScale < 0.999f || pbr.bumpScale > 1.001f) {
+            ss << L",\"bumpS\":";
+            WriteFloatValue(ss, pbr.bumpScale, 1.0f);
+        }
+        if (!pbr.displacementMap.empty() || std::fabs(pbr.displacementScale) > 1.0e-6f) {
+            ss << L",\"dispS\":";
+            WriteFloatValue(ss, pbr.displacementScale, 0.0f);
+        }
+        if (!pbr.displacementMap.empty() || std::fabs(pbr.displacementBias) > 1.0e-6f) {
+            ss << L",\"dispB\":";
+            WriteFloatValue(ss, pbr.displacementBias, 0.0f);
+        }
         ss << L",\"aoI\":";
         WriteFloatValue(ss, pbr.aoIntensity, 1.0f);
         ss << L",\"envI\":";
@@ -1459,12 +1649,21 @@ public:
             ss << L",\"emI\":";
             WriteFloatValue(ss, pbr.emIntensity, 0.0f);
         }
+        if (pbr.emissiveMapStrength < 0.999f || pbr.emissiveMapStrength > 1.001f) {
+            ss << L",\"emMapS\":";
+            WriteFloatValue(ss, pbr.emissiveMapStrength, 1.0f);
+        }
+        if (pbr.opacityMapStrength < 0.999f || pbr.opacityMapStrength > 1.001f) {
+            ss << L",\"opMapS\":";
+            WriteFloatValue(ss, pbr.opacityMapStrength, 1.0f);
+        }
         if (pbr.lightmapIntensity > 0) {
             ss << L",\"lmI\":";
             WriteFloatValue(ss, pbr.lightmapIntensity, 1.0f);
             ss << L",\"lmCh\":" << pbr.lightmapChannel;
         }
         WriteMaterialTextures(ss, pbr);
+        ss << L'}';
     }
 
     void WriteCameraJson(std::wostringstream& ss) {

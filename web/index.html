@@ -101,13 +101,68 @@
         let envVisible = true;
         let currentHdriUrl = null;
 
-        function loadTexture(url, colorSpace = THREE.LinearSRGBColorSpace) {
+        function normalizeTextureTransform(xf) {
+            if (!xf) return null;
+            return {
+                scale: Number.isFinite(xf.scale) && Math.abs(xf.scale) > 1e-6 ? xf.scale : 1.0,
+                tiling: [
+                    Number.isFinite(xf.tiling?.[0]) ? xf.tiling[0] : 1.0,
+                    Number.isFinite(xf.tiling?.[1]) ? xf.tiling[1] : 1.0,
+                ],
+                offset: [
+                    Number.isFinite(xf.offset?.[0]) ? xf.offset[0] : 0.0,
+                    Number.isFinite(xf.offset?.[1]) ? xf.offset[1] : 0.0,
+                ],
+                rotate: Number.isFinite(xf.rotate) ? xf.rotate : 0.0,
+                center: [
+                    Number.isFinite(xf.center?.[0]) ? xf.center[0] : 0.5,
+                    Number.isFinite(xf.center?.[1]) ? xf.center[1] : 0.5,
+                ],
+                realWorld: !!xf.realWorld,
+                realWidth: Number.isFinite(xf.realWidth) && Math.abs(xf.realWidth) > 1e-6 ? xf.realWidth : 1.0,
+                realHeight: Number.isFinite(xf.realHeight) && Math.abs(xf.realHeight) > 1e-6 ? xf.realHeight : 1.0,
+                wrap: typeof xf.wrap === 'string' ? xf.wrap : 'periodic',
+            };
+        }
+
+        function wrapModeToThree(mode) {
+            switch ((mode || 'periodic').toLowerCase()) {
+                case 'mirror': return THREE.MirroredRepeatWrapping;
+                case 'clamp':
+                case 'black': return THREE.ClampToEdgeWrapping;
+                case 'default':
+                case 'periodic':
+                default: return THREE.RepeatWrapping;
+            }
+        }
+
+        function applyTextureTransform(tex, xf) {
+            const wrap = wrapModeToThree(xf?.wrap);
+            tex.wrapS = tex.wrapT = wrap;
+
+            if (!xf) return;
+
+            const worldScaleU = xf.realWorld ? xf.realWidth : 1.0;
+            const worldScaleV = xf.realWorld ? xf.realHeight : 1.0;
+            const repeatU = xf.tiling[0] / worldScaleU / xf.scale;
+            const repeatV = xf.tiling[1] / worldScaleV / xf.scale;
+
+            tex.repeat.set(repeatU, repeatV);
+            tex.offset.set(-xf.offset[0] * repeatU, -xf.offset[1] * repeatV);
+            tex.center.set(xf.center[0], xf.center[1]);
+            tex.rotation = THREE.MathUtils.degToRad(xf.rotate);
+            tex.needsUpdate = true;
+        }
+
+        function loadTexture(url, colorSpace = THREE.LinearSRGBColorSpace, xf = null) {
             if (!url) return null;
-            if (textureCache.has(url)) return textureCache.get(url);
+            const normalizedXf = normalizeTextureTransform(xf);
+            const cacheKey = JSON.stringify([url, String(colorSpace), normalizedXf]);
+            if (textureCache.has(cacheKey)) return textureCache.get(cacheKey);
             const tex = textureLoader.load(url);
             tex.colorSpace = colorSpace;
-            tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
-            textureCache.set(url, tex);
+            applyTextureTransform(tex, normalizedXf);
+            textureCache.set(cacheKey, tex);
             return tex;
         }
 
@@ -151,51 +206,163 @@
             });
         }
 
+        function clamp01(value, fallback = 1.0) {
+            const num = Number.isFinite(value) ? value : fallback;
+            return Math.min(1.0, Math.max(0.0, num));
+        }
+
+        function installThreeJSMaterialExtensions(mat, md) {
+            if (md.bumpMap) {
+                mat.bumpMap = loadTexture(md.bumpMap, THREE.LinearSRGBColorSpace, md.bumpMapXf);
+                mat.bumpScale = md.bumpS ?? 1.0;
+            }
+            if (md.dispMap) {
+                mat.displacementMap = loadTexture(md.dispMap, THREE.LinearSRGBColorSpace, md.dispMapXf);
+                mat.displacementScale = md.dispS ?? 0.0;
+                mat.displacementBias = md.dispB ?? 0.0;
+            }
+
+            const mapStrength = clamp01(md.mapS, 1.0);
+            const roughMapStrength = clamp01(md.roughMapS, 1.0);
+            const metalMapStrength = clamp01(md.metalMapS, 1.0);
+            const emissiveMapStrength = clamp01(md.emMapS, 1.0);
+            const opacityMapStrength = clamp01(md.opMapS, 1.0);
+
+            const needsShaderPatch =
+                mapStrength !== 1.0 ||
+                roughMapStrength !== 1.0 ||
+                metalMapStrength !== 1.0 ||
+                emissiveMapStrength !== 1.0 ||
+                opacityMapStrength !== 1.0;
+
+            if (!needsShaderPatch) return;
+
+            mat.onBeforeCompile = shader => {
+                shader.uniforms.maxjsMapStrength = { value: mapStrength };
+                shader.uniforms.maxjsRoughnessMapStrength = { value: roughMapStrength };
+                shader.uniforms.maxjsMetalnessMapStrength = { value: metalMapStrength };
+                shader.uniforms.maxjsEmissiveMapStrength = { value: emissiveMapStrength };
+                shader.uniforms.maxjsOpacityMapStrength = { value: opacityMapStrength };
+
+                shader.fragmentShader = shader.fragmentShader.replace(
+                    '#include <common>',
+                    `#include <common>
+uniform float maxjsMapStrength;
+uniform float maxjsRoughnessMapStrength;
+uniform float maxjsMetalnessMapStrength;
+uniform float maxjsEmissiveMapStrength;
+uniform float maxjsOpacityMapStrength;`
+                );
+
+                shader.fragmentShader = shader.fragmentShader.replace(
+                    '#include <map_fragment>',
+                    `#ifdef USE_MAP
+	vec4 sampledDiffuseColor = texture2D( map, vMapUv );
+	#ifdef DECODE_VIDEO_TEXTURE
+		sampledDiffuseColor = sRGBTransferEOTF( sampledDiffuseColor );
+	#endif
+	diffuseColor *= mix( vec4( 1.0 ), sampledDiffuseColor, clamp( maxjsMapStrength, 0.0, 1.0 ) );
+#endif`
+                );
+
+                shader.fragmentShader = shader.fragmentShader.replace(
+                    '#include <roughnessmap_fragment>',
+                    `float roughnessFactor = roughness;
+#ifdef USE_ROUGHNESSMAP
+	vec4 texelRoughness = texture2D( roughnessMap, vRoughnessMapUv );
+	roughnessFactor *= mix( 1.0, texelRoughness.g, clamp( maxjsRoughnessMapStrength, 0.0, 1.0 ) );
+#endif`
+                );
+
+                shader.fragmentShader = shader.fragmentShader.replace(
+                    '#include <metalnessmap_fragment>',
+                    `float metalnessFactor = metalness;
+#ifdef USE_METALNESSMAP
+	vec4 texelMetalness = texture2D( metalnessMap, vMetalnessMapUv );
+	metalnessFactor *= mix( 1.0, texelMetalness.b, clamp( maxjsMetalnessMapStrength, 0.0, 1.0 ) );
+#endif`
+                );
+
+                shader.fragmentShader = shader.fragmentShader.replace(
+                    '#include <emissivemap_fragment>',
+                    `#ifdef USE_EMISSIVEMAP
+	vec4 emissiveSample = texture2D( emissiveMap, vEmissiveMapUv );
+	#ifdef DECODE_VIDEO_TEXTURE_EMISSIVE
+		emissiveSample = sRGBTransferEOTF( emissiveSample );
+	#endif
+	totalEmissiveRadiance *= mix( vec3( 1.0 ), emissiveSample.rgb, clamp( maxjsEmissiveMapStrength, 0.0, 1.0 ) );
+#endif`
+                );
+
+                shader.fragmentShader = shader.fragmentShader.replace(
+                    '#include <alphamap_fragment>',
+                    `#ifdef USE_ALPHAMAP
+	diffuseColor.a *= mix( 1.0, texture2D( alphaMap, vAlphaMapUv ).g, clamp( maxjsOpacityMapStrength, 0.0, 1.0 ) );
+#endif`
+                );
+            };
+
+            mat.customProgramCacheKey = () => [
+                'maxjs-special',
+                mapStrength,
+                roughMapStrength,
+                metalMapStrength,
+                emissiveMapStrength,
+                opacityMapStrength,
+            ].join('|');
+            mat.needsUpdate = true;
+        }
+
         // ── Material Creation ───────────────────────────────
         function createMaterial(md) {
             const key = md.name || 'default';
-            if (materialCache.has(key)) return materialCache.get(key).clone();
+            let template = materialCache.get(key);
 
-            const params = {
-                color: new THREE.Color(md.color[0], md.color[1], md.color[2]),
-                roughness: md.rough ?? 0.5,
-                metalness: md.metal ?? 0.0,
-                side: md.side === 0 ? THREE.FrontSide : THREE.DoubleSide,
-                envMapIntensity: md.envI ?? 1.0,
-            };
+            if (!template) {
+                const params = {
+                    color: new THREE.Color(md.color[0], md.color[1], md.color[2]),
+                    roughness: md.rough ?? 0.5,
+                    metalness: md.metal ?? 0.0,
+                    side: md.side === 0 ? THREE.FrontSide : THREE.DoubleSide,
+                    envMapIntensity: md.envI ?? 1.0,
+                };
 
-            if (md.opacity != null && md.opacity < 0.999) {
-                params.transparent = true;
-                params.opacity = md.opacity;
+                if (md.opacity != null && md.opacity < 0.999) {
+                    params.transparent = true;
+                    params.opacity = md.opacity;
+                }
+
+                if (md.em && md.emI > 0) {
+                    params.emissive = new THREE.Color(md.em[0], md.em[1], md.em[2]);
+                    params.emissiveIntensity = md.emI;
+                }
+
+                if (md.normScl != null) params.normalScale = new THREE.Vector2(md.normScl, md.normScl);
+                if (md.aoI != null) params.aoMapIntensity = md.aoI;
+
+                template = new THREE.MeshStandardMaterial(params);
+
+                // Textures
+                if (md.map) template.map = loadTexture(md.map, THREE.SRGBColorSpace, md.mapXf);
+                if (md.roughMap) template.roughnessMap = loadTexture(md.roughMap, THREE.LinearSRGBColorSpace, md.roughMapXf);
+                if (md.metalMap) template.metalnessMap = loadTexture(md.metalMap, THREE.LinearSRGBColorSpace, md.metalMapXf);
+                if (md.normMap) template.normalMap = loadTexture(md.normMap, THREE.LinearSRGBColorSpace, md.normMapXf);
+                if (md.aoMap) template.aoMap = loadTexture(md.aoMap, THREE.LinearSRGBColorSpace, md.aoMapXf);
+                if (md.emMap) template.emissiveMap = loadTexture(md.emMap, THREE.SRGBColorSpace, md.emMapXf);
+                if (md.opMap) { template.alphaMap = loadTexture(md.opMap, THREE.LinearSRGBColorSpace, md.opMapXf); template.transparent = true; }
+
+                // Lightmap
+                if (md.lmMap) {
+                    template.lightMap = loadTexture(md.lmMap, THREE.LinearSRGBColorSpace, md.lmMapXf);
+                    template.lightMapIntensity = md.lmI ?? 1.0;
+                }
+
+                materialCache.set(key, template);
             }
 
-            if (md.em && md.emI > 0) {
-                params.emissive = new THREE.Color(md.em[0], md.em[1], md.em[2]);
-                params.emissiveIntensity = md.emI;
-            }
-
-            if (md.normScl != null) params.normalScale = new THREE.Vector2(md.normScl, md.normScl);
-            if (md.aoI != null) params.aoMapIntensity = md.aoI;
-
-            const mat = new THREE.MeshStandardMaterial(params);
-
-            // Textures
-            if (md.map) mat.map = loadTexture(md.map, THREE.SRGBColorSpace);
-            if (md.roughMap) mat.roughnessMap = loadTexture(md.roughMap);
-            if (md.metalMap) mat.metalnessMap = loadTexture(md.metalMap);
-            if (md.normMap) mat.normalMap = loadTexture(md.normMap);
-            if (md.aoMap) mat.aoMap = loadTexture(md.aoMap);
-            if (md.emMap) mat.emissiveMap = loadTexture(md.emMap, THREE.SRGBColorSpace);
-            if (md.opMap) { mat.alphaMap = loadTexture(md.opMap); mat.transparent = true; }
-
-            // Lightmap
-            if (md.lmMap) {
-                mat.lightMap = loadTexture(md.lmMap);
-                mat.lightMapIntensity = md.lmI ?? 1.0;
-            }
-
-            materialCache.set(key, mat);
-            return mat.clone();
+            const mat = template.clone();
+            installThreeJSMaterialExtensions(mat, md);
+            return mat;
         }
 
         // ── Max Bridge ──────────────────────────────────────

@@ -22,12 +22,14 @@ extern HINSTANCE hInstance;
 
 static const ParamID kMapParamIDs[kNumMaps] = {
     pb_color_map, pb_roughness_map, pb_metalness_map, pb_normal_map,
-    pb_emissive_map, pb_opacity_map, pb_lightmap, pb_ao_map
+    pb_bump_map, pb_displacement_map, pb_emissive_map, pb_opacity_map,
+    pb_lightmap, pb_ao_map
 };
 
 static const MCHAR* kMapSlotNames[kNumMaps] = {
     _T("Color Map"), _T("Roughness Map"), _T("Metalness Map"), _T("Normal Map"),
-    _T("Emissive Map"), _T("Opacity Map"), _T("Light Map"), _T("AO Map")
+    _T("Bump Map"), _T("Displacement Map"), _T("Emissive Map"),
+    _T("Opacity Map"), _T("Light Map"), _T("AO Map")
 };
 
 // ── Material Class ────────────────────────────────────────────
@@ -101,33 +103,26 @@ public:
     }
 
     // ── Viewport Texture Display ────────────────────────────
-    BOOL SupportTexDisplay() override { return TRUE; }
+    BOOL SupportTexDisplay() override { return FALSE; }
 
     void ActivateTexDisplay(BOOL onoff) override {
-        texDisplayOn_ = (onoff != 0);
-        if (!texDisplayOn_) DiscardTexHandle();
+        texDisplayOn_ = false;
+        DiscardTexHandle();
     }
 
     DWORD_PTR GetActiveTexHandle(TimeValue t, TexHandleMaker& thmaker) override {
-        Texmap* colorMap = pblock ? pblock->GetTexmap(pb_color_map, t) : nullptr;
-        if (!colorMap) { DiscardTexHandle(); return 0; }
         DiscardTexHandle();
-        Interval valid;
-        BITMAPINFO* bmi = colorMap->GetVPDisplayDIB(t, thmaker, valid);
-        if (bmi) texHandle_ = thmaker.CreateHandle(bmi);
-        return (DWORD_PTR)texHandle_;
+        return 0;
     }
 
     ULONG Requirements(int subMtlNum) override {
-        return MTLREQ_UV;
+        return 0;
     }
 
     // ITextureDisplay (Nitrous)
     void SetupTextures(TimeValue t, MaxSDK::Graphics::DisplayTextureHelper& updater) override {
-        Texmap* colorMap = pblock ? pblock->GetTexmap(pb_color_map, t) : nullptr;
-        if (colorMap) {
-            updater.UpdateTextureMapInfo(t, MaxSDK::Graphics::ISimpleMaterial::UsageDiffuse, colorMap);
-        }
+        (void)t;
+        (void)updater;
     }
 
     // ITextureDisplay interface via BaseInterface
@@ -226,6 +221,11 @@ static ParamBlockDesc2 threejs_pb_desc(
         p_subtexno, kMap_Color,
         p_ui, TYPE_TEXMAPBUTTON, IDC_COLOR_MAP,
         p_end,
+    pb_color_map_strength, _T("colorMapStrength"), TYPE_FLOAT, P_ANIMATABLE, 0,
+        p_default, 1.0f,
+        p_range, 0.0f, 1.0f,
+        p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_MAPSTR_EDIT, IDC_MAPSTR_SPIN, 0.01f,
+        p_end,
 
     pb_roughness, _T("roughness"), TYPE_FLOAT, P_ANIMATABLE, 0,
         p_default, 0.5f,
@@ -235,6 +235,11 @@ static ParamBlockDesc2 threejs_pb_desc(
     pb_roughness_map, _T("roughnessMap"), TYPE_TEXMAP, 0, 0,
         p_subtexno, kMap_Roughness,
         p_ui, TYPE_TEXMAPBUTTON, IDC_ROUGH_MAP,
+        p_end,
+    pb_roughness_map_strength, _T("roughnessMapStrength"), TYPE_FLOAT, P_ANIMATABLE, 0,
+        p_default, 1.0f,
+        p_range, 0.0f, 1.0f,
+        p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_RMAPSTR_EDIT, IDC_RMAPSTR_SPIN, 0.01f,
         p_end,
 
     pb_metalness, _T("metalness"), TYPE_FLOAT, P_ANIMATABLE, 0,
@@ -246,6 +251,11 @@ static ParamBlockDesc2 threejs_pb_desc(
         p_subtexno, kMap_Metalness,
         p_ui, TYPE_TEXMAPBUTTON, IDC_METAL_MAP,
         p_end,
+    pb_metalness_map_strength, _T("metalnessMapStrength"), TYPE_FLOAT, P_ANIMATABLE, 0,
+        p_default, 1.0f,
+        p_range, 0.0f, 1.0f,
+        p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_MMAPSTR_EDIT, IDC_MMAPSTR_SPIN, 0.01f,
+        p_end,
 
     pb_normal_map, _T("normalMap"), TYPE_TEXMAP, 0, 0,
         p_subtexno, kMap_Normal,
@@ -255,6 +265,29 @@ static ParamBlockDesc2 threejs_pb_desc(
         p_default, 1.0f,
         p_range, 0.0f, 5.0f,
         p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_NORMSCL_EDIT, IDC_NORMSCL_SPIN, 0.01f,
+        p_end,
+    pb_bump_map, _T("bumpMap"), TYPE_TEXMAP, 0, 0,
+        p_subtexno, kMap_Bump,
+        p_ui, TYPE_TEXMAPBUTTON, IDC_BUMP_MAP,
+        p_end,
+    pb_bump_scale, _T("bumpScale"), TYPE_FLOAT, P_ANIMATABLE, 0,
+        p_default, 1.0f,
+        p_range, 0.0f, 5.0f,
+        p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_BUMP_EDIT, IDC_BUMP_SPIN, 0.01f,
+        p_end,
+    pb_displacement_map, _T("displacementMap"), TYPE_TEXMAP, 0, 0,
+        p_subtexno, kMap_Displacement,
+        p_ui, TYPE_TEXMAPBUTTON, IDC_DISP_MAP,
+        p_end,
+    pb_displacement_scale, _T("displacementScale"), TYPE_FLOAT, P_ANIMATABLE, 0,
+        p_default, 0.0f,
+        p_range, -1000.0f, 1000.0f,
+        p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_DISP_EDIT, IDC_DISP_SPIN, 0.01f,
+        p_end,
+    pb_displacement_bias, _T("displacementBias"), TYPE_FLOAT, P_ANIMATABLE, 0,
+        p_default, 0.0f,
+        p_range, -1000.0f, 1000.0f,
+        p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_DISP_BIAS_EDIT, IDC_DISP_BIAS_SPIN, 0.01f,
         p_end,
 
     // ═══ Emission ═════════════════════════════════════════════
@@ -271,6 +304,11 @@ static ParamBlockDesc2 threejs_pb_desc(
         p_range, 0.0f, 100.0f,
         p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_EM_INT_EDIT, IDC_EM_INT_SPIN, 0.1f,
         p_end,
+    pb_emissive_map_strength, _T("emissiveMapStrength"), TYPE_FLOAT, P_ANIMATABLE, 0,
+        p_default, 1.0f,
+        p_range, 0.0f, 1.0f,
+        p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_EMMAPSTR_EDIT, IDC_EMMAPSTR_SPIN, 0.01f,
+        p_end,
 
     // ═══ Transparency ═════════════════════════════════════════
     pb_opacity, _T("opacity"), TYPE_FLOAT, P_ANIMATABLE, 0,
@@ -281,6 +319,11 @@ static ParamBlockDesc2 threejs_pb_desc(
     pb_opacity_map, _T("opacityMap"), TYPE_TEXMAP, 0, 0,
         p_subtexno, kMap_Opacity,
         p_ui, TYPE_TEXMAPBUTTON, IDC_OPACITY_MAP,
+        p_end,
+    pb_opacity_map_strength, _T("opacityMapStrength"), TYPE_FLOAT, P_ANIMATABLE, 0,
+        p_default, 1.0f,
+        p_range, 0.0f, 1.0f,
+        p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_OPMAPSTR_EDIT, IDC_OPMAPSTR_SPIN, 0.01f,
         p_end,
 
     // ═══ Lightmap ═════════════════════════════════════════════

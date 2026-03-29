@@ -212,6 +212,7 @@
         import { LightProbeGenerator } from 'three/addons/lights/LightProbeGenerator.js';
         import { RectAreaLightTexturesLib } from 'three/addons/lights/RectAreaLightTexturesLib.js';
         import { hashBlur } from 'three/addons/tsl/display/hashBlur.js';
+        import { XRButton } from 'three/addons/webxr/XRButton.js';
         import * as GaussianSplats3D from 'gaussian-splats-3d';
         import {
             color as tslColor,
@@ -248,20 +249,33 @@
         }
 
         async function createRenderer() {
-            let nextRenderer = new THREE.WebGPURenderer({ antialias: true });
-            let backendLabel = 'WebGPU';
+            // Check if VR mode was requested (forces WebGL for XR compat)
+            const forceVR = sessionStorage.getItem('maxjs_force_webgl') === '1';
+            if (forceVR) sessionStorage.removeItem('maxjs_force_webgl');
 
-            try {
-                configureRenderer(nextRenderer);
-                await nextRenderer.init();
-            } catch (error) {
-                console.warn('MaxJS WebGPU init failed, retrying with forced WebGL2 backend.', error);
-                nextRenderer.domElement.remove();
-                nextRenderer.dispose?.();
+            let nextRenderer;
+            let backendLabel;
+
+            if (forceVR) {
                 nextRenderer = new THREE.WebGPURenderer({ antialias: true, forceWebGL: true });
-                backendLabel = 'WebGL2 fallback';
+                backendLabel = 'WebGL2 (VR)';
                 configureRenderer(nextRenderer);
                 await nextRenderer.init();
+            } else {
+                nextRenderer = new THREE.WebGPURenderer({ antialias: true });
+                backendLabel = 'WebGPU';
+                try {
+                    configureRenderer(nextRenderer);
+                    await nextRenderer.init();
+                } catch (error) {
+                    console.warn('MaxJS WebGPU init failed, retrying with forced WebGL2 backend.', error);
+                    nextRenderer.domElement.remove();
+                    nextRenderer.dispose?.();
+                    nextRenderer = new THREE.WebGPURenderer({ antialias: true, forceWebGL: true });
+                    backendLabel = 'WebGL2 fallback';
+                    configureRenderer(nextRenderer);
+                    await nextRenderer.init();
+                }
             }
 
             return { renderer: nextRenderer, backendLabel };
@@ -1348,6 +1362,23 @@
                         ? JSON.parse(e.additionalData) : e.additionalData;
                     if (meta?.type === 'delta_bin') {
                         handleBinaryDelta(buf, meta);
+                    } else if (meta?.type === 'geo_fast') {
+                        // Real-time vertex update — patch single mesh
+                        const mesh = nodeMap.get(meta.h);
+                        if (mesh) {
+                            const verts = new Float32Array(new Float32Array(buf, meta.vOff, meta.vN));
+                            const idx = new Uint32Array(new Int32Array(buf, meta.iOff, meta.iN));
+                            const geom = new THREE.BufferGeometry();
+                            geom.setAttribute('position', new THREE.BufferAttribute(verts, 3));
+                            geom.setIndex(new THREE.BufferAttribute(idx, 1));
+                            if (meta.uvOff != null && meta.uvN) {
+                                const uvs = new Float32Array(new Float32Array(buf, meta.uvOff, meta.uvN));
+                                geom.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
+                            }
+                            geom.computeVertexNormals();
+                            mesh.geometry.dispose();
+                            mesh.geometry = geom;
+                        }
                     } else {
                         handleBinaryScene(buf, meta);
                     }
@@ -1461,6 +1492,15 @@
                     applyMs: 0,
                 });
             }
+        });
+
+        // ── Geometry Fast Update (single mesh, real-time vertex editing) ──
+        bridge.on('geo_fast', msg => {
+            const mesh = nodeMap.get(msg.h);
+            if (!mesh) return;
+            const geom = buildGeometry(msg.v, msg.i, msg.uv);
+            mesh.geometry.dispose();
+            mesh.geometry = geom;
         });
 
         // ── Transform Sync (+ material scalars, ~6fps) ──────
@@ -2487,7 +2527,119 @@
             }
         });
 
+        // ── WebXR / VR ───────────────────────────────────────
+        // Simple approach: rotate all scene meshes into Y-up for VR,
+        // controllers added to scene directly (like the Three.js example)
+        const vrSceneWrapper = new THREE.Group();
+        vrSceneWrapper.name = '__vr_scene_wrapper';
+        let vrActive = false;
+        let vrSavedCameraState = null;
+
+        // Dolly for locomotion (no rotation — just translation)
+        const vrDolly = new THREE.Group();
+        vrDolly.name = '__vr_dolly';
+        scene.add(vrDolly);
+
+        try {
+            const isNativeWebGPU = rendererBackendLabel === 'WebGPU';
+
+            if (isNativeWebGPU) {
+                const vrNote = document.createElement('button');
+                vrNote.textContent = 'VR (needs WebGL)';
+                vrNote.style.cssText = 'position:absolute;bottom:12px;right:12px;z-index:100;background:rgba(40,40,60,0.8);color:#aaa;border:1px solid #444;padding:6px 14px;border-radius:4px;font:12px "Segoe UI",sans-serif;cursor:pointer';
+                vrNote.onclick = () => {
+                    if (confirm('VR requires WebGL backend. Restart without WebGPU post-effects?')) {
+                        sessionStorage.setItem('maxjs_force_webgl', '1');
+                        location.reload();
+                    }
+                };
+                document.body.appendChild(vrNote);
+            } else {
+                renderer.xr.enabled = true;
+                document.body.appendChild(XRButton.createButton(renderer));
+            }
+
+            // Controllers — static laser + teleport
+            for (let i = 0; i < 2; i++) {
+                const ctrl = renderer.xr.getController(i);
+                const line = new THREE.Line(
+                    new THREE.BufferGeometry().setFromPoints([
+                        new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, -2)
+                    ]),
+                    new THREE.LineBasicMaterial({ color: 0x4488ff })
+                );
+                ctrl.add(line);
+                ctrl.addEventListener('selectend', () => {
+                    const dir = new THREE.Vector3(0, 0, -1).applyQuaternion(ctrl.quaternion);
+                    dir.y = 0; dir.normalize();
+                    vrDolly.position.addScaledVector(dir, 2);
+                });
+                vrDolly.add(ctrl);
+            }
+
+            renderer.xr.addEventListener('sessionstart', () => {
+                vrActive = true;
+                controls.enabled = false;
+
+                // Move all scene meshes into a wrapper that rotates Z-up → Y-up
+                // and scales cm → meters
+                const toMove = [];
+                scene.children.forEach(c => {
+                    if (c !== vrDolly && c !== grid && c !== camera && c.name !== '__maxjs_lights') {
+                        toMove.push(c);
+                    }
+                });
+                for (const c of toMove) vrSceneWrapper.add(c);
+                // Z-up → Y-up: +90° around X (Z goes to Y, Y goes to -Z)
+                vrSceneWrapper.rotation.x = Math.PI / 2;
+                vrSceneWrapper.scale.setScalar(0.01); // cm → meters
+                vrDolly.add(vrSceneWrapper);
+                vrDolly.add(camera);
+
+                // Start at scene center, eye height 1.6m
+                vrDolly.position.set(0, 0, 0);
+            });
+
+            renderer.xr.addEventListener('sessionend', () => {
+                vrActive = false;
+                controls.enabled = !camLock;
+
+                // Restore scene: unwrap meshes back to scene root
+                const toRestore = [...vrSceneWrapper.children];
+                for (const c of toRestore) scene.add(c);
+                vrSceneWrapper.rotation.set(0, 0, 0);
+                vrSceneWrapper.scale.setScalar(1);
+                scene.add(camera);
+                camera.up.set(0, 0, 1);
+                camera.position.set(200, -200, 150);
+            });
+        } catch (e) {
+            console.warn('[MaxJS] WebXR not available:', e);
+        }
+
+        function processVRInput() {
+            if (!vrActive) return;
+            const session = renderer.xr.getSession();
+            if (!session) return;
+            for (const source of session.inputSources) {
+                if (source.gamepad?.axes?.length >= 4) {
+                    const ax = source.gamepad.axes[2];
+                    const ay = source.gamepad.axes[3];
+                    if (Math.abs(ax) > 0.1 || Math.abs(ay) > 0.1) {
+                        const xrCam = renderer.xr.getCamera();
+                        const fwd = new THREE.Vector3(0, 0, -1).applyQuaternion(xrCam.quaternion);
+                        const right = new THREE.Vector3(1, 0, 0).applyQuaternion(xrCam.quaternion);
+                        fwd.y = 0; fwd.normalize();
+                        right.y = 0; right.normalize();
+                        vrDolly.position.addScaledVector(fwd, -ay * 0.05);
+                        vrDolly.position.addScaledVector(right, ax * 0.05);
+                    }
+                }
+            }
+        }
+
         function renderFrame() {
+            processVRInput();
             controls.update();
             const renderStart = performance.now();
             ssgiFx.render();

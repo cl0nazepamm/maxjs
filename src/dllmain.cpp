@@ -18,6 +18,7 @@
 
 #include <wrl.h>
 #include <WebView2.h>
+#include <WebView2EnvironmentOptions.h>
 #include <ShlObj.h>
 #include <Shlwapi.h>
 #include <wincodec.h>
@@ -1322,7 +1323,11 @@ public:
         std::wstring udf = std::wstring(localAppData) + L"\\MaxJS\\WebView2Data";
         CoTaskMemFree(localAppData);
 
-        CreateCoreWebView2EnvironmentWithOptions(nullptr, udf.c_str(), nullptr,
+        // Enable WebXR in WebView2
+        auto options = Microsoft::WRL::Make<CoreWebView2EnvironmentOptions>();
+        options->put_AdditionalBrowserArguments(L"--enable-features=WebXR,WebXRARModule,OpenXR");
+
+        CreateCoreWebView2EnvironmentWithOptions(nullptr, udf.c_str(), options.Get(),
             Callback<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler>(
                 [this](HRESULT r, ICoreWebView2Environment* env) -> HRESULT {
                     if (FAILED(r) || !env) return r;
@@ -1576,6 +1581,49 @@ public:
     void CaptureCurrentCameraState() {
         GetViewportCamera(lastSentCamera_);
         haveLastSentCamera_ = true;
+    }
+
+    // Cheap per-node bounding box for vertex edit detection
+    std::unordered_map<ULONG, uint64_t> lastBBoxHash_;
+
+    static uint64_t HashBBox(INode* node, TimeValue t) {
+        // Use object's validity interval as a cheap change detector
+        ObjectState os = node->EvalWorldState(t);
+        if (!os.obj) return 0;
+        Interval geomValid = os.obj->ChannelValidity(t, GEOM_CHAN_NUM);
+        // Hash the validity interval — changes when geometry is modified
+        return (uint64_t)geomValid.Start() ^ ((uint64_t)geomValid.End() << 32);
+    }
+
+    // Handles that need geometry re-sent via fast path (not full sync)
+    std::unordered_set<ULONG> geoFastDirtyHandles_;
+
+    void CheckSelectedGeometryLive() {
+        Interface* ip = GetCOREInterface();
+        if (!ip) return;
+        const int selCount = ip->GetSelNodeCount();
+        if (selCount <= 0) return;
+        TimeValue t = ip->GetTime();
+
+        bool changed = false;
+        for (int i = 0; i < selCount; ++i) {
+            INode* node = ip->GetSelNode(i);
+            if (!node) continue;
+            ULONG handle = node->GetHandle();
+            if (!IsTrackedHandle(handle)) continue;
+
+            uint64_t validHash = HashBBox(node, t);
+            auto it = lastBBoxHash_.find(handle);
+            if (it != lastBBoxHash_.end() && it->second == validHash) continue;
+            lastBBoxHash_[handle] = validHash;
+
+            // Geometry changed — send ONLY this mesh via fast path, no full sync
+            geoHashMap_.erase(handle);
+            geoFastDirtyHandles_.insert(handle);
+            fastDirtyHandles_.insert(handle);
+            changed = true;
+        }
+        if (changed) QueueFastFlush();
     }
 
     void RememberSentTransform(ULONG handle, const float* xform) {
@@ -1899,6 +1947,74 @@ public:
         }
     }
 
+    // Surgical geometry update — sends ONLY changed mesh data, no metadata for other nodes
+    void SendGeometryFastUpdate(const std::unordered_set<ULONG>& handles) {
+        if (!webview_) return;
+        Interface* ip = GetCOREInterface();
+        if (!ip) return;
+        TimeValue t = ip->GetTime();
+
+        ComPtr<ICoreWebView2_17> wv17;
+        ComPtr<ICoreWebView2Environment12> env12;
+        if (useBinary_ && env_) {
+            webview_->QueryInterface(IID_PPV_ARGS(&wv17));
+            env_->QueryInterface(IID_PPV_ARGS(&env12));
+        }
+
+        for (ULONG handle : handles) {
+            INode* node = ip->GetINodeByHandle(handle);
+            if (!node) continue;
+
+            std::vector<float> verts, uvs;
+            std::vector<int> indices;
+            std::vector<MatGroup> groups;
+            if (!ExtractMesh(node, t, verts, uvs, indices, groups)) continue;
+
+            // Update hash so we don't re-send next frame
+            uint64_t hash = HashMeshData(verts, indices, uvs);
+            geoHashMap_[handle] = hash;
+
+            if (wv17 && env12) {
+                // Binary: SharedBuffer with just this mesh
+                size_t totalBytes = verts.size() * 4 + indices.size() * 4 + uvs.size() * 4;
+                if (totalBytes < 4) totalBytes = 4;
+
+                ComPtr<ICoreWebView2SharedBuffer> buf;
+                if (FAILED(env12->CreateSharedBuffer(totalBytes, &buf)) || !buf) continue;
+
+                BYTE* ptr = nullptr;
+                buf->get_Buffer(&ptr);
+                size_t off = 0;
+                memcpy(ptr + off, verts.data(), verts.size() * 4); size_t vOff = off; off += verts.size() * 4;
+                memcpy(ptr + off, indices.data(), indices.size() * 4); size_t iOff = off; off += indices.size() * 4;
+                size_t uvOff = off;
+                if (!uvs.empty()) { memcpy(ptr + off, uvs.data(), uvs.size() * 4); off += uvs.size() * 4; }
+
+                std::wostringstream ss;
+                ss.imbue(std::locale::classic());
+                ss << L"{\"type\":\"geo_fast\",\"h\":" << handle;
+                ss << L",\"vOff\":" << vOff << L",\"vN\":" << verts.size();
+                ss << L",\"iOff\":" << iOff << L",\"iN\":" << indices.size();
+                if (!uvs.empty()) ss << L",\"uvOff\":" << uvOff << L",\"uvN\":" << uvs.size();
+                ss << L'}';
+
+                wv17->PostSharedBufferToScript(buf.Get(),
+                    COREWEBVIEW2_SHARED_BUFFER_ACCESS_READ_ONLY,
+                    ss.str().c_str());
+            } else {
+                // JSON fallback
+                std::wostringstream ss;
+                ss.imbue(std::locale::classic());
+                ss << L"{\"type\":\"geo_fast\",\"h\":" << handle;
+                ss << L",\"v\":"; WriteFloats(ss, verts.data(), verts.size());
+                ss << L",\"i\":"; WriteInts(ss, indices.data(), indices.size());
+                if (!uvs.empty()) { ss << L",\"uv\":"; WriteFloats(ss, uvs.data(), uvs.size()); }
+                ss << L'}';
+                webview_->PostWebMessageAsJson(ss.str().c_str());
+            }
+        }
+    }
+
     void FlushFastPath() {
         fastFlushPosted_ = false;
 
@@ -1924,8 +2040,18 @@ public:
             }
         }
 
+        // Collect geometry-dirty handles before clearing
+        std::unordered_set<ULONG> geoDirty;
+        geoDirty.swap(geoFastDirtyHandles_);
+
         fastDirtyHandles_.clear();
         fastCameraDirty_ = false;
+
+        // Geometry fast path: send ONLY the changed mesh(es), nothing else
+        if (!geoDirty.empty()) {
+            SendGeometryFastUpdate(geoDirty);
+            return;
+        }
 
         if (!useBinary_ || hasDirtyLights || hasDirtySplats) {
             if (hasDirtyNodes) SendTransformSync();
@@ -3374,6 +3500,7 @@ void MaxJSFastRedrawCallback::proc(Interface*) {
     owner_->MarkTrackedLightTransformsDirty();
     owner_->MarkTrackedSplatTransformsDirty();
     owner_->MarkCameraDirtyIfChanged();
+    owner_->CheckSelectedGeometryLive();
 }
 
 void MaxJSFastTimeChangeCallback::TimeChanged(TimeValue) {

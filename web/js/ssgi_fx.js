@@ -150,11 +150,9 @@ export function createSSGIController({
         },
         toonOutline: {
             enabled: true,
-            edgeStrength: 3.0,
-            edgeGlow: 0.0,
-            edgeThickness: 1.0,
-            visibleEdgeColor: [0, 0, 0],
-            hiddenEdgeColor: [0, 0, 0],
+            color: [0, 0, 0],
+            thickness: 0.003,
+            alpha: 1.0,
         },
         contactShadow: {
             enabled: false,
@@ -484,8 +482,12 @@ export function createSSGIController({
 
                 // Use toonOutlinePass as scene pass when toon materials exist — outlines + MRT
                 const useToonPass = state.toonOutline.enabled && getToonMeshes().length > 0;
+                const toc = state.toonOutline;
                 const scenePass = useToonPass
-                    ? toonOutlinePass(scene, camera)
+                    ? toonOutlinePass(scene, camera,
+                        new THREE.Color(toc.color[0], toc.color[1], toc.color[2]),
+                        toc.thickness,
+                        toc.alpha)
                     : pass(scene, camera);
                 activeNodes.push(scenePass);
 
@@ -810,11 +812,9 @@ export function createSSGIController({
             return state.toonOutline.enabled;
         },
         setToonOutlineOptions(options = {}) {
-            assignFinite(state.toonOutline, 'edgeStrength', options.edgeStrength);
-            assignFinite(state.toonOutline, 'edgeGlow', options.edgeGlow);
-            assignFinite(state.toonOutline, 'edgeThickness', options.edgeThickness);
-            if (Array.isArray(options.visibleEdgeColor)) state.toonOutline.visibleEdgeColor = options.visibleEdgeColor;
-            if (Array.isArray(options.hiddenEdgeColor)) state.toonOutline.hiddenEdgeColor = options.hiddenEdgeColor;
+            assignFinite(state.toonOutline, 'thickness', options.thickness);
+            assignFinite(state.toonOutline, 'alpha', options.alpha);
+            if (Array.isArray(options.color)) state.toonOutline.color = options.color;
             rebuildPipeline();
             return { ...state.toonOutline };
         },

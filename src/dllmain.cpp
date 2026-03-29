@@ -1219,6 +1219,8 @@ public:
     void LinkChanged(NodeKeyTab& nodes) override;
     void SelectionChanged(NodeKeyTab& nodes) override;
     void HideChanged(NodeKeyTab& nodes) override;
+    void GeometryChanged(NodeKeyTab& nodes) override;
+    void TopologyChanged(NodeKeyTab& nodes) override;
 
 private:
     MaxJSPanel* owner_;

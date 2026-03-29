@@ -32,6 +32,43 @@ static const MCHAR* kMapSlotNames[kNumMaps] = {
     _T("Opacity Map"), _T("Light Map"), _T("AO Map"), _T("SSS Color Map"), _T("Matcap Map")
 };
 
+struct SupportedMapSlots {
+    const int* slots = nullptr;
+    int count = 0;
+};
+
+static const int kStandardMapSlots[] = {
+    kMap_Color, kMap_Roughness, kMap_Metalness, kMap_Normal, kMap_Bump,
+    kMap_Displacement, kMap_Emissive, kMap_Opacity, kMap_Lightmap, kMap_AO
+};
+
+static const int kSSSMapSlots[] = {
+    kMap_Color, kMap_Roughness, kMap_Metalness, kMap_Normal, kMap_Bump,
+    kMap_Displacement, kMap_Emissive, kMap_Opacity, kMap_Lightmap, kMap_AO,
+    kMap_SSSColor
+};
+
+static const int kUtilityDistanceDepthMapSlots[] = {
+    kMap_Color, kMap_Displacement, kMap_Opacity
+};
+
+static const int kUtilityLambertPhongMapSlots[] = {
+    kMap_Color, kMap_Normal, kMap_Bump, kMap_Displacement,
+    kMap_Emissive, kMap_Opacity, kMap_Lightmap, kMap_AO
+};
+
+static const int kUtilityMatcapMapSlots[] = {
+    kMap_Color, kMap_Normal, kMap_Bump, kMap_Displacement, kMap_Opacity, kMap_Matcap
+};
+
+static const int kUtilityNormalMapSlots[] = {
+    kMap_Normal, kMap_Bump, kMap_Displacement
+};
+
+static const int kUtilityBackdropMapSlots[] = {
+    kMap_Color, kMap_Opacity
+};
+
 enum class ThreeJSMaterialKind {
     Standard,
     Physical,
@@ -57,6 +94,36 @@ static int GetOptionalInt(IParamBlock2* pb, ParamID id, TimeValue t, int def) {
 
 static Color GetOptionalColor(IParamBlock2* pb, ParamID id, TimeValue t, const Color& def) {
     return HasParam(pb, id) ? pb->GetColor(id, t) : def;
+}
+
+static SupportedMapSlots GetSupportedMapSlots(ThreeJSMaterialKind kind, IParamBlock2* pb) {
+    switch (kind) {
+        case ThreeJSMaterialKind::Standard:
+        case ThreeJSMaterialKind::Physical:
+            return { kStandardMapSlots, static_cast<int>(std::size(kStandardMapSlots)) };
+        case ThreeJSMaterialKind::SSS:
+            return { kSSSMapSlots, static_cast<int>(std::size(kSSSMapSlots)) };
+        case ThreeJSMaterialKind::Utility: {
+            const int utilityModel = GetOptionalInt(pb, pb_utility_model, 0, threejs_utility_lambert);
+            switch (utilityModel) {
+                case threejs_utility_distance:
+                case threejs_utility_depth:
+                    return { kUtilityDistanceDepthMapSlots, static_cast<int>(std::size(kUtilityDistanceDepthMapSlots)) };
+                case threejs_utility_matcap:
+                    return { kUtilityMatcapMapSlots, static_cast<int>(std::size(kUtilityMatcapMapSlots)) };
+                case threejs_utility_normal:
+                    return { kUtilityNormalMapSlots, static_cast<int>(std::size(kUtilityNormalMapSlots)) };
+                case threejs_utility_backdrop:
+                    return { kUtilityBackdropMapSlots, static_cast<int>(std::size(kUtilityBackdropMapSlots)) };
+                case threejs_utility_lambert:
+                case threejs_utility_phong:
+                default:
+                    return { kUtilityLambertPhongMapSlots, static_cast<int>(std::size(kUtilityLambertPhongMapSlots)) };
+            }
+        }
+        default:
+            return {};
+    }
 }
 
 class ThreeJSMtl : public Mtl, public MaxSDK::Graphics::ITextureDisplay {
@@ -97,7 +164,10 @@ public:
         if (i == 0) pblock = static_cast<IParamBlock2*>(rtarg);
     }
 
-    RefResult NotifyRefChanged(const Interval&, RefTargetHandle, PartID&, RefMessage, BOOL) override {
+    RefResult NotifyRefChanged(const Interval&, RefTargetHandle, PartID& partID, RefMessage msg, BOOL) override {
+        if (msg == REFMSG_CHANGE && kind_ == ThreeJSMaterialKind::Utility && partID == static_cast<PartID>(pb_utility_model)) {
+            NotifyDependents(FOREVER, PART_ALL, REFMSG_SUBANIM_STRUCTURE_CHANGED);
+        }
         return REF_SUCCEED;
     }
 
@@ -178,19 +248,26 @@ public:
     Interval Validity(TimeValue t) override { return FOREVER; }
     void Reset() override { GetDescriptor()->MakeAutoParamBlocks(this); }
 
-    int NumSubTexmaps() override { return kNumMaps; }
+    int NumSubTexmaps() override {
+        return GetSupportedMapSlots(kind_, pblock).count;
+    }
     Texmap* GetSubTexmap(int i) override {
-        if (!pblock || i < 0 || i >= kNumMaps) return nullptr;
-        const ParamID pid = kMapParamIDs[i];
+        if (!pblock) return nullptr;
+        const int slotIndex = GetSupportedMapSlotIndex(i);
+        if (slotIndex < 0) return nullptr;
+        const ParamID pid = kMapParamIDs[slotIndex];
         return HasParam(pblock, pid) ? pblock->GetTexmap(pid) : nullptr;
     }
     void SetSubTexmap(int i, Texmap* m) override {
-        if (!pblock || i < 0 || i >= kNumMaps) return;
-        const ParamID pid = kMapParamIDs[i];
+        if (!pblock) return;
+        const int slotIndex = GetSupportedMapSlotIndex(i);
+        if (slotIndex < 0) return;
+        const ParamID pid = kMapParamIDs[slotIndex];
         if (HasParam(pblock, pid)) pblock->SetValue(pid, 0, m);
     }
     MSTR GetSubTexmapSlotName(int i, bool) override {
-        if (i >= 0 && i < kNumMaps) return MSTR(kMapSlotNames[i]);
+        const int slotIndex = GetSupportedMapSlotIndex(i);
+        if (slotIndex >= 0) return MSTR(kMapSlotNames[slotIndex]);
         return MSTR(_T(""));
     }
     int MapSlotType(int) override { return MAPSLOT_TEXTURE; }
@@ -216,6 +293,14 @@ public:
     IParamBlock2* pblock = nullptr;
 
 private:
+    int GetSupportedMapSlotIndex(int visibleIndex) const {
+        const SupportedMapSlots visibleSlots = GetSupportedMapSlots(kind_, pblock);
+        if (visibleIndex < 0 || visibleIndex >= visibleSlots.count || !visibleSlots.slots) {
+            return -1;
+        }
+        return visibleSlots.slots[visibleIndex];
+    }
+
     void DiscardTexHandle() {
         if (texHandle_) {
             texHandle_->DeleteThis();

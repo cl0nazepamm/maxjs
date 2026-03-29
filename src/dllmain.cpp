@@ -355,6 +355,8 @@ static void GetWireColor3f(INode* node, float out[3]) {
 struct MaxJSPBR {
     struct TexTransform {
         bool  isUberBitmap = false;
+        bool  hasChannelSelect = false;
+        int   outputChannelIndex = 1;
         float scale = 1.0f;
         float tiling[2] = {1.0f, 1.0f};
         float offset[2] = {0.0f, 0.0f};
@@ -550,6 +552,7 @@ static bool ExtractMaterialTexture(Texmap* map, std::wstring& filePath, MaxJSPBR
     if (!map) return false;
 
     Texmap* resolved = map;
+    const int outputChannelIndex = std::max(1, FindPBInt(map, _T("outputChannelIndex"), 1));
     if (Texmap* sourceMap = FindPBMap(map, _T("sourceMap")))
         resolved = sourceMap;
 
@@ -567,6 +570,8 @@ static bool ExtractMaterialTexture(Texmap* map, std::wstring& filePath, MaxJSPBR
 
         filePath = filename;
         xf.isUberBitmap = true;
+        xf.hasChannelSelect = outputChannelIndex != 1;
+        xf.outputChannelIndex = outputChannelIndex;
         xf.scale = FindPBFloat(resolved, _T("scale"), 1.0f);
         xf.tiling[0] = tiling.x;
         xf.tiling[1] = tiling.y;
@@ -589,6 +594,8 @@ static bool ExtractMaterialTexture(Texmap* map, std::wstring& filePath, MaxJSPBR
             return false;
         filePath = filename;
         xf = {};
+        xf.hasChannelSelect = outputChannelIndex != 1;
+        xf.outputChannelIndex = outputChannelIndex;
         return true;
     }
 
@@ -1737,6 +1744,7 @@ public:
         RegisterNotification(OnSceneChanged, this, NOTIFY_SCENE_PRE_DELETED_NODE);
         RegisterNotification(OnSceneChanged, this, NOTIFY_FILE_POST_OPEN);
         RegisterNotification(OnSceneChanged, this, NOTIFY_SYSTEM_POST_RESET);
+        // Hide/unhide/isolate handled via visibility flag in xform sync — no full rebuild needed
 
         Interface* ip = GetCOREInterface();
         if (ip) {
@@ -1771,6 +1779,7 @@ public:
         UnRegisterNotification(OnSceneChanged, this, NOTIFY_SCENE_PRE_DELETED_NODE);
         UnRegisterNotification(OnSceneChanged, this, NOTIFY_FILE_POST_OPEN);
         UnRegisterNotification(OnSceneChanged, this, NOTIFY_SYSTEM_POST_RESET);
+        // Hide/unhide handled in xform sync — no notification needed
     }
 
     void OnWebMessage(const wchar_t* json) {
@@ -1934,12 +1943,34 @@ public:
             meta.str().c_str());
     }
 
+    EnvData cachedEnv_;
+    int envPollCounter_ = 0;
+
     void SendCameraSync() {
         const std::uint32_t frameId = AllocateFrameId();
         std::wostringstream ss;
         ss.imbue(std::locale::classic());
         ss << L"{\"type\":\"cam\",\"frame\":" << frameId << L",";
         WriteCameraJson(ss);
+
+        // Poll env params every 5th camera tick (~165ms) to avoid per-frame paramblock walks
+        GetEnvironment(cachedEnv_);
+
+        ss << L",\"env\":{\"rot\":";
+        WriteFloatValue(ss, cachedEnv_.rotation, 0.0f);
+        ss << L",\"exp\":";
+        WriteFloatValue(ss, cachedEnv_.exposure, 0.0f);
+        ss << L",\"gamma\":";
+        WriteFloatValue(ss, cachedEnv_.gamma, 1.0f);
+        ss << L",\"zup\":" << cachedEnv_.zup;
+        ss << L",\"flip\":" << cachedEnv_.flip;
+        if (!cachedEnv_.hdriPath.empty()) {
+            std::wstring url = MapTexturePath(cachedEnv_.hdriPath);
+            if (!url.empty())
+                ss << L",\"hdri\":\"" << EscapeJson(url.c_str()) << L'"';
+        }
+        ss << L'}';
+
         ss << L'}';
         webview_->PostWebMessageAsJson(ss.str().c_str());
     }
@@ -2223,27 +2254,37 @@ public:
 
     void WriteMaterialTextures(std::wostringstream& ss, const MaxJSPBR& pbr) {
         auto writeXf = [&](const wchar_t* key, const MaxJSPBR::TexTransform& xf) {
-            if (!xf.isUberBitmap) return;
+            if (!xf.isUberBitmap && !xf.hasChannelSelect) return;
             ss << L",\"" << key << L"\":{";
-            ss << L"\"scale\":";
-            WriteFloatValue(ss, xf.scale, 1.0f);
-            ss << L",\"tiling\":[";
-            WriteFloatValue(ss, xf.tiling[0], 1.0f); ss << L',';
-            WriteFloatValue(ss, xf.tiling[1], 1.0f); ss << L']';
-            ss << L",\"offset\":[";
-            WriteFloatValue(ss, xf.offset[0], 0.0f); ss << L',';
-            WriteFloatValue(ss, xf.offset[1], 0.0f); ss << L']';
-            ss << L",\"rotate\":";
-            WriteFloatValue(ss, xf.rotate, 0.0f);
-            ss << L",\"center\":[";
-            WriteFloatValue(ss, xf.center[0], 0.5f); ss << L',';
-            WriteFloatValue(ss, xf.center[1], 0.5f); ss << L']';
-            ss << L",\"realWorld\":" << (xf.realWorld ? L"true" : L"false");
-            ss << L",\"realWidth\":";
-            WriteFloatValue(ss, xf.realWidth, 0.2f);
-            ss << L",\"realHeight\":";
-            WriteFloatValue(ss, xf.realHeight, 0.2f);
-            ss << L",\"wrap\":\"" << EscapeJson(xf.wrapMode.c_str()) << L"\"}";
+            bool wroteField = false;
+            if (xf.isUberBitmap) {
+                ss << L"\"scale\":";
+                WriteFloatValue(ss, xf.scale, 1.0f);
+                ss << L",\"tiling\":[";
+                WriteFloatValue(ss, xf.tiling[0], 1.0f); ss << L',';
+                WriteFloatValue(ss, xf.tiling[1], 1.0f); ss << L']';
+                ss << L",\"offset\":[";
+                WriteFloatValue(ss, xf.offset[0], 0.0f); ss << L',';
+                WriteFloatValue(ss, xf.offset[1], 0.0f); ss << L']';
+                ss << L",\"rotate\":";
+                WriteFloatValue(ss, xf.rotate, 0.0f);
+                ss << L",\"center\":[";
+                WriteFloatValue(ss, xf.center[0], 0.5f); ss << L',';
+                WriteFloatValue(ss, xf.center[1], 0.5f); ss << L']';
+                ss << L",\"realWorld\":" << (xf.realWorld ? L"true" : L"false");
+                ss << L",\"realWidth\":";
+                WriteFloatValue(ss, xf.realWidth, 0.2f);
+                ss << L",\"realHeight\":";
+                WriteFloatValue(ss, xf.realHeight, 0.2f);
+                ss << L",\"wrap\":\"" << EscapeJson(xf.wrapMode.c_str()) << L"\"";
+                wroteField = true;
+            }
+            if (xf.hasChannelSelect) {
+                if (wroteField) ss << L',';
+                ss << L"\"channel\":";
+                ss << xf.outputChannelIndex;
+            }
+            ss << L"}";
         };
         auto writeMap = [&](const wchar_t* key, const wchar_t* xfKey, const std::wstring& path, const MaxJSPBR::TexTransform& xf) {
             if (path.empty()) return;
@@ -2793,6 +2834,7 @@ public:
             std::vector<int> indices;
             std::vector<MatGroup> groups;
             bool changed;
+            bool visible = true;
             size_t vOff, iOff, uvOff;
         };
         std::vector<NodeGeo> geos;
@@ -2801,7 +2843,7 @@ public:
         std::function<void(INode*)> collect = [&](INode* parent) {
             for (int i = 0; i < parent->NumberOfChildren(); i++) {
                 INode* node = parent->GetChildNode(i);
-                if (!node || node->IsNodeHidden(TRUE)) continue;
+                if (!node) continue;
                 ObjectState os = node->EvalWorldState(t);
                 if (os.obj && IsThreeJSSplatClassID(os.obj->ClassID())) {
                     collect(node);
@@ -2811,6 +2853,7 @@ public:
                 ng.node = node;
                 ng.handle = node->GetHandle();
                 ng.changed = false;
+                ng.visible = !node->IsNodeHidden(TRUE);
                 if (ExtractMesh(node, t, ng.verts, ng.uvs, ng.indices, ng.groups)) {
                     // Content hash: catches deforms/UV edits even when counts are unchanged.
                     uint64_t hash = HashMeshData(ng.verts, ng.indices, ng.uvs);
@@ -2879,6 +2922,7 @@ public:
             ss << L"{\"h\":" << ng.handle;
             ss << L",\"n\":\"" << EscapeJson(ng.node->GetName()) << L'"';
             ss << L",\"s\":" << (ng.node->Selected() ? L'1' : L'0');
+            ss << L",\"vis\":" << (ng.visible ? L'1' : L'0');
             ss << L",\"t\":"; WriteFloats(ss, xform, 16);
 
             // Geometry: byte offsets into shared buffer (or -1 if unchanged)
@@ -2990,9 +3034,12 @@ public:
             Mtl* foundMtl = FindSupportedMaterial(node->GetMtl());
             ExtractMaterialScalarPreview(foundMtl, node, t, col, rough, metal, opac);
 
+            bool visible = !node->IsNodeHidden(TRUE);
+
             if (!first) ss << L',';
             ss << L"{\"h\":" << handle;
             ss << L",\"s\":" << (node->Selected() ? L'1' : L'0');
+            ss << L",\"vis\":" << (visible ? L'1' : L'0');
             ss << L",\"t\":"; WriteFloats(ss, xform, 16);
             // For Multi/Sub objects, skip scalar material pushes to avoid
             // corrupting material arrays on the web side.

@@ -68,20 +68,37 @@ export function createSSGIController({
     const hiddenBackground = new THREE.Color(hiddenBackgroundColor);
     const hiddenBackgroundNode = vec3(hiddenBackground.r, hiddenBackground.g, hiddenBackground.b);
 
-    // Collect meshes with MeshToonMaterial for auto-outline
-    function getToonMeshes() {
-        const toonMeshes = [];
+    // Cached toon mesh detection — refreshed on pipeline rebuild, not every frame
+    let cachedHasToonMeshes = false;
+
+    function refreshToonMeshCache() {
+        cachedHasToonMeshes = false;
         scene.traverse(obj => {
             if (!obj.isMesh || !obj.visible) return;
             const mats = Array.isArray(obj.material) ? obj.material : [obj.material];
             for (const m of mats) {
                 if (m && m.isMeshToonMaterial) {
-                    toonMeshes.push(obj);
+                    cachedHasToonMeshes = true;
+                    return;
+                }
+            }
+        });
+    }
+
+    function getToonMeshes() {
+        // Only used during pipeline rebuild — returns fresh list
+        const result = [];
+        scene.traverse(obj => {
+            if (!obj.isMesh || !obj.visible) return;
+            const mats = Array.isArray(obj.material) ? obj.material : [obj.material];
+            for (const m of mats) {
+                if (m && m.isMeshToonMaterial) {
+                    result.push(obj);
                     break;
                 }
             }
         });
-        return toonMeshes;
+        return result;
     }
     const state = {
         ssgi: {
@@ -179,36 +196,34 @@ export function createSSGIController({
     let forceEnvironmentBackground = false;
     let forcedContactShadowLightState = null;
 
-    function prepareSceneForPostPass() {
-        hiddenDuringPost = [];
+    // Cache objects that need hiding during post pass — rebuilt on pipeline rebuild only
+    let postPassHideList = [];
+    let normalsComputed = new WeakSet();
 
+    function refreshPostPassHideList() {
+        postPassHideList = [];
         scene.traverse((object) => {
             if (!object?.visible) return;
-
             if (object.isLine || object.isLineSegments || object.isPoints || object.isSprite) {
-                hiddenDuringPost.push(object);
-                object.visible = false;
-                return;
+                postPassHideList.push(object);
             }
-
-            if (!object.isMesh || !object.geometry) return;
-
-            const hasNormal = !!object.geometry.getAttribute?.('normal');
-            if (!hasNormal && object.geometry.getAttribute?.('position')) {
-                try {
-                    object.geometry.computeVertexNormals();
-                } catch (error) {
-                    hiddenDuringPost.push(object);
-                    object.visible = false;
+            // Pre-compute normals once, not every frame
+            if (object.isMesh && object.geometry && !normalsComputed.has(object.geometry)) {
+                if (!object.geometry.getAttribute?.('normal') && object.geometry.getAttribute?.('position')) {
+                    try { object.geometry.computeVertexNormals(); } catch {}
                 }
+                normalsComputed.add(object.geometry);
             }
         });
     }
 
+    function prepareSceneForPostPass() {
+        hiddenDuringPost = postPassHideList.filter(o => o.visible);
+        for (const o of hiddenDuringPost) o.visible = false;
+    }
+
     function restoreSceneAfterPostPass() {
-        for (const object of hiddenDuringPost) {
-            object.visible = true;
-        }
+        for (const o of hiddenDuringPost) o.visible = true;
         hiddenDuringPost = [];
     }
 
@@ -287,7 +302,7 @@ export function createSSGIController({
 
     function hasAnyEffectEnabled() {
         return state.ssgi.enabled || state.ssr.enabled || state.gtao.enabled || state.motionBlur.enabled || state.traa.enabled || state.bloom.enabled
-            || (state.toonOutline.enabled && getToonMeshes().length > 0)
+            || (state.toonOutline.enabled && cachedHasToonMeshes)
             || (state.contactShadow.enabled && mainLight)
             || state.retro.enabled;
     }
@@ -338,7 +353,7 @@ export function createSSGIController({
             motionBlur: { ...state.motionBlur },
             traa: { ...state.traa },
             bloom: { ...state.bloom },
-            toonOutline: { ...state.toonOutline, toonCount: getToonMeshes().length },
+            toonOutline: { ...state.toonOutline, toonCount: cachedHasToonMeshes ? 1 : 0 },
             contactShadow: { ...state.contactShadow },
             retro: { ...state.retro },
         };
@@ -365,6 +380,8 @@ export function createSSGIController({
     }
 
     function rebuildPipeline() {
+        refreshToonMeshCache();
+        refreshPostPassHideList();
         ensureMainLightSupportsContactShadow();
 
         if (!hasAnyEffectEnabled() || !available) {
@@ -889,9 +906,7 @@ export function createSSGIController({
             }
         },
         resize() {
-            if (hasAnyEffectEnabled()) {
-                postProcessing.needsUpdate = true;
-            }
+            // Post-processing handles resize internally — no need to force recompile
         },
     };
 }

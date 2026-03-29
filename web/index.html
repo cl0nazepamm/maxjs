@@ -981,8 +981,10 @@
                 break;
             case 0:
             default:
-                material.backdropNode = hashBlur(viewportSharedTexture(), blurAmountNode).add(depthAlphaNode.mul(tintNode));
-                material.opacityNode = depthOpacityNode;
+                // Frosted glass: depth-based blur + tint (matches webgpu_backdrop_area example)
+                material.backdropNode = hashBlur(viewportSharedTexture(), blurAmountNode)
+                    .add(depthAlphaNode.mix(tintNode.mul(0.3), 0));
+                // No opacityNode — let backdropNode handle the compositing
                 break;
             }
             material.side = md.side === 0 ? THREE.FrontSide : THREE.DoubleSide;
@@ -1440,8 +1442,16 @@
         });
 
         // ── Camera-only sync (30fps) ─────────────────────────
+        let lastEnvSig = '';
         bridge.on('cam', msg => {
             if (msg.camera) applyCamera(msg.camera);
+            if (msg.env) {
+                const sig = `${msg.env.rot}|${msg.env.exp}|${msg.env.gamma}|${msg.env.zup}|${msg.env.hdri}`;
+                if (sig !== lastEnvSig) {
+                    lastEnvSig = sig;
+                    loadHDRI(msg.env);
+                }
+            }
             if (msg.frame || msg.stats) {
                 updateSyncHud({
                     transport: 'json',
@@ -1459,6 +1469,9 @@
             for (const nd of msg.nodes) {
                 const mesh = nodeMap.get(nd.h);
                 if (!mesh) continue;
+                // Visibility (hide/unhide/isolate) — instant, no full sync needed
+                const vis = nd.vis !== 0;
+                if (mesh.visible !== vis) mesh.visible = vis;
                 applyTransform(mesh, nd.t);
                 applySelection(mesh, nd.s);
                 // Live material update from scalars
@@ -1581,7 +1594,7 @@
                     nodeMap.set(nd.h, mesh);
                 }
 
-                mesh.visible = true;
+                mesh.visible = nd.vis !== 0;
                 mesh.frustumCulled = false;
                 applyMeshShadowState(mesh);
 
@@ -2023,6 +2036,19 @@
         let postPanelVisible = false;
         let lastPostFxSignature = '';
 
+        // Tone mapping modes
+        const toneMappingModes = {
+            'None': THREE.NoToneMapping,
+            'Linear': THREE.LinearToneMapping,
+            'Reinhard': THREE.ReinhardToneMapping,
+            'Cineon': THREE.CineonToneMapping,
+            'ACES Filmic': THREE.ACESFilmicToneMapping,
+            'AgX': THREE.AgXToneMapping,
+            'Neutral': THREE.NeutralToneMapping,
+        };
+        let currentToneMapping = 'ACES Filmic';
+        let currentExposure = 1.2;
+
         const postFxSections = [
             {
                 key: 'ssgi',
@@ -2261,6 +2287,10 @@
                 </section>
             `).join('');
 
+            const tmOptions = Object.keys(toneMappingModes).map(name =>
+                `<option value="${name}" ${name === currentToneMapping ? 'selected' : ''}>${name}</option>`
+            ).join('');
+
             postPanel.innerHTML = `
                 <div class="sidepanel-header">
                     <div>
@@ -2269,10 +2299,47 @@
                     </div>
                     <button id="btnPostPanelClose" type="button">Hide</button>
                 </div>
-                <div class="sidepanel-body">${sectionsHtml}</div>
+                <div class="sidepanel-body">
+                    <section class="fx-section">
+                        <div class="fx-section-header">
+                            <div>
+                                <div class="fx-section-title">Tone Mapping</div>
+                            </div>
+                        </div>
+                        <div class="fx-grid">
+                            <label class="fx-row">
+                                <div class="fx-row-label"><span>Mode</span></div>
+                                <select id="fx-tonemapping-mode" style="background:rgba(30,34,55,0.9);color:#ccd3e5;border:1px solid rgba(110,120,154,0.4);border-radius:4px;padding:3px 6px;font:12px 'Segoe UI',sans-serif;width:100%">
+                                    ${tmOptions}
+                                </select>
+                            </label>
+                            <label class="fx-row">
+                                <div class="fx-row-label">
+                                    <span>Exposure</span>
+                                    <span class="fx-value" id="fx-tonemapping-exp-val">${currentExposure.toFixed(1)}</span>
+                                </div>
+                                <input class="fx-range" id="fx-tonemapping-exp" type="range" min="0" max="5" step="0.1" value="${currentExposure}">
+                            </label>
+                        </div>
+                    </section>
+                    ${sectionsHtml}
+                </div>
             `;
 
             document.getElementById('btnPostPanelClose').onclick = () => setPostPanelVisible(false);
+
+            // Tone mapping controls
+            document.getElementById('fx-tonemapping-mode').onchange = (e) => {
+                currentToneMapping = e.target.value;
+                renderer.toneMapping = toneMappingModes[currentToneMapping];
+            };
+            const expSlider = document.getElementById('fx-tonemapping-exp');
+            const expLabel = document.getElementById('fx-tonemapping-exp-val');
+            expSlider.oninput = (e) => {
+                currentExposure = parseFloat(e.target.value);
+                renderer.toneMappingExposure = currentExposure;
+                expLabel.textContent = currentExposure.toFixed(1);
+            };
 
             for (const section of postFxSections) {
                 section.toggleEl = document.getElementById(`fx-toggle-${section.key}`);
@@ -2405,11 +2472,14 @@
         syncPostFxPanel(true);
 
         // ── Resize + Render ─────────────────────────────────
+        let resizeTimer = null;
         addEventListener('resize', () => {
             camera.aspect = innerWidth / innerHeight;
             camera.updateProjectionMatrix();
             renderer.setSize(innerWidth, innerHeight);
-            ssgiFx.resize();
+            // Debounce post-FX resize — only recompile after dragging stops
+            clearTimeout(resizeTimer);
+            resizeTimer = setTimeout(() => ssgiFx.resize(), 200);
             if (splatOverlay) {
                 splatOverlay.renderer.setPixelRatio(devicePixelRatio);
                 splatOverlay.renderer.setSize(innerWidth, innerHeight, false);

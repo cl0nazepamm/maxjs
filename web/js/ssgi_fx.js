@@ -465,7 +465,11 @@ export function createSSGIController({
                     sceneContext = builtinAOContext(aoSample, sceneContext);
                 }
 
-                const scenePass = pass(scene, camera);
+                // Use toonOutlinePass as scene pass when toon materials exist — outlines + MRT
+                const useToonPass = state.toonOutline.enabled && getToonMeshes().length > 0;
+                const scenePass = useToonPass
+                    ? toonOutlinePass(scene, camera)
+                    : pass(scene, camera);
                 activeNodes.push(scenePass);
 
                 if (sceneContext) scenePass.contextNode = sceneContext;
@@ -545,11 +549,8 @@ export function createSSGIController({
                 beauty = beauty.add(bloomPass);
             }
 
-            // Toon outline: uses built-in toonOutlinePass which auto-detects MeshToonMaterial
-            if (state.toonOutline.enabled && getToonMeshes().length > 0) {
-                // toonOutlinePass renders the scene with outlines — replaces beauty
-                beauty = toonOutlinePass(scene, camera);
-            }
+            // Toon outline is handled at the scene pass level (line above) —
+            // toonOutlinePass replaces pass() so MRT + SSGI/SSR/Bloom all stack on top.
 
             if (state.traa.enabled && !useRetroTakeover && prePassDepth && prePassVelocity) {
                 const traaInput = convertToTexture(beauty);

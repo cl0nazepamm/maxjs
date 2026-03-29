@@ -182,7 +182,6 @@
             <button id="btnCamLock" class="active">Cam Lock: ON</button>
             <button id="btnEnv">Env: OFF</button>
             <button id="btnLightProbe" class="active">Probe: ON</button>
-            <button id="btnSel">Outline: OFF</button>
             <button id="btnPostFxPanel">Post FX</button>
         </div>
     </div>
@@ -667,6 +666,7 @@
                 realWidth: Number.isFinite(xf.realWidth) && Math.abs(xf.realWidth) > 1e-6 ? xf.realWidth : 1.0,
                 realHeight: Number.isFinite(xf.realHeight) && Math.abs(xf.realHeight) > 1e-6 ? xf.realHeight : 1.0,
                 wrap: typeof xf.wrap === 'string' ? xf.wrap : 'periodic',
+                channel: Number.isFinite(xf.channel) ? Math.max(1, Math.round(xf.channel)) : 1,
             };
         }
 
@@ -717,6 +717,66 @@
             return tex;
         }
 
+        function applyTextureChannelSelection(tex, xf) {
+            const channel = xf?.channel ?? 1;
+            if (channel <= 1) return;
+
+            const image = tex?.image;
+            const width = image?.width ?? image?.videoWidth ?? 0;
+            const height = image?.height ?? image?.videoHeight ?? 0;
+            if (!width || !height) return;
+
+            const canvas = document.createElement('canvas');
+            canvas.width = width;
+            canvas.height = height;
+            const ctx = canvas.getContext('2d', { willReadFrequently: true });
+            if (!ctx) return;
+
+            ctx.drawImage(image, 0, 0, width, height);
+            const imageData = ctx.getImageData(0, 0, width, height);
+            const { data } = imageData;
+
+            for (let i = 0; i < data.length; i += 4) {
+                const r = data[i];
+                const g = data[i + 1];
+                const b = data[i + 2];
+                const a = data[i + 3];
+                let value = r;
+
+                switch (channel) {
+                case 2:
+                    value = r;
+                    break;
+                case 3:
+                    value = g;
+                    break;
+                case 4:
+                    value = b;
+                    break;
+                case 5:
+                    value = a;
+                    break;
+                case 6:
+                    value = Math.round((0.2126 * r) + (0.7152 * g) + (0.0722 * b));
+                    break;
+                case 7:
+                    value = Math.round((r + g + b) / 3);
+                    break;
+                default:
+                    value = r;
+                    break;
+                }
+
+                data[i] = value;
+                data[i + 1] = value;
+                data[i + 2] = value;
+                data[i + 3] = channel === 5 ? value : a;
+            }
+
+            ctx.putImageData(imageData, 0, 0);
+            tex.image = canvas;
+        }
+
         function loadTexture(url, colorSpace = THREE.LinearSRGBColorSpace, xf = null, fallbackTex = fallbackWhiteTexture) {
             if (!url) return null;
             const normalizedXf = normalizeTextureTransform(xf);
@@ -725,6 +785,7 @@
             const tex = textureLoader.load(
                 url,
                 loadedTex => {
+                    applyTextureChannelSelection(loadedTex, normalizedXf);
                     loadedTex.colorSpace = colorSpace;
                     applyTextureTransform(loadedTex, normalizedXf);
                     loadedTex.needsUpdate = true;
@@ -1618,24 +1679,9 @@
             return true;
         }
 
-        let selHighlight = false;
-
         function applySelection(mesh, selected) {
             mesh.userData.maxjsSelected = !!selected;
-            // Update outline pass with current selection
-            updateOutlineSelection();
-        }
-
-        function updateOutlineSelection() {
-            if (!selHighlight) {
-                ssgiFx.setSelectedObjects([]);
-                return;
-            }
-            const selected = [];
-            for (const [, mesh] of nodeMap) {
-                if (mesh.userData.maxjsSelected) selected.push(mesh);
-            }
-            ssgiFx.setSelectedObjects(selected);
+            // Toon outline is auto-detected from material type — no manual selection needed
         }
 
         function applyMaterialScalar(mesh, material) {
@@ -1970,14 +2016,7 @@
             if (lightProbeEnabled) refreshLightProbeFromCurrentHDRI();
         };
 
-        const btnSel = document.getElementById('btnSel');
-        btnSel.onclick = () => {
-            selHighlight = !selHighlight;
-            btnSel.textContent = `Outline: ${selHighlight ? 'ON' : 'OFF'}`;
-            btnSel.classList.toggle('active', selHighlight);
-            ssgiFx.setOutlineEnabled(selHighlight);
-            updateOutlineSelection();
-        };
+        // Toon outline is automatic — no UI button needed
 
         const btnPostFxPanel = document.getElementById('btnPostFxPanel');
         const postPanel = document.getElementById('postPanel');
@@ -1999,7 +2038,7 @@
                     { key: 'radius', label: 'Radius', min: 1, max: 24, step: 0.5 },
                     { key: 'thickness', label: 'Thickness', min: 0.01, max: 10, step: 0.01 },
                     { key: 'aoIntensity', label: 'AO Intensity', min: 0, max: 4, step: 0.05 },
-                    { key: 'giIntensity', label: 'GI Intensity', min: 0, max: 12, step: 0.1 },
+                    { key: 'giIntensity', label: 'GI Intensity', min: 0, max: 32, step: 0.1 },
                     { key: 'expFactor', label: 'Falloff', min: 1, max: 3, step: 0.05 },
                     { key: 'sliceCount', label: 'Slices', min: 1, max: 4, step: 1, integer: true },
                     { key: 'stepCount', label: 'Steps', min: 1, max: 24, step: 1, integer: true },
@@ -2025,6 +2064,26 @@
                 ],
             },
             {
+                key: 'gtao',
+                title: 'GTAO',
+                copy: 'Ground-truth ambient occlusion from a dedicated depth and normal pre-pass.',
+                note: 'Requires the real WebGPU backend.',
+                requiresWebGPU: true,
+                isEnabled: () => ssgiFx.isGTAOEnabled(),
+                setEnabled: (enabled) => ssgiFx.setGTAOEnabled(enabled),
+                getValues: (state) => state.gtao,
+                setValues: (patch) => ssgiFx.setGTAOOptions(patch),
+                controls: [
+                    { key: 'radius', label: 'Radius', min: 0.05, max: 2, step: 0.01 },
+                    { key: 'thickness', label: 'Thickness', min: 0.01, max: 2, step: 0.01 },
+                    { key: 'scale', label: 'Intensity', min: 0, max: 4, step: 0.05 },
+                    { key: 'distanceExponent', label: 'Dist Exp', min: 1, max: 2, step: 0.01 },
+                    { key: 'distanceFallOff', label: 'Falloff', min: 0.01, max: 1, step: 0.01 },
+                    { key: 'samples', label: 'Samples', min: 4, max: 32, step: 1, integer: true },
+                    { key: 'resolutionScale', label: 'Resolution', min: 0.25, max: 1, step: 0.05 },
+                ],
+            },
+            {
                 key: 'bloom',
                 title: 'Bloom',
                 copy: 'Highlights bleed for emissive and high-energy surfaces.',
@@ -2038,6 +2097,54 @@
                     { key: 'strength', label: 'Strength', min: 0, max: 3, step: 0.01 },
                     { key: 'radius', label: 'Radius', min: 0, max: 1, step: 0.01 },
                     { key: 'threshold', label: 'Threshold', min: 0, max: 2, step: 0.01 },
+                ],
+            },
+            {
+                key: 'toonOutline',
+                title: 'Toon Outline',
+                copy: 'Black ink outline on objects with ThreeJS Toon material. Auto-detected.',
+                note: 'Only visible on MeshToonMaterial objects.',
+                requiresWebGPU: true,
+                isEnabled: () => ssgiFx.isToonOutlineEnabled(),
+                setEnabled: (enabled) => ssgiFx.setToonOutlineEnabled(enabled),
+                getValues: (state) => state.toonOutline,
+                setValues: (patch) => ssgiFx.setToonOutlineOptions(patch),
+                controls: [
+                    { key: 'edgeStrength', label: 'Strength', min: 0, max: 10, step: 0.1 },
+                    { key: 'edgeThickness', label: 'Thickness', min: 0, max: 5, step: 0.1 },
+                    { key: 'edgeGlow', label: 'Glow', min: 0, max: 1, step: 0.01 },
+                ],
+            },
+            {
+                key: 'motionBlur',
+                title: 'Motion Blur',
+                copy: 'Velocity-based blur from camera and object motion in the current frame.',
+                note: 'Requires the real WebGPU backend.',
+                requiresWebGPU: true,
+                isEnabled: () => ssgiFx.isMotionBlurEnabled(),
+                setEnabled: (enabled) => ssgiFx.setMotionBlurEnabled(enabled),
+                getValues: (state) => state.motionBlur,
+                setValues: (patch) => ssgiFx.setMotionBlurOptions(patch),
+                controls: [
+                    { key: 'amount', label: 'Amount', min: 0, max: 3, step: 0.01 },
+                    { key: 'samples', label: 'Samples', min: 4, max: 32, step: 1, integer: true },
+                ],
+            },
+            {
+                key: 'traa',
+                title: 'TRAA',
+                copy: 'Temporal reprojection anti-aliasing for cleaner edges and more stable GI.',
+                note: 'Requires the real WebGPU backend.',
+                requiresWebGPU: true,
+                isEnabled: () => ssgiFx.isTRAAEnabled(),
+                setEnabled: (enabled) => ssgiFx.setTRAAEnabled(enabled),
+                getValues: (state) => state.traa,
+                setValues: (patch) => ssgiFx.setTRAAOptions(patch),
+                controls: [
+                    { key: 'useSubpixelCorrection', label: 'Subpixel Corr', type: 'checkbox' },
+                    { key: 'depthThreshold', label: 'Depth Reject', min: 0.0001, max: 0.01, step: 0.0001 },
+                    { key: 'edgeDepthDiff', label: 'Edge Threshold', min: 0.0001, max: 0.02, step: 0.0001 },
+                    { key: 'maxVelocityLength', label: 'Velocity Clamp', min: 8, max: 256, step: 1, integer: true },
                 ],
             },
             {
@@ -2265,8 +2372,24 @@
                 } else if (section.requiresWebGPU && !supportsScreenSpaceEffects) {
                     note = 'Requires the real WebGPU backend.';
                     isError = true;
+                } else if (
+                    derived?.retroTakeoverActive &&
+                    ['ssgi', 'ssr', 'gtao', 'motionBlur', 'traa', 'contactShadow'].includes(section.key)
+                ) {
+                    note = 'Bypassed while Retro Wiggle takeover is active.';
                 } else if (section.key === 'ssr' && derived) {
                     note = `World distance ${derived.effectiveSSRMaxDistance.toFixed(2)} • thickness ${derived.effectiveSSRThickness.toFixed(3)}`;
+                } else if (section.key === 'gtao' && derived) {
+                    note = `World radius ${derived.effectiveGTAORadius.toFixed(2)} • thickness ${derived.effectiveGTAOThickness.toFixed(2)}`;
+                } else if (section.key === 'contactShadow' && derived) {
+                    note = `World distance ${derived.effectiveContactShadowMaxDistance.toFixed(2)} • thickness ${derived.effectiveContactShadowThickness.toFixed(3)}`;
+                    if (values.temporal && !state.traa.enabled) {
+                        note += ' • Temporal needs TRAA';
+                    }
+                } else if (section.key === 'traa') {
+                    note = values.useSubpixelCorrection
+                        ? 'Temporal AA with subpixel correction enabled.'
+                        : 'Temporal AA with the cleaner, less corrective resolve.';
                 }
 
                 section.noteEl.textContent = note;

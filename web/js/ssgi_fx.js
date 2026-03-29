@@ -2,10 +2,12 @@ import * as THREE from 'three';
 import {
     add,
     blendColor,
+    convertToTexture,
     colorToDirection,
     diffuseColor,
     directionToColor,
     float,
+    int,
     max,
     metalness,
     mrt,
@@ -21,19 +23,23 @@ import {
     screenSize,
     builtinShadowContext,
     builtinAOContext,
+    toonOutlinePass,
     posterize,
     uniform,
     replaceDefaultUV,
+    velocity,
 } from 'three/tsl';
 import { bloom } from 'three/addons/tsl/display/BloomNode.js';
 import { ssr } from 'three/addons/tsl/display/SSRNode.js';
 import { ssgi } from 'three/addons/tsl/display/SSGINode.js';
-import { outline } from 'three/addons/tsl/display/OutlineNode.js';
+// OutlineNode removed — using built-in toonOutlinePass from TSL instead
 import { sss } from 'three/addons/tsl/display/SSSNode.js';
 import { scanlines, vignette, colorBleeding, barrelUV } from 'three/addons/tsl/display/CRT.js';
 import { bayerDither } from 'three/addons/tsl/math/Bayer.js';
 import { retroPass } from 'three/addons/tsl/display/RetroPassNode.js';
 import { ao } from 'three/addons/tsl/display/GTAONode.js';
+import { motionBlur } from 'three/addons/tsl/display/MotionBlur.js';
+import { traa } from 'three/addons/tsl/display/TRAANode.js';
 
 function setTexturePrecision(scenePass) {
     const diffuseTexture = scenePass.getTexture('diffuseColor');
@@ -61,6 +67,22 @@ export function createSSGIController({
     const SSR_REFERENCE_SIZE = 6.0;
     const hiddenBackground = new THREE.Color(hiddenBackgroundColor);
     const hiddenBackgroundNode = vec3(hiddenBackground.r, hiddenBackground.g, hiddenBackground.b);
+
+    // Collect meshes with MeshToonMaterial for auto-outline
+    function getToonMeshes() {
+        const toonMeshes = [];
+        scene.traverse(obj => {
+            if (!obj.isMesh || !obj.visible) return;
+            const mats = Array.isArray(obj.material) ? obj.material : [obj.material];
+            for (const m of mats) {
+                if (m && m.isMeshToonMaterial) {
+                    toonMeshes.push(obj);
+                    break;
+                }
+            }
+        });
+        return toonMeshes;
+    }
     const state = {
         ssgi: {
             enabled: false,
@@ -81,27 +103,49 @@ export function createSSGIController({
             opacity: 0.9,
             thickness: 0.015,
         },
+        gtao: {
+            enabled: false,
+            samples: 16,
+            distanceExponent: 1.0,
+            distanceFallOff: 1.0,
+            radius: 0.25,
+            scale: 1.0,
+            thickness: 1.0,
+            resolutionScale: 0.5,
+        },
+        motionBlur: {
+            enabled: false,
+            amount: 1.0,
+            samples: 16,
+        },
+        traa: {
+            enabled: false,
+            useSubpixelCorrection: true,
+            depthThreshold: 0.0005,
+            edgeDepthDiff: 0.001,
+            maxVelocityLength: 128,
+        },
         bloom: {
             enabled: false,
             strength: 0.4,
             radius: 0.2,
             threshold: 0.75,
         },
-        outline: {
-            enabled: false,
+        toonOutline: {
+            enabled: true,
             edgeStrength: 3.0,
             edgeGlow: 0.0,
             edgeThickness: 1.0,
-            visibleEdgeColor: [1, 1, 1],
-            hiddenEdgeColor: [0.3, 0.2, 0.2],
+            visibleEdgeColor: [0, 0, 0],
+            hiddenEdgeColor: [0, 0, 0],
         },
         contactShadow: {
             enabled: false,
-            maxDistance: 0.15,
-            thickness: 0.01,
-            shadowIntensity: 1.0,
-            quality: 0.5,
-            temporal: true,
+            maxDistance: 0.1,
+            thickness: 0.006,
+            shadowIntensity: 0.85,
+            quality: 0.3,
+            temporal: false,
         },
         retro: {
             enabled: false,
@@ -129,8 +173,11 @@ export function createSSGIController({
     let pipelineReady = false;
     let activeNodes = [];
     let activeSSRPass = null;
+    let activeAOPass = null;
+    let activeContactShadowPass = null;
     let hiddenDuringPost = [];
     let forceEnvironmentBackground = false;
+    let forcedContactShadowLightState = null;
 
     function prepareSceneForPostPass() {
         hiddenDuringPost = [];
@@ -165,8 +212,54 @@ export function createSSGIController({
         hiddenDuringPost = [];
     }
 
+    function restoreForcedContactShadowLight() {
+        if (!forcedContactShadowLightState) return;
+
+        const { light, castShadow, shadowIntensity } = forcedContactShadowLightState;
+        forcedContactShadowLightState = null;
+
+        if (!light) return;
+
+        light.castShadow = castShadow;
+        if (light.shadow && shadowIntensity != null) {
+            light.shadow.intensity = shadowIntensity;
+            light.shadow.needsUpdate = true;
+        }
+    }
+
+    function ensureMainLightSupportsContactShadow() {
+        if (!state.contactShadow.enabled || !mainLight?.isDirectionalLight) {
+            restoreForcedContactShadowLight();
+            return;
+        }
+
+        if (forcedContactShadowLightState?.light && forcedContactShadowLightState.light !== mainLight) {
+            restoreForcedContactShadowLight();
+        }
+
+        if (mainLight.castShadow || forcedContactShadowLightState?.light === mainLight) return;
+
+        forcedContactShadowLightState = {
+            light: mainLight,
+            castShadow: mainLight.castShadow,
+            shadowIntensity: mainLight.shadow && Number.isFinite(mainLight.shadow.intensity)
+                ? mainLight.shadow.intensity
+                : null,
+        };
+
+        mainLight.castShadow = true;
+        if (mainLight.shadow) {
+            if (typeof mainLight.shadow.intensity === 'number') {
+                mainLight.shadow.intensity = 0;
+            }
+            mainLight.shadow.needsUpdate = true;
+        }
+    }
+
     function clearNodes() {
         activeSSRPass = null;
+        activeAOPass = null;
+        activeContactShadowPass = null;
         for (const node of activeNodes) {
             if (node && typeof node.dispose === 'function') {
                 node.dispose();
@@ -180,8 +273,12 @@ export function createSSGIController({
         available = false;
         state.ssgi.enabled = false;
         state.ssr.enabled = false;
+        state.gtao.enabled = false;
+        state.motionBlur.enabled = false;
+        state.traa.enabled = false;
         state.bloom.enabled = false;
         pipelineReady = false;
+        restoreForcedContactShadowLight();
         clearNodes();
         postProcessing.outputNode = null;
         postProcessing.needsUpdate = true;
@@ -189,8 +286,8 @@ export function createSSGIController({
     }
 
     function hasAnyEffectEnabled() {
-        return state.ssgi.enabled || state.ssr.enabled || state.bloom.enabled
-            || (state.outline.enabled && selectedObjects.length > 0)
+        return state.ssgi.enabled || state.ssr.enabled || state.gtao.enabled || state.motionBlur.enabled || state.traa.enabled || state.bloom.enabled
+            || (state.toonOutline.enabled && getToonMeshes().length > 0)
             || (state.contactShadow.enabled && mainLight)
             || state.retro.enabled;
     }
@@ -225,6 +322,11 @@ export function createSSGIController({
             ssrUnitScale,
             effectiveSSRMaxDistance: state.ssr.maxDistance * ssrUnitScale,
             effectiveSSRThickness: state.ssr.thickness * ssrUnitScale,
+            effectiveGTAORadius: state.gtao.radius * ssrUnitScale,
+            effectiveGTAOThickness: state.gtao.thickness * ssrUnitScale,
+            effectiveContactShadowMaxDistance: state.contactShadow.maxDistance * ssrUnitScale,
+            effectiveContactShadowThickness: state.contactShadow.thickness * ssrUnitScale,
+            retroTakeoverActive: state.retro.enabled && state.retro.wiggle,
         };
     }
 
@@ -232,18 +334,30 @@ export function createSSGIController({
         return {
             ssgi: { ...state.ssgi },
             ssr: { ...state.ssr },
+            gtao: { ...state.gtao },
+            motionBlur: { ...state.motionBlur },
+            traa: { ...state.traa },
             bloom: { ...state.bloom },
-            outline: { ...state.outline, selectedCount: selectedObjects.length },
+            toonOutline: { ...state.toonOutline, toonCount: getToonMeshes().length },
             contactShadow: { ...state.contactShadow },
             retro: { ...state.retro },
         };
     }
 
     function updateActiveScreenSpaceParams() {
-        if (!activeSSRPass) return;
         const derived = computeDerivedState();
-        activeSSRPass.maxDistance.value = derived.effectiveSSRMaxDistance;
-        activeSSRPass.thickness.value = derived.effectiveSSRThickness;
+        if (activeSSRPass) {
+            activeSSRPass.maxDistance.value = derived.effectiveSSRMaxDistance;
+            activeSSRPass.thickness.value = derived.effectiveSSRThickness;
+        }
+        if (activeAOPass) {
+            activeAOPass.radius.value = derived.effectiveGTAORadius;
+            activeAOPass.thickness.value = derived.effectiveGTAOThickness;
+        }
+        if (activeContactShadowPass) {
+            activeContactShadowPass.maxDistance.value = derived.effectiveContactShadowMaxDistance;
+            activeContactShadowPass.thickness.value = derived.effectiveContactShadowThickness;
+        }
     }
 
     function assignFinite(target, key, value) {
@@ -251,8 +365,11 @@ export function createSSGIController({
     }
 
     function rebuildPipeline() {
+        ensureMainLightSupportsContactShadow();
+
         if (!hasAnyEffectEnabled() || !available) {
             pipelineReady = false;
+            restoreForcedContactShadowLight();
             clearNodes();
             postProcessing.outputNode = null;
             postProcessing.needsUpdate = true;
@@ -263,26 +380,54 @@ export function createSSGIController({
         clearNodes();
 
         try {
-            // Contact shadows need a depth pre-pass
-            let sssContext = null;
-            if (state.contactShadow.enabled && mainLight) {
+            const useRetroTakeover = state.retro.enabled && state.retro.wiggle;
+            const useSharedPrePass =
+                !useRetroTakeover && (
+                    state.gtao.enabled ||
+                    state.motionBlur.enabled ||
+                    state.traa.enabled ||
+                    (state.contactShadow.enabled && mainLight)
+                );
+
+            let prePassDepth = null;
+            let prePassNormal = null;
+            let prePassVelocity = null;
+
+            if (useSharedPrePass) {
                 const prePass = pass(scene, camera);
                 activeNodes.push(prePass);
-                const prePassDepth = prePass.getTextureNode('depth');
+                prePass.transparent = false;
+                prePass.setMRT(mrt({
+                    output: directionToColor(normalView),
+                    velocity,
+                }));
 
-                const sssPass = sss(prePassDepth, camera, mainLight);
-                sssPass.maxDistance.value = state.contactShadow.maxDistance;
-                sssPass.thickness.value = state.contactShadow.thickness;
-                sssPass.shadowIntensity.value = state.contactShadow.shadowIntensity;
-                sssPass.quality.value = state.contactShadow.quality;
-                sssPass.useTemporalFiltering = state.contactShadow.temporal;
-                activeNodes.push(sssPass);
+                prePassDepth = prePass.getTextureNode('depth');
+                const prePassNormalColor = prePass.getTextureNode('output');
+                prePassVelocity = prePass.getTextureNode('velocity');
+                prePassNormal = sample((uvNode) => colorToDirection(prePassNormalColor.sample(uvNode)));
 
-                const sssSample = sssPass.getTextureNode().sample(screenUV).r;
-                sssContext = builtinShadowContext(sssSample, mainLight);
+                const normalTexture = prePass.getTexture('output');
+                if (normalTexture) normalTexture.type = THREE.UnsignedByteType;
             }
 
-            const useRetroTakeover = state.retro.enabled && state.retro.wiggle;
+            let sceneContext = null;
+            if (state.contactShadow.enabled && mainLight && prePassDepth) {
+                const derived = computeDerivedState();
+                const contactShadowTemporal = state.contactShadow.temporal && state.traa.enabled;
+                const sssPass = sss(prePassDepth, camera, mainLight);
+                sssPass.maxDistance.value = derived.effectiveContactShadowMaxDistance;
+                sssPass.thickness.value = derived.effectiveContactShadowThickness;
+                sssPass.shadowIntensity.value = state.contactShadow.shadowIntensity;
+                sssPass.quality.value = state.contactShadow.quality;
+                sssPass.useTemporalFiltering = contactShadowTemporal;
+                activeNodes.push(sssPass);
+                activeContactShadowPass = sssPass;
+
+                const sssSample = sssPass.getTextureNode().sample(screenUV).r;
+                sceneContext = builtinShadowContext(sssSample, mainLight, sceneContext);
+            }
+
             const useEnvironmentBackdropCompensation =
                 state.ssr.enabled && !useRetroTakeover && !!scene.environment && !environmentVisible;
 
@@ -297,16 +442,39 @@ export function createSSGIController({
                 activeNodes.push(retro);
                 beauty = retro;
             } else {
+                const derived = computeDerivedState();
+                const ssrReflectivityNode = max(
+                    metalness,
+                    roughness.oneMinus().mul(0.35).add(float(0.04))
+                );
+
+                if (state.gtao.enabled && prePassDepth && prePassNormal) {
+                    const aoPass = ao(prePassDepth, prePassNormal, camera);
+                    aoPass.samples.value = state.gtao.samples;
+                    aoPass.distanceExponent.value = state.gtao.distanceExponent;
+                    aoPass.distanceFallOff.value = state.gtao.distanceFallOff;
+                    aoPass.radius.value = derived.effectiveGTAORadius;
+                    aoPass.scale.value = state.gtao.scale;
+                    aoPass.thickness.value = derived.effectiveGTAOThickness;
+                    aoPass.resolutionScale = state.gtao.resolutionScale;
+                    aoPass.useTemporalFiltering = state.traa.enabled;
+                    activeNodes.push(aoPass);
+                    activeAOPass = aoPass;
+
+                    const aoSample = aoPass.getTextureNode().sample(screenUV).r;
+                    sceneContext = builtinAOContext(aoSample, sceneContext);
+                }
+
                 const scenePass = pass(scene, camera);
                 activeNodes.push(scenePass);
 
-                if (sssContext) scenePass.contextNode = sssContext;
+                if (sceneContext) scenePass.contextNode = sceneContext;
 
                 scenePass.setMRT(mrt({
                     output,
                     diffuseColor,
                     normal: directionToColor(normalView),
-                    metalrough: vec2(metalness, roughness),
+                    metalrough: vec2(ssrReflectivityNode, roughness),
                 }));
 
                 setTexturePrecision(scenePass);
@@ -377,21 +545,33 @@ export function createSSGIController({
                 beauty = beauty.add(bloomPass);
             }
 
-            if (state.outline.enabled && selectedObjects.length > 0) {
-                const outlinePass = outline(scene, camera, {
-                    selectedObjects,
-                    edgeGlow: float(state.outline.edgeGlow),
-                    edgeThickness: float(state.outline.edgeThickness),
-                });
-                activeNodes.push(outlinePass);
+            // Toon outline: uses built-in toonOutlinePass which auto-detects MeshToonMaterial
+            if (state.toonOutline.enabled && getToonMeshes().length > 0) {
+                // toonOutlinePass renders the scene with outlines — replaces beauty
+                beauty = toonOutlinePass(scene, camera);
+            }
 
-                const visC = state.outline.visibleEdgeColor;
-                const hidC = state.outline.hiddenEdgeColor;
-                const outlineColor = outlinePass.visibleEdge
-                    .mul(vec3(visC[0], visC[1], visC[2]))
-                    .add(outlinePass.hiddenEdge.mul(vec3(hidC[0], hidC[1], hidC[2])))
-                    .mul(state.outline.edgeStrength);
-                beauty = beauty.add(vec4(outlineColor, 0));
+            if (state.traa.enabled && !useRetroTakeover && prePassDepth && prePassVelocity) {
+                const traaInput = convertToTexture(beauty);
+                activeNodes.push(traaInput);
+
+                const traaPass = traa(traaInput, prePassDepth, prePassVelocity, camera);
+                traaPass.useSubpixelCorrection = state.traa.useSubpixelCorrection;
+                traaPass.depthThreshold = state.traa.depthThreshold;
+                traaPass.edgeDepthDiff = state.traa.edgeDepthDiff;
+                traaPass.maxVelocityLength = state.traa.maxVelocityLength;
+                activeNodes.push(traaPass);
+                beauty = traaPass;
+            }
+
+            if (state.motionBlur.enabled && !useRetroTakeover && prePassVelocity) {
+                const motionBlurInput = convertToTexture(beauty);
+                activeNodes.push(motionBlurInput);
+                beauty = motionBlur(
+                    motionBlurInput,
+                    prePassVelocity.mul(uniform(state.motionBlur.amount)),
+                    int(Math.max(2, Math.round(state.motionBlur.samples)))
+                );
             }
 
             if (state.retro.enabled) {
@@ -514,6 +694,73 @@ export function createSSGIController({
             rebuildPipeline();
             return { ...state.ssr };
         },
+        isGTAOEnabled() {
+            return state.gtao.enabled;
+        },
+        setGTAOEnabled(enabled) {
+            if (enabled && !supportsScreenSpaceEffects) {
+                lastError = 'GTAO requires the real WebGPU backend';
+                state.gtao.enabled = false;
+                onError(lastError);
+                return false;
+            }
+            state.gtao.enabled = !!enabled && available;
+            rebuildPipeline();
+            return state.gtao.enabled;
+        },
+        setGTAOOptions(options = {}) {
+            assignFinite(state.gtao, 'samples', options.samples);
+            assignFinite(state.gtao, 'distanceExponent', options.distanceExponent);
+            assignFinite(state.gtao, 'distanceFallOff', options.distanceFallOff);
+            assignFinite(state.gtao, 'radius', options.radius);
+            assignFinite(state.gtao, 'scale', options.scale);
+            assignFinite(state.gtao, 'thickness', options.thickness);
+            assignFinite(state.gtao, 'resolutionScale', options.resolutionScale);
+            rebuildPipeline();
+            return { ...state.gtao };
+        },
+        isMotionBlurEnabled() {
+            return state.motionBlur.enabled;
+        },
+        setMotionBlurEnabled(enabled) {
+            if (enabled && !supportsScreenSpaceEffects) {
+                lastError = 'Motion blur requires the real WebGPU backend';
+                state.motionBlur.enabled = false;
+                onError(lastError);
+                return false;
+            }
+            state.motionBlur.enabled = !!enabled && available;
+            rebuildPipeline();
+            return state.motionBlur.enabled;
+        },
+        setMotionBlurOptions(options = {}) {
+            assignFinite(state.motionBlur, 'amount', options.amount);
+            assignFinite(state.motionBlur, 'samples', options.samples);
+            rebuildPipeline();
+            return { ...state.motionBlur };
+        },
+        isTRAAEnabled() {
+            return state.traa.enabled;
+        },
+        setTRAAEnabled(enabled) {
+            if (enabled && !supportsScreenSpaceEffects) {
+                lastError = 'TRAA requires the real WebGPU backend';
+                state.traa.enabled = false;
+                onError(lastError);
+                return false;
+            }
+            state.traa.enabled = !!enabled && available;
+            rebuildPipeline();
+            return state.traa.enabled;
+        },
+        setTRAAOptions(options = {}) {
+            if (typeof options.useSubpixelCorrection === 'boolean') state.traa.useSubpixelCorrection = options.useSubpixelCorrection;
+            assignFinite(state.traa, 'depthThreshold', options.depthThreshold);
+            assignFinite(state.traa, 'edgeDepthDiff', options.edgeDepthDiff);
+            assignFinite(state.traa, 'maxVelocityLength', options.maxVelocityLength);
+            rebuildPipeline();
+            return { ...state.traa };
+        },
         setEnvironmentVisible(visible) {
             const nextVisible = !!visible;
             if (environmentVisible === nextVisible) return environmentVisible;
@@ -536,29 +783,22 @@ export function createSSGIController({
             rebuildPipeline();
             return { ...state.bloom };
         },
-        isOutlineEnabled() {
-            return state.outline.enabled;
+        isToonOutlineEnabled() {
+            return state.toonOutline.enabled;
         },
-        setOutlineEnabled(enabled) {
-            state.outline.enabled = !!enabled;
+        setToonOutlineEnabled(enabled) {
+            state.toonOutline.enabled = !!enabled;
             rebuildPipeline();
-            return state.outline.enabled;
+            return state.toonOutline.enabled;
         },
-        setSelectedObjects(objects) {
-            // Mutate the array in place — OutlineNode holds a reference to it
-            selectedObjects.length = 0;
-            if (objects) selectedObjects.push(...objects);
-            // Only rebuild if outline just became relevant (first selection) or lost all selection
-            if (state.outline.enabled && !pipelineReady) rebuildPipeline();
-        },
-        setOutlineOptions(options = {}) {
-            assignFinite(state.outline, 'edgeStrength', options.edgeStrength);
-            assignFinite(state.outline, 'edgeGlow', options.edgeGlow);
-            assignFinite(state.outline, 'edgeThickness', options.edgeThickness);
-            if (Array.isArray(options.visibleEdgeColor)) state.outline.visibleEdgeColor = options.visibleEdgeColor;
-            if (Array.isArray(options.hiddenEdgeColor)) state.outline.hiddenEdgeColor = options.hiddenEdgeColor;
+        setToonOutlineOptions(options = {}) {
+            assignFinite(state.toonOutline, 'edgeStrength', options.edgeStrength);
+            assignFinite(state.toonOutline, 'edgeGlow', options.edgeGlow);
+            assignFinite(state.toonOutline, 'edgeThickness', options.edgeThickness);
+            if (Array.isArray(options.visibleEdgeColor)) state.toonOutline.visibleEdgeColor = options.visibleEdgeColor;
+            if (Array.isArray(options.hiddenEdgeColor)) state.toonOutline.hiddenEdgeColor = options.hiddenEdgeColor;
             rebuildPipeline();
-            return { ...state.outline };
+            return { ...state.toonOutline };
         },
         isContactShadowEnabled() {
             return state.contactShadow.enabled;
@@ -576,6 +816,9 @@ export function createSSGIController({
                 return false;
             }
             state.contactShadow.enabled = !!enabled && available;
+            if (!state.contactShadow.enabled) {
+                restoreForcedContactShadowLight();
+            }
             rebuildPipeline();
             return state.contactShadow.enabled;
         },

@@ -2,20 +2,28 @@ import * as THREE from 'three';
 import {
     add,
     blendColor,
+    color,
     convertToTexture,
     colorToDirection,
+    densityFogFactor,
     diffuseColor,
     directionToColor,
     float,
+    fog,
     int,
     max,
     metalness,
     mrt,
     normalView,
+    normalWorld,
     output,
     pass,
+    positionWorld,
+    positionView,
+    rangeFogFactor,
     roughness,
     sample,
+    triNoise3D,
     vec2,
     vec3,
     vec4,
@@ -177,6 +185,18 @@ export function createSSGIController({
             vignetteIntensity: 0.3,
             bleeding: 0.001,
             curvature: 0.02,
+        },
+        fog: {
+            enabled: false,
+            type: 0,          // 0=Range, 1=Density, 2=Custom (procedural)
+            color: [0.85, 0.85, 0.9],
+            opacity: 1.0,
+            near: 10.0,
+            far: 500.0,
+            density: 0.01,
+            noiseScale: 0.005,
+            noiseSpeed: 0.2,
+            height: 20.0,
         },
     };
 
@@ -354,7 +374,47 @@ export function createSSGIController({
             toonOutline: { ...state.toonOutline, toonCount: cachedHasToonMeshes ? 1 : 0 },
             contactShadow: { ...state.contactShadow },
             retro: { ...state.retro },
+            fog: { ...state.fog },
         };
+    }
+
+    // ── Fog — applied via scene.fogNode (independent of post-processing) ──
+
+    const fogTimer = uniform(0);
+    let fogAnimationActive = false;
+
+    function applyFog() {
+        const f = state.fog;
+        if (!f.enabled) {
+            scene.fogNode = null;
+            fogAnimationActive = false;
+            return;
+        }
+
+        const fogColor = color(f.color[0], f.color[1], f.color[2]);
+
+        if (f.type === 0) {
+            // Range fog (linear near/far)
+            const factor = rangeFogFactor(f.near, f.far);
+            scene.fogNode = fog(fogColor, factor.mul(float(f.opacity)));
+        } else if (f.type === 1) {
+            // Density fog (exponential)
+            const factor = densityFogFactor(f.density);
+            scene.fogNode = fog(fogColor, factor.mul(float(f.opacity)));
+        } else if (f.type === 2) {
+            // Custom procedural fog with triNoise3D
+            const groundColor = fogColor;
+            const fogDistance = positionView.z.negate().smoothstep(0, camera.far.sub ? camera.far : float(1000));
+            const distance = fogDistance.mul(float(f.height)).max(float(4));
+            const groundFogArea = distance.sub(positionWorld.y).div(distance).pow(3).saturate().mul(float(f.opacity));
+
+            const noiseA = triNoise3D(positionWorld.mul(float(f.noiseScale)), float(0.2), fogTimer);
+            const noiseB = triNoise3D(positionWorld.mul(float(f.noiseScale * 2)), float(0.2), fogTimer.mul(float(1.2)));
+            const fogNoise = noiseA.add(noiseB).mul(groundColor);
+
+            scene.fogNode = fog(fogDistance.oneMinus().mix(groundColor, fogNoise), groundFogArea);
+            fogAnimationActive = true;
+        }
     }
 
     function updateActiveScreenSpaceParams() {
@@ -879,7 +939,50 @@ export function createSSGIController({
             rebuildPipeline();
             return { ...state.retro };
         },
+        // ── Fog (scene.fogNode — independent of post-processing) ──
+
+        isFogEnabled() {
+            return state.fog.enabled;
+        },
+        setFogEnabled(enabled) {
+            state.fog.enabled = !!enabled;
+            applyFog();
+            return state.fog.enabled;
+        },
+        setFogOptions(options = {}) {
+            if (Number.isFinite(options.type)) state.fog.type = options.type;
+            if (Array.isArray(options.color)) state.fog.color = options.color;
+            assignFinite(state.fog, 'opacity', options.opacity);
+            assignFinite(state.fog, 'near', options.near);
+            assignFinite(state.fog, 'far', options.far);
+            assignFinite(state.fog, 'density', options.density);
+            assignFinite(state.fog, 'noiseScale', options.noiseScale);
+            assignFinite(state.fog, 'noiseSpeed', options.noiseSpeed);
+            assignFinite(state.fog, 'height', options.height);
+            applyFog();
+            return { ...state.fog };
+        },
+        setFogFromScene(fogData) {
+            if (!fogData) return;
+            state.fog.enabled = !!fogData.active;
+            state.fog.type = fogData.type ?? 0;
+            if (Array.isArray(fogData.color)) state.fog.color = fogData.color;
+            if (Number.isFinite(fogData.opacity)) state.fog.opacity = fogData.opacity;
+            if (Number.isFinite(fogData.near)) state.fog.near = fogData.near;
+            if (Number.isFinite(fogData.far)) state.fog.far = fogData.far;
+            if (Number.isFinite(fogData.density)) state.fog.density = fogData.density;
+            if (Number.isFinite(fogData.noiseScale)) state.fog.noiseScale = fogData.noiseScale;
+            if (Number.isFinite(fogData.noiseSpeed)) state.fog.noiseSpeed = fogData.noiseSpeed;
+            if (Number.isFinite(fogData.height)) state.fog.height = fogData.height;
+            applyFog();
+        },
+
         render() {
+            // Update fog timer for procedural animation
+            if (fogAnimationActive) {
+                fogTimer.value = performance.now() * 0.001 * state.fog.noiseSpeed;
+            }
+
             if (!hasAnyEffectEnabled() || !pipelineReady) {
                 renderer.render(scene, camera);
                 return;

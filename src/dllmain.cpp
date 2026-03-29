@@ -15,6 +15,7 @@
 #include "threejs_splat.h"
 #include "threejs_toon.h"
 #include "threejs_renderer.h"
+#include "threejs_fog.h"
 
 #include <wrl.h>
 #include <WebView2.h>
@@ -1207,6 +1208,68 @@ static void GetEnvironment(EnvData& env) {
     env.flip     = FindPBInt(envMap, _T("flip"), 0);
 }
 
+// ══════════════════════════════════════════════════════════════
+//  ThreeJS Fog — read from Rendering > Environment > Atmosphere
+// ══════════════════════════════════════════════════════════════
+
+struct FogData {
+    bool active = false;
+    int  type   = 0;        // 0=Range, 1=Density, 2=Custom
+    float r = 0.85f, g = 0.85f, b = 0.9f;
+    float opacity    = 1.0f;
+    float nearDist   = 10.0f;
+    float farDist    = 500.0f;
+    float density    = 0.01f;
+    float noiseScale = 0.005f;
+    float noiseSpeed = 0.2f;
+    float height     = 20.0f;
+};
+
+static void GetFogData(FogData& fog) {
+    fog = FogData{};
+    Interface* ip = GetCOREInterface();
+    if (!ip) return;
+
+    int numAtmos = ip->NumAtmospheric();
+    for (int i = 0; i < numAtmos; i++) {
+        Atmospheric* atm = ip->GetAtmospheric(i);
+        if (!atm || !IsThreeJSFogClassID(atm->ClassID())) continue;
+        if (!atm->Active(ip->GetTime())) continue;
+
+        IParamBlock2* pb = atm->GetParamBlock(0);
+        if (!pb) continue;
+
+        fog.active   = true;
+        fog.type     = pb->GetInt(pf_type);
+        Color c      = pb->GetColor(pf_color);
+        fog.r = c.r; fog.g = c.g; fog.b = c.b;
+        fog.opacity    = pb->GetFloat(pf_opacity);
+        fog.nearDist   = pb->GetFloat(pf_near);
+        fog.farDist    = pb->GetFloat(pf_far);
+        fog.density    = pb->GetFloat(pf_density);
+        fog.noiseScale = pb->GetFloat(pf_noise_scale);
+        fog.noiseSpeed = pb->GetFloat(pf_noise_speed);
+        fog.height     = pb->GetFloat(pf_height);
+        break;  // use first active ThreeJS Fog
+    }
+}
+
+static void WriteFogJson(std::wostringstream& ss) {
+    FogData fog;
+    GetFogData(fog);
+    ss << L"\"fog\":{\"active\":" << (fog.active ? L'1' : L'0');
+    ss << L",\"type\":" << fog.type;
+    ss << L",\"color\":[" << fog.r << L',' << fog.g << L',' << fog.b << L']';
+    ss << L",\"opacity\":" << fog.opacity;
+    ss << L",\"near\":" << fog.nearDist;
+    ss << L",\"far\":" << fog.farDist;
+    ss << L",\"density\":" << fog.density;
+    ss << L",\"noiseScale\":" << fog.noiseScale;
+    ss << L",\"noiseSpeed\":" << fog.noiseSpeed;
+    ss << L",\"height\":" << fog.height;
+    ss << L'}';
+}
+
 // ── Scene change notification ─────────────────────────────────
 
 static void OnSceneChanged(void* param, NotifyInfo*);
@@ -2171,6 +2234,10 @@ public:
         }
         ss << L'}';
 
+        // Fog
+        ss << L",";
+        WriteFogJson(ss);
+
         ss << L'}';
         webview_->PostWebMessageAsJson(ss.str().c_str());
     }
@@ -2929,6 +2996,8 @@ public:
         ss << L'}';
 
         ss << L",";
+        WriteFogJson(ss);
+        ss << L",";
         WriteLightsJson(ss, ip, t, true, false, true);
         ss << L",";
         WriteSplatsJson(ss, ip, t, true, false, true);
@@ -3189,6 +3258,8 @@ public:
         ss << L",\"zup\":" << envData.zup;
         ss << L",\"flip\":" << envData.flip;
         ss << L'}';
+        ss << L",";
+        WriteFogJson(ss);
         ss << L",";
         WriteLightsJson(ss, ip, t, true, false, true);
         ss << L",";
@@ -3636,7 +3707,7 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, ULONG fdwReason, LPVOID) {
 }
 
 __declspec(dllexport) const TCHAR* LibDescription()   { return MAXJS_NAME; }
-__declspec(dllexport) int LibNumberClasses()           { return 15; }
+__declspec(dllexport) int LibNumberClasses()           { return 16; }
 __declspec(dllexport) ClassDesc* LibClassDesc(int i) {
     switch (i) {
         case 0: return &maxJSDesc;
@@ -3654,6 +3725,7 @@ __declspec(dllexport) ClassDesc* LibClassDesc(int i) {
         case 12: return GetThreeJSAmbientLightDesc();
         case 13: return GetThreeJSToonDesc();
         case 14: return GetThreeJSSplatDesc();
+        case 15: return GetThreeJSFogDesc();
         default: return nullptr;
     }
 }

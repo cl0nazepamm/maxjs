@@ -1454,6 +1454,7 @@
 
             if (msg.camera) applyCamera(msg.camera);
             if (msg.env?.hdri) loadHDRI(msg.env);
+            if (msg.fog) ssgiFx.setFogFromScene(msg.fog);
             if (msg.lights) applyLights(msg.lights);
             reconcileSplats(msg.splats ?? []);
             scene.updateMatrixWorld(true);
@@ -1475,6 +1476,7 @@
 
         // ── Camera-only sync (30fps) ─────────────────────────
         let lastEnvSig = '';
+        let lastFogSig = '';
         bridge.on('cam', msg => {
             if (msg.camera) applyCamera(msg.camera);
             if (msg.env) {
@@ -1482,6 +1484,14 @@
                 if (sig !== lastEnvSig) {
                     lastEnvSig = sig;
                     loadHDRI(msg.env);
+                }
+            }
+            if (msg.fog) {
+                const f = msg.fog;
+                const sig = `${f.active}|${f.type}|${f.color}|${f.opacity}|${f.near}|${f.far}|${f.density}|${f.noiseScale}|${f.noiseSpeed}|${f.height}`;
+                if (sig !== lastFogSig) {
+                    lastFogSig = sig;
+                    ssgiFx.setFogFromScene(f);
                 }
             }
             if (msg.frame || msg.stats) {
@@ -1645,6 +1655,7 @@
 
             if (meta.camera) applyCamera(meta.camera);
             if (meta.env?.hdri) loadHDRI(meta.env);
+            if (meta.fog) ssgiFx.setFogFromScene(meta.fog);
             if (meta.lights) applyLights(meta.lights);
             reconcileSplats(meta.splats ?? []);
             scene.updateMatrixWorld(true);
@@ -2255,6 +2266,27 @@
                     { key: 'curvature', label: 'Curvature', min: 0, max: 0.2, step: 0.01 },
                     { key: 'bleeding', label: 'Color Bleed', min: 0, max: 0.01, step: 0.001 },
                     { key: 'vignetteIntensity', label: 'Vignette', min: 0, max: 1, step: 0.01 },
+                ],
+            },
+            {
+                key: 'fog',
+                title: 'Fog',
+                copy: 'Distance fog, density fog, or animated procedural ground fog.',
+                note: 'Also controllable via Rendering > Environment > Atmosphere in Max.',
+                requiresWebGPU: false,
+                isEnabled: () => ssgiFx.isFogEnabled(),
+                setEnabled: (enabled) => ssgiFx.setFogEnabled(enabled),
+                getValues: (state) => state.fog,
+                setValues: (patch) => ssgiFx.setFogOptions(patch),
+                controls: [
+                    { key: 'type', label: 'Type', min: 0, max: 2, step: 1, integer: true },
+                    { key: 'opacity', label: 'Opacity', min: 0, max: 1, step: 0.01 },
+                    { key: 'near', label: 'Near', min: 0, max: 9999, step: 1 },
+                    { key: 'far', label: 'Far', min: 1, max: 9999, step: 5 },
+                    { key: 'density', label: 'Density', min: 0.0001, max: 0.5, step: 0.001 },
+                    { key: 'noiseScale', label: 'Noise Scale', min: 0.0001, max: 0.1, step: 0.001 },
+                    { key: 'noiseSpeed', label: 'Noise Speed', min: 0, max: 5, step: 0.05 },
+                    { key: 'height', label: 'Height', min: 0, max: 9999, step: 1 },
                 ],
             },
         ];

@@ -457,14 +457,101 @@ ClassDesc2* GetThreeJSUtilityMtlDesc() { return &threeJSUtilityMtlDesc; }
         p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_SSS_SCALE_EDIT, IDC_SSS_SCALE_SPIN, 0.1f, \
         p_end
 
+#define THREEJS_PHYSICAL_PARAM_ITEMS \
+    pb_phys_specular_color, _T("physicalSpecularColor"), TYPE_RGBA, P_ANIMATABLE, 0, \
+        p_default, Color(1.0f, 1.0f, 1.0f), \
+        p_ui, TYPE_COLORSWATCH, IDC_PHYS_SPEC_COLOR, \
+        p_end, \
+    pb_phys_specular_intensity, _T("physicalSpecularIntensity"), TYPE_FLOAT, P_ANIMATABLE, 0, \
+        p_default, 1.0f, \
+        p_range, 0.0f, 1.0f, \
+        p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_PHYS_SPEC_INT_EDIT, IDC_PHYS_SPEC_INT_SPIN, 0.01f, \
+        p_end, \
+    pb_phys_clearcoat, _T("physicalClearcoat"), TYPE_FLOAT, P_ANIMATABLE, 0, \
+        p_default, 0.0f, \
+        p_range, 0.0f, 1.0f, \
+        p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_PHYS_CLEARCOAT_EDIT, IDC_PHYS_CLEARCOAT_SPIN, 0.01f, \
+        p_end, \
+    pb_phys_clearcoat_roughness, _T("physicalClearcoatRoughness"), TYPE_FLOAT, P_ANIMATABLE, 0, \
+        p_default, 0.0f, \
+        p_range, 0.0f, 1.0f, \
+        p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_PHYS_CLEARCOAT_ROUGH_EDIT, IDC_PHYS_CLEARCOAT_ROUGH_SPIN, 0.01f, \
+        p_end, \
+    pb_phys_sheen, _T("physicalSheen"), TYPE_FLOAT, P_ANIMATABLE, 0, \
+        p_default, 0.0f, \
+        p_range, 0.0f, 1.0f, \
+        p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_PHYS_SHEEN_EDIT, IDC_PHYS_SHEEN_SPIN, 0.01f, \
+        p_end, \
+    pb_phys_sheen_roughness, _T("physicalSheenRoughness"), TYPE_FLOAT, P_ANIMATABLE, 0, \
+        p_default, 1.0f, \
+        p_range, 0.0f, 1.0f, \
+        p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_PHYS_SHEEN_ROUGH_EDIT, IDC_PHYS_SHEEN_ROUGH_SPIN, 0.01f, \
+        p_end, \
+    pb_phys_sheen_color, _T("physicalSheenColor"), TYPE_RGBA, P_ANIMATABLE, 0, \
+        p_default, Color(0.0f, 0.0f, 0.0f), \
+        p_ui, TYPE_COLORSWATCH, IDC_PHYS_SHEEN_COLOR, \
+        p_end, \
+    pb_phys_iridescence, _T("physicalIridescence"), TYPE_FLOAT, P_ANIMATABLE, 0, \
+        p_default, 0.0f, \
+        p_range, 0.0f, 1.0f, \
+        p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_PHYS_IRIDESCENCE_EDIT, IDC_PHYS_IRIDESCENCE_SPIN, 0.01f, \
+        p_end, \
+    pb_phys_iridescence_ior, _T("physicalIridescenceIOR"), TYPE_FLOAT, P_ANIMATABLE, 0, \
+        p_default, 1.3f, \
+        p_range, 1.0f, 3.0f, \
+        p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_PHYS_IRIDESCENCE_IOR_EDIT, IDC_PHYS_IRIDESCENCE_IOR_SPIN, 0.01f, \
+        p_end, \
+    pb_phys_transmission, _T("physicalTransmission"), TYPE_FLOAT, P_ANIMATABLE, 0, \
+        p_default, 0.0f, \
+        p_range, 0.0f, 1.0f, \
+        p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_PHYS_TRANSMISSION_EDIT, IDC_PHYS_TRANSMISSION_SPIN, 0.01f, \
+        p_end, \
+    pb_phys_ior, _T("physicalIOR"), TYPE_FLOAT, P_ANIMATABLE, 0, \
+        p_default, 1.5f, \
+        p_range, 1.0f, 2.333f, \
+        p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_PHYS_IOR_EDIT, IDC_PHYS_IOR_SPIN, 0.01f, \
+        p_end, \
+    pb_phys_thickness, _T("physicalThickness"), TYPE_FLOAT, P_ANIMATABLE, 0, \
+        p_default, 0.0f, \
+        p_range, 0.0f, 99999.0f, \
+        p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_PHYS_THICKNESS_EDIT, IDC_PHYS_THICKNESS_SPIN, 0.01f, \
+        p_end, \
+    pb_phys_dispersion, _T("physicalDispersion"), TYPE_FLOAT, P_ANIMATABLE, 0, \
+        p_default, 0.0f, \
+        p_range, 0.0f, 10.0f, \
+        p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_PHYS_DISPERSION_EDIT, IDC_PHYS_DISPERSION_SPIN, 0.01f, \
+        p_end, \
+    pb_phys_attenuation_color, _T("physicalAttenuationColor"), TYPE_RGBA, P_ANIMATABLE, 0, \
+        p_default, Color(1.0f, 1.0f, 1.0f), \
+        p_ui, TYPE_COLORSWATCH, IDC_PHYS_ATT_COLOR, \
+        p_end, \
+    pb_phys_attenuation_distance, _T("physicalAttenuationDistance"), TYPE_FLOAT, P_ANIMATABLE, 0, \
+        p_default, 0.0f, \
+        p_range, 0.0f, 99999.0f, \
+        p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_PHYS_ATT_DIST_EDIT, IDC_PHYS_ATT_DIST_SPIN, 0.1f, \
+        p_end, \
+    pb_phys_anisotropy, _T("physicalAnisotropy"), TYPE_FLOAT, P_ANIMATABLE, 0, \
+        p_default, 0.0f, \
+        p_range, 0.0f, 1.0f, \
+        p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_PHYS_ANISOTROPY_EDIT, IDC_PHYS_ANISOTROPY_SPIN, 0.01f, \
+        p_end
+
 #define THREEJS_UTILITY_PARAM_ITEMS \
     pb_utility_model, _T("utilityModel"), TYPE_INT, 0, 0, \
         p_default, threejs_utility_lambert, \
-        p_ui, TYPE_INT_COMBOBOX, IDC_UTILITY_MODE, 6, \
+        p_ui, TYPE_INT_COMBOBOX, IDC_UTILITY_MODE, 7, \
             IDS_UTILITY_MODE_DISTANCE, IDS_UTILITY_MODE_DEPTH, IDS_UTILITY_MODE_LAMBERT, \
             IDS_UTILITY_MODE_MATCAP, IDS_UTILITY_MODE_NORMAL, IDS_UTILITY_MODE_PHONG, \
+            IDS_UTILITY_MODE_BACKDROP, \
         p_vals, threejs_utility_distance, threejs_utility_depth, threejs_utility_lambert, \
             threejs_utility_matcap, threejs_utility_normal, threejs_utility_phong, \
+            threejs_utility_backdrop, \
+        p_end, \
+    pb_backdrop_mode, _T("backdropMode"), TYPE_INT, 0, 0, \
+        p_default, threejs_backdrop_blurred, \
+        p_ui, TYPE_INT_COMBOBOX, IDC_UTILITY_BACKDROP_MODE, 4, \
+            IDS_BACKDROP_MODE_BLURRED, IDS_BACKDROP_MODE_DEPTH, IDS_BACKDROP_MODE_TEXTURE, IDS_BACKDROP_MODE_PIXEL, \
+        p_vals, threejs_backdrop_blurred, threejs_backdrop_depth, threejs_backdrop_texture, threejs_backdrop_pixel, \
         p_end, \
     pb_color, _T("color"), TYPE_RGBA, P_ANIMATABLE, 0, \
         p_default, Color(0.8f, 0.8f, 0.8f), \
@@ -641,6 +728,7 @@ static ParamBlockDesc2 threejs_adv_pb_desc(
     0,
     IDD_THREEJS_ADV_MTL, IDS_ADV_PARAMS, 0, 0, nullptr,
     THREEJS_COMMON_PARAM_ITEMS,
+    THREEJS_PHYSICAL_PARAM_ITEMS,
     THREEJS_HIDDEN_LEGACY_PARAM_ITEMS,
     p_end
 );

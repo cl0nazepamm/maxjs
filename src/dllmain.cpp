@@ -392,10 +392,27 @@ struct MaxJSPBR {
     float sssAttenuation = 0.1f;
     float sssPower = 2.0f;
     float sssScale = 10.0f;
+    float physicalSpecularColor[3] = {1.0f, 1.0f, 1.0f};
+    float physicalSpecularIntensity = 1.0f;
+    float clearcoat = 0.0f;
+    float clearcoatRoughness = 0.0f;
+    float sheen = 0.0f;
+    float sheenRoughness = 1.0f;
+    float sheenColor[3] = {0.0f, 0.0f, 0.0f};
+    float iridescence = 0.0f;
+    float iridescenceIOR = 1.3f;
+    float transmission = 0.0f;
+    float ior = 1.5f;
+    float thickness = 0.0f;
+    float dispersion = 0.0f;
+    float attenuationColor[3] = {1.0f, 1.0f, 1.0f};
+    float attenuationDistance = 0.0f;
+    float anisotropy = 0.0f;
     float specular[3] = {0.0666667f, 0.0666667f, 0.0666667f};
     float shininess = 30.0f;
     bool  flatShading = false;
     bool  wireframe = false;
+    int   backdropMode = 0;
     std::wstring colorMap, gradientMap, roughnessMap, metalnessMap, normalMap;
     std::wstring bumpMap, displacementMap, parallaxMap, sssColorMap, matcapMap;
     std::wstring aoMap, emissionMap, lightmapFile, opacityMap;
@@ -430,6 +447,7 @@ static std::wstring GetUtilityMaterialModelName(int utilityModel) {
         case threejs_utility_matcap: return L"MeshMatcapMaterial";
         case threejs_utility_normal: return L"MeshNormalMaterial";
         case threejs_utility_phong: return L"MeshPhongMaterial";
+        case threejs_utility_backdrop: return L"MeshBackdropNodeMaterial";
         case threejs_utility_lambert:
         default:
             return L"MeshLambertMaterial";
@@ -442,7 +460,8 @@ static bool IsUtilityMaterialModel(const std::wstring& materialModel) {
            materialModel == L"MeshLambertMaterial" ||
            materialModel == L"MeshMatcapMaterial" ||
            materialModel == L"MeshNormalMaterial" ||
-           materialModel == L"MeshPhongMaterial";
+           materialModel == L"MeshPhongMaterial" ||
+           materialModel == L"MeshBackdropNodeMaterial";
 }
 
 static bool IsSupportedMaterial(Mtl* mtl) {
@@ -619,7 +638,27 @@ static void ExtractThreeJSMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
     d.lightmapIntensity = pb->GetFloat(pb_lightmap_intensity, t);
     d.lightmapChannel = pb->GetInt(pb_lightmap_channel, t);
 
-    if (cid == THREEJS_SSS_MTL_CLASS_ID) {
+    if (cid == THREEJS_ADV_MTL_CLASS_ID) {
+        Color specColor = pb->GetColor(pb_phys_specular_color, t);
+        d.physicalSpecularColor[0] = specColor.r; d.physicalSpecularColor[1] = specColor.g; d.physicalSpecularColor[2] = specColor.b;
+        d.physicalSpecularIntensity = pb->GetFloat(pb_phys_specular_intensity, t);
+        d.clearcoat = pb->GetFloat(pb_phys_clearcoat, t);
+        d.clearcoatRoughness = pb->GetFloat(pb_phys_clearcoat_roughness, t);
+        d.sheen = pb->GetFloat(pb_phys_sheen, t);
+        d.sheenRoughness = pb->GetFloat(pb_phys_sheen_roughness, t);
+        Color sheenColor = pb->GetColor(pb_phys_sheen_color, t);
+        d.sheenColor[0] = sheenColor.r; d.sheenColor[1] = sheenColor.g; d.sheenColor[2] = sheenColor.b;
+        d.iridescence = pb->GetFloat(pb_phys_iridescence, t);
+        d.iridescenceIOR = pb->GetFloat(pb_phys_iridescence_ior, t);
+        d.transmission = pb->GetFloat(pb_phys_transmission, t);
+        d.ior = pb->GetFloat(pb_phys_ior, t);
+        d.thickness = pb->GetFloat(pb_phys_thickness, t);
+        d.dispersion = pb->GetFloat(pb_phys_dispersion, t);
+        Color attenuationColor = pb->GetColor(pb_phys_attenuation_color, t);
+        d.attenuationColor[0] = attenuationColor.r; d.attenuationColor[1] = attenuationColor.g; d.attenuationColor[2] = attenuationColor.b;
+        d.attenuationDistance = pb->GetFloat(pb_phys_attenuation_distance, t);
+        d.anisotropy = pb->GetFloat(pb_phys_anisotropy, t);
+    } else if (cid == THREEJS_SSS_MTL_CLASS_ID) {
         Color sss = pb->GetColor(pb_sss_color, t);
         d.sssColor[0] = sss.r; d.sssColor[1] = sss.g; d.sssColor[2] = sss.b;
         d.sssDistortion = pb->GetFloat(pb_sss_distortion, t);
@@ -633,6 +672,7 @@ static void ExtractThreeJSMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
         d.shininess = pb->GetFloat(pb_shininess, t);
         d.flatShading = pb->GetInt(pb_flat_shading, t) != 0;
         d.wireframe = pb->GetInt(pb_wireframe, t) != 0;
+        d.backdropMode = pb->GetInt(pb_backdrop_mode, t);
     }
 
     auto readMap = [&](ParamID pid, std::wstring& outPath, MaxJSPBR::TexTransform& outXf) {
@@ -1309,7 +1349,7 @@ public:
                     return S_OK;
                 }).Get(), nullptr);
 
-        webview_->AddWebResourceRequestedFilter(L"https://maxjs.local/__asset/*", COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL);
+        webview_->AddWebResourceRequestedFilter(L"https://maxjs-assets.local/*", COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL);
         webview_->add_WebResourceRequested(
             Callback<ICoreWebView2WebResourceRequestedEventHandler>(
                 [this](ICoreWebView2*, ICoreWebView2WebResourceRequestedEventArgs* args) -> HRESULT {
@@ -1321,7 +1361,7 @@ public:
                     LPWSTR uri = nullptr;
                     if (FAILED(request->get_Uri(&uri)) || !uri) return S_OK;
 
-                    const std::wstring_view prefix = L"https://maxjs.local/__asset/";
+                    const std::wstring_view prefix = L"https://maxjs-assets.local/";
                     const std::wstring uriView(uri);
                     CoTaskMemFree(uri);
                     if (uriView.rfind(prefix, 0) != 0) return S_OK;
@@ -1332,7 +1372,7 @@ public:
                     if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_DIRECTORY)) {
                         ComPtr<ICoreWebView2WebResourceResponse> response;
                         env_->CreateWebResourceResponse(nullptr, 404, L"Not Found",
-                            L"Content-Type: text/plain\r\nCache-Control: no-store\r\n", &response);
+                            L"Content-Type: text/plain\r\nCache-Control: no-store\r\nAccess-Control-Allow-Origin: https://maxjs.local\r\nCross-Origin-Resource-Policy: cross-origin\r\n", &response);
                         args->put_Response(response.Get());
                         return S_OK;
                     }
@@ -1342,14 +1382,14 @@ public:
                         FILE_ATTRIBUTE_NORMAL, FALSE, nullptr, &stream)) || !stream) {
                         ComPtr<ICoreWebView2WebResourceResponse> response;
                         env_->CreateWebResourceResponse(nullptr, 500, L"Open Failed",
-                            L"Content-Type: text/plain\r\nCache-Control: no-store\r\n", &response);
+                            L"Content-Type: text/plain\r\nCache-Control: no-store\r\nAccess-Control-Allow-Origin: https://maxjs.local\r\nCross-Origin-Resource-Policy: cross-origin\r\n", &response);
                         args->put_Response(response.Get());
                         return S_OK;
                     }
 
                     std::wstring headers = L"Content-Type: ";
                     headers += GetMimeTypeForPath(decodedPath);
-                    headers += L"\r\nCache-Control: no-store\r\n";
+                    headers += L"\r\nCache-Control: no-store\r\nAccess-Control-Allow-Origin: https://maxjs.local\r\nCross-Origin-Resource-Policy: cross-origin\r\n";
 
                     ComPtr<ICoreWebView2WebResourceResponse> response;
                     if (SUCCEEDED(env_->CreateWebResourceResponse(stream.Get(), 200, L"OK", headers.c_str(), &response)) && response) {
@@ -1501,7 +1541,7 @@ public:
         std::replace(normalizedPath.begin(), normalizedPath.end(), L'\\', L'/');
         std::wstring encodedPath = UrlEncodePath(normalizedPath);
         if (encodedPath.empty()) return {};
-        return L"https://maxjs.local/__asset/" + encodedPath;
+        return L"https://maxjs-assets.local/" + encodedPath;
     }
 
     // ── Callbacks & sync ─────────────────────────────────────
@@ -2277,7 +2317,46 @@ public:
         WriteFloatValue(ss, pbr.aoIntensity, 1.0f);
         ss << L",\"envI\":";
         WriteFloatValue(ss, pbr.envIntensity, 1.0f);
-        if (pbr.materialModel == L"MeshSSSNodeMaterial") {
+        if (pbr.materialModel == L"MeshPhysicalMaterial") {
+            ss << L",\"specularColor\":[";
+            WriteFloatValue(ss, pbr.physicalSpecularColor[0], 1.0f); ss << L',';
+            WriteFloatValue(ss, pbr.physicalSpecularColor[1], 1.0f); ss << L',';
+            WriteFloatValue(ss, pbr.physicalSpecularColor[2], 1.0f); ss << L']';
+            ss << L",\"specularIntensity\":";
+            WriteFloatValue(ss, pbr.physicalSpecularIntensity, 1.0f);
+            ss << L",\"clearcoat\":";
+            WriteFloatValue(ss, pbr.clearcoat, 0.0f);
+            ss << L",\"clearcoatRoughness\":";
+            WriteFloatValue(ss, pbr.clearcoatRoughness, 0.0f);
+            ss << L",\"sheen\":";
+            WriteFloatValue(ss, pbr.sheen, 0.0f);
+            ss << L",\"sheenRoughness\":";
+            WriteFloatValue(ss, pbr.sheenRoughness, 1.0f);
+            ss << L",\"sheenColor\":[";
+            WriteFloatValue(ss, pbr.sheenColor[0], 0.0f); ss << L',';
+            WriteFloatValue(ss, pbr.sheenColor[1], 0.0f); ss << L',';
+            WriteFloatValue(ss, pbr.sheenColor[2], 0.0f); ss << L']';
+            ss << L",\"iridescence\":";
+            WriteFloatValue(ss, pbr.iridescence, 0.0f);
+            ss << L",\"iridescenceIOR\":";
+            WriteFloatValue(ss, pbr.iridescenceIOR, 1.3f);
+            ss << L",\"transmission\":";
+            WriteFloatValue(ss, pbr.transmission, 0.0f);
+            ss << L",\"ior\":";
+            WriteFloatValue(ss, pbr.ior, 1.5f);
+            ss << L",\"thickness\":";
+            WriteFloatValue(ss, pbr.thickness, 0.0f);
+            ss << L",\"dispersion\":";
+            WriteFloatValue(ss, pbr.dispersion, 0.0f);
+            ss << L",\"attenuationColor\":[";
+            WriteFloatValue(ss, pbr.attenuationColor[0], 1.0f); ss << L',';
+            WriteFloatValue(ss, pbr.attenuationColor[1], 1.0f); ss << L',';
+            WriteFloatValue(ss, pbr.attenuationColor[2], 1.0f); ss << L']';
+            ss << L",\"attenuationDistance\":";
+            WriteFloatValue(ss, pbr.attenuationDistance, 0.0f);
+            ss << L",\"anisotropy\":";
+            WriteFloatValue(ss, pbr.anisotropy, 0.0f);
+        } else if (pbr.materialModel == L"MeshSSSNodeMaterial") {
             ss << L",\"sssColor\":[";
             WriteFloatValue(ss, pbr.sssColor[0], 1.0f); ss << L',';
             WriteFloatValue(ss, pbr.sssColor[1], 1.0f); ss << L',';
@@ -2293,6 +2372,10 @@ public:
             ss << L",\"sssScale\":";
             WriteFloatValue(ss, pbr.sssScale, 10.0f);
         } else if (IsUtilityMaterialModel(pbr.materialModel)) {
+            if (pbr.materialModel == L"MeshBackdropNodeMaterial") {
+                ss << L",\"backdropMode\":";
+                ss << pbr.backdropMode;
+            }
             if (pbr.materialModel == L"MeshPhongMaterial") {
                 ss << L",\"spec\":[";
                 WriteFloatValue(ss, pbr.specular[0], 0.0666667f); ss << L',';

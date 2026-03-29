@@ -37,11 +37,29 @@ enum ThreeJSParamIDs {
     pb_sss_power, pb_sss_scale,
     // Utility stack
     pb_utility_model,
+    pb_backdrop_mode,
     pb_matcap_map,
     pb_specular_color,
     pb_shininess,
     pb_flat_shading,
     pb_wireframe,
+    // Physical extras
+    pb_phys_specular_color,
+    pb_phys_specular_intensity,
+    pb_phys_clearcoat,
+    pb_phys_clearcoat_roughness,
+    pb_phys_sheen,
+    pb_phys_sheen_roughness,
+    pb_phys_sheen_color,
+    pb_phys_iridescence,
+    pb_phys_iridescence_ior,
+    pb_phys_transmission,
+    pb_phys_ior,
+    pb_phys_thickness,
+    pb_phys_dispersion,
+    pb_phys_attenuation_color,
+    pb_phys_attenuation_distance,
+    pb_phys_anisotropy,
 };
 
 enum ThreeJSUtilityModel {
@@ -51,6 +69,14 @@ enum ThreeJSUtilityModel {
     threejs_utility_matcap,
     threejs_utility_normal,
     threejs_utility_phong,
+    threejs_utility_backdrop,
+};
+
+enum ThreeJSBackdropMode {
+    threejs_backdrop_blurred = 0,
+    threejs_backdrop_depth,
+    threejs_backdrop_texture,
+    threejs_backdrop_pixel,
 };
 
 // Texmap slot indices (for SubTexmap)

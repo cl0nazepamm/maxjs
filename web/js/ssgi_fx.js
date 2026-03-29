@@ -14,13 +14,13 @@ import {
     pass,
     roughness,
     sample,
-    sub,
     vec2,
     vec3,
     vec4,
     screenUV,
     screenSize,
     builtinShadowContext,
+    builtinAOContext,
     posterize,
     uniform,
     replaceDefaultUV,
@@ -33,6 +33,7 @@ import { sss } from 'three/addons/tsl/display/SSSNode.js';
 import { scanlines, vignette, colorBleeding, barrelUV } from 'three/addons/tsl/display/CRT.js';
 import { bayerDither } from 'three/addons/tsl/math/Bayer.js';
 import { retroPass } from 'three/addons/tsl/display/RetroPassNode.js';
+import { ao } from 'three/addons/tsl/display/GTAONode.js';
 
 function setTexturePrecision(scenePass) {
     const diffuseTexture = scenePass.getTexture('diffuseColor');
@@ -45,11 +46,21 @@ function setTexturePrecision(scenePass) {
     if (metalRoughTexture) metalRoughTexture.type = THREE.UnsignedByteType;
 }
 
-export function createSSGIController({ renderer, scene, camera, backendLabel = '', onError = () => {} }) {
-    const postProcessing = new THREE.PostProcessing(renderer);
+export function createSSGIController({
+    renderer,
+    scene,
+    camera,
+    backendLabel = '',
+    onError = () => {},
+    environmentVisible = true,
+    hiddenBackgroundColor = 0x1a1a2e,
+}) {
+    const PipelineCtor = THREE.RenderPipeline || THREE.PostProcessing;
+    const postProcessing = new PipelineCtor(renderer);
     const supportsScreenSpaceEffects = backendLabel === 'WebGPU';
     const SSR_REFERENCE_SIZE = 6.0;
-    const SSR_DIELECTRIC_STRENGTH = 0.35;
+    const hiddenBackground = new THREE.Color(hiddenBackgroundColor);
+    const hiddenBackgroundNode = vec3(hiddenBackground.r, hiddenBackground.g, hiddenBackground.b);
     const state = {
         ssgi: {
             enabled: false,
@@ -119,6 +130,7 @@ export function createSSGIController({ renderer, scene, camera, backendLabel = '
     let activeNodes = [];
     let activeSSRPass = null;
     let hiddenDuringPost = [];
+    let forceEnvironmentBackground = false;
 
     function prepareSceneForPostPass() {
         hiddenDuringPost = [];
@@ -244,6 +256,7 @@ export function createSSGIController({ renderer, scene, camera, backendLabel = '
             clearNodes();
             postProcessing.outputNode = null;
             postProcessing.needsUpdate = true;
+            forceEnvironmentBackground = false;
             return;
         }
 
@@ -269,21 +282,21 @@ export function createSSGIController({ renderer, scene, camera, backendLabel = '
                 sssContext = builtinShadowContext(sssSample, mainLight);
             }
 
-            const useWiggle = state.retro.enabled && state.retro.wiggle;
-            let beauty;
-            let scenePassDepth, scenePassDiffuse, scenePassNormalColor, scenePassMetalRough, sceneNormal, ssrReflectivity;
+            const useRetroTakeover = state.retro.enabled && state.retro.wiggle;
+            const useEnvironmentBackdropCompensation =
+                state.ssr.enabled && !useRetroTakeover && !!scene.environment && !environmentVisible;
 
-            if (useWiggle) {
-                // Wiggle: retroPass replaces the normal scene pass
+            let beauty;
+            let scenePassColor, scenePassDepth, scenePassDiffuse, scenePassNormalColor, scenePassMetalRough, sceneNormal, ssrReflectivity;
+
+            if (useRetroTakeover) {
                 const r = state.retro;
                 const retro = retroPass(scene, camera, { affineDistortion: uniform(r.affineDistortion) });
                 retro.setResolutionScale(r.resolutionScale);
                 retro.filterTextures = r.filterTextures;
                 activeNodes.push(retro);
                 beauty = retro;
-                // No MRT — SSGI/SSR won't have depth/normals
             } else {
-                // Normal scene pass with MRT for SSGI/SSR
                 const scenePass = pass(scene, camera);
                 activeNodes.push(scenePass);
 
@@ -298,19 +311,17 @@ export function createSSGIController({ renderer, scene, camera, backendLabel = '
 
                 setTexturePrecision(scenePass);
 
-                beauty = scenePass.getTextureNode('output');
+                scenePassColor = scenePass.getTextureNode('output');
+                beauty = scenePassColor;
                 scenePassDiffuse = scenePass.getTextureNode('diffuseColor');
                 scenePassDepth = scenePass.getTextureNode('depth');
                 scenePassNormalColor = scenePass.getTextureNode('normal');
                 scenePassMetalRough = scenePass.getTextureNode('metalrough');
                 sceneNormal = sample((uvNode) => colorToDirection(scenePassNormalColor.sample(uvNode)));
-                ssrReflectivity = max(
-                    scenePassMetalRough.r,
-                    sub(float(1.0), scenePassMetalRough.g).mul(SSR_DIELECTRIC_STRENGTH)
-                );
+                ssrReflectivity = scenePassMetalRough.r;
             }
 
-            if (state.ssgi.enabled && !useWiggle) {
+            if (state.ssgi.enabled && !useRetroTakeover) {
                 const ssgiPass = ssgi(scenePassColor, scenePassDepth, sceneNormal, camera);
                 ssgiPass.sliceCount.value = state.ssgi.sliceCount;
                 ssgiPass.stepCount.value = state.ssgi.stepCount;
@@ -331,7 +342,7 @@ export function createSSGIController({ renderer, scene, camera, backendLabel = '
                 );
             }
 
-            if (state.ssr.enabled && !useWiggle) {
+            if (state.ssr.enabled && !useRetroTakeover) {
                 const derived = computeDerivedState();
                 const ssrPass = ssr(
                     scenePassColor,
@@ -348,7 +359,11 @@ export function createSSGIController({ renderer, scene, camera, backendLabel = '
                 ssrPass.thickness.value = derived.effectiveSSRThickness;
                 activeNodes.push(ssrPass);
                 activeSSRPass = ssrPass;
-                beauty = blendColor(beauty, ssrPass);
+                // SSR has no proper environment fallback, so do not let it darken
+                // the existing beauty pass. Keep the brighter of the base lighting
+                // (including HDRI/IBL) and the SSR-composited result.
+                const ssrBlended = blendColor(beauty, ssrPass);
+                beauty = vec4(max(beauty.rgb, ssrBlended.rgb), beauty.a);
             }
 
             if (state.bloom.enabled) {
@@ -381,6 +396,14 @@ export function createSSGIController({ renderer, scene, camera, backendLabel = '
 
             if (state.retro.enabled) {
                 const r = state.retro;
+                if (!useRetroTakeover && !r.filterTextures && r.resolutionScale < 0.999) {
+                    const retroScale = uniform(Math.max(0.05, r.resolutionScale));
+                    const retroPixels = vec2(
+                        max(screenSize.x.mul(retroScale), float(1.0)),
+                        max(screenSize.y.mul(retroScale), float(1.0))
+                    );
+                    beauty = replaceDefaultUV(() => screenUV.mul(retroPixels).floor().div(retroPixels), beauty);
+                }
 
                 // CRT barrel distortion + color bleeding
                 if (r.crt) {
@@ -407,11 +430,18 @@ export function createSSGIController({ renderer, scene, camera, backendLabel = '
                 }
             }
 
+            if (useEnvironmentBackdropCompensation && scenePassDepth) {
+                const hasSceneGeometry = scenePassDepth.r.lessThan(float(0.999999));
+                beauty = vec4(hasSceneGeometry.select(beauty.rgb, hiddenBackgroundNode), beauty.a);
+            }
+
             postProcessing.outputNode = beauty;
             postProcessing.needsUpdate = true;
             pipelineReady = true;
             lastError = '';
+            forceEnvironmentBackground = useEnvironmentBackdropCompensation;
         } catch (error) {
+            forceEnvironmentBackground = false;
             disableWithError('SSGI setup failed', error);
         }
     }
@@ -483,6 +513,13 @@ export function createSSGIController({ renderer, scene, camera, backendLabel = '
             assignFinite(state.ssr, 'thickness', options.thickness);
             rebuildPipeline();
             return { ...state.ssr };
+        },
+        setEnvironmentVisible(visible) {
+            const nextVisible = !!visible;
+            if (environmentVisible === nextVisible) return environmentVisible;
+            environmentVisible = nextVisible;
+            if (state.ssr.enabled) rebuildPipeline();
+            return environmentVisible;
         },
         isBloomEnabled() {
             return state.bloom.enabled;
@@ -587,7 +624,12 @@ export function createSSGIController({ renderer, scene, camera, backendLabel = '
                 return;
             }
 
+            const originalBackground = forceEnvironmentBackground ? scene.background : null;
+
             try {
+                if (forceEnvironmentBackground) {
+                    scene.background = scene.environment;
+                }
                 updateActiveScreenSpaceParams();
                 prepareSceneForPostPass();
                 postProcessing.render();
@@ -596,6 +638,10 @@ export function createSSGIController({ renderer, scene, camera, backendLabel = '
                 restoreSceneAfterPostPass();
                 disableWithError('Post pipeline render failed', error);
                 renderer.render(scene, camera);
+            } finally {
+                if (forceEnvironmentBackground) {
+                    scene.background = originalBackground;
+                }
             }
         },
         resize() {

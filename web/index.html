@@ -212,15 +212,25 @@
         import { HDRLoader } from 'three/addons/loaders/HDRLoader.js';
         import { LightProbeGenerator } from 'three/addons/lights/LightProbeGenerator.js';
         import { RectAreaLightTexturesLib } from 'three/addons/lights/RectAreaLightTexturesLib.js';
+        import { hashBlur } from 'three/addons/tsl/display/hashBlur.js';
         import * as GaussianSplats3D from 'gaussian-splats-3d';
-        import { color as tslColor, float as tslFloat, texture as tslTexture } from 'three/tsl';
+        import {
+            color as tslColor,
+            float as tslFloat,
+            linearDepth,
+            screenUV,
+            texture as tslTexture,
+            viewportLinearDepth,
+            viewportSharedTexture,
+        } from 'three/tsl';
         import { applyDeltaFrame } from './js/protocol.js';
         import { createPerfHud } from './js/perf_hud.js';
         import { createSSGIController } from './js/ssgi_fx.js';
 
         // ── Scene Setup (Z-up, matching Max) ────────────────
+        const hiddenBackgroundColor = 0x1a1a2e;
         const scene = new THREE.Scene();
-        scene.background = new THREE.Color(0x1a1a2e);
+        scene.background = new THREE.Color(hiddenBackgroundColor);
 
         const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.1, 100000);
         camera.up.set(0, 0, 1);  // Z-up to match Max
@@ -295,6 +305,8 @@
         // ── Loaders & Caches ────────────────────────────────
         const textureLoader = new THREE.TextureLoader();
         const rgbeLoader = new HDRLoader();
+        textureLoader.setCrossOrigin?.('anonymous');
+        rgbeLoader.setCrossOrigin?.('anonymous');
         const pmremGenerator = new THREE.PMREMGenerator(renderer);
         pmremGenerator.compileEquirectangularShader();
 
@@ -316,6 +328,8 @@
             scene,
             camera,
             backendLabel: rendererBackendLabel,
+            environmentVisible: false,
+            hiddenBackgroundColor,
             onError(message) {
                 perfHud.setStatus(`MaxJS - ${message}`);
             },
@@ -573,10 +587,18 @@
         const lightProbeIntensity = 1.0;
         let currentHdriUrl = null;
         let currentHdriProbeSignature = '';
+        let currentEnvParams = null;
+        let hasLightProbeData = false;
         let hdriLoadGeneration = 0;
 
         function applyLightProbeState() {
             lightProbe.intensity = lightProbeEnabled ? lightProbeIntensity : 0.0;
+        }
+
+        function clearLightProbe() {
+            lightProbe.copy(new THREE.LightProbe());
+            hasLightProbeData = false;
+            applyLightProbeState();
         }
 
         async function updateLightProbeFromHDRI(hdrTex, probeSignature, loadGeneration) {
@@ -584,11 +606,26 @@
             captureScene.background = hdrTex;
             captureScene.backgroundRotation.copy(scene.environmentRotation);
 
-            const cubeRenderTarget = new THREE.WebGLCubeRenderTarget(128, {
+            const CubeRenderTargetCtor =
+                typeof THREE.WebGLCubeRenderTarget === 'function'
+                    ? THREE.WebGLCubeRenderTarget
+                    : THREE_STD.WebGLCubeRenderTarget;
+            const CubeCameraCtor =
+                typeof THREE.CubeCamera === 'function'
+                    ? THREE.CubeCamera
+                    : THREE_STD.CubeCamera;
+
+            if (typeof CubeRenderTargetCtor !== 'function' || typeof CubeCameraCtor !== 'function') {
+                hasLightProbeData = false;
+                console.warn('MaxJS light probe generation unavailable: missing cube capture constructors');
+                return;
+            }
+
+            const cubeRenderTarget = new CubeRenderTargetCtor(128, {
                 type: hdrTex.type ?? THREE.HalfFloatType,
                 colorSpace: hdrTex.colorSpace ?? THREE.LinearSRGBColorSpace,
             });
-            const cubeCamera = new THREE.CubeCamera(0.1, 10, cubeRenderTarget);
+            const cubeCamera = new CubeCameraCtor(0.1, 10, cubeRenderTarget);
 
             try {
                 cubeCamera.update(renderer, captureScene);
@@ -599,8 +636,10 @@
                 }
 
                 lightProbe.copy(nextProbe);
+                hasLightProbeData = true;
                 applyLightProbeState();
             } catch (error) {
+                hasLightProbeData = false;
                 console.warn('MaxJS light probe generation failed:', error);
             } finally {
                 cubeRenderTarget.dispose();
@@ -699,8 +738,21 @@
             return tex;
         }
 
-        function loadHDRI(envParams) {
+        function refreshLightProbeFromCurrentHDRI() {
+            if (!currentEnvParams?.hdri) return;
+            loadHDRI(currentEnvParams, { forceProbeRefresh: true });
+        }
+
+        function loadHDRI(envParams, options = {}) {
             if (!envParams?.hdri) return;
+            currentEnvParams = envParams;
+
+            let hdriUrl = envParams.hdri;
+            try {
+                hdriUrl = new URL(envParams.hdri, window.location.href).href;
+            } catch {
+                hdriUrl = envParams.hdri;
+            }
 
             // Exposure
             renderer.toneMappingExposure = Math.pow(2, envParams.exp || 0) * (envParams.gamma || 1.0);
@@ -724,18 +776,20 @@
             const envRotation = new THREE.Matrix4().multiplyMatrices(envBasis, envYaw);
             scene.environmentRotation.setFromRotationMatrix(envRotation);
             scene.backgroundRotation.copy(scene.environmentRotation);
-            const probeSignature = JSON.stringify([envParams.hdri, envParams.rot || 0, envParams.flip || 0, envParams.zup || 0]);
-            const shouldRefreshTexture = envParams.hdri !== currentHdriUrl;
-            const shouldRefreshProbe = probeSignature !== currentHdriProbeSignature;
+            const probeSignature = JSON.stringify([hdriUrl, envParams.rot || 0, envParams.flip || 0, envParams.zup || 0]);
+            const shouldRefreshTexture = hdriUrl !== currentHdriUrl;
+            const shouldRefreshProbe = !!options.forceProbeRefresh
+                || probeSignature !== currentHdriProbeSignature
+                || !hasLightProbeData;
 
             if (!shouldRefreshTexture && !shouldRefreshProbe) return;
 
-            currentHdriUrl = envParams.hdri;
+            currentHdriUrl = hdriUrl;
             currentHdriProbeSignature = probeSignature;
             hdriLoadGeneration += 1;
             const loadGeneration = hdriLoadGeneration;
 
-            rgbeLoader.load(envParams.hdri, async (hdrTex) => {
+            rgbeLoader.load(hdriUrl, async (hdrTex) => {
                 if (loadGeneration !== hdriLoadGeneration) {
                     hdrTex.dispose();
                     return;
@@ -749,6 +803,15 @@
                     await updateLightProbeFromHDRI(hdrTex, probeSignature, loadGeneration);
                 }
                 hdrTex.dispose();
+            }, undefined, (error) => {
+                console.error('MaxJS HDRI load failed', { hdriUrl, error });
+                currentHdriUrl = null;
+                currentHdriProbeSignature = null;
+                currentEnvParams = null;
+                scene.environment = null;
+                clearLightProbe();
+                if (envVisible) scene.background = new THREE.Color(hiddenBackgroundColor);
+                defaultLights.visible = true;
             });
         }
 
@@ -808,13 +871,70 @@
         const utilityMaterialModels = new Set([
             'MeshDistanceMaterial',
             'MeshDepthMaterial',
+            'MeshBackdropNodeMaterial',
             'MeshLambertMaterial',
             'MeshMatcapMaterial',
             'MeshNormalMaterial',
             'MeshPhongMaterial',
         ]);
 
+        function createBackdropUtilityMaterial(md) {
+            const material = new THREE.MeshBasicNodeMaterial();
+            const opacity = Math.min(1.0, Math.max(0.0, md.opacity ?? 1.0));
+            const tintStrength = Math.max(0.0, md.mapS ?? 1.0);
+            const blurStrength = Math.max(0.0, md.rough ?? 0.5);
+            const pixelGrid = Math.max(8.0, (1.0 - Math.min(1.0, blurStrength)) * 128.0);
+            const backdropMode = md.backdropMode ?? 0;
+            const depthDistance = viewportLinearDepth.distance(linearDepth());
+            const depthAlphaNode = depthDistance.oneMinus().smoothstep(0.90, 2.0).mul(10.0).saturate();
+            const blurAmountNode = depthDistance.smoothstep(0.0, 0.6).mul(blurStrength * 40.0).clamp().mul(0.1);
+
+            let tintNode = tslColor(new THREE.Color(md.color[0], md.color[1], md.color[2])).mul(tslFloat(tintStrength));
+            let colorMapNode = null;
+
+            if (md.map) {
+                const tintMap = loadTexture(md.map, THREE.SRGBColorSpace, md.mapXf, fallbackWhiteTexture);
+                colorMapNode = tslTexture(tintMap);
+                tintNode = colorMapNode.rgb.mul(tintNode);
+            }
+
+            let flatOpacityNode = tslFloat(opacity);
+            if (md.opMap) {
+                const alphaMap = loadTexture(md.opMap, THREE.LinearSRGBColorSpace, md.opMapXf, fallbackWhiteTexture);
+                flatOpacityNode = flatOpacityNode.mul(tslTexture(alphaMap).r.mul(tslFloat(md.opMapS ?? 1.0)));
+            }
+            const depthOpacityNode = depthAlphaNode.mul(flatOpacityNode);
+
+            switch (backdropMode) {
+            case 1:
+                material.backdropNode = depthAlphaNode;
+                material.opacityNode = depthOpacityNode;
+                break;
+            case 2:
+                material.backdropNode = colorMapNode ? colorMapNode.rgb.mul(tslFloat(tintStrength)) : hashBlur(viewportSharedTexture(), tslFloat(0.05));
+                material.opacityNode = colorMapNode ? flatOpacityNode.mul(colorMapNode.a) : flatOpacityNode;
+                break;
+            case 3:
+                material.backdropNode = viewportSharedTexture(screenUV.mul(pixelGrid).floor().div(pixelGrid));
+                material.opacityNode = flatOpacityNode;
+                break;
+            case 0:
+            default:
+                material.backdropNode = hashBlur(viewportSharedTexture(), blurAmountNode).add(depthAlphaNode.mul(tintNode));
+                material.opacityNode = depthOpacityNode;
+                break;
+            }
+            material.side = md.side === 0 ? THREE.FrontSide : THREE.DoubleSide;
+            material.transparent = true;
+            material.depthWrite = false;
+            return material;
+        }
+
         function createUtilityMaterial(runtimeModelName, md) {
+            if (runtimeModelName === 'MeshBackdropNodeMaterial') {
+                return createBackdropUtilityMaterial(md);
+            }
+
             let material;
             switch (runtimeModelName) {
             case 'MeshDistanceMaterial':
@@ -909,7 +1029,15 @@
             const wantsAdvancedMaterial =
                 requestedModelName === 'MeshPhysicalMaterial' ||
                 requestedModelName === 'MeshStandardNodeMaterial';
-            const hasUtilityCtor = wantsUtilityMaterial && typeof THREE[requestedModelName] === 'function';
+            const canUseBackdropUtility =
+                requestedModelName === 'MeshBackdropNodeMaterial' &&
+                rendererBackendLabel === 'WebGPU' &&
+                typeof THREE.MeshBasicNodeMaterial === 'function' &&
+                typeof hashBlur === 'function';
+            const hasUtilityCtor =
+                wantsUtilityMaterial &&
+                requestedModelName !== 'MeshBackdropNodeMaterial' &&
+                typeof THREE[requestedModelName] === 'function';
             const canUseToonMaterial = wantsToonMaterial && typeof THREE.MeshToonMaterial === 'function';
             const canUseSSSMaterial =
                 wantsSSSMaterial &&
@@ -918,7 +1046,7 @@
                 typeof tslFloat === 'function' &&
                 typeof tslTexture === 'function';
             const runtimeModelName = wantsUtilityMaterial
-                ? (hasUtilityCtor ? requestedModelName : 'MeshLambertMaterial')
+                ? ((hasUtilityCtor || canUseBackdropUtility) ? requestedModelName : 'MeshLambertMaterial')
                 : (canUseToonMaterial
                 ? 'MeshToonMaterial'
                 : (canUseSSSMaterial
@@ -945,6 +1073,34 @@
                     if (md.opacity != null && md.opacity < 0.999) {
                         params.transparent = true;
                         params.opacity = md.opacity;
+                    }
+
+                    if (wantsAdvancedMaterial) {
+                        if (Array.isArray(md.specularColor)) {
+                            params.specularColor = new THREE.Color(md.specularColor[0], md.specularColor[1], md.specularColor[2]);
+                        }
+                        if (md.specularIntensity != null) params.specularIntensity = md.specularIntensity;
+                        if (md.clearcoat != null) params.clearcoat = md.clearcoat;
+                        if (md.clearcoatRoughness != null) params.clearcoatRoughness = md.clearcoatRoughness;
+                        if (md.sheen != null) params.sheen = md.sheen;
+                        if (md.sheenRoughness != null) params.sheenRoughness = md.sheenRoughness;
+                        if (Array.isArray(md.sheenColor)) {
+                            params.sheenColor = new THREE.Color(md.sheenColor[0], md.sheenColor[1], md.sheenColor[2]);
+                        }
+                        if (md.iridescence != null) params.iridescence = md.iridescence;
+                        if (md.iridescenceIOR != null) params.iridescenceIOR = md.iridescenceIOR;
+                        if (md.transmission != null) params.transmission = md.transmission;
+                        if (md.ior != null) params.ior = md.ior;
+                        if (md.thickness != null) params.thickness = md.thickness;
+                        if (md.dispersion != null) params.dispersion = md.dispersion;
+                        if (Array.isArray(md.attenuationColor)) {
+                            params.attenuationColor = new THREE.Color(md.attenuationColor[0], md.attenuationColor[1], md.attenuationColor[2]);
+                        }
+                        if (md.attenuationDistance != null && md.attenuationDistance > 0) {
+                            params.attenuationDistance = md.attenuationDistance;
+                        }
+                        if (md.anisotropy != null) params.anisotropy = md.anisotropy;
+                        if ((md.transmission ?? 0) > 0) params.transparent = true;
                     }
 
                     const hasEmissiveColor = Array.isArray(md.em) && md.em.length === 3 &&
@@ -1014,7 +1170,7 @@
                 template.userData.maxjsRequestedMaterialModel = requestedModelName;
                 template.userData.maxjsMaterialModel = runtimeModelName;
                 template.userData.maxjsUtilityMaterialFallback =
-                    wantsUtilityMaterial && !hasUtilityCtor;
+                    wantsUtilityMaterial && !(hasUtilityCtor || canUseBackdropUtility);
                 template.userData.maxjsToonMaterialFallback =
                     wantsToonMaterial && !canUseToonMaterial;
                 template.userData.maxjsSSSMaterialFallback =
@@ -1800,8 +1956,9 @@
             envVisible = !envVisible;
             btnEnv.textContent = `Env: ${envVisible ? 'ON' : 'OFF'}`;
             btnEnv.classList.toggle('active', envVisible);
+            ssgiFx.setEnvironmentVisible(envVisible);
             scene.background = envVisible && scene.environment
-                ? scene.environment : new THREE.Color(0x1a1a2e);
+                ? scene.environment : new THREE.Color(hiddenBackgroundColor);
         };
 
         const btnLightProbe = document.getElementById('btnLightProbe');
@@ -1810,6 +1967,7 @@
             btnLightProbe.textContent = `Probe: ${lightProbeEnabled ? 'ON' : 'OFF'}`;
             btnLightProbe.classList.toggle('active', lightProbeEnabled);
             applyLightProbeState();
+            if (lightProbeEnabled) refreshLightProbeFromCurrentHDRI();
         };
 
         const btnSel = document.getElementById('btnSel');

@@ -1617,6 +1617,78 @@ public:
         }
     }
 
+    // Check if selected nodes' geometry changed since last sync (for real-time vertex editing)
+    void CheckSelectedGeometryChanged() {
+        Interface* ip = GetCOREInterface();
+        if (!ip) return;
+        const int selCount = ip->GetSelNodeCount();
+        if (selCount <= 0) return;
+        TimeValue t = ip->GetTime();
+
+        for (int i = 0; i < selCount; ++i) {
+            INode* node = ip->GetSelNode(i);
+            if (!node) continue;
+            ULONG handle = node->GetHandle();
+            if (!IsTrackedHandle(handle)) continue;
+
+            // Quick geometry hash: EvalWorldState + hash verts/faces count + sample vertices
+            ObjectState os = node->EvalWorldState(t);
+            if (!os.obj || os.obj->SuperClassID() != GEOMOBJECT_CLASS_ID) continue;
+            if (!os.obj->CanConvertToType(Class_ID(TRIOBJ_CLASS_ID, 0))) continue;
+
+            TriObject* tri = static_cast<TriObject*>(
+                os.obj->ConvertToType(t, Class_ID(TRIOBJ_CLASS_ID, 0)));
+            if (!tri) continue;
+
+            Mesh& mesh = tri->GetMesh();
+            // Fast hash: vert count + a few sample vertex positions
+            uint64_t quickHash = mesh.getNumVerts() ^ ((uint64_t)mesh.getNumFaces() << 20);
+            int nv = mesh.getNumVerts();
+            if (nv > 0) {
+                // Sample first, middle, last vertex
+                auto hashVert = [](Point3 p) -> uint64_t {
+                    uint64_t h = 0;
+                    memcpy(&h, &p.x, sizeof(float));
+                    uint64_t h2 = 0;
+                    memcpy(&h2, &p.y, sizeof(float));
+                    return h ^ (h2 << 16);
+                };
+                quickHash ^= hashVert(mesh.getVert(0)) * 2654435761ULL;
+                quickHash ^= hashVert(mesh.getVert(nv / 2)) * 40503ULL;
+                quickHash ^= hashVert(mesh.getVert(nv - 1)) * 12289ULL;
+            }
+
+            if (tri != os.obj) tri->DeleteThis();
+
+            auto it = geoHashMap_.find(handle);
+            if (it != geoHashMap_.end() && it->second != quickHash) {
+                geoHashMap_.erase(handle);
+                fastDirtyHandles_.insert(handle);
+                dirty_ = true;
+                QueueFastFlush();
+            }
+        }
+    }
+
+    // Invalidate geometry hash — forces mesh re-extraction on next sync
+    void MarkGeometryDirty(const NodeEventNamespace::NodeKeyTab& nodes) {
+        bool changed = false;
+        for (int i = 0; i < nodes.Count(); ++i) {
+            INode* node = NodeEventNamespace::GetNodeByKey(nodes[i]);
+            if (!node) continue;
+            VisitNodeSubtree(node, [this, &changed](INode* current) {
+                const ULONG handle = current->GetHandle();
+                if (!IsTrackedHandle(handle)) return;
+                geoHashMap_.erase(handle);  // forces re-send of vertex data
+                if (fastDirtyHandles_.insert(handle).second) changed = true;
+            });
+        }
+        if (changed) {
+            dirty_ = true;  // need full sync to re-extract geometry
+            QueueFastFlush();
+        }
+    }
+
     void MarkSelectedTransformsDirty() {
         Interface* ip = GetCOREInterface();
         if (!ip) return;
@@ -3286,6 +3358,14 @@ void MaxJSFastNodeEventCallback::SelectionChanged(NodeKeyTab& nodes) {
 
 void MaxJSFastNodeEventCallback::HideChanged(NodeKeyTab& nodes) {
     if (owner_) owner_->MarkVisibilityNodesDirty(nodes);
+}
+
+void MaxJSFastNodeEventCallback::GeometryChanged(NodeKeyTab& nodes) {
+    if (owner_) owner_->MarkGeometryDirty(nodes);
+}
+
+void MaxJSFastNodeEventCallback::TopologyChanged(NodeKeyTab& nodes) {
+    if (owner_) owner_->MarkGeometryDirty(nodes);
 }
 
 void MaxJSFastRedrawCallback::proc(Interface*) {

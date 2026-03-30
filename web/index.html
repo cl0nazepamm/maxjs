@@ -923,48 +923,43 @@
                 skyMesh.mieCoefficient.value = skyParams.mieCoefficient;
                 skyMesh.mieDirectionalG.value = skyParams.mieDirectionalG;
 
-                // Sun position from elevation/azimuth
-                // Camera is Z-up to match Max, but SkyMesh is Y-up internally.
-                // Compute sun direction in Y-up for the sky shader:
-                const phi = THREE.MathUtils.degToRad(90 - skyParams.elevation);
-                const theta = THREE.MathUtils.degToRad(skyParams.azimuth);
-                const sunDirYUp = new THREE.Vector3().setFromSphericalCoords(1, phi, theta);
-                skyMesh.sunPosition.value.copy(sunDirYUp);
+                // Tell SkyMesh shader that Z is up (matches Max/camera convention)
+                skyMesh.upUniform.value.set(0, 0, 1);
+
+                // Sun direction in Z-up: elevation from XY plane, azimuth around Z
+                const elevRad = THREE.MathUtils.degToRad(skyParams.elevation);
+                const azimRad = THREE.MathUtils.degToRad(skyParams.azimuth);
+                const sunDir = new THREE.Vector3(
+                    Math.cos(elevRad) * Math.sin(azimRad),
+                    Math.cos(elevRad) * Math.cos(azimRad),
+                    Math.sin(elevRad)
+                );
+                skyMesh.sunPosition.value.copy(sunDir);
 
                 renderer.toneMappingExposure = skyParams.exposure;
 
-                // Rotate sky mesh so its Y-up aligns with our Z-up scene
-                // SkyMesh renders in Y-up space; rotate -90° around X to match Z-up
                 if (skyMesh.parent !== scene) scene.add(skyMesh);
-                skyMesh.rotation.set(-Math.PI / 2, 0, 0);
-
                 scene.background = null;
                 scene.environment = null;
                 scene.environmentRotation.identity();
                 scene.backgroundRotation.identity();
 
-                // Convert sun direction from Y-up to Z-up for scene lights
-                // Y-up (x,y,z) → Z-up (x,z,-y)
-                const sunDirZUp = new THREE.Vector3(sunDirYUp.x, sunDirYUp.z, -sunDirYUp.y).normalize();
-
-                // Sun DirectionalLight
+                // Sun DirectionalLight along sun direction
                 if (!skySunLight) {
                     skySunLight = new THREE.DirectionalLight(0xffffff, 2.0);
                     skySunLight.name = '__maxjs_sky_sun__';
                 }
                 if (skySunLight.parent !== scene) scene.add(skySunLight);
-                const elevRad = THREE.MathUtils.degToRad(Math.max(skyParams.elevation, 0));
                 const sunStrength = Math.max(0.1, Math.sin(elevRad));
                 const warmth = 1.0 - sunStrength * 0.2;
                 skySunLight.color.setRGB(1.0, warmth, warmth * 0.85);
                 skySunLight.intensity = 1.0 + sunStrength * 3.0;
-                skySunLight.position.copy(sunDirZUp).multiplyScalar(200);
+                skySunLight.position.copy(sunDir).multiplyScalar(200);
 
-                // Sky fill HemisphereLight (Z-up: up is +Z)
+                // Sky fill HemisphereLight
                 if (!skyFillLight) {
                     skyFillLight = new THREE.HemisphereLight(0x87CEEB, 0x362D1B, 1.0);
                     skyFillLight.name = '__maxjs_sky_fill__';
-                    skyFillLight.position.set(0, 0, 1);
                 }
                 if (skyFillLight.parent !== scene) scene.add(skyFillLight);
                 skyFillLight.intensity = 0.5 + sunStrength * 0.5;
@@ -1979,6 +1974,9 @@
             }
             if ('intensity' in light && Number.isFinite(ld.intensity)) {
                 light.intensity = ld.intensity;
+            }
+            if (Number.isFinite(ld.volContrib)) {
+                light.userData.volContrib = ld.volContrib;
             }
 
             switch (ld.type) {

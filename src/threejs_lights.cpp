@@ -567,6 +567,10 @@ static ParamBlockDesc2 g_legacyLightPB(
         p_range, 1, 16384,
         p_ui, TYPE_SPINNER, EDITTYPE_INT, IDC_SHMAP_EDIT, IDC_SHMAP_SPIN, 128.0f,
         p_end,
+    pl_vol_contrib, _T("volContrib"), TYPE_FLOAT, P_ANIMATABLE, 0,
+        p_default, 1.0f,
+        p_range, 0.0f, 10.0f,
+        p_end,
     p_end
 );
 
@@ -601,6 +605,11 @@ static ParamBlockDesc2 g_directionalLightPB(
         p_default, 2048,
         p_range, 1, 16384,
         p_ui, TYPE_SPINNER, EDITTYPE_INT, IDC_SHMAP_EDIT, IDC_SHMAP_SPIN, 128.0f,
+        p_end,
+    pl_vol_contrib, _T("volContrib"), TYPE_FLOAT, P_ANIMATABLE, 0,
+        p_default, 1.0f,
+        p_range, 0.0f, 10.0f,
+        p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_VOL_CONTRIB_EDIT, IDC_VOL_CONTRIB_SPIN, 0.1f,
         p_end,
     p_end
 );
@@ -646,6 +655,11 @@ static ParamBlockDesc2 g_pointLightPB(
         p_default, 1024,
         p_range, 1, 16384,
         p_ui, TYPE_SPINNER, EDITTYPE_INT, IDC_SHMAP_EDIT, IDC_SHMAP_SPIN, 128.0f,
+        p_end,
+    pl_vol_contrib, _T("volContrib"), TYPE_FLOAT, P_ANIMATABLE, 0,
+        p_default, 1.0f,
+        p_range, 0.0f, 10.0f,
+        p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_VOL_CONTRIB_EDIT, IDC_VOL_CONTRIB_SPIN, 0.1f,
         p_end,
     p_end
 );
@@ -702,6 +716,11 @@ static ParamBlockDesc2 g_spotLightPB(
         p_range, 1, 16384,
         p_ui, TYPE_SPINNER, EDITTYPE_INT, IDC_SHMAP_EDIT, IDC_SHMAP_SPIN, 128.0f,
         p_end,
+    pl_vol_contrib, _T("volContrib"), TYPE_FLOAT, P_ANIMATABLE, 0,
+        p_default, 1.0f,
+        p_range, 0.0f, 10.0f,
+        p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_VOL_CONTRIB_EDIT, IDC_VOL_CONTRIB_SPIN, 0.1f,
+        p_end,
     p_end
 );
 
@@ -728,6 +747,11 @@ static ParamBlockDesc2 g_rectAreaLightPB(
         p_range, 0.1f, 1000000.0f,
         p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_HEIGHT_EDIT, IDC_HEIGHT_SPIN, 1.0f,
         p_end,
+    pl_vol_contrib, _T("volContrib"), TYPE_FLOAT, P_ANIMATABLE, 0,
+        p_default, 1.0f,
+        p_range, 0.0f, 10.0f,
+        p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_VOL_CONTRIB_EDIT, IDC_VOL_CONTRIB_SPIN, 0.1f,
+        p_end,
     p_end
 );
 
@@ -748,6 +772,10 @@ static ParamBlockDesc2 g_hemisphereLightPB(
         p_default, Color(0.2666667f, 0.2666667f, 0.2666667f),
         p_ui, TYPE_COLORSWATCH, IDC_GROUND_COLOR,
         p_end,
+    pl_vol_contrib, _T("volContrib"), TYPE_FLOAT, P_ANIMATABLE, 0,
+        p_default, 1.0f,
+        p_range, 0.0f, 10.0f,
+        p_end,
     p_end
 );
 
@@ -763,6 +791,10 @@ static ParamBlockDesc2 g_ambientLightPB(
         p_default, 1.0f,
         p_range, 0.0f, 10000.0f,
         p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_LIGHT_INT_EDIT, IDC_LIGHT_INT_SPIN, 0.1f,
+        p_end,
+    pl_vol_contrib, _T("volContrib"), TYPE_FLOAT, P_ANIMATABLE, 0,
+        p_default, 1.0f,
+        p_range, 0.0f, 10.0f,
         p_end,
     p_end
 );

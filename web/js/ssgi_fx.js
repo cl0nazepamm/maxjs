@@ -434,6 +434,8 @@ export function createSSGIController({
     let volNoiseTexture = null;
     let volLightsEnabled = [];
     const volDensityU = uniform(0.5);
+    const volIntensityU = uniform(1.0);
+    const volDenoiseU = uniform(0.6);
 
     function getOrCreateVolNoise() {
         if (volNoiseTexture) return volNoiseTexture;
@@ -510,13 +512,15 @@ export function createSSGIController({
         }
         volumetricMesh.visible = true;
 
-        // Enable volumetric layer on scene lights
+        // Enable volumetric layer on scene lights that have volContrib > 0
         disableVolLights();
         scene.traverse(obj => {
-            if (obj.isLight) {
-                obj.layers.enable(LAYER_VOL);
-                volLightsEnabled.push(obj);
-            }
+            if (!obj.isLight) return;
+            const vc = obj.userData?.volContrib;
+            // Default: all lights contribute unless explicitly set to 0
+            if (vc !== undefined && vc <= 0) return;
+            obj.layers.enable(LAYER_VOL);
+            volLightsEnabled.push(obj);
         });
     }
 
@@ -786,15 +790,19 @@ export function createSSGIController({
             if (state.volumetric.enabled && supportsScreenSpaceEffects) {
                 try {
                     ensureVolumetricMesh();
+                    volDensityU.value = state.volumetric.density;
+                    volIntensityU.value = state.volumetric.intensity;
+                    volDenoiseU.value = state.volumetric.denoise;
+
                     const volPass = pass(scene, camera, { depthBuffer: false });
                     volPass.setLayers(volLayerMask);
                     volPass.setResolutionScale(state.volumetric.resolution);
                     activeNodes.push(volPass);
 
-                    const blurredVol = gaussianBlur(volPass, state.volumetric.denoise);
+                    const blurredVol = gaussianBlur(volPass, volDenoiseU);
                     activeNodes.push(blurredVol);
 
-                    const volContrib = blurredVol.mul(uniform(state.volumetric.intensity));
+                    const volContrib = blurredVol.mul(volIntensityU);
                     const volLuma = volContrib.r.mul(0.2126).add(volContrib.g.mul(0.7152)).add(volContrib.b.mul(0.0722));
                     beauty = vec4(beauty.rgb.add(volContrib.rgb), max(beauty.a, volLuma));
                 } catch (e) {
@@ -1257,12 +1265,27 @@ export function createSSGIController({
             return state.volumetric.enabled;
         },
         setVolumetricOptions(options = {}) {
+            const needsRebuild =
+                (Number.isFinite(options.steps) && options.steps !== state.volumetric.steps) ||
+                (Number.isFinite(options.resolution) && options.resolution !== state.volumetric.resolution);
+
             assignFinite(state.volumetric, 'intensity', options.intensity);
             assignFinite(state.volumetric, 'steps', options.steps);
             assignFinite(state.volumetric, 'density', options.density);
             assignFinite(state.volumetric, 'denoise', options.denoise);
             assignFinite(state.volumetric, 'resolution', options.resolution);
-            rebuildPipeline();
+
+            // Live-update uniforms without pipeline rebuild
+            volDensityU.value = state.volumetric.density;
+            volIntensityU.value = state.volumetric.intensity;
+            volDenoiseU.value = state.volumetric.denoise;
+
+            if (volumetricMesh && Number.isFinite(options.steps)) {
+                volumetricMesh.material.steps = state.volumetric.steps;
+                volumetricMesh.material.needsUpdate = true;
+            }
+
+            if (needsRebuild) rebuildPipeline();
             return { ...state.volumetric };
         },
 

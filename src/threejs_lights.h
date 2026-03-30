@@ -52,6 +52,9 @@ enum ThreeJSLightParamIDs {
     pl_shadow_bias,
     pl_shadow_radius,
     pl_shadow_mapsize,
+
+    // Volumetric lighting
+    pl_vol_contrib,
 };
 
 bool IsThreeJSLightClassID(const Class_ID& cid);

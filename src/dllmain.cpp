@@ -16,6 +16,7 @@
 #include "threejs_toon.h"
 #include "threejs_renderer.h"
 #include "threejs_fog.h"
+#include "threejs_sky.h"
 
 #include <wrl.h>
 #include <WebView2.h>
@@ -1140,6 +1141,16 @@ struct EnvData {
     float gamma = 1.0f;
     int   zup = 0;
     int   flip = 0;
+
+    // ThreeJS Sky (when env map is ThreeJS Sky texmap)
+    bool  isSky = false;
+    float skyTurbidity  = 10.0f;
+    float skyRayleigh   = 3.0f;
+    float skyMieCoeff   = 0.005f;
+    float skyMieDirG    = 0.7f;
+    float skyElevation  = 2.0f;
+    float skyAzimuth    = 180.0f;
+    float skyExposure   = 0.5f;
 };
 
 // Generic: find a named float/int/string in any paramblock of a map
@@ -1192,6 +1203,22 @@ static std::wstring FindPBString(Texmap* map, const MCHAR* name) {
 static void GetEnvironment(EnvData& env) {
     Texmap* envMap = GetCOREInterface()->GetEnvironmentMap();
     if (!envMap) return;
+
+    // Check if env map is ThreeJS Sky
+    if (IsThreeJSSkyClassID(envMap->ClassID())) {
+        IParamBlock2* pb = envMap->GetParamBlock(0);
+        if (pb) {
+            env.isSky = true;
+            env.skyTurbidity = pb->GetFloat(psky_turbidity);
+            env.skyRayleigh  = pb->GetFloat(psky_rayleigh);
+            env.skyMieCoeff  = pb->GetFloat(psky_mie_coeff);
+            env.skyMieDirG   = pb->GetFloat(psky_mie_dir_g);
+            env.skyElevation = pb->GetFloat(psky_elevation);
+            env.skyAzimuth   = pb->GetFloat(psky_azimuth);
+            env.skyExposure  = pb->GetFloat(psky_exposure);
+        }
+        return;
+    }
 
     // Try named string param "HDRI" first (OSL HDRI Environment)
     env.hdriPath = FindPBString(envMap, _T("HDRI"));
@@ -1254,9 +1281,7 @@ static void GetFogData(FogData& fog) {
     }
 }
 
-static void WriteFogJson(std::wostringstream& ss) {
-    FogData fog;
-    GetFogData(fog);
+static void WriteFogJson(std::wostringstream& ss, const FogData& fog) {
     ss << L"\"fog\":{\"active\":" << (fog.active ? L'1' : L'0');
     ss << L",\"type\":" << fog.type;
     ss << L",\"color\":[" << fog.r << L',' << fog.g << L',' << fog.b << L']';
@@ -1267,6 +1292,36 @@ static void WriteFogJson(std::wostringstream& ss) {
     ss << L",\"noiseScale\":" << fog.noiseScale;
     ss << L",\"noiseSpeed\":" << fog.noiseSpeed;
     ss << L",\"height\":" << fog.height;
+    ss << L'}';
+}
+
+// Helper: write full env JSON block (includes sky or HDRI data)
+static void WriteEnvJson(std::wostringstream& ss, const EnvData& env,
+                         const std::wstring& hdriUrl = {}) {
+    ss << L"\"env\":{";
+    if (env.isSky) {
+        ss << L"\"sky\":{";
+        ss << L"\"turbidity\":" << env.skyTurbidity;
+        ss << L",\"rayleigh\":" << env.skyRayleigh;
+        ss << L",\"mieCoefficient\":" << env.skyMieCoeff;
+        ss << L",\"mieDirectionalG\":" << env.skyMieDirG;
+        ss << L",\"elevation\":" << env.skyElevation;
+        ss << L",\"azimuth\":" << env.skyAzimuth;
+        ss << L",\"exposure\":" << env.skyExposure;
+        ss << L'}';
+    } else {
+        if (!hdriUrl.empty()) {
+            ss << L"\"hdri\":\"" << EscapeJson(hdriUrl.c_str()) << L"\",";
+        }
+        ss << L"\"rot\":";
+        WriteFloatValue(ss, env.rotation, 0.0f);
+        ss << L",\"exp\":";
+        WriteFloatValue(ss, env.exposure, 0.0f);
+        ss << L",\"gamma\":";
+        WriteFloatValue(ss, env.gamma, 1.0f);
+        ss << L",\"zup\":" << env.zup;
+        ss << L",\"flip\":" << env.flip;
+    }
     ss << L'}';
 }
 
@@ -1996,6 +2051,9 @@ public:
         if (!hwnd_ || !IsWindowVisible(hwnd_)) return;
         tickCount_++;
 
+        // Poll env+fog at reduced cadence (~200ms)
+        if (tickCount_ % ENV_FOG_POLL_TICKS == 0) PollEnvFog();
+
         if (dirty_) {
             dirty_ = false;
             if (useBinary_) SendFullSyncBinary(); else SendFullSync();
@@ -2198,7 +2256,11 @@ public:
         meta.imbue(std::locale::classic());
         meta << L"{\"type\":\"delta_bin\",\"frame\":" << frameId;
         meta << L",\"stats\":{\"producerBytes\":" << frameBytes.size();
-        meta << L",\"commandCount\":" << frame.command_count() << L"}}";
+        meta << L",\"commandCount\":" << frame.command_count() << L"}";
+
+        // Env+fog from cache (polled at reduced cadence)
+        WriteEnvFogCached(meta);
+        meta << L"}";
 
         wv17->PostSharedBufferToScript(
             sharedBuf.Get(),
@@ -2207,7 +2269,60 @@ public:
     }
 
     EnvData cachedEnv_;
-    int envPollCounter_ = 0;
+    FogData cachedFog_;
+    std::wstring cachedEnvJson_;   // pre-built JSON fragment
+    std::wstring cachedFogJson_;   // pre-built JSON fragment
+    std::wstring cachedHdriPath_;  // last HDRI path we mapped
+    std::wstring cachedHdriUrl_;   // cached MapTexturePath result
+    static constexpr int ENV_FOG_POLL_TICKS = 6;  // ~200ms at 33ms tick
+
+    // Poll env+fog at reduced cadence, rebuild cached JSON only on change
+    void PollEnvFog() {
+        EnvData env;
+        GetEnvironment(env);
+        FogData fog;
+        GetFogData(fog);
+
+        // Only re-map HDRI URL when path actually changes (avoids filesystem hit)
+        std::wstring hdriUrl;
+        if (!env.isSky && !env.hdriPath.empty()) {
+            if (env.hdriPath != cachedHdriPath_) {
+                cachedHdriPath_ = env.hdriPath;
+                cachedHdriUrl_ = MapTexturePath(env.hdriPath);
+            }
+            hdriUrl = cachedHdriUrl_;
+        } else if (env.isSky) {
+            cachedHdriPath_.clear();
+            cachedHdriUrl_.clear();
+        }
+
+        // Rebuild env JSON
+        {
+            std::wostringstream ss;
+            ss.imbue(std::locale::classic());
+            WriteEnvJson(ss, env, hdriUrl);
+            cachedEnvJson_ = ss.str();
+        }
+        cachedEnv_ = env;
+
+        // Rebuild fog JSON
+        {
+            std::wostringstream ss;
+            ss.imbue(std::locale::classic());
+            WriteFogJson(ss, fog);
+            cachedFogJson_ = ss.str();
+        }
+        cachedFog_ = fog;
+    }
+
+    void WriteEnvFogCached(std::wostringstream& ss) {
+        ss << L",";
+        if (!cachedEnvJson_.empty()) ss << cachedEnvJson_;
+        else ss << L"\"env\":{}";
+        ss << L",";
+        if (!cachedFogJson_.empty()) ss << cachedFogJson_;
+        else ss << L"\"fog\":{\"active\":0}";
+    }
 
     void SendCameraSync() {
         const std::uint32_t frameId = AllocateFrameId();
@@ -2215,29 +2330,7 @@ public:
         ss.imbue(std::locale::classic());
         ss << L"{\"type\":\"cam\",\"frame\":" << frameId << L",";
         WriteCameraJson(ss);
-
-        // Poll env params every 5th camera tick (~165ms) to avoid per-frame paramblock walks
-        GetEnvironment(cachedEnv_);
-
-        ss << L",\"env\":{\"rot\":";
-        WriteFloatValue(ss, cachedEnv_.rotation, 0.0f);
-        ss << L",\"exp\":";
-        WriteFloatValue(ss, cachedEnv_.exposure, 0.0f);
-        ss << L",\"gamma\":";
-        WriteFloatValue(ss, cachedEnv_.gamma, 1.0f);
-        ss << L",\"zup\":" << cachedEnv_.zup;
-        ss << L",\"flip\":" << cachedEnv_.flip;
-        if (!cachedEnv_.hdriPath.empty()) {
-            std::wstring url = MapTexturePath(cachedEnv_.hdriPath);
-            if (!url.empty())
-                ss << L",\"hdri\":\"" << EscapeJson(url.c_str()) << L'"';
-        }
-        ss << L'}';
-
-        // Fog
-        ss << L",";
-        WriteFogJson(ss);
-
+        WriteEnvFogCached(ss);
         ss << L'}';
         webview_->PostWebMessageAsJson(ss.str().c_str());
     }
@@ -2827,6 +2920,11 @@ public:
             ss << L",\"shadowMapSize\":" << pb->GetInt(pl_shadow_mapsize);
         }
 
+        const float volContrib = pb->GetFloat(pl_vol_contrib, t);
+        if (volContrib != 1.0f) {
+            ss << L",\"volContrib\":" << volContrib;
+        }
+
         ss << L'}';
         return true;
     }
@@ -2979,24 +3077,17 @@ public:
         // Environment
         EnvData envData;
         GetEnvironment(envData);
-        std::wstring hdriUrl = MapTexturePath(envData.hdriPath);
-        ss << L",\"env\":{";
-        if (!hdriUrl.empty()) {
-            ss << L"\"hdri\":\"" << EscapeJson(hdriUrl.c_str()) << L'"';
-            ss << L',';
-        }
-        ss << L"\"rot\":";
-        WriteFloatValue(ss, envData.rotation, 0.0f);
-        ss << L",\"exp\":";
-        WriteFloatValue(ss, envData.exposure, 0.0f);
-        ss << L",\"gamma\":";
-        WriteFloatValue(ss, envData.gamma, 1.0f);
-        ss << L",\"zup\":" << envData.zup;
-        ss << L",\"flip\":" << envData.flip;
-        ss << L'}';
+        std::wstring hdriUrl;
+        if (!envData.isSky && !envData.hdriPath.empty())
+            hdriUrl = MapTexturePath(envData.hdriPath);
 
         ss << L",";
-        WriteFogJson(ss);
+        WriteEnvJson(ss, envData, hdriUrl);
+
+        FogData fogData;
+        GetFogData(fogData);
+        ss << L",";
+        WriteFogJson(ss, fogData);
         ss << L",";
         WriteLightsJson(ss, ip, t, true, false, true);
         ss << L",";
@@ -3243,23 +3334,16 @@ public:
 
         // Environment
         EnvData envData; GetEnvironment(envData);
-        std::wstring hdriUrl = MapTexturePath(envData.hdriPath);
-        ss << L",\"env\":{";
-        if (!hdriUrl.empty()) {
-            ss << L"\"hdri\":\"" << EscapeJson(hdriUrl.c_str()) << L'"';
-            ss << L',';
-        }
-        ss << L"\"rot\":";
-        WriteFloatValue(ss, envData.rotation, 0.0f);
-        ss << L",\"exp\":";
-        WriteFloatValue(ss, envData.exposure, 0.0f);
-        ss << L",\"gamma\":";
-        WriteFloatValue(ss, envData.gamma, 1.0f);
-        ss << L",\"zup\":" << envData.zup;
-        ss << L",\"flip\":" << envData.flip;
-        ss << L'}';
+        std::wstring hdriUrl;
+        if (!envData.isSky && !envData.hdriPath.empty())
+            hdriUrl = MapTexturePath(envData.hdriPath);
+
         ss << L",";
-        WriteFogJson(ss);
+        WriteEnvJson(ss, envData, hdriUrl);
+        FogData fogBin;
+        GetFogData(fogBin);
+        ss << L",";
+        WriteFogJson(ss, fogBin);
         ss << L",";
         WriteLightsJson(ss, ip, t, true, false, true);
         ss << L",";
@@ -3335,11 +3419,15 @@ public:
             ++it;
         }
         ss << L"],";
+        WriteCameraJson(ss);
+
+        // Env+fog from cache (polled at reduced cadence, not per-frame)
+        WriteEnvFogCached(ss);
+
+        ss << L",";
         WriteLightsJson(ss, ip, t, true, true, true);
         ss << L",";
         WriteSplatsJson(ss, ip, t, true, true, true);
-        ss << L",";
-        WriteCameraJson(ss);
         ss << L'}';
         webview_->PostWebMessageAsJson(ss.str().c_str());
     }
@@ -3707,7 +3795,7 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, ULONG fdwReason, LPVOID) {
 }
 
 __declspec(dllexport) const TCHAR* LibDescription()   { return MAXJS_NAME; }
-__declspec(dllexport) int LibNumberClasses()           { return 16; }
+__declspec(dllexport) int LibNumberClasses()           { return 17; }
 __declspec(dllexport) ClassDesc* LibClassDesc(int i) {
     switch (i) {
         case 0: return &maxJSDesc;
@@ -3726,6 +3814,7 @@ __declspec(dllexport) ClassDesc* LibClassDesc(int i) {
         case 13: return GetThreeJSToonDesc();
         case 14: return GetThreeJSSplatDesc();
         case 15: return GetThreeJSFogDesc();
+        case 16: return GetThreeJSSkyDesc();
         default: return nullptr;
     }
 }

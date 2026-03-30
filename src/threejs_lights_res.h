@@ -52,3 +52,6 @@
 #define IDC_SHRAD_SPIN                   2054
 #define IDC_SHMAP_EDIT                   2055
 #define IDC_SHMAP_SPIN                   2056
+
+#define IDC_VOL_CONTRIB_EDIT             2060
+#define IDC_VOL_CONTRIB_SPIN             2061

@@ -214,6 +214,7 @@
         import { RectAreaLightTexturesLib } from 'three/addons/lights/RectAreaLightTexturesLib.js';
         import { hashBlur } from 'three/addons/tsl/display/hashBlur.js';
         import { XRButton } from 'three/addons/webxr/XRButton.js';
+        import { SkyMesh } from 'three/addons/objects/SkyMesh.js';
         import * as GaussianSplats3D from 'gaussian-splats-3d';
         import {
             color as tslColor,
@@ -891,6 +892,103 @@
             });
         }
 
+        // ── Sky Environment ──────────────────────────────────
+        // Matches the official Three.js webgpu_sky example pattern:
+        // SkyMesh added directly to scene, no PMREM (broken with TSL).
+        // Lighting via DirectionalLight (sun) + HemisphereLight (sky fill).
+        let skyMesh = null;
+        let skySunLight = null;
+        let skyFillLight = null;
+        let lastSkySig = '';
+        let skyActive = false;
+
+        function applySky(skyParams) {
+            if (!skyParams) return;
+
+            const sig = JSON.stringify(skyParams);
+            if (sig === lastSkySig) return;
+            lastSkySig = sig;
+
+            try {
+                if (!skyMesh) {
+                    skyMesh = new SkyMesh();
+                    skyMesh.scale.setScalar(450000);
+                    skyMesh.name = '__maxjs_sky__';
+                    skyMesh.frustumCulled = false;
+                }
+
+                // Update sky uniforms — exact same pattern as official example
+                skyMesh.turbidity.value = skyParams.turbidity;
+                skyMesh.rayleigh.value = skyParams.rayleigh;
+                skyMesh.mieCoefficient.value = skyParams.mieCoefficient;
+                skyMesh.mieDirectionalG.value = skyParams.mieDirectionalG;
+
+                // Sun position from elevation/azimuth
+                // Camera is Z-up to match Max, but SkyMesh is Y-up internally.
+                // Compute sun direction in Y-up for the sky shader:
+                const phi = THREE.MathUtils.degToRad(90 - skyParams.elevation);
+                const theta = THREE.MathUtils.degToRad(skyParams.azimuth);
+                const sunDirYUp = new THREE.Vector3().setFromSphericalCoords(1, phi, theta);
+                skyMesh.sunPosition.value.copy(sunDirYUp);
+
+                renderer.toneMappingExposure = skyParams.exposure;
+
+                // Rotate sky mesh so its Y-up aligns with our Z-up scene
+                // SkyMesh renders in Y-up space; rotate -90° around X to match Z-up
+                if (skyMesh.parent !== scene) scene.add(skyMesh);
+                skyMesh.rotation.set(-Math.PI / 2, 0, 0);
+
+                scene.background = null;
+                scene.environment = null;
+                scene.environmentRotation.identity();
+                scene.backgroundRotation.identity();
+
+                // Convert sun direction from Y-up to Z-up for scene lights
+                // Y-up (x,y,z) → Z-up (x,z,-y)
+                const sunDirZUp = new THREE.Vector3(sunDirYUp.x, sunDirYUp.z, -sunDirYUp.y).normalize();
+
+                // Sun DirectionalLight
+                if (!skySunLight) {
+                    skySunLight = new THREE.DirectionalLight(0xffffff, 2.0);
+                    skySunLight.name = '__maxjs_sky_sun__';
+                }
+                if (skySunLight.parent !== scene) scene.add(skySunLight);
+                const elevRad = THREE.MathUtils.degToRad(Math.max(skyParams.elevation, 0));
+                const sunStrength = Math.max(0.1, Math.sin(elevRad));
+                const warmth = 1.0 - sunStrength * 0.2;
+                skySunLight.color.setRGB(1.0, warmth, warmth * 0.85);
+                skySunLight.intensity = 1.0 + sunStrength * 3.0;
+                skySunLight.position.copy(sunDirZUp).multiplyScalar(200);
+
+                // Sky fill HemisphereLight (Z-up: up is +Z)
+                if (!skyFillLight) {
+                    skyFillLight = new THREE.HemisphereLight(0x87CEEB, 0x362D1B, 1.0);
+                    skyFillLight.name = '__maxjs_sky_fill__';
+                    skyFillLight.position.set(0, 0, 1);
+                }
+                if (skyFillLight.parent !== scene) scene.add(skyFillLight);
+                skyFillLight.intensity = 0.5 + sunStrength * 0.5;
+
+                defaultLights.visible = false;
+                skyActive = true;
+
+                // Clear HDRI state
+                currentHdriUrl = null;
+                currentHdriProbeSignature = '';
+
+            } catch (err) {
+                console.error('[MaxJS] applySky error:', err);
+            }
+        }
+
+        function removeSky() {
+            lastSkySig = '';
+            skyActive = false;
+            if (skyMesh?.parent) skyMesh.parent.remove(skyMesh);
+            if (skySunLight?.parent) skySunLight.parent.remove(skySunLight);
+            if (skyFillLight?.parent) skyFillLight.parent.remove(skyFillLight);
+        }
+
         // ── Material Creation ───────────────────────────────
         function rememberMaterialEmissiveBase(material) {
             if (!material?.emissive) return;
@@ -1453,7 +1551,8 @@
             }
 
             if (msg.camera) applyCamera(msg.camera);
-            if (msg.env?.hdri) loadHDRI(msg.env);
+            if (msg.env?.sky) applySky(msg.env.sky);
+            else if (msg.env?.hdri) { removeSky(); loadHDRI(msg.env); }
             if (msg.fog) ssgiFx.setFogFromScene(msg.fog);
             if (msg.lights) applyLights(msg.lights);
             reconcileSplats(msg.splats ?? []);
@@ -1480,10 +1579,16 @@
         bridge.on('cam', msg => {
             if (msg.camera) applyCamera(msg.camera);
             if (msg.env) {
-                const sig = `${msg.env.rot}|${msg.env.exp}|${msg.env.gamma}|${msg.env.zup}|${msg.env.hdri}`;
-                if (sig !== lastEnvSig) {
-                    lastEnvSig = sig;
-                    loadHDRI(msg.env);
+                if (msg.env.sky) {
+                    applySky(msg.env.sky);
+                    lastEnvSig = '';
+                } else {
+                    const sig = `${msg.env.rot}|${msg.env.exp}|${msg.env.gamma}|${msg.env.zup}|${msg.env.hdri}`;
+                    if (sig !== lastEnvSig) {
+                        lastEnvSig = sig;
+                        removeSky();
+                        loadHDRI(msg.env);
+                    }
                 }
             }
             if (msg.fog) {
@@ -1531,6 +1636,12 @@
             if (msg.lights) applyLightUpdates(msg.lights);
             if (msg.splats) applySplatUpdates(msg.splats);
             if (msg.camera) applyCamera(msg.camera);
+            // Live env/fog updates
+            if (msg.env) {
+                if (msg.env.sky) { applySky(msg.env.sky); }
+                else if (msg.env.hdri) { removeSky(); loadHDRI(msg.env); }
+            }
+            if (msg.fog) ssgiFx.setFogFromScene(msg.fog);
             scene.updateMatrixWorld(true);
             const applyMs = performance.now() - applyStart;
             updateSyncHud({
@@ -1654,7 +1765,8 @@
             }
 
             if (meta.camera) applyCamera(meta.camera);
-            if (meta.env?.hdri) loadHDRI(meta.env);
+            if (meta.env?.sky) applySky(meta.env.sky);
+            else if (meta.env?.hdri) { removeSky(); loadHDRI(meta.env); }
             if (meta.fog) ssgiFx.setFogFromScene(meta.fog);
             if (meta.lights) applyLights(meta.lights);
             reconcileSplats(meta.splats ?? []);
@@ -1697,6 +1809,12 @@
                     applyCamera(cameraState);
                 },
             });
+            // Live env/fog updates in delta frames
+            if (meta.env) {
+                if (meta.env.sky) { applySky(meta.env.sky); }
+                else if (meta.env.hdri) { removeSky(); loadHDRI(meta.env); }
+            }
+            if (meta.fog) ssgiFx.setFogFromScene(meta.fog);
             scene.updateMatrixWorld(true);
             markInitialSync();
             setTransportMode('binary-delta');
@@ -1967,7 +2085,7 @@
                 ssgiFx.setMainLight(mainDirectionalLight);
             }
 
-            defaultLights.visible = appliedLightCount === 0 && !currentHdriUrl;
+            defaultLights.visible = appliedLightCount === 0 && !currentHdriUrl && !skyActive;
         }
 
         function applyLights(lightsData) {
@@ -1999,7 +2117,7 @@
                 ssgiFx.setMainLight(mainDirectionalLight);
             }
 
-            defaultLights.visible = appliedLightCount === 0 && !currentHdriUrl;
+            defaultLights.visible = appliedLightCount === 0 && !currentHdriUrl && !skyActive;
         }
 
         // ── Camera Sync (Z-up, raw from Max) ────────────────
@@ -2266,6 +2384,48 @@
                     { key: 'curvature', label: 'Curvature', min: 0, max: 0.2, step: 0.01 },
                     { key: 'bleeding', label: 'Color Bleed', min: 0, max: 0.01, step: 0.001 },
                     { key: 'vignetteIntensity', label: 'Vignette', min: 0, max: 1, step: 0.01 },
+                ],
+            },
+            {
+                key: 'volumetric',
+                title: 'Volumetric Light',
+                copy: 'Ray-marched light scattering through fog volume. Reacts to scene lights.',
+                note: 'Requires the real WebGPU backend.',
+                requiresWebGPU: true,
+                isEnabled: () => ssgiFx.isVolumetricEnabled(),
+                setEnabled: (enabled) => ssgiFx.setVolumetricEnabled(enabled),
+                getValues: (state) => state.volumetric,
+                setValues: (patch) => ssgiFx.setVolumetricOptions(patch),
+                controls: [
+                    { key: 'intensity', label: 'Intensity', min: 0, max: 5, step: 0.05 },
+                    { key: 'density', label: 'Density', min: 0, max: 1, step: 0.01 },
+                    { key: 'steps', label: 'Steps', min: 2, max: 32, step: 1, integer: true },
+                    { key: 'denoise', label: 'Denoise', min: 0, max: 2, step: 0.05 },
+                    { key: 'resolution', label: 'Resolution', min: 0.1, max: 1, step: 0.05 },
+                ],
+            },
+            {
+                key: 'pixel',
+                title: 'Pixel FX',
+                copy: 'Pixelation, chromatic aberration, sharpen, color grading, and film grain.',
+                note: 'Works on WebGPU and WebGL fallback.',
+                requiresWebGPU: false,
+                isEnabled: () => ssgiFx.isPixelEnabled(),
+                setEnabled: (enabled) => ssgiFx.setPixelEnabled(enabled),
+                getValues: (state) => state.pixel,
+                setValues: (patch) => ssgiFx.setPixelOptions(patch),
+                controls: [
+                    { key: 'pixelate', label: 'Pixelate', type: 'checkbox' },
+                    { key: 'pixelSize', label: 'Pixel Size', min: 1, max: 32, step: 1, integer: true },
+                    { key: 'chromatic', label: 'Chromatic Aberr', type: 'checkbox' },
+                    { key: 'chromaticIntensity', label: 'CA Intensity', min: 0, max: 0.05, step: 0.001 },
+                    { key: 'sharpen', label: 'Sharpen', type: 'checkbox' },
+                    { key: 'sharpenStrength', label: 'Sharp Strength', min: 0, max: 3, step: 0.05 },
+                    { key: 'grain', label: 'Film Grain', type: 'checkbox' },
+                    { key: 'grainIntensity', label: 'Grain Amount', min: 0, max: 0.5, step: 0.01 },
+                    { key: 'brightness', label: 'Brightness', min: -1, max: 1, step: 0.01 },
+                    { key: 'contrast', label: 'Contrast', min: -1, max: 1, step: 0.01 },
+                    { key: 'saturation', label: 'Saturation', min: -1, max: 1, step: 0.01 },
                 ],
             },
             {

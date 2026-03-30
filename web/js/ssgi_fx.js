@@ -36,6 +36,14 @@ import {
     uniform,
     replaceDefaultUV,
     velocity,
+    dot,
+    fract,
+    mix,
+    sin,
+    Fn,
+    time,
+    texture3D,
+    screenCoordinate,
 } from 'three/tsl';
 import { bloom } from 'three/addons/tsl/display/BloomNode.js';
 import { ssr } from 'three/addons/tsl/display/SSRNode.js';
@@ -43,11 +51,13 @@ import { ssgi } from 'three/addons/tsl/display/SSGINode.js';
 // OutlineNode removed — using built-in toonOutlinePass from TSL instead
 import { sss } from 'three/addons/tsl/display/SSSNode.js';
 import { scanlines, vignette, colorBleeding, barrelUV } from 'three/addons/tsl/display/CRT.js';
-import { bayerDither } from 'three/addons/tsl/math/Bayer.js';
+import { bayerDither, bayer16 } from 'three/addons/tsl/math/Bayer.js';
 import { retroPass } from 'three/addons/tsl/display/RetroPassNode.js';
 import { ao } from 'three/addons/tsl/display/GTAONode.js';
 import { motionBlur } from 'three/addons/tsl/display/MotionBlur.js';
 import { traa } from 'three/addons/tsl/display/TRAANode.js';
+import { gaussianBlur } from 'three/addons/tsl/display/GaussianBlurNode.js';
+import { ImprovedNoise } from 'three/addons/math/ImprovedNoise.js';
 
 function setTexturePrecision(scenePass) {
     const diffuseTexture = scenePass.getTexture('diffuseColor');
@@ -198,6 +208,28 @@ export function createSSGIController({
             noiseSpeed: 0.2,
             height: 20.0,
         },
+        volumetric: {
+            enabled: false,
+            intensity: 1.0,
+            steps: 12,
+            density: 0.5,
+            denoise: 0.6,
+            resolution: 0.25,
+        },
+        pixel: {
+            enabled: false,
+            pixelate: false,
+            pixelSize: 4,
+            chromatic: false,
+            chromaticIntensity: 0.005,
+            sharpen: false,
+            sharpenStrength: 0.5,
+            grain: false,
+            grainIntensity: 0.08,
+            brightness: 0,
+            contrast: 0,
+            saturation: 0,
+        },
     };
 
     let selectedObjects = [];
@@ -310,8 +342,11 @@ export function createSSGIController({
         state.motionBlur.enabled = false;
         state.traa.enabled = false;
         state.bloom.enabled = false;
+        state.pixel.enabled = false;
+        state.volumetric.enabled = false;
         pipelineReady = false;
         restoreForcedContactShadowLight();
+        removeVolumetricMesh();
         clearNodes();
         postProcessing.outputNode = null;
         postProcessing.needsUpdate = true;
@@ -322,7 +357,9 @@ export function createSSGIController({
         return state.ssgi.enabled || state.ssr.enabled || state.gtao.enabled || state.motionBlur.enabled || state.traa.enabled || state.bloom.enabled
             || (state.toonOutline.enabled && cachedHasToonMeshes)
             || (state.contactShadow.enabled && mainLight)
-            || state.retro.enabled;
+            || state.retro.enabled
+            || state.pixel.enabled
+            || state.volumetric.enabled;
     }
 
     function computeSceneReferenceSize() {
@@ -375,6 +412,8 @@ export function createSSGIController({
             contactShadow: { ...state.contactShadow },
             retro: { ...state.retro },
             fog: { ...state.fog },
+            pixel: { ...state.pixel },
+            volumetric: { ...state.volumetric },
         };
     }
 
@@ -382,6 +421,116 @@ export function createSSGIController({
 
     const fogTimer = uniform(0);
     let fogAnimationActive = false;
+    const pixelTimer = uniform(0);
+
+    // ── Volumetric lighting mesh management ──
+
+    const LAYER_VOL = 10;
+    const volLayerMask = new THREE.Layers();
+    volLayerMask.disableAll();
+    volLayerMask.enable(LAYER_VOL);
+
+    let volumetricMesh = null;
+    let volNoiseTexture = null;
+    let volLightsEnabled = [];
+    const volDensityU = uniform(0.5);
+
+    function getOrCreateVolNoise() {
+        if (volNoiseTexture) return volNoiseTexture;
+        const size = 64;
+        const data = new Uint8Array(size * size * size);
+        const noise = new ImprovedNoise();
+        const scale = 5.0;
+        for (let k = 0; k < size; k++)
+            for (let j = 0; j < size; j++)
+                for (let i = 0; i < size; i++)
+                    data[i + j * size + k * size * size] =
+                        (noise.noise(i * scale / size, j * scale / size, k * scale / size) * 0.5 + 0.5) * 255;
+        const tex = new THREE.Data3DTexture(data, size, size, size);
+        tex.format = THREE.RedFormat;
+        tex.minFilter = THREE.LinearFilter;
+        tex.magFilter = THREE.LinearFilter;
+        tex.wrapS = tex.wrapT = tex.wrapR = THREE.RepeatWrapping;
+        tex.needsUpdate = true;
+        volNoiseTexture = tex;
+        return tex;
+    }
+
+    function ensureVolumetricMesh() {
+        const noiseTex = getOrCreateVolNoise();
+        volDensityU.value = state.volumetric.density;
+
+        if (!volumetricMesh) {
+            const volMat = new THREE.VolumeNodeMaterial();
+            volMat.steps = state.volumetric.steps;
+            volMat.offsetNode = bayer16(screenCoordinate);
+            volMat.scatteringNode = Fn(({ positionRay }) => {
+                const t = vec3(time, float(0), time.mul(0.3));
+                const sampleAt = (scale, timeScale) =>
+                    texture3D(noiseTex, positionRay.add(t.mul(timeScale)).mul(scale).mod(1), 0).r.add(0.5);
+                let d = sampleAt(0.1, 1);
+                d = d.mul(sampleAt(0.05, 1));
+                d = d.mul(sampleAt(0.02, 2));
+                return volDensityU.mix(float(1), d);
+            });
+
+            volumetricMesh = new THREE.Mesh(
+                new THREE.BoxGeometry(1, 1, 1),
+                volMat
+            );
+            volumetricMesh.userData.isVolume = true;
+            volumetricMesh.layers.disableAll();
+            volumetricMesh.layers.enable(LAYER_VOL);
+            scene.add(volumetricMesh);
+        } else {
+            volumetricMesh.material.steps = state.volumetric.steps;
+        }
+
+        // Size to scene bounds
+        const box = new THREE.Box3();
+        scene.traverse(obj => {
+            if (obj.isMesh && obj !== volumetricMesh && obj.visible && obj.geometry) {
+                const pos = obj.geometry.getAttribute?.('position');
+                if (pos && pos.count > 0) box.expandByObject(obj);
+            }
+        });
+        if (!box.isEmpty()) {
+            const center = box.getCenter(new THREE.Vector3());
+            const sz = box.getSize(new THREE.Vector3());
+            const pad = 2.0;
+            volumetricMesh.position.copy(center);
+            volumetricMesh.scale.set(
+                Math.max(sz.x * pad, 1),
+                Math.max(sz.y * pad, 1),
+                Math.max(sz.z * pad, 1)
+            );
+        } else {
+            volumetricMesh.position.set(0, 0, 0);
+            volumetricMesh.scale.set(500, 500, 500);
+        }
+        volumetricMesh.visible = true;
+
+        // Enable volumetric layer on scene lights
+        disableVolLights();
+        scene.traverse(obj => {
+            if (obj.isLight) {
+                obj.layers.enable(LAYER_VOL);
+                volLightsEnabled.push(obj);
+            }
+        });
+    }
+
+    function disableVolLights() {
+        for (const light of volLightsEnabled) {
+            if (light.layers) light.layers.disable(LAYER_VOL);
+        }
+        volLightsEnabled = [];
+    }
+
+    function removeVolumetricMesh() {
+        if (volumetricMesh) volumetricMesh.visible = false;
+        disableVolLights();
+    }
 
     function applyFog() {
         const f = state.fog;
@@ -441,6 +590,7 @@ export function createSSGIController({
         refreshToonMeshCache();
         refreshPostPassHideList();
         ensureMainLightSupportsContactShadow();
+        if (!state.volumetric.enabled) removeVolumetricMesh();
 
         if (!hasAnyEffectEnabled() || !available) {
             pipelineReady = false;
@@ -625,11 +775,33 @@ export function createSSGIController({
                     state.bloom.threshold
                 );
                 activeNodes.push(bloomPass);
-                beauty = beauty.add(bloomPass);
+                const bloomLuma = bloomPass.r.mul(0.2126).add(bloomPass.g.mul(0.7152)).add(bloomPass.b.mul(0.0722));
+                beauty = vec4(beauty.rgb.add(bloomPass.rgb), max(beauty.a, bloomLuma));
             }
 
             // Toon outline is handled at the scene pass level (line above) —
             // toonOutlinePass replaces pass() so MRT + SSGI/SSR/Bloom all stack on top.
+
+            // ── Volumetric Lighting ──
+            if (state.volumetric.enabled && supportsScreenSpaceEffects) {
+                try {
+                    ensureVolumetricMesh();
+                    const volPass = pass(scene, camera, { depthBuffer: false });
+                    volPass.setLayers(volLayerMask);
+                    volPass.setResolutionScale(state.volumetric.resolution);
+                    activeNodes.push(volPass);
+
+                    const blurredVol = gaussianBlur(volPass, state.volumetric.denoise);
+                    activeNodes.push(blurredVol);
+
+                    const volContrib = blurredVol.mul(uniform(state.volumetric.intensity));
+                    const volLuma = volContrib.r.mul(0.2126).add(volContrib.g.mul(0.7152)).add(volContrib.b.mul(0.0722));
+                    beauty = vec4(beauty.rgb.add(volContrib.rgb), max(beauty.a, volLuma));
+                } catch (e) {
+                    console.warn('Volumetric pass failed:', e);
+                    removeVolumetricMesh();
+                }
+            }
 
             if (state.traa.enabled && !useRetroTakeover && prePassDepth && prePassVelocity) {
                 const traaInput = convertToTexture(beauty);
@@ -690,9 +862,112 @@ export function createSSGIController({
                 }
             }
 
+            // ── Pixel FX ──
+            if (state.pixel.enabled) {
+                const p = state.pixel;
+
+                // Pixelate — snap UVs to a coarse grid
+                if (p.pixelate && p.pixelSize > 1) {
+                    const pxSize = uniform(p.pixelSize);
+                    const px = vec2(
+                        max(screenSize.x.div(pxSize), float(1.0)),
+                        max(screenSize.y.div(pxSize), float(1.0))
+                    );
+                    beauty = replaceDefaultUV(() => screenUV.mul(px).floor().div(px), beauty);
+                }
+
+                // Effects requiring random-access texture sampling
+                const needsTex = (p.chromatic && p.chromaticIntensity > 0) ||
+                                  (p.sharpen && p.sharpenStrength > 0);
+
+                if (needsTex) {
+                    let bTex = convertToTexture(beauty);
+                    activeNodes.push(bTex);
+
+                    // Chromatic Aberration — radial RGB split
+                    if (p.chromatic && p.chromaticIntensity > 0) {
+                        const caI = uniform(p.chromaticIntensity);
+                        const dir = screenUV.sub(vec2(0.5, 0.5));
+                        const uvR = screenUV.add(dir.mul(caI));
+                        const uvB = screenUV.sub(dir.mul(caI));
+                        beauty = vec4(
+                            bTex.sample(uvR).r,
+                            bTex.sample(screenUV).g,
+                            bTex.sample(uvB).b,
+                            bTex.sample(screenUV).a
+                        );
+
+                        if (p.sharpen && p.sharpenStrength > 0) {
+                            bTex = convertToTexture(beauty);
+                            activeNodes.push(bTex);
+                        }
+                    }
+
+                    // Sharpen — unsharp mask kernel
+                    if (p.sharpen && p.sharpenStrength > 0) {
+                        const str = uniform(p.sharpenStrength);
+                        const txX = float(1).div(screenSize.x);
+                        const txY = float(1).div(screenSize.y);
+                        const ctr = bTex.sample(screenUV);
+                        const sl  = bTex.sample(screenUV.sub(vec2(txX, 0)));
+                        const sr  = bTex.sample(screenUV.add(vec2(txX, 0)));
+                        const st  = bTex.sample(screenUV.sub(vec2(0, txY)));
+                        const sb  = bTex.sample(screenUV.add(vec2(0, txY)));
+                        const avg = sl.add(sr).add(st).add(sb).mul(0.25);
+                        beauty = vec4(ctr.rgb.add(ctr.rgb.sub(avg.rgb).mul(str)), ctr.a);
+                    }
+                }
+
+                // Color Grading — brightness / contrast / saturation
+                if (p.brightness !== 0 || p.contrast !== 0 || p.saturation !== 0) {
+                    let col = beauty.rgb;
+                    if (p.brightness !== 0) {
+                        col = col.add(uniform(p.brightness));
+                    }
+                    if (p.contrast !== 0) {
+                        col = col.sub(0.5).mul(uniform(p.contrast).add(1.0)).add(0.5);
+                    }
+                    if (p.saturation !== 0) {
+                        const luma = col.r.mul(0.2126).add(col.g.mul(0.7152)).add(col.b.mul(0.0722));
+                        col = mix(vec3(luma, luma, luma), col, uniform(p.saturation).add(1.0));
+                    }
+                    beauty = vec4(col, beauty.a);
+                }
+
+                // Film Grain — animated hash noise
+                if (p.grain && p.grainIntensity > 0) {
+                    const gi = uniform(p.grainIntensity);
+                    const seed = screenUV.add(vec2(pixelTimer.mul(0.17), pixelTimer.mul(0.31)));
+                    const noise = fract(sin(dot(seed, vec2(12.9898, 78.233))).mul(43758.5453));
+                    beauty = vec4(beauty.rgb.add(noise.sub(0.5).mul(gi)), beauty.a);
+                }
+            }
+
             if (useEnvironmentBackdropCompensation && scenePassDepth) {
                 const hasSceneGeometry = scenePassDepth.r.lessThan(float(0.999999));
                 beauty = vec4(hasSceneGeometry.select(beauty.rgb, hiddenBackgroundNode), beauty.a);
+            }
+
+            // Fog alpha — make fog visible over transparent backgrounds
+            if (state.fog.enabled && scenePassDepth) {
+                const f = state.fog;
+                const d = scenePassDepth.r;
+                const cn = float(camera.near);
+                const cf = float(camera.far);
+                const z = cn.mul(cf).div(cf.sub(d.mul(cf.sub(cn))));
+
+                let fogAlpha;
+                if (f.type === 0) {
+                    fogAlpha = z.sub(float(f.near)).div(float(Math.max(f.far - f.near, 0.001)))
+                        .saturate().mul(float(f.opacity));
+                } else {
+                    const dens = float(f.type === 1 ? f.density : (f.density || 0.01));
+                    fogAlpha = z.mul(dens).negate().exp().oneMinus().mul(float(f.opacity));
+                }
+
+                const fogCol = vec3(f.color[0], f.color[1], f.color[2]);
+                const isBg = beauty.a.lessThan(0.001);
+                beauty = vec4(isBg.select(fogCol, beauty.rgb), max(beauty.a, fogAlpha));
             }
 
             postProcessing.outputNode = beauty;
@@ -939,6 +1214,58 @@ export function createSSGIController({
             rebuildPipeline();
             return { ...state.retro };
         },
+        // ── Pixel FX ──
+
+        isPixelEnabled() {
+            return state.pixel.enabled;
+        },
+        setPixelEnabled(enabled) {
+            state.pixel.enabled = !!enabled;
+            rebuildPipeline();
+            return state.pixel.enabled;
+        },
+        setPixelOptions(options = {}) {
+            if (typeof options.pixelate === 'boolean') state.pixel.pixelate = options.pixelate;
+            assignFinite(state.pixel, 'pixelSize', options.pixelSize);
+            if (typeof options.chromatic === 'boolean') state.pixel.chromatic = options.chromatic;
+            assignFinite(state.pixel, 'chromaticIntensity', options.chromaticIntensity);
+            if (typeof options.sharpen === 'boolean') state.pixel.sharpen = options.sharpen;
+            assignFinite(state.pixel, 'sharpenStrength', options.sharpenStrength);
+            if (typeof options.grain === 'boolean') state.pixel.grain = options.grain;
+            assignFinite(state.pixel, 'grainIntensity', options.grainIntensity);
+            assignFinite(state.pixel, 'brightness', options.brightness);
+            assignFinite(state.pixel, 'contrast', options.contrast);
+            assignFinite(state.pixel, 'saturation', options.saturation);
+            rebuildPipeline();
+            return { ...state.pixel };
+        },
+
+        // ── Volumetric Lighting ──
+
+        isVolumetricEnabled() {
+            return state.volumetric.enabled;
+        },
+        setVolumetricEnabled(enabled) {
+            if (enabled && !supportsScreenSpaceEffects) {
+                lastError = 'Volumetric lighting requires the real WebGPU backend';
+                state.volumetric.enabled = false;
+                onError(lastError);
+                return false;
+            }
+            state.volumetric.enabled = !!enabled && available;
+            rebuildPipeline();
+            return state.volumetric.enabled;
+        },
+        setVolumetricOptions(options = {}) {
+            assignFinite(state.volumetric, 'intensity', options.intensity);
+            assignFinite(state.volumetric, 'steps', options.steps);
+            assignFinite(state.volumetric, 'density', options.density);
+            assignFinite(state.volumetric, 'denoise', options.denoise);
+            assignFinite(state.volumetric, 'resolution', options.resolution);
+            rebuildPipeline();
+            return { ...state.volumetric };
+        },
+
         // ── Fog (scene.fogNode — independent of post-processing) ──
 
         isFogEnabled() {
@@ -981,6 +1308,10 @@ export function createSSGIController({
             // Update fog timer for procedural animation
             if (fogAnimationActive) {
                 fogTimer.value = performance.now() * 0.001 * state.fog.noiseSpeed;
+            }
+            // Update pixel grain timer
+            if (state.pixel.enabled && state.pixel.grain) {
+                pixelTimer.value = performance.now() * 0.001;
             }
 
             if (!hasAnyEffectEnabled() || !pipelineReady) {

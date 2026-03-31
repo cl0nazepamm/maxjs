@@ -24,6 +24,7 @@ export function createPerfHud(infoEl) {
         applyMs: 0,
         renderMs: 0,
         nodeCount: 0,
+        instanceCount: 0,
         textureCount: 0,
         drawCalls: 0,
         triangleCount: 0,
@@ -41,6 +42,7 @@ export function createPerfHud(infoEl) {
         infoEl.textContent =
             `MaxJS [${state.transport}] f${state.frameId || '-'} ` +
             `| nodes ${state.nodeCount} ` +
+            `| inst ${state.instanceCount} ` +
             `| tex ${state.textureCount} ` +
             `| bytes ${formatBytes(state.producerBytes)} ` +
             `| dec ${formatMs(state.decodeMs)} ` +

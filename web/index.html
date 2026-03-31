@@ -1707,6 +1707,10 @@
                 if (geoms.has(mesh.geometry)) count++;
                 else geoms.add(mesh.geometry);
             }
+            // Count Forest Pack GPU instances
+            for (const [, im] of forestMeshes) {
+                count += im.count; // InstancedMesh.count = number of instances
+            }
             return count;
         }
 
@@ -2239,8 +2243,8 @@
                     }
                 }
 
-                // Cache geometry for instance sharing
-                if (nd.geo && geom) geoByHandle.set(nd.h, geom);
+                // Cache geometry for instance sharing (always, not just when new geo arrives)
+                if (geom) geoByHandle.set(nd.h, geom);
 
                 if (mesh) {
                     if (geom && geom !== mesh.geometry) {
@@ -2612,6 +2616,7 @@
             forestMeshes.clear();
 
             if (!Array.isArray(groups) || groups.length === 0) return;
+            console.log('[ForestPack]', groups.length, 'groups, total instances:', groups.reduce((s, g) => s + (g.count || 0), 0));
 
             const m = new THREE.Matrix4();
 
@@ -2619,8 +2624,22 @@
                 if (!grp.v?.length || !grp.i?.length || !grp.xforms?.length) continue;
 
                 const geom = buildGeometry(grp.v, grp.i, grp.uv, grp.norm);
-                const mat = clayModeActive ? clayMat
-                    : new THREE.MeshStandardMaterial({ color: 0x888888, roughness: 0.7, side: THREE.DoubleSide });
+
+                // Material: use data from C++ (single or multi-sub), fallback to gray
+                let mat;
+                if (clayModeActive) {
+                    mat = clayMat;
+                } else if (grp.mats && grp.groups) {
+                    // Multi/Sub material — create material array + geometry groups
+                    mat = grp.mats.map(m => createMaterial(m));
+                    for (const [start, count, idx] of grp.groups) {
+                        geom.addGroup(start, count, idx);
+                    }
+                } else if (grp.mat) {
+                    mat = createMaterial(grp.mat);
+                } else {
+                    mat = new THREE.MeshStandardMaterial({ color: 0x888888, roughness: 0.7, side: THREE.DoubleSide });
+                }
 
                 const count = grp.count || (grp.xforms.length / 16);
                 const instMesh = new THREE.InstancedMesh(geom, mat, count);

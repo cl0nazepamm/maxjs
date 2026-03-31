@@ -11,10 +11,13 @@
 #include <stdmat.h>
 #include <ISceneEventManager.h>
 #include <iInstanceMgr.h>
+#include <modstack.h>
 #include <Graphics/IViewportViewSetting.h>
 #include <Graphics/GraphicsEnums.h>
 #include <maxscript/maxscript.h>
 #include "itreesinterface.h"
+#include "ircinterface.h"
+#include "tyParticleObjectExt.h"
 #include "sync_protocol.h"
 #include "threejs_material.h"
 #include "threejs_lights.h"
@@ -1565,6 +1568,21 @@ static bool IsForestPackClassID(const Class_ID& id) {
     return id == TFOREST_CLASS_ID || id == FIVY_CLASS_ID;
 }
 
+// Walk past modifiers/derived objects to find the base object
+static Object* GetBaseObject(Object* obj) {
+    while (obj && obj->SuperClassID() == GEN_DERIVOB_CLASS_ID) {
+        obj = reinterpret_cast<IDerivedObject*>(obj)->GetObjRef();
+    }
+    return obj;
+}
+
+// Check base object ClassID (EvalWorldState returns collapsed mesh, not Forest Pack)
+static bool IsForestPackNode(INode* node) {
+    if (!node) return false;
+    Object* base = GetBaseObject(node->GetObjectRef());
+    return base && IsForestPackClassID(base->ClassID());
+}
+
 // Check if ForestPack plugin is actually loaded before touching its interfaces
 static bool IsForestPackAvailable() {
     static int cached = -1;
@@ -1572,7 +1590,8 @@ static bool IsForestPackAvailable() {
         // ForestPack's main DLL — if not loaded, don't touch anything
         cached = (GetModuleHandleW(L"Forest.dlo") != nullptr ||
                   GetModuleHandleW(L"ForestPack.dlo") != nullptr ||
-                  GetModuleHandleW(L"ForestPackPro.dlo") != nullptr) ? 1 : 0;
+                  GetModuleHandleW(L"ForestPackPro.dlo") != nullptr ||
+                  GetModuleHandleW(L"ForestPro.dlo") != nullptr) ? 1 : 0;
     }
     return cached == 1;
 }
@@ -1584,6 +1603,8 @@ struct ForestInstanceGroup {
     std::vector<MatGroup> groups;
     std::vector<float> transforms;    // flat array of 16-float matrices
     int instanceCount = 0;
+    Mtl* mtl = nullptr;               // material for this group (may be multi-sub)
+    INode* mtlNode = nullptr;         // node for wire color fallback
 };
 
 // Register MaxJS as a Forest Pack render engine (once per session)
@@ -1608,9 +1629,9 @@ static void RegisterForestPackEngine() {
 // SEH wrapper — isolates crash guard from C++ object unwinding
 static bool SafeGetForestInterface(INode* fpNode, ITreesInterface** out) {
     __try {
-        Object* objRef = fpNode->GetObjectRef();
-        if (!objRef) return false;
-        *out = GetTreesInterface(objRef);
+        Object* base = GetBaseObject(fpNode->GetObjectRef());
+        if (!base) return false;
+        *out = GetTreesInterface(base);
         return *out != nullptr;
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -1646,10 +1667,8 @@ static void Matrix3To16(const Matrix3& m, float out[16]) {
 static bool ExtractForestPackInstances(INode* fpNode, TimeValue t,
                                        std::vector<ForestInstanceGroup>& outGroups) {
     if (!IsForestPackAvailable()) return false;
+    if (!IsForestPackNode(fpNode)) return false;
     RegisterForestPackEngine();
-
-    ObjectState os = fpNode->EvalWorldState(t);
-    if (!os.obj || !IsForestPackClassID(os.obj->ClassID())) return false;
 
     ITreesInterface* itrees = nullptr;
     if (!SafeGetForestInterface(fpNode, &itrees)) return false;
@@ -1689,6 +1708,10 @@ static bool ExtractForestPackInstances(INode* fpNode, TimeValue t,
             } else if (fi.node) {
                 ExtractMesh(fi.node, t, grp.verts, grp.uvs, grp.indices, grp.groups, &grp.norms);
             }
+
+            // Material: per-instance mtl override, source node mtl, or FP node mtl
+            grp.mtl = fi.mtl ? fi.mtl : (fi.node ? fi.node->GetMtl() : fpNode->GetMtl());
+            grp.mtlNode = fi.node ? fi.node : fpNode;
         }
 
         ForestInstanceGroup& grp = outGroups[groupIdx];
@@ -1703,6 +1726,269 @@ static bool ExtractForestPackInstances(INode* fpNode, TimeValue t,
 
     itrees->IForestClearRenderNodes();
     itrees->IForestRenderEnd(t);
+    return !outGroups.empty();
+}
+
+// ══════════════════════════════════════════════════════════════
+//  RailClone Instance Extraction
+// ══════════════════════════════════════════════════════════════
+
+static bool IsRailCloneClassID(const Class_ID& id) {
+    return id == TRAIL_CLASS_ID || id == TRAIL_PROXY_CLASS_ID;
+}
+
+static bool IsRailCloneNode(INode* node) {
+    if (!node) return false;
+    Object* base = GetBaseObject(node->GetObjectRef());
+    return base && IsRailCloneClassID(base->ClassID());
+}
+
+static bool IsRailCloneAvailable() {
+    static int cached = -1;
+    if (cached < 0) {
+        cached = (GetModuleHandleW(L"railclonepro.dlo") != nullptr ||
+                  GetModuleHandleW(L"RailClone.dlo") != nullptr ||
+                  GetModuleHandleW(L"RailClonePro.dlo") != nullptr) ? 1 : 0;
+    }
+    return cached == 1;
+}
+
+static bool g_rcEngineRegistered = false;
+static TRCEngineFeatures g_rcFeatures;
+
+static void RegisterRailCloneEngine() {
+    if (g_rcEngineRegistered) return;
+    __try {
+        IRCStaticInterface* isrc = GetRCStaticInterface();
+        if (!isrc) return;
+        isrc->IRCRegisterEngine();
+        g_rcFeatures.supportNoGeomObjects = false;
+        if (isrc->functions.Count() > 2)
+            isrc->IRCSetEngineFeatures((INT_PTR)&g_rcFeatures);
+        g_rcEngineRegistered = true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+static bool SafeGetRCInterface(INode* rcNode, IRCInterface** out) {
+    __try {
+        Object* base = GetBaseObject(rcNode->GetObjectRef());
+        if (!base) return false;
+        *out = GetRCInterface(base);
+        return *out != nullptr;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// SEH wrappers for RailClone API calls (can't mix __try with C++ objects)
+static bool SafeRCRenderBegin(IRCInterface* irc, TimeValue t) {
+    __try { irc->IRCRenderBegin(t); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+static Mesh** SafeRCGetMeshes(IRCInterface* irc, int* numMeshes) {
+    __try { return reinterpret_cast<Mesh**>(irc->IRCGetMeshes(*numMeshes)); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { *numMeshes = 0; return nullptr; }
+}
+static TRCInstance* SafeRCGetInstances(IRCInterface* irc, int* numInstances) {
+    __try { return RCGetInstances(irc, g_rcFeatures, *numInstances); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { *numInstances = 0; return nullptr; }
+}
+static void SafeRCRenderEnd(IRCInterface* irc, TimeValue t) {
+    __try { irc->IRCClearInstances(); irc->IRCClearMeshes(); irc->IRCRenderEnd(t); }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+// Reuses ForestInstanceGroup for output (same structure: mesh + transforms)
+static bool ExtractRailCloneInstances(INode* rcNode, TimeValue t,
+                                      std::vector<ForestInstanceGroup>& outGroups) {
+    if (!IsRailCloneAvailable()) return false;
+    if (!IsRailCloneNode(rcNode)) return false;
+    RegisterRailCloneEngine();
+
+    IRCInterface* irc = nullptr;
+    if (!SafeGetRCInterface(rcNode, &irc)) return false;
+    if (!SafeRCRenderBegin(irc, t)) return false;
+
+    // Get unique meshes
+    int numMeshes = 0;
+    Mesh** pmeshes = SafeRCGetMeshes(irc, &numMeshes);
+
+    // Build mesh pointer → group index map, extract geometry for each unique mesh
+    std::unordered_map<uintptr_t, size_t> meshToGroupIdx;
+    if (pmeshes && numMeshes > 0) {
+        for (int m = 0; m < numMeshes; m++) {
+            if (!pmeshes[m]) continue;
+            uintptr_t key = reinterpret_cast<uintptr_t>(pmeshes[m]);
+            if (meshToGroupIdx.count(key)) continue;
+            size_t idx = outGroups.size();
+            meshToGroupIdx[key] = idx;
+            outGroups.emplace_back();
+            ForestInstanceGroup& grp = outGroups.back();
+            grp.groupKey = key;
+            ExtractMeshFromRawMesh(*pmeshes[m], grp.verts, grp.uvs, grp.indices, grp.groups, &grp.norms);
+            // RailClone: all segments use the RC node's material
+            grp.mtl = rcNode->GetMtl();
+            grp.mtlNode = rcNode;
+        }
+    }
+
+    // Get instances
+    int numInstances = 0;
+    TRCInstance* inst = SafeRCGetInstances(irc, &numInstances);
+
+    Matrix3 nodeTM = rcNode->GetNodeTM(t);
+
+    if (inst && numInstances > 0) {
+        for (int i = 0; i < numInstances; i++) {
+            if (!inst->mesh) {
+                inst = RCGetNextInstance(inst, g_rcFeatures);
+                continue;
+            }
+            uintptr_t key = reinterpret_cast<uintptr_t>(inst->mesh);
+            auto it = meshToGroupIdx.find(key);
+            if (it == meshToGroupIdx.end()) {
+                size_t idx = outGroups.size();
+                meshToGroupIdx[key] = idx;
+                outGroups.emplace_back();
+                ForestInstanceGroup& grp = outGroups.back();
+                grp.groupKey = key;
+                ExtractMeshFromRawMesh(*inst->mesh, grp.verts, grp.uvs, grp.indices, grp.groups, &grp.norms);
+                // Per-segment material override (RCv4+), or RC node material
+                if (RCisV4(g_rcFeatures)) {
+                    TRCInstanceV400* rci4 = static_cast<TRCInstanceV400*>(inst);
+                    grp.mtl = rci4->mtl ? rci4->mtl : rcNode->GetMtl();
+                } else {
+                    grp.mtl = rcNode->GetMtl();
+                }
+                grp.mtlNode = rcNode;
+                it = meshToGroupIdx.find(key);
+            }
+
+            ForestInstanceGroup& grp = outGroups[it->second];
+            Matrix3 worldTM = inst->tm * nodeTM;
+            float xform[16];
+            Matrix3To16(worldTM, xform);
+            grp.transforms.insert(grp.transforms.end(), xform, xform + 16);
+            grp.instanceCount++;
+
+            inst = RCGetNextInstance(inst, g_rcFeatures);
+        }
+    }
+
+    SafeRCRenderEnd(irc, t);
+    return !outGroups.empty();
+}
+
+// ══════════════════════════════════════════════════════════════
+//  tyFlow Particle Instance Extraction
+// ══════════════════════════════════════════════════════════════
+
+#define TYFLOW_CLASS_ID   Class_ID(825370769, 1895152074)
+
+static bool IsTyFlowClassID(const Class_ID& id) {
+    return id == TYFLOW_CLASS_ID;
+}
+
+static bool IsTyFlowNode(INode* node) {
+    if (!node) return false;
+    Object* base = GetBaseObject(node->GetObjectRef());
+    return base && IsTyFlowClassID(base->ClassID());
+}
+
+static bool IsTyFlowAvailable() {
+    static int cached = -1;
+    if (cached < 0) {
+        cached = (GetModuleHandleW(L"tyFlow_2026.dlo") != nullptr ||
+                  GetModuleHandleW(L"tyFlow.dlo") != nullptr) ? 1 : 0;
+    }
+    return cached == 1;
+}
+
+// SEH wrappers for tyFlow API
+static tyFlow::tyParticleInterface* SafeGetTyInterface(INode* node) {
+    __try {
+        Object* base = GetBaseObject(node->GetObjectRef());
+        if (!base) return nullptr;
+        return tyFlow::GetTyParticleInterfaceForced(static_cast<BaseObject*>(base));
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
+}
+
+// Can't use __try here due to TSTR having a destructor — call directly
+static tyFlow::tyVector<tyFlow::tyInstanceInfo>* SafeTyCollectInstances(
+    tyFlow::tyParticleInterface* tyObj, INode* node, TimeValue t) {
+    return tyObj->CollectInstances(
+        node, tyFlow::DataFlags::mesh, t, t, _T("maxjs"));
+}
+
+static void SafeTyReleaseInstances(tyFlow::tyParticleInterface* tyObj,
+                                   tyFlow::tyVector<tyFlow::tyInstanceInfo>* inst) {
+    __try { tyObj->ReleaseInstances(inst); }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+static bool ExtractTyFlowInstances(INode* tyNode, TimeValue t,
+                                   std::vector<ForestInstanceGroup>& outGroups) {
+    if (!IsTyFlowAvailable()) return false;
+    if (!IsTyFlowNode(tyNode)) return false;
+
+    tyFlow::tyParticleInterface* tyObj = SafeGetTyInterface(tyNode);
+    if (!tyObj) return false;
+
+    tyFlow::tyVector<tyFlow::tyInstanceInfo>* infos =
+        SafeTyCollectInstances(tyObj, tyNode, t);
+    if (!infos || infos->size() == 0) return false;
+
+    Matrix3 nodeTM = tyNode->GetNodeTM(t);
+
+    std::unordered_map<uintptr_t, size_t> meshToGroupIdx;
+
+    for (size_t g = 0; g < infos->size(); g++) {
+        tyFlow::tyInstanceInfo& info = (*infos)[g];
+        if (!(info.flags & tyFlow::DataFlags::mesh) || !info.data) continue;
+
+        Mesh* srcMesh = static_cast<Mesh*>(info.data);
+        uintptr_t key = reinterpret_cast<uintptr_t>(srcMesh);
+
+        // Extract geometry once per unique mesh
+        auto it = meshToGroupIdx.find(key);
+        if (it == meshToGroupIdx.end()) {
+            size_t idx = outGroups.size();
+            meshToGroupIdx[key] = idx;
+            outGroups.emplace_back();
+            ForestInstanceGroup& grp = outGroups.back();
+            grp.groupKey = key;
+            ExtractMeshFromRawMesh(*srcMesh, grp.verts, grp.uvs, grp.indices, grp.groups, &grp.norms);
+            // tyFlow: use node material (instance overrides handled below)
+            grp.mtl = tyNode->GetMtl();
+            grp.mtlNode = tyNode;
+            it = meshToGroupIdx.find(key);
+        }
+
+        ForestInstanceGroup& grp = outGroups[it->second];
+
+        // Each tyInstance has a tyVector<Matrix3> tms — use tms[0] for current frame
+        for (size_t i = 0; i < info.instances.size(); i++) {
+            tyFlow::tyInstance& inst = info.instances[i];
+            if (inst.tms.size() == 0) continue;
+
+            Matrix3 worldTM = inst.tms[0] * nodeTM;
+            float xform[16];
+            Matrix3To16(worldTM, xform);
+            grp.transforms.insert(grp.transforms.end(), xform, xform + 16);
+            grp.instanceCount++;
+        }
+
+        // Clean up mesh if flagged
+        if (info.flags & tyFlow::DataFlags::pluginMustDelete) {
+            delete srcMesh;
+            info.data = nullptr;
+        }
+    }
+
+    SafeTyReleaseInstances(tyObj, infos);
     return !outGroups.empty();
 }
 
@@ -1971,6 +2257,8 @@ public:
     std::unordered_map<ULONG, uint64_t> geoHashMap_;   // node handle → geometry topology hash
     std::unordered_map<ULONG, std::vector<MatGroup>> groupCache_; // cached material groups per node
     std::unordered_map<ULONG, uint64_t> propHashMap_;  // node handle → object properties hash
+    std::unordered_set<ULONG> pluginInstHandles_;        // FP/RC/tyFlow node handles for change detection
+    std::unordered_map<ULONG, uint64_t> pluginInstHash_; // plugin node → geometry validity hash
     std::map<std::wstring, std::wstring> texDirMap_;    // dir → host
     int texDirCount_ = 0;
     bool lastClayMode_ = false;
@@ -2630,6 +2918,7 @@ public:
                 DetectSplatChanges();
             }
             if (tickCount_ % 15 == 0) DetectGeometryChanges();
+            if (tickCount_ % 15 == 0) DetectPluginInstanceChanges();
             if (tickCount_ % LIGHT_DETECT_TICKS == 0) PollViewportModes();
         }
     }
@@ -3190,6 +3479,35 @@ public:
         geoScanCursor_ = idx;
     }
 
+    // Detect changes to Forest Pack / RailClone / tyFlow plugin nodes
+    void DetectPluginInstanceChanges() {
+        if (pluginInstHandles_.empty()) return;
+        Interface* ip = GetCOREInterface();
+        if (!ip) return;
+        TimeValue t = ip->GetTime();
+
+        for (ULONG handle : pluginInstHandles_) {
+            INode* node = ip->GetINodeByHandle(handle);
+            if (!node) continue;
+            ObjectState os = node->EvalWorldState(t);
+            if (!os.obj) continue;
+
+            // Use geometry channel validity interval as a lightweight change key
+            Interval gv = os.obj->ChannelValidity(t, GEOM_CHAN_NUM);
+            uint64_t validKey = static_cast<uint64_t>(gv.Start())
+                              ^ (static_cast<uint64_t>(gv.End()) << 32);
+
+            auto it = pluginInstHash_.find(handle);
+            if (it == pluginInstHash_.end()) {
+                pluginInstHash_[handle] = validKey;
+            } else if (it->second != validKey) {
+                it->second = validKey;
+                SetDirty();
+                return;
+            }
+        }
+    }
+
     // Detect object property changes — triggers full sync (same pattern as DetectMaterialChanges)
     void DetectPropertyChanges() {
         Interface* ip = GetCOREInterface();
@@ -3651,6 +3969,44 @@ public:
         return nextFrameId_++;
     }
 
+    // Write material JSON for an instance group (handles Multi/Sub safely)
+    void WriteInstanceGroupMaterial(std::wostringstream& ss,
+                                    const ForestInstanceGroup& grp, TimeValue t) {
+        if (!grp.mtl) {
+            // No material — wire color fallback
+            MaxJSPBR pbr;
+            if (grp.mtlNode) GetWireColor3f(grp.mtlNode, pbr.color);
+            ss << L",\"mat\":";
+            WriteMaterialFull(ss, pbr);
+            return;
+        }
+
+        Mtl* multiMtl = FindMultiSubMtl(grp.mtl);
+        if (multiMtl && multiMtl->NumSubMtls() > 0 && grp.groups.size() > 1) {
+            // Multi/Sub: write groups + per-group sub-materials
+            ss << L",\"groups\":[";
+            for (size_t g = 0; g < grp.groups.size(); g++) {
+                if (g) ss << L',';
+                ss << L'[' << grp.groups[g].start << L',' << grp.groups[g].count << L',' << g << L']';
+            }
+            ss << L"],\"mats\":[";
+            for (size_t g = 0; g < grp.groups.size(); g++) {
+                if (g) ss << L',';
+                Mtl* subMtl = GetSubMtlFromMatID(multiMtl, grp.groups[g].matID);
+                MaxJSPBR subPBR;
+                ExtractPBRFromMtl(subMtl, grp.mtlNode, t, subPBR);
+                WriteMaterialFull(ss, subPBR);
+            }
+            ss << L"]";
+        } else {
+            // Single material
+            MaxJSPBR pbr;
+            ExtractPBRFromMtl(grp.mtl, grp.mtlNode, t, pbr);
+            ss << L",\"mat\":";
+            WriteMaterialFull(ss, pbr);
+        }
+    }
+
     // ── Full scene sync ──────────────────────────────────────
 
     void SendFullSync() {
@@ -3665,6 +4021,7 @@ public:
         geomHandles_.clear();
         lightHandles_.clear();
         splatHandles_.clear();
+        pluginInstHandles_.clear();
         lastSentTransforms_.clear();
 
         std::wostringstream ss;
@@ -3696,25 +4053,27 @@ public:
         ss << L",";
         WriteSplatsJson(ss, ip, t, true, false, true);
 
-        // ForestPack instance groups (GPU instancing)
-        if (IsForestPackAvailable()) {
-            std::vector<ForestInstanceGroup> allFpGroups;
-            std::function<void(INode*)> collectForest = [&](INode* parent) {
+        // ForestPack + RailClone instance groups (GPU instancing)
+        {
+            std::vector<ForestInstanceGroup> allInstGroups;
+            std::function<void(INode*)> collectInstances = [&](INode* parent) {
                 for (int c = 0; c < parent->NumberOfChildren(); c++) {
                     INode* node = parent->GetChildNode(c);
                     if (!node) continue;
-                    ObjectState fos = node->EvalWorldState(t);
-                    if (fos.obj && IsForestPackClassID(fos.obj->ClassID())) {
-                        ExtractForestPackInstances(node, t, allFpGroups);
-                    }
-                    collectForest(node);
+                    if (IsForestPackAvailable() && IsForestPackNode(node))
+                        ExtractForestPackInstances(node, t, allInstGroups);
+                    else if (IsRailCloneAvailable() && IsRailCloneNode(node))
+                        ExtractRailCloneInstances(node, t, allInstGroups);
+                    else if (IsTyFlowAvailable() && IsTyFlowNode(node))
+                        ExtractTyFlowInstances(node, t, allInstGroups);
+                    collectInstances(node);
                 }
             };
-            collectForest(root);
-            if (!allFpGroups.empty()) {
+            collectInstances(root);
+            if (!allInstGroups.empty()) {
                 ss << L",\"forestInstances\":[";
                 bool firstGrp = true;
-                for (auto& grp : allFpGroups) {
+                for (auto& grp : allInstGroups) {
                     if (grp.verts.empty() || grp.transforms.empty()) continue;
                     if (!firstGrp) ss << L',';
                     firstGrp = false;
@@ -3730,6 +4089,7 @@ public:
                     }
                     ss << L",\"xforms\":";
                     WriteFloats(ss, grp.transforms.data(), grp.transforms.size());
+                    WriteInstanceGroupMaterial(ss, grp, t);
                     ss << L'}';
                 }
                 ss << L']';
@@ -3753,8 +4113,10 @@ public:
                 WriteSceneNodes(node, t, ss, first, prevGeom);
                 continue;
             }
-            // Skip Forest Pack / ForestIvy — handled via GPU instancing
-            if (os.obj && IsForestPackClassID(os.obj->ClassID())) {
+            // Skip Forest Pack / ForestIvy / RailClone / tyFlow — handled via GPU instancing
+            if (IsForestPackNode(node) || IsRailCloneNode(node) ||
+                (IsTyFlowAvailable() && IsTyFlowNode(node))) {
+                pluginInstHandles_.insert(node->GetHandle());
                 WriteSceneNodes(node, t, ss, first, prevGeom);
                 continue;
             }
@@ -3899,6 +4261,7 @@ public:
         geomHandles_.clear();
         lightHandles_.clear();
         splatHandles_.clear();
+        pluginInstHandles_.clear();
         lastSentTransforms_.clear();
 
         // Collect all geometry nodes
@@ -3961,8 +4324,9 @@ public:
                     collect(node);
                     continue;
                 }
-                // Skip Forest Pack / ForestIvy — handled via GPU instancing
-                if (os.obj && IsForestPackClassID(os.obj->ClassID())) {
+                // Skip Forest Pack / ForestIvy / RailClone / tyFlow — handled via GPU instancing
+                if (IsForestPackNode(node) || IsRailCloneNode(node) ||
+                    (IsTyFlowAvailable() && IsTyFlowNode(node))) {
                     collect(node);
                     continue;
                 }
@@ -4171,28 +4535,28 @@ public:
         ss << L",";
         WriteSplatsJson(ss, ip, t, true, false, true);
 
-        // ForestPack instance groups (GPU instancing)
+        // ForestPack + RailClone instance groups (GPU instancing)
         {
-            std::vector<ForestInstanceGroup> allFpGroups;
-            if (IsForestPackAvailable()) {
-                std::function<void(INode*)> collectForest = [&](INode* parent) {
-                    for (int c = 0; c < parent->NumberOfChildren(); c++) {
-                        INode* node = parent->GetChildNode(c);
-                        if (!node) continue;
-                        ObjectState fos = node->EvalWorldState(t);
-                        if (fos.obj && IsForestPackClassID(fos.obj->ClassID())) {
-                            ExtractForestPackInstances(node, t, allFpGroups);
-                        }
-                        collectForest(node);
-                    }
-                };
-                collectForest(root);
-            }
+            std::vector<ForestInstanceGroup> allInstGroups;
+            std::function<void(INode*)> collectInstances = [&](INode* parent) {
+                for (int c = 0; c < parent->NumberOfChildren(); c++) {
+                    INode* node = parent->GetChildNode(c);
+                    if (!node) continue;
+                    if (IsForestPackAvailable() && IsForestPackNode(node))
+                        ExtractForestPackInstances(node, t, allInstGroups);
+                    else if (IsRailCloneAvailable() && IsRailCloneNode(node))
+                        ExtractRailCloneInstances(node, t, allInstGroups);
+                    else if (IsTyFlowAvailable() && IsTyFlowNode(node))
+                        ExtractTyFlowInstances(node, t, allInstGroups);
+                    collectInstances(node);
+                }
+            };
+            collectInstances(root);
 
-            if (!allFpGroups.empty()) {
+            if (!allInstGroups.empty()) {
                 ss << L",\"forestInstances\":[";
                 bool firstGrp = true;
-                for (auto& grp : allFpGroups) {
+                for (auto& grp : allInstGroups) {
                     if (grp.verts.empty() || grp.transforms.empty()) continue;
                     if (!firstGrp) ss << L',';
                     firstGrp = false;
@@ -4209,6 +4573,7 @@ public:
                     }
                     ss << L",\"xforms\":";
                     WriteFloats(ss, grp.transforms.data(), grp.transforms.size());
+                    WriteInstanceGroupMaterial(ss, grp, t);
                     ss << L'}';
                 }
                 ss << L']';

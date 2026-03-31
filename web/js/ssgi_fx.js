@@ -953,7 +953,10 @@ export function createSSGIController({
 
             if (useEnvironmentBackdropCompensation && scenePassDepth) {
                 const hasSceneGeometry = scenePassDepth.r.lessThan(float(0.999999));
-                beauty = vec4(hasSceneGeometry.select(beauty.rgb, hiddenBackgroundNode), beauty.a);
+                beauty = vec4(
+                    hasSceneGeometry.select(beauty.rgb, hiddenBackgroundNode),
+                    hasSceneGeometry.select(beauty.a, float(0))
+                );
             }
 
             // Fog alpha — make fog visible over transparent backgrounds

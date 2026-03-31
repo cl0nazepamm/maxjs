@@ -437,6 +437,8 @@ static std::wstring FindPBString(Texmap* map, const MCHAR* name);
 #define SHELL_MTL_CLASS_ID Class_ID(597, 0)
 // glTF Material Class_ID = (943849874, 1174294043)
 #define GLTF_MTL_CLASS_ID Class_ID(943849874, 1174294043)
+// USD Preview Surface Class_ID = (1794787635, 1200091591)
+#define USD_PREVIEW_SURFACE_CLASS_ID Class_ID(1794787635, 1200091591)
 
 static bool IsThreeJSMaterialClass(const Class_ID& cid) {
     return cid == THREEJS_MTL_CLASS_ID ||
@@ -472,7 +474,8 @@ static bool IsUtilityMaterialModel(const std::wstring& materialModel) {
 static bool IsSupportedMaterial(Mtl* mtl) {
     if (!mtl) return false;
     Class_ID cid = mtl->ClassID();
-    return IsThreeJSMaterialClass(cid) || cid == THREEJS_TOON_CLASS_ID || cid == GLTF_MTL_CLASS_ID;
+    return IsThreeJSMaterialClass(cid) || cid == THREEJS_TOON_CLASS_ID || cid == GLTF_MTL_CLASS_ID
+        || cid == USD_PREVIEW_SURFACE_CLASS_ID;
 }
 
 // Find ThreeJS or glTF Material in material tree — uses ClassID only
@@ -839,6 +842,88 @@ static void ExtractGltfMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
     readMap(_T("AlphaMap"), d.opacityMap, d.opacityMapTransform);
 }
 
+// Extract PBR from USD Preview Surface — generic paramblock reader
+static void ExtractUsdPreviewSurfaceMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
+    MSTR name = mtl->GetName();
+    d.mtlName = name.data();
+
+    auto readColor = [&](const MCHAR* pname, float out[3]) {
+        for (int b = 0; b < mtl->NumParamBlocks(); b++) {
+            IParamBlock2* pb = mtl->GetParamBlock(b);
+            if (!pb) continue;
+            for (int i = 0; i < pb->NumParams(); i++) {
+                ParamID pid = pb->IndextoID(i);
+                const ParamDef& pd = pb->GetParamDef(pid);
+                if (pd.int_name && _tcsicmp(pd.int_name, pname) == 0) {
+                    if (pd.type == TYPE_RGBA || pd.type == TYPE_FRGBA) {
+                        Color c = pb->GetColor(pid, t);
+                        out[0] = c.r; out[1] = c.g; out[2] = c.b;
+                    }
+                    return;
+                }
+            }
+        }
+    };
+    auto readFloat = [&](const MCHAR* pname, float def) -> float {
+        for (int b = 0; b < mtl->NumParamBlocks(); b++) {
+            IParamBlock2* pb = mtl->GetParamBlock(b);
+            if (!pb) continue;
+            for (int i = 0; i < pb->NumParams(); i++) {
+                ParamID pid = pb->IndextoID(i);
+                const ParamDef& pd = pb->GetParamDef(pid);
+                if (pd.int_name && _tcsicmp(pd.int_name, pname) == 0 && pd.type == TYPE_FLOAT)
+                    return pb->GetFloat(pid, t);
+            }
+        }
+        return def;
+    };
+    auto readMap = [&](const MCHAR* pname, std::wstring& outPath, MaxJSPBR::TexTransform& outXf) {
+        outPath.clear();
+        outXf = {};
+        for (int b = 0; b < mtl->NumParamBlocks(); b++) {
+            IParamBlock2* pb = mtl->GetParamBlock(b);
+            if (!pb) continue;
+            for (int i = 0; i < pb->NumParams(); i++) {
+                ParamID pid = pb->IndextoID(i);
+                const ParamDef& pd = pb->GetParamDef(pid);
+                if (pd.int_name && _tcsicmp(pd.int_name, pname) == 0 && pd.type == TYPE_TEXMAP) {
+                    Texmap* map = pb->GetTexmap(pid, t);
+                    ExtractMaterialTexture(map, outPath, outXf);
+                    return;
+                }
+            }
+        }
+    };
+
+    readColor(_T("diffuseColor"), d.color);
+
+    d.roughness         = readFloat(_T("roughness"), 0.5f);
+    d.metalness         = readFloat(_T("metallic"), 0.0f);
+    d.opacity           = readFloat(_T("opacity"), 1.0f);
+    d.normalScale       = readFloat(_T("bump_map_amt"), 1.0f);
+    d.aoIntensity       = readFloat(_T("occlusion"), 1.0f);
+    d.ior               = readFloat(_T("ior"), 1.5f);
+    d.clearcoat         = readFloat(_T("clearcoat"), 0.0f);
+    d.clearcoatRoughness = readFloat(_T("clearcoatRoughness"), 0.01f);
+    d.displacementScale = readFloat(_T("displacement"), 0.0f);
+
+    readColor(_T("emissiveColor"), d.emission);
+    d.emIntensity = (d.emission[0] + d.emission[1] + d.emission[2] > 0) ? 1.0f : 0.0f;
+
+    readMap(_T("diffuseColor_map"),      d.colorMap,        d.colorMapTransform);
+    readMap(_T("roughness_map"),          d.roughnessMap,    d.roughnessMapTransform);
+    readMap(_T("metallic_map"),           d.metalnessMap,    d.metalnessMapTransform);
+    readMap(_T("normal_map"),             d.normalMap,       d.normalMapTransform);
+    readMap(_T("occlusion_map"),          d.aoMap,           d.aoMapTransform);
+    readMap(_T("emissiveColor_map"),      d.emissionMap,     d.emissionMapTransform);
+    readMap(_T("opacity_map"),            d.opacityMap,      d.opacityMapTransform);
+    readMap(_T("displacement_map"),       d.displacementMap, d.displacementMapTransform);
+
+    // USD Preview Surface with clearcoat or IOR ≠ 1.5 → Physical material
+    if (d.clearcoat > 0.0f || d.ior != 1.5f)
+        d.materialModel = L"MeshPhysicalMaterial";
+}
+
 // Extract PBR from a single material (ThreeJS, glTF, or wire color fallback)
 static void ExtractPBRFromMtl(Mtl* mtl, INode* node, TimeValue t, MaxJSPBR& d) {
     if (mtl) {
@@ -849,6 +934,8 @@ static void ExtractPBRFromMtl(Mtl* mtl, INode* node, TimeValue t, MaxJSPBR& d) {
                 ExtractThreeJSMtl(found, t, d);
             else if (cid == THREEJS_TOON_CLASS_ID)
                 ExtractThreeJSToonMtl(found, t, d);
+            else if (cid == USD_PREVIEW_SURFACE_CLASS_ID)
+                ExtractUsdPreviewSurfaceMtl(found, t, d);
             else
                 ExtractGltfMtl(found, t, d);
             return;
@@ -882,7 +969,7 @@ static Mtl* GetSubMtlFromMatID(Mtl* multiMtl, int matID) {
 static void ExtractPBR(INode* node, TimeValue t, MaxJSPBR& d) {
     Mtl* mtl = node->GetMtl();
 
-    // Priority 1: ThreeJS Material or glTF Material (direct or inside Shell)
+    // Priority 1: ThreeJS Material, glTF Material, or USD Preview Surface (direct or inside Shell)
     Mtl* found = FindSupportedMaterial(mtl);
     if (found) {
         const Class_ID cid = found->ClassID();
@@ -890,6 +977,8 @@ static void ExtractPBR(INode* node, TimeValue t, MaxJSPBR& d) {
             ExtractThreeJSMtl(found, t, d);
         else if (cid == THREEJS_TOON_CLASS_ID)
             ExtractThreeJSToonMtl(found, t, d);
+        else if (cid == USD_PREVIEW_SURFACE_CLASS_ID)
+            ExtractUsdPreviewSurfaceMtl(found, t, d);
         else
             ExtractGltfMtl(found, t, d);
         return;
@@ -929,6 +1018,14 @@ static void ExtractMaterialScalarPreview(Mtl* foundMtl, INode* node, TimeValue t
     } else if (cid == GLTF_MTL_CLASS_ID) {
         MaxJSPBR tmp;
         ExtractGltfMtl(foundMtl, t, tmp);
+        col[0] = tmp.color[0]; col[1] = tmp.color[1]; col[2] = tmp.color[2];
+        rough = tmp.roughness;
+        metal = tmp.metalness;
+        opac = tmp.opacity;
+        return;
+    } else if (cid == USD_PREVIEW_SURFACE_CLASS_ID) {
+        MaxJSPBR tmp;
+        ExtractUsdPreviewSurfaceMtl(foundMtl, t, tmp);
         col[0] = tmp.color[0]; col[1] = tmp.color[1]; col[2] = tmp.color[2];
         rough = tmp.roughness;
         metal = tmp.metalness;
@@ -984,7 +1081,7 @@ static bool ExtractMesh(INode* node, TimeValue t,
     int nv = mesh.getNumVerts();
     int nf = mesh.getNumFaces();
 
-    if (nv == 0 || nf == 0 || nv > 500000) {
+    if (nv == 0 || nf == 0) {
         if (tri != os.obj) tri->DeleteThis();
         return false;
     }
@@ -2256,11 +2353,7 @@ public:
         meta.imbue(std::locale::classic());
         meta << L"{\"type\":\"delta_bin\",\"frame\":" << frameId;
         meta << L",\"stats\":{\"producerBytes\":" << frameBytes.size();
-        meta << L",\"commandCount\":" << frame.command_count() << L"}";
-
-        // Env+fog from cache (polled at reduced cadence)
-        WriteEnvFogCached(meta);
-        meta << L"}";
+        meta << L",\"commandCount\":" << frame.command_count() << L"}}";
 
         wv17->PostSharedBufferToScript(
             sharedBuf.Get(),
@@ -2276,8 +2369,12 @@ public:
     std::wstring cachedHdriUrl_;   // cached MapTexturePath result
     static constexpr int ENV_FOG_POLL_TICKS = 6;  // ~200ms at 33ms tick
 
-    // Poll env+fog at reduced cadence, rebuild cached JSON only on change
+    std::wstring lastEnvFogSig_;   // change-detection signature
+
+    // Poll env+fog at reduced cadence; send standalone message ONLY when changed
     void PollEnvFog() {
+        if (!webview_) return;
+
         EnvData env;
         GetEnvironment(env);
         FogData fog;
@@ -2296,32 +2393,23 @@ public:
             cachedHdriUrl_.clear();
         }
 
-        // Rebuild env JSON
-        {
-            std::wostringstream ss;
-            ss.imbue(std::locale::classic());
-            WriteEnvJson(ss, env, hdriUrl);
-            cachedEnvJson_ = ss.str();
-        }
+        // Build env+fog JSON
+        std::wostringstream ss;
+        ss.imbue(std::locale::classic());
+        ss << L"{\"type\":\"env_update\",";
+        WriteEnvJson(ss, env, hdriUrl);
+        ss << L",";
+        WriteFogJson(ss, fog);
+        ss << L'}';
+        std::wstring json = ss.str();
+
+        // Only send if something changed
+        if (json == lastEnvFogSig_) return;
+        lastEnvFogSig_ = json;
         cachedEnv_ = env;
-
-        // Rebuild fog JSON
-        {
-            std::wostringstream ss;
-            ss.imbue(std::locale::classic());
-            WriteFogJson(ss, fog);
-            cachedFogJson_ = ss.str();
-        }
         cachedFog_ = fog;
-    }
 
-    void WriteEnvFogCached(std::wostringstream& ss) {
-        ss << L",";
-        if (!cachedEnvJson_.empty()) ss << cachedEnvJson_;
-        else ss << L"\"env\":{}";
-        ss << L",";
-        if (!cachedFogJson_.empty()) ss << cachedFogJson_;
-        else ss << L"\"fog\":{\"active\":0}";
+        webview_->PostWebMessageAsJson(json.c_str());
     }
 
     void SendCameraSync() {
@@ -2330,7 +2418,6 @@ public:
         ss.imbue(std::locale::classic());
         ss << L"{\"type\":\"cam\",\"frame\":" << frameId << L",";
         WriteCameraJson(ss);
-        WriteEnvFogCached(ss);
         ss << L'}';
         webview_->PostWebMessageAsJson(ss.str().c_str());
     }
@@ -3420,10 +3507,6 @@ public:
         }
         ss << L"],";
         WriteCameraJson(ss);
-
-        // Env+fog from cache (polled at reduced cadence, not per-frame)
-        WriteEnvFogCached(ss);
-
         ss << L",";
         WriteLightsJson(ss, ip, t, true, true, true);
         ss << L",";

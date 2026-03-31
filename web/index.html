@@ -28,7 +28,6 @@
         #info {
             background: rgba(0,0,0,0.6); padding: 6px 10px;
             border-radius: 4px; margin-bottom: 6px;
-            display: none;
         }
         #controls {
             pointer-events: auto;
@@ -259,12 +258,12 @@
             let backendLabel;
 
             if (forceVR) {
-                nextRenderer = new THREE.WebGPURenderer({ antialias: true, forceWebGL: true });
+                nextRenderer = new THREE.WebGPURenderer({ antialias: true, alpha: true, forceWebGL: true });
                 backendLabel = 'WebGL2 (VR)';
                 configureRenderer(nextRenderer);
                 await nextRenderer.init();
             } else {
-                nextRenderer = new THREE.WebGPURenderer({ antialias: true });
+                nextRenderer = new THREE.WebGPURenderer({ antialias: true, alpha: true });
                 backendLabel = 'WebGPU';
                 try {
                     configureRenderer(nextRenderer);
@@ -273,7 +272,7 @@
                     console.warn('MaxJS WebGPU init failed, retrying with forced WebGL2 backend.', error);
                     nextRenderer.domElement.remove();
                     nextRenderer.dispose?.();
-                    nextRenderer = new THREE.WebGPURenderer({ antialias: true, forceWebGL: true });
+                    nextRenderer = new THREE.WebGPURenderer({ antialias: true, alpha: true, forceWebGL: true });
                     backendLabel = 'WebGL2 fallback';
                     configureRenderer(nextRenderer);
                     await nextRenderer.init();
@@ -1457,21 +1456,49 @@
                     if (meta?.type === 'delta_bin') {
                         handleBinaryDelta(buf, meta);
                     } else if (meta?.type === 'geo_fast') {
-                        // Real-time vertex update — patch single mesh
+                        // Real-time vertex update — in-place when topology matches
                         const mesh = nodeMap.get(meta.h);
                         if (mesh) {
-                            const verts = new Float32Array(new Float32Array(buf, meta.vOff, meta.vN));
-                            const idx = new Uint32Array(new Int32Array(buf, meta.iOff, meta.iN));
-                            const geom = new THREE.BufferGeometry();
-                            geom.setAttribute('position', new THREE.BufferAttribute(verts, 3));
-                            geom.setIndex(new THREE.BufferAttribute(idx, 1));
-                            if (meta.uvOff != null && meta.uvN) {
-                                const uvs = new Float32Array(new Float32Array(buf, meta.uvOff, meta.uvN));
-                                geom.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
+                            const pos = mesh.geometry.getAttribute('position');
+                            const vertCount = meta.vN / 3;
+                            const idxCount = meta.iN;
+                            const existingIdx = mesh.geometry.getIndex();
+                            const sameTopology = pos
+                                && pos.count === vertCount
+                                && existingIdx
+                                && existingIdx.count === idxCount;
+
+                            if (sameTopology) {
+                                // Hot path: copy positions into existing GPU buffer
+                                pos.array.set(new Float32Array(buf, meta.vOff, meta.vN));
+                                pos.needsUpdate = true;
+
+                                if (meta.uvOff != null && meta.uvN) {
+                                    const uv = mesh.geometry.getAttribute('uv');
+                                    if (uv && uv.count === meta.uvN / 2) {
+                                        uv.array.set(new Float32Array(buf, meta.uvOff, meta.uvN));
+                                        uv.needsUpdate = true;
+                                    }
+                                }
+
+                                mesh.geometry.computeBoundingSphere();
+                                scheduleNormals(mesh.geometry);
+                            } else {
+                                // Topology changed — full rebuild
+                                const verts = new Float32Array(new Float32Array(buf, meta.vOff, meta.vN));
+                                const idx = new Uint32Array(new Int32Array(buf, meta.iOff, meta.iN));
+                                const geom = new THREE.BufferGeometry();
+                                geom.setAttribute('position', new THREE.BufferAttribute(verts, 3));
+                                geom.setIndex(new THREE.BufferAttribute(idx, 1));
+                                if (meta.uvOff != null && meta.uvN) {
+                                    const uvs = new Float32Array(new Float32Array(buf, meta.uvOff, meta.uvN));
+                                    geom.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
+                                }
+                                geom.computeVertexNormals();
+                                geom.computeBoundingSphere();
+                                mesh.geometry.dispose();
+                                mesh.geometry = geom;
                             }
-                            geom.computeVertexNormals();
-                            mesh.geometry.dispose();
-                            mesh.geometry = geom;
                         }
                     } else {
                         handleBinaryScene(buf, meta);
@@ -1569,31 +1596,8 @@
         });
 
         // ── Camera-only sync (30fps) ─────────────────────────
-        let lastEnvSig = '';
-        let lastFogSig = '';
         bridge.on('cam', msg => {
             if (msg.camera) applyCamera(msg.camera);
-            if (msg.env) {
-                if (msg.env.sky) {
-                    applySky(msg.env.sky);
-                    lastEnvSig = '';
-                } else {
-                    const sig = `${msg.env.rot}|${msg.env.exp}|${msg.env.gamma}|${msg.env.zup}|${msg.env.hdri}`;
-                    if (sig !== lastEnvSig) {
-                        lastEnvSig = sig;
-                        removeSky();
-                        loadHDRI(msg.env);
-                    }
-                }
-            }
-            if (msg.fog) {
-                const f = msg.fog;
-                const sig = `${f.active}|${f.type}|${f.color}|${f.opacity}|${f.near}|${f.far}|${f.density}|${f.noiseScale}|${f.noiseSpeed}|${f.height}`;
-                if (sig !== lastFogSig) {
-                    lastFogSig = sig;
-                    ssgiFx.setFogFromScene(f);
-                }
-            }
             if (msg.frame || msg.stats) {
                 updateSyncHud({
                     transport: 'json',
@@ -1605,7 +1609,35 @@
             }
         });
 
+        // ── Environment/Fog live update (standalone, change-only) ──
+        bridge.on('env_update', msg => {
+            if (msg.env) {
+                if (msg.env.sky) {
+                    applySky(msg.env.sky);
+                } else if (msg.env.hdri) {
+                    removeSky();
+                    loadHDRI(msg.env);
+                }
+            }
+            if (msg.fog) ssgiFx.setFogFromScene(msg.fog);
+        });
+
         // ── Geometry Fast Update (single mesh, real-time vertex editing) ──
+        const pendingNormals = new Set();
+        let normalTimer = null;
+        function scheduleNormals(geom) {
+            pendingNormals.add(geom);
+            clearTimeout(normalTimer);
+            normalTimer = setTimeout(() => {
+                for (const g of pendingNormals) {
+                    g.computeVertexNormals();
+                    const n = g.getAttribute('normal');
+                    if (n) n.needsUpdate = true;
+                }
+                pendingNormals.clear();
+            }, 80);
+        }
+
         bridge.on('geo_fast', msg => {
             const mesh = nodeMap.get(msg.h);
             if (!mesh) return;
@@ -1631,12 +1663,6 @@
             if (msg.lights) applyLightUpdates(msg.lights);
             if (msg.splats) applySplatUpdates(msg.splats);
             if (msg.camera) applyCamera(msg.camera);
-            // Live env/fog updates
-            if (msg.env) {
-                if (msg.env.sky) { applySky(msg.env.sky); }
-                else if (msg.env.hdri) { removeSky(); loadHDRI(msg.env); }
-            }
-            if (msg.fog) ssgiFx.setFogFromScene(msg.fog);
             scene.updateMatrixWorld(true);
             const applyMs = performance.now() - applyStart;
             updateSyncHud({
@@ -1804,12 +1830,6 @@
                     applyCamera(cameraState);
                 },
             });
-            // Live env/fog updates in delta frames
-            if (meta.env) {
-                if (meta.env.sky) { applySky(meta.env.sky); }
-                else if (meta.env.hdri) { removeSky(); loadHDRI(meta.env); }
-            }
-            if (meta.fog) ssgiFx.setFogFromScene(meta.fog);
             scene.updateMatrixWorld(true);
             markInitialSync();
             setTransportMode('binary-delta');
@@ -2562,6 +2582,7 @@
             document.getElementById('fx-tonemapping-mode').onchange = (e) => {
                 currentToneMapping = e.target.value;
                 renderer.toneMapping = toneMappingModes[currentToneMapping];
+                savePostFxState();
             };
             const expSlider = document.getElementById('fx-tonemapping-exp');
             const expLabel = document.getElementById('fx-tonemapping-exp-val');
@@ -2569,6 +2590,7 @@
                 currentExposure = parseFloat(e.target.value);
                 renderer.toneMappingExposure = currentExposure;
                 expLabel.textContent = currentExposure.toFixed(1);
+                savePostFxState();
             };
 
             for (const section of postFxSections) {
@@ -2692,12 +2714,59 @@
                 section.noteEl.textContent = note;
                 section.noteEl.classList.toggle('error', isError);
             }
+
+            savePostFxState();
         }
 
         btnPostFxPanel.onclick = () => {
             setPostPanelVisible(!postPanelVisible);
         };
 
+        // ── Post FX persistence via localStorage ──
+        const POSTFX_STORAGE_KEY = 'maxjs_postfx_state';
+
+        function savePostFxState() {
+            try {
+                const state = ssgiFx.getState();
+                const payload = { toneMapping: currentToneMapping, exposure: currentExposure, fx: state };
+                localStorage.setItem(POSTFX_STORAGE_KEY, JSON.stringify(payload));
+            } catch {}
+        }
+
+        function restorePostFxState() {
+            try {
+                const raw = localStorage.getItem(POSTFX_STORAGE_KEY);
+                if (!raw) return;
+                const saved = JSON.parse(raw);
+
+                if (saved.toneMapping && toneMappingModes[saved.toneMapping] != null) {
+                    currentToneMapping = saved.toneMapping;
+                    renderer.toneMapping = toneMappingModes[currentToneMapping];
+                }
+                if (Number.isFinite(saved.exposure)) {
+                    currentExposure = saved.exposure;
+                    renderer.toneMappingExposure = currentExposure;
+                }
+
+                const fx = saved.fx;
+                if (!fx) return;
+
+                for (const section of postFxSections) {
+                    const saved = fx[section.key];
+                    if (!saved) continue;
+                    const wasEnabled = saved.enabled;
+                    delete saved.enabled;
+                    // Apply values first (without triggering rebuild per-param)
+                    section.setValues(saved);
+                    // Then enable/disable
+                    if (wasEnabled) section.setEnabled(true);
+                }
+            } catch (e) {
+                console.warn('MaxJS: failed to restore post-FX state', e);
+            }
+        }
+
+        restorePostFxState();
         buildPostFxPanel();
         syncPostFxPanel(true);
 

@@ -78,6 +78,8 @@ target_link_libraries(${PLUGIN_NAME} PRIVATE
     mesh.lib
     bmm.lib
     Maxscrpt.lib
+    poly.lib
+    MNMath.lib
     comctl32.lib
     comdlg32.lib
     shlwapi.lib

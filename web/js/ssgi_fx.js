@@ -143,10 +143,10 @@ export function createSSGIController({
             samples: 16,
             distanceExponent: 1.0,
             distanceFallOff: 1.0,
-            radius: 0.25,
-            scale: 1.0,
+            radius: 0.5,
+            scale: 2.0,
             thickness: 1.0,
-            resolutionScale: 0.5,
+            resolutionScale: 1.0,
         },
         motionBlur: {
             enabled: false,

@@ -6,7 +6,7 @@
     <title>MaxJS</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { overflow: hidden; background: #1a1a2e; position: relative; width: 100vw; height: 100vh; }
+        body { overflow: hidden; background: #353535; position: relative; width: 100vw; height: 100vh; }
         canvas { display: block; }
         #splatLayer {
             position: absolute;
@@ -20,156 +20,317 @@
             pointer-events: none;
         }
         #hud {
-            position: absolute; top: 10px; left: 10px;
-            color: #999; font: 13px 'Segoe UI', sans-serif;
+            position: absolute; top: 8px; left: 8px;
+            color: rgba(180, 180, 180, 0.8);
+            font: 10px/1.4 'Segoe UI', system-ui, sans-serif;
             pointer-events: none;
             z-index: 20;
         }
         #info {
-            background: rgba(0,0,0,0.6); padding: 6px 10px;
-            border-radius: 4px; margin-bottom: 6px;
+            background: rgba(20, 20, 20, 0.55);
+            padding: 4px 8px;
+            border-radius: 6px;
+            margin-bottom: 5px;
+            border: 1px solid rgba(255, 255, 255, 0.06);
+            backdrop-filter: blur(16px);
         }
         #controls {
             pointer-events: auto;
             display: flex;
-            gap: 6px;
+            gap: 4px;
             flex-wrap: wrap;
             max-width: min(880px, calc(100vw - 32px));
         }
         #controls button {
-            background: rgba(40,40,60,0.8); color: #aaa; border: 1px solid #444;
-            padding: 4px 10px; border-radius: 3px; font: 12px 'Segoe UI', sans-serif;
+            background: rgba(255, 255, 255, 0.06);
+            color: #999;
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            padding: 3px 9px;
+            border-radius: 5px;
+            font: 10px/1 'Segoe UI', system-ui, sans-serif;
+            font-weight: 600;
+            letter-spacing: 0.03em;
+            text-transform: uppercase;
             cursor: pointer;
+            backdrop-filter: blur(12px);
+            transition: all 0.15s ease;
         }
-        #controls button.active { background: rgba(60,60,120,0.9); color: #ddd; border-color: #668; }
-        #controls button:hover { background: rgba(60,60,100,0.9); color: #ccc; }
+        #controls button.active {
+            background: rgba(64, 200, 176, 0.1);
+            color: #40c8b0;
+            border-color: rgba(64, 200, 176, 0.35);
+        }
+        #controls button:hover {
+            background: rgba(255, 255, 255, 0.1);
+            color: #ccc;
+        }
+        /* ── Side Panel ─────────────────────────────── */
+        .sidepanel-resize {
+            position: absolute;
+            left: 0; top: 0; bottom: 0;
+            width: 5px;
+            cursor: ew-resize;
+            z-index: 2;
+            border-radius: 10px 0 0 10px;
+            transition: background 0.15s ease;
+        }
+        .sidepanel-resize:hover,
+        .sidepanel-resize.active {
+            background: rgba(64, 200, 176, 0.25);
+        }
         .sidepanel {
             position: absolute;
-            top: 12px;
-            right: 12px;
-            width: min(340px, calc(100vw - 24px));
-            max-height: calc(100vh - 24px);
-            padding: 14px;
-            border-radius: 14px;
-            border: 1px solid rgba(106, 118, 158, 0.35);
-            background: rgba(13, 17, 29, 0.92);
-            color: #cdd5e4;
-            font: 12px 'Segoe UI', sans-serif;
-            backdrop-filter: blur(16px);
-            box-shadow: 0 18px 50px rgba(0, 0, 0, 0.35);
-            overflow: auto;
+            top: 8px;
+            right: 8px;
+            width: min(280px, calc(100vw - 16px));
+            min-width: 200px;
+            max-width: calc(100vw - 16px);
+            max-height: calc(100vh - 16px);
+            padding: 8px;
+            border-radius: 10px;
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            background: rgba(30, 30, 30, 0.72);
+            color: #bbb;
+            font: 11px/1.4 'Segoe UI', system-ui, sans-serif;
+            backdrop-filter: blur(28px) saturate(1.4);
+            -webkit-backdrop-filter: blur(28px) saturate(1.4);
+            box-shadow:
+                0 8px 32px rgba(0, 0, 0, 0.5),
+                inset 0 1px 0 rgba(255, 255, 255, 0.06),
+                inset 0 -1px 0 rgba(0, 0, 0, 0.2);
+            overflow-y: auto;
+            overflow-x: hidden;
             opacity: 0;
             pointer-events: none;
-            transform: translateX(24px);
-            transition: opacity 0.18s ease, transform 0.18s ease;
+            transform: translateX(14px) scale(0.98);
+            transition: opacity 0.2s ease, transform 0.2s cubic-bezier(0.16, 1, 0.3, 1);
             z-index: 30;
+            scrollbar-width: thin;
+            scrollbar-color: rgba(120,120,120,0.2) transparent;
         }
+        .sidepanel::-webkit-scrollbar { width: 4px; }
+        .sidepanel::-webkit-scrollbar-track { background: transparent; }
+        .sidepanel::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.08); border-radius: 2px; }
         .sidepanel.visible {
             opacity: 1;
             pointer-events: auto;
-            transform: translateX(0);
+            transform: translateX(0) scale(1);
         }
         .sidepanel-header {
-            display: flex;
-            align-items: flex-start;
-            justify-content: space-between;
-            gap: 10px;
-            margin-bottom: 12px;
-        }
-        .sidepanel-title {
-            font-size: 15px;
-            font-weight: 600;
-            color: #eef2ff;
-        }
-        .sidepanel-subtitle {
-            margin-top: 4px;
-            color: #7f8aa3;
-            font-size: 11px;
-        }
-        .sidepanel button,
-        .fx-toggle {
-            background: rgba(38, 44, 70, 0.9);
-            color: #ccd3e5;
-            border: 1px solid rgba(110, 120, 154, 0.4);
-            border-radius: 8px;
-            padding: 6px 10px;
-            font: 12px 'Segoe UI', sans-serif;
-            cursor: pointer;
-        }
-        .sidepanel button:hover,
-        .fx-toggle:hover {
-            background: rgba(58, 66, 102, 0.95);
-        }
-        .fx-toggle.active {
-            background: rgba(91, 118, 215, 0.28);
-            border-color: rgba(124, 167, 255, 0.85);
-            color: #eef3ff;
-        }
-        .sidepanel button:disabled,
-        .fx-toggle:disabled,
-        .sidepanel input:disabled {
-            opacity: 0.45;
-            cursor: not-allowed;
-        }
-        .sidepanel-body {
-            display: grid;
-            gap: 12px;
-        }
-        .fx-section {
-            border: 1px solid rgba(100, 112, 146, 0.28);
-            border-radius: 12px;
-            background: rgba(25, 31, 52, 0.7);
-            padding: 12px;
-        }
-        .fx-section-header {
-            display: flex;
-            align-items: flex-start;
-            justify-content: space-between;
-            gap: 10px;
-        }
-        .fx-section-title {
-            font-size: 13px;
-            font-weight: 600;
-            color: #eef2ff;
-        }
-        .fx-section-copy {
-            margin-top: 4px;
-            line-height: 1.35;
-            color: #8e98ad;
-            font-size: 11px;
-        }
-        .fx-grid {
-            display: grid;
-            gap: 10px;
-            margin-top: 12px;
-        }
-        .fx-control {
-            display: grid;
-            gap: 6px;
-        }
-        .fx-control-head,
-        .fx-check {
             display: flex;
             align-items: center;
             justify-content: space-between;
             gap: 8px;
+            margin-bottom: 6px;
+            padding-bottom: 6px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+        }
+        .sidepanel-title {
+            font-size: 12px;
+            font-weight: 700;
+            color: #ddd;
+        }
+        .sidepanel-subtitle {
+            color: #888;
+            font-size: 10px;
+        }
+        .sidepanel button,
+        .fx-toggle {
+            background: rgba(255, 255, 255, 0.06);
+            color: #aaa;
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            border-radius: 5px;
+            padding: 3px 7px;
+            font: 10px/1 'Segoe UI', system-ui, sans-serif;
+            font-weight: 600;
+            letter-spacing: 0.02em;
+            text-transform: uppercase;
+            cursor: pointer;
+            transition: all 0.15s ease;
+            white-space: nowrap;
+            backdrop-filter: blur(4px);
+        }
+        .sidepanel button:hover,
+        .fx-toggle:hover {
+            background: rgba(255, 255, 255, 0.1);
+            color: #ccc;
+        }
+        .fx-toggle.active {
+            background: rgba(64, 200, 176, 0.12);
+            border-color: rgba(64, 200, 176, 0.5);
+            color: #40c8b0;
+            box-shadow: 0 0 8px rgba(64, 200, 176, 0.1);
+        }
+        .sidepanel button:disabled,
+        .fx-toggle:disabled,
+        .sidepanel input:disabled {
+            opacity: 0.35;
+            cursor: not-allowed;
+        }
+        .sidepanel-body {
+            display: grid;
+            gap: 4px;
+        }
+        /* ── FX Sections ───────────────────────────── */
+        .fx-section {
+            border: 1px solid rgba(255, 255, 255, 0.05);
+            border-radius: 7px;
+            background: rgba(255, 255, 255, 0.03);
+            padding: 6px;
+            transition: background 0.15s ease, border-color 0.15s ease;
+        }
+        .fx-section:hover {
+            background: rgba(255, 255, 255, 0.045);
+            border-color: rgba(255, 255, 255, 0.08);
+        }
+        .fx-section-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 6px;
+        }
+        .fx-section-title {
+            font-size: 10px;
+            font-weight: 700;
+            color: #ccc;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+        }
+        .fx-section-copy {
+            display: none;
+        }
+        .fx-grid {
+            display: grid;
+            gap: 3px;
+            margin-top: 5px;
+        }
+        .fx-control {
+            display: grid;
+            gap: 1px;
+        }
+        .fx-control-head {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 6px;
+            font-size: 10px;
+            color: #999;
+        }
+        .fx-check {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 6px;
+            font-size: 10px;
+            color: #999;
         }
         .fx-value {
-            color: #edf2ff;
+            color: #ddd;
+            font-size: 10px;
+            font-weight: 600;
             font-variant-numeric: tabular-nums;
         }
+        /* ── Custom Range Slider ───────────────────── */
         .fx-range {
+            -webkit-appearance: none;
+            appearance: none;
             width: 100%;
-            accent-color: #86a8ff;
+            height: 3px;
+            border-radius: 2px;
+            background: rgba(255, 255, 255, 0.1);
+            outline: none;
+            cursor: pointer;
+        }
+        .fx-range::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background: #40c8b0;
+            border: 1px solid #2a9a85;
+            box-shadow: 0 0 4px rgba(60, 200, 175, 0.3);
+            cursor: pointer;
+            transition: box-shadow 0.12s ease, transform 0.1s ease;
+        }
+        .fx-range::-webkit-slider-thumb:hover {
+            transform: scale(1.25);
+            box-shadow: 0 0 8px rgba(60, 200, 175, 0.5);
+        }
+        .fx-range::-webkit-slider-thumb:active {
+            transform: scale(1.1);
+            background: #50d8c0;
+        }
+        .fx-range::-moz-range-thumb {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background: #40c8b0;
+            border: 1px solid #2a9a85;
+            box-shadow: 0 0 4px rgba(60, 200, 175, 0.3);
+            cursor: pointer;
+        }
+        .fx-range::-moz-range-track {
+            height: 3px;
+            border-radius: 2px;
+            background: rgba(255, 255, 255, 0.1);
+        }
+        /* ── Custom Checkbox (toggle switch) ────────── */
+        .fx-check input[type="checkbox"] {
+            -webkit-appearance: none;
+            appearance: none;
+            width: 26px;
+            height: 13px;
+            border-radius: 7px;
+            background: rgba(255, 255, 255, 0.08);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            cursor: pointer;
+            position: relative;
+            flex-shrink: 0;
+            transition: background 0.15s ease, border-color 0.15s ease;
+        }
+        .fx-check input[type="checkbox"]::after {
+            content: '';
+            position: absolute;
+            top: 1px;
+            left: 1px;
+            width: 9px;
+            height: 9px;
+            border-radius: 50%;
+            background: rgba(255, 255, 255, 0.3);
+            transition: transform 0.15s cubic-bezier(0.16, 1, 0.3, 1), background 0.15s ease;
+        }
+        .fx-check input[type="checkbox"]:checked {
+            background: rgba(64, 200, 176, 0.15);
+            border-color: rgba(64, 200, 176, 0.4);
+        }
+        .fx-check input[type="checkbox"]:checked::after {
+            transform: translateX(13px);
+            background: #40c8b0;
+            box-shadow: 0 0 4px rgba(64, 200, 176, 0.4);
         }
         .fx-note {
-            margin-top: 8px;
-            min-height: 15px;
-            color: #7e899d;
-            font-size: 11px;
+            margin-top: 3px;
+            min-height: 0;
+            color: #777;
+            font-size: 9px;
+            line-height: 1.3;
         }
+        .fx-note:empty { display: none; }
         .fx-note.error {
-            color: #ffb4b4;
+            color: #e88;
+        }
+        .fx-row {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .fx-row-label {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            min-width: 48px;
+            font-size: 10px;
+            color: #999;
         }
     </style>
 </head>
@@ -209,6 +370,7 @@
         import * as THREE_STD from 'three-std';
         import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
         import { HDRLoader } from 'three/addons/loaders/HDRLoader.js';
+        import { EXRLoader } from 'three/addons/loaders/EXRLoader.js';
         import { LightProbeGenerator } from 'three/addons/lights/LightProbeGenerator.js';
         import { RectAreaLightTexturesLib } from 'three/addons/lights/RectAreaLightTexturesLib.js';
         import { hashBlur } from 'three/addons/tsl/display/hashBlur.js';
@@ -229,7 +391,7 @@
         import { createSSGIController } from './js/ssgi_fx.js';
 
         // ── Scene Setup (Z-up, matching Max) ────────────────
-        const hiddenBackgroundColor = 0x1a1a2e;
+        const hiddenBackgroundColor = 0x353535;
         const scene = new THREE.Scene();
         scene.background = new THREE.Color(hiddenBackgroundColor);
 
@@ -302,16 +464,28 @@
         controls.enabled = false;  // cam lock ON by default
 
         // Grid on XY plane (Z-up)
-        const grid = new THREE.GridHelper(200, 20, 0x444466, 0x2a2a44);
+        const grid = new THREE.GridHelper(200, 20, 0x555555, 0x444444);
         grid.rotation.x = Math.PI / 2;  // Rotate to XY plane for Z-up
         scene.add(grid);
 
         // Lights (fallback, hidden when HDRI loads)
+        // Default lighting — neutral, camera-aligned
         const defaultLights = new THREE.Group();
-        defaultLights.add(new THREE.AmbientLight(0x404060, 2));
-        const sun = new THREE.DirectionalLight(0xffffff, 3);
-        sun.position.set(50, -50, 100);
-        defaultLights.add(sun);
+        const defaultKey = new THREE.DirectionalLight(0xffffff, 2.5);
+        defaultKey.castShadow = true;
+        defaultKey.shadow.mapSize.set(2048, 2048);
+        defaultKey.shadow.camera.near = 0.1;
+        defaultKey.shadow.camera.far = 2000;
+        defaultKey.shadow.camera.left = -500;
+        defaultKey.shadow.camera.right = 500;
+        defaultKey.shadow.camera.top = 500;
+        defaultKey.shadow.camera.bottom = -500;
+        defaultKey.shadow.bias = -0.001;
+        defaultKey.shadow.normalBias = 0.02;
+        const defaultFill = new THREE.DirectionalLight(0xe8e8e8, 0.8);
+        defaultFill.position.set(-1, 1, 0.5);
+        defaultLights.add(defaultKey);
+        defaultLights.add(defaultFill);
         scene.add(defaultLights);
         const lightProbe = new THREE.LightProbe();
         scene.add(lightProbe);
@@ -319,6 +493,7 @@
         // ── Loaders & Caches ────────────────────────────────
         const textureLoader = new THREE.TextureLoader();
         const rgbeLoader = new HDRLoader();
+        const exrLoader = new EXRLoader();
         textureLoader.setCrossOrigin?.('anonymous');
         rgbeLoader.setCrossOrigin?.('anonymous');
         const pmremGenerator = new THREE.PMREMGenerator(renderer);
@@ -348,6 +523,8 @@
                 perfHud.setStatus(`MaxJS - ${message}`);
             },
         });
+        // Default camera light available for contact shadows from the start
+        if (ssgiFx.setMainLight) ssgiFx.setMainLight(defaultKey);
 
         function queueSplatMutation(work) {
             splatMutationQueue = splatMutationQueue
@@ -604,6 +781,19 @@
         let currentEnvParams = null;
         let hasLightProbeData = false;
         let hdriLoadGeneration = 0;
+
+        // Local HDRI override (independent of Max environment)
+        let localHdriObjectUrl = null;   // file loaded in memory
+        let localHdriEnvMap = null;      // cached PMREM texture
+        let localHdriEnabled = true;     // on/off toggle (file stays loaded)
+        let localHdriFileName = '';
+        let localHdriRotation = 0;
+        let localHdriIntensity = 1.0;
+        let localHdriShowBg = false;
+        let localHdriBlur = 0;
+
+        function isLocalHdriLoaded() { return localHdriObjectUrl != null; }
+        function isLocalHdriActive() { return isLocalHdriLoaded() && localHdriEnabled; }
 
         function applyLightProbeState() {
             lightProbe.intensity = lightProbeEnabled ? lightProbeIntensity : 0.0;
@@ -889,6 +1079,105 @@
                 if (envVisible) scene.background = new THREE.Color(hiddenBackgroundColor);
                 defaultLights.visible = true;
             });
+        }
+
+        // ── Local HDRI (independent of Max) ─────────────────
+        function loadLocalHDRIFile(file) {
+            if (localHdriObjectUrl) URL.revokeObjectURL(localHdriObjectUrl);
+            if (localHdriEnvMap) { localHdriEnvMap.dispose(); localHdriEnvMap = null; }
+            localHdriObjectUrl = URL.createObjectURL(file);
+            localHdriFileName = file.name;
+            localHdriEnabled = true;
+
+            const isExr = file.name.toLowerCase().endsWith('.exr');
+            const loader = isExr ? exrLoader : rgbeLoader;
+
+            hdriLoadGeneration += 1;
+            const loadGen = hdriLoadGeneration;
+
+            loader.load(localHdriObjectUrl, async (hdrTex) => {
+                if (loadGen !== hdriLoadGeneration) { hdrTex.dispose(); return; }
+                hdrTex.mapping = THREE.EquirectangularReflectionMapping;
+                localHdriEnvMap = pmremGenerator.fromEquirectangular(hdrTex).texture;
+                applyLocalHDRIToScene();
+                currentHdriUrl = localHdriObjectUrl;
+                if (lightProbeEnabled) {
+                    await updateLightProbeFromHDRI(hdrTex, 'local-' + localHdriFileName, loadGen);
+                }
+                hdrTex.dispose();
+                savePostFxState();
+                syncHdriPanel();
+            }, undefined, (error) => {
+                console.error('MaxJS local HDRI load failed', error);
+                clearLocalHDRI();
+            });
+        }
+
+        function applyLocalHDRIToScene() {
+            if (!localHdriEnvMap) return;
+            if (localHdriEnabled) {
+                scene.environment = localHdriEnvMap;
+                scene.environmentIntensity = localHdriIntensity;
+                scene.environmentRotation.set(0, localHdriRotation * Math.PI / 180, 0);
+                scene.backgroundRotation.set(0, localHdriRotation * Math.PI / 180, 0);
+                scene.backgroundBlurriness = localHdriBlur;
+                if (localHdriShowBg) {
+                    scene.background = localHdriEnvMap;
+                    scene.backgroundIntensity = localHdriIntensity;
+                } else {
+                    scene.background = new THREE.Color(hiddenBackgroundColor);
+                }
+                defaultLights.visible = false;
+            } else {
+                scene.environment = null;
+                scene.background = new THREE.Color(hiddenBackgroundColor);
+                defaultLights.visible = true;
+            }
+        }
+
+        function applyLocalHDRISettings() {
+            if (!isLocalHdriActive()) return;
+            applyLocalHDRIToScene();
+        }
+
+        function toggleLocalHDRI(enabled) {
+            localHdriEnabled = enabled;
+            applyLocalHDRIToScene();
+            savePostFxState();
+            syncHdriPanel();
+        }
+
+        function clearLocalHDRI() {
+            localHdriFileName = '';
+            localHdriEnabled = true;
+            if (localHdriEnvMap) { localHdriEnvMap.dispose(); localHdriEnvMap = null; }
+            if (localHdriObjectUrl) { URL.revokeObjectURL(localHdriObjectUrl); localHdriObjectUrl = null; }
+            currentHdriUrl = null;
+            currentHdriProbeSignature = '';
+            scene.environment = null;
+            scene.environmentIntensity = 1.0;
+            scene.environmentRotation.set(0, 0, 0);
+            scene.backgroundRotation.set(0, 0, 0);
+            scene.backgroundBlurriness = 0;
+            scene.background = new THREE.Color(hiddenBackgroundColor);
+            clearLightProbe();
+            defaultLights.visible = true;
+            savePostFxState();
+            syncHdriPanel();
+        }
+
+        function syncHdriPanel() {
+            const nameEl = document.getElementById('fx-hdri-name');
+            const toggleEl = document.getElementById('fx-hdri-toggle');
+            if (nameEl) {
+                nameEl.textContent = isLocalHdriLoaded()
+                    ? localHdriFileName + (localHdriEnabled ? '' : ' (off)')
+                    : 'No HDRI loaded';
+            }
+            if (toggleEl) {
+                toggleEl.textContent = localHdriEnabled ? 'On' : 'Off';
+                toggleEl.classList.toggle('active', localHdriEnabled && isLocalHdriLoaded());
+            }
         }
 
         // ── Sky Environment ──────────────────────────────────
@@ -1433,6 +1722,107 @@
             }
         });
 
+        // ── Clay Mode ───────────────────────────────────
+        let clayModeActive = false;
+        let clayPreFxSnapshot = null;
+        const clayMat = new THREE.MeshStandardMaterial({
+            color: 0x9d3d31, roughness: 0.85, metalness: 0.0, side: THREE.DoubleSide,
+        });
+
+        function enterClayMode() {
+            // Snapshot current FX state
+            clayPreFxSnapshot = {
+                ssgi: ssgiFx.isEnabled(),
+                ssr: ssgiFx.isSSREnabled(),
+                gtao: ssgiFx.isGTAOEnabled(),
+                bloom: ssgiFx.isBloomEnabled(),
+                toonOutline: ssgiFx.isToonOutlineEnabled(),
+                motionBlur: ssgiFx.isMotionBlurEnabled(),
+                traa: ssgiFx.isTRAAEnabled(),
+                contactShadow: ssgiFx.isContactShadowEnabled(),
+                retro: ssgiFx.isRetroEnabled(),
+                volumetric: ssgiFx.isVolumetricEnabled(),
+                pixel: ssgiFx.isPixelEnabled(),
+                fog: ssgiFx.isFogEnabled(),
+            };
+            // Disable everything
+            ssgiFx.setEnabled(false);
+            ssgiFx.setSSREnabled(false);
+            ssgiFx.setBloomEnabled(false);
+            ssgiFx.setToonOutlineEnabled(false);
+            ssgiFx.setMotionBlurEnabled(false);
+            ssgiFx.setTRAAEnabled(false);
+            ssgiFx.setContactShadowEnabled(false);
+            ssgiFx.setRetroEnabled(false);
+            ssgiFx.setVolumetricEnabled(false);
+            ssgiFx.setPixelEnabled(false);
+            ssgiFx.setFogEnabled(false);
+            // Force GTAO on
+            ssgiFx.setGTAOEnabled(true);
+
+            // Swap materials
+            for (const [, mesh] of nodeMap) {
+                if (!mesh.isMesh) continue;
+                mesh.userData._origMaterial = mesh.material;
+                mesh.material = Array.isArray(mesh.userData._origMaterial)
+                    ? mesh.userData._origMaterial.map(() => clayMat) : clayMat;
+            }
+        }
+
+        function exitClayMode() {
+            // Restore materials
+            for (const [, mesh] of nodeMap) {
+                if (!mesh.isMesh) continue;
+                if (mesh.userData._origMaterial) {
+                    mesh.material = mesh.userData._origMaterial;
+                    delete mesh.userData._origMaterial;
+                }
+            }
+            // Restore FX state
+            if (clayPreFxSnapshot) {
+                ssgiFx.setGTAOEnabled(clayPreFxSnapshot.gtao);
+                ssgiFx.setEnabled(clayPreFxSnapshot.ssgi);
+                ssgiFx.setSSREnabled(clayPreFxSnapshot.ssr);
+                ssgiFx.setBloomEnabled(clayPreFxSnapshot.bloom);
+                ssgiFx.setToonOutlineEnabled(clayPreFxSnapshot.toonOutline);
+                ssgiFx.setMotionBlurEnabled(clayPreFxSnapshot.motionBlur);
+                ssgiFx.setTRAAEnabled(clayPreFxSnapshot.traa);
+                ssgiFx.setContactShadowEnabled(clayPreFxSnapshot.contactShadow);
+                ssgiFx.setRetroEnabled(clayPreFxSnapshot.retro);
+                ssgiFx.setVolumetricEnabled(clayPreFxSnapshot.volumetric);
+                ssgiFx.setPixelEnabled(clayPreFxSnapshot.pixel);
+                ssgiFx.setFogEnabled(clayPreFxSnapshot.fog);
+                clayPreFxSnapshot = null;
+            }
+        }
+
+        bridge.on('clay_mode', msg => {
+            const enabled = !!msg.enabled;
+            if (enabled === clayModeActive) return;
+            clayModeActive = enabled;
+            if (enabled) enterClayMode(); else exitClayMode();
+            syncPostFxPanel(true);
+        });
+
+        // ── Shadow Mode (synced to Nitrous viewport shadows toggle) ──
+        let nitrousShadowActive = false;
+        bridge.on('shadow_mode', msg => {
+            const enabled = !!msg.enabled;
+            if (enabled === nitrousShadowActive) return;
+            nitrousShadowActive = enabled;
+            // Toggle castShadow on all lights
+            defaultKey.castShadow = enabled;
+            for (const [, light] of lightHandleMap) {
+                if (light.isDirectionalLight || light.isSpotLight || light.isPointLight) {
+                    light.castShadow = enabled;
+                }
+            }
+            // Also enable receiveShadow on all meshes
+            for (const [, mesh] of nodeMap) {
+                if (mesh.isMesh) mesh.receiveShadow = enabled;
+            }
+        });
+
         window.addEventListener('error', e => {
             reportBridgeError('runtime error', e.error || e.message);
         });
@@ -1563,10 +1953,12 @@
                         mesh.geometry.dispose();
                         mesh.geometry = geom;
                     }
-                    mesh.material = mat;
+                    if (clayModeActive) { mesh.userData._origMaterial = mat; }
+                    else { mesh.material = mat; }
                 } else {
                     if (!geom) continue;
-                    mesh = new THREE.Mesh(geom, mat);
+                    mesh = new THREE.Mesh(geom, clayModeActive ? clayMat : mat);
+                    if (clayModeActive) mesh.userData._origMaterial = mat;
                     mesh.matrixAutoUpdate = false;
                     mesh.name = nd.n;
                     mesh.frustumCulled = false;
@@ -1583,8 +1975,10 @@
             }
 
             if (msg.camera) applyCamera(msg.camera);
-            if (msg.env?.sky) applySky(msg.env.sky);
-            else if (msg.env?.hdri) { removeSky(); loadHDRI(msg.env); }
+            if (!isLocalHdriLoaded()) {
+                if (msg.env?.sky) applySky(msg.env.sky);
+                else if (msg.env?.hdri) { removeSky(); loadHDRI(msg.env); }
+            }
             if (msg.fog) ssgiFx.setFogFromScene(msg.fog);
             if (msg.lights) applyLights(msg.lights);
             reconcileSplats(msg.splats ?? []);
@@ -1621,7 +2015,7 @@
 
         // ── Environment/Fog live update (standalone, change-only) ──
         bridge.on('env_update', msg => {
-            if (msg.env) {
+            if (msg.env && !isLocalHdriLoaded()) {
                 if (msg.env.sky) {
                     applySky(msg.env.sky);
                 } else if (msg.env.hdri) {
@@ -1776,10 +2170,12 @@
                         mesh.geometry.dispose();
                         mesh.geometry = geom;
                     }
-                    mesh.material = mat;
+                    if (clayModeActive) { mesh.userData._origMaterial = mat; }
+                    else { mesh.material = mat; }
                 } else {
                     if (!geom) continue; // Never create an empty mesh entry
-                    mesh = new THREE.Mesh(geom, mat);
+                    mesh = new THREE.Mesh(geom, clayModeActive ? clayMat : mat);
+                    if (clayModeActive) mesh.userData._origMaterial = mat;
                     mesh.matrixAutoUpdate = false;
                     mesh.name = nd.n;
                     mesh.frustumCulled = false;
@@ -1796,8 +2192,10 @@
             }
 
             if (meta.camera) applyCamera(meta.camera);
-            if (meta.env?.sky) applySky(meta.env.sky);
-            else if (meta.env?.hdri) { removeSky(); loadHDRI(meta.env); }
+            if (!isLocalHdriLoaded()) {
+                if (meta.env?.sky) applySky(meta.env.sky);
+                else if (meta.env?.hdri) { removeSky(); loadHDRI(meta.env); }
+            }
             if (meta.fog) ssgiFx.setFogFromScene(meta.fog);
             if (meta.lights) applyLights(meta.lights);
             reconcileSplats(meta.splats ?? []);
@@ -2109,11 +2507,10 @@
                 }
             }
 
-            if (ssgiFx.setMainLight) {
-                ssgiFx.setMainLight(mainDirectionalLight);
-            }
-
             defaultLights.visible = appliedLightCount === 0 && !currentHdriUrl && !skyActive;
+            if (ssgiFx.setMainLight) {
+                ssgiFx.setMainLight(mainDirectionalLight || (defaultLights.visible ? defaultKey : null));
+            }
         }
 
         function applyLights(lightsData) {
@@ -2141,11 +2538,10 @@
                 }
             }
 
-            if (ssgiFx.setMainLight) {
-                ssgiFx.setMainLight(mainDirectionalLight);
-            }
-
             defaultLights.visible = appliedLightCount === 0 && !currentHdriUrl && !skyActive;
+            if (ssgiFx.setMainLight) {
+                ssgiFx.setMainLight(mainDirectionalLight || (defaultLights.visible ? defaultKey : null));
+            }
         }
 
         // ── Camera Sync (Z-up, raw from Max) ────────────────
@@ -2244,8 +2640,8 @@
             'AgX': THREE.AgXToneMapping,
             'Neutral': THREE.NeutralToneMapping,
         };
-        let currentToneMapping = 'ACES Filmic';
-        let currentExposure = 1.2;
+        let currentToneMapping = 'None';
+        let currentExposure = 1.0;
 
         const postFxSections = [
             {
@@ -2505,11 +2901,8 @@
             const sectionsHtml = postFxSections.map(section => `
                 <section class="fx-section" data-fx-section="${section.key}">
                     <div class="fx-section-header">
-                        <div>
-                            <div class="fx-section-title">${section.title}</div>
-                            <div class="fx-section-copy">${section.copy}</div>
-                        </div>
-                        <button class="fx-toggle" type="button" id="fx-toggle-${section.key}">${section.title}: OFF</button>
+                        <div class="fx-section-title">${section.title}</div>
+                        <button class="fx-toggle" type="button" id="fx-toggle-${section.key}">Off</button>
                     </div>
                     <div class="fx-grid">
                         ${section.controls.map(control => {
@@ -2552,33 +2945,60 @@
             ).join('');
 
             postPanel.innerHTML = `
+                <div class="sidepanel-resize" id="panelResizeHandle"></div>
                 <div class="sidepanel-header">
                     <div>
                         <div class="sidepanel-title">Post FX</div>
                         <div class="sidepanel-subtitle" id="postPanelStatus">${rendererBackendLabel}</div>
                     </div>
+                    <button id="btnPostPanelReset" type="button" style="border-color:rgba(200,80,80,0.3)">Reset</button>
                     <button id="btnPostPanelClose" type="button">Hide</button>
                 </div>
                 <div class="sidepanel-body">
                     <section class="fx-section">
                         <div class="fx-section-header">
-                            <div>
-                                <div class="fx-section-title">Tone Mapping</div>
-                            </div>
+                            <div class="fx-section-title">Tone Mapping</div>
                         </div>
                         <div class="fx-grid">
-                            <label class="fx-row">
-                                <div class="fx-row-label"><span>Mode</span></div>
-                                <select id="fx-tonemapping-mode" style="background:rgba(30,34,55,0.9);color:#ccd3e5;border:1px solid rgba(110,120,154,0.4);border-radius:4px;padding:3px 6px;font:12px 'Segoe UI',sans-serif;width:100%">
-                                    ${tmOptions}
-                                </select>
-                            </label>
-                            <label class="fx-row">
-                                <div class="fx-row-label">
+                            <select id="fx-tonemapping-mode" style="background:rgba(255,255,255,0.05);color:#aaa;border:1px solid rgba(255,255,255,0.08);border-radius:5px;padding:3px 6px;font:10px 'Segoe UI',system-ui,sans-serif;width:100%;outline:none;cursor:pointer">
+                                ${tmOptions}
+                            </select>
+                            <label class="fx-control" for="fx-tonemapping-exp">
+                                <div class="fx-control-head">
                                     <span>Exposure</span>
                                     <span class="fx-value" id="fx-tonemapping-exp-val">${currentExposure.toFixed(1)}</span>
                                 </div>
                                 <input class="fx-range" id="fx-tonemapping-exp" type="range" min="0" max="5" step="0.1" value="${currentExposure}">
+                            </label>
+                        </div>
+                    </section>
+                    <section class="fx-section" data-fx-section="hdri">
+                        <div class="fx-section-header">
+                            <div class="fx-section-title">HDRI</div>
+                            <div style="display:flex;gap:3px">
+                                <button class="fx-toggle" id="fx-hdri-toggle" type="button">Off</button>
+                                <button id="fx-hdri-load" type="button">Load</button>
+                                <button id="fx-hdri-clear" type="button" style="border-color:#663030">Clear</button>
+                            </div>
+                            <input type="file" id="fx-hdri-file" accept=".hdr,.exr" style="display:none">
+                        </div>
+                        <div id="fx-hdri-name" style="font-size:9px;color:#777;padding:2px 0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">No HDRI loaded</div>
+                        <div class="fx-grid">
+                            <label class="fx-control" for="fx-hdri-intensity">
+                                <div class="fx-control-head"><span>Intensity</span><span class="fx-value" id="fx-hdri-intensity-val">1.0</span></div>
+                                <input class="fx-range" id="fx-hdri-intensity" type="range" min="0" max="5" step="0.05" value="1">
+                            </label>
+                            <label class="fx-control" for="fx-hdri-rotation">
+                                <div class="fx-control-head"><span>Rotation</span><span class="fx-value" id="fx-hdri-rotation-val">0</span></div>
+                                <input class="fx-range" id="fx-hdri-rotation" type="range" min="0" max="360" step="1" value="0">
+                            </label>
+                            <label class="fx-control" for="fx-hdri-blur">
+                                <div class="fx-control-head"><span>BG Blur</span><span class="fx-value" id="fx-hdri-blur-val">0.0</span></div>
+                                <input class="fx-range" id="fx-hdri-blur" type="range" min="0" max="1" step="0.01" value="0">
+                            </label>
+                            <label class="fx-check" for="fx-hdri-bg">
+                                <span>Background</span>
+                                <input id="fx-hdri-bg" type="checkbox">
                             </label>
                         </div>
                     </section>
@@ -2587,6 +3007,76 @@
             `;
 
             document.getElementById('btnPostPanelClose').onclick = () => setPostPanelVisible(false);
+            document.getElementById('btnPostPanelReset').onclick = () => {
+                // Reset all FX values to defaults then disable
+                // Does NOT touch HDRI or clay mode
+                const defaults = {
+                    ssgi: { radius: 8, thickness: 1.5, aoIntensity: 1.0, giIntensity: 1.5, expFactor: 1.5, sliceCount: 2, stepCount: 8, temporal: false },
+                    ssr: { quality: 0.45, blurQuality: 2, maxDistance: 0.5, opacity: 0.9, thickness: 0.015 },
+                    gtao: { samples: 16, distanceExponent: 1.0, distanceFallOff: 1.0, radius: 0.5, scale: 2.0, thickness: 1.0, resolutionScale: 1.0 },
+                    bloom: { strength: 0.4, radius: 0.2, threshold: 0.75 },
+                    toonOutline: { thickness: 0.003, alpha: 1.0 },
+                    motionBlur: { amount: 1.0, samples: 16 },
+                    traa: { useSubpixelCorrection: true, depthThreshold: 0.0005, edgeDepthDiff: 0.001, maxVelocityLength: 128 },
+                    contactShadow: { maxDistance: 0.1, thickness: 0.006, shadowIntensity: 0.85, quality: 0.3, temporal: false },
+                    retro: { wiggle: true, affineDistortion: 5.0, resolutionScale: 0.25, filterTextures: false, dither: false, colorDepth: 32, scanlines: false, scanlineIntensity: 0.3, scanlineDensity: 1.0, crt: false, vignetteIntensity: 0.3, bleeding: 0.001, curvature: 0.02 },
+                    volumetric: { intensity: 1.0, steps: 12, density: 0.5, denoise: 0.6, resolution: 0.25 },
+                    pixel: { pixelate: false, pixelSize: 4, chromatic: false, chromaticIntensity: 0.005, sharpen: false, sharpenStrength: 0.5, grain: false, grainIntensity: 0.08, brightness: 0, contrast: 0, saturation: 0 },
+                    fog: { type: 0, opacity: 1.0, near: 10, far: 500, density: 0.01, noiseScale: 0.005, noiseSpeed: 0.2, height: 20 },
+                };
+                if (clayModeActive) {
+                    // Clay owns the live FX state — reset the snapshot so exit restores to defaults
+                    clayPreFxSnapshot = { ssgi: false, ssr: false, gtao: false, bloom: false,
+                        toonOutline: false, motionBlur: false, traa: false, contactShadow: false,
+                        retro: false, volumetric: false, pixel: false, fog: false };
+                    // Still push default values so they're ready when clay exits
+                    for (const section of postFxSections) {
+                        if (defaults[section.key]) section.setValues(defaults[section.key]);
+                    }
+                } else {
+                    for (const section of postFxSections) {
+                        section.setEnabled(false);
+                        if (defaults[section.key]) section.setValues(defaults[section.key]);
+                    }
+                }
+                currentToneMapping = 'None';
+                currentExposure = 1.0;
+                renderer.toneMapping = toneMappingModes[currentToneMapping];
+                renderer.toneMappingExposure = currentExposure;
+                try { localStorage.removeItem(POSTFX_STORAGE_KEY); localStorage.removeItem('maxjs_panel_width'); } catch {}
+                postPanel.style.width = '';
+                buildPostFxPanel();
+                syncPostFxPanel(true);
+            };
+
+            // Panel horizontal resize
+            const resizeHandle = document.getElementById('panelResizeHandle');
+            let resizing = false;
+            resizeHandle.addEventListener('mousedown', (e) => {
+                e.preventDefault();
+                resizing = true;
+                resizeHandle.classList.add('active');
+                const startX = e.clientX;
+                const startW = postPanel.offsetWidth;
+                const onMove = (ev) => {
+                    const dx = startX - ev.clientX;
+                    const newW = Math.max(200, Math.min(startW + dx, window.innerWidth - 16));
+                    postPanel.style.width = newW + 'px';
+                };
+                const onUp = () => {
+                    resizing = false;
+                    resizeHandle.classList.remove('active');
+                    document.removeEventListener('mousemove', onMove);
+                    document.removeEventListener('mouseup', onUp);
+                    try { localStorage.setItem('maxjs_panel_width', postPanel.style.width); } catch {}
+                };
+                document.addEventListener('mousemove', onMove);
+                document.addEventListener('mouseup', onUp);
+            });
+            try {
+                const savedW = localStorage.getItem('maxjs_panel_width');
+                if (savedW) postPanel.style.width = savedW;
+            } catch {}
 
             // Tone mapping controls
             document.getElementById('fx-tonemapping-mode').onchange = (e) => {
@@ -2602,6 +3092,56 @@
                 expLabel.textContent = currentExposure.toFixed(1);
                 savePostFxState();
             };
+
+            // HDRI Environment controls
+            const hdriFileInput = document.getElementById('fx-hdri-file');
+            document.getElementById('fx-hdri-toggle').onclick = () => toggleLocalHDRI(!localHdriEnabled);
+            document.getElementById('fx-hdri-load').onclick = () => hdriFileInput.click();
+            document.getElementById('fx-hdri-clear').onclick = () => clearLocalHDRI();
+            hdriFileInput.onchange = (e) => {
+                const file = e.target.files?.[0];
+                if (file) loadLocalHDRIFile(file);
+                hdriFileInput.value = '';
+            };
+            const hdriRotSlider = document.getElementById('fx-hdri-rotation');
+            const hdriRotVal = document.getElementById('fx-hdri-rotation-val');
+            hdriRotSlider.oninput = (e) => {
+                localHdriRotation = parseFloat(e.target.value);
+                hdriRotVal.textContent = Math.round(localHdriRotation);
+                applyLocalHDRISettings();
+                savePostFxState();
+            };
+            const hdriIntSlider = document.getElementById('fx-hdri-intensity');
+            const hdriIntVal = document.getElementById('fx-hdri-intensity-val');
+            hdriIntSlider.oninput = (e) => {
+                localHdriIntensity = parseFloat(e.target.value);
+                hdriIntVal.textContent = localHdriIntensity.toFixed(2);
+                applyLocalHDRISettings();
+                savePostFxState();
+            };
+            const hdriBlurSlider = document.getElementById('fx-hdri-blur');
+            const hdriBlurVal = document.getElementById('fx-hdri-blur-val');
+            hdriBlurSlider.oninput = (e) => {
+                localHdriBlur = parseFloat(e.target.value);
+                hdriBlurVal.textContent = localHdriBlur.toFixed(2);
+                applyLocalHDRISettings();
+                savePostFxState();
+            };
+            const hdriBgCheck = document.getElementById('fx-hdri-bg');
+            hdriBgCheck.onchange = () => {
+                localHdriShowBg = hdriBgCheck.checked;
+                applyLocalHDRISettings();
+                savePostFxState();
+            };
+            // Sync initial state
+            hdriRotSlider.value = localHdriRotation;
+            hdriRotVal.textContent = Math.round(localHdriRotation);
+            hdriIntSlider.value = localHdriIntensity;
+            hdriIntVal.textContent = localHdriIntensity.toFixed(2);
+            hdriBlurSlider.value = localHdriBlur;
+            hdriBlurVal.textContent = localHdriBlur.toFixed(2);
+            hdriBgCheck.checked = localHdriShowBg;
+            syncHdriPanel();
 
             for (const section of postFxSections) {
                 section.toggleEl = document.getElementById(`fx-toggle-${section.key}`);
@@ -2673,7 +3213,7 @@
                 const enabled = section.isEnabled();
                 const disabled = !available || (section.requiresWebGPU && !supportsScreenSpaceEffects);
 
-                section.toggleEl.textContent = `${section.title}: ${enabled ? 'ON' : 'OFF'}`;
+                section.toggleEl.textContent = enabled ? 'On' : 'Off';
                 section.toggleEl.classList.toggle('active', enabled);
                 section.toggleEl.disabled = disabled;
 
@@ -2738,7 +3278,19 @@
         function savePostFxState() {
             try {
                 const state = ssgiFx.getState();
-                const payload = { toneMapping: currentToneMapping, exposure: currentExposure, fx: state };
+                const payload = {
+                    toneMapping: currentToneMapping,
+                    exposure: currentExposure,
+                    fx: state,
+                    hdri: {
+                        rotation: localHdriRotation,
+                        intensity: localHdriIntensity,
+                        showBg: localHdriShowBg,
+                        blur: localHdriBlur,
+                        enabled: localHdriEnabled,
+                        fileName: isLocalHdriLoaded() ? localHdriFileName : '',
+                    },
+                };
                 localStorage.setItem(POSTFX_STORAGE_KEY, JSON.stringify(payload));
             } catch {}
         }
@@ -2756,6 +3308,15 @@
                 if (Number.isFinite(saved.exposure)) {
                     currentExposure = saved.exposure;
                     renderer.toneMappingExposure = currentExposure;
+                }
+
+                // Restore HDRI settings (file must be re-picked, but sliders persist)
+                if (saved.hdri) {
+                    if (Number.isFinite(saved.hdri.rotation)) localHdriRotation = saved.hdri.rotation;
+                    if (Number.isFinite(saved.hdri.intensity)) localHdriIntensity = saved.hdri.intensity;
+                    if (Number.isFinite(saved.hdri.blur)) localHdriBlur = saved.hdri.blur;
+                    if (typeof saved.hdri.showBg === 'boolean') localHdriShowBg = saved.hdri.showBg;
+                    if (typeof saved.hdri.enabled === 'boolean') localHdriEnabled = saved.hdri.enabled;
                 }
 
                 const fx = saved.fx;
@@ -2890,6 +3451,10 @@
         function renderFrame() {
             processVRInput();
             controls.update();
+            // Default key light follows camera
+            if (defaultLights.visible) {
+                defaultKey.position.copy(camera.position);
+            }
             const renderStart = performance.now();
             ssgiFx.render();
             if (splatOverlay && splatHandleMap.size > 0) {

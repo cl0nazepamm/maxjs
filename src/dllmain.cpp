@@ -5,9 +5,13 @@
 #include <maxapi.h>
 #include <units.h>
 #include <triobj.h>
+#include <polyobj.h>
+#include <mnmesh.h>
 #include <notify.h>
 #include <stdmat.h>
 #include <ISceneEventManager.h>
+#include <Graphics/IViewportViewSetting.h>
+#include <Graphics/GraphicsEnums.h>
 #include <maxscript/maxscript.h>
 #include "sync_protocol.h"
 #include "threejs_material.h"
@@ -1063,32 +1067,126 @@ struct MeshCornerKeyHash {
     }
 };
 
-static bool ExtractMesh(INode* node, TimeValue t,
-                        std::vector<float>& verts,
-                        std::vector<float>& uvs,
-                        std::vector<int>& indices,
-                        std::vector<MatGroup>& groups) {
-    ObjectState os = node->EvalWorldState(t);
-    if (!os.obj || os.obj->SuperClassID() != GEOMOBJECT_CLASS_ID) return false;
-    if (IsThreeJSSplatClassID(os.obj->ClassID())) return false;
-    if (!os.obj->CanConvertToType(Class_ID(TRIOBJ_CLASS_ID, 0))) return false;
+// ── MNMesh (PolyObject) extraction — handles ngons correctly ──
+static bool ExtractMeshFromMNMesh(MNMesh& mn,
+                                  std::vector<float>& verts,
+                                  std::vector<float>& uvs,
+                                  std::vector<int>& indices,
+                                  std::vector<MatGroup>& groups) {
+    const int numFaces = mn.FNum();
+    const int numVerts = mn.VNum();
+    if (numFaces == 0 || numVerts == 0) return false;
 
-    TriObject* tri = static_cast<TriObject*>(
-        os.obj->ConvertToType(t, Class_ID(TRIOBJ_CLASS_ID, 0)));
-    if (!tri) return false;
+    // UV map channel 1
+    MNMap* uvMap = mn.M(1);
+    const bool hasUVs = uvMap && uvMap->GetFlag(MN_DEAD) == 0 && uvMap->numv > 0;
 
+    // Count live faces + sort by matID
+    struct FaceRef { int idx; MtlID matID; };
+    std::vector<FaceRef> liveFaces;
+    liveFaces.reserve(numFaces);
+    for (int i = 0; i < numFaces; i++) {
+        MNFace* f = mn.F(i);
+        if (!f || f->GetFlag(MN_DEAD)) continue;
+        liveFaces.push_back({ i, f->material });
+    }
+    if (liveFaces.empty()) return false;
+
+    // Check for multi-mat and sort
+    bool multiMat = false;
+    MtlID firstMat = liveFaces[0].matID;
+    for (auto& fr : liveFaces) {
+        if (fr.matID != firstMat) { multiMat = true; break; }
+    }
+    if (multiMat) {
+        std::sort(liveFaces.begin(), liveFaces.end(),
+            [](const FaceRef& a, const FaceRef& b) { return a.matID < b.matID; });
+    }
+
+    // Estimate output sizes
+    int estTris = 0;
+    for (auto& fr : liveFaces) estTris += mn.F(fr.idx)->deg - 2;
+    verts.reserve(numVerts * 3);
+    if (hasUVs) uvs.reserve(numVerts * 2);
+    indices.reserve(estTris * 3);
+
+    std::unordered_map<MeshCornerKey, int, MeshCornerKeyHash> vertMap;
+    Tab<int> triTab;
+    int curMatID = -1;
+
+    for (auto& fr : liveFaces) {
+        MNFace* face = mn.F(fr.idx);
+        const int deg = face->deg;
+        const DWORD smGrp = face->smGroup;
+        const int matID = (int)face->material;
+
+        if (matID != curMatID) {
+            curMatID = matID;
+            groups.push_back({ matID, (int)indices.size(), 0 });
+        }
+
+        // Get UV face (same degree as geo face)
+        MNMapFace* uvFace = (hasUVs && fr.idx < uvMap->numf) ? uvMap->F(fr.idx) : nullptr;
+
+        // Triangulate: GetTriangles returns indices into the face's vtx[] array
+        triTab.SetCount(0);
+        face->GetTriangles(triTab);
+        const int numTris = triTab.Count() / 3;
+
+        for (int ti = 0; ti < numTris; ti++) {
+            for (int tv = 0; tv < 3; tv++) {
+                int localIdx = triTab[ti * 3 + tv];  // index into face->vtx[]
+                DWORD posIdx = face->vtx[localIdx];
+                DWORD uvIdx = (uvFace && localIdx < uvFace->deg) ? uvFace->tv[localIdx] : 0;
+
+                MeshCornerKey key = { posIdx, uvIdx, smGrp };
+                auto it = vertMap.find(key);
+                if (it != vertMap.end()) {
+                    indices.push_back(it->second);
+                } else {
+                    int newIdx = (int)(verts.size() / 3);
+                    vertMap[key] = newIdx;
+
+                    Point3 p = mn.P(posIdx);
+                    verts.push_back(p.x);
+                    verts.push_back(p.y);
+                    verts.push_back(p.z);
+
+                    if (hasUVs && uvIdx < (DWORD)uvMap->numv) {
+                        UVVert uv = uvMap->v[uvIdx];
+                        uvs.push_back(uv.x);
+                        uvs.push_back(uv.y);
+                    } else if (hasUVs) {
+                        uvs.push_back(0.0f);
+                        uvs.push_back(0.0f);
+                    }
+
+                    indices.push_back(newIdx);
+                }
+            }
+            groups.back().count += 3;
+        }
+    }
+    return !indices.empty();
+}
+
+// ── TriObject (Mesh) extraction — standard triangle meshes ──
+static bool ExtractMeshFromTriObject(TriObject* tri, Object* srcObj,
+                                     std::vector<float>& verts,
+                                     std::vector<float>& uvs,
+                                     std::vector<int>& indices,
+                                     std::vector<MatGroup>& groups) {
     Mesh& mesh = tri->GetMesh();
     int nv = mesh.getNumVerts();
     int nf = mesh.getNumFaces();
 
     if (nv == 0 || nf == 0) {
-        if (tri != os.obj) tri->DeleteThis();
+        if (tri != srcObj) tri->DeleteThis();
         return false;
     }
 
     bool hasUVs = mesh.getNumTVerts() > 0;
 
-    // Collect face order sorted by matID only when multiple IDs exist.
     std::vector<int> faceOrder;
     faceOrder.reserve(nf);
     int firstMatID = (int)mesh.faces[0].getMatID();
@@ -1103,7 +1201,6 @@ static bool ExtractMesh(INode* node, TimeValue t,
         });
     }
 
-    // Build indexed mesh with split vertices at UV seams
     std::unordered_map<MeshCornerKey, int, MeshCornerKeyHash> vertMap;
     verts.reserve(nv * 3);
     if (hasUVs) uvs.reserve(nv * 2);
@@ -1114,7 +1211,6 @@ static bool ExtractMesh(INode* node, TimeValue t,
         int f = faceOrder[fi];
         int matID = (int)mesh.faces[f].getMatID();
 
-        // Track material groups
         if (matID != curMatID) {
             curMatID = matID;
             groups.push_back({ matID, (int)indices.size(), 0 });
@@ -1123,11 +1219,7 @@ static bool ExtractMesh(INode* node, TimeValue t,
         for (int v = 0; v < 3; v++) {
             DWORD posIdx = mesh.faces[f].v[v];
             DWORD uvIdx  = hasUVs ? mesh.tvFace[f].t[v] : 0;
-            MeshCornerKey key = {
-                posIdx,
-                uvIdx,
-                mesh.faces[f].getSmGroup()
-            };
+            MeshCornerKey key = { posIdx, uvIdx, mesh.faces[f].getSmGroup() };
 
             auto it = vertMap.find(key);
             if (it != vertMap.end()) {
@@ -1153,8 +1245,33 @@ static bool ExtractMesh(INode* node, TimeValue t,
         groups.back().count += 3;
     }
 
-    if (tri != os.obj) tri->DeleteThis();
+    if (tri != srcObj) tri->DeleteThis();
     return true;
+}
+
+// ── Unified ExtractMesh — MNMesh path for PolyObject, TriObject fallback ──
+static bool ExtractMesh(INode* node, TimeValue t,
+                        std::vector<float>& verts,
+                        std::vector<float>& uvs,
+                        std::vector<int>& indices,
+                        std::vector<MatGroup>& groups) {
+    ObjectState os = node->EvalWorldState(t);
+    if (!os.obj || os.obj->SuperClassID() != GEOMOBJECT_CLASS_ID) return false;
+    if (IsThreeJSSplatClassID(os.obj->ClassID())) return false;
+
+    // Prefer MNMesh path — handles ngons natively without ConvertToType
+    if (os.obj->IsSubClassOf(polyObjectClassID)) {
+        PolyObject* poly = static_cast<PolyObject*>(os.obj);
+        MNMesh& mn = poly->GetMesh();
+        return ExtractMeshFromMNMesh(mn, verts, uvs, indices, groups);
+    }
+
+    // Fallback: convert to TriObject for non-poly geometry (primitives, patches, etc.)
+    if (!os.obj->CanConvertToType(Class_ID(TRIOBJ_CLASS_ID, 0))) return false;
+    TriObject* tri = static_cast<TriObject*>(
+        os.obj->ConvertToType(t, Class_ID(TRIOBJ_CLASS_ID, 0)));
+    if (!tri) return false;
+    return ExtractMeshFromTriObject(tri, os.obj, verts, uvs, indices, groups);
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -1211,6 +1328,24 @@ static void GetViewportCamera(CameraData& cam) {
     cam.pos[0] = pos.x;    cam.pos[1] = pos.y;    cam.pos[2] = pos.z;
     cam.target[0] = tgt.x; cam.target[1] = tgt.y;  cam.target[2] = tgt.z;
     cam.up[0] = up.x;      cam.up[1] = up.y;       cam.up[2] = up.z;
+}
+
+static MaxSDK::Graphics::IViewportViewSetting* GetViewportSettings() {
+    Interface* ip = GetCOREInterface();
+    if (!ip) return nullptr;
+    ViewExp& vp = ip->GetActiveViewExp();
+    return static_cast<MaxSDK::Graphics::IViewportViewSetting*>(
+        vp.GetInterface(IVIEWPORT_SETTINGS_INTERFACE_ID));
+}
+
+static bool IsClayModeActive() {
+    auto* s = GetViewportSettings();
+    return s && s->GetViewportVisualStyle() == MaxSDK::Graphics::VisualStyleClay;
+}
+
+static bool IsNitrousShadowsEnabled() {
+    auto* s = GetViewportSettings();
+    return s && s->GetShadowsEnabled();
 }
 
 static bool NearlyEqualFloat(float a, float b, float epsilon = 1.0e-4f) {
@@ -1493,6 +1628,8 @@ public:
     std::unordered_map<ULONG, std::vector<MatGroup>> groupCache_; // cached material groups per node
     std::map<std::wstring, std::wstring> texDirMap_;    // dir → host
     int texDirCount_ = 0;
+    bool lastClayMode_ = false;
+    bool lastShadowMode_ = false;
     std::wstring activeWebDir_;
     std::uint64_t activeWebStamp_ = 0;
     bool fastCameraDirty_ = false;
@@ -2145,6 +2282,29 @@ public:
                 DetectSplatChanges();
             }
             if (tickCount_ % 15 == 0) DetectGeometryChanges();
+            if (tickCount_ % LIGHT_DETECT_TICKS == 0) PollViewportModes();
+        }
+    }
+
+    void PollViewportModes() {
+        if (!webview_) return;
+
+        bool clay = IsClayModeActive();
+        if (clay != lastClayMode_) {
+            lastClayMode_ = clay;
+            std::wstring msg = clay
+                ? L"{\"type\":\"clay_mode\",\"enabled\":true}"
+                : L"{\"type\":\"clay_mode\",\"enabled\":false}";
+            webview_->PostWebMessageAsJson(msg.c_str());
+        }
+
+        bool shadow = IsNitrousShadowsEnabled();
+        if (shadow != lastShadowMode_) {
+            lastShadowMode_ = shadow;
+            std::wstring msg = shadow
+                ? L"{\"type\":\"shadow_mode\",\"enabled\":true}"
+                : L"{\"type\":\"shadow_mode\",\"enabled\":false}";
+            webview_->PostWebMessageAsJson(msg.c_str());
         }
     }
 

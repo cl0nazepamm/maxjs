@@ -10,9 +10,11 @@
 #include <notify.h>
 #include <stdmat.h>
 #include <ISceneEventManager.h>
+#include <iInstanceMgr.h>
 #include <Graphics/IViewportViewSetting.h>
 #include <Graphics/GraphicsEnums.h>
 #include <maxscript/maxscript.h>
+#include "itreesinterface.h"
 #include "sync_protocol.h"
 #include "threejs_material.h"
 #include "threejs_lights.h"
@@ -1298,6 +1300,118 @@ static bool ExtractMeshFromTriObject(TriObject* tri, Object* srcObj,
     return true;
 }
 
+// ── Raw Mesh extraction — for Forest Pack fi.mesh pointers ──
+static bool ExtractMeshFromRawMesh(Mesh& mesh,
+                                   std::vector<float>& verts,
+                                   std::vector<float>& uvs,
+                                   std::vector<int>& indices,
+                                   std::vector<MatGroup>& groups,
+                                   std::vector<float>* outNormals = nullptr) {
+    int nv = mesh.getNumVerts();
+    int nf = mesh.getNumFaces();
+    if (nv == 0 || nf == 0) return false;
+
+    bool hasUVs = mesh.getNumTVerts() > 0;
+
+    std::vector<int> faceOrder;
+    faceOrder.reserve(nf);
+    int firstMatID = (int)mesh.faces[0].getMatID();
+    bool multiMatIDs = false;
+    for (int f = 0; f < nf; f++) {
+        faceOrder.push_back(f);
+        if ((int)mesh.faces[f].getMatID() != firstMatID) multiMatIDs = true;
+    }
+    if (multiMatIDs) {
+        std::sort(faceOrder.begin(), faceOrder.end(), [&](int a, int b) {
+            return mesh.faces[a].getMatID() < mesh.faces[b].getMatID();
+        });
+    }
+
+    // Build smooth normals if requested
+    std::vector<Point3> faceNormals;
+    struct SmKey { int posIdx; DWORD smGrp; };
+    struct SmKeyHash { size_t operator()(const SmKey& k) const noexcept {
+        return size_t(k.posIdx) * 16777619u ^ size_t(k.smGrp); }};
+    struct SmKeyEq { bool operator()(const SmKey& a, const SmKey& b) const {
+        return a.posIdx == b.posIdx && a.smGrp == b.smGrp; }};
+    std::unordered_map<SmKey, Point3, SmKeyHash, SmKeyEq> smoothNormals;
+    if (outNormals) {
+        faceNormals.resize(nf, Point3(0,0,0));
+        for (int f = 0; f < nf; f++) {
+            Point3 a = mesh.getVert(mesh.faces[f].v[0]);
+            Point3 b = mesh.getVert(mesh.faces[f].v[1]);
+            Point3 c = mesh.getVert(mesh.faces[f].v[2]);
+            faceNormals[f] = Normalize((b - a) ^ (c - a));
+        }
+        for (int f = 0; f < nf; f++) {
+            DWORD smGrp = mesh.faces[f].getSmGroup();
+            for (int v = 0; v < 3; v++) {
+                SmKey key = { (int)mesh.faces[f].v[v], smGrp };
+                smoothNormals[key] = smoothNormals[key] + faceNormals[f];
+            }
+        }
+        for (auto& kv : smoothNormals) kv.second = Normalize(kv.second);
+    }
+
+    std::unordered_map<MeshCornerKey, int, MeshCornerKeyHash> vertMap;
+    verts.reserve(nv * 3);
+    if (hasUVs) uvs.reserve(nv * 2);
+    indices.reserve(nf * 3);
+    std::vector<float> normals;
+    if (outNormals) normals.reserve(nv * 3);
+
+    int curMatID = -1;
+    for (int fi = 0; fi < nf; fi++) {
+        int f = faceOrder[fi];
+        int matID = (int)mesh.faces[f].getMatID();
+
+        if (matID != curMatID) {
+            curMatID = matID;
+            groups.push_back({ matID, (int)indices.size(), 0 });
+        }
+
+        for (int v = 0; v < 3; v++) {
+            DWORD posIdx = mesh.faces[f].v[v];
+            DWORD uvIdx  = hasUVs ? mesh.tvFace[f].t[v] : 0;
+            DWORD smGrp  = mesh.faces[f].getSmGroup();
+            MeshCornerKey key = { posIdx, uvIdx, smGrp };
+
+            auto it = vertMap.find(key);
+            if (it != vertMap.end()) {
+                indices.push_back(it->second);
+            } else {
+                int newIdx = (int)(verts.size() / 3);
+                vertMap[key] = newIdx;
+
+                Point3 p = mesh.getVert(posIdx);
+                verts.push_back(p.x);
+                verts.push_back(p.y);
+                verts.push_back(p.z);
+
+                if (outNormals) {
+                    SmKey nk = { (int)posIdx, smGrp };
+                    auto nit = smoothNormals.find(nk);
+                    Point3 n = (nit != smoothNormals.end()) ? nit->second : faceNormals[f];
+                    normals.push_back(n.x);
+                    normals.push_back(n.y);
+                    normals.push_back(n.z);
+                }
+
+                if (hasUVs) {
+                    UVVert uv = mesh.tVerts[uvIdx];
+                    uvs.push_back(uv.x);
+                    uvs.push_back(uv.y);
+                }
+
+                indices.push_back(newIdx);
+            }
+        }
+        groups.back().count += 3;
+    }
+    if (outNormals) *outNormals = std::move(normals);
+    return !indices.empty();
+}
+
 // ── Unified ExtractMesh — MNMesh path for PolyObject, TriObject fallback ──
 static bool ExtractMesh(INode* node, TimeValue t,
                         std::vector<float>& verts,
@@ -1410,6 +1524,186 @@ static bool CameraEquals(const CameraData& a, const CameraData& b) {
     }
     if (!NearlyEqualFloat(a.fov, b.fov, 1.0e-3f)) return false;
     return a.perspective == b.perspective;
+}
+
+// ══════════════════════════════════════════════════════════════
+//  Node Object Properties
+// ══════════════════════════════════════════════════════════════
+
+static uint64_t ComputeNodePropHash(INode* node, TimeValue t) {
+    uint64_t h = 0;
+    h = h * 31 + (uint64_t)node->Renderable();
+    h = h * 31 + (uint64_t)node->GetBackCull();
+    h = h * 31 + (uint64_t)node->CastShadows();
+    h = h * 31 + (uint64_t)node->RcvShadows();
+    h = h * 31 + (uint64_t)(node->GetPrimaryVisibility() ? 1 : 0);
+    h = h * 31 + (uint64_t)(node->GetSecondaryVisibility() ? 1 : 0);
+    float vis = node->GetVisibility(t);
+    uint32_t visBits; memcpy(&visBits, &vis, 4);
+    h = h * 31 + visBits;
+    return h;
+}
+
+static void WriteNodePropsJson(std::wostringstream& ss, INode* node, TimeValue t) {
+    ss << L"\"rend\":" << (node->Renderable() ? L'1' : L'0');
+    ss << L",\"bcull\":" << (node->GetBackCull() ? L'1' : L'0');
+    ss << L",\"cshadow\":" << (node->CastShadows() ? L'1' : L'0');
+    ss << L",\"rshadow\":" << (node->RcvShadows() ? L'1' : L'0');
+    ss << L",\"visCam\":" << (node->GetPrimaryVisibility() ? L'1' : L'0');
+    ss << L",\"visRefl\":" << (node->GetSecondaryVisibility() ? L'1' : L'0');
+    float opacity = node->GetVisibility(t);
+    if (opacity < 0.0f) opacity = 0.0f;
+    if (opacity > 1.0f) opacity = 1.0f;
+    ss << L",\"opacity\":" << opacity;
+}
+
+// ══════════════════════════════════════════════════════════════
+//  ForestPack Instance Extraction
+// ══════════════════════════════════════════════════════════════
+
+static bool IsForestPackClassID(const Class_ID& id) {
+    return id == TFOREST_CLASS_ID || id == FIVY_CLASS_ID;
+}
+
+// Check if ForestPack plugin is actually loaded before touching its interfaces
+static bool IsForestPackAvailable() {
+    static int cached = -1;
+    if (cached < 0) {
+        // ForestPack's main DLL — if not loaded, don't touch anything
+        cached = (GetModuleHandleW(L"Forest.dlo") != nullptr ||
+                  GetModuleHandleW(L"ForestPack.dlo") != nullptr ||
+                  GetModuleHandleW(L"ForestPackPro.dlo") != nullptr) ? 1 : 0;
+    }
+    return cached == 1;
+}
+
+struct ForestInstanceGroup {
+    uintptr_t groupKey;               // unique key: source node handle or mesh pointer
+    std::vector<float> verts, uvs, norms;
+    std::vector<int> indices;
+    std::vector<MatGroup> groups;
+    std::vector<float> transforms;    // flat array of 16-float matrices
+    int instanceCount = 0;
+};
+
+// Register MaxJS as a Forest Pack render engine (once per session)
+static bool g_forestEngineRegistered = false;
+static void RegisterForestPackEngine() {
+    if (g_forestEngineRegistered) return;
+    __try {
+        IForestPackInterface* fpi = GetForestPackInterface();
+        if (!fpi) return;
+        fpi->IForestRegisterEngine();
+        TForestEngineFeatures features;
+        features.edgeMode = FALSE;
+        features.meshesSupport = TRUE;
+        features.animProxySupport = FALSE;
+        features.ivySupport = TRUE;
+        fpi->IForestSetEngineFeatures((INT_PTR)&features);
+        g_forestEngineRegistered = true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+// SEH wrapper — isolates crash guard from C++ object unwinding
+static bool SafeGetForestInterface(INode* fpNode, ITreesInterface** out) {
+    __try {
+        Object* objRef = fpNode->GetObjectRef();
+        if (!objRef) return false;
+        *out = GetTreesInterface(objRef);
+        return *out != nullptr;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+static bool SafeForestRenderBegin(ITreesInterface* itrees, TimeValue t,
+                                   TForestInstance** outInstances, int* outCount) {
+    __try {
+        itrees->IForestRenderBegin(t);
+        *outCount = 0;
+        INT_PTR rawPtr = itrees->IForestGetRenderNodes(*outCount);
+        *outInstances = reinterpret_cast<TForestInstance*>(rawPtr);
+        return *outInstances != nullptr && *outCount > 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// Convert a Matrix3 to a 16-float row-major array
+static void Matrix3To16(const Matrix3& m, float out[16]) {
+    Point3 r0 = m.GetRow(0), r1 = m.GetRow(1), r2 = m.GetRow(2), tr = m.GetTrans();
+    out[0]=r0.x; out[1]=r0.y; out[2]=r0.z; out[3]=0;
+    out[4]=r1.x; out[5]=r1.y; out[6]=r1.z; out[7]=0;
+    out[8]=r2.x; out[9]=r2.y; out[10]=r2.z; out[11]=0;
+    out[12]=tr.x; out[13]=tr.y; out[14]=tr.z; out[15]=1;
+}
+
+// Extract ForestPack instances from a Forest object node.
+// Instance TMs are in local coords of the Forest object — multiplied by the node's world TM.
+static bool ExtractForestPackInstances(INode* fpNode, TimeValue t,
+                                       std::vector<ForestInstanceGroup>& outGroups) {
+    if (!IsForestPackAvailable()) return false;
+    RegisterForestPackEngine();
+
+    ObjectState os = fpNode->EvalWorldState(t);
+    if (!os.obj || !IsForestPackClassID(os.obj->ClassID())) return false;
+
+    ITreesInterface* itrees = nullptr;
+    if (!SafeGetForestInterface(fpNode, &itrees)) return false;
+
+    TForestInstance* instances = nullptr;
+    int numInstances = 0;
+    if (!SafeForestRenderBegin(itrees, t, &instances, &numInstances)) return false;
+
+    // Forest node's world TM — instance TMs are in local coords, need world
+    // API says "multiply by the INode TM" — GetNodeTM(), not GetObjTMAfterWSM()
+    Matrix3 nodeTM = fpNode->GetNodeTM(t);
+
+    std::unordered_map<uintptr_t, size_t> keyToGroupIdx;
+
+    for (int i = 0; i < numInstances; i++) {
+        TForestInstance& fi = instances[i];
+        if (!fi.mesh && !fi.node) continue;
+
+        // Group by mesh pointer when available, else by node handle
+        uintptr_t groupKey = fi.mesh ? reinterpret_cast<uintptr_t>(fi.mesh)
+                                     : static_cast<uintptr_t>(fi.node->GetHandle());
+        size_t groupIdx;
+
+        auto it = keyToGroupIdx.find(groupKey);
+        if (it != keyToGroupIdx.end()) {
+            groupIdx = it->second;
+        } else {
+            groupIdx = outGroups.size();
+            keyToGroupIdx[groupKey] = groupIdx;
+            outGroups.emplace_back();
+            ForestInstanceGroup& grp = outGroups.back();
+            grp.groupKey = groupKey;
+
+            // Extract geometry — prefer fi.mesh (raw Mesh*), fall back to fi.node
+            if (fi.mesh) {
+                ExtractMeshFromRawMesh(*fi.mesh, grp.verts, grp.uvs, grp.indices, grp.groups, &grp.norms);
+            } else if (fi.node) {
+                ExtractMesh(fi.node, t, grp.verts, grp.uvs, grp.indices, grp.groups, &grp.norms);
+            }
+        }
+
+        ForestInstanceGroup& grp = outGroups[groupIdx];
+
+        // Instance TM (local) * Forest node TM → world TM
+        Matrix3 worldTM = fi.tm * nodeTM;
+        float xform[16];
+        Matrix3To16(worldTM, xform);
+        grp.transforms.insert(grp.transforms.end(), xform, xform + 16);
+        grp.instanceCount++;
+    }
+
+    itrees->IForestClearRenderNodes();
+    itrees->IForestRenderEnd(t);
+    return !outGroups.empty();
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -1676,6 +1970,7 @@ public:
     std::unordered_map<ULONG, uint64_t> splatHashMap_; // node handle → splat source state hash
     std::unordered_map<ULONG, uint64_t> geoHashMap_;   // node handle → geometry topology hash
     std::unordered_map<ULONG, std::vector<MatGroup>> groupCache_; // cached material groups per node
+    std::unordered_map<ULONG, uint64_t> propHashMap_;  // node handle → object properties hash
     std::map<std::wstring, std::wstring> texDirMap_;    // dir → host
     int texDirCount_ = 0;
     bool lastClayMode_ = false;
@@ -1923,6 +2218,7 @@ public:
         mtlHashMap_.clear();
         lightHashMap_.clear();
         splatHashMap_.clear();
+        propHashMap_.clear();
         geoHashMap_.clear();
         groupCache_.clear();
         lastBBoxHash_.clear();
@@ -2301,6 +2597,7 @@ public:
             mtlHashMap_.clear();
             lightHashMap_.clear();
             splatHashMap_.clear();
+            propHashMap_.clear();
             geoHashMap_.clear();  // force all geometry to be sent
             lastSentTransforms_.clear();
             lightHandles_.clear();
@@ -2327,6 +2624,7 @@ public:
         } else {
             if (tickCount_ % 15 == 0) CheckWebContentChanges();
             if (tickCount_ % MATERIAL_DETECT_TICKS == 0) DetectMaterialChanges();
+            if (tickCount_ % LIGHT_DETECT_TICKS == 0) DetectPropertyChanges();
             if (tickCount_ % LIGHT_DETECT_TICKS == 0) {
                 DetectLightChanges();
                 DetectSplatChanges();
@@ -2892,6 +3190,28 @@ public:
         geoScanCursor_ = idx;
     }
 
+    // Detect object property changes — triggers full sync (same pattern as DetectMaterialChanges)
+    void DetectPropertyChanges() {
+        Interface* ip = GetCOREInterface();
+        if (!ip) return;
+        TimeValue t = ip->GetTime();
+
+        for (ULONG handle : geomHandles_) {
+            INode* node = ip->GetINodeByHandle(handle);
+            if (!node) continue;
+
+            uint64_t h = ComputeNodePropHash(node, t);
+            auto it = propHashMap_.find(handle);
+            if (it == propHashMap_.end()) {
+                propHashMap_[handle] = h;
+            } else if (it->second != h) {
+                it->second = h;
+                SetDirty();
+                return;
+            }
+        }
+    }
+
     // ── Camera JSON fragment ─────────────────────────────────
 
     void WriteMaterialTextures(std::wostringstream& ss, const MaxJSPBR& pbr) {
@@ -3376,6 +3696,46 @@ public:
         ss << L",";
         WriteSplatsJson(ss, ip, t, true, false, true);
 
+        // ForestPack instance groups (GPU instancing)
+        if (IsForestPackAvailable()) {
+            std::vector<ForestInstanceGroup> allFpGroups;
+            std::function<void(INode*)> collectForest = [&](INode* parent) {
+                for (int c = 0; c < parent->NumberOfChildren(); c++) {
+                    INode* node = parent->GetChildNode(c);
+                    if (!node) continue;
+                    ObjectState fos = node->EvalWorldState(t);
+                    if (fos.obj && IsForestPackClassID(fos.obj->ClassID())) {
+                        ExtractForestPackInstances(node, t, allFpGroups);
+                    }
+                    collectForest(node);
+                }
+            };
+            collectForest(root);
+            if (!allFpGroups.empty()) {
+                ss << L",\"forestInstances\":[";
+                bool firstGrp = true;
+                for (auto& grp : allFpGroups) {
+                    if (grp.verts.empty() || grp.transforms.empty()) continue;
+                    if (!firstGrp) ss << L',';
+                    firstGrp = false;
+                    ss << L"{\"src\":" << grp.groupKey;
+                    ss << L",\"count\":" << grp.instanceCount;
+                    ss << L",\"v\":"; WriteFloats(ss, grp.verts.data(), grp.verts.size());
+                    ss << L",\"i\":"; WriteInts(ss, grp.indices.data(), grp.indices.size());
+                    if (!grp.uvs.empty()) {
+                        ss << L",\"uv\":"; WriteFloats(ss, grp.uvs.data(), grp.uvs.size());
+                    }
+                    if (!grp.norms.empty()) {
+                        ss << L",\"norm\":"; WriteFloats(ss, grp.norms.data(), grp.norms.size());
+                    }
+                    ss << L",\"xforms\":";
+                    WriteFloats(ss, grp.transforms.data(), grp.transforms.size());
+                    ss << L'}';
+                }
+                ss << L']';
+            }
+        }
+
         ss << L'}';
 
         webview_->PostWebMessageAsJson(ss.str().c_str());
@@ -3390,6 +3750,11 @@ public:
             if (!node || node->IsNodeHidden(TRUE)) continue;
             ObjectState os = node->EvalWorldState(t);
             if (os.obj && IsThreeJSSplatClassID(os.obj->ClassID())) {
+                WriteSceneNodes(node, t, ss, first, prevGeom);
+                continue;
+            }
+            // Skip Forest Pack / ForestIvy — handled via GPU instancing
+            if (os.obj && IsForestPackClassID(os.obj->ClassID())) {
                 WriteSceneNodes(node, t, ss, first, prevGeom);
                 continue;
             }
@@ -3419,6 +3784,7 @@ public:
                 ss << L"{\"h\":" << handle;
                 ss << L",\"n\":\"" << EscapeJson(node->GetName()) << L'"';
                 ss << L",\"s\":" << (node->Selected() ? L'1' : L'0');
+                ss << L",\"props\":{"; WriteNodePropsJson(ss, node, t); ss << L'}';
                 ss << L",\"t\":"; WriteFloats(ss, xform, 16);
                 RememberSentTransform(handle, xform);
 
@@ -3466,6 +3832,7 @@ public:
                     ss << L"{\"h\":" << handle;
                     ss << L",\"n\":\"" << EscapeJson(node->GetName()) << L'"';
                     ss << L",\"s\":" << (node->Selected() ? L'1' : L'0');
+                    ss << L",\"props\":{"; WriteNodePropsJson(ss, node, t); ss << L'}';
                     ss << L",\"t\":"; WriteFloats(ss, xform, 16);
                     RememberSentTransform(handle, xform);
                     ss << L",\"v\":"; WriteFloats(ss, verts.data(), verts.size());
@@ -3544,9 +3911,46 @@ public:
             bool changed;
             bool visible = true;
             size_t vOff, iOff, uvOff, nOff;
+            uint64_t objId = 0;      // evaluated Object* — instances share this
+            ULONG instOfHandle = 0;  // 0 = owns geometry, else = shares from this handle
         };
         std::vector<NodeGeo> geos;
         size_t totalBytes = 0;
+
+        // Build instance groups via IInstanceMgr — maps each node handle to a canonical "source" handle.
+        // All instances of the same object get the same source; only the source extracts geometry.
+        std::unordered_map<ULONG, ULONG> instanceSourceMap; // handle → source handle (0 = self)
+        {
+            IInstanceMgr* imgr = IInstanceMgr::GetInstanceMgr();
+            std::unordered_set<ULONG> visited;
+            std::function<void(INode*)> buildInstMap = [&](INode* parent) {
+                for (int c = 0; c < parent->NumberOfChildren(); c++) {
+                    INode* node = parent->GetChildNode(c);
+                    if (!node) continue;
+                    ULONG h = node->GetHandle();
+                    if (!visited.insert(h).second) { buildInstMap(node); continue; }
+                    if (instanceSourceMap.count(h)) { buildInstMap(node); continue; }
+
+                    INodeTab instTab;
+                    if (imgr) imgr->GetInstances(*node, instTab);
+                    if (instTab.Count() > 1) {
+                        // First handle in the group is the source
+                        ULONG srcH = instTab[0] ? instTab[0]->GetHandle() : h;
+                        for (int i = 0; i < instTab.Count(); i++) {
+                            if (!instTab[i]) continue;
+                            ULONG ih = instTab[i]->GetHandle();
+                            instanceSourceMap[ih] = srcH;
+                            visited.insert(ih);
+                        }
+                    }
+                    buildInstMap(node);
+                }
+            };
+            buildInstMap(root);
+        }
+
+        // Track which source handle has already been extracted
+        std::unordered_set<ULONG> extractedSources;
 
         std::function<void(INode*)> collect = [&](INode* parent) {
             for (int i = 0; i < parent->NumberOfChildren(); i++) {
@@ -3557,14 +3961,23 @@ public:
                     collect(node);
                     continue;
                 }
+                // Skip Forest Pack / ForestIvy — handled via GPU instancing
+                if (os.obj && IsForestPackClassID(os.obj->ClassID())) {
+                    collect(node);
+                    continue;
+                }
                 NodeGeo ng;
                 ng.node = node;
                 ng.handle = node->GetHandle();
                 ng.changed = false;
                 ng.visible = !node->IsNodeHidden(TRUE);
 
+                // Instance detection via IInstanceMgr
+                auto instIt = instanceSourceMap.find(ng.handle);
+                ULONG srcHandle = (instIt != instanceSourceMap.end()) ? instIt->second : 0;
+                ng.objId = srcHandle; // used as instance group ID in JSON
+
                 // Skip expensive ExtractMesh for previously-tracked nodes with unchanged geometry.
-                // ConvertToType(TRIOBJ) on a 10M poly mesh takes seconds — avoid it when possible.
                 bool skipExtract = false;
                 if (prevGeom.count(ng.handle) && geoHashMap_.count(ng.handle)) {
                     if (os.obj && os.obj->SuperClassID() == GEOMOBJECT_CLASS_ID) {
@@ -3578,10 +3991,22 @@ public:
                     }
                 }
 
+                // Instance dedup: if another node in this group already extracted, skip
+                if (!skipExtract && srcHandle != 0 && srcHandle != ng.handle) {
+                    if (extractedSources.count(srcHandle)) {
+                        ng.instOfHandle = srcHandle;
+                        skipExtract = true;
+                    }
+                }
+
                 if (skipExtract) {
-                    // Geometry unchanged — reuse cached groups, skip mesh extraction entirely
                     auto gIt = groupCache_.find(ng.handle);
                     if (gIt != groupCache_.end()) ng.groups = gIt->second;
+                    if (ng.instOfHandle != 0 && geoHashMap_.count(ng.instOfHandle)) {
+                        geoHashMap_[ng.handle] = geoHashMap_[ng.instOfHandle];
+                        if (groupCache_.count(ng.instOfHandle))
+                            ng.groups = groupCache_[ng.instOfHandle];
+                    }
                     geos.push_back(std::move(ng));
                     geomHandles_.insert(node->GetHandle());
                 } else if (ExtractMesh(node, t, ng.verts, ng.uvs, ng.indices, ng.groups, &ng.norms)) {
@@ -3595,6 +4020,8 @@ public:
                         Interval gv = os.obj->ChannelValidity(t, GEOM_CHAN_NUM);
                         lastBBoxHash_[ng.handle] = static_cast<uint64_t>(gv.Start()) ^ (static_cast<uint64_t>(gv.End()) << 32);
                     }
+
+                    if (srcHandle != 0) extractedSources.insert(srcHandle);
 
                     if (ng.changed) {
                         ng.vOff = totalBytes;
@@ -3668,7 +4095,10 @@ public:
             ss << L"{\"h\":" << ng.handle;
             ss << L",\"n\":\"" << EscapeJson(ng.node->GetName()) << L'"';
             ss << L",\"s\":" << (ng.node->Selected() ? L'1' : L'0');
+            ss << L",\"props\":{"; WriteNodePropsJson(ss, ng.node, t); ss << L'}';
             ss << L",\"vis\":" << (ng.visible ? L'1' : L'0');
+            if (ng.objId != 0) ss << L",\"objId\":" << ng.objId;
+            if (ng.instOfHandle != 0) ss << L",\"instOf\":" << ng.instOfHandle;
             ss << L",\"t\":"; WriteFloats(ss, xform, 16);
 
             // Geometry: byte offsets into shared buffer (or -1 if unchanged)
@@ -3740,6 +4170,51 @@ public:
         WriteLightsJson(ss, ip, t, true, false, true);
         ss << L",";
         WriteSplatsJson(ss, ip, t, true, false, true);
+
+        // ForestPack instance groups (GPU instancing)
+        {
+            std::vector<ForestInstanceGroup> allFpGroups;
+            if (IsForestPackAvailable()) {
+                std::function<void(INode*)> collectForest = [&](INode* parent) {
+                    for (int c = 0; c < parent->NumberOfChildren(); c++) {
+                        INode* node = parent->GetChildNode(c);
+                        if (!node) continue;
+                        ObjectState fos = node->EvalWorldState(t);
+                        if (fos.obj && IsForestPackClassID(fos.obj->ClassID())) {
+                            ExtractForestPackInstances(node, t, allFpGroups);
+                        }
+                        collectForest(node);
+                    }
+                };
+                collectForest(root);
+            }
+
+            if (!allFpGroups.empty()) {
+                ss << L",\"forestInstances\":[";
+                bool firstGrp = true;
+                for (auto& grp : allFpGroups) {
+                    if (grp.verts.empty() || grp.transforms.empty()) continue;
+                    if (!firstGrp) ss << L',';
+                    firstGrp = false;
+
+                    ss << L"{\"src\":" << grp.groupKey;
+                    ss << L",\"count\":" << grp.instanceCount;
+                    ss << L",\"v\":"; WriteFloats(ss, grp.verts.data(), grp.verts.size());
+                    ss << L",\"i\":"; WriteInts(ss, grp.indices.data(), grp.indices.size());
+                    if (!grp.uvs.empty()) {
+                        ss << L",\"uv\":"; WriteFloats(ss, grp.uvs.data(), grp.uvs.size());
+                    }
+                    if (!grp.norms.empty()) {
+                        ss << L",\"norm\":"; WriteFloats(ss, grp.norms.data(), grp.norms.size());
+                    }
+                    ss << L",\"xforms\":";
+                    WriteFloats(ss, grp.transforms.data(), grp.transforms.size());
+                    ss << L'}';
+                }
+                ss << L']';
+            }
+        }
+
         ss << L'}';
 
         wv17->PostSharedBufferToScript(sharedBuf.Get(),
@@ -3975,6 +4450,7 @@ public:
         mtlHashMap_.clear();
         lightHashMap_.clear();
         splatHashMap_.clear();
+        propHashMap_.clear();
         geoHashMap_.clear();
         groupCache_.clear();
         lastBBoxHash_.clear();

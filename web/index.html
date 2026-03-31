@@ -1317,6 +1317,28 @@
             mesh.receiveShadow = true;
         }
 
+        function applyNodeProps(mesh, props) {
+            if (!mesh?.isMesh || !props) return;
+            if (props.rend === 0) mesh.visible = false;
+            mesh.castShadow = props.cshadow !== 0;
+            mesh.receiveShadow = props.rshadow !== 0;
+            const side = props.bcull ? THREE.FrontSide : THREE.DoubleSide;
+            const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+            for (const m of mats) {
+                if (m && m.side !== side) m.side = side;
+                if (!m) continue;
+                if (props.opacity != null && props.opacity < 0.999) {
+                    m.transparent = true;
+                    m.opacity = props.opacity;
+                } else if (m.userData?._propsOpacity) {
+                    m.transparent = false;
+                    m.opacity = 1.0;
+                }
+                if (!m.userData) m.userData = {};
+                m.userData._propsOpacity = props.opacity != null && props.opacity < 0.999;
+            }
+        }
+
         function applySSSMaterialNodes(material, md) {
             if (!material || typeof material !== 'object') return;
 
@@ -1678,6 +1700,16 @@
             transportMode = mode;
         }
 
+        function countInstances() {
+            const geoms = new Set();
+            let count = 0;
+            for (const [, mesh] of nodeMap) {
+                if (geoms.has(mesh.geometry)) count++;
+                else geoms.add(mesh.geometry);
+            }
+            return count;
+        }
+
         function updateSyncHud(partial = {}) {
             perfHud.updateSync({
                 transport: partial.transport ?? transportMode,
@@ -1686,6 +1718,7 @@
                 decodeMs: partial.decodeMs ?? 0,
                 applyMs: partial.applyMs ?? 0,
                 nodeCount: nodeMap.size,
+                instanceCount: countInstances(),
                 textureCount: textureCache.size,
             });
         }
@@ -1998,6 +2031,7 @@
                 mesh.visible = true;
                 mesh.frustumCulled = false;
                 applyMeshShadowState(mesh);
+                applyNodeProps(mesh, nd.props);
 
                 applyTransform(mesh, nd.t);
                 applySelection(mesh, nd.s);
@@ -2011,6 +2045,7 @@
             if (msg.fog) ssgiFx.setFogFromScene(msg.fog);
             if (msg.lights) applyLights(msg.lights);
             reconcileSplats(msg.splats ?? []);
+            applyForestInstances(msg.forestInstances);
             scene.updateMatrixWorld(true);
 
             if (firstSync && msg.nodes.length > 0) {
@@ -2115,14 +2150,21 @@
             const incoming = new Set(meta.nodes.map(n => n.h));
             materialCache.clear();
 
-            // Remove deleted
+            // Remove deleted — collect first, then dispose non-shared geometries
+            const toRemove = [];
             for (const [handle, mesh] of nodeMap) {
-                if (!incoming.has(handle)) {
-                    scene.remove(mesh);
-                    mesh.geometry.dispose();
-                    nodeMap.delete(handle);
-                }
+                if (!incoming.has(handle)) toRemove.push(handle);
             }
+            for (const handle of toRemove) {
+                const mesh = nodeMap.get(handle);
+                scene.remove(mesh);
+                const isShared = [...nodeMap.values()].some(m => m !== mesh && m.geometry === mesh.geometry);
+                if (!isShared) mesh.geometry.dispose();
+                nodeMap.delete(handle);
+            }
+
+            // Geometry cache for instance sharing within this sync
+            const geoByHandle = new Map();
 
             for (const nd of meta.nodes) {
                 let mesh = nodeMap.get(nd.h);
@@ -2136,9 +2178,12 @@
                         : new THREE.MeshStandardMaterial({ color: 0x888888, side: THREE.DoubleSide });
                 }
 
-                // Build geometry from binary buffer if geo data present
+                // Instance: share geometry from the source node (no new BufferGeometry)
                 let geom = mesh?.geometry;
-                if (nd.geo) {
+                if (nd.instOf && !nd.geo) {
+                    const srcGeom = geoByHandle.get(nd.instOf) || nodeMap.get(nd.instOf)?.geometry;
+                    if (srcGeom) geom = srcGeom;
+                } else if (nd.geo) {
                     const inRange = (off, n) =>
                         Number.isInteger(off) &&
                         Number.isInteger(n) &&
@@ -2194,15 +2239,20 @@
                     }
                 }
 
+                // Cache geometry for instance sharing
+                if (nd.geo && geom) geoByHandle.set(nd.h, geom);
+
                 if (mesh) {
-                    if (nd.geo && geom !== mesh.geometry) {
-                        mesh.geometry.dispose();
+                    if (geom && geom !== mesh.geometry) {
+                        // Only dispose if not shared with another mesh
+                        const isShared = [...nodeMap.values()].some(m => m !== mesh && m.geometry === mesh.geometry);
+                        if (!isShared) mesh.geometry.dispose();
                         mesh.geometry = geom;
                     }
                     if (clayModeActive) { mesh.userData._origMaterial = mat; }
                     else { mesh.material = mat; }
                 } else {
-                    if (!geom) continue; // Never create an empty mesh entry
+                    if (!geom) continue;
                     mesh = new THREE.Mesh(geom, clayModeActive ? clayMat : mat);
                     if (clayModeActive) mesh.userData._origMaterial = mat;
                     mesh.matrixAutoUpdate = false;
@@ -2215,6 +2265,7 @@
                 mesh.visible = nd.vis !== 0;
                 mesh.frustumCulled = false;
                 applyMeshShadowState(mesh);
+                applyNodeProps(mesh, nd.props);
 
                 applyTransform(mesh, nd.t);
                 applySelection(mesh, nd.s);
@@ -2228,6 +2279,7 @@
             if (meta.fog) ssgiFx.setFogFromScene(meta.fog);
             if (meta.lights) applyLights(meta.lights);
             reconcileSplats(meta.splats ?? []);
+            applyForestInstances(meta.forestInstances);
             scene.updateMatrixWorld(true);
 
             if (firstSync && meta.nodes.length > 0) {
@@ -2545,6 +2597,56 @@
         function applyLights(lightsData) {
             clearLights();
             finalizeLightState(lightsData);
+        }
+
+        // ── ForestPack GPU Instancing ───────────────────────
+        const forestMeshes = new Map(); // key → InstancedMesh
+
+        function applyForestInstances(groups) {
+            // Remove old forest meshes
+            for (const [key, mesh] of forestMeshes) {
+                scene.remove(mesh);
+                mesh.geometry.dispose();
+                mesh.dispose();
+            }
+            forestMeshes.clear();
+
+            if (!Array.isArray(groups) || groups.length === 0) return;
+
+            const m = new THREE.Matrix4();
+
+            for (const grp of groups) {
+                if (!grp.v?.length || !grp.i?.length || !grp.xforms?.length) continue;
+
+                const geom = buildGeometry(grp.v, grp.i, grp.uv, grp.norm);
+                const mat = clayModeActive ? clayMat
+                    : new THREE.MeshStandardMaterial({ color: 0x888888, roughness: 0.7, side: THREE.DoubleSide });
+
+                const count = grp.count || (grp.xforms.length / 16);
+                const instMesh = new THREE.InstancedMesh(geom, mat, count);
+                instMesh.matrixAutoUpdate = false;
+                instMesh.frustumCulled = false;
+                instMesh.castShadow = true;
+                instMesh.receiveShadow = true;
+                instMesh.name = `forest_${grp.src}_x${count}`;
+
+                // xforms is a flat array: [m0_0..m0_15, m1_0..m1_15, ...]
+                for (let i = 0; i < count; i++) {
+                    const off = i * 16;
+                    // Max row-major → Three.js column-major (transpose)
+                    m.set(
+                        grp.xforms[off+0], grp.xforms[off+4], grp.xforms[off+8],  grp.xforms[off+12],
+                        grp.xforms[off+1], grp.xforms[off+5], grp.xforms[off+9],  grp.xforms[off+13],
+                        grp.xforms[off+2], grp.xforms[off+6], grp.xforms[off+10], grp.xforms[off+14],
+                        grp.xforms[off+3], grp.xforms[off+7], grp.xforms[off+11], grp.xforms[off+15]
+                    );
+                    instMesh.setMatrixAt(i, m);
+                }
+                instMesh.instanceMatrix.needsUpdate = true;
+
+                scene.add(instMesh);
+                forestMeshes.set(`${grp.src}`, instMesh);
+            }
         }
 
         function applyLightUpdates(lightsData) {

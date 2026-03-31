@@ -1490,6 +1490,7 @@ public:
     std::unordered_map<ULONG, uint64_t> lightHashMap_; // node handle → light state hash
     std::unordered_map<ULONG, uint64_t> splatHashMap_; // node handle → splat source state hash
     std::unordered_map<ULONG, uint64_t> geoHashMap_;   // node handle → geometry topology hash
+    std::unordered_map<ULONG, std::vector<MatGroup>> groupCache_; // cached material groups per node
     std::map<std::wstring, std::wstring> texDirMap_;    // dir → host
     int texDirCount_ = 0;
     std::wstring activeWebDir_;
@@ -1497,6 +1498,7 @@ public:
     bool fastCameraDirty_ = false;
     bool fastFlushPosted_ = false;
     bool haveLastSentCamera_ = false;
+    ULONGLONG dirtyStamp_ = 0;   // when dirty_ was last set (for debounce)
     CameraData lastSentCamera_ = {};
     SceneEventNamespace::CallbackKey fastNodeEventCallbackKey_ = 0;
     MaxJSFastNodeEventCallback fastNodeEvents_;
@@ -1723,7 +1725,7 @@ public:
 
     void PrepareForWebReload() {
         jsReady_ = false;
-        dirty_ = true;
+        SetDirtyImmediate();
         tickCount_ = 0;
         geoScanCursor_ = 0;
         geomHandles_.clear();
@@ -1735,6 +1737,8 @@ public:
         lightHashMap_.clear();
         splatHashMap_.clear();
         geoHashMap_.clear();
+        groupCache_.clear();
+        lastBBoxHash_.clear();
         ResetFastPathState(false);
     }
 
@@ -1783,6 +1787,21 @@ public:
 
     bool HasTrackedNodes() const {
         return !geomHandles_.empty() || !lightHandles_.empty() || !splatHandles_.empty();
+    }
+
+    // Debounced dirty: coalesces rapid-fire notifications (e.g. clone) into one full sync
+    static constexpr ULONGLONG DIRTY_DEBOUNCE_MS = 150;
+
+    void SetDirty() {
+        if (!dirty_) {
+            dirty_ = true;
+            dirtyStamp_ = GetTickCount64();
+        }
+    }
+
+    void SetDirtyImmediate() {
+        dirty_ = true;
+        dirtyStamp_ = 0;  // bypass debounce — sync on next tick
     }
 
     void QueueFastFlush() {
@@ -1880,61 +1899,8 @@ public:
         }
     }
 
-    // Check if selected nodes' geometry changed since last sync (for real-time vertex editing)
-    void CheckSelectedGeometryChanged() {
-        Interface* ip = GetCOREInterface();
-        if (!ip) return;
-        const int selCount = ip->GetSelNodeCount();
-        if (selCount <= 0) return;
-        TimeValue t = ip->GetTime();
-
-        for (int i = 0; i < selCount; ++i) {
-            INode* node = ip->GetSelNode(i);
-            if (!node) continue;
-            ULONG handle = node->GetHandle();
-            if (!IsTrackedHandle(handle)) continue;
-
-            // Quick geometry hash: EvalWorldState + hash verts/faces count + sample vertices
-            ObjectState os = node->EvalWorldState(t);
-            if (!os.obj || os.obj->SuperClassID() != GEOMOBJECT_CLASS_ID) continue;
-            if (!os.obj->CanConvertToType(Class_ID(TRIOBJ_CLASS_ID, 0))) continue;
-
-            TriObject* tri = static_cast<TriObject*>(
-                os.obj->ConvertToType(t, Class_ID(TRIOBJ_CLASS_ID, 0)));
-            if (!tri) continue;
-
-            Mesh& mesh = tri->GetMesh();
-            // Fast hash: vert count + a few sample vertex positions
-            uint64_t quickHash = mesh.getNumVerts() ^ ((uint64_t)mesh.getNumFaces() << 20);
-            int nv = mesh.getNumVerts();
-            if (nv > 0) {
-                // Sample first, middle, last vertex
-                auto hashVert = [](Point3 p) -> uint64_t {
-                    uint64_t h = 0;
-                    memcpy(&h, &p.x, sizeof(float));
-                    uint64_t h2 = 0;
-                    memcpy(&h2, &p.y, sizeof(float));
-                    return h ^ (h2 << 16);
-                };
-                quickHash ^= hashVert(mesh.getVert(0)) * 2654435761ULL;
-                quickHash ^= hashVert(mesh.getVert(nv / 2)) * 40503ULL;
-                quickHash ^= hashVert(mesh.getVert(nv - 1)) * 12289ULL;
-            }
-
-            if (tri != os.obj) tri->DeleteThis();
-
-            auto it = geoHashMap_.find(handle);
-            if (it != geoHashMap_.end() && it->second != quickHash) {
-                geoHashMap_.erase(handle);
-                fastDirtyHandles_.insert(handle);
-                dirty_ = true;
-                QueueFastFlush();
-            }
-        }
-    }
-
-    // Invalidate geometry hash — forces mesh re-extraction on next sync
-    void MarkGeometryDirty(const NodeEventNamespace::NodeKeyTab& nodes) {
+    // Geometry position change (deform/vertex edit) — fast path, no full sync
+    void MarkGeometryPositionsDirty(const NodeEventNamespace::NodeKeyTab& nodes) {
         bool changed = false;
         for (int i = 0; i < nodes.Count(); ++i) {
             INode* node = NodeEventNamespace::GetNodeByKey(nodes[i]);
@@ -1942,14 +1908,28 @@ public:
             VisitNodeSubtree(node, [this, &changed](INode* current) {
                 const ULONG handle = current->GetHandle();
                 if (!IsTrackedHandle(handle)) return;
-                geoHashMap_.erase(handle);  // forces re-send of vertex data
+                geoHashMap_.erase(handle);
+                geoFastDirtyHandles_.insert(handle);
                 if (fastDirtyHandles_.insert(handle).second) changed = true;
             });
         }
-        if (changed) {
-            dirty_ = true;  // need full sync to re-extract geometry
-            QueueFastFlush();
+        if (changed) QueueFastFlush();
+    }
+
+    // Topology change (add/remove faces/verts) — needs full sync (debounced)
+    void MarkGeometryTopologyDirty(const NodeEventNamespace::NodeKeyTab& nodes) {
+        bool changed = false;
+        for (int i = 0; i < nodes.Count(); ++i) {
+            INode* node = NodeEventNamespace::GetNodeByKey(nodes[i]);
+            if (!node) continue;
+            VisitNodeSubtree(node, [this, &changed](INode* current) {
+                const ULONG handle = current->GetHandle();
+                if (!IsTrackedHandle(handle)) return;
+                geoHashMap_.erase(handle);
+                if (fastDirtyHandles_.insert(handle).second) changed = true;
+            });
         }
+        if (changed) SetDirty();
     }
 
     void MarkSelectedTransformsDirty() {
@@ -2047,7 +2027,7 @@ public:
 
                 // A node that becomes visible after being absent from the last full sync
                 // needs geometry/bootstrap data, not just a transform delta.
-                if (!current->IsNodeHidden(TRUE)) dirty_ = true;
+                if (!current->IsNodeHidden(TRUE)) SetDirty();
             });
         }
 
@@ -2130,7 +2110,7 @@ public:
             return;
         }
         if (msg.find(L"\"ready\"") != std::wstring::npos) {
-            jsReady_ = true; dirty_ = true;
+            jsReady_ = true; SetDirtyImmediate();
             mtlHashMap_.clear();
             lightHashMap_.clear();
             splatHashMap_.clear();
@@ -2152,8 +2132,11 @@ public:
         if (tickCount_ % ENV_FOG_POLL_TICKS == 0) PollEnvFog();
 
         if (dirty_) {
-            dirty_ = false;
-            if (useBinary_) SendFullSyncBinary(); else SendFullSync();
+            // Debounce: wait for notifications to settle before expensive full sync
+            if (GetTickCount64() - dirtyStamp_ >= DIRTY_DEBOUNCE_MS) {
+                dirty_ = false;
+                if (useBinary_) SendFullSyncBinary(); else SendFullSync();
+            }
         } else {
             if (tickCount_ % 15 == 0) CheckWebContentChanges();
             if (tickCount_ % MATERIAL_DETECT_TICKS == 0) DetectMaterialChanges();
@@ -2308,7 +2291,7 @@ public:
                 lightHandles_.erase(handle);
                 splatHandles_.erase(handle);
                 lastSentTransforms_.erase(handle);
-                dirty_ = true;
+                SetDirty();
                 continue;
             }
 
@@ -2596,7 +2579,7 @@ public:
                 mtlHashMap_[handle] = hash;
             } else if (it->second != hash) {
                 it->second = hash;
-                dirty_ = true;  // triggers full sync on next tick
+                SetDirty();
                 return;
             }
         }
@@ -2683,7 +2666,7 @@ public:
                     uint64_t hash = HashMeshData(verts, indices, uvs);
                     auto it = geoHashMap_.find(handle);
                     if (it == geoHashMap_.end() || it->second != hash) {
-                        dirty_ = true;
+                        SetDirty();
                         return;
                     }
                 }
@@ -3146,6 +3129,7 @@ public:
         if (!root) return;
         const std::uint32_t frameId = AllocateFrameId();
 
+        std::unordered_set<ULONG> prevGeom = std::move(geomHandles_);
         geomHandles_.clear();
         lightHandles_.clear();
         splatHandles_.clear();
@@ -3155,7 +3139,7 @@ public:
         ss.imbue(std::locale::classic());
         ss << L"{\"type\":\"scene\",\"frame\":" << frameId << L",\"nodes\":[";
         bool first = true;
-        WriteSceneNodes(root, t, ss, first);
+        WriteSceneNodes(root, t, ss, first, prevGeom);
         ss << L"],";
 
         // Camera
@@ -3187,68 +3171,129 @@ public:
     }
 
     void WriteSceneNodes(INode* parent, TimeValue t,
-                         std::wostringstream& ss, bool& first) {
+                         std::wostringstream& ss, bool& first,
+                         const std::unordered_set<ULONG>& prevGeom) {
         for (int i = 0; i < parent->NumberOfChildren(); i++) {
             INode* node = parent->GetChildNode(i);
             if (!node || node->IsNodeHidden(TRUE)) continue;
             ObjectState os = node->EvalWorldState(t);
             if (os.obj && IsThreeJSSplatClassID(os.obj->ClassID())) {
-                WriteSceneNodes(node, t, ss, first);
+                WriteSceneNodes(node, t, ss, first, prevGeom);
                 continue;
             }
 
-            std::vector<float> verts, uvs;
-            std::vector<int> indices;
-            std::vector<MatGroup> groups;
-            if (ExtractMesh(node, t, verts, uvs, indices, groups)) {
+            ULONG handle = node->GetHandle();
+
+            // Skip expensive ExtractMesh for previously-tracked nodes with unchanged geometry
+            bool skipExtract = false;
+            if (prevGeom.count(handle) && geoHashMap_.count(handle)) {
+                if (os.obj && os.obj->SuperClassID() == GEOMOBJECT_CLASS_ID) {
+                    Interval gv = os.obj->ChannelValidity(t, GEOM_CHAN_NUM);
+                    uint64_t validKey = static_cast<uint64_t>(gv.Start()) ^ (static_cast<uint64_t>(gv.End()) << 32);
+                    auto bboxIt = lastBBoxHash_.find(handle);
+                    if (bboxIt != lastBBoxHash_.end() && bboxIt->second == validKey) {
+                        skipExtract = true;
+                    }
+                    lastBBoxHash_[handle] = validKey;
+                }
+            }
+
+            if (skipExtract) {
+                // Geometry unchanged — send node with transform + material, no geometry data.
+                // JS side keeps existing BufferGeometry when v/i fields are absent.
                 float xform[16]; GetTransform16(node, t, xform);
 
                 if (!first) ss << L',';
-                ss << L"{\"h\":" << node->GetHandle();
+                ss << L"{\"h\":" << handle;
                 ss << L",\"n\":\"" << EscapeJson(node->GetName()) << L'"';
                 ss << L",\"s\":" << (node->Selected() ? L'1' : L'0');
                 ss << L",\"t\":"; WriteFloats(ss, xform, 16);
-                RememberSentTransform(node->GetHandle(), xform);
-                ss << L",\"v\":"; WriteFloats(ss, verts.data(), verts.size());
-                ss << L",\"i\":"; WriteInts(ss, indices.data(), indices.size());
-                if (!uvs.empty()) {
-                    ss << L",\"uv\":"; WriteFloats(ss, uvs.data(), uvs.size());
-                }
+                RememberSentTransform(handle, xform);
 
-                // Multi/Sub material support
+                auto cachedGroups = groupCache_.find(handle);
                 Mtl* multiMtl = FindMultiSubMtl(node->GetMtl());
-                if (multiMtl && multiMtl->NumSubMtls() > 0 && groups.size() > 1) {
-                    // Groups: [[start, count, groupIdx], ...]
+                if (multiMtl && multiMtl->NumSubMtls() > 0 && cachedGroups != groupCache_.end() && cachedGroups->second.size() > 1) {
                     ss << L",\"groups\":[";
-                    for (size_t g = 0; g < groups.size(); g++) {
+                    for (size_t g = 0; g < cachedGroups->second.size(); g++) {
                         if (g) ss << L',';
-                        ss << L'[' << groups[g].start << L',' << groups[g].count << L',' << g << L']';
+                        ss << L'[' << cachedGroups->second[g].start << L',' << cachedGroups->second[g].count << L',' << g << L']';
                     }
-                    ss << L"]";
-                    // Materials array: one PBR per group
-                    ss << L",\"mats\":[";
-                    for (size_t g = 0; g < groups.size(); g++) {
+                    ss << L"],\"mats\":[";
+                    for (size_t g = 0; g < cachedGroups->second.size(); g++) {
                         if (g) ss << L',';
-                        Mtl* subMtl = GetSubMtlFromMatID(multiMtl, groups[g].matID);
+                        Mtl* subMtl = GetSubMtlFromMatID(multiMtl, cachedGroups->second[g].matID);
                         MaxJSPBR subPBR;
                         ExtractPBRFromMtl(subMtl, node, t, subPBR);
                         WriteMaterialFull(ss, subPBR);
                     }
                     ss << L"]";
                 } else {
-                    // Single material
                     MaxJSPBR pbr;
                     ExtractPBR(node, t, pbr);
                     ss << L",\"mat\":";
                     WriteMaterialFull(ss, pbr);
                 }
 
-                ss << L'}';  // end node
+                ss << L'}';
                 first = false;
-                geomHandles_.insert(node->GetHandle());
+                geomHandles_.insert(handle);
+            } else {
+                std::vector<float> verts, uvs;
+                std::vector<int> indices;
+                std::vector<MatGroup> groups;
+                if (ExtractMesh(node, t, verts, uvs, indices, groups)) {
+                    float xform[16]; GetTransform16(node, t, xform);
+
+                    // Cache validity + groups for future skip
+                    if (os.obj && os.obj->SuperClassID() == GEOMOBJECT_CLASS_ID) {
+                        Interval gv = os.obj->ChannelValidity(t, GEOM_CHAN_NUM);
+                        lastBBoxHash_[handle] = static_cast<uint64_t>(gv.Start()) ^ (static_cast<uint64_t>(gv.End()) << 32);
+                    }
+                    groupCache_[handle] = groups;
+
+                    if (!first) ss << L',';
+                    ss << L"{\"h\":" << handle;
+                    ss << L",\"n\":\"" << EscapeJson(node->GetName()) << L'"';
+                    ss << L",\"s\":" << (node->Selected() ? L'1' : L'0');
+                    ss << L",\"t\":"; WriteFloats(ss, xform, 16);
+                    RememberSentTransform(handle, xform);
+                    ss << L",\"v\":"; WriteFloats(ss, verts.data(), verts.size());
+                    ss << L",\"i\":"; WriteInts(ss, indices.data(), indices.size());
+                    if (!uvs.empty()) {
+                        ss << L",\"uv\":"; WriteFloats(ss, uvs.data(), uvs.size());
+                    }
+
+                    // Multi/Sub material support
+                    Mtl* multiMtl = FindMultiSubMtl(node->GetMtl());
+                    if (multiMtl && multiMtl->NumSubMtls() > 0 && groups.size() > 1) {
+                        ss << L",\"groups\":[";
+                        for (size_t g = 0; g < groups.size(); g++) {
+                            if (g) ss << L',';
+                            ss << L'[' << groups[g].start << L',' << groups[g].count << L',' << g << L']';
+                        }
+                        ss << L"],\"mats\":[";
+                        for (size_t g = 0; g < groups.size(); g++) {
+                            if (g) ss << L',';
+                            Mtl* subMtl = GetSubMtlFromMatID(multiMtl, groups[g].matID);
+                            MaxJSPBR subPBR;
+                            ExtractPBRFromMtl(subMtl, node, t, subPBR);
+                            WriteMaterialFull(ss, subPBR);
+                        }
+                        ss << L"]";
+                    } else {
+                        MaxJSPBR pbr;
+                        ExtractPBR(node, t, pbr);
+                        ss << L",\"mat\":";
+                        WriteMaterialFull(ss, pbr);
+                    }
+
+                    ss << L'}';
+                    first = false;
+                    geomHandles_.insert(handle);
+                }
             }
 
-            WriteSceneNodes(node, t, ss, first);
+            WriteSceneNodes(node, t, ss, first, prevGeom);
         }
     }
 
@@ -3268,6 +3313,8 @@ public:
         env_->QueryInterface(IID_PPV_ARGS(&env12));
         if (!wv17 || !env12) { SendFullSync(); return; }
 
+        // Save previous tracking so we can skip extraction for unchanged nodes
+        std::unordered_set<ULONG> prevGeom = std::move(geomHandles_);
         geomHandles_.clear();
         lightHandles_.clear();
         splatHandles_.clear();
@@ -3301,12 +3348,41 @@ public:
                 ng.handle = node->GetHandle();
                 ng.changed = false;
                 ng.visible = !node->IsNodeHidden(TRUE);
-                if (ExtractMesh(node, t, ng.verts, ng.uvs, ng.indices, ng.groups)) {
-                    // Content hash: catches deforms/UV edits even when counts are unchanged.
+
+                // Skip expensive ExtractMesh for previously-tracked nodes with unchanged geometry.
+                // ConvertToType(TRIOBJ) on a 10M poly mesh takes seconds — avoid it when possible.
+                bool skipExtract = false;
+                if (prevGeom.count(ng.handle) && geoHashMap_.count(ng.handle)) {
+                    if (os.obj && os.obj->SuperClassID() == GEOMOBJECT_CLASS_ID) {
+                        Interval gv = os.obj->ChannelValidity(t, GEOM_CHAN_NUM);
+                        uint64_t validKey = static_cast<uint64_t>(gv.Start()) ^ (static_cast<uint64_t>(gv.End()) << 32);
+                        auto bboxIt = lastBBoxHash_.find(ng.handle);
+                        if (bboxIt != lastBBoxHash_.end() && bboxIt->second == validKey) {
+                            skipExtract = true;
+                        }
+                        lastBBoxHash_[ng.handle] = validKey;
+                    }
+                }
+
+                if (skipExtract) {
+                    // Geometry unchanged — reuse cached groups, skip mesh extraction entirely
+                    auto gIt = groupCache_.find(ng.handle);
+                    if (gIt != groupCache_.end()) ng.groups = gIt->second;
+                    geos.push_back(std::move(ng));
+                    geomHandles_.insert(node->GetHandle());
+                } else if (ExtractMesh(node, t, ng.verts, ng.uvs, ng.indices, ng.groups)) {
+                    // Full extraction — compute content hash
                     uint64_t hash = HashMeshData(ng.verts, ng.indices, ng.uvs);
                     auto it = geoHashMap_.find(ng.handle);
                     ng.changed = (it == geoHashMap_.end() || it->second != hash);
                     geoHashMap_[ng.handle] = hash;
+                    groupCache_[ng.handle] = ng.groups;
+
+                    // Cache validity for future skip checks
+                    if (os.obj && os.obj->SuperClassID() == GEOMOBJECT_CLASS_ID) {
+                        Interval gv = os.obj->ChannelValidity(t, GEOM_CHAN_NUM);
+                        lastBBoxHash_[ng.handle] = static_cast<uint64_t>(gv.Start()) ^ (static_cast<uint64_t>(gv.End()) << 32);
+                    }
 
                     if (ng.changed) {
                         ng.vOff = totalBytes;
@@ -3318,7 +3394,7 @@ public:
                             totalBytes += ng.uvs.size() * sizeof(float);
                     }
                     geos.push_back(std::move(ng));
-                    geomHandles_.insert(ng.handle);
+                    geomHandles_.insert(node->GetHandle());
                 }
                 collect(node);
             }
@@ -3340,6 +3416,14 @@ public:
         }
         for (auto it = splatHashMap_.begin(); it != splatHashMap_.end(); ) {
             if (splatHandles_.find(it->first) == splatHandles_.end()) it = splatHashMap_.erase(it);
+            else ++it;
+        }
+        for (auto it = groupCache_.begin(); it != groupCache_.end(); ) {
+            if (geomHandles_.find(it->first) == geomHandles_.end()) it = groupCache_.erase(it);
+            else ++it;
+        }
+        for (auto it = lastBBoxHash_.begin(); it != lastBBoxHash_.end(); ) {
+            if (geomHandles_.find(it->first) == geomHandles_.end()) it = lastBBoxHash_.erase(it);
             else ++it;
         }
 
@@ -3671,6 +3755,8 @@ public:
         lightHashMap_.clear();
         splatHashMap_.clear();
         geoHashMap_.clear();
+        groupCache_.clear();
+        lastBBoxHash_.clear();
         if (hwnd_) { HWND h = hwnd_; hwnd_ = nullptr; DestroyWindow(h); }
     }
 
@@ -3729,11 +3815,11 @@ void MaxJSFastNodeEventCallback::HideChanged(NodeKeyTab& nodes) {
 }
 
 void MaxJSFastNodeEventCallback::GeometryChanged(NodeKeyTab& nodes) {
-    if (owner_) owner_->MarkGeometryDirty(nodes);
+    if (owner_) owner_->MarkGeometryPositionsDirty(nodes);
 }
 
 void MaxJSFastNodeEventCallback::TopologyChanged(NodeKeyTab& nodes) {
-    if (owner_) owner_->MarkGeometryDirty(nodes);
+    if (owner_) owner_->MarkGeometryTopologyDirty(nodes);
 }
 
 void MaxJSFastRedrawCallback::proc(Interface*) {
@@ -3753,7 +3839,7 @@ void MaxJSFastTimeChangeCallback::TimeChanged(TimeValue) {
 
 static void OnSceneChanged(void* param, NotifyInfo*) {
     auto* p = static_cast<MaxJSPanel*>(param);
-    if (p) p->dirty_ = true;
+    if (p) p->SetDirty();
 }
 
 // ══════════════════════════════════════════════════════════════

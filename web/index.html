@@ -1542,20 +1542,30 @@
                         : new THREE.MeshStandardMaterial({ color: 0x888888, side: THREE.DoubleSide });
                 }
 
-                const geom = buildGeometry(nd.v, nd.i, nd.uv, nd.norm);
-
-                // Add material groups for Multi/Sub
-                if (nd.groups) {
+                // Geometry: only rebuild if vertex data is present (skip for cached nodes)
+                let geom = mesh?.geometry;
+                if (nd.v && nd.i) {
+                    geom = buildGeometry(nd.v, nd.i, nd.uv, nd.norm);
+                    if (nd.groups) {
+                        for (const [start, count, idx] of nd.groups) {
+                            geom.addGroup(start, count, idx);
+                        }
+                    }
+                } else if (geom && nd.groups) {
+                    geom.clearGroups();
                     for (const [start, count, idx] of nd.groups) {
                         geom.addGroup(start, count, idx);
                     }
                 }
 
                 if (mesh) {
-                    mesh.geometry.dispose();
-                    mesh.geometry = geom;
+                    if (nd.v && nd.i && geom !== mesh.geometry) {
+                        mesh.geometry.dispose();
+                        mesh.geometry = geom;
+                    }
                     mesh.material = mat;
                 } else {
+                    if (!geom) continue;
                     mesh = new THREE.Mesh(geom, mat);
                     mesh.matrixAutoUpdate = false;
                     mesh.name = nd.n;

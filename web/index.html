@@ -471,6 +471,7 @@
         // Lights (fallback, hidden when HDRI loads)
         // Default lighting — neutral, camera-aligned
         const defaultLights = new THREE.Group();
+        defaultLights.add(new THREE.AmbientLight(0xffffff, 0.4));
         const defaultKey = new THREE.DirectionalLight(0xffffff, 2.5);
         defaultKey.castShadow = true;
         defaultKey.shadow.mapSize.set(2048, 2048);
@@ -791,6 +792,7 @@
         let localHdriIntensity = 1.0;
         let localHdriShowBg = false;
         let localHdriBlur = 0;
+        let localHdriFlip = false;
 
         function isLocalHdriLoaded() { return localHdriObjectUrl != null; }
         function isLocalHdriActive() { return isLocalHdriLoaded() && localHdriEnabled; }
@@ -1118,8 +1120,19 @@
             if (localHdriEnabled) {
                 scene.environment = localHdriEnvMap;
                 scene.environmentIntensity = localHdriIntensity;
-                scene.environmentRotation.set(0, localHdriRotation * Math.PI / 180, 0);
-                scene.backgroundRotation.set(0, localHdriRotation * Math.PI / 180, 0);
+                const rot = localHdriRotation * Math.PI / 180;
+                const envBasis = new THREE.Matrix4().makeBasis(
+                    new THREE.Vector3(0, 0, 1),
+                    new THREE.Vector3(1, 0, 0),
+                    new THREE.Vector3(0, -1, 0)
+                );
+                const envYaw = new THREE.Matrix4().makeRotationZ(-rot);
+                const flipMat = localHdriFlip
+                    ? new THREE.Matrix4().makeScale(1, 1, -1)
+                    : new THREE.Matrix4();
+                const envRotation = new THREE.Matrix4().multiplyMatrices(envBasis, envYaw).multiply(flipMat);
+                scene.environmentRotation.setFromRotationMatrix(envRotation);
+                scene.backgroundRotation.copy(scene.environmentRotation);
                 scene.backgroundBlurriness = localHdriBlur;
                 if (localHdriShowBg) {
                     scene.background = localHdriEnvMap;
@@ -1726,7 +1739,7 @@
         let clayModeActive = false;
         let clayPreFxSnapshot = null;
         const clayMat = new THREE.MeshStandardMaterial({
-            color: 0x9d3d31, roughness: 0.85, metalness: 0.0, side: THREE.DoubleSide,
+            color: 0x9d3d31, roughness: 0.6, metalness: 0.05, side: THREE.DoubleSide,
         });
 
         function enterClayMode() {
@@ -1757,7 +1770,8 @@
             ssgiFx.setVolumetricEnabled(false);
             ssgiFx.setPixelEnabled(false);
             ssgiFx.setFogEnabled(false);
-            // Force GTAO on
+            // Force GTAO on with inverted (bright) AO
+            if (ssgiFx.setClayOverride) ssgiFx.setClayOverride(true);
             ssgiFx.setGTAOEnabled(true);
 
             // Swap materials
@@ -1780,6 +1794,7 @@
             }
             // Restore FX state
             if (clayPreFxSnapshot) {
+                if (ssgiFx.setClayOverride) ssgiFx.setClayOverride(false);
                 ssgiFx.setGTAOEnabled(clayPreFxSnapshot.gtao);
                 ssgiFx.setEnabled(clayPreFxSnapshot.ssgi);
                 ssgiFx.setSSREnabled(clayPreFxSnapshot.ssr);
@@ -1871,8 +1886,17 @@
                                     }
                                 }
 
+                                if (meta.nOff != null && meta.nN) {
+                                    const norm = mesh.geometry.getAttribute('normal');
+                                    if (norm && norm.count === meta.nN / 3) {
+                                        norm.array.set(new Float32Array(buf, meta.nOff, meta.nN));
+                                        norm.needsUpdate = true;
+                                    }
+                                } else {
+                                    scheduleNormals(mesh.geometry);
+                                }
+
                                 mesh.geometry.computeBoundingSphere();
-                                scheduleNormals(mesh.geometry);
                             } else {
                                 // Topology changed — full rebuild
                                 const verts = new Float32Array(new Float32Array(buf, meta.vOff, meta.vN));
@@ -1884,7 +1908,12 @@
                                     const uvs = new Float32Array(new Float32Array(buf, meta.uvOff, meta.uvN));
                                     geom.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
                                 }
-                                geom.computeVertexNormals();
+                                if (meta.nOff != null && meta.nN) {
+                                    const norms = new Float32Array(new Float32Array(buf, meta.nOff, meta.nN));
+                                    geom.setAttribute('normal', new THREE.BufferAttribute(norms, 3));
+                                } else {
+                                    geom.computeVertexNormals();
+                                }
                                 geom.computeBoundingSphere();
                                 mesh.geometry.dispose();
                                 mesh.geometry = geom;
@@ -2045,7 +2074,7 @@
         bridge.on('geo_fast', msg => {
             const mesh = nodeMap.get(msg.h);
             if (!mesh) return;
-            const geom = buildGeometry(msg.v, msg.i, msg.uv);
+            const geom = buildGeometry(msg.v, msg.i, msg.uv, msg.norm);
             mesh.geometry.dispose();
             mesh.geometry = geom;
         });
@@ -2996,9 +3025,9 @@
                                 <div class="fx-control-head"><span>BG Blur</span><span class="fx-value" id="fx-hdri-blur-val">0.0</span></div>
                                 <input class="fx-range" id="fx-hdri-blur" type="range" min="0" max="1" step="0.01" value="0">
                             </label>
-                            <label class="fx-check" for="fx-hdri-bg">
-                                <span>Background</span>
-                                <input id="fx-hdri-bg" type="checkbox">
+                            <label class="fx-check" for="fx-hdri-flip">
+                                <span>Flip</span>
+                                <input id="fx-hdri-flip" type="checkbox">
                             </label>
                         </div>
                     </section>
@@ -3127,9 +3156,9 @@
                 applyLocalHDRISettings();
                 savePostFxState();
             };
-            const hdriBgCheck = document.getElementById('fx-hdri-bg');
-            hdriBgCheck.onchange = () => {
-                localHdriShowBg = hdriBgCheck.checked;
+            const hdriFlipCheck = document.getElementById('fx-hdri-flip');
+            hdriFlipCheck.onchange = () => {
+                localHdriFlip = hdriFlipCheck.checked;
                 applyLocalHDRISettings();
                 savePostFxState();
             };
@@ -3140,7 +3169,7 @@
             hdriIntVal.textContent = localHdriIntensity.toFixed(2);
             hdriBlurSlider.value = localHdriBlur;
             hdriBlurVal.textContent = localHdriBlur.toFixed(2);
-            hdriBgCheck.checked = localHdriShowBg;
+            hdriFlipCheck.checked = localHdriFlip;
             syncHdriPanel();
 
             for (const section of postFxSections) {
@@ -3287,6 +3316,7 @@
                         intensity: localHdriIntensity,
                         showBg: localHdriShowBg,
                         blur: localHdriBlur,
+                        flip: localHdriFlip,
                         enabled: localHdriEnabled,
                         fileName: isLocalHdriLoaded() ? localHdriFileName : '',
                     },
@@ -3316,6 +3346,7 @@
                     if (Number.isFinite(saved.hdri.intensity)) localHdriIntensity = saved.hdri.intensity;
                     if (Number.isFinite(saved.hdri.blur)) localHdriBlur = saved.hdri.blur;
                     if (typeof saved.hdri.showBg === 'boolean') localHdriShowBg = saved.hdri.showBg;
+                    if (typeof saved.hdri.flip === 'boolean') localHdriFlip = saved.hdri.flip;
                     if (typeof saved.hdri.enabled === 'boolean') localHdriEnabled = saved.hdri.enabled;
                 }
 

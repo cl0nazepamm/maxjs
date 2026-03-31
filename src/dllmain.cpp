@@ -1072,7 +1072,8 @@ static bool ExtractMeshFromMNMesh(MNMesh& mn,
                                   std::vector<float>& verts,
                                   std::vector<float>& uvs,
                                   std::vector<int>& indices,
-                                  std::vector<MatGroup>& groups) {
+                                  std::vector<MatGroup>& groups,
+                                  std::vector<float>* outNormals = nullptr) {
     const int numFaces = mn.FNum();
     const int numVerts = mn.VNum();
     if (numFaces == 0 || numVerts == 0) return false;
@@ -1103,12 +1104,52 @@ static bool ExtractMeshFromMNMesh(MNMesh& mn,
             [](const FaceRef& a, const FaceRef& b) { return a.matID < b.matID; });
     }
 
+    // Compute face normals for all live faces
+    std::vector<Point3> faceNormals(numFaces, Point3(0, 0, 0));
+    for (auto& fr : liveFaces) {
+        MNFace* face = mn.F(fr.idx);
+        if (face->deg < 3) continue;
+        Point3 a = mn.P(face->vtx[0]);
+        Point3 b = mn.P(face->vtx[1]);
+        Point3 c = mn.P(face->vtx[2]);
+        faceNormals[fr.idx] = Normalize((b - a) ^ (c - a));
+    }
+
+    // Build per-vertex smooth normals respecting smoothing groups.
+    // Key: {posIdx, smGroup} → accumulated normal
+    struct SmNormKey { int posIdx; DWORD smGrp; };
+    struct SmNormKeyHash {
+        size_t operator()(const SmNormKey& k) const noexcept {
+            return size_t(k.posIdx) * 16777619u ^ size_t(k.smGrp);
+        }
+    };
+    struct SmNormKeyEq {
+        bool operator()(const SmNormKey& a, const SmNormKey& b) const {
+            return a.posIdx == b.posIdx && a.smGrp == b.smGrp;
+        }
+    };
+    std::unordered_map<SmNormKey, Point3, SmNormKeyHash, SmNormKeyEq> smoothNormals;
+    for (auto& fr : liveFaces) {
+        MNFace* face = mn.F(fr.idx);
+        const DWORD smGrp = face->smGroup;
+        for (int v = 0; v < face->deg; v++) {
+            SmNormKey key = { face->vtx[v], smGrp };
+            smoothNormals[key] = smoothNormals[key] + faceNormals[fr.idx];
+        }
+    }
+    // Normalize
+    for (auto& kv : smoothNormals) {
+        kv.second = Normalize(kv.second);
+    }
+
     // Estimate output sizes
     int estTris = 0;
     for (auto& fr : liveFaces) estTris += mn.F(fr.idx)->deg - 2;
     verts.reserve(numVerts * 3);
     if (hasUVs) uvs.reserve(numVerts * 2);
     indices.reserve(estTris * 3);
+    std::vector<float> normals;
+    if (outNormals) normals.reserve(numVerts * 3);
 
     std::unordered_map<MeshCornerKey, int, MeshCornerKeyHash> vertMap;
     Tab<int> triTab;
@@ -1125,17 +1166,15 @@ static bool ExtractMeshFromMNMesh(MNMesh& mn,
             groups.push_back({ matID, (int)indices.size(), 0 });
         }
 
-        // Get UV face (same degree as geo face)
         MNMapFace* uvFace = (hasUVs && fr.idx < uvMap->numf) ? uvMap->F(fr.idx) : nullptr;
 
-        // Triangulate: GetTriangles returns indices into the face's vtx[] array
         triTab.SetCount(0);
         face->GetTriangles(triTab);
         const int numTris = triTab.Count() / 3;
 
         for (int ti = 0; ti < numTris; ti++) {
             for (int tv = 0; tv < 3; tv++) {
-                int localIdx = triTab[ti * 3 + tv];  // index into face->vtx[]
+                int localIdx = triTab[ti * 3 + tv];
                 DWORD posIdx = face->vtx[localIdx];
                 DWORD uvIdx = (uvFace && localIdx < uvFace->deg) ? uvFace->tv[localIdx] : 0;
 
@@ -1152,6 +1191,15 @@ static bool ExtractMeshFromMNMesh(MNMesh& mn,
                     verts.push_back(p.y);
                     verts.push_back(p.z);
 
+                    if (outNormals) {
+                        SmNormKey nk = { (int)posIdx, smGrp };
+                        auto nit = smoothNormals.find(nk);
+                        Point3 n = (nit != smoothNormals.end()) ? nit->second : faceNormals[fr.idx];
+                        normals.push_back(n.x);
+                        normals.push_back(n.y);
+                        normals.push_back(n.z);
+                    }
+
                     if (hasUVs && uvIdx < (DWORD)uvMap->numv) {
                         UVVert uv = uvMap->v[uvIdx];
                         uvs.push_back(uv.x);
@@ -1167,6 +1215,7 @@ static bool ExtractMeshFromMNMesh(MNMesh& mn,
             groups.back().count += 3;
         }
     }
+    if (outNormals) *outNormals = std::move(normals);
     return !indices.empty();
 }
 
@@ -1254,7 +1303,8 @@ static bool ExtractMesh(INode* node, TimeValue t,
                         std::vector<float>& verts,
                         std::vector<float>& uvs,
                         std::vector<int>& indices,
-                        std::vector<MatGroup>& groups) {
+                        std::vector<MatGroup>& groups,
+                        std::vector<float>* normals = nullptr) {
     ObjectState os = node->EvalWorldState(t);
     if (!os.obj || os.obj->SuperClassID() != GEOMOBJECT_CLASS_ID) return false;
     if (IsThreeJSSplatClassID(os.obj->ClassID())) return false;
@@ -1263,7 +1313,7 @@ static bool ExtractMesh(INode* node, TimeValue t,
     if (os.obj->IsSubClassOf(polyObjectClassID)) {
         PolyObject* poly = static_cast<PolyObject*>(os.obj);
         MNMesh& mn = poly->GetMesh();
-        return ExtractMeshFromMNMesh(mn, verts, uvs, indices, groups);
+        return ExtractMeshFromMNMesh(mn, verts, uvs, indices, groups, normals);
     }
 
     // Fallback: convert to TriObject for non-poly geometry (primitives, patches, etc.)
@@ -2326,18 +2376,17 @@ public:
             INode* node = ip->GetINodeByHandle(handle);
             if (!node) continue;
 
-            std::vector<float> verts, uvs;
+            std::vector<float> verts, uvs, norms;
             std::vector<int> indices;
             std::vector<MatGroup> groups;
-            if (!ExtractMesh(node, t, verts, uvs, indices, groups)) continue;
+            if (!ExtractMesh(node, t, verts, uvs, indices, groups, &norms)) continue;
 
             // Update hash so we don't re-send next frame
             uint64_t hash = HashMeshData(verts, indices, uvs);
             geoHashMap_[handle] = hash;
 
             if (wv17 && env12) {
-                // Binary: SharedBuffer with just this mesh
-                size_t totalBytes = verts.size() * 4 + indices.size() * 4 + uvs.size() * 4;
+                size_t totalBytes = verts.size() * 4 + indices.size() * 4 + uvs.size() * 4 + norms.size() * 4;
                 if (totalBytes < 4) totalBytes = 4;
 
                 ComPtr<ICoreWebView2SharedBuffer> buf;
@@ -2350,6 +2399,8 @@ public:
                 memcpy(ptr + off, indices.data(), indices.size() * 4); size_t iOff = off; off += indices.size() * 4;
                 size_t uvOff = off;
                 if (!uvs.empty()) { memcpy(ptr + off, uvs.data(), uvs.size() * 4); off += uvs.size() * 4; }
+                size_t nOff = off;
+                if (!norms.empty()) { memcpy(ptr + off, norms.data(), norms.size() * 4); off += norms.size() * 4; }
 
                 std::wostringstream ss;
                 ss.imbue(std::locale::classic());
@@ -2357,19 +2408,20 @@ public:
                 ss << L",\"vOff\":" << vOff << L",\"vN\":" << verts.size();
                 ss << L",\"iOff\":" << iOff << L",\"iN\":" << indices.size();
                 if (!uvs.empty()) ss << L",\"uvOff\":" << uvOff << L",\"uvN\":" << uvs.size();
+                if (!norms.empty()) ss << L",\"nOff\":" << nOff << L",\"nN\":" << norms.size();
                 ss << L'}';
 
                 wv17->PostSharedBufferToScript(buf.Get(),
                     COREWEBVIEW2_SHARED_BUFFER_ACCESS_READ_ONLY,
                     ss.str().c_str());
             } else {
-                // JSON fallback
                 std::wostringstream ss;
                 ss.imbue(std::locale::classic());
                 ss << L"{\"type\":\"geo_fast\",\"h\":" << handle;
                 ss << L",\"v\":"; WriteFloats(ss, verts.data(), verts.size());
                 ss << L",\"i\":"; WriteInts(ss, indices.data(), indices.size());
                 if (!uvs.empty()) { ss << L",\"uv\":"; WriteFloats(ss, uvs.data(), uvs.size()); }
+                if (!norms.empty()) { ss << L",\"norm\":"; WriteFloats(ss, norms.data(), norms.size()); }
                 ss << L'}';
                 webview_->PostWebMessageAsJson(ss.str().c_str());
             }
@@ -3398,13 +3450,12 @@ public:
                 first = false;
                 geomHandles_.insert(handle);
             } else {
-                std::vector<float> verts, uvs;
+                std::vector<float> verts, uvs, norms;
                 std::vector<int> indices;
                 std::vector<MatGroup> groups;
-                if (ExtractMesh(node, t, verts, uvs, indices, groups)) {
+                if (ExtractMesh(node, t, verts, uvs, indices, groups, &norms)) {
                     float xform[16]; GetTransform16(node, t, xform);
 
-                    // Cache validity + groups for future skip
                     if (os.obj && os.obj->SuperClassID() == GEOMOBJECT_CLASS_ID) {
                         Interval gv = os.obj->ChannelValidity(t, GEOM_CHAN_NUM);
                         lastBBoxHash_[handle] = static_cast<uint64_t>(gv.Start()) ^ (static_cast<uint64_t>(gv.End()) << 32);
@@ -3421,6 +3472,9 @@ public:
                     ss << L",\"i\":"; WriteInts(ss, indices.data(), indices.size());
                     if (!uvs.empty()) {
                         ss << L",\"uv\":"; WriteFloats(ss, uvs.data(), uvs.size());
+                    }
+                    if (!norms.empty()) {
+                        ss << L",\"norm\":"; WriteFloats(ss, norms.data(), norms.size());
                     }
 
                     // Multi/Sub material support
@@ -3484,12 +3538,12 @@ public:
         struct NodeGeo {
             ULONG handle;
             INode* node;
-            std::vector<float> verts, uvs;
+            std::vector<float> verts, uvs, norms;
             std::vector<int> indices;
             std::vector<MatGroup> groups;
             bool changed;
             bool visible = true;
-            size_t vOff, iOff, uvOff;
+            size_t vOff, iOff, uvOff, nOff;
         };
         std::vector<NodeGeo> geos;
         size_t totalBytes = 0;
@@ -3530,15 +3584,13 @@ public:
                     if (gIt != groupCache_.end()) ng.groups = gIt->second;
                     geos.push_back(std::move(ng));
                     geomHandles_.insert(node->GetHandle());
-                } else if (ExtractMesh(node, t, ng.verts, ng.uvs, ng.indices, ng.groups)) {
-                    // Full extraction — compute content hash
+                } else if (ExtractMesh(node, t, ng.verts, ng.uvs, ng.indices, ng.groups, &ng.norms)) {
                     uint64_t hash = HashMeshData(ng.verts, ng.indices, ng.uvs);
                     auto it = geoHashMap_.find(ng.handle);
                     ng.changed = (it == geoHashMap_.end() || it->second != hash);
                     geoHashMap_[ng.handle] = hash;
                     groupCache_[ng.handle] = ng.groups;
 
-                    // Cache validity for future skip checks
                     if (os.obj && os.obj->SuperClassID() == GEOMOBJECT_CLASS_ID) {
                         Interval gv = os.obj->ChannelValidity(t, GEOM_CHAN_NUM);
                         lastBBoxHash_[ng.handle] = static_cast<uint64_t>(gv.Start()) ^ (static_cast<uint64_t>(gv.End()) << 32);
@@ -3552,6 +3604,9 @@ public:
                         ng.uvOff = totalBytes;
                         if (!ng.uvs.empty())
                             totalBytes += ng.uvs.size() * sizeof(float);
+                        ng.nOff = totalBytes;
+                        if (!ng.norms.empty())
+                            totalBytes += ng.norms.size() * sizeof(float);
                     }
                     geos.push_back(std::move(ng));
                     geomHandles_.insert(node->GetHandle());
@@ -3622,6 +3677,8 @@ public:
                 memcpy(bufPtr + ng.iOff, ng.indices.data(), ng.indices.size() * sizeof(int));
                 if (!ng.uvs.empty())
                     memcpy(bufPtr + ng.uvOff, ng.uvs.data(), ng.uvs.size() * sizeof(float));
+                if (!ng.norms.empty())
+                    memcpy(bufPtr + ng.nOff, ng.norms.data(), ng.norms.size() * sizeof(float));
 
                 ss << L",\"geo\":{\"vOff\":" << ng.vOff;
                 ss << L",\"vN\":" << ng.verts.size();
@@ -3630,6 +3687,10 @@ public:
                 if (!ng.uvs.empty()) {
                     ss << L",\"uvOff\":" << ng.uvOff;
                     ss << L",\"uvN\":" << ng.uvs.size();
+                }
+                if (!ng.norms.empty()) {
+                    ss << L",\"nOff\":" << ng.nOff;
+                    ss << L",\"nN\":" << ng.norms.size();
                 }
                 ss << L'}';
             }

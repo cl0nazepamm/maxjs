@@ -1317,52 +1317,6 @@
             mesh.receiveShadow = true;
         }
 
-        function applyNodeProps(mesh, props) {
-            if (!mesh?.isMesh || !props) return;
-
-            // Renderable → visible (combined with hidden state)
-            if (props.rend === 0) mesh.visible = false;
-
-            // Cast / receive shadows (from Max node properties)
-            mesh.castShadow = props.cshadow !== 0;
-            mesh.receiveShadow = props.rshadow !== 0;
-
-            // Backface culling → material side
-            const side = props.bcull ? THREE.FrontSide : THREE.DoubleSide;
-            const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
-            for (const m of mats) {
-                if (m && m.side !== side) m.side = side;
-            }
-
-            // Opacity
-            if (props.opacity != null && props.opacity < 0.999) {
-                for (const m of mats) {
-                    if (!m) continue;
-                    m.transparent = true;
-                    m.opacity = props.opacity;
-                }
-            } else {
-                for (const m of mats) {
-                    if (!m) continue;
-                    // Only reset if we previously forced transparency from props
-                    if (m.opacity < 0.999 && m.userData?._propsOpacity) {
-                        m.transparent = false;
-                        m.opacity = 1.0;
-                    }
-                }
-            }
-            // Track that opacity came from props
-            for (const m of mats) {
-                if (m) {
-                    if (!m.userData) m.userData = {};
-                    m.userData._propsOpacity = props.opacity != null && props.opacity < 0.999;
-                }
-            }
-
-            // Store for reference
-            mesh.userData.nodeProps = props;
-        }
-
         function applySSSMaterialNodes(material, md) {
             if (!material || typeof material !== 'object') return;
 
@@ -2044,7 +1998,6 @@
                 mesh.visible = true;
                 mesh.frustumCulled = false;
                 applyMeshShadowState(mesh);
-                applyNodeProps(mesh, nd.props);
 
                 applyTransform(mesh, nd.t);
                 applySelection(mesh, nd.s);
@@ -2132,11 +2085,12 @@
             for (const nd of msg.nodes) {
                 const mesh = nodeMap.get(nd.h);
                 if (!mesh) continue;
+                // Visibility (hide/unhide/isolate) — instant, no full sync needed
                 const vis = nd.vis !== 0;
                 if (mesh.visible !== vis) mesh.visible = vis;
                 applyTransform(mesh, nd.t);
                 applySelection(mesh, nd.s);
-                applyNodeProps(mesh, nd.props);
+                // Live material update from scalars
                 if (nd.mat && mesh.material) applyMaterialScalar(mesh, nd.mat);
             }
             if (msg.lights) applyLightUpdates(msg.lights);
@@ -2261,7 +2215,6 @@
                 mesh.visible = nd.vis !== 0;
                 mesh.frustumCulled = false;
                 applyMeshShadowState(mesh);
-                applyNodeProps(mesh, nd.props);
 
                 applyTransform(mesh, nd.t);
                 applySelection(mesh, nd.s);

@@ -1413,25 +1413,6 @@ static bool CameraEquals(const CameraData& a, const CameraData& b) {
 }
 
 // ══════════════════════════════════════════════════════════════
-//  Node Object Properties (renderable, shadows, opacity, etc.)
-// ══════════════════════════════════════════════════════════════
-
-static void WriteNodeProps(std::wostringstream& ss, INode* node, TimeValue t) {
-    ss << L",\"props\":{";
-    ss << L"\"rend\":" << (node->Renderable() ? L'1' : L'0');
-    ss << L",\"bcull\":" << (node->GetBackCull() ? L'1' : L'0');
-    ss << L",\"cshadow\":" << (node->CastShadows() ? L'1' : L'0');
-    ss << L",\"rshadow\":" << (node->RcvShadows() ? L'1' : L'0');
-    ss << L",\"visCam\":" << (node->GetPrimaryVisibility() ? L'1' : L'0');
-    ss << L",\"visRefl\":" << (node->GetSecondaryVisibility() ? L'1' : L'0');
-    float opacity = node->GetVisibility(t);
-    if (opacity < 0.0f) opacity = 0.0f;
-    if (opacity > 1.0f) opacity = 1.0f;
-    ss << L",\"opacity\":" << opacity;
-    ss << L'}';
-}
-
-// ══════════════════════════════════════════════════════════════
 //  Environment HDRI — full param extraction
 // ══════════════════════════════════════════════════════════════
 
@@ -1695,7 +1676,6 @@ public:
     std::unordered_map<ULONG, uint64_t> splatHashMap_; // node handle → splat source state hash
     std::unordered_map<ULONG, uint64_t> geoHashMap_;   // node handle → geometry topology hash
     std::unordered_map<ULONG, std::vector<MatGroup>> groupCache_; // cached material groups per node
-    std::unordered_map<ULONG, uint64_t> propHashMap_;  // node handle → object properties hash
     std::map<std::wstring, std::wstring> texDirMap_;    // dir → host
     int texDirCount_ = 0;
     bool lastClayMode_ = false;
@@ -1943,7 +1923,6 @@ public:
         mtlHashMap_.clear();
         lightHashMap_.clear();
         splatHashMap_.clear();
-        propHashMap_.clear();
         geoHashMap_.clear();
         groupCache_.clear();
         lastBBoxHash_.clear();
@@ -2322,7 +2301,6 @@ public:
             mtlHashMap_.clear();
             lightHashMap_.clear();
             splatHashMap_.clear();
-            propHashMap_.clear();
             geoHashMap_.clear();  // force all geometry to be sent
             lastSentTransforms_.clear();
             lightHandles_.clear();
@@ -2348,10 +2326,7 @@ public:
             }
         } else {
             if (tickCount_ % 15 == 0) CheckWebContentChanges();
-            if (tickCount_ % MATERIAL_DETECT_TICKS == 0) {
-                DetectMaterialChanges();
-                DetectPropertyChanges();
-            }
+            if (tickCount_ % MATERIAL_DETECT_TICKS == 0) DetectMaterialChanges();
             if (tickCount_ % LIGHT_DETECT_TICKS == 0) {
                 DetectLightChanges();
                 DetectSplatChanges();
@@ -2917,40 +2892,6 @@ public:
         geoScanCursor_ = idx;
     }
 
-    // Detect object property changes (renderable, shadows, opacity, backface cull)
-    void DetectPropertyChanges() {
-        Interface* ip = GetCOREInterface();
-        if (!ip) return;
-        TimeValue t = ip->GetTime();
-        bool changed = false;
-
-        for (ULONG handle : geomHandles_) {
-            INode* node = ip->GetINodeByHandle(handle);
-            if (!node) continue;
-
-            // Quick hash of all node properties
-            uint64_t h = 0;
-            h = h * 31 + (uint64_t)node->Renderable();
-            h = h * 31 + (uint64_t)node->GetBackCull();
-            h = h * 31 + (uint64_t)node->CastShadows();
-            h = h * 31 + (uint64_t)node->RcvShadows();
-            h = h * 31 + (uint64_t)(node->GetPrimaryVisibility() ? 1 : 0);
-            h = h * 31 + (uint64_t)(node->GetSecondaryVisibility() ? 1 : 0);
-            float vis = node->GetVisibility(t);
-            uint32_t visBits; memcpy(&visBits, &vis, 4);
-            h = h * 31 + visBits;
-
-            auto it = propHashMap_.find(handle);
-            if (it == propHashMap_.end()) {
-                propHashMap_[handle] = h;
-            } else if (it->second != h) {
-                it->second = h;
-                if (fastDirtyHandles_.insert(handle).second) changed = true;
-            }
-        }
-        if (changed) QueueFastFlush();
-    }
-
     // ── Camera JSON fragment ─────────────────────────────────
 
     void WriteMaterialTextures(std::wostringstream& ss, const MaxJSPBR& pbr) {
@@ -3478,7 +3419,6 @@ public:
                 ss << L"{\"h\":" << handle;
                 ss << L",\"n\":\"" << EscapeJson(node->GetName()) << L'"';
                 ss << L",\"s\":" << (node->Selected() ? L'1' : L'0');
-                WriteNodeProps(ss, node, t);
                 ss << L",\"t\":"; WriteFloats(ss, xform, 16);
                 RememberSentTransform(handle, xform);
 
@@ -3526,7 +3466,6 @@ public:
                     ss << L"{\"h\":" << handle;
                     ss << L",\"n\":\"" << EscapeJson(node->GetName()) << L'"';
                     ss << L",\"s\":" << (node->Selected() ? L'1' : L'0');
-                    WriteNodeProps(ss, node, t);
                     ss << L",\"t\":"; WriteFloats(ss, xform, 16);
                     RememberSentTransform(handle, xform);
                     ss << L",\"v\":"; WriteFloats(ss, verts.data(), verts.size());
@@ -3730,7 +3669,6 @@ public:
             ss << L",\"n\":\"" << EscapeJson(ng.node->GetName()) << L'"';
             ss << L",\"s\":" << (ng.node->Selected() ? L'1' : L'0');
             ss << L",\"vis\":" << (ng.visible ? L'1' : L'0');
-            WriteNodeProps(ss, ng.node, t);
             ss << L",\"t\":"; WriteFloats(ss, xform, 16);
 
             // Geometry: byte offsets into shared buffer (or -1 if unchanged)
@@ -3849,7 +3787,6 @@ public:
             ss << L"{\"h\":" << handle;
             ss << L",\"s\":" << (node->Selected() ? L'1' : L'0');
             ss << L",\"vis\":" << (visible ? L'1' : L'0');
-            WriteNodeProps(ss, node, t);
             ss << L",\"t\":"; WriteFloats(ss, xform, 16);
             // For Multi/Sub objects, skip scalar material pushes to avoid
             // corrupting material arrays on the web side.
@@ -4038,7 +3975,6 @@ public:
         mtlHashMap_.clear();
         lightHashMap_.clear();
         splatHashMap_.clear();
-        propHashMap_.clear();
         geoHashMap_.clear();
         groupCache_.clear();
         lastBBoxHash_.clear();

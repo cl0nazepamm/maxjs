@@ -2172,14 +2172,6 @@
             });
         });
 
-        bridge.on('mat_fast', msg => {
-            for (const nd of msg.nodes || []) {
-                const mesh = nodeMap.get(nd.h);
-                if (mesh && nd.mat) applyMaterialScalar(mesh, nd.mat);
-            }
-            scene.updateMatrixWorld(true);
-        });
-
         // ── Binary Scene Handler (SharedBuffer) ──────────────
         function handleBinaryScene(buffer, meta) {
             if (meta.type !== 'scene_bin') return;
@@ -2410,82 +2402,18 @@
             // Toon outline is auto-detected from material type — no manual selection needed
         }
 
-        function applyColor3(target, value) {
-            if (!target || !Array.isArray(value) || value.length !== 3) return;
-            target.setRGB(value[0], value[1], value[2]);
-        }
-
         function applyMaterialScalar(mesh, material) {
+            const c = material?.color;
             const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
             for (const m of mats) {
                 if (!m) continue;
-                applyColor3(m.color, material?.color);
+                if (c && m.color) m.color.setRGB(c[0], c[1], c[2]);
                 if (material?.rough != null && 'roughness' in m) m.roughness = material.rough;
                 if (material?.metal != null && 'metalness' in m) m.metalness = material.metal;
-                if (material?.envI != null && 'envMapIntensity' in m) m.envMapIntensity = material.envI;
-                if (material?.aoI != null && 'aoMapIntensity' in m) m.aoMapIntensity = material.aoI;
-                if (material?.lmI != null && 'lightMapIntensity' in m) m.lightMapIntensity = material.lmI;
-                if (material?.normScl != null && m.normalScale) m.normalScale.set(material.normScl, material.normScl);
-                if (material?.bumpS != null && 'bumpScale' in m) m.bumpScale = material.bumpS;
-                if (material?.dispS != null && 'displacementScale' in m) m.displacementScale = material.dispS;
-                if (material?.dispB != null && 'displacementBias' in m) m.displacementBias = material.dispB;
-
-                if ('emissive' in m) {
-                    applyColor3(m.emissive, material?.em);
-                    if (material?.emI != null) {
-                        m.emissiveIntensity = material.emI;
-                    } else if (material?.emMapS != null && m.emissiveMap) {
-                        m.emissiveIntensity = material.emMapS;
-                    }
-                }
-
-                if (material?.specularIntensity != null && 'specularIntensity' in m) {
-                    m.specularIntensity = material.specularIntensity;
-                }
-                applyColor3(m.specularColor, material?.specularColor);
-                if (material?.clearcoat != null && 'clearcoat' in m) m.clearcoat = material.clearcoat;
-                if (material?.clearcoatRoughness != null && 'clearcoatRoughness' in m) {
-                    m.clearcoatRoughness = material.clearcoatRoughness;
-                }
-                if (material?.sheen != null && 'sheen' in m) m.sheen = material.sheen;
-                if (material?.sheenRoughness != null && 'sheenRoughness' in m) {
-                    m.sheenRoughness = material.sheenRoughness;
-                }
-                applyColor3(m.sheenColor, material?.sheenColor);
-                if (material?.iridescence != null && 'iridescence' in m) m.iridescence = material.iridescence;
-                if (material?.iridescenceIOR != null && 'iridescenceIOR' in m) {
-                    m.iridescenceIOR = material.iridescenceIOR;
-                }
-                if (material?.transmission != null && 'transmission' in m) m.transmission = material.transmission;
-                if (material?.ior != null && 'ior' in m) m.ior = material.ior;
-                if (material?.thickness != null && 'thickness' in m) m.thickness = material.thickness;
-                if (material?.dispersion != null && 'dispersion' in m) m.dispersion = material.dispersion;
-                applyColor3(m.attenuationColor, material?.attenuationColor);
-                if (material?.attenuationDistance != null && 'attenuationDistance' in m) {
-                    m.attenuationDistance = material.attenuationDistance;
-                }
-                if (material?.anisotropy != null && 'anisotropy' in m) m.anisotropy = material.anisotropy;
-
-                applyColor3(m.specular, material?.spec);
-                if (material?.shininess != null && 'shininess' in m) m.shininess = material.shininess;
-                if (material?.flat != null && 'flatShading' in m) m.flatShading = !!material.flat;
-                if (material?.wireframe != null && 'wireframe' in m) m.wireframe = !!material.wireframe;
-
-                if ((material?.sssColor || material?.sssDistortion != null || material?.sssAmbient != null ||
-                        material?.sssAttenuation != null || material?.sssPower != null || material?.sssScale != null) &&
-                    (m.userData?.maxjsMaterialModel === 'MeshSSSNodeMaterial' || 'thicknessColorNode' in m)) {
-                    applySSSMaterialNodes(m, material);
-                }
-
                 if (material?.opacity != null) {
                     m.opacity = material.opacity;
+                    m.transparent = material.opacity < 0.999;
                 }
-                const keepsTransparency =
-                    m.opacity < 0.999 ||
-                    !!m.alphaMap ||
-                    !!m.userData?._propsOpacity ||
-                    (Number.isFinite(m.transmission) && m.transmission > 0);
-                m.transparent = keepsTransparency;
                 rememberMaterialEmissiveBase(m);
                 applyMaterialSelectionState(m, !!mesh.userData.maxjsSelected);
                 m.needsUpdate = true;

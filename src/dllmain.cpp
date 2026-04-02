@@ -1364,53 +1364,13 @@ static void ExtractMaterialScalarPreview(Mtl* foundMtl, INode* node, TimeValue t
     if (node) GetWireColor3f(node, col);
 }
 
-static void ResetFastMaterialScalarsForStructureHash(MaxJSPBR& pbr) {
-    pbr.color[0] = 0.8f; pbr.color[1] = 0.8f; pbr.color[2] = 0.8f;
-    pbr.roughness = 0.5f;
-    pbr.metalness = 0.0f;
-    pbr.opacity = 1.0f;
-    pbr.normalScale = 1.0f;
-    pbr.bumpScale = 1.0f;
-    pbr.displacementScale = 0.0f;
-    pbr.displacementBias = 0.0f;
-    pbr.aoIntensity = 1.0f;
-    pbr.envIntensity = 1.0f;
-    pbr.emission[0] = 0.0f; pbr.emission[1] = 0.0f; pbr.emission[2] = 0.0f;
-    pbr.emIntensity = 0.0f;
-    pbr.emissiveMapStrength = 1.0f;
-    pbr.lightmapIntensity = 1.0f;
-    pbr.physicalSpecularColor[0] = 1.0f; pbr.physicalSpecularColor[1] = 1.0f; pbr.physicalSpecularColor[2] = 1.0f;
-    pbr.physicalSpecularIntensity = 1.0f;
-    pbr.clearcoat = 0.0f;
-    pbr.clearcoatRoughness = 0.0f;
-    pbr.sheen = 0.0f;
-    pbr.sheenRoughness = 1.0f;
-    pbr.sheenColor[0] = 0.0f; pbr.sheenColor[1] = 0.0f; pbr.sheenColor[2] = 0.0f;
-    pbr.iridescence = 0.0f;
-    pbr.iridescenceIOR = 1.3f;
-    pbr.transmission = 0.0f;
-    pbr.ior = 1.5f;
-    pbr.thickness = 0.0f;
-    pbr.dispersion = 0.0f;
-    pbr.attenuationColor[0] = 1.0f; pbr.attenuationColor[1] = 1.0f; pbr.attenuationColor[2] = 1.0f;
-    pbr.attenuationDistance = 0.0f;
-    pbr.anisotropy = 0.0f;
-    pbr.sssColor[0] = 1.0f; pbr.sssColor[1] = 1.0f; pbr.sssColor[2] = 1.0f;
-    pbr.sssDistortion = 0.1f;
-    pbr.sssAmbient = 0.0f;
-    pbr.sssAttenuation = 0.1f;
-    pbr.sssPower = 2.0f;
-    pbr.sssScale = 10.0f;
-    pbr.specular[0] = 0.0666667f; pbr.specular[1] = 0.0666667f; pbr.specular[2] = 0.0666667f;
-    pbr.shininess = 30.0f;
-    pbr.flatShading = false;
-    pbr.wireframe = false;
-}
-
-static bool CanFastSyncMaterialScalars(const MaxJSPBR& pbr) {
-    if (pbr.materialModel == L"MeshBackdropNodeMaterial") return false;
-    if (pbr.materialModel == L"MeshSSSNodeMaterial" && !pbr.sssColorMap.empty()) return false;
-    return true;
+static uint64_t HashMaterialScalarPreviewValues(const float col[3], float rough, float metal, float opac) {
+    uint64_t h = 1469598103934665603ULL;
+    h = HashFNV1a(col, sizeof(float) * 3, h);
+    h = HashFNV1a(&rough, sizeof(rough), h);
+    h = HashFNV1a(&metal, sizeof(metal), h);
+    h = HashFNV1a(&opac, sizeof(opac), h);
+    return h;
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -3144,25 +3104,30 @@ public:
         for (ULONG handle : geomHandles_) {
             INode* node = ip->GetINodeByHandle(handle);
             if (!node) {
-                mtlHashMap_.erase(handle);
                 mtlScalarHashMap_.erase(handle);
                 materialFastDirtyHandles_.erase(handle);
                 continue;
             }
 
-            const MaterialSyncState state = ComputeMaterialSyncState(node, t);
-            if (!state.canFastSync) continue;
+            Mtl* rawMtl = node->GetMtl();
+            Mtl* multiMtl = FindMultiSubMtl(rawMtl);
+            if (multiMtl && multiMtl->NumSubMtls() > 1) continue;
 
+            float col[3] = {0.8f, 0.8f, 0.8f};
+            float rough = 0.5f;
+            float metal = 0.0f;
+            float opac = 1.0f;
+            ExtractMaterialScalarPreview(FindSupportedMaterial(rawMtl), node, t, col, rough, metal, opac);
+
+            const uint64_t scalarHash = HashMaterialScalarPreviewValues(col, rough, metal, opac);
             auto it = mtlScalarHashMap_.find(handle);
             if (it == mtlScalarHashMap_.end()) {
-                mtlHashMap_[handle] = state.structureHash;
-                mtlScalarHashMap_[handle] = state.scalarHash;
+                mtlScalarHashMap_[handle] = scalarHash;
                 continue;
             }
 
-            if (it->second != state.scalarHash) {
-                mtlHashMap_[handle] = state.structureHash;
-                it->second = state.scalarHash;
+            if (it->second != scalarHash) {
+                it->second = scalarHash;
                 materialFastDirtyHandles_.insert(handle);
                 if (fastDirtyHandles_.insert(handle).second) changed = true;
             }
@@ -3557,41 +3522,6 @@ public:
         }
     }
 
-    void SendMaterialFastUpdate(const std::unordered_set<ULONG>& handles, TimeValue t, std::uint32_t frameId) {
-        if (!webview_ || handles.empty()) return;
-
-        Interface* ip = GetCOREInterface();
-        if (!ip) return;
-
-        std::wostringstream ss;
-        ss.imbue(std::locale::classic());
-        ss << L"{\"type\":\"mat_fast\",\"frame\":" << frameId << L",\"nodes\":[";
-
-        bool first = true;
-        for (ULONG handle : handles) {
-            INode* node = ip->GetINodeByHandle(handle);
-            if (!node) continue;
-
-            Mtl* multiMtl = FindMultiSubMtl(node->GetMtl());
-            if (multiMtl && multiMtl->NumSubMtls() > 1) continue;
-
-            MaxJSPBR pbr;
-            ExtractPBR(node, t, pbr);
-            if (!CanFastSyncMaterialScalars(pbr)) continue;
-
-            if (!first) ss << L',';
-            ss << L"{\"h\":" << handle << L",\"mat\":";
-            WriteMaterialScalarFast(ss, pbr);
-            ss << L'}';
-            first = false;
-        }
-
-        ss << L"]}";
-        if (!first) {
-            webview_->PostWebMessageAsJson(ss.str().c_str());
-        }
-    }
-
     void FlushFastPath() {
         fastFlushPosted_ = false;
 
@@ -3738,10 +3668,6 @@ public:
             sharedBuf.Get(),
             COREWEBVIEW2_SHARED_BUFFER_ACCESS_READ_ONLY,
             meta.str().c_str());
-
-        if (!materialDirty.empty()) {
-            SendMaterialFastUpdate(materialDirty, t, frameId);
-        }
     }
 
     EnvData cachedEnv_;
@@ -3892,24 +3818,12 @@ public:
         wv17->PostSharedBufferToScript(sharedBuf.Get(),
             COREWEBVIEW2_SHARED_BUFFER_ACCESS_READ_ONLY,
             meta.str().c_str());
-
-        if (includeMaterialScalars) {
-            SendMaterialFastUpdate(geomHandles_, t, frameId);
-        }
     }
 
     uint64_t HashMaterialPBRState(const MaxJSPBR& pbr) {
         std::wostringstream ss;
         ss.imbue(std::locale::classic());
         WriteMaterialFull(ss, pbr);
-        const std::wstring payload = ss.str();
-        return HashFNV1a(payload.data(), payload.size() * sizeof(wchar_t));
-    }
-
-    uint64_t HashMaterialFastState(const MaxJSPBR& pbr) {
-        std::wostringstream ss;
-        ss.imbue(std::locale::classic());
-        WriteMaterialScalarFast(ss, pbr);
         const std::wstring payload = ss.str();
         return HashFNV1a(payload.data(), payload.size() * sizeof(wchar_t));
     }
@@ -3963,11 +3877,17 @@ public:
         ExtractPBR(node, t, pbr);
 
         MaxJSPBR structurePbr = pbr;
-        ResetFastMaterialScalarsForStructureHash(structurePbr);
+        structurePbr.color[0] = 0.8f;
+        structurePbr.color[1] = 0.8f;
+        structurePbr.color[2] = 0.8f;
+        structurePbr.roughness = 0.5f;
+        structurePbr.metalness = 0.0f;
+        structurePbr.opacity = 1.0f;
 
         state.structureHash = HashMaterialPBRState(structurePbr);
-        state.scalarHash = HashMaterialFastState(pbr);
-        state.canFastSync = CanFastSyncMaterialScalars(pbr);
+        state.scalarHash = HashMaterialScalarPreviewValues(
+            pbr.color, pbr.roughness, pbr.metalness, pbr.opacity);
+        state.canFastSync = true;
         return state;
     }
 
@@ -4265,113 +4185,6 @@ public:
         writeMap(L"ccMap", L"ccMapXf", pbr.clearcoatMap, pbr.clearcoatMapTransform);
         writeMap(L"ccRoughMap", L"ccRoughMapXf", pbr.clearcoatRoughnessMap, pbr.clearcoatRoughnessMapTransform);
         writeMap(L"ccNormMap", L"ccNormMapXf", pbr.clearcoatNormalMap, pbr.clearcoatNormalMapTransform);
-    }
-
-    void WriteMaterialScalarFast(std::wostringstream& ss, const MaxJSPBR& pbr) {
-        ss << L"{\"model\":\"" << EscapeJson(pbr.materialModel.c_str()) << L'"';
-        ss << L",\"color\":[";
-        WriteFloatValue(ss, pbr.color[0], 0.8f); ss << L',';
-        WriteFloatValue(ss, pbr.color[1], 0.8f); ss << L',';
-        WriteFloatValue(ss, pbr.color[2], 0.8f); ss << L']';
-        ss << L",\"rough\":";
-        WriteFloatValue(ss, pbr.roughness, 0.5f);
-        ss << L",\"metal\":";
-        WriteFloatValue(ss, pbr.metalness, 0.0f);
-        ss << L",\"opacity\":";
-        WriteFloatValue(ss, pbr.opacity, 1.0f);
-        ss << L",\"normScl\":";
-        WriteFloatValue(ss, pbr.normalScale, 1.0f);
-        ss << L",\"bumpS\":";
-        WriteFloatValue(ss, pbr.bumpScale, 1.0f);
-        ss << L",\"dispS\":";
-        WriteFloatValue(ss, pbr.displacementScale, 0.0f);
-        ss << L",\"dispB\":";
-        WriteFloatValue(ss, pbr.displacementBias, 0.0f);
-        ss << L",\"aoI\":";
-        WriteFloatValue(ss, pbr.aoIntensity, 1.0f);
-        ss << L",\"envI\":";
-        WriteFloatValue(ss, pbr.envIntensity, 1.0f);
-        ss << L",\"em\":[";
-        WriteFloatValue(ss, pbr.emission[0], 0.0f); ss << L',';
-        WriteFloatValue(ss, pbr.emission[1], 0.0f); ss << L',';
-        WriteFloatValue(ss, pbr.emission[2], 0.0f); ss << L']';
-        ss << L",\"emI\":";
-        WriteFloatValue(ss, pbr.emIntensity, 0.0f);
-        ss << L",\"emMapS\":";
-        WriteFloatValue(ss, pbr.emissiveMapStrength, 1.0f);
-        ss << L",\"lmI\":";
-        WriteFloatValue(ss, pbr.lightmapIntensity, 1.0f);
-
-        if (pbr.materialModel == L"MeshPhysicalMaterial") {
-            ss << L",\"specularColor\":[";
-            WriteFloatValue(ss, pbr.physicalSpecularColor[0], 1.0f); ss << L',';
-            WriteFloatValue(ss, pbr.physicalSpecularColor[1], 1.0f); ss << L',';
-            WriteFloatValue(ss, pbr.physicalSpecularColor[2], 1.0f); ss << L']';
-            ss << L",\"specularIntensity\":";
-            WriteFloatValue(ss, pbr.physicalSpecularIntensity, 1.0f);
-            ss << L",\"clearcoat\":";
-            WriteFloatValue(ss, pbr.clearcoat, 0.0f);
-            ss << L",\"clearcoatRoughness\":";
-            WriteFloatValue(ss, pbr.clearcoatRoughness, 0.0f);
-            ss << L",\"sheen\":";
-            WriteFloatValue(ss, pbr.sheen, 0.0f);
-            ss << L",\"sheenRoughness\":";
-            WriteFloatValue(ss, pbr.sheenRoughness, 1.0f);
-            ss << L",\"sheenColor\":[";
-            WriteFloatValue(ss, pbr.sheenColor[0], 0.0f); ss << L',';
-            WriteFloatValue(ss, pbr.sheenColor[1], 0.0f); ss << L',';
-            WriteFloatValue(ss, pbr.sheenColor[2], 0.0f); ss << L']';
-            ss << L",\"iridescence\":";
-            WriteFloatValue(ss, pbr.iridescence, 0.0f);
-            ss << L",\"iridescenceIOR\":";
-            WriteFloatValue(ss, pbr.iridescenceIOR, 1.3f);
-            ss << L",\"transmission\":";
-            WriteFloatValue(ss, pbr.transmission, 0.0f);
-            ss << L",\"ior\":";
-            WriteFloatValue(ss, pbr.ior, 1.5f);
-            ss << L",\"thickness\":";
-            WriteFloatValue(ss, pbr.thickness, 0.0f);
-            ss << L",\"dispersion\":";
-            WriteFloatValue(ss, pbr.dispersion, 0.0f);
-            ss << L",\"attenuationColor\":[";
-            WriteFloatValue(ss, pbr.attenuationColor[0], 1.0f); ss << L',';
-            WriteFloatValue(ss, pbr.attenuationColor[1], 1.0f); ss << L',';
-            WriteFloatValue(ss, pbr.attenuationColor[2], 1.0f); ss << L']';
-            ss << L",\"attenuationDistance\":";
-            WriteFloatValue(ss, pbr.attenuationDistance, 0.0f);
-            ss << L",\"anisotropy\":";
-            WriteFloatValue(ss, pbr.anisotropy, 0.0f);
-        } else if (pbr.materialModel == L"MeshSSSNodeMaterial") {
-            ss << L",\"sssColor\":[";
-            WriteFloatValue(ss, pbr.sssColor[0], 1.0f); ss << L',';
-            WriteFloatValue(ss, pbr.sssColor[1], 1.0f); ss << L',';
-            WriteFloatValue(ss, pbr.sssColor[2], 1.0f); ss << L']';
-            ss << L",\"sssDistortion\":";
-            WriteFloatValue(ss, pbr.sssDistortion, 0.1f);
-            ss << L",\"sssAmbient\":";
-            WriteFloatValue(ss, pbr.sssAmbient, 0.0f);
-            ss << L",\"sssAttenuation\":";
-            WriteFloatValue(ss, pbr.sssAttenuation, 0.1f);
-            ss << L",\"sssPower\":";
-            WriteFloatValue(ss, pbr.sssPower, 2.0f);
-            ss << L",\"sssScale\":";
-            WriteFloatValue(ss, pbr.sssScale, 10.0f);
-        } else if (IsUtilityMaterialModel(pbr.materialModel)) {
-            if (pbr.materialModel == L"MeshPhongMaterial") {
-                ss << L",\"spec\":[";
-                WriteFloatValue(ss, pbr.specular[0], 0.0666667f); ss << L',';
-                WriteFloatValue(ss, pbr.specular[1], 0.0666667f); ss << L',';
-                WriteFloatValue(ss, pbr.specular[2], 0.0666667f); ss << L']';
-                ss << L",\"shininess\":";
-                WriteFloatValue(ss, pbr.shininess, 30.0f);
-            }
-            ss << L",\"flat\":";
-            ss << (pbr.flatShading ? L"true" : L"false");
-            ss << L",\"wireframe\":";
-            ss << (pbr.wireframe ? L"true" : L"false");
-        }
-
-        ss << L'}';
     }
 
     void WriteMaterialFull(std::wostringstream& ss, const MaxJSPBR& pbr) {
@@ -5478,6 +5291,12 @@ public:
             float xform[16]; GetTransform16(node, t, xform);
             RememberSentTransform(handle, xform);
 
+            // Lightweight material scalars (no texture walks)
+            float col[3] = {0.8f,0.8f,0.8f};
+            float rough = 0.5f, metal = 0.0f, opac = 1.0f;
+            Mtl* foundMtl = FindSupportedMaterial(node->GetMtl());
+            ExtractMaterialScalarPreview(foundMtl, node, t, col, rough, metal, opac);
+
             bool visible = !node->IsNodeHidden(TRUE);
 
             if (!first) ss << L',';
@@ -5489,12 +5308,19 @@ public:
             // corrupting material arrays on the web side.
             Mtl* multiMtl = FindMultiSubMtl(node->GetMtl());
             if (!(multiMtl && multiMtl->NumSubMtls() > 1)) {
-                MaxJSPBR pbr;
-                ExtractPBR(node, t, pbr);
-                if (CanFastSyncMaterialScalars(pbr)) {
-                    ss << L",\"mat\":";
-                    WriteMaterialScalarFast(ss, pbr);
+                ss << L",\"mat\":{\"color\":[";
+                WriteFloatValue(ss, col[0], 0.8f); ss << L',';
+                WriteFloatValue(ss, col[1], 0.8f); ss << L',';
+                WriteFloatValue(ss, col[2], 0.8f); ss << L']';
+                ss << L",\"rough\":";
+                WriteFloatValue(ss, rough, 0.5f);
+                ss << L",\"metal\":";
+                WriteFloatValue(ss, metal, 0.0f);
+                if (opac < 0.999f) {
+                    ss << L",\"opacity\":";
+                    WriteFloatValue(ss, opac, 1.0f);
                 }
+                ss << L"}";
             }
             ss << L"}";
             first = false;

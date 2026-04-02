@@ -3062,6 +3062,80 @@ public:
         if (changed) QueueFastFlush();
     }
 
+    void CheckTrackedLightsLive() {
+        if (lightHandles_.empty()) return;
+
+        Interface* ip = GetCOREInterface();
+        if (!ip) return;
+        TimeValue t = ip->GetTime();
+
+        bool changed = false;
+        for (ULONG handle : lightHandles_) {
+            INode* node = ip->GetINodeByHandle(handle);
+            if (!node) {
+                lightHashMap_.erase(handle);
+                continue;
+            }
+
+            const uint64_t hash = ComputeLightStateHash(node, t);
+            auto it = lightHashMap_.find(handle);
+            if (it == lightHashMap_.end()) {
+                lightHashMap_[handle] = hash;
+                continue;
+            }
+
+            if (it->second != hash) {
+                it->second = hash;
+                if (fastDirtyHandles_.insert(handle).second) changed = true;
+            }
+        }
+
+        if (changed) QueueFastFlush();
+    }
+
+    void CheckTrackedMaterialScalarsLive() {
+        if (geomHandles_.empty()) return;
+
+        Interface* ip = GetCOREInterface();
+        if (!ip) return;
+        TimeValue t = ip->GetTime();
+
+        bool changed = false;
+        for (ULONG handle : geomHandles_) {
+            INode* node = ip->GetINodeByHandle(handle);
+            if (!node) {
+                mtlScalarHashMap_.erase(handle);
+                materialFastDirtyHandles_.erase(handle);
+                continue;
+            }
+
+            Mtl* rawMtl = node->GetMtl();
+            Mtl* multiMtl = FindMultiSubMtl(rawMtl);
+            if (multiMtl && multiMtl->NumSubMtls() > 1) continue;
+
+            float col[3] = {0.8f, 0.8f, 0.8f};
+            float rough = 0.5f;
+            float metal = 0.0f;
+            float opac = 1.0f;
+            ExtractMaterialScalarPreview(FindSupportedMaterial(rawMtl), node, t, col, rough, metal, opac);
+
+            const uint64_t scalarHash = HashMaterialScalarPreviewValues(col, rough, metal, opac);
+            auto it = mtlScalarHashMap_.find(handle);
+            if (it == mtlScalarHashMap_.end()) {
+                mtlScalarHashMap_[handle] = scalarHash;
+                continue;
+            }
+
+            if (it->second != scalarHash) {
+                it->second = scalarHash;
+                materialFastDirtyHandles_.insert(handle);
+                if (fastDirtyHandles_.insert(handle).second) changed = true;
+            }
+        }
+
+        if (changed) QueueFastFlush();
+    }
+
     void RememberSentTransform(ULONG handle, const float* xform) {
         std::array<float, 16> cached = {};
         std::copy(xform, xform + 16, cached.begin());
@@ -5491,7 +5565,9 @@ void MaxJSFastNodeEventCallback::TopologyChanged(NodeKeyTab& nodes) {
 void MaxJSFastRedrawCallback::proc(Interface*) {
     if (!owner_) return;
     owner_->MarkSelectedTransformsDirty();
+    owner_->CheckTrackedMaterialScalarsLive();
     owner_->MarkTrackedLightTransformsDirty();
+    owner_->CheckTrackedLightsLive();
     owner_->MarkTrackedSplatTransformsDirty();
     owner_->MarkCameraDirtyIfChanged();
     owner_->CheckSelectedGeometryLive();

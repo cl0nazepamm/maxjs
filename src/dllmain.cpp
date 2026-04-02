@@ -6,6 +6,8 @@
 #include <units.h>
 #include <triobj.h>
 #include <polyobj.h>
+#include <iepoly.h>
+#include <iEPolyMod.h>
 #include <mnmesh.h>
 #include <notify.h>
 #include <stdmat.h>
@@ -299,6 +301,125 @@ static uint64_t HashMeshData(const std::vector<float>& verts,
     if (!uvs.empty())
         h = HashFNV1a(uvs.data(), uvs.size() * sizeof(float), h);
     return h;
+}
+
+static uint64_t HashMeshState(Mesh& mesh) {
+    uint64_t h = 1469598103934665603ULL;
+    const int numVerts = mesh.getNumVerts();
+    const int numFaces = mesh.getNumFaces();
+    h = HashFNV1a(&numVerts, sizeof(numVerts), h);
+    h = HashFNV1a(&numFaces, sizeof(numFaces), h);
+
+    for (int i = 0; i < numVerts; ++i) {
+        Point3 p = mesh.getVert(i);
+        h = HashFNV1a(&p, sizeof(p), h);
+    }
+
+    for (int i = 0; i < numFaces; ++i) {
+        Face& face = mesh.faces[i];
+        const DWORD smGroup = face.getSmGroup();
+        const MtlID matID = face.getMatID();
+        h = HashFNV1a(face.v, sizeof(face.v), h);
+        h = HashFNV1a(&smGroup, sizeof(smGroup), h);
+        h = HashFNV1a(&matID, sizeof(matID), h);
+    }
+
+    return h;
+}
+
+static uint64_t HashMNMeshState(MNMesh& mn) {
+    uint64_t h = 1469598103934665603ULL;
+    const int numVerts = mn.VNum();
+    const int numFaces = mn.FNum();
+    h = HashFNV1a(&numVerts, sizeof(numVerts), h);
+    h = HashFNV1a(&numFaces, sizeof(numFaces), h);
+
+    for (int i = 0; i < numVerts; ++i) {
+        const MNVert* vert = mn.V(i);
+        const DWORD dead = (vert && vert->GetFlag(MN_DEAD)) ? 1u : 0u;
+        const Point3 p = mn.P(i);
+        h = HashFNV1a(&dead, sizeof(dead), h);
+        h = HashFNV1a(&p, sizeof(p), h);
+    }
+
+    for (int i = 0; i < numFaces; ++i) {
+        const MNFace* face = mn.F(i);
+        if (!face) continue;
+
+        const DWORD dead = face->GetFlag(MN_DEAD) ? 1u : 0u;
+        const int deg = face->deg;
+        const DWORD smGroup = face->smGroup;
+        const MtlID matID = face->material;
+        h = HashFNV1a(&dead, sizeof(dead), h);
+        h = HashFNV1a(&deg, sizeof(deg), h);
+        h = HashFNV1a(&smGroup, sizeof(smGroup), h);
+        h = HashFNV1a(&matID, sizeof(matID), h);
+        if (deg > 0 && face->vtx) {
+            h = HashFNV1a(face->vtx, sizeof(int) * static_cast<size_t>(deg), h);
+        }
+    }
+
+    return h;
+}
+
+static MNMesh* TryGetLiveEditablePolyMesh(INode* node) {
+    if (!node) return nullptr;
+
+    Object* cursor = node->GetObjectRef();
+    while (cursor &&
+           (cursor->ClassID() == derivObjClassID || cursor->ClassID() == WSMDerivObjClassID)) {
+        IDerivedObject* derived = static_cast<IDerivedObject*>(cursor);
+        const int modCount = derived->NumModifiers();
+        if (modCount <= 0) {
+            cursor = derived->GetObjRef();
+            continue;
+        }
+
+        Modifier* topModifier = derived->GetModifier(modCount - 1);
+        if (!topModifier) return nullptr;
+
+        if (auto* epMod = static_cast<EPolyMod*>(topModifier->GetInterface(EPOLY_MOD_INTERFACE))) {
+            if (MNMesh* mesh = epMod->EpModGetOutputMesh(node)) return mesh;
+            if (MNMesh* mesh = epMod->EpModGetMesh(node)) return mesh;
+        }
+
+        // A higher non-Edit Poly modifier sits above any deeper Editable Poly state.
+        return nullptr;
+    }
+
+    if (!cursor) return nullptr;
+    if (auto* epoly = static_cast<EPoly*>(cursor->GetInterface(EPOLY_INTERFACE))) {
+        return epoly->GetMeshPtr();
+    }
+
+    return nullptr;
+}
+
+static uint64_t HashNodeGeometryState(INode* node, TimeValue t) {
+    if (!node) return 0;
+
+    if (MNMesh* liveMN = TryGetLiveEditablePolyMesh(node)) {
+        return HashMNMeshState(*liveMN);
+    }
+
+    ObjectState os = node->EvalWorldState(t);
+    if (!os.obj || os.obj->SuperClassID() != GEOMOBJECT_CLASS_ID) return 0;
+    if (IsThreeJSSplatClassID(os.obj->ClassID())) return 0;
+
+    if (os.obj->IsSubClassOf(polyObjectClassID)) {
+        PolyObject* poly = static_cast<PolyObject*>(os.obj);
+        return HashMNMeshState(poly->GetMesh());
+    }
+
+    if (!os.obj->CanConvertToType(Class_ID(TRIOBJ_CLASS_ID, 0))) return 0;
+
+    TriObject* tri = static_cast<TriObject*>(
+        os.obj->ConvertToType(t, Class_ID(TRIOBJ_CLASS_ID, 0)));
+    if (!tri) return 0;
+
+    const uint64_t hash = HashMeshState(tri->GetMesh());
+    if (tri != os.obj) tri->DeleteThis();
+    return hash;
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -1612,6 +1733,10 @@ static bool ExtractMesh(INode* node, TimeValue t,
                         std::vector<int>& indices,
                         std::vector<MatGroup>& groups,
                         std::vector<float>* normals = nullptr) {
+    if (MNMesh* liveMN = TryGetLiveEditablePolyMesh(node)) {
+        return ExtractMeshFromMNMesh(*liveMN, verts, uvs, indices, groups, normals);
+    }
+
     ObjectState os = node->EvalWorldState(t);
     if (!os.obj || os.obj->SuperClassID() != GEOMOBJECT_CLASS_ID) return false;
     if (IsThreeJSSplatClassID(os.obj->ClassID())) return false;
@@ -2803,6 +2928,7 @@ public:
         geoHashMap_.clear();
         groupCache_.clear();
         lastBBoxHash_.clear();
+        lastLiveGeomHash_.clear();
         ResetFastPathState(false);
     }
 
@@ -2881,17 +3007,9 @@ public:
         haveLastSentCamera_ = true;
     }
 
-    // Cheap per-node bounding box for vertex edit detection
+    // Live geometry signature for redraw-driven edit detection
     std::unordered_map<ULONG, uint64_t> lastBBoxHash_;
-
-    static uint64_t HashBBox(INode* node, TimeValue t) {
-        // Use object's validity interval as a cheap change detector
-        ObjectState os = node->EvalWorldState(t);
-        if (!os.obj) return 0;
-        Interval geomValid = os.obj->ChannelValidity(t, GEOM_CHAN_NUM);
-        // Hash the validity interval — changes when geometry is modified
-        return (uint64_t)geomValid.Start() ^ ((uint64_t)geomValid.End() << 32);
-    }
+    std::unordered_map<ULONG, uint64_t> lastLiveGeomHash_;
 
     // Handles that need geometry re-sent via fast path (not full sync)
     std::unordered_set<ULONG> geoFastDirtyHandles_;
@@ -2910,10 +3028,10 @@ public:
             ULONG handle = node->GetHandle();
             if (!IsTrackedHandle(handle)) continue;
 
-            uint64_t validHash = HashBBox(node, t);
-            auto it = lastBBoxHash_.find(handle);
-            if (it != lastBBoxHash_.end() && it->second == validHash) continue;
-            lastBBoxHash_[handle] = validHash;
+            const uint64_t geomHash = HashNodeGeometryState(node, t);
+            auto it = lastLiveGeomHash_.find(handle);
+            if (it != lastLiveGeomHash_.end() && it->second == geomHash) continue;
+            lastLiveGeomHash_[handle] = geomHash;
 
             // Geometry changed — send ONLY this mesh via fast path, no full sync
             geoHashMap_.erase(handle);
@@ -4769,6 +4887,10 @@ public:
             if (geomHandles_.find(it->first) == geomHandles_.end()) it = lastBBoxHash_.erase(it);
             else ++it;
         }
+        for (auto it = lastLiveGeomHash_.begin(); it != lastLiveGeomHash_.end(); ) {
+            if (geomHandles_.find(it->first) == geomHandles_.end()) it = lastLiveGeomHash_.erase(it);
+            else ++it;
+        }
 
         // Create shared buffer
         if (totalBytes == 0) totalBytes = 4;  // min size
@@ -5191,6 +5313,7 @@ public:
         geoHashMap_.clear();
         groupCache_.clear();
         lastBBoxHash_.clear();
+        lastLiveGeomHash_.clear();
         if (hwnd_) { HWND h = hwnd_; hwnd_ = nullptr; DestroyWindow(h); }
     }
 

@@ -18,6 +18,7 @@
 #include "itreesinterface.h"
 #include "ircinterface.h"
 #include "tyParticleObjectExt.h"
+#include "tyVolumeObjectExt.h"
 #include "sync_protocol.h"
 #include "threejs_material.h"
 #include "threejs_lights.h"
@@ -311,6 +312,7 @@ static bool IsImageFile(const wchar_t* path) {
     return (_wcsicmp(ext, L".png") == 0 || _wcsicmp(ext, L".jpg") == 0 ||
             _wcsicmp(ext, L".jpeg") == 0 || _wcsicmp(ext, L".tga") == 0 ||
             _wcsicmp(ext, L".tif") == 0 || _wcsicmp(ext, L".tiff") == 0 ||
+            _wcsicmp(ext, L".tif") == 0 || _wcsicmp(ext, L".tiff") == 0 ||
             _wcsicmp(ext, L".bmp") == 0 || _wcsicmp(ext, L".exr") == 0 ||
             _wcsicmp(ext, L".hdr") == 0 || _wcsicmp(ext, L".dds") == 0 ||
             _wcsicmp(ext, L".psd") == 0 || _wcsicmp(ext, L".tx") == 0);
@@ -378,6 +380,8 @@ struct MaxJSPBR {
         float realWidth = 0.2f;
         float realHeight = 0.2f;
         std::wstring wrapMode = L"periodic";
+        std::wstring colorSpace;   // "sRGB", "Linear", "auto", etc.
+        float manualGamma = 1.0f;
     };
 
     float color[3]    = {0.8f, 0.8f, 0.8f};
@@ -430,9 +434,11 @@ struct MaxJSPBR {
     std::wstring colorMap, gradientMap, roughnessMap, metalnessMap, normalMap;
     std::wstring bumpMap, displacementMap, parallaxMap, sssColorMap, matcapMap;
     std::wstring aoMap, emissionMap, lightmapFile, opacityMap;
+    std::wstring clearcoatMap, clearcoatRoughnessMap, clearcoatNormalMap;
     TexTransform colorMapTransform, gradientMapTransform, roughnessMapTransform, metalnessMapTransform, normalMapTransform;
     TexTransform bumpMapTransform, displacementMapTransform, parallaxMapTransform, sssColorMapTransform;
     TexTransform aoMapTransform, emissionMapTransform, lightmapTransform, opacityMapTransform, matcapMapTransform;
+    TexTransform clearcoatMapTransform, clearcoatRoughnessMapTransform, clearcoatNormalMapTransform;
     std::wstring mtlName;
     std::wstring materialModel = L"MeshStandardMaterial";
     float parallaxScale = 0.0f;
@@ -448,11 +454,19 @@ static std::wstring FindPBString(Texmap* map, const MCHAR* name);
 #define GLTF_MTL_CLASS_ID Class_ID(943849874, 1174294043)
 // USD Preview Surface Class_ID = (1794787635, 1200091591)
 #define USD_PREVIEW_SURFACE_CLASS_ID Class_ID(1794787635, 1200091591)
+// Normal Bump texmap Class_ID = {243e22c6, 63f6a014}
+#define NORMAL_BUMP_CLASS_ID Class_ID(0x243e22c6, 0x63f6a014)
+
+static bool HasParam(IParamBlock2* pb, ParamID id) {
+    if (!pb) return false;
+    for (int i = 0; i < pb->NumParams(); ++i) {
+        if (pb->IndextoID(i) == id) return true;
+    }
+    return false;
+}
 
 static bool IsThreeJSMaterialClass(const Class_ID& cid) {
-    return cid == THREEJS_MTL_CLASS_ID ||
-           cid == THREEJS_ADV_MTL_CLASS_ID ||
-           cid == THREEJS_SSS_MTL_CLASS_ID ||
+    return cid == THREEJS_ADV_MTL_CLASS_ID ||
            cid == THREEJS_UTILITY_MTL_CLASS_ID;
 }
 
@@ -480,11 +494,13 @@ static bool IsUtilityMaterialModel(const std::wstring& materialModel) {
            materialModel == L"MeshBackdropNodeMaterial";
 }
 
+#define PHYSICAL_MTL_CLASS_ID Class_ID(1030429932, 3735928833)
+
 static bool IsSupportedMaterial(Mtl* mtl) {
     if (!mtl) return false;
     Class_ID cid = mtl->ClassID();
     return IsThreeJSMaterialClass(cid) || cid == THREEJS_TOON_CLASS_ID || cid == GLTF_MTL_CLASS_ID
-        || cid == USD_PREVIEW_SURFACE_CLASS_ID;
+        || cid == USD_PREVIEW_SURFACE_CLASS_ID || cid == PHYSICAL_MTL_CLASS_ID;
 }
 
 // Find ThreeJS or glTF Material in material tree — uses ClassID only
@@ -600,6 +616,8 @@ static bool ExtractMaterialTexture(Texmap* map, std::wstring& filePath, MaxJSPBR
         xf.realHeight = FindPBFloat(resolved, _T("RealHeight"), 0.2f);
         xf.wrapMode = FindPBString(resolved, _T("WrapMode"));
         if (xf.wrapMode.empty()) xf.wrapMode = L"periodic";
+        xf.colorSpace = FindPBString(resolved, _T("Filename_ColorSpace"));
+        xf.manualGamma = FindPBFloat(resolved, _T("ManualGamma"), 1.0f);
         return true;
     }
 
@@ -625,9 +643,10 @@ static void ExtractThreeJSMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
     d.mtlName = name.data();
     const Class_ID cid = mtl->ClassID();
     if (cid == THREEJS_ADV_MTL_CLASS_ID) {
-        d.materialModel = L"MeshPhysicalMaterial";
-    } else if (cid == THREEJS_SSS_MTL_CLASS_ID) {
-        d.materialModel = L"MeshSSSNodeMaterial";
+        const int mode = HasParam(pb, pb_material_mode) ? pb->GetInt(pb_material_mode, t) : threejs_mode_standard;
+        if (mode == threejs_mode_physical) d.materialModel = L"MeshPhysicalMaterial";
+        else if (mode == threejs_mode_sss) d.materialModel = L"MeshSSSNodeMaterial";
+        else d.materialModel = L"MeshStandardMaterial";
     } else if (cid == THREEJS_UTILITY_MTL_CLASS_ID) {
         d.materialModel = GetUtilityMaterialModelName(pb->GetInt(pb_utility_model, t));
     } else {
@@ -660,7 +679,7 @@ static void ExtractThreeJSMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
     d.lightmapIntensity = pb->GetFloat(pb_lightmap_intensity, t);
     d.lightmapChannel = pb->GetInt(pb_lightmap_channel, t);
 
-    if (cid == THREEJS_ADV_MTL_CLASS_ID) {
+    if (cid == THREEJS_ADV_MTL_CLASS_ID && d.materialModel == L"MeshPhysicalMaterial") {
         Color specColor = pb->GetColor(pb_phys_specular_color, t);
         d.physicalSpecularColor[0] = specColor.r; d.physicalSpecularColor[1] = specColor.g; d.physicalSpecularColor[2] = specColor.b;
         d.physicalSpecularIntensity = pb->GetFloat(pb_phys_specular_intensity, t);
@@ -680,7 +699,7 @@ static void ExtractThreeJSMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
         d.attenuationColor[0] = attenuationColor.r; d.attenuationColor[1] = attenuationColor.g; d.attenuationColor[2] = attenuationColor.b;
         d.attenuationDistance = pb->GetFloat(pb_phys_attenuation_distance, t);
         d.anisotropy = pb->GetFloat(pb_phys_anisotropy, t);
-    } else if (cid == THREEJS_SSS_MTL_CLASS_ID) {
+    } else if (cid == THREEJS_ADV_MTL_CLASS_ID && d.materialModel == L"MeshSSSNodeMaterial") {
         Color sss = pb->GetColor(pb_sss_color, t);
         d.sssColor[0] = sss.r; d.sssColor[1] = sss.g; d.sssColor[2] = sss.b;
         d.sssDistortion = pb->GetFloat(pb_sss_distortion, t);
@@ -714,7 +733,7 @@ static void ExtractThreeJSMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
     readMap(pb_opacity_map, d.opacityMap, d.opacityMapTransform);
     readMap(pb_lightmap, d.lightmapFile, d.lightmapTransform);
     readMap(pb_ao_map, d.aoMap, d.aoMapTransform);
-    if (cid == THREEJS_SSS_MTL_CLASS_ID) {
+    if (cid == THREEJS_ADV_MTL_CLASS_ID && d.materialModel == L"MeshSSSNodeMaterial") {
         readMap(pb_sss_color_map, d.sssColorMap, d.sssColorMapTransform);
     } else if (cid == THREEJS_UTILITY_MTL_CLASS_ID) {
         readMap(pb_matcap_map, d.matcapMap, d.matcapMapTransform);
@@ -933,6 +952,173 @@ static void ExtractUsdPreviewSurfaceMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
         d.materialModel = L"MeshPhysicalMaterial";
 }
 
+// Extract PBR from 3ds Max Physical Material
+static void ExtractPhysicalMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
+    MSTR name = mtl->GetName();
+    d.mtlName = name.data();
+    d.materialModel = L"MeshPhysicalMaterial";
+
+    auto readColor = [&](const MCHAR* pname, float out[3]) {
+        for (int b = 0; b < mtl->NumParamBlocks(); b++) {
+            IParamBlock2* pb = mtl->GetParamBlock(b);
+            if (!pb) continue;
+            for (int i = 0; i < pb->NumParams(); i++) {
+                ParamID pid = pb->IndextoID(i);
+                const ParamDef& pd = pb->GetParamDef(pid);
+                if (pd.int_name && _tcsicmp(pd.int_name, pname) == 0 &&
+                    (pd.type == TYPE_RGBA || pd.type == TYPE_FRGBA)) {
+                    Color c = pb->GetColor(pid, t);
+                    out[0] = c.r; out[1] = c.g; out[2] = c.b;
+                    return;
+                }
+            }
+        }
+    };
+    auto readFloat = [&](const MCHAR* pname, float def) -> float {
+        for (int b = 0; b < mtl->NumParamBlocks(); b++) {
+            IParamBlock2* pb = mtl->GetParamBlock(b);
+            if (!pb) continue;
+            for (int i = 0; i < pb->NumParams(); i++) {
+                ParamID pid = pb->IndextoID(i);
+                const ParamDef& pd = pb->GetParamDef(pid);
+                if (pd.int_name && _tcsicmp(pd.int_name, pname) == 0 && pd.type == TYPE_FLOAT)
+                    return pb->GetFloat(pid, t);
+            }
+        }
+        return def;
+    };
+    auto readBool = [&](const MCHAR* pname, bool def) -> bool {
+        for (int b = 0; b < mtl->NumParamBlocks(); b++) {
+            IParamBlock2* pb = mtl->GetParamBlock(b);
+            if (!pb) continue;
+            for (int i = 0; i < pb->NumParams(); i++) {
+                ParamID pid = pb->IndextoID(i);
+                const ParamDef& pd = pb->GetParamDef(pid);
+                if (pd.int_name && _tcsicmp(pd.int_name, pname) == 0 &&
+                    (pd.type == TYPE_BOOL || pd.type == TYPE_INT))
+                    return pb->GetInt(pid, t) != 0;
+            }
+        }
+        return def;
+    };
+    auto readMap = [&](const MCHAR* pname, const MCHAR* onName,
+                       std::wstring& outPath, MaxJSPBR::TexTransform& outXf) {
+        outPath.clear();
+        outXf = {};
+        // Check if map is enabled
+        if (onName && !readBool(onName, true)) return;
+        for (int b = 0; b < mtl->NumParamBlocks(); b++) {
+            IParamBlock2* pb = mtl->GetParamBlock(b);
+            if (!pb) continue;
+            for (int i = 0; i < pb->NumParams(); i++) {
+                ParamID pid = pb->IndextoID(i);
+                const ParamDef& pd = pb->GetParamDef(pid);
+                if (pd.int_name && _tcsicmp(pd.int_name, pname) == 0 && pd.type == TYPE_TEXMAP) {
+                    Texmap* map = pb->GetTexmap(pid, t);
+                    ExtractMaterialTexture(map, outPath, outXf);
+                    return;
+                }
+            }
+        }
+    };
+
+    // Core PBR
+    readColor(_T("base_color"), d.color);
+    d.roughness  = readFloat(_T("roughness"), 0.0f);
+    d.metalness  = readFloat(_T("metalness"), 0.0f);
+    d.opacity    = 1.0f - readFloat(_T("transparency"), 0.0f);
+    d.ior        = readFloat(_T("trans_ior"), 1.52f);
+    d.normalScale = readFloat(_T("bump_map_amt"), 0.3f);
+    d.displacementScale = readFloat(_T("displacement_map_amt"), 1.0f);
+
+    // Transmission
+    d.transmission = readFloat(_T("transparency"), 0.0f);
+    if (d.transmission > 0.0f) {
+        readColor(_T("trans_color"), d.attenuationColor);
+        d.attenuationDistance = readFloat(_T("trans_depth"), 0.0f);
+    }
+
+    // Clearcoat
+    d.clearcoat = readFloat(_T("coating"), 0.0f);
+    d.clearcoatRoughness = readFloat(_T("coat_roughness"), 0.0f);
+
+    // Sheen
+    d.sheen = readFloat(_T("sheen"), 0.0f);
+    d.sheenRoughness = readFloat(_T("sheen_roughness"), 0.3f);
+    readColor(_T("sheen_color"), d.sheenColor);
+
+    // Emission
+    float emWeight = readFloat(_T("emission"), 0.0f);
+    readColor(_T("emit_color"), d.emission);
+    d.emIntensity = emWeight;
+
+    // Anisotropy
+    d.anisotropy = readFloat(_T("anisotropy"), 0.0f);
+
+    // Iridescence (thin film)
+    d.iridescence = readFloat(_T("thin_film"), 0.0f);
+    d.iridescenceIOR = readFloat(_T("thin_film_ior"), 1.3f);
+
+    // Texture maps (param name, enable param name)
+    readMap(_T("base_color_map"),    _T("base_color_map_on"),    d.colorMap,        d.colorMapTransform);
+    readMap(_T("roughness_map"),     _T("roughness_map_on"),     d.roughnessMap,    d.roughnessMapTransform);
+    readMap(_T("metalness_map"),     _T("metalness_map_on"),     d.metalnessMap,    d.metalnessMapTransform);
+    readMap(_T("emit_color_map"),    _T("emit_color_map_on"),    d.emissionMap,     d.emissionMapTransform);
+    readMap(_T("coat_map"),          _T("coat_map_on"),          d.clearcoatMap,             d.clearcoatMapTransform);
+    readMap(_T("coat_rough_map"),    _T("coat_rough_map_on"),    d.clearcoatRoughnessMap,    d.clearcoatRoughnessMapTransform);
+    readMap(_T("displacement_map"), _T("displacement_map_on"),  d.displacementMap, d.displacementMapTransform);
+    readMap(_T("transparency_map"), _T("transparency_map_on"),  d.opacityMap,      d.opacityMapTransform);
+    readMap(_T("cutout_map"),       _T("cutout_map_on"),        d.opacityMap,      d.opacityMapTransform);
+
+    // Normal/Bump map — Physical Material "bump_map" slot can contain either:
+    //   1) Normal Bump texmap (wrapper) → subtex 0 is normal map, subtex 1 is additional bump
+    //   2) Plain bitmap → height-based bump map
+    // Detect which one and route to the correct PBR field.
+    auto getTexmap = [&](const MCHAR* pname, const MCHAR* onName) -> Texmap* {
+        if (onName && !readBool(onName, true)) return nullptr;
+        for (int b = 0; b < mtl->NumParamBlocks(); b++) {
+            IParamBlock2* pb = mtl->GetParamBlock(b);
+            if (!pb) continue;
+            for (int i = 0; i < pb->NumParams(); i++) {
+                ParamID pid = pb->IndextoID(i);
+                const ParamDef& pd = pb->GetParamDef(pid);
+                if (pd.int_name && _tcsicmp(pd.int_name, pname) == 0 && pd.type == TYPE_TEXMAP)
+                    return pb->GetTexmap(pid, t);
+            }
+        }
+        return nullptr;
+    };
+
+    Texmap* bumpSlot = getTexmap(_T("bump_map"), _T("bump_map_on"));
+    if (bumpSlot) {
+        if (bumpSlot->ClassID() == NORMAL_BUMP_CLASS_ID) {
+            // Normal Bump wrapper — subtex 0 = normal map, subtex 1 = additional bump
+            if (bumpSlot->NumSubTexmaps() > 0 && bumpSlot->GetSubTexmap(0))
+                ExtractMaterialTexture(bumpSlot->GetSubTexmap(0), d.normalMap, d.normalMapTransform);
+            if (bumpSlot->NumSubTexmaps() > 1 && bumpSlot->GetSubTexmap(1)) {
+                ExtractMaterialTexture(bumpSlot->GetSubTexmap(1), d.bumpMap, d.bumpMapTransform);
+                d.bumpScale = d.normalScale;
+            }
+        } else {
+            // Plain texmap — treat as height-based bump map
+            ExtractMaterialTexture(bumpSlot, d.bumpMap, d.bumpMapTransform);
+            d.bumpScale = d.normalScale;
+            d.normalScale = 1.0f;
+        }
+    }
+
+    // Clearcoat normal/bump — same detection logic
+    Texmap* coatBumpSlot = getTexmap(_T("coat_bump_map"), _T("coat_bump_map_on"));
+    if (coatBumpSlot) {
+        if (coatBumpSlot->ClassID() == NORMAL_BUMP_CLASS_ID) {
+            if (coatBumpSlot->NumSubTexmaps() > 0 && coatBumpSlot->GetSubTexmap(0))
+                ExtractMaterialTexture(coatBumpSlot->GetSubTexmap(0), d.clearcoatNormalMap, d.clearcoatNormalMapTransform);
+        } else {
+            ExtractMaterialTexture(coatBumpSlot, d.clearcoatNormalMap, d.clearcoatNormalMapTransform);
+        }
+    }
+}
+
 // Extract PBR from a single material (ThreeJS, glTF, or wire color fallback)
 static void ExtractPBRFromMtl(Mtl* mtl, INode* node, TimeValue t, MaxJSPBR& d) {
     if (mtl) {
@@ -945,6 +1131,8 @@ static void ExtractPBRFromMtl(Mtl* mtl, INode* node, TimeValue t, MaxJSPBR& d) {
                 ExtractThreeJSToonMtl(found, t, d);
             else if (cid == USD_PREVIEW_SURFACE_CLASS_ID)
                 ExtractUsdPreviewSurfaceMtl(found, t, d);
+            else if (cid == PHYSICAL_MTL_CLASS_ID)
+                ExtractPhysicalMtl(found, t, d);
             else
                 ExtractGltfMtl(found, t, d);
             return;
@@ -988,6 +1176,8 @@ static void ExtractPBR(INode* node, TimeValue t, MaxJSPBR& d) {
             ExtractThreeJSToonMtl(found, t, d);
         else if (cid == USD_PREVIEW_SURFACE_CLASS_ID)
             ExtractUsdPreviewSurfaceMtl(found, t, d);
+        else if (cid == PHYSICAL_MTL_CLASS_ID)
+            ExtractPhysicalMtl(found, t, d);
         else
             ExtractGltfMtl(found, t, d);
         return;
@@ -1990,6 +2180,109 @@ static bool ExtractTyFlowInstances(INode* tyNode, TimeValue t,
 
     SafeTyReleaseInstances(tyObj, infos);
     return !outGroups.empty();
+}
+
+// ══════════════════════════════════════════════════════════════
+//  tyFlow Volume Extraction (smoke/fire)
+// ══════════════════════════════════════════════════════════════
+
+struct VolumeData {
+    ULONG handle;
+    int dimX, dimY, dimZ;           // voxel counts
+    float voxelSize[3];             // world-space size per voxel
+    float origin[3];                // world origin (first voxel center)
+    float transform[16];            // world transform of the volume
+    std::vector<float> density;     // flat density array [dimX * dimY * dimZ]
+    float stepSize = 1.0f;          // raymarching step size
+};
+
+static bool ExtractTyFlowVolumes(INode* tyNode, TimeValue t,
+                                 std::vector<VolumeData>& outVolumes) {
+    if (!IsTyFlowAvailable()) return false;
+    if (!IsTyFlowNode(tyNode)) return false;
+
+    Object* base = GetBaseObject(tyNode->GetObjectRef());
+    if (!base) return false;
+
+    // Try v3 first (has step size + fuel color), fall back to v1
+    tyFlow::tyVolumeObjectExt_v3* volIf3 = tyFlow::GetTyVolumeInterface_v3(static_cast<BaseObject*>(base));
+    tyFlow::tyVolumeObjectExt_v1* volIf = volIf3
+        ? static_cast<tyFlow::tyVolumeObjectExt_v1*>(volIf3)
+        : tyFlow::GetTyVolumeInterface_v1(static_cast<BaseObject*>(base));
+    if (!volIf) return false;
+
+    volIf->UpdateVolumes(t, _T("maxjs"));
+
+    int numVolumes = volIf->NumVolumes();
+    if (numVolumes <= 0) {
+        volIf->ReleaseVolumes();
+        return false;
+    }
+
+    float stepSize = volIf3 ? volIf3->GetVolumeRaymarchingStepSize() : 1.0f;
+
+    // For the combined bounding box, all volumes share same dimensions/scale (axiom 1)
+    tyFlow::tyVolume_v1* vol0 = volIf->GetVolume(0);
+    if (!vol0) { volIf->ReleaseVolumes(); return false; }
+
+    IPoint3 dim = vol0->dimensions;
+    if (dim.x <= 0 || dim.y <= 0 || dim.z <= 0) {
+        volIf->ReleaseVolumes();
+        return false;
+    }
+
+    // Compute voxel size from the transform (scale of axes / dimensions)
+    Matrix3 tm0 = vol0->transform;
+    Point3 axisX = tm0.GetRow(0);
+    Point3 axisY = tm0.GetRow(1);
+    Point3 axisZ = tm0.GetRow(2);
+    float voxelSizeX = axisX.Length() / (float)dim.x;
+    float voxelSizeY = axisY.Length() / (float)dim.y;
+    float voxelSizeZ = axisZ.Length() / (float)dim.z;
+
+    // For MVP: extract each volume block as a separate VolumeData
+    // (JS side will render each as a separate volume)
+    for (int vi = 0; vi < numVolumes; vi++) {
+        tyFlow::tyVolume_v1* vol = volIf->GetVolume(vi);
+        if (!vol) continue;
+
+        VolumeData vd;
+        vd.handle = tyNode->GetHandle();
+        vd.dimX = dim.x;
+        vd.dimY = dim.y;
+        vd.dimZ = dim.z;
+        vd.voxelSize[0] = voxelSizeX;
+        vd.voxelSize[1] = voxelSizeY;
+        vd.voxelSize[2] = voxelSizeZ;
+        vd.stepSize = stepSize;
+
+        // Volume origin in world space
+        Point3 orig = vol->transform.GetTrans();
+        vd.origin[0] = orig.x;
+        vd.origin[1] = orig.y;
+        vd.origin[2] = orig.z;
+
+        Matrix3To16(vol->transform, vd.transform);
+
+        // Extract density voxels
+        int totalVoxels = dim.x * dim.y * dim.z;
+        vd.density.resize(totalVoxels);
+
+        for (int z = 0; z < dim.z; z++) {
+            for (int y = 0; y < dim.y; y++) {
+                for (int x = 0; x < dim.x; x++) {
+                    Point3 coord((float)x, (float)y, (float)z);
+                    float d = vol->GetScalar(coord, tyFlow::tyVolume_v1::density);
+                    vd.density[x + y * dim.x + z * dim.x * dim.y] = d;
+                }
+            }
+        }
+
+        outVolumes.push_back(std::move(vd));
+    }
+
+    volIf->ReleaseVolumes();
+    return !outVolumes.empty();
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -3557,6 +3850,12 @@ public:
                 ss << L",\"realHeight\":";
                 WriteFloatValue(ss, xf.realHeight, 0.2f);
                 ss << L",\"wrap\":\"" << EscapeJson(xf.wrapMode.c_str()) << L"\"";
+                if (!xf.colorSpace.empty())
+                    ss << L",\"colorSpace\":\"" << EscapeJson(xf.colorSpace.c_str()) << L"\"";
+                if (std::fabs(xf.manualGamma - 1.0f) > 1.0e-6f) {
+                    ss << L",\"manualGamma\":";
+                    WriteFloatValue(ss, xf.manualGamma, 1.0f);
+                }
                 wroteField = true;
             }
             if (xf.hasChannelSelect) {
@@ -3588,6 +3887,9 @@ public:
         writeMap(L"emMap", L"emMapXf", pbr.emissionMap, pbr.emissionMapTransform);
         writeMap(L"lmMap", L"lmMapXf", pbr.lightmapFile, pbr.lightmapTransform);
         writeMap(L"opMap", L"opMapXf", pbr.opacityMap, pbr.opacityMapTransform);
+        writeMap(L"ccMap", L"ccMapXf", pbr.clearcoatMap, pbr.clearcoatMapTransform);
+        writeMap(L"ccRoughMap", L"ccRoughMapXf", pbr.clearcoatRoughnessMap, pbr.clearcoatRoughnessMapTransform);
+        writeMap(L"ccNormMap", L"ccNormMapXf", pbr.clearcoatNormalMap, pbr.clearcoatNormalMapTransform);
     }
 
     void WriteMaterialFull(std::wostringstream& ss, const MaxJSPBR& pbr) {
@@ -4096,6 +4398,41 @@ public:
             }
         }
 
+        // TODO: tyFlow volume rendering (smoke/fire) — disabled pending shader fixes
+        if (false && IsTyFlowAvailable()) {
+            std::vector<VolumeData> volumes;
+            std::function<void(INode*)> collectVolumes = [&](INode* parent) {
+                for (int c = 0; c < parent->NumberOfChildren(); c++) {
+                    INode* node = parent->GetChildNode(c);
+                    if (!node) continue;
+                    if (IsTyFlowNode(node))
+                        ExtractTyFlowVolumes(node, t, volumes);
+                    collectVolumes(node);
+                }
+            };
+            collectVolumes(root);
+            if (!volumes.empty()) {
+                ss << L",\"volumes\":[";
+                for (size_t vi = 0; vi < volumes.size(); vi++) {
+                    if (vi) ss << L',';
+                    auto& vd = volumes[vi];
+                    ss << L"{\"h\":" << vd.handle;
+                    ss << L",\"dim\":[" << vd.dimX << L',' << vd.dimY << L',' << vd.dimZ << L']';
+                    ss << L",\"voxSize\":[";
+                    WriteFloats(ss, vd.voxelSize, 3);
+                    ss << L"],\"origin\":[";
+                    WriteFloats(ss, vd.origin, 3);
+                    ss << L"],\"tm\":";
+                    WriteFloats(ss, vd.transform, 16);
+                    ss << L",\"step\":" << vd.stepSize;
+                    ss << L",\"density\":";
+                    WriteFloats(ss, vd.density.data(), vd.density.size());
+                    ss << L'}';
+                }
+                ss << L']';
+            }
+        }
+
         ss << L'}';
 
         webview_->PostWebMessageAsJson(ss.str().c_str());
@@ -4580,6 +4917,41 @@ public:
             }
         }
 
+        // TODO: tyFlow volume rendering (smoke/fire) — disabled pending shader fixes
+        if (false && IsTyFlowAvailable()) {
+            std::vector<VolumeData> volumes;
+            std::function<void(INode*)> collectVolumes = [&](INode* parent) {
+                for (int c = 0; c < parent->NumberOfChildren(); c++) {
+                    INode* node = parent->GetChildNode(c);
+                    if (!node) continue;
+                    if (IsTyFlowNode(node))
+                        ExtractTyFlowVolumes(node, t, volumes);
+                    collectVolumes(node);
+                }
+            };
+            collectVolumes(root);
+            if (!volumes.empty()) {
+                ss << L",\"volumes\":[";
+                for (size_t vi = 0; vi < volumes.size(); vi++) {
+                    if (vi) ss << L',';
+                    auto& vd = volumes[vi];
+                    ss << L"{\"h\":" << vd.handle;
+                    ss << L",\"dim\":[" << vd.dimX << L',' << vd.dimY << L',' << vd.dimZ << L']';
+                    ss << L",\"voxSize\":";
+                    WriteFloats(ss, vd.voxelSize, 3);
+                    ss << L",\"origin\":";
+                    WriteFloats(ss, vd.origin, 3);
+                    ss << L",\"tm\":";
+                    WriteFloats(ss, vd.transform, 16);
+                    ss << L",\"step\":" << vd.stepSize;
+                    ss << L",\"density\":";
+                    WriteFloats(ss, vd.density.data(), vd.density.size());
+                    ss << L'}';
+                }
+                ss << L']';
+            }
+        }
+
         ss << L'}';
 
         wv17->PostSharedBufferToScript(sharedBuf.Get(),
@@ -4955,7 +5327,7 @@ static void RegisterMaxScript() {
         L"macroScript MaxJS_Toggle category:\"MaxJS\" tooltip:\"Toggle MaxJS Viewport\" buttonText:\"MaxJS\" (\r\n"
         L"    windows.sendMessage MaxJS_HWND %d 0 0\r\n"
         L")\r\n"
-        L"if menuMan.findMenu \"MaxJS\" == undefined do (\r\n"
+        L"if menuMan != undefined and menuMan.findMenu \"MaxJS\" == undefined do (\r\n"
         L"    local subMenu = menuMan.createMenu \"MaxJS\"\r\n"
         L"    local toggleItem = menuMan.createActionItem \"MaxJS_Toggle\" \"MaxJS\"\r\n"
         L"    subMenu.addItem toggleItem -1\r\n"
@@ -5026,26 +5398,24 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, ULONG fdwReason, LPVOID) {
 }
 
 __declspec(dllexport) const TCHAR* LibDescription()   { return MAXJS_NAME; }
-__declspec(dllexport) int LibNumberClasses()           { return 17; }
+__declspec(dllexport) int LibNumberClasses()           { return 15; }
 __declspec(dllexport) ClassDesc* LibClassDesc(int i) {
     switch (i) {
         case 0: return &maxJSDesc;
-        case 1: return GetThreeJSMtlDesc();
-        case 2: return GetThreeJSAdvMtlDesc();
-        case 3: return GetThreeJSSSSMtlDesc();
-        case 4: return GetThreeJSUtilityMtlDesc();
-        case 5: return GetThreeJSRendererDesc();
-        case 6: return GetThreeJSLightLegacyDesc();
-        case 7: return GetThreeJSDirectionalLightDesc();
-        case 8: return GetThreeJSPointLightDesc();
-        case 9: return GetThreeJSSpotLightDesc();
-        case 10: return GetThreeJSRectAreaLightDesc();
-        case 11: return GetThreeJSHemisphereLightDesc();
-        case 12: return GetThreeJSAmbientLightDesc();
-        case 13: return GetThreeJSToonDesc();
-        case 14: return GetThreeJSSplatDesc();
-        case 15: return GetThreeJSFogDesc();
-        case 16: return GetThreeJSSkyDesc();
+        case 1: return GetThreeJSAdvMtlDesc();
+        case 2: return GetThreeJSUtilityMtlDesc();
+        case 3: return GetThreeJSRendererDesc();
+        case 4: return GetThreeJSLightLegacyDesc();
+        case 5: return GetThreeJSDirectionalLightDesc();
+        case 6: return GetThreeJSPointLightDesc();
+        case 7: return GetThreeJSSpotLightDesc();
+        case 8: return GetThreeJSRectAreaLightDesc();
+        case 9: return GetThreeJSHemisphereLightDesc();
+        case 10: return GetThreeJSAmbientLightDesc();
+        case 11: return GetThreeJSToonDesc();
+        case 12: return GetThreeJSSplatDesc();
+        case 13: return GetThreeJSFogDesc();
+        case 14: return GetThreeJSSkyDesc();
         default: return nullptr;
     }
 }

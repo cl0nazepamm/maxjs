@@ -70,9 +70,7 @@ static const int kUtilityBackdropMapSlots[] = {
 };
 
 enum class ThreeJSMaterialKind {
-    Standard,
     Physical,
-    SSS,
     Utility,
 };
 
@@ -98,11 +96,12 @@ static Color GetOptionalColor(IParamBlock2* pb, ParamID id, TimeValue t, const C
 
 static SupportedMapSlots GetSupportedMapSlots(ThreeJSMaterialKind kind, IParamBlock2* pb) {
     switch (kind) {
-        case ThreeJSMaterialKind::Standard:
-        case ThreeJSMaterialKind::Physical:
+        case ThreeJSMaterialKind::Physical: {
+            const int mode = GetOptionalInt(pb, pb_material_mode, 0, threejs_mode_standard);
+            if (mode == threejs_mode_sss)
+                return { kSSSMapSlots, static_cast<int>(std::size(kSSSMapSlots)) };
             return { kStandardMapSlots, static_cast<int>(std::size(kStandardMapSlots)) };
-        case ThreeJSMaterialKind::SSS:
-            return { kSSSMapSlots, static_cast<int>(std::size(kSSSMapSlots)) };
+        }
         case ThreeJSMaterialKind::Utility: {
             const int utilityModel = GetOptionalInt(pb, pb_utility_model, 0, threejs_utility_lambert);
             switch (utilityModel) {
@@ -140,21 +139,17 @@ public:
     void DeleteThis() override { delete this; }
     Class_ID ClassID() override {
         switch (kind_) {
-            case ThreeJSMaterialKind::Physical: return THREEJS_ADV_MTL_CLASS_ID;
-            case ThreeJSMaterialKind::SSS: return THREEJS_SSS_MTL_CLASS_ID;
             case ThreeJSMaterialKind::Utility: return THREEJS_UTILITY_MTL_CLASS_ID;
-            case ThreeJSMaterialKind::Standard:
-            default: return THREEJS_MTL_CLASS_ID;
+            case ThreeJSMaterialKind::Physical:
+            default: return THREEJS_ADV_MTL_CLASS_ID;
         }
     }
     SClass_ID SuperClassID() override { return MATERIAL_CLASS_ID; }
     void GetClassName(MSTR& s, bool localized) const override {
         switch (kind_) {
-            case ThreeJSMaterialKind::Physical: s = _T("ThreeJS Adv"); break;
-            case ThreeJSMaterialKind::SSS: s = _T("ThreeJS SSS"); break;
-            case ThreeJSMaterialKind::Utility: s = _T("ThreeJS Utility"); break;
-            case ThreeJSMaterialKind::Standard:
-            default: s = _T("ThreeJS Material"); break;
+            case ThreeJSMaterialKind::Utility: s = _T("three.js Utility"); break;
+            case ThreeJSMaterialKind::Physical:
+            default: s = _T("three.js"); break;
         }
     }
 
@@ -165,8 +160,11 @@ public:
     }
 
     RefResult NotifyRefChanged(const Interval&, RefTargetHandle, PartID& partID, RefMessage msg, BOOL) override {
-        if (msg == REFMSG_CHANGE && kind_ == ThreeJSMaterialKind::Utility && partID == static_cast<PartID>(pb_utility_model)) {
-            NotifyDependents(FOREVER, PART_ALL, REFMSG_SUBANIM_STRUCTURE_CHANGED);
+        if (msg == REFMSG_CHANGE) {
+            if ((kind_ == ThreeJSMaterialKind::Utility && partID == static_cast<PartID>(pb_utility_model)) ||
+                (kind_ == ThreeJSMaterialKind::Physical && partID == static_cast<PartID>(pb_material_mode))) {
+                NotifyDependents(FOREVER, PART_ALL, REFMSG_SUBANIM_STRUCTURE_CHANGED);
+            }
         }
         return REF_SUCCEED;
     }
@@ -310,17 +308,15 @@ private:
 
     ClassDesc2* GetDescriptor() const {
         switch (kind_) {
-            case ThreeJSMaterialKind::Physical: return GetThreeJSAdvMtlDesc();
-            case ThreeJSMaterialKind::SSS: return GetThreeJSSSSMtlDesc();
             case ThreeJSMaterialKind::Utility: return GetThreeJSUtilityMtlDesc();
-            case ThreeJSMaterialKind::Standard:
-            default: return GetThreeJSMtlDesc();
+            case ThreeJSMaterialKind::Physical:
+            default: return GetThreeJSAdvMtlDesc();
         }
     }
 
     bool texDisplayOn_ = false;
     TexHandle* texHandle_ = nullptr;
-    ThreeJSMaterialKind kind_ = ThreeJSMaterialKind::Standard;
+    ThreeJSMaterialKind kind_ = ThreeJSMaterialKind::Physical;
 };
 
 class ThreeJSMtlClassDesc : public ClassDesc2 {
@@ -339,24 +335,18 @@ public:
     HINSTANCE HInstance() override { return hInstance; }
 
 private:
-    ThreeJSMaterialKind kind_ = ThreeJSMaterialKind::Standard;
+    ThreeJSMaterialKind kind_ = ThreeJSMaterialKind::Physical;
     Class_ID classID_;
     const TCHAR* className_ = nullptr;
     const TCHAR* internalName_ = nullptr;
 };
 
-static ThreeJSMtlClassDesc threeJSMtlDesc(
-    ThreeJSMaterialKind::Standard, THREEJS_MTL_CLASS_ID, _T("ThreeJS Material"), _T("ThreeJSMaterial"));
 static ThreeJSMtlClassDesc threeJSAdvMtlDesc(
-    ThreeJSMaterialKind::Physical, THREEJS_ADV_MTL_CLASS_ID, _T("ThreeJS Adv"), _T("ThreeJSAdvMaterial"));
-static ThreeJSMtlClassDesc threeJSSSSMtlDesc(
-    ThreeJSMaterialKind::SSS, THREEJS_SSS_MTL_CLASS_ID, _T("ThreeJS SSS"), _T("ThreeJSSSSMaterial"));
+    ThreeJSMaterialKind::Physical, THREEJS_ADV_MTL_CLASS_ID, _T("three.js"), _T("ThreeJSAdvMaterial"));
 static ThreeJSMtlClassDesc threeJSUtilityMtlDesc(
-    ThreeJSMaterialKind::Utility, THREEJS_UTILITY_MTL_CLASS_ID, _T("ThreeJS Utility"), _T("ThreeJSUtilityMaterial"));
+    ThreeJSMaterialKind::Utility, THREEJS_UTILITY_MTL_CLASS_ID, _T("three.js Utility"), _T("ThreeJSUtilityMaterial"));
 
-ClassDesc2* GetThreeJSMtlDesc() { return &threeJSMtlDesc; }
 ClassDesc2* GetThreeJSAdvMtlDesc() { return &threeJSAdvMtlDesc; }
-ClassDesc2* GetThreeJSSSSMtlDesc() { return &threeJSSSSMtlDesc; }
 ClassDesc2* GetThreeJSUtilityMtlDesc() { return &threeJSUtilityMtlDesc; }
 
 #define THREEJS_COMMON_PARAM_ITEMS \
@@ -791,50 +781,30 @@ ClassDesc2* GetThreeJSUtilityMtlDesc() { return &threeJSUtilityMtlDesc; }
         p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_ENV_INT_EDIT, IDC_ENV_INT_SPIN, 0.1f, \
         p_end
 
-static ParamBlockDesc2 threejs_pb_desc(
-    threejs_params,
-    _T("ThreeJS Material Parameters"),
-    IDS_PARAMS,
-    &threeJSMtlDesc,
-    P_AUTO_CONSTRUCT + P_AUTO_UI,
-    0,
-    IDD_THREEJS_MTL, IDS_PARAMS, 0, 0, nullptr,
-    THREEJS_COMMON_PARAM_ITEMS,
-    THREEJS_HIDDEN_LEGACY_PARAM_ITEMS,
-    p_end
-);
-
 static ParamBlockDesc2 threejs_adv_pb_desc(
     threejs_params,
-    _T("ThreeJS Adv Parameters"),
+    _T("three.js Parameters"),
     IDS_ADV_PARAMS,
     &threeJSAdvMtlDesc,
     P_AUTO_CONSTRUCT + P_AUTO_UI,
     0,
     IDD_THREEJS_ADV_MTL, IDS_ADV_PARAMS, 0, 0, nullptr,
+    pb_material_mode, _T("materialMode"), TYPE_INT, 0, 0,
+        p_default, threejs_mode_standard,
+        p_ui, TYPE_INT_COMBOBOX, IDC_MATERIAL_MODE, 3,
+            IDS_MATERIAL_MODE_STANDARD, IDS_MATERIAL_MODE_PHYSICAL, IDS_MATERIAL_MODE_SSS,
+        p_vals, threejs_mode_standard, threejs_mode_physical, threejs_mode_sss,
+        p_end,
     THREEJS_COMMON_PARAM_ITEMS,
     THREEJS_PHYSICAL_PARAM_ITEMS,
-    THREEJS_HIDDEN_LEGACY_PARAM_ITEMS,
-    p_end
-);
-
-static ParamBlockDesc2 threejs_sss_pb_desc(
-    threejs_params,
-    _T("ThreeJS SSS Parameters"),
-    IDS_SSS_PARAMS,
-    &threeJSSSSMtlDesc,
-    P_AUTO_CONSTRUCT + P_AUTO_UI,
-    0,
-    IDD_THREEJS_SSS_MTL, IDS_SSS_PARAMS, 0, 0, nullptr,
-    THREEJS_COMMON_PARAM_ITEMS,
-    THREEJS_HIDDEN_LEGACY_PARAM_ITEMS,
     THREEJS_SSS_PARAM_ITEMS,
+    THREEJS_HIDDEN_LEGACY_PARAM_ITEMS,
     p_end
 );
 
 static ParamBlockDesc2 threejs_utility_pb_desc(
     threejs_params,
-    _T("ThreeJS Utility Parameters"),
+    _T("three.js Utility Parameters"),
     IDS_UTILITY_PARAMS,
     &threeJSUtilityMtlDesc,
     P_AUTO_CONSTRUCT + P_AUTO_UI,

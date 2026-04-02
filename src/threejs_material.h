@@ -5,10 +5,16 @@
 
 #define THREEJS_MTL_CLASS_ID Class_ID(0x7F3A9B10, 0x4E2D8C10)
 #define THREEJS_ADV_MTL_CLASS_ID Class_ID(0x7F3A9B11, 0x4E2D8C10)
-#define THREEJS_SSS_MTL_CLASS_ID Class_ID(0x7F3A9B12, 0x4E2D8C10)
+
 #define THREEJS_UTILITY_MTL_CLASS_ID Class_ID(0x7F3A9B13, 0x4E2D8C10)
 
 enum { threejs_params };
+
+enum ThreeJSMaterialMode {
+    threejs_mode_standard = 0,
+    threejs_mode_physical,
+    threejs_mode_sss,
+};
 
 enum ThreeJSParamIDs {
     // PBR Core
@@ -60,6 +66,8 @@ enum ThreeJSParamIDs {
     pb_phys_attenuation_color,
     pb_phys_attenuation_distance,
     pb_phys_anisotropy,
+    // Material mode (Standard / Physical)
+    pb_material_mode,
 };
 
 enum ThreeJSUtilityModel {
@@ -97,7 +105,5 @@ enum ThreeJSMapSlots {
     kNumMaps
 };
 
-ClassDesc2* GetThreeJSMtlDesc();
 ClassDesc2* GetThreeJSAdvMtlDesc();
-ClassDesc2* GetThreeJSSSSMtlDesc();
 ClassDesc2* GetThreeJSUtilityMtlDesc();

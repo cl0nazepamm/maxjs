@@ -1,0 +1,49 @@
+#include "threejs_fog_res.h"
+#include <windows.h>
+
+STRINGTABLE
+BEGIN
+    IDS_THREEJS_FOG_PARAMS "three.js Fog"
+    IDS_FOG_TYPE_RANGE     "Range"
+    IDS_FOG_TYPE_DENSITY   "Density"
+    IDS_FOG_TYPE_CUSTOM    "Procedural"
+END
+
+IDD_THREEJS_FOG DIALOG 0, 0, 217, 164
+STYLE DS_SETFONT | WS_CHILD | WS_VISIBLE
+FONT 8, "Segoe UI"
+BEGIN
+    LTEXT           "Type", -1, 8, 6, 42, 8
+    COMBOBOX        IDC_FOG_TYPE, 60, 4, 80, 60, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+
+    LTEXT           "Color", -1, 8, 22, 42, 8
+    CONTROL         "", IDC_FOG_COLOR, "ColorSwatch", WS_TABSTOP, 60, 20, 40, 12
+
+    LTEXT           "Opacity", -1, 8, 38, 42, 8
+    CONTROL         "", IDC_FOG_OPACITY_EDIT, "CustEdit", WS_TABSTOP, 60, 36, 40, 10
+    CONTROL         "", IDC_FOG_OPACITY_SPIN, "SpinnerControl", 0, 100, 36, 11, 10
+
+    GROUPBOX        "Range Fog", -1, 2, 52, 213, 30
+    LTEXT           "Near", IDC_LABEL_NEAR, 8, 64, 42, 8
+    CONTROL         "", IDC_FOG_NEAR_EDIT, "CustEdit", WS_TABSTOP, 60, 62, 40, 10
+    CONTROL         "", IDC_FOG_NEAR_SPIN, "SpinnerControl", 0, 100, 62, 11, 10
+    LTEXT           "Far", IDC_LABEL_FAR, 120, 64, 28, 8
+    CONTROL         "", IDC_FOG_FAR_EDIT, "CustEdit", WS_TABSTOP, 150, 62, 40, 10
+    CONTROL         "", IDC_FOG_FAR_SPIN, "SpinnerControl", 0, 190, 62, 11, 10
+
+    GROUPBOX        "Density Fog", -1, 2, 84, 213, 30
+    LTEXT           "Density", IDC_LABEL_DENSITY, 8, 96, 42, 8
+    CONTROL         "", IDC_FOG_DENSITY_EDIT, "CustEdit", WS_TABSTOP, 60, 94, 40, 10
+    CONTROL         "", IDC_FOG_DENSITY_SPIN, "SpinnerControl", 0, 100, 94, 11, 10
+
+    GROUPBOX        "Procedural Fog", -1, 2, 116, 213, 46
+    LTEXT           "Scale", IDC_LABEL_NOISE_SCALE, 8, 128, 42, 8
+    CONTROL         "", IDC_FOG_NOISE_SCALE_EDIT, "CustEdit", WS_TABSTOP, 60, 126, 40, 10
+    CONTROL         "", IDC_FOG_NOISE_SCALE_SPIN, "SpinnerControl", 0, 100, 126, 11, 10
+    LTEXT           "Speed", IDC_LABEL_NOISE_SPEED, 120, 128, 28, 8
+    CONTROL         "", IDC_FOG_NOISE_SPEED_EDIT, "CustEdit", WS_TABSTOP, 150, 126, 40, 10
+    CONTROL         "", IDC_FOG_NOISE_SPEED_SPIN, "SpinnerControl", 0, 190, 126, 11, 10
+    LTEXT           "Height", IDC_LABEL_HEIGHT, 8, 144, 42, 8
+    CONTROL         "", IDC_FOG_HEIGHT_EDIT, "CustEdit", WS_TABSTOP, 60, 142, 40, 10
+    CONTROL         "", IDC_FOG_HEIGHT_SPIN, "SpinnerControl", 0, 100, 142, 11, 10
+END

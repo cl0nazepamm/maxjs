@@ -3,10 +3,10 @@
 
 STRINGTABLE
 BEGIN
-    IDS_PARAMS "ThreeJS Material"
-    IDS_ADV_PARAMS "ThreeJS Adv"
-    IDS_SSS_PARAMS "ThreeJS SSS"
-    IDS_UTILITY_PARAMS "ThreeJS Utility"
+    IDS_PARAMS "three.js"
+    IDS_ADV_PARAMS "three.js"
+    IDS_SSS_PARAMS "three.js SSS"
+    IDS_UTILITY_PARAMS "three.js Utility"
     IDS_UTILITY_MODE_DISTANCE "Distance"
     IDS_UTILITY_MODE_DEPTH "Depth"
     IDS_UTILITY_MODE_LAMBERT "Lambert"
@@ -14,6 +14,10 @@ BEGIN
     IDS_UTILITY_MODE_NORMAL "Normal"
     IDS_UTILITY_MODE_PHONG "Phong"
     IDS_UTILITY_MODE_BACKDROP "Backdrop"
+    IDS_UTILITY_MODE_SSS "SSS"
+    IDS_MATERIAL_MODE_STANDARD "Standard"
+    IDS_MATERIAL_MODE_PHYSICAL "Physical"
+    IDS_MATERIAL_MODE_SSS "SSS"
     IDS_BACKDROP_MODE_BLURRED "Blurred"
     IDS_BACKDROP_MODE_DEPTH "Depth"
     IDS_BACKDROP_MODE_TEXTURE "Texture"
@@ -112,11 +116,13 @@ BEGIN
     LTEXT           "Model: MeshStandardMaterial", IDC_MTL_MODEL_LABEL, 8, 414, 132, 8
 END
 
-IDD_THREEJS_ADV_MTL DIALOG 0, 0, 170, 596
+IDD_THREEJS_ADV_MTL DIALOG 0, 0, 170, 612
 STYLE DS_SETFONT | WS_CHILD | WS_VISIBLE
 FONT 8, "Segoe UI"
 BEGIN
-    GROUPBOX        "Base Surface", -1,   2,   2, 166, 150
+    LTEXT           "Mode",          -1,   8,   4, 20,   8
+    COMBOBOX        IDC_MATERIAL_MODE,          34,   2, 60, 80, CBS_DROPDOWNLIST | WS_TABSTOP
+    GROUPBOX        "Base Surface", -1,   2,  18, 166, 150
     LTEXT           "Color",         -1,   8,  15, 20,   8
     CONTROL         "",  IDC_COLOR,      "ColorSwatch",    WS_TABSTOP, 34,  13, 24, 12
     CONTROL         "",  IDC_COLOR_MAP,  "CustButton",     WS_TABSTOP, 74,  13, 46, 12

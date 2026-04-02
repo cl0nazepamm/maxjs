@@ -874,6 +874,8 @@
                 realHeight: Number.isFinite(xf.realHeight) && Math.abs(xf.realHeight) > 1e-6 ? xf.realHeight : 1.0,
                 wrap: typeof xf.wrap === 'string' ? xf.wrap : 'periodic',
                 channel: Number.isFinite(xf.channel) ? Math.max(1, Math.round(xf.channel)) : 1,
+                colorSpace: typeof xf.colorSpace === 'string' ? xf.colorSpace : '',
+                manualGamma: Number.isFinite(xf.manualGamma) ? xf.manualGamma : 1.0,
             };
         }
 
@@ -984,8 +986,19 @@
             tex.image = canvas;
         }
 
+        function resolveColorSpace(slotColorSpace, xf) {
+            const cs = xf?.colorSpace;
+            if (!cs) return slotColorSpace;
+            const lc = cs.toLowerCase();
+            if (lc === 'srgb' || lc === 'srgb texture') return THREE.SRGBColorSpace;
+            if (lc === 'linear' || lc === 'raw' || lc === 'data' || lc === 'non-color') return THREE.LinearSRGBColorSpace;
+            // "auto" — fall back to slot default
+            return slotColorSpace;
+        }
+
         function loadTexture(url, colorSpace = THREE.LinearSRGBColorSpace, xf = null, fallbackTex = fallbackWhiteTexture) {
             if (!url) return null;
+            colorSpace = resolveColorSpace(colorSpace, xf);
             const normalizedXf = normalizeTextureTransform(xf);
             const cacheKey = JSON.stringify([url, String(colorSpace), normalizedXf]);
             if (textureCache.has(cacheKey)) return textureCache.get(cacheKey);
@@ -1490,6 +1503,15 @@
             if (md.bumpMap && 'bumpMap' in material) {
                 material.bumpMap = loadTexture(md.bumpMap, THREE.NoColorSpace, md.bumpMapXf, fallbackHeightTexture);
             }
+            if (md.ccMap && 'clearcoatMap' in material) {
+                material.clearcoatMap = loadTexture(md.ccMap, THREE.LinearSRGBColorSpace, md.ccMapXf, fallbackWhiteTexture);
+            }
+            if (md.ccRoughMap && 'clearcoatRoughnessMap' in material) {
+                material.clearcoatRoughnessMap = loadTexture(md.ccRoughMap, THREE.LinearSRGBColorSpace, md.ccRoughMapXf, fallbackWhiteTexture);
+            }
+            if (md.ccNormMap && 'clearcoatNormalMap' in material) {
+                material.clearcoatNormalMap = loadTexture(md.ccNormMap, THREE.LinearSRGBColorSpace, md.ccNormMapXf, fallbackFlatNormalTexture);
+            }
             if (md.dispMap && 'displacementMap' in material) {
                 material.displacementMap = loadTexture(md.dispMap, THREE.NoColorSpace, md.dispMapXf, fallbackHeightTexture);
             }
@@ -1576,6 +1598,9 @@
                         if (md.specularIntensity != null) params.specularIntensity = md.specularIntensity;
                         if (md.clearcoat != null) params.clearcoat = md.clearcoat;
                         if (md.clearcoatRoughness != null) params.clearcoatRoughness = md.clearcoatRoughness;
+                        if (md.ccMap) params.clearcoatMap = loadTexture(md.ccMap, THREE.LinearSRGBColorSpace, md.ccMapXf, fallbackWhiteTexture);
+                        if (md.ccRoughMap) params.clearcoatRoughnessMap = loadTexture(md.ccRoughMap, THREE.LinearSRGBColorSpace, md.ccRoughMapXf, fallbackWhiteTexture);
+                        if (md.ccNormMap) params.clearcoatNormalMap = loadTexture(md.ccNormMap, THREE.LinearSRGBColorSpace, md.ccNormMapXf, fallbackFlatNormalTexture);
                         if (md.sheen != null) params.sheen = md.sheen;
                         if (md.sheenRoughness != null) params.sheenRoughness = md.sheenRoughness;
                         if (Array.isArray(md.sheenColor)) {
@@ -2050,6 +2075,7 @@
             if (msg.lights) applyLights(msg.lights);
             reconcileSplats(msg.splats ?? []);
             applyForestInstances(msg.forestInstances);
+            applyVolumes(msg.volumes);
             scene.updateMatrixWorld(true);
 
             if (firstSync && msg.nodes.length > 0) {
@@ -2284,6 +2310,7 @@
             if (meta.lights) applyLights(meta.lights);
             reconcileSplats(meta.splats ?? []);
             applyForestInstances(meta.forestInstances);
+            applyVolumes(meta.volumes);
             scene.updateMatrixWorld(true);
 
             if (firstSync && meta.nodes.length > 0) {
@@ -2665,6 +2692,184 @@
 
                 scene.add(instMesh);
                 forestMeshes.set(`${grp.src}`, instMesh);
+            }
+        }
+
+        // ── tyFlow Volume Rendering (smoke/fire) ─────────────
+        const volumeMeshes = new Map(); // key → THREE.Mesh with volume shader
+
+        function createSmokePalette() {
+            const canvas = document.createElement('canvas');
+            canvas.width = 256; canvas.height = 1;
+            const ctx = canvas.getContext('2d');
+            const grad = ctx.createLinearGradient(0, 0, 256, 0);
+            grad.addColorStop(0.0, 'rgba(0,0,0,0)');
+            grad.addColorStop(0.1, 'rgba(40,40,40,0.3)');
+            grad.addColorStop(0.4, 'rgba(120,120,120,0.6)');
+            grad.addColorStop(0.7, 'rgba(180,180,180,0.8)');
+            grad.addColorStop(1.0, 'rgba(220,220,220,1.0)');
+            ctx.fillStyle = grad;
+            ctx.fillRect(0, 0, 256, 1);
+            const tex = new THREE.CanvasTexture(canvas);
+            tex.minFilter = THREE.LinearFilter;
+            tex.magFilter = THREE.LinearFilter;
+            return tex;
+        }
+        const smokePalette = createSmokePalette();
+
+        // Simplified box-based volume shader (integrates with scene depth)
+        function createVolumeMesh(vol) {
+            const dim = vol.dim;
+            const voxSize = vol.voxSize;
+            const sizeX = dim[0] * voxSize[0];
+            const sizeY = dim[1] * voxSize[1];
+            const sizeZ = dim[2] * voxSize[2];
+
+            // Create 3D texture from density data
+            const data = new Float32Array(vol.density);
+            const tex3d = new THREE.Data3DTexture(data, dim[0], dim[1], dim[2]);
+            tex3d.format = THREE.RedFormat;
+            tex3d.type = THREE.FloatType;
+            tex3d.minFilter = THREE.LinearFilter;
+            tex3d.magFilter = THREE.LinearFilter;
+            tex3d.wrapS = THREE.ClampToEdgeWrapping;
+            tex3d.wrapT = THREE.ClampToEdgeWrapping;
+            tex3d.wrapR = THREE.ClampToEdgeWrapping;
+            tex3d.needsUpdate = true;
+
+            const stepNorm = (vol.step || Math.min(voxSize[0], voxSize[1], voxSize[2]))
+                             / Math.max(sizeX, sizeY, sizeZ);
+
+            const mat = new THREE.ShaderMaterial({
+                uniforms: {
+                    volumeTex: { value: tex3d },
+                    stepSize: { value: stepNorm },
+                    densityMult: { value: 15.0 },
+                    cameraPos: { value: new THREE.Vector3() },
+                },
+                vertexShader: `
+                    varying vec3 vLocalPos;
+                    void main() {
+                        // position is [-0.5, 0.5], map to [0,1]
+                        vLocalPos = position + 0.5;
+                        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+                    }
+                `,
+                fragmentShader: `
+                    precision highp sampler3D;
+                    uniform sampler3D volumeTex;
+                    uniform float stepSize;
+                    uniform float densityMult;
+                    uniform vec3 cameraPos;
+                    varying vec3 vLocalPos;
+
+                    void main() {
+                        // Camera position in local [0,1] space
+                        vec3 camLocal = (inverse(modelMatrix) * vec4(cameraPos, 1.0)).xyz + 0.5;
+                        vec3 rayDir = normalize(vLocalPos - camLocal);
+
+                        // Ray-box intersection in [0,1] space
+                        vec3 invDir = 1.0 / rayDir;
+                        vec3 t0 = -camLocal * invDir;
+                        vec3 t1 = (vec3(1.0) - camLocal) * invDir;
+                        vec3 tmin = min(t0, t1);
+                        vec3 tmax = max(t0, t1);
+                        float tNear = max(max(tmin.x, tmin.y), tmin.z);
+                        float tFar = min(min(tmax.x, tmax.y), tmax.z);
+                        if (tNear > tFar) discard;
+                        tNear = max(tNear, 0.0);
+
+                        float dt = stepSize;
+                        vec4 acc = vec4(0.0);
+                        float t = tNear;
+
+                        for (int i = 0; i < 256; i++) {
+                            if (t > tFar || acc.a > 0.95) break;
+                            vec3 pos = camLocal + rayDir * t;
+                            float d = texture(volumeTex, pos).r;
+                            if (d > 0.001) {
+                                float a = 1.0 - exp(-d * densityMult * dt);
+                                // Smoke: light gray, denser = slightly darker
+                                vec3 col = mix(vec3(0.85), vec3(0.3), clamp(d, 0.0, 1.0));
+                                acc.rgb += col * a * (1.0 - acc.a);
+                                acc.a += a * (1.0 - acc.a);
+                            }
+                            t += dt;
+                        }
+                        if (acc.a < 0.005) discard;
+                        gl_FragColor = acc;
+                    }
+                `,
+                transparent: true,
+                depthWrite: false,
+                side: THREE.BackSide,
+            });
+
+            // Unit box centered at origin — scaled to volume size
+            const geom = new THREE.BoxGeometry(1, 1, 1);
+            const mesh = new THREE.Mesh(geom, mat);
+            mesh.scale.set(sizeX, sizeY, sizeZ);
+            mesh.frustumCulled = false;
+            mesh.renderOrder = 100;
+            mesh.userData._volumeTex = tex3d;
+            return mesh;
+        }
+
+        function applyVolumes(volumes) {
+            // Remove old volume meshes
+            for (const [key, mesh] of volumeMeshes) {
+                scene.remove(mesh);
+                if (mesh.userData._volumeTex) mesh.userData._volumeTex.dispose();
+                mesh.material.dispose();
+                mesh.geometry.dispose();
+            }
+            volumeMeshes.clear();
+
+            if (!Array.isArray(volumes) || volumes.length === 0) return;
+
+            let totalVoxels = 0, rendered = 0;
+            for (let vi = 0; vi < volumes.length; vi++) {
+                const vol = volumes[vi];
+                if (!vol.density?.length || !vol.dim) continue;
+                totalVoxels += vol.dim[0] * vol.dim[1] * vol.dim[2];
+
+                // Skip empty volumes (no significant density)
+                let maxD = 0;
+                for (let i = 0; i < vol.density.length; i++) {
+                    if (vol.density[i] > maxD) maxD = vol.density[i];
+                }
+                if (maxD < 0.001) continue;
+
+                const mesh = createVolumeMesh(vol);
+
+                // Position: origin is voxel [0,0,0] center in world space
+                // Box spans from origin to origin + dim*voxelSize
+                const sX = vol.dim[0] * vol.voxSize[0];
+                const sY = vol.dim[1] * vol.voxSize[1];
+                const sZ = vol.dim[2] * vol.voxSize[2];
+                // Center the box at the middle of the volume
+                mesh.position.set(
+                    vol.origin[0] + sX * 0.5,
+                    vol.origin[1] + sY * 0.5,
+                    vol.origin[2] + sZ * 0.5
+                );
+
+                mesh.name = `volume_${vol.h}_${vi}`;
+                scene.add(mesh);
+                volumeMeshes.set(`${vol.h}_${vi}`, mesh);
+                rendered++;
+            }
+            if (rendered > 0) {
+                console.log('[Volume]', rendered, '/', volumes.length, 'blocks,', totalVoxels, 'voxels');
+            }
+        }
+
+        // Update camera position uniform for volume shaders
+        function updateVolumeUniforms() {
+            for (const [, mesh] of volumeMeshes) {
+                if (mesh.material?.uniforms?.cameraPos) {
+                    mesh.material.uniforms.cameraPos.value.copy(camera.position);
+                }
             }
         }
 
@@ -3607,6 +3812,7 @@
             if (defaultLights.visible) {
                 defaultKey.position.copy(camera.position);
             }
+            updateVolumeUniforms();
             const renderStart = performance.now();
             ssgiFx.render();
             if (splatOverlay && splatHandleMap.size > 0) {

@@ -36,7 +36,7 @@ public:
     void DeleteThis() override { delete this; }
     Class_ID ClassID() override { return THREEJS_TOON_CLASS_ID; }
     SClass_ID SuperClassID() override { return MATERIAL_CLASS_ID; }
-    void GetClassName(MSTR& s, bool) const override { s = _T("ThreeJS Toon"); }
+    void GetClassName(MSTR& s, bool) const override { s = _T("three.js Toon"); }
 
     int NumRefs() override { return 1; }
     RefTargetHandle GetReference(int i) override { return i == 0 ? pblock : nullptr; }
@@ -123,8 +123,8 @@ class ThreeJSToonClassDesc : public ClassDesc2 {
 public:
     int IsPublic() override { return TRUE; }
     void* Create(BOOL loading) override { return new ThreeJSToon(loading); }
-    const TCHAR* ClassName() override { return _T("ThreeJS Toon"); }
-    const TCHAR* NonLocalizedClassName() override { return _T("ThreeJS Toon"); }
+    const TCHAR* ClassName() override { return _T("three.js Toon"); }
+    const TCHAR* NonLocalizedClassName() override { return _T("three.js Toon"); }
     SClass_ID SuperClassID() override { return MATERIAL_CLASS_ID; }
     Class_ID ClassID() override { return THREEJS_TOON_CLASS_ID; }
     const TCHAR* Category() override { return _T("MaxJS"); }

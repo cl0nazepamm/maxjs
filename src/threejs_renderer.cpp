@@ -102,7 +102,7 @@ public:
     void DeleteThis() override { delete this; }
     Class_ID ClassID() override { return THREEJS_RENDERER_CLASS_ID; }
     SClass_ID SuperClassID() override { return RENDERER_CLASS_ID; }
-    void GetClassName(MSTR& s, bool) const override { s = _T("ThreeJS"); }
+    void GetClassName(MSTR& s, bool) const override { s = _T("three.js"); }
 
     // ── ReferenceMaker ───────────────────────────────────────
     int NumRefs() override { return 0; }
@@ -179,8 +179,8 @@ class ThreeJSRendererClassDesc : public ClassDesc2 {
 public:
     int IsPublic() override { return TRUE; }
     void* Create(BOOL) override { return new ThreeJSRenderer(); }
-    const TCHAR* ClassName() override { return _T("ThreeJS"); }
-    const TCHAR* NonLocalizedClassName() override { return _T("ThreeJS"); }
+    const TCHAR* ClassName() override { return _T("three.js"); }
+    const TCHAR* NonLocalizedClassName() override { return _T("three.js"); }
     SClass_ID SuperClassID() override { return RENDERER_CLASS_ID; }
     Class_ID ClassID() override { return THREEJS_RENDERER_CLASS_ID; }
     const TCHAR* Category() override { return _T("MaxJS"); }

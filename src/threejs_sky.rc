@@ -1,0 +1,42 @@
+#include "threejs_sky_res.h"
+#include <windows.h>
+
+STRINGTABLE
+BEGIN
+    IDS_THREEJS_SKY_PARAMS "three.js Sky"
+END
+
+IDD_THREEJS_SKY DIALOG 0, 0, 217, 120
+STYLE DS_SETFONT | WS_CHILD | WS_VISIBLE
+FONT 8, "Segoe UI"
+BEGIN
+    GROUPBOX        "Sun", -1, 2, 2, 213, 30
+    LTEXT           "Elevation", -1, 8, 14, 48, 8
+    CONTROL         "", IDC_SKY_ELEVATION_EDIT, "CustEdit", WS_TABSTOP, 60, 12, 40, 10
+    CONTROL         "", IDC_SKY_ELEVATION_SPIN, "SpinnerControl", 0, 100, 12, 11, 10
+    LTEXT           "Azimuth", -1, 120, 14, 28, 8
+    CONTROL         "", IDC_SKY_AZIMUTH_EDIT, "CustEdit", WS_TABSTOP, 152, 12, 40, 10
+    CONTROL         "", IDC_SKY_AZIMUTH_SPIN, "SpinnerControl", 0, 192, 12, 11, 10
+
+    GROUPBOX        "Atmosphere", -1, 2, 34, 213, 58
+    LTEXT           "Turbidity", -1, 8, 46, 48, 8
+    CONTROL         "", IDC_SKY_TURBIDITY_EDIT, "CustEdit", WS_TABSTOP, 60, 44, 40, 10
+    CONTROL         "", IDC_SKY_TURBIDITY_SPIN, "SpinnerControl", 0, 100, 44, 11, 10
+    LTEXT           "Rayleigh", -1, 120, 46, 32, 8
+    CONTROL         "", IDC_SKY_RAYLEIGH_EDIT, "CustEdit", WS_TABSTOP, 152, 44, 40, 10
+    CONTROL         "", IDC_SKY_RAYLEIGH_SPIN, "SpinnerControl", 0, 192, 44, 11, 10
+
+    LTEXT           "Mie Coeff", -1, 8, 60, 48, 8
+    CONTROL         "", IDC_SKY_MIE_COEFF_EDIT, "CustEdit", WS_TABSTOP, 60, 58, 40, 10
+    CONTROL         "", IDC_SKY_MIE_COEFF_SPIN, "SpinnerControl", 0, 100, 58, 11, 10
+    LTEXT           "Mie Dir G", -1, 120, 60, 32, 8
+    CONTROL         "", IDC_SKY_MIE_DIR_G_EDIT, "CustEdit", WS_TABSTOP, 152, 58, 40, 10
+    CONTROL         "", IDC_SKY_MIE_DIR_G_SPIN, "SpinnerControl", 0, 192, 58, 11, 10
+
+    LTEXT           "Exposure", -1, 8, 76, 48, 8
+    CONTROL         "", IDC_SKY_EXPOSURE_EDIT, "CustEdit", WS_TABSTOP, 60, 74, 40, 10
+    CONTROL         "", IDC_SKY_EXPOSURE_SPIN, "SpinnerControl", 0, 100, 74, 11, 10
+
+    GROUPBOX        "", -1, 2, 92, 213, 24
+    LTEXT           "Assign to Environment Map slot for live sky.", -1, 8, 100, 200, 10
+END

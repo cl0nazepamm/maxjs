@@ -161,10 +161,19 @@ public:
 
     RefResult NotifyRefChanged(const Interval&, RefTargetHandle, PartID& partID, RefMessage msg, BOOL) override {
         if (msg == REFMSG_CHANGE) {
+            ivalid_.SetEmpty();
+            NotifyDependents(FOREVER, PART_ALL, REFMSG_DISPLAY_MATERIAL_CHANGE);
+            NotifyDependents(FOREVER, partID ? partID : PART_ALL, REFMSG_CHANGE);
             if ((kind_ == ThreeJSMaterialKind::Utility && partID == static_cast<PartID>(pb_utility_model)) ||
                 (kind_ == ThreeJSMaterialKind::Physical && partID == static_cast<PartID>(pb_material_mode))) {
+                DiscardTexHandle();
                 NotifyDependents(FOREVER, PART_ALL, REFMSG_SUBANIM_STRUCTURE_CHANGED);
             }
+        } else if (msg == REFMSG_TEXMAP_REMOVED) {
+            ivalid_.SetEmpty();
+            DiscardTexHandle();
+            NotifyDependents(FOREVER, PART_ALL, REFMSG_DISPLAY_MATERIAL_CHANGE);
+            NotifyDependents(FOREVER, PART_ALL, REFMSG_CHANGE);
         }
         return REF_SUCCEED;
     }
@@ -242,9 +251,34 @@ public:
         return GetDescriptor()->CreateParamDlgs(hwMtlEdit, imp, this);
     }
 
-    void Update(TimeValue t, Interval& valid) override { valid = FOREVER; }
-    Interval Validity(TimeValue t) override { return FOREVER; }
-    void Reset() override { GetDescriptor()->MakeAutoParamBlocks(this); }
+    void Update(TimeValue t, Interval& valid) override {
+        if (!ivalid_.InInterval(t)) {
+            ivalid_.SetInfinite();
+            if (pblock) {
+                pblock->GetValidity(t, ivalid_);
+            }
+
+            const SupportedMapSlots visibleSlots = GetSupportedMapSlots(kind_, pblock);
+            if (visibleSlots.slots) {
+                for (int i = 0; i < visibleSlots.count; ++i) {
+                    Texmap* tex = GetSubTexmap(i);
+                    if (tex) {
+                        tex->Update(t, ivalid_);
+                    }
+                }
+            }
+        }
+        valid &= ivalid_;
+    }
+    Interval Validity(TimeValue t) override {
+        Interval valid = FOREVER;
+        Update(t, valid);
+        return valid;
+    }
+    void Reset() override {
+        ivalid_.SetEmpty();
+        GetDescriptor()->MakeAutoParamBlocks(this);
+    }
 
     int NumSubTexmaps() override {
         return GetSupportedMapSlots(kind_, pblock).count;
@@ -316,6 +350,7 @@ private:
 
     bool texDisplayOn_ = false;
     TexHandle* texHandle_ = nullptr;
+    Interval ivalid_ = Interval(0, -1);
     ThreeJSMaterialKind kind_ = ThreeJSMaterialKind::Physical;
 };
 

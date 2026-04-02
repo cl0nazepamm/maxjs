@@ -1351,9 +1351,26 @@ static void ExtractMaterialScalarPreview(Mtl* foundMtl, INode* node, TimeValue t
         metal = tmp.metalness;
         opac = tmp.opacity;
         return;
+    } else {
+        MaxJSPBR tmp;
+        ExtractPBRFromMtl(foundMtl, node, t, tmp);
+        col[0] = tmp.color[0]; col[1] = tmp.color[1]; col[2] = tmp.color[2];
+        rough = tmp.roughness;
+        metal = tmp.metalness;
+        opac = tmp.opacity;
+        return;
     }
 
     if (node) GetWireColor3f(node, col);
+}
+
+static uint64_t HashMaterialScalarPreviewValues(const float col[3], float rough, float metal, float opac) {
+    uint64_t h = 1469598103934665603ULL;
+    h = HashFNV1a(col, sizeof(float) * 3, h);
+    h = HashFNV1a(&rough, sizeof(rough), h);
+    h = HashFNV1a(&metal, sizeof(metal), h);
+    h = HashFNV1a(&opac, sizeof(opac), h);
+    return h;
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -2669,7 +2686,8 @@ public:
     std::unordered_set<ULONG> splatHandles_;
     std::unordered_set<ULONG> fastDirtyHandles_;
     std::unordered_map<ULONG, std::array<float, 16>> lastSentTransforms_;
-    std::unordered_map<ULONG, uintptr_t> mtlHashMap_;  // node handle → material state hash
+    std::unordered_map<ULONG, uint64_t> mtlHashMap_;   // node handle → material structure hash
+    std::unordered_map<ULONG, uint64_t> mtlScalarHashMap_; // node handle → fast-sync scalar hash
     std::unordered_map<ULONG, uint64_t> lightHashMap_; // node handle → light state hash
     std::unordered_map<ULONG, uint64_t> splatHashMap_; // node handle → splat source state hash
     std::unordered_map<ULONG, uint64_t> geoHashMap_;   // node handle → geometry topology hash
@@ -2922,6 +2940,7 @@ public:
         fastDirtyHandles_.clear();
         lastSentTransforms_.clear();
         mtlHashMap_.clear();
+        mtlScalarHashMap_.clear();
         lightHashMap_.clear();
         splatHashMap_.clear();
         propHashMap_.clear();
@@ -3013,6 +3032,7 @@ public:
 
     // Handles that need geometry re-sent via fast path (not full sync)
     std::unordered_set<ULONG> geoFastDirtyHandles_;
+    std::unordered_set<ULONG> materialFastDirtyHandles_;
 
     void CheckSelectedGeometryLive() {
         Interface* ip = GetCOREInterface();
@@ -3050,6 +3070,7 @@ public:
 
     void ResetFastPathState(bool refreshCameraState = false) {
         fastDirtyHandles_.clear();
+        materialFastDirtyHandles_.clear();
         fastCameraDirty_ = false;
         fastFlushPosted_ = false;
         if (refreshCameraState) CaptureCurrentCameraState();
@@ -3294,6 +3315,7 @@ public:
         if (msg.find(L"\"ready\"") != std::wstring::npos) {
             jsReady_ = true; SetDirtyImmediate();
             mtlHashMap_.clear();
+            mtlScalarHashMap_.clear();
             lightHashMap_.clear();
             splatHashMap_.clear();
             propHashMap_.clear();
@@ -3454,6 +3476,8 @@ public:
         // Collect geometry-dirty handles before clearing
         std::unordered_set<ULONG> geoDirty;
         geoDirty.swap(geoFastDirtyHandles_);
+        std::unordered_set<ULONG> materialDirty;
+        materialDirty.swap(materialFastDirtyHandles_);
 
         fastDirtyHandles_.clear();
         fastCameraDirty_ = false;
@@ -3461,7 +3485,9 @@ public:
         // Geometry fast path: send ONLY the changed mesh(es), nothing else
         if (!geoDirty.empty()) {
             SendGeometryFastUpdate(geoDirty);
-            return;
+            if (materialDirty.empty() && !hasDirtyCamera && !hasDirtyLights && !hasDirtySplats) {
+                return;
+            }
         }
 
         if (!useBinary_ || hasDirtyLights || hasDirtySplats) {
@@ -3494,6 +3520,7 @@ public:
             INode* node = ip->GetINodeByHandle(handle);
             if (!node) {
                 mtlHashMap_.erase(handle);
+                mtlScalarHashMap_.erase(handle);
                 lightHashMap_.erase(handle);
                 splatHashMap_.erase(handle);
                 geoHashMap_.erase(handle);
@@ -3501,6 +3528,7 @@ public:
                 lightHandles_.erase(handle);
                 splatHandles_.erase(handle);
                 lastSentTransforms_.erase(handle);
+                materialFastDirtyHandles_.erase(handle);
                 SetDirty();
                 continue;
             }
@@ -3511,6 +3539,20 @@ public:
             frame.UpdateTransform(static_cast<std::uint32_t>(handle), xform);
             frame.UpdateSelection(static_cast<std::uint32_t>(handle), node->Selected() != 0);
             frame.UpdateVisibility(static_cast<std::uint32_t>(handle), !node->IsNodeHidden(TRUE));
+
+            if (materialDirty.find(handle) != materialDirty.end()) {
+                float col[3] = {0.8f, 0.8f, 0.8f};
+                float rough = 0.5f;
+                float metal = 0.0f;
+                float opac = 1.0f;
+
+                ExtractMaterialScalarPreview(FindSupportedMaterial(node->GetMtl()), node, t, col, rough, metal, opac);
+
+                Mtl* multiMtl = FindMultiSubMtl(node->GetMtl());
+                if (!(multiMtl && multiMtl->NumSubMtls() > 1)) {
+                    frame.UpdateMaterialScalar(static_cast<std::uint32_t>(handle), col, rough, metal, opac);
+                }
+            }
         }
 
         if (hasDirtyCamera) {
@@ -3641,6 +3683,7 @@ public:
             INode* node = ip->GetINodeByHandle(handle);
             if (!node) {
                 mtlHashMap_.erase(handle);
+                mtlScalarHashMap_.erase(handle);
                 lightHashMap_.erase(handle);
                 geoHashMap_.erase(handle);
                 it = geomHandles_.erase(it);
@@ -3703,6 +3746,14 @@ public:
             meta.str().c_str());
     }
 
+    uint64_t HashMaterialPBRState(const MaxJSPBR& pbr) {
+        std::wostringstream ss;
+        ss.imbue(std::locale::classic());
+        WriteMaterialFull(ss, pbr);
+        const std::wstring payload = ss.str();
+        return HashFNV1a(payload.data(), payload.size() * sizeof(wchar_t));
+    }
+
     uint64_t ComputeMaterialStateHash(INode* node, TimeValue t) {
         if (!node) return 0;
 
@@ -3710,12 +3761,6 @@ public:
         ss.imbue(std::locale::classic());
 
         Mtl* rawMtl = node->GetMtl();
-        if (!rawMtl) {
-            ss << L"null";
-            const std::wstring payload = ss.str();
-            return HashFNV1a(payload.data(), payload.size() * sizeof(wchar_t));
-        }
-
         Mtl* multiMtl = FindMultiSubMtl(rawMtl);
         if (multiMtl && multiMtl->NumSubMtls() > 0) {
             ss << L"{\"multi\":true,\"count\":" << multiMtl->NumSubMtls() << L",\"mats\":[";
@@ -3734,6 +3779,42 @@ public:
 
         const std::wstring payload = ss.str();
         return HashFNV1a(payload.data(), payload.size() * sizeof(wchar_t));
+    }
+
+    struct MaterialSyncState {
+        uint64_t structureHash = 0;
+        uint64_t scalarHash = 0;
+        bool canFastSync = false;
+    };
+
+    MaterialSyncState ComputeMaterialSyncState(INode* node, TimeValue t) {
+        MaterialSyncState state;
+        if (!node) return state;
+
+        Mtl* rawMtl = node->GetMtl();
+        Mtl* multiMtl = FindMultiSubMtl(rawMtl);
+        if (multiMtl && multiMtl->NumSubMtls() > 1) {
+            state.structureHash = ComputeMaterialStateHash(node, t);
+            state.canFastSync = false;
+            return state;
+        }
+
+        MaxJSPBR pbr;
+        ExtractPBR(node, t, pbr);
+
+        MaxJSPBR structurePbr = pbr;
+        structurePbr.color[0] = 0.8f;
+        structurePbr.color[1] = 0.8f;
+        structurePbr.color[2] = 0.8f;
+        structurePbr.roughness = 0.5f;
+        structurePbr.metalness = 0.0f;
+        structurePbr.opacity = 1.0f;
+
+        state.structureHash = HashMaterialPBRState(structurePbr);
+        state.scalarHash = HashMaterialScalarPreviewValues(
+            pbr.color, pbr.roughness, pbr.metalness, pbr.opacity);
+        state.canFastSync = true;
+        return state;
     }
 
     uint64_t ComputeLightStateHash(INode* node, TimeValue t) {
@@ -3772,27 +3853,49 @@ public:
         return HashFNV1a(payload.data(), payload.size() * sizeof(wchar_t));
     }
 
-    // Check if any material's serialized state changed — triggers full sync on NEXT tick
+    // Scalar-only edits stay on the fast path; structural material changes force a full sync.
     void DetectMaterialChanges() {
         Interface* ip = GetCOREInterface();
         if (!ip) return;
         TimeValue t = ip->GetTime();
+        bool fastChanged = false;
 
         for (ULONG handle : geomHandles_) {
             INode* node = ip->GetINodeByHandle(handle);
-            if (!node) continue;
+            if (!node) {
+                mtlHashMap_.erase(handle);
+                mtlScalarHashMap_.erase(handle);
+                materialFastDirtyHandles_.erase(handle);
+                continue;
+            }
 
-            const uintptr_t hash = static_cast<uintptr_t>(ComputeMaterialStateHash(node, t));
+            const MaterialSyncState state = ComputeMaterialSyncState(node, t);
 
-            auto it = mtlHashMap_.find(handle);
-            if (it == mtlHashMap_.end()) {
-                mtlHashMap_[handle] = hash;
-            } else if (it->second != hash) {
-                it->second = hash;
+            auto structureIt = mtlHashMap_.find(handle);
+            auto scalarIt = mtlScalarHashMap_.find(handle);
+            if (structureIt == mtlHashMap_.end() || scalarIt == mtlScalarHashMap_.end()) {
+                mtlHashMap_[handle] = state.structureHash;
+                mtlScalarHashMap_[handle] = state.scalarHash;
+                continue;
+            }
+
+            const bool structureChanged = structureIt->second != state.structureHash;
+            const bool scalarChanged = scalarIt->second != state.scalarHash;
+            if (!structureChanged && !scalarChanged) continue;
+
+            structureIt->second = state.structureHash;
+            scalarIt->second = state.scalarHash;
+
+            if (!structureChanged && scalarChanged && state.canFastSync) {
+                materialFastDirtyHandles_.insert(handle);
+                if (fastDirtyHandles_.insert(handle).second) fastChanged = true;
+            } else {
                 SetDirty();
                 return;
             }
         }
+
+        if (fastChanged) QueueFastFlush();
     }
 
     void DetectLightChanges() {
@@ -4871,6 +4974,10 @@ public:
             if (geomHandles_.find(it->first) == geomHandles_.end()) it = mtlHashMap_.erase(it);
             else ++it;
         }
+        for (auto it = mtlScalarHashMap_.begin(); it != mtlScalarHashMap_.end(); ) {
+            if (geomHandles_.find(it->first) == geomHandles_.end()) it = mtlScalarHashMap_.erase(it);
+            else ++it;
+        }
         for (auto it = lightHashMap_.begin(); it != lightHashMap_.end(); ) {
             if (lightHandles_.find(it->first) == lightHandles_.end()) it = lightHashMap_.erase(it);
             else ++it;
@@ -5100,6 +5207,7 @@ public:
             INode* node = ip->GetINodeByHandle(handle);
             if (!node) {
                 mtlHashMap_.erase(handle);
+                mtlScalarHashMap_.erase(handle);
                 lightHashMap_.erase(handle);
                 geoHashMap_.erase(handle);
                 lastSentTransforms_.erase(handle);
@@ -5314,6 +5422,7 @@ public:
         groupCache_.clear();
         lastBBoxHash_.clear();
         lastLiveGeomHash_.clear();
+        mtlScalarHashMap_.clear();
         if (hwnd_) { HWND h = hwnd_; hwnd_ = nullptr; DestroyWindow(h); }
     }
 

@@ -47,6 +47,7 @@
 #include <numeric>
 #include <functional>
 #include <cmath>
+#include <cwctype>
 #include <locale>
 
 using namespace Microsoft::WRL;
@@ -158,6 +159,186 @@ static std::uint64_t GetDirectoryWriteStamp(const std::wstring& dirPath) {
 
     FindClose(findHandle);
     return latest;
+}
+
+static bool FileExists(const std::wstring& path) {
+    if (path.empty()) return false;
+    const DWORD attrs = GetFileAttributesW(path.c_str());
+    return attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+static bool EndsWithInsensitive(const std::wstring& value, const std::wstring& suffix) {
+    if (suffix.size() > value.size()) return false;
+    const size_t start = value.size() - suffix.size();
+    for (size_t i = 0; i < suffix.size(); ++i) {
+        if (towlower(value[start + i]) != towlower(suffix[i])) return false;
+    }
+    return true;
+}
+
+static bool IsProjectRuntimeFile(const std::wstring& fileName) {
+    const size_t dot = fileName.find_last_of(L'.');
+    if (dot == std::wstring::npos) return false;
+
+    std::wstring ext = fileName.substr(dot);
+    std::transform(ext.begin(), ext.end(), ext.begin(),
+        [](wchar_t ch) { return static_cast<wchar_t>(towlower(ch)); });
+
+    return ext == L".js" || ext == L".mjs" || ext == L".cjs" || ext == L".json";
+}
+
+static std::wstring GetInlineLayerFileName(const std::wstring& id, bool enabled) {
+    return id + (enabled ? L".js" : L".js.disabled");
+}
+
+static bool TryParseInlineLayerFileName(const std::wstring& fileName, std::wstring& id, bool& enabled) {
+    static const std::wstring enabledSuffix = L".js";
+    static const std::wstring disabledSuffix = L".js.disabled";
+
+    if (EndsWithInsensitive(fileName, disabledSuffix)) {
+        id = fileName.substr(0, fileName.size() - disabledSuffix.size());
+        enabled = false;
+        return !id.empty();
+    }
+    if (EndsWithInsensitive(fileName, enabledSuffix)) {
+        id = fileName.substr(0, fileName.size() - enabledSuffix.size());
+        enabled = true;
+        return !id.empty();
+    }
+    return false;
+}
+
+static std::uint64_t GetProjectRuntimeWriteStamp(const std::wstring& dirPath) {
+    if (!DirectoryExists(dirPath)) return 0;
+
+    std::uint64_t latest = 0;
+    WIN32_FIND_DATAW findData = {};
+    const std::wstring pattern = dirPath + L"\\*";
+    HANDLE findHandle = FindFirstFileW(pattern.c_str(), &findData);
+    if (findHandle == INVALID_HANDLE_VALUE) return 0;
+
+    do {
+        if (wcscmp(findData.cFileName, L".") == 0 || wcscmp(findData.cFileName, L"..") == 0) {
+            continue;
+        }
+
+        if (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            latest = std::max(latest, GetProjectRuntimeWriteStamp(dirPath + L"\\" + findData.cFileName));
+            continue;
+        }
+
+        if (IsProjectRuntimeFile(findData.cFileName)) {
+            latest = std::max(latest, FileTimeToUint64(findData.ftLastWriteTime));
+        }
+    } while (FindNextFileW(findHandle, &findData));
+
+    FindClose(findHandle);
+    return latest;
+}
+
+static bool WriteBinaryFile(const std::wstring& path, const std::string& data) {
+    HANDLE hFile = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ,
+        nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) return false;
+
+    DWORD bytesWritten = 0;
+    const BOOL ok = WriteFile(hFile, data.data(), static_cast<DWORD>(data.size()), &bytesWritten, nullptr);
+    CloseHandle(hFile);
+    return ok && bytesWritten == data.size();
+}
+
+static int Base64Value(wchar_t ch) {
+    if (ch >= L'A' && ch <= L'Z') return static_cast<int>(ch - L'A');
+    if (ch >= L'a' && ch <= L'z') return static_cast<int>(ch - L'a') + 26;
+    if (ch >= L'0' && ch <= L'9') return static_cast<int>(ch - L'0') + 52;
+    if (ch == L'+') return 62;
+    if (ch == L'/') return 63;
+    return -1;
+}
+
+static bool DecodeBase64Wide(const std::wstring& input, std::string& out) {
+    out.clear();
+    int accumulator = 0;
+    int bits = -8;
+
+    for (wchar_t ch : input) {
+        if (ch == L'=') break;
+        if (iswspace(ch)) continue;
+        const int value = Base64Value(ch);
+        if (value < 0) return false;
+        accumulator = (accumulator << 6) | value;
+        bits += 6;
+        if (bits >= 0) {
+            out.push_back(static_cast<char>((accumulator >> bits) & 0xFF));
+            bits -= 8;
+        }
+    }
+
+    return true;
+}
+
+static bool TryGetFileWriteStamp(const std::wstring& path, ULONGLONG& outStamp) {
+    WIN32_FILE_ATTRIBUTE_DATA data = {};
+    if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &data)) return false;
+    outStamp = (static_cast<ULONGLONG>(data.ftLastWriteTime.dwHighDateTime) << 32)
+             | static_cast<ULONGLONG>(data.ftLastWriteTime.dwLowDateTime);
+    return true;
+}
+
+static bool ExtractJsonString(const std::wstring& json, const wchar_t* key, std::wstring& out) {
+    const std::wstring needle = std::wstring(L"\"") + key + L"\":\"";
+    size_t pos = json.find(needle);
+    if (pos == std::wstring::npos) return false;
+    pos += needle.size();
+
+    out.clear();
+    bool escape = false;
+    for (; pos < json.size(); ++pos) {
+        const wchar_t ch = json[pos];
+        if (escape) {
+            switch (ch) {
+                case L'"': out += L'"'; break;
+                case L'\\': out += L'\\'; break;
+                case L'/': out += L'/'; break;
+                case L'b': out += L'\b'; break;
+                case L'f': out += L'\f'; break;
+                case L'n': out += L'\n'; break;
+                case L'r': out += L'\r'; break;
+                case L't': out += L'\t'; break;
+                default: out += ch; break;
+            }
+            escape = false;
+            continue;
+        }
+
+        if (ch == L'\\') {
+            escape = true;
+            continue;
+        }
+        if (ch == L'"') {
+            return true;
+        }
+        out += ch;
+    }
+
+    return false;
+}
+
+static bool ExtractJsonBool(const std::wstring& json, const wchar_t* key, bool& out) {
+    const std::wstring needle = std::wstring(L"\"") + key + L"\":";
+    size_t pos = json.find(needle);
+    if (pos == std::wstring::npos) return false;
+    pos += needle.size();
+    while (pos < json.size() && iswspace(json[pos])) ++pos;
+    if (json.compare(pos, 4, L"true") == 0) {
+        out = true;
+        return true;
+    }
+    if (json.compare(pos, 5, L"false") == 0) {
+        out = false;
+        return true;
+    }
+    return false;
 }
 
 static std::wstring UrlEncodePath(const std::wstring& path) {
@@ -2701,6 +2882,8 @@ public:
     bool lastShadowMode_ = false;
     std::wstring activeWebDir_;
     std::uint64_t activeWebStamp_ = 0;
+    std::wstring activeProjectDir_;
+    std::uint64_t activeProjectStamp_ = 0;
     bool fastCameraDirty_ = false;
     bool fastFlushPosted_ = false;
     bool haveLastSentCamera_ = false;
@@ -2713,6 +2896,7 @@ public:
 
     // ── JS_Inline hot folder ──────────────────────────
     std::unordered_map<std::wstring, ULONGLONG> inlineFileStamps_;  // filename → last write time
+    std::wstring inlineLayersStateSignature_;
 
     static std::wstring ReadUtf8File(const std::wstring& path) {
         HANDLE hFile = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
@@ -2739,22 +2923,76 @@ public:
         return dir;
     }
 
+    void SendInlineLayersState(bool force = false) {
+        if (!webview_ || !jsReady_) return;
+
+        const std::wstring dir = GetInlineLayerDir();
+        const std::wstring pattern = dir + L"*";
+        std::vector<std::pair<std::wstring, bool>> layers;
+
+        WIN32_FIND_DATAW fd = {};
+        HANDLE hFind = FindFirstFileW(pattern.c_str(), &fd);
+        if (hFind != INVALID_HANDLE_VALUE) {
+            do {
+                if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+
+                std::wstring id;
+                bool enabled = false;
+                if (!TryParseInlineLayerFileName(fd.cFileName, id, enabled)) continue;
+                layers.emplace_back(id, enabled);
+            } while (FindNextFileW(hFind, &fd));
+            FindClose(hFind);
+        }
+
+        std::sort(layers.begin(), layers.end(), [](const auto& a, const auto& b) {
+            if (a.first == b.first) return a.second > b.second;
+            return a.first < b.first;
+        });
+
+        std::wostringstream ss;
+        ss << L"{\"type\":\"inline_layers_state\",\"layers\":[";
+        bool first = true;
+        std::wstring lastId;
+        for (const auto& layer : layers) {
+            if (!lastId.empty() && layer.first == lastId) continue;
+            lastId = layer.first;
+
+            if (!first) ss << L',';
+            first = false;
+            ss << L"{\"id\":\"" << EscapeJson(layer.first.c_str())
+               << L"\",\"name\":\"" << EscapeJson(layer.first.c_str())
+               << L"\",\"enabled\":" << (layer.second ? L"true" : L"false") << L'}';
+        }
+        ss << L"]}";
+
+        const std::wstring payload = ss.str();
+        if (!force && payload == inlineLayersStateSignature_) return;
+        inlineLayersStateSignature_ = payload;
+        webview_->PostWebMessageAsJson(payload.c_str());
+    }
+
     void ScanInlineLayers() {
         if (!webview_ || !jsReady_) return;
 
         const std::wstring dir = GetInlineLayerDir();
-        const std::wstring pattern = dir + L"*.js";
+        const std::wstring pattern = dir + L"*";
 
-        // Track which files still exist this scan
-        std::unordered_set<std::wstring> seen;
+        // Track which enabled layer files still exist this scan
+        std::unordered_set<std::wstring> seenEnabled;
 
         WIN32_FIND_DATAW fd;
         HANDLE hFind = FindFirstFileW(pattern.c_str(), &fd);
         if (hFind != INVALID_HANDLE_VALUE) {
             do {
                 if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+
                 const std::wstring filename(fd.cFileName);
-                seen.insert(filename);
+                std::wstring id;
+                bool enabled = false;
+                if (!TryParseInlineLayerFileName(filename, id, enabled)) continue;
+                if (!enabled) continue;
+
+                seenEnabled.insert(filename);
 
                 // Compute write stamp
                 ULONGLONG stamp = ((ULONGLONG)fd.ftLastWriteTime.dwHighDateTime << 32)
@@ -2767,10 +3005,6 @@ public:
                 const std::wstring filePath = dir + filename;
                 std::wstring code = ReadUtf8File(filePath);
                 if (code.empty()) continue;
-
-                // Layer ID = filename without .js
-                std::wstring id = filename;
-                if (id.size() > 3) id.resize(id.size() - 3);
 
                 std::wostringstream ss;
                 ss << L"{\"type\":\"js_inline\",\"action\":\"inject\",\"id\":\""
@@ -2785,9 +3019,13 @@ public:
 
         // Remove layers whose files were deleted
         for (auto it = inlineFileStamps_.begin(); it != inlineFileStamps_.end(); ) {
-            if (seen.find(it->first) == seen.end()) {
-                std::wstring id = it->first;
-                if (id.size() > 3) id.resize(id.size() - 3);
+            if (seenEnabled.find(it->first) == seenEnabled.end()) {
+                std::wstring id;
+                bool enabled = false;
+                if (!TryParseInlineLayerFileName(it->first, id, enabled)) {
+                    ++it;
+                    continue;
+                }
                 std::wostringstream ss;
                 ss << L"{\"type\":\"js_inline\",\"action\":\"remove\",\"id\":\""
                    << EscapeJson(id.c_str()) << L"\"}";
@@ -2797,6 +3035,8 @@ public:
                 ++it;
             }
         }
+
+        SendInlineLayersState();
     }
 
     MaxJSPanel()
@@ -3004,14 +3244,83 @@ public:
         return d + L"\\maxjs_projects\\active";
     }
 
+    std::wstring GetProjectManifestPath() {
+        return GetProjectDir() + L"\\project.maxjs.json";
+    }
+
+    void SendHostActionResult(const std::wstring& action, const std::wstring& requestId,
+                              bool ok, const std::wstring& error = {}) {
+        if (!webview_) return;
+
+        std::wostringstream ss;
+        ss << L"{\"type\":\"host_action_result\",\"action\":\"" << EscapeJson(action.c_str()) << L"\"";
+        if (!requestId.empty()) {
+            ss << L",\"requestId\":\"" << EscapeJson(requestId.c_str()) << L"\"";
+        }
+        ss << L",\"ok\":" << (ok ? L"true" : L"false");
+        if (!error.empty()) {
+            ss << L",\"error\":\"" << EscapeJson(error.c_str()) << L"\"";
+        }
+        ss << L'}';
+        webview_->PostWebMessageAsJson(ss.str().c_str());
+    }
+
+    void SendProjectReload() {
+        if (!webview_) return;
+        webview_->PostWebMessageAsJson(L"{\"type\":\"project_reload\"}");
+    }
+
+    void SendInlineLayerRemove(const std::wstring& id) {
+        if (!webview_ || !jsReady_) return;
+        std::wostringstream ss;
+        ss << L"{\"type\":\"js_inline\",\"action\":\"remove\",\"id\":\""
+           << EscapeJson(id.c_str()) << L"\"}";
+        webview_->PostWebMessageAsJson(ss.str().c_str());
+    }
+
+    void SendInlineLayerClear() {
+        if (!webview_ || !jsReady_) return;
+        webview_->PostWebMessageAsJson(L"{\"type\":\"js_inline\",\"action\":\"clear\"}");
+    }
+
+    bool SendInlineLayerInject(const std::wstring& id, std::wstring& error) {
+        if (!webview_ || !jsReady_) return true;
+
+        const std::wstring fileName = GetInlineLayerFileName(id, true);
+        const std::wstring filePath = GetInlineLayerDir() + fileName;
+        std::wstring code = ReadUtf8File(filePath);
+        if (code.empty()) {
+            error = L"Inline layer file is empty or unreadable";
+            return false;
+        }
+
+        std::wostringstream ss;
+        ss << L"{\"type\":\"js_inline\",\"action\":\"inject\",\"id\":\""
+           << EscapeJson(id.c_str()) << L"\",\"name\":\""
+           << EscapeJson(id.c_str()) << L"\",\"code\":\""
+           << EscapeJson(code.c_str()) << L"\"}";
+        webview_->PostWebMessageAsJson(ss.str().c_str());
+
+        ULONGLONG stamp = 0;
+        if (TryGetFileWriteStamp(filePath, stamp)) {
+            inlineFileStamps_[fileName] = stamp;
+        } else {
+            inlineFileStamps_.erase(fileName);
+        }
+        return true;
+    }
+
     void SendProjectConfig() {
         if (!webview_) return;
 
         const std::wstring projectDir = GetProjectDir();
+        SHCreateDirectoryExW(nullptr, projectDir.c_str(), nullptr);
+        activeProjectDir_ = projectDir;
+        activeProjectStamp_ = GetProjectRuntimeWriteStamp(projectDir);
         std::wostringstream ss;
         ss << L"{\"type\":\"project_config\",\"dir\":\""
            << EscapeJson(projectDir.c_str())
-           << L"\",\"pollMs\":1200}";
+           << L"\",\"pollMs\":0}";
         webview_->PostWebMessageAsJson(ss.str().c_str());
     }
 
@@ -3094,6 +3403,163 @@ public:
         if (activeWebDir_ != webDir || activeWebStamp_ == 0 || nextStamp != activeWebStamp_) {
             ReloadWebContent();
         }
+    }
+
+    void CheckProjectContentChanges() {
+        if (!webview_ || !jsReady_) return;
+
+        const std::wstring projectDir = GetProjectDir();
+        if (projectDir.empty()) return;
+        SHCreateDirectoryExW(nullptr, projectDir.c_str(), nullptr);
+
+        const std::uint64_t nextStamp = GetProjectRuntimeWriteStamp(projectDir);
+        if (activeProjectDir_ != projectDir) {
+            activeProjectDir_ = projectDir;
+            activeProjectStamp_ = nextStamp;
+            SendProjectConfig();
+            SendProjectReload();
+            return;
+        }
+
+        if (activeProjectStamp_ == 0) {
+            activeProjectStamp_ = nextStamp;
+            if (nextStamp != 0) SendProjectReload();
+            return;
+        }
+
+        if (nextStamp != activeProjectStamp_) {
+            activeProjectStamp_ = nextStamp;
+            SendProjectReload();
+        }
+    }
+
+    bool RemoveInlineLayerFile(const std::wstring& id, std::wstring& error) {
+        const std::wstring dir = GetInlineLayerDir();
+        const std::wstring enabledFileName = GetInlineLayerFileName(id, true);
+        const std::wstring disabledFileName = GetInlineLayerFileName(id, false);
+        const std::wstring enabledPath = dir + enabledFileName;
+        const std::wstring disabledPath = dir + disabledFileName;
+
+        bool found = false;
+        if (FileExists(enabledPath)) {
+            found = true;
+            if (!DeleteFileW(enabledPath.c_str())) {
+                error = L"Failed to delete enabled inline layer file";
+                return false;
+            }
+        }
+        if (FileExists(disabledPath)) {
+            found = true;
+            if (!DeleteFileW(disabledPath.c_str())) {
+                error = L"Failed to delete disabled inline layer file";
+                return false;
+            }
+        }
+        if (!found) {
+            error = L"Inline layer file not found";
+            return false;
+        }
+
+        inlineFileStamps_.erase(enabledFileName);
+        SendInlineLayerRemove(id);
+        SendInlineLayersState(true);
+        return true;
+    }
+
+    bool SetInlineLayerEnabled(const std::wstring& id, bool enabled, std::wstring& error) {
+        const std::wstring dir = GetInlineLayerDir();
+        const std::wstring enabledFileName = GetInlineLayerFileName(id, true);
+        const std::wstring disabledFileName = GetInlineLayerFileName(id, false);
+        const std::wstring enabledPath = dir + enabledFileName;
+        const std::wstring disabledPath = dir + disabledFileName;
+
+        const bool hasEnabled = FileExists(enabledPath);
+        const bool hasDisabled = FileExists(disabledPath);
+        if (!hasEnabled && !hasDisabled) {
+            error = L"Inline layer file not found";
+            return false;
+        }
+
+        if ((enabled && hasEnabled && !hasDisabled) || (!enabled && hasDisabled && !hasEnabled)) {
+            SendInlineLayersState(true);
+            return true;
+        }
+
+        const std::wstring fromPath = enabled ? disabledPath : enabledPath;
+        const std::wstring toPath = enabled ? enabledPath : disabledPath;
+        if (!MoveFileExW(fromPath.c_str(), toPath.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+            error = enabled
+                ? L"Failed to enable inline layer file"
+                : L"Failed to disable inline layer file";
+            return false;
+        }
+
+        inlineFileStamps_.erase(enabledFileName);
+        if (jsReady_) {
+            if (enabled) {
+                if (!SendInlineLayerInject(id, error)) return false;
+            } else {
+                SendInlineLayerRemove(id);
+            }
+            SendInlineLayersState(true);
+        } else {
+            inlineLayersStateSignature_.clear();
+        }
+        return true;
+    }
+
+    bool ClearInlineLayerFiles(std::wstring& error) {
+        const std::wstring dir = GetInlineLayerDir();
+        const std::wstring pattern = dir + L"*";
+        WIN32_FIND_DATAW fd = {};
+        HANDLE hFind = FindFirstFileW(pattern.c_str(), &fd);
+        if (hFind != INVALID_HANDLE_VALUE) {
+            do {
+                if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+                std::wstring id;
+                bool enabled = false;
+                if (!TryParseInlineLayerFileName(fd.cFileName, id, enabled)) continue;
+                const std::wstring filePath = dir + fd.cFileName;
+                if (!DeleteFileW(filePath.c_str())) {
+                    error = L"Failed to delete one or more inline layer files";
+                    FindClose(hFind);
+                    return false;
+                }
+            } while (FindNextFileW(hFind, &fd));
+            FindClose(hFind);
+        }
+
+        inlineFileStamps_.clear();
+        SendInlineLayerClear();
+        SendInlineLayersState(true);
+        return true;
+    }
+
+    bool WriteProjectManifestContent(const std::wstring& contentBase64, std::wstring& error) {
+        const std::wstring projectDir = GetProjectDir();
+        if (projectDir.empty()) {
+            error = L"Project directory is empty";
+            return false;
+        }
+
+        SHCreateDirectoryExW(nullptr, projectDir.c_str(), nullptr);
+
+        std::string decoded;
+        if (!DecodeBase64Wide(contentBase64, decoded)) {
+            error = L"Invalid base64 manifest payload";
+            return false;
+        }
+
+        const std::wstring manifestPath = GetProjectManifestPath();
+        if (!WriteBinaryFile(manifestPath, decoded)) {
+            error = L"Failed to write project manifest";
+            return false;
+        }
+
+        activeProjectDir_ = projectDir;
+        activeProjectStamp_ = GetProjectRuntimeWriteStamp(projectDir);
+        SendProjectReload();
+        return true;
     }
 
     // ── Same-origin asset serving via WebResourceRequested ──
@@ -3502,15 +3968,75 @@ public:
 
     void OnWebMessage(const wchar_t* json) {
         std::wstring msg(json);
-        if (msg.find(L"\"kill\"") != std::wstring::npos) {
+        std::wstring type;
+        ExtractJsonString(msg, L"type", type);
+
+        if (type == L"kill" || msg.find(L"\"kill\"") != std::wstring::npos) {
             if (hwnd_) PostMessage(hwnd_, WM_KILL_PANEL, 0, 0);
             return;
         }
-        if (msg.find(L"\"refresh\"") != std::wstring::npos || msg.find(L"\"reload\"") != std::wstring::npos) {
+        if (type == L"refresh" || type == L"reload"
+                || msg.find(L"\"refresh\"") != std::wstring::npos
+                || msg.find(L"\"reload\"") != std::wstring::npos) {
             ReloadWebContent();
             return;
         }
-        if (msg.find(L"\"ready\"") != std::wstring::npos) {
+        if (type == L"project_manifest_write") {
+            std::wstring requestId;
+            std::wstring contentBase64;
+            ExtractJsonString(msg, L"requestId", requestId);
+            if (!ExtractJsonString(msg, L"contentBase64", contentBase64)) {
+                SendHostActionResult(type, requestId, false, L"Missing contentBase64");
+                return;
+            }
+
+            std::wstring error;
+            const bool ok = WriteProjectManifestContent(contentBase64, error);
+            SendHostActionResult(type, requestId, ok, error);
+            return;
+        }
+        if (type == L"inline_layer_remove") {
+            std::wstring requestId;
+            std::wstring id;
+            ExtractJsonString(msg, L"requestId", requestId);
+            if (!ExtractJsonString(msg, L"id", id) || id.empty()) {
+                SendHostActionResult(type, requestId, false, L"Missing layer id");
+                return;
+            }
+
+            std::wstring error;
+            const bool ok = RemoveInlineLayerFile(id, error);
+            SendHostActionResult(type, requestId, ok, error);
+            return;
+        }
+        if (type == L"inline_layer_set_enabled") {
+            std::wstring requestId;
+            std::wstring id;
+            bool enabled = true;
+            ExtractJsonString(msg, L"requestId", requestId);
+            if (!ExtractJsonString(msg, L"id", id) || id.empty()) {
+                SendHostActionResult(type, requestId, false, L"Missing layer id");
+                return;
+            }
+            if (!ExtractJsonBool(msg, L"enabled", enabled)) {
+                SendHostActionResult(type, requestId, false, L"Missing enabled flag");
+                return;
+            }
+
+            std::wstring error;
+            const bool ok = SetInlineLayerEnabled(id, enabled, error);
+            SendHostActionResult(type, requestId, ok, error);
+            return;
+        }
+        if (type == L"inline_layer_clear") {
+            std::wstring requestId;
+            ExtractJsonString(msg, L"requestId", requestId);
+            std::wstring error;
+            const bool ok = ClearInlineLayerFiles(error);
+            SendHostActionResult(type, requestId, ok, error);
+            return;
+        }
+        if (type == L"ready" || msg.find(L"\"ready\"") != std::wstring::npos) {
             jsReady_ = true; SetDirtyImmediate();
             mtlHashMap_.clear();
             mtlScalarHashMap_.clear();
@@ -3519,12 +4045,14 @@ public:
             propHashMap_.clear();
             geoHashMap_.clear();  // force all geometry to be sent
             inlineFileStamps_.clear();  // re-scan inline layers on reconnect
+            inlineLayersStateSignature_.clear();
             lastSentTransforms_.clear();
             lightHandles_.clear();
             splatHandles_.clear();
             geoScanCursor_ = 0;
             ResetFastPathState(false);
             SendProjectConfig();
+            ScanInlineLayers();
         }
     }
 
@@ -3544,6 +4072,7 @@ public:
             }
         } else {
             if (tickCount_ % 15 == 0) CheckWebContentChanges();
+            if (tickCount_ % 15 == 0) CheckProjectContentChanges();
             if (tickCount_ % MATERIAL_DETECT_TICKS == 0) DetectMaterialChanges();
             if (tickCount_ % LIGHT_DETECT_TICKS == 0) DetectPropertyChanges();
             if (tickCount_ % LIGHT_DETECT_TICKS == 0) {

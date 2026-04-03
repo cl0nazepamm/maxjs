@@ -130,8 +130,8 @@
             border-radius: 0 10px 10px 0;
         }
         .layer-item {
-            display: flex;
-            align-items: center;
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) auto;
             gap: 6px;
             padding: 5px 6px;
             border-radius: 5px;
@@ -144,13 +144,39 @@
         .layer-item.inactive {
             opacity: 0.45;
         }
+        .layer-main {
+            min-width: 0;
+        }
+        .layer-meta {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            min-width: 0;
+        }
         .layer-name {
-            flex: 1;
             font-size: 11px;
             color: #ccc;
             overflow: hidden;
             text-overflow: ellipsis;
             white-space: nowrap;
+        }
+        .layer-source {
+            font-size: 9px;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            color: #8a8a8a;
+            padding: 1px 4px;
+            border-radius: 999px;
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            flex-shrink: 0;
+        }
+        .layer-source.project {
+            color: #8fd4ff;
+            border-color: rgba(90, 180, 255, 0.22);
+        }
+        .layer-source.inline {
+            color: #ffd27a;
+            border-color: rgba(255, 180, 80, 0.18);
         }
         .layer-status {
             font-size: 9px;
@@ -159,15 +185,40 @@
         }
         .layer-status.live { color: #40c8b0; }
         .layer-status.err { color: #ff5050; }
-        .layer-remove {
-            background: rgba(255, 80, 80, 0.1);
-            border: 1px solid rgba(255, 80, 80, 0.2);
-            color: #ff6666;
+        .layer-status.off { color: #9e9e9e; }
+        .layer-detail {
+            margin-top: 3px;
+            font-size: 9px;
+            color: #6f6f6f;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .layer-actions {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+            flex-shrink: 0;
+        }
+        .layer-action {
             border-radius: 3px;
             padding: 1px 5px;
             font: 9px/1 'Segoe UI', system-ui, sans-serif;
             cursor: pointer;
             flex-shrink: 0;
+        }
+        .layer-toggle {
+            background: rgba(64, 200, 176, 0.08);
+            border: 1px solid rgba(64, 200, 176, 0.22);
+            color: #65d3bf;
+        }
+        .layer-toggle:hover {
+            background: rgba(64, 200, 176, 0.18);
+        }
+        .layer-remove {
+            background: rgba(255, 80, 80, 0.1);
+            border: 1px solid rgba(255, 80, 80, 0.2);
+            color: #ff6666;
         }
         .layer-remove:hover {
             background: rgba(255, 80, 80, 0.25);
@@ -3060,6 +3111,7 @@
         const layersPanel = document.getElementById('layersPanel');
         let layersPanelVisible = false;
         let layersPanelDirty = true;
+        let layersPanelRefreshQueued = false;
 
         function setLayersPanelVisible(visible) {
             layersPanelVisible = !!visible;
@@ -3070,20 +3122,128 @@
             layersPanel.classList.toggle('visible', layersPanelVisible);
             layersPanel.toggleAttribute('inert', !layersPanelVisible);
             layersPanel.setAttribute('aria-hidden', String(!layersPanelVisible));
-            if (layersPanelVisible) refreshLayersPanel();
+            if (layersPanelVisible) queueLayersPanelRefresh();
         }
 
         let _layerManagerRef = null;
+        let _projectRuntimeRef = null;
+        let _layerManagerUnsub = null;
+        let _projectRuntimeUnsub = null;
+
+        function queueLayersPanelRefresh() {
+            layersPanelDirty = true;
+            if (!layersPanelVisible || layersPanelRefreshQueued) return;
+            layersPanelRefreshQueued = true;
+            requestAnimationFrame(() => {
+                layersPanelRefreshQueued = false;
+                if (!layersPanelVisible || !layersPanelDirty) return;
+                layersPanelDirty = false;
+                refreshLayersPanel();
+            });
+        }
+
+        function attachLayerPanelSubscriptions() {
+            _layerManagerUnsub?.();
+            _projectRuntimeUnsub?.();
+            _layerManagerUnsub = _layerManagerRef?.subscribe?.(() => queueLayersPanelRefresh()) ?? null;
+            _projectRuntimeUnsub = _projectRuntimeRef?.subscribe?.(() => queueLayersPanelRefresh()) ?? null;
+        }
+
+        function getPanelLayers() {
+            const runtimeLayers = _layerManagerRef?.list?.() ?? [];
+            const projectLayers = _projectRuntimeRef?.listEntries?.() ?? runtimeLayers.filter(layer => layer.source === 'project');
+            const inlineLayers = _projectRuntimeRef?.listInlineEntries?.()
+                ?? runtimeLayers.filter(layer => layer.source !== 'project');
+            return [
+                ...projectLayers.sort((a, b) => a.name.localeCompare(b.name)),
+                ...inlineLayers.sort((a, b) => a.name.localeCompare(b.name)),
+            ];
+        }
+
+        function getLayerStatus(layer) {
+            if (layer.error) return { label: 'ERR', className: 'err' };
+            if (layer.loading) return { label: 'LOAD', className: 'off' };
+            if (layer.enabled === false) return { label: 'OFF', className: 'off' };
+            return layer.active ? { label: 'LIVE', className: 'live' } : { label: 'OFF', className: 'off' };
+        }
+
+        function getLayerDetails(layer) {
+            const details = [];
+            if (layer.source === 'project' && layer.entry) details.push(layer.entry);
+            if (layer.source === 'inline') details.push('%TEMP%/maxjs_layers');
+            if (Number.isFinite(layer.profile?.avgUpdateMs) && layer.profile.updateCount > 0) {
+                details.push(`avg ${layer.profile.avgUpdateMs.toFixed(2)}ms`);
+            }
+            details.push(`anc ${layer.anchors ?? 0}`);
+            details.push(`trk ${layer.tracked ?? 0}`);
+            return details.join(' | ');
+        }
+
+        async function handleLayerToggle(layer) {
+            try {
+                const enabled = !(layer.enabled !== false);
+                if (layer.source === 'project') {
+                    await _projectRuntimeRef?.setLayerEnabled(layer.id, enabled);
+                } else {
+                    if (layer.persisted === false) return;
+                    await _projectRuntimeRef?.setInlineLayerEnabled?.(layer.id, enabled);
+                }
+            } catch (error) {
+                reportBridgeError('layer toggle', error);
+            }
+        }
+
+        async function handleLayerRemove(layer) {
+            try {
+                if (layer.source === 'project') {
+                    await _projectRuntimeRef?.removeLayer(layer.id);
+                } else if (_projectRuntimeRef?.removeInlineLayer) {
+                    await _projectRuntimeRef.removeInlineLayer(layer.id);
+                    _layerManagerRef?.remove(layer.id);
+                } else {
+                    _layerManagerRef?.remove(layer.id);
+                }
+            } catch (error) {
+                reportBridgeError('layer remove', error);
+            }
+        }
+
+        async function handleLayerClearAll() {
+            try {
+                await _projectRuntimeRef?.clearPersistedLayers?.();
+                if (_projectRuntimeRef?.clearInlineLayers) {
+                    await _projectRuntimeRef.clearInlineLayers();
+                    _layerManagerRef?.clearInline?.();
+                } else {
+                    _layerManagerRef?.clear?.();
+                }
+            } catch (error) {
+                reportBridgeError('layer clear', error);
+            }
+        }
+
         function refreshLayersPanel() {
             if (!layersPanelVisible || !_layerManagerRef) return;
-            const layers = _layerManagerRef.list();
+            const layers = getPanelLayers();
             const itemsHtml = layers.length === 0
-                ? '<div class="layers-empty">No layers — drop .js files in %TEMP%/maxjs_layers/</div>'
+                ? '<div class="layers-empty">No layers loaded. Project layers live in project.maxjs.json and inline layers live in %TEMP%/maxjs_layers.</div>'
                 : layers.map(l => `
                     <div class="layer-item${l.error ? ' error' : ''}${!l.active ? ' inactive' : ''}">
-                        <span class="layer-name" title="${l.name}">${l.name}</span>
-                        <span class="layer-status ${l.error ? 'err' : 'live'}">${l.error ? 'ERR' : 'LIVE'}</span>
-                        <button class="layer-remove" data-layer-id="${l.id}">x</button>
+                        <div class="layer-main">
+                            <div class="layer-meta">
+                                <span class="layer-name" title="${l.name}">${l.name}</span>
+                                <span class="layer-source ${l.source === 'project' ? 'project' : 'inline'}">${l.source}</span>
+                                <span class="layer-status ${getLayerStatus(l).className}">${getLayerStatus(l).label}</span>
+                            </div>
+                            <div class="layer-detail" title="${getLayerDetails(l)}">${getLayerDetails(l)}</div>
+                        </div>
+                        <div class="layer-actions">
+                            ${l.source === 'project' || l.persisted !== false
+                                ? `<button class="layer-action layer-toggle" data-layer-toggle="${l.id}">${l.enabled === false ? 'Enable' : 'Disable'}</button>`
+                                : ''
+                            }
+                            <button class="layer-action layer-remove" data-layer-remove="${l.id}">${l.source === 'project' ? 'Remove' : 'Delete'}</button>
+                        </div>
                     </div>
                 `).join('');
 
@@ -3091,10 +3251,10 @@
                 <div class="sidepanel-header">
                     <div>
                         <div class="sidepanel-title">Layers</div>
-                        <div class="sidepanel-subtitle">${layers.length} active</div>
+                        <div class="sidepanel-subtitle">${layers.length} tracked</div>
                     </div>
                     <div style="display:flex;gap:4px">
-                        <button id="layersClearBtn">Clear All</button>
+                        <button id="layersClearBtn">Remove All</button>
                         <button id="layersHideBtn">Hide</button>
                     </div>
                 </div>
@@ -3102,20 +3262,22 @@
             `;
 
             layersPanel.querySelector('#layersHideBtn')?.addEventListener('click', () => setLayersPanelVisible(false));
-            layersPanel.querySelector('#layersClearBtn')?.addEventListener('click', () => {
-                _layerManagerRef?.clear();
-                refreshLayersPanel();
-            });
-            layersPanel.querySelectorAll('.layer-remove').forEach(btn => {
+            layersPanel.querySelector('#layersClearBtn')?.addEventListener('click', () => { void handleLayerClearAll(); });
+            layersPanel.querySelectorAll('[data-layer-toggle]').forEach(btn => {
                 btn.addEventListener('click', () => {
-                    _layerManagerRef?.remove(btn.dataset.layerId);
-                    refreshLayersPanel();
+                    const layer = layers.find(item => item.id === btn.dataset.layerToggle);
+                    if (layer) void handleLayerToggle(layer);
+                });
+            });
+            layersPanel.querySelectorAll('[data-layer-remove]').forEach(btn => {
+                btn.addEventListener('click', () => {
+                    const layer = layers.find(item => item.id === btn.dataset.layerRemove);
+                    if (layer) void handleLayerRemove(layer);
                 });
             });
         }
 
         btnLayersPanel.addEventListener('click', () => setLayersPanelVisible(!layersPanelVisible));
-        setInterval(() => { if (layersPanelVisible) refreshLayersPanel(); }, 1000);
 
         const btnPostFxPanel = document.getElementById('btnPostFxPanel');
         const postPanel = document.getElementById('postPanel');
@@ -3951,6 +4113,7 @@
             }
             updateVolumeUniforms();
             layerManager.update(inlineClock.getDelta(), inlineClock.getElapsedTime());
+            perfHud.updateLayers(layerManager.getStats());
             const renderStart = performance.now();
             ssgiFx.render();
             if (splatOverlay && splatHandleMap.size > 0) {
@@ -3970,6 +4133,9 @@
         window.maxJSProjectRuntime = projectRuntime;
         window.maxJS.layers = layerManager;
         _layerManagerRef = layerManager;
+        _projectRuntimeRef = projectRuntime;
+        attachLayerPanelSubscriptions();
+        queueLayersPanelRefresh();
 
         bridge.on('js_inline', msg => {
             switch (msg.action) {
@@ -3980,8 +4146,8 @@
                     break;
                 }
                 case 'remove': layerManager.remove(msg.id); break;
-                case 'list':   bridge.send('js_inline_list', { layers: layerManager.list() }); break;
-                case 'clear':  layerManager.clear(); break;
+                case 'list':   bridge.send('js_inline_list', { layers: layerManager.list().filter(layer => layer.source === 'inline') }); break;
+                case 'clear':  layerManager.clearInline(); break;
             }
         });
 

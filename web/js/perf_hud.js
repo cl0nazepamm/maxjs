@@ -23,6 +23,10 @@ export function createPerfHud(infoEl) {
         decodeMs: 0,
         applyMs: 0,
         renderMs: 0,
+        layerCount: 0,
+        activeLayerCount: 0,
+        layerUpdateMs: 0,
+        anchorCount: 0,
         nodeCount: 0,
         instanceCount: 0,
         textureCount: 0,
@@ -47,6 +51,9 @@ export function createPerfHud(infoEl) {
             `| bytes ${formatBytes(state.producerBytes)} ` +
             `| dec ${formatMs(state.decodeMs)} ` +
             `| app ${formatMs(state.applyMs)} ` +
+            `| layers ${state.activeLayerCount}/${state.layerCount} ` +
+            `| lyt ${formatMs(state.layerUpdateMs)} ` +
+            `| anc ${state.anchorCount} ` +
             `| rnd ${formatMs(state.renderMs)} ` +
             `| calls ${state.drawCalls} ` +
             `| tris ${state.triangleCount}`;
@@ -78,6 +85,10 @@ export function createPerfHud(infoEl) {
                 lastRenderPaintMs = now;
                 paint();
             }
+        },
+        updateLayers(partial) {
+            Object.assign(state, partial);
+            if (state.active) paint();
         },
     };
 }

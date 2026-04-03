@@ -285,7 +285,7 @@ function createRendererFacade(renderer) {
     });
 }
 
-function createInputHelper(renderer, layer) {
+function createInputHelper(renderer) {
     const el = renderer.domElement;
     const listeners = [];
     function on(target, event, fn, opts) {
@@ -333,7 +333,17 @@ export function createLayerManager({
     overlayRoot = null,
 }) {
     const layers = new Map();
+    const listeners = new Set();
     let projectControl = null;
+    let lastMountMs = 0;
+    let lastStats = freezePlainObject({
+        layerCount: 0,
+        activeLayerCount: 0,
+        anchorCount: 0,
+        trackedCount: 0,
+        updateMs: 0,
+        lastMountMs: 0,
+    });
 
     const jsWorldRoot = markOwned(jsRoot || new THREE.Group(), OWNER_JS);
     jsWorldRoot.name ||= '__maxjs_js_root__';
@@ -358,8 +368,50 @@ export function createLayerManager({
     let dt = 0;
     let elapsed = 0;
 
+    function emitChange(reason = 'state') {
+        for (const listener of listeners) {
+            try {
+                listener(reason);
+            } catch (error) {
+                console.error('[LayerManager] listener error', error);
+            }
+        }
+    }
+
+    function subscribe(listener) {
+        listeners.add(listener);
+        return () => listeners.delete(listener);
+    }
+
+    function snapshotLayer(layer) {
+        return {
+            id: layer.id,
+            name: layer.name,
+            source: layer.source,
+            entry: layer.entry,
+            code: layer.code,
+            active: layer.active,
+            loading: layer.loading,
+            error: layer.error,
+            anchors: layer.anchors.length,
+            tracked: layer.tracked.size,
+            profile: freezePlainObject({
+                mountMs: layer.profile.mountMs,
+                lastUpdateMs: layer.profile.lastUpdateMs,
+                avgUpdateMs: layer.profile.avgUpdateMs,
+                maxUpdateMs: layer.profile.maxUpdateMs,
+                updateCount: layer.profile.updateCount,
+            }),
+        };
+    }
+
     function ownForLayer(resource, owner = OWNER_JS) {
         return markOwned(resource, owner);
+    }
+
+    function getOrCreateLayerInput(layer) {
+        if (!layer.input) layer.input = createInputHelper(renderer);
+        return layer.input;
     }
 
     function cloneMaterialForLayer(material, owner) {
@@ -404,12 +456,17 @@ export function createLayerManager({
 
     function getLayerNodeAdapter(layer, handle) {
         if (!nodeMap.has(handle)) return null;
-        return createMaxNodeAdapter({
-            handle,
-            getObject: () => nodeMap.get(handle) ?? null,
-            THREE,
-            createAnchor: (nextHandle, options) => createAnchorForLayer(layer, nextHandle, options),
-        });
+        let adapter = layer.nodeAdapters.get(handle);
+        if (!adapter) {
+            adapter = createMaxNodeAdapter({
+                handle,
+                getObject: () => nodeMap.get(handle) ?? null,
+                THREE,
+                createAnchor: (nextHandle, options) => createAnchorForLayer(layer, nextHandle, options),
+            });
+            layer.nodeAdapters.set(handle, adapter);
+        }
+        return adapter;
     }
 
     function buildContext(layer) {
@@ -512,7 +569,9 @@ export function createLayerManager({
             nodeMap: nodeMapFacade,
             camera: cameraFacade,
             renderer: rendererFacade,
-            input: layer.input,
+            get input() {
+                return getOrCreateLayerInput(layer);
+            },
             THREE,
             clock: freezePlainObject({
                 get dt() { return dt; },
@@ -526,17 +585,31 @@ export function createLayerManager({
         };
     }
 
-    function syncAnchors(layer) {
+    function syncAnchors(layer, syncCache) {
         for (const anchor of layer.anchors) {
-            const source = nodeMap.get(anchor.userData.maxjsAnchorHandle);
-            if (!source) {
+            const handle = anchor.userData.maxjsAnchorHandle;
+            let sourceState = syncCache.get(handle);
+            if (sourceState === undefined) {
+                const source = nodeMap.get(handle);
+                if (!source) {
+                    sourceState = null;
+                } else {
+                    source.updateWorldMatrix(true, false);
+                    sourceState = {
+                        visible: !!source.visible,
+                        matrixWorld: source.matrixWorld,
+                    };
+                }
+                syncCache.set(handle, sourceState);
+            }
+
+            if (!sourceState) {
                 anchor.visible = false;
                 continue;
             }
-            anchor.visible = anchor.userData.maxjsFollowVisibility ? !!source.visible : true;
+            anchor.visible = anchor.userData.maxjsFollowVisibility ? sourceState.visible : true;
             if (anchor.userData.maxjsCopyWorldMatrix) {
-                source.updateWorldMatrix(true, false);
-                anchor.matrix.copy(source.matrixWorld);
+                anchor.matrix.copy(sourceState.matrixWorld);
                 anchor.matrixWorldNeedsUpdate = true;
             }
         }
@@ -570,20 +643,29 @@ export function createLayerManager({
             errorCount: 0,
             tracked: new Set(),
             anchors: [],
+            nodeAdapters: new Map(),
             input: null,
+            profile: {
+                mountMs: 0,
+                lastUpdateMs: 0,
+                avgUpdateMs: 0,
+                maxUpdateMs: 0,
+                updateCount: 0,
+            },
             ctx: null,
         };
 
-        layer.input = createInputHelper(renderer, layer);
         jsWorldRoot.add(group);
         overlayWorldRoot.add(overlayGroup);
         layer.ctx = buildContext(layer);
         layers.set(id, layer);
+        emitChange('mounting');
         return layer;
     }
 
     async function mount(id, createHooks, options = {}) {
         const layer = createLayerState(id, options);
+        const mountStart = performance.now();
         const mountToken = Symbol(id);
         layer.loading = true;
         layer.mountToken = mountToken;
@@ -603,6 +685,9 @@ export function createLayerManager({
         } finally {
             if (layers.get(id) === layer) layer.loading = false;
         }
+        layer.profile.mountMs = performance.now() - mountStart;
+        lastMountMs = layer.profile.mountMs;
+        emitChange('mounted');
         return { id, error: layer.error };
     }
 
@@ -613,7 +698,7 @@ export function createLayerManager({
         }, { name: name || id, code, source: 'inline' });
     }
 
-    function remove(id) {
+    function remove(id, options = {}) {
         const layer = layers.get(id);
         if (!layer) return false;
 
@@ -634,6 +719,7 @@ export function createLayerManager({
         }
         layer.tracked.clear();
         layer.anchors.length = 0;
+        layer.nodeAdapters.clear();
         if (layer.input) { layer.input.dispose(); layer.input = null; }
 
         jsWorldRoot.remove(layer.group);
@@ -642,34 +728,68 @@ export function createLayerManager({
         disposeOwnedResource(layer.overlayGroup);
 
         layers.delete(id);
+        if (!options.silent) emitChange('removed');
         return true;
     }
 
+    function clearWhere(predicate = null) {
+        let changed = false;
+        for (const [id, layer] of [...layers.entries()]) {
+            if (predicate && !predicate(layer)) continue;
+            changed = remove(id, { silent: true }) || changed;
+        }
+        if (changed) emitChange('cleared');
+    }
+
     function clear() {
-        for (const id of [...layers.keys()]) remove(id);
+        clearWhere();
+    }
+
+    function clearInline() {
+        clearWhere(layer => layer.source === 'inline');
     }
 
     function list() {
-        return [...layers.values()].map(layer => ({
-            id: layer.id,
-            name: layer.name,
-            active: layer.active,
-            error: layer.error,
-        }));
+        return [...layers.values()].map(layer => snapshotLayer(layer));
+    }
+
+    function getLayerSnapshot(id) {
+        const layer = layers.get(id);
+        return layer ? snapshotLayer(layer) : null;
+    }
+
+    function getStats() {
+        return lastStats;
     }
 
     function update(frameDt, frameElapsed) {
         dt = frameDt;
         elapsed = frameElapsed;
+        const anchorSyncCache = new Map();
+        let activeLayerCount = 0;
+        let anchorCount = 0;
+        let trackedCount = 0;
+        let totalUpdateMs = 0;
 
         for (const layer of layers.values()) {
+            anchorCount += layer.anchors.length;
+            trackedCount += layer.tracked.size;
+            if (layer.active) activeLayerCount++;
+
             if (layer.loading || !layer.active || !layer.hooks || typeof layer.hooks.update !== 'function') {
-                syncAnchors(layer);
+                syncAnchors(layer, anchorSyncCache);
                 continue;
             }
             try {
-                syncAnchors(layer);
+                const updateStart = performance.now();
+                syncAnchors(layer, anchorSyncCache);
                 layer.hooks.update(layer.ctx, dt, elapsed);
+                const updateMs = performance.now() - updateStart;
+                totalUpdateMs += updateMs;
+                layer.profile.lastUpdateMs = updateMs;
+                layer.profile.updateCount += 1;
+                layer.profile.avgUpdateMs += (updateMs - layer.profile.avgUpdateMs) / layer.profile.updateCount;
+                layer.profile.maxUpdateMs = Math.max(layer.profile.maxUpdateMs, updateMs);
                 layer.errorCount = 0;
             } catch (err) {
                 layer.errorCount++;
@@ -677,9 +797,19 @@ export function createLayerManager({
                     layer.active = false;
                     layer.error = `Auto-deactivated after ${MAX_CONSECUTIVE_ERRORS} errors: ${err.message}`;
                     console.error(`[LayerManager] Layer "${layer.id}" deactivated:`, err);
+                    emitChange('deactivated');
                 }
             }
         }
+
+        lastStats = freezePlainObject({
+            layerCount: layers.size,
+            activeLayerCount,
+            anchorCount,
+            trackedCount,
+            updateMs: totalUpdateMs,
+            lastMountMs,
+        });
     }
 
     function getLayerCode(id) {
@@ -697,13 +827,18 @@ export function createLayerManager({
 
     return {
         mount,
+        subscribe,
         bindProjectRuntime(control) {
             projectControl = control;
+            emitChange('project_bound');
         },
         inject,
         remove,
         clear,
+        clearInline,
         list,
+        getLayerSnapshot,
+        getStats,
         update,
         getLayerCode,
         serialize,

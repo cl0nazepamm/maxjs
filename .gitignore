@@ -3,3 +3,6 @@ thirdparty/
 *.user
 *.suo
 .vs/
+*.aps
+*.tmp
+tmp_*

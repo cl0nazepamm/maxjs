@@ -389,6 +389,7 @@
         import { applyDeltaFrame } from './js/protocol.js';
         import { createPerfHud } from './js/perf_hud.js';
         import { createSSGIController } from './js/ssgi_fx.js';
+        import { createLayerManager } from './js/layer_manager.js';
 
         // ── Scene Setup (Z-up, matching Max) ────────────────
         const hiddenBackgroundColor = 0x353535;
@@ -3813,6 +3814,7 @@
                 defaultKey.position.copy(camera.position);
             }
             updateVolumeUniforms();
+            layerManager.update(inlineClock.getDelta(), inlineClock.getElapsedTime());
             const renderStart = performance.now();
             ssgiFx.render();
             if (splatOverlay && splatHandleMap.size > 0) {
@@ -3823,6 +3825,23 @@
             syncPostFxPanel();
             perfHud.updateRender(performance.now() - renderStart, renderer.info?.render);
         }
+
+        // ── JS_Inline Layer Manager ──────────────────────────
+        const inlineClock = new THREE.Clock();
+        const layerManager = createLayerManager({ scene, camera, renderer, THREE, nodeMap });
+
+        bridge.on('js_inline', msg => {
+            switch (msg.action) {
+                case 'inject': case 'update': {
+                    const result = layerManager.inject(msg.id, msg.code, msg.name);
+                    bridge.send('js_inline_result', { id: msg.id, error: result.error || null });
+                    break;
+                }
+                case 'remove': layerManager.remove(msg.id); break;
+                case 'list':   bridge.send('js_inline_list', { layers: layerManager.list() }); break;
+                case 'clear':  layerManager.clear(); break;
+            }
+        });
 
         renderer.setAnimationLoop(renderFrame);
 

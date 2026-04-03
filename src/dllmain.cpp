@@ -5569,6 +5569,7 @@ void MaxJSFastRedrawCallback::proc(Interface*) {
     owner_->MarkTrackedLightTransformsDirty();
     owner_->CheckTrackedLightsLive();
     owner_->MarkTrackedSplatTransformsDirty();
+    owner_->PollViewportModes();
     owner_->MarkCameraDirtyIfChanged();
     owner_->CheckSelectedGeometryLive();
 }

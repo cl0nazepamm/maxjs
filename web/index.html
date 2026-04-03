@@ -2976,7 +2976,7 @@
 
         // ── Camera Sync (Z-up, raw from Max) ────────────────
         function applyCamera(cam) {
-            if (!camLock) return;
+            if (!camLock || layerManager?.isCameraOverridden) return;
             if (!isFiniteArray(cam?.pos, 3) || !isFiniteArray(cam?.tgt, 3) || !isFiniteArray(cam?.up, 3)) {
                 return;
             }

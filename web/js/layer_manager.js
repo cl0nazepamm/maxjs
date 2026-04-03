@@ -110,8 +110,9 @@ function freezePlainObject(obj) {
     return Object.freeze(obj);
 }
 
-function createCameraAdapter(camera, THREE, ownForJs) {
+function createCameraAdapter(camera, THREE, ownForJs, cameraControl) {
     return freezePlainObject({
+        get raw() { return camera; },
         getState() {
             return {
                 type: camera.type,
@@ -133,6 +134,9 @@ function createCameraAdapter(camera, THREE, ownForJs) {
             if (options.name) clone.name = options.name;
             return ownForJs(clone, options.overlay ? OWNER_OVERLAY : OWNER_JS);
         },
+        takeOver() { cameraControl.claim(); },
+        release() { cameraControl.release(); },
+        get isOverridden() { return cameraControl.isClaimed(); },
     });
 }
 
@@ -226,7 +230,7 @@ function createNodeMapFacade(nodeMap, getAdapter) {
     return freezePlainObject(facade);
 }
 
-function createMaxSceneFacade({ scene, nodeMap, getAdapter, createAnchor }) {
+function createMaxSceneFacade({ scene, nodeMap, getAdapter, createAnchor, THREE }) {
     return freezePlainObject({
         get size() { return nodeMap.size; },
         get background() { return scene.background?.clone?.() ?? scene.background ?? null; },
@@ -252,6 +256,22 @@ function createMaxSceneFacade({ scene, nodeMap, getAdapter, createAnchor }) {
         createAnchor(handle, options = {}) {
             return createAnchor(handle, options);
         },
+        raycast(origin, direction, options = {}) {
+            const rc = new THREE.Raycaster(origin, direction);
+            if (Number.isFinite(options.near)) rc.near = options.near;
+            if (Number.isFinite(options.far)) rc.far = options.far;
+            const targets = [];
+            for (const obj of nodeMap.values()) {
+                if (obj?.isMesh && obj.visible) targets.push(obj);
+            }
+            return rc.intersectObjects(targets, false).map(hit => ({
+                point: hit.point.clone(),
+                normal: hit.face?.normal?.clone() ?? new THREE.Vector3(0, 0, 1),
+                distance: hit.distance,
+                handle: hit.object?.userData?.maxjsHandle ?? null,
+                name: hit.object?.name ?? '',
+            }));
+        },
     });
 }
 
@@ -259,9 +279,29 @@ function createRendererFacade(renderer) {
     return freezePlainObject({
         get capabilities() { return renderer.capabilities; },
         get info() { return renderer.info; },
+        get domElement() { return renderer.domElement; },
         get width() { return renderer.domElement?.width ?? 0; },
         get height() { return renderer.domElement?.height ?? 0; },
     });
+}
+
+function createInputHelper(renderer, layer) {
+    const el = renderer.domElement;
+    const listeners = [];
+    function on(target, event, fn, opts) {
+        target.addEventListener(event, fn, opts);
+        listeners.push({ target, event, fn, opts });
+    }
+    return {
+        get element() { return el; },
+        get document() { return el?.ownerDocument; },
+        on,
+        dispose() {
+            for (const { target, event, fn, opts } of listeners)
+                target.removeEventListener(event, fn, opts);
+            listeners.length = 0;
+        },
+    };
 }
 
 const SANDBOX_PRELUDE = [
@@ -304,6 +344,13 @@ export function createLayerManager({
     if (!overlayWorldRoot.parent) scene.add(overlayWorldRoot);
 
     if (maxRoot) setOwner(maxRoot, OWNER_MAX);
+
+    let cameraOverride = false;
+    const cameraControl = {
+        claim() { cameraOverride = true; camera.matrixAutoUpdate = true; },
+        release() { cameraOverride = false; camera.matrixAutoUpdate = false; },
+        isClaimed() { return cameraOverride; },
+    };
 
     const isWebGPU = !!(renderer?.backend?.parameters?.forceWebGL === undefined
         && renderer?.backend?.constructor?.name !== 'WebGLBackend');
@@ -367,13 +414,14 @@ export function createLayerManager({
 
     function buildContext(layer) {
         const rendererFacade = createRendererFacade(renderer);
-        const cameraFacade = createCameraAdapter(camera, THREE, ownForLayer);
+        const cameraFacade = createCameraAdapter(camera, THREE, ownForLayer, cameraControl);
         const nodeMapFacade = createNodeMapFacade(nodeMap, handle => getLayerNodeAdapter(layer, handle));
         const maxSceneFacade = createMaxSceneFacade({
             scene,
             nodeMap,
             getAdapter: handle => getLayerNodeAdapter(layer, handle),
             createAnchor: (handle, options = {}) => createAnchorForLayer(layer, handle, options),
+            THREE,
         });
 
         const runtimeFacade = freezePlainObject({
@@ -464,6 +512,7 @@ export function createLayerManager({
             nodeMap: nodeMapFacade,
             camera: cameraFacade,
             renderer: rendererFacade,
+            input: layer.input,
             THREE,
             clock: freezePlainObject({
                 get dt() { return dt; },
@@ -521,9 +570,11 @@ export function createLayerManager({
             errorCount: 0,
             tracked: new Set(),
             anchors: [],
+            input: null,
             ctx: null,
         };
 
+        layer.input = createInputHelper(renderer, layer);
         jsWorldRoot.add(group);
         overlayWorldRoot.add(overlayGroup);
         layer.ctx = buildContext(layer);
@@ -583,6 +634,7 @@ export function createLayerManager({
         }
         layer.tracked.clear();
         layer.anchors.length = 0;
+        if (layer.input) { layer.input.dispose(); layer.input = null; }
 
         jsWorldRoot.remove(layer.group);
         overlayWorldRoot.remove(layer.overlayGroup);
@@ -655,6 +707,7 @@ export function createLayerManager({
         update,
         getLayerCode,
         serialize,
+        get isCameraOverridden() { return cameraOverride; },
         roots: freezePlainObject({
             maxRoot,
             jsRoot: jsWorldRoot,

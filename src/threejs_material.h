@@ -7,6 +7,7 @@
 #define THREEJS_ADV_MTL_CLASS_ID Class_ID(0x7F3A9B11, 0x4E2D8C10)
 
 #define THREEJS_UTILITY_MTL_CLASS_ID Class_ID(0x7F3A9B13, 0x4E2D8C10)
+#define THREEJS_TSL_CLASS_ID Class_ID(0x7F3A9B14, 0x4E2D8C10)
 
 enum { threejs_params };
 
@@ -68,6 +69,8 @@ enum ThreeJSParamIDs {
     pb_phys_anisotropy,
     // Material mode (Standard / Physical)
     pb_material_mode,
+    // TSL
+    pb_tsl_code,
 };
 
 enum ThreeJSUtilityModel {
@@ -105,5 +108,17 @@ enum ThreeJSMapSlots {
     kNumMaps
 };
 
+// Video Texture
+#define THREEJS_VIDEO_TEX_CLASS_ID Class_ID(0x7F3A9B20, 0x4E2D8C20)
+enum { threejs_video_params };
+enum ThreeJSVideoParamIDs {
+    pvid_filename,
+    pvid_loop,
+    pvid_rate,
+    pvid_muted,
+};
+
 ClassDesc2* GetThreeJSAdvMtlDesc();
 ClassDesc2* GetThreeJSUtilityMtlDesc();
+ClassDesc2* GetThreeJSTSLMtlDesc();
+ClassDesc2* GetThreeJSVideoTexDesc();

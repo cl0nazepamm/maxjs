@@ -25,6 +25,19 @@
 #define IDS_MATERIAL_MODE_PHYSICAL 122
 #define IDS_MATERIAL_MODE_SSS      123
 #define IDC_MATERIAL_MODE          1130
+#define IDD_THREEJS_TSL_MTL        124
+#define IDS_TSL_PARAMS             125
+#define IDC_TSL_CODE_EDIT          1140
+#define IDC_TSL_LOAD_BTN           1141
+#define IDC_TSL_FILE_LABEL         1142
+#define IDD_THREEJS_VIDEO_TEX      126
+#define IDS_VIDEO_TEX_PARAMS       127
+#define IDC_VIDEO_FILE_BTN         1150
+#define IDC_VIDEO_FILE_LABEL       1151
+#define IDC_VIDEO_LOOP             1152
+#define IDC_VIDEO_RATE_EDIT        1153
+#define IDC_VIDEO_RATE_SPIN        1154
+#define IDC_VIDEO_MUTED            1155
 
 // PBR Core
 #define IDC_COLOR           1001

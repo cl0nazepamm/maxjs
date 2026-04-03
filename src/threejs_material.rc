@@ -22,6 +22,8 @@ BEGIN
     IDS_BACKDROP_MODE_DEPTH "Depth"
     IDS_BACKDROP_MODE_TEXTURE "Texture"
     IDS_BACKDROP_MODE_PIXEL "Pixel"
+    IDS_TSL_PARAMS "three.js TSL"
+    IDS_VIDEO_TEX_PARAMS "three.js Video"
 END
 
 IDD_THREEJS_MTL DIALOG 0, 0, 170, 426
@@ -469,4 +471,29 @@ BEGIN
     CONTROL         "",  IDC_ENV_INT_EDIT,"CustEdit",      WS_TABSTOP, 128,360, 20, 10
     CONTROL         "",  IDC_ENV_INT_SPIN,"SpinnerControl", 0,         150,360, 11, 10
     LTEXT           "Models: Distance / Depth / Lambert / Matcap / Normal / Phong", IDC_MTL_MODEL_LABEL, 8, 392, 154, 16
+END
+
+IDD_THREEJS_TSL_MTL DIALOG 0, 0, 170, 200
+STYLE DS_SETFONT | WS_CHILD | WS_VISIBLE
+FONT 8, "Segoe UI"
+BEGIN
+    GROUPBOX        "TSL Shader", -1,   2,   2, 166, 190
+    LTEXT           "No file loaded", IDC_TSL_FILE_LABEL, 8, 14, 100, 8
+    PUSHBUTTON      "Load .tsl",  IDC_TSL_LOAD_BTN,  114, 11, 46, 14
+    EDITTEXT        IDC_TSL_CODE_EDIT, 6, 28, 158, 156, ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN | WS_VSCROLL | WS_TABSTOP
+END
+
+IDD_THREEJS_VIDEO_TEX DIALOG 0, 0, 170, 80
+STYLE DS_SETFONT | WS_CHILD | WS_VISIBLE
+FONT 8, "Segoe UI"
+BEGIN
+    GROUPBOX        "Video Source", -1,  2,  2, 166, 72
+    LTEXT           "No video loaded", IDC_VIDEO_FILE_LABEL, 8, 14, 110, 8
+    PUSHBUTTON      "Browse...",  IDC_VIDEO_FILE_BTN,  8, 24, 154, 14
+    CONTROL         "Loop",    IDC_VIDEO_LOOP,   "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 8, 44, 34, 10
+    CONTROL         "Muted",   IDC_VIDEO_MUTED,  "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 50, 44, 36, 10
+    LTEXT           "Rate",    -1,  96, 44, 16, 8
+    CONTROL         "",  IDC_VIDEO_RATE_EDIT,  "CustEdit", WS_TABSTOP, 114, 42, 22, 10
+    CONTROL         "",  IDC_VIDEO_RATE_SPIN,  "SpinnerControl", 0, 138, 42, 7, 10
+    LTEXT           "Supports: .mp4 .webm .ogg", -1, 8, 60, 150, 8
 END

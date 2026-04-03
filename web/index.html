@@ -1122,8 +1122,34 @@
             return slotColorSpace;
         }
 
+        function loadVideoTexture(url, xf) {
+            const playbackKey = JSON.stringify({
+                loop: xf?.loop !== false,
+                muted: xf?.muted !== false,
+                rate: xf?.rate ?? 1.0,
+            });
+            const cacheKey = `video:${url}:${playbackKey}`;
+            if (textureCache.has(cacheKey)) return textureCache.get(cacheKey);
+            const video = document.createElement('video');
+            video.src = url;
+            video.crossOrigin = 'anonymous';
+            video.loop = xf?.loop !== false;
+            video.muted = xf?.muted !== false;
+            video.playbackRate = xf?.rate ?? 1.0;
+            video.playsInline = true;
+            video.autoplay = true;
+            video.play().catch(() => {});
+            const tex = new THREE.VideoTexture(video);
+            tex.colorSpace = THREE.SRGBColorSpace;
+            tex.minFilter = THREE.LinearFilter;
+            tex.magFilter = THREE.LinearFilter;
+            textureCache.set(cacheKey, tex);
+            return tex;
+        }
+
         function loadTexture(url, colorSpace = THREE.LinearSRGBColorSpace, xf = null, fallbackTex = fallbackWhiteTexture) {
             if (!url) return null;
+            if (xf?.video) return loadVideoTexture(url, xf);
             colorSpace = resolveColorSpace(colorSpace, xf);
             const normalizedXf = normalizeTextureTransform(xf);
             const cacheKey = JSON.stringify([url, String(colorSpace), normalizedXf]);
@@ -1563,6 +1589,22 @@
             return material;
         }
 
+        function createTSLMaterial(md) {
+            try {
+                const material = new THREE.MeshPhysicalNodeMaterial();
+                material.side = md.side === 0 ? THREE.FrontSide : THREE.DoubleSide;
+                // TSL code gets full access to THREE (which includes all TSL nodes)
+                // and a convenience `loadTexture` for loading bitmaps from Max paths
+                const fn = new Function('material', 'THREE', 'loadTexture', md.tslCode);
+                fn(material, THREE, loadTexture);
+                material.needsUpdate = true;
+                return material;
+            } catch (err) {
+                console.error('[TSL Material] Compile error:', err);
+                return new THREE.MeshStandardMaterial({ color: 0xff00ff, wireframe: true });
+            }
+        }
+
         function createUtilityMaterial(runtimeModelName, md) {
             if (runtimeModelName === 'MeshBackdropNodeMaterial') {
                 return createBackdropUtilityMaterial(md);
@@ -1697,8 +1739,12 @@
             const key = JSON.stringify([requestedModelName, runtimeModelName, md]);
             let template = materialCache.get(key);
 
+            const wantsTSLMaterial = requestedModelName === 'MeshTSLNodeMaterial';
+
             if (!template) {
-                if (wantsUtilityMaterial) {
+                if (wantsTSLMaterial && md.tslCode) {
+                    template = createTSLMaterial(md);
+                } else if (wantsUtilityMaterial) {
                     template = createUtilityMaterial(runtimeModelName, md);
                 } else {
                     const params = {
@@ -2066,6 +2112,9 @@
                                 pos.array.set(new Float32Array(buf, meta.vOff, meta.vN));
                                 pos.needsUpdate = true;
 
+                                existingIdx.array.set(new Int32Array(buf, meta.iOff, meta.iN));
+                                existingIdx.needsUpdate = true;
+
                                 if (meta.uvOff != null && meta.uvN) {
                                     const uv = mesh.geometry.getAttribute('uv');
                                     if (uv && uv.count === meta.uvN / 2) {
@@ -2084,6 +2133,7 @@
                                     scheduleNormals(mesh.geometry);
                                 }
 
+                                mesh.geometry.computeBoundingBox();
                                 mesh.geometry.computeBoundingSphere();
                             } else {
                                 // Topology changed — full rebuild
@@ -2277,17 +2327,18 @@
                 const mesh = nodeMap.get(nd.h);
                 if (!mesh) continue;
                 // Visibility (hide/unhide/isolate) — instant, no full sync needed
-                const vis = nd.vis !== 0;
-                if (mesh.visible !== vis) mesh.visible = vis;
-                applyTransform(mesh, nd.t);
-                applySelection(mesh, nd.s);
+                if (nd.vis != null) {
+                    const vis = nd.vis !== 0;
+                    if (mesh.visible !== vis) mesh.visible = vis;
+                }
+                if (Array.isArray(nd.t) && nd.t.length === 16) applyTransform(mesh, nd.t);
+                if (nd.s != null) applySelection(mesh, nd.s);
                 // Live material update from scalars
                 if (nd.mat && mesh.material) applyMaterialScalar(mesh, nd.mat);
             }
             if (msg.lights) applyLightUpdates(msg.lights);
             if (msg.splats) applySplatUpdates(msg.splats);
             if (msg.camera) applyCamera(msg.camera);
-            scene.updateMatrixWorld(true);
             const applyMs = performance.now() - applyStart;
             updateSyncHud({
                 transport: 'json',
@@ -2476,7 +2527,6 @@
                     applyCamera(cameraState);
                 },
             });
-            scene.updateMatrixWorld(true);
             markInitialSync();
             setTransportMode('binary-delta');
             updateSyncHud({
@@ -3091,8 +3141,15 @@
             btnEnv.textContent = `Env: ${envVisible ? 'ON' : 'OFF'}`;
             btnEnv.classList.toggle('active', envVisible);
             ssgiFx.setEnvironmentVisible(envVisible);
-            scene.background = envVisible && scene.environment
-                ? scene.environment : new THREE.Color(hiddenBackgroundColor);
+            if (isLocalHdriActive()) {
+                localHdriShowBg = envVisible;
+                applyLocalHDRIToScene();
+            } else {
+                scene.background = envVisible && scene.environment
+                    ? scene.environment : new THREE.Color(hiddenBackgroundColor);
+                if (envVisible) scene.backgroundBlurriness = localHdriBlur;
+            }
+            savePostFxState();
         };
 
         const btnLightProbe = document.getElementById('btnLightProbe');
@@ -3935,6 +3992,7 @@
                 const payload = {
                     toneMapping: currentToneMapping,
                     exposure: currentExposure,
+                    envVisible,
                     fx: state,
                     hdri: {
                         rotation: localHdriRotation,
@@ -3964,6 +4022,9 @@
                     currentExposure = saved.exposure;
                     renderer.toneMappingExposure = currentExposure;
                 }
+                if (typeof saved.envVisible === 'boolean') {
+                    envVisible = saved.envVisible;
+                }
 
                 // Restore HDRI settings (file must be re-picked, but sliders persist)
                 if (saved.hdri) {
@@ -3973,7 +4034,13 @@
                     if (typeof saved.hdri.showBg === 'boolean') localHdriShowBg = saved.hdri.showBg;
                     if (typeof saved.hdri.flip === 'boolean') localHdriFlip = saved.hdri.flip;
                     if (typeof saved.hdri.enabled === 'boolean') localHdriEnabled = saved.hdri.enabled;
+                    // Apply blur to scene even without HDRI loaded (will be used when HDRI loads)
+                    scene.backgroundBlurriness = localHdriBlur;
                 }
+
+                btnEnv.textContent = `Env: ${envVisible ? 'ON' : 'OFF'}`;
+                btnEnv.classList.toggle('active', envVisible);
+                ssgiFx.setEnvironmentVisible(envVisible);
 
                 const fx = saved.fx;
                 if (!fx) return;

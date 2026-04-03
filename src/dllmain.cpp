@@ -684,6 +684,10 @@ struct MaxJSPBR {
         std::wstring wrapMode = L"periodic";
         std::wstring colorSpace;   // "sRGB", "Linear", "auto", etc.
         float manualGamma = 1.0f;
+        bool  isVideo = false;
+        bool  videoLoop = true;
+        bool  videoMuted = true;
+        float videoRate = 1.0f;
     };
 
     float color[3]    = {0.8f, 0.8f, 0.8f};
@@ -742,6 +746,7 @@ struct MaxJSPBR {
     TexTransform aoMapTransform, emissionMapTransform, lightmapTransform, opacityMapTransform, matcapMapTransform;
     TexTransform clearcoatMapTransform, clearcoatRoughnessMapTransform, clearcoatNormalMapTransform;
     std::wstring mtlName;
+    std::wstring tslCode;
     std::wstring materialModel = L"MeshStandardMaterial";
     float parallaxScale = 0.0f;
 };
@@ -758,6 +763,12 @@ static std::wstring FindPBString(Texmap* map, const MCHAR* name);
 #define USD_PREVIEW_SURFACE_CLASS_ID Class_ID(1794787635, 1200091591)
 // Normal Bump texmap Class_ID = {243e22c6, 63f6a014}
 #define NORMAL_BUMP_CLASS_ID Class_ID(0x243e22c6, 0x63f6a014)
+// VRayMtl Class_ID
+#define VRAYMTL_CLASS_ID Class_ID(935280431, 1882483036)
+// VRayBitmap Class_ID
+#define VRAYBITMAP_CLASS_ID Class_ID(1734939723, 46203261)
+// VRayNormalMap Class_ID
+#define VRAYNORMALMAP_CLASS_ID Class_ID(1912237649, 1912962095)
 
 static bool HasParam(IParamBlock2* pb, ParamID id) {
     if (!pb) return false;
@@ -769,7 +780,8 @@ static bool HasParam(IParamBlock2* pb, ParamID id) {
 
 static bool IsThreeJSMaterialClass(const Class_ID& cid) {
     return cid == THREEJS_ADV_MTL_CLASS_ID ||
-           cid == THREEJS_UTILITY_MTL_CLASS_ID;
+           cid == THREEJS_UTILITY_MTL_CLASS_ID ||
+           cid == THREEJS_TSL_CLASS_ID;
 }
 
 static std::wstring GetUtilityMaterialModelName(int utilityModel) {
@@ -802,7 +814,8 @@ static bool IsSupportedMaterial(Mtl* mtl) {
     if (!mtl) return false;
     Class_ID cid = mtl->ClassID();
     return IsThreeJSMaterialClass(cid) || cid == THREEJS_TOON_CLASS_ID || cid == GLTF_MTL_CLASS_ID
-        || cid == USD_PREVIEW_SURFACE_CLASS_ID || cid == PHYSICAL_MTL_CLASS_ID;
+        || cid == USD_PREVIEW_SURFACE_CLASS_ID || cid == PHYSICAL_MTL_CLASS_ID
+        || cid == VRAYMTL_CLASS_ID;
 }
 
 // Find ThreeJS or glTF Material in material tree — uses ClassID only
@@ -934,6 +947,42 @@ static bool ExtractMaterialTexture(Texmap* map, std::wstring& filePath, MaxJSPBR
         return true;
     }
 
+    // VRayNormalMap — walk through to the inner normal map texture
+    if (resolved->ClassID() == VRAYNORMALMAP_CLASS_ID) {
+        Texmap* innerNormal = FindPBMap(resolved, _T("normal_map"));
+        if (innerNormal) return ExtractMaterialTexture(innerNormal, filePath, xf);
+        Texmap* innerBump = FindPBMap(resolved, _T("bump_map"));
+        if (innerBump) return ExtractMaterialTexture(innerBump, filePath, xf);
+        return false;
+    }
+
+    // VRayBitmap (VRayHDRI)
+    if (resolved->ClassID() == VRAYBITMAP_CLASS_ID) {
+        const std::wstring filename = FindPBString(resolved, _T("HDRIMapName"));
+        if (filename.empty() || !IsImageFile(filename.c_str()))
+            return false;
+        filePath = filename;
+        xf = {};
+        xf.hasChannelSelect = outputChannelIndex != 1;
+        xf.outputChannelIndex = outputChannelIndex;
+        return true;
+    }
+
+    // three.js Video Texture
+    if (resolved->ClassID() == THREEJS_VIDEO_TEX_CLASS_ID) {
+        IParamBlock2* vpb = resolved->GetParamBlockByID(threejs_video_params);
+        if (!vpb) return false;
+        const MCHAR* fn = vpb->GetStr(pvid_filename);
+        if (!fn || !fn[0]) return false;
+        filePath = fn;
+        xf = {};
+        xf.isVideo = true;
+        xf.videoLoop = vpb->GetInt(pvid_loop, 0) != 0;
+        xf.videoMuted = vpb->GetInt(pvid_muted, 0) != 0;
+        xf.videoRate = vpb->GetFloat(pvid_rate, 0);
+        return true;
+    }
+
     return false;
 }
 
@@ -949,6 +998,8 @@ static void ExtractThreeJSMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
         if (mode == threejs_mode_physical) d.materialModel = L"MeshPhysicalMaterial";
         else if (mode == threejs_mode_sss) d.materialModel = L"MeshSSSNodeMaterial";
         else d.materialModel = L"MeshStandardMaterial";
+    } else if (cid == THREEJS_TSL_CLASS_ID) {
+        d.materialModel = L"MeshTSLNodeMaterial";
     } else if (cid == THREEJS_UTILITY_MTL_CLASS_ID) {
         d.materialModel = GetUtilityMaterialModelName(pb->GetInt(pb_utility_model, t));
     } else {
@@ -1009,6 +1060,9 @@ static void ExtractThreeJSMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
         d.sssAttenuation = pb->GetFloat(pb_sss_attenuation, t);
         d.sssPower = pb->GetFloat(pb_sss_power, t);
         d.sssScale = pb->GetFloat(pb_sss_scale, t);
+    } else if (cid == THREEJS_TSL_CLASS_ID) {
+        const MCHAR* code = pb->GetStr(pb_tsl_code);
+        if (code && code[0]) d.tslCode = code;
     } else if (cid == THREEJS_UTILITY_MTL_CLASS_ID) {
         Color spec = pb->GetColor(pb_specular_color, t);
         d.specular[0] = spec.r; d.specular[1] = spec.g; d.specular[2] = spec.b;
@@ -1421,6 +1475,137 @@ static void ExtractPhysicalMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
     }
 }
 
+// Extract PBR from VRayMtl
+static void ExtractVRayMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
+    MSTR name = mtl->GetName();
+    d.mtlName = name.data();
+    d.materialModel = L"MeshPhysicalMaterial";
+
+    // VRayMtl uses PB index 1 ("basic") for most params
+    auto readFloat = [&](const MCHAR* pname, float def) -> float {
+        for (int b = 0; b < mtl->NumParamBlocks(); b++) {
+            IParamBlock2* pb = mtl->GetParamBlock(b);
+            if (!pb) continue;
+            for (int i = 0; i < pb->NumParams(); i++) {
+                ParamID pid = pb->IndextoID(i);
+                const ParamDef& pd = pb->GetParamDef(pid);
+                if (pd.int_name && _tcsicmp(pd.int_name, pname) == 0 && pd.type == TYPE_FLOAT)
+                    return pb->GetFloat(pid, t);
+            }
+        }
+        return def;
+    };
+    auto readColor = [&](const MCHAR* pname, float out[3]) {
+        for (int b = 0; b < mtl->NumParamBlocks(); b++) {
+            IParamBlock2* pb = mtl->GetParamBlock(b);
+            if (!pb) continue;
+            for (int i = 0; i < pb->NumParams(); i++) {
+                ParamID pid = pb->IndextoID(i);
+                const ParamDef& pd = pb->GetParamDef(pid);
+                if (pd.int_name && _tcsicmp(pd.int_name, pname) == 0) {
+                    if (pd.type == TYPE_RGBA || pd.type == TYPE_FRGBA || pd.type == TYPE_COLOR) {
+                        Color c = pb->GetColor(pid, t);
+                        out[0] = c.r; out[1] = c.g; out[2] = c.b;
+                    }
+                    return;
+                }
+            }
+        }
+    };
+    auto readBool = [&](const MCHAR* pname, bool def) -> bool {
+        for (int b = 0; b < mtl->NumParamBlocks(); b++) {
+            IParamBlock2* pb = mtl->GetParamBlock(b);
+            if (!pb) continue;
+            for (int i = 0; i < pb->NumParams(); i++) {
+                ParamID pid = pb->IndextoID(i);
+                const ParamDef& pd = pb->GetParamDef(pid);
+                if (pd.int_name && _tcsicmp(pd.int_name, pname) == 0 &&
+                    (pd.type == TYPE_BOOL || pd.type == TYPE_INT))
+                    return pb->GetInt(pid, t) != 0;
+            }
+        }
+        return def;
+    };
+    auto readMap = [&](const MCHAR* mapName, const MCHAR* onName,
+                       std::wstring& outPath, MaxJSPBR::TexTransform& outXf) {
+        outPath.clear(); outXf = {};
+        if (onName && !readBool(onName, true)) return;
+        for (int b = 0; b < mtl->NumParamBlocks(); b++) {
+            IParamBlock2* pb = mtl->GetParamBlock(b);
+            if (!pb) continue;
+            for (int i = 0; i < pb->NumParams(); i++) {
+                ParamID pid = pb->IndextoID(i);
+                const ParamDef& pd = pb->GetParamDef(pid);
+                if (pd.int_name && _tcsicmp(pd.int_name, mapName) == 0 && pd.type == TYPE_TEXMAP) {
+                    Texmap* map = pb->GetTexmap(pid, t);
+                    ExtractMaterialTexture(map, outPath, outXf);
+                    return;
+                }
+            }
+        }
+    };
+
+    // Core PBR
+    readColor(_T("diffuse"), d.color);
+    d.roughness = 1.0f - readFloat(_T("reflection_glossiness"), 1.0f);
+    d.metalness = readFloat(_T("reflection_metalness"), 0.0f);
+    d.ior = readFloat(_T("reflection_ior"), 1.6f);
+    d.normalScale = readFloat(_T("bump_multiplier"), 30.0f) / 30.0f; // normalize to ~1.0
+    d.doubleSided = readBool(_T("option_doubleSided"), true);
+
+    // Emission
+    readColor(_T("selfIllumination"), d.emission);
+    d.emIntensity = readFloat(_T("selfIllumination_multiplier"), 1.0f);
+    if (d.emission[0] + d.emission[1] + d.emission[2] < 0.001f) d.emIntensity = 0.0f;
+
+    // Refraction → transmission
+    float refr[3] = {0, 0, 0};
+    readColor(_T("refraction"), refr);
+    d.transmission = (refr[0] + refr[1] + refr[2]) / 3.0f;
+    if (d.transmission > 0.0f) {
+        readColor(_T("refraction_fogColor"), d.attenuationColor);
+        d.attenuationDistance = readFloat(_T("refraction_fogMult"), 1.0f);
+        d.opacity = 1.0f - d.transmission;
+    }
+
+    // Coat
+    d.clearcoat = readFloat(_T("coat_amount"), 0.0f);
+    d.clearcoatRoughness = 1.0f - readFloat(_T("coat_glossiness"), 1.0f);
+
+    // Sheen
+    float sheenCol[3] = {0, 0, 0};
+    readColor(_T("sheen_color"), sheenCol);
+    d.sheen = (sheenCol[0] + sheenCol[1] + sheenCol[2]) / 3.0f;
+    d.sheenColor[0] = sheenCol[0]; d.sheenColor[1] = sheenCol[1]; d.sheenColor[2] = sheenCol[2];
+    d.sheenRoughness = 1.0f - readFloat(_T("sheen_glossiness"), 0.8f);
+
+    // Anisotropy
+    d.anisotropy = readFloat(_T("anisotropy"), 0.0f);
+
+    // Thin film → iridescence
+    if (readBool(_T("thinFilm_on"), false)) {
+        d.iridescence = 1.0f;
+        d.iridescenceIOR = readFloat(_T("thinFilm_ior"), 1.47f);
+    }
+
+    // Texture maps
+    readMap(_T("texmap_diffuse"),          _T("texmap_diffuse_on"),          d.colorMap,      d.colorMapTransform);
+    readMap(_T("texmap_roughness"),        _T("texmap_roughness_on"),        d.roughnessMap,  d.roughnessMapTransform);
+    readMap(_T("texmap_metalness"),        _T("texmap_metalness_on"),        d.metalnessMap,  d.metalnessMapTransform);
+    readMap(_T("texmap_bump"),             _T("texmap_bump_on"),             d.normalMap,     d.normalMapTransform);
+    readMap(_T("texmap_self_illumination"),_T("texmap_self_illumination_on"),d.emissionMap,   d.emissionMapTransform);
+    readMap(_T("texmap_opacity"),          _T("texmap_opacity_on"),          d.opacityMap,    d.opacityMapTransform);
+    readMap(_T("texmap_displacement"),     _T("texmap_displacement_on"),     d.displacementMap, d.displacementMapTransform);
+    readMap(_T("texmap_coat_amount"),      _T("texmap_coat_amount_on"),      d.clearcoatMap,  d.clearcoatMapTransform);
+    readMap(_T("texmap_coat_glossiness"),  _T("texmap_coat_glossiness_on"),  d.clearcoatRoughnessMap, d.clearcoatRoughnessMapTransform);
+    readMap(_T("texmap_coat_bump"),        _T("texmap_coat_bump_on"),        d.clearcoatNormalMap, d.clearcoatNormalMapTransform);
+
+    // Downgrade to Standard if no advanced features used
+    if (d.clearcoat == 0.0f && d.sheen == 0.0f && d.transmission == 0.0f &&
+        d.iridescence == 0.0f && d.anisotropy == 0.0f)
+        d.materialModel = L"MeshStandardMaterial";
+}
+
 // Extract PBR from a single material (ThreeJS, glTF, or wire color fallback)
 static void ExtractPBRFromMtl(Mtl* mtl, INode* node, TimeValue t, MaxJSPBR& d) {
     if (mtl) {
@@ -1435,6 +1620,8 @@ static void ExtractPBRFromMtl(Mtl* mtl, INode* node, TimeValue t, MaxJSPBR& d) {
                 ExtractUsdPreviewSurfaceMtl(found, t, d);
             else if (cid == PHYSICAL_MTL_CLASS_ID)
                 ExtractPhysicalMtl(found, t, d);
+            else if (cid == VRAYMTL_CLASS_ID)
+                ExtractVRayMtl(found, t, d);
             else
                 ExtractGltfMtl(found, t, d);
             return;
@@ -1480,6 +1667,8 @@ static void ExtractPBR(INode* node, TimeValue t, MaxJSPBR& d) {
             ExtractUsdPreviewSurfaceMtl(found, t, d);
         else if (cid == PHYSICAL_MTL_CLASS_ID)
             ExtractPhysicalMtl(found, t, d);
+        else if (cid == VRAYMTL_CLASS_ID)
+            ExtractVRayMtl(found, t, d);
         else
             ExtractGltfMtl(found, t, d);
         return;
@@ -2866,6 +3055,7 @@ public:
     std::unordered_set<ULONG> lightHandles_;
     std::unordered_set<ULONG> splatHandles_;
     std::unordered_set<ULONG> fastDirtyHandles_;
+    std::unordered_set<ULONG> visibilityDirtyHandles_;
     std::unordered_map<ULONG, std::array<float, 16>> lastSentTransforms_;
     std::unordered_map<ULONG, uint64_t> mtlHashMap_;   // node handle → material structure hash
     std::unordered_map<ULONG, uint64_t> mtlScalarHashMap_; // node handle → fast-sync scalar hash
@@ -3064,6 +3254,7 @@ public:
         if (!hwnd_) return false;
         ShowWindow(hwnd_, SW_SHOW);
         UpdateWindow(hwnd_);
+        NormalizeFloatingWindow(true);
         InitWebView2();
         return true;
     }
@@ -3734,12 +3925,29 @@ public:
 
     void ResetFastPathState(bool refreshCameraState = false) {
         fastDirtyHandles_.clear();
+        visibilityDirtyHandles_.clear();
         materialFastDirtyHandles_.clear();
         fastCameraDirty_ = false;
         fastFlushPosted_ = false;
         if (refreshCameraState) CaptureCurrentCameraState();
         else haveLastSentCamera_ = false;
     }
+
+    bool ShouldBootstrapVisibleNode(INode* node, TimeValue t) const {
+        if (!node) return false;
+        if (IsForestPackNode(node) || IsRailCloneNode(node) ||
+            (IsTyFlowAvailable() && IsTyFlowNode(node))) {
+            return true;
+        }
+
+        ObjectState os = node->EvalWorldState(t);
+        if (!os.obj) return false;
+        if (IsThreeJSSplatClassID(os.obj->ClassID())) return true;
+
+        const SClass_ID superClass = os.obj->SuperClassID();
+        return superClass == GEOMOBJECT_CLASS_ID || superClass == LIGHT_CLASS_ID;
+    }
+
 
     template <typename Fn>
     void VisitNodeSubtree(INode* node, Fn&& fn) {
@@ -3880,7 +4088,10 @@ public:
     }
 
     void MarkVisibilityNodesDirty(const NodeEventNamespace::NodeKeyTab& nodes) {
+        Interface* ip = GetCOREInterface();
+        const TimeValue t = ip ? ip->GetTime() : 0;
         bool changed = false;
+        bool needsFullSync = false;
         for (int i = 0; i < nodes.Count(); ++i) {
             INode* node = NodeEventNamespace::GetNodeByKey(nodes[i]);
             if (!node) continue;
@@ -3888,16 +4099,23 @@ public:
             VisitNodeSubtree(node, [this, &changed](INode* current) {
                 const ULONG handle = current->GetHandle();
                 if (IsTrackedHandle(handle)) {
-                    if (fastDirtyHandles_.insert(handle).second) changed = true;
+                    if (visibilityDirtyHandles_.insert(handle).second) changed = true;
                     return;
                 }
+            });
 
-                // A node that becomes visible after being absent from the last full sync
-                // needs geometry/bootstrap data, not just a transform delta.
-                if (!current->IsNodeHidden(TRUE)) SetDirty();
+            VisitNodeSubtree(node, [this, t, &needsFullSync](INode* current) {
+                if (needsFullSync) return;
+                if (IsTrackedHandle(current->GetHandle())) return;
+                if (current->IsNodeHidden(TRUE)) return;
+
+                // A newly visible supported scene node may need bootstrap data,
+                // but helpers/non-renderables should not escalate visibility edits.
+                if (ShouldBootstrapVisibleNode(current, t)) needsFullSync = true;
             });
         }
 
+        if (needsFullSync) SetDirty();
         if (!dirty_ && changed) QueueFastFlush();
     }
 
@@ -4057,8 +4275,9 @@ public:
     }
 
     void OnTimer() {
-        if (!jsReady_ || !webview_) return;
         if (!hwnd_ || !IsWindowVisible(hwnd_)) return;
+        if (!MaintainWindowState()) return;
+        if (!jsReady_ || !webview_) return;
         tickCount_++;
 
         // Poll env+fog at reduced cadence (~200ms)
@@ -4188,13 +4407,30 @@ public:
         dirtyHandles.reserve(fastDirtyHandles_.size());
         for (ULONG handle : fastDirtyHandles_) dirtyHandles.push_back(handle);
 
-        const bool hasDirtyNodes = !dirtyHandles.empty();
         const bool hasDirtyCamera = fastCameraDirty_;
-        if (!hasDirtyNodes && !hasDirtyCamera) return;
+
+        // Collect geometry-dirty handles before clearing
+        std::unordered_set<ULONG> geoDirty;
+        geoDirty.swap(geoFastDirtyHandles_);
+        std::unordered_set<ULONG> materialDirty;
+        materialDirty.swap(materialFastDirtyHandles_);
+        std::unordered_set<ULONG> visibilityDirty;
+        visibilityDirty.swap(visibilityDirtyHandles_);
+
+        for (ULONG handle : dirtyHandles) visibilityDirty.erase(handle);
+        fastDirtyHandles_.clear();
+        fastCameraDirty_ = false;
+
+        std::vector<ULONG> combinedNodeHandles = dirtyHandles;
+        combinedNodeHandles.reserve(dirtyHandles.size() + visibilityDirty.size());
+        for (ULONG handle : visibilityDirty) combinedNodeHandles.push_back(handle);
+
+        const bool hasAnyNodeUpdates = !combinedNodeHandles.empty();
+        if (!hasAnyNodeUpdates && !hasDirtyCamera) return;
 
         bool hasDirtyLights = false;
         bool hasDirtySplats = false;
-        for (ULONG handle : dirtyHandles) {
+        for (ULONG handle : combinedNodeHandles) {
             if (lightHandles_.find(handle) != lightHandles_.end()) {
                 hasDirtyLights = true;
             }
@@ -4203,25 +4439,16 @@ public:
             }
         }
 
-        // Collect geometry-dirty handles before clearing
-        std::unordered_set<ULONG> geoDirty;
-        geoDirty.swap(geoFastDirtyHandles_);
-        std::unordered_set<ULONG> materialDirty;
-        materialDirty.swap(materialFastDirtyHandles_);
-
-        fastDirtyHandles_.clear();
-        fastCameraDirty_ = false;
-
         // Geometry fast path: send ONLY the changed mesh(es), nothing else
         if (!geoDirty.empty()) {
             SendGeometryFastUpdate(geoDirty);
-            if (materialDirty.empty() && !hasDirtyCamera && !hasDirtyLights && !hasDirtySplats) {
+            if (materialDirty.empty() && visibilityDirty.empty() && !hasDirtyCamera && !hasDirtyLights && !hasDirtySplats) {
                 return;
             }
         }
 
         if (!useBinary_ || hasDirtyLights || hasDirtySplats) {
-            if (hasDirtyNodes) SendTransformSync();
+            if (hasAnyNodeUpdates) SendTransformSync(&combinedNodeHandles);
             else SendCameraSync();
             CaptureCurrentCameraState();
             return;
@@ -4232,7 +4459,7 @@ public:
         webview_->QueryInterface(IID_PPV_ARGS(&wv17));
         env_->QueryInterface(IID_PPV_ARGS(&env12));
         if (!wv17 || !env12) {
-            if (hasDirtyNodes) SendTransformSync();
+            if (hasAnyNodeUpdates) SendTransformSync(&combinedNodeHandles);
             else SendCameraSync();
             CaptureCurrentCameraState();
             return;
@@ -4285,6 +4512,12 @@ public:
             }
         }
 
+        for (ULONG handle : visibilityDirty) {
+            INode* node = ip->GetINodeByHandle(handle);
+            if (!node) continue;
+            frame.UpdateVisibility(static_cast<std::uint32_t>(handle), !node->IsNodeHidden(TRUE));
+        }
+
         if (hasDirtyCamera) {
             CameraData cam = {};
             GetViewportCamera(cam);
@@ -4302,7 +4535,7 @@ public:
         ComPtr<ICoreWebView2SharedBuffer> sharedBuf;
         HRESULT hr = env12->CreateSharedBuffer(totalBytes, &sharedBuf);
         if (FAILED(hr) || !sharedBuf) {
-            if (hasDirtyNodes) SendTransformSync();
+            if (hasAnyNodeUpdates) SendTransformSync(&combinedNodeHandles);
             else SendCameraSync();
             CaptureCurrentCameraState();
             return;
@@ -4778,7 +5011,7 @@ public:
 
     void WriteMaterialTextures(std::wostringstream& ss, const MaxJSPBR& pbr) {
         auto writeXf = [&](const wchar_t* key, const MaxJSPBR::TexTransform& xf) {
-            if (!xf.isUberBitmap && !xf.hasChannelSelect) return;
+            if (!xf.isUberBitmap && !xf.hasChannelSelect && !xf.isVideo) return;
             ss << L",\"" << key << L"\":{";
             bool wroteField = false;
             if (xf.isUberBitmap) {
@@ -4813,6 +5046,15 @@ public:
                 if (wroteField) ss << L',';
                 ss << L"\"channel\":";
                 ss << xf.outputChannelIndex;
+                wroteField = true;
+            }
+            if (xf.isVideo) {
+                if (wroteField) ss << L',';
+                ss << L"\"video\":true";
+                ss << L",\"loop\":" << (xf.videoLoop ? L"true" : L"false");
+                ss << L",\"muted\":" << (xf.videoMuted ? L"true" : L"false");
+                ss << L",\"rate\":";
+                WriteFloatValue(ss, xf.videoRate, 1.0f);
             }
             ss << L"}";
         };
@@ -4945,6 +5187,8 @@ public:
             WriteFloatValue(ss, pbr.sssPower, 2.0f);
             ss << L",\"sssScale\":";
             WriteFloatValue(ss, pbr.sssScale, 10.0f);
+        } else if (pbr.materialModel == L"MeshTSLNodeMaterial" && !pbr.tslCode.empty()) {
+            ss << L",\"tslCode\":\"" << EscapeJson(pbr.tslCode.c_str()) << L"\"";
         } else if (IsUtilityMaterialModel(pbr.materialModel)) {
             if (pbr.materialModel == L"MeshBackdropNodeMaterial") {
                 ss << L",\"backdropMode\":";
@@ -5921,19 +6165,26 @@ public:
 
     // ── Transform-only sync ──────────────────────────────────
 
-    void SendTransformSync() {
-        if (!HasTrackedNodes()) return;
+    void SendTransformSync(const std::vector<ULONG>* handles = nullptr) {
+        if (!handles && !HasTrackedNodes()) return;
         Interface* ip = GetCOREInterface();
         if (!ip) return;
         TimeValue t = ip->GetTime();
         const std::uint32_t frameId = AllocateFrameId();
 
+        std::vector<ULONG> scratchHandles;
+        const std::vector<ULONG>* sourceHandles = handles;
+        if (!sourceHandles) {
+            scratchHandles.reserve(geomHandles_.size());
+            for (ULONG handle : geomHandles_) scratchHandles.push_back(handle);
+            sourceHandles = &scratchHandles;
+        }
+
         std::wostringstream ss;
         ss.imbue(std::locale::classic());
         ss << L"{\"type\":\"xform\",\"frame\":" << frameId << L",\"nodes\":[";
         bool first = true;
-        for (auto it = geomHandles_.begin(); it != geomHandles_.end(); ) {
-            ULONG handle = *it;
+        for (ULONG handle : *sourceHandles) {
             INode* node = ip->GetINodeByHandle(handle);
             if (!node) {
                 mtlHashMap_.erase(handle);
@@ -5941,7 +6192,10 @@ public:
                 lightHashMap_.erase(handle);
                 geoHashMap_.erase(handle);
                 lastSentTransforms_.erase(handle);
-                it = geomHandles_.erase(it);
+                continue;
+            }
+
+            if (geomHandles_.find(handle) == geomHandles_.end()) {
                 continue;
             }
             float xform[16]; GetTransform16(node, t, xform);
@@ -5980,7 +6234,6 @@ public:
             }
             ss << L"}";
             first = false;
-            ++it;
         }
         ss << L"],";
         WriteCameraJson(ss);
@@ -5997,8 +6250,125 @@ public:
     Bitmap* asTarget_ = nullptr;
     bool asCapturing_ = false;
     HWND originalParent_ = nullptr;
+    HWND embeddedViewportHwnd_ = nullptr;
     LONG originalStyle_ = 0;
     RECT originalRect_ = {};
+    RECT lastFloatingRect_ = {};
+    bool haveLastFloatingRect_ = false;
+
+    bool IsViewportHosted() const {
+        return originalParent_ != nullptr && embeddedViewportHwnd_ != nullptr;
+    }
+
+    void RequestPanelKill() {
+        if (hwnd_) PostMessage(hwnd_, WM_KILL_PANEL, 0, 0);
+    }
+
+    void RememberFloatingBounds() {
+        if (!hwnd_ || IsViewportHosted() || IsIconic(hwnd_)) return;
+
+        RECT rect = {};
+        if (!GetWindowRect(hwnd_, &rect)) return;
+        if (rect.right <= rect.left || rect.bottom <= rect.top) return;
+
+        lastFloatingRect_ = rect;
+        haveLastFloatingRect_ = true;
+    }
+
+    void NormalizeFloatingWindow(bool forceRecenter = false) {
+        if (!hwnd_ || IsViewportHosted() || !IsWindowVisible(hwnd_) || IsIconic(hwnd_)) return;
+
+        RECT rect = {};
+        if (!GetWindowRect(hwnd_, &rect)) return;
+
+        int width = rect.right - rect.left;
+        int height = rect.bottom - rect.top;
+        if (width < 320 || height < 240) forceRecenter = true;
+
+        HMONITOR monitor = MonitorFromRect(&rect, MONITOR_DEFAULTTONULL);
+        if (!monitor) {
+            HWND anchor = GetCOREInterface() ? GetCOREInterface()->GetMAXHWnd() : hwnd_;
+            monitor = MonitorFromWindow(anchor ? anchor : hwnd_, MONITOR_DEFAULTTOPRIMARY);
+            forceRecenter = true;
+        }
+
+        MONITORINFO mi = {};
+        mi.cbSize = sizeof(mi);
+        if (!GetMonitorInfoW(monitor, &mi)) return;
+
+        const RECT work = mi.rcWork;
+        const int workWidth = std::max(320, static_cast<int>(work.right - work.left));
+        const int workHeight = std::max(240, static_cast<int>(work.bottom - work.top));
+        width = std::clamp(width, 320, workWidth);
+        height = std::clamp(height, 240, workHeight);
+
+        RECT visible = {};
+        if (!IntersectRect(&visible, &rect, &work)) {
+            forceRecenter = true;
+        }
+
+        int x = rect.left;
+        int y = rect.top;
+        if (forceRecenter) {
+            x = static_cast<int>(work.left) + std::max(0, (workWidth - width) / 2);
+            y = static_cast<int>(work.top) + std::max(0, (workHeight - height) / 2);
+        } else {
+            x = std::clamp(x, static_cast<int>(work.left), static_cast<int>(work.right) - width);
+            y = std::clamp(y, static_cast<int>(work.top), static_cast<int>(work.bottom) - height);
+        }
+
+        if (x != rect.left || y != rect.top || width != (rect.right - rect.left) || height != (rect.bottom - rect.top)) {
+            SetWindowPos(hwnd_, nullptr, x, y, width, height,
+                SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        }
+
+        RememberFloatingBounds();
+    }
+
+    bool MaintainViewportHost() {
+        if (!IsViewportHosted()) return true;
+        if (!hwnd_ || !IsWindow(hwnd_) || !IsWindow(embeddedViewportHwnd_)) {
+            RequestPanelKill();
+            return false;
+        }
+        if (GetParent(hwnd_) != embeddedViewportHwnd_ || !IsWindowVisible(embeddedViewportHwnd_)) {
+            RequestPanelKill();
+            return false;
+        }
+
+        RECT vpRect = {};
+        if (!GetClientRect(embeddedViewportHwnd_, &vpRect)) {
+            RequestPanelKill();
+            return false;
+        }
+
+        const int width = vpRect.right - vpRect.left;
+        const int height = vpRect.bottom - vpRect.top;
+        if (width < 64 || height < 64) {
+            RequestPanelKill();
+            return false;
+        }
+
+        SetWindowPos(hwnd_, HWND_TOP, 0, 0, width, height,
+            SWP_NOACTIVATE | SWP_NOCOPYBITS | SWP_SHOWWINDOW);
+        Resize();
+        return true;
+    }
+
+    bool MaintainWindowState() {
+        Interface* ip = GetCOREInterface();
+        if (IsViewportHosted() && ip && ip->IsViewportMaxed()) {
+            RequestPanelKill();
+            return false;
+        }
+
+        if (IsViewportHosted()) {
+            return MaintainViewportHost();
+        }
+
+        NormalizeFloatingWindow(false);
+        return true;
+    }
 
     void StartActiveShade(Bitmap* target) {
         asTarget_ = target;
@@ -6014,38 +6384,51 @@ public:
 
     // Reparent WebView2 into a viewport HWND — true GPU overlay
     void ReparentIntoViewport(HWND viewportHwnd) {
-        if (!hwnd_ || !viewportHwnd) return;
+        if (!hwnd_ || !viewportHwnd || !IsWindow(viewportHwnd)) return;
 
-        // Save original state
-        originalParent_ = GetParent(hwnd_);
-        originalStyle_ = GetWindowLong(hwnd_, GWL_STYLE);
-        GetWindowRect(hwnd_, &originalRect_);
+        if (!IsViewportHosted()) {
+            RememberFloatingBounds();
+            originalParent_ = GetParent(hwnd_);
+            originalStyle_ = GetWindowLong(hwnd_, GWL_STYLE);
+            GetWindowRect(hwnd_, &originalRect_);
+        }
+        embeddedViewportHwnd_ = viewportHwnd;
 
         // Strip window chrome, make it a child of the viewport
-        SetWindowLong(hwnd_, GWL_STYLE, WS_CHILD | WS_VISIBLE);
+        SetWindowLong(hwnd_, GWL_STYLE, WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_CLIPSIBLINGS);
         SetParent(hwnd_, viewportHwnd);
 
         // Fill the viewport
         RECT vpRect;
         GetClientRect(viewportHwnd, &vpRect);
         SetWindowPos(hwnd_, HWND_TOP, 0, 0,
-            vpRect.right, vpRect.bottom, SWP_SHOWWINDOW);
+            vpRect.right, vpRect.bottom, SWP_SHOWWINDOW | SWP_NOACTIVATE | SWP_FRAMECHANGED);
         Resize();
     }
 
     // Restore to original floating window
     void RestoreFromViewport() {
-        if (!hwnd_ || !originalParent_) return;
+        if (!hwnd_ || !IsViewportHosted()) return;
 
-        SetParent(hwnd_, originalParent_);
+        HWND restoreParent = originalParent_;
+        if (!restoreParent || !IsWindow(restoreParent)) {
+            Interface* ip = GetCOREInterface();
+            restoreParent = ip ? ip->GetMAXHWnd() : nullptr;
+        }
+        if (!restoreParent) return;
+
+        SetParent(hwnd_, restoreParent);
         SetWindowLong(hwnd_, GWL_STYLE, originalStyle_);
+        const RECT& restoreRect = haveLastFloatingRect_ ? lastFloatingRect_ : originalRect_;
         SetWindowPos(hwnd_, nullptr,
-            originalRect_.left, originalRect_.top,
-            originalRect_.right - originalRect_.left,
-            originalRect_.bottom - originalRect_.top,
-            SWP_NOZORDER | SWP_SHOWWINDOW | SWP_FRAMECHANGED);
+            restoreRect.left, restoreRect.top,
+            restoreRect.right - restoreRect.left,
+            restoreRect.bottom - restoreRect.top,
+            SWP_NOZORDER | SWP_SHOWWINDOW | SWP_FRAMECHANGED | SWP_NOACTIVATE);
+        embeddedViewportHwnd_ = nullptr;
         originalParent_ = nullptr;
         Resize();
+        NormalizeFloatingWindow(true);
     }
 
     void CaptureActiveShadeFrame() {
@@ -6139,6 +6522,8 @@ public:
         jsReady_ = false;
         useBinary_ = false;
         dirty_ = true;
+        embeddedViewportHwnd_ = nullptr;
+        haveLastFloatingRect_ = false;
         fastDirtyHandles_.clear();
         lastSentTransforms_.clear();
         geomHandles_.clear();
@@ -6166,7 +6551,15 @@ public:
             p = reinterpret_cast<MaxJSPanel*>(GetWindowLongPtr(hwnd, GWLP_USERDATA));
         }
         switch (msg) {
-        case WM_SIZE:  if (p) p->Resize(); return 0;
+        case WM_SIZE:
+            if (p) {
+                p->Resize();
+                p->RememberFloatingBounds();
+            }
+            return 0;
+        case WM_MOVE:
+            if (p) p->RememberFloatingBounds();
+            return 0;
         case WM_FAST_FLUSH:
             if (p) p->FlushFastPath();
             return 0;
@@ -6253,16 +6646,23 @@ static void KillPanel() {
 }
 
 void TogglePanel() {
+    Interface* ip = GetCOREInterface();
+    if (g_panel && g_panel->IsViewportHosted() && ip && ip->IsViewportMaxed()) {
+        KillPanel();
+        return;
+    }
+
     if (!g_panel) {
         g_panel = new MaxJSPanel();
-        g_panel->Create(GetCOREInterface()->GetMAXHWnd());
+        g_panel->Create(ip ? ip->GetMAXHWnd() : nullptr);
     } else if (g_panel->hwnd_ && IsWindowVisible(g_panel->hwnd_)) {
         ShowWindow(g_panel->hwnd_, SW_HIDE);
     } else if (g_panel->hwnd_) {
         ShowWindow(g_panel->hwnd_, SW_SHOW);
+        g_panel->NormalizeFloatingWindow(true);
         g_panel->ReloadWebContent();
     } else {
-        g_panel->Create(GetCOREInterface()->GetMAXHWnd());
+        g_panel->Create(ip ? ip->GetMAXHWnd() : nullptr);
     }
 }
 
@@ -6363,24 +6763,26 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, ULONG fdwReason, LPVOID) {
 }
 
 __declspec(dllexport) const TCHAR* LibDescription()   { return MAXJS_NAME; }
-__declspec(dllexport) int LibNumberClasses()           { return 15; }
+__declspec(dllexport) int LibNumberClasses()           { return 17; }
 __declspec(dllexport) ClassDesc* LibClassDesc(int i) {
     switch (i) {
         case 0: return &maxJSDesc;
         case 1: return GetThreeJSAdvMtlDesc();
         case 2: return GetThreeJSUtilityMtlDesc();
-        case 3: return GetThreeJSRendererDesc();
-        case 4: return GetThreeJSLightLegacyDesc();
-        case 5: return GetThreeJSDirectionalLightDesc();
-        case 6: return GetThreeJSPointLightDesc();
-        case 7: return GetThreeJSSpotLightDesc();
-        case 8: return GetThreeJSRectAreaLightDesc();
-        case 9: return GetThreeJSHemisphereLightDesc();
-        case 10: return GetThreeJSAmbientLightDesc();
-        case 11: return GetThreeJSToonDesc();
-        case 12: return GetThreeJSSplatDesc();
-        case 13: return GetThreeJSFogDesc();
-        case 14: return GetThreeJSSkyDesc();
+        case 3: return GetThreeJSTSLMtlDesc();
+        case 4: return GetThreeJSVideoTexDesc();
+        case 5: return GetThreeJSRendererDesc();
+        case 6: return GetThreeJSLightLegacyDesc();
+        case 7: return GetThreeJSDirectionalLightDesc();
+        case 8: return GetThreeJSPointLightDesc();
+        case 9: return GetThreeJSSpotLightDesc();
+        case 10: return GetThreeJSRectAreaLightDesc();
+        case 11: return GetThreeJSHemisphereLightDesc();
+        case 12: return GetThreeJSAmbientLightDesc();
+        case 13: return GetThreeJSToonDesc();
+        case 14: return GetThreeJSSplatDesc();
+        case 15: return GetThreeJSFogDesc();
+        case 16: return GetThreeJSSkyDesc();
         default: return nullptr;
     }
 }

@@ -72,6 +72,7 @@ static const int kUtilityBackdropMapSlots[] = {
 enum class ThreeJSMaterialKind {
     Physical,
     Utility,
+    TSL,
 };
 
 static bool HasParam(IParamBlock2* pb, ParamID id) {
@@ -140,6 +141,7 @@ public:
     Class_ID ClassID() override {
         switch (kind_) {
             case ThreeJSMaterialKind::Utility: return THREEJS_UTILITY_MTL_CLASS_ID;
+            case ThreeJSMaterialKind::TSL: return THREEJS_TSL_CLASS_ID;
             case ThreeJSMaterialKind::Physical:
             default: return THREEJS_ADV_MTL_CLASS_ID;
         }
@@ -148,6 +150,7 @@ public:
     void GetClassName(MSTR& s, bool localized) const override {
         switch (kind_) {
             case ThreeJSMaterialKind::Utility: s = _T("three.js Utility"); break;
+            case ThreeJSMaterialKind::TSL: s = _T("three.js TSL"); break;
             case ThreeJSMaterialKind::Physical:
             default: s = _T("three.js"); break;
         }
@@ -309,6 +312,7 @@ private:
     ClassDesc2* GetDescriptor() const {
         switch (kind_) {
             case ThreeJSMaterialKind::Utility: return GetThreeJSUtilityMtlDesc();
+            case ThreeJSMaterialKind::TSL: return GetThreeJSTSLMtlDesc();
             case ThreeJSMaterialKind::Physical:
             default: return GetThreeJSAdvMtlDesc();
         }
@@ -345,9 +349,12 @@ static ThreeJSMtlClassDesc threeJSAdvMtlDesc(
     ThreeJSMaterialKind::Physical, THREEJS_ADV_MTL_CLASS_ID, _T("three.js"), _T("ThreeJSAdvMaterial"));
 static ThreeJSMtlClassDesc threeJSUtilityMtlDesc(
     ThreeJSMaterialKind::Utility, THREEJS_UTILITY_MTL_CLASS_ID, _T("three.js Utility"), _T("ThreeJSUtilityMaterial"));
+static ThreeJSMtlClassDesc threeJSTSLMtlDesc(
+    ThreeJSMaterialKind::TSL, THREEJS_TSL_CLASS_ID, _T("three.js TSL"), _T("ThreeJSTSLMaterial"));
 
 ClassDesc2* GetThreeJSAdvMtlDesc() { return &threeJSAdvMtlDesc; }
 ClassDesc2* GetThreeJSUtilityMtlDesc() { return &threeJSUtilityMtlDesc; }
+ClassDesc2* GetThreeJSTSLMtlDesc() { return &threeJSTSLMtlDesc; }
 
 #define THREEJS_COMMON_PARAM_ITEMS \
     pb_color, _T("color"), TYPE_RGBA, P_ANIMATABLE, 0, \
@@ -814,3 +821,233 @@ static ParamBlockDesc2 threejs_utility_pb_desc(
     THREEJS_HIDDEN_LEGACY_PARAM_ITEMS,
     p_end
 );
+
+// ── TSL Material DlgProc ────────────────────────────────────
+class ThreeJSTSLDlgProc : public ParamMap2UserDlgProc {
+public:
+    INT_PTR DlgProc(TimeValue t, IParamMap2* map, HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) override {
+        IParamBlock2* pb = map ? map->GetParamBlock() : nullptr;
+        switch (msg) {
+        case WM_INITDIALOG: {
+            if (pb) {
+                const MCHAR* code = pb->GetStr(pb_tsl_code);
+                if (code && code[0]) SetDlgItemText(hWnd, IDC_TSL_CODE_EDIT, code);
+            }
+            return TRUE;
+        }
+        case WM_COMMAND:
+            if (LOWORD(wParam) == IDC_TSL_LOAD_BTN && HIWORD(wParam) == BN_CLICKED) {
+                OPENFILENAME ofn = {};
+                wchar_t filePath[MAX_PATH] = {};
+                ofn.lStructSize = sizeof(ofn);
+                ofn.hwndOwner = hWnd;
+                ofn.lpstrFilter = L"TSL Files (*.tsl;*.js)\0*.tsl;*.js\0All Files (*.*)\0*.*\0";
+                ofn.lpstrFile = filePath;
+                ofn.nMaxFile = MAX_PATH;
+                ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+                if (GetOpenFileName(&ofn)) {
+                    // Read file
+                    HANDLE hFile = CreateFileW(filePath, GENERIC_READ, FILE_SHARE_READ, nullptr,
+                        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+                    if (hFile != INVALID_HANDLE_VALUE) {
+                        DWORD sz = GetFileSize(hFile, nullptr);
+                        if (sz > 0 && sz != INVALID_FILE_SIZE) {
+                            std::string buf(sz, '\0');
+                            DWORD bytesRead = 0;
+                            ReadFile(hFile, buf.data(), sz, &bytesRead, nullptr);
+                            buf.resize(bytesRead);
+                            // Convert UTF-8 to wide
+                            int wLen = MultiByteToWideChar(CP_UTF8, 0, buf.data(), (int)buf.size(), nullptr, 0);
+                            std::wstring wCode(wLen, L'\0');
+                            MultiByteToWideChar(CP_UTF8, 0, buf.data(), (int)buf.size(), wCode.data(), wLen);
+                            // Set code in edit + PB
+                            SetDlgItemText(hWnd, IDC_TSL_CODE_EDIT, wCode.c_str());
+                            if (pb) pb->SetValue(pb_tsl_code, 0, wCode.c_str());
+                            // Show filename in label
+                            const wchar_t* fname = wcsrchr(filePath, L'\\');
+                            SetDlgItemText(hWnd, IDC_TSL_FILE_LABEL, fname ? fname + 1 : filePath);
+                        }
+                        CloseHandle(hFile);
+                    }
+                }
+                return TRUE;
+            }
+            if (LOWORD(wParam) == IDC_TSL_CODE_EDIT && HIWORD(wParam) == EN_CHANGE) {
+                int len = GetWindowTextLength(GetDlgItem(hWnd, IDC_TSL_CODE_EDIT));
+                std::wstring text(static_cast<size_t>(len) + 1, L'\0');
+                int copied = GetDlgItemText(hWnd, IDC_TSL_CODE_EDIT, text.data(), len + 1);
+                if (copied >= 0) {
+                    text.resize(static_cast<size_t>(copied));
+                } else {
+                    text.clear();
+                }
+                if (pb) pb->SetValue(pb_tsl_code, 0, text.c_str());
+                return TRUE;
+            }
+            break;
+        }
+        return FALSE;
+    }
+    void DeleteThis() override {}
+};
+
+static ThreeJSTSLDlgProc tslDlgProc;
+
+static ParamBlockDesc2 threejs_tsl_pb_desc(
+    threejs_params,
+    _T("three.js TSL Parameters"),
+    IDS_TSL_PARAMS,
+    &threeJSTSLMtlDesc,
+    P_AUTO_CONSTRUCT + P_AUTO_UI,
+    0,
+    IDD_THREEJS_TSL_MTL, IDS_TSL_PARAMS, 0, 0, &tslDlgProc,
+    pb_tsl_code, _T("tslCode"), TYPE_STRING, 0, 0,
+        p_end,
+    p_end
+);
+
+// ══════════════════════════════════════════════════════════════
+//  three.js Video Texture — Texmap for video files in material slots
+// ══════════════════════════════════════════════════════════════
+
+class ThreeJSVideoTex : public Texmap {
+public:
+    IParamBlock2* pblock = nullptr;
+
+    ThreeJSVideoTex(BOOL /*loading*/) {
+        GetThreeJSVideoTexDesc()->MakeAutoParamBlocks(this);
+    }
+    ~ThreeJSVideoTex() override = default;
+
+    void DeleteThis() override { delete this; }
+    Class_ID ClassID() override { return THREEJS_VIDEO_TEX_CLASS_ID; }
+    SClass_ID SuperClassID() override { return TEXMAP_CLASS_ID; }
+    void GetClassName(MSTR& s, bool) const override { s = _T("three.js Video"); }
+
+    int NumRefs() override { return 1; }
+    RefTargetHandle GetReference(int i) override { return i == 0 ? pblock : nullptr; }
+    void SetReference(int i, RefTargetHandle r) override { if (i == 0) pblock = static_cast<IParamBlock2*>(r); }
+    RefResult NotifyRefChanged(const Interval&, RefTargetHandle, PartID&, RefMessage, BOOL) override { return REF_SUCCEED; }
+
+    RefTargetHandle Clone(RemapDir& remap) override {
+        auto* c = new ThreeJSVideoTex(FALSE);
+        *static_cast<MtlBase*>(c) = *static_cast<MtlBase*>(this);
+        BaseClone(this, c, remap);
+        c->ReplaceReference(0, remap.CloneRef(pblock));
+        return c;
+    }
+
+    int NumSubTexmaps() override { return 0; }
+    Texmap* GetSubTexmap(int) override { return nullptr; }
+    void SetSubTexmap(int, Texmap*) override {}
+
+    int NumParamBlocks() override { return 1; }
+    IParamBlock2* GetParamBlock(int i) override { return i == 0 ? pblock : nullptr; }
+    IParamBlock2* GetParamBlockByID(BlockID id) override { return id == threejs_video_params ? pblock : nullptr; }
+
+    ParamDlg* CreateParamDlg(HWND hwMtlEdit, IMtlParams* imp) override {
+        return GetThreeJSVideoTexDesc()->CreateParamDlgs(hwMtlEdit, imp, this);
+    }
+
+    void Update(TimeValue, Interval& valid) override { valid = FOREVER; }
+    Interval Validity(TimeValue) override { return FOREVER; }
+    void Reset() override { GetThreeJSVideoTexDesc()->MakeAutoParamBlocks(this); }
+
+    AColor EvalColor(ShadeContext&) override { return AColor(0.5f, 0.5f, 0.5f, 1.0f); }
+    float EvalMono(ShadeContext& sc) override { return Intens(EvalColor(sc)); }
+    Point3 EvalNormalPerturb(ShadeContext&) override { return Point3(0, 0, 0); }
+
+    IOResult Save(ISave* isave) override { return Texmap::Save(isave); }
+    IOResult Load(ILoad* iload) override { return Texmap::Load(iload); }
+};
+
+class ThreeJSVideoTexClassDesc : public ClassDesc2 {
+public:
+    int IsPublic() override { return TRUE; }
+    void* Create(BOOL loading) override { return new ThreeJSVideoTex(loading); }
+    const TCHAR* ClassName() override { return _T("three.js Video"); }
+    const TCHAR* NonLocalizedClassName() override { return _T("three.js Video"); }
+    SClass_ID SuperClassID() override { return TEXMAP_CLASS_ID; }
+    Class_ID ClassID() override { return THREEJS_VIDEO_TEX_CLASS_ID; }
+    const TCHAR* Category() override { return _T("MaxJS"); }
+    const TCHAR* InternalName() override { return _T("ThreeJSVideoTexture"); }
+    HINSTANCE HInstance() override { return hInstance; }
+};
+
+static ThreeJSVideoTexClassDesc videoTexDesc;
+
+class ThreeJSVideoDlgProc : public ParamMap2UserDlgProc {
+public:
+    INT_PTR DlgProc(TimeValue, IParamMap2* map, HWND hWnd, UINT msg, WPARAM wParam, LPARAM) override {
+        IParamBlock2* pb = map ? map->GetParamBlock() : nullptr;
+        switch (msg) {
+        case WM_INITDIALOG: {
+            if (pb) {
+                const MCHAR* fn = pb->GetStr(pvid_filename);
+                if (fn && fn[0]) {
+                    const wchar_t* name = wcsrchr(fn, L'\\');
+                    SetDlgItemText(hWnd, IDC_VIDEO_FILE_LABEL, name ? name + 1 : fn);
+                    SetDlgItemText(hWnd, IDC_VIDEO_FILE_BTN, name ? name + 1 : fn);
+                }
+            }
+            return TRUE;
+        }
+        case WM_COMMAND:
+            if (LOWORD(wParam) == IDC_VIDEO_FILE_BTN) {
+                OPENFILENAME ofn = {};
+                wchar_t filePath[MAX_PATH] = {};
+                ofn.lStructSize = sizeof(ofn);
+                ofn.hwndOwner = hWnd;
+                ofn.lpstrFilter = L"Video Files (*.mp4;*.webm;*.ogg)\0*.mp4;*.webm;*.ogg\0All Files (*.*)\0*.*\0";
+                ofn.lpstrFile = filePath;
+                ofn.nMaxFile = MAX_PATH;
+                ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+                if (GetOpenFileName(&ofn) && pb) {
+                    pb->SetValue(pvid_filename, 0, filePath);
+                    const wchar_t* name = wcsrchr(filePath, L'\\');
+                    SetDlgItemText(hWnd, IDC_VIDEO_FILE_LABEL, name ? name + 1 : filePath);
+                    SetDlgItemText(hWnd, IDC_VIDEO_FILE_BTN, name ? name + 1 : filePath);
+                }
+                return TRUE;
+            }
+            break;
+        }
+        return FALSE;
+    }
+    void DeleteThis() override {}
+};
+
+static ThreeJSVideoDlgProc videoDlgProc;
+
+static ParamBlockDesc2 threejs_video_pb_desc(
+    threejs_video_params,
+    _T("three.js Video Params"),
+    IDS_VIDEO_TEX_PARAMS,
+    &videoTexDesc,
+    P_AUTO_CONSTRUCT + P_AUTO_UI,
+    0,
+    IDD_THREEJS_VIDEO_TEX, IDS_VIDEO_TEX_PARAMS, 0, 0, &videoDlgProc,
+
+    pvid_filename, _T("filename"), TYPE_FILENAME, 0, 0,
+        p_end,
+
+    pvid_loop, _T("loop"), TYPE_BOOL, 0, 0,
+        p_default, TRUE,
+        p_ui, TYPE_SINGLECHEKBOX, IDC_VIDEO_LOOP,
+        p_end,
+
+    pvid_muted, _T("muted"), TYPE_BOOL, 0, 0,
+        p_default, TRUE,
+        p_ui, TYPE_SINGLECHEKBOX, IDC_VIDEO_MUTED,
+        p_end,
+
+    pvid_rate, _T("playbackRate"), TYPE_FLOAT, P_ANIMATABLE, 0,
+        p_default, 1.0f,
+        p_range, 0.1f, 10.0f,
+        p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_VIDEO_RATE_EDIT, IDC_VIDEO_RATE_SPIN, 0.1f,
+        p_end,
+
+    p_end
+);
+
+ClassDesc2* GetThreeJSVideoTexDesc() { return &videoTexDesc; }

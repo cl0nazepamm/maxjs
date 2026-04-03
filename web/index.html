@@ -116,6 +116,68 @@
             pointer-events: auto;
             transform: translateX(0) scale(1);
         }
+        .sidepanel-left {
+            right: auto;
+            left: 8px;
+            transform: translateX(-14px) scale(0.98);
+        }
+        .sidepanel-left.visible {
+            transform: translateX(0) scale(1);
+        }
+        .sidepanel-left .sidepanel-resize {
+            left: auto;
+            right: 0;
+            border-radius: 0 10px 10px 0;
+        }
+        .layer-item {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            padding: 5px 6px;
+            border-radius: 5px;
+            background: rgba(255, 255, 255, 0.03);
+            border: 1px solid rgba(255, 255, 255, 0.04);
+        }
+        .layer-item.error {
+            border-color: rgba(255, 80, 80, 0.3);
+        }
+        .layer-item.inactive {
+            opacity: 0.45;
+        }
+        .layer-name {
+            flex: 1;
+            font-size: 11px;
+            color: #ccc;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .layer-status {
+            font-size: 9px;
+            color: #666;
+            flex-shrink: 0;
+        }
+        .layer-status.live { color: #40c8b0; }
+        .layer-status.err { color: #ff5050; }
+        .layer-remove {
+            background: rgba(255, 80, 80, 0.1);
+            border: 1px solid rgba(255, 80, 80, 0.2);
+            color: #ff6666;
+            border-radius: 3px;
+            padding: 1px 5px;
+            font: 9px/1 'Segoe UI', system-ui, sans-serif;
+            cursor: pointer;
+            flex-shrink: 0;
+        }
+        .layer-remove:hover {
+            background: rgba(255, 80, 80, 0.25);
+        }
+        .layers-empty {
+            color: #555;
+            font-size: 10px;
+            text-align: center;
+            padding: 12px 0;
+        }
         .sidepanel-header {
             display: flex;
             align-items: center;
@@ -343,9 +405,11 @@
             <button id="btnCamLock" class="active">Cam Lock: ON</button>
             <button id="btnEnv">Env: OFF</button>
             <button id="btnLightProbe" class="active">Probe: ON</button>
+            <button id="btnLayersPanel">Layers</button>
             <button id="btnPostFxPanel">Post FX</button>
         </div>
     </div>
+    <aside id="layersPanel" class="sidepanel sidepanel-left" aria-hidden="true" inert></aside>
     <aside id="postPanel" class="sidepanel" aria-hidden="true" inert></aside>
     <div id="splatLayer" aria-hidden="true"></div>
     <script type="importmap">
@@ -2004,7 +2068,6 @@
             setInfoText('MaxJS - no bridge (standalone mode)');
         }
         window.maxJS = bridge;
-        window.THREE = THREE;
 
         // ── Scene Sync ──────────────────────────────────────
         bridge.on('scene', msg => {
@@ -2992,6 +3055,68 @@
 
         // Toon outline is automatic — no UI button needed
 
+        // ── Layers Panel ─────────────────────────────────
+        const btnLayersPanel = document.getElementById('btnLayersPanel');
+        const layersPanel = document.getElementById('layersPanel');
+        let layersPanelVisible = false;
+        let layersPanelDirty = true;
+
+        function setLayersPanelVisible(visible) {
+            layersPanelVisible = !!visible;
+            if (!layersPanelVisible) {
+                const ae = document.activeElement;
+                if (ae instanceof HTMLElement && layersPanel.contains(ae)) btnLayersPanel.focus();
+            }
+            layersPanel.classList.toggle('visible', layersPanelVisible);
+            layersPanel.toggleAttribute('inert', !layersPanelVisible);
+            layersPanel.setAttribute('aria-hidden', String(!layersPanelVisible));
+            if (layersPanelVisible) refreshLayersPanel();
+        }
+
+        let _layerManagerRef = null;
+        function refreshLayersPanel() {
+            if (!layersPanelVisible || !_layerManagerRef) return;
+            const layers = _layerManagerRef.list();
+            const itemsHtml = layers.length === 0
+                ? '<div class="layers-empty">No layers — drop .js files in %TEMP%/maxjs_layers/</div>'
+                : layers.map(l => `
+                    <div class="layer-item${l.error ? ' error' : ''}${!l.active ? ' inactive' : ''}">
+                        <span class="layer-name" title="${l.name}">${l.name}</span>
+                        <span class="layer-status ${l.error ? 'err' : 'live'}">${l.error ? 'ERR' : 'LIVE'}</span>
+                        <button class="layer-remove" data-layer-id="${l.id}">x</button>
+                    </div>
+                `).join('');
+
+            layersPanel.innerHTML = `
+                <div class="sidepanel-header">
+                    <div>
+                        <div class="sidepanel-title">Layers</div>
+                        <div class="sidepanel-subtitle">${layers.length} active</div>
+                    </div>
+                    <div style="display:flex;gap:4px">
+                        <button id="layersClearBtn">Clear All</button>
+                        <button id="layersHideBtn">Hide</button>
+                    </div>
+                </div>
+                <div class="sidepanel-body">${itemsHtml}</div>
+            `;
+
+            layersPanel.querySelector('#layersHideBtn')?.addEventListener('click', () => setLayersPanelVisible(false));
+            layersPanel.querySelector('#layersClearBtn')?.addEventListener('click', () => {
+                _layerManagerRef?.clear();
+                refreshLayersPanel();
+            });
+            layersPanel.querySelectorAll('.layer-remove').forEach(btn => {
+                btn.addEventListener('click', () => {
+                    _layerManagerRef?.remove(btn.dataset.layerId);
+                    refreshLayersPanel();
+                });
+            });
+        }
+
+        btnLayersPanel.addEventListener('click', () => setLayersPanelVisible(!layersPanelVisible));
+        setInterval(() => { if (layersPanelVisible) refreshLayersPanel(); }, 1000);
+
         const btnPostFxPanel = document.getElementById('btnPostFxPanel');
         const postPanel = document.getElementById('postPanel');
         let postPanelVisible = false;
@@ -3844,9 +3969,7 @@
         layerManager.bindProjectRuntime(projectRuntime);
         window.maxJSProjectRuntime = projectRuntime;
         window.maxJS.layers = layerManager;
-        window.maxJS.scene = scene;
-        window.maxJS.camera = camera;
-        window.maxJS.renderer = renderer;
+        _layerManagerRef = layerManager;
 
         bridge.on('js_inline', msg => {
             switch (msg.action) {

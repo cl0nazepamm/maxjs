@@ -264,22 +264,22 @@ function createRendererFacade(renderer) {
     });
 }
 
-function buildInlineFactory(code) {
-    const prelude = [
-        '"use strict";',
-        'const window = undefined;',
-        'const document = undefined;',
-        'const globalThis = undefined;',
-        'const self = undefined;',
-        'const chrome = undefined;',
-        'const fetch = undefined;',
-        'const XMLHttpRequest = undefined;',
-        'const WebSocket = undefined;',
-        'const localStorage = undefined;',
-        'const sessionStorage = undefined;',
-    ].join('\n');
+const SANDBOX_PRELUDE = [
+    '"use strict";',
+    'const window = undefined;',
+    'const document = undefined;',
+    'const globalThis = undefined;',
+    'const self = undefined;',
+    'const chrome = undefined;',
+    'const fetch = undefined;',
+    'const XMLHttpRequest = undefined;',
+    'const WebSocket = undefined;',
+    'const localStorage = undefined;',
+    'const sessionStorage = undefined;',
+].join('\n');
 
-    return new Function('ctx', 'THREE', `${prelude}\n${code}`);
+function buildInlineFactory(code) {
+    return new Function('ctx', 'THREE', `${SANDBOX_PRELUDE}\n${code}`);
 }
 
 export function createLayerManager({

@@ -62,7 +62,6 @@ using namespace Microsoft::WRL;
 #define WM_TOGGLE_PANEL           (WM_USER + 1)
 #define WM_FAST_FLUSH             (WM_USER + 2)
 #define WM_KILL_PANEL             (WM_USER + 3)
-#define WM_JS_INLINE              (WM_USER + 4)
 #define SETUP_TIMER_ID            2
 #define AS_TIMER_ID               3
 #define AS_INTERVAL_MS            66   // ~15fps ActiveShade
@@ -2729,11 +2728,14 @@ public:
         return Utf8ToWide(buf);
     }
 
-    static std::wstring GetInlineLayerDir() {
-        wchar_t temp[MAX_PATH];
-        GetTempPathW(MAX_PATH, temp);
-        std::wstring dir = std::wstring(temp) + L"maxjs_layers\\";
-        CreateDirectoryW(dir.c_str(), nullptr);
+    static const std::wstring& GetInlineLayerDir() {
+        static std::wstring dir;
+        if (dir.empty()) {
+            wchar_t temp[MAX_PATH];
+            GetTempPathW(MAX_PATH, temp);
+            dir = std::wstring(temp) + L"maxjs_layers\\";
+            CreateDirectoryW(dir.c_str(), nullptr);
+        }
         return dir;
     }
 
@@ -5772,58 +5774,11 @@ static void RegisterMaxScript() {
         L")\r\n",
         (long long)(intptr_t)g_helperHwnd, (int)WM_TOGGLE_PANEL);
     ExecuteMAXScriptScript(script, MAXScript::ScriptSource::NonEmbedded);
-
-    // JS_Inline MAXScript functions
-    // Python MCP writes JS code to %TEMP%/maxjs_inline/<id>.js, then calls these.
-    wchar_t inlineScript[4096];
-    swprintf_s(inlineScript, 4096,
-        L"global maxjs_js_inline\r\n"
-        L"fn maxjs_js_inline id filePath name:\"\" = (\r\n"
-        L"    local cmdFile = (getDir #temp) + \"\\\\maxjs_inline_cmd.txt\"\r\n"
-        L"    local f = createFile cmdFile\r\n"
-        L"    format \"inject\\n%%\\n%%\\n%%\\n\" id filePath name to:f\r\n"
-        L"    close f\r\n"
-        L"    windows.sendMessage %lld %d 0 0\r\n"
-        L"    true\r\n"
-        L")\r\n"
-        L"global maxjs_js_remove\r\n"
-        L"fn maxjs_js_remove id = (\r\n"
-        L"    local cmdFile = (getDir #temp) + \"\\\\maxjs_inline_cmd.txt\"\r\n"
-        L"    local f = createFile cmdFile\r\n"
-        L"    format \"remove\\n%%\\n\\n\\n\" id to:f\r\n"
-        L"    close f\r\n"
-        L"    windows.sendMessage %lld %d 0 0\r\n"
-        L"    true\r\n"
-        L")\r\n"
-        L"global maxjs_js_list\r\n"
-        L"fn maxjs_js_list = (\r\n"
-        L"    local cmdFile = (getDir #temp) + \"\\\\maxjs_inline_cmd.txt\"\r\n"
-        L"    local f = createFile cmdFile\r\n"
-        L"    format \"list\\n\\n\\n\\n\" to:f\r\n"
-        L"    close f\r\n"
-        L"    windows.sendMessage %lld %d 0 0\r\n"
-        L"    true\r\n"
-        L")\r\n"
-        L"global maxjs_js_clear\r\n"
-        L"fn maxjs_js_clear = (\r\n"
-        L"    local cmdFile = (getDir #temp) + \"\\\\maxjs_inline_cmd.txt\"\r\n"
-        L"    local f = createFile cmdFile\r\n"
-        L"    format \"clear\\n\\n\\n\\n\" to:f\r\n"
-        L"    close f\r\n"
-        L"    windows.sendMessage %lld %d 0 0\r\n"
-        L"    true\r\n"
-        L")\r\n",
-        (long long)(intptr_t)g_helperHwnd, (int)WM_JS_INLINE,
-        (long long)(intptr_t)g_helperHwnd, (int)WM_JS_INLINE,
-        (long long)(intptr_t)g_helperHwnd, (int)WM_JS_INLINE,
-        (long long)(intptr_t)g_helperHwnd, (int)WM_JS_INLINE);
-    ExecuteMAXScriptScript(inlineScript, MAXScript::ScriptSource::NonEmbedded);
 }
 
 static LRESULT CALLBACK HelperWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
     case WM_TOGGLE_PANEL: TogglePanel(); return 0;
-    case WM_JS_INLINE: if (g_panel) g_panel->ScanInlineLayers(); return 0;
     case WM_TIMER:
         if (wParam == SETUP_TIMER_ID) { KillTimer(hwnd, SETUP_TIMER_ID); RegisterMaxScript(); }
         return 0;

@@ -390,11 +390,21 @@
         import { createPerfHud } from './js/perf_hud.js';
         import { createSSGIController } from './js/ssgi_fx.js';
         import { createLayerManager } from './js/layer_manager.js';
+        import { createProjectRuntime } from './js/project_runtime.js';
 
         // ── Scene Setup (Z-up, matching Max) ────────────────
         const hiddenBackgroundColor = 0x353535;
         const scene = new THREE.Scene();
         scene.background = new THREE.Color(hiddenBackgroundColor);
+        const maxRoot = new THREE.Group();
+        maxRoot.name = '__maxjs_max_root__';
+        scene.add(maxRoot);
+        const jsRoot = new THREE.Group();
+        jsRoot.name = '__maxjs_js_root__';
+        scene.add(jsRoot);
+        const overlayRoot = new THREE.Group();
+        overlayRoot.name = '__maxjs_overlay_root__';
+        scene.add(overlayRoot);
 
         const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.1, 100000);
         camera.up.set(0, 0, 1);  // Z-up to match Max
@@ -467,7 +477,7 @@
         // Grid on XY plane (Z-up)
         const grid = new THREE.GridHelper(200, 20, 0x555555, 0x444444);
         grid.rotation.x = Math.PI / 2;  // Rotate to XY plane for Z-up
-        scene.add(grid);
+        overlayRoot.add(grid);
 
         // Lights (fallback, hidden when HDRI loads)
         // Default lighting — neutral, camera-aligned
@@ -1994,6 +2004,7 @@
             setInfoText('MaxJS - no bridge (standalone mode)');
         }
         window.maxJS = bridge;
+        window.THREE = THREE;
 
         // ── Scene Sync ──────────────────────────────────────
         bridge.on('scene', msg => {
@@ -2006,7 +2017,7 @@
 
             for (const [handle, mesh] of nodeMap) {
                 if (!incoming.has(handle)) {
-                    scene.remove(mesh);
+                    maxRoot.remove(mesh);
                     mesh.geometry.dispose();
                     nodeMap.delete(handle);
                 }
@@ -2054,7 +2065,7 @@
                     mesh.matrixAutoUpdate = false;
                     mesh.name = nd.n;
                     mesh.frustumCulled = false;
-                    scene.add(mesh);
+                    maxRoot.add(mesh);
                     nodeMap.set(nd.h, mesh);
                 }
 
@@ -2188,7 +2199,7 @@
             }
             for (const handle of toRemove) {
                 const mesh = nodeMap.get(handle);
-                scene.remove(mesh);
+                maxRoot.remove(mesh);
                 const isShared = [...nodeMap.values()].some(m => m !== mesh && m.geometry === mesh.geometry);
                 if (!isShared) mesh.geometry.dispose();
                 nodeMap.delete(handle);
@@ -2289,7 +2300,7 @@
                     mesh.matrixAutoUpdate = false;
                     mesh.name = nd.n;
                     mesh.frustumCulled = false;
-                    scene.add(mesh);
+                    maxRoot.add(mesh);
                     nodeMap.set(nd.h, mesh);
                 }
 
@@ -2424,7 +2435,7 @@
         // ── Lights Sync ──────────────────────────────────────
         const lightGroup = new THREE.Group();
         lightGroup.name = '__maxjs_lights';
-        scene.add(lightGroup);
+        maxRoot.add(lightGroup);
         const LIGHT_TYPES = ['DirectionalLight', 'PointLight', 'SpotLight', 'RectAreaLight', 'HemisphereLight', 'AmbientLight'];
         const lightHandleMap = new Map();
         const shadowBounds = new THREE.Box3();
@@ -2637,7 +2648,7 @@
         function applyForestInstances(groups) {
             // Remove old forest meshes
             for (const [key, mesh] of forestMeshes) {
-                scene.remove(mesh);
+                maxRoot.remove(mesh);
                 mesh.geometry.dispose();
                 mesh.dispose();
             }
@@ -2691,7 +2702,7 @@
                 }
                 instMesh.instanceMatrix.needsUpdate = true;
 
-                scene.add(instMesh);
+                maxRoot.add(instMesh);
                 forestMeshes.set(`${grp.src}`, instMesh);
             }
         }
@@ -2819,7 +2830,7 @@
         function applyVolumes(volumes) {
             // Remove old volume meshes
             for (const [key, mesh] of volumeMeshes) {
-                scene.remove(mesh);
+                maxRoot.remove(mesh);
                 if (mesh.userData._volumeTex) mesh.userData._volumeTex.dispose();
                 mesh.material.dispose();
                 mesh.geometry.dispose();
@@ -2856,7 +2867,7 @@
                 );
 
                 mesh.name = `volume_${vol.h}_${vi}`;
-                scene.add(mesh);
+                maxRoot.add(mesh);
                 volumeMeshes.set(`${vol.h}_${vi}`, mesh);
                 rendered++;
             }
@@ -3828,13 +3839,21 @@
 
         // ── JS_Inline Layer Manager ──────────────────────────
         const inlineClock = new THREE.Clock();
-        const layerManager = createLayerManager({ scene, camera, renderer, THREE, nodeMap });
+        const layerManager = createLayerManager({ scene, camera, renderer, THREE, nodeMap, maxRoot, jsRoot, overlayRoot });
+        const projectRuntime = createProjectRuntime({ layerManager, bridge, perfHud });
+        layerManager.bindProjectRuntime(projectRuntime);
+        window.maxJSProjectRuntime = projectRuntime;
+        window.maxJS.layers = layerManager;
+        window.maxJS.scene = scene;
+        window.maxJS.camera = camera;
+        window.maxJS.renderer = renderer;
 
         bridge.on('js_inline', msg => {
             switch (msg.action) {
                 case 'inject': case 'update': {
-                    const result = layerManager.inject(msg.id, msg.code, msg.name);
-                    bridge.send('js_inline_result', { id: msg.id, error: result.error || null });
+                    void layerManager.inject(msg.id, msg.code, msg.name).then(result => {
+                        bridge.send('js_inline_result', { id: msg.id, error: result?.error || null });
+                    });
                     break;
                 }
                 case 'remove': layerManager.remove(msg.id); break;

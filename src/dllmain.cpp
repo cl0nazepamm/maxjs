@@ -62,6 +62,7 @@ using namespace Microsoft::WRL;
 #define WM_TOGGLE_PANEL           (WM_USER + 1)
 #define WM_FAST_FLUSH             (WM_USER + 2)
 #define WM_KILL_PANEL             (WM_USER + 3)
+#define WM_JS_INLINE              (WM_USER + 4)
 #define SETUP_TIMER_ID            2
 #define AS_TIMER_ID               3
 #define AS_INTERVAL_MS            66   // ~15fps ActiveShade
@@ -2711,6 +2712,91 @@ public:
     MaxJSFastRedrawCallback fastRedrawCallback_;
     MaxJSFastTimeChangeCallback fastTimeChangeCallback_;
 
+    // ── JS_Inline hot folder ──────────────────────────
+    std::unordered_map<std::wstring, ULONGLONG> inlineFileStamps_;  // filename → last write time
+
+    static std::wstring ReadUtf8File(const std::wstring& path) {
+        HANDLE hFile = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (hFile == INVALID_HANDLE_VALUE) return {};
+        DWORD fileSize = GetFileSize(hFile, nullptr);
+        if (fileSize == 0 || fileSize == INVALID_FILE_SIZE) { CloseHandle(hFile); return {}; }
+        std::string buf(fileSize, '\0');
+        DWORD bytesRead = 0;
+        ReadFile(hFile, buf.data(), fileSize, &bytesRead, nullptr);
+        CloseHandle(hFile);
+        buf.resize(bytesRead);
+        return Utf8ToWide(buf);
+    }
+
+    static std::wstring GetInlineLayerDir() {
+        wchar_t temp[MAX_PATH];
+        GetTempPathW(MAX_PATH, temp);
+        std::wstring dir = std::wstring(temp) + L"maxjs_layers\\";
+        CreateDirectoryW(dir.c_str(), nullptr);
+        return dir;
+    }
+
+    void ScanInlineLayers() {
+        if (!webview_ || !jsReady_) return;
+
+        const std::wstring dir = GetInlineLayerDir();
+        const std::wstring pattern = dir + L"*.js";
+
+        // Track which files still exist this scan
+        std::unordered_set<std::wstring> seen;
+
+        WIN32_FIND_DATAW fd;
+        HANDLE hFind = FindFirstFileW(pattern.c_str(), &fd);
+        if (hFind != INVALID_HANDLE_VALUE) {
+            do {
+                if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+                const std::wstring filename(fd.cFileName);
+                seen.insert(filename);
+
+                // Compute write stamp
+                ULONGLONG stamp = ((ULONGLONG)fd.ftLastWriteTime.dwHighDateTime << 32)
+                                | fd.ftLastWriteTime.dwLowDateTime;
+
+                auto it = inlineFileStamps_.find(filename);
+                if (it != inlineFileStamps_.end() && it->second == stamp) continue;
+
+                // New or modified — inject
+                const std::wstring filePath = dir + filename;
+                std::wstring code = ReadUtf8File(filePath);
+                if (code.empty()) continue;
+
+                // Layer ID = filename without .js
+                std::wstring id = filename;
+                if (id.size() > 3) id.resize(id.size() - 3);
+
+                std::wostringstream ss;
+                ss << L"{\"type\":\"js_inline\",\"action\":\"inject\",\"id\":\""
+                   << EscapeJson(id.c_str()) << L"\",\"name\":\""
+                   << EscapeJson(id.c_str()) << L"\",\"code\":\""
+                   << EscapeJson(code.c_str()) << L"\"}";
+                webview_->PostWebMessageAsJson(ss.str().c_str());
+                inlineFileStamps_[filename] = stamp;
+            } while (FindNextFileW(hFind, &fd));
+            FindClose(hFind);
+        }
+
+        // Remove layers whose files were deleted
+        for (auto it = inlineFileStamps_.begin(); it != inlineFileStamps_.end(); ) {
+            if (seen.find(it->first) == seen.end()) {
+                std::wstring id = it->first;
+                if (id.size() > 3) id.resize(id.size() - 3);
+                std::wostringstream ss;
+                ss << L"{\"type\":\"js_inline\",\"action\":\"remove\",\"id\":\""
+                   << EscapeJson(id.c_str()) << L"\"}";
+                webview_->PostWebMessageAsJson(ss.str().c_str());
+                it = inlineFileStamps_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
     MaxJSPanel()
         : fastNodeEvents_(this)
         , fastRedrawCallback_(this)
@@ -2889,6 +2975,42 @@ public:
         std::wstring d(p); d = d.substr(0, d.find_last_of(L"\\/"));
         std::wstring w = d + L"\\maxjs_web";
         return DirectoryExists(w) ? w : std::wstring{};
+    }
+
+    std::wstring GetProjectDir() {
+        std::wstring envProjectDir = GetEnvironmentString(L"MAXJS_PROJECT_DIR");
+        if (!envProjectDir.empty()) {
+            return envProjectDir;
+        }
+
+#ifdef MAXJS_SOURCE_WEB_DIR
+        std::wstring sourceWebDir = Utf8ToWide(MAXJS_SOURCE_WEB_DIR);
+        std::replace(sourceWebDir.begin(), sourceWebDir.end(), L'/', L'\\');
+        const size_t split = sourceWebDir.find_last_of(L"\\/");
+        if (split != std::wstring::npos) {
+            const std::wstring repoRoot = sourceWebDir.substr(0, split);
+            const std::wstring repoProjectDir = repoRoot + L"\\projects\\active";
+            if (DirectoryExists(repoProjectDir)) {
+                return repoProjectDir;
+            }
+        }
+#endif
+
+        wchar_t p[MAX_PATH];
+        GetModuleFileNameW(hInstance, p, MAX_PATH);
+        std::wstring d(p); d = d.substr(0, d.find_last_of(L"\\/"));
+        return d + L"\\maxjs_projects\\active";
+    }
+
+    void SendProjectConfig() {
+        if (!webview_) return;
+
+        const std::wstring projectDir = GetProjectDir();
+        std::wostringstream ss;
+        ss << L"{\"type\":\"project_config\",\"dir\":\""
+           << EscapeJson(projectDir.c_str())
+           << L"\",\"pollMs\":1200}";
+        webview_->PostWebMessageAsJson(ss.str().c_str());
     }
 
     void ClearWebMappings() {
@@ -3394,11 +3516,13 @@ public:
             splatHashMap_.clear();
             propHashMap_.clear();
             geoHashMap_.clear();  // force all geometry to be sent
+            inlineFileStamps_.clear();  // re-scan inline layers on reconnect
             lastSentTransforms_.clear();
             lightHandles_.clear();
             splatHandles_.clear();
             geoScanCursor_ = 0;
             ResetFastPathState(false);
+            SendProjectConfig();
         }
     }
 
@@ -3427,6 +3551,7 @@ public:
             if (tickCount_ % 15 == 0) DetectGeometryChanges();
             if (tickCount_ % 15 == 0) DetectPluginInstanceChanges();
             if (tickCount_ % LIGHT_DETECT_TICKS == 0) PollViewportModes();
+            if (tickCount_ % 15 == 0) ScanInlineLayers();
         }
     }
 
@@ -5647,11 +5772,58 @@ static void RegisterMaxScript() {
         L")\r\n",
         (long long)(intptr_t)g_helperHwnd, (int)WM_TOGGLE_PANEL);
     ExecuteMAXScriptScript(script, MAXScript::ScriptSource::NonEmbedded);
+
+    // JS_Inline MAXScript functions
+    // Python MCP writes JS code to %TEMP%/maxjs_inline/<id>.js, then calls these.
+    wchar_t inlineScript[4096];
+    swprintf_s(inlineScript, 4096,
+        L"global maxjs_js_inline\r\n"
+        L"fn maxjs_js_inline id filePath name:\"\" = (\r\n"
+        L"    local cmdFile = (getDir #temp) + \"\\\\maxjs_inline_cmd.txt\"\r\n"
+        L"    local f = createFile cmdFile\r\n"
+        L"    format \"inject\\n%%\\n%%\\n%%\\n\" id filePath name to:f\r\n"
+        L"    close f\r\n"
+        L"    windows.sendMessage %lld %d 0 0\r\n"
+        L"    true\r\n"
+        L")\r\n"
+        L"global maxjs_js_remove\r\n"
+        L"fn maxjs_js_remove id = (\r\n"
+        L"    local cmdFile = (getDir #temp) + \"\\\\maxjs_inline_cmd.txt\"\r\n"
+        L"    local f = createFile cmdFile\r\n"
+        L"    format \"remove\\n%%\\n\\n\\n\" id to:f\r\n"
+        L"    close f\r\n"
+        L"    windows.sendMessage %lld %d 0 0\r\n"
+        L"    true\r\n"
+        L")\r\n"
+        L"global maxjs_js_list\r\n"
+        L"fn maxjs_js_list = (\r\n"
+        L"    local cmdFile = (getDir #temp) + \"\\\\maxjs_inline_cmd.txt\"\r\n"
+        L"    local f = createFile cmdFile\r\n"
+        L"    format \"list\\n\\n\\n\\n\" to:f\r\n"
+        L"    close f\r\n"
+        L"    windows.sendMessage %lld %d 0 0\r\n"
+        L"    true\r\n"
+        L")\r\n"
+        L"global maxjs_js_clear\r\n"
+        L"fn maxjs_js_clear = (\r\n"
+        L"    local cmdFile = (getDir #temp) + \"\\\\maxjs_inline_cmd.txt\"\r\n"
+        L"    local f = createFile cmdFile\r\n"
+        L"    format \"clear\\n\\n\\n\\n\" to:f\r\n"
+        L"    close f\r\n"
+        L"    windows.sendMessage %lld %d 0 0\r\n"
+        L"    true\r\n"
+        L")\r\n",
+        (long long)(intptr_t)g_helperHwnd, (int)WM_JS_INLINE,
+        (long long)(intptr_t)g_helperHwnd, (int)WM_JS_INLINE,
+        (long long)(intptr_t)g_helperHwnd, (int)WM_JS_INLINE,
+        (long long)(intptr_t)g_helperHwnd, (int)WM_JS_INLINE);
+    ExecuteMAXScriptScript(inlineScript, MAXScript::ScriptSource::NonEmbedded);
 }
 
 static LRESULT CALLBACK HelperWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
     case WM_TOGGLE_PANEL: TogglePanel(); return 0;
+    case WM_JS_INLINE: if (g_panel) g_panel->ScanInlineLayers(); return 0;
     case WM_TIMER:
         if (wParam == SETUP_TIMER_ID) { KillTimer(hwnd, SETUP_TIMER_ID); RegisterMaxScript(); }
         return 0;

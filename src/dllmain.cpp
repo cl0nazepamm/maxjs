@@ -8,6 +8,7 @@
 #include <polyobj.h>
 #include <iepoly.h>
 #include <iEPolyMod.h>
+#include <gencam.h>
 #include <mnmesh.h>
 #include <splshape.h>
 #include <notify.h>
@@ -4389,6 +4390,440 @@ public:
         return true;
     }
 
+    struct SnapshotNodeRecord {
+        ULONG handle = 0;
+        INode* node = nullptr;
+        bool visible = true;
+        bool spline = false;
+        std::vector<float> verts, uvs, norms;
+        std::vector<int> indices;
+        std::vector<MatGroup> groups;
+        size_t vOff = 0, iOff = 0, uvOff = 0, nOff = 0;
+    };
+
+    struct SnapshotAnimationTrackDef {
+        std::wstring path;
+        std::wstring type;
+        std::wstring interpolation;
+        std::vector<float> times;
+        std::vector<float> values;
+        std::vector<unsigned char> boolValues;
+        bool isBoolean = false;
+    };
+
+    struct SnapshotAnimationTargetDef {
+        std::wstring target;
+        std::vector<SnapshotAnimationTrackDef> tracks;
+    };
+
+    static Point3 MaxPointToWorld(const Point3& point) {
+        return Point3(point.x, point.z, -point.y);
+    }
+
+    static bool NearlyEqualPoint3(const Point3& a, const Point3& b, float epsilon = 1.0e-4f) {
+        return std::fabs(a.x - b.x) <= epsilon &&
+               std::fabs(a.y - b.y) <= epsilon &&
+               std::fabs(a.z - b.z) <= epsilon;
+    }
+
+    static double GetAnimationTicksPerSecond() {
+        const int ticksPerFrame = GetTicksPerFrame();
+        const int frameRate = GetFrameRate();
+        const double ticksPerSecond = static_cast<double>(ticksPerFrame) * static_cast<double>(frameRate);
+        return ticksPerSecond > 0.0 ? ticksPerSecond : 4800.0;
+    }
+
+    static float TimeValueToAnimationSeconds(TimeValue value, TimeValue rangeStart) {
+        return static_cast<float>(
+            static_cast<double>(value - rangeStart) / GetAnimationTicksPerSecond());
+    }
+
+    static void AppendUniqueTimeValue(std::vector<TimeValue>& times, TimeValue value) {
+        if (std::find(times.begin(), times.end(), value) == times.end()) {
+            times.push_back(value);
+        }
+    }
+
+    static void SortUniqueTimeValues(std::vector<TimeValue>& times) {
+        std::sort(times.begin(), times.end());
+        times.erase(std::unique(times.begin(), times.end()), times.end());
+    }
+
+    static void CollectAnimatableKeyTimesRecursive(Animatable* anim,
+                                                   const Interval& range,
+                                                   std::vector<TimeValue>& times,
+                                                   std::unordered_set<const Animatable*>& visited) {
+        if (!anim || visited.find(anim) != visited.end()) return;
+        visited.insert(anim);
+
+        Tab<TimeValue> keyTimes;
+        if (anim->GetKeyTimes(keyTimes, range, 0) > 0) {
+            for (int i = 0; i < keyTimes.Count(); ++i) {
+                const TimeValue time = keyTimes[i];
+                if (time >= range.Start() && time <= range.End()) {
+                    AppendUniqueTimeValue(times, time);
+                }
+            }
+        }
+
+        const int subCount = anim->NumSubs();
+        for (int i = 0; i < subCount; ++i) {
+            Animatable* sub = anim->SubAnim(i);
+            if (!sub || sub == anim) continue;
+            CollectAnimatableKeyTimesRecursive(sub, range, times, visited);
+        }
+    }
+
+    static void AppendFrameSampleTimes(std::vector<TimeValue>& times, const Interval& range) {
+        int step = GetTicksPerFrame();
+        if (step <= 0) step = 160;
+        for (TimeValue t = range.Start(); t <= range.End(); t += step) {
+            AppendUniqueTimeValue(times, t);
+        }
+        AppendUniqueTimeValue(times, range.End());
+    }
+
+    static bool BuildAnimatableTimeSamples(Animatable* anim,
+                                           const Interval& range,
+                                           TimeValue currentTime,
+                                           std::vector<TimeValue>& outTimes) {
+        if (!anim) return false;
+
+        std::vector<TimeValue> localTimes;
+        std::unordered_set<const Animatable*> visited;
+        CollectAnimatableKeyTimesRecursive(anim, range, localTimes, visited);
+
+        const bool animated = anim->IsAnimated() != FALSE;
+        if (animated && localTimes.empty()) {
+            AppendFrameSampleTimes(localTimes, range);
+        }
+        if (localTimes.empty()) {
+            return animated;
+        }
+
+        AppendUniqueTimeValue(localTimes, range.Start());
+        AppendUniqueTimeValue(localTimes, range.End());
+        if (currentTime >= range.Start() && currentTime <= range.End()) {
+            AppendUniqueTimeValue(localTimes, currentTime);
+        }
+        SortUniqueTimeValues(localTimes);
+        outTimes.insert(outTimes.end(), localTimes.begin(), localTimes.end());
+        return true;
+    }
+
+    static bool BuildNodeAnimationTarget(INode* node,
+                                         const Interval& range,
+                                         TimeValue currentTime,
+                                         SnapshotAnimationTargetDef& outTarget) {
+        if (!node) return false;
+
+        std::vector<TimeValue> discoveryTimes;
+        const bool hasTransformAnimation =
+            BuildAnimatableTimeSamples(node->GetTMController(), range, currentTime, discoveryTimes);
+        const bool hasVisibilityAnimation =
+            BuildAnimatableTimeSamples(node->GetVisController(), range, currentTime, discoveryTimes);
+        if (!hasTransformAnimation && !hasVisibilityAnimation) {
+            return false;
+        }
+
+        std::vector<TimeValue> sampleTimes;
+        AppendFrameSampleTimes(sampleTimes, range);
+        SortUniqueTimeValues(sampleTimes);
+        if (sampleTimes.size() < 2) {
+            return false;
+        }
+
+        SnapshotAnimationTrackDef matrixTrack;
+        matrixTrack.path = L"matrix";
+        matrixTrack.type = L"matrix16";
+        matrixTrack.interpolation = L"linear";
+
+        SnapshotAnimationTrackDef visibilityTrack;
+        visibilityTrack.path = L"visible";
+        visibilityTrack.type = L"boolean";
+        visibilityTrack.interpolation = L"step";
+        visibilityTrack.isBoolean = true;
+
+        bool matrixChanged = false;
+        bool visChanged = false;
+        bool havePrevious = false;
+        float previousMatrix[16] = {};
+        bool previousVisible = true;
+
+        for (TimeValue sampleTime : sampleTimes) {
+            const float seconds = TimeValueToAnimationSeconds(sampleTime, range.Start());
+            float matrixValues[16];
+            GetTransform16(node, sampleTime, matrixValues);
+
+            const bool visible =
+                !node->IsNodeHidden(TRUE) && node->GetVisibility(sampleTime) > 0.0f;
+
+            matrixTrack.times.push_back(seconds);
+            matrixTrack.values.insert(
+                matrixTrack.values.end(),
+                matrixValues,
+                matrixValues + 16);
+
+            visibilityTrack.times.push_back(seconds);
+            visibilityTrack.boolValues.push_back(visible ? 1 : 0);
+
+            if (havePrevious) {
+                if (!TransformEquals16(matrixValues, previousMatrix)) matrixChanged = true;
+                if (visible != previousVisible) visChanged = true;
+            }
+
+            std::copy(std::begin(matrixValues), std::end(matrixValues), previousMatrix);
+            previousVisible = visible;
+            havePrevious = true;
+        }
+
+        outTarget.target = L"handle:" + std::to_wstring(node->GetHandle());
+        if (matrixChanged) outTarget.tracks.push_back(std::move(matrixTrack));
+        if (visChanged) outTarget.tracks.push_back(std::move(visibilityTrack));
+        return !outTarget.tracks.empty();
+    }
+
+    static bool BuildActiveCameraAnimationTarget(Interface* ip,
+                                                 const Interval& range,
+                                                 TimeValue currentTime,
+                                                 SnapshotAnimationTargetDef& outTarget) {
+        if (!ip) return false;
+
+        ViewExp& vp = ip->GetActiveViewExp();
+        INode* cameraNode = vp.GetViewCamera();
+        if (!cameraNode) {
+            return false;
+        }
+
+        ObjectState cameraState = cameraNode->EvalWorldState(currentTime);
+        CameraObject* cameraObject =
+            (cameraState.obj && cameraState.obj->SuperClassID() == CAMERA_CLASS_ID)
+                ? static_cast<CameraObject*>(cameraState.obj)
+                : nullptr;
+        if (!cameraObject) {
+            return false;
+        }
+
+        std::vector<TimeValue> discoveryTimes;
+        const bool hasTransformAnimation =
+            BuildAnimatableTimeSamples(cameraNode->GetTMController(), range, currentTime, discoveryTimes);
+        bool hasLensAnimation = BuildAnimatableTimeSamples(cameraObject, range, currentTime, discoveryTimes);
+        if (GenCamera* genCamera = dynamic_cast<GenCamera*>(cameraObject)) {
+            hasLensAnimation =
+                BuildAnimatableTimeSamples(genCamera->GetFOVControl(), range, currentTime, discoveryTimes) ||
+                hasLensAnimation;
+        }
+        if (!hasTransformAnimation && !hasLensAnimation) {
+            return false;
+        }
+
+        std::vector<TimeValue> sampleTimes;
+        AppendFrameSampleTimes(sampleTimes, range);
+        SortUniqueTimeValues(sampleTimes);
+        if (sampleTimes.size() < 2) {
+            return false;
+        }
+
+        SnapshotAnimationTrackDef positionTrack;
+        positionTrack.path = L"position";
+        positionTrack.type = L"vector3";
+        positionTrack.interpolation = L"linear";
+
+        SnapshotAnimationTrackDef targetTrack;
+        targetTrack.path = L"cameraTarget";
+        targetTrack.type = L"vector3";
+        targetTrack.interpolation = L"linear";
+
+        SnapshotAnimationTrackDef upTrack;
+        upTrack.path = L"cameraUp";
+        upTrack.type = L"vector3";
+        upTrack.interpolation = L"linear";
+
+        SnapshotAnimationTrackDef fovTrack;
+        fovTrack.path = L"fovHorizontal";
+        fovTrack.type = L"number";
+        fovTrack.interpolation = L"linear";
+
+        SnapshotAnimationTrackDef viewWidthTrack;
+        viewWidthTrack.path = L"viewWidth";
+        viewWidthTrack.type = L"number";
+        viewWidthTrack.interpolation = L"linear";
+
+        bool posChanged = false;
+        bool targetChanged = false;
+        bool upChanged = false;
+        bool fovChanged = false;
+        bool viewWidthChanged = false;
+        bool havePrevious = false;
+        Point3 previousPos(0.0f, 0.0f, 0.0f);
+        Point3 previousTarget(0.0f, 0.0f, 0.0f);
+        Point3 previousUp(0.0f, 1.0f, 0.0f);
+        float previousFov = 0.0f;
+        float previousViewWidth = 0.0f;
+        bool exportingOrtho = false;
+
+        for (TimeValue sampleTime : sampleTimes) {
+            cameraState = cameraNode->EvalWorldState(sampleTime);
+            cameraObject =
+                (cameraState.obj && cameraState.obj->SuperClassID() == CAMERA_CLASS_ID)
+                    ? static_cast<CameraObject*>(cameraState.obj)
+                    : nullptr;
+            if (!cameraObject) continue;
+
+            Interval valid = FOREVER;
+            CameraState cs;
+            if (cameraObject->EvalCameraState(sampleTime, valid, &cs) != REF_SUCCEED) {
+                continue;
+            }
+
+            const Matrix3 cameraTM = cameraNode->GetNodeTM(sampleTime);
+            const Point3 maxPos = cameraTM.GetTrans();
+            Point3 maxForward = -Normalize(cameraTM.GetRow(2));
+            Point3 maxUp = Normalize(cameraTM.GetRow(1));
+            Point3 pos = MaxPointToWorld(maxPos);
+            Point3 target = pos + Normalize(MaxPointToWorld(maxForward)) * 100.0f;
+            Point3 up = Normalize(MaxPointToWorld(maxUp));
+
+            const float seconds = TimeValueToAnimationSeconds(sampleTime, range.Start());
+            positionTrack.times.push_back(seconds);
+            positionTrack.values.push_back(pos.x);
+            positionTrack.values.push_back(pos.y);
+            positionTrack.values.push_back(pos.z);
+
+            targetTrack.times.push_back(seconds);
+            targetTrack.values.push_back(target.x);
+            targetTrack.values.push_back(target.y);
+            targetTrack.values.push_back(target.z);
+
+            upTrack.times.push_back(seconds);
+            upTrack.values.push_back(up.x);
+            upTrack.values.push_back(up.y);
+            upTrack.values.push_back(up.z);
+
+            const bool isOrtho = cs.isOrtho != FALSE;
+            if (!havePrevious) exportingOrtho = isOrtho;
+            if (exportingOrtho) {
+                viewWidthTrack.times.push_back(seconds);
+                viewWidthTrack.values.push_back(cs.fov);
+            } else {
+                fovTrack.times.push_back(seconds);
+                fovTrack.values.push_back(cs.fov * (180.0f / 3.14159265f));
+            }
+
+            if (havePrevious) {
+                if (!NearlyEqualPoint3(pos, previousPos)) posChanged = true;
+                if (!NearlyEqualPoint3(target, previousTarget)) targetChanged = true;
+                if (!NearlyEqualPoint3(up, previousUp)) upChanged = true;
+                if (exportingOrtho) {
+                    if (std::fabs(cs.fov - previousViewWidth) > 1.0e-4f) viewWidthChanged = true;
+                } else if (std::fabs(cs.fov - previousFov) > 1.0e-4f) {
+                    fovChanged = true;
+                }
+            }
+
+            previousPos = pos;
+            previousTarget = target;
+            previousUp = up;
+            previousFov = cs.fov;
+            previousViewWidth = cs.fov;
+            havePrevious = true;
+        }
+
+        outTarget.target = L"camera:active";
+        if (posChanged) outTarget.tracks.push_back(std::move(positionTrack));
+        if (targetChanged) outTarget.tracks.push_back(std::move(targetTrack));
+        if (upChanged) outTarget.tracks.push_back(std::move(upTrack));
+        if (viewWidthChanged) outTarget.tracks.push_back(std::move(viewWidthTrack));
+        if (fovChanged) outTarget.tracks.push_back(std::move(fovTrack));
+        return !outTarget.tracks.empty();
+    }
+
+    static void WriteSnapshotAnimationTrackJson(std::wostringstream& ss,
+                                                const SnapshotAnimationTrackDef& track) {
+        ss << L"{\"path\":\"" << EscapeJson(track.path.c_str()) << L"\"";
+        if (!track.type.empty()) {
+            ss << L",\"type\":\"" << EscapeJson(track.type.c_str()) << L"\"";
+        }
+        if (!track.interpolation.empty()) {
+            ss << L",\"interpolation\":\"" << EscapeJson(track.interpolation.c_str()) << L"\"";
+        }
+        ss << L",\"times\":";
+        WriteFloats(ss, track.times.data(), track.times.size());
+        ss << L",\"values\":";
+        if (track.isBoolean) {
+            ss << L'[';
+            for (size_t i = 0; i < track.boolValues.size(); ++i) {
+                if (i) ss << L',';
+                ss << (track.boolValues[i] ? L"true" : L"false");
+            }
+            ss << L']';
+        } else {
+            WriteFloats(ss, track.values.data(), track.values.size());
+        }
+        ss << L'}';
+    }
+
+    static void WriteSnapshotAnimationsJson(std::wostringstream& ss,
+                                            const std::vector<SnapshotNodeRecord>& nodes,
+                                            Interface* ip,
+                                            TimeValue currentTime) {
+        if (!ip) return;
+
+        const Interval range = ip->GetAnimRange();
+        if (range.End() <= range.Start()) {
+            return;
+        }
+
+        std::vector<SnapshotAnimationTargetDef> targets;
+        targets.reserve(nodes.size() + 1);
+
+        for (const auto& node : nodes) {
+            SnapshotAnimationTargetDef target;
+            if (BuildNodeAnimationTarget(node.node, range, currentTime, target)) {
+                targets.push_back(std::move(target));
+            }
+        }
+
+        SnapshotAnimationTargetDef cameraTarget;
+        if (BuildActiveCameraAnimationTarget(ip, range, currentTime, cameraTarget)) {
+            targets.push_back(std::move(cameraTarget));
+        }
+
+        if (targets.empty()) {
+            return;
+        }
+
+        const float duration = TimeValueToAnimationSeconds(range.End(), range.Start());
+        const TimeValue clampedTime = std::clamp(currentTime, range.Start(), range.End());
+        const float currentSeconds = TimeValueToAnimationSeconds(clampedTime, range.Start());
+
+        ss << L",\"animations\":{";
+        ss << L"\"version\":1,";
+        ss << L"\"clips\":[{";
+        ss << L"\"id\":\"scene\",";
+        ss << L"\"name\":\"Scene\",";
+        ss << L"\"autoPlay\":true,";
+        ss << L"\"loop\":\"repeat\",";
+        ss << L"\"start\":0,";
+        ss << L"\"end\":";
+        WriteFloatValue(ss, duration, 0.0f);
+        ss << L",\"duration\":";
+        WriteFloatValue(ss, duration, 0.0f);
+        ss << L",\"time\":";
+        WriteFloatValue(ss, currentSeconds, 0.0f);
+        ss << L",\"targets\":[";
+        for (size_t i = 0; i < targets.size(); ++i) {
+            if (i) ss << L',';
+            ss << L"{\"target\":\"" << EscapeJson(targets[i].target.c_str()) << L"\",\"tracks\":[";
+            for (size_t j = 0; j < targets[i].tracks.size(); ++j) {
+                if (j) ss << L',';
+                WriteSnapshotAnimationTrackJson(ss, targets[i].tracks[j]);
+            }
+            ss << L"]}";
+        }
+        ss << L"]}]}";
+    }
+
     bool CopySnapshotRuntime(const std::wstring& webDir,
                              const std::wstring& outDir,
                              std::wstring& error) {
@@ -4437,18 +4872,7 @@ public:
 
         TimeValue t = ip->GetTime();
 
-        struct SnapshotNode {
-            ULONG handle = 0;
-            INode* node = nullptr;
-            bool visible = true;
-            bool spline = false;
-            std::vector<float> verts, uvs, norms;
-            std::vector<int> indices;
-            std::vector<MatGroup> groups;
-            size_t vOff = 0, iOff = 0, uvOff = 0, nOff = 0;
-        };
-
-        std::vector<SnapshotNode> nodes;
+        std::vector<SnapshotNodeRecord> nodes;
         size_t totalBytes = 0;
 
         std::function<void(INode*)> collect = [&](INode* parent) {
@@ -4475,10 +4899,11 @@ public:
                     continue;
                 }
 
-                SnapshotNode snapshotNode;
+                SnapshotNodeRecord snapshotNode;
                 snapshotNode.handle = node->GetHandle();
                 snapshotNode.node = node;
-                snapshotNode.visible = !node->IsNodeHidden(TRUE);
+                snapshotNode.visible =
+                    !node->IsNodeHidden(TRUE) && node->GetVisibility(t) > 0.0f;
 
                 bool extracted = ExtractMesh(node, t, snapshotNode.verts, snapshotNode.uvs,
                     snapshotNode.indices, snapshotNode.groups, &snapshotNode.norms);
@@ -4611,6 +5036,7 @@ public:
         WriteLightsJson(ss, ip, t, true, false, false);
         ss << L",";
         WriteSplatsJson(ss, ip, t, true, false, false);
+        WriteSnapshotAnimationsJson(ss, nodes, ip, t);
 
         {
             std::vector<ForestInstanceGroup> allInstGroups;

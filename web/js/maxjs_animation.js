@@ -2,6 +2,8 @@ function normalizeBindingPath(path) {
     const raw = String(path ?? '').trim();
     if (!raw) return null;
     if (raw === 'rotationQuaternion') return '.quaternion';
+    if (raw === 'fovHorizontal') return '.userData.maxjsHorizontalFov';
+    if (raw === 'viewWidth') return '.userData.maxjsViewWidth';
     return raw.startsWith('.') ? raw : `.${raw}`;
 }
 
@@ -28,6 +30,20 @@ function toInterpolation(THREE, interpolation) {
         default:
             return THREE.InterpolateLinear;
     }
+}
+
+function normalizeCustomTrackPath(trackDef) {
+    return String(trackDef?.path ?? trackDef?.property ?? '').trim();
+}
+
+function getCustomTrackKind(trackDef) {
+    const rawPath = normalizeCustomTrackPath(trackDef);
+    const type = String(trackDef?.type ?? '').trim().toLowerCase();
+    if (type === 'matrix16' || rawPath === 'matrix') return 'matrix16';
+    if (rawPath === 'visible') return 'boolean';
+    if (rawPath === 'position' || rawPath === 'cameraTarget' || rawPath === 'cameraUp') return 'vector3';
+    if (rawPath === 'fovHorizontal' || rawPath === 'viewWidth') return 'number';
+    return null;
 }
 
 function createTrack(THREE, trackDef) {
@@ -89,14 +105,31 @@ export function createMaxJSAnimationSystem({
     THREE,
     nodeMap,
     getCamera,
+    getControls,
     getJsRoot,
     getOverlayRoot,
+    getViewportAspect,
 }) {
     const targetRegistry = new Map();
     const mixers = new Map();
     const clipGroups = new Map();
     let registryDirty = true;
     let loadedPayload = null;
+    const matrixA = new THREE.Matrix4();
+    const matrixB = new THREE.Matrix4();
+    const matrixSample = new THREE.Matrix4();
+    const posA = new THREE.Vector3();
+    const posB = new THREE.Vector3();
+    const scaleA = new THREE.Vector3();
+    const scaleB = new THREE.Vector3();
+    const posSample = new THREE.Vector3();
+    const scaleSample = new THREE.Vector3();
+    const quatA = new THREE.Quaternion();
+    const quatB = new THREE.Quaternion();
+    const quatSample = new THREE.Quaternion();
+    const vectorA = new THREE.Vector3();
+    const vectorB = new THREE.Vector3();
+    const vectorSample = new THREE.Vector3();
 
     function getMixer(target) {
         let mixer = mixers.get(target);
@@ -129,6 +162,264 @@ export function createMaxJSAnimationSystem({
         }
         clipGroups.clear();
         mixers.clear();
+        const camera = getCamera?.();
+        if (camera?.userData) {
+            delete camera.userData.maxjsHorizontalFov;
+            delete camera.userData.maxjsViewWidth;
+            delete camera.userData.maxjsAnimatedTarget;
+        }
+    }
+
+    function syncAnimatedCamera(camera) {
+        if (!camera?.isCamera) return;
+        const animatedTarget = camera.userData?.maxjsAnimatedTarget;
+        if (animatedTarget?.isVector3) {
+            camera.lookAt(animatedTarget);
+            const controls = getControls?.();
+            if (controls?.target?.copy) controls.target.copy(animatedTarget);
+        }
+
+        if (camera.isPerspectiveCamera) {
+            const horizontalFov = Number.isFinite(camera.userData?.maxjsHorizontalFov)
+                ? camera.userData.maxjsHorizontalFov
+                : null;
+            if (horizontalFov && horizontalFov > 0 && horizontalFov < 170) {
+                const aspect = Math.max(1e-6, getViewportAspect?.() ?? camera.aspect ?? 1);
+                const horizontalRad = horizontalFov * Math.PI / 180;
+                camera.fov = 2 * Math.atan(Math.tan(horizontalRad / 2) / aspect) * 180 / Math.PI;
+            }
+            camera.updateProjectionMatrix();
+            return;
+        }
+
+        if (camera.isOrthographicCamera) {
+            const aspect = Math.max(1e-6, getViewportAspect?.() ?? 1);
+            const viewWidth = Number.isFinite(camera.userData?.maxjsViewWidth) && camera.userData.maxjsViewWidth > 0
+                ? camera.userData.maxjsViewWidth
+                : Math.max(1e-3, camera.right - camera.left);
+            camera.left = -viewWidth / 2;
+            camera.right = viewWidth / 2;
+            camera.top = viewWidth / (2 * aspect);
+            camera.bottom = -viewWidth / (2 * aspect);
+            camera.updateProjectionMatrix();
+        }
+    }
+
+    function getTrackInterpolation(trackDef) {
+        return String(trackDef?.interpolation ?? 'linear').trim().toLowerCase();
+    }
+
+    function isStepTrack(trackDef) {
+        const interpolation = getTrackInterpolation(trackDef);
+        return interpolation === 'step' || interpolation === 'discrete';
+    }
+
+    function getGroupDuration(group) {
+        return Number.isFinite(group?.duration) && group.duration > 0 ? group.duration : 0;
+    }
+
+    function normalizeGroupTime(group, time) {
+        const duration = getGroupDuration(group);
+        if (!Number.isFinite(time)) return 0;
+        if (duration <= 0) return Math.max(0, time);
+
+        const loop = String(group?.loop ?? 'repeat').trim().toLowerCase();
+        if (loop === 'once') {
+            return Math.min(Math.max(time, 0), duration);
+        }
+        if (loop === 'pingpong') {
+            const cycle = duration * 2;
+            let wrapped = ((time % cycle) + cycle) % cycle;
+            if (wrapped > duration) wrapped = cycle - wrapped;
+            return wrapped;
+        }
+        return ((time % duration) + duration) % duration;
+    }
+
+    function getGroupPlaybackTime(group) {
+        const firstEntry = group?.entries?.[0];
+        if (firstEntry?.action) {
+            group.time = firstEntry.action.time;
+            return group.time;
+        }
+        return Number.isFinite(group?.time) ? group.time : 0;
+    }
+
+    function findTrackSegment(times, timeSeconds) {
+        const count = Array.isArray(times) ? times.length : 0;
+        if (count === 0) return null;
+        if (count === 1 || timeSeconds <= times[0]) {
+            return { indexA: 0, indexB: 0, alpha: 0 };
+        }
+        const lastIndex = count - 1;
+        if (timeSeconds >= times[lastIndex]) {
+            return { indexA: lastIndex, indexB: lastIndex, alpha: 0 };
+        }
+
+        let lo = 0;
+        let hi = lastIndex;
+        while (lo <= hi) {
+            const mid = (lo + hi) >> 1;
+            const value = times[mid];
+            if (value === timeSeconds) {
+                return { indexA: mid, indexB: mid, alpha: 0 };
+            }
+            if (value < timeSeconds) lo = mid + 1;
+            else hi = mid - 1;
+        }
+
+        const indexA = Math.max(0, hi);
+        const indexB = Math.min(lastIndex, lo);
+        const t0 = times[indexA];
+        const t1 = times[indexB];
+        const alpha = t1 > t0 ? (timeSeconds - t0) / (t1 - t0) : 0;
+        return { indexA, indexB, alpha };
+    }
+
+    function readVector3At(values, index, target) {
+        const offset = index * 3;
+        target.set(
+            Number(values[offset] ?? 0),
+            Number(values[offset + 1] ?? 0),
+            Number(values[offset + 2] ?? 0),
+        );
+        return target;
+    }
+
+    function sampleVectorTrack(trackDef, timeSeconds, target) {
+        const times = Array.isArray(trackDef?.times) ? trackDef.times : [];
+        const values = Array.isArray(trackDef?.values) ? trackDef.values : [];
+        if (times.length === 0 || values.length < times.length * 3) return false;
+
+        const segment = findTrackSegment(times, timeSeconds);
+        if (!segment) return false;
+
+        readVector3At(values, segment.indexA, vectorA);
+        if (segment.indexA === segment.indexB || isStepTrack(trackDef) || segment.alpha <= 0) {
+            target.copy(vectorA);
+            return true;
+        }
+
+        readVector3At(values, segment.indexB, vectorB);
+        target.lerpVectors(vectorA, vectorB, segment.alpha);
+        return true;
+    }
+
+    function sampleNumberTrack(trackDef, timeSeconds) {
+        const times = Array.isArray(trackDef?.times) ? trackDef.times : [];
+        const values = Array.isArray(trackDef?.values) ? trackDef.values : [];
+        if (times.length === 0 || values.length < times.length) return null;
+
+        const segment = findTrackSegment(times, timeSeconds);
+        if (!segment) return null;
+
+        const a = Number(values[segment.indexA] ?? 0);
+        if (segment.indexA === segment.indexB || isStepTrack(trackDef) || segment.alpha <= 0) {
+            return a;
+        }
+
+        const b = Number(values[segment.indexB] ?? a);
+        return a + (b - a) * segment.alpha;
+    }
+
+    function sampleBooleanTrack(trackDef, timeSeconds) {
+        const times = Array.isArray(trackDef?.times) ? trackDef.times : [];
+        const values = Array.isArray(trackDef?.values) ? trackDef.values : [];
+        if (times.length === 0 || values.length < times.length) return null;
+
+        const segment = findTrackSegment(times, timeSeconds);
+        if (!segment) return null;
+        return !!values[segment.indexA];
+    }
+
+    function sampleMatrixTrack(trackDef, timeSeconds, targetMatrix) {
+        const times = Array.isArray(trackDef?.times) ? trackDef.times : [];
+        const values = Array.isArray(trackDef?.values) ? trackDef.values : [];
+        if (times.length === 0 || values.length < times.length * 16) return false;
+
+        const segment = findTrackSegment(times, timeSeconds);
+        if (!segment) return false;
+
+        matrixA.fromArray(values, segment.indexA * 16);
+        if (segment.indexA === segment.indexB || isStepTrack(trackDef) || segment.alpha <= 0) {
+            targetMatrix.copy(matrixA);
+            return true;
+        }
+
+        matrixB.fromArray(values, segment.indexB * 16);
+        matrixA.decompose(posA, quatA, scaleA);
+        matrixB.decompose(posB, quatB, scaleB);
+        posSample.lerpVectors(posA, posB, segment.alpha);
+        scaleSample.lerpVectors(scaleA, scaleB, segment.alpha);
+        quatSample.copy(quatA).slerp(quatB, segment.alpha);
+        targetMatrix.compose(posSample, quatSample, scaleSample);
+        return true;
+    }
+
+    function applyCustomEntry(entry, timeSeconds) {
+        const { target, kind, path, trackDef } = entry;
+        if (!target) return;
+
+        switch (kind) {
+            case 'matrix16':
+                if (sampleMatrixTrack(trackDef, timeSeconds, matrixSample)) {
+                    target.matrixAutoUpdate = false;
+                    target.matrix.copy(matrixSample);
+                    target.matrix.decompose(target.position, target.quaternion, target.scale);
+                    target.matrixWorldNeedsUpdate = true;
+                }
+                break;
+            case 'boolean': {
+                const visible = sampleBooleanTrack(trackDef, timeSeconds);
+                if (visible != null && path === 'visible') target.visible = visible;
+                break;
+            }
+            case 'vector3':
+                if (!sampleVectorTrack(trackDef, timeSeconds, vectorSample)) break;
+                if (path === 'position') {
+                    target.position.copy(vectorSample);
+                    target.matrixWorldNeedsUpdate = true;
+                } else if (path === 'cameraTarget') {
+                    const lookTarget = target.userData.maxjsAnimatedTarget instanceof THREE.Vector3
+                        ? target.userData.maxjsAnimatedTarget
+                        : (target.userData.maxjsAnimatedTarget = new THREE.Vector3());
+                    lookTarget.copy(vectorSample);
+                } else if (path === 'cameraUp') {
+                    target.up.copy(vectorSample).normalize();
+                    target.matrixWorldNeedsUpdate = true;
+                }
+                break;
+            case 'number': {
+                const value = sampleNumberTrack(trackDef, timeSeconds);
+                if (!Number.isFinite(value)) break;
+                if (path === 'fovHorizontal') target.userData.maxjsHorizontalFov = value;
+                else if (path === 'viewWidth') target.userData.maxjsViewWidth = value;
+                break;
+            }
+        }
+    }
+
+    function applyCustomEntries() {
+        for (const group of clipGroups.values()) {
+            if (!group.customEntries.length) continue;
+            const timeSeconds = getGroupPlaybackTime(group);
+            for (const entry of group.customEntries) {
+                applyCustomEntry(entry, timeSeconds);
+            }
+        }
+    }
+
+    function syncAnimatedTargets() {
+        applyCustomEntries();
+        const activeCamera = getCamera?.();
+        if (activeCamera) syncAnimatedCamera(activeCamera);
+    }
+
+    function applyInstantPose() {
+        for (const mixer of mixers.values()) {
+            mixer.update(0);
+        }
+        syncAnimatedTargets();
     }
 
     function rebuildTargetRegistry() {
@@ -162,8 +453,20 @@ export function createMaxJSAnimationSystem({
                 id: clipId,
                 name: clipDef?.name || clipId,
                 entries: [],
+                customEntries: [],
                 speed: Number.isFinite(clipState?.speed) ? clipState.speed : (clipDef?.speed ?? 1),
                 playing: clipState?.playing ?? (clipDef?.autoPlay !== false),
+                loop: clipDef?.loop ?? 'repeat',
+                duration: Number.isFinite(clipDef?.duration)
+                    ? clipDef.duration
+                    : (Number.isFinite(clipDef?.end) && Number.isFinite(clipDef?.start)
+                        ? Math.max(0, clipDef.end - clipDef.start)
+                        : -1),
+                time: Number.isFinite(clipState?.time)
+                    ? clipState.time
+                    : (Number.isFinite(clipDef?.time)
+                        ? clipDef.time
+                        : (Number.isFinite(clipDef?.start) ? clipDef.start : 0)),
             };
 
             for (const targetDef of (Array.isArray(clipDef?.targets) ? clipDef.targets : [])) {
@@ -173,18 +476,23 @@ export function createMaxJSAnimationSystem({
 
                 const tracks = [];
                 for (const trackDef of (Array.isArray(targetDef?.tracks) ? targetDef.tracks : [])) {
+                    const customKind = getCustomTrackKind(trackDef);
+                    if (customKind) {
+                        group.customEntries.push({
+                            targetId,
+                            target,
+                            trackDef,
+                            path: normalizeCustomTrackPath(trackDef),
+                            kind: customKind,
+                        });
+                        continue;
+                    }
                     const track = createTrack(THREE, trackDef);
                     if (track) tracks.push(track);
                 }
                 if (tracks.length === 0) continue;
 
-                const duration = Number.isFinite(clipDef?.duration)
-                    ? clipDef.duration
-                    : (Number.isFinite(clipDef?.end) && Number.isFinite(clipDef?.start)
-                        ? Math.max(0, clipDef.end - clipDef.start)
-                        : -1);
-
-                const clip = new THREE.AnimationClip(group.name, duration, tracks);
+                const clip = new THREE.AnimationClip(group.name, group.duration, tracks);
                 const mixer = getMixer(target);
                 const action = mixer.clipAction(clip);
                 applyLoopMode(THREE, action, clipDef);
@@ -192,21 +500,18 @@ export function createMaxJSAnimationSystem({
                 action.paused = !group.playing;
                 action.timeScale = group.speed;
                 action.play();
-                if (Number.isFinite(clipState?.time)) {
-                    action.time = clipState.time;
-                } else if (Number.isFinite(clipDef?.start) && clipDef.start > 0) {
-                    action.time = clipDef.start;
-                }
+                action.time = group.time;
 
                 group.entries.push({ targetId, clip, mixer, action });
             }
 
-            if (group.entries.length > 0) {
+            if (group.entries.length > 0 || group.customEntries.length > 0) {
                 clipGroups.set(clipId, group);
                 clipCount += 1;
             }
         }
 
+        applyInstantPose();
         return { clipCount, targetCount: targetRegistry.size };
     }
 
@@ -229,10 +534,18 @@ export function createMaxJSAnimationSystem({
 
     function update(deltaSeconds) {
         if (registryDirty) refreshTargets();
-        if (!Number.isFinite(deltaSeconds) || deltaSeconds <= 0) return;
+        if (!Number.isFinite(deltaSeconds) || deltaSeconds <= 0) {
+            syncAnimatedTargets();
+            return;
+        }
         for (const mixer of mixers.values()) {
             mixer.update(deltaSeconds);
         }
+        for (const group of clipGroups.values()) {
+            if (group.entries.length > 0 || !group.playing) continue;
+            group.time = normalizeGroupTime(group, group.time + deltaSeconds * group.speed);
+        }
+        syncAnimatedTargets();
     }
 
     function setClipPlaying(clipId, playing) {
@@ -243,15 +556,18 @@ export function createMaxJSAnimationSystem({
             entry.action.paused = !group.playing;
             if (group.playing && !entry.action.isRunning()) entry.action.play();
         }
+        applyInstantPose();
         return true;
     }
 
     function setClipTime(clipId, timeSeconds) {
         const group = clipGroups.get(clipId);
         if (!group || !Number.isFinite(timeSeconds)) return false;
+        group.time = normalizeGroupTime(group, timeSeconds);
         for (const entry of group.entries) {
-            entry.action.time = timeSeconds;
+            entry.action.time = group.time;
         }
+        applyInstantPose();
         return true;
     }
 
@@ -262,6 +578,7 @@ export function createMaxJSAnimationSystem({
         for (const entry of group.entries) {
             entry.action.timeScale = speed;
         }
+        syncAnimatedTargets();
         return true;
     }
 

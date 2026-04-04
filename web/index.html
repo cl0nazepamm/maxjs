@@ -4944,8 +4944,10 @@
             THREE,
             nodeMap,
             getCamera: () => camera,
+            getControls: () => controls,
             getJsRoot: () => jsRoot,
             getOverlayRoot: () => overlayRoot,
+            getViewportAspect: () => innerWidth / innerHeight,
         });
         layerManager.subscribe?.(() => animationSystem.invalidateTargets());
         const projectRuntime = window.chrome?.webview
@@ -4989,14 +4991,14 @@
                         if (overlaySnapshotRoot?.isObject3D) overlayRoot.add(overlaySnapshotRoot);
                     }
                 }
-                animationSystem.invalidateTargets();
-                if (meta.animations) animationSystem.loadSnapshotAnimations(meta.animations);
-                else animationSystem.clear();
                 if (meta.snapshotUi) {
                     applySavedPostFxPayload(meta.snapshotUi);
                     applyStandaloneCameraState(meta.snapshotUi.camera);
                     syncPostFxPanel(true);
                 }
+                animationSystem.invalidateTargets();
+                if (meta.animations) animationSystem.loadSnapshotAnimations(meta.animations);
+                else animationSystem.clear();
                 setInfoText(`MaxJS Snapshot - ${meta.nodes?.length ?? 0} nodes`);
                 return true;
             } catch (error) {

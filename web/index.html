@@ -4596,14 +4596,8 @@
             }
         }
 
-        restorePostFxState();
         buildPostFxPanel();
         syncPostFxPanel(true);
-
-        // Restore HDRI from IndexedDB (survives VR mode page reload)
-        void restoreStashedHdri().then(file => {
-            if (file && !isLocalHdriLoaded()) loadLocalHDRIFile(file);
-        });
 
         // ── Resize + Render ─────────────────────────────────
         let resizeTimer = null;
@@ -4955,14 +4949,8 @@
                 const buffer = await binResponse.arrayBuffer();
                 handleBinaryScene(buffer, meta);
                 if (meta.snapshotUi) {
-                    // Local HDRI file can't survive export — clear so we don't try to load a missing file
-                    if (meta.snapshotUi.hdri) {
-                        meta.snapshotUi.hdri.fileName = '';
-                        meta.snapshotUi.hdri.enabled = false;
-                    }
                     applySavedPostFxPayload(meta.snapshotUi);
                     applyStandaloneCameraState(meta.snapshotUi.camera);
-                    buildPostFxPanel();
                     syncPostFxPanel(true);
                 }
                 setInfoText(`MaxJS Snapshot - ${meta.nodes?.length ?? 0} nodes`);
@@ -4997,6 +4985,21 @@
         let debugMode = isStandalone ? false
             : (localStorage.getItem(DEBUG_STORAGE_KEY) ?? 'true') === 'true';
 
+        async function restoreInteractiveBrowserState() {
+            restorePostFxState();
+            syncPostFxPanel(true);
+
+            const file = await restoreStashedHdri();
+            if (file && !isLocalHdriLoaded()) loadLocalHDRIFile(file);
+        }
+
+        async function bootStandaloneSnapshot() {
+            const loaded = await loadStandaloneSnapshot();
+            if (loaded) return true;
+            await restoreInteractiveBrowserState();
+            return false;
+        }
+
         function applyBuildMode() {
             if (isStandalone) {
                 document.getElementById('hud').style.display = 'none';
@@ -5013,8 +5016,9 @@
         }
 
         if (isStandalone) {
-            void loadStandaloneSnapshot();
+            void bootStandaloneSnapshot();
         } else {
+            void restoreInteractiveBrowserState();
             // Debug toggle in Max — hides HUD/controls for clean viewport
             const debugBtn = document.getElementById('btnDebug');
             debugBtn.style.display = '';

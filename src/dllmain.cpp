@@ -230,7 +230,18 @@ static bool TryParseInlineLayerFileName(const std::wstring& fileName, std::wstri
     return false;
 }
 
-static std::uint64_t GetProjectRuntimeWriteStamp(const std::wstring& dirPath) {
+static std::wstring NormalizeWindowsPathForCompare(std::wstring path) {
+    std::replace(path.begin(), path.end(), L'/', L'\\');
+    while (path.size() > 3 && !path.empty() && path.back() == L'\\') {
+        path.pop_back();
+    }
+    std::transform(path.begin(), path.end(), path.begin(),
+        [](wchar_t ch) { return static_cast<wchar_t>(towlower(ch)); });
+    return path;
+}
+
+static std::uint64_t GetProjectRuntimeWriteStampInternal(const std::wstring& dirPath,
+                                                         const std::wstring& excludedDir) {
     if (!DirectoryExists(dirPath)) return 0;
 
     std::uint64_t latest = 0;
@@ -245,7 +256,12 @@ static std::uint64_t GetProjectRuntimeWriteStamp(const std::wstring& dirPath) {
         }
 
         if (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-            latest = std::max(latest, GetProjectRuntimeWriteStamp(dirPath + L"\\" + findData.cFileName));
+            const std::wstring childPath = dirPath + L"\\" + findData.cFileName;
+            if (!excludedDir.empty() &&
+                NormalizeWindowsPathForCompare(childPath) == excludedDir) {
+                continue;
+            }
+            latest = std::max(latest, GetProjectRuntimeWriteStampInternal(childPath, excludedDir));
             continue;
         }
 
@@ -256,6 +272,11 @@ static std::uint64_t GetProjectRuntimeWriteStamp(const std::wstring& dirPath) {
 
     FindClose(findHandle);
     return latest;
+}
+
+static std::uint64_t GetProjectRuntimeWriteStamp(const std::wstring& dirPath) {
+    return GetProjectRuntimeWriteStampInternal(
+        dirPath, NormalizeWindowsPathForCompare(dirPath + L"\\dist"));
 }
 
 static bool WriteBinaryFile(const std::wstring& path, const std::string& data) {
@@ -312,6 +333,15 @@ static bool CopyDirectoryRecursive(const std::wstring& src, const std::wstring& 
         if (ec) return false;
     }
     return true;
+}
+
+static bool CopyFileEnsuringDirectories(const std::wstring& src, const std::wstring& dst) {
+    if (!FileExists(src)) return false;
+    std::error_code ec;
+    const auto dstPath = std::filesystem::path(dst);
+    std::filesystem::create_directories(dstPath.parent_path(), ec);
+    if (ec) return false;
+    return CopyFileW(src.c_str(), dst.c_str(), FALSE) != FALSE;
 }
 
 static int Base64Value(wchar_t ch) {
@@ -4359,6 +4389,35 @@ public:
         return true;
     }
 
+    bool CopySnapshotRuntime(const std::wstring& webDir,
+                             const std::wstring& outDir,
+                             std::wstring& error) {
+        if (!CopyFileEnsuringDirectories(webDir + L"\\index.html", outDir + L"\\index.html")) {
+            error = L"Failed to copy snapshot runtime index.html";
+            return false;
+        }
+
+        if (!CopyDirectoryRecursive(webDir + L"\\js", outDir + L"\\js")) {
+            error = L"Failed to copy snapshot runtime js directory";
+            return false;
+        }
+
+        const std::wstring sparkDist = webDir + L"\\node_modules\\@sparkjsdev\\spark\\dist";
+        if (!DirectoryExists(sparkDist)) {
+            error = L"Snapshot runtime dependency missing: @sparkjsdev/spark/dist";
+            return false;
+        }
+
+        if (!CopyDirectoryRecursive(
+                sparkDist,
+                outDir + L"\\node_modules\\@sparkjsdev\\spark\\dist")) {
+            error = L"Failed to copy snapshot runtime spark dist";
+            return false;
+        }
+
+        return true;
+    }
+
     bool BuildSnapshotBinary(std::wstring& outMetaJson,
                              std::string& outBinary,
                              const std::wstring& snapshotUiJson,
@@ -4629,8 +4688,7 @@ public:
             std::filesystem::remove_all(std::filesystem::path(outDir), ec);
         };
 
-        if (!CopyDirectoryRecursive(webDir, outDir)) {
-            error = L"Failed to copy web runtime into snapshot directory";
+        if (!CopySnapshotRuntime(webDir, outDir, error)) {
             cleanupOnFail();
             return false;
         }

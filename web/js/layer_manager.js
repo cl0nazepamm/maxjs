@@ -66,6 +66,13 @@ function markOwned(resource, owner = OWNER_JS) {
     return setOwner(resource, owner);
 }
 
+function setSnapshotTargetId(resource, snapshotId) {
+    if (!resource || typeof resource !== 'object') return resource;
+    resource.userData ??= {};
+    resource.userData.maxjsSnapshotId = snapshotId;
+    return resource;
+}
+
 function disposeOwnedMaterial(material) {
     if (!material) return;
     if (Array.isArray(material)) {
@@ -456,6 +463,7 @@ export function createLayerManager({
         anchor.userData.maxjsAnchorHandle = handle;
         anchor.userData.maxjsFollowVisibility = options.followVisibility !== false;
         anchor.userData.maxjsCopyWorldMatrix = options.copyWorldMatrix !== false;
+        if (options.snapshotId) setSnapshotTargetId(anchor, `runtime:${layer.id}:${options.snapshotId}`);
         layer.anchors.push(anchor);
         parent.add(anchor);
         return anchor;
@@ -533,6 +541,7 @@ export function createLayerManager({
                 const owner = options.overlay ? OWNER_OVERLAY : OWNER_JS;
                 const parent = owner === OWNER_OVERLAY ? layer.overlayGroup : layer.group;
                 markOwned(resource, owner);
+                if (options.snapshotId) setSnapshotTargetId(resource, `runtime:${layer.id}:${options.snapshotId}`);
                 parent.add(resource);
                 return resource;
             },
@@ -546,6 +555,7 @@ export function createLayerManager({
                 const owner = options.overlay ? OWNER_OVERLAY : OWNER_JS;
                 const group = markOwned(new THREE.Group(), owner);
                 if (name) group.name = name;
+                if (options.snapshotId) setSnapshotTargetId(group, `runtime:${layer.id}:${options.snapshotId}`);
                 const parent = owner === OWNER_OVERLAY ? layer.overlayGroup : layer.group;
                 parent.add(group);
                 return group;
@@ -556,6 +566,7 @@ export function createLayerManager({
             cloneFromMax(handle, options = {}) {
                 const clone = cloneMaxNode(handle, options);
                 if (!clone) return null;
+                if (options.snapshotId) setSnapshotTargetId(clone, `runtime:${layer.id}:${options.snapshotId}`);
                 const parent = options.overlay ? layer.overlayGroup : layer.group;
                 parent.add(clone);
                 return clone;
@@ -563,8 +574,13 @@ export function createLayerManager({
             track(resource, options = {}) {
                 if (!resource) return resource;
                 markOwned(resource, options.overlay ? OWNER_OVERLAY : OWNER_JS);
+                if (options.snapshotId) setSnapshotTargetId(resource, `runtime:${layer.id}:${options.snapshotId}`);
                 layer.tracked.add(resource);
                 return resource;
+            },
+            setSnapshotId(resource, id) {
+                if (!resource?.isObject3D || !id) return resource;
+                return setSnapshotTargetId(resource, `runtime:${layer.id}:${id}`);
             },
             dispose(resource) {
                 disposeOwnedResource(resource);
@@ -634,11 +650,13 @@ export function createLayerManager({
         group.name = `__inline_${id}__`;
         group.matrixAutoUpdate = false;
         group.matrix.identity();
+        setSnapshotTargetId(group, `runtime:${id}:root`);
 
         const overlayGroup = markOwned(new THREE.Group(), OWNER_OVERLAY);
         overlayGroup.name = `__inline_overlay_${id}__`;
         overlayGroup.matrixAutoUpdate = false;
         overlayGroup.matrix.identity();
+        setSnapshotTargetId(overlayGroup, `runtime:${id}:overlay_root`);
 
         const layer = {
             id,

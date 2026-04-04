@@ -500,6 +500,7 @@
         import { createPerfHud } from './js/perf_hud.js';
         import { createSSGIController } from './js/ssgi_fx.js';
         import { createLayerManager } from './js/layer_manager.js';
+        import { createMaxJSAnimationSystem } from './js/maxjs_animation.js';
         import { createProjectRuntime } from './js/project_runtime.js';
 
         // ── Scene Setup (Y-up world + Max basis boundary) ───
@@ -725,6 +726,7 @@
         const materialXTemplateCache = new Map();
         const materialXLoadCache = new Map();
         const nodeMap = new Map();
+        let animationSystem = null;
         const splatHandleMap = new Map();
         const splatMatrix = new THREE_STD.Matrix4();
         const splatPosition = new THREE_STD.Vector3();
@@ -2881,6 +2883,7 @@
             applyForestInstances(meta.forestInstances);
             applyVolumes(meta.volumes);
             scene.updateMatrixWorld(true);
+            animationSystem?.invalidateTargets();
 
             if (firstSync && meta.nodes.length > 0) {
                 firstSync = false;
@@ -4908,6 +4911,7 @@
             }
             updateVolumeUniforms();
             layerManager.update(frameDt, frameElapsed);
+            animationSystem?.update(frameDt);
             perfHud.updateLayers(layerManager.getStats());
             const renderStart = performance.now();
             if (xrRuntime.shouldBypassPostFx) {
@@ -4936,6 +4940,14 @@
             overlayRoot,
             space: sceneSpace,
         });
+        animationSystem = createMaxJSAnimationSystem({
+            THREE,
+            nodeMap,
+            getCamera: () => camera,
+            getJsRoot: () => jsRoot,
+            getOverlayRoot: () => overlayRoot,
+        });
+        layerManager.subscribe?.(() => animationSystem.invalidateTargets());
         const projectRuntime = window.chrome?.webview
             ? createProjectRuntime({ layerManager, bridge, perfHud })
             : null;
@@ -4944,6 +4956,7 @@
         }
         window.maxJSProjectRuntime = projectRuntime;
         window.maxJS.layers = layerManager;
+        window.maxJS.animation = animationSystem;
         _layerManagerRef = layerManager;
         _projectRuntimeRef = projectRuntime;
         attachLayerPanelSubscriptions();
@@ -4976,6 +4989,9 @@
                         if (overlaySnapshotRoot?.isObject3D) overlayRoot.add(overlaySnapshotRoot);
                     }
                 }
+                animationSystem.invalidateTargets();
+                if (meta.animations) animationSystem.loadSnapshotAnimations(meta.animations);
+                else animationSystem.clear();
                 if (meta.snapshotUi) {
                     applySavedPostFxPayload(meta.snapshotUi);
                     applyStandaloneCameraState(meta.snapshotUi.camera);

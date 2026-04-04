@@ -71,6 +71,7 @@ enum ThreeJSParamIDs {
     pb_material_mode,
     // TSL
     pb_tsl_code,
+    pb_tsl_source_mtl,  // submaterial input for MaterialX auto-compile
     // Utility extras (appended for scene compatibility)
     pb_specular_map,
     pb_reflectivity,

@@ -30,6 +30,7 @@
 #define IDC_TSL_CODE_EDIT          1140
 #define IDC_TSL_LOAD_BTN           1141
 #define IDC_TSL_FILE_LABEL         1142
+#define IDC_TSL_SOURCE_MTL         1143
 #define IDD_THREEJS_VIDEO_TEX      126
 #define IDS_VIDEO_TEX_PARAMS       127
 #define IDC_VIDEO_FILE_BTN         1150

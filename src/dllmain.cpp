@@ -843,6 +843,8 @@ struct MaxJSPBR {
     std::wstring tslCode;
     std::wstring materialModel = L"MeshStandardMaterial";
     std::wstring materialXFile;
+    std::wstring materialXInline;  // MaterialX XML string (from MtlxIOUtil.ExportMtlxString)
+    std::wstring materialXBase;
     std::wstring materialXMaterialName;
     int materialXMaterialIndex = 1;
     float parallaxScale = 0.0f;
@@ -1152,6 +1154,59 @@ static void ExtractWrappedNormalBumpMaps(
     ExtractMaterialTexture(map, bumpPath, bumpXf);
 }
 
+static std::wstring GetMtlxExportBaseDir() {
+    Interface* ip = GetCOREInterface();
+    std::wstring layerPath;
+    if (ip) {
+        MSTR scenePath = ip->GetCurFilePath();
+        if (scenePath.Length() > 0) {
+            layerPath = scenePath.data();
+            const size_t slash = layerPath.find_last_of(L"\\/");
+            if (slash != std::wstring::npos) layerPath = layerPath.substr(0, slash);
+        }
+    }
+    if (layerPath.empty()) {
+        wchar_t tmp[MAX_PATH];
+        GetTempPathW(MAX_PATH, tmp);
+        layerPath = tmp;
+    }
+    return layerPath;
+}
+
+// Export a material's MaterialX node graph as an XML string via MtlxIOUtil.
+static std::wstring ExportMtlxString(Mtl* mtl, std::wstring* outBaseDir = nullptr) {
+    if (!mtl) return {};
+
+    const auto animHandle = Animatable::GetHandleByAnim(mtl);
+    if (animHandle == 0) return {};
+
+    const std::wstring layerPath = GetMtlxExportBaseDir();
+    if (outBaseDir) *outBaseDir = layerPath;
+
+    std::wostringstream ss;
+    ss << LR"(
+        fn _maxjs_exportMtlx materialAnimHandle layerPath = (
+            local m = getAnimByHandle materialAnimHandle
+            if m == undefined do return ""
+            local mArr = #(m)
+            local mtlxStr = MtlxIOUtil.ExportMtlxString layerPath mArr
+            if mtlxStr == undefined then "" else mtlxStr
+        )
+        _maxjs_exportMtlx )" << animHandle << L" @\"" << layerPath << L"\"";
+
+    FPValue rvalue;
+    rvalue.Init();
+    try {
+        if (!ExecuteMAXScriptScript(ss.str().c_str(), MAXScript::ScriptSource::Dynamic, false, &rvalue)) {
+            return {};
+        }
+        if (rvalue.type == TYPE_STRING && rvalue.s && wcslen(rvalue.s) > 0) {
+            return std::wstring(rvalue.s);
+        }
+    } catch (...) {}
+    return {};
+}
+
 static void ExtractThreeJSMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
     IParamBlock2* pb = mtl->GetParamBlockByID(threejs_params);
     if (!pb) return;
@@ -1235,6 +1290,22 @@ static void ExtractThreeJSMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
     } else if (cid == THREEJS_TSL_CLASS_ID) {
         const MCHAR* code = pb->GetStr(pb_tsl_code);
         if (code && code[0]) d.tslCode = code;
+        // Auto-compile MaterialX from source material if connected
+        if (HasParam(pb, pb_tsl_source_mtl)) {
+            Mtl* srcMtl = pb->GetMtl(pb_tsl_source_mtl);
+            if (srcMtl) {
+                std::wstring materialXBase;
+                std::wstring xml = ExportMtlxString(srcMtl, &materialXBase);
+                if (!xml.empty()) {
+                    d.materialXInline = xml;
+                    d.materialXBase = materialXBase;
+                    MSTR srcName = srcMtl->GetName();
+                    if (srcName.Length() > 0)
+                        d.materialXMaterialName = srcName.data();
+                    d.materialXMaterialIndex = 1;
+                }
+            }
+        }
     } else if (cid == THREEJS_UTILITY_MTL_CLASS_ID) {
         Color spec = pb->GetColor(pb_specular_color, t);
         d.specular[0] = spec.r; d.specular[1] = spec.g; d.specular[2] = spec.b;
@@ -1284,6 +1355,11 @@ static void ExtractMaterialXMtl(Mtl* mtl, TimeValue /*t*/, MaxJSPBR& d) {
     d.materialXFile = FindPBString(mtl, _T("MaterialXFile"));
     d.materialXMaterialName = FindPBString(mtl, _T("curMatName"));
     d.materialXMaterialIndex = std::max(1, FindPBInt(mtl, _T("curMatIdx"), 1));
+
+    // If no file path, try live export from node graph
+    if (d.materialXFile.empty()) {
+        d.materialXInline = ExportMtlxString(mtl, &d.materialXBase);
+    }
 }
 
 static void ExtractThreeJSToonMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
@@ -6419,13 +6495,33 @@ public:
                 if (!baseUrl.empty()) {
                     ss << L",\"materialXBase\":\"" << EscapeJson(baseUrl.c_str()) << L"\"";
                 }
+            } else if (!pbr.materialXInline.empty()) {
+                ss << L",\"materialXInline\":\"" << EscapeJson(pbr.materialXInline.c_str()) << L"\"";
+                const std::wstring baseUrl = MapAssetPath(pbr.materialXBase, true);
+                if (!baseUrl.empty()) {
+                    ss << L",\"materialXBase\":\"" << EscapeJson(baseUrl.c_str()) << L"\"";
+                }
             }
             if (!pbr.materialXMaterialName.empty()) {
                 ss << L",\"materialXName\":\"" << EscapeJson(pbr.materialXMaterialName.c_str()) << L"\"";
             }
             ss << L",\"materialXIndex\":" << std::max(1, pbr.materialXMaterialIndex);
-        } else if (pbr.materialModel == L"MeshTSLNodeMaterial" && !pbr.tslCode.empty()) {
-            ss << L",\"tslCode\":\"" << EscapeJson(pbr.tslCode.c_str()) << L"\"";
+        } else if (pbr.materialModel == L"MeshTSLNodeMaterial") {
+            if (!pbr.tslCode.empty())
+                ss << L",\"tslCode\":\"" << EscapeJson(pbr.tslCode.c_str()) << L"\"";
+            if (!pbr.materialXInline.empty()) {
+                ss << L",\"materialXInline\":\"" << EscapeJson(pbr.materialXInline.c_str()) << L"\"";
+                const std::wstring baseUrl = MapAssetPath(pbr.materialXBase, true);
+                if (!baseUrl.empty()) {
+                    ss << L",\"materialXBase\":\"" << EscapeJson(baseUrl.c_str()) << L"\"";
+                }
+            }
+            if (!pbr.materialXMaterialName.empty()) {
+                ss << L",\"materialXName\":\"" << EscapeJson(pbr.materialXMaterialName.c_str()) << L"\"";
+            }
+            if (!pbr.materialXInline.empty()) {
+                ss << L",\"materialXIndex\":" << std::max(1, pbr.materialXMaterialIndex);
+            }
         } else if (IsUtilityMaterialModel(pbr.materialModel)) {
             if (pbr.materialModel == L"MeshBackdropNodeMaterial") {
                 ss << L",\"backdropMode\":";

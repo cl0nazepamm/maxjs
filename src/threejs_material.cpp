@@ -274,6 +274,22 @@ public:
     }
     int MapSlotType(int) override { return MAPSLOT_TEXTURE; }
 
+    // Sub-material support (TSL Source Material slot for MaterialX auto-compile)
+    int NumSubMtls() override {
+        return (kind_ == ThreeJSMaterialKind::TSL) ? 1 : 0;
+    }
+    Mtl* GetSubMtl(int i) override {
+        if (kind_ != ThreeJSMaterialKind::TSL || i != 0 || !pblock) return nullptr;
+        return HasParam(pblock, pb_tsl_source_mtl) ? pblock->GetMtl(pb_tsl_source_mtl) : nullptr;
+    }
+    void SetSubMtl(int i, Mtl* m) override {
+        if (kind_ != ThreeJSMaterialKind::TSL || i != 0 || !pblock) return;
+        if (HasParam(pblock, pb_tsl_source_mtl)) pblock->SetValue(pb_tsl_source_mtl, 0, m);
+    }
+    MSTR GetSubMtlSlotName(int i, bool) override {
+        return (i == 0) ? MSTR(_T("Source Material")) : MSTR(_T(""));
+    }
+
     int NumParamBlocks() override { return 1; }
     IParamBlock2* GetParamBlock(int i) override { return i == 0 ? pblock : nullptr; }
     IParamBlock2* GetParamBlockByID(BlockID id) override {
@@ -1150,6 +1166,8 @@ static ParamBlockDesc2 threejs_tsl_pb_desc(
     0,
     IDD_THREEJS_TSL_MTL, IDS_TSL_PARAMS, 0, 0, &tslDlgProc,
     pb_tsl_code, _T("tslCode"), TYPE_STRING, 0, 0,
+        p_end,
+    pb_tsl_source_mtl, _T("sourceMaterial"), TYPE_MTL, 0, 0,
         p_end,
     p_end
 );

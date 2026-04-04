@@ -1204,8 +1204,41 @@
             return material;
         }
 
+        function normalizeMaterialXDocument(text) {
+            const source = String(text ?? '');
+            if (!source.trim()) return source;
+
+            const parser = new DOMParser();
+            const doc = parser.parseFromString(source, 'application/xml');
+            if (doc.querySelector('parsererror')) return source;
+
+            const hasNamedChild = (node, name) => Array.from(node.children).some(child => child.getAttribute('name') === name);
+            const appendElement = (node, tagName, attrs) => {
+                const child = doc.createElement(tagName);
+                for (const [key, value] of Object.entries(attrs)) child.setAttribute(key, value);
+                node.appendChild(child);
+            };
+
+            const ensureNamedChild = (selector, name, tagName, attrs) => {
+                for (const node of doc.querySelectorAll(selector)) {
+                    if (!hasNamedChild(node, name)) appendElement(node, tagName, { name, ...attrs });
+                }
+            };
+
+            // Max's MaterialX export can omit the procedural coordinate input,
+            // while Three's MaterialXLoader only wires what is explicitly present.
+            ensureNamedChild('noise2d, cellnoise2d, worleynoise2d, unifiednoise2d', 'texcoord', 'texcoord', { type: 'vector2' });
+            ensureNamedChild('noise3d, cellnoise3d, worleynoise3d, unifiednoise3d', 'texcoord', 'position', { type: 'vector3' });
+            ensureNamedChild('fractal3d', 'position', 'position', { type: 'vector3' });
+
+            return new XMLSerializer().serializeToString(doc);
+        }
+
         function applyLoadedMaterialXTemplate(target, source, md) {
             target.copy(source);
+            for (const key of Object.keys(source)) {
+                if (key.endsWith('Node')) target[key] = source[key];
+            }
             target.name = source.name || target.name;
             target.side = md.side === 0 ? THREE.FrontSide : THREE.DoubleSide;
             target.userData ??= {};
@@ -1216,7 +1249,7 @@
         }
 
         async function ensureMaterialXTemplateLoaded(cacheKey, template, md) {
-            if (!md.materialXFile) return template;
+            if (!md.materialXFile && !md.materialXInline) return template;
 
             let pending = materialXLoadCache.get(cacheKey);
             if (pending) return pending;
@@ -1227,18 +1260,23 @@
             const loader = new MaterialXLoader(manager);
             if (md.materialXBase) loader.setPath(md.materialXBase);
 
-            pending = fetch(md.materialXFile, { cache: 'no-store' })
-                .then(response => {
-                    if (!response.ok) {
-                        throw new Error(`MaterialX fetch failed: ${response.status} ${response.statusText}`);
-                    }
-                    return response.text();
-                })
-                .then(text => loader.parse(text))
+            // Get MaterialX XML — either from inline string or file fetch
+            const getXml = md.materialXInline
+                ? Promise.resolve(md.materialXInline)
+                : fetch(md.materialXFile, { cache: 'no-store' })
+                    .then(response => {
+                        if (!response.ok) {
+                            throw new Error(`MaterialX fetch failed: ${response.status} ${response.statusText}`);
+                        }
+                        return response.text();
+                    });
+
+            pending = getXml
+                .then(text => loader.parse(normalizeMaterialXDocument(text)))
                 .then(({ materials }) => {
                     const loadedMaterial = pickMaterialXMaterial(materials, md);
                     if (!loadedMaterial) {
-                        throw new Error(`No MaterialX material resolved for ${md.materialXFile}`);
+                        throw new Error(`No MaterialX material resolved for ${md.materialXFile || 'inline'}`);
                     }
 
                     applyLoadedMaterialXTemplate(template, loadedMaterial, md);
@@ -1793,6 +1831,19 @@
             }
         }
 
+        function createMissingTSLMaterial(md) {
+            console.warn('[TSL Material] Missing MaterialX source and tslCode. Rendering debug fallback.', md);
+            const material = new THREE.MeshStandardMaterial({
+                color: 0xff00ff,
+                wireframe: true,
+                side: md.side === 0 ? THREE.FrontSide : THREE.DoubleSide,
+            });
+            material.userData ??= {};
+            material.userData.maxjsTSLMissingSource = true;
+            material.needsUpdate = true;
+            return material;
+        }
+
         function createUtilityMaterial(runtimeModelName, md) {
             if (runtimeModelName === 'MeshBackdropNodeMaterial') {
                 return createBackdropUtilityMaterial(md);
@@ -1921,6 +1972,8 @@
             const wantsUtilityMaterial = utilityMaterialModels.has(requestedModelName);
             const wantsToonMaterial = requestedModelName === 'MeshToonMaterial';
             const wantsSSSMaterial = requestedModelName === 'MeshSSSNodeMaterial';
+            const wantsTSLMaterial = requestedModelName === 'MeshTSLNodeMaterial';
+            const hasMaterialXSource = Boolean(md.materialXInline || md.materialXFile);
             const wantsAdvancedMaterial =
                 requestedModelName === 'MeshPhysicalMaterial' ||
                 requestedModelName === 'MeshStandardNodeMaterial';
@@ -1955,15 +2008,20 @@
                 template = materialXTemplateCache.get(key);
             }
 
-            const wantsTSLMaterial = requestedModelName === 'MeshTSLNodeMaterial';
-
             if (!template) {
                 if (wantsMaterialXMaterial) {
                     template = createPendingMaterialXMaterial(md);
                     materialXTemplateCache.set(key, template);
                     ensureMaterialXTemplateLoaded(key, template, md);
+                } else if (wantsTSLMaterial && hasMaterialXSource) {
+                    // TSL material with MaterialX source — use MaterialXLoader
+                    template = createPendingMaterialXMaterial(md);
+                    materialXTemplateCache.set(key, template);
+                    ensureMaterialXTemplateLoaded(key, template, md);
                 } else if (wantsTSLMaterial && md.tslCode) {
                     template = createTSLMaterial(md);
+                } else if (wantsTSLMaterial) {
+                    template = createMissingTSLMaterial(md);
                 } else if (wantsUtilityMaterial) {
                     template = createUtilityMaterial(runtimeModelName, md);
                 } else {
@@ -2094,11 +2152,12 @@
                 rememberMaterialEmissiveBase(template);
                 template.needsUpdate = true;
                 materialCache.set(key, template);
+
             } else if (wantsMaterialXMaterial) {
                 materialCache.set(key, template);
             }
 
-            if (wantsMaterialXMaterial) {
+            if (wantsMaterialXMaterial || (wantsTSLMaterial && hasMaterialXSource)) {
                 return template;
             }
 
@@ -2106,6 +2165,7 @@
             rememberMaterialEmissiveBase(material);
             return material;
         }
+
 
         // ── Max Bridge ──────────────────────────────────────
         const bridge = {

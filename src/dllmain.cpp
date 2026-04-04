@@ -4981,15 +4981,11 @@ public:
         Mtl* mtl = node->GetMtl();
         if (!mtl) return false;
 
-        std::vector<TimeValue> discoveryTimes;
-        const bool hasMaterialAnimation =
-            BuildAnimatableTimeSamples(mtl, range, currentTime, discoveryTimes);
-        if (!hasMaterialAnimation) {
-            return false;
-        }
-
         std::vector<TimeValue> sampleTimes;
         AppendFrameSampleTimes(sampleTimes, range);
+        if (currentTime >= range.Start() && currentTime <= range.End()) {
+            AppendUniqueTimeValue(sampleTimes, currentTime);
+        }
         SortUniqueTimeValues(sampleTimes);
         if (sampleTimes.size() < 2) {
             return false;

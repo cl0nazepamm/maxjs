@@ -2569,9 +2569,36 @@
         bridge.on('geo_fast', msg => {
             const mesh = nodeMap.get(msg.h);
             if (!mesh) return;
-            const geom = buildGeometry(msg.v, msg.i, msg.uv, msg.norm, {
-                isLine: !!(msg.spline || mesh.isLine || mesh.isLineSegments),
-            });
+            const wantsLine = !!msg.spline;
+            const hasLine = !!(mesh.isLine || mesh.isLineSegments);
+
+            // Type changed (spline ↔ mesh) — need full rebuild, can't just swap geometry
+            if (wantsLine !== hasLine) {
+                maxRoot.remove(mesh);
+                mesh.geometry?.dispose?.();
+                if (Array.isArray(mesh.material)) {
+                    for (const m of mesh.material) m?.dispose?.();
+                } else {
+                    mesh.material?.dispose?.();
+                }
+                const geom = buildGeometry(msg.v, msg.i, msg.uv, msg.norm, { isLine: wantsLine });
+                let newMesh;
+                if (wantsLine) {
+                    newMesh = new THREE.LineSegments(geom, new THREE.LineBasicMaterial({ color: 0xffffff }));
+                } else {
+                    newMesh = new THREE.Mesh(geom, new THREE.MeshStandardMaterial());
+                }
+                newMesh.matrixAutoUpdate = false;
+                newMesh.name = mesh.name;
+                newMesh.frustumCulled = false;
+                newMesh.matrix.copy(mesh.matrix);
+                newMesh.matrixWorld.copy(mesh.matrixWorld);
+                maxRoot.add(newMesh);
+                nodeMap.set(msg.h, newMesh);
+                return;
+            }
+
+            const geom = buildGeometry(msg.v, msg.i, msg.uv, msg.norm, { isLine: wantsLine });
             mesh.geometry.dispose();
             mesh.geometry = geom;
         });

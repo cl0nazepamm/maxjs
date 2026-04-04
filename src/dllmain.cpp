@@ -7378,7 +7378,9 @@ public:
 };
 
 void MaxJSFastNodeEventCallback::ControllerStructured(NodeKeyTab& nodes) {
-    if (owner_) owner_->MarkTrackedNodesDirty(nodes);
+    // Modifier stack changes (add/remove modifier) can change object type
+    // (e.g. spline → extruded mesh). Treat as topology change for full rebuild.
+    if (owner_) owner_->MarkGeometryTopologyDirty(nodes);
 }
 
 void MaxJSFastNodeEventCallback::ControllerOtherEvent(NodeKeyTab& nodes) {

@@ -595,6 +595,10 @@ static MNMesh* TryGetLiveEditablePolyMesh(INode* node) {
     return nullptr;
 }
 
+static bool ExtractSpline(INode* node, TimeValue t,
+                          std::vector<float>& verts,
+                          std::vector<int>& indices);
+
 static uint64_t HashNodeGeometryState(INode* node, TimeValue t) {
     if (!node) return 0;
 
@@ -603,7 +607,15 @@ static uint64_t HashNodeGeometryState(INode* node, TimeValue t) {
     }
 
     ObjectState os = node->EvalWorldState(t);
-    if (!os.obj || os.obj->SuperClassID() != GEOMOBJECT_CLASS_ID) return 0;
+    if (!os.obj) return 0;
+    if (os.obj->SuperClassID() == SHAPE_CLASS_ID) {
+        std::vector<float> verts;
+        std::vector<int> indices;
+        if (!ExtractSpline(node, t, verts, indices)) return 0;
+        const std::vector<float> uvs;
+        return HashMeshData(verts, indices, uvs);
+    }
+    if (os.obj->SuperClassID() != GEOMOBJECT_CLASS_ID) return 0;
     if (IsThreeJSSplatClassID(os.obj->ClassID())) return 0;
 
     if (os.obj->IsSubClassOf(polyObjectClassID)) {
@@ -2639,6 +2651,23 @@ static bool ExtractMesh(INode* node, TimeValue t,
         os.obj->ConvertToType(t, Class_ID(TRIOBJ_CLASS_ID, 0)));
     if (!tri) return false;
     return ExtractMeshFromTriObject(tri, os.obj, verts, uvs, indices, groups);
+}
+
+static bool TryHashExtractedRenderableGeometry(INode* node, TimeValue t, uint64_t& outHash) {
+    std::vector<float> verts, uvs;
+    std::vector<int> indices;
+    std::vector<MatGroup> groups;
+    if (ExtractMesh(node, t, verts, uvs, indices, groups)) {
+        outHash = HashMeshData(verts, indices, uvs);
+        return true;
+    }
+
+    ObjectState os = node->EvalWorldState(t);
+    if (!os.obj || os.obj->SuperClassID() != SHAPE_CLASS_ID) return false;
+    if (!ExtractSpline(node, t, verts, indices)) return false;
+
+    outHash = HashMeshData(verts, indices, uvs);
+    return true;
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -5595,11 +5624,8 @@ public:
             ULONG handle = handles[idx];
             INode* node = ip->GetINodeByHandle(handle);
             if (node) {
-                std::vector<float> verts, uvs;
-                std::vector<int> indices;
-                std::vector<MatGroup> groups;
-                if (ExtractMesh(node, t, verts, uvs, indices, groups)) {
-                    uint64_t hash = HashMeshData(verts, indices, uvs);
+                uint64_t hash = 0;
+                if (TryHashExtractedRenderableGeometry(node, t, hash)) {
                     auto it = geoHashMap_.find(handle);
                     if (it == geoHashMap_.end() || it->second != hash) {
                         SetDirty();

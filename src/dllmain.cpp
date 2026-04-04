@@ -47,6 +47,7 @@
 #include <algorithm>
 #include <numeric>
 #include <functional>
+#include <filesystem>
 #include <cmath>
 #include <cwctype>
 #include <locale>
@@ -121,6 +122,15 @@ static std::wstring Utf8ToWide(const std::string& s) {
     if (needed <= 0) return {};
     std::wstring out(static_cast<size_t>(needed), L'\0');
     MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), out.data(), needed);
+    return out;
+}
+
+static std::string WideToUtf8(const std::wstring& s) {
+    if (s.empty()) return {};
+    int needed = WideCharToMultiByte(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), nullptr, 0, nullptr, nullptr);
+    if (needed <= 0) return {};
+    std::string out(static_cast<size_t>(needed), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), out.data(), needed, nullptr, nullptr);
     return out;
 }
 
@@ -257,6 +267,51 @@ static bool WriteBinaryFile(const std::wstring& path, const std::string& data) {
     const BOOL ok = WriteFile(hFile, data.data(), static_cast<DWORD>(data.size()), &bytesWritten, nullptr);
     CloseHandle(hFile);
     return ok && bytesWritten == data.size();
+}
+
+static bool WriteUtf8File(const std::wstring& path, const std::wstring& text) {
+    return WriteBinaryFile(path, WideToUtf8(text));
+}
+
+static std::wstring HexU64(uint64_t value) {
+    wchar_t buffer[17] = {};
+    swprintf_s(buffer, L"%016llx", static_cast<unsigned long long>(value));
+    return buffer;
+}
+
+static bool RecreateDirectory(const std::wstring& path) {
+    if (path.empty()) return false;
+    std::error_code ec;
+    std::filesystem::remove_all(std::filesystem::path(path), ec);
+    ec.clear();
+    return std::filesystem::create_directories(std::filesystem::path(path), ec) || DirectoryExists(path);
+}
+
+static bool CopyDirectoryRecursive(const std::wstring& src, const std::wstring& dst) {
+    if (src.empty() || dst.empty() || !DirectoryExists(src)) return false;
+    std::error_code ec;
+    const auto srcPath = std::filesystem::path(src);
+    const auto dstPath = std::filesystem::path(dst);
+    std::filesystem::create_directories(dstPath, ec);
+    if (ec) return false;
+
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(srcPath, ec)) {
+        if (ec) return false;
+        const auto relative = std::filesystem::relative(entry.path(), srcPath, ec);
+        if (ec) return false;
+        const auto target = dstPath / relative;
+        if (entry.is_directory()) {
+            std::filesystem::create_directories(target, ec);
+            if (ec) return false;
+            continue;
+        }
+        std::filesystem::create_directories(target.parent_path(), ec);
+        if (ec) return false;
+        std::filesystem::copy_file(entry.path(), target,
+            std::filesystem::copy_options::overwrite_existing, ec);
+        if (ec) return false;
+    }
+    return true;
 }
 
 static int Base64Value(wchar_t ch) {
@@ -2699,7 +2754,8 @@ struct CameraData {
     float pos[3];      // Y-up
     float target[3];   // Y-up
     float up[3];       // Y-up
-    float fov;         // degrees (horizontal)
+    float fov;         // degrees (horizontal) for perspective
+    float viewWidth;   // world-unit width for orthographic
     bool perspective;
 };
 
@@ -2719,6 +2775,7 @@ static void GetViewportCamera(CameraData& cam) {
     Point3 fwd = -Normalize(camTM.GetRow(2));
     Point3 up  = Normalize(camTM.GetRow(1));
     Point3 tgt = pos + fwd * 100.0f;
+    cam.viewWidth = cam.perspective ? 0.0f : vp.GetVPWorldWidth(tgt);
 
     // Raw Z-up coordinates — JS handles conversion
     cam.pos[0] = pos.x;    cam.pos[1] = pos.y;    cam.pos[2] = pos.z;
@@ -4094,8 +4151,443 @@ public:
         return GetProjectDir() + L"\\project.maxjs.json";
     }
 
+    std::wstring GetSnapshotDir() {
+        return GetProjectDir() + L"\\dist";
+    }
+
+    bool CopySnapshotAsset(const std::wstring& rawPath,
+                           bool isDirectory,
+                           const std::wstring& exportDir,
+                           std::unordered_map<std::wstring, std::wstring>& copiedPaths,
+                           std::wstring& relativePath,
+                           std::wstring& error) {
+        std::wstring sourcePath = rawPath;
+        std::replace(sourcePath.begin(), sourcePath.end(), L'/', L'\\');
+        while (isDirectory && !sourcePath.empty() &&
+               (sourcePath.back() == L'\\' || sourcePath.back() == L'/')) {
+            sourcePath.pop_back();
+        }
+
+        if (sourcePath.empty()) {
+            error = L"Snapshot asset path is empty";
+            return false;
+        }
+
+        const std::wstring cacheKey = sourcePath + (isDirectory ? L"\\" : L"");
+        auto cached = copiedPaths.find(cacheKey);
+        if (cached != copiedPaths.end()) {
+            relativePath = cached->second;
+            return true;
+        }
+
+        const DWORD attrs = GetFileAttributesW(sourcePath.c_str());
+        if (attrs == INVALID_FILE_ATTRIBUTES) {
+            error = L"Snapshot asset missing: " + sourcePath;
+            return false;
+        }
+
+        const bool sourceIsDirectory = (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
+        if (sourceIsDirectory != isDirectory) {
+            error = L"Snapshot asset type mismatch: " + sourcePath;
+            return false;
+        }
+
+        const std::wstring assetsDir = exportDir + L"\\assets";
+        SHCreateDirectoryExW(nullptr, assetsDir.c_str(), nullptr);
+
+        const uint64_t hash = HashFNV1a(sourcePath.data(), sourcePath.size() * sizeof(wchar_t));
+        std::wstring targetName;
+        if (isDirectory) {
+            targetName = L"dir_" + HexU64(hash);
+        } else {
+            const wchar_t* ext = PathFindExtensionW(sourcePath.c_str());
+            targetName = L"file_" + HexU64(hash);
+            if (ext && *ext) targetName += ext;
+        }
+
+        const std::wstring targetPath = assetsDir + L"\\" + targetName;
+        bool ok = false;
+        if (isDirectory) {
+            ok = CopyDirectoryRecursive(sourcePath, targetPath);
+            relativePath = L"./assets/" + targetName + L"/";
+        } else {
+            SHCreateDirectoryExW(nullptr, assetsDir.c_str(), nullptr);
+            ok = CopyFileW(sourcePath.c_str(), targetPath.c_str(), FALSE) != FALSE;
+            relativePath = L"./assets/" + targetName;
+        }
+
+        if (!ok) {
+            error = L"Failed to copy snapshot asset: " + sourcePath;
+            return false;
+        }
+
+        copiedPaths.emplace(cacheKey, relativePath);
+        return true;
+    }
+
+    // Resolve a virtual-host URL to a local filesystem path.
+    // Handles both https://maxjs-assets.local/... and https://maxjsdrv<X>.local/...
+    bool ResolveVirtualHostUrl(const std::wstring& url, std::wstring& localPath) {
+        static const std::wstring assetsPrefix = L"https://maxjs-assets.local/";
+        static const std::wstring drvPrefix = L"https://maxjsdrv";
+        static const std::wstring drvSuffix = L".local/";
+
+        if (url.compare(0, assetsPrefix.size(), assetsPrefix) == 0) {
+            localPath = UrlDecodePath(url.substr(assetsPrefix.size()));
+            return true;
+        }
+        if (url.compare(0, drvPrefix.size(), drvPrefix) == 0) {
+            // Pattern: https://maxjsdrv<key>.local/<path>
+            const size_t suffixPos = url.find(drvSuffix, drvPrefix.size());
+            if (suffixPos != std::wstring::npos) {
+                const std::wstring key = url.substr(drvPrefix.size(), suffixPos - drvPrefix.size());
+                const std::wstring rest = url.substr(suffixPos + drvSuffix.size());
+                // Drive key is lowercase letter(s) — map back to drive root
+                if (!key.empty()) {
+                    const wchar_t driveLetter = static_cast<wchar_t>(towupper(key[0]));
+                    localPath = std::wstring(1, driveLetter) + L":\\" + UrlDecodePath(rest);
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    bool RewriteSnapshotAssetUrls(std::wstring& json,
+                                  const std::wstring& exportDir,
+                                  std::wstring& error) {
+        static const std::wstring httpsPrefix = L"https://maxjs";
+        std::unordered_map<std::wstring, std::wstring> copiedPaths;
+        size_t pos = 0;
+        while ((pos = json.find(httpsPrefix, pos)) != std::wstring::npos) {
+            const size_t end = json.find(L'"', pos);
+            if (end == std::wstring::npos) break;
+
+            const std::wstring url = json.substr(pos, end - pos);
+            std::wstring localPath;
+            if (!ResolveVirtualHostUrl(url, localPath)) {
+                pos += url.size();
+                continue;
+            }
+
+            const bool isDirectory = !localPath.empty() && localPath.back() == L'/';
+
+            std::wstring relativePath;
+            if (!CopySnapshotAsset(localPath, isDirectory, exportDir, copiedPaths, relativePath, error)) {
+                return false;
+            }
+
+            json.replace(pos, url.size(), relativePath);
+            pos += relativePath.size();
+        }
+        return true;
+    }
+
+    bool BuildSnapshotBinary(std::wstring& outMetaJson,
+                             std::string& outBinary,
+                             const std::wstring& snapshotUiJson,
+                             std::wstring& error) {
+        Interface* ip = GetCOREInterface();
+        if (!ip) {
+            error = L"3ds Max interface unavailable";
+            return false;
+        }
+
+        INode* root = ip->GetRootNode();
+        if (!root) {
+            error = L"3ds Max scene root unavailable";
+            return false;
+        }
+
+        TimeValue t = ip->GetTime();
+
+        struct SnapshotNode {
+            ULONG handle = 0;
+            INode* node = nullptr;
+            bool visible = true;
+            bool spline = false;
+            std::vector<float> verts, uvs, norms;
+            std::vector<int> indices;
+            std::vector<MatGroup> groups;
+            size_t vOff = 0, iOff = 0, uvOff = 0, nOff = 0;
+        };
+
+        std::vector<SnapshotNode> nodes;
+        size_t totalBytes = 0;
+
+        std::function<void(INode*)> collect = [&](INode* parent) {
+            for (int i = 0; i < parent->NumberOfChildren(); ++i) {
+                INode* node = parent->GetChildNode(i);
+                if (!node) continue;
+
+                // Always recurse into children — a hidden group node
+                // (e.g. PointHelper on a hidden layer) may have visible children.
+                ObjectState os = node->EvalWorldState(t);
+                if (os.obj && IsThreeJSSplatClassID(os.obj->ClassID())) {
+                    collect(node);
+                    continue;
+                }
+                if (IsForestPackNode(node) || IsRailCloneNode(node) ||
+                    (IsTyFlowAvailable() && IsTyFlowNode(node))) {
+                    collect(node);
+                    continue;
+                }
+
+                // Skip hidden nodes from extraction but still recurse below
+                if (node->IsNodeHidden(TRUE)) {
+                    collect(node);
+                    continue;
+                }
+
+                SnapshotNode snapshotNode;
+                snapshotNode.handle = node->GetHandle();
+                snapshotNode.node = node;
+                snapshotNode.visible = !node->IsNodeHidden(TRUE);
+
+                bool extracted = ExtractMesh(node, t, snapshotNode.verts, snapshotNode.uvs,
+                    snapshotNode.indices, snapshotNode.groups, &snapshotNode.norms);
+
+                if (!extracted && os.obj && os.obj->SuperClassID() == SHAPE_CLASS_ID) {
+                    extracted = ExtractSpline(node, t, snapshotNode.verts, snapshotNode.indices);
+                    snapshotNode.spline = extracted;
+                    if (extracted) {
+                        snapshotNode.uvs.clear();
+                        snapshotNode.norms.clear();
+                        snapshotNode.groups.clear();
+                    }
+                }
+
+                if (extracted) {
+                    snapshotNode.vOff = totalBytes;
+                    totalBytes += snapshotNode.verts.size() * sizeof(float);
+                    snapshotNode.iOff = totalBytes;
+                    totalBytes += snapshotNode.indices.size() * sizeof(int);
+                    snapshotNode.uvOff = totalBytes;
+                    totalBytes += snapshotNode.uvs.size() * sizeof(float);
+                    snapshotNode.nOff = totalBytes;
+                    totalBytes += snapshotNode.norms.size() * sizeof(float);
+                    nodes.push_back(std::move(snapshotNode));
+                }
+
+                collect(node);
+            }
+        };
+        collect(root);
+
+        outBinary.assign(std::max<size_t>(totalBytes, 4), '\0');
+        BYTE* buffer = reinterpret_cast<BYTE*>(outBinary.data());
+
+        std::wostringstream ss;
+        ss.imbue(std::locale::classic());
+        ss << L"{\"type\":\"scene_bin\",\"frame\":1";
+        ss << L",\"bin\":\"scene.bin\"";
+        ss << L",\"stats\":{\"producerBytes\":" << totalBytes << L"}";
+        ss << L",\"nodes\":[";
+
+        bool first = true;
+        for (auto& node : nodes) {
+            float xform[16];
+            GetTransform16(node.node, t, xform);
+
+            if (!first) ss << L',';
+            first = false;
+
+            if (!node.verts.empty()) {
+                memcpy(buffer + node.vOff, node.verts.data(), node.verts.size() * sizeof(float));
+            }
+            if (!node.indices.empty()) {
+                memcpy(buffer + node.iOff, node.indices.data(), node.indices.size() * sizeof(int));
+            }
+            if (!node.uvs.empty()) {
+                memcpy(buffer + node.uvOff, node.uvs.data(), node.uvs.size() * sizeof(float));
+            }
+            if (!node.norms.empty()) {
+                memcpy(buffer + node.nOff, node.norms.data(), node.norms.size() * sizeof(float));
+            }
+
+            MaxJSPBR pbr;
+            ExtractPBR(node.node, t, pbr);
+
+            ss << L"{\"h\":" << node.handle;
+            ss << L",\"n\":\"" << EscapeJson(node.node->GetName()) << L'"';
+            ss << L",\"s\":" << (node.node->Selected() ? L'1' : L'0');
+            ss << L",\"props\":{"; WriteNodePropsJson(ss, node.node, t); ss << L'}';
+            ss << L",\"vis\":" << (node.visible ? L'1' : L'0');
+            ss << L",\"t\":"; WriteFloats(ss, xform, 16);
+            if (node.spline) ss << L",\"spline\":true";
+
+            ss << L",\"geo\":{\"vOff\":" << node.vOff;
+            ss << L",\"vN\":" << node.verts.size();
+            ss << L",\"iOff\":" << node.iOff;
+            ss << L",\"iN\":" << node.indices.size();
+            if (!node.uvs.empty()) {
+                ss << L",\"uvOff\":" << node.uvOff;
+                ss << L",\"uvN\":" << node.uvs.size();
+            }
+            if (!node.norms.empty()) {
+                ss << L",\"nOff\":" << node.nOff;
+                ss << L",\"nN\":" << node.norms.size();
+            }
+            ss << L'}';
+
+            Mtl* multiMtl = FindMultiSubMtl(node.node->GetMtl());
+            if (!node.spline && multiMtl && multiMtl->NumSubMtls() > 0 && node.groups.size() > 1) {
+                ss << L",\"groups\":[";
+                for (size_t g = 0; g < node.groups.size(); ++g) {
+                    if (g) ss << L',';
+                    ss << L'[' << node.groups[g].start << L',' << node.groups[g].count << L',' << g << L']';
+                }
+                ss << L"],\"mats\":[";
+                for (size_t g = 0; g < node.groups.size(); ++g) {
+                    if (g) ss << L',';
+                    Mtl* subMtl = GetSubMtlFromMatID(multiMtl, node.groups[g].matID);
+                    MaxJSPBR subPBR;
+                    ExtractPBRFromMtl(subMtl, node.node, t, subPBR);
+                    WriteMaterialFull(ss, subPBR);
+                }
+                ss << L"]";
+            } else {
+                ss << L",\"mat\":";
+                WriteMaterialFull(ss, pbr);
+            }
+
+            ss << L'}';
+        }
+
+        ss << L"],";
+        WriteCameraJson(ss);
+
+        EnvData envData;
+        GetEnvironment(envData);
+        std::wstring hdriUrl;
+        if (!envData.isSky && !envData.hdriPath.empty()) {
+            hdriUrl = MapTexturePath(envData.hdriPath);
+        }
+
+        ss << L",";
+        WriteEnvJson(ss, envData, hdriUrl);
+
+        FogData fogData;
+        GetFogData(fogData);
+        ss << L",";
+        WriteFogJson(ss, fogData);
+        ss << L",";
+        WriteLightsJson(ss, ip, t, true, false, false);
+        ss << L",";
+        WriteSplatsJson(ss, ip, t, true, false, false);
+
+        {
+            std::vector<ForestInstanceGroup> allInstGroups;
+            std::function<void(INode*)> collectInstances = [&](INode* parent) {
+                for (int c = 0; c < parent->NumberOfChildren(); ++c) {
+                    INode* node = parent->GetChildNode(c);
+                    if (!node) continue;
+                    if (node->IsNodeHidden(TRUE)) {
+                        collectInstances(node);
+                        continue;
+                    }
+                    if (IsForestPackAvailable() && IsForestPackNode(node))
+                        ExtractForestPackInstances(node, t, allInstGroups);
+                    else if (IsRailCloneAvailable() && IsRailCloneNode(node))
+                        ExtractRailCloneInstances(node, t, allInstGroups);
+                    else if (IsTyFlowAvailable() && IsTyFlowNode(node))
+                        ExtractTyFlowInstances(node, t, allInstGroups);
+                    collectInstances(node);
+                }
+            };
+            collectInstances(root);
+
+            if (!allInstGroups.empty()) {
+                ss << L",\"forestInstances\":[";
+                bool firstGroup = true;
+                for (auto& group : allInstGroups) {
+                    if (group.verts.empty() || group.transforms.empty()) continue;
+                    if (!firstGroup) ss << L',';
+                    firstGroup = false;
+                    ss << L"{\"src\":" << group.groupKey;
+                    ss << L",\"count\":" << group.instanceCount;
+                    ss << L",\"v\":"; WriteFloats(ss, group.verts.data(), group.verts.size());
+                    ss << L",\"i\":"; WriteInts(ss, group.indices.data(), group.indices.size());
+                    if (!group.uvs.empty()) {
+                        ss << L",\"uv\":"; WriteFloats(ss, group.uvs.data(), group.uvs.size());
+                    }
+                    if (!group.norms.empty()) {
+                        ss << L",\"norm\":"; WriteFloats(ss, group.norms.data(), group.norms.size());
+                    }
+                    ss << L",\"xforms\":";
+                    WriteFloats(ss, group.transforms.data(), group.transforms.size());
+                    WriteInstanceGroupMaterial(ss, group, t);
+                    ss << L'}';
+                }
+                ss << L']';
+            }
+        }
+
+        if (!snapshotUiJson.empty()) {
+            ss << L",\"snapshotUi\":" << snapshotUiJson;
+        }
+
+        ss << L'}';
+        outMetaJson = ss.str();
+        return true;
+    }
+
+    bool ExportSnapshotSite(const std::wstring& snapshotUiJson,
+                            std::wstring& outDir,
+                            std::wstring& error) {
+        const std::wstring webDir = GetWebDir();
+        if (webDir.empty()) {
+            error = L"Web runtime folder not found";
+            return false;
+        }
+
+        outDir = GetSnapshotDir();
+        if (!RecreateDirectory(outDir)) {
+            error = L"Failed to recreate snapshot directory";
+            return false;
+        }
+
+        // Helper: clean up dist/ on any failure after this point
+        auto cleanupOnFail = [&]() {
+            std::error_code ec;
+            std::filesystem::remove_all(std::filesystem::path(outDir), ec);
+        };
+
+        if (!CopyDirectoryRecursive(webDir, outDir)) {
+            error = L"Failed to copy web runtime into snapshot directory";
+            cleanupOnFail();
+            return false;
+        }
+
+        std::wstring metaJson;
+        std::string binary;
+        if (!BuildSnapshotBinary(metaJson, binary, snapshotUiJson, error)) {
+            cleanupOnFail();
+            return false;
+        }
+
+        if (!RewriteSnapshotAssetUrls(metaJson, outDir, error)) {
+            cleanupOnFail();
+            return false;
+        }
+
+        if (!WriteUtf8File(outDir + L"\\snapshot.json", metaJson)) {
+            error = L"Failed to write snapshot.json";
+            cleanupOnFail();
+            return false;
+        }
+        if (!WriteBinaryFile(outDir + L"\\scene.bin", binary)) {
+            error = L"Failed to write scene.bin";
+            cleanupOnFail();
+            return false;
+        }
+
+        return true;
+    }
+
     void SendHostActionResult(const std::wstring& action, const std::wstring& requestId,
-                              bool ok, const std::wstring& error = {}) {
+                              bool ok, const std::wstring& error = {},
+                              const std::wstring& path = {}) {
         if (!webview_) return;
 
         std::wostringstream ss;
@@ -4106,6 +4598,9 @@ public:
         ss << L",\"ok\":" << (ok ? L"true" : L"false");
         if (!error.empty()) {
             ss << L",\"error\":\"" << EscapeJson(error.c_str()) << L"\"";
+        }
+        if (!path.empty()) {
+            ss << L",\"path\":\"" << EscapeJson(path.c_str()) << L"\"";
         }
         ss << L'}';
         webview_->PostWebMessageAsJson(ss.str().c_str());
@@ -4884,6 +5379,27 @@ public:
             SendHostActionResult(type, requestId, ok, error);
             return;
         }
+        if (type == L"snapshot_export") {
+            std::wstring requestId;
+            std::wstring snapshotBase64;
+            std::wstring snapshotUiJson = L"{}";
+            ExtractJsonString(msg, L"requestId", requestId);
+            if (ExtractJsonString(msg, L"snapshotBase64", snapshotBase64) && !snapshotBase64.empty()) {
+                std::string decoded;
+                if (!DecodeBase64Wide(snapshotBase64, decoded)) {
+                    SendHostActionResult(type, requestId, false, L"Invalid snapshot payload");
+                    return;
+                }
+                snapshotUiJson = Utf8ToWide(decoded);
+                if (snapshotUiJson.empty()) snapshotUiJson = L"{}";
+            }
+
+            std::wstring exportPath;
+            std::wstring error;
+            const bool ok = ExportSnapshotSite(snapshotUiJson, exportPath, error);
+            SendHostActionResult(type, requestId, ok, error, exportPath);
+            return;
+        }
         if (type == L"inline_layer_remove") {
             std::wstring requestId;
             std::wstring id;
@@ -5204,7 +5720,7 @@ public:
         if (hasDirtyCamera) {
             CameraData cam = {};
             GetViewportCamera(cam);
-            frame.UpdateCamera(cam.pos, cam.target, cam.up, cam.fov, cam.perspective);
+            frame.UpdateCamera(cam.pos, cam.target, cam.up, cam.fov, cam.perspective, cam.viewWidth);
             lastSentCamera_ = cam;
             haveLastSentCamera_ = true;
         }
@@ -5361,7 +5877,7 @@ public:
 
         CameraData cam = {};
         GetViewportCamera(cam);
-        frame.UpdateCamera(cam.pos, cam.target, cam.up, cam.fov, cam.perspective);
+        frame.UpdateCamera(cam.pos, cam.target, cam.up, cam.fov, cam.perspective, cam.viewWidth);
         frame.EndFrame();
 
         const auto& frameBytes = frame.bytes();
@@ -6002,6 +6518,10 @@ public:
         ss << L",\"fov\":";
         WriteFloatValue(ss, cam.fov, 60.0f);
         ss << L",\"persp\":" << (cam.perspective ? L"true" : L"false");
+        if (!cam.perspective) {
+            ss << L",\"viewWidth\":";
+            WriteFloatValue(ss, cam.viewWidth, 500.0f);
+        }
         ss << L'}';
     }
 
@@ -6397,7 +6917,7 @@ public:
                          const std::unordered_set<ULONG>& prevGeom) {
         for (int i = 0; i < parent->NumberOfChildren(); i++) {
             INode* node = parent->GetChildNode(i);
-            if (!node || node->IsNodeHidden(TRUE)) continue;
+            if (!node) continue;
             ObjectState os = node->EvalWorldState(t);
             if (os.obj && IsThreeJSSplatClassID(os.obj->ClassID())) {
                 WriteSceneNodes(node, t, ss, first, prevGeom);
@@ -6407,6 +6927,12 @@ public:
             if (IsForestPackNode(node) || IsRailCloneNode(node) ||
                 (IsTyFlowAvailable() && IsTyFlowNode(node))) {
                 pluginInstHandles_.insert(node->GetHandle());
+                WriteSceneNodes(node, t, ss, first, prevGeom);
+                continue;
+            }
+
+            // Hidden node — skip extraction but recurse into children
+            if (node->IsNodeHidden(TRUE)) {
                 WriteSceneNodes(node, t, ss, first, prevGeom);
                 continue;
             }

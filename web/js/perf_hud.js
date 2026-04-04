@@ -38,6 +38,7 @@ export function createPerfHud(infoEl) {
     let lastRenderPaintMs = 0;
 
     function paint() {
+        if (!infoEl.offsetParent && infoEl.style.display === 'none') return;
         if (!state.active) {
             infoEl.textContent = state.statusText;
             return;

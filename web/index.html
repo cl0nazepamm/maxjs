@@ -440,13 +440,15 @@
     <div id="hud">
         <div id="info">MaxJS Live — hot reload works!</div>
         <div id="controls">
-            <button id="btnKill">Kill</button>
-            <button id="btnRefresh">Refresh</button>
-            <button id="btnCamLock" class="active">Cam Lock: ON</button>
-            <button id="btnEnv">Env: OFF</button>
-            <button id="btnLightProbe" class="active">Probe: ON</button>
-            <button id="btnLayersPanel">Layers</button>
-            <button id="btnPostFxPanel">Post FX</button>
+            <button id="btnKill" class="maxonly devonly">Kill</button>
+            <button id="btnRefresh" class="maxonly devonly">Refresh</button>
+            <button id="btnSnapshot" class="maxonly devonly">Snapshot</button>
+            <button id="btnCamLock" class="active devonly">Cam Lock: ON</button>
+            <button id="btnEnv" class="devonly">Env: OFF</button>
+            <button id="btnLightProbe" class="active devonly">Probe: ON</button>
+            <button id="btnLayersPanel" class="maxonly devonly">Layers</button>
+            <button id="btnPostFxPanel" class="devonly">Post FX</button>
+            <button id="btnDebug" style="display:none">Debug</button>
         </div>
     </div>
     <aside id="layersPanel" class="sidepanel sidepanel-left" aria-hidden="true" inert></aside>
@@ -591,9 +593,12 @@
             return activeCamera.getWorldPosition(target);
         }
 
-        const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.1, 100000);
-        camera.up.set(0, 1, 0);
-        camera.position.copy(cameraDefaultPosition);
+        const perspCamera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.1, 100000);
+        const orthoCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 100000);
+        perspCamera.up.set(0, 1, 0);
+        orthoCamera.up.set(0, 1, 0);
+        perspCamera.position.copy(cameraDefaultPosition);
+        let camera = perspCamera;
 
         function configureRenderer(nextRenderer) {
             nextRenderer.setSize(innerWidth, innerHeight);
@@ -1663,8 +1668,10 @@
         }
 
         function applyNodeProps(mesh, props) {
-            if (!mesh?.isMesh || !props) return;
-            if (props.rend === 0) mesh.visible = false;
+            if (!props) return;
+            // Renderable toggle — works for both meshes and splines
+            if (props.rend === 0) { mesh.visible = false; }
+            if (!mesh?.isMesh) return;
             mesh.castShadow = props.cshadow !== 0;
             mesh.receiveShadow = props.rshadow !== 0;
             const side = props.bcull ? THREE.FrontSide : THREE.DoubleSide;
@@ -2107,6 +2114,16 @@
             on(type, fn) { (this.handlers[type] ??= []).push(fn); },
             dispatch(msg) { (this.handlers[msg.type] || []).forEach(fn => fn(msg)); }
         };
+
+        function toBase64Utf8(text) {
+            const bytes = new TextEncoder().encode(String(text ?? ''));
+            let binary = '';
+            const chunkSize = 0x8000;
+            for (let i = 0; i < bytes.length; i += chunkSize) {
+                binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+            }
+            return btoa(binary);
+        }
 
         let hasInitialSync = false;
         let readyRetryTimer = 0;
@@ -3395,16 +3412,44 @@
 
         // ── Camera Sync (Max view → world camera) ───────────
         function applyCamera(cam) {
-            if (!camLock || layerManager?.isCameraOverridden) return;
+            if (!camLock || layerManager?.isCameraOverridden || xrRuntime?.active) return;
             if (!isFiniteArray(cam?.pos, 3) || !isFiniteArray(cam?.tgt, 3) || !isFiniteArray(cam?.up, 3)) {
                 return;
             }
+
+            const wantOrtho = cam.persp === false;
+            const isOrtho = camera.isOrthographicCamera;
+
+            if (wantOrtho && !isOrtho) {
+                // Switch to orthographic
+                scene.remove(camera);
+                camera = orthoCamera;
+                scene.add(camera);
+                controls.object = camera;
+            } else if (!wantOrtho && isOrtho) {
+                // Switch to perspective
+                scene.remove(camera);
+                camera = perspCamera;
+                scene.add(camera);
+                controls.object = camera;
+            }
+
             copyMaxArrayToWorld(camera.position, cam.pos);
             copyMaxArrayToWorld(camera.up, cam.up);
             copyMaxArrayToWorld(cameraTargetWorld, cam.tgt);
             camera.lookAt(cameraTargetWorld);
 
-            if (Number.isFinite(cam.fov) && cam.persp && cam.fov > 0 && cam.fov < 170) {
+            if (wantOrtho) {
+                // viewWidth from Max (world units) defines the visible horizontal span
+                const vw = Number.isFinite(cam.viewWidth) && cam.viewWidth > 0 ? cam.viewWidth : 500;
+                const aspect = innerWidth / innerHeight;
+                camera.left = -vw / 2;
+                camera.right = vw / 2;
+                camera.top = vw / (2 * aspect);
+                camera.bottom = -vw / (2 * aspect);
+                camera.near = 0.1;
+                camera.far = 100000;
+            } else if (Number.isFinite(cam.fov) && cam.fov > 0 && cam.fov < 170) {
                 const aspect = innerWidth / innerHeight;
                 const hRad = cam.fov * Math.PI / 180;
                 camera.fov = 2 * Math.atan(Math.tan(hRad / 2) / aspect) * 180 / Math.PI;
@@ -3419,6 +3464,64 @@
                 if (mesh?.visible) target.expandByObject(mesh);
             }
             return target;
+        }
+
+        function serializeCurrentCameraState() {
+            return {
+                perspective: !camera.isOrthographicCamera,
+                position: camera.position.toArray(),
+                up: camera.up.toArray(),
+                target: controls.target.toArray(),
+                fov: camera.isPerspectiveCamera ? camera.fov : null,
+                viewWidth: camera.isOrthographicCamera ? (camera.right - camera.left) : null,
+            };
+        }
+
+        function applyStandaloneCameraState(savedCamera) {
+            if (!savedCamera) return;
+            if (!isFiniteArray(savedCamera.position, 3) ||
+                !isFiniteArray(savedCamera.up, 3) ||
+                !isFiniteArray(savedCamera.target, 3)) {
+                return;
+            }
+
+            const wantOrtho = savedCamera.perspective === false;
+            const isOrtho = camera.isOrthographicCamera;
+            if (wantOrtho && !isOrtho) {
+                scene.remove(camera);
+                camera = orthoCamera;
+                scene.add(camera);
+                controls.object = camera;
+            } else if (!wantOrtho && isOrtho) {
+                scene.remove(camera);
+                camera = perspCamera;
+                scene.add(camera);
+                controls.object = camera;
+            }
+
+            camera.position.fromArray(savedCamera.position);
+            camera.up.fromArray(savedCamera.up);
+            cameraTargetWorld.fromArray(savedCamera.target);
+            camera.lookAt(cameraTargetWorld);
+
+            if (wantOrtho) {
+                const viewWidth = Number.isFinite(savedCamera.viewWidth) && savedCamera.viewWidth > 0
+                    ? savedCamera.viewWidth
+                    : 500;
+                const aspect = innerWidth / innerHeight;
+                camera.left = -viewWidth / 2;
+                camera.right = viewWidth / 2;
+                camera.top = viewWidth / (2 * aspect);
+                camera.bottom = -viewWidth / (2 * aspect);
+                camera.near = 0.1;
+                camera.far = 100000;
+            } else if (Number.isFinite(savedCamera.fov) && savedCamera.fov > 0 && savedCamera.fov < 170) {
+                camera.fov = savedCamera.fov;
+            }
+
+            camera.updateProjectionMatrix();
+            controls.target.fromArray(savedCamera.target);
+            controls.update();
         }
 
         function fitCamera() {
@@ -3448,6 +3551,31 @@
                 location.reload();
             }
         };
+
+        const btnSnapshot = document.getElementById('btnSnapshot');
+        let pendingSnapshotRequestId = null;
+        btnSnapshot.onclick = () => {
+            if (!window.chrome?.webview || pendingSnapshotRequestId) return;
+            pendingSnapshotRequestId = `snapshot_${Date.now()}`;
+            btnSnapshot.disabled = true;
+            setInfoText('MaxJS - writing snapshot...');
+            bridge.send('snapshot_export', {
+                requestId: pendingSnapshotRequestId,
+                snapshotBase64: toBase64Utf8(JSON.stringify(serializeSnapshotUiState())),
+            });
+        };
+
+        bridge.on('host_action_result', msg => {
+            if (msg.action !== 'snapshot_export') return;
+            if (pendingSnapshotRequestId && msg.requestId && msg.requestId !== pendingSnapshotRequestId) return;
+            pendingSnapshotRequestId = null;
+            btnSnapshot.disabled = false;
+            if (msg.ok) {
+                setInfoText(`MaxJS - snapshot written: ${msg.path || 'dist'}`);
+            } else {
+                reportBridgeError('snapshot export', msg.error || 'snapshot export failed');
+            }
+        });
 
         const btnCam = document.getElementById('btnCamLock');
         btnCam.onclick = () => {
@@ -4310,36 +4438,36 @@
         // ── Post FX persistence via localStorage ──
         const POSTFX_STORAGE_KEY = 'maxjs_postfx_state';
 
+        function serializeSnapshotUiState() {
+            return {
+                toneMapping: currentToneMapping,
+                exposure: currentExposure,
+                envVisible,
+                camLock,
+                lightProbeEnabled,
+                fx: ssgiFx.getState(),
+                camera: serializeCurrentCameraState(),
+                hdri: {
+                    rotation: localHdriRotation,
+                    intensity: localHdriIntensity,
+                    showBg: localHdriShowBg,
+                    blur: localHdriBlur,
+                    flip: localHdriFlip,
+                    enabled: localHdriEnabled,
+                    fileName: isLocalHdriLoaded() ? localHdriFileName : '',
+                },
+            };
+        }
+
         function savePostFxState() {
             try {
-                const state = ssgiFx.getState();
-                const payload = {
-                    toneMapping: currentToneMapping,
-                    exposure: currentExposure,
-                    envVisible,
-                    camLock,
-                    lightProbeEnabled,
-                    fx: state,
-                    hdri: {
-                        rotation: localHdriRotation,
-                        intensity: localHdriIntensity,
-                        showBg: localHdriShowBg,
-                        blur: localHdriBlur,
-                        flip: localHdriFlip,
-                        enabled: localHdriEnabled,
-                        fileName: isLocalHdriLoaded() ? localHdriFileName : '',
-                    },
-                };
+                const payload = serializeSnapshotUiState();
                 localStorage.setItem(POSTFX_STORAGE_KEY, JSON.stringify(payload));
             } catch {}
         }
 
-        function restorePostFxState() {
+        function applySavedPostFxPayload(saved) {
             try {
-                const raw = localStorage.getItem(POSTFX_STORAGE_KEY);
-                if (!raw) return;
-                const saved = JSON.parse(raw);
-
                 if (saved.toneMapping && toneMappingModes[saved.toneMapping] != null) {
                     currentToneMapping = saved.toneMapping;
                     renderer.toneMapping = toneMappingModes[currentToneMapping];
@@ -4394,6 +4522,16 @@
                     if (wasEnabled) section.setEnabled(true);
                 }
             } catch (e) {
+                console.warn('MaxJS: failed to apply post-FX state', e);
+            }
+        }
+
+        function restorePostFxState() {
+            try {
+                const raw = localStorage.getItem(POSTFX_STORAGE_KEY);
+                if (!raw) return;
+                applySavedPostFxPayload(JSON.parse(raw));
+            } catch (e) {
                 console.warn('MaxJS: failed to restore post-FX state', e);
             }
         }
@@ -4410,7 +4548,14 @@
         // ── Resize + Render ─────────────────────────────────
         let resizeTimer = null;
         addEventListener('resize', () => {
-            camera.aspect = innerWidth / innerHeight;
+            if (camera.isPerspectiveCamera) {
+                camera.aspect = innerWidth / innerHeight;
+            } else {
+                const viewWidth = Math.max(0.001, camera.right - camera.left);
+                const aspect = innerWidth / innerHeight;
+                camera.top = viewWidth / (2 * aspect);
+                camera.bottom = -viewWidth / (2 * aspect);
+            }
             camera.updateProjectionMatrix();
             renderer.setSize(innerWidth, innerHeight);
             // Debounce post-FX resize — only recompile after dragging stops
@@ -4681,7 +4826,9 @@
             return runtime;
         }
 
-        const xrRuntime = createWebXRRuntime();
+        const xrRuntime = !window.chrome?.webview
+            ? { active: false, shouldBypassPostFx: false, update() {} }
+            : createWebXRRuntime();
 
         function renderFrame() {
             const frameDt = inlineClock.getDelta();
@@ -4722,14 +4869,49 @@
             overlayRoot,
             space: sceneSpace,
         });
-        const projectRuntime = createProjectRuntime({ layerManager, bridge, perfHud });
-        layerManager.bindProjectRuntime(projectRuntime);
+        const projectRuntime = window.chrome?.webview
+            ? createProjectRuntime({ layerManager, bridge, perfHud })
+            : null;
+        if (projectRuntime) {
+            layerManager.bindProjectRuntime(projectRuntime);
+        }
         window.maxJSProjectRuntime = projectRuntime;
         window.maxJS.layers = layerManager;
         _layerManagerRef = layerManager;
         _projectRuntimeRef = projectRuntime;
         attachLayerPanelSubscriptions();
         queueLayersPanelRefresh();
+
+        async function loadStandaloneSnapshot() {
+            if (window.chrome?.webview) return false;
+            try {
+                const metaResponse = await fetch('./snapshot.json', { cache: 'no-store' });
+                if (!metaResponse.ok) return false;
+                const meta = await metaResponse.json();
+                const binResponse = await fetch(meta.bin || './scene.bin', { cache: 'no-store' });
+                if (!binResponse.ok) {
+                    throw new Error(`HTTP ${binResponse.status} for ${meta.bin || './scene.bin'}`);
+                }
+                const buffer = await binResponse.arrayBuffer();
+                handleBinaryScene(buffer, meta);
+                if (meta.snapshotUi) {
+                    // Local HDRI file can't survive export — clear so we don't try to load a missing file
+                    if (meta.snapshotUi.hdri) {
+                        meta.snapshotUi.hdri.fileName = '';
+                        meta.snapshotUi.hdri.enabled = false;
+                    }
+                    applySavedPostFxPayload(meta.snapshotUi);
+                    applyStandaloneCameraState(meta.snapshotUi.camera);
+                    buildPostFxPanel();
+                    syncPostFxPanel(true);
+                }
+                setInfoText(`MaxJS Snapshot - ${meta.nodes?.length ?? 0} nodes`);
+                return true;
+            } catch (error) {
+                reportBridgeError('snapshot load', error);
+                return false;
+            }
+        }
 
         bridge.on('js_inline', msg => {
             switch (msg.action) {
@@ -4744,6 +4926,42 @@
                 case 'clear':  layerManager.clearInline(); break;
             }
         });
+
+        // ── Build mode / Standalone / Debug ──
+        // Build modes: 'dev' (local dev, all UI), 'release' (GitHub, no HUD/controls)
+        // Override via ?mode=dev or ?mode=release in URL
+        const isStandalone = !window.chrome?.webview;
+        const urlMode = new URLSearchParams(location.search).get('mode');
+        const buildMode = urlMode || (isStandalone ? 'release' : 'dev');
+        const DEBUG_STORAGE_KEY = 'maxjs_debug';
+        let debugMode = isStandalone ? false
+            : (localStorage.getItem(DEBUG_STORAGE_KEY) ?? 'true') === 'true';
+
+        function applyBuildMode() {
+            if (isStandalone) {
+                document.getElementById('hud').style.display = 'none';
+            } else {
+                document.getElementById('info').style.display = debugMode ? '' : 'none';
+                document.getElementById('btnDebug').classList.toggle('active', debugMode);
+            }
+        }
+
+        function setDebugMode(enabled) {
+            debugMode = enabled;
+            try { localStorage.setItem(DEBUG_STORAGE_KEY, String(debugMode)); } catch {}
+            applyBuildMode();
+        }
+
+        if (isStandalone) {
+            void loadStandaloneSnapshot();
+        } else {
+            // Debug toggle in Max — hides HUD/controls for clean viewport
+            const debugBtn = document.getElementById('btnDebug');
+            debugBtn.style.display = '';
+            debugBtn.onclick = () => setDebugMode(!debugMode);
+        }
+
+        applyBuildMode();
 
         renderer.setAnimationLoop(renderFrame);
 

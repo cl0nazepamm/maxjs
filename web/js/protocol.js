@@ -103,15 +103,16 @@ export function applyDeltaFrame(buffer, handlers = {}) {
                 break;
             }
             case COMMAND_TYPES.UpdateCamera: {
-                assertSize('UpdateCamera', commandSize, 48);
+                assertSize('UpdateCamera', commandSize, 52);
                 const pos = new Float32Array(buffer, payloadOffset, 3);
                 const tgt = new Float32Array(buffer, payloadOffset + 12, 3);
                 const up = new Float32Array(buffer, payloadOffset + 24, 3);
                 const fov = view.getFloat32(payloadOffset + 36, true);
                 const persp = view.getUint32(payloadOffset + 40, true) !== 0;
+                const viewWidth = view.getFloat32(payloadOffset + 44, true);
                 decodeMs += performance.now() - decodeStart;
                 const applyStart = performance.now();
-                handlers.onCamera?.({ pos, tgt, up, fov, persp });
+                handlers.onCamera?.({ pos, tgt, up, fov, persp, viewWidth });
                 applyMs += performance.now() - applyStart;
                 break;
             }

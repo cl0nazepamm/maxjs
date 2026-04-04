@@ -60,8 +60,8 @@ void DeltaFrameBuilder::UpdateVisibility(std::uint32_t nodeHandle, bool visible)
 }
 
 void DeltaFrameBuilder::UpdateCamera(const float* position3, const float* target3, const float* up3,
-                                     float fov, bool perspective) {
-    BeginCommand(CommandType::UpdateCamera, 10 * sizeof(float) + 4);
+                                     float fov, bool perspective, float viewWidth) {
+    BeginCommand(CommandType::UpdateCamera, 11 * sizeof(float) + 4);
     for (int i = 0; i < 3; ++i) {
         AppendF32(position3[i]);
     }
@@ -73,6 +73,7 @@ void DeltaFrameBuilder::UpdateCamera(const float* position3, const float* target
     }
     AppendF32(fov);
     AppendU32(perspective ? 1u : 0u);
+    AppendF32(viewWidth);
 }
 
 void DeltaFrameBuilder::EndFrame() {

@@ -3616,12 +3616,25 @@
         let pendingSnapshotRequestId = null;
         btnSnapshot.onclick = () => {
             if (!window.chrome?.webview || pendingSnapshotRequestId) return;
+
+            let runtimeSnapshotBase64 = '';
+            try {
+                const runtimeSnapshot = layerManager.serializeSnapshot?.() ?? null;
+                if (runtimeSnapshot) {
+                    runtimeSnapshotBase64 = toBase64Utf8(JSON.stringify(runtimeSnapshot));
+                }
+            } catch (error) {
+                reportBridgeError('snapshot serialize', error);
+                return;
+            }
+
             pendingSnapshotRequestId = `snapshot_${Date.now()}`;
             btnSnapshot.disabled = true;
             setInfoText('MaxJS - writing snapshot...');
             bridge.send('snapshot_export', {
                 requestId: pendingSnapshotRequestId,
                 snapshotBase64: toBase64Utf8(JSON.stringify(serializeSnapshotUiState())),
+                runtimeBase64: runtimeSnapshotBase64,
             });
         };
 
@@ -4948,6 +4961,21 @@
                 }
                 const buffer = await binResponse.arrayBuffer();
                 handleBinaryScene(buffer, meta);
+                if (meta.runtimeScene) {
+                    const SnapshotObjectLoader = THREE.ObjectLoader || THREE_STD.ObjectLoader;
+                    const objectLoader = SnapshotObjectLoader ? new SnapshotObjectLoader() : null;
+                    if (!objectLoader) {
+                        throw new Error('Three.js ObjectLoader unavailable for snapshot runtime scene');
+                    }
+                    if (meta.runtimeScene.jsRoot) {
+                        const jsSnapshotRoot = objectLoader.parse(meta.runtimeScene.jsRoot);
+                        if (jsSnapshotRoot?.isObject3D) jsRoot.add(jsSnapshotRoot);
+                    }
+                    if (meta.runtimeScene.overlayRoot) {
+                        const overlaySnapshotRoot = objectLoader.parse(meta.runtimeScene.overlayRoot);
+                        if (overlaySnapshotRoot?.isObject3D) overlayRoot.add(overlaySnapshotRoot);
+                    }
+                }
                 if (meta.snapshotUi) {
                     applySavedPostFxPayload(meta.snapshotUi);
                     applyStandaloneCameraState(meta.snapshotUi.camera);

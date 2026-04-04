@@ -833,6 +833,36 @@ export function createLayerManager({
         return layers.get(id)?.code ?? null;
     }
 
+    function buildSnapshotRootJson(name, selectGroup) {
+        const root = new THREE.Group();
+        root.name = name;
+
+        let hasChildren = false;
+        for (const layer of layers.values()) {
+            const group = selectGroup(layer);
+            if (!group?.isObject3D || group.children.length === 0) continue;
+            root.add(group.clone(true));
+            hasChildren = true;
+        }
+
+        return hasChildren ? root.toJSON() : null;
+    }
+
+    function serializeSnapshot() {
+        return {
+            version: 1,
+            layers: [...layers.values()].map(layer => ({
+                id: layer.id,
+                name: layer.name,
+                source: layer.source,
+                active: layer.active,
+                error: layer.error,
+            })),
+            jsRoot: buildSnapshotRootJson('__maxjs_snapshot_js_root__', layer => layer.group),
+            overlayRoot: buildSnapshotRootJson('__maxjs_snapshot_overlay_root__', layer => layer.overlayGroup),
+        };
+    }
+
     function serialize() {
         return [...layers.values()].map(layer => ({
             id: layer.id,
@@ -858,6 +888,7 @@ export function createLayerManager({
         getStats,
         update,
         getLayerCode,
+        serializeSnapshot,
         serialize,
         get isCameraOverridden() { return cameraControl.isClaimed(); },
         roots: freezePlainObject({

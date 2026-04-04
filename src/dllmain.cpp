@@ -4421,6 +4421,7 @@ public:
     bool BuildSnapshotBinary(std::wstring& outMetaJson,
                              std::string& outBinary,
                              const std::wstring& snapshotUiJson,
+                             const std::wstring& runtimeSceneJson,
                              std::wstring& error) {
         Interface* ip = GetCOREInterface();
         if (!ip) {
@@ -4661,6 +4662,9 @@ public:
         if (!snapshotUiJson.empty()) {
             ss << L",\"snapshotUi\":" << snapshotUiJson;
         }
+        if (!runtimeSceneJson.empty()) {
+            ss << L",\"runtimeScene\":" << runtimeSceneJson;
+        }
 
         ss << L'}';
         outMetaJson = ss.str();
@@ -4668,6 +4672,7 @@ public:
     }
 
     bool ExportSnapshotSite(const std::wstring& snapshotUiJson,
+                            const std::wstring& runtimeSceneJson,
                             std::wstring& outDir,
                             std::wstring& error) {
         const std::wstring webDir = GetWebDir();
@@ -4695,7 +4700,7 @@ public:
 
         std::wstring metaJson;
         std::string binary;
-        if (!BuildSnapshotBinary(metaJson, binary, snapshotUiJson, error)) {
+        if (!BuildSnapshotBinary(metaJson, binary, snapshotUiJson, runtimeSceneJson, error)) {
             cleanupOnFail();
             return false;
         }
@@ -5517,6 +5522,8 @@ public:
             std::wstring requestId;
             std::wstring snapshotBase64;
             std::wstring snapshotUiJson = L"{}";
+            std::wstring runtimeBase64;
+            std::wstring runtimeSceneJson;
             ExtractJsonString(msg, L"requestId", requestId);
             if (ExtractJsonString(msg, L"snapshotBase64", snapshotBase64) && !snapshotBase64.empty()) {
                 std::string decoded;
@@ -5527,10 +5534,18 @@ public:
                 snapshotUiJson = Utf8ToWide(decoded);
                 if (snapshotUiJson.empty()) snapshotUiJson = L"{}";
             }
+            if (ExtractJsonString(msg, L"runtimeBase64", runtimeBase64) && !runtimeBase64.empty()) {
+                std::string decoded;
+                if (!DecodeBase64Wide(runtimeBase64, decoded)) {
+                    SendHostActionResult(type, requestId, false, L"Invalid runtime snapshot payload");
+                    return;
+                }
+                runtimeSceneJson = Utf8ToWide(decoded);
+            }
 
             std::wstring exportPath;
             std::wstring error;
-            const bool ok = ExportSnapshotSite(snapshotUiJson, exportPath, error);
+            const bool ok = ExportSnapshotSite(snapshotUiJson, runtimeSceneJson, exportPath, error);
             SendHostActionResult(type, requestId, ok, error, exportPath);
             return;
         }

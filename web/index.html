@@ -491,6 +491,7 @@
         import { RectAreaLightTexturesLib } from 'three/addons/lights/RectAreaLightTexturesLib.js';
         import { hashBlur } from 'three/addons/tsl/display/hashBlur.js';
         import { XRButton } from 'three/addons/webxr/XRButton.js';
+        import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
         import { SkyMesh } from 'three/addons/objects/SkyMesh.js';
         import * as GaussianSplats3D from 'gaussian-splats-3d';
         import {
@@ -509,23 +510,100 @@
         import { createLayerManager } from './js/layer_manager.js';
         import { createProjectRuntime } from './js/project_runtime.js';
 
-        // ── Scene Setup (Z-up, matching Max) ────────────────
+        // ── Scene Setup (Y-up world + Max basis boundary) ───
         const hiddenBackgroundColor = 0x353535;
         const scene = new THREE.Scene();
         scene.background = new THREE.Color(hiddenBackgroundColor);
+        const maxBasisRoot = new THREE.Group();
+        maxBasisRoot.name = '__maxjs_max_basis_root__';
+        maxBasisRoot.rotation.x = -Math.PI / 2;
+        scene.add(maxBasisRoot);
         const maxRoot = new THREE.Group();
         maxRoot.name = '__maxjs_max_root__';
-        scene.add(maxRoot);
+        maxBasisRoot.add(maxRoot);
         const jsRoot = new THREE.Group();
         jsRoot.name = '__maxjs_js_root__';
         scene.add(jsRoot);
         const overlayRoot = new THREE.Group();
         overlayRoot.name = '__maxjs_overlay_root__';
-        scene.add(overlayRoot);
+        maxBasisRoot.add(overlayRoot);
+
+        const MAX_TO_WORLD_ROTATION_X = -Math.PI / 2;
+        const MAX_TO_WORLD_QUATERNION = new THREE.Quaternion()
+            .setFromEuler(new THREE.Euler(MAX_TO_WORLD_ROTATION_X, 0, 0, 'XYZ'));
+        const WORLD_TO_MAX_QUATERNION = MAX_TO_WORLD_QUATERNION.clone().invert();
+        const MAX_TO_WORLD_MATRIX = new THREE.Matrix4()
+            .makeRotationFromQuaternion(MAX_TO_WORLD_QUATERNION);
+        const MAX_TO_WORLD_MATRIX_STD = new THREE_STD.Matrix4()
+            .makeRotationX(MAX_TO_WORLD_ROTATION_X);
+        const cameraTargetWorld = new THREE.Vector3();
+        const cameraPositionWorld = new THREE.Vector3();
+        const lightTargetWorld = new THREE.Vector3();
+
+        function readVector3(target, value) {
+            if (Array.isArray(value) || ArrayBuffer.isView(value)) {
+                target.set(value[0] ?? 0, value[1] ?? 0, value[2] ?? 0);
+                return target;
+            }
+            if (value && Number.isFinite(value.x) && Number.isFinite(value.y) && Number.isFinite(value.z)) {
+                target.set(value.x, value.y, value.z);
+                return target;
+            }
+            target.set(0, 0, 0);
+            return target;
+        }
+
+        function copyMaxArrayToWorld(target, values) {
+            target.set(values[0], values[1], values[2]);
+            target.applyQuaternion(MAX_TO_WORLD_QUATERNION);
+            return target;
+        }
+
+        function copyMaxComponentsToWorld(target, x, y, z) {
+            target.set(x, y, z);
+            target.applyQuaternion(MAX_TO_WORLD_QUATERNION);
+            return target;
+        }
+
+        function copyMaxMatrixArrayToWorld(target, matrixArray) {
+            target.fromArray(matrixArray);
+            target.premultiply(MAX_TO_WORLD_MATRIX);
+            return target;
+        }
+
+        function copyMaxMatrixArrayToWorldStd(target, matrixArray) {
+            target.fromArray(matrixArray);
+            target.premultiply(MAX_TO_WORLD_MATRIX_STD);
+            return target;
+        }
+
+        const cameraDefaultPosition = copyMaxComponentsToWorld(new THREE.Vector3(), 200, -200, 150);
+        const cameraDefaultDirection = cameraDefaultPosition.clone().normalize();
+        const sceneSpace = Object.freeze({
+            maxUpAxis: Object.freeze(new THREE.Vector3(0, 0, 1)),
+            worldUpAxis: Object.freeze(new THREE.Vector3(0, 1, 0)),
+            toWorldPosition(value, target = new THREE.Vector3()) {
+                return readVector3(target, value).applyQuaternion(MAX_TO_WORLD_QUATERNION);
+            },
+            toWorldDirection(value, target = new THREE.Vector3()) {
+                return readVector3(target, value).applyQuaternion(MAX_TO_WORLD_QUATERNION);
+            },
+            toWorldMatrix(value, target = new THREE.Matrix4()) {
+                return copyMaxMatrixArrayToWorld(target, value);
+            },
+            toMaxPosition(value, target = new THREE.Vector3()) {
+                return readVector3(target, value).applyQuaternion(WORLD_TO_MAX_QUATERNION);
+            },
+        });
+
+        function getActiveCameraWorldPosition(target = new THREE.Vector3()) {
+            const activeCamera = renderer.xr?.isPresenting ? renderer.xr.getCamera(camera) : camera;
+            return activeCamera.getWorldPosition(target);
+        }
 
         const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.1, 100000);
-        camera.up.set(0, 0, 1);  // Z-up to match Max
-        camera.position.set(200, -200, 150);
+        camera.up.set(0, 1, 0);
+        camera.position.copy(cameraDefaultPosition);
 
         function configureRenderer(nextRenderer) {
             nextRenderer.setSize(innerWidth, innerHeight);
@@ -609,9 +687,9 @@
         }, true);
         controls.enabled = false;  // cam lock ON by default
 
-        // Grid on XY plane (Z-up)
+        // Grid lives in Max space under the basis root, so the default helper plane
+        // lands on Max's XY ground plane without extra rotations.
         const grid = new THREE.GridHelper(200, 20, 0x555555, 0x444444);
-        grid.rotation.x = Math.PI / 2;  // Rotate to XY plane for Z-up
         grid.visible = false;
         overlayRoot.add(grid);
 
@@ -712,7 +790,6 @@
             splatLayer.appendChild(overlayRenderer.domElement);
 
             const overlayCamera = new THREE_STD.PerspectiveCamera(camera.fov, camera.aspect, camera.near, camera.far);
-            overlayCamera.up.set(0, 0, 1);
 
             const viewer = new GaussianSplats3D.Viewer({
                 selfDrivenMode: false,
@@ -763,7 +840,7 @@
             if (!sceneRef) return;
 
             if (isFiniteArray(splat?.t, 16)) {
-                splatMatrix.fromArray(splat.t);
+                copyMaxMatrixArrayToWorldStd(splatMatrix, splat.t);
                 splatMatrix.decompose(splatPosition, splatQuaternion, splatScale);
                 sceneRef.position.copy(splatPosition);
                 sceneRef.quaternion.copy(splatQuaternion);
@@ -1324,25 +1401,9 @@
             // Exposure
             renderer.toneMappingExposure = Math.pow(2, envParams.exp || 0) * (envParams.gamma || 1.0);
 
-            // Autodesk HDRIenv:
-            //   u = rot + atan2( x, y )
-            //   v sample = 1 - ( 0.5 + asin( z ) / PI )
-            // Three.js equirect:
-            //   u = atan2( z, x )
-            //   v = 0.5 + asin( y ) / PI
-            // So the lookup direction remap is:
-            //   (x, y, z)_three = ( y, -z, x )_max
-            // with Autodesk rotation applied around Max's Z axis before the basis remap.
             const rot = (envParams.rot || 0) * Math.PI / 180;
-            const envBasis = new THREE.Matrix4().makeBasis(
-                new THREE.Vector3(0, 0, 1),
-                new THREE.Vector3(1, 0, 0),
-                new THREE.Vector3(0, -1, 0)
-            );
-            const envYaw = new THREE.Matrix4().makeRotationZ(-rot);
-            const envRotation = new THREE.Matrix4().multiplyMatrices(envBasis, envYaw);
-            scene.environmentRotation.setFromRotationMatrix(envRotation);
-            scene.backgroundRotation.copy(scene.environmentRotation);
+            scene.environmentRotation.set(0, -rot, 0);
+            scene.backgroundRotation.set(0, -rot, 0);
             const probeSignature = JSON.stringify([hdriUrl, envParams.rot || 0, envParams.flip || 0, envParams.zup || 0]);
             const shouldRefreshTexture = hdriUrl !== currentHdriUrl;
             const shouldRefreshProbe = !!options.forceProbeRefresh
@@ -1420,18 +1481,12 @@
                 scene.environment = localHdriEnvMap;
                 scene.environmentIntensity = localHdriIntensity;
                 const rot = localHdriRotation * Math.PI / 180;
-                const envBasis = new THREE.Matrix4().makeBasis(
-                    new THREE.Vector3(0, 0, 1),
-                    new THREE.Vector3(1, 0, 0),
-                    new THREE.Vector3(0, -1, 0)
-                );
-                const envYaw = new THREE.Matrix4().makeRotationZ(-rot);
-                const flipMat = localHdriFlip
-                    ? new THREE.Matrix4().makeScale(1, 1, -1)
-                    : new THREE.Matrix4();
-                const envRotation = new THREE.Matrix4().multiplyMatrices(envBasis, envYaw).multiply(flipMat);
-                scene.environmentRotation.setFromRotationMatrix(envRotation);
-                scene.backgroundRotation.copy(scene.environmentRotation);
+                scene.environmentRotation.set(0, -rot, 0);
+                scene.backgroundRotation.set(0, -rot, 0);
+                if (localHdriFlip) {
+                    scene.environmentRotation.y += Math.PI;
+                    scene.backgroundRotation.y += Math.PI;
+                }
                 scene.backgroundBlurriness = localHdriBlur;
                 if (localHdriShowBg) {
                     scene.background = localHdriEnvMap;
@@ -1499,6 +1554,7 @@
         let skyMesh = null;
         let skySunLight = null;
         let skyFillLight = null;
+        let skyEnvMap = null;
         let lastSkySig = '';
         let skyActive = false;
 
@@ -1523,13 +1579,15 @@
                 skyMesh.mieCoefficient.value = skyParams.mieCoefficient;
                 skyMesh.mieDirectionalG.value = skyParams.mieDirectionalG;
 
-                // Tell SkyMesh shader that Z is up (matches Max/camera convention)
-                skyMesh.upUniform.value.set(0, 0, 1);
+                // Sky lives in world space, so keep the shader on world Y-up and
+                // convert the incoming Max sun direction at the boundary.
+                skyMesh.upUniform.value.set(0, 1, 0);
 
-                // Sun direction in Z-up: elevation from XY plane, azimuth around Z
+                // Sun direction authored in Max space: elevation from XY plane,
+                // azimuth around Z, then converted once into world Y-up space.
                 const elevRad = THREE.MathUtils.degToRad(skyParams.elevation);
                 const azimRad = THREE.MathUtils.degToRad(skyParams.azimuth);
-                const sunDir = new THREE.Vector3(
+                const sunDir = copyMaxComponentsToWorld(new THREE.Vector3(),
                     Math.cos(elevRad) * Math.sin(azimRad),
                     Math.cos(elevRad) * Math.cos(azimRad),
                     Math.sin(elevRad)
@@ -1539,8 +1597,18 @@
                 renderer.toneMappingExposure = skyParams.exposure;
 
                 if (skyMesh.parent !== scene) scene.add(skyMesh);
+
+                // Generate environment map from sky for PBR reflections
+                const skyScene = new THREE.Scene();
+                const skyCopy = skyMesh.clone();
+                skyScene.add(skyCopy);
+                if (skyEnvMap) skyEnvMap.dispose();
+                skyEnvMap = pmremGenerator.fromScene(skyScene, 0, 0.1, 1000000).texture;
+                skyCopy.geometry?.dispose?.();
+                skyScene.clear();
+
                 scene.background = null;
-                scene.environment = null;
+                scene.environment = skyEnvMap;
                 scene.environmentRotation.identity();
                 scene.backgroundRotation.identity();
 
@@ -1582,6 +1650,7 @@
             if (skyMesh?.parent) skyMesh.parent.remove(skyMesh);
             if (skySunLight?.parent) skySunLight.parent.remove(skySunLight);
             if (skyFillLight?.parent) skyFillLight.parent.remove(skyFillLight);
+            if (skyEnvMap) { skyEnvMap.dispose(); skyEnvMap = null; }
         }
 
         // ── Material Creation ───────────────────────────────
@@ -2901,11 +2970,13 @@
                 light.position.set(ld.pos[0], ld.pos[1], ld.pos[2]);
                 light.width = ld.width || 20;
                 light.height = ld.height || 20;
-                light.lookAt(
+                copyMaxComponentsToWorld(
+                    lightTargetWorld,
                     ld.pos[0] + ld.dir[0],
                     ld.pos[1] + ld.dir[1],
                     ld.pos[2] + ld.dir[2]
                 );
+                light.lookAt(lightTargetWorld);
                 break;
             case 4:
                 light.position.set(ld.pos[0], ld.pos[1], ld.pos[2]);
@@ -3228,7 +3299,7 @@
         function updateVolumeUniforms() {
             for (const [, mesh] of volumeMeshes) {
                 if (mesh.material?.uniforms?.cameraPos) {
-                    mesh.material.uniforms.cameraPos.value.copy(camera.position);
+                    mesh.material.uniforms.cameraPos.value.copy(getActiveCameraWorldPosition(cameraPositionWorld));
                 }
             }
         }
@@ -3259,15 +3330,16 @@
             }
         }
 
-        // ── Camera Sync (Z-up, raw from Max) ────────────────
+        // ── Camera Sync (Max view → world camera) ───────────
         function applyCamera(cam) {
             if (!camLock || layerManager?.isCameraOverridden) return;
             if (!isFiniteArray(cam?.pos, 3) || !isFiniteArray(cam?.tgt, 3) || !isFiniteArray(cam?.up, 3)) {
                 return;
             }
-            camera.position.set(cam.pos[0], cam.pos[1], cam.pos[2]);
-            camera.up.set(cam.up[0], cam.up[1], cam.up[2]);
-            camera.lookAt(cam.tgt[0], cam.tgt[1], cam.tgt[2]);
+            copyMaxArrayToWorld(camera.position, cam.pos);
+            copyMaxArrayToWorld(camera.up, cam.up);
+            copyMaxArrayToWorld(cameraTargetWorld, cam.tgt);
+            camera.lookAt(cameraTargetWorld);
 
             if (Number.isFinite(cam.fov) && cam.persp && cam.fov > 0 && cam.fov < 170) {
                 const aspect = innerWidth / innerHeight;
@@ -3275,23 +3347,26 @@
                 camera.fov = 2 * Math.atan(Math.tan(hRad / 2) / aspect) * 180 / Math.PI;
             }
             camera.updateProjectionMatrix();
-            controls.target.set(cam.tgt[0], cam.tgt[1], cam.tgt[2]);
+            controls.target.copy(cameraTargetWorld);
+        }
+
+        function computeVisibleSceneBounds(target = new THREE.Box3()) {
+            target.makeEmpty();
+            for (const [, mesh] of nodeMap) {
+                if (mesh?.visible) target.expandByObject(mesh);
+            }
+            return target;
         }
 
         function fitCamera() {
             scene.updateMatrixWorld(true);
-            const box = new THREE.Box3();
-            for (const [, mesh] of nodeMap) box.expandByObject(mesh);
+            const box = computeVisibleSceneBounds(new THREE.Box3());
             if (box.isEmpty()) return;
             const center = box.getCenter(new THREE.Vector3());
             const size = box.getSize(new THREE.Vector3());
             const maxDim = Math.max(size.x, size.y, size.z);
             controls.target.copy(center);
-            camera.position.set(
-                center.x + maxDim * 1.2,
-                center.y - maxDim * 1.2,
-                center.z + maxDim * 0.8
-            );
+            camera.position.copy(center).addScaledVector(cameraDefaultDirection, maxDim * 1.85);
             camera.near = maxDim * 0.001;
             camera.far = maxDim * 100;
             camera.updateProjectionMatrix();
@@ -4281,109 +4356,286 @@
             }
         });
 
-        // ── WebXR / VR (minimal, matching Three.js examples) ─
-        let vrActive = false;
+        // ── WebXR / VR ───────────────────────────────────────
+        function createWebXRRuntime() {
+            const runtime = {
+                active: false,
+                supportsXR: false,
+                shouldBypassPostFx: false,
+                update() {},
+            };
 
-        try {
             const isNativeWebGPU = rendererBackendLabel === 'WebGPU';
-
             if (isNativeWebGPU) {
                 const vrNote = document.createElement('button');
                 vrNote.textContent = 'Switch to VR';
-                vrNote.style.cssText = 'position:absolute;bottom:8px;right:8px;z-index:100;background:rgba(40,40,60,0.7);color:#888;border:1px solid #333;padding:3px 8px;border-radius:3px;font:10px "Segoe UI",sans-serif;cursor:pointer';
+                vrNote.style.cssText = 'position:absolute;bottom:8px;right:8px;z-index:100;background:rgba(40,40,60,0.78);color:#ddd;border:1px solid #333;padding:4px 10px;border-radius:4px;font:10px "Segoe UI",sans-serif;cursor:pointer';
                 vrNote.onclick = () => {
-                    if (confirm('VR requires WebGL backend. Restart without WebGPU post-effects?')) {
+                    if (confirm('WebXR needs the WebGL backend. Restart MaxJS in XR mode now?')) {
                         sessionStorage.setItem('maxjs_force_webgl', '1');
                         location.reload();
                     }
                 };
                 document.body.appendChild(vrNote);
-            } else {
+                return runtime;
+            }
+
+            try {
                 renderer.xr.enabled = true;
-                document.body.appendChild(XRButton.createButton(renderer));
+                renderer.xr.setReferenceSpaceType?.('local-floor');
+                runtime.supportsXR = true;
 
-                // Camera group: converts VR tracking (Y-up meters) → scene space (Z-up cm)
-                const vrCamGroup = new THREE.Group();
-                vrCamGroup.name = '__vr_cam';
-                // Don't transform the cam group — transform the scene instead
-                scene.add(vrCamGroup);
-                vrCamGroup.visible = false; // hidden until VR starts
+                const xrButton = XRButton.createButton(renderer, {
+                    optionalFeatures: ['local-floor', 'bounded-floor', 'hand-tracking'],
+                });
+                xrButton.style.zIndex = '100';
+                document.body.appendChild(xrButton);
 
-                // Controllers inside the camera group (move with user)
-                const geo = new THREE.BufferGeometry();
-                geo.setAttribute('position', new THREE.Float32BufferAttribute([0,0,0, 0,0,-0.5], 3));
-                const lineMat = new THREE.LineBasicMaterial({ color: 0x4488ff });
+                const xrOrigin = new THREE.Group();
+                xrOrigin.name = '__maxjs_xr_origin__';
+                xrOrigin.visible = false;
+                scene.add(xrOrigin);
 
-                for (let i = 0; i < 2; i++) {
-                    const ctrl = renderer.xr.getController(i);
-                    ctrl.add(new THREE.Line(geo.clone(), lineMat.clone()));
-                    ctrl.addEventListener('selectend', () => {
-                        const dir = new THREE.Vector3(0, 0, -1);
-                        dir.applyQuaternion(ctrl.quaternion);
-                        dir.multiplyScalar(300);
-                        vrCamGroup.position.add(dir);
-                    });
-                    scene.add(ctrl);  // scene, not cam group
+                const controllerModelFactory = new XRControllerModelFactory();
+                const pointerGeometry = new THREE.BufferGeometry();
+                pointerGeometry.setAttribute('position', new THREE.Float32BufferAttribute([0, 0, 0, 0, 0, -1], 3));
+                const controllerStates = [];
+                const savedCameraState = {
+                    position: new THREE.Vector3(),
+                    quaternion: new THREE.Quaternion(),
+                    up: new THREE.Vector3(),
+                    target: new THREE.Vector3(),
+                    hasValue: false,
+                };
+                const moveForward = new THREE.Vector3();
+                const moveRight = new THREE.Vector3();
+                const moveDelta = new THREE.Vector3();
+                const focusBounds = new THREE.Box3();
+                const focusCenter = new THREE.Vector3();
+
+                const inputDeadzone = 0.16;
+                const moveSpeed = 180;
+                const verticalSpeed = 120;
+                const snapTurnAngle = THREE.MathUtils.degToRad(30);
+                const snapTurnThreshold = 0.72;
+                const snapTurnReset = 0.28;
+
+                function applyDeadzone(value, deadzone = inputDeadzone) {
+                    if (!Number.isFinite(value) || Math.abs(value) <= deadzone) return 0;
+                    return ((Math.abs(value) - deadzone) / (1 - deadzone)) * Math.sign(value);
                 }
 
-                renderer.xr.addEventListener('sessionstart', () => {
-                    vrActive = true;
+                function readPrimaryStick(inputSource) {
+                    const axes = inputSource?.gamepad?.axes;
+                    if (!axes?.length) return { x: 0, y: 0 };
+
+                    let bestX = 0;
+                    let bestY = 0;
+                    let bestStrength = 0;
+                    const pairCount = Math.floor(axes.length / 2);
+                    for (let i = 0; i < pairCount; i++) {
+                        const x = applyDeadzone(axes[i * 2] ?? 0);
+                        const y = applyDeadzone(axes[i * 2 + 1] ?? 0);
+                        const strength = x * x + y * y;
+                        if (strength > bestStrength) {
+                            bestStrength = strength;
+                            bestX = x;
+                            bestY = y;
+                        }
+                    }
+                    return { x: bestX, y: bestY };
+                }
+
+                function isButtonPressed(inputSource, index) {
+                    return !!inputSource?.gamepad?.buttons?.[index]?.pressed;
+                }
+
+                function getControllerState(handedness, fallbackIndex = -1) {
+                    for (const state of controllerStates) {
+                        if (state.inputSource?.handedness === handedness) return state;
+                    }
+                    if (fallbackIndex >= 0 && controllerStates[fallbackIndex]?.inputSource) {
+                        return controllerStates[fallbackIndex];
+                    }
+                    return controllerStates.find(state => !!state.inputSource) ?? null;
+                }
+
+                function recenterOrigin() {
+                    const box = computeVisibleSceneBounds(focusBounds);
+                    if (box.isEmpty()) {
+                        xrOrigin.position.set(0, 0, 0);
+                        xrOrigin.rotation.set(0, 0, 0);
+                        return;
+                    }
+
+                    box.getCenter(focusCenter);
+                    xrOrigin.position.copy(focusCenter);
+                    xrOrigin.position.y = 0;
+                    xrOrigin.rotation.set(0, 0, 0);
+                }
+
+                function captureCameraState() {
+                    savedCameraState.position.copy(camera.position);
+                    savedCameraState.quaternion.copy(camera.quaternion);
+                    savedCameraState.up.copy(camera.up);
+                    savedCameraState.target.copy(controls.target);
+                    savedCameraState.hasValue = true;
+                }
+
+                function restoreCameraState() {
+                    if (!savedCameraState.hasValue) {
+                        camera.up.set(0, 1, 0);
+                        camera.position.copy(cameraDefaultPosition);
+                        camera.lookAt(controls.target);
+                        return;
+                    }
+                    camera.position.copy(savedCameraState.position);
+                    camera.quaternion.copy(savedCameraState.quaternion);
+                    camera.up.copy(savedCameraState.up);
+                    controls.target.copy(savedCameraState.target);
+                }
+
+                function handleSessionStart() {
+                    runtime.active = true;
+                    runtime.shouldBypassPostFx = true;
+                    captureCameraState();
                     controls.enabled = false;
-                    vrCamGroup.add(camera);
-                    vrCamGroup.visible = true;
+                    xrOrigin.visible = true;
+                    xrOrigin.scale.setScalar(100);
+                    xrOrigin.add(camera);
+                    recenterOrigin();
+                    perfHud.setStatus('MaxJS - XR active');
+                }
 
-                    // DON'T transform scene — causes render errors.
-                    // Instead, scale+rotate the cam group to map
-                    // VR meters/Y-up INTO scene cm/Z-up.
-                    //
-                    // VR headset 1.7m up → need to be at Z=170 in scene.
-                    // VR 1 meter step → 100cm in scene.
-                    // VR Y-up → scene Z-up: rotate cam group so VR-Y maps to scene-Z
-                    vrCamGroup.rotation.x = Math.PI / 2;
-                    vrCamGroup.scale.setScalar(100);
-
-                    // Start at scene center
-                    const box = new THREE.Box3();
-                    for (const [, mesh] of nodeMap) {
-                        if (mesh.visible) box.expandByObject(mesh);
-                    }
-                    if (!box.isEmpty()) {
-                        const center = box.getCenter(new THREE.Vector3());
-                        vrCamGroup.position.copy(center);
-                        vrCamGroup.position.z = 0; // floor level
-                    }
-                });
-                renderer.xr.addEventListener('sessionend', () => {
-                    vrActive = false;
-                    controls.enabled = !camLock;
+                function handleSessionEnd() {
+                    runtime.active = false;
+                    runtime.shouldBypassPostFx = false;
                     scene.add(camera);
-                    vrCamGroup.visible = false;
-                    vrCamGroup.rotation.set(0, 0, 0);
-                    vrCamGroup.scale.setScalar(1);
-                    vrCamGroup.position.set(0, 0, 0);
-                    camera.up.set(0, 0, 1);
-                    camera.position.set(200, -200, 150);
-                });
+                    xrOrigin.visible = false;
+                    xrOrigin.position.set(0, 0, 0);
+                    xrOrigin.rotation.set(0, 0, 0);
+                    xrOrigin.scale.setScalar(1);
+                    restoreCameraState();
+                    camera.updateProjectionMatrix();
+                    controls.enabled = !camLock;
+                    controls.update();
+                    perfHud.setStatus(`MaxJS - ${rendererBackendLabel} renderer ready`);
+                }
+
+                function updateLocomotion(dt) {
+                    if (!runtime.active) return;
+
+                    const leftState = getControllerState('left', 0);
+                    const rightState = getControllerState('right', 1);
+                    const moveState = leftState ?? rightState;
+                    const turnState = rightState && rightState !== moveState ? rightState : null;
+
+                    if (moveState?.inputSource) {
+                        const { x, y } = readPrimaryStick(moveState.inputSource);
+                        const xrCamera = renderer.xr.getCamera(camera);
+                        xrCamera.getWorldDirection(moveForward);
+                        moveForward.y = 0;
+                        if (moveForward.lengthSq() < 1e-6) moveForward.set(0, 0, -1);
+                        moveForward.normalize();
+                        moveRight.crossVectors(moveForward, camera.up).normalize();
+
+                        moveDelta.set(0, 0, 0);
+                        if (x) moveDelta.addScaledVector(moveRight, x * moveSpeed * dt);
+                        if (y) moveDelta.addScaledVector(moveForward, -y * moveSpeed * dt);
+                        if (moveDelta.lengthSq() > 0) xrOrigin.position.add(moveDelta);
+
+                        if (isButtonPressed(moveState.inputSource, 1)) {
+                            xrOrigin.position.y += verticalSpeed * dt;
+                        }
+                    }
+
+                    if (rightState?.inputSource && isButtonPressed(rightState.inputSource, 1)) {
+                        xrOrigin.position.y -= verticalSpeed * dt;
+                    }
+
+                    if (turnState?.inputSource) {
+                        const { x } = readPrimaryStick(turnState.inputSource);
+                        if (turnState.turnReady && Math.abs(x) >= snapTurnThreshold) {
+                            xrOrigin.rotateY(-Math.sign(x) * snapTurnAngle);
+                            turnState.turnReady = false;
+                        } else if (!turnState.turnReady && Math.abs(x) <= snapTurnReset) {
+                            turnState.turnReady = true;
+                        }
+                    }
+                }
+
+                for (let i = 0; i < 2; i++) {
+                    const controller = renderer.xr.getController(i);
+                    const grip = renderer.xr.getControllerGrip(i);
+                    const ray = new THREE.Line(pointerGeometry, new THREE.LineBasicMaterial({
+                        color: i === 0 ? 0x66d9ef : 0xffc857,
+                        transparent: true,
+                        opacity: 0.85,
+                    }));
+                    ray.name = `__maxjs_xr_ray_${i}`;
+                    ray.scale.z = 0.75;
+                    controller.visible = false;
+                    grip.visible = false;
+                    controller.add(ray);
+                    grip.add(controllerModelFactory.createControllerModel(grip));
+                    xrOrigin.add(controller);
+                    xrOrigin.add(grip);
+
+                    const state = {
+                        index: i,
+                        controller,
+                        grip,
+                        ray,
+                        inputSource: null,
+                        turnReady: true,
+                    };
+
+                    controller.addEventListener('connected', event => {
+                        state.inputSource = event.data ?? null;
+                        controller.visible = true;
+                        grip.visible = true;
+                    });
+                    controller.addEventListener('disconnected', () => {
+                        state.inputSource = null;
+                        state.turnReady = true;
+                        controller.visible = false;
+                        grip.visible = false;
+                    });
+
+                    controllerStates.push(state);
+                }
+
+                renderer.xr.addEventListener('sessionstart', handleSessionStart);
+                renderer.xr.addEventListener('sessionend', handleSessionEnd);
+                runtime.update = updateLocomotion;
+            } catch (error) {
+                console.warn('[MaxJS] WebXR init failed:', error);
             }
-        } catch (e) {
-            console.warn('[MaxJS] WebXR not available:', e);
+
+            return runtime;
         }
 
-        function processVRInput() {}
+        const xrRuntime = createWebXRRuntime();
 
         function renderFrame() {
-            processVRInput();
+            const frameDt = inlineClock.getDelta();
+            const frameElapsed = inlineClock.getElapsedTime();
+            xrRuntime.update(frameDt);
             controls.update();
             // Default key light follows camera
             if (defaultLights.visible) {
-                defaultKey.position.copy(camera.position);
+                defaultKey.position.copy(getActiveCameraWorldPosition(cameraPositionWorld));
             }
             updateVolumeUniforms();
-            layerManager.update(inlineClock.getDelta(), inlineClock.getElapsedTime());
+            layerManager.update(frameDt, frameElapsed);
             perfHud.updateLayers(layerManager.getStats());
             const renderStart = performance.now();
-            ssgiFx.render();
-            if (splatOverlay && splatHandleMap.size > 0) {
+            if (xrRuntime.shouldBypassPostFx) {
+                renderer.render(scene, camera);
+            } else {
+                ssgiFx.render();
+            }
+            if (!xrRuntime.active && splatOverlay && splatHandleMap.size > 0) {
                 updateSplatCamera();
                 splatOverlay.viewer.update();
                 splatOverlay.viewer.render();
@@ -4394,7 +4646,17 @@
 
         // ── JS_Inline Layer Manager ──────────────────────────
         const inlineClock = new THREE.Clock();
-        const layerManager = createLayerManager({ scene, camera, renderer, THREE, nodeMap, maxRoot, jsRoot, overlayRoot });
+        const layerManager = createLayerManager({
+            scene,
+            camera,
+            renderer,
+            THREE,
+            nodeMap,
+            maxRoot,
+            jsRoot,
+            overlayRoot,
+            space: sceneSpace,
+        });
         const projectRuntime = createProjectRuntime({ layerManager, bridge, perfHud });
         layerManager.bindProjectRuntime(projectRuntime);
         window.maxJSProjectRuntime = projectRuntime;

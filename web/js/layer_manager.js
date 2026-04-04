@@ -110,7 +110,7 @@ function freezePlainObject(obj) {
     return Object.freeze(obj);
 }
 
-function createCameraAdapter(camera, THREE, ownForJs, cameraControl) {
+function createCameraAdapter(camera, THREE, ownForJs, cameraControl, layerId) {
     return freezePlainObject({
         get raw() { return camera; },
         getState() {
@@ -134,8 +134,8 @@ function createCameraAdapter(camera, THREE, ownForJs, cameraControl) {
             if (options.name) clone.name = options.name;
             return ownForJs(clone, options.overlay ? OWNER_OVERLAY : OWNER_JS);
         },
-        takeOver() { cameraControl.claim(); },
-        release() { cameraControl.release(); },
+        takeOver() { cameraControl.claim(layerId); },
+        release() { cameraControl.release(layerId); },
         get isOverridden() { return cameraControl.isClaimed(); },
     });
 }
@@ -331,6 +331,7 @@ export function createLayerManager({
     maxRoot = null,
     jsRoot = null,
     overlayRoot = null,
+    space = null,
 }) {
     const layers = new Map();
     const listeners = new Set();
@@ -355,11 +356,17 @@ export function createLayerManager({
 
     if (maxRoot) setOwner(maxRoot, OWNER_MAX);
 
-    let cameraOverride = false;
+    let cameraClaimOwner = null; // layer id that claimed camera, or null
     const cameraControl = {
-        claim() { cameraOverride = true; camera.matrixAutoUpdate = true; },
-        release() { cameraOverride = false; camera.matrixAutoUpdate = false; },
-        isClaimed() { return cameraOverride; },
+        claim(layerId) { cameraClaimOwner = layerId; camera.matrixAutoUpdate = true; },
+        release(layerId) {
+            if (!layerId || cameraClaimOwner === layerId) {
+                cameraClaimOwner = null;
+                camera.matrixAutoUpdate = false;
+            }
+        },
+        isClaimed() { return cameraClaimOwner !== null; },
+        getOwner() { return cameraClaimOwner; },
     };
 
     const isWebGPU = !!(renderer?.backend?.parameters?.forceWebGL === undefined
@@ -471,7 +478,7 @@ export function createLayerManager({
 
     function buildContext(layer) {
         const rendererFacade = createRendererFacade(renderer);
-        const cameraFacade = createCameraAdapter(camera, THREE, ownForLayer, cameraControl);
+        const cameraFacade = createCameraAdapter(camera, THREE, ownForLayer, cameraControl, layer.id);
         const nodeMapFacade = createNodeMapFacade(nodeMap, handle => getLayerNodeAdapter(layer, handle));
         const maxSceneFacade = createMaxSceneFacade({
             scene,
@@ -487,9 +494,10 @@ export function createLayerManager({
             get isWebGPU() { return isWebGPU; },
             get dt() { return dt; },
             get elapsed() { return elapsed; },
-            // Scene coordinate info — 3ds Max is Z-up, units in system units (typically cm)
-            upAxis: Object.freeze(new THREE.Vector3(0, 0, 1)),
-            gravity: Object.freeze(new THREE.Vector3(0, 0, -980)),
+            // Scene coordinate info — world is Y-up (Three.js default), Max Z-up converted on input
+            upAxis: Object.freeze(new THREE.Vector3(0, 1, 0)),
+            gravity: Object.freeze(new THREE.Vector3(0, -980, 0)),
+            space,
             units: 'cm',
             log: (...args) => console.log(`[Layer:${layer.id}]`, ...args),
             warn: (...args) => console.warn(`[Layer:${layer.id}]`, ...args),
@@ -731,6 +739,11 @@ export function createLayerManager({
         disposeOwnedResource(layer.group);
         disposeOwnedResource(layer.overlayGroup);
 
+        // Safety: release camera if this layer had claimed it
+        if (cameraControl.getOwner() === id) {
+            cameraControl.release(id);
+        }
+
         layers.delete(id);
         if (!options.silent) emitChange('removed');
         return true;
@@ -846,7 +859,7 @@ export function createLayerManager({
         update,
         getLayerCode,
         serialize,
-        get isCameraOverridden() { return cameraOverride; },
+        get isCameraOverridden() { return cameraControl.isClaimed(); },
         roots: freezePlainObject({
             maxRoot,
             jsRoot: jsWorldRoot,

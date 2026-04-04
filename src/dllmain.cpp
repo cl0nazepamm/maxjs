@@ -633,7 +633,6 @@ static bool IsImageFile(const wchar_t* path) {
     return (_wcsicmp(ext, L".png") == 0 || _wcsicmp(ext, L".jpg") == 0 ||
             _wcsicmp(ext, L".jpeg") == 0 || _wcsicmp(ext, L".tga") == 0 ||
             _wcsicmp(ext, L".tif") == 0 || _wcsicmp(ext, L".tiff") == 0 ||
-            _wcsicmp(ext, L".tif") == 0 || _wcsicmp(ext, L".tiff") == 0 ||
             _wcsicmp(ext, L".bmp") == 0 || _wcsicmp(ext, L".exr") == 0 ||
             _wcsicmp(ext, L".hdr") == 0 || _wcsicmp(ext, L".dds") == 0 ||
             _wcsicmp(ext, L".psd") == 0 || _wcsicmp(ext, L".tx") == 0);
@@ -692,6 +691,7 @@ struct MaxJSPBR {
         bool  isUberBitmap = false;
         bool  hasChannelSelect = false;
         int   outputChannelIndex = 1;
+        bool  invert = false;
         float scale = 1.0f;
         float tiling[2] = {1.0f, 1.0f};
         float offset[2] = {0.0f, 0.0f};
@@ -765,10 +765,12 @@ struct MaxJSPBR {
     std::wstring colorMap, gradientMap, roughnessMap, metalnessMap, normalMap;
     std::wstring bumpMap, displacementMap, parallaxMap, sssColorMap, matcapMap, specularMap;
     std::wstring aoMap, emissionMap, lightmapFile, opacityMap;
+    std::wstring transmissionMap;
     std::wstring clearcoatMap, clearcoatRoughnessMap, clearcoatNormalMap;
     TexTransform colorMapTransform, gradientMapTransform, roughnessMapTransform, metalnessMapTransform, normalMapTransform;
     TexTransform bumpMapTransform, displacementMapTransform, parallaxMapTransform, sssColorMapTransform;
     TexTransform aoMapTransform, emissionMapTransform, lightmapTransform, opacityMapTransform, matcapMapTransform, specularMapTransform;
+    TexTransform transmissionMapTransform;
     TexTransform clearcoatMapTransform, clearcoatRoughnessMapTransform, clearcoatNormalMapTransform;
     std::wstring mtlName;
     std::wstring tslCode;
@@ -934,6 +936,27 @@ static bool IsAutodeskUberBitmap(Texmap* map) {
     return fileName && _wcsicmp(fileName, L"UberBitmap2.osl") == 0;
 }
 
+static void ExtractStdUVTransform(Texmap* map, MaxJSPBR::TexTransform& xf) {
+    if (!map) return;
+
+    UVGen* uvGen = map->GetTheUVGen();
+    if (uvGen && uvGen->IsStdUVGen()) {
+        auto* stdUv = static_cast<StdUVGen*>(uvGen);
+        xf.tiling[0] = stdUv->GetUScl(0);
+        xf.tiling[1] = stdUv->GetVScl(0);
+        xf.offset[0] = stdUv->GetUOffs(0);
+        xf.offset[1] = stdUv->GetVOffs(0);
+        xf.rotate = stdUv->GetWAng(0) * (180.0f / PI);
+
+        const int tilingFlags = stdUv->GetTextureTiling();
+        if ((tilingFlags & (U_MIRROR | V_MIRROR)) != 0) {
+            xf.wrapMode = L"mirror";
+        } else if ((tilingFlags & (U_WRAP | V_WRAP)) != (U_WRAP | V_WRAP)) {
+            xf.wrapMode = L"clamp";
+        }
+    }
+}
+
 static bool ExtractMaterialTexture(Texmap* map, std::wstring& filePath, MaxJSPBR::TexTransform& xf) {
     if (!map) return false;
 
@@ -982,6 +1005,7 @@ static bool ExtractMaterialTexture(Texmap* map, std::wstring& filePath, MaxJSPBR
             return false;
         filePath = filename;
         xf = {};
+        ExtractStdUVTransform(resolved, xf);
         xf.hasChannelSelect = outputChannelIndex != 1;
         xf.outputChannelIndex = outputChannelIndex;
         return true;
@@ -1003,8 +1027,13 @@ static bool ExtractMaterialTexture(Texmap* map, std::wstring& filePath, MaxJSPBR
             return false;
         filePath = filename;
         xf = {};
+        ExtractStdUVTransform(resolved, xf);
         xf.hasChannelSelect = outputChannelIndex != 1;
         xf.outputChannelIndex = outputChannelIndex;
+        xf.colorSpace = FindPBString(resolved, _T("color_space"));
+        if (xf.colorSpace.empty())
+            xf.colorSpace = FindPBString(resolved, _T("rgbColorSpace"));
+        xf.manualGamma = FindPBFloat(resolved, _T("gamma"), 1.0f);
         return true;
     }
 
@@ -1024,6 +1053,36 @@ static bool ExtractMaterialTexture(Texmap* map, std::wstring& filePath, MaxJSPBR
     }
 
     return false;
+}
+
+static void ExtractWrappedNormalBumpMaps(
+    Texmap* map,
+    std::wstring& normalPath,
+    MaxJSPBR::TexTransform& normalXf,
+    std::wstring& bumpPath,
+    MaxJSPBR::TexTransform& bumpXf)
+{
+    if (!map) return;
+
+    if (map->ClassID() == NORMAL_BUMP_CLASS_ID || map->ClassID() == VRAYNORMALMAP_CLASS_ID) {
+        Texmap* normalMap = FindPBMap(map, _T("normal_map"));
+        Texmap* bumpMap = FindPBMap(map, _T("bump_map"));
+        const bool normalEnabled = FindPBInt(map, _T("map1on"), 1) != 0;
+        const bool bumpEnabled = FindPBInt(map, _T("map2on"), 1) != 0;
+
+        if (!normalMap && map->NumSubTexmaps() > 0)
+            normalMap = map->GetSubTexmap(0);
+        if (!bumpMap && map->NumSubTexmaps() > 1)
+            bumpMap = map->GetSubTexmap(1);
+
+        if (normalEnabled && normalMap)
+            ExtractMaterialTexture(normalMap, normalPath, normalXf);
+        if (bumpEnabled && bumpMap)
+            ExtractMaterialTexture(bumpMap, bumpPath, bumpXf);
+        return;
+    }
+
+    ExtractMaterialTexture(map, bumpPath, bumpXf);
 }
 
 static void ExtractThreeJSMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
@@ -1564,30 +1623,33 @@ static void ExtractPhysicalMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
     // Detect which one and route to the correct PBR field.
     Texmap* bumpSlot = getTexmap(_T("bump_map"), _T("bump_map_on"));
     if (bumpSlot) {
-        if (bumpSlot->ClassID() == NORMAL_BUMP_CLASS_ID) {
-            // Normal Bump wrapper — subtex 0 = normal map, subtex 1 = additional bump
-            if (bumpSlot->NumSubTexmaps() > 0 && bumpSlot->GetSubTexmap(0))
-                ExtractMaterialTexture(bumpSlot->GetSubTexmap(0), d.normalMap, d.normalMapTransform);
-            if (bumpSlot->NumSubTexmaps() > 1 && bumpSlot->GetSubTexmap(1)) {
-                ExtractMaterialTexture(bumpSlot->GetSubTexmap(1), d.bumpMap, d.bumpMapTransform);
-                d.bumpScale = d.normalScale;
-            }
-        } else {
-            // Plain texmap — treat as height-based bump map
-            ExtractMaterialTexture(bumpSlot, d.bumpMap, d.bumpMapTransform);
+        ExtractWrappedNormalBumpMaps(
+            bumpSlot,
+            d.normalMap,
+            d.normalMapTransform,
+            d.bumpMap,
+            d.bumpMapTransform
+        );
+        if (!d.bumpMap.empty()) {
             d.bumpScale = d.normalScale;
-            d.normalScale = 1.0f;
         }
     }
 
     // Clearcoat normal/bump — same detection logic
     Texmap* coatBumpSlot = getTexmap(_T("coat_bump_map"), _T("coat_bump_map_on"));
     if (coatBumpSlot) {
-        if (coatBumpSlot->ClassID() == NORMAL_BUMP_CLASS_ID) {
-            if (coatBumpSlot->NumSubTexmaps() > 0 && coatBumpSlot->GetSubTexmap(0))
-                ExtractMaterialTexture(coatBumpSlot->GetSubTexmap(0), d.clearcoatNormalMap, d.clearcoatNormalMapTransform);
-        } else {
-            ExtractMaterialTexture(coatBumpSlot, d.clearcoatNormalMap, d.clearcoatNormalMapTransform);
+        std::wstring clearcoatBumpPath;
+        MaxJSPBR::TexTransform clearcoatBumpXf;
+        ExtractWrappedNormalBumpMaps(
+            coatBumpSlot,
+            d.clearcoatNormalMap,
+            d.clearcoatNormalMapTransform,
+            clearcoatBumpPath,
+            clearcoatBumpXf
+        );
+        if (d.clearcoatNormalMap.empty() && !clearcoatBumpPath.empty()) {
+            d.clearcoatNormalMap = clearcoatBumpPath;
+            d.clearcoatNormalMapTransform = clearcoatBumpXf;
         }
     }
 }
@@ -1736,15 +1798,31 @@ static void ExtractOpenPBRMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
     // bump_map can be Normal Bump or plain bump — same detection as Physical
     Texmap* bumpSlot = getTexmap(_T("bump_map"), _T("bump_map_on"));
     if (bumpSlot) {
-        if (bumpSlot->ClassID() == NORMAL_BUMP_CLASS_ID) {
-            if (d.normalMap.empty() && bumpSlot->NumSubTexmaps() > 0 && bumpSlot->GetSubTexmap(0))
-                ExtractMaterialTexture(bumpSlot->GetSubTexmap(0), d.normalMap, d.normalMapTransform);
-            if (bumpSlot->NumSubTexmaps() > 1 && bumpSlot->GetSubTexmap(1))
-                ExtractMaterialTexture(bumpSlot->GetSubTexmap(1), d.bumpMap, d.bumpMapTransform);
-        } else if (d.normalMap.empty()) {
-            ExtractMaterialTexture(bumpSlot, d.normalMap, d.normalMapTransform);
-        } else {
-            ExtractMaterialTexture(bumpSlot, d.bumpMap, d.bumpMapTransform);
+        std::wstring wrappedNormalPath;
+        MaxJSPBR::TexTransform wrappedNormalXf;
+        std::wstring wrappedBumpPath;
+        MaxJSPBR::TexTransform wrappedBumpXf;
+        ExtractWrappedNormalBumpMaps(
+            bumpSlot,
+            wrappedNormalPath,
+            wrappedNormalXf,
+            wrappedBumpPath,
+            wrappedBumpXf
+        );
+
+        if (d.normalMap.empty() && !wrappedNormalPath.empty()) {
+            d.normalMap = wrappedNormalPath;
+            d.normalMapTransform = wrappedNormalXf;
+        }
+        if (!wrappedBumpPath.empty()) {
+            d.bumpMap = wrappedBumpPath;
+            d.bumpMapTransform = wrappedBumpXf;
+        } else if (d.normalMap.empty() && d.bumpMap.empty()) {
+            d.bumpMap = wrappedNormalPath;
+            d.bumpMapTransform = wrappedNormalXf;
+        }
+        if (!d.bumpMap.empty()) {
+            d.bumpScale = d.normalScale;
         }
     }
 
@@ -1823,12 +1901,28 @@ static void ExtractVRayMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
             }
         }
     };
+    auto getTexmap = [&](const MCHAR* pname, const MCHAR* onName) -> Texmap* {
+        if (onName && !readBool(onName, true)) return nullptr;
+        for (int b = 0; b < mtl->NumParamBlocks(); b++) {
+            IParamBlock2* pb = mtl->GetParamBlock(b);
+            if (!pb) continue;
+            for (int i = 0; i < pb->NumParams(); i++) {
+                ParamID pid = pb->IndextoID(i);
+                const ParamDef& pd = pb->GetParamDef(pid);
+                if (pd.int_name && _tcsicmp(pd.int_name, pname) == 0 && pd.type == TYPE_TEXMAP)
+                    return pb->GetTexmap(pid, t);
+            }
+        }
+        return nullptr;
+    };
 
     // Core PBR
     readColor(_T("diffuse"), d.color);
-    d.roughness = 1.0f - readFloat(_T("reflection_glossiness"), 1.0f);
+    const bool useRoughnessWorkflow = readBool(_T("brdf_useRoughness"), false);
+    const float reflectionGlossiness = readFloat(_T("reflection_glossiness"), 1.0f);
+    d.roughness = useRoughnessWorkflow ? reflectionGlossiness : (1.0f - reflectionGlossiness);
     d.metalness = readFloat(_T("reflection_metalness"), 0.0f);
-    d.ior = readFloat(_T("reflection_ior"), 1.6f);
+    d.ior = readFloat(_T("refraction_ior"), readFloat(_T("reflection_ior"), 1.6f));
     d.normalScale = readFloat(_T("bump_multiplier"), 30.0f) / 30.0f; // normalize to ~1.0
     d.doubleSided = readBool(_T("option_doubleSided"), true);
 
@@ -1843,8 +1937,9 @@ static void ExtractVRayMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
     d.transmission = (refr[0] + refr[1] + refr[2]) / 3.0f;
     if (d.transmission > 0.0f) {
         readColor(_T("refraction_fogColor"), d.attenuationColor);
-        d.attenuationDistance = readFloat(_T("refraction_fogMult"), 1.0f);
-        d.opacity = 1.0f - d.transmission;
+        d.attenuationDistance = readFloat(_T("refraction_fogDepth"), readFloat(_T("refraction_fogMult"), 1.0f));
+        if (readBool(_T("refraction_dispersion_on"), false))
+            d.dispersion = readFloat(_T("refraction_dispersion"), 0.0f);
     }
 
     // Coat
@@ -1889,15 +1984,52 @@ static void ExtractVRayMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
         if (!diffuseMap || !TrySplitCompositeAO(diffuseMap, t, d.colorMap, d.colorMapTransform, d.aoMap, d.aoMapTransform))
             readMap(_T("texmap_diffuse"), _T("texmap_diffuse_on"), d.colorMap, d.colorMapTransform);
     }
-    readMap(_T("texmap_roughness"),        _T("texmap_roughness_on"),        d.roughnessMap,  d.roughnessMapTransform);
+    if (useRoughnessWorkflow) {
+        readMap(_T("texmap_roughness"), _T("texmap_roughness_on"), d.roughnessMap, d.roughnessMapTransform);
+    } else {
+        readMap(_T("texmap_reflectionGlossiness"), _T("texmap_reflectionGlossiness_on"), d.roughnessMap, d.roughnessMapTransform);
+        if (!d.roughnessMap.empty())
+            d.roughnessMapTransform.invert = true;
+    }
     readMap(_T("texmap_metalness"),        _T("texmap_metalness_on"),        d.metalnessMap,  d.metalnessMapTransform);
-    readMap(_T("texmap_bump"),             _T("texmap_bump_on"),             d.normalMap,     d.normalMapTransform);
+    readMap(_T("texmap_refraction"),       _T("texmap_refraction_on"),       d.transmissionMap, d.transmissionMapTransform);
     readMap(_T("texmap_self_illumination"),_T("texmap_self_illumination_on"),d.emissionMap,   d.emissionMapTransform);
     readMap(_T("texmap_opacity"),          _T("texmap_opacity_on"),          d.opacityMap,    d.opacityMapTransform);
     readMap(_T("texmap_displacement"),     _T("texmap_displacement_on"),     d.displacementMap, d.displacementMapTransform);
     readMap(_T("texmap_coat_amount"),      _T("texmap_coat_amount_on"),      d.clearcoatMap,  d.clearcoatMapTransform);
     readMap(_T("texmap_coat_glossiness"),  _T("texmap_coat_glossiness_on"),  d.clearcoatRoughnessMap, d.clearcoatRoughnessMapTransform);
-    readMap(_T("texmap_coat_bump"),        _T("texmap_coat_bump_on"),        d.clearcoatNormalMap, d.clearcoatNormalMapTransform);
+    if (!d.clearcoatRoughnessMap.empty())
+        d.clearcoatRoughnessMapTransform.invert = true;
+
+    Texmap* bumpSlot = getTexmap(_T("texmap_bump"), _T("texmap_bump_on"));
+    if (bumpSlot) {
+        ExtractWrappedNormalBumpMaps(
+            bumpSlot,
+            d.normalMap,
+            d.normalMapTransform,
+            d.bumpMap,
+            d.bumpMapTransform
+        );
+        if (!d.bumpMap.empty())
+            d.bumpScale = d.normalScale;
+    }
+
+    Texmap* coatBumpSlot = getTexmap(_T("texmap_coat_bump"), _T("texmap_coat_bump_on"));
+    if (coatBumpSlot) {
+        std::wstring clearcoatBumpPath;
+        MaxJSPBR::TexTransform clearcoatBumpXf;
+        ExtractWrappedNormalBumpMaps(
+            coatBumpSlot,
+            d.clearcoatNormalMap,
+            d.clearcoatNormalMapTransform,
+            clearcoatBumpPath,
+            clearcoatBumpXf
+        );
+        if (d.clearcoatNormalMap.empty() && !clearcoatBumpPath.empty()) {
+            d.clearcoatNormalMap = clearcoatBumpPath;
+            d.clearcoatNormalMapTransform = clearcoatBumpXf;
+        }
+    }
 
     // Downgrade to Standard if no advanced features used
     if (d.clearcoat == 0.0f && d.sheen == 0.0f && d.transmission == 0.0f &&
@@ -3810,7 +3942,13 @@ public:
                     CoTaskMemFree(uri);
                     if (uriView.rfind(prefix, 0) != 0) return S_OK;
 
-                    std::wstring decodedPath = UrlDecodePath(uriView.substr(prefix.size()));
+                    std::wstring_view encodedPath = uriView.substr(prefix.size());
+                    const size_t queryPos = encodedPath.find_first_of(L"?#");
+                    if (queryPos != std::wstring_view::npos) {
+                        encodedPath = encodedPath.substr(0, queryPos);
+                    }
+
+                    std::wstring decodedPath = UrlDecodePath(std::wstring(encodedPath));
                     std::replace(decodedPath.begin(), decodedPath.end(), L'/', L'\\');
                     const DWORD attrs = GetFileAttributesW(decodedPath.c_str());
                     if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_DIRECTORY)) {
@@ -5516,38 +5654,56 @@ public:
     // ── Camera JSON fragment ─────────────────────────────────
 
     void WriteMaterialTextures(std::wostringstream& ss, const MaxJSPBR& pbr) {
+        auto hasTransformData = [](const MaxJSPBR::TexTransform& xf) {
+            return xf.isUberBitmap ||
+                   xf.hasChannelSelect ||
+                   xf.isVideo ||
+                   xf.invert ||
+                   std::fabs(xf.scale - 1.0f) > 1.0e-6f ||
+                   std::fabs(xf.tiling[0] - 1.0f) > 1.0e-6f ||
+                   std::fabs(xf.tiling[1] - 1.0f) > 1.0e-6f ||
+                   std::fabs(xf.offset[0]) > 1.0e-6f ||
+                   std::fabs(xf.offset[1]) > 1.0e-6f ||
+                   std::fabs(xf.rotate) > 1.0e-6f ||
+                   std::fabs(xf.center[0] - 0.5f) > 1.0e-6f ||
+                   std::fabs(xf.center[1] - 0.5f) > 1.0e-6f ||
+                   xf.realWorld ||
+                   _wcsicmp(xf.wrapMode.c_str(), L"periodic") != 0 ||
+                   !xf.colorSpace.empty() ||
+                   std::fabs(xf.manualGamma - 1.0f) > 1.0e-6f;
+        };
         auto writeXf = [&](const wchar_t* key, const MaxJSPBR::TexTransform& xf) {
-            if (!xf.isUberBitmap && !xf.hasChannelSelect && !xf.isVideo) return;
+            if (!hasTransformData(xf)) return;
             ss << L",\"" << key << L"\":{";
             bool wroteField = false;
-            if (xf.isUberBitmap) {
-                ss << L"\"scale\":";
-                WriteFloatValue(ss, xf.scale, 1.0f);
-                ss << L",\"tiling\":[";
-                WriteFloatValue(ss, xf.tiling[0], 1.0f); ss << L',';
-                WriteFloatValue(ss, xf.tiling[1], 1.0f); ss << L']';
-                ss << L",\"offset\":[";
-                WriteFloatValue(ss, xf.offset[0], 0.0f); ss << L',';
-                WriteFloatValue(ss, xf.offset[1], 0.0f); ss << L']';
-                ss << L",\"rotate\":";
-                WriteFloatValue(ss, xf.rotate, 0.0f);
-                ss << L",\"center\":[";
-                WriteFloatValue(ss, xf.center[0], 0.5f); ss << L',';
-                WriteFloatValue(ss, xf.center[1], 0.5f); ss << L']';
-                ss << L",\"realWorld\":" << (xf.realWorld ? L"true" : L"false");
-                ss << L",\"realWidth\":";
-                WriteFloatValue(ss, xf.realWidth, 0.2f);
-                ss << L",\"realHeight\":";
-                WriteFloatValue(ss, xf.realHeight, 0.2f);
-                ss << L",\"wrap\":\"" << EscapeJson(xf.wrapMode.c_str()) << L"\"";
-                if (!xf.colorSpace.empty())
-                    ss << L",\"colorSpace\":\"" << EscapeJson(xf.colorSpace.c_str()) << L"\"";
-                if (std::fabs(xf.manualGamma - 1.0f) > 1.0e-6f) {
-                    ss << L",\"manualGamma\":";
-                    WriteFloatValue(ss, xf.manualGamma, 1.0f);
-                }
-                wroteField = true;
+            ss << L"\"scale\":";
+            WriteFloatValue(ss, xf.scale, 1.0f);
+            ss << L",\"tiling\":[";
+            WriteFloatValue(ss, xf.tiling[0], 1.0f); ss << L',';
+            WriteFloatValue(ss, xf.tiling[1], 1.0f); ss << L']';
+            ss << L",\"offset\":[";
+            WriteFloatValue(ss, xf.offset[0], 0.0f); ss << L',';
+            WriteFloatValue(ss, xf.offset[1], 0.0f); ss << L']';
+            ss << L",\"rotate\":";
+            WriteFloatValue(ss, xf.rotate, 0.0f);
+            ss << L",\"center\":[";
+            WriteFloatValue(ss, xf.center[0], 0.5f); ss << L',';
+            WriteFloatValue(ss, xf.center[1], 0.5f); ss << L']';
+            ss << L",\"realWorld\":" << (xf.realWorld ? L"true" : L"false");
+            ss << L",\"realWidth\":";
+            WriteFloatValue(ss, xf.realWidth, 0.2f);
+            ss << L",\"realHeight\":";
+            WriteFloatValue(ss, xf.realHeight, 0.2f);
+            ss << L",\"wrap\":\"" << EscapeJson(xf.wrapMode.c_str()) << L"\"";
+            if (xf.invert)
+                ss << L",\"invert\":true";
+            if (!xf.colorSpace.empty())
+                ss << L",\"colorSpace\":\"" << EscapeJson(xf.colorSpace.c_str()) << L"\"";
+            if (std::fabs(xf.manualGamma - 1.0f) > 1.0e-6f) {
+                ss << L",\"manualGamma\":";
+                WriteFloatValue(ss, xf.manualGamma, 1.0f);
             }
+            wroteField = true;
             if (xf.hasChannelSelect) {
                 if (wroteField) ss << L',';
                 ss << L"\"channel\":";
@@ -5587,6 +5743,7 @@ public:
         writeMap(L"emMap", L"emMapXf", pbr.emissionMap, pbr.emissionMapTransform);
         writeMap(L"lmMap", L"lmMapXf", pbr.lightmapFile, pbr.lightmapTransform);
         writeMap(L"opMap", L"opMapXf", pbr.opacityMap, pbr.opacityMapTransform);
+        writeMap(L"transMap", L"transMapXf", pbr.transmissionMap, pbr.transmissionMapTransform);
         writeMap(L"ccMap", L"ccMapXf", pbr.clearcoatMap, pbr.clearcoatMapTransform);
         writeMap(L"ccRoughMap", L"ccRoughMapXf", pbr.clearcoatRoughnessMap, pbr.clearcoatRoughnessMapTransform);
         writeMap(L"ccNormMap", L"ccNormMapXf", pbr.clearcoatNormalMap, pbr.clearcoatNormalMapTransform);

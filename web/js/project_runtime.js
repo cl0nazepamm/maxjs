@@ -78,6 +78,16 @@ function cloneManifest(manifest) {
     return JSON.parse(JSON.stringify(manifest));
 }
 
+function manifest404(error) {
+    return String(error?.message || error).includes('404');
+}
+
+function deriveProjectName(projectDir) {
+    const normalized = String(projectDir ?? '').replace(/[\\/]+$/, '');
+    const parts = normalized.split(/[\\/]/).filter(Boolean);
+    return parts[parts.length - 1] || 'Active Project';
+}
+
 export function createProjectRuntime({ layerManager, bridge, perfHud }) {
     let projectDir = '';
     let projectRootUrl = '';
@@ -152,6 +162,22 @@ export function createProjectRuntime({ layerManager, bridge, perfHud }) {
         };
     }
 
+    function implicitMainManifest() {
+        return {
+            name: deriveProjectName(projectDir),
+            pollMs,
+            layers: [
+                {
+                    id: 'main',
+                    name: 'main',
+                    entry: 'main.js',
+                    enabled: true,
+                },
+            ],
+            __implicit: true,
+        };
+    }
+
     function buildManifestLayers(manifest) {
         const rawLayers = Array.isArray(manifest?.layers)
             ? manifest.layers
@@ -222,14 +248,38 @@ export function createProjectRuntime({ layerManager, bridge, perfHud }) {
         if (!projectRootUrl) return null;
 
         const manifestUrl = projectUrl(projectRootUrl, 'project.maxjs.json', `${Date.now()}`);
-        const manifestText = await fetchText(manifestUrl);
-        if (!force && manifestText === lastManifestText) return null;
+        try {
+            const manifestText = await fetchText(manifestUrl);
+            if (!force && manifestText === lastManifestText) return null;
 
-        const manifest = JSON.parse(manifestText);
-        lastManifestText = manifestText;
-        manifestState = manifest;
-        emitChange();
-        return manifest;
+            const manifest = JSON.parse(manifestText);
+            lastManifestText = manifestText;
+            manifestState = manifest;
+            emitChange();
+            return manifest;
+        } catch (error) {
+            if (!manifest404(error)) throw error;
+
+            const mainUrl = projectUrl(projectRootUrl, 'main.js', `${Date.now()}`);
+            let mainText = '';
+            try {
+                mainText = await fetchText(mainUrl);
+            } catch (mainError) {
+                throw error;
+            }
+
+            const fallbackManifest = implicitMainManifest();
+            const fallbackText = stableStringify({
+                implicit: true,
+                entry: 'main.js',
+                mainText,
+            });
+            if (!force && fallbackText === lastManifestText) return null;
+            lastManifestText = fallbackText;
+            manifestState = fallbackManifest;
+            emitChange();
+            return fallbackManifest;
+        }
     }
 
     async function mountLayer(entry, manifest) {
@@ -265,7 +315,8 @@ export function createProjectRuntime({ layerManager, bridge, perfHud }) {
         });
     }
 
-    async function applyManifest(manifest) {
+    async function applyManifest(manifest, options = {}) {
+        const forceReload = !!options.forceReload;
         manifestState = manifest;
         const desiredLayers = buildManifestLayers(manifest).filter(entry => entry.enabled);
         const desiredIds = new Set(desiredLayers.map(entry => entry.id));
@@ -276,7 +327,7 @@ export function createProjectRuntime({ layerManager, bridge, perfHud }) {
 
         for (const entry of desiredLayers) {
             const current = activeProjectLayers.get(entry.id);
-            if (current?.signature === entry.signature) continue;
+            if (!forceReload && current?.signature === entry.signature) continue;
 
             if (current) removeProjectLayer(entry.id);
             await mountLayer(entry, manifest);
@@ -292,7 +343,7 @@ export function createProjectRuntime({ layerManager, bridge, perfHud }) {
             const manifest = await loadManifest(force);
             if (!manifest) return false;
 
-            await applyManifest(manifest);
+            await applyManifest(manifest, { forceReload: force });
 
             if (Number.isFinite(manifest.pollMs) && manifest.pollMs >= 0) {
                 pollMs = manifest.pollMs;
@@ -307,7 +358,7 @@ export function createProjectRuntime({ layerManager, bridge, perfHud }) {
             lastManifestText = '';
             emitChange();
 
-            const is404 = error?.message?.includes('404');
+            const is404 = manifest404(error);
             if (is404) {
                 clearTimer();
                 setStatus('no project manifest');
@@ -327,7 +378,7 @@ export function createProjectRuntime({ layerManager, bridge, perfHud }) {
             const manifest = await loadManifest(true);
             if (manifest) return manifest;
         } catch (error) {
-            if (!String(error?.message || error).includes('404')) throw error;
+            if (!manifest404(error)) throw error;
         }
 
         manifestState = defaultManifest();

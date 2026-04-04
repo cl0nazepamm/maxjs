@@ -49,6 +49,8 @@ Current default dev path:
 - `projects/active/project.maxjs.json`
 - `projects/active/main.js`
 
+If `project.maxjs.json` is missing but `main.js` exists, the runtime falls back to an implicit single-layer manifest for `main.js`.
+
 ## Adapter Contract
 
 ### `ctx.maxScene`
@@ -155,6 +157,8 @@ Example:
 ```
 
 The native side sends the active project directory to the web runtime via `project_config` after the normal `ready` handshake. The web runtime then polls the manifest and remounts project layers when it changes.
+
+For lightweight projects, `main.js` can also be used without a manifest. In that case the runtime synthesizes a single `main` layer and polls `main.js` directly for reloads.
 
 ## Execution Model
 

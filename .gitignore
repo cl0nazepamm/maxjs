@@ -1,5 +1,7 @@
 build/
 thirdparty/
+test_scene/
+node_modules/
 *.user
 *.suo
 .vs/

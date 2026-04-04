@@ -8,18 +8,7 @@
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { overflow: hidden; background: #353535; position: relative; width: 100vw; height: 100vh; }
         canvas { display: block; }
-        #splatLayer {
-            position: absolute;
-            inset: 0;
-            z-index: 5;
-            pointer-events: none;
-        }
-        #splatLayer canvas {
-            position: absolute;
-            inset: 0;
-            pointer-events: none;
-        }
-        #hud {
+#hud {
             position: absolute; top: 8px; left: 8px;
             color: rgba(180, 180, 180, 0.8);
             font: 10px/1.4 'Segoe UI', system-ui, sans-serif;
@@ -462,7 +451,6 @@
     </div>
     <aside id="layersPanel" class="sidepanel sidepanel-left" aria-hidden="true" inert></aside>
     <aside id="postPanel" class="sidepanel" aria-hidden="true" inert></aside>
-    <div id="splatLayer" aria-hidden="true"></div>
     <script type="importmap">
     {
         "imports": {
@@ -471,10 +459,10 @@
             "three/webgpu": "https://cdn.jsdelivr.net/npm/three@0.183.2/build/three.webgpu.js",
             "three/tsl": "https://cdn.jsdelivr.net/npm/three@0.183.2/build/three.tsl.js",
             "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.183.2/examples/jsm/",
-            "gaussian-splats-3d": "https://cdn.jsdelivr.net/npm/@mkkellogg/gaussian-splats-3d@0.4.7/build/gaussian-splats-3d.module.js"
+            "@sparkjsdev/spark": "./node_modules/@sparkjsdev/spark/dist/spark.module.js"
         },
         "scopes": {
-            "https://cdn.jsdelivr.net/npm/@mkkellogg/gaussian-splats-3d@0.4.7/": {
+            "./node_modules/@sparkjsdev/spark/": {
                 "three": "https://cdn.jsdelivr.net/npm/three@0.183.2/build/three.module.js"
             }
         }
@@ -493,7 +481,9 @@
         import { XRButton } from 'three/addons/webxr/XRButton.js';
         import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
         import { SkyMesh } from 'three/addons/objects/SkyMesh.js';
-        import * as GaussianSplats3D from 'gaussian-splats-3d';
+        // Spark.js uses GLSL3/ShaderChunk — needs WebGL THREE build (scoped in importmap).
+        // Lazy-import to avoid crashing on page load.
+        let Spark = null;
         import {
             color as tslColor,
             float as tslFloat,
@@ -730,14 +720,13 @@
         const materialXTemplateCache = new Map();
         const materialXLoadCache = new Map();
         const nodeMap = new Map();
-        const splatLayer = document.getElementById('splatLayer');
         const splatHandleMap = new Map();
         const splatMatrix = new THREE_STD.Matrix4();
         const splatPosition = new THREE_STD.Vector3();
         const splatQuaternion = new THREE_STD.Quaternion();
         const splatScale = new THREE_STD.Vector3();
-        let splatOverlay = null;
         let splatMutationQueue = Promise.resolve();
+        let splatOverlay = null;
         const perfHud = createPerfHud(document.getElementById('info'));
         perfHud.setStatus(`MaxJS - ${rendererBackendLabel} renderer ready`);
         const ssgiFx = createSSGIController({
@@ -763,124 +752,69 @@
             return splatMutationQueue;
         }
 
-        function syncSplatLayerVisibility() {
-            const visible = splatHandleMap.size > 0;
-            splatLayer.style.display = visible ? 'block' : 'none';
-            if (splatOverlay?.renderer?.domElement) {
-                splatOverlay.renderer.domElement.style.display = visible ? 'block' : 'none';
-            }
-        }
-
-        function ensureSplatOverlay() {
+        async function ensureSplatOverlay() {
             if (splatOverlay) return splatOverlay;
 
+            if (!Spark) Spark = await import('@sparkjsdev/spark');
+
             const overlayRenderer = new THREE_STD.WebGLRenderer({
-                antialias: true,
-                alpha: true,
-                premultipliedAlpha: true,
+                antialias: true, alpha: true, premultipliedAlpha: true,
             });
             overlayRenderer.setPixelRatio(devicePixelRatio);
             overlayRenderer.setSize(innerWidth, innerHeight, false);
             overlayRenderer.setClearColor(0x000000, 0);
-            overlayRenderer.domElement.style.position = 'absolute';
-            overlayRenderer.domElement.style.inset = '0';
-            overlayRenderer.domElement.style.pointerEvents = 'none';
-            overlayRenderer.domElement.style.zIndex = '5';
+            overlayRenderer.domElement.style.cssText = 'position:absolute;inset:0;pointer-events:none;z-index:5';
             overlayRenderer.outputColorSpace = THREE_STD.SRGBColorSpace;
-            splatLayer.appendChild(overlayRenderer.domElement);
+            document.body.appendChild(overlayRenderer.domElement);
 
+            const overlayScene = new THREE_STD.Scene();
             const overlayCamera = new THREE_STD.PerspectiveCamera(camera.fov, camera.aspect, camera.near, camera.far);
+            const spark = new Spark.SparkRenderer({ renderer: overlayRenderer });
+            spark.frustumCulled = false;
+            overlayScene.add(spark);
 
-            const viewer = new GaussianSplats3D.Viewer({
-                selfDrivenMode: false,
-                renderer: overlayRenderer,
-                camera: overlayCamera,
-                rootElement: splatLayer,
-                useBuiltInControls: false,
-                renderMode: GaussianSplats3D.RenderMode.Always,
-                dynamicScene: true,
-                gpuAcceleratedSort: false,
-                sharedMemoryForWorkers: false,
-                integerBasedSort: false,
-                sceneRevealMode: GaussianSplats3D.SceneRevealMode.Instant,
-                logLevel: GaussianSplats3D.LogLevel.Warn,
-            });
-
-            splatOverlay = {
-                renderer: overlayRenderer,
-                camera: overlayCamera,
-                viewer,
-            };
-            syncSplatLayerVisibility();
+            splatOverlay = { renderer: overlayRenderer, scene: overlayScene, camera: overlayCamera, spark };
             return splatOverlay;
-        }
-
-        function updateSplatViewerTransforms() {
-            splatOverlay?.viewer?.getSplatMesh?.()?.updateTransforms?.();
-            splatOverlay?.viewer?.forceRenderNextFrame?.();
         }
 
         function updateSplatCamera() {
             if (!splatOverlay) return;
-
-            const overlayCamera = splatOverlay.camera;
-            overlayCamera.position.set(camera.position.x, camera.position.y, camera.position.z);
-            overlayCamera.quaternion.set(camera.quaternion.x, camera.quaternion.y, camera.quaternion.z, camera.quaternion.w);
-            overlayCamera.scale.set(camera.scale.x, camera.scale.y, camera.scale.z);
-            overlayCamera.up.set(camera.up.x, camera.up.y, camera.up.z);
-            overlayCamera.near = Math.max(camera.near, 0.01);
-            overlayCamera.far = Math.max(camera.far, overlayCamera.near + 1.0);
-            overlayCamera.aspect = camera.aspect;
-            overlayCamera.fov = camera.fov;
-            overlayCamera.updateProjectionMatrix();
-            overlayCamera.updateMatrixWorld(true);
+            const oc = splatOverlay.camera;
+            oc.position.set(camera.position.x, camera.position.y, camera.position.z);
+            oc.quaternion.set(camera.quaternion.x, camera.quaternion.y, camera.quaternion.z, camera.quaternion.w);
+            oc.up.set(camera.up.x, camera.up.y, camera.up.z);
+            oc.near = Math.max(camera.near, 0.01);
+            oc.far = Math.max(camera.far, oc.near + 1.0);
+            oc.aspect = camera.aspect;
+            oc.fov = camera.fov;
+            oc.updateProjectionMatrix();
+            oc.updateMatrixWorld(true);
         }
 
-        function applySplatTransform(sceneRef, splat) {
-            if (!sceneRef) return;
+        function applySplatTransform(mesh, splat) {
+            if (!mesh) return;
 
             if (isFiniteArray(splat?.t, 16)) {
                 copyMaxMatrixArrayToWorldStd(splatMatrix, splat.t);
                 splatMatrix.decompose(splatPosition, splatQuaternion, splatScale);
-                sceneRef.position.copy(splatPosition);
-                sceneRef.quaternion.copy(splatQuaternion);
-                sceneRef.scale.copy(splatScale);
+                mesh.position.copy(splatPosition);
+                mesh.quaternion.copy(splatQuaternion);
+                mesh.scale.copy(splatScale);
             } else {
-                sceneRef.position.set(0, 0, 0);
-                sceneRef.quaternion.identity();
-                sceneRef.scale.set(1, 1, 1);
+                mesh.position.set(0, 0, 0);
+                mesh.quaternion.identity();
+                mesh.scale.set(1, 1, 1);
             }
 
-            sceneRef.visible = splat?.v == null ? true : !!splat.v;
-            sceneRef.updateMatrixWorld(true);
-            updateSplatViewerTransforms();
-        }
-
-        function findSplatSceneIndex(sceneRef) {
-            const viewer = splatOverlay?.viewer;
-            if (!viewer || !sceneRef) return -1;
-
-            const sceneCount = viewer.getSceneCount();
-            for (let i = 0; i < sceneCount; i++) {
-                if (viewer.getSplatScene(i) === sceneRef) return i;
-            }
-            return -1;
+            mesh.visible = splat?.v == null ? true : !!splat.v;
         }
 
         async function removeTrackedSplat(handle) {
             const entry = splatHandleMap.get(handle);
             if (!entry) return;
-
             splatHandleMap.delete(handle);
-
-            if (splatOverlay) {
-                const index = findSplatSceneIndex(entry.scene);
-                if (index >= 0) {
-                    await splatOverlay.viewer.removeSplatScene(index, false);
-                }
-            }
-
-            syncSplatLayerVisibility();
+            if (entry.mesh.parent) entry.mesh.parent.remove(entry.mesh);
+            entry.mesh.dispose?.();
         }
 
         async function upsertTrackedSplat(splat) {
@@ -893,12 +827,10 @@
                 return;
             }
 
-            const overlay = ensureSplatOverlay();
             const existing = splatHandleMap.get(handle);
 
             if (existing && existing.url === url) {
-                applySplatTransform(existing.scene, splat);
-                syncSplatLayerVisibility();
+                applySplatTransform(existing.mesh, splat);
                 return;
             }
 
@@ -906,33 +838,14 @@
                 await removeTrackedSplat(handle);
             }
 
-            const lowerUrl = url.toLowerCase();
-            let format;
-            if (lowerUrl.endsWith('.ply')) format = GaussianSplats3D.SceneFormat.Ply;
-            else if (lowerUrl.endsWith('.splat')) format = GaussianSplats3D.SceneFormat.Splat;
-            else if (lowerUrl.endsWith('.ksplat')) format = GaussianSplats3D.SceneFormat.KSplat;
-
-            await overlay.viewer.addSplatScene(url, {
-                format,
-                showLoadingUI: true,
-                splatAlphaRemovalThreshold: 1,
-                position: [0, 0, 0],
-                rotation: [0, 0, 0, 1],
-                scale: [1, 1, 1],
-                onProgress(percent, label, stage) {
-                    const stageLabel = stage?.toString?.() ?? 'Loading';
-                    perfHud.setStatus(`MaxJS - Splat ${stageLabel} ${label ?? `${percent ?? 0}%`}`);
-                },
-            });
-
-            const sceneRef = overlay.viewer.getSplatScene(overlay.viewer.getSceneCount() - 1);
-            if (!sceneRef) return;
-
-            sceneRef.name = splat.n || `Splat ${handle}`;
-            splatHandleMap.set(handle, { url, scene: sceneRef });
-            applySplatTransform(sceneRef, splat);
-            perfHud.setStatus(`MaxJS - Splat ready: ${sceneRef.name}`);
-            syncSplatLayerVisibility();
+            const overlay = await ensureSplatOverlay();
+            perfHud.setStatus(`MaxJS - Loading splat...`);
+            const mesh = new Spark.SplatMesh({ url });
+            mesh.name = splat.n || `Splat ${handle}`;
+            overlay.scene.add(mesh);
+            splatHandleMap.set(handle, { url, mesh });
+            applySplatTransform(mesh, splat);
+            perfHud.setStatus(`MaxJS - Splat ready: ${mesh.name}`);
         }
 
         function reconcileSplats(splats = []) {
@@ -1100,6 +1013,7 @@
                 realHeight: Number.isFinite(xf.realHeight) && Math.abs(xf.realHeight) > 1e-6 ? xf.realHeight : 1.0,
                 wrap: typeof xf.wrap === 'string' ? xf.wrap : 'periodic',
                 channel: Number.isFinite(xf.channel) ? Math.max(1, Math.round(xf.channel)) : 1,
+                invert: !!xf.invert,
                 colorSpace: typeof xf.colorSpace === 'string' ? xf.colorSpace : '',
                 manualGamma: Number.isFinite(xf.manualGamma) ? xf.manualGamma : 1.0,
             };
@@ -1154,7 +1068,8 @@
 
         function applyTextureChannelSelection(tex, xf) {
             const channel = xf?.channel ?? 1;
-            if (channel <= 1) return;
+            const invert = !!xf?.invert;
+            if (channel <= 1 && !invert) return;
 
             const image = tex?.image;
             const width = image?.width ?? image?.videoWidth ?? 0;
@@ -1176,6 +1091,13 @@
                 const g = data[i + 1];
                 const b = data[i + 2];
                 const a = data[i + 3];
+                if (channel <= 1) {
+                    data[i] = 255 - r;
+                    data[i + 1] = 255 - g;
+                    data[i + 2] = 255 - b;
+                    continue;
+                }
+
                 let value = r;
 
                 switch (channel) {
@@ -1202,6 +1124,7 @@
                     break;
                 }
 
+                if (invert) value = 255 - value;
                 data[i] = value;
                 data[i + 1] = value;
                 data[i + 2] = value;
@@ -1444,12 +1367,65 @@
         }
 
         // ── Local HDRI (independent of Max) ─────────────────
+        // Persist HDRI across page reloads (VR mode switch) via IndexedDB
+        const HDRI_DB_NAME = 'maxjs_hdri_cache';
+        const HDRI_DB_STORE = 'files';
+
+        function openHdriDB() {
+            return new Promise((resolve, reject) => {
+                const req = indexedDB.open(HDRI_DB_NAME, 1);
+                req.onupgradeneeded = () => req.result.createObjectStore(HDRI_DB_STORE);
+                req.onsuccess = () => resolve(req.result);
+                req.onerror = () => reject(req.error);
+            });
+        }
+
+        async function stashHdriFile(file) {
+            try {
+                const db = await openHdriDB();
+                const buf = await file.arrayBuffer();
+                const tx = db.transaction(HDRI_DB_STORE, 'readwrite');
+                tx.objectStore(HDRI_DB_STORE).put({ name: file.name, buffer: buf }, 'current');
+                db.close();
+            } catch (e) { console.warn('[MaxJS] HDRI stash failed:', e); }
+        }
+
+        async function restoreStashedHdri() {
+            try {
+                const db = await openHdriDB();
+                const tx = db.transaction(HDRI_DB_STORE, 'readonly');
+                const req = tx.objectStore(HDRI_DB_STORE).get('current');
+                return new Promise((resolve) => {
+                    req.onsuccess = () => {
+                        db.close();
+                        const data = req.result;
+                        if (data?.buffer && data?.name) {
+                            resolve(new File([data.buffer], data.name));
+                        } else {
+                            resolve(null);
+                        }
+                    };
+                    req.onerror = () => { db.close(); resolve(null); };
+                });
+            } catch { return null; }
+        }
+
+        async function clearStashedHdri() {
+            try {
+                const db = await openHdriDB();
+                const tx = db.transaction(HDRI_DB_STORE, 'readwrite');
+                tx.objectStore(HDRI_DB_STORE).delete('current');
+                db.close();
+            } catch {}
+        }
+
         function loadLocalHDRIFile(file) {
             if (localHdriObjectUrl) URL.revokeObjectURL(localHdriObjectUrl);
             if (localHdriEnvMap) { localHdriEnvMap.dispose(); localHdriEnvMap = null; }
             localHdriObjectUrl = URL.createObjectURL(file);
             localHdriFileName = file.name;
             localHdriEnabled = true;
+            void stashHdriFile(file);
 
             const isExr = file.name.toLowerCase().endsWith('.exr');
             const loader = isExr ? exrLoader : rgbeLoader;
@@ -1519,6 +1495,7 @@
             localHdriEnabled = true;
             if (localHdriEnvMap) { localHdriEnvMap.dispose(); localHdriEnvMap = null; }
             if (localHdriObjectUrl) { URL.revokeObjectURL(localHdriObjectUrl); localHdriObjectUrl = null; }
+            void clearStashedHdri();
             currentHdriUrl = null;
             currentHdriProbeSignature = '';
             scene.environment = null;
@@ -1913,6 +1890,9 @@
                 material.alphaMap = loadTexture(md.opMap, THREE.LinearSRGBColorSpace, md.opMapXf, fallbackWhiteTexture);
                 material.transparent = true;
             }
+            if (md.transMap && 'transmissionMap' in material) {
+                material.transmissionMap = loadTexture(md.transMap, THREE.LinearSRGBColorSpace, md.transMapXf, fallbackWhiteTexture);
+            }
             if (md.lmMap && 'lightMap' in material) {
                 material.lightMap = loadTexture(md.lmMap, THREE.LinearSRGBColorSpace, md.lmMapXf, fallbackWhiteTexture);
             }
@@ -2014,6 +1994,7 @@
                         if (md.iridescence != null) params.iridescence = md.iridescence;
                         if (md.iridescenceIOR != null) params.iridescenceIOR = md.iridescenceIOR;
                         if (md.transmission != null) params.transmission = md.transmission;
+                        if (md.transMap) params.transmissionMap = loadTexture(md.transMap, THREE.LinearSRGBColorSpace, md.transMapXf, fallbackWhiteTexture);
                         if (md.ior != null) params.ior = md.ior;
                         if (md.thickness != null) params.thickness = md.thickness;
                         if (md.dispersion != null) params.dispersion = md.dispersion;
@@ -2074,6 +2055,9 @@
                     if (md.aoMap) template.aoMap = loadTexture(md.aoMap, THREE.LinearSRGBColorSpace, md.aoMapXf, fallbackWhiteTexture);
                     if (md.emMap) template.emissiveMap = loadTexture(md.emMap, THREE.SRGBColorSpace, md.emMapXf, fallbackWhiteTexture);
                     if (md.opMap) { template.alphaMap = loadTexture(md.opMap, THREE.LinearSRGBColorSpace, md.opMapXf, fallbackWhiteTexture); template.transparent = true; }
+                    if (md.transMap && 'transmissionMap' in template) {
+                        template.transmissionMap = loadTexture(md.transMap, THREE.LinearSRGBColorSpace, md.transMapXf, fallbackWhiteTexture);
+                    }
                     if (canUseToonMaterial) {
                         template.gradientMap = md.gradMap
                             ? configureGradientTexture(loadTexture(md.gradMap, THREE.NoColorSpace, null, fallbackToonGradientTexture))
@@ -2243,9 +2227,9 @@
             ssgiFx.setVolumetricEnabled(false);
             ssgiFx.setPixelEnabled(false);
             ssgiFx.setFogEnabled(false);
-            // Force GTAO on with inverted (bright) AO
+            // Clay mode is unstable with GTAO enabled, so keep it off.
             if (ssgiFx.setClayOverride) ssgiFx.setClayOverride(true);
-            ssgiFx.setGTAOEnabled(true);
+            ssgiFx.setGTAOEnabled(false);
 
             // Swap materials
             for (const [, mesh] of nodeMap) {
@@ -4339,6 +4323,11 @@
         buildPostFxPanel();
         syncPostFxPanel(true);
 
+        // Restore HDRI from IndexedDB (survives VR mode page reload)
+        void restoreStashedHdri().then(file => {
+            if (file && !isLocalHdriLoaded()) loadLocalHDRIFile(file);
+        });
+
         // ── Resize + Render ─────────────────────────────────
         let resizeTimer = null;
         addEventListener('resize', () => {
@@ -4351,8 +4340,6 @@
             if (splatOverlay) {
                 splatOverlay.renderer.setPixelRatio(devicePixelRatio);
                 splatOverlay.renderer.setSize(innerWidth, innerHeight, false);
-                splatOverlay.camera.aspect = camera.aspect;
-                splatOverlay.camera.updateProjectionMatrix();
             }
         });
 
@@ -4371,7 +4358,7 @@
                 vrNote.textContent = 'Switch to VR';
                 vrNote.style.cssText = 'position:absolute;bottom:8px;right:8px;z-index:100;background:rgba(40,40,60,0.78);color:#ddd;border:1px solid #333;padding:4px 10px;border-radius:4px;font:10px "Segoe UI",sans-serif;cursor:pointer';
                 vrNote.onclick = () => {
-                    if (confirm('WebXR needs the WebGL backend. Restart MaxJS in XR mode now?')) {
+                    if (confirm('VR requires HDRI environment, please load one if it\'s not already loaded.\n\nWebXR needs the WebGL backend. Restart MaxJS in VR mode now?')) {
                         sessionStorage.setItem('maxjs_force_webgl', '1');
                         location.reload();
                     }
@@ -4540,8 +4527,8 @@
                         moveRight.crossVectors(moveForward, camera.up).normalize();
 
                         moveDelta.set(0, 0, 0);
-                        if (x) moveDelta.addScaledVector(moveRight, x * moveSpeed * dt);
-                        if (y) moveDelta.addScaledVector(moveForward, -y * moveSpeed * dt);
+                        if (y) moveDelta.addScaledVector(moveRight, -y * moveSpeed * dt);
+                        if (x) moveDelta.addScaledVector(moveForward, -x * moveSpeed * dt);
                         if (moveDelta.lengthSq() > 0) xrOrigin.position.add(moveDelta);
 
                         if (isButtonPressed(moveState.inputSource, 1)) {
@@ -4635,10 +4622,9 @@
             } else {
                 ssgiFx.render();
             }
-            if (!xrRuntime.active && splatOverlay && splatHandleMap.size > 0) {
+            if (splatOverlay && splatHandleMap.size > 0) {
                 updateSplatCamera();
-                splatOverlay.viewer.update();
-                splatOverlay.viewer.render();
+                splatOverlay.renderer.render(splatOverlay.scene, splatOverlay.camera);
             }
             syncPostFxPanel();
             perfHud.updateRender(performance.now() - renderStart, renderer.info?.render);

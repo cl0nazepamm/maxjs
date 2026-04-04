@@ -22,6 +22,15 @@ BEGIN
     IDS_BACKDROP_MODE_DEPTH "Depth"
     IDS_BACKDROP_MODE_TEXTURE "Texture"
     IDS_BACKDROP_MODE_PIXEL "Pixel"
+    IDS_UTILITY_NORMAL_TANGENT "Tangent"
+    IDS_UTILITY_NORMAL_OBJECT "Object"
+    IDS_UTILITY_DEPTH_PACK_BASIC "Basic"
+    IDS_UTILITY_DEPTH_PACK_RGBA "RGBA"
+    IDS_UTILITY_DEPTH_PACK_RGB "RGB"
+    IDS_UTILITY_DEPTH_PACK_RG "RG"
+    IDS_UTILITY_COMBINE_MULTIPLY "Multiply"
+    IDS_UTILITY_COMBINE_MIX "Mix"
+    IDS_UTILITY_COMBINE_ADD "Add"
     IDS_TSL_PARAMS "three.js TSL"
     IDS_VIDEO_TEX_PARAMS "three.js Video"
 END
@@ -379,98 +388,115 @@ BEGIN
     LTEXT           "Model: MeshSSSNodeMaterial", IDC_MTL_MODEL_LABEL, 8, 374, 132, 8
 END
 
-IDD_THREEJS_UTILITY_MTL DIALOG 0, 0, 170, 422
+IDD_THREEJS_UTILITY_MTL DIALOG 0, 0, 170, 496
 STYLE DS_SETFONT | WS_CHILD | WS_VISIBLE
 FONT 8, "Segoe UI"
 BEGIN
     GROUPBOX        "Renderer", -1,   2,   2, 166, 24
     LTEXT           "Mode",         -1,   8,  13, 20,   8
     COMBOBOX        IDC_UTILITY_MODE, 36, 11, 54, 70, CBS_DROPDOWNLIST | WS_TABSTOP
-    LTEXT           "FX",           -1,  96,  13, 10,   8
+    LTEXT           "FX",           IDC_UTILITY_FX_LABEL,  96,  13, 10,   8
     COMBOBOX        IDC_UTILITY_BACKDROP_MODE, 108, 11, 46, 60, CBS_DROPDOWNLIST | WS_TABSTOP
 
-    GROUPBOX        "Base Surface", -1,   2,  30, 166, 70
-    LTEXT           "Color",         -1,   8,  43, 20,   8
+    GROUPBOX        "Base Surface", IDC_UTILITY_GROUP_BASE,   2,  30, 166, 70
+    LTEXT           "Color",         IDC_UTILITY_COLOR_LABEL,   8,  43, 20,   8
     CONTROL         "",  IDC_COLOR,      "ColorSwatch",    WS_TABSTOP, 34,  41, 24, 12
     CONTROL         "",  IDC_COLOR_MAP,  "CustButton",     WS_TABSTOP, 74,  41, 46, 12
-    LTEXT           "Amt",           -1, 122,  43, 14,   8
+    LTEXT           "Amt",           IDC_UTILITY_MAPSTR_LABEL, 122,  43, 14,   8
     CONTROL         "",  IDC_MAPSTR_EDIT,"CustEdit",      WS_TABSTOP, 134, 41, 20, 10
     CONTROL         "",  IDC_MAPSTR_SPIN,"SpinnerControl", 0,         156, 41, 11, 10
 
-    LTEXT           "Opacity",       -1,   8,  59, 22,   8
+    LTEXT           "Opacity",       IDC_UTILITY_OPACITY_LABEL,   8,  59, 22,   8
     CONTROL         "",  IDC_OPACITY_EDIT,"CustEdit",     WS_TABSTOP, 34,  57, 18, 10
     CONTROL         "",  IDC_OPACITY_SPIN,"SpinnerControl",0,         54,  57, 11, 10
     CONTROL         "",  IDC_OPACITY_MAP, "CustButton",   WS_TABSTOP, 74,  57, 46, 10
-    LTEXT           "Amt",           -1, 122,  59, 14,   8
+    LTEXT           "Amt",           IDC_UTILITY_OPMAPSTR_LABEL, 122,  59, 14,   8
     CONTROL         "",  IDC_OPMAPSTR_EDIT,"CustEdit",    WS_TABSTOP, 134, 57, 20, 10
     CONTROL         "",  IDC_OPMAPSTR_SPIN,"SpinnerControl",0,        156, 57, 11, 10
 
-    LTEXT           "Normal",        -1,   8,  75, 22,   8
+    LTEXT           "Normal",        IDC_UTILITY_NORMAL_LABEL,   8,  75, 22,   8
     CONTROL         "",  IDC_NORMAL_MAP, "CustButton",    WS_TABSTOP, 74,  73, 46, 10
-    LTEXT           "Scale",         -1, 122,  75, 18,   8
+    LTEXT           "Scale",         IDC_UTILITY_NORMSCL_LABEL, 122,  75, 18,   8
     CONTROL         "",  IDC_NORMSCL_EDIT,"CustEdit",     WS_TABSTOP, 138, 73, 16, 10
     CONTROL         "",  IDC_NORMSCL_SPIN,"SpinnerControl",0,         156, 73, 11, 10
 
-    GROUPBOX        "Emission",     -1,   2, 104, 166, 46
-    LTEXT           "Color",        -1,   8, 117, 20,   8
+    GROUPBOX        "Emission",     IDC_UTILITY_GROUP_EMISSION,   2, 104, 166, 46
+    LTEXT           "Color",        IDC_UTILITY_EM_COLOR_LABEL,   8, 117, 20,   8
     CONTROL         "",  IDC_EM_COLOR,    "ColorSwatch",   WS_TABSTOP, 34, 115, 24, 12
     CONTROL         "",  IDC_EM_MAP,      "CustButton",    WS_TABSTOP, 74, 115, 46, 12
-    LTEXT           "Intensity",    -1,   8, 133, 30,   8
+    LTEXT           "Intensity",    IDC_UTILITY_EM_INT_LABEL,   8, 133, 30,   8
     CONTROL         "",  IDC_EM_INT_EDIT, "CustEdit",      WS_TABSTOP, 44, 131, 18, 10
     CONTROL         "",  IDC_EM_INT_SPIN, "SpinnerControl", 0,         64, 131, 11, 10
-    LTEXT           "Amt",          -1, 122, 133, 14,   8
+    LTEXT           "Amt",          IDC_UTILITY_EMMAPSTR_LABEL, 122, 133, 14,   8
     CONTROL         "",  IDC_EMMAPSTR_EDIT,"CustEdit",    WS_TABSTOP, 134,131, 20, 10
     CONTROL         "",  IDC_EMMAPSTR_SPIN,"SpinnerControl",0,        156,131, 11, 10
 
-    GROUPBOX        "Utility Maps", -1,   2, 154, 166, 64
-    LTEXT           "Lightmap",     -1,   8, 167, 26,   8
+    GROUPBOX        "Utility Maps", IDC_UTILITY_GROUP_MAPS,   2, 154, 166, 64
+    LTEXT           "Lightmap",     IDC_UTILITY_LM_LABEL,   8, 167, 26,   8
     CONTROL         "",  IDC_LM_MAP,      "CustButton",    WS_TABSTOP, 44, 165, 110, 12
-    LTEXT           "Intensity",    -1,   8, 183, 30,   8
+    LTEXT           "Intensity",    IDC_UTILITY_LM_INT_LABEL,   8, 183, 30,   8
     CONTROL         "",  IDC_LM_INT_EDIT, "CustEdit",      WS_TABSTOP, 44, 181, 18, 10
     CONTROL         "",  IDC_LM_INT_SPIN, "SpinnerControl", 0,         64, 181, 11, 10
-    LTEXT           "UV Ch",        -1, 108, 183, 20,   8
+    LTEXT           "UV Ch",        IDC_UTILITY_LM_CH_LABEL, 108, 183, 20,   8
     CONTROL         "",  IDC_LM_CH_EDIT,  "CustEdit",      WS_TABSTOP, 130,181, 14, 10
     CONTROL         "",  IDC_LM_CH_SPIN,  "SpinnerControl", 0,         146,181, 11, 10
 
-    LTEXT           "AO",           -1,   8, 199, 14,   8
+    LTEXT           "AO",           IDC_UTILITY_AO_LABEL,   8, 199, 14,   8
     CONTROL         "",  IDC_AO_MAP,      "CustButton",    WS_TABSTOP, 44, 197, 70, 12
-    LTEXT           "Intensity",    -1, 118, 199, 30,   8
+    LTEXT           "Intensity",    IDC_UTILITY_AO_INT_LABEL, 118, 199, 30,   8
     CONTROL         "",  IDC_AO_INT_EDIT, "CustEdit",      WS_TABSTOP, 142,197, 12, 10
     CONTROL         "",  IDC_AO_INT_SPIN, "SpinnerControl", 0,         156,197, 11, 10
 
-    GROUPBOX        "Surface Relief", -1,  2, 222, 166, 48
-    LTEXT           "Bump",        -1,   8, 235, 30,   8
+    GROUPBOX        "Surface Relief", IDC_UTILITY_GROUP_RELIEF,  2, 222, 166, 48
+    LTEXT           "Bump",        IDC_UTILITY_BUMP_LABEL,   8, 235, 30,   8
     CONTROL         "",  IDC_BUMP_MAP,    "CustButton",    WS_TABSTOP, 44, 233, 70, 12
-    LTEXT           "Scale",       -1, 118, 235, 18,   8
+    LTEXT           "Scale",       IDC_UTILITY_BUMP_SCALE_LABEL, 118, 235, 18,   8
     CONTROL         "",  IDC_BUMP_EDIT,   "CustEdit",      WS_TABSTOP, 142,233, 12, 10
     CONTROL         "",  IDC_BUMP_SPIN,   "SpinnerControl", 0,         156,233, 11, 10
-    LTEXT           "Disp",        -1,   8, 251, 30,   8
+    LTEXT           "Disp",        IDC_UTILITY_DISP_LABEL,   8, 251, 30,   8
     CONTROL         "",  IDC_DISP_MAP,    "CustButton",    WS_TABSTOP, 44, 249, 70, 12
-    LTEXT           "Scale",       -1, 118, 251, 18,   8
+    LTEXT           "Scale",       IDC_UTILITY_DISP_SCALE_LABEL, 118, 251, 18,   8
     CONTROL         "",  IDC_DISP_EDIT,   "CustEdit",      WS_TABSTOP, 142,249, 12, 10
     CONTROL         "",  IDC_DISP_SPIN,   "SpinnerControl", 0,         156,249, 11, 10
-    LTEXT           "Bias",        -1, 118, 263, 18,   8
+    LTEXT           "Bias",        IDC_UTILITY_DISP_BIAS_LABEL, 118, 263, 18,   8
     CONTROL         "",  IDC_DISP_BIAS_EDIT,"CustEdit",    WS_TABSTOP, 142,261, 12, 10
     CONTROL         "",  IDC_DISP_BIAS_SPIN,"SpinnerControl",0,        156,261, 11, 10
 
-    GROUPBOX        "Mode Extras", -1,   2, 274, 166, 72
-    LTEXT           "Matcap",      -1,   8, 287, 22,   8
+    GROUPBOX        "Mode Extras", IDC_UTILITY_GROUP_EXTRAS,   2, 274, 166, 136
+    LTEXT           "Matcap",      IDC_UTILITY_MATCAP_LABEL,   8, 287, 22,   8
     CONTROL         "",  IDC_UTILITY_MATCAP_MAP, "CustButton", WS_TABSTOP, 40, 285, 114, 12
-    LTEXT           "Specular",    -1,   8, 303, 24,   8
-    CONTROL         "",  IDC_UTILITY_SPECULAR, "ColorSwatch", WS_TABSTOP, 40, 301, 24, 12
-    LTEXT           "Shiny",       -1,  90, 303, 18,   8
-    CONTROL         "",  IDC_UTILITY_SHINE_EDIT, "CustEdit", WS_TABSTOP, 118,301, 18, 10
-    CONTROL         "",  IDC_UTILITY_SHINE_SPIN, "SpinnerControl", 0, 138,301, 11, 10
-    CONTROL         "Flat Shading",IDC_UTILITY_FLAT,"Button",BS_AUTOCHECKBOX | WS_TABSTOP, 8, 319, 54, 10
-    CONTROL         "Wireframe",   IDC_UTILITY_WIREFRAME,"Button",BS_AUTOCHECKBOX | WS_TABSTOP, 74, 319, 46, 10
-    LTEXT           "Distance / Depth ignore color lighting extras.", -1, 8, 333, 146, 8
+    LTEXT           "Spec Map",    IDC_UTILITY_SPECMAP_LABEL,   8, 303, 28,   8
+    CONTROL         "",  IDC_UTILITY_SPECMAP, "CustButton", WS_TABSTOP, 40, 301, 114, 12
+    LTEXT           "Specular",    IDC_UTILITY_SPECULAR_LABEL,   8, 319, 24,   8
+    CONTROL         "",  IDC_UTILITY_SPECULAR, "ColorSwatch", WS_TABSTOP, 40, 317, 24, 12
+    LTEXT           "Shiny",       IDC_UTILITY_SHINE_LABEL,  90, 319, 18,   8
+    CONTROL         "",  IDC_UTILITY_SHINE_EDIT, "CustEdit", WS_TABSTOP, 118,317, 18, 10
+    CONTROL         "",  IDC_UTILITY_SHINE_SPIN, "SpinnerControl", 0, 138,317, 11, 10
+    LTEXT           "Combine",     IDC_UTILITY_COMBINE_LABEL, 8, 335, 28, 8
+    COMBOBOX        IDC_UTILITY_COMBINE, 40, 333, 52, 48, CBS_DROPDOWNLIST | WS_TABSTOP
+    LTEXT           "Reflect",     IDC_UTILITY_REFLECT_LABEL, 96, 335, 24,   8
+    CONTROL         "",  IDC_UTILITY_REFLECT_EDIT, "CustEdit", WS_TABSTOP, 124,333, 18, 10
+    CONTROL         "",  IDC_UTILITY_REFLECT_SPIN, "SpinnerControl", 0, 144,333, 11, 10
+    LTEXT           "Refract",     IDC_UTILITY_REFRACT_LABEL, 8, 351, 24,   8
+    CONTROL         "",  IDC_UTILITY_REFRACT_EDIT, "CustEdit", WS_TABSTOP, 40,349, 18, 10
+    CONTROL         "",  IDC_UTILITY_REFRACT_SPIN, "SpinnerControl", 0, 60,349, 11, 10
+    LTEXT           "Normals",     IDC_UTILITY_NORMAL_TYPE_LABEL, 96, 351, 24, 8
+    COMBOBOX        IDC_UTILITY_NORMAL_TYPE, 124, 349, 30, 40, CBS_DROPDOWNLIST | WS_TABSTOP
+    LTEXT           "Depth",       IDC_UTILITY_DEPTH_PACK_LABEL, 8, 367, 24,   8
+    COMBOBOX        IDC_UTILITY_DEPTH_PACK, 40, 365, 52, 56, CBS_DROPDOWNLIST | WS_TABSTOP
+    LTEXT           "Blur",        IDC_UTILITY_BLUR_LABEL, 96, 367, 18,   8
+    CONTROL         "",  IDC_UTILITY_BLUR_EDIT, "CustEdit", WS_TABSTOP, 124,365, 18, 10
+    CONTROL         "",  IDC_UTILITY_BLUR_SPIN, "SpinnerControl", 0, 144,365, 11, 10
+    CONTROL         "Flat Shading",IDC_UTILITY_FLAT,"Button",BS_AUTOCHECKBOX | WS_TABSTOP, 8, 383, 54, 10
+    CONTROL         "Wireframe",   IDC_UTILITY_WIREFRAME,"Button",BS_AUTOCHECKBOX | WS_TABSTOP, 74, 383, 46, 10
+    CONTROL         "Fog",         IDC_UTILITY_FOG,"Button",BS_AUTOCHECKBOX | WS_TABSTOP, 128, 383, 24, 10
 
-    GROUPBOX        "Options",     -1,   2, 350, 166, 60
-    CONTROL         "Double Sided",IDC_DOUBLE_SIDED,"Button",BS_AUTOCHECKBOX | WS_TABSTOP, 8, 362, 68, 10
-    LTEXT           "Env",         -1, 108, 362, 14,   8
-    CONTROL         "",  IDC_ENV_INT_EDIT,"CustEdit",      WS_TABSTOP, 128,360, 20, 10
-    CONTROL         "",  IDC_ENV_INT_SPIN,"SpinnerControl", 0,         150,360, 11, 10
-    LTEXT           "Models: Distance / Depth / Lambert / Matcap / Normal / Phong", IDC_MTL_MODEL_LABEL, 8, 392, 154, 16
+    GROUPBOX        "Options",     IDC_UTILITY_GROUP_OPTIONS,   2, 414, 166, 60
+    CONTROL         "Double Sided",IDC_DOUBLE_SIDED,"Button",BS_AUTOCHECKBOX | WS_TABSTOP, 8, 426, 68, 10
+    LTEXT           "Env",         IDC_UTILITY_ENV_LABEL, 108, 426, 14,   8
+    CONTROL         "",  IDC_ENV_INT_EDIT,"CustEdit",      WS_TABSTOP, 128,424, 20, 10
+    CONTROL         "",  IDC_ENV_INT_SPIN,"SpinnerControl", 0,         150,424, 11, 10
+    LTEXT           "Models: Distance / Depth / Lambert / Matcap / Normal / Phong / Backdrop", IDC_MTL_MODEL_LABEL, 8, 456, 154, 24
 END
 
 IDD_THREEJS_TSL_MTL DIALOG 0, 0, 170, 200

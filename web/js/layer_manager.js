@@ -487,6 +487,10 @@ export function createLayerManager({
             get isWebGPU() { return isWebGPU; },
             get dt() { return dt; },
             get elapsed() { return elapsed; },
+            // Scene coordinate info — 3ds Max is Z-up, units in system units (typically cm)
+            upAxis: Object.freeze(new THREE.Vector3(0, 0, 1)),
+            gravity: Object.freeze(new THREE.Vector3(0, 0, -980)),
+            units: 'cm',
             log: (...args) => console.log(`[Layer:${layer.id}]`, ...args),
             warn: (...args) => console.warn(`[Layer:${layer.id}]`, ...args),
             error: (...args) => console.error(`[Layer:${layer.id}]`, ...args),

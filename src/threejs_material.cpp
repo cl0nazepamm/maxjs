@@ -23,13 +23,15 @@ extern HINSTANCE hInstance;
 static const ParamID kMapParamIDs[kNumMaps] = {
     pb_color_map, pb_roughness_map, pb_metalness_map, pb_normal_map,
     pb_bump_map, pb_displacement_map, pb_parallax_map, pb_emissive_map,
-    pb_opacity_map, pb_lightmap, pb_ao_map, pb_sss_color_map, pb_matcap_map
+    pb_opacity_map, pb_lightmap, pb_ao_map, pb_sss_color_map, pb_matcap_map,
+    pb_specular_map
 };
 
 static const MCHAR* kMapSlotNames[kNumMaps] = {
     _T("Color Map"), _T("Roughness Map"), _T("Metalness Map"), _T("Normal Map"),
     _T("Bump Map"), _T("Displacement Map"), _T("Parallax Map"), _T("Emissive Map"),
-    _T("Opacity Map"), _T("Light Map"), _T("AO Map"), _T("SSS Color Map"), _T("Matcap Map")
+    _T("Opacity Map"), _T("Light Map"), _T("AO Map"), _T("SSS Color Map"), _T("Matcap Map"),
+    _T("Specular Map")
 };
 
 struct SupportedMapSlots {
@@ -54,7 +56,7 @@ static const int kUtilityDistanceDepthMapSlots[] = {
 
 static const int kUtilityLambertPhongMapSlots[] = {
     kMap_Color, kMap_Normal, kMap_Bump, kMap_Displacement,
-    kMap_Emissive, kMap_Opacity, kMap_Lightmap, kMap_AO
+    kMap_Emissive, kMap_Opacity, kMap_Lightmap, kMap_AO, kMap_Specular
 };
 
 static const int kUtilityMatcapMapSlots[] = {
@@ -106,7 +108,6 @@ static SupportedMapSlots GetSupportedMapSlots(ThreeJSMaterialKind kind, IParamBl
         case ThreeJSMaterialKind::Utility: {
             const int utilityModel = GetOptionalInt(pb, pb_utility_model, 0, threejs_utility_lambert);
             switch (utilityModel) {
-                case threejs_utility_distance:
                 case threejs_utility_depth:
                     return { kUtilityDistanceDepthMapSlots, static_cast<int>(std::size(kUtilityDistanceDepthMapSlots)) };
                 case threejs_utility_matcap:
@@ -618,14 +619,224 @@ ClassDesc2* GetThreeJSTSLMtlDesc() { return &threeJSTSLMtlDesc; }
         p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_PHYS_ANISOTROPY_EDIT, IDC_PHYS_ANISOTROPY_SPIN, 0.01f, \
         p_end
 
+static void ShowUtilityControl(HWND hWnd, int controlID, bool visible) {
+    if (HWND child = GetDlgItem(hWnd, controlID)) {
+        ShowWindow(child, visible ? SW_SHOW : SW_HIDE);
+        EnableWindow(child, visible ? TRUE : FALSE);
+    }
+}
+
+static void SetUtilityControlText(HWND hWnd, int controlID, const wchar_t* text) {
+    if (HWND child = GetDlgItem(hWnd, controlID)) {
+        SetWindowTextW(child, text);
+    }
+}
+
+static void SetUtilityModeSummary(HWND hWnd, int utilityModel) {
+    const wchar_t* summary = L"Models: Depth / Lambert / Matcap / Normal / Phong / Backdrop";
+    switch (utilityModel) {
+        case threejs_utility_depth:
+            summary = L"Depth: map, alpha, depth packing, displacement, and wireframe.";
+            break;
+        case threejs_utility_lambert:
+            summary = L"Lambert: color, emissive, AO, relief, spec map, env blend, flat, wireframe, and fog.";
+            break;
+        case threejs_utility_matcap:
+            summary = L"Matcap: color, matcap, normal space, relief, flat, wireframe, and fog.";
+            break;
+        case threejs_utility_normal:
+            summary = L"Normal: opacity, normal-space controls, relief, flat, and wireframe.";
+            break;
+        case threejs_utility_phong:
+            summary = L"Phong: Lambert plus specular color, shininess, and reflect/refract controls.";
+            break;
+        case threejs_utility_backdrop:
+            summary = L"Backdrop: tint, opacity, backdrop FX mode, and blur amount.";
+            break;
+    }
+    SetDlgItemTextW(hWnd, IDC_MTL_MODEL_LABEL, summary);
+}
+
+static void UpdateUtilityDialogUI(HWND hWnd, int utilityModel) {
+    const bool isDistance = false; // Distance material removed
+    const bool isDepth = utilityModel == threejs_utility_depth;
+    const bool isLambert = utilityModel == threejs_utility_lambert;
+    const bool isMatcap = utilityModel == threejs_utility_matcap;
+    const bool isNormal = utilityModel == threejs_utility_normal;
+    const bool isPhong = utilityModel == threejs_utility_phong;
+    const bool isBackdrop = utilityModel == threejs_utility_backdrop;
+    const bool showColorSwatch = isLambert || isMatcap || isPhong || isBackdrop;
+    const bool showColorMap = isDistance || isDepth || isLambert || isMatcap || isPhong || isBackdrop;
+    const bool showColorAmount = isBackdrop;
+    const bool showOpacityMap = !isNormal;
+    const bool showOpacityMapAmount = isBackdrop;
+    const bool showNormalRow = isLambert || isMatcap || isNormal || isPhong;
+    const bool showEmissionGroup = isLambert || isPhong;
+    const bool showLightmapGroup = isLambert || isPhong;
+    const bool showBumpRow = isLambert || isMatcap || isNormal || isPhong;
+    const bool showDisplacementRow = !isBackdrop;
+    const bool supportsNormalType = isLambert || isMatcap || isNormal || isPhong;
+    const bool supportsReflect = isLambert || isPhong;
+    const bool supportsFog = isLambert || isMatcap || isPhong;
+    const bool supportsFlat = isLambert || isMatcap || isNormal || isPhong;
+    const bool supportsWireframe = isDepth || isLambert || isMatcap || isNormal || isPhong;
+    const bool showModeExtrasGroup = isDepth || isLambert || isMatcap || isNormal || isPhong || isBackdrop;
+    const bool showReliefGroup = showBumpRow || showDisplacementRow;
+    const bool showEnv = isLambert || isPhong;
+
+    SetUtilityControlText(
+        hWnd,
+        IDC_UTILITY_COLOR_LABEL,
+        isDistance || isDepth ? L"Map" : (isBackdrop ? L"Tint" : L"Color"));
+
+    ShowUtilityControl(hWnd, IDC_UTILITY_GROUP_BASE, TRUE);
+    ShowUtilityControl(hWnd, IDC_UTILITY_COLOR_LABEL, showColorMap || showColorSwatch);
+    ShowUtilityControl(hWnd, IDC_COLOR, showColorSwatch);
+    ShowUtilityControl(hWnd, IDC_COLOR_MAP, showColorMap);
+    ShowUtilityControl(hWnd, IDC_UTILITY_MAPSTR_LABEL, showColorAmount);
+    ShowUtilityControl(hWnd, IDC_MAPSTR_EDIT, showColorAmount);
+    ShowUtilityControl(hWnd, IDC_MAPSTR_SPIN, showColorAmount);
+
+    ShowUtilityControl(hWnd, IDC_UTILITY_OPACITY_LABEL, TRUE);
+    ShowUtilityControl(hWnd, IDC_OPACITY_EDIT, TRUE);
+    ShowUtilityControl(hWnd, IDC_OPACITY_SPIN, TRUE);
+    ShowUtilityControl(hWnd, IDC_OPACITY_MAP, showOpacityMap);
+    ShowUtilityControl(hWnd, IDC_UTILITY_OPMAPSTR_LABEL, showOpacityMapAmount);
+    ShowUtilityControl(hWnd, IDC_OPMAPSTR_EDIT, showOpacityMapAmount);
+    ShowUtilityControl(hWnd, IDC_OPMAPSTR_SPIN, showOpacityMapAmount);
+
+    ShowUtilityControl(hWnd, IDC_UTILITY_NORMAL_LABEL, showNormalRow);
+    ShowUtilityControl(hWnd, IDC_NORMAL_MAP, showNormalRow);
+    ShowUtilityControl(hWnd, IDC_UTILITY_NORMSCL_LABEL, showNormalRow);
+    ShowUtilityControl(hWnd, IDC_NORMSCL_EDIT, showNormalRow);
+    ShowUtilityControl(hWnd, IDC_NORMSCL_SPIN, showNormalRow);
+
+    ShowUtilityControl(hWnd, IDC_UTILITY_GROUP_EMISSION, showEmissionGroup);
+    ShowUtilityControl(hWnd, IDC_UTILITY_EM_COLOR_LABEL, showEmissionGroup);
+    ShowUtilityControl(hWnd, IDC_EM_COLOR, showEmissionGroup);
+    ShowUtilityControl(hWnd, IDC_EM_MAP, showEmissionGroup);
+    ShowUtilityControl(hWnd, IDC_UTILITY_EM_INT_LABEL, showEmissionGroup);
+    ShowUtilityControl(hWnd, IDC_EM_INT_EDIT, showEmissionGroup);
+    ShowUtilityControl(hWnd, IDC_EM_INT_SPIN, showEmissionGroup);
+    ShowUtilityControl(hWnd, IDC_UTILITY_EMMAPSTR_LABEL, showEmissionGroup);
+    ShowUtilityControl(hWnd, IDC_EMMAPSTR_EDIT, showEmissionGroup);
+    ShowUtilityControl(hWnd, IDC_EMMAPSTR_SPIN, showEmissionGroup);
+
+    ShowUtilityControl(hWnd, IDC_UTILITY_GROUP_MAPS, showLightmapGroup);
+    ShowUtilityControl(hWnd, IDC_UTILITY_LM_LABEL, showLightmapGroup);
+    ShowUtilityControl(hWnd, IDC_LM_MAP, showLightmapGroup);
+    ShowUtilityControl(hWnd, IDC_UTILITY_LM_INT_LABEL, showLightmapGroup);
+    ShowUtilityControl(hWnd, IDC_LM_INT_EDIT, showLightmapGroup);
+    ShowUtilityControl(hWnd, IDC_LM_INT_SPIN, showLightmapGroup);
+    ShowUtilityControl(hWnd, IDC_UTILITY_LM_CH_LABEL, showLightmapGroup);
+    ShowUtilityControl(hWnd, IDC_LM_CH_EDIT, showLightmapGroup);
+    ShowUtilityControl(hWnd, IDC_LM_CH_SPIN, showLightmapGroup);
+    ShowUtilityControl(hWnd, IDC_UTILITY_AO_LABEL, showLightmapGroup);
+    ShowUtilityControl(hWnd, IDC_AO_MAP, showLightmapGroup);
+    ShowUtilityControl(hWnd, IDC_UTILITY_AO_INT_LABEL, showLightmapGroup);
+    ShowUtilityControl(hWnd, IDC_AO_INT_EDIT, showLightmapGroup);
+    ShowUtilityControl(hWnd, IDC_AO_INT_SPIN, showLightmapGroup);
+
+    ShowUtilityControl(hWnd, IDC_UTILITY_GROUP_RELIEF, showReliefGroup);
+    ShowUtilityControl(hWnd, IDC_UTILITY_BUMP_LABEL, showBumpRow);
+    ShowUtilityControl(hWnd, IDC_BUMP_MAP, showBumpRow);
+    ShowUtilityControl(hWnd, IDC_UTILITY_BUMP_SCALE_LABEL, showBumpRow);
+    ShowUtilityControl(hWnd, IDC_BUMP_EDIT, showBumpRow);
+    ShowUtilityControl(hWnd, IDC_BUMP_SPIN, showBumpRow);
+    ShowUtilityControl(hWnd, IDC_UTILITY_DISP_LABEL, showDisplacementRow);
+    ShowUtilityControl(hWnd, IDC_DISP_MAP, showDisplacementRow);
+    ShowUtilityControl(hWnd, IDC_UTILITY_DISP_SCALE_LABEL, showDisplacementRow);
+    ShowUtilityControl(hWnd, IDC_DISP_EDIT, showDisplacementRow);
+    ShowUtilityControl(hWnd, IDC_DISP_SPIN, showDisplacementRow);
+    ShowUtilityControl(hWnd, IDC_UTILITY_DISP_BIAS_LABEL, showDisplacementRow);
+    ShowUtilityControl(hWnd, IDC_DISP_BIAS_EDIT, showDisplacementRow);
+    ShowUtilityControl(hWnd, IDC_DISP_BIAS_SPIN, showDisplacementRow);
+
+    ShowUtilityControl(hWnd, IDC_UTILITY_FX_LABEL, isBackdrop);
+    ShowUtilityControl(hWnd, IDC_UTILITY_BACKDROP_MODE, isBackdrop);
+
+    ShowUtilityControl(hWnd, IDC_UTILITY_GROUP_EXTRAS, showModeExtrasGroup);
+
+    ShowUtilityControl(hWnd, IDC_UTILITY_MATCAP_LABEL, isMatcap);
+    ShowUtilityControl(hWnd, IDC_UTILITY_MATCAP_MAP, isMatcap);
+
+    ShowUtilityControl(hWnd, IDC_UTILITY_SPECMAP_LABEL, supportsReflect);
+    ShowUtilityControl(hWnd, IDC_UTILITY_SPECMAP, supportsReflect);
+
+    ShowUtilityControl(hWnd, IDC_UTILITY_SPECULAR_LABEL, isPhong);
+    ShowUtilityControl(hWnd, IDC_UTILITY_SPECULAR, isPhong);
+    ShowUtilityControl(hWnd, IDC_UTILITY_SHINE_LABEL, isPhong);
+    ShowUtilityControl(hWnd, IDC_UTILITY_SHINE_EDIT, isPhong);
+    ShowUtilityControl(hWnd, IDC_UTILITY_SHINE_SPIN, isPhong);
+
+    ShowUtilityControl(hWnd, IDC_UTILITY_COMBINE_LABEL, supportsReflect);
+    ShowUtilityControl(hWnd, IDC_UTILITY_COMBINE, supportsReflect);
+    ShowUtilityControl(hWnd, IDC_UTILITY_REFLECT_LABEL, supportsReflect);
+    ShowUtilityControl(hWnd, IDC_UTILITY_REFLECT_EDIT, supportsReflect);
+    ShowUtilityControl(hWnd, IDC_UTILITY_REFLECT_SPIN, supportsReflect);
+    ShowUtilityControl(hWnd, IDC_UTILITY_REFRACT_LABEL, supportsReflect);
+    ShowUtilityControl(hWnd, IDC_UTILITY_REFRACT_EDIT, supportsReflect);
+    ShowUtilityControl(hWnd, IDC_UTILITY_REFRACT_SPIN, supportsReflect);
+
+    ShowUtilityControl(hWnd, IDC_UTILITY_NORMAL_TYPE_LABEL, supportsNormalType);
+    ShowUtilityControl(hWnd, IDC_UTILITY_NORMAL_TYPE, supportsNormalType);
+
+    ShowUtilityControl(hWnd, IDC_UTILITY_DEPTH_PACK_LABEL, isDepth);
+    ShowUtilityControl(hWnd, IDC_UTILITY_DEPTH_PACK, isDepth);
+
+    ShowUtilityControl(hWnd, IDC_UTILITY_BLUR_LABEL, isBackdrop);
+    ShowUtilityControl(hWnd, IDC_UTILITY_BLUR_EDIT, isBackdrop);
+    ShowUtilityControl(hWnd, IDC_UTILITY_BLUR_SPIN, isBackdrop);
+
+    ShowUtilityControl(hWnd, IDC_UTILITY_FLAT, supportsFlat);
+    ShowUtilityControl(hWnd, IDC_UTILITY_WIREFRAME, supportsWireframe);
+    ShowUtilityControl(hWnd, IDC_UTILITY_FOG, supportsFog);
+
+    ShowUtilityControl(hWnd, IDC_UTILITY_GROUP_OPTIONS, TRUE);
+    ShowUtilityControl(hWnd, IDC_DOUBLE_SIDED, TRUE);
+    ShowUtilityControl(hWnd, IDC_UTILITY_ENV_LABEL, showEnv);
+    ShowUtilityControl(hWnd, IDC_ENV_INT_EDIT, showEnv);
+    ShowUtilityControl(hWnd, IDC_ENV_INT_SPIN, showEnv);
+
+    SetUtilityModeSummary(hWnd, utilityModel);
+}
+
+class ThreeJSUtilityDlgProc : public ParamMap2UserDlgProc {
+public:
+    INT_PTR DlgProc(TimeValue, IParamMap2* map, HWND hWnd, UINT msg, WPARAM wParam, LPARAM) override {
+        IParamBlock2* pb = map ? map->GetParamBlock() : nullptr;
+        auto refresh = [&]() {
+            const int utilityModel = pb ? GetOptionalInt(pb, pb_utility_model, 0, threejs_utility_lambert) : threejs_utility_lambert;
+            UpdateUtilityDialogUI(hWnd, utilityModel);
+        };
+
+        switch (msg) {
+            case WM_INITDIALOG:
+                refresh();
+                return TRUE;
+            case WM_COMMAND:
+                if (LOWORD(wParam) == IDC_UTILITY_MODE && HIWORD(wParam) == CBN_SELCHANGE) {
+                    refresh();
+                    return TRUE;
+                }
+                break;
+        }
+        return FALSE;
+    }
+
+    void DeleteThis() override {}
+};
+
+static ThreeJSUtilityDlgProc utilityDlgProc;
+
 #define THREEJS_UTILITY_PARAM_ITEMS \
     pb_utility_model, _T("utilityModel"), TYPE_INT, 0, 0, \
         p_default, threejs_utility_lambert, \
-        p_ui, TYPE_INT_COMBOBOX, IDC_UTILITY_MODE, 7, \
-            IDS_UTILITY_MODE_DISTANCE, IDS_UTILITY_MODE_DEPTH, IDS_UTILITY_MODE_LAMBERT, \
+        p_ui, TYPE_INT_COMBOBOX, IDC_UTILITY_MODE, 6, \
+            IDS_UTILITY_MODE_DEPTH, IDS_UTILITY_MODE_LAMBERT, \
             IDS_UTILITY_MODE_MATCAP, IDS_UTILITY_MODE_NORMAL, IDS_UTILITY_MODE_PHONG, \
             IDS_UTILITY_MODE_BACKDROP, \
-        p_vals, threejs_utility_distance, threejs_utility_depth, threejs_utility_lambert, \
+        p_vals, threejs_utility_depth, threejs_utility_lambert, \
             threejs_utility_matcap, threejs_utility_normal, threejs_utility_phong, \
             threejs_utility_backdrop, \
         p_end, \
@@ -651,6 +862,7 @@ ClassDesc2* GetThreeJSTSLMtlDesc() { return &threeJSTSLMtlDesc; }
     pb_roughness, _T("roughness"), TYPE_FLOAT, P_ANIMATABLE, 0, \
         p_default, 0.5f, \
         p_range, 0.0f, 99999.0f, \
+        p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_UTILITY_BLUR_EDIT, IDC_UTILITY_BLUR_SPIN, 0.01f, \
         p_end, \
     pb_roughness_map, _T("roughnessMap"), TYPE_TEXMAP, 0, 0, \
         p_subtexno, kMap_Roughness, \
@@ -761,6 +973,10 @@ ClassDesc2* GetThreeJSTSLMtlDesc() { return &threeJSTSLMtlDesc; }
         p_subtexno, kMap_Matcap, \
         p_ui, TYPE_TEXMAPBUTTON, IDC_UTILITY_MATCAP_MAP, \
         p_end, \
+    pb_specular_map, _T("specularMap"), TYPE_TEXMAP, 0, 0, \
+        p_subtexno, kMap_Specular, \
+        p_ui, TYPE_TEXMAPBUTTON, IDC_UTILITY_SPECMAP, \
+        p_end, \
     pb_specular_color, _T("specularColor"), TYPE_RGBA, P_ANIMATABLE, 0, \
         p_default, Color(0.0666667f, 0.0666667f, 0.0666667f), \
         p_ui, TYPE_COLORSWATCH, IDC_UTILITY_SPECULAR, \
@@ -777,6 +993,38 @@ ClassDesc2* GetThreeJSTSLMtlDesc() { return &threeJSTSLMtlDesc; }
     pb_wireframe, _T("wireframe"), TYPE_BOOL, 0, 0, \
         p_default, FALSE, \
         p_ui, TYPE_SINGLECHEKBOX, IDC_UTILITY_WIREFRAME, \
+        p_end, \
+    pb_reflectivity, _T("reflectivity"), TYPE_FLOAT, P_ANIMATABLE, 0, \
+        p_default, 1.0f, \
+        p_range, 0.0f, 1.0f, \
+        p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_UTILITY_REFLECT_EDIT, IDC_UTILITY_REFLECT_SPIN, 0.01f, \
+        p_end, \
+    pb_refraction_ratio, _T("refractionRatio"), TYPE_FLOAT, P_ANIMATABLE, 0, \
+        p_default, 0.98f, \
+        p_range, 0.0f, 1.0f, \
+        p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_UTILITY_REFRACT_EDIT, IDC_UTILITY_REFRACT_SPIN, 0.01f, \
+        p_end, \
+    pb_normal_map_type, _T("normalMapType"), TYPE_INT, 0, 0, \
+        p_default, threejs_utility_normal_tangent, \
+        p_ui, TYPE_INT_COMBOBOX, IDC_UTILITY_NORMAL_TYPE, 2, \
+            IDS_UTILITY_NORMAL_TANGENT, IDS_UTILITY_NORMAL_OBJECT, \
+        p_vals, threejs_utility_normal_tangent, threejs_utility_normal_object, \
+        p_end, \
+    pb_depth_packing, _T("depthPacking"), TYPE_INT, 0, 0, \
+        p_default, threejs_utility_depth_packing_basic, \
+        p_ui, TYPE_INT_COMBOBOX, IDC_UTILITY_DEPTH_PACK, 4, \
+            IDS_UTILITY_DEPTH_PACK_BASIC, IDS_UTILITY_DEPTH_PACK_RGBA, IDS_UTILITY_DEPTH_PACK_RGB, IDS_UTILITY_DEPTH_PACK_RG, \
+        p_vals, threejs_utility_depth_packing_basic, threejs_utility_depth_packing_rgba, threejs_utility_depth_packing_rgb, threejs_utility_depth_packing_rg, \
+        p_end, \
+    pb_fog, _T("fog"), TYPE_BOOL, 0, 0, \
+        p_default, TRUE, \
+        p_ui, TYPE_SINGLECHEKBOX, IDC_UTILITY_FOG, \
+        p_end, \
+    pb_combine, _T("combine"), TYPE_INT, 0, 0, \
+        p_default, threejs_utility_combine_multiply, \
+        p_ui, TYPE_INT_COMBOBOX, IDC_UTILITY_COMBINE, 3, \
+            IDS_UTILITY_COMBINE_MULTIPLY, IDS_UTILITY_COMBINE_MIX, IDS_UTILITY_COMBINE_ADD, \
+        p_vals, threejs_utility_combine_multiply, threejs_utility_combine_mix, threejs_utility_combine_add, \
         p_end, \
     pb_double_sided, _T("doubleSided"), TYPE_BOOL, 0, 0, \
         p_default, TRUE, \
@@ -816,7 +1064,7 @@ static ParamBlockDesc2 threejs_utility_pb_desc(
     &threeJSUtilityMtlDesc,
     P_AUTO_CONSTRUCT + P_AUTO_UI,
     0,
-    IDD_THREEJS_UTILITY_MTL, IDS_UTILITY_PARAMS, 0, 0, nullptr,
+    IDD_THREEJS_UTILITY_MTL, IDS_UTILITY_PARAMS, 0, 0, &utilityDlgProc,
     THREEJS_UTILITY_PARAM_ITEMS,
     THREEJS_HIDDEN_LEGACY_PARAM_ITEMS,
     p_end

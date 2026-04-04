@@ -486,6 +486,7 @@
         import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
         import { HDRLoader } from 'three/addons/loaders/HDRLoader.js';
         import { EXRLoader } from 'three/addons/loaders/EXRLoader.js';
+        import { MaterialXLoader } from 'three/addons/loaders/MaterialXLoader.js';
         import { LightProbeGenerator } from 'three/addons/lights/LightProbeGenerator.js';
         import { RectAreaLightTexturesLib } from 'three/addons/lights/RectAreaLightTexturesLib.js';
         import { hashBlur } from 'three/addons/tsl/display/hashBlur.js';
@@ -501,6 +502,7 @@
             viewportLinearDepth,
             viewportSharedTexture,
         } from 'three/tsl';
+        import * as TSL from 'three/tsl';
         import { applyDeltaFrame } from './js/protocol.js';
         import { createPerfHud } from './js/perf_hud.js';
         import { createSSGIController } from './js/ssgi_fx.js';
@@ -587,11 +589,30 @@
         const controls = new OrbitControls(camera, renderer.domElement);
         controls.enableDamping = true;
         controls.dampingFactor = 0.08;
+        controls.mouseButtons = {
+            LEFT: null,               // reserved for selection
+            MIDDLE: THREE.MOUSE.PAN,  // middle = pan
+            RIGHT: null               // reserved
+        };
+        controls.zoomSpeed = 2.0;
+        controls.rotateSpeed = 0.5;
+        // Alt+MMB = orbit (3ds Max style) — capture phase to beat OrbitControls
+        renderer.domElement.addEventListener('pointerdown', e => {
+            if (e.button === 1 && controls.enabled) {
+                controls.mouseButtons.MIDDLE = e.altKey ? THREE.MOUSE.ROTATE : THREE.MOUSE.PAN;
+            }
+        }, true);
+        renderer.domElement.addEventListener('pointerup', e => {
+            if (e.button === 1) {
+                controls.mouseButtons.MIDDLE = THREE.MOUSE.PAN;
+            }
+        }, true);
         controls.enabled = false;  // cam lock ON by default
 
         // Grid on XY plane (Z-up)
         const grid = new THREE.GridHelper(200, 20, 0x555555, 0x444444);
         grid.rotation.x = Math.PI / 2;  // Rotate to XY plane for Z-up
+        grid.visible = false;
         overlayRoot.add(grid);
 
         // Lights (fallback, hidden when HDRI loads)
@@ -628,6 +649,8 @@
 
         const textureCache = new Map();
         const materialCache = new Map();
+        const materialXTemplateCache = new Map();
+        const materialXLoadCache = new Map();
         const nodeMap = new Map();
         const splatLayer = document.getElementById('splatLayer');
         const splatHandleMap = new Map();
@@ -1122,6 +1145,117 @@
             return slotColorSpace;
         }
 
+        function isAbsoluteWindowsPath(path) {
+            return /^[a-zA-Z]:[\\/]/.test(path) || /^\\\\/.test(path);
+        }
+
+        function toAssetUrl(filePath) {
+            const normalized = String(filePath ?? '').replace(/\\/g, '/');
+            const segments = normalized.split('/').filter((segment, index) => segment.length > 0 || index === 0);
+            const encoded = segments.map(segment => encodeURIComponent(segment)).join('/');
+            return `https://maxjs-assets.local/${encoded}`;
+        }
+
+        function normalizeMaterialXResourceUrl(url) {
+            const value = String(url ?? '').trim();
+            if (!value) return value;
+            if (/^(?:data:|blob:|https?:)/i.test(value)) return value;
+            if (isAbsoluteWindowsPath(value)) return toAssetUrl(value);
+            return value.replace(/\\/g, '/');
+        }
+
+        function pickMaterialXMaterial(materials, md) {
+            const entries = Object.entries(materials ?? {});
+            if (!entries.length) return null;
+
+            const requestedName = String(md.materialXName ?? '').trim();
+            if (requestedName) {
+                const namedEntry = entries.find(([name]) => name === requestedName);
+                if (namedEntry) return namedEntry[1];
+            }
+
+            const requestedIndex = Number.isFinite(md.materialXIndex)
+                ? Math.max(1, Math.round(md.materialXIndex))
+                : 1;
+            return entries[Math.min(entries.length - 1, requestedIndex - 1)][1];
+        }
+
+        function createPendingMaterialXMaterial(md) {
+            const material = new THREE.MeshPhysicalNodeMaterial({
+                color: new THREE.Color(md.color[0], md.color[1], md.color[2]),
+                roughness: md.rough ?? 0.5,
+                metalness: md.metal ?? 0.0,
+                side: md.side === 0 ? THREE.FrontSide : THREE.DoubleSide,
+            });
+
+            if (md.opacity != null && md.opacity < 0.999) {
+                material.transparent = true;
+                material.opacity = md.opacity;
+            }
+
+            material.userData ??= {};
+            material.userData.maxjsMaterialXPending = true;
+            material.needsUpdate = true;
+            return material;
+        }
+
+        function applyLoadedMaterialXTemplate(target, source, md) {
+            target.copy(source);
+            target.name = source.name || target.name;
+            target.side = md.side === 0 ? THREE.FrontSide : THREE.DoubleSide;
+            target.userData ??= {};
+            target.userData.maxjsMaterialXPending = false;
+            target.userData.maxjsMaterialXSourceName = source.name || '';
+            rememberMaterialEmissiveBase(target);
+            target.needsUpdate = true;
+        }
+
+        async function ensureMaterialXTemplateLoaded(cacheKey, template, md) {
+            if (!md.materialXFile) return template;
+
+            let pending = materialXLoadCache.get(cacheKey);
+            if (pending) return pending;
+
+            const manager = new THREE.LoadingManager();
+            manager.setURLModifier(url => normalizeMaterialXResourceUrl(url));
+
+            const loader = new MaterialXLoader(manager);
+            if (md.materialXBase) loader.setPath(md.materialXBase);
+
+            pending = fetch(md.materialXFile, { cache: 'no-store' })
+                .then(response => {
+                    if (!response.ok) {
+                        throw new Error(`MaterialX fetch failed: ${response.status} ${response.statusText}`);
+                    }
+                    return response.text();
+                })
+                .then(text => loader.parse(text))
+                .then(({ materials }) => {
+                    const loadedMaterial = pickMaterialXMaterial(materials, md);
+                    if (!loadedMaterial) {
+                        throw new Error(`No MaterialX material resolved for ${md.materialXFile}`);
+                    }
+
+                    applyLoadedMaterialXTemplate(template, loadedMaterial, md);
+                    return template;
+                })
+                .catch(error => {
+                    console.error('[MaterialX] Load failed:', error);
+                    template.color?.set?.(0xff00ff);
+                    template.wireframe = true;
+                    template.userData ??= {};
+                    template.userData.maxjsMaterialXPending = false;
+                    template.needsUpdate = true;
+                    return template;
+                })
+                .finally(() => {
+                    materialXLoadCache.delete(cacheKey);
+                });
+
+            materialXLoadCache.set(cacheKey, pending);
+            return pending;
+        }
+
         function loadVideoTexture(url, xf) {
             const playbackKey = JSON.stringify({
                 loop: xf?.loop !== false,
@@ -1526,7 +1660,7 @@
         }
 
         const utilityMaterialModels = new Set([
-            'MeshDistanceMaterial',
+
             'MeshDepthMaterial',
             'MeshBackdropNodeMaterial',
             'MeshLambertMaterial',
@@ -1595,8 +1729,9 @@
                 material.side = md.side === 0 ? THREE.FrontSide : THREE.DoubleSide;
                 // TSL code gets full access to THREE (which includes all TSL nodes)
                 // and a convenience `loadTexture` for loading bitmaps from Max paths
-                const fn = new Function('material', 'THREE', 'loadTexture', md.tslCode);
-                fn(material, THREE, loadTexture);
+                const code = md.tslCode;
+                const fn = new Function('material', 'THREE', 'TSL', 'loadTexture', code);
+                fn(material, THREE, TSL, loadTexture);
                 material.needsUpdate = true;
                 return material;
             } catch (err) {
@@ -1612,9 +1747,6 @@
 
             let material;
             switch (runtimeModelName) {
-            case 'MeshDistanceMaterial':
-                material = new THREE.MeshDistanceMaterial();
-                break;
             case 'MeshDepthMaterial':
                 material = new THREE.MeshDepthMaterial();
                 break;
@@ -1647,11 +1779,30 @@
                 material.emissiveIntensity = md.emI ?? material.emissiveIntensity ?? 1.0;
             }
             if ('envMapIntensity' in material && md.envI != null) material.envMapIntensity = md.envI;
+            if ('reflectivity' in material && md.reflectivity != null) material.reflectivity = md.reflectivity;
+            if ('refractionRatio' in material && md.refractionRatio != null) material.refractionRatio = md.refractionRatio;
             if ('flatShading' in material) material.flatShading = !!md.flat;
             if ('wireframe' in material) material.wireframe = !!md.wireframe;
+            if ('fog' in material && md.fog != null) material.fog = !!md.fog;
             if ('shininess' in material && md.shininess != null) material.shininess = md.shininess;
             if ('specular' in material && Array.isArray(md.spec)) {
                 material.specular.setRGB(md.spec[0], md.spec[1], md.spec[2]);
+            }
+            if ('combine' in material && md.combine != null) {
+                const combineModes = [THREE.MultiplyOperation, THREE.MixOperation, THREE.AddOperation];
+                material.combine = combineModes[md.combine] ?? THREE.MultiplyOperation;
+            }
+            if ('normalMapType' in material && md.normalMapType != null) {
+                material.normalMapType = md.normalMapType === 1 ? THREE.ObjectSpaceNormalMap : THREE.TangentSpaceNormalMap;
+            }
+            if ('depthPacking' in material && md.depthPacking != null) {
+                const depthPackingModes = [
+                    THREE.BasicDepthPacking,
+                    THREE.RGBADepthPacking,
+                    THREE.RGBDepthPacking,
+                    THREE.RGDepthPacking,
+                ];
+                material.depthPacking = depthPackingModes[md.depthPacking] ?? THREE.BasicDepthPacking;
             }
             if (md.normScl != null && 'normalScale' in material) {
                 material.normalScale = new THREE.Vector2(md.normScl, md.normScl);
@@ -1699,6 +1850,9 @@
             if (md.matcapMap && 'matcap' in material) {
                 material.matcap = loadTexture(md.matcapMap, THREE.SRGBColorSpace, md.matcapMapXf, fallbackWhiteTexture);
             }
+            if (md.specMap && 'specularMap' in material) {
+                material.specularMap = loadTexture(md.specMap, THREE.LinearSRGBColorSpace, md.specMapXf, fallbackWhiteTexture);
+            }
 
             rememberMaterialEmissiveBase(material);
             material.needsUpdate = true;
@@ -1707,6 +1861,7 @@
 
         function createMaterial(md) {
             const requestedModelName = md.model || 'MeshStandardMaterial';
+            const wantsMaterialXMaterial = requestedModelName === 'MaterialXMaterial';
             const wantsUtilityMaterial = utilityMaterialModels.has(requestedModelName);
             const wantsToonMaterial = requestedModelName === 'MeshToonMaterial';
             const wantsSSSMaterial = requestedModelName === 'MeshSSSNodeMaterial';
@@ -1729,7 +1884,9 @@
                 typeof tslColor === 'function' &&
                 typeof tslFloat === 'function' &&
                 typeof tslTexture === 'function';
-            const runtimeModelName = wantsUtilityMaterial
+            const runtimeModelName = wantsMaterialXMaterial
+                ? 'MaterialXMaterial'
+                : wantsUtilityMaterial
                 ? ((hasUtilityCtor || canUseBackdropUtility) ? requestedModelName : 'MeshLambertMaterial')
                 : (canUseToonMaterial
                 ? 'MeshToonMaterial'
@@ -1738,11 +1895,18 @@
                     : ((wantsAdvancedMaterial || wantsSSSMaterial) ? 'MeshPhysicalMaterial' : 'MeshStandardMaterial')));
             const key = JSON.stringify([requestedModelName, runtimeModelName, md]);
             let template = materialCache.get(key);
+            if (!template && wantsMaterialXMaterial) {
+                template = materialXTemplateCache.get(key);
+            }
 
             const wantsTSLMaterial = requestedModelName === 'MeshTSLNodeMaterial';
 
             if (!template) {
-                if (wantsTSLMaterial && md.tslCode) {
+                if (wantsMaterialXMaterial) {
+                    template = createPendingMaterialXMaterial(md);
+                    materialXTemplateCache.set(key, template);
+                    ensureMaterialXTemplateLoaded(key, template, md);
+                } else if (wantsTSLMaterial && md.tslCode) {
                     template = createTSLMaterial(md);
                 } else if (wantsUtilityMaterial) {
                     template = createUtilityMaterial(runtimeModelName, md);
@@ -1870,6 +2034,12 @@
                 rememberMaterialEmissiveBase(template);
                 template.needsUpdate = true;
                 materialCache.set(key, template);
+            } else if (wantsMaterialXMaterial) {
+                materialCache.set(key, template);
+            }
+
+            if (wantsMaterialXMaterial) {
+                return template;
             }
 
             const material = template.clone();
@@ -2224,8 +2394,15 @@
                     else { mesh.material = mat; }
                 } else {
                     if (!geom) continue;
-                    mesh = new THREE.Mesh(geom, clayModeActive ? clayMat : mat);
-                    if (clayModeActive) mesh.userData._origMaterial = mat;
+                    if (nd.spline) {
+                        const lineMat = new THREE.LineBasicMaterial({
+                            color: mat?.color ?? new THREE.Color(0xffffff),
+                        });
+                        mesh = new THREE.LineSegments(geom, lineMat);
+                    } else {
+                        mesh = new THREE.Mesh(geom, clayModeActive ? clayMat : mat);
+                        if (clayModeActive) mesh.userData._origMaterial = mat;
+                    }
                     mesh.matrixAutoUpdate = false;
                     mesh.name = nd.n;
                     mesh.frustumCulled = false;
@@ -2235,7 +2412,7 @@
 
                 mesh.visible = true;
                 mesh.frustumCulled = false;
-                applyMeshShadowState(mesh);
+                if (!nd.spline) applyMeshShadowState(mesh);
                 applyNodeProps(mesh, nd.props);
 
                 applyTransform(mesh, nd.t);
@@ -2460,8 +2637,15 @@
                     else { mesh.material = mat; }
                 } else {
                     if (!geom) continue;
-                    mesh = new THREE.Mesh(geom, clayModeActive ? clayMat : mat);
-                    if (clayModeActive) mesh.userData._origMaterial = mat;
+                    if (nd.spline) {
+                        const lineMat = new THREE.LineBasicMaterial({
+                            color: mat?.color ?? new THREE.Color(0xffffff),
+                        });
+                        mesh = new THREE.LineSegments(geom, lineMat);
+                    } else {
+                        mesh = new THREE.Mesh(geom, clayModeActive ? clayMat : mat);
+                        if (clayModeActive) mesh.userData._origMaterial = mat;
+                    }
                     mesh.matrixAutoUpdate = false;
                     mesh.name = nd.n;
                     mesh.frustumCulled = false;
@@ -2471,7 +2655,7 @@
 
                 mesh.visible = nd.vis !== 0;
                 mesh.frustumCulled = false;
-                applyMeshShadowState(mesh);
+                if (!nd.spline) applyMeshShadowState(mesh);
                 applyNodeProps(mesh, nd.props);
 
                 applyTransform(mesh, nd.t);
@@ -3133,6 +3317,7 @@
             btnCam.textContent = `Cam Lock: ${camLock ? 'ON' : 'OFF'}`;
             btnCam.classList.toggle('active', camLock);
             controls.enabled = !camLock;
+            savePostFxState();
         };
 
         const btnEnv = document.getElementById('btnEnv');
@@ -3159,6 +3344,7 @@
             btnLightProbe.classList.toggle('active', lightProbeEnabled);
             applyLightProbeState();
             if (lightProbeEnabled) refreshLightProbeFromCurrentHDRI();
+            savePostFxState();
         };
 
         // Toon outline is automatic — no UI button needed
@@ -3993,6 +4179,8 @@
                     toneMapping: currentToneMapping,
                     exposure: currentExposure,
                     envVisible,
+                    camLock,
+                    lightProbeEnabled,
                     fx: state,
                     hdri: {
                         rotation: localHdriRotation,
@@ -4024,6 +4212,18 @@
                 }
                 if (typeof saved.envVisible === 'boolean') {
                     envVisible = saved.envVisible;
+                }
+                if (typeof saved.camLock === 'boolean') {
+                    camLock = saved.camLock;
+                    controls.enabled = !camLock;
+                    btnCam.textContent = `Cam Lock: ${camLock ? 'ON' : 'OFF'}`;
+                    btnCam.classList.toggle('active', camLock);
+                }
+                if (typeof saved.lightProbeEnabled === 'boolean') {
+                    lightProbeEnabled = saved.lightProbeEnabled;
+                    btnLightProbe.textContent = `Probe: ${lightProbeEnabled ? 'ON' : 'OFF'}`;
+                    btnLightProbe.classList.toggle('active', lightProbeEnabled);
+                    applyLightProbeState();
                 }
 
                 // Restore HDRI settings (file must be re-picked, but sliders persist)

@@ -9,6 +9,7 @@
 #include <iepoly.h>
 #include <iEPolyMod.h>
 #include <mnmesh.h>
+#include <splshape.h>
 #include <notify.h>
 #include <stdmat.h>
 #include <ISceneEventManager.h>
@@ -77,6 +78,7 @@ static HWND g_helperHwnd = nullptr;
 // Forward — used by renderer's ActiveShade
 static void TogglePanel();
 static void KillPanel();
+static void RequestGlobalPanelKill();
 void ToggleMaxJSPanel(); // defined after class
 void StartMaxJSActiveShade(Bitmap* target); // defined after class
 void StopMaxJSActiveShade(); // defined after class
@@ -96,8 +98,18 @@ static std::wstring EscapeJson(const wchar_t* s) {
             case L'"':  out += L"\\\""; break;
             case L'\\': out += L"\\\\"; break;
             case L'\n': out += L"\\n"; break;
+            case L'\r': out += L"\\r"; break;
             case L'\t': out += L"\\t"; break;
-            default:    out += *s;
+            case L'\b': out += L"\\b"; break;
+            case L'\f': out += L"\\f"; break;
+            default:
+                if (static_cast<unsigned>(*s) < 0x20) {
+                    wchar_t buf[8];
+                    swprintf_s(buf, 8, L"\\u%04x", static_cast<unsigned>(*s));
+                    out += buf;
+                } else {
+                    out += *s;
+                }
         }
     }
     return out;
@@ -471,6 +483,13 @@ static uint64_t HashFNV1a(const void* data, size_t bytes, uint64_t seed = 146959
     return h;
 }
 
+static uint64_t HashIntervalState(const Interval& iv, uint64_t seed = 1469598103934665603ULL) {
+    const int start = iv.Start();
+    const int end = iv.End();
+    uint64_t h = HashFNV1a(&start, sizeof(start), seed);
+    return HashFNV1a(&end, sizeof(end), h);
+}
+
 static uint64_t HashMeshData(const std::vector<float>& verts,
                              const std::vector<int>& indices,
                              const std::vector<float>& uvs) {
@@ -734,26 +753,37 @@ struct MaxJSPBR {
     float anisotropy = 0.0f;
     float specular[3] = {0.0666667f, 0.0666667f, 0.0666667f};
     float shininess = 30.0f;
+    float reflectivity = 1.0f;
+    float refractionRatio = 0.98f;
     bool  flatShading = false;
     bool  wireframe = false;
+    bool  fog = true;
     int   backdropMode = 0;
+    int   normalMapType = 0;
+    int   depthPacking = 0;
+    int   combine = 0;
     std::wstring colorMap, gradientMap, roughnessMap, metalnessMap, normalMap;
-    std::wstring bumpMap, displacementMap, parallaxMap, sssColorMap, matcapMap;
+    std::wstring bumpMap, displacementMap, parallaxMap, sssColorMap, matcapMap, specularMap;
     std::wstring aoMap, emissionMap, lightmapFile, opacityMap;
     std::wstring clearcoatMap, clearcoatRoughnessMap, clearcoatNormalMap;
     TexTransform colorMapTransform, gradientMapTransform, roughnessMapTransform, metalnessMapTransform, normalMapTransform;
     TexTransform bumpMapTransform, displacementMapTransform, parallaxMapTransform, sssColorMapTransform;
-    TexTransform aoMapTransform, emissionMapTransform, lightmapTransform, opacityMapTransform, matcapMapTransform;
+    TexTransform aoMapTransform, emissionMapTransform, lightmapTransform, opacityMapTransform, matcapMapTransform, specularMapTransform;
     TexTransform clearcoatMapTransform, clearcoatRoughnessMapTransform, clearcoatNormalMapTransform;
     std::wstring mtlName;
     std::wstring tslCode;
     std::wstring materialModel = L"MeshStandardMaterial";
+    std::wstring materialXFile;
+    std::wstring materialXMaterialName;
+    int materialXMaterialIndex = 1;
     float parallaxScale = 0.0f;
 };
 
 static float FindPBFloat(Texmap* map, const MCHAR* name, float def);
 static int FindPBInt(Texmap* map, const MCHAR* name, int def);
 static std::wstring FindPBString(Texmap* map, const MCHAR* name);
+static std::wstring FindPBString(Mtl* mtl, const MCHAR* name);
+static int FindPBInt(Mtl* mtl, const MCHAR* name, int def);
 
 // Shell Material Class_ID = (597, 0)
 #define SHELL_MTL_CLASS_ID Class_ID(597, 0)
@@ -763,12 +793,17 @@ static std::wstring FindPBString(Texmap* map, const MCHAR* name);
 #define USD_PREVIEW_SURFACE_CLASS_ID Class_ID(1794787635, 1200091591)
 // Normal Bump texmap Class_ID = {243e22c6, 63f6a014}
 #define NORMAL_BUMP_CLASS_ID Class_ID(0x243e22c6, 0x63f6a014)
+// OpenPBR Material Class_ID
+#define OPENPBR_MTL_CLASS_ID Class_ID(4048887347u, 939201335)
 // VRayMtl Class_ID
 #define VRAYMTL_CLASS_ID Class_ID(935280431, 1882483036)
 // VRayBitmap Class_ID
 #define VRAYBITMAP_CLASS_ID Class_ID(1734939723, 46203261)
 // VRayNormalMap Class_ID
 #define VRAYNORMALMAP_CLASS_ID Class_ID(1912237649, 1912962095)
+// MaterialX Material Class_ID variants observed in Max runtime
+#define MATERIALX_MTL_CLASS_ID Class_ID(0x37161b0b, 0x51c741cc)
+#define MATERIALX_MTL_ALT_CLASS_ID Class_ID(0x20fb46dc, 0x30fd79bf)
 
 static bool HasParam(IParamBlock2* pb, ParamID id) {
     if (!pb) return false;
@@ -784,9 +819,12 @@ static bool IsThreeJSMaterialClass(const Class_ID& cid) {
            cid == THREEJS_TSL_CLASS_ID;
 }
 
+static bool IsMaterialXMaterialClass(const Class_ID& cid) {
+    return cid == MATERIALX_MTL_CLASS_ID || cid == MATERIALX_MTL_ALT_CLASS_ID;
+}
+
 static std::wstring GetUtilityMaterialModelName(int utilityModel) {
     switch (utilityModel) {
-        case threejs_utility_distance: return L"MeshDistanceMaterial";
         case threejs_utility_depth: return L"MeshDepthMaterial";
         case threejs_utility_matcap: return L"MeshMatcapMaterial";
         case threejs_utility_normal: return L"MeshNormalMaterial";
@@ -799,7 +837,7 @@ static std::wstring GetUtilityMaterialModelName(int utilityModel) {
 }
 
 static bool IsUtilityMaterialModel(const std::wstring& materialModel) {
-    return materialModel == L"MeshDistanceMaterial" ||
+    return
            materialModel == L"MeshDepthMaterial" ||
            materialModel == L"MeshLambertMaterial" ||
            materialModel == L"MeshMatcapMaterial" ||
@@ -815,7 +853,9 @@ static bool IsSupportedMaterial(Mtl* mtl) {
     Class_ID cid = mtl->ClassID();
     return IsThreeJSMaterialClass(cid) || cid == THREEJS_TOON_CLASS_ID || cid == GLTF_MTL_CLASS_ID
         || cid == USD_PREVIEW_SURFACE_CLASS_ID || cid == PHYSICAL_MTL_CLASS_ID
-        || cid == VRAYMTL_CLASS_ID;
+        || cid == VRAYMTL_CLASS_ID
+        || cid == OPENPBR_MTL_CLASS_ID
+        || IsMaterialXMaterialClass(cid);
 }
 
 // Find ThreeJS or glTF Material in material tree — uses ClassID only
@@ -989,6 +1029,12 @@ static bool ExtractMaterialTexture(Texmap* map, std::wstring& filePath, MaxJSPBR
 static void ExtractThreeJSMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
     IParamBlock2* pb = mtl->GetParamBlockByID(threejs_params);
     if (!pb) return;
+    auto getOptionalFloat = [&](ParamID id, float def) {
+        return HasParam(pb, id) ? pb->GetFloat(id, t) : def;
+    };
+    auto getOptionalInt = [&](ParamID id, int def) {
+        return HasParam(pb, id) ? pb->GetInt(id, t) : def;
+    };
 
     MSTR name = mtl->GetName();
     d.mtlName = name.data();
@@ -1066,10 +1112,16 @@ static void ExtractThreeJSMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
     } else if (cid == THREEJS_UTILITY_MTL_CLASS_ID) {
         Color spec = pb->GetColor(pb_specular_color, t);
         d.specular[0] = spec.r; d.specular[1] = spec.g; d.specular[2] = spec.b;
-        d.shininess = pb->GetFloat(pb_shininess, t);
-        d.flatShading = pb->GetInt(pb_flat_shading, t) != 0;
-        d.wireframe = pb->GetInt(pb_wireframe, t) != 0;
-        d.backdropMode = pb->GetInt(pb_backdrop_mode, t);
+        d.shininess = getOptionalFloat(pb_shininess, 30.0f);
+        d.reflectivity = getOptionalFloat(pb_reflectivity, 1.0f);
+        d.refractionRatio = getOptionalFloat(pb_refraction_ratio, 0.98f);
+        d.flatShading = getOptionalInt(pb_flat_shading, FALSE) != 0;
+        d.wireframe = getOptionalInt(pb_wireframe, FALSE) != 0;
+        d.fog = getOptionalInt(pb_fog, TRUE) != 0;
+        d.backdropMode = getOptionalInt(pb_backdrop_mode, threejs_backdrop_blurred);
+        d.normalMapType = getOptionalInt(pb_normal_map_type, threejs_utility_normal_tangent);
+        d.depthPacking = getOptionalInt(pb_depth_packing, threejs_utility_depth_packing_basic);
+        d.combine = getOptionalInt(pb_combine, threejs_utility_combine_multiply);
     }
 
     auto readMap = [&](ParamID pid, std::wstring& outPath, MaxJSPBR::TexTransform& outXf) {
@@ -1093,7 +1145,19 @@ static void ExtractThreeJSMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
         readMap(pb_sss_color_map, d.sssColorMap, d.sssColorMapTransform);
     } else if (cid == THREEJS_UTILITY_MTL_CLASS_ID) {
         readMap(pb_matcap_map, d.matcapMap, d.matcapMapTransform);
+        readMap(pb_specular_map, d.specularMap, d.specularMapTransform);
     }
+}
+
+static void ExtractMaterialXMtl(Mtl* mtl, TimeValue /*t*/, MaxJSPBR& d) {
+    if (!mtl) return;
+
+    MSTR name = mtl->GetName();
+    d.mtlName = name.data();
+    d.materialModel = L"MaterialXMaterial";
+    d.materialXFile = FindPBString(mtl, _T("MaterialXFile"));
+    d.materialXMaterialName = FindPBString(mtl, _T("curMatName"));
+    d.materialXMaterialIndex = std::max(1, FindPBInt(mtl, _T("curMatIdx"), 1));
 }
 
 static void ExtractThreeJSToonMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
@@ -1308,6 +1372,54 @@ static void ExtractUsdPreviewSurfaceMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
         d.materialModel = L"MeshPhysicalMaterial";
 }
 
+// ── Composite AO detection ──────────────────────────────────
+#define COMPOSITE_TEX_CLASS_ID Class_ID(640, 0)
+#define COMPOSITE_BLEND_MULTIPLY 5
+
+static bool TrySplitCompositeAO(Texmap* map, TimeValue t,
+                                std::wstring& colorPath, MaxJSPBR::TexTransform& colorXf,
+                                std::wstring& aoPath, MaxJSPBR::TexTransform& aoXf) {
+    if (!map || map->ClassID() != COMPOSITE_TEX_CLASS_ID) return false;
+    IParamBlock2* pb = map->GetParamBlockByID(0);
+    if (!pb) return false;
+
+    auto getTabCount = [&](const MCHAR* pname) -> int {
+        for (int i = 0; i < pb->NumParams(); i++) {
+            ParamID pid = pb->IndextoID(i);
+            const ParamDef& pd = pb->GetParamDef(pid);
+            if (pd.int_name && _tcsicmp(pd.int_name, pname) == 0) return pb->Count(pid);
+        }
+        return 0;
+    };
+    auto getTabInt = [&](const MCHAR* pname, int idx) -> int {
+        for (int i = 0; i < pb->NumParams(); i++) {
+            ParamID pid = pb->IndextoID(i);
+            const ParamDef& pd = pb->GetParamDef(pid);
+            if (pd.int_name && _tcsicmp(pd.int_name, pname) == 0) return pb->GetInt(pid, t, idx);
+        }
+        return 0;
+    };
+    auto getTabTexmap = [&](const MCHAR* pname, int idx) -> Texmap* {
+        for (int i = 0; i < pb->NumParams(); i++) {
+            ParamID pid = pb->IndextoID(i);
+            const ParamDef& pd = pb->GetParamDef(pid);
+            if (pd.int_name && _tcsicmp(pd.int_name, pname) == 0) return pb->GetTexmap(pid, t, idx);
+        }
+        return nullptr;
+    };
+
+    if (getTabCount(_T("mapList")) < 2) return false;
+    if (!getTabInt(_T("mapEnabled"), 0) || !getTabInt(_T("mapEnabled"), 1)) return false;
+    if (getTabInt(_T("blendMode"), 1) != COMPOSITE_BLEND_MULTIPLY) return false;
+
+    Texmap* layer1 = getTabTexmap(_T("mapList"), 0);
+    Texmap* layer2 = getTabTexmap(_T("mapList"), 1);
+    if (!layer1 || !layer2) return false;
+
+    return ExtractMaterialTexture(layer1, colorPath, colorXf) &&
+           ExtractMaterialTexture(layer2, aoPath, aoXf);
+}
+
 // Extract PBR from 3ds Max Physical Material
 static void ExtractPhysicalMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
     MSTR name = mtl->GetName();
@@ -1415,21 +1527,7 @@ static void ExtractPhysicalMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
     d.iridescence = readFloat(_T("thin_film"), 0.0f);
     d.iridescenceIOR = readFloat(_T("thin_film_ior"), 1.3f);
 
-    // Texture maps (param name, enable param name)
-    readMap(_T("base_color_map"),    _T("base_color_map_on"),    d.colorMap,        d.colorMapTransform);
-    readMap(_T("roughness_map"),     _T("roughness_map_on"),     d.roughnessMap,    d.roughnessMapTransform);
-    readMap(_T("metalness_map"),     _T("metalness_map_on"),     d.metalnessMap,    d.metalnessMapTransform);
-    readMap(_T("emit_color_map"),    _T("emit_color_map_on"),    d.emissionMap,     d.emissionMapTransform);
-    readMap(_T("coat_map"),          _T("coat_map_on"),          d.clearcoatMap,             d.clearcoatMapTransform);
-    readMap(_T("coat_rough_map"),    _T("coat_rough_map_on"),    d.clearcoatRoughnessMap,    d.clearcoatRoughnessMapTransform);
-    readMap(_T("displacement_map"), _T("displacement_map_on"),  d.displacementMap, d.displacementMapTransform);
-    readMap(_T("transparency_map"), _T("transparency_map_on"),  d.opacityMap,      d.opacityMapTransform);
-    readMap(_T("cutout_map"),       _T("cutout_map_on"),        d.opacityMap,      d.opacityMapTransform);
-
-    // Normal/Bump map — Physical Material "bump_map" slot can contain either:
-    //   1) Normal Bump texmap (wrapper) → subtex 0 is normal map, subtex 1 is additional bump
-    //   2) Plain bitmap → height-based bump map
-    // Detect which one and route to the correct PBR field.
+    // Helper to get raw Texmap from PB
     auto getTexmap = [&](const MCHAR* pname, const MCHAR* onName) -> Texmap* {
         if (onName && !readBool(onName, true)) return nullptr;
         for (int b = 0; b < mtl->NumParamBlocks(); b++) {
@@ -1445,6 +1543,25 @@ static void ExtractPhysicalMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
         return nullptr;
     };
 
+    // Texture maps — check diffuse for Composite AO pattern
+    {
+        Texmap* baseColorMap = getTexmap(_T("base_color_map"), _T("base_color_map_on"));
+        if (!baseColorMap || !TrySplitCompositeAO(baseColorMap, t, d.colorMap, d.colorMapTransform, d.aoMap, d.aoMapTransform))
+            readMap(_T("base_color_map"), _T("base_color_map_on"), d.colorMap, d.colorMapTransform);
+    }
+    readMap(_T("roughness_map"),     _T("roughness_map_on"),     d.roughnessMap,    d.roughnessMapTransform);
+    readMap(_T("metalness_map"),     _T("metalness_map_on"),     d.metalnessMap,    d.metalnessMapTransform);
+    readMap(_T("emit_color_map"),    _T("emit_color_map_on"),    d.emissionMap,     d.emissionMapTransform);
+    readMap(_T("coat_map"),          _T("coat_map_on"),          d.clearcoatMap,             d.clearcoatMapTransform);
+    readMap(_T("coat_rough_map"),    _T("coat_rough_map_on"),    d.clearcoatRoughnessMap,    d.clearcoatRoughnessMapTransform);
+    readMap(_T("displacement_map"), _T("displacement_map_on"),  d.displacementMap, d.displacementMapTransform);
+    readMap(_T("transparency_map"), _T("transparency_map_on"),  d.opacityMap,      d.opacityMapTransform);
+    readMap(_T("cutout_map"),       _T("cutout_map_on"),        d.opacityMap,      d.opacityMapTransform);
+
+    // Normal/Bump map — Physical Material "bump_map" slot can contain either:
+    //   1) Normal Bump texmap (wrapper) → subtex 0 is normal map, subtex 1 is additional bump
+    //   2) Plain bitmap → height-based bump map
+    // Detect which one and route to the correct PBR field.
     Texmap* bumpSlot = getTexmap(_T("bump_map"), _T("bump_map_on"));
     if (bumpSlot) {
         if (bumpSlot->ClassID() == NORMAL_BUMP_CLASS_ID) {
@@ -1473,6 +1590,168 @@ static void ExtractPhysicalMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
             ExtractMaterialTexture(coatBumpSlot, d.clearcoatNormalMap, d.clearcoatNormalMapTransform);
         }
     }
+}
+
+// Extract PBR from OpenPBR Material — same PB layout as Physical Material
+static void ExtractOpenPBRMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
+    MSTR name = mtl->GetName();
+    d.mtlName = name.data();
+    d.materialModel = L"MeshPhysicalMaterial";
+
+    // Reuse the same generic PB reader pattern as Physical Material
+    auto readFloat = [&](const MCHAR* pname, float def) -> float {
+        for (int b = 0; b < mtl->NumParamBlocks(); b++) {
+            IParamBlock2* pb = mtl->GetParamBlock(b);
+            if (!pb) continue;
+            for (int i = 0; i < pb->NumParams(); i++) {
+                ParamID pid = pb->IndextoID(i);
+                const ParamDef& pd = pb->GetParamDef(pid);
+                if (pd.int_name && _tcsicmp(pd.int_name, pname) == 0 && pd.type == TYPE_FLOAT)
+                    return pb->GetFloat(pid, t);
+            }
+        }
+        return def;
+    };
+    auto readColor = [&](const MCHAR* pname, float out[3]) {
+        for (int b = 0; b < mtl->NumParamBlocks(); b++) {
+            IParamBlock2* pb = mtl->GetParamBlock(b);
+            if (!pb) continue;
+            for (int i = 0; i < pb->NumParams(); i++) {
+                ParamID pid = pb->IndextoID(i);
+                const ParamDef& pd = pb->GetParamDef(pid);
+                if (pd.int_name && _tcsicmp(pd.int_name, pname) == 0 &&
+                    (pd.type == TYPE_RGBA || pd.type == TYPE_FRGBA)) {
+                    Color c = pb->GetColor(pid, t);
+                    out[0] = c.r; out[1] = c.g; out[2] = c.b;
+                    return;
+                }
+            }
+        }
+    };
+    auto readBool = [&](const MCHAR* pname, bool def) -> bool {
+        for (int b = 0; b < mtl->NumParamBlocks(); b++) {
+            IParamBlock2* pb = mtl->GetParamBlock(b);
+            if (!pb) continue;
+            for (int i = 0; i < pb->NumParams(); i++) {
+                ParamID pid = pb->IndextoID(i);
+                const ParamDef& pd = pb->GetParamDef(pid);
+                if (pd.int_name && _tcsicmp(pd.int_name, pname) == 0 &&
+                    (pd.type == TYPE_BOOL || pd.type == TYPE_INT))
+                    return pb->GetInt(pid, t) != 0;
+            }
+        }
+        return def;
+    };
+    auto readMap = [&](const MCHAR* mapName, const MCHAR* onName,
+                       std::wstring& outPath, MaxJSPBR::TexTransform& outXf) {
+        outPath.clear(); outXf = {};
+        if (onName && !readBool(onName, true)) return;
+        for (int b = 0; b < mtl->NumParamBlocks(); b++) {
+            IParamBlock2* pb = mtl->GetParamBlock(b);
+            if (!pb) continue;
+            for (int i = 0; i < pb->NumParams(); i++) {
+                ParamID pid = pb->IndextoID(i);
+                const ParamDef& pd = pb->GetParamDef(pid);
+                if (pd.int_name && _tcsicmp(pd.int_name, mapName) == 0 && pd.type == TYPE_TEXMAP) {
+                    Texmap* map = pb->GetTexmap(pid, t);
+                    ExtractMaterialTexture(map, outPath, outXf);
+                    return;
+                }
+            }
+        }
+    };
+
+    // Core PBR
+    readColor(_T("base_color"), d.color);
+    d.roughness       = readFloat(_T("specular_roughness"), 0.3f);
+    d.metalness       = readFloat(_T("base_metalness"), 0.0f);
+    d.ior             = readFloat(_T("specular_ior"), 1.5f);
+    d.normalScale     = readFloat(_T("bump_map_amt"), 1.0f);
+    d.displacementScale = readFloat(_T("displacement_map_amt"), 1.0f);
+    d.anisotropy      = readFloat(_T("specular_roughness_anisotropy"), 0.0f);
+
+    // Specular
+    readColor(_T("specular_color"), d.physicalSpecularColor);
+    d.physicalSpecularIntensity = readFloat(_T("specular_weight"), 1.0f);
+
+    // Transmission
+    d.transmission = readFloat(_T("transmission_weight"), 0.0f);
+    if (d.transmission > 0.0f) {
+        readColor(_T("transmission_color"), d.attenuationColor);
+        d.attenuationDistance = readFloat(_T("transmission_depth"), 0.0f);
+        d.dispersion = readFloat(_T("transmission_dispersion_scale"), 0.0f);
+    }
+
+    // Coat
+    d.clearcoat = readFloat(_T("coat_weight"), 0.0f);
+    d.clearcoatRoughness = readFloat(_T("coat_roughness"), 0.0f);
+
+    // Fuzz → Sheen
+    d.sheen = readFloat(_T("fuzz_weight"), 0.0f);
+    readColor(_T("fuzz_color"), d.sheenColor);
+    d.sheenRoughness = readFloat(_T("fuzz_roughness"), 0.5f);
+
+    // Emission
+    float emWeight = readFloat(_T("emission_weight"), 0.0f);
+    readColor(_T("emission_color"), d.emission);
+    d.emIntensity = emWeight;
+
+    // Thin film → Iridescence
+    d.iridescence = readFloat(_T("thin_film_weight"), 0.0f);
+    d.iridescenceIOR = readFloat(_T("thin_film_ior"), 1.4f);
+
+    auto getTexmap = [&](const MCHAR* pname, const MCHAR* onName) -> Texmap* {
+        if (onName && !readBool(onName, true)) return nullptr;
+        for (int b = 0; b < mtl->NumParamBlocks(); b++) {
+            IParamBlock2* pb = mtl->GetParamBlock(b);
+            if (!pb) continue;
+            for (int i = 0; i < pb->NumParams(); i++) {
+                ParamID pid = pb->IndextoID(i);
+                const ParamDef& pd = pb->GetParamDef(pid);
+                if (pd.int_name && _tcsicmp(pd.int_name, pname) == 0 && pd.type == TYPE_TEXMAP)
+                    return pb->GetTexmap(pid, t);
+            }
+        }
+        return nullptr;
+    };
+
+    // Texture maps — check for Composite AO
+    {
+        Texmap* baseColorMap = getTexmap(_T("base_color_map"), _T("base_color_map_on"));
+        if (!baseColorMap || !TrySplitCompositeAO(baseColorMap, t, d.colorMap, d.colorMapTransform, d.aoMap, d.aoMapTransform))
+            readMap(_T("base_color_map"), _T("base_color_map_on"), d.colorMap, d.colorMapTransform);
+    }
+    readMap(_T("specular_roughness_map"), _T("specular_roughness_map_on"), d.roughnessMap,    d.roughnessMapTransform);
+    readMap(_T("base_metalness_map"),     _T("base_metalness_map_on"),     d.metalnessMap,    d.metalnessMapTransform);
+    readMap(_T("emission_color_map"),     _T("emission_color_map_on"),     d.emissionMap,     d.emissionMapTransform);
+    readMap(_T("geometry_opacity_map"),   _T("geometry_opacity_map_on"),   d.opacityMap,      d.opacityMapTransform);
+    readMap(_T("displacement_map"),       _T("displacement_map_on"),       d.displacementMap, d.displacementMapTransform);
+    readMap(_T("coat_weight_map"),        _T("coat_weight_map_on"),        d.clearcoatMap,    d.clearcoatMapTransform);
+    readMap(_T("coat_roughness_map"),     _T("coat_roughness_map_on"),     d.clearcoatRoughnessMap, d.clearcoatRoughnessMapTransform);
+    readMap(_T("geometry_coat_normal_map"), _T("geometry_coat_normal_map_on"), d.clearcoatNormalMap, d.clearcoatNormalMapTransform);
+
+    // geometry_normal_map is a dedicated normal map slot (no Normal Bump wrapper needed)
+    readMap(_T("geometry_normal_map"), _T("geometry_normal_map_on"), d.normalMap, d.normalMapTransform);
+
+    // bump_map can be Normal Bump or plain bump — same detection as Physical
+    Texmap* bumpSlot = getTexmap(_T("bump_map"), _T("bump_map_on"));
+    if (bumpSlot) {
+        if (bumpSlot->ClassID() == NORMAL_BUMP_CLASS_ID) {
+            if (d.normalMap.empty() && bumpSlot->NumSubTexmaps() > 0 && bumpSlot->GetSubTexmap(0))
+                ExtractMaterialTexture(bumpSlot->GetSubTexmap(0), d.normalMap, d.normalMapTransform);
+            if (bumpSlot->NumSubTexmaps() > 1 && bumpSlot->GetSubTexmap(1))
+                ExtractMaterialTexture(bumpSlot->GetSubTexmap(1), d.bumpMap, d.bumpMapTransform);
+        } else if (d.normalMap.empty()) {
+            ExtractMaterialTexture(bumpSlot, d.normalMap, d.normalMapTransform);
+        } else {
+            ExtractMaterialTexture(bumpSlot, d.bumpMap, d.bumpMapTransform);
+        }
+    }
+
+    // Downgrade to Standard if no advanced features
+    if (d.clearcoat == 0.0f && d.sheen == 0.0f && d.transmission == 0.0f &&
+        d.iridescence == 0.0f && d.anisotropy == 0.0f)
+        d.materialModel = L"MeshStandardMaterial";
 }
 
 // Extract PBR from VRayMtl
@@ -1589,7 +1868,27 @@ static void ExtractVRayMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
     }
 
     // Texture maps
-    readMap(_T("texmap_diffuse"),          _T("texmap_diffuse_on"),          d.colorMap,      d.colorMapTransform);
+    // Diffuse — check for Composite AO pattern (Color × AO multiply)
+    {
+        Texmap* diffuseMap = nullptr;
+        if (readBool(_T("texmap_diffuse_on"), true)) {
+            for (int b = 0; b < mtl->NumParamBlocks(); b++) {
+                IParamBlock2* pb = mtl->GetParamBlock(b);
+                if (!pb) continue;
+                for (int i = 0; i < pb->NumParams(); i++) {
+                    ParamID pid = pb->IndextoID(i);
+                    const ParamDef& pd = pb->GetParamDef(pid);
+                    if (pd.int_name && _tcsicmp(pd.int_name, _T("texmap_diffuse")) == 0 && pd.type == TYPE_TEXMAP) {
+                        diffuseMap = pb->GetTexmap(pid, t);
+                        break;
+                    }
+                }
+                if (diffuseMap) break;
+            }
+        }
+        if (!diffuseMap || !TrySplitCompositeAO(diffuseMap, t, d.colorMap, d.colorMapTransform, d.aoMap, d.aoMapTransform))
+            readMap(_T("texmap_diffuse"), _T("texmap_diffuse_on"), d.colorMap, d.colorMapTransform);
+    }
     readMap(_T("texmap_roughness"),        _T("texmap_roughness_on"),        d.roughnessMap,  d.roughnessMapTransform);
     readMap(_T("texmap_metalness"),        _T("texmap_metalness_on"),        d.metalnessMap,  d.metalnessMapTransform);
     readMap(_T("texmap_bump"),             _T("texmap_bump_on"),             d.normalMap,     d.normalMapTransform);
@@ -1616,12 +1915,16 @@ static void ExtractPBRFromMtl(Mtl* mtl, INode* node, TimeValue t, MaxJSPBR& d) {
                 ExtractThreeJSMtl(found, t, d);
             else if (cid == THREEJS_TOON_CLASS_ID)
                 ExtractThreeJSToonMtl(found, t, d);
+            else if (IsMaterialXMaterialClass(cid))
+                ExtractMaterialXMtl(found, t, d);
             else if (cid == USD_PREVIEW_SURFACE_CLASS_ID)
                 ExtractUsdPreviewSurfaceMtl(found, t, d);
             else if (cid == PHYSICAL_MTL_CLASS_ID)
                 ExtractPhysicalMtl(found, t, d);
             else if (cid == VRAYMTL_CLASS_ID)
                 ExtractVRayMtl(found, t, d);
+            else if (cid == OPENPBR_MTL_CLASS_ID)
+                ExtractOpenPBRMtl(found, t, d);
             else
                 ExtractGltfMtl(found, t, d);
             return;
@@ -1663,12 +1966,16 @@ static void ExtractPBR(INode* node, TimeValue t, MaxJSPBR& d) {
             ExtractThreeJSMtl(found, t, d);
         else if (cid == THREEJS_TOON_CLASS_ID)
             ExtractThreeJSToonMtl(found, t, d);
+        else if (IsMaterialXMaterialClass(cid))
+            ExtractMaterialXMtl(found, t, d);
         else if (cid == USD_PREVIEW_SURFACE_CLASS_ID)
             ExtractUsdPreviewSurfaceMtl(found, t, d);
         else if (cid == PHYSICAL_MTL_CLASS_ID)
             ExtractPhysicalMtl(found, t, d);
         else if (cid == VRAYMTL_CLASS_ID)
             ExtractVRayMtl(found, t, d);
+        else if (cid == OPENPBR_MTL_CLASS_ID)
+            ExtractOpenPBRMtl(found, t, d);
         else
             ExtractGltfMtl(found, t, d);
         return;
@@ -2113,6 +2420,65 @@ static bool ExtractMeshFromRawMesh(Mesh& mesh,
     return !indices.empty();
 }
 
+// ── Spline extraction — sample BezierShape curves into line vertices ──
+static bool ExtractSpline(INode* node, TimeValue t,
+                          std::vector<float>& verts,
+                          std::vector<int>& indices) {
+    ObjectState os = node->EvalWorldState(t);
+    if (!os.obj || os.obj->SuperClassID() != SHAPE_CLASS_ID) return false;
+
+    // Get BezierShape — either directly or via conversion
+    SplineShape* converted = nullptr;
+    BezierShape* bezShape = nullptr;
+
+    if (os.obj->ClassID() == splineShapeClassID) {
+        bezShape = &static_cast<SplineShape*>(os.obj)->shape;
+    } else if (os.obj->CanConvertToType(splineShapeClassID)) {
+        SplineShape* conv = static_cast<SplineShape*>(
+            os.obj->ConvertToType(t, splineShapeClassID));
+        if (conv && conv != os.obj) converted = conv;
+        if (conv) bezShape = &conv->shape;
+    }
+
+    if (!bezShape || bezShape->SplineCount() == 0) {
+        if (converted) converted->DeleteThis();
+        return false;
+    }
+
+    const int STEPS = 6; // steps per spline segment
+    int vertOffset = 0;
+
+    for (int s = 0; s < bezShape->SplineCount(); s++) {
+        Spline3D* spline = bezShape->GetSpline(s);
+        if (!spline || spline->Segments() <= 0) continue;
+
+        const int totalSteps = spline->Segments() * STEPS;
+        const int startVert = vertOffset;
+
+        for (int i = 0; i <= totalSteps; i++) {
+            const float param = static_cast<float>(i) / static_cast<float>(totalSteps);
+            Point3 pt = bezShape->InterpCurve3D(s, param, PARAM_SIMPLE);
+            verts.push_back(pt.x);
+            verts.push_back(pt.y);
+            verts.push_back(pt.z);
+            vertOffset++;
+        }
+
+        for (int i = startVert; i < vertOffset - 1; i++) {
+            indices.push_back(i);
+            indices.push_back(i + 1);
+        }
+
+        if (spline->Closed() && vertOffset - startVert > 2) {
+            indices.push_back(vertOffset - 1);
+            indices.push_back(startVert);
+        }
+    }
+
+    if (converted) converted->DeleteThis();
+    return !verts.empty();
+}
+
 // ── Unified ExtractMesh — MNMesh path for PolyObject, TriObject fallback ──
 static bool ExtractMesh(INode* node, TimeValue t,
                         std::vector<float>& verts,
@@ -2246,6 +2612,93 @@ static uint64_t ComputeNodePropHash(INode* node, TimeValue t) {
     float vis = node->GetVisibility(t);
     uint32_t visBits; memcpy(&visBits, &vis, 4);
     h = h * 31 + visBits;
+    return h;
+}
+
+static uint64_t ComputeSyncRelevantNodeStateHash(INode* node, TimeValue t) {
+    if (!node) return 0;
+
+    uint64_t h = 1469598103934665603ULL;
+    const ULONG handle = node->GetHandle();
+    h = HashFNV1a(&handle, sizeof(handle), h);
+
+    float xform[16];
+    GetTransform16(node, t, xform);
+    h = HashFNV1a(xform, sizeof(xform), h);
+
+    const uint64_t props = ComputeNodePropHash(node, t);
+    h = HashFNV1a(&props, sizeof(props), h);
+
+    ObjectState os = node->EvalWorldState(t);
+    if (os.obj) {
+        const SClass_ID superClass = os.obj->SuperClassID();
+        const Class_ID classId = os.obj->ClassID();
+        h = HashFNV1a(&superClass, sizeof(superClass), h);
+        h = HashFNV1a(&classId, sizeof(classId), h);
+        h = HashIntervalState(os.obj->ChannelValidity(t, GEOM_CHAN_NUM), h);
+        h = HashIntervalState(os.obj->ChannelValidity(t, TOPO_CHAN_NUM), h);
+    }
+
+    if (Mtl* mtl = node->GetMtl()) {
+        const Class_ID mtlClass = mtl->ClassID();
+        h = HashFNV1a(&mtlClass, sizeof(mtlClass), h);
+        h = HashIntervalState(mtl->Validity(t), h);
+    }
+
+    return h;
+}
+
+static void CollectReferencedNodeHandlesRecursive(ReferenceMaker* maker,
+                                                  ULONG ownerHandle,
+                                                  std::unordered_set<ULONG>& out,
+                                                  std::unordered_set<const void*>& visited,
+                                                  int depth = 0) {
+    if (!maker || depth > 8) return;
+    if (!visited.insert(maker).second) return;
+
+    if (maker->SuperClassID() == BASENODE_CLASS_ID) {
+        INode* depNode = static_cast<INode*>(maker);
+        const ULONG depHandle = depNode->GetHandle();
+        if (depHandle != ownerHandle) out.insert(depHandle);
+        return;
+    }
+
+    const int numRefs = maker->NumRefs();
+    for (int i = 0; i < numRefs; ++i) {
+        RefTargetHandle ref = maker->GetReference(i);
+        if (!ref) continue;
+        CollectReferencedNodeHandlesRecursive(ref, ownerHandle, out, visited, depth + 1);
+    }
+}
+
+static uint64_t ComputePluginInstanceStateHash(INode* node, TimeValue t, Interface* ip) {
+    if (!node) return 0;
+
+    uint64_t h = ComputeSyncRelevantNodeStateHash(node, t);
+    std::unordered_set<ULONG> deps;
+    std::unordered_set<const void*> visited;
+
+    Object* base = node->GetObjectRef();
+    while (base && base->SuperClassID() == GEN_DERIVOB_CLASS_ID) {
+        base = reinterpret_cast<IDerivedObject*>(base)->GetObjRef();
+    }
+    ReferenceMaker* root = base
+        ? static_cast<ReferenceMaker*>(base)
+        : static_cast<ReferenceMaker*>(node->GetObjectRef());
+    CollectReferencedNodeHandlesRecursive(root, node->GetHandle(), deps, visited);
+
+    std::vector<ULONG> sortedDeps(deps.begin(), deps.end());
+    std::sort(sortedDeps.begin(), sortedDeps.end());
+    const size_t depCount = sortedDeps.size();
+    h = HashFNV1a(&depCount, sizeof(depCount), h);
+
+    for (ULONG depHandle : sortedDeps) {
+        h = HashFNV1a(&depHandle, sizeof(depHandle), h);
+        INode* depNode = ip ? ip->GetINodeByHandle(depHandle) : nullptr;
+        const uint64_t depHash = depNode ? ComputeSyncRelevantNodeStateHash(depNode, t) : 0;
+        h = HashFNV1a(&depHash, sizeof(depHash), h);
+    }
+
     return h;
 }
 
@@ -2867,6 +3320,41 @@ static std::wstring FindPBString(Texmap* map, const MCHAR* name) {
     return {};
 }
 
+static std::wstring FindPBString(Mtl* mtl, const MCHAR* name) {
+    if (!mtl) return {};
+    for (int b = 0; b < mtl->NumParamBlocks(); b++) {
+        IParamBlock2* pb = mtl->GetParamBlock(b);
+        if (!pb) continue;
+        for (int i = 0; i < pb->NumParams(); i++) {
+            ParamID pid = pb->IndextoID(i);
+            const ParamDef& pd = pb->GetParamDef(pid);
+            if (pd.int_name && _tcsicmp(pd.int_name, name) == 0 &&
+                (pd.type == TYPE_STRING || pd.type == TYPE_FILENAME)) {
+                const MCHAR* s = pb->GetStr(pid);
+                return s ? s : L"";
+            }
+        }
+    }
+    return {};
+}
+
+static int FindPBInt(Mtl* mtl, const MCHAR* name, int def) {
+    if (!mtl) return def;
+    for (int b = 0; b < mtl->NumParamBlocks(); b++) {
+        IParamBlock2* pb = mtl->GetParamBlock(b);
+        if (!pb) continue;
+        for (int i = 0; i < pb->NumParams(); i++) {
+            ParamID pid = pb->IndextoID(i);
+            const ParamDef& pd = pb->GetParamDef(pid);
+            if (pd.int_name && _tcsicmp(pd.int_name, name) == 0 &&
+                (pd.type == TYPE_INT || pd.type == TYPE_BOOL)) {
+                return pb->GetInt(pid);
+            }
+        }
+    }
+    return def;
+}
+
 static void GetEnvironment(EnvData& env) {
     Texmap* envMap = GetCOREInterface()->GetEnvironmentMap();
     if (!envMap) return;
@@ -3065,7 +3553,7 @@ public:
     std::unordered_map<ULONG, std::vector<MatGroup>> groupCache_; // cached material groups per node
     std::unordered_map<ULONG, uint64_t> propHashMap_;  // node handle → object properties hash
     std::unordered_set<ULONG> pluginInstHandles_;        // FP/RC/tyFlow node handles for change detection
-    std::unordered_map<ULONG, uint64_t> pluginInstHash_; // plugin node → geometry validity hash
+    std::unordered_map<ULONG, uint64_t> pluginInstHash_; // plugin node → generated-instance dependency hash
     std::map<std::wstring, std::wstring> texDirMap_;    // dir → host
     int texDirCount_ = 0;
     bool lastClayMode_ = false;
@@ -3755,16 +4243,26 @@ public:
 
     // ── Same-origin asset serving via WebResourceRequested ──
 
-    std::wstring MapTexturePath(const std::wstring& filePath) {
-        if (filePath.empty() || filePath.size() < 3 || filePath[1] != L':') return {};
-        const DWORD attrs = GetFileAttributesW(filePath.c_str());
-        if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_DIRECTORY)) return {};
+    std::wstring MapAssetPath(const std::wstring& path, bool allowDirectory = false) {
+        if (path.empty() || path.size() < 3 || path[1] != L':') return {};
+        const DWORD attrs = GetFileAttributesW(path.c_str());
+        if (attrs == INVALID_FILE_ATTRIBUTES) return {};
 
-        std::wstring normalizedPath = filePath;
+        const bool isDirectory = (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
+        if (isDirectory && !allowDirectory) return {};
+        if (!isDirectory && allowDirectory) return {};
+
+        std::wstring normalizedPath = path;
         std::replace(normalizedPath.begin(), normalizedPath.end(), L'\\', L'/');
+        if (isDirectory && !normalizedPath.empty() && normalizedPath.back() != L'/')
+            normalizedPath.push_back(L'/');
         std::wstring encodedPath = UrlEncodePath(normalizedPath);
         if (encodedPath.empty()) return {};
         return L"https://maxjs-assets.local/" + encodedPath;
+    }
+
+    std::wstring MapTexturePath(const std::wstring& filePath) {
+        return MapAssetPath(filePath, false);
     }
 
     // ── Callbacks & sync ─────────────────────────────────────
@@ -3945,7 +4443,8 @@ public:
         if (IsThreeJSSplatClassID(os.obj->ClassID())) return true;
 
         const SClass_ID superClass = os.obj->SuperClassID();
-        return superClass == GEOMOBJECT_CLASS_ID || superClass == LIGHT_CLASS_ID;
+        return superClass == GEOMOBJECT_CLASS_ID || superClass == LIGHT_CLASS_ID
+            || superClass == SHAPE_CLASS_ID;
     }
 
 
@@ -4106,6 +4605,11 @@ public:
 
             VisitNodeSubtree(node, [this, t, &needsFullSync](INode* current) {
                 if (needsFullSync) return;
+                if (IsForestPackNode(current) || IsRailCloneNode(current) ||
+                    (IsTyFlowAvailable() && IsTyFlowNode(current))) {
+                    needsFullSync = true;
+                    return;
+                }
                 if (IsTrackedHandle(current->GetHandle())) return;
                 if (current->IsNodeHidden(TRUE)) return;
 
@@ -4190,7 +4694,7 @@ public:
         ExtractJsonString(msg, L"type", type);
 
         if (type == L"kill" || msg.find(L"\"kill\"") != std::wstring::npos) {
-            if (hwnd_) PostMessage(hwnd_, WM_KILL_PANEL, 0, 0);
+            RequestPanelKill();
             return;
         }
         if (type == L"refresh" || type == L"reload"
@@ -4765,6 +5269,12 @@ public:
         MaxJSPBR pbr;
         ExtractPBR(node, t, pbr);
 
+        if (pbr.materialModel == L"MaterialXMaterial") {
+            state.structureHash = HashMaterialPBRState(pbr);
+            state.canFastSync = false;
+            return state;
+        }
+
         MaxJSPBR structurePbr = pbr;
         structurePbr.color[0] = 0.8f;
         structurePbr.color[1] = 0.8f;
@@ -4956,7 +5466,9 @@ public:
         geoScanCursor_ = idx;
     }
 
-    // Detect changes to Forest Pack / RailClone / tyFlow plugin nodes
+    // Detect changes to Forest Pack / RailClone / tyFlow plugin nodes.
+    // These generators rebuild instance structure from referenced nodes, so they
+    // stay on the conservative full-sync path instead of fast mesh deltas.
     void DetectPluginInstanceChanges() {
         if (pluginInstHandles_.empty()) return;
         Interface* ip = GetCOREInterface();
@@ -4966,19 +5478,13 @@ public:
         for (ULONG handle : pluginInstHandles_) {
             INode* node = ip->GetINodeByHandle(handle);
             if (!node) continue;
-            ObjectState os = node->EvalWorldState(t);
-            if (!os.obj) continue;
-
-            // Use geometry channel validity interval as a lightweight change key
-            Interval gv = os.obj->ChannelValidity(t, GEOM_CHAN_NUM);
-            uint64_t validKey = static_cast<uint64_t>(gv.Start())
-                              ^ (static_cast<uint64_t>(gv.End()) << 32);
+            const uint64_t stateHash = ComputePluginInstanceStateHash(node, t, ip);
 
             auto it = pluginInstHash_.find(handle);
             if (it == pluginInstHash_.end()) {
-                pluginInstHash_[handle] = validKey;
-            } else if (it->second != validKey) {
-                it->second = validKey;
+                pluginInstHash_[handle] = stateHash;
+            } else if (it->second != stateHash) {
+                it->second = stateHash;
                 SetDirty();
                 return;
             }
@@ -5077,6 +5583,7 @@ public:
         writeMap(L"aoMap", L"aoMapXf", pbr.aoMap, pbr.aoMapTransform);
         writeMap(L"sssMap", L"sssMapXf", pbr.sssColorMap, pbr.sssColorMapTransform);
         writeMap(L"matcapMap", L"matcapMapXf", pbr.matcapMap, pbr.matcapMapTransform);
+        writeMap(L"specMap", L"specMapXf", pbr.specularMap, pbr.specularMapTransform);
         writeMap(L"emMap", L"emMapXf", pbr.emissionMap, pbr.emissionMapTransform);
         writeMap(L"lmMap", L"lmMapXf", pbr.lightmapFile, pbr.lightmapTransform);
         writeMap(L"opMap", L"opMapXf", pbr.opacityMap, pbr.opacityMapTransform);
@@ -5086,6 +5593,11 @@ public:
     }
 
     void WriteMaterialFull(std::wostringstream& ss, const MaxJSPBR& pbr) {
+        auto parentDirectoryOf = [](const std::wstring& path) -> std::wstring {
+            const size_t pos = path.find_last_of(L"\\/");
+            if (pos == std::wstring::npos) return {};
+            return path.substr(0, pos);
+        };
         ss << L"{\"name\":\"" << EscapeJson(pbr.mtlName.empty() ? L"default" : pbr.mtlName.c_str()) << L'"';
         ss << L",\"model\":\"" << EscapeJson(pbr.materialModel.c_str()) << L'"';
         ss << L",\"color\":[";
@@ -5187,12 +5699,52 @@ public:
             WriteFloatValue(ss, pbr.sssPower, 2.0f);
             ss << L",\"sssScale\":";
             WriteFloatValue(ss, pbr.sssScale, 10.0f);
+        } else if (pbr.materialModel == L"MaterialXMaterial") {
+            const std::wstring materialXUrl = MapAssetPath(pbr.materialXFile, false);
+            if (!materialXUrl.empty()) {
+                ss << L",\"materialXFile\":\"" << EscapeJson(materialXUrl.c_str()) << L"\"";
+                const std::wstring baseDir = parentDirectoryOf(pbr.materialXFile);
+                const std::wstring baseUrl = MapAssetPath(baseDir, true);
+                if (!baseUrl.empty()) {
+                    ss << L",\"materialXBase\":\"" << EscapeJson(baseUrl.c_str()) << L"\"";
+                }
+            }
+            if (!pbr.materialXMaterialName.empty()) {
+                ss << L",\"materialXName\":\"" << EscapeJson(pbr.materialXMaterialName.c_str()) << L"\"";
+            }
+            ss << L",\"materialXIndex\":" << std::max(1, pbr.materialXMaterialIndex);
         } else if (pbr.materialModel == L"MeshTSLNodeMaterial" && !pbr.tslCode.empty()) {
             ss << L",\"tslCode\":\"" << EscapeJson(pbr.tslCode.c_str()) << L"\"";
         } else if (IsUtilityMaterialModel(pbr.materialModel)) {
             if (pbr.materialModel == L"MeshBackdropNodeMaterial") {
                 ss << L",\"backdropMode\":";
                 ss << pbr.backdropMode;
+            }
+            if (pbr.materialModel == L"MeshDepthMaterial" && pbr.depthPacking != threejs_utility_depth_packing_basic) {
+                ss << L",\"depthPacking\":";
+                ss << pbr.depthPacking;
+            }
+            if ((pbr.materialModel == L"MeshLambertMaterial" ||
+                 pbr.materialModel == L"MeshMatcapMaterial" ||
+                 pbr.materialModel == L"MeshNormalMaterial" ||
+                 pbr.materialModel == L"MeshPhongMaterial") &&
+                pbr.normalMapType != threejs_utility_normal_tangent) {
+                ss << L",\"normalMapType\":";
+                ss << pbr.normalMapType;
+            }
+            if (pbr.materialModel == L"MeshLambertMaterial" || pbr.materialModel == L"MeshPhongMaterial") {
+                if (pbr.combine != threejs_utility_combine_multiply) {
+                    ss << L",\"combine\":";
+                    ss << pbr.combine;
+                }
+                if (std::fabs(pbr.reflectivity - 1.0f) > 1.0e-6f) {
+                    ss << L",\"reflectivity\":";
+                    WriteFloatValue(ss, pbr.reflectivity, 1.0f);
+                }
+                if (std::fabs(pbr.refractionRatio - 0.98f) > 1.0e-6f) {
+                    ss << L",\"refractionRatio\":";
+                    WriteFloatValue(ss, pbr.refractionRatio, 0.98f);
+                }
             }
             if (pbr.materialModel == L"MeshPhongMaterial") {
                 ss << L",\"spec\":[";
@@ -5201,6 +5753,12 @@ public:
                 WriteFloatValue(ss, pbr.specular[2], 0.0666667f); ss << L']';
                 ss << L",\"shininess\":";
                 WriteFloatValue(ss, pbr.shininess, 30.0f);
+            }
+            if ((pbr.materialModel == L"MeshLambertMaterial" ||
+                 pbr.materialModel == L"MeshMatcapMaterial" ||
+                 pbr.materialModel == L"MeshPhongMaterial") &&
+                !pbr.fog) {
+                ss << L",\"fog\":false";
             }
             if (pbr.flatShading) ss << L",\"flat\":true";
             if (pbr.wireframe) ss << L",\"wireframe\":true";
@@ -5519,6 +6077,7 @@ public:
         lightHandles_.clear();
         splatHandles_.clear();
         pluginInstHandles_.clear();
+        pluginInstHash_.clear();
         lastSentTransforms_.clear();
 
         std::wostringstream ss;
@@ -5557,6 +6116,10 @@ public:
                 for (int c = 0; c < parent->NumberOfChildren(); c++) {
                     INode* node = parent->GetChildNode(c);
                     if (!node) continue;
+                    if (node->IsNodeHidden(TRUE)) {
+                        collectInstances(node);
+                        continue;
+                    }
                     if (IsForestPackAvailable() && IsForestPackNode(node))
                         ExtractForestPackInstances(node, t, allInstGroups);
                     else if (IsRailCloneAvailable() && IsRailCloneNode(node))
@@ -5713,7 +6276,16 @@ public:
                 std::vector<float> verts, uvs, norms;
                 std::vector<int> indices;
                 std::vector<MatGroup> groups;
-                if (ExtractMesh(node, t, verts, uvs, indices, groups, &norms)) {
+                bool extracted = ExtractMesh(node, t, verts, uvs, indices, groups, &norms);
+
+                // Spline fallback — extract as line geometry
+                bool isSpline = false;
+                if (!extracted && os.obj && os.obj->SuperClassID() == SHAPE_CLASS_ID) {
+                    extracted = ExtractSpline(node, t, verts, indices);
+                    isSpline = extracted;
+                }
+
+                if (extracted) {
                     float xform[16]; GetTransform16(node, t, xform);
 
                     if (os.obj && os.obj->SuperClassID() == GEOMOBJECT_CLASS_ID) {
@@ -5728,6 +6300,7 @@ public:
                     ss << L",\"s\":" << (node->Selected() ? L'1' : L'0');
                     ss << L",\"props\":{"; WriteNodePropsJson(ss, node, t); ss << L'}';
                     ss << L",\"t\":"; WriteFloats(ss, xform, 16);
+                    if (isSpline) ss << L",\"spline\":true";
                     RememberSentTransform(handle, xform);
                     ss << L",\"v\":"; WriteFloats(ss, verts.data(), verts.size());
                     ss << L",\"i\":"; WriteInts(ss, indices.data(), indices.size());
@@ -5738,28 +6311,30 @@ public:
                         ss << L",\"norm\":"; WriteFloats(ss, norms.data(), norms.size());
                     }
 
-                    // Multi/Sub material support
-                    Mtl* multiMtl = FindMultiSubMtl(node->GetMtl());
-                    if (multiMtl && multiMtl->NumSubMtls() > 0 && groups.size() > 1) {
-                        ss << L",\"groups\":[";
-                        for (size_t g = 0; g < groups.size(); g++) {
-                            if (g) ss << L',';
-                            ss << L'[' << groups[g].start << L',' << groups[g].count << L',' << g << L']';
+                    if (!isSpline) {
+                        // Multi/Sub material support (meshes only)
+                        Mtl* multiMtl = FindMultiSubMtl(node->GetMtl());
+                        if (multiMtl && multiMtl->NumSubMtls() > 0 && groups.size() > 1) {
+                            ss << L",\"groups\":[";
+                            for (size_t g = 0; g < groups.size(); g++) {
+                                if (g) ss << L',';
+                                ss << L'[' << groups[g].start << L',' << groups[g].count << L',' << g << L']';
+                            }
+                            ss << L"],\"mats\":[";
+                            for (size_t g = 0; g < groups.size(); g++) {
+                                if (g) ss << L',';
+                                Mtl* subMtl = GetSubMtlFromMatID(multiMtl, groups[g].matID);
+                                MaxJSPBR subPBR;
+                                ExtractPBRFromMtl(subMtl, node, t, subPBR);
+                                WriteMaterialFull(ss, subPBR);
+                            }
+                            ss << L"]";
+                        } else {
+                            MaxJSPBR pbr;
+                            ExtractPBR(node, t, pbr);
+                            ss << L",\"mat\":";
+                            WriteMaterialFull(ss, pbr);
                         }
-                        ss << L"],\"mats\":[";
-                        for (size_t g = 0; g < groups.size(); g++) {
-                            if (g) ss << L',';
-                            Mtl* subMtl = GetSubMtlFromMatID(multiMtl, groups[g].matID);
-                            MaxJSPBR subPBR;
-                            ExtractPBRFromMtl(subMtl, node, t, subPBR);
-                            WriteMaterialFull(ss, subPBR);
-                        }
-                        ss << L"]";
-                    } else {
-                        MaxJSPBR pbr;
-                        ExtractPBR(node, t, pbr);
-                        ss << L",\"mat\":";
-                        WriteMaterialFull(ss, pbr);
                     }
 
                     ss << L'}';
@@ -5794,6 +6369,7 @@ public:
         lightHandles_.clear();
         splatHandles_.clear();
         pluginInstHandles_.clear();
+        pluginInstHash_.clear();
         lastSentTransforms_.clear();
 
         // Collect all geometry nodes
@@ -6082,6 +6658,10 @@ public:
                 for (int c = 0; c < parent->NumberOfChildren(); c++) {
                     INode* node = parent->GetChildNode(c);
                     if (!node) continue;
+                    if (node->IsNodeHidden(TRUE)) {
+                        collectInstances(node);
+                        continue;
+                    }
                     if (IsForestPackAvailable() && IsForestPackNode(node))
                         ExtractForestPackInstances(node, t, allInstGroups);
                     else if (IsRailCloneAvailable() && IsRailCloneNode(node))
@@ -6261,7 +6841,7 @@ public:
     }
 
     void RequestPanelKill() {
-        if (hwnd_) PostMessage(hwnd_, WM_KILL_PANEL, 0, 0);
+        RequestGlobalPanelKill();
     }
 
     void RememberFloatingBounds() {
@@ -6570,7 +7150,9 @@ public:
         case WM_KILL_PANEL:
             KillPanel();
             return 0;
-        case WM_CLOSE: ShowWindow(hwnd, SW_HIDE); return 0;
+        case WM_CLOSE:
+            RequestGlobalPanelKill();
+            return 0;
         case WM_KEYDOWN:
             // Escape exits ActiveShade viewport mode
             if (wParam == VK_ESCAPE && p && p->originalParent_) {
@@ -6645,6 +7227,14 @@ static void KillPanel() {
     g_panel = nullptr;
 }
 
+static void RequestGlobalPanelKill() {
+    if (g_helperHwnd && IsWindow(g_helperHwnd)) {
+        PostMessage(g_helperHwnd, WM_KILL_PANEL, 0, 0);
+        return;
+    }
+    KillPanel();
+}
+
 void TogglePanel() {
     Interface* ip = GetCOREInterface();
     if (g_panel && g_panel->IsViewportHosted() && ip && ip->IsViewportMaxed()) {
@@ -6686,28 +7276,38 @@ void RestoreMaxJSPanel() {
 }
 
 static void RegisterMaxScript() {
-    wchar_t script[2048];
-    swprintf_s(script, 2048,
+    wchar_t script[4096];
+    swprintf_s(script, 4096,
         L"global MaxJS_HWND = %lld\r\n"
+        L"fn MaxJS_KillPanel = ( windows.sendMessage MaxJS_HWND %d 0 0 )\r\n"
         L"macroScript MaxJS_Toggle category:\"MaxJS\" tooltip:\"Toggle MaxJS Viewport\" buttonText:\"MaxJS\" (\r\n"
+        L"    windows.sendMessage MaxJS_HWND %d 0 0\r\n"
+        L")\r\n"
+        L"macroScript MaxJS_Kill category:\"MaxJS\" tooltip:\"Kill MaxJS Viewport\" buttonText:\"Kill MaxJS\" (\r\n"
         L"    windows.sendMessage MaxJS_HWND %d 0 0\r\n"
         L")\r\n"
         L"if menuMan != undefined and menuMan.findMenu \"MaxJS\" == undefined do (\r\n"
         L"    local subMenu = menuMan.createMenu \"MaxJS\"\r\n"
         L"    local toggleItem = menuMan.createActionItem \"MaxJS_Toggle\" \"MaxJS\"\r\n"
+        L"    local killItem = menuMan.createActionItem \"MaxJS_Kill\" \"MaxJS\"\r\n"
         L"    subMenu.addItem toggleItem -1\r\n"
+        L"    subMenu.addItem killItem -1\r\n"
         L"    local mainMenu = menuMan.getMainMenuBar()\r\n"
         L"    local subMenuItem = menuMan.createSubMenuItem \"MaxJS\" subMenu\r\n"
         L"    mainMenu.addItem subMenuItem 0\r\n"
         L"    menuMan.updateMenuBar()\r\n"
         L")\r\n",
-        (long long)(intptr_t)g_helperHwnd, (int)WM_TOGGLE_PANEL);
+        (long long)(intptr_t)g_helperHwnd,
+        (int)WM_KILL_PANEL,
+        (int)WM_TOGGLE_PANEL,
+        (int)WM_KILL_PANEL);
     ExecuteMAXScriptScript(script, MAXScript::ScriptSource::NonEmbedded);
 }
 
 static LRESULT CALLBACK HelperWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
     case WM_TOGGLE_PANEL: TogglePanel(); return 0;
+    case WM_KILL_PANEL: KillPanel(); return 0;
     case WM_TIMER:
         if (wParam == SETUP_TIMER_ID) { KillTimer(hwnd, SETUP_TIMER_ID); RegisterMaxScript(); }
         return 0;

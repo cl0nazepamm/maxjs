@@ -71,11 +71,18 @@ enum ThreeJSParamIDs {
     pb_material_mode,
     // TSL
     pb_tsl_code,
+    // Utility extras (appended for scene compatibility)
+    pb_specular_map,
+    pb_reflectivity,
+    pb_refraction_ratio,
+    pb_normal_map_type,
+    pb_depth_packing,
+    pb_fog,
+    pb_combine,
 };
 
 enum ThreeJSUtilityModel {
-    threejs_utility_distance = 0,
-    threejs_utility_depth,
+    threejs_utility_depth = 1,
     threejs_utility_lambert,
     threejs_utility_matcap,
     threejs_utility_normal,
@@ -88,6 +95,24 @@ enum ThreeJSBackdropMode {
     threejs_backdrop_depth,
     threejs_backdrop_texture,
     threejs_backdrop_pixel,
+};
+
+enum ThreeJSUtilityNormalMapType {
+    threejs_utility_normal_tangent = 0,
+    threejs_utility_normal_object,
+};
+
+enum ThreeJSUtilityDepthPacking {
+    threejs_utility_depth_packing_basic = 0,
+    threejs_utility_depth_packing_rgba,
+    threejs_utility_depth_packing_rgb,
+    threejs_utility_depth_packing_rg,
+};
+
+enum ThreeJSUtilityCombineMode {
+    threejs_utility_combine_multiply = 0,
+    threejs_utility_combine_mix,
+    threejs_utility_combine_add,
 };
 
 // Texmap slot indices (for SubTexmap)
@@ -105,6 +130,7 @@ enum ThreeJSMapSlots {
     kMap_AO,
     kMap_SSSColor,
     kMap_Matcap,
+    kMap_Specular,
     kNumMaps
 };
 

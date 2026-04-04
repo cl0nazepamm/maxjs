@@ -1,0 +1,19 @@
+#pragma once
+
+#define IDD_THREEJS_SKY              510
+#define IDS_THREEJS_SKY_PARAMS       530
+
+#define IDC_SKY_TURBIDITY_EDIT       3100
+#define IDC_SKY_TURBIDITY_SPIN       3101
+#define IDC_SKY_RAYLEIGH_EDIT        3102
+#define IDC_SKY_RAYLEIGH_SPIN        3103
+#define IDC_SKY_MIE_COEFF_EDIT       3104
+#define IDC_SKY_MIE_COEFF_SPIN       3105
+#define IDC_SKY_MIE_DIR_G_EDIT       3106
+#define IDC_SKY_MIE_DIR_G_SPIN       3107
+#define IDC_SKY_ELEVATION_EDIT       3110
+#define IDC_SKY_ELEVATION_SPIN       3111
+#define IDC_SKY_AZIMUTH_EDIT         3112
+#define IDC_SKY_AZIMUTH_SPIN         3113
+#define IDC_SKY_EXPOSURE_EDIT        3114
+#define IDC_SKY_EXPOSURE_SPIN        3115

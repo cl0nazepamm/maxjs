@@ -4990,7 +4990,17 @@ public:
             std::vector<float> verts, uvs, norms;
             std::vector<int> indices;
             std::vector<MatGroup> groups;
-            if (!ExtractMesh(node, t, verts, uvs, indices, groups, &norms)) continue;
+            bool isSpline = false;
+            if (!ExtractMesh(node, t, verts, uvs, indices, groups, &norms)) {
+                ObjectState os = node->EvalWorldState(t);
+                if (!os.obj || os.obj->SuperClassID() != SHAPE_CLASS_ID ||
+                    !ExtractSpline(node, t, verts, indices)) {
+                    continue;
+                }
+                isSpline = true;
+                uvs.clear();
+                norms.clear();
+            }
 
             // Update hash so we don't re-send next frame
             uint64_t hash = HashMeshData(verts, indices, uvs);
@@ -5016,6 +5026,7 @@ public:
                 std::wostringstream ss;
                 ss.imbue(std::locale::classic());
                 ss << L"{\"type\":\"geo_fast\",\"h\":" << handle;
+                if (isSpline) ss << L",\"spline\":true";
                 ss << L",\"vOff\":" << vOff << L",\"vN\":" << verts.size();
                 ss << L",\"iOff\":" << iOff << L",\"iN\":" << indices.size();
                 if (!uvs.empty()) ss << L",\"uvOff\":" << uvOff << L",\"uvN\":" << uvs.size();
@@ -5029,6 +5040,7 @@ public:
                 std::wostringstream ss;
                 ss.imbue(std::locale::classic());
                 ss << L"{\"type\":\"geo_fast\",\"h\":" << handle;
+                if (isSpline) ss << L",\"spline\":true";
                 ss << L",\"v\":"; WriteFloats(ss, verts.data(), verts.size());
                 ss << L",\"i\":"; WriteInts(ss, indices.data(), indices.size());
                 if (!uvs.empty()) { ss << L",\"uv\":"; WriteFloats(ss, uvs.data(), uvs.size()); }
@@ -6538,6 +6550,7 @@ public:
             std::vector<MatGroup> groups;
             bool changed;
             bool visible = true;
+            bool spline = false;
             size_t vOff, iOff, uvOff, nOff;
             uint64_t objId = 0;      // evaluated Object* — instances share this
             ULONG instOfHandle = 0;  // 0 = owns geometry, else = shares from this handle
@@ -6638,7 +6651,22 @@ public:
                     }
                     geos.push_back(std::move(ng));
                     geomHandles_.insert(node->GetHandle());
-                } else if (ExtractMesh(node, t, ng.verts, ng.uvs, ng.indices, ng.groups, &ng.norms)) {
+                } else {
+                    bool extracted = ExtractMesh(node, t, ng.verts, ng.uvs, ng.indices, ng.groups, &ng.norms);
+                    if (!extracted && os.obj && os.obj->SuperClassID() == SHAPE_CLASS_ID) {
+                        extracted = ExtractSpline(node, t, ng.verts, ng.indices);
+                        ng.spline = extracted;
+                        if (extracted) {
+                            ng.uvs.clear();
+                            ng.norms.clear();
+                            ng.groups.clear();
+                        }
+                    }
+                    if (!extracted) {
+                        collect(node);
+                        continue;
+                    }
+
                     uint64_t hash = HashMeshData(ng.verts, ng.indices, ng.uvs);
                     auto it = geoHashMap_.find(ng.handle);
                     ng.changed = (it == geoHashMap_.end() || it->second != hash);
@@ -6737,6 +6765,7 @@ public:
             if (ng.objId != 0) ss << L",\"objId\":" << ng.objId;
             if (ng.instOfHandle != 0) ss << L",\"instOf\":" << ng.instOfHandle;
             ss << L",\"t\":"; WriteFloats(ss, xform, 16);
+            if (ng.spline) ss << L",\"spline\":true";
 
             // Geometry: byte offsets into shared buffer (or -1 if unchanged)
             if (ng.changed) {

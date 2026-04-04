@@ -2425,7 +2425,7 @@
                 // Geometry: only rebuild if vertex data is present (skip for cached nodes)
                 let geom = mesh?.geometry;
                 if (nd.v && nd.i) {
-                    geom = buildGeometry(nd.v, nd.i, nd.uv, nd.norm);
+                    geom = buildGeometry(nd.v, nd.i, nd.uv, nd.norm, { isLine: !!nd.spline });
                     if (nd.groups) {
                         for (const [start, count, idx] of nd.groups) {
                             geom.addGroup(start, count, idx);
@@ -2438,16 +2438,40 @@
                     }
                 }
 
+                const wantsLine = !!nd.spline;
+                const hasLineRenderable = !!(mesh?.isLine || mesh?.isLineSegments);
+                const renderableTypeMismatch = !!mesh && wantsLine !== hasLineRenderable;
+                if (renderableTypeMismatch) {
+                    maxRoot.remove(mesh);
+                    mesh.geometry?.dispose?.();
+                    if (Array.isArray(mesh.material)) {
+                        for (const material of mesh.material) material?.dispose?.();
+                    } else {
+                        mesh.material?.dispose?.();
+                    }
+                    nodeMap.delete(nd.h);
+                    mesh = null;
+                }
+
                 if (mesh) {
                     if (nd.v && nd.i && geom !== mesh.geometry) {
                         mesh.geometry.dispose();
                         mesh.geometry = geom;
                     }
-                    if (clayModeActive) { mesh.userData._origMaterial = mat; }
+                    if (wantsLine) {
+                        if (Array.isArray(mesh.material)) {
+                            for (const material of mesh.material) material?.dispose?.();
+                        } else {
+                            mesh.material?.dispose?.();
+                        }
+                        mesh.material = new THREE.LineBasicMaterial({
+                            color: mat?.color ?? new THREE.Color(0xffffff),
+                        });
+                    } else if (clayModeActive) { mesh.userData._origMaterial = mat; }
                     else { mesh.material = mat; }
                 } else {
                     if (!geom) continue;
-                    if (nd.spline) {
+                    if (wantsLine) {
                         const lineMat = new THREE.LineBasicMaterial({
                             color: mat?.color ?? new THREE.Color(0xffffff),
                         });
@@ -2545,7 +2569,9 @@
         bridge.on('geo_fast', msg => {
             const mesh = nodeMap.get(msg.h);
             if (!mesh) return;
-            const geom = buildGeometry(msg.v, msg.i, msg.uv, msg.norm);
+            const geom = buildGeometry(msg.v, msg.i, msg.uv, msg.norm, {
+                isLine: !!(msg.spline || mesh.isLine || mesh.isLineSegments),
+            });
             mesh.geometry.dispose();
             mesh.geometry = geom;
         });
@@ -2659,7 +2685,7 @@
                             new Float32Array(buffer, nd.geo.nOff, nd.geo.nN)
                         );
                         geom.setAttribute('normal', new THREE.BufferAttribute(normalsCopy, 3));
-                    } else {
+                    } else if (!nd.spline) {
                         geom.computeVertexNormals();
                     }
                     // Add material groups for Multi/Sub
@@ -2679,6 +2705,22 @@
                 // Cache geometry for instance sharing (always, not just when new geo arrives)
                 if (geom) geoByHandle.set(nd.h, geom);
 
+                const wantsLine = !!nd.spline;
+                const hasLineRenderable = !!(mesh?.isLine || mesh?.isLineSegments);
+                const renderableTypeMismatch = !!mesh && wantsLine !== hasLineRenderable;
+                if (renderableTypeMismatch) {
+                    maxRoot.remove(mesh);
+                    const isSharedGeometry = [...nodeMap.values()].some(m => m !== mesh && m.geometry === mesh.geometry);
+                    if (!isSharedGeometry) mesh.geometry?.dispose?.();
+                    if (Array.isArray(mesh.material)) {
+                        for (const material of mesh.material) material?.dispose?.();
+                    } else {
+                        mesh.material?.dispose?.();
+                    }
+                    nodeMap.delete(nd.h);
+                    mesh = null;
+                }
+
                 if (mesh) {
                     if (geom && geom !== mesh.geometry) {
                         // Only dispose if not shared with another mesh
@@ -2686,11 +2728,20 @@
                         if (!isShared) mesh.geometry.dispose();
                         mesh.geometry = geom;
                     }
-                    if (clayModeActive) { mesh.userData._origMaterial = mat; }
+                    if (wantsLine) {
+                        if (Array.isArray(mesh.material)) {
+                            for (const material of mesh.material) material?.dispose?.();
+                        } else {
+                            mesh.material?.dispose?.();
+                        }
+                        mesh.material = new THREE.LineBasicMaterial({
+                            color: mat?.color ?? new THREE.Color(0xffffff),
+                        });
+                    } else if (clayModeActive) { mesh.userData._origMaterial = mat; }
                     else { mesh.material = mat; }
                 } else {
                     if (!geom) continue;
-                    if (nd.spline) {
+                    if (wantsLine) {
                         const lineMat = new THREE.LineBasicMaterial({
                             color: mat?.color ?? new THREE.Color(0xffffff),
                         });
@@ -2776,13 +2827,14 @@
         }
 
         // ── Geometry Builder ────────────────────────────────
-        function buildGeometry(vertices, indices, uvs, normals) {
+        function buildGeometry(vertices, indices, uvs, normals, options = {}) {
+            const isLine = !!options.isLine;
             const geom = new THREE.BufferGeometry();
             geom.setAttribute('position', new THREE.Float32BufferAttribute(vertices, 3));
             if (indices?.length) geom.setIndex(indices);
             if (uvs?.length) geom.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
             if (normals?.length) geom.setAttribute('normal', new THREE.Float32BufferAttribute(normals, 3));
-            else geom.computeVertexNormals();
+            else if (!isLine) geom.computeVertexNormals();
             geom.computeBoundingBox();
             geom.computeBoundingSphere();
             return geom;

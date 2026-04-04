@@ -2974,17 +2974,65 @@
             // Toon outline is auto-detected from material type — no manual selection needed
         }
 
-        function applyMaterialScalar(mesh, material) {
+        function applyMaterialScalar(mesh, material, materialIndex = null) {
             const c = material?.color;
-            const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+            const emissive = material?.emissive;
+            const specularColor = material?.specularColor;
+            const sheenColor = material?.sheenColor;
+            const attenuationColor = material?.attenuationColor;
+            let mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+            if (materialIndex != null) {
+                const selected = Array.isArray(mesh.material)
+                    ? mesh.material[materialIndex] ?? null
+                    : (materialIndex === 0 ? mesh.material : null);
+                mats = selected ? [selected] : [];
+            }
             for (const m of mats) {
                 if (!m) continue;
                 if (c && m.color) m.color.setRGB(c[0], c[1], c[2]);
-                if (material?.rough != null && 'roughness' in m) m.roughness = material.rough;
-                if (material?.metal != null && 'metalness' in m) m.metalness = material.metal;
+                if (emissive && m.emissive) m.emissive.setRGB(emissive[0], emissive[1], emissive[2]);
+                if (specularColor && 'specularColor' in m && m.specularColor) {
+                    m.specularColor.setRGB(specularColor[0], specularColor[1], specularColor[2]);
+                }
+                if (sheenColor && 'sheenColor' in m && m.sheenColor) {
+                    m.sheenColor.setRGB(sheenColor[0], sheenColor[1], sheenColor[2]);
+                }
+                if (attenuationColor && 'attenuationColor' in m && m.attenuationColor) {
+                    m.attenuationColor.setRGB(attenuationColor[0], attenuationColor[1], attenuationColor[2]);
+                }
+                const roughness = material?.roughness ?? material?.rough;
+                const metalness = material?.metalness ?? material?.metal;
+                if (roughness != null && 'roughness' in m) m.roughness = roughness;
+                if (metalness != null && 'metalness' in m) m.metalness = metalness;
                 if (material?.opacity != null) {
                     m.opacity = material.opacity;
                     m.transparent = material.opacity < 0.999;
+                }
+                if (material?.emissiveIntensity != null || material?.emI != null) {
+                    if ('emissiveIntensity' in m) m.emissiveIntensity = material?.emissiveIntensity ?? material?.emI;
+                }
+                if (material?.envMapIntensity != null || material?.envI != null) {
+                    if ('envMapIntensity' in m) m.envMapIntensity = material?.envMapIntensity ?? material?.envI;
+                }
+                if (material?.aoMapIntensity != null || material?.aoI != null) {
+                    if ('aoMapIntensity' in m) m.aoMapIntensity = material?.aoMapIntensity ?? material?.aoI;
+                }
+                if (material?.clearcoat != null && 'clearcoat' in m) m.clearcoat = material.clearcoat;
+                if (material?.clearcoatRoughness != null && 'clearcoatRoughness' in m) {
+                    m.clearcoatRoughness = material.clearcoatRoughness;
+                }
+                if (material?.sheen != null && 'sheen' in m) m.sheen = material.sheen;
+                if (material?.sheenRoughness != null && 'sheenRoughness' in m) {
+                    m.sheenRoughness = material.sheenRoughness;
+                }
+                if (material?.transmission != null && 'transmission' in m) {
+                    m.transmission = material.transmission;
+                    if (material.transmission > 0) m.transparent = true;
+                }
+                if (material?.ior != null && 'ior' in m) m.ior = material.ior;
+                if (material?.thickness != null && 'thickness' in m) m.thickness = material.thickness;
+                if (material?.specularIntensity != null && 'specularIntensity' in m) {
+                    m.specularIntensity = material.specularIntensity;
                 }
                 rememberMaterialEmissiveBase(m);
                 applyMaterialSelectionState(m, !!mesh.userData.maxjsSelected);
@@ -4948,6 +4996,8 @@
             getJsRoot: () => jsRoot,
             getOverlayRoot: () => overlayRoot,
             getViewportAspect: () => innerWidth / innerHeight,
+            buildGeometry,
+            applyMaterialScalar,
         });
         layerManager.subscribe?.(() => animationSystem.invalidateTargets());
         const projectRuntime = window.chrome?.webview
@@ -4975,6 +5025,14 @@
                     throw new Error(`HTTP ${binResponse.status} for ${meta.bin || './scene.bin'}`);
                 }
                 const buffer = await binResponse.arrayBuffer();
+                let animationBuffer = null;
+                if (meta.animations?.bin) {
+                    const animationResponse = await fetch(meta.animations.bin, { cache: 'no-store' });
+                    if (!animationResponse.ok) {
+                        throw new Error(`HTTP ${animationResponse.status} for ${meta.animations.bin}`);
+                    }
+                    animationBuffer = await animationResponse.arrayBuffer();
+                }
                 handleBinaryScene(buffer, meta);
                 if (meta.runtimeScene) {
                     const SnapshotObjectLoader = THREE.ObjectLoader || THREE_STD.ObjectLoader;
@@ -4997,7 +5055,7 @@
                     syncPostFxPanel(true);
                 }
                 animationSystem.invalidateTargets();
-                if (meta.animations) animationSystem.loadSnapshotAnimations(meta.animations);
+                if (meta.animations) animationSystem.loadSnapshotAnimations(meta.animations, animationBuffer);
                 else animationSystem.clear();
                 setInfoText(`MaxJS Snapshot - ${meta.nodes?.length ?? 0} nodes`);
                 return true;

@@ -40,9 +40,25 @@ function getCustomTrackKind(trackDef) {
     const rawPath = normalizeCustomTrackPath(trackDef);
     const type = String(trackDef?.type ?? '').trim().toLowerCase();
     if (type === 'matrix16' || rawPath === 'matrix') return 'matrix16';
+    if (type === 'geometryframes' || rawPath === 'geometry') return 'geometry';
+    if (/^materials?\[?\d*\]?\.|^material\./.test(rawPath) || rawPath.startsWith('material.') || rawPath.startsWith('materials[')) {
+        return 'material';
+    }
     if (rawPath === 'visible') return 'boolean';
     if (rawPath === 'position' || rawPath === 'cameraTarget' || rawPath === 'cameraUp') return 'vector3';
     if (rawPath === 'fovHorizontal' || rawPath === 'viewWidth') return 'number';
+    return null;
+}
+
+function parseMaterialTrackPath(path) {
+    const raw = String(path ?? '').trim();
+    const multiMatch = /^materials\[(\d+)\]\.(.+)$/.exec(raw);
+    if (multiMatch) {
+        return { materialIndex: Number(multiMatch[1]), property: multiMatch[2] };
+    }
+    if (raw.startsWith('material.')) {
+        return { materialIndex: null, property: raw.slice('material.'.length) };
+    }
     return null;
 }
 
@@ -109,12 +125,15 @@ export function createMaxJSAnimationSystem({
     getJsRoot,
     getOverlayRoot,
     getViewportAspect,
+    buildGeometry,
+    applyMaterialScalar,
 }) {
     const targetRegistry = new Map();
     const mixers = new Map();
     const clipGroups = new Map();
     let registryDirty = true;
     let loadedPayload = null;
+    let loadedBinary = null;
     const matrixA = new THREE.Matrix4();
     const matrixB = new THREE.Matrix4();
     const matrixSample = new THREE.Matrix4();
@@ -162,6 +181,7 @@ export function createMaxJSAnimationSystem({
         }
         clipGroups.clear();
         mixers.clear();
+        loadedBinary = null;
         const camera = getCamera?.();
         if (camera?.userData) {
             delete camera.userData.maxjsHorizontalFov;
@@ -332,6 +352,30 @@ export function createMaxJSAnimationSystem({
         return !!values[segment.indexA];
     }
 
+    function readBinaryFloatArray(offset, count) {
+        if (!(loadedBinary instanceof ArrayBuffer)) return null;
+        if (!Number.isInteger(offset) || !Number.isInteger(count) || offset < 0 || count < 0) return null;
+        if ((offset % 4) !== 0 || (offset + count * 4) > loadedBinary.byteLength) return null;
+        return new Float32Array(loadedBinary.slice(offset, offset + count * 4));
+    }
+
+    function readBinaryIndexArray(offset, count) {
+        if (!(loadedBinary instanceof ArrayBuffer)) return null;
+        if (!Number.isInteger(offset) || !Number.isInteger(count) || offset < 0 || count < 0) return null;
+        if ((offset % 4) !== 0 || (offset + count * 4) > loadedBinary.byteLength) return null;
+        return new Uint32Array(loadedBinary.slice(offset, offset + count * 4));
+    }
+
+    function sampleGeometryFrame(trackDef, timeSeconds) {
+        const times = Array.isArray(trackDef?.times) ? trackDef.times : [];
+        const frames = Array.isArray(trackDef?.frames) ? trackDef.frames : [];
+        if (times.length === 0 || frames.length < times.length) return null;
+
+        const segment = findTrackSegment(times, timeSeconds);
+        if (!segment) return null;
+        return frames[segment.indexA] ?? null;
+    }
+
     function sampleMatrixTrack(trackDef, timeSeconds, targetMatrix) {
         const times = Array.isArray(trackDef?.times) ? trackDef.times : [];
         const values = Array.isArray(trackDef?.values) ? trackDef.values : [];
@@ -356,6 +400,104 @@ export function createMaxJSAnimationSystem({
         return true;
     }
 
+    function applyGeometryFrame(target, frame) {
+        if (!target?.geometry || typeof buildGeometry !== 'function' || !frame) return;
+
+        const isLineTarget = !!(target.isLine || target.isLineSegments);
+        if (!!frame.spline !== isLineTarget) return;
+
+        const vertices = readBinaryFloatArray(frame.vOff, frame.vN);
+        const indices = readBinaryIndexArray(frame.iOff, frame.iN);
+        if (!vertices || !indices) return;
+
+        const uvs = frame.uvOff != null && frame.uvN ? readBinaryFloatArray(frame.uvOff, frame.uvN) : null;
+        const normals = frame.nOff != null && frame.nN ? readBinaryFloatArray(frame.nOff, frame.nN) : null;
+        const geometry = target.geometry;
+
+        const currentPosition = geometry.getAttribute('position');
+        if (currentPosition?.array?.length === vertices.length) {
+            currentPosition.copyArray(vertices);
+            currentPosition.needsUpdate = true;
+        } else {
+            geometry.setAttribute('position', new THREE.BufferAttribute(vertices, 3));
+        }
+
+        const currentIndex = geometry.getIndex();
+        if (currentIndex?.array?.length === indices.length) {
+            currentIndex.copyArray(indices);
+            currentIndex.needsUpdate = true;
+        } else {
+            geometry.setIndex(new THREE.BufferAttribute(indices, 1));
+        }
+
+        if (uvs) {
+            const currentUv = geometry.getAttribute('uv');
+            if (currentUv?.array?.length === uvs.length) {
+                currentUv.copyArray(uvs);
+                currentUv.needsUpdate = true;
+            } else {
+                geometry.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
+            }
+        } else if (geometry.getAttribute('uv')) {
+            geometry.deleteAttribute('uv');
+        }
+
+        if (normals && !frame.spline) {
+            const currentNormal = geometry.getAttribute('normal');
+            if (currentNormal?.array?.length === normals.length) {
+                currentNormal.copyArray(normals);
+                currentNormal.needsUpdate = true;
+            } else {
+                geometry.setAttribute('normal', new THREE.BufferAttribute(normals, 3));
+            }
+        } else {
+            if (geometry.getAttribute('normal')) {
+                geometry.deleteAttribute('normal');
+            }
+            if (!frame.spline) {
+                geometry.computeVertexNormals();
+                const recomputedNormal = geometry.getAttribute('normal');
+                if (recomputedNormal) recomputedNormal.needsUpdate = true;
+            }
+        }
+
+        if (Array.isArray(frame.groups)) {
+            geometry.clearGroups();
+            for (const group of frame.groups) {
+                if (!Array.isArray(group) || group.length < 3) continue;
+                geometry.addGroup(group[0], group[1], group[2]);
+            }
+        }
+        geometry.computeBoundingBox();
+        geometry.computeBoundingSphere();
+    }
+
+    function applyMaterialTrack(target, path, kind, trackDef, timeSeconds) {
+        if (typeof applyMaterialScalar !== 'function') return;
+        const binding = parseMaterialTrackPath(path);
+        if (!binding) return;
+
+        let payload = null;
+        if (kind === 'vector3') {
+            if (!sampleVectorTrack(trackDef, timeSeconds, vectorSample)) return;
+            payload = {
+                [binding.property]: [vectorSample.x, vectorSample.y, vectorSample.z],
+            };
+        } else if (kind === 'number') {
+            const value = sampleNumberTrack(trackDef, timeSeconds);
+            if (!Number.isFinite(value)) return;
+            payload = { [binding.property]: value };
+        } else if (kind === 'boolean') {
+            const value = sampleBooleanTrack(trackDef, timeSeconds);
+            if (value == null) return;
+            payload = { [binding.property]: value };
+        }
+
+        if (payload) {
+            applyMaterialScalar(target, payload, binding.materialIndex);
+        }
+    }
+
     function applyCustomEntry(entry, timeSeconds) {
         const { target, kind, path, trackDef } = entry;
         if (!target) return;
@@ -374,6 +516,14 @@ export function createMaxJSAnimationSystem({
                 if (visible != null && path === 'visible') target.visible = visible;
                 break;
             }
+            case 'geometry': {
+                const frame = sampleGeometryFrame(trackDef, timeSeconds);
+                if (frame) applyGeometryFrame(target, frame);
+                break;
+            }
+            case 'material':
+                applyMaterialTrack(target, path, normalizeTrackType(trackDef?.type, path), trackDef, timeSeconds);
+                break;
             case 'vector3':
                 if (!sampleVectorTrack(trackDef, timeSeconds, vectorSample)) break;
                 if (path === 'position') {
@@ -515,16 +665,19 @@ export function createMaxJSAnimationSystem({
         return { clipCount, targetCount: targetRegistry.size };
     }
 
-    function loadSnapshotAnimations(payload) {
+    function loadSnapshotAnimations(payload, binaryBuffer = null) {
         if (registryDirty) rebuildTargetRegistry();
         clear();
+        loadedBinary = binaryBuffer instanceof ArrayBuffer ? binaryBuffer : null;
         return mountPayload(payload);
     }
 
     function refreshTargets() {
         const playbackState = capturePlaybackState();
+        const binaryBuffer = loadedBinary;
         rebuildTargetRegistry();
         clear();
+        loadedBinary = binaryBuffer;
         return mountPayload(loadedPayload, playbackState);
     }
 

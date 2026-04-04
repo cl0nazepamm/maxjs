@@ -4408,12 +4408,58 @@ public:
         std::vector<float> times;
         std::vector<float> values;
         std::vector<unsigned char> boolValues;
+        struct GeometryFrameRef {
+            size_t vOff = 0, iOff = 0, uvOff = 0, nOff = 0;
+            size_t vN = 0, iN = 0, uvN = 0, nN = 0;
+            bool spline = false;
+            std::vector<MatGroup> groups;
+        };
+        std::vector<GeometryFrameRef> geometryFrames;
         bool isBoolean = false;
+        bool isGeometryFrames = false;
     };
 
     struct SnapshotAnimationTargetDef {
         std::wstring target;
         std::vector<SnapshotAnimationTrackDef> tracks;
+    };
+
+    struct SnapshotGeometrySample {
+        bool spline = false;
+        std::vector<float> verts, uvs, norms;
+        std::vector<int> indices;
+        std::vector<MatGroup> groups;
+    };
+
+    struct SnapshotMaterialSample {
+        Point3 color = Point3(0.8f, 0.8f, 0.8f);
+        Point3 emissive = Point3(0.0f, 0.0f, 0.0f);
+        Point3 specularColor = Point3(1.0f, 1.0f, 1.0f);
+        Point3 sheenColor = Point3(0.0f, 0.0f, 0.0f);
+        Point3 attenuationColor = Point3(1.0f, 1.0f, 1.0f);
+        float roughness = 0.5f;
+        float metalness = 0.0f;
+        float opacity = 1.0f;
+        float emissiveIntensity = 0.0f;
+        float aoIntensity = 1.0f;
+        float envIntensity = 1.0f;
+        float transmission = 0.0f;
+        float clearcoat = 0.0f;
+        float clearcoatRoughness = 0.0f;
+        float thickness = 0.0f;
+        float ior = 1.5f;
+        float specularIntensity = 1.0f;
+        float sheen = 0.0f;
+        float sheenRoughness = 1.0f;
+        bool physical = false;
+    };
+
+    struct SnapshotCameraCutSegment {
+        TimeValue start = 0;
+        TimeValue end = 0;
+        ULONG handle = 0;
+        INode* node = nullptr;
+        std::wstring name;
     };
 
     static Point3 MaxPointToWorld(const Point3& point) {
@@ -4424,6 +4470,10 @@ public:
         return std::fabs(a.x - b.x) <= epsilon &&
                std::fabs(a.y - b.y) <= epsilon &&
                std::fabs(a.z - b.z) <= epsilon;
+    }
+
+    static bool NearlyEqualFloat(float a, float b, float epsilon = 1.0e-4f) {
+        return std::fabs(a - b) <= epsilon;
     }
 
     static double GetAnimationTicksPerSecond() {
@@ -4442,6 +4492,117 @@ public:
         if (std::find(times.begin(), times.end(), value) == times.end()) {
             times.push_back(value);
         }
+    }
+
+    static void AppendNumberTrackSample(SnapshotAnimationTrackDef& track, float seconds, float value) {
+        track.times.push_back(seconds);
+        track.values.push_back(value);
+    }
+
+    static void AppendVectorTrackSample(SnapshotAnimationTrackDef& track, float seconds, const Point3& value) {
+        track.times.push_back(seconds);
+        track.values.push_back(value.x);
+        track.values.push_back(value.y);
+        track.values.push_back(value.z);
+    }
+
+    static void AppendBinaryFloats(std::string& outBinary,
+                                   const std::vector<float>& values,
+                                   size_t& outOffset,
+                                   size_t& outCount) {
+        outOffset = outBinary.size();
+        outCount = values.size();
+        if (values.empty()) return;
+        outBinary.append(
+            reinterpret_cast<const char*>(values.data()),
+            values.size() * sizeof(float));
+    }
+
+    static void AppendBinaryInts(std::string& outBinary,
+                                 const std::vector<int>& values,
+                                 size_t& outOffset,
+                                 size_t& outCount) {
+        outOffset = outBinary.size();
+        outCount = values.size();
+        if (values.empty()) return;
+        outBinary.append(
+            reinterpret_cast<const char*>(values.data()),
+            values.size() * sizeof(int));
+    }
+
+    static bool ExtractSnapshotGeometrySample(INode* node,
+                                             TimeValue sampleTime,
+                                             SnapshotGeometrySample& outSample) {
+        if (!node) return false;
+        outSample = SnapshotGeometrySample();
+
+        ObjectState os = node->EvalWorldState(sampleTime);
+        bool extracted = ExtractMesh(
+            node,
+            sampleTime,
+            outSample.verts,
+            outSample.uvs,
+            outSample.indices,
+            outSample.groups,
+            &outSample.norms);
+
+        if (!extracted && os.obj && os.obj->SuperClassID() == SHAPE_CLASS_ID) {
+            extracted = ExtractSpline(node, sampleTime, outSample.verts, outSample.indices);
+            outSample.spline = extracted;
+            if (extracted) {
+                outSample.uvs.clear();
+                outSample.norms.clear();
+                outSample.groups.clear();
+            }
+        }
+
+        return extracted;
+    }
+
+    static bool SnapshotGeometrySamplesEqual(const SnapshotGeometrySample& a,
+                                             const SnapshotGeometrySample& b) {
+        if (a.groups.size() != b.groups.size()) return false;
+        for (size_t i = 0; i < a.groups.size(); ++i) {
+            if (a.groups[i].matID != b.groups[i].matID ||
+                a.groups[i].start != b.groups[i].start ||
+                a.groups[i].count != b.groups[i].count) {
+                return false;
+            }
+        }
+        return a.spline == b.spline &&
+               a.verts == b.verts &&
+               a.indices == b.indices &&
+               a.uvs == b.uvs &&
+               a.norms == b.norms;
+    }
+
+    static void FillSnapshotMaterialSample(const MaxJSPBR& pbr, SnapshotMaterialSample& out) {
+        out.color = Point3(pbr.color[0], pbr.color[1], pbr.color[2]);
+        out.emissive = Point3(pbr.emission[0], pbr.emission[1], pbr.emission[2]);
+        out.specularColor = Point3(
+            pbr.physicalSpecularColor[0],
+            pbr.physicalSpecularColor[1],
+            pbr.physicalSpecularColor[2]);
+        out.sheenColor = Point3(pbr.sheenColor[0], pbr.sheenColor[1], pbr.sheenColor[2]);
+        out.attenuationColor = Point3(
+            pbr.attenuationColor[0],
+            pbr.attenuationColor[1],
+            pbr.attenuationColor[2]);
+        out.roughness = pbr.roughness;
+        out.metalness = pbr.metalness;
+        out.opacity = pbr.opacity;
+        out.emissiveIntensity = pbr.emIntensity;
+        out.aoIntensity = pbr.aoIntensity;
+        out.envIntensity = pbr.envIntensity;
+        out.transmission = pbr.transmission;
+        out.clearcoat = pbr.clearcoat;
+        out.clearcoatRoughness = pbr.clearcoatRoughness;
+        out.thickness = pbr.thickness;
+        out.ior = pbr.ior;
+        out.specularIntensity = pbr.physicalSpecularIntensity;
+        out.sheen = pbr.sheen;
+        out.sheenRoughness = pbr.sheenRoughness;
+        out.physical = pbr.materialModel == L"MeshPhysicalMaterial";
     }
 
     static void SortUniqueTimeValues(std::vector<TimeValue>& times) {
@@ -4583,6 +4744,422 @@ public:
         return !outTarget.tracks.empty();
     }
 
+    static void MergeSnapshotAnimationTarget(SnapshotAnimationTargetDef& dst,
+                                             SnapshotAnimationTargetDef&& src) {
+        if (src.tracks.empty()) return;
+        if (dst.target.empty()) dst.target = std::move(src.target);
+        dst.tracks.insert(
+            dst.tracks.end(),
+            std::make_move_iterator(src.tracks.begin()),
+            std::make_move_iterator(src.tracks.end()));
+    }
+
+    static void AppendGeometryFrame(std::string& binary,
+                                    const SnapshotGeometrySample& sample,
+                                    SnapshotAnimationTrackDef::GeometryFrameRef& frame) {
+        AppendBinaryFloats(binary, sample.verts, frame.vOff, frame.vN);
+        AppendBinaryInts(binary, sample.indices, frame.iOff, frame.iN);
+        AppendBinaryFloats(binary, sample.uvs, frame.uvOff, frame.uvN);
+        AppendBinaryFloats(binary, sample.norms, frame.nOff, frame.nN);
+        frame.spline = sample.spline;
+        frame.groups = sample.groups;
+    }
+
+    static void OffsetGeometryFrameRefs(std::vector<SnapshotAnimationTrackDef::GeometryFrameRef>& frames,
+                                        size_t baseOffset) {
+        for (auto& frame : frames) {
+            frame.vOff += baseOffset;
+            frame.iOff += baseOffset;
+            frame.uvOff += baseOffset;
+            frame.nOff += baseOffset;
+        }
+    }
+
+    static bool BuildNodeGeometryAnimationTarget(INode* node,
+                                                 const Interval& range,
+                                                 TimeValue currentTime,
+                                                 SnapshotAnimationTargetDef& outTarget,
+                                                 std::string& outBinary) {
+        if (!node) return false;
+
+        std::vector<TimeValue> discoveryTimes;
+        const bool hasGeometryAnimation =
+            BuildAnimatableTimeSamples(node->GetObjectRef(), range, currentTime, discoveryTimes);
+        if (!hasGeometryAnimation) {
+            return false;
+        }
+
+        std::vector<TimeValue> sampleTimes;
+        AppendFrameSampleTimes(sampleTimes, range);
+        SortUniqueTimeValues(sampleTimes);
+        if (sampleTimes.size() < 2) {
+            return false;
+        }
+
+        SnapshotAnimationTrackDef geometryTrack;
+        geometryTrack.path = L"geometry";
+        geometryTrack.type = L"geometryFrames";
+        geometryTrack.interpolation = L"step";
+        geometryTrack.isGeometryFrames = true;
+
+        std::string localBinary;
+        bool geometryChanged = false;
+        bool havePrevious = false;
+        SnapshotGeometrySample previousSample;
+
+        for (TimeValue sampleTime : sampleTimes) {
+            SnapshotGeometrySample sample;
+            if (!ExtractSnapshotGeometrySample(node, sampleTime, sample)) {
+                continue;
+            }
+
+            geometryTrack.times.push_back(TimeValueToAnimationSeconds(sampleTime, range.Start()));
+            SnapshotAnimationTrackDef::GeometryFrameRef frame;
+            AppendGeometryFrame(localBinary, sample, frame);
+            geometryTrack.geometryFrames.push_back(std::move(frame));
+
+            if (havePrevious && !SnapshotGeometrySamplesEqual(sample, previousSample)) {
+                geometryChanged = true;
+            }
+            previousSample = std::move(sample);
+            havePrevious = true;
+        }
+
+        if (!geometryChanged ||
+            geometryTrack.times.size() < 2 ||
+            geometryTrack.geometryFrames.size() != geometryTrack.times.size()) {
+            return false;
+        }
+
+        const size_t baseOffset = outBinary.size();
+        OffsetGeometryFrameRefs(geometryTrack.geometryFrames, baseOffset);
+        outBinary.append(localBinary);
+
+        outTarget.target = L"handle:" + std::to_wstring(node->GetHandle());
+        outTarget.tracks.push_back(std::move(geometryTrack));
+        return true;
+    }
+
+    static void BuildMaterialTracksForPrefix(const std::wstring& prefix,
+                                             const std::vector<float>& seconds,
+                                             const std::vector<SnapshotMaterialSample>& samples,
+                                             std::vector<SnapshotAnimationTrackDef>& outTracks) {
+        if (seconds.size() < 2 || samples.size() != seconds.size()) return;
+
+        auto makeVectorTrack = [&](const wchar_t* suffix) {
+            SnapshotAnimationTrackDef track;
+            track.path = prefix + L"." + suffix;
+            track.type = L"vector3";
+            track.interpolation = L"linear";
+            return track;
+        };
+        auto makeNumberTrack = [&](const wchar_t* suffix) {
+            SnapshotAnimationTrackDef track;
+            track.path = prefix + L"." + suffix;
+            track.type = L"number";
+            track.interpolation = L"linear";
+            return track;
+        };
+
+        SnapshotAnimationTrackDef colorTrack = makeVectorTrack(L"color");
+        SnapshotAnimationTrackDef emissiveTrack = makeVectorTrack(L"emissive");
+        SnapshotAnimationTrackDef specularColorTrack = makeVectorTrack(L"specularColor");
+        SnapshotAnimationTrackDef sheenColorTrack = makeVectorTrack(L"sheenColor");
+        SnapshotAnimationTrackDef attenuationColorTrack = makeVectorTrack(L"attenuationColor");
+
+        SnapshotAnimationTrackDef roughnessTrack = makeNumberTrack(L"roughness");
+        SnapshotAnimationTrackDef metalnessTrack = makeNumberTrack(L"metalness");
+        SnapshotAnimationTrackDef opacityTrack = makeNumberTrack(L"opacity");
+        SnapshotAnimationTrackDef emissiveIntensityTrack = makeNumberTrack(L"emissiveIntensity");
+        SnapshotAnimationTrackDef aoIntensityTrack = makeNumberTrack(L"aoMapIntensity");
+        SnapshotAnimationTrackDef envIntensityTrack = makeNumberTrack(L"envMapIntensity");
+        SnapshotAnimationTrackDef transmissionTrack = makeNumberTrack(L"transmission");
+        SnapshotAnimationTrackDef clearcoatTrack = makeNumberTrack(L"clearcoat");
+        SnapshotAnimationTrackDef clearcoatRoughnessTrack = makeNumberTrack(L"clearcoatRoughness");
+        SnapshotAnimationTrackDef thicknessTrack = makeNumberTrack(L"thickness");
+        SnapshotAnimationTrackDef iorTrack = makeNumberTrack(L"ior");
+        SnapshotAnimationTrackDef specularIntensityTrack = makeNumberTrack(L"specularIntensity");
+        SnapshotAnimationTrackDef sheenTrack = makeNumberTrack(L"sheen");
+        SnapshotAnimationTrackDef sheenRoughnessTrack = makeNumberTrack(L"sheenRoughness");
+
+        bool colorChanged = false;
+        bool emissiveChanged = false;
+        bool specularColorChanged = false;
+        bool sheenColorChanged = false;
+        bool attenuationColorChanged = false;
+        bool roughnessChanged = false;
+        bool metalnessChanged = false;
+        bool opacityChanged = false;
+        bool emissiveIntensityChanged = false;
+        bool aoIntensityChanged = false;
+        bool envIntensityChanged = false;
+        bool transmissionChanged = false;
+        bool clearcoatChanged = false;
+        bool clearcoatRoughnessChanged = false;
+        bool thicknessChanged = false;
+        bool iorChanged = false;
+        bool specularIntensityChanged = false;
+        bool sheenChanged = false;
+        bool sheenRoughnessChanged = false;
+
+        for (size_t i = 0; i < samples.size(); ++i) {
+            const auto& sample = samples[i];
+            const float second = seconds[i];
+
+            AppendVectorTrackSample(colorTrack, second, sample.color);
+            AppendVectorTrackSample(emissiveTrack, second, sample.emissive);
+            AppendVectorTrackSample(specularColorTrack, second, sample.specularColor);
+            AppendVectorTrackSample(sheenColorTrack, second, sample.sheenColor);
+            AppendVectorTrackSample(attenuationColorTrack, second, sample.attenuationColor);
+
+            AppendNumberTrackSample(roughnessTrack, second, sample.roughness);
+            AppendNumberTrackSample(metalnessTrack, second, sample.metalness);
+            AppendNumberTrackSample(opacityTrack, second, sample.opacity);
+            AppendNumberTrackSample(emissiveIntensityTrack, second, sample.emissiveIntensity);
+            AppendNumberTrackSample(aoIntensityTrack, second, sample.aoIntensity);
+            AppendNumberTrackSample(envIntensityTrack, second, sample.envIntensity);
+            AppendNumberTrackSample(transmissionTrack, second, sample.transmission);
+            AppendNumberTrackSample(clearcoatTrack, second, sample.clearcoat);
+            AppendNumberTrackSample(clearcoatRoughnessTrack, second, sample.clearcoatRoughness);
+            AppendNumberTrackSample(thicknessTrack, second, sample.thickness);
+            AppendNumberTrackSample(iorTrack, second, sample.ior);
+            AppendNumberTrackSample(specularIntensityTrack, second, sample.specularIntensity);
+            AppendNumberTrackSample(sheenTrack, second, sample.sheen);
+            AppendNumberTrackSample(sheenRoughnessTrack, second, sample.sheenRoughness);
+
+            if (i == 0) continue;
+            const auto& prev = samples[i - 1];
+            colorChanged = colorChanged || !NearlyEqualPoint3(sample.color, prev.color);
+            emissiveChanged = emissiveChanged || !NearlyEqualPoint3(sample.emissive, prev.emissive);
+            specularColorChanged = specularColorChanged || !NearlyEqualPoint3(sample.specularColor, prev.specularColor);
+            sheenColorChanged = sheenColorChanged || !NearlyEqualPoint3(sample.sheenColor, prev.sheenColor);
+            attenuationColorChanged = attenuationColorChanged || !NearlyEqualPoint3(sample.attenuationColor, prev.attenuationColor);
+            roughnessChanged = roughnessChanged || !NearlyEqualFloat(sample.roughness, prev.roughness);
+            metalnessChanged = metalnessChanged || !NearlyEqualFloat(sample.metalness, prev.metalness);
+            opacityChanged = opacityChanged || !NearlyEqualFloat(sample.opacity, prev.opacity);
+            emissiveIntensityChanged = emissiveIntensityChanged || !NearlyEqualFloat(sample.emissiveIntensity, prev.emissiveIntensity);
+            aoIntensityChanged = aoIntensityChanged || !NearlyEqualFloat(sample.aoIntensity, prev.aoIntensity);
+            envIntensityChanged = envIntensityChanged || !NearlyEqualFloat(sample.envIntensity, prev.envIntensity);
+            transmissionChanged = transmissionChanged || !NearlyEqualFloat(sample.transmission, prev.transmission);
+            clearcoatChanged = clearcoatChanged || !NearlyEqualFloat(sample.clearcoat, prev.clearcoat);
+            clearcoatRoughnessChanged = clearcoatRoughnessChanged || !NearlyEqualFloat(sample.clearcoatRoughness, prev.clearcoatRoughness);
+            thicknessChanged = thicknessChanged || !NearlyEqualFloat(sample.thickness, prev.thickness);
+            iorChanged = iorChanged || !NearlyEqualFloat(sample.ior, prev.ior);
+            specularIntensityChanged = specularIntensityChanged || !NearlyEqualFloat(sample.specularIntensity, prev.specularIntensity);
+            sheenChanged = sheenChanged || !NearlyEqualFloat(sample.sheen, prev.sheen);
+            sheenRoughnessChanged = sheenRoughnessChanged || !NearlyEqualFloat(sample.sheenRoughness, prev.sheenRoughness);
+        }
+
+        if (colorChanged) outTracks.push_back(std::move(colorTrack));
+        if (emissiveChanged) outTracks.push_back(std::move(emissiveTrack));
+        if (specularColorChanged) outTracks.push_back(std::move(specularColorTrack));
+        if (sheenColorChanged) outTracks.push_back(std::move(sheenColorTrack));
+        if (attenuationColorChanged) outTracks.push_back(std::move(attenuationColorTrack));
+        if (roughnessChanged) outTracks.push_back(std::move(roughnessTrack));
+        if (metalnessChanged) outTracks.push_back(std::move(metalnessTrack));
+        if (opacityChanged) outTracks.push_back(std::move(opacityTrack));
+        if (emissiveIntensityChanged) outTracks.push_back(std::move(emissiveIntensityTrack));
+        if (aoIntensityChanged) outTracks.push_back(std::move(aoIntensityTrack));
+        if (envIntensityChanged) outTracks.push_back(std::move(envIntensityTrack));
+        if (transmissionChanged) outTracks.push_back(std::move(transmissionTrack));
+        if (clearcoatChanged) outTracks.push_back(std::move(clearcoatTrack));
+        if (clearcoatRoughnessChanged) outTracks.push_back(std::move(clearcoatRoughnessTrack));
+        if (thicknessChanged) outTracks.push_back(std::move(thicknessTrack));
+        if (iorChanged) outTracks.push_back(std::move(iorTrack));
+        if (specularIntensityChanged) outTracks.push_back(std::move(specularIntensityTrack));
+        if (sheenChanged) outTracks.push_back(std::move(sheenTrack));
+        if (sheenRoughnessChanged) outTracks.push_back(std::move(sheenRoughnessTrack));
+    }
+
+    static bool BuildNodeMaterialAnimationTarget(const SnapshotNodeRecord& nodeRecord,
+                                                 const Interval& range,
+                                                 TimeValue currentTime,
+                                                 SnapshotAnimationTargetDef& outTarget) {
+        INode* node = nodeRecord.node;
+        if (!node) return false;
+
+        Mtl* mtl = node->GetMtl();
+        if (!mtl) return false;
+
+        std::vector<TimeValue> discoveryTimes;
+        const bool hasMaterialAnimation =
+            BuildAnimatableTimeSamples(mtl, range, currentTime, discoveryTimes);
+        if (!hasMaterialAnimation) {
+            return false;
+        }
+
+        std::vector<TimeValue> sampleTimes;
+        AppendFrameSampleTimes(sampleTimes, range);
+        SortUniqueTimeValues(sampleTimes);
+        if (sampleTimes.size() < 2) {
+            return false;
+        }
+
+        std::vector<float> seconds;
+        seconds.reserve(sampleTimes.size());
+        for (TimeValue sampleTime : sampleTimes) {
+            seconds.push_back(TimeValueToAnimationSeconds(sampleTime, range.Start()));
+        }
+
+        outTarget.target = L"handle:" + std::to_wstring(node->GetHandle());
+
+        Mtl* multiMtl = FindMultiSubMtl(mtl);
+        if (multiMtl && multiMtl->NumSubMtls() > 0 && nodeRecord.groups.size() > 1) {
+            for (size_t groupIndex = 0; groupIndex < nodeRecord.groups.size(); ++groupIndex) {
+                std::vector<SnapshotMaterialSample> samples;
+                samples.reserve(sampleTimes.size());
+                for (TimeValue sampleTime : sampleTimes) {
+                    Mtl* subMtl = GetSubMtlFromMatID(multiMtl, nodeRecord.groups[groupIndex].matID);
+                    if (!subMtl) subMtl = multiMtl;
+
+                    MaxJSPBR pbr;
+                    ExtractPBRFromMtl(subMtl, node, sampleTime, pbr);
+                    SnapshotMaterialSample sample;
+                    FillSnapshotMaterialSample(pbr, sample);
+                    samples.push_back(sample);
+                }
+                const std::wstring prefix = L"materials[" + std::to_wstring(groupIndex) + L"]";
+                BuildMaterialTracksForPrefix(prefix, seconds, samples, outTarget.tracks);
+            }
+        } else {
+            std::vector<SnapshotMaterialSample> samples;
+            samples.reserve(sampleTimes.size());
+            for (TimeValue sampleTime : sampleTimes) {
+                MaxJSPBR pbr;
+                ExtractPBR(node, sampleTime, pbr);
+                SnapshotMaterialSample sample;
+                FillSnapshotMaterialSample(pbr, sample);
+                samples.push_back(sample);
+            }
+            BuildMaterialTracksForPrefix(L"material", seconds, samples, outTarget.tracks);
+        }
+
+        return !outTarget.tracks.empty();
+    }
+
+    static INode* ResolveStateSetCameraNode(Interface* ip, ULONG handle) {
+        return (ip && handle != 0) ? ip->GetINodeByHandle(handle) : nullptr;
+    }
+
+    static bool TryBuildStateSetCameraSegments(Interface* ip,
+                                               const Interval& range,
+                                               std::vector<SnapshotCameraCutSegment>& outSegments) {
+        if (!ip) return false;
+
+        static const wchar_t* script = LR"(
+            fn _maxjs_snapshot_state_cameras = (
+                local rows = #()
+                try (
+                    local plugin = dotNetObject "Autodesk.Max.StateSets.Plugin"
+                    local entityManager = plugin.EntityManager
+                    if entityManager != undefined do (
+                        local root = entityManager.RootEntity.MasterStateSet
+                        if root != undefined do (
+                            for i = 0 to root.ChildrenCount - 1 do (
+                                local state = root.GetChild i
+                                local cam = undefined
+                                local startTick = undefined
+                                local endTick = undefined
+                                try (cam = state.ActiveViewportCamera) catch()
+                                try (
+                                    local rr = state.RenderRange
+                                    if rr != undefined do (
+                                        startTick = rr.Start.ticks
+                                        endTick = rr.End.ticks
+                                    )
+                                ) catch()
+                                try (
+                                    if startTick == undefined or endTick == undefined do (
+                                        local ar = state.AnimationRange
+                                        if ar != undefined do (
+                                            startTick = ar.Start.ticks
+                                            endTick = ar.End.ticks
+                                        )
+                                    )
+                                ) catch()
+                                if cam != undefined and startTick != undefined and endTick != undefined do (
+                                    append rows ((getHandleByAnim cam) as string + "|" +
+                                        (startTick as integer) as string + "|" +
+                                        (endTick as integer) as string + "|" +
+                                        state.Name)
+                                )
+                            )
+                        )
+                    )
+                ) catch()
+                join rows "\n"
+            )
+            _maxjs_snapshot_state_cameras()
+        )";
+
+        FPValue result;
+        result.Init();
+        try {
+            if (!ExecuteMAXScriptScript(script, MAXScript::ScriptSource::Dynamic, false, &result)) {
+                return false;
+            }
+        } catch (...) {
+            return false;
+        }
+
+        if (result.type != TYPE_STRING || !result.s || !*result.s) {
+            return false;
+        }
+
+        std::wstringstream lines(result.s);
+        std::wstring line;
+        while (std::getline(lines, line)) {
+            if (line.empty()) continue;
+
+            std::vector<std::wstring> parts;
+            size_t start = 0;
+            while (start <= line.size()) {
+                const size_t pos = line.find(L'|', start);
+                if (pos == std::wstring::npos) {
+                    parts.push_back(line.substr(start));
+                    break;
+                }
+                parts.push_back(line.substr(start, pos - start));
+                start = pos + 1;
+            }
+            if (parts.size() < 4) continue;
+
+            try {
+                SnapshotCameraCutSegment segment;
+                segment.handle = static_cast<ULONG>(std::stoul(parts[0]));
+                segment.start = static_cast<TimeValue>(std::stoi(parts[1]));
+                segment.end = static_cast<TimeValue>(std::stoi(parts[2]));
+                segment.name = parts[3];
+                segment.node = ResolveStateSetCameraNode(ip, segment.handle);
+                if (!segment.node || segment.end < range.Start() || segment.start > range.End()) {
+                    continue;
+                }
+                segment.start = std::max(segment.start, range.Start());
+                segment.end = std::min(segment.end, range.End());
+                outSegments.push_back(segment);
+            } catch (...) {
+            }
+        }
+
+        std::sort(outSegments.begin(), outSegments.end(),
+                  [](const SnapshotCameraCutSegment& a, const SnapshotCameraCutSegment& b) {
+                      if (a.start != b.start) return a.start < b.start;
+                      return a.end < b.end;
+                  });
+        return !outSegments.empty();
+    }
+
+    static INode* FindCameraNodeForTime(const std::vector<SnapshotCameraCutSegment>& segments,
+                                        TimeValue sampleTime,
+                                        INode* fallbackNode) {
+        for (const auto& segment : segments) {
+            if (segment.node && sampleTime >= segment.start && sampleTime <= segment.end) {
+                return segment.node;
+            }
+        }
+        return fallbackNode;
+    }
+
     static bool BuildActiveCameraAnimationTarget(Interface* ip,
                                                  const Interval& range,
                                                  TimeValue currentTime,
@@ -4604,8 +5181,21 @@ public:
             return false;
         }
 
+        std::vector<SnapshotCameraCutSegment> cameraSegments;
+        TryBuildStateSetCameraSegments(ip, range, cameraSegments);
+        if (cameraSegments.empty()) {
+            SnapshotCameraCutSegment fallbackSegment;
+            fallbackSegment.start = range.Start();
+            fallbackSegment.end = range.End();
+            fallbackSegment.handle = cameraNode->GetHandle();
+            fallbackSegment.node = cameraNode;
+            fallbackSegment.name = cameraNode->GetName();
+            cameraSegments.push_back(std::move(fallbackSegment));
+        }
+
         std::vector<TimeValue> discoveryTimes;
-        const bool hasTransformAnimation =
+        const bool hasCameraCuts = cameraSegments.size() > 1;
+        bool hasTransformAnimation =
             BuildAnimatableTimeSamples(cameraNode->GetTMController(), range, currentTime, discoveryTimes);
         bool hasLensAnimation = BuildAnimatableTimeSamples(cameraObject, range, currentTime, discoveryTimes);
         if (GenCamera* genCamera = dynamic_cast<GenCamera*>(cameraObject)) {
@@ -4613,12 +5203,19 @@ public:
                 BuildAnimatableTimeSamples(genCamera->GetFOVControl(), range, currentTime, discoveryTimes) ||
                 hasLensAnimation;
         }
+        hasTransformAnimation = hasTransformAnimation || hasCameraCuts;
         if (!hasTransformAnimation && !hasLensAnimation) {
             return false;
         }
 
         std::vector<TimeValue> sampleTimes;
         AppendFrameSampleTimes(sampleTimes, range);
+        for (size_t i = 1; i < cameraSegments.size(); ++i) {
+            if (cameraSegments[i].start > range.Start()) {
+                AppendUniqueTimeValue(sampleTimes, cameraSegments[i].start - 1);
+            }
+            AppendUniqueTimeValue(sampleTimes, cameraSegments[i].start);
+        }
         SortUniqueTimeValues(sampleTimes);
         if (sampleTimes.size() < 2) {
             return false;
@@ -4663,7 +5260,10 @@ public:
         bool exportingOrtho = false;
 
         for (TimeValue sampleTime : sampleTimes) {
-            cameraState = cameraNode->EvalWorldState(sampleTime);
+            INode* sampleCameraNode = FindCameraNodeForTime(cameraSegments, sampleTime, cameraNode);
+            if (!sampleCameraNode) continue;
+
+            cameraState = sampleCameraNode->EvalWorldState(sampleTime);
             cameraObject =
                 (cameraState.obj && cameraState.obj->SuperClassID() == CAMERA_CLASS_ID)
                     ? static_cast<CameraObject*>(cameraState.obj)
@@ -4676,7 +5276,7 @@ public:
                 continue;
             }
 
-            const Matrix3 cameraTM = cameraNode->GetNodeTM(sampleTime);
+            const Matrix3 cameraTM = sampleCameraNode->GetNodeTM(sampleTime);
             const Point3 maxPos = cameraTM.GetTrans();
             Point3 maxForward = -Normalize(cameraTM.GetRow(2));
             Point3 maxUp = Normalize(cameraTM.GetRow(1));
@@ -4749,16 +5349,49 @@ public:
         }
         ss << L",\"times\":";
         WriteFloats(ss, track.times.data(), track.times.size());
-        ss << L",\"values\":";
-        if (track.isBoolean) {
-            ss << L'[';
-            for (size_t i = 0; i < track.boolValues.size(); ++i) {
+        if (track.isGeometryFrames) {
+            ss << L",\"frames\":[";
+            for (size_t i = 0; i < track.geometryFrames.size(); ++i) {
                 if (i) ss << L',';
-                ss << (track.boolValues[i] ? L"true" : L"false");
+                const auto& frame = track.geometryFrames[i];
+                ss << L"{\"vOff\":" << frame.vOff
+                   << L",\"vN\":" << frame.vN
+                   << L",\"iOff\":" << frame.iOff
+                   << L",\"iN\":" << frame.iN;
+                if (frame.uvN > 0) {
+                    ss << L",\"uvOff\":" << frame.uvOff
+                       << L",\"uvN\":" << frame.uvN;
+                }
+                if (frame.nN > 0) {
+                    ss << L",\"nOff\":" << frame.nOff
+                       << L",\"nN\":" << frame.nN;
+                }
+                if (frame.spline) ss << L",\"spline\":true";
+                if (!frame.groups.empty()) {
+                    ss << L",\"groups\":[";
+                    for (size_t g = 0; g < frame.groups.size(); ++g) {
+                        if (g) ss << L',';
+                        ss << L'[' << frame.groups[g].start
+                           << L',' << frame.groups[g].count
+                           << L',' << g << L']';
+                    }
+                    ss << L']';
+                }
+                ss << L'}';
             }
             ss << L']';
         } else {
-            WriteFloats(ss, track.values.data(), track.values.size());
+            ss << L",\"values\":";
+            if (track.isBoolean) {
+                ss << L'[';
+                for (size_t i = 0; i < track.boolValues.size(); ++i) {
+                    if (i) ss << L',';
+                    ss << (track.boolValues[i] ? L"true" : L"false");
+                }
+                ss << L']';
+            } else {
+                WriteFloats(ss, track.values.data(), track.values.size());
+            }
         }
         ss << L'}';
     }
@@ -4766,7 +5399,8 @@ public:
     static void WriteSnapshotAnimationsJson(std::wostringstream& ss,
                                             const std::vector<SnapshotNodeRecord>& nodes,
                                             Interface* ip,
-                                            TimeValue currentTime) {
+                                            TimeValue currentTime,
+                                            std::string& outAnimBinary) {
         if (!ip) return;
 
         const Interval range = ip->GetAnimRange();
@@ -4779,7 +5413,19 @@ public:
 
         for (const auto& node : nodes) {
             SnapshotAnimationTargetDef target;
-            if (BuildNodeAnimationTarget(node.node, range, currentTime, target)) {
+            SnapshotAnimationTargetDef part;
+            if (BuildNodeAnimationTarget(node.node, range, currentTime, part)) {
+                MergeSnapshotAnimationTarget(target, std::move(part));
+            }
+            part = SnapshotAnimationTargetDef();
+            if (BuildNodeGeometryAnimationTarget(node.node, range, currentTime, part, outAnimBinary)) {
+                MergeSnapshotAnimationTarget(target, std::move(part));
+            }
+            part = SnapshotAnimationTargetDef();
+            if (BuildNodeMaterialAnimationTarget(node, range, currentTime, part)) {
+                MergeSnapshotAnimationTarget(target, std::move(part));
+            }
+            if (!target.tracks.empty()) {
                 targets.push_back(std::move(target));
             }
         }
@@ -4799,6 +5445,9 @@ public:
 
         ss << L",\"animations\":{";
         ss << L"\"version\":1,";
+        if (!outAnimBinary.empty()) {
+            ss << L"\"bin\":\"scene_anim.bin\",";
+        }
         ss << L"\"clips\":[{";
         ss << L"\"id\":\"scene\",";
         ss << L"\"name\":\"Scene\",";
@@ -4855,6 +5504,7 @@ public:
 
     bool BuildSnapshotBinary(std::wstring& outMetaJson,
                              std::string& outBinary,
+                             std::string& outAnimBinary,
                              const std::wstring& snapshotUiJson,
                              const std::wstring& runtimeSceneJson,
                              std::wstring& error) {
@@ -5036,7 +5686,7 @@ public:
         WriteLightsJson(ss, ip, t, true, false, false);
         ss << L",";
         WriteSplatsJson(ss, ip, t, true, false, false);
-        WriteSnapshotAnimationsJson(ss, nodes, ip, t);
+        WriteSnapshotAnimationsJson(ss, nodes, ip, t, outAnimBinary);
 
         {
             std::vector<ForestInstanceGroup> allInstGroups;
@@ -5126,7 +5776,8 @@ public:
 
         std::wstring metaJson;
         std::string binary;
-        if (!BuildSnapshotBinary(metaJson, binary, snapshotUiJson, runtimeSceneJson, error)) {
+        std::string animBinary;
+        if (!BuildSnapshotBinary(metaJson, binary, animBinary, snapshotUiJson, runtimeSceneJson, error)) {
             cleanupOnFail();
             return false;
         }
@@ -5143,6 +5794,11 @@ public:
         }
         if (!WriteBinaryFile(outDir + L"\\scene.bin", binary)) {
             error = L"Failed to write scene.bin";
+            cleanupOnFail();
+            return false;
+        }
+        if (!animBinary.empty() && !WriteBinaryFile(outDir + L"\\scene_anim.bin", animBinary)) {
+            error = L"Failed to write scene_anim.bin";
             cleanupOnFail();
             return false;
         }

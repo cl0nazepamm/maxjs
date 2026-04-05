@@ -2884,7 +2884,14 @@ struct CameraData {
     float fov;         // degrees (horizontal) for perspective
     float viewWidth;   // world-unit width for orthographic
     bool perspective;
+    // DOF from Physical Camera
+    bool dofEnabled;
+    float dofFocusDistance;  // world units
+    float dofFocalLength;   // Three.js DOF transition zone, world units
+    float dofBokehScale;    // artistic bokeh size multiplier
 };
+
+static constexpr Class_ID PHYSICAL_CAM_CLASS_ID(0x46695608, 0x28E9148D);
 
 static void GetViewportCamera(CameraData& cam) {
     Interface* ip = GetCOREInterface();
@@ -2908,6 +2915,60 @@ static void GetViewportCamera(CameraData& cam) {
     cam.pos[0] = pos.x;    cam.pos[1] = pos.y;    cam.pos[2] = pos.z;
     cam.target[0] = tgt.x; cam.target[1] = tgt.y;  cam.target[2] = tgt.z;
     cam.up[0] = up.x;      cam.up[1] = up.y;       cam.up[2] = up.z;
+
+    // DOF from Physical Camera
+    cam.dofEnabled = false;
+    cam.dofFocusDistance = 0.0f;
+    cam.dofFocalLength = 0.0f;
+    cam.dofBokehScale = 0.0f;
+
+    INode* camNode = vp.GetViewCamera();
+    if (camNode && cam.perspective) {
+        TimeValue t = ip->GetTime();
+        ObjectState os = camNode->EvalWorldState(t);
+        if (os.obj && os.obj->ClassID() == PHYSICAL_CAM_CLASS_ID) {
+            IParamBlock2* pb = os.obj->GetParamBlockByID(0);
+            if (pb) {
+                int useDof = 0;
+                pb->GetValue(11, t, useDof, FOREVER);
+                cam.dofEnabled = useDof != 0;
+
+                if (cam.dofEnabled) {
+                    float fNumber = 8.0f;
+                    float focusDist = 5.0f;
+                    float targetDist = 5.0f;
+                    float focalLengthMM = 40.0f;
+                    float sensorWidthMM = 36.0f;
+                    int specifyFocus = 0;
+
+                    pb->GetValue(6, t, fNumber, FOREVER);
+                    pb->GetValue(9, t, focusDist, FOREVER);
+                    pb->GetValue(8, t, targetDist, FOREVER);
+                    pb->GetValue(10, t, specifyFocus, FOREVER);
+                    pb->GetValue(5, t, focalLengthMM, FOREVER);
+                    pb->GetValue(4, t, sensorWidthMM, FOREVER);
+
+                    float effectiveFocusDist = (specifyFocus != 0) ? focusDist : targetDist;
+                    if (effectiveFocusDist < 1e-4f) effectiveFocusDist = 5.0f;
+
+                    double mmPerSU = GetSystemUnitScale(UNITS_MILLIMETERS);
+                    if (mmPerSU < 1e-9) mmPerSU = 1.0;
+                    float focalLengthSU = focalLengthMM / (float)mmPerSU;
+                    float cocSU = (sensorWidthMM / 1500.0f) / (float)mmPerSU;
+
+                    float dofHalf = 0.0f;
+                    if (focalLengthSU > 1e-6f) {
+                        dofHalf = fNumber * cocSU * effectiveFocusDist * effectiveFocusDist /
+                                  (focalLengthSU * focalLengthSU);
+                    }
+
+                    cam.dofFocusDistance = effectiveFocusDist;
+                    cam.dofFocalLength = std::clamp(dofHalf, 0.01f, effectiveFocusDist * 10.0f);
+                    cam.dofBokehScale = std::clamp(focalLengthMM / fNumber, 0.5f, 30.0f);
+                }
+            }
+        }
+    }
 }
 
 static MaxSDK::Graphics::IViewportViewSetting* GetViewportSettings() {
@@ -2939,7 +3000,14 @@ static bool CameraEquals(const CameraData& a, const CameraData& b) {
         if (!NearlyEqualFloat(a.up[i], b.up[i])) return false;
     }
     if (!NearlyEqualFloat(a.fov, b.fov, 1.0e-3f)) return false;
-    return a.perspective == b.perspective;
+    if (a.perspective != b.perspective) return false;
+    if (a.dofEnabled != b.dofEnabled) return false;
+    if (a.dofEnabled) {
+        if (!NearlyEqualFloat(a.dofFocusDistance, b.dofFocusDistance, 0.01f)) return false;
+        if (!NearlyEqualFloat(a.dofFocalLength, b.dofFocalLength, 0.01f)) return false;
+        if (!NearlyEqualFloat(a.dofBokehScale, b.dofBokehScale, 0.01f)) return false;
+    }
+    return true;
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -7039,7 +7107,8 @@ public:
         if (hasDirtyCamera) {
             CameraData cam = {};
             GetViewportCamera(cam);
-            frame.UpdateCamera(cam.pos, cam.target, cam.up, cam.fov, cam.perspective, cam.viewWidth);
+            frame.UpdateCamera(cam.pos, cam.target, cam.up, cam.fov, cam.perspective, cam.viewWidth,
+                               cam.dofEnabled, cam.dofFocusDistance, cam.dofFocalLength, cam.dofBokehScale);
             lastSentCamera_ = cam;
             haveLastSentCamera_ = true;
         }
@@ -7196,7 +7265,8 @@ public:
 
         CameraData cam = {};
         GetViewportCamera(cam);
-        frame.UpdateCamera(cam.pos, cam.target, cam.up, cam.fov, cam.perspective, cam.viewWidth);
+        frame.UpdateCamera(cam.pos, cam.target, cam.up, cam.fov, cam.perspective, cam.viewWidth,
+                               cam.dofEnabled, cam.dofFocusDistance, cam.dofFocalLength, cam.dofBokehScale);
         frame.EndFrame();
 
         const auto& frameBytes = frame.bytes();
@@ -7860,6 +7930,15 @@ public:
         if (!cam.perspective) {
             ss << L",\"viewWidth\":";
             WriteFloatValue(ss, cam.viewWidth, 500.0f);
+        }
+        ss << L",\"dofEnabled\":" << (cam.dofEnabled ? L"true" : L"false");
+        if (cam.dofEnabled) {
+            ss << L",\"dofFocusDistance\":";
+            WriteFloatValue(ss, cam.dofFocusDistance);
+            ss << L",\"dofFocalLength\":";
+            WriteFloatValue(ss, cam.dofFocalLength);
+            ss << L",\"dofBokehScale\":";
+            WriteFloatValue(ss, cam.dofBokehScale);
         }
         ss << L'}';
     }

@@ -953,6 +953,7 @@
 
         let firstSync = true;
         let camLock = true;
+        let physicalCameraDofActive = false;
         let envVisible = false;
         let lightProbeEnabled = true;
         const lightProbeIntensity = 1.0;
@@ -3600,6 +3601,12 @@
             }
             camera.updateProjectionMatrix();
             controls.target.copy(cameraTargetWorld);
+
+            // Forward Physical Camera DOF to post-fx when available
+            physicalCameraDofActive = !!cam.dofEnabled;
+            if (physicalCameraDofActive && ssgiFx?.updateDofFromPhysicalCamera) {
+                ssgiFx.updateDofFromPhysicalCamera(cam, () => syncPostFxPanel(false));
+            }
         }
 
         function computeVisibleSceneBounds(target = new THREE.Box3()) {
@@ -4403,6 +4410,23 @@
                 ],
             },
             {
+                key: 'dof',
+                title: 'Depth of Field',
+                copy: 'Physical camera DOF with bokeh blur. Auto-syncs from Max Physical Camera when enabled.',
+                note: 'Requires the real WebGPU backend. Enable DOF on the Physical Camera in Max for auto mode.',
+                requiresWebGPU: true,
+                isEnabled: () => ssgiFx.isDofEnabled(),
+                setEnabled: (enabled) => ssgiFx.setDofEnabled(enabled),
+                getValues: (state) => state.dof,
+                setValues: (patch) => ssgiFx.setDofOptions(patch),
+                controls: [
+                    { key: 'autoFromCamera', label: 'Auto from Camera', type: 'checkbox' },
+                    { key: 'focusDistance', label: 'Focus Distance', min: 0.1, max: 10000, step: 1 },
+                    { key: 'focalLength', label: 'DOF Range', min: 0.1, max: 5000, step: 1 },
+                    { key: 'bokehScale', label: 'Bokeh Scale', min: 0.5, max: 30, step: 0.5 },
+                ],
+            },
+            {
                 key: 'fog',
                 title: 'Fog',
                 copy: 'Distance fog, density fog, or animated procedural ground fog.',
@@ -4771,7 +4795,10 @@
                     const controlEl = section.controlEls[control.key];
                     if (!controlEl) continue;
 
-                    controlEl.input.disabled = disabled;
+                    // Disable DOF sliders when "Auto from Camera" is on (Physical Camera drives them)
+                    const dofAutoControls = ['focusDistance', 'focalLength', 'bokehScale'];
+                    const autoLocked = section.key === 'dof' && dofAutoControls.includes(control.key) && values.autoFromCamera;
+                    controlEl.input.disabled = disabled || autoLocked;
 
                     if (control.type === 'checkbox') {
                         controlEl.input.checked = !!values[control.key];
@@ -4924,7 +4951,8 @@
         }
 
         buildPostFxPanel();
-        syncPostFxPanel(true);
+        // NOTE: Do NOT call syncPostFxPanel here — it would save defaults and overwrite stored settings.
+        // restoreInteractiveBrowserState() handles restore then sync.
 
         // ── Resize + Render ─────────────────────────────────
         let resizeTimer = null;
@@ -5216,6 +5244,11 @@
             const frameElapsed = inlineClock.getElapsedTime();
             xrRuntime.update(frameDt);
             controls.update();
+            // Auto-update DOF focus distance from camera-to-target when enabled
+            // Skip when Physical Camera DOF is driving the values (Camera Lock ON + Physical Camera has DOF)
+            if (!physicalCameraDofActive || !camLock) {
+                ssgiFx.updateDofFocusFromCamera(camera.position.distanceTo(controls.target));
+            }
             // Default key light follows camera
             if (defaultLights.visible) {
                 defaultKey.position.copy(getActiveCameraWorldPosition(cameraPositionWorld));

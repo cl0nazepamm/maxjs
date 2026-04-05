@@ -30,7 +30,9 @@ public:
     void UpdateSelection(std::uint32_t nodeHandle, bool selected);
     void UpdateVisibility(std::uint32_t nodeHandle, bool visible);
     void UpdateCamera(const float* position3, const float* target3, const float* up3,
-                      float fov, bool perspective, float viewWidth = 0.0f);
+                      float fov, bool perspective, float viewWidth = 0.0f,
+                      bool dofEnabled = false, float dofFocusDistance = 0.0f,
+                      float dofFocalLength = 0.0f, float dofBokehScale = 0.0f);
     void EndFrame();
 
     std::uint32_t frame_id() const { return frameId_; }

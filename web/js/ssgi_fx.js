@@ -55,6 +55,7 @@ import { bayerDither, bayer16 } from 'three/addons/tsl/math/Bayer.js';
 import { retroPass } from 'three/addons/tsl/display/RetroPassNode.js';
 import { ao } from 'three/addons/tsl/display/GTAONode.js';
 import { motionBlur } from 'three/addons/tsl/display/MotionBlur.js';
+import { dof } from 'three/addons/tsl/display/DepthOfFieldNode.js';
 import { traa } from 'three/addons/tsl/display/TRAANode.js';
 import { gaussianBlur } from 'three/addons/tsl/display/GaussianBlurNode.js';
 import { ImprovedNoise } from 'three/addons/math/ImprovedNoise.js';
@@ -230,6 +231,13 @@ export function createSSGIController({
             contrast: 0,
             saturation: 0,
         },
+        dof: {
+            enabled: false,
+            autoFromCamera: true,
+            focusDistance: 100,
+            focalLength: 50,
+            bokehScale: 5,
+        },
     };
 
     let selectedObjects = [];
@@ -242,6 +250,9 @@ export function createSSGIController({
     let activeSSRPass = null;
     let activeAOPass = null;
     let activeContactShadowPass = null;
+    const dofFocusDistanceU = uniform(100);
+    const dofFocalLengthU = uniform(50);
+    const dofBokehScaleU = uniform(5);
     let hiddenDuringPost = [];
     let forceEnvironmentBackground = false;
     let forcedContactShadowLightState = null;
@@ -344,6 +355,7 @@ export function createSSGIController({
         state.bloom.enabled = false;
         state.pixel.enabled = false;
         state.volumetric.enabled = false;
+        state.dof.enabled = false;
         pipelineReady = false;
         restoreForcedContactShadowLight();
         removeVolumetricMesh();
@@ -359,7 +371,8 @@ export function createSSGIController({
             || (state.contactShadow.enabled && mainLight)
             || state.retro.enabled
             || state.pixel.enabled
-            || state.volumetric.enabled;
+            || state.volumetric.enabled
+            || state.dof.enabled;
     }
 
     function computeSceneReferenceSize() {
@@ -414,6 +427,7 @@ export function createSSGIController({
             fog: { ...state.fog },
             pixel: { ...state.pixel },
             volumetric: { ...state.volumetric },
+            dof: { ...state.dof },
         };
     }
 
@@ -661,6 +675,7 @@ export function createSSGIController({
                 state.ssr.enabled && !useRetroTakeover && !!scene.environment && !environmentVisible;
 
             let beauty;
+            let scenePassNode = null;
             let scenePassColor, scenePassDepth, scenePassDiffuse, scenePassNormalColor, scenePassMetalRough, sceneNormal, ssrReflectivity;
 
             if (useRetroTakeover) {
@@ -704,6 +719,7 @@ export function createSSGIController({
                         toc.alpha)
                     : pass(scene, camera);
                 activeNodes.push(scenePass);
+                scenePassNode = scenePass;
 
                 if (sceneContext) scenePass.contextNode = sceneContext;
 
@@ -781,6 +797,15 @@ export function createSSGIController({
                 activeNodes.push(bloomPass);
                 const bloomLuma = bloomPass.r.mul(0.2126).add(bloomPass.g.mul(0.7152)).add(bloomPass.b.mul(0.0722));
                 beauty = vec4(beauty.rgb.add(bloomPass.rgb), max(beauty.a, bloomLuma));
+            }
+
+            if (state.dof.enabled && scenePassNode) {
+                dofFocusDistanceU.value = state.dof.focusDistance;
+                dofFocalLengthU.value = state.dof.focalLength;
+                dofBokehScaleU.value = state.dof.bokehScale;
+                const dofPass = dof(beauty, scenePassNode.getViewZNode(), dofFocusDistanceU, dofFocalLengthU, dofBokehScaleU);
+                activeNodes.push(dofPass);
+                beauty = dofPass;
             }
 
             // Toon outline is handled at the scene pass level (line above) —
@@ -1249,6 +1274,64 @@ export function createSSGIController({
             assignFinite(state.pixel, 'saturation', options.saturation);
             rebuildPipeline();
             return { ...state.pixel };
+        },
+
+        // ── Depth of Field ──
+
+        isDofEnabled() {
+            return state.dof.enabled;
+        },
+        setDofEnabled(enabled) {
+            if (enabled && !supportsScreenSpaceEffects) {
+                lastError = 'DOF requires the real WebGPU backend';
+                state.dof.enabled = false;
+                onError(lastError);
+                return false;
+            }
+            state.dof.enabled = !!enabled && available;
+            rebuildPipeline();
+            return state.dof.enabled;
+        },
+        setDofOptions(options = {}) {
+            assignFinite(state.dof, 'focusDistance', options.focusDistance);
+            assignFinite(state.dof, 'focalLength', options.focalLength);
+            assignFinite(state.dof, 'bokehScale', options.bokehScale);
+            if (typeof options.autoFromCamera === 'boolean') state.dof.autoFromCamera = options.autoFromCamera;
+            if (state.dof.enabled) {
+                dofFocusDistanceU.value = state.dof.focusDistance;
+                dofFocalLengthU.value = state.dof.focalLength;
+                dofBokehScaleU.value = state.dof.bokehScale;
+            }
+            return { ...state.dof };
+        },
+        updateDofFocusFromCamera(targetDist) {
+            if (!state.dof.enabled || !state.dof.autoFromCamera) return;
+            if (!Number.isFinite(targetDist) || targetDist <= 0) return;
+            state.dof.focusDistance = targetDist;
+            dofFocusDistanceU.value = targetDist;
+        },
+        updateDofFromPhysicalCamera(cam, onUpdate = null) {
+            // Called when Camera Lock is ON and Physical Camera has DOF
+            if (!state.dof.enabled || !state.dof.autoFromCamera) return;
+            if (!cam.dofEnabled) return;
+
+            let changed = false;
+            if (Number.isFinite(cam.dofFocusDistance) && cam.dofFocusDistance > 0) {
+                state.dof.focusDistance = cam.dofFocusDistance;
+                dofFocusDistanceU.value = cam.dofFocusDistance;
+                changed = true;
+            }
+            if (Number.isFinite(cam.dofFocalLength) && cam.dofFocalLength > 0) {
+                state.dof.focalLength = cam.dofFocalLength;
+                dofFocalLengthU.value = cam.dofFocalLength;
+                changed = true;
+            }
+            if (Number.isFinite(cam.dofBokehScale) && cam.dofBokehScale > 0) {
+                state.dof.bokehScale = cam.dofBokehScale;
+                dofBokehScaleU.value = cam.dofBokehScale;
+                changed = true;
+            }
+            if (changed && onUpdate) onUpdate();
         },
 
         // ── Volumetric Lighting ──

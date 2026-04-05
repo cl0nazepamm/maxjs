@@ -273,6 +273,37 @@
             display: grid;
             gap: 4px;
         }
+        .snapshot-grid {
+            display: grid;
+            gap: 6px;
+        }
+        .snapshot-inline {
+            display: grid;
+            grid-template-columns: 1fr auto;
+            gap: 8px;
+            align-items: center;
+        }
+        .snapshot-inline input[type="number"] {
+            width: 72px;
+            background: rgba(255, 255, 255, 0.05);
+            color: #bbb;
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            border-radius: 5px;
+            padding: 4px 6px;
+            font: 10px/1 'Segoe UI', system-ui, sans-serif;
+        }
+        .snapshot-actions {
+            display: flex;
+            gap: 6px;
+        }
+        .snapshot-actions button {
+            flex: 1 1 0;
+        }
+        .snapshot-note {
+            color: #777;
+            font-size: 9px;
+            line-height: 1.35;
+        }
         /* ── FX Sections ───────────────────────────── */
         .fx-section {
             border: 1px solid rgba(255, 255, 255, 0.05);
@@ -443,6 +474,7 @@
             <button id="btnKill" class="maxonly devonly">Kill</button>
             <button id="btnRefresh" class="maxonly devonly">Refresh</button>
             <button id="btnSnapshot" class="maxonly devonly">Snapshot</button>
+            <button id="btnSnapshotPanel" class="maxonly devonly">Snap Opts</button>
             <button id="btnCamLock" class="active devonly">Cam Lock: ON</button>
             <button id="btnEnv" class="devonly">Env: OFF</button>
             <button id="btnLightProbe" class="active devonly">Probe: ON</button>
@@ -452,6 +484,7 @@
         </div>
     </div>
     <aside id="layersPanel" class="sidepanel sidepanel-left" aria-hidden="true" inert></aside>
+    <aside id="snapshotPanel" class="sidepanel" aria-hidden="true" inert></aside>
     <aside id="postPanel" class="sidepanel" aria-hidden="true" inert></aside>
     <script type="importmap">
     {
@@ -3663,30 +3696,259 @@
             }
         };
 
+        const SNAPSHOT_SETTINGS_KEY = 'maxjs_snapshot_settings';
+        const SNAPSHOT_SETTINGS_DEFAULTS = Object.freeze({
+            includeSceneNodes: true,
+            includeEnvironment: true,
+            includeFog: true,
+            includeLights: true,
+            includeSplats: true,
+            includeInstances: true,
+            includeSnapshotUi: true,
+            includeRuntimeScene: true,
+            copyAssets: true,
+            includeAnimations: true,
+            includeTransformAnimation: true,
+            includeGeometryAnimation: true,
+            includeMaterialAnimation: true,
+            includeCameraAnimation: true,
+            animationSampleStepFrames: 1,
+        });
+
+        function sanitizeSnapshotSettings(value) {
+            const raw = value && typeof value === 'object' ? value : {};
+            const sanitized = { ...SNAPSHOT_SETTINGS_DEFAULTS };
+            for (const key of Object.keys(SNAPSHOT_SETTINGS_DEFAULTS)) {
+                if (!(key in raw)) continue;
+                if (key === 'animationSampleStepFrames') {
+                    const step = Math.round(Number(raw[key]));
+                    sanitized[key] = Number.isFinite(step) ? Math.min(120, Math.max(1, step)) : 1;
+                } else {
+                    sanitized[key] = !!raw[key];
+                }
+            }
+            return sanitized;
+        }
+
+        function getSnapshotExportSettings() {
+            const settings = sanitizeSnapshotSettings(snapshotSettings);
+            if (!settings.includeAnimations) {
+                settings.includeTransformAnimation = false;
+                settings.includeGeometryAnimation = false;
+                settings.includeMaterialAnimation = false;
+                settings.includeCameraAnimation = false;
+            }
+            return settings;
+        }
+
+        function loadSnapshotSettings() {
+            try {
+                const raw = localStorage.getItem(SNAPSHOT_SETTINGS_KEY);
+                if (!raw) return { ...SNAPSHOT_SETTINGS_DEFAULTS };
+                return sanitizeSnapshotSettings(JSON.parse(raw));
+            } catch {
+                return { ...SNAPSHOT_SETTINGS_DEFAULTS };
+            }
+        }
+
+        function saveSnapshotSettings() {
+            try {
+                localStorage.setItem(SNAPSHOT_SETTINGS_KEY, JSON.stringify(snapshotSettings));
+            } catch {}
+        }
+
+        let snapshotSettings = loadSnapshotSettings();
         const btnSnapshot = document.getElementById('btnSnapshot');
+        const btnSnapshotPanel = document.getElementById('btnSnapshotPanel');
+        const snapshotPanel = document.getElementById('snapshotPanel');
+        let snapshotPanelVisible = false;
         let pendingSnapshotRequestId = null;
-        btnSnapshot.onclick = () => {
+
+        function setSnapshotPanelVisible(visible) {
+            snapshotPanelVisible = !!visible;
+            if (!snapshotPanelVisible) {
+                const activeElement = document.activeElement;
+                if (activeElement instanceof HTMLElement && snapshotPanel.contains(activeElement)) {
+                    btnSnapshotPanel.focus();
+                }
+            }
+            snapshotPanel.classList.toggle('visible', snapshotPanelVisible);
+            snapshotPanel.toggleAttribute('inert', !snapshotPanelVisible);
+            snapshotPanel.setAttribute('aria-hidden', String(!snapshotPanelVisible));
+            btnSnapshotPanel.classList.toggle('active', snapshotPanelVisible);
+            if (snapshotPanelVisible) {
+                buildSnapshotPanel();
+                syncSnapshotPanel();
+            }
+        }
+
+        function updateSnapshotSetting(key, value) {
+            snapshotSettings = sanitizeSnapshotSettings({
+                ...snapshotSettings,
+                [key]: key === 'animationSampleStepFrames' ? Number(value) : !!value,
+            });
+            saveSnapshotSettings();
+            syncSnapshotPanel();
+        }
+
+        function resetSnapshotSettings() {
+            snapshotSettings = { ...SNAPSHOT_SETTINGS_DEFAULTS };
+            saveSnapshotSettings();
+            syncSnapshotPanel();
+        }
+
+        function buildSnapshotPanel() {
+            snapshotPanel.innerHTML = `
+                <div class="sidepanel-header">
+                    <div>
+                        <div class="sidepanel-title">Snapshot</div>
+                        <div class="sidepanel-subtitle" id="snapshotPanelStatus">Saved export profile</div>
+                    </div>
+                    <div style="display:flex;gap:4px">
+                        <button id="snapshotResetBtn" type="button">Reset</button>
+                        <button id="snapshotHideBtn" type="button">Hide</button>
+                    </div>
+                </div>
+                <div class="sidepanel-body">
+                    <section class="fx-section">
+                        <div class="fx-section-header">
+                            <div class="fx-section-title">Content</div>
+                        </div>
+                        <div class="snapshot-grid">
+                            <label class="fx-check" for="snapshot-includeSceneNodes"><span>Scene Nodes</span><input id="snapshot-includeSceneNodes" type="checkbox"></label>
+                            <label class="fx-check" for="snapshot-includeEnvironment"><span>Environment</span><input id="snapshot-includeEnvironment" type="checkbox"></label>
+                            <label class="fx-check" for="snapshot-includeFog"><span>Fog</span><input id="snapshot-includeFog" type="checkbox"></label>
+                            <label class="fx-check" for="snapshot-includeLights"><span>Lights</span><input id="snapshot-includeLights" type="checkbox"></label>
+                            <label class="fx-check" for="snapshot-includeSplats"><span>Splats</span><input id="snapshot-includeSplats" type="checkbox"></label>
+                            <label class="fx-check" for="snapshot-includeInstances"><span>Instances</span><input id="snapshot-includeInstances" type="checkbox"></label>
+                            <label class="fx-check" for="snapshot-includeSnapshotUi"><span>Viewer UI State</span><input id="snapshot-includeSnapshotUi" type="checkbox"></label>
+                            <label class="fx-check" for="snapshot-includeRuntimeScene"><span>JS Runtime Scene</span><input id="snapshot-includeRuntimeScene" type="checkbox"></label>
+                            <label class="fx-check" for="snapshot-copyAssets"><span>Copy Assets</span><input id="snapshot-copyAssets" type="checkbox"></label>
+                        </div>
+                        <div class="snapshot-note">Copy Assets should stay on for deployable snapshots. Turning it off preserves original URLs.</div>
+                    </section>
+                    <section class="fx-section">
+                        <div class="fx-section-header">
+                            <div class="fx-section-title">Animation</div>
+                        </div>
+                        <div class="snapshot-grid">
+                            <label class="fx-check" for="snapshot-includeAnimations"><span>Export Animation</span><input id="snapshot-includeAnimations" type="checkbox"></label>
+                            <label class="fx-check" for="snapshot-includeTransformAnimation"><span>Transform + Visibility</span><input id="snapshot-includeTransformAnimation" type="checkbox"></label>
+                            <label class="fx-check" for="snapshot-includeGeometryAnimation"><span>Geometry / Vertex</span><input id="snapshot-includeGeometryAnimation" type="checkbox"></label>
+                            <label class="fx-check" for="snapshot-includeMaterialAnimation"><span>Material Params</span><input id="snapshot-includeMaterialAnimation" type="checkbox"></label>
+                            <label class="fx-check" for="snapshot-includeCameraAnimation"><span>Active Camera</span><input id="snapshot-includeCameraAnimation" type="checkbox"></label>
+                            <label class="snapshot-inline" for="snapshot-animationSampleStepFrames">
+                                <span>Sample Every N Frames</span>
+                                <input id="snapshot-animationSampleStepFrames" type="number" min="1" max="120" step="1">
+                            </label>
+                        </div>
+                        <div class="snapshot-note">Material and geometry export are baked from the Max scene. Higher sample steps reduce export cost but also reduce fidelity.</div>
+                    </section>
+                    <section class="fx-section">
+                        <div class="fx-section-header">
+                            <div class="fx-section-title">Actions</div>
+                        </div>
+                        <div class="snapshot-actions">
+                            <button id="snapshotExportBtn" type="button">Export Snapshot</button>
+                        </div>
+                        <div class="snapshot-note">The Snapshot button on the toolbar uses this saved profile for one-click export.</div>
+                    </section>
+                </div>
+            `;
+
+            snapshotPanel.querySelector('#snapshotHideBtn')?.addEventListener('click', () => setSnapshotPanelVisible(false));
+            snapshotPanel.querySelector('#snapshotResetBtn')?.addEventListener('click', () => resetSnapshotSettings());
+            snapshotPanel.querySelector('#snapshotExportBtn')?.addEventListener('click', () => {
+                void exportSnapshotWithSettings();
+            });
+
+            for (const key of Object.keys(SNAPSHOT_SETTINGS_DEFAULTS)) {
+                const input = snapshotPanel.querySelector(`#snapshot-${key}`);
+                if (!input) continue;
+                const eventName = input.type === 'number' ? 'input' : 'change';
+                input.addEventListener(eventName, () => {
+                    updateSnapshotSetting(key, input.type === 'number' ? input.value : input.checked);
+                });
+            }
+        }
+
+        function syncSnapshotPanel() {
+            if (!snapshotPanelVisible) return;
+
+            const effective = getSnapshotExportSettings();
+            const exportButton = snapshotPanel.querySelector('#snapshotExportBtn');
+            const status = snapshotPanel.querySelector('#snapshotPanelStatus');
+            if (status) {
+                status.textContent = window.chrome?.webview
+                    ? `dist export • step ${effective.animationSampleStepFrames}f`
+                    : 'Available only inside MaxJS';
+            }
+            if (exportButton) {
+                exportButton.disabled = !window.chrome?.webview || !!pendingSnapshotRequestId;
+                exportButton.textContent = pendingSnapshotRequestId ? 'Writing...' : 'Export Snapshot';
+            }
+
+            for (const [key, defaultValue] of Object.entries(SNAPSHOT_SETTINGS_DEFAULTS)) {
+                const input = snapshotPanel.querySelector(`#snapshot-${key}`);
+                if (!input) continue;
+                if (typeof defaultValue === 'number') input.value = snapshotSettings[key];
+                else input.checked = !!snapshotSettings[key];
+            }
+
+            const animationsEnabled = !!snapshotSettings.includeAnimations;
+            const sceneNodesEnabled = !!snapshotSettings.includeSceneNodes;
+            const animationKeys = ['includeTransformAnimation', 'includeGeometryAnimation', 'includeMaterialAnimation'];
+            for (const key of animationKeys) {
+                const input = snapshotPanel.querySelector(`#snapshot-${key}`);
+                if (input) input.disabled = !animationsEnabled || !sceneNodesEnabled;
+            }
+            const cameraInput = snapshotPanel.querySelector('#snapshot-includeCameraAnimation');
+            if (cameraInput) cameraInput.disabled = !animationsEnabled;
+            const stepInput = snapshotPanel.querySelector('#snapshot-animationSampleStepFrames');
+            if (stepInput) stepInput.disabled = !animationsEnabled;
+        }
+
+        async function exportSnapshotWithSettings() {
             if (!window.chrome?.webview || pendingSnapshotRequestId) return;
 
+            const settings = getSnapshotExportSettings();
+            let snapshotBase64 = '';
             let runtimeSnapshotBase64 = '';
-            try {
-                const runtimeSnapshot = layerManager.serializeSnapshot?.() ?? null;
-                if (runtimeSnapshot) {
-                    runtimeSnapshotBase64 = toBase64Utf8(JSON.stringify(runtimeSnapshot));
+
+            if (settings.includeSnapshotUi) {
+                snapshotBase64 = toBase64Utf8(JSON.stringify(serializeSnapshotUiState()));
+            }
+
+            if (settings.includeRuntimeScene) {
+                try {
+                    const runtimeSnapshot = layerManager.serializeSnapshot?.() ?? null;
+                    if (runtimeSnapshot) {
+                        runtimeSnapshotBase64 = toBase64Utf8(JSON.stringify(runtimeSnapshot));
+                    }
+                } catch (error) {
+                    reportBridgeError('snapshot serialize', error);
+                    return;
                 }
-            } catch (error) {
-                reportBridgeError('snapshot serialize', error);
-                return;
             }
 
             pendingSnapshotRequestId = `snapshot_${Date.now()}`;
             btnSnapshot.disabled = true;
+            syncSnapshotPanel();
             setInfoText('MaxJS - writing snapshot...');
             bridge.send('snapshot_export', {
                 requestId: pendingSnapshotRequestId,
-                snapshotBase64: toBase64Utf8(JSON.stringify(serializeSnapshotUiState())),
+                snapshotBase64,
                 runtimeBase64: runtimeSnapshotBase64,
+                ...settings,
             });
+        }
+
+        btnSnapshot.onclick = () => {
+            void exportSnapshotWithSettings();
+        };
+
+        btnSnapshotPanel.onclick = () => {
+            setSnapshotPanelVisible(!snapshotPanelVisible);
         };
 
         bridge.on('host_action_result', msg => {
@@ -3694,6 +3956,7 @@
             if (pendingSnapshotRequestId && msg.requestId && msg.requestId !== pendingSnapshotRequestId) return;
             pendingSnapshotRequestId = null;
             btnSnapshot.disabled = false;
+            syncSnapshotPanel();
             if (msg.ok) {
                 setInfoText(`MaxJS - snapshot written: ${msg.path || 'dist'}`);
             } else {

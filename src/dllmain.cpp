@@ -439,6 +439,26 @@ static bool ExtractJsonBool(const std::wstring& json, const wchar_t* key, bool& 
     return false;
 }
 
+static bool ExtractJsonInt(const std::wstring& json, const wchar_t* key, int& out) {
+    const std::wstring needle = std::wstring(L"\"") + key + L"\":";
+    size_t pos = json.find(needle);
+    if (pos == std::wstring::npos) return false;
+    pos += needle.size();
+    while (pos < json.size() && iswspace(json[pos])) ++pos;
+
+    size_t start = pos;
+    if (pos < json.size() && (json[pos] == L'-' || json[pos] == L'+')) ++pos;
+    while (pos < json.size() && iswdigit(json[pos])) ++pos;
+    if (pos == start || (pos == start + 1 && (json[start] == L'-' || json[start] == L'+'))) return false;
+
+    try {
+        out = std::stoi(json.substr(start, pos - start));
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
 static std::wstring UrlEncodePath(const std::wstring& path) {
     if (path.empty()) return {};
 
@@ -4462,6 +4482,34 @@ public:
         std::wstring name;
     };
 
+    struct SnapshotExportOptions {
+        bool includeSceneNodes = true;
+        bool includeEnvironment = true;
+        bool includeFog = true;
+        bool includeLights = true;
+        bool includeSplats = true;
+        bool includeInstances = true;
+        bool includeSnapshotUi = true;
+        bool includeRuntimeScene = true;
+        bool copyAssets = true;
+        bool includeAnimations = true;
+        bool includeTransformAnimation = true;
+        bool includeGeometryAnimation = true;
+        bool includeMaterialAnimation = true;
+        bool includeCameraAnimation = true;
+        int animationSampleStepFrames = 1;
+    };
+
+    static void NormalizeSnapshotExportOptions(SnapshotExportOptions& options) {
+        options.animationSampleStepFrames = std::clamp(options.animationSampleStepFrames, 1, 120);
+        if (!options.includeAnimations) {
+            options.includeTransformAnimation = false;
+            options.includeGeometryAnimation = false;
+            options.includeMaterialAnimation = false;
+            options.includeCameraAnimation = false;
+        }
+    }
+
     static Point3 MaxPointToWorld(const Point3& point) {
         return Point3(point.x, point.z, -point.y);
     }
@@ -4635,9 +4683,12 @@ public:
         }
     }
 
-    static void AppendFrameSampleTimes(std::vector<TimeValue>& times, const Interval& range) {
+    static void AppendFrameSampleTimes(std::vector<TimeValue>& times,
+                                       const Interval& range,
+                                       int stepFrames = 1) {
         int step = GetTicksPerFrame();
         if (step <= 0) step = 160;
+        step *= std::max(stepFrames, 1);
         for (TimeValue t = range.Start(); t <= range.End(); t += step) {
             AppendUniqueTimeValue(times, t);
         }
@@ -4675,6 +4726,7 @@ public:
     static bool BuildNodeAnimationTarget(INode* node,
                                          const Interval& range,
                                          TimeValue currentTime,
+                                         const SnapshotExportOptions& options,
                                          SnapshotAnimationTargetDef& outTarget) {
         if (!node) return false;
 
@@ -4688,7 +4740,7 @@ public:
         }
 
         std::vector<TimeValue> sampleTimes;
-        AppendFrameSampleTimes(sampleTimes, range);
+        AppendFrameSampleTimes(sampleTimes, range, options.animationSampleStepFrames);
         SortUniqueTimeValues(sampleTimes);
         if (sampleTimes.size() < 2) {
             return false;
@@ -4778,6 +4830,7 @@ public:
     static bool BuildNodeGeometryAnimationTarget(INode* node,
                                                  const Interval& range,
                                                  TimeValue currentTime,
+                                                 const SnapshotExportOptions& options,
                                                  SnapshotAnimationTargetDef& outTarget,
                                                  std::string& outBinary) {
         if (!node) return false;
@@ -4790,7 +4843,7 @@ public:
         }
 
         std::vector<TimeValue> sampleTimes;
-        AppendFrameSampleTimes(sampleTimes, range);
+        AppendFrameSampleTimes(sampleTimes, range, options.animationSampleStepFrames);
         SortUniqueTimeValues(sampleTimes);
         if (sampleTimes.size() < 2) {
             return false;
@@ -4974,6 +5027,7 @@ public:
     static bool BuildNodeMaterialAnimationTarget(const SnapshotNodeRecord& nodeRecord,
                                                  const Interval& range,
                                                  TimeValue currentTime,
+                                                 const SnapshotExportOptions& options,
                                                  SnapshotAnimationTargetDef& outTarget) {
         INode* node = nodeRecord.node;
         if (!node) return false;
@@ -4982,7 +5036,7 @@ public:
         if (!mtl) return false;
 
         std::vector<TimeValue> sampleTimes;
-        AppendFrameSampleTimes(sampleTimes, range);
+        AppendFrameSampleTimes(sampleTimes, range, options.animationSampleStepFrames);
         if (currentTime >= range.Start() && currentTime <= range.End()) {
             AppendUniqueTimeValue(sampleTimes, currentTime);
         }
@@ -5159,6 +5213,7 @@ public:
     static bool BuildActiveCameraAnimationTarget(Interface* ip,
                                                  const Interval& range,
                                                  TimeValue currentTime,
+                                                 const SnapshotExportOptions& options,
                                                  SnapshotAnimationTargetDef& outTarget) {
         if (!ip) return false;
 
@@ -5205,7 +5260,7 @@ public:
         }
 
         std::vector<TimeValue> sampleTimes;
-        AppendFrameSampleTimes(sampleTimes, range);
+        AppendFrameSampleTimes(sampleTimes, range, options.animationSampleStepFrames);
         for (size_t i = 1; i < cameraSegments.size(); ++i) {
             if (cameraSegments[i].start > range.Start()) {
                 AppendUniqueTimeValue(sampleTimes, cameraSegments[i].start - 1);
@@ -5396,6 +5451,7 @@ public:
                                             const std::vector<SnapshotNodeRecord>& nodes,
                                             Interface* ip,
                                             TimeValue currentTime,
+                                            const SnapshotExportOptions& options,
                                             std::string& outAnimBinary) {
         if (!ip) return;
 
@@ -5410,15 +5466,18 @@ public:
         for (const auto& node : nodes) {
             SnapshotAnimationTargetDef target;
             SnapshotAnimationTargetDef part;
-            if (BuildNodeAnimationTarget(node.node, range, currentTime, part)) {
+            if (options.includeTransformAnimation &&
+                BuildNodeAnimationTarget(node.node, range, currentTime, options, part)) {
                 MergeSnapshotAnimationTarget(target, std::move(part));
             }
             part = SnapshotAnimationTargetDef();
-            if (BuildNodeGeometryAnimationTarget(node.node, range, currentTime, part, outAnimBinary)) {
+            if (options.includeGeometryAnimation &&
+                BuildNodeGeometryAnimationTarget(node.node, range, currentTime, options, part, outAnimBinary)) {
                 MergeSnapshotAnimationTarget(target, std::move(part));
             }
             part = SnapshotAnimationTargetDef();
-            if (BuildNodeMaterialAnimationTarget(node, range, currentTime, part)) {
+            if (options.includeMaterialAnimation &&
+                BuildNodeMaterialAnimationTarget(node, range, currentTime, options, part)) {
                 MergeSnapshotAnimationTarget(target, std::move(part));
             }
             if (!target.tracks.empty()) {
@@ -5427,7 +5486,8 @@ public:
         }
 
         SnapshotAnimationTargetDef cameraTarget;
-        if (BuildActiveCameraAnimationTarget(ip, range, currentTime, cameraTarget)) {
+        if (options.includeCameraAnimation &&
+            BuildActiveCameraAnimationTarget(ip, range, currentTime, options, cameraTarget)) {
             targets.push_back(std::move(cameraTarget));
         }
 
@@ -5503,6 +5563,7 @@ public:
                              std::string& outAnimBinary,
                              const std::wstring& snapshotUiJson,
                              const std::wstring& runtimeSceneJson,
+                             const SnapshotExportOptions& options,
                              std::wstring& error) {
         Interface* ip = GetCOREInterface();
         if (!ip) {
@@ -5579,7 +5640,9 @@ public:
                 collect(node);
             }
         };
-        collect(root);
+        if (options.includeSceneNodes) {
+            collect(root);
+        }
 
         outBinary.assign(std::max<size_t>(totalBytes, 4), '\0');
         BYTE* buffer = reinterpret_cast<BYTE*>(outBinary.data());
@@ -5671,20 +5734,30 @@ public:
             hdriUrl = MapTexturePath(envData.hdriPath);
         }
 
-        ss << L",";
-        WriteEnvJson(ss, envData, hdriUrl);
+        if (options.includeEnvironment) {
+            ss << L",";
+            WriteEnvJson(ss, envData, hdriUrl);
+        }
 
         FogData fogData;
         GetFogData(fogData);
-        ss << L",";
-        WriteFogJson(ss, fogData);
-        ss << L",";
-        WriteLightsJson(ss, ip, t, true, false, false);
-        ss << L",";
-        WriteSplatsJson(ss, ip, t, true, false, false);
-        WriteSnapshotAnimationsJson(ss, nodes, ip, t, outAnimBinary);
+        if (options.includeFog) {
+            ss << L",";
+            WriteFogJson(ss, fogData);
+        }
+        if (options.includeLights) {
+            ss << L",";
+            WriteLightsJson(ss, ip, t, true, false, false);
+        }
+        if (options.includeSplats) {
+            ss << L",";
+            WriteSplatsJson(ss, ip, t, true, false, false);
+        }
+        if (options.includeAnimations) {
+            WriteSnapshotAnimationsJson(ss, nodes, ip, t, options, outAnimBinary);
+        }
 
-        {
+        if (options.includeInstances) {
             std::vector<ForestInstanceGroup> allInstGroups;
             std::function<void(INode*)> collectInstances = [&](INode* parent) {
                 for (int c = 0; c < parent->NumberOfChildren(); ++c) {
@@ -5731,10 +5804,10 @@ public:
             }
         }
 
-        if (!snapshotUiJson.empty()) {
+        if (options.includeSnapshotUi && !snapshotUiJson.empty()) {
             ss << L",\"snapshotUi\":" << snapshotUiJson;
         }
-        if (!runtimeSceneJson.empty()) {
+        if (options.includeRuntimeScene && !runtimeSceneJson.empty()) {
             ss << L",\"runtimeScene\":" << runtimeSceneJson;
         }
 
@@ -5745,6 +5818,7 @@ public:
 
     bool ExportSnapshotSite(const std::wstring& snapshotUiJson,
                             const std::wstring& runtimeSceneJson,
+                            const SnapshotExportOptions& options,
                             std::wstring& outDir,
                             std::wstring& error) {
         const std::wstring webDir = GetWebDir();
@@ -5773,12 +5847,12 @@ public:
         std::wstring metaJson;
         std::string binary;
         std::string animBinary;
-        if (!BuildSnapshotBinary(metaJson, binary, animBinary, snapshotUiJson, runtimeSceneJson, error)) {
+        if (!BuildSnapshotBinary(metaJson, binary, animBinary, snapshotUiJson, runtimeSceneJson, options, error)) {
             cleanupOnFail();
             return false;
         }
 
-        if (!RewriteSnapshotAssetUrls(metaJson, outDir, error)) {
+        if (options.copyAssets && !RewriteSnapshotAssetUrls(metaJson, outDir, error)) {
             cleanupOnFail();
             return false;
         }
@@ -6599,10 +6673,28 @@ public:
         if (type == L"snapshot_export") {
             std::wstring requestId;
             std::wstring snapshotBase64;
-            std::wstring snapshotUiJson = L"{}";
             std::wstring runtimeBase64;
-            std::wstring runtimeSceneJson;
+            SnapshotExportOptions options;
             ExtractJsonString(msg, L"requestId", requestId);
+            ExtractJsonBool(msg, L"includeSceneNodes", options.includeSceneNodes);
+            ExtractJsonBool(msg, L"includeEnvironment", options.includeEnvironment);
+            ExtractJsonBool(msg, L"includeFog", options.includeFog);
+            ExtractJsonBool(msg, L"includeLights", options.includeLights);
+            ExtractJsonBool(msg, L"includeSplats", options.includeSplats);
+            ExtractJsonBool(msg, L"includeInstances", options.includeInstances);
+            ExtractJsonBool(msg, L"includeSnapshotUi", options.includeSnapshotUi);
+            ExtractJsonBool(msg, L"includeRuntimeScene", options.includeRuntimeScene);
+            ExtractJsonBool(msg, L"copyAssets", options.copyAssets);
+            ExtractJsonBool(msg, L"includeAnimations", options.includeAnimations);
+            ExtractJsonBool(msg, L"includeTransformAnimation", options.includeTransformAnimation);
+            ExtractJsonBool(msg, L"includeGeometryAnimation", options.includeGeometryAnimation);
+            ExtractJsonBool(msg, L"includeMaterialAnimation", options.includeMaterialAnimation);
+            ExtractJsonBool(msg, L"includeCameraAnimation", options.includeCameraAnimation);
+            ExtractJsonInt(msg, L"animationSampleStepFrames", options.animationSampleStepFrames);
+            NormalizeSnapshotExportOptions(options);
+
+            std::wstring snapshotUiJson = options.includeSnapshotUi ? L"{}" : L"";
+            std::wstring runtimeSceneJson;
             if (ExtractJsonString(msg, L"snapshotBase64", snapshotBase64) && !snapshotBase64.empty()) {
                 std::string decoded;
                 if (!DecodeBase64Wide(snapshotBase64, decoded)) {
@@ -6623,7 +6715,7 @@ public:
 
             std::wstring exportPath;
             std::wstring error;
-            const bool ok = ExportSnapshotSite(snapshotUiJson, runtimeSceneJson, exportPath, error);
+            const bool ok = ExportSnapshotSite(snapshotUiJson, runtimeSceneJson, options, exportPath, error);
             SendHostActionResult(type, requestId, ok, error, exportPath);
             return;
         }

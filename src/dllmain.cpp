@@ -7325,16 +7325,6 @@ public:
             if (!IsTrackedHandle(handle)) continue;
             if (skinnedHandles_.count(handle)) continue;
 
-            ObjectState os = node->EvalWorldState(t);
-            if (os.obj && os.obj->SuperClassID() == GEOMOBJECT_CLASS_ID) {
-                const uint64_t validKey = MakeGeomValidityKey(os.obj->ChannelValidity(t, GEOM_CHAN_NUM));
-                auto bboxIt = lastBBoxHash_.find(handle);
-                if (bboxIt != lastBBoxHash_.end() && bboxIt->second == validKey) {
-                    continue;
-                }
-                lastBBoxHash_[handle] = validKey;
-            }
-
             // Match DetectGeometryChanges / geo_fast payload: include UVs (HashNodeGeometryState omits them).
             uint64_t geomHash = 0;
             if (!TryHashExtractedRenderableGeometry(node, t, geomHash))
@@ -8613,26 +8603,12 @@ public:
             INode* node = ip->GetINodeByHandle(handle);
             if (node) {
                 if (!geoFastDirtyHandles_.count(handle) && !skinnedHandles_.count(handle)) {
-                    ObjectState os = node->EvalWorldState(t);
-                    bool needsHashCheck = true;
-                    if (os.obj && os.obj->SuperClassID() == GEOMOBJECT_CLASS_ID) {
-                        const uint64_t validKey = MakeGeomValidityKey(os.obj->ChannelValidity(t, GEOM_CHAN_NUM));
-                        auto bboxIt = lastBBoxHash_.find(handle);
-                        if (bboxIt != lastBBoxHash_.end() && bboxIt->second == validKey) {
-                            needsHashCheck = false;
-                        } else {
-                            lastBBoxHash_[handle] = validKey;
-                        }
-                    }
-
-                    if (needsHashCheck) {
-                        uint64_t hash = 0;
-                        if (TryHashExtractedRenderableGeometry(node, t, hash)) {
-                            auto it = geoHashMap_.find(handle);
-                            if (it == geoHashMap_.end() || it->second != hash) {
-                                SetDirty();
-                                return;
-                            }
+                    uint64_t hash = 0;
+                    if (TryHashExtractedRenderableGeometry(node, t, hash)) {
+                        auto it = geoHashMap_.find(handle);
+                        if (it == geoHashMap_.end() || it->second != hash) {
+                            SetDirty();
+                            return;
                         }
                     }
                 }

@@ -873,23 +873,77 @@ export function createLayerManager({
         return layers.get(id)?.code ?? null;
     }
 
-    function buildSnapshotRootJson(name, selectGroup) {
-        const root = new THREE.Group();
-        root.name = name;
+    function isDescendantOf(obj, ancestor) {
+        let p = obj;
+        while (p) {
+            if (p === ancestor) return true;
+            p = p.parent;
+        }
+        return false;
+    }
 
-        let hasChildren = false;
-        for (const layer of layers.values()) {
-            const group = selectGroup(layer);
-            if (!group?.isObject3D || group.children.length === 0) continue;
-            root.add(group.clone(true));
-            hasChildren = true;
+    /** Max-bridge meshes currently hidden in the viewport (e.g. jsmod layers show JS clones instead). */
+    function collectHiddenMaxSyncHandles() {
+        if (!maxRoot) return [];
+        const out = [];
+        for (const [handle, obj] of nodeMap.entries()) {
+            if (!obj?.isObject3D) continue;
+            if (!isDescendantOf(obj, maxRoot)) continue;
+            const drawable = obj.isMesh || obj.isLine || obj.isLineSegments;
+            if (!drawable) continue;
+            if (!obj.visible) out.push(handle);
+        }
+        return out;
+    }
+
+    /** Meshes driven by three.js Deform (jsmod); snapshot embeds JS clones under jsRoot — always hide these Max copies when jsRoot is present. */
+    function collectJsmodMaxSyncHandles() {
+        if (!maxRoot) return [];
+        const out = [];
+        for (const [handle, obj] of nodeMap.entries()) {
+            if (!obj?.isObject3D) continue;
+            if (!isDescendantOf(obj, maxRoot)) continue;
+            const drawable = obj.isMesh || obj.isLine || obj.isLineSegments;
+            if (!drawable) continue;
+            if (obj.userData?.jsmod) out.push(handle);
+        }
+        return out;
+    }
+
+    /**
+     * Snapshot everything under a runtime world root (all layer groups + any future direct children),
+     * plus tracked Object3Ds that are not already in that subtree (e.g. ctx.track only).
+     */
+    function buildRuntimeSubtreeJson(worldRoot, snapshotName, trackedOwnerFilter) {
+        const snapshot = new THREE.Group();
+        snapshot.name = snapshotName;
+
+        if (worldRoot?.isObject3D) {
+            for (const child of worldRoot.children) {
+                if (!child?.isObject3D) continue;
+                if (child.userData?.maxjsExcludeFromRuntimeSnapshot) continue;
+                snapshot.add(child.clone(true));
+            }
         }
 
-        return hasChildren ? root.toJSON() : null;
+        if (trackedOwnerFilter != null) {
+            for (const layer of layers.values()) {
+                for (const t of layer.tracked) {
+                    if (!t?.isObject3D) continue;
+                    if (getOwner(t) !== trackedOwnerFilter) continue;
+                    if (isDescendantOf(t, worldRoot)) continue;
+                    snapshot.add(t.clone(true));
+                }
+            }
+        }
+
+        return snapshot.children.length > 0 ? snapshot.toJSON() : null;
     }
 
     function serializeSnapshot() {
-        return {
+        const jsRoot = buildRuntimeSubtreeJson(jsWorldRoot, '__maxjs_snapshot_js_root__', OWNER_JS);
+        const overlayRoot = buildRuntimeSubtreeJson(overlayWorldRoot, '__maxjs_snapshot_overlay_root__', OWNER_OVERLAY);
+        const payload = {
             version: 1,
             layers: [...layers.values()].map(layer => ({
                 id: layer.id,
@@ -898,9 +952,17 @@ export function createLayerManager({
                 active: layer.active,
                 error: layer.error,
             })),
-            jsRoot: buildSnapshotRootJson('__maxjs_snapshot_js_root__', layer => layer.group),
-            overlayRoot: buildSnapshotRootJson('__maxjs_snapshot_overlay_root__', layer => layer.overlayGroup),
+            jsRoot,
+            overlayRoot,
         };
+        if (jsRoot || overlayRoot) {
+            const hidden = new Set(collectHiddenMaxSyncHandles());
+            if (jsRoot) {
+                for (const h of collectJsmodMaxSyncHandles()) hidden.add(h);
+            }
+            payload.hideMaxSyncHandles = [...hidden];
+        }
+        return payload;
     }
 
     function serialize() {

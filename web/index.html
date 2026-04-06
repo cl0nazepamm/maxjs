@@ -721,6 +721,7 @@
         // lands on Max's XY ground plane without extra rotations.
         const grid = new THREE.GridHelper(200, 20, 0x555555, 0x444444);
         grid.visible = false;
+        grid.userData.maxjsExcludeFromRuntimeSnapshot = true;
         overlayRoot.add(grid);
 
         // Lights (fallback, hidden when HDRI loads)
@@ -3976,6 +3977,13 @@
                     const runtimeSnapshot = layerManager.serializeSnapshot?.() ?? null;
                     if (runtimeSnapshot) {
                         runtimeSnapshotBase64 = toBase64Utf8(JSON.stringify(runtimeSnapshot));
+                        const layerRows = runtimeSnapshot.layers?.length ?? 0;
+                        if (layerRows > 0 && !runtimeSnapshot.jsRoot && !runtimeSnapshot.overlayRoot) {
+                            console.warn(
+                                '[MaxJS snapshot] Runtime scene has layer metadata but no serialized 3D (empty roots and no tracked orphans). '
+                                + 'Parent effects with ctx.js.add(...) / overlay:true, or ctx.track() if you attach elsewhere.',
+                            );
+                        }
                     }
                 } catch (error) {
                     reportBridgeError('snapshot serialize', error);
@@ -5376,6 +5384,14 @@
         attachLayerPanelSubscriptions();
         queueLayersPanelRefresh();
 
+        function getSyncedObjectForSnapshotHandle(h) {
+            if (nodeMap.has(h)) return nodeMap.get(h);
+            const n = typeof h === 'string' ? Number(h) : h;
+            if (Number.isFinite(n) && nodeMap.has(n)) return nodeMap.get(n);
+            if (typeof h === 'number' && nodeMap.has(String(h))) return nodeMap.get(String(h));
+            return undefined;
+        }
+
         async function loadStandaloneSnapshot() {
             if (window.chrome?.webview) return false;
             try {
@@ -5397,18 +5413,51 @@
                 }
                 handleBinaryScene(buffer, meta);
                 if (meta.runtimeScene) {
-                    const SnapshotObjectLoader = THREE.ObjectLoader || THREE_STD.ObjectLoader;
-                    const objectLoader = SnapshotObjectLoader ? new SnapshotObjectLoader() : null;
+                    const LoaderCtor = THREE.NodeObjectLoader || THREE.ObjectLoader || THREE_STD.ObjectLoader;
+                    const objectLoader = LoaderCtor ? new LoaderCtor() : null;
                     if (!objectLoader) {
                         throw new Error('Three.js ObjectLoader unavailable for snapshot runtime scene');
                     }
+                    async function parseRuntimeSubtree(json) {
+                        if (!json || typeof json !== 'object') return null;
+                        if (typeof objectLoader.parseAsync === 'function') {
+                            return objectLoader.parseAsync(json);
+                        }
+                        return objectLoader.parse(json);
+                    }
                     if (meta.runtimeScene.jsRoot) {
-                        const jsSnapshotRoot = objectLoader.parse(meta.runtimeScene.jsRoot);
-                        if (jsSnapshotRoot?.isObject3D) jsRoot.add(jsSnapshotRoot);
+                        try {
+                            const jsSnapshotRoot = await parseRuntimeSubtree(meta.runtimeScene.jsRoot);
+                            if (jsSnapshotRoot?.isObject3D) {
+                                jsSnapshotRoot.visible = true;
+                                jsRoot.add(jsSnapshotRoot);
+                                jsSnapshotRoot.updateMatrixWorld(true);
+                            }
+                        } catch (err) {
+                            console.error('[MaxJS snapshot] Failed to parse runtimeScene.jsRoot', err);
+                            throw err;
+                        }
                     }
                     if (meta.runtimeScene.overlayRoot) {
-                        const overlaySnapshotRoot = objectLoader.parse(meta.runtimeScene.overlayRoot);
-                        if (overlaySnapshotRoot?.isObject3D) overlayRoot.add(overlaySnapshotRoot);
+                        try {
+                            const overlaySnapshotRoot = await parseRuntimeSubtree(meta.runtimeScene.overlayRoot);
+                            if (overlaySnapshotRoot?.isObject3D) {
+                                overlaySnapshotRoot.visible = true;
+                                overlayRoot.add(overlaySnapshotRoot);
+                                overlaySnapshotRoot.updateMatrixWorld(true);
+                            }
+                        } catch (err) {
+                            console.error('[MaxJS snapshot] Failed to parse runtimeScene.overlayRoot', err);
+                            throw err;
+                        }
+                    }
+                    // Layers hide Max meshes and draw deformed clones under jsRoot; export still bakes Max geometry as visible.
+                    const hideHandles = meta.runtimeScene.hideMaxSyncHandles;
+                    if (Array.isArray(hideHandles) && hideHandles.length) {
+                        for (const h of hideHandles) {
+                            const m = getSyncedObjectForSnapshotHandle(h);
+                            if (m) m.visible = false;
+                        }
                     }
                 }
                 if (meta.snapshotUi) {

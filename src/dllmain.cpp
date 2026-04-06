@@ -4399,6 +4399,7 @@ public:
     std::unordered_map<ULONG, std::vector<MatGroup>> groupCache_; // cached material groups per node
     std::unordered_map<ULONG, uint64_t> propHashMap_;  // node handle → object properties hash
     std::unordered_map<ULONG, bool> jsmodStateMap_;    // node handle → last-seen three.js Deform flag
+    std::unordered_set<ULONG> skinnedHandles_;             // geom handles with Skin modifier (need geo resend on time change)
     std::unordered_set<ULONG> pluginInstHandles_;        // FP/RC/tyFlow node handles for change detection
     std::unordered_map<ULONG, uint64_t> pluginInstHash_; // plugin node → generated-instance dependency hash
 
@@ -6887,6 +6888,7 @@ public:
         tickCount_ = 0;
         geoScanCursor_ = 0;
         geomHandles_.clear();
+        skinnedHandles_.clear();
         lightHandles_.clear();
         splatHandles_.clear();
         fastDirtyHandles_.clear();
@@ -7472,6 +7474,17 @@ public:
         fastDirtyHandles_.insert(geomHandles_.begin(), geomHandles_.end());
         fastDirtyHandles_.insert(lightHandles_.begin(), lightHandles_.end());
         fastDirtyHandles_.insert(splatHandles_.begin(), splatHandles_.end());
+        QueueFastFlush();
+    }
+
+    // On time change, skinned meshes need geometry re-sent (bone deformation changes vertices)
+    void MarkSkinnedGeometryDirty() {
+        if (skinnedHandles_.empty()) return;
+        for (ULONG h : skinnedHandles_) {
+            geoFastDirtyHandles_.insert(h);
+            fastDirtyHandles_.insert(h);
+            lastLiveGeomHash_.erase(h);
+        }
         QueueFastFlush();
     }
 
@@ -9071,6 +9084,7 @@ public:
 
         std::unordered_set<ULONG> prevGeom = std::move(geomHandles_);
         geomHandles_.clear();
+        skinnedHandles_.clear();
         lightHandles_.clear();
         splatHandles_.clear();
         pluginInstHandles_.clear();
@@ -9276,6 +9290,7 @@ public:
                 ss << L'}';
                 first = false;
                 geomHandles_.insert(handle);
+                if (FindModifierOnNode(node, SKIN_CLASSID)) skinnedHandles_.insert(handle);
             } else {
                 std::vector<float> verts, uvs, norms;
                 std::vector<int> indices;
@@ -9345,6 +9360,7 @@ public:
                     ss << L'}';
                     first = false;
                     geomHandles_.insert(handle);
+                    if (FindModifierOnNode(node, SKIN_CLASSID)) skinnedHandles_.insert(handle);
                 }
             }
 
@@ -9371,6 +9387,7 @@ public:
         // Save previous tracking so we can skip extraction for unchanged nodes
         std::unordered_set<ULONG> prevGeom = std::move(geomHandles_);
         geomHandles_.clear();
+        skinnedHandles_.clear();
         lightHandles_.clear();
         splatHandles_.clear();
         pluginInstHandles_.clear();
@@ -9487,6 +9504,7 @@ public:
                     }
                     geos.push_back(std::move(ng));
                     geomHandles_.insert(node->GetHandle());
+                    if (FindModifierOnNode(node, SKIN_CLASSID)) skinnedHandles_.insert(node->GetHandle());
                 } else {
                     bool extracted = ExtractMesh(node, t, ng.verts, ng.uvs, ng.indices, ng.groups, &ng.norms);
                     if (!extracted && os.obj && os.obj->SuperClassID() == SHAPE_CLASS_ID) {
@@ -9530,6 +9548,7 @@ public:
                     }
                     geos.push_back(std::move(ng));
                     geomHandles_.insert(node->GetHandle());
+                    if (FindModifierOnNode(node, SKIN_CLASSID)) skinnedHandles_.insert(node->GetHandle());
                 }
                 collect(node);
             }
@@ -10131,6 +10150,7 @@ public:
         fastDirtyHandles_.clear();
         lastSentTransforms_.clear();
         geomHandles_.clear();
+        skinnedHandles_.clear();
         lightHandles_.clear();
         splatHandles_.clear();
         mtlHashMap_.clear();
@@ -10236,6 +10256,7 @@ void MaxJSFastTimeChangeCallback::TimeChanged(TimeValue) {
     if (!owner_) return;
     owner_->MarkAllTrackedNodesDirty();
     owner_->MarkCameraDirty();
+    owner_->MarkSkinnedGeometryDirty();
 }
 
 static void OnSceneChanged(void* param, NotifyInfo*) {

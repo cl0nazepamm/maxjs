@@ -2,7 +2,7 @@
 
 This file records how realtime sync currently works in MaxJS and what was changed to make it reliable for live editing.
 
-Date: 2026-04-02
+Date: 2026-04-07
 
 ## Goal
 
@@ -141,7 +141,8 @@ This is what removes the "wait for timer cadence" feeling during interaction.
 
 `MaxJSFastTimeChangeCallback`
 
-Used to keep animated playback responsive.
+Marks all tracked node transforms dirty and camera dirty on timeline scrub or playback.
+Does not extract or hash geometry — that stays on the redraw callback path.
 
 ### Background timer
 
@@ -386,52 +387,34 @@ Use full sync for:
 
 ### 1. Live Editable Poly geometry sync
 
-Committed as:
-
 - `84a1458` `Add live Editable Poly geometry sync`
-
-What changed:
-
-- added direct live Editable Poly and Edit Poly mesh extraction
-- replaced validity-interval geometry detection with actual mesh hashing for redraw-driven live edit detection
-- routed changed meshes through `geo_fast`
-
-Result:
-
-- realtime vertex movement and mesh edits now work for:
-  - base Editable Poly
-  - top-of-stack Edit Poly
+- direct live Editable Poly and Edit Poly mesh extraction
+- actual mesh hashing replaces validity-interval detection
+- changed meshes route through `geo_fast`
 
 ### 2. Realtime material scalar sync
 
-Committed as:
-
 - `8749cf5` `Add realtime material scalar sync`
-
-What changed:
-
-- split material detection into scalar vs structural
-- added material scalar dirty bookkeeping
-- routed scalar-only material changes into fast delta sync
-- kept structural changes on full sync
-- extended scalar preview extraction to cover Physical materials through the general PBR path
-
-Result:
-
-- live material sliders for common scalar properties update without full scene rebuild
+- scalar vs structural material split
+- scalar-only changes go through fast delta sync
+- Physical materials through the general PBR path
 
 ### 3. Redraw-driven lag removal
-
-Working tree changes after the commits above:
 
 - redraw-driven live light hash checks
 - redraw-driven live material scalar checks
 - rich native ThreeJS material fast patching via `mat_fast`
 
-Why:
+### 4. Sync cleanup (38f09c4)
 
-- the timer cadence was good enough for correctness but still felt slightly laggy
-- redraw-driven checks make the UI feel immediate during interaction
+Removed broken optimizations that were added between `9a66ccf` and `1d0468d` and caused choppy interactive editing:
+
+- removed 200ms throttle on `CheckSelectedGeometryLive` (`ShouldThrottleSelectedGeometryProbe`, `kThrottleMs`)
+- removed `IsAnimPlaying()` early bail from `CheckSelectedGeometryLive`
+- removed `CheckTrackedGeometryLive()` which hashed every tracked mesh on every `TimeChanged` frame
+- restored 150ms debounce on full sync (`DIRTY_DEBOUNCE_MS`, `dirtyStamp_`)
+
+The clean design: `CheckSelectedGeometryLive` runs on every redraw with no throttle. Time change marks transforms dirty but does not extract geometry. Full sync debounces rapid-fire structural events.
 
 ## Known Limitations
 
@@ -466,6 +449,15 @@ Why:
 - Prefer redraw-driven checks for anything the user manipulates interactively.
   Timer polling is a fallback, not the primary interaction path.
 
+- Never throttle the redraw geometry probe.
+  `CheckSelectedGeometryLive` must run unconditionally on every redraw. Throttling it causes visible chop.
+
+- Never extract geometry in the time change callback.
+  `TimeChanged` must only mark dirty flags. Extraction belongs in the redraw callback or the timer fallback.
+
+- Keep the full sync debounce.
+  Rapid-fire `SetDirty` calls (clone, undo, structural notifications) must coalesce into one full sync, not fire individually every 33ms.
+
 ## If Realtime Sync Breaks Again
 
 Check these first:
@@ -475,3 +467,17 @@ Check these first:
 3. Is the update going through the fast path or incorrectly escalating to full sync?
 4. Is the web side mutating existing objects in place or rebuilding too much?
 5. Is a timer cadence masking an otherwise-correct realtime path and making it feel laggy?
+6. Is `CheckSelectedGeometryLive` being throttled or skipped? It must run on every redraw with no guards.
+7. Is anything doing per-mesh extraction inside `TimeChanged`? That callback must only mark dirty, never extract.
+8. Is the full sync debounce missing? Without it, rapid-fire `SetDirty` calls trigger expensive full syncs every 33ms tick.
+
+### What went wrong before (lesson from 38f09c4)
+
+Three "optimizations" were added that each individually seemed reasonable but together killed interactive performance:
+
+- A 200ms throttle on selected geometry probing starved vertex edit detection
+- An `IsAnimPlaying()` bail prevented geometry checks during playback
+- A `CheckTrackedGeometryLive()` on every `TimeChanged` tried to compensate but extracted every tracked mesh per frame
+- Removing the full sync debounce made every structural notification trigger an immediate expensive rebuild
+
+The reference clean state is commit `9a66ccf`. Compare against it when in doubt.

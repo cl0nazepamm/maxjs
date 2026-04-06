@@ -7323,6 +7323,17 @@ public:
             if (!node) continue;
             ULONG handle = node->GetHandle();
             if (!IsTrackedHandle(handle)) continue;
+            if (skinnedHandles_.count(handle)) continue;
+
+            ObjectState os = node->EvalWorldState(t);
+            if (os.obj && os.obj->SuperClassID() == GEOMOBJECT_CLASS_ID) {
+                const uint64_t validKey = MakeGeomValidityKey(os.obj->ChannelValidity(t, GEOM_CHAN_NUM));
+                auto bboxIt = lastBBoxHash_.find(handle);
+                if (bboxIt != lastBBoxHash_.end() && bboxIt->second == validKey) {
+                    continue;
+                }
+                lastBBoxHash_[handle] = validKey;
+            }
 
             // Match DetectGeometryChanges / geo_fast payload: include UVs (HashNodeGeometryState omits them).
             uint64_t geomHash = 0;

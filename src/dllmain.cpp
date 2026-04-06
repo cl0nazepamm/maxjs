@@ -4399,7 +4399,7 @@ public:
     std::unordered_map<ULONG, std::vector<MatGroup>> groupCache_; // cached material groups per node
     std::unordered_map<ULONG, uint64_t> propHashMap_;  // node handle → object properties hash
     std::unordered_map<ULONG, bool> jsmodStateMap_;    // node handle → last-seen three.js Deform flag
-    std::unordered_set<ULONG> skinnedHandles_;             // geom handles with Skin modifier (need geo resend on time change)
+    std::unordered_set<ULONG> skinnedHandles_;             // geom handles with Skin modifier
     std::unordered_set<ULONG> pluginInstHandles_;        // FP/RC/tyFlow node handles for change detection
     std::unordered_map<ULONG, uint64_t> pluginInstHash_; // plugin node → generated-instance dependency hash
 
@@ -7187,6 +7187,33 @@ public:
         if (changed) QueueFastFlush();
     }
 
+    // Same as CheckSelectedGeometryLive but for skinned meshes — runs on redraw
+    void CheckSkinnedGeometryLive() {
+        if (skinnedHandles_.empty()) return;
+        Interface* ip = GetCOREInterface();
+        if (!ip) return;
+        TimeValue t = ip->GetTime();
+
+        bool changed = false;
+        for (ULONG handle : skinnedHandles_) {
+            if (geoFastDirtyHandles_.count(handle)) continue; // already queued
+            INode* node = ip->GetINodeByHandle(handle);
+            if (!node) continue;
+
+            uint64_t geomHash = 0;
+            if (!TryHashExtractedRenderableGeometry(node, t, geomHash)) continue;
+            auto it = lastLiveGeomHash_.find(handle);
+            if (it != lastLiveGeomHash_.end() && it->second == geomHash) continue;
+            lastLiveGeomHash_[handle] = geomHash;
+
+            geoHashMap_.erase(handle);
+            geoFastDirtyHandles_.insert(handle);
+            fastDirtyHandles_.insert(handle);
+            changed = true;
+        }
+        if (changed) QueueFastFlush();
+    }
+
     void CheckTrackedLightsLive() {
         if (lightHandles_.empty()) return;
 
@@ -7474,17 +7501,6 @@ public:
         fastDirtyHandles_.insert(geomHandles_.begin(), geomHandles_.end());
         fastDirtyHandles_.insert(lightHandles_.begin(), lightHandles_.end());
         fastDirtyHandles_.insert(splatHandles_.begin(), splatHandles_.end());
-        QueueFastFlush();
-    }
-
-    // On time change, skinned meshes need geometry re-sent (bone deformation changes vertices)
-    void MarkSkinnedGeometryDirty() {
-        if (skinnedHandles_.empty()) return;
-        for (ULONG h : skinnedHandles_) {
-            geoFastDirtyHandles_.insert(h);
-            fastDirtyHandles_.insert(h);
-            lastLiveGeomHash_.erase(h);
-        }
         QueueFastFlush();
     }
 
@@ -10250,13 +10266,13 @@ void MaxJSFastRedrawCallback::proc(Interface*) {
     owner_->PollViewportModes();
     owner_->MarkCameraDirtyIfChanged();
     owner_->CheckSelectedGeometryLive();
+    owner_->CheckSkinnedGeometryLive();
 }
 
 void MaxJSFastTimeChangeCallback::TimeChanged(TimeValue) {
     if (!owner_) return;
     owner_->MarkAllTrackedNodesDirty();
     owner_->MarkCameraDirty();
-    owner_->MarkSkinnedGeometryDirty();
 }
 
 static void OnSceneChanged(void* param, NotifyInfo*) {

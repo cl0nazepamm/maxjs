@@ -53,6 +53,7 @@
 #include <cmath>
 #include <cwctype>
 #include <locale>
+#include <immintrin.h>
 
 using namespace Microsoft::WRL;
 
@@ -2378,6 +2379,80 @@ static uint64_t HashMaterialScalarPreviewValues(const float col[3], float rough,
 }
 
 // ══════════════════════════════════════════════════════════════
+//  SSE SIMD helpers for vertex/normal processing
+// ══════════════════════════════════════════════════════════════
+
+// Cross product of two Point3 vectors using SSE
+// (b-a) x (c-a), returned as Point3
+static __forceinline Point3 CrossProductSSE(const Point3& a, const Point3& b, const Point3& c) {
+    // edge1 = b - a, edge2 = c - a
+    __m128 va = _mm_set_ps(0, a.z, a.y, a.x);
+    __m128 vb = _mm_set_ps(0, b.z, b.y, b.x);
+    __m128 vc = _mm_set_ps(0, c.z, c.y, c.x);
+    __m128 e1 = _mm_sub_ps(vb, va);
+    __m128 e2 = _mm_sub_ps(vc, va);
+    // cross = (e1.y*e2.z - e1.z*e2.y, e1.z*e2.x - e1.x*e2.z, e1.x*e2.y - e1.y*e2.x)
+    __m128 e1_yzx = _mm_shuffle_ps(e1, e1, _MM_SHUFFLE(3, 0, 2, 1));
+    __m128 e2_yzx = _mm_shuffle_ps(e2, e2, _MM_SHUFFLE(3, 0, 2, 1));
+    __m128 cross = _mm_sub_ps(_mm_mul_ps(e1, e2_yzx), _mm_mul_ps(e1_yzx, e2));
+    cross = _mm_shuffle_ps(cross, cross, _MM_SHUFFLE(3, 0, 2, 1));
+    float out[4];
+    _mm_storeu_ps(out, cross);
+    return Point3(out[0], out[1], out[2]);
+}
+
+// Normalize a Point3 using SSE rsqrt + Newton-Raphson refinement
+static __forceinline Point3 NormalizeSSE(const Point3& v) {
+    __m128 vec = _mm_set_ps(0, v.z, v.y, v.x);
+    __m128 dot = _mm_mul_ps(vec, vec);
+    // horizontal sum: x*x + y*y + z*z
+    __m128 shuf = _mm_shuffle_ps(dot, dot, _MM_SHUFFLE(0, 0, 0, 1));
+    dot = _mm_add_ss(dot, shuf);
+    shuf = _mm_shuffle_ps(dot, dot, _MM_SHUFFLE(0, 0, 0, 2));
+    dot = _mm_add_ss(dot, shuf);
+    dot = _mm_shuffle_ps(dot, dot, _MM_SHUFFLE(0, 0, 0, 0));
+    // rsqrt + one Newton-Raphson iteration for accuracy
+    __m128 rsq = _mm_rsqrt_ps(dot);
+    __m128 half = _mm_set1_ps(0.5f);
+    __m128 three = _mm_set1_ps(3.0f);
+    rsq = _mm_mul_ps(_mm_mul_ps(half, rsq),
+                     _mm_sub_ps(three, _mm_mul_ps(dot, _mm_mul_ps(rsq, rsq))));
+    // guard against zero-length
+    __m128 mask = _mm_cmpgt_ps(dot, _mm_set1_ps(1e-30f));
+    rsq = _mm_and_ps(rsq, mask);
+    __m128 result = _mm_mul_ps(vec, rsq);
+    float out[4];
+    _mm_storeu_ps(out, result);
+    return Point3(out[0], out[1], out[2]);
+}
+
+// Batch normalize an array of Point3 (as float triplets) in-place
+static void BatchNormalizeSSE(float* data, size_t count) {
+    for (size_t i = 0; i < count; i++) {
+        __m128 vec = _mm_set_ps(0, data[i * 3 + 2], data[i * 3 + 1], data[i * 3]);
+        __m128 dot = _mm_mul_ps(vec, vec);
+        __m128 shuf = _mm_shuffle_ps(dot, dot, _MM_SHUFFLE(0, 0, 0, 1));
+        dot = _mm_add_ss(dot, shuf);
+        shuf = _mm_shuffle_ps(dot, dot, _MM_SHUFFLE(0, 0, 0, 2));
+        dot = _mm_add_ss(dot, shuf);
+        dot = _mm_shuffle_ps(dot, dot, _MM_SHUFFLE(0, 0, 0, 0));
+        __m128 rsq = _mm_rsqrt_ps(dot);
+        __m128 half = _mm_set1_ps(0.5f);
+        __m128 three = _mm_set1_ps(3.0f);
+        rsq = _mm_mul_ps(_mm_mul_ps(half, rsq),
+                         _mm_sub_ps(three, _mm_mul_ps(dot, _mm_mul_ps(rsq, rsq))));
+        __m128 mask = _mm_cmpgt_ps(dot, _mm_set1_ps(1e-30f));
+        rsq = _mm_and_ps(rsq, mask);
+        __m128 result = _mm_mul_ps(vec, rsq);
+        _mm_store_ss(&data[i * 3], result);
+        result = _mm_shuffle_ps(result, result, _MM_SHUFFLE(0, 0, 0, 1));
+        _mm_store_ss(&data[i * 3 + 1], result);
+        result = _mm_shuffle_ps(result, result, _MM_SHUFFLE(0, 0, 0, 1));
+        _mm_store_ss(&data[i * 3 + 2], result);
+    }
+}
+
+// ══════════════════════════════════════════════════════════════
 //  Mesh Extraction with UV coordinates + Multi/Sub material groups
 // ══════════════════════════════════════════════════════════════
 
@@ -2441,15 +2516,13 @@ static bool ExtractMeshFromMNMesh(MNMesh& mn,
             [](const FaceRef& a, const FaceRef& b) { return a.matID < b.matID; });
     }
 
-    // Compute face normals for all live faces
+    // Compute face normals for all live faces (SSE cross product + normalize)
     std::vector<Point3> faceNormals(numFaces, Point3(0, 0, 0));
     for (auto& fr : liveFaces) {
         MNFace* face = mn.F(fr.idx);
         if (face->deg < 3) continue;
-        Point3 a = mn.P(face->vtx[0]);
-        Point3 b = mn.P(face->vtx[1]);
-        Point3 c = mn.P(face->vtx[2]);
-        faceNormals[fr.idx] = Normalize((b - a) ^ (c - a));
+        Point3 cross = CrossProductSSE(mn.P(face->vtx[0]), mn.P(face->vtx[1]), mn.P(face->vtx[2]));
+        faceNormals[fr.idx] = NormalizeSSE(cross);
     }
 
     // Build per-vertex smooth normals respecting smoothing groups (bitwise).
@@ -2490,7 +2563,7 @@ static bool ExtractMeshFromMNMesh(MNMesh& mn,
                         accum += other.normal;
                 }
             }
-            smoothNormals[{ posIdx, fn.faceIdx }] = Normalize(accum);
+            smoothNormals[{ posIdx, fn.faceIdx }] = NormalizeSSE(accum);
         }
     }
 
@@ -2885,8 +2958,17 @@ static void GetTransform16(INode* node, TimeValue t, float out[16]) {
 }
 
 static bool TransformEquals16(const float* a, const float* b, float epsilon = 1.0e-4f) {
-    for (int i = 0; i < 16; ++i) {
-        if (std::fabs(a[i] - b[i]) > epsilon) return false;
+    // SSE: compare 4 floats at a time (4 iterations for 16 floats)
+    __m128 eps = _mm_set1_ps(epsilon);
+    for (int i = 0; i < 16; i += 4) {
+        __m128 va = _mm_loadu_ps(a + i);
+        __m128 vb = _mm_loadu_ps(b + i);
+        __m128 diff = _mm_sub_ps(va, vb);
+        // abs(diff): clear sign bit
+        __m128 absDiff = _mm_andnot_ps(_mm_set1_ps(-0.0f), diff);
+        // if any component > epsilon, not equal
+        if (_mm_movemask_ps(_mm_cmpgt_ps(absDiff, eps)) != 0)
+            return false;
     }
     return true;
 }

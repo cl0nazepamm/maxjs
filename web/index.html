@@ -3067,6 +3067,28 @@
             applyForestInstances(meta.forestInstances);
             applyVolumes(meta.volumes);
             scene.updateMatrixWorld(true);
+            // Recalculate skeleton boneInverses now that skinned meshes are
+            // in the scene hierarchy (under maxBasisRoot). Without this,
+            // boneInverses miss the Z→Y basis conversion and animation
+            // deltas are applied in the wrong coordinate space.
+            for (const mesh of nodeMap.values()) {
+                if (mesh?.isSkinnedMesh && mesh.skeleton) {
+                    mesh.skeleton.calculateInverses();
+                    mesh.bind(mesh.skeleton, mesh.matrixWorld);
+                    // Debug: dump skeleton state
+                    const sk = mesh.skeleton;
+                    for (let i = 0; i < Math.min(sk.bones.length, 5); i++) {
+                        const b = sk.bones[i];
+                        const inv = sk.boneInverses[i];
+                        console.log(`[SKEL ${i}] ${b.name} parent=${b.parent?.name}`,
+                            'pos', b.position.toArray().map(v=>+v.toFixed(3)),
+                            'mW', b.matrixWorld.elements.slice(12,15).map(v=>+v.toFixed(2)),
+                            'inv[12..14]', inv.elements.slice(12,15).map(v=>+v.toFixed(2)));
+                    }
+                    console.log('[SKEL] bindMatrix pos:', mesh.matrixWorld.elements.slice(12,15).map(v=>+v.toFixed(2)));
+                    console.log('[SKEL] mesh.matrix:', mesh.matrix.elements.slice(12,15).map(v=>+v.toFixed(2)));
+                }
+            }
             animationSystem?.invalidateTargets();
 
             if (firstSync && meta.nodes.length > 0) {
@@ -5416,6 +5438,7 @@
             ? { active: false, shouldBypassPostFx: false, update() {} }
             : createWebXRRuntime();
 
+        let standaloneHudFrame = 0;
         function renderFrame() {
             const frameDt = inlineClock.getDelta();
             const frameElapsed = inlineClock.getElapsedTime();
@@ -5447,6 +5470,17 @@
             }
             syncPostFxPanel();
             perfHud.updateRender(performance.now() - renderStart, renderer.info?.render, renderer.info?.memory);
+            // Standalone / snapshot viewers have no bridge sync — drive the perf HUD from the render loop.
+            if (!(window.chrome?.webview?.postMessage) && debugMode) {
+                standaloneHudFrame++;
+                updateSyncHud({
+                    transport: 'snapshot',
+                    frameId: standaloneHudFrame,
+                    producerBytes: 0,
+                    decodeMs: 0,
+                    applyMs: 0,
+                });
+            }
         }
 
         // ── JS_Inline Layer Manager ──────────────────────────
@@ -5598,14 +5632,13 @@
         });
 
         // ── Build mode / Standalone / Debug ──
-        // Build modes: 'dev' (local dev, all UI), 'release' (GitHub, no HUD/controls)
+        // Build modes: 'dev' (HUD + debug), 'release' (no HUD — e.g. static hosting)
         // Override via ?mode=dev or ?mode=release in URL
         const isStandalone = !(window.chrome?.webview?.postMessage);
         const urlMode = new URLSearchParams(location.search).get('mode');
-        const buildMode = urlMode || (isStandalone ? 'release' : 'dev');
+        const buildMode = urlMode || 'dev';
         const DEBUG_STORAGE_KEY = 'maxjs_debug';
-        let debugMode = isStandalone ? false
-            : (localStorage.getItem(DEBUG_STORAGE_KEY) ?? 'true') === 'true';
+        let debugMode = (localStorage.getItem(DEBUG_STORAGE_KEY) ?? 'true') === 'true';
         perfHud.setDebugEnabled(debugMode);
 
         async function restoreInteractiveBrowserState() {
@@ -5624,12 +5657,16 @@
         }
 
         function applyBuildMode() {
-            if (isStandalone) {
-                document.getElementById('hud').style.display = 'none';
-            } else {
-                document.getElementById('info').style.display = debugMode ? '' : 'none';
-                document.getElementById('btnDebug').classList.toggle('active', debugMode);
+            const hud = document.getElementById('hud');
+            const info = document.getElementById('info');
+            const debugBtn = document.getElementById('btnDebug');
+            if (buildMode === 'release') {
+                hud.style.display = 'none';
+                return;
             }
+            hud.style.display = '';
+            info.style.display = debugMode ? '' : 'none';
+            debugBtn.classList.toggle('active', debugMode);
         }
 
         function setDebugMode(enabled) {
@@ -5643,7 +5680,9 @@
             void bootStandaloneSnapshot();
         } else {
             void restoreInteractiveBrowserState();
-            // Debug toggle in Max — hides HUD/controls for clean viewport
+        }
+
+        if (buildMode !== 'release') {
             const debugBtn = document.getElementById('btnDebug');
             debugBtn.style.display = '';
             debugBtn.onclick = () => setDebugMode(!debugMode);

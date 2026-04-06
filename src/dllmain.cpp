@@ -3238,11 +3238,8 @@ static bool TryExtractSkinRigData(
             if (pi >= 0 && pi < numBones && boneNodes[static_cast<size_t>(pi)]) {
                 memcpy(parentWorld, &boneWorld[static_cast<size_t>(pi) * 16u], sizeof(float) * 16);
             } else {
-                INode* par = bn->GetParentNode();
-                if (par)
-                    GetTransform16(par, t, parentWorld);
-                else
-                    Mat4IdentityCM(parentWorld);
+                // Root bone: parent in Three.js is the SkinnedMesh → use mesh node transform
+                GetTransform16(meshNode, t, parentWorld);
             }
             float invParent[16];
             if (!InvertMat4CM(parentWorld, invParent))

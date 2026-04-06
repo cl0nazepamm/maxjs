@@ -5538,8 +5538,7 @@
                                 jsSnapshotRoot.updateMatrixWorld(true);
                             }
                         } catch (err) {
-                            console.error('[MaxJS snapshot] Failed to parse runtimeScene.jsRoot', err);
-                            throw err;
+                            console.warn('[MaxJS snapshot] runtimeScene.jsRoot parse failed (non-fatal)', err);
                         }
                     }
                     if (meta.runtimeScene.overlayRoot) {
@@ -5551,8 +5550,7 @@
                                 overlaySnapshotRoot.updateMatrixWorld(true);
                             }
                         } catch (err) {
-                            console.error('[MaxJS snapshot] Failed to parse runtimeScene.overlayRoot', err);
-                            throw err;
+                            console.warn('[MaxJS snapshot] runtimeScene.overlayRoot parse failed (non-fatal)', err);
                         }
                     }
                     // Layers hide Max meshes and draw deformed clones under jsRoot; export still bakes Max geometry as visible.
@@ -5602,7 +5600,7 @@
         // ── Build mode / Standalone / Debug ──
         // Build modes: 'dev' (local dev, all UI), 'release' (GitHub, no HUD/controls)
         // Override via ?mode=dev or ?mode=release in URL
-        const isStandalone = !window.chrome?.webview;
+        const isStandalone = !(window.chrome?.webview?.postMessage);
         const urlMode = new URLSearchParams(location.search).get('mode');
         const buildMode = urlMode || (isStandalone ? 'release' : 'dev');
         const DEBUG_STORAGE_KEY = 'maxjs_debug';

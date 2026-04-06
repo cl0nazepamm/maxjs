@@ -2488,7 +2488,8 @@ static bool ExtractMeshFromMNMesh(MNMesh& mn,
                                   std::vector<float>& uvs,
                                   std::vector<int>& indices,
                                   std::vector<MatGroup>& groups,
-                                  std::vector<float>* outNormals = nullptr) {
+                                  std::vector<float>* outNormals = nullptr,
+                                  std::vector<int>* outControlIdx = nullptr) {
     const int numFaces = mn.FNum();
     const int numVerts = mn.VNum();
     if (numFaces == 0 || numVerts == 0) return false;
@@ -2578,6 +2579,7 @@ static bool ExtractMeshFromMNMesh(MNMesh& mn,
     indices.reserve(estTris * 3);
     std::vector<float> normals;
     if (outNormals) normals.reserve(numVerts * 3);
+    if (outControlIdx) outControlIdx->clear();
 
     std::unordered_map<MeshCornerKey, int, MeshCornerKeyHash> vertMap;
     Tab<int> triTab;
@@ -2639,6 +2641,7 @@ static bool ExtractMeshFromMNMesh(MNMesh& mn,
                         uvs.push_back(0.0f);
                     }
 
+                    if (outControlIdx) outControlIdx->push_back(static_cast<int>(posIdx));
                     indices.push_back(newIdx);
                 }
             }
@@ -2654,7 +2657,8 @@ static bool ExtractMeshFromTriObject(TriObject* tri, Object* srcObj,
                                      std::vector<float>& verts,
                                      std::vector<float>& uvs,
                                      std::vector<int>& indices,
-                                     std::vector<MatGroup>& groups) {
+                                     std::vector<MatGroup>& groups,
+                                     std::vector<int>* outControlIdx = nullptr) {
     Mesh& mesh = tri->GetMesh();
     int nv = mesh.getNumVerts();
     int nf = mesh.getNumFaces();
@@ -2684,6 +2688,7 @@ static bool ExtractMeshFromTriObject(TriObject* tri, Object* srcObj,
     verts.reserve(nv * 3);
     if (hasUVs) uvs.reserve(nv * 2);
     indices.reserve(nf * 3);
+    if (outControlIdx) outControlIdx->clear();
 
     int curMatID = -1;
     for (int fi = 0; fi < nf; fi++) {
@@ -2718,6 +2723,7 @@ static bool ExtractMeshFromTriObject(TriObject* tri, Object* srcObj,
                     uvs.push_back(uv.y);
                 }
 
+                if (outControlIdx) outControlIdx->push_back(static_cast<int>(posIdx));
                 indices.push_back(newIdx);
             }
         }
@@ -2905,9 +2911,10 @@ static bool ExtractMesh(INode* node, TimeValue t,
                         std::vector<float>& uvs,
                         std::vector<int>& indices,
                         std::vector<MatGroup>& groups,
-                        std::vector<float>* normals = nullptr) {
+                        std::vector<float>* normals = nullptr,
+                        std::vector<int>* controlIdx = nullptr) {
     if (MNMesh* liveMN = TryGetLiveEditablePolyMesh(node)) {
-        return ExtractMeshFromMNMesh(*liveMN, verts, uvs, indices, groups, normals);
+        return ExtractMeshFromMNMesh(*liveMN, verts, uvs, indices, groups, normals, controlIdx);
     }
 
     ObjectState os = node->EvalWorldState(t);
@@ -2918,7 +2925,7 @@ static bool ExtractMesh(INode* node, TimeValue t,
     if (os.obj->IsSubClassOf(polyObjectClassID)) {
         PolyObject* poly = static_cast<PolyObject*>(os.obj);
         MNMesh& mn = poly->GetMesh();
-        return ExtractMeshFromMNMesh(mn, verts, uvs, indices, groups, normals);
+        return ExtractMeshFromMNMesh(mn, verts, uvs, indices, groups, normals, controlIdx);
     }
 
     // Fallback: convert to TriObject for non-poly geometry (primitives, patches, etc.)
@@ -2926,7 +2933,7 @@ static bool ExtractMesh(INode* node, TimeValue t,
     TriObject* tri = static_cast<TriObject*>(
         os.obj->ConvertToType(t, Class_ID(TRIOBJ_CLASS_ID, 0)));
     if (!tri) return false;
-    return ExtractMeshFromTriObject(tri, os.obj, verts, uvs, indices, groups);
+    return ExtractMeshFromTriObject(tri, os.obj, verts, uvs, indices, groups, controlIdx);
 }
 
 static bool TryHashExtractedRenderableGeometry(INode* node, TimeValue t, uint64_t& outHash) {
@@ -3122,32 +3129,38 @@ static bool TryExtractSkinRigData(
     outMorphDeltas.clear();
 
     Modifier* skinMod = FindModifierOnNode(meshNode, SKIN_CLASSID);
-    if (!skinMod) return false;
+    Modifier* morphMod = FindModifierOnNode(meshNode, MR3_CLASS_ID);
 
-    const int morphIdx = FindModifierStackIndexOnNode(meshNode, MR3_CLASS_ID);
-    const int skinIdx = FindModifierStackIndexOnNode(meshNode, SKIN_CLASSID);
-    if (morphIdx >= 0 && skinIdx >= 0 && morphIdx > skinIdx) {
-        // Morpher above Skin — vertex/bind data order does not match our skin extraction path.
-        return false;
+    // Need at least Skin or Morpher
+    if (!skinMod && !morphMod) return false;
+
+    ISkin* skin = nullptr;
+    if (skinMod) {
+        skin = static_cast<ISkin*>(skinMod->GetInterface(I_SKIN));
+        if (!skin) skinMod = nullptr;  // Skin interface unavailable, treat as no-skin
     }
 
-    ISkin* skin = static_cast<ISkin*>(skinMod->GetInterface(I_SKIN));
-    if (!skin) return false;
-
-    skinMod->DisableMod();
+    // Disable Skin (keep Morpher active) so bind pose matches Skin's expected topology.
+    // Extract with controlIdx mapping so split render vertices map back to control vertices
+    // (needed for skin weight lookup when ExtractMesh splits verts by UV/smoothing).
+    if (skinMod) skinMod->DisableMod();
     std::vector<float> bindVerts, bindUvs, bindNorms;
-    std::vector<int> bindIdx;
+    std::vector<int> bindIdx, controlIdx;
     std::vector<MatGroup> bindGroups;
-    const bool bindOk = ExtractMesh(meshNode, t, bindVerts, bindUvs, bindIdx, bindGroups, &bindNorms);
-    skinMod->EnableMod();
+    bool bindOk = false;
+    if (skinMod) {
+        bindOk = ExtractMesh(meshNode, t, bindVerts, bindUvs, bindIdx, bindGroups, &bindNorms, &controlIdx);
+        skinMod->EnableMod();
+    } else {
+        // Morpher only: bind pose = mesh with Morpher off (true base shape)
+        if (morphMod) morphMod->DisableMod();
+        bindOk = ExtractMesh(meshNode, t, bindVerts, bindUvs, bindIdx, bindGroups, &bindNorms, &controlIdx);
+        if (morphMod) morphMod->EnableMod();
+    }
     if (!bindOk) return false;
 
-    ISkinContextData* skinData = skin->GetContextInterface(meshNode);
-    if (!skinData) return false;
-
-    const int nPts = skinData->GetNumPoints();
     const int vCount = static_cast<int>(bindVerts.size() / 3);
-    if (nPts != vCount || nPts <= 0) return false;
+    if (vCount <= 0) return false;
 
     verts = std::move(bindVerts);
     uvs = std::move(bindUvs);
@@ -3155,103 +3168,128 @@ static bool TryExtractSkinRigData(
     indices = std::move(bindIdx);
     groups = std::move(bindGroups);
 
-    const int numBones = skin->GetNumBones();
-    if (numBones <= 0) return false;
-
-    std::vector<INode*> boneNodes(static_cast<size_t>(numBones), nullptr);
-    outBoneHandles.resize(static_cast<size_t>(numBones));
-    std::unordered_map<ULONG, int> handleToSkinIndex;
-    for (int bi = 0; bi < numBones; bi++) {
-        INode* bn = skin->GetBone(bi);
-        boneNodes[static_cast<size_t>(bi)] = bn;
-        outBoneHandles[static_cast<size_t>(bi)] = bn ? bn->GetHandle() : 0;
-        if (bn) handleToSkinIndex[bn->GetHandle()] = bi;
-    }
-
-    outBoneParents.resize(static_cast<size_t>(numBones), -1);
-    for (int bi = 0; bi < numBones; bi++) {
-        INode* bn = boneNodes[static_cast<size_t>(bi)];
-        if (!bn) {
-            outBoneParents[static_cast<size_t>(bi)] = -1;
-            continue;
+    int numBones = 0;
+    ISkinContextData* skinData = nullptr;
+    if (skin) {
+        skinData = skin->GetContextInterface(meshNode);
+        if (skinData) {
+            const int nPts = skinData->GetNumPoints();
+            // nPts is control vertex count; vCount may be larger (split for UV/smoothing).
+            // controlIdx maps each split vertex back to its control vertex index.
+            if (static_cast<int>(controlIdx.size()) != vCount) skinData = nullptr;  // safety check
         }
-        INode* par = bn->GetParentNode();
-        if (!par) {
-            outBoneParents[static_cast<size_t>(bi)] = -1;
-            continue;
+        if (skinData) {
+            numBones = skin->GetNumBones();
+            if (numBones <= 0) skinData = nullptr;
         }
-        auto it = handleToSkinIndex.find(par->GetHandle());
-        outBoneParents[static_cast<size_t>(bi)] =
-            (it != handleToSkinIndex.end()) ? it->second : -1;
     }
+    // Skin-only mode: must have valid skin data
+    if (!morphMod && !skinData) return false;
+    // Morpher-only or Skin+Morpher: continue even without skin data
 
-    std::vector<float> boneWorld(static_cast<size_t>(numBones) * 16u);
-    for (int bi = 0; bi < numBones; bi++) {
-        INode* bn = boneNodes[static_cast<size_t>(bi)];
-        if (bn)
-            GetTransform16(bn, t, &boneWorld[static_cast<size_t>(bi) * 16u]);
-        else
-            Mat4IdentityCM(&boneWorld[static_cast<size_t>(bi) * 16u]);
-    }
-
-    outBoneBindLocal.resize(static_cast<size_t>(numBones) * 16u);
-    for (int bi = 0; bi < numBones; bi++) {
-        INode* bn = boneNodes[static_cast<size_t>(bi)];
-        if (!bn) {
-            Mat4IdentityCM(&outBoneBindLocal[static_cast<size_t>(bi) * 16u]);
-            continue;
+    // ── Skin bone/weight extraction (only if Skin modifier present) ──
+    std::vector<INode*> boneNodes;
+    if (skinData && numBones > 0) {
+        boneNodes.resize(static_cast<size_t>(numBones), nullptr);
+        outBoneHandles.resize(static_cast<size_t>(numBones));
+        std::unordered_map<ULONG, int> handleToSkinIndex;
+        for (int bi = 0; bi < numBones; bi++) {
+            INode* bn = skin->GetBone(bi);
+            boneNodes[static_cast<size_t>(bi)] = bn;
+            outBoneHandles[static_cast<size_t>(bi)] = bn ? bn->GetHandle() : 0;
+            if (bn) handleToSkinIndex[bn->GetHandle()] = bi;
         }
-        float parentWorld[16];
-        const int pi = outBoneParents[static_cast<size_t>(bi)];
-        if (pi >= 0 && pi < numBones && boneNodes[static_cast<size_t>(pi)]) {
-            memcpy(parentWorld, &boneWorld[static_cast<size_t>(pi) * 16u], sizeof(float) * 16);
-        } else {
+
+        outBoneParents.resize(static_cast<size_t>(numBones), -1);
+        for (int bi = 0; bi < numBones; bi++) {
+            INode* bn = boneNodes[static_cast<size_t>(bi)];
+            if (!bn) {
+                outBoneParents[static_cast<size_t>(bi)] = -1;
+                continue;
+            }
             INode* par = bn->GetParentNode();
-            if (par)
-                GetTransform16(par, t, parentWorld);
-            else
-                Mat4IdentityCM(parentWorld);
+            if (!par) {
+                outBoneParents[static_cast<size_t>(bi)] = -1;
+                continue;
+            }
+            auto it = handleToSkinIndex.find(par->GetHandle());
+            outBoneParents[static_cast<size_t>(bi)] =
+                (it != handleToSkinIndex.end()) ? it->second : -1;
         }
-        float invParent[16];
-        if (!InvertMat4CM(parentWorld, invParent))
-            Mat4IdentityCM(invParent);
-        MulMat4CM(invParent, &boneWorld[static_cast<size_t>(bi) * 16u], &outBoneBindLocal[static_cast<size_t>(bi) * 16u]);
-    }
 
-    outSkinW.resize(static_cast<size_t>(vCount) * 4u, 0.0f);
-    outSkinIdx.resize(static_cast<size_t>(vCount) * 4u, 0.0f);
-    std::vector<SkinWeightSortPair> pairs;
-    for (int vi = 0; vi < vCount; vi++) {
-        pairs.clear();
-        const int nb = skinData->GetNumAssignedBones(vi);
-        for (int j = 0; j < nb; j++) {
-            const int bSkin = skinData->GetAssignedBone(vi, j);
-            const float w = skinData->GetBoneWeight(vi, j);
-            if (bSkin < 0 || bSkin >= numBones || w <= 0.0f) continue;
-            SkinWeightSortPair p;
-            p.boneIdx = bSkin;
-            p.w = w;
-            pairs.push_back(p);
+        std::vector<float> boneWorld(static_cast<size_t>(numBones) * 16u);
+        for (int bi = 0; bi < numBones; bi++) {
+            INode* bn = boneNodes[static_cast<size_t>(bi)];
+            if (bn)
+                GetTransform16(bn, t, &boneWorld[static_cast<size_t>(bi) * 16u]);
+            else
+                Mat4IdentityCM(&boneWorld[static_cast<size_t>(bi) * 16u]);
         }
-        std::sort(pairs.begin(), pairs.end(), SkinWeightPairGreater);
-        float sum = 0.0f;
-        const int take = std::min(4, static_cast<int>(pairs.size()));
-        for (int k = 0; k < take; k++) sum += pairs[static_cast<size_t>(k)].w;
-        if (sum < 1.0e-8f) sum = 1.0f;
-        for (int k = 0; k < 4; k++) {
-            if (k < take) {
-                outSkinIdx[static_cast<size_t>(vi) * 4u + static_cast<size_t>(k)] =
-                    static_cast<float>(pairs[static_cast<size_t>(k)].boneIdx);
-                outSkinW[static_cast<size_t>(vi) * 4u + static_cast<size_t>(k)] =
-                    pairs[static_cast<size_t>(k)].w / sum;
+
+        outBoneBindLocal.resize(static_cast<size_t>(numBones) * 16u);
+        for (int bi = 0; bi < numBones; bi++) {
+            INode* bn = boneNodes[static_cast<size_t>(bi)];
+            if (!bn) {
+                Mat4IdentityCM(&outBoneBindLocal[static_cast<size_t>(bi) * 16u]);
+                continue;
+            }
+            float parentWorld[16];
+            const int pi = outBoneParents[static_cast<size_t>(bi)];
+            if (pi >= 0 && pi < numBones && boneNodes[static_cast<size_t>(pi)]) {
+                memcpy(parentWorld, &boneWorld[static_cast<size_t>(pi) * 16u], sizeof(float) * 16);
             } else {
-                outSkinIdx[static_cast<size_t>(vi) * 4u + static_cast<size_t>(k)] = 0.0f;
-                outSkinW[static_cast<size_t>(vi) * 4u + static_cast<size_t>(k)] = 0.0f;
+                INode* par = bn->GetParentNode();
+                if (par)
+                    GetTransform16(par, t, parentWorld);
+                else
+                    Mat4IdentityCM(parentWorld);
+            }
+            float invParent[16];
+            if (!InvertMat4CM(parentWorld, invParent))
+                Mat4IdentityCM(invParent);
+            MulMat4CM(invParent, &boneWorld[static_cast<size_t>(bi) * 16u], &outBoneBindLocal[static_cast<size_t>(bi) * 16u]);
+        }
+
+        outSkinW.resize(static_cast<size_t>(vCount) * 4u, 0.0f);
+        outSkinIdx.resize(static_cast<size_t>(vCount) * 4u, 0.0f);
+        std::vector<SkinWeightSortPair> pairs;
+        const int nPts = skinData->GetNumPoints();
+        for (int vi = 0; vi < vCount; vi++) {
+            // Map split render vertex → control vertex for skin weight lookup
+            const int ci = (vi < static_cast<int>(controlIdx.size())) ? controlIdx[vi] : vi;
+            if (ci < 0 || ci >= nPts) continue;  // out of range safety
+            pairs.clear();
+            const int nb = skinData->GetNumAssignedBones(ci);
+            for (int j = 0; j < nb; j++) {
+                const int bSkin = skinData->GetAssignedBone(ci, j);
+                const float w = skinData->GetBoneWeight(ci, j);
+                if (bSkin < 0 || bSkin >= numBones || w <= 0.0f) continue;
+                SkinWeightSortPair p;
+                p.boneIdx = bSkin;
+                p.w = w;
+                pairs.push_back(p);
+            }
+            std::sort(pairs.begin(), pairs.end(), SkinWeightPairGreater);
+            float sum = 0.0f;
+            const int take = std::min(4, static_cast<int>(pairs.size()));
+            for (int k = 0; k < take; k++) sum += pairs[static_cast<size_t>(k)].w;
+            if (sum < 1.0e-8f) sum = 1.0f;
+            for (int k = 0; k < 4; k++) {
+                if (k < take) {
+                    outSkinIdx[static_cast<size_t>(vi) * 4u + static_cast<size_t>(k)] =
+                        static_cast<float>(pairs[static_cast<size_t>(k)].boneIdx);
+                    outSkinW[static_cast<size_t>(vi) * 4u + static_cast<size_t>(k)] =
+                        pairs[static_cast<size_t>(k)].w / sum;
+                } else {
+                    outSkinIdx[static_cast<size_t>(vi) * 4u + static_cast<size_t>(k)] = 0.0f;
+                    outSkinW[static_cast<size_t>(vi) * 4u + static_cast<size_t>(k)] = 0.0f;
+                }
             }
         }
-    }
+    } // end skin data block
 
-    Modifier* morphMod = FindModifierOnNode(meshNode, MR3_CLASS_ID);
+    // ── Morpher extraction (works with or without Skin) ──
+    const int nPts = vCount;  // morpher point count should match bind pose vertex count
     if (morphMod) {
         IMorpher* morpher = static_cast<IMorpher*>(morphMod->GetInterface(I_MORPHER_INTERFACE_ID));
         if (morpher) {
@@ -6385,15 +6423,6 @@ public:
                 }
 
                 if (extracted) {
-                    snapshotNode.vOff = totalBytes;
-                    totalBytes += snapshotNode.verts.size() * sizeof(float);
-                    snapshotNode.iOff = totalBytes;
-                    totalBytes += snapshotNode.indices.size() * sizeof(int);
-                    snapshotNode.uvOff = totalBytes;
-                    totalBytes += snapshotNode.uvs.size() * sizeof(float);
-                    snapshotNode.nOff = totalBytes;
-                    totalBytes += snapshotNode.norms.size() * sizeof(float);
-
                     if (!snapshotNode.spline) {
                         std::vector<std::wstring> morphNamesTmp;
                         std::vector<int> morphChIdsTmp;
@@ -6421,19 +6450,32 @@ public:
                             snapshotNode.morphChannelIds = std::move(morphChIdsTmp);
                             snapshotNode.morphInfluences = std::move(morphInflTmp);
                             snapshotNode.morphChannelsData = std::move(morphChTmp);
-                            snapshotNode.skinWOff = totalBytes;
-                            totalBytes += snapshotNode.skinWData.size() * sizeof(float);
-                            snapshotNode.skinIndOff = totalBytes;
-                            totalBytes += snapshotNode.skinIdxData.size() * sizeof(float);
-                            snapshotNode.skinBoneBindOff = totalBytes;
-                            totalBytes += snapshotNode.skinBoneBindLocal.size() * sizeof(float);
-                            for (size_t mi = 0; mi < snapshotNode.morphChannelsData.size(); ++mi) {
-                                snapshotNode.morphDOff.push_back(totalBytes);
-                                snapshotNode.morphDN.push_back(
-                                    static_cast<int>(snapshotNode.morphChannelsData[mi].size()));
-                                totalBytes += snapshotNode.morphChannelsData[mi].size() * sizeof(float);
-                            }
                             skinRigMeshHandles.insert(snapshotNode.handle);
+                        }
+                    }
+
+                    // Calculate ALL binary offsets after skin/morph extraction
+                    // (bind pose replaces verts/uvs/norms/indices — use final sizes)
+                    snapshotNode.vOff = totalBytes;
+                    totalBytes += snapshotNode.verts.size() * sizeof(float);
+                    snapshotNode.iOff = totalBytes;
+                    totalBytes += snapshotNode.indices.size() * sizeof(int);
+                    snapshotNode.uvOff = totalBytes;
+                    totalBytes += snapshotNode.uvs.size() * sizeof(float);
+                    snapshotNode.nOff = totalBytes;
+                    totalBytes += snapshotNode.norms.size() * sizeof(float);
+                    if (snapshotNode.skinRig) {
+                        snapshotNode.skinWOff = totalBytes;
+                        totalBytes += snapshotNode.skinWData.size() * sizeof(float);
+                        snapshotNode.skinIndOff = totalBytes;
+                        totalBytes += snapshotNode.skinIdxData.size() * sizeof(float);
+                        snapshotNode.skinBoneBindOff = totalBytes;
+                        totalBytes += snapshotNode.skinBoneBindLocal.size() * sizeof(float);
+                        for (size_t mi = 0; mi < snapshotNode.morphChannelsData.size(); ++mi) {
+                            snapshotNode.morphDOff.push_back(totalBytes);
+                            snapshotNode.morphDN.push_back(
+                                static_cast<int>(snapshotNode.morphChannelsData[mi].size()));
+                            totalBytes += snapshotNode.morphChannelsData[mi].size() * sizeof(float);
                         }
                     }
 
@@ -6522,24 +6564,27 @@ public:
             }
             ss << L'}';
             if (node.skinRig) {
-                ss << L",\"skin\":{";
-                ss << L"\"bones\":[";
-                for (size_t bi = 0; bi < node.skinBoneHandles.size(); ++bi) {
-                    if (bi) ss << L',';
-                    ss << node.skinBoneHandles[bi];
+                // Skin block: only emit if we have bone data (Skin modifier present)
+                if (!node.skinBoneHandles.empty()) {
+                    ss << L",\"skin\":{";
+                    ss << L"\"bones\":[";
+                    for (size_t bi = 0; bi < node.skinBoneHandles.size(); ++bi) {
+                        if (bi) ss << L',';
+                        ss << node.skinBoneHandles[bi];
+                    }
+                    ss << L"],\"parent\":[";
+                    for (size_t bi = 0; bi < node.skinBoneParents.size(); ++bi) {
+                        if (bi) ss << L',';
+                        ss << node.skinBoneParents[bi];
+                    }
+                    ss << L"],\"wOff\":" << node.skinWOff
+                       << L",\"wN\":" << node.skinWData.size()
+                       << L",\"iOff\":" << node.skinIndOff
+                       << L",\"iN\":" << node.skinIdxData.size()
+                       << L",\"bindOff\":" << node.skinBoneBindOff
+                       << L",\"bindN\":" << node.skinBoneBindLocal.size();
+                    ss << L"}";
                 }
-                ss << L"],\"parent\":[";
-                for (size_t bi = 0; bi < node.skinBoneParents.size(); ++bi) {
-                    if (bi) ss << L',';
-                    ss << node.skinBoneParents[bi];
-                }
-                ss << L"],\"wOff\":" << node.skinWOff
-                   << L",\"wN\":" << node.skinWData.size()
-                   << L",\"iOff\":" << node.skinIndOff
-                   << L",\"iN\":" << node.skinIdxData.size()
-                   << L",\"bindOff\":" << node.skinBoneBindOff
-                   << L",\"bindN\":" << node.skinBoneBindLocal.size();
-                ss << L"}";
                 if (!node.morphNames.empty()) {
                     ss << L",\"morph\":{";
                     ss << L"\"names\":[";

@@ -114,4 +114,6 @@ include/        SDK compatibility headers
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT
+
+clone - 2026 Metaverse Makers

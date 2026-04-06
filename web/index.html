@@ -2259,6 +2259,7 @@
         }
 
         function updateSyncHud(partial = {}) {
+            if (!debugMode) return;
             perfHud.updateSync({
                 transport: partial.transport ?? transportMode,
                 frameId: partial.frameId ?? 0,
@@ -2493,9 +2494,6 @@
                                 } else if (!meta.keepNormals) {
                                     scheduleNormals(mesh.geometry);
                                 }
-
-                                mesh.geometry.computeBoundingBox();
-                                mesh.geometry.computeBoundingSphere();
                             } else {
                                 if (!hasIncomingIndex) return;
                                 // Topology changed — full rebuild
@@ -4945,6 +4943,7 @@
         }
 
         function syncPostFxPanel(force = false) {
+            if (!postPanelVisible && !force) return;
             const state = ssgiFx.getState();
             const derived = postPanelVisible ? ssgiFx.getDerivedState() : null;
             const available = ssgiFx.isAvailable();
@@ -5460,7 +5459,7 @@
                 updateSplatCamera();
                 splatOverlay.renderer.render(splatOverlay.scene, splatOverlay.camera);
             }
-            syncPostFxPanel();
+            if (postPanelVisible) syncPostFxPanel();
             perfHud.updateRender(performance.now() - renderStart, renderer.info?.render, renderer.info?.memory);
             // Standalone / snapshot viewers have no bridge sync — drive the perf HUD from the render loop.
             if (!(window.chrome?.webview?.postMessage) && debugMode) {

@@ -687,6 +687,57 @@ static uint64_t HashMNMeshState(MNMesh& mn) {
     return h;
 }
 
+static uint64_t HashMeshStateWithUVs(Mesh& mesh) {
+    uint64_t h = HashMeshState(mesh);
+    const int numTVerts = mesh.getNumTVerts();
+    h = HashFNV1a(&numTVerts, sizeof(numTVerts), h);
+    if (numTVerts > 0 && mesh.tVerts) {
+        h = HashFNV1a(mesh.tVerts, static_cast<size_t>(numTVerts) * sizeof(UVVert), h);
+    }
+
+    if (numTVerts > 0 && mesh.tvFace) {
+        const int numFaces = mesh.getNumFaces();
+        for (int i = 0; i < numFaces; ++i) {
+            h = HashFNV1a(mesh.tvFace[i].t, sizeof(mesh.tvFace[i].t), h);
+        }
+    }
+    return h;
+}
+
+static uint64_t HashMNMeshStateWithUVs(MNMesh& mn) {
+    uint64_t h = HashMNMeshState(mn);
+
+    MNMap* uvMap = mn.M(1);
+    const bool hasUVs = uvMap && uvMap->GetFlag(MN_DEAD) == 0;
+    const int numUVVerts = hasUVs ? uvMap->numv : 0;
+    const int numUVFaces = hasUVs ? uvMap->numf : 0;
+    h = HashFNV1a(&numUVVerts, sizeof(numUVVerts), h);
+    h = HashFNV1a(&numUVFaces, sizeof(numUVFaces), h);
+    if (!hasUVs) return h;
+
+    for (int i = 0; i < numUVVerts; ++i) {
+        UVVert uv = uvMap->v[i];
+        h = HashFNV1a(&uv, sizeof(uv), h);
+    }
+
+    for (int i = 0; i < numUVFaces; ++i) {
+        MNMapFace* uvFace = uvMap->F(i);
+        if (!uvFace) {
+            const int deg = -1;
+            h = HashFNV1a(&deg, sizeof(deg), h);
+            continue;
+        }
+
+        const int deg = uvFace->deg;
+        h = HashFNV1a(&deg, sizeof(deg), h);
+        if (deg > 0 && uvFace->tv) {
+            h = HashFNV1a(uvFace->tv, sizeof(int) * static_cast<size_t>(deg), h);
+        }
+    }
+
+    return h;
+}
+
 static uint64_t MakeGeomValidityKey(const Interval& iv) {
     return static_cast<uint64_t>(iv.Start()) ^ (static_cast<uint64_t>(iv.End()) << 32);
 }
@@ -2602,31 +2653,7 @@ static bool ExtractMeshFromMNMesh(MNMesh& mn,
             [](const FaceRef& a, const FaceRef& b) { return a.matID < b.matID; });
     }
 
-    // Compute face normals for all live faces (SSE cross product + normalize)
-    std::vector<Point3> faceNormals(numFaces, Point3(0, 0, 0));
-    for (auto& fr : liveFaces) {
-        MNFace* face = mn.F(fr.idx);
-        if (face->deg < 3) continue;
-        Point3 cross = CrossProductSSE(mn.P(face->vtx[0]), mn.P(face->vtx[1]), mn.P(face->vtx[2]));
-        faceNormals[fr.idx] = NormalizeSSE(cross);
-    }
-
-    // Build per-vertex smooth normals respecting smoothing groups (bitwise).
-    // smGroup 0 = no smoothing (faceted), otherwise faces share normals when bits overlap.
-    // Two-pass: first collect all face normals per vertex, then merge by bitwise overlap.
-    struct VertFaceNormal { int faceIdx; DWORD smGrp; Point3 normal; };
-    std::unordered_map<int, std::vector<VertFaceNormal>> vertFaceNormals;
-    for (auto& fr : liveFaces) {
-        MNFace* face = mn.F(fr.idx);
-        const DWORD smGrp = face->smGroup;
-        for (int v = 0; v < face->deg; v++) {
-            vertFaceNormals[face->vtx[v]].push_back({ fr.idx, smGrp, faceNormals[fr.idx] });
-        }
-    }
-
-    // For each vertex+face, compute the smooth normal by summing all face normals
-    // at that vertex whose smoothing groups overlap (bitwise AND != 0).
-    // smGroup 0 means no smoothing — only the face's own normal is used.
+    std::vector<Point3> faceNormals;
     struct SmNormKey { int posIdx; int faceIdx; };
     struct SmNormKeyHash {
         size_t operator()(const SmNormKey& k) const noexcept {
@@ -2639,17 +2666,39 @@ static bool ExtractMeshFromMNMesh(MNMesh& mn,
         }
     };
     std::unordered_map<SmNormKey, Point3, SmNormKeyHash, SmNormKeyEq> smoothNormals;
-    for (auto& [posIdx, faceNorms] : vertFaceNormals) {
-        for (auto& fn : faceNorms) {
-            Point3 accum = fn.normal;
-            if (fn.smGrp != 0) {
-                for (auto& other : faceNorms) {
-                    if (other.faceIdx == fn.faceIdx) continue;
-                    if ((fn.smGrp & other.smGrp) != 0)
-                        accum += other.normal;
-                }
+    if (outNormals) {
+        // Compute face normals for all live faces (SSE cross product + normalize)
+        faceNormals.assign(numFaces, Point3(0, 0, 0));
+        for (auto& fr : liveFaces) {
+            MNFace* face = mn.F(fr.idx);
+            if (face->deg < 3) continue;
+            Point3 cross = CrossProductSSE(mn.P(face->vtx[0]), mn.P(face->vtx[1]), mn.P(face->vtx[2]));
+            faceNormals[fr.idx] = NormalizeSSE(cross);
+        }
+
+        // Build per-vertex smooth normals respecting smoothing groups (bitwise).
+        struct VertFaceNormal { int faceIdx; DWORD smGrp; Point3 normal; };
+        std::unordered_map<int, std::vector<VertFaceNormal>> vertFaceNormals;
+        for (auto& fr : liveFaces) {
+            MNFace* face = mn.F(fr.idx);
+            const DWORD smGrp = face->smGroup;
+            for (int v = 0; v < face->deg; v++) {
+                vertFaceNormals[face->vtx[v]].push_back({ fr.idx, smGrp, faceNormals[fr.idx] });
             }
-            smoothNormals[{ posIdx, fn.faceIdx }] = NormalizeSSE(accum);
+        }
+
+        for (auto& [posIdx, faceNorms] : vertFaceNormals) {
+            for (auto& fn : faceNorms) {
+                Point3 accum = fn.normal;
+                if (fn.smGrp != 0) {
+                    for (auto& other : faceNorms) {
+                        if (other.faceIdx == fn.faceIdx) continue;
+                        if ((fn.smGrp & other.smGrp) != 0)
+                            accum += other.normal;
+                    }
+                }
+                smoothNormals[{ posIdx, fn.faceIdx }] = NormalizeSSE(accum);
+            }
         }
     }
 
@@ -3032,6 +3081,37 @@ static bool TryHashExtractedRenderableGeometry(INode* node, TimeValue t, uint64_
     if (!ExtractSpline(node, t, verts, indices)) return false;
 
     outHash = HashMeshData(verts, indices, uvs);
+    return true;
+}
+
+static bool TryHashRenderableGeometryState(INode* node, TimeValue t, uint64_t& outHash) {
+    if (MNMesh* liveMN = TryGetLiveEditablePolyMesh(node)) {
+        outHash = HashMNMeshStateWithUVs(*liveMN);
+        return true;
+    }
+
+    ObjectState os = node->EvalWorldState(t);
+    if (!os.obj) return false;
+
+    if (os.obj->SuperClassID() == SHAPE_CLASS_ID) {
+        return TryHashExtractedRenderableGeometry(node, t, outHash);
+    }
+
+    if (os.obj->SuperClassID() != GEOMOBJECT_CLASS_ID) return false;
+    if (IsThreeJSSplatClassID(os.obj->ClassID())) return false;
+
+    if (os.obj->IsSubClassOf(polyObjectClassID)) {
+        PolyObject* poly = static_cast<PolyObject*>(os.obj);
+        outHash = HashMNMeshStateWithUVs(poly->GetMesh());
+        return true;
+    }
+
+    if (!os.obj->CanConvertToType(Class_ID(TRIOBJ_CLASS_ID, 0))) return false;
+    TriObject* tri = static_cast<TriObject*>(os.obj->ConvertToType(t, Class_ID(TRIOBJ_CLASS_ID, 0)));
+    if (!tri) return false;
+
+    outHash = HashMeshStateWithUVs(tri->GetMesh());
+    if (tri != os.obj) tri->DeleteThis();
     return true;
 }
 
@@ -4552,6 +4632,7 @@ public:
     std::unordered_set<ULONG> skinnedHandles_;             // geom handles with Skin modifier
     std::unordered_map<ULONG, std::vector<int>> skinnedControlIdxCache_; // render vertex -> control vertex
     ULONGLONG lastSkinnedLivePollTick_ = 0;
+    ULONGLONG lastInteractionTick_ = 0;
     std::unordered_set<ULONG> pluginInstHandles_;        // FP/RC/tyFlow node handles for change detection
     std::unordered_map<ULONG, uint64_t> pluginInstHash_; // plugin node → generated-instance dependency hash
 
@@ -7321,13 +7402,14 @@ public:
         for (int i = 0; i < selCount; ++i) {
             INode* node = ip->GetSelNode(i);
             if (!node) continue;
+            if (!ShouldRunInteractiveGeometryChecks(node)) continue;
             ULONG handle = node->GetHandle();
             if (!IsTrackedHandle(handle)) continue;
             if (skinnedHandles_.count(handle)) continue;
 
             // Match DetectGeometryChanges / geo_fast payload: include UVs (HashNodeGeometryState omits them).
             uint64_t geomHash = 0;
-            if (!TryHashExtractedRenderableGeometry(node, t, geomHash))
+            if (!TryHashRenderableGeometryState(node, t, geomHash))
                 continue;
             auto it = lastLiveGeomHash_.find(handle);
             if (it != lastLiveGeomHash_.end() && it->second == geomHash) continue;
@@ -7469,6 +7551,49 @@ public:
         lastSentTransforms_[handle] = cached;
     }
 
+    static constexpr ULONGLONG kInteractiveCooldownMs = 250;
+    static constexpr size_t kMaxFastFlushHandlesPerPass = 128;
+
+    void MarkInteractiveActivity() {
+        lastInteractionTick_ = GetTickCount64();
+    }
+
+    bool IsAnimationPlaying() const {
+        Interface* ip = GetCOREInterface();
+        return ip && ip->IsAnimPlaying() != 0;
+    }
+
+    bool IsModifyTaskActive() const {
+        Interface* ip = GetCOREInterface();
+        return ip && ip->GetCommandPanelTaskMode() == TASK_MODE_MODIFY;
+    }
+
+    bool IsSubObjectEditingActive() const {
+        Interface* ip = GetCOREInterface();
+        return ip && ip->GetSubObjectLevel() > 0;
+    }
+
+    bool ShouldFavorInteractivePerformance() const {
+        if (IsAnimationPlaying()) return true;
+        const ULONGLONG now = GetTickCount64();
+        return lastInteractionTick_ != 0 && (now - lastInteractionTick_) <= kInteractiveCooldownMs;
+    }
+
+    bool ShouldRunInteractiveGeometryChecks(INode* node) const {
+        if (IsSubObjectEditingActive()) return true;
+        if (!IsModifyTaskActive()) return false;
+
+        Interface* ip = GetCOREInterface();
+        if (!ip || !node) return false;
+
+        BaseObject* editObj = ip->GetCurEditObject();
+        if (!editObj) return false;
+
+        if (editObj->GetInterface(EPOLY_MOD_INTERFACE) != nullptr) return false;
+        if (editObj->GetInterface(EPOLY_INTERFACE) != nullptr) return false;
+        return true;
+    }
+
     void ResetFastPathState(bool refreshCameraState = false) {
         fastDirtyHandles_.clear();
         visibilityDirtyHandles_.clear();
@@ -7541,17 +7666,27 @@ public:
     // Topology change (add/remove faces/verts) — needs full sync (debounced)
     void MarkGeometryTopologyDirty(const NodeEventNamespace::NodeKeyTab& nodes) {
         bool changed = false;
+        bool needsFullSync = false;
         for (int i = 0; i < nodes.Count(); ++i) {
             INode* node = NodeEventNamespace::GetNodeByKey(nodes[i]);
             if (!node) continue;
-            VisitNodeSubtree(node, [this, &changed](INode* current) {
+            VisitNodeSubtree(node, [this, &changed, &needsFullSync](INode* current) {
                 const ULONG handle = current->GetHandle();
                 if (!IsTrackedHandle(handle)) return;
                 geoHashMap_.erase(handle);
-                if (fastDirtyHandles_.insert(handle).second) changed = true;
+                if (skinnedHandles_.count(handle)) {
+                    // Skinned meshes: topology is stable during animation,
+                    // downgrade to fast geo path instead of full sync
+                    geoFastDirtyHandles_.insert(handle);
+                    if (fastDirtyHandles_.insert(handle).second) changed = true;
+                } else {
+                    if (fastDirtyHandles_.insert(handle).second) changed = true;
+                    needsFullSync = true;
+                }
             });
         }
-        if (changed) SetDirty();
+        if (needsFullSync) SetDirty();
+        else if (changed) QueueFastFlush();
     }
 
     void MarkSelectedTransformsDirty() {
@@ -7582,6 +7717,7 @@ public:
         }
 
         if (changed) QueueFastFlush();
+        if (changed) MarkInteractiveActivity();
     }
 
     void MarkTrackedLightTransformsDirty() {
@@ -7607,6 +7743,7 @@ public:
         }
 
         if (changed) QueueFastFlush();
+        if (changed) MarkInteractiveActivity();
     }
 
     void MarkTrackedSplatTransformsDirty() {
@@ -7632,6 +7769,7 @@ public:
         }
 
         if (changed) QueueFastFlush();
+        if (changed) MarkInteractiveActivity();
     }
 
     void MarkVisibilityNodesDirty(const NodeEventNamespace::NodeKeyTab& nodes) {
@@ -7677,6 +7815,36 @@ public:
         fastDirtyHandles_.insert(lightHandles_.begin(), lightHandles_.end());
         fastDirtyHandles_.insert(splatHandles_.begin(), splatHandles_.end());
         QueueFastFlush();
+    }
+
+    void MarkAnimatedTransformsDirty() {
+        if (!HasTrackedNodes()) return;
+        Interface* ip = GetCOREInterface();
+        if (!ip) return;
+
+        const TimeValue t = ip->GetTime();
+        bool changed = false;
+        auto markIfTransformChanged = [this, t, &changed](ULONG handle) {
+            INode* node = GetCOREInterface() ? GetCOREInterface()->GetINodeByHandle(handle) : nullptr;
+            if (!node) return;
+
+            float xform[16];
+            GetTransform16(node, t, xform);
+
+            auto it = lastSentTransforms_.find(handle);
+            if (it == lastSentTransforms_.end() || !TransformEquals16(xform, it->second.data())) {
+                if (fastDirtyHandles_.insert(handle).second) changed = true;
+            }
+        };
+
+        for (ULONG handle : geomHandles_) markIfTransformChanged(handle);
+        for (ULONG handle : lightHandles_) markIfTransformChanged(handle);
+        for (ULONG handle : splatHandles_) markIfTransformChanged(handle);
+
+        if (changed) {
+            QueueFastFlush();
+            MarkInteractiveActivity();
+        }
     }
 
     void MarkCameraDirty() {
@@ -7907,19 +8075,23 @@ public:
                 if (useBinary_) SendFullSyncBinary(); else SendFullSync();
             }
         } else {
-            if (slowPhase == 0) CheckWebContentChanges();
-            if (slowPhase == 3) CheckProjectContentChanges();
-            if (tickCount_ % MATERIAL_DETECT_TICKS == 2) DetectMaterialChanges();
-            if (lightPhase == 0) DetectPropertyChanges();
-            if (lightPhase == 1) {
+            const bool favorInteractive = ShouldFavorInteractivePerformance();
+            const bool allowIdlePolling = !favorInteractive;
+            const bool allowHeavyGeometryPolling = !favorInteractive && !IsAnimationPlaying();
+
+            if (allowIdlePolling && slowPhase == 0) CheckWebContentChanges();
+            if (allowIdlePolling && slowPhase == 3) CheckProjectContentChanges();
+            if (allowIdlePolling && tickCount_ % MATERIAL_DETECT_TICKS == 2) DetectMaterialChanges();
+            if (allowIdlePolling && lightPhase == 0) DetectPropertyChanges();
+            if (allowIdlePolling && lightPhase == 1) {
                 DetectLightChanges();
                 DetectSplatChanges();
             }
-            if (slowPhase == 6) DetectGeometryChanges();
-            if (slowPhase == 9) DetectJsModChanges();
-            if (slowPhase == 12) DetectPluginInstanceChanges();
-            if (lightPhase == 2) PollViewportModes();
-            if (slowPhase == 1) ScanInlineLayers();
+            if (allowHeavyGeometryPolling && slowPhase == 6) DetectGeometryChanges();
+            if (allowIdlePolling && slowPhase == 9) DetectJsModChanges();
+            if (allowIdlePolling && slowPhase == 12) DetectPluginInstanceChanges();
+            if (allowIdlePolling && lightPhase == 2) PollViewportModes();
+            if (allowIdlePolling && slowPhase == 1) ScanInlineLayers();
         }
     }
 
@@ -7989,9 +8161,11 @@ public:
             }
 
             if (!usedSkinnedFastPositions) {
-                // Update hash so we don't re-send next frame
-                uint64_t hash = HashMeshData(verts, indices, uvs);
-                geoHashMap_[handle] = hash;
+                // Store raw hash consistent with DetectGeometryChanges / TryHashRenderableGeometryState
+                uint64_t rawHash = 0;
+                if (!TryHashRenderableGeometryState(node, t, rawHash))
+                    rawHash = HashMeshData(verts, indices, uvs);
+                geoHashMap_[handle] = rawHash;
             }
 
             JsModData jmFast;
@@ -8065,6 +8239,20 @@ public:
         std::vector<ULONG> dirtyHandles;
         dirtyHandles.reserve(fastDirtyHandles_.size());
         for (ULONG handle : fastDirtyHandles_) dirtyHandles.push_back(handle);
+        if (dirtyHandles.size() > kMaxFastFlushHandlesPerPass) {
+            std::vector<ULONG> deferredHandles(
+                dirtyHandles.begin() + static_cast<std::ptrdiff_t>(kMaxFastFlushHandlesPerPass),
+                dirtyHandles.end());
+            dirtyHandles.resize(kMaxFastFlushHandlesPerPass);
+            fastDirtyHandles_.clear();
+            fastDirtyHandles_.insert(deferredHandles.begin(), deferredHandles.end());
+            fastFlushPosted_ = true;
+            if (!PostMessage(hwnd_, WM_FAST_FLUSH, 0, 0)) {
+                fastFlushPosted_ = false;
+            }
+        } else {
+            fastDirtyHandles_.clear();
+        }
 
         const bool hasDirtyCamera = fastCameraDirty_;
 
@@ -8077,7 +8265,6 @@ public:
         visibilityDirty.swap(visibilityDirtyHandles_);
 
         for (ULONG handle : dirtyHandles) visibilityDirty.erase(handle);
-        fastDirtyHandles_.clear();
         fastCameraDirty_ = false;
 
         std::vector<ULONG> combinedNodeHandles = dirtyHandles;
@@ -8604,7 +8791,7 @@ public:
             if (node) {
                 if (!geoFastDirtyHandles_.count(handle) && !skinnedHandles_.count(handle)) {
                     uint64_t hash = 0;
-                    if (TryHashExtractedRenderableGeometry(node, t, hash)) {
+                    if (TryHashRenderableGeometryState(node, t, hash)) {
                         auto it = geoHashMap_.find(handle);
                         if (it == geoHashMap_.end() || it->second != hash) {
                             SetDirty();
@@ -9762,7 +9949,10 @@ public:
                         continue;
                     }
 
-                    uint64_t hash = HashMeshData(ng.verts, ng.indices, ng.uvs);
+                    // Use raw hash consistent with DetectGeometryChanges
+                    uint64_t hash = 0;
+                    if (!TryHashRenderableGeometryState(node, t, hash))
+                        hash = HashMeshData(ng.verts, ng.indices, ng.uvs);
                     auto it = geoHashMap_.find(ng.handle);
                     ng.changed = (it == geoHashMap_.end() || it->second != hash);
                     geoHashMap_[ng.handle] = hash;
@@ -10497,11 +10687,12 @@ void MaxJSFastNodeEventCallback::TopologyChanged(NodeKeyTab& nodes) {
 void MaxJSFastRedrawCallback::proc(Interface*) {
     if (!owner_) return;
     owner_->MarkSelectedTransformsDirty();
-    owner_->CheckTrackedMaterialScalarsLive();
-    owner_->MarkTrackedLightTransformsDirty();
-    owner_->CheckTrackedLightsLive();
-    owner_->MarkTrackedSplatTransformsDirty();
-    owner_->PollViewportModes();
+    if (!owner_->ShouldFavorInteractivePerformance()) {
+        owner_->MarkTrackedLightTransformsDirty();
+        owner_->CheckTrackedLightsLive();
+        owner_->MarkTrackedSplatTransformsDirty();
+        owner_->PollViewportModes();
+    }
     owner_->MarkCameraDirtyIfChanged();
     owner_->CheckSelectedGeometryLive();
     owner_->CheckSkinnedGeometryLive();
@@ -10509,8 +10700,9 @@ void MaxJSFastRedrawCallback::proc(Interface*) {
 
 void MaxJSFastTimeChangeCallback::TimeChanged(TimeValue) {
     if (!owner_) return;
-    owner_->MarkAllTrackedNodesDirty();
+    owner_->MarkAnimatedTransformsDirty();
     owner_->MarkCameraDirty();
+    owner_->MarkInteractiveActivity();
 }
 
 static void OnSceneChanged(void* param, NotifyInfo*) {

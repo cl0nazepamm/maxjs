@@ -4401,6 +4401,7 @@ public:
     std::unordered_map<ULONG, bool> jsmodStateMap_;    // node handle → last-seen three.js Deform flag
     std::unordered_set<ULONG> pluginInstHandles_;        // FP/RC/tyFlow node handles for change detection
     std::unordered_map<ULONG, uint64_t> pluginInstHash_; // plugin node → generated-instance dependency hash
+
     std::map<std::wstring, std::wstring> texDirMap_;    // dir → host
     int texDirCount_ = 0;
     bool lastClayMode_ = false;
@@ -4413,9 +4414,6 @@ public:
     bool fastFlushPosted_ = false;
     bool haveLastSentCamera_ = false;
     ULONGLONG dirtyStamp_ = 0;   // when dirty_ was last set (for debounce)
-    // Throttles CheckSelectedGeometryLive (full ExtractMesh + hash) when GEOM channel validity is stable.
-    ULONGLONG lastSelectedGeometryLiveRunMs_ = 0;
-    std::unordered_map<ULONG, uint64_t> lastSelectedGeomChannelKey_;
     CameraData lastSentCamera_ = {};
     SceneEventNamespace::CallbackKey fastNodeEventCallbackKey_ = 0;
     MaxJSFastNodeEventCallback fastNodeEvents_;
@@ -6903,8 +6901,6 @@ public:
         groupCache_.clear();
         lastBBoxHash_.clear();
         lastLiveGeomHash_.clear();
-        lastSelectedGeometryLiveRunMs_ = 0;
-        lastSelectedGeomChannelKey_.clear();
         ResetFastPathState(false);
     }
 
@@ -7137,12 +7133,6 @@ public:
         dirtyStamp_ = 0;  // bypass debounce — sync on next tick
     }
 
-    /** Next redraw may run CheckSelectedGeometryLive immediately (bypass per-frame throttle). */
-    void ResetSelectedGeometryLiveThrottle() {
-        lastSelectedGeometryLiveRunMs_ = 0;
-        lastSelectedGeomChannelKey_.clear();
-    }
-
     void QueueFastFlush() {
         if (!hwnd_ || dirty_ || fastFlushPosted_) return;
         fastFlushPosted_ = true;
@@ -7164,46 +7154,11 @@ public:
     std::unordered_set<ULONG> geoFastDirtyHandles_;
     std::unordered_set<ULONG> materialFastDirtyHandles_;
 
-    /**
-     * Cheap GEOM channel validity check (same idea as full-sync skipExtract).
-     * Returns true only when validity is unchanged vs last redraw — safe to apply the 200ms throttle
-     * (UV-only edits may not bump validity). Returns false when validity changed (skin pose, etc.)
-     * or on first probe — caller must run full ExtractMesh + hash without throttling.
-     */
-    bool ShouldThrottleSelectedGeometryProbe(INode* node, TimeValue t, ULONG handle) {
-        ObjectState os = node->EvalWorldState(t);
-        if (!os.obj || os.obj->SuperClassID() != GEOMOBJECT_CLASS_ID) return false;
-
-        Interval gv = os.obj->ChannelValidity(t, GEOM_CHAN_NUM);
-        const uint64_t validKey =
-            static_cast<uint64_t>(gv.Start()) ^ (static_cast<uint64_t>(gv.End()) << 32);
-        auto it = lastSelectedGeomChannelKey_.find(handle);
-        if (it == lastSelectedGeomChannelKey_.end()) {
-            lastSelectedGeomChannelKey_[handle] = validKey;
-            return false;
-        }
-        if (it->second != validKey) {
-            it->second = validKey;
-            return false;
-        }
-        return true;
-    }
-
     void CheckSelectedGeometryLive() {
         Interface* ip = GetCOREInterface();
         if (!ip) return;
-        // During timeline playback, CheckTrackedGeometryLive() hashes every tracked mesh on
-        // TimeChanged — selection would duplicate ExtractMesh work every redraw.
-        if (ip->IsAnimPlaying()) return;
         const int selCount = ip->GetSelNodeCount();
         if (selCount <= 0) return;
-
-        // Redraw proc runs every viewport paint. Full ExtractMesh + hash is expensive when a heavy
-        // mesh stays selected with a static pose — throttle only when GEOM channel validity is
-        // unchanged (ShouldThrottle…). When Skin / deformers update validity (pose change), probe
-        // every frame so geo_fast preview stays live.
-        static constexpr ULONGLONG kThrottleMs = 200;
-        const ULONGLONG now = GetTickCount64();
         TimeValue t = ip->GetTime();
 
         bool changed = false;
@@ -7213,52 +7168,15 @@ public:
             ULONG handle = node->GetHandle();
             if (!IsTrackedHandle(handle)) continue;
 
-            if (ShouldThrottleSelectedGeometryProbe(node, t, handle)) {
-                if (lastSelectedGeometryLiveRunMs_ != 0 &&
-                    now - lastSelectedGeometryLiveRunMs_ < kThrottleMs) {
-                    continue;
-                }
-            }
-
             // Match DetectGeometryChanges / geo_fast payload: include UVs (HashNodeGeometryState omits them).
             uint64_t geomHash = 0;
             if (!TryHashExtractedRenderableGeometry(node, t, geomHash))
                 continue;
-            lastSelectedGeometryLiveRunMs_ = now;
-
             auto it = lastLiveGeomHash_.find(handle);
             if (it != lastLiveGeomHash_.end() && it->second == geomHash) continue;
             lastLiveGeomHash_[handle] = geomHash;
 
             // Geometry changed — send ONLY this mesh via fast path, no full sync
-            geoHashMap_.erase(handle);
-            geoFastDirtyHandles_.insert(handle);
-            fastDirtyHandles_.insert(handle);
-            changed = true;
-        }
-        if (changed) QueueFastFlush();
-    }
-
-    // While animation plays, deforming meshes (Skin, etc.) need per-time geometry even when
-    // not selected. SendFullSyncBinary can skip ExtractMesh when GEOM channel validity is
-    // unchanged; delta sync only updates transforms — so unselected skinned meshes froze
-    // unless selection forced CheckSelectedGeometryLive. Hash all tracked meshes each frame.
-    void CheckTrackedGeometryLive() {
-        Interface* ip = GetCOREInterface();
-        if (!ip || !ip->IsAnimPlaying() || geomHandles_.empty()) return;
-        TimeValue t = ip->GetTime();
-
-        bool changed = false;
-        for (ULONG handle : geomHandles_) {
-            INode* node = ip->GetINodeByHandle(handle);
-            if (!node) continue;
-
-            uint64_t geomHash = 0;
-            if (!TryHashExtractedRenderableGeometry(node, t, geomHash)) continue;
-            auto it = lastLiveGeomHash_.find(handle);
-            if (it != lastLiveGeomHash_.end() && it->second == geomHash) continue;
-            lastLiveGeomHash_[handle] = geomHash;
-
             geoHashMap_.erase(handle);
             geoFastDirtyHandles_.insert(handle);
             fastDirtyHandles_.insert(handle);
@@ -10224,7 +10142,6 @@ public:
         groupCache_.clear();
         lastBBoxHash_.clear();
         lastLiveGeomHash_.clear();
-        lastSelectedGeomChannelKey_.clear();
         mtlScalarHashMap_.clear();
         if (hwnd_) { HWND h = hwnd_; hwnd_ = nullptr; DestroyWindow(h); }
     }
@@ -10288,10 +10205,7 @@ void MaxJSFastNodeEventCallback::LinkChanged(NodeKeyTab& nodes) {
 }
 
 void MaxJSFastNodeEventCallback::SelectionChanged(NodeKeyTab& nodes) {
-    if (owner_) {
-        owner_->MarkTrackedNodesDirty(nodes);
-        owner_->ResetSelectedGeometryLiveThrottle();
-    }
+    if (owner_) owner_->MarkTrackedNodesDirty(nodes);
 }
 
 void MaxJSFastNodeEventCallback::HideChanged(NodeKeyTab& nodes) {
@@ -10322,7 +10236,6 @@ void MaxJSFastTimeChangeCallback::TimeChanged(TimeValue) {
     if (!owner_) return;
     owner_->MarkAllTrackedNodesDirty();
     owner_->MarkCameraDirty();
-    owner_->CheckTrackedGeometryLive();
 }
 
 static void OnSceneChanged(void* param, NotifyInfo*) {

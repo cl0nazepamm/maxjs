@@ -2452,31 +2452,46 @@ static bool ExtractMeshFromMNMesh(MNMesh& mn,
         faceNormals[fr.idx] = Normalize((b - a) ^ (c - a));
     }
 
-    // Build per-vertex smooth normals respecting smoothing groups.
-    // Key: {posIdx, smGroup} → accumulated normal
-    struct SmNormKey { int posIdx; DWORD smGrp; };
-    struct SmNormKeyHash {
-        size_t operator()(const SmNormKey& k) const noexcept {
-            return size_t(k.posIdx) * 16777619u ^ size_t(k.smGrp);
-        }
-    };
-    struct SmNormKeyEq {
-        bool operator()(const SmNormKey& a, const SmNormKey& b) const {
-            return a.posIdx == b.posIdx && a.smGrp == b.smGrp;
-        }
-    };
-    std::unordered_map<SmNormKey, Point3, SmNormKeyHash, SmNormKeyEq> smoothNormals;
+    // Build per-vertex smooth normals respecting smoothing groups (bitwise).
+    // smGroup 0 = no smoothing (faceted), otherwise faces share normals when bits overlap.
+    // Two-pass: first collect all face normals per vertex, then merge by bitwise overlap.
+    struct VertFaceNormal { int faceIdx; DWORD smGrp; Point3 normal; };
+    std::unordered_map<int, std::vector<VertFaceNormal>> vertFaceNormals;
     for (auto& fr : liveFaces) {
         MNFace* face = mn.F(fr.idx);
         const DWORD smGrp = face->smGroup;
         for (int v = 0; v < face->deg; v++) {
-            SmNormKey key = { face->vtx[v], smGrp };
-            smoothNormals[key] = smoothNormals[key] + faceNormals[fr.idx];
+            vertFaceNormals[face->vtx[v]].push_back({ fr.idx, smGrp, faceNormals[fr.idx] });
         }
     }
-    // Normalize
-    for (auto& kv : smoothNormals) {
-        kv.second = Normalize(kv.second);
+
+    // For each vertex+face, compute the smooth normal by summing all face normals
+    // at that vertex whose smoothing groups overlap (bitwise AND != 0).
+    // smGroup 0 means no smoothing — only the face's own normal is used.
+    struct SmNormKey { int posIdx; int faceIdx; };
+    struct SmNormKeyHash {
+        size_t operator()(const SmNormKey& k) const noexcept {
+            return size_t(k.posIdx) * 16777619u ^ size_t(k.faceIdx);
+        }
+    };
+    struct SmNormKeyEq {
+        bool operator()(const SmNormKey& a, const SmNormKey& b) const {
+            return a.posIdx == b.posIdx && a.faceIdx == b.faceIdx;
+        }
+    };
+    std::unordered_map<SmNormKey, Point3, SmNormKeyHash, SmNormKeyEq> smoothNormals;
+    for (auto& [posIdx, faceNorms] : vertFaceNormals) {
+        for (auto& fn : faceNorms) {
+            Point3 accum = fn.normal;
+            if (fn.smGrp != 0) {
+                for (auto& other : faceNorms) {
+                    if (other.faceIdx == fn.faceIdx) continue;
+                    if ((fn.smGrp & other.smGrp) != 0)
+                        accum += other.normal;
+                }
+            }
+            smoothNormals[{ posIdx, fn.faceIdx }] = Normalize(accum);
+        }
     }
 
     // Estimate output sizes
@@ -2515,7 +2530,9 @@ static bool ExtractMeshFromMNMesh(MNMesh& mn,
                 DWORD posIdx = face->vtx[localIdx];
                 DWORD uvIdx = (uvFace && localIdx < uvFace->deg) ? uvFace->tv[localIdx] : 0;
 
-                MeshCornerKey key = { posIdx, uvIdx, smGrp };
+                // smGrp 0 = no smoothing: force unique vertices per face for flat normals
+                DWORD keySmGrp = smGrp == 0 ? (DWORD)(0x80000000u | fr.idx) : smGrp;
+                MeshCornerKey key = { posIdx, uvIdx, keySmGrp };
                 auto it = vertMap.find(key);
                 if (it != vertMap.end()) {
                     indices.push_back(it->second);
@@ -2529,7 +2546,7 @@ static bool ExtractMeshFromMNMesh(MNMesh& mn,
                     verts.push_back(p.z);
 
                     if (outNormals) {
-                        SmNormKey nk = { (int)posIdx, smGrp };
+                        SmNormKey nk = { (int)posIdx, fr.idx };
                         auto nit = smoothNormals.find(nk);
                         Point3 n = (nit != smoothNormals.end()) ? nit->second : faceNormals[fr.idx];
                         normals.push_back(n.x);

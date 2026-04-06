@@ -3217,13 +3217,40 @@ static bool TryExtractSkinRigData(
                 (it != handleToSkinIndex.end()) ? it->second : -1;
         }
 
+        // Use ISkin::GetBoneInitTM for true bind pose — the bone transforms from
+        // when the Skin modifier was set up, independent of current animation frame.
+        auto MatrixToFloat16 = [](const Matrix3& tm, float out[16]) {
+            Point3 r0 = tm.GetRow(0), r1 = tm.GetRow(1), r2 = tm.GetRow(2), tr = tm.GetTrans();
+            out[0]=r0.x; out[1]=r0.y; out[2]=r0.z; out[3]=0;
+            out[4]=r1.x; out[5]=r1.y; out[6]=r1.z; out[7]=0;
+            out[8]=r2.x; out[9]=r2.y; out[10]=r2.z; out[11]=0;
+            out[12]=tr.x; out[13]=tr.y; out[14]=tr.z; out[15]=1;
+        };
+
         std::vector<float> boneWorld(static_cast<size_t>(numBones) * 16u);
         for (int bi = 0; bi < numBones; bi++) {
             INode* bn = boneNodes[static_cast<size_t>(bi)];
-            if (bn)
-                GetTransform16(bn, t, &boneWorld[static_cast<size_t>(bi) * 16u]);
-            else
+            if (bn) {
+                Matrix3 initTM;
+                if (skin->GetBoneInitTM(bn, initTM) == SKIN_OK) {
+                    MatrixToFloat16(initTM, &boneWorld[static_cast<size_t>(bi) * 16u]);
+                } else {
+                    GetTransform16(bn, t, &boneWorld[static_cast<size_t>(bi) * 16u]);
+                }
+            } else {
                 Mat4IdentityCM(&boneWorld[static_cast<size_t>(bi) * 16u]);
+            }
+        }
+
+        // Get mesh's initial transform from Skin for root bone parent
+        float meshInitWorld[16];
+        {
+            Matrix3 skinInitTM;
+            if (skin->GetSkinInitTM(meshNode, skinInitTM) == SKIN_OK) {
+                MatrixToFloat16(skinInitTM, meshInitWorld);
+            } else {
+                GetTransform16(meshNode, t, meshInitWorld);
+            }
         }
 
         outBoneBindLocal.resize(static_cast<size_t>(numBones) * 16u);
@@ -3238,8 +3265,8 @@ static bool TryExtractSkinRigData(
             if (pi >= 0 && pi < numBones && boneNodes[static_cast<size_t>(pi)]) {
                 memcpy(parentWorld, &boneWorld[static_cast<size_t>(pi) * 16u], sizeof(float) * 16);
             } else {
-                // Root bone: parent in Three.js is the SkinnedMesh → use mesh node transform
-                GetTransform16(meshNode, t, parentWorld);
+                // Root bone: parent in Three.js is the SkinnedMesh → use mesh init transform
+                memcpy(parentWorld, meshInitWorld, sizeof(float) * 16);
             }
             float invParent[16];
             if (!InvertMat4CM(parentWorld, invParent))
@@ -6499,7 +6526,23 @@ public:
         bool first = true;
         for (auto& node : nodes) {
             float xform[16];
-            GetTransform16(node.node, t, xform);
+            if (node.skinRig) {
+                // Skinned mesh: use Skin's init transform to match bind pose
+                Modifier* sm = FindModifierOnNode(node.node, SKIN_CLASSID);
+                ISkin* sk = sm ? static_cast<ISkin*>(sm->GetInterface(I_SKIN)) : nullptr;
+                Matrix3 initTM;
+                if (sk && sk->GetSkinInitTM(node.node, initTM) == SKIN_OK) {
+                    Point3 r0 = initTM.GetRow(0), r1 = initTM.GetRow(1), r2 = initTM.GetRow(2), tr = initTM.GetTrans();
+                    xform[0]=r0.x; xform[1]=r0.y; xform[2]=r0.z; xform[3]=0;
+                    xform[4]=r1.x; xform[5]=r1.y; xform[6]=r1.z; xform[7]=0;
+                    xform[8]=r2.x; xform[9]=r2.y; xform[10]=r2.z; xform[11]=0;
+                    xform[12]=tr.x; xform[13]=tr.y; xform[14]=tr.z; xform[15]=1;
+                } else {
+                    GetTransform16(node.node, t, xform);
+                }
+            } else {
+                GetTransform16(node.node, t, xform);
+            }
 
             if (!first) ss << L',';
             first = false;

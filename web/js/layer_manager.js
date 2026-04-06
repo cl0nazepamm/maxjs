@@ -251,11 +251,12 @@ function createMaxSceneFacade({ scene, nodeMap, getAdapter, createAnchor, THREE 
             const query = String(name ?? '').toLowerCase();
             const exact = options.exact === true;
             const matches = [];
-            for (const [handle, obj] of nodeMap) {
-                const current = String(obj?.name ?? '').toLowerCase();
+            for (const handle of nodeMap.keys()) {
+                const adapter = getAdapter(handle);
+                const current = String(adapter?.name ?? '').toLowerCase();
                 if (!query) continue;
                 if ((exact && current === query) || (!exact && current.includes(query))) {
-                    matches.push(getAdapter(handle));
+                    matches.push(adapter);
                 }
             }
             return matches;

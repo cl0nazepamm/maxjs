@@ -5416,6 +5416,7 @@
         const DEBUG_STORAGE_KEY = 'maxjs_debug';
         let debugMode = isStandalone ? false
             : (localStorage.getItem(DEBUG_STORAGE_KEY) ?? 'true') === 'true';
+        perfHud.setDebugEnabled(debugMode);
 
         async function restoreInteractiveBrowserState() {
             restorePostFxState();
@@ -5443,6 +5444,7 @@
 
         function setDebugMode(enabled) {
             debugMode = enabled;
+            perfHud.setDebugEnabled(enabled);
             try { localStorage.setItem(DEBUG_STORAGE_KEY, String(debugMode)); } catch {}
             applyBuildMode();
         }

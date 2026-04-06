@@ -37,6 +37,7 @@ export function createPerfHud(infoEl) {
         active: false,
     };
 
+    let debugEnabled = false;
     let lastRenderPaintMs = 0;
     let prevCalls = 0;
     let prevTriangles = 0;
@@ -62,7 +63,7 @@ export function createPerfHud(infoEl) {
             `| rnd ${formatMs(state.renderMs)} ` +
             `| calls ${state.drawCalls} ` +
             `| tris ${state.triangleCount} ` +
-            `| mem ${state.memGeometries}g/${state.memTextures}t`;
+            `| geo ${state.memGeometries} tex ${state.memTextures}`;
     }
 
     return {
@@ -82,6 +83,7 @@ export function createPerfHud(infoEl) {
             if (state.active) paint();
         },
         updateRender(renderMs, renderInfo, memoryInfo) {
+            if (!debugEnabled) return;
             state.renderMs = renderMs;
             const currCalls = renderInfo?.calls ?? 0;
             const currTriangles = renderInfo?.triangles ?? 0;
@@ -99,8 +101,19 @@ export function createPerfHud(infoEl) {
             }
         },
         updateLayers(partial) {
+            if (!debugEnabled) return;
             Object.assign(state, partial);
             if (state.active) paint();
+        },
+        setDebugEnabled(enabled) {
+            debugEnabled = enabled;
+            if (!enabled) {
+                prevCalls = 0;
+                prevTriangles = 0;
+            }
+        },
+        isDebugEnabled() {
+            return debugEnabled;
         },
     };
 }

@@ -2794,44 +2794,6 @@
             );
         }
 
-        /** Avoid re-copying bind pose + skin/morph buffers when topology and layouts are unchanged. */
-        function canReuseSkinnedGeometry(mesh, nd) {
-            if (!mesh?.isSkinnedMesh || !mesh.userData?.maxjsSkinRig || !nd?.skin || nd.spline || nd.instOf) {
-                return false;
-            }
-            const g = mesh.geometry;
-            if (!g?.getAttribute('position') || !g.getIndex()) return false;
-            const geo = nd.geo;
-            const sk = nd.skin;
-            const pos = g.getAttribute('position');
-            const idx = g.getIndex();
-            if (pos.array.length !== geo.vN || idx.array.length !== geo.iN) return false;
-            if (geo.uvOff != null && geo.uvN) {
-                const uv = g.getAttribute('uv');
-                if (!uv || uv.array.length !== geo.uvN) return false;
-            }
-            if (geo.nOff != null && geo.nN) {
-                const nm = g.getAttribute('normal');
-                if (!nm || nm.array.length !== geo.nN) return false;
-            }
-            const sw = g.getAttribute('skinWeight');
-            const si = g.getAttribute('skinIndex');
-            if (!sw || !si || sw.array.length !== sk.wN || si.array.length !== sk.iN) return false;
-            const mNames = nd.morph?.names;
-            const mDN = nd.morph?.dN;
-            const mp = g.morphAttributes?.position;
-            const nMorph = Array.isArray(mNames) ? mNames.length : 0;
-            if (nMorph > 0) {
-                if (!mp || mp.length !== nMorph) return false;
-                for (let mi = 0; mi < nMorph; mi++) {
-                    if (!mDN || mDN[mi] !== mp[mi]?.array?.length) return false;
-                }
-            } else if (mp?.length) {
-                return false;
-            }
-            return true;
-        }
-
         function buildSkinnedMeshFromNd(geom, mat, nd, buffer) {
             const sk = nd.skin;
             const nB = sk.bones?.length ?? 0;
@@ -2950,67 +2912,56 @@
                         console.warn('[MaxJS binary] Invalid UV range for', nd.n);
                         continue;
                     }
+                    const vertsCopy = new Float32Array(
+                        new Float32Array(buffer, nd.geo.vOff, nd.geo.vN)
+                    );
+                    const idxCopy = new Uint32Array(
+                        new Int32Array(buffer, nd.geo.iOff, nd.geo.iN)
+                    );
 
-                    if (mesh && canReuseSkinnedGeometry(mesh, nd)) {
-                        geom = mesh.geometry;
-                        if (nd.groups) {
-                            geom.clearGroups();
-                            for (const [start, count, idx] of nd.groups) {
-                                geom.addGroup(start, count, idx);
-                            }
-                        }
-                    } else {
-                        const vertsCopy = new Float32Array(
-                            new Float32Array(buffer, nd.geo.vOff, nd.geo.vN)
+                    geom = new THREE.BufferGeometry();
+                    geom.setAttribute('position', new THREE.BufferAttribute(vertsCopy, 3));
+                    geom.setIndex(new THREE.BufferAttribute(idxCopy, 1));
+
+                    if (nd.geo.uvOff != null && nd.geo.uvN) {
+                        const uvsCopy = new Float32Array(
+                            new Float32Array(buffer, nd.geo.uvOff, nd.geo.uvN)
                         );
-                        const idxCopy = new Uint32Array(
-                            new Int32Array(buffer, nd.geo.iOff, nd.geo.iN)
+                        geom.setAttribute('uv', new THREE.BufferAttribute(uvsCopy, 2));
+                    }
+                    if (nd.geo.nOff != null && inRange(nd.geo.nOff, nd.geo.nN || 0)) {
+                        const normalsCopy = new Float32Array(
+                            new Float32Array(buffer, nd.geo.nOff, nd.geo.nN)
                         );
-
-                        geom = new THREE.BufferGeometry();
-                        geom.setAttribute('position', new THREE.BufferAttribute(vertsCopy, 3));
-                        geom.setIndex(new THREE.BufferAttribute(idxCopy, 1));
-
-                        if (nd.geo.uvOff != null && nd.geo.uvN) {
-                            const uvsCopy = new Float32Array(
-                                new Float32Array(buffer, nd.geo.uvOff, nd.geo.uvN)
-                            );
-                            geom.setAttribute('uv', new THREE.BufferAttribute(uvsCopy, 2));
+                        geom.setAttribute('normal', new THREE.BufferAttribute(normalsCopy, 3));
+                    } else if (!nd.spline) {
+                        geom.computeVertexNormals();
+                    }
+                    // Add material groups for Multi/Sub
+                    if (nd.groups) {
+                        for (const [start, count, idx] of nd.groups) {
+                            geom.addGroup(start, count, idx);
                         }
-                        if (nd.geo.nOff != null && inRange(nd.geo.nOff, nd.geo.nN || 0)) {
-                            const normalsCopy = new Float32Array(
-                                new Float32Array(buffer, nd.geo.nOff, nd.geo.nN)
-                            );
-                            geom.setAttribute('normal', new THREE.BufferAttribute(normalsCopy, 3));
-                        } else if (!nd.spline) {
-                            geom.computeVertexNormals();
+                    }
+                    if (nd.skin && geom && !nd.spline) {
+                        const sk = nd.skin;
+                        if (binInRange(buffer, sk.wOff, sk.wN) && binInRange(buffer, sk.iOff, sk.iN)) {
+                            const w = new Float32Array(new Float32Array(buffer, sk.wOff, sk.wN));
+                            const si = new Float32Array(new Float32Array(buffer, sk.iOff, sk.iN));
+                            geom.setAttribute('skinWeight', new THREE.Float32BufferAttribute(w, 4));
+                            geom.setAttribute('skinIndex', new THREE.Float32BufferAttribute(si, 4));
                         }
-                        // Add material groups for Multi/Sub
-                        if (nd.groups) {
-                            for (const [start, count, idx] of nd.groups) {
-                                geom.addGroup(start, count, idx);
+                        if (nd.morph?.dOff?.length && nd.morph?.dN?.length && nd.morph?.names?.length) {
+                            geom.morphAttributes = { position: [] };
+                            for (let mi = 0; mi < nd.morph.names.length; mi++) {
+                                const off = nd.morph.dOff[mi];
+                                const cnt = nd.morph.dN[mi];
+                                if (!binInRange(buffer, off, cnt)) continue;
+                                const d = new Float32Array(new Float32Array(buffer, off, cnt));
+                                geom.morphAttributes.position.push(new THREE.BufferAttribute(d, 3));
                             }
-                        }
-                        if (nd.skin && geom && !nd.spline) {
-                            const sk = nd.skin;
-                            if (binInRange(buffer, sk.wOff, sk.wN) && binInRange(buffer, sk.iOff, sk.iN)) {
-                                const w = new Float32Array(new Float32Array(buffer, sk.wOff, sk.wN));
-                                const si = new Float32Array(new Float32Array(buffer, sk.iOff, sk.iN));
-                                geom.setAttribute('skinWeight', new THREE.Float32BufferAttribute(w, 4));
-                                geom.setAttribute('skinIndex', new THREE.Float32BufferAttribute(si, 4));
-                            }
-                            if (nd.morph?.dOff?.length && nd.morph?.dN?.length && nd.morph?.names?.length) {
-                                geom.morphAttributes = { position: [] };
-                                for (let mi = 0; mi < nd.morph.names.length; mi++) {
-                                    const off = nd.morph.dOff[mi];
-                                    const cnt = nd.morph.dN[mi];
-                                    if (!binInRange(buffer, off, cnt)) continue;
-                                    const d = new Float32Array(new Float32Array(buffer, off, cnt));
-                                    geom.morphAttributes.position.push(new THREE.BufferAttribute(d, 3));
-                                }
-                                if (geom.morphAttributes.position.length > 0) {
-                                    geom.morphTargetRelative = false;
-                                }
+                            if (geom.morphAttributes.position.length > 0) {
+                                geom.morphTargetRelative = false;
                             }
                         }
                     }

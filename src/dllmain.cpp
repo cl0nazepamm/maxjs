@@ -6992,6 +6992,9 @@ public:
     void CheckSelectedGeometryLive() {
         Interface* ip = GetCOREInterface();
         if (!ip) return;
+        // During timeline playback, CheckTrackedGeometryLive() hashes every tracked mesh on
+        // TimeChanged — selection would duplicate ExtractMesh work every redraw.
+        if (ip->IsAnimPlaying()) return;
         const int selCount = ip->GetSelNodeCount();
         if (selCount <= 0) return;
         TimeValue t = ip->GetTime();
@@ -7012,6 +7015,34 @@ public:
             lastLiveGeomHash_[handle] = geomHash;
 
             // Geometry changed — send ONLY this mesh via fast path, no full sync
+            geoHashMap_.erase(handle);
+            geoFastDirtyHandles_.insert(handle);
+            fastDirtyHandles_.insert(handle);
+            changed = true;
+        }
+        if (changed) QueueFastFlush();
+    }
+
+    // While animation plays, deforming meshes (Skin, etc.) need per-time geometry even when
+    // not selected. SendFullSyncBinary can skip ExtractMesh when GEOM channel validity is
+    // unchanged; delta sync only updates transforms — so unselected skinned meshes froze
+    // unless selection forced CheckSelectedGeometryLive. Hash all tracked meshes each frame.
+    void CheckTrackedGeometryLive() {
+        Interface* ip = GetCOREInterface();
+        if (!ip || !ip->IsAnimPlaying() || geomHandles_.empty()) return;
+        TimeValue t = ip->GetTime();
+
+        bool changed = false;
+        for (ULONG handle : geomHandles_) {
+            INode* node = ip->GetINodeByHandle(handle);
+            if (!node) continue;
+
+            uint64_t geomHash = 0;
+            if (!TryHashExtractedRenderableGeometry(node, t, geomHash)) continue;
+            auto it = lastLiveGeomHash_.find(handle);
+            if (it != lastLiveGeomHash_.end() && it->second == geomHash) continue;
+            lastLiveGeomHash_[handle] = geomHash;
+
             geoHashMap_.erase(handle);
             geoFastDirtyHandles_.insert(handle);
             fastDirtyHandles_.insert(handle);
@@ -10070,6 +10101,7 @@ void MaxJSFastTimeChangeCallback::TimeChanged(TimeValue) {
     if (!owner_) return;
     owner_->MarkAllTrackedNodesDirty();
     owner_->MarkCameraDirty();
+    owner_->CheckTrackedGeometryLive();
 }
 
 static void OnSceneChanged(void* param, NotifyInfo*) {

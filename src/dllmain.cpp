@@ -7674,9 +7674,13 @@ public:
                 const ULONG handle = current->GetHandle();
                 if (!IsTrackedHandle(handle)) return;
                 geoHashMap_.erase(handle);
-                if (skinnedHandles_.count(handle)) {
-                    // Skinned meshes: topology is stable during animation,
-                    // downgrade to fast geo path instead of full sync
+                // Skinned meshes and selected nodes: route through fast geo path.
+                // Selected nodes get false topology notifications from parameter edits
+                // (e.g. sphere radius, modifier params). The JS geo_fast handler
+                // rebuilds BufferGeometry when topology actually changes.
+                // Unselected nodes with real structural changes get full sync;
+                // DetectGeometryChanges catches anything missed on idle.
+                if (skinnedHandles_.count(handle) || current->Selected()) {
                     geoFastDirtyHandles_.insert(handle);
                     if (fastDirtyHandles_.insert(handle).second) changed = true;
                 } else {
@@ -10687,6 +10691,7 @@ void MaxJSFastNodeEventCallback::TopologyChanged(NodeKeyTab& nodes) {
 void MaxJSFastRedrawCallback::proc(Interface*) {
     if (!owner_) return;
     owner_->MarkSelectedTransformsDirty();
+    owner_->CheckTrackedMaterialScalarsLive();
     if (!owner_->ShouldFavorInteractivePerformance()) {
         owner_->MarkTrackedLightTransformsDirty();
         owner_->CheckTrackedLightsLive();

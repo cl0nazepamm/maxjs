@@ -2327,6 +2327,7 @@
                 volumetric: ssgiFx.isVolumetricEnabled(),
                 pixel: ssgiFx.isPixelEnabled(),
                 fog: ssgiFx.isFogEnabled(),
+                opaqueBackdrop: ssgiFx.isOpaqueBackdropEnabled(),
             };
             // Disable everything
             ssgiFx.setEnabled(false);
@@ -2340,6 +2341,7 @@
             ssgiFx.setVolumetricEnabled(false);
             ssgiFx.setPixelEnabled(false);
             ssgiFx.setFogEnabled(false);
+            ssgiFx.setOpaqueBackdropEnabled(false);
             // Clay mode is unstable with GTAO enabled, so keep it off.
             if (ssgiFx.setClayOverride) ssgiFx.setClayOverride(true);
             ssgiFx.setGTAOEnabled(false);
@@ -2377,6 +2379,7 @@
                 ssgiFx.setVolumetricEnabled(clayPreFxSnapshot.volumetric);
                 ssgiFx.setPixelEnabled(clayPreFxSnapshot.pixel);
                 ssgiFx.setFogEnabled(clayPreFxSnapshot.fog);
+                ssgiFx.setOpaqueBackdropEnabled(clayPreFxSnapshot.opaqueBackdrop);
                 clayPreFxSnapshot = null;
             }
         }
@@ -4447,6 +4450,22 @@
                     { key: 'height', label: 'Height', min: 0, max: 9999, step: 1 },
                 ],
             },
+            {
+                key: 'opaqueBackdrop',
+                title: 'Opaque backdrop',
+                copy: 'Composite the frame onto a solid color and force alpha to 1. Use with fog without enabling SSR.',
+                note: 'Linear RGB (0–1). Matches viewport “empty” look when set to your scene background color.',
+                requiresWebGPU: false,
+                isEnabled: () => ssgiFx.isOpaqueBackdropEnabled(),
+                setEnabled: (enabled) => ssgiFx.setOpaqueBackdropEnabled(enabled),
+                getValues: (state) => state.opaqueBackdrop,
+                setValues: (patch) => ssgiFx.setOpaqueBackdropOptions(patch),
+                controls: [
+                    { key: 'red', label: 'Red', min: 0, max: 1, step: 0.01 },
+                    { key: 'green', label: 'Green', min: 0, max: 1, step: 0.01 },
+                    { key: 'blue', label: 'Blue', min: 0, max: 1, step: 0.01 },
+                ],
+            },
         ];
 
         function formatControlValue(control, value) {
@@ -4597,12 +4616,16 @@
                     volumetric: { intensity: 1.0, steps: 12, density: 0.5, denoise: 0.6, resolution: 0.25 },
                     pixel: { pixelate: false, pixelSize: 4, chromatic: false, chromaticIntensity: 0.005, sharpen: false, sharpenStrength: 0.5, grain: false, grainIntensity: 0.08, brightness: 0, contrast: 0, saturation: 0 },
                     fog: { type: 0, opacity: 1.0, near: 10, far: 500, density: 0.01, noiseScale: 0.005, noiseSpeed: 0.2, height: 20 },
+                    opaqueBackdrop: (() => {
+                        const c = new THREE.Color(hiddenBackgroundColor);
+                        return { red: c.r, green: c.g, blue: c.b };
+                    })(),
                 };
                 if (clayModeActive) {
                     // Clay owns the live FX state — reset the snapshot so exit restores to defaults
                     clayPreFxSnapshot = { ssgi: false, ssr: false, gtao: false, bloom: false,
                         toonOutline: false, motionBlur: false, traa: false, contactShadow: false,
-                        retro: false, volumetric: false, pixel: false, fog: false };
+                        retro: false, volumetric: false, pixel: false, fog: false, opaqueBackdrop: false };
                     // Still push default values so they're ready when clay exits
                     for (const section of postFxSections) {
                         if (defaults[section.key]) section.setValues(defaults[section.key]);

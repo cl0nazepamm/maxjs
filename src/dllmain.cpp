@@ -9,6 +9,7 @@
 #include <iepoly.h>
 #include <iEPolyMod.h>
 #include <gencam.h>
+#include <Scene/IPhysicalCamera.h>
 #include <mnmesh.h>
 #include <splshape.h>
 #include <notify.h>
@@ -2891,8 +2892,6 @@ struct CameraData {
     float dofBokehScale;    // artistic bokeh size multiplier
 };
 
-static constexpr Class_ID PHYSICAL_CAM_CLASS_ID(0x46695608, 0x28E9148D);
-
 static void GetViewportCamera(CameraData& cam) {
     Interface* ip = GetCOREInterface();
 
@@ -2926,46 +2925,42 @@ static void GetViewportCamera(CameraData& cam) {
     if (camNode && cam.perspective) {
         TimeValue t = ip->GetTime();
         ObjectState os = camNode->EvalWorldState(t);
-        if (os.obj && os.obj->ClassID() == PHYSICAL_CAM_CLASS_ID) {
-            IParamBlock2* pb = os.obj->GetParamBlockByID(0);
-            if (pb) {
-                int useDof = 0;
-                pb->GetValue(11, t, useDof, FOREVER);
-                cam.dofEnabled = useDof != 0;
+        // Use IPhysicalCamera API — Class_ID differs across Max versions; ParamBlock indices are not stable.
+        MaxSDK::IPhysicalCamera* phys = dynamic_cast<MaxSDK::IPhysicalCamera*>(os.obj);
+        if (phys) {
+            Interval iv = FOREVER;
+            cam.dofEnabled = phys->GetDOFEnabled(t, iv);
 
-                if (cam.dofEnabled) {
-                    float fNumber = 8.0f;
-                    float focusDist = 5.0f;
-                    float targetDist = 5.0f;
-                    float focalLengthMM = 40.0f;
-                    float sensorWidthMM = 36.0f;
-                    int specifyFocus = 0;
+            if (cam.dofEnabled) {
+                iv = FOREVER;
+                float focusDist = phys->GetFocusDistance(t, iv);
+                if (focusDist < 1e-4f) focusDist = 5.0f;
 
-                    pb->GetValue(6, t, fNumber, FOREVER);
-                    pb->GetValue(9, t, focusDist, FOREVER);
-                    pb->GetValue(8, t, targetDist, FOREVER);
-                    pb->GetValue(10, t, specifyFocus, FOREVER);
-                    pb->GetValue(5, t, focalLengthMM, FOREVER);
-                    pb->GetValue(4, t, sensorWidthMM, FOREVER);
+                iv = FOREVER;
+                float fNumber = phys->GetLensApertureFNumber(t, iv);
+                if (fNumber < 1e-4f) fNumber = 8.0f;
 
-                    float effectiveFocusDist = (specifyFocus != 0) ? focusDist : targetDist;
-                    if (effectiveFocusDist < 1e-4f) effectiveFocusDist = 5.0f;
+                iv = FOREVER;
+                float focalLenSU = phys->GetEffectiveLensFocalLength(t, iv);
+                if (focalLenSU < 1e-6f) focalLenSU = 0.04f;
 
-                    double mmPerSU = GetSystemUnitScale(UNITS_MILLIMETERS);
-                    if (mmPerSU < 1e-9) mmPerSU = 1.0;
-                    float focalLengthSU = focalLengthMM / (float)mmPerSU;
-                    float cocSU = (sensorWidthMM / 1500.0f) / (float)mmPerSU;
+                iv = FOREVER;
+                float filmW = phys->GetFilmWidth(t, iv);
+                double mmPerSU = GetSystemUnitScale(UNITS_MILLIMETERS);
+                if (mmPerSU < 1e-9) mmPerSU = 1.0;
+                if (filmW < 1e-6f) filmW = 36.0f / (float)mmPerSU;
 
-                    float dofHalf = 0.0f;
-                    if (focalLengthSU > 1e-6f) {
-                        dofHalf = fNumber * cocSU * effectiveFocusDist * effectiveFocusDist /
-                                  (focalLengthSU * focalLengthSU);
-                    }
+                float cocSU = filmW / 1500.0f;
 
-                    cam.dofFocusDistance = effectiveFocusDist;
-                    cam.dofFocalLength = std::clamp(dofHalf, 0.01f, effectiveFocusDist * 10.0f);
-                    cam.dofBokehScale = std::clamp(focalLengthMM / fNumber, 0.5f, 30.0f);
+                float dofHalf = 0.0f;
+                if (focalLenSU > 1e-6f) {
+                    dofHalf = fNumber * cocSU * focusDist * focusDist / (focalLenSU * focalLenSU);
                 }
+
+                cam.dofFocusDistance = focusDist;
+                cam.dofFocalLength = std::clamp(dofHalf, 0.01f, focusDist * 10.0f);
+                float focalMM = focalLenSU * (float)mmPerSU;
+                cam.dofBokehScale = std::clamp(focalMM / fNumber, 0.5f, 30.0f);
             }
         }
     }

@@ -87,6 +87,10 @@ export function createSSGIController({
     const hiddenBackground = new THREE.Color(hiddenBackgroundColor);
     const hiddenBackgroundNode = vec3(hiddenBackground.r, hiddenBackground.g, hiddenBackground.b);
 
+    const opaqueBackdropRU = uniform(hiddenBackground.r);
+    const opaqueBackdropGU = uniform(hiddenBackground.g);
+    const opaqueBackdropBU = uniform(hiddenBackground.b);
+
     // Cached toon mesh detection — refreshed on pipeline rebuild, not every frame
     let cachedHasToonMeshes = false;
 
@@ -238,6 +242,12 @@ export function createSSGIController({
             focalLength: 50,
             bokehScale: 5,
         },
+        opaqueBackdrop: {
+            enabled: false,
+            red: hiddenBackground.r,
+            green: hiddenBackground.g,
+            blue: hiddenBackground.b,
+        },
     };
 
     let selectedObjects = [];
@@ -372,7 +382,9 @@ export function createSSGIController({
             || state.retro.enabled
             || state.pixel.enabled
             || state.volumetric.enabled
-            || state.dof.enabled;
+            || state.dof.enabled
+            || state.fog.enabled
+            || state.opaqueBackdrop.enabled;
     }
 
     function computeSceneReferenceSize() {
@@ -428,6 +440,7 @@ export function createSSGIController({
             pixel: { ...state.pixel },
             volumetric: { ...state.volumetric },
             dof: { ...state.dof },
+            opaqueBackdrop: { ...state.opaqueBackdrop },
         };
     }
 
@@ -671,8 +684,15 @@ export function createSSGIController({
                 sceneContext = builtinShadowContext(sssSample, mainLight, sceneContext);
             }
 
+            // When HDRI is loaded but not shown as the viewport background, the scene pass still
+            // sees environment in reflections; far-depth pixels must be normalized to hidden fill + a=0
+            // so SSR, fog (isBg), and opaque backdrop (mix) behave. This was SSR-only before, which
+            // broke fog / opaque backdrop whenever SSR was off.
+            const hiddenEnvironmentBackdrop =
+                !useRetroTakeover && !!scene.environment && !environmentVisible;
             const useEnvironmentBackdropCompensation =
-                state.ssr.enabled && !useRetroTakeover && !!scene.environment && !environmentVisible;
+                hiddenEnvironmentBackdrop
+                && (state.ssr.enabled || state.fog.enabled || state.opaqueBackdrop.enabled);
 
             let beauty;
             let scenePassNode = null;
@@ -720,6 +740,8 @@ export function createSSGIController({
                     : pass(scene, camera);
                 activeNodes.push(scenePass);
                 scenePassNode = scenePass;
+                // Transparent pass + RGBA beauty so empty pixels stay a=0 (HTML/WebView2 backdrop + fog alpha comp)
+                scenePass.transparent = true;
 
                 if (sceneContext) scenePass.contextNode = sceneContext;
 
@@ -803,9 +825,11 @@ export function createSSGIController({
                 dofFocusDistanceU.value = state.dof.focusDistance;
                 dofFocalLengthU.value = state.dof.focalLength;
                 dofBokehScaleU.value = state.dof.bokehScale;
+                const beautyBeforeDof = beauty;
                 const dofPass = dof(beauty, scenePassNode.getViewZNode(), dofFocusDistanceU, dofFocalLengthU, dofBokehScaleU);
                 activeNodes.push(dofPass);
-                beauty = dofPass;
+                // DepthOfFieldNode composite forces a=1; keep scene alpha for transparent backdrop + fog
+                beauty = vec4(dofPass.rgb, beautyBeforeDof.a);
             }
 
             // Toon outline is handled at the scene pass level (line above) —
@@ -1004,6 +1028,15 @@ export function createSSGIController({
                 const fogCol = vec3(f.color[0], f.color[1], f.color[2]);
                 const isBg = beauty.a.lessThan(0.001);
                 beauty = vec4(isBg.select(fogCol, beauty.rgb), max(beauty.a, fogAlpha));
+            }
+
+            // Solid backdrop + force a=1 — straight-alpha composite (no transparent canvas / no SSR workaround)
+            if (state.opaqueBackdrop.enabled) {
+                opaqueBackdropRU.value = state.opaqueBackdrop.red;
+                opaqueBackdropGU.value = state.opaqueBackdrop.green;
+                opaqueBackdropBU.value = state.opaqueBackdrop.blue;
+                const solidBg = vec3(opaqueBackdropRU, opaqueBackdropGU, opaqueBackdropBU);
+                beauty = vec4(mix(solidBg, beauty.rgb, beauty.a), float(1));
             }
 
             postProcessing.outputNode = beauty;
@@ -1383,6 +1416,7 @@ export function createSSGIController({
         setFogEnabled(enabled) {
             state.fog.enabled = !!enabled;
             applyFog();
+            rebuildPipeline();
             return state.fog.enabled;
         },
         setFogOptions(options = {}) {
@@ -1396,6 +1430,7 @@ export function createSSGIController({
             assignFinite(state.fog, 'noiseSpeed', options.noiseSpeed);
             assignFinite(state.fog, 'height', options.height);
             applyFog();
+            rebuildPipeline();
             return { ...state.fog };
         },
         setFogFromScene(fogData) {
@@ -1411,6 +1446,28 @@ export function createSSGIController({
             if (Number.isFinite(fogData.noiseSpeed)) state.fog.noiseSpeed = fogData.noiseSpeed;
             if (Number.isFinite(fogData.height)) state.fog.height = fogData.height;
             applyFog();
+            rebuildPipeline();
+        },
+
+        isOpaqueBackdropEnabled() {
+            return state.opaqueBackdrop.enabled;
+        },
+        setOpaqueBackdropEnabled(enabled) {
+            state.opaqueBackdrop.enabled = !!enabled;
+            rebuildPipeline();
+            return state.opaqueBackdrop.enabled;
+        },
+        setOpaqueBackdropOptions(options = {}) {
+            assignFinite(state.opaqueBackdrop, 'red', options.red);
+            assignFinite(state.opaqueBackdrop, 'green', options.green);
+            assignFinite(state.opaqueBackdrop, 'blue', options.blue);
+            opaqueBackdropRU.value = state.opaqueBackdrop.red;
+            opaqueBackdropGU.value = state.opaqueBackdrop.green;
+            opaqueBackdropBU.value = state.opaqueBackdrop.blue;
+            if (pipelineReady && state.opaqueBackdrop.enabled) {
+                postProcessing.needsUpdate = true;
+            }
+            return { ...state.opaqueBackdrop };
         },
 
         render() {

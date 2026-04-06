@@ -7903,8 +7903,12 @@ public:
         if (!jsReady_ || !webview_) return;
         tickCount_++;
 
+        const int envPhase = tickCount_ % ENV_FOG_POLL_TICKS;
+        const int lightPhase = tickCount_ % LIGHT_DETECT_TICKS;
+        const int slowPhase = tickCount_ % 15;
+
         // Poll env+fog at reduced cadence (~200ms)
-        if (tickCount_ % ENV_FOG_POLL_TICKS == 0) PollEnvFog();
+        if (envPhase == 0) PollEnvFog();
 
         if (dirty_) {
             // Debounce: wait for notifications to settle before expensive full sync
@@ -7913,19 +7917,19 @@ public:
                 if (useBinary_) SendFullSyncBinary(); else SendFullSync();
             }
         } else {
-            if (tickCount_ % 15 == 0) CheckWebContentChanges();
-            if (tickCount_ % 15 == 0) CheckProjectContentChanges();
-            if (tickCount_ % MATERIAL_DETECT_TICKS == 0) DetectMaterialChanges();
-            if (tickCount_ % LIGHT_DETECT_TICKS == 0) DetectPropertyChanges();
-            if (tickCount_ % LIGHT_DETECT_TICKS == 0) {
+            if (slowPhase == 0) CheckWebContentChanges();
+            if (slowPhase == 3) CheckProjectContentChanges();
+            if (tickCount_ % MATERIAL_DETECT_TICKS == 2) DetectMaterialChanges();
+            if (lightPhase == 0) DetectPropertyChanges();
+            if (lightPhase == 1) {
                 DetectLightChanges();
                 DetectSplatChanges();
             }
-            if (tickCount_ % 15 == 0) DetectGeometryChanges();
-            if (tickCount_ % 15 == 0) DetectJsModChanges();
-            if (tickCount_ % 15 == 0) DetectPluginInstanceChanges();
-            if (tickCount_ % LIGHT_DETECT_TICKS == 0) PollViewportModes();
-            if (tickCount_ % 15 == 0) ScanInlineLayers();
+            if (slowPhase == 6) DetectGeometryChanges();
+            if (slowPhase == 9) DetectJsModChanges();
+            if (slowPhase == 12) DetectPluginInstanceChanges();
+            if (lightPhase == 2) PollViewportModes();
+            if (slowPhase == 1) ScanInlineLayers();
         }
     }
 
@@ -8608,12 +8612,28 @@ public:
             ULONG handle = handles[idx];
             INode* node = ip->GetINodeByHandle(handle);
             if (node) {
-                uint64_t hash = 0;
-                if (TryHashExtractedRenderableGeometry(node, t, hash)) {
-                    auto it = geoHashMap_.find(handle);
-                    if (it == geoHashMap_.end() || it->second != hash) {
-                        SetDirty();
-                        return;
+                if (!geoFastDirtyHandles_.count(handle) && !skinnedHandles_.count(handle)) {
+                    ObjectState os = node->EvalWorldState(t);
+                    bool needsHashCheck = true;
+                    if (os.obj && os.obj->SuperClassID() == GEOMOBJECT_CLASS_ID) {
+                        const uint64_t validKey = MakeGeomValidityKey(os.obj->ChannelValidity(t, GEOM_CHAN_NUM));
+                        auto bboxIt = lastBBoxHash_.find(handle);
+                        if (bboxIt != lastBBoxHash_.end() && bboxIt->second == validKey) {
+                            needsHashCheck = false;
+                        } else {
+                            lastBBoxHash_[handle] = validKey;
+                        }
+                    }
+
+                    if (needsHashCheck) {
+                        uint64_t hash = 0;
+                        if (TryHashExtractedRenderableGeometry(node, t, hash)) {
+                            auto it = geoHashMap_.find(handle);
+                            if (it == geoHashMap_.end() || it->second != hash) {
+                                SetDirty();
+                                return;
+                            }
+                        }
                     }
                 }
             }

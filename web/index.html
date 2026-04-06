@@ -3067,26 +3067,13 @@
             applyForestInstances(meta.forestInstances);
             applyVolumes(meta.volumes);
             scene.updateMatrixWorld(true);
-            // Recalculate skeleton boneInverses now that skinned meshes are
-            // in the scene hierarchy (under maxBasisRoot). Without this,
-            // boneInverses miss the Z→Y basis conversion and animation
-            // deltas are applied in the wrong coordinate space.
+            // Recalculate skeleton boneInverses for NEWLY created skinned meshes
+            // (only needed once — after the mesh is in the scene hierarchy under maxBasisRoot).
             for (const mesh of nodeMap.values()) {
-                if (mesh?.isSkinnedMesh && mesh.skeleton) {
+                if (mesh?.isSkinnedMesh && mesh.skeleton && !mesh.userData._skelBound) {
                     mesh.skeleton.calculateInverses();
                     mesh.bind(mesh.skeleton, mesh.matrixWorld);
-                    // Debug: dump skeleton state
-                    const sk = mesh.skeleton;
-                    for (let i = 0; i < Math.min(sk.bones.length, 5); i++) {
-                        const b = sk.bones[i];
-                        const inv = sk.boneInverses[i];
-                        console.log(`[SKEL ${i}] ${b.name} parent=${b.parent?.name}`,
-                            'pos', b.position.toArray().map(v=>+v.toFixed(3)),
-                            'mW', b.matrixWorld.elements.slice(12,15).map(v=>+v.toFixed(2)),
-                            'inv[12..14]', inv.elements.slice(12,15).map(v=>+v.toFixed(2)));
-                    }
-                    console.log('[SKEL] bindMatrix pos:', mesh.matrixWorld.elements.slice(12,15).map(v=>+v.toFixed(2)));
-                    console.log('[SKEL] mesh.matrix:', mesh.matrix.elements.slice(12,15).map(v=>+v.toFixed(2)));
+                    mesh.userData._skelBound = true;
                 }
             }
             animationSystem?.invalidateTargets();

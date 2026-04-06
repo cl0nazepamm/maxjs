@@ -1000,15 +1000,16 @@ export function createSSGIController({
                 }
             }
 
+            // Environment backdrop compensation: hide HDRI on background when not visible
             if (useEnvironmentBackdropCompensation && scenePassDepth) {
-                const hasSceneGeometry = scenePassDepth.r.lessThan(float(0.999999));
+                const hasGeom = scenePassDepth.r.lessThan(float(0.999999));
                 beauty = vec4(
-                    hasSceneGeometry.select(beauty.rgb, hiddenBackgroundNode),
-                    hasSceneGeometry.select(beauty.a, float(0))
+                    hasGeom.select(beauty.rgb, hiddenBackgroundNode),
+                    hasGeom.select(beauty.a, float(0))
                 );
             }
 
-            // Fog alpha — make fog visible over transparent backgrounds
+            // Fog: blend fog color based on depth, works over geometry AND background
             if (state.fog.enabled && scenePassDepth) {
                 const f = state.fog;
                 const d = scenePassDepth.r;
@@ -1026,8 +1027,16 @@ export function createSSGIController({
                 }
 
                 const fogCol = vec3(f.color[0], f.color[1], f.color[2]);
-                const isBg = beauty.a.lessThan(0.001);
-                beauty = vec4(isBg.select(fogCol, beauty.rgb), max(beauty.a, fogAlpha));
+                // Blend fog color over scene based on depth-computed alpha
+                const blended = beauty.rgb.mul(fogAlpha.oneMinus()).add(fogCol.mul(fogAlpha));
+                beauty = vec4(blended, max(beauty.a, fogAlpha));
+            }
+
+            // Opaque backdrop alpha mask: set background alpha=0 when env is visible (HDRI has alpha=1)
+            // Skip when fog is enabled (fog already set proper alpha) or when env compensation ran (already alpha=0)
+            if (state.opaqueBackdrop.enabled && scenePassDepth && !state.fog.enabled && !useEnvironmentBackdropCompensation) {
+                const hasGeom = scenePassDepth.r.lessThan(float(0.999999));
+                beauty = vec4(beauty.rgb, hasGeom.select(beauty.a, float(0)));
             }
 
             // Solid backdrop + force a=1 — straight-alpha composite (no transparent canvas / no SSR workaround)
@@ -1189,8 +1198,12 @@ export function createSSGIController({
             const nextVisible = !!visible;
             if (environmentVisible === nextVisible) return environmentVisible;
             environmentVisible = nextVisible;
-            if (state.ssr.enabled) rebuildPipeline();
+            rebuildPipeline();
             return environmentVisible;
+        },
+        /** Call after scene.environment toggles or swaps (local HDRI load, Max HDRI, clear). */
+        markEnvironmentChanged() {
+            if (hasAnyEffectEnabled() && available) rebuildPipeline();
         },
         isBloomEnabled() {
             return state.bloom.enabled;

@@ -1433,6 +1433,7 @@
                     await updateLightProbeFromHDRI(hdrTex, probeSignature, loadGeneration);
                 }
                 hdrTex.dispose();
+                ssgiFx.markEnvironmentChanged?.();
             }, undefined, (error) => {
                 console.error('MaxJS HDRI load failed', { hdriUrl, error });
                 currentHdriUrl = null;
@@ -1442,6 +1443,7 @@
                 clearLightProbe();
                 if (envVisible) scene.background = new THREE.Color(hiddenBackgroundColor);
                 defaultLights.visible = true;
+                ssgiFx.markEnvironmentChanged?.();
             });
         }
 
@@ -1498,12 +1500,12 @@
             } catch {}
         }
 
-        function loadLocalHDRIFile(file) {
+        function loadLocalHDRIFile(file, { preserveEnabled = false } = {}) {
             if (localHdriObjectUrl) URL.revokeObjectURL(localHdriObjectUrl);
             if (localHdriEnvMap) { localHdriEnvMap.dispose(); localHdriEnvMap = null; }
             localHdriObjectUrl = URL.createObjectURL(file);
             localHdriFileName = file.name;
-            localHdriEnabled = true;
+            if (!preserveEnabled) localHdriEnabled = true;
             void stashHdriFile(file);
 
             const isExr = file.name.toLowerCase().endsWith('.exr');
@@ -1522,6 +1524,7 @@
                     await updateLightProbeFromHDRI(hdrTex, 'local-' + localHdriFileName, loadGen);
                 }
                 hdrTex.dispose();
+                ssgiFx.markEnvironmentChanged?.();
                 savePostFxState();
                 syncHdriPanel();
             }, undefined, (error) => {
@@ -1533,6 +1536,7 @@
         function applyLocalHDRIToScene() {
             if (!localHdriEnvMap) return;
             if (localHdriEnabled) {
+                localHdriShowBg = envVisible;
                 scene.environment = localHdriEnvMap;
                 scene.environmentIntensity = localHdriIntensity;
                 const rot = localHdriRotation * Math.PI / 180;
@@ -1565,6 +1569,7 @@
         function toggleLocalHDRI(enabled) {
             localHdriEnabled = enabled;
             applyLocalHDRIToScene();
+            ssgiFx.markEnvironmentChanged?.();
             savePostFxState();
             syncHdriPanel();
         }
@@ -1585,6 +1590,7 @@
             scene.background = new THREE.Color(hiddenBackgroundColor);
             clearLightProbe();
             defaultLights.visible = true;
+            ssgiFx.markEnvironmentChanged?.();
             savePostFxState();
             syncHdriPanel();
         }
@@ -1694,6 +1700,8 @@
                 // Clear HDRI state
                 currentHdriUrl = null;
                 currentHdriProbeSignature = '';
+
+                ssgiFx.markEnvironmentChanged?.();
 
             } catch (err) {
                 console.error('[MaxJS] applySky error:', err);
@@ -4940,6 +4948,7 @@
                     // Apply blur to scene even without HDRI loaded (will be used when HDRI loads)
                     scene.backgroundBlurriness = localHdriBlur;
                 }
+                localHdriShowBg = envVisible;
 
                 btnEnv.textContent = `Env: ${envVisible ? 'ON' : 'OFF'}`;
                 btnEnv.classList.toggle('active', envVisible);
@@ -5291,7 +5300,7 @@
                 splatOverlay.renderer.render(splatOverlay.scene, splatOverlay.camera);
             }
             syncPostFxPanel();
-            perfHud.updateRender(performance.now() - renderStart, renderer.info?.render);
+            perfHud.updateRender(performance.now() - renderStart, renderer.info?.render, renderer.info?.memory);
         }
 
         // ── JS_Inline Layer Manager ──────────────────────────
@@ -5413,7 +5422,7 @@
             syncPostFxPanel(true);
 
             const file = await restoreStashedHdri();
-            if (file && !isLocalHdriLoaded()) loadLocalHDRIFile(file);
+            if (file && !isLocalHdriLoaded()) loadLocalHDRIFile(file, { preserveEnabled: true });
         }
 
         async function bootStandaloneSnapshot() {

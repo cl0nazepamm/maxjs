@@ -32,10 +32,14 @@ export function createPerfHud(infoEl) {
         textureCount: 0,
         drawCalls: 0,
         triangleCount: 0,
+        memGeometries: 0,
+        memTextures: 0,
         active: false,
     };
 
     let lastRenderPaintMs = 0;
+    let prevCalls = 0;
+    let prevTriangles = 0;
 
     function paint() {
         if (!infoEl.offsetParent && infoEl.style.display === 'none') return;
@@ -57,7 +61,8 @@ export function createPerfHud(infoEl) {
             `| anc ${state.anchorCount} ` +
             `| rnd ${formatMs(state.renderMs)} ` +
             `| calls ${state.drawCalls} ` +
-            `| tris ${state.triangleCount}`;
+            `| tris ${state.triangleCount} ` +
+            `| mem ${state.memGeometries}g/${state.memTextures}t`;
     }
 
     return {
@@ -76,10 +81,16 @@ export function createPerfHud(infoEl) {
             state.textureCount = textureCount;
             if (state.active) paint();
         },
-        updateRender(renderMs, renderInfo) {
+        updateRender(renderMs, renderInfo, memoryInfo) {
             state.renderMs = renderMs;
-            state.drawCalls = renderInfo?.calls ?? 0;
-            state.triangleCount = renderInfo?.triangles ?? 0;
+            const currCalls = renderInfo?.calls ?? 0;
+            const currTriangles = renderInfo?.triangles ?? 0;
+            state.drawCalls = currCalls - prevCalls;
+            state.triangleCount = currTriangles - prevTriangles;
+            prevCalls = currCalls;
+            prevTriangles = currTriangles;
+            state.memGeometries = memoryInfo?.geometries ?? 0;
+            state.memTextures = memoryInfo?.textures ?? 0;
 
             const now = performance.now();
             if (state.active && now - lastRenderPaintMs >= 250) {

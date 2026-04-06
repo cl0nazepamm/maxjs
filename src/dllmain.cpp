@@ -3129,34 +3129,19 @@ static bool TryExtractSkinRigData(
     outMorphDeltas.clear();
 
     Modifier* skinMod = FindModifierOnNode(meshNode, SKIN_CLASSID);
-    Modifier* morphMod = FindModifierOnNode(meshNode, MR3_CLASS_ID);
+    if (!skinMod) return false;
 
-    // Need at least Skin or Morpher
-    if (!skinMod && !morphMod) return false;
+    ISkin* skin = static_cast<ISkin*>(skinMod->GetInterface(I_SKIN));
+    if (!skin) return false;
 
-    ISkin* skin = nullptr;
-    if (skinMod) {
-        skin = static_cast<ISkin*>(skinMod->GetInterface(I_SKIN));
-        if (!skin) skinMod = nullptr;  // Skin interface unavailable, treat as no-skin
-    }
-
-    // Disable Skin (keep Morpher active) so bind pose matches Skin's expected topology.
-    // Extract with controlIdx mapping so split render vertices map back to control vertices
-    // (needed for skin weight lookup when ExtractMesh splits verts by UV/smoothing).
-    if (skinMod) skinMod->DisableMod();
+    // Disable Skin to get undeformed bind pose mesh.
+    // controlIdx maps split render vertices back to control vertices for skin weight lookup.
+    skinMod->DisableMod();
     std::vector<float> bindVerts, bindUvs, bindNorms;
     std::vector<int> bindIdx, controlIdx;
     std::vector<MatGroup> bindGroups;
-    bool bindOk = false;
-    if (skinMod) {
-        bindOk = ExtractMesh(meshNode, t, bindVerts, bindUvs, bindIdx, bindGroups, &bindNorms, &controlIdx);
-        skinMod->EnableMod();
-    } else {
-        // Morpher only: bind pose = mesh with Morpher off (true base shape)
-        if (morphMod) morphMod->DisableMod();
-        bindOk = ExtractMesh(meshNode, t, bindVerts, bindUvs, bindIdx, bindGroups, &bindNorms, &controlIdx);
-        if (morphMod) morphMod->EnableMod();
-    }
+    const bool bindOk = ExtractMesh(meshNode, t, bindVerts, bindUvs, bindIdx, bindGroups, &bindNorms, &controlIdx);
+    skinMod->EnableMod();
     if (!bindOk) return false;
 
     const int vCount = static_cast<int>(bindVerts.size() / 3);
@@ -3168,28 +3153,15 @@ static bool TryExtractSkinRigData(
     indices = std::move(bindIdx);
     groups = std::move(bindGroups);
 
-    int numBones = 0;
-    ISkinContextData* skinData = nullptr;
-    if (skin) {
-        skinData = skin->GetContextInterface(meshNode);
-        if (skinData) {
-            const int nPts = skinData->GetNumPoints();
-            // nPts is control vertex count; vCount may be larger (split for UV/smoothing).
-            // controlIdx maps each split vertex back to its control vertex index.
-            if (static_cast<int>(controlIdx.size()) != vCount) skinData = nullptr;  // safety check
-        }
-        if (skinData) {
-            numBones = skin->GetNumBones();
-            if (numBones <= 0) skinData = nullptr;
-        }
-    }
-    // Skin-only mode: must have valid skin data
-    if (!morphMod && !skinData) return false;
-    // Morpher-only or Skin+Morpher: continue even without skin data
+    ISkinContextData* skinData = skin->GetContextInterface(meshNode);
+    if (!skinData) return false;
+    if (static_cast<int>(controlIdx.size()) != vCount) return false;
 
-    // ── Skin bone/weight extraction (only if Skin modifier present) ──
+    const int numBones = skin->GetNumBones();
+    if (numBones <= 0) return false;
+
     std::vector<INode*> boneNodes;
-    if (skinData && numBones > 0) {
+    {
         boneNodes.resize(static_cast<size_t>(numBones), nullptr);
         outBoneHandles.resize(static_cast<size_t>(numBones));
         std::unordered_map<ULONG, int> handleToSkinIndex;
@@ -3308,39 +3280,6 @@ static bool TryExtractSkinRigData(
                     outSkinIdx[static_cast<size_t>(vi) * 4u + static_cast<size_t>(k)] = 0.0f;
                     outSkinW[static_cast<size_t>(vi) * 4u + static_cast<size_t>(k)] = 0.0f;
                 }
-            }
-        }
-    } // end skin data block
-
-    // ── Morpher extraction (works with or without Skin) ──
-    const int nPts = vCount;  // morpher point count should match bind pose vertex count
-    if (morphMod) {
-        IMorpher* morpher = static_cast<IMorpher*>(morphMod->GetInterface(I_MORPHER_INTERFACE_ID));
-        if (morpher) {
-            const int nCh = morpher->NumChannels();
-            for (int ci = 0; ci < nCh; ci++) {
-                IMorpherChannel* ch = morpher->GetChannel(ci, false);
-                if (!ch || !ch->IsActive()) continue;
-                if (ch->NumPoints() != nPts) continue;
-                std::vector<float> delta(static_cast<size_t>(nPts) * 3u);
-                bool any = false;
-                for (int pi = 0; pi < nPts; pi++) {
-                    Point3 d = ch->GetDelta(pi);
-                    float o[3];
-                    DeltaPoint3ToYUp(d, o);
-                    delta[static_cast<size_t>(pi) * 3u + 0u] = o[0];
-                    delta[static_cast<size_t>(pi) * 3u + 1u] = o[1];
-                    delta[static_cast<size_t>(pi) * 3u + 2u] = o[2];
-                    if (std::fabs(o[0]) > 1.0e-12f || std::fabs(o[1]) > 1.0e-12f || std::fabs(o[2]) > 1.0e-12f)
-                        any = true;
-                }
-                if (!any) continue;
-                const MCHAR* nm = ch->GetName(false);
-                outMorphNames.push_back(nm ? std::wstring(nm) : (L"morph_" + std::to_wstring(ci)));
-                outMorphChannelIds.push_back(ci);
-                double pct = ch->GetTargetPercent(0);
-                outMorphInfl.push_back(static_cast<float>(pct / 100.0));
-                outMorphDeltas.push_back(std::move(delta));
             }
         }
     }
@@ -4474,6 +4413,9 @@ public:
     bool fastFlushPosted_ = false;
     bool haveLastSentCamera_ = false;
     ULONGLONG dirtyStamp_ = 0;   // when dirty_ was last set (for debounce)
+    // Throttles CheckSelectedGeometryLive (full ExtractMesh + hash) when GEOM channel validity is stable.
+    ULONGLONG lastSelectedGeometryLiveRunMs_ = 0;
+    std::unordered_map<ULONG, uint64_t> lastSelectedGeomChannelKey_;
     CameraData lastSentCamera_ = {};
     SceneEventNamespace::CallbackKey fastNodeEventCallbackKey_ = 0;
     MaxJSFastNodeEventCallback fastNodeEvents_;
@@ -6246,7 +6188,7 @@ public:
 
         std::vector<SnapshotAnimationTargetDef> targets;
         targets.reserve(nodes.size() + 1);
-        std::unordered_set<ULONG> skinBonesAnimated;
+        std::unordered_set<std::wstring> skinBonesAnimated;
 
         for (const auto& node : nodes) {
             SnapshotAnimationTargetDef target;
@@ -6277,29 +6219,31 @@ public:
             }
 
             if (node.skinRig && options.includeTransformAnimation) {
+                const ULONG meshHandle = node.handle;
                 for (size_t bi = 0; bi < node.skinBoneHandles.size(); bi++) {
                     ULONG bh = node.skinBoneHandles[bi];
                     if (bh == 0) continue;
-                    if (skinBonesAnimated.find(bh) != skinBonesAnimated.end()) continue;
                     INode* bn = ip->GetINodeByHandle(bh);
                     if (!bn) continue;
 
-                    // Determine parent node matching the Three.js bone hierarchy:
-                    // parent index >= 0 → parent bone; parent index < 0 → the mesh node itself
+                    // Scoped key: meshHandle:boneHandle — allows same bone in multiple characters
+                    const std::wstring scopedKey = std::to_wstring(meshHandle) + L":" + std::to_wstring(bh);
+                    if (skinBonesAnimated.count(scopedKey)) continue;
+
                     INode* parentNode = nullptr;
                     const int parentIdx = (bi < node.skinBoneParents.size()) ? node.skinBoneParents[bi] : -1;
                     if (parentIdx >= 0 && parentIdx < static_cast<int>(node.skinBoneHandles.size())) {
                         parentNode = ip->GetINodeByHandle(node.skinBoneHandles[parentIdx]);
                     }
                     if (!parentNode) {
-                        parentNode = node.node;  // root bone: parent is the skinned mesh
+                        parentNode = node.node;
                     }
 
                     SnapshotAnimationTargetDef boneTarget;
                     if (BuildBoneAnimationTarget(bn, parentNode, range, currentTime, options, boneTarget)) {
-                        boneTarget.target = L"handle:" + std::to_wstring(bh);
+                        boneTarget.target = L"handle:" + scopedKey;
                         targets.push_back(std::move(boneTarget));
-                        skinBonesAnimated.insert(bh);
+                        skinBonesAnimated.insert(scopedKey);
                     }
                 }
             }
@@ -6604,27 +6548,24 @@ public:
             }
             ss << L'}';
             if (node.skinRig) {
-                // Skin block: only emit if we have bone data (Skin modifier present)
-                if (!node.skinBoneHandles.empty()) {
-                    ss << L",\"skin\":{";
-                    ss << L"\"bones\":[";
-                    for (size_t bi = 0; bi < node.skinBoneHandles.size(); ++bi) {
-                        if (bi) ss << L',';
-                        ss << node.skinBoneHandles[bi];
-                    }
-                    ss << L"],\"parent\":[";
-                    for (size_t bi = 0; bi < node.skinBoneParents.size(); ++bi) {
-                        if (bi) ss << L',';
-                        ss << node.skinBoneParents[bi];
-                    }
-                    ss << L"],\"wOff\":" << node.skinWOff
-                       << L",\"wN\":" << node.skinWData.size()
-                       << L",\"iOff\":" << node.skinIndOff
-                       << L",\"iN\":" << node.skinIdxData.size()
-                       << L",\"bindOff\":" << node.skinBoneBindOff
-                       << L",\"bindN\":" << node.skinBoneBindLocal.size();
-                    ss << L"}";
+                ss << L",\"skin\":{";
+                ss << L"\"bones\":[";
+                for (size_t bi = 0; bi < node.skinBoneHandles.size(); ++bi) {
+                    if (bi) ss << L',';
+                    ss << node.skinBoneHandles[bi];
                 }
+                ss << L"],\"parent\":[";
+                for (size_t bi = 0; bi < node.skinBoneParents.size(); ++bi) {
+                    if (bi) ss << L',';
+                    ss << node.skinBoneParents[bi];
+                }
+                ss << L"],\"wOff\":" << node.skinWOff
+                   << L",\"wN\":" << node.skinWData.size()
+                   << L",\"iOff\":" << node.skinIndOff
+                   << L",\"iN\":" << node.skinIdxData.size()
+                   << L",\"bindOff\":" << node.skinBoneBindOff
+                   << L",\"bindN\":" << node.skinBoneBindLocal.size();
+                ss << L"}";
                 if (!node.morphNames.empty()) {
                     ss << L",\"morph\":{";
                     ss << L"\"names\":[";
@@ -6962,6 +6903,8 @@ public:
         groupCache_.clear();
         lastBBoxHash_.clear();
         lastLiveGeomHash_.clear();
+        lastSelectedGeometryLiveRunMs_ = 0;
+        lastSelectedGeomChannelKey_.clear();
         ResetFastPathState(false);
     }
 
@@ -7194,6 +7137,12 @@ public:
         dirtyStamp_ = 0;  // bypass debounce — sync on next tick
     }
 
+    /** Next redraw may run CheckSelectedGeometryLive immediately (bypass per-frame throttle). */
+    void ResetSelectedGeometryLiveThrottle() {
+        lastSelectedGeometryLiveRunMs_ = 0;
+        lastSelectedGeomChannelKey_.clear();
+    }
+
     void QueueFastFlush() {
         if (!hwnd_ || dirty_ || fastFlushPosted_) return;
         fastFlushPosted_ = true;
@@ -7215,6 +7164,31 @@ public:
     std::unordered_set<ULONG> geoFastDirtyHandles_;
     std::unordered_set<ULONG> materialFastDirtyHandles_;
 
+    /**
+     * Cheap GEOM channel validity check (same idea as full-sync skipExtract).
+     * Returns true only when validity is unchanged vs last redraw — safe to apply the 200ms throttle
+     * (UV-only edits may not bump validity). Returns false when validity changed (skin pose, etc.)
+     * or on first probe — caller must run full ExtractMesh + hash without throttling.
+     */
+    bool ShouldThrottleSelectedGeometryProbe(INode* node, TimeValue t, ULONG handle) {
+        ObjectState os = node->EvalWorldState(t);
+        if (!os.obj || os.obj->SuperClassID() != GEOMOBJECT_CLASS_ID) return false;
+
+        Interval gv = os.obj->ChannelValidity(t, GEOM_CHAN_NUM);
+        const uint64_t validKey =
+            static_cast<uint64_t>(gv.Start()) ^ (static_cast<uint64_t>(gv.End()) << 32);
+        auto it = lastSelectedGeomChannelKey_.find(handle);
+        if (it == lastSelectedGeomChannelKey_.end()) {
+            lastSelectedGeomChannelKey_[handle] = validKey;
+            return false;
+        }
+        if (it->second != validKey) {
+            it->second = validKey;
+            return false;
+        }
+        return true;
+    }
+
     void CheckSelectedGeometryLive() {
         Interface* ip = GetCOREInterface();
         if (!ip) return;
@@ -7223,6 +7197,13 @@ public:
         if (ip->IsAnimPlaying()) return;
         const int selCount = ip->GetSelNodeCount();
         if (selCount <= 0) return;
+
+        // Redraw proc runs every viewport paint. Full ExtractMesh + hash is expensive when a heavy
+        // mesh stays selected with a static pose — throttle only when GEOM channel validity is
+        // unchanged (ShouldThrottle…). When Skin / deformers update validity (pose change), probe
+        // every frame so geo_fast preview stays live.
+        static constexpr ULONGLONG kThrottleMs = 200;
+        const ULONGLONG now = GetTickCount64();
         TimeValue t = ip->GetTime();
 
         bool changed = false;
@@ -7232,10 +7213,19 @@ public:
             ULONG handle = node->GetHandle();
             if (!IsTrackedHandle(handle)) continue;
 
+            if (ShouldThrottleSelectedGeometryProbe(node, t, handle)) {
+                if (lastSelectedGeometryLiveRunMs_ != 0 &&
+                    now - lastSelectedGeometryLiveRunMs_ < kThrottleMs) {
+                    continue;
+                }
+            }
+
             // Match DetectGeometryChanges / geo_fast payload: include UVs (HashNodeGeometryState omits them).
             uint64_t geomHash = 0;
             if (!TryHashExtractedRenderableGeometry(node, t, geomHash))
                 continue;
+            lastSelectedGeometryLiveRunMs_ = now;
+
             auto it = lastLiveGeomHash_.find(handle);
             if (it != lastLiveGeomHash_.end() && it->second == geomHash) continue;
             lastLiveGeomHash_[handle] = geomHash;
@@ -10234,6 +10224,7 @@ public:
         groupCache_.clear();
         lastBBoxHash_.clear();
         lastLiveGeomHash_.clear();
+        lastSelectedGeomChannelKey_.clear();
         mtlScalarHashMap_.clear();
         if (hwnd_) { HWND h = hwnd_; hwnd_ = nullptr; DestroyWindow(h); }
     }
@@ -10297,7 +10288,10 @@ void MaxJSFastNodeEventCallback::LinkChanged(NodeKeyTab& nodes) {
 }
 
 void MaxJSFastNodeEventCallback::SelectionChanged(NodeKeyTab& nodes) {
-    if (owner_) owner_->MarkTrackedNodesDirty(nodes);
+    if (owner_) {
+        owner_->MarkTrackedNodesDirty(nodes);
+        owner_->ResetSelectedGeometryLiveThrottle();
+    }
 }
 
 void MaxJSFastNodeEventCallback::HideChanged(NodeKeyTab& nodes) {

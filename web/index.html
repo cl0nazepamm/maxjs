@@ -2842,8 +2842,10 @@
             for (let i = 0; i < nB; i++) {
                 const h = sk.bones[i];
                 if (h) {
-                    bones[i].userData.maxjsHandle = h;
-                    nodeMap.set(h, bones[i]);
+                    // Scope bone handles per mesh to avoid collisions between characters
+                    const scopedKey = `${nd.h}:${h}`;
+                    bones[i].userData.maxjsHandle = scopedKey;
+                    nodeMap.set(scopedKey, bones[i]);
                 }
             }
             return skinned;

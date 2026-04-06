@@ -154,7 +154,9 @@ function createMaxNodeAdapter({ handle, getObject, THREE, createAnchor }) {
         get name() { return getObject()?.name ?? ''; },
         get type() { return getObject()?.type ?? null; },
         get visible() { return !!getObject()?.visible; },
+        setVisible(v) { const obj = getObject(); if (obj) obj.visible = !!v; },
         get isMesh() { return !!getObject()?.isMesh; },
+        get jsmod() { return !!getObject()?.userData?.jsmod; },
         get materialType() {
             const obj = getObject();
             const mat = Array.isArray(obj?.material) ? obj.material[0] : obj?.material;
@@ -312,10 +314,20 @@ function createInputHelper(renderer) {
     };
 }
 
+const SANDBOX_DOM_WHITELIST = new Set(['canvas', 'img', 'video', 'audio']);
+
+const sandboxDocument = Object.freeze({
+    createElement(tag) {
+        const t = String(tag).toLowerCase();
+        if (!SANDBOX_DOM_WHITELIST.has(t))
+            throw new Error(`Sandbox: createElement("${t}") not allowed. Whitelist: ${[...SANDBOX_DOM_WHITELIST].join(', ')}`);
+        return document.createElement(t);
+    },
+});
+
 const SANDBOX_PRELUDE = [
     '"use strict";',
     'const window = undefined;',
-    'const document = undefined;',
     'const globalThis = undefined;',
     'const self = undefined;',
     'const chrome = undefined;',
@@ -327,7 +339,7 @@ const SANDBOX_PRELUDE = [
 ].join('\n');
 
 function buildInlineFactory(code) {
-    return new Function('ctx', 'THREE', `${SANDBOX_PRELUDE}\n${code}`);
+    return new Function('ctx', 'THREE', 'document', `${SANDBOX_PRELUDE}\n${code}`);
 }
 
 export function createLayerManager({
@@ -449,7 +461,7 @@ export function createLayerManager({
         clone.matrix.copy(source.matrixWorld);
         clone.matrixWorld.copy(source.matrixWorld);
         clone.matrixWorldNeedsUpdate = true;
-        clone.visible = source.visible;
+        clone.visible = true;
         if (source.geometry?.clone) clone.geometry = markOwned(source.geometry.clone(), owner);
         if (source.material) clone.material = cloneMaterialForLayer(source.material, owner);
         return markOwned(clone, owner);
@@ -725,7 +737,7 @@ export function createLayerManager({
     function inject(id, code, name) {
         return mount(id, async (ctx, runtimeThree) => {
             const factory = buildInlineFactory(code);
-            return factory(ctx, runtimeThree);
+            return factory(ctx, runtimeThree, sandboxDocument);
         }, { name: name || id, code, source: 'inline' });
     }
 

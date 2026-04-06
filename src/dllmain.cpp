@@ -32,6 +32,7 @@
 #include "threejs_renderer.h"
 #include "threejs_fog.h"
 #include "threejs_sky.h"
+#include "threejs_deform.h"
 
 #include <wrl.h>
 #include <WebView2.h>
@@ -3209,6 +3210,31 @@ static uint64_t ComputePluginInstanceStateHash(INode* node, TimeValue t, Interfa
     return h;
 }
 
+// ── JS Modifier detection (three.js Deform in modifier stack) ──
+struct JsModData {
+    bool found = false;
+};
+
+static void GetJsModData(INode* node, TimeValue t, JsModData& out) {
+    out = {};
+    Object* obj = node->GetObjectRef();
+    while (obj && obj->SuperClassID() == GEN_DERIVOB_CLASS_ID) {
+        IDerivedObject* dobj = static_cast<IDerivedObject*>(obj);
+        for (int i = 0; i < dobj->NumModifiers(); i++) {
+            Modifier* mod = dobj->GetModifier(i);
+            if (mod && mod->IsEnabled() && IsThreeJSDeformClassID(mod->ClassID())) {
+                out.found = true;
+                return;
+            }
+        }
+        obj = dobj->GetObjRef();
+    }
+}
+
+static void WriteJsModJson(std::wostringstream& ss, const JsModData&) {
+    ss << L"\"jsmod\":true";
+}
+
 static void WriteNodePropsJson(std::wostringstream& ss, INode* node, TimeValue t) {
     ss << L"\"rend\":" << (node->Renderable() ? L'1' : L'0');
     ss << L",\"bcull\":" << (node->GetBackCull() ? L'1' : L'0');
@@ -5844,6 +5870,7 @@ public:
             ss << L",\"n\":\"" << EscapeJson(node.node->GetName()) << L'"';
             ss << L",\"s\":" << (node.node->Selected() ? L'1' : L'0');
             ss << L",\"props\":{"; WriteNodePropsJson(ss, node.node, t); ss << L'}';
+            { JsModData jm; GetJsModData(node.node, t, jm); if (jm.found) { ss << L","; WriteJsModJson(ss, jm); } }
             ss << L",\"vis\":" << (node.visible ? L'1' : L'0');
             ss << L",\"t\":"; WriteFloats(ss, xform, 16);
             if (node.spline) ss << L",\"spline\":true";
@@ -7032,6 +7059,9 @@ public:
             uint64_t hash = HashMeshData(verts, indices, uvs);
             geoHashMap_[handle] = hash;
 
+            JsModData jmFast;
+            GetJsModData(node, t, jmFast);
+
             if (wv17 && env12) {
                 size_t totalBytes = verts.size() * 4 + indices.size() * 4 + uvs.size() * 4 + norms.size() * 4;
                 if (totalBytes < 4) totalBytes = 4;
@@ -7052,6 +7082,7 @@ public:
                 std::wostringstream ss;
                 ss.imbue(std::locale::classic());
                 ss << L"{\"type\":\"geo_fast\",\"h\":" << handle;
+                ss << L",\"jsmod\":" << (jmFast.found ? L"true" : L"false");
                 if (isSpline) ss << L",\"spline\":true";
                 ss << L",\"vOff\":" << vOff << L",\"vN\":" << verts.size();
                 ss << L",\"iOff\":" << iOff << L",\"iN\":" << indices.size();
@@ -7066,6 +7097,7 @@ public:
                 std::wostringstream ss;
                 ss.imbue(std::locale::classic());
                 ss << L"{\"type\":\"geo_fast\",\"h\":" << handle;
+                ss << L",\"jsmod\":" << (jmFast.found ? L"true" : L"false");
                 if (isSpline) ss << L",\"spline\":true";
                 ss << L",\"v\":"; WriteFloats(ss, verts.data(), verts.size());
                 ss << L",\"i\":"; WriteInts(ss, indices.data(), indices.size());
@@ -8475,6 +8507,7 @@ public:
                 ss << L",\"n\":\"" << EscapeJson(node->GetName()) << L'"';
                 ss << L",\"s\":" << (node->Selected() ? L'1' : L'0');
                 ss << L",\"props\":{"; WriteNodePropsJson(ss, node, t); ss << L'}';
+                { JsModData jm; GetJsModData(node, t, jm); if (jm.found) { ss << L","; WriteJsModJson(ss, jm); } }
                 ss << L",\"t\":"; WriteFloats(ss, xform, 16);
                 RememberSentTransform(handle, xform);
 
@@ -8532,6 +8565,7 @@ public:
                     ss << L",\"n\":\"" << EscapeJson(node->GetName()) << L'"';
                     ss << L",\"s\":" << (node->Selected() ? L'1' : L'0');
                     ss << L",\"props\":{"; WriteNodePropsJson(ss, node, t); ss << L'}';
+                    { JsModData jm; GetJsModData(node, t, jm); if (jm.found) { ss << L","; WriteJsModJson(ss, jm); } }
                     ss << L",\"t\":"; WriteFloats(ss, xform, 16);
                     if (isSpline) ss << L",\"spline\":true";
                     RememberSentTransform(handle, xform);
@@ -8825,6 +8859,7 @@ public:
             ss << L",\"n\":\"" << EscapeJson(ng.node->GetName()) << L'"';
             ss << L",\"s\":" << (ng.node->Selected() ? L'1' : L'0');
             ss << L",\"props\":{"; WriteNodePropsJson(ss, ng.node, t); ss << L'}';
+            { JsModData jm; GetJsModData(ng.node, t, jm); if (jm.found) { ss << L","; WriteJsModJson(ss, jm); } }
             ss << L",\"vis\":" << (ng.visible ? L'1' : L'0');
             if (ng.objId != 0) ss << L",\"objId\":" << ng.objId;
             if (ng.instOfHandle != 0) ss << L",\"instOf\":" << ng.instOfHandle;
@@ -9043,6 +9078,7 @@ public:
             ss << L"{\"h\":" << handle;
             ss << L",\"s\":" << (node->Selected() ? L'1' : L'0');
             ss << L",\"vis\":" << (visible ? L'1' : L'0');
+            { JsModData jm; GetJsModData(node, t, jm); ss << L",\"jsmod\":" << (jm.found ? L"true" : L"false"); }
             ss << L",\"t\":"; WriteFloats(ss, xform, 16);
             // For Multi/Sub objects, skip scalar material pushes to avoid
             // corrupting material arrays on the web side.
@@ -9615,7 +9651,7 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, ULONG fdwReason, LPVOID) {
 }
 
 __declspec(dllexport) const TCHAR* LibDescription()   { return MAXJS_NAME; }
-__declspec(dllexport) int LibNumberClasses()           { return 17; }
+__declspec(dllexport) int LibNumberClasses()           { return 18; }
 __declspec(dllexport) ClassDesc* LibClassDesc(int i) {
     switch (i) {
         case 0: return &maxJSDesc;
@@ -9635,6 +9671,7 @@ __declspec(dllexport) ClassDesc* LibClassDesc(int i) {
         case 14: return GetThreeJSSplatDesc();
         case 15: return GetThreeJSFogDesc();
         case 16: return GetThreeJSSkyDesc();
+        case 17: return GetThreeJSDeformDesc();
         default: return nullptr;
     }
 }

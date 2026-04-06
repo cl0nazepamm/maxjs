@@ -402,6 +402,7 @@ export function createMaxJSAnimationSystem({
 
     function applyGeometryFrame(target, frame) {
         if (!target?.geometry || typeof buildGeometry !== 'function' || !frame) return;
+        if (target.userData?.maxjsSkinRig) return;
 
         const isLineTarget = !!(target.isLine || target.isLineSegments);
         if (!!frame.spline !== isLineTarget) return;

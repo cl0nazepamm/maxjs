@@ -2783,6 +2783,110 @@
         });
 
         // ── Binary Scene Handler (SharedBuffer) ──────────────
+        function binInRange(buffer, off, n) {
+            return (
+                Number.isInteger(off) &&
+                Number.isInteger(n) &&
+                off >= 0 &&
+                n >= 0 &&
+                (off % 4) === 0 &&
+                (off + n * 4) <= buffer.byteLength
+            );
+        }
+
+        /** Avoid re-copying bind pose + skin/morph buffers when topology and layouts are unchanged. */
+        function canReuseSkinnedGeometry(mesh, nd) {
+            if (!mesh?.isSkinnedMesh || !mesh.userData?.maxjsSkinRig || !nd?.skin || nd.spline || nd.instOf) {
+                return false;
+            }
+            const g = mesh.geometry;
+            if (!g?.getAttribute('position') || !g.getIndex()) return false;
+            const geo = nd.geo;
+            const sk = nd.skin;
+            const pos = g.getAttribute('position');
+            const idx = g.getIndex();
+            if (pos.array.length !== geo.vN || idx.array.length !== geo.iN) return false;
+            if (geo.uvOff != null && geo.uvN) {
+                const uv = g.getAttribute('uv');
+                if (!uv || uv.array.length !== geo.uvN) return false;
+            }
+            if (geo.nOff != null && geo.nN) {
+                const nm = g.getAttribute('normal');
+                if (!nm || nm.array.length !== geo.nN) return false;
+            }
+            const sw = g.getAttribute('skinWeight');
+            const si = g.getAttribute('skinIndex');
+            if (!sw || !si || sw.array.length !== sk.wN || si.array.length !== sk.iN) return false;
+            const mNames = nd.morph?.names;
+            const mDN = nd.morph?.dN;
+            const mp = g.morphAttributes?.position;
+            const nMorph = Array.isArray(mNames) ? mNames.length : 0;
+            if (nMorph > 0) {
+                if (!mp || mp.length !== nMorph) return false;
+                for (let mi = 0; mi < nMorph; mi++) {
+                    if (!mDN || mDN[mi] !== mp[mi]?.array?.length) return false;
+                }
+            } else if (mp?.length) {
+                return false;
+            }
+            return true;
+        }
+
+        function buildSkinnedMeshFromNd(geom, mat, nd, buffer) {
+            const sk = nd.skin;
+            const nB = sk.bones?.length ?? 0;
+            if (!nB || !geom) return null;
+            const bones = [];
+            for (let i = 0; i < nB; i++) {
+                const bone = new THREE.Bone();
+                bone.name = `bone_${i}`;
+                const bo = sk.bindOff + i * 16 * 4;
+                if (binInRange(buffer, bo, 16)) {
+                    bone.matrix.fromArray(new Float32Array(buffer, bo, 16));
+                    bone.matrix.decompose(bone.position, bone.quaternion, bone.scale);
+                }
+                bone.matrixAutoUpdate = false;
+                bones.push(bone);
+            }
+            const skinned = new THREE.SkinnedMesh(geom, mat);
+            skinned.matrixAutoUpdate = false;
+            const pending = new Set(bones.map((_, i) => i));
+            let guard = 0;
+            while (pending.size > 0 && guard++ < nB * 4) {
+                for (const i of [...pending]) {
+                    const pi = sk.parent[i];
+                    if (pi < 0) {
+                        skinned.add(bones[i]);
+                        pending.delete(i);
+                    } else if (!pending.has(pi)) {
+                        bones[pi].add(bones[i]);
+                        pending.delete(i);
+                    }
+                }
+            }
+            for (const i of pending) {
+                skinned.add(bones[i]);
+            }
+            const skeleton = new THREE.Skeleton(bones);
+            skinned.bind(skeleton);
+            skinned.userData.maxjsSkinRig = true;
+            if (nd.morph?.names?.length) {
+                const nM = nd.morph.names.length;
+                skinned.morphTargetInfluences =
+                    nd.morph.infl?.length === nM
+                        ? nd.morph.infl.slice()
+                        : new Array(nM).fill(0);
+            }
+            for (let i = 0; i < nB; i++) {
+                const h = sk.bones[i];
+                if (h) {
+                    bones[i].userData.maxjsHandle = h;
+                    nodeMap.set(h, bones[i]);
+                }
+            }
+            return skinned;
+        }
+
         function handleBinaryScene(buffer, meta) {
             if (meta.type !== 'scene_bin') return;
             setTransportMode('binary-scene');
@@ -2846,35 +2950,68 @@
                         console.warn('[MaxJS binary] Invalid UV range for', nd.n);
                         continue;
                     }
-                    const vertsCopy = new Float32Array(
-                        new Float32Array(buffer, nd.geo.vOff, nd.geo.vN)
-                    );
-                    const idxCopy = new Uint32Array(
-                        new Int32Array(buffer, nd.geo.iOff, nd.geo.iN)
-                    );
 
-                    geom = new THREE.BufferGeometry();
-                    geom.setAttribute('position', new THREE.BufferAttribute(vertsCopy, 3));
-                    geom.setIndex(new THREE.BufferAttribute(idxCopy, 1));
+                    if (mesh && canReuseSkinnedGeometry(mesh, nd)) {
+                        geom = mesh.geometry;
+                        if (nd.groups) {
+                            geom.clearGroups();
+                            for (const [start, count, idx] of nd.groups) {
+                                geom.addGroup(start, count, idx);
+                            }
+                        }
+                    } else {
+                        const vertsCopy = new Float32Array(
+                            new Float32Array(buffer, nd.geo.vOff, nd.geo.vN)
+                        );
+                        const idxCopy = new Uint32Array(
+                            new Int32Array(buffer, nd.geo.iOff, nd.geo.iN)
+                        );
 
-                    if (nd.geo.uvOff != null && nd.geo.uvN) {
-                        const uvsCopy = new Float32Array(
-                            new Float32Array(buffer, nd.geo.uvOff, nd.geo.uvN)
-                        );
-                        geom.setAttribute('uv', new THREE.BufferAttribute(uvsCopy, 2));
-                    }
-                    if (nd.geo.nOff != null && inRange(nd.geo.nOff, nd.geo.nN || 0)) {
-                        const normalsCopy = new Float32Array(
-                            new Float32Array(buffer, nd.geo.nOff, nd.geo.nN)
-                        );
-                        geom.setAttribute('normal', new THREE.BufferAttribute(normalsCopy, 3));
-                    } else if (!nd.spline) {
-                        geom.computeVertexNormals();
-                    }
-                    // Add material groups for Multi/Sub
-                    if (nd.groups) {
-                        for (const [start, count, idx] of nd.groups) {
-                            geom.addGroup(start, count, idx);
+                        geom = new THREE.BufferGeometry();
+                        geom.setAttribute('position', new THREE.BufferAttribute(vertsCopy, 3));
+                        geom.setIndex(new THREE.BufferAttribute(idxCopy, 1));
+
+                        if (nd.geo.uvOff != null && nd.geo.uvN) {
+                            const uvsCopy = new Float32Array(
+                                new Float32Array(buffer, nd.geo.uvOff, nd.geo.uvN)
+                            );
+                            geom.setAttribute('uv', new THREE.BufferAttribute(uvsCopy, 2));
+                        }
+                        if (nd.geo.nOff != null && inRange(nd.geo.nOff, nd.geo.nN || 0)) {
+                            const normalsCopy = new Float32Array(
+                                new Float32Array(buffer, nd.geo.nOff, nd.geo.nN)
+                            );
+                            geom.setAttribute('normal', new THREE.BufferAttribute(normalsCopy, 3));
+                        } else if (!nd.spline) {
+                            geom.computeVertexNormals();
+                        }
+                        // Add material groups for Multi/Sub
+                        if (nd.groups) {
+                            for (const [start, count, idx] of nd.groups) {
+                                geom.addGroup(start, count, idx);
+                            }
+                        }
+                        if (nd.skin && geom && !nd.spline) {
+                            const sk = nd.skin;
+                            if (binInRange(buffer, sk.wOff, sk.wN) && binInRange(buffer, sk.iOff, sk.iN)) {
+                                const w = new Float32Array(new Float32Array(buffer, sk.wOff, sk.wN));
+                                const si = new Float32Array(new Float32Array(buffer, sk.iOff, sk.iN));
+                                geom.setAttribute('skinWeight', new THREE.Float32BufferAttribute(w, 4));
+                                geom.setAttribute('skinIndex', new THREE.Float32BufferAttribute(si, 4));
+                            }
+                            if (nd.morph?.dOff?.length && nd.morph?.dN?.length && nd.morph?.names?.length) {
+                                geom.morphAttributes = { position: [] };
+                                for (let mi = 0; mi < nd.morph.names.length; mi++) {
+                                    const off = nd.morph.dOff[mi];
+                                    const cnt = nd.morph.dN[mi];
+                                    if (!binInRange(buffer, off, cnt)) continue;
+                                    const d = new Float32Array(new Float32Array(buffer, off, cnt));
+                                    geom.morphAttributes.position.push(new THREE.BufferAttribute(d, 3));
+                                }
+                                if (geom.morphAttributes.position.length > 0) {
+                                    geom.morphTargetRelative = false;
+                                }
+                            }
                         }
                     }
                 } else if (geom && nd.groups) {
@@ -2889,6 +3026,18 @@
                 if (geom) geoByHandle.set(nd.h, geom);
 
                 const wantsLine = !!nd.spline;
+                if (mesh && nd.skin && !mesh.isSkinnedMesh && !wantsLine) {
+                    maxRoot.remove(mesh);
+                    const isSharedGeometry = [...nodeMap.values()].some(m => m !== mesh && m.geometry === mesh.geometry);
+                    if (!isSharedGeometry) mesh.geometry?.dispose?.();
+                    if (Array.isArray(mesh.material)) {
+                        for (const material of mesh.material) material?.dispose?.();
+                    } else {
+                        mesh.material?.dispose?.();
+                    }
+                    nodeMap.delete(nd.h);
+                    mesh = null;
+                }
                 const hasLineRenderable = !!(mesh?.isLine || mesh?.isLineSegments);
                 const renderableTypeMismatch = !!mesh && wantsLine !== hasLineRenderable;
                 if (renderableTypeMismatch) {
@@ -2929,6 +3078,10 @@
                             color: mat?.color ?? new THREE.Color(0xffffff),
                         });
                         mesh = new THREE.LineSegments(geom, lineMat);
+                    } else if (nd.skin) {
+                        mesh = buildSkinnedMeshFromNd(geom, clayModeActive ? clayMat : mat, nd, buffer);
+                        if (!mesh) mesh = new THREE.Mesh(geom, clayModeActive ? clayMat : mat);
+                        if (clayModeActive) mesh.userData._origMaterial = mat;
                     } else {
                         mesh = new THREE.Mesh(geom, clayModeActive ? clayMat : mat);
                         if (clayModeActive) mesh.userData._origMaterial = mat;

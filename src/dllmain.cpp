@@ -33,6 +33,8 @@
 #include "threejs_fog.h"
 #include "threejs_sky.h"
 #include "threejs_deform.h"
+#include <iskin.h>
+#include <imorpher.h>
 
 #include <wrl.h>
 #include <WebView2.h>
@@ -2974,6 +2976,316 @@ static bool TransformEquals16(const float* a, const float* b, float epsilon = 1.
     return true;
 }
 
+// Column-major 4x4 multiply (matches THREE.Matrix4.elements layout).
+static void MulMat4CM(const float* a, const float* b, float* o) {
+    for (int col = 0; col < 4; col++) {
+        for (int row = 0; row < 4; row++) {
+            float s = 0.0f;
+            for (int k = 0; k < 4; k++)
+                s += a[k * 4 + row] * b[col * 4 + k];
+            o[col * 4 + row] = s;
+        }
+    }
+}
+
+static bool InvertMat4CM(const float m[16], float invOut[16]) {
+    double inv[16], det;
+    inv[0] = m[5] * m[10] * m[15] - m[5] * m[11] * m[14] - m[9] * m[6] * m[15] + m[9] * m[7] * m[14] +
+             m[13] * m[6] * m[11] - m[13] * m[7] * m[10];
+    inv[4] = -m[4] * m[10] * m[15] + m[4] * m[11] * m[14] + m[8] * m[6] * m[15] - m[8] * m[7] * m[14] -
+             m[12] * m[6] * m[11] + m[12] * m[7] * m[10];
+    inv[8] = m[4] * m[9] * m[15] - m[4] * m[11] * m[13] - m[8] * m[5] * m[15] + m[8] * m[7] * m[13] +
+             m[12] * m[5] * m[11] - m[12] * m[7] * m[9];
+    inv[12] = -m[4] * m[9] * m[14] + m[4] * m[10] * m[13] + m[8] * m[5] * m[14] - m[8] * m[6] * m[13] -
+              m[12] * m[5] * m[10] + m[12] * m[6] * m[9];
+    inv[1] = -m[1] * m[10] * m[15] + m[1] * m[11] * m[14] + m[9] * m[2] * m[15] - m[9] * m[3] * m[14] -
+             m[13] * m[2] * m[11] + m[13] * m[3] * m[10];
+    inv[5] = m[0] * m[10] * m[15] - m[0] * m[11] * m[14] - m[8] * m[2] * m[15] + m[8] * m[3] * m[14] +
+             m[12] * m[2] * m[11] - m[12] * m[3] * m[10];
+    inv[9] = -m[0] * m[9] * m[15] + m[0] * m[11] * m[13] + m[8] * m[1] * m[15] - m[8] * m[3] * m[13] -
+             m[12] * m[1] * m[11] + m[12] * m[3] * m[9];
+    inv[13] = m[0] * m[9] * m[14] - m[0] * m[10] * m[13] - m[8] * m[1] * m[14] + m[8] * m[2] * m[13] +
+              m[12] * m[1] * m[10] - m[12] * m[2] * m[9];
+    inv[2] = m[1] * m[6] * m[15] - m[1] * m[7] * m[14] - m[5] * m[2] * m[15] + m[5] * m[3] * m[14] +
+             m[13] * m[2] * m[7] - m[13] * m[3] * m[6];
+    inv[6] = -m[0] * m[6] * m[15] + m[0] * m[7] * m[14] + m[4] * m[2] * m[15] - m[4] * m[3] * m[14] -
+             m[12] * m[2] * m[7] + m[12] * m[3] * m[6];
+    inv[10] = m[0] * m[5] * m[15] - m[0] * m[7] * m[13] - m[4] * m[1] * m[15] + m[4] * m[3] * m[13] +
+              m[12] * m[1] * m[7] - m[12] * m[3] * m[5];
+    inv[14] = -m[0] * m[5] * m[14] + m[0] * m[6] * m[13] + m[4] * m[1] * m[14] - m[4] * m[2] * m[13] -
+              m[12] * m[1] * m[6] + m[12] * m[2] * m[5];
+    inv[3] = -m[1] * m[6] * m[11] + m[1] * m[7] * m[10] + m[5] * m[2] * m[11] - m[5] * m[3] * m[10] -
+             m[9] * m[2] * m[7] + m[9] * m[3] * m[6];
+    inv[7] = m[0] * m[6] * m[11] - m[0] * m[7] * m[10] - m[4] * m[2] * m[11] + m[4] * m[3] * m[10] +
+             m[8] * m[2] * m[7] - m[8] * m[3] * m[6];
+    inv[11] = -m[0] * m[5] * m[11] + m[0] * m[7] * m[9] + m[4] * m[1] * m[11] - m[4] * m[3] * m[9] -
+              m[8] * m[1] * m[7] + m[8] * m[3] * m[5];
+    inv[15] = m[0] * m[5] * m[10] - m[0] * m[6] * m[9] - m[4] * m[1] * m[10] + m[4] * m[2] * m[9] +
+              m[8] * m[1] * m[6] - m[8] * m[2] * m[5];
+
+    det = m[0] * inv[0] + m[1] * inv[4] + m[2] * inv[8] + m[3] * inv[12];
+    if (std::fabs(det) < 1.0e-20)
+        return false;
+    det = 1.0 / det;
+    for (int i = 0; i < 16; i++)
+        invOut[i] = static_cast<float>(inv[i] * det);
+    return true;
+}
+
+static void DeltaPoint3ToYUp(const Point3& d, float out[3]) {
+    // Same linear map as MaxJSPanel::MaxPointToWorld for vectors (no translation).
+    out[0] = d.x;
+    out[1] = d.z;
+    out[2] = -d.y;
+}
+
+class FindModifierOnStackEnum : public GeomPipelineEnumProc {
+public:
+    Class_ID cid;
+    Modifier* mod = nullptr;
+    explicit FindModifierOnStackEnum(Class_ID id) : cid(id) {}
+    PipeEnumResult proc(ReferenceTarget* object, IDerivedObject* derObj, int index) override {
+        (void)derObj;
+        (void)index;
+        if (object && object->ClassID() == cid) {
+            mod = dynamic_cast<Modifier*>(object);
+            if (mod)
+                return PIPE_ENUM_STOP;
+        }
+        return PIPE_ENUM_CONTINUE;
+    }
+};
+
+static Modifier* FindModifierOnNode(INode* node, Class_ID cid) {
+    if (!node) return nullptr;
+    FindModifierOnStackEnum proc(cid);
+    EnumGeomPipeline(&proc, node);
+    return proc.mod;
+}
+
+// Returns stack index of first modifier matching cid on the node's pipeline, or -1.
+static int FindModifierStackIndexOnNode(INode* node, Class_ID cid) {
+    if (!node) return -1;
+    Object* cur = node->GetObjectRef();
+    while (cur && (cur->ClassID() == derivObjClassID || cur->ClassID() == WSMDerivObjClassID)) {
+        IDerivedObject* d = static_cast<IDerivedObject*>(cur);
+        for (int i = 0; i < d->NumModifiers(); ++i) {
+            Modifier* m = d->GetModifier(i);
+            if (m && m->ClassID() == cid)
+                return i;
+        }
+        cur = d->GetObjRef();
+    }
+    return -1;
+}
+
+static void Mat4IdentityCM(float o[16]) {
+    for (int i = 0; i < 16; i++) o[i] = 0.0f;
+    o[0] = o[5] = o[10] = o[15] = 1.0f;
+}
+
+struct SkinWeightSortPair {
+    int boneIdx = 0;
+    float w = 0.0f;
+};
+static bool SkinWeightPairGreater(const SkinWeightSortPair& a, const SkinWeightSortPair& b) {
+    return a.w > b.w;
+}
+
+// Fills skin + optional morph data for snapshot export. Replaces verts/uvs/norms with bind-pose
+// mesh (Skin disabled). Morpher must be applied before Skin (lower stack index than Skin).
+static bool TryExtractSkinRigData(
+    INode* meshNode,
+    TimeValue t,
+    std::vector<float>& verts,
+    std::vector<float>& uvs,
+    std::vector<float>& norms,
+    std::vector<int>& indices,
+    std::vector<MatGroup>& groups,
+    std::vector<ULONG>& outBoneHandles,
+    std::vector<int>& outBoneParents,
+    std::vector<float>& outBoneBindLocal,
+    std::vector<float>& outSkinW,
+    std::vector<float>& outSkinIdx,
+    std::vector<std::wstring>& outMorphNames,
+    std::vector<int>& outMorphChannelIds,
+    std::vector<float>& outMorphInfl,
+    std::vector<std::vector<float>>& outMorphDeltas) {
+    outBoneHandles.clear();
+    outBoneParents.clear();
+    outBoneBindLocal.clear();
+    outSkinW.clear();
+    outSkinIdx.clear();
+    outMorphNames.clear();
+    outMorphChannelIds.clear();
+    outMorphInfl.clear();
+    outMorphDeltas.clear();
+
+    Modifier* skinMod = FindModifierOnNode(meshNode, SKIN_CLASSID);
+    if (!skinMod) return false;
+
+    const int morphIdx = FindModifierStackIndexOnNode(meshNode, MR3_CLASS_ID);
+    const int skinIdx = FindModifierStackIndexOnNode(meshNode, SKIN_CLASSID);
+    if (morphIdx >= 0 && skinIdx >= 0 && morphIdx > skinIdx) {
+        // Morpher above Skin — vertex/bind data order does not match our skin extraction path.
+        return false;
+    }
+
+    ISkin* skin = static_cast<ISkin*>(skinMod->GetInterface(I_SKIN));
+    if (!skin) return false;
+
+    skinMod->DisableMod();
+    std::vector<float> bindVerts, bindUvs, bindNorms;
+    std::vector<int> bindIdx;
+    std::vector<MatGroup> bindGroups;
+    const bool bindOk = ExtractMesh(meshNode, t, bindVerts, bindUvs, bindIdx, bindGroups, &bindNorms);
+    skinMod->EnableMod();
+    if (!bindOk) return false;
+
+    ISkinContextData* skinData = skin->GetContextInterface(meshNode);
+    if (!skinData) return false;
+
+    const int nPts = skinData->GetNumPoints();
+    const int vCount = static_cast<int>(bindVerts.size() / 3);
+    if (nPts != vCount || nPts <= 0) return false;
+
+    verts = std::move(bindVerts);
+    uvs = std::move(bindUvs);
+    norms = std::move(bindNorms);
+    indices = std::move(bindIdx);
+    groups = std::move(bindGroups);
+
+    const int numBones = skin->GetNumBones();
+    if (numBones <= 0) return false;
+
+    std::vector<INode*> boneNodes(static_cast<size_t>(numBones), nullptr);
+    outBoneHandles.resize(static_cast<size_t>(numBones));
+    std::unordered_map<ULONG, int> handleToSkinIndex;
+    for (int bi = 0; bi < numBones; bi++) {
+        INode* bn = skin->GetBone(bi);
+        boneNodes[static_cast<size_t>(bi)] = bn;
+        outBoneHandles[static_cast<size_t>(bi)] = bn ? bn->GetHandle() : 0;
+        if (bn) handleToSkinIndex[bn->GetHandle()] = bi;
+    }
+
+    outBoneParents.resize(static_cast<size_t>(numBones), -1);
+    for (int bi = 0; bi < numBones; bi++) {
+        INode* bn = boneNodes[static_cast<size_t>(bi)];
+        if (!bn) {
+            outBoneParents[static_cast<size_t>(bi)] = -1;
+            continue;
+        }
+        INode* par = bn->GetParentNode();
+        if (!par) {
+            outBoneParents[static_cast<size_t>(bi)] = -1;
+            continue;
+        }
+        auto it = handleToSkinIndex.find(par->GetHandle());
+        outBoneParents[static_cast<size_t>(bi)] =
+            (it != handleToSkinIndex.end()) ? it->second : -1;
+    }
+
+    std::vector<float> boneWorld(static_cast<size_t>(numBones) * 16u);
+    for (int bi = 0; bi < numBones; bi++) {
+        INode* bn = boneNodes[static_cast<size_t>(bi)];
+        if (bn)
+            GetTransform16(bn, t, &boneWorld[static_cast<size_t>(bi) * 16u]);
+        else
+            Mat4IdentityCM(&boneWorld[static_cast<size_t>(bi) * 16u]);
+    }
+
+    outBoneBindLocal.resize(static_cast<size_t>(numBones) * 16u);
+    for (int bi = 0; bi < numBones; bi++) {
+        INode* bn = boneNodes[static_cast<size_t>(bi)];
+        if (!bn) {
+            Mat4IdentityCM(&outBoneBindLocal[static_cast<size_t>(bi) * 16u]);
+            continue;
+        }
+        float parentWorld[16];
+        const int pi = outBoneParents[static_cast<size_t>(bi)];
+        if (pi >= 0 && pi < numBones && boneNodes[static_cast<size_t>(pi)]) {
+            memcpy(parentWorld, &boneWorld[static_cast<size_t>(pi) * 16u], sizeof(float) * 16);
+        } else {
+            INode* par = bn->GetParentNode();
+            if (par)
+                GetTransform16(par, t, parentWorld);
+            else
+                Mat4IdentityCM(parentWorld);
+        }
+        float invParent[16];
+        if (!InvertMat4CM(parentWorld, invParent))
+            Mat4IdentityCM(invParent);
+        MulMat4CM(invParent, &boneWorld[static_cast<size_t>(bi) * 16u], &outBoneBindLocal[static_cast<size_t>(bi) * 16u]);
+    }
+
+    outSkinW.resize(static_cast<size_t>(vCount) * 4u, 0.0f);
+    outSkinIdx.resize(static_cast<size_t>(vCount) * 4u, 0.0f);
+    std::vector<SkinWeightSortPair> pairs;
+    for (int vi = 0; vi < vCount; vi++) {
+        pairs.clear();
+        const int nb = skinData->GetNumAssignedBones(vi);
+        for (int j = 0; j < nb; j++) {
+            const int bSkin = skinData->GetAssignedBone(vi, j);
+            const float w = skinData->GetBoneWeight(vi, j);
+            if (bSkin < 0 || bSkin >= numBones || w <= 0.0f) continue;
+            SkinWeightSortPair p;
+            p.boneIdx = bSkin;
+            p.w = w;
+            pairs.push_back(p);
+        }
+        std::sort(pairs.begin(), pairs.end(), SkinWeightPairGreater);
+        float sum = 0.0f;
+        const int take = std::min(4, static_cast<int>(pairs.size()));
+        for (int k = 0; k < take; k++) sum += pairs[static_cast<size_t>(k)].w;
+        if (sum < 1.0e-8f) sum = 1.0f;
+        for (int k = 0; k < 4; k++) {
+            if (k < take) {
+                outSkinIdx[static_cast<size_t>(vi) * 4u + static_cast<size_t>(k)] =
+                    static_cast<float>(pairs[static_cast<size_t>(k)].boneIdx);
+                outSkinW[static_cast<size_t>(vi) * 4u + static_cast<size_t>(k)] =
+                    pairs[static_cast<size_t>(k)].w / sum;
+            } else {
+                outSkinIdx[static_cast<size_t>(vi) * 4u + static_cast<size_t>(k)] = 0.0f;
+                outSkinW[static_cast<size_t>(vi) * 4u + static_cast<size_t>(k)] = 0.0f;
+            }
+        }
+    }
+
+    Modifier* morphMod = FindModifierOnNode(meshNode, MR3_CLASS_ID);
+    if (morphMod) {
+        IMorpher* morpher = static_cast<IMorpher*>(morphMod->GetInterface(I_MORPHER_INTERFACE_ID));
+        if (morpher) {
+            const int nCh = morpher->NumChannels();
+            for (int ci = 0; ci < nCh; ci++) {
+                IMorpherChannel* ch = morpher->GetChannel(ci, false);
+                if (!ch || !ch->IsActive()) continue;
+                if (ch->NumPoints() != nPts) continue;
+                std::vector<float> delta(static_cast<size_t>(nPts) * 3u);
+                bool any = false;
+                for (int pi = 0; pi < nPts; pi++) {
+                    Point3 d = ch->GetDelta(pi);
+                    float o[3];
+                    DeltaPoint3ToYUp(d, o);
+                    delta[static_cast<size_t>(pi) * 3u + 0u] = o[0];
+                    delta[static_cast<size_t>(pi) * 3u + 1u] = o[1];
+                    delta[static_cast<size_t>(pi) * 3u + 2u] = o[2];
+                    if (std::fabs(o[0]) > 1.0e-12f || std::fabs(o[1]) > 1.0e-12f || std::fabs(o[2]) > 1.0e-12f)
+                        any = true;
+                }
+                if (!any) continue;
+                const MCHAR* nm = ch->GetName(false);
+                outMorphNames.push_back(nm ? std::wstring(nm) : (L"morph_" + std::to_wstring(ci)));
+                outMorphChannelIds.push_back(ci);
+                double pct = ch->GetTargetPercent(0);
+                outMorphInfl.push_back(static_cast<float>(pct / 100.0));
+                outMorphDeltas.push_back(std::move(delta));
+            }
+        }
+    }
+
+    return true;
+}
+
 // ══════════════════════════════════════════════════════════════
 //  Viewport Camera Extraction
 // ══════════════════════════════════════════════════════════════
@@ -4608,6 +4920,20 @@ public:
         std::vector<int> indices;
         std::vector<MatGroup> groups;
         size_t vOff = 0, iOff = 0, uvOff = 0, nOff = 0;
+        // Skeletal skin + optional Morpher (Morpher must be below Skin in the stack).
+        bool skinRig = false;
+        std::vector<ULONG> skinBoneHandles;
+        std::vector<int> skinBoneParents;
+        std::vector<float> skinBoneBindLocal;
+        std::vector<float> skinWData;
+        std::vector<float> skinIdxData;
+        size_t skinWOff = 0, skinIndOff = 0, skinBoneBindOff = 0;
+        std::vector<std::wstring> morphNames;
+        std::vector<int> morphChannelIds;
+        std::vector<float> morphInfluences;
+        std::vector<size_t> morphDOff;
+        std::vector<int> morphDN;
+        std::vector<std::vector<float>> morphChannelsData;
     };
 
     struct SnapshotAnimationTrackDef {
@@ -4811,6 +5137,22 @@ public:
                a.indices == b.indices &&
                a.uvs == b.uvs &&
                a.norms == b.norms;
+    }
+
+    // Skinned / mocap / stack-driven deformation often does not mark the mesh ObjectRef as
+    // IsAnimated() — only bones have keys. Probe evaluated mesh so we still bake vertex frames.
+    // If start/end poses match (e.g. loop), compare a midpoint to start as well.
+    static bool SnapshotGeometryAppearsTimeVaryingInRange(INode* node, const Interval& range) {
+        SnapshotGeometrySample a, b;
+        if (!ExtractSnapshotGeometrySample(node, range.Start(), a)) return false;
+        if (!ExtractSnapshotGeometrySample(node, range.End(), b)) return false;
+        if (!SnapshotGeometrySamplesEqual(a, b)) return true;
+        if (range.Start() >= range.End()) return false;
+        const TimeValue mid = (range.Start() + range.End()) / 2;
+        if (mid <= range.Start() || mid >= range.End()) return false;
+        SnapshotGeometrySample m;
+        if (!ExtractSnapshotGeometrySample(node, mid, m)) return false;
+        return !SnapshotGeometrySamplesEqual(a, m);
     }
 
     static void FillSnapshotMaterialSample(const MaxJSPBR& pbr, SnapshotMaterialSample& out) {
@@ -5025,8 +5367,11 @@ public:
         if (!node) return false;
 
         std::vector<TimeValue> discoveryTimes;
-        const bool hasGeometryAnimation =
+        bool hasGeometryAnimation =
             BuildAnimatableTimeSamples(node->GetObjectRef(), range, currentTime, discoveryTimes);
+        if (!hasGeometryAnimation) {
+            hasGeometryAnimation = SnapshotGeometryAppearsTimeVaryingInRange(node, range);
+        }
         if (!hasGeometryAnimation) {
             return false;
         }
@@ -5636,12 +5981,72 @@ public:
         ss << L'}';
     }
 
+    static bool BuildMorpherInfluenceAnimationTracks(Interface* ip,
+                                                     INode* meshNode,
+                                                     const Interval& range,
+                                                     TimeValue currentTime,
+                                                     const SnapshotExportOptions& options,
+                                                     const std::vector<int>& morphChannelIds,
+                                                     SnapshotAnimationTargetDef& outTarget) {
+        (void)currentTime;
+        if (!ip || !meshNode || morphChannelIds.empty()) return false;
+        Modifier* morphMod = FindModifierOnNode(meshNode, MR3_CLASS_ID);
+        if (!morphMod) return false;
+        IMorpher* morpher = static_cast<IMorpher*>(morphMod->GetInterface(I_MORPHER_INTERFACE_ID));
+        if (!morpher) return false;
+
+        std::vector<TimeValue> sampleTimes;
+        AppendFrameSampleTimes(sampleTimes, range, options.animationSampleStepFrames);
+        SortUniqueTimeValues(sampleTimes);
+        if (sampleTimes.size() < 2) return false;
+
+        const TimeValue savedTime = ip->GetTime();
+        bool anyTrack = false;
+
+        for (size_t mi = 0; mi < morphChannelIds.size(); ++mi) {
+            const int cid = morphChannelIds[mi];
+            SnapshotAnimationTrackDef tr;
+            tr.path = L".morphTargetInfluences[" + std::to_wstring(mi) + L"]";
+            tr.type = L"number";
+            tr.interpolation = L"linear";
+
+            std::vector<float> vals;
+            vals.reserve(sampleTimes.size());
+            for (TimeValue tv : sampleTimes) {
+                ip->SetTime(tv);
+                IMorpherChannel* ch = morpher->GetChannel(cid, false);
+                double pct = 0.0;
+                if (ch) pct = ch->GetTargetPercent(0);
+                vals.push_back(static_cast<float>(pct / 100.0));
+            }
+            bool changed = false;
+            for (size_t i = 1; i < vals.size(); ++i) {
+                if (std::fabs(vals[i] - vals[0]) > 1.0e-5f) {
+                    changed = true;
+                    break;
+                }
+            }
+            if (!changed) continue;
+
+            for (size_t i = 0; i < sampleTimes.size(); ++i) {
+                tr.times.push_back(TimeValueToAnimationSeconds(sampleTimes[i], range.Start()));
+                tr.values.push_back(vals[i]);
+            }
+            outTarget.tracks.push_back(std::move(tr));
+            anyTrack = true;
+        }
+
+        ip->SetTime(savedTime);
+        return anyTrack;
+    }
+
     static void WriteSnapshotAnimationsJson(std::wostringstream& ss,
                                             const std::vector<SnapshotNodeRecord>& nodes,
                                             Interface* ip,
                                             TimeValue currentTime,
                                             const SnapshotExportOptions& options,
-                                            std::string& outAnimBinary) {
+                                            std::string& outAnimBinary,
+                                            const std::unordered_set<ULONG>& skinRigMeshHandles) {
         if (!ip) return;
 
         const Interval range = ip->GetAnimRange();
@@ -5651,6 +6056,7 @@ public:
 
         std::vector<SnapshotAnimationTargetDef> targets;
         targets.reserve(nodes.size() + 1);
+        std::unordered_set<ULONG> skinBonesAnimated;
 
         for (const auto& node : nodes) {
             SnapshotAnimationTargetDef target;
@@ -5661,6 +6067,7 @@ public:
             }
             part = SnapshotAnimationTargetDef();
             if (options.includeGeometryAnimation &&
+                skinRigMeshHandles.find(node.handle) == skinRigMeshHandles.end() &&
                 BuildNodeGeometryAnimationTarget(node.node, range, currentTime, options, part, outAnimBinary)) {
                 MergeSnapshotAnimationTarget(target, std::move(part));
             }
@@ -5669,8 +6076,29 @@ public:
                 BuildNodeMaterialAnimationTarget(node, range, currentTime, options, part)) {
                 MergeSnapshotAnimationTarget(target, std::move(part));
             }
+            part = SnapshotAnimationTargetDef();
+            if (node.skinRig && options.includeGeometryAnimation && !node.morphChannelIds.empty() &&
+                BuildMorpherInfluenceAnimationTracks(
+                    ip, node.node, range, currentTime, options, node.morphChannelIds, part)) {
+                MergeSnapshotAnimationTarget(target, std::move(part));
+            }
             if (!target.tracks.empty()) {
                 targets.push_back(std::move(target));
+            }
+
+            if (node.skinRig && options.includeTransformAnimation) {
+                for (ULONG bh : node.skinBoneHandles) {
+                    if (bh == 0) continue;
+                    if (skinBonesAnimated.find(bh) != skinBonesAnimated.end()) continue;
+                    INode* bn = ip->GetINodeByHandle(bh);
+                    if (!bn) continue;
+                    SnapshotAnimationTargetDef boneTarget;
+                    if (BuildNodeAnimationTarget(bn, range, currentTime, options, boneTarget)) {
+                        boneTarget.target = L"handle:" + std::to_wstring(bh);
+                        targets.push_back(std::move(boneTarget));
+                        skinBonesAnimated.insert(bh);
+                    }
+                }
             }
         }
 
@@ -5770,6 +6198,7 @@ public:
 
         std::vector<SnapshotNodeRecord> nodes;
         size_t totalBytes = 0;
+        std::unordered_set<ULONG> skinRigMeshHandles;
 
         std::function<void(INode*)> collect = [&](INode* parent) {
             for (int i = 0; i < parent->NumberOfChildren(); ++i) {
@@ -5823,6 +6252,50 @@ public:
                     totalBytes += snapshotNode.uvs.size() * sizeof(float);
                     snapshotNode.nOff = totalBytes;
                     totalBytes += snapshotNode.norms.size() * sizeof(float);
+
+                    if (!snapshotNode.spline) {
+                        std::vector<std::wstring> morphNamesTmp;
+                        std::vector<int> morphChIdsTmp;
+                        std::vector<float> morphInflTmp;
+                        std::vector<std::vector<float>> morphChTmp;
+                        if (TryExtractSkinRigData(
+                                snapshotNode.node,
+                                t,
+                                snapshotNode.verts,
+                                snapshotNode.uvs,
+                                snapshotNode.norms,
+                                snapshotNode.indices,
+                                snapshotNode.groups,
+                                snapshotNode.skinBoneHandles,
+                                snapshotNode.skinBoneParents,
+                                snapshotNode.skinBoneBindLocal,
+                                snapshotNode.skinWData,
+                                snapshotNode.skinIdxData,
+                                morphNamesTmp,
+                                morphChIdsTmp,
+                                morphInflTmp,
+                                morphChTmp)) {
+                            snapshotNode.skinRig = true;
+                            snapshotNode.morphNames = std::move(morphNamesTmp);
+                            snapshotNode.morphChannelIds = std::move(morphChIdsTmp);
+                            snapshotNode.morphInfluences = std::move(morphInflTmp);
+                            snapshotNode.morphChannelsData = std::move(morphChTmp);
+                            snapshotNode.skinWOff = totalBytes;
+                            totalBytes += snapshotNode.skinWData.size() * sizeof(float);
+                            snapshotNode.skinIndOff = totalBytes;
+                            totalBytes += snapshotNode.skinIdxData.size() * sizeof(float);
+                            snapshotNode.skinBoneBindOff = totalBytes;
+                            totalBytes += snapshotNode.skinBoneBindLocal.size() * sizeof(float);
+                            for (size_t mi = 0; mi < snapshotNode.morphChannelsData.size(); ++mi) {
+                                snapshotNode.morphDOff.push_back(totalBytes);
+                                snapshotNode.morphDN.push_back(
+                                    static_cast<int>(snapshotNode.morphChannelsData[mi].size()));
+                                totalBytes += snapshotNode.morphChannelsData[mi].size() * sizeof(float);
+                            }
+                            skinRigMeshHandles.insert(snapshotNode.handle);
+                        }
+                    }
+
                     nodes.push_back(std::move(snapshotNode));
                 }
 
@@ -5863,6 +6336,24 @@ public:
             if (!node.norms.empty()) {
                 memcpy(buffer + node.nOff, node.norms.data(), node.norms.size() * sizeof(float));
             }
+            if (node.skinRig) {
+                if (!node.skinWData.empty()) {
+                    memcpy(buffer + node.skinWOff, node.skinWData.data(), node.skinWData.size() * sizeof(float));
+                }
+                if (!node.skinIdxData.empty()) {
+                    memcpy(buffer + node.skinIndOff, node.skinIdxData.data(), node.skinIdxData.size() * sizeof(float));
+                }
+                if (!node.skinBoneBindLocal.empty()) {
+                    memcpy(buffer + node.skinBoneBindOff, node.skinBoneBindLocal.data(),
+                           node.skinBoneBindLocal.size() * sizeof(float));
+                }
+                for (size_t mi = 0; mi < node.morphChannelsData.size(); ++mi) {
+                    if (!node.morphChannelsData[mi].empty() && mi < node.morphDOff.size()) {
+                        memcpy(buffer + node.morphDOff[mi], node.morphChannelsData[mi].data(),
+                               node.morphChannelsData[mi].size() * sizeof(float));
+                    }
+                }
+            }
 
             MaxJSPBR pbr;
             ExtractPBR(node.node, t, pbr);
@@ -5889,6 +6380,47 @@ public:
                 ss << L",\"nN\":" << node.norms.size();
             }
             ss << L'}';
+            if (node.skinRig) {
+                ss << L",\"skin\":{";
+                ss << L"\"bones\":[";
+                for (size_t bi = 0; bi < node.skinBoneHandles.size(); ++bi) {
+                    if (bi) ss << L',';
+                    ss << node.skinBoneHandles[bi];
+                }
+                ss << L"],\"parent\":[";
+                for (size_t bi = 0; bi < node.skinBoneParents.size(); ++bi) {
+                    if (bi) ss << L',';
+                    ss << node.skinBoneParents[bi];
+                }
+                ss << L"],\"wOff\":" << node.skinWOff
+                   << L",\"wN\":" << node.skinWData.size()
+                   << L",\"iOff\":" << node.skinIndOff
+                   << L",\"iN\":" << node.skinIdxData.size()
+                   << L",\"bindOff\":" << node.skinBoneBindOff
+                   << L",\"bindN\":" << node.skinBoneBindLocal.size();
+                ss << L"}";
+                if (!node.morphNames.empty()) {
+                    ss << L",\"morph\":{";
+                    ss << L"\"names\":[";
+                    for (size_t mi = 0; mi < node.morphNames.size(); ++mi) {
+                        if (mi) ss << L',';
+                        ss << L'"' << EscapeJson(node.morphNames[mi].c_str()) << L'"';
+                    }
+                    ss << L"],\"infl\":";
+                    WriteFloats(ss, node.morphInfluences.data(), node.morphInfluences.size());
+                    ss << L",\"dOff\":[";
+                    for (size_t mi = 0; mi < node.morphDOff.size(); ++mi) {
+                        if (mi) ss << L',';
+                        ss << node.morphDOff[mi];
+                    }
+                    ss << L"],\"dN\":[";
+                    for (size_t mi = 0; mi < node.morphDN.size(); ++mi) {
+                        if (mi) ss << L',';
+                        ss << node.morphDN[mi];
+                    }
+                    ss << L"]}";
+                }
+            }
 
             Mtl* multiMtl = FindMultiSubMtl(node.node->GetMtl());
             if (!node.spline && multiMtl && multiMtl->NumSubMtls() > 0 && node.groups.size() > 1) {
@@ -5944,7 +6476,7 @@ public:
             WriteSplatsJson(ss, ip, t, true, false, false);
         }
         if (options.includeAnimations) {
-            WriteSnapshotAnimationsJson(ss, nodes, ip, t, options, outAnimBinary);
+            WriteSnapshotAnimationsJson(ss, nodes, ip, t, options, outAnimBinary, skinRigMeshHandles);
         }
 
         if (options.includeInstances) {

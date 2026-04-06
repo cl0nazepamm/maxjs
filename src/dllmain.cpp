@@ -4085,6 +4085,7 @@ public:
     std::unordered_map<ULONG, uint64_t> geoHashMap_;   // node handle → geometry topology hash
     std::unordered_map<ULONG, std::vector<MatGroup>> groupCache_; // cached material groups per node
     std::unordered_map<ULONG, uint64_t> propHashMap_;  // node handle → object properties hash
+    std::unordered_map<ULONG, bool> jsmodStateMap_;    // node handle → last-seen three.js Deform flag
     std::unordered_set<ULONG> pluginInstHandles_;        // FP/RC/tyFlow node handles for change detection
     std::unordered_map<ULONG, uint64_t> pluginInstHash_; // plugin node → generated-instance dependency hash
     std::map<std::wstring, std::wstring> texDirMap_;    // dir → host
@@ -6199,6 +6200,7 @@ public:
         splatHashMap_.clear();
         propHashMap_.clear();
         geoHashMap_.clear();
+        jsmodStateMap_.clear();
         groupCache_.clear();
         lastBBoxHash_.clear();
         lastLiveGeomHash_.clear();
@@ -6845,6 +6847,14 @@ public:
             ReloadWebContent();
             return;
         }
+        // Layer mount/remove or host-side sync repair — full resend without reloading WebView2
+        if (type == L"scene_dirty" || msg.find(L"\"scene_dirty\"") != std::wstring::npos) {
+            jsmodStateMap_.clear();
+            geoHashMap_.clear();
+            lastLiveGeomHash_.clear();
+            SetDirtyImmediate();
+            return;
+        }
         if (type == L"project_manifest_write") {
             std::wstring requestId;
             std::wstring contentBase64;
@@ -6957,6 +6967,7 @@ public:
             splatHashMap_.clear();
             propHashMap_.clear();
             geoHashMap_.clear();  // force all geometry to be sent
+            jsmodStateMap_.clear();
             inlineFileStamps_.clear();  // re-scan inline layers on reconnect
             inlineLayersStateSignature_.clear();
             lastSentTransforms_.clear();
@@ -6994,6 +7005,7 @@ public:
                 DetectSplatChanges();
             }
             if (tickCount_ % 15 == 0) DetectGeometryChanges();
+            if (tickCount_ % 15 == 0) DetectJsModChanges();
             if (tickCount_ % 15 == 0) DetectPluginInstanceChanges();
             if (tickCount_ % LIGHT_DETECT_TICKS == 0) PollViewportModes();
             if (tickCount_ % 15 == 0) ScanInlineLayers();
@@ -7676,6 +7688,31 @@ public:
     // Detect changes to Forest Pack / RailClone / tyFlow plugin nodes.
     // These generators rebuild instance structure from referenced nodes, so they
     // stay on the conservative full-sync path instead of fast mesh deltas.
+    void DetectJsModChanges() {
+        Interface* ip = GetCOREInterface();
+        if (!ip || geomHandles_.empty()) return;
+        const TimeValue t = ip->GetTime();
+        for (ULONG handle : geomHandles_) {
+            INode* node = ip->GetINodeByHandle(handle);
+            if (!node) continue;
+            JsModData jm;
+            GetJsModData(node, t, jm);
+            const bool found = jm.found;
+            auto it = jsmodStateMap_.find(handle);
+            if (it == jsmodStateMap_.end()) {
+                jsmodStateMap_[handle] = found;
+                continue;
+            }
+            if (it->second != found) {
+                it->second = found;
+                geoHashMap_.erase(handle);
+                lastLiveGeomHash_.erase(handle);
+                SetDirty();
+                return;
+            }
+        }
+    }
+
     void DetectPluginInstanceChanges() {
         if (pluginInstHandles_.empty()) return;
         Interface* ip = GetCOREInterface();
@@ -9400,6 +9437,7 @@ public:
         splatHashMap_.clear();
         propHashMap_.clear();
         geoHashMap_.clear();
+        jsmodStateMap_.clear();
         groupCache_.clear();
         lastBBoxHash_.clear();
         lastLiveGeomHash_.clear();

@@ -2812,14 +2812,16 @@
                 }
 
                 const jsmodFlag = !!nd.jsmod;
-                // jsmod flag: layers own vertices — skip geo rebuild for existing meshes
-                const jsmodSkipGeo = jsmodFlag && mesh;
+                const instSrcMesh = nd.instOf ? nodeMap.get(nd.instOf) : null;
+                const sharesInstGeom = !!(mesh && instSrcMesh && mesh.geometry === instSrcMesh.geometry);
+                // jsmod: skip host geo swap unless instanced mesh still shares master geometry (layers need a unique buffer)
+                const jsmodSkipGeo = jsmodFlag && mesh && !sharesInstGeom;
 
                 // Instance: share geometry from the source node (no new BufferGeometry)
                 let geom = mesh?.geometry;
                 if (nd.instOf && !nd.geo) {
-                    const srcGeom = geoByHandle.get(nd.instOf) || nodeMap.get(nd.instOf)?.geometry;
-                    if (srcGeom) geom = srcGeom;
+                    const srcGeom = geoByHandle.get(nd.instOf) || instSrcMesh?.geometry;
+                    if (srcGeom) geom = jsmodFlag ? srcGeom.clone() : srcGeom;
                 } else if (nd.geo && !jsmodSkipGeo) {
                     const inRange = (off, n) =>
                         Number.isInteger(off) &&
@@ -5424,12 +5426,17 @@
                 case 'inject': case 'update': {
                     void layerManager.inject(msg.id, msg.code, msg.name).then(result => {
                         bridge.send('js_inline_result', { id: msg.id, error: result?.error || null });
+                        if (!result?.error) bridge.send('scene_dirty');
                     });
                     break;
                 }
-                case 'remove': layerManager.remove(msg.id); break;
+                case 'remove': {
+                    layerManager.remove(msg.id);
+                    bridge.send('scene_dirty');
+                    break;
+                }
                 case 'list':   bridge.send('js_inline_list', { layers: layerManager.list().filter(layer => layer.source === 'inline') }); break;
-                case 'clear':  layerManager.clearInline(); break;
+                case 'clear':  layerManager.clearInline(); bridge.send('scene_dirty'); break;
             }
         });
 

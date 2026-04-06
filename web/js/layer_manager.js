@@ -249,6 +249,15 @@ function createMaxSceneFacade({ scene, nodeMap, getAdapter, createAnchor, THREE 
         getNode(handle) { return nodeMap.has(handle) ? getAdapter(handle) : null; },
         listHandles() { return Array.from(nodeMap.keys()); },
         listNodes() { return Array.from(nodeMap.keys(), handle => getAdapter(handle)); },
+        /** Meshes whose Max stack has three.js Deform (bridge sets adapter.jsmod). Safe to poll every frame — nodeMap grows as sync arrives. */
+        listJsmodNodes() {
+            const out = [];
+            for (const handle of nodeMap.keys()) {
+                const adapter = getAdapter(handle);
+                if (adapter?.isMesh && adapter.jsmod) out.push(adapter);
+            }
+            return out;
+        },
         findByName(name, options = {}) {
             const query = String(name ?? '').toLowerCase();
             const exact = options.exact === true;

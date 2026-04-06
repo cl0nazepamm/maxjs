@@ -587,7 +587,21 @@ static void WriteInts(std::wostringstream& ss, const int* d, size_t n) {
 static uint64_t HashFNV1a(const void* data, size_t bytes, uint64_t seed = 1469598103934665603ULL) {
     const unsigned char* p = static_cast<const unsigned char*>(data);
     uint64_t h = seed;
-    for (size_t i = 0; i < bytes; i++) {
+    // SSE: process 16 bytes at a time for large buffers
+    // Fold 128-bit chunks into the hash via XOR + multiply cascade
+    size_t i = 0;
+    if (bytes >= 32) {
+        for (; i + 15 < bytes; i += 16) {
+            uint64_t lo, hi;
+            memcpy(&lo, p + i, 8);
+            memcpy(&hi, p + i + 8, 8);
+            h ^= lo;
+            h *= 1099511628211ULL;
+            h ^= hi;
+            h *= 1099511628211ULL;
+        }
+    }
+    for (; i < bytes; i++) {
         h ^= static_cast<uint64_t>(p[i]);
         h *= 1099511628211ULL;
     }
@@ -670,6 +684,74 @@ static uint64_t HashMNMeshState(MNMesh& mn) {
         }
     }
 
+    return h;
+}
+
+static uint64_t MakeGeomValidityKey(const Interval& iv) {
+    return static_cast<uint64_t>(iv.Start()) ^ (static_cast<uint64_t>(iv.End()) << 32);
+}
+
+static constexpr int kSkinnedHashFullVertexThreshold = 16384;
+static constexpr int kSkinnedHashSampleCount = 256;
+static constexpr ULONGLONG kSkinnedLivePollIntervalMs = 16;
+
+static uint64_t HashSampledPoint3Array(const Point3* points,
+                                       int count,
+                                       uint64_t seed = 1469598103934665603ULL) {
+    uint64_t h = HashFNV1a(&count, sizeof(count), seed);
+    if (!points || count <= 0) return h;
+
+    const int sampleCount = (count < kSkinnedHashSampleCount) ? count : kSkinnedHashSampleCount;
+    const int stride = (count <= sampleCount) ? 1 : std::max(1, count / sampleCount);
+    for (int sampleIdx = 0; sampleIdx < sampleCount; ++sampleIdx) {
+        int idx = sampleIdx * stride;
+        if (idx >= count) idx = count - 1;
+        h = HashFNV1a(&idx, sizeof(idx), h);
+        h = HashFNV1a(&points[idx], sizeof(Point3), h);
+    }
+
+    const int lastIdx = count - 1;
+    h = HashFNV1a(&lastIdx, sizeof(lastIdx), h);
+    h = HashFNV1a(&points[lastIdx], sizeof(Point3), h);
+    return h;
+}
+
+static uint64_t HashAdaptiveSkinnedPositions(Mesh& mesh) {
+    const int nv = mesh.getNumVerts();
+    uint64_t h = HashFNV1a(&nv, sizeof(nv));
+    if (nv <= 0) return h;
+    if (nv <= kSkinnedHashFullVertexThreshold) {
+        return HashFNV1a(mesh.verts, static_cast<size_t>(nv) * sizeof(Point3), h);
+    }
+    return HashSampledPoint3Array(mesh.verts, nv, h);
+}
+
+static uint64_t HashAdaptiveSkinnedPositions(MNMesh& mn) {
+    const int nv = mn.VNum();
+    uint64_t h = HashFNV1a(&nv, sizeof(nv));
+    if (nv <= 0) return h;
+    if (nv <= kSkinnedHashFullVertexThreshold) {
+        for (int i = 0; i < nv; ++i) {
+            Point3 p = mn.P(i);
+            h = HashFNV1a(&p, sizeof(p), h);
+        }
+        return h;
+    }
+
+    const int sampleCount = (nv < kSkinnedHashSampleCount) ? nv : kSkinnedHashSampleCount;
+    const int stride = (nv <= sampleCount) ? 1 : std::max(1, nv / sampleCount);
+    for (int sampleIdx = 0; sampleIdx < sampleCount; ++sampleIdx) {
+        int idx = sampleIdx * stride;
+        if (idx >= nv) idx = nv - 1;
+        Point3 p = mn.P(idx);
+        h = HashFNV1a(&idx, sizeof(idx), h);
+        h = HashFNV1a(&p, sizeof(p), h);
+    }
+
+    const int lastIdx = nv - 1;
+    Point3 lastPoint = mn.P(lastIdx);
+    h = HashFNV1a(&lastIdx, sizeof(lastIdx), h);
+    h = HashFNV1a(&lastPoint, sizeof(lastPoint), h);
     return h;
 }
 
@@ -2953,6 +3035,74 @@ static bool TryHashExtractedRenderableGeometry(INode* node, TimeValue t, uint64_
     return true;
 }
 
+static bool ExtractSkinnedFastPositions(INode* node,
+                                        TimeValue t,
+                                        const std::vector<int>& controlIdx,
+                                        std::vector<float>& outVerts) {
+    outVerts.clear();
+    if (!node || controlIdx.empty()) return false;
+
+    if (MNMesh* liveMN = TryGetLiveEditablePolyMesh(node)) {
+        outVerts.resize(controlIdx.size() * 3);
+        for (size_t i = 0; i < controlIdx.size(); ++i) {
+            const int ci = controlIdx[i];
+            if (ci < 0 || ci >= liveMN->VNum()) {
+                outVerts.clear();
+                return false;
+            }
+            const Point3 p = liveMN->P(ci);
+            outVerts[i * 3 + 0] = p.x;
+            outVerts[i * 3 + 1] = p.y;
+            outVerts[i * 3 + 2] = p.z;
+        }
+        return true;
+    }
+
+    ObjectState os = node->EvalWorldState(t);
+    if (!os.obj || os.obj->SuperClassID() != GEOMOBJECT_CLASS_ID) return false;
+    if (IsThreeJSSplatClassID(os.obj->ClassID())) return false;
+
+    if (os.obj->IsSubClassOf(polyObjectClassID)) {
+        MNMesh& mn = static_cast<PolyObject*>(os.obj)->GetMesh();
+        outVerts.resize(controlIdx.size() * 3);
+        for (size_t i = 0; i < controlIdx.size(); ++i) {
+            const int ci = controlIdx[i];
+            if (ci < 0 || ci >= mn.VNum()) {
+                outVerts.clear();
+                return false;
+            }
+            const Point3 p = mn.P(ci);
+            outVerts[i * 3 + 0] = p.x;
+            outVerts[i * 3 + 1] = p.y;
+            outVerts[i * 3 + 2] = p.z;
+        }
+        return true;
+    }
+
+    if (!os.obj->CanConvertToType(Class_ID(TRIOBJ_CLASS_ID, 0))) return false;
+    TriObject* tri = static_cast<TriObject*>(os.obj->ConvertToType(t, Class_ID(TRIOBJ_CLASS_ID, 0)));
+    if (!tri) return false;
+
+    Mesh& mesh = tri->GetMesh();
+    outVerts.resize(controlIdx.size() * 3);
+    bool ok = true;
+    for (size_t i = 0; i < controlIdx.size(); ++i) {
+        const int ci = controlIdx[i];
+        if (ci < 0 || ci >= mesh.getNumVerts()) {
+            ok = false;
+            break;
+        }
+        const Point3 p = mesh.getVert(ci);
+        outVerts[i * 3 + 0] = p.x;
+        outVerts[i * 3 + 1] = p.y;
+        outVerts[i * 3 + 2] = p.z;
+    }
+
+    if (!ok) outVerts.clear();
+    if (tri != os.obj) tri->DeleteThis();
+    return ok;
+}
+
 // ══════════════════════════════════════════════════════════════
 //  Transform + Color helpers
 // ══════════════════════════════════════════════════════════════
@@ -4400,6 +4550,8 @@ public:
     std::unordered_map<ULONG, uint64_t> propHashMap_;  // node handle → object properties hash
     std::unordered_map<ULONG, bool> jsmodStateMap_;    // node handle → last-seen three.js Deform flag
     std::unordered_set<ULONG> skinnedHandles_;             // geom handles with Skin modifier
+    std::unordered_map<ULONG, std::vector<int>> skinnedControlIdxCache_; // render vertex -> control vertex
+    ULONGLONG lastSkinnedLivePollTick_ = 0;
     std::unordered_set<ULONG> pluginInstHandles_;        // FP/RC/tyFlow node handles for change detection
     std::unordered_map<ULONG, uint64_t> pluginInstHash_; // plugin node → generated-instance dependency hash
 
@@ -6903,6 +7055,8 @@ public:
         groupCache_.clear();
         lastBBoxHash_.clear();
         lastLiveGeomHash_.clear();
+        skinnedControlIdxCache_.clear();
+        lastSkinnedLivePollTick_ = 0;
         ResetFastPathState(false);
     }
 
@@ -7187,21 +7341,41 @@ public:
         if (changed) QueueFastFlush();
     }
 
-    // Same as CheckSelectedGeometryLive but for skinned meshes — runs on redraw
+    // Skinned mesh check — hash only vertex positions (topology stable, skip indices/UVs)
     void CheckSkinnedGeometryLive() {
         if (skinnedHandles_.empty()) return;
         Interface* ip = GetCOREInterface();
         if (!ip) return;
+        const ULONGLONG now = GetTickCount64();
+        if (lastSkinnedLivePollTick_ != 0 &&
+            (now - lastSkinnedLivePollTick_) < kSkinnedLivePollIntervalMs) {
+            return;
+        }
+        lastSkinnedLivePollTick_ = now;
         TimeValue t = ip->GetTime();
 
         bool changed = false;
         for (ULONG handle : skinnedHandles_) {
-            if (geoFastDirtyHandles_.count(handle)) continue; // already queued
+            if (geoFastDirtyHandles_.count(handle)) continue;
             INode* node = ip->GetINodeByHandle(handle);
             if (!node) continue;
 
+            // Hash raw vertex positions directly from evaluated mesh — skip full ExtractMesh
             uint64_t geomHash = 0;
-            if (!TryHashExtractedRenderableGeometry(node, t, geomHash)) continue;
+            ObjectState os = node->EvalWorldState(t);
+            if (!os.obj || os.obj->SuperClassID() != GEOMOBJECT_CLASS_ID) continue;
+            if (os.obj->IsSubClassOf(polyObjectClassID)) {
+                PolyObject* poly = static_cast<PolyObject*>(os.obj);
+                MNMesh& mn = poly->GetMesh();
+                geomHash = HashAdaptiveSkinnedPositions(mn);
+            } else if (os.obj->CanConvertToType(Class_ID(TRIOBJ_CLASS_ID, 0))) {
+                TriObject* tri = static_cast<TriObject*>(
+                    os.obj->ConvertToType(t, Class_ID(TRIOBJ_CLASS_ID, 0)));
+                if (!tri) continue;
+                Mesh& mesh = tri->GetMesh();
+                geomHash = HashAdaptiveSkinnedPositions(mesh);
+                if (tri != os.obj) tri->DeleteThis();
+            } else continue;
             auto it = lastLiveGeomHash_.find(handle);
             if (it != lastLiveGeomHash_.end() && it->second == geomHash) continue;
             lastLiveGeomHash_[handle] = geomHash;
@@ -7704,6 +7878,8 @@ public:
             lightHandles_.clear();
             splatHandles_.clear();
             geoScanCursor_ = 0;
+            skinnedControlIdxCache_.clear();
+            lastSkinnedLivePollTick_ = 0;
             ResetFastPathState(false);
             SendProjectConfig();
             ScanInlineLayers();
@@ -7786,7 +7962,17 @@ public:
             std::vector<int> indices;
             std::vector<MatGroup> groups;
             bool isSpline = false;
-            if (!ExtractMesh(node, t, verts, uvs, indices, groups, &norms)) {
+            const bool trySkinnedFastPositions =
+                (wv17 && env12) && (skinnedHandles_.find(handle) != skinnedHandles_.end());
+            bool usedSkinnedFastPositions = false;
+            if (trySkinnedFastPositions) {
+                auto cacheIt = skinnedControlIdxCache_.find(handle);
+                if (cacheIt != skinnedControlIdxCache_.end()) {
+                    usedSkinnedFastPositions = ExtractSkinnedFastPositions(node, t, cacheIt->second, verts);
+                }
+            }
+
+            if (!usedSkinnedFastPositions && !ExtractMesh(node, t, verts, uvs, indices, groups, &norms)) {
                 ObjectState os = node->EvalWorldState(t);
                 if (!os.obj || os.obj->SuperClassID() != SHAPE_CLASS_ID ||
                     !ExtractSpline(node, t, verts, indices)) {
@@ -7797,15 +7983,20 @@ public:
                 norms.clear();
             }
 
-            // Update hash so we don't re-send next frame
-            uint64_t hash = HashMeshData(verts, indices, uvs);
-            geoHashMap_[handle] = hash;
+            if (!usedSkinnedFastPositions) {
+                // Update hash so we don't re-send next frame
+                uint64_t hash = HashMeshData(verts, indices, uvs);
+                geoHashMap_[handle] = hash;
+            }
 
             JsModData jmFast;
             GetJsModData(node, t, jmFast);
 
             if (wv17 && env12) {
-                size_t totalBytes = verts.size() * 4 + indices.size() * 4 + uvs.size() * 4 + norms.size() * 4;
+                size_t totalBytes = verts.size() * 4;
+                if (!usedSkinnedFastPositions) {
+                    totalBytes += indices.size() * 4 + uvs.size() * 4 + norms.size() * 4;
+                }
                 if (totalBytes < 4) totalBytes = 4;
 
                 ComPtr<ICoreWebView2SharedBuffer> buf;
@@ -7815,11 +8006,16 @@ public:
                 buf->get_Buffer(&ptr);
                 size_t off = 0;
                 memcpy(ptr + off, verts.data(), verts.size() * 4); size_t vOff = off; off += verts.size() * 4;
-                memcpy(ptr + off, indices.data(), indices.size() * 4); size_t iOff = off; off += indices.size() * 4;
-                size_t uvOff = off;
-                if (!uvs.empty()) { memcpy(ptr + off, uvs.data(), uvs.size() * 4); off += uvs.size() * 4; }
-                size_t nOff = off;
-                if (!norms.empty()) { memcpy(ptr + off, norms.data(), norms.size() * 4); off += norms.size() * 4; }
+                size_t iOff = 0;
+                size_t uvOff = 0;
+                size_t nOff = 0;
+                if (!usedSkinnedFastPositions) {
+                    memcpy(ptr + off, indices.data(), indices.size() * 4); iOff = off; off += indices.size() * 4;
+                    uvOff = off;
+                    if (!uvs.empty()) { memcpy(ptr + off, uvs.data(), uvs.size() * 4); off += uvs.size() * 4; }
+                    nOff = off;
+                    if (!norms.empty()) { memcpy(ptr + off, norms.data(), norms.size() * 4); off += norms.size() * 4; }
+                }
 
                 std::wostringstream ss;
                 ss.imbue(std::locale::classic());
@@ -7827,9 +8023,13 @@ public:
                 ss << L",\"jsmod\":" << (jmFast.found ? L"true" : L"false");
                 if (isSpline) ss << L",\"spline\":true";
                 ss << L",\"vOff\":" << vOff << L",\"vN\":" << verts.size();
-                ss << L",\"iOff\":" << iOff << L",\"iN\":" << indices.size();
-                if (!uvs.empty()) ss << L",\"uvOff\":" << uvOff << L",\"uvN\":" << uvs.size();
-                if (!norms.empty()) ss << L",\"nOff\":" << nOff << L",\"nN\":" << norms.size();
+                if (usedSkinnedFastPositions) {
+                    ss << L",\"keepNormals\":true";
+                } else {
+                    ss << L",\"iOff\":" << iOff << L",\"iN\":" << indices.size();
+                    if (!uvs.empty()) ss << L",\"uvOff\":" << uvOff << L",\"uvN\":" << uvs.size();
+                    if (!norms.empty()) ss << L",\"nOff\":" << nOff << L",\"nN\":" << norms.size();
+                }
                 ss << L'}';
 
                 wv17->PostSharedBufferToScript(buf.Get(),
@@ -9112,6 +9312,10 @@ public:
         ss << L"{\"type\":\"scene\",\"frame\":" << frameId << L",\"nodes\":[";
         bool first = true;
         WriteSceneNodes(root, t, ss, first, prevGeom);
+        for (auto it = skinnedControlIdxCache_.begin(); it != skinnedControlIdxCache_.end(); ) {
+            if (skinnedHandles_.find(it->first) == skinnedHandles_.end()) it = skinnedControlIdxCache_.erase(it);
+            else ++it;
+        }
         ss << L"],";
 
         // Camera
@@ -9256,7 +9460,7 @@ public:
             if (prevGeom.count(handle) && geoHashMap_.count(handle)) {
                 if (os.obj && os.obj->SuperClassID() == GEOMOBJECT_CLASS_ID) {
                     Interval gv = os.obj->ChannelValidity(t, GEOM_CHAN_NUM);
-                    uint64_t validKey = static_cast<uint64_t>(gv.Start()) ^ (static_cast<uint64_t>(gv.End()) << 32);
+                    uint64_t validKey = MakeGeomValidityKey(gv);
                     auto bboxIt = lastBBoxHash_.find(handle);
                     if (bboxIt != lastBBoxHash_.end() && bboxIt->second == validKey) {
                         skipExtract = true;
@@ -9311,7 +9515,10 @@ public:
                 std::vector<float> verts, uvs, norms;
                 std::vector<int> indices;
                 std::vector<MatGroup> groups;
-                bool extracted = ExtractMesh(node, t, verts, uvs, indices, groups, &norms);
+                const bool isSkinned = FindModifierOnNode(node, SKIN_CLASSID) != nullptr;
+                std::vector<int> controlIdx;
+                bool extracted = ExtractMesh(node, t, verts, uvs, indices, groups, &norms,
+                    isSkinned ? &controlIdx : nullptr);
 
                 // Spline fallback — extract as line geometry
                 bool isSpline = false;
@@ -9325,9 +9532,17 @@ public:
 
                     if (os.obj && os.obj->SuperClassID() == GEOMOBJECT_CLASS_ID) {
                         Interval gv = os.obj->ChannelValidity(t, GEOM_CHAN_NUM);
-                        lastBBoxHash_[handle] = static_cast<uint64_t>(gv.Start()) ^ (static_cast<uint64_t>(gv.End()) << 32);
+                        lastBBoxHash_[handle] = MakeGeomValidityKey(gv);
                     }
                     groupCache_[handle] = groups;
+                    if (isSkinned) {
+                        skinnedHandles_.insert(handle);
+                        if (!isSpline && controlIdx.size() * 3 == verts.size()) {
+                            skinnedControlIdxCache_[handle] = std::move(controlIdx);
+                        } else {
+                            skinnedControlIdxCache_.erase(handle);
+                        }
+                    }
 
                     if (!first) ss << L',';
                     ss << L"{\"h\":" << handle;
@@ -9493,7 +9708,7 @@ public:
                 if (prevGeom.count(ng.handle) && geoHashMap_.count(ng.handle)) {
                     if (os.obj && os.obj->SuperClassID() == GEOMOBJECT_CLASS_ID) {
                         Interval gv = os.obj->ChannelValidity(t, GEOM_CHAN_NUM);
-                        uint64_t validKey = static_cast<uint64_t>(gv.Start()) ^ (static_cast<uint64_t>(gv.End()) << 32);
+                        uint64_t validKey = MakeGeomValidityKey(gv);
                         auto bboxIt = lastBBoxHash_.find(ng.handle);
                         if (bboxIt != lastBBoxHash_.end() && bboxIt->second == validKey) {
                             skipExtract = true;
@@ -9522,7 +9737,10 @@ public:
                     geomHandles_.insert(node->GetHandle());
                     if (FindModifierOnNode(node, SKIN_CLASSID)) skinnedHandles_.insert(node->GetHandle());
                 } else {
-                    bool extracted = ExtractMesh(node, t, ng.verts, ng.uvs, ng.indices, ng.groups, &ng.norms);
+                    const bool isSkinned = FindModifierOnNode(node, SKIN_CLASSID) != nullptr;
+                    std::vector<int> controlIdx;
+                    bool extracted = ExtractMesh(node, t, ng.verts, ng.uvs, ng.indices, ng.groups, &ng.norms,
+                        isSkinned ? &controlIdx : nullptr);
                     if (!extracted && os.obj && os.obj->SuperClassID() == SHAPE_CLASS_ID) {
                         extracted = ExtractSpline(node, t, ng.verts, ng.indices);
                         ng.spline = extracted;
@@ -9545,7 +9763,15 @@ public:
 
                     if (os.obj && os.obj->SuperClassID() == GEOMOBJECT_CLASS_ID) {
                         Interval gv = os.obj->ChannelValidity(t, GEOM_CHAN_NUM);
-                        lastBBoxHash_[ng.handle] = static_cast<uint64_t>(gv.Start()) ^ (static_cast<uint64_t>(gv.End()) << 32);
+                        lastBBoxHash_[ng.handle] = MakeGeomValidityKey(gv);
+                    }
+                    if (isSkinned) {
+                        skinnedHandles_.insert(node->GetHandle());
+                        if (!ng.spline && controlIdx.size() * 3 == ng.verts.size()) {
+                            skinnedControlIdxCache_[ng.handle] = std::move(controlIdx);
+                        } else {
+                            skinnedControlIdxCache_.erase(ng.handle);
+                        }
                     }
 
                     if (srcHandle != 0) extractedSources.insert(srcHandle);
@@ -9564,7 +9790,6 @@ public:
                     }
                     geos.push_back(std::move(ng));
                     geomHandles_.insert(node->GetHandle());
-                    if (FindModifierOnNode(node, SKIN_CLASSID)) skinnedHandles_.insert(node->GetHandle());
                 }
                 collect(node);
             }
@@ -9602,6 +9827,10 @@ public:
         }
         for (auto it = lastLiveGeomHash_.begin(); it != lastLiveGeomHash_.end(); ) {
             if (geomHandles_.find(it->first) == geomHandles_.end()) it = lastLiveGeomHash_.erase(it);
+            else ++it;
+        }
+        for (auto it = skinnedControlIdxCache_.begin(); it != skinnedControlIdxCache_.end(); ) {
+            if (skinnedHandles_.find(it->first) == skinnedHandles_.end()) it = skinnedControlIdxCache_.erase(it);
             else ++it;
         }
 
@@ -10179,6 +10408,8 @@ public:
         lastBBoxHash_.clear();
         lastLiveGeomHash_.clear();
         mtlScalarHashMap_.clear();
+        skinnedControlIdxCache_.clear();
+        lastSkinnedLivePollTick_ = 0;
         if (hwnd_) { HWND h = hwnd_; hwnd_ = nullptr; DestroyWindow(h); }
     }
 

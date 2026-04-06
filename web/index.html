@@ -2453,20 +2453,22 @@
                             if (!mesh.userData.jsmod) {
                             const pos = mesh.geometry.getAttribute('position');
                             const vertCount = meta.vN / 3;
-                            const idxCount = meta.iN;
+                            const hasIncomingIndex = meta.iOff != null && meta.iN != null;
+                            const idxCount = hasIncomingIndex ? meta.iN : 0;
                             const existingIdx = mesh.geometry.getIndex();
                             const sameTopology = pos
                                 && pos.count === vertCount
-                                && existingIdx
-                                && existingIdx.count === idxCount;
+                                && (!hasIncomingIndex || (existingIdx && existingIdx.count === idxCount));
 
                             if (sameTopology) {
                                 // Hot path: copy positions into existing GPU buffer
                                 pos.array.set(new Float32Array(buf, meta.vOff, meta.vN));
                                 pos.needsUpdate = true;
 
-                                existingIdx.array.set(new Int32Array(buf, meta.iOff, meta.iN));
-                                existingIdx.needsUpdate = true;
+                                if (hasIncomingIndex && existingIdx) {
+                                    existingIdx.array.set(new Int32Array(buf, meta.iOff, meta.iN));
+                                    existingIdx.needsUpdate = true;
+                                }
 
                                 if (meta.uvOff != null && meta.uvN) {
                                     const uvCount = meta.uvN / 2;
@@ -2488,13 +2490,14 @@
                                         norm.array.set(new Float32Array(buf, meta.nOff, meta.nN));
                                         norm.needsUpdate = true;
                                     }
-                                } else {
+                                } else if (!meta.keepNormals) {
                                     scheduleNormals(mesh.geometry);
                                 }
 
                                 mesh.geometry.computeBoundingBox();
                                 mesh.geometry.computeBoundingSphere();
                             } else {
+                                if (!hasIncomingIndex) return;
                                 // Topology changed — full rebuild
                                 const verts = new Float32Array(new Float32Array(buf, meta.vOff, meta.vN));
                                 const idx = new Uint32Array(new Int32Array(buf, meta.iOff, meta.iN));

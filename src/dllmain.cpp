@@ -4783,6 +4783,58 @@ public:
         return GetProjectDir() + L"\\dist";
     }
 
+    // Returns the projects root folder (parent of "active", "bee", etc.)
+    std::wstring GetProjectsRoot() {
+#ifdef MAXJS_SOURCE_WEB_DIR
+        std::wstring sourceWebDir = Utf8ToWide(MAXJS_SOURCE_WEB_DIR);
+        std::replace(sourceWebDir.begin(), sourceWebDir.end(), L'/', L'\\');
+        const size_t split = sourceWebDir.find_last_of(L"\\/");
+        if (split != std::wstring::npos) {
+            std::wstring root = sourceWebDir.substr(0, split) + L"\\projects";
+            // Ensure the projects root exists
+            std::error_code ec;
+            std::filesystem::create_directories(std::filesystem::path(root), ec);
+            if (DirectoryExists(root)) return root;
+        }
+#endif
+        // Fallback: parent of GetProjectDir()
+        const std::wstring projectDir = GetProjectDir();
+        const size_t split2 = projectDir.find_last_of(L"\\/");
+        if (split2 != std::wstring::npos) return projectDir.substr(0, split2);
+        return projectDir;
+    }
+
+    // Derive a safe folder name from the Max scene filename (strips extension, replaces bad chars)
+    std::wstring DeriveSceneExportName() {
+        Interface* ip = GetCOREInterface();
+        if (!ip) return L"";
+        MSTR scenePath = ip->GetCurFilePath();
+        if (!scenePath.data() || scenePath.Length() == 0) return L"";
+        std::wstring full(scenePath.data());
+        // Extract filename without extension
+        size_t lastSlash = full.find_last_of(L"\\/");
+        std::wstring name = (lastSlash != std::wstring::npos) ? full.substr(lastSlash + 1) : full;
+        size_t dot = name.find_last_of(L'.');
+        if (dot != std::wstring::npos) name = name.substr(0, dot);
+        // Replace unsafe chars with underscore
+        for (auto& c : name) {
+            if (c == L' ' || c == L'<' || c == L'>' || c == L':' || c == L'"' ||
+                c == L'|' || c == L'?' || c == L'*') c = L'_';
+        }
+        // Trim and lowercase
+        while (!name.empty() && (name.back() == L'_' || name.back() == L'.')) name.pop_back();
+        if (name.empty()) return L"";
+        return name;
+    }
+
+    // Get the export dist folder for a named project (or derive from scene name)
+    std::wstring GetNamedSnapshotDir(const std::wstring& exportName) {
+        std::wstring name = exportName;
+        if (name.empty()) name = DeriveSceneExportName();
+        if (name.empty()) return GetSnapshotDir();  // fallback to active/dist
+        return GetProjectsRoot() + L"\\" + name + L"\\dist";
+    }
+
     bool CopySnapshotAsset(const std::wstring& rawPath,
                            bool isDirectory,
                            const std::wstring& exportDir,
@@ -5013,6 +5065,7 @@ public:
         bool includeMaterialAnimation = true;
         bool includeCameraAnimation = true;
         int animationSampleStepFrames = 1;
+        std::wstring exportName;  // optional: exports to projects/{exportName}/dist/
     };
 
     static void NormalizeSnapshotExportOptions(SnapshotExportOptions& options) {
@@ -5324,6 +5377,81 @@ public:
         outTarget.target = L"handle:" + std::to_wstring(node->GetHandle());
         if (matrixChanged) outTarget.tracks.push_back(std::move(matrixTrack));
         if (visChanged) outTarget.tracks.push_back(std::move(visibilityTrack));
+        return !outTarget.tracks.empty();
+    }
+
+    // Like BuildNodeAnimationTarget but stores LOCAL transforms (parentInverse * world)
+    // instead of world transforms. Required for bones in a SkinnedMesh hierarchy.
+    static bool BuildBoneAnimationTarget(INode* bone,
+                                         INode* parentNode,
+                                         const Interval& range,
+                                         TimeValue currentTime,
+                                         const SnapshotExportOptions& options,
+                                         SnapshotAnimationTargetDef& outTarget) {
+        if (!bone) return false;
+
+        std::vector<TimeValue> discoveryTimes;
+        const bool hasTransformAnimation =
+            BuildAnimatableTimeSamples(bone->GetTMController(), range, currentTime, discoveryTimes);
+        // Also check if parent is animated (parent movement changes this bone's local transform)
+        if (parentNode) {
+            BuildAnimatableTimeSamples(parentNode->GetTMController(), range, currentTime, discoveryTimes);
+        }
+        if (discoveryTimes.empty() && !hasTransformAnimation) {
+            return false;
+        }
+
+        std::vector<TimeValue> sampleTimes;
+        AppendFrameSampleTimes(sampleTimes, range, options.animationSampleStepFrames);
+        SortUniqueTimeValues(sampleTimes);
+        if (sampleTimes.size() < 2) {
+            return false;
+        }
+
+        SnapshotAnimationTrackDef matrixTrack;
+        matrixTrack.path = L"matrix";
+        matrixTrack.type = L"matrix16";
+        matrixTrack.interpolation = L"linear";
+
+        bool matrixChanged = false;
+        bool havePrevious = false;
+        float previousMatrix[16] = {};
+
+        for (TimeValue sampleTime : sampleTimes) {
+            const float seconds = TimeValueToAnimationSeconds(sampleTime, range.Start());
+
+            float boneWorld[16];
+            GetTransform16(bone, sampleTime, boneWorld);
+
+            float parentWorld[16];
+            if (parentNode)
+                GetTransform16(parentNode, sampleTime, parentWorld);
+            else
+                Mat4IdentityCM(parentWorld);
+
+            float invParent[16];
+            if (!InvertMat4CM(parentWorld, invParent))
+                Mat4IdentityCM(invParent);
+
+            float localMatrix[16];
+            MulMat4CM(invParent, boneWorld, localMatrix);
+
+            matrixTrack.times.push_back(seconds);
+            matrixTrack.values.insert(
+                matrixTrack.values.end(),
+                localMatrix,
+                localMatrix + 16);
+
+            if (havePrevious) {
+                if (!TransformEquals16(localMatrix, previousMatrix)) matrixChanged = true;
+            }
+
+            std::copy(std::begin(localMatrix), std::end(localMatrix), previousMatrix);
+            havePrevious = true;
+        }
+
+        outTarget.target = L"handle:" + std::to_wstring(bone->GetHandle());
+        if (matrixChanged) outTarget.tracks.push_back(std::move(matrixTrack));
         return !outTarget.tracks.empty();
     }
 
@@ -6087,13 +6215,26 @@ public:
             }
 
             if (node.skinRig && options.includeTransformAnimation) {
-                for (ULONG bh : node.skinBoneHandles) {
+                for (size_t bi = 0; bi < node.skinBoneHandles.size(); bi++) {
+                    ULONG bh = node.skinBoneHandles[bi];
                     if (bh == 0) continue;
                     if (skinBonesAnimated.find(bh) != skinBonesAnimated.end()) continue;
                     INode* bn = ip->GetINodeByHandle(bh);
                     if (!bn) continue;
+
+                    // Determine parent node matching the Three.js bone hierarchy:
+                    // parent index >= 0 → parent bone; parent index < 0 → the mesh node itself
+                    INode* parentNode = nullptr;
+                    const int parentIdx = (bi < node.skinBoneParents.size()) ? node.skinBoneParents[bi] : -1;
+                    if (parentIdx >= 0 && parentIdx < static_cast<int>(node.skinBoneHandles.size())) {
+                        parentNode = ip->GetINodeByHandle(node.skinBoneHandles[parentIdx]);
+                    }
+                    if (!parentNode) {
+                        parentNode = node.node;  // root bone: parent is the skinned mesh
+                    }
+
                     SnapshotAnimationTargetDef boneTarget;
-                    if (BuildNodeAnimationTarget(bn, range, currentTime, options, boneTarget)) {
+                    if (BuildBoneAnimationTarget(bn, parentNode, range, currentTime, options, boneTarget)) {
                         boneTarget.target = L"handle:" + std::to_wstring(bh);
                         targets.push_back(std::move(boneTarget));
                         skinBonesAnimated.insert(bh);
@@ -6549,7 +6690,7 @@ public:
             return false;
         }
 
-        outDir = GetSnapshotDir();
+        outDir = GetNamedSnapshotDir(options.exportName);
         if (!RecreateDirectory(outDir)) {
             error = L"Failed to recreate snapshot directory";
             return false;
@@ -7456,6 +7597,7 @@ public:
             ExtractJsonBool(msg, L"includeMaterialAnimation", options.includeMaterialAnimation);
             ExtractJsonBool(msg, L"includeCameraAnimation", options.includeCameraAnimation);
             ExtractJsonInt(msg, L"animationSampleStepFrames", options.animationSampleStepFrames);
+            ExtractJsonString(msg, L"exportName", options.exportName);
             NormalizeSnapshotExportOptions(options);
 
             std::wstring snapshotUiJson = options.includeSnapshotUi ? L"{}" : L"";

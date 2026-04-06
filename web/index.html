@@ -2468,8 +2468,14 @@
                                 existingIdx.needsUpdate = true;
 
                                 if (meta.uvOff != null && meta.uvN) {
-                                    const uv = mesh.geometry.getAttribute('uv');
-                                    if (uv && uv.count === meta.uvN / 2) {
+                                    const uvCount = meta.uvN / 2;
+                                    let uv = mesh.geometry.getAttribute('uv');
+                                    if (!uv || uv.count !== uvCount) {
+                                        mesh.geometry.setAttribute(
+                                            'uv',
+                                            new THREE.BufferAttribute(new Float32Array(buf, meta.uvOff, meta.uvN), 2),
+                                        );
+                                    } else {
                                         uv.array.set(new Float32Array(buf, meta.uvOff, meta.uvN));
                                         uv.needsUpdate = true;
                                     }

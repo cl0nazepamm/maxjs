@@ -6471,7 +6471,10 @@ public:
             ULONG handle = node->GetHandle();
             if (!IsTrackedHandle(handle)) continue;
 
-            const uint64_t geomHash = HashNodeGeometryState(node, t);
+            // Match DetectGeometryChanges / geo_fast payload: include UVs (HashNodeGeometryState omits them).
+            uint64_t geomHash = 0;
+            if (!TryHashExtractedRenderableGeometry(node, t, geomHash))
+                continue;
             auto it = lastLiveGeomHash_.find(handle);
             if (it != lastLiveGeomHash_.end() && it->second == geomHash) continue;
             lastLiveGeomHash_[handle] = geomHash;

@@ -7579,8 +7579,14 @@ public:
         return lastInteractionTick_ != 0 && (now - lastInteractionTick_) <= kInteractiveCooldownMs;
     }
 
+    bool IsCreateTaskActive() const {
+        Interface* ip = GetCOREInterface();
+        return ip && ip->GetCommandPanelTaskMode() == TASK_MODE_CREATE;
+    }
+
     bool ShouldRunInteractiveGeometryChecks(INode* node) const {
         if (IsSubObjectEditingActive()) return true;
+        if (IsCreateTaskActive()) return true;
         if (!IsModifyTaskActive()) return false;
 
         Interface* ip = GetCOREInterface();

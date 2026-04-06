@@ -416,6 +416,34 @@ Removed broken optimizations that were added between `9a66ccf` and `1d0468d` and
 
 The clean design: `CheckSelectedGeometryLive` runs on every redraw with no throttle. Time change marks transforms dirty but does not extract geometry. Full sync debounces rapid-fire structural events.
 
+### 5. Interactive performance gating (7cecc69+)
+
+Added `ShouldFavorInteractivePerformance()` to suppress heavy idle polling during interaction.
+When animation is playing or recent interaction detected (250ms cooldown), the timer skips:
+material detection, geometry scanning, light/property polling, web/project content checks.
+
+Only fast path (redraw-driven) runs during interaction. Timer is fallback for idle.
+
+### 6. Hash domain fix (7cecc69)
+
+`DetectGeometryChanges` and `CheckSelectedGeometryLive` were changed to use `TryHashRenderableGeometryState` (hashes raw MNMesh/Mesh data) instead of `TryHashExtractedRenderableGeometry` (hashes extracted/split mesh data via ExtractMesh).
+
+But `geoHashMap_` was still populated with extracted hashes from `SendGeometryFastUpdate` and `SendFullSyncBinary`. The hash domain mismatch caused `DetectGeometryChanges` to always find a difference, triggering `SetDirty()` in an infinite loop every 2-3 seconds.
+
+Fix: all `geoHashMap_` writes now use `TryHashRenderableGeometryState` to match the detection side.
+
+### 7. Topology notification downgrade for interactive edits
+
+3ds Max fires `TopologyChanged` for parametric objects (sphere radius, modifier params) even when only vertex positions change. This was routing through `SetDirty()` for every parameter drag increment, forcing full sync instead of fast geo.
+
+Fix: `MarkGeometryTopologyDirty` now routes selected nodes and skinned meshes through `geo_fast` instead of full sync. The JS side already rebuilds BufferGeometry when topology actually changes in a `geo_fast` message. Unselected nodes still get full sync for real structural changes.
+
+### 8. Creation mode geometry checks
+
+`ShouldRunInteractiveGeometryChecks` gates `CheckSelectedGeometryLive` to avoid unnecessary hashing during idle selection/movement. But it was returning false in the Create panel (`TASK_MODE_CREATE`), breaking realtime feedback during object creation drag.
+
+Fix: `IsCreateTaskActive()` check added so creation mode gets the same redraw-driven geometry detection as Modify panel.
+
 ## Known Limitations
 
 - Editable Poly under higher modifiers is still conservative.
@@ -451,6 +479,7 @@ The clean design: `CheckSelectedGeometryLive` runs on every redraw with no throt
 
 - Never throttle the redraw geometry probe.
   `CheckSelectedGeometryLive` must run unconditionally on every redraw. Throttling it causes visible chop.
+  The `ShouldRunInteractiveGeometryChecks` gate must return true for Create, Modify, and SubObject modes.
 
 - Never extract geometry in the time change callback.
   `TimeChanged` must only mark dirty flags. Extraction belongs in the redraw callback or the timer fallback.
@@ -471,6 +500,10 @@ Check these first:
 7. Is anything doing per-mesh extraction inside `TimeChanged`? That callback must only mark dirty, never extract.
 8. Is the full sync debounce missing? Without it, rapid-fire `SetDirty` calls trigger expensive full syncs every 33ms tick.
 
+9. Are `geoHashMap_` writes using the same hash function as `DetectGeometryChanges`? A domain mismatch causes infinite full sync loops.
+10. Is `MarkGeometryTopologyDirty` escalating to full sync for the selected node? Parametric objects fire `TopologyChanged` on every parameter drag — selected nodes must route through `geo_fast`.
+11. Is `ShouldRunInteractiveGeometryChecks` returning false for the active task mode? It must cover Create, Modify, and SubObject modes.
+
 ### What went wrong before (lesson from 38f09c4)
 
 Three "optimizations" were added that each individually seemed reasonable but together killed interactive performance:
@@ -481,3 +514,9 @@ Three "optimizations" were added that each individually seemed reasonable but to
 - Removing the full sync debounce made every structural notification trigger an immediate expensive rebuild
 
 The reference clean state is commit `9a66ccf`. Compare against it when in doubt.
+
+### What went wrong later (hash domain mismatch, fixed in 7cecc69+)
+
+`TryHashExtractedRenderableGeometry` was replaced with `TryHashRenderableGeometryState` in detection code (faster, skips ExtractMesh). But `geoHashMap_` was still populated with `HashMeshData` (extracted mesh hashes). The two hash domains never match, so `DetectGeometryChanges` triggered `SetDirty()` on every idle poll cycle, causing a full sync every 2-3 seconds.
+
+Rule: every write to `geoHashMap_` must use the same hash function that `DetectGeometryChanges` uses for comparison. Currently that is `TryHashRenderableGeometryState`.

@@ -1806,6 +1806,23 @@
             }
         }
 
+        function applyJsmodSyncState(mesh, enabled) {
+            if (enabled) mesh.userData.jsmod = true;
+            else delete mesh.userData.jsmod;
+        }
+
+        function applyBridgeVisibility(mesh, visibleFlag) {
+            if (!mesh || mesh.userData.jsmod) return;
+            const visible = visibleFlag == null ? true : visibleFlag !== 0;
+            if (mesh.visible !== visible) mesh.visible = visible;
+        }
+
+        function applyInstanceSyncState(mesh, instOfHandle) {
+            if (!mesh) return;
+            if (Number.isFinite(instOfHandle) && instOfHandle > 0) mesh.userData.maxjsInstOf = instOfHandle;
+            else delete mesh.userData.maxjsInstOf;
+        }
+
         function applySSSMaterialNodes(material, md) {
             if (!material || typeof material !== 'object') return;
 
@@ -2301,11 +2318,16 @@
         }
 
         function countInstances() {
-            const geoms = new Set();
+            const implicitInstanceGeoms = new Set();
             let count = 0;
             for (const [, mesh] of nodeMap) {
-                if (geoms.has(mesh.geometry)) count++;
-                else geoms.add(mesh.geometry);
+                if (!mesh?.geometry) continue;
+                if (Number.isFinite(mesh.userData?.maxjsInstOf) && mesh.userData.maxjsInstOf > 0) {
+                    count++;
+                    continue;
+                }
+                if (implicitInstanceGeoms.has(mesh.geometry)) count++;
+                else implicitInstanceGeoms.add(mesh.geometry);
             }
             // Count Forest Pack GPU instances
             for (const [, im] of forestMeshes) {
@@ -2504,8 +2526,7 @@
                         // Real-time vertex update — in-place when topology matches
                         const mesh = nodeMap.get(meta.h);
                         if (mesh) {
-                            if (meta.jsmod === true) mesh.userData.jsmod = true;
-                            else if (meta.jsmod === false) delete mesh.userData.jsmod;
+                            if (meta.jsmod != null) applyJsmodSyncState(mesh, meta.jsmod === true);
                             if (!mesh.userData.jsmod) {
                             const pos = mesh.geometry.getAttribute('position');
                             const vertCount = meta.vN / 3;
@@ -2687,10 +2708,9 @@
                     nodeMap.set(nd.h, mesh);
                 }
 
-                if (jsmodFlag) mesh.userData.jsmod = true;
-                else delete mesh.userData.jsmod;
-                // jsmod nodes: don't overwrite visibility (layers control it)
-                if (!mesh.userData.jsmod) mesh.visible = true;
+                applyJsmodSyncState(mesh, jsmodFlag);
+                applyInstanceSyncState(mesh, nd.instOf);
+                applyBridgeVisibility(mesh, nd.vis);
                 mesh.frustumCulled = false;
                 if (!nd.spline) applyMeshShadowState(mesh);
                 applyNodeProps(mesh, nd.props);
@@ -2772,8 +2792,7 @@
         bridge.on('geo_fast', msg => {
             const mesh = nodeMap.get(msg.h);
             if (!mesh) return;
-            if (msg.jsmod === true) mesh.userData.jsmod = true;
-            else if (msg.jsmod === false) delete mesh.userData.jsmod;
+            if (msg.jsmod != null) applyJsmodSyncState(mesh, msg.jsmod === true);
             if (mesh.userData.jsmod) return;  // layers own vertices
             const wantsLine = !!msg.spline;
             const hasLine = !!(mesh.isLine || mesh.isLineSegments);
@@ -2815,14 +2834,10 @@
             for (const nd of msg.nodes) {
                 const mesh = nodeMap.get(nd.h);
                 if (!mesh) continue;
-                if (nd.jsmod === true) mesh.userData.jsmod = true;
-                else if (nd.jsmod === false) delete mesh.userData.jsmod;
-                // Visibility (hide/unhide/isolate) — instant, no full sync needed
-                // jsmod nodes: layers control visibility, skip sync overwrite
-                if (nd.vis != null && !mesh.userData.jsmod) {
-                    const vis = nd.vis !== 0;
-                    if (mesh.visible !== vis) mesh.visible = vis;
-                }
+                if (nd.jsmod != null) applyJsmodSyncState(mesh, nd.jsmod === true);
+                // Visibility (hide/unhide/isolate) — instant, no full sync needed.
+                // jsmod nodes keep visibility under the layer runtime.
+                if (nd.vis != null) applyBridgeVisibility(mesh, nd.vis);
                 if (Array.isArray(nd.t) && nd.t.length === 16) applyTransform(mesh, nd.t);
                 if (nd.s != null) applySelection(mesh, nd.s);
                 // Live material update from scalars
@@ -3105,10 +3120,9 @@
                     nodeMap.set(nd.h, mesh);
                 }
 
-                if (jsmodFlag) mesh.userData.jsmod = true;
-                else delete mesh.userData.jsmod;
-                // jsmod nodes: don't overwrite visibility (layers control it)
-                if (!mesh.userData.jsmod) mesh.visible = (nd.vis !== 0);
+                applyJsmodSyncState(mesh, jsmodFlag);
+                applyInstanceSyncState(mesh, nd.instOf);
+                applyBridgeVisibility(mesh, nd.vis);
                 mesh.frustumCulled = false;
                 if (!nd.spline) applyMeshShadowState(mesh);
                 applyNodeProps(mesh, nd.props);
@@ -3170,7 +3184,7 @@
                 },
                 onVisibility(nodeHandle, visible) {
                     const mesh = nodeMap.get(nodeHandle);
-                    if (mesh && !mesh.userData.jsmod) mesh.visible = visible;
+                    if (mesh) applyBridgeVisibility(mesh, visible);
                 },
                 onCamera(cameraState) {
                     applyCamera(cameraState);

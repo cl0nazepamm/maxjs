@@ -472,7 +472,17 @@ export function createLayerManager({
         clone.matrixWorldNeedsUpdate = true;
         clone.visible = true;
         if (source.geometry?.clone) clone.geometry = markOwned(source.geometry.clone(), owner);
-        if (source.material) clone.material = cloneMaterialForLayer(source.material, owner);
+        if (source.material) {
+            if (source.userData?.jsmod) {
+                // three.js Deform layers own geometry, but material edits from Max
+                // should keep flowing to the runtime clone without a refresh.
+                clone.material = source.material;
+                clone.userData.maxjsSourceHandle = handle;
+                clone.userData.maxjsFollowSourceMaterial = true;
+            } else {
+                clone.material = cloneMaterialForLayer(source.material, owner);
+            }
+        }
         return markOwned(clone, owner);
     }
 
@@ -591,6 +601,7 @@ export function createLayerManager({
                 if (options.snapshotId) setSnapshotTargetId(clone, `runtime:${layer.id}:${options.snapshotId}`);
                 const parent = options.overlay ? layer.overlayGroup : layer.group;
                 parent.add(clone);
+                if (clone.userData?.maxjsFollowSourceMaterial) layer.liveMaterialClones.add(clone);
                 return clone;
             },
             track(resource, options = {}) {
@@ -665,6 +676,28 @@ export function createLayerManager({
         }
     }
 
+    function syncLiveMaterialClones(layer) {
+        for (const clone of [...layer.liveMaterialClones]) {
+            if (!clone?.isObject3D || !clone.parent) {
+                layer.liveMaterialClones.delete(clone);
+                continue;
+            }
+            if (!clone.userData?.maxjsFollowSourceMaterial) {
+                layer.liveMaterialClones.delete(clone);
+                continue;
+            }
+
+            const handle = clone.userData.maxjsSourceHandle;
+            const source = Number.isFinite(handle) ? nodeMap.get(handle) : null;
+            if (!source?.isObject3D) {
+                clone.visible = false;
+                continue;
+            }
+
+            if (clone.material !== source.material) clone.material = source.material;
+        }
+    }
+
     function createLayerState(id, options = {}) {
         if (layers.has(id)) remove(id);
 
@@ -695,6 +728,7 @@ export function createLayerManager({
             errorCount: 0,
             tracked: new Set(),
             anchors: [],
+            liveMaterialClones: new Set(),
             nodeAdapters: new Map(),
             input: null,
             profile: {
@@ -835,11 +869,13 @@ export function createLayerManager({
 
             if (layer.loading || !layer.active || !layer.hooks || typeof layer.hooks.update !== 'function') {
                 syncAnchors(layer, anchorSyncCache);
+                syncLiveMaterialClones(layer);
                 continue;
             }
             try {
                 const updateStart = performance.now();
                 syncAnchors(layer, anchorSyncCache);
+                syncLiveMaterialClones(layer);
                 layer.hooks.update(layer.ctx, dt, elapsed);
                 const updateMs = performance.now() - updateStart;
                 totalUpdateMs += updateMs;

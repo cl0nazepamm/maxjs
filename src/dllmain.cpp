@@ -8160,22 +8160,24 @@ public:
                 if (useBinary_) SendFullSyncBinary(); else SendFullSync();
             }
         } else {
+            const bool animPlaying = IsAnimationPlaying();
             const bool favorInteractive = ShouldFavorInteractivePerformance();
             const bool allowIdlePolling = !favorInteractive;
-            const bool allowHeavyGeometryPolling = !favorInteractive && !IsAnimationPlaying();
+            const bool allowRealtimeAuxPolling = allowIdlePolling || animPlaying;
+            const bool allowHeavyGeometryPolling = !favorInteractive && !animPlaying;
 
             if (allowIdlePolling && slowPhase == 0) CheckWebContentChanges();
             if (allowIdlePolling && slowPhase == 3) CheckProjectContentChanges();
             if (allowIdlePolling && tickCount_ % MATERIAL_DETECT_TICKS == 2) DetectMaterialChanges();
             if (allowIdlePolling && lightPhase == 0) DetectPropertyChanges();
-            if (allowIdlePolling && lightPhase == 1) {
+            if (allowRealtimeAuxPolling && lightPhase == 1) {
                 DetectLightChanges();
                 DetectSplatChanges();
             }
             if (allowHeavyGeometryPolling && slowPhase == 6) DetectGeometryChanges();
             if (allowIdlePolling && slowPhase == 9) DetectJsModChanges();
             if (allowIdlePolling && slowPhase == 12) DetectPluginInstanceChanges();
-            if (allowIdlePolling && lightPhase == 2) PollViewportModes();
+            if (allowRealtimeAuxPolling && lightPhase == 2) PollViewportModes();
             if (allowIdlePolling && slowPhase == 1) ScanInlineLayers();
         }
     }
@@ -10791,7 +10793,7 @@ void MaxJSFastRedrawCallback::proc(Interface*) {
     if (!owner_) return;
     owner_->MarkSelectedTransformsDirty();
     owner_->CheckTrackedMaterialScalarsLive();
-    if (!owner_->ShouldFavorInteractivePerformance()) {
+    if (!owner_->ShouldFavorInteractivePerformance() || owner_->IsAnimationPlaying()) {
         owner_->MarkTrackedLightTransformsDirty();
         owner_->CheckTrackedLightsLive();
         owner_->MarkTrackedSplatTransformsDirty();

@@ -635,9 +635,36 @@
         perspCamera.position.copy(cameraDefaultPosition);
         let camera = perspCamera;
 
+        const PERFORMANCE_DEFAULTS = Object.freeze({
+            fpsCap: 0,
+            renderScale: 1.0,
+            autoThrottle: true,
+        });
+        let performanceSettings = { ...PERFORMANCE_DEFAULTS };
+        let lastRenderTimestamp = 0;
+        let windowFocused = true;
+
+        function getEffectivePixelRatio() {
+            const scale = Number.isFinite(performanceSettings.renderScale) ? performanceSettings.renderScale : 1.0;
+            return Math.max(0.25, devicePixelRatio * scale);
+        }
+
+        function applyRendererPerformanceSettings({ resizePostFx = false } = {}) {
+            if (renderer) {
+                renderer.setPixelRatio(getEffectivePixelRatio());
+                renderer.setSize(innerWidth, innerHeight);
+            }
+            if (splatOverlay?.renderer) {
+                splatOverlay.renderer.setPixelRatio(getEffectivePixelRatio());
+                splatOverlay.renderer.setSize(innerWidth, innerHeight, false);
+            }
+            lastRenderTimestamp = 0;
+            if (resizePostFx) ssgiFx.resize();
+        }
+
         function configureRenderer(nextRenderer) {
             nextRenderer.setSize(innerWidth, innerHeight);
-            nextRenderer.setPixelRatio(devicePixelRatio);
+            nextRenderer.setPixelRatio(getEffectivePixelRatio());
             nextRenderer.toneMapping = THREE.ACESFilmicToneMapping;
             nextRenderer.toneMappingExposure = 1.2;
             nextRenderer.shadowMap.enabled = true;
@@ -803,7 +830,7 @@
             const overlayRenderer = new THREE_STD.WebGLRenderer({
                 antialias: true, alpha: true, premultipliedAlpha: true,
             });
-            overlayRenderer.setPixelRatio(devicePixelRatio);
+            overlayRenderer.setPixelRatio(getEffectivePixelRatio());
             overlayRenderer.setSize(innerWidth, innerHeight, false);
             overlayRenderer.setClearColor(0x000000, 0);
             overlayRenderer.domElement.style.cssText = 'position:absolute;inset:0;pointer-events:none;z-index:5';
@@ -4742,6 +4769,17 @@
             const tmOptions = Object.keys(toneMappingModes).map(name =>
                 `<option value="${name}" ${name === currentToneMapping ? 'selected' : ''}>${name}</option>`
             ).join('');
+            const fpsCapOptions = [
+                { value: 0, label: 'Uncapped' },
+                { value: 30, label: '30 FPS' },
+                { value: 60, label: '60 FPS' },
+                { value: 90, label: '90 FPS' },
+                { value: 120, label: '120 FPS' },
+                { value: 144, label: '144 FPS' },
+                { value: 240, label: '240 FPS' },
+            ].map(option =>
+                `<option value="${option.value}" ${option.value === performanceSettings.fpsCap ? 'selected' : ''}>${option.label}</option>`
+            ).join('');
 
             postPanel.innerHTML = `
                 <div class="sidepanel-resize" id="panelResizeHandle"></div>
@@ -4770,6 +4808,33 @@
                                 <input class="fx-range" id="fx-tonemapping-exp" type="range" min="0" max="5" step="0.1" value="${currentExposure}">
                             </label>
                         </div>
+                    </section>
+                    <section class="fx-section">
+                        <div class="fx-section-header">
+                            <div class="fx-section-title">Performance</div>
+                        </div>
+                        <div class="fx-grid">
+                            <label class="fx-control" for="fx-performance-fpscap">
+                                <div class="fx-control-head">
+                                    <span>FPS Cap</span>
+                                </div>
+                                <select id="fx-performance-fpscap" style="background:rgba(255,255,255,0.05);color:#aaa;border:1px solid rgba(255,255,255,0.08);border-radius:5px;padding:3px 6px;font:10px 'Segoe UI',system-ui,sans-serif;width:100%;outline:none;cursor:pointer">
+                                    ${fpsCapOptions}
+                                </select>
+                            </label>
+                            <label class="fx-control" for="fx-performance-renderscale">
+                                <div class="fx-control-head">
+                                    <span>Render Scale</span>
+                                    <span class="fx-value" id="fx-performance-renderscale-val">${performanceSettings.renderScale.toFixed(2)}x</span>
+                                </div>
+                                <input class="fx-range" id="fx-performance-renderscale" type="range" min="0.25" max="1" step="0.05" value="${performanceSettings.renderScale}">
+                            </label>
+                            <label class="fx-check" for="fx-performance-autothrottle">
+                                <span>Auto Throttle</span>
+                                <input id="fx-performance-autothrottle" type="checkbox" ${performanceSettings.autoThrottle ? 'checked' : ''}>
+                            </label>
+                        </div>
+                        <div class="fx-note" id="fx-performance-note">Caps the viewer frame rate and scales device pixel ratio to reduce GPU load. XR stays uncapped.</div>
                     </section>
                     <section class="fx-section" data-fx-section="hdri">
                         <div class="fx-section-header">
@@ -4844,6 +4909,8 @@
                 }
                 currentToneMapping = 'None';
                 currentExposure = 1.0;
+                performanceSettings = { ...PERFORMANCE_DEFAULTS };
+                applyRendererPerformanceSettings({ resizePostFx: true });
                 renderer.toneMapping = toneMappingModes[currentToneMapping];
                 renderer.toneMappingExposure = currentExposure;
                 try { localStorage.removeItem(POSTFX_STORAGE_KEY); localStorage.removeItem('maxjs_panel_width'); } catch {}
@@ -4894,6 +4961,29 @@
                 renderer.toneMappingExposure = currentExposure;
                 expLabel.textContent = currentExposure.toFixed(1);
                 savePostFxState();
+            };
+
+            const fpsCapSelect = document.getElementById('fx-performance-fpscap');
+            const renderScaleSlider = document.getElementById('fx-performance-renderscale');
+            const renderScaleValue = document.getElementById('fx-performance-renderscale-val');
+            const autoThrottleCheck = document.getElementById('fx-performance-autothrottle');
+            fpsCapSelect.onchange = (e) => {
+                performanceSettings.fpsCap = Number(e.target.value) || 0;
+                lastRenderTimestamp = 0;
+                savePostFxState();
+                syncPostFxPanel(true);
+            };
+            renderScaleSlider.oninput = (e) => {
+                performanceSettings.renderScale = Math.max(0.25, Math.min(1.0, Number(e.target.value) || 1.0));
+                renderScaleValue.textContent = `${performanceSettings.renderScale.toFixed(2)}x`;
+                applyRendererPerformanceSettings({ resizePostFx: true });
+                savePostFxState();
+            };
+            autoThrottleCheck.onchange = () => {
+                performanceSettings.autoThrottle = autoThrottleCheck.checked;
+                lastRenderTimestamp = 0;
+                savePostFxState();
+                syncPostFxPanel(true);
             };
 
             // HDRI Environment controls
@@ -4994,6 +5084,7 @@
                 available,
                 supportsScreenSpaceEffects,
                 lastError,
+                performanceSettings,
                 state,
                 derived,
             });
@@ -5006,6 +5097,21 @@
                 panelStatus.textContent = available
                     ? `${rendererBackendLabel} backend`
                     : `${rendererBackendLabel} backend • ${lastError || 'unavailable'}`;
+            }
+
+            const fpsCapSelect = document.getElementById('fx-performance-fpscap');
+            const renderScaleSlider = document.getElementById('fx-performance-renderscale');
+            const renderScaleValue = document.getElementById('fx-performance-renderscale-val');
+            const autoThrottleCheck = document.getElementById('fx-performance-autothrottle');
+            const performanceNote = document.getElementById('fx-performance-note');
+            if (fpsCapSelect) fpsCapSelect.value = String(performanceSettings.fpsCap || 0);
+            if (renderScaleSlider) renderScaleSlider.value = String(performanceSettings.renderScale);
+            if (renderScaleValue) renderScaleValue.textContent = `${performanceSettings.renderScale.toFixed(2)}x`;
+            if (autoThrottleCheck) autoThrottleCheck.checked = !!performanceSettings.autoThrottle;
+            if (performanceNote) {
+                const throttleActive = performanceSettings.autoThrottle && (document.hidden || !windowFocused);
+                performanceNote.textContent =
+                    `Caps the viewer frame rate and scales device pixel ratio to reduce GPU load. Effective DPR ${getEffectivePixelRatio().toFixed(2)}.${throttleActive ? ' Auto-throttle active.' : ''} XR stays uncapped.`;
             }
 
             const hasEnabledEffects = ssgiFx.hasEnabledEffects();
@@ -5099,6 +5205,11 @@
                     enabled: localHdriEnabled,
                     fileName: isLocalHdriLoaded() ? localHdriFileName : '',
                 },
+                performance: {
+                    fpsCap: performanceSettings.fpsCap,
+                    renderScale: performanceSettings.renderScale,
+                    autoThrottle: performanceSettings.autoThrottle,
+                },
             };
         }
 
@@ -5145,6 +5256,18 @@
                     if (typeof saved.hdri.enabled === 'boolean') localHdriEnabled = saved.hdri.enabled;
                     // Apply blur to scene even without HDRI loaded (will be used when HDRI loads)
                     scene.backgroundBlurriness = localHdriBlur;
+                }
+                if (saved.performance) {
+                    if (Number.isFinite(saved.performance.fpsCap)) {
+                        performanceSettings.fpsCap = Math.max(0, Math.round(saved.performance.fpsCap));
+                    }
+                    if (Number.isFinite(saved.performance.renderScale)) {
+                        performanceSettings.renderScale = Math.max(0.25, Math.min(1.0, saved.performance.renderScale));
+                    }
+                    if (typeof saved.performance.autoThrottle === 'boolean') {
+                        performanceSettings.autoThrottle = saved.performance.autoThrottle;
+                    }
+                    applyRendererPerformanceSettings({ resizePostFx: true });
                 }
                 localHdriShowBg = envVisible;
 
@@ -5196,14 +5319,10 @@
                 camera.bottom = -viewWidth / (2 * aspect);
             }
             camera.updateProjectionMatrix();
-            renderer.setSize(innerWidth, innerHeight);
+            applyRendererPerformanceSettings({ resizePostFx: false });
             // Debounce post-FX resize — only recompile after dragging stops
             clearTimeout(resizeTimer);
             resizeTimer = setTimeout(() => ssgiFx.resize(), 200);
-            if (splatOverlay) {
-                splatOverlay.renderer.setPixelRatio(devicePixelRatio);
-                splatOverlay.renderer.setSize(innerWidth, innerHeight, false);
-            }
         });
 
         // ── WebXR / VR ───────────────────────────────────────
@@ -5470,7 +5589,17 @@
             : createWebXRRuntime();
 
         let standaloneHudFrame = 0;
-        function renderFrame() {
+        function renderFrame(frameTimeMs = performance.now()) {
+            const manualFpsCap = Number.isFinite(performanceSettings.fpsCap) ? performanceSettings.fpsCap : 0;
+            const autoThrottleCap = performanceSettings.autoThrottle && (document.hidden || !windowFocused) ? 30 : 0;
+            const effectiveFpsCap = autoThrottleCap > 0
+                ? (manualFpsCap > 0 ? Math.min(manualFpsCap, autoThrottleCap) : autoThrottleCap)
+                : manualFpsCap;
+            if (!renderer.xr?.isPresenting && effectiveFpsCap > 0) {
+                const minFrameMs = 1000 / effectiveFpsCap;
+                if (lastRenderTimestamp !== 0 && (frameTimeMs - lastRenderTimestamp) < minFrameMs) return;
+            }
+            lastRenderTimestamp = frameTimeMs;
             const frameDt = inlineClock.getDelta();
             const frameElapsed = inlineClock.getElapsedTime();
             xrRuntime.update(frameDt);
@@ -5712,6 +5841,21 @@
         } else {
             void restoreInteractiveBrowserState();
         }
+
+        addEventListener('focus', () => {
+            windowFocused = true;
+            lastRenderTimestamp = 0;
+            syncPostFxPanel(true);
+        });
+        addEventListener('blur', () => {
+            windowFocused = false;
+            lastRenderTimestamp = 0;
+            syncPostFxPanel(true);
+        });
+        document.addEventListener('visibilitychange', () => {
+            lastRenderTimestamp = 0;
+            syncPostFxPanel(true);
+        });
 
         if (buildMode !== 'release') {
             const debugBtn = document.getElementById('btnDebug');

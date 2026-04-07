@@ -27,7 +27,7 @@ There are two sync modes:
    Sends only what changed.
    Used for transforms, camera, selection, visibility, lights, material scalars, and live geometry edits.
 
-The producer is native C++ in `src/dllmain.cpp`.
+The producer is native C++ in `src/maxjs_main.cpp`.
 The consumer is the Three.js app in `web/index.html` plus binary delta decoding in `web/js/protocol.js`.
 
 ## Transport Layers

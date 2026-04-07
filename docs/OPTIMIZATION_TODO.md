@@ -242,7 +242,7 @@ Investigate compositing WebView2 directly over the Max viewport.
 
 ### C++
 
-- keep [src/dllmain.cpp](src/dllmain.cpp) for panel/bootstrap only
+- keep [src/maxjs_main.cpp](src/maxjs_main.cpp) for panel/bootstrap only
 - add:
   - `src/sync_protocol.h`
   - `src/sync_protocol.cpp`

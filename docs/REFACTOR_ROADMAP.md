@@ -10,7 +10,7 @@ The goal is not a rewrite.
 
 The goal is to reduce change risk in the two oversized runtime centers:
 
-- `src/dllmain.cpp`
+- `src/maxjs_main.cpp`
 - `web/index.html`
 
 while keeping the current realtime sync, WebView2 host model, and native Three.js plugin surface working.
@@ -19,7 +19,7 @@ while keeping the current realtime sync, WebView2 host model, and native Three.j
 
 ### 1. Native host concentration
 
-`src/dllmain.cpp` currently owns too many jobs:
+`src/maxjs_main.cpp` currently owns too many jobs:
 
 - panel window lifecycle
 - WebView2 boot and message bridge
@@ -100,7 +100,7 @@ Estimated effort: 3 to 5 days
 
 Target result:
 
-`src/dllmain.cpp` becomes orchestration, not implementation.
+`src/maxjs_main.cpp` becomes orchestration, not implementation.
 
 Recommended extraction order:
 
@@ -140,7 +140,7 @@ Suggested file layout:
 - `src/sync_engine.cpp`
 - `src/mesh_extract.cpp`
 
-Keep in `dllmain.cpp`:
+Keep in `maxjs_main.cpp`:
 
 - plugin exports
 - class registration
@@ -149,7 +149,7 @@ Keep in `dllmain.cpp`:
 
 Success criteria:
 
-- `dllmain.cpp` drops below roughly 2k lines
+- `maxjs_main.cpp` drops below roughly 2k lines
 - no sync behavior changes are required to complete this phase
 
 ## Phase 2: Split Web Runtime by Domain
@@ -387,7 +387,7 @@ That sequence reduces the most risk with the least product-level behavior change
 
 This roadmap is successful when:
 
-- `src/dllmain.cpp` is no longer the default place for every native change
+- `src/maxjs_main.cpp` is no longer the default place for every native change
 - `web/index.html` is no longer the default place for every viewer change
 - sync messages are documented and named in one place
 - the scene corpus has a real smoke-test matrix

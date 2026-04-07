@@ -7,7 +7,7 @@
 
 extern HINSTANCE hInstance;
 
-// Forward — panel access from dllmain.cpp
+// Forward — panel access from maxjs_main.cpp
 extern void ToggleMaxJSPanel();
 extern void StartMaxJSActiveShade(Bitmap* target);
 extern void StopMaxJSActiveShade();

@@ -8178,6 +8178,7 @@ public:
 
     void OnTimer() {
         if (!hwnd_ || !IsWindowVisible(hwnd_)) return;
+        if (renderLocked_) return;  // suppress all polling during production render
         if (!MaintainWindowState()) return;
         if (!jsReady_ || !webview_) return;
         tickCount_++;

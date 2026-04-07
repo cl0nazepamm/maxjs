@@ -2466,28 +2466,17 @@
             ssgiFx.setPixelEnabled(false);
             ssgiFx.setFogEnabled(false);
             ssgiFx.setOpaqueBackdropEnabled(false);
-            // Clay mode is unstable with GTAO enabled, so keep it off.
             if (ssgiFx.setClayOverride) ssgiFx.setClayOverride(true);
             ssgiFx.setGTAOEnabled(false);
 
-            // Swap materials
-            for (const [, mesh] of nodeMap) {
-                if (!mesh.isMesh) continue;
-                mesh.userData._origMaterial = mesh.material;
-                mesh.material = Array.isArray(mesh.userData._origMaterial)
-                    ? mesh.userData._origMaterial.map(() => clayMat) : clayMat;
-            }
+            // Use scene.overrideMaterial — renderer + shadow system use it natively,
+            // no per-mesh swap needed, no stale WebGPU TextureNode references.
+            scene.overrideMaterial = clayMat;
         }
 
         function exitClayMode() {
-            // Restore materials
-            for (const [, mesh] of nodeMap) {
-                if (!mesh.isMesh) continue;
-                if (mesh.userData._origMaterial) {
-                    mesh.material = mesh.userData._origMaterial;
-                    delete mesh.userData._origMaterial;
-                }
-            }
+            scene.overrideMaterial = null;
+
             // Restore FX state
             if (clayPreFxSnapshot) {
                 if (ssgiFx.setClayOverride) ssgiFx.setClayOverride(false);
@@ -2509,6 +2498,7 @@
         }
 
         bridge.on('clay_mode', msg => {
+            if (renderToImageActive) return;  // suppress during production render
             const enabled = !!msg.enabled;
             if (enabled === clayModeActive) return;
             clayModeActive = enabled;
@@ -2655,12 +2645,19 @@
                 : new THREE.MeshStandardMaterial({ color: 0x888888, side: THREE.DoubleSide });
         }
 
+        const pendingMaterialDisposals = [];
         function disposeSceneMaterial(material) {
+            // Defer disposal to next frame — WebGPU node cache may still reference textures
             if (Array.isArray(material)) {
-                for (const item of material) item?.dispose?.();
-            } else {
-                material?.dispose?.();
+                for (const item of material) { if (item) pendingMaterialDisposals.push(item); }
+            } else if (material) {
+                pendingMaterialDisposals.push(material);
             }
+        }
+        function flushMaterialDisposals() {
+            if (pendingMaterialDisposals.length === 0) return;
+            for (const mat of pendingMaterialDisposals) mat.dispose?.();
+            pendingMaterialDisposals.length = 0;
         }
 
         function createSceneLineMaterial(mat) {
@@ -2675,8 +2672,7 @@
                 mesh.material = createSceneLineMaterial(mat);
                 return;
             }
-            if (clayModeActive) mesh.userData._origMaterial = mat;
-            else mesh.material = mat;
+            mesh.material = mat;
         }
 
         function finalizeSceneNode(mesh, nd) {
@@ -2949,8 +2945,7 @@
                     if (wantsLine) {
                         mesh = new THREE.LineSegments(geom, createSceneLineMaterial(mat));
                     } else {
-                        mesh = new THREE.Mesh(geom, clayModeActive ? clayMat : mat);
-                        if (clayModeActive) mesh.userData._origMaterial = mat;
+                        mesh = new THREE.Mesh(geom, mat);
                     }
                     mesh.matrixAutoUpdate = false;
                     mesh.name = nd.n;
@@ -3291,12 +3286,10 @@
                     if (wantsLine) {
                         mesh = new THREE.LineSegments(geom, createSceneLineMaterial(mat));
                     } else if (nd.skin) {
-                        mesh = buildSkinnedMeshFromNd(geom, clayModeActive ? clayMat : mat, nd, buffer);
-                        if (!mesh) mesh = new THREE.Mesh(geom, clayModeActive ? clayMat : mat);
-                        if (clayModeActive) mesh.userData._origMaterial = mat;
+                        mesh = buildSkinnedMeshFromNd(geom, mat, nd, buffer);
+                        if (!mesh) mesh = new THREE.Mesh(geom, mat);
                     } else {
-                        mesh = new THREE.Mesh(geom, clayModeActive ? clayMat : mat);
-                        if (clayModeActive) mesh.userData._origMaterial = mat;
+                        mesh = new THREE.Mesh(geom, mat);
                     }
                     mesh.matrixAutoUpdate = false;
                     mesh.name = nd.n;
@@ -3703,9 +3696,7 @@
 
                 // Material: use data from C++ (single or multi-sub), fallback to gray
                 let mat;
-                if (clayModeActive) {
-                    mat = clayMat;
-                } else if (grp.mats && grp.groups) {
+                if (grp.mats && grp.groups) {
                     // Multi/Sub material — create material array + geometry groups
                     mat = grp.mats.map(m => createMaterial(m));
                     for (const [start, count, idx] of grp.groups) {
@@ -5795,6 +5786,7 @@
         let standaloneHudFrame = 0;
         let lastPostFxPanelSyncMs = 0;
         function renderFrame(frameTimeMs = performance.now()) {
+            flushMaterialDisposals();
             if (renderToImageActive && !pendingRenderToImage) return;
             const manualFpsCap = Number.isFinite(performanceSettings.fpsCap) ? performanceSettings.fpsCap : 0;
             const autoThrottleCap = performanceSettings.autoThrottle && (document.hidden || !windowFocused) ? 30 : 0;
@@ -5825,10 +5817,14 @@
 
             perfHud.updateLayers(layerManager.getStats());
             const renderStart = performance.now();
-            if (xrRuntime.shouldBypassPostFx) {
-                renderer.render(scene, camera);
-            } else {
-                ssgiFx.render();
+            try {
+                if (xrRuntime.shouldBypassPostFx) {
+                    renderer.render(scene, camera);
+                } else {
+                    ssgiFx.render();
+                }
+            } catch (error) {
+                reportBridgeError('runtime error', error);
             }
             if (splatOverlay && splatHandleMap.size > 0) {
                 updateSplatCamera();
@@ -6040,10 +6036,14 @@
                 animationSystem?.update(0);
             }
 
-            if (ssgiFx.hasEnabledEffects()) {
-                ssgiFx.render();
-            } else {
-                renderer.render(scene, camera);
+            try {
+                if (ssgiFx.hasEnabledEffects()) {
+                    ssgiFx.render();
+                } else {
+                    renderer.render(scene, camera);
+                }
+            } catch (error) {
+                reportBridgeError('runtime error', error);
             }
             if (splatOverlay && splatHandleMap.size > 0) {
                 updateSplatCamera();

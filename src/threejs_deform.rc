@@ -1,0 +1,14 @@
+#include "threejs_deform_res.h"
+#include <windows.h>
+
+STRINGTABLE
+BEGIN
+    IDS_THREEJS_DEFORM_PARAMS "three.js Deform"
+END
+
+IDD_THREEJS_DEFORM DIALOG 0, 0, 217, 24
+STYLE DS_SETFONT | WS_CHILD | WS_VISIBLE
+FONT 8, "Segoe UI"
+BEGIN
+    LTEXT "Vertices controlled by JS layers", -1, 8, 8, 200, 10
+END

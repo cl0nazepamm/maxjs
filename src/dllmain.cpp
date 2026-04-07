@@ -7566,11 +7566,42 @@ public:
             Mtl* multiMtl = FindMultiSubMtl(rawMtl);
             if (multiMtl && multiMtl->NumSubMtls() > 1) continue;
 
+            Mtl* supportedMtl = FindSupportedMaterial(rawMtl);
+            if (supportedMtl && IsThreeJSMaterialClass(supportedMtl->ClassID())) {
+                const MaterialSyncState state = ComputeMaterialSyncState(node, t);
+                auto structureIt = mtlHashMap_.find(handle);
+                auto scalarIt = mtlScalarHashMap_.find(handle);
+                if (structureIt == mtlHashMap_.end() || scalarIt == mtlScalarHashMap_.end()) {
+                    mtlHashMap_[handle] = state.structureHash;
+                    mtlScalarHashMap_[handle] = state.scalarHash;
+                    continue;
+                }
+
+                const bool structureChanged = structureIt->second != state.structureHash;
+                const bool scalarChanged = scalarIt->second != state.scalarHash;
+                if (!structureChanged && !scalarChanged) continue;
+
+                structureIt->second = state.structureHash;
+                scalarIt->second = state.scalarHash;
+
+                if (structureChanged || !state.canFastSync) {
+                    // Custom three.js materials often change structure while the user is
+                    // interacting with spinners/map slots. Escalate immediately instead
+                    // of waiting for the slower idle-only material detector.
+                    SetDirtyImmediate();
+                    return;
+                }
+
+                materialFastDirtyHandles_.insert(handle);
+                if (fastDirtyHandles_.insert(handle).second) changed = true;
+                continue;
+            }
+
             float col[3] = {0.8f, 0.8f, 0.8f};
             float rough = 0.5f;
             float metal = 0.0f;
             float opac = 1.0f;
-            ExtractMaterialScalarPreview(FindSupportedMaterial(rawMtl), node, t, col, rough, metal, opac);
+            ExtractMaterialScalarPreview(supportedMtl, node, t, col, rough, metal, opac);
 
             const uint64_t scalarHash = HashMaterialScalarPreviewValues(col, rough, metal, opac);
             auto it = mtlScalarHashMap_.find(handle);

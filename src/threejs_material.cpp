@@ -29,6 +29,9 @@ static const ParamID kMapParamIDs[kNumMaps] = {
     pb_bump_map, pb_displacement_map, pb_parallax_map, pb_emissive_map,
     pb_opacity_map, pb_lightmap, pb_ao_map, pb_sss_color_map, pb_matcap_map,
     pb_specular_map,
+    pb_phys_specular_intensity_map, pb_phys_specular_color_map,
+    pb_phys_clearcoat_map, pb_phys_clearcoat_roughness_map,
+    pb_phys_clearcoat_normal_map, pb_phys_transmission_map,
     pb_tsl_map1, pb_tsl_map2, pb_tsl_map3, pb_tsl_map4
 };
 
@@ -37,6 +40,9 @@ static const MCHAR* kMapSlotNames[kNumMaps] = {
     _T("Bump Map"), _T("Displacement Map"), _T("Parallax Map"), _T("Emissive Map"),
     _T("Opacity Map"), _T("Light Map"), _T("AO Map"), _T("SSS Color Map"), _T("Matcap Map"),
     _T("Specular Map"),
+    _T("Specular Intensity Map"), _T("Specular Color Map"),
+    _T("Clearcoat Map"), _T("Clearcoat Roughness Map"),
+    _T("Clearcoat Normal Map"), _T("Transmission Map"),
     _T("TSL Map 1"), _T("TSL Map 2"), _T("TSL Map 3"), _T("TSL Map 4")
 };
 
@@ -48,6 +54,14 @@ struct SupportedMapSlots {
 static const int kStandardMapSlots[] = {
     kMap_Color, kMap_Roughness, kMap_Metalness, kMap_Normal, kMap_Bump,
     kMap_Displacement, kMap_Emissive, kMap_Opacity, kMap_Lightmap, kMap_AO
+};
+
+static const int kPhysicalMapSlots[] = {
+    kMap_Color, kMap_Roughness, kMap_Metalness, kMap_Normal, kMap_Bump,
+    kMap_Displacement, kMap_Emissive, kMap_Opacity, kMap_Lightmap, kMap_AO,
+    kMap_PhysSpecularIntensity, kMap_PhysSpecularColor,
+    kMap_ClearcoatMap, kMap_ClearcoatRoughnessMap, kMap_ClearcoatNormalMap,
+    kMap_TransmissionMap
 };
 
 static const int kSSSMapSlots[] = {
@@ -113,6 +127,8 @@ static SupportedMapSlots GetSupportedMapSlots(ThreeJSMaterialKind kind, IParamBl
             const int mode = GetOptionalInt(pb, pb_material_mode, 0, threejs_mode_standard);
             if (mode == threejs_mode_sss)
                 return { kSSSMapSlots, static_cast<int>(std::size(kSSSMapSlots)) };
+            if (mode == threejs_mode_physical)
+                return { kPhysicalMapSlots, static_cast<int>(std::size(kPhysicalMapSlots)) };
             return { kStandardMapSlots, static_cast<int>(std::size(kStandardMapSlots)) };
         }
         case ThreeJSMaterialKind::Utility: {
@@ -645,6 +661,24 @@ ClassDesc2* GetThreeJSTSLMtlDesc() { return &threeJSTSLMtlDesc; }
         p_default, 0.0f, \
         p_range, 0.0f, 1.0f, \
         p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_PHYS_ANISOTROPY_EDIT, IDC_PHYS_ANISOTROPY_SPIN, 0.01f, \
+        p_end, \
+    pb_phys_specular_intensity_map, _T("physicalSpecularIntensityMap"), TYPE_TEXMAP, 0, 0, \
+        p_subtexno, kMap_PhysSpecularIntensity, \
+        p_end, \
+    pb_phys_specular_color_map, _T("physicalSpecularColorMap"), TYPE_TEXMAP, 0, 0, \
+        p_subtexno, kMap_PhysSpecularColor, \
+        p_end, \
+    pb_phys_clearcoat_map, _T("physicalClearcoatMap"), TYPE_TEXMAP, 0, 0, \
+        p_subtexno, kMap_ClearcoatMap, \
+        p_end, \
+    pb_phys_clearcoat_roughness_map, _T("physicalClearcoatRoughnessMap"), TYPE_TEXMAP, 0, 0, \
+        p_subtexno, kMap_ClearcoatRoughnessMap, \
+        p_end, \
+    pb_phys_clearcoat_normal_map, _T("physicalClearcoatNormalMap"), TYPE_TEXMAP, 0, 0, \
+        p_subtexno, kMap_ClearcoatNormalMap, \
+        p_end, \
+    pb_phys_transmission_map, _T("physicalTransmissionMap"), TYPE_TEXMAP, 0, 0, \
+        p_subtexno, kMap_TransmissionMap, \
         p_end
 
 static void ShowUtilityControl(HWND hWnd, int controlID, bool visible) {

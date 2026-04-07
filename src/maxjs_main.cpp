@@ -1057,11 +1057,13 @@ struct MaxJSPBR {
     std::wstring aoMap, emissionMap, lightmapFile, opacityMap;
     std::wstring transmissionMap;
     std::wstring clearcoatMap, clearcoatRoughnessMap, clearcoatNormalMap;
+    std::wstring specularIntensityMap, specularColorMap;
     TexTransform colorMapTransform, gradientMapTransform, roughnessMapTransform, metalnessMapTransform, normalMapTransform;
     TexTransform bumpMapTransform, displacementMapTransform, parallaxMapTransform, sssColorMapTransform;
     TexTransform aoMapTransform, emissionMapTransform, lightmapTransform, opacityMapTransform, matcapMapTransform, specularMapTransform;
     TexTransform transmissionMapTransform;
     TexTransform clearcoatMapTransform, clearcoatRoughnessMapTransform, clearcoatNormalMapTransform;
+    TexTransform specularIntensityMapTransform, specularColorMapTransform;
     std::wstring mtlName;
     std::wstring tslCode;
     std::wstring tslMaps[4];
@@ -1603,7 +1605,14 @@ static void ExtractThreeJSMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
     readMap(pb_opacity_map, d.opacityMap, d.opacityMapTransform);
     readMap(pb_lightmap, d.lightmapFile, d.lightmapTransform);
     readMap(pb_ao_map, d.aoMap, d.aoMapTransform);
-    if (cid == THREEJS_ADV_MTL_CLASS_ID && d.materialModel == L"MeshSSSNodeMaterial") {
+    if (cid == THREEJS_ADV_MTL_CLASS_ID && d.materialModel == L"MeshPhysicalMaterial") {
+        readMap(pb_phys_specular_intensity_map, d.specularIntensityMap, d.specularIntensityMapTransform);
+        readMap(pb_phys_specular_color_map, d.specularColorMap, d.specularColorMapTransform);
+        readMap(pb_phys_clearcoat_map, d.clearcoatMap, d.clearcoatMapTransform);
+        readMap(pb_phys_clearcoat_roughness_map, d.clearcoatRoughnessMap, d.clearcoatRoughnessMapTransform);
+        readMap(pb_phys_clearcoat_normal_map, d.clearcoatNormalMap, d.clearcoatNormalMapTransform);
+        readMap(pb_phys_transmission_map, d.transmissionMap, d.transmissionMapTransform);
+    } else if (cid == THREEJS_ADV_MTL_CLASS_ID && d.materialModel == L"MeshSSSNodeMaterial") {
         readMap(pb_sss_color_map, d.sssColorMap, d.sssColorMapTransform);
     } else if (cid == THREEJS_UTILITY_MTL_CLASS_ID) {
         readMap(pb_matcap_map, d.matcapMap, d.matcapMapTransform);
@@ -8751,17 +8760,36 @@ public:
         }
 
         MaxJSPBR structurePbr = pbr;
+        // Zero out all animatable scalars — changes to these go through scalar hash, not structure
         structurePbr.color[0] = 0.8f;
         structurePbr.color[1] = 0.8f;
         structurePbr.color[2] = 0.8f;
         structurePbr.roughness = 0.5f;
         structurePbr.metalness = 0.0f;
         structurePbr.opacity = 1.0f;
+        structurePbr.envIntensity = 1.0f;
+        structurePbr.physicalSpecularColor[0] = 1.0f;
+        structurePbr.physicalSpecularColor[1] = 1.0f;
+        structurePbr.physicalSpecularColor[2] = 1.0f;
+        structurePbr.physicalSpecularIntensity = 1.0f;
+        structurePbr.ior = 1.5f;
+        structurePbr.clearcoat = 0.0f;
+        structurePbr.clearcoatRoughness = 0.0f;
+        structurePbr.sheen = 0.0f;
+        structurePbr.sheenRoughness = 0.0f;
+        structurePbr.sheenColor[0] = 0.0f;
+        structurePbr.sheenColor[1] = 0.0f;
+        structurePbr.sheenColor[2] = 0.0f;
+        structurePbr.transmission = 0.0f;
+        structurePbr.thickness = 0.0f;
+        structurePbr.iridescence = 0.0f;
+        structurePbr.anisotropy = 0.0f;
 
         state.structureHash = HashMaterialPBRState(structurePbr);
-        state.scalarHash = HashMaterialScalarPreviewValues(
-            pbr.color, pbr.roughness, pbr.metalness, pbr.opacity);
-        state.canFastSync = true;
+        // Scalar hash: full material JSON so ANY param change is detected
+        state.scalarHash = HashMaterialPBRState(pbr);
+        // Three.js materials need full resync for physical params (binary protocol only carries basic scalars)
+        state.canFastSync = false;
         return state;
     }
 
@@ -9108,6 +9136,8 @@ public:
         writeMap(L"sssMap", L"sssMapXf", pbr.sssColorMap, pbr.sssColorMapTransform);
         writeMap(L"matcapMap", L"matcapMapXf", pbr.matcapMap, pbr.matcapMapTransform);
         writeMap(L"specMap", L"specMapXf", pbr.specularMap, pbr.specularMapTransform);
+        writeMap(L"specIntMap", L"specIntMapXf", pbr.specularIntensityMap, pbr.specularIntensityMapTransform);
+        writeMap(L"specColMap", L"specColMapXf", pbr.specularColorMap, pbr.specularColorMapTransform);
         writeMap(L"emMap", L"emMapXf", pbr.emissionMap, pbr.emissionMapTransform);
         writeMap(L"lmMap", L"lmMapXf", pbr.lightmapFile, pbr.lightmapTransform);
         writeMap(L"opMap", L"opMapXf", pbr.opacityMap, pbr.opacityMapTransform);

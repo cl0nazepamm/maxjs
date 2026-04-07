@@ -82,6 +82,13 @@ enum ThreeJSParamIDs {
     // Utility extras (appended for scene compatibility)
     pb_specular_map,
     pb_reflectivity,
+    // Physical texture map slots
+    pb_phys_specular_intensity_map,
+    pb_phys_specular_color_map,
+    pb_phys_clearcoat_map,
+    pb_phys_clearcoat_roughness_map,
+    pb_phys_clearcoat_normal_map,
+    pb_phys_transmission_map,
     pb_refraction_ratio,
     pb_normal_map_type,
     pb_depth_packing,
@@ -139,6 +146,12 @@ enum ThreeJSMapSlots {
     kMap_SSSColor,
     kMap_Matcap,
     kMap_Specular,
+    kMap_PhysSpecularIntensity,
+    kMap_PhysSpecularColor,
+    kMap_ClearcoatMap,
+    kMap_ClearcoatRoughnessMap,
+    kMap_ClearcoatNormalMap,
+    kMap_TransmissionMap,
     // TSL generic map slots
     kMap_TSL1,
     kMap_TSL2,

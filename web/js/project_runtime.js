@@ -265,25 +265,8 @@ export function createProjectRuntime({ layerManager, bridge, perfHud }) {
         } catch (error) {
             if (!manifest404(error)) throw error;
 
-            const mainUrl = projectUrl(projectRootUrl, 'main.js', `${Date.now()}`);
-            let mainText = '';
-            try {
-                mainText = await fetchText(mainUrl);
-            } catch (mainError) {
-                throw error;
-            }
-
-            const fallbackManifest = implicitMainManifest();
-            const fallbackText = stableStringify({
-                implicit: true,
-                entry: 'main.js',
-                mainText,
-            });
-            if (!force && fallbackText === lastManifestText) return null;
-            lastManifestText = fallbackText;
-            manifestState = fallbackManifest;
-            emitChange();
-            return fallbackManifest;
+            // No manifest — don't try main.js fallback (avoids console 404 noise)
+            throw error;
         }
     }
 

@@ -666,7 +666,10 @@ export function createSSGIController({
             let prePassVelocity = null;
 
             if (useSharedPrePass) {
-                const prePass = pass(scene, camera);
+                // TRAA copies depth — MSAA sample count must be 1 to avoid mismatch
+                const prePass = state.traa.enabled
+                    ? pass(scene, camera, { samples: 1 })
+                    : pass(scene, camera);
                 activeNodes.push(prePass);
                 prePass.transparent = false;
                 prePass.setMRT(mrt({

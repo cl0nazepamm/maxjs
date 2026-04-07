@@ -4,6 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>MaxJS</title>
+    <link rel="icon" href="data:,">
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { overflow: hidden; background: #353535; position: relative; width: 100vw; height: 100vh; }
@@ -1301,6 +1302,30 @@
             ensureNamedChild('noise3d, cellnoise3d, worleynoise3d, unifiednoise3d', 'texcoord', 'position', { type: 'vector3' });
             ensureNamedChild('fractal3d', 'position', 'position', { type: 'vector3' });
 
+            // Fix unconnected <output> nodes with default values — Three.js loader can't handle them.
+            // Convert: <output name="X" type="T" value="V"/> → <constant name="X_const" type="T" value="V"/>
+            // and rewire the output to point at the constant node.
+            for (const output of doc.querySelectorAll('output[value]')) {
+                if (output.getAttribute('nodename')) continue; // already connected
+                const name = output.getAttribute('name');
+                const type = output.getAttribute('type');
+                const value = output.getAttribute('value');
+                if (!name || !type || !value) continue;
+                const constName = `${name}_const`;
+                const parent = output.parentNode;
+                const constant = doc.createElement('constant');
+                constant.setAttribute('name', constName);
+                constant.setAttribute('type', type);
+                const valInput = doc.createElement('input');
+                valInput.setAttribute('name', 'value');
+                valInput.setAttribute('type', type);
+                valInput.setAttribute('value', value);
+                constant.appendChild(valInput);
+                parent.insertBefore(constant, output);
+                output.removeAttribute('value');
+                output.setAttribute('nodename', constName);
+            }
+
             return new XMLSerializer().serializeToString(doc);
         }
 
@@ -1324,8 +1349,21 @@
             let pending = materialXLoadCache.get(cacheKey);
             if (pending) return pending;
 
+            const materialXBase = md.materialXBase || '';
             const manager = new THREE.LoadingManager();
-            manager.setURLModifier(url => normalizeMaterialXResourceUrl(url));
+            manager.setURLModifier(url => {
+                const normalized = normalizeMaterialXResourceUrl(url);
+                if (materialXBase && !/^(?:data:|blob:|https?:)/i.test(normalized)) {
+                    return materialXBase + (materialXBase.endsWith('/') ? '' : '/') + normalized;
+                }
+                return normalized;
+            });
+            // MaterialXLoader uses ImageBitmapLoader internally — WebGPU renderer
+            // doesn't always handle ImageBitmap textures properly. Override with
+            // a regex handler that routes all image requests to TextureLoader.
+            const texLoader = new THREE.TextureLoader(manager);
+            manager.addHandler(/\.(jpg|jpeg|png|webp|gif|bmp|tga|exr|hdr|tiff?)$/i, texLoader);
+            manager.onError = url => console.error('[MaterialX] Failed to load:', url);
 
             const loader = new MaterialXLoader(manager);
             if (md.materialXBase) loader.setPath(md.materialXBase);
@@ -2183,7 +2221,16 @@
                         if (Array.isArray(md.specularColor)) {
                             params.specularColor = new THREE.Color(md.specularColor[0], md.specularColor[1], md.specularColor[2]);
                         }
-                        if (md.specularIntensity != null) params.specularIntensity = md.specularIntensity;
+                        if (md.specularIntensity != null) {
+                            params.specularIntensity = md.specularIntensity;
+                            // specularIntensity 0 = no reflections at all; also kill env reflections + set IOR 1.0
+                            if (md.specularIntensity < 0.001) {
+                                params.envMapIntensity = 0;
+                                params.ior = 1.0;
+                            }
+                        }
+                        if (md.specIntMap) params.specularIntensityMap = loadTexture(md.specIntMap, THREE.LinearSRGBColorSpace, md.specIntMapXf, fallbackWhiteTexture);
+                        if (md.specColMap) params.specularColorMap = loadTexture(md.specColMap, THREE.SRGBColorSpace, md.specColMapXf, fallbackWhiteTexture);
                         if (md.clearcoat != null) params.clearcoat = md.clearcoat;
                         if (md.clearcoatRoughness != null) params.clearcoatRoughness = md.clearcoatRoughness;
                         if (md.ccMap) params.clearcoatMap = loadTexture(md.ccMap, THREE.LinearSRGBColorSpace, md.ccMapXf, fallbackWhiteTexture);
@@ -2198,7 +2245,7 @@
                         if (md.iridescenceIOR != null) params.iridescenceIOR = md.iridescenceIOR;
                         if (md.transmission != null) params.transmission = md.transmission;
                         if (md.transMap) params.transmissionMap = loadTexture(md.transMap, THREE.LinearSRGBColorSpace, md.transMapXf, fallbackWhiteTexture);
-                        if (md.ior != null) params.ior = md.ior;
+                        if (md.ior != null && !(md.specularIntensity != null && md.specularIntensity < 0.001)) params.ior = md.ior;
                         if (md.thickness != null) params.thickness = md.thickness;
                         if (md.dispersion != null) params.dispersion = md.dispersion;
                         if (Array.isArray(md.attenuationColor)) {
@@ -2350,20 +2397,27 @@
         }
 
         function countInstances() {
-            const implicitInstanceGeoms = new Set();
+            const sharedGeoms = new Set();
             let count = 0;
-            for (const [, mesh] of nodeMap) {
+            for (const [handle, mesh] of nodeMap) {
                 if (!mesh?.geometry) continue;
+                if (maxInstanceHandleToBucket.has(handle)) continue; // counted via bucket below
+                // Explicit Max instance (instOf from C++)
                 if (Number.isFinite(mesh.userData?.maxjsInstOf) && mesh.userData.maxjsInstOf > 0) {
                     count++;
                     continue;
                 }
-                if (implicitInstanceGeoms.has(mesh.geometry)) count++;
-                else implicitInstanceGeoms.add(mesh.geometry);
+                // Implicit: multiple meshes sharing same BufferGeometry
+                if (sharedGeoms.has(mesh.geometry)) count++;
+                else sharedGeoms.add(mesh.geometry);
             }
-            // Count Forest Pack GPU instances
+            // Max instance GPU buckets
+            for (const [, bucket] of maxInstanceBuckets) {
+                count += bucket.handles.size;
+            }
+            // Forest Pack GPU instances
             for (const [, im] of forestMeshes) {
-                count += im.count; // InstancedMesh.count = number of instances
+                count += im.count;
             }
             return count;
         }
@@ -3457,6 +3511,10 @@
                 if (material?.thickness != null && 'thickness' in m) m.thickness = material.thickness;
                 if (material?.specularIntensity != null && 'specularIntensity' in m) {
                     m.specularIntensity = material.specularIntensity;
+                    if (material.specularIntensity < 0.001) {
+                        m.envMapIntensity = 0;
+                        if ('ior' in m) m.ior = 1.0;
+                    }
                 }
                 rememberMaterialEmissiveBase(m);
                 applyMaterialSelectionState(m, !!mesh.userData.maxjsSelected);
@@ -4595,6 +4653,7 @@
         };
         let currentToneMapping = 'None';
         let currentExposure = 1.0;
+        let currentAAMode = 'msaa'; // 'msaa' | 'traa' | 'off'
 
         const postFxSections = [
             {
@@ -4702,23 +4761,7 @@
                     { key: 'samples', label: 'Samples', min: 4, max: 32, step: 1, integer: true },
                 ],
             },
-            {
-                key: 'traa',
-                title: 'TRAA',
-                copy: 'Temporal reprojection anti-aliasing for cleaner edges and more stable GI.',
-                note: 'Requires the real WebGPU backend.',
-                requiresWebGPU: true,
-                isEnabled: () => ssgiFx.isTRAAEnabled(),
-                setEnabled: (enabled) => ssgiFx.setTRAAEnabled(enabled),
-                getValues: (state) => state.traa,
-                setValues: (patch) => ssgiFx.setTRAAOptions(patch),
-                controls: [
-                    { key: 'useSubpixelCorrection', label: 'Subpixel Corr', type: 'checkbox' },
-                    { key: 'depthThreshold', label: 'Depth Reject', min: 0.0001, max: 0.01, step: 0.0001 },
-                    { key: 'edgeDepthDiff', label: 'Edge Threshold', min: 0.0001, max: 0.02, step: 0.0001 },
-                    { key: 'maxVelocityLength', label: 'Velocity Clamp', min: 8, max: 256, step: 1, integer: true },
-                ],
-            },
+            // TRAA is now managed via the Anti-Aliasing selector above the FX sections
             {
                 key: 'contactShadow',
                 title: 'Contact Shadows',
@@ -4971,6 +5014,19 @@
                     </section>
                     <section class="fx-section">
                         <div class="fx-section-header">
+                            <div class="fx-section-title">Anti-Aliasing</div>
+                        </div>
+                        <div class="fx-grid">
+                            <select id="fx-aa-mode" style="background:rgba(255,255,255,0.05);color:#aaa;border:1px solid rgba(255,255,255,0.08);border-radius:5px;padding:3px 6px;font:10px 'Segoe UI',system-ui,sans-serif;width:100%;outline:none;cursor:pointer">
+                                <option value="msaa"${!ssgiFx.isTRAAEnabled() ? ' selected' : ''}>MSAA</option>
+                                <option value="traa"${ssgiFx.isTRAAEnabled() ? ' selected' : ''}>TRAA</option>
+                                <option value="off">Off</option>
+                            </select>
+                        </div>
+                        <div class="fx-note">MSAA: hardware multisample (default). TRAA: temporal reprojection (WebGPU only). Off: no anti-aliasing.</div>
+                    </section>
+                    <section class="fx-section">
+                        <div class="fx-section-header">
                             <div class="fx-section-title">Performance</div>
                         </div>
                         <div class="fx-grid">
@@ -5080,6 +5136,8 @@
                 }
                 currentToneMapping = 'None';
                 currentExposure = 1.0;
+                currentAAMode = 'msaa';
+                ssgiFx.setTRAAEnabled(false);
                 performanceSettings = { ...PERFORMANCE_DEFAULTS };
                 applyRendererPerformanceSettings({ resizePostFx: true });
                 renderer.toneMapping = toneMappingModes[currentToneMapping];
@@ -5132,6 +5190,16 @@
                 renderer.toneMappingExposure = currentExposure;
                 expLabel.textContent = currentExposure.toFixed(1);
                 savePostFxState();
+            };
+
+            // Anti-Aliasing mode
+            const aaSelect = document.getElementById('fx-aa-mode');
+            aaSelect.onchange = (e) => {
+                const mode = e.target.value;
+                ssgiFx.setTRAAEnabled(mode === 'traa');
+                currentAAMode = mode;
+                savePostFxState();
+                syncPostFxPanel(true);
             };
 
             const fpsCapSelect = document.getElementById('fx-performance-fpscap');
@@ -5294,6 +5362,8 @@
             const instanceThresholdSlider = document.getElementById('fx-performance-instancethreshold');
             const instanceThresholdValue = document.getElementById('fx-performance-instancethreshold-val');
             const performanceNote = document.getElementById('fx-performance-note');
+            const aaSelect = document.getElementById('fx-aa-mode');
+            if (aaSelect) aaSelect.value = currentAAMode;
             if (fpsCapSelect) fpsCapSelect.value = String(performanceSettings.fpsCap || 0);
             if (renderScaleSlider) renderScaleSlider.value = String(performanceSettings.renderScale);
             if (renderScaleValue) renderScaleValue.textContent = `${performanceSettings.renderScale.toFixed(2)}x`;
@@ -5384,6 +5454,7 @@
             return {
                 toneMapping: currentToneMapping,
                 exposure: currentExposure,
+                aaMode: currentAAMode,
                 envVisible,
                 camLock,
                 lightProbeEnabled,
@@ -5424,6 +5495,10 @@
                 if (Number.isFinite(saved.exposure)) {
                     currentExposure = saved.exposure;
                     renderer.toneMappingExposure = currentExposure;
+                }
+                if (saved.aaMode && ['msaa', 'traa', 'off'].includes(saved.aaMode)) {
+                    currentAAMode = saved.aaMode;
+                    ssgiFx.setTRAAEnabled(currentAAMode === 'traa');
                 }
                 if (typeof saved.envVisible === 'boolean') {
                     envVisible = saved.envVisible;

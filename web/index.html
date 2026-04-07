@@ -639,6 +639,8 @@
             fpsCap: 0,
             renderScale: 1.0,
             autoThrottle: true,
+            optimizeMaxInstances: true,
+            maxInstanceBucketThreshold: 50,
         });
         let performanceSettings = { ...PERFORMANCE_DEFAULTS };
         let lastRenderTimestamp = 0;
@@ -788,6 +790,8 @@
         const materialXTemplateCache = new Map();
         const materialXLoadCache = new Map();
         const nodeMap = new Map();
+        const maxInstanceBuckets = new Map(); // bucketKey -> { mesh, materialKey, sourceHandle, handles:Set, handleToIndex:Map, transforms:Map, visible:Map }
+        const maxInstanceHandleToBucket = new Map(); // handle -> bucketKey
         let animationSystem = null;
         const splatHandleMap = new Map();
         const splatMatrix = new THREE_STD.Matrix4();
@@ -2686,13 +2690,169 @@
             applySelection(mesh, nd.s);
         }
 
-        function applyIncrementalNodeUpdate(mesh, nd) {
+        function applyIncrementalNodeUpdate(mesh, nd, handleOverride = null) {
             if (!mesh || !nd) return;
+            const handle = handleOverride ?? nd.h ?? null;
+            if (handle != null && updateMaxInstanceBucketNode(handle, nd)) return;
             if (nd.jsmod != null) applyJsmodSyncState(mesh, nd.jsmod === true);
             if (nd.vis != null) applyBridgeVisibility(mesh, nd.vis);
             if (isFiniteArray(nd.t, 16)) applyTransform(mesh, nd.t);
             if (nd.s != null) applySelection(mesh, nd.s);
             if (nd.mat && mesh.material) applyMaterialScalar(mesh, nd.mat);
+        }
+
+        function buildNodeGeometryRefCounts() {
+            const counts = new Map();
+            for (const mesh of nodeMap.values()) {
+                const geom = mesh?.geometry;
+                if (!geom) continue;
+                counts.set(geom, (counts.get(geom) || 0) + 1);
+            }
+            return counts;
+        }
+
+        function retainGeometryRef(refCounts, geom) {
+            if (!refCounts || !geom) return;
+            refCounts.set(geom, (refCounts.get(geom) || 0) + 1);
+        }
+
+        function releaseGeometryRef(refCounts, geom) {
+            if (!refCounts || !geom) return;
+            const next = (refCounts.get(geom) || 0) - 1;
+            if (next <= 0) {
+                refCounts.delete(geom);
+                geom.dispose?.();
+            } else {
+                refCounts.set(geom, next);
+            }
+        }
+
+        function disposeMaxInstanceBuckets() {
+            for (const [, bucket] of maxInstanceBuckets) {
+                if (bucket.mesh?.parent) bucket.mesh.parent.remove(bucket.mesh);
+                bucket.mesh?.geometry?.dispose?.();
+                disposeSceneMaterial(bucket.mesh?.material);
+            }
+            maxInstanceBuckets.clear();
+            maxInstanceHandleToBucket.clear();
+        }
+
+        function getMaxInstanceBucketForHandle(handle) {
+            const bucketKey = maxInstanceHandleToBucket.get(handle);
+            return bucketKey ? maxInstanceBuckets.get(bucketKey) ?? null : null;
+        }
+
+        function updateMaxInstanceBucketVisibility(bucket) {
+            if (!bucket?.mesh) return;
+            let visibleCount = 0;
+            for (const handle of bucket.handles) {
+                if (bucket.visible.get(handle) !== false) visibleCount++;
+            }
+            bucket.mesh.count = visibleCount;
+            bucket.mesh.visible = visibleCount > 0;
+            bucket.mesh.instanceMatrix.needsUpdate = true;
+        }
+
+        function updateMaxInstanceBucketTransform(handle, matrixArray) {
+            const bucket = getMaxInstanceBucketForHandle(handle);
+            if (!bucket || !isFiniteArray(matrixArray, 16)) return false;
+            const idx = bucket.handleToIndex.get(handle);
+            if (idx == null) return false;
+            const matrix = new THREE.Matrix4().fromArray(matrixArray);
+            bucket.transforms.set(handle, Array.from(matrixArray));
+            bucket.visible.set(handle, true);
+            bucket.mesh.setMatrixAt(idx, matrix);
+            updateMaxInstanceBucketVisibility(bucket);
+            return true;
+        }
+
+        function updateMaxInstanceBucketNode(handle, nd) {
+            const bucket = getMaxInstanceBucketForHandle(handle);
+            if (!bucket) return false;
+            if (nd.vis != null) {
+                bucket.visible.set(handle, nd.vis !== 0);
+                updateMaxInstanceBucketVisibility(bucket);
+            }
+            if (isFiniteArray(nd.t, 16)) {
+                updateMaxInstanceBucketTransform(handle, nd.t);
+            }
+            if (nd.mat) {
+                applyMaterialScalar(bucket.mesh, nd.mat);
+            }
+            return true;
+        }
+
+        function computeMaxInstanceBucketGroups(nodes) {
+            const groups = new Map();
+            if (!performanceSettings.optimizeMaxInstances) return groups;
+            for (const nd of nodes) {
+                if (!Number.isFinite(nd?.instOf) || nd.instOf <= 0) continue;
+                if (nd.jsmod || nd.spline || nd.skin || nd.groups || nd.mats) continue;
+                const sourceHandle = nd.instOf;
+                const materialKey = nd.mat ? JSON.stringify(nd.mat) : '__default__';
+                const bucketKey = `${sourceHandle}|${materialKey}`;
+                if (!groups.has(bucketKey)) {
+                    groups.set(bucketKey, {
+                        key: bucketKey,
+                        sourceHandle,
+                        materialKey,
+                        nodes: [],
+                    });
+                }
+                groups.get(bucketKey).nodes.push(nd);
+            }
+            for (const [key, group] of [...groups.entries()]) {
+                if (group.nodes.length < Math.max(1, performanceSettings.maxInstanceBucketThreshold)) {
+                    groups.delete(key);
+                }
+            }
+            return groups;
+        }
+
+        function buildMaxInstanceBuckets(snapshotNodes) {
+            disposeMaxInstanceBuckets();
+            const bucketGroups = computeMaxInstanceBucketGroups(snapshotNodes);
+            if (bucketGroups.size === 0) return;
+
+            for (const group of bucketGroups.values()) {
+                const sourceMesh = nodeMap.get(group.sourceHandle);
+                if (!sourceMesh?.geometry || sourceMesh.isLine || sourceMesh.isLineSegments || sourceMesh.isSkinnedMesh) continue;
+                const sourceMaterial = sourceMesh.material;
+                const mesh = new THREE.InstancedMesh(sourceMesh.geometry, sourceMaterial, group.nodes.length);
+                mesh.matrixAutoUpdate = false;
+                mesh.frustumCulled = false;
+                mesh.castShadow = !!sourceMesh.castShadow;
+                mesh.receiveShadow = !!sourceMesh.receiveShadow;
+                mesh.name = `max_instances_${group.sourceHandle}_x${group.nodes.length}`;
+
+                const bucket = {
+                    mesh,
+                    materialKey: group.materialKey,
+                    sourceHandle: group.sourceHandle,
+                    handles: new Set(),
+                    handleToIndex: new Map(),
+                    transforms: new Map(),
+                    visible: new Map(),
+                };
+
+                group.nodes.forEach((nd, index) => {
+                    bucket.handles.add(nd.h);
+                    bucket.handleToIndex.set(nd.h, index);
+                    bucket.transforms.set(nd.h, isFiniteArray(nd.t, 16) ? Array.from(nd.t) : null);
+                    bucket.visible.set(nd.h, nd.vis == null ? true : nd.vis !== 0);
+                    const matrix = new THREE.Matrix4();
+                    if (isFiniteArray(nd.t, 16)) matrix.fromArray(nd.t);
+                    else matrix.identity();
+                    mesh.setMatrixAt(index, matrix);
+                    maxInstanceHandleToBucket.set(nd.h, group.key);
+                    const original = nodeMap.get(nd.h);
+                    if (original && original !== sourceMesh) original.visible = false;
+                });
+
+                updateMaxInstanceBucketVisibility(bucket);
+                maxRoot.add(mesh);
+                maxInstanceBuckets.set(group.key, bucket);
+            }
         }
 
         function finalizeSceneSnapshot(snapshot, transport, applyStart, producerBytes, options = {}) {
@@ -2706,6 +2866,7 @@
             reconcileSplats(snapshot.splats ?? []);
             applyForestInstances(snapshot.forestInstances);
             applyVolumes(snapshot.volumes);
+            buildMaxInstanceBuckets(snapshot.nodes);
             scene.updateMatrixWorld(true);
             options.afterWorldUpdate?.();
 
@@ -2982,6 +3143,7 @@
             const applyStart = performance.now();
             const incoming = new Set(meta.nodes.map(n => n.h));
             materialCache.clear();
+            const geometryRefCounts = buildNodeGeometryRefCounts();
 
             // Remove deleted — collect first, then dispose non-shared geometries
             const toRemove = [];
@@ -2991,8 +3153,7 @@
             for (const handle of toRemove) {
                 const mesh = nodeMap.get(handle);
                 maxRoot.remove(mesh);
-                const isShared = [...nodeMap.values()].some(m => m !== mesh && m.geometry === mesh.geometry);
-                if (!isShared) mesh.geometry.dispose();
+                releaseGeometryRef(geometryRefCounts, mesh?.geometry);
                 nodeMap.delete(handle);
             }
 
@@ -3099,8 +3260,7 @@
                 const wantsLine = !!nd.spline;
                 if (mesh && nd.skin && !mesh.isSkinnedMesh && !wantsLine) {
                     maxRoot.remove(mesh);
-                    const isSharedGeometry = [...nodeMap.values()].some(m => m !== mesh && m.geometry === mesh.geometry);
-                    if (!isSharedGeometry) mesh.geometry?.dispose?.();
+                    releaseGeometryRef(geometryRefCounts, mesh?.geometry);
                     if (Array.isArray(mesh.material)) {
                         for (const material of mesh.material) material?.dispose?.();
                     } else {
@@ -3113,8 +3273,7 @@
                 const renderableTypeMismatch = !!mesh && wantsLine !== hasLineRenderable;
                 if (renderableTypeMismatch) {
                     maxRoot.remove(mesh);
-                    const isSharedGeometry = [...nodeMap.values()].some(m => m !== mesh && m.geometry === mesh.geometry);
-                    if (!isSharedGeometry) mesh.geometry?.dispose?.();
+                    releaseGeometryRef(geometryRefCounts, mesh?.geometry);
                     disposeSceneMaterial(mesh.material);
                     nodeMap.delete(nd.h);
                     mesh = null;
@@ -3122,9 +3281,8 @@
 
                 if (mesh) {
                     if (!jsmodSkipGeo && geom && geom !== mesh.geometry) {
-                        // Only dispose if not shared with another mesh
-                        const isShared = [...nodeMap.values()].some(m => m !== mesh && m.geometry === mesh.geometry);
-                        if (!isShared) mesh.geometry.dispose();
+                        releaseGeometryRef(geometryRefCounts, mesh.geometry);
+                        retainGeometryRef(geometryRefCounts, geom);
                         mesh.geometry = geom;
                     }
                     applySceneRenderableMaterial(mesh, mat, wantsLine);
@@ -3145,6 +3303,7 @@
                     mesh.frustumCulled = false;
                     maxRoot.add(mesh);
                     nodeMap.set(nd.h, mesh);
+                    retainGeometryRef(geometryRefCounts, mesh.geometry);
                 }
 
                 finalizeSceneNode(mesh, nd);
@@ -4837,6 +4996,17 @@
                                 <span>Auto Throttle</span>
                                 <input id="fx-performance-autothrottle" type="checkbox" ${performanceSettings.autoThrottle ? 'checked' : ''}>
                             </label>
+                            <label class="fx-check" for="fx-performance-optimizeinstances">
+                                <span>Optimize Max Instances</span>
+                                <input id="fx-performance-optimizeinstances" type="checkbox" ${performanceSettings.optimizeMaxInstances ? 'checked' : ''}>
+                            </label>
+                            <label class="fx-control" for="fx-performance-instancethreshold">
+                                <div class="fx-control-head">
+                                    <span>Instance Bucket Threshold</span>
+                                    <span class="fx-value" id="fx-performance-instancethreshold-val">${performanceSettings.maxInstanceBucketThreshold}</span>
+                                </div>
+                                <input class="fx-range" id="fx-performance-instancethreshold" type="range" min="2" max="500" step="1" value="${performanceSettings.maxInstanceBucketThreshold}">
+                            </label>
                         </div>
                         <div class="fx-note" id="fx-performance-note">Caps the viewer frame rate and scales device pixel ratio to reduce GPU load. XR stays uncapped.</div>
                     </section>
@@ -4971,6 +5141,9 @@
             const renderScaleSlider = document.getElementById('fx-performance-renderscale');
             const renderScaleValue = document.getElementById('fx-performance-renderscale-val');
             const autoThrottleCheck = document.getElementById('fx-performance-autothrottle');
+            const optimizeInstancesCheck = document.getElementById('fx-performance-optimizeinstances');
+            const instanceThresholdSlider = document.getElementById('fx-performance-instancethreshold');
+            const instanceThresholdValue = document.getElementById('fx-performance-instancethreshold-val');
             fpsCapSelect.onchange = (e) => {
                 performanceSettings.fpsCap = Number(e.target.value) || 0;
                 lastRenderTimestamp = 0;
@@ -4986,6 +5159,19 @@
             autoThrottleCheck.onchange = () => {
                 performanceSettings.autoThrottle = autoThrottleCheck.checked;
                 lastRenderTimestamp = 0;
+                savePostFxState();
+                syncPostFxPanel(true);
+            };
+            optimizeInstancesCheck.onchange = () => {
+                performanceSettings.optimizeMaxInstances = optimizeInstancesCheck.checked;
+                disposeMaxInstanceBuckets();
+                savePostFxState();
+                syncPostFxPanel(true);
+            };
+            instanceThresholdSlider.oninput = (e) => {
+                performanceSettings.maxInstanceBucketThreshold = Math.max(2, Math.round(Number(e.target.value) || 50));
+                instanceThresholdValue.textContent = String(performanceSettings.maxInstanceBucketThreshold);
+                disposeMaxInstanceBuckets();
                 savePostFxState();
                 syncPostFxPanel(true);
             };
@@ -5107,15 +5293,21 @@
             const renderScaleSlider = document.getElementById('fx-performance-renderscale');
             const renderScaleValue = document.getElementById('fx-performance-renderscale-val');
             const autoThrottleCheck = document.getElementById('fx-performance-autothrottle');
+            const optimizeInstancesCheck = document.getElementById('fx-performance-optimizeinstances');
+            const instanceThresholdSlider = document.getElementById('fx-performance-instancethreshold');
+            const instanceThresholdValue = document.getElementById('fx-performance-instancethreshold-val');
             const performanceNote = document.getElementById('fx-performance-note');
             if (fpsCapSelect) fpsCapSelect.value = String(performanceSettings.fpsCap || 0);
             if (renderScaleSlider) renderScaleSlider.value = String(performanceSettings.renderScale);
             if (renderScaleValue) renderScaleValue.textContent = `${performanceSettings.renderScale.toFixed(2)}x`;
             if (autoThrottleCheck) autoThrottleCheck.checked = !!performanceSettings.autoThrottle;
+            if (optimizeInstancesCheck) optimizeInstancesCheck.checked = !!performanceSettings.optimizeMaxInstances;
+            if (instanceThresholdSlider) instanceThresholdSlider.value = String(performanceSettings.maxInstanceBucketThreshold);
+            if (instanceThresholdValue) instanceThresholdValue.textContent = String(performanceSettings.maxInstanceBucketThreshold);
             if (performanceNote) {
                 const throttleActive = performanceSettings.autoThrottle && (document.hidden || !windowFocused);
                 performanceNote.textContent =
-                    `Caps the viewer frame rate and scales device pixel ratio to reduce GPU load. Effective DPR ${getEffectivePixelRatio().toFixed(2)}.${throttleActive ? ' Auto-throttle active.' : ''} XR stays uncapped.`;
+                    `Caps the viewer frame rate and scales device pixel ratio to reduce GPU load. Effective DPR ${getEffectivePixelRatio().toFixed(2)}.${throttleActive ? ' Auto-throttle active.' : ''} Large plain Max instance groups can collapse into InstancedMesh buckets. XR stays uncapped.`;
             }
 
             const hasEnabledEffects = ssgiFx.hasEnabledEffects();
@@ -5213,6 +5405,8 @@
                     fpsCap: performanceSettings.fpsCap,
                     renderScale: performanceSettings.renderScale,
                     autoThrottle: performanceSettings.autoThrottle,
+                    optimizeMaxInstances: performanceSettings.optimizeMaxInstances,
+                    maxInstanceBucketThreshold: performanceSettings.maxInstanceBucketThreshold,
                 },
             };
         }
@@ -5270,6 +5464,12 @@
                     }
                     if (typeof saved.performance.autoThrottle === 'boolean') {
                         performanceSettings.autoThrottle = saved.performance.autoThrottle;
+                    }
+                    if (typeof saved.performance.optimizeMaxInstances === 'boolean') {
+                        performanceSettings.optimizeMaxInstances = saved.performance.optimizeMaxInstances;
+                    }
+                    if (Number.isFinite(saved.performance.maxInstanceBucketThreshold)) {
+                        performanceSettings.maxInstanceBucketThreshold = Math.max(2, Math.round(saved.performance.maxInstanceBucketThreshold));
                     }
                     applyRendererPerformanceSettings({ resizePostFx: true });
                 }
@@ -5593,6 +5793,7 @@
             : createWebXRRuntime();
 
         let standaloneHudFrame = 0;
+        let lastPostFxPanelSyncMs = 0;
         function renderFrame(frameTimeMs = performance.now()) {
             if (renderToImageActive && !pendingRenderToImage) return;
             const manualFpsCap = Number.isFinite(performanceSettings.fpsCap) ? performanceSettings.fpsCap : 0;
@@ -5646,7 +5847,12 @@
                     });
                 }
             }
-            syncPostFxPanel();
+            if (postPanelVisible || debugMode) {
+                if ((frameTimeMs - lastPostFxPanelSyncMs) >= 250) {
+                    lastPostFxPanelSyncMs = frameTimeMs;
+                    syncPostFxPanel();
+                }
+            }
             perfHud.updateRender(performance.now() - renderStart, renderer.info?.render, renderer.info?.memory);
             // Standalone / snapshot viewers have no bridge sync — drive the perf HUD from the render loop.
             if (!(window.chrome?.webview?.postMessage) && debugMode) {

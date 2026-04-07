@@ -9952,10 +9952,30 @@ public:
         std::vector<NodeGeo> geos;
         size_t totalBytes = 0;
 
+        // Plain 3ds Max instance discovery via IInstanceMgr can get very expensive on
+        // extremely node-heavy scenes and stall Max before the viewport even loads.
+        // Past this threshold, prefer brute-force sync over global instance classification.
+        static constexpr size_t kMaxNodesForPlainInstanceDiscovery = 1500;
+        size_t sceneNodeCount = 0;
+        {
+            std::function<void(INode*)> countNodes = [&](INode* parent) {
+                if (!parent || sceneNodeCount > kMaxNodesForPlainInstanceDiscovery) return;
+                for (int c = 0; c < parent->NumberOfChildren(); ++c) {
+                    INode* node = parent->GetChildNode(c);
+                    if (!node) continue;
+                    ++sceneNodeCount;
+                    if (sceneNodeCount > kMaxNodesForPlainInstanceDiscovery) return;
+                    countNodes(node);
+                    if (sceneNodeCount > kMaxNodesForPlainInstanceDiscovery) return;
+                }
+            };
+            countNodes(root);
+        }
+
         // Build instance groups via IInstanceMgr — maps each node handle to a canonical "source" handle.
         // All instances of the same object get the same source; only the source extracts geometry.
         std::unordered_map<ULONG, ULONG> instanceSourceMap; // handle → source handle (0 = self)
-        {
+        if (sceneNodeCount <= kMaxNodesForPlainInstanceDiscovery) {
             IInstanceMgr* imgr = IInstanceMgr::GetInstanceMgr();
             std::unordered_set<ULONG> visited;
             std::function<void(INode*)> buildInstMap = [&](INode* parent) {

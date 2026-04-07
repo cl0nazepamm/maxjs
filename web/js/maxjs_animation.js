@@ -751,6 +751,47 @@ export function createMaxJSAnimationSystem({
         };
     }
 
+    function seekAllClips(timeSeconds) {
+        if (!Number.isFinite(timeSeconds)) return false;
+        for (const group of clipGroups.values()) {
+            group.time = normalizeGroupTime(group, timeSeconds);
+            for (const entry of group.entries) {
+                entry.action.time = group.time;
+            }
+        }
+        applyInstantPose();
+        return true;
+    }
+
+    function restorePlaybackState(stateByClip) {
+        if (!(stateByClip instanceof Map)) return false;
+        for (const [clipId, playback] of stateByClip.entries()) {
+            const group = clipGroups.get(clipId);
+            if (!group) continue;
+            if (Number.isFinite(playback.time)) {
+                group.time = normalizeGroupTime(group, playback.time);
+                for (const entry of group.entries) {
+                    entry.action.time = group.time;
+                }
+            }
+            if (Number.isFinite(playback.speed)) {
+                group.speed = playback.speed;
+                for (const entry of group.entries) {
+                    entry.action.timeScale = playback.speed;
+                }
+            }
+            if (typeof playback.playing === 'boolean') {
+                group.playing = playback.playing;
+                for (const entry of group.entries) {
+                    entry.action.paused = !group.playing;
+                    if (group.playing && !entry.action.isRunning()) entry.action.play();
+                }
+            }
+        }
+        applyInstantPose();
+        return true;
+    }
+
     return {
         rebuildTargetRegistry,
         refreshTargets,
@@ -761,6 +802,9 @@ export function createMaxJSAnimationSystem({
         setClipPlaying,
         setClipTime,
         setClipSpeed,
+        seekAllClips,
+        capturePlaybackState,
+        restorePlaybackState,
         getState,
     };
 }

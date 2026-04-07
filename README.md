@@ -144,7 +144,7 @@ Spark.js integration for `.splat` and `.ksplat` files. Dedicated splat helper ob
 
 ---
 
-## Snapshots & Export
+## Snapshots
 
 One-click export to a self-contained HTML site with:
 - Full scene hierarchy with transforms
@@ -172,9 +172,13 @@ Per-resource disposal tracking for materials, textures, and geometries. Layers p
 
 # Missing - To do
 
-- Rendering (registers as renderer for ActiveShade slot but does not produce frames yet)
 - Vertex Color processing
 - Morpher (do not use morphers with skin modifier you will write vertex for every frame)
+
+# Rendering frames
+
+This tool targets web development but since it's registered as renderer I added some functions to get pictures out.
+
 
 # Bugs
 - Spline creation mode mismatch / turning to mesh requires refresh

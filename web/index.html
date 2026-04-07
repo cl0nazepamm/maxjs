@@ -2335,6 +2335,7 @@
         let hasInitialSync = false;
         let readyRetryTimer = 0;
         let transportMode = 'waiting';
+        let latestAppliedSyncFrame = 0;
 
         function setInfoText(text) {
             perfHud.setStatus(text);
@@ -2364,6 +2365,9 @@
         }
 
         function updateSyncHud(partial = {}) {
+            if (Number.isFinite(partial.frameId) && partial.frameId > 0) {
+                latestAppliedSyncFrame = Math.max(latestAppliedSyncFrame, partial.frameId);
+            }
             perfHud.updateSync({
                 transport: partial.transport ?? transportMode,
                 frameId: partial.frameId ?? 0,
@@ -5590,6 +5594,7 @@
 
         let standaloneHudFrame = 0;
         function renderFrame(frameTimeMs = performance.now()) {
+            if (renderToImageActive && !pendingRenderToImage) return;
             const manualFpsCap = Number.isFinite(performanceSettings.fpsCap) ? performanceSettings.fpsCap : 0;
             const autoThrottleCap = performanceSettings.autoThrottle && (document.hidden || !windowFocused) ? 30 : 0;
             const effectiveFpsCap = autoThrottleCap > 0
@@ -5627,6 +5632,19 @@
             if (splatOverlay && splatHandleMap.size > 0) {
                 updateSplatCamera();
                 splatOverlay.renderer.render(splatOverlay.scene, splatOverlay.camera);
+            }
+            if (renderToImageActive && pendingRenderToImage) {
+                const syncReady = latestAppliedSyncFrame > pendingRenderToImage.observedSyncFrame;
+                const settledEnough = performance.now() >= (pendingRenderToImage.startedAtMs + 100);
+                const timedOut = performance.now() >= pendingRenderToImage.syncDeadlineMs;
+                if (syncReady || settledEnough || timedOut) {
+                    const renderTimeSeconds = pendingRenderToImage.renderTimeSeconds;
+                    pendingRenderToImage = null;
+                    requestAnimationFrame(() => {
+                        renderCurrentFrameOnce(renderTimeSeconds);
+                        requestAnimationFrame(() => bridge.send('render_to_image_ready'));
+                    });
+                }
             }
             syncPostFxPanel();
             perfHud.updateRender(performance.now() - renderStart, renderer.info?.render, renderer.info?.memory);
@@ -5789,6 +5807,150 @@
                 case 'list':   bridge.send('js_inline_list', { layers: layerManager.list().filter(layer => layer.source === 'inline') }); break;
                 case 'clear':  layerManager.clearInline(); bridge.send('scene_dirty'); break;
             }
+        });
+
+        // ── Render to Image (production render) ──────────────
+        let savedPerformanceSettings = null;
+        let renderToImageActive = false;
+        let pendingRenderToImage = null;
+        let savedRenderToImageState = null;
+
+        function renderCurrentFrameOnce(renderTimeSeconds = null) {
+            controls.update();
+            if (!physicalCameraDofActive || !camLock) {
+                ssgiFx.updateDofFocusFromCamera(camera.position.distanceTo(controls.target));
+            }
+            if (defaultLights.visible) {
+                defaultKey.position.copy(getActiveCameraWorldPosition(cameraPositionWorld));
+            }
+            updateVolumeUniforms();
+            const effectiveElapsed = Number.isFinite(renderTimeSeconds)
+                ? renderTimeSeconds
+                : inlineClock.getElapsedTime();
+            layerManager.update(0, effectiveElapsed);
+            if (Number.isFinite(renderTimeSeconds)) {
+                animationSystem?.seekAllClips?.(renderTimeSeconds);
+            } else {
+                animationSystem?.update(0);
+            }
+
+            if (ssgiFx.hasEnabledEffects()) {
+                ssgiFx.render();
+            } else {
+                renderer.render(scene, camera);
+            }
+            if (splatOverlay && splatHandleMap.size > 0) {
+                updateSplatCamera();
+                splatOverlay.renderer.render(splatOverlay.scene, splatOverlay.camera);
+            }
+        }
+
+        bridge.on('render_to_image', async msg => {
+            const w = msg.width || innerWidth;
+            const h = msg.height || innerHeight;
+            const frameNumber = Number.isFinite(msg.frame) ? msg.frame : 0;
+            const fps = Number.isFinite(msg.fps) && msg.fps > 0 ? msg.fps : 30;
+            renderToImageActive = true;
+            pendingRenderToImage = {
+                observedSyncFrame: latestAppliedSyncFrame,
+                renderTimeSeconds: frameNumber / fps,
+                startedAtMs: performance.now(),
+                syncDeadlineMs: performance.now() + 10000,
+            };
+
+            // Hide all UI — keep only canvas elements visible
+            for (const el of document.body.children) {
+                if (el.tagName !== 'CANVAS' && el.tagName !== 'SCRIPT') {
+                    el._rtiPrevDisplay = el.style.display;
+                    el.style.display = 'none';
+                }
+            }
+            // Transparent background for alpha channel
+            document.body.style.background = 'transparent';
+
+            // Save and bypass all performance throttling
+            savedPerformanceSettings = { ...performanceSettings };
+            performanceSettings.renderScale = 1.0;
+            performanceSettings.fpsCap = 0;
+            performanceSettings.autoThrottle = false;
+
+            savedRenderToImageState = {
+                envVisible,
+                localHdriShowBg,
+                opaqueBackdropEnabled: ssgiFx.isOpaqueBackdropEnabled(),
+                playbackState: animationSystem?.capturePlaybackState?.() ?? null,
+            };
+
+            // Force transparent background for capture while keeping environment reflections.
+            envVisible = false;
+            localHdriShowBg = false;
+            ssgiFx.setEnvironmentVisible(false);
+            if (savedRenderToImageState.opaqueBackdropEnabled) {
+                ssgiFx.setOpaqueBackdropEnabled(false);
+            }
+            scene.background = null;
+
+            if (frameNumber >= 0) {
+                animationSystem?.seekAllClips?.(frameNumber / fps);
+            }
+
+            // Set renderer to exact requested resolution, pixel ratio 1:1
+            renderer.setPixelRatio(1);
+            renderer.setSize(w, h);
+            camera.aspect = w / h;
+            camera.updateProjectionMatrix();
+            ssgiFx.resize();
+            if (splatOverlay?.renderer) {
+                splatOverlay.renderer.setPixelRatio(1);
+                splatOverlay.renderer.setSize(w, h, false);
+            }
+
+            try {
+                // Wait for the fresh synced frame to land; renderFrame will perform the one-shot render.
+            } catch (error) {
+                console.warn('[MaxJS render_to_image] render failed', error);
+                bridge.send('render_to_image_ready');
+            }
+        });
+
+        bridge.on('render_to_image_done', () => {
+            renderToImageActive = false;
+            pendingRenderToImage = null;
+
+            // Restore all UI elements
+            for (const el of document.body.children) {
+                if ('_rtiPrevDisplay' in el) {
+                    el.style.display = el._rtiPrevDisplay;
+                    delete el._rtiPrevDisplay;
+                }
+            }
+            document.body.style.background = '';
+
+            // Restore performance settings and viewport size
+            if (savedPerformanceSettings) {
+                Object.assign(performanceSettings, savedPerformanceSettings);
+                savedPerformanceSettings = null;
+            }
+            if (savedRenderToImageState) {
+                envVisible = savedRenderToImageState.envVisible;
+                localHdriShowBg = savedRenderToImageState.localHdriShowBg;
+                ssgiFx.setEnvironmentVisible(envVisible);
+                ssgiFx.setOpaqueBackdropEnabled(savedRenderToImageState.opaqueBackdropEnabled);
+                animationSystem?.restorePlaybackState?.(savedRenderToImageState.playbackState);
+                savedRenderToImageState = null;
+                btnEnv.textContent = `Env: ${envVisible ? 'ON' : 'OFF'}`;
+                btnEnv.classList.toggle('active', envVisible);
+                if (isLocalHdriActive()) {
+                    applyLocalHDRIToScene();
+                } else {
+                    scene.background = envVisible && scene.environment
+                        ? scene.environment : new THREE.Color(hiddenBackgroundColor);
+                    if (envVisible) scene.backgroundBlurriness = localHdriBlur;
+                }
+            }
+            camera.aspect = innerWidth / innerHeight;
+            camera.updateProjectionMatrix();
+            applyRendererPerformanceSettings({ resizePostFx: true });
         });
 
         // ── Build mode / Standalone / Debug ──

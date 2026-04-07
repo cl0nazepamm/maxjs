@@ -9,11 +9,13 @@ extern HINSTANCE hInstance;
 
 // Forward — panel access from maxjs_main.cpp
 extern void ToggleMaxJSPanel();
+extern void EnsureMaxJSPanel();
 extern void StartMaxJSActiveShade(Bitmap* target);
 extern void StopMaxJSActiveShade();
 extern HWND GetMaxJSWebViewHWND();
 extern void ReparentMaxJSPanel(HWND newParent);
 extern void RestoreMaxJSPanel();
+extern bool RenderMaxJSFrameToBitmap(Bitmap* target, int width, int height, TimeValue t, RendProgressCallback* prog);
 
 // ══════════════════════════════════════════════════════════════
 //  ThreeJS Interactive Render (ActiveShade)
@@ -94,6 +96,9 @@ public:
 
 class ThreeJSRenderer : public Renderer {
     ThreeJSInteractiveRender interactiveRender_;
+    int renderWidth_ = 0;
+    int renderHeight_ = 0;
+    bool stopRequested_ = false;
 
 public:
     ThreeJSRenderer() {}
@@ -121,18 +126,32 @@ public:
     }
 
     // ── Renderer core ────────────────────────────────────────
-    int Open(INode*, INode*, ViewParams*, RendParams&, HWND,
+    int Open(INode*, INode*, ViewParams*, RendParams& rp, HWND,
              DefaultLight* = nullptr, int = 0, RendProgressCallback* = nullptr) override {
+        renderWidth_ = rp.width;
+        renderHeight_ = rp.height;
+        stopRequested_ = false;
+        // Ensure the MaxJS panel is up (non-toggling)
+        EnsureMaxJSPanel();
         return 1;
     }
 
-    int Render(TimeValue, Bitmap*, FrameRendParams&, HWND,
-               RendProgressCallback* = nullptr, ViewParams* = nullptr) override {
-        // TODO: capture WebView2 panel to bitmap
-        return 1;
+    int Render(TimeValue t, Bitmap* tobm, FrameRendParams&, HWND,
+               RendProgressCallback* prog = nullptr, ViewParams* = nullptr) override {
+        if (stopRequested_ || !tobm) return 0;
+
+        int w = tobm->Width();
+        int h = tobm->Height();
+
+        if (prog) prog->SetTitle(_T("three.js — rendering frame..."));
+
+        bool ok = RenderMaxJSFrameToBitmap(tobm, w, h, t, prog);
+        return ok ? 1 : 0;
     }
 
-    void Close(HWND, RendProgressCallback* = nullptr) override {}
+    void Close(HWND, RendProgressCallback* = nullptr) override {
+        stopRequested_ = false;
+    }
 
     RendParamDlg* CreateParamDialog(IRendParams*, BOOL = FALSE) override {
         return nullptr;  // No render settings dialog yet
@@ -152,7 +171,7 @@ public:
     void GetPlatformInformation(MSTR& info) const override { info = _T("Three.js / WebView2"); }
 
     bool IsStopSupported() const override { return true; }
-    void StopRendering() override {}
+    void StopRendering() override { stopRequested_ = true; }
 
     Renderer::PauseSupport IsPauseSupported() const override {
         return Renderer::PauseSupport::None;
@@ -162,8 +181,8 @@ public:
 
     bool HasRequirement(Requirement requirement) override {
         switch (requirement) {
-            case Requirement::kRequirement_NoVFB: return true;
-            case Requirement::kRequirement_DontSaveRenderOutput: return true;
+            case Requirement::kRequirement_NoVFB: return false;  // show VFB for production renders
+            case Requirement::kRequirement_DontSaveRenderOutput: return false;
             default: return false;
         }
     }

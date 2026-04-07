@@ -8117,6 +8117,10 @@ public:
             SendHostActionResult(type, requestId, ok, error);
             return;
         }
+        if (type == L"render_to_image_ready") {
+            if (renderImageEvent_) SetEvent(renderImageEvent_);
+            return;
+        }
         if (type == L"ready" || msg.find(L"\"ready\"") != std::wstring::npos) {
             jsReady_ = true; SetDirtyImmediate();
             mtlHashMap_.clear();
@@ -10422,6 +10426,225 @@ public:
         webview_->PostWebMessageAsJson(ss.str().c_str());
     }
 
+    // ── Render-to-image (production render) ────────────────
+
+    HANDLE renderImageEvent_ = nullptr;  // signaled when JS confirms frame rendered
+    bool renderLocked_ = false;          // panel is locked to render resolution
+    RECT preRenderRect_ = {};            // saved window rect before render
+    LONG preRenderStyle_ = 0;            // saved window style before render
+
+    void LockToRenderSize(int width, int height) {
+        if (!hwnd_ || renderLocked_) return;
+        GetWindowRect(hwnd_, &preRenderRect_);
+        preRenderStyle_ = GetWindowLong(hwnd_, GWL_STYLE);
+
+        // Remove resize/maximize handles
+        LONG style = preRenderStyle_ & ~(WS_THICKFRAME | WS_MAXIMIZEBOX);
+        SetWindowLong(hwnd_, GWL_STYLE, style);
+
+        // Compute window size from desired client area
+        RECT desired = { 0, 0, width, height };
+        AdjustWindowRect(&desired, style, FALSE);
+        int winW = desired.right - desired.left;
+        int winH = desired.bottom - desired.top;
+
+        SetWindowPos(hwnd_, nullptr,
+            preRenderRect_.left, preRenderRect_.top, winW, winH,
+            SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+        Resize();  // update controller bounds
+        renderLocked_ = true;
+    }
+
+    void UnlockRenderSize() {
+        if (!hwnd_ || !renderLocked_) return;
+        SetWindowLong(hwnd_, GWL_STYLE, preRenderStyle_);
+        SetWindowPos(hwnd_, nullptr,
+            preRenderRect_.left, preRenderRect_.top,
+            preRenderRect_.right - preRenderRect_.left,
+            preRenderRect_.bottom - preRenderRect_.top,
+            SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+        Resize();
+        renderLocked_ = false;
+    }
+
+    void SetWebViewBackgroundTransparent(bool transparent) {
+        ComPtr<ICoreWebView2Controller2> ctrl2;
+        if (SUCCEEDED(controller_->QueryInterface(IID_PPV_ARGS(&ctrl2))) && ctrl2) {
+            COREWEBVIEW2_COLOR bg;
+            bg.R = 0; bg.G = 0; bg.B = 0;
+            bg.A = transparent ? 0 : 255;
+            ctrl2->put_DefaultBackgroundColor(bg);
+        }
+    }
+
+    // Render a single frame at the given resolution and write to a Max Bitmap.
+    // Called from ThreeJSRenderer::Render() on the main thread.
+    bool RenderFrameToBitmap(Bitmap* target, int width, int height, TimeValue t, RendProgressCallback* prog) {
+        if (!webview_ || !target) return false;
+
+        auto restoreRenderState = [this]() {
+            if (webview_) {
+                webview_->PostWebMessageAsJson(L"{\"type\":\"render_to_image_done\"}");
+            }
+            UnlockRenderSize();
+            SetWebViewBackgroundTransparent(false);
+        };
+
+        // Wait for JS to be ready (panel may have just been created)
+        if (!jsReady_) {
+            const DWORD readyTimeout = 15000;
+            const DWORD readyStart = GetTickCount();
+            while (!jsReady_) {
+                if (GetTickCount() - readyStart > readyTimeout) {
+                    restoreRenderState();
+                    return false;
+                }
+                MSG winMsg;
+                while (PeekMessage(&winMsg, nullptr, 0, 0, PM_REMOVE)) {
+                    TranslateMessage(&winMsg);
+                    DispatchMessage(&winMsg);
+                }
+                Sleep(1);
+            }
+        }
+
+        // Lock panel to render resolution and set transparent background for alpha
+        LockToRenderSize(width, height);
+        SetWebViewBackgroundTransparent(true);
+        if (prog) prog->SetTitle(_T("three.js — syncing frame..."));
+
+        // Disable gamma/color transforms — Three.js output is already display-referred sRGB
+        target->UseScaleColors(0);
+
+        // Create event for synchronization
+        if (!renderImageEvent_)
+            renderImageEvent_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        ResetEvent(renderImageEvent_);
+
+        // Tell JS to render at the requested resolution
+        int fps = GetFrameRate();
+        int frame = t / GetTicksPerFrame();
+        wchar_t msg[256];
+        swprintf_s(msg, L"{\"type\":\"render_to_image\",\"width\":%d,\"height\":%d,\"frame\":%d,\"fps\":%d}",
+                   width, height, frame, fps);
+
+        // Force a fresh scene sync at the requested frame before asking JS to render.
+        Interface* ip = GetCOREInterface();
+        TimeValue previousTime = ip ? ip->GetTime() : t;
+        if (ip && previousTime != t) ip->SetTime(t, FALSE);
+        if (useBinary_) SendFullSyncBinary(); else SendFullSync();
+        webview_->PostWebMessageAsJson(msg);
+
+        // Pump messages until JS signals ready or timeout (10 seconds)
+        const DWORD timeout = 10000;
+        const DWORD start = GetTickCount();
+        while (WaitForSingleObject(renderImageEvent_, 0) != WAIT_OBJECT_0) {
+            if (GetTickCount() - start > timeout) {
+                if (ip && previousTime != t) ip->SetTime(previousTime, FALSE);
+                restoreRenderState();
+                return false;
+            }
+            MSG winMsg;
+            while (PeekMessage(&winMsg, nullptr, 0, 0, PM_REMOVE)) {
+                TranslateMessage(&winMsg);
+                DispatchMessage(&winMsg);
+            }
+            Sleep(1);
+        }
+
+        // JS has rendered — capture the WebView2 content
+        HANDLE captureEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        bool captureOk = false;
+        if (prog) prog->SetTitle(_T("three.js — capturing frame..."));
+
+        ComPtr<IStream> stream;
+        CreateStreamOnHGlobal(NULL, TRUE, &stream);
+
+        webview_->CapturePreview(
+            COREWEBVIEW2_CAPTURE_PREVIEW_IMAGE_FORMAT_PNG,
+            stream.Get(),
+            Callback<ICoreWebView2CapturePreviewCompletedHandler>(
+                [&captureOk, &captureEvent, stream, target](HRESULT hr) -> HRESULT {
+                    if (SUCCEEDED(hr)) {
+                        LARGE_INTEGER zero = {};
+                        stream->Seek(zero, STREAM_SEEK_SET, nullptr);
+
+                        ComPtr<IWICImagingFactory> wic;
+                        CoCreateInstance(CLSID_WICImagingFactory, nullptr,
+                            CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic));
+                        if (wic) {
+                            ComPtr<IWICBitmapDecoder> decoder;
+                            wic->CreateDecoderFromStream(stream.Get(), nullptr,
+                                WICDecodeMetadataCacheOnLoad, &decoder);
+                            if (decoder) {
+                                ComPtr<IWICBitmapFrameDecode> frame;
+                                decoder->GetFrame(0, &frame);
+                                if (frame) {
+                                    int dstW = target->Width();
+                                    int dstH = target->Height();
+
+                                    UINT srcW, srcH;
+                                    frame->GetSize(&srcW, &srcH);
+
+                                    ComPtr<IWICBitmapScaler> scaler;
+                                    wic->CreateBitmapScaler(&scaler);
+                                    scaler->Initialize(frame.Get(), dstW, dstH,
+                                        WICBitmapInterpolationModeHighQualityCubic);
+
+                                    ComPtr<IWICFormatConverter> converter;
+                                    wic->CreateFormatConverter(&converter);
+                                    converter->Initialize(scaler.Get(),
+                                        GUID_WICPixelFormat32bppBGRA,
+                                        WICBitmapDitherTypeNone, nullptr, 0,
+                                        WICBitmapPaletteTypeCustom);
+
+                                    std::vector<BYTE> pixels(dstW * dstH * 4);
+                                    converter->CopyPixels(nullptr, dstW * 4,
+                                        (UINT)pixels.size(), pixels.data());
+
+                                    // Write to Max Bitmap — preserve alpha from capture
+                                    BMM_Color_64 px;
+                                    for (int y = 0; y < dstH; y++) {
+                                        for (int x = 0; x < dstW; x++) {
+                                            int idx = (y * dstW + x) * 4;
+                                            px.b = pixels[idx + 0] << 8;
+                                            px.g = pixels[idx + 1] << 8;
+                                            px.r = pixels[idx + 2] << 8;
+                                            px.a = pixels[idx + 3] << 8;
+                                            target->PutPixels(x, y, 1, &px);
+                                        }
+                                        target->ShowProgressLine(y);
+                                    }
+                                    target->RefreshWindow();
+                                    captureOk = true;
+                                }
+                            }
+                        }
+                    }
+                    SetEvent(captureEvent);
+                    return S_OK;
+                }).Get());
+
+        // Wait for capture to finish
+        const DWORD captureStart = GetTickCount();
+        while (WaitForSingleObject(captureEvent, 0) != WAIT_OBJECT_0) {
+            if (GetTickCount() - captureStart > timeout) break;
+            MSG winMsg;
+            while (PeekMessage(&winMsg, nullptr, 0, 0, PM_REMOVE)) {
+                TranslateMessage(&winMsg);
+                DispatchMessage(&winMsg);
+            }
+            Sleep(1);
+        }
+        CloseHandle(captureEvent);
+
+        // Tell JS to restore, unlock panel, restore opaque background
+        if (ip && previousTime != t) ip->SetTime(previousTime, FALSE);
+        restoreRenderState();
+
+        return captureOk;
+    }
+
     // ── ActiveShade capture ─────────────────────────────────
 
     Bitmap* asTarget_ = nullptr;
@@ -10691,6 +10914,7 @@ public:
 
     void Destroy() {
         StopActiveShade();
+        if (renderImageEvent_) { CloseHandle(renderImageEvent_); renderImageEvent_ = nullptr; }
         if (originalParent_) RestoreFromViewport();
         UnregisterCallbacks();
         if (controller_) { controller_->Close(); controller_ = nullptr; }
@@ -10864,8 +11088,24 @@ void TogglePanel() {
 }
 
 void ToggleMaxJSPanel() { TogglePanel(); }
+
+// Ensure panel exists and is visible (non-toggling)
+static void EnsurePanel() {
+    Interface* ip = GetCOREInterface();
+    if (!g_panel) {
+        g_panel = new MaxJSPanel();
+        g_panel->Create(ip ? ip->GetMAXHWnd() : nullptr);
+    } else if (g_panel->hwnd_ && !IsWindowVisible(g_panel->hwnd_)) {
+        ShowWindow(g_panel->hwnd_, SW_SHOW);
+        g_panel->NormalizeFloatingWindow(true);
+    } else if (!g_panel->hwnd_) {
+        g_panel->Create(ip ? ip->GetMAXHWnd() : nullptr);
+    }
+}
+void EnsureMaxJSPanel() { EnsurePanel(); }
+
 void StartMaxJSActiveShade(Bitmap* target) {
-    if (!g_panel) TogglePanel();
+    if (!g_panel) EnsurePanel();
     if (g_panel) g_panel->StartActiveShade(target);
 }
 void StopMaxJSActiveShade() {
@@ -10880,6 +11120,11 @@ void ReparentMaxJSPanel(HWND newParent) {
 }
 void RestoreMaxJSPanel() {
     if (g_panel) g_panel->RestoreFromViewport();
+}
+bool RenderMaxJSFrameToBitmap(Bitmap* target, int width, int height, TimeValue t, RendProgressCallback* prog) {
+    EnsurePanel();
+    if (!g_panel) return false;
+    return g_panel->RenderFrameToBitmap(target, width, height, t, prog);
 }
 
 static void RegisterMaxScript() {

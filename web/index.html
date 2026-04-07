@@ -2610,6 +2610,77 @@
         }
         window.maxJS = bridge;
 
+        function createSceneMaterial(nd) {
+            if (nd.mats && nd.groups) return nd.mats.map(m => createMaterial(m));
+            return nd.mat
+                ? createMaterial(nd.mat)
+                : new THREE.MeshStandardMaterial({ color: 0x888888, side: THREE.DoubleSide });
+        }
+
+        function disposeSceneMaterial(material) {
+            if (Array.isArray(material)) {
+                for (const item of material) item?.dispose?.();
+            } else {
+                material?.dispose?.();
+            }
+        }
+
+        function createSceneLineMaterial(mat) {
+            return new THREE.LineBasicMaterial({
+                color: mat?.color ?? new THREE.Color(0xffffff),
+            });
+        }
+
+        function applySceneRenderableMaterial(mesh, mat, wantsLine) {
+            if (wantsLine) {
+                disposeSceneMaterial(mesh.material);
+                mesh.material = createSceneLineMaterial(mat);
+                return;
+            }
+            if (clayModeActive) mesh.userData._origMaterial = mat;
+            else mesh.material = mat;
+        }
+
+        function finalizeSceneNode(mesh, nd) {
+            applyJsmodSyncState(mesh, !!nd.jsmod);
+            applyInstanceSyncState(mesh, nd.instOf);
+            applyBridgeVisibility(mesh, nd.vis);
+            mesh.frustumCulled = false;
+            if (!nd.spline) applyMeshShadowState(mesh);
+            applyNodeProps(mesh, nd.props);
+            applyTransform(mesh, nd.t);
+            applySelection(mesh, nd.s);
+        }
+
+        function finalizeSceneSnapshot(snapshot, transport, applyStart, producerBytes, options = {}) {
+            if (snapshot.camera) applyCamera(snapshot.camera);
+            if (!isLocalHdriLoaded()) {
+                if (snapshot.env?.sky) applySky(snapshot.env.sky);
+                else if (snapshot.env?.hdri) { removeSky(); loadHDRI(snapshot.env); }
+            }
+            if (snapshot.fog) ssgiFx.setFogFromScene(snapshot.fog);
+            if (snapshot.lights) applyLights(snapshot.lights);
+            reconcileSplats(snapshot.splats ?? []);
+            applyForestInstances(snapshot.forestInstances);
+            applyVolumes(snapshot.volumes);
+            scene.updateMatrixWorld(true);
+            options.afterWorldUpdate?.();
+
+            if (firstSync && snapshot.nodes.length > 0) {
+                firstSync = false;
+                if (!camLock) fitCamera();
+            }
+            const applyMs = performance.now() - applyStart;
+            markInitialSync();
+            updateSyncHud({
+                transport,
+                frameId: snapshot.frame ?? 0,
+                producerBytes,
+                decodeMs: 0,
+                applyMs,
+            });
+        }
+
         // ── Scene Sync ──────────────────────────────────────
         bridge.on('scene', msg => {
             setTransportMode('json');
@@ -2630,14 +2701,7 @@
             for (const nd of msg.nodes) {
                 let mesh = nodeMap.get(nd.h);
 
-                // Build material: single or multi-sub array
-                let mat;
-                if (nd.mats && nd.groups) {
-                    mat = nd.mats.map(m => createMaterial(m));
-                } else {
-                    mat = nd.mat ? createMaterial(nd.mat)
-                        : new THREE.MeshStandardMaterial({ color: 0x888888, side: THREE.DoubleSide });
-                }
+                const mat = createSceneMaterial(nd);
 
                 const jsmodFlag = !!nd.jsmod;
                 // jsmod flag: layers own vertices — skip geo rebuild for existing meshes
@@ -2665,11 +2729,7 @@
                 if (renderableTypeMismatch) {
                     maxRoot.remove(mesh);
                     mesh.geometry?.dispose?.();
-                    if (Array.isArray(mesh.material)) {
-                        for (const material of mesh.material) material?.dispose?.();
-                    } else {
-                        mesh.material?.dispose?.();
-                    }
+                    disposeSceneMaterial(mesh.material);
                     nodeMap.delete(nd.h);
                     mesh = null;
                 }
@@ -2679,24 +2739,11 @@
                         mesh.geometry.dispose();
                         mesh.geometry = geom;
                     }
-                    if (wantsLine) {
-                        if (Array.isArray(mesh.material)) {
-                            for (const material of mesh.material) material?.dispose?.();
-                        } else {
-                            mesh.material?.dispose?.();
-                        }
-                        mesh.material = new THREE.LineBasicMaterial({
-                            color: mat?.color ?? new THREE.Color(0xffffff),
-                        });
-                    } else if (clayModeActive) { mesh.userData._origMaterial = mat; }
-                    else { mesh.material = mat; }
+                    applySceneRenderableMaterial(mesh, mat, wantsLine);
                 } else {
                     if (!geom) continue;
                     if (wantsLine) {
-                        const lineMat = new THREE.LineBasicMaterial({
-                            color: mat?.color ?? new THREE.Color(0xffffff),
-                        });
-                        mesh = new THREE.LineSegments(geom, lineMat);
+                        mesh = new THREE.LineSegments(geom, createSceneLineMaterial(mat));
                     } else {
                         mesh = new THREE.Mesh(geom, clayModeActive ? clayMat : mat);
                         if (clayModeActive) mesh.userData._origMaterial = mat;
@@ -2708,42 +2755,10 @@
                     nodeMap.set(nd.h, mesh);
                 }
 
-                applyJsmodSyncState(mesh, jsmodFlag);
-                applyInstanceSyncState(mesh, nd.instOf);
-                applyBridgeVisibility(mesh, nd.vis);
-                mesh.frustumCulled = false;
-                if (!nd.spline) applyMeshShadowState(mesh);
-                applyNodeProps(mesh, nd.props);
-
-                applyTransform(mesh, nd.t);
-                applySelection(mesh, nd.s);
+                finalizeSceneNode(mesh, nd);
             }
 
-            if (msg.camera) applyCamera(msg.camera);
-            if (!isLocalHdriLoaded()) {
-                if (msg.env?.sky) applySky(msg.env.sky);
-                else if (msg.env?.hdri) { removeSky(); loadHDRI(msg.env); }
-            }
-            if (msg.fog) ssgiFx.setFogFromScene(msg.fog);
-            if (msg.lights) applyLights(msg.lights);
-            reconcileSplats(msg.splats ?? []);
-            applyForestInstances(msg.forestInstances);
-            applyVolumes(msg.volumes);
-            scene.updateMatrixWorld(true);
-
-            if (firstSync && msg.nodes.length > 0) {
-                firstSync = false;
-                if (!camLock) fitCamera();
-            }
-            const applyMs = performance.now() - applyStart;
-            markInitialSync();
-            updateSyncHud({
-                transport: 'json',
-                frameId: msg.frame ?? 0,
-                producerBytes: msg.stats?.producerBytes ?? 0,
-                decodeMs: 0,
-                applyMs,
-            });
+            finalizeSceneSnapshot(msg, 'json', applyStart, msg.stats?.producerBytes ?? 0);
         });
 
         // ── Camera-only sync (30fps) ─────────────────────────
@@ -2951,14 +2966,7 @@
             for (const nd of meta.nodes) {
                 let mesh = nodeMap.get(nd.h);
 
-                // Build material: single or multi-sub array
-                let mat;
-                if (nd.mats && nd.groups) {
-                    mat = nd.mats.map(m => createMaterial(m));
-                } else {
-                    mat = nd.mat ? createMaterial(nd.mat)
-                        : new THREE.MeshStandardMaterial({ color: 0x888888, side: THREE.DoubleSide });
-                }
+                const mat = createSceneMaterial(nd);
 
                 const jsmodFlag = !!nd.jsmod;
                 const instSrcMesh = nd.instOf ? nodeMap.get(nd.instOf) : null;
@@ -3071,11 +3079,7 @@
                     maxRoot.remove(mesh);
                     const isSharedGeometry = [...nodeMap.values()].some(m => m !== mesh && m.geometry === mesh.geometry);
                     if (!isSharedGeometry) mesh.geometry?.dispose?.();
-                    if (Array.isArray(mesh.material)) {
-                        for (const material of mesh.material) material?.dispose?.();
-                    } else {
-                        mesh.material?.dispose?.();
-                    }
+                    disposeSceneMaterial(mesh.material);
                     nodeMap.delete(nd.h);
                     mesh = null;
                 }
@@ -3087,24 +3091,11 @@
                         if (!isShared) mesh.geometry.dispose();
                         mesh.geometry = geom;
                     }
-                    if (wantsLine) {
-                        if (Array.isArray(mesh.material)) {
-                            for (const material of mesh.material) material?.dispose?.();
-                        } else {
-                            mesh.material?.dispose?.();
-                        }
-                        mesh.material = new THREE.LineBasicMaterial({
-                            color: mat?.color ?? new THREE.Color(0xffffff),
-                        });
-                    } else if (clayModeActive) { mesh.userData._origMaterial = mat; }
-                    else { mesh.material = mat; }
+                    applySceneRenderableMaterial(mesh, mat, wantsLine);
                 } else {
                     if (!geom) continue;
                     if (wantsLine) {
-                        const lineMat = new THREE.LineBasicMaterial({
-                            color: mat?.color ?? new THREE.Color(0xffffff),
-                        });
-                        mesh = new THREE.LineSegments(geom, lineMat);
+                        mesh = new THREE.LineSegments(geom, createSceneLineMaterial(mat));
                     } else if (nd.skin) {
                         mesh = buildSkinnedMeshFromNd(geom, clayModeActive ? clayMat : mat, nd, buffer);
                         if (!mesh) mesh = new THREE.Mesh(geom, clayModeActive ? clayMat : mat);
@@ -3120,51 +3111,22 @@
                     nodeMap.set(nd.h, mesh);
                 }
 
-                applyJsmodSyncState(mesh, jsmodFlag);
-                applyInstanceSyncState(mesh, nd.instOf);
-                applyBridgeVisibility(mesh, nd.vis);
-                mesh.frustumCulled = false;
-                if (!nd.spline) applyMeshShadowState(mesh);
-                applyNodeProps(mesh, nd.props);
-
-                applyTransform(mesh, nd.t);
-                applySelection(mesh, nd.s);
+                finalizeSceneNode(mesh, nd);
             }
 
-            if (meta.camera) applyCamera(meta.camera);
-            if (!isLocalHdriLoaded()) {
-                if (meta.env?.sky) applySky(meta.env.sky);
-                else if (meta.env?.hdri) { removeSky(); loadHDRI(meta.env); }
-            }
-            if (meta.fog) ssgiFx.setFogFromScene(meta.fog);
-            if (meta.lights) applyLights(meta.lights);
-            reconcileSplats(meta.splats ?? []);
-            applyForestInstances(meta.forestInstances);
-            applyVolumes(meta.volumes);
-            scene.updateMatrixWorld(true);
-            // Recalculate skeleton boneInverses for NEWLY created skinned meshes
-            // (only needed once — after the mesh is in the scene hierarchy under maxBasisRoot).
-            for (const mesh of nodeMap.values()) {
-                if (mesh?.isSkinnedMesh && mesh.skeleton && !mesh.userData._skelBound) {
-                    mesh.skeleton.calculateInverses();
-                    mesh.bind(mesh.skeleton, mesh.matrixWorld);
-                    mesh.userData._skelBound = true;
-                }
-            }
-            animationSystem?.invalidateTargets();
-
-            if (firstSync && meta.nodes.length > 0) {
-                firstSync = false;
-                if (!camLock) fitCamera();
-            }
-            const applyMs = performance.now() - applyStart;
-            markInitialSync();
-            updateSyncHud({
-                transport: 'binary-scene',
-                frameId: meta.frame ?? 0,
-                producerBytes: meta.stats?.producerBytes ?? buffer.byteLength,
-                decodeMs: 0,
-                applyMs,
+            finalizeSceneSnapshot(meta, 'binary-scene', applyStart, meta.stats?.producerBytes ?? buffer.byteLength, {
+                afterWorldUpdate() {
+                    // Recalculate skeleton boneInverses for NEWLY created skinned meshes
+                    // (only needed once — after the mesh is in the scene hierarchy under maxBasisRoot).
+                    for (const mesh of nodeMap.values()) {
+                        if (mesh?.isSkinnedMesh && mesh.skeleton && !mesh.userData._skelBound) {
+                            mesh.skeleton.calculateInverses();
+                            mesh.bind(mesh.skeleton, mesh.matrixWorld);
+                            mesh.userData._skelBound = true;
+                        }
+                    }
+                    animationSystem?.invalidateTargets();
+                },
             });
         }
 

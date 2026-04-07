@@ -1388,13 +1388,14 @@
         }
 
         // Evaluate TSL texture code — code must return a THREE.Texture or THREE.DataTexture
-        function evalTSLTexture(code) {
+        function evalTSLTexture(code, tslParams) {
             if (!code) return null;
-            const cacheKey = 'tsl_tex:' + code;
+            const cacheKey = 'tsl_tex:' + code + JSON.stringify(tslParams || {});
             if (textureCache.has(cacheKey)) return textureCache.get(cacheKey);
             try {
-                const fn = new Function('THREE', 'TSL', code);
-                const result = fn(THREE, TSL);
+                const params = buildTSLParams(code, tslParams || {});
+                const fn = new Function('THREE', 'TSL', 'params', code);
+                const result = fn(THREE, TSL, params);
                 if (result && result.isTexture) {
                     result.needsUpdate = true;
                     textureCache.set(cacheKey, result);
@@ -1410,7 +1411,7 @@
         // Load a map slot — checks for TSL procedural texture first, then falls back to URL
         function loadMapSlot(md, key, colorSpace, xfKey, fallback) {
             const tslCode = md[key + 'TSL'];
-            if (tslCode) return evalTSLTexture(tslCode);
+            if (tslCode) return evalTSLTexture(tslCode, md[key + 'TSLParams']);
             const url = md[key];
             if (url) return loadTexture(url, colorSpace, xfKey ? md[xfKey] : null, fallback);
             return null;
@@ -1890,6 +1891,32 @@
             return material;
         }
 
+        // Parse @param declarations from TSL code and build uniform params object
+        function buildTSLParams(code, values) {
+            const params = {};
+            const lines = code.split('\n');
+            for (const line of lines) {
+                const m = line.match(/\/\/\s*@param\s+(float|color|bool)\s+(\w+)\s*(.*)/);
+                if (!m) continue;
+                const [, type, name, rest] = m;
+                const parts = rest.trim().split(/\s+/).map(Number);
+                if (type === 'float') {
+                    const val = values?.[name] ?? (isFinite(parts[0]) ? parts[0] : 0.5);
+                    params[name] = TSL.uniform(val);
+                } else if (type === 'color') {
+                    const v = values?.[name];
+                    const r = v ? v[0] : (isFinite(parts[0]) ? parts[0] : 1);
+                    const g = v ? v[1] : (isFinite(parts[1]) ? parts[1] : 1);
+                    const b = v ? v[2] : (isFinite(parts[2]) ? parts[2] : 1);
+                    params[name] = TSL.uniform(new THREE.Color(r, g, b));
+                } else if (type === 'bool') {
+                    const val = values?.[name] ?? (rest.trim() === 'true');
+                    params[name] = TSL.uniform(val ? 1.0 : 0.0);
+                }
+            }
+            return params;
+        }
+
         function createTSLMaterial(md) {
             try {
                 const material = new THREE.MeshPhysicalNodeMaterial();
@@ -1900,12 +1927,14 @@
                 if (md.tslMap2) maps.map2 = loadTexture(md.tslMap2);
                 if (md.tslMap3) maps.map3 = loadTexture(md.tslMap3);
                 if (md.tslMap4) maps.map4 = loadTexture(md.tslMap4);
-                // TSL code gets full access to THREE (which includes all TSL nodes),
-                // a convenience `loadTexture` for loading bitmaps by path,
-                // and `maps` object with pre-loaded textures from material slots
+                // Build dynamic params from @param declarations + stored values
+                const params = buildTSLParams(md.tslCode, md.tslParams || {});
+                // TSL code gets: material, THREE, TSL, loadTexture, maps, params (uniforms)
                 const code = md.tslCode;
-                const fn = new Function('material', 'THREE', 'TSL', 'loadTexture', 'maps', code);
-                fn(material, THREE, TSL, loadTexture, maps);
+                const fn = new Function('material', 'THREE', 'TSL', 'loadTexture', 'maps', 'params', code);
+                fn(material, THREE, TSL, loadTexture, maps, params);
+                // Store params on material for live uniform updates
+                material.userData.tslParams = params;
                 material.needsUpdate = true;
                 return material;
             } catch (err) {
@@ -2000,49 +2029,27 @@
             if (md.aoI != null && 'aoMapIntensity' in material) material.aoMapIntensity = md.aoI;
             if (md.lmI != null && 'lightMapIntensity' in material) material.lightMapIntensity = md.lmI;
 
-            if (md.map && 'map' in material) {
-                material.map = loadTexture(md.map, THREE.SRGBColorSpace, md.mapXf, fallbackWhiteTexture);
-            }
-            if (md.normMap && 'normalMap' in material) {
-                material.normalMap = loadTexture(md.normMap, THREE.LinearSRGBColorSpace, md.normMapXf, fallbackFlatNormalTexture);
-            }
-            if (md.bumpMap && 'bumpMap' in material) {
-                material.bumpMap = loadTexture(md.bumpMap, THREE.NoColorSpace, md.bumpMapXf, fallbackHeightTexture);
-            }
-            if (md.ccMap && 'clearcoatMap' in material) {
-                material.clearcoatMap = loadTexture(md.ccMap, THREE.LinearSRGBColorSpace, md.ccMapXf, fallbackWhiteTexture);
-            }
-            if (md.ccRoughMap && 'clearcoatRoughnessMap' in material) {
-                material.clearcoatRoughnessMap = loadTexture(md.ccRoughMap, THREE.LinearSRGBColorSpace, md.ccRoughMapXf, fallbackWhiteTexture);
-            }
-            if (md.ccNormMap && 'clearcoatNormalMap' in material) {
-                material.clearcoatNormalMap = loadTexture(md.ccNormMap, THREE.LinearSRGBColorSpace, md.ccNormMapXf, fallbackFlatNormalTexture);
-            }
-            if (md.dispMap && 'displacementMap' in material) {
-                material.displacementMap = loadTexture(md.dispMap, THREE.NoColorSpace, md.dispMapXf, fallbackHeightTexture);
-            }
-            if (md.aoMap && 'aoMap' in material) {
-                material.aoMap = loadTexture(md.aoMap, THREE.LinearSRGBColorSpace, md.aoMapXf, fallbackWhiteTexture);
-            }
-            if (md.emMap && 'emissiveMap' in material) {
-                material.emissiveMap = loadTexture(md.emMap, THREE.SRGBColorSpace, md.emMapXf, fallbackWhiteTexture);
-            }
-            if (md.opMap && 'alphaMap' in material) {
-                material.alphaMap = loadTexture(md.opMap, THREE.LinearSRGBColorSpace, md.opMapXf, fallbackWhiteTexture);
-                material.transparent = true;
-            }
-            if (md.transMap && 'transmissionMap' in material) {
-                material.transmissionMap = loadTexture(md.transMap, THREE.LinearSRGBColorSpace, md.transMapXf, fallbackWhiteTexture);
-            }
-            if (md.lmMap && 'lightMap' in material) {
-                material.lightMap = loadTexture(md.lmMap, THREE.LinearSRGBColorSpace, md.lmMapXf, fallbackWhiteTexture);
-            }
-            if (md.matcapMap && 'matcap' in material) {
-                material.matcap = loadTexture(md.matcapMap, THREE.SRGBColorSpace, md.matcapMapXf, fallbackWhiteTexture);
-            }
-            if (md.specMap && 'specularMap' in material) {
-                material.specularMap = loadTexture(md.specMap, THREE.LinearSRGBColorSpace, md.specMapXf, fallbackWhiteTexture);
-            }
+            // Apply texture maps (all slots support TSL Texture)
+            const applyMap = (key, prop, cs, xf, fb) => {
+                const tex = loadMapSlot(md, key, cs, xf, fb);
+                if (tex && prop in material) material[prop] = tex;
+                return tex;
+            };
+            const W = fallbackWhiteTexture, N = fallbackFlatNormalTexture, H = fallbackHeightTexture;
+            applyMap('map',        'map',                    THREE.SRGBColorSpace,         'mapXf',        W);
+            applyMap('normMap',    'normalMap',              THREE.LinearSRGBColorSpace,   'normMapXf',    N);
+            applyMap('bumpMap',    'bumpMap',                THREE.NoColorSpace,           'bumpMapXf',    H);
+            applyMap('ccMap',      'clearcoatMap',           THREE.LinearSRGBColorSpace,   'ccMapXf',      W);
+            applyMap('ccRoughMap', 'clearcoatRoughnessMap',  THREE.LinearSRGBColorSpace,   'ccRoughMapXf', W);
+            applyMap('ccNormMap',  'clearcoatNormalMap',     THREE.LinearSRGBColorSpace,   'ccNormMapXf',  N);
+            applyMap('dispMap',    'displacementMap',        THREE.NoColorSpace,           'dispMapXf',    H);
+            applyMap('aoMap',      'aoMap',                  THREE.LinearSRGBColorSpace,   'aoMapXf',      W);
+            applyMap('emMap',      'emissiveMap',            THREE.SRGBColorSpace,         'emMapXf',      W);
+            applyMap('transMap',   'transmissionMap',        THREE.LinearSRGBColorSpace,   'transMapXf',   W);
+            applyMap('lmMap',      'lightMap',               THREE.LinearSRGBColorSpace,   'lmMapXf',      W);
+            applyMap('matcapMap',  'matcap',                 THREE.SRGBColorSpace,         'matcapMapXf',  W);
+            applyMap('specMap',    'specularMap',            THREE.LinearSRGBColorSpace,   'specMapXf',    W);
+            if (applyMap('opMap',  'alphaMap',               THREE.LinearSRGBColorSpace,   'opMapXf',      W)) material.transparent = true;
 
             rememberMaterialEmissiveBase(material);
             material.needsUpdate = true;
@@ -2193,18 +2200,27 @@
                         template = new THREE.MeshStandardMaterial(params);
                     }
 
-                    // Textures
-                    if (md.map) template.map = loadTexture(md.map, THREE.SRGBColorSpace, md.mapXf, fallbackWhiteTexture);
-                    if (!wantsToonMaterial && md.roughMap) template.roughnessMap = loadTexture(md.roughMap, THREE.LinearSRGBColorSpace, md.roughMapXf, fallbackWhiteTexture);
-                    if (!wantsToonMaterial && md.metalMap) template.metalnessMap = loadTexture(md.metalMap, THREE.LinearSRGBColorSpace, md.metalMapXf, fallbackWhiteTexture);
-                    if (md.normMap) template.normalMap = loadTexture(md.normMap, THREE.LinearSRGBColorSpace, md.normMapXf, fallbackFlatNormalTexture);
-                    if (md.bumpMap) template.bumpMap = loadTexture(md.bumpMap, THREE.NoColorSpace, md.bumpMapXf, fallbackHeightTexture);
-                    if (md.dispMap) template.displacementMap = loadTexture(md.dispMap, THREE.NoColorSpace, md.dispMapXf, fallbackHeightTexture);
-                    if (md.aoMap) template.aoMap = loadTexture(md.aoMap, THREE.LinearSRGBColorSpace, md.aoMapXf, fallbackWhiteTexture);
-                    if (md.emMap) template.emissiveMap = loadTexture(md.emMap, THREE.SRGBColorSpace, md.emMapXf, fallbackWhiteTexture);
-                    if (md.opMap) { template.alphaMap = loadTexture(md.opMap, THREE.LinearSRGBColorSpace, md.opMapXf, fallbackWhiteTexture); template.transparent = true; }
-                    if (md.transMap && 'transmissionMap' in template) {
-                        template.transmissionMap = loadTexture(md.transMap, THREE.LinearSRGBColorSpace, md.transMapXf, fallbackWhiteTexture);
+                    // Textures (all slots support TSL Texture)
+                    {
+                        const apply = (key, prop, cs, xf, fb) => {
+                            const tex = loadMapSlot(md, key, cs, xf, fb);
+                            if (tex) template[prop] = tex;
+                            return tex;
+                        };
+                        const W = fallbackWhiteTexture, N = fallbackFlatNormalTexture, H = fallbackHeightTexture;
+                        apply('map',      'map',               THREE.SRGBColorSpace,       'mapXf',      W);
+                        if (!wantsToonMaterial) {
+                            apply('roughMap', 'roughnessMap',  THREE.LinearSRGBColorSpace, 'roughMapXf', W);
+                            apply('metalMap', 'metalnessMap',  THREE.LinearSRGBColorSpace, 'metalMapXf', W);
+                        }
+                        apply('normMap',  'normalMap',         THREE.LinearSRGBColorSpace, 'normMapXf',  N);
+                        apply('bumpMap',  'bumpMap',           THREE.NoColorSpace,         'bumpMapXf',  H);
+                        apply('dispMap',  'displacementMap',   THREE.NoColorSpace,         'dispMapXf',  H);
+                        apply('aoMap',    'aoMap',             THREE.LinearSRGBColorSpace, 'aoMapXf',    W);
+                        apply('emMap',    'emissiveMap',       THREE.SRGBColorSpace,       'emMapXf',    W);
+                        if (apply('opMap', 'alphaMap',         THREE.LinearSRGBColorSpace, 'opMapXf',    W)) template.transparent = true;
+                        if ('transmissionMap' in template)
+                            apply('transMap', 'transmissionMap', THREE.LinearSRGBColorSpace, 'transMapXf', W);
                     }
                     if (canUseToonMaterial) {
                         const gradTex = loadMapSlot(md, 'gradMap', THREE.NoColorSpace, null, fallbackToonGradientTexture);
@@ -2214,9 +2230,12 @@
                     }
 
                     // Lightmap
-                    if (md.lmMap) {
-                        template.lightMap = loadTexture(md.lmMap, THREE.LinearSRGBColorSpace, md.lmMapXf, fallbackWhiteTexture);
-                        template.lightMapIntensity = md.lmI ?? 1.0;
+                    {
+                        const lmTex = loadMapSlot(md, 'lmMap', THREE.LinearSRGBColorSpace, 'lmMapXf', fallbackWhiteTexture);
+                        if (lmTex) {
+                            template.lightMap = lmTex;
+                            template.lightMapIntensity = md.lmI ?? 1.0;
+                        }
                     }
 
                     if (canUseSSSMaterial) {
@@ -2576,7 +2595,7 @@
             const applyStart = performance.now();
             const incoming = new Set(msg.nodes.map(n => n.h));
 
-            // Clear material cache so changes are picked up
+            // Clear material cache so changes are picked up (texture cache uses content-addressed keys)
             materialCache.clear();
 
             for (const [handle, mesh] of nodeMap) {

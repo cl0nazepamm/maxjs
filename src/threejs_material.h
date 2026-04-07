@@ -77,6 +77,8 @@ enum ThreeJSParamIDs {
     pb_tsl_map2,
     pb_tsl_map3,
     pb_tsl_map4,
+    // TSL dynamic params (JSON storage)
+    pb_tsl_params_json,
     // Utility extras (appended for scene compatibility)
     pb_specular_map,
     pb_reflectivity,
@@ -160,6 +162,7 @@ enum ThreeJSVideoParamIDs {
 enum { threejs_tsl_tex_params };
 enum ThreeJSTSLTexParamIDs {
     ptsl_tex_code,
+    ptsl_tex_params_json,
 };
 ClassDesc2* GetThreeJSTSLTexDesc();
 

@@ -963,7 +963,8 @@ struct MaxJSPBR {
         bool  videoLoop = true;
         bool  videoMuted = true;
         float videoRate = 1.0f;
-        std::wstring tslCode;  // TSL procedural texture code (if non-empty, this is a TSL Texture)
+        std::wstring tslCode;       // TSL procedural texture code (if non-empty, this is a TSL Texture)
+        std::wstring tslParamsJson; // TSL texture dynamic params JSON
     };
 
     float color[3]    = {0.8f, 0.8f, 0.8f};
@@ -1032,6 +1033,7 @@ struct MaxJSPBR {
     std::wstring mtlName;
     std::wstring tslCode;
     std::wstring tslMaps[4];
+    std::wstring tslParamsJson;
     std::wstring materialModel = L"MeshStandardMaterial";
     std::wstring materialXFile;
     std::wstring materialXInline;  // MaterialX XML string (from MtlxIOUtil.ExportMtlxString)
@@ -1236,6 +1238,10 @@ static bool ExtractMaterialTexture(Texmap* map, std::wstring& filePath, MaxJSPBR
                     filePath = L"tsl://procedural";
                     xf = {};
                     xf.tslCode = code;
+                    if (HasParam(pb, ptsl_tex_params_json)) {
+                        const MCHAR* pj = pb->GetStr(ptsl_tex_params_json);
+                        if (pj && pj[0]) xf.tslParamsJson = pj;
+                    }
                     return true;
                 }
             }
@@ -1511,6 +1517,11 @@ static void ExtractThreeJSMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
                     }
                 }
             }
+        }
+        // Extract dynamic params JSON
+        if (HasParam(pb, pb_tsl_params_json)) {
+            const MCHAR* pj = pb->GetStr(pb_tsl_params_json);
+            if (pj && pj[0]) d.tslParamsJson = pj;
         }
         // Auto-compile MaterialX from source material if connected
         if (HasParam(pb, pb_tsl_source_mtl)) {
@@ -8995,9 +9006,11 @@ public:
         };
         auto writeMap = [&](const wchar_t* key, const wchar_t* xfKey, const std::wstring& path, const MaxJSPBR::TexTransform& xf) {
             if (path.empty()) return;
-            // TSL procedural texture — emit code instead of URL
+            // TSL procedural texture — emit code and params instead of URL
             if (!xf.tslCode.empty()) {
                 ss << L",\"" << key << L"TSL\":\"" << EscapeJson(xf.tslCode.c_str()) << L'"';
+                if (!xf.tslParamsJson.empty())
+                    ss << L",\"" << key << L"TSLParams\":" << xf.tslParamsJson;
                 return;
             }
             std::wstring url = MapTexturePath(path);
@@ -9157,6 +9170,9 @@ public:
         } else if (pbr.materialModel == L"MeshTSLNodeMaterial") {
             if (!pbr.tslCode.empty())
                 ss << L",\"tslCode\":\"" << EscapeJson(pbr.tslCode.c_str()) << L"\"";
+            // TSL dynamic params — send raw JSON (already valid JSON object)
+            if (!pbr.tslParamsJson.empty())
+                ss << L",\"tslParams\":" << pbr.tslParamsJson;
             // TSL texture map slots
             static const wchar_t* tslMapKeys[] = { L"tslMap1", L"tslMap2", L"tslMap3", L"tslMap4" };
             for (int m = 0; m < 4; ++m) {

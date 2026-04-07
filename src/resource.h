@@ -35,6 +35,7 @@
 #define IDC_TSL_MAP2               1145
 #define IDC_TSL_MAP3               1146
 #define IDC_TSL_MAP4               1147
+#define IDC_TSL_DYN_GROUP          1148
 #define IDD_THREEJS_VIDEO_TEX      126
 #define IDS_VIDEO_TEX_PARAMS       127
 #define IDD_THREEJS_TSL_TEX        137
@@ -42,6 +43,7 @@
 #define IDC_TSL_TEX_CODE_EDIT      1210
 #define IDC_TSL_TEX_LOAD_BTN       1211
 #define IDC_TSL_TEX_FILE_LABEL     1212
+#define IDC_TSL_TEX_DYN_GROUP      1213
 #define IDC_VIDEO_FILE_BTN         1150
 #define IDC_VIDEO_FILE_LABEL       1151
 #define IDC_VIDEO_LOOP             1152

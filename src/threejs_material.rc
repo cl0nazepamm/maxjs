@@ -500,14 +500,14 @@ BEGIN
     LTEXT           "Models: Distance / Depth / Lambert / Matcap / Normal / Phong / Backdrop", IDC_MTL_MODEL_LABEL, 8, 456, 154, 24
 END
 
-IDD_THREEJS_TSL_MTL DIALOG 0, 0, 170, 270
+IDD_THREEJS_TSL_MTL DIALOG 0, 0, 170, 540
 STYLE DS_SETFONT | WS_CHILD | WS_VISIBLE
 FONT 8, "Segoe UI"
 BEGIN
     GROUPBOX        "TSL Shader", -1,   2,   2, 166, 200
     LTEXT           "Connect Source Material in Node Editor for MaterialX auto-compile", -1, 8, 14, 154, 16
     LTEXT           "No file loaded", IDC_TSL_FILE_LABEL, 8, 34, 100, 8
-    PUSHBUTTON      "Load .tsl",  IDC_TSL_LOAD_BTN,  114, 31, 46, 14
+    PUSHBUTTON      "Load .js",   IDC_TSL_LOAD_BTN,  114, 31, 46, 14
     EDITTEXT        IDC_TSL_CODE_EDIT, 6, 48, 158, 148, ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN | WS_VSCROLL | WS_TABSTOP
     GROUPBOX        "Texture Maps", -1, 2, 206, 166, 60
     LTEXT           "Map 1:", -1, 8, 220, 24, 8
@@ -518,6 +518,7 @@ BEGIN
     CONTROL         "", IDC_TSL_MAP3, "CustButton", 0x50010000, 34, 246, 128, 12
     LTEXT           "Map 4:", -1, 8, 262, 24, 8
     CONTROL         "", IDC_TSL_MAP4, "CustButton", 0x50010000, 34, 260, 128, 12
+    GROUPBOX        "Dynamic Parameters", IDC_TSL_DYN_GROUP, 2, 272, 166, 264
 END
 
 IDD_THREEJS_VIDEO_TEX DIALOG 0, 0, 170, 80
@@ -535,13 +536,14 @@ BEGIN
     LTEXT           "Supports: .mp4 .webm .ogg", -1, 8, 60, 150, 8
 END
 
-IDD_THREEJS_TSL_TEX DIALOG 0, 0, 170, 160
+IDD_THREEJS_TSL_TEX DIALOG 0, 0, 170, 440
 STYLE DS_SETFONT | WS_CHILD | WS_VISIBLE
 FONT 8, "Segoe UI"
 BEGIN
     GROUPBOX        "TSL Texture", -1, 2, 2, 166, 152
     LTEXT           "Code returns a THREE.Texture or THREE.DataTexture", -1, 8, 14, 154, 16
     LTEXT           "No file loaded", IDC_TSL_TEX_FILE_LABEL, 8, 34, 100, 8
-    PUSHBUTTON      "Load .tsl",  IDC_TSL_TEX_LOAD_BTN,  114, 31, 46, 14
+    PUSHBUTTON      "Load .js",   IDC_TSL_TEX_LOAD_BTN,  114, 31, 46, 14
     EDITTEXT        IDC_TSL_TEX_CODE_EDIT, 6, 48, 158, 100, ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN | WS_VSCROLL | WS_TABSTOP
+    GROUPBOX        "Dynamic Parameters", IDC_TSL_TEX_DYN_GROUP, 2, 158, 166, 264
 END

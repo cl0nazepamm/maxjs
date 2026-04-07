@@ -2834,11 +2834,17 @@
         function disposeMaxInstanceBuckets() {
             for (const [, bucket] of maxInstanceBuckets) {
                 if (bucket.mesh?.parent) bucket.mesh.parent.remove(bucket.mesh);
-                bucket.mesh?.geometry?.dispose?.();
+                // Don't dispose geometry — it's shared with the source mesh
                 disposeSceneMaterial(bucket.mesh?.material);
             }
             maxInstanceBuckets.clear();
             maxInstanceHandleToBucket.clear();
+            // Restore visibility on nodes that were hidden by bucket merge
+            for (const [, mesh] of nodeMap) {
+                if (mesh && !mesh.visible && mesh.userData?.maxjsInstOf) {
+                    mesh.visible = true;
+                }
+            }
         }
 
         function getMaxInstanceBucketForHandle(handle) {

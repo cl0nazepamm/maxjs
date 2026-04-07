@@ -8865,6 +8865,11 @@ public:
                 materialFastDirtyHandles_.insert(handle);
                 if (fastDirtyHandles_.insert(handle).second) fastChanged = true;
             } else {
+                // Material structure changed — invalidate geometry hash + group cache
+                // so next full sync re-extracts face matIDs for multi-sub materials
+                geoHashMap_.erase(handle);
+                groupCache_.erase(handle);
+                lastBBoxHash_.erase(handle);
                 SetDirty();
                 return;
             }

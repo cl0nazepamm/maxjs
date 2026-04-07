@@ -8376,6 +8376,13 @@ public:
         if (!geoDirty.empty()) {
             SendGeometryFastUpdate(geoDirty);
             if (materialDirty.empty() && visibilityDirty.empty() && !hasDirtyCamera && !hasDirtyLights && !hasDirtySplats) {
+                // Creation-mode primitives (e.g. Box drag) can change geometry and pivot/transform
+                // together. If we return after geo_fast only, the mesh updates but the transform
+                // can lag a frame or more, which makes the object appear centered/offset while drawing.
+                if (hasAnyNodeUpdates) {
+                    SendTransformSync(&combinedNodeHandles);
+                    CaptureCurrentCameraState();
+                }
                 return;
             }
         }

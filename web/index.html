@@ -2529,11 +2529,14 @@
                             if (meta.jsmod != null) applyJsmodSyncState(mesh, meta.jsmod === true);
                             if (!mesh.userData.jsmod) {
                             const pos = mesh.geometry.getAttribute('position');
+                            const wantsLine = !!meta.spline;
+                            const hasLine = !!(mesh.isLine || mesh.isLineSegments);
                             const vertCount = meta.vN / 3;
                             const hasIncomingIndex = meta.iOff != null && meta.iN != null;
                             const idxCount = hasIncomingIndex ? meta.iN : 0;
                             const existingIdx = mesh.geometry.getIndex();
-                            const sameTopology = pos
+                            const sameTopology = wantsLine === hasLine
+                                && pos
                                 && pos.count === vertCount
                                 && (!hasIncomingIndex || (existingIdx && existingIdx.count === idxCount));
 
@@ -2656,7 +2659,7 @@
             if (!mesh || !nd) return;
             if (nd.jsmod != null) applyJsmodSyncState(mesh, nd.jsmod === true);
             if (nd.vis != null) applyBridgeVisibility(mesh, nd.vis);
-            if (Array.isArray(nd.t) && nd.t.length === 16) applyTransform(mesh, nd.t);
+            if (isFiniteArray(nd.t, 16)) applyTransform(mesh, nd.t);
             if (nd.s != null) applySelection(mesh, nd.s);
             if (nd.mat && mesh.material) applyMaterialScalar(mesh, nd.mat);
         }

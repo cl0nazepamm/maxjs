@@ -8788,8 +8788,7 @@ public:
         state.structureHash = HashMaterialPBRState(structurePbr);
         // Scalar hash: full material JSON so ANY param change is detected
         state.scalarHash = HashMaterialPBRState(pbr);
-        // Three.js materials need full resync for physical params (binary protocol only carries basic scalars)
-        state.canFastSync = false;
+        state.canFastSync = true;
         return state;
     }
 

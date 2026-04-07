@@ -1301,6 +1301,50 @@
             ensureNamedChild('noise2d, cellnoise2d, worleynoise2d, unifiednoise2d', 'texcoord', 'texcoord', { type: 'vector2' });
             ensureNamedChild('noise3d, cellnoise3d, worleynoise3d, unifiednoise3d', 'texcoord', 'position', { type: 'vector3' });
             ensureNamedChild('fractal3d', 'position', 'position', { type: 'vector3' });
+            // image: loader does texture(file, texcoord) — missing texcoord => broken sampling.
+            ensureNamedChild('image', 'texcoord', 'texcoord', { type: 'vector2' });
+            // tiledimage: mx_transform_uv(uvtiling, uvoffset); both must exist or the spread is empty.
+            ensureNamedChild('tiledimage', 'uvtiling', 'input', { type: 'vector2', value: '1, 1' });
+            ensureNamedChild('tiledimage', 'uvoffset', 'input', { type: 'vector2', value: '0, 0' });
+
+            // Max exports emission=1.0 even when emission_color is black — force emission to 0
+            for (const ss of doc.querySelectorAll('standard_surface')) {
+                const emissionInput = Array.from(ss.children).find(c => c.getAttribute('name') === 'emission');
+                const emColorInput = Array.from(ss.children).find(c => c.getAttribute('name') === 'emission_color');
+                if (emissionInput && !emColorInput) {
+                    // No emission color means it defaults to black — zero out emission weight
+                    emissionInput.setAttribute('value', '0');
+                } else if (emissionInput && emColorInput && !emColorInput.getAttribute('nodename')) {
+                    const val = emColorInput.getAttribute('value') || '0, 0, 0';
+                    const parts = val.split(',').map(v => parseFloat(v.trim()));
+                    if (parts.every(v => v < 0.001)) {
+                        emissionInput.setAttribute('value', '0');
+                    }
+                }
+            }
+
+            // If Max exports a standard_surface or gltf_pbr without a <surfacematerial> wrapper,
+            // inject one so the loader creates MeshPhysicalNodeMaterial instead of unlit MeshBasicNodeMaterial.
+            const root = doc.documentElement;
+            if (!root.querySelector('surfacematerial')) {
+                const shaderNode = root.querySelector('standard_surface, gltf_pbr');
+                if (shaderNode) {
+                    const shaderName = shaderNode.getAttribute('name') || 'SR_default';
+                    const smName = shaderName + '_material';
+                    // Only wrap if not already inside a surfacematerial
+                    if (!shaderNode.closest('surfacematerial')) {
+                        const sm = doc.createElement('surfacematerial');
+                        sm.setAttribute('name', smName);
+                        sm.setAttribute('type', 'material');
+                        const inp = doc.createElement('input');
+                        inp.setAttribute('name', 'surfaceshader');
+                        inp.setAttribute('type', 'surfaceshader');
+                        inp.setAttribute('nodename', shaderName);
+                        sm.appendChild(inp);
+                        root.appendChild(sm);
+                    }
+                }
+            }
 
             // Fix unconnected <output> nodes with default values — Three.js loader can't handle them.
             // Convert: <output name="X" type="T" value="V"/> → <constant name="X_const" type="T" value="V"/>
@@ -1358,12 +1402,22 @@
                 }
                 return normalized;
             });
-            // MaterialXLoader uses ImageBitmapLoader internally — WebGPU renderer
-            // doesn't always handle ImageBitmap textures properly. Override with
-            // a regex handler that routes all image requests to TextureLoader.
-            const texLoader = new THREE.TextureLoader(manager);
-            manager.addHandler(/\.(jpg|jpeg|png|webp|gif|bmp|tga|exr|hdr|tiff?)$/i, texLoader);
             manager.onError = url => console.error('[MaterialX] Failed to load:', url);
+
+            // ImageBitmapLoader can produce blank textures in WebView2 virtual hosts.
+            // Use a handler that loads via HTMLImageElement instead.
+            const imgLoader = {
+                load(url, onLoad, onProgress, onError) {
+                    const resolvedUrl = manager.resolveURL(url);
+                    const img = new Image();
+                    img.crossOrigin = 'anonymous';
+                    img.onload = () => { manager.itemEnd(resolvedUrl); if (onLoad) onLoad(img); };
+                    img.onerror = (e) => { manager.itemEnd(resolvedUrl); manager.itemError(resolvedUrl); if (onError) onError(e); };
+                    manager.itemStart(resolvedUrl);
+                    img.src = resolvedUrl;
+                }
+            };
+            manager.addHandler(/\./, imgLoader);
 
             const loader = new MaterialXLoader(manager);
             if (md.materialXBase) loader.setPath(md.materialXBase);

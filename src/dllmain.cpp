@@ -9326,9 +9326,8 @@ public:
         }
 
         const float volContrib = pb->GetFloat(pl_vol_contrib, t);
-        if (volContrib != 1.0f) {
-            ss << L",\"volContrib\":" << volContrib;
-        }
+        // Always emit so the web side never keeps a stale multiplier when the user returns to 1.0.
+        ss << L",\"volContrib\":" << volContrib;
 
         ss << L'}';
         return true;

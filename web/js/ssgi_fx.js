@@ -463,6 +463,7 @@ export function createSSGIController({
     const volDensityU = uniform(0.5);
     const volIntensityU = uniform(1.0);
     const volDenoiseU = uniform(0.6);
+    const volLightContribU = uniform(1.0);
 
     function getOrCreateVolNoise() {
         if (volNoiseTexture) return volNoiseTexture;
@@ -539,16 +540,26 @@ export function createSSGIController({
         }
         volumetricMesh.visible = true;
 
-        // Enable volumetric layer on scene lights that have volContrib > 0
+        syncVolumetricLightLayers();
+    }
+
+    /** Max light volContrib edits do not rebuild the post pipeline; re-apply light.layers every frame. */
+    function syncVolumetricLightLayers() {
         disableVolLights();
+        let contribSum = 0;
+        let contribCount = 0;
         scene.traverse(obj => {
             if (!obj.isLight) return;
             const vc = obj.userData?.volContrib;
-            // Default: all lights contribute unless explicitly set to 0
             if (vc !== undefined && vc <= 0) return;
             obj.layers.enable(LAYER_VOL);
             volLightsEnabled.push(obj);
+            const val = (vc !== undefined && Number.isFinite(vc)) ? Math.max(0, vc) : 1.0;
+            contribSum += val;
+            contribCount++;
         });
+        // Average per-light volContrib as linear output multiplier
+        volLightContribU.value = contribCount > 0 ? contribSum / contribCount : 1.0;
     }
 
     function disableVolLights() {
@@ -557,6 +568,11 @@ export function createSSGIController({
         }
         volLightsEnabled = [];
     }
+
+    // Per-light volContrib is applied as a linear output multiplier via volLightContribU
+    // (averaged across contributing lights in syncVolumetricLightLayers).
+    // This gives smooth 0-1 control instead of the near-binary response from
+    // scaling light intensity before Beer's law exponential.
 
     function removeVolumetricMesh() {
         if (volumetricMesh) volumetricMesh.visible = false;
@@ -851,9 +867,9 @@ export function createSSGIController({
                     const blurredVol = gaussianBlur(volPass, volDenoiseU);
                     activeNodes.push(blurredVol);
 
-                    const volContrib = blurredVol.mul(volIntensityU);
-                    const volLuma = volContrib.r.mul(0.2126).add(volContrib.g.mul(0.7152)).add(volContrib.b.mul(0.0722));
-                    beauty = vec4(beauty.rgb.add(volContrib.rgb), max(beauty.a, volLuma));
+                    const volResult = blurredVol.mul(volIntensityU).mul(volLightContribU);
+                    const volLuma = volResult.r.mul(0.2126).add(volResult.g.mul(0.7152)).add(volResult.b.mul(0.0722));
+                    beauty = vec4(beauty.rgb.add(volResult.rgb), max(beauty.a, volLuma));
                 } catch (e) {
                     console.warn('Volumetric pass failed:', e);
                     removeVolumetricMesh();
@@ -1505,6 +1521,9 @@ export function createSSGIController({
                     scene.background = scene.environment;
                 }
                 updateActiveScreenSpaceParams();
+                if (state.volumetric.enabled && supportsScreenSpaceEffects) {
+                    syncVolumetricLightLayers();
+                }
                 prepareSceneForPostPass();
                 postProcessing.render();
                 restoreSceneAfterPostPass();

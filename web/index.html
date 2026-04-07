@@ -2652,6 +2652,15 @@
             applySelection(mesh, nd.s);
         }
 
+        function applyIncrementalNodeUpdate(mesh, nd) {
+            if (!mesh || !nd) return;
+            if (nd.jsmod != null) applyJsmodSyncState(mesh, nd.jsmod === true);
+            if (nd.vis != null) applyBridgeVisibility(mesh, nd.vis);
+            if (Array.isArray(nd.t) && nd.t.length === 16) applyTransform(mesh, nd.t);
+            if (nd.s != null) applySelection(mesh, nd.s);
+            if (nd.mat && mesh.material) applyMaterialScalar(mesh, nd.mat);
+        }
+
         function finalizeSceneSnapshot(snapshot, transport, applyStart, producerBytes, options = {}) {
             if (snapshot.camera) applyCamera(snapshot.camera);
             if (!isLocalHdriLoaded()) {
@@ -2849,14 +2858,7 @@
             for (const nd of msg.nodes) {
                 const mesh = nodeMap.get(nd.h);
                 if (!mesh) continue;
-                if (nd.jsmod != null) applyJsmodSyncState(mesh, nd.jsmod === true);
-                // Visibility (hide/unhide/isolate) — instant, no full sync needed.
-                // jsmod nodes keep visibility under the layer runtime.
-                if (nd.vis != null) applyBridgeVisibility(mesh, nd.vis);
-                if (Array.isArray(nd.t) && nd.t.length === 16) applyTransform(mesh, nd.t);
-                if (nd.s != null) applySelection(mesh, nd.s);
-                // Live material update from scalars
-                if (nd.mat && mesh.material) applyMaterialScalar(mesh, nd.mat);
+                applyIncrementalNodeUpdate(mesh, nd);
             }
             if (msg.lights) applyLightUpdates(msg.lights);
             if (msg.splats) applySplatUpdates(msg.splats);
@@ -3134,19 +3136,19 @@
             const result = applyDeltaFrame(buffer, {
                 onTransform(nodeHandle, matrix) {
                     const mesh = nodeMap.get(nodeHandle);
-                    if (mesh) applyTransform(mesh, matrix);
+                    if (mesh) applyIncrementalNodeUpdate(mesh, { t: matrix });
                 },
                 onMaterialScalar(nodeHandle, material) {
                     const mesh = nodeMap.get(nodeHandle);
-                    if (mesh) applyMaterialScalar(mesh, material);
+                    if (mesh) applyIncrementalNodeUpdate(mesh, { mat: material });
                 },
                 onSelection(nodeHandle, selected) {
                     const mesh = nodeMap.get(nodeHandle);
-                    if (mesh) applySelection(mesh, selected);
+                    if (mesh) applyIncrementalNodeUpdate(mesh, { s: selected });
                 },
                 onVisibility(nodeHandle, visible) {
                     const mesh = nodeMap.get(nodeHandle);
-                    if (mesh) applyBridgeVisibility(mesh, visible);
+                    if (mesh) applyIncrementalNodeUpdate(mesh, { vis: visible });
                 },
                 onCamera(cameraState) {
                     applyCamera(cameraState);

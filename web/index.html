@@ -1387,6 +1387,35 @@
             return tex;
         }
 
+        // Evaluate TSL texture code — code must return a THREE.Texture or THREE.DataTexture
+        function evalTSLTexture(code) {
+            if (!code) return null;
+            const cacheKey = 'tsl_tex:' + code;
+            if (textureCache.has(cacheKey)) return textureCache.get(cacheKey);
+            try {
+                const fn = new Function('THREE', 'TSL', code);
+                const result = fn(THREE, TSL);
+                if (result && result.isTexture) {
+                    result.needsUpdate = true;
+                    textureCache.set(cacheKey, result);
+                    return result;
+                }
+                console.warn('[TSL Texture] Code did not return a Texture');
+            } catch (err) {
+                console.error('[TSL Texture] Eval error:', err);
+            }
+            return null;
+        }
+
+        // Load a map slot — checks for TSL procedural texture first, then falls back to URL
+        function loadMapSlot(md, key, colorSpace, xfKey, fallback) {
+            const tslCode = md[key + 'TSL'];
+            if (tslCode) return evalTSLTexture(tslCode);
+            const url = md[key];
+            if (url) return loadTexture(url, colorSpace, xfKey ? md[xfKey] : null, fallback);
+            return null;
+        }
+
         function refreshLightProbeFromCurrentHDRI() {
             if (!currentEnvParams?.hdri) return;
             loadHDRI(currentEnvParams, { forceProbeRefresh: true });
@@ -1865,11 +1894,18 @@
             try {
                 const material = new THREE.MeshPhysicalNodeMaterial();
                 material.side = md.side === 0 ? THREE.FrontSide : THREE.DoubleSide;
-                // TSL code gets full access to THREE (which includes all TSL nodes)
-                // and a convenience `loadTexture` for loading bitmaps from Max paths
+                // Pre-load textures from material map slots
+                const maps = {};
+                if (md.tslMap1) maps.map1 = loadTexture(md.tslMap1);
+                if (md.tslMap2) maps.map2 = loadTexture(md.tslMap2);
+                if (md.tslMap3) maps.map3 = loadTexture(md.tslMap3);
+                if (md.tslMap4) maps.map4 = loadTexture(md.tslMap4);
+                // TSL code gets full access to THREE (which includes all TSL nodes),
+                // a convenience `loadTexture` for loading bitmaps by path,
+                // and `maps` object with pre-loaded textures from material slots
                 const code = md.tslCode;
-                const fn = new Function('material', 'THREE', 'TSL', 'loadTexture', code);
-                fn(material, THREE, TSL, loadTexture);
+                const fn = new Function('material', 'THREE', 'TSL', 'loadTexture', 'maps', code);
+                fn(material, THREE, TSL, loadTexture, maps);
                 material.needsUpdate = true;
                 return material;
             } catch (err) {
@@ -2171,8 +2207,9 @@
                         template.transmissionMap = loadTexture(md.transMap, THREE.LinearSRGBColorSpace, md.transMapXf, fallbackWhiteTexture);
                     }
                     if (canUseToonMaterial) {
-                        template.gradientMap = md.gradMap
-                            ? configureGradientTexture(loadTexture(md.gradMap, THREE.NoColorSpace, null, fallbackToonGradientTexture))
+                        const gradTex = loadMapSlot(md, 'gradMap', THREE.NoColorSpace, null, fallbackToonGradientTexture);
+                        template.gradientMap = gradTex
+                            ? configureGradientTexture(gradTex)
                             : fallbackToonGradientTexture;
                     }
 

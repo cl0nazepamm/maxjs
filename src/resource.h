@@ -31,8 +31,17 @@
 #define IDC_TSL_LOAD_BTN           1141
 #define IDC_TSL_FILE_LABEL         1142
 #define IDC_TSL_SOURCE_MTL         1143
+#define IDC_TSL_MAP1               1144
+#define IDC_TSL_MAP2               1145
+#define IDC_TSL_MAP3               1146
+#define IDC_TSL_MAP4               1147
 #define IDD_THREEJS_VIDEO_TEX      126
 #define IDS_VIDEO_TEX_PARAMS       127
+#define IDD_THREEJS_TSL_TEX        137
+#define IDS_TSL_TEX_PARAMS         138
+#define IDC_TSL_TEX_CODE_EDIT      1210
+#define IDC_TSL_TEX_LOAD_BTN       1211
+#define IDC_TSL_TEX_FILE_LABEL     1212
 #define IDC_VIDEO_FILE_BTN         1150
 #define IDC_VIDEO_FILE_LABEL       1151
 #define IDC_VIDEO_LOOP             1152

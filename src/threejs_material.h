@@ -72,6 +72,11 @@ enum ThreeJSParamIDs {
     // TSL
     pb_tsl_code,
     pb_tsl_source_mtl,  // submaterial input for MaterialX auto-compile
+    // TSL texture map slots
+    pb_tsl_map1,
+    pb_tsl_map2,
+    pb_tsl_map3,
+    pb_tsl_map4,
     // Utility extras (appended for scene compatibility)
     pb_specular_map,
     pb_reflectivity,
@@ -132,6 +137,11 @@ enum ThreeJSMapSlots {
     kMap_SSSColor,
     kMap_Matcap,
     kMap_Specular,
+    // TSL generic map slots
+    kMap_TSL1,
+    kMap_TSL2,
+    kMap_TSL3,
+    kMap_TSL4,
     kNumMaps
 };
 
@@ -144,6 +154,14 @@ enum ThreeJSVideoParamIDs {
     pvid_rate,
     pvid_muted,
 };
+
+// TSL Texture (procedural texmap driven by TSL code)
+#define THREEJS_TSL_TEX_CLASS_ID Class_ID(0x7F3A9B21, 0x4E2D8C20)
+enum { threejs_tsl_tex_params };
+enum ThreeJSTSLTexParamIDs {
+    ptsl_tex_code,
+};
+ClassDesc2* GetThreeJSTSLTexDesc();
 
 ClassDesc2* GetThreeJSAdvMtlDesc();
 ClassDesc2* GetThreeJSUtilityMtlDesc();

@@ -963,6 +963,7 @@ struct MaxJSPBR {
         bool  videoLoop = true;
         bool  videoMuted = true;
         float videoRate = 1.0f;
+        std::wstring tslCode;  // TSL procedural texture code (if non-empty, this is a TSL Texture)
     };
 
     float color[3]    = {0.8f, 0.8f, 0.8f};
@@ -1030,6 +1031,7 @@ struct MaxJSPBR {
     TexTransform clearcoatMapTransform, clearcoatRoughnessMapTransform, clearcoatNormalMapTransform;
     std::wstring mtlName;
     std::wstring tslCode;
+    std::wstring tslMaps[4];
     std::wstring materialModel = L"MeshStandardMaterial";
     std::wstring materialXFile;
     std::wstring materialXInline;  // MaterialX XML string (from MtlxIOUtil.ExportMtlxString)
@@ -1222,6 +1224,24 @@ static bool ExtractMaterialTexture(Texmap* map, std::wstring& filePath, MaxJSPBR
     const int outputChannelIndex = std::max(1, FindPBInt(map, _T("outputChannelIndex"), 1));
     if (Texmap* sourceMap = FindPBMap(map, _T("sourceMap")))
         resolved = sourceMap;
+
+    // TSL Texture — procedural texmap with TSL code
+    if (resolved->ClassID() == THREEJS_TSL_TEX_CLASS_ID) {
+        for (int b = 0; b < resolved->NumParamBlocks(); b++) {
+            IParamBlock2* pb = resolved->GetParamBlock(b);
+            if (!pb) continue;
+            if (HasParam(pb, ptsl_tex_code)) {
+                const MCHAR* code = pb->GetStr(ptsl_tex_code);
+                if (code && code[0]) {
+                    filePath = L"tsl://procedural";
+                    xf = {};
+                    xf.tslCode = code;
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
 
     if (IsAutodeskUberBitmap(resolved)) {
         const std::wstring filename = FindPBString(resolved, _T("filename"));
@@ -1479,6 +1499,19 @@ static void ExtractThreeJSMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
     } else if (cid == THREEJS_TSL_CLASS_ID) {
         const MCHAR* code = pb->GetStr(pb_tsl_code);
         if (code && code[0]) d.tslCode = code;
+        // Extract TSL texture map slots
+        {
+            static const ParamID tslMapIDs[] = { pb_tsl_map1, pb_tsl_map2, pb_tsl_map3, pb_tsl_map4 };
+            for (int m = 0; m < 4; ++m) {
+                if (HasParam(pb, tslMapIDs[m])) {
+                    Texmap* tm = pb->GetTexmap(tslMapIDs[m], t);
+                    if (tm) {
+                        MaxJSPBR::TexTransform xf;
+                        ExtractMaterialTexture(tm, d.tslMaps[m], xf);
+                    }
+                }
+            }
+        }
         // Auto-compile MaterialX from source material if connected
         if (HasParam(pb, pb_tsl_source_mtl)) {
             Mtl* srcMtl = pb->GetMtl(pb_tsl_source_mtl);
@@ -8962,6 +8995,11 @@ public:
         };
         auto writeMap = [&](const wchar_t* key, const wchar_t* xfKey, const std::wstring& path, const MaxJSPBR::TexTransform& xf) {
             if (path.empty()) return;
+            // TSL procedural texture — emit code instead of URL
+            if (!xf.tslCode.empty()) {
+                ss << L",\"" << key << L"TSL\":\"" << EscapeJson(xf.tslCode.c_str()) << L'"';
+                return;
+            }
             std::wstring url = MapTexturePath(path);
             if (!url.empty()) {
                 ss << L",\"" << key << L"\":\"" << EscapeJson(url.c_str()) << L'"';
@@ -9119,6 +9157,15 @@ public:
         } else if (pbr.materialModel == L"MeshTSLNodeMaterial") {
             if (!pbr.tslCode.empty())
                 ss << L",\"tslCode\":\"" << EscapeJson(pbr.tslCode.c_str()) << L"\"";
+            // TSL texture map slots
+            static const wchar_t* tslMapKeys[] = { L"tslMap1", L"tslMap2", L"tslMap3", L"tslMap4" };
+            for (int m = 0; m < 4; ++m) {
+                if (!pbr.tslMaps[m].empty()) {
+                    const std::wstring url = MapTexturePath(pbr.tslMaps[m]);
+                    if (!url.empty())
+                        ss << L",\"" << tslMapKeys[m] << L"\":\"" << EscapeJson(url.c_str()) << L"\"";
+                }
+            }
             if (!pbr.materialXInline.empty()) {
                 ss << L",\"materialXInline\":\"" << EscapeJson(pbr.materialXInline.c_str()) << L"\"";
                 const std::wstring baseUrl = MapAssetPath(pbr.materialXBase, true);
@@ -10867,7 +10914,7 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, ULONG fdwReason, LPVOID) {
 }
 
 __declspec(dllexport) const TCHAR* LibDescription()   { return MAXJS_NAME; }
-__declspec(dllexport) int LibNumberClasses()           { return 18; }
+__declspec(dllexport) int LibNumberClasses()           { return 19; }
 __declspec(dllexport) ClassDesc* LibClassDesc(int i) {
     switch (i) {
         case 0: return &maxJSDesc;
@@ -10888,6 +10935,7 @@ __declspec(dllexport) ClassDesc* LibClassDesc(int i) {
         case 15: return GetThreeJSFogDesc();
         case 16: return GetThreeJSSkyDesc();
         case 17: return GetThreeJSDeformDesc();
+        case 18: return GetThreeJSTSLTexDesc();
         default: return nullptr;
     }
 }

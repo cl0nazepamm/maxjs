@@ -24,14 +24,16 @@ static const ParamID kMapParamIDs[kNumMaps] = {
     pb_color_map, pb_roughness_map, pb_metalness_map, pb_normal_map,
     pb_bump_map, pb_displacement_map, pb_parallax_map, pb_emissive_map,
     pb_opacity_map, pb_lightmap, pb_ao_map, pb_sss_color_map, pb_matcap_map,
-    pb_specular_map
+    pb_specular_map,
+    pb_tsl_map1, pb_tsl_map2, pb_tsl_map3, pb_tsl_map4
 };
 
 static const MCHAR* kMapSlotNames[kNumMaps] = {
     _T("Color Map"), _T("Roughness Map"), _T("Metalness Map"), _T("Normal Map"),
     _T("Bump Map"), _T("Displacement Map"), _T("Parallax Map"), _T("Emissive Map"),
     _T("Opacity Map"), _T("Light Map"), _T("AO Map"), _T("SSS Color Map"), _T("Matcap Map"),
-    _T("Specular Map")
+    _T("Specular Map"),
+    _T("TSL Map 1"), _T("TSL Map 2"), _T("TSL Map 3"), _T("TSL Map 4")
 };
 
 struct SupportedMapSlots {
@@ -69,6 +71,10 @@ static const int kUtilityNormalMapSlots[] = {
 
 static const int kUtilityBackdropMapSlots[] = {
     kMap_Color, kMap_Opacity
+};
+
+static const int kTSLMapSlots[] = {
+    kMap_TSL1, kMap_TSL2, kMap_TSL3, kMap_TSL4
 };
 
 enum class ThreeJSMaterialKind {
@@ -122,6 +128,8 @@ static SupportedMapSlots GetSupportedMapSlots(ThreeJSMaterialKind kind, IParamBl
                     return { kUtilityLambertPhongMapSlots, static_cast<int>(std::size(kUtilityLambertPhongMapSlots)) };
             }
         }
+        case ThreeJSMaterialKind::TSL:
+            return { kTSLMapSlots, static_cast<int>(std::size(kTSLMapSlots)) };
         default:
             return {};
     }
@@ -1169,6 +1177,22 @@ static ParamBlockDesc2 threejs_tsl_pb_desc(
         p_end,
     pb_tsl_source_mtl, _T("sourceMaterial"), TYPE_MTL, 0, 0,
         p_end,
+    pb_tsl_map1, _T("map1"), TYPE_TEXMAP, 0, 0,
+        p_subtexno, kMap_TSL1,
+        p_ui, TYPE_TEXMAPBUTTON, IDC_TSL_MAP1,
+        p_end,
+    pb_tsl_map2, _T("map2"), TYPE_TEXMAP, 0, 0,
+        p_subtexno, kMap_TSL2,
+        p_ui, TYPE_TEXMAPBUTTON, IDC_TSL_MAP2,
+        p_end,
+    pb_tsl_map3, _T("map3"), TYPE_TEXMAP, 0, 0,
+        p_subtexno, kMap_TSL3,
+        p_ui, TYPE_TEXMAPBUTTON, IDC_TSL_MAP3,
+        p_end,
+    pb_tsl_map4, _T("map4"), TYPE_TEXMAP, 0, 0,
+        p_subtexno, kMap_TSL4,
+        p_ui, TYPE_TEXMAPBUTTON, IDC_TSL_MAP4,
+        p_end,
     p_end
 );
 
@@ -1317,3 +1341,150 @@ static ParamBlockDesc2 threejs_video_pb_desc(
 );
 
 ClassDesc2* GetThreeJSVideoTexDesc() { return &videoTexDesc; }
+
+// ══════════════════════════════════════════════════════════════
+//  three.js TSL Texture — procedural texmap driven by TSL code
+// ══════════════════════════════════════════════════════════════
+
+class ThreeJSTSLTex : public Texmap {
+public:
+    IParamBlock2* pblock = nullptr;
+
+    ThreeJSTSLTex(BOOL /*loading*/) {
+        GetThreeJSTSLTexDesc()->MakeAutoParamBlocks(this);
+    }
+    ~ThreeJSTSLTex() override = default;
+
+    void DeleteThis() override { delete this; }
+    Class_ID ClassID() override { return THREEJS_TSL_TEX_CLASS_ID; }
+    SClass_ID SuperClassID() override { return TEXMAP_CLASS_ID; }
+    void GetClassName(MSTR& s, bool) const override { s = _T("three.js TSL Texture"); }
+
+    int NumRefs() override { return 1; }
+    RefTargetHandle GetReference(int i) override { return i == 0 ? pblock : nullptr; }
+    void SetReference(int i, RefTargetHandle r) override { if (i == 0) pblock = static_cast<IParamBlock2*>(r); }
+    RefResult NotifyRefChanged(const Interval&, RefTargetHandle, PartID&, RefMessage, BOOL) override { return REF_SUCCEED; }
+
+    RefTargetHandle Clone(RemapDir& remap) override {
+        auto* c = new ThreeJSTSLTex(FALSE);
+        *static_cast<MtlBase*>(c) = *static_cast<MtlBase*>(this);
+        BaseClone(this, c, remap);
+        c->ReplaceReference(0, remap.CloneRef(pblock));
+        return c;
+    }
+
+    int NumSubTexmaps() override { return 0; }
+    Texmap* GetSubTexmap(int) override { return nullptr; }
+    void SetSubTexmap(int, Texmap*) override {}
+
+    int NumParamBlocks() override { return 1; }
+    IParamBlock2* GetParamBlock(int i) override { return i == 0 ? pblock : nullptr; }
+    IParamBlock2* GetParamBlockByID(BlockID id) override { return id == threejs_tsl_tex_params ? pblock : nullptr; }
+
+    ParamDlg* CreateParamDlg(HWND hwMtlEdit, IMtlParams* imp) override {
+        return GetThreeJSTSLTexDesc()->CreateParamDlgs(hwMtlEdit, imp, this);
+    }
+
+    void Update(TimeValue, Interval& valid) override { valid = FOREVER; }
+    Interval Validity(TimeValue) override { return FOREVER; }
+    void Reset() override { GetThreeJSTSLTexDesc()->MakeAutoParamBlocks(this); }
+
+    AColor EvalColor(ShadeContext&) override { return AColor(0.5f, 0.5f, 0.5f, 1.0f); }
+    float EvalMono(ShadeContext& sc) override { return Intens(EvalColor(sc)); }
+    Point3 EvalNormalPerturb(ShadeContext&) override { return Point3(0, 0, 0); }
+
+    IOResult Save(ISave* isave) override { return Texmap::Save(isave); }
+    IOResult Load(ILoad* iload) override { return Texmap::Load(iload); }
+};
+
+class ThreeJSTSLTexClassDesc : public ClassDesc2 {
+public:
+    int IsPublic() override { return TRUE; }
+    void* Create(BOOL loading) override { return new ThreeJSTSLTex(loading); }
+    const TCHAR* ClassName() override { return _T("three.js TSL Texture"); }
+    const TCHAR* NonLocalizedClassName() override { return _T("three.js TSL Texture"); }
+    SClass_ID SuperClassID() override { return TEXMAP_CLASS_ID; }
+    Class_ID ClassID() override { return THREEJS_TSL_TEX_CLASS_ID; }
+    const TCHAR* Category() override { return _T("MaxJS"); }
+    const TCHAR* InternalName() override { return _T("ThreeJSTSLTexture"); }
+    HINSTANCE HInstance() override { return hInstance; }
+};
+
+static ThreeJSTSLTexClassDesc tslTexDesc;
+
+class ThreeJSTSLTexDlgProc : public ParamMap2UserDlgProc {
+public:
+    INT_PTR DlgProc(TimeValue t, IParamMap2* map, HWND hWnd, UINT msg, WPARAM wParam, LPARAM) override {
+        IParamBlock2* pb = map ? map->GetParamBlock() : nullptr;
+        switch (msg) {
+        case WM_INITDIALOG: {
+            if (pb) {
+                const MCHAR* code = pb->GetStr(ptsl_tex_code);
+                if (code && code[0]) SetDlgItemText(hWnd, IDC_TSL_TEX_CODE_EDIT, code);
+            }
+            return TRUE;
+        }
+        case WM_COMMAND:
+            if (LOWORD(wParam) == IDC_TSL_TEX_LOAD_BTN && HIWORD(wParam) == BN_CLICKED) {
+                OPENFILENAME ofn = {};
+                wchar_t filePath[MAX_PATH] = {};
+                ofn.lStructSize = sizeof(ofn);
+                ofn.hwndOwner = hWnd;
+                ofn.lpstrFilter = L"TSL Files (*.tsl;*.js)\0*.tsl;*.js\0All Files (*.*)\0*.*\0";
+                ofn.lpstrFile = filePath;
+                ofn.nMaxFile = MAX_PATH;
+                ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+                if (GetOpenFileName(&ofn)) {
+                    HANDLE hFile = CreateFileW(filePath, GENERIC_READ, FILE_SHARE_READ, nullptr,
+                        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+                    if (hFile != INVALID_HANDLE_VALUE) {
+                        DWORD sz = GetFileSize(hFile, nullptr);
+                        if (sz > 0 && sz != INVALID_FILE_SIZE) {
+                            std::string buf(sz, '\0');
+                            DWORD bytesRead = 0;
+                            ReadFile(hFile, buf.data(), sz, &bytesRead, nullptr);
+                            buf.resize(bytesRead);
+                            int wLen = MultiByteToWideChar(CP_UTF8, 0, buf.data(), (int)buf.size(), nullptr, 0);
+                            std::wstring wCode(wLen, L'\0');
+                            MultiByteToWideChar(CP_UTF8, 0, buf.data(), (int)buf.size(), wCode.data(), wLen);
+                            SetDlgItemText(hWnd, IDC_TSL_TEX_CODE_EDIT, wCode.c_str());
+                            if (pb) pb->SetValue(ptsl_tex_code, 0, wCode.c_str());
+                            const wchar_t* fname = wcsrchr(filePath, L'\\');
+                            SetDlgItemText(hWnd, IDC_TSL_TEX_FILE_LABEL, fname ? fname + 1 : filePath);
+                        }
+                        CloseHandle(hFile);
+                    }
+                }
+                return TRUE;
+            }
+            if (LOWORD(wParam) == IDC_TSL_TEX_CODE_EDIT && HIWORD(wParam) == EN_CHANGE) {
+                int len = GetWindowTextLength(GetDlgItem(hWnd, IDC_TSL_TEX_CODE_EDIT));
+                std::wstring text(static_cast<size_t>(len) + 1, L'\0');
+                int copied = GetDlgItemText(hWnd, IDC_TSL_TEX_CODE_EDIT, text.data(), len + 1);
+                if (copied >= 0) text.resize(static_cast<size_t>(copied)); else text.clear();
+                if (pb) pb->SetValue(ptsl_tex_code, 0, text.c_str());
+                return TRUE;
+            }
+            break;
+        }
+        return FALSE;
+    }
+    void DeleteThis() override {}
+};
+
+static ThreeJSTSLTexDlgProc tslTexDlgProc;
+
+static ParamBlockDesc2 threejs_tsl_tex_pb_desc(
+    threejs_tsl_tex_params,
+    _T("three.js TSL Texture Params"),
+    IDS_TSL_TEX_PARAMS,
+    &tslTexDesc,
+    P_AUTO_CONSTRUCT + P_AUTO_UI,
+    0,
+    IDD_THREEJS_TSL_TEX, IDS_TSL_TEX_PARAMS, 0, 0, &tslTexDlgProc,
+    ptsl_tex_code, _T("tslCode"), TYPE_STRING, 0, 0,
+        p_end,
+    p_end
+);
+
+ClassDesc2* GetThreeJSTSLTexDesc() { return &tslTexDesc; }

@@ -1844,7 +1844,7 @@
 
         function applyBridgeVisibility(mesh, visibleFlag) {
             if (!mesh || mesh.userData.jsmod) return;
-            const visible = visibleFlag == null ? true : visibleFlag !== 0;
+            const visible = visibleFlag == null ? true : !!visibleFlag;
             if (mesh.visible !== visible) mesh.visible = visible;
         }
 
@@ -2740,12 +2740,19 @@
 
         function updateMaxInstanceBucketVisibility(bucket) {
             if (!bucket?.mesh) return;
-            let visibleCount = 0;
+            // Compact: rebuild instance matrices with only visible entries
+            const matrix = new THREE.Matrix4();
+            let slot = 0;
             for (const handle of bucket.handles) {
-                if (bucket.visible.get(handle) !== false) visibleCount++;
+                if (bucket.visible.get(handle) === false) continue;
+                const xf = bucket.transforms.get(handle);
+                if (xf) matrix.fromArray(xf);
+                else matrix.identity();
+                bucket.mesh.setMatrixAt(slot, matrix);
+                slot++;
             }
-            bucket.mesh.count = visibleCount;
-            bucket.mesh.visible = visibleCount > 0;
+            bucket.mesh.count = slot;
+            bucket.mesh.visible = slot > 0;
             bucket.mesh.instanceMatrix.needsUpdate = true;
         }
 
@@ -2756,9 +2763,8 @@
             if (idx == null) return false;
             const matrix = new THREE.Matrix4().fromArray(matrixArray);
             bucket.transforms.set(handle, Array.from(matrixArray));
-            bucket.visible.set(handle, true);
             bucket.mesh.setMatrixAt(idx, matrix);
-            updateMaxInstanceBucketVisibility(bucket);
+            bucket.mesh.instanceMatrix.needsUpdate = true;
             return true;
         }
 
@@ -2766,7 +2772,7 @@
             const bucket = getMaxInstanceBucketForHandle(handle);
             if (!bucket) return false;
             if (nd.vis != null) {
-                bucket.visible.set(handle, nd.vis !== 0);
+                bucket.visible.set(handle, !!nd.vis);
                 updateMaxInstanceBucketVisibility(bucket);
             }
             if (isFiniteArray(nd.t, 16)) {
@@ -2835,7 +2841,7 @@
                     bucket.handles.add(nd.h);
                     bucket.handleToIndex.set(nd.h, index);
                     bucket.transforms.set(nd.h, isFiniteArray(nd.t, 16) ? Array.from(nd.t) : null);
-                    bucket.visible.set(nd.h, nd.vis == null ? true : nd.vis !== 0);
+                    bucket.visible.set(nd.h, nd.vis == null ? true : !!nd.vis);
                     const matrix = new THREE.Matrix4();
                     if (isFiniteArray(nd.t, 16)) matrix.fromArray(nd.t);
                     else matrix.identity();

@@ -17,6 +17,8 @@ function formatMs(ms) {
 export function createPerfHud(infoEl) {
     const state = {
         statusText: 'MaxJS - booting...',
+        /** Shown after the main line; does not disable sync stats (unlike setStatus). */
+        projectBanner: '',
         transport: 'waiting',
         frameId: 0,
         producerBytes: 0,
@@ -42,10 +44,14 @@ export function createPerfHud(infoEl) {
     let prevCalls = 0;
     let prevTriangles = 0;
 
+    function bannerSuffix() {
+        return state.projectBanner ? ` | ${state.projectBanner}` : '';
+    }
+
     function paint() {
         if (!infoEl.offsetParent && infoEl.style.display === 'none') return;
         if (!state.active) {
-            infoEl.textContent = state.statusText;
+            infoEl.textContent = state.statusText + bannerSuffix();
             return;
         }
 
@@ -63,13 +69,19 @@ export function createPerfHud(infoEl) {
             `| rnd ${formatMs(state.renderMs)} ` +
             `| calls ${state.drawCalls} ` +
             `| tris ${state.triangleCount} ` +
-            `| geo ${state.memGeometries} tex ${state.memTextures}`;
+            `| geo ${state.memGeometries} tex ${state.memTextures}` +
+            bannerSuffix();
     }
 
     return {
         setStatus(text) {
             state.statusText = text;
             state.active = false;
+            state.projectBanner = '';
+            paint();
+        },
+        setProjectBanner(text) {
+            state.projectBanner = text ? String(text) : '';
             paint();
         },
         updateSync(partial) {

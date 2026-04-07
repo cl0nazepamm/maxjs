@@ -124,7 +124,12 @@ export function createProjectRuntime({ layerManager, bridge, perfHud }) {
     function setStatus(message) {
         if (message === lastStatus) return;
         lastStatus = message;
-        perfHud?.setStatus?.(`MaxJS - ${message}`);
+        const line = `MaxJS - ${message}`;
+        if (typeof perfHud?.setProjectBanner === 'function') {
+            perfHud.setProjectBanner(line);
+        } else {
+            perfHud?.setStatus?.(line);
+        }
         emitChange();
     }
 

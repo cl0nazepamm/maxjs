@@ -14,6 +14,7 @@
 #include <splshape.h>
 #include <notify.h>
 #include <stdmat.h>
+#include <AssetManagement/AssetUser.h>
 #include <ISceneEventManager.h>
 #include <iInstanceMgr.h>
 #include <modstack.h>
@@ -894,9 +895,40 @@ static bool IsImageFile(const wchar_t* path) {
             _wcsicmp(ext, L".psd") == 0 || _wcsicmp(ext, L".tx") == 0);
 }
 
+// Standard BitmapTex keeps the path on the class + asset system, not always as TYPE_FILENAME in a param block.
+static std::wstring GetStandardBitmapTexFilename(Texmap* map) {
+    if (!map || map->ClassID() != Class_ID(BMTEX_CLASS_ID, 0)) return {};
+
+    auto* bt = static_cast<BitmapTex*>(map);
+
+    const MCHAR* mapName = bt->GetMapName();
+    if (mapName && mapName[0]) {
+        std::wstring w(mapName);
+        if (IsImageFile(w.c_str())) return w;
+    }
+
+    const MaxSDK::AssetManagement::AssetUser& au = bt->GetMap();
+    MSTR fullPath;
+    if (au.GetFullFilePath(fullPath) && fullPath.Length() > 0) {
+        std::wstring w(fullPath.data());
+        if (IsImageFile(w.c_str())) return w;
+    }
+    const MSTR& fn = au.GetFileName();
+    if (fn.Length() > 0) {
+        std::wstring w(fn.data());
+        if (IsImageFile(w.c_str())) return w;
+    }
+    return {};
+}
+
 static std::wstring FindBitmapFileImpl(Texmap* map, std::unordered_set<Texmap*>& visited) {
     if (!map) return {};
     if (!visited.insert(map).second) return {};
+
+    {
+        std::wstring fromBm = GetStandardBitmapTexFilename(map);
+        if (!fromBm.empty()) return fromBm;
+    }
 
     // Check paramblocks for filename-type params — skip non-image files (.osl etc)
     for (int pb = 0; pb < map->NumParamBlocks(); pb++) {
@@ -9952,30 +9984,10 @@ public:
         std::vector<NodeGeo> geos;
         size_t totalBytes = 0;
 
-        // Plain 3ds Max instance discovery via IInstanceMgr can get very expensive on
-        // extremely node-heavy scenes and stall Max before the viewport even loads.
-        // Past this threshold, prefer brute-force sync over global instance classification.
-        static constexpr size_t kMaxNodesForPlainInstanceDiscovery = 1500;
-        size_t sceneNodeCount = 0;
-        {
-            std::function<void(INode*)> countNodes = [&](INode* parent) {
-                if (!parent || sceneNodeCount > kMaxNodesForPlainInstanceDiscovery) return;
-                for (int c = 0; c < parent->NumberOfChildren(); ++c) {
-                    INode* node = parent->GetChildNode(c);
-                    if (!node) continue;
-                    ++sceneNodeCount;
-                    if (sceneNodeCount > kMaxNodesForPlainInstanceDiscovery) return;
-                    countNodes(node);
-                    if (sceneNodeCount > kMaxNodesForPlainInstanceDiscovery) return;
-                }
-            };
-            countNodes(root);
-        }
-
         // Build instance groups via IInstanceMgr — maps each node handle to a canonical "source" handle.
         // All instances of the same object get the same source; only the source extracts geometry.
         std::unordered_map<ULONG, ULONG> instanceSourceMap; // handle → source handle (0 = self)
-        if (sceneNodeCount <= kMaxNodesForPlainInstanceDiscovery) {
+        {
             IInstanceMgr* imgr = IInstanceMgr::GetInstanceMgr();
             std::unordered_set<ULONG> visited;
             std::function<void(INode*)> buildInstMap = [&](INode* parent) {

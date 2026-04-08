@@ -696,6 +696,17 @@
             document.body.appendChild(nextRenderer.domElement);
         }
 
+        async function initializeRenderer(nextRenderer) {
+            if (typeof nextRenderer.init === 'function') {
+                await nextRenderer.init();
+            }
+        }
+
+        function disposeRenderer(nextRenderer) {
+            nextRenderer?.domElement?.remove?.();
+            nextRenderer?.dispose?.();
+        }
+
         async function createRenderer() {
             // Check if VR mode was requested (forces WebGL for XR compat)
             const forceVR = sessionStorage.getItem('maxjs_force_webgl') === '1';
@@ -705,24 +716,27 @@
             let backendLabel;
 
             if (forceVR) {
-                nextRenderer = new THREE.WebGPURenderer({ antialias: true, alpha: true, forceWebGL: true });
+                nextRenderer = new THREE_STD.WebGLRenderer({
+                    antialias: true,
+                    alpha: true,
+                    powerPreference: 'high-performance',
+                });
                 backendLabel = 'WebGL2 (VR)';
                 configureRenderer(nextRenderer);
-                await nextRenderer.init();
+                await initializeRenderer(nextRenderer);
             } else {
                 nextRenderer = new THREE.WebGPURenderer({ antialias: true, alpha: true });
                 backendLabel = 'WebGPU';
                 try {
                     configureRenderer(nextRenderer);
-                    await nextRenderer.init();
+                    await initializeRenderer(nextRenderer);
                 } catch (error) {
                     console.warn('MaxJS WebGPU init failed, retrying with forced WebGL2 backend.', error);
-                    nextRenderer.domElement.remove();
-                    nextRenderer.dispose?.();
+                    disposeRenderer(nextRenderer);
                     nextRenderer = new THREE.WebGPURenderer({ antialias: true, alpha: true, forceWebGL: true });
                     backendLabel = 'WebGL2 fallback';
                     configureRenderer(nextRenderer);
-                    await nextRenderer.init();
+                    await initializeRenderer(nextRenderer);
                 }
             }
 
@@ -3118,6 +3132,7 @@
             buildMaxInstanceBuckets(snapshot.nodes);
             profileSceneNodes(snapshot.nodes);
             scene.updateMatrixWorld(true);
+            ssgiFx.markSceneChanged?.({ rebuild: true });
             options.afterWorldUpdate?.();
 
             if (firstSync && snapshot.nodes.length > 0) {
@@ -3237,6 +3252,7 @@
                     removeSky();
                     loadHDRI(msg.env);
                 }
+                ssgiFx.markEnvironmentChanged?.();
             }
             if (msg.fog) ssgiFx.setFogFromScene(msg.fog);
         });
@@ -3288,26 +3304,33 @@
                 newMesh.matrixWorld.copy(mesh.matrixWorld);
                 maxRoot.add(newMesh);
                 nodeMap.set(msg.h, newMesh);
+                ssgiFx.markSceneChanged?.({ rebuild: true });
                 return;
             }
 
             const geom = buildGeometry(msg.v, msg.i, msg.uv, msg.norm, { isLine: wantsLine });
             mesh.geometry.dispose();
             mesh.geometry = geom;
+            ssgiFx.markSceneChanged?.({ rebuild: true });
         });
 
         // ── Transform Sync (+ material scalars, ~6fps) ──────
         bridge.on('xform', msg => {
             const applyStart = performance.now();
+            let visibilityChanged = false;
             for (const nd of msg.nodes) {
                 const mesh = nodeMap.get(nd.h);
                 if (!mesh) continue;
+                if (nd.vis != null) visibilityChanged = true;
                 applyIncrementalNodeUpdate(mesh, nd);
             }
             if (msg.lights) applyLightUpdates(msg.lights);
             if (msg.splats) applySplatUpdates(msg.splats);
             if (msg.audios) audioSystem?.applyAudioUpdates(msg.audios);
             if (msg.camera) applyCamera(msg.camera);
+            if (visibilityChanged) {
+                ssgiFx.markSceneChanged?.({ rebuild: true });
+            }
             const applyMs = performance.now() - applyStart;
             updateSyncHud({
                 transport: 'json',
@@ -5397,7 +5420,7 @@
                     motionBlur: { amount: 1.0, samples: 16 },
                     traa: { useSubpixelCorrection: true, depthThreshold: 0.0005, edgeDepthDiff: 0.001, maxVelocityLength: 128 },
                     contactShadow: { maxDistance: 0.1, thickness: 0.006, shadowIntensity: 0.85, quality: 0.3, temporal: false },
-                    retro: { wiggle: true, affineDistortion: 5.0, resolutionScale: 0.25, filterTextures: false, dither: false, colorDepth: 32, scanlines: false, scanlineIntensity: 0.3, scanlineDensity: 1.0, crt: false, vignetteIntensity: 0.3, bleeding: 0.001, curvature: 0.02 },
+                    retro: { wiggle: false, affineDistortion: 5.0, resolutionScale: 0.25, filterTextures: false, dither: false, colorDepth: 32, scanlines: false, scanlineIntensity: 0.3, scanlineDensity: 1.0, crt: false, vignetteIntensity: 0.3, bleeding: 0.001, curvature: 0.02 },
                     volumetric: { intensity: 1.0, steps: 12, density: 0.5, denoise: 0.6, resolution: 0.25 },
                     pixel: { pixelate: false, pixelSize: 4, chromatic: false, chromaticIntensity: 0.005, sharpen: false, sharpenStrength: 0.5, grain: false, grainIntensity: 0.08, brightness: 0, contrast: 0, saturation: 0 },
                     fog: { type: 0, opacity: 1.0, near: 10, far: 500, density: 0.01, noiseScale: 0.005, noiseSpeed: 0.2, height: 20 },
@@ -5433,6 +5456,7 @@
                 applyRendererPerformanceSettings({ resizePostFx: true });
                 renderer.toneMapping = toneMappingModes[currentToneMapping];
                 renderer.toneMappingExposure = currentExposure;
+                ssgiFx.markOutputChanged?.();
                 try { localStorage.removeItem(POSTFX_STORAGE_KEY); localStorage.removeItem('maxjs_panel_width'); } catch {}
                 postPanel.style.width = '';
                 buildPostFxPanel();
@@ -5472,6 +5496,7 @@
             document.getElementById('fx-tonemapping-mode').onchange = (e) => {
                 currentToneMapping = e.target.value;
                 renderer.toneMapping = toneMappingModes[currentToneMapping];
+                ssgiFx.markOutputChanged?.();
                 savePostFxState();
             };
             const expSlider = document.getElementById('fx-tonemapping-exp');
@@ -5479,6 +5504,7 @@
             expSlider.oninput = (e) => {
                 currentExposure = parseFloat(e.target.value);
                 renderer.toneMappingExposure = currentExposure;
+                ssgiFx.markOutputChanged?.();
                 expLabel.textContent = currentExposure.toFixed(1);
                 savePostFxState();
             };
@@ -5885,14 +5911,18 @@
 
         function applySavedPostFxPayload(saved) {
             try {
+                let toneMappingChanged = false;
                 if (saved.toneMapping && toneMappingModes[saved.toneMapping] != null) {
                     currentToneMapping = saved.toneMapping;
                     renderer.toneMapping = toneMappingModes[currentToneMapping];
+                    toneMappingChanged = true;
                 }
                 if (Number.isFinite(saved.exposure)) {
                     currentExposure = saved.exposure;
                     renderer.toneMappingExposure = currentExposure;
+                    toneMappingChanged = true;
                 }
+                if (toneMappingChanged) ssgiFx.markOutputChanged?.();
                 if (saved.aaMode && ['msaa', 'traa', 'off'].includes(saved.aaMode)) {
                     currentAAMode = saved.aaMode;
                     ssgiFx.setTRAAEnabled(currentAAMode === 'traa');
@@ -6109,6 +6139,35 @@
                     return !!inputSource?.gamepad?.buttons?.[index]?.pressed;
                 }
 
+                function setControllerInputSource(state, inputSource) {
+                    if (state.inputSource === inputSource) return;
+                    state.inputSource = inputSource ?? null;
+                    const visible = !!state.inputSource;
+                    state.controller.visible = visible;
+                    state.grip.visible = visible;
+                    if (!visible) state.turnReady = true;
+                }
+
+                function syncControllerInputSources() {
+                    const session = renderer.xr?.getSession?.();
+                    const inputSources = Array.from(session?.inputSources ?? [])
+                        .filter(source => !!source && (!!source.gamepad || source.targetRayMode === 'tracked-pointer'))
+                        .sort((a, b) => {
+                            const rank = (source) => {
+                                switch (source?.handedness) {
+                                    case 'left': return 0;
+                                    case 'right': return 1;
+                                    default: return 2;
+                                }
+                            };
+                            return rank(a) - rank(b);
+                        });
+
+                    for (let i = 0; i < controllerStates.length; i++) {
+                        setControllerInputSource(controllerStates[i], inputSources[i] ?? null);
+                    }
+                }
+
                 function getControllerState(handedness, fallbackIndex = -1) {
                     for (const state of controllerStates) {
                         if (state.inputSource?.handedness === handedness) return state;
@@ -6160,8 +6219,9 @@
                     captureCameraState();
                     controls.enabled = false;
                     xrOrigin.visible = true;
-                    xrOrigin.scale.setScalar(100);
+                    xrOrigin.scale.setScalar(1);
                     xrOrigin.add(camera);
+                    syncControllerInputSources();
                     recenterOrigin();
                     perfHud.setStatus('MaxJS - XR active');
                 }
@@ -6184,6 +6244,8 @@
                 function updateLocomotion(dt) {
                     if (!runtime.active) return;
 
+                    syncControllerInputSources();
+
                     const leftState = getControllerState('left', 0);
                     const rightState = getControllerState('right', 1);
                     const moveState = leftState ?? rightState;
@@ -6199,8 +6261,8 @@
                         moveRight.crossVectors(moveForward, camera.up).normalize();
 
                         moveDelta.set(0, 0, 0);
-                        if (y) moveDelta.addScaledVector(moveRight, -y * moveSpeed * dt);
-                        if (x) moveDelta.addScaledVector(moveForward, -x * moveSpeed * dt);
+                        if (x) moveDelta.addScaledVector(moveRight, x * moveSpeed * dt);
+                        if (y) moveDelta.addScaledVector(moveForward, -y * moveSpeed * dt);
                         if (moveDelta.lengthSq() > 0) xrOrigin.position.add(moveDelta);
 
                         if (isButtonPressed(moveState.inputSource, 1)) {
@@ -6296,10 +6358,10 @@
             const frameDt = inlineClock.getDelta();
             const frameElapsed = inlineClock.getElapsedTime();
             xrRuntime.update(frameDt);
-            controls.update();
+            if (!xrRuntime.active) controls.update();
             // Auto-update DOF focus distance from camera-to-target when enabled
             // Skip when Physical Camera DOF is driving the values (Camera Lock ON + Physical Camera has DOF)
-            if (!physicalCameraDofActive || !camLock) {
+            if (!xrRuntime.active && (!physicalCameraDofActive || !camLock)) {
                 ssgiFx.updateDofFocusFromCamera(camera.position.distanceTo(controls.target));
             }
             // Default key light follows camera
@@ -6396,7 +6458,10 @@
             parent: maxBasisRoot,
             getActiveCamera: () => renderer.xr?.isPresenting ? renderer.xr.getCamera(camera) : camera,
         });
-        layerManager.subscribe?.(() => animationSystem.invalidateTargets());
+        layerManager.subscribe?.(() => {
+            animationSystem.invalidateTargets();
+            ssgiFx.markSceneChanged?.({ rebuild: true });
+        });
         const projectRuntime = window.chrome?.webview
             ? createProjectRuntime({ layerManager, bridge, perfHud })
             : null;
@@ -6528,8 +6593,8 @@
         let savedRenderToImageState = null;
 
         function renderCurrentFrameOnce(renderTimeSeconds = null) {
-            controls.update();
-            if (!physicalCameraDofActive || !camLock) {
+            if (!xrRuntime.active) controls.update();
+            if (!xrRuntime.active && (!physicalCameraDofActive || !camLock)) {
                 ssgiFx.updateDofFocusFromCamera(camera.position.distanceTo(controls.target));
             }
             if (defaultLights.visible) {

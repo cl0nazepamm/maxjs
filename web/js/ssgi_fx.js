@@ -193,7 +193,7 @@ export function createSSGIController({
         },
         retro: {
             enabled: false,
-            wiggle: true,
+            wiggle: false,
             affineDistortion: 5.0,
             resolutionScale: 0.25,
             filterTextures: false,
@@ -692,6 +692,82 @@ export function createSSGIController({
     const fogTimer = uniform(0);
     let fogAnimationActive = false;
     const pixelTimer = uniform(0);
+    const rendererDrawBufferSize = new THREE.Vector2();
+    let pendingPipelineRebuild = false;
+    let pendingSceneRefresh = false;
+    let pendingOutputRefresh = false;
+    let lastRenderWidth = 0;
+    let lastRenderHeight = 0;
+    let lastRenderPixelRatio = 1;
+    let lastToneMapping = renderer.toneMapping;
+    let lastToneMappingExposure = renderer.toneMappingExposure;
+
+    function readRendererDrawBufferSize(target) {
+        if (typeof renderer.getDrawingBufferSize === 'function') {
+            return renderer.getDrawingBufferSize(target);
+        }
+        return renderer.getSize(target);
+    }
+
+    function snapshotRendererOutputState() {
+        readRendererDrawBufferSize(rendererDrawBufferSize);
+        lastRenderWidth = rendererDrawBufferSize.x;
+        lastRenderHeight = rendererDrawBufferSize.y;
+        lastRenderPixelRatio = Number.isFinite(renderer.getPixelRatio?.()) ? renderer.getPixelRatio() : 1;
+        lastToneMapping = renderer.toneMapping;
+        lastToneMappingExposure = renderer.toneMappingExposure;
+    }
+
+    function queuePipelineUpdate({ rebuild = false, scene = false, output = false } = {}) {
+        if (rebuild) pendingPipelineRebuild = true;
+        if (scene) pendingSceneRefresh = true;
+        if (output) pendingOutputRefresh = true;
+        if (output && pipelineReady) {
+            postProcessing.needsUpdate = true;
+        }
+    }
+
+    function syncRendererOutputState(force = false) {
+        readRendererDrawBufferSize(rendererDrawBufferSize);
+        const nextPixelRatio = Number.isFinite(renderer.getPixelRatio?.()) ? renderer.getPixelRatio() : 1;
+        const sizeChanged =
+            force ||
+            rendererDrawBufferSize.x !== lastRenderWidth ||
+            rendererDrawBufferSize.y !== lastRenderHeight ||
+            Math.abs(nextPixelRatio - lastRenderPixelRatio) > 1.0e-6;
+        const toneMappingChanged =
+            renderer.toneMapping !== lastToneMapping ||
+            Math.abs((renderer.toneMappingExposure ?? 1) - (lastToneMappingExposure ?? 1)) > 1.0e-6;
+
+        if (sizeChanged) {
+            queuePipelineUpdate({ rebuild: true, output: true });
+        } else if (toneMappingChanged) {
+            queuePipelineUpdate({ output: true });
+        }
+
+        snapshotRendererOutputState();
+    }
+
+    function flushPendingPipelineUpdates() {
+        syncRendererOutputState();
+        const needsRebuild = pendingSceneRefresh || pendingPipelineRebuild;
+        const needsOutputRefresh = pendingOutputRefresh;
+
+        pendingSceneRefresh = false;
+        pendingPipelineRebuild = false;
+        pendingOutputRefresh = false;
+
+        if (needsRebuild) {
+            rebuildPipeline();
+            return;
+        }
+
+        if (needsOutputRefresh && pipelineReady) {
+            postProcessing.needsUpdate = true;
+        }
+    }
+
+    snapshotRendererOutputState();
 
     // ── Volumetric lighting mesh management ──
 
@@ -1363,7 +1439,7 @@ export function createSSGIController({
             return computeDerivedState();
         },
         hasEnabledEffects() {
-            return hasAnyEffectEnabled();
+            return pendingSceneRefresh || pendingPipelineRebuild || hasAnyEffectEnabled();
         },
         isEnabled() {
             return state.ssgi.enabled;
@@ -1499,7 +1575,19 @@ export function createSSGIController({
         },
         /** Call after scene.environment toggles or swaps (local HDRI load, Max HDRI, clear). */
         markEnvironmentChanged() {
-            if (hasAnyEffectEnabled() && available) rebuildPipeline();
+            if (available) {
+                queuePipelineUpdate({ rebuild: true, output: true });
+            }
+        },
+        markSceneChanged(options = {}) {
+            queuePipelineUpdate({
+                scene: true,
+                rebuild: options.rebuild !== false,
+                output: true,
+            });
+        },
+        markOutputChanged() {
+            queuePipelineUpdate({ output: true });
         },
         isBloomEnabled() {
             return state.bloom.enabled;
@@ -1803,6 +1891,7 @@ export function createSSGIController({
         },
 
         render() {
+            flushPendingPipelineUpdates();
             // Update fog timer for procedural animation
             if (fogAnimationActive) {
                 fogTimer.value = performance.now() * 0.001 * state.fog.noiseSpeed;
@@ -1925,7 +2014,7 @@ export function createSSGIController({
         },
 
         resize() {
-            // Post-processing handles resize internally — no need to force recompile
+            syncRendererOutputState(true);
         },
     };
 }

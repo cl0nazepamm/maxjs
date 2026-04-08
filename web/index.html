@@ -336,6 +336,10 @@
         .fx-section.collapsed .fx-section-title::before {
             content: '▸ ';
         }
+        .sidepanel-body.ascii-takeover .fx-section:not([data-fx-section="clone"]):not([data-fx-section="ascii"]) {
+            opacity: 0.25;
+            pointer-events: none;
+        }
         .fx-section-title {
             font-size: 10px;
             font-weight: 700;
@@ -530,6 +534,7 @@
         import { XRButton } from 'three/addons/webxr/XRButton.js';
         import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
         import { SkyMesh } from 'three/addons/objects/SkyMesh.js';
+        import { AsciiEffect } from 'three/addons/effects/AsciiEffect.js';
         // Spark.js uses GLSL3/ShaderChunk — needs WebGL THREE build (scoped in importmap).
         // Lazy-import to avoid crashing on page load.
         let Spark = null;
@@ -832,6 +837,19 @@
         });
         // Default camera light available for contact shadows from the start
         if (ssgiFx.setMainLight) ssgiFx.setMainLight(defaultKey);
+
+        // Clone blob overlay — 2D canvas for bounding rectangles
+        const blobOverlayCvs = document.createElement('canvas');
+        blobOverlayCvs.style.cssText = 'position:absolute;inset:0;pointer-events:none;z-index:10';
+        blobOverlayCvs.width = innerWidth;
+        blobOverlayCvs.height = innerHeight;
+        document.body.appendChild(blobOverlayCvs);
+        const blobOverlayCtx = blobOverlayCvs.getContext('2d');
+        addEventListener('resize', () => {
+            blobOverlayCvs.width = innerWidth;
+            blobOverlayCvs.height = innerHeight;
+            if (asciiActive && asciiEffect) asciiEffect.setSize(innerWidth, innerHeight);
+        });
 
         function queueSplatMutation(work) {
             splatMutationQueue = splatMutationQueue
@@ -2555,6 +2573,67 @@
 
         // ── Clay Mode ───────────────────────────────────
         let clayModeActive = false;
+
+        // ── ASCII Effect (full takeover) ──
+        let asciiActive = false;
+        let asciiEffect = null;
+        let asciiPreFxSnapshot = null;
+        let asciiSettings = { resolution: 0.15, color: 'white', invert: false };
+        const ASCII_COLORS = { white: '#fff', green: '#0f0', amber: '#ffb000' };
+        const ASCII_CHARS = ' .:-=+*#%@';
+
+        function enterAsciiMode() {
+            if (asciiActive) return;
+            asciiPreFxSnapshot = {
+                ssgi: ssgiFx.isEnabled(), ssr: ssgiFx.isSSREnabled(), gtao: ssgiFx.isGTAOEnabled(),
+                bloom: ssgiFx.isBloomEnabled(), toonOutline: ssgiFx.isToonOutlineEnabled(),
+                motionBlur: ssgiFx.isMotionBlurEnabled(), traa: ssgiFx.isTRAAEnabled(),
+                contactShadow: ssgiFx.isContactShadowEnabled(), retro: ssgiFx.isRetroEnabled(),
+                volumetric: ssgiFx.isVolumetricEnabled(), pixel: ssgiFx.isPixelEnabled(),
+                fog: ssgiFx.isFogEnabled(), opaqueBackdrop: ssgiFx.isOpaqueBackdropEnabled(),
+            };
+            ssgiFx.setEnabled(false); ssgiFx.setSSREnabled(false); ssgiFx.setGTAOEnabled(false);
+            ssgiFx.setBloomEnabled(false); ssgiFx.setToonOutlineEnabled(false);
+            ssgiFx.setMotionBlurEnabled(false); ssgiFx.setTRAAEnabled(false);
+            ssgiFx.setContactShadowEnabled(false); ssgiFx.setRetroEnabled(false);
+            ssgiFx.setVolumetricEnabled(false); ssgiFx.setPixelEnabled(false);
+            ssgiFx.setFogEnabled(false); ssgiFx.setOpaqueBackdropEnabled(false);
+            rebuildAsciiEffect();
+            asciiActive = true;
+            renderer.domElement.style.display = 'none';
+            document.querySelector('.sidepanel-body')?.classList.add('ascii-takeover');
+        }
+
+        function exitAsciiMode() {
+            if (!asciiActive) return;
+            asciiActive = false;
+            if (asciiEffect) { asciiEffect.domElement.remove(); asciiEffect = null; }
+            renderer.domElement.style.display = '';
+            document.querySelector('.sidepanel-body')?.classList.remove('ascii-takeover');
+            if (asciiPreFxSnapshot) {
+                const s = asciiPreFxSnapshot;
+                ssgiFx.setGTAOEnabled(s.gtao); ssgiFx.setEnabled(s.ssgi);
+                ssgiFx.setSSREnabled(s.ssr); ssgiFx.setBloomEnabled(s.bloom);
+                ssgiFx.setToonOutlineEnabled(s.toonOutline); ssgiFx.setMotionBlurEnabled(s.motionBlur);
+                ssgiFx.setTRAAEnabled(s.traa); ssgiFx.setContactShadowEnabled(s.contactShadow);
+                ssgiFx.setRetroEnabled(s.retro); ssgiFx.setVolumetricEnabled(s.volumetric);
+                ssgiFx.setPixelEnabled(s.pixel); ssgiFx.setFogEnabled(s.fog);
+                ssgiFx.setOpaqueBackdropEnabled(s.opaqueBackdrop);
+                asciiPreFxSnapshot = null;
+            }
+            syncPostFxPanel(true);
+        }
+
+        function rebuildAsciiEffect() {
+            if (asciiEffect) asciiEffect.domElement.remove();
+            asciiEffect = new AsciiEffect(renderer, ASCII_CHARS, {
+                invert: asciiSettings.invert, resolution: asciiSettings.resolution,
+            });
+            asciiEffect.setSize(innerWidth, innerHeight);
+            asciiEffect.domElement.style.cssText = 'position:absolute;inset:0;z-index:1;color:' +
+                (ASCII_COLORS[asciiSettings.color] || '#fff') + ';background:#000;overflow:hidden';
+            document.body.appendChild(asciiEffect.domElement);
+        }
         let clayPreFxSnapshot = null;
         const clayMat = new THREE.MeshStandardMaterial({
             color: 0x9d3d31, roughness: 0.6, metalness: 0.05, side: THREE.DoubleSide,
@@ -2576,8 +2655,10 @@
                 pixel: ssgiFx.isPixelEnabled(),
                 fog: ssgiFx.isFogEnabled(),
                 opaqueBackdrop: ssgiFx.isOpaqueBackdropEnabled(),
+                clone: ssgiFx.isCloneEnabled(),
             };
             // Disable everything
+            ssgiFx.setCloneEnabled(false);
             ssgiFx.setEnabled(false);
             ssgiFx.setSSREnabled(false);
             ssgiFx.setBloomEnabled(false);
@@ -2617,6 +2698,7 @@
                 ssgiFx.setPixelEnabled(clayPreFxSnapshot.pixel);
                 ssgiFx.setFogEnabled(clayPreFxSnapshot.fog);
                 ssgiFx.setOpaqueBackdropEnabled(clayPreFxSnapshot.opaqueBackdrop);
+                ssgiFx.setCloneEnabled(clayPreFxSnapshot.clone);
                 clayPreFxSnapshot = null;
             }
         }
@@ -4754,6 +4836,7 @@
         const btnPostFxPanel = document.getElementById('btnPostFxPanel');
         const postPanel = document.getElementById('postPanel');
         let postPanelVisible = false;
+        let syncClonePanelFn = null;
         let lastPostFxSignature = '';
 
         // Tone mapping modes
@@ -4906,8 +4989,6 @@
                 getValues: (state) => state.retro,
                 setValues: (patch) => ssgiFx.setRetroOptions(patch),
                 controls: [
-                    { key: 'wiggle', label: 'Vertex Snap (PS1 Style)', type: 'checkbox' },
-                    { key: 'affineDistortion', label: 'Snap Grid', min: 1, max: 20, step: 0.5 },
                     { key: 'dither', label: 'Dither', type: 'checkbox' },
                     { key: 'colorDepth', label: 'Color Depth', min: 2, max: 64, step: 1, integer: true },
                     { key: 'scanlines', label: 'Scanlines', type: 'checkbox' },
@@ -5207,6 +5288,89 @@
                         </div>
                     </section>
                     ${sectionsHtml}
+                    <section class="fx-section" data-fx-section="clone">
+                        <div class="fx-section-header">
+                            <div class="fx-section-title">Clone</div>
+                        </div>
+                        <div class="fx-note" style="margin:0;padding:2px 0;color:#666;font-size:9px">Custom fun effects that are designed by me.</div>
+
+                        <div class="clone-subsection" style="margin-top:8px;padding:6px 0 4px;border-top:1px solid rgba(255,255,255,0.08)">
+                            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">
+                                <span style="font-size:11px;color:#ccc;font-weight:600;letter-spacing:0.3px">Blob Tracker</span>
+                                <button class="fx-toggle" type="button" id="fx-toggle-clone">Off</button>
+                            </div>
+                            <div class="fx-grid">
+                                <label class="fx-control" for="fx-clone-source">
+                                    <div class="fx-control-head"><span>Source</span></div>
+                                    <select id="fx-clone-source" style="background:rgba(255,255,255,0.05);color:#aaa;border:1px solid rgba(255,255,255,0.08);border-radius:5px;padding:3px 6px;font:10px 'Segoe UI',system-ui,sans-serif;width:100%;outline:none;cursor:pointer">
+                                        <option value="luma" selected>Luminance</option>
+                                        <option value="depth">Depth</option>
+                                    </select>
+                                </label>
+                                <label class="fx-control" for="fx-clone-threshold">
+                                    <div class="fx-control-head"><span>Threshold</span><span class="fx-value" id="fx-clone-threshold-val">0.53</span></div>
+                                    <input class="fx-range" id="fx-clone-threshold" type="range" min="0" max="1" step="0.005" value="0.53">
+                                </label>
+                                <label class="fx-control" for="fx-clone-blurRadius">
+                                    <div class="fx-control-head"><span>Merge Radius</span><span class="fx-value" id="fx-clone-blurRadius-val">0.0</span></div>
+                                    <input class="fx-range" id="fx-clone-blurRadius" type="range" min="0" max="16" step="0.1" value="0">
+                                </label>
+                                <label class="fx-control" for="fx-clone-minBlobSize">
+                                    <div class="fx-control-head"><span>Min Blob Size</span><span class="fx-value" id="fx-clone-minBlobSize-val">0.00</span></div>
+                                    <input class="fx-range" id="fx-clone-minBlobSize" type="range" min="0" max="0.5" step="0.001" value="0">
+                                </label>
+                                <label class="fx-control" for="fx-clone-gridDensity">
+                                    <div class="fx-control-head"><span>Grid Density</span><span class="fx-value" id="fx-clone-gridDensity-val">0</span></div>
+                                    <input class="fx-range" id="fx-clone-gridDensity" type="range" min="0" max="8" step="1" value="0">
+                                </label>
+                                <label class="fx-control" for="fx-clone-smoothing">
+                                    <div class="fx-control-head"><span>Smoothing</span><span class="fx-value" id="fx-clone-smoothing-val">0.75</span></div>
+                                    <input class="fx-range" id="fx-clone-smoothing" type="range" min="0.01" max="1" step="0.01" value="0.75">
+                                </label>
+                                <label class="fx-control" for="fx-clone-opacity">
+                                    <div class="fx-control-head"><span>Opacity</span><span class="fx-value" id="fx-clone-opacity-val">1.00</span></div>
+                                    <input class="fx-range" id="fx-clone-opacity" type="range" min="0" max="1" step="0.005" value="1">
+                                </label>
+                                <label class="fx-check" for="fx-clone-invert"><span>Invert</span><input id="fx-clone-invert" type="checkbox"></label>
+                            </div>
+                        </div>
+
+                        <div class="clone-subsection" style="margin-top:8px;padding:6px 0 4px;border-top:1px solid rgba(255,255,255,0.08)">
+                            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">
+                                <span style="font-size:11px;color:#ccc;font-weight:600;letter-spacing:0.3px">Playstation Wobble</span>
+                                <button class="fx-toggle" type="button" id="fx-toggle-wobble">Off</button>
+                            </div>
+                            <div class="fx-grid" style="margin-top:6px">
+                                <label class="fx-control" for="fx-clone-snapGrid">
+                                    <div class="fx-control-head"><span>Snap Grid</span><span class="fx-value" id="fx-clone-snapGrid-val">5.0</span></div>
+                                    <input class="fx-range" id="fx-clone-snapGrid" type="range" min="1" max="20" step="0.5" value="5">
+                                </label>
+                            </div>
+                            <div class="fx-note" style="margin-top:2px">Combine it with Pixel or Retro.</div>
+                        </div>
+                    </section>
+                    <section class="fx-section" data-fx-section="ascii">
+                        <div class="fx-section-header">
+                            <div class="fx-section-title">ASCII</div>
+                            <button class="fx-toggle" type="button" id="fx-toggle-ascii">Off</button>
+                        </div>
+                        <div class="fx-grid">
+                            <label class="fx-control" for="fx-clone-ascii-resolution">
+                                <div class="fx-control-head"><span>Resolution</span><span class="fx-value" id="fx-clone-ascii-resolution-val">0.15</span></div>
+                                <input class="fx-range" id="fx-clone-ascii-resolution" type="range" min="0.05" max="0.5" step="0.01" value="0.15">
+                            </label>
+                            <label class="fx-control" for="fx-clone-ascii-color">
+                                <div class="fx-control-head"><span>Color</span></div>
+                                <select id="fx-clone-ascii-color" style="background:rgba(255,255,255,0.05);color:#aaa;border:1px solid rgba(255,255,255,0.08);border-radius:5px;padding:3px 6px;font:10px 'Segoe UI',system-ui,sans-serif;width:100%;outline:none;cursor:pointer">
+                                    <option value="white" selected>White</option>
+                                    <option value="green">Green</option>
+                                    <option value="amber">Amber</option>
+                                </select>
+                            </label>
+                            <label class="fx-check" for="fx-clone-ascii-invert"><span>Invert</span><input id="fx-clone-ascii-invert" type="checkbox"></label>
+                        </div>
+                        <div class="fx-note">Full takeover — disables all other post-FX.</div>
+                    </section>
                 </div>
             `;
 
@@ -5246,7 +5410,7 @@
                     // Clay owns the live FX state — reset the snapshot so exit restores to defaults
                     clayPreFxSnapshot = { ssgi: false, ssr: false, gtao: false, bloom: false,
                         toonOutline: false, motionBlur: false, traa: false, contactShadow: false,
-                        retro: false, volumetric: false, pixel: false, fog: false, opaqueBackdrop: false };
+                        retro: false, volumetric: false, pixel: false, fog: false, opaqueBackdrop: false, clone: false };
                     // Still push default values so they're ready when clay exits
                     for (const section of postFxSections) {
                         if (defaults[section.key]) section.setValues(defaults[section.key]);
@@ -5261,6 +5425,10 @@
                 currentExposure = 1.0;
                 currentAAMode = 'msaa';
                 ssgiFx.setTRAAEnabled(false);
+                ssgiFx.setCloneEnabled(false);
+                ssgiFx.setCloneOptions({ threshold: 0.53, blurRadius: 0, minBlobSize: 0, opacity: 1.0, gridDensity: 0, smoothing: 0.75, invert: false, source: 'luma' });
+                if (asciiActive) exitAsciiMode();
+                asciiSettings = { resolution: 0.15, color: 'white', invert: false };
                 performanceSettings = { ...PERFORMANCE_DEFAULTS };
                 applyRendererPerformanceSettings({ resizePostFx: true });
                 renderer.toneMapping = toneMappingModes[currentToneMapping];
@@ -5414,6 +5582,115 @@
             hdriFlipCheck.checked = localHdriFlip;
             syncHdriPanel();
 
+            // Clone blob tracker controls
+            {
+                const cloneToggle = document.getElementById('fx-toggle-clone');
+                const cloneSource = document.getElementById('fx-clone-source');
+                const cloneSliders = ['threshold', 'blurRadius', 'minBlobSize', 'gridDensity', 'smoothing', 'opacity'];
+
+                cloneToggle.onclick = () => {
+                    const enabled = ssgiFx.setCloneEnabled(!ssgiFx.isCloneEnabled());
+                    cloneToggle.textContent = enabled ? 'On' : 'Off';
+                    cloneToggle.classList.toggle('active', enabled);
+                    syncPostFxPanel(true);
+                };
+                cloneSource.onchange = () => {
+                    ssgiFx.setCloneOptions({ source: cloneSource.value });
+                    savePostFxState();
+                };
+                for (const key of cloneSliders) {
+                    const input = document.getElementById(`fx-clone-${key}`);
+                    const valEl = document.getElementById(`fx-clone-${key}-val`);
+                    input.oninput = () => {
+                        const v = Number(input.value);
+                        ssgiFx.setCloneOptions({ [key]: v });
+                        if (valEl) valEl.textContent = v >= 1 ? String(Math.round(v)) : v.toFixed(2);
+                    };
+                    input.onchange = () => savePostFxState();
+                }
+                const invertCheck = document.getElementById('fx-clone-invert');
+                invertCheck.onchange = () => {
+                    ssgiFx.setCloneOptions({ invert: invertCheck.checked });
+                    savePostFxState();
+                };
+
+                // Playstation Wobble controls (drives retro.wiggle / retro.affineDistortion)
+                const wobbleToggle = document.getElementById('fx-toggle-wobble');
+                const snapGridSlider = document.getElementById('fx-clone-snapGrid');
+                const snapGridVal = document.getElementById('fx-clone-snapGrid-val');
+                wobbleToggle.onclick = () => {
+                    const retro = ssgiFx.getState().retro;
+                    const next = !retro.wiggle;
+                    ssgiFx.setRetroOptions({ wiggle: next });
+                    if (next && !ssgiFx.isRetroEnabled()) ssgiFx.setRetroEnabled(true);
+                    wobbleToggle.textContent = next ? 'On' : 'Off';
+                    wobbleToggle.classList.toggle('active', next);
+                    savePostFxState();
+                    syncPostFxPanel(true);
+                };
+                snapGridSlider.oninput = () => {
+                    const v = Number(snapGridSlider.value);
+                    ssgiFx.setRetroOptions({ affineDistortion: v });
+                    snapGridVal.textContent = v.toFixed(1);
+                };
+                snapGridSlider.onchange = () => savePostFxState();
+
+                // ASCII controls
+                const asciiToggle = document.getElementById('fx-toggle-ascii');
+                const asciiResSlider = document.getElementById('fx-clone-ascii-resolution');
+                const asciiResVal = document.getElementById('fx-clone-ascii-resolution-val');
+                const asciiColorSelect = document.getElementById('fx-clone-ascii-color');
+                const asciiInvertCheck = document.getElementById('fx-clone-ascii-invert');
+                asciiToggle.onclick = () => {
+                    if (asciiActive) exitAsciiMode(); else enterAsciiMode();
+                    asciiToggle.textContent = asciiActive ? 'On' : 'Off';
+                    asciiToggle.classList.toggle('active', asciiActive);
+                    syncPostFxPanel(true);
+                };
+                asciiResSlider.oninput = () => {
+                    asciiSettings.resolution = Number(asciiResSlider.value);
+                    asciiResVal.textContent = asciiSettings.resolution.toFixed(2);
+                    if (asciiActive) rebuildAsciiEffect();
+                };
+                asciiResSlider.onchange = () => savePostFxState();
+                asciiColorSelect.onchange = () => {
+                    asciiSettings.color = asciiColorSelect.value;
+                    if (asciiActive) rebuildAsciiEffect();
+                    savePostFxState();
+                };
+                asciiInvertCheck.onchange = () => {
+                    asciiSettings.invert = asciiInvertCheck.checked;
+                    if (asciiActive) rebuildAsciiEffect();
+                    savePostFxState();
+                };
+
+                syncClonePanelFn = () => {
+                    const s = ssgiFx.getState().clone;
+                    cloneToggle.textContent = s.enabled ? 'On' : 'Off';
+                    cloneToggle.classList.toggle('active', s.enabled);
+                    cloneSource.value = s.source;
+                    for (const key of cloneSliders) {
+                        const input = document.getElementById(`fx-clone-${key}`);
+                        const valEl = document.getElementById(`fx-clone-${key}-val`);
+                        if (input) input.value = s[key];
+                        if (valEl) valEl.textContent = s[key] >= 1 ? String(Math.round(s[key])) : s[key].toFixed(2);
+                    }
+                    invertCheck.checked = !!s.invert;
+                    const retro = ssgiFx.getState().retro;
+                    wobbleToggle.textContent = retro.wiggle ? 'On' : 'Off';
+                    wobbleToggle.classList.toggle('active', retro.wiggle);
+                    snapGridSlider.value = retro.affineDistortion;
+                    snapGridVal.textContent = retro.affineDistortion.toFixed(1);
+                    asciiToggle.textContent = asciiActive ? 'On' : 'Off';
+                    asciiToggle.classList.toggle('active', asciiActive);
+                    asciiResSlider.value = asciiSettings.resolution;
+                    asciiResVal.textContent = asciiSettings.resolution.toFixed(2);
+                    asciiColorSelect.value = asciiSettings.color;
+                    asciiInvertCheck.checked = asciiSettings.invert;
+                };
+                syncClonePanelFn();
+            }
+
             for (const section of postFxSections) {
                 section.toggleEl = document.getElementById(`fx-toggle-${section.key}`);
                 section.noteEl = document.getElementById(`fx-note-${section.key}`);
@@ -5558,6 +5835,7 @@
                 section.noteEl.classList.toggle('error', isError);
             }
 
+            if (syncClonePanelFn) syncClonePanelFn();
             savePostFxState();
         }
 
@@ -5594,6 +5872,7 @@
                     optimizeMaxInstances: performanceSettings.optimizeMaxInstances,
                     maxInstanceBucketThreshold: performanceSettings.maxInstanceBucketThreshold,
                 },
+                ascii: { enabled: asciiActive, ...asciiSettings },
             };
         }
 
@@ -5681,6 +5960,23 @@
                     section.setValues(saved);
                     // Then enable/disable
                     if (wasEnabled) section.setEnabled(true);
+                }
+
+                // Clone blob tracker restore
+                if (fx.clone) {
+                    const cl = fx.clone;
+                    const wasEnabled = cl.enabled;
+                    delete cl.enabled;
+                    ssgiFx.setCloneOptions(cl);
+                    if (wasEnabled) ssgiFx.setCloneEnabled(true);
+                }
+
+                // ASCII restore
+                if (saved.ascii) {
+                    if (Number.isFinite(saved.ascii.resolution)) asciiSettings.resolution = saved.ascii.resolution;
+                    if (saved.ascii.color) asciiSettings.color = saved.ascii.color;
+                    if (typeof saved.ascii.invert === 'boolean') asciiSettings.invert = saved.ascii.invert;
+                    if (saved.ascii.enabled) enterAsciiMode();
                 }
             } catch (e) {
                 console.warn('MaxJS: failed to apply post-FX state', e);
@@ -6018,13 +6314,21 @@
             perfHud.updateLayers(layerManager.getStats());
             const renderStart = performance.now();
             try {
-                if (xrRuntime.shouldBypassPostFx) {
+                if (asciiActive && asciiEffect) {
+                    asciiEffect.render(scene, camera);
+                } else if (xrRuntime.shouldBypassPostFx) {
                     renderer.render(scene, camera);
                 } else {
                     ssgiFx.render();
                 }
             } catch (error) {
                 reportBridgeError('runtime error', error);
+            }
+            // Clone blob overlay — draw bounding rects on 2D canvas
+            if (ssgiFx.isCloneEnabled() && !renderToImageActive) {
+                ssgiFx.drawBlobOverlay(blobOverlayCtx, blobOverlayCvs.width, blobOverlayCvs.height);
+            } else if (blobOverlayCtx) {
+                blobOverlayCtx.clearRect(0, 0, blobOverlayCvs.width, blobOverlayCvs.height);
             }
             if (splatOverlay && splatHandleMap.size > 0) {
                 updateSplatCamera();

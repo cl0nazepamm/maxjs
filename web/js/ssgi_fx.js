@@ -254,6 +254,18 @@ export function createSSGIController({
             green: hiddenBackground.g,
             blue: hiddenBackground.b,
         },
+        clone: {
+            enabled: false,
+            source: 'luma',          // 'luma', 'depth'
+            threshold: 0.53,
+            blurRadius: 0,           // box blur radius on the 64x64 analysis grid
+            minBlobSize: 0,          // minimum blob area (0-1 of screen)
+            color: [0.0, 1.0, 0.6], // reserved for future use
+            opacity: 1.0,
+            gridDensity: 0,          // subdivision grid (0=off, 2-8=lines)
+            smoothing: 0.75,         // lerp factor (0=frozen, 1=instant snap)
+            invert: false,           // invert threshold (track dark regions)
+        },
     };
 
     let selectedObjects = [];
@@ -271,6 +283,230 @@ export function createSSGIController({
     const dofBokehScaleU = uniform(5);
     let hiddenDuringPost = [];
     let forceEnvironmentBackground = false;
+
+    // Clone blob analysis (CPU side — tiny 64x64 readback + CCL)
+    const BLOB_W = 64, BLOB_H = 64;
+    let blobCvs = null, blobCtx = null;
+    try {
+        blobCvs = typeof OffscreenCanvas !== 'undefined'
+            ? new OffscreenCanvas(BLOB_W, BLOB_H)
+            : (() => { const c = document.createElement('canvas'); c.width = BLOB_W; c.height = BLOB_H; return c; })();
+        blobCtx = blobCvs.getContext('2d', { willReadFrequently: true });
+    } catch {}
+    let lastBlobs = [];      // raw CCL output
+    let stableBlobs = [];    // temporally smoothed blobs for rendering
+    let nextStableId = 0;
+    let blobSkip = 0;
+    const BLOB_SMOOTH_DEFAULT = 0.25;
+    const BLOB_MATCH_DIST = 0.3;    // max centroid distance to match (normalized)
+    const BLOB_FADE_FRAMES = 8;     // frames before an unmatched blob disappears
+
+    function matchAndSmooth(rawBlobs) {
+        const lerp = state.clone.smoothing;
+        const used = new Set();
+
+        // Match each stable blob to the nearest raw blob by centroid
+        for (const sb of stableBlobs) {
+            let bestDist = BLOB_MATCH_DIST;
+            let bestRaw = null;
+            let bestIdx = -1;
+            for (let i = 0; i < rawBlobs.length; i++) {
+                if (used.has(i)) continue;
+                const dx = rawBlobs[i].cx - sb.cx;
+                const dy = rawBlobs[i].cy - sb.cy;
+                const dist = Math.sqrt(dx * dx + dy * dy);
+                if (dist < bestDist) {
+                    bestDist = dist;
+                    bestRaw = rawBlobs[i];
+                    bestIdx = i;
+                }
+            }
+            if (bestRaw) {
+                used.add(bestIdx);
+                sb.x += (bestRaw.x - sb.x) * lerp;
+                sb.y += (bestRaw.y - sb.y) * lerp;
+                sb.w += (bestRaw.w - sb.w) * lerp;
+                sb.h += (bestRaw.h - sb.h) * lerp;
+                sb.cx += (bestRaw.cx - sb.cx) * lerp;
+                sb.cy += (bestRaw.cy - sb.cy) * lerp;
+                sb.area += (bestRaw.area - sb.area) * lerp;
+                sb.ttl = BLOB_FADE_FRAMES;
+            } else {
+                sb.ttl--;
+            }
+        }
+
+        // Remove dead blobs
+        stableBlobs = stableBlobs.filter(sb => sb.ttl > 0);
+
+        // Spawn new blobs for unmatched raw detections
+        for (let i = 0; i < rawBlobs.length; i++) {
+            if (used.has(i)) continue;
+            stableBlobs.push({
+                ...rawBlobs[i],
+                id: nextStableId++,
+                ttl: BLOB_FADE_FRAMES,
+            });
+        }
+
+        // Update lastBlobs for external consumers
+        lastBlobs = stableBlobs.map(sb => ({
+            x: sb.x, y: sb.y, w: sb.w, h: sb.h,
+            cx: sb.cx, cy: sb.cy, area: sb.area,
+            id: sb.id,
+            opacity: Math.min(sb.ttl / BLOB_FADE_FRAMES, 1),
+        }));
+    }
+
+    // Two-pass union-find CCL on a binary image → bounding box list
+    function runCCL(data, w, h, threshold, invert, minAreaPx, sourceMode, blurRadius) {
+        // Extract luminance/depth from RGBA pixels
+        const luma = new Float32Array(w * h);
+        for (let i = 0; i < w * h; i++) {
+            const r = data[i * 4], g = data[i * 4 + 1], b = data[i * 4 + 2];
+            luma[i] = sourceMode === 'depth'
+                ? r / 255
+                : (r * 0.2126 + g * 0.7152 + b * 0.0722) / 255;
+        }
+
+        // Box blur to merge nearby blobs (fast separable 1D passes, fractional radius via lerp)
+        const radClamped = Math.max(0, Math.min(blurRadius, 16));
+        if (radClamped > 0) {
+            const radLo = Math.floor(radClamped);
+            const radHi = Math.ceil(radClamped);
+            const frac = radClamped - radLo;
+
+            function boxBlur1D(src, dst, r) {
+                if (r <= 0) { dst.set(src); return; }
+                const kern = 2 * r + 1;
+                const tmp = new Float32Array(w * h);
+                for (let y = 0; y < h; y++) {
+                    let sum = 0;
+                    for (let x = 0; x < Math.min(r, w); x++) sum += src[y * w + x];
+                    for (let x = 0; x < w; x++) {
+                        if (x + r < w) sum += src[y * w + x + r];
+                        if (x - r - 1 >= 0) sum -= src[y * w + x - r - 1];
+                        tmp[y * w + x] = sum / kern;
+                    }
+                }
+                for (let x = 0; x < w; x++) {
+                    let sum = 0;
+                    for (let y = 0; y < Math.min(r, h); y++) sum += tmp[y * w + x];
+                    for (let y = 0; y < h; y++) {
+                        if (y + r < h) sum += tmp[(y + r) * w + x];
+                        if (y - r - 1 >= 0) sum -= tmp[(y - r - 1) * w + x];
+                        dst[y * w + x] = sum / kern;
+                    }
+                }
+            }
+
+            if (frac < 0.001 || radLo === radHi) {
+                boxBlur1D(luma, luma, radLo);
+            } else {
+                const lo = new Float32Array(w * h);
+                const hi = new Float32Array(w * h);
+                boxBlur1D(luma, lo, radLo);
+                boxBlur1D(luma, hi, radHi);
+                for (let i = 0; i < w * h; i++) luma[i] = lo[i] + (hi[i] - lo[i]) * frac;
+            }
+        }
+
+        // Threshold to binary
+        const binary = new Uint8Array(w * h);
+        for (let i = 0; i < w * h; i++) {
+            binary[i] = (invert ? luma[i] < threshold : luma[i] > threshold) ? 1 : 0;
+        }
+
+        const labels = new Int32Array(w * h).fill(-1);
+        const parent = [];
+        let nextLabel = 0;
+
+        const find = (x) => {
+            while (parent[x] !== x) { parent[x] = parent[parent[x]]; x = parent[x]; }
+            return x;
+        };
+        const union = (a, b) => {
+            a = find(a); b = find(b);
+            if (a !== b) parent[Math.max(a, b)] = Math.min(a, b);
+        };
+
+        // Pass 1: assign labels with neighbor merge
+        for (let y = 0; y < h; y++) {
+            for (let x = 0; x < w; x++) {
+                const idx = y * w + x;
+                if (!binary[idx]) continue;
+                const up = y > 0 ? labels[(y - 1) * w + x] : -1;
+                const left = x > 0 ? labels[y * w + x - 1] : -1;
+                if (up >= 0 && left >= 0) {
+                    labels[idx] = Math.min(up, left);
+                    union(up, left);
+                } else if (up >= 0) {
+                    labels[idx] = up;
+                } else if (left >= 0) {
+                    labels[idx] = left;
+                } else {
+                    parent.push(nextLabel);
+                    labels[idx] = nextLabel++;
+                }
+            }
+        }
+
+        // Pass 2: resolve labels → bounding boxes
+        const blobs = new Map();
+        for (let y = 0; y < h; y++) {
+            for (let x = 0; x < w; x++) {
+                const idx = y * w + x;
+                if (labels[idx] < 0) continue;
+                const root = find(labels[idx]);
+                let b = blobs.get(root);
+                if (!b) { b = { minX: x, minY: y, maxX: x, maxY: y, area: 0, sumX: 0, sumY: 0 }; blobs.set(root, b); }
+                if (x < b.minX) b.minX = x;
+                if (y < b.minY) b.minY = y;
+                if (x > b.maxX) b.maxX = x;
+                if (y > b.maxY) b.maxY = y;
+                b.area++;
+                b.sumX += x;
+                b.sumY += y;
+            }
+        }
+
+        // Filter + normalize to 0-1 range
+        const result = [];
+        for (const [, b] of blobs) {
+            if (b.area < minAreaPx) continue;
+            // Kill blobs that are too large
+            const bboxW = (b.maxX - b.minX + 1) / w;
+            const bboxH = (b.maxY - b.minY + 1) / h;
+            if (b.area > w * h * 0.4) continue;
+            if (bboxW > 0.85 || bboxH > 0.85) continue;
+            if (bboxW * bboxH > 0.5) continue;
+            result.push({
+                x: b.minX / w,
+                y: b.minY / h,
+                w: (b.maxX - b.minX + 1) / w,
+                h: (b.maxY - b.minY + 1) / h,
+                area: b.area / (w * h),
+                cx: (b.sumX / b.area) / w,
+                cy: (b.sumY / b.area) / h,
+                id: result.length,
+            });
+        }
+        return result.sort((a, b) => b.area - a.area);
+    }
+
+    function analyzeBlobsFromCanvas() {
+        if (!blobCtx || !renderer.domElement) return;
+        try {
+            blobCtx.drawImage(renderer.domElement, 0, 0, BLOB_W, BLOB_H);
+            const imgData = blobCtx.getImageData(0, 0, BLOB_W, BLOB_H);
+            const cl = state.clone;
+            const minAreaPx = cl.minBlobSize * BLOB_W * BLOB_H;
+            const rawBlobs = runCCL(imgData.data, BLOB_W, BLOB_H, cl.threshold, cl.invert, minAreaPx, cl.source, cl.blurRadius);
+            matchAndSmooth(rawBlobs);
+        } catch {
+            lastBlobs = [];
+        }
+    }
     let forcedContactShadowLightState = null;
 
     // Cache objects that need hiding during post pass — rebuilt on pipeline rebuild only
@@ -447,6 +683,7 @@ export function createSSGIController({
             volumetric: { ...state.volumetric },
             dof: { ...state.dof },
             opaqueBackdrop: { ...state.opaqueBackdrop },
+            clone: { ...state.clone, color: [...state.clone.color] },  // blob tracker (CPU-only, no GPU pipeline)
         };
     }
 
@@ -1542,6 +1779,29 @@ export function createSSGIController({
             return { ...state.opaqueBackdrop };
         },
 
+        // ── Clone Blob Tracker ──
+
+        isCloneEnabled() {
+            return state.clone.enabled;
+        },
+        setCloneEnabled(enabled) {
+            state.clone.enabled = !!enabled;
+            if (!enabled) { lastBlobs = []; stableBlobs = []; }
+            return state.clone.enabled;
+        },
+        setCloneOptions(options = {}) {
+            if (typeof options.source === 'string') state.clone.source = options.source;
+            assignFinite(state.clone, 'threshold', options.threshold);
+            assignFinite(state.clone, 'blurRadius', options.blurRadius);
+            assignFinite(state.clone, 'minBlobSize', options.minBlobSize);
+            if (typeof options.invert === 'boolean') state.clone.invert = options.invert;
+            assignFinite(state.clone, 'opacity', options.opacity);
+            assignFinite(state.clone, 'gridDensity', options.gridDensity);
+            assignFinite(state.clone, 'smoothing', options.smoothing);
+            if (Array.isArray(options.color)) state.clone.color = options.color;
+            return { ...state.clone };
+        },
+
         render() {
             // Update fog timer for procedural animation
             if (fogAnimationActive) {
@@ -1554,6 +1814,10 @@ export function createSSGIController({
 
             if (!hasAnyEffectEnabled() || !pipelineReady) {
                 renderer.render(scene, camera);
+                // Clone blob analysis still runs even without post-processing pipeline
+                if (state.clone.enabled && blobCtx) {
+                    if (++blobSkip >= 2) { blobSkip = 0; analyzeBlobsFromCanvas(); }
+                }
                 return;
             }
 
@@ -1579,7 +1843,87 @@ export function createSSGIController({
                     scene.background = originalBackground;
                 }
             }
+
+            // Clone blob analysis — readback tiny canvas + CCL every 2 frames
+            if (state.clone.enabled && blobCtx) {
+                if (++blobSkip >= 2) {
+                    blobSkip = 0;
+                    analyzeBlobsFromCanvas();
+                }
+            } else {
+                lastBlobs = [];
+                stableBlobs = [];
+            }
         },
+
+        getBlobs() {
+            return lastBlobs;
+        },
+
+        drawBlobOverlay(ctx, canvasW, canvasH) {
+            ctx.clearRect(0, 0, canvasW, canvasH);
+            if (!state.clone.enabled || lastBlobs.length === 0) return;
+            const cl = state.clone;
+            const a = cl.opacity;
+            const density = cl.gridDensity;
+
+            ctx.font = '10px "Segoe UI", system-ui, monospace';
+
+            for (const blob of lastBlobs) {
+                const ba = a * (blob.opacity != null ? blob.opacity : 1);
+                if (ba < 0.01) continue;
+                const bx = blob.x * canvasW;
+                const by = blob.y * canvasH;
+                const bw = blob.w * canvasW;
+                const bh = blob.h * canvasH;
+                const ccx = blob.cx * canvasW;
+                const ccy = blob.cy * canvasH;
+
+                // ── Subdivision grid inside the blob rect ──
+                if (density >= 2) {
+                    ctx.strokeStyle = `rgba(255,255,255,${ba * 0.15})`;
+                    ctx.lineWidth = 1;
+                    ctx.beginPath();
+                    for (let i = 1; i < density; i++) {
+                        const gx = bx + (bw * i / density);
+                        ctx.moveTo(gx, by); ctx.lineTo(gx, by + bh);
+                        const gy = by + (bh * i / density);
+                        ctx.moveTo(bx, gy); ctx.lineTo(bx + bw, gy);
+                    }
+                    ctx.stroke();
+                }
+
+                // ── Main bounding rectangle ──
+                ctx.strokeStyle = `rgba(255,255,255,${ba})`;
+                ctx.lineWidth = 2;
+                ctx.strokeRect(bx, by, bw, bh);
+
+                // ── Corner brackets ──
+                const bracketLen = Math.min(bw, bh, 14) * 0.35;
+                ctx.lineWidth = 2.5;
+                ctx.beginPath();
+                ctx.moveTo(bx, by + bracketLen); ctx.lineTo(bx, by); ctx.lineTo(bx + bracketLen, by);
+                ctx.moveTo(bx + bw - bracketLen, by); ctx.lineTo(bx + bw, by); ctx.lineTo(bx + bw, by + bracketLen);
+                ctx.moveTo(bx + bw, by + bh - bracketLen); ctx.lineTo(bx + bw, by + bh); ctx.lineTo(bx + bw - bracketLen, by + bh);
+                ctx.moveTo(bx + bracketLen, by + bh); ctx.lineTo(bx, by + bh); ctx.lineTo(bx, by + bh - bracketLen);
+                ctx.stroke();
+
+                // ── Centroid crosshair ──
+                ctx.strokeStyle = `rgba(255,255,255,${ba})`;
+                ctx.lineWidth = 1.5;
+                const crossSize = 6;
+                ctx.beginPath();
+                ctx.moveTo(ccx - crossSize, ccy); ctx.lineTo(ccx + crossSize, ccy);
+                ctx.moveTo(ccx, ccy - crossSize); ctx.lineTo(ccx, ccy + crossSize);
+                ctx.stroke();
+
+                // ── Label ──
+                ctx.fillStyle = `rgba(255,255,255,${ba * 0.9})`;
+                const areaPercent = (blob.area * 100).toFixed(1);
+                ctx.fillText(`#${blob.id} ${areaPercent}%`, bx + 3, by - 4);
+            }
+        },
+
         resize() {
             // Post-processing handles resize internally — no need to force recompile
         },

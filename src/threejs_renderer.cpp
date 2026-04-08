@@ -8,7 +8,6 @@
 extern HINSTANCE hInstance;
 
 // Forward — panel access from maxjs_main.cpp
-extern void ToggleMaxJSPanel();
 extern void EnsureMaxJSPanel();
 extern void StartMaxJSActiveShade(Bitmap* target);
 extern void StopMaxJSActiveShade();
@@ -37,7 +36,7 @@ public:
     void BeginSession() override {
         rendering_ = true;
         // Ensure panel exists
-        ToggleMaxJSPanel();
+        EnsureMaxJSPanel();
         // Reparent WebView2 into the viewport — true GPU compositing
         if (ownerWnd_)
             ReparentMaxJSPanel(ownerWnd_);

@@ -548,6 +548,7 @@
         import { createSSGIController } from './js/ssgi_fx.js';
         import { createLayerManager } from './js/layer_manager.js';
         import { createMaxJSAnimationSystem } from './js/maxjs_animation.js';
+        import { createMaxJSAudioSystem } from './js/maxjs_audio.js';
         import { createProjectRuntime } from './js/project_runtime.js';
 
 
@@ -807,6 +808,7 @@
         const maxInstanceBuckets = new Map(); // bucketKey -> { mesh, materialKey, sourceHandle, handles:Set, handleToIndex:Map, transforms:Map, visible:Map }
         const maxInstanceHandleToBucket = new Map(); // handle -> bucketKey
         let animationSystem = null;
+        let audioSystem = null;
         const splatHandleMap = new Map();
         const splatMatrix = new THREE_STD.Matrix4();
         const splatPosition = new THREE_STD.Vector3();
@@ -3028,6 +3030,7 @@
             if (snapshot.fog) ssgiFx.setFogFromScene(snapshot.fog);
             if (snapshot.lights) applyLights(snapshot.lights);
             reconcileSplats(snapshot.splats ?? []);
+            audioSystem?.applyAudios(snapshot.audios ?? []);
             applyForestInstances(snapshot.forestInstances);
             applyVolumes(snapshot.volumes);
             buildMaxInstanceBuckets(snapshot.nodes);
@@ -3221,6 +3224,7 @@
             }
             if (msg.lights) applyLightUpdates(msg.lights);
             if (msg.splats) applySplatUpdates(msg.splats);
+            if (msg.audios) audioSystem?.applyAudioUpdates(msg.audios);
             if (msg.camera) applyCamera(msg.camera);
             const applyMs = performance.now() - applyStart;
             updateSyncHud({
@@ -4267,6 +4271,7 @@
             includeFog: true,
             includeLights: true,
             includeSplats: true,
+            includeAudios: true,
             includeInstances: true,
             includeSnapshotUi: true,
             includeRuntimeScene: true,
@@ -4384,6 +4389,7 @@
                             <label class="fx-check" for="snapshot-includeFog"><span>Fog</span><input id="snapshot-includeFog" type="checkbox"></label>
                             <label class="fx-check" for="snapshot-includeLights"><span>Lights</span><input id="snapshot-includeLights" type="checkbox"></label>
                             <label class="fx-check" for="snapshot-includeSplats"><span>Splats</span><input id="snapshot-includeSplats" type="checkbox"></label>
+                            <label class="fx-check" for="snapshot-includeAudios"><span>Audio</span><input id="snapshot-includeAudios" type="checkbox"></label>
                             <label class="fx-check" for="snapshot-includeInstances"><span>Instances</span><input id="snapshot-includeInstances" type="checkbox"></label>
                             <label class="fx-check" for="snapshot-includeSnapshotUi"><span>Viewer UI State</span><input id="snapshot-includeSnapshotUi" type="checkbox"></label>
                             <label class="fx-check" for="snapshot-includeRuntimeScene"><span>JS Runtime Scene</span><input id="snapshot-includeRuntimeScene" type="checkbox"></label>
@@ -6007,6 +6013,7 @@
             updateVolumeUniforms();
             layerManager.update(frameDt, frameElapsed);
             animationSystem?.update(frameDt);
+            audioSystem?.update();
 
             perfHud.updateLayers(layerManager.getStats());
             const renderStart = performance.now();
@@ -6080,6 +6087,11 @@
             buildGeometry,
             applyMaterialScalar,
         });
+        audioSystem = createMaxJSAudioSystem({
+            THREE,
+            parent: maxBasisRoot,
+            getActiveCamera: () => renderer.xr?.isPresenting ? renderer.xr.getCamera(camera) : camera,
+        });
         layerManager.subscribe?.(() => animationSystem.invalidateTargets());
         const projectRuntime = window.chrome?.webview
             ? createProjectRuntime({ layerManager, bridge, perfHud })
@@ -6090,6 +6102,7 @@
         window.maxJSProjectRuntime = projectRuntime;
         window.maxJS.layers = layerManager;
         window.maxJS.animation = animationSystem;
+        window.maxJS.audio = audioSystem;
         _layerManagerRef = layerManager;
         _projectRuntimeRef = projectRuntime;
         attachLayerPanelSubscriptions();

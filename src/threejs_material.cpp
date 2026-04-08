@@ -160,6 +160,7 @@ public:
     explicit ThreeJSMtl(BOOL loading, ThreeJSMaterialKind kind)
         : kind_(kind) {
         GetDescriptor()->MakeAutoParamBlocks(this);
+        texHandleValid_.SetEmpty();
     }
 
     ~ThreeJSMtl() override {
@@ -193,6 +194,7 @@ public:
 
     RefResult NotifyRefChanged(const Interval&, RefTargetHandle, PartID& partID, RefMessage msg, BOOL) override {
         if (msg == REFMSG_CHANGE) {
+            DiscardTexHandle();
             if ((kind_ == ThreeJSMaterialKind::Utility && partID == static_cast<PartID>(pb_utility_model)) ||
                 (kind_ == ThreeJSMaterialKind::Physical && partID == static_cast<PartID>(pb_material_mode))) {
                 NotifyDependents(FOREVER, PART_ALL, REFMSG_SUBANIM_STRUCTURE_CHANGED);
@@ -242,25 +244,71 @@ public:
         }
     }
 
-    BOOL SupportTexDisplay() override { return FALSE; }
+    BOOL SupportTexDisplay() override {
+        return GetViewportColorTexmap() != nullptr || GetViewportOpacityTexmap() != nullptr;
+    }
 
     void ActivateTexDisplay(BOOL onoff) override {
-        texDisplayOn_ = false;
+        texDisplayOn_ = onoff ? true : false;
         DiscardTexHandle();
+        if (!texDisplayOn_) {
+            SetActiveTexmap(nullptr);
+            return;
+        }
+
+        if (Texmap* colorMap = GetViewportColorTexmap()) {
+            SetActiveTexmap(colorMap);
+        } else {
+            SetActiveTexmap(GetViewportOpacityTexmap());
+        }
     }
 
     DWORD_PTR GetActiveTexHandle(TimeValue t, TexHandleMaker& thmaker) override {
+        if (!texDisplayOn_) return 0;
+
+        Texmap* viewportMap = GetViewportColorTexmap();
+        if (!viewportMap) viewportMap = GetViewportOpacityTexmap();
+        if (!viewportMap) {
+            DiscardTexHandle();
+            SetActiveTexmap(nullptr);
+            return 0;
+        }
+
+        SetActiveTexmap(viewportMap);
+
+        const DWORD_PTR delegatedHandle = viewportMap->GetActiveTexHandle(t, thmaker);
+        if (delegatedHandle) return delegatedHandle;
+
+        if (texHandle_ && texHandleValid_.InInterval(t)) {
+            return texHandle_->GetHandle();
+        }
+
         DiscardTexHandle();
-        return 0;
+        BITMAPINFO* dib = viewportMap->GetVPDisplayDIB(t, thmaker, texHandleValid_);
+        if (!dib) return 0;
+
+        texHandle_ = thmaker.MakeHandle(dib);
+        return texHandle_ ? texHandle_->GetHandle() : 0;
     }
 
     ULONG Requirements(int subMtlNum) override {
-        return 0;
+        ULONG requirements = 0;
+        if (Texmap* colorMap = GetViewportColorTexmap()) {
+            requirements |= colorMap->Requirements(subMtlNum);
+        }
+        if (Texmap* opacityMap = GetViewportOpacityTexmap()) {
+            requirements |= opacityMap->Requirements(subMtlNum);
+        }
+        return requirements;
     }
 
     void SetupTextures(TimeValue t, MaxSDK::Graphics::DisplayTextureHelper& updater) override {
-        (void)t;
-        (void)updater;
+        if (Texmap* colorMap = GetViewportColorTexmap()) {
+            updater.UpdateTextureMapInfo(t, MaxSDK::Graphics::ISimpleMaterial::UsageDiffuse, colorMap);
+        }
+        if (Texmap* opacityMap = GetViewportOpacityTexmap()) {
+            updater.UpdateTextureMapInfo(t, MaxSDK::Graphics::ISimpleMaterial::UsageOpacity, opacityMap);
+        }
     }
 
     BaseInterface* GetInterface(Interface_ID id) override {
@@ -347,11 +395,30 @@ private:
         return visibleSlots.slots[visibleIndex];
     }
 
+    Texmap* GetViewportColorTexmap() const {
+        if (!pblock || !HasParam(pblock, pb_color_map)) return nullptr;
+        if (HasParam(pblock, pb_color_map_strength) &&
+            GetOptionalFloat(pblock, pb_color_map_strength, 0, 1.0f) <= 0.0f) {
+            return nullptr;
+        }
+        return pblock->GetTexmap(pb_color_map);
+    }
+
+    Texmap* GetViewportOpacityTexmap() const {
+        if (!pblock || !HasParam(pblock, pb_opacity_map)) return nullptr;
+        if (HasParam(pblock, pb_opacity_map_strength) &&
+            GetOptionalFloat(pblock, pb_opacity_map_strength, 0, 1.0f) <= 0.0f) {
+            return nullptr;
+        }
+        return pblock->GetTexmap(pb_opacity_map);
+    }
+
     void DiscardTexHandle() {
         if (texHandle_) {
             texHandle_->DeleteThis();
             texHandle_ = nullptr;
         }
+        texHandleValid_.SetEmpty();
     }
 
     ClassDesc2* GetDescriptor() const {
@@ -365,6 +432,7 @@ private:
 
     bool texDisplayOn_ = false;
     TexHandle* texHandle_ = nullptr;
+    Interval texHandleValid_;
     ThreeJSMaterialKind kind_ = ThreeJSMaterialKind::Physical;
 };
 

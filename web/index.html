@@ -2480,6 +2480,7 @@
             if (Number.isFinite(partial.frameId) && partial.frameId > 0) {
                 latestAppliedSyncFrame = Math.max(latestAppliedSyncFrame, partial.frameId);
             }
+            if (!debugMode) return;
             perfHud.updateSync({
                 transport: partial.transport ?? transportMode,
                 frameId: partial.frameId ?? 0,
@@ -2971,6 +2972,40 @@
             }
         }
 
+        function profileSceneNodes(nodes) {
+            if (!debugMode) return;
+            const stats = [];
+            for (const nd of nodes) {
+                const mesh = nodeMap.get(nd.h);
+                if (!mesh) continue;
+                const verts = nd.geo?.vN || nd.v?.length || 0;
+                const matCount = Array.isArray(mesh.material) ? mesh.material.length : 1;
+                const geom = mesh.geometry;
+                const triCount = geom?.index
+                    ? Math.floor(geom.index.count / 3)
+                    : Math.floor((geom?.attributes?.position?.count || 0) / 3);
+                stats.push({
+                    name: nd.n || `h:${nd.h}`,
+                    handle: nd.h,
+                    verts: Math.floor(verts / 3),
+                    tris: triCount,
+                    materials: matCount,
+                    instOf: nd.instOf || 0,
+                    skinned: !!nd.skin,
+                    spline: !!nd.spline,
+                });
+            }
+            if (stats.length === 0) return;
+            stats.sort((a, b) => b.tris - a.tris);
+            const top = stats.slice(0, 10);
+            console.groupCollapsed(`[MaxJS Profile] ${stats.length} nodes, top 10 by tri count`);
+            console.table(top);
+            const totalTris = stats.reduce((s, n) => s + n.tris, 0);
+            const totalVerts = stats.reduce((s, n) => s + n.verts, 0);
+            console.log(`Total: ${totalVerts} verts, ${totalTris} tris, ${stats.length} nodes`);
+            console.groupEnd();
+        }
+
         function finalizeSceneSnapshot(snapshot, transport, applyStart, producerBytes, options = {}) {
             if (snapshot.camera) applyCamera(snapshot.camera);
             if (!isLocalHdriLoaded()) {
@@ -2983,6 +3018,7 @@
             applyForestInstances(snapshot.forestInstances);
             applyVolumes(snapshot.volumes);
             buildMaxInstanceBuckets(snapshot.nodes);
+            profileSceneNodes(snapshot.nodes);
             scene.updateMatrixWorld(true);
             options.afterWorldUpdate?.();
 
@@ -4851,10 +4887,8 @@
                 getValues: (state) => state.retro,
                 setValues: (patch) => ssgiFx.setRetroOptions(patch),
                 controls: [
-                    { key: 'wiggle', label: 'Wiggle (PS1)', type: 'checkbox' },
-                    { key: 'affineDistortion', label: 'Affine Amt', min: 0, max: 20, step: 0.5 },
-                    { key: 'resolutionScale', label: 'Resolution', min: 0.1, max: 1, step: 0.05 },
-                    { key: 'filterTextures', label: 'Filter Tex', type: 'checkbox' },
+                    { key: 'wiggle', label: 'Vertex Snap (PS1 Style)', type: 'checkbox' },
+                    { key: 'affineDistortion', label: 'Snap Grid', min: 1, max: 20, step: 0.5 },
                     { key: 'dither', label: 'Dither', type: 'checkbox' },
                     { key: 'colorDepth', label: 'Color Depth', min: 2, max: 64, step: 1, integer: true },
                     { key: 'scanlines', label: 'Scanlines', type: 'checkbox' },
@@ -5480,7 +5514,7 @@
                     derived?.retroTakeoverActive &&
                     ['ssgi', 'ssr', 'gtao', 'motionBlur', 'traa', 'contactShadow'].includes(section.key)
                 ) {
-                    note = 'Bypassed while Retro Wiggle takeover is active.';
+                    note = 'Bypassed while Vertex Snap (PS1 Style) is active.';
                 } else if (section.key === 'ssr' && derived) {
                     note = `World distance ${derived.effectiveSSRMaxDistance.toFixed(2)} • thickness ${derived.effectiveSSRThickness.toFixed(3)}`;
                 } else if (section.key === 'gtao' && derived) {

@@ -44,6 +44,12 @@ import {
     time,
     texture3D,
     screenCoordinate,
+    cameraProjectionMatrix,
+    cameraViewMatrix,
+    positionLocal,
+    modelWorldMatrix,
+    varying,
+    uv,
 } from 'three/tsl';
 import { bloom } from 'three/addons/tsl/display/BloomNode.js';
 import { ssr } from 'three/addons/tsl/display/SSRNode.js';
@@ -52,7 +58,7 @@ import { ssgi } from 'three/addons/tsl/display/SSGINode.js';
 import { sss } from 'three/addons/tsl/display/SSSNode.js';
 import { scanlines, vignette, colorBleeding, barrelUV } from 'three/addons/tsl/display/CRT.js';
 import { bayerDither, bayer16 } from 'three/addons/tsl/math/Bayer.js';
-import { retroPass } from 'three/addons/tsl/display/RetroPassNode.js';
+// retroPass removed — replaced with lightweight PS1 vertex snap
 import { ao } from 'three/addons/tsl/display/GTAONode.js';
 import { motionBlur } from 'three/addons/tsl/display/MotionBlur.js';
 import { dof } from 'three/addons/tsl/display/DepthOfFieldNode.js';
@@ -633,7 +639,53 @@ export function createSSGIController({
         if (Number.isFinite(value)) target[key] = value;
     }
 
+    // ── PS1 Vertex Snap ──────────────────────────────────
+    // Snaps vertices to screen-pixel grid in clip space. Modifies materials in-place —
+    // no material cloning, no CubeMapNode overhead, no separate render pass.
+    const ps1SnapStrength = uniform(5.0);
+    // PS1 vertex snap — outputs clip-space position via vertexNode (bypasses Three.js projection)
+    const ps1VertexSnap = Fn(() => {
+        const worldPos = modelWorldMatrix.mul(vec4(positionLocal, 1.0));
+        const clipPos = cameraProjectionMatrix.mul(cameraViewMatrix).mul(worldPos);
+        const w = clipPos.w;
+        const ndc = clipPos.xy.div(w);
+        const screenPx = ndc.add(1.0).mul(0.5).mul(screenSize);
+        const grid = ps1SnapStrength;
+        const snappedPx = screenPx.div(grid).floor().mul(grid);
+        const snappedNdc = snappedPx.div(screenSize).mul(2.0).sub(1.0);
+        return vec4(snappedNdc.mul(w), clipPos.z, w);
+    })();
+
+    let ps1WiggleActive = false;
+    const ps1SavedNodes = new Map();
+
+    function enablePS1Wiggle(strength = 5.0) {
+        ps1SnapStrength.value = Math.max(1.0, strength);
+        if (ps1WiggleActive) return;
+        ps1WiggleActive = true;
+        scene.traverse(obj => {
+            const mats = obj.material
+                ? (Array.isArray(obj.material) ? obj.material : [obj.material])
+                : [];
+            for (const mat of mats) {
+                if (ps1SavedNodes.has(mat)) continue;
+                ps1SavedNodes.set(mat, mat.vertexNode || null);
+                mat.vertexNode = ps1VertexSnap;
+            }
+        });
+    }
+
+    function disablePS1Wiggle() {
+        if (!ps1WiggleActive) return;
+        ps1WiggleActive = false;
+        for (const [mat, savedNode] of ps1SavedNodes) {
+            mat.vertexNode = savedNode;
+        }
+        ps1SavedNodes.clear();
+    }
+
     function rebuildPipeline() {
+        disablePS1Wiggle();
         refreshToonMeshCache();
         refreshPostPassHideList();
         ensureMainLightSupportsContactShadow();
@@ -641,6 +693,7 @@ export function createSSGIController({
 
         if (!hasAnyEffectEnabled() || !available) {
             pipelineReady = false;
+            disablePS1Wiggle();
             restoreForcedContactShadowLight();
             clearNodes();
             postProcessing.outputNode = null;
@@ -719,11 +772,12 @@ export function createSSGIController({
 
             if (useRetroTakeover) {
                 const r = state.retro;
-                const retro = retroPass(scene, camera, { affineDistortion: uniform(r.affineDistortion) });
-                retro.setResolutionScale(r.resolutionScale);
-                retro.filterTextures = r.filterTextures;
-                activeNodes.push(retro);
-                beauty = retro;
+                enablePS1Wiggle(r.affineDistortion);
+                const scenePass = pass(scene, camera);
+                activeNodes.push(scenePass);
+                // Live exposure control — reads renderer.toneMappingExposure each frame
+                const retroExposure = uniform(1.0).onRenderUpdate(() => renderer.toneMappingExposure);
+                beauty = scenePass.mul(retroExposure);
             } else {
                 const derived = computeDerivedState();
                 const ssrReflectivityNode = max(
@@ -904,14 +958,6 @@ export function createSSGIController({
 
             if (state.retro.enabled) {
                 const r = state.retro;
-                if (!useRetroTakeover && !r.filterTextures && r.resolutionScale < 0.999) {
-                    const retroScale = uniform(Math.max(0.05, r.resolutionScale));
-                    const retroPixels = vec2(
-                        max(screenSize.x.mul(retroScale), float(1.0)),
-                        max(screenSize.y.mul(retroScale), float(1.0))
-                    );
-                    beauty = replaceDefaultUV(() => screenUV.mul(retroPixels).floor().div(retroPixels), beauty);
-                }
 
                 // CRT barrel distortion + color bleeding
                 if (r.crt) {

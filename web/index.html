@@ -5510,11 +5510,6 @@
                 } else if (section.requiresWebGPU && !supportsScreenSpaceEffects) {
                     note = 'Requires the real WebGPU backend.';
                     isError = true;
-                } else if (
-                    derived?.retroTakeoverActive &&
-                    ['ssgi', 'ssr', 'gtao', 'motionBlur', 'traa', 'contactShadow'].includes(section.key)
-                ) {
-                    note = 'Bypassed while Vertex Snap (PS1 Style) is active.';
                 } else if (section.key === 'ssr' && derived) {
                     note = `World distance ${derived.effectiveSSRMaxDistance.toFixed(2)} • thickness ${derived.effectiveSSRThickness.toFixed(3)}`;
                 } else if (section.key === 'gtao' && derived) {

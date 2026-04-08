@@ -427,7 +427,7 @@ export function createSSGIController({
             effectiveGTAOThickness: state.gtao.thickness * ssrUnitScale,
             effectiveContactShadowMaxDistance: state.contactShadow.maxDistance * ssrUnitScale,
             effectiveContactShadowThickness: state.contactShadow.thickness * ssrUnitScale,
-            retroTakeoverActive: state.retro.enabled && state.retro.wiggle,
+            ps1SnapActive: state.retro.enabled && state.retro.wiggle,
         };
     }
 
@@ -705,14 +705,16 @@ export function createSSGIController({
         clearNodes();
 
         try {
-            const useRetroTakeover = state.retro.enabled && state.retro.wiggle;
+            // PS1 vertex snap — coexists with all post-FX, no takeover needed
+            if (state.retro.enabled && state.retro.wiggle) {
+                enablePS1Wiggle(state.retro.affineDistortion);
+            }
+
             const useSharedPrePass =
-                !useRetroTakeover && (
-                    state.gtao.enabled ||
-                    state.motionBlur.enabled ||
-                    state.traa.enabled ||
-                    (state.contactShadow.enabled && mainLight)
-                );
+                state.gtao.enabled ||
+                state.motionBlur.enabled ||
+                state.traa.enabled ||
+                (state.contactShadow.enabled && mainLight);
 
             let prePassDepth = null;
             let prePassNormal = null;
@@ -761,7 +763,7 @@ export function createSSGIController({
             // so SSR, fog (isBg), and opaque backdrop (mix) behave. This was SSR-only before, which
             // broke fog / opaque backdrop whenever SSR was off.
             const hiddenEnvironmentBackdrop =
-                !useRetroTakeover && !!scene.environment && !environmentVisible;
+                !!scene.environment && !environmentVisible;
             const useEnvironmentBackdropCompensation =
                 hiddenEnvironmentBackdrop
                 && (state.ssr.enabled || state.fog.enabled || state.opaqueBackdrop.enabled);
@@ -770,15 +772,7 @@ export function createSSGIController({
             let scenePassNode = null;
             let scenePassColor, scenePassDepth, scenePassDiffuse, scenePassNormalColor, scenePassMetalRough, sceneNormal, ssrReflectivity;
 
-            if (useRetroTakeover) {
-                const r = state.retro;
-                enablePS1Wiggle(r.affineDistortion);
-                const scenePass = pass(scene, camera);
-                activeNodes.push(scenePass);
-                // Live exposure control — reads renderer.toneMappingExposure each frame
-                const retroExposure = uniform(1.0).onRenderUpdate(() => renderer.toneMappingExposure);
-                beauty = scenePass.mul(retroExposure);
-            } else {
+            {
                 const derived = computeDerivedState();
                 const ssrReflectivityNode = max(
                     metalness,
@@ -837,7 +831,7 @@ export function createSSGIController({
                 ssrReflectivity = scenePassMetalRough.r;
             }
 
-            if (state.ssgi.enabled && !useRetroTakeover) {
+            if (state.ssgi.enabled) {
                 const ssgiPass = ssgi(scenePassColor, scenePassDepth, sceneNormal, camera);
                 ssgiPass.sliceCount.value = state.ssgi.sliceCount;
                 ssgiPass.stepCount.value = state.ssgi.stepCount;
@@ -858,7 +852,7 @@ export function createSSGIController({
                 );
             }
 
-            if (state.ssr.enabled && !useRetroTakeover) {
+            if (state.ssr.enabled) {
                 const derived = computeDerivedState();
                 const ssrPass = ssr(
                     scenePassColor,
@@ -933,7 +927,7 @@ export function createSSGIController({
                 }
             }
 
-            if (state.traa.enabled && !useRetroTakeover && prePassDepth && prePassVelocity) {
+            if (state.traa.enabled && prePassDepth && prePassVelocity) {
                 const traaInput = convertToTexture(beauty);
                 activeNodes.push(traaInput);
 
@@ -946,7 +940,7 @@ export function createSSGIController({
                 beauty = traaPass;
             }
 
-            if (state.motionBlur.enabled && !useRetroTakeover && prePassVelocity) {
+            if (state.motionBlur.enabled && prePassVelocity) {
                 const motionBlurInput = convertToTexture(beauty);
                 activeNodes.push(motionBlurInput);
                 beauty = motionBlur(

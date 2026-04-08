@@ -10,3 +10,4 @@ node_modules/
 tmp_*
 .claude/
 AGENTS.md
+dev.bat

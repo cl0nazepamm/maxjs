@@ -322,6 +322,19 @@
             align-items: center;
             justify-content: space-between;
             gap: 6px;
+            cursor: pointer;
+            user-select: none;
+        }
+        .fx-section.collapsed .fx-grid,
+        .fx-section.collapsed .fx-note {
+            display: none;
+        }
+        .fx-section-title::before {
+            content: '▾ ';
+            font-size: 8px;
+        }
+        .fx-section.collapsed .fx-section-title::before {
+            content: '▸ ';
         }
         .fx-section-title {
             font-size: 10px;
@@ -5192,6 +5205,16 @@
             `;
 
             document.getElementById('btnPostPanelClose').onclick = () => setPostPanelVisible(false);
+
+            // Collapsible sections — click header to toggle
+            for (const header of postPanel.querySelectorAll('.fx-section-header')) {
+                header.addEventListener('click', (e) => {
+                    // Don't collapse when clicking buttons/inputs inside the header
+                    if (e.target.closest('button, input, select')) return;
+                    header.closest('.fx-section')?.classList.toggle('collapsed');
+                });
+            }
+
             document.getElementById('btnPostPanelReset').onclick = () => {
                 // Reset all FX values to defaults then disable
                 // Does NOT touch HDRI or clay mode

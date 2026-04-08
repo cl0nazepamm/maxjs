@@ -8,3 +8,5 @@ node_modules/
 *.aps
 *.tmp
 tmp_*
+.claude/
+AGENTS.md

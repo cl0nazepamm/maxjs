@@ -184,59 +184,59 @@ BEGIN
     CONTROL         "",  IDC_EMMAPSTR_SPIN,"SpinnerControl",0,        144,151, 11, 10
 
     GROUPBOX        "Physical Surface", -1,   2, 174, 166, 74
-    LTEXT           "Spec",         -1,   8, 187, 20,   8
-    CONTROL         "",  IDC_PHYS_SPEC_COLOR, "ColorSwatch", WS_TABSTOP, 34, 185, 24, 12
-    LTEXT           "Int",          -1,  88, 187, 14,   8
+    LTEXT           "Specular",     -1,   8, 187, 28,   8
+    CONTROL         "",  IDC_PHYS_SPEC_COLOR, "ColorSwatch", WS_TABSTOP, 38, 185, 24, 12
+    LTEXT           "Intensity",    -1,  78, 187, 30,   8
     CONTROL         "",  IDC_PHYS_SPEC_INT_EDIT, "CustEdit", WS_TABSTOP, 114, 185, 18, 10
     CONTROL         "",  IDC_PHYS_SPEC_INT_SPIN, "SpinnerControl", 0, 134, 185, 11, 10
 
-    LTEXT           "Coat",         -1,   8, 203, 20,   8
-    CONTROL         "",  IDC_PHYS_CLEARCOAT_EDIT, "CustEdit", WS_TABSTOP, 34, 201, 18, 10
-    CONTROL         "",  IDC_PHYS_CLEARCOAT_SPIN, "SpinnerControl", 0, 54, 201, 11, 10
-    LTEXT           "Rough",        -1,  88, 203, 22,   8
+    LTEXT           "Clearcoat",    -1,   8, 203, 32,   8
+    CONTROL         "",  IDC_PHYS_CLEARCOAT_EDIT, "CustEdit", WS_TABSTOP, 42, 201, 18, 10
+    CONTROL         "",  IDC_PHYS_CLEARCOAT_SPIN, "SpinnerControl", 0, 62, 201, 11, 10
+    LTEXT           "Roughness",    -1,  78, 203, 34,   8
     CONTROL         "",  IDC_PHYS_CLEARCOAT_ROUGH_EDIT, "CustEdit", WS_TABSTOP, 114, 201, 18, 10
     CONTROL         "",  IDC_PHYS_CLEARCOAT_ROUGH_SPIN, "SpinnerControl", 0, 134, 201, 11, 10
 
     LTEXT           "Sheen",        -1,   8, 219, 24,   8
-    CONTROL         "",  IDC_PHYS_SHEEN_EDIT, "CustEdit", WS_TABSTOP, 34, 217, 18, 10
-    CONTROL         "",  IDC_PHYS_SHEEN_SPIN, "SpinnerControl", 0, 54, 217, 11, 10
-    LTEXT           "Rough",        -1,  88, 219, 22,   8
+    CONTROL         "",  IDC_PHYS_SHEEN_EDIT, "CustEdit", WS_TABSTOP, 42, 217, 18, 10
+    CONTROL         "",  IDC_PHYS_SHEEN_SPIN, "SpinnerControl", 0, 62, 217, 11, 10
+    LTEXT           "Roughness",    -1,  78, 219, 34,   8
     CONTROL         "",  IDC_PHYS_SHEEN_ROUGH_EDIT, "CustEdit", WS_TABSTOP, 114, 217, 18, 10
     CONTROL         "",  IDC_PHYS_SHEEN_ROUGH_SPIN, "SpinnerControl", 0, 134, 217, 11, 10
 
-    LTEXT           "Color",        -1,   8, 235, 20,   8
-    CONTROL         "",  IDC_PHYS_SHEEN_COLOR, "ColorSwatch", WS_TABSTOP, 34, 233, 24, 12
-    LTEXT           "Iri",          -1,  88, 235, 12,   8
+    LTEXT           "Sheen Color",  -1,   8, 235, 40,   8
+    CONTROL         "",  IDC_PHYS_SHEEN_COLOR, "ColorSwatch", WS_TABSTOP, 50, 233, 24, 12
+    LTEXT           "Iridescence",  -1,  78, 235, 34,   8
     CONTROL         "",  IDC_PHYS_IRIDESCENCE_EDIT, "CustEdit", WS_TABSTOP, 114, 233, 18, 10
     CONTROL         "",  IDC_PHYS_IRIDESCENCE_SPIN, "SpinnerControl", 0, 134, 233, 11, 10
 
     GROUPBOX        "Transmission", -1,   2, 252, 166, 74
-    LTEXT           "Trans",        -1,   8, 265, 20,   8
-    CONTROL         "",  IDC_PHYS_TRANSMISSION_EDIT, "CustEdit", WS_TABSTOP, 34, 263, 18, 10
-    CONTROL         "",  IDC_PHYS_TRANSMISSION_SPIN, "SpinnerControl", 0, 54, 263, 11, 10
+    LTEXT           "Transmission", -1,   8, 265, 40,   8
+    CONTROL         "",  IDC_PHYS_TRANSMISSION_EDIT, "CustEdit", WS_TABSTOP, 50, 263, 18, 10
+    CONTROL         "",  IDC_PHYS_TRANSMISSION_SPIN, "SpinnerControl", 0, 70, 263, 11, 10
     LTEXT           "IOR",          -1,  88, 265, 16,   8
     CONTROL         "",  IDC_PHYS_IOR_EDIT, "CustEdit", WS_TABSTOP, 114, 263, 18, 10
     CONTROL         "",  IDC_PHYS_IOR_SPIN, "SpinnerControl", 0, 134, 263, 11, 10
 
-    LTEXT           "Thick",        -1,   8, 281, 20,   8
-    CONTROL         "",  IDC_PHYS_THICKNESS_EDIT, "CustEdit", WS_TABSTOP, 34, 279, 18, 10
-    CONTROL         "",  IDC_PHYS_THICKNESS_SPIN, "SpinnerControl", 0, 54, 279, 11, 10
-    LTEXT           "Disp",         -1,  88, 281, 18,   8
-    CONTROL         "",  IDC_PHYS_DISPERSION_EDIT, "CustEdit", WS_TABSTOP, 114, 279, 18, 10
-    CONTROL         "",  IDC_PHYS_DISPERSION_SPIN, "SpinnerControl", 0, 134, 279, 11, 10
+    LTEXT           "Thickness",    -1,   8, 281, 34,   8
+    CONTROL         "",  IDC_PHYS_THICKNESS_EDIT, "CustEdit", WS_TABSTOP, 50, 279, 18, 10
+    CONTROL         "",  IDC_PHYS_THICKNESS_SPIN, "SpinnerControl", 0, 70, 279, 11, 10
+    LTEXT           "Dispersion",   -1,  88, 281, 34,   8
+    CONTROL         "",  IDC_PHYS_DISPERSION_EDIT, "CustEdit", WS_TABSTOP, 126, 279, 18, 10
+    CONTROL         "",  IDC_PHYS_DISPERSION_SPIN, "SpinnerControl", 0, 146, 279, 11, 10
 
-    LTEXT           "Attn Col",     -1,   8, 297, 26,   8
-    CONTROL         "",  IDC_PHYS_ATT_COLOR, "ColorSwatch", WS_TABSTOP, 38, 295, 24, 12
-    LTEXT           "Dist",         -1,  88, 297, 16,   8
-    CONTROL         "",  IDC_PHYS_ATT_DIST_EDIT, "CustEdit", WS_TABSTOP, 114, 295, 18, 10
-    CONTROL         "",  IDC_PHYS_ATT_DIST_SPIN, "SpinnerControl", 0, 134, 295, 11, 10
+    LTEXT           "Atten Color",  -1,   8, 297, 38,   8
+    CONTROL         "",  IDC_PHYS_ATT_COLOR, "ColorSwatch", WS_TABSTOP, 50, 295, 24, 12
+    LTEXT           "Distance",     -1,  88, 297, 28,   8
+    CONTROL         "",  IDC_PHYS_ATT_DIST_EDIT, "CustEdit", WS_TABSTOP, 126, 295, 18, 10
+    CONTROL         "",  IDC_PHYS_ATT_DIST_SPIN, "SpinnerControl", 0, 146, 295, 11, 10
 
-    LTEXT           "Aniso",        -1,   8, 313, 24,   8
-    CONTROL         "",  IDC_PHYS_ANISOTROPY_EDIT, "CustEdit", WS_TABSTOP, 34, 311, 18, 10
-    CONTROL         "",  IDC_PHYS_ANISOTROPY_SPIN, "SpinnerControl", 0, 54, 311, 11, 10
-    LTEXT           "Iri IOR",      -1,  88, 313, 24,   8
-    CONTROL         "",  IDC_PHYS_IRIDESCENCE_IOR_EDIT, "CustEdit", WS_TABSTOP, 114, 311, 18, 10
-    CONTROL         "",  IDC_PHYS_IRIDESCENCE_IOR_SPIN, "SpinnerControl", 0, 134, 311, 11, 10
+    LTEXT           "Anisotropy",   -1,   8, 313, 36,   8
+    CONTROL         "",  IDC_PHYS_ANISOTROPY_EDIT, "CustEdit", WS_TABSTOP, 50, 311, 18, 10
+    CONTROL         "",  IDC_PHYS_ANISOTROPY_SPIN, "SpinnerControl", 0, 70, 311, 11, 10
+    LTEXT           "Iri IOR",      -1,  88, 313, 28,   8
+    CONTROL         "",  IDC_PHYS_IRIDESCENCE_IOR_EDIT, "CustEdit", WS_TABSTOP, 126, 311, 18, 10
+    CONTROL         "",  IDC_PHYS_IRIDESCENCE_IOR_SPIN, "SpinnerControl", 0, 146, 311, 11, 10
 
     GROUPBOX        "Utility Maps", -1,   2, 330, 166, 64
     LTEXT           "Lightmap",     -1,   8, 343, 26,   8

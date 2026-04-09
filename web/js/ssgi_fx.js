@@ -1920,9 +1920,7 @@ export function createSSGIController({
                 if (state.volumetric.enabled && supportsScreenSpaceEffects) {
                     syncVolumetricLightLayers();
                 }
-                prepareSceneForPostPass();
                 postProcessing.render();
-                restoreSceneAfterPostPass();
             } catch (error) {
                 restoreSceneAfterPostPass();
                 disableWithError('Post pipeline render failed', error);

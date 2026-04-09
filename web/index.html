@@ -483,6 +483,179 @@
             font-size: 10px;
             color: #999;
         }
+        /* ── Light Mode — brushed metal / CLONE.LLC ── */
+        body.light-mode { background: #2a2a2a; }
+
+        /* HUD info — dark translucent terminal style */
+        body.light-mode #info {
+            background: rgba(18, 18, 18, 0.88);
+            color: #b0b0b0;
+            border-color: rgba(80, 80, 80, 0.3);
+            box-shadow: 0 1px 4px rgba(0, 0, 0, 0.4);
+        }
+
+        /* Toolbar buttons — brushed metal */
+        body.light-mode #controls button {
+            background: linear-gradient(180deg, #d8d8d8 0%, #b8b8b8 100%);
+            color: #2a2a2a;
+            border: 1px solid #8a8a8a;
+            box-shadow:
+                inset 0 1px 0 rgba(255, 255, 255, 0.55),
+                0 1px 2px rgba(0, 0, 0, 0.25);
+            text-shadow: 0 1px 0 rgba(255, 255, 255, 0.4);
+            backdrop-filter: none;
+        }
+        body.light-mode #controls button:hover {
+            background: linear-gradient(180deg, #e4e4e4 0%, #c8c8c8 100%);
+            color: #111;
+            border-color: #777;
+        }
+        body.light-mode #controls button.active {
+            background: linear-gradient(180deg, #c0ddd6 0%, #8fbfb4 100%);
+            color: #1a4a3e;
+            border-color: #6a9a8a;
+            text-shadow: 0 1px 0 rgba(255, 255, 255, 0.3);
+        }
+
+        /* Side panels — brushed metal window chrome */
+        body.light-mode .sidepanel {
+            background: linear-gradient(180deg, #d4d4d4 0%, #c0c0c0 3%, #d0d0d0 4%, #bcbcbc 100%);
+            color: #2a2a2a;
+            border: 1px solid #777;
+            border-top-color: #999;
+            box-shadow:
+                0 6px 28px rgba(0, 0, 0, 0.55),
+                inset 0 1px 0 rgba(255, 255, 255, 0.5),
+                inset 0 -1px 0 rgba(0, 0, 0, 0.08);
+            backdrop-filter: none;
+            -webkit-backdrop-filter: none;
+            scrollbar-color: rgba(80, 80, 80, 0.35) transparent;
+        }
+        body.light-mode .sidepanel-title {
+            color: #1a1a1a;
+            text-shadow: 0 1px 0 rgba(255, 255, 255, 0.5);
+        }
+        body.light-mode .sidepanel-header {
+            border-bottom-color: rgba(0, 0, 0, 0.12);
+        }
+        body.light-mode .sidepanel-subtitle { color: #555; }
+
+        /* Panel buttons — embossed metal */
+        body.light-mode .sidepanel button,
+        body.light-mode .fx-toggle {
+            background: linear-gradient(180deg, #d8d8d8 0%, #b4b4b4 100%);
+            color: #333;
+            border: 1px solid #888;
+            box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.45), 0 1px 1px rgba(0, 0, 0, 0.12);
+            text-shadow: 0 1px 0 rgba(255, 255, 255, 0.35);
+            backdrop-filter: none;
+        }
+        body.light-mode .sidepanel button:hover,
+        body.light-mode .fx-toggle:hover {
+            background: linear-gradient(180deg, #e2e2e2 0%, #c4c4c4 100%);
+            color: #111;
+            border-color: #777;
+        }
+        body.light-mode .fx-toggle.active {
+            background: linear-gradient(180deg, #b8ddd4 0%, #88bfb0 100%);
+            color: #1a4a3e;
+            border-color: #6a9a8a;
+            box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.3), 0 0 6px rgba(64, 200, 176, 0.15);
+        }
+
+        /* FX sections — inset panels */
+        body.light-mode .fx-section {
+            background: rgba(0, 0, 0, 0.04);
+            border: 1px solid rgba(0, 0, 0, 0.1);
+            box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.06);
+        }
+        body.light-mode .fx-section:hover {
+            background: rgba(0, 0, 0, 0.06);
+            border-color: rgba(0, 0, 0, 0.15);
+        }
+        body.light-mode .fx-section-title {
+            color: #222;
+            text-shadow: 0 1px 0 rgba(255, 255, 255, 0.4);
+        }
+        body.light-mode .fx-control-head,
+        body.light-mode .fx-check { color: #444; }
+        body.light-mode .fx-value { color: #111; }
+
+        /* Slider — metal track */
+        body.light-mode .fx-range {
+            background: rgba(0, 0, 0, 0.12);
+            box-shadow: inset 0 1px 1px rgba(0, 0, 0, 0.1);
+        }
+        body.light-mode .fx-range::-webkit-slider-thumb {
+            background: linear-gradient(180deg, #e0e0e0, #b0b0b0);
+            border-color: #777;
+            box-shadow: 0 1px 2px rgba(0, 0, 0, 0.25);
+        }
+        body.light-mode .fx-range::-moz-range-thumb {
+            background: linear-gradient(180deg, #e0e0e0, #b0b0b0);
+            border-color: #777;
+            box-shadow: 0 1px 2px rgba(0, 0, 0, 0.25);
+        }
+        body.light-mode .fx-note { color: #666; }
+
+        /* Toggle switch — metal */
+        body.light-mode .fx-check input[type="checkbox"] {
+            background: rgba(0, 0, 0, 0.1);
+            border-color: rgba(0, 0, 0, 0.2);
+            box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.1);
+        }
+        body.light-mode .fx-check input[type="checkbox"]::after {
+            background: linear-gradient(180deg, #ddd, #aaa);
+            box-shadow: 0 1px 1px rgba(0, 0, 0, 0.15);
+        }
+        body.light-mode .fx-check input[type="checkbox"]:checked {
+            background: rgba(64, 200, 176, 0.2);
+            border-color: rgba(64, 200, 176, 0.4);
+        }
+        body.light-mode .fx-check input[type="checkbox"]:checked::after {
+            background: linear-gradient(180deg, #60d8c0, #40b8a0);
+            box-shadow: 0 0 4px rgba(64, 200, 176, 0.3);
+        }
+
+        /* Layer items — inset rows */
+        body.light-mode .layer-item {
+            background: rgba(255, 255, 255, 0.35);
+            border: 1px solid rgba(0, 0, 0, 0.08);
+            box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.5);
+        }
+        body.light-mode .layer-name { color: #1a1a1a; }
+        body.light-mode .layer-source {
+            color: #555;
+            border-color: rgba(0, 0, 0, 0.15);
+        }
+        body.light-mode .layer-source.project {
+            color: #2a6a8a;
+            border-color: rgba(40, 100, 140, 0.3);
+        }
+        body.light-mode .layer-source.inline {
+            color: #8a6a2a;
+            border-color: rgba(140, 100, 40, 0.3);
+        }
+        body.light-mode .layer-status { color: #888; }
+        body.light-mode .layer-status.live { color: #2a8a6a; }
+        body.light-mode .layer-status.err { color: #cc3333; }
+        body.light-mode .layers-empty { color: #999; }
+
+        /* Inputs — inset field */
+        body.light-mode .snapshot-inline input[type="number"] {
+            background: rgba(255, 255, 255, 0.5);
+            color: #222;
+            border: 1px solid rgba(0, 0, 0, 0.18);
+            box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.08);
+        }
+
+        body.light-mode .sidepanel::-webkit-scrollbar-thumb {
+            background: rgba(0, 0, 0, 0.15);
+        }
+        body.light-mode .sidepanel-resize:hover,
+        body.light-mode .sidepanel-resize.active {
+            background: rgba(64, 200, 176, 0.35);
+        }
     </style>
 </head>
 <body>
@@ -498,6 +671,7 @@
             <button id="btnLightProbe" class="active devonly">Probe: ON</button>
             <button id="btnLayersPanel" class="maxonly devonly">Layers</button>
             <button id="btnPostFxPanel" class="devonly">Post FX</button>
+            <button id="btnTheme">☀</button>
             <button id="btnDebug" style="display:none">Debug</button>
         </div>
     </div>
@@ -558,7 +732,7 @@
 
 
         // ── Scene Setup (Y-up world + Max basis boundary) ───
-        const hiddenBackgroundColor = 0x353535;
+        let hiddenBackgroundColor = 0x353535;
         const scene = new THREE.Scene();
         scene.background = new THREE.Color(hiddenBackgroundColor);
         const maxBasisRoot = new THREE.Group();
@@ -3725,14 +3899,16 @@
                     m.transmission = material.transmission;
                     if (material.transmission > 0) m.transparent = true;
                 }
-                if (material?.ior != null && 'ior' in m) m.ior = material.ior;
                 if (material?.thickness != null && 'thickness' in m) m.thickness = material.thickness;
                 if (material?.specularIntensity != null && 'specularIntensity' in m) {
                     m.specularIntensity = material.specularIntensity;
                     if (material.specularIntensity < 0.001) {
                         m.envMapIntensity = 0;
-                        if ('ior' in m) m.ior = 1.0;
                     }
+                }
+                // IOR must be set AFTER specularIntensity — Three.js derives F0 from both
+                if (material?.ior != null && 'ior' in m) {
+                    m.ior = (material.specularIntensity != null && material.specularIntensity < 0.001) ? 1.0 : material.ior;
                 }
                 rememberMaterialEmissiveBase(m);
                 applyMaterialSelectionState(m, !!mesh.userData.maxjsSelected);
@@ -4680,6 +4856,23 @@
             applyLightProbeState();
             if (lightProbeEnabled) refreshLightProbeFromCurrentHDRI();
             savePostFxState();
+        };
+
+        // ── Theme Toggle ─────────────────────────────────
+        const DARK_BG = 0x353535;
+        const LIGHT_BG = 0x2a2a2a;
+        const btnTheme = document.getElementById('btnTheme');
+        let lightMode = false;
+        btnTheme.onclick = () => {
+            lightMode = !lightMode;
+            document.body.classList.toggle('light-mode', lightMode);
+            btnTheme.textContent = lightMode ? '☾' : '☀';
+            hiddenBackgroundColor = lightMode ? LIGHT_BG : DARK_BG;
+            const bgColor = new THREE.Color(hiddenBackgroundColor);
+            if (!envVisible && !isLocalHdriActive()) {
+                scene.background = bgColor;
+            }
+            ssgiFx.setOpaqueBackdropOptions({ red: bgColor.r, green: bgColor.g, blue: bgColor.b });
         };
 
         // Toon outline is automatic — no UI button needed
@@ -6046,6 +6239,8 @@
         });
 
         // ── WebXR / VR ───────────────────────────────────────
+        // Fragile integration: this path is intentionally isolated from snapshots/export
+        // and has only been tested on Quest 3 via Virtual Desktop (VDXR).
         function createWebXRRuntime() {
             const runtime = {
                 active: false,
@@ -6060,7 +6255,7 @@
                 vrNote.textContent = 'Switch to VR';
                 vrNote.style.cssText = 'position:absolute;bottom:8px;right:8px;z-index:100;background:rgba(40,40,60,0.78);color:#ddd;border:1px solid #333;padding:4px 10px;border-radius:4px;font:10px "Segoe UI",sans-serif;cursor:pointer';
                 vrNote.onclick = () => {
-                    if (confirm('VR requires HDRI environment, please load one if it\'s not already loaded.\n\nWebXR needs the WebGL backend. Restart MaxJS in VR mode now?')) {
+                    if (confirm('WebXR needs the WebGL backend.\n\nOnly tested on Quest 3 with VDXR (Virtual Desktop).\n\nRestart MaxJS in VR mode now?')) {
                         sessionStorage.setItem('maxjs_force_webgl', '1');
                         location.reload();
                     }
@@ -6099,6 +6294,7 @@
                 const moveForward = new THREE.Vector3();
                 const moveRight = new THREE.Vector3();
                 const moveDelta = new THREE.Vector3();
+                const worldUp = new THREE.Vector3(0, 1, 0);
                 const focusBounds = new THREE.Box3();
                 const focusCenter = new THREE.Vector3();
 
@@ -6253,12 +6449,11 @@
 
                     if (moveState?.inputSource) {
                         const { x, y } = readPrimaryStick(moveState.inputSource);
-                        const xrCamera = renderer.xr.getCamera(camera);
-                        xrCamera.getWorldDirection(moveForward);
+                        moveForward.set(0, 0, -1).applyQuaternion(xrOrigin.quaternion);
                         moveForward.y = 0;
                         if (moveForward.lengthSq() < 1e-6) moveForward.set(0, 0, -1);
                         moveForward.normalize();
-                        moveRight.crossVectors(moveForward, camera.up).normalize();
+                        moveRight.crossVectors(moveForward, worldUp).normalize();
 
                         moveDelta.set(0, 0, 0);
                         if (x) moveDelta.addScaledVector(moveRight, x * moveSpeed * dt);

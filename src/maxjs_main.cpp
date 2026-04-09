@@ -863,6 +863,13 @@ static bool ShouldExtractRenderableShape(INode* node, TimeValue t, const ObjectS
         && !IsShapeConsumedByOtherRuntimeNode(node, t);
 }
 
+// Fast-path visibility (delta / xform / splat-audio hashes) must match layer hidden + renderable.
+// Sending only IsNodeHidden caused non-renderable meshes to receive vis=1 every frame and fight
+// props.rend on the JS side (flicker).
+static bool IsMaxJsSyncDrawVisible(INode* node) {
+    return node && !node->IsNodeHidden(TRUE) && node->Renderable();
+}
+
 static uint64_t HashNodeGeometryState(INode* node, TimeValue t) {
     if (!node) return 0;
 
@@ -4245,7 +4252,7 @@ static bool ExtractHairInstances(INode* node,
 
     HairInstanceGroup group;
     group.handle = node->GetHandle();
-    group.visible = !node->IsNodeHidden(TRUE);
+    group.visible = IsMaxJsSyncDrawVisible(node);
     GetTransform16(node, t, group.nodeTransform);
 
     Interval hairValidity = FOREVER;
@@ -7211,7 +7218,7 @@ public:
                 snapshotNode.handle = node->GetHandle();
                 snapshotNode.node = node;
                 snapshotNode.visible =
-                    !node->IsNodeHidden(TRUE) && node->GetVisibility(t) > 0.0f;
+                    !node->IsNodeHidden(TRUE) && node->GetVisibility(t) > 0.0f && node->Renderable();
 
                 bool extracted = ExtractMesh(node, t, snapshotNode.verts, snapshotNode.uvs,
                     snapshotNode.indices, snapshotNode.groups, &snapshotNode.norms);
@@ -7496,12 +7503,14 @@ public:
                         collectInstances(node);
                         continue;
                     }
-                    if (IsForestPackAvailable() && IsForestPackNode(node))
-                        ExtractForestPackInstances(node, t, allInstGroups);
-                    else if (IsRailCloneAvailable() && IsRailCloneNode(node))
-                        ExtractRailCloneInstances(node, t, allInstGroups);
-                    else if (IsTyFlowAvailable() && IsTyFlowNode(node))
-                        ExtractTyFlowInstances(node, t, allInstGroups);
+                    if (IsMaxJsSyncDrawVisible(node)) {
+                        if (IsForestPackAvailable() && IsForestPackNode(node))
+                            ExtractForestPackInstances(node, t, allInstGroups);
+                        else if (IsRailCloneAvailable() && IsRailCloneNode(node))
+                            ExtractRailCloneInstances(node, t, allInstGroups);
+                        else if (IsTyFlowAvailable() && IsTyFlowNode(node))
+                            ExtractTyFlowInstances(node, t, allInstGroups);
+                    }
                     collectInstances(node);
                 }
             };
@@ -9054,7 +9063,7 @@ public:
             RememberSentTransform(handle, xform);
             frame.UpdateTransform(static_cast<std::uint32_t>(handle), xform);
             frame.UpdateSelection(static_cast<std::uint32_t>(handle), node->Selected() != 0);
-            frame.UpdateVisibility(static_cast<std::uint32_t>(handle), !node->IsNodeHidden(TRUE));
+            frame.UpdateVisibility(static_cast<std::uint32_t>(handle), IsMaxJsSyncDrawVisible(node));
 
             if (materialDirty.find(handle) != materialDirty.end()) {
                 float col[3] = {0.8f, 0.8f, 0.8f};
@@ -9074,7 +9083,7 @@ public:
         for (ULONG handle : visibilityDirty) {
             INode* node = ip->GetINodeByHandle(handle);
             if (!node) continue;
-            frame.UpdateVisibility(static_cast<std::uint32_t>(handle), !node->IsNodeHidden(TRUE));
+            frame.UpdateVisibility(static_cast<std::uint32_t>(handle), IsMaxJsSyncDrawVisible(node));
         }
 
         if (hasDirtyCamera) {
@@ -9217,7 +9226,7 @@ public:
             GetTransform16(node, t, xform);
             frame.UpdateTransform(static_cast<std::uint32_t>(handle), xform);
             frame.UpdateSelection(static_cast<std::uint32_t>(handle), node->Selected() != 0);
-            frame.UpdateVisibility(static_cast<std::uint32_t>(handle), !node->IsNodeHidden(TRUE));
+            frame.UpdateVisibility(static_cast<std::uint32_t>(handle), IsMaxJsSyncDrawVisible(node));
 
             if (includeMaterialScalars) {
                 float col[3] = {0.8f, 0.8f, 0.8f};
@@ -9395,7 +9404,7 @@ public:
 
         std::wostringstream ss;
         ss.imbue(std::locale::classic());
-        ss << L"{\"v\":" << (node->IsNodeHidden(TRUE) ? L'0' : L'1');
+        ss << L"{\"v\":" << (IsMaxJsSyncDrawVisible(node) ? L'1' : L'0');
         ss << L",\"url\":\"" << EscapeJson(mappedPath.c_str()) << L"\"}";
         const std::wstring payload = ss.str();
         return HashFNV1a(payload.data(), payload.size() * sizeof(wchar_t));
@@ -9421,7 +9430,7 @@ public:
 
         std::wostringstream ss;
         ss.imbue(std::locale::classic());
-        ss << L"{\"v\":" << (node->IsNodeHidden(TRUE) ? L'0' : L'1');
+        ss << L"{\"v\":" << (IsMaxJsSyncDrawVisible(node) ? L'1' : L'0');
         ss << L",\"url\":\"" << EscapeJson(mappedPath.c_str()) << L"\"";
         ss << L",\"volume\":" << pb->GetFloat(pa_volume, t);
         ss << L",\"loop\":" << (pb->GetInt(pa_loop) ? L'1' : L'0');
@@ -10095,7 +10104,7 @@ public:
         }
         if (includeVisibility) {
             appendComma();
-            ss << L"\"v\":" << (node->IsNodeHidden(TRUE) ? L'0' : L'1');
+            ss << L"\"v\":" << (IsMaxJsSyncDrawVisible(node) ? L'1' : L'0');
         }
 
         appendComma();
@@ -10176,7 +10185,7 @@ public:
 
         if (includeVisibility) {
             appendComma();
-            ss << L"\"v\":" << (node->IsNodeHidden(TRUE) ? L'0' : L'1');
+            ss << L"\"v\":" << (IsMaxJsSyncDrawVisible(node) ? L'1' : L'0');
         }
 
         appendComma();
@@ -10228,7 +10237,7 @@ public:
 
         if (includeVisibility) {
             appendComma();
-            ss << L"\"v\":" << (node->IsNodeHidden(TRUE) ? L'0' : L'1');
+            ss << L"\"v\":" << (IsMaxJsSyncDrawVisible(node) ? L'1' : L'0');
         }
 
         appendComma();
@@ -10416,6 +10425,10 @@ public:
                     collectHair(node);
                     continue;
                 }
+                if (!IsMaxJsSyncDrawVisible(node)) {
+                    collectHair(node);
+                    continue;
+                }
                 const size_t beforeCount = hairGroups.size();
                 Object* obj = node->GetObjectRef();
                 const MSTR className = obj ? obj->ClassName() : MSTR(_T("<null>"));
@@ -10560,12 +10573,14 @@ public:
                         collectInstances(node);
                         continue;
                     }
-                    if (IsForestPackAvailable() && IsForestPackNode(node))
-                        ExtractForestPackInstances(node, t, allInstGroups);
-                    else if (IsRailCloneAvailable() && IsRailCloneNode(node))
-                        ExtractRailCloneInstances(node, t, allInstGroups);
-                    else if (IsTyFlowAvailable() && IsTyFlowNode(node))
-                        ExtractTyFlowInstances(node, t, allInstGroups);
+                    if (IsMaxJsSyncDrawVisible(node)) {
+                        if (IsForestPackAvailable() && IsForestPackNode(node))
+                            ExtractForestPackInstances(node, t, allInstGroups);
+                        else if (IsRailCloneAvailable() && IsRailCloneNode(node))
+                            ExtractRailCloneInstances(node, t, allInstGroups);
+                        else if (IsTyFlowAvailable() && IsTyFlowNode(node))
+                            ExtractTyFlowInstances(node, t, allInstGroups);
+                    }
                     collectInstances(node);
                 }
             };
@@ -10910,7 +10925,7 @@ public:
                 ng.node = node;
                 ng.handle = node->GetHandle();
                 ng.changed = false;
-                ng.visible = !node->IsNodeHidden(TRUE);
+                ng.visible = IsMaxJsSyncDrawVisible(node);
                 if (HasEnabledHairModifier(node)) {
                     pluginInstHandles_.insert(ng.handle);
                 }
@@ -11175,12 +11190,14 @@ public:
                         collectInstances(node);
                         continue;
                     }
-                    if (IsForestPackAvailable() && IsForestPackNode(node))
-                        ExtractForestPackInstances(node, t, allInstGroups);
-                    else if (IsRailCloneAvailable() && IsRailCloneNode(node))
-                        ExtractRailCloneInstances(node, t, allInstGroups);
-                    else if (IsTyFlowAvailable() && IsTyFlowNode(node))
-                        ExtractTyFlowInstances(node, t, allInstGroups);
+                    if (IsMaxJsSyncDrawVisible(node)) {
+                        if (IsForestPackAvailable() && IsForestPackNode(node))
+                            ExtractForestPackInstances(node, t, allInstGroups);
+                        else if (IsRailCloneAvailable() && IsRailCloneNode(node))
+                            ExtractRailCloneInstances(node, t, allInstGroups);
+                        else if (IsTyFlowAvailable() && IsTyFlowNode(node))
+                            ExtractTyFlowInstances(node, t, allInstGroups);
+                    }
                     collectInstances(node);
                 }
             };
@@ -11303,7 +11320,7 @@ public:
             Mtl* foundMtl = FindSupportedMaterial(node->GetMtl());
             ExtractMaterialScalarPreview(foundMtl, node, t, col, rough, metal, opac);
 
-            bool visible = !node->IsNodeHidden(TRUE);
+            const bool visible = IsMaxJsSyncDrawVisible(node);
 
             if (!first) ss << L',';
             ss << L"{\"h\":" << handle;

@@ -1606,12 +1606,17 @@ export function createSSGIController({
             // the post-FX node graph at rebuild time, so scene-structure changes
             // while it is enabled must escalate to a full rebuild. Everything
             // else only needs the cheap toon-cache + hide-list refresh.
+            //
+            // Do NOT pass output:true here — scene structure changes do not touch
+            // the output node tree (tone mapping / exposure / gamma). Setting
+            // postProcessing.needsUpdate forces a one-frame re-resolution that can
+            // cause DOF microflicker (the gather kernel samples a partially
+            // re-bound RT). Output changes have their own entry point.
             const mustRebuild =
                 options.rebuild === true || state.toonOutline.enabled;
             queuePipelineUpdate({
                 scene: true,
                 rebuild: mustRebuild,
-                output: true,
             });
         },
         /**

@@ -19,7 +19,7 @@
         #info {
             background: rgba(20, 20, 20, 0.55);
             padding: 4px 8px;
-            border-radius: 6px;
+            border-radius: 0;
             margin-bottom: 5px;
             border: 1px solid rgba(255, 255, 255, 0.06);
             backdrop-filter: blur(16px);
@@ -36,7 +36,7 @@
             color: #999;
             border: 1px solid rgba(255, 255, 255, 0.08);
             padding: 3px 9px;
-            border-radius: 5px;
+            border-radius: 0;
             font: 10px/1 'Segoe UI', system-ui, sans-serif;
             font-weight: 600;
             letter-spacing: 0.03em;
@@ -61,7 +61,7 @@
             width: 5px;
             cursor: ew-resize;
             z-index: 2;
-            border-radius: 10px 0 0 10px;
+            border-radius: 0;
             transition: background 0.15s ease;
         }
         .sidepanel-resize:hover,
@@ -77,7 +77,7 @@
             max-width: calc(100vw - 16px);
             max-height: calc(100vh - 16px);
             padding: 8px;
-            border-radius: 10px;
+            border-radius: 0;
             border: 1px solid rgba(255, 255, 255, 0.08);
             background: rgba(30, 30, 30, 0.72);
             color: #bbb;
@@ -100,7 +100,7 @@
         }
         .sidepanel::-webkit-scrollbar { width: 4px; }
         .sidepanel::-webkit-scrollbar-track { background: transparent; }
-        .sidepanel::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.08); border-radius: 2px; }
+        .sidepanel::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.08); border-radius: 0; }
         .sidepanel.visible {
             opacity: 1;
             pointer-events: auto;
@@ -117,14 +117,14 @@
         .sidepanel-left .sidepanel-resize {
             left: auto;
             right: 0;
-            border-radius: 0 10px 10px 0;
+            border-radius: 0;
         }
         .layer-item {
             display: grid;
             grid-template-columns: minmax(0, 1fr) auto;
             gap: 6px;
             padding: 5px 6px;
-            border-radius: 5px;
+            border-radius: 0;
             background: rgba(255, 255, 255, 0.03);
             border: 1px solid rgba(255, 255, 255, 0.04);
         }
@@ -156,7 +156,7 @@
             text-transform: uppercase;
             color: #8a8a8a;
             padding: 1px 4px;
-            border-radius: 999px;
+            border-radius: 0;
             border: 1px solid rgba(255, 255, 255, 0.08);
             flex-shrink: 0;
         }
@@ -191,7 +191,7 @@
             flex-shrink: 0;
         }
         .layer-action {
-            border-radius: 3px;
+            border-radius: 0;
             padding: 1px 5px;
             font: 9px/1 'Segoe UI', system-ui, sans-serif;
             cursor: pointer;
@@ -242,7 +242,7 @@
             background: rgba(255, 255, 255, 0.06);
             color: #aaa;
             border: 1px solid rgba(255, 255, 255, 0.08);
-            border-radius: 5px;
+            border-radius: 0;
             padding: 3px 7px;
             font: 10px/1 'Segoe UI', system-ui, sans-serif;
             font-weight: 600;
@@ -289,7 +289,7 @@
             background: rgba(255, 255, 255, 0.05);
             color: #bbb;
             border: 1px solid rgba(255, 255, 255, 0.08);
-            border-radius: 5px;
+            border-radius: 0;
             padding: 4px 6px;
             font: 10px/1 'Segoe UI', system-ui, sans-serif;
         }
@@ -308,7 +308,7 @@
         /* ── FX Sections ───────────────────────────── */
         .fx-section {
             border: 1px solid rgba(255, 255, 255, 0.05);
-            border-radius: 7px;
+            border-radius: 0;
             background: rgba(255, 255, 255, 0.03);
             padding: 6px;
             transition: background 0.15s ease, border-color 0.15s ease;
@@ -387,7 +387,7 @@
             appearance: none;
             width: 100%;
             height: 3px;
-            border-radius: 2px;
+            border-radius: 0;
             background: rgba(255, 255, 255, 0.1);
             outline: none;
             cursor: pointer;
@@ -422,7 +422,7 @@
         }
         .fx-range::-moz-range-track {
             height: 3px;
-            border-radius: 2px;
+            border-radius: 0;
             background: rgba(255, 255, 255, 0.1);
         }
         /* ── Custom Checkbox (toggle switch) ────────── */
@@ -431,7 +431,7 @@
             appearance: none;
             width: 26px;
             height: 13px;
-            border-radius: 7px;
+            border-radius: 0;
             background: rgba(255, 255, 255, 0.08);
             border: 1px solid rgba(255, 255, 255, 0.1);
             cursor: pointer;
@@ -446,7 +446,7 @@
             left: 1px;
             width: 9px;
             height: 9px;
-            border-radius: 50%;
+            border-radius: 0;
             background: rgba(255, 255, 255, 0.3);
             transition: transform 0.15s cubic-bezier(0.16, 1, 0.3, 1), background 0.15s ease;
         }
@@ -656,6 +656,37 @@
         body.light-mode .sidepanel-resize.active {
             background: rgba(64, 200, 176, 0.35);
         }
+
+        /* ── Dark Mode — rounded corners (light mode stays sharp at base 0) ── */
+        body:not(.light-mode) #info { border-radius: 6px; }
+        body:not(.light-mode) #controls button { border-radius: 5px; }
+        body:not(.light-mode) .sidepanel { border-radius: 10px; }
+        body:not(.light-mode) .sidepanel::-webkit-scrollbar-thumb { border-radius: 2px; }
+        body:not(.light-mode) .sidepanel-resize { border-radius: 10px 0 0 10px; }
+        body:not(.light-mode) .sidepanel-left .sidepanel-resize { border-radius: 0 10px 10px 0; }
+        body:not(.light-mode) .layer-item { border-radius: 5px; }
+        body:not(.light-mode) .layer-source { border-radius: 999px; }
+        body:not(.light-mode) .layer-action { border-radius: 3px; }
+        body:not(.light-mode) .sidepanel button,
+        body:not(.light-mode) .fx-toggle { border-radius: 5px; }
+        body:not(.light-mode) .snapshot-inline input[type="number"] { border-radius: 5px; }
+        body:not(.light-mode) .fx-section { border-radius: 7px; }
+        body:not(.light-mode) .fx-range { border-radius: 2px; }
+        body:not(.light-mode) .fx-range::-moz-range-track { border-radius: 2px; }
+        body:not(.light-mode) .fx-check input[type="checkbox"] { border-radius: 7px; }
+        body:not(.light-mode) .fx-check input[type="checkbox"]::after { border-radius: 50%; }
+        body:not(.light-mode) .sidepanel select { border-radius: 5px !important; }
+
+        /* ── Light Mode — Clone section inline color fixes ── */
+        body.light-mode .clone-subsection { border-top-color: rgba(0, 0, 0, 0.1) !important; }
+        body.light-mode .clone-subsection span[style*="color:#ccc"] { color: #333 !important; }
+        body.light-mode [data-fx-section="clone"] > .fx-note { color: #666 !important; }
+        body.light-mode .sidepanel select {
+            background: rgba(0, 0, 0, 0.06) !important;
+            color: #333 !important;
+            border-color: rgba(0, 0, 0, 0.15) !important;
+        }
+        body.light-mode #fx-hdri-name { color: #666 !important; }
     </style>
 </head>
 <body>
@@ -675,6 +706,17 @@
             <button id="btnDebug" style="display:none">Debug</button>
         </div>
     </div>
+    <script>
+        (function () {
+            try {
+                if (localStorage.getItem('maxjs-theme') === 'light') {
+                    document.body.classList.add('light-mode');
+                    var t = document.getElementById('btnTheme');
+                    if (t) t.textContent = '\u263e';
+                }
+            } catch (e) { /* private mode / disabled storage */ }
+        })();
+    </script>
     <aside id="layersPanel" class="sidepanel sidepanel-left" aria-hidden="true" inert></aside>
     <aside id="snapshotPanel" class="sidepanel" aria-hidden="true" inert></aside>
     <aside id="postPanel" class="sidepanel" aria-hidden="true" inert></aside>
@@ -730,9 +772,21 @@
         import { createMaxJSAudioSystem } from './js/maxjs_audio.js';
         import { createProjectRuntime } from './js/project_runtime.js';
 
+        const THEME_STORAGE_KEY = 'maxjs-theme';
+        const DARK_BG = 0x353535;
+        const LIGHT_BG = 0x2a2a2a;
+        function readPersistedLightMode() {
+            try {
+                return localStorage.getItem(THEME_STORAGE_KEY) === 'light';
+            } catch {
+                return false;
+            }
+        }
+        let lightMode = readPersistedLightMode();
+        document.body.classList.toggle('light-mode', lightMode);
 
         // ── Scene Setup (Y-up world + Max basis boundary) ───
-        let hiddenBackgroundColor = 0x353535;
+        let hiddenBackgroundColor = lightMode ? LIGHT_BG : DARK_BG;
         const scene = new THREE.Scene();
         scene.background = new THREE.Color(hiddenBackgroundColor);
         const maxBasisRoot = new THREE.Group();
@@ -4859,15 +4913,16 @@
         };
 
         // ── Theme Toggle ─────────────────────────────────
-        const DARK_BG = 0x353535;
-        const LIGHT_BG = 0x2a2a2a;
         const btnTheme = document.getElementById('btnTheme');
-        let lightMode = false;
+        btnTheme.textContent = lightMode ? '\u263e' : '\u2600';
         btnTheme.onclick = () => {
             lightMode = !lightMode;
             document.body.classList.toggle('light-mode', lightMode);
-            btnTheme.textContent = lightMode ? '☾' : '☀';
+            btnTheme.textContent = lightMode ? '\u263e' : '\u2600';
             hiddenBackgroundColor = lightMode ? LIGHT_BG : DARK_BG;
+            try {
+                localStorage.setItem(THEME_STORAGE_KEY, lightMode ? 'light' : 'dark');
+            } catch (e) { /* private mode */ }
             const bgColor = new THREE.Color(hiddenBackgroundColor);
             if (!envVisible && !isLocalHdriActive()) {
                 scene.background = bgColor;
@@ -5338,7 +5393,7 @@
 
         function buildPostFxPanel() {
             const sectionsHtml = postFxSections.map(section => `
-                <section class="fx-section" data-fx-section="${section.key}">
+                <section class="fx-section collapsed" data-fx-section="${section.key}">
                     <div class="fx-section-header">
                         <div class="fx-section-title">${section.title}</div>
                         <button class="fx-toggle" type="button" id="fx-toggle-${section.key}">Off</button>
@@ -5405,12 +5460,12 @@
                     <button id="btnPostPanelClose" type="button">Hide</button>
                 </div>
                 <div class="sidepanel-body">
-                    <section class="fx-section">
+                    <section class="fx-section collapsed">
                         <div class="fx-section-header">
                             <div class="fx-section-title">Tone Mapping</div>
                         </div>
                         <div class="fx-grid">
-                            <select id="fx-tonemapping-mode" style="background:rgba(255,255,255,0.05);color:#aaa;border:1px solid rgba(255,255,255,0.08);border-radius:5px;padding:3px 6px;font:10px 'Segoe UI',system-ui,sans-serif;width:100%;outline:none;cursor:pointer">
+                            <select id="fx-tonemapping-mode" style="background:rgba(255,255,255,0.05);color:#aaa;border:1px solid rgba(255,255,255,0.08);border-radius:0;padding:3px 6px;font:10px 'Segoe UI',system-ui,sans-serif;width:100%;outline:none;cursor:pointer">
                                 ${tmOptions}
                             </select>
                             <label class="fx-control" for="fx-tonemapping-exp">
@@ -5422,12 +5477,12 @@
                             </label>
                         </div>
                     </section>
-                    <section class="fx-section">
+                    <section class="fx-section collapsed">
                         <div class="fx-section-header">
                             <div class="fx-section-title">Anti-Aliasing</div>
                         </div>
                         <div class="fx-grid">
-                            <select id="fx-aa-mode" style="background:rgba(255,255,255,0.05);color:#aaa;border:1px solid rgba(255,255,255,0.08);border-radius:5px;padding:3px 6px;font:10px 'Segoe UI',system-ui,sans-serif;width:100%;outline:none;cursor:pointer">
+                            <select id="fx-aa-mode" style="background:rgba(255,255,255,0.05);color:#aaa;border:1px solid rgba(255,255,255,0.08);border-radius:0;padding:3px 6px;font:10px 'Segoe UI',system-ui,sans-serif;width:100%;outline:none;cursor:pointer">
                                 <option value="msaa"${!ssgiFx.isTRAAEnabled() ? ' selected' : ''}>MSAA</option>
                                 <option value="traa"${ssgiFx.isTRAAEnabled() ? ' selected' : ''}>TRAA</option>
                                 <option value="off">Off</option>
@@ -5435,7 +5490,7 @@
                         </div>
                         <div class="fx-note">MSAA: hardware multisample (default). TRAA: temporal reprojection (WebGPU only). Off: no anti-aliasing.</div>
                     </section>
-                    <section class="fx-section">
+                    <section class="fx-section collapsed">
                         <div class="fx-section-header">
                             <div class="fx-section-title">Performance</div>
                         </div>
@@ -5444,7 +5499,7 @@
                                 <div class="fx-control-head">
                                     <span>FPS Cap</span>
                                 </div>
-                                <select id="fx-performance-fpscap" style="background:rgba(255,255,255,0.05);color:#aaa;border:1px solid rgba(255,255,255,0.08);border-radius:5px;padding:3px 6px;font:10px 'Segoe UI',system-ui,sans-serif;width:100%;outline:none;cursor:pointer">
+                                <select id="fx-performance-fpscap" style="background:rgba(255,255,255,0.05);color:#aaa;border:1px solid rgba(255,255,255,0.08);border-radius:0;padding:3px 6px;font:10px 'Segoe UI',system-ui,sans-serif;width:100%;outline:none;cursor:pointer">
                                     ${fpsCapOptions}
                                 </select>
                             </label>
@@ -5473,7 +5528,7 @@
                         </div>
                         <div class="fx-note" id="fx-performance-note">Caps the viewer frame rate and scales device pixel ratio to reduce GPU load. XR stays uncapped.</div>
                     </section>
-                    <section class="fx-section" data-fx-section="hdri">
+                    <section class="fx-section collapsed" data-fx-section="hdri">
                         <div class="fx-section-header">
                             <div class="fx-section-title">HDRI</div>
                             <div style="display:flex;gap:3px">
@@ -5504,7 +5559,7 @@
                         </div>
                     </section>
                     ${sectionsHtml}
-                    <section class="fx-section" data-fx-section="clone">
+                    <section class="fx-section collapsed" data-fx-section="clone">
                         <div class="fx-section-header">
                             <div class="fx-section-title">Clone</div>
                         </div>
@@ -5518,7 +5573,7 @@
                             <div class="fx-grid">
                                 <label class="fx-control" for="fx-clone-source">
                                     <div class="fx-control-head"><span>Source</span></div>
-                                    <select id="fx-clone-source" style="background:rgba(255,255,255,0.05);color:#aaa;border:1px solid rgba(255,255,255,0.08);border-radius:5px;padding:3px 6px;font:10px 'Segoe UI',system-ui,sans-serif;width:100%;outline:none;cursor:pointer">
+                                    <select id="fx-clone-source" style="background:rgba(255,255,255,0.05);color:#aaa;border:1px solid rgba(255,255,255,0.08);border-radius:0;padding:3px 6px;font:10px 'Segoe UI',system-ui,sans-serif;width:100%;outline:none;cursor:pointer">
                                         <option value="luma" selected>Luminance</option>
                                         <option value="depth">Depth</option>
                                     </select>
@@ -5565,7 +5620,7 @@
                             <div class="fx-note" style="margin-top:2px">Combine it with Pixel or Retro.</div>
                         </div>
                     </section>
-                    <section class="fx-section" data-fx-section="ascii">
+                    <section class="fx-section collapsed" data-fx-section="ascii">
                         <div class="fx-section-header">
                             <div class="fx-section-title">ASCII</div>
                             <button class="fx-toggle" type="button" id="fx-toggle-ascii">Off</button>
@@ -5577,7 +5632,7 @@
                             </label>
                             <label class="fx-control" for="fx-clone-ascii-color">
                                 <div class="fx-control-head"><span>Color</span></div>
-                                <select id="fx-clone-ascii-color" style="background:rgba(255,255,255,0.05);color:#aaa;border:1px solid rgba(255,255,255,0.08);border-radius:5px;padding:3px 6px;font:10px 'Segoe UI',system-ui,sans-serif;width:100%;outline:none;cursor:pointer">
+                                <select id="fx-clone-ascii-color" style="background:rgba(255,255,255,0.05);color:#aaa;border:1px solid rgba(255,255,255,0.08);border-radius:0;padding:3px 6px;font:10px 'Segoe UI',system-ui,sans-serif;width:100%;outline:none;cursor:pointer">
                                     <option value="white" selected>White</option>
                                     <option value="green">Green</option>
                                     <option value="amber">Amber</option>
@@ -6253,7 +6308,7 @@
             if (isNativeWebGPU) {
                 const vrNote = document.createElement('button');
                 vrNote.textContent = 'Switch to VR';
-                vrNote.style.cssText = 'position:absolute;bottom:8px;right:8px;z-index:100;background:rgba(40,40,60,0.78);color:#ddd;border:1px solid #333;padding:4px 10px;border-radius:4px;font:10px "Segoe UI",sans-serif;cursor:pointer';
+                vrNote.style.cssText = 'position:absolute;bottom:8px;right:8px;z-index:100;background:rgba(40,40,60,0.78);color:#ddd;border:1px solid #333;padding:4px 10px;border-radius:0;font:10px "Segoe UI",sans-serif;cursor:pointer';
                 vrNote.onclick = () => {
                     if (confirm('WebXR needs the WebGL backend.\n\nOnly tested on Quest 3 with VDXR (Virtual Desktop).\n\nRestart MaxJS in VR mode now?')) {
                         sessionStorage.setItem('maxjs_force_webgl', '1');

@@ -10,6 +10,7 @@
 #include <iEPolyMod.h>
 #include <gencam.h>
 #include <Scene/IPhysicalCamera.h>
+#include <Scene/IHairModifier.h>
 #include <mnmesh.h>
 #include <splshape.h>
 #include <notify.h>
@@ -54,6 +55,7 @@
 #include <algorithm>
 #include <numeric>
 #include <functional>
+#include <mutex>
 #include <filesystem>
 #include <cmath>
 #include <cwctype>
@@ -3079,6 +3081,105 @@ static bool ExtractMeshFromRawMesh(Mesh& mesh,
     return !indices.empty();
 }
 
+static bool ProbeHairModifierOnNode(INode* node, MaxSDK::IHairModifier*& outHair, MSTR* outSourceClassName = nullptr);
+
+class MaxJSNullView : public View {
+public:
+    Point2 ViewToScreen(Point3 p) override { return Point2(p.x, p.y); }
+    MaxJSNullView() {
+        worldToView.IdentityMatrix();
+        affineTM.IdentityMatrix();
+        screenW = 640.0f;
+        screenH = 480.0f;
+        projType = 0;
+        fov = 0.0f;
+        pixelSize = 1.0f;
+        flags = 0;
+    }
+};
+
+static bool ShouldUseHairRenderMeshFallback(INode* node) {
+    // Disabled — IsHairEnabled() is unreliable on built-in HairMod.
+    // Hair-bearing nodes are now handled exclusively by the strand extraction path.
+    (void)node;
+    return false;
+}
+
+static void ApplyMatrixToVertexBuffer(std::vector<float>& verts, const Matrix3& tm) {
+    for (size_t i = 0; i + 2 < verts.size(); i += 3) {
+        Point3 p(verts[i + 0], verts[i + 1], verts[i + 2]);
+        p = p * tm;
+        verts[i + 0] = p.x;
+        verts[i + 1] = p.y;
+        verts[i + 2] = p.z;
+    }
+}
+
+static void AppendExtractedGeometry(std::vector<float>& dstVerts,
+                                    std::vector<int>& dstIndices,
+                                    std::vector<MatGroup>& dstGroups,
+                                    const std::vector<float>& srcVerts,
+                                    const std::vector<int>& srcIndices,
+                                    const std::vector<MatGroup>& srcGroups) {
+    const int vertexBase = static_cast<int>(dstVerts.size() / 3);
+    const int indexBase = static_cast<int>(dstIndices.size());
+
+    dstVerts.insert(dstVerts.end(), srcVerts.begin(), srcVerts.end());
+    for (int idx : srcIndices) {
+        dstIndices.push_back(vertexBase + idx);
+    }
+    for (const MatGroup& group : srcGroups) {
+        dstGroups.push_back({ group.matID, indexBase + group.start, group.count });
+    }
+}
+
+static bool ExtractRenderMeshGeometry(INode* node, TimeValue t,
+                                      std::vector<float>& verts,
+                                      std::vector<float>& uvs,
+                                      std::vector<int>& indices,
+                                      std::vector<MatGroup>& groups) {
+    ObjectState os = node->EvalWorldState(t);
+    if (!os.obj || os.obj->SuperClassID() != GEOMOBJECT_CLASS_ID) return false;
+
+    GeomObject* geom = static_cast<GeomObject*>(os.obj);
+    MaxJSNullView view;
+    bool any = false;
+
+    auto appendMesh = [&](Mesh* mesh, const Matrix3* meshTM) {
+        if (!mesh) return;
+        std::vector<float> meshVerts, meshUvs;
+        std::vector<int> meshIndices;
+        std::vector<MatGroup> meshGroups;
+        if (!ExtractMeshFromRawMesh(*mesh, meshVerts, meshUvs, meshIndices, meshGroups, nullptr)) return;
+        if (meshTM) {
+            ApplyMatrixToVertexBuffer(meshVerts, *meshTM);
+        }
+        AppendExtractedGeometry(verts, indices, groups, meshVerts, meshIndices, meshGroups);
+        any = true;
+    };
+
+    const int renderMeshCount = geom->NumberOfRenderMeshes();
+    if (renderMeshCount > 0) {
+        for (int meshIndex = 0; meshIndex < renderMeshCount; ++meshIndex) {
+            BOOL needDelete = FALSE;
+            Mesh* mesh = geom->GetMultipleRenderMesh(t, node, view, needDelete, meshIndex);
+            Matrix3 meshTM;
+            Interval meshTMValid = FOREVER;
+            geom->GetMultipleRenderMeshTM(t, node, view, meshIndex, meshTM, meshTMValid);
+            appendMesh(mesh, &meshTM);
+            if (needDelete && mesh) delete mesh;
+        }
+    } else {
+        BOOL needDelete = FALSE;
+        Mesh* mesh = geom->GetRenderMesh(t, node, view, needDelete);
+        appendMesh(mesh, nullptr);
+        if (needDelete && mesh) delete mesh;
+    }
+
+    uvs.clear(); // Mixed render meshes may not provide stable UVs; prefer position-only fallback.
+    return any && !verts.empty() && !indices.empty();
+}
+
 // ── Spline extraction — sample BezierShape curves into line vertices ──
 static bool ExtractSpline(INode* node, TimeValue t,
                           std::vector<float>& verts,
@@ -3154,6 +3255,10 @@ static bool ExtractMesh(INode* node, TimeValue t,
     if (!os.obj || os.obj->SuperClassID() != GEOMOBJECT_CLASS_ID) return false;
     if (IsThreeJSSplatClassID(os.obj->ClassID())) return false;
 
+    if (ShouldUseHairRenderMeshFallback(node)) {
+        return ExtractRenderMeshGeometry(node, t, verts, uvs, indices, groups);
+    }
+
     // Prefer MNMesh path — handles ngons natively without ConvertToType
     if (os.obj->IsSubClassOf(polyObjectClassID)) {
         PolyObject* poly = static_cast<PolyObject*>(os.obj);
@@ -3201,6 +3306,10 @@ static bool TryHashRenderableGeometryState(INode* node, TimeValue t, uint64_t& o
 
     if (os.obj->SuperClassID() != GEOMOBJECT_CLASS_ID) return false;
     if (IsThreeJSSplatClassID(os.obj->ClassID())) return false;
+
+    if (ShouldUseHairRenderMeshFallback(node)) {
+        return TryHashExtractedRenderableGeometry(node, t, outHash);
+    }
 
     if (os.obj->IsSubClassOf(polyObjectClassID)) {
         PolyObject* poly = static_cast<PolyObject*>(os.obj);
@@ -3946,6 +4055,303 @@ static uint64_t ComputePluginInstanceStateHash(INode* node, TimeValue t, Interfa
     }
 
     return h;
+}
+
+// ══════════════════════════════════════════════════════════════
+//  Hair And Fur Modifier Extraction
+// ══════════════════════════════════════════════════════════════
+
+static void HairDebugLog(const std::wstring& line) {
+    static std::mutex sMutex;
+    std::lock_guard<std::mutex> lock(sMutex);
+    HANDLE h = CreateFileW(L"C:\\Users\\dev\\maxjs_hair_debug.log",
+        FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
+        nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    SetFilePointer(h, 0, nullptr, FILE_END);
+    const std::string utf8 = WideToUtf8(line + L"\r\n");
+    DWORD written = 0;
+    WriteFile(h, utf8.data(), static_cast<DWORD>(utf8.size()), &written, nullptr);
+    CloseHandle(h);
+}
+
+class FindHairModifierOnStackEnum : public GeomPipelineEnumProc {
+public:
+    MaxSDK::IHairModifier* hair = nullptr;
+    MSTR sourceClassName;
+    bool dumpAll = false;
+    int stepCount = 0;
+    PipeEnumResult proc(ReferenceTarget* object, IDerivedObject* derObj, int index) override {
+        (void)derObj;
+        stepCount++;
+        if (!object) {
+            if (dumpAll) {
+                std::wostringstream ss;
+                ss << L"  step[" << stepCount << L"] object=<null> derObj=" << (derObj ? L"yes" : L"no") << L" idx=" << index;
+                HairDebugLog(ss.str());
+            }
+            return PIPE_ENUM_CONTINUE;
+        }
+        const Class_ID cid = object->ClassID();
+        const SClass_ID sid = object->SuperClassID();
+        MaxSDK::IHairModifier* maybeHair = dynamic_cast<MaxSDK::IHairModifier*>(object);
+        if (dumpAll) {
+            std::wostringstream ss;
+            ss << L"  step[" << stepCount << L"] class=" << object->ClassName().data()
+               << L" sid=0x" << std::hex << sid << std::dec
+               << L" cid=(" << cid.PartA() << L"," << cid.PartB() << L")"
+               << L" idx=" << index
+               << L" hairCast=" << (maybeHair ? L"YES" : L"no");
+            HairDebugLog(ss.str());
+        }
+        if (maybeHair && !hair) {
+            hair = maybeHair;
+            sourceClassName = object->ClassName();
+        }
+        return PIPE_ENUM_CONTINUE; // walk full stack so we see everything
+    }
+};
+
+static MaxSDK::IHairModifier* FindHairModifierOnNode(INode* node) {
+    if (!node) return nullptr;
+    FindHairModifierOnStackEnum proc;
+    EnumGeomPipeline(&proc, node);
+    return proc.hair;
+}
+
+static bool ProbeHairModifierOnNode(INode* node, MaxSDK::IHairModifier*& outHair, MSTR* outSourceClassName) {
+    outHair = nullptr;
+    if (!node) return false;
+    FindHairModifierOnStackEnum proc;
+    EnumGeomPipeline(&proc, node);
+    outHair = proc.hair;
+    if (outSourceClassName) {
+        *outSourceClassName = proc.sourceClassName;
+    }
+    return outHair != nullptr;
+}
+
+static bool HasEnabledHairModifier(INode* node) {
+    MaxSDK::IHairModifier* hair = FindHairModifierOnNode(node);
+    return hair && hair->IsHairEnabled();
+}
+
+static bool SafeNormalizePoint3(Point3& value, float eps = 1.0e-6f) {
+    const float lenSq = DotProd(value, value);
+    if (lenSq <= eps * eps) return false;
+    value *= 1.0f / std::sqrt(lenSq);
+    return true;
+}
+
+static Point3 FallbackHairNormal(const Point3& tangent) {
+    Point3 normal = CrossProd(tangent, Point3(0.0f, 0.0f, 1.0f));
+    if (!SafeNormalizePoint3(normal)) {
+        normal = CrossProd(tangent, Point3(0.0f, 1.0f, 0.0f));
+        if (!SafeNormalizePoint3(normal)) {
+            normal = Point3(1.0f, 0.0f, 0.0f);
+        }
+    }
+    return normal;
+}
+
+static void WriteBasisTransform16(const Point3& basisX,
+                                  const Point3& basisY,
+                                  const Point3& basisZ,
+                                  const Point3& translation,
+                                  float out[16]) {
+    out[0] = basisX.x; out[1] = basisX.y; out[2] = basisX.z; out[3] = 0.0f;
+    out[4] = basisY.x; out[5] = basisY.y; out[6] = basisY.z; out[7] = 0.0f;
+    out[8] = basisZ.x; out[9] = basisZ.y; out[10] = basisZ.z; out[11] = 0.0f;
+    out[12] = translation.x; out[13] = translation.y; out[14] = translation.z; out[15] = 1.0f;
+}
+
+static void FillHairPBR(INode* node,
+                        TimeValue t,
+                        const MaxSDK::IHairModifier::ShadingParameters& shading,
+                        MaxJSPBR& outPbr) {
+    outPbr = MaxJSPBR();
+    outPbr.materialModel = L"MeshPhysicalMaterial";
+    outPbr.doubleSided = true;
+    outPbr.color[0] = 1.0f;
+    outPbr.color[1] = 1.0f;
+    outPbr.color[2] = 1.0f;
+    outPbr.roughness = std::clamp(1.0f - shading.gloss, 0.02f, 1.0f);
+    outPbr.physicalSpecularIntensity = std::clamp(shading.specular, 0.0f, 1.0f);
+    outPbr.physicalSpecularColor[0] = std::max(0.0f, shading.specular_tint.r);
+    outPbr.physicalSpecularColor[1] = std::max(0.0f, shading.specular_tint.g);
+    outPbr.physicalSpecularColor[2] = std::max(0.0f, shading.specular_tint.b);
+    outPbr.opacity = 1.0f;
+
+    if (shading.shader) {
+        ExtractPBRFromMtl(shading.shader, node, t, outPbr);
+        outPbr.doubleSided = true;
+    }
+}
+
+struct HairInstanceGroup {
+    ULONG handle = 0;
+    bool visible = true;
+    int instanceCount = 0;
+    float nodeTransform[16] = {
+        1.0f, 0.0f, 0.0f, 0.0f,
+        0.0f, 1.0f, 0.0f, 0.0f,
+        0.0f, 0.0f, 1.0f, 0.0f,
+        0.0f, 0.0f, 0.0f, 1.0f,
+    };
+    std::vector<float> transforms;
+    std::vector<float> colors;
+    MaxJSPBR pbr;
+};
+
+static bool ExtractHairInstances(INode* node,
+                                 TimeValue t,
+                                 std::vector<HairInstanceGroup>& outGroups) {
+    MaxSDK::IHairModifier* hair = FindHairModifierOnNode(node);
+    if (!hair) return false;
+    // NOTE: ignore IsHairEnabled() — the built-in HairMod returns false even when
+    // hair primitives ARE available via GetHairDefinition. Empirically, calling
+    // GetHairDefinition unconditionally is the only way to actually retrieve the strands.
+
+    MaxSDK::Array<unsigned int> perHairVertexCount;
+    MaxSDK::Array<Point3> vertices;
+    MaxSDK::Array<float> perVertexRadius;
+    MaxSDK::Array<Color> perVertexColor;
+    MaxSDK::Array<Point3> perVertexNormal;
+    MaxSDK::Array<Point3> perVertexVelocity;
+    MaxSDK::Array<float> perVertexOpacity;
+    MaxSDK::Array<Point2> perVertexUv;
+
+    const bool getDefOk = hair->GetHairDefinition(t, *node,
+                                 perHairVertexCount, vertices, perVertexRadius,
+                                 perVertexColor, perVertexNormal, perVertexVelocity,
+                                 perVertexOpacity, perVertexUv);
+    {
+        std::wostringstream ss;
+        ss << L"  GetHairDefinition: ok=" << (getDefOk ? L"1" : L"0")
+           << L" strands=" << perHairVertexCount.length()
+           << L" verts=" << vertices.length()
+           << L" radii=" << perVertexRadius.length()
+           << L" normals=" << perVertexNormal.length()
+           << L" colors=" << perVertexColor.length();
+        if (vertices.length() > 0) {
+            const Point3& v0 = vertices[0];
+            ss << L" v0=(" << v0.x << L"," << v0.y << L"," << v0.z << L")";
+        }
+        HairDebugLog(ss.str());
+    }
+    if (!getDefOk) return false;
+
+    if (perHairVertexCount.length() <= 0 || vertices.length() <= 0) return false;
+
+    HairInstanceGroup group;
+    group.handle = node->GetHandle();
+    group.visible = !node->IsNodeHidden(TRUE);
+    GetTransform16(node, t, group.nodeTransform);
+
+    Interval hairValidity = FOREVER;
+    FillHairPBR(node, t, hair->GetShadingParameters(t, hairValidity), group.pbr);
+
+    double opacitySum = 0.0;
+    size_t opacityCount = 0;
+    size_t vertexBase = 0;
+
+    for (size_t hairIndex = 0; hairIndex < perHairVertexCount.length(); ++hairIndex) {
+        const unsigned int vertexCount = perHairVertexCount[hairIndex];
+        if (vertexCount < 2 || (vertexBase + vertexCount) > vertices.length()) {
+            vertexBase += vertexCount;
+            continue;
+        }
+
+        const Point3 root = vertices[vertexBase];
+        Point3 tangentSum(0.0f, 0.0f, 0.0f);
+        float totalLength = 0.0f;
+
+        for (unsigned int vi = 1; vi < vertexCount; ++vi) {
+            Point3 segment = vertices[vertexBase + vi] - vertices[vertexBase + vi - 1];
+            const float segLen = Length(segment);
+            if (segLen <= 1.0e-5f) continue;
+            tangentSum += segment;
+            totalLength += segLen;
+        }
+
+        if (totalLength <= 1.0e-5f || !SafeNormalizePoint3(tangentSum)) {
+            vertexBase += vertexCount;
+            continue;
+        }
+
+        Point3 normalSum(0.0f, 0.0f, 0.0f);
+        if (perVertexNormal.length() == vertices.length()) {
+            for (unsigned int vi = 0; vi < vertexCount; ++vi) {
+                normalSum += perVertexNormal[vertexBase + vi];
+            }
+        }
+        normalSum -= tangentSum * DotProd(normalSum, tangentSum);
+        if (!SafeNormalizePoint3(normalSum)) {
+            normalSum = FallbackHairNormal(tangentSum);
+        }
+
+        Point3 side = CrossProd(normalSum, tangentSum);
+        if (!SafeNormalizePoint3(side)) {
+            normalSum = FallbackHairNormal(tangentSum);
+            side = CrossProd(normalSum, tangentSum);
+            if (!SafeNormalizePoint3(side)) {
+                vertexBase += vertexCount;
+                continue;
+            }
+        }
+
+        float radiusSum = 0.0f;
+        int radiusCount = 0;
+        if (perVertexRadius.length() == vertices.length()) {
+            for (unsigned int vi = 0; vi < vertexCount; ++vi) {
+                radiusSum += std::max(0.0f, perVertexRadius[vertexBase + vi]);
+                radiusCount++;
+            }
+        }
+        const float avgRadius = radiusCount > 0 ? (radiusSum / static_cast<float>(radiusCount)) : 0.0f;
+        const float widthFromRadius = avgRadius * 2.0f;
+        const float widthFromLength = totalLength * 0.035f;
+        const float bladeWidth = std::max(std::max(widthFromRadius, widthFromLength), 0.25f);
+
+        float matrix[16];
+        WriteBasisTransform16(side * bladeWidth, tangentSum * totalLength, normalSum, root, matrix);
+        group.transforms.insert(group.transforms.end(), matrix, matrix + 16);
+
+        float color[3] = { group.pbr.color[0], group.pbr.color[1], group.pbr.color[2] };
+        if (perVertexColor.length() == vertices.length()) {
+            Point3 strandColor(0.0f, 0.0f, 0.0f);
+            for (unsigned int vi = 0; vi < vertexCount; ++vi) {
+                const Color c = perVertexColor[vertexBase + vi];
+                strandColor += Point3(c.r, c.g, c.b);
+            }
+            strandColor *= (1.0f / static_cast<float>(vertexCount));
+            color[0] = std::max(0.0f, strandColor.x);
+            color[1] = std::max(0.0f, strandColor.y);
+            color[2] = std::max(0.0f, strandColor.z);
+        }
+        group.colors.insert(group.colors.end(), color, color + 3);
+
+        if (perVertexOpacity.length() == vertices.length()) {
+            float strandOpacity = 0.0f;
+            for (unsigned int vi = 0; vi < vertexCount; ++vi) {
+                strandOpacity += std::clamp(perVertexOpacity[vertexBase + vi], 0.0f, 1.0f);
+            }
+            opacitySum += strandOpacity / static_cast<float>(vertexCount);
+            opacityCount++;
+        }
+
+        group.instanceCount++;
+        vertexBase += vertexCount;
+    }
+
+    if (group.instanceCount <= 0) return false;
+
+    if (opacityCount > 0) {
+        group.pbr.opacity = static_cast<float>(std::clamp(opacitySum / static_cast<double>(opacityCount), 0.0, 1.0));
+    }
+
+    outGroups.push_back(std::move(group));
+    return true;
 }
 
 // ── JS Modifier detection (three.js Deform in modifier stack) ──
@@ -7125,6 +7531,7 @@ public:
                 }
                 ss << L']';
             }
+            WriteHairInstanceGroupsJson(ss, root, t);
         }
 
         if (options.includeSnapshotUi && !snapshotUiJson.empty()) {
@@ -7223,6 +7630,13 @@ public:
     void SendProjectReload() {
         if (!webview_) return;
         webview_->PostWebMessageAsJson(L"{\"type\":\"project_reload\"}");
+    }
+
+    void SendDebugMessage(const std::wstring& message) {
+        if (!webview_ || !jsReady_) return;
+        std::wostringstream ss;
+        ss << L"{\"type\":\"debug\",\"msg\":\"" << EscapeJson(message.c_str()) << L"\"}";
+        webview_->PostWebMessageAsJson(ss.str().c_str());
     }
 
     void SendInlineLayerRemove(const std::wstring& id) {
@@ -9989,6 +10403,97 @@ public:
         }
     }
 
+    void WriteHairInstanceGroupsJson(std::wostringstream& ss, INode* root, TimeValue t) {
+        if (!root) return;
+
+        HairDebugLog(L"========== WriteHairInstanceGroupsJson called ==========");
+        std::vector<HairInstanceGroup> hairGroups;
+        std::function<void(INode*)> collectHair = [&](INode* parent) {
+            for (int c = 0; c < parent->NumberOfChildren(); ++c) {
+                INode* node = parent->GetChildNode(c);
+                if (!node) continue;
+                if (node->IsNodeHidden(TRUE)) {
+                    collectHair(node);
+                    continue;
+                }
+                const size_t beforeCount = hairGroups.size();
+                Object* obj = node->GetObjectRef();
+                const MSTR className = obj ? obj->ClassName() : MSTR(_T("<null>"));
+                {
+                    std::wostringstream nl;
+                    nl << L"visit node=" << node->GetName() << L" objRefClass=" << className.data();
+                    if (Object* ws = node->EvalWorldState(t).obj) {
+                        nl << L" wsClass=" << ws->ClassName().data() << L" wsSid=0x" << std::hex << ws->SuperClassID() << std::dec;
+                    }
+                    HairDebugLog(nl.str());
+                }
+                const bool isStackHair = _tcsicmp(className.data(), _T("StackHair")) == 0;
+                MaxSDK::IHairModifier* hair = nullptr;
+                MSTR hairSourceClass;
+                const bool hasHairInterface = ProbeHairModifierOnNode(node, hair, &hairSourceClass);
+                const bool hairEnabled = hair ? hair->IsHairEnabled() : false;
+                const bool extracted = ExtractHairInstances(node, t, hairGroups);
+                int renderFallbackVerts = 0;
+                int renderFallbackFaces = 0;
+                if (hasHairInterface && !hairEnabled) {
+                    std::vector<float> rv, ruv;
+                    std::vector<int> ri;
+                    std::vector<MatGroup> rg;
+                    if (ExtractRenderMeshGeometry(node, t, rv, ruv, ri, rg)) {
+                        renderFallbackVerts = static_cast<int>(rv.size() / 3);
+                        renderFallbackFaces = static_cast<int>(ri.size() / 3);
+                    }
+                }
+                if (isStackHair || hasHairInterface) {
+                    std::wostringstream dbg;
+                    dbg << L"=== Hair probe: node=" << node->GetName()
+                        << L" class=" << className.data()
+                        << L" iface=" << (hasHairInterface ? L"1" : L"0")
+                        << L" enabled=" << (hairEnabled ? L"1" : L"0")
+                        << L" ifaceClass=" << (hairSourceClass.isNull() ? L"<null>" : hairSourceClass.data())
+                        << L" extracted=" << (extracted ? L"1" : L"0")
+                        << L" renderVerts=" << renderFallbackVerts
+                        << L" renderFaces=" << renderFallbackFaces
+                        << L" groupsAdded=" << static_cast<int>(hairGroups.size() - beforeCount);
+                    HairDebugLog(dbg.str());
+                    // Now do a verbose pipeline dump for this node
+                    HairDebugLog(L"  pipeline dump:");
+                    FindHairModifierOnStackEnum dumpProc;
+                    dumpProc.dumpAll = true;
+                    EnumGeomPipeline(&dumpProc, node);
+                    HairDebugLog(L"  pipeline dump end");
+                }
+                collectHair(node);
+            }
+        };
+        collectHair(root);
+
+        if (hairGroups.empty()) return;
+
+        ss << L",\"hairInstances\":[";
+        bool firstHair = true;
+        for (const HairInstanceGroup& group : hairGroups) {
+            if (group.instanceCount <= 0 || group.transforms.empty()) continue;
+            if (!firstHair) ss << L',';
+            firstHair = false;
+            ss << L"{\"h\":" << group.handle;
+            ss << L",\"vis\":" << (group.visible ? L'1' : L'0');
+            ss << L",\"count\":" << group.instanceCount;
+            ss << L",\"t\":";
+            WriteFloats(ss, group.nodeTransform, 16);
+            ss << L",\"xforms\":";
+            WriteFloats(ss, group.transforms.data(), group.transforms.size());
+            if (!group.colors.empty()) {
+                ss << L",\"colors\":";
+                WriteFloats(ss, group.colors.data(), group.colors.size());
+            }
+            ss << L",\"mat\":";
+            WriteMaterialFull(ss, group.pbr);
+            ss << L'}';
+        }
+        ss << L']';
+    }
+
     // ── Full scene sync ──────────────────────────────────────
 
     void SendFullSync() {
@@ -10090,6 +10595,7 @@ public:
                 ss << L']';
             }
         }
+        WriteHairInstanceGroupsJson(ss, root, t);
 
         // TODO: tyFlow volume rendering (smoke/fire) — disabled pending shader fixes
         if (false && IsTyFlowAvailable()) {
@@ -10158,6 +10664,9 @@ public:
             }
 
             ULONG handle = node->GetHandle();
+            if (HasEnabledHairModifier(node)) {
+                pluginInstHandles_.insert(handle);
+            }
 
             // Skip expensive ExtractMesh for previously-tracked nodes with unchanged geometry
             bool skipExtract = false;
@@ -10402,6 +10911,9 @@ public:
                 ng.handle = node->GetHandle();
                 ng.changed = false;
                 ng.visible = !node->IsNodeHidden(TRUE);
+                if (HasEnabledHairModifier(node)) {
+                    pluginInstHandles_.insert(ng.handle);
+                }
 
                 // Instance detection via IInstanceMgr
                 auto instIt = instanceSourceMap.find(ng.handle);
@@ -10700,6 +11212,7 @@ public:
                 ss << L']';
             }
         }
+        WriteHairInstanceGroupsJson(ss, root, t);
 
         // TODO: tyFlow volume rendering (smoke/fire) — disabled pending shader fixes
         if (false && IsTyFlowAvailable()) {

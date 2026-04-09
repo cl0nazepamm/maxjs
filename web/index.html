@@ -2730,6 +2730,7 @@
             on(type, fn) { (this.handlers[type] ??= []).push(fn); },
             dispatch(msg) { (this.handlers[msg.type] || []).forEach(fn => fn(msg)); }
         };
+        bridge.on('debug', (msg) => { console.warn('[maxjs/c++]', msg.msg); });
 
         function toBase64Utf8(text) {
             const bytes = new TextEncoder().encode(String(text ?? ''));
@@ -2772,6 +2773,9 @@
             // Max instance GPU buckets
             for (const [, bucket] of maxInstanceBuckets) {
                 count += bucket.handles.size;
+            }
+            for (const [, entry] of hairMeshes) {
+                count += entry?.mesh?.count ?? 0;
             }
             // Forest Pack GPU instances
             for (const [, im] of forestMeshes) {
@@ -2999,6 +3003,9 @@
             // Also enable receiveShadow on all meshes
             for (const [, mesh] of nodeMap) {
                 if (mesh.isMesh) mesh.receiveShadow = enabled;
+            }
+            for (const [, entry] of hairMeshes) {
+                if (entry?.mesh?.isMesh) entry.mesh.receiveShadow = enabled;
             }
         });
 
@@ -3387,6 +3394,7 @@
             if (snapshot.lights) applyLights(snapshot.lights);
             reconcileSplats(snapshot.splats ?? []);
             audioSystem?.applyAudios(snapshot.audios ?? []);
+            applyHairInstances(snapshot.hairInstances);
             applyForestInstances(snapshot.forestInstances);
             applyVolumes(snapshot.volumes);
             buildMaxInstanceBuckets(snapshot.nodes);
@@ -3588,9 +3596,10 @@
             let visibilityChanged = false;
             for (const nd of msg.nodes) {
                 const mesh = nodeMap.get(nd.h);
-                if (!mesh) continue;
                 if (nd.vis != null) visibilityChanged = true;
-                applyIncrementalNodeUpdate(mesh, nd);
+                if (mesh) applyIncrementalNodeUpdate(mesh, nd);
+                if (nd.t) applyHairTransform(nd.h, nd.t);
+                if (nd.vis != null) applyHairVisibility(nd.h, nd.vis);
             }
             if (msg.lights) applyLightUpdates(msg.lights);
             if (msg.splats) applySplatUpdates(msg.splats);
@@ -3870,6 +3879,7 @@
                 onTransform(nodeHandle, matrix) {
                     const mesh = nodeMap.get(nodeHandle);
                     if (mesh) applyIncrementalNodeUpdate(mesh, { t: matrix });
+                    applyHairTransform(nodeHandle, matrix);
                 },
                 onMaterialScalar(nodeHandle, material) {
                     const mesh = nodeMap.get(nodeHandle);
@@ -3882,6 +3892,7 @@
                 onVisibility(nodeHandle, visible) {
                     const mesh = nodeMap.get(nodeHandle);
                     if (mesh) applyIncrementalNodeUpdate(mesh, { vis: visible });
+                    applyHairVisibility(nodeHandle, visible);
                 },
                 onCamera(cameraState) {
                     applyCamera(cameraState);
@@ -4223,6 +4234,146 @@
         function applyLights(lightsData) {
             clearLights();
             finalizeLightState(lightsData);
+        }
+
+        // ── Hair And Fur GPU Instancing ─────────────────────
+        const hairMeshes = new Map(); // handle -> { root, mesh }
+
+        function createHairBladeGeometry() {
+            const rows = 5;
+            const positions = [];
+            const normals = [];
+            const uvs = [];
+            const indices = [];
+
+            function appendPlane(angle) {
+                const c = Math.cos(angle);
+                const s = Math.sin(angle);
+                const baseVertex = positions.length / 3;
+                const nx = s;
+                const ny = 0;
+                const nz = c;
+
+                for (let row = 0; row <= rows; row++) {
+                    const v = row / rows;
+                    const taper = Math.max(0.02, Math.pow(1.0 - v, 0.7));
+                    const halfWidth = 0.5 * taper;
+
+                    const lx0 = -halfWidth;
+                    const lx1 = halfWidth;
+                    const x0 = lx0 * c;
+                    const z0 = -lx0 * s;
+                    const x1 = lx1 * c;
+                    const z1 = -lx1 * s;
+
+                    positions.push(x0, v, z0, x1, v, z1);
+                    normals.push(nx, ny, nz, nx, ny, nz);
+                    uvs.push(0, v, 1, v);
+
+                    if (row < rows) {
+                        const base = baseVertex + row * 2;
+                        indices.push(base, base + 1, base + 2);
+                        indices.push(base + 1, base + 3, base + 2);
+                    }
+                }
+            }
+
+            appendPlane(0);
+            appendPlane(Math.PI * 0.5);
+
+            const geom = new THREE.BufferGeometry();
+            geom.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+            geom.setAttribute('normal', new THREE.Float32BufferAttribute(normals, 3));
+            geom.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
+            geom.setIndex(indices);
+            geom.computeBoundingBox();
+            geom.computeBoundingSphere();
+            return geom;
+        }
+
+        const hairBladeGeometry = createHairBladeGeometry();
+
+        function disposeHairInstances() {
+            for (const [, entry] of hairMeshes) {
+                if (entry?.root?.parent) entry.root.parent.remove(entry.root);
+                disposeSceneMaterial(entry?.mesh?.material);
+            }
+            hairMeshes.clear();
+        }
+
+        function applyHairTransform(handle, matrixArray) {
+            const entry = hairMeshes.get(handle);
+            if (!entry?.root) return false;
+            return applyTransform(entry.root, matrixArray);
+        }
+
+        function applyHairVisibility(handle, visible) {
+            const entry = hairMeshes.get(handle);
+            if (!entry?.root) return false;
+            entry.root.visible = !!visible;
+            return true;
+        }
+
+        function applyHairInstances(groups) {
+            disposeHairInstances();
+            console.warn('[Hair] applyHairInstances called, groups=', Array.isArray(groups) ? groups.length : 'NOT_ARRAY', groups);
+            if (!Array.isArray(groups) || groups.length === 0) return;
+            console.warn('[Hair]', groups.length, 'groups, total instances:', groups.reduce((s, g) => s + (g.count || 0), 0));
+
+            const m = new THREE.Matrix4();
+            const c = new THREE.Color();
+
+            for (const grp of groups) {
+                const count = grp.count || Math.floor((grp.xforms?.length || 0) / 16);
+                if (!count || !Array.isArray(grp.xforms) || grp.xforms.length < count * 16) continue;
+
+                let mat = grp.mat ? createMaterial(grp.mat) : new THREE.MeshPhysicalMaterial({
+                    color: 0xffffff,
+                    roughness: 0.8,
+                    metalness: 0.0,
+                    side: THREE.DoubleSide,
+                });
+                if (Array.isArray(mat)) {
+                    mat = mat[0] ?? new THREE.MeshPhysicalMaterial({ color: 0xffffff, side: THREE.DoubleSide });
+                }
+                mat.side = THREE.DoubleSide;
+                mat.vertexColors = true;
+                if ((grp.mat?.opacity ?? 1) < 0.999) mat.transparent = true;
+                mat.needsUpdate = true;
+
+                const instMesh = new THREE.InstancedMesh(hairBladeGeometry, mat, count);
+                instMesh.matrixAutoUpdate = false;
+                instMesh.frustumCulled = false;
+                instMesh.castShadow = true;
+                instMesh.receiveShadow = true;
+                instMesh.name = `hair_${grp.h}_x${count}`;
+
+                for (let i = 0; i < count; i++) {
+                    const off = i * 16;
+                    m.fromArray(grp.xforms, off);
+                    instMesh.setMatrixAt(i, m);
+
+                    const colorOff = i * 3;
+                    const r = grp.colors?.[colorOff + 0] ?? 1.0;
+                    const g = grp.colors?.[colorOff + 1] ?? 1.0;
+                    const b = grp.colors?.[colorOff + 2] ?? 1.0;
+                    c.setRGB(r, g, b);
+                    instMesh.setColorAt(i, c);
+                }
+                instMesh.instanceMatrix.needsUpdate = true;
+                if (instMesh.instanceColor) instMesh.instanceColor.needsUpdate = true;
+
+                const root = new THREE.Group();
+                root.matrixAutoUpdate = false;
+                root.name = `hair_root_${grp.h}`;
+                root.userData.maxjsHair = true;
+                // NOTE: hair instance matrices are world-space (IHairModifier returns world coords),
+                // so the root group stays at identity. applyHairTransform is a no-op for world-space hair.
+                root.visible = grp.vis == null ? true : !!grp.vis;
+                root.add(instMesh);
+                maxRoot.add(root);
+                hairMeshes.set(grp.h, { root, mesh: instMesh });
+            }
         }
 
         // ── ForestPack GPU Instancing ───────────────────────

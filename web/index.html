@@ -470,6 +470,25 @@
         .fx-note.error {
             color: #e88;
         }
+        .fx-warn {
+            margin: 4px 0 6px 0;
+            padding: 6px 8px;
+            border-left: 2px solid #ffb340;
+            background: rgba(255, 179, 64, 0.08);
+            color: #ffcf80;
+            font-size: 11px;
+            font-weight: 600;
+            line-height: 1.35;
+            letter-spacing: 0.02em;
+            text-transform: none;
+        }
+        .fx-warn:empty { display: none; }
+        .fx-section.collapsed .fx-warn { display: none; }
+        body.light-mode .fx-warn {
+            background: rgba(200, 110, 0, 0.10);
+            color: #8a4a00;
+            border-left-color: #c46a00;
+        }
         .fx-row {
             display: flex;
             align-items: center;
@@ -5214,7 +5233,8 @@
                 key: 'toonOutline',
                 title: 'Toon Outline',
                 copy: 'Black ink outline on objects with ThreeJS Toon material. Auto-detected.',
-                note: 'Only visible on MeshToonMaterial objects. Note: this effect will slow down vertex buffer.',
+                warn: 'NOTICE: enabling this turns OFF mesh fast sync — vertex updates will lag.',
+                note: 'Only visible on MeshToonMaterial objects.',
                 requiresWebGPU: true,
                 isEnabled: () => ssgiFx.isToonOutlineEnabled(),
                 setEnabled: (enabled) => ssgiFx.setToonOutlineEnabled(enabled),
@@ -5408,6 +5428,7 @@
                         <div class="fx-section-title">${section.title}</div>
                         <button class="fx-toggle" type="button" id="fx-toggle-${section.key}">Off</button>
                     </div>
+                    ${section.warn ? `<div class="fx-warn">${section.warn}</div>` : ''}
                     <div class="fx-grid">
                         ${section.controls.map(control => {
                             const inputId = `fx-${section.key}-${control.key}`;

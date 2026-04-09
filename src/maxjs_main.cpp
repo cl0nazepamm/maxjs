@@ -850,6 +850,17 @@ static bool ExtractSpline(INode* node, TimeValue t,
                           std::vector<float>& verts,
                           std::vector<int>& indices);
 
+static bool IsShapeConsumedByOtherRuntimeNode(INode* node, TimeValue t);
+
+static bool ShouldExtractRenderableShape(INode* node, TimeValue t, const ObjectState* os = nullptr) {
+    if (!node) return false;
+    const ObjectState localOs = os ? *os : node->EvalWorldState(t);
+    return localOs.obj
+        && localOs.obj->SuperClassID() == SHAPE_CLASS_ID
+        && node->Renderable()
+        && !IsShapeConsumedByOtherRuntimeNode(node, t);
+}
+
 static uint64_t HashNodeGeometryState(INode* node, TimeValue t) {
     if (!node) return 0;
 
@@ -859,7 +870,7 @@ static uint64_t HashNodeGeometryState(INode* node, TimeValue t) {
 
     ObjectState os = node->EvalWorldState(t);
     if (!os.obj) return 0;
-    if (os.obj->SuperClassID() == SHAPE_CLASS_ID) {
+    if (ShouldExtractRenderableShape(node, t, &os)) {
         std::vector<float> verts;
         std::vector<int> indices;
         if (!ExtractSpline(node, t, verts, indices)) return 0;
@@ -3168,7 +3179,7 @@ static bool TryHashExtractedRenderableGeometry(INode* node, TimeValue t, uint64_
     }
 
     ObjectState os = node->EvalWorldState(t);
-    if (!os.obj || os.obj->SuperClassID() != SHAPE_CLASS_ID) return false;
+    if (!ShouldExtractRenderableShape(node, t, &os)) return false;
     if (!ExtractSpline(node, t, verts, indices)) return false;
 
     outHash = HashMeshData(verts, indices, uvs);
@@ -3811,6 +3822,99 @@ static void CollectReferencedNodeHandlesRecursive(ReferenceMaker* maker,
         if (!ref) continue;
         CollectReferencedNodeHandlesRecursive(ref, ownerHandle, out, visited, depth + 1);
     }
+}
+
+static void CollectReferenceTargetsForNodeObjectGraph(INode* node,
+                                                      std::unordered_set<ReferenceTarget*>& out) {
+    if (!node) return;
+    Object* obj = node->GetObjectRef();
+    while (obj) {
+        if (obj->IsRefTarget()) {
+            out.insert(static_cast<ReferenceTarget*>(obj));
+        }
+        if (obj->SuperClassID() != GEN_DERIVOB_CLASS_ID) break;
+        obj = static_cast<IDerivedObject*>(obj)->GetObjRef();
+    }
+}
+
+static bool ReferenceGraphContainsAnyTarget(ReferenceMaker* maker,
+                                            const std::unordered_set<ReferenceTarget*>& targets,
+                                            std::unordered_set<const void*>& visited,
+                                            int depth = 0) {
+    if (!maker || targets.empty() || depth > 12) return false;
+    if (!visited.insert(maker).second) return false;
+
+    if (maker->IsRefTarget()) {
+        ReferenceTarget* asTarget = static_cast<ReferenceTarget*>(maker);
+        if (targets.find(asTarget) != targets.end()) {
+            return true;
+        }
+    }
+
+    const int numRefs = maker->NumRefs();
+    for (int i = 0; i < numRefs; ++i) {
+        RefTargetHandle ref = maker->GetReference(i);
+        if (!ref) continue;
+        if (targets.find(ref) != targets.end()) {
+            return true;
+        }
+        if (ReferenceGraphContainsAnyTarget(ref, targets, visited, depth + 1)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool HasConsumptiveDependentRecursive(ReferenceMaker* maker,
+                                             INode* targetNode,
+                                             const std::unordered_set<ReferenceTarget*>& targetRefs,
+                                             TimeValue t,
+                                             std::unordered_set<const void*>& visited,
+                                             int depth = 0) {
+    if (!maker || depth > 10) return false;
+    if (!visited.insert(maker).second) return false;
+
+    if (maker->SuperClassID() == BASENODE_CLASS_ID) {
+        INode* depNode = static_cast<INode*>(maker);
+        if (depNode != targetNode) {
+            ObjectState depOs = depNode->EvalWorldState(t);
+            const bool geometryConsumer =
+                depOs.obj && depOs.obj->SuperClassID() == GEOMOBJECT_CLASS_ID;
+            if (geometryConsumer) {
+                std::unordered_set<const void*> refVisited;
+                if (ReferenceGraphContainsAnyTarget(static_cast<ReferenceMaker*>(depNode->GetObjectRef()), targetRefs, refVisited, 0)) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    if (!maker->IsRefTarget()) return false;
+    DependentIterator iter(static_cast<ReferenceTarget*>(maker));
+    for (ReferenceMaker* dep = iter.Next(); dep; dep = iter.Next()) {
+        if (HasConsumptiveDependentRecursive(dep, targetNode, targetRefs, t, visited, depth + 1)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool IsShapeConsumedByOtherRuntimeNode(INode* node, TimeValue t) {
+    if (!node) return false;
+    std::unordered_set<ReferenceTarget*> targetRefs;
+    CollectReferenceTargetsForNodeObjectGraph(node, targetRefs);
+    if (targetRefs.empty()) return false;
+
+    std::unordered_set<const void*> visited;
+    Object* objRef = node->GetObjectRef();
+    if (!objRef || !objRef->IsRefTarget()) return false;
+    DependentIterator iter(static_cast<ReferenceTarget*>(objRef));
+    for (ReferenceMaker* dep = iter.Next(); dep; dep = iter.Next()) {
+        if (HasConsumptiveDependentRecursive(dep, node, targetRefs, t, visited, 0)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 static uint64_t ComputePluginInstanceStateHash(INode* node, TimeValue t, Interface* ip) {
@@ -5492,7 +5596,7 @@ public:
             outSample.groups,
             &outSample.norms);
 
-        if (!extracted && os.obj && os.obj->SuperClassID() == SHAPE_CLASS_ID) {
+        if (!extracted && ShouldExtractRenderableShape(node, sampleTime, &os)) {
             extracted = ExtractSpline(node, sampleTime, outSample.verts, outSample.indices);
             outSample.spline = extracted;
             if (extracted) {
@@ -6706,7 +6810,7 @@ public:
                 bool extracted = ExtractMesh(node, t, snapshotNode.verts, snapshotNode.uvs,
                     snapshotNode.indices, snapshotNode.groups, &snapshotNode.norms);
 
-                if (!extracted && os.obj && os.obj->SuperClassID() == SHAPE_CLASS_ID) {
+                if (!extracted && ShouldExtractRenderableShape(node, t, &os)) {
                     extracted = ExtractSpline(node, t, snapshotNode.verts, snapshotNode.indices);
                     snapshotNode.spline = extracted;
                     if (extracted) {
@@ -8333,7 +8437,7 @@ public:
 
             if (!usedSkinnedFastPositions && !ExtractMesh(node, t, verts, uvs, indices, groups, &norms)) {
                 ObjectState os = node->EvalWorldState(t);
-                if (!os.obj || os.obj->SuperClassID() != SHAPE_CLASS_ID ||
+                if (!ShouldExtractRenderableShape(node, t, &os) ||
                     !ExtractSpline(node, t, verts, indices)) {
                     continue;
                 }
@@ -10122,7 +10226,7 @@ public:
 
                 // Spline fallback — extract as line geometry
                 bool isSpline = false;
-                if (!extracted && os.obj && os.obj->SuperClassID() == SHAPE_CLASS_ID) {
+                if (!extracted && ShouldExtractRenderableShape(node, t, &os)) {
                     extracted = ExtractSpline(node, t, verts, indices);
                     isSpline = extracted;
                 }
@@ -10342,7 +10446,7 @@ public:
                     std::vector<int> controlIdx;
                     bool extracted = ExtractMesh(node, t, ng.verts, ng.uvs, ng.indices, ng.groups, &ng.norms,
                         isSkinned ? &controlIdx : nullptr);
-                    if (!extracted && os.obj && os.obj->SuperClassID() == SHAPE_CLASS_ID) {
+                    if (!extracted && ShouldExtractRenderableShape(node, t, &os)) {
                         extracted = ExtractSpline(node, t, ng.verts, ng.indices);
                         ng.spline = extracted;
                         if (extracted) {

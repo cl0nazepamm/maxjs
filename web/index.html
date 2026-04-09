@@ -886,13 +886,11 @@
         const PERFORMANCE_DEFAULTS = Object.freeze({
             fpsCap: 0,
             renderScale: 1.0,
-            autoThrottle: true,
             optimizeMaxInstances: true,
             maxInstanceBucketThreshold: 50,
         });
         let performanceSettings = { ...PERFORMANCE_DEFAULTS };
         let lastRenderTimestamp = 0;
-        let windowFocused = true;
 
         function getEffectivePixelRatio() {
             const scale = Number.isFinite(performanceSettings.renderScale) ? performanceSettings.renderScale : 1.0;
@@ -3071,6 +3069,9 @@
                                 mesh.geometry.dispose();
                                 mesh.geometry = geom;
                             }
+                            // Geometry data on the same Object3D — no pipeline
+                            // rebuild needed regardless of which branch ran.
+                            ssgiFx?.markGeometryDataDirty?.();
                             }
                         }
                     } else {
@@ -3360,7 +3361,10 @@
             buildMaxInstanceBuckets(snapshot.nodes);
             profileSceneNodes(snapshot.nodes);
             scene.updateMatrixWorld(true);
-            ssgiFx.markSceneChanged?.({ rebuild: true });
+            // Full snapshot can add/remove many meshes — cheap scene refresh.
+            // Effect toggles, env, and renderer size have their own dedicated
+            // entry points, so a full pipeline rebuild is unnecessary here.
+            ssgiFx.markSceneChanged?.();
             options.afterWorldUpdate?.();
 
             if (firstSync && snapshot.nodes.length > 0) {
@@ -3532,14 +3536,19 @@
                 newMesh.matrixWorld.copy(mesh.matrixWorld);
                 maxRoot.add(newMesh);
                 nodeMap.set(msg.h, newMesh);
-                ssgiFx.markSceneChanged?.({ rebuild: true });
+                // Renderable-type swap (mesh ↔ line) — scene structure changed,
+                // refresh the post-pass hide list / toon cache. Cheap.
+                ssgiFx.markSceneChanged?.();
                 return;
             }
 
             const geom = buildGeometry(msg.v, msg.i, msg.uv, msg.norm, { isLine: wantsLine });
             mesh.geometry.dispose();
             mesh.geometry = geom;
-            ssgiFx.markSceneChanged?.({ rebuild: true });
+            // Vertex / topology data on the same Object3D — no scene-structure
+            // refresh, no pipeline rebuild. pass(scene, camera) picks up the new
+            // BufferGeometry attributes on the next frame automatically.
+            ssgiFx.markGeometryDataDirty?.();
         });
 
         // ── Transform Sync (+ material scalars, ~6fps) ──────
@@ -3557,7 +3566,8 @@
             if (msg.audios) audioSystem?.applyAudioUpdates(msg.audios);
             if (msg.camera) applyCamera(msg.camera);
             if (visibilityChanged) {
-                ssgiFx.markSceneChanged?.({ rebuild: true });
+                // Visibility flip changes the post-pass hide list — cheap refresh.
+                ssgiFx.markSceneChanged?.();
             }
             const applyMs = performance.now() - applyStart;
             updateSyncHud({
@@ -5510,10 +5520,6 @@
                                 </div>
                                 <input class="fx-range" id="fx-performance-renderscale" type="range" min="0.25" max="1" step="0.05" value="${performanceSettings.renderScale}">
                             </label>
-                            <label class="fx-check" for="fx-performance-autothrottle">
-                                <span>Auto Throttle</span>
-                                <input id="fx-performance-autothrottle" type="checkbox" ${performanceSettings.autoThrottle ? 'checked' : ''}>
-                            </label>
                             <label class="fx-check" for="fx-performance-optimizeinstances">
                                 <span>Optimize Max Instances</span>
                                 <input id="fx-performance-optimizeinstances" type="checkbox" ${performanceSettings.optimizeMaxInstances ? 'checked' : ''}>
@@ -5770,7 +5776,6 @@
             const fpsCapSelect = document.getElementById('fx-performance-fpscap');
             const renderScaleSlider = document.getElementById('fx-performance-renderscale');
             const renderScaleValue = document.getElementById('fx-performance-renderscale-val');
-            const autoThrottleCheck = document.getElementById('fx-performance-autothrottle');
             const optimizeInstancesCheck = document.getElementById('fx-performance-optimizeinstances');
             const instanceThresholdSlider = document.getElementById('fx-performance-instancethreshold');
             const instanceThresholdValue = document.getElementById('fx-performance-instancethreshold-val');
@@ -5785,12 +5790,6 @@
                 renderScaleValue.textContent = `${performanceSettings.renderScale.toFixed(2)}x`;
                 applyRendererPerformanceSettings({ resizePostFx: true });
                 savePostFxState();
-            };
-            autoThrottleCheck.onchange = () => {
-                performanceSettings.autoThrottle = autoThrottleCheck.checked;
-                lastRenderTimestamp = 0;
-                savePostFxState();
-                syncPostFxPanel(true);
             };
             optimizeInstancesCheck.onchange = () => {
                 performanceSettings.optimizeMaxInstances = optimizeInstancesCheck.checked;
@@ -6031,7 +6030,6 @@
             const fpsCapSelect = document.getElementById('fx-performance-fpscap');
             const renderScaleSlider = document.getElementById('fx-performance-renderscale');
             const renderScaleValue = document.getElementById('fx-performance-renderscale-val');
-            const autoThrottleCheck = document.getElementById('fx-performance-autothrottle');
             const optimizeInstancesCheck = document.getElementById('fx-performance-optimizeinstances');
             const instanceThresholdSlider = document.getElementById('fx-performance-instancethreshold');
             const instanceThresholdValue = document.getElementById('fx-performance-instancethreshold-val');
@@ -6041,14 +6039,12 @@
             if (fpsCapSelect) fpsCapSelect.value = String(performanceSettings.fpsCap || 0);
             if (renderScaleSlider) renderScaleSlider.value = String(performanceSettings.renderScale);
             if (renderScaleValue) renderScaleValue.textContent = `${performanceSettings.renderScale.toFixed(2)}x`;
-            if (autoThrottleCheck) autoThrottleCheck.checked = !!performanceSettings.autoThrottle;
             if (optimizeInstancesCheck) optimizeInstancesCheck.checked = !!performanceSettings.optimizeMaxInstances;
             if (instanceThresholdSlider) instanceThresholdSlider.value = String(performanceSettings.maxInstanceBucketThreshold);
             if (instanceThresholdValue) instanceThresholdValue.textContent = String(performanceSettings.maxInstanceBucketThreshold);
             if (performanceNote) {
-                const throttleActive = performanceSettings.autoThrottle && (document.hidden || !windowFocused);
                 performanceNote.textContent =
-                    `Caps the viewer frame rate and scales device pixel ratio to reduce GPU load. Effective DPR ${getEffectivePixelRatio().toFixed(2)}.${throttleActive ? ' Auto-throttle active.' : ''} Large plain Max instance groups can collapse into InstancedMesh buckets. XR stays uncapped.`;
+                    `Caps the viewer frame rate and scales device pixel ratio to reduce GPU load. Effective DPR ${getEffectivePixelRatio().toFixed(2)}. Large plain Max instance groups can collapse into InstancedMesh buckets. XR stays uncapped.`;
             }
 
             const hasEnabledEffects = ssgiFx.hasEnabledEffects();
@@ -6142,7 +6138,6 @@
                 performance: {
                     fpsCap: performanceSettings.fpsCap,
                     renderScale: performanceSettings.renderScale,
-                    autoThrottle: performanceSettings.autoThrottle,
                     optimizeMaxInstances: performanceSettings.optimizeMaxInstances,
                     maxInstanceBucketThreshold: performanceSettings.maxInstanceBucketThreshold,
                 },
@@ -6208,9 +6203,6 @@
                     }
                     if (Number.isFinite(saved.performance.renderScale)) {
                         performanceSettings.renderScale = Math.max(0.25, Math.min(1.0, saved.performance.renderScale));
-                    }
-                    if (typeof saved.performance.autoThrottle === 'boolean') {
-                        performanceSettings.autoThrottle = saved.performance.autoThrottle;
                     }
                     if (typeof saved.performance.optimizeMaxInstances === 'boolean') {
                         performanceSettings.optimizeMaxInstances = saved.performance.optimizeMaxInstances;
@@ -6596,12 +6588,8 @@
             flushMaterialDisposals();
             if (renderToImageActive && !pendingRenderToImage) return;
             const manualFpsCap = Number.isFinite(performanceSettings.fpsCap) ? performanceSettings.fpsCap : 0;
-            const autoThrottleCap = performanceSettings.autoThrottle && (document.hidden || !windowFocused) ? 30 : 0;
-            const effectiveFpsCap = autoThrottleCap > 0
-                ? (manualFpsCap > 0 ? Math.min(manualFpsCap, autoThrottleCap) : autoThrottleCap)
-                : manualFpsCap;
-            if (!renderer.xr?.isPresenting && effectiveFpsCap > 0) {
-                const minFrameMs = 1000 / effectiveFpsCap;
+            if (!renderer.xr?.isPresenting && manualFpsCap > 0) {
+                const minFrameMs = 1000 / manualFpsCap;
                 if (lastRenderTimestamp !== 0 && (frameTimeMs - lastRenderTimestamp) < minFrameMs) return;
             }
             lastRenderTimestamp = frameTimeMs;
@@ -6710,7 +6698,8 @@
         });
         layerManager.subscribe?.(() => {
             animationSystem.invalidateTargets();
-            ssgiFx.markSceneChanged?.({ rebuild: true });
+            // Layer mutations can add/remove meshes — cheap scene refresh.
+            ssgiFx.markSceneChanged?.();
         });
         const projectRuntime = window.chrome?.webview
             ? createProjectRuntime({ layerManager, bridge, perfHud })
@@ -6903,7 +6892,6 @@
             savedPerformanceSettings = { ...performanceSettings };
             performanceSettings.renderScale = 1.0;
             performanceSettings.fpsCap = 0;
-            performanceSettings.autoThrottle = false;
 
             savedRenderToImageState = {
                 envVisible,
@@ -7036,12 +7024,10 @@
         }
 
         addEventListener('focus', () => {
-            windowFocused = true;
             lastRenderTimestamp = 0;
             syncPostFxPanel(true);
         });
         addEventListener('blur', () => {
-            windowFocused = false;
             lastRenderTimestamp = 0;
             syncPostFxPanel(true);
         });

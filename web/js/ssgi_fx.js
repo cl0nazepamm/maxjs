@@ -750,7 +750,8 @@ export function createSSGIController({
 
     function flushPendingPipelineUpdates() {
         syncRendererOutputState();
-        const needsRebuild = pendingSceneRefresh || pendingPipelineRebuild;
+        const needsRebuild = pendingPipelineRebuild;
+        const needsSceneRefresh = pendingSceneRefresh;
         const needsOutputRefresh = pendingOutputRefresh;
 
         pendingSceneRefresh = false;
@@ -758,8 +759,20 @@ export function createSSGIController({
         pendingOutputRefresh = false;
 
         if (needsRebuild) {
+            // Full pipeline reconstruction — only when the post-FX node graph actually
+            // changes (effect toggled, renderer size changed, env map swapped). Do not
+            // call this on data updates: pass(scene, camera) reads the latest scene
+            // state every frame automatically.
             rebuildPipeline();
             return;
+        }
+
+        if (needsSceneRefresh && pipelineReady) {
+            // Scene structure changed (mesh added/removed/material swap) but the
+            // post-FX node graph is unchanged. Refresh the two scene-derived caches
+            // without tearing down the pipeline.
+            refreshToonMeshCache();
+            refreshPostPassHideList();
         }
 
         if (needsOutputRefresh && pipelineReady) {
@@ -1579,12 +1592,36 @@ export function createSSGIController({
                 queuePipelineUpdate({ rebuild: true, output: true });
             }
         },
+        /**
+         * Call when the scene's mesh list / material assignment changes
+         * (mesh added, removed, or material swapped). Cheap: just refreshes the
+         * toon-cache and post-pass hide list. Does NOT rebuild the pipeline graph.
+         *
+         * Pass `{ rebuild: true }` only when the post-FX node graph itself must be
+         * reconstructed (renderer size, effect toggled, env map swapped) — almost
+         * never needed from outside, since those have dedicated entry points.
+         */
         markSceneChanged(options = {}) {
+            // Toon outline is the one effect that binds per-mesh references into
+            // the post-FX node graph at rebuild time, so scene-structure changes
+            // while it is enabled must escalate to a full rebuild. Everything
+            // else only needs the cheap toon-cache + hide-list refresh.
+            const mustRebuild =
+                options.rebuild === true || state.toonOutline.enabled;
             queuePipelineUpdate({
                 scene: true,
-                rebuild: options.rebuild !== false,
+                rebuild: mustRebuild,
                 output: true,
             });
+        },
+        /**
+         * Call after vertex / normal / uv / index data on an existing mesh changed
+         * (mesh fast sync hot path). This is a no-op: pass(scene, camera) reads the
+         * latest BufferGeometry attributes every frame automatically. Exists so
+         * callers can document intent without paying for an unnecessary rebuild.
+         */
+        markGeometryDataDirty() {
+            // intentionally empty — see doc above
         },
         markOutputChanged() {
             queuePipelineUpdate({ output: true });

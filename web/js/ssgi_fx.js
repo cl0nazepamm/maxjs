@@ -274,6 +274,13 @@ export function createSSGIController({
     let available = true;
     let lastError = '';
     let pipelineReady = false;
+    // True if rebuildPipeline() last ran while the scene had zero renderables.
+    // Happens when saved post-FX state is restored at boot before any scene
+    // sync — the pass(scene, camera) node caches an empty render list.
+    // Next scene-change escalates to a real rebuild to re-bind against the
+    // now-populated scene, then clears this flag. Prevents breakage without
+    // rebuilding on every subsequent snapshot (which would murder scrub perf).
+    let pipelineBuiltAgainstEmptyScene = false;
     let activeNodes = [];
     let activeSSRPass = null;
     let activeAOPass = null;
@@ -1438,6 +1445,16 @@ export function createSSGIController({
             pipelineReady = true;
             lastError = '';
             forceEnvironmentBackground = useEnvironmentBackdropCompensation;
+
+            // Track whether the scene had any renderables at build time. If
+            // zero (cold-start with saved post-FX before any scene sync),
+            // pass(scene, camera) cached an empty render list and the next
+            // markSceneChanged must escalate to a real rebuild.
+            let renderableCount = 0;
+            scene.traverse((obj) => {
+                if (obj?.isMesh || obj?.isSkinnedMesh) renderableCount++;
+            });
+            pipelineBuiltAgainstEmptyScene = renderableCount === 0;
         } catch (error) {
             forceEnvironmentBackground = false;
             disableWithError('SSGI setup failed', error);
@@ -1602,10 +1619,13 @@ export function createSSGIController({
          * never needed from outside, since those have dedicated entry points.
          */
         markSceneChanged(options = {}) {
-            // Toon outline is the one effect that binds per-mesh references into
-            // the post-FX node graph at rebuild time, so scene-structure changes
-            // while it is enabled must escalate to a full rebuild. Everything
-            // else only needs the cheap toon-cache + hide-list refresh.
+            // Three reasons to escalate a scene-structure change to a full rebuild:
+            //   1. Explicit {rebuild:true} from the caller (env swap, resize).
+            //   2. Toon outline is on — it binds per-mesh refs into the node
+            //      graph at rebuild time, so scene-structure mutations break it.
+            //   3. The current pipeline was built against an empty scene (cold
+            //      start with saved post-FX). pass(scene, camera) cached an
+            //      empty render list; we need one real rebuild to re-bind.
             //
             // Do NOT pass output:true here — scene structure changes do not touch
             // the output node tree (tone mapping / exposure / gamma). Setting
@@ -1613,7 +1633,9 @@ export function createSSGIController({
             // cause DOF microflicker (the gather kernel samples a partially
             // re-bound RT). Output changes have their own entry point.
             const mustRebuild =
-                options.rebuild === true || state.toonOutline.enabled;
+                options.rebuild === true ||
+                state.toonOutline.enabled ||
+                pipelineBuiltAgainstEmptyScene;
             queuePipelineUpdate({
                 scene: true,
                 rebuild: mustRebuild,

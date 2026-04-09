@@ -3410,20 +3410,10 @@
             } else if (typeof renderer.compile === 'function') {
                 try { renderer.compile(scene, camera); } catch {}
             }
-            // Full scene snapshots MUST rebuild the post-FX pipeline, not just
-            // refresh the scene caches. Two failure modes the cheap refresh can
-            // not cover:
-            //   1. Cold start with saved-on post-FX: rebuildPipeline ran once
-            //      against an empty scene during applySavedPostFxPayload, so
-            //      pass(scene, camera) cached an empty render list. The first
-            //      sync needs to rebuild so the pass re-binds to populated scene.
-            //   2. Live refresh while post-FX is on: mesh.geometry = newGeom
-            //      swaps leave stale GPU state in Three.js's WebGPU RenderObject
-            //      cache. Rebuild causes clearNodes → fresh pass → cache re-query.
-            // This is the rare path (once per full scene swap, not per-frame),
-            // so the rebuild cost is fine. geo_fast / xform / visibility paths
-            // stay on the cheap refresh.
-            ssgiFx.markSceneChanged?.({ rebuild: true });
+            // Full snapshot can add/remove many meshes — cheap scene refresh.
+            // Effect toggles, env, and renderer size have their own dedicated
+            // entry points, so a full pipeline rebuild is unnecessary here.
+            ssgiFx.markSceneChanged?.();
             options.afterWorldUpdate?.();
 
             if (firstSync && snapshot.nodes.length > 0) {

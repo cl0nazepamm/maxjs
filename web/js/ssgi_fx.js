@@ -178,7 +178,7 @@ export function createSSGIController({
             threshold: 0.75,
         },
         toonOutline: {
-            enabled: true,
+            enabled: false,
             color: [0, 0, 0],
             thickness: 0.003,
             alpha: 1.0,

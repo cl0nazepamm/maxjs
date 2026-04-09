@@ -3400,16 +3400,6 @@
             buildMaxInstanceBuckets(snapshot.nodes);
             profileSceneNodes(snapshot.nodes);
             scene.updateMatrixWorld(true);
-            // Pre-warm GPU resources (shader compile, VBO/IBO upload, texture
-            // binding) for all meshes in the refreshed scene. Without this the
-            // first post-FX frame after a refresh stalls on cold shader compile
-            // and buffer upload — visible as choppiness, especially with motion
-            // blur / SSR / DOF where the frame budget is already tight.
-            if (typeof renderer.compileAsync === 'function') {
-                renderer.compileAsync(scene, camera).catch(() => {});
-            } else if (typeof renderer.compile === 'function') {
-                try { renderer.compile(scene, camera); } catch {}
-            }
             // Full snapshot can add/remove many meshes — cheap scene refresh.
             // Effect toggles, env, and renderer size have their own dedicated
             // entry points, so a full pipeline rebuild is unnecessary here.
@@ -3608,7 +3598,6 @@
                 const mesh = nodeMap.get(nd.h);
                 if (nd.vis != null) visibilityChanged = true;
                 if (mesh) applyIncrementalNodeUpdate(mesh, nd);
-                if (nd.mat) applyHairMaterialScalar(nd.h, nd.mat);
                 if (nd.t) applyHairTransform(nd.h, nd.t);
                 if (nd.vis != null) applyHairVisibility(nd.h, nd.vis);
             }
@@ -3895,7 +3884,6 @@
                 onMaterialScalar(nodeHandle, material) {
                     const mesh = nodeMap.get(nodeHandle);
                     if (mesh) applyIncrementalNodeUpdate(mesh, { mat: material });
-                    applyHairMaterialScalar(nodeHandle, material);
                 },
                 onSelection(nodeHandle, selected) {
                     const mesh = nodeMap.get(nodeHandle);
@@ -4326,16 +4314,11 @@
             return true;
         }
 
-        function applyHairMaterialScalar(handle, material) {
-            const entry = hairMeshes.get(handle);
-            if (!entry?.mesh || !material) return false;
-            applyMaterialScalar(entry.mesh, material);
-            return true;
-        }
-
         function applyHairInstances(groups) {
             disposeHairInstances();
+            console.warn('[Hair] applyHairInstances called, groups=', Array.isArray(groups) ? groups.length : 'NOT_ARRAY', groups);
             if (!Array.isArray(groups) || groups.length === 0) return;
+            console.warn('[Hair]', groups.length, 'groups, total instances:', groups.reduce((s, g) => s + (g.count || 0), 0));
 
             const m = new THREE.Matrix4();
             const c = new THREE.Color();
@@ -4384,9 +4367,8 @@
                 root.matrixAutoUpdate = false;
                 root.name = `hair_root_${grp.h}`;
                 root.userData.maxjsHair = true;
-                if (Array.isArray(grp.t) && grp.t.length >= 16) {
-                    applyTransform(root, grp.t);
-                }
+                // NOTE: hair instance matrices are world-space (IHairModifier returns world coords),
+                // so the root group stays at identity. applyHairTransform is a no-op for world-space hair.
                 root.visible = grp.vis == null ? true : !!grp.vis;
                 root.add(instMesh);
                 maxRoot.add(root);

@@ -340,6 +340,17 @@
             opacity: 0.25;
             pointer-events: none;
         }
+        .fx-section.disabled-by-other {
+            opacity: 0.45;
+        }
+        .fx-section.disabled-by-other .fx-section-title,
+        .fx-section.disabled-by-other .fx-control-head,
+        .fx-section.disabled-by-other .fx-check {
+            color: #666;
+        }
+        .fx-section.disabled-by-other .fx-toggle {
+            cursor: not-allowed;
+        }
         .fx-section-title {
             font-size: 10px;
             font-weight: 700;
@@ -5233,7 +5244,7 @@
                 key: 'toonOutline',
                 title: 'Toon Outline',
                 copy: 'Black ink outline on objects with ThreeJS Toon material. Auto-detected.',
-                warn: 'NOTICE: enabling this turns OFF mesh fast sync — vertex updates will lag.',
+                warn: 'NOTICE: This particular effect will turn off max.js fastsync and vertex updates will lag.',
                 note: 'Only visible on MeshToonMaterial objects.',
                 requiresWebGPU: true,
                 isEnabled: () => ssgiFx.isToonOutlineEnabled(),
@@ -5251,6 +5262,11 @@
                 copy: 'Velocity-based blur from camera and object motion in the current frame.',
                 note: 'Requires the real WebGPU backend.',
                 requiresWebGPU: true,
+                // Pixel FX takes the post-pass output; motion blur on top is meaningless
+                // (it would smear the pixelated image). Mutually exclusive.
+                disabledBy: (state) => state.pixel.enabled
+                    ? 'Disabled while Pixel FX is on.'
+                    : null,
                 isEnabled: () => ssgiFx.isMotionBlurEnabled(),
                 setEnabled: (enabled) => ssgiFx.setMotionBlurEnabled(enabled),
                 getValues: (state) => state.motionBlur,
@@ -5323,10 +5339,17 @@
                 key: 'pixel',
                 title: 'Pixel FX',
                 copy: 'Pixelation, chromatic aberration, sharpen, color grading, and film grain.',
-                note: 'Works on WebGPU and WebGL fallback.',
+                note: 'Works on WebGPU and WebGL fallback. Mutually exclusive with Motion Blur.',
                 requiresWebGPU: false,
                 isEnabled: () => ssgiFx.isPixelEnabled(),
-                setEnabled: (enabled) => ssgiFx.setPixelEnabled(enabled),
+                setEnabled: (enabled) => {
+                    // Pixel FX and Motion Blur are mutually exclusive — turning on
+                    // Pixel forces Motion Blur off so the disabled-by gate is honored.
+                    if (enabled && ssgiFx.isMotionBlurEnabled()) {
+                        ssgiFx.setMotionBlurEnabled(false);
+                    }
+                    return ssgiFx.setPixelEnabled(enabled);
+                },
                 getValues: (state) => state.pixel,
                 setValues: (patch) => ssgiFx.setPixelOptions(patch),
                 controls: [
@@ -5986,6 +6009,7 @@
             }
 
             for (const section of postFxSections) {
+                section.sectionEl = document.querySelector(`.fx-section[data-fx-section="${section.key}"]`);
                 section.toggleEl = document.getElementById(`fx-toggle-${section.key}`);
                 section.noteEl = document.getElementById(`fx-note-${section.key}`);
                 section.controlEls = {};
@@ -6074,11 +6098,18 @@
             for (const section of postFxSections) {
                 const values = section.getValues(state);
                 const enabled = section.isEnabled();
-                const disabled = !available || (section.requiresWebGPU && !supportsScreenSpaceEffects);
+                const disabledByOther = section.disabledBy ? section.disabledBy(state) : null;
+                const disabled =
+                    !available ||
+                    (section.requiresWebGPU && !supportsScreenSpaceEffects) ||
+                    !!disabledByOther;
 
                 section.toggleEl.textContent = enabled ? 'On' : 'Off';
                 section.toggleEl.classList.toggle('active', enabled);
                 section.toggleEl.disabled = disabled;
+                if (section.sectionEl) {
+                    section.sectionEl.classList.toggle('disabled-by-other', !!disabledByOther);
+                }
 
                 for (const control of section.controls) {
                     const controlEl = section.controlEls[control.key];
@@ -6106,6 +6137,9 @@
                     isError = true;
                 } else if (section.requiresWebGPU && !supportsScreenSpaceEffects) {
                     note = 'Requires the real WebGPU backend.';
+                    isError = true;
+                } else if (disabledByOther) {
+                    note = disabledByOther;
                     isError = true;
                 } else if (section.key === 'ssr' && derived) {
                     note = `World distance ${derived.effectiveSSRMaxDistance.toFixed(2)} • thickness ${derived.effectiveSSRThickness.toFixed(3)}`;

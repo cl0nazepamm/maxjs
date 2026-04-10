@@ -2,6 +2,17 @@
 
 This document describes the Stage 3 runtime split for file-backed Three.js projects inside MaxJS.
 
+Usage-facing naming:
+
+- `FastAPI`
+  The layer-facing read/query surface for scene data.
+  In code today this is mainly `ctx.maxScene`, `ctx.scene`, `ctx.nodeMap`,
+  and the node adapters they return.
+- `ctx.js`
+  The JS ownership/write surface.
+- `snapshot`
+  The deployable exported runtime state.
+
 ## Goal
 
 MaxJS needs two different authoring worlds:
@@ -66,6 +77,10 @@ Available methods:
 - `findByName(name, { exact })`
 - `createAnchor(handle, options)`
 
+Node adapters returned by `getNode(handle)` also expose:
+
+- `sampleSurface(options)`
+
 Available state snapshots:
 
 - `background`
@@ -103,6 +118,7 @@ Each node adapter exposes:
 - `getWorldScale()`
 - `getBoundingBox()`
 - `snapshot()`
+- `sampleSurface(options)`
 
 ### `ctx.js`
 
@@ -120,6 +136,9 @@ Authoring surface for JS-owned content.
 - `dispose(resource)`
 
 `cloneFromMax()` is the escape hatch for "use this Max object as a starting point, but make it JS-owned from now on."
+
+It is not the preferred read path for geometry sampling.
+For read-only mesh surface access, use `ctx.maxScene.getNode(handle).sampleSurface()`.
 
 ## Anchors
 

@@ -9021,8 +9021,10 @@ public:
             const bool allowRealtimeAuxPolling = allowIdlePolling || animPlaying;
             const bool allowHeavyGeometryPolling = !favorInteractive && !animPlaying;
 
-            if (allowIdlePolling && slowPhase == 0) CheckWebContentChanges();
-            if (allowIdlePolling && slowPhase == 3) CheckProjectContentChanges();
+            // Source file polling must keep working even while favoring interactive redraw.
+            // These are cheap timestamp checks, unlike the heavier scene/material scans below.
+            if (slowPhase == 0) CheckWebContentChanges();
+            if (slowPhase == 3) CheckProjectContentChanges();
             if (allowIdlePolling && tickCount_ % MATERIAL_DETECT_TICKS == 2) DetectMaterialChanges();
             if (allowIdlePolling && lightPhase == 0) DetectPropertyChanges();
             if (allowRealtimeAuxPolling && lightPhase == 1) {
@@ -9034,7 +9036,7 @@ public:
             if (allowIdlePolling && slowPhase == 9) DetectJsModChanges();
             if (allowIdlePolling && slowPhase == 12) DetectPluginInstanceChanges();
             if (allowRealtimeAuxPolling && lightPhase == 2) PollViewportModes();
-            if (allowIdlePolling && slowPhase == 1) ScanInlineLayers();
+            if (slowPhase == 1) ScanInlineLayers();
         }
     }
 

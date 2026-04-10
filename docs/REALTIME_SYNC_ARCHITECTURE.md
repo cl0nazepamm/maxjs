@@ -4,6 +4,13 @@ This file records how realtime sync currently works in MaxJS and what was change
 
 Date: 2026-04-07
 
+Terminology used elsewhere in docs:
+
+- `fastsync`
+  The native realtime delta pipeline described in this document.
+- `FastAPI`
+  The layer-facing scene access surface described in `STAGE3_DUAL_WORLD_ARCHITECTURE.md`.
+
 ## Goal
 
 MaxJS keeps a Three.js scene inside WebView2 synchronized with the live 3ds Max scene.
@@ -62,6 +69,8 @@ Examples:
 - `geo_fast`
   Dedicated geometry hot update for a single mesh.
   Used for realtime vertex edits and mesh deformation updates.
+
+This whole delta path is what we refer to as `fastsync`.
 
 ### Other messages
 

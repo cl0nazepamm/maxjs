@@ -78,6 +78,10 @@ function cloneManifest(manifest) {
     return JSON.parse(JSON.stringify(manifest));
 }
 
+function cloneJsonValue(value) {
+    return value == null ? value : JSON.parse(JSON.stringify(value));
+}
+
 function manifest404(error) {
     return String(error?.message || error).includes('404');
 }
@@ -95,13 +99,17 @@ export function createProjectRuntime({ layerManager, bridge, perfHud }) {
     let pollMs = 0;
     let sceneSaved = false;
     let manifestExists = false;
+    let transientPostFxState = null;
+    let postFxState = null;
     let lastManifestText = '';
+    let lastPostFxText = '';
     let lastStatus = '';
     let timer = 0;
     let revision = 0;
     let pollInFlight = false;
     let manifestState = null;
     let nextRequestId = 1;
+    let suppressProjectReloadCount = 0;
 
     const activeLayerIds = new Set();
     const activeProjectLayers = new Map();
@@ -274,6 +282,34 @@ export function createProjectRuntime({ layerManager, bridge, perfHud }) {
         }
     }
 
+    async function loadPostFxState(force = false) {
+        if (!projectRootUrl) {
+            postFxState = null;
+            lastPostFxText = '';
+            return false;
+        }
+
+        const postFxUrl = projectUrl(projectRootUrl, 'postfx.maxjs.json', `${Date.now()}`);
+        try {
+            const text = await fetchText(postFxUrl);
+            if (!force && text === lastPostFxText) return false;
+
+            lastPostFxText = text;
+            postFxState = cloneJsonValue(JSON.parse(text));
+            emitChange();
+            return true;
+        } catch (error) {
+            if (!manifest404(error)) throw error;
+
+            lastPostFxText = '';
+            const fallback = cloneJsonValue(manifestState?.postFx ?? null);
+            const changed = stableStringify(postFxState) !== stableStringify(fallback);
+            postFxState = fallback;
+            if (changed) emitChange();
+            return changed;
+        }
+    }
+
     async function mountLayer(entry, manifest) {
         const layerId = entry.id;
         const entryPath = entry.entryPath;
@@ -333,9 +369,12 @@ export function createProjectRuntime({ layerManager, bridge, perfHud }) {
         pollInFlight = true;
         try {
             const manifest = await loadManifest(force);
-            if (!manifest) return false;
+            if (!manifest) {
+                return await loadPostFxState(force);
+            }
 
             await applyManifest(manifest, { forceReload: force });
+            await loadPostFxState(force);
 
             if (Number.isFinite(manifest.pollMs) && manifest.pollMs >= 0) {
                 pollMs = manifest.pollMs;
@@ -347,7 +386,9 @@ export function createProjectRuntime({ layerManager, bridge, perfHud }) {
         } catch (error) {
             clearProjectLayers();
             manifestState = null;
+            postFxState = null;
             lastManifestText = '';
+            lastPostFxText = '';
             emitChange();
 
             const is404 = manifest404(error);
@@ -378,24 +419,35 @@ export function createProjectRuntime({ layerManager, bridge, perfHud }) {
         return manifestState;
     }
 
-    async function persistManifest(nextManifest) {
+    async function persistManifest(nextManifest, options = {}) {
         const text = `${JSON.stringify(nextManifest, null, 2)}\n`;
+        if (options.reload === false) {
+            suppressProjectReloadCount = Math.max(suppressProjectReloadCount, 2);
+        }
         await requestHostAction('project_manifest_write', {
             contentBase64: toBase64Utf8(text),
+            reload: options.reload !== false,
         });
 
         lastManifestText = text;
         manifestExists = true;
-        await applyManifest(nextManifest);
-        setStatus(`project saved: ${nextManifest.name || projectDir}`);
+        if (options.apply !== false) {
+            await applyManifest(nextManifest);
+        } else {
+            manifestState = nextManifest;
+            emitChange();
+        }
+        if (!options.silent) {
+            setStatus(`project saved: ${nextManifest.name || projectDir}`);
+        }
         return true;
     }
 
-    async function updateManifest(mutator) {
+    async function updateManifest(mutator, options = {}) {
         const manifest = cloneManifest(await ensureManifestLoaded());
         mutator(manifest);
         if (!Array.isArray(manifest.layers)) manifest.layers = [];
-        await persistManifest(manifest);
+        await persistManifest(manifest, options);
     }
 
     async function setLayerEnabled(id, enabled) {
@@ -447,6 +499,29 @@ export function createProjectRuntime({ layerManager, bridge, perfHud }) {
         await requestHostAction('inline_layer_clear');
     }
 
+    function getPostFxState() {
+        return cloneJsonValue(postFxState ?? transientPostFxState ?? manifestState?.postFx ?? null);
+    }
+
+    async function setPostFxState(nextState) {
+        const cloned = cloneJsonValue(nextState);
+        if (!sceneSaved || !manifestExists) {
+            transientPostFxState = cloned;
+            emitChange();
+            return false;
+        }
+
+        transientPostFxState = null;
+        const text = `${JSON.stringify(cloned, null, 2)}\n`;
+        await requestHostAction('project_postfx_write', {
+            contentBase64: toBase64Utf8(text),
+        });
+        lastPostFxText = text;
+        postFxState = cloned;
+        emitChange();
+        return true;
+    }
+
     async function releaseManifest() {
         const result = await requestHostAction('project_release_manifest');
         sceneSaved = true;
@@ -458,6 +533,9 @@ export function createProjectRuntime({ layerManager, bridge, perfHud }) {
         }
         emitChange();
         await reload(true);
+        if (transientPostFxState != null) {
+            await setPostFxState(transientPostFxState);
+        }
         return true;
     }
 
@@ -546,8 +624,11 @@ export function createProjectRuntime({ layerManager, bridge, perfHud }) {
         }
 
         manifestState = null;
+        postFxState = null;
         lastManifestText = '';
+        lastPostFxText = '';
         if (projectChanged) clearProjectLayers();
+        if (projectChanged) transientPostFxState = null;
         schedulePolling();
         emitChange();
 
@@ -570,6 +651,10 @@ export function createProjectRuntime({ layerManager, bridge, perfHud }) {
     });
 
     bridge.on('project_reload', () => {
+        if (suppressProjectReloadCount > 0) {
+            suppressProjectReloadCount -= 1;
+            return;
+        }
         void reload(true);
     });
 
@@ -597,6 +682,8 @@ export function createProjectRuntime({ layerManager, bridge, perfHud }) {
         setInlineLayerEnabled,
         removeInlineLayer,
         clearInlineLayers,
+        getPostFxState,
+        setPostFxState,
         releaseManifest,
         setProjectDirectory,
         reload,

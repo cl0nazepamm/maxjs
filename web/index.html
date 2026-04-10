@@ -1960,7 +1960,7 @@
             } catch {}
         }
 
-        function loadLocalHDRIFile(file, { preserveEnabled = false } = {}) {
+        function loadLocalHDRIFile(file, { preserveEnabled = false, persist = true } = {}) {
             if (localHdriObjectUrl) URL.revokeObjectURL(localHdriObjectUrl);
             if (localHdriEnvMap) { localHdriEnvMap.dispose(); localHdriEnvMap = null; }
             localHdriObjectUrl = URL.createObjectURL(file);
@@ -1985,7 +1985,7 @@
                 }
                 hdrTex.dispose();
                 ssgiFx.markEnvironmentChanged?.();
-                savePostFxState();
+                if (persist) savePostFxState();
                 syncHdriPanel();
             }, undefined, (error) => {
                 console.error('MaxJS local HDRI load failed', error);
@@ -2131,8 +2131,8 @@
 
                 scene.background = null;
                 scene.environment = skyEnvMap;
-                scene.environmentRotation.identity();
-                scene.backgroundRotation.identity();
+                scene.environmentRotation.set(0, 0, 0);
+                scene.backgroundRotation.set(0, 0, 0);
 
                 // Sun DirectionalLight along sun direction
                 if (!skySunLight) {
@@ -2984,7 +2984,7 @@
             if (enabled === clayModeActive) return;
             clayModeActive = enabled;
             if (enabled) enterClayMode(); else exitClayMode();
-            syncPostFxPanel(true);
+            syncPostFxPanel(true, { persist: false });
         });
 
         // ── Shadow Mode (synced to Nitrous viewport shadows toggle) ──
@@ -3394,9 +3394,9 @@
             if (snapshot.lights) applyLights(snapshot.lights);
             reconcileSplats(snapshot.splats ?? []);
             audioSystem?.applyAudios(snapshot.audios ?? []);
-            applyHairInstances(snapshot.hairInstances);
-            applyForestInstances(snapshot.forestInstances);
-            applyVolumes(snapshot.volumes);
+            applyHairInstances(snapshot.hairInstances ?? []);
+            applyForestInstances(snapshot.forestInstances ?? []);
+            applyVolumes(snapshot.volumes ?? []);
             buildMaxInstanceBuckets(snapshot.nodes);
             profileSceneNodes(snapshot.nodes);
             scene.updateMatrixWorld(true);
@@ -4316,9 +4316,7 @@
 
         function applyHairInstances(groups) {
             disposeHairInstances();
-            console.warn('[Hair] applyHairInstances called, groups=', Array.isArray(groups) ? groups.length : 'NOT_ARRAY', groups);
             if (!Array.isArray(groups) || groups.length === 0) return;
-            console.warn('[Hair]', groups.length, 'groups, total instances:', groups.reduce((s, g) => s + (g.count || 0), 0));
 
             const m = new THREE.Matrix4();
             const c = new THREE.Color();
@@ -4693,7 +4691,7 @@
             // Forward Physical Camera DOF to post-fx when available
             physicalCameraDofActive = !!cam.dofEnabled;
             if (physicalCameraDofActive && ssgiFx?.updateDofFromPhysicalCamera) {
-                ssgiFx.updateDofFromPhysicalCamera(cam, () => syncPostFxPanel(false));
+                ssgiFx.updateDofFromPhysicalCamera(cam, () => syncPostFxPanel(false, { persist: false }));
             }
         }
 
@@ -5164,7 +5162,10 @@
             _layerManagerUnsub?.();
             _projectRuntimeUnsub?.();
             _layerManagerUnsub = _layerManagerRef?.subscribe?.(() => queueLayersPanelRefresh()) ?? null;
-            _projectRuntimeUnsub = _projectRuntimeRef?.subscribe?.(() => queueLayersPanelRefresh()) ?? null;
+            _projectRuntimeUnsub = _projectRuntimeRef?.subscribe?.(() => {
+                queueLayersPanelRefresh();
+                syncProjectPostFxState();
+            }) ?? null;
         }
 
         function getPanelLayers() {
@@ -5616,7 +5617,7 @@
             postPanel.classList.toggle('visible', postPanelVisible);
             postPanel.toggleAttribute('inert', !postPanelVisible);
             postPanel.setAttribute('aria-hidden', String(!postPanelVisible));
-            syncPostFxPanel(true);
+            syncPostFxPanel(true, { persist: false });
         }
 
         function buildPostFxPanel() {
@@ -5979,8 +5980,8 @@
                 renderer.toneMappingExposure = currentExposure;
                 ssgiFx.markOutputChanged?.();
                 expLabel.textContent = currentExposure.toFixed(1);
-                savePostFxState();
             };
+            expSlider.onchange = () => savePostFxState();
 
             // Anti-Aliasing mode
             const aaSelect = document.getElementById('fx-aa-mode');
@@ -6008,8 +6009,8 @@
                 performanceSettings.renderScale = Math.max(0.25, Math.min(1.0, Number(e.target.value) || 1.0));
                 renderScaleValue.textContent = `${performanceSettings.renderScale.toFixed(2)}x`;
                 applyRendererPerformanceSettings({ resizePostFx: true });
-                savePostFxState();
             };
+            renderScaleSlider.onchange = () => savePostFxState();
             optimizeInstancesCheck.onchange = () => {
                 performanceSettings.optimizeMaxInstances = optimizeInstancesCheck.checked;
                 disposeMaxInstanceBuckets();
@@ -6020,9 +6021,9 @@
                 performanceSettings.maxInstanceBucketThreshold = Math.max(2, Math.round(Number(e.target.value) || 50));
                 instanceThresholdValue.textContent = String(performanceSettings.maxInstanceBucketThreshold);
                 disposeMaxInstanceBuckets();
-                savePostFxState();
-                syncPostFxPanel(true);
+                syncPostFxPanel(true, { persist: false });
             };
+            instanceThresholdSlider.onchange = () => savePostFxState();
 
             // HDRI Environment controls
             const hdriFileInput = document.getElementById('fx-hdri-file');
@@ -6040,24 +6041,24 @@
                 localHdriRotation = parseFloat(e.target.value);
                 hdriRotVal.textContent = Math.round(localHdriRotation);
                 applyLocalHDRISettings();
-                savePostFxState();
             };
+            hdriRotSlider.onchange = () => savePostFxState();
             const hdriIntSlider = document.getElementById('fx-hdri-intensity');
             const hdriIntVal = document.getElementById('fx-hdri-intensity-val');
             hdriIntSlider.oninput = (e) => {
                 localHdriIntensity = parseFloat(e.target.value);
                 hdriIntVal.textContent = localHdriIntensity.toFixed(2);
                 applyLocalHDRISettings();
-                savePostFxState();
             };
+            hdriIntSlider.onchange = () => savePostFxState();
             const hdriBlurSlider = document.getElementById('fx-hdri-blur');
             const hdriBlurVal = document.getElementById('fx-hdri-blur-val');
             hdriBlurSlider.oninput = (e) => {
                 localHdriBlur = parseFloat(e.target.value);
                 hdriBlurVal.textContent = localHdriBlur.toFixed(2);
                 applyLocalHDRISettings();
-                savePostFxState();
             };
+            hdriBlurSlider.onchange = () => savePostFxState();
             const hdriFlipCheck = document.getElementById('fx-hdri-flip');
             hdriFlipCheck.onchange = () => {
                 localHdriFlip = hdriFlipCheck.checked;
@@ -6208,20 +6209,26 @@
 
                     section.controlEls[control.key] = { input, valueEl };
 
-                    const eventName = control.type === 'checkbox' ? 'change' : 'input';
-                    input.addEventListener(eventName, () => {
+                    const applyControlValue = (persist) => {
                         const rawValue = control.type === 'checkbox'
                             ? input.checked
                             : Number(input.value);
                         const value = control.integer ? Math.round(rawValue) : rawValue;
                         section.setValues({ [control.key]: value });
-                        syncPostFxPanel(true);
-                    });
+                        syncPostFxPanel(true, { persist });
+                    };
+
+                    if (control.type === 'checkbox') {
+                        input.addEventListener('change', () => applyControlValue(true));
+                    } else {
+                        input.addEventListener('input', () => applyControlValue(false));
+                        input.addEventListener('change', () => applyControlValue(true));
+                    }
                 }
             }
         }
 
-        function syncPostFxPanel(force = false) {
+        function syncPostFxPanel(force = false, { persist = true } = {}) {
             const state = ssgiFx.getState();
             const derived = postPanelVisible ? ssgiFx.getDerivedState() : null;
             const available = ssgiFx.isAvailable();
@@ -6336,15 +6343,27 @@
             }
 
             if (syncClonePanelFn) syncClonePanelFn();
-            savePostFxState();
+            if (persist) savePostFxState();
         }
 
         btnPostFxPanel.onclick = () => {
             setPostPanelVisible(!postPanelVisible);
         };
 
-        // ── Post FX persistence via localStorage ──
+        // ── Post FX persistence ──
         const POSTFX_STORAGE_KEY = 'maxjs_postfx_state';
+        let postFxPersistTimer = 0;
+        let lastProjectPostFxSignature = '';
+        let suppressPostFxPersistenceDepth = 0;
+
+        function withPostFxPersistenceSuppressed(fn) {
+            suppressPostFxPersistenceDepth += 1;
+            try {
+                return fn();
+            } finally {
+                suppressPostFxPersistenceDepth = Math.max(0, suppressPostFxPersistenceDepth - 1);
+            }
+        }
 
         function serializeSnapshotUiState() {
             return {
@@ -6375,9 +6394,30 @@
             };
         }
 
+        function serializePersistedPostFxState() {
+            const payload = serializeSnapshotUiState();
+            delete payload.camera;
+            return payload;
+        }
+
         function savePostFxState() {
+            if (suppressPostFxPersistenceDepth > 0) return;
+            const projectRuntime = _projectRuntimeRef;
+            if (projectRuntime?.setPostFxState) {
+                const payload = serializePersistedPostFxState();
+                const signature = JSON.stringify(payload);
+                if (signature === lastProjectPostFxSignature) return;
+                lastProjectPostFxSignature = signature;
+                clearTimeout(postFxPersistTimer);
+                postFxPersistTimer = setTimeout(() => {
+                    void projectRuntime.setPostFxState(payload).catch(error => {
+                        reportBridgeError('post fx state save', error);
+                    });
+                }, 180);
+                return;
+            }
             try {
-                const payload = serializeSnapshotUiState();
+                const payload = serializePersistedPostFxState();
                 localStorage.setItem(POSTFX_STORAGE_KEY, JSON.stringify(payload));
             } catch {}
         }
@@ -6484,13 +6524,34 @@
         }
 
         function restorePostFxState() {
-            try {
-                const raw = localStorage.getItem(POSTFX_STORAGE_KEY);
-                if (!raw) return;
-                applySavedPostFxPayload(JSON.parse(raw));
-            } catch (e) {
-                console.warn('MaxJS: failed to restore post-FX state', e);
-            }
+            withPostFxPersistenceSuppressed(() => {
+                try {
+                    const projectPayload = _projectRuntimeRef?.getPostFxState?.();
+                    if (projectPayload) {
+                        lastProjectPostFxSignature = JSON.stringify(projectPayload);
+                        applySavedPostFxPayload(projectPayload);
+                        return;
+                    }
+                    if (_projectRuntimeRef) return;
+                    const raw = localStorage.getItem(POSTFX_STORAGE_KEY);
+                    if (!raw) return;
+                    applySavedPostFxPayload(JSON.parse(raw));
+                } catch (e) {
+                    console.warn('MaxJS: failed to restore post-FX state', e);
+                }
+            });
+        }
+
+        function syncProjectPostFxState() {
+            const payload = _projectRuntimeRef?.getPostFxState?.();
+            if (!payload) return;
+            const signature = JSON.stringify(payload);
+            if (!signature || signature === lastProjectPostFxSignature) return;
+            lastProjectPostFxSignature = signature;
+            withPostFxPersistenceSuppressed(() => {
+                applySavedPostFxPayload(payload);
+                syncPostFxPanel(true, { persist: false });
+            });
         }
 
         buildPostFxPanel();
@@ -6880,7 +6941,7 @@
             if (postPanelVisible || debugMode) {
                 if ((frameTimeMs - lastPostFxPanelSyncMs) >= 250) {
                     lastPostFxPanelSyncMs = frameTimeMs;
-                    syncPostFxPanel();
+                    syncPostFxPanel(false, { persist: false });
                 }
             }
             perfHud.updateRender(performance.now() - renderStart, renderer.info?.render, renderer.info?.memory);
@@ -7216,10 +7277,10 @@
 
         async function restoreInteractiveBrowserState() {
             restorePostFxState();
-            syncPostFxPanel(true);
+            syncPostFxPanel(true, { persist: false });
 
             const file = await restoreStashedHdri();
-            if (file && !isLocalHdriLoaded()) loadLocalHDRIFile(file, { preserveEnabled: true });
+            if (file && !isLocalHdriLoaded()) loadLocalHDRIFile(file, { preserveEnabled: true, persist: false });
         }
 
         async function bootStandaloneSnapshot() {
@@ -7257,15 +7318,15 @@
 
         addEventListener('focus', () => {
             lastRenderTimestamp = 0;
-            syncPostFxPanel(true);
+            syncPostFxPanel(true, { persist: false });
         });
         addEventListener('blur', () => {
             lastRenderTimestamp = 0;
-            syncPostFxPanel(true);
+            syncPostFxPanel(true, { persist: false });
         });
         document.addEventListener('visibilitychange', () => {
             lastRenderTimestamp = 0;
-            syncPostFxPanel(true);
+            syncPostFxPanel(true, { persist: false });
         });
 
         if (buildMode !== 'release') {

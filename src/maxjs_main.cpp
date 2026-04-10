@@ -242,6 +242,7 @@ static bool EndsWithInsensitive(const std::wstring& value, const std::wstring& s
 }
 
 static bool IsProjectRuntimeFile(const std::wstring& fileName) {
+    if (EndsWithInsensitive(fileName, L"postfx.maxjs.json")) return false;
     const size_t dot = fileName.find_last_of(L'.');
     if (dot == std::wstring::npos) return false;
 
@@ -5287,6 +5288,7 @@ public:
     std::uint64_t activeWebStamp_ = 0;
     std::wstring activeProjectDir_;
     std::uint64_t activeProjectStamp_ = 0;
+    int suppressProjectReloadCount_ = 0;
     bool fastCameraDirty_ = false;
     bool fastFlushPosted_ = false;
     bool haveLastSentCamera_ = false;
@@ -5669,6 +5671,12 @@ public:
         const std::wstring projectDir = GetProjectDir();
         if (projectDir.empty()) return {};
         return projectDir + L"\\project.maxjs.json";
+    }
+
+    std::wstring GetProjectPostFxPath() {
+        const std::wstring projectDir = GetProjectDir();
+        if (projectDir.empty()) return {};
+        return projectDir + L"\\postfx.maxjs.json";
     }
 
     std::wstring GetSnapshotDir() {
@@ -7958,6 +7966,10 @@ public:
 
         if (nextStamp != activeProjectStamp_) {
             activeProjectStamp_ = nextStamp;
+            if (suppressProjectReloadCount_ > 0) {
+                suppressProjectReloadCount_--;
+                return;
+            }
             SendProjectReload();
         }
     }
@@ -8078,7 +8090,7 @@ public:
         return true;
     }
 
-    bool WriteProjectManifestContent(const std::wstring& contentBase64, std::wstring& error) {
+    bool WriteProjectManifestContent(const std::wstring& contentBase64, std::wstring& error, bool triggerReload = true) {
         const std::wstring projectDir = GetProjectDir();
         if (projectDir.empty()) {
             error = L"Save the scene first";
@@ -8101,7 +8113,35 @@ public:
 
         activeProjectDir_ = projectDir;
         activeProjectStamp_ = GetProjectRuntimeWriteStamp(projectDir);
-        SendProjectReload();
+        if (triggerReload) {
+            SendProjectReload();
+        } else {
+            suppressProjectReloadCount_ = std::max(suppressProjectReloadCount_, 2);
+        }
+        return true;
+    }
+
+    bool WriteProjectPostFxContent(const std::wstring& contentBase64, std::wstring& error) {
+        const std::wstring projectDir = GetProjectDir();
+        if (projectDir.empty()) {
+            error = L"Save the scene first";
+            return false;
+        }
+
+        SHCreateDirectoryExW(nullptr, projectDir.c_str(), nullptr);
+
+        std::string decoded;
+        if (!DecodeBase64Wide(contentBase64, decoded)) {
+            error = L"Invalid base64 post fx payload";
+            return false;
+        }
+
+        const std::wstring postFxPath = GetProjectPostFxPath();
+        if (!WriteBinaryFile(postFxPath, decoded)) {
+            error = L"Failed to write post fx state";
+            return false;
+        }
+
         return true;
     }
 
@@ -8787,6 +8827,22 @@ public:
         if (type == L"project_manifest_write") {
             std::wstring requestId;
             std::wstring contentBase64;
+            bool reload = true;
+            ExtractJsonString(msg, L"requestId", requestId);
+            if (!ExtractJsonString(msg, L"contentBase64", contentBase64)) {
+                SendHostActionResult(type, requestId, false, L"Missing contentBase64");
+                return;
+            }
+            ExtractJsonBool(msg, L"reload", reload);
+
+            std::wstring error;
+            const bool ok = WriteProjectManifestContent(contentBase64, error, reload);
+            SendHostActionResult(type, requestId, ok, error);
+            return;
+        }
+        if (type == L"project_postfx_write") {
+            std::wstring requestId;
+            std::wstring contentBase64;
             ExtractJsonString(msg, L"requestId", requestId);
             if (!ExtractJsonString(msg, L"contentBase64", contentBase64)) {
                 SendHostActionResult(type, requestId, false, L"Missing contentBase64");
@@ -8794,7 +8850,7 @@ public:
             }
 
             std::wstring error;
-            const bool ok = WriteProjectManifestContent(contentBase64, error);
+            const bool ok = WriteProjectPostFxContent(contentBase64, error);
             SendHostActionResult(type, requestId, ok, error);
             return;
         }

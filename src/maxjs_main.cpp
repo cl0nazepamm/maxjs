@@ -161,6 +161,39 @@ static std::wstring GetEnvironmentString(const wchar_t* name) {
     return value;
 }
 
+static bool TryGetCurrentScenePath(std::wstring& outPath) {
+    outPath.clear();
+    Interface* ip = GetCOREInterface();
+    if (!ip) return false;
+
+    const MSTR scenePath = ip->GetCurFilePath();
+    if (!scenePath.data() || scenePath.Length() == 0) return false;
+
+    outPath.assign(scenePath.data(), scenePath.Length());
+    return !outPath.empty();
+}
+
+static std::wstring GetCurrentSceneDir() {
+    std::wstring scenePath;
+    if (!TryGetCurrentScenePath(scenePath)) return {};
+
+    const size_t split = scenePath.find_last_of(L"\\/");
+    if (split == std::wstring::npos) return {};
+    return scenePath.substr(0, split);
+}
+
+static std::wstring GetCurrentSceneStem() {
+    std::wstring scenePath;
+    if (!TryGetCurrentScenePath(scenePath)) return L"Scene";
+
+    size_t split = scenePath.find_last_of(L"\\/");
+    std::wstring name = (split == std::wstring::npos) ? scenePath : scenePath.substr(split + 1);
+    const size_t dot = name.find_last_of(L'.');
+    if (dot != std::wstring::npos) name = name.substr(0, dot);
+    if (name.empty()) return L"Scene";
+    return name;
+}
+
 static std::uint64_t FileTimeToUint64(const FILETIME& ft) {
     ULARGE_INTEGER value = {};
     value.LowPart = ft.dwLowDateTime;
@@ -5282,36 +5315,39 @@ public:
         return Utf8ToWide(buf);
     }
 
-    static const std::wstring& GetInlineLayerDir() {
-        static std::wstring dir;
-        if (dir.empty()) {
-            wchar_t temp[MAX_PATH];
-            GetTempPathW(MAX_PATH, temp);
-            dir = std::wstring(temp) + L"maxjs_layers\\";
-            CreateDirectoryW(dir.c_str(), nullptr);
-        }
-        return dir;
+    static std::wstring GetLegacyInlineLayerDir() {
+        wchar_t temp[MAX_PATH];
+        GetTempPathW(MAX_PATH, temp);
+        return std::wstring(temp) + L"maxjs_layers\\";
+    }
+
+    std::wstring GetInlineLayerDir() {
+        const std::wstring projectDir = GetProjectDir();
+        if (projectDir.empty()) return {};
+        return projectDir + L"\\inlines\\";
     }
 
     void SendInlineLayersState(bool force = false) {
         if (!webview_ || !jsReady_) return;
 
         const std::wstring dir = GetInlineLayerDir();
-        const std::wstring pattern = dir + L"*";
         std::vector<std::pair<std::wstring, bool>> layers;
 
-        WIN32_FIND_DATAW fd = {};
-        HANDLE hFind = FindFirstFileW(pattern.c_str(), &fd);
-        if (hFind != INVALID_HANDLE_VALUE) {
-            do {
-                if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        if (!dir.empty() && DirectoryExists(dir)) {
+            const std::wstring pattern = dir + L"*";
+            WIN32_FIND_DATAW fd = {};
+            HANDLE hFind = FindFirstFileW(pattern.c_str(), &fd);
+            if (hFind != INVALID_HANDLE_VALUE) {
+                do {
+                    if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
 
-                std::wstring id;
-                bool enabled = false;
-                if (!TryParseInlineLayerFileName(fd.cFileName, id, enabled)) continue;
-                layers.emplace_back(id, enabled);
-            } while (FindNextFileW(hFind, &fd));
-            FindClose(hFind);
+                    std::wstring id;
+                    bool enabled = false;
+                    if (!TryParseInlineLayerFileName(fd.cFileName, id, enabled)) continue;
+                    layers.emplace_back(id, enabled);
+                } while (FindNextFileW(hFind, &fd));
+                FindClose(hFind);
+            }
         }
 
         std::sort(layers.begin(), layers.end(), [](const auto& a, const auto& b) {
@@ -5345,46 +5381,45 @@ public:
         if (!webview_ || !jsReady_) return;
 
         const std::wstring dir = GetInlineLayerDir();
-        const std::wstring pattern = dir + L"*";
-
         // Track which enabled layer files still exist this scan
         std::unordered_set<std::wstring> seenEnabled;
 
-        WIN32_FIND_DATAW fd;
-        HANDLE hFind = FindFirstFileW(pattern.c_str(), &fd);
-        if (hFind != INVALID_HANDLE_VALUE) {
-            do {
-                if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        if (!dir.empty() && DirectoryExists(dir)) {
+            const std::wstring pattern = dir + L"*";
+            WIN32_FIND_DATAW fd;
+            HANDLE hFind = FindFirstFileW(pattern.c_str(), &fd);
+            if (hFind != INVALID_HANDLE_VALUE) {
+                do {
+                    if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
 
-                const std::wstring filename(fd.cFileName);
-                std::wstring id;
-                bool enabled = false;
-                if (!TryParseInlineLayerFileName(filename, id, enabled)) continue;
-                if (!enabled) continue;
+                    const std::wstring filename(fd.cFileName);
+                    std::wstring id;
+                    bool enabled = false;
+                    if (!TryParseInlineLayerFileName(filename, id, enabled)) continue;
+                    if (!enabled) continue;
 
-                seenEnabled.insert(filename);
+                    seenEnabled.insert(filename);
 
-                // Compute write stamp
-                ULONGLONG stamp = ((ULONGLONG)fd.ftLastWriteTime.dwHighDateTime << 32)
-                                | fd.ftLastWriteTime.dwLowDateTime;
+                    ULONGLONG stamp = ((ULONGLONG)fd.ftLastWriteTime.dwHighDateTime << 32)
+                                    | fd.ftLastWriteTime.dwLowDateTime;
 
-                auto it = inlineFileStamps_.find(filename);
-                if (it != inlineFileStamps_.end() && it->second == stamp) continue;
+                    auto it = inlineFileStamps_.find(filename);
+                    if (it != inlineFileStamps_.end() && it->second == stamp) continue;
 
-                // New or modified — inject
-                const std::wstring filePath = dir + filename;
-                std::wstring code = ReadUtf8File(filePath);
-                if (code.empty()) continue;
+                    const std::wstring filePath = dir + filename;
+                    std::wstring code = ReadUtf8File(filePath);
+                    if (code.empty()) continue;
 
-                std::wostringstream ss;
-                ss << L"{\"type\":\"js_inline\",\"action\":\"inject\",\"id\":\""
-                   << EscapeJson(id.c_str()) << L"\",\"name\":\""
-                   << EscapeJson(id.c_str()) << L"\",\"code\":\""
-                   << EscapeJson(code.c_str()) << L"\"}";
-                webview_->PostWebMessageAsJson(ss.str().c_str());
-                inlineFileStamps_[filename] = stamp;
-            } while (FindNextFileW(hFind, &fd));
-            FindClose(hFind);
+                    std::wostringstream ss;
+                    ss << L"{\"type\":\"js_inline\",\"action\":\"inject\",\"id\":\""
+                       << EscapeJson(id.c_str()) << L"\",\"name\":\""
+                       << EscapeJson(id.c_str()) << L"\",\"code\":\""
+                       << EscapeJson(code.c_str()) << L"\"}";
+                    webview_->PostWebMessageAsJson(ss.str().c_str());
+                    inlineFileStamps_[filename] = stamp;
+                } while (FindNextFileW(hFind, &fd));
+                FindClose(hFind);
+            }
         }
 
         // Remove layers whose files were deleted
@@ -5596,7 +5631,7 @@ public:
         return DirectoryExists(w) ? w : std::wstring{};
     }
 
-    std::wstring GetProjectDir() {
+    std::wstring GetFallbackProjectDir() {
         std::wstring envProjectDir = GetEnvironmentString(L"MAXJS_PROJECT_DIR");
         if (!envProjectDir.empty()) {
             return envProjectDir;
@@ -5621,12 +5656,110 @@ public:
         return d + L"\\maxjs_projects\\active";
     }
 
+    std::wstring GetProjectDir() {
+        std::wstring envProjectDir = GetEnvironmentString(L"MAXJS_PROJECT_DIR");
+        if (!envProjectDir.empty()) {
+            return envProjectDir;
+        }
+
+        return GetCurrentSceneDir();
+    }
+
     std::wstring GetProjectManifestPath() {
-        return GetProjectDir() + L"\\project.maxjs.json";
+        const std::wstring projectDir = GetProjectDir();
+        if (projectDir.empty()) return {};
+        return projectDir + L"\\project.maxjs.json";
     }
 
     std::wstring GetSnapshotDir() {
-        return GetProjectDir() + L"\\dist";
+        const std::wstring projectDir = GetProjectDir();
+        if (!projectDir.empty()) return projectDir + L"\\dist";
+        return GetFallbackProjectDir() + L"\\dist";
+    }
+
+    bool SceneProjectManifestExists() {
+        const std::wstring manifestPath = GetProjectManifestPath();
+        return !manifestPath.empty() && FileExists(manifestPath);
+    }
+
+    std::wstring BuildDefaultProjectManifestText() {
+        const std::wstring sceneName = EscapeJson(GetCurrentSceneStem().c_str());
+        std::wostringstream ss;
+        ss << L"{\n"
+           << L"  \"name\": \"" << sceneName << L"\",\n"
+           << L"  \"pollMs\": 0,\n"
+           << L"  \"layers\": []\n"
+           << L"}\n";
+        return ss.str();
+    }
+
+    bool MigrateLegacyInlineLayers(const std::wstring& dstDir, std::wstring& error) {
+        const std::wstring legacyDir = GetLegacyInlineLayerDir();
+        if (!DirectoryExists(legacyDir)) return true;
+        if (!DirectoryExists(dstDir) && SHCreateDirectoryExW(nullptr, dstDir.c_str(), nullptr) != ERROR_SUCCESS && !DirectoryExists(dstDir)) {
+            error = L"Failed to create scene-local inline folder";
+            return false;
+        }
+
+        WIN32_FIND_DATAW fd = {};
+        const std::wstring pattern = legacyDir + L"*";
+        HANDLE hFind = FindFirstFileW(pattern.c_str(), &fd);
+        if (hFind == INVALID_HANDLE_VALUE) return true;
+
+        do {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+
+            std::wstring id;
+            bool enabled = false;
+            if (!TryParseInlineLayerFileName(fd.cFileName, id, enabled)) continue;
+
+            const std::wstring srcPath = legacyDir + fd.cFileName;
+            const std::wstring dstPath = dstDir + fd.cFileName;
+            if (FileExists(dstPath)) continue;
+
+            if (!CopyFileEnsuringDirectories(srcPath, dstPath)) {
+                error = L"Failed to migrate one or more inline layer files";
+                FindClose(hFind);
+                return false;
+            }
+        } while (FindNextFileW(hFind, &fd));
+
+        FindClose(hFind);
+        return true;
+    }
+
+    bool ReleaseProjectManifest(std::wstring& projectDirOut, std::wstring& error) {
+        const std::wstring projectDir = GetProjectDir();
+        if (projectDir.empty()) {
+            error = L"Save the scene first";
+            return false;
+        }
+
+        const std::wstring inlineDir = GetInlineLayerDir();
+        const std::wstring manifestPath = GetProjectManifestPath();
+        if (inlineDir.empty() || manifestPath.empty()) {
+            error = L"Failed to resolve scene-local project paths";
+            return false;
+        }
+
+        if (!DirectoryExists(projectDir) && SHCreateDirectoryExW(nullptr, projectDir.c_str(), nullptr) != ERROR_SUCCESS && !DirectoryExists(projectDir)) {
+            error = L"Failed to prepare scene project folder";
+            return false;
+        }
+        if (!DirectoryExists(inlineDir) && SHCreateDirectoryExW(nullptr, inlineDir.c_str(), nullptr) != ERROR_SUCCESS && !DirectoryExists(inlineDir)) {
+            error = L"Failed to create inlines folder";
+            return false;
+        }
+        if (!MigrateLegacyInlineLayers(inlineDir, error)) {
+            return false;
+        }
+        if (!FileExists(manifestPath) && !WriteUtf8File(manifestPath, BuildDefaultProjectManifestText())) {
+            error = L"Failed to create project manifest";
+            return false;
+        }
+
+        projectDirOut = projectDir;
+        return true;
     }
 
     // Returns the projects root folder (parent of "active", "bee", etc.)
@@ -5645,6 +5778,7 @@ public:
 #endif
         // Fallback: parent of GetProjectDir()
         const std::wstring projectDir = GetProjectDir();
+        if (projectDir.empty()) return GetFallbackProjectDir();
         const size_t split2 = projectDir.find_last_of(L"\\/");
         if (split2 != std::wstring::npos) return projectDir.substr(0, split2);
         return projectDir;
@@ -7699,13 +7833,19 @@ public:
         if (!webview_) return;
 
         const std::wstring projectDir = GetProjectDir();
-        SHCreateDirectoryExW(nullptr, projectDir.c_str(), nullptr);
+        const std::wstring inlineDir = GetInlineLayerDir();
+        const bool sceneSaved = !projectDir.empty();
+        const bool manifestExists = SceneProjectManifestExists();
         activeProjectDir_ = projectDir;
-        activeProjectStamp_ = GetProjectRuntimeWriteStamp(projectDir);
+        activeProjectStamp_ = projectDir.empty() ? 0 : GetProjectRuntimeWriteStamp(projectDir);
         std::wostringstream ss;
         ss << L"{\"type\":\"project_config\",\"dir\":\""
            << EscapeJson(projectDir.c_str())
-           << L"\",\"pollMs\":0}";
+           << L"\",\"inlineDir\":\"" << EscapeJson(inlineDir.c_str())
+           << L"\",\"pollMs\":0"
+           << L",\"sceneSaved\":" << (sceneSaved ? L"true" : L"false")
+           << L",\"manifestExists\":" << (manifestExists ? L"true" : L"false")
+           << L"}";
         webview_->PostWebMessageAsJson(ss.str().c_str());
     }
 
@@ -7800,18 +7940,16 @@ public:
         if (!webview_ || !jsReady_) return;
 
         const std::wstring projectDir = GetProjectDir();
-        if (projectDir.empty()) return;
-        SHCreateDirectoryExW(nullptr, projectDir.c_str(), nullptr);
-
-        const std::uint64_t nextStamp = GetProjectRuntimeWriteStamp(projectDir);
         if (activeProjectDir_ != projectDir) {
             activeProjectDir_ = projectDir;
-            activeProjectStamp_ = nextStamp;
+            activeProjectStamp_ = projectDir.empty() ? 0 : GetProjectRuntimeWriteStamp(projectDir);
             SendProjectConfig();
             SendProjectReload();
             return;
         }
+        if (projectDir.empty()) return;
 
+        const std::uint64_t nextStamp = GetProjectRuntimeWriteStamp(projectDir);
         if (activeProjectStamp_ == 0) {
             activeProjectStamp_ = nextStamp;
             if (nextStamp != 0) SendProjectReload();
@@ -7826,6 +7964,10 @@ public:
 
     bool RemoveInlineLayerFile(const std::wstring& id, std::wstring& error) {
         const std::wstring dir = GetInlineLayerDir();
+        if (dir.empty() || !DirectoryExists(dir)) {
+            error = L"Scene-local inline folder is not available";
+            return false;
+        }
         const std::wstring enabledFileName = GetInlineLayerFileName(id, true);
         const std::wstring disabledFileName = GetInlineLayerFileName(id, false);
         const std::wstring enabledPath = dir + enabledFileName;
@@ -7859,6 +8001,10 @@ public:
 
     bool SetInlineLayerEnabled(const std::wstring& id, bool enabled, std::wstring& error) {
         const std::wstring dir = GetInlineLayerDir();
+        if (dir.empty() || !DirectoryExists(dir)) {
+            error = L"Scene-local inline folder is not available";
+            return false;
+        }
         const std::wstring enabledFileName = GetInlineLayerFileName(id, true);
         const std::wstring disabledFileName = GetInlineLayerFileName(id, false);
         const std::wstring enabledPath = dir + enabledFileName;
@@ -7901,6 +8047,12 @@ public:
 
     bool ClearInlineLayerFiles(std::wstring& error) {
         const std::wstring dir = GetInlineLayerDir();
+        if (dir.empty() || !DirectoryExists(dir)) {
+            inlineFileStamps_.clear();
+            SendInlineLayerClear();
+            SendInlineLayersState(true);
+            return true;
+        }
         const std::wstring pattern = dir + L"*";
         WIN32_FIND_DATAW fd = {};
         HANDLE hFind = FindFirstFileW(pattern.c_str(), &fd);
@@ -7929,7 +8081,7 @@ public:
     bool WriteProjectManifestContent(const std::wstring& contentBase64, std::wstring& error) {
         const std::wstring projectDir = GetProjectDir();
         if (projectDir.empty()) {
-            error = L"Project directory is empty";
+            error = L"Save the scene first";
             return false;
         }
 
@@ -8644,6 +8796,25 @@ public:
             std::wstring error;
             const bool ok = WriteProjectManifestContent(contentBase64, error);
             SendHostActionResult(type, requestId, ok, error);
+            return;
+        }
+        if (type == L"project_release_manifest") {
+            std::wstring requestId;
+            ExtractJsonString(msg, L"requestId", requestId);
+
+            std::wstring projectDir;
+            std::wstring error;
+            const bool ok = ReleaseProjectManifest(projectDir, error);
+            if (ok) {
+                activeProjectDir_ = projectDir;
+                activeProjectStamp_ = GetProjectRuntimeWriteStamp(projectDir);
+                inlineFileStamps_.clear();
+                inlineLayersStateSignature_.clear();
+                SendProjectConfig();
+                SendProjectReload();
+                SendInlineLayersState(true);
+            }
+            SendHostActionResult(type, requestId, ok, error, projectDir);
             return;
         }
         if (type == L"snapshot_export") {

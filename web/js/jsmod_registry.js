@@ -42,6 +42,7 @@ function valueNoise3D(x, y, z) {
 export function createJsModRegistry({ THREE, nodeMap, maxRoot, jsRoot }) {
     const modifiers = new Map();   // name -> fn
     const tracked = new Map();     // handle -> { clone, restPositions, params, original }
+    const runtimeRoot = jsRoot?.isObject3D ? jsRoot : maxRoot;
 
     function registerModifier(name, fn) {
         modifiers.set(name, fn);
@@ -77,9 +78,10 @@ export function createJsModRegistry({ THREE, nodeMap, maxRoot, jsRoot }) {
         clone.matrixWorld.copy(original.matrixWorld);
         clone.matrixWorldNeedsUpdate = true;
 
-        // Hide original, show clone
+        // Hide original, show clone under the JS runtime root so snapshots
+        // serialize the deform output instead of the authored Max mesh.
         original.visible = false;
-        maxRoot.add(clone);
+        runtimeRoot?.add(clone);
 
         return { clone, restPositions, params, original };
     }

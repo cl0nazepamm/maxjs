@@ -5178,6 +5178,10 @@
             ];
         }
 
+        function getProjectRuntimeState() {
+            return _projectRuntimeRef?.getState?.() ?? {};
+        }
+
         function getLayerStatus(layer) {
             if (layer.error) return { label: 'ERR', className: 'err' };
             if (layer.loading) return { label: 'LOAD', className: 'off' };
@@ -5188,7 +5192,7 @@
         function getLayerDetails(layer) {
             const details = [];
             if (layer.source === 'project' && layer.entry) details.push(layer.entry);
-            if (layer.source === 'inline') details.push('%TEMP%/maxjs_layers');
+            if (layer.source === 'inline') details.push(`inlines/${layer.id}.js${layer.enabled === false ? '.disabled' : ''}`);
             if (Number.isFinite(layer.profile?.avgUpdateMs) && layer.profile.updateCount > 0) {
                 details.push(`avg ${layer.profile.avgUpdateMs.toFixed(2)}ms`);
             }
@@ -5240,11 +5244,28 @@
             }
         }
 
+        async function handleReleaseProjectManifest() {
+            try {
+                await _projectRuntimeRef?.releaseManifest?.();
+            } catch (error) {
+                reportBridgeError('release project manifest', error);
+            }
+        }
+
         function refreshLayersPanel() {
             if (!layersPanelVisible || !_layerManagerRef) return;
+            const projectState = getProjectRuntimeState();
             const layers = getPanelLayers();
+            const projectReady = projectState.manifestExists === true;
+            const canReleaseProject = projectState.sceneSaved === true && !projectReady;
+            const showClearAll = layers.length > 0 || projectReady;
+            const emptyHtml = !projectState.sceneSaved
+                ? '<div class="layers-empty">Save the scene first. MaxJS creates <code>project.maxjs.json</code> and <code>inlines/</code> next to the <code>.max</code> file.</div>'
+                : !projectReady
+                    ? `<div class="layers-empty">This scene has no MaxJS project yet. Create scene-local runtime files next to the <code>.max</code> file.<div style="margin-top:10px"><button id="layersReleaseBtn">Release Project Manifest</button></div></div>`
+                    : '<div class="layers-empty">No layers yet. Scene-local project files live in <code>project.maxjs.json</code> and <code>inlines/</code>.</div>';
             const itemsHtml = layers.length === 0
-                ? '<div class="layers-empty">No layers loaded. Project layers live in project.maxjs.json and inline layers live in %TEMP%/maxjs_layers.</div>'
+                ? emptyHtml
                 : layers.map(l => `
                     <div class="layer-item${l.error ? ' error' : ''}${!l.active ? ' inactive' : ''}">
                         <div class="layer-main">
@@ -5271,7 +5292,8 @@
                         <div class="sidepanel-subtitle">${layers.length} tracked</div>
                     </div>
                     <div style="display:flex;gap:4px">
-                        <button id="layersClearBtn">Remove All</button>
+                        ${canReleaseProject && layers.length > 0 ? '<button id="layersReleaseBtn">Release Project Manifest</button>' : ''}
+                        ${showClearAll ? '<button id="layersClearBtn">Remove All</button>' : ''}
                         <button id="layersHideBtn">Hide</button>
                     </div>
                 </div>
@@ -5280,6 +5302,7 @@
 
             layersPanel.querySelector('#layersHideBtn')?.addEventListener('click', () => setLayersPanelVisible(false));
             layersPanel.querySelector('#layersClearBtn')?.addEventListener('click', () => { void handleLayerClearAll(); });
+            layersPanel.querySelector('#layersReleaseBtn')?.addEventListener('click', () => { void handleReleaseProjectManifest(); });
             layersPanel.querySelectorAll('[data-layer-toggle]').forEach(btn => {
                 btn.addEventListener('click', () => {
                     const layer = layers.find(item => item.id === btn.dataset.layerToggle);
@@ -6952,7 +6975,9 @@
                 }
                 handleBinaryScene(buffer, meta);
                 if (meta.runtimeScene) {
-                    const LoaderCtor = THREE.NodeObjectLoader || THREE.ObjectLoader || THREE_STD.ObjectLoader;
+                    // Snapshot runtime trees are plain Object3D JSON, not node-material graphs.
+                    // Prefer the standard ObjectLoader here; NodeObjectLoader can reject this payload.
+                    const LoaderCtor = THREE_STD.ObjectLoader || THREE.ObjectLoader || THREE.NodeObjectLoader;
                     const objectLoader = LoaderCtor ? new LoaderCtor() : null;
                     if (!objectLoader) {
                         throw new Error('Three.js ObjectLoader unavailable for snapshot runtime scene');

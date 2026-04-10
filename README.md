@@ -166,7 +166,9 @@ This tool targets web development but since it's registered as renderer I added 
 - ActiveShade can bug out if you maximize or minimize windows. Just use registered "kill maxjs" command in search menu
 - No orthographic view (yet)
 - Volumetric Lights contribution
-- Compound Objects can show as duplicate (hide source curve to get rid of it)
+- Heavy post effects can cause flicker in realtime preview
+- Fur modifier is WIP (buggy)
+
 
 # Build
 

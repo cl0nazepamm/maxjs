@@ -91,7 +91,10 @@ function deriveProjectName(projectDir) {
 export function createProjectRuntime({ layerManager, bridge, perfHud }) {
     let projectDir = '';
     let projectRootUrl = '';
+    let inlineDir = '';
     let pollMs = 0;
+    let sceneSaved = false;
+    let manifestExists = false;
     let lastManifestText = '';
     let lastStatus = '';
     let timer = 0;
@@ -260,6 +263,7 @@ export function createProjectRuntime({ layerManager, bridge, perfHud }) {
             const manifest = JSON.parse(manifestText);
             lastManifestText = manifestText;
             manifestState = manifest;
+            manifestExists = true;
             emitChange();
             return manifest;
         } catch (error) {
@@ -348,6 +352,7 @@ export function createProjectRuntime({ layerManager, bridge, perfHud }) {
 
             const is404 = manifest404(error);
             if (is404) {
+                manifestExists = false;
                 clearTimer();
                 setStatus('no project manifest');
             } else {
@@ -380,6 +385,7 @@ export function createProjectRuntime({ layerManager, bridge, perfHud }) {
         });
 
         lastManifestText = text;
+        manifestExists = true;
         await applyManifest(nextManifest);
         setStatus(`project saved: ${nextManifest.name || projectDir}`);
         return true;
@@ -439,6 +445,20 @@ export function createProjectRuntime({ layerManager, bridge, perfHud }) {
 
     async function clearInlineLayers() {
         await requestHostAction('inline_layer_clear');
+    }
+
+    async function releaseManifest() {
+        const result = await requestHostAction('project_release_manifest');
+        sceneSaved = true;
+        manifestExists = true;
+        if (result?.path) {
+            projectDir = normalizeWindowsPath(result.path).trim();
+            projectRootUrl = projectDir ? toProjectRootUrl(projectDir) : '';
+            inlineDir = projectDir ? ensureTrailingSlash(`${projectDir}\\inlines`) : '';
+        }
+        emitChange();
+        await reload(true);
+        return true;
     }
 
     function listEntries() {
@@ -512,6 +532,15 @@ export function createProjectRuntime({ layerManager, bridge, perfHud }) {
         const projectChanged = normalized !== projectDir;
         projectDir = normalized;
         projectRootUrl = normalized ? toProjectRootUrl(normalized) : '';
+        if (typeof options.inlineDir === 'string') {
+            inlineDir = normalizeWindowsPath(options.inlineDir).trim();
+        }
+        if (typeof options.sceneSaved === 'boolean') {
+            sceneSaved = options.sceneSaved;
+        }
+        if (typeof options.manifestExists === 'boolean') {
+            manifestExists = options.manifestExists;
+        }
         if (Number.isFinite(options.pollMs) && options.pollMs >= 0) {
             pollMs = options.pollMs;
         }
@@ -532,7 +561,12 @@ export function createProjectRuntime({ layerManager, bridge, perfHud }) {
     }
 
     bridge.on('project_config', msg => {
-        void setProjectDirectory(msg.dir || '', { pollMs: msg.pollMs });
+        void setProjectDirectory(msg.dir || '', {
+            pollMs: msg.pollMs,
+            inlineDir: msg.inlineDir || '',
+            sceneSaved: msg.sceneSaved === true,
+            manifestExists: msg.manifestExists === true,
+        });
     });
 
     bridge.on('project_reload', () => {
@@ -563,6 +597,7 @@ export function createProjectRuntime({ layerManager, bridge, perfHud }) {
         setInlineLayerEnabled,
         removeInlineLayer,
         clearInlineLayers,
+        releaseManifest,
         setProjectDirectory,
         reload,
         clear() {
@@ -570,6 +605,11 @@ export function createProjectRuntime({ layerManager, bridge, perfHud }) {
             clearProjectLayers();
             manifestState = null;
             lastManifestText = '';
+            projectDir = '';
+            projectRootUrl = '';
+            inlineDir = '';
+            sceneSaved = false;
+            manifestExists = false;
             emitChange();
             setStatus('project runtime cleared');
         },
@@ -577,7 +617,10 @@ export function createProjectRuntime({ layerManager, bridge, perfHud }) {
             return {
                 projectDir,
                 projectRootUrl,
+                inlineDir,
                 pollMs,
+                sceneSaved,
+                manifestExists,
                 activeLayers: Array.from(activeLayerIds),
                 manifest: manifestState,
             };

@@ -4106,6 +4106,7 @@
             light.userData ??= {};
             light.userData.maxjsTypeId = ld.type;
             if (ld.h != null) light.userData.maxjsHandle = ld.h;
+            if (ld.name) light.name = ld.name;
 
             const visible = ld.v == null ? true : !!ld.v;
             light.visible = visible;
@@ -5020,7 +5021,9 @@
                     if (runtimeSnapshot) {
                         runtimeSnapshotBase64 = toBase64Utf8(JSON.stringify(runtimeSnapshot));
                         const layerRows = runtimeSnapshot.layers?.length ?? 0;
-                        if (layerRows > 0 && !runtimeSnapshot.jsRoot && !runtimeSnapshot.overlayRoot) {
+                        const hasTransformOverrides = Array.isArray(runtimeSnapshot.transformOverrides)
+                            && runtimeSnapshot.transformOverrides.length > 0;
+                        if (layerRows > 0 && !runtimeSnapshot.jsRoot && !runtimeSnapshot.overlayRoot && !hasTransformOverrides) {
                             console.warn(
                                 '[MaxJS snapshot] Runtime scene has layer metadata but no serialized 3D (empty roots and no tracked orphans). '
                                 + 'Parent effects with ctx.js.add(...) / overlay:true, or ctx.track() if you attach elsewhere.',
@@ -6966,6 +6969,7 @@
             renderer,
             THREE,
             nodeMap,
+            lightHandleMap,
             maxRoot,
             jsRoot,
             overlayRoot,
@@ -7081,6 +7085,9 @@
                             const m = getSyncedObjectForSnapshotHandle(h);
                             if (m) m.visible = false;
                         }
+                    }
+                    if (Array.isArray(meta.runtimeScene.transformOverrides) && meta.runtimeScene.transformOverrides.length) {
+                        layerManager.restoreTransformOverrides?.(meta.runtimeScene.transformOverrides);
                     }
                 }
                 if (meta.snapshotUi) {

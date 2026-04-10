@@ -13,6 +13,7 @@ const MATERIAL_MAP_KEYS = [
     'emissiveMap', 'aoMap', 'displacementMap', 'alphaMap', 'envMap',
     'lightMap', 'clearcoatMap', 'clearcoatNormalMap', 'clearcoatRoughnessMap',
 ];
+const MATRIX_EPSILON = 1e-6;
 
 function setOwner(resource, owner) {
     if (!resource || typeof resource !== 'object') return resource;
@@ -200,6 +201,17 @@ function getMeshVertexPosition(mesh, vertexIndex, target) {
     return target;
 }
 
+function matrixElementsAlmostEqual(a, b, epsilon = MATRIX_EPSILON) {
+    if (!a || !b) return false;
+    const ae = a.elements ?? a;
+    const be = b.elements ?? b;
+    if (!ae || !be || ae.length !== be.length) return false;
+    for (let i = 0; i < ae.length; i++) {
+        if (Math.abs(ae[i] - be[i]) > epsilon) return false;
+    }
+    return true;
+}
+
 function freezePlainObject(obj) {
     return Object.freeze(obj);
 }
@@ -234,7 +246,7 @@ function createCameraAdapter(camera, THREE, ownForJs, cameraControl, layerId) {
     });
 }
 
-function createMaxNodeAdapter({ handle, getObject, THREE, createAnchor }) {
+function createMaxNodeAdapter({ handle, getObject, THREE, createAnchor, layerId, getTransformApi }) {
     const scratch = {
         vA: new THREE.Vector3(),
         vB: new THREE.Vector3(),
@@ -245,6 +257,7 @@ function createMaxNodeAdapter({ handle, getObject, THREE, createAnchor }) {
         localNormal: new THREE.Vector3(),
         normalMatrix: new THREE.Matrix3(),
     };
+    const transform = getTransformApi(handle, getObject, layerId);
 
     function collectSampleableMeshes(root, includeInvisible = false) {
         if (!root?.isObject3D) return [];
@@ -358,6 +371,7 @@ function createMaxNodeAdapter({ handle, getObject, THREE, createAnchor }) {
             const obj = getObject();
             return obj ? new THREE.Box3().setFromObject(obj) : null;
         },
+        transform,
         snapshot() {
             const obj = getObject();
             if (!obj) return null;
@@ -438,7 +452,7 @@ function createNodeMapFacade(nodeMap, getAdapter) {
     return freezePlainObject(facade);
 }
 
-function createMaxSceneFacade({ scene, nodeMap, getAdapter, createAnchor, THREE }) {
+function createMaxSceneFacade({ scene, nodeMap, lightHandleMap, getAdapter, createAnchor, THREE }) {
     return freezePlainObject({
         get size() { return nodeMap.size; },
         get background() { return scene.background?.clone?.() ?? scene.background ?? null; },
@@ -461,12 +475,23 @@ function createMaxSceneFacade({ scene, nodeMap, getAdapter, createAnchor, THREE 
             const query = String(name ?? '').toLowerCase();
             const exact = options.exact === true;
             const matches = [];
+            // Search meshes in nodeMap
             for (const handle of nodeMap.keys()) {
                 const adapter = getAdapter(handle);
                 const current = String(adapter?.name ?? '').toLowerCase();
                 if (!query) continue;
                 if ((exact && current === query) || (!exact && current.includes(query))) {
                     matches.push(adapter);
+                }
+            }
+            // Search lights in lightHandleMap
+            if (lightHandleMap) {
+                for (const [handle, light] of lightHandleMap.entries()) {
+                    const current = String(light?.name ?? '').toLowerCase();
+                    if (!query) continue;
+                    if ((exact && current === query) || (!exact && current.includes(query))) {
+                        matches.push(getAdapter(handle, light));
+                    }
                 }
             }
             return matches;
@@ -556,6 +581,7 @@ export function createLayerManager({
     renderer,
     THREE,
     nodeMap,
+    lightHandleMap = null,
     maxRoot = null,
     jsRoot = null,
     overlayRoot = null,
@@ -602,6 +628,246 @@ export function createLayerManager({
 
     let dt = 0;
     let elapsed = 0;
+    const runtimeTransformOverrides = new Map();
+    const transformScratch = {
+        localMatrix: new THREE.Matrix4(),
+        finalMatrix: new THREE.Matrix4(),
+        baseInverse: new THREE.Matrix4(),
+        position: new THREE.Vector3(),
+        quaternion: new THREE.Quaternion(),
+        scale: new THREE.Vector3(),
+        deltaPosition: new THREE.Vector3(),
+        deltaQuaternion: new THREE.Quaternion(),
+        deltaScale: new THREE.Vector3(),
+        euler: new THREE.Euler(),
+    };
+
+    function applyObjectLocalMatrix(obj, matrix) {
+        if (!obj?.isObject3D) return false;
+        obj.matrixAutoUpdate = false;
+        obj.matrix.copy(matrix);
+        obj.matrix.decompose(obj.position, obj.quaternion, obj.scale);
+        obj.matrixWorldNeedsUpdate = true;
+        obj.updateWorldMatrix(false, true);
+        return true;
+    }
+
+    function createRuntimeTransformState(handle, layerId, obj = null) {
+        const source = obj ?? nodeMap.get(handle) ?? null;
+        const baseMatrix = source?.matrix?.clone?.() ?? new THREE.Matrix4();
+        return {
+            handle,
+            ownerLayer: layerId ?? null,
+            mode: 'additive',
+            baseMatrix,
+            lastAppliedMatrix: baseMatrix.clone(),
+            position: new THREE.Vector3(0, 0, 0),
+            quaternion: new THREE.Quaternion(),
+            scale: new THREE.Vector3(1, 1, 1),
+        };
+    }
+
+    function composeRuntimeTransformState(state, target) {
+        if (state.mode === 'absolute') {
+            return target.compose(state.position, state.quaternion, state.scale);
+        }
+        transformScratch.localMatrix.compose(state.position, state.quaternion, state.scale);
+        return target.copy(state.baseMatrix).multiply(transformScratch.localMatrix);
+    }
+
+    function syncRuntimeTransformBaseFromScene(state, obj) {
+        if (!state || !obj?.isObject3D) return;
+        if (!matrixElementsAlmostEqual(obj.matrix, state.lastAppliedMatrix)) {
+            state.baseMatrix.copy(obj.matrix);
+        }
+    }
+
+    function setRuntimeTransformStateMode(state, mode, obj, preserveCurrent = true) {
+        if (!state || (mode !== 'additive' && mode !== 'absolute') || state.mode === mode) return state;
+        const currentMatrix = preserveCurrent
+            ? composeRuntimeTransformState(state, transformScratch.finalMatrix)
+            : (obj?.matrix?.clone?.() ?? state.baseMatrix.clone());
+        if (mode === 'absolute') {
+            currentMatrix.decompose(state.position, state.quaternion, state.scale);
+        } else {
+            transformScratch.baseInverse.copy(state.baseMatrix).invert();
+            transformScratch.localMatrix.copy(transformScratch.baseInverse).multiply(currentMatrix);
+            transformScratch.localMatrix.decompose(state.position, state.quaternion, state.scale);
+        }
+        state.mode = mode;
+        return state;
+    }
+
+    function applyRuntimeTransformState(state, obj) {
+        if (!state || !obj?.isObject3D) return false;
+        syncRuntimeTransformBaseFromScene(state, obj);
+        const finalMatrix = composeRuntimeTransformState(state, transformScratch.finalMatrix);
+        applyObjectLocalMatrix(obj, finalMatrix);
+        state.lastAppliedMatrix.copy(finalMatrix);
+        return true;
+    }
+
+    function getOrCreateRuntimeTransformState(handle, layerId, obj = null) {
+        let state = runtimeTransformOverrides.get(handle);
+        if (!state) {
+            state = createRuntimeTransformState(handle, layerId, obj);
+            runtimeTransformOverrides.set(handle, state);
+        }
+        if (layerId != null) state.ownerLayer = layerId;
+        return state;
+    }
+
+    function clearRuntimeTransformOverride(handle) {
+        const state = runtimeTransformOverrides.get(handle);
+        if (!state) return false;
+        const obj = nodeMap.get(handle);
+        if (obj?.isObject3D) applyObjectLocalMatrix(obj, state.baseMatrix);
+        runtimeTransformOverrides.delete(handle);
+        return true;
+    }
+
+    function clearRuntimeTransformOverridesForLayer(layerId) {
+        if (!layerId) return;
+        for (const [handle, state] of [...runtimeTransformOverrides.entries()]) {
+            if (state.ownerLayer === layerId) clearRuntimeTransformOverride(handle);
+        }
+    }
+
+    function applyAllRuntimeTransformOverrides() {
+        for (const [handle, state] of runtimeTransformOverrides.entries()) {
+            const obj = nodeMap.get(handle);
+            if (!obj?.isObject3D) continue;
+            applyRuntimeTransformState(state, obj);
+        }
+    }
+
+    function getRuntimeTransformStateSnapshot(handle) {
+        const state = runtimeTransformOverrides.get(handle);
+        if (!state) return null;
+        const currentMatrix = composeRuntimeTransformState(state, transformScratch.finalMatrix);
+        currentMatrix.decompose(transformScratch.position, transformScratch.quaternion, transformScratch.scale);
+        return freezePlainObject({
+            handle,
+            mode: state.mode,
+            position: transformScratch.position.toArray(),
+            quaternion: transformScratch.quaternion.toArray(),
+            scale: transformScratch.scale.toArray(),
+            baseMatrix: state.baseMatrix.toArray(),
+            matrix: currentMatrix.toArray(),
+        });
+    }
+
+    function serializeRuntimeTransformOverrides() {
+        const out = [];
+        for (const [handle, state] of runtimeTransformOverrides.entries()) {
+            const currentMatrix = composeRuntimeTransformState(state, transformScratch.finalMatrix);
+            currentMatrix.decompose(transformScratch.position, transformScratch.quaternion, transformScratch.scale);
+            out.push({
+                handle,
+                mode: state.mode,
+                position: transformScratch.position.toArray(),
+                quaternion: transformScratch.quaternion.toArray(),
+                scale: transformScratch.scale.toArray(),
+            });
+        }
+        return out;
+    }
+
+    function restoreRuntimeTransformOverrides(serialized = []) {
+        if (!Array.isArray(serialized)) return 0;
+        let restored = 0;
+        for (const item of serialized) {
+            const handle = item?.handle;
+            const obj = nodeMap.get(handle);
+            if (!obj?.isObject3D) continue;
+            const state = getOrCreateRuntimeTransformState(handle, null, obj);
+            state.mode = item.mode === 'absolute' ? 'absolute' : 'additive';
+            state.baseMatrix.copy(obj.matrix);
+            state.lastAppliedMatrix.copy(obj.matrix);
+            if (Array.isArray(item.position) && item.position.length >= 3) state.position.fromArray(item.position);
+            else state.position.set(0, 0, 0);
+            if (Array.isArray(item.quaternion) && item.quaternion.length >= 4) state.quaternion.fromArray(item.quaternion);
+            else state.quaternion.identity();
+            if (Array.isArray(item.scale) && item.scale.length >= 3) state.scale.fromArray(item.scale);
+            else state.scale.set(1, 1, 1);
+            applyRuntimeTransformState(state, obj);
+            restored++;
+        }
+        return restored;
+    }
+
+    function createTransformApi(handle, getObject, layerId) {
+        function getSceneObject() {
+            const obj = getObject();
+            return obj?.isObject3D ? obj : null;
+        }
+
+        function ensureState(mode, preserveCurrent = true) {
+            const obj = getSceneObject();
+            if (!obj) return null;
+            const state = getOrCreateRuntimeTransformState(handle, layerId, obj);
+            setRuntimeTransformStateMode(state, mode, obj, preserveCurrent);
+            return { state, obj };
+        }
+
+        function mutate(mode, mutator, options = {}) {
+            const payload = ensureState(mode, options.preserveCurrent !== false);
+            if (!payload) return false;
+            const { state, obj } = payload;
+            mutator(state.position, state.quaternion, state.scale, state, obj);
+            applyRuntimeTransformState(state, obj);
+            return true;
+        }
+
+        return freezePlainObject({
+            get hasOverride() { return runtimeTransformOverrides.has(handle); },
+            get mode() { return runtimeTransformOverrides.get(handle)?.mode ?? null; },
+            clear() { return clearRuntimeTransformOverride(handle); },
+            snapshot() { return getRuntimeTransformStateSnapshot(handle); },
+            setMode(mode, options = {}) {
+                const payload = ensureState(mode === 'absolute' ? 'absolute' : 'additive', options.preserveCurrent !== false);
+                if (!payload) return false;
+                applyRuntimeTransformState(payload.state, payload.obj);
+                return true;
+            },
+            setPosition(x = 0, y = 0, z = 0, options = {}) {
+                return mutate(options.mode === 'additive' ? 'additive' : 'absolute', position => {
+                    position.set(x, y, z);
+                }, options);
+            },
+            offsetPosition(x = 0, y = 0, z = 0) {
+                return mutate('additive', position => {
+                    position.add(transformScratch.deltaPosition.set(x, y, z));
+                });
+            },
+            setRotationEuler(x = 0, y = 0, z = 0, options = {}) {
+                return mutate(options.mode === 'additive' ? 'additive' : 'absolute', (position, quaternion) => {
+                    quaternion.setFromEuler(transformScratch.euler.set(x, y, z, 'XYZ'));
+                }, options);
+            },
+            offsetRotationEuler(x = 0, y = 0, z = 0) {
+                return mutate('additive', (position, quaternion) => {
+                    transformScratch.deltaQuaternion.setFromEuler(transformScratch.euler.set(x, y, z, 'XYZ'));
+                    quaternion.multiply(transformScratch.deltaQuaternion);
+                });
+            },
+            setQuaternion(x = 0, y = 0, z = 0, w = 1, options = {}) {
+                return mutate(options.mode === 'additive' ? 'additive' : 'absolute', (position, quaternion) => {
+                    quaternion.set(x, y, z, w).normalize();
+                }, options);
+            },
+            setScale(x = 1, y = x, z = x, options = {}) {
+                return mutate(options.mode === 'additive' ? 'additive' : 'absolute', (position, quaternion, scale) => {
+                    scale.set(x, y, z);
+                }, options);
+            },
+            multiplyScale(x = 1, y = x, z = x) {
+                return mutate('additive', (position, quaternion, scale) => {
+                    scale.multiply(transformScratch.deltaScale.set(x, y, z));
+                });
+            },
+        });
+    }
 
     function emitChange(reason = 'state') {
         for (const listener of listeners) {
@@ -700,15 +966,21 @@ export function createLayerManager({
         return anchor;
     }
 
-    function getLayerNodeAdapter(layer, handle) {
-        if (!nodeMap.has(handle)) return null;
+    function getLayerNodeAdapter(layer, handle, explicitObj = null) {
+        // Check if handle exists in nodeMap or lightHandleMap
+        const fromNodeMap = nodeMap.has(handle);
+        const fromLightMap = lightHandleMap?.has(handle);
+        if (!fromNodeMap && !fromLightMap && !explicitObj) return null;
+
         let adapter = layer.nodeAdapters.get(handle);
         if (!adapter) {
             adapter = createMaxNodeAdapter({
                 handle,
-                getObject: () => nodeMap.get(handle) ?? null,
+                getObject: () => explicitObj ?? nodeMap.get(handle) ?? lightHandleMap?.get(handle) ?? null,
                 THREE,
                 createAnchor: (nextHandle, options) => createAnchorForLayer(layer, nextHandle, options),
+                layerId: layer.id,
+                getTransformApi: createTransformApi,
             });
             layer.nodeAdapters.set(handle, adapter);
         }
@@ -722,7 +994,8 @@ export function createLayerManager({
         const maxSceneFacade = createMaxSceneFacade({
             scene,
             nodeMap,
-            getAdapter: handle => getLayerNodeAdapter(layer, handle),
+            lightHandleMap,
+            getAdapter: (handle, explicitObj) => getLayerNodeAdapter(layer, handle, explicitObj),
             createAnchor: (handle, options = {}) => createAnchorForLayer(layer, handle, options),
             THREE,
         });
@@ -1006,6 +1279,7 @@ export function createLayerManager({
         layer.anchors.length = 0;
         layer.nodeAdapters.clear();
         if (layer.input) { layer.input.dispose(); layer.input = null; }
+        clearRuntimeTransformOverridesForLayer(id);
 
         jsWorldRoot.remove(layer.group);
         overlayWorldRoot.remove(layer.overlayGroup);
@@ -1061,6 +1335,8 @@ export function createLayerManager({
         let trackedCount = 0;
         let totalUpdateMs = 0;
 
+        applyAllRuntimeTransformOverrides();
+
         for (const layer of layers.values()) {
             anchorCount += layer.anchors.length;
             trackedCount += layer.tracked.size;
@@ -1092,6 +1368,14 @@ export function createLayerManager({
                     emitChange('deactivated');
                 }
             }
+        }
+
+        applyAllRuntimeTransformOverrides();
+
+        // Re-sync anchors after runtime transform overrides are applied,
+        // so anchors reflect the current frame's transforms, not the previous frame's.
+        for (const layer of layers.values()) {
+            syncAnchors(layer, anchorSyncCache);
         }
 
         lastStats = freezePlainObject({
@@ -1190,6 +1474,8 @@ export function createLayerManager({
             jsRoot,
             overlayRoot,
         };
+        const transformOverrides = serializeRuntimeTransformOverrides();
+        if (transformOverrides.length > 0) payload.transformOverrides = transformOverrides;
         if (jsRoot || overlayRoot) {
             const hidden = new Set(collectHiddenMaxSyncHandles());
             if (jsRoot) {
@@ -1226,6 +1512,7 @@ export function createLayerManager({
         update,
         getLayerCode,
         serializeSnapshot,
+        restoreTransformOverrides: restoreRuntimeTransformOverrides,
         serialize,
         get isCameraOverridden() { return cameraControl.isClaimed(); },
         roots: freezePlainObject({

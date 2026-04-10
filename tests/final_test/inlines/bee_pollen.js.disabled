@@ -1,0 +1,333 @@
+// Pollen from the Bee — surface-normal bias + curl; each mote dies after a few seconds.
+// Emitter keeps spawning into free slots forever (no overwrite of living particles).
+//
+// Uses camera-facing instanced quads instead of THREE.Points so particle size
+// behaves consistently under the WebGPU renderer.
+
+const PARTICLE_COUNT = 32000;
+const SPAWN_PER_FRAME = 8;
+const HIDDEN_SCALE = 0.0001;
+const LIFE_SECONDS = 4.2;
+const FADE_IN_SEC = 0.18;
+const FADE_OUT_START = 0.68;
+const NORMAL_FOLLOW = 5.2;
+const NORM_RESAMPLE_STRIDE = 160;
+
+const positions = new Float32Array(PARTICLE_COUNT * 3);
+const velocities = new Float32Array(PARTICLE_COUNT * 3);
+const spawnNorm = new Float32Array(PARTICLE_COUNT * 3);
+const ageSec = new Float32Array(PARTICLE_COUNT);
+const isAlive = new Uint8Array(PARTICLE_COUNT);
+const baseSizes = new Float32Array(PARTICLE_COUNT);
+const flickFreq = new Float32Array(PARTICLE_COUNT);
+const flickFreq2 = new Float32Array(PARTICLE_COUNT);
+const flickPhase = new Float32Array(PARTICLE_COUNT);
+
+let particles = null;
+let bee = null;
+let head = 0;
+let initialized = false;
+
+const _surfPos = new THREE.Vector3();
+const _surfNorm = new THREE.Vector3();
+const _cameraQuat = new THREE.Quaternion();
+const _instancePos = new THREE.Vector3();
+const _instanceScale = new THREE.Vector3();
+const _instanceMatrix = new THREE.Matrix4();
+const _blackCol = new THREE.Color(0, 0, 0);
+let updateFrame = 0;
+
+function createSoftParticleTexture(document, THREE) {
+    const canvas = document.createElement('canvas');
+    canvas.width = 64;
+    canvas.height = 64;
+    const ctx2d = canvas.getContext('2d');
+    const gradient = ctx2d.createRadialGradient(32, 32, 0, 32, 32, 32);
+    // Hot core + wide bright halo for additive glow.
+    gradient.addColorStop(0.0, 'rgba(255,255,255,1)');
+    gradient.addColorStop(0.15, 'rgba(240,248,255,1)');
+    gradient.addColorStop(0.4, 'rgba(160,220,255,1)');
+    gradient.addColorStop(0.65, 'rgba(80,170,255,0.95)');
+    gradient.addColorStop(1.0, 'rgba(20,80,200,0)');
+    ctx2d.fillStyle = gradient;
+    ctx2d.fillRect(0, 0, 64, 64);
+
+    const texture = new THREE.CanvasTexture(canvas);
+    texture.needsUpdate = true;
+    return texture;
+}
+
+function findBee(ctx) {
+    const matches = ctx.scene.findByName('Bee', { exact: true });
+    return matches[0] || null;
+}
+
+function setInstanceTransform(index, position, quaternion, size) {
+    _instanceScale.set(size, size, size);
+    _instanceMatrix.compose(position, quaternion, _instanceScale);
+    particles.setMatrixAt(index, _instanceMatrix);
+}
+
+function hideInstance(index, quaternion) {
+    _instancePos.set(0, -100000, 0);
+    setInstanceTransform(index, _instancePos, quaternion, HIDDEN_SCALE);
+    const ic = particles?.instanceColor;
+    if (ic) {
+        const o = index * 3;
+        ic.array[o] = 0;
+        ic.array[o + 1] = 0;
+        ic.array[o + 2] = 0;
+    }
+}
+
+function init(ctx) {
+    bee = findBee(ctx);
+    if (!bee) return false;
+    if (!bee.sampleSurface()) return false;
+
+    for (let i = 0; i < PARTICLE_COUNT; i++) {
+        isAlive[i] = 0;
+        ageSec[i] = 0;
+        baseSizes[i] = 0;
+    }
+
+    const texture = createSoftParticleTexture(document, THREE);
+    const geometry = new THREE.PlaneGeometry(1, 1);
+    const material = new THREE.MeshBasicMaterial({
+        color: 0xffffff,
+        map: texture,
+        alphaMap: texture,
+        transparent: true,
+        opacity: 1,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
+        side: THREE.DoubleSide,
+        toneMapped: false,
+    });
+
+    particles = new THREE.InstancedMesh(geometry, material, PARTICLE_COUNT);
+    particles.name = 'bee_pollen_trail';
+    particles.frustumCulled = false;
+    particles.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    particles.setColorAt(0, _blackCol);
+
+    ctx.camera.raw.getWorldQuaternion(_cameraQuat);
+    for (let i = 0; i < PARTICLE_COUNT; i++) {
+        hideInstance(i, _cameraQuat);
+    }
+    particles.instanceMatrix.needsUpdate = true;
+    if (particles.instanceColor) particles.instanceColor.needsUpdate = true;
+
+    ctx.js.add(particles, { snapshotId: 'bee_pollen_trail' });
+    return true;
+}
+
+function spawn(i) {
+    const sample = bee.sampleSurface({ point: _surfPos, normal: _surfNorm });
+    if (!sample) return false;
+
+    positions[i * 3] = _surfPos.x;
+    positions[i * 3 + 1] = _surfPos.y;
+    positions[i * 3 + 2] = _surfPos.z;
+
+    const normalSpeed = 0.3 + Math.random() * 0.5;
+    const tangentSpeed = 0.3 + Math.random() * 0.4;
+    const a = Math.random() * Math.PI * 2;
+
+    let tx, ty, tz;
+    if (Math.abs(_surfNorm.y) < 0.9) {
+        tx = _surfNorm.z;
+        ty = 0;
+        tz = -_surfNorm.x;
+    } else {
+        tx = 0;
+        ty = -_surfNorm.z;
+        tz = _surfNorm.y;
+    }
+    const tl = Math.sqrt(tx * tx + ty * ty + tz * tz) || 1;
+    tx /= tl;
+    ty /= tl;
+    tz /= tl;
+
+    const bx = _surfNorm.y * tz - _surfNorm.z * ty;
+    const by = _surfNorm.z * tx - _surfNorm.x * tz;
+    const bz = _surfNorm.x * ty - _surfNorm.y * tx;
+
+    velocities[i * 3] = _surfNorm.x * normalSpeed + (Math.cos(a) * tx + Math.sin(a) * bx) * tangentSpeed;
+    velocities[i * 3 + 1] = _surfNorm.y * normalSpeed + (Math.cos(a) * ty + Math.sin(a) * by) * tangentSpeed - 0.15;
+    velocities[i * 3 + 2] = _surfNorm.z * normalSpeed + (Math.cos(a) * tz + Math.sin(a) * bz) * tangentSpeed;
+
+    const j = i * 3;
+    spawnNorm[j] = _surfNorm.x;
+    spawnNorm[j + 1] = _surfNorm.y;
+    spawnNorm[j + 2] = _surfNorm.z;
+
+    isAlive[i] = 1;
+    ageSec[i] = 0;
+    baseSizes[i] = 0.28 + Math.random() * 0.22;
+    flickPhase[i] = Math.random() * Math.PI * 2;
+    flickFreq[i] = 9 + Math.random() * 38;
+    flickFreq2[i] = 2.2 + Math.random() * 11;
+    return true;
+}
+
+return {
+    update(ctx) {
+        if (!initialized) {
+            initialized = init(ctx);
+            if (!initialized) return;
+        }
+
+        if (!bee || !bee.exists) {
+            bee = findBee(ctx);
+            if (!bee) return;
+        }
+
+        const dt = Math.min(ctx.clock.dt, 0.05);
+        ctx.camera.raw.getWorldQuaternion(_cameraQuat);
+        updateFrame++;
+
+        let spawned = 0;
+        let scan = 0;
+        while (spawned < SPAWN_PER_FRAME && scan < PARTICLE_COUNT) {
+            if (!isAlive[head] && spawn(head)) spawned++;
+            head = (head + 1) % PARTICLE_COUNT;
+            scan++;
+        }
+
+        const drag = Math.max(0, 1 - 0.42 * dt);
+        const gravity = 0.48 * dt;
+        const te = ctx.clock.elapsed;
+        const icArr = particles.instanceColor?.array;
+
+        let instanceColorDirty = false;
+
+        for (let i = 0; i < PARTICLE_COUNT; i++) {
+            if (!isAlive[i]) {
+                hideInstance(i, _cameraQuat);
+                continue;
+            }
+
+            ageSec[i] += dt;
+            if (ageSec[i] >= LIFE_SECONDS) {
+                isAlive[i] = 0;
+                hideInstance(i, _cameraQuat);
+                continue;
+            }
+
+            const u = ageSec[i] / LIFE_SECONDS;
+            const fadeIn = Math.min(1, ageSec[i] / FADE_IN_SEC);
+            const fadeOut = u < FADE_OUT_START
+                ? 1
+                : Math.max(0, 1 - (u - FADE_OUT_START) / (1 - FADE_OUT_START));
+            const fade = fadeIn * fadeOut;
+
+            const j = i * 3;
+            let nx = spawnNorm[j];
+            let ny = spawnNorm[j + 1];
+            let nz = spawnNorm[j + 2];
+
+            if (((i + updateFrame) % NORM_RESAMPLE_STRIDE) === 0 && bee.sampleSurface({ point: _surfPos, normal: _surfNorm })) {
+                const a = 0.14;
+                nx = nx * (1 - a) + _surfNorm.x * a;
+                ny = ny * (1 - a) + _surfNorm.y * a;
+                nz = nz * (1 - a) + _surfNorm.z * a;
+                const nl = Math.sqrt(nx * nx + ny * ny + nz * nz) || 1;
+                nx /= nl;
+                ny /= nl;
+                nz /= nl;
+                spawnNorm[j] = nx;
+                spawnNorm[j + 1] = ny;
+                spawnNorm[j + 2] = nz;
+            }
+
+            let vx = velocities[j];
+            let vy = velocities[j + 1];
+            let vz = velocities[j + 2];
+
+            const vn = vx * nx + vy * ny + vz * nz;
+            const targetN = 0.18 + 0.14 * Math.sin(te * 2.2 + flickPhase[i]);
+            const nk = NORMAL_FOLLOW * dt;
+            vx += nx * nk * (targetN - vn);
+            vy += ny * nk * (targetN - vn);
+            vz += nz * nk * (targetN - vn);
+
+            let tx;
+            let ty;
+            let tz;
+            if (Math.abs(ny) < 0.92) {
+                tx = nz;
+                ty = 0;
+                tz = -nx;
+            } else {
+                tx = 0;
+                ty = -nz;
+                tz = ny;
+            }
+            let tl = Math.sqrt(tx * tx + ty * ty + tz * tz) || 1;
+            tx /= tl;
+            ty /= tl;
+            tz /= tl;
+            const bx = ny * tz - nz * ty;
+            const by = nz * tx - nx * tz;
+            const bz = nx * ty - ny * tx;
+            const swirl = 1.15 * dt * Math.sin(te * (1.4 + flickFreq2[i] * 0.08) + flickPhase[i] * 1.3);
+            vx += (tx * Math.cos(te * 2.7 + i) + bx * Math.sin(te * 2.7 + i)) * swirl;
+            vy += (ty * Math.cos(te * 2.7 + i) + by * Math.sin(te * 2.7 + i)) * swirl;
+            vz += (tz * Math.cos(te * 2.7 + i) + bz * Math.sin(te * 2.7 + i)) * swirl;
+
+            const lift = 0.85 * gravity;
+            vx += nx * lift * 0.35;
+            vy += ny * lift;
+            vz += nz * lift * 0.35;
+            vy -= gravity;
+
+            vx *= drag;
+            vy *= drag;
+            vz *= drag;
+
+            velocities[j] = vx;
+            velocities[j + 1] = vy;
+            velocities[j + 2] = vz;
+
+            positions[j] += vx * dt;
+            positions[j + 1] += vy * dt;
+            positions[j + 2] += vz * dt;
+
+            _instancePos.set(
+                positions[i * 3],
+                positions[i * 3 + 1],
+                positions[i * 3 + 2],
+            );
+            const ph = flickPhase[i];
+            const a = 0.5 + 0.5 * Math.sin(te * flickFreq[i] + ph);
+            const b = 0.5 + 0.5 * Math.sin(te * flickFreq2[i] + ph * 1.713);
+            const snap = ((i * 1103515245 + (te * 17.3) | 0) >>> 0) % 501;
+            const c = 0.62 + 0.38 * (snap / 500);
+            let glow = a * b * c;
+            glow = 0.22 + glow * 0.78;
+            const pulse = 0.5 + 0.5 * Math.sin(te * (3.1 + (i % 17) * 0.09) + ph * 0.37);
+            glow *= 0.82 + 0.22 * pulse;
+            const mult = (2.2 + glow * 3.6) * fade;
+            if (icArr) {
+                const o = i * 3;
+                icArr[o] = mult * 0.72;
+                icArr[o + 1] = mult * 0.9;
+                icArr[o + 2] = mult * 1.05;
+                instanceColorDirty = true;
+            }
+
+            setInstanceTransform(i, _instancePos, _cameraQuat, baseSizes[i] * fade * (0.92 + 0.08 * glow));
+        }
+
+        particles.instanceMatrix.needsUpdate = true;
+        if (instanceColorDirty && particles.instanceColor) particles.instanceColor.needsUpdate = true;
+    },
+
+    dispose(ctx) {
+        particles = null;
+        bee = null;
+        initialized = false;
+        updateFrame = 0;
+    },
+};

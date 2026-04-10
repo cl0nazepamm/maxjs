@@ -10343,6 +10343,10 @@ public:
             ss << L"\"v\":" << (IsMaxJsSyncDrawVisible(node) ? L'1' : L'0');
         }
 
+        // Node name
+        appendComma();
+        ss << L"\"name\":\"" << EscapeJson(node->GetName()) << L'"';
+
         appendComma();
         ss << L"\"type\":" << static_cast<int>(ltype);
         ss << L",\"pos\":[" << pos.x << L',' << pos.y << L',' << pos.z << L']';

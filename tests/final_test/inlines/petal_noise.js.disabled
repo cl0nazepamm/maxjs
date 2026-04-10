@@ -1,0 +1,127 @@
+// Wind deform for three.js Deform (jsmod) meshes.
+//
+// Sync arrives over several frames: do NOT "discover once". Use ctx.scene.listJsmodNodes()
+// each update and merge/prune so every petal joins when its node gets userData.jsmod.
+
+const targets = new Map(); // handle -> { clone, rest, seed, yMin, yMax, anchor }
+
+function hash(x, y, z) {
+    let h = (x * 374761393 + y * 668265263 + z * 1274126177) | 0;
+    h = ((h ^ (h >> 13)) * 1274126177) | 0;
+    return (h & 0x7fffffff) / 0x7fffffff;
+}
+
+function noise3(x, y, z) {
+    const X = Math.floor(x), Y = Math.floor(y), Z = Math.floor(z);
+    const fx = x - X, fy = y - Y, fz = z - Z;
+    const u = fx * fx * (3 - 2 * fx), v = fy * fy * (3 - 2 * fy), w = fz * fz * (3 - 2 * fz);
+    const a = hash(X, Y, Z), b = hash(X + 1, Y, Z);
+    const c = hash(X, Y + 1, Z), d = hash(X + 1, Y + 1, Z);
+    const e = hash(X, Y, Z + 1), f = hash(X + 1, Y, Z + 1);
+    const g = hash(X, Y + 1, Z + 1), h2 = hash(X + 1, Y + 1, Z + 1);
+    const x0 = a + (b - a) * u, x1 = c + (d - c) * u;
+    const x2 = e + (f - e) * u, x3 = g + (h2 - g) * u;
+    return (x0 + (x1 - x0) * v) + ((x2 + (x3 - x2) * v) - (x0 + (x1 - x0) * v)) * w;
+}
+
+function boundsY(rest) {
+    let yMin = Infinity, yMax = -Infinity;
+    for (let i = 1; i < rest.length; i += 3) {
+        const y = rest[i];
+        if (y < yMin) yMin = y;
+        if (y > yMax) yMax = y;
+    }
+    if (!Number.isFinite(yMin)) return { yMin: 0, yMax: 1 };
+    if (yMax <= yMin) return { yMin, yMax: yMin + 1e-3 };
+    return { yMin, yMax };
+}
+
+function addTarget(ctx, node) {
+    const clone = ctx.js.cloneFromMax(node.handle);
+    if (!clone) return;
+    clone.visible = true;
+    clone.matrixAutoUpdate = true;
+    clone.position.set(0, 0, 0);
+    clone.quaternion.identity();
+    clone.scale.set(1, 1, 1);
+    clone.matrix.identity();
+    const anchor = ctx.js.createAnchor(node.handle, { followVisibility: false });
+    anchor.visible = true;
+    anchor.add(clone);
+    node.setVisible(false);
+    const rest = new Float32Array(clone.geometry.attributes.position.array);
+    const { yMin, yMax } = boundsY(rest);
+    targets.set(node.handle, {
+        clone,
+        rest,
+        anchor,
+        seed: Math.random() * 6.28318,
+        yMin,
+        yMax,
+    });
+}
+
+function removeTarget(ctx, handle) {
+    const t = targets.get(handle);
+    if (!t) return;
+    const node = ctx.scene.getNode(handle);
+    if (node) node.setVisible(true);
+    if (t.anchor) ctx.js.remove(t.anchor);
+    targets.delete(handle);
+}
+
+function syncTargets(ctx) {
+    const live = ctx.scene.listJsmodNodes();
+    const want = new Set(live.map(n => n.handle));
+    for (const h of [...targets.keys()]) {
+        if (!want.has(h)) removeTarget(ctx, h);
+    }
+    for (const node of live) {
+        if (!targets.has(node.handle)) addTarget(ctx, node);
+    }
+}
+
+return {
+    update(ctx) {
+        syncTargets(ctx);
+        if (targets.size === 0) return;
+
+        const t = ctx.clock.elapsed;
+        const mainAmp = 5;
+        const gustSpeed = 0.8;
+        const rippleSpeed = 1.4;
+        const flutterAmp = 1.8;
+
+        for (const tgt of targets.values()) {
+            const pos = tgt.clone.geometry.attributes.position;
+            const arr = pos.array;
+            const r = tgt.rest;
+            const { yMin, yMax, seed } = tgt;
+            const ySpan = yMax - yMin;
+
+            for (let i = 0; i < r.length; i += 3) {
+                const rx = r[i], ry = r[i + 1], rz = r[i + 2];
+                const bend = Math.pow(Math.max(0, Math.min(1, (ry - yMin) / ySpan)), 1.35);
+
+                const phase = rx * 0.031 + ry * 0.018 + rz * 0.024 + seed;
+                const gust = Math.sin(phase - t * gustSpeed)
+                    * Math.sin(phase * 0.37 + t * rippleSpeed + seed * 0.5);
+                const sway = Math.cos(phase * 0.61 - t * (gustSpeed * 0.85));
+
+                const nx = (noise3(rx * 0.04 + seed, ry * 0.04, rz * 0.04 + t * 0.3) - 0.5) * flutterAmp * bend;
+                const ny = (noise3(rx * 0.04 + 19, ry * 0.04 + t * 0.25, rz * 0.04) - 0.5) * flutterAmp * 0.45 * bend;
+                const nz = (noise3(rx * 0.04, ry * 0.04 + seed * 2, rz * 0.04 + t * 0.35) - 0.5) * flutterAmp * 0.7 * bend;
+
+                arr[i]     = rx + gust * mainAmp * bend + nx;
+                arr[i + 1] = ry + sway * mainAmp * 0.28 * bend + ny;
+                arr[i + 2] = rz + gust * mainAmp * 0.55 * bend + nz;
+            }
+            pos.needsUpdate = true;
+            tgt.clone.geometry.computeVertexNormals();
+        }
+    },
+
+    dispose(ctx) {
+        for (const h of [...targets.keys()]) removeTarget(ctx, h);
+    },
+};

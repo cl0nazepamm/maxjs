@@ -1,0 +1,314 @@
+// Gold dust particles emitting from Flower_01_Core mesh surface.
+// Uses camera-facing instanced quads so particle size is stable under WebGPU.
+// Surface sampling via cloneFromMax — same approach as bee_pollen.
+
+const PARTICLE_COUNT = 500;
+const HIDDEN_SCALE = 0.0001;
+
+const particlesState = { positions: null, velocities: null, lifetimes: null, sizes: null };
+let particles = null;
+let flower = null;
+let initialized = false;
+
+// Surface sampling data (built once from flower geometry)
+let triPositions = null;
+let triNormals   = null;
+let triCount     = 0;
+let cumulativeAreas = null;
+let totalArea = 0;
+
+const _cameraQuat = new THREE.Quaternion();
+const _instancePos = new THREE.Vector3();
+const _instanceScale = new THREE.Vector3();
+const _instanceMatrix = new THREE.Matrix4();
+const _surfPos = new THREE.Vector3();
+const _surfNorm = new THREE.Vector3();
+
+function createSoftParticleTexture(document, THREE) {
+    const canvas = document.createElement('canvas');
+    canvas.width = 64;
+    canvas.height = 64;
+    const ctx2d = canvas.getContext('2d');
+    const gradient = ctx2d.createRadialGradient(32, 32, 0, 32, 32, 32);
+    gradient.addColorStop(0.0, 'rgba(200,220,255,1)');
+    gradient.addColorStop(0.15, 'rgba(100,160,255,1)');
+    gradient.addColorStop(0.4, 'rgba(60,120,255,0.85)');
+    gradient.addColorStop(0.7, 'rgba(30,80,220,0.4)');
+    gradient.addColorStop(1.0, 'rgba(10,40,180,0)');
+    ctx2d.fillStyle = gradient;
+    ctx2d.fillRect(0, 0, 64, 64);
+
+    const texture = new THREE.CanvasTexture(canvas);
+    texture.needsUpdate = true;
+    return texture;
+}
+
+function setInstanceTransform(index, position, quaternion, size) {
+    _instanceScale.set(size, size, size);
+    _instanceMatrix.compose(position, quaternion, _instanceScale);
+    particles.setMatrixAt(index, _instanceMatrix);
+}
+
+function hideInstance(index, quaternion) {
+    _instancePos.set(0, -100000, 0);
+    setInstanceTransform(index, _instancePos, quaternion, HIDDEN_SCALE);
+}
+
+function findFlower(ctx) {
+    const allNodes = ctx.scene.listNodes();
+    for (const node of allNodes) {
+        if (node.name === 'flowercenter') return node;
+    }
+    return null;
+}
+
+function buildSurfaceData(ctx) {
+    const clone = ctx.js.cloneFromMax(flower.handle);
+    if (!clone || !clone.geometry) return false;
+
+    const geo = clone.geometry;
+    const posAttr = geo.attributes.position;
+    if (!posAttr) { ctx.js.dispose(clone); return false; }
+
+    const index = geo.index;
+
+    if (index) {
+        triCount = Math.floor(index.count / 3);
+    } else {
+        triCount = Math.floor(posAttr.count / 3);
+    }
+    if (triCount === 0) { ctx.js.dispose(clone); return false; }
+
+    triPositions = new Float32Array(triCount * 9);
+    triNormals   = new Float32Array(triCount * 3);
+    cumulativeAreas = new Float32Array(triCount);
+
+    const vA = new THREE.Vector3();
+    const vB = new THREE.Vector3();
+    const vC = new THREE.Vector3();
+    const ab = new THREE.Vector3();
+    const ac = new THREE.Vector3();
+    const cross = new THREE.Vector3();
+
+    totalArea = 0;
+
+    for (let t = 0; t < triCount; t++) {
+        let iA, iB, iC;
+        if (index) {
+            iA = index.getX(t * 3);
+            iB = index.getX(t * 3 + 1);
+            iC = index.getX(t * 3 + 2);
+        } else {
+            iA = t * 3;
+            iB = t * 3 + 1;
+            iC = t * 3 + 2;
+        }
+
+        vA.fromBufferAttribute(posAttr, iA);
+        vB.fromBufferAttribute(posAttr, iB);
+        vC.fromBufferAttribute(posAttr, iC);
+
+        const o = t * 9;
+        triPositions[o]     = vA.x; triPositions[o + 1] = vA.y; triPositions[o + 2] = vA.z;
+        triPositions[o + 3] = vB.x; triPositions[o + 4] = vB.y; triPositions[o + 5] = vB.z;
+        triPositions[o + 6] = vC.x; triPositions[o + 7] = vC.y; triPositions[o + 8] = vC.z;
+
+        ab.subVectors(vB, vA);
+        ac.subVectors(vC, vA);
+        cross.crossVectors(ab, ac);
+        const area = cross.length() * 0.5;
+
+        const nl = cross.length();
+        if (nl > 0) {
+            triNormals[t * 3]     = cross.x / nl;
+            triNormals[t * 3 + 1] = cross.y / nl;
+            triNormals[t * 3 + 2] = cross.z / nl;
+        }
+
+        totalArea += area;
+        cumulativeAreas[t] = totalArea;
+    }
+
+    ctx.js.remove(clone);
+    return true;
+}
+
+function sampleSurface(worldMatrix) {
+    const r = Math.random() * totalArea;
+    let lo = 0, hi = triCount - 1;
+    while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if (cumulativeAreas[mid] < r) lo = mid + 1;
+        else hi = mid;
+    }
+    const t = lo;
+
+    let u = Math.random();
+    let v = Math.random();
+    if (u + v > 1) { u = 1 - u; v = 1 - v; }
+    const w = 1 - u - v;
+
+    const o = t * 9;
+    const lx = triPositions[o]     * w + triPositions[o + 3] * u + triPositions[o + 6] * v;
+    const ly = triPositions[o + 1] * w + triPositions[o + 4] * u + triPositions[o + 7] * v;
+    const lz = triPositions[o + 2] * w + triPositions[o + 5] * u + triPositions[o + 8] * v;
+
+    const e = worldMatrix.elements;
+    _surfPos.x = e[0] * lx + e[4] * ly + e[8]  * lz + e[12];
+    _surfPos.y = e[1] * lx + e[5] * ly + e[9]  * lz + e[13];
+    _surfPos.z = e[2] * lx + e[6] * ly + e[10] * lz + e[14];
+
+    const nx = triNormals[t * 3], ny = triNormals[t * 3 + 1], nz = triNormals[t * 3 + 2];
+    _surfNorm.x = e[0] * nx + e[4] * ny + e[8]  * nz;
+    _surfNorm.y = e[1] * nx + e[5] * ny + e[9]  * nz;
+    _surfNorm.z = e[2] * nx + e[6] * ny + e[10] * nz;
+    const nl = Math.sqrt(_surfNorm.x * _surfNorm.x + _surfNorm.y * _surfNorm.y + _surfNorm.z * _surfNorm.z);
+    if (nl > 0) { _surfNorm.x /= nl; _surfNorm.y /= nl; _surfNorm.z /= nl; }
+}
+
+function setup(ctx) {
+    flower = findFlower(ctx);
+    if (!flower) return false;
+
+    if (!buildSurfaceData(ctx)) return false;
+
+    const positions = new Float32Array(PARTICLE_COUNT * 3);
+    const velocities = new Float32Array(PARTICLE_COUNT * 3);
+    const lifetimes = new Float32Array(PARTICLE_COUNT);
+    const sizes = new Float32Array(PARTICLE_COUNT);
+
+    for (let i = 0; i < PARTICLE_COUNT; i++) {
+        lifetimes[i] = 2;
+        sizes[i] = 0;
+    }
+
+    particlesState.positions = positions;
+    particlesState.velocities = velocities;
+    particlesState.lifetimes = lifetimes;
+    particlesState.sizes = sizes;
+
+    const texture = createSoftParticleTexture(document, THREE);
+    const geometry = new THREE.PlaneGeometry(1, 1);
+    const material = new THREE.MeshStandardMaterial({
+        color: 0x000000,
+        emissive: new THREE.Color(0.3, 0.5, 1.0).multiplyScalar(3.0),
+        emissiveMap: texture,
+        alphaMap: texture,
+        metalness: 0,
+        roughness: 1,
+        transparent: true,
+        opacity: 1.0,
+        toneMapped: false,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
+        side: THREE.DoubleSide,
+    });
+
+    particles = new THREE.InstancedMesh(geometry, material, PARTICLE_COUNT);
+    particles.name = 'gold_dust_particles';
+    particles.frustumCulled = false;
+    particles.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+
+    ctx.camera.raw.getWorldQuaternion(_cameraQuat);
+    for (let i = 0; i < PARTICLE_COUNT; i++) {
+        hideInstance(i, _cameraQuat);
+    }
+    particles.instanceMatrix.needsUpdate = true;
+
+    ctx.js.add(particles, { snapshotId: 'gold_dust_particles' });
+    return true;
+}
+
+function resetParticle(pos, vel, life, sizes, i, worldMatrix) {
+    sampleSurface(worldMatrix);
+
+    pos[i * 3]     = _surfPos.x;
+    pos[i * 3 + 1] = _surfPos.y;
+    pos[i * 3 + 2] = _surfPos.z;
+
+    // Drift along surface normal + gentle tangent spread
+    const normalSpeed = 0.2 + Math.random() * 0.4;
+    vel[i * 3]     = _surfNorm.x * normalSpeed;
+    vel[i * 3 + 1] = _surfNorm.y * normalSpeed + 0.5 + Math.random() * 1.0;
+    vel[i * 3 + 2] = _surfNorm.z * normalSpeed;
+
+    life[i] = 0;
+    sizes[i] = 0.3 + Math.random() * 0.7;
+}
+
+return {
+    update(ctx) {
+        if (!initialized) {
+            initialized = setup(ctx);
+            if (!initialized) return;
+        }
+
+        if (!flower || !flower.exists) {
+            flower = findFlower(ctx);
+            if (!flower) return;
+        }
+
+        const wm = flower.getWorldMatrix();
+        if (!wm) return;
+
+        const dt = ctx.clock.dt;
+        const elapsed = ctx.clock.elapsed;
+        const pos = particlesState.positions;
+        const vel = particlesState.velocities;
+        const life = particlesState.lifetimes;
+        const sizes = particlesState.sizes;
+
+        ctx.camera.raw.getWorldQuaternion(_cameraQuat);
+
+        for (let i = 0; i < PARTICLE_COUNT; i++) {
+            life[i] += dt * (0.025 + sizes[i] * 0.005);
+
+            if (life[i] > 1) {
+                resetParticle(pos, vel, life, sizes, i, wm);
+            } else {
+                const t = life[i];
+                const ease = 1 - t * t * t;
+
+                // Base drift
+                pos[i * 3]     += vel[i * 3]     * ease * dt;
+                pos[i * 3 + 1] += vel[i * 3 + 1] * ease * dt;
+                pos[i * 3 + 2] += vel[i * 3 + 2] * ease * dt;
+
+                // Harmonic scatter — layered sine waves at different frequencies
+                const seed = i * 1.618033;
+                const f1 = elapsed * 1.2 + seed;
+                const f2 = elapsed * 2.7 + seed * 0.7;
+                const f3 = elapsed * 0.5 + seed * 1.3;
+
+                const amp = 1.8 * ease;
+                pos[i * 3]     += Math.sin(f1) * Math.cos(f3) * amp * dt;
+                pos[i * 3 + 1] += Math.sin(f2) * 0.6 * amp * dt;
+                pos[i * 3 + 2] += Math.cos(f1) * Math.sin(f2 * 0.8) * amp * dt;
+            }
+
+            if (life[i] >= 1) {
+                hideInstance(i, _cameraQuat);
+                continue;
+            }
+
+            const ease = 1 - life[i] * life[i] * life[i];
+            _instancePos.set(pos[i * 3], pos[i * 3 + 1], pos[i * 3 + 2]);
+            setInstanceTransform(i, _instancePos, _cameraQuat, sizes[i] * Math.max(0, Math.min(1, ease)));
+        }
+
+        particles.instanceMatrix.needsUpdate = true;
+    },
+
+    dispose(ctx) {
+        particlesState.positions = null;
+        particlesState.velocities = null;
+        particlesState.lifetimes = null;
+        particlesState.sizes = null;
+        particles = null;
+        flower = null;
+        initialized = false;
+        triPositions = null;
+        triNormals = null;
+        cumulativeAreas = null;
+    },
+};

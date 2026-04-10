@@ -6166,8 +6166,15 @@ public:
             BuildAnimatableTimeSamples(node->GetTMController(), range, currentTime, discoveryTimes);
         const bool hasVisibilityAnimation =
             BuildAnimatableTimeSamples(node->GetVisController(), range, currentTime, discoveryTimes);
+        // Parent-driven motion still changes this node's world transform in the snapshot.
+        for (INode* parent = node->GetParentNode(); parent; parent = parent->GetParentNode()) {
+            if (parent->IsRootNode()) break;
+            BuildAnimatableTimeSamples(parent->GetTMController(), range, currentTime, discoveryTimes);
+        }
         if (!hasTransformAnimation && !hasVisibilityAnimation) {
-            return false;
+            if (discoveryTimes.empty()) {
+                return false;
+            }
         }
 
         std::vector<TimeValue> sampleTimes;

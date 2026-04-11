@@ -1,0 +1,51 @@
+#include "threejs_audio_res.h"
+#include <windows.h>
+
+STRINGTABLE
+BEGIN
+    IDS_AUDIO_PARAMS "Audio Origin"
+    IDS_AUDIO_DISPLAY_SIZE "Display Size"
+    IDS_AUDIO_FILE "Audio File"
+    IDS_AUDIO_VOLUME "Volume"
+    IDS_AUDIO_LOOP "Loop"
+    IDS_AUDIO_CROSSFADE "Crossfade (ms)"
+    IDS_AUDIO_REF_DISTANCE "Ref Distance"
+    IDS_AUDIO_MAX_DISTANCE "Max Distance"
+    IDS_AUDIO_ROLLOFF "Rolloff"
+END
+
+IDD_THREEJS_AUDIO DIALOG 0, 0, 186, 82
+STYLE DS_SETFONT | WS_CHILD | WS_VISIBLE
+FONT 8, "Segoe UI"
+BEGIN
+    LTEXT           "File", -1, 8, 6, 160, 8
+    EDITTEXT        IDC_AUDIO_PATH, 24, 4, 88, 12, ES_AUTOHSCROLL | ES_READONLY
+    PUSHBUTTON      "Load...", IDC_AUDIO_LOAD, 116, 4, 30, 12
+    PUSHBUTTON      "Clear", IDC_AUDIO_CLEAR, 150, 4, 28, 12
+
+    LTEXT           "Display", -1, 8, 22, 32, 8
+    CONTROL         "", IDC_AUDIO_SIZE_EDIT, "CustEdit", WS_TABSTOP, 44, 20, 26, 10
+    CONTROL         "", IDC_AUDIO_SIZE_SPIN, "SpinnerControl", 0, 70, 20, 11, 10
+
+    LTEXT           "Volume", -1, 92, 22, 30, 8
+    CONTROL         "", IDC_AUDIO_VOLUME_EDIT, "CustEdit", WS_TABSTOP, 122, 20, 24, 10
+    CONTROL         "", IDC_AUDIO_VOLUME_SPIN, "SpinnerControl", 0, 146, 20, 11, 10
+
+    CONTROL         "Loop", IDC_AUDIO_LOOP, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 8, 38, 34, 10
+
+    LTEXT           "XFade", -1, 52, 38, 26, 8
+    CONTROL         "", IDC_AUDIO_CROSSFADE_EDIT, "CustEdit", WS_TABSTOP, 80, 36, 24, 10
+    CONTROL         "", IDC_AUDIO_CROSSFADE_SPIN, "SpinnerControl", 0, 104, 36, 11, 10
+
+    LTEXT           "Ref", -1, 120, 38, 16, 8
+    CONTROL         "", IDC_AUDIO_REF_EDIT, "CustEdit", WS_TABSTOP, 136, 36, 24, 10
+    CONTROL         "", IDC_AUDIO_REF_SPIN, "SpinnerControl", 0, 160, 36, 11, 10
+
+    LTEXT           "Max", -1, 8, 54, 18, 8
+    CONTROL         "", IDC_AUDIO_MAX_EDIT, "CustEdit", WS_TABSTOP, 28, 52, 34, 10
+    CONTROL         "", IDC_AUDIO_MAX_SPIN, "SpinnerControl", 0, 62, 52, 11, 10
+
+    LTEXT           "Rolloff", -1, 92, 54, 28, 8
+    CONTROL         "", IDC_AUDIO_ROLLOFF_EDIT, "CustEdit", WS_TABSTOP, 122, 52, 24, 10
+    CONTROL         "", IDC_AUDIO_ROLLOFF_SPIN, "SpinnerControl", 0, 146, 52, 11, 10
+END

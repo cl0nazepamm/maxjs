@@ -1121,7 +1121,7 @@ export function createSSGIController({
                 const ssrReflectivityNode = max(
                     metalness,
                     roughness.oneMinus().mul(0.35).add(float(0.04))
-                );
+                ).mul(roughness.smoothstep(0.85, 0.75));
 
                 if (state.gtao.enabled && prePassDepth && prePassNormal) {
                     const aoPass = ao(prePassDepth, prePassNormal, camera);

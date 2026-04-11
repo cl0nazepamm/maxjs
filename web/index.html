@@ -2720,7 +2720,12 @@
                 : (canUseSSSMaterial
                     ? 'MeshSSSNodeMaterial'
                     : ((wantsAdvancedMaterial || wantsSSSMaterial) ? 'MeshPhysicalMaterial' : 'MeshStandardMaterial')));
-            const key = JSON.stringify([requestedModelName, runtimeModelName, md]);
+            // Exclude tslParams from cache key — param changes should update
+            // existing uniforms, not trigger a full material rebuild.
+            const cacheableMd = (wantsTSLMaterial && md.tslParams)
+                ? Object.assign({}, md, { tslParams: undefined })
+                : md;
+            const key = JSON.stringify([requestedModelName, runtimeModelName, cacheableMd]);
             let template = materialCache.get(key);
             if (!template && wantsMaterialXMaterial) {
                 template = materialXTemplateCache.get(key);
@@ -2898,6 +2903,19 @@
             }
 
             if (wantsMaterialXMaterial || (wantsTSLMaterial && hasMaterialXSource)) {
+                return template;
+            }
+
+            // TSL material reuse: update uniforms from latest params without rebuild
+            if (wantsTSLMaterial && template.userData?.tslParams && md.tslParams) {
+                const stored = template.userData.tslParams;
+                for (const [k, v] of Object.entries(md.tslParams)) {
+                    const u = stored[k];
+                    if (!u) continue;
+                    if (typeof v === 'number') u.value = v;
+                    else if (Array.isArray(v) && u.value?.isColor) u.value.setRGB(v[0]??0, v[1]??0, v[2]??0);
+                    else if (typeof v === 'boolean') u.value = v ? 1.0 : 0.0;
+                }
                 return template;
             }
 
@@ -6898,6 +6916,12 @@
             const instanceThresholdSlider = document.getElementById('fx-performance-instancethreshold');
             const instanceThresholdValue = document.getElementById('fx-performance-instancethreshold-val');
             const performanceNote = document.getElementById('fx-performance-note');
+            const tmSelect = document.getElementById('fx-tonemapping-mode');
+            if (tmSelect) tmSelect.value = currentToneMapping;
+            const expSlider = document.getElementById('fx-tonemapping-exp');
+            const expLabel = document.getElementById('fx-tonemapping-exp-val');
+            if (expSlider) expSlider.value = String(currentExposure);
+            if (expLabel) expLabel.textContent = currentExposure.toFixed(2);
             const aaSelect = document.getElementById('fx-aa-mode');
             if (aaSelect) aaSelect.value = currentAAMode;
             if (fpsCapSelect) fpsCapSelect.value = String(performanceSettings.fpsCap || 0);

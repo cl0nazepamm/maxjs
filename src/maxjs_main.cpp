@@ -10060,6 +10060,17 @@ public:
             return state;
         }
 
+        // TSL materials: strip tslParamsJson from structure hash so param
+        // tweaks don't trigger full scene rebuilds (JS updates uniforms in-place).
+        if (pbr.materialModel == L"MeshTSLNodeMaterial" ||
+            !pbr.tslParamsJson.empty()) {
+            MaxJSPBR stable = pbr;
+            stable.tslParamsJson.clear();
+            state.structureHash = HashMaterialPBRState(stable);
+            state.canFastSync = false;
+            return state;
+        }
+
         MaxJSPBR structurePbr = pbr;
         // Zero out all animatable scalars — changes to these go through scalar hash, not structure
         structurePbr.color[0] = 0.8f;

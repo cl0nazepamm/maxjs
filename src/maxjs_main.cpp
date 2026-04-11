@@ -1134,6 +1134,9 @@ struct MaxJSPBR {
     std::wstring materialXBase;
     std::wstring materialXMaterialName;
     int materialXMaterialIndex = 1;
+    bool materialXBridgeConnected = false;
+    std::wstring materialXBridgeSourceName;
+    std::wstring materialXBridgeError;
     float parallaxScale = 0.0f;
 };
 
@@ -1142,6 +1145,7 @@ static int FindPBInt(Texmap* map, const MCHAR* name, int def);
 static std::wstring FindPBString(Texmap* map, const MCHAR* name);
 static std::wstring FindPBString(Mtl* mtl, const MCHAR* name);
 static int FindPBInt(Mtl* mtl, const MCHAR* name, int def);
+static void ExtractMaterialXMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d);
 
 // Shell Material Class_ID = (597, 0)
 #define SHELL_MTL_CLASS_ID Class_ID(597, 0)
@@ -1313,6 +1317,60 @@ static void ExtractStdUVTransform(Texmap* map, MaxJSPBR::TexTransform& xf) {
     }
 }
 
+// ── Procedural Map Baking ──────────────────────────────────
+// Cache: Texmap pointer + time → baked PNG path.  Re-bakes only when the combo is new.
+static std::unordered_map<uintptr_t, std::wstring> bakedMapCache_;
+static constexpr int BAKE_SIZE = 512;
+
+static std::wstring BakeProceduralMap(Texmap* map, TimeValue t) {
+    if (!map) return {};
+
+    // Cache key: texmap address (stable within a session)
+    uintptr_t key = reinterpret_cast<uintptr_t>(map);
+    auto it = bakedMapCache_.find(key);
+    if (it != bakedMapCache_.end()) return it->second;
+
+    // Create bitmap
+    BitmapInfo bi;
+    bi.SetWidth(BAKE_SIZE);
+    bi.SetHeight(BAKE_SIZE);
+    bi.SetType(BMM_TRUE_32);
+    bi.SetFlags(MAP_HAS_ALPHA);
+
+    Bitmap* bm = TheManager->Create(&bi);
+    if (!bm) return {};
+
+    // Bake the procedural map into the bitmap
+    map->RenderBitmap(t, bm, 1.0f, TRUE);
+
+    // Save to temp directory as PNG
+    wchar_t tempDir[MAX_PATH];
+    GetTempPathW(MAX_PATH, tempDir);
+    std::wstring dir = std::wstring(tempDir) + L"maxjs_baked\\";
+    CreateDirectoryW(dir.c_str(), nullptr);
+
+    std::wstring filename = dir + L"proc_" + std::to_wstring(key) + L".png";
+
+    BitmapInfo outBi;
+    outBi.SetName(filename.c_str());
+    outBi.SetWidth(BAKE_SIZE);
+    outBi.SetHeight(BAKE_SIZE);
+    outBi.SetType(BMM_TRUE_32);
+
+    if (bm->OpenOutput(&outBi) == BMMRES_SUCCESS) {
+        bm->Write(&outBi);
+        bm->Close(&outBi);
+    }
+    bm->DeleteThis();
+
+    bakedMapCache_[key] = filename;
+    return filename;
+}
+
+static void ClearBakedMapCache() {
+    bakedMapCache_.clear();
+}
+
 static bool ExtractMaterialTexture(Texmap* map, std::wstring& filePath, MaxJSPBR::TexTransform& xf) {
     if (!map) return false;
 
@@ -1428,6 +1486,19 @@ static bool ExtractMaterialTexture(Texmap* map, std::wstring& filePath, MaxJSPBR
         xf.videoMuted = vpb->GetInt(pvid_muted, 0) != 0;
         xf.videoRate = vpb->GetFloat(pvid_rate, 0);
         return true;
+    }
+
+    // Fallback: bake any unknown procedural map to a temp PNG
+    {
+        std::wstring bakedPath = BakeProceduralMap(resolved, GetCOREInterface()->GetTime());
+        if (!bakedPath.empty()) {
+            filePath = bakedPath;
+            xf = {};
+            ExtractStdUVTransform(resolved, xf);
+            xf.hasChannelSelect = outputChannelIndex != 1;
+            xf.outputChannelIndex = outputChannelIndex;
+            return true;
+        }
     }
 
     return false;
@@ -1621,15 +1692,35 @@ static void ExtractThreeJSMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
         if (HasParam(pb, pb_tsl_source_mtl)) {
             Mtl* srcMtl = pb->GetMtl(pb_tsl_source_mtl);
             if (srcMtl) {
-                std::wstring materialXBase;
-                std::wstring xml = ExportMtlxString(srcMtl, &materialXBase);
-                if (!xml.empty()) {
-                    d.materialXInline = xml;
-                    d.materialXBase = materialXBase;
-                    MSTR srcName = srcMtl->GetName();
-                    if (srcName.Length() > 0)
-                        d.materialXMaterialName = srcName.data();
-                    d.materialXMaterialIndex = 1;
+                d.materialXBridgeConnected = true;
+                MSTR srcName = srcMtl->GetName();
+                if (srcName.Length() > 0) {
+                    d.materialXBridgeSourceName = srcName.data();
+                }
+
+                if (IsMaterialXMaterialClass(srcMtl->ClassID())) {
+                    MaxJSPBR srcBridge;
+                    ExtractMaterialXMtl(srcMtl, t, srcBridge);
+                    d.materialXFile = srcBridge.materialXFile;
+                    d.materialXInline = srcBridge.materialXInline;
+                    d.materialXBase = srcBridge.materialXBase;
+                    d.materialXMaterialName = srcBridge.materialXMaterialName;
+                    d.materialXMaterialIndex = std::max(1, srcBridge.materialXMaterialIndex);
+                    if (d.materialXInline.empty() && d.materialXFile.empty()) {
+                        d.materialXBridgeError = L"Connected MaterialX source produced no XML or file payload";
+                    }
+                } else {
+                    std::wstring materialXBase;
+                    std::wstring xml = ExportMtlxString(srcMtl, &materialXBase);
+                    if (!xml.empty()) {
+                        d.materialXInline = xml;
+                        d.materialXBase = materialXBase;
+                        if (srcName.Length() > 0)
+                            d.materialXMaterialName = srcName.data();
+                        d.materialXMaterialIndex = 1;
+                    } else {
+                        d.materialXBridgeError = L"MtlxIOUtil.ExportMtlxString returned empty XML";
+                    }
                 }
             }
         }
@@ -8014,6 +8105,7 @@ public:
         lastLiveGeomHash_.clear();
         skinnedControlIdxCache_.clear();
         lastSkinnedLivePollTick_ = 0;
+        ClearBakedMapCache();
         ResetFastPathState(false);
     }
 
@@ -10338,6 +10430,15 @@ public:
             if (!pbr.materialXInline.empty()) {
                 ss << L",\"materialXIndex\":" << std::max(1, pbr.materialXMaterialIndex);
             }
+            if (pbr.materialXBridgeConnected) {
+                ss << L",\"materialXBridgeConnected\":true";
+                if (!pbr.materialXBridgeSourceName.empty()) {
+                    ss << L",\"materialXBridgeSourceName\":\"" << EscapeJson(pbr.materialXBridgeSourceName.c_str()) << L"\"";
+                }
+                if (!pbr.materialXBridgeError.empty()) {
+                    ss << L",\"materialXBridgeError\":\"" << EscapeJson(pbr.materialXBridgeError.c_str()) << L"\"";
+                }
+            }
         } else if (IsUtilityMaterialModel(pbr.materialModel)) {
             if (pbr.materialModel == L"MeshBackdropNodeMaterial") {
                 ss << L",\"backdropMode\":";
@@ -10572,11 +10673,10 @@ public:
         ObjectState os = node->EvalWorldState(t);
         if (!os.obj || !IsThreeJSLightClassID(os.obj->ClassID())) return false;
         IParamBlock2* pb = os.obj->GetParamBlockByID(threejs_light_params);
-        if (!pb) return false;
 
         const Class_ID classId = os.obj->ClassID();
         ThreeJSLightType ltype = GetThreeJSLightTypeFromClassID(classId);
-        if (ThreeJSLightClassUsesTypeParam(classId)) {
+        if (pb && ThreeJSLightClassUsesTypeParam(classId) && HasParam(pb, pl_type)) {
             int rawType = pb->GetInt(pl_type);
             if (rawType < 0) rawType = 0;
             if (rawType >= kLight_COUNT) rawType = kLight_Directional;
@@ -10588,30 +10688,41 @@ public:
         const double metersPerUnit = GetSystemUnitScale(UNITS_METERS);
         const double pointSpotScale = metersPerUnit > 1.0e-9 ? 1.0 / (metersPerUnit * metersPerUnit) : 1.0;
 
-        Color c = pb->GetColor(pl_color, t);
-        double intensity = pb->GetFloat(pl_intensity, t);
+        Color c(1.0f, 1.0f, 1.0f);
+        if (pb && HasParam(pb, pl_color)) c = pb->GetColor(pl_color, t);
+
+        double intensity = 1.0;
+        if (pb && HasParam(pb, pl_intensity)) intensity = pb->GetFloat(pl_intensity, t);
         if (ltype == kLight_Point || ltype == kLight_Spot) intensity *= pointSpotScale;
 
         ld.type = static_cast<std::uint32_t>(ltype);
         ld.color[0] = c.r; ld.color[1] = c.g; ld.color[2] = c.b;
         ld.intensity = static_cast<float>(intensity);
-        ld.distance = (ltype == kLight_Point || ltype == kLight_Spot) ? pb->GetFloat(pl_distance, t) : 0.0f;
-        ld.decay = (ltype == kLight_Point || ltype == kLight_Spot) ? pb->GetFloat(pl_decay, t) : 2.0f;
-        ld.angle = (ltype == kLight_Spot) ? (pb->GetFloat(pl_angle, t) * 3.14159265f / 180.f) : 0.0f;
-        ld.penumbra = (ltype == kLight_Spot) ? pb->GetFloat(pl_penumbra, t) : 0.0f;
-        ld.width = (ltype == kLight_RectArea) ? pb->GetFloat(pl_width, t) : 0.0f;
-        ld.height = (ltype == kLight_RectArea) ? pb->GetFloat(pl_height, t) : 0.0f;
+        ld.distance = (ltype == kLight_Point || ltype == kLight_Spot) && pb && HasParam(pb, pl_distance)
+            ? pb->GetFloat(pl_distance, t) : 0.0f;
+        ld.decay = (ltype == kLight_Point || ltype == kLight_Spot) && pb && HasParam(pb, pl_decay)
+            ? pb->GetFloat(pl_decay, t) : 2.0f;
+        ld.angle = (ltype == kLight_Spot) && pb && HasParam(pb, pl_angle)
+            ? (pb->GetFloat(pl_angle, t) * 3.14159265f / 180.f) : 0.0f;
+        ld.penumbra = (ltype == kLight_Spot) && pb && HasParam(pb, pl_penumbra)
+            ? pb->GetFloat(pl_penumbra, t) : 0.0f;
+        ld.width = (ltype == kLight_RectArea) && pb && HasParam(pb, pl_width)
+            ? pb->GetFloat(pl_width, t) : 0.0f;
+        ld.height = (ltype == kLight_RectArea) && pb && HasParam(pb, pl_height)
+            ? pb->GetFloat(pl_height, t) : 0.0f;
         if (ltype == kLight_Hemisphere) {
-            Color gc = pb->GetColor(pl_ground_color, t);
+            Color gc(0.0f, 0.0f, 0.0f);
+            if (pb && HasParam(pb, pl_ground_color)) gc = pb->GetColor(pl_ground_color, t);
             ld.groundColor[0] = gc.r; ld.groundColor[1] = gc.g; ld.groundColor[2] = gc.b;
         } else {
             ld.groundColor[0] = ld.groundColor[1] = ld.groundColor[2] = 0.0f;
         }
-        ld.castShadow = supportsShadows && pb->GetInt(pl_cast_shadow) != 0;
-        ld.shadowBias = ld.castShadow ? pb->GetFloat(pl_shadow_bias, t) : -0.0001f;
-        ld.shadowRadius = ld.castShadow ? pb->GetFloat(pl_shadow_radius, t) : 1.0f;
-        ld.shadowMapSize = ld.castShadow ? static_cast<std::uint32_t>(pb->GetInt(pl_shadow_mapsize)) : 1024u;
-        ld.volContrib = pb->GetFloat(pl_vol_contrib, t);
+        ld.castShadow = supportsShadows && pb && HasParam(pb, pl_cast_shadow) && pb->GetInt(pl_cast_shadow) != 0;
+        ld.shadowBias = (ld.castShadow && pb && HasParam(pb, pl_shadow_bias)) ? pb->GetFloat(pl_shadow_bias, t) : -0.0001f;
+        ld.shadowRadius = (ld.castShadow && pb && HasParam(pb, pl_shadow_radius)) ? pb->GetFloat(pl_shadow_radius, t) : 1.0f;
+        ld.shadowMapSize = (ld.castShadow && pb && HasParam(pb, pl_shadow_mapsize))
+            ? static_cast<std::uint32_t>(pb->GetInt(pl_shadow_mapsize)) : 1024u;
+        ld.volContrib = (pb && HasParam(pb, pl_vol_contrib)) ? pb->GetFloat(pl_vol_contrib, t) : 0.0f;
         return true;
     }
 

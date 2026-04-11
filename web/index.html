@@ -1766,6 +1766,20 @@
             target.needsUpdate = true;
         }
 
+        function applyLoadedTSLTemplate(target, source, md) {
+            target.copy(source);
+            for (const key of Object.keys(source)) {
+                if (key.endsWith('Node')) target[key] = source[key];
+            }
+            target.name = source.name || target.name;
+            target.side = md.side === 0 ? THREE.FrontSide : THREE.DoubleSide;
+            target.userData ??= {};
+            target.userData.maxjsMaterialXPending = false;
+            target.userData.maxjsMaterialXFallback = true;
+            rememberMaterialEmissiveBase(target);
+            target.needsUpdate = true;
+        }
+
         async function ensureMaterialXTemplateLoaded(cacheKey, template, md) {
             if (!md.materialXFile && !md.materialXInline) return template;
 
@@ -1825,6 +1839,23 @@
                 })
                 .catch(error => {
                     console.error('[MaterialX] Load failed:', error);
+                    if (md.model === 'MeshTSLNodeMaterial' && md.tslCode) {
+                        try {
+                            const fallback = createTSLMaterial({
+                                ...md,
+                                materialXFile: '',
+                                materialXInline: '',
+                                materialXBase: '',
+                                materialXName: '',
+                                materialXIndex: 1,
+                            });
+                            applyLoadedTSLTemplate(template, fallback, md);
+                            console.warn('[MaterialX] Falling back to TSL code for MeshTSLNodeMaterial');
+                            return template;
+                        } catch (fallbackError) {
+                            console.error('[MaterialX] TSL fallback failed:', fallbackError);
+                        }
+                    }
                     template.color?.set?.(0xff00ff);
                     template.wireframe = true;
                     template.userData ??= {};
@@ -2448,7 +2479,7 @@
 
         function getTSLCompatNamespace() {
             if (tslCompatNamespace) return tslCompatNamespace;
-            const compat = Object.create(TSL);
+            const compat = Object.assign({}, TSL);
             const makeTimerShim = (name) => (scale = 1.0) => {
                 warnTSLLegacy(name, 'TSL.time');
                 const s = Number.isFinite(scale) ? scale : 1.0;
@@ -2487,6 +2518,11 @@
         }
 
         function createMissingTSLMaterial(md) {
+            if (md.materialXBridgeConnected) {
+                const sourceName = md.materialXBridgeSourceName || 'connected source material';
+                const reason = md.materialXBridgeError || 'auto-compile produced no MaterialX payload';
+                console.error(`[MaterialX] Auto-compile bridge failed for ${sourceName}: ${reason}`);
+            }
             console.warn('[TSL Material] Missing MaterialX source and tslCode. Rendering debug fallback.', md);
             const material = new THREE.MeshStandardMaterial({
                 color: 0xff00ff,
@@ -2607,6 +2643,11 @@
             const wantsSSSMaterial = requestedModelName === 'MeshSSSNodeMaterial';
             const wantsTSLMaterial = requestedModelName === 'MeshTSLNodeMaterial';
             const hasMaterialXSource = Boolean(md.materialXInline || md.materialXFile);
+            if (wantsTSLMaterial && md.materialXBridgeConnected && !hasMaterialXSource) {
+                const sourceName = md.materialXBridgeSourceName || 'connected source material';
+                const reason = md.materialXBridgeError || 'auto-compile produced no MaterialX payload';
+                console.error(`[MaterialX] Auto-compile bridge failed for ${sourceName}: ${reason}`);
+            }
             const wantsAdvancedMaterial =
                 requestedModelName === 'MeshPhysicalMaterial' ||
                 requestedModelName === 'MeshStandardNodeMaterial';

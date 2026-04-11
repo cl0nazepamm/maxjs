@@ -7706,8 +7706,35 @@
                     if (!objectLoader) {
                         throw new Error('Three.js ObjectLoader unavailable for snapshot runtime scene');
                     }
+                    // WebGPU node materials serialize with "NodeMaterial" suffix that
+                    // the standard ObjectLoader doesn't know. Rewrite to standard types.
+                    const nodeMaterialTypeMap = {
+                        MeshPhysicalNodeMaterial: 'MeshStandardMaterial',
+                        MeshStandardNodeMaterial: 'MeshStandardMaterial',
+                        MeshBasicNodeMaterial: 'MeshBasicMaterial',
+                        MeshLambertNodeMaterial: 'MeshLambertMaterial',
+                        MeshPhongNodeMaterial: 'MeshPhongMaterial',
+                        MeshPhysicalMaterial: 'MeshStandardMaterial',
+                        LineBasicNodeMaterial: 'LineBasicMaterial',
+                        PointsNodeMaterial: 'PointsMaterial',
+                        SpriteNodeMaterial: 'SpriteMaterial',
+                    };
+                    function patchMaterialTypes(json) {
+                        if (!json?.materials) return;
+                        for (const mat of json.materials) {
+                            if (mat.type && nodeMaterialTypeMap[mat.type]) {
+                                mat.type = nodeMaterialTypeMap[mat.type];
+                            }
+                            // Final fallback: if type still isn't a known standard type,
+                            // force MeshStandardMaterial so ObjectLoader doesn't throw.
+                            if (mat.type && mat.type.includes('Node')) {
+                                mat.type = 'MeshStandardMaterial';
+                            }
+                        }
+                    }
                     async function parseRuntimeSubtree(json) {
                         if (!json || typeof json !== 'object') return null;
+                        patchMaterialTypes(json);
                         if (typeof objectLoader.parseAsync === 'function') {
                             return objectLoader.parseAsync(json);
                         }
@@ -7720,6 +7747,26 @@
                                 jsSnapshotRoot.visible = true;
                                 jsRoot.add(jsSnapshotRoot);
                                 jsSnapshotRoot.updateMatrixWorld(true);
+                                // Re-apply TSL materials from Max meshes onto runtime scene meshes.
+                                // ObjectLoader can't round-trip NodeMaterial shader graphs, so the
+                                // deformed clones lose their TSL effect. Match by userData.maxjsOwnerHandle
+                                // or name and swap the material from the hidden Max mesh.
+                                const handleToTSLMat = new Map();
+                                for (const nd of (meta.nodes || [])) {
+                                    if (nd.mat?.model === 'MeshTSLNodeMaterial' && nd.mat?.tslCode) {
+                                        const maxMesh = getSyncedObjectForSnapshotHandle(nd.h);
+                                        if (maxMesh?.material) handleToTSLMat.set(nd.h, maxMesh.material);
+                                    }
+                                }
+                                if (handleToTSLMat.size > 0) {
+                                    jsSnapshotRoot.traverse(child => {
+                                        if (!child.isMesh) return;
+                                        const srcH = child.userData?.maxjsSourceHandle
+                                                  ?? child.userData?.maxjsHandle;
+                                        const tslMat = srcH != null ? handleToTSLMat.get(srcH) : null;
+                                        if (tslMat) child.material = tslMat;
+                                    });
+                                }
                             }
                         } catch (err) {
                             console.warn('[MaxJS snapshot] runtimeScene.jsRoot parse failed (non-fatal)', err);
@@ -7750,6 +7797,10 @@
                     }
                 }
                 if (meta.snapshotUi) {
+                    // Force disable motion blur in standalone — no velocity data
+                    if (meta.snapshotUi.fx?.motionBlur) {
+                        meta.snapshotUi.fx.motionBlur.enabled = false;
+                    }
                     applySavedPostFxPayload(meta.snapshotUi);
                     applyStandaloneCameraState(meta.snapshotUi.camera);
                     syncPostFxPanel(true);

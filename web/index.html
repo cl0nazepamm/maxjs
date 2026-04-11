@@ -1122,8 +1122,11 @@
         // Lights (fallback, hidden when HDRI loads)
         // Default lighting — neutral, camera-aligned
         const defaultLights = new THREE.Group();
-        defaultLights.add(new THREE.AmbientLight(0xffffff, 0.4));
+        const defaultAmbient = new THREE.AmbientLight(0xffffff, 0.4);
+        defaultAmbient.userData.volumetricBypass = true;
+        defaultLights.add(defaultAmbient);
         const defaultKey = new THREE.DirectionalLight(0xffffff, 2.5);
+        defaultKey.userData.volumetricBypass = true;
         defaultKey.castShadow = true;
         defaultKey.shadow.mapSize.set(2048, 2048);
         defaultKey.shadow.camera.near = 0.1;
@@ -1135,6 +1138,7 @@
         defaultKey.shadow.bias = -0.001;
         defaultKey.shadow.normalBias = 0.02;
         const defaultFill = new THREE.DirectionalLight(0xe8e8e8, 0.8);
+        defaultFill.userData.volumetricBypass = true;
         defaultFill.position.set(-1, 1, 0.5);
         defaultLights.add(defaultKey);
         defaultLights.add(defaultFill);
@@ -2199,6 +2203,7 @@
                     skyMesh.scale.setScalar(450000);
                     skyMesh.name = '__maxjs_sky__';
                     skyMesh.frustumCulled = false;
+                    skyMesh.userData.volumetricBoundsBypass = true;
                 }
 
                 // Update sky uniforms — exact same pattern as official example
@@ -2244,6 +2249,7 @@
                 if (!skySunLight) {
                     skySunLight = new THREE.DirectionalLight(0xffffff, 2.0);
                     skySunLight.name = '__maxjs_sky_sun__';
+                    skySunLight.userData.volumetricBypass = true;
                 }
                 if (skySunLight.parent !== scene) scene.add(skySunLight);
                 const sunStrength = Math.max(0.1, Math.sin(elevRad));
@@ -2256,6 +2262,7 @@
                 if (!skyFillLight) {
                     skyFillLight = new THREE.HemisphereLight(0x87CEEB, 0x362D1B, 1.0);
                     skyFillLight.name = '__maxjs_sky_fill__';
+                    skyFillLight.userData.volumetricBypass = true;
                 }
                 if (skyFillLight.parent !== scene) scene.add(skyFillLight);
                 skyFillLight.intensity = 0.5 + sunStrength * 0.5;

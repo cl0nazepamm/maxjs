@@ -832,6 +832,10 @@ export function createSSGIController({
         if (!volumetricMesh) {
             const volMat = new THREE.VolumeNodeMaterial();
             volMat.steps = state.volumetric.steps;
+            // Volumetric light should respond only to explicit scene lights.
+            // Letting scene.environment drive this material makes HDRI/env slot
+            // changes wash out or override the intended volumetric contribution.
+            volMat.envNode = color(0x000000);
             volMat.offsetNode = bayer16(screenCoordinate);
             volMat.scatteringNode = Fn(({ positionRay }) => {
                 const t = vec3(time, float(0), time.mul(0.3));
@@ -858,7 +862,13 @@ export function createSSGIController({
         // Size to scene bounds
         const box = new THREE.Box3();
         scene.traverse(obj => {
-            if (obj.isMesh && obj !== volumetricMesh && obj.visible && obj.geometry) {
+            if (
+                obj.isMesh
+                && obj !== volumetricMesh
+                && !obj.userData?.volumetricBoundsBypass
+                && obj.visible
+                && obj.geometry
+            ) {
                 const pos = obj.geometry.getAttribute?.('position');
                 if (pos && pos.count > 0) box.expandByObject(obj);
             }
@@ -889,6 +899,7 @@ export function createSSGIController({
         let contribCount = 0;
         scene.traverse(obj => {
             if (!obj.isLight) return;
+            if (obj.userData?.volumetricBypass) return;
             const vc = obj.userData?.volContrib;
             if (vc !== undefined && vc <= 0) return;
             obj.layers.enable(LAYER_VOL);

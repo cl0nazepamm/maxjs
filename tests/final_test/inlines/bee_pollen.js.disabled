@@ -1,17 +1,32 @@
-// Pollen from the Bee — surface-normal bias + curl; each mote dies after a few seconds.
+// Pollen from all listed bee meshes — drops with gravity + turbulence; can stick to petal meshes (raycast).
 // Emitter keeps spawning into free slots forever (no overwrite of living particles).
 //
 // Uses camera-facing instanced quads instead of THREE.Points so particle size
 // behaves consistently under the WebGPU renderer.
 
 const PARTICLE_COUNT = 32000;
-const SPAWN_PER_FRAME = 8;
+const SPAWN_PER_FRAME = 2;
 const HIDDEN_SCALE = 0.0001;
 const LIFE_SECONDS = 4.2;
 const FADE_IN_SEC = 0.18;
 const FADE_OUT_START = 0.68;
-const NORMAL_FOLLOW = 5.2;
+const NORMAL_FOLLOW = 4.2;
 const NORM_RESAMPLE_STRIDE = 160;
+const WORLD_GRAVITY = 25.35;
+const LIFT_ALONG_BEE_N = 0.12;
+const TURBULENCE = 0.55;
+const STICK_STRIDE = 96;
+const STICK_RAY_UP = 2.5;
+const STICK_RAY_FAR = 28;
+const STICK_SURFACE_EPS = 0.0012;
+const STICK_NORMAL_PROBE = 0.35;
+const STICK_APPROACH_FAR = 1.2;
+const STICK_SLIDE_GRAV = 0.85;
+const STICK_DRAG = 0.94;
+const STICK_TRY_VY = 0.35;
+
+// Max node names — every match in the scene emits (each particle sticks to its bee).
+const EMITTER_SOURCES = ['Bee', 'Bee001'];
 
 const positions = new Float32Array(PARTICLE_COUNT * 3);
 const velocities = new Float32Array(PARTICLE_COUNT * 3);
@@ -22,9 +37,14 @@ const baseSizes = new Float32Array(PARTICLE_COUNT);
 const flickFreq = new Float32Array(PARTICLE_COUNT);
 const flickFreq2 = new Float32Array(PARTICLE_COUNT);
 const flickPhase = new Float32Array(PARTICLE_COUNT);
+const emitterIdx = new Uint8Array(PARTICLE_COUNT);
+const stuck = new Uint8Array(PARTICLE_COUNT);
+const stickNorm = new Float32Array(PARTICLE_COUNT * 3);
+
+const emitters = [];
+const petalHandles = new Set();
 
 let particles = null;
-let bee = null;
 let head = 0;
 let initialized = false;
 
@@ -35,7 +55,89 @@ const _instancePos = new THREE.Vector3();
 const _instanceScale = new THREE.Vector3();
 const _instanceMatrix = new THREE.Matrix4();
 const _blackCol = new THREE.Color(0, 0, 0);
+const _rayO = new THREE.Vector3();
+const _rayD = new THREE.Vector3(0, -1, 0);
+const _rayDn = new THREE.Vector3();
 let updateFrame = 0;
+
+function isPetalMeshName(name) {
+    const s = String(name ?? '').toLowerCase().trim();
+    return s.startsWith('petal');
+}
+
+function refreshPetalHandles(ctx) {
+    petalHandles.clear();
+    const nodes = ctx.scene.listNodes?.();
+    if (!nodes || !nodes.length) return;
+    for (let k = 0; k < nodes.length; k++) {
+        const node = nodes[k];
+        if (!node?.exists || !node.isMesh) continue;
+        if (!isPetalMeshName(node.name)) continue;
+        if (node.handle != null) petalHandles.add(node.handle);
+    }
+}
+
+function pickPetalHit(hits) {
+    if (!hits || !hits.length) return null;
+    for (let h = 0; h < hits.length; h++) {
+        const hi = hits[h];
+        if (isPetalMeshName(hi.name)) return hi;
+        if (hi.handle != null && petalHandles.has(hi.handle)) return hi;
+    }
+    return null;
+}
+
+function writeStickNormalFromHit(hi, j) {
+    let nx = hi.normal.x;
+    let ny = hi.normal.y;
+    let nz = hi.normal.z;
+    const nl = Math.sqrt(nx * nx + ny * ny + nz * nz) || 1;
+    stickNorm[j] = nx / nl;
+    stickNorm[j + 1] = ny / nl;
+    stickNorm[j + 2] = nz / nl;
+}
+
+/** Ray from above + optional motion-biased ray so sloped / vertical petals register. */
+function findPetalSurfaceHit(ctx, px, py, pz, vx, vy, vz) {
+    _rayO.set(px, py + STICK_RAY_UP, pz);
+    _rayD.set(0, -1, 0);
+    let hit = pickPetalHit(ctx.scene.raycast(_rayO, _rayD, { far: STICK_RAY_FAR }));
+    if (hit) return hit;
+
+    const v2 = vx * vx + vy * vy + vz * vz;
+    if (v2 < 1e-5) return null;
+    _rayDn.set(vx * 0.35, vy * 0.35 - 0.88, vz * 0.35);
+    if (_rayDn.lengthSq() < 1e-8) return null;
+    _rayDn.normalize();
+    _rayO.set(
+        px - _rayDn.x * 0.12,
+        py - _rayDn.y * 0.12,
+        pz - _rayDn.z * 0.12,
+    );
+    return pickPetalHit(ctx.scene.raycast(_rayO, _rayDn, { far: Math.min(STICK_RAY_FAR, 6) }));
+}
+
+/** Re-project onto petal by casting along -surface normal (stable on tilted geometry). */
+function snapStuckToPetal(ctx, j, px, py, pz) {
+    const snx = stickNorm[j];
+    const sny = stickNorm[j + 1];
+    const snz = stickNorm[j + 2];
+    _rayDn.set(-snx, -sny, -snz);
+    if (_rayDn.lengthSq() < 1e-10) _rayDn.set(0, -1, 0);
+    else _rayDn.normalize();
+    const lift = STICK_NORMAL_PROBE;
+    _rayO.set(px + snx * lift, py + sny * lift, pz + snz * lift);
+    const rehit = pickPetalHit(ctx.scene.raycast(_rayO, _rayDn, { far: STICK_APPROACH_FAR }));
+    if (!rehit) return false;
+    writeStickNormalFromHit(rehit, j);
+    const nnx = stickNorm[j];
+    const nny = stickNorm[j + 1];
+    const nnz = stickNorm[j + 2];
+    positions[j] = rehit.point.x + nnx * STICK_SURFACE_EPS;
+    positions[j + 1] = rehit.point.y + nny * STICK_SURFACE_EPS;
+    positions[j + 2] = rehit.point.z + nnz * STICK_SURFACE_EPS;
+    return true;
+}
 
 function createSoftParticleTexture(document, THREE) {
     const canvas = document.createElement('canvas');
@@ -57,9 +159,13 @@ function createSoftParticleTexture(document, THREE) {
     return texture;
 }
 
-function findBee(ctx) {
-    const matches = ctx.scene.findByName('Bee', { exact: true });
-    return matches[0] || null;
+function refreshEmitters(ctx) {
+    emitters.length = 0;
+    for (let s = 0; s < EMITTER_SOURCES.length; s++) {
+        const matches = ctx.scene.findByName(EMITTER_SOURCES[s], { exact: true });
+        const node = matches[0];
+        if (node && node.exists) emitters.push(node);
+    }
 }
 
 function setInstanceTransform(index, position, quaternion, size) {
@@ -81,12 +187,20 @@ function hideInstance(index, quaternion) {
 }
 
 function init(ctx) {
-    bee = findBee(ctx);
-    if (!bee) return false;
-    if (!bee.sampleSurface()) return false;
+    refreshEmitters(ctx);
+    if (emitters.length === 0) return false;
+    let anySurface = false;
+    for (let k = 0; k < emitters.length; k++) {
+        if (emitters[k].sampleSurface()) {
+            anySurface = true;
+            break;
+        }
+    }
+    if (!anySurface) return false;
 
     for (let i = 0; i < PARTICLE_COUNT; i++) {
         isAlive[i] = 0;
+        stuck[i] = 0;
         ageSec[i] = 0;
         baseSizes[i] = 0;
     }
@@ -123,7 +237,11 @@ function init(ctx) {
 }
 
 function spawn(i) {
-    const sample = bee.sampleSurface({ point: _surfPos, normal: _surfNorm });
+    if (emitters.length === 0) return false;
+    const ei = Math.floor(Math.random() * emitters.length);
+    const node = emitters[ei];
+    if (!node?.exists) return false;
+    const sample = node.sampleSurface({ point: _surfPos, normal: _surfNorm });
     if (!sample) return false;
 
     positions[i * 3] = _surfPos.x;
@@ -163,6 +281,8 @@ function spawn(i) {
     spawnNorm[j + 2] = _surfNorm.z;
 
     isAlive[i] = 1;
+    stuck[i] = 0;
+    emitterIdx[i] = ei;
     ageSec[i] = 0;
     baseSizes[i] = 0.28 + Math.random() * 0.22;
     flickPhase[i] = Math.random() * Math.PI * 2;
@@ -178,10 +298,8 @@ return {
             if (!initialized) return;
         }
 
-        if (!bee || !bee.exists) {
-            bee = findBee(ctx);
-            if (!bee) return;
-        }
+        refreshEmitters(ctx);
+        refreshPetalHandles(ctx);
 
         const dt = Math.min(ctx.clock.dt, 0.05);
         ctx.camera.raw.getWorldQuaternion(_cameraQuat);
@@ -189,14 +307,14 @@ return {
 
         let spawned = 0;
         let scan = 0;
-        while (spawned < SPAWN_PER_FRAME && scan < PARTICLE_COUNT) {
+        while (emitters.length > 0 && spawned < SPAWN_PER_FRAME && scan < PARTICLE_COUNT) {
             if (!isAlive[head] && spawn(head)) spawned++;
             head = (head + 1) % PARTICLE_COUNT;
             scan++;
         }
 
-        const drag = Math.max(0, 1 - 0.42 * dt);
-        const gravity = 0.48 * dt;
+        const drag = Math.max(0, 1 - 0.38 * dt);
+        const gravity = WORLD_GRAVITY * dt;
         const te = ctx.clock.elapsed;
         const icArr = particles.instanceColor?.array;
 
@@ -204,6 +322,7 @@ return {
 
         for (let i = 0; i < PARTICLE_COUNT; i++) {
             if (!isAlive[i]) {
+                stuck[i] = 0;
                 hideInstance(i, _cameraQuat);
                 continue;
             }
@@ -211,6 +330,7 @@ return {
             ageSec[i] += dt;
             if (ageSec[i] >= LIFE_SECONDS) {
                 isAlive[i] = 0;
+                stuck[i] = 0;
                 hideInstance(i, _cameraQuat);
                 continue;
             }
@@ -223,76 +343,168 @@ return {
             const fade = fadeIn * fadeOut;
 
             const j = i * 3;
-            let nx = spawnNorm[j];
-            let ny = spawnNorm[j + 1];
-            let nz = spawnNorm[j + 2];
 
-            if (((i + updateFrame) % NORM_RESAMPLE_STRIDE) === 0 && bee.sampleSurface({ point: _surfPos, normal: _surfNorm })) {
-                const a = 0.14;
-                nx = nx * (1 - a) + _surfNorm.x * a;
-                ny = ny * (1 - a) + _surfNorm.y * a;
-                nz = nz * (1 - a) + _surfNorm.z * a;
-                const nl = Math.sqrt(nx * nx + ny * ny + nz * nz) || 1;
-                nx /= nl;
-                ny /= nl;
-                nz /= nl;
-                spawnNorm[j] = nx;
-                spawnNorm[j + 1] = ny;
-                spawnNorm[j + 2] = nz;
-            }
+            if (stuck[i]) {
+                const snx = stickNorm[j];
+                const sny = stickNorm[j + 1];
+                const snz = stickNorm[j + 2];
 
-            let vx = velocities[j];
-            let vy = velocities[j + 1];
-            let vz = velocities[j + 2];
+                let vx = velocities[j];
+                let vy = velocities[j + 1];
+                let vz = velocities[j + 2];
 
-            const vn = vx * nx + vy * ny + vz * nz;
-            const targetN = 0.18 + 0.14 * Math.sin(te * 2.2 + flickPhase[i]);
-            const nk = NORMAL_FOLLOW * dt;
-            vx += nx * nk * (targetN - vn);
-            vy += ny * nk * (targetN - vn);
-            vz += nz * nk * (targetN - vn);
+                let vn = vx * snx + vy * sny + vz * snz;
+                vx -= snx * vn;
+                vy -= sny * vn;
+                vz -= snz * vn;
 
-            let tx;
-            let ty;
-            let tz;
-            if (Math.abs(ny) < 0.92) {
-                tx = nz;
-                ty = 0;
-                tz = -nx;
+                const gdot = -sny;
+                const tgx = -snx * gdot;
+                const tgy = -1 - sny * gdot;
+                const tgz = -snz * gdot;
+                const gl = Math.sqrt(tgx * tgx + tgy * tgy + tgz * tgz) || 1;
+                const sg = STICK_SLIDE_GRAV * dt;
+                vx += (tgx / gl) * sg;
+                vy += (tgy / gl) * sg;
+                vz += (tgz / gl) * sg;
+
+                const tu = TURBULENCE * 0.35 * dt;
+                vx += Math.sin(te * 3.1 + flickPhase[i]) * tu;
+                vz += Math.cos(te * 2.4 + i * 0.1) * tu;
+
+                vx *= STICK_DRAG;
+                vy *= STICK_DRAG;
+                vz *= STICK_DRAG;
+
+                velocities[j] = vx;
+                velocities[j + 1] = vy;
+                velocities[j + 2] = vz;
+
+                positions[j] += vx * dt;
+                positions[j + 1] += vy * dt;
+                positions[j + 2] += vz * dt;
+
+                if (!snapStuckToPetal(ctx, j, positions[j], positions[j + 1], positions[j + 2])) {
+                    stuck[i] = 0;
+                }
             } else {
-                tx = 0;
-                ty = -nz;
-                tz = ny;
+                let nx = spawnNorm[j];
+                let ny = spawnNorm[j + 1];
+                let nz = spawnNorm[j + 2];
+
+                const ei = emitterIdx[i];
+                const owner = ei < emitters.length ? emitters[ei] : null;
+                if (!owner || !owner.exists) {
+                    isAlive[i] = 0;
+                    stuck[i] = 0;
+                    hideInstance(i, _cameraQuat);
+                    continue;
+                }
+
+                if (((i + updateFrame) % NORM_RESAMPLE_STRIDE) === 0 && owner.sampleSurface({ point: _surfPos, normal: _surfNorm })) {
+                    const a = 0.14;
+                    nx = nx * (1 - a) + _surfNorm.x * a;
+                    ny = ny * (1 - a) + _surfNorm.y * a;
+                    nz = nz * (1 - a) + _surfNorm.z * a;
+                    const nl = Math.sqrt(nx * nx + ny * ny + nz * nz) || 1;
+                    nx /= nl;
+                    ny /= nl;
+                    nz /= nl;
+                    spawnNorm[j] = nx;
+                    spawnNorm[j + 1] = ny;
+                    spawnNorm[j + 2] = nz;
+                }
+
+                let vx = velocities[j];
+                let vy = velocities[j + 1];
+                let vz = velocities[j + 2];
+
+                const vn = vx * nx + vy * ny + vz * nz;
+                const targetN = 0.12 + 0.1 * Math.sin(te * 2.2 + flickPhase[i]);
+                const nk = NORMAL_FOLLOW * dt;
+                vx += nx * nk * (targetN - vn);
+                vy += ny * nk * (targetN - vn);
+                vz += nz * nk * (targetN - vn);
+
+                let tx;
+                let ty;
+                let tz;
+                if (Math.abs(ny) < 0.92) {
+                    tx = nz;
+                    ty = 0;
+                    tz = -nx;
+                } else {
+                    tx = 0;
+                    ty = -nz;
+                    tz = ny;
+                }
+                let tl = Math.sqrt(tx * tx + ty * ty + tz * tz) || 1;
+                tx /= tl;
+                ty /= tl;
+                tz /= tl;
+                const bx = ny * tz - nz * ty;
+                const by = nz * tx - nx * tz;
+                const bz = nx * ty - ny * tx;
+                const swirl = 1.25 * dt * Math.sin(te * (1.4 + flickFreq2[i] * 0.08) + flickPhase[i] * 1.3);
+                vx += (tx * Math.cos(te * 2.7 + i) + bx * Math.sin(te * 2.7 + i)) * swirl;
+                vy += (ty * Math.cos(te * 2.7 + i) + by * Math.sin(te * 2.7 + i)) * swirl;
+                vz += (tz * Math.cos(te * 2.7 + i) + bz * Math.sin(te * 2.7 + i)) * swirl;
+
+                const lift = LIFT_ALONG_BEE_N * gravity;
+                vx += nx * lift * 0.35;
+                vy += ny * lift;
+                vz += nz * lift * 0.35;
+                vy -= gravity;
+
+                const tu = TURBULENCE * dt;
+                vx += Math.sin(te * 1.9 + i * 0.37) * tu;
+                vy += Math.sin(te * 2.6 + flickPhase[i]) * tu * 0.45;
+                vz += Math.cos(te * 1.7 + i * 0.21) * tu;
+
+                vx *= drag;
+                vy *= drag;
+                vz *= drag;
+
+                velocities[j] = vx;
+                velocities[j + 1] = vy;
+                velocities[j + 2] = vz;
+
+                positions[j] += vx * dt;
+                positions[j + 1] += vy * dt;
+                positions[j + 2] += vz * dt;
+
+                if (((i + updateFrame) % STICK_STRIDE) === 0 && vy < STICK_TRY_VY) {
+                    const hit = findPetalSurfaceHit(
+                        ctx,
+                        positions[j],
+                        positions[j + 1],
+                        positions[j + 2],
+                        vx,
+                        vy,
+                        vz,
+                    );
+                    if (hit && hit.distance < STICK_RAY_FAR * 0.98) {
+                        stuck[i] = 1;
+                        writeStickNormalFromHit(hit, j);
+                        const nnx = stickNorm[j];
+                        const nny = stickNorm[j + 1];
+                        const nnz = stickNorm[j + 2];
+                        positions[j] = hit.point.x + nnx * STICK_SURFACE_EPS;
+                        positions[j + 1] = hit.point.y + nny * STICK_SURFACE_EPS;
+                        positions[j + 2] = hit.point.z + nnz * STICK_SURFACE_EPS;
+                        vn = vx * nnx + vy * nny + vz * nnz;
+                        vx -= nnx * vn;
+                        vy -= nny * vn;
+                        vz -= nnz * vn;
+                        vx *= 0.55;
+                        vy *= 0.55;
+                        vz *= 0.55;
+                        velocities[j] = vx;
+                        velocities[j + 1] = vy;
+                        velocities[j + 2] = vz;
+                    }
+                }
             }
-            let tl = Math.sqrt(tx * tx + ty * ty + tz * tz) || 1;
-            tx /= tl;
-            ty /= tl;
-            tz /= tl;
-            const bx = ny * tz - nz * ty;
-            const by = nz * tx - nx * tz;
-            const bz = nx * ty - ny * tx;
-            const swirl = 1.15 * dt * Math.sin(te * (1.4 + flickFreq2[i] * 0.08) + flickPhase[i] * 1.3);
-            vx += (tx * Math.cos(te * 2.7 + i) + bx * Math.sin(te * 2.7 + i)) * swirl;
-            vy += (ty * Math.cos(te * 2.7 + i) + by * Math.sin(te * 2.7 + i)) * swirl;
-            vz += (tz * Math.cos(te * 2.7 + i) + bz * Math.sin(te * 2.7 + i)) * swirl;
-
-            const lift = 0.85 * gravity;
-            vx += nx * lift * 0.35;
-            vy += ny * lift;
-            vz += nz * lift * 0.35;
-            vy -= gravity;
-
-            vx *= drag;
-            vy *= drag;
-            vz *= drag;
-
-            velocities[j] = vx;
-            velocities[j + 1] = vy;
-            velocities[j + 2] = vz;
-
-            positions[j] += vx * dt;
-            positions[j + 1] += vy * dt;
-            positions[j + 2] += vz * dt;
 
             _instancePos.set(
                 positions[i * 3],
@@ -326,7 +538,8 @@ return {
 
     dispose(ctx) {
         particles = null;
-        bee = null;
+        emitters.length = 0;
+        petalHandles.clear();
         initialized = false;
         updateFrame = 0;
     },

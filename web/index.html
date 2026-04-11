@@ -3163,6 +3163,7 @@
         }
 
         function finalizeSceneNode(mesh, nd) {
+            if (mesh && nd && nd.h != null) mesh.userData.maxjsHandle = nd.h;
             applyJsmodSyncState(mesh, !!nd.jsmod);
             applyInstanceSyncState(mesh, nd.instOf);
             applyBridgeVisibility(mesh, nd.vis);
@@ -3490,6 +3491,7 @@
                     mesh.matrixAutoUpdate = false;
                     mesh.name = nd.n;
                     mesh.frustumCulled = false;
+                    mesh.userData.maxjsHandle = nd.h;
                     maxRoot.add(mesh);
                     nodeMap.set(nd.h, mesh);
                 }
@@ -3571,6 +3573,7 @@
                 newMesh.matrixAutoUpdate = false;
                 newMesh.name = mesh.name;
                 newMesh.frustumCulled = false;
+                newMesh.userData.maxjsHandle = msg.h;
                 newMesh.matrix.copy(mesh.matrix);
                 newMesh.matrixWorld.copy(mesh.matrixWorld);
                 maxRoot.add(newMesh);
@@ -3850,6 +3853,7 @@
                     mesh.matrixAutoUpdate = false;
                     mesh.name = nd.n;
                     mesh.frustumCulled = false;
+                    mesh.userData.maxjsHandle = nd.h;
                     maxRoot.add(mesh);
                     nodeMap.set(nd.h, mesh);
                     retainGeometryRef(geometryRefCounts, mesh.geometry);
@@ -3896,6 +3900,34 @@
                 },
                 onCamera(cameraState) {
                     applyCamera(cameraState);
+                },
+                onLight(handle, matrix, visible) {
+                    const light = lightHandleMap.get(handle);
+                    if (!light) return;
+                    // Extract position from transform matrix (column 3)
+                    light.position.set(matrix[12], matrix[13], matrix[14]);
+                    light.visible = visible;
+                    if (light.userData?.maxjsTarget) {
+                        light.userData.maxjsTarget.visible = visible;
+                        // Update target for directional/spot lights using -Y axis direction
+                        const dirX = -matrix[4], dirY = -matrix[5], dirZ = -matrix[6];
+                        const { radius } = getShadowSceneFocus();
+                        const targetDistance = Math.max(radius * 2, 100);
+                        light.userData.maxjsTarget.position.set(
+                            matrix[12] + dirX * targetDistance,
+                            matrix[13] + dirY * targetDistance,
+                            matrix[14] + dirZ * targetDistance
+                        );
+                        light.userData.maxjsTarget.updateMatrixWorld();
+                    }
+                },
+                onSplat(handle, matrix, visible) {
+                    const entry = splatHandleMap.get(handle);
+                    if (!entry?.mesh) return;
+                    applySplatTransform(entry.mesh, { t: matrix, v: visible ? 1 : 0 });
+                },
+                onAudio(handle, matrix, visible) {
+                    audioSystem?.applyAudioTransformBinary(handle, matrix, visible);
                 },
             });
             markInitialSync();

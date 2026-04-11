@@ -8290,9 +8290,11 @@ public:
             if (it != lastLiveGeomHash_.end() && it->second == geomHash) continue;
             lastLiveGeomHash_[handle] = geomHash;
 
+            // Skinned meshes only need geometry updates (vertex positions via geo_fast).
+            // Don't add to fastDirtyHandles_ — that would trigger JSON transform sync,
+            // but bone deformation is already baked into the vertex data.
             geoHashMap_.erase(handle);
             geoFastDirtyHandles_.insert(handle);
-            fastDirtyHandles_.insert(handle);
             changed = true;
         }
         if (changed) QueueFastFlush();
@@ -8522,7 +8524,14 @@ public:
                 if (!IsTrackedHandle(handle)) return;
                 geoHashMap_.erase(handle);
                 geoFastDirtyHandles_.insert(handle);
-                if (fastDirtyHandles_.insert(handle).second) changed = true;
+                // Skinned meshes only need vertex data updates via geo_fast.
+                // Adding them to fastDirtyHandles_ would trigger redundant
+                // transform sync — bone deformation is already in the vertices.
+                if (skinnedHandles_.count(handle)) {
+                    changed = true;
+                } else {
+                    if (fastDirtyHandles_.insert(handle).second) changed = true;
+                }
             });
         }
         if (changed) QueueFastFlush();
@@ -9181,6 +9190,23 @@ public:
         if (!jsReady_ || !webview_ || dirty_) return;
         if (!hwnd_ || !IsWindowVisible(hwnd_)) return;
 
+        // Check for lights/splats/audios BEFORE batching to ensure consistent protocol
+        // selection even when handles are deferred across frames.
+        bool hasDirtyLights = false;
+        bool hasDirtySplats = false;
+        bool hasDirtyAudios = false;
+        for (ULONG handle : fastDirtyHandles_) {
+            if (!hasDirtyLights && lightHandles_.find(handle) != lightHandles_.end()) {
+                hasDirtyLights = true;
+            }
+            if (!hasDirtySplats && splatHandles_.find(handle) != splatHandles_.end()) {
+                hasDirtySplats = true;
+            }
+            if (!hasDirtyAudios && audioHandles_.find(handle) != audioHandles_.end()) {
+                hasDirtyAudios = true;
+            }
+        }
+
         std::vector<ULONG> dirtyHandles;
         dirtyHandles.reserve(fastDirtyHandles_.size());
         for (ULONG handle : fastDirtyHandles_) dirtyHandles.push_back(handle);
@@ -9219,37 +9245,26 @@ public:
         const bool hasAnyNodeUpdates = !combinedNodeHandles.empty();
         if (!hasAnyNodeUpdates && !hasDirtyCamera) return;
 
-        bool hasDirtyLights = false;
-        bool hasDirtySplats = false;
-        bool hasDirtyAudios = false;
-        for (ULONG handle : combinedNodeHandles) {
-            if (lightHandles_.find(handle) != lightHandles_.end()) {
+        // Also check visibility dirty handles for lights/splats/audios
+        for (ULONG handle : visibilityDirty) {
+            if (!hasDirtyLights && lightHandles_.find(handle) != lightHandles_.end()) {
                 hasDirtyLights = true;
             }
-            if (splatHandles_.find(handle) != splatHandles_.end()) {
+            if (!hasDirtySplats && splatHandles_.find(handle) != splatHandles_.end()) {
                 hasDirtySplats = true;
             }
-            if (audioHandles_.find(handle) != audioHandles_.end()) {
+            if (!hasDirtyAudios && audioHandles_.find(handle) != audioHandles_.end()) {
                 hasDirtyAudios = true;
             }
         }
 
-        // Geometry fast path: send ONLY the changed mesh(es), nothing else
+        // Geometry fast path: send changed mesh vertex data via binary geo_fast.
+        // Then fall through to binary delta for transform/visibility/etc updates.
         if (!geoDirty.empty()) {
             SendGeometryFastUpdate(geoDirty);
-            if (materialDirty.empty() && visibilityDirty.empty() && !hasDirtyCamera && !hasDirtyLights && !hasDirtySplats && !hasDirtyAudios) {
-                // Creation-mode primitives (e.g. Box drag) can change geometry and pivot/transform
-                // together. If we return after geo_fast only, the mesh updates but the transform
-                // can lag a frame or more, which makes the object appear centered/offset while drawing.
-                if (hasAnyNodeUpdates) {
-                    SendTransformSync(&combinedNodeHandles);
-                    CaptureCurrentCameraState();
-                }
-                return;
-            }
         }
 
-        if (!useBinary_ || hasDirtyLights || hasDirtySplats || hasDirtyAudios) {
+        if (!useBinary_) {
             if (hasAnyNodeUpdates) SendTransformSync(&combinedNodeHandles);
             else SendCameraSync();
             CaptureCurrentCameraState();
@@ -9297,9 +9312,26 @@ public:
             float xform[16];
             GetTransform16(node, t, xform);
             RememberSentTransform(handle, xform);
+            const bool visible = IsMaxJsSyncDrawVisible(node);
+
+            // Use specialized commands for lights/splats/audios
+            if (lightHandles_.find(handle) != lightHandles_.end()) {
+                frame.UpdateLight(static_cast<std::uint32_t>(handle), xform, visible);
+                continue;
+            }
+            if (splatHandles_.find(handle) != splatHandles_.end()) {
+                frame.UpdateSplat(static_cast<std::uint32_t>(handle), xform, visible);
+                continue;
+            }
+            if (audioHandles_.find(handle) != audioHandles_.end()) {
+                frame.UpdateAudio(static_cast<std::uint32_t>(handle), xform, visible);
+                continue;
+            }
+
+            // Regular geometry node
             frame.UpdateTransform(static_cast<std::uint32_t>(handle), xform);
             frame.UpdateSelection(static_cast<std::uint32_t>(handle), node->Selected() != 0);
-            frame.UpdateVisibility(static_cast<std::uint32_t>(handle), IsMaxJsSyncDrawVisible(node));
+            frame.UpdateVisibility(static_cast<std::uint32_t>(handle), visible);
 
             if (materialDirty.find(handle) != materialDirty.end()) {
                 float col[3] = {0.8f, 0.8f, 0.8f};

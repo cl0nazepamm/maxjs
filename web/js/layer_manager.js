@@ -505,15 +505,22 @@ function createMaxSceneFacade({ scene, nodeMap, lightHandleMap, getAdapter, crea
             if (Number.isFinite(options.far)) rc.far = options.far;
             const targets = [];
             for (const obj of nodeMap.values()) {
-                if (obj?.isMesh && obj.visible) targets.push(obj);
+                if (obj?.visible) targets.push(obj);
             }
-            return rc.intersectObjects(targets, false).map(hit => ({
-                point: hit.point.clone(),
-                normal: hit.face?.normal?.clone() ?? new THREE.Vector3(0, 0, 1),
-                distance: hit.distance,
-                handle: hit.object?.userData?.maxjsHandle ?? null,
-                name: hit.object?.name ?? '',
-            }));
+            return rc.intersectObjects(targets, true).map((hit) => {
+                let normal = hit.face?.normal?.clone() ?? new THREE.Vector3(0, 1, 0);
+                if (hit.face?.normal && hit.object?.matrixWorld) {
+                    normal.transformDirection(hit.object.matrixWorld);
+                    if (normal.lengthSq() > 0) normal.normalize();
+                }
+                return {
+                    point: hit.point.clone(),
+                    normal,
+                    distance: hit.distance,
+                    handle: hit.object?.userData?.maxjsHandle ?? null,
+                    name: hit.object?.name ?? '',
+                };
+            });
         },
     });
 }

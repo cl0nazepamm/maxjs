@@ -82,6 +82,33 @@ void DeltaFrameBuilder::UpdateCamera(const float* position3, const float* target
     AppendF32(dofBokehScale);
 }
 
+void DeltaFrameBuilder::UpdateLight(std::uint32_t handle, const float* matrix16, bool visible) {
+    BeginCommand(CommandType::UpdateLight, 4 + 16 * sizeof(float) + 4);
+    AppendU32(handle);
+    for (int i = 0; i < 16; ++i) {
+        AppendF32(matrix16[i]);
+    }
+    AppendU32(visible ? 1u : 0u);
+}
+
+void DeltaFrameBuilder::UpdateSplat(std::uint32_t handle, const float* matrix16, bool visible) {
+    BeginCommand(CommandType::UpdateSplat, 4 + 16 * sizeof(float) + 4);
+    AppendU32(handle);
+    for (int i = 0; i < 16; ++i) {
+        AppendF32(matrix16[i]);
+    }
+    AppendU32(visible ? 1u : 0u);
+}
+
+void DeltaFrameBuilder::UpdateAudio(std::uint32_t handle, const float* matrix16, bool visible) {
+    BeginCommand(CommandType::UpdateAudio, 4 + 16 * sizeof(float) + 4);
+    AppendU32(handle);
+    for (int i = 0; i < 16; ++i) {
+        AppendF32(matrix16[i]);
+    }
+    AppendU32(visible ? 1u : 0u);
+}
+
 void DeltaFrameBuilder::EndFrame() {
     BeginCommand(CommandType::EndFrame, 0);
 }

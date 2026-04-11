@@ -36,6 +36,7 @@ export function createPerfHud(infoEl) {
         triangleCount: 0,
         memGeometries: 0,
         memTextures: 0,
+        fps: 0,
         active: false,
     };
 
@@ -43,6 +44,8 @@ export function createPerfHud(infoEl) {
     let lastRenderPaintMs = 0;
     let prevCalls = 0;
     let prevTriangles = 0;
+    let fpsFrames = 0;
+    let fpsLastSample = 0;
 
     function bannerSuffix() {
         return state.projectBanner ? ` | ${state.projectBanner}` : '';

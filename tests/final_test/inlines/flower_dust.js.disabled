@@ -1,4 +1,4 @@
-// Gold dust particles emitting from Flower_01_Core mesh surface.
+// Soft blue glow dust from Flower_01_Core — same sprite + MeshBasic additive path as bee_pollen.
 // Uses camera-facing instanced quads so particle size is stable under WebGPU.
 // Surface sampling via cloneFromMax — same approach as bee_pollen.
 
@@ -30,11 +30,12 @@ function createSoftParticleTexture(document, THREE) {
     canvas.height = 64;
     const ctx2d = canvas.getContext('2d');
     const gradient = ctx2d.createRadialGradient(32, 32, 0, 32, 32, 32);
-    gradient.addColorStop(0.0, 'rgba(200,220,255,1)');
-    gradient.addColorStop(0.15, 'rgba(100,160,255,1)');
-    gradient.addColorStop(0.4, 'rgba(60,120,255,0.85)');
-    gradient.addColorStop(0.7, 'rgba(30,80,220,0.4)');
-    gradient.addColorStop(1.0, 'rgba(10,40,180,0)');
+    // Same hot core + wide halo as bee_pollen for additive glow.
+    gradient.addColorStop(0.0, 'rgba(255,255,255,1)');
+    gradient.addColorStop(0.15, 'rgba(240,248,255,1)');
+    gradient.addColorStop(0.4, 'rgba(160,220,255,1)');
+    gradient.addColorStop(0.65, 'rgba(80,170,255,0.95)');
+    gradient.addColorStop(1.0, 'rgba(20,80,200,0)');
     ctx2d.fillStyle = gradient;
     ctx2d.fillRect(0, 0, 64, 64);
 
@@ -189,19 +190,16 @@ function setup(ctx) {
 
     const texture = createSoftParticleTexture(document, THREE);
     const geometry = new THREE.PlaneGeometry(1, 1);
-    const material = new THREE.MeshStandardMaterial({
-        color: 0x000000,
-        emissive: new THREE.Color(0.3, 0.5, 1.0).multiplyScalar(3.0),
-        emissiveMap: texture,
+    const material = new THREE.MeshBasicMaterial({
+        color: 0xffffff,
+        map: texture,
         alphaMap: texture,
-        metalness: 0,
-        roughness: 1,
         transparent: true,
-        opacity: 1.0,
-        toneMapped: false,
+        opacity: 1,
         blending: THREE.AdditiveBlending,
         depthWrite: false,
         side: THREE.DoubleSide,
+        toneMapped: false,
     });
 
     particles = new THREE.InstancedMesh(geometry, material, PARTICLE_COUNT);

@@ -80,6 +80,7 @@ Available methods:
 Node adapters returned by `getNode(handle)` also expose:
 
 - `sampleSurface(options)`
+- `transform`
 
 Available state snapshots:
 
@@ -119,6 +120,7 @@ Each node adapter exposes:
 - `getBoundingBox()`
 - `snapshot()`
 - `sampleSurface(options)`
+- `transform`
 
 ### `ctx.js`
 
@@ -139,6 +141,10 @@ Authoring surface for JS-owned content.
 
 It is not the preferred read path for geometry sampling.
 For read-only mesh surface access, use `ctx.maxScene.getNode(handle).sampleSurface()`.
+
+`transform` is the runtime override API for moving an existing synced viewport
+object without cloning it. In additive mode, the override keeps building on the
+latest synced Max transform if the user moves the object in 3ds Max later.
 
 ## Anchors
 

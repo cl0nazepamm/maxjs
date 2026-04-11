@@ -17,6 +17,9 @@ enum class CommandType : std::uint16_t {
     UpdateVisibility = 5,
     UpdateCamera = 6,
     EndFrame = 7,
+    UpdateLight = 8,
+    UpdateSplat = 9,
+    UpdateAudio = 10,
 };
 
 class DeltaFrameBuilder {
@@ -33,6 +36,9 @@ public:
                       float fov, bool perspective, float viewWidth = 0.0f,
                       bool dofEnabled = false, float dofFocusDistance = 0.0f,
                       float dofFocalLength = 0.0f, float dofBokehScale = 0.0f);
+    void UpdateLight(std::uint32_t handle, const float* matrix16, bool visible);
+    void UpdateSplat(std::uint32_t handle, const float* matrix16, bool visible);
+    void UpdateAudio(std::uint32_t handle, const float* matrix16, bool visible);
     void EndFrame();
 
     std::uint32_t frame_id() const { return frameId_; }

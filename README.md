@@ -7,7 +7,7 @@
 - **Realtime Sync** — Binary delta protocol over WebView2 shared memory.
 - **ActiveShade** — Docks into a Max viewport for live feedback on your design
 - **Layer Manager** — Early prototype / Outline for Playcanvas style script loading.
-- **Snapshots** — Fast exports. What you see is exactly what you get.
+- **Snapshots** — Fast export your scene to standalone browser (WIP)
 - **Virtual Reality** — WebXR (only tested on Quest 3 VDXR)
 
 ---
@@ -43,9 +43,7 @@ Auto-promotion to MeshPhysicalMaterial triggers when clearcoat, sheen, transmiss
 
 ## Bitmaps
 
-- **UberBitmap.osl** — Main bitmap node supported and translated by Max.js
-- **Bitmap** — Limited support.
-- **VRayBitmap** — Limited support.
+- **UberBitmap.osl** — Main bitmap node supported and translated by max.js
 - **three.js TSL bitmap** — Custom shader code for materials (Parameterization supported)
 - **three.js video textures** — Load .mp4 or .webm directly
 
@@ -83,22 +81,6 @@ Most effects require WebGPU backend. Supplied by three.js team with few of my ow
 | **Contact Shadows** | max distance, thickness, intensity, quality, temporal |
 | **Retro / CRT** | scanlines, curvature, vignette, color depth, dithering |
 | **Pixel FX** | pixelation, chromatic aberration, sharpening, film grain, brightness, contrast, saturation |
-
----
-
-## Supported Geometry
-
-- **Mesh types:** TriObject, PolyObject (MNMesh with n-gons), auto-conversion of primitives/patches/NURBS
-- **Data:** vertices, indices, UVs (all channels), normals (smooth groups), material IDs
-- **Splines:** sampled as line geometry (6 samples per segment)
-- **Instancing:** automatic instance detection and WebGPU instanced rendering
-- **Multi/Sub-Object:** per-face material group assignment
-- **Skin modifier:** bone weights (vec4), bone indices, bind pose, bone hierarchy
-- **Morph targets:** per-channel morpher influence with delta geometry
-- **Deformation detection:** adaptive vertex hashing detects stack-driven deformation for auto-baking
-- **ForestPack** — instance extraction with per-instance transforms
-- **RailClone** — instance extraction
-- **tyFlow** — particle instance extraction
 
 ### Node Properties
 
@@ -140,7 +122,7 @@ One-click export to a self-contained HTML site with:
 
 ---
 
-## Layer Manager
+## Layer Manager (WIP)
 
 Architecture:
 - **Max-owned layers** — read-only mirror of the 3ds Max scene
@@ -151,7 +133,7 @@ Per-resource disposal tracking for materials, textures, and geometries. Layers p
 
 # Exporting your scene standalone
 
-- **Snapshot sites**: Click snapshot and it saves. That's it.
+- **Snapshot sites**: Click snapshot and it saves. That's it. Your mileage may vary when it comes to performance or missing stuff
 
 # Missing - To do
 
@@ -165,8 +147,6 @@ This tool targets web development but since it's registered as renderer I added 
 # Bugs
 - ActiveShade can bug out if you maximize or minimize windows. Just use registered "kill maxjs" command in search menu
 - No orthographic view (yet)
-- Volumetric Lights contribution
-- Compound Objects can show as duplicate (hide source curve to get rid of it)
 
 # Build
 

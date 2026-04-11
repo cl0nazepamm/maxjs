@@ -1,130 +1,198 @@
-# MaxJS
+# max.js - Create interactive web experiences directly inside 3dsmax. 
 
-MaxJS is a 3ds Max 2026 GUP plugin that embeds a Three.js viewport through WebView2. It gives you realtime scene sync, a post-FX stack, custom `three.js` / TSL materials, layer-driven runtime behavior, and snapshot export to a deployable website.
+ Comes with a nice postfx stack and it's very fun to play around with! Try utilizing layer manager to create custom fx or logic. Runs on WebGPU backend with fallbacks to WebGL.
 
-## Quick Start
+# Features
 
-### 1. Prerequisites
+- **Realtime Sync** — Binary delta protocol over WebView2 shared memory.
+- **ActiveShade** — Docks into a Max viewport for live feedback on your design
+- **Layer Manager** — Early prototype / Outline for Playcanvas style script loading.
+- **Snapshots** — Fast exports. What you see is exactly what you get.
+- **Virtual Reality** — WebXR (only tested on Quest 3 VDXR)
 
-- 3ds Max 2026
-- 3ds Max 2026 SDK at `C:\Program Files\Autodesk\3ds Max 2026 SDK\maxsdk`
-- Visual Studio 2022 Build Tools with the `v143` toolset
-- CMake 3.20+
+---
 
-### 2. Build and install
+## Objects
 
-The shortest path is:
+- **Splat Origin** - Guassian Splat loading via Spark.js integration.
+- **Audio Origin** - Load audio Tracks
 
-```bat
-install.bat
+## Materials
+
+Most 3dsmax materials are supported. three.js materials can be created in material editor also.
+
+### Supported Material Types
+
+| 3ds Max Material | Three.js Output |
+|---|---|
+| **three.js Material** | MeshStandardMaterial / MeshPhysicalMaterial / MeshSSSNodeMaterial |
+| **three.js Utility** | MeshDepthMaterial, MeshLambertMaterial, MeshMatcapMaterial, MeshNormalMaterial, MeshPhongMaterial, MeshBackdropNodeMaterial |
+| **three.js TSL** | MeshTSLNodeMaterial (Custom shader code for materials (Parameterization supported)) | 
+| **three.js Toon** | MeshToonMaterial |
+| **Physical Material** | MeshStandardMaterial or MeshPhysicalMaterial (auto-promoted) |
+| **glTF Material** | MeshStandardMaterial <br>1:1 mapping |
+| **USD Preview Surface** | MeshStandardMaterial or MeshPhysicalMaterial |
+| **VRay Material** | MeshPhysicalMaterial (refraction, coat, thin film mapped) |
+| **OpenPBR Material** | MeshPhysicalMaterial (specular, coat, fuzz, transmission) |
+| **MaterialX** | Load external MaterialX |
+| **Shell Material** | Reads viewport slot so you don't have to overwrite existing |
+
+Auto-promotion to MeshPhysicalMaterial triggers when clearcoat, sheen, transmission, iridescence, anisotropy, or non-default IOR is detected. Map colors always drive material even if a bitmap is connected.
+
+---
+
+## Bitmaps
+
+- **UberBitmap.osl** — Main bitmap node supported and translated by Max.js
+- **Bitmap** — Limited support.
+- **VRayBitmap** — Limited support.
+- **three.js TSL bitmap** — Custom shader code for materials (Parameterization supported)
+- **three.js video textures** — Load .mp4 or .webm directly
+
+---
+
+## Lights
+
+| Light Type | Shadows | Parameters |
+|---|---|---|
+| **Directional** | Yes | color, intensity, shadow bias/radius/mapsize |
+| **Point** | Yes | color, intensity, distance, decay |
+| **Spot** | Yes | color, intensity, distance, decay, angle, penumbra |
+| **Rect Area** | No | color, intensity, width, height | 
+| **Hemisphere** | No | color, intensity, ground color |
+| **Ambient** | No | color, intensity |
+
+All shadow-casting lights support configurable bias, blur radius, and map resolution. Volumetric light contribution parameter included but it's broken currently.
+
+---
+
+## Post-Processing
+
+Most effects require WebGPU backend. Supplied by three.js team with few of my own added (not in the list).
+
+| Effect | Key Parameters |
+|---|---|
+| **SSGI** | radius, thickness, AO/GI intensity, slice count, step count, temporal jitter |
+| **SSR** | quality, blur quality, max distance, opacity, thickness |
+| **GTAO** | samples, distance exponent/falloff, radius, scale, thickness, resolution scale |
+| **Motion Blur** | amount, sample count |
+| **TRAA** | subpixel correction, depth threshold, edge depth diff, max velocity |
+| **Bloom** | strength, radius, threshold |
+| **Depth of Field** | focus distance, focal length, bokeh scale, auto-focus from camera |
+| **Toon Outline** | thickness, alpha, color |
+| **Contact Shadows** | max distance, thickness, intensity, quality, temporal |
+| **Retro / CRT** | scanlines, curvature, vignette, color depth, dithering |
+| **Pixel FX** | pixelation, chromatic aberration, sharpening, film grain, brightness, contrast, saturation |
+
+---
+
+## Supported Geometry
+
+- **Mesh types:** TriObject, PolyObject (MNMesh with n-gons), auto-conversion of primitives/patches/NURBS
+- **Data:** vertices, indices, UVs (all channels), normals (smooth groups), material IDs
+- **Splines:** sampled as line geometry (6 samples per segment)
+- **Instancing:** automatic instance detection and WebGPU instanced rendering
+- **Multi/Sub-Object:** per-face material group assignment
+- **Skin modifier:** bone weights (vec4), bone indices, bind pose, bone hierarchy
+- **Morph targets:** per-channel morpher influence with delta geometry
+- **Deformation detection:** adaptive vertex hashing detects stack-driven deformation for auto-baking
+- **ForestPack** — instance extraction with per-instance transforms
+- **RailClone** — instance extraction
+- **tyFlow** — particle instance extraction
+
+### Node Properties
+
+Per-node flags synced to Three.js: renderable, backface cull, cast shadows, receive shadows, camera visibility, reflection visibility, opacity.
+
+---
+
+## Animation
+
+| Track Type | Data |
+|---|---|
+| **Transform** | position, rotation (quaternion), scale — per-frame matrix sampling |
+| **Material** | color, roughness, metalness, opacity, clearcoat, sheen, transmission, IOR, attenuation, thickness, specular |
+| **Geometry** | vertex animation baking (configurable 1-120 frame step) |
+| **Camera** | position, target, FOV, DOF params, camera cuts via State Sets |
+| **Visibility** | boolean visibility track |
+| **Vertex Level Animation** | samples per frame |
+
+---
+
+## Environment
+
+- **HDRIEnviron.osl** with exposure, gamma, and rotation controls
+- **Sky** (ai_physical_sky): turbidity, rayleigh, mie coefficient/direction, sun elevation/azimuth, exposure
+- **Fog (postfx):** linear (near/far), exponential (density), procedural noise (scale, speed, height falloff, animated turbulence)
+
+---
+
+## Snapshots
+
+One-click export to a self-contained HTML site with:
+- Full scene hierarchy with transforms
+- All PBR materials and texture assets
+- Animation (transform, material, geometry, vertex level animation, camera cuts)
+- Lights, environment (HDRI/sky), fog
+- Gaussian splats
+- Layers
+- Automatic asset URL rewriting for portability
+
+---
+
+## Layer Manager
+
+Architecture:
+- **Max-owned layers** — read-only mirror of the 3ds Max scene
+- **JS-authored layers** — full ownership, hot-loaded from project folder, with access to 3dsmax objects + vibe coding potential.
+- **Overlay layers** — UI/HUD elements outside the scene graph
+
+Per-resource disposal tracking for materials, textures, and geometries. Layers persist per scene file.
+
+# Exporting your scene standalone
+
+- **Snapshot sites**: Click snapshot and it saves. That's it.
+
+# Missing - To do
+
+- Vertex Color processing
+- Morpher (do not use morphers with skin modifier you will write vertex for every frame)
+
+# Rendering frames
+
+This tool targets web development but since it's registered as renderer I added some functions to get pictures out.
+
+# Bugs
+- ActiveShade can bug out if you maximize or minimize windows. Just use registered "kill maxjs" command in search menu
+- No orthographic view (yet)
+- Volumetric Lights contribution
+- Compound Objects can show as duplicate (hide source curve to get rid of it)
+
+# Build
+
+**Requirements:** Visual Studio 2022 (v143 toolset), CMake 3.20+, 3ds Max 2026 SDK
+
+```bash
+# 1. Pull WebView2 SDK (one time)
+setup_webview2.bat
+
+# 2. Configure
+cmake -B build -G "Visual Studio 17 2022" -A x64 .
+
+# If your SDK isn't in the default path:
+# cmake -B build -G "Visual Studio 17 2022" -A x64 -DMAXSDK_PATH="D:/your/sdk/maxsdk" .
+
+# 3. Build
+cmake --build build --config Release
+
+# 4. Deploy (needs admin if Max is in Program Files)
+copy build\Release\maxjs.gup "C:\Program Files\Autodesk\3ds Max 2026\plugins\"
 ```
 
-That script:
-
-1. Ensures the WebView2 SDK is present
-2. Configures CMake if needed
-3. Builds `maxjs.gup`
-4. Deploys the plugin and `web/` runtime into the 3ds Max plugins folder
-
-If deployment needs elevation, the script will prompt for it. Restart 3ds Max after deployment.
-
-### 3. Manual build
-
-```bat
-cmake -S . -B build -G "Visual Studio 17 2022" -A x64
-cmake --build build --config Release --target maxjs
-```
-
-The built plugin is:
-
-`build\Release\maxjs.gup`
-
-Default deploy targets:
-
-- `C:\Program Files\Autodesk\3ds Max 2026\plugins\maxjs.gup`
-- `C:\Program Files\Autodesk\3ds Max 2026\plugins\maxjs_web\`
-
-## Main scripts
-
-- `install.bat`
-  Build + deploy. This is the normal entrypoint.
-- `build.bat`
-  Same as `install.bat`, but also supports `MAXJS_SKIP_DEPLOY=1` for build-only verification.
-- `clean.bat`
-  Removes the build directory.
-- `snapshot-mcp.bat`
-  Serves the checked-in sample snapshot for browser debugging.
-- `snapshot-debug.bat`
-  Starts the sample snapshot server and the configured Chromium/CDP browser.
-
-## Features
-
-- Binary realtime sync over WebView2
-- ActiveShade / docked viewport workflow
-- Layer Manager for runtime logic and effects
-- `three.js` materials and TSL materials in the 3ds Max Material Editor
-- MaterialX bridge path through the `MaterialX Compiler` slot on `MeshTSLNodeMaterial`
-- Snapshot export to a self-contained website
-- WebGPU-first renderer with WebGL fallback
-- WebXR support in the Max viewport only
-- Shipped web runtime uses a locally vendored `three@0.183.2` instead of CDN imports
-
-## Project layout
-
-### Repo-owned sample/export folders
-
-Checked-in sample snapshots and cloned snapshot folders live under:
-
-`projects/`
-
-Example:
-
-`projects/flowerandbee/dist`
-
-### Scene-local authoring data
-
-Real working project data lives next to the `.max` file, not in the repo:
-
-- `project.maxjs.json`
-- `postfx.maxjs.json`
-- `inlines/`
-
-This is the intended ownership split:
-
-- repo `projects/` = samples / cloned snapshots
-- scene folder = actual working MaxJS project state
-
-## Snapshot contract
-
-Snapshot export writes a website folder containing:
-
-- `index.html`
-- `snapshot.json`
-- `scene.bin`
-- optional `scene_anim.bin`
-
-If **Debug Payload** is enabled during snapshot export, the export can also include:
-
-- viewer UI state
-- runtime scene/debug payload
-- project sidecars such as `project.maxjs.json`, `postfx.maxjs.json`, and `inlines/`
-
-If **Debug Payload** is off, those extras are omitted so the snapshot stays clean.
-
-## Current boundaries
-
-- WebXR is not part of the snapshot/export contract
-- Heavy CPU layer simulations can replay in snapshots when debug/runtime payload is included, but they are not yet native runtime systems
-- Generic procedural 3ds Max map baking fallback is intentionally disabled; use supported bitmap/TSL/MaterialX paths instead
-
-## Known rough edges
-
-- ActiveShade can misbehave after aggressive window maximize/minimize operations
-- Orthographic view support is incomplete
-- Volumetric lighting is still sensitive to scene setup
-- Heavy post FX can cause realtime preview instability in some scenes
-- Fur is still work-in-progress
+Restart Max to load the plugin.
 
 ## License
 
 MIT
+
+clone - 2026 Metaverse Makers

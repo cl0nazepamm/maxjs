@@ -20,3 +20,8 @@ projects/*/dist/node_modules/
 AGENTS.md
 docs/
 dev.bat
+debug.bat
+install.bat
+snapshot-debug.bat
+snapshot-debug-setup.bat
+snapshot-mcp.bat

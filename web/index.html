@@ -2436,6 +2436,30 @@
             return params;
         }
 
+        const tslCompatWarnings = new Set();
+        let tslCompatNamespace = null;
+
+        function warnTSLLegacy(name, replacement) {
+            const key = `${name}->${replacement}`;
+            if (tslCompatWarnings.has(key)) return;
+            tslCompatWarnings.add(key);
+            console.warn(`[TSL] Legacy API shim: ${name} -> ${replacement}`);
+        }
+
+        function getTSLCompatNamespace() {
+            if (tslCompatNamespace) return tslCompatNamespace;
+            const compat = Object.create(TSL);
+            const makeTimerShim = (name) => (scale = 1.0) => {
+                warnTSLLegacy(name, 'TSL.time');
+                const s = Number.isFinite(scale) ? scale : 1.0;
+                return s === 1.0 ? TSL.time : TSL.time.mul(s);
+            };
+            compat.timerLocal = makeTimerShim('TSL.timerLocal');
+            compat.timerGlobal = makeTimerShim('TSL.timerGlobal');
+            tslCompatNamespace = compat;
+            return compat;
+        }
+
         function createTSLMaterial(md) {
             try {
                 const material = new THREE.MeshPhysicalNodeMaterial();
@@ -2451,7 +2475,7 @@
                 // TSL code gets: material, THREE, TSL, loadTexture, maps, params (uniforms)
                 const code = md.tslCode;
                 const fn = new Function('material', 'THREE', 'TSL', 'loadTexture', 'maps', 'params', code);
-                fn(material, THREE, TSL, loadTexture, maps, params);
+                fn(material, THREE, getTSLCompatNamespace(), loadTexture, maps, params);
                 // Store params on material for live uniform updates
                 material.userData.tslParams = params;
                 material.needsUpdate = true;

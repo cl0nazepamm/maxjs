@@ -281,7 +281,7 @@ function spawnParticle(pos, vel, ageSec, sizes, isAlive, i, worldMatrix) {
     vel[i * 3 + 2] = _surfNorm.z * normalSpeed;
 
     ageSec[i] = 0;
-    sizes[i] = 0.3 + Math.random() * 0.7;
+    sizes[i] = 0.12 + Math.random() * 0.28;
     isAlive[i] = 1;
 }
 

@@ -26,6 +26,12 @@ const STICK_SLIDE_GRAV = 0.85;
 const STICK_DRAG = 0.94;
 const STICK_TRY_VY = 0.35;
 
+/** World-space swirl around Y through bee centroid (flying particles only). */
+const VORTEX_SWIRL = 2.1;
+const VORTEX_INWARD = 0.55;
+const VORTEX_FALLOFF = 0.11;
+const VORTEX_MIN_R = 0.06;
+
 // Max node names — every match in the scene emits (each particle sticks to its bee).
 const EMITTER_SOURCES = ['Bee', 'Bee001'];
 
@@ -62,6 +68,7 @@ const _blackCol = new THREE.Color(0, 0, 0);
 const _rayO = new THREE.Vector3();
 const _rayD = new THREE.Vector3(0, -1, 0);
 const _rayDn = new THREE.Vector3();
+const _vortexC = new THREE.Vector3();
 let updateFrame = 0;
 let stickSurfaceListFrame = -1;
 
@@ -136,13 +143,13 @@ function createSoftParticleTexture(document, THREE) {
     canvas.height = 64;
     const ctx2d = canvas.getContext('2d');
     const gradient = ctx2d.createRadialGradient(32, 32, 0, 32, 32, 32);
-    // Soft airy blue-white (less saturated than electric cyan).
-    gradient.addColorStop(0.0, 'rgba(255,255,255,1)');
-    gradient.addColorStop(0.18, 'rgba(236,244,252,1)');
-    gradient.addColorStop(0.42, 'rgba(200,222,245,0.95)');
-    gradient.addColorStop(0.65, 'rgba(150,190,232,0.75)');
-    gradient.addColorStop(0.88, 'rgba(110,155,210,0.35)');
-    gradient.addColorStop(1.0, 'rgba(70,110,170,0)');
+    // All-blue radial (core slightly lighter; edge deep blue, additive-friendly).
+    gradient.addColorStop(0.0, 'rgba(210,230,255,1)');
+    gradient.addColorStop(0.2, 'rgba(160,200,255,1)');
+    gradient.addColorStop(0.45, 'rgba(100,170,255,0.95)');
+    gradient.addColorStop(0.68, 'rgba(55,130,235,0.72)');
+    gradient.addColorStop(0.9, 'rgba(30,90,200,0.35)');
+    gradient.addColorStop(1.0, 'rgba(20,60,160,0)');
     ctx2d.fillStyle = gradient;
     ctx2d.fillRect(0, 0, 64, 64);
 
@@ -158,6 +165,25 @@ function refreshEmitters(ctx) {
         const node = matches[0];
         if (node && node.exists) emitters.push(node);
     }
+}
+
+/** Average world origin of current emitters — vortex axis runs vertically through this point. */
+function getEmitterCentroidWorld(target) {
+    target.set(0, 0, 0);
+    let n = 0;
+    for (let e = 0; e < emitters.length; e++) {
+        const node = emitters[e];
+        if (!node?.exists) continue;
+        const wm = node.getWorldMatrix?.();
+        if (!wm) continue;
+        const el = wm.elements;
+        target.x += el[12];
+        target.y += el[13];
+        target.z += el[14];
+        n++;
+    }
+    if (n > 0) target.multiplyScalar(1 / n);
+    return n > 0;
 }
 
 function setInstanceTransform(index, position, quaternion, size) {
@@ -200,7 +226,7 @@ function init(ctx) {
     const texture = createSoftParticleTexture(document, THREE);
     const geometry = new THREE.PlaneGeometry(1, 1);
     const material = new THREE.MeshBasicMaterial({
-        color: 0xffffff,
+        color: 0x5599ff,
         map: texture,
         alphaMap: texture,
         transparent: true,
@@ -276,7 +302,7 @@ function spawn(i) {
     stuck[i] = 0;
     emitterIdx[i] = ei;
     ageSec[i] = 0;
-    baseSizes[i] = 0.18 + Math.random() * 0.22;
+    baseSizes[i] = 0.085 + Math.random() * 0.095;
     flickPhase[i] = Math.random() * Math.PI * 2;
     flickFreq[i] = 9 + Math.random() * 38;
     flickFreq2[i] = 2.2 + Math.random() * 11;
@@ -312,6 +338,8 @@ return {
         const gravity = WORLD_GRAVITY * dt;
         const te = ctx.clock.elapsed;
         const icArr = particles.instanceColor?.array;
+
+        const haveVortex = getEmitterCentroidWorld(_vortexC);
 
         let instanceColorDirty = false;
 
@@ -463,6 +491,21 @@ return {
                 vy += Math.sin(te * 2.6 + flickPhase[i]) * tu * 0.45;
                 vz += Math.cos(te * 1.7 + i * 0.21) * tu;
 
+                if (haveVortex) {
+                    const dx = positions[j] - _vortexC.x;
+                    const dz = positions[j + 2] - _vortexC.z;
+                    const r = Math.sqrt(dx * dx + dz * dz) + VORTEX_MIN_R;
+                    const fall = 1 / (1 + r * VORTEX_FALLOFF);
+                    const tx = -dz / r;
+                    const tz = dx / r;
+                    const rx = -dx / r;
+                    const rz = -dz / r;
+                    const vs = VORTEX_SWIRL * dt * fall;
+                    const vi = VORTEX_INWARD * dt * fall;
+                    vx += tx * vs + rx * vi;
+                    vz += tz * vs + rz * vi;
+                }
+
                 vx *= drag;
                 vy *= drag;
                 vz *= drag;
@@ -522,9 +565,10 @@ return {
             const mult = (2.2 + glow * 3.6) * fade;
             if (icArr) {
                 const o = i * 3;
-                icArr[o] = mult * 0.82;
-                icArr[o + 1] = mult * 0.9;
-                icArr[o + 2] = mult * 0.98;
+                // Same blue tint for every particle; only `mult` (brightness) varies.
+                icArr[o] = mult * 0.38;
+                icArr[o + 1] = mult * 0.62;
+                icArr[o + 2] = mult * 1.0;
                 instanceColorDirty = true;
             }
 

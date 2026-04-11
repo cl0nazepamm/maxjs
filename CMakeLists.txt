@@ -80,6 +80,7 @@ target_link_libraries(${PLUGIN_NAME} PRIVATE
     Maxscrpt.lib
     poly.lib
     MNMath.lib
+    RenderingAPI.lib
     comctl32.lib
     comdlg32.lib
     shlwapi.lib

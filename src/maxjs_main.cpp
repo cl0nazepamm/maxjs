@@ -21,6 +21,8 @@
 #include <modstack.h>
 #include <Graphics/IViewportViewSetting.h>
 #include <Graphics/GraphicsEnums.h>
+#include <Materials/TexHandle.h>
+#include <RenderingAPI/Translator/BaseTranslators/BaseTranslator_Texmap.h>
 #include <maxscript/maxscript.h>
 #include "itreesinterface.h"
 #include "ircinterface.h"
@@ -1318,53 +1320,191 @@ static void ExtractStdUVTransform(Texmap* map, MaxJSPBR::TexTransform& xf) {
 }
 
 // ── Procedural Map Baking ──────────────────────────────────
+// TODO(maxjs): Revisit generic 3ds Max procedural texmap baking after release.
+// The current experimental fallback is intentionally disabled at the call site in
+// ExtractMaterialTexture(). Direct file textures, TSL textures, and known bridge
+// paths remain supported; arbitrary procedural maps should not silently bake until
+// the viewport-DIB/BakeTexmap path is validated against real scenes.
 // Cache: Texmap pointer + time → baked PNG path.  Re-bakes only when the combo is new.
-static std::unordered_map<uintptr_t, std::wstring> bakedMapCache_;
+static std::unordered_map<unsigned long long, std::wstring> bakedMapCache_;
 static constexpr int BAKE_SIZE = 512;
 
-static std::wstring BakeProceduralMap(Texmap* map, TimeValue t) {
-    if (!map) return {};
+class OfflineTexHandleMaker final : public TexHandleMaker {
+public:
+    explicit OfflineTexHandleMaker(int size) : size_(size) {}
 
-    // Cache key: texmap address (stable within a session)
-    uintptr_t key = reinterpret_cast<uintptr_t>(map);
-    auto it = bakedMapCache_.find(key);
-    if (it != bakedMapCache_.end()) return it->second;
+    TexHandle* CreateHandle(Bitmap* bm, int symflags = 0, int extraFlags = 0) override {
+        UNUSED_PARAM(bm);
+        UNUSED_PARAM(symflags);
+        UNUSED_PARAM(extraFlags);
+        return nullptr;
+    }
 
-    // Create bitmap
+    TexHandle* CreateHandle(BITMAPINFO* bminf, int symflags = 0, int extraFlags = 0) override {
+        UNUSED_PARAM(bminf);
+        UNUSED_PARAM(symflags);
+        UNUSED_PARAM(extraFlags);
+        return nullptr;
+    }
+
+    BITMAPINFO* BitmapToDIB(Bitmap* bm, int symflags, int extraFlags, BOOL forceW = 0, BOOL forceH = 0) override {
+        UNUSED_PARAM(bm);
+        UNUSED_PARAM(symflags);
+        UNUSED_PARAM(extraFlags);
+        UNUSED_PARAM(forceW);
+        UNUSED_PARAM(forceH);
+        return nullptr;
+    }
+
+    TexHandle* MakeHandle(BITMAPINFO* bminf) override {
+        if (bminf) {
+            LocalFree(bminf);
+        }
+        return nullptr;
+    }
+
+    BOOL UseClosestPowerOf2() override { return TRUE; }
+    int Size() override { return size_; }
+
+private:
+    int size_;
+};
+
+static bool SaveBitmapToPng(Bitmap* bm, const std::wstring& filename, int width, int height) {
+    if (!bm) return false;
+
+    BitmapInfo outBi;
+    outBi.SetName(filename.c_str());
+    outBi.SetWidth(width);
+    outBi.SetHeight(height);
+    outBi.SetType(BMM_TRUE_32);
+    outBi.SetFlags(MAP_HAS_ALPHA);
+
+    BMMRES writeResult = bm->OpenOutput(&outBi);
+    if (writeResult != BMMRES_SUCCESS) {
+        return false;
+    }
+
+    bm->Write(&outBi);
+    bm->Close(&outBi);
+    return true;
+}
+
+static bool SaveViewportDibAsPng(BITMAPINFO* dib, const std::wstring& filename) {
+    if (!dib) return false;
+    if (dib->bmiHeader.biBitCount != 32 || dib->bmiHeader.biWidth <= 0 || dib->bmiHeader.biHeight == 0) {
+        return false;
+    }
+
+    const int width = dib->bmiHeader.biWidth;
+    const int height = std::abs(dib->bmiHeader.biHeight);
+    const bool bottomUp = dib->bmiHeader.biHeight > 0;
+    const int stride = ((width * dib->bmiHeader.biBitCount + 31) / 32) * 4;
+    const BYTE* pixelData = reinterpret_cast<const BYTE*>(dib) + dib->bmiHeader.biSize;
+
     BitmapInfo bi;
-    bi.SetWidth(BAKE_SIZE);
-    bi.SetHeight(BAKE_SIZE);
+    bi.SetWidth(width);
+    bi.SetHeight(height);
     bi.SetType(BMM_TRUE_32);
     bi.SetFlags(MAP_HAS_ALPHA);
 
     Bitmap* bm = TheManager->Create(&bi);
-    if (!bm) return {};
+    if (!bm) return false;
 
-    // Bake the procedural map into the bitmap
-    map->RenderBitmap(t, bm, 1.0f, TRUE);
+    std::vector<BMM_Color_fl> row(static_cast<size_t>(width));
+    for (int y = 0; y < height; ++y) {
+        const int srcY = bottomUp ? (height - 1 - y) : y;
+        const BYTE* src = pixelData + static_cast<size_t>(srcY) * static_cast<size_t>(stride);
+        for (int x = 0; x < width; ++x) {
+            const BYTE* px = src + static_cast<size_t>(x) * 4;
+            row[static_cast<size_t>(x)].r = static_cast<float>(px[2]) / 255.0f;
+            row[static_cast<size_t>(x)].g = static_cast<float>(px[1]) / 255.0f;
+            row[static_cast<size_t>(x)].b = static_cast<float>(px[0]) / 255.0f;
+            row[static_cast<size_t>(x)].a = static_cast<float>(px[3]) / 255.0f;
+        }
+        bm->PutPixels(0, y, width, row.data());
+    }
 
-    // Save to temp directory as PNG
+    const bool ok = SaveBitmapToPng(bm, filename, width, height);
+    bm->DeleteThis();
+    return ok;
+}
+
+static bool SaveBakedPixelsAsPng(const std::vector<BMM_Color_fl>& bakedPixels, int width, int height, const std::wstring& filename) {
+    BitmapInfo bi;
+    bi.SetWidth(width);
+    bi.SetHeight(height);
+    bi.SetType(BMM_TRUE_32);
+    bi.SetFlags(MAP_HAS_ALPHA);
+
+    Bitmap* bm = TheManager->Create(&bi);
+    if (!bm) return false;
+
+    for (int y = 0; y < height; ++y) {
+        BMM_Color_fl* row = const_cast<BMM_Color_fl*>(bakedPixels.data()) + static_cast<size_t>(y) * static_cast<size_t>(width);
+        bm->PutPixels(0, y, width, row);
+    }
+
+    const bool ok = SaveBitmapToPng(bm, filename, width, height);
+    bm->DeleteThis();
+    return ok;
+}
+
+static std::wstring BakeProceduralMap(Texmap* map, TimeValue t) {
+    if (!map) return {};
+
+    // Cache key: texmap address + time. Animated procedural maps need different bakes per frame.
+    const unsigned long long key =
+        (static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(map)) << 16) ^
+        static_cast<unsigned int>(t);
+    auto it = bakedMapCache_.find(key);
+    if (it != bakedMapCache_.end()) {
+        return it->second;
+    }
+
     wchar_t tempDir[MAX_PATH];
     GetTempPathW(MAX_PATH, tempDir);
     std::wstring dir = std::wstring(tempDir) + L"maxjs_baked\\";
     CreateDirectoryW(dir.c_str(), nullptr);
-
     std::wstring filename = dir + L"proc_" + std::to_wstring(key) + L".png";
 
-    BitmapInfo outBi;
-    outBi.SetName(filename.c_str());
-    outBi.SetWidth(BAKE_SIZE);
-    outBi.SetHeight(BAKE_SIZE);
-    outBi.SetType(BMM_TRUE_32);
-
-    if (bm->OpenOutput(&outBi) == BMMRES_SUCCESS) {
-        bm->Write(&outBi);
-        bm->Close(&outBi);
+    // Prefer the viewport-display DIB path for unknown procedural maps.
+    // This is the same path many Autodesk procedural maps implement for Nitrous/viewport preview.
+    OfflineTexHandleMaker thmaker(BAKE_SIZE);
+    Interval vpValid = FOREVER;
+    BITMAPINFO* dib = map->GetVPDisplayDIB(t, thmaker, vpValid, FALSE, BAKE_SIZE, BAKE_SIZE);
+    if (dib) {
+        const bool ok = SaveViewportDibAsPng(dib, filename);
+        LocalFree(dib);
+        if (ok) {
+            bakedMapCache_[key] = filename;
+            return filename;
+        }
     }
-    bm->DeleteThis();
 
-    bakedMapCache_[key] = filename;
-    return filename;
+    Interval validity = FOREVER;
+    IPoint2 bakedRes(0, 0);
+    std::vector<BMM_Color_fl> bakedPixels;
+    if (!MaxSDK::RenderingAPI::BaseTranslator_Texmap::BakeTexmap(
+            *map,
+            t,
+            validity,
+            IPoint2(BAKE_SIZE, BAKE_SIZE),
+            bakedRes,
+            bakedPixels)) {
+        return {};
+    }
+
+    if (bakedRes.x <= 0 || bakedRes.y <= 0) return {};
+    const size_t pixelCount = static_cast<size_t>(bakedRes.x) * static_cast<size_t>(bakedRes.y);
+    if (bakedPixels.size() < pixelCount) return {};
+
+    if (SaveBakedPixelsAsPng(bakedPixels, bakedRes.x, bakedRes.y, filename)) {
+        bakedMapCache_[key] = filename;
+        return filename;
+    }
+
+    return {};
 }
 
 static void ClearBakedMapCache() {
@@ -1488,18 +1628,20 @@ static bool ExtractMaterialTexture(Texmap* map, std::wstring& filePath, MaxJSPBR
         return true;
     }
 
-    // Fallback: bake any unknown procedural map to a temp PNG
-    {
-        std::wstring bakedPath = BakeProceduralMap(resolved, GetCOREInterface()->GetTime());
-        if (!bakedPath.empty()) {
-            filePath = bakedPath;
-            xf = {};
-            ExtractStdUVTransform(resolved, xf);
-            xf.hasChannelSelect = outputChannelIndex != 1;
-            xf.outputChannelIndex = outputChannelIndex;
-            return true;
-        }
-    }
+    // TODO(maxjs): Re-enable procedural texmap baking after the generic fallback
+    // is proven reliable. For release, do not silently convert arbitrary 3ds Max
+    // maps into baked PNGs here.
+    // {
+    //     std::wstring bakedPath = BakeProceduralMap(resolved, GetCOREInterface()->GetTime());
+    //     if (!bakedPath.empty()) {
+    //         filePath = bakedPath;
+    //         xf = {};
+    //         ExtractStdUVTransform(resolved, xf);
+    //         xf.hasChannelSelect = outputChannelIndex != 1;
+    //         xf.outputChannelIndex = outputChannelIndex;
+    //         return true;
+    //     }
+    // }
 
     return false;
 }

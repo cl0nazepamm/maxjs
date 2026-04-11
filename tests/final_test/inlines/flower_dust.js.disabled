@@ -1,14 +1,25 @@
-// Soft blue glow dust from Flower_01_Core — same sprite + MeshBasic additive path as bee_pollen.
+// Soft cream / pollen dust from flowercenter — rate-based jittered spawn; pulled toward nodes whose name contains "bee".
 // Uses camera-facing instanced quads so particle size is stable under WebGPU.
 // Surface sampling via cloneFromMax — same approach as bee_pollen.
 
 const PARTICLE_COUNT = 500;
+const LIFE_SECONDS = 6;
+/** Target emission rate; actual spawns vary frame-to-frame (accumulator + jitter). */
+const SPAWN_RATE_PER_SEC = 48;
+const MAX_SPAWN_PER_FRAME = 3;
+const SPAWN_ACC_MAX = 2.5;
+const BIRTH_SOFT_SEC = 0.22;
 const HIDDEN_SCALE = 0.0001;
+/** Case-insensitive substring match on Max node names (e.g. Bee, Bee001). */
+const BEE_NAME_SUBSTR = 'bee';
+const BEE_ATTRACT_STRENGTH = 3.2;
 
-const particlesState = { positions: null, velocities: null, lifetimes: null, sizes: null };
+const particlesState = { positions: null, velocities: null, ageSec: null, sizes: null, isAlive: null };
 let particles = null;
 let flower = null;
 let initialized = false;
+/** Fractional spawn budget — smooths emission vs fixed N/frame bursts. */
+let spawnAccumulator = 0;
 
 // Surface sampling data (built once from flower geometry)
 let triPositions = null;
@@ -23,6 +34,7 @@ const _instanceScale = new THREE.Vector3();
 const _instanceMatrix = new THREE.Matrix4();
 const _surfPos = new THREE.Vector3();
 const _surfNorm = new THREE.Vector3();
+const _beeCentroid = new THREE.Vector3();
 
 function createSoftParticleTexture(document, THREE) {
     const canvas = document.createElement('canvas');
@@ -30,12 +42,13 @@ function createSoftParticleTexture(document, THREE) {
     canvas.height = 64;
     const ctx2d = canvas.getContext('2d');
     const gradient = ctx2d.createRadialGradient(32, 32, 0, 32, 32, 32);
-    // Same hot core + wide halo as bee_pollen for additive glow.
+    // Near-white core, pale butter rim — no orange/rust (additive-friendly).
     gradient.addColorStop(0.0, 'rgba(255,255,255,1)');
-    gradient.addColorStop(0.15, 'rgba(240,248,255,1)');
-    gradient.addColorStop(0.4, 'rgba(160,220,255,1)');
-    gradient.addColorStop(0.65, 'rgba(80,170,255,0.95)');
-    gradient.addColorStop(1.0, 'rgba(20,80,200,0)');
+    gradient.addColorStop(0.18, 'rgba(255,252,244,1)');
+    gradient.addColorStop(0.42, 'rgba(255,246,220,0.92)');
+    gradient.addColorStop(0.68, 'rgba(245,235,205,0.55)');
+    gradient.addColorStop(0.88, 'rgba(228,218,198,0.22)');
+    gradient.addColorStop(1.0, 'rgba(210,205,195,0)');
     ctx2d.fillStyle = gradient;
     ctx2d.fillRect(0, 0, 64, 64);
 
@@ -61,6 +74,31 @@ function findFlower(ctx) {
         if (node.name === 'flowercenter') return node;
     }
     return null;
+}
+
+/** World-space centroid of all existing nodes with "bee" in the name (cheap, throttled). */
+function refreshBeeCentroid(ctx) {
+    _beeCentroid.set(0, 0, 0);
+    let n = 0;
+    const nodes = ctx.scene.listNodes?.() ?? [];
+    for (let k = 0; k < nodes.length; k++) {
+        const node = nodes[k];
+        if (!node?.exists) continue;
+        const name = String(node.name ?? '').toLowerCase();
+        if (!name.includes(BEE_NAME_SUBSTR)) continue;
+        const wm = node.getWorldMatrix?.();
+        if (!wm) continue;
+        const e = wm.elements;
+        _beeCentroid.x += e[12];
+        _beeCentroid.y += e[13];
+        _beeCentroid.z += e[14];
+        n++;
+    }
+    if (n > 0) {
+        _beeCentroid.multiplyScalar(1 / n);
+        return true;
+    }
+    return false;
 }
 
 function buildSurfaceData(ctx) {
@@ -175,23 +213,26 @@ function setup(ctx) {
 
     const positions = new Float32Array(PARTICLE_COUNT * 3);
     const velocities = new Float32Array(PARTICLE_COUNT * 3);
-    const lifetimes = new Float32Array(PARTICLE_COUNT);
+    const ageSec = new Float32Array(PARTICLE_COUNT);
     const sizes = new Float32Array(PARTICLE_COUNT);
+    const isAlive = new Uint8Array(PARTICLE_COUNT);
 
     for (let i = 0; i < PARTICLE_COUNT; i++) {
-        lifetimes[i] = 2;
+        isAlive[i] = 0;
         sizes[i] = 0;
+        ageSec[i] = 0;
     }
 
     particlesState.positions = positions;
     particlesState.velocities = velocities;
-    particlesState.lifetimes = lifetimes;
+    particlesState.ageSec = ageSec;
     particlesState.sizes = sizes;
+    particlesState.isAlive = isAlive;
 
     const texture = createSoftParticleTexture(document, THREE);
     const geometry = new THREE.PlaneGeometry(1, 1);
     const material = new THREE.MeshBasicMaterial({
-        color: 0xffffff,
+        color: 0xfff6ea,
         map: texture,
         alphaMap: texture,
         transparent: true,
@@ -214,24 +255,34 @@ function setup(ctx) {
     particles.instanceMatrix.needsUpdate = true;
 
     ctx.js.add(particles, { snapshotId: 'gold_dust_particles' });
+    spawnAccumulator = 0.15 + Math.random() * 0.85;
     return true;
 }
 
-function resetParticle(pos, vel, life, sizes, i, worldMatrix) {
+function findDeadSlot(isAlive) {
+    const start = (Math.random() * PARTICLE_COUNT) | 0;
+    for (let k = 0; k < PARTICLE_COUNT; k++) {
+        const i = (start + k) % PARTICLE_COUNT;
+        if (!isAlive[i]) return i;
+    }
+    return -1;
+}
+
+function spawnParticle(pos, vel, ageSec, sizes, isAlive, i, worldMatrix) {
     sampleSurface(worldMatrix);
 
     pos[i * 3]     = _surfPos.x;
     pos[i * 3 + 1] = _surfPos.y;
     pos[i * 3 + 2] = _surfPos.z;
 
-    // Drift along surface normal + gentle tangent spread
     const normalSpeed = 0.2 + Math.random() * 0.4;
     vel[i * 3]     = _surfNorm.x * normalSpeed;
     vel[i * 3 + 1] = _surfNorm.y * normalSpeed + 0.5 + Math.random() * 1.0;
     vel[i * 3 + 2] = _surfNorm.z * normalSpeed;
 
-    life[i] = 0;
+    ageSec[i] = 0;
     sizes[i] = 0.3 + Math.random() * 0.7;
+    isAlive[i] = 1;
 }
 
 return {
@@ -253,45 +304,83 @@ return {
         const elapsed = ctx.clock.elapsed;
         const pos = particlesState.positions;
         const vel = particlesState.velocities;
-        const life = particlesState.lifetimes;
+        const ageSec = particlesState.ageSec;
         const sizes = particlesState.sizes;
+        const isAlive = particlesState.isAlive;
 
         ctx.camera.raw.getWorldQuaternion(_cameraQuat);
 
+        const haveBee = refreshBeeCentroid(ctx);
+
+        const rateJitter = SPAWN_RATE_PER_SEC * (0.78 + Math.random() * 0.44);
+        spawnAccumulator += dt * rateJitter;
+        if (spawnAccumulator > SPAWN_ACC_MAX) spawnAccumulator = SPAWN_ACC_MAX;
+
+        let spawnBurst = 0;
+        while (
+            spawnAccumulator >= 1
+            && spawnBurst < MAX_SPAWN_PER_FRAME
+        ) {
+            const si = findDeadSlot(isAlive);
+            if (si < 0) break;
+            spawnParticle(pos, vel, ageSec, sizes, isAlive, si, wm);
+            spawnAccumulator -= 1;
+            spawnBurst++;
+        }
+
         for (let i = 0; i < PARTICLE_COUNT; i++) {
-            life[i] += dt * (0.025 + sizes[i] * 0.005);
-
-            if (life[i] > 1) {
-                resetParticle(pos, vel, life, sizes, i, wm);
-            } else {
-                const t = life[i];
-                const ease = 1 - t * t * t;
-
-                // Base drift
-                pos[i * 3]     += vel[i * 3]     * ease * dt;
-                pos[i * 3 + 1] += vel[i * 3 + 1] * ease * dt;
-                pos[i * 3 + 2] += vel[i * 3 + 2] * ease * dt;
-
-                // Harmonic scatter — layered sine waves at different frequencies
-                const seed = i * 1.618033;
-                const f1 = elapsed * 1.2 + seed;
-                const f2 = elapsed * 2.7 + seed * 0.7;
-                const f3 = elapsed * 0.5 + seed * 1.3;
-
-                const amp = 1.8 * ease;
-                pos[i * 3]     += Math.sin(f1) * Math.cos(f3) * amp * dt;
-                pos[i * 3 + 1] += Math.sin(f2) * 0.6 * amp * dt;
-                pos[i * 3 + 2] += Math.cos(f1) * Math.sin(f2 * 0.8) * amp * dt;
-            }
-
-            if (life[i] >= 1) {
+            if (!isAlive[i]) {
                 hideInstance(i, _cameraQuat);
                 continue;
             }
 
-            const ease = 1 - life[i] * life[i] * life[i];
+            ageSec[i] += dt;
+            if (ageSec[i] >= LIFE_SECONDS) {
+                isAlive[i] = 0;
+                hideInstance(i, _cameraQuat);
+                continue;
+            }
+
+            const u = ageSec[i] / LIFE_SECONDS;
+            const ease = 1 - u * u * u;
+
+            pos[i * 3]     += vel[i * 3]     * ease * dt;
+            pos[i * 3 + 1] += vel[i * 3 + 1] * ease * dt;
+            pos[i * 3 + 2] += vel[i * 3 + 2] * ease * dt;
+
+            const seed = i * 1.618033;
+            const f1 = elapsed * 1.2 + seed;
+            const f2 = elapsed * 2.7 + seed * 0.7;
+            const f3 = elapsed * 0.5 + seed * 1.3;
+
+            const amp = 1.8 * ease;
+            pos[i * 3]     += Math.sin(f1) * Math.cos(f3) * amp * dt;
+            pos[i * 3 + 1] += Math.sin(f2) * 0.6 * amp * dt;
+            pos[i * 3 + 2] += Math.cos(f1) * Math.sin(f2 * 0.8) * amp * dt;
+
+            if (haveBee) {
+                let bx = _beeCentroid.x - pos[i * 3];
+                let by = _beeCentroid.y - pos[i * 3 + 1];
+                let bz = _beeCentroid.z - pos[i * 3 + 2];
+                const d = Math.sqrt(bx * bx + by * by + bz * bz) + 0.25;
+                bx /= d;
+                by /= d;
+                bz /= d;
+                const pull = BEE_ATTRACT_STRENGTH * ease * dt;
+                vel[i * 3]     += bx * pull;
+                vel[i * 3 + 1] += by * pull;
+                vel[i * 3 + 2] += bz * pull;
+            }
+
+            const sizeEase = Math.max(0, Math.min(1, ease));
+            const birthEase = Math.min(1, ageSec[i] / BIRTH_SOFT_SEC);
             _instancePos.set(pos[i * 3], pos[i * 3 + 1], pos[i * 3 + 2]);
-            setInstanceTransform(i, _instancePos, _cameraQuat, sizes[i] * Math.max(0, Math.min(1, ease)));
+            setInstanceTransform(
+                i,
+                _instancePos,
+                _cameraQuat,
+                sizes[i] * sizeEase * birthEase,
+            );
         }
 
         particles.instanceMatrix.needsUpdate = true;
@@ -300,13 +389,16 @@ return {
     dispose(ctx) {
         particlesState.positions = null;
         particlesState.velocities = null;
-        particlesState.lifetimes = null;
+        particlesState.ageSec = null;
         particlesState.sizes = null;
+        particlesState.isAlive = null;
         particles = null;
         flower = null;
         initialized = false;
+        spawnAccumulator = 0;
         triPositions = null;
         triNormals = null;
         cumulativeAreas = null;
+        _beeCentroid.set(0, 0, 0);
     },
 };

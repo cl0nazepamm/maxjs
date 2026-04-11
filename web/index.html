@@ -718,23 +718,92 @@
             border-color: rgba(0, 0, 0, 0.15) !important;
         }
         body.light-mode #fx-hdri-name { color: #666 !important; }
+        /* MAYBE IN FUTURE: Light Linking styles
+        .ll-mode {
+            background: rgba(255,255,255,0.06);
+            border: 1px solid rgba(255,255,255,0.08);
+            color: #888;
+            cursor: pointer;
+            border-radius: 0;
+        }
+        .ll-mode.active {
+            background: rgba(64,200,176,0.12);
+            color: #40c8b0;
+            border-color: rgba(64,200,176,0.35);
+        }
+        #ll-obj-list label:hover { background: rgba(255,255,255,0.04); }
+        */
+        #hamburger-menu {
+            position: absolute;
+            top: 100%;
+            left: 0;
+            margin-top: 2px;
+            background: rgba(30,30,30,0.92);
+            backdrop-filter: blur(28px) saturate(1.4);
+            -webkit-backdrop-filter: blur(28px) saturate(1.4);
+            border: 1px solid rgba(255,255,255,0.08);
+            box-shadow: 0 8px 32px rgba(0,0,0,0.5);
+            padding: 4px 0;
+            min-width: 140px;
+            z-index: 50;
+            display: none;
+        }
+        #hamburger-menu.open { display: block; }
+        #hamburger-menu button {
+            display: block;
+            width: 100%;
+            text-align: left;
+            padding: 5px 12px;
+            font: 10px/1.4 'Segoe UI', system-ui, sans-serif;
+            color: #aaa;
+            background: none;
+            border: none;
+            cursor: pointer;
+        }
+        #hamburger-menu button:hover { background: rgba(255,255,255,0.06); }
+        #hamburger-menu button.active { color: #40c8b0; }
+        #hamburger-menu .menu-sep {
+            height: 1px;
+            background: rgba(255,255,255,0.06);
+            margin: 3px 0;
+        }
+        #btnHamburger {
+            font-size: 14px !important;
+            padding: 2px 7px !important;
+            line-height: 1 !important;
+        }
     </style>
 </head>
 <body>
     <div id="hud">
         <div id="info">MaxJS Live — hot reload works!</div>
         <div id="controls">
-            <button id="btnKill" class="maxonly devonly">Kill</button>
-            <button id="btnRefresh" class="maxonly devonly">Refresh</button>
-            <button id="btnSnapshot" class="maxonly devonly">Snapshot</button>
-            <button id="btnSnapshotPanel" class="maxonly devonly">Snap Opts</button>
-            <button id="btnCamLock" class="active devonly">Cam Lock: ON</button>
-            <button id="btnEnv" class="devonly">Env: OFF</button>
-            <button id="btnLightProbe" class="active devonly">Probe: ON</button>
-            <button id="btnLayersPanel" class="maxonly devonly">Layers</button>
+            <div style="position:relative;display:inline-block;">
+                <button id="btnHamburger">&#9776;</button>
+                <div id="hamburger-menu">
+                    <button id="btnKill" class="maxonly devonly">Kill Panel</button>
+                    <button id="btnRefresh" class="maxonly devonly">Refresh</button>
+                    <div class="menu-sep"></div>
+                    <button id="btnSnapshot" class="maxonly devonly">Snapshot</button>
+                    <button id="btnSnapshotPanel" class="maxonly devonly">Snapshot Options</button>
+                    <button id="btnLayersPanel" class="maxonly devonly">Layers</button>
+                    <div class="menu-sep"></div>
+                    <div class="menu-sep"></div>
+                    <div style="padding:3px 12px;font:10px/1.4 'Segoe UI',system-ui,sans-serif;color:#666;">Camera</div>
+                    <select id="selSceneCamera" style="margin:2px 12px;width:calc(100% - 24px);background:#1a1a1a;color:#aaa;border:1px solid rgba(255,255,255,0.1);padding:3px;font:10px 'Segoe UI',system-ui,sans-serif;">
+                        <option value="0">Viewport</option>
+                    </select>
+                    <div class="menu-sep"></div>
+                    <button id="btnCamLock" class="active devonly">Cam Lock: ON</button>
+                    <button id="btnEnv" class="devonly">Env: OFF</button>
+                    <button id="btnLightProbe" class="active devonly">Probe: ON</button>
+                    <button id="btnLightHelpers" class="devonly">Light Helpers</button>
+                    <div class="menu-sep"></div>
+                    <button id="btnTheme">Theme: Dark</button>
+                    <button id="btnDebug" style="display:none">Debug</button>
+                </div>
+            </div>
             <button id="btnPostFxPanel" class="devonly">Post FX</button>
-            <button id="btnTheme">☀</button>
-            <button id="btnDebug" style="display:none">Debug</button>
         </div>
     </div>
     <script>
@@ -743,11 +812,14 @@
                 if (localStorage.getItem('maxjs-theme') === 'light') {
                     document.body.classList.add('light-mode');
                     var t = document.getElementById('btnTheme');
-                    if (t) t.textContent = '\u263e';
+                    if (t) t.textContent = 'Theme: Light';
                 }
             } catch (e) { /* private mode / disabled storage */ }
         })();
     </script>
+    <!-- MAYBE IN FUTURE: Light Linking panel
+    <aside id="lightLinkPanel" class="sidepanel" aria-hidden="true" inert></aside>
+    -->
     <aside id="layersPanel" class="sidepanel sidepanel-left" aria-hidden="true" inert></aside>
     <aside id="snapshotPanel" class="sidepanel" aria-hidden="true" inert></aside>
     <aside id="postPanel" class="sidepanel" aria-hidden="true" inert></aside>
@@ -799,6 +871,7 @@
         import { createPerfHud } from './js/perf_hud.js';
         import { createSSGIController } from './js/ssgi_fx.js';
         import { createLayerManager } from './js/layer_manager.js';
+        import { MAXJS_LAYER_SSR_EXCLUDE } from './js/render_layers.js';
         import { createMaxJSAnimationSystem } from './js/maxjs_animation.js';
         import { createMaxJSAudioSystem } from './js/maxjs_audio.js';
         import { createProjectRuntime } from './js/project_runtime.js';
@@ -912,6 +985,8 @@
         perspCamera.up.set(0, 1, 0);
         orthoCamera.up.set(0, 1, 0);
         perspCamera.position.copy(cameraDefaultPosition);
+        perspCamera.layers.enable(MAXJS_LAYER_SSR_EXCLUDE);
+        orthoCamera.layers.enable(MAXJS_LAYER_SSR_EXCLUDE);
         let camera = perspCamera;
 
         const PERFORMANCE_DEFAULTS = Object.freeze({
@@ -2823,6 +2898,8 @@
             if (hasInitialSync) return;
             hasInitialSync = true;
             stopReadyRetry();
+            // MAYBE IN FUTURE: Restore light linking now that lights + meshes are populated
+            // lightLinking.restoreFromStorage();
         }
 
         function startBridgeHandshake() {
@@ -3393,6 +3470,7 @@
             }
             if (snapshot.fog) ssgiFx.setFogFromScene(snapshot.fog);
             if (snapshot.lights) applyLights(snapshot.lights);
+            if (snapshot.sceneCameras) updateSceneCameraList(snapshot.sceneCameras, snapshot.lockedCamera);
             reconcileSplats(snapshot.splats ?? []);
             audioSystem?.applyAudios(snapshot.audios ?? []);
             applyHairInstances(snapshot.hairInstances ?? []);
@@ -3901,25 +3979,28 @@
                 onCamera(cameraState) {
                     applyCamera(cameraState);
                 },
-                onLight(handle, matrix, visible) {
+                onLight(handle, ld) {
                     const light = lightHandleMap.get(handle);
                     if (!light) return;
-                    // Extract position from transform matrix (column 3)
-                    light.position.set(matrix[12], matrix[13], matrix[14]);
-                    light.visible = visible;
-                    if (light.userData?.maxjsTarget) {
-                        light.userData.maxjsTarget.visible = visible;
-                        // Update target for directional/spot lights using -Y axis direction
-                        const dirX = -matrix[4], dirY = -matrix[5], dirZ = -matrix[6];
-                        const { radius } = getShadowSceneFocus();
-                        const targetDistance = Math.max(radius * 2, 100);
-                        light.userData.maxjsTarget.position.set(
-                            matrix[12] + dirX * targetDistance,
-                            matrix[13] + dirY * targetDistance,
-                            matrix[14] + dirZ * targetDistance
-                        );
-                        light.userData.maxjsTarget.updateMatrixWorld();
-                    }
+                    const m = ld.matrix;
+                    // Reconstruct the JSON-style light data for applyLightData
+                    const pos = [m[12], m[13], m[14]];
+                    const len = Math.sqrt(m[4]*m[4] + m[5]*m[5] + m[6]*m[6]) || 1;
+                    const dir = [-m[4]/len, -m[5]/len, -m[6]/len];
+                    applyLightData(light, {
+                        h: handle, type: ld.type,
+                        v: ld.visible ? 1 : 0,
+                        pos, dir,
+                        color: ld.color, intensity: ld.intensity,
+                        distance: ld.distance, decay: ld.decay,
+                        angle: ld.angle, penumbra: ld.penumbra,
+                        width: ld.width, height: ld.height,
+                        groundColor: ld.groundColor,
+                        castShadow: ld.castShadow,
+                        shadowBias: ld.shadowBias, shadowRadius: ld.shadowRadius,
+                        shadowMapSize: ld.shadowMapSize,
+                        volContrib: ld.volContrib,
+                    });
                 },
                 onSplat(handle, matrix, visible) {
                     const entry = splatHandleMap.get(handle);
@@ -4060,6 +4141,8 @@
         maxRoot.add(lightGroup);
         const LIGHT_TYPES = ['DirectionalLight', 'PointLight', 'SpotLight', 'RectAreaLight', 'HemisphereLight', 'AmbientLight'];
         const lightHandleMap = new Map();
+        const lightHelperMap = new Map();
+        let lightHelpersVisible = false;
         const shadowBounds = new THREE.Box3();
         const shadowCenter = new THREE.Vector3();
         const shadowSize = new THREE.Vector3();
@@ -4111,8 +4194,49 @@
             light.shadow.needsUpdate = true;
         }
 
+        function createLightHelper(light, type) {
+            let helper = null;
+            const sz = 2;
+            switch (type) {
+            case 0: helper = new THREE.DirectionalLightHelper(light, sz); break;
+            case 1: helper = new THREE.PointLightHelper(light, sz); break;
+            case 2: helper = new THREE.SpotLightHelper(light); break;
+            case 4: helper = new THREE.HemisphereLightHelper(light, sz); break;
+            }
+            if (helper) {
+                helper.userData.maxjsExcludeFromRuntimeSnapshot = true;
+                helper.visible = lightHelpersVisible;
+                lightGroup.add(helper);
+            }
+            return helper;
+        }
+
+        function clearLightHelpers() {
+            for (const [, helper] of lightHelperMap) {
+                if (helper.parent) helper.parent.remove(helper);
+                helper.dispose?.();
+            }
+            lightHelperMap.clear();
+        }
+
+        function updateLightHelpers() {
+            for (const [, helper] of lightHelperMap) {
+                helper.update?.();
+            }
+        }
+
+        function setLightHelpersVisible(v) {
+            lightHelpersVisible = !!v;
+            for (const [, helper] of lightHelperMap) {
+                helper.visible = lightHelpersVisible;
+            }
+            const btn = document.getElementById('btnLightHelpers');
+            if (btn) btn.classList.toggle('active', lightHelpersVisible);
+        }
+
         function clearLights() {
             lightHandleMap.clear();
+            clearLightHelpers();
             while (lightGroup.children.length) {
                 const c = lightGroup.children[0];
                 lightGroup.remove(c);
@@ -4251,7 +4375,11 @@
                 const light = createLightFromData(ld);
                 if (!light) continue;
                 lightGroup.add(light);
-                if (ld.h != null) lightHandleMap.set(ld.h, light);
+                if (ld.h != null) {
+                    lightHandleMap.set(ld.h, light);
+                    const helper = createLightHelper(light, ld.type);
+                    if (helper) lightHelperMap.set(ld.h, helper);
+                }
                 if (light.visible !== false) {
                     appliedLightCount++;
                     if (!mainDirectionalLight && ld.type === 0) mainDirectionalLight = light;
@@ -4267,7 +4395,327 @@
         function applyLights(lightsData) {
             clearLights();
             finalizeLightState(lightsData);
+            // MAYBE IN FUTURE: lightLinking.reapply();
         }
+
+        /* MAYBE IN FUTURE: Light Linking — needs custom NodeMaterial lighting node
+           or multi-pass render. Data model + UI ready, no renderer support yet.
+
+        // ── Light Linking ────────────────────────────────────
+        const LIGHT_LINK_LAYER_BASE = 16;
+        const LIGHT_LINK_LAYER_MAX = 30;
+        const LIGHT_LINK_STORAGE_KEY = 'maxjs-light-linking';
+
+        const lightLinking = (() => {
+            // Runtime: { lightHandle: { mode: 'include'|'exclude', objects: Set<nodeHandle> } }
+            const links = new Map();
+            // lightHandle -> layer number
+            const layerAlloc = new Map();
+            let nextLayer = LIGHT_LINK_LAYER_BASE;
+
+            function allocLayer(lightHandle) {
+                if (layerAlloc.has(lightHandle)) return layerAlloc.get(lightHandle);
+                if (nextLayer > LIGHT_LINK_LAYER_MAX) return -1;
+                const layer = nextLayer++;
+                layerAlloc.set(lightHandle, layer);
+                return layer;
+            }
+
+            function freeLayer(lightHandle) {
+                layerAlloc.delete(lightHandle);
+                repackLayers();
+            }
+
+            function repackLayers() {
+                const entries = [...layerAlloc.entries()];
+                layerAlloc.clear();
+                nextLayer = LIGHT_LINK_LAYER_BASE;
+                for (const [h] of entries) {
+                    layerAlloc.set(h, nextLayer++);
+                }
+            }
+
+            // Resolve a handle to its node name (stable across sessions)
+            function lightName(handle) {
+                const light = lightHandleMap.get(handle);
+                return light?.name || null;
+            }
+            function meshName(handle) {
+                const mesh = nodeMap.get(handle);
+                return mesh?.name || null;
+            }
+            // Reverse: find handle by name
+            function lightHandleByName(name) {
+                for (const [h, light] of lightHandleMap) {
+                    if (light.name === name) return h;
+                }
+                return null;
+            }
+            function meshHandleByName(name) {
+                for (const [h, mesh] of nodeMap) {
+                    if (mesh.name === name) return h;
+                }
+                return null;
+            }
+
+            function reapply() {
+                // Reset all lights to layer 0
+                for (const [, light] of lightHandleMap) {
+                    light.layers.set(0);
+                }
+                // Reset all meshes to layer 0
+                for (const [, mesh] of nodeMap) {
+                    mesh.layers.set(0);
+                }
+                // Ensure camera sees all layers
+                camera.layers.enableAll();
+
+                for (const [lh, link] of links) {
+                    const light = lightHandleMap.get(lh);
+                    if (!light) continue;
+                    const layer = allocLayer(lh);
+                    if (layer < 0) continue;
+
+                    // Move light off default layer onto its dedicated layer
+                    light.layers.disable(0);
+                    light.layers.enable(layer);
+                    if (light.userData?.maxjsTarget) {
+                        light.userData.maxjsTarget.layers.enable(layer);
+                    }
+
+                    if (link.mode === 'include') {
+                        for (const oh of link.objects) {
+                            const mesh = nodeMap.get(oh);
+                            if (mesh) mesh.layers.enable(layer);
+                        }
+                    } else {
+                        for (const [oh, mesh] of nodeMap) {
+                            if (!link.objects.has(oh)) {
+                                mesh.layers.enable(layer);
+                            }
+                        }
+                    }
+                }
+            }
+
+            function setLink(lightHandle, mode, objectHandles) {
+                if (!objectHandles || objectHandles.size === 0) {
+                    links.delete(lightHandle);
+                    freeLayer(lightHandle);
+                } else {
+                    links.set(lightHandle, { mode, objects: new Set(objectHandles) });
+                }
+                reapply();
+                save();
+            }
+
+            function removeLink(lightHandle) {
+                links.delete(lightHandle);
+                freeLayer(lightHandle);
+                reapply();
+                save();
+            }
+
+            function getLink(lightHandle) {
+                return links.get(lightHandle) || null;
+            }
+
+            function getAllLinks() { return links; }
+
+            // Save by node name so it survives handle reassignment across sessions
+            function save() {
+                try {
+                    const data = {};
+                    for (const [lh, link] of links) {
+                        const lName = lightName(lh);
+                        if (!lName) continue;
+                        const objNames = [];
+                        for (const oh of link.objects) {
+                            const n = meshName(oh);
+                            if (n) objNames.push(n);
+                        }
+                        data[lName] = { mode: link.mode, objects: objNames };
+                    }
+                    localStorage.setItem(LIGHT_LINK_STORAGE_KEY, JSON.stringify(data));
+                } catch {}
+            }
+
+            // Load: resolve names back to current session handles
+            function load() {
+                try {
+                    const raw = localStorage.getItem(LIGHT_LINK_STORAGE_KEY);
+                    if (!raw) return;
+                    const data = JSON.parse(raw);
+                    for (const [lName, entry] of Object.entries(data)) {
+                        const lh = lightHandleByName(lName);
+                        if (lh == null) continue;
+                        const objHandles = new Set();
+                        for (const oName of (entry.objects || [])) {
+                            const oh = meshHandleByName(oName);
+                            if (oh != null) objHandles.add(oh);
+                        }
+                        if (objHandles.size > 0) {
+                            links.set(lh, {
+                                mode: entry.mode === 'include' ? 'include' : 'exclude',
+                                objects: objHandles,
+                            });
+                        }
+                    }
+                } catch {}
+            }
+
+            // Called after scene sync populates lightHandleMap + nodeMap
+            function restoreFromStorage() {
+                links.clear();
+                layerAlloc.clear();
+                nextLayer = LIGHT_LINK_LAYER_BASE;
+                load();
+                if (links.size > 0) reapply();
+            }
+
+            return { reapply, setLink, removeLink, getLink, getAllLinks, restoreFromStorage };
+        })();
+
+        // ── Light Linking Panel UI ───────────────────────────
+        const lightLinkPanel = document.getElementById('lightLinkPanel');
+        let lightLinkPanelVisible = false;
+
+        function setLightLinkPanelVisible(v) {
+            lightLinkPanelVisible = !!v;
+            lightLinkPanel.classList.toggle('visible', lightLinkPanelVisible);
+            lightLinkPanel.toggleAttribute('inert', !lightLinkPanelVisible);
+            lightLinkPanel.setAttribute('aria-hidden', String(!lightLinkPanelVisible));
+            document.getElementById('btnLightLink').classList.toggle('active', lightLinkPanelVisible);
+            if (lightLinkPanelVisible) rebuildLightLinkPanel();
+        }
+
+        function rebuildLightLinkPanel() {
+            const lights = [];
+            for (const [h, light] of lightHandleMap) {
+                lights.push({ h, name: light.name || `Light ${h}`, type: light.type });
+            }
+            const nodes = [];
+            for (const [h, mesh] of nodeMap) {
+                nodes.push({ h, name: mesh.name || `Object ${h}` });
+            }
+            nodes.sort((a, b) => a.name.localeCompare(b.name));
+
+            let html = `<div class="sidepanel-header"><strong>Light Linking</strong></div><div class="sidepanel-body" style="gap:6px;">`;
+
+            if (lights.length === 0) {
+                html += `<div style="color:#666;padding:8px 0;">No lights in scene</div>`;
+            } else {
+                // Light selector
+                html += `<label style="font-size:10px;color:#888;">Light</label>`;
+                html += `<select id="ll-light-sel" style="width:100%;background:#222;color:#ccc;border:1px solid #444;padding:3px;font-size:11px;">`;
+                for (const l of lights) {
+                    html += `<option value="${l.h}">${l.name}</option>`;
+                }
+                html += `</select>`;
+
+                // Mode selector
+                html += `<div style="display:flex;gap:4px;margin:4px 0;">`;
+                html += `<button id="ll-mode-none" class="ll-mode active" style="flex:1;font-size:10px;padding:3px;">None</button>`;
+                html += `<button id="ll-mode-include" class="ll-mode" style="flex:1;font-size:10px;padding:3px;">Include</button>`;
+                html += `<button id="ll-mode-exclude" class="ll-mode" style="flex:1;font-size:10px;padding:3px;">Exclude</button>`;
+                html += `</div>`;
+
+                // Object list
+                html += `<div style="display:flex;justify-content:space-between;align-items:center;margin-top:4px;">`;
+                html += `<label style="font-size:10px;color:#888;">Objects</label>`;
+                html += `<div style="display:flex;gap:3px;">`;
+                html += `<button id="ll-sel-all" style="font-size:9px;padding:1px 5px;">All</button>`;
+                html += `<button id="ll-sel-none" style="font-size:9px;padding:1px 5px;">None</button>`;
+                html += `</div></div>`;
+                html += `<div id="ll-obj-list" style="max-height:300px;overflow-y:auto;border:1px solid #333;padding:2px;">`;
+                for (const n of nodes) {
+                    html += `<label style="display:flex;align-items:center;gap:4px;padding:1px 2px;font-size:10px;cursor:pointer;">`;
+                    html += `<input type="checkbox" data-h="${n.h}" style="margin:0;accent-color:#40c8b0;"> ${n.name}`;
+                    html += `</label>`;
+                }
+                html += `</div>`;
+            }
+            html += `</div>`;
+            lightLinkPanel.innerHTML = html;
+
+            if (lights.length === 0) return;
+
+            const lightSel = document.getElementById('ll-light-sel');
+            const modeNone = document.getElementById('ll-mode-none');
+            const modeInclude = document.getElementById('ll-mode-include');
+            const modeExclude = document.getElementById('ll-mode-exclude');
+            const objList = document.getElementById('ll-obj-list');
+
+            function getSelectedLight() { return Number(lightSel.value); }
+
+            function getMode() {
+                if (modeInclude.classList.contains('active')) return 'include';
+                if (modeExclude.classList.contains('active')) return 'exclude';
+                return 'none';
+            }
+
+            function setActiveMode(mode) {
+                modeNone.classList.toggle('active', mode === 'none');
+                modeInclude.classList.toggle('active', mode === 'include');
+                modeExclude.classList.toggle('active', mode === 'exclude');
+                // Dim object list when mode is none
+                objList.style.opacity = mode === 'none' ? '0.3' : '1';
+                objList.style.pointerEvents = mode === 'none' ? 'none' : 'auto';
+            }
+
+            function loadLightState() {
+                const lh = getSelectedLight();
+                const link = lightLinking.getLink(lh);
+                if (!link) {
+                    setActiveMode('none');
+                    for (const cb of objList.querySelectorAll('input[type=checkbox]')) cb.checked = false;
+                } else {
+                    setActiveMode(link.mode);
+                    for (const cb of objList.querySelectorAll('input[type=checkbox]')) {
+                        cb.checked = link.objects.has(Number(cb.dataset.h));
+                    }
+                }
+            }
+
+            function applyFromUI() {
+                const lh = getSelectedLight();
+                const mode = getMode();
+                if (mode === 'none') {
+                    lightLinking.removeLink(lh);
+                    return;
+                }
+                const objs = new Set();
+                for (const cb of objList.querySelectorAll('input[type=checkbox]')) {
+                    if (cb.checked) objs.add(Number(cb.dataset.h));
+                }
+                lightLinking.setLink(lh, mode, objs);
+            }
+
+            lightSel.addEventListener('change', loadLightState);
+
+            modeNone.addEventListener('click', () => { setActiveMode('none'); applyFromUI(); });
+            modeInclude.addEventListener('click', () => { setActiveMode('include'); applyFromUI(); });
+            modeExclude.addEventListener('click', () => { setActiveMode('exclude'); applyFromUI(); });
+
+            objList.addEventListener('change', applyFromUI);
+
+            document.getElementById('ll-sel-all').addEventListener('click', () => {
+                for (const cb of objList.querySelectorAll('input[type=checkbox]')) cb.checked = true;
+                applyFromUI();
+            });
+            document.getElementById('ll-sel-none').addEventListener('click', () => {
+                for (const cb of objList.querySelectorAll('input[type=checkbox]')) cb.checked = false;
+                applyFromUI();
+            });
+
+            loadLightState();
+        }
+
+        document.getElementById('btnLightLink')?.addEventListener('click', () => {
+            setLightLinkPanelVisible(!lightLinkPanelVisible);
+        });
+
+        END MAYBE IN FUTURE */
 
         // ── Hair And Fur GPU Instancing ─────────────────────
         const hairMeshes = new Map(); // handle -> { root, mesh }
@@ -4672,7 +5120,36 @@
             if (ssgiFx.setMainLight) {
                 ssgiFx.setMainLight(mainDirectionalLight || (defaultLights.visible ? defaultKey : null));
             }
+            // MAYBE IN FUTURE: lightLinking.reapply();
         }
+
+        // ── Scene Camera Lock ────────────────────────────────
+        const selSceneCamera = document.getElementById('selSceneCamera');
+        let knownSceneCameras = [];
+
+        function updateSceneCameraList(cameras, lockedHandle) {
+            knownSceneCameras = cameras || [];
+            const current = selSceneCamera.value;
+            selSceneCamera.innerHTML = '<option value="0">Viewport</option>';
+            for (const c of knownSceneCameras) {
+                const opt = document.createElement('option');
+                opt.value = String(c.h);
+                opt.textContent = c.n || `Camera ${c.h}`;
+                selSceneCamera.appendChild(opt);
+            }
+            // Restore selection
+            const target = lockedHandle != null ? String(lockedHandle) : current;
+            if ([...selSceneCamera.options].some(o => o.value === target)) {
+                selSceneCamera.value = target;
+            } else {
+                selSceneCamera.value = '0';
+            }
+        }
+
+        selSceneCamera.addEventListener('change', () => {
+            const handle = parseInt(selSceneCamera.value, 10) || 0;
+            bridge.send('lock_camera', { handle: String(handle) });
+        });
 
         // ── Camera Sync (Max view → world camera) ───────────
         function applyCamera(cam) {
@@ -5139,11 +5616,14 @@
 
         // ── Theme Toggle ─────────────────────────────────
         const btnTheme = document.getElementById('btnTheme');
-        btnTheme.textContent = lightMode ? '\u263e' : '\u2600';
+        function updateThemeLabel() {
+            btnTheme.textContent = `Theme: ${lightMode ? 'Light' : 'Dark'}`;
+        }
+        updateThemeLabel();
         btnTheme.onclick = () => {
             lightMode = !lightMode;
             document.body.classList.toggle('light-mode', lightMode);
-            btnTheme.textContent = lightMode ? '\u263e' : '\u2600';
+            updateThemeLabel();
             hiddenBackgroundColor = lightMode ? LIGHT_BG : DARK_BG;
             try {
                 localStorage.setItem(THEME_STORAGE_KEY, lightMode ? 'light' : 'dark');
@@ -5354,6 +5834,19 @@
         }
 
         btnLayersPanel.addEventListener('click', () => setLayersPanelVisible(!layersPanelVisible));
+
+        // ── Hamburger Menu ───────────────────────────────────
+        const hamburgerMenu = document.getElementById('hamburger-menu');
+        document.getElementById('btnHamburger').addEventListener('click', (e) => {
+            e.stopPropagation();
+            hamburgerMenu.classList.toggle('open');
+        });
+        document.addEventListener('click', () => hamburgerMenu.classList.remove('open'));
+        hamburgerMenu.addEventListener('click', (e) => e.stopPropagation());
+
+        document.getElementById('btnLightHelpers')?.addEventListener('click', () => {
+            setLightHelpersVisible(!lightHelpersVisible);
+        });
 
         const btnPostFxPanel = document.getElementById('btnPostFxPanel');
         const postPanel = document.getElementById('postPanel');
@@ -6933,6 +7426,7 @@
                 defaultKey.position.copy(getActiveCameraWorldPosition(cameraPositionWorld));
             }
             updateVolumeUniforms();
+            if (lightHelpersVisible) updateLightHelpers();
             layerManager.update(frameDt, frameElapsed);
             animationSystem?.update(frameDt);
             audioSystem?.update();

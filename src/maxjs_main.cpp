@@ -3861,6 +3861,99 @@ static void GetViewportCamera(CameraData& cam) {
     }
 }
 
+static bool GetSceneCameraData(INode* camNode, TimeValue t, CameraData& cam) {
+    if (!camNode) return false;
+    ObjectState os = camNode->EvalWorldState(t);
+    if (!os.obj) return false;
+
+    // Must be a camera superclass
+    SClass_ID sc = os.obj->SuperClassID();
+    if (sc != CAMERA_CLASS_ID) return false;
+
+    GenCamera* genCam = dynamic_cast<GenCamera*>(os.obj);
+
+    Matrix3 camTM = camNode->GetNodeTM(t);
+    Point3 pos = camTM.GetTrans();
+    Point3 fwd = -Normalize(camTM.GetRow(2));
+    Point3 up  = Normalize(camTM.GetRow(1));
+
+    // Target distance: use target node if it exists, otherwise default
+    float targetDist = 100.0f;
+    if (camNode->GetTarget()) {
+        Point3 tgtPos = camNode->GetTarget()->GetNodeTM(t).GetTrans();
+        targetDist = Length(tgtPos - pos);
+        if (targetDist < 1.0f) targetDist = 100.0f;
+    }
+    Point3 tgt = pos + fwd * targetDist;
+
+    cam.pos[0] = pos.x;    cam.pos[1] = pos.y;    cam.pos[2] = pos.z;
+    cam.target[0] = tgt.x; cam.target[1] = tgt.y;  cam.target[2] = tgt.z;
+    cam.up[0] = up.x;      cam.up[1] = up.y;       cam.up[2] = up.z;
+
+    // FOV
+    cam.perspective = true;
+    cam.viewWidth = 0.0f;
+    if (genCam) {
+        float fovRad = genCam->GetFOV(t);
+        cam.fov = fovRad * (180.0f / 3.14159265f);
+        if (genCam->IsOrtho()) {
+            cam.perspective = false;
+            cam.viewWidth = targetDist * 2.0f;
+        }
+    } else {
+        cam.fov = 45.0f;
+    }
+
+    // DOF from Physical Camera
+    cam.dofEnabled = false;
+    cam.dofFocusDistance = 0.0f;
+    cam.dofFocalLength = 0.0f;
+    cam.dofBokehScale = 0.0f;
+
+    MaxSDK::IPhysicalCamera* phys = dynamic_cast<MaxSDK::IPhysicalCamera*>(os.obj);
+    if (phys && cam.perspective) {
+        Interval iv = FOREVER;
+        cam.dofEnabled = phys->GetDOFEnabled(t, iv);
+        if (cam.dofEnabled) {
+            iv = FOREVER;
+            float focusDist = phys->GetFocusDistance(t, iv);
+            if (focusDist < 1e-4f) focusDist = 5.0f;
+
+            iv = FOREVER;
+            float fNumber = phys->GetLensApertureFNumber(t, iv);
+            if (fNumber < 1e-4f) fNumber = 8.0f;
+
+            iv = FOREVER;
+            float focalLenSU = phys->GetEffectiveLensFocalLength(t, iv);
+            if (focalLenSU < 1e-6f) focalLenSU = 0.04f;
+
+            iv = FOREVER;
+            float filmW = phys->GetFilmWidth(t, iv);
+            double mmPerSU = GetSystemUnitScale(UNITS_MILLIMETERS);
+            if (mmPerSU < 1e-9) mmPerSU = 1.0;
+            if (filmW < 1e-6f) filmW = 36.0f / (float)mmPerSU;
+
+            float cocSU = filmW / 1500.0f;
+            float dofHalf = 0.0f;
+            if (focalLenSU > 1e-6f) {
+                dofHalf = fNumber * cocSU * focusDist * focusDist / (focalLenSU * focalLenSU);
+            }
+
+            cam.dofFocusDistance = focusDist;
+            cam.dofFocalLength = std::clamp(dofHalf, 0.01f, focusDist * 10.0f);
+            float focalMM = focalLenSU * (float)mmPerSU;
+            cam.dofBokehScale = std::clamp(focalMM / fNumber, 0.5f, 30.0f);
+        }
+    }
+    return true;
+}
+
+static bool IsSceneCameraNode(INode* node) {
+    if (!node) return false;
+    ObjectState os = node->EvalWorldState(GetCOREInterface()->GetTime());
+    return os.obj && os.obj->SuperClassID() == CAMERA_CLASS_ID;
+}
+
 static MaxSDK::Graphics::IViewportViewSetting* GetViewportSettings() {
     Interface* ip = GetCOREInterface();
     if (!ip) return nullptr;
@@ -5294,6 +5387,7 @@ public:
     bool haveLastSentCamera_ = false;
     ULONGLONG dirtyStamp_ = 0;   // when dirty_ was last set (for debounce)
     CameraData lastSentCamera_ = {};
+    ULONG lockedCameraHandle_ = 0;  // 0 = viewport (default), nonzero = scene camera handle
     SceneEventNamespace::CallbackKey fastNodeEventCallbackKey_ = 0;
     MaxJSFastNodeEventCallback fastNodeEvents_;
     MaxJSFastRedrawCallback fastRedrawCallback_;
@@ -8205,8 +8299,21 @@ public:
         }
     }
 
+    void GetActiveCamera(CameraData& cam) {
+        if (lockedCameraHandle_ != 0) {
+            Interface* ip = GetCOREInterface();
+            INode* camNode = ip ? ip->GetINodeByHandle(lockedCameraHandle_) : nullptr;
+            if (camNode && GetSceneCameraData(camNode, ip->GetTime(), cam)) {
+                return;
+            }
+            // Camera deleted or invalid — fall back to viewport
+            lockedCameraHandle_ = 0;
+        }
+        GetViewportCamera(cam);
+    }
+
     void CaptureCurrentCameraState() {
-        GetViewportCamera(lastSentCamera_);
+        GetActiveCamera(lastSentCamera_);
         haveLastSentCamera_ = true;
     }
 
@@ -8760,7 +8867,7 @@ public:
 
     void MarkCameraDirtyIfChanged() {
         CameraData current = {};
-        GetViewportCamera(current);
+        GetActiveCamera(current);
         if (!haveLastSentCamera_ || !CameraEquals(lastSentCamera_, current)) {
             fastCameraDirty_ = true;
             QueueFastFlush();
@@ -8823,6 +8930,19 @@ public:
                 || msg.find(L"\"refresh\"") != std::wstring::npos
                 || msg.find(L"\"reload\"") != std::wstring::npos) {
             ReloadWebContent();
+            return;
+        }
+        if (type == L"lock_camera") {
+            std::wstring handleStr;
+            ExtractJsonString(msg, L"handle", handleStr);
+            ULONG h = 0;
+            if (!handleStr.empty()) {
+                try { h = static_cast<ULONG>(std::stoul(handleStr)); } catch (...) { h = 0; }
+            }
+            lockedCameraHandle_ = h;
+            haveLastSentCamera_ = false;  // force camera resend
+            fastCameraDirty_ = true;
+            QueueFastFlush();
             return;
         }
         // Layer mount/remove or host-side sync repair — full resend without reloading WebView2
@@ -9316,7 +9436,12 @@ public:
 
             // Use specialized commands for lights/splats/audios
             if (lightHandles_.find(handle) != lightHandles_.end()) {
-                frame.UpdateLight(static_cast<std::uint32_t>(handle), xform, visible);
+                maxjs::sync::DeltaFrameBuilder::LightData ld = {};
+                ld.matrix16 = xform;
+                ld.visible = visible;
+                if (ExtractLightBinaryData(node, t, ld)) {
+                    frame.UpdateLight(static_cast<std::uint32_t>(handle), ld);
+                }
                 continue;
             }
             if (splatHandles_.find(handle) != splatHandles_.end()) {
@@ -9356,7 +9481,7 @@ public:
 
         if (hasDirtyCamera) {
             CameraData cam = {};
-            GetViewportCamera(cam);
+            GetActiveCamera(cam);
             frame.UpdateCamera(cam.pos, cam.target, cam.up, cam.fov, cam.perspective, cam.viewWidth,
                                cam.dofEnabled, cam.dofFocusDistance, cam.dofFocalLength, cam.dofBokehScale);
             lastSentCamera_ = cam;
@@ -9514,7 +9639,7 @@ public:
         }
 
         CameraData cam = {};
-        GetViewportCamera(cam);
+        GetActiveCamera(cam);
         frame.UpdateCamera(cam.pos, cam.target, cam.up, cam.fov, cam.perspective, cam.viewWidth,
                                cam.dofEnabled, cam.dofFocusDistance, cam.dofFocalLength, cam.dofBokehScale);
         frame.EndFrame();
@@ -10286,9 +10411,33 @@ public:
         ss << L'}';
     }
 
+    void WriteSceneCamerasJson(std::wostringstream& ss) {
+        ss << L"\"sceneCameras\":[";
+        Interface* ip = GetCOREInterface();
+        INode* root = ip ? ip->GetRootNode() : nullptr;
+        bool first = true;
+        if (root) {
+            std::function<void(INode*)> collect = [&](INode* parent) {
+                for (int i = 0; i < parent->NumberOfChildren(); i++) {
+                    INode* node = parent->GetChildNode(i);
+                    if (!node) continue;
+                    if (IsSceneCameraNode(node)) {
+                        if (!first) ss << L',';
+                        ss << L"{\"h\":" << node->GetHandle()
+                           << L",\"n\":\"" << EscapeJson(node->GetName()) << L"\"}";
+                        first = false;
+                    }
+                    collect(node);
+                }
+            };
+            collect(root);
+        }
+        ss << L"],\"lockedCamera\":" << lockedCameraHandle_;
+    }
+
     void WriteCameraJson(std::wostringstream& ss) {
         CameraData cam = {};
-        GetViewportCamera(cam);
+        GetActiveCamera(cam);
         ss << L"\"camera\":{";
         ss << L"\"pos\":[";
         WriteFloatValue(ss, cam.pos[0]); ss << L',';
@@ -10415,6 +10564,54 @@ public:
         ss << L",\"volContrib\":" << volContrib;
 
         ss << L'}';
+        return true;
+    }
+
+    bool ExtractLightBinaryData(INode* node, TimeValue t, maxjs::sync::DeltaFrameBuilder::LightData& ld) {
+        if (!node) return false;
+        ObjectState os = node->EvalWorldState(t);
+        if (!os.obj || !IsThreeJSLightClassID(os.obj->ClassID())) return false;
+        IParamBlock2* pb = os.obj->GetParamBlockByID(threejs_light_params);
+        if (!pb) return false;
+
+        const Class_ID classId = os.obj->ClassID();
+        ThreeJSLightType ltype = GetThreeJSLightTypeFromClassID(classId);
+        if (ThreeJSLightClassUsesTypeParam(classId)) {
+            int rawType = pb->GetInt(pl_type);
+            if (rawType < 0) rawType = 0;
+            if (rawType >= kLight_COUNT) rawType = kLight_Directional;
+            ltype = static_cast<ThreeJSLightType>(rawType);
+        }
+
+        const bool supportsShadows =
+            ltype == kLight_Directional || ltype == kLight_Point || ltype == kLight_Spot;
+        const double metersPerUnit = GetSystemUnitScale(UNITS_METERS);
+        const double pointSpotScale = metersPerUnit > 1.0e-9 ? 1.0 / (metersPerUnit * metersPerUnit) : 1.0;
+
+        Color c = pb->GetColor(pl_color, t);
+        double intensity = pb->GetFloat(pl_intensity, t);
+        if (ltype == kLight_Point || ltype == kLight_Spot) intensity *= pointSpotScale;
+
+        ld.type = static_cast<std::uint32_t>(ltype);
+        ld.color[0] = c.r; ld.color[1] = c.g; ld.color[2] = c.b;
+        ld.intensity = static_cast<float>(intensity);
+        ld.distance = (ltype == kLight_Point || ltype == kLight_Spot) ? pb->GetFloat(pl_distance, t) : 0.0f;
+        ld.decay = (ltype == kLight_Point || ltype == kLight_Spot) ? pb->GetFloat(pl_decay, t) : 2.0f;
+        ld.angle = (ltype == kLight_Spot) ? (pb->GetFloat(pl_angle, t) * 3.14159265f / 180.f) : 0.0f;
+        ld.penumbra = (ltype == kLight_Spot) ? pb->GetFloat(pl_penumbra, t) : 0.0f;
+        ld.width = (ltype == kLight_RectArea) ? pb->GetFloat(pl_width, t) : 0.0f;
+        ld.height = (ltype == kLight_RectArea) ? pb->GetFloat(pl_height, t) : 0.0f;
+        if (ltype == kLight_Hemisphere) {
+            Color gc = pb->GetColor(pl_ground_color, t);
+            ld.groundColor[0] = gc.r; ld.groundColor[1] = gc.g; ld.groundColor[2] = gc.b;
+        } else {
+            ld.groundColor[0] = ld.groundColor[1] = ld.groundColor[2] = 0.0f;
+        }
+        ld.castShadow = supportsShadows && pb->GetInt(pl_cast_shadow) != 0;
+        ld.shadowBias = ld.castShadow ? pb->GetFloat(pl_shadow_bias, t) : -0.0001f;
+        ld.shadowRadius = ld.castShadow ? pb->GetFloat(pl_shadow_radius, t) : 1.0f;
+        ld.shadowMapSize = ld.castShadow ? static_cast<std::uint32_t>(pb->GetInt(pl_shadow_mapsize)) : 1024u;
+        ld.volContrib = pb->GetFloat(pl_vol_contrib, t);
         return true;
     }
 
@@ -10810,8 +11007,10 @@ public:
         }
         ss << L"],";
 
-        // Camera
+        // Camera + scene camera list
         WriteCameraJson(ss);
+        ss << L",";
+        WriteSceneCamerasJson(ss);
 
         // Environment
         EnvData envData;
@@ -11538,6 +11737,8 @@ public:
             }
         }
 
+        ss << L",";
+        WriteSceneCamerasJson(ss);
         ss << L'}';
 
         wv17->PostSharedBufferToScript(sharedBuf.Get(),

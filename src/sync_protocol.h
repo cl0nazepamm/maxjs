@@ -36,7 +36,26 @@ public:
                       float fov, bool perspective, float viewWidth = 0.0f,
                       bool dofEnabled = false, float dofFocusDistance = 0.0f,
                       float dofFocalLength = 0.0f, float dofBokehScale = 0.0f);
-    void UpdateLight(std::uint32_t handle, const float* matrix16, bool visible);
+    struct LightData {
+        const float* matrix16;
+        bool visible;
+        std::uint32_t type;
+        float color[3];
+        float intensity;
+        float distance;
+        float decay;
+        float angle;
+        float penumbra;
+        float width;
+        float height;
+        float groundColor[3];
+        bool castShadow;
+        float shadowBias;
+        float shadowRadius;
+        std::uint32_t shadowMapSize;
+        float volContrib;
+    };
+    void UpdateLight(std::uint32_t handle, const LightData& data);
     void UpdateSplat(std::uint32_t handle, const float* matrix16, bool visible);
     void UpdateAudio(std::uint32_t handle, const float* matrix16, bool visible);
     void EndFrame();

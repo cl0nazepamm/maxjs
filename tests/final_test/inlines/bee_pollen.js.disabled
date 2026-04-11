@@ -1,4 +1,4 @@
-// Pollen from all listed bee meshes — drops with gravity + turbulence; can stick to petal meshes (raycast).
+// Pollen from all listed bee meshes — drops with gravity + turbulence; can stick to `flowercenter` mesh (raycast).
 // Emitter keeps spawning into free slots forever (no overwrite of living particles).
 //
 // Uses camera-facing instanced quads instead of THREE.Points so particle size
@@ -11,11 +11,12 @@ const LIFE_SECONDS = 4.2;
 const FADE_IN_SEC = 0.18;
 const FADE_OUT_START = 0.68;
 const NORMAL_FOLLOW = 4.2;
-const NORM_RESAMPLE_STRIDE = 160;
+const NORM_RESAMPLE_STRIDE = 256;
 const WORLD_GRAVITY = 25.35;
 const LIFT_ALONG_BEE_N = 0.12;
 const TURBULENCE = 0.55;
-const STICK_STRIDE = 96;
+const STICK_STRIDE = 640;
+const STICK_SNAP_STRIDE = 8;
 const STICK_RAY_UP = 2.5;
 const STICK_RAY_FAR = 28;
 const STICK_SURFACE_EPS = 0.0012;
@@ -27,6 +28,9 @@ const STICK_TRY_VY = 0.35;
 
 // Max node names — every match in the scene emits (each particle sticks to its bee).
 const EMITTER_SOURCES = ['Bee', 'Bee001'];
+
+// Simple collider for sticking (same node name as flower_dust surface source).
+const STICK_SURFACE_NODE_NAME = 'flowercenter';
 
 const positions = new Float32Array(PARTICLE_COUNT * 3);
 const velocities = new Float32Array(PARTICLE_COUNT * 3);
@@ -42,7 +46,7 @@ const stuck = new Uint8Array(PARTICLE_COUNT);
 const stickNorm = new Float32Array(PARTICLE_COUNT * 3);
 
 const emitters = [];
-const petalHandles = new Set();
+const stickSurfaceHandles = new Set();
 
 let particles = null;
 let head = 0;
@@ -59,30 +63,30 @@ const _rayO = new THREE.Vector3();
 const _rayD = new THREE.Vector3(0, -1, 0);
 const _rayDn = new THREE.Vector3();
 let updateFrame = 0;
+let stickSurfaceListFrame = -1;
 
-function isPetalMeshName(name) {
-    const s = String(name ?? '').toLowerCase().trim();
-    return s.startsWith('petal');
+function isStickSurfaceMeshName(name) {
+    return String(name ?? '').toLowerCase().trim() === STICK_SURFACE_NODE_NAME;
 }
 
-function refreshPetalHandles(ctx) {
-    petalHandles.clear();
+function refreshStickSurfaceHandles(ctx) {
+    stickSurfaceHandles.clear();
     const nodes = ctx.scene.listNodes?.();
     if (!nodes || !nodes.length) return;
     for (let k = 0; k < nodes.length; k++) {
         const node = nodes[k];
         if (!node?.exists || !node.isMesh) continue;
-        if (!isPetalMeshName(node.name)) continue;
-        if (node.handle != null) petalHandles.add(node.handle);
+        if (!isStickSurfaceMeshName(node.name)) continue;
+        if (node.handle != null) stickSurfaceHandles.add(node.handle);
     }
 }
 
-function pickPetalHit(hits) {
+function pickStickSurfaceHit(hits) {
     if (!hits || !hits.length) return null;
     for (let h = 0; h < hits.length; h++) {
         const hi = hits[h];
-        if (isPetalMeshName(hi.name)) return hi;
-        if (hi.handle != null && petalHandles.has(hi.handle)) return hi;
+        if (isStickSurfaceMeshName(hi.name)) return hi;
+        if (hi.handle != null && stickSurfaceHandles.has(hi.handle)) return hi;
     }
     return null;
 }
@@ -97,28 +101,15 @@ function writeStickNormalFromHit(hi, j) {
     stickNorm[j + 2] = nz / nl;
 }
 
-/** Ray from above + optional motion-biased ray so sloped / vertical petals register. */
-function findPetalSurfaceHit(ctx, px, py, pz, vx, vy, vz) {
+/** Single down-ray only (cheap). */
+function findStickSurfaceHit(ctx, px, py, pz) {
     _rayO.set(px, py + STICK_RAY_UP, pz);
     _rayD.set(0, -1, 0);
-    let hit = pickPetalHit(ctx.scene.raycast(_rayO, _rayD, { far: STICK_RAY_FAR }));
-    if (hit) return hit;
-
-    const v2 = vx * vx + vy * vy + vz * vz;
-    if (v2 < 1e-5) return null;
-    _rayDn.set(vx * 0.35, vy * 0.35 - 0.88, vz * 0.35);
-    if (_rayDn.lengthSq() < 1e-8) return null;
-    _rayDn.normalize();
-    _rayO.set(
-        px - _rayDn.x * 0.12,
-        py - _rayDn.y * 0.12,
-        pz - _rayDn.z * 0.12,
-    );
-    return pickPetalHit(ctx.scene.raycast(_rayO, _rayDn, { far: Math.min(STICK_RAY_FAR, 6) }));
+    return pickStickSurfaceHit(ctx.scene.raycast(_rayO, _rayD, { far: STICK_RAY_FAR }));
 }
 
-/** Re-project onto petal by casting along -surface normal (stable on tilted geometry). */
-function snapStuckToPetal(ctx, j, px, py, pz) {
+/** Re-project onto surface by casting along -surface normal. */
+function snapStuckToSurface(ctx, j, px, py, pz) {
     const snx = stickNorm[j];
     const sny = stickNorm[j + 1];
     const snz = stickNorm[j + 2];
@@ -127,7 +118,7 @@ function snapStuckToPetal(ctx, j, px, py, pz) {
     else _rayDn.normalize();
     const lift = STICK_NORMAL_PROBE;
     _rayO.set(px + snx * lift, py + sny * lift, pz + snz * lift);
-    const rehit = pickPetalHit(ctx.scene.raycast(_rayO, _rayDn, { far: STICK_APPROACH_FAR }));
+    const rehit = pickStickSurfaceHit(ctx.scene.raycast(_rayO, _rayDn, { far: STICK_APPROACH_FAR }));
     if (!rehit) return false;
     writeStickNormalFromHit(rehit, j);
     const nnx = stickNorm[j];
@@ -145,12 +136,13 @@ function createSoftParticleTexture(document, THREE) {
     canvas.height = 64;
     const ctx2d = canvas.getContext('2d');
     const gradient = ctx2d.createRadialGradient(32, 32, 0, 32, 32, 32);
-    // Hot core + wide bright halo for additive glow.
+    // Soft airy blue-white (less saturated than electric cyan).
     gradient.addColorStop(0.0, 'rgba(255,255,255,1)');
-    gradient.addColorStop(0.15, 'rgba(240,248,255,1)');
-    gradient.addColorStop(0.4, 'rgba(160,220,255,1)');
-    gradient.addColorStop(0.65, 'rgba(80,170,255,0.95)');
-    gradient.addColorStop(1.0, 'rgba(20,80,200,0)');
+    gradient.addColorStop(0.18, 'rgba(236,244,252,1)');
+    gradient.addColorStop(0.42, 'rgba(200,222,245,0.95)');
+    gradient.addColorStop(0.65, 'rgba(150,190,232,0.75)');
+    gradient.addColorStop(0.88, 'rgba(110,155,210,0.35)');
+    gradient.addColorStop(1.0, 'rgba(70,110,170,0)');
     ctx2d.fillStyle = gradient;
     ctx2d.fillRect(0, 0, 64, 64);
 
@@ -284,7 +276,7 @@ function spawn(i) {
     stuck[i] = 0;
     emitterIdx[i] = ei;
     ageSec[i] = 0;
-    baseSizes[i] = 0.28 + Math.random() * 0.22;
+    baseSizes[i] = 0.18 + Math.random() * 0.22;
     flickPhase[i] = Math.random() * Math.PI * 2;
     flickFreq[i] = 9 + Math.random() * 38;
     flickFreq2[i] = 2.2 + Math.random() * 11;
@@ -299,7 +291,10 @@ return {
         }
 
         refreshEmitters(ctx);
-        refreshPetalHandles(ctx);
+        if (stickSurfaceHandles.size === 0 || updateFrame - stickSurfaceListFrame > 48) {
+            refreshStickSurfaceHandles(ctx);
+            stickSurfaceListFrame = updateFrame;
+        }
 
         const dt = Math.min(ctx.clock.dt, 0.05);
         ctx.camera.raw.getWorldQuaternion(_cameraQuat);
@@ -384,8 +379,15 @@ return {
                 positions[j + 1] += vy * dt;
                 positions[j + 2] += vz * dt;
 
-                if (!snapStuckToPetal(ctx, j, positions[j], positions[j + 1], positions[j + 2])) {
-                    stuck[i] = 0;
+                if (((i + updateFrame) % STICK_SNAP_STRIDE) === 0) {
+                    if (!snapStuckToSurface(ctx, j, positions[j], positions[j + 1], positions[j + 2])) {
+                        stuck[i] = 0;
+                    }
+                } else {
+                    const d = snx * vx + sny * vy + snz * vz;
+                    if (d < -0.35) {
+                        stuck[i] = 0;
+                    }
                 }
             } else {
                 let nx = spawnNorm[j];
@@ -474,14 +476,11 @@ return {
                 positions[j + 2] += vz * dt;
 
                 if (((i + updateFrame) % STICK_STRIDE) === 0 && vy < STICK_TRY_VY) {
-                    const hit = findPetalSurfaceHit(
+                    const hit = findStickSurfaceHit(
                         ctx,
                         positions[j],
                         positions[j + 1],
                         positions[j + 2],
-                        vx,
-                        vy,
-                        vz,
                     );
                     if (hit && hit.distance < STICK_RAY_FAR * 0.98) {
                         stuck[i] = 1;
@@ -523,9 +522,9 @@ return {
             const mult = (2.2 + glow * 3.6) * fade;
             if (icArr) {
                 const o = i * 3;
-                icArr[o] = mult * 0.72;
+                icArr[o] = mult * 0.82;
                 icArr[o + 1] = mult * 0.9;
-                icArr[o + 2] = mult * 1.05;
+                icArr[o + 2] = mult * 0.98;
                 instanceColorDirty = true;
             }
 
@@ -539,8 +538,9 @@ return {
     dispose(ctx) {
         particles = null;
         emitters.length = 0;
-        petalHandles.clear();
+        stickSurfaceHandles.clear();
         initialized = false;
         updateFrame = 0;
+        stickSurfaceListFrame = -1;
     },
 };

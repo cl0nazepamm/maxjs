@@ -82,13 +82,30 @@ void DeltaFrameBuilder::UpdateCamera(const float* position3, const float* target
     AppendF32(dofBokehScale);
 }
 
-void DeltaFrameBuilder::UpdateLight(std::uint32_t handle, const float* matrix16, bool visible) {
-    BeginCommand(CommandType::UpdateLight, 4 + 16 * sizeof(float) + 4);
+void DeltaFrameBuilder::UpdateLight(std::uint32_t handle, const LightData& d) {
+    // 4 handle + 64 matrix + 4 vis + 4 type + 12 color + 4 intensity
+    // + 4 distance + 4 decay + 4 angle + 4 penumbra + 4 width + 4 height
+    // + 12 groundColor + 4 castShadow + 4 shadowBias + 4 shadowRadius
+    // + 4 shadowMapSize + 4 volContrib = 148 bytes
+    BeginCommand(CommandType::UpdateLight, 148);
     AppendU32(handle);
-    for (int i = 0; i < 16; ++i) {
-        AppendF32(matrix16[i]);
-    }
-    AppendU32(visible ? 1u : 0u);
+    for (int i = 0; i < 16; ++i) AppendF32(d.matrix16[i]);
+    AppendU32(d.visible ? 1u : 0u);
+    AppendU32(d.type);
+    AppendF32(d.color[0]); AppendF32(d.color[1]); AppendF32(d.color[2]);
+    AppendF32(d.intensity);
+    AppendF32(d.distance);
+    AppendF32(d.decay);
+    AppendF32(d.angle);
+    AppendF32(d.penumbra);
+    AppendF32(d.width);
+    AppendF32(d.height);
+    AppendF32(d.groundColor[0]); AppendF32(d.groundColor[1]); AppendF32(d.groundColor[2]);
+    AppendU32(d.castShadow ? 1u : 0u);
+    AppendF32(d.shadowBias);
+    AppendF32(d.shadowRadius);
+    AppendU32(d.shadowMapSize);
+    AppendF32(d.volContrib);
 }
 
 void DeltaFrameBuilder::UpdateSplat(std::uint32_t handle, const float* matrix16, bool visible) {

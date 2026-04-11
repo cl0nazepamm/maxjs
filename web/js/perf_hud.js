@@ -59,7 +59,7 @@ export function createPerfHud(infoEl) {
         }
 
         infoEl.textContent =
-            `MaxJS [${state.transport}] f${state.frameId || '-'} ` +
+            `MaxJS [${state.transport}] f${state.frameId || '-'} ${state.fps}fps ` +
             `| nodes ${state.nodeCount} ` +
             `| inst ${state.instanceCount} ` +
             `| tex ${state.textureCount} ` +
@@ -110,6 +110,12 @@ export function createPerfHud(infoEl) {
             state.memTextures = memoryInfo?.textures ?? 0;
 
             const now = performance.now();
+            fpsFrames++;
+            if (now - fpsLastSample >= 1000) {
+                state.fps = Math.round(fpsFrames * 1000 / (now - fpsLastSample));
+                fpsFrames = 0;
+                fpsLastSample = now;
+            }
             if (state.active && now - lastRenderPaintMs >= 250) {
                 lastRenderPaintMs = now;
                 paint();

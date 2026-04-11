@@ -132,13 +132,34 @@ export function applyDeltaFrame(buffer, handlers = {}) {
                 break;
             }
             case COMMAND_TYPES.UpdateLight: {
-                assertSize('UpdateLight', commandSize, 76);
-                const handle = view.getUint32(payloadOffset, true);
-                const matrix = new Float32Array(buffer, payloadOffset + 4, 16);
-                const visible = view.getUint32(payloadOffset + 68, true) !== 0;
+                assertSize('UpdateLight', commandSize, 152);
+                let o = payloadOffset;
+                const handle = view.getUint32(o, true); o += 4;
+                const matrix = new Float32Array(buffer, o, 16); o += 64;
+                const visible = view.getUint32(o, true) !== 0; o += 4;
+                const lightType = view.getUint32(o, true); o += 4;
+                const color = [view.getFloat32(o, true), view.getFloat32(o+4, true), view.getFloat32(o+8, true)]; o += 12;
+                const intensity = view.getFloat32(o, true); o += 4;
+                const distance = view.getFloat32(o, true); o += 4;
+                const decay = view.getFloat32(o, true); o += 4;
+                const angle = view.getFloat32(o, true); o += 4;
+                const penumbra = view.getFloat32(o, true); o += 4;
+                const width = view.getFloat32(o, true); o += 4;
+                const height = view.getFloat32(o, true); o += 4;
+                const groundColor = [view.getFloat32(o, true), view.getFloat32(o+4, true), view.getFloat32(o+8, true)]; o += 12;
+                const castShadow = view.getUint32(o, true) !== 0; o += 4;
+                const shadowBias = view.getFloat32(o, true); o += 4;
+                const shadowRadius = view.getFloat32(o, true); o += 4;
+                const shadowMapSize = view.getUint32(o, true); o += 4;
+                const volContrib = view.getFloat32(o, true);
                 decodeMs += performance.now() - decodeStart;
                 const applyStart = performance.now();
-                handlers.onLight?.(handle, matrix, visible);
+                handlers.onLight?.(handle, {
+                    matrix, visible, type: lightType,
+                    color, intensity, distance, decay, angle, penumbra,
+                    width, height, groundColor,
+                    castShadow, shadowBias, shadowRadius, shadowMapSize, volContrib,
+                });
                 applyMs += performance.now() - applyStart;
                 break;
             }

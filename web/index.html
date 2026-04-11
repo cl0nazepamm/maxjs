@@ -2441,6 +2441,44 @@
             return material;
         }
 
+        function coerceTSLFloat(value, fallback) {
+            const n = Number(value);
+            return Number.isFinite(n) ? n : fallback;
+        }
+
+        function coerceTSLColor(value, fallbackR, fallbackG, fallbackB) {
+            if (Array.isArray(value) && value.length >= 3) {
+                return new THREE.Color(
+                    coerceTSLFloat(value[0], fallbackR),
+                    coerceTSLFloat(value[1], fallbackG),
+                    coerceTSLFloat(value[2], fallbackB),
+                );
+            }
+            if (value && typeof value === 'object' &&
+                Number.isFinite(value.r) &&
+                Number.isFinite(value.g) &&
+                Number.isFinite(value.b)) {
+                return new THREE.Color(value.r, value.g, value.b);
+            }
+            if (typeof value === 'string' && value.trim()) {
+                try {
+                    return new THREE.Color(value);
+                } catch {}
+            }
+            return new THREE.Color(fallbackR, fallbackG, fallbackB);
+        }
+
+        function coerceTSLBool(value, fallback) {
+            if (typeof value === 'boolean') return value;
+            if (typeof value === 'number') return value !== 0;
+            if (typeof value === 'string') {
+                const normalized = value.trim().toLowerCase();
+                if (normalized === 'true' || normalized === '1' || normalized === 'on') return true;
+                if (normalized === 'false' || normalized === '0' || normalized === 'off') return false;
+            }
+            return fallback;
+        }
+
         // Parse @param declarations from TSL code and build uniform params object
         function buildTSLParams(code, values) {
             const params = {};
@@ -2451,16 +2489,15 @@
                 const [, type, name, rest] = m;
                 const parts = rest.trim().split(/\s+/).map(Number);
                 if (type === 'float') {
-                    const val = values?.[name] ?? (isFinite(parts[0]) ? parts[0] : 0.5);
-                    params[name] = TSL.uniform(val);
+                    const fallback = isFinite(parts[0]) ? parts[0] : 0.5;
+                    params[name] = TSL.uniform(coerceTSLFloat(values?.[name], fallback));
                 } else if (type === 'color') {
-                    const v = values?.[name];
-                    const r = v ? v[0] : (isFinite(parts[0]) ? parts[0] : 1);
-                    const g = v ? v[1] : (isFinite(parts[1]) ? parts[1] : 1);
-                    const b = v ? v[2] : (isFinite(parts[2]) ? parts[2] : 1);
-                    params[name] = TSL.uniform(new THREE.Color(r, g, b));
+                    const r = isFinite(parts[0]) ? parts[0] : 1;
+                    const g = isFinite(parts[1]) ? parts[1] : 1;
+                    const b = isFinite(parts[2]) ? parts[2] : 1;
+                    params[name] = TSL.uniform(coerceTSLColor(values?.[name], r, g, b));
                 } else if (type === 'bool') {
-                    const val = values?.[name] ?? (rest.trim() === 'true');
+                    const val = coerceTSLBool(values?.[name], rest.trim() === 'true');
                     params[name] = TSL.uniform(val ? 1.0 : 0.0);
                 }
             }

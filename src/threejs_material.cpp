@@ -14,6 +14,7 @@
 #include <custcont.h>
 
 extern HINSTANCE hInstance;
+extern void MaxJSNotifyMaterialEdited();
 
 // ══════════════════════════════════════════════════════════════
 //  ThreeJS Materials — native PBR materials for the MaxJS viewport
@@ -341,7 +342,10 @@ public:
         const int slotIndex = GetSupportedMapSlotIndex(i);
         if (slotIndex < 0) return;
         const ParamID pid = kMapParamIDs[slotIndex];
-        if (HasParam(pblock, pid)) pblock->SetValue(pid, 0, m);
+        if (HasParam(pblock, pid)) {
+            pblock->SetValue(pid, 0, m);
+            MaxJSNotifyMaterialEdited();
+        }
     }
     MSTR GetSubTexmapSlotName(int i, bool) override {
         const int slotIndex = GetSupportedMapSlotIndex(i);
@@ -1318,76 +1322,73 @@ static constexpr int kTSLDynCtrl  = 2;   // +i*3 (spinner / swatch / checkbox)
 // ── TSL Material DlgProc ────────────────────────────────────
 class ThreeJSTSLDlgProc : public ParamMap2UserDlgProc {
 public:
-    std::vector<TSLParamDef> dynParams_;
-    std::vector<ISpinnerControl*> dynSpinners_;
-    std::vector<IColorSwatch*> dynSwatches_;
-    HWND dlgHwnd_ = nullptr;
-    IParamBlock2* pb_ = nullptr;
-    bool rebuildingUI_ = false;
+    struct DialogState {
+        std::vector<TSLParamDef> dynParams;
+        std::vector<ISpinnerControl*> dynSpinners;
+        std::vector<IColorSwatch*> dynSwatches;
+        IParamBlock2* pb = nullptr;
+        bool rebuildingUI = false;
+    };
 
-    void DestroyDynamicControls() {
-        for (auto* sp : dynSpinners_) if (sp) ReleaseISpinner(sp);
-        dynSpinners_.clear();
-        for (auto* sw : dynSwatches_) if (sw) sw->SetModal();  // detach
-        dynSwatches_.clear();
-        if (!dlgHwnd_) return;
-        // Destroy all dynamic child windows
+    std::unordered_map<HWND, DialogState> states_;
+
+    void DestroyDynamicControls(HWND dlgHwnd, DialogState& state) {
+        for (auto* sp : state.dynSpinners) if (sp) ReleaseISpinner(sp);
+        state.dynSpinners.clear();
+        for (auto* sw : state.dynSwatches) if (sw) sw->SetModal();
+        state.dynSwatches.clear();
         for (int i = 0; i < 16; ++i) {
             for (int j = 0; j < 3; ++j) {
-                HWND h = GetDlgItem(dlgHwnd_, kTSLDynBase + i * 3 + j);
+                HWND h = GetDlgItem(dlgHwnd, kTSLDynBase + i * 3 + j);
                 if (h) DestroyWindow(h);
             }
         }
     }
 
-    void RebuildDynamicControls(const std::wstring& code) {
-        rebuildingUI_ = true;
-        DestroyDynamicControls();
+    void RebuildDynamicControls(HWND dlgHwnd, DialogState& state, const std::wstring& code) {
+        state.rebuildingUI = true;
+        DestroyDynamicControls(dlgHwnd, state);
 
-        dynParams_ = ParseTSLParams(code);
-        if (dynParams_.empty()) { rebuildingUI_ = false; return; }
+        state.dynParams = ParseTSLParams(code);
+        if (state.dynParams.empty()) { state.rebuildingUI = false; return; }
 
-        // Load stored values
-        if (pb_) {
-            const MCHAR* stored = pb_->GetStr(pb_tsl_params_json);
-            if (stored && stored[0]) LoadParamsFromJson(stored, dynParams_);
+        if (state.pb) {
+            const MCHAR* stored = state.pb->GetStr(pb_tsl_params_json);
+            if (stored && stored[0]) LoadParamsFromJson(stored, state.dynParams);
         }
 
-        // Find the "Dynamic Parameters" group box position
-        HWND groupBox = GetDlgItem(dlgHwnd_, IDC_TSL_DYN_GROUP);
+        HWND groupBox = GetDlgItem(dlgHwnd, IDC_TSL_DYN_GROUP);
         RECT groupRect = {};
         if (groupBox) {
             GetWindowRect(groupBox, &groupRect);
-            MapWindowPoints(HWND_DESKTOP, dlgHwnd_, reinterpret_cast<POINT*>(&groupRect), 2);
+            MapWindowPoints(HWND_DESKTOP, dlgHwnd, reinterpret_cast<POINT*>(&groupRect), 2);
         } else {
-            // Fallback position below maps
             groupRect.left = 4; groupRect.top = 280; groupRect.right = 166;
         }
 
-        HINSTANCE hInst = (HINSTANCE)GetWindowLongPtr(dlgHwnd_, GWLP_HINSTANCE);
+        HINSTANCE hInst = (HINSTANCE)GetWindowLongPtr(dlgHwnd, GWLP_HINSTANCE);
         int yPos = groupRect.top + 16;
         const int labelW = 60, editW = 54, spinW = 10, swatchW = 90;
         const int ctrlH = 16, rowH = 26;
 
-        for (int i = 0; i < static_cast<int>(dynParams_.size()); ++i) {
-            auto& p = dynParams_[i];
+        for (int i = 0; i < static_cast<int>(state.dynParams.size()); ++i) {
+            auto& p = state.dynParams[i];
             int baseId = kTSLDynBase + i * 3;
 
-            // Label
             CreateWindowW(L"STATIC", p.name.c_str(),
                 WS_CHILD | WS_VISIBLE | SS_LEFT,
                 8, yPos + 2, labelW, ctrlH,
-                dlgHwnd_, (HMENU)(INT_PTR)(baseId + kTSLDynLabel), hInst, nullptr);
+                dlgHwnd, (HMENU)(INT_PTR)(baseId + kTSLDynLabel), hInst, nullptr);
 
             if (p.type == TSLParamType::Float) {
                 HWND hEdit = CreateWindowW(L"CustEdit", L"",
                     WS_CHILD | WS_VISIBLE | WS_TABSTOP,
                     8 + labelW + 4, yPos, editW, ctrlH,
-                    dlgHwnd_, (HMENU)(INT_PTR)(baseId + kTSLDynEdit), hInst, nullptr);
+                    dlgHwnd, (HMENU)(INT_PTR)(baseId + kTSLDynEdit), hInst, nullptr);
                 HWND hSpin = CreateWindowW(SPINNERWINDOWCLASS, L"",
                     WS_CHILD | WS_VISIBLE,
                     8 + labelW + 4 + editW, yPos, spinW, ctrlH,
-                    dlgHwnd_, (HMENU)(INT_PTR)(baseId + kTSLDynCtrl), hInst, nullptr);
+                    dlgHwnd, (HMENU)(INT_PTR)(baseId + kTSLDynCtrl), hInst, nullptr);
 
                 ISpinnerControl* sp = GetISpinner(hSpin);
                 if (sp) {
@@ -1395,13 +1396,13 @@ public:
                     sp->SetLimits(p.floatMin, p.floatMax, FALSE);
                     sp->SetValue(p.floatVal, FALSE);
                     sp->SetAutoScale();
-                    dynSpinners_.push_back(sp);
+                    state.dynSpinners.push_back(sp);
                 }
             } else if (p.type == TSLParamType::Color) {
                 HWND hSwatch = CreateWindowW(COLORSWATCHWINDOWCLASS, L"",
                     WS_CHILD | WS_VISIBLE,
                     8 + labelW + 4, yPos, swatchW, ctrlH,
-                    dlgHwnd_, (HMENU)(INT_PTR)(baseId + kTSLDynCtrl), hInst, nullptr);
+                    dlgHwnd, (HMENU)(INT_PTR)(baseId + kTSLDynCtrl), hInst, nullptr);
                 IColorSwatch* cs = GetIColorSwatch(hSwatch);
                 if (cs) {
                     COLORREF cr = RGB(
@@ -1409,52 +1410,47 @@ public:
                         static_cast<int>(p.color[1] * 255.0f),
                         static_cast<int>(p.color[2] * 255.0f));
                     cs->SetColor(cr);
-                    dynSwatches_.push_back(cs);
+                    state.dynSwatches.push_back(cs);
                 }
             } else if (p.type == TSLParamType::Bool) {
                 CreateWindowW(L"Button", p.name.c_str(),
                     WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX | WS_TABSTOP,
                     8 + labelW + 4, yPos, swatchW, ctrlH,
-                    dlgHwnd_, (HMENU)(INT_PTR)(baseId + kTSLDynCtrl), hInst, nullptr);
-                HWND hChk = GetDlgItem(dlgHwnd_, baseId + kTSLDynCtrl);
-                if (hChk) CheckDlgButton(dlgHwnd_, baseId + kTSLDynCtrl, p.boolVal ? BST_CHECKED : BST_UNCHECKED);
+                    dlgHwnd, (HMENU)(INT_PTR)(baseId + kTSLDynCtrl), hInst, nullptr);
+                HWND hChk = GetDlgItem(dlgHwnd, baseId + kTSLDynCtrl);
+                if (hChk) CheckDlgButton(dlgHwnd, baseId + kTSLDynCtrl, p.boolVal ? BST_CHECKED : BST_UNCHECKED);
             }
             yPos += rowH;
         }
 
-        // Save defaults for any newly added params
-        FlushParamsJson();
-        rebuildingUI_ = false;
+        FlushParamsJson(dlgHwnd, state);
+        state.rebuildingUI = false;
     }
 
-    void FlushParamsJson() {
-        // Read current values from controls back into dynParams_
+    void FlushParamsJson(HWND dlgHwnd, DialogState& state) {
         int spinIdx = 0, swatchIdx = 0;
-        for (auto& p : dynParams_) {
-            if (p.type == TSLParamType::Float && spinIdx < static_cast<int>(dynSpinners_.size())) {
-                p.floatVal = dynSpinners_[spinIdx++]->GetFVal();
-            } else if (p.type == TSLParamType::Color && swatchIdx < static_cast<int>(dynSwatches_.size())) {
-                COLORREF cr = dynSwatches_[swatchIdx++]->GetColor();
+        for (auto& p : state.dynParams) {
+            if (p.type == TSLParamType::Float && spinIdx < static_cast<int>(state.dynSpinners.size())) {
+                p.floatVal = state.dynSpinners[spinIdx++]->GetFVal();
+            } else if (p.type == TSLParamType::Color && swatchIdx < static_cast<int>(state.dynSwatches.size())) {
+                COLORREF cr = state.dynSwatches[swatchIdx++]->GetColor();
                 p.color[0] = GetRValue(cr) / 255.0f;
                 p.color[1] = GetGValue(cr) / 255.0f;
                 p.color[2] = GetBValue(cr) / 255.0f;
             } else if (p.type == TSLParamType::Bool) {
-                // read from checkbox — find by scanning
-                for (int i = 0; i < static_cast<int>(dynParams_.size()); ++i) {
-                    if (&dynParams_[i] == &p) {
-                        HWND hChk = GetDlgItem(dlgHwnd_, kTSLDynBase + i * 3 + kTSLDynCtrl);
-                        if (hChk) p.boolVal = (IsDlgButtonChecked(dlgHwnd_, kTSLDynBase + i * 3 + kTSLDynCtrl) == BST_CHECKED);
+                for (int i = 0; i < static_cast<int>(state.dynParams.size()); ++i) {
+                    if (&state.dynParams[i] == &p) {
+                        HWND hChk = GetDlgItem(dlgHwnd, kTSLDynBase + i * 3 + kTSLDynCtrl);
+                        if (hChk) p.boolVal = (IsDlgButtonChecked(dlgHwnd, kTSLDynBase + i * 3 + kTSLDynCtrl) == BST_CHECKED);
                         break;
                     }
                 }
             }
         }
-        if (pb_) {
-            std::wstring json = BuildParamsJson(dynParams_);
-            pb_->SetValue(pb_tsl_params_json, 0, json.c_str());
-            // Kick the dependency chain so MaxJS re-syncs the material
-            // pb->SetValue already propagates REFMSG_CHANGE through the reference chain.
-            // Do NOT call NotifyDependents here — it causes a feedback loop with MaxJS polling.
+        if (state.pb) {
+            std::wstring json = BuildParamsJson(state.dynParams);
+            state.pb->SetValue(pb_tsl_params_json, 0, json.c_str());
+            MaxJSNotifyMaterialEdited();
         }
     }
 
@@ -1462,27 +1458,32 @@ public:
         IParamBlock2* pb = map ? map->GetParamBlock() : nullptr;
         switch (msg) {
         case WM_INITDIALOG: {
-            dlgHwnd_ = hWnd;
-            pb_ = pb;
+            DialogState& state = states_[hWnd];
+            state.pb = pb;
             if (pb) {
                 const MCHAR* code = pb->GetStr(pb_tsl_code);
                 if (code && code[0]) {
                     SetDlgItemText(hWnd, IDC_TSL_CODE_EDIT, code);
-                    RebuildDynamicControls(code);
+                    RebuildDynamicControls(hWnd, state, code);
                 }
             }
             return TRUE;
         }
         case WM_DESTROY:
-            DestroyDynamicControls();
-            dlgHwnd_ = nullptr;
-            pb_ = nullptr;
+            if (auto it = states_.find(hWnd); it != states_.end()) {
+                DestroyDynamicControls(hWnd, it->second);
+                states_.erase(it);
+            }
             return TRUE;
         case CC_SPINNER_CHANGE:
-            if (!rebuildingUI_) FlushParamsJson();
+            if (auto it = states_.find(hWnd); it != states_.end() && !it->second.rebuildingUI) {
+                FlushParamsJson(hWnd, it->second);
+            }
             return TRUE;
         case CC_COLOR_CHANGE:
-            if (!rebuildingUI_) FlushParamsJson();
+            if (auto it = states_.find(hWnd); it != states_.end() && !it->second.rebuildingUI) {
+                FlushParamsJson(hWnd, it->second);
+            }
             return TRUE;
         case WM_COMMAND:
             if (LOWORD(wParam) == IDC_TSL_LOAD_BTN && HIWORD(wParam) == BN_CLICKED) {
@@ -1508,10 +1509,15 @@ public:
                             std::wstring wCode(wLen, L'\0');
                             MultiByteToWideChar(CP_UTF8, 0, buf.data(), (int)buf.size(), wCode.data(), wLen);
                             SetDlgItemText(hWnd, IDC_TSL_CODE_EDIT, wCode.c_str());
-                            if (pb) pb->SetValue(pb_tsl_code, 0, wCode.c_str());
+                            if (pb) {
+                                pb->SetValue(pb_tsl_code, 0, wCode.c_str());
+                                MaxJSNotifyMaterialEdited();
+                            }
                             const wchar_t* fname = wcsrchr(filePath, L'\\');
                             SetDlgItemText(hWnd, IDC_TSL_FILE_LABEL, fname ? fname + 1 : filePath);
-                            RebuildDynamicControls(wCode);
+                            if (auto it = states_.find(hWnd); it != states_.end()) {
+                                RebuildDynamicControls(hWnd, it->second, wCode);
+                            }
                         }
                         CloseHandle(hFile);
                     }
@@ -1524,8 +1530,13 @@ public:
                 std::wstring text(static_cast<size_t>(len) + 1, L'\0');
                 int copied = GetDlgItemText(hWnd, IDC_TSL_CODE_EDIT, text.data(), len + 1);
                 if (copied >= 0) text.resize(static_cast<size_t>(copied)); else text.clear();
-                if (pb) pb->SetValue(pb_tsl_code, 0, text.c_str());
-                RebuildDynamicControls(text);
+                if (pb) {
+                    pb->SetValue(pb_tsl_code, 0, text.c_str());
+                    MaxJSNotifyMaterialEdited();
+                }
+                if (auto it = states_.find(hWnd); it != states_.end()) {
+                    RebuildDynamicControls(hWnd, it->second, text);
+                }
                 return TRUE;
             }
             if (LOWORD(wParam) == IDC_TSL_CODE_EDIT && HIWORD(wParam) == EN_CHANGE) {
@@ -1533,12 +1544,16 @@ public:
                 std::wstring text(static_cast<size_t>(len) + 1, L'\0');
                 int copied = GetDlgItemText(hWnd, IDC_TSL_CODE_EDIT, text.data(), len + 1);
                 if (copied >= 0) text.resize(static_cast<size_t>(copied)); else text.clear();
-                if (pb) pb->SetValue(pb_tsl_code, 0, text.c_str());
+                if (pb) {
+                    pb->SetValue(pb_tsl_code, 0, text.c_str());
+                    MaxJSNotifyMaterialEdited();
+                }
                 return TRUE;
             }
-            // Bool checkbox changes
             if (HIWORD(wParam) == BN_CLICKED && LOWORD(wParam) >= kTSLDynBase) {
-                if (!rebuildingUI_) FlushParamsJson();
+                if (auto it = states_.find(hWnd); it != states_.end() && !it->second.rebuildingUI) {
+                    FlushParamsJson(hWnd, it->second);
+                }
                 return TRUE;
             }
             break;
@@ -1801,85 +1816,87 @@ static ThreeJSTSLTexClassDesc tslTexDesc;
 
 class ThreeJSTSLTexDlgProc : public ParamMap2UserDlgProc {
 public:
-    std::vector<TSLParamDef> dynParams_;
-    std::vector<ISpinnerControl*> dynSpinners_;
-    std::vector<IColorSwatch*> dynSwatches_;
-    HWND dlgHwnd_ = nullptr;
-    IParamBlock2* pb_ = nullptr;
-    bool rebuildingUI_ = false;
+    struct DialogState {
+        std::vector<TSLParamDef> dynParams;
+        std::vector<ISpinnerControl*> dynSpinners;
+        std::vector<IColorSwatch*> dynSwatches;
+        IParamBlock2* pb = nullptr;
+        bool rebuildingUI = false;
+    };
+
+    std::unordered_map<HWND, DialogState> states_;
 
     // Use offset base to avoid collisions with TSL Material's dynamic IDs
     static constexpr int kBase = 9200;
 
-    void DestroyDynamicControls() {
-        for (auto* sp : dynSpinners_) if (sp) ReleaseISpinner(sp);
-        dynSpinners_.clear();
-        for (auto* sw : dynSwatches_) if (sw) sw->SetModal();
-        dynSwatches_.clear();
-        if (!dlgHwnd_) return;
+    void DestroyDynamicControls(HWND dlgHwnd, DialogState& state) {
+        for (auto* sp : state.dynSpinners) if (sp) ReleaseISpinner(sp);
+        state.dynSpinners.clear();
+        for (auto* sw : state.dynSwatches) if (sw) sw->SetModal();
+        state.dynSwatches.clear();
         for (int i = 0; i < 16; ++i)
             for (int j = 0; j < 3; ++j) {
-                HWND h = GetDlgItem(dlgHwnd_, kBase + i * 3 + j);
+                HWND h = GetDlgItem(dlgHwnd, kBase + i * 3 + j);
                 if (h) DestroyWindow(h);
             }
     }
 
-    void RebuildDynamicControls(const std::wstring& code) {
-        rebuildingUI_ = true;
-        DestroyDynamicControls();
-        dynParams_ = ParseTSLParams(code);
-        if (dynParams_.empty()) { rebuildingUI_ = false; return; }
+    void RebuildDynamicControls(HWND dlgHwnd, DialogState& state, const std::wstring& code) {
+        state.rebuildingUI = true;
+        DestroyDynamicControls(dlgHwnd, state);
+        state.dynParams = ParseTSLParams(code);
+        if (state.dynParams.empty()) { state.rebuildingUI = false; return; }
 
-        if (pb_) {
-            const MCHAR* stored = pb_->GetStr(ptsl_tex_params_json);
-            if (stored && stored[0]) LoadParamsFromJson(stored, dynParams_);
+        if (state.pb) {
+            const MCHAR* stored = state.pb->GetStr(ptsl_tex_params_json);
+            if (stored && stored[0]) LoadParamsFromJson(stored, state.dynParams);
         }
 
-        HWND groupBox = GetDlgItem(dlgHwnd_, IDC_TSL_TEX_DYN_GROUP);
+        HWND groupBox = GetDlgItem(dlgHwnd, IDC_TSL_TEX_DYN_GROUP);
         RECT groupRect = {};
         if (groupBox) {
             GetWindowRect(groupBox, &groupRect);
-            MapWindowPoints(HWND_DESKTOP, dlgHwnd_, reinterpret_cast<POINT*>(&groupRect), 2);
+            MapWindowPoints(HWND_DESKTOP, dlgHwnd, reinterpret_cast<POINT*>(&groupRect), 2);
         } else {
             groupRect.left = 4; groupRect.top = 160; groupRect.right = 166;
         }
 
-        HINSTANCE hInst = (HINSTANCE)GetWindowLongPtr(dlgHwnd_, GWLP_HINSTANCE);
+        HINSTANCE hInst = (HINSTANCE)GetWindowLongPtr(dlgHwnd, GWLP_HINSTANCE);
         int yPos = groupRect.top + 16;
         const int labelW = 60, editW = 54, spinW = 10, swatchW = 90;
         const int ctrlH = 16, rowH = 26;
 
-        for (int i = 0; i < static_cast<int>(dynParams_.size()); ++i) {
-            auto& p = dynParams_[i];
+        for (int i = 0; i < static_cast<int>(state.dynParams.size()); ++i) {
+            auto& p = state.dynParams[i];
             int baseId = kBase + i * 3;
 
             CreateWindowW(L"STATIC", p.name.c_str(),
                 WS_CHILD | WS_VISIBLE | SS_LEFT,
                 8, yPos + 2, labelW, ctrlH,
-                dlgHwnd_, (HMENU)(INT_PTR)(baseId + 0), hInst, nullptr);
+                dlgHwnd, (HMENU)(INT_PTR)(baseId + 0), hInst, nullptr);
 
             if (p.type == TSLParamType::Float) {
                 HWND hEdit = CreateWindowW(L"CustEdit", L"",
                     WS_CHILD | WS_VISIBLE | WS_TABSTOP,
                     8 + labelW + 4, yPos, editW, ctrlH,
-                    dlgHwnd_, (HMENU)(INT_PTR)(baseId + 1), hInst, nullptr);
+                    dlgHwnd, (HMENU)(INT_PTR)(baseId + 1), hInst, nullptr);
                 HWND hSpin = CreateWindowW(SPINNERWINDOWCLASS, L"",
                     WS_CHILD | WS_VISIBLE,
                     8 + labelW + 4 + editW, yPos, spinW, ctrlH,
-                    dlgHwnd_, (HMENU)(INT_PTR)(baseId + 2), hInst, nullptr);
+                    dlgHwnd, (HMENU)(INT_PTR)(baseId + 2), hInst, nullptr);
                 ISpinnerControl* sp = GetISpinner(hSpin);
                 if (sp) {
                     sp->LinkToEdit(hEdit, EDITTYPE_FLOAT);
                     sp->SetLimits(p.floatMin, p.floatMax, FALSE);
                     sp->SetValue(p.floatVal, FALSE);
                     sp->SetAutoScale();
-                    dynSpinners_.push_back(sp);
+                    state.dynSpinners.push_back(sp);
                 }
             } else if (p.type == TSLParamType::Color) {
                 HWND hSwatch = CreateWindowW(COLORSWATCHWINDOWCLASS, L"",
                     WS_CHILD | WS_VISIBLE,
                     8 + labelW + 4, yPos, swatchW, ctrlH,
-                    dlgHwnd_, (HMENU)(INT_PTR)(baseId + 2), hInst, nullptr);
+                    dlgHwnd, (HMENU)(INT_PTR)(baseId + 2), hInst, nullptr);
                 IColorSwatch* cs = GetIColorSwatch(hSwatch);
                 if (cs) {
                     COLORREF cr = RGB(
@@ -1887,43 +1904,42 @@ public:
                         static_cast<int>(p.color[1] * 255.0f),
                         static_cast<int>(p.color[2] * 255.0f));
                     cs->SetColor(cr);
-                    dynSwatches_.push_back(cs);
+                    state.dynSwatches.push_back(cs);
                 }
             } else if (p.type == TSLParamType::Bool) {
                 CreateWindowW(L"Button", p.name.c_str(),
                     WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX | WS_TABSTOP,
                     8 + labelW + 4, yPos, swatchW, ctrlH,
-                    dlgHwnd_, (HMENU)(INT_PTR)(baseId + 2), hInst, nullptr);
-                HWND hChk = GetDlgItem(dlgHwnd_, baseId + 2);
-                if (hChk) CheckDlgButton(dlgHwnd_, baseId + 2, p.boolVal ? BST_CHECKED : BST_UNCHECKED);
+                    dlgHwnd, (HMENU)(INT_PTR)(baseId + 2), hInst, nullptr);
+                HWND hChk = GetDlgItem(dlgHwnd, baseId + 2);
+                if (hChk) CheckDlgButton(dlgHwnd, baseId + 2, p.boolVal ? BST_CHECKED : BST_UNCHECKED);
             }
             yPos += rowH;
         }
-        FlushParamsJson();
-        rebuildingUI_ = false;
+        FlushParamsJson(dlgHwnd, state);
+        state.rebuildingUI = false;
     }
 
-    void FlushParamsJson() {
+    void FlushParamsJson(HWND dlgHwnd, DialogState& state) {
         int spinIdx = 0, swatchIdx = 0;
-        for (size_t pi = 0; pi < dynParams_.size(); ++pi) {
-            auto& p = dynParams_[pi];
-            if (p.type == TSLParamType::Float && spinIdx < static_cast<int>(dynSpinners_.size())) {
-                p.floatVal = dynSpinners_[spinIdx++]->GetFVal();
-            } else if (p.type == TSLParamType::Color && swatchIdx < static_cast<int>(dynSwatches_.size())) {
-                COLORREF cr = dynSwatches_[swatchIdx++]->GetColor();
+        for (size_t pi = 0; pi < state.dynParams.size(); ++pi) {
+            auto& p = state.dynParams[pi];
+            if (p.type == TSLParamType::Float && spinIdx < static_cast<int>(state.dynSpinners.size())) {
+                p.floatVal = state.dynSpinners[spinIdx++]->GetFVal();
+            } else if (p.type == TSLParamType::Color && swatchIdx < static_cast<int>(state.dynSwatches.size())) {
+                COLORREF cr = state.dynSwatches[swatchIdx++]->GetColor();
                 p.color[0] = GetRValue(cr) / 255.0f;
                 p.color[1] = GetGValue(cr) / 255.0f;
                 p.color[2] = GetBValue(cr) / 255.0f;
             } else if (p.type == TSLParamType::Bool) {
-                HWND hChk = GetDlgItem(dlgHwnd_, kBase + static_cast<int>(pi) * 3 + 2);
-                if (hChk) p.boolVal = (IsDlgButtonChecked(dlgHwnd_, kBase + static_cast<int>(pi) * 3 + 2) == BST_CHECKED);
+                HWND hChk = GetDlgItem(dlgHwnd, kBase + static_cast<int>(pi) * 3 + 2);
+                if (hChk) p.boolVal = (IsDlgButtonChecked(dlgHwnd, kBase + static_cast<int>(pi) * 3 + 2) == BST_CHECKED);
             }
         }
-        if (pb_) {
-            std::wstring json = BuildParamsJson(dynParams_);
-            pb_->SetValue(ptsl_tex_params_json, 0, json.c_str());
-            // pb->SetValue already propagates REFMSG_CHANGE through the reference chain.
-            // Do NOT call NotifyDependents here — it causes a feedback loop with MaxJS polling.
+        if (state.pb) {
+            std::wstring json = BuildParamsJson(state.dynParams);
+            state.pb->SetValue(ptsl_tex_params_json, 0, json.c_str());
+            MaxJSNotifyMaterialEdited();
         }
     }
 
@@ -1931,27 +1947,32 @@ public:
         IParamBlock2* pb = map ? map->GetParamBlock() : nullptr;
         switch (msg) {
         case WM_INITDIALOG: {
-            dlgHwnd_ = hWnd;
-            pb_ = pb;
+            DialogState& state = states_[hWnd];
+            state.pb = pb;
             if (pb) {
                 const MCHAR* code = pb->GetStr(ptsl_tex_code);
                 if (code && code[0]) {
                     SetDlgItemText(hWnd, IDC_TSL_TEX_CODE_EDIT, code);
-                    RebuildDynamicControls(code);
+                    RebuildDynamicControls(hWnd, state, code);
                 }
             }
             return TRUE;
         }
         case WM_DESTROY:
-            DestroyDynamicControls();
-            dlgHwnd_ = nullptr;
-            pb_ = nullptr;
+            if (auto it = states_.find(hWnd); it != states_.end()) {
+                DestroyDynamicControls(hWnd, it->second);
+                states_.erase(it);
+            }
             return TRUE;
         case CC_SPINNER_CHANGE:
-            if (!rebuildingUI_) FlushParamsJson();
+            if (auto it = states_.find(hWnd); it != states_.end() && !it->second.rebuildingUI) {
+                FlushParamsJson(hWnd, it->second);
+            }
             return TRUE;
         case CC_COLOR_CHANGE:
-            if (!rebuildingUI_) FlushParamsJson();
+            if (auto it = states_.find(hWnd); it != states_.end() && !it->second.rebuildingUI) {
+                FlushParamsJson(hWnd, it->second);
+            }
             return TRUE;
         case WM_COMMAND:
             if (LOWORD(wParam) == IDC_TSL_TEX_LOAD_BTN && HIWORD(wParam) == BN_CLICKED) {
@@ -1977,10 +1998,15 @@ public:
                             std::wstring wCode(wLen, L'\0');
                             MultiByteToWideChar(CP_UTF8, 0, buf.data(), (int)buf.size(), wCode.data(), wLen);
                             SetDlgItemText(hWnd, IDC_TSL_TEX_CODE_EDIT, wCode.c_str());
-                            if (pb) pb->SetValue(ptsl_tex_code, 0, wCode.c_str());
+                            if (pb) {
+                                pb->SetValue(ptsl_tex_code, 0, wCode.c_str());
+                                MaxJSNotifyMaterialEdited();
+                            }
                             const wchar_t* fname = wcsrchr(filePath, L'\\');
                             SetDlgItemText(hWnd, IDC_TSL_TEX_FILE_LABEL, fname ? fname + 1 : filePath);
-                            RebuildDynamicControls(wCode);
+                            if (auto it = states_.find(hWnd); it != states_.end()) {
+                                RebuildDynamicControls(hWnd, it->second, wCode);
+                            }
                         }
                         CloseHandle(hFile);
                     }
@@ -1992,8 +2018,13 @@ public:
                 std::wstring text(static_cast<size_t>(len) + 1, L'\0');
                 int copied = GetDlgItemText(hWnd, IDC_TSL_TEX_CODE_EDIT, text.data(), len + 1);
                 if (copied >= 0) text.resize(static_cast<size_t>(copied)); else text.clear();
-                if (pb) pb->SetValue(ptsl_tex_code, 0, text.c_str());
-                RebuildDynamicControls(text);
+                if (pb) {
+                    pb->SetValue(ptsl_tex_code, 0, text.c_str());
+                    MaxJSNotifyMaterialEdited();
+                }
+                if (auto it = states_.find(hWnd); it != states_.end()) {
+                    RebuildDynamicControls(hWnd, it->second, text);
+                }
                 return TRUE;
             }
             if (LOWORD(wParam) == IDC_TSL_TEX_CODE_EDIT && HIWORD(wParam) == EN_CHANGE) {
@@ -2001,11 +2032,16 @@ public:
                 std::wstring text(static_cast<size_t>(len) + 1, L'\0');
                 int copied = GetDlgItemText(hWnd, IDC_TSL_TEX_CODE_EDIT, text.data(), len + 1);
                 if (copied >= 0) text.resize(static_cast<size_t>(copied)); else text.clear();
-                if (pb) pb->SetValue(ptsl_tex_code, 0, text.c_str());
+                if (pb) {
+                    pb->SetValue(ptsl_tex_code, 0, text.c_str());
+                    MaxJSNotifyMaterialEdited();
+                }
                 return TRUE;
             }
             if (HIWORD(wParam) == BN_CLICKED && LOWORD(wParam) >= kBase) {
-                if (!rebuildingUI_) FlushParamsJson();
+                if (auto it = states_.find(hWnd); it != states_.end() && !it->second.rebuildingUI) {
+                    FlushParamsJson(hWnd, it->second);
+                }
                 return TRUE;
             }
             break;

@@ -86,6 +86,7 @@ HINSTANCE hInstance = nullptr;
 
 class MaxJSPanel;
 static MaxJSPanel* g_panel = nullptr;
+void MaxJSNotifyMaterialEdited();
 static HWND g_helperHwnd = nullptr;
 
 // Forward — used by renderer's ActiveShade
@@ -4271,7 +4272,8 @@ static uint64_t ComputeSyncRelevantNodeStateHash(INode* node, TimeValue t) {
     if (Mtl* mtl = node->GetMtl()) {
         const Class_ID mtlClass = mtl->ClassID();
         h = HashFNV1a(&mtlClass, sizeof(mtlClass), h);
-        h = HashIntervalState(mtl->Validity(t), h);
+        // Material validity can flap from editor-preview churn. Actual material changes
+        // are tracked through the dedicated material sync paths instead.
     }
 
     return h;
@@ -5619,6 +5621,8 @@ public:
     bool fastFlushPosted_ = false;
     bool haveLastSentCamera_ = false;
     ULONGLONG dirtyStamp_ = 0;   // when dirty_ was last set (for debounce)
+    ULONGLONG lastMaterialInteractionTick_ = 0;
+    ULONGLONG lastMaterialLivePollTick_ = 0;
     CameraData lastSentCamera_ = {};
     ULONG lockedCameraHandle_ = 0;  // 0 = viewport (default), nonzero = scene camera handle
     SceneEventNamespace::CallbackKey fastNodeEventCallbackKey_ = 0;
@@ -8674,6 +8678,14 @@ public:
 
     void CheckTrackedMaterialScalarsLive() {
         if (geomHandles_.empty()) return;
+        if (!ShouldRunInteractiveMaterialChecks()) return;
+
+        const ULONGLONG now = GetTickCount64();
+        if (lastMaterialLivePollTick_ != 0 &&
+            (now - lastMaterialLivePollTick_) < kMaterialLivePollIntervalMs) {
+            return;
+        }
+        lastMaterialLivePollTick_ = now;
 
         Interface* ip = GetCOREInterface();
         if (!ip) return;
@@ -8753,10 +8765,17 @@ public:
     }
 
     static constexpr ULONGLONG kInteractiveCooldownMs = 250;
+    static constexpr ULONGLONG kMaterialInteractiveCooldownMs = 400;
+    static constexpr ULONGLONG kMaterialLivePollIntervalMs = 50;
     static constexpr size_t kMaxFastFlushHandlesPerPass = 128;
 
     void MarkInteractiveActivity() {
         lastInteractionTick_ = GetTickCount64();
+    }
+
+    void MarkMaterialInteractiveActivity() {
+        lastMaterialInteractionTick_ = GetTickCount64();
+        MarkInteractiveActivity();
     }
 
     bool IsAnimationPlaying() const {
@@ -8778,6 +8797,12 @@ public:
         if (IsAnimationPlaying()) return true;
         const ULONGLONG now = GetTickCount64();
         return lastInteractionTick_ != 0 && (now - lastInteractionTick_) <= kInteractiveCooldownMs;
+    }
+
+    bool ShouldRunInteractiveMaterialChecks() const {
+        const ULONGLONG now = GetTickCount64();
+        return lastMaterialInteractionTick_ != 0 &&
+               (now - lastMaterialInteractionTick_) <= kMaterialInteractiveCooldownMs;
     }
 
     bool IsCreateTaskActive() const {
@@ -12728,6 +12753,10 @@ static void RequestGlobalPanelKill() {
         return;
     }
     KillPanel();
+}
+
+void MaxJSNotifyMaterialEdited() {
+    if (g_panel) g_panel->MarkMaterialInteractiveActivity();
 }
 
 void TogglePanel() {

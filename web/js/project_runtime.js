@@ -95,6 +95,7 @@ function deriveProjectName(projectDir) {
 export function createProjectRuntime({ layerManager, bridge, perfHud }) {
     let projectDir = '';
     let projectRootUrl = '';
+    let manifestBaseUrl = '';
     let inlineDir = '';
     let pollMs = 0;
     let sceneSaved = false;
@@ -271,6 +272,7 @@ export function createProjectRuntime({ layerManager, bridge, perfHud }) {
             const manifest = JSON.parse(manifestText);
             lastManifestText = manifestText;
             manifestState = manifest;
+            manifestBaseUrl = new URL('./', manifestUrl).toString();
             manifestExists = true;
             emitChange();
             return manifest;
@@ -314,11 +316,18 @@ export function createProjectRuntime({ layerManager, bridge, perfHud }) {
         const layerId = entry.id;
         const entryPath = entry.entryPath;
         const moduleVersion = ++revision;
+        const baseUrl = manifestBaseUrl || projectRootUrl;
         const moduleUrl = isAbsolutePath(entryPath)
             ? `${toAssetUrl(entryPath)}?v=${moduleVersion}`
-            : projectUrl(projectRootUrl, entryPath, `${moduleVersion}`);
+            : projectUrl(baseUrl, entryPath, `${moduleVersion}`);
 
-        const moduleNamespace = await import(moduleUrl);
+        let moduleNamespace;
+        try {
+            moduleNamespace = await import(moduleUrl);
+        } catch (error) {
+            const detail = error?.message || String(error);
+            throw new Error(`layer import failed: ${layerId} (${entryPath}) -> ${detail}`);
+        }
         const factory = resolveFactory(moduleNamespace);
 
         const result = await layerManager.mount(
@@ -624,6 +633,7 @@ export function createProjectRuntime({ layerManager, bridge, perfHud }) {
         }
 
         manifestState = null;
+        manifestBaseUrl = '';
         postFxState = null;
         lastManifestText = '';
         lastPostFxText = '';
@@ -694,6 +704,7 @@ export function createProjectRuntime({ layerManager, bridge, perfHud }) {
             lastManifestText = '';
             projectDir = '';
             projectRootUrl = '';
+            manifestBaseUrl = '';
             inlineDir = '';
             sceneSaved = false;
             manifestExists = false;

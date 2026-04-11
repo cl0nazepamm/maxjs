@@ -602,6 +602,13 @@ static const wchar_t* GetMimeTypeForPath(const std::wstring& path) {
     if (_wcsicmp(ext, L".flac") == 0) return L"audio/flac";
     if (_wcsicmp(ext, L".json") == 0) return L"application/json";
     if (_wcsicmp(ext, L".bin") == 0) return L"application/octet-stream";
+    // ES module dynamic import() requires a JavaScript MIME type (not octet-stream).
+    if (_wcsicmp(ext, L".js") == 0 || _wcsicmp(ext, L".mjs") == 0 || _wcsicmp(ext, L".cjs") == 0) {
+        return L"text/javascript";
+    }
+    if (_wcsicmp(ext, L".css") == 0) return L"text/css";
+    if (_wcsicmp(ext, L".svg") == 0) return L"image/svg+xml";
+    if (_wcsicmp(ext, L".wasm") == 0) return L"application/wasm";
     return L"application/octet-stream";
 }
 
@@ -5684,10 +5691,14 @@ public:
         return projectDir + L"\\inlines\\";
     }
 
+    std::wstring GetInlineHotLayerDir() {
+        return GetLegacyInlineLayerDir();
+    }
+
     void SendInlineLayersState(bool force = false) {
         if (!webview_ || !jsReady_) return;
 
-        const std::wstring dir = GetInlineLayerDir();
+        const std::wstring dir = GetInlineHotLayerDir();
         std::vector<std::pair<std::wstring, bool>> layers;
 
         if (!dir.empty() && DirectoryExists(dir)) {
@@ -5737,7 +5748,7 @@ public:
     void ScanInlineLayers() {
         if (!webview_ || !jsReady_) return;
 
-        const std::wstring dir = GetInlineLayerDir();
+        const std::wstring dir = GetInlineHotLayerDir();
         // Track which enabled layer files still exist this scan
         std::unordered_set<std::wstring> seenEnabled;
 
@@ -8116,6 +8127,33 @@ public:
             return false;
         }
 
+        const std::wstring projectManifestPath = GetProjectManifestPath();
+        if (!projectManifestPath.empty() && FileExists(projectManifestPath)) {
+            if (!CopyFileEnsuringDirectories(projectManifestPath, outDir + L"\\project.maxjs.json")) {
+                error = L"Failed to copy project.maxjs.json into snapshot";
+                cleanupOnFail();
+                return false;
+            }
+        }
+
+        const std::wstring postFxPath = GetProjectPostFxPath();
+        if (!postFxPath.empty() && FileExists(postFxPath)) {
+            if (!CopyFileEnsuringDirectories(postFxPath, outDir + L"\\postfx.maxjs.json")) {
+                error = L"Failed to copy postfx.maxjs.json into snapshot";
+                cleanupOnFail();
+                return false;
+            }
+        }
+
+        const std::wstring inlineDir = GetInlineLayerDir();
+        if (!inlineDir.empty() && DirectoryExists(inlineDir)) {
+            if (!CopyDirectoryRecursive(inlineDir, outDir + L"\\inlines")) {
+                error = L"Failed to copy inlines into snapshot";
+                cleanupOnFail();
+                return false;
+            }
+        }
+
         return true;
     }
 
@@ -8169,7 +8207,7 @@ public:
         if (!webview_ || !jsReady_) return true;
 
         const std::wstring fileName = GetInlineLayerFileName(id, true);
-        const std::wstring filePath = GetInlineLayerDir() + fileName;
+        const std::wstring filePath = GetInlineHotLayerDir() + fileName;
         std::wstring code = ReadUtf8File(filePath);
         if (code.empty()) {
             error = L"Inline layer file is empty or unreadable";
@@ -8331,7 +8369,7 @@ public:
     }
 
     bool RemoveInlineLayerFile(const std::wstring& id, std::wstring& error) {
-        const std::wstring dir = GetInlineLayerDir();
+        const std::wstring dir = GetInlineHotLayerDir();
         if (dir.empty() || !DirectoryExists(dir)) {
             error = L"Scene-local inline folder is not available";
             return false;
@@ -8368,7 +8406,7 @@ public:
     }
 
     bool SetInlineLayerEnabled(const std::wstring& id, bool enabled, std::wstring& error) {
-        const std::wstring dir = GetInlineLayerDir();
+        const std::wstring dir = GetInlineHotLayerDir();
         if (dir.empty() || !DirectoryExists(dir)) {
             error = L"Scene-local inline folder is not available";
             return false;
@@ -8414,7 +8452,7 @@ public:
     }
 
     bool ClearInlineLayerFiles(std::wstring& error) {
-        const std::wstring dir = GetInlineLayerDir();
+        const std::wstring dir = GetInlineHotLayerDir();
         if (dir.empty() || !DirectoryExists(dir)) {
             inlineFileStamps_.clear();
             SendInlineLayerClear();

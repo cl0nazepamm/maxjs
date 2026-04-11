@@ -7699,6 +7699,77 @@
                 }
                 handleBinaryScene(buffer, meta);
                 if (meta.runtimeScene) {
+                    function resolveSnapshotLayerFactory(moduleNamespace) {
+                        const directHooks = ['init', 'update', 'dispose'].some(key => typeof moduleNamespace?.[key] === 'function');
+                        if (directHooks) return async () => moduleNamespace;
+
+                        const candidate = moduleNamespace?.default
+                            ?? moduleNamespace?.createLayer
+                            ?? moduleNamespace?.mount;
+
+                        if (typeof candidate === 'function') return candidate;
+                        if (candidate && typeof candidate === 'object') return async () => candidate;
+
+                        throw new Error('Snapshot layer module must export default/createLayer/mount or layer hooks');
+                    }
+
+                    function buildSnapshotManifestLayers(manifest) {
+                        const rawLayers = Array.isArray(manifest?.layers) ? manifest.layers : [];
+                        return rawLayers.map((entry, index) => ({
+                            id: entry?.id || entry?.name || `layer_${index}`,
+                            name: entry?.name || entry?.id || `layer_${index}`,
+                            entryPath: entry?.entry || entry?.path || 'main.js',
+                            enabled: entry?.enabled !== false,
+                        }));
+                    }
+
+                    async function tryReplaySnapshotProjectLayers() {
+                        let manifest;
+                        let manifestUrl;
+                        try {
+                            manifestUrl = new URL('./project.maxjs.json', window.location.href);
+                            const response = await fetch(manifestUrl, { cache: 'no-store' });
+                            if (!response.ok) return false;
+                            manifest = await response.json();
+                        } catch {
+                            return false;
+                        }
+
+                        const manifestBaseUrl = new URL('./', manifestUrl);
+                        const enabledLayers = buildSnapshotManifestLayers(manifest).filter(entry => entry.enabled);
+                        if (enabledLayers.length === 0) return false;
+
+                        const mountedIds = [];
+                        try {
+                            for (const entry of enabledLayers) {
+                                const moduleUrl = new URL(entry.entryPath.replace(/\\/g, '/'), manifestBaseUrl);
+                                moduleUrl.searchParams.set('v', `${Date.now()}_${entry.id}`);
+                                const moduleNamespace = await import(moduleUrl.toString());
+                                const factory = resolveSnapshotLayerFactory(moduleNamespace);
+                                const result = await layerManager.mount(
+                                    entry.id,
+                                    async (ctx, THREE) => factory(ctx, THREE, { manifest, layer: entry }),
+                                    {
+                                        name: entry.name || entry.id,
+                                        code: moduleUrl.toString(),
+                                        source: 'project',
+                                        entry: entry.entryPath,
+                                    },
+                                );
+                                if (result?.error) throw new Error(result.error);
+                                mountedIds.push(entry.id);
+                            }
+                            return true;
+                        } catch (error) {
+                            console.warn('[MaxJS snapshot] project layer replay failed; falling back to baked runtimeScene', error);
+                            for (const id of mountedIds) {
+                                try { layerManager.remove(id); } catch {}
+                            }
+                            return false;
+                        }
+                    }
+
+                    const replayedProjectLayers = await tryReplaySnapshotProjectLayers();
                     // Snapshot runtime trees are plain Object3D JSON, not node-material graphs.
                     // Prefer the standard ObjectLoader here; NodeObjectLoader can reject this payload.
                     const LoaderCtor = THREE_STD.ObjectLoader || THREE.ObjectLoader || THREE.NodeObjectLoader;
@@ -7740,7 +7811,7 @@
                         }
                         return objectLoader.parse(json);
                     }
-                    if (meta.runtimeScene.jsRoot) {
+                    if (!replayedProjectLayers && meta.runtimeScene.jsRoot) {
                         try {
                             const jsSnapshotRoot = await parseRuntimeSubtree(meta.runtimeScene.jsRoot);
                             if (jsSnapshotRoot?.isObject3D) {
@@ -7772,7 +7843,7 @@
                             console.warn('[MaxJS snapshot] runtimeScene.jsRoot parse failed (non-fatal)', err);
                         }
                     }
-                    if (meta.runtimeScene.overlayRoot) {
+                    if (!replayedProjectLayers && meta.runtimeScene.overlayRoot) {
                         try {
                             const overlaySnapshotRoot = await parseRuntimeSubtree(meta.runtimeScene.overlayRoot);
                             if (overlaySnapshotRoot?.isObject3D) {

@@ -1,65 +1,59 @@
 @echo off
 setlocal
 
-set NATIVE_DIR=%~dp0
-set CMAKE="C:\Program Files\CMake\bin\cmake.exe"
+for %%I in ("%~dp0.") do set "ROOT=%%~fI"
+set "BUILD_DIR=%ROOT%\build"
+set "CMAKE_EXE=cmake"
+if exist "C:\Program Files\CMake\bin\cmake.exe" set "CMAKE_EXE=C:\Program Files\CMake\bin\cmake.exe"
 
-:: Ensure WebView2 SDK is present
-call "%NATIVE_DIR%setup_webview2.bat"
-if %ERRORLEVEL% NEQ 0 goto :fail
+call "%ROOT%\setup_webview2.bat"
+if errorlevel 1 goto :fail
 
-:: Configure if needed
-if not exist "%NATIVE_DIR%build\CMakeCache.txt" (
-    echo [1/4] Configuring...
-    %CMAKE% -B "%NATIVE_DIR%build" -G "Visual Studio 17 2022" -A x64 "%NATIVE_DIR%"
-    if %ERRORLEVEL% NEQ 0 goto :fail
-)
+echo [1/4] Configuring...
+"%CMAKE_EXE%" -S "%ROOT%" -B "%BUILD_DIR%" -G "Visual Studio 17 2022" -A x64
+if errorlevel 1 goto :fail
 
-:: Build
 echo [2/4] Building...
-%CMAKE% --build "%NATIVE_DIR%build" --config Release
-if %ERRORLEVEL% NEQ 0 goto :fail
+"%CMAKE_EXE%" --build "%BUILD_DIR%" --config Release --target maxjs
+if errorlevel 1 goto :fail
 
-:: Read plugin name and type from CMakeCache
-for /f "tokens=2 delims==" %%a in ('findstr "PLUGIN_NAME:INTERNAL" "%NATIVE_DIR%build\CMakeCache.txt"') do set PNAME=%%a
-for /f "tokens=2 delims==" %%a in ('findstr "PLUGIN_TYPE:INTERNAL" "%NATIVE_DIR%build\CMakeCache.txt"') do set PTYPE=%%a
-
-:: Fallback
-if "%PNAME%"=="" set PNAME=maxjs
-if "%PTYPE%"=="" set PTYPE=gup
-
-set PLUGIN_FILE=%PNAME%.%PTYPE%
-set PLUGIN_SRC=%NATIVE_DIR%build\Release\%PLUGIN_FILE%
-set PLUGIN_DST=C:\Program Files\Autodesk\3ds Max 2026\plugins\%PLUGIN_FILE%
-set WEB_DST=C:\Program Files\Autodesk\3ds Max 2026\plugins\maxjs_web
-
-:: Deploy plugin
-echo [3/4] Deploying %PLUGIN_FILE%...
-copy /Y "%PLUGIN_SRC%" "%PLUGIN_DST%"
-if %ERRORLEVEL% NEQ 0 (
-    echo Deploy failed - retrying as Administrator...
-    powershell -Command "Start-Process cmd -ArgumentList '/c copy /Y \"%PLUGIN_SRC%\" \"%PLUGIN_DST%\" && xcopy /Y /E /I \"%NATIVE_DIR%web\" \"%WEB_DST%\" && echo SUCCESS && pause' -Verb RunAs"
+if /I "%MAXJS_SKIP_DEPLOY%"=="1" (
+    echo.
+    echo Build complete. Deployment skipped because MAXJS_SKIP_DEPLOY=1.
     goto :done
 )
 
-:: Deploy web files
-echo [4/4] Deploying web files...
-xcopy /Y /E /I "%NATIVE_DIR%web" "%WEB_DST%"
-if %ERRORLEVEL% NEQ 0 (
-    echo Web deploy failed - retrying as Administrator...
-    powershell -Command "Start-Process cmd -ArgumentList '/c xcopy /Y /E /I \"%NATIVE_DIR%web\" \"%WEB_DST%\" && echo SUCCESS && pause' -Verb RunAs"
-    goto :done
-)
+set "PLUGIN_NAME=maxjs"
+set "PLUGIN_TYPE=gup"
+for /f "tokens=2 delims==" %%a in ('findstr "PLUGIN_NAME:INTERNAL" "%BUILD_DIR%\CMakeCache.txt"') do set "PLUGIN_NAME=%%a"
+for /f "tokens=2 delims==" %%a in ('findstr "PLUGIN_TYPE:INTERNAL" "%BUILD_DIR%\CMakeCache.txt"') do set "PLUGIN_TYPE=%%a"
+
+set "PLUGIN_FILE=%PLUGIN_NAME%.%PLUGIN_TYPE%"
+set "PLUGIN_SRC=%BUILD_DIR%\Release\%PLUGIN_FILE%"
+set "PLUGIN_DST=C:\Program Files\Autodesk\3ds Max 2026\plugins\%PLUGIN_FILE%"
+set "WEB_DST=C:\Program Files\Autodesk\3ds Max 2026\plugins\maxjs_web"
+
+echo [3/4] Deploying plugin...
+powershell -NoProfile -ExecutionPolicy Bypass -Command "Copy-Item -Force '%PLUGIN_SRC%' '%PLUGIN_DST%'" >nul
+if errorlevel 1 goto :deploy_fail
+
+echo [4/4] Deploying web runtime...
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$dst='%WEB_DST%'; New-Item -ItemType Directory -Force -Path $dst | Out-Null; Copy-Item -Recurse -Force '%ROOT%\web\*' $dst" >nul
+if errorlevel 1 goto :deploy_fail
 
 echo.
-echo === Done! Restart 3ds Max to load %PLUGIN_FILE% ===
+echo Done. Restart 3ds Max to load %PLUGIN_FILE%.
 goto :done
+
+:deploy_fail
+echo.
+echo Deployment failed. Run install.bat to retry with elevation.
+exit /b 1
 
 :fail
 echo.
-echo === BUILD FAILED ===
-pause
+echo Build failed.
 exit /b 1
 
 :done
-pause
+exit /b 0

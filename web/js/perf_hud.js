@@ -136,5 +136,11 @@ export function createPerfHud(infoEl) {
         isDebugEnabled() {
             return debugEnabled;
         },
+        getState() {
+            return {
+                ...state,
+                debugEnabled,
+            };
+        },
     };
 }

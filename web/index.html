@@ -777,6 +777,7 @@
 <body>
     <div id="hud">
         <div id="info">MaxJS Live — hot reload works!</div>
+        <pre id="debugConsole" style="display:none;margin:6px 0 0 0;max-width:min(860px,92vw);max-height:40vh;overflow:auto;padding:8px 10px;border:1px solid rgba(255,255,255,0.12);background:rgba(0,0,0,0.72);color:#cfcfcf;font:11px/1.35 'Fira Code','Consolas',monospace;white-space:pre-wrap;word-break:break-word;"></pre>
         <div id="controls">
             <div style="position:relative;display:inline-block;">
                 <button id="btnHamburger">&#9776;</button>
@@ -826,16 +827,16 @@
     <script type="importmap">
     {
         "imports": {
-            "three": "https://cdn.jsdelivr.net/npm/three@0.183.2/build/three.webgpu.js",
-            "three-std": "https://cdn.jsdelivr.net/npm/three@0.183.2/build/three.module.js",
-            "three/webgpu": "https://cdn.jsdelivr.net/npm/three@0.183.2/build/three.webgpu.js",
-            "three/tsl": "https://cdn.jsdelivr.net/npm/three@0.183.2/build/three.tsl.js",
-            "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.183.2/examples/jsm/",
+            "three": "./vendor/three-r183.2/build/three.webgpu.js",
+            "three-std": "./vendor/three-r183.2/build/three.module.js",
+            "three/webgpu": "./vendor/three-r183.2/build/three.webgpu.js",
+            "three/tsl": "./vendor/three-r183.2/build/three.tsl.js",
+            "three/addons/": "./vendor/three-r183.2/examples/jsm/",
             "@sparkjsdev/spark": "./node_modules/@sparkjsdev/spark/dist/spark.module.js"
         },
         "scopes": {
             "./node_modules/@sparkjsdev/spark/": {
-                "three": "https://cdn.jsdelivr.net/npm/three@0.183.2/build/three.module.js"
+                "three": "./vendor/three-r183.2/build/three.module.js"
             }
         }
     }
@@ -5435,6 +5436,7 @@
             includeSplats: true,
             includeAudios: true,
             includeInstances: true,
+            includeDebugPayload: false,
             includeSnapshotUi: true,
             includeRuntimeScene: true,
             copyAssets: true,
@@ -5463,6 +5465,10 @@
 
         function getSnapshotExportSettings() {
             const settings = sanitizeSnapshotSettings(snapshotSettings);
+            if (!settings.includeDebugPayload) {
+                settings.includeSnapshotUi = false;
+                settings.includeRuntimeScene = false;
+            }
             if (!settings.includeAnimations) {
                 settings.includeTransformAnimation = false;
                 settings.includeGeometryAnimation = false;
@@ -5553,11 +5559,12 @@
                             <label class="fx-check" for="snapshot-includeSplats"><span>Splats</span><input id="snapshot-includeSplats" type="checkbox"></label>
                             <label class="fx-check" for="snapshot-includeAudios"><span>Audio</span><input id="snapshot-includeAudios" type="checkbox"></label>
                             <label class="fx-check" for="snapshot-includeInstances"><span>Instances</span><input id="snapshot-includeInstances" type="checkbox"></label>
+                            <label class="fx-check" for="snapshot-includeDebugPayload"><span>Debug Payload</span><input id="snapshot-includeDebugPayload" type="checkbox"></label>
                             <label class="fx-check" for="snapshot-includeSnapshotUi"><span>Viewer UI State</span><input id="snapshot-includeSnapshotUi" type="checkbox"></label>
                             <label class="fx-check" for="snapshot-includeRuntimeScene"><span>JS Runtime Scene</span><input id="snapshot-includeRuntimeScene" type="checkbox"></label>
                             <label class="fx-check" for="snapshot-copyAssets"><span>Copy Assets</span><input id="snapshot-copyAssets" type="checkbox"></label>
                         </div>
-                        <div class="snapshot-note">Copy Assets should stay on for deployable snapshots. Turning it off preserves original URLs.</div>
+                        <div class="snapshot-note">Copy Assets should stay on for deployable snapshots. Debug Payload controls viewer UI, runtime scene, and debug-side snapshot extras.</div>
                     </section>
                     <section class="fx-section">
                         <div class="fx-section-header">
@@ -5629,11 +5636,16 @@
 
             const animationsEnabled = !!snapshotSettings.includeAnimations;
             const sceneNodesEnabled = !!snapshotSettings.includeSceneNodes;
+            const debugPayloadEnabled = !!snapshotSettings.includeDebugPayload;
             const animationKeys = ['includeTransformAnimation', 'includeGeometryAnimation', 'includeMaterialAnimation'];
             for (const key of animationKeys) {
                 const input = snapshotPanel.querySelector(`#snapshot-${key}`);
                 if (input) input.disabled = !animationsEnabled || !sceneNodesEnabled;
             }
+            const snapshotUiInput = snapshotPanel.querySelector('#snapshot-includeSnapshotUi');
+            if (snapshotUiInput) snapshotUiInput.disabled = !debugPayloadEnabled;
+            const runtimeSceneInput = snapshotPanel.querySelector('#snapshot-includeRuntimeScene');
+            if (runtimeSceneInput) runtimeSceneInput.disabled = !debugPayloadEnabled;
             const cameraInput = snapshotPanel.querySelector('#snapshot-includeCameraAnimation');
             if (cameraInput) cameraInput.disabled = !animationsEnabled;
             const stepInput = snapshotPanel.querySelector('#snapshot-animationSampleStepFrames');
@@ -5648,7 +5660,7 @@
             let runtimeSnapshotBase64 = '';
 
             if (settings.includeSnapshotUi) {
-                snapshotBase64 = toBase64Utf8(JSON.stringify(serializeSnapshotUiState()));
+                snapshotBase64 = toBase64Utf8(JSON.stringify(serializeSnapshotUiState({ includeDebug: settings.includeDebugPayload })));
             }
 
             if (settings.includeRuntimeScene) {
@@ -7026,8 +7038,8 @@
             }
         }
 
-        function serializeSnapshotUiState() {
-            return {
+        function serializeSnapshotUiState({ includeDebug = false } = {}) {
+            const payload = {
                 toneMapping: currentToneMapping,
                 exposure: currentExposure,
                 aaMode: currentAAMode,
@@ -7053,6 +7065,10 @@
                 },
                 ascii: { enabled: asciiActive, ...asciiSettings },
             };
+            if (includeDebug) {
+                payload.debug = buildDebugConsoleState();
+            }
+            return payload;
         }
 
         function serializePersistedPostFxState() {
@@ -7607,6 +7623,9 @@
                 }
             }
             perfHud.updateRender(performance.now() - renderStart, renderer.info?.render, renderer.info?.memory);
+            if (debugMode) {
+                syncDebugConsole(false);
+            }
             // Standalone / snapshot viewers have no bridge sync — drive the perf HUD from the render loop.
             if (!(window.chrome?.webview?.postMessage) && debugMode) {
                 standaloneHudFrame++;
@@ -8062,6 +8081,86 @@
         const DEBUG_STORAGE_KEY = 'maxjs_debug';
         let debugMode = (localStorage.getItem(DEBUG_STORAGE_KEY) ?? 'true') === 'true';
         perfHud.setDebugEnabled(debugMode);
+        const debugConsole = document.getElementById('debugConsole');
+        let lastDebugConsoleSignature = '';
+        let lastDebugConsolePaintMs = 0;
+
+        function buildDebugConsoleState() {
+            const perfState = typeof perfHud.getState === 'function' ? perfHud.getState() : null;
+            const layerStats = layerManager?.getStats?.() ?? null;
+            const layerRows = layerManager?.list?.().map(layer => ({
+                id: layer.id,
+                name: layer.name,
+                source: layer.source,
+                active: layer.active,
+                loading: layer.loading,
+                error: layer.error ?? null,
+                anchors: layer.anchors ?? 0,
+                tracked: layer.tracked ?? 0,
+                profile: layer.profile ?? null,
+            })) ?? [];
+            const projectState = _projectRuntimeRef?.getState?.() ?? null;
+            return {
+                buildMode,
+                debugMode,
+                standalone: isStandalone,
+                transportMode,
+                hasInitialSync,
+                latestAppliedSyncFrame,
+                renderer: {
+                    backend: rendererBackendLabel,
+                    toneMapping: currentToneMapping,
+                    exposure: currentExposure,
+                    aaMode: currentAAMode,
+                    pixelRatio: renderer?.getPixelRatio?.() ?? null,
+                    effectivePixelRatio: getEffectivePixelRatio(),
+                    info: {
+                        render: renderer?.info?.render ?? null,
+                        memory: renderer?.info?.memory ?? null,
+                    },
+                },
+                perfHud: perfState,
+                layers: {
+                    stats: layerStats,
+                    rows: layerRows,
+                },
+                project: projectState,
+                snapshotExport: getSnapshotExportSettings(),
+                postFx: {
+                    panelVisible: postPanelVisible,
+                    state: ssgiFx.getState(),
+                },
+                camera: {
+                    camLock,
+                    sceneCameraId: currentSceneCameraHandle ?? 0,
+                },
+                scene: {
+                    nodeMapSize: nodeMap.size,
+                    textureCacheSize: textureCache.size,
+                    maxInstanceBuckets: maxInstanceBuckets.size,
+                    forestMeshes: forestMeshes.size,
+                    hairMeshes: hairMeshes.size,
+                },
+            };
+        }
+
+        function syncDebugConsole(force = false) {
+            if (buildMode === 'release' || !debugMode) {
+                debugConsole.style.display = 'none';
+                debugConsole.textContent = '';
+                lastDebugConsoleSignature = '';
+                return;
+            }
+            const now = performance.now();
+            if (!force && now - lastDebugConsolePaintMs < 250) return;
+            const state = buildDebugConsoleState();
+            const text = JSON.stringify(state, null, 2);
+            if (!force && text === lastDebugConsoleSignature) return;
+            lastDebugConsolePaintMs = now;
+            lastDebugConsoleSignature = text;
+            debugConsole.style.display = '';
+            debugConsole.textContent = text;
+        }
 
         async function restoreInteractiveBrowserState() {
             restorePostFxState();
@@ -8089,6 +8188,7 @@
             hud.style.display = '';
             info.style.display = debugMode ? '' : 'none';
             debugBtn.classList.toggle('active', debugMode);
+            syncDebugConsole(true);
         }
 
         function setDebugMode(enabled) {
@@ -8096,6 +8196,7 @@
             perfHud.setDebugEnabled(enabled);
             try { localStorage.setItem(DEBUG_STORAGE_KEY, String(debugMode)); } catch {}
             applyBuildMode();
+            syncDebugConsole(true);
         }
 
         if (isStandalone) {

@@ -6411,6 +6411,7 @@ public:
         bool includeSplats = true;
         bool includeAudios = true;
         bool includeInstances = true;
+        bool includeDebugPayload = false;
         bool includeSnapshotUi = true;
         bool includeRuntimeScene = true;
         bool copyAssets = true;
@@ -6425,6 +6426,10 @@ public:
 
     static void NormalizeSnapshotExportOptions(SnapshotExportOptions& options) {
         options.animationSampleStepFrames = std::clamp(options.animationSampleStepFrames, 1, 120);
+        if (!options.includeDebugPayload) {
+            options.includeSnapshotUi = false;
+            options.includeRuntimeScene = false;
+        }
         if (!options.includeAnimations) {
             options.includeTransformAnimation = false;
             options.includeGeometryAnimation = false;
@@ -8127,30 +8132,32 @@ public:
             return false;
         }
 
-        const std::wstring projectManifestPath = GetProjectManifestPath();
-        if (!projectManifestPath.empty() && FileExists(projectManifestPath)) {
-            if (!CopyFileEnsuringDirectories(projectManifestPath, outDir + L"\\project.maxjs.json")) {
-                error = L"Failed to copy project.maxjs.json into snapshot";
-                cleanupOnFail();
-                return false;
+        if (options.includeDebugPayload) {
+            const std::wstring projectManifestPath = GetProjectManifestPath();
+            if (!projectManifestPath.empty() && FileExists(projectManifestPath)) {
+                if (!CopyFileEnsuringDirectories(projectManifestPath, outDir + L"\\project.maxjs.json")) {
+                    error = L"Failed to copy project.maxjs.json into snapshot";
+                    cleanupOnFail();
+                    return false;
+                }
             }
-        }
 
-        const std::wstring postFxPath = GetProjectPostFxPath();
-        if (!postFxPath.empty() && FileExists(postFxPath)) {
-            if (!CopyFileEnsuringDirectories(postFxPath, outDir + L"\\postfx.maxjs.json")) {
-                error = L"Failed to copy postfx.maxjs.json into snapshot";
-                cleanupOnFail();
-                return false;
+            const std::wstring postFxPath = GetProjectPostFxPath();
+            if (!postFxPath.empty() && FileExists(postFxPath)) {
+                if (!CopyFileEnsuringDirectories(postFxPath, outDir + L"\\postfx.maxjs.json")) {
+                    error = L"Failed to copy postfx.maxjs.json into snapshot";
+                    cleanupOnFail();
+                    return false;
+                }
             }
-        }
 
-        const std::wstring inlineDir = GetInlineLayerDir();
-        if (!inlineDir.empty() && DirectoryExists(inlineDir)) {
-            if (!CopyDirectoryRecursive(inlineDir, outDir + L"\\inlines")) {
-                error = L"Failed to copy inlines into snapshot";
-                cleanupOnFail();
-                return false;
+            const std::wstring inlineDir = GetInlineLayerDir();
+            if (!inlineDir.empty() && DirectoryExists(inlineDir)) {
+                if (!CopyDirectoryRecursive(inlineDir, outDir + L"\\inlines")) {
+                    error = L"Failed to copy inlines into snapshot";
+                    cleanupOnFail();
+                    return false;
+                }
             }
         }
 
@@ -9379,6 +9386,7 @@ public:
             ExtractJsonBool(msg, L"includeSplats", options.includeSplats);
             ExtractJsonBool(msg, L"includeAudios", options.includeAudios);
             ExtractJsonBool(msg, L"includeInstances", options.includeInstances);
+            ExtractJsonBool(msg, L"includeDebugPayload", options.includeDebugPayload);
             ExtractJsonBool(msg, L"includeSnapshotUi", options.includeSnapshotUi);
             ExtractJsonBool(msg, L"includeRuntimeScene", options.includeRuntimeScene);
             ExtractJsonBool(msg, L"copyAssets", options.copyAssets);

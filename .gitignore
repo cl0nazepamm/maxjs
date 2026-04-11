@@ -9,5 +9,14 @@ node_modules/
 *.tmp
 tmp_*
 .claude/
+.cursor/
+.playwright-mcp/
+.graphify_python
+graphify-out/
+build/_tmp_*
+.tmp_*
+projects/active/
+projects/*/dist/node_modules/
 AGENTS.md
+docs/
 dev.bat

@@ -86,7 +86,7 @@ HINSTANCE hInstance = nullptr;
 
 class MaxJSPanel;
 static MaxJSPanel* g_panel = nullptr;
-void MaxJSNotifyMaterialEdited();
+void MaxJSNotifyMaterialEdited(ReferenceTarget* target = nullptr);
 static HWND g_helperHwnd = nullptr;
 
 // Forward — used by renderer's ActiveShade
@@ -1253,6 +1253,30 @@ static Mtl* FindSupportedMaterial(Mtl* mtl) {
 
 // Keep old name working for transform sync
 static Mtl* FindThreeJSMaterial(Mtl* mtl) { return FindSupportedMaterial(mtl); }
+
+static bool ReferenceTreeContainsImpl(ReferenceTarget* root, ReferenceTarget* needle, std::unordered_set<ReferenceTarget*>& visited) {
+    if (!root || !needle) return false;
+    if (root == needle) return true;
+    if (!visited.insert(root).second) return false;
+
+    ReferenceMaker* maker = dynamic_cast<ReferenceMaker*>(root);
+    if (!maker) return false;
+
+    const int numRefs = maker->NumRefs();
+    for (int i = 0; i < numRefs; ++i) {
+        RefTargetHandle ref = maker->GetReference(i);
+        ReferenceTarget* child = dynamic_cast<ReferenceTarget*>(ref);
+        if (child && ReferenceTreeContainsImpl(child, needle, visited)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool ReferenceTreeContains(ReferenceTarget* root, ReferenceTarget* needle) {
+    std::unordered_set<ReferenceTarget*> visited;
+    return ReferenceTreeContainsImpl(root, needle, visited);
+}
 
 static bool FindPBPoint3(Texmap* map, const MCHAR* name, Point3& out) {
     if (!map) return false;
@@ -8778,6 +8802,49 @@ public:
         MarkInteractiveActivity();
     }
 
+    void NotifyMaterialEditedTarget(ReferenceTarget* target) {
+        if (!target) {
+            MarkMaterialInteractiveActivity();
+            return;
+        }
+
+        if (geomHandles_.empty()) return;
+
+        Interface* ip = GetCOREInterface();
+        if (!ip) return;
+        TimeValue t = ip->GetTime();
+
+        bool changed = false;
+        for (ULONG handle : geomHandles_) {
+            INode* node = ip->GetINodeByHandle(handle);
+            if (!node) continue;
+
+            Mtl* rawMtl = node->GetMtl();
+            Mtl* supportedMtl = FindSupportedMaterial(rawMtl);
+            if (!supportedMtl) continue;
+            if (!ReferenceTreeContains(supportedMtl, target)) continue;
+
+            const MaterialSyncState state = ComputeMaterialSyncState(node, t);
+            mtlHashMap_[handle] = state.structureHash;
+            mtlScalarHashMap_[handle] = state.scalarHash;
+
+            if (!state.canFastSync) {
+                SetDirtyImmediate();
+                return;
+            }
+
+            materialFastDirtyHandles_.insert(handle);
+            if (fastDirtyHandles_.insert(handle).second) changed = true;
+        }
+
+        if (changed) {
+            QueueFastFlush();
+            return;
+        }
+
+        MarkMaterialInteractiveActivity();
+    }
+
     bool IsAnimationPlaying() const {
         Interface* ip = GetCOREInterface();
         return ip && ip->IsAnimPlaying() != 0;
@@ -12755,8 +12822,8 @@ static void RequestGlobalPanelKill() {
     KillPanel();
 }
 
-void MaxJSNotifyMaterialEdited() {
-    if (g_panel) g_panel->MarkMaterialInteractiveActivity();
+void MaxJSNotifyMaterialEdited(ReferenceTarget* target) {
+    if (g_panel) g_panel->NotifyMaterialEditedTarget(target);
 }
 
 void TogglePanel() {

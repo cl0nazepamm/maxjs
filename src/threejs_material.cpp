@@ -14,7 +14,12 @@
 #include <custcont.h>
 
 extern HINSTANCE hInstance;
-extern void MaxJSNotifyMaterialEdited();
+extern void MaxJSNotifyMaterialEdited(ReferenceTarget* target);
+
+static void NotifyOwnerMaterialEdited(IParamBlock2* pb) {
+    ReferenceTarget* owner = pb ? dynamic_cast<ReferenceTarget*>(pb->GetOwner()) : nullptr;
+    MaxJSNotifyMaterialEdited(owner);
+}
 
 // ══════════════════════════════════════════════════════════════
 //  ThreeJS Materials — native PBR materials for the MaxJS viewport
@@ -344,7 +349,7 @@ public:
         const ParamID pid = kMapParamIDs[slotIndex];
         if (HasParam(pblock, pid)) {
             pblock->SetValue(pid, 0, m);
-            MaxJSNotifyMaterialEdited();
+            NotifyOwnerMaterialEdited(pblock);
         }
     }
     MSTR GetSubTexmapSlotName(int i, bool) override {
@@ -1423,11 +1428,11 @@ public:
             yPos += rowH;
         }
 
-        FlushParamsJson(dlgHwnd, state);
+        FlushParamsJson(dlgHwnd, state, false);
         state.rebuildingUI = false;
     }
 
-    void FlushParamsJson(HWND dlgHwnd, DialogState& state) {
+    void FlushParamsJson(HWND dlgHwnd, DialogState& state, bool notify = true) {
         int spinIdx = 0, swatchIdx = 0;
         for (auto& p : state.dynParams) {
             if (p.type == TSLParamType::Float && spinIdx < static_cast<int>(state.dynSpinners.size())) {
@@ -1450,7 +1455,7 @@ public:
         if (state.pb) {
             std::wstring json = BuildParamsJson(state.dynParams);
             state.pb->SetValue(pb_tsl_params_json, 0, json.c_str());
-            MaxJSNotifyMaterialEdited();
+            if (notify) NotifyOwnerMaterialEdited(state.pb);
         }
     }
 
@@ -1511,7 +1516,7 @@ public:
                             SetDlgItemText(hWnd, IDC_TSL_CODE_EDIT, wCode.c_str());
                             if (pb) {
                                 pb->SetValue(pb_tsl_code, 0, wCode.c_str());
-                                MaxJSNotifyMaterialEdited();
+                                NotifyOwnerMaterialEdited(pb);
                             }
                             const wchar_t* fname = wcsrchr(filePath, L'\\');
                             SetDlgItemText(hWnd, IDC_TSL_FILE_LABEL, fname ? fname + 1 : filePath);
@@ -1532,7 +1537,7 @@ public:
                 if (copied >= 0) text.resize(static_cast<size_t>(copied)); else text.clear();
                 if (pb) {
                     pb->SetValue(pb_tsl_code, 0, text.c_str());
-                    MaxJSNotifyMaterialEdited();
+                    NotifyOwnerMaterialEdited(pb);
                 }
                 if (auto it = states_.find(hWnd); it != states_.end()) {
                     RebuildDynamicControls(hWnd, it->second, text);
@@ -1546,7 +1551,7 @@ public:
                 if (copied >= 0) text.resize(static_cast<size_t>(copied)); else text.clear();
                 if (pb) {
                     pb->SetValue(pb_tsl_code, 0, text.c_str());
-                    MaxJSNotifyMaterialEdited();
+                    NotifyOwnerMaterialEdited(pb);
                 }
                 return TRUE;
             }
@@ -1916,11 +1921,11 @@ public:
             }
             yPos += rowH;
         }
-        FlushParamsJson(dlgHwnd, state);
+        FlushParamsJson(dlgHwnd, state, false);
         state.rebuildingUI = false;
     }
 
-    void FlushParamsJson(HWND dlgHwnd, DialogState& state) {
+    void FlushParamsJson(HWND dlgHwnd, DialogState& state, bool notify = true) {
         int spinIdx = 0, swatchIdx = 0;
         for (size_t pi = 0; pi < state.dynParams.size(); ++pi) {
             auto& p = state.dynParams[pi];
@@ -1939,7 +1944,7 @@ public:
         if (state.pb) {
             std::wstring json = BuildParamsJson(state.dynParams);
             state.pb->SetValue(ptsl_tex_params_json, 0, json.c_str());
-            MaxJSNotifyMaterialEdited();
+            if (notify) NotifyOwnerMaterialEdited(state.pb);
         }
     }
 
@@ -2000,7 +2005,7 @@ public:
                             SetDlgItemText(hWnd, IDC_TSL_TEX_CODE_EDIT, wCode.c_str());
                             if (pb) {
                                 pb->SetValue(ptsl_tex_code, 0, wCode.c_str());
-                                MaxJSNotifyMaterialEdited();
+                                NotifyOwnerMaterialEdited(pb);
                             }
                             const wchar_t* fname = wcsrchr(filePath, L'\\');
                             SetDlgItemText(hWnd, IDC_TSL_TEX_FILE_LABEL, fname ? fname + 1 : filePath);
@@ -2020,7 +2025,7 @@ public:
                 if (copied >= 0) text.resize(static_cast<size_t>(copied)); else text.clear();
                 if (pb) {
                     pb->SetValue(ptsl_tex_code, 0, text.c_str());
-                    MaxJSNotifyMaterialEdited();
+                    NotifyOwnerMaterialEdited(pb);
                 }
                 if (auto it = states_.find(hWnd); it != states_.end()) {
                     RebuildDynamicControls(hWnd, it->second, text);
@@ -2034,7 +2039,7 @@ public:
                 if (copied >= 0) text.resize(static_cast<size_t>(copied)); else text.clear();
                 if (pb) {
                     pb->SetValue(ptsl_tex_code, 0, text.c_str());
-                    MaxJSNotifyMaterialEdited();
+                    NotifyOwnerMaterialEdited(pb);
                 }
                 return TRUE;
             }

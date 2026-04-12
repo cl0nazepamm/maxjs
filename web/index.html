@@ -832,11 +832,20 @@
             "three/webgpu": "./vendor/three-r183.2/build/three.webgpu.js",
             "three/tsl": "./vendor/three-r183.2/build/three.tsl.js",
             "three/addons/": "./vendor/three-r183.2/examples/",
-            "@sparkjsdev/spark": "./node_modules/@sparkjsdev/spark/dist/spark.module.js"
+            "@sparkjsdev/spark": "./node_modules/@sparkjsdev/spark/dist/spark.module.js",
+            "@dimforge/rapier3d-compat": "./vendor/rapier/rapier.es.js"
         },
         "scopes": {
             "./node_modules/@sparkjsdev/spark/": {
                 "three": "./vendor/three-r183.2/build/three.module.js"
+            },
+            "https://maxjs-assets.local/": {
+                "three": "https://maxjs.local/vendor/three-r183.2/build/three.webgpu.js",
+                "three-std": "https://maxjs.local/vendor/three-r183.2/build/three.module.js",
+                "three/webgpu": "https://maxjs.local/vendor/three-r183.2/build/three.webgpu.js",
+                "three/tsl": "https://maxjs.local/vendor/three-r183.2/build/three.tsl.js",
+                "three/addons/": "https://maxjs.local/vendor/three-r183.2/examples/",
+                "@dimforge/rapier3d-compat": "https://maxjs.local/vendor/rapier/rapier.es.js"
             }
         }
     }
@@ -7652,6 +7661,8 @@
             jsRoot,
             overlayRoot,
             space: sceneSpace,
+            controls,
+            getCamera: () => camera,
         });
         animationSystem = createMaxJSAnimationSystem({
             THREE,

@@ -217,32 +217,318 @@ function freezePlainObject(obj) {
 }
 
 function createCameraAdapter(camera, THREE, ownForJs, cameraControl, layerId) {
+    const scratch = {
+        position: new THREE.Vector3(),
+        target: new THREE.Vector3(),
+        direction: new THREE.Vector3(),
+        up: new THREE.Vector3(),
+        quaternion: new THREE.Quaternion(),
+        euler: new THREE.Euler(),
+        matrix: new THREE.Matrix4(),
+    };
+
+    function getActiveCamera() {
+        return cameraControl.getCamera?.() ?? camera;
+    }
+
+    function ensureOwnership() {
+        const owner = cameraControl.getOwner();
+        if (owner && owner !== layerId) {
+            console.warn(`[Camera] Layer ${layerId} cannot control camera owned by ${owner}`);
+            return false;
+        }
+        if (!owner) {
+            cameraControl.claim(layerId);
+        }
+        return true;
+    }
+
     return freezePlainObject({
-        get raw() { return camera; },
+        get raw() { return getActiveCamera(); },
+        get position() {
+            const cam = getActiveCamera();
+            return cam.position.clone();
+        },
+        get quaternion() {
+            const cam = getActiveCamera();
+            return cam.quaternion.clone();
+        },
+        get fov() { return getActiveCamera().fov; },
+        get near() { return getActiveCamera().near; },
+        get far() { return getActiveCamera().far; },
+        get aspect() { return getActiveCamera().aspect; },
+        get isPerspective() { return getActiveCamera().isPerspectiveCamera; },
+        get isOrthographic() { return getActiveCamera().isOrthographicCamera; },
+
         getState() {
+            const cam = getActiveCamera();
             return {
-                type: camera.type,
-                fov: camera.fov,
-                near: camera.near,
-                far: camera.far,
-                up: camera.up.toArray(),
-                matrix: camera.matrix.toArray(),
-                matrixWorld: camera.matrixWorld.toArray(),
-                projectionMatrix: camera.projectionMatrix.toArray(),
+                type: cam.type,
+                fov: cam.fov,
+                near: cam.near,
+                far: cam.far,
+                up: cam.up.toArray(),
+                position: cam.position.toArray(),
+                quaternion: cam.quaternion.toArray(),
+                matrix: cam.matrix.toArray(),
+                matrixWorld: cam.matrixWorld.toArray(),
+                projectionMatrix: cam.projectionMatrix.toArray(),
             };
         },
+
         clone(options = {}) {
-            const clone = camera.clone();
-            clone.matrix.copy(camera.matrix);
-            clone.matrixWorld.copy(camera.matrixWorld);
-            clone.projectionMatrix.copy(camera.projectionMatrix);
-            clone.matrixAutoUpdate = camera.matrixAutoUpdate;
+            const cam = getActiveCamera();
+            const clone = cam.clone();
+            clone.matrix.copy(cam.matrix);
+            clone.matrixWorld.copy(cam.matrixWorld);
+            clone.projectionMatrix.copy(cam.projectionMatrix);
+            clone.matrixAutoUpdate = cam.matrixAutoUpdate;
             if (options.name) clone.name = options.name;
             return ownForJs(clone, options.overlay ? OWNER_OVERLAY : OWNER_JS);
         },
-        takeOver() { cameraControl.claim(layerId); },
+
+        // Camera modes: 'viewport' (Max sync), 'physical' (Max camera object), 'script' (JS owned)
+        get mode() { return cameraControl.getMode(); },
+        get isViewportMode() { return cameraControl.isViewportMode(); },
+        get isPhysicalMode() { return cameraControl.isPhysicalMode(); },
+        get isScriptMode() { return cameraControl.isScriptMode(); },
+
+        // Switch to viewport mode (synced from Max viewport)
+        useViewport() {
+            return cameraControl.setMode('viewport');
+        },
+
+        // Switch to physical camera mode (lock to Max camera object)
+        usePhysicalCamera(handle) {
+            return cameraControl.setMode('physical', { handle });
+        },
+
+        // Switch to script/game mode (full JS control)
+        useScriptMode(options = {}) {
+            return cameraControl.setMode('script', {
+                layerId,
+                enableControls: options.enableOrbitControls ?? false,
+            });
+        },
+
+        // Legacy ownership API (maps to script mode)
+        takeOver() { return cameraControl.claim(layerId); },
         release() { cameraControl.release(layerId); },
         get isOverridden() { return cameraControl.isClaimed(); },
+        get isOwnedByMe() { return cameraControl.getOwner() === layerId; },
+
+        // Position control
+        setPosition(x, y, z) {
+            if (!ensureOwnership()) return false;
+            const cam = getActiveCamera();
+            cam.position.set(x, y, z);
+            cam.updateMatrixWorld();
+            return true;
+        },
+
+        setPositionVec(vec) {
+            if (!ensureOwnership()) return false;
+            const cam = getActiveCamera();
+            cam.position.copy(vec);
+            cam.updateMatrixWorld();
+            return true;
+        },
+
+        // Rotation control
+        setQuaternion(x, y, z, w) {
+            if (!ensureOwnership()) return false;
+            const cam = getActiveCamera();
+            cam.quaternion.set(x, y, z, w).normalize();
+            cam.updateMatrixWorld();
+            return true;
+        },
+
+        setQuaternionVec(quat) {
+            if (!ensureOwnership()) return false;
+            const cam = getActiveCamera();
+            cam.quaternion.copy(quat).normalize();
+            cam.updateMatrixWorld();
+            return true;
+        },
+
+        setRotationEuler(x, y, z, order = 'YXZ') {
+            if (!ensureOwnership()) return false;
+            const cam = getActiveCamera();
+            scratch.euler.set(x, y, z, order);
+            cam.quaternion.setFromEuler(scratch.euler);
+            cam.updateMatrixWorld();
+            return true;
+        },
+
+        // LookAt
+        lookAt(x, y, z) {
+            if (!ensureOwnership()) return false;
+            const cam = getActiveCamera();
+            if (typeof x === 'object' && x !== null) {
+                cam.lookAt(x.x ?? x[0] ?? 0, x.y ?? x[1] ?? 0, x.z ?? x[2] ?? 0);
+            } else {
+                cam.lookAt(x, y, z);
+            }
+            cam.updateMatrixWorld();
+            // Sync controls target if available
+            const ctrl = cameraControl.getControls?.();
+            if (ctrl?.target) {
+                if (typeof x === 'object' && x !== null) {
+                    ctrl.target.set(x.x ?? x[0] ?? 0, x.y ?? x[1] ?? 0, x.z ?? x[2] ?? 0);
+                } else {
+                    ctrl.target.set(x, y, z);
+                }
+            }
+            return true;
+        },
+
+        // Combined position + lookAt
+        setPositionAndLookAt(px, py, pz, tx, ty, tz) {
+            if (!ensureOwnership()) return false;
+            const cam = getActiveCamera();
+            cam.position.set(px, py, pz);
+            cam.lookAt(tx, ty, tz);
+            cam.updateMatrixWorld();
+            const ctrl = cameraControl.getControls?.();
+            if (ctrl?.target) ctrl.target.set(tx, ty, tz);
+            return true;
+        },
+
+        // Full transform
+        setTransform(px, py, pz, qx, qy, qz, qw) {
+            if (!ensureOwnership()) return false;
+            const cam = getActiveCamera();
+            cam.position.set(px, py, pz);
+            cam.quaternion.set(qx, qy, qz, qw).normalize();
+            cam.updateMatrixWorld();
+            return true;
+        },
+
+        setMatrix(matrix) {
+            if (!ensureOwnership()) return false;
+            const cam = getActiveCamera();
+            if (matrix?.isMatrix4) {
+                cam.matrix.copy(matrix);
+            } else if (Array.isArray(matrix) || ArrayBuffer.isView(matrix)) {
+                cam.matrix.fromArray(matrix);
+            }
+            cam.matrix.decompose(cam.position, cam.quaternion, scratch.position); // scale to scratch
+            cam.updateMatrixWorld();
+            return true;
+        },
+
+        // Projection control
+        setFov(fov) {
+            if (!ensureOwnership()) return false;
+            const cam = getActiveCamera();
+            if (cam.isPerspectiveCamera) {
+                cam.fov = fov;
+                cam.updateProjectionMatrix();
+            }
+            return true;
+        },
+
+        setNearFar(near, far) {
+            if (!ensureOwnership()) return false;
+            const cam = getActiveCamera();
+            cam.near = near;
+            cam.far = far;
+            cam.updateProjectionMatrix();
+            return true;
+        },
+
+        // Orbit-style controls (works even when OrbitControls is disabled)
+        orbit(deltaAzimuth, deltaPolar, target = null) {
+            if (!ensureOwnership()) return false;
+            const cam = getActiveCamera();
+            const ctrl = cameraControl.getControls?.();
+            const pivot = target
+                ? scratch.target.set(target.x ?? target[0], target.y ?? target[1], target.z ?? target[2])
+                : (ctrl?.target?.clone() ?? new THREE.Vector3(0, 0, 0));
+
+            // Compute current spherical position relative to pivot
+            scratch.position.copy(cam.position).sub(pivot);
+            const radius = scratch.position.length();
+            let theta = Math.atan2(scratch.position.x, scratch.position.z); // azimuth
+            let phi = Math.acos(Math.min(1, Math.max(-1, scratch.position.y / radius))); // polar
+
+            theta += deltaAzimuth;
+            phi = Math.max(0.01, Math.min(Math.PI - 0.01, phi + deltaPolar));
+
+            // Convert back to cartesian
+            scratch.position.set(
+                radius * Math.sin(phi) * Math.sin(theta),
+                radius * Math.cos(phi),
+                radius * Math.sin(phi) * Math.cos(theta)
+            );
+            cam.position.copy(scratch.position).add(pivot);
+            cam.lookAt(pivot);
+            cam.updateMatrixWorld();
+            if (ctrl?.target) ctrl.target.copy(pivot);
+            return true;
+        },
+
+        dolly(delta, target = null) {
+            if (!ensureOwnership()) return false;
+            const cam = getActiveCamera();
+            const ctrl = cameraControl.getControls?.();
+            const pivot = target
+                ? scratch.target.set(target.x ?? target[0], target.y ?? target[1], target.z ?? target[2])
+                : (ctrl?.target?.clone() ?? new THREE.Vector3(0, 0, 0));
+
+            scratch.direction.copy(cam.position).sub(pivot).normalize();
+            cam.position.addScaledVector(scratch.direction, delta);
+            cam.updateMatrixWorld();
+            return true;
+        },
+
+        pan(deltaX, deltaY) {
+            if (!ensureOwnership()) return false;
+            const cam = getActiveCamera();
+            const ctrl = cameraControl.getControls?.();
+
+            // Get camera right and up vectors
+            scratch.direction.set(1, 0, 0).applyQuaternion(cam.quaternion);
+            scratch.up.set(0, 1, 0).applyQuaternion(cam.quaternion);
+
+            cam.position.addScaledVector(scratch.direction, deltaX);
+            cam.position.addScaledVector(scratch.up, deltaY);
+            cam.updateMatrixWorld();
+
+            if (ctrl?.target) {
+                ctrl.target.addScaledVector(scratch.direction, deltaX);
+                ctrl.target.addScaledVector(scratch.up, deltaY);
+            }
+            return true;
+        },
+
+        // Get direction vectors
+        getForward(out = new THREE.Vector3()) {
+            const cam = getActiveCamera();
+            return out.set(0, 0, -1).applyQuaternion(cam.quaternion);
+        },
+
+        getRight(out = new THREE.Vector3()) {
+            const cam = getActiveCamera();
+            return out.set(1, 0, 0).applyQuaternion(cam.quaternion);
+        },
+
+        getUp(out = new THREE.Vector3()) {
+            const cam = getActiveCamera();
+            return out.set(0, 1, 0).applyQuaternion(cam.quaternion);
+        },
+
+        // Access to underlying controls (when claimed)
+        get controls() {
+            if (cameraControl.getOwner() !== layerId) return null;
+            return cameraControl.getControls?.() ?? null;
+        },
+
+        // Enable/disable controls temporarily
+        setControlsEnabled(enabled) {
+            const ctrl = cameraControl.getControls?.();
+            if (ctrl) ctrl.enabled = enabled;
+        },
     });
 }
 
@@ -593,6 +879,8 @@ export function createLayerManager({
     jsRoot = null,
     overlayRoot = null,
     space = null,
+    controls = null,
+    getCamera = null,
 }) {
     const layers = new Map();
     const listeners = new Set();
@@ -617,17 +905,64 @@ export function createLayerManager({
 
     if (maxRoot) setOwner(maxRoot, OWNER_MAX);
 
-    let cameraClaimOwner = null; // layer id that claimed camera, or null
+    // Camera modes:
+    // - 'viewport': synced from Max viewport (default, controlled by Max navigation)
+    // - 'physical': locked to a Max Physical Camera object in scene
+    // - 'script': fully owned by Three.js layer code (game camera)
+    let cameraMode = 'viewport';
+    let cameraClaimOwner = null; // layer id that claimed camera (for 'script' mode)
+    let physicalCameraHandle = null; // handle of locked physical camera (for 'physical' mode)
+    let controlsEnabledBeforeClaim = true;
+
     const cameraControl = {
-        claim(layerId) { cameraClaimOwner = layerId; camera.matrixAutoUpdate = true; },
-        release(layerId) {
-            if (!layerId || cameraClaimOwner === layerId) {
+        getMode() { return cameraMode; },
+        setMode(mode, options = {}) {
+            if (mode !== 'viewport' && mode !== 'physical' && mode !== 'script') return false;
+            const prevMode = cameraMode;
+            cameraMode = mode;
+
+            if (mode === 'viewport') {
+                // Release any ownership, sync from Max viewport
+                cameraClaimOwner = null;
+                physicalCameraHandle = null;
+                camera.matrixAutoUpdate = false;
+                if (controls) controls.enabled = controlsEnabledBeforeClaim;
+            } else if (mode === 'physical') {
+                // Lock to physical camera object
+                physicalCameraHandle = options.handle ?? null;
                 cameraClaimOwner = null;
                 camera.matrixAutoUpdate = false;
+                if (controls) controls.enabled = false;
+            } else if (mode === 'script') {
+                // Full JS control
+                cameraClaimOwner = options.layerId ?? null;
+                physicalCameraHandle = null;
+                camera.matrixAutoUpdate = true;
+                if (controls) {
+                    if (prevMode !== 'script') controlsEnabledBeforeClaim = controls.enabled;
+                    controls.enabled = options.enableControls ?? false;
+                }
             }
+            return true;
         },
-        isClaimed() { return cameraClaimOwner !== null; },
+        claim(layerId) {
+            if (cameraMode === 'script' && cameraClaimOwner && cameraClaimOwner !== layerId) return false;
+            return this.setMode('script', { layerId, enableControls: false });
+        },
+        release(layerId) {
+            if (cameraMode === 'script' && (!layerId || cameraClaimOwner === layerId)) {
+                return this.setMode('viewport');
+            }
+            return false;
+        },
+        isClaimed() { return cameraMode === 'script' && cameraClaimOwner !== null; },
+        isScriptMode() { return cameraMode === 'script'; },
+        isViewportMode() { return cameraMode === 'viewport'; },
+        isPhysicalMode() { return cameraMode === 'physical'; },
         getOwner() { return cameraClaimOwner; },
+        getPhysicalCameraHandle() { return physicalCameraHandle; },
+        getControls() { return controls; },
+        getCamera() { return getCamera ? getCamera() : camera; },
     };
 
     const isWebGPU = !!(renderer?.backend?.parameters?.forceWebGL === undefined
@@ -640,6 +975,9 @@ export function createLayerManager({
         localMatrix: new THREE.Matrix4(),
         finalMatrix: new THREE.Matrix4(),
         baseInverse: new THREE.Matrix4(),
+        parentWorldMatrix: new THREE.Matrix4(),
+        parentWorldInverse: new THREE.Matrix4(),
+        worldMatrix: new THREE.Matrix4(),
         position: new THREE.Vector3(),
         quaternion: new THREE.Quaternion(),
         scale: new THREE.Vector3(),
@@ -674,10 +1012,25 @@ export function createLayerManager({
         };
     }
 
-    function composeRuntimeTransformState(state, target) {
+    function composeRuntimeTransformState(state, target, obj = null) {
         if (state.mode === 'absolute') {
             return target.compose(state.position, state.quaternion, state.scale);
         }
+        if (state.mode === 'world') {
+            // Build world matrix from world-space position/quaternion/scale
+            transformScratch.worldMatrix.compose(state.position, state.quaternion, state.scale);
+            // Get parent's world matrix (if object has a parent)
+            const parent = obj?.parent;
+            if (parent?.isObject3D) {
+                parent.updateWorldMatrix(true, false);
+                transformScratch.parentWorldInverse.copy(parent.matrixWorld).invert();
+                // localMatrix = parentWorldInverse * worldMatrix
+                return target.copy(transformScratch.parentWorldInverse).multiply(transformScratch.worldMatrix);
+            }
+            // No parent means world = local
+            return target.copy(transformScratch.worldMatrix);
+        }
+        // additive mode: baseMatrix * localOffset
         transformScratch.localMatrix.compose(state.position, state.quaternion, state.scale);
         return target.copy(state.baseMatrix).multiply(transformScratch.localMatrix);
     }
@@ -690,13 +1043,26 @@ export function createLayerManager({
     }
 
     function setRuntimeTransformStateMode(state, mode, obj, preserveCurrent = true) {
-        if (!state || (mode !== 'additive' && mode !== 'absolute') || state.mode === mode) return state;
+        if (!state || (mode !== 'additive' && mode !== 'absolute' && mode !== 'world') || state.mode === mode) return state;
         const currentMatrix = preserveCurrent
-            ? composeRuntimeTransformState(state, transformScratch.finalMatrix)
+            ? composeRuntimeTransformState(state, transformScratch.finalMatrix, obj)
             : (obj?.matrix?.clone?.() ?? state.baseMatrix.clone());
-        if (mode === 'absolute') {
+        if (mode === 'world') {
+            // Convert current local matrix to world space
+            if (obj?.isObject3D) {
+                obj.updateWorldMatrix(true, false);
+                transformScratch.worldMatrix.copy(currentMatrix);
+                if (obj.parent?.isObject3D) {
+                    transformScratch.worldMatrix.premultiply(obj.parent.matrixWorld);
+                }
+                transformScratch.worldMatrix.decompose(state.position, state.quaternion, state.scale);
+            } else {
+                currentMatrix.decompose(state.position, state.quaternion, state.scale);
+            }
+        } else if (mode === 'absolute') {
             currentMatrix.decompose(state.position, state.quaternion, state.scale);
         } else {
+            // additive
             transformScratch.baseInverse.copy(state.baseMatrix).invert();
             transformScratch.localMatrix.copy(transformScratch.baseInverse).multiply(currentMatrix);
             transformScratch.localMatrix.decompose(state.position, state.quaternion, state.scale);
@@ -708,7 +1074,7 @@ export function createLayerManager({
     function applyRuntimeTransformState(state, obj) {
         if (!state || !obj?.isObject3D) return false;
         syncRuntimeTransformBaseFromScene(state, obj);
-        const finalMatrix = composeRuntimeTransformState(state, transformScratch.finalMatrix);
+        const finalMatrix = composeRuntimeTransformState(state, transformScratch.finalMatrix, obj);
         applyObjectLocalMatrix(obj, finalMatrix);
         state.lastAppliedMatrix.copy(finalMatrix);
         return true;
@@ -751,7 +1117,8 @@ export function createLayerManager({
     function getRuntimeTransformStateSnapshot(handle) {
         const state = runtimeTransformOverrides.get(handle);
         if (!state) return null;
-        const currentMatrix = composeRuntimeTransformState(state, transformScratch.finalMatrix);
+        const obj = nodeMap.get(handle);
+        const currentMatrix = composeRuntimeTransformState(state, transformScratch.finalMatrix, obj);
         currentMatrix.decompose(transformScratch.position, transformScratch.quaternion, transformScratch.scale);
         return freezePlainObject({
             handle,
@@ -767,7 +1134,8 @@ export function createLayerManager({
     function serializeRuntimeTransformOverrides() {
         const out = [];
         for (const [handle, state] of runtimeTransformOverrides.entries()) {
-            const currentMatrix = composeRuntimeTransformState(state, transformScratch.finalMatrix);
+            const obj = nodeMap.get(handle);
+            const currentMatrix = composeRuntimeTransformState(state, transformScratch.finalMatrix, obj);
             currentMatrix.decompose(transformScratch.position, transformScratch.quaternion, transformScratch.scale);
             out.push({
                 handle,
@@ -832,7 +1200,8 @@ export function createLayerManager({
             clear() { return clearRuntimeTransformOverride(handle); },
             snapshot() { return getRuntimeTransformStateSnapshot(handle); },
             setMode(mode, options = {}) {
-                const payload = ensureState(mode === 'absolute' ? 'absolute' : 'additive', options.preserveCurrent !== false);
+                const validMode = mode === 'world' ? 'world' : (mode === 'absolute' ? 'absolute' : 'additive');
+                const payload = ensureState(validMode, options.preserveCurrent !== false);
                 if (!payload) return false;
                 applyRuntimeTransformState(payload.state, payload.obj);
                 return true;
@@ -871,6 +1240,40 @@ export function createLayerManager({
             multiplyScale(x = 1, y = x, z = x) {
                 return mutate('additive', (position, quaternion, scale) => {
                     scale.multiply(transformScratch.deltaScale.set(x, y, z));
+                });
+            },
+            // World-space transform methods for physics
+            setWorldPosition(x = 0, y = 0, z = 0) {
+                return mutate('world', position => {
+                    position.set(x, y, z);
+                });
+            },
+            setWorldQuaternion(x = 0, y = 0, z = 0, w = 1) {
+                return mutate('world', (position, quaternion) => {
+                    quaternion.set(x, y, z, w).normalize();
+                });
+            },
+            setWorldRotationEuler(x = 0, y = 0, z = 0) {
+                return mutate('world', (position, quaternion) => {
+                    quaternion.setFromEuler(transformScratch.euler.set(x, y, z, 'XYZ'));
+                });
+            },
+            setWorldTransform(px = 0, py = 0, pz = 0, qx = 0, qy = 0, qz = 0, qw = 1, sx = 1, sy = sx, sz = sx) {
+                return mutate('world', (position, quaternion, scale) => {
+                    position.set(px, py, pz);
+                    quaternion.set(qx, qy, qz, qw).normalize();
+                    scale.set(sx, sy, sz);
+                });
+            },
+            setWorldMatrix(matrix) {
+                // matrix can be THREE.Matrix4 or Float32Array/Array of 16 elements
+                return mutate('world', (position, quaternion, scale) => {
+                    if (matrix?.isMatrix4) {
+                        matrix.decompose(position, quaternion, scale);
+                    } else if (Array.isArray(matrix) || ArrayBuffer.isView(matrix)) {
+                        transformScratch.worldMatrix.fromArray(matrix);
+                        transformScratch.worldMatrix.decompose(position, quaternion, scale);
+                    }
                 });
             },
         });
@@ -1521,7 +1924,8 @@ export function createLayerManager({
         serializeSnapshot,
         restoreTransformOverrides: restoreRuntimeTransformOverrides,
         serialize,
-        get isCameraOverridden() { return cameraControl.isClaimed(); },
+        get isCameraOverridden() { return !cameraControl.isViewportMode(); },
+        get cameraMode() { return cameraControl.getMode(); },
         roots: freezePlainObject({
             maxRoot,
             jsRoot: jsWorldRoot,

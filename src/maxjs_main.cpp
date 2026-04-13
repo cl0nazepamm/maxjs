@@ -4462,9 +4462,19 @@ static uint64_t ComputePluginInstanceStateHash(INode* node, TimeValue t, Interfa
 // ══════════════════════════════════════════════════════════════
 
 static void HairDebugLog(const std::wstring& line) {
+#ifndef _DEBUG
+    (void)line;
+    return;
+#else
     static std::mutex sMutex;
     std::lock_guard<std::mutex> lock(sMutex);
-    HANDLE h = CreateFileW(L"C:\\Users\\dev\\maxjs_hair_debug.log",
+    wchar_t tempPath[MAX_PATH] = {};
+    DWORD tempLen = GetTempPathW(static_cast<DWORD>(std::size(tempPath)), tempPath);
+    if (!tempLen || tempLen >= std::size(tempPath)) return;
+    std::wstring logPath(tempPath);
+    if (!logPath.empty() && logPath.back() != L'\\' && logPath.back() != L'/') logPath += L'\\';
+    logPath += L"maxjs_hair_debug.log";
+    HANDLE h = CreateFileW(logPath.c_str(),
         FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
         nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE) return;
@@ -4473,6 +4483,7 @@ static void HairDebugLog(const std::wstring& line) {
     DWORD written = 0;
     WriteFile(h, utf8.data(), static_cast<DWORD>(utf8.size()), &written, nullptr);
     CloseHandle(h);
+#endif
 }
 
 class FindHairModifierOnStackEnum : public GeomPipelineEnumProc {

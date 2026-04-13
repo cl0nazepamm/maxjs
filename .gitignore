@@ -16,6 +16,7 @@ graphify-out/
 build/_tmp_*
 .tmp_*
 projects/active/
+projects/
 projects/*/dist/node_modules/
 AGENTS.md
 docs/
@@ -25,3 +26,8 @@ install.bat
 snapshot-debug.bat
 snapshot-debug-setup.bat
 snapshot-mcp.bat
+web/node_modules/
+examples/
+skills/
+package.json
+package-lock.json

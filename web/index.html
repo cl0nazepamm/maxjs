@@ -776,7 +776,7 @@
 </head>
 <body>
     <div id="hud">
-        <div id="info">MaxJS Live — hot reload works!</div>
+        <div id="info">max.js - Check console</div>
         <pre id="debugConsole" style="display:none;position:fixed;bottom:8px;right:8px;max-width:360px;max-height:30vh;overflow:auto;padding:8px 10px;border:1px solid rgba(255,255,255,0.12);background:rgba(0,0,0,0.82);color:#cfcfcf;font:10px/1.3 'Fira Code','Consolas',monospace;white-space:pre-wrap;word-break:break-word;z-index:9999;pointer-events:auto;resize:both;"></pre>
         <div id="controls">
             <div style="position:relative;display:inline-block;">
@@ -841,6 +841,9 @@
             "./node_modules/@sparkjsdev/spark/": {
                 "three": "./vendor/three-r183.2/build/three.module.js"
             },
+            "./vendor/three-r183.2/examples/objects/Sky.js": {
+                "three": "./vendor/three-r183.2/build/three.module.js"
+            },
             "https://maxjs-assets.local/": {
                 "three": "https://maxjs.local/vendor/three-r183.2/build/three.webgpu.js",
                 "three-std": "https://maxjs.local/vendor/three-r183.2/build/three.module.js",
@@ -848,6 +851,9 @@
                 "three/tsl": "https://maxjs.local/vendor/three-r183.2/build/three.tsl.js",
                 "three/addons/": "https://maxjs.local/vendor/three-r183.2/examples/",
                 "@dimforge/rapier3d-compat": "https://maxjs.local/vendor/rapier/rapier.es.js"
+            },
+            "https://maxjs.local/vendor/three-r183.2/examples/objects/Sky.js": {
+                "three": "https://maxjs.local/vendor/three-r183.2/build/three.module.js"
             }
         }
     }
@@ -865,6 +871,7 @@
         import { XRButton } from 'three/addons/webxr/XRButton.js';
         import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
         import { SkyMesh } from 'three/addons/objects/SkyMesh.js';
+        import { Sky } from 'three/addons/objects/Sky.js';
         import { AsciiEffect } from 'three/addons/effects/AsciiEffect.js';
         // Spark.js uses GLSL3/ShaderChunk — needs WebGL THREE build (scoped in importmap).
         // Lazy-import to avoid crashing on page load.
@@ -2298,15 +2305,16 @@
         }
 
         // ── Sky Environment ──────────────────────────────────
-        // Matches the official Three.js webgpu_sky example pattern:
-        // SkyMesh added directly to scene, no PMREM (broken with TSL).
-        // Lighting via DirectionalLight (sun) + HemisphereLight (sky fill).
+        // SkyMesh (TSL/NodeMaterial) for WebGPU + WebGL2-fallback backends.
+        // Legacy Sky (ShaderMaterial) for pure WebGLRenderer — NodeMaterial can't compile there.
         let skyMesh = null;
         let skySunLight = null;
         let skyFillLight = null;
         let skyEnvMap = null;
         let lastSkySig = '';
         let skyActive = false;
+        // Pure WebGLRenderer cannot render NodeMaterial. WebGPURenderer({forceWebGL:true}) still can.
+        const useLegacySky = !(renderer instanceof THREE.WebGPURenderer);
 
         function applySky(skyParams) {
             if (!skyParams) return;
@@ -2317,25 +2325,13 @@
 
             try {
                 if (!skyMesh) {
-                    skyMesh = new SkyMesh();
+                    skyMesh = useLegacySky ? new Sky() : new SkyMesh();
                     skyMesh.scale.setScalar(450000);
                     skyMesh.name = '__maxjs_sky__';
                     skyMesh.frustumCulled = false;
                     skyMesh.userData.volumetricBoundsBypass = true;
                 }
 
-                // Update sky uniforms — exact same pattern as official example
-                skyMesh.turbidity.value = skyParams.turbidity;
-                skyMesh.rayleigh.value = skyParams.rayleigh;
-                skyMesh.mieCoefficient.value = skyParams.mieCoefficient;
-                skyMesh.mieDirectionalG.value = skyParams.mieDirectionalG;
-
-                // Sky lives in world space, so keep the shader on world Y-up and
-                // convert the incoming Max sun direction at the boundary.
-                skyMesh.upUniform.value.set(0, 1, 0);
-
-                // Sun direction authored in Max space: elevation from XY plane,
-                // azimuth around Z, then converted once into world Y-up space.
                 const elevRad = THREE.MathUtils.degToRad(skyParams.elevation);
                 const azimRad = THREE.MathUtils.degToRad(skyParams.azimuth);
                 const sunDir = copyMaxComponentsToWorld(new THREE.Vector3(),
@@ -2343,7 +2339,23 @@
                     Math.cos(elevRad) * Math.cos(azimRad),
                     Math.sin(elevRad)
                 );
-                skyMesh.sunPosition.value.copy(sunDir);
+
+                if (useLegacySky) {
+                    const u = skyMesh.material.uniforms;
+                    u.turbidity.value = skyParams.turbidity;
+                    u.rayleigh.value = skyParams.rayleigh;
+                    u.mieCoefficient.value = skyParams.mieCoefficient;
+                    u.mieDirectionalG.value = skyParams.mieDirectionalG;
+                    u.up.value.set(0, 1, 0);
+                    u.sunPosition.value.copy(sunDir);
+                } else {
+                    skyMesh.turbidity.value = skyParams.turbidity;
+                    skyMesh.rayleigh.value = skyParams.rayleigh;
+                    skyMesh.mieCoefficient.value = skyParams.mieCoefficient;
+                    skyMesh.mieDirectionalG.value = skyParams.mieDirectionalG;
+                    skyMesh.upUniform.value.set(0, 1, 0);
+                    skyMesh.sunPosition.value.copy(sunDir);
+                }
 
                 renderer.toneMappingExposure = skyParams.exposure;
 

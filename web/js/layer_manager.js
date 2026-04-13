@@ -881,6 +881,7 @@ export function createLayerManager({
     space = null,
     controls = null,
     getCamera = null,
+    onCameraModeChange = null,
 }) {
     const layers = new Map();
     const listeners = new Set();
@@ -918,6 +919,7 @@ export function createLayerManager({
         getMode() { return cameraMode; },
         setMode(mode, options = {}) {
             if (mode !== 'viewport' && mode !== 'physical' && mode !== 'script') return false;
+            if (mode === 'physical' && !Number.isFinite(Number(options.handle))) return false;
             const prevMode = cameraMode;
             cameraMode = mode;
 
@@ -942,6 +944,15 @@ export function createLayerManager({
                     if (prevMode !== 'script') controlsEnabledBeforeClaim = controls.enabled;
                     controls.enabled = options.enableControls ?? false;
                 }
+            }
+            try {
+                onCameraModeChange?.(mode, {
+                    handle: physicalCameraHandle,
+                    owner: cameraClaimOwner,
+                    enableControls: options.enableControls ?? false,
+                });
+            } catch (error) {
+                console.error('[LayerManager] camera mode change callback error', error);
             }
             return true;
         },
@@ -1156,7 +1167,9 @@ export function createLayerManager({
             const obj = nodeMap.get(handle);
             if (!obj?.isObject3D) continue;
             const state = getOrCreateRuntimeTransformState(handle, null, obj);
-            state.mode = item.mode === 'absolute' ? 'absolute' : 'additive';
+            state.mode = item.mode === 'world'
+                ? 'world'
+                : (item.mode === 'absolute' ? 'absolute' : 'additive');
             state.baseMatrix.copy(obj.matrix);
             state.lastAppliedMatrix.copy(obj.matrix);
             if (Array.isArray(item.position) && item.position.length >= 3) state.position.fromArray(item.position);
@@ -1924,7 +1937,7 @@ export function createLayerManager({
         serializeSnapshot,
         restoreTransformOverrides: restoreRuntimeTransformOverrides,
         serialize,
-        get isCameraOverridden() { return !cameraControl.isViewportMode(); },
+        get isCameraOverridden() { return cameraControl.isScriptMode(); },
         get cameraMode() { return cameraControl.getMode(); },
         roots: freezePlainObject({
             maxRoot,

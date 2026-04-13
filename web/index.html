@@ -1801,6 +1801,22 @@
             if (pending) return pending;
 
             const materialXBase = md.materialXBase || '';
+            const isDataTextureUrl = (url) => {
+                const lower = String(url || '').toLowerCase();
+                return (
+                    lower.includes('normal') ||
+                    lower.includes('rough') ||
+                    lower.includes('metal') ||
+                    lower.includes('orm') ||
+                    lower.includes('ao') ||
+                    lower.includes('occlusion') ||
+                    lower.includes('height') ||
+                    lower.includes('displace') ||
+                    lower.includes('displacement') ||
+                    lower.includes('bump') ||
+                    lower.includes('mask')
+                );
+            };
             const manager = new THREE.LoadingManager();
             manager.setURLModifier(url => {
                 const normalized = normalizeMaterialXResourceUrl(url);
@@ -1824,10 +1840,29 @@
                     img.src = resolvedUrl;
                 }
             };
+            // EXRLoader returns DataTexture; mark likely utility maps as raw data.
+            const exrHandler = {
+                load(url, onLoad, onProgress, onError) {
+                    const resolvedUrl = manager.resolveURL(url);
+                    manager.itemStart(resolvedUrl);
+                    exrLoader.load(resolvedUrl,
+                        (texture) => {
+                            texture.colorSpace = isDataTextureUrl(resolvedUrl)
+                                ? THREE.NoColorSpace
+                                : THREE.LinearSRGBColorSpace;
+                            manager.itemEnd(resolvedUrl);
+                            if (onLoad) onLoad(texture);
+                        },
+                        onProgress,
+                        (e) => { manager.itemEnd(resolvedUrl); manager.itemError(resolvedUrl); if (onError) onError(e); }
+                    );
+                }
+            };
+            manager.addHandler(/\.exr$/i, exrHandler);
             manager.addHandler(/\./, imgLoader);
 
             const loader = new MaterialXLoader(manager);
-            if (md.materialXBase) loader.setPath(md.materialXBase);
+            // Don't call loader.setPath() — URLModifier already handles materialXBase
 
             // Get MaterialX XML — either from inline string or file fetch
             const getXml = md.materialXInline
@@ -5288,9 +5323,39 @@
             bridge.send('lock_camera', { handle: String(handle) });
         });
 
+        function syncCameraLockButtonUi() {
+            btnCam.textContent = `Cam Lock: ${camLock ? 'ON' : 'OFF'}`;
+            btnCam.classList.toggle('active', camLock);
+        }
+
+        function applyLayerCameraMode(mode, options = {}) {
+            if (mode === 'physical') {
+                const handle = parseInt(options.handle, 10) || 0;
+                if (!handle) return;
+                camLock = true;
+                syncCameraLockButtonUi();
+                controls.enabled = false;
+                if ([...selSceneCamera.options].some(o => o.value === String(handle))) {
+                    selSceneCamera.value = String(handle);
+                }
+                bridge.send('lock_camera', { handle: String(handle) });
+                return;
+            }
+
+            if (mode === 'viewport') {
+                selSceneCamera.value = '0';
+                bridge.send('lock_camera', { handle: '0' });
+                controls.enabled = !camLock;
+                return;
+            }
+        }
+
         // ── Camera Sync (Max view → world camera) ───────────
         function applyCamera(cam) {
-            if (!camLock || layerManager?.isCameraOverridden || xrRuntime?.active) return;
+            const layerCameraMode = layerManager?.cameraMode ?? 'viewport';
+            if (xrRuntime?.active) return;
+            if (layerCameraMode === 'script') return;
+            if (!camLock && layerCameraMode !== 'physical') return;
             if (!isFiniteArray(cam?.pos, 3) || !isFiniteArray(cam?.tgt, 3) || !isFiniteArray(cam?.up, 3)) {
                 return;
             }
@@ -5729,8 +5794,7 @@
         const btnCam = document.getElementById('btnCamLock');
         btnCam.onclick = () => {
             camLock = !camLock;
-            btnCam.textContent = `Cam Lock: ${camLock ? 'ON' : 'OFF'}`;
-            btnCam.classList.toggle('active', camLock);
+            syncCameraLockButtonUi();
             controls.enabled = !camLock;
             savePostFxState();
         };
@@ -7663,6 +7727,7 @@
             space: sceneSpace,
             controls,
             getCamera: () => camera,
+            onCameraModeChange: applyLayerCameraMode,
         });
         animationSystem = createMaxJSAnimationSystem({
             THREE,

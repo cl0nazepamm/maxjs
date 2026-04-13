@@ -34,7 +34,7 @@ Most 3dsmax materials are supported. three.js materials can be created in materi
 | **USD Preview Surface** | MeshStandardMaterial or MeshPhysicalMaterial |
 | **VRay Material** | MeshPhysicalMaterial (refraction, coat, thin film mapped) |
 | **OpenPBR Material** | MeshPhysicalMaterial (specular, coat, fuzz, transmission) |
-| **MaterialX** | Load external MaterialX |
+| **MaterialX** | Load external MaterialX (EXPERIMENTAL) | 
 | **Shell Material** | Reads viewport slot so you don't have to overwrite existing |
 
 Auto-promotion to MeshPhysicalMaterial triggers when clearcoat, sheen, transmission, iridescence, anisotropy, or non-default IOR is detected. Map colors always drive material even if a bitmap is connected.
@@ -60,7 +60,7 @@ Auto-promotion to MeshPhysicalMaterial triggers when clearcoat, sheen, transmiss
 | **Hemisphere** | No | color, intensity, ground color |
 | **Ambient** | No | color, intensity |
 
-All shadow-casting lights support configurable bias, blur radius, and map resolution. Volumetric light contribution parameter included but it's broken currently.
+All shadow-casting lights support configurable bias, blur radius, and map resolution.
 
 ---
 
@@ -109,7 +109,7 @@ Per-node flags synced to Three.js: renderable, backface cull, cast shadows, rece
 
 ---
 
-## Snapshots
+## Snapshots (WIP)
 
 One-click export to a self-contained HTML site with:
 - Full scene hierarchy with transforms
@@ -133,12 +133,13 @@ Per-resource disposal tracking for materials, textures, and geometries. Layers p
 
 # Exporting your scene standalone
 
-- **Snapshot sites**: Click snapshot and it saves. That's it. Your mileage may vary when it comes to performance or missing stuff
+- **Snapshot sites**: Click snapshot and it saves. That's it. Your mileage may vary when it comes to performance or missing stuff.
+- This is work in progress. Do not actually try anything serious with this.
 
 # Missing - To do
 
 - Vertex Color processing
-- Morpher (do not use morphers with skin modifier you will write vertex for every frame)
+- Morpher under Skin (do not use morphers with skin modifier you will write vertex for every frame). Otherwise you can use it.
 
 # Rendering frames
 
@@ -147,6 +148,7 @@ This tool targets web development but since it's registered as renderer I added 
 # Bugs
 - ActiveShade can bug out if you maximize or minimize windows. Just use registered "kill maxjs" command in search menu
 - No orthographic view (yet)
+
 
 # Build
 
@@ -175,4 +177,4 @@ Restart Max to load the plugin.
 
 MIT
 
-clone - 2026 Metaverse Makers
+clone - 2026

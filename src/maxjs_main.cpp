@@ -6437,10 +6437,9 @@ public:
 
     static void NormalizeSnapshotExportOptions(SnapshotExportOptions& options) {
         options.animationSampleStepFrames = std::clamp(options.animationSampleStepFrames, 1, 120);
-        if (!options.includeDebugPayload) {
-            options.includeSnapshotUi = false;
-            options.includeRuntimeScene = false;
-        }
+        // NOTE: snapshotUi (post-fx, camera) and runtimeScene (layers) are essential for
+        // working snapshots and should NOT be gated by includeDebugPayload. Debug payload
+        // only controls whether extra dev files (full project manifest, inline sources) are copied.
         if (!options.includeAnimations) {
             options.includeTransformAnimation = false;
             options.includeGeometryAnimation = false;
@@ -7254,11 +7253,24 @@ public:
                                                  const Interval& range,
                                                  TimeValue currentTime,
                                                  const SnapshotExportOptions& options,
+                                                 ULONG lockedCameraHandle,
                                                  SnapshotAnimationTargetDef& outTarget) {
         if (!ip) return false;
 
-        ViewExp& vp = ip->GetActiveViewExp();
-        INode* cameraNode = vp.GetViewCamera();
+        INode* cameraNode = nullptr;
+        if (lockedCameraHandle != 0) {
+            cameraNode = ip->GetINodeByHandle(lockedCameraHandle);
+            if (cameraNode) {
+                ObjectState lockedOs = cameraNode->EvalWorldState(currentTime);
+                if (!lockedOs.obj || lockedOs.obj->SuperClassID() != CAMERA_CLASS_ID) {
+                    cameraNode = nullptr;
+                }
+            }
+        }
+        if (!cameraNode) {
+            ViewExp& vp = ip->GetActiveViewExp();
+            cameraNode = vp.GetViewCamera();
+        }
         if (!cameraNode) {
             return false;
         }
@@ -7552,7 +7564,8 @@ public:
                                             TimeValue currentTime,
                                             const SnapshotExportOptions& options,
                                             std::string& outAnimBinary,
-                                            const std::unordered_set<ULONG>& skinRigMeshHandles) {
+                                            const std::unordered_set<ULONG>& skinRigMeshHandles,
+                                            ULONG lockedCameraHandle) {
         if (!ip) return;
 
         const Interval range = ip->GetAnimRange();
@@ -7625,7 +7638,8 @@ public:
 
         SnapshotAnimationTargetDef cameraTarget;
         if (options.includeCameraAnimation &&
-            BuildActiveCameraAnimationTarget(ip, range, currentTime, options, cameraTarget)) {
+            BuildActiveCameraAnimationTarget(
+                ip, range, currentTime, options, lockedCameraHandle, cameraTarget)) {
             targets.push_back(std::move(cameraTarget));
         }
 
@@ -7677,6 +7691,15 @@ public:
 
         if (!CopyDirectoryRecursive(webDir + L"\\js", outDir + L"\\js")) {
             error = L"Failed to copy snapshot runtime js directory";
+            return false;
+        }
+
+        if (!DirectoryExists(webDir + L"\\vendor")) {
+            error = L"Snapshot runtime dependency missing: web/vendor (three.js, etc.)";
+            return false;
+        }
+        if (!CopyDirectoryRecursive(webDir + L"\\vendor", outDir + L"\\vendor")) {
+            error = L"Failed to copy snapshot runtime vendor directory";
             return false;
         }
 
@@ -7989,6 +8012,8 @@ public:
 
         ss << L"],";
         WriteCameraJson(ss);
+        ss << L",";
+        WriteSceneCamerasJson(ss);
 
         EnvData envData;
         GetEnvironment(envData);
@@ -8021,7 +8046,8 @@ public:
             WriteAudiosJson(ss, ip, t, true, false, false);
         }
         if (options.includeAnimations) {
-            WriteSnapshotAnimationsJson(ss, nodes, ip, t, options, outAnimBinary, skinRigMeshHandles);
+            WriteSnapshotAnimationsJson(
+                ss, nodes, ip, t, options, outAnimBinary, skinRigMeshHandles, lockedCameraHandle_);
         }
 
         if (options.includeInstances) {
@@ -8143,7 +8169,8 @@ public:
             return false;
         }
 
-        if (options.includeDebugPayload) {
+        // Copy project layers when runtimeScene is included (needed for layer replay in snapshot)
+        if (options.includeRuntimeScene) {
             const std::wstring projectManifestPath = GetProjectManifestPath();
             if (!projectManifestPath.empty() && FileExists(projectManifestPath)) {
                 if (!CopyFileEnsuringDirectories(projectManifestPath, outDir + L"\\project.maxjs.json")) {
@@ -8153,19 +8180,22 @@ public:
                 }
             }
 
-            const std::wstring postFxPath = GetProjectPostFxPath();
-            if (!postFxPath.empty() && FileExists(postFxPath)) {
-                if (!CopyFileEnsuringDirectories(postFxPath, outDir + L"\\postfx.maxjs.json")) {
-                    error = L"Failed to copy postfx.maxjs.json into snapshot";
-                    cleanupOnFail();
-                    return false;
-                }
-            }
-
             const std::wstring inlineDir = GetInlineLayerDir();
             if (!inlineDir.empty() && DirectoryExists(inlineDir)) {
                 if (!CopyDirectoryRecursive(inlineDir, outDir + L"\\inlines")) {
                     error = L"Failed to copy inlines into snapshot";
+                    cleanupOnFail();
+                    return false;
+                }
+            }
+        }
+
+        // Copy postfx state when snapshotUi is included
+        if (options.includeSnapshotUi) {
+            const std::wstring postFxPath = GetProjectPostFxPath();
+            if (!postFxPath.empty() && FileExists(postFxPath)) {
+                if (!CopyFileEnsuringDirectories(postFxPath, outDir + L"\\postfx.maxjs.json")) {
+                    error = L"Failed to copy postfx.maxjs.json into snapshot";
                     cleanupOnFail();
                     return false;
                 }

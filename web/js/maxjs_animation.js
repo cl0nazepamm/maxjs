@@ -686,6 +686,16 @@ export function createMaxJSAnimationSystem({
         registryDirty = true;
     }
 
+    function isDrivingSceneCamera() {
+        for (const group of clipGroups.values()) {
+            if (!group.playing) continue;
+            for (const entry of group.customEntries) {
+                if (entry.targetId === 'camera:active') return true;
+            }
+        }
+        return false;
+    }
+
     function update(deltaSeconds) {
         if (registryDirty) refreshTargets();
         if (!Number.isFinite(deltaSeconds) || deltaSeconds <= 0) {
@@ -796,6 +806,7 @@ export function createMaxJSAnimationSystem({
         rebuildTargetRegistry,
         refreshTargets,
         invalidateTargets,
+        isDrivingSceneCamera,
         loadSnapshotAnimations,
         update,
         clear,

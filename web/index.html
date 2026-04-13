@@ -5448,12 +5448,14 @@
         }
 
         function applyStandaloneCameraState(savedCamera) {
-            if (!savedCamera) return;
+            if (!savedCamera) { console.log('[MaxJS] applyStandaloneCameraState: no savedCamera'); return; }
             if (!isFiniteArray(savedCamera.position, 3) ||
                 !isFiniteArray(savedCamera.up, 3) ||
                 !isFiniteArray(savedCamera.target, 3)) {
+                console.log('[MaxJS] applyStandaloneCameraState: invalid arrays', savedCamera);
                 return;
             }
+            console.log('[MaxJS] applyStandaloneCameraState: applying', savedCamera.position, savedCamera.target);
 
             const wantOrtho = savedCamera.perspective === false;
             const isOrtho = camera.isOrthographicCamera;
@@ -5582,10 +5584,8 @@
 
         function getSnapshotExportSettings() {
             const settings = sanitizeSnapshotSettings(snapshotSettings);
-            if (!settings.includeDebugPayload) {
-                settings.includeSnapshotUi = false;
-                settings.includeRuntimeScene = false;
-            }
+            // NOTE: snapshotUi (post-fx, camera) and runtimeScene (layers) are essential
+            // for working snapshots - don't gate them behind includeDebugPayload
             if (!settings.includeAnimations) {
                 settings.includeTransformAnimation = false;
                 settings.includeGeometryAnimation = false;
@@ -5753,16 +5753,12 @@
 
             const animationsEnabled = !!snapshotSettings.includeAnimations;
             const sceneNodesEnabled = !!snapshotSettings.includeSceneNodes;
-            const debugPayloadEnabled = !!snapshotSettings.includeDebugPayload;
             const animationKeys = ['includeTransformAnimation', 'includeGeometryAnimation', 'includeMaterialAnimation'];
             for (const key of animationKeys) {
                 const input = snapshotPanel.querySelector(`#snapshot-${key}`);
                 if (input) input.disabled = !animationsEnabled || !sceneNodesEnabled;
             }
-            const snapshotUiInput = snapshotPanel.querySelector('#snapshot-includeSnapshotUi');
-            if (snapshotUiInput) snapshotUiInput.disabled = !debugPayloadEnabled;
-            const runtimeSceneInput = snapshotPanel.querySelector('#snapshot-includeRuntimeScene');
-            if (runtimeSceneInput) runtimeSceneInput.disabled = !debugPayloadEnabled;
+            // NOTE: snapshotUi and runtimeScene are NOT gated by debugPayload - they're essential
             const cameraInput = snapshotPanel.querySelector('#snapshot-includeCameraAnimation');
             if (cameraInput) cameraInput.disabled = !animationsEnabled;
             const stepInput = snapshotPanel.querySelector('#snapshot-animationSampleStepFrames');
@@ -7221,6 +7217,7 @@
 
         function serializeSnapshotUiState({ includeDebug = false } = {}) {
             const payload = {
+                buildMode: includeDebug ? 'dev' : 'release',
                 toneMapping: currentToneMapping,
                 exposure: currentExposure,
                 aaMode: currentAAMode,
@@ -7749,7 +7746,7 @@
             const frameElapsed = inlineClock.getElapsedTime();
             xrRuntime.update(frameDt);
             if (!xrRuntime.active) syncOrbitNavigationFeel();
-            if (!xrRuntime.active) controls.update();
+            if (!xrRuntime.active && !(animationSystem?.isDrivingSceneCamera?.())) controls.update();
             // Auto-update DOF focus distance from camera-to-target when enabled
             // Skip when Physical Camera DOF is driving the values (Camera Lock ON + Physical Camera has DOF)
             if (!xrRuntime.active && (!physicalCameraDofActive || !camLock)) {
@@ -7922,6 +7919,11 @@
                         throw new Error(`HTTP ${animationResponse.status} for ${meta.animations.bin}`);
                     }
                     animationBuffer = await animationResponse.arrayBuffer();
+                }
+                // Pre-apply camLock from snapshotUi BEFORE handleBinaryScene to prevent fitCamera() override
+                if (meta.snapshotUi?.camLock != null) {
+                    camLock = !!meta.snapshotUi.camLock;
+                    console.log('[MaxJS] Pre-set camLock from snapshotUi:', camLock);
                 }
                 handleBinaryScene(buffer, meta);
                 if (meta.runtimeScene) {
@@ -8096,12 +8098,24 @@
                     }
                 }
                 if (meta.snapshotUi) {
+                    // Apply snapshot's buildMode if no URL override
+                    // Fallback: if debug object exists, treat as dev mode (for older snapshots)
+                    if (!urlMode) {
+                        const snapshotBuildMode = meta.snapshotUi.buildMode
+                            || (meta.snapshotUi.debug ? 'dev' : 'release');
+                        if (snapshotBuildMode !== buildMode) {
+                            buildMode = snapshotBuildMode;
+                            applyBuildMode();
+                        }
+                    }
                     // Force disable motion blur in standalone — no velocity data
                     if (meta.snapshotUi.fx?.motionBlur) {
                         meta.snapshotUi.fx.motionBlur.enabled = false;
                     }
                     applySavedPostFxPayload(meta.snapshotUi);
+                    console.log('[MaxJS] Applying standalone camera:', meta.snapshotUi.camera);
                     applyStandaloneCameraState(meta.snapshotUi.camera);
+                    console.log('[MaxJS] Camera after apply:', camera.position.toArray(), 'target:', controls.target.toArray());
                     syncPostFxPanel(true);
                 }
                 animationSystem.invalidateTargets();
@@ -8286,7 +8300,9 @@
         // Override via ?mode=dev or ?mode=release in URL
         const isStandalone = !(window.chrome?.webview?.postMessage);
         const urlMode = new URLSearchParams(location.search).get('mode');
-        const buildMode = urlMode || 'dev';
+        // Standalone snapshots default to release mode (no debug HUD)
+        // Can be overridden by snapshot's buildMode field
+        let buildMode = urlMode || (isStandalone ? 'release' : 'dev');
         const DEBUG_STORAGE_KEY = 'maxjs_debug';
         let debugMode = (localStorage.getItem(DEBUG_STORAGE_KEY) ?? 'true') === 'true';
         perfHud.setDebugEnabled(debugMode);

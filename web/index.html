@@ -1006,6 +1006,7 @@
             renderScale: 1.0,
             optimizeMaxInstances: true,
             maxInstanceBucketThreshold: 50,
+            splatsEnabled: true,
         });
         let performanceSettings = { ...PERFORMANCE_DEFAULTS };
         let lastRenderTimestamp = 0;
@@ -1240,7 +1241,25 @@
             return splatMutationQueue;
         }
 
+        function splatsViewerEnabled() {
+            return performanceSettings.splatsEnabled !== false;
+        }
+
+        async function shutdownSplatViewer() {
+            const handles = [...splatHandleMap.keys()];
+            for (const h of handles) await removeTrackedSplat(h);
+            if (splatOverlay) {
+                try {
+                    splatOverlay.renderer?.dispose?.();
+                    splatOverlay.renderer?.domElement?.remove?.();
+                } catch (e) { /* ignore */ }
+                splatOverlay = null;
+            }
+            Spark = null;
+        }
+
         async function ensureSplatOverlay() {
+            if (!splatsViewerEnabled()) return null;
             if (splatOverlay) return splatOverlay;
 
             if (!Spark) Spark = await import('@sparkjsdev/spark');
@@ -1309,6 +1328,11 @@
             const handle = splat?.h;
             if (handle == null) return;
 
+            if (!splatsViewerEnabled()) {
+                await removeTrackedSplat(handle);
+                return;
+            }
+
             const url = typeof splat.url === 'string' ? splat.url : '';
             if (!url) {
                 await removeTrackedSplat(handle);
@@ -1327,6 +1351,7 @@
             }
 
             const overlay = await ensureSplatOverlay();
+            if (!overlay) return;
             perfHud.setStatus(`MaxJS - Loading splat...`);
             const mesh = new Spark.SplatMesh({ url });
             mesh.name = splat.n || `Splat ${handle}`;
@@ -1338,6 +1363,10 @@
 
         function reconcileSplats(splats = []) {
             return queueSplatMutation(async () => {
+                if (!splatsViewerEnabled()) {
+                    await shutdownSplatViewer();
+                    return;
+                }
                 const incomingHandles = new Set(splats.map(splat => splat.h));
                 const staleHandles = [];
 
@@ -1357,6 +1386,7 @@
 
         function applySplatUpdates(splats = []) {
             if (!splats.length) return;
+            if (!splatsViewerEnabled()) return;
 
             return queueSplatMutation(async () => {
                 for (const splat of splats) {
@@ -5773,7 +5803,11 @@
             let runtimeSnapshotBase64 = '';
 
             if (settings.includeSnapshotUi) {
-                snapshotBase64 = toBase64Utf8(JSON.stringify(serializeSnapshotUiState({ includeDebug: settings.includeDebugPayload })));
+                const uiState = serializeSnapshotUiState({ includeDebug: settings.includeDebugPayload });
+                if (!settings.includeSplats && uiState.performance) {
+                    uiState.performance = { ...uiState.performance, splatsEnabled: false };
+                }
+                snapshotBase64 = toBase64Utf8(JSON.stringify(uiState));
             }
 
             if (settings.includeRuntimeScene) {
@@ -6576,6 +6610,10 @@
                                 <span>Optimize Max Instances</span>
                                 <input id="fx-performance-optimizeinstances" type="checkbox" ${performanceSettings.optimizeMaxInstances ? 'checked' : ''}>
                             </label>
+                            <label class="fx-check" for="fx-performance-splats">
+                                <span>Gaussian splats (Spark)</span>
+                                <input id="fx-performance-splats" type="checkbox" ${performanceSettings.splatsEnabled !== false ? 'checked' : ''}>
+                            </label>
                             <label class="fx-control" for="fx-performance-instancethreshold">
                                 <div class="fx-control-head">
                                     <span>Instance Bucket Threshold</span>
@@ -6584,7 +6622,7 @@
                                 <input class="fx-range" id="fx-performance-instancethreshold" type="range" min="2" max="500" step="1" value="${performanceSettings.maxInstanceBucketThreshold}">
                             </label>
                         </div>
-                        <div class="fx-note" id="fx-performance-note">Caps the viewer frame rate and scales device pixel ratio to reduce GPU load. XR stays uncapped.</div>
+                        <div class="fx-note" id="fx-performance-note">Caps the viewer frame rate and scales device pixel ratio to reduce GPU load. Splats off skips Spark (no second WebGL pass). XR stays uncapped.</div>
                     </section>
                     <section class="fx-section collapsed" data-fx-section="hdri">
                         <div class="fx-section-header">
@@ -6830,6 +6868,7 @@
             const renderScaleSlider = document.getElementById('fx-performance-renderscale');
             const renderScaleValue = document.getElementById('fx-performance-renderscale-val');
             const optimizeInstancesCheck = document.getElementById('fx-performance-optimizeinstances');
+            const splatsEnabledCheck = document.getElementById('fx-performance-splats');
             const instanceThresholdSlider = document.getElementById('fx-performance-instancethreshold');
             const instanceThresholdValue = document.getElementById('fx-performance-instancethreshold-val');
             fpsCapSelect.onchange = (e) => {
@@ -6850,6 +6889,22 @@
                 savePostFxState();
                 syncPostFxPanel(true);
             };
+            if (splatsEnabledCheck) {
+                splatsEnabledCheck.onchange = () => {
+                    performanceSettings.splatsEnabled = splatsEnabledCheck.checked;
+                    if (!performanceSettings.splatsEnabled) {
+                        splatMutationQueue = Promise.resolve();
+                        void shutdownSplatViewer().then(() => {
+                            savePostFxState();
+                            syncPostFxPanel(true);
+                        });
+                    } else {
+                        savePostFxState();
+                        syncPostFxPanel(true);
+                        bridge.send('scene_dirty');
+                    }
+                };
+            }
             instanceThresholdSlider.oninput = (e) => {
                 performanceSettings.maxInstanceBucketThreshold = Math.max(2, Math.round(Number(e.target.value) || 50));
                 instanceThresholdValue.textContent = String(performanceSettings.maxInstanceBucketThreshold);
@@ -7095,6 +7150,7 @@
             const renderScaleSlider = document.getElementById('fx-performance-renderscale');
             const renderScaleValue = document.getElementById('fx-performance-renderscale-val');
             const optimizeInstancesCheck = document.getElementById('fx-performance-optimizeinstances');
+            const splatsEnabledCheck = document.getElementById('fx-performance-splats');
             const instanceThresholdSlider = document.getElementById('fx-performance-instancethreshold');
             const instanceThresholdValue = document.getElementById('fx-performance-instancethreshold-val');
             const performanceNote = document.getElementById('fx-performance-note');
@@ -7113,11 +7169,12 @@
             if (renderScaleSlider) renderScaleSlider.value = String(performanceSettings.renderScale);
             if (renderScaleValue) renderScaleValue.textContent = `${performanceSettings.renderScale.toFixed(2)}x`;
             if (optimizeInstancesCheck) optimizeInstancesCheck.checked = !!performanceSettings.optimizeMaxInstances;
+            if (splatsEnabledCheck) splatsEnabledCheck.checked = performanceSettings.splatsEnabled !== false;
             if (instanceThresholdSlider) instanceThresholdSlider.value = String(performanceSettings.maxInstanceBucketThreshold);
             if (instanceThresholdValue) instanceThresholdValue.textContent = String(performanceSettings.maxInstanceBucketThreshold);
             if (performanceNote) {
                 performanceNote.textContent =
-                    `Caps the viewer frame rate and scales device pixel ratio to reduce GPU load. Effective DPR ${getEffectivePixelRatio().toFixed(2)}. Large plain Max instance groups can collapse into InstancedMesh buckets. XR stays uncapped.`;
+                    `Caps the viewer frame rate and scales device pixel ratio to reduce GPU load. Effective DPR ${getEffectivePixelRatio().toFixed(2)}. Splats off skips Spark. Large plain Max instance groups can collapse into InstancedMesh buckets. XR stays uncapped.`;
             }
 
             const hasEnabledEffects = ssgiFx.hasEnabledEffects();
@@ -7240,6 +7297,7 @@
                     renderScale: performanceSettings.renderScale,
                     optimizeMaxInstances: performanceSettings.optimizeMaxInstances,
                     maxInstanceBucketThreshold: performanceSettings.maxInstanceBucketThreshold,
+                    splatsEnabled: performanceSettings.splatsEnabled !== false,
                 },
                 ascii: { enabled: asciiActive, ...asciiSettings },
             };
@@ -7339,6 +7397,13 @@
                     }
                     if (Number.isFinite(saved.performance.maxInstanceBucketThreshold)) {
                         performanceSettings.maxInstanceBucketThreshold = Math.max(2, Math.round(saved.performance.maxInstanceBucketThreshold));
+                    }
+                    if (typeof saved.performance.splatsEnabled === 'boolean') {
+                        performanceSettings.splatsEnabled = saved.performance.splatsEnabled;
+                        if (!performanceSettings.splatsEnabled) {
+                            splatMutationQueue = Promise.resolve();
+                            void shutdownSplatViewer();
+                        }
                     }
                     applyRendererPerformanceSettings({ resizePostFx: true });
                 }
@@ -7924,6 +7989,13 @@
                 if (meta.snapshotUi?.camLock != null) {
                     camLock = !!meta.snapshotUi.camLock;
                     console.log('[MaxJS] Pre-set camLock from snapshotUi:', camLock);
+                }
+                if (meta.snapshotUi?.performance && typeof meta.snapshotUi.performance.splatsEnabled === 'boolean') {
+                    performanceSettings.splatsEnabled = meta.snapshotUi.performance.splatsEnabled;
+                    if (!performanceSettings.splatsEnabled) {
+                        splatMutationQueue = Promise.resolve();
+                        await shutdownSplatViewer();
+                    }
                 }
                 handleBinaryScene(buffer, meta);
                 if (meta.runtimeScene) {

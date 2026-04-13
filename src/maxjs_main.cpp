@@ -7683,6 +7683,7 @@ public:
 
     bool CopySnapshotRuntime(const std::wstring& webDir,
                              const std::wstring& outDir,
+                             bool copySparkDist,
                              std::wstring& error) {
         if (!CopyFileEnsuringDirectories(webDir + L"\\index.html", outDir + L"\\index.html")) {
             error = L"Failed to copy snapshot runtime index.html";
@@ -7703,17 +7704,19 @@ public:
             return false;
         }
 
-        const std::wstring sparkDist = webDir + L"\\node_modules\\@sparkjsdev\\spark\\dist";
-        if (!DirectoryExists(sparkDist)) {
-            error = L"Snapshot runtime dependency missing: @sparkjsdev/spark/dist";
-            return false;
-        }
+        if (copySparkDist) {
+            const std::wstring sparkDist = webDir + L"\\node_modules\\@sparkjsdev\\spark\\dist";
+            if (!DirectoryExists(sparkDist)) {
+                error = L"Snapshot runtime dependency missing: @sparkjsdev/spark/dist";
+                return false;
+            }
 
-        if (!CopyDirectoryRecursive(
-                sparkDist,
-                outDir + L"\\node_modules\\@sparkjsdev\\spark\\dist")) {
-            error = L"Failed to copy snapshot runtime spark dist";
-            return false;
+            if (!CopyDirectoryRecursive(
+                    sparkDist,
+                    outDir + L"\\node_modules\\@sparkjsdev\\spark\\dist")) {
+                error = L"Failed to copy snapshot runtime spark dist";
+                return false;
+            }
         }
 
         return true;
@@ -8135,7 +8138,7 @@ public:
             std::filesystem::remove_all(std::filesystem::path(outDir), ec);
         };
 
-        if (!CopySnapshotRuntime(webDir, outDir, error)) {
+        if (!CopySnapshotRuntime(webDir, outDir, options.includeSplats, error)) {
             cleanupOnFail();
             return false;
         }

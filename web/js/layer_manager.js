@@ -216,7 +216,7 @@ function freezePlainObject(obj) {
     return Object.freeze(obj);
 }
 
-function createCameraAdapter(camera, THREE, ownForJs, cameraControl, layerId) {
+function createCameraAdapter(camera, THREE, ownForJs, cameraControl, layerId, debugWarn = () => {}) {
     const scratch = {
         position: new THREE.Vector3(),
         target: new THREE.Vector3(),
@@ -234,7 +234,7 @@ function createCameraAdapter(camera, THREE, ownForJs, cameraControl, layerId) {
     function ensureOwnership() {
         const owner = cameraControl.getOwner();
         if (owner && owner !== layerId) {
-            console.warn(`[Camera] Layer ${layerId} cannot control camera owned by ${owner}`);
+            debugWarn(`[Camera] Layer ${layerId} cannot control camera owned by ${owner}`);
             return false;
         }
         if (!owner) {
@@ -882,6 +882,8 @@ export function createLayerManager({
     controls = null,
     getCamera = null,
     onCameraModeChange = null,
+    debugLog = () => {},
+    debugWarn = () => {},
 }) {
     const layers = new Map();
     const listeners = new Set();
@@ -1412,7 +1414,7 @@ export function createLayerManager({
 
     function buildContext(layer) {
         const rendererFacade = createRendererFacade(renderer);
-        const cameraFacade = createCameraAdapter(camera, THREE, ownForLayer, cameraControl, layer.id);
+        const cameraFacade = createCameraAdapter(camera, THREE, ownForLayer, cameraControl, layer.id, debugWarn);
         const nodeMapFacade = createNodeMapFacade(nodeMap, handle => getLayerNodeAdapter(layer, handle));
         const maxSceneFacade = createMaxSceneFacade({
             scene,
@@ -1434,8 +1436,8 @@ export function createLayerManager({
             gravity: Object.freeze(new THREE.Vector3(0, -980, 0)),
             space,
             units: 'cm',
-            log: (...args) => console.log(`[Layer:${layer.id}]`, ...args),
-            warn: (...args) => console.warn(`[Layer:${layer.id}]`, ...args),
+            log: (...args) => debugLog(`[Layer:${layer.id}]`, ...args),
+            warn: (...args) => debugWarn(`[Layer:${layer.id}]`, ...args),
             error: (...args) => console.error(`[Layer:${layer.id}]`, ...args),
         });
 
@@ -1687,7 +1689,7 @@ export function createLayerManager({
             try {
                 layer.hooks.dispose(layer.ctx);
             } catch (err) {
-                console.warn(`[LayerManager] Layer "${id}" dispose error:`, err);
+                debugWarn(`[LayerManager] Layer "${id}" dispose error:`, err);
             }
         }
 
@@ -1695,7 +1697,7 @@ export function createLayerManager({
             try {
                 disposeOwnedResource(resource);
             } catch (err) {
-                console.warn(`[LayerManager] Layer "${id}" tracked dispose error:`, err);
+                debugWarn(`[LayerManager] Layer "${id}" tracked dispose error:`, err);
             }
         }
         layer.tracked.clear();

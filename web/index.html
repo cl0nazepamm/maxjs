@@ -1205,6 +1205,29 @@
         const perfHud = createPerfHud(document.getElementById('info'));
         perfHud.setStatus(`MaxJS - ${rendererBackendLabel} renderer ready`);
 
+        const DEBUG_STORAGE_KEY = 'maxjs_debug';
+        const isStandalone = !(window.chrome?.webview?.postMessage);
+        const urlMode = new URLSearchParams(location.search).get('mode');
+        let buildMode = urlMode || (isStandalone ? 'release' : 'dev');
+        let debugMode = false;
+        try {
+            const raw = localStorage.getItem(DEBUG_STORAGE_KEY);
+            if (raw === 'true') debugMode = true;
+            else if (raw === 'false') debugMode = false;
+            else {
+                // Unset: loud inside Max; quiet for hosted snapshots (release). ?mode=dev defaults verbose.
+                debugMode = !isStandalone || buildMode !== 'release';
+            }
+        } catch (_) {
+            debugMode = !isStandalone;
+        }
+        function maxjsDebugLog(...args) {
+            if (debugMode) console.log(...args);
+        }
+        function maxjsDebugWarn(...args) {
+            if (debugMode) console.warn(...args);
+        }
+
         const ssgiFx = createSSGIController({
             renderer,
             scene,
@@ -1481,7 +1504,7 @@
 
             if (typeof CubeRenderTargetCtor !== 'function' || typeof CubeCameraCtor !== 'function') {
                 hasLightProbeData = false;
-                console.warn('MaxJS light probe generation unavailable: missing cube capture constructors');
+                maxjsDebugWarn('MaxJS light probe generation unavailable: missing cube capture constructors');
                 return;
             }
 
@@ -1504,7 +1527,7 @@
                 applyLightProbeState();
             } catch (error) {
                 hasLightProbeData = false;
-                console.warn('MaxJS light probe generation failed:', error);
+                maxjsDebugWarn('MaxJS light probe generation failed:', error);
             } finally {
                 cubeRenderTarget.dispose();
             }
@@ -1949,7 +1972,7 @@
                                 materialXIndex: 1,
                             });
                             applyLoadedTSLTemplate(template, fallback, md);
-                            console.warn('[MaterialX] Falling back to TSL code for MeshTSLNodeMaterial');
+                            maxjsDebugWarn('[MaterialX] Falling back to TSL code for MeshTSLNodeMaterial');
                             return template;
                         } catch (fallbackError) {
                             console.error('[MaterialX] TSL fallback failed:', fallbackError);
@@ -2033,7 +2056,7 @@
                     textureCache.set(cacheKey, result);
                     return result;
                 }
-                console.warn('[TSL Texture] Code did not return a Texture');
+                maxjsDebugWarn('[TSL Texture] Code did not return a Texture');
             } catch (err) {
                 console.error('[TSL Texture] Eval error:', err);
             }
@@ -2133,7 +2156,7 @@
                 const tx = db.transaction(HDRI_DB_STORE, 'readwrite');
                 tx.objectStore(HDRI_DB_STORE).put({ name: file.name, buffer: buf }, 'current');
                 db.close();
-            } catch (e) { console.warn('[MaxJS] HDRI stash failed:', e); }
+            } catch (e) { maxjsDebugWarn('[MaxJS] HDRI stash failed:', e); }
         }
 
         async function restoreStashedHdri() {
@@ -2613,7 +2636,7 @@
             const key = `${name}->${replacement}`;
             if (tslCompatWarnings.has(key)) return;
             tslCompatWarnings.add(key);
-            console.warn(`[TSL] Legacy API shim: ${name} -> ${replacement}`);
+            maxjsDebugWarn(`[TSL] Legacy API shim: ${name} -> ${replacement}`);
         }
 
         function getTSLCompatNamespace() {
@@ -2662,7 +2685,7 @@
                 const reason = md.materialXBridgeError || 'auto-compile produced no MaterialX payload';
                 console.error(`[MaterialX] Auto-compile bridge failed for ${sourceName}: ${reason}`);
             }
-            console.warn('[TSL Material] Missing MaterialX source and tslCode. Rendering debug fallback.', md);
+            maxjsDebugWarn('[TSL Material] Missing MaterialX source and tslCode. Rendering debug fallback.', md);
             const material = new THREE.MeshStandardMaterial({
                 color: 0xff00ff,
                 wireframe: true,
@@ -3027,8 +3050,6 @@
             on(type, fn) { (this.handlers[type] ??= []).push(fn); },
             dispatch(msg) { (this.handlers[msg.type] || []).forEach(fn => fn(msg)); }
         };
-        bridge.on('debug', (msg) => { console.warn('[maxjs/c++]', msg.msg); });
-
         function toBase64Utf8(text) {
             const bytes = new TextEncoder().encode(String(text ?? ''));
             let binary = '';
@@ -3085,7 +3106,8 @@
             if (Number.isFinite(partial.frameId) && partial.frameId > 0) {
                 latestAppliedSyncFrame = Math.max(latestAppliedSyncFrame, partial.frameId);
             }
-            if (!debugMode) return;
+            // Release / static snapshot: no HUD churn (perfHud.updateSync repaints + countInstances).
+            if (!debugMode || buildMode === 'release') return;
             perfHud.updateSync({
                 transport: partial.transport ?? transportMode,
                 frameId: partial.frameId ?? 0,
@@ -3141,7 +3163,7 @@
             if (!hasInitialSync) {
                 setInfoText('MaxJS - ' + (msg.msg || 'debug'));
             } else {
-                console.log('[MaxJS debug]', msg.msg || 'debug');
+                maxjsDebugLog('[MaxJS debug]', msg.msg || 'debug');
             }
         });
 
@@ -3651,7 +3673,7 @@
         }
 
         function profileSceneNodes(nodes) {
-            if (!debugMode) return;
+            if (!debugMode || buildMode === 'release') return;
             const stats = [];
             for (const nd of nodes) {
                 const mesh = nodeMap.get(nd.h);
@@ -5090,7 +5112,7 @@
             forestMeshes.clear();
 
             if (!Array.isArray(groups) || groups.length === 0) return;
-            console.log('[ForestPack]', groups.length, 'groups, total instances:', groups.reduce((s, g) => s + (g.count || 0), 0));
+            maxjsDebugLog('[ForestPack]', groups.length, 'groups, total instances:', groups.reduce((s, g) => s + (g.count || 0), 0));
 
             const m = new THREE.Matrix4();
 
@@ -5305,7 +5327,7 @@
                 rendered++;
             }
             if (rendered > 0) {
-                console.log('[Volume]', rendered, '/', volumes.length, 'blocks,', totalVoxels, 'voxels');
+                maxjsDebugLog('[Volume]', rendered, '/', volumes.length, 'blocks,', totalVoxels, 'voxels');
             }
         }
 
@@ -5478,14 +5500,14 @@
         }
 
         function applyStandaloneCameraState(savedCamera) {
-            if (!savedCamera) { console.log('[MaxJS] applyStandaloneCameraState: no savedCamera'); return; }
+            if (!savedCamera) { maxjsDebugLog('[MaxJS] applyStandaloneCameraState: no savedCamera'); return; }
             if (!isFiniteArray(savedCamera.position, 3) ||
                 !isFiniteArray(savedCamera.up, 3) ||
                 !isFiniteArray(savedCamera.target, 3)) {
-                console.log('[MaxJS] applyStandaloneCameraState: invalid arrays', savedCamera);
+                maxjsDebugLog('[MaxJS] applyStandaloneCameraState: invalid arrays', savedCamera);
                 return;
             }
-            console.log('[MaxJS] applyStandaloneCameraState: applying', savedCamera.position, savedCamera.target);
+            maxjsDebugLog('[MaxJS] applyStandaloneCameraState: applying', savedCamera.position, savedCamera.target);
 
             const wantOrtho = savedCamera.perspective === false;
             const isOrtho = camera.isOrthographicCamera;
@@ -5819,7 +5841,7 @@
                         const hasTransformOverrides = Array.isArray(runtimeSnapshot.transformOverrides)
                             && runtimeSnapshot.transformOverrides.length > 0;
                         if (layerRows > 0 && !runtimeSnapshot.jsRoot && !runtimeSnapshot.overlayRoot && !hasTransformOverrides) {
-                            console.warn(
+                            maxjsDebugWarn(
                                 '[MaxJS snapshot] Runtime scene has layer metadata but no serialized 3D (empty roots and no tracked orphans). '
                                 + 'Parent effects with ctx.js.add(...) / overlay:true, or ctx.track() if you attach elsewhere.',
                             );
@@ -7451,7 +7473,7 @@
                     if (saved.ascii.enabled) enterAsciiMode();
                 }
             } catch (e) {
-                console.warn('MaxJS: failed to apply post-FX state', e);
+                maxjsDebugWarn('MaxJS: failed to apply post-FX state', e);
             }
         }
 
@@ -7469,7 +7491,7 @@
                     if (!raw) return;
                     applySavedPostFxPayload(JSON.parse(raw));
                 } catch (e) {
-                    console.warn('MaxJS: failed to restore post-FX state', e);
+                    maxjsDebugWarn('MaxJS: failed to restore post-FX state', e);
                 }
             });
         }
@@ -7827,7 +7849,8 @@
             animationSystem?.update(frameDt);
             audioSystem?.update();
 
-            perfHud.updateLayers(layerManager.getStats());
+            const perfHudActive = perfHud.isDebugEnabled?.() ?? false;
+            if (perfHudActive) perfHud.updateLayers(layerManager.getStats());
             const renderStart = performance.now();
             try {
                 if (asciiActive && asciiEffect) {
@@ -7882,18 +7905,20 @@
                     });
                 }
             }
-            if (postPanelVisible || debugMode) {
+            if (postPanelVisible || (debugMode && buildMode !== 'release')) {
                 if ((frameTimeMs - lastPostFxPanelSyncMs) >= 250) {
                     lastPostFxPanelSyncMs = frameTimeMs;
                     syncPostFxPanel(false, { persist: false });
                 }
             }
-            perfHud.updateRender(performance.now() - renderStart, renderer.info?.render, renderer.info?.memory);
-            if (debugMode) {
+            if (perfHudActive) {
+                perfHud.updateRender(performance.now() - renderStart, renderer.info?.render, renderer.info?.memory);
+            }
+            if (debugMode && buildMode !== 'release') {
                 syncDebugConsole(false);
             }
             // Standalone / snapshot viewers have no bridge sync — drive the perf HUD from the render loop.
-            if (!(window.chrome?.webview?.postMessage) && debugMode) {
+            if (!(window.chrome?.webview?.postMessage) && debugMode && buildMode !== 'release') {
                 standaloneHudFrame++;
                 updateSyncHud({
                     transport: 'snapshot',
@@ -7921,10 +7946,13 @@
             controls,
             getCamera: () => camera,
             onCameraModeChange: applyLayerCameraMode,
+            debugLog: maxjsDebugLog,
+            debugWarn: maxjsDebugWarn,
         });
         animationSystem = createMaxJSAnimationSystem({
             THREE,
             nodeMap,
+            lightHandleMap,
             getCamera: () => camera,
             getControls: () => controls,
             getJsRoot: () => jsRoot,
@@ -7988,7 +8016,7 @@
                 // Pre-apply camLock from snapshotUi BEFORE handleBinaryScene to prevent fitCamera() override
                 if (meta.snapshotUi?.camLock != null) {
                     camLock = !!meta.snapshotUi.camLock;
-                    console.log('[MaxJS] Pre-set camLock from snapshotUi:', camLock);
+                    maxjsDebugLog('[MaxJS] Pre-set camLock from snapshotUi:', camLock);
                 }
                 if (meta.snapshotUi?.performance && typeof meta.snapshotUi.performance.splatsEnabled === 'boolean') {
                     performanceSettings.splatsEnabled = meta.snapshotUi.performance.splatsEnabled;
@@ -8063,7 +8091,7 @@
                             }
                             return true;
                         } catch (error) {
-                            console.warn('[MaxJS snapshot] project layer replay failed; falling back to baked runtimeScene', error);
+                            maxjsDebugWarn('[MaxJS snapshot] project layer replay failed; falling back to baked runtimeScene', error);
                             for (const id of mountedIds) {
                                 try { layerManager.remove(id); } catch {}
                             }
@@ -8142,7 +8170,7 @@
                                 }
                             }
                         } catch (err) {
-                            console.warn('[MaxJS snapshot] runtimeScene.jsRoot parse failed (non-fatal)', err);
+                            maxjsDebugWarn('[MaxJS snapshot] runtimeScene.jsRoot parse failed (non-fatal)', err);
                         }
                     }
                     if (!replayedProjectLayers && meta.runtimeScene.overlayRoot) {
@@ -8154,7 +8182,7 @@
                                 overlaySnapshotRoot.updateMatrixWorld(true);
                             }
                         } catch (err) {
-                            console.warn('[MaxJS snapshot] runtimeScene.overlayRoot parse failed (non-fatal)', err);
+                            maxjsDebugWarn('[MaxJS snapshot] runtimeScene.overlayRoot parse failed (non-fatal)', err);
                         }
                     }
                     // Layers hide Max meshes and draw deformed clones under jsRoot; export still bakes Max geometry as visible.
@@ -8185,9 +8213,9 @@
                         meta.snapshotUi.fx.motionBlur.enabled = false;
                     }
                     applySavedPostFxPayload(meta.snapshotUi);
-                    console.log('[MaxJS] Applying standalone camera:', meta.snapshotUi.camera);
+                    maxjsDebugLog('[MaxJS] Applying standalone camera:', meta.snapshotUi.camera);
                     applyStandaloneCameraState(meta.snapshotUi.camera);
-                    console.log('[MaxJS] Camera after apply:', camera.position.toArray(), 'target:', controls.target.toArray());
+                    maxjsDebugLog('[MaxJS] Camera after apply:', camera.position.toArray(), 'target:', controls.target.toArray());
                     syncPostFxPanel(true);
                 }
                 animationSystem.invalidateTargets();
@@ -8368,16 +8396,7 @@
         });
 
         // ── Build mode / Standalone / Debug ──
-        // Build modes: 'dev' (HUD + debug), 'release' (no HUD — e.g. static hosting)
-        // Override via ?mode=dev or ?mode=release in URL
-        const isStandalone = !(window.chrome?.webview?.postMessage);
-        const urlMode = new URLSearchParams(location.search).get('mode');
-        // Standalone snapshots default to release mode (no debug HUD)
-        // Can be overridden by snapshot's buildMode field
-        let buildMode = urlMode || (isStandalone ? 'release' : 'dev');
-        const DEBUG_STORAGE_KEY = 'maxjs_debug';
-        let debugMode = (localStorage.getItem(DEBUG_STORAGE_KEY) ?? 'true') === 'true';
-        perfHud.setDebugEnabled(debugMode);
+        // buildMode / isStandalone / urlMode are initialized near perfHud (early).
         const debugConsole = document.getElementById('debugConsole');
         let lastDebugConsoleSignature = '';
         let lastDebugConsolePaintMs = 0;
@@ -8478,6 +8497,8 @@
             const hud = document.getElementById('hud');
             const info = document.getElementById('info');
             const debugBtn = document.getElementById('btnDebug');
+            // Perf HUD + sync stats: only when not in static release mode (localStorage debug alone must not cost frames).
+            perfHud.setDebugEnabled(debugMode && buildMode !== 'release');
             if (buildMode === 'release') {
                 hud.style.display = 'none';
                 return;
@@ -8490,7 +8511,6 @@
 
         function setDebugMode(enabled) {
             debugMode = enabled;
-            perfHud.setDebugEnabled(enabled);
             try { localStorage.setItem(DEBUG_STORAGE_KEY, String(debugMode)); } catch {}
             applyBuildMode();
             syncDebugConsole(true);

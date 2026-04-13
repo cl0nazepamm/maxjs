@@ -108,6 +108,8 @@ export function createProjectRuntime({ layerManager, bridge, perfHud }) {
     let timer = 0;
     let revision = 0;
     let pollInFlight = false;
+    /** Serializes manifest application so persist + poll reload cannot interleave mounts/removes. */
+    let manifestApplyGate = Promise.resolve();
     let manifestState = null;
     let nextRequestId = 1;
     let suppressProjectReloadCount = 0;
@@ -353,24 +355,34 @@ export function createProjectRuntime({ layerManager, bridge, perfHud }) {
     }
 
     async function applyManifest(manifest, options = {}) {
-        const forceReload = !!options.forceReload;
-        manifestState = manifest;
-        const desiredLayers = buildManifestLayers(manifest).filter(entry => entry.enabled);
-        const desiredIds = new Set(desiredLayers.map(entry => entry.id));
+        const previous = manifestApplyGate;
+        let releaseGate;
+        manifestApplyGate = new Promise((resolve) => {
+            releaseGate = resolve;
+        });
+        await previous.catch(() => {});
+        try {
+            const forceReload = !!options.forceReload;
+            manifestState = manifest;
+            const desiredLayers = buildManifestLayers(manifest).filter(entry => entry.enabled);
+            const desiredIds = new Set(desiredLayers.map(entry => entry.id));
 
-        for (const id of [...activeLayerIds]) {
-            if (!desiredIds.has(id)) removeProjectLayer(id);
+            for (const id of [...activeLayerIds]) {
+                if (!desiredIds.has(id)) removeProjectLayer(id);
+            }
+
+            for (const entry of desiredLayers) {
+                const current = activeProjectLayers.get(entry.id);
+                if (!forceReload && current?.signature === entry.signature) continue;
+
+                if (current) removeProjectLayer(entry.id);
+                await mountLayer(entry, manifest);
+            }
+
+            emitChange();
+        } finally {
+            releaseGate();
         }
-
-        for (const entry of desiredLayers) {
-            const current = activeProjectLayers.get(entry.id);
-            if (!forceReload && current?.signature === entry.signature) continue;
-
-            if (current) removeProjectLayer(entry.id);
-            await mountLayer(entry, manifest);
-        }
-
-        emitChange();
     }
 
     async function reload(force = false) {
@@ -430,12 +442,12 @@ export function createProjectRuntime({ layerManager, bridge, perfHud }) {
 
     async function persistManifest(nextManifest, options = {}) {
         const text = `${JSON.stringify(nextManifest, null, 2)}\n`;
-        if (options.reload === false) {
-            suppressProjectReloadCount = Math.max(suppressProjectReloadCount, 2);
-        }
+        // Always reload:false: we apply `nextManifest` locally below. Asking the host to
+        // SendProjectReload in parallel races with this async applyManifest (and with poll
+        // reload), overlapping layer teardown/mount and crashing WebView2.
         await requestHostAction('project_manifest_write', {
             contentBase64: toBase64Utf8(text),
-            reload: options.reload !== false,
+            reload: false,
         });
 
         lastManifestText = text;

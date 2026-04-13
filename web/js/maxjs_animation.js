@@ -120,6 +120,7 @@ function collectRuntimeTargets(root, registry) {
 export function createMaxJSAnimationSystem({
     THREE,
     nodeMap,
+    lightHandleMap,
     getCamera,
     getControls,
     getJsRoot,
@@ -578,6 +579,13 @@ export function createMaxJSAnimationSystem({
 
         for (const [handle, object] of nodeMap.entries()) {
             if (object) targetRegistry.set(`handle:${handle}`, object);
+        }
+
+        // Include lights for animation (lights may have animated parent transforms)
+        if (lightHandleMap) {
+            for (const [handle, light] of lightHandleMap.entries()) {
+                if (light) targetRegistry.set(`handle:${handle}`, light);
+            }
         }
 
         const camera = getCamera?.();

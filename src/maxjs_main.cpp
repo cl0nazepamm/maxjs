@@ -7636,6 +7636,28 @@ public:
             }
         }
 
+        // Light animations — only creates tracks if light or its parents are animated
+        if (options.includeTransformAnimation) {
+            INode* sceneRoot = ip->GetRootNode();
+            std::function<void(INode*)> collectLightAnims = [&](INode* parent) {
+                for (int i = 0; i < parent->NumberOfChildren(); ++i) {
+                    INode* node = parent->GetChildNode(i);
+                    if (!node) continue;
+
+                    ObjectState os = node->EvalWorldState(currentTime);
+                    if (os.obj && IsThreeJSLightClassID(os.obj->ClassID())) {
+                        SnapshotAnimationTargetDef lightTarget;
+                        if (BuildNodeAnimationTarget(node, range, currentTime, options, lightTarget)) {
+                            targets.push_back(std::move(lightTarget));
+                        }
+                    }
+
+                    collectLightAnims(node);
+                }
+            };
+            if (sceneRoot) collectLightAnims(sceneRoot);
+        }
+
         SnapshotAnimationTargetDef cameraTarget;
         if (options.includeCameraAnimation &&
             BuildActiveCameraAnimationTarget(
@@ -10918,7 +10940,6 @@ public:
         if (!pb) return false;
 
         const ULONG handle = node->GetHandle();
-        Matrix3 tm = node->GetObjectTM(t);
         float xform[16];
         GetTransform16(node, t, xform);
         if (trackHandle) {
@@ -10926,6 +10947,10 @@ public:
             RememberSentTransform(handle, xform);
         }
 
+        // World-space orientation/position (matches GetTransform16 / binary light deltas).
+        // GetObjectTM() is parent-relative; parented TJS lights under dummies/controllers
+        // would not follow unless we use GetObjTMAfterWSM here.
+        Matrix3 tm = node->GetObjTMAfterWSM(t);
         const Class_ID classId = os.obj->ClassID();
         ThreeJSLightType ltype = GetThreeJSLightTypeFromClassID(classId);
         if (ThreeJSLightClassUsesTypeParam(classId)) {

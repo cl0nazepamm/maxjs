@@ -6537,9 +6537,9 @@
                             <label class="fx-control" for="fx-tonemapping-exp">
                                 <div class="fx-control-head">
                                     <span>Exposure</span>
-                                    <span class="fx-value" id="fx-tonemapping-exp-val">${currentExposure.toFixed(1)}</span>
+                                    <span class="fx-value" id="fx-tonemapping-exp-val">+0.0 EV</span>
                                 </div>
-                                <input class="fx-range" id="fx-tonemapping-exp" type="range" min="0" max="5" step="0.1" value="${currentExposure}">
+                                <input class="fx-range" id="fx-tonemapping-exp" type="range" min="-6" max="4" step="0.1" value="0" data-ev="true">
                             </label>
                         </div>
                     </section>
@@ -6812,10 +6812,11 @@
             const expSlider = document.getElementById('fx-tonemapping-exp');
             const expLabel = document.getElementById('fx-tonemapping-exp-val');
             expSlider.oninput = (e) => {
-                currentExposure = parseFloat(e.target.value);
+                const ev = parseFloat(e.target.value);
+                currentExposure = Math.pow(2, ev);
                 renderer.toneMappingExposure = currentExposure;
                 ssgiFx.markOutputChanged?.();
-                expLabel.textContent = currentExposure.toFixed(1);
+                expLabel.textContent = `${ev >= 0 ? '+' : ''}${ev.toFixed(1)} EV`;
             };
             expSlider.onchange = () => savePostFxState();
 
@@ -7105,8 +7106,9 @@
             if (tmSelect) tmSelect.value = currentToneMapping;
             const expSlider = document.getElementById('fx-tonemapping-exp');
             const expLabel = document.getElementById('fx-tonemapping-exp-val');
-            if (expSlider) expSlider.value = String(currentExposure);
-            if (expLabel) expLabel.textContent = currentExposure.toFixed(2);
+            const currentEV = Math.log2(currentExposure || 1);
+            if (expSlider) expSlider.value = String(currentEV);
+            if (expLabel) expLabel.textContent = `${currentEV >= 0 ? '+' : ''}${currentEV.toFixed(1)} EV`;
             const aaSelect = document.getElementById('fx-aa-mode');
             if (aaSelect) aaSelect.value = currentAAMode;
             const aaTraaOption = document.querySelector('#fx-aa-mode option[value="traa"]');
@@ -7611,7 +7613,8 @@
                     captureCameraState();
                     controls.enabled = false;
                     xrOrigin.visible = true;
-                    xrOrigin.scale.setScalar(1);
+                    // Scale up for cm units (Max) vs meters (VR headset)
+                    xrOrigin.scale.setScalar(100);
                     xrOrigin.add(camera);
                     syncControllerInputSources();
                     recenterOrigin();
@@ -7768,7 +7771,26 @@
                 if (asciiActive && asciiEffect) {
                     asciiEffect.render(scene, camera);
                 } else if (xrRuntime.shouldBypassPostFx) {
+                    // Reduce brightness for VR (no post-fx tone mapping)
+                    const savedExposure = renderer.toneMappingExposure;
+                    const vrLightScale = 0.1;
+                    renderer.toneMappingExposure = savedExposure * 0.15;
+                    // Scale down lights temporarily
+                    scene.traverse(obj => {
+                        if (obj.isLight && obj.intensity !== undefined) {
+                            obj.userData._vrSavedIntensity = obj.intensity;
+                            obj.intensity *= vrLightScale;
+                        }
+                    });
                     renderer.render(scene, camera);
+                    // Restore
+                    renderer.toneMappingExposure = savedExposure;
+                    scene.traverse(obj => {
+                        if (obj.isLight && obj.userData._vrSavedIntensity !== undefined) {
+                            obj.intensity = obj.userData._vrSavedIntensity;
+                            delete obj.userData._vrSavedIntensity;
+                        }
+                    });
                 } else {
                     ssgiFx.render();
                 }

@@ -308,6 +308,25 @@ export function createSSGIController({
     const BLOB_MATCH_DIST = 0.3;    // max centroid distance to match (normalized)
     const BLOB_FADE_FRAMES = 8;     // frames before an unmatched blob disappears
 
+    function disableUnsupportedRealtimeEffects() {
+        if (supportsScreenSpaceEffects) return;
+        state.ssgi.enabled = false;
+        state.ssr.enabled = false;
+        state.gtao.enabled = false;
+        state.motionBlur.enabled = false;
+        state.traa.enabled = false;
+        state.bloom.enabled = false;
+        state.toonOutline.enabled = false;
+        state.contactShadow.enabled = false;
+        state.retro.enabled = false;
+        state.pixel.enabled = false;
+        state.volumetric.enabled = false;
+        state.dof.enabled = false;
+        state.fog.enabled = false;
+        state.opaqueBackdrop.enabled = false;
+        state.clone.enabled = false;
+    }
+
     function matchAndSmooth(rawBlobs) {
         const lerp = state.clone.smoothing;
         const used = new Set();
@@ -675,6 +694,7 @@ export function createSSGIController({
     }
 
     function snapshotState() {
+        disableUnsupportedRealtimeEffects();
         return {
             ssgi: { ...state.ssgi },
             ssr: { ...state.ssr },
@@ -1683,6 +1703,12 @@ export function createSSGIController({
             return state.toonOutline.enabled;
         },
         setToonOutlineEnabled(enabled) {
+            if (enabled && !supportsScreenSpaceEffects) {
+                lastError = 'Toon outline requires the real WebGPU backend';
+                state.toonOutline.enabled = false;
+                onError(lastError);
+                return false;
+            }
             state.toonOutline.enabled = !!enabled;
             rebuildPipeline();
             return state.toonOutline.enabled;
@@ -1698,6 +1724,12 @@ export function createSSGIController({
             return state.contactShadow.enabled;
         },
         setContactShadowEnabled(enabled) {
+            if (enabled && !supportsScreenSpaceEffects) {
+                lastError = 'Contact shadows require the real WebGPU backend';
+                state.contactShadow.enabled = false;
+                onError(lastError);
+                return false;
+            }
             if (enabled && !mainLight) {
                 // Auto-find a directional light in the scene
                 scene.traverse(obj => {
@@ -1963,6 +1995,15 @@ export function createSSGIController({
             assignFinite(state.clone, 'smoothing', options.smoothing);
             if (Array.isArray(options.color)) state.clone.color = options.color;
             return { ...state.clone };
+        },
+        sanitizeForCurrentBackend() {
+            disableUnsupportedRealtimeEffects();
+            if (!supportsScreenSpaceEffects) {
+                restoreForcedContactShadowLight();
+                removeVolumetricMesh();
+            }
+            rebuildPipeline();
+            return snapshotState();
         },
 
         render() {

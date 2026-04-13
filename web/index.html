@@ -799,6 +799,8 @@
                     <button id="btnEnv" class="devonly">Env: OFF</button>
                     <button id="btnLightProbe" class="active devonly">Probe: ON</button>
                     <button id="btnLightHelpers" class="devonly">Light Helpers</button>
+                    <button id="btnRenderer" class="devonly">Renderer: WebGPU</button>
+                    <button id="btnSwitchVR" class="devonly">Switch to VR</button>
                     <div class="menu-sep"></div>
                     <button id="btnTheme">Theme: Dark</button>
                     <button id="btnDebug" style="display:none">Debug</button>
@@ -1049,21 +1051,33 @@
             nextRenderer?.dispose?.();
         }
 
-        async function createRenderer() {
-            // Check if VR mode was requested (forces WebGL for XR compat)
+        function consumeRequestedRendererBackend() {
+            const explicit = sessionStorage.getItem('maxjs_renderer_backend');
+            if (explicit) {
+                sessionStorage.removeItem('maxjs_renderer_backend');
+                return explicit;
+            }
             const forceVR = sessionStorage.getItem('maxjs_force_webgl') === '1';
-            if (forceVR) sessionStorage.removeItem('maxjs_force_webgl');
+            if (forceVR) {
+                sessionStorage.removeItem('maxjs_force_webgl');
+                return 'webgl-vr';
+            }
+            return '';
+        }
+
+        async function createRenderer() {
+            const requestedBackend = consumeRequestedRendererBackend();
 
             let nextRenderer;
             let backendLabel;
 
-            if (forceVR) {
+            if (requestedBackend === 'webgl' || requestedBackend === 'webgl-vr') {
                 nextRenderer = new THREE_STD.WebGLRenderer({
                     antialias: true,
                     alpha: true,
                     powerPreference: 'high-performance',
                 });
-                backendLabel = 'WebGL2 (VR)';
+                backendLabel = requestedBackend === 'webgl-vr' ? 'WebGL2 (VR)' : 'WebGL2';
                 configureRenderer(nextRenderer);
                 await initializeRenderer(nextRenderer);
             } else {
@@ -1102,6 +1116,8 @@
         const controls = new OrbitControls(camera, renderer.domElement);
         controls.enableDamping = true;
         controls.dampingFactor = 0.08;
+        controls.zoomToCursor = true;
+        controls.screenSpacePanning = false;
         controls.mouseButtons = {
             LEFT: null,               // reserved for selection
             MIDDLE: THREE.MOUSE.PAN,  // middle = pan
@@ -1109,6 +1125,7 @@
         };
         controls.zoomSpeed = 2.0;
         controls.rotateSpeed = 0.5;
+        controls.panSpeed = 1.0;
         // Alt+MMB = orbit (3ds Max style) — capture phase to beat OrbitControls
         renderer.domElement.addEventListener('pointerdown', e => {
             if (e.button === 1 && controls.enabled) {
@@ -1162,7 +1179,10 @@
         const exrLoader = new EXRLoader();
         textureLoader.setCrossOrigin?.('anonymous');
         rgbeLoader.setCrossOrigin?.('anonymous');
-        const pmremGenerator = new THREE.PMREMGenerator(renderer);
+        const PMREMGeneratorCtor = String(rendererBackendLabel || '').startsWith('WebGL2')
+            ? THREE_STD.PMREMGenerator
+            : THREE.PMREMGenerator;
+        const pmremGenerator = new PMREMGeneratorCtor(renderer);
         pmremGenerator.compileEquirectangularShader();
 
         const textureCache = new Map();
@@ -5399,6 +5419,7 @@
             }
             camera.updateProjectionMatrix();
             controls.target.copy(cameraTargetWorld);
+            syncOrbitNavigationFeel();
 
             // Forward Physical Camera DOF to post-fx when available
             physicalCameraDofActive = !!cam.dofEnabled;
@@ -5470,6 +5491,7 @@
 
             camera.updateProjectionMatrix();
             controls.target.fromArray(savedCamera.target);
+            syncOrbitNavigationFeel();
             controls.update();
         }
 
@@ -5481,11 +5503,32 @@
             const size = box.getSize(new THREE.Vector3());
             const maxDim = Math.max(size.x, size.y, size.z);
             controls.target.copy(center);
-            camera.position.copy(center).addScaledVector(cameraDefaultDirection, maxDim * 1.85);
-            camera.near = maxDim * 0.001;
-            camera.far = maxDim * 100;
+            if (camera.isPerspectiveCamera) {
+                const verticalFov = THREE.MathUtils.degToRad(camera.fov || 60);
+                const fitDistance = maxDim / Math.max(0.2, 2 * Math.tan(verticalFov * 0.5));
+                camera.position.copy(center).addScaledVector(cameraDefaultDirection, fitDistance * 1.15);
+            } else {
+                camera.position.copy(center).addScaledVector(cameraDefaultDirection, Math.max(maxDim, 1) * 1.15);
+            }
+            camera.near = Math.max(0.01, maxDim * 0.001);
+            camera.far = Math.max(1000, maxDim * 100);
             camera.updateProjectionMatrix();
+            syncOrbitNavigationFeel();
             controls.update();
+        }
+
+        function syncOrbitNavigationFeel() {
+            const distance = Math.max(0.01, camera.position.distanceTo(controls.target));
+            const box = computeVisibleSceneBounds(new THREE.Box3());
+            const size = box.isEmpty() ? new THREE.Vector3(1, 1, 1) : box.getSize(new THREE.Vector3());
+            const maxDim = Math.max(1, size.x, size.y, size.z);
+            const scale = THREE.MathUtils.clamp(distance / maxDim, 0.15, 6.0);
+
+            controls.panSpeed = THREE.MathUtils.clamp(scale * 1.1, 0.15, 3.5);
+            controls.zoomSpeed = THREE.MathUtils.clamp(1.35 + Math.log2(scale + 1.0), 0.8, 3.0);
+            controls.rotateSpeed = THREE.MathUtils.clamp(0.42 + scale * 0.08, 0.35, 0.95);
+            controls.minDistance = Math.max(0.01, maxDim * 0.0025);
+            controls.maxDistance = Math.max(1000, maxDim * 25);
         }
 
         // ── UI Controls ─────────────────────────────────────
@@ -5825,6 +5868,59 @@
             if (lightProbeEnabled) refreshLightProbeFromCurrentHDRI();
             savePostFxState();
         };
+
+        const btnRenderer = document.getElementById('btnRenderer');
+        const btnSwitchVR = document.getElementById('btnSwitchVR');
+        function isWebGLBackendActive() {
+            return String(rendererBackendLabel || '').startsWith('WebGL2');
+        }
+        function syncRendererButtonUi() {
+            if (!btnRenderer) return;
+            const webgl = isWebGLBackendActive();
+            btnRenderer.textContent = `Renderer: ${webgl ? 'WebGL2' : 'WebGPU'}`;
+            btnRenderer.classList.toggle('active', webgl);
+            if (btnSwitchVR) {
+                btnSwitchVR.textContent = webgl ? 'VR Ready: WebGL2' : 'Switch to VR';
+                btnSwitchVR.classList.toggle('active', webgl);
+            }
+        }
+        function restartWithRendererBackend(mode, options = {}) {
+            const reason = options.reason || 'manual';
+            const confirmMessage = options.confirmMessage
+                || `Restart MaxJS with ${mode === 'webgl' ? 'WebGL2' : 'WebGPU'} backend now?`;
+            if (mode === 'webgl' && reason === 'vr') {
+                sessionStorage.setItem('maxjs_force_webgl', '1');
+            } else {
+                sessionStorage.setItem('maxjs_renderer_backend', mode);
+            }
+            if (options.prompt === false || confirm(confirmMessage)) {
+                location.reload();
+                return;
+            }
+            if (mode === 'webgl' && reason === 'vr') {
+                sessionStorage.removeItem('maxjs_force_webgl');
+            } else {
+                sessionStorage.removeItem('maxjs_renderer_backend');
+            }
+        }
+        btnRenderer?.addEventListener('click', () => {
+            const nextMode = isWebGLBackendActive() ? 'webgpu' : 'webgl';
+            restartWithRendererBackend(nextMode, {
+                reason: 'manual',
+                confirmMessage: `Restart MaxJS with ${nextMode === 'webgl' ? 'WebGL2' : 'WebGPU'} backend now?`,
+            });
+        });
+        btnSwitchVR?.addEventListener('click', () => {
+            if (isWebGLBackendActive()) {
+                perfHud.setStatus('MaxJS - WebGL2 backend is already active for VR');
+                return;
+            }
+            restartWithRendererBackend('webgl', {
+                reason: 'vr',
+                confirmMessage: 'WebXR needs the WebGL backend.\n\nOnly tested on Quest 3 with VDXR (Virtual Desktop).\n\nRestart MaxJS in VR mode now?',
+            });
+        });
+        syncRendererButtonUi();
 
         // ── Theme Toggle ─────────────────────────────────
         const btnTheme = document.getElementById('btnTheme');
@@ -6973,11 +7069,13 @@
             const derived = postPanelVisible ? ssgiFx.getDerivedState() : null;
             const available = ssgiFx.isAvailable();
             const supportsScreenSpaceEffects = ssgiFx.supportsScreenSpaceEffects();
+            const postFxInteractiveAvailable = rendererBackendLabel === 'WebGPU';
             const lastError = ssgiFx.getLastError();
             const signature = JSON.stringify({
                 panel: postPanelVisible,
                 available,
                 supportsScreenSpaceEffects,
+                postFxInteractiveAvailable,
                 lastError,
                 performanceSettings,
                 state,
@@ -6989,7 +7087,9 @@
 
             const panelStatus = document.getElementById('postPanelStatus');
             if (panelStatus) {
-                panelStatus.textContent = available
+                panelStatus.textContent = !postFxInteractiveAvailable
+                    ? `${rendererBackendLabel} backend • Post FX disabled on WebGL`
+                    : available
                     ? `${rendererBackendLabel} backend`
                     : `${rendererBackendLabel} backend • ${lastError || 'unavailable'}`;
             }
@@ -7009,6 +7109,8 @@
             if (expLabel) expLabel.textContent = currentExposure.toFixed(2);
             const aaSelect = document.getElementById('fx-aa-mode');
             if (aaSelect) aaSelect.value = currentAAMode;
+            const aaTraaOption = document.querySelector('#fx-aa-mode option[value="traa"]');
+            if (aaTraaOption) aaTraaOption.disabled = !supportsScreenSpaceEffects;
             if (fpsCapSelect) fpsCapSelect.value = String(performanceSettings.fpsCap || 0);
             if (renderScaleSlider) renderScaleSlider.value = String(performanceSettings.renderScale);
             if (renderScaleValue) renderScaleValue.textContent = `${performanceSettings.renderScale.toFixed(2)}x`;
@@ -7028,6 +7130,7 @@
                 const enabled = section.isEnabled();
                 const disabledByOther = section.disabledBy ? section.disabledBy(state) : null;
                 const disabled =
+                    !postFxInteractiveAvailable ||
                     !available ||
                     (section.requiresWebGPU && !supportsScreenSpaceEffects) ||
                     !!disabledByOther;
@@ -7062,6 +7165,9 @@
                 let isError = false;
                 if (!available && lastError) {
                     note = lastError;
+                    isError = true;
+                } else if (!postFxInteractiveAvailable) {
+                    note = 'Post FX is disabled on WebGL. Switch back to WebGPU to use these effects.';
                     isError = true;
                 } else if (section.requiresWebGPU && !supportsScreenSpaceEffects) {
                     note = 'Requires the real WebGPU backend.';
@@ -7152,6 +7258,7 @@
 
         function savePostFxState() {
             if (suppressPostFxPersistenceDepth > 0) return;
+            if (rendererBackendLabel !== 'WebGPU') return;
             const projectRuntime = _projectRuntimeRef;
             if (projectRuntime?.setPostFxState) {
                 const payload = serializePersistedPostFxState();
@@ -7174,6 +7281,8 @@
 
         function applySavedPostFxPayload(saved) {
             try {
+                const supportsScreenSpaceEffects = ssgiFx.supportsScreenSpaceEffects();
+                const postFxInteractiveAvailable = rendererBackendLabel === 'WebGPU';
                 let toneMappingChanged = false;
                 if (saved.toneMapping && toneMappingModes[saved.toneMapping] != null) {
                     currentToneMapping = saved.toneMapping;
@@ -7187,7 +7296,9 @@
                 }
                 if (toneMappingChanged) ssgiFx.markOutputChanged?.();
                 if (saved.aaMode && ['msaa', 'traa', 'off'].includes(saved.aaMode)) {
-                    currentAAMode = saved.aaMode;
+                    currentAAMode = (!postFxInteractiveAvailable || !supportsScreenSpaceEffects) && saved.aaMode === 'traa'
+                        ? 'msaa'
+                        : saved.aaMode;
                     ssgiFx.setTRAAEnabled(currentAAMode === 'traa');
                 }
                 if (typeof saved.envVisible === 'boolean') {
@@ -7241,15 +7352,22 @@
                 const fx = saved.fx;
                 if (!fx) return;
 
-                for (const section of postFxSections) {
-                    const saved = fx[section.key];
-                    if (!saved) continue;
-                    const wasEnabled = saved.enabled;
-                    delete saved.enabled;
-                    // Apply values first (without triggering rebuild per-param)
-                    section.setValues(saved);
-                    // Then enable/disable
-                    if (wasEnabled) section.setEnabled(true);
+                if (postFxInteractiveAvailable) {
+                    for (const section of postFxSections) {
+                        const saved = fx[section.key];
+                        if (!saved) continue;
+                        if (section.requiresWebGPU && !supportsScreenSpaceEffects) continue;
+                        const wasEnabled = saved.enabled;
+                        delete saved.enabled;
+                        // Apply values first (without triggering rebuild per-param)
+                        section.setValues(saved);
+                        // Then enable/disable
+                        if (wasEnabled) section.setEnabled(true);
+                    }
+                }
+
+                if (!postFxInteractiveAvailable || !supportsScreenSpaceEffects) {
+                    ssgiFx.sanitizeForCurrentBackend?.();
                 }
 
                 // Clone blob tracker restore
@@ -7339,16 +7457,6 @@
 
             const isNativeWebGPU = rendererBackendLabel === 'WebGPU';
             if (isNativeWebGPU) {
-                const vrNote = document.createElement('button');
-                vrNote.textContent = 'Switch to VR';
-                vrNote.style.cssText = 'position:absolute;bottom:8px;right:8px;z-index:100;background:rgba(40,40,60,0.78);color:#ddd;border:1px solid #333;padding:4px 10px;border-radius:0;font:10px "Segoe UI",sans-serif;cursor:pointer';
-                vrNote.onclick = () => {
-                    if (confirm('WebXR needs the WebGL backend.\n\nOnly tested on Quest 3 with VDXR (Virtual Desktop).\n\nRestart MaxJS in VR mode now?')) {
-                        sessionStorage.setItem('maxjs_force_webgl', '1');
-                        location.reload();
-                    }
-                };
-                document.body.appendChild(vrNote);
                 return runtime;
             }
 
@@ -7637,6 +7745,7 @@
             const frameDt = inlineClock.getDelta();
             const frameElapsed = inlineClock.getElapsedTime();
             xrRuntime.update(frameDt);
+            if (!xrRuntime.active) syncOrbitNavigationFeel();
             if (!xrRuntime.active) controls.update();
             // Auto-update DOF focus distance from camera-to-target when enabled
             // Skip when Physical Camera DOF is driving the values (Camera Lock ON + Physical Camera has DOF)
@@ -7837,7 +7946,9 @@
                         const mountedIds = [];
                         try {
                             for (const entry of enabledLayers) {
-                                const moduleUrl = new URL(entry.entryPath.replace(/\\/g, '/'), manifestBaseUrl);
+                                const entryPath = String(entry.entryPath || entry.entry || entry.path || '').replace(/\\/g, '/');
+                                if (!entryPath) throw new Error(`Missing layer entry path for ${entry.id}`);
+                                const moduleUrl = new URL(entryPath, manifestBaseUrl);
                                 moduleUrl.searchParams.set('v', `${Date.now()}_${entry.id}`);
                                 const moduleNamespace = await import(moduleUrl.toString());
                                 const factory = resolveSnapshotLayerFactory(moduleNamespace);

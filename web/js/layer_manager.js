@@ -840,34 +840,6 @@ function createInputHelper(renderer) {
     };
 }
 
-const SANDBOX_DOM_WHITELIST = new Set(['canvas', 'img', 'video', 'audio']);
-
-const sandboxDocument = Object.freeze({
-    createElement(tag) {
-        const t = String(tag).toLowerCase();
-        if (!SANDBOX_DOM_WHITELIST.has(t))
-            throw new Error(`Sandbox: createElement("${t}") not allowed. Whitelist: ${[...SANDBOX_DOM_WHITELIST].join(', ')}`);
-        return document.createElement(t);
-    },
-});
-
-const SANDBOX_PRELUDE = [
-    '"use strict";',
-    'const window = undefined;',
-    'const globalThis = undefined;',
-    'const self = undefined;',
-    'const chrome = undefined;',
-    'const fetch = undefined;',
-    'const XMLHttpRequest = undefined;',
-    'const WebSocket = undefined;',
-    'const localStorage = undefined;',
-    'const sessionStorage = undefined;',
-].join('\n');
-
-function buildInlineFactory(code) {
-    return new Function('ctx', 'THREE', 'document', `${SANDBOX_PRELUDE}\n${code}`);
-}
-
 export function createLayerManager({
     scene,
     camera,
@@ -1674,13 +1646,6 @@ export function createLayerManager({
         return { id, error: layer.error };
     }
 
-    function inject(id, code, name) {
-        return mount(id, async (ctx, runtimeThree) => {
-            const factory = buildInlineFactory(code);
-            return factory(ctx, runtimeThree, sandboxDocument);
-        }, { name: name || id, code, source: 'inline' });
-    }
-
     function remove(id, options = {}) {
         const layer = layers.get(id);
         if (!layer) return false;
@@ -1732,10 +1697,6 @@ export function createLayerManager({
 
     function clear() {
         clearWhere();
-    }
-
-    function clearInline() {
-        clearWhere(layer => layer.source === 'inline');
     }
 
     function list() {
@@ -1927,10 +1888,8 @@ export function createLayerManager({
             projectControl = control;
             emitChange('project_bound');
         },
-        inject,
         remove,
         clear,
-        clearInline,
         setActive(id, active) {
             const layer = layers.get(id);
             if (!layer) return false;

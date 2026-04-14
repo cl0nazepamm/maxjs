@@ -808,13 +808,8 @@ export function createProjectRuntime({ layerManager, bridge, perfHud, debugLog =
         emitChange();
     });
 
-    function hasInlineMount(id) {
-        return mountedInlineLayers.has(id);
-    }
-
     return {
         subscribe,
-        hasInlineMount,
         listEntries,
         listInlineEntries,
         setLayerEnabled,

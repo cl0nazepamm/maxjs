@@ -5672,8 +5672,7 @@ public:
     MaxJSFastRedrawCallback fastRedrawCallback_;
     MaxJSFastTimeChangeCallback fastTimeChangeCallback_;
 
-    // ── JS_Inline hot folder ──────────────────────────
-    std::unordered_map<std::wstring, ULONGLONG> inlineFileStamps_;  // filename → last write time
+    // ── Inline layer scan state ────────────────────────
     std::wstring inlineLayersStateSignature_;
 
     static std::wstring ReadUtf8File(const std::wstring& path) {
@@ -5760,70 +5759,11 @@ public:
         webview_->PostWebMessageAsJson(payload.c_str());
     }
 
+    // Inline-folder scan — just notifies the JS project runtime of the
+    // current file list. The runtime imports each .js as an ES module
+    // via the asset URL host. There is no legacy sandbox-inject path.
     void ScanInlineLayers() {
         if (!webview_ || !jsReady_) return;
-
-        const std::wstring dir = GetInlineHotLayerDir();
-        // Track which enabled layer files still exist this scan
-        std::unordered_set<std::wstring> seenEnabled;
-
-        if (!dir.empty() && DirectoryExists(dir)) {
-            const std::wstring pattern = dir + L"*";
-            WIN32_FIND_DATAW fd;
-            HANDLE hFind = FindFirstFileW(pattern.c_str(), &fd);
-            if (hFind != INVALID_HANDLE_VALUE) {
-                do {
-                    if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-
-                    const std::wstring filename(fd.cFileName);
-                    std::wstring id;
-                    bool enabled = false;
-                    if (!TryParseInlineLayerFileName(filename, id, enabled)) continue;
-                    if (!enabled) continue;
-
-                    seenEnabled.insert(filename);
-
-                    ULONGLONG stamp = ((ULONGLONG)fd.ftLastWriteTime.dwHighDateTime << 32)
-                                    | fd.ftLastWriteTime.dwLowDateTime;
-
-                    auto it = inlineFileStamps_.find(filename);
-                    if (it != inlineFileStamps_.end() && it->second == stamp) continue;
-
-                    const std::wstring filePath = dir + filename;
-                    std::wstring code = ReadUtf8File(filePath);
-                    if (code.empty()) continue;
-
-                    std::wostringstream ss;
-                    ss << L"{\"type\":\"js_inline\",\"action\":\"inject\",\"id\":\""
-                       << EscapeJson(id.c_str()) << L"\",\"name\":\""
-                       << EscapeJson(id.c_str()) << L"\",\"code\":\""
-                       << EscapeJson(code.c_str()) << L"\"}";
-                    webview_->PostWebMessageAsJson(ss.str().c_str());
-                    inlineFileStamps_[filename] = stamp;
-                } while (FindNextFileW(hFind, &fd));
-                FindClose(hFind);
-            }
-        }
-
-        // Remove layers whose files were deleted
-        for (auto it = inlineFileStamps_.begin(); it != inlineFileStamps_.end(); ) {
-            if (seenEnabled.find(it->first) == seenEnabled.end()) {
-                std::wstring id;
-                bool enabled = false;
-                if (!TryParseInlineLayerFileName(it->first, id, enabled)) {
-                    ++it;
-                    continue;
-                }
-                std::wostringstream ss;
-                ss << L"{\"type\":\"js_inline\",\"action\":\"remove\",\"id\":\""
-                   << EscapeJson(id.c_str()) << L"\"}";
-                webview_->PostWebMessageAsJson(ss.str().c_str());
-                it = inlineFileStamps_.erase(it);
-            } else {
-                ++it;
-            }
-        }
-
         SendInlineLayersState();
     }
 
@@ -8267,46 +8207,6 @@ public:
         webview_->PostWebMessageAsJson(ss.str().c_str());
     }
 
-    void SendInlineLayerRemove(const std::wstring& id) {
-        if (!webview_ || !jsReady_) return;
-        std::wostringstream ss;
-        ss << L"{\"type\":\"js_inline\",\"action\":\"remove\",\"id\":\""
-           << EscapeJson(id.c_str()) << L"\"}";
-        webview_->PostWebMessageAsJson(ss.str().c_str());
-    }
-
-    void SendInlineLayerClear() {
-        if (!webview_ || !jsReady_) return;
-        webview_->PostWebMessageAsJson(L"{\"type\":\"js_inline\",\"action\":\"clear\"}");
-    }
-
-    bool SendInlineLayerInject(const std::wstring& id, std::wstring& error) {
-        if (!webview_ || !jsReady_) return true;
-
-        const std::wstring fileName = GetInlineLayerFileName(id, true);
-        const std::wstring filePath = GetInlineHotLayerDir() + fileName;
-        std::wstring code = ReadUtf8File(filePath);
-        if (code.empty()) {
-            error = L"Inline layer file is empty or unreadable";
-            return false;
-        }
-
-        std::wostringstream ss;
-        ss << L"{\"type\":\"js_inline\",\"action\":\"inject\",\"id\":\""
-           << EscapeJson(id.c_str()) << L"\",\"name\":\""
-           << EscapeJson(id.c_str()) << L"\",\"code\":\""
-           << EscapeJson(code.c_str()) << L"\"}";
-        webview_->PostWebMessageAsJson(ss.str().c_str());
-
-        ULONGLONG stamp = 0;
-        if (TryGetFileWriteStamp(filePath, stamp)) {
-            inlineFileStamps_[fileName] = stamp;
-        } else {
-            inlineFileStamps_.erase(fileName);
-        }
-        return true;
-    }
-
     void SendProjectConfig() {
         if (!webview_) return;
 
@@ -8476,8 +8376,6 @@ public:
             return false;
         }
 
-        inlineFileStamps_.erase(enabledFileName);
-        SendInlineLayerRemove(id);
         SendInlineLayersState(true);
         return true;
     }
@@ -8514,13 +8412,7 @@ public:
             return false;
         }
 
-        inlineFileStamps_.erase(enabledFileName);
         if (jsReady_) {
-            if (enabled) {
-                if (!SendInlineLayerInject(id, error)) return false;
-            } else {
-                SendInlineLayerRemove(id);
-            }
             SendInlineLayersState(true);
         } else {
             inlineLayersStateSignature_.clear();
@@ -8531,8 +8423,6 @@ public:
     bool ClearInlineLayerFiles(std::wstring& error) {
         const std::wstring dir = GetInlineHotLayerDir();
         if (dir.empty() || !DirectoryExists(dir)) {
-            inlineFileStamps_.clear();
-            SendInlineLayerClear();
             SendInlineLayersState(true);
             return true;
         }
@@ -8555,8 +8445,6 @@ public:
             FindClose(hFind);
         }
 
-        inlineFileStamps_.clear();
-        SendInlineLayerClear();
         SendInlineLayersState(true);
         return true;
     }
@@ -9434,7 +9322,6 @@ public:
             if (ok) {
                 activeProjectDir_ = projectDir;
                 activeProjectStamp_ = GetProjectRuntimeWriteStamp(projectDir);
-                inlineFileStamps_.clear();
                 inlineLayersStateSignature_.clear();
                 SendProjectConfig();
                 SendProjectReload();
@@ -9549,8 +9436,7 @@ public:
             propHashMap_.clear();
             geoHashMap_.clear();  // force all geometry to be sent
             jsmodStateMap_.clear();
-            inlineFileStamps_.clear();  // re-scan inline layers on reconnect
-            inlineLayersStateSignature_.clear();
+            inlineLayersStateSignature_.clear();  // re-scan inline layers on reconnect
             lastSentTransforms_.clear();
             lightHandles_.clear();
             splatHandles_.clear();

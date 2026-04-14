@@ -6073,12 +6073,9 @@
 
         function getPanelLayers() {
             // listEntries() is the single source of truth — driven by the
-            // C++ inlines/ folder scan via inline_layers_state. Anything in
-            // the layer manager that isn't in that list is an unmounted
-            // sandboxed inline (legacy path) shown for parity.
-            const projectLayers = _projectRuntimeRef?.listEntries?.()
-                ?? (_layerManagerRef?.list?.() ?? []).filter(layer => layer.source === 'project');
-            return [...projectLayers].sort((a, b) => a.name.localeCompare(b.name));
+            // C++ inlines/ folder scan via inline_layers_state.
+            const layers = _projectRuntimeRef?.listEntries?.() ?? [];
+            return [...layers].sort((a, b) => a.name.localeCompare(b.name));
         }
 
         function getProjectRuntimeState() {
@@ -6135,13 +6132,8 @@
 
         async function handleLayerClearAll() {
             try {
-                await _projectRuntimeRef?.clearPersistedLayers?.();
-                if (_projectRuntimeRef?.clearInlineLayers) {
-                    await _projectRuntimeRef.clearInlineLayers();
-                    _layerManagerRef?.clearInline?.();
-                } else {
-                    _layerManagerRef?.clear?.();
-                }
+                await _projectRuntimeRef?.clearInlineLayers?.();
+                _layerManagerRef?.clear?.();
             } catch (error) {
                 reportBridgeError('layer clear', error);
             }
@@ -8341,37 +8333,6 @@
             }
         }
 
-        bridge.on('js_inline', msg => {
-            // The inline-scan auto-mount path (project_runtime inline_layers_state)
-            // imports the file as an ES module via a URL. The legacy js_inline
-            // path tries to compile the file content inside a sandbox via
-            // `new Function`, which chokes on `export default`. If the same id
-            // is already mounted via the URL path, ignore js_inline so we don't
-            // clobber a working mount with a sandbox-syntax error.
-            const project = window.maxJSProjectRuntime;
-            const ownedByProjectRuntime = project?.hasInlineMount?.(msg.id) === true;
-            switch (msg.action) {
-                case 'inject': case 'update': {
-                    if (ownedByProjectRuntime) {
-                        bridge.send('js_inline_result', { id: msg.id, error: null });
-                        return;
-                    }
-                    void layerManager.inject(msg.id, msg.code, msg.name).then(result => {
-                        bridge.send('js_inline_result', { id: msg.id, error: result?.error || null });
-                        if (!result?.error) bridge.send('scene_dirty');
-                    });
-                    break;
-                }
-                case 'remove': {
-                    if (ownedByProjectRuntime) return;
-                    layerManager.remove(msg.id);
-                    bridge.send('scene_dirty');
-                    break;
-                }
-                case 'list':   bridge.send('js_inline_list', { layers: layerManager.list().filter(layer => layer.source === 'inline') }); break;
-                case 'clear':  layerManager.clearInline(); bridge.send('scene_dirty'); break;
-            }
-        });
 
         // ── Render to Image (production render) ──────────────
         let savedPerformanceSettings = null;

@@ -36,10 +36,11 @@ Most 3dsmax materials are supported. Three.js materials can be created in materi
 | **USD Preview Surface** | MeshStandardMaterial or MeshPhysicalMaterial |
 | **VRay Material** | MeshPhysicalMaterial (refraction, coat, thin film mapped) |
 | **OpenPBR Material** | MeshPhysicalMaterial (specular, coat, fuzz, transmission) |
-| **MaterialX** | Load external MaterialX (EXPERIMENTAL) | 
+| **MaterialX** | Load external MaterialX | 
 | **Shell Material** | Reads viewport slot so you don't have to overwrite existing |
 
-Auto-promotion to MeshPhysicalMaterial triggers when clearcoat, sheen, transmission, iridescence, anisotropy, or non-default IOR is detected. Map colors always drive material even if a bitmap is connected.
+Auto-promotion to MeshPhysicalMaterial triggers when clearcoat, sheen, transmission, iridescence, anisotropy, or non-default IOR is detected. Map colors always drive result even if a bitmap is connected.
+MaterialX Compiler slot can be used to convert 3dsMax OSL into MaterialX quickly (via MtlxIOUtil).
 
 ---
 

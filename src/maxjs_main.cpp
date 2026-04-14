@@ -5934,19 +5934,14 @@ public:
     }
 
     std::wstring GetWebDir() {
+        // 1. Dev hot-reload: set MAXJS_WEB_DIR before launching Max to point
+        //    at any web folder (e.g. your cloned repo's web/).
         std::wstring envWebDir = GetEnvironmentString(L"MAXJS_WEB_DIR");
         if (!envWebDir.empty() && DirectoryExists(envWebDir)) {
             return envWebDir;
         }
 
-#ifdef MAXJS_SOURCE_WEB_DIR
-        std::wstring sourceWebDir = Utf8ToWide(MAXJS_SOURCE_WEB_DIR);
-        std::replace(sourceWebDir.begin(), sourceWebDir.end(), L'/', L'\\');
-        if (DirectoryExists(sourceWebDir)) {
-            return sourceWebDir;
-        }
-#endif
-
+        // 2. Shipped runtime: maxjs_web/ sibling of maxjs.gup.
         wchar_t p[MAX_PATH];
         GetModuleFileNameW(hInstance, p, MAX_PATH);
         std::wstring d(p); d = d.substr(0, d.find_last_of(L"\\/"));
@@ -5959,19 +5954,6 @@ public:
         if (!envProjectDir.empty()) {
             return envProjectDir;
         }
-
-#ifdef MAXJS_SOURCE_WEB_DIR
-        std::wstring sourceWebDir = Utf8ToWide(MAXJS_SOURCE_WEB_DIR);
-        std::replace(sourceWebDir.begin(), sourceWebDir.end(), L'/', L'\\');
-        const size_t split = sourceWebDir.find_last_of(L"\\/");
-        if (split != std::wstring::npos) {
-            const std::wstring repoRoot = sourceWebDir.substr(0, split);
-            const std::wstring repoProjectDir = repoRoot + L"\\projects\\active";
-            if (DirectoryExists(repoProjectDir)) {
-                return repoProjectDir;
-            }
-        }
-#endif
 
         wchar_t p[MAX_PATH];
         GetModuleFileNameW(hInstance, p, MAX_PATH);
@@ -6093,19 +6075,8 @@ public:
 
     // Returns the projects root folder (parent of "active", "bee", etc.)
     std::wstring GetProjectsRoot() {
-#ifdef MAXJS_SOURCE_WEB_DIR
-        std::wstring sourceWebDir = Utf8ToWide(MAXJS_SOURCE_WEB_DIR);
-        std::replace(sourceWebDir.begin(), sourceWebDir.end(), L'/', L'\\');
-        const size_t split = sourceWebDir.find_last_of(L"\\/");
-        if (split != std::wstring::npos) {
-            std::wstring root = sourceWebDir.substr(0, split) + L"\\projects";
-            // Ensure the projects root exists
-            std::error_code ec;
-            std::filesystem::create_directories(std::filesystem::path(root), ec);
-            if (DirectoryExists(root)) return root;
-        }
-#endif
-        // Fallback: parent of GetProjectDir()
+        // Parent of GetProjectDir(). If no scene is saved, falls back to the
+        // plugin's sibling projects folder.
         const std::wstring projectDir = GetProjectDir();
         if (projectDir.empty()) return GetFallbackProjectDir();
         const size_t split2 = projectDir.find_last_of(L"\\/");

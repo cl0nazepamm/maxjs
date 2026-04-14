@@ -1,6 +1,8 @@
-# max.js - Create interactive web experiences directly inside 3dsmax. 
+# max.js - Three.js integration for 3dsmax
 
  Comes with a nice postfx stack and it's very fun to play around with! Runs on WebGPU backend.
+
+![max.js demo](img/maxjs.gif)
 
 # Features
 

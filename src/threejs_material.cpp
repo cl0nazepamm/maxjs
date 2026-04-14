@@ -21,6 +21,21 @@ static void NotifyOwnerMaterialEdited(IParamBlock2* pb) {
     MaxJSNotifyMaterialEdited(owner);
 }
 
+// IColorSwatch::GetColor() returns COLORREF on the 2026 SDK and Color on
+// 2027+. Overload here so call sites compile against either SDK without
+// version macros — the compiler picks the right one based on the return
+// type of GetColor().
+static inline void SwatchColorToFloat3(COLORREF c, float* out) {
+    out[0] = GetRValue(c) / 255.0f;
+    out[1] = GetGValue(c) / 255.0f;
+    out[2] = GetBValue(c) / 255.0f;
+}
+static inline void SwatchColorToFloat3(const Color& c, float* out) {
+    out[0] = c.r;
+    out[1] = c.g;
+    out[2] = c.b;
+}
+
 // ══════════════════════════════════════════════════════════════
 //  ThreeJS Materials — native PBR materials for the MaxJS viewport
 //
@@ -1410,11 +1425,8 @@ public:
                     dlgHwnd, (HMENU)(INT_PTR)(baseId + kTSLDynCtrl), hInst, nullptr);
                 IColorSwatch* cs = GetIColorSwatch(hSwatch);
                 if (cs) {
-                    COLORREF cr = RGB(
-                        static_cast<int>(p.color[0] * 255.0f),
-                        static_cast<int>(p.color[1] * 255.0f),
-                        static_cast<int>(p.color[2] * 255.0f));
-                    cs->SetColor(cr);
+                    Color col(p.color[0], p.color[1], p.color[2]);
+                    cs->SetColor(col);
                     state.dynSwatches.push_back(cs);
                 }
             } else if (p.type == TSLParamType::Bool) {
@@ -1438,10 +1450,7 @@ public:
             if (p.type == TSLParamType::Float && spinIdx < static_cast<int>(state.dynSpinners.size())) {
                 p.floatVal = state.dynSpinners[spinIdx++]->GetFVal();
             } else if (p.type == TSLParamType::Color && swatchIdx < static_cast<int>(state.dynSwatches.size())) {
-                COLORREF cr = state.dynSwatches[swatchIdx++]->GetColor();
-                p.color[0] = GetRValue(cr) / 255.0f;
-                p.color[1] = GetGValue(cr) / 255.0f;
-                p.color[2] = GetBValue(cr) / 255.0f;
+                SwatchColorToFloat3(state.dynSwatches[swatchIdx++]->GetColor(), p.color);
             } else if (p.type == TSLParamType::Bool) {
                 for (int i = 0; i < static_cast<int>(state.dynParams.size()); ++i) {
                     if (&state.dynParams[i] == &p) {
@@ -1904,11 +1913,8 @@ public:
                     dlgHwnd, (HMENU)(INT_PTR)(baseId + 2), hInst, nullptr);
                 IColorSwatch* cs = GetIColorSwatch(hSwatch);
                 if (cs) {
-                    COLORREF cr = RGB(
-                        static_cast<int>(p.color[0] * 255.0f),
-                        static_cast<int>(p.color[1] * 255.0f),
-                        static_cast<int>(p.color[2] * 255.0f));
-                    cs->SetColor(cr);
+                    Color col(p.color[0], p.color[1], p.color[2]);
+                    cs->SetColor(col);
                     state.dynSwatches.push_back(cs);
                 }
             } else if (p.type == TSLParamType::Bool) {
@@ -1932,10 +1938,7 @@ public:
             if (p.type == TSLParamType::Float && spinIdx < static_cast<int>(state.dynSpinners.size())) {
                 p.floatVal = state.dynSpinners[spinIdx++]->GetFVal();
             } else if (p.type == TSLParamType::Color && swatchIdx < static_cast<int>(state.dynSwatches.size())) {
-                COLORREF cr = state.dynSwatches[swatchIdx++]->GetColor();
-                p.color[0] = GetRValue(cr) / 255.0f;
-                p.color[1] = GetGValue(cr) / 255.0f;
-                p.color[2] = GetBValue(cr) / 255.0f;
+                SwatchColorToFloat3(state.dynSwatches[swatchIdx++]->GetColor(), p.color);
             } else if (p.type == TSLParamType::Bool) {
                 HWND hChk = GetDlgItem(dlgHwnd, kBase + static_cast<int>(pi) * 3 + 2);
                 if (hChk) p.boolVal = (IsDlgButtonChecked(dlgHwnd, kBase + static_cast<int>(pi) * 3 + 2) == BST_CHECKED);

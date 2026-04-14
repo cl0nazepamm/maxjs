@@ -1016,6 +1016,16 @@
             splatsEnabled: true,
         });
         let performanceSettings = { ...PERFORMANCE_DEFAULTS };
+
+        // User-overridable camera clip planes. null means "use auto-fit value".
+        // Raise `near` to reclaim depth precision on large scenes where distant geo z-fights.
+        const cameraClip = { near: null, far: null };
+        function applyCameraClipOverrides(cam) {
+            if (!cam) return;
+            if (Number.isFinite(cameraClip.near) && cameraClip.near > 0) cam.near = cameraClip.near;
+            if (Number.isFinite(cameraClip.far) && cameraClip.far > cam.near) cam.far = cameraClip.far;
+            cam.updateProjectionMatrix();
+        }
         let lastRenderTimestamp = 0;
 
         function getEffectivePixelRatio() {
@@ -3956,6 +3966,12 @@
             });
         });
 
+        // Audio param edits ride a standalone JSON message because the binary
+        // delta's UpdateAudio command only carries transform + visibility.
+        bridge.on('audio_update', msg => {
+            if (Array.isArray(msg?.audios)) audioSystem?.applyAudioUpdates(msg.audios);
+        });
+
         // ── Binary Scene Handler (SharedBuffer) ──────────────
         function binInRange(buffer, off, n) {
             return (
@@ -5481,7 +5497,7 @@
                 const hRad = cam.fov * Math.PI / 180;
                 camera.fov = 2 * Math.atan(Math.tan(hRad / 2) / aspect) * 180 / Math.PI;
             }
-            camera.updateProjectionMatrix();
+            applyCameraClipOverrides(camera);
             controls.target.copy(cameraTargetWorld);
             syncOrbitNavigationFeel();
 
@@ -5555,7 +5571,7 @@
                 camera.fov = savedCamera.fov;
             }
 
-            camera.updateProjectionMatrix();
+            applyCameraClipOverrides(camera);
             controls.target.fromArray(savedCamera.target);
             syncOrbitNavigationFeel();
             controls.update();
@@ -5578,7 +5594,7 @@
             }
             camera.near = Math.max(0.01, maxDim * 0.001);
             camera.far = Math.max(1000, maxDim * 100);
-            camera.updateProjectionMatrix();
+            applyCameraClipOverrides(camera);
             syncOrbitNavigationFeel();
             controls.update();
         }
@@ -6056,14 +6072,13 @@
         }
 
         function getPanelLayers() {
-            const runtimeLayers = _layerManagerRef?.list?.() ?? [];
-            const projectLayers = _projectRuntimeRef?.listEntries?.() ?? runtimeLayers.filter(layer => layer.source === 'project');
-            const inlineLayers = _projectRuntimeRef?.listInlineEntries?.()
-                ?? runtimeLayers.filter(layer => layer.source !== 'project');
-            return [
-                ...projectLayers.sort((a, b) => a.name.localeCompare(b.name)),
-                ...inlineLayers.sort((a, b) => a.name.localeCompare(b.name)),
-            ];
+            // listEntries() is the single source of truth — driven by the
+            // C++ inlines/ folder scan via inline_layers_state. Anything in
+            // the layer manager that isn't in that list is an unmounted
+            // sandboxed inline (legacy path) shown for parity.
+            const projectLayers = _projectRuntimeRef?.listEntries?.()
+                ?? (_layerManagerRef?.list?.() ?? []).filter(layer => layer.source === 'project');
+            return [...projectLayers].sort((a, b) => a.name.localeCompare(b.name));
         }
 
         function getProjectRuntimeState() {
@@ -6089,18 +6104,18 @@
             return details.join(' | ');
         }
 
-        async function handleLayerToggle(layer) {
-            try {
-                const enabled = !(layer.enabled !== false);
-                if (layer.source === 'project') {
-                    await _projectRuntimeRef?.setLayerEnabled(layer.id, enabled);
-                } else {
-                    if (layer.persisted === false) return;
-                    await _projectRuntimeRef?.setInlineLayerEnabled?.(layer.id, enabled);
-                }
-            } catch (error) {
-                reportBridgeError('layer toggle', error);
-            }
+        function handleLayerToggle(layer) {
+            const nextEnabled = !(layer.enabled !== false);
+            // Pure runtime flag flip. No await, no dispose, no remount,
+            // no manifest write. File rename is fire-and-forget and never
+            // blocks the UI or affects the visual state.
+            try { _layerManagerRef?.setActive?.(layer.id, nextEnabled); }
+            catch (err) { maxjsDebugWarn('[MaxJS layer toggle] setActive failed', layer.id, err); }
+            queueLayersPanelRefresh();
+            _projectRuntimeRef?.setInlineLayerEnabled?.(layer.id, nextEnabled)
+                ?.catch?.(err => {
+                    maxjsDebugWarn('[MaxJS layer toggle] persist failed', layer.id, err);
+                });
         }
 
         async function handleLayerRemove(layer) {
@@ -6658,6 +6673,28 @@
                         </div>
                         <div class="fx-note" id="fx-performance-note">Caps the viewer frame rate and scales device pixel ratio to reduce GPU load. Splats off skips Spark (no second WebGL pass). XR stays uncapped.</div>
                     </section>
+                    <section class="fx-section collapsed">
+                        <div class="fx-section-header">
+                            <div class="fx-section-title">Camera Clipping</div>
+                        </div>
+                        <div class="fx-grid">
+                            <label class="fx-control" for="fx-camera-near">
+                                <div class="fx-control-head">
+                                    <span>Near plane</span>
+                                    <span class="fx-value" id="fx-camera-near-val">auto (${camera.near.toFixed(3)})</span>
+                                </div>
+                                <input class="fx-range" id="fx-camera-near" type="number" min="0" step="0.01" placeholder="auto" value="${cameraClip.near ?? ''}" style="background:rgba(255,255,255,0.05);color:#ccc;border:1px solid rgba(255,255,255,0.08);border-radius:0;padding:3px 6px;font:10px 'Segoe UI',system-ui,sans-serif;width:100%;outline:none">
+                            </label>
+                            <label class="fx-control" for="fx-camera-far">
+                                <div class="fx-control-head">
+                                    <span>Far plane</span>
+                                    <span class="fx-value" id="fx-camera-far-val">auto (${camera.far.toFixed(0)})</span>
+                                </div>
+                                <input class="fx-range" id="fx-camera-far" type="number" min="0" step="1" placeholder="auto" value="${cameraClip.far ?? ''}" style="background:rgba(255,255,255,0.05);color:#ccc;border:1px solid rgba(255,255,255,0.08);border-radius:0;padding:3px 6px;font:10px 'Segoe UI',system-ui,sans-serif;width:100%;outline:none">
+                            </label>
+                        </div>
+                        <div class="fx-note">Leave empty for auto-fit. Raise Near (e.g. 1–10) on large scenes to eliminate distant-geometry z-fighting by reclaiming depth buffer precision.</div>
+                    </section>
                     <section class="fx-section collapsed" data-fx-section="hdri">
                         <div class="fx-section-header">
                             <div class="fx-section-title">HDRI</div>
@@ -6831,6 +6868,18 @@
                 if (asciiActive) exitAsciiMode();
                 asciiSettings = { resolution: 0.15, color: 'white', invert: false };
                 performanceSettings = { ...PERFORMANCE_DEFAULTS };
+                cameraClip.near = null;
+                cameraClip.far = null;
+                {
+                    const bounds = computeVisibleSceneBounds(new THREE.Box3());
+                    if (!bounds.isEmpty()) {
+                        const size = bounds.getSize(new THREE.Vector3());
+                        const maxDim = Math.max(size.x, size.y, size.z);
+                        camera.near = Math.max(0.01, maxDim * 0.001);
+                        camera.far = Math.max(1000, maxDim * 100);
+                        applyCameraClipOverrides(camera);
+                    }
+                }
                 applyRendererPerformanceSettings({ resizePostFx: true });
                 renderer.toneMapping = toneMappingModes[currentToneMapping];
                 renderer.toneMappingExposure = currentExposure;
@@ -6946,6 +6995,30 @@
                 syncPostFxPanel(true, { persist: false });
             };
             instanceThresholdSlider.onchange = () => savePostFxState();
+
+            // Camera clipping controls
+            const cameraNearInput = document.getElementById('fx-camera-near');
+            const cameraNearValue = document.getElementById('fx-camera-near-val');
+            const cameraFarInput = document.getElementById('fx-camera-far');
+            const cameraFarValue = document.getElementById('fx-camera-far-val');
+            function commitCameraClip() {
+                const nearRaw = parseFloat(cameraNearInput.value);
+                const farRaw = parseFloat(cameraFarInput.value);
+                cameraClip.near = Number.isFinite(nearRaw) && nearRaw > 0 ? nearRaw : null;
+                cameraClip.far = Number.isFinite(farRaw) && farRaw > 0 ? farRaw : null;
+                applyCameraClipOverrides(camera);
+                cameraNearValue.textContent = cameraClip.near != null
+                    ? `${camera.near.toFixed(3)}`
+                    : `auto (${camera.near.toFixed(3)})`;
+                cameraFarValue.textContent = cameraClip.far != null
+                    ? `${camera.far.toFixed(0)}`
+                    : `auto (${camera.far.toFixed(0)})`;
+                ssgiFx.markSceneChanged?.();
+            }
+            cameraNearInput.oninput = commitCameraClip;
+            cameraFarInput.oninput = commitCameraClip;
+            cameraNearInput.onchange = () => { commitCameraClip(); savePostFxState(); };
+            cameraFarInput.onchange = () => { commitCameraClip(); savePostFxState(); };
 
             // HDRI Environment controls
             const hdriFileInput = document.getElementById('fx-hdri-file');
@@ -7164,6 +7237,7 @@
                 postFxInteractiveAvailable,
                 lastError,
                 performanceSettings,
+                cameraClip,
                 state,
                 derived,
             });
@@ -7209,6 +7283,23 @@
             if (performanceNote) {
                 performanceNote.textContent =
                     `Caps the viewer frame rate and scales device pixel ratio to reduce GPU load. Effective DPR ${getEffectivePixelRatio().toFixed(2)}. Splats off skips Spark. Large plain Max instance groups can collapse into InstancedMesh buckets. XR stays uncapped.`;
+            }
+
+            const cameraNearInput = document.getElementById('fx-camera-near');
+            const cameraNearValue = document.getElementById('fx-camera-near-val');
+            const cameraFarInput = document.getElementById('fx-camera-far');
+            const cameraFarValue = document.getElementById('fx-camera-far-val');
+            if (cameraNearInput) cameraNearInput.value = cameraClip.near != null ? String(cameraClip.near) : '';
+            if (cameraFarInput) cameraFarInput.value = cameraClip.far != null ? String(cameraClip.far) : '';
+            if (cameraNearValue) {
+                cameraNearValue.textContent = cameraClip.near != null
+                    ? `${camera.near.toFixed(3)}`
+                    : `auto (${camera.near.toFixed(3)})`;
+            }
+            if (cameraFarValue) {
+                cameraFarValue.textContent = cameraClip.far != null
+                    ? `${camera.far.toFixed(0)}`
+                    : `auto (${camera.far.toFixed(0)})`;
             }
 
             const hasEnabledEffects = ssgiFx.hasEnabledEffects();
@@ -7333,6 +7424,7 @@
                     maxInstanceBucketThreshold: performanceSettings.maxInstanceBucketThreshold,
                     splatsEnabled: performanceSettings.splatsEnabled !== false,
                 },
+                cameraClip: { near: cameraClip.near, far: cameraClip.far },
                 ascii: { enabled: asciiActive, ...asciiSettings },
             };
             if (includeDebug) {
@@ -7418,6 +7510,11 @@
                     if (typeof saved.hdri.enabled === 'boolean') localHdriEnabled = saved.hdri.enabled;
                     // Apply blur to scene even without HDRI loaded (will be used when HDRI loads)
                     scene.backgroundBlurriness = localHdriBlur;
+                }
+                if (saved.cameraClip) {
+                    cameraClip.near = Number.isFinite(saved.cameraClip.near) && saved.cameraClip.near > 0 ? saved.cameraClip.near : null;
+                    cameraClip.far = Number.isFinite(saved.cameraClip.far) && saved.cameraClip.far > 0 ? saved.cameraClip.far : null;
+                    applyCameraClipOverrides(camera);
                 }
                 if (saved.performance) {
                     if (Number.isFinite(saved.performance.fpsCap)) {
@@ -7984,7 +8081,7 @@
             ssgiFx.markSceneChanged?.();
         });
         const projectRuntime = window.chrome?.webview
-            ? createProjectRuntime({ layerManager, bridge, perfHud })
+            ? createProjectRuntime({ layerManager, bridge, perfHud, debugLog: maxjsDebugLog, debugWarn: maxjsDebugWarn })
             : null;
         if (projectRuntime) {
             layerManager.bindProjectRuntime(projectRuntime);
@@ -8076,12 +8173,15 @@
                         }
 
                         const manifestBaseUrl = new URL('./', manifestUrl);
-                        const enabledLayers = buildSnapshotManifestLayers(manifest).filter(entry => entry.enabled);
-                        if (enabledLayers.length === 0) return false;
+                        // Snapshot always imports every layer in the manifest,
+                        // regardless of the enabled flag. Disable is a live-mode
+                        // concept only; snapshot releases ship the full set.
+                        const allLayers = buildSnapshotManifestLayers(manifest);
+                        if (allLayers.length === 0) return false;
 
                         const mountedIds = [];
                         try {
-                            for (const entry of enabledLayers) {
+                            for (const entry of allLayers) {
                                 const entryPath = String(entry.entryPath || entry.entry || entry.path || '').replace(/\\/g, '/');
                                 if (!entryPath) throw new Error(`Missing layer entry path for ${entry.id}`);
                                 const moduleUrl = new URL(entryPath, manifestBaseUrl);
@@ -8242,8 +8342,20 @@
         }
 
         bridge.on('js_inline', msg => {
+            // The inline-scan auto-mount path (project_runtime inline_layers_state)
+            // imports the file as an ES module via a URL. The legacy js_inline
+            // path tries to compile the file content inside a sandbox via
+            // `new Function`, which chokes on `export default`. If the same id
+            // is already mounted via the URL path, ignore js_inline so we don't
+            // clobber a working mount with a sandbox-syntax error.
+            const project = window.maxJSProjectRuntime;
+            const ownedByProjectRuntime = project?.hasInlineMount?.(msg.id) === true;
             switch (msg.action) {
                 case 'inject': case 'update': {
+                    if (ownedByProjectRuntime) {
+                        bridge.send('js_inline_result', { id: msg.id, error: null });
+                        return;
+                    }
                     void layerManager.inject(msg.id, msg.code, msg.name).then(result => {
                         bridge.send('js_inline_result', { id: msg.id, error: result?.error || null });
                         if (!result?.error) bridge.send('scene_dirty');
@@ -8251,6 +8363,7 @@
                     break;
                 }
                 case 'remove': {
+                    if (ownedByProjectRuntime) return;
                     layerManager.remove(msg.id);
                     bridge.send('scene_dirty');
                     break;

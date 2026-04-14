@@ -1931,6 +1931,17 @@ export function createLayerManager({
         remove,
         clear,
         clearInline,
+        setActive(id, active) {
+            const layer = layers.get(id);
+            if (!layer) return false;
+            const next = !!active;
+            if (layer.active === next && !!layer.group?.visible === next) return false;
+            layer.active = next;
+            if (layer.group) layer.group.visible = next;
+            if (layer.overlayGroup) layer.overlayGroup.visible = next;
+            emitChange(next ? 'activated' : 'deactivated');
+            return true;
+        },
         list,
         getLayerSnapshot,
         getStats,

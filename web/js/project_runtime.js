@@ -92,7 +92,7 @@ function deriveProjectName(projectDir) {
     return parts[parts.length - 1] || 'Active Project';
 }
 
-export function createProjectRuntime({ layerManager, bridge, perfHud }) {
+export function createProjectRuntime({ layerManager, bridge, perfHud, debugLog = () => {}, debugWarn = () => {} }) {
     let projectDir = '';
     let projectRootUrl = '';
     let manifestBaseUrl = '';
@@ -162,7 +162,11 @@ export function createProjectRuntime({ layerManager, bridge, perfHud }) {
     }
 
     function removeProjectLayer(id) {
-        layerManager.remove(id);
+        try {
+            layerManager.remove(id);
+        } catch (err) {
+            debugWarn('[ProjectRuntime] layer remove failed', id, err);
+        }
         activeLayerIds.delete(id);
         activeProjectLayers.delete(id);
     }
@@ -355,34 +359,19 @@ export function createProjectRuntime({ layerManager, bridge, perfHud }) {
     }
 
     async function applyManifest(manifest, options = {}) {
-        const previous = manifestApplyGate;
-        let releaseGate;
-        manifestApplyGate = new Promise((resolve) => {
-            releaseGate = resolve;
-        });
-        await previous.catch(() => {});
-        try {
-            const forceReload = !!options.forceReload;
-            manifestState = manifest;
-            const desiredLayers = buildManifestLayers(manifest).filter(entry => entry.enabled);
-            const desiredIds = new Set(desiredLayers.map(entry => entry.id));
-
+        // Layer discovery is now driven by the C++ inline-folder scan
+        // (inline_layers_state message), not by the manifest. We keep
+        // applyManifest as a no-op for the layers field so the manifest
+        // file can still carry name/pollMs/postFx without surprising us.
+        // Drop any project-source layers from the legacy active sets so
+        // they don't shadow the inline mount path.
+        manifestState = manifest;
+        if (activeLayerIds.size > 0) {
             for (const id of [...activeLayerIds]) {
-                if (!desiredIds.has(id)) removeProjectLayer(id);
+                if (!mountedInlineLayers.has(id)) removeProjectLayer(id);
             }
-
-            for (const entry of desiredLayers) {
-                const current = activeProjectLayers.get(entry.id);
-                if (!forceReload && current?.signature === entry.signature) continue;
-
-                if (current) removeProjectLayer(entry.id);
-                await mountLayer(entry, manifest);
-            }
-
-            emitChange();
-        } finally {
-            releaseGate();
         }
+        emitChange();
     }
 
     async function reload(force = false) {
@@ -480,6 +469,38 @@ export function createProjectRuntime({ layerManager, bridge, perfHud }) {
         });
     }
 
+    // Synchronous: flip the enabled flag in the in-memory manifest state so
+    // listEntries() reflects the change immediately. Does NOT touch disk and
+    // does NOT re-run applyManifest. Caller is responsible for actually
+    // mounting/unmounting the layer. Used by the instant disable path in the
+    // panel UI.
+    function markLayerEnabled(id, enabled) {
+        if (!manifestState) return false;
+        const layers = Array.isArray(manifestState.layers) ? manifestState.layers : null;
+        if (!layers) return false;
+        const entry = layers.find(layer => (layer?.id || layer?.name) === id);
+        if (!entry) return false;
+        entry.enabled = !!enabled;
+        emitChange();
+        return true;
+    }
+
+    // Async: write the manifest to disk without re-running applyManifest.
+    // Used together with markLayerEnabled in the instant-disable path so the
+    // project file stays in sync with the runtime state.
+    async function persistLayerEnabled(id, enabled) {
+        if (!manifestState) return false;
+        const nextManifest = cloneManifest(manifestState);
+        const layers = ensureMutableLayers(nextManifest);
+        const entry = layers.find(layer => (layer?.id || layer?.name) === id);
+        if (!entry) return false;
+        entry.enabled = !!enabled;
+        // apply:false so persistManifest writes the file without re-running
+        // applyManifest — we already applied state via the direct remove.
+        await persistManifest(nextManifest, { apply: false, silent: true });
+        return true;
+    }
+
     async function removeLayer(id) {
         await updateManifest(manifest => {
             const layers = ensureMutableLayers(manifest);
@@ -503,17 +524,15 @@ export function createProjectRuntime({ layerManager, bridge, perfHud }) {
     }
 
     async function setInlineLayerEnabled(id, enabled) {
-        await requestHostAction('inline_layer_set_enabled', { id, enabled: !!enabled });
         const nextEnabled = !!enabled;
+        // Best-effort persistence — the runtime active flag is the source
+        // of visual truth, set by the caller via layerManager.setActive.
+        // We update local state immediately so the UI reflects the change
+        // even if the host action is slow or fails.
         const current = inlineLayerState.get(id) || { id, name: id };
-        inlineLayerState.set(id, {
-            ...current,
-            enabled: nextEnabled,
-        });
-        if (!nextEnabled) {
-            layerManager.remove(id);
-        }
+        inlineLayerState.set(id, { ...current, enabled: nextEnabled });
         emitChange();
+        await requestHostAction('inline_layer_set_enabled', { id, enabled: nextEnabled });
     }
 
     async function clearInlineLayers() {
@@ -561,24 +580,33 @@ export function createProjectRuntime({ layerManager, bridge, perfHud }) {
     }
 
     function listEntries() {
+        // Layer list is the union of everything the C++ inline-folder scan
+        // told us about. Each entry's enabled state is the layer's RUNTIME
+        // active flag (live truth), with a fallback to the scan flag when
+        // the layer hasn't been mounted yet (e.g. .js.disabled file).
         const runtimeLayers = new Map(layerManager.list().map(layer => [layer.id, layer]));
-        return buildManifestLayers(manifestState ?? defaultManifest()).map(entry => {
-            const runtime = runtimeLayers.get(entry.id);
-            return {
-                id: entry.id,
-                name: entry.name,
-                entry: entry.entryPath,
+        const out = [];
+        for (const [id, state] of inlineLayerState.entries()) {
+            const runtime = runtimeLayers.get(id);
+            const mounted = mountedInlineLayers.has(id);
+            const enabled = mounted ? !!runtime?.active : state.enabled;
+            out.push({
+                id,
+                name: runtime?.name || state.name || id,
+                entry: `inlines/${id}.js`,
                 source: 'project',
                 persisted: true,
-                enabled: entry.enabled,
-                active: runtime?.active ?? false,
-                loading: runtime?.loading ?? false,
+                enabled,
+                active: !!runtime?.active,
+                loading: !!runtime?.loading,
                 error: runtime?.error ?? null,
                 anchors: runtime?.anchors ?? 0,
                 tracked: runtime?.tracked ?? 0,
                 profile: runtime?.profile ?? null,
-            };
-        });
+            });
+        }
+        out.sort((a, b) => a.name.localeCompare(b.name));
+        return out;
     }
 
     function listInlineEntries() {
@@ -680,25 +708,118 @@ export function createProjectRuntime({ layerManager, bridge, perfHud }) {
         void reload(true);
     });
 
-    bridge.on('inline_layers_state', msg => {
-        inlineLayerState.clear();
+    // Auto-mount layers discovered by C++ scanning the inlines/ folder.
+    // No manifest entry needed — drop a .js into inlines/ and it loads.
+    // Each call to inline_layers_state is the full current state of the
+    // folder; we mount what's new, drop what's gone, and apply the
+    // enabled flag as a runtime active state on what stays.
+    const mountedInlineLayers = new Map(); // id -> { signature, moduleUrl }
+
+    function inlineLayerUrl(id, version) {
+        if (!inlineDir) return null;
+        const baseUrl = toAssetUrl(inlineDir);
+        const sep = baseUrl.endsWith('/') ? '' : '/';
+        return `${baseUrl}${sep}${encodeURIComponent(id)}.js?v=${version}`;
+    }
+
+    async function mountInlineLayer(id, name) {
+        const moduleVersion = ++revision;
+        const moduleUrl = inlineLayerUrl(id, moduleVersion);
+        if (!moduleUrl) throw new Error(`No inline directory configured for ${id}`);
+
+        let moduleNamespace;
+        try {
+            moduleNamespace = await import(moduleUrl);
+        } catch (error) {
+            const detail = error?.message || String(error);
+            throw new Error(`inline layer import failed: ${id} -> ${detail}`);
+        }
+        const factory = resolveFactory(moduleNamespace);
+
+        const result = await layerManager.mount(
+            id,
+            async (ctx, THREE) => factory(ctx, THREE, { layer: { id, name } }),
+            {
+                name: name || id,
+                code: moduleUrl,
+                source: 'project',
+                entry: `inlines/${id}.js`,
+            },
+        );
+        if (result?.error) throw new Error(result.error);
+
+        mountedInlineLayers.set(id, { moduleUrl });
+    }
+
+    function unmountInlineLayer(id) {
+        try { layerManager.remove(id); }
+        catch (err) { debugWarn('[ProjectRuntime] inline unmount failed', id, err); }
+        mountedInlineLayers.delete(id);
+    }
+
+    bridge.on('inline_layers_state', async msg => {
         const layers = Array.isArray(msg?.layers) ? msg.layers : [];
+        debugLog('[ProjectRuntime] inline_layers_state', {
+            inlineDir,
+            layerCount: layers.length,
+            layers: layers.map(l => ({ id: l.id, enabled: l.enabled })),
+        });
+
+        inlineLayerState.clear();
+        const seen = new Set();
         for (const layer of layers) {
             if (!layer?.id) continue;
+            seen.add(layer.id);
             inlineLayerState.set(layer.id, {
                 id: layer.id,
                 name: layer.name || layer.id,
                 enabled: layer.enabled !== false,
             });
         }
+
+        // Drop layers whose files vanished from the folder.
+        for (const id of [...mountedInlineLayers.keys()]) {
+            if (!seen.has(id)) unmountInlineLayer(id);
+        }
+
+        // Mount whatever's new. Skip layers reported as disabled — the file
+        // is renamed to .js.disabled and the URL would 404. Re-enable
+        // happens via the rename host action which will trigger a fresh
+        // inline_layers_state with enabled=true.
+        for (const layer of layers) {
+            if (!layer?.id) continue;
+            if (layer.enabled === false) {
+                if (mountedInlineLayers.has(layer.id)) unmountInlineLayer(layer.id);
+                continue;
+            }
+            if (!mountedInlineLayers.has(layer.id)) {
+                try {
+                    await mountInlineLayer(layer.id, layer.name);
+                    debugLog('[ProjectRuntime] mounted inline layer', layer.id);
+                } catch (err) {
+                    debugWarn('[ProjectRuntime] inline mount failed', layer.id, err);
+                }
+            }
+            // Apply the enabled flag as a runtime active state. For layers
+            // already mounted, this is just a flag flip — no remount.
+            layerManager.setActive?.(layer.id, true);
+        }
+
         emitChange();
     });
 
+    function hasInlineMount(id) {
+        return mountedInlineLayers.has(id);
+    }
+
     return {
         subscribe,
+        hasInlineMount,
         listEntries,
         listInlineEntries,
         setLayerEnabled,
+        markLayerEnabled,
+        persistLayerEnabled,
         removeLayer,
         clearPersistedLayers,
         setInlineLayerEnabled,

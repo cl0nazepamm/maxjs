@@ -5703,7 +5703,11 @@ public:
     }
 
     std::wstring GetInlineHotLayerDir() {
-        return GetLegacyInlineLayerDir();
+        // Source of truth for inline-layer scan/rename/inject is the
+        // scene-local `inlines/` folder. The legacy %TEMP% location is
+        // only kept around for the one-shot migration in
+        // MigrateLegacyInlineLayers().
+        return GetInlineLayerDir();
     }
 
     void SendInlineLayersState(bool force = false) {
@@ -9597,8 +9601,10 @@ public:
             if (allowRealtimeAuxPolling && lightPhase == 1) {
                 DetectLightChanges();
                 DetectSplatChanges();
-                DetectAudioChanges();
             }
+            // Audio is cheap (few nodes, 7 params each) — poll every tick
+            // and ignore the interactive gate so spinner drags propagate live.
+            DetectAudioChanges();
             if (allowHeavyGeometryPolling && slowPhase == 6) DetectGeometryChanges();
             if (allowIdlePolling && slowPhase == 9) DetectJsModChanges();
             if (allowIdlePolling && slowPhase == 12) DetectPluginInstanceChanges();
@@ -10391,7 +10397,8 @@ public:
         if (!ip || audioHandles_.empty()) return;
 
         TimeValue t = ip->GetTime();
-        bool changed = false;
+        std::vector<INode*> dirty;
+        dirty.reserve(audioHandles_.size());
 
         for (ULONG handle : audioHandles_) {
             INode* node = ip->GetINodeByHandle(handle);
@@ -10401,13 +10408,33 @@ public:
             auto it = audioHashMap_.find(handle);
             if (it == audioHashMap_.end()) {
                 audioHashMap_[handle] = hash;
+                dirty.push_back(node);  // first observation — push so JS has initial state
             } else if (it->second != hash) {
                 it->second = hash;
-                if (fastDirtyHandles_.insert(handle).second) changed = true;
+                dirty.push_back(node);
             }
         }
 
-        if (changed) QueueFastFlush();
+        if (dirty.empty() || !webview_) return;
+
+        // Send the full audio state as JSON. The binary UpdateAudio delta
+        // command only carries transform/visibility, so param edits must
+        // ride a dedicated JSON message (WriteAudioJson emits every field).
+        std::wostringstream ss;
+        ss.imbue(std::locale::classic());
+        ss << L"{\"type\":\"audio_update\",\"audios\":[";
+        bool first = true;
+        for (INode* node : dirty) {
+            std::wostringstream audioJson;
+            audioJson.imbue(std::locale::classic());
+            if (WriteAudioJson(audioJson, node, t, /*includeHandle*/ true, /*includeVisibility*/ true, /*trackHandle*/ false)) {
+                if (!first) ss << L',';
+                ss << audioJson.str();
+                first = false;
+            }
+        }
+        ss << L"]}";
+        webview_->PostWebMessageAsJson(ss.str().c_str());
     }
 
     // Detect geometry edits that keep the same topology counts (e.g. deforms)

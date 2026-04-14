@@ -1,25 +1,25 @@
 # max.js - Create interactive web experiences directly inside 3dsmax. 
 
- Comes with a nice postfx stack and it's very fun to play around with! Try utilizing layer manager to create custom fx or logic. Runs on WebGPU backend with fallbacks to WebGL.
+ Comes with a nice postfx stack and it's very fun to play around with! Runs on WebGPU backend.
 
 # Features
 
 - **Realtime Sync** — Binary delta protocol over WebView2 shared memory.
 - **ActiveShade** — Docks into a Max viewport for live feedback on your design
-- **Layer Manager** — Early prototype / Outline for Playcanvas style script loading.
-- **Snapshots** — Fast export your scene to standalone browser (WIP)
-- **Virtual Reality** — WebXR (only tested on Quest 3 VDXR)
+- **Layer Manager** — Early prototype / Outline for Playcanvas style script loading. (WIP)
+- **Snapshots** — Fast export your scene to standalone (WIP)
+- **Virtual Reality** — WebXR (only tested on Quest 3 VDXR) (WebGL only)
 
 ---
 
 ## Objects
 
 - **Splat Origin** - Guassian Splat loading via Spark.js integration.
-- **Audio Origin** - Load audio Tracks
+- **Audio Origin** - Load audio tracks
 
 ## Materials
 
-Most 3dsmax materials are supported. three.js materials can be created in material editor also.
+Most 3dsmax materials are supported. Three.js materials can be created in material editor also. You might have to switch renderer to Three.js for it to show up.
 
 ### Supported Material Types
 
@@ -148,6 +148,7 @@ This tool targets web development but since it's registered as renderer I added 
 # Bugs
 - ActiveShade can bug out if you maximize or minimize windows. Just use registered "kill maxjs" command in search menu
 - No orthographic view (yet)
+- Hair and Fur modifier causes mesh offset. 
 
 
 # Build

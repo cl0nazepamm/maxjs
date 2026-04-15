@@ -33,6 +33,7 @@ BEGIN
     IDS_UTILITY_COMBINE_ADD "Add"
     IDS_TSL_PARAMS "three.js TSL"
     IDS_VIDEO_TEX_PARAMS "three.js Video"
+    IDS_HTML_TEX_PARAMS "three.js HTML"
 END
 
 IDD_THREEJS_MTL DIALOG 0, 0, 170, 318
@@ -546,4 +547,22 @@ BEGIN
     PUSHBUTTON      "Load .js",   IDC_TSL_TEX_LOAD_BTN,  114, 31, 46, 14
     EDITTEXT        IDC_TSL_TEX_CODE_EDIT, 6, 48, 158, 100, ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN | WS_VSCROLL | WS_TABSTOP
     GROUPBOX        "Dynamic Parameters", IDC_TSL_TEX_DYN_GROUP, 2, 158, 166, 264
+END
+
+IDD_THREEJS_HTML_TEX DIALOG 0, 0, 170, 170
+STYLE DS_SETFONT | WS_CHILD | WS_VISIBLE
+FONT 8, "Segoe UI"
+BEGIN
+    GROUPBOX        "HTML Source", -1, 2, 2, 166, 74
+    LTEXT           "No file loaded", IDC_HTML_TEX_FILE_LABEL, 8, 14, 154, 8
+    PUSHBUTTON      "Load .html", IDC_HTML_TEX_FILE_BTN, 8, 24, 154, 14
+    LTEXT           "W:", -1, 8, 46, 10, 8
+    CONTROL         "", IDC_HTML_TEX_WIDTH_EDIT, "CustEdit", WS_TABSTOP, 22, 44, 34, 10
+    CONTROL         "", IDC_HTML_TEX_WIDTH_SPIN, "SpinnerControl", 0, 56, 44, 7, 10
+    LTEXT           "H:", -1, 72, 46, 10, 8
+    CONTROL         "", IDC_HTML_TEX_HEIGHT_EDIT, "CustEdit", WS_TABSTOP, 86, 44, 34, 10
+    CONTROL         "", IDC_HTML_TEX_HEIGHT_SPIN, "SpinnerControl", 0, 120, 44, 7, 10
+    LTEXT           "Supports: .html .htm", -1, 8, 62, 150, 8
+    GROUPBOX        "Params JSON", -1, 2, 80, 166, 86
+    EDITTEXT        IDC_HTML_TEX_PARAMS_EDIT, 6, 92, 158, 70, ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN | WS_VSCROLL | WS_TABSTOP
 END

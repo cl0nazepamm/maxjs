@@ -253,7 +253,8 @@ static bool IsProjectRuntimeFile(const std::wstring& fileName) {
     std::transform(ext.begin(), ext.end(), ext.begin(),
         [](wchar_t ch) { return static_cast<wchar_t>(towlower(ch)); });
 
-    return ext == L".js" || ext == L".mjs" || ext == L".cjs" || ext == L".json";
+    return ext == L".js" || ext == L".mjs" || ext == L".cjs" || ext == L".json"
+        || ext == L".html" || ext == L".htm";
 }
 
 static std::wstring GetInlineLayerFileName(const std::wstring& id, bool enabled) {
@@ -609,6 +610,7 @@ static const wchar_t* GetMimeTypeForPath(const std::wstring& path) {
     if (_wcsicmp(ext, L".css") == 0) return L"text/css";
     if (_wcsicmp(ext, L".svg") == 0) return L"image/svg+xml";
     if (_wcsicmp(ext, L".wasm") == 0) return L"application/wasm";
+    if (_wcsicmp(ext, L".html") == 0 || _wcsicmp(ext, L".htm") == 0) return L"text/html";
     return L"application/octet-stream";
 }
 
@@ -1067,6 +1069,10 @@ struct MaxJSPBR {
         float videoRate = 1.0f;
         std::wstring tslCode;       // TSL procedural texture code (if non-empty, this is a TSL Texture)
         std::wstring tslParamsJson; // TSL texture dynamic params JSON
+        std::wstring htmlFile;      // absolute disk path to the .html source file
+        std::wstring htmlParamsJson;
+        int   htmlWidth  = 1024;
+        int   htmlHeight = 1024;
     };
 
     float color[3]    = {0.8f, 0.8f, 0.8f};
@@ -1571,6 +1577,24 @@ static bool ExtractMaterialTexture(Texmap* map, std::wstring& filePath, MaxJSPBR
             }
         }
         return false;
+    }
+
+    // HTML Texture — live HTML file rasterized on the web side
+    if (resolved->ClassID() == THREEJS_HTML_TEX_CLASS_ID) {
+        IParamBlock2* pb = resolved->GetParamBlockByID(threejs_html_tex_params);
+        if (!pb) return false;
+        const MCHAR* fn = pb->GetStr(phtml_tex_file);
+        if (!fn || !fn[0]) return false;
+        filePath = L"html://managed";
+        xf = {};
+        xf.htmlFile = fn;
+        xf.htmlWidth  = pb->GetInt(phtml_tex_width,  0);
+        xf.htmlHeight = pb->GetInt(phtml_tex_height, 0);
+        if (xf.htmlWidth  <= 0) xf.htmlWidth  = 1024;
+        if (xf.htmlHeight <= 0) xf.htmlHeight = 1024;
+        const MCHAR* pj = pb->GetStr(phtml_tex_params_json);
+        if (pj && pj[0]) xf.htmlParamsJson = pj;
+        return true;
     }
 
     if (IsAutodeskUberBitmap(resolved)) {
@@ -5803,9 +5827,14 @@ public:
         std::wstring udf = std::wstring(localAppData) + L"\\MaxJS\\WebView2Data";
         CoTaskMemFree(localAppData);
 
-        // Enable WebXR in WebView2
+        // Enable WebXR + HTML-in-canvas (WICG draw-element) in WebView2.
+        // CanvasDrawElement unlocks drawElementImage / texElementImage2D /
+        // copyElementImageToTexture — lets us render live HTML straight into
+        // Three.js WebGPU textures for in-scene UI and billboards.
         auto options = Microsoft::WRL::Make<CoreWebView2EnvironmentOptions>();
-        options->put_AdditionalBrowserArguments(L"--enable-features=WebXR,WebXRARModule,OpenXR");
+        options->put_AdditionalBrowserArguments(
+            L"--enable-features=WebXR,WebXRARModule,OpenXR,CanvasDrawElement "
+            L"--enable-blink-features=CanvasDrawElement");
 
         CreateCoreWebView2EnvironmentWithOptions(nullptr, udf.c_str(), options.Get(),
             Callback<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler>(
@@ -8313,6 +8342,10 @@ public:
                 return;
             }
             SendProjectReload();
+            // Kick a scene resync so materialCache rebuilds. HTML texmap
+            // materials re-fetch their source file on the next sync via
+            // Cache-Control: no-store, picking up any .html edit.
+            SetDirtyImmediate();
         }
     }
 
@@ -10046,6 +10079,43 @@ public:
             return state;
         }
 
+        // HTML texmap slots: mirror the TSL strip — a material that has any
+        // slot holding an HTML texmap is never fast-sync eligible, and
+        // htmlParamsJson is removed from the structure hash so param edits
+        // don't thrash the material cache key.
+        auto hasHtmlSlot = [](const MaxJSPBR& p) {
+            auto has = [](const MaxJSPBR::TexTransform& xf) { return !xf.htmlFile.empty(); };
+            return has(p.colorMapTransform) || has(p.gradientMapTransform) ||
+                   has(p.roughnessMapTransform) || has(p.metalnessMapTransform) ||
+                   has(p.normalMapTransform) || has(p.bumpMapTransform) ||
+                   has(p.displacementMapTransform) || has(p.parallaxMapTransform) ||
+                   has(p.sssColorMapTransform) || has(p.aoMapTransform) ||
+                   has(p.emissionMapTransform) || has(p.lightmapTransform) ||
+                   has(p.opacityMapTransform) || has(p.matcapMapTransform) ||
+                   has(p.specularMapTransform) || has(p.transmissionMapTransform) ||
+                   has(p.clearcoatMapTransform) || has(p.clearcoatRoughnessMapTransform) ||
+                   has(p.clearcoatNormalMapTransform) ||
+                   has(p.specularIntensityMapTransform) || has(p.specularColorMapTransform);
+        };
+        if (hasHtmlSlot(pbr)) {
+            MaxJSPBR stable = pbr;
+            auto clear = [](MaxJSPBR::TexTransform& xf) { xf.htmlParamsJson.clear(); };
+            clear(stable.colorMapTransform); clear(stable.gradientMapTransform);
+            clear(stable.roughnessMapTransform); clear(stable.metalnessMapTransform);
+            clear(stable.normalMapTransform); clear(stable.bumpMapTransform);
+            clear(stable.displacementMapTransform); clear(stable.parallaxMapTransform);
+            clear(stable.sssColorMapTransform); clear(stable.aoMapTransform);
+            clear(stable.emissionMapTransform); clear(stable.lightmapTransform);
+            clear(stable.opacityMapTransform); clear(stable.matcapMapTransform);
+            clear(stable.specularMapTransform); clear(stable.transmissionMapTransform);
+            clear(stable.clearcoatMapTransform); clear(stable.clearcoatRoughnessMapTransform);
+            clear(stable.clearcoatNormalMapTransform);
+            clear(stable.specularIntensityMapTransform); clear(stable.specularColorMapTransform);
+            state.structureHash = HashMaterialPBRState(stable);
+            state.canFastSync = false;
+            return state;
+        }
+
         MaxJSPBR structurePbr = pbr;
         // Zero out all animatable scalars — changes to these go through scalar hash, not structure
         structurePbr.color[0] = 0.8f;
@@ -10485,6 +10555,30 @@ public:
                 ss << L",\"" << key << L"TSL\":\"" << EscapeJson(xf.tslCode.c_str()) << L'"';
                 if (!xf.tslParamsJson.empty())
                     ss << L",\"" << key << L"TSLParams\":" << xf.tslParamsJson;
+                return;
+            }
+            // HTML texture — emit asset URLs + resolution + params
+            if (!xf.htmlFile.empty()) {
+                const std::wstring htmlFileUrl = MapAssetPath(xf.htmlFile, false);
+                std::wstring htmlBaseUrl;
+                std::wstring htmlFilename;
+                const size_t slash = xf.htmlFile.find_last_of(L"\\/");
+                if (slash != std::wstring::npos) {
+                    htmlBaseUrl = MapAssetPath(xf.htmlFile.substr(0, slash), true);
+                    htmlFilename = xf.htmlFile.substr(slash + 1);
+                } else {
+                    htmlFilename = xf.htmlFile;
+                }
+                if (!htmlFileUrl.empty())
+                    ss << L",\"" << key << L"HTML\":\"" << EscapeJson(htmlFileUrl.c_str()) << L'"';
+                if (!htmlBaseUrl.empty())
+                    ss << L",\"" << key << L"HTMLBase\":\"" << EscapeJson(htmlBaseUrl.c_str()) << L'"';
+                if (!htmlFilename.empty())
+                    ss << L",\"" << key << L"HTMLName\":\"" << EscapeJson(htmlFilename.c_str()) << L'"';
+                ss << L",\"" << key << L"HTMLW\":" << xf.htmlWidth;
+                ss << L",\"" << key << L"HTMLH\":" << xf.htmlHeight;
+                if (!xf.htmlParamsJson.empty())
+                    ss << L",\"" << key << L"HTMLParams\":" << xf.htmlParamsJson;
                 return;
             }
             std::wstring url = MapTexturePath(path);
@@ -12985,7 +13079,7 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, ULONG fdwReason, LPVOID) {
 }
 
 __declspec(dllexport) const TCHAR* LibDescription()   { return MAXJS_NAME; }
-__declspec(dllexport) int LibNumberClasses()           { return 20; }
+__declspec(dllexport) int LibNumberClasses()           { return 21; }
 __declspec(dllexport) ClassDesc* LibClassDesc(int i) {
     switch (i) {
         case 0: return &maxJSDesc;
@@ -13008,6 +13102,7 @@ __declspec(dllexport) ClassDesc* LibClassDesc(int i) {
         case 17: return GetThreeJSSkyDesc();
         case 18: return GetThreeJSDeformDesc();
         case 19: return GetThreeJSTSLTexDesc();
+        case 20: return GetThreeJSHTMLTexDesc();
         default: return nullptr;
     }
 }

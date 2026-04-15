@@ -2077,3 +2077,159 @@ static ParamBlockDesc2 threejs_tsl_tex_pb_desc(
 );
 
 ClassDesc2* GetThreeJSTSLTexDesc() { return &tslTexDesc; }
+
+// ══════════════════════════════════════════════════════════════
+//  three.js HTML Texture — live HTML file rasterized via WICG
+//  CanvasDrawElement on the web side. This C++ side is a thin
+//  Texmap that stores the file path, target resolution, and an
+//  optional params JSON; actual rendering happens in WebView2.
+// ══════════════════════════════════════════════════════════════
+
+class ThreeJSHTMLTex : public Texmap {
+public:
+    IParamBlock2* pblock = nullptr;
+
+    ThreeJSHTMLTex(BOOL /*loading*/) {
+        GetThreeJSHTMLTexDesc()->MakeAutoParamBlocks(this);
+    }
+    ~ThreeJSHTMLTex() override = default;
+
+    void DeleteThis() override { delete this; }
+    Class_ID ClassID() override { return THREEJS_HTML_TEX_CLASS_ID; }
+    SClass_ID SuperClassID() override { return TEXMAP_CLASS_ID; }
+    void GetClassName(MSTR& s, bool) const override { s = _T("three.js HTML"); }
+
+    int NumRefs() override { return 1; }
+    RefTargetHandle GetReference(int i) override { return i == 0 ? pblock : nullptr; }
+    void SetReference(int i, RefTargetHandle r) override { if (i == 0) pblock = static_cast<IParamBlock2*>(r); }
+    RefResult NotifyRefChanged(const Interval&, RefTargetHandle, PartID&, RefMessage, BOOL) override { return REF_SUCCEED; }
+
+    RefTargetHandle Clone(RemapDir& remap) override {
+        auto* c = new ThreeJSHTMLTex(FALSE);
+        *static_cast<MtlBase*>(c) = *static_cast<MtlBase*>(this);
+        BaseClone(this, c, remap);
+        c->ReplaceReference(0, remap.CloneRef(pblock));
+        return c;
+    }
+
+    int NumSubTexmaps() override { return 0; }
+    Texmap* GetSubTexmap(int) override { return nullptr; }
+    void SetSubTexmap(int, Texmap*) override {}
+
+    int NumParamBlocks() override { return 1; }
+    IParamBlock2* GetParamBlock(int i) override { return i == 0 ? pblock : nullptr; }
+    IParamBlock2* GetParamBlockByID(BlockID id) override { return id == threejs_html_tex_params ? pblock : nullptr; }
+
+    ParamDlg* CreateParamDlg(HWND hwMtlEdit, IMtlParams* imp) override {
+        return GetThreeJSHTMLTexDesc()->CreateParamDlgs(hwMtlEdit, imp, this);
+    }
+
+    void Update(TimeValue, Interval& valid) override { valid = FOREVER; }
+    Interval Validity(TimeValue) override { return FOREVER; }
+    void Reset() override { GetThreeJSHTMLTexDesc()->MakeAutoParamBlocks(this); }
+
+    AColor EvalColor(ShadeContext&) override { return AColor(0.5f, 0.5f, 0.5f, 1.0f); }
+    float EvalMono(ShadeContext& sc) override { return Intens(EvalColor(sc)); }
+    Point3 EvalNormalPerturb(ShadeContext&) override { return Point3(0, 0, 0); }
+
+    IOResult Save(ISave* isave) override { return Texmap::Save(isave); }
+    IOResult Load(ILoad* iload) override { return Texmap::Load(iload); }
+};
+
+class ThreeJSHTMLTexClassDesc : public ClassDesc2 {
+public:
+    int IsPublic() override { return TRUE; }
+    void* Create(BOOL loading) override { return new ThreeJSHTMLTex(loading); }
+    const TCHAR* ClassName() override { return _T("three.js HTML"); }
+    const TCHAR* NonLocalizedClassName() override { return _T("three.js HTML"); }
+    SClass_ID SuperClassID() override { return TEXMAP_CLASS_ID; }
+    Class_ID ClassID() override { return THREEJS_HTML_TEX_CLASS_ID; }
+    const TCHAR* Category() override { return _T("MaxJS"); }
+    const TCHAR* InternalName() override { return _T("ThreeJSHTMLTexture"); }
+    HINSTANCE HInstance() override { return hInstance; }
+};
+
+static ThreeJSHTMLTexClassDesc htmlTexDesc;
+
+class ThreeJSHTMLTexDlgProc : public ParamMap2UserDlgProc {
+public:
+    INT_PTR DlgProc(TimeValue, IParamMap2* map, HWND hWnd, UINT msg, WPARAM wParam, LPARAM) override {
+        IParamBlock2* pb = map ? map->GetParamBlock() : nullptr;
+        switch (msg) {
+        case WM_INITDIALOG: {
+            if (pb) {
+                const MCHAR* fn = pb->GetStr(phtml_tex_file);
+                if (fn && fn[0]) {
+                    const wchar_t* name = wcsrchr(fn, L'\\');
+                    SetDlgItemText(hWnd, IDC_HTML_TEX_FILE_LABEL, name ? name + 1 : fn);
+                }
+                const MCHAR* pj = pb->GetStr(phtml_tex_params_json);
+                if (pj && pj[0]) {
+                    SetDlgItemText(hWnd, IDC_HTML_TEX_PARAMS_EDIT, pj);
+                }
+            }
+            return TRUE;
+        }
+        case WM_COMMAND: {
+            const WORD id = LOWORD(wParam);
+            const WORD code = HIWORD(wParam);
+            if (id == IDC_HTML_TEX_FILE_BTN) {
+                OPENFILENAME ofn = {};
+                wchar_t filePath[MAX_PATH] = {};
+                ofn.lStructSize = sizeof(ofn);
+                ofn.hwndOwner = hWnd;
+                ofn.lpstrFilter = L"HTML Files (*.html;*.htm)\0*.html;*.htm\0All Files (*.*)\0*.*\0";
+                ofn.lpstrFile = filePath;
+                ofn.nMaxFile = MAX_PATH;
+                ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+                if (GetOpenFileName(&ofn) && pb) {
+                    pb->SetValue(phtml_tex_file, 0, filePath);
+                    const wchar_t* name = wcsrchr(filePath, L'\\');
+                    SetDlgItemText(hWnd, IDC_HTML_TEX_FILE_LABEL, name ? name + 1 : filePath);
+                    NotifyOwnerMaterialEdited(pb);
+                }
+                return TRUE;
+            }
+            if (id == IDC_HTML_TEX_PARAMS_EDIT && code == EN_KILLFOCUS && pb) {
+                wchar_t buf[4096] = {};
+                GetDlgItemText(hWnd, IDC_HTML_TEX_PARAMS_EDIT, buf, 4095);
+                pb->SetValue(phtml_tex_params_json, 0, buf);
+                NotifyOwnerMaterialEdited(pb);
+                return TRUE;
+            }
+            break;
+        }
+        }
+        return FALSE;
+    }
+    void DeleteThis() override {}
+};
+
+static ThreeJSHTMLTexDlgProc htmlTexDlgProc;
+
+static ParamBlockDesc2 threejs_html_tex_pb_desc(
+    threejs_html_tex_params,
+    _T("three.js HTML Texture Params"),
+    IDS_HTML_TEX_PARAMS,
+    &htmlTexDesc,
+    P_AUTO_CONSTRUCT + P_AUTO_UI,
+    0,
+    IDD_THREEJS_HTML_TEX, IDS_HTML_TEX_PARAMS, 0, 0, &htmlTexDlgProc,
+    phtml_tex_file, _T("htmlFile"), TYPE_FILENAME, 0, 0,
+        p_end,
+    phtml_tex_width, _T("width"), TYPE_INT, 0, 0,
+        p_default, 1024,
+        p_range, 64, 4096,
+        p_ui, TYPE_SPINNER, EDITTYPE_INT, IDC_HTML_TEX_WIDTH_EDIT, IDC_HTML_TEX_WIDTH_SPIN, 16,
+        p_end,
+    phtml_tex_height, _T("height"), TYPE_INT, 0, 0,
+        p_default, 1024,
+        p_range, 64, 4096,
+        p_ui, TYPE_SPINNER, EDITTYPE_INT, IDC_HTML_TEX_HEIGHT_EDIT, IDC_HTML_TEX_HEIGHT_SPIN, 16,
+        p_end,
+    phtml_tex_params_json, _T("paramsJson"), TYPE_STRING, 0, 0,
+        p_end,
+    p_end
+);
+
+ClassDesc2* GetThreeJSHTMLTexDesc() { return &htmlTexDesc; }

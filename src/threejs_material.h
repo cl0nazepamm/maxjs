@@ -179,6 +179,17 @@ enum ThreeJSTSLTexParamIDs {
 };
 ClassDesc2* GetThreeJSTSLTexDesc();
 
+// HTML Texture (live HTML file rasterized via WICG CanvasDrawElement)
+#define THREEJS_HTML_TEX_CLASS_ID Class_ID(0x7F3A9B22, 0x4E2D8C20)
+enum { threejs_html_tex_params };
+enum ThreeJSHTMLTexParamIDs {
+    phtml_tex_file,
+    phtml_tex_width,
+    phtml_tex_height,
+    phtml_tex_params_json,
+};
+ClassDesc2* GetThreeJSHTMLTexDesc();
+
 ClassDesc2* GetThreeJSAdvMtlDesc();
 ClassDesc2* GetThreeJSUtilityMtlDesc();
 ClassDesc2* GetThreeJSTSLMtlDesc();

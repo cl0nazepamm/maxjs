@@ -532,7 +532,7 @@ function createCameraAdapter(camera, THREE, ownForJs, cameraControl, layerId, de
     });
 }
 
-function createMaxNodeAdapter({ handle, getObject, THREE, createAnchor, layerId, getTransformApi }) {
+function createMaxNodeAdapter({ handle, getObject, THREE, createAnchor, layerId, getTransformApi, setMaterialMap }) {
     const scratch = {
         vA: new THREE.Vector3(),
         vB: new THREE.Vector3(),
@@ -658,6 +658,14 @@ function createMaxNodeAdapter({ handle, getObject, THREE, createAnchor, layerId,
             return obj ? new THREE.Box3().setFromObject(obj) : null;
         },
         transform,
+        // Override a material map slot on the synced mesh. Survives
+        // fastsync rebuilds — registered against the handle, reapplied
+        // on every scene message after the material is rebuilt. Pass
+        // texture=null to clear an override.
+        setMap(slot, texture) {
+            if (typeof slot !== 'string' || !slot) return;
+            setMaterialMap?.(handle, slot, texture);
+        },
         snapshot() {
             const obj = getObject();
             if (!obj) return null;
@@ -805,6 +813,7 @@ function createMaxSceneFacade({ scene, nodeMap, lightHandleMap, getAdapter, crea
                     distance: hit.distance,
                     handle: hit.object?.userData?.maxjsHandle ?? null,
                     name: hit.object?.name ?? '',
+                    uv: hit.uv ? hit.uv.clone() : null,
                 };
             });
         },
@@ -956,6 +965,12 @@ export function createLayerManager({
     let dt = 0;
     let elapsed = 0;
     const runtimeTransformOverrides = new Map();
+    // Map<handle, Map<slotName, { texture, layerId }>> — survives sync
+    // rebuilds. The scene message handler calls applyMaterialOverrides()
+    // after every fastsync material assignment so layer-supplied textures
+    // (HTML, canvas, anything) reach displacement / color / etc. on the
+    // synced mesh without cloning.
+    const materialOverrides = new Map();
     const transformScratch = {
         localMatrix: new THREE.Matrix4(),
         finalMatrix: new THREE.Matrix4(),
@@ -1088,6 +1103,56 @@ export function createLayerManager({
         if (!layerId) return;
         for (const [handle, state] of [...runtimeTransformOverrides.entries()]) {
             if (state.ownerLayer === layerId) clearRuntimeTransformOverride(handle);
+        }
+    }
+
+    // ── Material map overrides ────────────────────────────────────
+    // Layers register a per-slot texture override on a synced node by
+    // handle. The scene sync calls applyMaterialOverridesToMesh() after
+    // each material assignment so the override survives the full
+    // material rebuild that fastsync does on every scene message.
+
+    function applyMaterialOverridesToMesh(handle, mesh) {
+        const slots = materialOverrides.get(handle);
+        if (!slots || !mesh) return;
+        const mats = Array.isArray(mesh.material) ? mesh.material : (mesh.material ? [mesh.material] : []);
+        for (const m of mats) {
+            if (!m) continue;
+            for (const [slot, entry] of slots) {
+                m[slot] = entry.texture;
+            }
+            m.needsUpdate = true;
+        }
+    }
+
+    function setMaterialMapOverride(layerId, handle, slot, texture) {
+        let slots = materialOverrides.get(handle);
+        if (!slots) {
+            slots = new Map();
+            materialOverrides.set(handle, slots);
+        }
+        if (texture == null) {
+            slots.delete(slot);
+            if (slots.size === 0) materialOverrides.delete(handle);
+        } else {
+            slots.set(slot, { texture, layerId });
+        }
+        // Apply to the live mesh immediately so the change is visible
+        // before the next scene sync.
+        const mesh = nodeMap.get(handle);
+        if (mesh) applyMaterialOverridesToMesh(handle, mesh);
+    }
+
+    function clearMaterialOverridesForLayer(layerId) {
+        if (!layerId) return;
+        for (const [handle, slots] of [...materialOverrides.entries()]) {
+            for (const [slot, entry] of [...slots.entries()]) {
+                if (entry.layerId === layerId) slots.delete(slot);
+            }
+            if (slots.size === 0) materialOverrides.delete(handle);
+            // Trigger a fresh sync so the original material reasserts.
+            // Cheaper than tracking the original map per slot — next
+            // scene message rebuilds the material from Max state.
         }
     }
 
@@ -1378,6 +1443,7 @@ export function createLayerManager({
                 createAnchor: (nextHandle, options) => createAnchorForLayer(layer, nextHandle, options),
                 layerId: layer.id,
                 getTransformApi: createTransformApi,
+                setMaterialMap: (h, slot, tex) => setMaterialMapOverride(layer.id, h, slot, tex),
             });
             layer.nodeAdapters.set(handle, adapter);
         }
@@ -1670,6 +1736,7 @@ export function createLayerManager({
         layer.nodeAdapters.clear();
         if (layer.input) { layer.input.dispose(); layer.input = null; }
         clearRuntimeTransformOverridesForLayer(id);
+        clearMaterialOverridesForLayer(id);
 
         jsWorldRoot.remove(layer.group);
         overlayWorldRoot.remove(layer.overlayGroup);
@@ -1908,6 +1975,9 @@ export function createLayerManager({
         getLayerCode,
         serializeSnapshot,
         restoreTransformOverrides: restoreRuntimeTransformOverrides,
+        // Called from the scene message handler after each material assignment
+        // so layer-registered map slot overrides survive fastsync rebuilds.
+        applyMaterialOverrides: applyMaterialOverridesToMesh,
         serialize,
         get isCameraOverridden() { return cameraControl.isScriptMode(); },
         get cameraMode() { return cameraControl.getMode(); },

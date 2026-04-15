@@ -788,6 +788,7 @@
                     <button id="btnSnapshot" class="maxonly devonly">Snapshot</button>
                     <button id="btnSnapshotPanel" class="maxonly devonly">Snapshot Options</button>
                     <button id="btnLayersPanel" class="maxonly devonly">Layers</button>
+                    <button id="btnCanvasPanel" class="maxonly devonly">Canvas</button>
                     <div class="menu-sep"></div>
                     <div class="menu-sep"></div>
                     <div style="padding:3px 12px;font:10px/1.4 'Segoe UI',system-ui,sans-serif;color:#666;">Camera</div>
@@ -825,6 +826,7 @@
     -->
     <aside id="layersPanel" class="sidepanel sidepanel-left" aria-hidden="true" inert></aside>
     <aside id="snapshotPanel" class="sidepanel" aria-hidden="true" inert></aside>
+    <aside id="canvasPanel" class="sidepanel" aria-hidden="true" inert></aside>
     <aside id="postPanel" class="sidepanel" aria-hidden="true" inert></aside>
     <script type="importmap">
     {
@@ -894,6 +896,8 @@
         import { createMaxJSAnimationSystem } from './js/maxjs_animation.js';
         import { createMaxJSAudioSystem } from './js/maxjs_audio.js';
         import { createProjectRuntime } from './js/project_runtime.js';
+        import { getOrCreateHTMLTexture, releaseHTMLTexture, disposeAllHTMLTextures, attachHTMLClickForwarding } from './js/html_texture.js';
+        import { createCanvasPanel } from './js/canvas_panel.js';
 
         const THEME_STORAGE_KEY = 'maxjs-theme';
         const DARK_BG = 0x353535;
@@ -1258,6 +1262,12 @@
         });
         // Default camera light available for contact shadows from the start
         if (ssgiFx.setMainLight) ssgiFx.setMainLight(defaultKey);
+
+        // Forward viewport clicks to HTML texmap content. Raycast hits a
+        // mesh whose material has any HTML-texture map slot → convert UV
+        // hit to host pixel coords → dispatch click to the matching DOM
+        // element inside the texture's shadow tree.
+        attachHTMLClickForwarding(THREE, renderer, () => ({ camera, scene }));
 
         // Clone blob overlay — 2D canvas for bounding rectangles
         const blobOverlayCvs = document.createElement('canvas');
@@ -2080,8 +2090,26 @@
             return null;
         }
 
-        // Load a map slot — checks for TSL procedural texture first, then falls back to URL
+        // Load a map slot — priority: HTML texmap → TSL procedural → URL bitmap.
         function loadMapSlot(md, key, colorSpace, xfKey, fallback) {
+            const htmlUrl = md[key + 'HTML'];
+            if (htmlUrl) {
+                const baseUrl = md[key + 'HTMLBase'] || '';
+                const filename = md[key + 'HTMLName'] || '';
+                // Prefer baseUrl + filename so snapshot-mode relative URLs
+                // resolve inside the copied directory (and sibling images
+                // in the HTML file keep working).
+                const resolved = (baseUrl && filename)
+                    ? (baseUrl + encodeURIComponent(filename))
+                    : htmlUrl;
+                const handle = getOrCreateHTMLTexture(THREE, resolved, {
+                    width:  md[key + 'HTMLW']  || 1024,
+                    height: md[key + 'HTMLH'] || 1024,
+                    params: md[key + 'HTMLParams'],
+                    cacheKey: resolved,
+                });
+                return handle.texture;
+            }
             const tslCode = md[key + 'TSL'];
             if (tslCode) return evalTSLTexture(tslCode, md[key + 'TSLParams']);
             const url = md[key];
@@ -3840,6 +3868,10 @@
                     nodeMap.set(nd.h, mesh);
                 }
 
+                // Re-apply any layer-registered material map overrides for
+                // this handle so they survive the fresh material assignment.
+                layerManager.applyMaterialOverrides?.(nd.h, mesh);
+
                 finalizeSceneNode(mesh, nd);
             }
 
@@ -4208,6 +4240,9 @@
                     nodeMap.set(nd.h, mesh);
                     retainGeometryRef(geometryRefCounts, mesh.geometry);
                 }
+
+                // Re-apply any layer-registered material map overrides.
+                layerManager.applyMaterialOverrides?.(nd.h, mesh);
 
                 finalizeSceneNode(mesh, nd);
             }
@@ -6044,6 +6079,42 @@
             if (layersPanelVisible) queueLayersPanelRefresh();
         }
 
+        // ── Canvas Panel ────────────────────────────────────
+        const btnCanvasPanel = document.getElementById('btnCanvasPanel');
+        const canvasPanel = document.getElementById('canvasPanel');
+        let canvasPanelVisible = false;
+        let canvasPanelApp = null;
+
+        function setCanvasPanelVisible(visible) {
+            canvasPanelVisible = !!visible;
+            if (!canvasPanelVisible) {
+                const ae = document.activeElement;
+                if (ae instanceof HTMLElement && canvasPanel.contains(ae)) btnCanvasPanel?.focus();
+            }
+            canvasPanel.classList.toggle('visible', canvasPanelVisible);
+            canvasPanel.toggleAttribute('inert', !canvasPanelVisible);
+            canvasPanel.setAttribute('aria-hidden', String(!canvasPanelVisible));
+            btnCanvasPanel?.classList.toggle('active', canvasPanelVisible);
+            if (canvasPanelVisible && !canvasPanelApp) {
+                // Lazy-mount on first open so React isn't fetched on load.
+                createCanvasPanel({
+                    panelEl: canvasPanel,
+                    getProjectBaseUrl: () => projectRuntime?.getState?.().projectRootUrl || '',
+                    onHide: () => setCanvasPanelVisible(false),
+                }).then(app => { canvasPanelApp = app; }).catch(err => {
+                    canvasPanel.innerHTML =
+                        '<div class="sidepanel-header"><div>' +
+                        '<div class="sidepanel-title">Canvas</div>' +
+                        '<div class="sidepanel-subtitle" style="color:#f66">' +
+                        'Failed to load React: ' + String(err.message || err) +
+                        '</div></div></div>';
+                    console.error('[CanvasPanel] React load failed:', err);
+                });
+            } else if (canvasPanelVisible && canvasPanelApp) {
+                canvasPanelApp.render();
+            }
+        }
+
         let _layerManagerRef = null;
         let _projectRuntimeRef = null;
         let _layerManagerUnsub = null;
@@ -6213,6 +6284,7 @@
         }
 
         btnLayersPanel.addEventListener('click', () => setLayersPanelVisible(!layersPanelVisible));
+        btnCanvasPanel?.addEventListener('click', () => setCanvasPanelVisible(!canvasPanelVisible));
 
         // ── Hamburger Menu ───────────────────────────────────
         const hamburgerMenu = document.getElementById('hamburger-menu');

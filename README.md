@@ -107,7 +107,7 @@ Per-node flags synced to Three.js: renderable, backface cull, cast shadows, rece
 ## Environment
 
 - **HDRIEnviron.osl** with exposure, gamma, and rotation controls
-- **Sky** (ai_physical_sky): turbidity, rayleigh, mie coefficient/direction, sun elevation/azimuth, exposure
+- **Sky** (three.js Sky): turbidity, rayleigh, mie coefficient/direction, sun elevation/azimuth, exposure
 - **Fog (postfx):** linear (near/far), exponential (density), procedural noise (scale, speed, height falloff, animated turbulence)
 
 ---

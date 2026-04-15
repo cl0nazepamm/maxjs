@@ -8,16 +8,16 @@
 //
 // Layer manager stays for game logic / FX; Canvas is the design-side UI.
 
-// React + ReactDOM are loaded on first panel open from esm.sh. The import
-// is awaited once and cached. Requires internet on first load; thereafter
-// WebView2's HTTP cache keeps it local.
+// React + ReactDOM are resolved via the importmap in index.html, so both
+// the Canvas panel and shader_lab_fx share the SAME React instance — no
+// "two copies of React" hook dispatcher mismatch.
 let _reactLoad = null;
 async function ensureReact() {
     if (!_reactLoad) {
         _reactLoad = (async () => {
             const [React, ReactDOMClient] = await Promise.all([
-                import('https://esm.sh/react@18.3.1'),
-                import('https://esm.sh/react-dom@18.3.1/client'),
+                import('react'),
+                import('react-dom/client'),
             ]);
             return { React: React.default ?? React, ReactDOMClient };
         })();

@@ -789,6 +789,7 @@
                     <button id="btnSnapshotPanel" class="maxonly devonly">Snapshot Options</button>
                     <button id="btnLayersPanel" class="maxonly devonly">Layers</button>
                     <button id="btnCanvasPanel" class="maxonly devonly">Canvas</button>
+                    <button id="btnShaderLabPanel" class="maxonly devonly">Shader Lab</button>
                     <div class="menu-sep"></div>
                     <div class="menu-sep"></div>
                     <div style="padding:3px 12px;font:10px/1.4 'Segoe UI',system-ui,sans-serif;color:#666;">Camera</div>
@@ -801,6 +802,7 @@
                     <button id="btnLightProbe" class="active devonly">Probe: ON</button>
                     <button id="btnLightHelpers" class="devonly">Light Helpers</button>
                     <button id="btnRenderer" class="devonly">Renderer: WebGPU</button>
+                    <button id="btnShaderLab" class="devonly">Shader Lab: OFF</button>
                     <button id="btnSwitchVR" class="devonly">Switch to VR</button>
                     <div class="menu-sep"></div>
                     <button id="btnTheme">Theme: Dark</button>
@@ -827,6 +829,7 @@
     <aside id="layersPanel" class="sidepanel sidepanel-left" aria-hidden="true" inert></aside>
     <aside id="snapshotPanel" class="sidepanel" aria-hidden="true" inert></aside>
     <aside id="canvasPanel" class="sidepanel" aria-hidden="true" inert></aside>
+    <aside id="shaderLabPanel" class="sidepanel" aria-hidden="true" inert></aside>
     <aside id="postPanel" class="sidepanel" aria-hidden="true" inert></aside>
     <script type="importmap">
     {
@@ -836,8 +839,14 @@
             "three/webgpu": "./vendor/three-r183.2/build/three.webgpu.js",
             "three/tsl": "./vendor/three-r183.2/build/three.tsl.js",
             "three/addons/": "./vendor/three-r183.2/examples/",
+            "three/examples/jsm/": "./vendor/three-r183.2/examples/",
             "@sparkjsdev/spark": "./node_modules/@sparkjsdev/spark/dist/spark.module.js",
-            "@dimforge/rapier3d-compat": "./vendor/rapier/rapier.es.js"
+            "@dimforge/rapier3d-compat": "./vendor/rapier/rapier.es.js",
+            "react": "https://esm.sh/react@18.3.1",
+            "react/jsx-runtime": "https://esm.sh/react@18.3.1/jsx-runtime",
+            "react/jsx-dev-runtime": "https://esm.sh/react@18.3.1/jsx-dev-runtime",
+            "react-dom": "https://esm.sh/react-dom@18.3.1",
+            "react-dom/client": "https://esm.sh/react-dom@18.3.1/client"
         },
         "scopes": {
             "./node_modules/@sparkjsdev/spark/": {
@@ -898,6 +907,8 @@
         import { createProjectRuntime } from './js/project_runtime.js';
         import { getOrCreateHTMLTexture, releaseHTMLTexture, disposeAllHTMLTextures, attachHTMLClickForwarding } from './js/html_texture.js';
         import { createCanvasPanel } from './js/canvas_panel.js';
+        import { createShaderLabFx } from './js/shader_lab_fx.js';
+        import { createShaderLabPanel } from './js/shader_lab_panel.js';
 
         const THEME_STORAGE_KEY = 'maxjs-theme';
         const DARK_BG = 0x353535;
@@ -1268,6 +1279,12 @@
         // hit to host pixel coords → dispatch click to the matching DOM
         // element inside the texture's shadow tree.
         attachHTMLClickForwarding(THREE, renderer, () => ({ camera, scene }));
+
+        // Shader Lab FX — alternate post-fx path that bypasses ssgiFx.
+        // When enabled, the main render loop routes through shaderLabFx
+        // instead. Toggled from the hamburger menu. Loads React +
+        // @basementstudio/shader-lab from esm.sh on first enable.
+        const shaderLabFx = createShaderLabFx({ THREE, renderer, scene, camera });
 
         // Clone blob overlay — 2D canvas for bounding rectangles
         const blobOverlayCvs = document.createElement('canvas');
@@ -6079,6 +6096,39 @@
             if (layersPanelVisible) queueLayersPanelRefresh();
         }
 
+        // ── Shader Lab Panel ────────────────────────────────
+        const btnShaderLabPanel = document.getElementById('btnShaderLabPanel');
+        const shaderLabPanel = document.getElementById('shaderLabPanel');
+        let shaderLabPanelVisible = false;
+        let shaderLabPanelApp = null;
+
+        function setShaderLabPanelVisible(visible) {
+            shaderLabPanelVisible = !!visible;
+            if (!shaderLabPanelVisible) {
+                const ae = document.activeElement;
+                if (ae instanceof HTMLElement && shaderLabPanel.contains(ae)) btnShaderLabPanel?.focus();
+            }
+            shaderLabPanel.classList.toggle('visible', shaderLabPanelVisible);
+            shaderLabPanel.toggleAttribute('inert', !shaderLabPanelVisible);
+            shaderLabPanel.setAttribute('aria-hidden', String(!shaderLabPanelVisible));
+            btnShaderLabPanel?.classList.toggle('active', shaderLabPanelVisible);
+            if (shaderLabPanelVisible && !shaderLabPanelApp) {
+                createShaderLabPanel({
+                    panelEl: shaderLabPanel,
+                    shaderLabFx,
+                    onHide: () => setShaderLabPanelVisible(false),
+                }).then(app => { shaderLabPanelApp = app; }).catch(err => {
+                    shaderLabPanel.innerHTML =
+                        '<div class="sidepanel-header"><div>' +
+                        '<div class="sidepanel-title">Shader Lab</div>' +
+                        '<div class="sidepanel-subtitle" style="color:#f66">' +
+                        'Failed to load: ' + String(err.message || err) +
+                        '</div></div></div>';
+                    console.error('[ShaderLabPanel] React load failed:', err);
+                });
+            }
+        }
+
         // ── Canvas Panel ────────────────────────────────────
         const btnCanvasPanel = document.getElementById('btnCanvasPanel');
         const canvasPanel = document.getElementById('canvasPanel');
@@ -6285,6 +6335,15 @@
 
         btnLayersPanel.addEventListener('click', () => setLayersPanelVisible(!layersPanelVisible));
         btnCanvasPanel?.addEventListener('click', () => setCanvasPanelVisible(!canvasPanelVisible));
+        btnShaderLabPanel?.addEventListener('click', () => setShaderLabPanelVisible(!shaderLabPanelVisible));
+
+        // The legacy "Shader Lab" quick-toggle in the burger menu opens the
+        // standalone configurator panel — full layer-stack editing lives
+        // there now, not in the Post FX panel.
+        const btnShaderLab = document.getElementById('btnShaderLab');
+        btnShaderLab?.addEventListener('click', () => {
+            setShaderLabPanelVisible(!shaderLabPanelVisible);
+        });
 
         // ── Hamburger Menu ───────────────────────────────────
         const hamburgerMenu = document.getElementById('hamburger-menu');
@@ -8049,6 +8108,12 @@
                             delete obj.userData._vrSavedIntensity;
                         }
                     });
+                } else if (shaderLabFx.isEnabled()) {
+                    // Shader Lab mode bypasses ssgiFx entirely and runs its
+                    // own scene→target→shader-lab→fullscreen-quad pipeline.
+                    const nowS = performance.now() * 0.001;
+                    shaderLabFx.renderFrame(nowS, nowS - (shaderLabFx._lastT || nowS));
+                    shaderLabFx._lastT = nowS;
                 } else {
                     ssgiFx.render();
                 }

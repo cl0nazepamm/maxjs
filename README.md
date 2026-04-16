@@ -16,8 +16,11 @@
 
 ## Objects
 
-- **Splat Origin** - Guassian Splat loading via Spark.js integration.
-- **Audio Origin** - Load audio tracks
+Supports rendering of splines (as lines) and all types of meshes.
+
+- **Splat Origin** — Gaussian Splat loading via [Spark](https://github.com/sparkjsdev/spark) (`@sparkjsdev/spark`).
+- **Audio Origin** — Load audio tracks
+- **WebGPU instancing** - Instance handling is automatic including forest pack and railclone geo
 
 ## Materials
 
@@ -49,6 +52,7 @@ MaterialX Compiler slot can be used to convert 3dsMax OSL into MaterialX quickly
 - **UberBitmap.osl** — Main bitmap node supported and translated by max.js
 - **three.js TSL bitmap** — Custom shader code for materials (Parameterization supported)
 - **three.js video textures** — Load .mp4 or .webm directly
+- **three.js HTML** — html-in-canvas 
 
 ---
 
@@ -88,6 +92,15 @@ Most effects require WebGPU backend. Supplied by three.js team with few of my ow
 ### Node Properties
 
 Per-node flags synced to Three.js: renderable, backface cull, cast shadows, receive shadows, camera visibility, reflection visibility, opacity.
+
+### Shader Lab Backend in 0.2.0
+
+An alternate post-fx stack powered by [Shader Lab](https://github.com/basementstudio/shader-lab) from [basement.studio](https://eng.basement.studio/tools/shader-lab) has been added.
+
+# Canvas
+
+HTML can be loaded directly to viewer with React support.
+
 
 ---
 
@@ -156,7 +169,7 @@ This tool targets web development but since it's registered as renderer I added 
 
 # Build
 
-**Requirements:** Visual Studio 2022 (v143 toolset), CMake 3.20+, 3ds Max 2026 SDK
+**Requirements:** Visual Studio 2022 (v143 toolset), CMake 3.20+, 3ds Max SDK
 
 ```bash
 # 1. Pull WebView2 SDK (one time)
@@ -176,6 +189,14 @@ copy build\Release\maxjs.gup "C:\Program Files\Autodesk\3ds Max 2026\plugins\"
 ```
 
 Restart Max to load the plugin.
+
+## Acknowledgments
+
+- [three.js](https://threejs.org/) by mrdoob
+- [Spark](https://github.com/sparkjsdev/spark) by World Labs
+- [Shader Lab](https://github.com/basementstudio/shader-lab) by [basement.studio] 
+- [WebView2](https://developer.microsoft.com/en-us/microsoft-edge/webview2/) — by [Microsoft]
+- [Rapier](https://rapier.rs/) — physics in runtime layers
 
 ## License
 

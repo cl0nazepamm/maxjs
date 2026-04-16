@@ -9616,6 +9616,16 @@ public:
                 if (useBinary_) SendFullSyncBinary(); else SendFullSync();
             }
         } else {
+            // Poll deforming meshes every tick regardless of interactive state.
+            // Max's RedrawViewsCallback only fires on full scene redraws
+            // (animation, param edits, etc.) — NOT during interactive bone
+            // manipulation, which uses a gizmo-only fast path. Without this
+            // timer-driven poll, manually dragging bones doesn't update the
+            // viewer even though the Skin modifier IS re-evaluating in Max.
+            // The 16ms throttle inside the function dedups when the redraw
+            // callback also runs during animation.
+            CheckSkinnedGeometryLive();
+
             const bool animPlaying = IsAnimationPlaying();
             const bool favorInteractive = ShouldFavorInteractivePerformance();
             const bool allowIdlePolling = !favorInteractive;
@@ -13103,7 +13113,16 @@ void MaxJSFastNodeEventCallback::ControllerStructured(NodeKeyTab& nodes) {
 }
 
 void MaxJSFastNodeEventCallback::ControllerOtherEvent(NodeKeyTab& nodes) {
-    if (owner_) owner_->MarkTrackedNodesDirty(nodes);
+    if (!owner_) return;
+    owner_->MarkTrackedNodesDirty(nodes);
+    // Controller change on ANY node (bones, helpers, dummies, etc.) can drive
+    // skin deformation via the modifier stack. Max doesn't fire a geometry
+    // event on the skinned mesh itself in this path — and the RedrawViewsCallback
+    // doesn't fire during interactive gizmo drags — so we poll deform meshes
+    // here directly. The 16ms throttle inside CheckSkinnedGeometryLive dedups
+    // against the tick-timer and redraw paths.
+    owner_->MarkInteractiveActivity();
+    owner_->CheckSkinnedGeometryLive();
 }
 
 void MaxJSFastNodeEventCallback::LinkChanged(NodeKeyTab& nodes) {

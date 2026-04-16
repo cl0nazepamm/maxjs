@@ -417,32 +417,6 @@
         .fx-section.disabled-by-other {
             opacity: 0.45;
         }
-        /* ── Shader Lab bypass state ─────────────────────────
-         * When Shader Lab is the active post-fx backend, MaxJS's
-         * Three.js post-fx chain is bypassed. Gray out every section
-         * in the Post FX panel except ones marked data-keep-on-shader-lab
-         * (currently just Tone Mapping — it lives at the renderer
-         * level and keeps applying in Shader Lab mode). */
-        .sidepanel-body.shader-lab-bypass .fx-section:not([data-keep-on-shader-lab]) {
-            opacity: 0.3;
-            pointer-events: none;
-            filter: grayscale(0.4);
-        }
-        .shader-lab-bypass-note {
-            display: none;
-            margin-bottom: 10px;
-            padding: 8px 10px;
-            background: rgba(255, 255, 255, 0.04);
-            border: 1px solid rgba(255, 255, 255, 0.08);
-            border-radius: 3px;
-            font: 9px/1.4 -apple-system, 'Segoe UI', system-ui, sans-serif;
-            color: #aaa;
-            text-transform: uppercase;
-            letter-spacing: 0.08em;
-        }
-        .sidepanel-body.shader-lab-bypass .shader-lab-bypass-note {
-            display: block;
-        }
         .fx-section.disabled-by-other .fx-section-title,
         .fx-section.disabled-by-other .fx-control-head,
         .fx-section.disabled-by-other .fx-check {
@@ -915,7 +889,6 @@
                     <button id="btnLightProbe" class="active devonly">Probe: ON</button>
                     <button id="btnLightHelpers" class="devonly">Light Helpers</button>
                     <button id="btnRenderer" class="devonly">Renderer: WebGPU</button>
-                    <button id="btnShaderLab" class="devonly">POSTFX: THREE.JS</button>
                     <button id="btnSwitchVR" class="devonly">Switch to VR</button>
                     <div class="menu-sep"></div>
                     <button id="btnTheme">Theme: Dark</button>
@@ -1023,7 +996,13 @@
         import { getOrCreateHTMLTexture, releaseHTMLTexture, disposeAllHTMLTextures, attachHTMLClickForwarding } from './js/html_texture.js';
         import { createCanvasPanel } from './js/canvas_panel.js';
         import { createShaderLabFx } from './js/shader_lab_fx.js';
-        import { createShaderLabPanel } from './js/shader_lab_panel.js';
+        import {
+            createShaderLabPanel,
+            getShaderLabSnapshot,
+            setShaderLabSnapshot,
+            onShaderLabSnapshotChange,
+            updateShaderLabEnabled,
+        } from './js/shader_lab_panel.js';
 
         const THEME_STORAGE_KEY = 'maxjs-theme';
         const DARK_BG = 0x353535;
@@ -6499,53 +6478,6 @@
         btnCanvasPanel?.addEventListener('click', () => setCanvasPanelVisible(!canvasPanelVisible));
         btnShaderLabPanel?.addEventListener('click', () => setShaderLabPanelVisible(!shaderLabPanelVisible));
 
-        // POSTFX backend switch: toggles between MaxJS's Three.js post-fx
-        // stack (ssgi / ssr / gtao / bloom / tone map) and the Shader Lab
-        // stack. Only one runs at a time — see the note in the Shader Lab
-        // panel's Pipeline section. Button label reflects the current
-        // backend and stays in sync with the panel's switch via the
-        // `maxjs-shader-lab-state` custom event shaderLabFx dispatches.
-        const btnShaderLab = document.getElementById('btnShaderLab');
-        function syncShaderLabBackendBtn() {
-            if (!btnShaderLab) return;
-            const on = shaderLabFx.isEnabled();
-            btnShaderLab.textContent = on ? 'POSTFX: SHADER-LAB' : 'POSTFX: THREE.JS';
-            btnShaderLab.classList.toggle('active', on);
-        }
-        btnShaderLab?.addEventListener('click', async () => {
-            if (shaderLabFx.isEnabled()) {
-                shaderLabFx.disable();
-                return;
-            }
-            try {
-                await shaderLabFx.enable();
-            } catch (err) {
-                console.error('[ShaderLab] enable failed:', err);
-                perfHud?.setStatus?.('Shader Lab failed: ' + (err?.message || err));
-            }
-        });
-        window.addEventListener('maxjs-shader-lab-state', syncShaderLabBackendBtn);
-        syncShaderLabBackendBtn();
-
-        // Gray out every Post FX section when Shader Lab is the active
-        // backend, keeping only sections marked data-keep-on-shader-lab
-        // (Tone Mapping) interactive. The panel body gets a marker class
-        // that drives the CSS rules in `.fx-section:not([data-keep...])`.
-        function syncShaderLabPostFxBypass() {
-            const body = postPanel?.querySelector('.sidepanel-body');
-            if (!body) return;
-            body.classList.toggle('shader-lab-bypass', shaderLabFx.isEnabled());
-        }
-        window.addEventListener('maxjs-shader-lab-state', syncShaderLabPostFxBypass);
-        // Also re-run after panel rebuilds (postPanel.innerHTML is rewritten
-        // when the user opens it for the first time).
-        const _origBuild = typeof buildPostFxPanel === 'function' ? buildPostFxPanel : null;
-        if (_origBuild) {
-            // Post-wiring pass — schedule after any buildPostFxPanel call.
-            // Cheap way: poll via the state event next tick.
-            setTimeout(syncShaderLabPostFxBypass, 0);
-        }
-
         // ── Hamburger Menu ───────────────────────────────────
         const hamburgerMenu = document.getElementById('hamburger-menu');
         document.getElementById('btnHamburger').addEventListener('click', (e) => {
@@ -6908,6 +6840,8 @@
             ).join('');
             const fpsCapOptions = [
                 { value: 0, label: 'Uncapped' },
+                { value: 12, label: '12 FPS (stop-motion)' },
+                { value: 24, label: '24 FPS (cinema)' },
                 { value: 30, label: '30 FPS' },
                 { value: 60, label: '60 FPS' },
                 { value: 90, label: '90 FPS' },
@@ -6929,9 +6863,6 @@
                     <button id="btnPostPanelClose" type="button">Hide</button>
                 </div>
                 <div class="sidepanel-body">
-                    <div class="shader-lab-bypass-note">
-                        Shader Lab backend active · three.js post-fx bypassed · tone mapping still applies
-                    </div>
                     <section class="fx-section collapsed" data-keep-on-shader-lab>
                         <div class="fx-section-header">
                             <div class="fx-section-title">Tone Mapping</div>
@@ -6962,7 +6893,7 @@
                         </div>
                         <div class="fx-note">MSAA: hardware multisample (default). TRAA: temporal reprojection (WebGPU only). Off: no anti-aliasing.</div>
                     </section>
-                    <section class="fx-section collapsed">
+                    <section class="fx-section collapsed" data-keep-on-shader-lab>
                         <div class="fx-section-header">
                             <div class="fx-section-title">Performance</div>
                         </div>
@@ -6998,9 +6929,9 @@
                                 <input class="fx-range" id="fx-performance-instancethreshold" type="range" min="2" max="500" step="1" value="${performanceSettings.maxInstanceBucketThreshold}">
                             </label>
                         </div>
-                        <div class="fx-note" id="fx-performance-note">Caps the viewer frame rate and scales device pixel ratio to reduce GPU load. Splats off skips Spark (no second WebGL pass). XR stays uncapped.</div>
+                        <div class="fx-note" id="fx-performance-note">Caps viewer frame rate (12 = stop-motion look, 24 = cinema) and scales device pixel ratio to reduce GPU load. Splats off skips Spark (no second WebGL pass). XR stays uncapped.</div>
                     </section>
-                    <section class="fx-section collapsed">
+                    <section class="fx-section collapsed" data-keep-on-shader-lab>
                         <div class="fx-section-header">
                             <div class="fx-section-title">Camera Clipping</div>
                         </div>
@@ -7022,7 +6953,7 @@
                         </div>
                         <div class="fx-note">Leave empty for auto-fit. Raise Near (e.g. 1–10) on large scenes to eliminate distant-geometry z-fighting by reclaiming depth buffer precision.</div>
                     </section>
-                    <section class="fx-section collapsed" data-fx-section="hdri">
+                    <section class="fx-section collapsed" data-fx-section="hdri" data-keep-on-shader-lab>
                         <div class="fx-section-header">
                             <div class="fx-section-title">HDRI</div>
                             <div style="display:flex;gap:3px">
@@ -7053,13 +6984,13 @@
                         </div>
                     </section>
                     ${sectionsHtml}
-                    <section class="fx-section collapsed" data-fx-section="clone">
+                    <section class="fx-section collapsed" data-fx-section="clone" data-keep-on-shader-lab>
                         <div class="fx-section-header">
                             <div class="fx-section-title">Clone</div>
                         </div>
                         <div class="fx-note" style="margin:0;padding:2px 0;color:#666;font-size:9px">Custom fun effects that are designed by me.</div>
 
-                        <div class="clone-subsection" style="margin-top:8px;padding:6px 0 4px;border-top:1px solid rgba(255,255,255,0.08)">
+                        <div class="clone-subsection" data-requires-threejs-backend style="margin-top:8px;padding:6px 0 4px;border-top:1px solid rgba(255,255,255,0.08)">
                             <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">
                                 <span style="font-size:11px;color:#ccc;font-weight:600;letter-spacing:0.3px">Blob Tracker</span>
                                 <button class="fx-toggle" type="button" id="fx-toggle-clone">Off</button>
@@ -7215,7 +7146,6 @@
                 postPanel.style.width = '';
                 buildPostFxPanel();
                 syncPostFxPanel(true);
-                syncShaderLabPostFxBypass();
             };
 
             // Panel horizontal resize
@@ -7754,6 +7684,7 @@
                 },
                 cameraClip: { near: cameraClip.near, far: cameraClip.far },
                 ascii: { enabled: asciiActive, ...asciiSettings },
+                shaderLab: getShaderLabSnapshot(),
             };
             if (includeDebug) {
                 payload.debug = buildDebugConsoleState();
@@ -7789,6 +7720,19 @@
                 localStorage.setItem(POSTFX_STORAGE_KEY, JSON.stringify(payload));
             } catch {}
         }
+
+        // Any user edit in the Shader Lab panel (config layer add/edit/delete,
+        // autoApply toggle, activate/deactivate) routes through this handler
+        // to persist alongside the rest of the Post FX state — next to the
+        // .max file when the project runtime is available, otherwise
+        // localStorage.
+        onShaderLabSnapshotChange(() => savePostFxState());
+
+        // Track the Activate state in the store whenever it flips so a refresh
+        // brings the effect back (same UX as ssgi effects being sticky).
+        window.addEventListener('maxjs-shader-lab-state', () => {
+            updateShaderLabEnabled(shaderLabFx.isEnabled());
+        });
 
         function applySavedPostFxPayload(saved) {
             try {
@@ -7909,6 +7853,19 @@
                     if (typeof saved.ascii.invert === 'boolean') asciiSettings.invert = saved.ascii.invert;
                     if (saved.ascii.enabled) enterAsciiMode();
                 }
+
+                // Shader Lab restore (config + autoApply + enabled) —
+                // next-to-.max persistence flows through the same Post FX
+                // state pipe. If the scene had Shader Lab active, reactivate
+                // it so the refresh keeps the effect on screen.
+                if (saved.shaderLab) {
+                    setShaderLabSnapshot(saved.shaderLab);
+                    if (saved.shaderLab.enabled && !shaderLabFx.isEnabled()) {
+                        shaderLabFx.enable(saved.shaderLab.config).catch(err => {
+                            console.error('[ShaderLab] restore enable failed:', err);
+                        });
+                    }
+                }
             } catch (e) {
                 maxjsDebugWarn('MaxJS: failed to apply post-FX state', e);
             }
@@ -7946,7 +7903,6 @@
         }
 
         buildPostFxPanel();
-        syncShaderLabPostFxBypass();
         // NOTE: Do NOT call syncPostFxPanel here — it would save defaults and overwrite stored settings.
         // restoreInteractiveBrowserState() handles restore then sync.
 

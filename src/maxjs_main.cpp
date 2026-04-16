@@ -9687,13 +9687,21 @@ public:
             std::vector<int> indices;
             std::vector<MatGroup> groups;
             bool isSpline = false;
-            // Fast-positions path is valid for any mesh whose topology is
-            // stable between full syncs — i.e., any mesh with a live
-            // controlIdx cache. This covers Skin, Path Deform, Bend, FFD,
-            // and all other position-only deformers (~4x smaller payload,
-            // single EvalWorldState, no normals recompute on the web side).
+            // Fast-positions path: only positions are re-sent. Valid for
+            // meshes whose non-position channels (UVs, indices, normals) are
+            // stable between full syncs — i.e., meshes where the current
+            // frame's change is driven by a modifier's deformation, not by
+            // a direct edit that could also change UVs or topology.
+            //
+            // Gated on "is deforming" (Skin or any modifier-stack mesh),
+            // not just cache presence — static meshes with manual vertex
+            // edits need the full ExtractMesh path so UV/topology changes
+            // are not silently dropped.
+            const bool isDeforming =
+                skinnedHandles_.find(handle) != skinnedHandles_.end() ||
+                deformHandles_.find(handle) != deformHandles_.end();
             bool usedSkinnedFastPositions = false;
-            if (wv17 && env12) {
+            if (wv17 && env12 && isDeforming) {
                 auto cacheIt = skinnedControlIdxCache_.find(handle);
                 if (cacheIt != skinnedControlIdxCache_.end()) {
                     usedSkinnedFastPositions = ExtractSkinnedFastPositions(node, t, cacheIt->second, verts);

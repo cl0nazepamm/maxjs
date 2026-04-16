@@ -104,7 +104,42 @@ void RestoreMaxJSPanel(); // defined after class
 //  JSON Helpers
 // ══════════════════════════════════════════════════════════════
 
+// Best-effort check: does `s` look like a JSON object/array that we can
+// splice raw into our stream without breaking the enclosing scene JSON?
+// Trims whitespace, requires matching `{}` or `[]` wrappers, counts brace
+// depth outside of string literals, and returns false if the content isn't
+// balanced. Used to guard user-supplied params blobs (HTML/TSL texmap) so a
+// typo in the material editor can't corrupt the entire scene delta.
+static bool IsProbablyJsonStructured(const std::wstring& s) {
+    size_t i = 0, j = s.size();
+    while (i < j && iswspace(s[i])) ++i;
+    while (j > i && iswspace(s[j - 1])) --j;
+    if (j - i < 2) return false;
+    const wchar_t open  = s[i];
+    const wchar_t close = s[j - 1];
+    if (!((open == L'{' && close == L'}') || (open == L'[' && close == L']'))) return false;
+    int depth = 0;
+    bool inStr = false;
+    bool esc   = false;
+    for (size_t k = i; k < j; ++k) {
+        const wchar_t c = s[k];
+        if (inStr) {
+            if (esc) { esc = false; continue; }
+            if (c == L'\\') { esc = true; continue; }
+            if (c == L'"')  { inStr = false; }
+            continue;
+        }
+        if (c == L'"') { inStr = true; continue; }
+        if (c == L'{' || c == L'[') ++depth;
+        else if (c == L'}' || c == L']') {
+            if (--depth < 0) return false;
+        }
+    }
+    return depth == 0 && !inStr;
+}
+
 static std::wstring EscapeJson(const wchar_t* s) {
+    if (!s) return {};
     std::wstring out;
     out.reserve(wcslen(s) + 16);
     for (; *s; ++s) {
@@ -204,7 +239,9 @@ static std::uint64_t FileTimeToUint64(const FILETIME& ft) {
     return value.QuadPart;
 }
 
-static std::uint64_t GetDirectoryWriteStamp(const std::wstring& dirPath) {
+static std::uint64_t GetDirectoryWriteStamp(const std::wstring& dirPath, int depth = 0) {
+    // Guard against pathological / symlink-looped project trees.
+    if (depth > 32) return 0;
     if (!DirectoryExists(dirPath)) return 0;
 
     std::uint64_t latest = 0;
@@ -221,7 +258,7 @@ static std::uint64_t GetDirectoryWriteStamp(const std::wstring& dirPath) {
         latest = std::max(latest, FileTimeToUint64(findData.ftLastWriteTime));
 
         if (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-            latest = std::max(latest, GetDirectoryWriteStamp(dirPath + L"\\" + findData.cFileName));
+            latest = std::max(latest, GetDirectoryWriteStamp(dirPath + L"\\" + findData.cFileName, depth + 1));
         }
     } while (FindNextFileW(findHandle, &findData));
 
@@ -1592,6 +1629,8 @@ static bool ExtractMaterialTexture(Texmap* map, std::wstring& filePath, MaxJSPBR
         xf.htmlHeight = pb->GetInt(phtml_tex_height, 0);
         if (xf.htmlWidth  <= 0) xf.htmlWidth  = 1024;
         if (xf.htmlHeight <= 0) xf.htmlHeight = 1024;
+        if (xf.htmlWidth  > 4096) xf.htmlWidth  = 4096;
+        if (xf.htmlHeight > 4096) xf.htmlHeight = 4096;
         const MCHAR* pj = pb->GetStr(phtml_tex_params_json);
         if (pj && pj[0]) xf.htmlParamsJson = pj;
         return true;
@@ -5655,6 +5694,7 @@ public:
     std::unordered_set<ULONG> lightHandles_;
     std::unordered_set<ULONG> splatHandles_;
     std::unordered_set<ULONG> audioHandles_;
+    std::unordered_set<ULONG> hairHandles_;
     std::unordered_set<ULONG> fastDirtyHandles_;
     std::unordered_set<ULONG> visibilityDirtyHandles_;
     std::unordered_map<ULONG, std::array<float, 16>> lastSentTransforms_;
@@ -5855,6 +5895,16 @@ public:
     void OnWebViewReady(ICoreWebView2Controller* ctrl) {
         controller_ = ctrl;
         controller_->get_CoreWebView2(&webview_);
+
+        // Tell WebView2 that put_Bounds coordinates are raw physical pixels,
+        // not DIPs. Without this, any display scale above 100% causes the
+        // WebView content to render at the wrong size and get clipped.
+        ComPtr<ICoreWebView2Controller3> ctrl3;
+        if (SUCCEEDED(controller_->QueryInterface(IID_PPV_ARGS(&ctrl3))) && ctrl3) {
+            ctrl3->put_BoundsMode(COREWEBVIEW2_BOUNDS_MODE_USE_RAW_PIXELS);
+            ctrl3->put_ShouldDetectMonitorScaleChanges(FALSE);
+        }
+
         RECT b; GetClientRect(hwnd_, &b); controller_->put_Bounds(b);
 
         ComPtr<ICoreWebView2Settings> settings;
@@ -8275,6 +8325,7 @@ public:
         lightHandles_.clear();
         splatHandles_.clear();
         audioHandles_.clear();
+        hairHandles_.clear();
         fastDirtyHandles_.clear();
         lastSentTransforms_.clear();
         mtlHashMap_.clear();
@@ -8538,11 +8589,13 @@ public:
         return geomHandles_.find(handle) != geomHandles_.end()
             || lightHandles_.find(handle) != lightHandles_.end()
             || splatHandles_.find(handle) != splatHandles_.end()
-            || audioHandles_.find(handle) != audioHandles_.end();
+            || audioHandles_.find(handle) != audioHandles_.end()
+            || hairHandles_.find(handle) != hairHandles_.end();
     }
 
     bool HasTrackedNodes() const {
-        return !geomHandles_.empty() || !lightHandles_.empty() || !splatHandles_.empty() || !audioHandles_.empty();
+        return !geomHandles_.empty() || !lightHandles_.empty() || !splatHandles_.empty()
+            || !audioHandles_.empty() || !hairHandles_.empty();
     }
 
     // Debounced dirty: coalesces rapid-fire notifications (e.g. clone) into one full sync
@@ -8963,6 +9016,12 @@ public:
                 const ULONG handle = current->GetHandle();
                 if (!IsTrackedHandle(handle)) return;
                 geoHashMap_.erase(handle);
+                // Hair handles get full re-extraction via SendHairFastUpdate —
+                // they don't go through geoFastDirtyHandles_ (no mesh to send).
+                if (hairHandles_.count(handle)) {
+                    if (fastDirtyHandles_.insert(handle).second) changed = true;
+                    return;
+                }
                 geoFastDirtyHandles_.insert(handle);
                 // Skinned meshes only need vertex data updates via geo_fast.
                 // Adding them to fastDirtyHandles_ would trigger redundant
@@ -9159,6 +9218,7 @@ public:
         fastDirtyHandles_.insert(lightHandles_.begin(), lightHandles_.end());
         fastDirtyHandles_.insert(splatHandles_.begin(), splatHandles_.end());
         fastDirtyHandles_.insert(audioHandles_.begin(), audioHandles_.end());
+        fastDirtyHandles_.insert(hairHandles_.begin(), hairHandles_.end());
         QueueFastFlush();
     }
 
@@ -9186,6 +9246,7 @@ public:
         for (ULONG handle : lightHandles_) markIfTransformChanged(handle);
         for (ULONG handle : splatHandles_) markIfTransformChanged(handle);
         for (ULONG handle : audioHandles_) markIfTransformChanged(handle);
+        for (ULONG handle : hairHandles_) markIfTransformChanged(handle);
 
         if (changed) {
             QueueFastFlush();
@@ -9445,6 +9506,7 @@ public:
             lightHandles_.clear();
             splatHandles_.clear();
             audioHandles_.clear();
+        hairHandles_.clear();
             audioHashMap_.clear();
             geoScanCursor_ = 0;
             skinnedControlIdxCache_.clear();
@@ -9638,6 +9700,49 @@ public:
         }
     }
 
+    void SendHairFastUpdate(const std::vector<ULONG>& dirtyHandles) {
+        if (!webview_) return;
+        Interface* ip = GetCOREInterface();
+        if (!ip) return;
+        TimeValue t = ip->GetTime();
+
+        std::vector<ULONG> hairDirty;
+        for (ULONG h : dirtyHandles) {
+            if (hairHandles_.find(h) != hairHandles_.end()) hairDirty.push_back(h);
+        }
+        if (hairDirty.empty()) return;
+
+        std::vector<HairInstanceGroup> groups;
+        for (ULONG h : hairDirty) {
+            INode* node = ip->GetINodeByHandle(h);
+            if (!node) continue;
+            ExtractHairInstances(node, t, groups);
+        }
+        if (groups.empty()) return;
+
+        std::wostringstream ss;
+        ss.imbue(std::locale::classic());
+        ss << L"{\"type\":\"hair_fast\",\"groups\":[";
+        bool first = true;
+        for (const HairInstanceGroup& g : groups) {
+            if (g.instanceCount <= 0 || g.transforms.empty()) continue;
+            if (!first) ss << L',';
+            first = false;
+            ss << L"{\"h\":" << g.handle;
+            ss << L",\"vis\":" << (g.visible ? L'1' : L'0');
+            ss << L",\"count\":" << g.instanceCount;
+            ss << L",\"xforms\":";
+            WriteFloats(ss, g.transforms.data(), g.transforms.size());
+            if (!g.colors.empty()) {
+                ss << L",\"colors\":";
+                WriteFloats(ss, g.colors.data(), g.colors.size());
+            }
+            ss << L'}';
+        }
+        ss << L"]}";
+        webview_->PostWebMessageAsJson(ss.str().c_str());
+    }
+
     void FlushFastPath() {
         fastFlushPosted_ = false;
 
@@ -9718,6 +9823,11 @@ public:
             SendGeometryFastUpdate(geoDirty);
         }
 
+        // Hair fast path: re-extract world-space hair instances for any dirty
+        // hair handles. Covers transforms, deformation, frizz, dynamics — any
+        // change that alters GetHairDefinition output.
+        SendHairFastUpdate(dirtyHandles);
+
         if (!useBinary_) {
             if (hasAnyNodeUpdates) SendTransformSync(&combinedNodeHandles);
             else SendCameraSync();
@@ -9757,11 +9867,16 @@ public:
                 lightHandles_.erase(handle);
                 splatHandles_.erase(handle);
                 audioHandles_.erase(handle);
+                hairHandles_.erase(handle);
                 lastSentTransforms_.erase(handle);
                 materialFastDirtyHandles_.erase(handle);
                 SetDirty();
                 continue;
             }
+
+            // Hair handles are fully handled by SendHairFastUpdate — skip
+            // from the binary delta loop to avoid spurious transform commands.
+            if (hairHandles_.find(handle) != hairHandles_.end()) continue;
 
             float xform[16];
             GetTransform16(node, t, xform);
@@ -10553,7 +10668,7 @@ public:
             // TSL procedural texture — emit code and params instead of URL
             if (!xf.tslCode.empty()) {
                 ss << L",\"" << key << L"TSL\":\"" << EscapeJson(xf.tslCode.c_str()) << L'"';
-                if (!xf.tslParamsJson.empty())
+                if (!xf.tslParamsJson.empty() && IsProbablyJsonStructured(xf.tslParamsJson))
                     ss << L",\"" << key << L"TSLParams\":" << xf.tslParamsJson;
                 return;
             }
@@ -10577,7 +10692,7 @@ public:
                     ss << L",\"" << key << L"HTMLName\":\"" << EscapeJson(htmlFilename.c_str()) << L'"';
                 ss << L",\"" << key << L"HTMLW\":" << xf.htmlWidth;
                 ss << L",\"" << key << L"HTMLH\":" << xf.htmlHeight;
-                if (!xf.htmlParamsJson.empty())
+                if (!xf.htmlParamsJson.empty() && IsProbablyJsonStructured(xf.htmlParamsJson))
                     ss << L",\"" << key << L"HTMLParams\":" << xf.htmlParamsJson;
                 return;
             }
@@ -10740,8 +10855,10 @@ public:
         } else if (pbr.materialModel == L"MeshTSLNodeMaterial") {
             if (!pbr.tslCode.empty())
                 ss << L",\"tslCode\":\"" << EscapeJson(pbr.tslCode.c_str()) << L"\"";
-            // TSL dynamic params — send raw JSON (already valid JSON object)
-            if (!pbr.tslParamsJson.empty())
+            // TSL dynamic params — send raw JSON (already valid JSON object).
+            // Guard against user-authored garbage in the params field corrupting the
+            // enclosing scene delta by validating brace balance before splicing raw.
+            if (!pbr.tslParamsJson.empty() && IsProbablyJsonStructured(pbr.tslParamsJson))
                 ss << L",\"tslParams\":" << pbr.tslParamsJson;
             // TSL texture map slots
             static const wchar_t* tslMapKeys[] = { L"tslMap1", L"tslMap2", L"tslMap3", L"tslMap4" };
@@ -11401,6 +11518,10 @@ public:
 
         if (hairGroups.empty()) return;
 
+        for (const HairInstanceGroup& group : hairGroups) {
+            if (group.instanceCount > 0) hairHandles_.insert(group.handle);
+        }
+
         ss << L",\"hairInstances\":[";
         bool firstHair = true;
         for (const HairInstanceGroup& group : hairGroups) {
@@ -11441,6 +11562,7 @@ public:
         lightHandles_.clear();
         splatHandles_.clear();
         audioHandles_.clear();
+        hairHandles_.clear();
         pluginInstHandles_.clear();
         pluginInstHash_.clear();
         lastSentTransforms_.clear();
@@ -11770,6 +11892,7 @@ public:
         lightHandles_.clear();
         splatHandles_.clear();
         audioHandles_.clear();
+        hairHandles_.clear();
         pluginInstHandles_.clear();
         pluginInstHash_.clear();
         lastSentTransforms_.clear();
@@ -12766,7 +12889,11 @@ public:
     // ── Window management ────────────────────────────────────
 
     void Resize() {
-        if (controller_) { RECT b; GetClientRect(hwnd_, &b); controller_->put_Bounds(b); }
+        if (!controller_ || !hwnd_) return;
+        RECT b;
+        if (!GetClientRect(hwnd_, &b)) return;
+        if ((b.right - b.left) <= 0 || (b.bottom - b.top) <= 0) return;
+        controller_->put_Bounds(b);
     }
 
     void Destroy() {
@@ -12789,6 +12916,7 @@ public:
         lightHandles_.clear();
         splatHandles_.clear();
         audioHandles_.clear();
+        hairHandles_.clear();
         mtlHashMap_.clear();
         lightHashMap_.clear();
         splatHashMap_.clear();

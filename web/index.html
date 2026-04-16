@@ -7,6 +7,7 @@
     <link rel="icon" href="data:,">
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
+        html, body { color-scheme: dark; }
         body { overflow: hidden; background: #353535; position: relative; width: 100vw; height: 100vh; }
         canvas { display: block; }
 #hud {
@@ -46,9 +47,9 @@
             transition: all 0.15s ease;
         }
         #controls button.active {
-            background: rgba(64, 200, 176, 0.1);
-            color: #40c8b0;
-            border-color: rgba(64, 200, 176, 0.35);
+            background: rgba(255, 255, 255, 0.08);
+            color: #e8e8e8;
+            border-color: rgba(255, 255, 255, 0.3);
         }
         #controls button:hover {
             background: rgba(255, 255, 255, 0.1);
@@ -66,7 +67,7 @@
         }
         .sidepanel-resize:hover,
         .sidepanel-resize.active {
-            background: rgba(64, 200, 176, 0.25);
+            background: rgba(255, 255, 255, 0.2);
         }
         .sidepanel {
             position: absolute;
@@ -76,18 +77,19 @@
             min-width: 200px;
             max-width: calc(100vw - 16px);
             max-height: calc(100vh - 16px);
-            padding: 8px;
-            border-radius: 0;
-            border: 1px solid rgba(255, 255, 255, 0.08);
-            background: rgba(30, 30, 30, 0.72);
-            color: #bbb;
-            font: 11px/1.4 'Segoe UI', system-ui, sans-serif;
-            backdrop-filter: blur(28px) saturate(1.4);
-            -webkit-backdrop-filter: blur(28px) saturate(1.4);
+            padding: 12px;
+            border-radius: 4px;
+            border: 1px solid rgba(255, 255, 255, 0.07);
+            background: rgba(20, 20, 22, 0.78);
+            color: #c8c8c8;
+            font: 11px/1.4 -apple-system, 'Segoe UI', system-ui, sans-serif;
+            letter-spacing: 0.005em;
+            backdrop-filter: blur(32px) saturate(1.4);
+            -webkit-backdrop-filter: blur(32px) saturate(1.4);
             box-shadow:
-                0 8px 32px rgba(0, 0, 0, 0.5),
-                inset 0 1px 0 rgba(255, 255, 255, 0.06),
-                inset 0 -1px 0 rgba(0, 0, 0, 0.2);
+                0 12px 40px rgba(0, 0, 0, 0.55),
+                0 1px 0 rgba(255, 255, 255, 0.04) inset,
+                0 -1px 0 rgba(0, 0, 0, 0.25) inset;
             overflow-y: auto;
             overflow-x: hidden;
             opacity: 0;
@@ -118,6 +120,57 @@
             left: auto;
             right: 0;
             border-radius: 0;
+        }
+        /* ── Right-side dock ─────────────────────────────────
+         * Fixed 280px-wide column pinned to the right edge. Panels
+         * stack vertically inside. When more panels are open than
+         * fit the viewport height, the dock scrolls vertically. */
+        #rightDock {
+            position: fixed;
+            top: 8px;
+            right: 8px;
+            bottom: 8px;
+            width: 280px;
+            display: flex;
+            flex-direction: column;
+            align-items: stretch;
+            gap: 8px;
+            overflow-y: auto;
+            overflow-x: hidden;
+            pointer-events: none;
+            z-index: 30;
+            scrollbar-width: thin;
+            scrollbar-color: rgba(120,120,120,0.2) transparent;
+        }
+        #rightDock::-webkit-scrollbar { width: 4px; }
+        #rightDock::-webkit-scrollbar-track { background: transparent; }
+        #rightDock::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.08); }
+        /* Panels inside the dock drop their own absolute positioning
+         * and become flex items. Hidden panels collapse to 0 height so
+         * they don't reserve vertical space. */
+        #rightDock .sidepanel {
+            position: relative;
+            top: auto;
+            right: auto;
+            left: auto;
+            width: auto;
+            min-width: 0;
+            max-width: none;
+            max-height: none;
+            transform: none;
+            flex: 0 0 auto;
+            transition: opacity 0.2s ease;
+        }
+        #rightDock .sidepanel:not(.visible) {
+            opacity: 0;
+            pointer-events: none;
+            display: none;
+        }
+        #rightDock .sidepanel.visible {
+            opacity: 1;
+            pointer-events: auto;
+            transform: none;
+            display: block;
         }
         .layer-item {
             display: grid;
@@ -173,7 +226,7 @@
             color: #666;
             flex-shrink: 0;
         }
-        .layer-status.live { color: #40c8b0; }
+        .layer-status.live { color: #e8e8e8; }
         .layer-status.err { color: #ff5050; }
         .layer-status.off { color: #9e9e9e; }
         .layer-detail {
@@ -198,12 +251,12 @@
             flex-shrink: 0;
         }
         .layer-toggle {
-            background: rgba(64, 200, 176, 0.08);
-            border: 1px solid rgba(64, 200, 176, 0.22);
-            color: #65d3bf;
+            background: rgba(255, 255, 255, 0.06);
+            border: 1px solid rgba(255, 255, 255, 0.18);
+            color: #e0e0e0;
         }
         .layer-toggle:hover {
-            background: rgba(64, 200, 176, 0.18);
+            background: rgba(255, 255, 255, 0.15);
         }
         .layer-remove {
             background: rgba(255, 80, 80, 0.1);
@@ -221,48 +274,61 @@
         }
         .sidepanel-header {
             display: flex;
-            align-items: center;
+            align-items: flex-start;
             justify-content: space-between;
-            gap: 8px;
-            margin-bottom: 6px;
-            padding-bottom: 6px;
+            gap: 10px;
+            margin-bottom: 10px;
+            padding-bottom: 10px;
             border-bottom: 1px solid rgba(255, 255, 255, 0.06);
         }
         .sidepanel-title {
-            font-size: 12px;
+            font-size: 13px;
             font-weight: 700;
-            color: #ddd;
+            color: #f0f0f0;
+            letter-spacing: -0.01em;
+            line-height: 1.1;
         }
         .sidepanel-subtitle {
-            color: #888;
-            font-size: 10px;
+            color: #777;
+            font-size: 9px;
+            font-weight: 500;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            margin-top: 3px;
         }
         .sidepanel button,
         .fx-toggle {
-            background: rgba(255, 255, 255, 0.06);
-            color: #aaa;
+            background: rgba(255, 255, 255, 0.05);
+            color: #b0b0b0;
             border: 1px solid rgba(255, 255, 255, 0.08);
-            border-radius: 0;
-            padding: 3px 7px;
-            font: 10px/1 'Segoe UI', system-ui, sans-serif;
+            border-radius: 3px;
+            padding: 5px 10px;
+            font: 9px/1 -apple-system, 'Segoe UI', system-ui, sans-serif;
             font-weight: 600;
-            letter-spacing: 0.02em;
+            letter-spacing: 0.05em;
             text-transform: uppercase;
             cursor: pointer;
-            transition: all 0.15s ease;
+            transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease;
             white-space: nowrap;
-            backdrop-filter: blur(4px);
         }
         .sidepanel button:hover,
         .fx-toggle:hover {
-            background: rgba(255, 255, 255, 0.1);
-            color: #ccc;
+            background: rgba(255, 255, 255, 0.09);
+            border-color: rgba(255, 255, 255, 0.14);
+            color: #e0e0e0;
+        }
+        .sidepanel button:focus-visible,
+        .fx-toggle:focus-visible,
+        .sidepanel input:focus-visible,
+        .sidepanel select:focus-visible,
+        .sidepanel textarea:focus-visible {
+            outline: 1px solid rgba(255, 255, 255, 0.35);
+            outline-offset: 1px;
         }
         .fx-toggle.active {
-            background: rgba(64, 200, 176, 0.12);
-            border-color: rgba(64, 200, 176, 0.5);
-            color: #40c8b0;
-            box-shadow: 0 0 8px rgba(64, 200, 176, 0.1);
+            background: rgba(255, 255, 255, 0.14);
+            border-color: rgba(255, 255, 255, 0.32);
+            color: #ffffff;
         }
         .sidepanel button:disabled,
         .fx-toggle:disabled,
@@ -272,7 +338,7 @@
         }
         .sidepanel-body {
             display: grid;
-            gap: 4px;
+            gap: 8px;
         }
         .snapshot-grid {
             display: grid;
@@ -307,23 +373,26 @@
         }
         /* ── FX Sections ───────────────────────────── */
         .fx-section {
-            border: 1px solid rgba(255, 255, 255, 0.05);
-            border-radius: 0;
-            background: rgba(255, 255, 255, 0.03);
-            padding: 6px;
-            transition: background 0.15s ease, border-color 0.15s ease;
+            border: 0;
+            border-radius: 3px;
+            background: rgba(255, 255, 255, 0.025);
+            padding: 10px 12px;
+            transition: background 0.15s ease;
         }
         .fx-section:hover {
-            background: rgba(255, 255, 255, 0.045);
-            border-color: rgba(255, 255, 255, 0.08);
+            background: rgba(255, 255, 255, 0.035);
         }
         .fx-section-header {
             display: flex;
             align-items: center;
             justify-content: space-between;
-            gap: 6px;
+            gap: 8px;
             cursor: pointer;
             user-select: none;
+            min-height: 18px;
+        }
+        .fx-section.collapsed {
+            padding: 10px 12px;
         }
         .fx-section.collapsed .fx-grid,
         .fx-section.collapsed .fx-note,
@@ -331,11 +400,15 @@
             display: none;
         }
         .fx-section-title::before {
-            content: '▾ ';
-            font-size: 8px;
+            content: '–';
+            display: inline-block;
+            width: 10px;
+            color: #555;
+            font-weight: 400;
         }
         .fx-section.collapsed .fx-section-title::before {
-            content: '▸ ';
+            content: '+';
+            color: #777;
         }
         .sidepanel-body.ascii-takeover .fx-section:not([data-fx-section="clone"]):not([data-fx-section="ascii"]) {
             opacity: 0.25;
@@ -343,6 +416,32 @@
         }
         .fx-section.disabled-by-other {
             opacity: 0.45;
+        }
+        /* ── Shader Lab bypass state ─────────────────────────
+         * When Shader Lab is the active post-fx backend, MaxJS's
+         * Three.js post-fx chain is bypassed. Gray out every section
+         * in the Post FX panel except ones marked data-keep-on-shader-lab
+         * (currently just Tone Mapping — it lives at the renderer
+         * level and keeps applying in Shader Lab mode). */
+        .sidepanel-body.shader-lab-bypass .fx-section:not([data-keep-on-shader-lab]) {
+            opacity: 0.3;
+            pointer-events: none;
+            filter: grayscale(0.4);
+        }
+        .shader-lab-bypass-note {
+            display: none;
+            margin-bottom: 10px;
+            padding: 8px 10px;
+            background: rgba(255, 255, 255, 0.04);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            border-radius: 3px;
+            font: 9px/1.4 -apple-system, 'Segoe UI', system-ui, sans-serif;
+            color: #aaa;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+        }
+        .sidepanel-body.shader-lab-bypass .shader-lab-bypass-note {
+            display: block;
         }
         .fx-section.disabled-by-other .fx-section-title,
         .fx-section.disabled-by-other .fx-control-head,
@@ -354,87 +453,101 @@
         }
         .fx-section-title {
             font-size: 10px;
-            font-weight: 700;
-            color: #ccc;
+            font-weight: 600;
+            color: #d8d8d8;
             text-transform: uppercase;
-            letter-spacing: 0.04em;
+            letter-spacing: 0.1em;
+            display: flex;
+            align-items: center;
+            gap: 6px;
         }
         .fx-section-copy {
             display: none;
         }
         .fx-grid {
             display: grid;
-            gap: 3px;
-            margin-top: 5px;
+            gap: 8px;
+            margin-top: 10px;
         }
         .fx-control {
             display: grid;
-            gap: 1px;
+            gap: 4px;
         }
         .fx-control-head {
             display: flex;
-            align-items: center;
+            align-items: baseline;
             justify-content: space-between;
-            gap: 6px;
+            gap: 8px;
             font-size: 10px;
-            color: #999;
+            color: #888;
+            font-weight: 500;
         }
         .fx-check {
             display: flex;
             align-items: center;
             justify-content: space-between;
-            gap: 6px;
+            gap: 8px;
             font-size: 10px;
-            color: #999;
+            color: #aaa;
+            font-weight: 500;
+            min-height: 18px;
         }
         .fx-value {
-            color: #ddd;
+            color: #e0e0e0;
             font-size: 10px;
             font-weight: 600;
             font-variant-numeric: tabular-nums;
+            letter-spacing: 0;
         }
         /* ── Custom Range Slider ───────────────────── */
         .fx-range {
             -webkit-appearance: none;
             appearance: none;
             width: 100%;
-            height: 3px;
-            border-radius: 0;
+            height: 2px;
+            border-radius: 1px;
             background: rgba(255, 255, 255, 0.1);
             outline: none;
             cursor: pointer;
+            margin: 6px 0;
         }
         .fx-range::-webkit-slider-thumb {
             -webkit-appearance: none;
-            width: 10px;
-            height: 10px;
+            width: 12px;
+            height: 12px;
             border-radius: 50%;
-            background: #40c8b0;
-            border: 1px solid #2a9a85;
-            box-shadow: 0 0 4px rgba(60, 200, 175, 0.3);
+            background: #f0f0f0;
+            border: none;
+            box-shadow:
+                0 0 0 1px rgba(0, 0, 0, 0.4),
+                0 1px 3px rgba(0, 0, 0, 0.4);
             cursor: pointer;
-            transition: box-shadow 0.12s ease, transform 0.1s ease;
+            transition: transform 0.1s ease, box-shadow 0.12s ease;
         }
         .fx-range::-webkit-slider-thumb:hover {
-            transform: scale(1.25);
-            box-shadow: 0 0 8px rgba(60, 200, 175, 0.5);
+            transform: scale(1.15);
+            box-shadow:
+                0 0 0 1px rgba(255, 255, 255, 0.3),
+                0 2px 6px rgba(0, 0, 0, 0.5);
         }
         .fx-range::-webkit-slider-thumb:active {
-            transform: scale(1.1);
-            background: #50d8c0;
+            transform: scale(1.05);
+            background: #ffffff;
         }
         .fx-range::-moz-range-thumb {
-            width: 10px;
-            height: 10px;
+            width: 12px;
+            height: 12px;
             border-radius: 50%;
-            background: #40c8b0;
-            border: 1px solid #2a9a85;
-            box-shadow: 0 0 4px rgba(60, 200, 175, 0.3);
+            background: #f0f0f0;
+            border: none;
+            box-shadow:
+                0 0 0 1px rgba(0, 0, 0, 0.4),
+                0 1px 3px rgba(0, 0, 0, 0.4);
             cursor: pointer;
         }
         .fx-range::-moz-range-track {
-            height: 3px;
-            border-radius: 0;
+            height: 2px;
+            border-radius: 1px;
             background: rgba(255, 255, 255, 0.1);
         }
         /* ── Custom Checkbox (toggle switch) ────────── */
@@ -463,13 +576,13 @@
             transition: transform 0.15s cubic-bezier(0.16, 1, 0.3, 1), background 0.15s ease;
         }
         .fx-check input[type="checkbox"]:checked {
-            background: rgba(64, 200, 176, 0.15);
-            border-color: rgba(64, 200, 176, 0.4);
+            background: rgba(255, 255, 255, 0.12);
+            border-color: rgba(255, 255, 255, 0.3);
         }
         .fx-check input[type="checkbox"]:checked::after {
             transform: translateX(13px);
-            background: #40c8b0;
-            box-shadow: 0 0 4px rgba(64, 200, 176, 0.4);
+            background: #e8e8e8;
+            box-shadow: 0 0 4px rgba(255, 255, 255, 0.35);
         }
         .fx-note {
             margin-top: 3px;
@@ -591,7 +704,7 @@
             background: linear-gradient(180deg, #b8ddd4 0%, #88bfb0 100%);
             color: #1a4a3e;
             border-color: #6a9a8a;
-            box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.3), 0 0 6px rgba(64, 200, 176, 0.15);
+            box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.3), 0 0 6px rgba(255, 255, 255, 0.12);
         }
 
         /* FX sections — inset panels */
@@ -640,12 +753,12 @@
             box-shadow: 0 1px 1px rgba(0, 0, 0, 0.15);
         }
         body.light-mode .fx-check input[type="checkbox"]:checked {
-            background: rgba(64, 200, 176, 0.2);
-            border-color: rgba(64, 200, 176, 0.4);
+            background: rgba(255, 255, 255, 0.16);
+            border-color: rgba(255, 255, 255, 0.3);
         }
         body.light-mode .fx-check input[type="checkbox"]:checked::after {
             background: linear-gradient(180deg, #60d8c0, #40b8a0);
-            box-shadow: 0 0 4px rgba(64, 200, 176, 0.3);
+            box-shadow: 0 0 4px rgba(255, 255, 255, 0.24);
         }
 
         /* Layer items — inset rows */
@@ -685,7 +798,7 @@
         }
         body.light-mode .sidepanel-resize:hover,
         body.light-mode .sidepanel-resize.active {
-            background: rgba(64, 200, 176, 0.35);
+            background: rgba(255, 255, 255, 0.3);
         }
 
         /* ── Dark Mode — rounded corners (light mode stays sharp at base 0) ── */
@@ -727,9 +840,9 @@
             border-radius: 0;
         }
         .ll-mode.active {
-            background: rgba(64,200,176,0.12);
-            color: #40c8b0;
-            border-color: rgba(64,200,176,0.35);
+            background: rgba(255,255,255,0.1);
+            color: #e8e8e8;
+            border-color: rgba(255,255,255,0.3);
         }
         #ll-obj-list label:hover { background: rgba(255,255,255,0.04); }
         */
@@ -761,7 +874,7 @@
             cursor: pointer;
         }
         #hamburger-menu button:hover { background: rgba(255,255,255,0.06); }
-        #hamburger-menu button.active { color: #40c8b0; }
+        #hamburger-menu button.active { color: #e8e8e8; }
         #hamburger-menu .menu-sep {
             height: 1px;
             background: rgba(255,255,255,0.06);
@@ -802,7 +915,7 @@
                     <button id="btnLightProbe" class="active devonly">Probe: ON</button>
                     <button id="btnLightHelpers" class="devonly">Light Helpers</button>
                     <button id="btnRenderer" class="devonly">Renderer: WebGPU</button>
-                    <button id="btnShaderLab" class="devonly">Shader Lab: OFF</button>
+                    <button id="btnShaderLab" class="devonly">POSTFX: THREE.JS</button>
                     <button id="btnSwitchVR" class="devonly">Switch to VR</button>
                     <div class="menu-sep"></div>
                     <button id="btnTheme">Theme: Dark</button>
@@ -827,10 +940,12 @@
     <aside id="lightLinkPanel" class="sidepanel" aria-hidden="true" inert></aside>
     -->
     <aside id="layersPanel" class="sidepanel sidepanel-left" aria-hidden="true" inert></aside>
-    <aside id="snapshotPanel" class="sidepanel" aria-hidden="true" inert></aside>
-    <aside id="canvasPanel" class="sidepanel" aria-hidden="true" inert></aside>
-    <aside id="shaderLabPanel" class="sidepanel" aria-hidden="true" inert></aside>
-    <aside id="postPanel" class="sidepanel" aria-hidden="true" inert></aside>
+    <div id="rightDock">
+        <aside id="snapshotPanel" class="sidepanel" aria-hidden="true" inert></aside>
+        <aside id="canvasPanel" class="sidepanel" aria-hidden="true" inert></aside>
+        <aside id="shaderLabPanel" class="sidepanel" aria-hidden="true" inert></aside>
+        <aside id="postPanel" class="sidepanel" aria-hidden="true" inert></aside>
+    </div>
     <script type="importmap">
     {
         "imports": {
@@ -3986,6 +4101,41 @@
             ssgiFx.markGeometryDataDirty?.();
         });
 
+        // ── Hair Fast Sync — re-extracted world-space instances ──
+        bridge.on('hair_fast', msg => {
+            if (!Array.isArray(msg.groups)) return;
+            const m = new THREE.Matrix4();
+            const c = new THREE.Color();
+            for (const grp of msg.groups) {
+                const count = grp.count || Math.floor((grp.xforms?.length || 0) / 16);
+                if (!count || !Array.isArray(grp.xforms) || grp.xforms.length < count * 16) continue;
+                const entry = hairMeshes.get(grp.h);
+                if (!entry?.mesh) continue;
+                const instMesh = entry.mesh;
+                if (instMesh.count === count) {
+                    for (let i = 0; i < count; i++) {
+                        m.fromArray(grp.xforms, i * 16);
+                        instMesh.setMatrixAt(i, m);
+                        if (grp.colors) {
+                            c.setRGB(
+                                grp.colors[i * 3] ?? 1,
+                                grp.colors[i * 3 + 1] ?? 1,
+                                grp.colors[i * 3 + 2] ?? 1
+                            );
+                            instMesh.setColorAt(i, c);
+                        }
+                    }
+                    instMesh.instanceMatrix.needsUpdate = true;
+                    if (instMesh.instanceColor) instMesh.instanceColor.needsUpdate = true;
+                } else {
+                    // Count changed — full rebuild via applyHairInstances
+                    applyHairInstances(msg.groups);
+                    return;
+                }
+                if (grp.vis != null) entry.root.visible = !!grp.vis;
+            }
+        });
+
         // ── Transform Sync (+ material scalars, ~6fps) ──────
         bridge.on('xform', msg => {
             const applyStart = performance.now();
@@ -4954,7 +5104,7 @@
                 html += `<div id="ll-obj-list" style="max-height:300px;overflow-y:auto;border:1px solid #333;padding:2px;">`;
                 for (const n of nodes) {
                     html += `<label style="display:flex;align-items:center;gap:4px;padding:1px 2px;font-size:10px;cursor:pointer;">`;
-                    html += `<input type="checkbox" data-h="${n.h}" style="margin:0;accent-color:#40c8b0;"> ${n.name}`;
+                    html += `<input type="checkbox" data-h="${n.h}" style="margin:0;accent-color:#e8e8e8;"> ${n.name}`;
                     html += `</label>`;
                 }
                 html += `</div>`;
@@ -5107,9 +5257,9 @@
         }
 
         function applyHairTransform(handle, matrixArray) {
-            const entry = hairMeshes.get(handle);
-            if (!entry?.root) return false;
-            return applyTransform(entry.root, matrixArray);
+            // Hair instance matrices are world-space — transform updates are
+            // handled via hair_fast re-extraction, not root group transforms.
+            return false;
         }
 
         function applyHairVisibility(handle, visible) {
@@ -5170,8 +5320,6 @@
                 root.matrixAutoUpdate = false;
                 root.name = `hair_root_${grp.h}`;
                 root.userData.maxjsHair = true;
-                // NOTE: hair instance matrices are world-space (IHairModifier returns world coords),
-                // so the root group stays at identity. applyHairTransform is a no-op for world-space hair.
                 root.visible = grp.vis == null ? true : !!grp.vis;
                 root.add(instMesh);
                 maxRoot.add(root);
@@ -5516,17 +5664,19 @@
             const isOrtho = camera.isOrthographicCamera;
 
             if (wantOrtho && !isOrtho) {
-                // Switch to orthographic
                 scene.remove(camera);
                 camera = orthoCamera;
                 scene.add(camera);
                 controls.object = camera;
+                ssgiFx.setCamera?.(camera);
+                shaderLabFx.setCamera?.(camera);
             } else if (!wantOrtho && isOrtho) {
-                // Switch to perspective
                 scene.remove(camera);
                 camera = perspCamera;
                 scene.add(camera);
                 controls.object = camera;
+                ssgiFx.setCamera?.(camera);
+                shaderLabFx.setCamera?.(camera);
             }
 
             copyMaxArrayToWorld(camera.position, cam.pos);
@@ -5542,7 +5692,7 @@
                 camera.right = vw / 2;
                 camera.top = vw / (2 * aspect);
                 camera.bottom = -vw / (2 * aspect);
-                camera.near = 0.1;
+                camera.near = -100000;
                 camera.far = 100000;
             } else if (Number.isFinite(cam.fov) && cam.fov > 0 && cam.fov < 170) {
                 const aspect = innerWidth / innerHeight;
@@ -5596,11 +5746,15 @@
                 camera = orthoCamera;
                 scene.add(camera);
                 controls.object = camera;
+                ssgiFx.setCamera?.(camera);
+                shaderLabFx.setCamera?.(camera);
             } else if (!wantOrtho && isOrtho) {
                 scene.remove(camera);
                 camera = perspCamera;
                 scene.add(camera);
                 controls.object = camera;
+                ssgiFx.setCamera?.(camera);
+                shaderLabFx.setCamera?.(camera);
             }
 
             camera.position.fromArray(savedCamera.position);
@@ -5617,7 +5771,7 @@
                 camera.right = viewWidth / 2;
                 camera.top = viewWidth / (2 * aspect);
                 camera.bottom = -viewWidth / (2 * aspect);
-                camera.near = 0.1;
+                camera.near = -100000;
                 camera.far = 100000;
             } else if (Number.isFinite(savedCamera.fov) && savedCamera.fov > 0 && savedCamera.fov < 170) {
                 camera.fov = savedCamera.fov;
@@ -6337,13 +6491,52 @@
         btnCanvasPanel?.addEventListener('click', () => setCanvasPanelVisible(!canvasPanelVisible));
         btnShaderLabPanel?.addEventListener('click', () => setShaderLabPanelVisible(!shaderLabPanelVisible));
 
-        // The legacy "Shader Lab" quick-toggle in the burger menu opens the
-        // standalone configurator panel — full layer-stack editing lives
-        // there now, not in the Post FX panel.
+        // POSTFX backend switch: toggles between MaxJS's Three.js post-fx
+        // stack (ssgi / ssr / gtao / bloom / tone map) and the Shader Lab
+        // stack. Only one runs at a time — see the note in the Shader Lab
+        // panel's Pipeline section. Button label reflects the current
+        // backend and stays in sync with the panel's switch via the
+        // `maxjs-shader-lab-state` custom event shaderLabFx dispatches.
         const btnShaderLab = document.getElementById('btnShaderLab');
-        btnShaderLab?.addEventListener('click', () => {
-            setShaderLabPanelVisible(!shaderLabPanelVisible);
+        function syncShaderLabBackendBtn() {
+            if (!btnShaderLab) return;
+            const on = shaderLabFx.isEnabled();
+            btnShaderLab.textContent = on ? 'POSTFX: SHADER-LAB' : 'POSTFX: THREE.JS';
+            btnShaderLab.classList.toggle('active', on);
+        }
+        btnShaderLab?.addEventListener('click', async () => {
+            if (shaderLabFx.isEnabled()) {
+                shaderLabFx.disable();
+                return;
+            }
+            try {
+                await shaderLabFx.enable();
+            } catch (err) {
+                console.error('[ShaderLab] enable failed:', err);
+                perfHud?.setStatus?.('Shader Lab failed: ' + (err?.message || err));
+            }
         });
+        window.addEventListener('maxjs-shader-lab-state', syncShaderLabBackendBtn);
+        syncShaderLabBackendBtn();
+
+        // Gray out every Post FX section when Shader Lab is the active
+        // backend, keeping only sections marked data-keep-on-shader-lab
+        // (Tone Mapping) interactive. The panel body gets a marker class
+        // that drives the CSS rules in `.fx-section:not([data-keep...])`.
+        function syncShaderLabPostFxBypass() {
+            const body = postPanel?.querySelector('.sidepanel-body');
+            if (!body) return;
+            body.classList.toggle('shader-lab-bypass', shaderLabFx.isEnabled());
+        }
+        window.addEventListener('maxjs-shader-lab-state', syncShaderLabPostFxBypass);
+        // Also re-run after panel rebuilds (postPanel.innerHTML is rewritten
+        // when the user opens it for the first time).
+        const _origBuild = typeof buildPostFxPanel === 'function' ? buildPostFxPanel : null;
+        if (_origBuild) {
+            // Post-wiring pass — schedule after any buildPostFxPanel call.
+            // Cheap way: poll via the state event next tick.
+            setTimeout(syncShaderLabPostFxBypass, 0);
+        }
 
         // ── Hamburger Menu ───────────────────────────────────
         const hamburgerMenu = document.getElementById('hamburger-menu');
@@ -6728,7 +6921,10 @@
                     <button id="btnPostPanelClose" type="button">Hide</button>
                 </div>
                 <div class="sidepanel-body">
-                    <section class="fx-section collapsed">
+                    <div class="shader-lab-bypass-note">
+                        Shader Lab backend active · three.js post-fx bypassed · tone mapping still applies
+                    </div>
+                    <section class="fx-section collapsed" data-keep-on-shader-lab>
                         <div class="fx-section-header">
                             <div class="fx-section-title">Tone Mapping</div>
                         </div>
@@ -7011,6 +7207,7 @@
                 postPanel.style.width = '';
                 buildPostFxPanel();
                 syncPostFxPanel(true);
+                syncShaderLabPostFxBypass();
             };
 
             // Panel horizontal resize
@@ -7741,6 +7938,7 @@
         }
 
         buildPostFxPanel();
+        syncShaderLabPostFxBypass();
         // NOTE: Do NOT call syncPostFxPanel here — it would save defaults and overwrite stored settings.
         // restoreInteractiveBrowserState() handles restore then sync.
 

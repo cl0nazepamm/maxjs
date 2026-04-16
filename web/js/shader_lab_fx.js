@@ -72,6 +72,7 @@ const DEFAULT_COMPOSITION = {
 };
 
 export function createShaderLabFx({ THREE, renderer, scene, camera }) {
+    let activeCamera = camera;
     let enabled = false;
     let ready = false;
     let postprocessing = null;
@@ -127,6 +128,14 @@ export function createShaderLabFx({ THREE, renderer, scene, camera }) {
         displayScene.add(quad);
     }
 
+    function emitStateChange() {
+        try {
+            window.dispatchEvent(new CustomEvent('maxjs-shader-lab-state', {
+                detail: { enabled, ready, error: errorText },
+            }));
+        } catch (_) { /* ignore */ }
+    }
+
     async function enable(config) {
         if (enabled) return;
         if (loading) return;
@@ -165,10 +174,12 @@ export function createShaderLabFx({ THREE, renderer, scene, camera }) {
 
             enabled = true;
             loading = false;
+            emitStateChange();
         } catch (err) {
             errorText = err?.message || String(err);
             console.error('[shader-lab-fx] enable failed:', err);
             loading = false;
+            emitStateChange();
             throw err;
         }
     }
@@ -184,6 +195,7 @@ export function createShaderLabFx({ THREE, renderer, scene, camera }) {
         hiddenDiv = null;
         try { sceneTarget?.dispose(); } catch (_) {}
         sceneTarget = null;
+        emitStateChange();
     }
 
     // Inner Bridge component reference (kept so a future optimization can
@@ -207,13 +219,13 @@ export function createShaderLabFx({ THREE, renderer, scene, camera }) {
     function renderFrame(elapsedTime, delta) {
         if (!enabled || !ready || !postprocessing) {
             // Fallback: draw scene directly while shader-lab loads.
-            renderer.render(scene, camera);
+            renderer.render(scene, activeCamera);
             return;
         }
         ensureTarget();
         try {
             renderer.setRenderTarget(sceneTarget);
-            renderer.render(scene, camera);
+            renderer.render(scene, activeCamera);
             renderer.setRenderTarget(null);
 
             const output = postprocessing.render(
@@ -231,7 +243,7 @@ export function createShaderLabFx({ THREE, renderer, scene, camera }) {
         } catch (err) {
             errorText = err?.message || String(err);
             console.error('[shader-lab-fx] frame render failed:', err);
-            renderer.render(scene, camera);
+            renderer.render(scene, activeCamera);
         }
     }
 
@@ -245,6 +257,7 @@ export function createShaderLabFx({ THREE, renderer, scene, camera }) {
         setConfig,
         renderFrame,
         resize,
+        setCamera(nextCamera) { if (nextCamera) activeCamera = nextCamera; },
         isEnabled: () => enabled,
         isReady:   () => ready,
         getError:  () => errorText,

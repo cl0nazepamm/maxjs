@@ -2006,6 +2006,17 @@ export function createSSGIController({
             return snapshotState();
         },
 
+        // Hot-swap the camera used by every pass/effect node. Callers hit
+        // this when Max toggles between perspective and orthographic so the
+        // pipeline's pass(scene, camera) nodes re-capture the right camera.
+        // Without this, the pipeline was stuck rendering with whichever
+        // camera was passed into createSSGIController().
+        setCamera(nextCamera) {
+            if (!nextCamera || nextCamera === camera) return;
+            camera = nextCamera;
+            rebuildPipeline();
+        },
+
         render() {
             flushPendingPipelineUpdates();
             // Update fog timer for procedural animation

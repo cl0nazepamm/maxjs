@@ -3586,8 +3586,16 @@
                                     scheduleNormals(mesh.geometry);
                                 }
 
-                                mesh.geometry.computeBoundingBox();
-                                mesh.geometry.computeBoundingSphere();
+                                // keepNormals signals a skinned fast-positions update:
+                                // bounding volumes are the hot path cost for skinned
+                                // meshes at 60fps and drive nothing visible (frustum
+                                // culling is off, shadow maps tolerate stale bounds).
+                                // Skip the recompute. Initial bind-pose bounds are
+                                // typically a superset of any deformed pose anyway.
+                                if (!meta.keepNormals) {
+                                    mesh.geometry.computeBoundingBox();
+                                    mesh.geometry.computeBoundingSphere();
+                                }
                             } else {
                                 if (!hasIncomingIndex) return;
                                 // Topology changed — full rebuild

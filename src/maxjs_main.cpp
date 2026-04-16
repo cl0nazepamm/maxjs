@@ -5695,6 +5695,11 @@ public:
     std::unordered_set<ULONG> splatHandles_;
     std::unordered_set<ULONG> audioHandles_;
     std::unordered_set<ULONG> hairHandles_;
+    // Meshes with a modifier stack whose output can change between frames
+    // independent of transform events (Path Deform, Skin, Bend, FFD, etc.).
+    // Polled every redraw so animation playback catches deformation without
+    // waiting for DetectGeometryChanges (~500ms) to run.
+    std::unordered_set<ULONG> deformHandles_;
     std::unordered_set<ULONG> fastDirtyHandles_;
     std::unordered_set<ULONG> visibilityDirtyHandles_;
     std::unordered_map<ULONG, std::array<float, 16>> lastSentTransforms_;
@@ -8326,6 +8331,7 @@ public:
         splatHandles_.clear();
         audioHandles_.clear();
         hairHandles_.clear();
+        deformHandles_.clear();
         fastDirtyHandles_.clear();
         lastSentTransforms_.clear();
         mtlHashMap_.clear();
@@ -8680,9 +8686,17 @@ public:
         if (changed) QueueFastFlush();
     }
 
-    // Skinned mesh check — hash only vertex positions (topology stable, skip indices/UVs)
+    // Deforming-mesh live check — polled every viewport redraw to pick up
+    // animated modifier output (Skin bones, Path Deform, Bend, FFD, etc.).
+    //
+    // Performance contract: the critical path for bone dragging and animation
+    // playback. Modifier evaluation is expensive, so we must not evaluate more
+    // than once per frame. The old design did EvalWorldState here to hash
+    // positions, then EvalWorldState AGAIN in SendGeometryFastUpdate for the
+    // data. During interactive manipulation or playback we know the mesh is
+    // changing, so skip the hash entirely — one eval per frame down from two.
     void CheckSkinnedGeometryLive() {
-        if (skinnedHandles_.empty()) return;
+        if (skinnedHandles_.empty() && deformHandles_.empty()) return;
         Interface* ip = GetCOREInterface();
         if (!ip) return;
         const ULONGLONG now = GetTickCount64();
@@ -8693,16 +8707,64 @@ public:
         lastSkinnedLivePollTick_ = now;
         TimeValue t = ip->GetTime();
 
-        bool changed = false;
-        for (ULONG handle : skinnedHandles_) {
-            if (geoFastDirtyHandles_.count(handle)) continue;
-            INode* node = ip->GetINodeByHandle(handle);
-            if (!node) continue;
+        // Any of these means "something is actively changing this frame" and
+        // the hash check is wasted work — extraction will happen anyway:
+        //   - Animation playback (time advancing every frame)
+        //   - Interactive cooldown window (user dragged something recently)
+        //   - Other tracked handles are dirty this frame (bone, controller, anything)
+        //   - Any non-renderable (bone/helper/controller) is currently selected
+        //
+        // Falling into the hash path is only correct for true idle where nothing
+        // is moving — it avoids redundant sends when the mesh genuinely isn't
+        // changing. But during any kind of activity, hashing doubles the work.
+        bool skipHash = IsAnimationPlaying()
+                     || ShouldFavorInteractivePerformance()
+                     || !fastDirtyHandles_.empty();
 
-            // Hash raw vertex positions directly from evaluated mesh — skip full ExtractMesh
+        if (!skipHash) {
+            const int selCount = ip->GetSelNodeCount();
+            for (int i = 0; i < selCount; ++i) {
+                INode* sel = ip->GetSelNode(i);
+                if (!sel) continue;
+                const ULONG selH = sel->GetHandle();
+                if (geomHandles_.find(selH) == geomHandles_.end() &&
+                    lightHandles_.find(selH) == lightHandles_.end() &&
+                    splatHandles_.find(selH) == splatHandles_.end() &&
+                    audioHandles_.find(selH) == audioHandles_.end() &&
+                    hairHandles_.find(selH) == hairHandles_.end()) {
+                    // Something non-renderable is selected — assume it's a bone
+                    // or controller driving the skin, and skip the hash.
+                    skipHash = true;
+                    break;
+                }
+            }
+        }
+
+        bool changed = false;
+        // Union iteration: skinned handles + deforming non-skinned handles
+        // (Path Deform, Bend, FFD, etc.). Skinned handles are usually a strict
+        // subset of deform handles, but we track both sets explicitly so skin
+        // weight wiring can check skinnedHandles_ specifically.
+        auto pollHandle = [&](ULONG handle) {
+            if (geoFastDirtyHandles_.count(handle)) return;
+            INode* node = ip->GetINodeByHandle(handle);
+            if (!node) return;
+
+            if (skipHash) {
+                // Fast path: just mark dirty. SendGeometryFastUpdate will do
+                // the one EvalWorldState we actually need (for data extraction).
+                geoHashMap_.erase(handle);
+                geoFastDirtyHandles_.insert(handle);
+                changed = true;
+                return;
+            }
+
+            // Idle path: hash raw vertex positions to avoid redundant sends
+            // when nothing changed. This path does EvalWorldState, but only
+            // fires when the scene is truly idle — the cost is acceptable.
             uint64_t geomHash = 0;
             ObjectState os = node->EvalWorldState(t);
-            if (!os.obj || os.obj->SuperClassID() != GEOMOBJECT_CLASS_ID) continue;
+            if (!os.obj || os.obj->SuperClassID() != GEOMOBJECT_CLASS_ID) return;
             if (os.obj->IsSubClassOf(polyObjectClassID)) {
                 PolyObject* poly = static_cast<PolyObject*>(os.obj);
                 MNMesh& mn = poly->GetMesh();
@@ -8710,21 +8772,27 @@ public:
             } else if (os.obj->CanConvertToType(Class_ID(TRIOBJ_CLASS_ID, 0))) {
                 TriObject* tri = static_cast<TriObject*>(
                     os.obj->ConvertToType(t, Class_ID(TRIOBJ_CLASS_ID, 0)));
-                if (!tri) continue;
+                if (!tri) return;
                 Mesh& mesh = tri->GetMesh();
                 geomHash = HashAdaptiveSkinnedPositions(mesh);
                 if (tri != os.obj) tri->DeleteThis();
-            } else continue;
+            } else return;
             auto it = lastLiveGeomHash_.find(handle);
-            if (it != lastLiveGeomHash_.end() && it->second == geomHash) continue;
+            if (it != lastLiveGeomHash_.end() && it->second == geomHash) return;
             lastLiveGeomHash_[handle] = geomHash;
 
-            // Skinned meshes only need geometry updates (vertex positions via geo_fast).
-            // Don't add to fastDirtyHandles_ — that would trigger JSON transform sync,
-            // but bone deformation is already baked into the vertex data.
             geoHashMap_.erase(handle);
             geoFastDirtyHandles_.insert(handle);
             changed = true;
+        };
+
+        for (ULONG handle : skinnedHandles_) pollHandle(handle);
+        for (ULONG handle : deformHandles_) {
+            // Skip handles already polled via skinnedHandles_ — most skinned
+            // meshes also have a derived-object wrapper, but we only need one
+            // eval per handle per tick.
+            if (skinnedHandles_.count(handle)) continue;
+            pollHandle(handle);
         }
         if (changed) QueueFastFlush();
     }
@@ -9023,10 +9091,14 @@ public:
                     return;
                 }
                 geoFastDirtyHandles_.insert(handle);
-                // Skinned meshes only need vertex data updates via geo_fast.
-                // Adding them to fastDirtyHandles_ would trigger redundant
-                // transform sync — bone deformation is already in the vertices.
-                if (skinnedHandles_.count(handle)) {
+                // Skinned + Path-Deform + any other deforming mesh only needs
+                // vertex data updates via geo_fast. The node transform doesn't
+                // change when a modifier's vertices animate — adding to
+                // fastDirtyHandles_ would fire a redundant UpdateTransform each
+                // frame during playback. When the node's transform actually
+                // changes, MarkSelectedTransformsDirty / MarkAnimatedTransformsDirty
+                // catch it through a real transform diff.
+                if (skinnedHandles_.count(handle) || deformHandles_.count(handle)) {
                     changed = true;
                 } else {
                     if (fastDirtyHandles_.insert(handle).second) changed = true;
@@ -9047,13 +9119,18 @@ public:
                 const ULONG handle = current->GetHandle();
                 if (!IsTrackedHandle(handle)) return;
                 geoHashMap_.erase(handle);
-                // Skinned meshes and selected nodes: route through fast geo path.
-                // Selected nodes get false topology notifications from parameter edits
-                // (e.g. sphere radius, modifier params). The JS geo_fast handler
-                // rebuilds BufferGeometry when topology actually changes.
-                // Unselected nodes with real structural changes get full sync;
-                // DetectGeometryChanges catches anything missed on idle.
-                if (skinnedHandles_.count(handle) || current->Selected()) {
+                // Skinned + deforming + selected nodes: route through fast
+                // geo path. Max fires spurious TopologyChanged events on
+                // *parameter* edits to modifiers (sphere radius, Path Deform
+                // percent, FFD points, etc.) — these don't actually change
+                // topology, but firing a full scene sync on every animated
+                // frame is the ~100ms+ hitch the user sees during Path Deform
+                // playback. The fast-positions handler on the JS side rebuilds
+                // BufferGeometry if topology does change; real structural
+                // edits to unselected non-deforming meshes still escalate.
+                if (skinnedHandles_.count(handle) ||
+                    deformHandles_.count(handle) ||
+                    current->Selected()) {
                     geoFastDirtyHandles_.insert(handle);
                     if (fastDirtyHandles_.insert(handle).second) changed = true;
                 } else {
@@ -9507,6 +9584,7 @@ public:
             splatHandles_.clear();
             audioHandles_.clear();
         hairHandles_.clear();
+        deformHandles_.clear();
             audioHashMap_.clear();
             geoScanCursor_ = 0;
             skinnedControlIdxCache_.clear();
@@ -9609,10 +9687,13 @@ public:
             std::vector<int> indices;
             std::vector<MatGroup> groups;
             bool isSpline = false;
-            const bool trySkinnedFastPositions =
-                (wv17 && env12) && (skinnedHandles_.find(handle) != skinnedHandles_.end());
+            // Fast-positions path is valid for any mesh whose topology is
+            // stable between full syncs — i.e., any mesh with a live
+            // controlIdx cache. This covers Skin, Path Deform, Bend, FFD,
+            // and all other position-only deformers (~4x smaller payload,
+            // single EvalWorldState, no normals recompute on the web side).
             bool usedSkinnedFastPositions = false;
-            if (trySkinnedFastPositions) {
+            if (wv17 && env12) {
                 auto cacheIt = skinnedControlIdxCache_.find(handle);
                 if (cacheIt != skinnedControlIdxCache_.end()) {
                     usedSkinnedFastPositions = ExtractSkinnedFastPositions(node, t, cacheIt->second, verts);
@@ -9868,6 +9949,7 @@ public:
                 splatHandles_.erase(handle);
                 audioHandles_.erase(handle);
                 hairHandles_.erase(handle);
+                deformHandles_.erase(handle);
                 lastSentTransforms_.erase(handle);
                 materialFastDirtyHandles_.erase(handle);
                 SetDirty();
@@ -10502,7 +10584,17 @@ public:
             ULONG handle = handles[idx];
             INode* node = ip->GetINodeByHandle(handle);
             if (node) {
-                if (!geoFastDirtyHandles_.count(handle) && !skinnedHandles_.count(handle)) {
+                // Skip any mesh already handled by the live deform poll. Those
+                // routes send positions-only deltas via SendGeometryFastUpdate;
+                // the idle geometry detector would only trigger a redundant
+                // full scene sync (the original hitch source on rigs where
+                // DetectGeometryChanges sees a Path Deform position change
+                // and calls SetDirty() mid-interaction).
+                const bool handledByLivePoll =
+                    geoFastDirtyHandles_.count(handle) ||
+                    skinnedHandles_.count(handle) ||
+                    deformHandles_.count(handle);
+                if (!handledByLivePoll) {
                     uint64_t hash = 0;
                     if (TryHashRenderableGeometryState(node, t, hash)) {
                         auto it = geoHashMap_.find(handle);
@@ -11563,6 +11655,7 @@ public:
         splatHandles_.clear();
         audioHandles_.clear();
         hairHandles_.clear();
+        deformHandles_.clear();
         pluginInstHandles_.clear();
         pluginInstHash_.clear();
         lastSentTransforms_.clear();
@@ -11787,8 +11880,11 @@ public:
                 std::vector<MatGroup> groups;
                 const bool isSkinned = FindModifierOnNode(node, SKIN_CLASSID) != nullptr;
                 std::vector<int> controlIdx;
-                bool extracted = ExtractMesh(node, t, verts, uvs, indices, groups, &norms,
-                    isSkinned ? &controlIdx : nullptr);
+                // Always capture the control-vertex mapping — any topology-
+                // stable deforming modifier (Skin, Path Deform, Bend, FFD, etc.)
+                // can then route through the fast-positions path instead of
+                // the full ExtractMesh (4x smaller payload, single EvalWorldState).
+                bool extracted = ExtractMesh(node, t, verts, uvs, indices, groups, &norms, &controlIdx);
 
                 // Spline fallback — extract as line geometry
                 bool isSpline = false;
@@ -11805,13 +11901,22 @@ public:
                         lastBBoxHash_[handle] = MakeGeomValidityKey(gv);
                     }
                     groupCache_[handle] = groups;
-                    if (isSkinned) {
-                        skinnedHandles_.insert(handle);
-                        if (!isSpline && controlIdx.size() * 3 == verts.size()) {
-                            skinnedControlIdxCache_[handle] = std::move(controlIdx);
+                    if (isSkinned) skinnedHandles_.insert(handle);
+                    if (!isSpline && controlIdx.size() * 3 == verts.size()) {
+                        skinnedControlIdxCache_[handle] = std::move(controlIdx);
+                        // If this mesh has a modifier stack it can deform without
+                        // firing a node event (e.g. Path Deform driven by time).
+                        // Mark it for per-frame polling so playback catches it
+                        // without waiting for the idle geometry detector.
+                        if (node->GetObjectRef() &&
+                            node->GetObjectRef()->SuperClassID() == GEN_DERIVOB_CLASS_ID) {
+                            deformHandles_.insert(handle);
                         } else {
-                            skinnedControlIdxCache_.erase(handle);
+                            deformHandles_.erase(handle);
                         }
+                    } else {
+                        skinnedControlIdxCache_.erase(handle);
+                        deformHandles_.erase(handle);
                     }
 
                     if (!first) ss << L',';
@@ -11893,6 +11998,7 @@ public:
         splatHandles_.clear();
         audioHandles_.clear();
         hairHandles_.clear();
+        deformHandles_.clear();
         pluginInstHandles_.clear();
         pluginInstHash_.clear();
         lastSentTransforms_.clear();
@@ -12014,8 +12120,7 @@ public:
                 } else {
                     const bool isSkinned = FindModifierOnNode(node, SKIN_CLASSID) != nullptr;
                     std::vector<int> controlIdx;
-                    bool extracted = ExtractMesh(node, t, ng.verts, ng.uvs, ng.indices, ng.groups, &ng.norms,
-                        isSkinned ? &controlIdx : nullptr);
+                    bool extracted = ExtractMesh(node, t, ng.verts, ng.uvs, ng.indices, ng.groups, &ng.norms, &controlIdx);
                     if (!extracted && ShouldExtractRenderableShape(node, t, &os)) {
                         extracted = ExtractSpline(node, t, ng.verts, ng.indices);
                         ng.spline = extracted;
@@ -12043,13 +12148,18 @@ public:
                         Interval gv = os.obj->ChannelValidity(t, GEOM_CHAN_NUM);
                         lastBBoxHash_[ng.handle] = MakeGeomValidityKey(gv);
                     }
-                    if (isSkinned) {
-                        skinnedHandles_.insert(node->GetHandle());
-                        if (!ng.spline && controlIdx.size() * 3 == ng.verts.size()) {
-                            skinnedControlIdxCache_[ng.handle] = std::move(controlIdx);
+                    if (isSkinned) skinnedHandles_.insert(node->GetHandle());
+                    if (!ng.spline && controlIdx.size() * 3 == ng.verts.size()) {
+                        skinnedControlIdxCache_[ng.handle] = std::move(controlIdx);
+                        if (node->GetObjectRef() &&
+                            node->GetObjectRef()->SuperClassID() == GEN_DERIVOB_CLASS_ID) {
+                            deformHandles_.insert(ng.handle);
                         } else {
-                            skinnedControlIdxCache_.erase(ng.handle);
+                            deformHandles_.erase(ng.handle);
                         }
+                    } else {
+                        skinnedControlIdxCache_.erase(ng.handle);
+                        deformHandles_.erase(ng.handle);
                     }
 
                     if (srcHandle != 0) extractedSources.insert(srcHandle);
@@ -12917,6 +13027,7 @@ public:
         splatHandles_.clear();
         audioHandles_.clear();
         hairHandles_.clear();
+        deformHandles_.clear();
         mtlHashMap_.clear();
         lightHashMap_.clear();
         splatHashMap_.clear();

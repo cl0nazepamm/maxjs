@@ -922,12 +922,12 @@
     <script type="importmap">
     {
         "imports": {
-            "three": "./vendor/three-r183.2/build/three.webgpu.js",
-            "three-std": "./vendor/three-r183.2/build/three.module.js",
-            "three/webgpu": "./vendor/three-r183.2/build/three.webgpu.js",
-            "three/tsl": "./vendor/three-r183.2/build/three.tsl.js",
-            "three/addons/": "./vendor/three-r183.2/examples/",
-            "three/examples/jsm/": "./vendor/three-r183.2/examples/",
+            "three": "./vendor/three-r184/build/three.webgpu.js",
+            "three-std": "./vendor/three-r184/build/three.module.js",
+            "three/webgpu": "./vendor/three-r184/build/three.webgpu.js",
+            "three/tsl": "./vendor/three-r184/build/three.tsl.js",
+            "three/addons/": "./vendor/three-r184/examples/",
+            "three/examples/jsm/": "./vendor/three-r184/examples/",
             "@sparkjsdev/spark": "./node_modules/@sparkjsdev/spark/dist/spark.module.js",
             "@dimforge/rapier3d-compat": "./vendor/rapier/rapier.es.js",
             "react": "https://esm.sh/react@18.3.1",
@@ -938,21 +938,21 @@
         },
         "scopes": {
             "./node_modules/@sparkjsdev/spark/": {
-                "three": "./vendor/three-r183.2/build/three.module.js"
+                "three": "./vendor/three-r184/build/three.module.js"
             },
-            "./vendor/three-r183.2/examples/objects/Sky.js": {
-                "three": "./vendor/three-r183.2/build/three.module.js"
+            "./vendor/three-r184/examples/objects/Sky.js": {
+                "three": "./vendor/three-r184/build/three.module.js"
             },
             "https://maxjs-assets.local/": {
-                "three": "https://maxjs.local/vendor/three-r183.2/build/three.webgpu.js",
-                "three-std": "https://maxjs.local/vendor/three-r183.2/build/three.module.js",
-                "three/webgpu": "https://maxjs.local/vendor/three-r183.2/build/three.webgpu.js",
-                "three/tsl": "https://maxjs.local/vendor/three-r183.2/build/three.tsl.js",
-                "three/addons/": "https://maxjs.local/vendor/three-r183.2/examples/",
+                "three": "https://maxjs.local/vendor/three-r184/build/three.webgpu.js",
+                "three-std": "https://maxjs.local/vendor/three-r184/build/three.module.js",
+                "three/webgpu": "https://maxjs.local/vendor/three-r184/build/three.webgpu.js",
+                "three/tsl": "https://maxjs.local/vendor/three-r184/build/three.tsl.js",
+                "three/addons/": "https://maxjs.local/vendor/three-r184/examples/",
                 "@dimforge/rapier3d-compat": "https://maxjs.local/vendor/rapier/rapier.es.js"
             },
-            "https://maxjs.local/vendor/three-r183.2/examples/objects/Sky.js": {
-                "three": "https://maxjs.local/vendor/three-r183.2/build/three.module.js"
+            "https://maxjs.local/vendor/three-r184/examples/objects/Sky.js": {
+                "three": "https://maxjs.local/vendor/three-r184/build/three.module.js"
             }
         }
     }
@@ -972,6 +972,7 @@
         import { SkyMesh } from 'three/addons/objects/SkyMesh.js';
         import { Sky } from 'three/addons/objects/Sky.js';
         import { AsciiEffect } from 'three/addons/effects/AsciiEffect.js';
+        import { dynamicLights } from 'three/addons/tsl/lighting/DynamicLightsNode.js';
         // Spark.js uses GLSL3/ShaderChunk — needs WebGL THREE build (scoped in importmap).
         // Lazy-import to avoid crashing on page load.
         let Spark = null;
@@ -1021,6 +1022,16 @@
         let hiddenBackgroundColor = lightMode ? LIGHT_BG : DARK_BG;
         const scene = new THREE.Scene();
         scene.background = new THREE.Color(hiddenBackgroundColor);
+        // Batched analytic-light path — one shader per light type, count driven
+        // by a uniform. Eliminates shader-recompile hitches when Max toggles
+        // light visibility / wires intensity. Shadow-casting and projected
+        // spot lights still take the per-light fallback inside LightsNode.
+        scene.lightsNode = dynamicLights({
+            maxDirectionalLights: 16,
+            maxPointLights: 32,
+            maxSpotLights: 32,
+            maxHemisphereLights: 4,
+        });
         const maxBasisRoot = new THREE.Group();
         maxBasisRoot.name = '__maxjs_max_basis_root__';
         maxBasisRoot.rotation.x = -Math.PI / 2;

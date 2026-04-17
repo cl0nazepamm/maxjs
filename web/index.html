@@ -805,7 +805,6 @@
             border-color: rgba(0, 0, 0, 0.15) !important;
         }
         body.light-mode #fx-hdri-name { color: #666 !important; }
-        /* MAYBE IN FUTURE: Light Linking styles
         .ll-mode {
             background: rgba(255,255,255,0.06);
             border: 1px solid rgba(255,255,255,0.08);
@@ -819,7 +818,6 @@
             border-color: rgba(255,255,255,0.3);
         }
         #ll-obj-list label:hover { background: rgba(255,255,255,0.04); }
-        */
         #hamburger-menu {
             position: absolute;
             top: 100%;
@@ -888,6 +886,7 @@
                     <button id="btnEnv" class="devonly">Env: OFF</button>
                     <button id="btnLightProbe" class="active devonly">Probe: ON</button>
                     <button id="btnLightHelpers" class="devonly">Light Helpers</button>
+                    <button id="btnLightLink" class="devonly">Light Linking</button>
                     <button id="btnRenderer" class="devonly">Renderer: WebGPU</button>
                     <button id="btnSwitchVR" class="devonly">Switch to VR</button>
                     <div class="menu-sep"></div>
@@ -909,9 +908,7 @@
             } catch (e) { /* private mode / disabled storage */ }
         })();
     </script>
-    <!-- MAYBE IN FUTURE: Light Linking panel
     <aside id="lightLinkPanel" class="sidepanel" aria-hidden="true" inert></aside>
-    -->
     <aside id="layersPanel" class="sidepanel sidepanel-left" aria-hidden="true" inert></aside>
     <div id="rightDock">
         <aside id="snapshotPanel" class="sidepanel" aria-hidden="true" inert></aside>
@@ -972,7 +969,14 @@
         import { SkyMesh } from 'three/addons/objects/SkyMesh.js';
         import { Sky } from 'three/addons/objects/Sky.js';
         import { AsciiEffect } from 'three/addons/effects/AsciiEffect.js';
-        import { dynamicLights } from 'three/addons/tsl/lighting/DynamicLightsNode.js';
+        import {
+            maxLights,
+            ensureMeshMaskDefaults,
+            buildEnvironmentIntensityNode,
+            LIGHT_MASK_LO_KEY,
+            LIGHT_MASK_HI_KEY,
+            ENV_INTENSITY_KEY,
+        } from './js/max_lights_node.js';
         // Spark.js uses GLSL3/ShaderChunk — needs WebGL THREE build (scoped in importmap).
         // Lazy-import to avoid crashing on page load.
         let Spark = null;
@@ -1022,16 +1026,6 @@
         let hiddenBackgroundColor = lightMode ? LIGHT_BG : DARK_BG;
         const scene = new THREE.Scene();
         scene.background = new THREE.Color(hiddenBackgroundColor);
-        // Batched analytic-light path — one shader per light type, count driven
-        // by a uniform. Eliminates shader-recompile hitches when Max toggles
-        // light visibility / wires intensity. Shadow-casting and projected
-        // spot lights still take the per-light fallback inside LightsNode.
-        scene.lightsNode = dynamicLights({
-            maxDirectionalLights: 16,
-            maxPointLights: 32,
-            maxSpotLights: 32,
-            maxHemisphereLights: 4,
-        });
         const maxBasisRoot = new THREE.Group();
         maxBasisRoot.name = '__maxjs_max_basis_root__';
         maxBasisRoot.rotation.x = -Math.PI / 2;
@@ -1249,6 +1243,19 @@
 
         if (THREE.RectAreaLightNode?.setLTC) {
             THREE.RectAreaLightNode.setLTC(RectAreaLightTexturesLib.init());
+        }
+
+        // Install MaxLightsNode as the renderer's LightsNode factory. The
+        // renderer creates one LightsNode per scene via lighting.createNode()
+        // and caches it; setting scene.lightsNode is a no-op in r184. Override
+        // must land before the first frame so the cached node is ours.
+        if (renderer.lighting?.createNode) {
+            renderer.lighting.createNode = (lights = []) => maxLights({
+                maxDirectionalLights: 16,
+                maxPointLights: 32,
+                maxSpotLights: 32,
+                maxHemisphereLights: 4,
+            }).setLights(lights);
         }
 
         const controls = new OrbitControls(camera, renderer.domElement);
@@ -1616,6 +1623,15 @@
         // Local HDRI override (independent of Max environment)
         let localHdriObjectUrl = null;   // file loaded in memory
         let localHdriEnvMap = null;      // cached PMREM texture
+
+        // Wrap scene.environment as a TSL node multiplied by each mesh's
+        // userData.maxjsEnvIntensity so per-mesh HDRI intensity is possible.
+        // Call after every scene.environment assignment.
+        function syncEnvironmentNode() {
+            scene.environmentNode = scene.environment
+                ? buildEnvironmentIntensityNode(scene.environment)
+                : null;
+        }
         let localHdriEnabled = true;     // on/off toggle (file stays loaded)
         let localHdriFileName = '';
         let localHdriRotation = 0;
@@ -2282,6 +2298,7 @@
                 hdrTex.mapping = THREE.EquirectangularReflectionMapping;
                 const envMap = pmremGenerator.fromEquirectangular(hdrTex).texture;
                 scene.environment = envMap;
+                syncEnvironmentNode();
                 if (envVisible) scene.background = envMap;
                 defaultLights.visible = false;
                 if (lightProbeEnabled || shouldRefreshProbe) {
@@ -2295,6 +2312,7 @@
                 currentHdriProbeSignature = null;
                 currentEnvParams = null;
                 scene.environment = null;
+                syncEnvironmentNode();
                 clearLightProbe();
                 if (envVisible) scene.background = new THREE.Color(hiddenBackgroundColor);
                 defaultLights.visible = true;
@@ -2393,6 +2411,7 @@
             if (localHdriEnabled) {
                 localHdriShowBg = envVisible;
                 scene.environment = localHdriEnvMap;
+                syncEnvironmentNode();
                 scene.environmentIntensity = localHdriIntensity;
                 const rot = localHdriRotation * Math.PI / 180;
                 scene.environmentRotation.set(0, -rot, 0);
@@ -2411,6 +2430,7 @@
                 defaultLights.visible = false;
             } else {
                 scene.environment = null;
+                syncEnvironmentNode();
                 scene.background = new THREE.Color(hiddenBackgroundColor);
                 defaultLights.visible = true;
             }
@@ -2438,6 +2458,7 @@
             currentHdriUrl = null;
             currentHdriProbeSignature = '';
             scene.environment = null;
+            syncEnvironmentNode();
             scene.environmentIntensity = 1.0;
             scene.environmentRotation.set(0, 0, 0);
             scene.backgroundRotation.set(0, 0, 0);
@@ -2532,6 +2553,7 @@
 
                 scene.background = null;
                 scene.environment = skyEnvMap;
+                syncEnvironmentNode();
                 scene.environmentRotation.set(0, 0, 0);
                 scene.backgroundRotation.set(0, 0, 0);
 
@@ -3314,8 +3336,8 @@
             if (hasInitialSync) return;
             hasInitialSync = true;
             stopReadyRetry();
-            // MAYBE IN FUTURE: Restore light linking now that lights + meshes are populated
-            // lightLinking.restoreFromStorage();
+            // Restore light linking now that lights + meshes are populated.
+            lightLinking.restoreFromStorage();
         }
 
         function startBridgeHandshake() {
@@ -4839,9 +4861,36 @@
             return light;
         }
 
+        // ── Light ID allocator for per-material mask uniforms ──
+        // Stable across re-syncs by name so UI state (stored by name) still
+        // applies. 64-slot cap (two uint32 per material). Slot 0..63 used for
+        // linked lights; any extras fall back to "unlinked" = always on.
+        const MAXJS_MAX_LIGHT_IDS = 64;
+        const lightIdByName = new Map();        // name -> id
+        const lightIdSlots = new Uint8Array(MAXJS_MAX_LIGHT_IDS); // 1 = taken
+        function lightStableKey(light, ld) {
+            return light?.name || ld?.name || ('_h' + ld?.h);
+        }
+        function allocLightId(key) {
+            if (lightIdByName.has(key)) {
+                const id = lightIdByName.get(key);
+                lightIdSlots[id] = 1;
+                return id;
+            }
+            for (let i = 0; i < MAXJS_MAX_LIGHT_IDS; i++) {
+                if (!lightIdSlots[i]) {
+                    lightIdSlots[i] = 1;
+                    lightIdByName.set(key, i);
+                    return i;
+                }
+            }
+            return -1; // all slots taken — light becomes "unlinked"
+        }
+
         function finalizeLightState(lightsData) {
             let appliedLightCount = 0;
             let mainDirectionalLight = null;
+            lightIdSlots.fill(0);
 
             for (const ld of lightsData) {
                 const light = createLightFromData(ld);
@@ -4851,6 +4900,9 @@
                     lightHandleMap.set(ld.h, light);
                     const helper = createLightHelper(light, ld.type);
                     if (helper) lightHelperMap.set(ld.h, helper);
+                    const id = allocLightId(lightStableKey(light, ld));
+                    light.userData ??= {};
+                    light.userData.maxjsLightId = id;
                 }
                 if (light.visible !== false) {
                     appliedLightCount++;
@@ -4867,56 +4919,21 @@
         function applyLights(lightsData) {
             clearLights();
             finalizeLightState(lightsData);
-            // MAYBE IN FUTURE: lightLinking.reapply();
+            lightLinking.reapply();
         }
 
-        /* MAYBE IN FUTURE: Light Linking — needs custom NodeMaterial lighting node
-           or multi-pass render. Data model + UI ready, no renderer support yet.
-
         // ── Light Linking ────────────────────────────────────
-        const LIGHT_LINK_LAYER_BASE = 16;
-        const LIGHT_LINK_LAYER_MAX = 30;
+        // Per-material 64-bit mask evaluated in the MaxLightsNode shader loop.
+        // State persisted by light name + mesh name so it survives re-sync.
         const LIGHT_LINK_STORAGE_KEY = 'maxjs-light-linking';
 
         const lightLinking = (() => {
-            // Runtime: { lightHandle: { mode: 'include'|'exclude', objects: Set<nodeHandle> } }
+            // lightHandle -> { mode: 'include'|'exclude', objects: Set<nodeHandle> }
             const links = new Map();
-            // lightHandle -> layer number
-            const layerAlloc = new Map();
-            let nextLayer = LIGHT_LINK_LAYER_BASE;
+            // meshName -> float (0..1+) HDRI intensity. Keyed by name so it
+            // survives handle churn and re-sync. Default 1.0 when absent.
+            const envIntensityByName = new Map();
 
-            function allocLayer(lightHandle) {
-                if (layerAlloc.has(lightHandle)) return layerAlloc.get(lightHandle);
-                if (nextLayer > LIGHT_LINK_LAYER_MAX) return -1;
-                const layer = nextLayer++;
-                layerAlloc.set(lightHandle, layer);
-                return layer;
-            }
-
-            function freeLayer(lightHandle) {
-                layerAlloc.delete(lightHandle);
-                repackLayers();
-            }
-
-            function repackLayers() {
-                const entries = [...layerAlloc.entries()];
-                layerAlloc.clear();
-                nextLayer = LIGHT_LINK_LAYER_BASE;
-                for (const [h] of entries) {
-                    layerAlloc.set(h, nextLayer++);
-                }
-            }
-
-            // Resolve a handle to its node name (stable across sessions)
-            function lightName(handle) {
-                const light = lightHandleMap.get(handle);
-                return light?.name || null;
-            }
-            function meshName(handle) {
-                const mesh = nodeMap.get(handle);
-                return mesh?.name || null;
-            }
-            // Reverse: find handle by name
             function lightHandleByName(name) {
                 for (const [h, light] of lightHandleMap) {
                     if (light.name === name) return h;
@@ -4930,50 +4947,55 @@
                 return null;
             }
 
-            function reapply() {
-                // Reset all lights to layer 0
-                for (const [, light] of lightHandleMap) {
-                    light.layers.set(0);
-                }
-                // Reset all meshes to layer 0
-                for (const [, mesh] of nodeMap) {
-                    mesh.layers.set(0);
-                }
-                // Ensure camera sees all layers
-                camera.layers.enableAll();
+            function resetMask(mesh) {
+                ensureMeshMaskDefaults(mesh);
+                mesh.userData[LIGHT_MASK_LO_KEY] = 0xFFFFFFFF;
+                mesh.userData[LIGHT_MASK_HI_KEY] = 0xFFFFFFFF;
+            }
 
+            function writeBit(mesh, lightId, enabled) {
+                ensureMeshMaskDefaults(mesh);
+                const key = lightId < 32 ? LIGHT_MASK_LO_KEY : LIGHT_MASK_HI_KEY;
+                const bit = (1 << (lightId & 31)) >>> 0;
+                const cur = mesh.userData[key] >>> 0;
+                mesh.userData[key] = enabled ? ((cur | bit) >>> 0) : ((cur & ~bit) >>> 0);
+            }
+
+            function applyEnvIntensities() {
+                for (const [, mesh] of nodeMap) {
+                    ensureMeshMaskDefaults(mesh);
+                    const v = envIntensityByName.get(mesh.name);
+                    mesh.userData[ENV_INTENSITY_KEY] = (typeof v === 'number') ? v : 1.0;
+                }
+            }
+
+            function reapply() {
+                // Baseline: every mesh all-on.
+                for (const [, mesh] of nodeMap) {
+                    resetMask(mesh);
+                }
+                // Apply each link as a bit-clear pattern.
                 for (const [lh, link] of links) {
                     const light = lightHandleMap.get(lh);
-                    if (!light) continue;
-                    const layer = allocLayer(lh);
-                    if (layer < 0) continue;
-
-                    // Move light off default layer onto its dedicated layer
-                    light.layers.disable(0);
-                    light.layers.enable(layer);
-                    if (light.userData?.maxjsTarget) {
-                        light.userData.maxjsTarget.layers.enable(layer);
-                    }
-
+                    const lid = light?.userData?.maxjsLightId;
+                    if (!Number.isInteger(lid) || lid < 0 || lid >= 64) continue;
                     if (link.mode === 'include') {
-                        for (const oh of link.objects) {
-                            const mesh = nodeMap.get(oh);
-                            if (mesh) mesh.layers.enable(layer);
+                        for (const [mh, mesh] of nodeMap) {
+                            writeBit(mesh, lid, link.objects.has(mh));
                         }
                     } else {
-                        for (const [oh, mesh] of nodeMap) {
-                            if (!link.objects.has(oh)) {
-                                mesh.layers.enable(layer);
-                            }
+                        for (const oh of link.objects) {
+                            const mesh = nodeMap.get(oh);
+                            if (mesh) writeBit(mesh, lid, false);
                         }
                     }
                 }
+                applyEnvIntensities();
             }
 
             function setLink(lightHandle, mode, objectHandles) {
                 if (!objectHandles || objectHandles.size === 0) {
                     links.delete(lightHandle);
-                    freeLayer(lightHandle);
                 } else {
                     links.set(lightHandle, { mode, objects: new Set(objectHandles) });
                 }
@@ -4983,7 +5005,6 @@
 
             function removeLink(lightHandle) {
                 links.delete(lightHandle);
-                freeLayer(lightHandle);
                 reapply();
                 save();
             }
@@ -4994,31 +5015,56 @@
 
             function getAllLinks() { return links; }
 
-            // Save by node name so it survives handle reassignment across sessions
+            function setEnvIntensity(meshHandle, value) {
+                const mesh = nodeMap.get(meshHandle);
+                if (!mesh || !mesh.name) return;
+                if (Number.isFinite(value) && value !== 1.0) {
+                    envIntensityByName.set(mesh.name, value);
+                } else {
+                    envIntensityByName.delete(mesh.name);
+                }
+                ensureMeshMaskDefaults(mesh);
+                mesh.userData[ENV_INTENSITY_KEY] = Number.isFinite(value) ? value : 1.0;
+                save();
+            }
+
+            function getEnvIntensity(meshHandle) {
+                const mesh = nodeMap.get(meshHandle);
+                if (!mesh) return 1.0;
+                const v = envIntensityByName.get(mesh.name);
+                return (typeof v === 'number') ? v : 1.0;
+            }
+
             function save() {
                 try {
-                    const data = {};
+                    const data = { links: {}, env: {} };
                     for (const [lh, link] of links) {
-                        const lName = lightName(lh);
+                        const lName = lightHandleMap.get(lh)?.name;
                         if (!lName) continue;
                         const objNames = [];
                         for (const oh of link.objects) {
-                            const n = meshName(oh);
+                            const n = nodeMap.get(oh)?.name;
                             if (n) objNames.push(n);
                         }
-                        data[lName] = { mode: link.mode, objects: objNames };
+                        data.links[lName] = { mode: link.mode, objects: objNames };
+                    }
+                    for (const [meshName, v] of envIntensityByName) {
+                        data.env[meshName] = v;
                     }
                     localStorage.setItem(LIGHT_LINK_STORAGE_KEY, JSON.stringify(data));
                 } catch {}
             }
 
-            // Load: resolve names back to current session handles
             function load() {
                 try {
                     const raw = localStorage.getItem(LIGHT_LINK_STORAGE_KEY);
                     if (!raw) return;
                     const data = JSON.parse(raw);
-                    for (const [lName, entry] of Object.entries(data)) {
+                    // Back-compat: old format was flat { lightName: {mode, objects} }.
+                    const rawLinks = data.links || (data.env === undefined ? data : {});
+                    const rawEnv = data.env || {};
+                    for (const [lName, entry] of Object.entries(rawLinks)) {
+                        if (!entry || typeof entry !== 'object' || !entry.mode) continue;
                         const lh = lightHandleByName(lName);
                         if (lh == null) continue;
                         const objHandles = new Set();
@@ -5033,19 +5079,23 @@
                             });
                         }
                     }
+                    for (const [meshName, v] of Object.entries(rawEnv)) {
+                        if (Number.isFinite(v)) envIntensityByName.set(meshName, v);
+                    }
                 } catch {}
             }
 
-            // Called after scene sync populates lightHandleMap + nodeMap
             function restoreFromStorage() {
                 links.clear();
-                layerAlloc.clear();
-                nextLayer = LIGHT_LINK_LAYER_BASE;
+                envIntensityByName.clear();
                 load();
-                if (links.size > 0) reapply();
+                reapply();
             }
 
-            return { reapply, setLink, removeLink, getLink, getAllLinks, restoreFromStorage };
+            return {
+                reapply, setLink, removeLink, getLink, getAllLinks, restoreFromStorage,
+                setEnvIntensity, getEnvIntensity,
+            };
         })();
 
         // ── Light Linking Panel UI ───────────────────────────
@@ -5074,50 +5124,55 @@
 
             let html = `<div class="sidepanel-header"><strong>Light Linking</strong></div><div class="sidepanel-body" style="gap:6px;">`;
 
-            if (lights.length === 0) {
-                html += `<div style="color:#666;padding:8px 0;">No lights in scene</div>`;
+            const hdriAvailable = !!scene.environment;
+            if (lights.length === 0 && !hdriAvailable) {
+                html += `<div style="color:#666;padding:8px 0;">No lights or HDRI in scene</div>`;
             } else {
-                // Light selector
-                html += `<label style="font-size:10px;color:#888;">Light</label>`;
+                // Target selector: HDRI first, then individual lights.
+                html += `<label style="font-size:10px;color:#888;">Target</label>`;
                 html += `<select id="ll-light-sel" style="width:100%;background:#222;color:#ccc;border:1px solid #444;padding:3px;font-size:11px;">`;
+                if (hdriAvailable) {
+                    html += `<option value="__hdri__">HDRI (per-mesh intensity)</option>`;
+                }
                 for (const l of lights) {
                     html += `<option value="${l.h}">${l.name}</option>`;
                 }
                 html += `</select>`;
 
-                // Mode selector
-                html += `<div style="display:flex;gap:4px;margin:4px 0;">`;
+                // Mode selector (hidden in HDRI mode)
+                html += `<div id="ll-mode-row" style="display:flex;gap:4px;margin:4px 0;">`;
                 html += `<button id="ll-mode-none" class="ll-mode active" style="flex:1;font-size:10px;padding:3px;">None</button>`;
                 html += `<button id="ll-mode-include" class="ll-mode" style="flex:1;font-size:10px;padding:3px;">Include</button>`;
                 html += `<button id="ll-mode-exclude" class="ll-mode" style="flex:1;font-size:10px;padding:3px;">Exclude</button>`;
                 html += `</div>`;
+                html += `<div id="ll-hdri-hint" style="display:none;font-size:10px;color:#888;margin:4px 0;">Drag sliders per-mesh — 0 removes HDRI contribution, 1 = default.</div>`;
 
-                // Object list
+                // Object list header
                 html += `<div style="display:flex;justify-content:space-between;align-items:center;margin-top:4px;">`;
                 html += `<label style="font-size:10px;color:#888;">Objects</label>`;
-                html += `<div style="display:flex;gap:3px;">`;
+                html += `<div id="ll-bulk-btns" style="display:flex;gap:3px;">`;
                 html += `<button id="ll-sel-all" style="font-size:9px;padding:1px 5px;">All</button>`;
                 html += `<button id="ll-sel-none" style="font-size:9px;padding:1px 5px;">None</button>`;
                 html += `</div></div>`;
-                html += `<div id="ll-obj-list" style="max-height:300px;overflow-y:auto;border:1px solid #333;padding:2px;">`;
-                for (const n of nodes) {
-                    html += `<label style="display:flex;align-items:center;gap:4px;padding:1px 2px;font-size:10px;cursor:pointer;">`;
-                    html += `<input type="checkbox" data-h="${n.h}" style="margin:0;accent-color:#e8e8e8;"> ${n.name}`;
-                    html += `</label>`;
-                }
-                html += `</div>`;
+
+                // Object list body — rendered fresh per-selection since items differ
+                html += `<div id="ll-obj-list" style="max-height:300px;overflow-y:auto;border:1px solid #333;padding:2px;"></div>`;
             }
             html += `</div>`;
             lightLinkPanel.innerHTML = html;
 
-            if (lights.length === 0) return;
+            if (lights.length === 0 && !scene.environment) return;
 
             const lightSel = document.getElementById('ll-light-sel');
+            const modeRow = document.getElementById('ll-mode-row');
+            const hdriHint = document.getElementById('ll-hdri-hint');
+            const bulkBtns = document.getElementById('ll-bulk-btns');
             const modeNone = document.getElementById('ll-mode-none');
             const modeInclude = document.getElementById('ll-mode-include');
             const modeExclude = document.getElementById('ll-mode-exclude');
             const objList = document.getElementById('ll-obj-list');
 
+            function isHdriMode() { return lightSel.value === '__hdri__'; }
             function getSelectedLight() { return Number(lightSel.value); }
 
             function getMode() {
@@ -5130,17 +5185,49 @@
                 modeNone.classList.toggle('active', mode === 'none');
                 modeInclude.classList.toggle('active', mode === 'include');
                 modeExclude.classList.toggle('active', mode === 'exclude');
-                // Dim object list when mode is none
                 objList.style.opacity = mode === 'none' ? '0.3' : '1';
                 objList.style.pointerEvents = mode === 'none' ? 'none' : 'auto';
             }
 
+            function renderObjectList() {
+                let inner = '';
+                if (isHdriMode()) {
+                    for (const n of nodes) {
+                        const v = lightLinking.getEnvIntensity(n.h);
+                        inner += `<div style="display:flex;align-items:center;gap:6px;padding:1px 2px;font-size:10px;">`;
+                        inner += `<span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${n.name}</span>`;
+                        inner += `<input type="range" data-h="${n.h}" min="0" max="1" step="0.01" value="${v}" style="width:90px;accent-color:#e8e8e8;">`;
+                        inner += `<span data-val="${n.h}" style="width:30px;text-align:right;color:#aaa;font-variant-numeric:tabular-nums;">${v.toFixed(2)}</span>`;
+                        inner += `</div>`;
+                    }
+                } else {
+                    for (const n of nodes) {
+                        inner += `<label style="display:flex;align-items:center;gap:4px;padding:1px 2px;font-size:10px;cursor:pointer;">`;
+                        inner += `<input type="checkbox" data-h="${n.h}" style="margin:0;accent-color:#e8e8e8;"> ${n.name}`;
+                        inner += `</label>`;
+                    }
+                }
+                objList.innerHTML = inner;
+            }
+
             function loadLightState() {
+                if (isHdriMode()) {
+                    modeRow.style.display = 'none';
+                    hdriHint.style.display = '';
+                    bulkBtns.style.display = 'none';
+                    objList.style.opacity = '1';
+                    objList.style.pointerEvents = 'auto';
+                    renderObjectList();
+                    return;
+                }
+                modeRow.style.display = '';
+                hdriHint.style.display = 'none';
+                bulkBtns.style.display = '';
+                renderObjectList();
                 const lh = getSelectedLight();
                 const link = lightLinking.getLink(lh);
                 if (!link) {
                     setActiveMode('none');
-                    for (const cb of objList.querySelectorAll('input[type=checkbox]')) cb.checked = false;
                 } else {
                     setActiveMode(link.mode);
                     for (const cb of objList.querySelectorAll('input[type=checkbox]')) {
@@ -5150,6 +5237,7 @@
             }
 
             function applyFromUI() {
+                if (isHdriMode()) return; // sliders fire their own path
                 const lh = getSelectedLight();
                 const mode = getMode();
                 if (mode === 'none') {
@@ -5169,13 +5257,28 @@
             modeInclude.addEventListener('click', () => { setActiveMode('include'); applyFromUI(); });
             modeExclude.addEventListener('click', () => { setActiveMode('exclude'); applyFromUI(); });
 
-            objList.addEventListener('change', applyFromUI);
+            objList.addEventListener('input', (ev) => {
+                if (!isHdriMode()) return;
+                const tgt = ev.target;
+                if (tgt?.type !== 'range') return;
+                const h = Number(tgt.dataset.h);
+                const v = parseFloat(tgt.value);
+                const lbl = objList.querySelector(`span[data-val="${h}"]`);
+                if (lbl) lbl.textContent = v.toFixed(2);
+                lightLinking.setEnvIntensity(h, v);
+            });
+            objList.addEventListener('change', (ev) => {
+                if (isHdriMode()) return;
+                applyFromUI();
+            });
 
             document.getElementById('ll-sel-all').addEventListener('click', () => {
+                if (isHdriMode()) return;
                 for (const cb of objList.querySelectorAll('input[type=checkbox]')) cb.checked = true;
                 applyFromUI();
             });
             document.getElementById('ll-sel-none').addEventListener('click', () => {
+                if (isHdriMode()) return;
                 for (const cb of objList.querySelectorAll('input[type=checkbox]')) cb.checked = false;
                 applyFromUI();
             });
@@ -5186,8 +5289,6 @@
         document.getElementById('btnLightLink')?.addEventListener('click', () => {
             setLightLinkPanelVisible(!lightLinkPanelVisible);
         });
-
-        END MAYBE IN FUTURE */
 
         // ── Hair And Fur GPU Instancing ─────────────────────
         const hairMeshes = new Map(); // handle -> { root, mesh }
@@ -5590,7 +5691,6 @@
             if (ssgiFx.setMainLight) {
                 ssgiFx.setMainLight(mainDirectionalLight || (defaultLights.visible ? defaultKey : null));
             }
-            // MAYBE IN FUTURE: lightLinking.reapply();
         }
 
         // ── Scene Camera Lock ────────────────────────────────

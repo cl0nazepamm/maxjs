@@ -887,6 +887,7 @@
                     <button id="btnLightProbe" class="active devonly">Probe: ON</button>
                     <button id="btnLightHelpers" class="devonly">Light Helpers</button>
                     <button id="btnLightLink" class="devonly">Light Linking</button>
+                    <button id="btnReflPaint" class="devonly">Reflection Paint</button>
                     <button id="btnRenderer" class="devonly">Renderer: WebGPU</button>
                     <button id="btnSwitchVR" class="devonly">Switch to VR</button>
                     <div class="menu-sep"></div>
@@ -909,6 +910,7 @@
         })();
     </script>
     <aside id="lightLinkPanel" class="sidepanel" aria-hidden="true" inert></aside>
+    <aside id="reflPaintPanel" class="sidepanel" aria-hidden="true" inert></aside>
     <aside id="layersPanel" class="sidepanel sidepanel-left" aria-hidden="true" inert></aside>
     <div id="rightDock">
         <aside id="snapshotPanel" class="sidepanel" aria-hidden="true" inert></aside>
@@ -973,9 +975,11 @@
             maxLights,
             ensureMeshMaskDefaults,
             buildEnvironmentIntensityNode,
+            getReflectionPaintNode,
             LIGHT_MASK_LO_KEY,
             LIGHT_MASK_HI_KEY,
             ENV_INTENSITY_KEY,
+            REFL_PAINT_INTENSITY_KEY,
         } from './js/max_lights_node.js';
         // Spark.js uses GLSL3/ShaderChunk — needs WebGL THREE build (scoped in importmap).
         // Lazy-import to avoid crashing on page load.
@@ -4951,6 +4955,7 @@
                 ensureMeshMaskDefaults(mesh);
                 mesh.userData[LIGHT_MASK_LO_KEY] = 0xFFFFFFFF;
                 mesh.userData[LIGHT_MASK_HI_KEY] = 0xFFFFFFFF;
+                mesh.userData[REFL_PAINT_INTENSITY_KEY] = 1.0;
             }
 
             function writeBit(mesh, lightId, enabled) {
@@ -4961,11 +4966,16 @@
                 mesh.userData[key] = enabled ? ((cur | bit) >>> 0) : ((cur & ~bit) >>> 0);
             }
 
+            // meshName -> float (0..1+) reflection paint intensity
+            const rpIntensityByName = new Map();
+
             function applyEnvIntensities() {
                 for (const [, mesh] of nodeMap) {
                     ensureMeshMaskDefaults(mesh);
-                    const v = envIntensityByName.get(mesh.name);
-                    mesh.userData[ENV_INTENSITY_KEY] = (typeof v === 'number') ? v : 1.0;
+                    const ev = envIntensityByName.get(mesh.name);
+                    mesh.userData[ENV_INTENSITY_KEY] = (typeof ev === 'number') ? ev : 1.0;
+                    const rv = rpIntensityByName.get(mesh.name);
+                    mesh.userData[REFL_PAINT_INTENSITY_KEY] = (typeof rv === 'number') ? rv : 1.0;
                 }
             }
 
@@ -5035,9 +5045,29 @@
                 return (typeof v === 'number') ? v : 1.0;
             }
 
+            function setRpIntensity(meshHandle, value) {
+                const mesh = nodeMap.get(meshHandle);
+                if (!mesh || !mesh.name) return;
+                if (Number.isFinite(value) && value !== 1.0) {
+                    rpIntensityByName.set(mesh.name, value);
+                } else {
+                    rpIntensityByName.delete(mesh.name);
+                }
+                ensureMeshMaskDefaults(mesh);
+                mesh.userData[REFL_PAINT_INTENSITY_KEY] = Number.isFinite(value) ? value : 1.0;
+                save();
+            }
+
+            function getRpIntensity(meshHandle) {
+                const mesh = nodeMap.get(meshHandle);
+                if (!mesh) return 1.0;
+                const v = rpIntensityByName.get(mesh.name);
+                return (typeof v === 'number') ? v : 1.0;
+            }
+
             function save() {
                 try {
-                    const data = { links: {}, env: {} };
+                    const data = { links: {}, env: {}, rp: {} };
                     for (const [lh, link] of links) {
                         const lName = lightHandleMap.get(lh)?.name;
                         if (!lName) continue;
@@ -5050,6 +5080,9 @@
                     }
                     for (const [meshName, v] of envIntensityByName) {
                         data.env[meshName] = v;
+                    }
+                    for (const [meshName, v] of rpIntensityByName) {
+                        data.rp[meshName] = v;
                     }
                     localStorage.setItem(LIGHT_LINK_STORAGE_KEY, JSON.stringify(data));
                 } catch {}
@@ -5082,12 +5115,17 @@
                     for (const [meshName, v] of Object.entries(rawEnv)) {
                         if (Number.isFinite(v)) envIntensityByName.set(meshName, v);
                     }
+                    const rawRp = data.rp || {};
+                    for (const [meshName, v] of Object.entries(rawRp)) {
+                        if (Number.isFinite(v)) rpIntensityByName.set(meshName, v);
+                    }
                 } catch {}
             }
 
             function restoreFromStorage() {
                 links.clear();
                 envIntensityByName.clear();
+                rpIntensityByName.clear();
                 load();
                 reapply();
             }
@@ -5095,6 +5133,7 @@
             return {
                 reapply, setLink, removeLink, getLink, getAllLinks, restoreFromStorage,
                 setEnvIntensity, getEnvIntensity,
+                setRpIntensity, getRpIntensity,
             };
         })();
 
@@ -5104,6 +5143,7 @@
 
         function setLightLinkPanelVisible(v) {
             lightLinkPanelVisible = !!v;
+            if (lightLinkPanelVisible) setReflPaintPanelVisible(false);
             lightLinkPanel.classList.toggle('visible', lightLinkPanelVisible);
             lightLinkPanel.toggleAttribute('inert', !lightLinkPanelVisible);
             lightLinkPanel.setAttribute('aria-hidden', String(!lightLinkPanelVisible));
@@ -5137,6 +5177,9 @@
                 for (const l of lights) {
                     html += `<option value="${l.h}">${l.name}</option>`;
                 }
+                if (getReflectionPaintNode().count > 0) {
+                    html += `<option value="__rp__">Reflection Paint (per-mesh intensity)</option>`;
+                }
                 html += `</select>`;
 
                 // Mode selector (hidden in HDRI mode)
@@ -5161,7 +5204,8 @@
             html += `</div>`;
             lightLinkPanel.innerHTML = html;
 
-            if (lights.length === 0 && !scene.environment) return;
+            const rpActive = getReflectionPaintNode().count > 0;
+            if (lights.length === 0 && !hdriAvailable && !rpActive) return;
 
             const lightSel = document.getElementById('ll-light-sel');
             const modeRow = document.getElementById('ll-mode-row');
@@ -5173,7 +5217,13 @@
             const objList = document.getElementById('ll-obj-list');
 
             function isHdriMode() { return lightSel.value === '__hdri__'; }
-            function getSelectedLight() { return Number(lightSel.value); }
+            function isRpMode() { return lightSel.value === '__rp__'; }
+            function isSliderMode() { return isHdriMode() || isRpMode(); }
+            function getSelectedLight() {
+                const v = lightSel.value;
+                if (v === '__hdri__' || v === '__rp__') return v;
+                return Number(v);
+            }
 
             function getMode() {
                 if (modeInclude.classList.contains('active')) return 'include';
@@ -5191,9 +5241,12 @@
 
             function renderObjectList() {
                 let inner = '';
-                if (isHdriMode()) {
+                if (isSliderMode()) {
+                    const getV = isHdriMode()
+                        ? (h) => lightLinking.getEnvIntensity(h)
+                        : (h) => lightLinking.getRpIntensity(h);
                     for (const n of nodes) {
-                        const v = lightLinking.getEnvIntensity(n.h);
+                        const v = getV(n.h);
                         inner += `<div style="display:flex;align-items:center;gap:6px;padding:1px 2px;font-size:10px;">`;
                         inner += `<span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${n.name}</span>`;
                         inner += `<input type="range" data-h="${n.h}" min="0" max="1" step="0.01" value="${v}" style="width:90px;accent-color:#e8e8e8;">`;
@@ -5211,9 +5264,12 @@
             }
 
             function loadLightState() {
-                if (isHdriMode()) {
+                if (isSliderMode()) {
                     modeRow.style.display = 'none';
                     hdriHint.style.display = '';
+                    hdriHint.textContent = isHdriMode()
+                        ? 'Drag sliders per-mesh \u2014 0 removes HDRI contribution, 1 = default.'
+                        : 'Drag sliders per-mesh \u2014 0 removes reflection paint, 1 = default.';
                     bulkBtns.style.display = 'none';
                     objList.style.opacity = '1';
                     objList.style.pointerEvents = 'auto';
@@ -5258,27 +5314,28 @@
             modeExclude.addEventListener('click', () => { setActiveMode('exclude'); applyFromUI(); });
 
             objList.addEventListener('input', (ev) => {
-                if (!isHdriMode()) return;
+                if (!isSliderMode()) return;
                 const tgt = ev.target;
                 if (tgt?.type !== 'range') return;
                 const h = Number(tgt.dataset.h);
                 const v = parseFloat(tgt.value);
                 const lbl = objList.querySelector(`span[data-val="${h}"]`);
                 if (lbl) lbl.textContent = v.toFixed(2);
-                lightLinking.setEnvIntensity(h, v);
+                if (isHdriMode()) lightLinking.setEnvIntensity(h, v);
+                else lightLinking.setRpIntensity(h, v);
             });
             objList.addEventListener('change', (ev) => {
-                if (isHdriMode()) return;
+                if (isSliderMode()) return;
                 applyFromUI();
             });
 
             document.getElementById('ll-sel-all').addEventListener('click', () => {
-                if (isHdriMode()) return;
+                if (isSliderMode()) return;
                 for (const cb of objList.querySelectorAll('input[type=checkbox]')) cb.checked = true;
                 applyFromUI();
             });
             document.getElementById('ll-sel-none').addEventListener('click', () => {
-                if (isHdriMode()) return;
+                if (isSliderMode()) return;
                 for (const cb of objList.querySelectorAll('input[type=checkbox]')) cb.checked = false;
                 applyFromUI();
             });
@@ -5288,6 +5345,174 @@
 
         document.getElementById('btnLightLink')?.addEventListener('click', () => {
             setLightLinkPanelVisible(!lightLinkPanelVisible);
+        });
+
+        // ── Reflection Paint Panel ──────────────────────────
+        const reflPaintPanel = document.getElementById('reflPaintPanel');
+        const reflPaint = getReflectionPaintNode();
+        let reflPaintPanelVisible = false;
+        const REFL_PAINT_STORAGE_KEY = 'maxjs-reflection-paint';
+
+        function setReflPaintPanelVisible(v) {
+            reflPaintPanelVisible = !!v;
+            if (reflPaintPanelVisible) setLightLinkPanelVisible(false);
+            reflPaintPanel.classList.toggle('visible', reflPaintPanelVisible);
+            reflPaintPanel.toggleAttribute('inert', !reflPaintPanelVisible);
+            reflPaintPanel.setAttribute('aria-hidden', String(!reflPaintPanelVisible));
+            document.getElementById('btnReflPaint')?.classList.toggle('active', reflPaintPanelVisible);
+            if (reflPaintPanelVisible) rebuildReflPaintPanel();
+        }
+
+        function saveReflPaint() {
+            try {
+                localStorage.setItem(REFL_PAINT_STORAGE_KEY, JSON.stringify(reflPaint.getLights()));
+            } catch {}
+        }
+
+        function loadReflPaint() {
+            try {
+                const raw = localStorage.getItem(REFL_PAINT_STORAGE_KEY);
+                if (!raw) return;
+                const arr = JSON.parse(raw);
+                reflPaint.clearLights();
+                for (const l of arr) {
+                    reflPaint.addLight({
+                        lat: l.lat, lon: l.lon,
+                        color: l.color,
+                        colorOuter: l.colorOuter,
+                        intensity: l.intensity,
+                        radiusX: l.radiusX ?? l.radius ?? 0.15,
+                        radiusY: l.radiusY ?? l.radius ?? 0.15,
+                        edge: l.edge ?? 0.3,
+                        shape: l.shape ?? 'circle',
+                        rotation: l.rotation ?? 0,
+                    });
+                }
+            } catch {}
+        }
+        loadReflPaint();
+
+        function rpRow(cls, id, label, type, min, max, step, value, displayVal) {
+            return `<label class="fx-check"><span>${label}</span><div style="display:flex;align-items:center;gap:4px;flex:1;min-width:0;">` +
+                `<input type="range" class="fx-range ${cls}" data-id="${id}" min="${min}" max="${max}" step="${step}" value="${value}">` +
+                `<span class="${cls}-val" data-id="${id}" style="width:32px;font-size:9px;text-align:right;color:#999;font-variant-numeric:tabular-nums;flex-shrink:0;">${displayVal}</span></div></label>`;
+        }
+
+        function rebuildReflPaintPanel() {
+            const lights = reflPaint.getLights();
+            let html = `<div class="sidepanel-header"><div><div class="sidepanel-title">Reflection Paint</div>` +
+                `<div class="sidepanel-subtitle">Analytical environment highlights</div></div>` +
+                `<div style="display:flex;gap:4px"><button id="rp-add" type="button">+ Add</button>` +
+                `<button id="rp-hide" type="button">Hide</button></div></div>`;
+            html += `<div class="sidepanel-body">`;
+
+            if (lights.length === 0) {
+                html += `<div style="color:#555;font-size:10px;padding:4px 0;">No reflection lights. Click + Add to paint one on the environment sphere.</div>`;
+            }
+
+            for (const l of lights) {
+                const rotDeg = Math.round((l.rotation || 0) * 180 / Math.PI);
+                html += `<section class="fx-section" data-id="${l.id}">`;
+                html += `<div class="fx-section-title" style="margin-bottom:8px;">`;
+                html += `<span style="flex:1;">Light ${l.id}</span>`;
+                html += `<button class="rp-del" data-id="${l.id}" type="button" style="color:#c66;">Delete</button>`;
+                html += `</div>`;
+                html += `<div class="fx-grid">`;
+                // Direction
+                html += rpRow('rp-lat', l.id, 'Latitude', 'range', -90, 90, 1, Math.round(l.lat), Math.round(l.lat));
+                html += rpRow('rp-lon', l.id, 'Longitude', 'range', 0, 360, 1, Math.round(l.lon), Math.round(l.lon));
+                // Color row
+                html += `<label class="fx-check"><span>Color</span><div style="display:flex;align-items:center;gap:6px;">` +
+                    `<input type="color" class="rp-color" data-id="${l.id}" value="${l.color}" style="width:24px;height:16px;border:1px solid rgba(255,255,255,0.1);padding:0;background:none;cursor:pointer;" title="Center">` +
+                    `<span style="font-size:9px;color:#666;">Edge</span>` +
+                    `<input type="color" class="rp-color-outer" data-id="${l.id}" value="${l.colorOuter}" style="width:24px;height:16px;border:1px solid rgba(255,255,255,0.1);padding:0;background:none;cursor:pointer;" title="Edge gradient">` +
+                    `</div></label>`;
+                // Intensity
+                html += rpRow('rp-int', l.id, 'Intensity', 'range', 0, 10, 0.1, l.intensity, l.intensity.toFixed(1));
+                // Size
+                html += rpRow('rp-sx', l.id, 'Size X', 'range', 0.01, 1.5, 0.01, l.radiusX, l.radiusX.toFixed(2));
+                html += rpRow('rp-sy', l.id, 'Size Y', 'range', 0.01, 1.5, 0.01, l.radiusY, l.radiusY.toFixed(2));
+                // Shape + Rotation
+                html += `<label class="fx-check"><span>Shape</span>` +
+                    `<select class="rp-shape" data-id="${l.id}" style="background:rgba(255,255,255,0.05);color:#bbb;border:1px solid rgba(255,255,255,0.08);padding:3px 6px;font:9px/1 -apple-system,'Segoe UI',system-ui,sans-serif;">` +
+                    `<option value="circle"${l.shape === 'circle' ? ' selected' : ''}>Circle</option>` +
+                    `<option value="rect"${l.shape === 'rect' ? ' selected' : ''}>Rectangle</option></select></label>`;
+                html += rpRow('rp-rot', l.id, 'Rotation', 'range', 0, 360, 1, rotDeg, rotDeg);
+                // Edge
+                html += rpRow('rp-edge', l.id, 'Edge', 'range', 0.001, 1, 0.001, l.edge, l.edge.toFixed(3));
+                html += `</div></section>`;
+            }
+
+            html += `</div>`;
+            reflPaintPanel.innerHTML = html;
+
+            // Wire events
+            document.getElementById('rp-add')?.addEventListener('click', () => {
+                reflPaint.addLight({ lat: 45, lon: 90, intensity: 2.0, radiusX: 0.15, radiusY: 0.15, edge: 0.3, shape: 'circle', rotation: 0 });
+                saveReflPaint();
+                rebuildReflPaintPanel();
+            });
+            document.getElementById('rp-hide')?.addEventListener('click', () => {
+                setReflPaintPanelVisible(false);
+            });
+
+            for (const btn of reflPaintPanel.querySelectorAll('.rp-del')) {
+                btn.addEventListener('click', () => {
+                    reflPaint.removeLight(Number(btn.dataset.id));
+                    saveReflPaint();
+                    rebuildReflPaintPanel();
+                });
+            }
+
+            reflPaintPanel.addEventListener('input', (ev) => {
+                const el = ev.target;
+                const sec = el.closest('[data-id]');
+                const id = Number(sec?.dataset.id || el.dataset.id);
+                if (!id) return;
+                const props = {};
+                if (el.classList.contains('rp-lat') || el.classList.contains('rp-lon')) {
+                    const latEl = reflPaintPanel.querySelector(`.rp-lat[data-id="${id}"]`);
+                    const lonEl = reflPaintPanel.querySelector(`.rp-lon[data-id="${id}"]`);
+                    props.lat = parseFloat(latEl.value);
+                    props.lon = parseFloat(lonEl.value);
+                    const latV = reflPaintPanel.querySelector(`.rp-lat-val[data-id="${id}"]`);
+                    const lonV = reflPaintPanel.querySelector(`.rp-lon-val[data-id="${id}"]`);
+                    if (latV) latV.textContent = Math.round(props.lat);
+                    if (lonV) lonV.textContent = Math.round(props.lon);
+                } else if (el.classList.contains('rp-color')) {
+                    props.color = el.value;
+                } else if (el.classList.contains('rp-color-outer')) {
+                    props.colorOuter = el.value;
+                } else if (el.classList.contains('rp-int')) {
+                    props.intensity = parseFloat(el.value);
+                    const v = reflPaintPanel.querySelector(`.rp-int-val[data-id="${id}"]`);
+                    if (v) v.textContent = props.intensity.toFixed(1);
+                } else if (el.classList.contains('rp-sx')) {
+                    props.radiusX = parseFloat(el.value);
+                    const v = reflPaintPanel.querySelector(`.rp-sx-val[data-id="${id}"]`);
+                    if (v) v.textContent = props.radiusX.toFixed(2);
+                } else if (el.classList.contains('rp-sy')) {
+                    props.radiusY = parseFloat(el.value);
+                    const v = reflPaintPanel.querySelector(`.rp-sy-val[data-id="${id}"]`);
+                    if (v) v.textContent = props.radiusY.toFixed(2);
+                } else if (el.classList.contains('rp-shape')) {
+                    props.shape = el.value;
+                } else if (el.classList.contains('rp-rot')) {
+                    props.rotation = parseFloat(el.value) * Math.PI / 180;
+                    const v = reflPaintPanel.querySelector(`.rp-rot-val[data-id="${id}"]`);
+                    if (v) v.textContent = Math.round(parseFloat(el.value));
+                } else if (el.classList.contains('rp-edge')) {
+                    props.edge = parseFloat(el.value);
+                    const v = reflPaintPanel.querySelector(`.rp-edge-val[data-id="${id}"]`);
+                    if (v) v.textContent = props.edge.toFixed(3);
+                }
+                reflPaint.updateLight(id, props);
+                saveReflPaint();
+            });
+        }
+
+        document.getElementById('btnReflPaint')?.addEventListener('click', () => {
+            setReflPaintPanelVisible(!reflPaintPanelVisible);
         });
 
         // ── Hair And Fur GPU Instancing ─────────────────────

@@ -17,6 +17,7 @@ import PointLightDataNode from 'three/addons/tsl/lighting/data/PointLightDataNod
 import SpotLightDataNode from 'three/addons/tsl/lighting/data/SpotLightDataNode.js';
 import HemisphereLightDataNode from 'three/addons/tsl/lighting/data/HemisphereLightDataNode.js';
 import AmbientLightDataNode from 'three/addons/tsl/lighting/data/AmbientLightDataNode.js';
+import { getReflectionPaintNode, REFL_PAINT_INTENSITY_KEY } from './reflection_paint.js';
 import {
     If, Loop, getDistanceAttenuation, mix, normalWorld, positionView, renderGroup,
     select, smoothstep, uniformArray, vec3, uint, int,
@@ -40,6 +41,9 @@ export function ensureMeshMaskDefaults(mesh) {
     }
     if (typeof mesh.userData[ENV_INTENSITY_KEY] !== 'number') {
         mesh.userData[ENV_INTENSITY_KEY] = 1.0;
+    }
+    if (typeof mesh.userData[REFL_PAINT_INTENSITY_KEY] !== 'number') {
+        mesh.userData[REFL_PAINT_INTENSITY_KEY] = 1.0;
     }
 }
 
@@ -306,8 +310,13 @@ export default class MaxLightsNode extends DynamicLightsNode {
             }
         }
 
+        // Reflection paint: analytical SG lobes on the environment sphere.
+        // Always included — Loop(0) is zero-cost when no lights are painted.
+        lightNodes.push(getReflectionPaintNode());
+
         this._lightNodes = lightNodes;
     }
 }
 
 export const maxLights = (options = {}) => new MaxLightsNode(options);
+export { getReflectionPaintNode, REFL_PAINT_INTENSITY_KEY } from './reflection_paint.js';

@@ -9900,6 +9900,12 @@ public:
         combinedNodeHandles.reserve(dirtyHandles.size() + visibilityDirty.size());
         for (ULONG handle : visibilityDirty) combinedNodeHandles.push_back(handle);
 
+        // Geometry fast path: send changed mesh vertex data via binary geo_fast.
+        // Then fall through to binary delta for transform/visibility/etc updates.
+        if (!geoDirty.empty()) {
+            SendGeometryFastUpdate(geoDirty);
+        }
+
         const bool hasAnyNodeUpdates = !combinedNodeHandles.empty();
         if (!hasAnyNodeUpdates && !hasDirtyCamera) return;
 
@@ -9914,12 +9920,6 @@ public:
             if (!hasDirtyAudios && audioHandles_.find(handle) != audioHandles_.end()) {
                 hasDirtyAudios = true;
             }
-        }
-
-        // Geometry fast path: send changed mesh vertex data via binary geo_fast.
-        // Then fall through to binary delta for transform/visibility/etc updates.
-        if (!geoDirty.empty()) {
-            SendGeometryFastUpdate(geoDirty);
         }
 
         // Hair fast path: re-extract world-space hair instances for any dirty

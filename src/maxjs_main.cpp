@@ -2527,12 +2527,21 @@ static void ExtractOpenPBRMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
             }
         }
     };
+    auto reflectivityFromIor = [](float ior) -> float {
+        const float clampedIor = std::max(1.0f, ior);
+        const float numerator = clampedIor - 1.0f;
+        const float denominator = clampedIor + 1.0f;
+        if (denominator <= 1.0e-6f) return 0.0f;
+        const float f0 = (numerator * numerator) / (denominator * denominator);
+        return std::clamp(std::sqrt(std::max(0.0f, f0) / 0.16f), 0.0f, 1.0f);
+    };
 
     // Core PBR
     readColor(_T("base_color"), d.color);
     d.roughness       = readFloat(_T("specular_roughness"), 0.3f);
     d.metalness       = readFloat(_T("base_metalness"), 0.0f);
     d.ior             = readFloat(_T("specular_ior"), 1.5f);
+    d.reflectivity    = reflectivityFromIor(d.ior);
     d.normalScale     = readFloat(_T("bump_map_amt"), 1.0f);
     d.displacementScale = readFloat(_T("displacement_map_amt"), 1.0f);
     d.anisotropy      = readFloat(_T("specular_roughness_anisotropy"), 0.0f);
@@ -2542,10 +2551,18 @@ static void ExtractOpenPBRMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
     d.physicalSpecularIntensity = readFloat(_T("specular_weight"), 1.0f);
 
     // Transmission
+    const bool thinWalled = readBool(_T("geometry_thin_walled"), false);
+    const float transmissionDepth = readFloat(_T("transmission_depth"), 0.0f);
     d.transmission = readFloat(_T("transmission_weight"), 0.0f);
     if (d.transmission > 0.0f) {
         readColor(_T("transmission_color"), d.attenuationColor);
-        d.attenuationDistance = readFloat(_T("transmission_depth"), 0.0f);
+        d.attenuationDistance = transmissionDepth;
+        // OpenPBR relies on actual mesh thickness when thin_walled is off.
+        // Three.js needs an explicit thickness scalar for volumetric
+        // transmission/refraction, so approximate it from transmission_depth.
+        if (!thinWalled) {
+            d.thickness = transmissionDepth > 0.0f ? transmissionDepth : 1.0f;
+        }
         d.dispersion = readFloat(_T("transmission_dispersion_scale"), 0.0f);
     }
 
@@ -2588,10 +2605,13 @@ static void ExtractOpenPBRMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
         if (!baseColorMap || !TrySplitCompositeAO(baseColorMap, t, d.colorMap, d.colorMapTransform, d.aoMap, d.aoMapTransform))
             readMap(_T("base_color_map"), _T("base_color_map_on"), d.colorMap, d.colorMapTransform);
     }
+    readMap(_T("specular_weight_map"),    _T("specular_weight_map_on"),    d.specularIntensityMap, d.specularIntensityMapTransform);
+    readMap(_T("specular_color_map"),     _T("specular_color_map_on"),     d.specularColorMap,     d.specularColorMapTransform);
     readMap(_T("specular_roughness_map"), _T("specular_roughness_map_on"), d.roughnessMap,    d.roughnessMapTransform);
     readMap(_T("base_metalness_map"),     _T("base_metalness_map_on"),     d.metalnessMap,    d.metalnessMapTransform);
     readMap(_T("emission_color_map"),     _T("emission_color_map_on"),     d.emissionMap,     d.emissionMapTransform);
     readMap(_T("geometry_opacity_map"),   _T("geometry_opacity_map_on"),   d.opacityMap,      d.opacityMapTransform);
+    readMap(_T("transmission_weight_map"), _T("transmission_weight_map_on"), d.transmissionMap, d.transmissionMapTransform);
     readMap(_T("displacement_map"),       _T("displacement_map_on"),       d.displacementMap, d.displacementMapTransform);
     readMap(_T("coat_weight_map"),        _T("coat_weight_map_on"),        d.clearcoatMap,    d.clearcoatMapTransform);
     readMap(_T("coat_roughness_map"),     _T("coat_roughness_map_on"),     d.clearcoatRoughnessMap, d.clearcoatRoughnessMapTransform);
@@ -10915,6 +10935,8 @@ public:
             WriteFloatValue(ss, pbr.transmission, 0.0f);
             ss << L",\"ior\":";
             WriteFloatValue(ss, pbr.ior, 1.5f);
+            ss << L",\"reflectivity\":";
+            WriteFloatValue(ss, pbr.reflectivity, 0.5f);
             ss << L",\"thickness\":";
             WriteFloatValue(ss, pbr.thickness, 0.0f);
             ss << L",\"dispersion\":";

@@ -862,7 +862,6 @@
 <body>
     <div id="hud">
         <div id="info">max.js - Check console</div>
-        <pre id="debugConsole" style="display:none;position:fixed;bottom:8px;right:8px;max-width:360px;max-height:30vh;overflow:auto;padding:8px 10px;border:1px solid rgba(255,255,255,0.12);background:rgba(0,0,0,0.82);color:#cfcfcf;font:10px/1.3 'Fira Code','Consolas',monospace;white-space:pre-wrap;word-break:break-word;z-index:9999;pointer-events:auto;resize:both;"></pre>
         <div id="controls">
             <div style="position:relative;display:inline-block;">
                 <button id="btnHamburger">&#9776;</button>
@@ -971,6 +970,7 @@
         import { SkyMesh } from 'three/addons/objects/SkyMesh.js';
         import { Sky } from 'three/addons/objects/Sky.js';
         import { AsciiEffect } from 'three/addons/effects/AsciiEffect.js';
+        import { Inspector } from 'three/addons/inspector/Inspector.js';
         import {
             maxLights,
             ensureMeshMaskDefaults,
@@ -3109,6 +3109,7 @@
                         if (md.transmission != null) params.transmission = md.transmission;
                         if (md.transMap) params.transmissionMap = loadTexture(md.transMap, THREE.LinearSRGBColorSpace, md.transMapXf, fallbackWhiteTexture);
                         if (md.ior != null && !(md.specularIntensity != null && md.specularIntensity < 0.001)) params.ior = md.ior;
+                        if (md.reflectivity != null) params.reflectivity = md.reflectivity;
                         if (md.thickness != null) params.thickness = md.thickness;
                         if (md.dispersion != null) params.dispersion = md.dispersion;
                         if (Array.isArray(md.attenuationColor)) {
@@ -4612,6 +4613,12 @@
                 if (material?.sheenRoughness != null && 'sheenRoughness' in m) {
                     m.sheenRoughness = material.sheenRoughness;
                 }
+                if (material?.iridescence != null && 'iridescence' in m) {
+                    m.iridescence = material.iridescence;
+                }
+                if (material?.iridescenceIOR != null && 'iridescenceIOR' in m) {
+                    m.iridescenceIOR = material.iridescenceIOR;
+                }
                 if (material?.transmission != null && 'transmission' in m) {
                     m.transmission = material.transmission;
                     if (material.transmission > 0) m.transparent = true;
@@ -4626,6 +4633,18 @@
                 // IOR must be set AFTER specularIntensity — Three.js derives F0 from both
                 if (material?.ior != null && 'ior' in m) {
                     m.ior = (material.specularIntensity != null && material.specularIntensity < 0.001) ? 1.0 : material.ior;
+                }
+                if (material?.reflectivity != null && 'reflectivity' in m) {
+                    m.reflectivity = material.reflectivity;
+                }
+                if (material?.dispersion != null && 'dispersion' in m) {
+                    m.dispersion = material.dispersion;
+                }
+                if (material?.attenuationDistance != null && 'attenuationDistance' in m) {
+                    m.attenuationDistance = material.attenuationDistance;
+                }
+                if (material?.anisotropy != null && 'anisotropy' in m) {
+                    m.anisotropy = material.anisotropy;
                 }
                 rememberMaterialEmissiveBase(m);
                 applyMaterialSelectionState(m, !!mesh.userData.maxjsSelected);
@@ -5025,6 +5044,66 @@
 
             function getAllLinks() { return links; }
 
+            // Constrain-to-camera: HDRI rotation tracks camera yaw
+            let hdriConstrainToCamera = false;
+            let hdriBaseRotationY = 0;
+            function setHdriConstrainToCamera(v) {
+                hdriConstrainToCamera = !!v;
+                if (v) hdriBaseRotationY = scene.environmentRotation.y;
+                save();
+            }
+            function getHdriConstrainToCamera() { return hdriConstrainToCamera; }
+
+            // Constrain-to-camera: per-light camera-relative offset
+            // lightHandle -> { posOffset: Vector3, dirOffset: Vector3 }
+            const lightCameraConstraints = new Map();
+            function setLightConstrainToCamera(lightHandle, enabled) {
+                if (enabled) {
+                    const light = lightHandleMap.get(lightHandle);
+                    if (!light) return;
+                    const camPos = camera.position;
+                    const posOffset = light.position.clone().sub(camPos);
+                    let dirOffset = null;
+                    const target = light.userData?.maxjsTarget;
+                    if (target) {
+                        dirOffset = target.position.clone().sub(camPos);
+                    }
+                    lightCameraConstraints.set(lightHandle, { posOffset, dirOffset });
+                } else {
+                    lightCameraConstraints.delete(lightHandle);
+                }
+                save();
+            }
+            function getLightConstrainToCamera(lightHandle) {
+                return lightCameraConstraints.has(lightHandle);
+            }
+
+            // Called each frame from renderFrame — updates constrained transforms.
+            function updateCameraConstraints() {
+                if (hdriConstrainToCamera) {
+                    const camYaw = Math.atan2(
+                        camera.matrixWorld.elements[8],
+                        camera.matrixWorld.elements[10]
+                    );
+                    scene.environmentRotation.y = hdriBaseRotationY - camYaw;
+                    scene.backgroundRotation.y = hdriBaseRotationY - camYaw;
+                }
+                if (lightCameraConstraints.size === 0) return;
+                const camPos = camera.position;
+                for (const [lh, c] of lightCameraConstraints) {
+                    const light = lightHandleMap.get(lh);
+                    if (!light) continue;
+                    light.position.copy(camPos).add(c.posOffset);
+                    if (c.dirOffset) {
+                        const target = light.userData?.maxjsTarget;
+                        if (target) {
+                            target.position.copy(camPos).add(c.dirOffset);
+                            target.updateMatrixWorld();
+                        }
+                    }
+                }
+            }
+
             function setEnvIntensity(meshHandle, value) {
                 const mesh = nodeMap.get(meshHandle);
                 if (!mesh || !mesh.name) return;
@@ -5067,7 +5146,14 @@
 
             function save() {
                 try {
-                    const data = { links: {}, env: {}, rp: {} };
+                    const data = { links: {}, env: {}, rp: {}, constrain: {} };
+                    data.constrain.hdri = hdriConstrainToCamera;
+                    const constrainedLightNames = [];
+                    for (const lh of lightCameraConstraints.keys()) {
+                        const n = lightHandleMap.get(lh)?.name;
+                        if (n) constrainedLightNames.push(n);
+                    }
+                    if (constrainedLightNames.length) data.constrain.lights = constrainedLightNames;
                     for (const [lh, link] of links) {
                         const lName = lightHandleMap.get(lh)?.name;
                         if (!lName) continue;
@@ -5115,6 +5201,13 @@
                     for (const [meshName, v] of Object.entries(rawEnv)) {
                         if (Number.isFinite(v)) envIntensityByName.set(meshName, v);
                     }
+                    const rawConstrain = data.constrain || {};
+                    hdriConstrainToCamera = !!rawConstrain.hdri;
+                    if (hdriConstrainToCamera) hdriBaseRotationY = scene.environmentRotation.y;
+                    for (const lName of (rawConstrain.lights || [])) {
+                        const lh = lightHandleByName(lName);
+                        if (lh != null) setLightConstrainToCamera(lh, true);
+                    }
                     const rawRp = data.rp || {};
                     for (const [meshName, v] of Object.entries(rawRp)) {
                         if (Number.isFinite(v)) rpIntensityByName.set(meshName, v);
@@ -5134,6 +5227,9 @@
                 reapply, setLink, removeLink, getLink, getAllLinks, restoreFromStorage,
                 setEnvIntensity, getEnvIntensity,
                 setRpIntensity, getRpIntensity,
+                setHdriConstrainToCamera, getHdriConstrainToCamera,
+                setLightConstrainToCamera, getLightConstrainToCamera,
+                updateCameraConstraints,
             };
         })();
 
@@ -5189,6 +5285,9 @@
                 html += `<button id="ll-mode-exclude" class="ll-mode" style="flex:1;font-size:10px;padding:3px;">Exclude</button>`;
                 html += `</div>`;
                 html += `<div id="ll-hdri-hint" style="display:none;font-size:10px;color:#888;margin:4px 0;">Drag sliders per-mesh — 0 removes HDRI contribution, 1 = default.</div>`;
+                html += `<label id="ll-constrain-row" style="display:none;font-size:10px;color:#aaa;margin:2px 0;cursor:pointer;gap:4px;align-items:center;">`;
+                html += `<input type="checkbox" id="ll-constrain-cam" style="margin:0;accent-color:#e8e8e8;"> Constrain to Camera`;
+                html += `</label>`;
 
                 // Object list header
                 html += `<div style="display:flex;justify-content:space-between;align-items:center;margin-top:4px;">`;
@@ -5263,7 +5362,11 @@
                 objList.innerHTML = inner;
             }
 
+            const constrainRow = document.getElementById('ll-constrain-row');
+            const constrainCam = document.getElementById('ll-constrain-cam');
+
             function loadLightState() {
+                const sel = getSelectedLight();
                 if (isSliderMode()) {
                     modeRow.style.display = 'none';
                     hdriHint.style.display = '';
@@ -5273,12 +5376,16 @@
                     bulkBtns.style.display = 'none';
                     objList.style.opacity = '1';
                     objList.style.pointerEvents = 'auto';
+                    constrainRow.style.display = 'flex';
+                    constrainCam.checked = (isHdriMode() || isRpMode()) && lightLinking.getHdriConstrainToCamera();
                     renderObjectList();
                     return;
                 }
                 modeRow.style.display = '';
                 hdriHint.style.display = 'none';
                 bulkBtns.style.display = '';
+                constrainRow.style.display = 'flex';
+                constrainCam.checked = typeof sel === 'number' && lightLinking.getLightConstrainToCamera(sel);
                 renderObjectList();
                 const lh = getSelectedLight();
                 const link = lightLinking.getLink(lh);
@@ -5338,6 +5445,15 @@
                 if (isSliderMode()) return;
                 for (const cb of objList.querySelectorAll('input[type=checkbox]')) cb.checked = false;
                 applyFromUI();
+            });
+
+            constrainCam.addEventListener('change', () => {
+                const sel = getSelectedLight();
+                if (isHdriMode() || isRpMode()) {
+                    lightLinking.setHdriConstrainToCamera(constrainCam.checked);
+                } else if (typeof sel === 'number') {
+                    lightLinking.setLightConstrainToCamera(sel, constrainCam.checked);
+                }
             });
 
             loadLightState();
@@ -8023,7 +8139,12 @@
                 shaderLab: getShaderLabSnapshot(),
             };
             if (includeDebug) {
-                payload.debug = buildDebugConsoleState();
+                payload.debug = {
+                    buildMode, debugMode, standalone: isStandalone,
+                    backend: rendererBackendLabel,
+                    nodeMapSize: nodeMap.size,
+                    memory: renderer?.info?.memory ?? null,
+                };
             }
             return payload;
         }
@@ -8574,6 +8695,7 @@
                 defaultKey.position.copy(getActiveCameraWorldPosition(cameraPositionWorld));
             }
             updateVolumeUniforms();
+            lightLinking.updateCameraConstraints();
             if (lightHelpersVisible) updateLightHelpers();
             layerManager.update(frameDt, frameElapsed);
             animationSystem?.update(frameDt);
@@ -8649,9 +8771,6 @@
             }
             if (perfHudActive) {
                 perfHud.updateRender(performance.now() - renderStart, renderer.info?.render, renderer.info?.memory);
-            }
-            if (debugMode && buildMode !== 'release') {
-                syncDebugConsole(false);
             }
             // Standalone / snapshot viewers have no bridge sync — drive the perf HUD from the render loop.
             if (!(window.chrome?.webview?.postMessage) && debugMode && buildMode !== 'release') {
@@ -9118,85 +9237,22 @@
 
         // ── Build mode / Standalone / Debug ──
         // buildMode / isStandalone / urlMode are initialized near perfHud (early).
-        const debugConsole = document.getElementById('debugConsole');
-        let lastDebugConsoleSignature = '';
-        let lastDebugConsolePaintMs = 0;
-
-        function buildDebugConsoleState() {
-            const perfState = typeof perfHud.getState === 'function' ? perfHud.getState() : null;
-            const layerStats = layerManager?.getStats?.() ?? null;
-            const layerRows = layerManager?.list?.().map(layer => ({
-                id: layer.id,
-                name: layer.name,
-                source: layer.source,
-                active: layer.active,
-                loading: layer.loading,
-                error: layer.error ?? null,
-                anchors: layer.anchors ?? 0,
-                tracked: layer.tracked ?? 0,
-                profile: layer.profile ?? null,
-            })) ?? [];
-            const projectState = _projectRuntimeRef?.getState?.() ?? null;
-            return {
-                buildMode,
-                debugMode,
-                standalone: isStandalone,
-                transportMode,
-                hasInitialSync,
-                latestAppliedSyncFrame,
-                renderer: {
-                    backend: rendererBackendLabel,
-                    toneMapping: currentToneMapping,
-                    exposure: currentExposure,
-                    aaMode: currentAAMode,
-                    pixelRatio: renderer?.getPixelRatio?.() ?? null,
-                    effectivePixelRatio: getEffectivePixelRatio(),
-                    info: {
-                        render: renderer?.info?.render ?? null,
-                        memory: renderer?.info?.memory ?? null,
-                    },
-                },
-                perfHud: perfState,
-                layers: {
-                    stats: layerStats,
-                    rows: layerRows,
-                },
-                project: projectState,
-                snapshotExport: getSnapshotExportSettings(),
-                postFx: {
-                    panelVisible: postPanelVisible,
-                    state: ssgiFx.getState(),
-                },
-                camera: {
-                    camLock,
-                    sceneCameraId: parseInt(selSceneCamera.value, 10) || 0,
-                },
-                scene: {
-                    nodeMapSize: nodeMap.size,
-                    textureCacheSize: textureCache.size,
-                    maxInstanceBuckets: maxInstanceBuckets.size,
-                    forestMeshes: forestMeshes.size,
-                    hairMeshes: hairMeshes.size,
-                },
-            };
-        }
-
-        function syncDebugConsole(force = false) {
-            if (buildMode === 'release' || !debugMode) {
-                debugConsole.style.display = 'none';
-                debugConsole.textContent = '';
-                lastDebugConsoleSignature = '';
-                return;
+        // three.js r184 Inspector — lazily created, gated by debug mode.
+        let threeInspector = null;
+        function syncInspector() {
+            if (debugMode && buildMode !== 'release') {
+                if (!threeInspector) {
+                    threeInspector = new Inspector();
+                    renderer.inspector = threeInspector;
+                    const parent = renderer.domElement.parentElement;
+                    if (parent && !threeInspector.domElement.parentElement) {
+                        parent.appendChild(threeInspector.domElement);
+                    }
+                }
+                threeInspector.domElement.style.display = '';
+            } else if (threeInspector) {
+                threeInspector.domElement.style.display = 'none';
             }
-            const now = performance.now();
-            if (!force && now - lastDebugConsolePaintMs < 250) return;
-            const state = buildDebugConsoleState();
-            const text = JSON.stringify(state, null, 2);
-            if (!force && text === lastDebugConsoleSignature) return;
-            lastDebugConsolePaintMs = now;
-            lastDebugConsoleSignature = text;
-            debugConsole.style.display = '';
-            debugConsole.textContent = text;
         }
 
         async function restoreInteractiveBrowserState() {
@@ -9227,14 +9283,13 @@
             hud.style.display = '';
             info.style.display = debugMode ? '' : 'none';
             debugBtn.classList.toggle('active', debugMode);
-            syncDebugConsole(true);
+            syncInspector();
         }
 
         function setDebugMode(enabled) {
             debugMode = enabled;
             try { localStorage.setItem(DEBUG_STORAGE_KEY, String(debugMode)); } catch {}
             applyBuildMode();
-            syncDebugConsole(true);
         }
 
         if (isStandalone) {

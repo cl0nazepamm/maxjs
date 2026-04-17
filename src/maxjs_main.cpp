@@ -1156,7 +1156,7 @@ struct MaxJSPBR {
     float anisotropy = 0.0f;
     float specular[3] = {0.0666667f, 0.0666667f, 0.0666667f};
     float shininess = 30.0f;
-    float reflectivity = 1.0f;
+    float reflectivity = 0.5f;
     float refractionRatio = 0.98f;
     bool  flatShading = false;
     bool  wireframe = false;
@@ -2651,10 +2651,8 @@ static void ExtractOpenPBRMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
         }
     }
 
-    // Downgrade to Standard if no advanced features
-    if (d.clearcoat == 0.0f && d.sheen == 0.0f && d.transmission == 0.0f &&
-        d.iridescence == 0.0f && d.anisotropy == 0.0f)
-        d.materialModel = L"MeshStandardMaterial";
+    // Keep OpenPBR on the physical path. Specular IOR/reflectivity is part of
+    // the core shading model and must not depend on coat or transmission.
 }
 
 // Extract PBR from VRayMtl
@@ -2856,10 +2854,8 @@ static void ExtractVRayMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
         }
     }
 
-    // Downgrade to Standard if no advanced features used
-    if (d.clearcoat == 0.0f && d.sheen == 0.0f && d.transmission == 0.0f &&
-        d.iridescence == 0.0f && d.anisotropy == 0.0f)
-        d.materialModel = L"MeshStandardMaterial";
+    // Keep VRay on the physical path. Reflection/specular controls are valid
+    // even when coat/transmission/etc. are off, and downgrading here drops them.
 }
 
 // Extract PBR from a single material (ThreeJS, glTF, or wire color fallback)
@@ -6417,8 +6413,14 @@ public:
         float transmission = 0.0f;
         float clearcoat = 0.0f;
         float clearcoatRoughness = 0.0f;
+        float iridescence = 0.0f;
+        float iridescenceIOR = 1.3f;
         float thickness = 0.0f;
         float ior = 1.5f;
+        float reflectivity = 0.5f;
+        float dispersion = 0.0f;
+        float attenuationDistance = 0.0f;
+        float anisotropy = 0.0f;
         float specularIntensity = 1.0f;
         float sheen = 0.0f;
         float sheenRoughness = 1.0f;
@@ -6618,8 +6620,14 @@ public:
         out.transmission = pbr.transmission;
         out.clearcoat = pbr.clearcoat;
         out.clearcoatRoughness = pbr.clearcoatRoughness;
+        out.iridescence = pbr.iridescence;
+        out.iridescenceIOR = pbr.iridescenceIOR;
         out.thickness = pbr.thickness;
         out.ior = pbr.ior;
+        out.reflectivity = pbr.reflectivity;
+        out.dispersion = pbr.dispersion;
+        out.attenuationDistance = pbr.attenuationDistance;
+        out.anisotropy = pbr.anisotropy;
         out.specularIntensity = pbr.physicalSpecularIntensity;
         out.sheen = pbr.sheen;
         out.sheenRoughness = pbr.sheenRoughness;
@@ -6987,8 +6995,14 @@ public:
         SnapshotAnimationTrackDef transmissionTrack = makeNumberTrack(L"transmission");
         SnapshotAnimationTrackDef clearcoatTrack = makeNumberTrack(L"clearcoat");
         SnapshotAnimationTrackDef clearcoatRoughnessTrack = makeNumberTrack(L"clearcoatRoughness");
+        SnapshotAnimationTrackDef iridescenceTrack = makeNumberTrack(L"iridescence");
+        SnapshotAnimationTrackDef iridescenceIORTrack = makeNumberTrack(L"iridescenceIOR");
         SnapshotAnimationTrackDef thicknessTrack = makeNumberTrack(L"thickness");
         SnapshotAnimationTrackDef iorTrack = makeNumberTrack(L"ior");
+        SnapshotAnimationTrackDef reflectivityTrack = makeNumberTrack(L"reflectivity");
+        SnapshotAnimationTrackDef dispersionTrack = makeNumberTrack(L"dispersion");
+        SnapshotAnimationTrackDef attenuationDistanceTrack = makeNumberTrack(L"attenuationDistance");
+        SnapshotAnimationTrackDef anisotropyTrack = makeNumberTrack(L"anisotropy");
         SnapshotAnimationTrackDef specularIntensityTrack = makeNumberTrack(L"specularIntensity");
         SnapshotAnimationTrackDef sheenTrack = makeNumberTrack(L"sheen");
         SnapshotAnimationTrackDef sheenRoughnessTrack = makeNumberTrack(L"sheenRoughness");
@@ -7007,8 +7021,14 @@ public:
         bool transmissionChanged = false;
         bool clearcoatChanged = false;
         bool clearcoatRoughnessChanged = false;
+        bool iridescenceChanged = false;
+        bool iridescenceIORChanged = false;
         bool thicknessChanged = false;
         bool iorChanged = false;
+        bool reflectivityChanged = false;
+        bool dispersionChanged = false;
+        bool attenuationDistanceChanged = false;
+        bool anisotropyChanged = false;
         bool specularIntensityChanged = false;
         bool sheenChanged = false;
         bool sheenRoughnessChanged = false;
@@ -7032,8 +7052,14 @@ public:
             AppendNumberTrackSample(transmissionTrack, second, sample.transmission);
             AppendNumberTrackSample(clearcoatTrack, second, sample.clearcoat);
             AppendNumberTrackSample(clearcoatRoughnessTrack, second, sample.clearcoatRoughness);
+            AppendNumberTrackSample(iridescenceTrack, second, sample.iridescence);
+            AppendNumberTrackSample(iridescenceIORTrack, second, sample.iridescenceIOR);
             AppendNumberTrackSample(thicknessTrack, second, sample.thickness);
             AppendNumberTrackSample(iorTrack, second, sample.ior);
+            AppendNumberTrackSample(reflectivityTrack, second, sample.reflectivity);
+            AppendNumberTrackSample(dispersionTrack, second, sample.dispersion);
+            AppendNumberTrackSample(attenuationDistanceTrack, second, sample.attenuationDistance);
+            AppendNumberTrackSample(anisotropyTrack, second, sample.anisotropy);
             AppendNumberTrackSample(specularIntensityTrack, second, sample.specularIntensity);
             AppendNumberTrackSample(sheenTrack, second, sample.sheen);
             AppendNumberTrackSample(sheenRoughnessTrack, second, sample.sheenRoughness);
@@ -7054,8 +7080,14 @@ public:
             transmissionChanged = transmissionChanged || !NearlyEqualFloat(sample.transmission, prev.transmission);
             clearcoatChanged = clearcoatChanged || !NearlyEqualFloat(sample.clearcoat, prev.clearcoat);
             clearcoatRoughnessChanged = clearcoatRoughnessChanged || !NearlyEqualFloat(sample.clearcoatRoughness, prev.clearcoatRoughness);
+            iridescenceChanged = iridescenceChanged || !NearlyEqualFloat(sample.iridescence, prev.iridescence);
+            iridescenceIORChanged = iridescenceIORChanged || !NearlyEqualFloat(sample.iridescenceIOR, prev.iridescenceIOR);
             thicknessChanged = thicknessChanged || !NearlyEqualFloat(sample.thickness, prev.thickness);
             iorChanged = iorChanged || !NearlyEqualFloat(sample.ior, prev.ior);
+            reflectivityChanged = reflectivityChanged || !NearlyEqualFloat(sample.reflectivity, prev.reflectivity);
+            dispersionChanged = dispersionChanged || !NearlyEqualFloat(sample.dispersion, prev.dispersion);
+            attenuationDistanceChanged = attenuationDistanceChanged || !NearlyEqualFloat(sample.attenuationDistance, prev.attenuationDistance);
+            anisotropyChanged = anisotropyChanged || !NearlyEqualFloat(sample.anisotropy, prev.anisotropy);
             specularIntensityChanged = specularIntensityChanged || !NearlyEqualFloat(sample.specularIntensity, prev.specularIntensity);
             sheenChanged = sheenChanged || !NearlyEqualFloat(sample.sheen, prev.sheen);
             sheenRoughnessChanged = sheenRoughnessChanged || !NearlyEqualFloat(sample.sheenRoughness, prev.sheenRoughness);
@@ -7075,8 +7107,14 @@ public:
         if (transmissionChanged) outTracks.push_back(std::move(transmissionTrack));
         if (clearcoatChanged) outTracks.push_back(std::move(clearcoatTrack));
         if (clearcoatRoughnessChanged) outTracks.push_back(std::move(clearcoatRoughnessTrack));
+        if (iridescenceChanged) outTracks.push_back(std::move(iridescenceTrack));
+        if (iridescenceIORChanged) outTracks.push_back(std::move(iridescenceIORTrack));
         if (thicknessChanged) outTracks.push_back(std::move(thicknessTrack));
         if (iorChanged) outTracks.push_back(std::move(iorTrack));
+        if (reflectivityChanged) outTracks.push_back(std::move(reflectivityTrack));
+        if (dispersionChanged) outTracks.push_back(std::move(dispersionTrack));
+        if (attenuationDistanceChanged) outTracks.push_back(std::move(attenuationDistanceTrack));
+        if (anisotropyChanged) outTracks.push_back(std::move(anisotropyTrack));
         if (specularIntensityChanged) outTracks.push_back(std::move(specularIntensityTrack));
         if (sheenChanged) outTracks.push_back(std::move(sheenTrack));
         if (sheenRoughnessChanged) outTracks.push_back(std::move(sheenRoughnessTrack));
@@ -8863,7 +8901,6 @@ public:
         if (!ip) return;
         TimeValue t = ip->GetTime();
 
-        bool changed = false;
         for (ULONG handle : geomHandles_) {
             INode* node = ip->GetINodeByHandle(handle);
             if (!node) {
@@ -8894,16 +8931,12 @@ public:
                 structureIt->second = state.structureHash;
                 scalarIt->second = state.scalarHash;
 
-                if (structureChanged || !state.canFastSync) {
-                    // Custom three.js materials often change structure while the user is
-                    // interacting with spinners/map slots. Escalate immediately instead
-                    // of waiting for the slower idle-only material detector.
-                    SetDirtyImmediate();
-                    return;
-                }
-
-                materialFastDirtyHandles_.insert(handle);
-                if (fastDirtyHandles_.insert(handle).second) changed = true;
+                // Any supported-material edit must use the full sync path. The fast
+                // material scalar channel only carries color/roughness/metalness/opacity
+                // and will silently drop physical fields like clearcoat/IOR/specular.
+                materialFastDirtyHandles_.clear();
+                SetDirtyImmediate();
+                return;
                 continue;
             }
 
@@ -8922,12 +8955,11 @@ public:
 
             if (it->second != scalarHash) {
                 it->second = scalarHash;
-                materialFastDirtyHandles_.insert(handle);
-                if (fastDirtyHandles_.insert(handle).second) changed = true;
+                materialFastDirtyHandles_.clear();
+                SetDirtyImmediate();
+                return;
             }
         }
-
-        if (changed) QueueFastFlush();
     }
 
     void RememberSentTransform(ULONG handle, const float* xform) {
@@ -8962,7 +8994,6 @@ public:
         if (!ip) return;
         TimeValue t = ip->GetTime();
 
-        bool changed = false;
         for (ULONG handle : geomHandles_) {
             INode* node = ip->GetINodeByHandle(handle);
             if (!node) continue;
@@ -8975,18 +9006,8 @@ public:
             const MaterialSyncState state = ComputeMaterialSyncState(node, t);
             mtlHashMap_[handle] = state.structureHash;
             mtlScalarHashMap_[handle] = state.scalarHash;
-
-            if (!state.canFastSync) {
-                SetDirtyImmediate();
-                return;
-            }
-
-            materialFastDirtyHandles_.insert(handle);
-            if (fastDirtyHandles_.insert(handle).second) changed = true;
-        }
-
-        if (changed) {
-            QueueFastFlush();
+            materialFastDirtyHandles_.clear();
+            SetDirtyImmediate();
             return;
         }
 
@@ -10453,12 +10474,13 @@ public:
         return HashFNV1a(payload.data(), payload.size() * sizeof(wchar_t));
     }
 
-    // Scalar-only edits stay on the fast path; structural material changes force a full sync.
+    // Supported material edits must use the full sync path. The lightweight scalar
+    // fast path only carries color/roughness/metalness/opacity and cannot keep
+    // physical properties in sync.
     void DetectMaterialChanges() {
         Interface* ip = GetCOREInterface();
         if (!ip) return;
         TimeValue t = ip->GetTime();
-        bool fastChanged = false;
 
         for (ULONG handle : geomHandles_) {
             INode* node = ip->GetINodeByHandle(handle);
@@ -10485,22 +10507,17 @@ public:
 
             structureIt->second = state.structureHash;
             scalarIt->second = state.scalarHash;
-
-            if (!structureChanged && scalarChanged && state.canFastSync) {
-                materialFastDirtyHandles_.insert(handle);
-                if (fastDirtyHandles_.insert(handle).second) fastChanged = true;
-            } else {
+            if (structureChanged) {
                 // Material structure changed — invalidate geometry hash + group cache
                 // so next full sync re-extracts face matIDs for multi-sub materials
                 geoHashMap_.erase(handle);
                 groupCache_.erase(handle);
                 lastBBoxHash_.erase(handle);
-                SetDirty();
-                return;
             }
+            materialFastDirtyHandles_.clear();
+            SetDirty();
+            return;
         }
-
-        if (fastChanged) QueueFastFlush();
     }
 
     void DetectLightChanges() {

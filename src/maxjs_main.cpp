@@ -12835,28 +12835,44 @@ public:
 
     bool MaintainViewportHost() {
         if (!IsViewportHosted()) return true;
-        if (!hwnd_ || !IsWindow(hwnd_) || !IsWindow(embeddedViewportHwnd_)) {
-            RequestPanelKill();
+        if (!hwnd_ || !IsWindow(hwnd_)) {
             return false;
         }
-        if (GetParent(hwnd_) != embeddedViewportHwnd_ || !IsWindowVisible(embeddedViewportHwnd_)) {
-            RequestPanelKill();
+        if (!IsWindow(embeddedViewportHwnd_)) {
+            // The render session can legitimately end by tearing down the
+            // viewport host. Restore the floating panel instead of killing the
+            // entire MaxJS window.
+            RestoreFromViewport();
+            return false;
+        }
+
+        const LONG hostedStyle = WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_CLIPSIBLINGS;
+        if (GetParent(hwnd_) != embeddedViewportHwnd_) {
+            SetWindowLong(hwnd_, GWL_STYLE, hostedStyle);
+            SetParent(hwnd_, embeddedViewportHwnd_);
+        }
+
+        HWND hostRoot = GetAncestor(embeddedViewportHwnd_, GA_ROOT);
+        if ((hostRoot && IsIconic(hostRoot)) || !IsWindowVisible(embeddedViewportHwnd_)) {
+            ShowWindow(hwnd_, SW_HIDE);
             return false;
         }
 
         RECT vpRect = {};
         if (!GetClientRect(embeddedViewportHwnd_, &vpRect)) {
-            RequestPanelKill();
             return false;
         }
 
         const int width = vpRect.right - vpRect.left;
         const int height = vpRect.bottom - vpRect.top;
         if (width < 64 || height < 64) {
-            RequestPanelKill();
+            // Viewport layout transitions briefly report tiny/empty client
+            // rects. Treat that as a suspended host, not a fatal condition.
+            ShowWindow(hwnd_, SW_HIDE);
             return false;
         }
 
+        ShowWindow(hwnd_, SW_SHOWNA);
         SetWindowPos(hwnd_, HWND_TOP, 0, 0, width, height,
             SWP_NOACTIVATE | SWP_NOCOPYBITS | SWP_SHOWWINDOW);
         Resize();
@@ -12864,12 +12880,6 @@ public:
     }
 
     bool MaintainWindowState() {
-        Interface* ip = GetCOREInterface();
-        if (IsViewportHosted() && ip && ip->IsViewportMaxed()) {
-            RequestPanelKill();
-            return false;
-        }
-
         if (IsViewportHosted()) {
             return MaintainViewportHost();
         }

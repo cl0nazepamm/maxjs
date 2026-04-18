@@ -21,15 +21,13 @@ import { getReflectionPaintNode, REFL_PAINT_INTENSITY_KEY } from './reflection_p
 import {
     If, Loop, getDistanceAttenuation, mix, normalWorld, positionView, renderGroup,
     select, smoothstep, uniformArray, vec3, uint, int,
-    bitAnd, shiftLeft, nodeObject, or, not, userData, materialReference, pmremTexture,
+    bitAnd, shiftLeft, nodeObject, or, not, userData,
 } from 'three/tsl';
 
 export const LIGHT_MASK_LO_KEY = 'maxjsLightMaskLo';
 export const LIGHT_MASK_HI_KEY = 'maxjsLightMaskHi';
-export const ENV_INTENSITY_KEY = 'maxjsEnvIntensity';
 const UNLINKED_ID = -1;
 
-// Stamp defaults on a mesh so the UserDataNode reads have a value on first draw.
 export function ensureMeshMaskDefaults(mesh) {
     if (!mesh) return;
     mesh.userData ??= {};
@@ -39,35 +37,9 @@ export function ensureMeshMaskDefaults(mesh) {
     if (typeof mesh.userData[LIGHT_MASK_HI_KEY] !== 'number') {
         mesh.userData[LIGHT_MASK_HI_KEY] = 0xFFFFFFFF;
     }
-}
-
-export function ensureMaterialLightingDefaults(material) {
-    if (!material) return;
-    material.userData ??= {};
-    if (typeof material[ENV_INTENSITY_KEY] !== 'number') {
-        material[ENV_INTENSITY_KEY] = 1.0;
+    if (typeof mesh.userData[REFL_PAINT_INTENSITY_KEY] !== 'number') {
+        mesh.userData[REFL_PAINT_INTENSITY_KEY] = 1.0;
     }
-    if (typeof material.userData[ENV_INTENSITY_KEY] !== 'number') {
-        material.userData[ENV_INTENSITY_KEY] = material[ENV_INTENSITY_KEY];
-    } else {
-        material[ENV_INTENSITY_KEY] = material.userData[ENV_INTENSITY_KEY];
-    }
-    if (typeof material[REFL_PAINT_INTENSITY_KEY] !== 'number') {
-        material[REFL_PAINT_INTENSITY_KEY] = 1.0;
-    }
-    if (typeof material.userData[REFL_PAINT_INTENSITY_KEY] !== 'number') {
-        material.userData[REFL_PAINT_INTENSITY_KEY] = material[REFL_PAINT_INTENSITY_KEY];
-    } else {
-        material[REFL_PAINT_INTENSITY_KEY] = material.userData[REFL_PAINT_INTENSITY_KEY];
-    }
-}
-
-// Wrap a scene's HDRI texture as a TSL node multiplied by a per-material factor.
-// Assigning the result to scene.environmentNode makes PBR IBL sampling scale
-// by each rendered material's maxjsEnvIntensity.
-export function buildEnvironmentIntensityNode(envTexture) {
-    if (!envTexture) return null;
-    return pmremTexture(envTexture).mul(materialReference(ENV_INTENSITY_KEY, 'float'));
 }
 
 // TSL: true if the light contributes. Unlinked lights (id === -1) always

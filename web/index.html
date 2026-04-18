@@ -1088,12 +1088,9 @@
         import {
             maxLights,
             ensureMeshMaskDefaults,
-            ensureMaterialLightingDefaults,
-            buildEnvironmentIntensityNode,
             getReflectionPaintNode,
             LIGHT_MASK_LO_KEY,
             LIGHT_MASK_HI_KEY,
-            ENV_INTENSITY_KEY,
             REFL_PAINT_INTENSITY_KEY,
         } from './js/max_lights_node.js';
         // Spark.js uses GLSL3/ShaderChunk — needs WebGL THREE build (scoped in importmap).
@@ -1103,12 +1100,20 @@
             color as tslColor,
             float as tslFloat,
             linearDepth,
+            materialEnvIntensity,
             screenUV,
             texture as tslTexture,
             viewportLinearDepth,
             viewportSharedTexture,
         } from 'three/tsl';
         import * as TSL from 'three/tsl';
+
+        // Patch materialEnvIntensity to always read material.envMapIntensity,
+        // even when no per-material envMap is set (default three.js falls back
+        // to scene.environmentIntensity which is global).  This makes the
+        // native EnvironmentNode respect per-material envMapIntensity with
+        // scene.environment — no custom environmentNode or envMap stamping.
+        materialEnvIntensity.onObjectUpdate(({ material }) => material.envMapIntensity);
         import { applyDeltaFrame } from './js/protocol.js';
         import { createPerfHud } from './js/perf_hud.js';
         import { createSSGIController } from './js/ssgi_fx.js';
@@ -1743,14 +1748,10 @@
         let localHdriObjectUrl = null;   // file loaded in memory
         let localHdriEnvMap = null;      // cached PMREM texture
 
-        // Wrap scene.environment as a TSL node multiplied by each material's
-        // maxjsEnvIntensity so per-material HDRI intensity is possible.
-        // Call after every scene.environment assignment.
-        function syncEnvironmentNode() {
-            scene.environmentNode = scene.environment
-                ? buildEnvironmentIntensityNode(scene.environment)
-                : null;
-        }
+        // No-op — env intensity is now controlled per-material via
+        // material.envMapIntensity using the patched materialEnvIntensity
+        // node (see import section). No need to stamp envMap on materials.
+        function syncMaterialEnvMaps() {}
         let localHdriEnabled = true;     // on/off toggle (file stays loaded)
         let localHdriFileName = '';
         let localHdriRotation = 0;
@@ -2417,7 +2418,7 @@
                 hdrTex.mapping = THREE.EquirectangularReflectionMapping;
                 const envMap = pmremGenerator.fromEquirectangular(hdrTex).texture;
                 scene.environment = envMap;
-                syncEnvironmentNode();
+                syncMaterialEnvMaps();
                 if (envVisible) scene.background = envMap;
                 defaultLights.visible = false;
                 if (lightProbeEnabled || shouldRefreshProbe) {
@@ -2431,7 +2432,7 @@
                 currentHdriProbeSignature = null;
                 currentEnvParams = null;
                 scene.environment = null;
-                syncEnvironmentNode();
+                syncMaterialEnvMaps();
                 clearLightProbe();
                 if (envVisible) scene.background = new THREE.Color(hiddenBackgroundColor);
                 defaultLights.visible = true;
@@ -2530,7 +2531,7 @@
             if (localHdriEnabled) {
                 localHdriShowBg = envVisible;
                 scene.environment = localHdriEnvMap;
-                syncEnvironmentNode();
+                syncMaterialEnvMaps();
                 scene.environmentIntensity = localHdriIntensity;
                 const rot = localHdriRotation * Math.PI / 180;
                 scene.environmentRotation.set(0, -rot, 0);
@@ -2549,7 +2550,7 @@
                 defaultLights.visible = false;
             } else {
                 scene.environment = null;
-                syncEnvironmentNode();
+                syncMaterialEnvMaps();
                 scene.background = new THREE.Color(hiddenBackgroundColor);
                 defaultLights.visible = true;
             }
@@ -2577,7 +2578,7 @@
             currentHdriUrl = null;
             currentHdriProbeSignature = '';
             scene.environment = null;
-            syncEnvironmentNode();
+            syncMaterialEnvMaps();
             scene.environmentIntensity = 1.0;
             scene.environmentRotation.set(0, 0, 0);
             scene.backgroundRotation.set(0, 0, 0);
@@ -2672,7 +2673,7 @@
 
                 scene.background = null;
                 scene.environment = skyEnvMap;
-                syncEnvironmentNode();
+                syncMaterialEnvMaps();
                 scene.environmentRotation.set(0, 0, 0);
                 scene.backgroundRotation.set(0, 0, 0);
 
@@ -3328,7 +3329,6 @@
                 template.userData.maxjsSourceMaterialName = md.name || template.name || 'default';
                 if (md.name) template.name = md.name;
 
-                ensureMaterialLightingDefaults(template);
                 rememberMaterialEmissiveBase(template);
                 template.needsUpdate = true;
                 materialCache.set(key, template);
@@ -3358,7 +3358,6 @@
             material.userData = { ...(template.userData || {}) };
             material.userData.maxjsSourceMaterialName = md.name || material.name || 'default';
             if (md.name) material.name = md.name;
-            ensureMaterialLightingDefaults(material);
             rememberMaterialEmissiveBase(material);
             return material;
         }
@@ -5107,6 +5106,10 @@
                     if (!mesh?.isMesh) continue;
                     fn(handleToken(h), mesh);
                 }
+                for (const [, bucket] of maxInstanceBuckets) {
+                    if (!bucket?.mesh?.isMesh) continue;
+                    fn(handleToken(bucket.sourceHandle ?? ''), bucket.mesh);
+                }
             }
 
             function materialNameOf(material) {
@@ -5118,42 +5121,12 @@
                 return value || 'default';
             }
 
-            function forEachSceneMaterial(fn) {
-                const seen = new Set();
-                forEachRenderableMesh((meshHandle, mesh) => {
-                    const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
-                    for (const material of materials) {
-                        if (!material || seen.has(material)) continue;
-                        seen.add(material);
-                        fn(materialNameOf(material), material, mesh);
-                    }
-                });
-                for (const [, bucket] of maxInstanceBuckets) {
-                    const materials = Array.isArray(bucket?.mesh?.material) ? bucket.mesh.material : [bucket?.mesh?.material];
-                    for (const material of materials) {
-                        if (!material || seen.has(material)) continue;
-                        seen.add(material);
-                        fn(materialNameOf(material), material, bucket.mesh);
-                    }
+            function meshUsesMaterial(mesh, materialName) {
+                const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+                for (const material of materials) {
+                    if (material && materialNameOf(material) === materialName) return true;
                 }
-                for (const material of materialCache.values()) {
-                    if (!material || seen.has(material)) continue;
-                    seen.add(material);
-                    fn(materialNameOf(material), material, null);
-                }
-            }
-
-            function mutateMaterialLighting(materialName, mutator) {
-                let touched = false;
-                forEachSceneMaterial((name, material) => {
-                    if (name !== materialName) return;
-                    ensureMaterialLightingDefaults(material);
-                    mutator(material.userData, material);
-                    material[ENV_INTENSITY_KEY] = material.userData[ENV_INTENSITY_KEY];
-                    material[REFL_PAINT_INTENSITY_KEY] = material.userData[REFL_PAINT_INTENSITY_KEY];
-                    touched = true;
-                });
-                return touched;
+                return false;
             }
 
             let lightingParamRefreshQueued = false;
@@ -5193,15 +5166,31 @@
                 mesh.userData[key] = enabled ? ((cur | bit) >>> 0) : ((cur & ~bit) >>> 0);
             }
 
+            function forEachMaterialByName(materialName, fn) {
+                const seen = new Set();
+                forEachRenderableMesh((_h, mesh) => {
+                    const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+                    for (const mat of materials) {
+                        if (!mat || seen.has(mat)) continue;
+                        seen.add(mat);
+                        if (materialNameOf(mat) === materialName) fn(mat, mesh);
+                    }
+                });
+            }
+
             function applyEnvIntensities() {
-                forEachSceneMaterial((materialName, material) => {
-                    const ev = envIntensityByName.get(materialName);
-                    const rv = rpIntensityByName.get(materialName);
-                    ensureMaterialLightingDefaults(material);
-                    material.userData[ENV_INTENSITY_KEY] = (typeof ev === 'number') ? ev : 1.0;
-                    material.userData[REFL_PAINT_INTENSITY_KEY] = (typeof rv === 'number') ? rv : 1.0;
-                    material[ENV_INTENSITY_KEY] = material.userData[ENV_INTENSITY_KEY];
-                    material[REFL_PAINT_INTENSITY_KEY] = material.userData[REFL_PAINT_INTENSITY_KEY];
+                const seen = new Set();
+                forEachRenderableMesh((_h, mesh) => {
+                    ensureMeshMaskDefaults(mesh);
+                    const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+                    for (const mat of materials) {
+                        if (!mat || seen.has(mat)) continue;
+                        seen.add(mat);
+                        const ev = envIntensityByName.get(materialNameOf(mat));
+                        mat.envMapIntensity = (typeof ev === 'number') ? ev : 1.0;
+                    }
+                    const rv = rpIntensityByName.get(materialNameOf(materials[0]));
+                    mesh.userData[REFL_PAINT_INTENSITY_KEY] = (typeof rv === 'number') ? rv : 1.0;
                 });
             }
 
@@ -5318,16 +5307,15 @@
 
             function setEnvIntensity(materialName, value) {
                 if (!materialName) return;
-                if (Number.isFinite(value) && value !== 1.0) {
-                    envIntensityByName.set(materialName, value);
-                } else {
-                    envIntensityByName.delete(materialName);
-                }
-                if (mutateMaterialLighting(materialName, (userData) => {
-                    userData[ENV_INTENSITY_KEY] = Number.isFinite(value) ? value : 1.0;
-                })) {
-                    notifyLightingParamChanged();
-                }
+                const v = Number.isFinite(value) ? value : 1.0;
+                if (v !== 1.0) envIntensityByName.set(materialName, v);
+                else envIntensityByName.delete(materialName);
+                let touched = false;
+                forEachMaterialByName(materialName, (mat) => {
+                    mat.envMapIntensity = v;
+                    touched = true;
+                });
+                if (touched) notifyLightingParamChanged();
                 save();
             }
 
@@ -5338,14 +5326,17 @@
 
             function setRpIntensity(materialName, value) {
                 if (!materialName) return;
-                if (Number.isFinite(value) && value !== 1.0) {
-                    rpIntensityByName.set(materialName, value);
-                } else {
-                    rpIntensityByName.delete(materialName);
-                }
-                if (mutateMaterialLighting(materialName, (userData) => {
-                    userData[REFL_PAINT_INTENSITY_KEY] = Number.isFinite(value) ? value : 1.0;
-                })) notifyLightingParamChanged();
+                const v = Number.isFinite(value) ? value : 1.0;
+                if (v !== 1.0) rpIntensityByName.set(materialName, v);
+                else rpIntensityByName.delete(materialName);
+                let touched = false;
+                forEachRenderableMesh((_h, mesh) => {
+                    if (!meshUsesMaterial(mesh, materialName)) return;
+                    ensureMeshMaskDefaults(mesh);
+                    mesh.userData[REFL_PAINT_INTENSITY_KEY] = v;
+                    touched = true;
+                });
+                if (touched) notifyLightingParamChanged();
                 save();
             }
 

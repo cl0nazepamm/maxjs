@@ -21,7 +21,7 @@ import { getReflectionPaintNode, REFL_PAINT_INTENSITY_KEY } from './reflection_p
 import {
     If, Loop, getDistanceAttenuation, mix, normalWorld, positionView, renderGroup,
     select, smoothstep, uniformArray, vec3, uint, int,
-    bitAnd, shiftLeft, nodeObject, or, not, userData, pmremTexture,
+    bitAnd, shiftLeft, nodeObject, or, not, userData, materialReference, pmremTexture,
 } from 'three/tsl';
 
 export const LIGHT_MASK_LO_KEY = 'maxjsLightMaskLo';
@@ -39,20 +39,35 @@ export function ensureMeshMaskDefaults(mesh) {
     if (typeof mesh.userData[LIGHT_MASK_HI_KEY] !== 'number') {
         mesh.userData[LIGHT_MASK_HI_KEY] = 0xFFFFFFFF;
     }
-    if (typeof mesh.userData[ENV_INTENSITY_KEY] !== 'number') {
-        mesh.userData[ENV_INTENSITY_KEY] = 1.0;
+}
+
+export function ensureMaterialLightingDefaults(material) {
+    if (!material) return;
+    material.userData ??= {};
+    if (typeof material[ENV_INTENSITY_KEY] !== 'number') {
+        material[ENV_INTENSITY_KEY] = 1.0;
     }
-    if (typeof mesh.userData[REFL_PAINT_INTENSITY_KEY] !== 'number') {
-        mesh.userData[REFL_PAINT_INTENSITY_KEY] = 1.0;
+    if (typeof material.userData[ENV_INTENSITY_KEY] !== 'number') {
+        material.userData[ENV_INTENSITY_KEY] = material[ENV_INTENSITY_KEY];
+    } else {
+        material[ENV_INTENSITY_KEY] = material.userData[ENV_INTENSITY_KEY];
+    }
+    if (typeof material[REFL_PAINT_INTENSITY_KEY] !== 'number') {
+        material[REFL_PAINT_INTENSITY_KEY] = 1.0;
+    }
+    if (typeof material.userData[REFL_PAINT_INTENSITY_KEY] !== 'number') {
+        material.userData[REFL_PAINT_INTENSITY_KEY] = material[REFL_PAINT_INTENSITY_KEY];
+    } else {
+        material[REFL_PAINT_INTENSITY_KEY] = material.userData[REFL_PAINT_INTENSITY_KEY];
     }
 }
 
-// Wrap a scene's HDRI texture as a TSL node multiplied by a per-mesh factor.
+// Wrap a scene's HDRI texture as a TSL node multiplied by a per-material factor.
 // Assigning the result to scene.environmentNode makes PBR IBL sampling scale
-// by each rendered mesh's userData.maxjsEnvIntensity.
+// by each rendered material's maxjsEnvIntensity.
 export function buildEnvironmentIntensityNode(envTexture) {
     if (!envTexture) return null;
-    return pmremTexture(envTexture).mul(userData(ENV_INTENSITY_KEY, 'float'));
+    return pmremTexture(envTexture).mul(materialReference(ENV_INTENSITY_KEY, 'float'));
 }
 
 // TSL: true if the light contributes. Unlinked lights (id === -1) always
@@ -302,6 +317,11 @@ export default class MaxLightsNode extends DynamicLightsNode {
             if (cls) lightNodes.push(new cls(light));
         }
 
+        // SHARED_DATA_NODES: each dataNode's _lights is driven ONLY by the scene
+        // MaxLightsNode's per-frame setLights → _updateDataNodeLights. Material
+        // compiles must not call dataNode.setLights — a material's _lights is a
+        // stale compile-time snapshot, and stomping the shared list truncates
+        // the light-link IDs writeIds() reads for other shaders.
         for (const [typeName, typeLights] of lightsByType) {
             let dataNode = this._dataNodes.get(typeName);
             if (dataNode === undefined) {
@@ -309,15 +329,18 @@ export default class MaxLightsNode extends DynamicLightsNode {
                 const maxProp = MAX_TO_PROP[typeName];
                 const maxCount = maxProp ? this[maxProp] : undefined;
                 dataNode = maxCount !== undefined ? new DataNodeClass(maxCount) : new DataNodeClass();
+                // Seed only once so the first render isn't empty; subsequent
+                // frames overwrite via scene's _updateDataNodeLights.
+                dataNode.setLights(typeLights);
                 this._dataNodes.set(typeName, dataNode);
             }
-            dataNode.setLights(typeLights);
             lightNodes.push(dataNode);
         }
 
         for (const [typeName, dataNode] of this._dataNodes) {
             if (!lightsByType.has(typeName)) {
-                dataNode.setLights([]);
+                // Don't reset to [] — another compiled material (or next
+                // frame's scene setLights) may still be populating this type.
                 lightNodes.push(dataNode);
             }
         }

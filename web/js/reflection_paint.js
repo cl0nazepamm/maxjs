@@ -8,7 +8,7 @@ import {
     cameraPosition, positionWorld, normalWorld, roughness, select, mix as tslMix,
     smoothstep, sin, cos,
     uniform, uniformArray, renderGroup, PI, NodeUpdateType,
-    userData, int,
+    materialReference, int,
 } from 'three/tsl';
 
 export const MAX_REFLECTION_LIGHTS = 16;
@@ -58,7 +58,7 @@ export class ReflectionPaintNode extends LightingNode {
     setup(builder) {
         const incident = positionWorld.sub(cameraPosition).normalize();
         const worldReflect = incident.reflect(normalWorld).normalize();
-        const intensityNode = userData(REFL_PAINT_INTENSITY_KEY, 'float');
+        const intensityNode = materialReference(REFL_PAINT_INTENSITY_KEY, 'float');
 
         const painted = vec3(0).toVar('reflPaintRadiance');
         Loop(this.countNode, ({ i }) => {

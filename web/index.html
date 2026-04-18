@@ -1088,6 +1088,7 @@
         import {
             maxLights,
             ensureMeshMaskDefaults,
+            ensureMaterialLightingDefaults,
             buildEnvironmentIntensityNode,
             getReflectionPaintNode,
             LIGHT_MASK_LO_KEY,
@@ -1742,8 +1743,8 @@
         let localHdriObjectUrl = null;   // file loaded in memory
         let localHdriEnvMap = null;      // cached PMREM texture
 
-        // Wrap scene.environment as a TSL node multiplied by each mesh's
-        // userData.maxjsEnvIntensity so per-mesh HDRI intensity is possible.
+        // Wrap scene.environment as a TSL node multiplied by each material's
+        // maxjsEnvIntensity so per-material HDRI intensity is possible.
         // Call after every scene.environment assignment.
         function syncEnvironmentNode() {
             scene.environmentNode = scene.environment
@@ -3324,7 +3325,10 @@
                     wantsToonMaterial && !canUseToonMaterial;
                 template.userData.maxjsSSSMaterialFallback =
                     wantsSSSMaterial && !canUseSSSMaterial;
+                template.userData.maxjsSourceMaterialName = md.name || template.name || 'default';
+                if (md.name) template.name = md.name;
 
+                ensureMaterialLightingDefaults(template);
                 rememberMaterialEmissiveBase(template);
                 template.needsUpdate = true;
                 materialCache.set(key, template);
@@ -3351,6 +3355,10 @@
             }
 
             const material = template.clone();
+            material.userData = { ...(template.userData || {}) };
+            material.userData.maxjsSourceMaterialName = md.name || material.name || 'default';
+            if (md.name) material.name = md.name;
+            ensureMaterialLightingDefaults(material);
             rememberMaterialEmissiveBase(material);
             return material;
         }
@@ -4044,6 +4052,7 @@
             buildMaxInstanceBuckets(snapshot.nodes);
             profileSceneNodes(snapshot.nodes);
             scene.updateMatrixWorld(true);
+            lightLinking.refreshSceneBindings?.();
             // Full snapshot can add/remove many meshes — cheap scene refresh.
             // Effect toggles, env, and renderer size have their own dedicated
             // entry points, so a full pipeline rebuild is unnecessary here.
@@ -5060,26 +5069,112 @@
         }
 
         // ── Light Linking ────────────────────────────────────
-        // Per-material 64-bit mask evaluated in the MaxLightsNode shader loop.
-        // State persisted by light name + mesh name so it survives re-sync.
+        // Per-mesh 64-bit light masks plus per-material HDRI / reflection-paint
+        // intensity state. Persisted by stable names so it survives re-sync.
         const LIGHT_LINK_STORAGE_KEY = 'maxjs-light-linking';
 
         const lightLinking = (() => {
             // lightHandle -> { mode: 'include'|'exclude', objects: Set<nodeHandle> }
             const links = new Map();
-            // meshName -> float (0..1+) HDRI intensity. Keyed by name so it
-            // survives handle churn and re-sync. Default 1.0 when absent.
+            // materialName -> float (0..1+) HDRI intensity. Keyed by Max material
+            // name so it survives handle churn and scene rebuilds.
             const envIntensityByName = new Map();
+            const rpIntensityByName = new Map();
+
+            function handleToken(handle) {
+                return handle == null ? '' : String(handle);
+            }
+
+            function resolveHandle(map, handle) {
+                if (handle == null) return null;
+                if (map.has(handle)) return handle;
+                const token = handleToken(handle);
+                if (map.has(token)) return token;
+                if (/^-?\d+$/.test(token)) {
+                    const numeric = Number(token);
+                    if (Number.isSafeInteger(numeric) && map.has(numeric)) return numeric;
+                }
+                return null;
+            }
+
+            function getByHandle(map, handle) {
+                const resolved = resolveHandle(map, handle);
+                return resolved == null ? undefined : map.get(resolved);
+            }
+
+            function forEachRenderableMesh(fn) {
+                for (const [h, mesh] of nodeMap) {
+                    if (!mesh?.isMesh) continue;
+                    fn(handleToken(h), mesh);
+                }
+            }
+
+            function materialNameOf(material) {
+                const value = String(
+                    material?.userData?.maxjsSourceMaterialName ??
+                    material?.name ??
+                    ''
+                ).trim();
+                return value || 'default';
+            }
+
+            function forEachSceneMaterial(fn) {
+                const seen = new Set();
+                forEachRenderableMesh((meshHandle, mesh) => {
+                    const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+                    for (const material of materials) {
+                        if (!material || seen.has(material)) continue;
+                        seen.add(material);
+                        fn(materialNameOf(material), material, mesh);
+                    }
+                });
+                for (const [, bucket] of maxInstanceBuckets) {
+                    const materials = Array.isArray(bucket?.mesh?.material) ? bucket.mesh.material : [bucket?.mesh?.material];
+                    for (const material of materials) {
+                        if (!material || seen.has(material)) continue;
+                        seen.add(material);
+                        fn(materialNameOf(material), material, bucket.mesh);
+                    }
+                }
+                for (const material of materialCache.values()) {
+                    if (!material || seen.has(material)) continue;
+                    seen.add(material);
+                    fn(materialNameOf(material), material, null);
+                }
+            }
+
+            function mutateMaterialLighting(materialName, mutator) {
+                let touched = false;
+                forEachSceneMaterial((name, material) => {
+                    if (name !== materialName) return;
+                    ensureMaterialLightingDefaults(material);
+                    mutator(material.userData, material);
+                    material[ENV_INTENSITY_KEY] = material.userData[ENV_INTENSITY_KEY];
+                    material[REFL_PAINT_INTENSITY_KEY] = material.userData[REFL_PAINT_INTENSITY_KEY];
+                    touched = true;
+                });
+                return touched;
+            }
+
+            let lightingParamRefreshQueued = false;
+            function notifyLightingParamChanged() {
+                if (lightingParamRefreshQueued) return;
+                lightingParamRefreshQueued = true;
+                requestAnimationFrame(() => {
+                    lightingParamRefreshQueued = false;
+                    ssgiFx.markOutputChanged?.();
+                });
+            }
 
             function lightHandleByName(name) {
                 for (const [h, light] of lightHandleMap) {
-                    if (light.name === name) return h;
+                    if (light.name === name) return handleToken(h);
                 }
                 return null;
             }
             function meshHandleByName(name) {
                 for (const [h, mesh] of nodeMap) {
-                    if (mesh.name === name) return h;
+                    if (mesh.name === name) return handleToken(h);
                 }
                 return null;
             }
@@ -5088,7 +5183,6 @@
                 ensureMeshMaskDefaults(mesh);
                 mesh.userData[LIGHT_MASK_LO_KEY] = 0xFFFFFFFF;
                 mesh.userData[LIGHT_MASK_HI_KEY] = 0xFFFFFFFF;
-                mesh.userData[REFL_PAINT_INTENSITY_KEY] = 1.0;
             }
 
             function writeBit(mesh, lightId, enabled) {
@@ -5099,36 +5193,35 @@
                 mesh.userData[key] = enabled ? ((cur | bit) >>> 0) : ((cur & ~bit) >>> 0);
             }
 
-            // meshName -> float (0..1+) reflection paint intensity
-            const rpIntensityByName = new Map();
-
             function applyEnvIntensities() {
-                for (const [, mesh] of nodeMap) {
-                    ensureMeshMaskDefaults(mesh);
-                    const ev = envIntensityByName.get(mesh.name);
-                    mesh.userData[ENV_INTENSITY_KEY] = (typeof ev === 'number') ? ev : 1.0;
-                    const rv = rpIntensityByName.get(mesh.name);
-                    mesh.userData[REFL_PAINT_INTENSITY_KEY] = (typeof rv === 'number') ? rv : 1.0;
-                }
+                forEachSceneMaterial((materialName, material) => {
+                    const ev = envIntensityByName.get(materialName);
+                    const rv = rpIntensityByName.get(materialName);
+                    ensureMaterialLightingDefaults(material);
+                    material.userData[ENV_INTENSITY_KEY] = (typeof ev === 'number') ? ev : 1.0;
+                    material.userData[REFL_PAINT_INTENSITY_KEY] = (typeof rv === 'number') ? rv : 1.0;
+                    material[ENV_INTENSITY_KEY] = material.userData[ENV_INTENSITY_KEY];
+                    material[REFL_PAINT_INTENSITY_KEY] = material.userData[REFL_PAINT_INTENSITY_KEY];
+                });
             }
 
             function reapply() {
                 // Baseline: every mesh all-on.
-                for (const [, mesh] of nodeMap) {
+                forEachRenderableMesh((meshHandle, mesh) => {
                     resetMask(mesh);
-                }
+                });
                 // Apply each link as a bit-clear pattern.
                 for (const [lh, link] of links) {
-                    const light = lightHandleMap.get(lh);
+                    const light = getByHandle(lightHandleMap, lh);
                     const lid = light?.userData?.maxjsLightId;
                     if (!Number.isInteger(lid) || lid < 0 || lid >= 64) continue;
                     if (link.mode === 'include') {
-                        for (const [mh, mesh] of nodeMap) {
-                            writeBit(mesh, lid, link.objects.has(mh));
-                        }
+                        forEachRenderableMesh((meshHandle, mesh) => {
+                            writeBit(mesh, lid, link.objects.has(meshHandle));
+                        });
                     } else {
                         for (const oh of link.objects) {
-                            const mesh = nodeMap.get(oh);
+                            const mesh = getByHandle(nodeMap, oh);
                             if (mesh) writeBit(mesh, lid, false);
                         }
                     }
@@ -5137,23 +5230,27 @@
             }
 
             function setLink(lightHandle, mode, objectHandles) {
+                const lightKey = handleToken(lightHandle);
                 if (!objectHandles || objectHandles.size === 0) {
-                    links.delete(lightHandle);
+                    links.delete(lightKey);
                 } else {
-                    links.set(lightHandle, { mode, objects: new Set(objectHandles) });
+                    links.set(lightKey, {
+                        mode,
+                        objects: new Set(Array.from(objectHandles, handleToken)),
+                    });
                 }
                 reapply();
                 save();
             }
 
             function removeLink(lightHandle) {
-                links.delete(lightHandle);
+                links.delete(handleToken(lightHandle));
                 reapply();
                 save();
             }
 
             function getLink(lightHandle) {
-                return links.get(lightHandle) || null;
+                return links.get(handleToken(lightHandle)) || null;
             }
 
             function getAllLinks() { return links; }
@@ -5172,8 +5269,9 @@
             // lightHandle -> { posOffset: Vector3, dirOffset: Vector3 }
             const lightCameraConstraints = new Map();
             function setLightConstrainToCamera(lightHandle, enabled) {
+                const lightKey = handleToken(lightHandle);
                 if (enabled) {
-                    const light = lightHandleMap.get(lightHandle);
+                    const light = getByHandle(lightHandleMap, lightHandle);
                     if (!light) return;
                     const camPos = camera.position;
                     const posOffset = light.position.clone().sub(camPos);
@@ -5182,14 +5280,14 @@
                     if (target) {
                         dirOffset = target.position.clone().sub(camPos);
                     }
-                    lightCameraConstraints.set(lightHandle, { posOffset, dirOffset });
+                    lightCameraConstraints.set(lightKey, { posOffset, dirOffset });
                 } else {
-                    lightCameraConstraints.delete(lightHandle);
+                    lightCameraConstraints.delete(lightKey);
                 }
                 save();
             }
             function getLightConstrainToCamera(lightHandle) {
-                return lightCameraConstraints.has(lightHandle);
+                return lightCameraConstraints.has(handleToken(lightHandle));
             }
 
             // Called each frame from renderFrame — updates constrained transforms.
@@ -5205,7 +5303,7 @@
                 if (lightCameraConstraints.size === 0) return;
                 const camPos = camera.position;
                 for (const [lh, c] of lightCameraConstraints) {
-                    const light = lightHandleMap.get(lh);
+                    const light = getByHandle(lightHandleMap, lh);
                     if (!light) continue;
                     light.position.copy(camPos).add(c.posOffset);
                     if (c.dirOffset) {
@@ -5218,43 +5316,41 @@
                 }
             }
 
-            function setEnvIntensity(meshHandle, value) {
-                const mesh = nodeMap.get(meshHandle);
-                if (!mesh || !mesh.name) return;
+            function setEnvIntensity(materialName, value) {
+                if (!materialName) return;
                 if (Number.isFinite(value) && value !== 1.0) {
-                    envIntensityByName.set(mesh.name, value);
+                    envIntensityByName.set(materialName, value);
                 } else {
-                    envIntensityByName.delete(mesh.name);
+                    envIntensityByName.delete(materialName);
                 }
-                ensureMeshMaskDefaults(mesh);
-                mesh.userData[ENV_INTENSITY_KEY] = Number.isFinite(value) ? value : 1.0;
+                if (mutateMaterialLighting(materialName, (userData) => {
+                    userData[ENV_INTENSITY_KEY] = Number.isFinite(value) ? value : 1.0;
+                })) {
+                    notifyLightingParamChanged();
+                }
                 save();
             }
 
-            function getEnvIntensity(meshHandle) {
-                const mesh = nodeMap.get(meshHandle);
-                if (!mesh) return 1.0;
-                const v = envIntensityByName.get(mesh.name);
+            function getEnvIntensity(materialName) {
+                const v = envIntensityByName.get(materialName);
                 return (typeof v === 'number') ? v : 1.0;
             }
 
-            function setRpIntensity(meshHandle, value) {
-                const mesh = nodeMap.get(meshHandle);
-                if (!mesh || !mesh.name) return;
+            function setRpIntensity(materialName, value) {
+                if (!materialName) return;
                 if (Number.isFinite(value) && value !== 1.0) {
-                    rpIntensityByName.set(mesh.name, value);
+                    rpIntensityByName.set(materialName, value);
                 } else {
-                    rpIntensityByName.delete(mesh.name);
+                    rpIntensityByName.delete(materialName);
                 }
-                ensureMeshMaskDefaults(mesh);
-                mesh.userData[REFL_PAINT_INTENSITY_KEY] = Number.isFinite(value) ? value : 1.0;
+                if (mutateMaterialLighting(materialName, (userData) => {
+                    userData[REFL_PAINT_INTENSITY_KEY] = Number.isFinite(value) ? value : 1.0;
+                })) notifyLightingParamChanged();
                 save();
             }
 
-            function getRpIntensity(meshHandle) {
-                const mesh = nodeMap.get(meshHandle);
-                if (!mesh) return 1.0;
-                const v = rpIntensityByName.get(mesh.name);
+            function getRpIntensity(materialName) {
+                const v = rpIntensityByName.get(materialName);
                 return (typeof v === 'number') ? v : 1.0;
             }
 
@@ -5264,25 +5360,25 @@
                     data.constrain.hdri = hdriConstrainToCamera;
                     const constrainedLightNames = [];
                     for (const lh of lightCameraConstraints.keys()) {
-                        const n = lightHandleMap.get(lh)?.name;
+                        const n = getByHandle(lightHandleMap, lh)?.name;
                         if (n) constrainedLightNames.push(n);
                     }
                     if (constrainedLightNames.length) data.constrain.lights = constrainedLightNames;
                     for (const [lh, link] of links) {
-                        const lName = lightHandleMap.get(lh)?.name;
+                        const lName = getByHandle(lightHandleMap, lh)?.name;
                         if (!lName) continue;
                         const objNames = [];
                         for (const oh of link.objects) {
-                            const n = nodeMap.get(oh)?.name;
+                            const n = getByHandle(nodeMap, oh)?.name;
                             if (n) objNames.push(n);
                         }
                         data.links[lName] = { mode: link.mode, objects: objNames };
                     }
-                    for (const [meshName, v] of envIntensityByName) {
-                        data.env[meshName] = v;
+                    for (const [materialName, v] of envIntensityByName) {
+                        data.env[materialName] = v;
                     }
-                    for (const [meshName, v] of rpIntensityByName) {
-                        data.rp[meshName] = v;
+                    for (const [materialName, v] of rpIntensityByName) {
+                        data.rp[materialName] = v;
                     }
                     localStorage.setItem(LIGHT_LINK_STORAGE_KEY, JSON.stringify(data));
                 } catch {}
@@ -5312,8 +5408,8 @@
                             });
                         }
                     }
-                    for (const [meshName, v] of Object.entries(rawEnv)) {
-                        if (Number.isFinite(v)) envIntensityByName.set(meshName, v);
+                    for (const [materialName, v] of Object.entries(rawEnv)) {
+                        if (Number.isFinite(v)) envIntensityByName.set(materialName, v);
                     }
                     const rawConstrain = data.constrain || {};
                     hdriConstrainToCamera = !!rawConstrain.hdri;
@@ -5323,8 +5419,8 @@
                         if (lh != null) setLightConstrainToCamera(lh, true);
                     }
                     const rawRp = data.rp || {};
-                    for (const [meshName, v] of Object.entries(rawRp)) {
-                        if (Number.isFinite(v)) rpIntensityByName.set(meshName, v);
+                    for (const [materialName, v] of Object.entries(rawRp)) {
+                        if (Number.isFinite(v)) rpIntensityByName.set(materialName, v);
                     }
                 } catch {}
             }
@@ -5338,7 +5434,12 @@
             }
 
             return {
-                reapply, setLink, removeLink, getLink, getAllLinks, restoreFromStorage,
+                reapply, restoreFromStorage,
+                refreshSceneBindings: () => {
+                    reapply();
+                    notifyLightingParamChanged();
+                },
+                setLink, removeLink, getLink, getAllLinks,
                 setEnvIntensity, getEnvIntensity,
                 setRpIntensity, getRpIntensity,
                 setHdriConstrainToCamera, getHdriConstrainToCamera,
@@ -5361,17 +5462,43 @@
         }
 
         function rebuildLightLinkPanel() {
+            const collectSliderMaterials = () => {
+                const names = new Set();
+                const items = [];
+                for (const [, mesh] of nodeMap) {
+                    if (!mesh?.isMesh) continue;
+                    const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+                    for (const material of materials) {
+                        if (!material) continue;
+                        const key = String(
+                            material.userData?.maxjsSourceMaterialName ??
+                            material.name ??
+                            'default'
+                        ).trim() || 'default';
+                        if (names.has(key)) continue;
+                        names.add(key);
+                        items.push({ key, name: key });
+                    }
+                }
+                items.sort((a, b) => a.name.localeCompare(b.name));
+                return items;
+            };
             const lights = [];
             for (const [h, light] of lightHandleMap) {
                 lights.push({ h, name: light.name || `Light ${h}`, type: light.type });
             }
             const nodes = [];
             for (const [h, mesh] of nodeMap) {
-                nodes.push({ h, name: mesh.name || `Object ${h}` });
+                if (!mesh?.isMesh) continue;
+                nodes.push({ h: String(h), name: mesh.name || `Object ${h}` });
             }
             nodes.sort((a, b) => a.name.localeCompare(b.name));
 
-            let html = `<div class="sidepanel-header"><strong>Light Linking</strong></div><div class="sidepanel-body" style="gap:6px;">`;
+            let html = `<div class="sidepanel-header">` +
+                `<div><div class="sidepanel-title">Light Linking</div>` +
+                `<div class="sidepanel-subtitle">Mesh links, material intensity</div></div>` +
+                `</div>` +
+                `<div class="sidepanel-body" style="gap:6px;">`;
 
             const hdriAvailable = !!scene.environment;
             if (lights.length === 0 && !hdriAvailable) {
@@ -5381,13 +5508,13 @@
                 html += `<label style="font-size:10px;color:#888;">Target</label>`;
                 html += `<select id="ll-light-sel" style="width:100%;background:#222;color:#ccc;border:1px solid #444;padding:3px;font-size:11px;">`;
                 if (hdriAvailable) {
-                    html += `<option value="__hdri__">HDRI (per-mesh intensity)</option>`;
+                    html += `<option value="__hdri__">HDRI (per-material intensity)</option>`;
                 }
                 for (const l of lights) {
                     html += `<option value="${l.h}">${l.name}</option>`;
                 }
                 if (getReflectionPaintNode().count > 0) {
-                    html += `<option value="__rp__">Reflection Paint (per-mesh intensity)</option>`;
+                    html += `<option value="__rp__">Reflection Paint (per-material intensity)</option>`;
                 }
                 html += `</select>`;
 
@@ -5397,14 +5524,14 @@
                 html += `<button id="ll-mode-include" class="ll-mode" style="flex:1;font-size:10px;padding:3px;">Include</button>`;
                 html += `<button id="ll-mode-exclude" class="ll-mode" style="flex:1;font-size:10px;padding:3px;">Exclude</button>`;
                 html += `</div>`;
-                html += `<div id="ll-hdri-hint" style="display:none;font-size:10px;color:#888;margin:4px 0;">Drag sliders per-mesh — 0 removes HDRI contribution, 1 = default.</div>`;
+                html += `<div id="ll-hdri-hint" style="display:none;font-size:10px;color:#888;margin:4px 0;">Drag sliders per material — 0 removes HDRI contribution, 1 = default.</div>`;
                 html += `<label id="ll-constrain-row" style="display:none;font-size:10px;color:#aaa;margin:2px 0;cursor:pointer;gap:4px;align-items:center;">`;
                 html += `<input type="checkbox" id="ll-constrain-cam" style="margin:0;accent-color:#e8e8e8;"> Constrain to Camera`;
                 html += `</label>`;
 
                 // Object list header
                 html += `<div style="display:flex;justify-content:space-between;align-items:center;margin-top:4px;">`;
-                html += `<label style="font-size:10px;color:#888;">Objects</label>`;
+                html += `<label id="ll-list-label" style="font-size:10px;color:#888;">Objects</label>`;
                 html += `<div id="ll-bulk-btns" style="display:flex;gap:3px;">`;
                 html += `<button id="ll-sel-all" style="font-size:9px;padding:1px 5px;">All</button>`;
                 html += `<button id="ll-sel-none" style="font-size:9px;padding:1px 5px;">None</button>`;
@@ -5427,6 +5554,8 @@
             const modeInclude = document.getElementById('ll-mode-include');
             const modeExclude = document.getElementById('ll-mode-exclude');
             const objList = document.getElementById('ll-obj-list');
+            const listLabel = document.getElementById('ll-list-label');
+            let sliderTargets = [];
 
             function isHdriMode() { return lightSel.value === '__hdri__'; }
             function isRpMode() { return lightSel.value === '__rp__'; }
@@ -5434,7 +5563,7 @@
             function getSelectedLight() {
                 const v = lightSel.value;
                 if (v === '__hdri__' || v === '__rp__') return v;
-                return Number(v);
+                return v;
             }
 
             function getMode() {
@@ -5454,18 +5583,21 @@
             function renderObjectList() {
                 let inner = '';
                 if (isSliderMode()) {
+                    sliderTargets = collectSliderMaterials();
                     const getV = isHdriMode()
-                        ? (h) => lightLinking.getEnvIntensity(h)
-                        : (h) => lightLinking.getRpIntensity(h);
-                    for (const n of nodes) {
-                        const v = getV(n.h);
+                        ? (key) => lightLinking.getEnvIntensity(key)
+                        : (key) => lightLinking.getRpIntensity(key);
+                    for (let i = 0; i < sliderTargets.length; i++) {
+                        const target = sliderTargets[i];
+                        const v = getV(target.key);
                         inner += `<div style="display:flex;align-items:center;gap:6px;padding:1px 2px;font-size:10px;">`;
-                        inner += `<span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${n.name}</span>`;
-                        inner += `<input type="range" data-h="${n.h}" min="0" max="1" step="0.01" value="${v}" style="width:90px;accent-color:#e8e8e8;">`;
-                        inner += `<span data-val="${n.h}" style="width:30px;text-align:right;color:#aaa;font-variant-numeric:tabular-nums;">${v.toFixed(2)}</span>`;
+                        inner += `<span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${target.name}</span>`;
+                        inner += `<input type="range" data-index="${i}" min="0" max="1" step="0.01" value="${v}" style="width:90px;accent-color:#e8e8e8;">`;
+                        inner += `<span data-index="${i}" style="width:30px;text-align:right;color:#aaa;font-variant-numeric:tabular-nums;">${v.toFixed(2)}</span>`;
                         inner += `</div>`;
                     }
                 } else {
+                    sliderTargets = [];
                     for (const n of nodes) {
                         inner += `<label style="display:flex;align-items:center;gap:4px;padding:1px 2px;font-size:10px;cursor:pointer;">`;
                         inner += `<input type="checkbox" data-h="${n.h}" style="margin:0;accent-color:#e8e8e8;"> ${n.name}`;
@@ -5483,9 +5615,10 @@
                 if (isSliderMode()) {
                     modeRow.style.display = 'none';
                     hdriHint.style.display = '';
+                    listLabel.textContent = 'Materials';
                     hdriHint.textContent = isHdriMode()
-                        ? 'Drag sliders per-mesh \u2014 0 removes HDRI contribution, 1 = default.'
-                        : 'Drag sliders per-mesh \u2014 0 removes reflection paint, 1 = default.';
+                        ? 'Drag sliders per material \u2014 0 removes HDRI contribution, 1 = default.'
+                        : 'Drag sliders per material \u2014 0 removes reflection paint, 1 = default.';
                     bulkBtns.style.display = 'none';
                     objList.style.opacity = '1';
                     objList.style.pointerEvents = 'auto';
@@ -5496,9 +5629,10 @@
                 }
                 modeRow.style.display = '';
                 hdriHint.style.display = 'none';
+                listLabel.textContent = 'Objects';
                 bulkBtns.style.display = '';
                 constrainRow.style.display = 'flex';
-                constrainCam.checked = typeof sel === 'number' && lightLinking.getLightConstrainToCamera(sel);
+                constrainCam.checked = lightLinking.getLightConstrainToCamera(sel);
                 renderObjectList();
                 const lh = getSelectedLight();
                 const link = lightLinking.getLink(lh);
@@ -5507,13 +5641,13 @@
                 } else {
                     setActiveMode(link.mode);
                     for (const cb of objList.querySelectorAll('input[type=checkbox]')) {
-                        cb.checked = link.objects.has(Number(cb.dataset.h));
+                        cb.checked = link.objects.has(String(cb.dataset.h));
                     }
                 }
             }
 
             function applyFromUI() {
-                if (isHdriMode()) return; // sliders fire their own path
+                if (isSliderMode()) return; // sliders fire their own path
                 const lh = getSelectedLight();
                 const mode = getMode();
                 if (mode === 'none') {
@@ -5522,7 +5656,7 @@
                 }
                 const objs = new Set();
                 for (const cb of objList.querySelectorAll('input[type=checkbox]')) {
-                    if (cb.checked) objs.add(Number(cb.dataset.h));
+                    if (cb.checked) objs.add(String(cb.dataset.h));
                 }
                 lightLinking.setLink(lh, mode, objs);
             }
@@ -5537,12 +5671,14 @@
                 if (!isSliderMode()) return;
                 const tgt = ev.target;
                 if (tgt?.type !== 'range') return;
-                const h = Number(tgt.dataset.h);
+                const index = Number.parseInt(tgt.dataset.index, 10);
+                const target = sliderTargets[index];
+                if (!target) return;
                 const v = parseFloat(tgt.value);
-                const lbl = objList.querySelector(`span[data-val="${h}"]`);
+                const lbl = tgt.parentElement?.querySelector('span[data-index]');
                 if (lbl) lbl.textContent = v.toFixed(2);
-                if (isHdriMode()) lightLinking.setEnvIntensity(h, v);
-                else lightLinking.setRpIntensity(h, v);
+                if (isHdriMode()) lightLinking.setEnvIntensity(target.key, v);
+                else lightLinking.setRpIntensity(target.key, v);
             });
             objList.addEventListener('change', (ev) => {
                 if (isSliderMode()) return;
@@ -5564,7 +5700,7 @@
                 const sel = getSelectedLight();
                 if (isHdriMode() || isRpMode()) {
                     lightLinking.setHdriConstrainToCamera(constrainCam.checked);
-                } else if (typeof sel === 'number') {
+                } else {
                     lightLinking.setLightConstrainToCamera(sel, constrainCam.checked);
                 }
             });

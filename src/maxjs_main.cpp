@@ -9637,8 +9637,15 @@ public:
     }
 
     void OnTimer() {
-        if (!hwnd_ || !IsWindowVisible(hwnd_)) return;
+        if (!hwnd_) return;
         if (renderLocked_) return;  // suppress all polling during production render
+        // ActiveShade host transitions (maximize/minimize/layout changes) can
+        // temporarily hide the child panel while the viewport host is invalid
+        // or reports a tiny client rect. We still need to run the host-state
+        // maintenance path while hidden so the panel can reattach/re-show once
+        // 3ds Max restores the viewport window. For the floating panel path,
+        // hidden still means "user closed it", so keep the old early-out.
+        if (!IsViewportHosted() && !IsWindowVisible(hwnd_)) return;
         if (!MaintainWindowState()) return;
         if (!jsReady_ || !webview_) return;
         tickCount_++;

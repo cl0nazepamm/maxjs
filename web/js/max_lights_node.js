@@ -37,9 +37,6 @@ export function ensureMeshMaskDefaults(mesh) {
     if (typeof mesh.userData[LIGHT_MASK_HI_KEY] !== 'number') {
         mesh.userData[LIGHT_MASK_HI_KEY] = 0xFFFFFFFF;
     }
-    if (typeof mesh.userData[REFL_PAINT_INTENSITY_KEY] !== 'number') {
-        mesh.userData[REFL_PAINT_INTENSITY_KEY] = 1.0;
-    }
 }
 
 // TSL: true if the light contributes. Unlinked lights (id === -1) always

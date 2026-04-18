@@ -5121,14 +5121,6 @@
                 return value || 'default';
             }
 
-            function meshUsesMaterial(mesh, materialName) {
-                const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
-                for (const material of materials) {
-                    if (material && materialNameOf(material) === materialName) return true;
-                }
-                return false;
-            }
-
             let lightingParamRefreshQueued = false;
             function notifyLightingParamChanged() {
                 if (lightingParamRefreshQueued) return;
@@ -5186,11 +5178,12 @@
                     for (const mat of materials) {
                         if (!mat || seen.has(mat)) continue;
                         seen.add(mat);
-                        const ev = envIntensityByName.get(materialNameOf(mat));
+                        const matName = materialNameOf(mat);
+                        const ev = envIntensityByName.get(matName);
+                        const rv = rpIntensityByName.get(matName);
                         mat.envMapIntensity = (typeof ev === 'number') ? ev : 1.0;
+                        mat[REFL_PAINT_INTENSITY_KEY] = (typeof rv === 'number') ? rv : 1.0;
                     }
-                    const rv = rpIntensityByName.get(materialNameOf(materials[0]));
-                    mesh.userData[REFL_PAINT_INTENSITY_KEY] = (typeof rv === 'number') ? rv : 1.0;
                 });
             }
 
@@ -5330,10 +5323,8 @@
                 if (v !== 1.0) rpIntensityByName.set(materialName, v);
                 else rpIntensityByName.delete(materialName);
                 let touched = false;
-                forEachRenderableMesh((_h, mesh) => {
-                    if (!meshUsesMaterial(mesh, materialName)) return;
-                    ensureMeshMaskDefaults(mesh);
-                    mesh.userData[REFL_PAINT_INTENSITY_KEY] = v;
+                forEachMaterialByName(materialName, (mat) => {
+                    mat[REFL_PAINT_INTENSITY_KEY] = v;
                     touched = true;
                 });
                 if (touched) notifyLightingParamChanged();

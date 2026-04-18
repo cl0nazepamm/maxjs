@@ -5323,8 +5323,13 @@
                 if (v !== 1.0) rpIntensityByName.set(materialName, v);
                 else rpIntensityByName.delete(materialName);
                 let touched = false;
+                const baseEnv = envIntensityByName.get(materialName) ?? 1.0;
                 forEachMaterialByName(materialName, (mat) => {
                     mat[REFL_PAINT_INTENSITY_KEY] = v;
+                    // Nudge a monitored property so NodeMaterialObserver
+                    // triggers a uniform refresh for every render object.
+                    mat._rpNudge = ((mat._rpNudge || 0) + 1) % 256;
+                    mat.envMapIntensity = baseEnv + mat._rpNudge * 1e-10;
                     touched = true;
                 });
                 if (touched) notifyLightingParamChanged();

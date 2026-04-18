@@ -14,8 +14,6 @@ import {
 export const MAX_REFLECTION_LIGHTS = 16;
 export const REFL_PAINT_INTENSITY_KEY = 'maxjsReflPaintIntensity';
 
-// Per-material RP intensity uniform — same pattern as materialEnvIntensity.
-// Updated per-draw so each material reads its own material[REFL_PAINT_INTENSITY_KEY].
 export const materialRpIntensity = /*@__PURE__*/ uniform(1)
     .onReference(({ material }) => material)
     .onObjectUpdate(({ material }) => material[REFL_PAINT_INTENSITY_KEY] ?? 1.0);

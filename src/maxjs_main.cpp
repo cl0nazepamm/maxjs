@@ -10408,13 +10408,78 @@ public:
     uint64_t ComputeLightStateHash(INode* node, TimeValue t) {
         if (!node) return 0;
 
-        std::wostringstream ss;
-        ss.imbue(std::locale::classic());
-
-        if (!WriteLightJson(ss, node, t, false, true, false)) {
+        ObjectState os = node->EvalWorldState(t);
+        if (!os.obj || !IsThreeJSLightClassID(os.obj->ClassID())) {
             const std::wstring payload = L"null";
             return HashFNV1a(payload.data(), payload.size() * sizeof(wchar_t));
         }
+
+        IParamBlock2* pb = os.obj->GetParamBlockByID(threejs_light_params);
+        if (!pb) {
+            const std::wstring payload = L"null";
+            return HashFNV1a(payload.data(), payload.size() * sizeof(wchar_t));
+        }
+
+        const Class_ID classId = os.obj->ClassID();
+        ThreeJSLightType ltype = GetThreeJSLightTypeFromClassID(classId);
+        if (ThreeJSLightClassUsesTypeParam(classId) && HasParam(pb, pl_type)) {
+            int rawType = pb->GetInt(pl_type);
+            if (rawType < 0) rawType = 0;
+            if (rawType >= kLight_COUNT) rawType = kLight_Directional;
+            ltype = static_cast<ThreeJSLightType>(rawType);
+        }
+
+        // Intentionally exclude world transform from the light-state hash.
+        // Parent-driven light motion must stay on the transform fast path;
+        // otherwise every animated parent makes the child light look like a
+        // full parameter change every frame, which causes playback hitches.
+        const bool supportsShadows =
+            ltype == kLight_Directional || ltype == kLight_Point || ltype == kLight_Spot;
+        const double metersPerUnit = GetSystemUnitScale(UNITS_METERS);
+        const double pointSpotScale = metersPerUnit > 1.0e-9 ? 1.0 / (metersPerUnit * metersPerUnit) : 1.0;
+
+        Color c(1.0f, 1.0f, 1.0f);
+        if (HasParam(pb, pl_color)) c = pb->GetColor(pl_color, t);
+
+        double intensity = HasParam(pb, pl_intensity) ? pb->GetFloat(pl_intensity, t) : 1.0;
+        if (ltype == kLight_Point || ltype == kLight_Spot) intensity *= pointSpotScale;
+
+        std::wostringstream ss;
+        ss.imbue(std::locale::classic());
+        ss << L"{\"v\":" << (IsMaxJsSyncDrawVisible(node) ? L'1' : L'0');
+        ss << L",\"type\":" << static_cast<int>(ltype);
+        ss << L",\"color\":[" << c.r << L',' << c.g << L',' << c.b << L']';
+        ss << L",\"intensity\":" << intensity;
+
+        if (ltype == kLight_Point || ltype == kLight_Spot) {
+            ss << L",\"distance\":" << (HasParam(pb, pl_distance) ? pb->GetFloat(pl_distance, t) : 0.0f);
+            ss << L",\"decay\":" << (HasParam(pb, pl_decay) ? pb->GetFloat(pl_decay, t) : 2.0f);
+        }
+        if (ltype == kLight_Spot) {
+            const float angleDeg = HasParam(pb, pl_angle) ? pb->GetFloat(pl_angle, t) : 45.0f;
+            ss << L",\"angle\":" << (angleDeg * 3.14159265f / 180.f);
+            ss << L",\"penumbra\":" << (HasParam(pb, pl_penumbra) ? pb->GetFloat(pl_penumbra, t) : 0.0f);
+        }
+        if (ltype == kLight_RectArea) {
+            ss << L",\"width\":" << (HasParam(pb, pl_width) ? pb->GetFloat(pl_width, t) : 0.0f);
+            ss << L",\"height\":" << (HasParam(pb, pl_height) ? pb->GetFloat(pl_height, t) : 0.0f);
+        }
+        if (ltype == kLight_Hemisphere) {
+            Color gc(0.0f, 0.0f, 0.0f);
+            if (HasParam(pb, pl_ground_color)) gc = pb->GetColor(pl_ground_color, t);
+            ss << L",\"groundColor\":[" << gc.r << L',' << gc.g << L',' << gc.b << L']';
+        }
+
+        const bool castShadow = supportsShadows && HasParam(pb, pl_cast_shadow) && pb->GetInt(pl_cast_shadow) != 0;
+        ss << L",\"castShadow\":" << (castShadow ? L'1' : L'0');
+        if (castShadow) {
+            ss << L",\"shadowBias\":" << (HasParam(pb, pl_shadow_bias) ? pb->GetFloat(pl_shadow_bias, t) : -0.0001f);
+            ss << L",\"shadowRadius\":" << (HasParam(pb, pl_shadow_radius) ? pb->GetFloat(pl_shadow_radius, t) : 1.0f);
+            ss << L",\"shadowMapSize\":" << (HasParam(pb, pl_shadow_mapsize) ? pb->GetInt(pl_shadow_mapsize) : 1024);
+        }
+
+        ss << L",\"volContrib\":" << (HasParam(pb, pl_vol_contrib) ? pb->GetFloat(pl_vol_contrib, t) : 0.0f);
+        ss << L'}';
 
         const std::wstring payload = ss.str();
         return HashFNV1a(payload.data(), payload.size() * sizeof(wchar_t));
@@ -13196,9 +13261,10 @@ void MaxJSFastNodeEventCallback::TopologyChanged(NodeKeyTab& nodes) {
 
 void MaxJSFastRedrawCallback::proc(Interface*) {
     if (!owner_) return;
+    const bool animPlaying = owner_->IsAnimationPlaying();
     owner_->MarkSelectedTransformsDirty();
     owner_->CheckTrackedMaterialScalarsLive();
-    if (!owner_->ShouldFavorInteractivePerformance() || owner_->IsAnimationPlaying()) {
+    if (!animPlaying && !owner_->ShouldFavorInteractivePerformance()) {
         owner_->MarkTrackedLightTransformsDirty();
         owner_->CheckTrackedLightsLive();
         owner_->MarkTrackedSplatTransformsDirty();

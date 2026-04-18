@@ -989,6 +989,7 @@
         <div class="rail-sep"></div>
         <div class="rail-group">
             <button id="btnRenderer" class="rail-btn rail-btn-text devonly" title="Renderer backend">WebGPU</button>
+            <button id="btnRenderMode" class="rail-btn rail-btn-text devonly" title="Render mode — Studio adds light linking / per-mesh HDRI / reflection paint; Standard stays within baseline WebGPU uniform-buffer limits. Toggling reloads the page.">Studio</button>
             <button id="btnSwitchVR" class="rail-btn devonly" title="Switch to VR" aria-label="Switch to VR">
                 <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="1" y="5" width="14" height="6" rx="2"/><circle cx="5" cy="8" r="1.2"/><circle cx="11" cy="8" r="1.2"/><path d="M8 6.5v3"/></svg>
             </button>
@@ -1369,11 +1370,29 @@
             THREE.RectAreaLightNode.setLTC(RectAreaLightTexturesLib.init());
         }
 
-        // Install MaxLightsNode as the renderer's LightsNode factory. The
-        // renderer creates one LightsNode per scene via lighting.createNode()
-        // and caches it; setting scene.lightsNode is a no-op in r184. Override
-        // must land before the first frame so the cached node is ours.
-        if (renderer.lighting?.createNode) {
+        // ── Studio vs Standard render mode ────────────────────
+        // Studio  = MaxLightsNode (light linking, per-mesh HDRI intensity,
+        //           reflection paint). Adds several fragment-stage uniform
+        //           buffers on top of stock three.js.
+        // Standard = stock three.js pipeline. No per-mesh tricks, but fits
+        //            within baseline WebGPU uniform-buffer limits — use on
+        //            heavier scenes that exceed 12 uniform buffers/stage.
+        //
+        // Mode is frozen at renderer init; switching requires reload.
+        const MAXJS_MODE_KEY = 'maxjs-render-mode';
+        const maxjsRenderMode = (() => {
+            try {
+                const v = localStorage.getItem(MAXJS_MODE_KEY);
+                return v === 'studio' ? 'studio' : 'standard';
+            } catch { return 'standard'; }
+        })();
+        const isStudioMode = maxjsRenderMode === 'studio';
+
+        if (isStudioMode && renderer.lighting?.createNode) {
+            // Install MaxLightsNode as the renderer's LightsNode factory. The
+            // renderer creates one LightsNode per scene via lighting.createNode()
+            // and caches it; setting scene.lightsNode is a no-op in r184. Override
+            // must land before the first frame so the cached node is ours.
             renderer.lighting.createNode = (lights = []) => maxLights({
                 maxDirectionalLights: 16,
                 maxPointLights: 32,
@@ -4886,8 +4905,11 @@
         function setLightTargetFromData(light, ld) {
             const target = light.userData?.maxjsTarget;
             if (!target) return;
-            const { radius } = getShadowSceneFocus();
-            const targetDistance = Math.max(radius * 2, 100);
+            // Fixed distance — three.js normalizes (target - position) internally,
+            // only the direction matters here. Previously recomputed scene bounds
+            // per call via getShadowSceneFocus(), which iterated every mesh and
+            // hitched animation playback with parented lights.
+            const targetDistance = 1000;
             target.position.set(
                 ld.pos[0] + ld.dir[0] * targetDistance,
                 ld.pos[1] + ld.dir[1] * targetDistance,
@@ -6860,6 +6882,18 @@
                 confirmMessage: `Restart MaxJS with ${nextMode === 'webgl' ? 'WebGL2' : 'WebGPU'} backend now?`,
             });
         });
+
+        const btnRenderMode = document.getElementById('btnRenderMode');
+        if (btnRenderMode) {
+            btnRenderMode.textContent = isStudioMode ? 'Studio' : 'Standard';
+            btnRenderMode.classList.toggle('active', isStudioMode);
+            btnRenderMode.addEventListener('click', () => {
+                const nextMode = isStudioMode ? 'standard' : 'studio';
+                if (!confirm(`Switch to ${nextMode === 'studio' ? 'Studio' : 'Standard'} mode? Reloads the page.`)) return;
+                try { localStorage.setItem(MAXJS_MODE_KEY, nextMode); } catch {}
+                location.reload();
+            });
+        }
         btnSwitchVR?.addEventListener('click', () => {
             if (isWebGLBackendActive()) {
                 perfHud.setStatus('MaxJS - WebGL2 backend is already active for VR');

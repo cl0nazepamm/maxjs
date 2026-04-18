@@ -12,6 +12,7 @@ export const COMMAND_TYPES = Object.freeze({
     UpdateLight: 8,
     UpdateSplat: 9,
     UpdateAudio: 10,
+    UpdateTime: 11,
 });
 
 function assertSize(type, actual, expected) {
@@ -182,6 +183,18 @@ export function applyDeltaFrame(buffer, handlers = {}) {
                 decodeMs += performance.now() - decodeStart;
                 const applyStart = performance.now();
                 handlers.onAudio?.(handle, matrix, visible);
+                applyMs += performance.now() - applyStart;
+                break;
+            }
+            case COMMAND_TYPES.UpdateTime: {
+                // 4 (ticks i32) + 4 (tpf i32) + 1 (flags u8) + 3 pad = 12 payload
+                assertSize('UpdateTime', commandSize, 16);
+                const ticks = view.getInt32(payloadOffset, true);
+                const tpf = view.getInt32(payloadOffset + 4, true);
+                const stateFlags = view.getUint8(payloadOffset + 8);
+                decodeMs += performance.now() - decodeStart;
+                const applyStart = performance.now();
+                handlers.onTime?.({ ticks, tpf, stateFlags });
                 applyMs += performance.now() - applyStart;
                 break;
             }

@@ -126,6 +126,17 @@ void DeltaFrameBuilder::UpdateAudio(std::uint32_t handle, const float* matrix16,
     AppendU32(visible ? 1u : 0u);
 }
 
+void DeltaFrameBuilder::UpdateTime(std::int32_t ticks, std::int32_t tpf, std::uint8_t stateFlags) {
+    // 4 ticks + 4 tpf + 1 flags + 3 pad = 12 payload
+    BeginCommand(CommandType::UpdateTime, 12);
+    AppendU32(static_cast<std::uint32_t>(ticks));
+    AppendU32(static_cast<std::uint32_t>(tpf));
+    bytes_.push_back(stateFlags);
+    bytes_.push_back(0);
+    bytes_.push_back(0);
+    bytes_.push_back(0);
+}
+
 void DeltaFrameBuilder::EndFrame() {
     BeginCommand(CommandType::EndFrame, 0);
 }

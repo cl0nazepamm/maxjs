@@ -10078,6 +10078,12 @@ public:
             haveLastSentCamera_ = true;
         }
 
+        // Time oracle — JS timeline / ctx.maxTime reads this.
+        {
+            const std::int32_t tpf = GetTicksPerFrame();
+            const std::uint8_t stateFlags = IsAnimationPlaying() ? 0x01 : 0x00;
+            frame.UpdateTime(static_cast<std::int32_t>(t), tpf, stateFlags);
+        }
         frame.EndFrame();
         if (frame.command_count() == 0) return;
 
@@ -10232,6 +10238,12 @@ public:
         GetActiveCamera(cam);
         frame.UpdateCamera(cam.pos, cam.target, cam.up, cam.fov, cam.perspective, cam.viewWidth,
                                cam.dofEnabled, cam.dofFocusDistance, cam.dofFocalLength, cam.dofBokehScale);
+        // Time oracle — JS timeline / ctx.maxTime reads this.
+        {
+            const std::int32_t tpf = GetTicksPerFrame();
+            const std::uint8_t stateFlags = IsAnimationPlaying() ? 0x01 : 0x00;
+            frame.UpdateTime(static_cast<std::int32_t>(t), tpf, stateFlags);
+        }
         frame.EndFrame();
 
         const auto& frameBytes = frame.bytes();

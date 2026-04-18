@@ -1116,6 +1116,7 @@
         // scene.environment — no custom environmentNode or envMap stamping.
         materialEnvIntensity.onObjectUpdate(({ material }) => material.envMapIntensity);
         import { applyDeltaFrame } from './js/protocol.js';
+        import { maxTimeline } from './js/maxjs_timeline.js';
         import { createPerfHud } from './js/perf_hud.js';
         import { createSSGIController } from './js/ssgi_fx.js';
         import { createLayerManager } from './js/layer_manager.js';
@@ -4173,6 +4174,7 @@
                 finalizeSceneNode(mesh, nd);
             }
 
+            layerManager.markRuntimeTransformsDirty?.();
             finalizeSceneSnapshot(msg, 'json', applyStart, msg.stats?.producerBytes ?? 0);
         });
 
@@ -4580,6 +4582,7 @@
                 finalizeSceneNode(mesh, nd);
             }
 
+            layerManager.markRuntimeTransformsDirty?.();
             finalizeSceneSnapshot(meta, 'binary-scene', applyStart, meta.stats?.producerBytes ?? buffer.byteLength, {
                 afterWorldUpdate() {
                     // Recalculate skeleton boneInverses for NEWLY created skinned meshes
@@ -4601,6 +4604,7 @@
                 onTransform(nodeHandle, matrix) {
                     const mesh = nodeMap.get(nodeHandle);
                     if (mesh) applyIncrementalNodeUpdate(mesh, { t: matrix });
+                    if (mesh) layerManager.markRuntimeTransformsDirty?.();
                     applyHairTransform(nodeHandle, matrix);
                 },
                 onMaterialScalar(nodeHandle, material) {
@@ -4649,6 +4653,9 @@
                 },
                 onAudio(handle, matrix, visible) {
                     audioSystem?.applyAudioTransformBinary(handle, matrix, visible);
+                },
+                onTime(td) {
+                    maxTimeline.onTime(td);
                 },
             });
             markInitialSync();
@@ -8383,6 +8390,12 @@
                 cameraClip: { near: cameraClip.near, far: cameraClip.far },
                 ascii: { enabled: asciiActive, ...asciiSettings },
                 shaderLab: getShaderLabSnapshot(),
+                timeline: {
+                    fps: maxTimeline.fps(),
+                    startFrame: 0,
+                    endFrame: 0,
+                    defaultPlaying: true,
+                },
             };
             if (includeDebug) {
                 payload.debug = {
@@ -9080,6 +9093,7 @@
         window.maxJSProjectRuntime = projectRuntime;
         window.maxJS.layers = layerManager;
         window.maxJS.animation = animationSystem;
+        window.maxJS.time = maxTimeline;
         window.maxJS.audio = audioSystem;
         _layerManagerRef = layerManager;
         _projectRuntimeRef = projectRuntime;
@@ -9324,6 +9338,12 @@
                 animationSystem.invalidateTargets();
                 if (meta.animations) animationSystem.loadSnapshotAnimations(meta.animations, animationBuffer);
                 else animationSystem.clear();
+                // Standalone has no Max — kick a local clock with the same API.
+                if (meta.snapshotUi?.timeline) {
+                    maxTimeline.initStandalone(meta.snapshotUi.timeline);
+                } else {
+                    maxTimeline.initStandalone({ fps: 30, defaultPlaying: true });
+                }
                 setInfoText(`MaxJS Snapshot - ${meta.nodes?.length ?? 0} nodes`);
                 return true;
             } catch (error) {

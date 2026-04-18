@@ -2,6 +2,8 @@
 // Max-owned scene content stays read-only behind adapters.
 // JS-authored content lives under its own roots and owns its own resources.
 
+import { maxTimeline } from './maxjs_timeline.js';
+
 const MAX_CONSECUTIVE_ERRORS = 60;
 const OWNER_KEY = 'maxjsOwner';
 const OWNER_MAX = 'max';
@@ -965,6 +967,7 @@ export function createLayerManager({
     let dt = 0;
     let elapsed = 0;
     const runtimeTransformOverrides = new Map();
+    let runtimeTransformReapplyNeeded = false;
     // Map<handle, Map<slotName, { texture, layerId }>> — survives sync
     // rebuilds. The scene message handler calls applyMaterialOverrides()
     // after every fastsync material assignment so layer-supplied textures
@@ -992,8 +995,15 @@ export function createLayerManager({
         obj.matrixAutoUpdate = false;
         obj.matrix.copy(matrix);
         obj.matrix.decompose(obj.position, obj.quaternion, obj.scale);
-        obj.matrixWorldNeedsUpdate = true;
-        obj.updateWorldMatrix(false, true);
+        if (obj.parent?.isObject3D) {
+            obj.matrixWorld.multiplyMatrices(obj.parent.matrixWorld, obj.matrix);
+        } else {
+            obj.matrixWorld.copy(obj.matrix);
+        }
+        obj.matrixWorldNeedsUpdate = false;
+        if (obj.children.length > 0) {
+            obj.updateWorldMatrix(false, true);
+        }
         return true;
     }
 
@@ -1022,7 +1032,6 @@ export function createLayerManager({
             // Get parent's world matrix (if object has a parent)
             const parent = obj?.parent;
             if (parent?.isObject3D) {
-                parent.updateWorldMatrix(true, false);
                 transformScratch.parentWorldInverse.copy(parent.matrixWorld).invert();
                 // localMatrix = parentWorldInverse * worldMatrix
                 return target.copy(transformScratch.parentWorldInverse).multiply(transformScratch.worldMatrix);
@@ -1075,6 +1084,10 @@ export function createLayerManager({
         if (!state || !obj?.isObject3D) return false;
         syncRuntimeTransformBaseFromScene(state, obj);
         const finalMatrix = composeRuntimeTransformState(state, transformScratch.finalMatrix, obj);
+        if (matrixElementsAlmostEqual(obj.matrix, finalMatrix)) {
+            state.lastAppliedMatrix.copy(finalMatrix);
+            return false;
+        }
         applyObjectLocalMatrix(obj, finalMatrix);
         state.lastAppliedMatrix.copy(finalMatrix);
         return true;
@@ -1096,6 +1109,7 @@ export function createLayerManager({
         const obj = nodeMap.get(handle);
         if (obj?.isObject3D) applyObjectLocalMatrix(obj, state.baseMatrix);
         runtimeTransformOverrides.delete(handle);
+        if (runtimeTransformOverrides.size === 0) runtimeTransformReapplyNeeded = false;
         return true;
     }
 
@@ -1156,12 +1170,20 @@ export function createLayerManager({
         }
     }
 
-    function applyAllRuntimeTransformOverrides() {
+    function applyAllRuntimeTransformOverrides(force = false) {
+        if (!force && !runtimeTransformReapplyNeeded) return false;
+        runtimeTransformReapplyNeeded = false;
+        let applied = false;
         for (const [handle, state] of runtimeTransformOverrides.entries()) {
             const obj = nodeMap.get(handle);
             if (!obj?.isObject3D) continue;
-            applyRuntimeTransformState(state, obj);
+            if (applyRuntimeTransformState(state, obj)) applied = true;
         }
+        return applied;
+    }
+
+    function markRuntimeTransformOverridesDirty() {
+        if (runtimeTransformOverrides.size > 0) runtimeTransformReapplyNeeded = true;
     }
 
     function getRuntimeTransformStateSnapshot(handle) {
@@ -1573,6 +1595,13 @@ export function createLayerManager({
                 get dt() { return dt; },
                 get elapsed() { return elapsed; },
             }),
+            maxTime: freezePlainObject({
+                get seconds() { return maxTimeline.now(); },
+                get frame() { return maxTimeline.frame(); },
+                get fps() { return maxTimeline.fps(); },
+                get playing() { return maxTimeline.playing(); },
+                get source() { return maxTimeline.source(); },
+            }),
             runtime: runtimeFacade,
             project: projectFacade,
             track(resource, options = {}) {
@@ -1823,8 +1852,6 @@ export function createLayerManager({
             }
         }
 
-        applyAllRuntimeTransformOverrides();
-
         // Re-sync anchors after runtime transform overrides are applied,
         // so anchors reflect the current frame's transforms, not the previous frame's.
         for (const layer of layers.values()) {
@@ -1975,6 +2002,7 @@ export function createLayerManager({
         getLayerCode,
         serializeSnapshot,
         restoreTransformOverrides: restoreRuntimeTransformOverrides,
+        markRuntimeTransformsDirty: markRuntimeTransformOverridesDirty,
         // Called from the scene message handler after each material assignment
         // so layer-registered map slot overrides survive fastsync rebuilds.
         applyMaterialOverrides: applyMaterialOverridesToMesh,

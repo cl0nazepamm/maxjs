@@ -8,7 +8,7 @@ import {
     cameraPosition, positionWorld, normalWorld, roughness, select, mix as tslMix,
     smoothstep, sin, cos,
     uniform, uniformArray, renderGroup, PI, NodeUpdateType,
-    userData,
+    userData, int,
 } from 'three/tsl';
 
 export const MAX_REFLECTION_LIGHTS = 16;
@@ -23,23 +23,19 @@ export class ReflectionPaintNode extends LightingNode {
         super();
         this._lights = [];
         this._nextId = 1;
-        this._dirs = [];
-        this._colors = [];
-        this._outerColors = [];
-        this._params = [];  // vec4: radiusX, radiusY, intensity, edge
-        this._params2 = []; // vec4: rotation, shape(0=circle,1=rect), 0, 0
+        // Packed 4 vec4s per light — single UBO instead of 5 separate arrays.
+        //   slot0: dir.xyz, intensity
+        //   slot1: color.rgb, radiusX
+        //   slot2: outerColor.rgb, radiusY
+        //   slot3: edge, rotation, shape, _
+        this._packed = [];
         for (let i = 0; i < MAX_REFLECTION_LIGHTS; i++) {
-            this._dirs.push(new Vector3(0, 1, 0));
-            this._colors.push(new Color(1, 1, 1));
-            this._outerColors.push(new Color(0, 0, 0));
-            this._params.push(new Vector4(0.15, 0.15, 2.0, 0.3));
-            this._params2.push(new Vector4(0, 0, 0, 0));
+            this._packed.push(new Vector4(0, 1, 0, 2.0));
+            this._packed.push(new Vector4(1, 1, 1, 0.15));
+            this._packed.push(new Vector4(0, 0, 0, 0.15));
+            this._packed.push(new Vector4(0.3, 0, 0, 0));
         }
-        this.dirsNode = uniformArray(this._dirs, 'vec3').setGroup(renderGroup);
-        this.colorsNode = uniformArray(this._colors, 'color').setGroup(renderGroup);
-        this.outerColorsNode = uniformArray(this._outerColors, 'color').setGroup(renderGroup);
-        this.paramsNode = uniformArray(this._params, 'vec4').setGroup(renderGroup);
-        this.params2Node = uniformArray(this._params2, 'vec4').setGroup(renderGroup);
+        this.dataNode = uniformArray(this._packed, 'vec4').setGroup(renderGroup);
         this.countNode = uniform(0, 'int').setGroup(renderGroup);
         this.updateType = NodeUpdateType.RENDER;
     }
@@ -49,11 +45,13 @@ export class ReflectionPaintNode extends LightingNode {
         this.countNode.value = count;
         for (let i = 0; i < count; i++) {
             const l = this._lights[i];
-            this._dirs[i].copy(l.direction).normalize();
-            this._colors[i].copy(l.color);
-            this._outerColors[i].copy(l.colorOuter);
-            this._params[i].set(l.radiusX, l.radiusY, l.intensity, l.edge);
-            this._params2[i].set(l.rotation, l.shape === 'rect' ? 1 : 0, 0, 0);
+            const base = i * 4;
+            const d = l.direction;
+            const len = Math.hypot(d.x, d.y, d.z) || 1;
+            this._packed[base + 0].set(d.x / len, d.y / len, d.z / len, l.intensity);
+            this._packed[base + 1].set(l.color.r, l.color.g, l.color.b, l.radiusX);
+            this._packed[base + 2].set(l.colorOuter.r, l.colorOuter.g, l.colorOuter.b, l.radiusY);
+            this._packed[base + 3].set(l.edge, l.rotation, l.shape === 'rect' ? 1 : 0, 0);
         }
     }
 
@@ -64,11 +62,21 @@ export class ReflectionPaintNode extends LightingNode {
 
         const painted = vec3(0).toVar('reflPaintRadiance');
         Loop(this.countNode, ({ i }) => {
-            const dir = this.dirsNode.element(i).normalize();
-            const col = this.colorsNode.element(i);
-            const outerCol = this.outerColorsNode.element(i);
-            const p = this.paramsNode.element(i);   // x=radiusX, y=radiusY, z=intensity, w=edge
-            const p2 = this.params2Node.element(i); // x=rotation, y=shape
+            const base = i.mul(int(4));
+            const d0 = this.dataNode.element(base);                  // dir.xyz, intensity
+            const d1 = this.dataNode.element(base.add(int(1)));      // color.rgb, radiusX
+            const d2 = this.dataNode.element(base.add(int(2)));      // outerColor.rgb, radiusY
+            const d3 = this.dataNode.element(base.add(int(3)));      // edge, rotation, shape, _
+
+            const dir = d0.xyz.normalize();
+            const intensity = d0.w;
+            const col = d1.xyz;
+            const radiusX = d1.w;
+            const outerCol = d2.xyz;
+            const radiusY = d2.w;
+            const edge = d3.x;
+            const rot = d3.y;
+            const shapeFlag = d3.z;
 
             // Build tangent frame around the light direction.
             const up = select(abs(dir.y).greaterThan(float(0.99)), vec3(1, 0, 0), vec3(0, 1, 0));
@@ -76,8 +84,8 @@ export class ReflectionPaintNode extends LightingNode {
             const rawBitangent = cross(dir, rawTangent);
 
             // Apply rotation to the tangent frame.
-            const ca = cos(p2.x);
-            const sa = sin(p2.x);
+            const ca = cos(rot);
+            const sa = sin(rot);
             const tangent = rawTangent.mul(ca).add(rawBitangent.mul(sa));
             const bitangent = rawBitangent.mul(ca).sub(rawTangent.mul(sa));
 
@@ -89,36 +97,27 @@ export class ReflectionPaintNode extends LightingNode {
 
             // Roughness-dependent minimum spread.
             const roughSpread = roughness.mul(PI).mul(float(0.25));
-            const spreadX = max(p.x, roughSpread);
-            const spreadY = max(p.y, roughSpread);
+            const spreadX = max(radiusX, roughSpread);
+            const spreadY = max(radiusY, roughSpread);
 
-            // Edge sharpness: 0 = razor sharp, 1 = very soft.
-            // edge controls the smoothstep transition width as a fraction of the radius.
-            const edgeW = clamp(p.w, float(0.001), float(1.0));
+            const edgeW = clamp(edge, float(0.001), float(1.0));
 
-            // Normalized coordinates (0 at center, 1 at boundary).
             const nx = abs(dx).div(spreadX);
             const ny = abs(dy).div(spreadY);
 
-            // Shape evaluation:
-            // Circle: radial distance
-            // Rect: max of X and Y (becomes independent axis smoothsteps)
-            const isRect = p2.y.greaterThan(float(0.5));
+            const isRect = shapeFlag.greaterThan(float(0.5));
 
-            // Circle mask
             const dist = sqrt(nx.mul(nx).add(ny.mul(ny)));
             const circleMask = smoothstep(float(1.0), float(1.0).sub(edgeW), dist);
 
-            // Rect mask
             const rectMaskX = smoothstep(float(1.0), float(1.0).sub(edgeW), nx);
             const rectMaskY = smoothstep(float(1.0), float(1.0).sub(edgeW), ny);
             const rectMask = rectMaskX.mul(rectMaskY);
 
             const mask = select(isRect, rectMask, circleMask);
 
-            // Two-color gradient: center color at mask=1, outer color at mask=0.
             const gradColor = tslMix(outerCol, col, mask);
-            painted.addAssign(gradColor.mul(mask).mul(p.z));
+            painted.addAssign(gradColor.mul(mask).mul(intensity));
         });
 
         builder.context.radiance.addAssign(painted.mul(intensityNode));

@@ -248,8 +248,20 @@ const MAX_TO_PROP = {
 const isSpecialSpotLight = (light) =>
     light.isSpotLight === true && (light.map !== null || light.colorNode !== undefined);
 
+// three.js r184 NodeMaterial.setupLights() spawns a fresh lightsNode via the factory
+// every time a material with an env LightingNode compiles (scene.environmentNode set).
+// Each instance owns its own _dataNodes → separate UBOs → per-frame setLights() from
+// renderList.finish() only reaches the scene-cached instance, leaving material-owned
+// ones frozen. Sharing _dataNodes gives every material the same UBO per light type.
+const SHARED_DATA_NODES = new Map();
+
 export default class MaxLightsNode extends DynamicLightsNode {
     static get type() { return 'MaxLightsNode'; }
+
+    constructor(options = {}) {
+        super(options);
+        this._dataNodes = SHARED_DATA_NODES;
+    }
 
     get _typeMap() {
         return {

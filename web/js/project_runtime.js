@@ -590,12 +590,18 @@ export function createProjectRuntime({ layerManager, bridge, perfHud, debugLog =
             const runtime = runtimeLayers.get(id);
             const mounted = mountedInlineLayers.has(id);
             const enabled = mounted ? !!runtime?.active : state.enabled;
+            const folder = runtime?.folder ?? state.folder ?? '';
+            const priority = Number.isFinite(runtime?.priority)
+                ? runtime.priority
+                : Number.isFinite(state.priority) ? state.priority : 100;
             out.push({
                 id,
                 name: runtime?.name || state.name || id,
-                entry: `inlines/${id}.js`,
+                entry: inlineEntryRelPath(id, folder),
                 source: 'project',
                 persisted: true,
+                folder,
+                priority,
                 enabled,
                 active: !!runtime?.active,
                 loading: !!runtime?.loading,
@@ -605,7 +611,11 @@ export function createProjectRuntime({ layerManager, bridge, perfHud, debugLog =
                 profile: runtime?.profile ?? null,
             });
         }
-        out.sort((a, b) => a.name.localeCompare(b.name));
+        out.sort((a, b) => {
+            if (a.priority !== b.priority) return a.priority - b.priority;
+            if (a.folder !== b.folder) return a.folder.localeCompare(b.folder);
+            return a.name.localeCompare(b.name);
+        });
         return out;
     }
 
@@ -722,9 +732,24 @@ export function createProjectRuntime({ layerManager, bridge, perfHud, debugLog =
         return `${baseUrl}${sep}${encodeURIComponent(id)}.js?v=${version}`;
     }
 
-    async function mountInlineLayer(id, name) {
+    function inlineEntryRelPath(id, folder) {
+        const f = folder ? `${folder.replace(/\\/g, '/').replace(/^\/+|\/+$/g, '')}/` : '';
+        return `inlines/${f}${id}.js`;
+    }
+
+    function inlineLayerUrlWithFolder(id, folder, version) {
+        if (!inlineDir) return null;
+        const baseUrl = toAssetUrl(inlineDir);
+        const sep = baseUrl.endsWith('/') ? '' : '/';
+        const f = folder ? `${folder.replace(/\\/g, '/').replace(/^\/+|\/+$/g, '').split('/').map(encodeURIComponent).join('/')}/` : '';
+        return `${baseUrl}${sep}${f}${encodeURIComponent(id)}.js?v=${version}`;
+    }
+
+    async function mountInlineLayer(id, name, meta = {}) {
         const moduleVersion = ++revision;
-        const moduleUrl = inlineLayerUrl(id, moduleVersion);
+        const folder = typeof meta.folder === 'string' ? meta.folder : '';
+        const priority = Number.isFinite(meta.priority) ? meta.priority : 100;
+        const moduleUrl = inlineLayerUrlWithFolder(id, folder, moduleVersion) || inlineLayerUrl(id, moduleVersion);
         if (!moduleUrl) throw new Error(`No inline directory configured for ${id}`);
 
         let moduleNamespace;
@@ -738,17 +763,19 @@ export function createProjectRuntime({ layerManager, bridge, perfHud, debugLog =
 
         const result = await layerManager.mount(
             id,
-            async (ctx, THREE) => factory(ctx, THREE, { layer: { id, name } }),
+            async (ctx, THREE) => factory(ctx, THREE, { layer: { id, name, folder, priority } }),
             {
                 name: name || id,
                 code: moduleUrl,
                 source: 'project',
-                entry: `inlines/${id}.js`,
+                entry: inlineEntryRelPath(id, folder),
+                folder,
+                priority,
             },
         );
         if (result?.error) throw new Error(result.error);
 
-        mountedInlineLayers.set(id, { moduleUrl });
+        mountedInlineLayers.set(id, { moduleUrl, folder, priority });
     }
 
     function unmountInlineLayer(id) {
@@ -758,22 +785,41 @@ export function createProjectRuntime({ layerManager, bridge, perfHud, debugLog =
     }
 
     bridge.on('inline_layers_state', async msg => {
-        const layers = Array.isArray(msg?.layers) ? msg.layers : [];
+        const layersRaw = Array.isArray(msg?.layers) ? msg.layers : [];
+        // Augment with folder/priority and sort. C++ scanner emits these; older builds
+        // without them fall through to ('', 100, alpha) which reproduces the pre-upgrade order.
+        const layers = layersRaw
+            .filter(l => l?.id)
+            .map((l, originalIndex) => ({
+                id: String(l.id),
+                name: l.name || l.id,
+                enabled: l.enabled !== false,
+                folder: typeof l.folder === 'string' ? l.folder : '',
+                priority: Number.isFinite(Number(l.priority)) ? Number(l.priority) : 100,
+                originalIndex,
+            }))
+            .sort((a, b) => {
+                if (a.priority !== b.priority) return a.priority - b.priority;
+                if (a.folder !== b.folder) return a.folder.localeCompare(b.folder);
+                return a.name.localeCompare(b.name);
+            });
+
         debugLog('[ProjectRuntime] inline_layers_state', {
             inlineDir,
             layerCount: layers.length,
-            layers: layers.map(l => ({ id: l.id, enabled: l.enabled })),
+            layers: layers.map(l => ({ id: l.id, enabled: l.enabled, folder: l.folder, priority: l.priority })),
         });
 
         inlineLayerState.clear();
         const seen = new Set();
         for (const layer of layers) {
-            if (!layer?.id) continue;
             seen.add(layer.id);
             inlineLayerState.set(layer.id, {
                 id: layer.id,
-                name: layer.name || layer.id,
-                enabled: layer.enabled !== false,
+                name: layer.name,
+                enabled: layer.enabled,
+                folder: layer.folder,
+                priority: layer.priority,
             });
         }
 
@@ -782,23 +828,33 @@ export function createProjectRuntime({ layerManager, bridge, perfHud, debugLog =
             if (!seen.has(id)) unmountInlineLayer(id);
         }
 
-        // Mount whatever's new. Skip layers reported as disabled — the file
-        // is renamed to .js.disabled and the URL would 404. Re-enable
-        // happens via the rename host action which will trigger a fresh
-        // inline_layers_state with enabled=true.
+        // Mount whatever's new (in priority order). Skip disabled layers — file is
+        // renamed to .js.disabled and the URL would 404. Re-enable happens via
+        // rename host action which triggers a fresh inline_layers_state.
         for (const layer of layers) {
-            if (!layer?.id) continue;
             if (layer.enabled === false) {
                 if (mountedInlineLayers.has(layer.id)) unmountInlineLayer(layer.id);
                 continue;
             }
-            if (!mountedInlineLayers.has(layer.id)) {
+            const mounted = mountedInlineLayers.get(layer.id);
+            if (!mounted) {
                 try {
-                    await mountInlineLayer(layer.id, layer.name);
+                    await mountInlineLayer(layer.id, layer.name, { folder: layer.folder, priority: layer.priority });
                     debugLog('[ProjectRuntime] mounted inline layer', layer.id);
                 } catch (err) {
                     debugWarn('[ProjectRuntime] inline mount failed', layer.id, err);
                 }
+            } else if (mounted.folder !== layer.folder || mounted.priority !== layer.priority) {
+                // Meta changed (user moved file between folders or renamed prefix) — push
+                // onto the live layer record without a remount. Priority re-sort only
+                // matters on fresh mount order, not at steady-state.
+                layerManager.setLayerMeta?.(layer.id, {
+                    folder: layer.folder,
+                    priority: layer.priority,
+                    name: layer.name,
+                });
+                mounted.folder = layer.folder;
+                mounted.priority = layer.priority;
             }
             // Apply the enabled flag as a runtime active state. For layers
             // already mounted, this is just a flag flip — no remount.

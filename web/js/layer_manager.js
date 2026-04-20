@@ -851,6 +851,20 @@ function createInputHelper(renderer) {
     };
 }
 
+function normalizeFolder(raw) {
+    if (typeof raw !== 'string') return '';
+    const trimmed = raw.trim().replace(/^\/+|\/+$/g, '').replace(/\\/g, '/');
+    if (!trimmed) return '';
+    const parts = trimmed.split('/').filter(p => p && p !== '.' && p !== '..');
+    return parts.join('/');
+}
+
+function normalizePriority(raw) {
+    const n = Number(raw);
+    if (!Number.isFinite(n)) return 100;
+    return n;
+}
+
 export function createLayerManager({
     scene,
     camera,
@@ -865,6 +879,7 @@ export function createLayerManager({
     controls = null,
     getCamera = null,
     onCameraModeChange = null,
+    getGLTFSystem = () => null,
     debugLog = () => {},
     debugWarn = () => {},
 }) {
@@ -966,6 +981,40 @@ export function createLayerManager({
 
     let dt = 0;
     let elapsed = 0;
+
+    // Inter-layer pub/sub (ctx.bus) — one map shared by all layers of this manager.
+    // Handlers are stored with their owning layerId so we can force-remove on layer dispose
+    // (the per-layer `disposers` array is the primary cleanup path; this is belt-and-braces).
+    const busHandlers = new Map(); // event -> Set<{ handler, layerId }>
+    function busEmitInternal(event, payload) {
+        const set = busHandlers.get(event);
+        if (!set || set.size === 0) return;
+        for (const rec of [...set]) {
+            try {
+                rec.handler(payload);
+            } catch (err) {
+                console.error(`[LayerManager bus:${event}]`, err);
+            }
+        }
+    }
+
+    // Named service registry (ctx.services) — long-lived handles shared across layers.
+    const serviceRegistry = new Map(); // name -> { value, layerId }
+    const servicePending = new Map();  // name -> Set<{ cb, layerId }>
+    function serviceFireWaiters(name, value) {
+        const set = servicePending.get(name);
+        if (!set || set.size === 0) return;
+        const waiters = [...set];
+        servicePending.delete(name);
+        for (const rec of waiters) {
+            try {
+                rec.cb(value);
+            } catch (err) {
+                console.error(`[LayerManager services.onProvide:${name}]`, err);
+            }
+        }
+    }
+
     const runtimeTransformOverrides = new Map();
     let runtimeTransformReapplyNeeded = false;
     // Map<handle, Map<slotName, { texture, layerId }>> — survives sync
@@ -1375,6 +1424,8 @@ export function createLayerManager({
             source: layer.source,
             entry: layer.entry,
             code: layer.code,
+            folder: layer.folder || '',
+            priority: Number.isFinite(layer.priority) ? layer.priority : 100,
             active: layer.active,
             loading: layer.loading,
             error: layer.error,
@@ -1485,6 +1536,25 @@ export function createLayerManager({
             THREE,
         });
 
+        const gltfFacade = freezePlainObject({
+            get(handle) {
+                return getGLTFSystem()?.getEntry?.(handle) ?? null;
+            },
+            findByName(name) {
+                return getGLTFSystem()?.findByName?.(name) ?? null;
+            },
+            list() {
+                return Object.freeze([...(getGLTFSystem()?.list?.() ?? [])]);
+            },
+            onReady(handle, cb) {
+                const sys = getGLTFSystem();
+                if (!sys?.onReady) return () => {};
+                const dispose = sys.onReady(handle, cb);
+                if (typeof dispose === 'function') layer.disposers.push(dispose);
+                return dispose;
+            },
+        });
+
         const runtimeFacade = freezePlainObject({
             get id() { return layer.id; },
             get name() { return layer.name; },
@@ -1496,6 +1566,7 @@ export function createLayerManager({
             gravity: Object.freeze(new THREE.Vector3(0, -980, 0)),
             space,
             units: 'cm',
+            gltf: gltfFacade,
             log: (...args) => debugLog(`[Layer:${layer.id}]`, ...args),
             warn: (...args) => debugWarn(`[Layer:${layer.id}]`, ...args),
             error: (...args) => console.error(`[Layer:${layer.id}]`, ...args),
@@ -1516,6 +1587,96 @@ export function createLayerManager({
             },
             getState() {
                 return projectControl?.getState?.() ?? null;
+            },
+        });
+
+        const busFacade = freezePlainObject({
+            on(event, handler) {
+                if (typeof event !== 'string' || !event) throw new TypeError('bus.on: event must be a non-empty string');
+                if (typeof handler !== 'function') throw new TypeError('bus.on: handler must be a function');
+                let set = busHandlers.get(event);
+                if (!set) { set = new Set(); busHandlers.set(event, set); }
+                const rec = { handler, layerId: layer.id };
+                set.add(rec);
+                const dispose = () => {
+                    set.delete(rec);
+                    if (set.size === 0) busHandlers.delete(event);
+                };
+                layer.disposers.push(dispose);
+                return dispose;
+            },
+            once(event, handler) {
+                if (typeof handler !== 'function') throw new TypeError('bus.once: handler must be a function');
+                let dispose = null;
+                dispose = busFacade.on(event, (payload) => {
+                    dispose?.();
+                    try { handler(payload); } catch (err) { console.error(`[LayerManager bus.once:${event}]`, err); }
+                });
+                return dispose;
+            },
+            off(event, handler) {
+                const set = busHandlers.get(event);
+                if (!set) return false;
+                for (const rec of set) {
+                    if (rec.handler === handler) {
+                        set.delete(rec);
+                        if (set.size === 0) busHandlers.delete(event);
+                        return true;
+                    }
+                }
+                return false;
+            },
+            emit: busEmitInternal,
+        });
+
+        const servicesFacade = freezePlainObject({
+            provide(name, value) {
+                if (typeof name !== 'string' || !name) throw new TypeError('services.provide: name must be a non-empty string');
+                const existing = serviceRegistry.get(name);
+                if (existing) {
+                    throw new Error(`Service "${name}" already provided by layer "${existing.layerId}" (layer "${layer.id}" conflict)`);
+                }
+                serviceRegistry.set(name, { value, layerId: layer.id });
+                serviceFireWaiters(name, value);
+                const dispose = () => {
+                    const cur = serviceRegistry.get(name);
+                    if (cur && cur.layerId === layer.id) serviceRegistry.delete(name);
+                };
+                layer.disposers.push(dispose);
+                return value;
+            },
+            get(name) {
+                const entry = serviceRegistry.get(name);
+                return entry ? entry.value : null;
+            },
+            require(name) {
+                const entry = serviceRegistry.get(name);
+                if (!entry) throw new Error(`Service "${name}" is not available`);
+                return entry.value;
+            },
+            onProvide(name, cb) {
+                if (typeof cb !== 'function') throw new TypeError('services.onProvide: cb must be a function');
+                const existing = serviceRegistry.get(name);
+                if (existing) {
+                    try { cb(existing.value); } catch (err) { console.error(`[LayerManager services.onProvide:${name}]`, err); }
+                    return () => {};
+                }
+                let set = servicePending.get(name);
+                if (!set) { set = new Set(); servicePending.set(name, set); }
+                const rec = { cb, layerId: layer.id };
+                set.add(rec);
+                const dispose = () => {
+                    const cur = servicePending.get(name);
+                    if (cur) {
+                        cur.delete(rec);
+                        if (cur.size === 0) servicePending.delete(name);
+                    }
+                };
+                layer.disposers.push(dispose);
+                return dispose;
+            },
+            has(name) {
+                return serviceRegistry.has(name);
             },
         });
 
@@ -1575,6 +1736,12 @@ export function createLayerManager({
             dispose(resource) {
                 disposeOwnedResource(resource);
             },
+            traverse(cb) {
+                if (typeof cb === 'function') layer.group.traverse(cb);
+            },
+            traverseScene(cb) {
+                if (typeof cb === 'function' && scene) scene.traverse(cb);
+            },
         });
 
         return {
@@ -1604,6 +1771,8 @@ export function createLayerManager({
             }),
             runtime: runtimeFacade,
             project: projectFacade,
+            bus: busFacade,
+            services: servicesFacade,
             track(resource, options = {}) {
                 return jsFacade.track(resource, options);
             },
@@ -1685,6 +1854,8 @@ export function createLayerManager({
             overlayGroup,
             source: options.source || 'inline',
             entry: options.entry || '',
+            folder: normalizeFolder(options.folder),
+            priority: normalizePriority(options.priority),
             hooks: null,
             active: true,
             loading: false,
@@ -1694,6 +1865,7 @@ export function createLayerManager({
             anchors: [],
             liveMaterialClones: new Set(),
             nodeAdapters: new Map(),
+            disposers: [],
             input: null,
             profile: {
                 mountMs: 0,
@@ -1751,6 +1923,16 @@ export function createLayerManager({
             } catch (err) {
                 debugWarn(`[LayerManager] Layer "${id}" dispose error:`, err);
             }
+        }
+
+        // Auto-unsubscribe bus handlers, service provisions, and onProvide waiters
+        // registered through ctx.bus / ctx.services. Runs after hooks.dispose so layer
+        // code sees a live bus during its own teardown, then we sweep ghost handlers.
+        if (layer.disposers?.length) {
+            for (const fn of layer.disposers) {
+                try { fn(); } catch (err) { debugWarn(`[LayerManager] Layer "${id}" disposer error:`, err); }
+            }
+            layer.disposers.length = 0;
         }
 
         for (const resource of layer.tracked) {
@@ -1948,6 +2130,8 @@ export function createLayerManager({
                 id: layer.id,
                 name: layer.name,
                 source: layer.source,
+                folder: layer.folder || '',
+                priority: Number.isFinite(layer.priority) ? layer.priority : 100,
                 active: layer.active,
                 error: layer.error,
             })),
@@ -1971,6 +2155,8 @@ export function createLayerManager({
             id: layer.id,
             name: layer.name,
             code: layer.code,
+            folder: layer.folder || '',
+            priority: Number.isFinite(layer.priority) ? layer.priority : 100,
             enabled: layer.active,
         }));
     }
@@ -1994,6 +2180,31 @@ export function createLayerManager({
             if (layer.overlayGroup) layer.overlayGroup.visible = next;
             emitChange(next ? 'activated' : 'deactivated');
             return true;
+        },
+        setLayerMeta(id, meta = {}) {
+            const layer = layers.get(id);
+            if (!layer) return false;
+            let changed = false;
+            if (Object.prototype.hasOwnProperty.call(meta, 'folder')) {
+                const next = normalizeFolder(meta.folder);
+                if (layer.folder !== next) { layer.folder = next; changed = true; }
+            }
+            if (Object.prototype.hasOwnProperty.call(meta, 'priority')) {
+                const next = normalizePriority(meta.priority);
+                if (layer.priority !== next) { layer.priority = next; changed = true; }
+            }
+            if (Object.prototype.hasOwnProperty.call(meta, 'name')) {
+                const next = String(meta.name || id);
+                if (layer.name !== next) { layer.name = next; changed = true; }
+            }
+            if (changed) emitChange('meta');
+            return changed;
+        },
+        getBus() {
+            return {
+                emit: busEmitInternal,
+                has(event) { return busHandlers.has(event) && busHandlers.get(event).size > 0; },
+            };
         },
         list,
         getLayerSnapshot,

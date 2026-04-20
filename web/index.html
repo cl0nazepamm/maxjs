@@ -199,6 +199,44 @@
             background: rgba(255, 255, 255, 0.03);
             border: 1px solid rgba(255, 255, 255, 0.04);
         }
+        .layer-folder { margin-top: 4px; }
+        .layer-folder-header {
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            padding: 3px 6px;
+            font-size: 10px;
+            letter-spacing: 0.04em;
+            color: #9a9a9a;
+            text-transform: uppercase;
+            list-style: none;
+        }
+        .layer-folder-header::-webkit-details-marker { display: none; }
+        .layer-folder-header::before {
+            content: '\25B6';
+            font-size: 8px;
+            color: #6a6a6a;
+            transition: transform 0.12s ease;
+        }
+        .layer-folder[open] > .layer-folder-header::before { transform: rotate(90deg); }
+        .layer-folder-name { color: #bdbdbd; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .layer-folder-count {
+            font-size: 9px;
+            color: #8a8a8a;
+            padding: 0 4px;
+            background: rgba(255, 255, 255, 0.04);
+            border-radius: 2px;
+        }
+        .layer-folder-body { display: flex; flex-direction: column; gap: 2px; padding-left: 10px; border-left: 1px solid rgba(255, 255, 255, 0.06); margin: 2px 0 4px 6px; }
+        .layer-priority {
+            font-size: 9px;
+            color: #8a8a8a;
+            padding: 1px 4px;
+            background: rgba(255, 255, 255, 0.04);
+            border-radius: 2px;
+            font-variant-numeric: tabular-nums;
+        }
         .layer-item.error {
             border-color: rgba(255, 80, 80, 0.3);
         }
@@ -921,6 +959,11 @@
             flex-shrink: 0;
             display: block;
         }
+        .rail-btn svg.rail-btn-logo-lg {
+            width: 24px;
+            height: 24px;
+            transform: translateY(-1px);
+        }
         .rail-btn-label {
             font-size: 7px;
             line-height: 1;
@@ -997,24 +1040,23 @@
     <aside id="rightRail" aria-label="Panel controls">
         <div class="rail-group">
             <div class="rail-group-label">Scene</div>
-            <button id="btnSnapshotPanel" class="rail-btn maxonly devonly" title="Snapshot" aria-label="Snapshot">
-                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2.5 13h11a1 1 0 0 0 1-1V6a1 1 0 0 0-1-1h-1.8l-.7-1.6a1 1 0 0 0-.9-.6H6a1 1 0 0 0-.9.6L4.3 5H2.5a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1Z"/><circle cx="8" cy="9" r="2.5"/></svg>
+            <button id="btnLayersPanel" class="rail-btn maxonly devonly" title="Load logic or custom effects, supports inter layer messaging." aria-label="Layers">
+                <svg class="rail-btn-logo-lg" viewBox="0 0 157 293" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" style="fill-rule:evenodd;clip-rule:evenodd;stroke-linejoin:round;stroke-miterlimit:2">
+                    <path fill="currentColor" d="M78.041,292.681c0,0 -4.398,-33.779 -10.937,-45.784c-5.947,-10.919 -34.8,-16.618 -43.787,-18.399c-8.987,-1.781 -23.316,-1.526 -23.316,-1.526c0,0 50.071,-3.146 57.464,-11.695c8.436,-9.756 10.996,-34.004 11.844,-40.109c0.848,-6.105 4.578,-98.776 4.578,-98.776l4.155,-76.392l4.155,76.392c0,0 3.731,92.671 4.578,98.776c0.848,6.105 3.407,30.353 11.844,40.109c7.393,8.549 57.464,11.695 57.464,11.695c0,0 -37.567,2.399 -23.316,1.526c14.251,-0.873 -28.138,0.93 -43.787,18.399c-9.122,10.182 -10.937,45.784 -10.937,45.784Z"/>
+                </svg>
             </button>
-            <button id="btnLayersPanel" class="rail-btn maxonly devonly" title="Layers" aria-label="Layers">
-                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 1.5 1.5 5 8 8.5 14.5 5 8 1.5Z"/><path d="M1.5 8 8 11.5 14.5 8"/><path d="M1.5 11 8 14.5 14.5 11"/></svg>
-            </button>
-            <button id="btnCanvasPanel" class="rail-btn maxonly devonly" title="Canvas" aria-label="Canvas">
-                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="1.5" y="2.5" width="13" height="9" rx="1"/><path d="M5 13.5h6M8 11.5v2"/></svg>
+            <button id="btnCanvasPanel" class="rail-btn maxonly devonly" title="You can use Canvas to load HTML on your viewport." aria-label="Canvas">
+                <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" role="img"><path fill="currentColor" d="M1.5 0h21l-1.91 21.563L11.977 24l-8.565-2.438L1.5 0zm7.031 9.75l-.232-2.718 10.059.003.23-2.62L5.412 4.41l.698 8.01h9.126l-.326 3.426-2.91.804-2.956-.81-.188-2.11H6.248l.33 4.171L12 19.351l5.075-1.427.695-8.491h-9.108z"/></svg>
             </button>
         </div>
         <div class="rail-sep"></div>
         <div class="rail-group">
             <div class="rail-group-label">Look</div>
-            <button id="btnShaderLabPanel" class="rail-btn maxonly devonly" title="Shader Lab" aria-label="Shader Lab">
-                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m3 14 9-9M11 3l2 2"/><path d="m7 2.5.5 1 1 .5-1 .5-.5 1-.5-1-1-.5 1-.5Z"/><path d="m13 10 .3.7.7.3-.7.3-.3.7-.3-.7-.7-.3.7-.3Z"/></svg>
+            <button id="btnShaderLabPanel" class="rail-btn maxonly devonly" title="Shader Lab by basement.studio" aria-label="Shader Lab">
+                <svg viewBox="0 0 184 250" fill="currentColor" aria-hidden="true"><path d="M59.4125 135.371C59.4125 125.265 67.6033 117.074 77.7092 117.074H106.703C116.809 117.074 125 125.265 125 135.371V179.308C125 189.414 116.809 197.604 106.703 197.604H77.7092C67.6033 197.604 59.4125 189.414 59.4125 179.308V135.371ZM57.5645 202.569C57.5645 229.105 79.0754 250 105.612 250H134.758C161.703 250 183.549 228.154 183.549 201.209V112.83C183.549 85.8847 161.703 64.0385 134.758 64.0385H98.1649C76.7151 64.0385 59.2844 81.957 59.132 103.401V0H0.58252V248.78H57.5645V202.569Z"/></svg>
             </button>
             <button id="btnPostFxPanel" class="rail-btn devonly" title="Post FX" aria-label="Post FX">
-                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 2v2M3 3h2"/><path d="M12 11v2M11 12h2"/><path d="m8 5 1.2 2.8L12 9l-2.8 1.2L8 13l-1.2-2.8L4 9l2.8-1.2L8 5Z"/></svg>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2.036 12.322a1.012 1.012 0 0 1 0-.639C3.423 7.51 7.36 4.5 12 4.5c4.638 0 8.573 3.007 9.963 7.178.07.207.07.431 0 .639C20.577 16.49 16.64 19.5 12 19.5c-4.638 0-8.573-3.007-9.963-7.178Z"/><path d="M15 12a3 3 0 1 1-6 0 3 3 0 0 1 6 0Z"/></svg>
             </button>
         </div>
         <div class="rail-sep"></div>
@@ -1035,22 +1077,16 @@
             <button id="btnLightProbe" class="rail-btn active devonly" title="Light probe" aria-label="Light probe">
                 <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="8" cy="8" r="5"/><circle cx="8" cy="8" r="2"/><path d="M8 1v1.5M8 13.5V15M1 8h1.5M13.5 8H15"/></svg>
             </button>
-            <button id="btnLightHelpers" class="rail-btn devonly" title="Light helpers" aria-label="Light helpers">
-                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 12.5h4M6.5 14h3"/><path d="M4.5 8.5a4 4 0 1 1 7 0c-.5 1-1.5 1.5-1.5 3h-4c0-1.5-1-2-1.5-3Z"/></svg>
-            </button>
         </div>
         <div class="rail-sep"></div>
         <div class="rail-group">
             <div class="rail-group-label">Render</div>
             <button id="btnRenderer" class="rail-btn devonly" title="Renderer backend" aria-label="Renderer backend">
                 <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="3" width="12" height="10" rx="2"/><path d="M5 1.5v3M8 1.5v3M11 1.5v3M5 12.5v2M8 12.5v2M11 12.5v2M1.5 6h3M1.5 10h3M11.5 6h3M11.5 10h3"/></svg>
-                <span class="rail-btn-label">Renderer</span>
                 <span class="rail-btn-badge">WGPU</span>
             </button>
-            <button id="btnRenderMode" class="rail-btn devonly" title="Render mode — Studio adds light linking / per-mesh HDRI / reflection paint; Standard stays within baseline WebGPU uniform-buffer limits. Toggling reloads the page." aria-label="Render mode">
+            <button id="btnRenderMode" class="rail-btn devonly" title="Render mode — Studio adds light linking / per-mesh HDRI / reflection paint; Standard stays within baseline WebGPU uniform-buffer limits." aria-label="Render mode">
                 <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 1.5 2.5 4.5v7L8 14.5l5.5-3v-7L8 1.5Z"/><path d="M8 1.5v13M2.5 4.5 8 8l5.5-3.5"/></svg>
-                <span class="rail-btn-label">Mode</span>
-                <span class="rail-btn-badge">STD</span>
             </button>
             <button id="btnLightLink" class="rail-btn devonly" title="Light Linking" aria-label="Light Linking">
                 <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6.5 8.5a2.5 2.5 0 0 0 3.5 0l2.5-2.5a2.5 2.5 0 0 0-3.5-3.5L8 3.5"/><path d="M9.5 7.5a2.5 2.5 0 0 0-3.5 0L3.5 10a2.5 2.5 0 0 0 3.5 3.5L8 12.5"/></svg>
@@ -1058,10 +1094,9 @@
             <button id="btnReflPaint" class="rail-btn devonly" title="Reflection Paint" aria-label="Reflection Paint">
                 <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 7-5 5a2 2 0 0 1-3-3l5-5"/><path d="m14 2-5 5M12 4l2 2"/></svg>
             </button>
-            <button id="btnSwitchVR" class="rail-btn devonly" title="Switch to VR" aria-label="Switch to VR">
+            <button id="btnSwitchVR" class="rail-btn devonly" title="Switch to WebGL for XR (reload)" aria-label="XR — use WebGL backend">
                 <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="1" y="5" width="14" height="6" rx="2"/><circle cx="5" cy="8" r="1.2"/><circle cx="11" cy="8" r="1.2"/><path d="M8 6.5v3"/></svg>
                 <span class="rail-btn-label">XR</span>
-                <span class="rail-btn-badge">VR</span>
             </button>
         </div>
         <div class="rail-spacer"></div>
@@ -1077,7 +1112,16 @@
             <button id="btnRefresh" class="rail-btn maxonly devonly" title="Refresh" aria-label="Refresh">
                 <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13.5 4.5a6 6 0 1 0 1.5 4"/><path d="M14 2v3h-3"/></svg>
             </button>
+            <button id="btnLightHelpers" class="rail-btn devonly" title="Light helpers" aria-label="Light helpers">
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 12.5h4M6.5 14h3"/><path d="M4.5 8.5a4 4 0 1 1 7 0c-.5 1-1.5 1.5-1.5 3h-4c0-1.5-1-2-1.5-3Z"/></svg>
+            </button>
             <button id="btnDebug" class="rail-btn rail-btn-text" style="display:none" title="Debug">DBG</button>
+        </div>
+        <div class="rail-group">
+            <div class="rail-group-label">Snap</div>
+            <button id="btnSnapshotPanel" class="rail-btn maxonly devonly" title="Snapshot" aria-label="Snapshot">
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2.5 13h11a1 1 0 0 0 1-1V6a1 1 0 0 0-1-1h-1.8l-.7-1.6a1 1 0 0 0-.9-.6H6a1 1 0 0 0-.9.6L4.3 5H2.5a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1Z"/><circle cx="8" cy="9" r="2.5"/></svg>
+            </button>
         </div>
     </aside>
     <div class="rail-drag-handle" aria-hidden="true"></div>
@@ -1194,6 +1238,7 @@
         import { MAXJS_LAYER_SSR_EXCLUDE } from './js/render_layers.js';
         import { createMaxJSAnimationSystem } from './js/maxjs_animation.js';
         import { createMaxJSAudioSystem } from './js/maxjs_audio.js';
+        import { createMaxJSGLTFSystem } from './js/maxjs_gltf.js';
         import { createProjectRuntime } from './js/project_runtime.js';
         import { getOrCreateHTMLTexture, releaseHTMLTexture, disposeAllHTMLTextures, attachHTMLClickForwarding } from './js/html_texture.js';
         import { createCanvasPanel } from './js/canvas_panel.js';
@@ -1567,6 +1612,7 @@
         const maxInstanceHandleToBucket = new Map(); // handle -> bucketKey
         let animationSystem = null;
         let audioSystem = null;
+        let gltfSystem = null;
         const splatHandleMap = new Map();
         const splatMatrix = new THREE_STD.Matrix4();
         const splatPosition = new THREE_STD.Vector3();
@@ -4149,6 +4195,7 @@
             if (snapshot.sceneCameras) updateSceneCameraList(snapshot.sceneCameras, snapshot.lockedCamera);
             reconcileSplats(snapshot.splats ?? []);
             audioSystem?.applyAudios(snapshot.audios ?? []);
+            gltfSystem?.applyGLTFs(snapshot.gltfs ?? []);
             applyHairInstances(snapshot.hairInstances ?? []);
             applyForestInstances(snapshot.forestInstances ?? []);
             applyVolumes(snapshot.volumes ?? []);
@@ -4402,6 +4449,7 @@
             if (msg.lights) applyLightUpdates(msg.lights);
             if (msg.splats) applySplatUpdates(msg.splats);
             if (msg.audios) audioSystem?.applyAudioUpdates(msg.audios);
+            if (msg.gltfs) gltfSystem?.applyGLTFUpdates(msg.gltfs);
             if (msg.camera) applyCamera(msg.camera);
             if (visibilityChanged) {
                 // Visibility flip changes the post-pass hide list — cheap refresh.
@@ -4421,6 +4469,12 @@
         // delta's UpdateAudio command only carries transform + visibility.
         bridge.on('audio_update', msg => {
             if (Array.isArray(msg?.audios)) audioSystem?.applyAudioUpdates(msg.audios);
+        });
+
+        // Same pattern for glTF param edits (file path, rootScale, autoplay, displayName).
+        // Binary UpdateGLTF carries transform + visibility only.
+        bridge.on('gltf_update', msg => {
+            if (Array.isArray(msg?.gltfs)) gltfSystem?.applyGLTFUpdates(msg.gltfs);
         });
 
         // ── Binary Scene Handler (SharedBuffer) ──────────────
@@ -4737,6 +4791,9 @@
                 },
                 onAudio(handle, matrix, visible) {
                     audioSystem?.applyAudioTransformBinary(handle, matrix, visible);
+                },
+                onGLTF(handle, matrix, visible) {
+                    gltfSystem?.applyGLTFTransformBinary(handle, matrix, visible);
                 },
                 onTime(td) {
                     maxTimeline.onTime(td);
@@ -6421,7 +6478,21 @@
         });
 
         function syncCameraLockButtonUi() {
-            btnCam.classList.toggle('active', camLock);
+            const el = document.getElementById('btnCamLock');
+            if (!el) return;
+            el.classList.toggle('active', camLock);
+            el.title = camLock ? 'Camera lock on — orbit disabled' : 'Camera lock off — orbit enabled';
+            el.setAttribute('aria-pressed', camLock ? 'true' : 'false');
+            el.setAttribute('aria-label', camLock ? 'Camera lock on' : 'Camera lock off');
+        }
+
+        function syncEnvButtonUi() {
+            const el = document.getElementById('btnEnv');
+            if (!el) return;
+            el.classList.toggle('active', envVisible);
+            el.title = envVisible ? 'Environment background visible' : 'Environment background hidden';
+            el.setAttribute('aria-pressed', envVisible ? 'true' : 'false');
+            el.setAttribute('aria-label', envVisible ? 'Environment visible' : 'Environment hidden');
         }
 
         function applyLayerCameraMode(mode, options = {}) {
@@ -6920,7 +6991,7 @@
         const btnEnv = document.getElementById('btnEnv');
         btnEnv.onclick = () => {
             envVisible = !envVisible;
-            btnEnv.classList.toggle('active', envVisible);
+            syncEnvButtonUi();
             ssgiFx.setEnvironmentVisible(envVisible);
             if (isLocalHdriActive()) {
                 localHdriShowBg = envVisible;
@@ -6932,6 +7003,9 @@
             }
             savePostFxState();
         };
+
+        syncCameraLockButtonUi();
+        syncEnvButtonUi();
 
         const btnLightProbe = document.getElementById('btnLightProbe');
         btnLightProbe.onclick = () => {
@@ -6954,9 +7028,8 @@
             btnRenderer.classList.toggle('active', webgl);
             btnRenderer.title = `Renderer backend: ${webgl ? 'WebGL2' : 'WebGPU'}`;
             if (btnSwitchVR) {
-                setRailButtonMeta(btnSwitchVR, { badge: webgl ? 'READY' : 'VR' });
                 btnSwitchVR.classList.toggle('active', webgl);
-                btnSwitchVR.title = webgl ? 'VR backend ready (WebGL2 active)' : 'Switch to VR';
+                btnSwitchVR.title = webgl ? 'WebGL2 active — XR-ready' : 'Switch to WebGL for XR (reload)';
             }
         }
         function restartWithRendererBackend(mode, options = {}) {
@@ -6988,7 +7061,6 @@
 
         const btnRenderMode = document.getElementById('btnRenderMode');
         if (btnRenderMode) {
-            setRailButtonMeta(btnRenderMode, { badge: isStudioMode ? 'STU' : 'STD' });
             btnRenderMode.classList.toggle('active', isStudioMode);
             btnRenderMode.title = `Render mode: ${isStudioMode ? 'Studio' : 'Standard'} — Studio adds light linking / per-mesh HDRI / reflection paint; Standard stays within baseline WebGPU uniform-buffer limits. Toggling reloads the page.`;
             btnRenderMode.addEventListener('click', () => {
@@ -7253,26 +7325,56 @@
                 : !projectReady
                     ? `<div class="layers-empty">This scene has no MaxJS project yet. Create scene-local runtime files next to the <code>.max</code> file.<div style="margin-top:10px"><button id="layersReleaseBtn">Release Project Manifest</button></div></div>`
                     : '<div class="layers-empty">No layers yet. Scene-local project files live in <code>project.maxjs.json</code> and <code>inlines/</code>.</div>';
+
+            const renderLayerItem = (l) => `
+                <div class="layer-item${l.error ? ' error' : ''}${!l.active ? ' inactive' : ''}">
+                    <div class="layer-main">
+                        <div class="layer-meta">
+                            <span class="layer-name" title="${l.name}">${l.name}</span>
+                            ${Number.isFinite(l.priority) && l.priority !== 100 ? `<span class="layer-priority" title="Load priority (lower = earlier)">${l.priority}</span>` : ''}
+                            <span class="layer-source ${l.source === 'project' ? 'project' : 'inline'}">${l.source}</span>
+                            <span class="layer-status ${getLayerStatus(l).className}">${getLayerStatus(l).label}</span>
+                        </div>
+                        <div class="layer-detail" title="${getLayerDetails(l)}">${getLayerDetails(l)}</div>
+                    </div>
+                    <div class="layer-actions">
+                        ${l.source === 'project' || l.persisted !== false
+                            ? `<button class="layer-action layer-toggle" data-layer-toggle="${l.id}">${l.enabled === false ? 'Enable' : 'Disable'}</button>`
+                            : ''
+                        }
+                    </div>
+                </div>`;
+
+            // Group by folder. Root ('') renders flat at top; named folders render as
+            // <details> collapsibles below. Collapse state persists in localStorage.
+            const collapseKey = 'maxjs.layers.folderCollapse';
+            let collapseState = {};
+            try { collapseState = JSON.parse(localStorage.getItem(collapseKey) || '{}') || {}; } catch {}
+
+            const rootLayers = [];
+            const byFolder = new Map();
+            for (const l of layers) {
+                const f = typeof l.folder === 'string' ? l.folder : '';
+                if (!f) { rootLayers.push(l); continue; }
+                let set = byFolder.get(f);
+                if (!set) { set = []; byFolder.set(f, set); }
+                set.push(l);
+            }
+            const folders = [...byFolder.keys()].sort();
+
             const itemsHtml = layers.length === 0
                 ? emptyHtml
-                : layers.map(l => `
-                    <div class="layer-item${l.error ? ' error' : ''}${!l.active ? ' inactive' : ''}">
-                        <div class="layer-main">
-                            <div class="layer-meta">
-                                <span class="layer-name" title="${l.name}">${l.name}</span>
-                                <span class="layer-source ${l.source === 'project' ? 'project' : 'inline'}">${l.source}</span>
-                                <span class="layer-status ${getLayerStatus(l).className}">${getLayerStatus(l).label}</span>
-                            </div>
-                            <div class="layer-detail" title="${getLayerDetails(l)}">${getLayerDetails(l)}</div>
-                        </div>
-                        <div class="layer-actions">
-                            ${l.source === 'project' || l.persisted !== false
-                                ? `<button class="layer-action layer-toggle" data-layer-toggle="${l.id}">${l.enabled === false ? 'Enable' : 'Disable'}</button>`
-                                : ''
-                            }
-                        </div>
-                    </div>
-                `).join('');
+                : [
+                    ...rootLayers.map(renderLayerItem),
+                    ...folders.map(folder => {
+                        const items = byFolder.get(folder).map(renderLayerItem).join('');
+                        const isOpen = collapseState[folder] !== false;
+                        return `<details class="layer-folder"${isOpen ? ' open' : ''} data-folder="${folder}">
+                            <summary class="layer-folder-header"><span class="layer-folder-name">${folder}</span><span class="layer-folder-count">${byFolder.get(folder).length}</span></summary>
+                            <div class="layer-folder-body">${items}</div>
+                        </details>`;
+                    }),
+                ].join('');
 
             layersPanel.innerHTML = `
                 <div class="sidepanel-header">
@@ -7302,6 +7404,15 @@
                 btn.addEventListener('click', () => {
                     const layer = layers.find(item => item.id === btn.dataset.layerRemove);
                     if (layer) void handleLayerRemove(layer);
+                });
+            });
+            layersPanel.querySelectorAll('details[data-folder]').forEach(el => {
+                el.addEventListener('toggle', () => {
+                    const folder = el.dataset.folder;
+                    let state = {};
+                    try { state = JSON.parse(localStorage.getItem(collapseKey) || '{}') || {}; } catch {}
+                    state[folder] = el.open;
+                    try { localStorage.setItem(collapseKey, JSON.stringify(state)); } catch {}
                 });
             });
         }
@@ -8596,8 +8707,7 @@
                 if (typeof saved.camLock === 'boolean') {
                     camLock = saved.camLock;
                     controls.enabled = !camLock;
-                    btnCam.textContent = `Cam Lock: ${camLock ? 'ON' : 'OFF'}`;
-                    btnCam.classList.toggle('active', camLock);
+                    syncCameraLockButtonUi();
                 }
                 if (typeof saved.lightProbeEnabled === 'boolean') {
                     lightProbeEnabled = saved.lightProbeEnabled;
@@ -8645,8 +8755,7 @@
                 }
                 localHdriShowBg = envVisible;
 
-                btnEnv.textContent = `Env: ${envVisible ? 'ON' : 'OFF'}`;
-                btnEnv.classList.toggle('active', envVisible);
+                syncEnvButtonUi();
                 ssgiFx.setEnvironmentVisible(envVisible);
 
                 const fx = saved.fx;
@@ -9177,6 +9286,7 @@
             controls,
             getCamera: () => camera,
             onCameraModeChange: applyLayerCameraMode,
+            getGLTFSystem: () => gltfSystem,
             debugLog: maxjsDebugLog,
             debugWarn: maxjsDebugWarn,
         });
@@ -9197,6 +9307,12 @@
             parent: maxBasisRoot,
             getActiveCamera: () => renderer.xr?.isPresenting ? renderer.xr.getCamera(camera) : camera,
         });
+        gltfSystem = createMaxJSGLTFSystem({
+            THREE,
+            parent: maxBasisRoot,
+            getBus: () => layerManager?.getBus?.(),
+            debugWarn: maxjsDebugWarn,
+        });
         layerManager.subscribe?.(() => {
             animationSystem.invalidateTargets();
             // Layer mutations can add/remove meshes — cheap scene refresh.
@@ -9213,6 +9329,7 @@
         window.maxJS.animation = animationSystem;
         window.maxJS.time = maxTimeline;
         window.maxJS.audio = audioSystem;
+        window.maxJS.gltf = gltfSystem;
         _layerManagerRef = layerManager;
         _projectRuntimeRef = projectRuntime;
         attachLayerPanelSubscriptions();
@@ -9603,8 +9720,7 @@
                 ssgiFx.setOpaqueBackdropEnabled(savedRenderToImageState.opaqueBackdropEnabled);
                 animationSystem?.restorePlaybackState?.(savedRenderToImageState.playbackState);
                 savedRenderToImageState = null;
-                btnEnv.textContent = `Env: ${envVisible ? 'ON' : 'OFF'}`;
-                btnEnv.classList.toggle('active', envVisible);
+                syncEnvButtonUi();
                 if (isLocalHdriActive()) {
                     applyLocalHDRIToScene();
                 } else {

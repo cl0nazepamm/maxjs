@@ -21,6 +21,7 @@ enum class CommandType : std::uint16_t {
     UpdateSplat = 9,
     UpdateAudio = 10,
     UpdateTime = 11,
+    UpdateGLTF = 12,
 };
 
 class DeltaFrameBuilder {
@@ -59,6 +60,7 @@ public:
     void UpdateLight(std::uint32_t handle, const LightData& data);
     void UpdateSplat(std::uint32_t handle, const float* matrix16, bool visible);
     void UpdateAudio(std::uint32_t handle, const float* matrix16, bool visible);
+    void UpdateGLTF(std::uint32_t handle, const float* matrix16, bool visible);
     // Max → JS time oracle. ticks is Max TimeValue (1/4800s). tpf is ticks per
     // frame (GetTicksPerFrame()). stateFlags: bit 0 = playing, bits 1-7 reserved.
     void UpdateTime(std::int32_t ticks, std::int32_t tpf, std::uint8_t stateFlags);

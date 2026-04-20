@@ -38,6 +38,7 @@
 #include "threejs_fog.h"
 #include "threejs_sky.h"
 #include "threejs_deform.h"
+#include "threejs_gltf.h"
 #include <iskin.h>
 #include <imorpher.h>
 
@@ -313,6 +314,30 @@ static bool TryParseInlineLayerFileName(const std::wstring& fileName, std::wstri
         return !id.empty();
     }
     return false;
+}
+
+// Parse leading `NN_` priority prefix from an inline layer id.
+// "10_gun" → priority=10, displayNameOut="gun"
+// "gun"    → priority=100, displayNameOut="gun"
+// Keeps the raw id (with prefix) as the stable identity so renaming the prefix
+// is treated as a remount, not a mutation. Display name is what artists read in the UI.
+static int ParseInlinePriorityPrefix(const std::wstring& id, std::wstring& displayNameOut) {
+    size_t pos = 0;
+    while (pos < id.size() && iswdigit(id[pos])) ++pos;
+    if (pos > 0 && pos < id.size() && id[pos] == L'_') {
+        int priority = 0;
+        bool ok = true;
+        for (size_t i = 0; i < pos; ++i) {
+            priority = priority * 10 + (id[i] - L'0');
+            if (priority > 1000000) { ok = false; break; }
+        }
+        if (ok) {
+            displayNameOut = id.substr(pos + 1);
+            if (!displayNameOut.empty()) return priority;
+        }
+    }
+    displayNameOut = id;
+    return 100;
 }
 
 static std::wstring NormalizeWindowsPathForCompare(std::wstring path) {
@@ -5710,6 +5735,7 @@ public:
     std::unordered_set<ULONG> lightHandles_;
     std::unordered_set<ULONG> splatHandles_;
     std::unordered_set<ULONG> audioHandles_;
+    std::unordered_set<ULONG> gltfHandles_;
     std::unordered_set<ULONG> hairHandles_;
     // Meshes with a modifier stack whose output can change between frames
     // independent of transform events (Path Deform, Skin, Bend, FFD, etc.).
@@ -5724,6 +5750,7 @@ public:
     std::unordered_map<ULONG, uint64_t> lightHashMap_; // node handle → light state hash
     std::unordered_map<ULONG, uint64_t> splatHashMap_; // node handle → splat source state hash
     std::unordered_map<ULONG, uint64_t> audioHashMap_; // node handle → audio source state hash
+    std::unordered_map<ULONG, uint64_t> gltfHashMap_;  // node handle → gltf source state hash
     std::unordered_map<ULONG, uint64_t> geoHashMap_;   // node handle → geometry topology hash
     std::unordered_map<ULONG, std::vector<MatGroup>> groupCache_; // cached material groups per node
     std::unordered_map<ULONG, uint64_t> propHashMap_;  // node handle → object properties hash
@@ -5794,47 +5821,85 @@ public:
         return GetInlineLayerDir();
     }
 
+    struct InlineLayerScanEntry {
+        std::wstring id;           // raw filename (sans extension) — stable identity, incl. NN_ prefix
+        std::wstring displayName;  // NN_ prefix stripped
+        std::wstring folder;       // forward-slash path relative to inlines/, empty for top-level
+        int priority;              // 100 default, from NN_ prefix
+        bool enabled;
+    };
+
+    static void ScanInlineLayersRecursive(const std::wstring& rootDir,
+                                          const std::wstring& subPath,
+                                          std::vector<InlineLayerScanEntry>& out) {
+        const std::wstring dir = rootDir + subPath;
+        if (!DirectoryExists(dir)) return;
+        const std::wstring pattern = dir + L"*";
+        WIN32_FIND_DATAW fd = {};
+        HANDLE hFind = FindFirstFileW(pattern.c_str(), &fd);
+        if (hFind == INVALID_HANDLE_VALUE) return;
+        do {
+            if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                const std::wstring nextSub = subPath + fd.cFileName + L"\\";
+                ScanInlineLayersRecursive(rootDir, nextSub, out);
+                continue;
+            }
+
+            std::wstring id;
+            bool enabled = false;
+            if (!TryParseInlineLayerFileName(fd.cFileName, id, enabled)) continue;
+
+            InlineLayerScanEntry entry;
+            entry.id = id;
+            entry.priority = ParseInlinePriorityPrefix(id, entry.displayName);
+            entry.enabled = enabled;
+
+            std::wstring folder = subPath;
+            std::replace(folder.begin(), folder.end(), L'\\', L'/');
+            while (!folder.empty() && folder.back() == L'/') folder.pop_back();
+            while (!folder.empty() && folder.front() == L'/') folder.erase(0, 1);
+            entry.folder = folder;
+
+            out.push_back(std::move(entry));
+        } while (FindNextFileW(hFind, &fd));
+        FindClose(hFind);
+    }
+
     void SendInlineLayersState(bool force = false) {
         if (!webview_ || !jsReady_) return;
 
         const std::wstring dir = GetInlineHotLayerDir();
-        std::vector<std::pair<std::wstring, bool>> layers;
-
-        if (!dir.empty() && DirectoryExists(dir)) {
-            const std::wstring pattern = dir + L"*";
-            WIN32_FIND_DATAW fd = {};
-            HANDLE hFind = FindFirstFileW(pattern.c_str(), &fd);
-            if (hFind != INVALID_HANDLE_VALUE) {
-                do {
-                    if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-
-                    std::wstring id;
-                    bool enabled = false;
-                    if (!TryParseInlineLayerFileName(fd.cFileName, id, enabled)) continue;
-                    layers.emplace_back(id, enabled);
-                } while (FindNextFileW(hFind, &fd));
-                FindClose(hFind);
-            }
+        std::vector<InlineLayerScanEntry> layers;
+        if (!dir.empty()) {
+            ScanInlineLayersRecursive(dir, L"", layers);
         }
 
-        std::sort(layers.begin(), layers.end(), [](const auto& a, const auto& b) {
-            if (a.first == b.first) return a.second > b.second;
-            return a.first < b.first;
+        // Stable sort: enabled state key so a .js / .js.disabled pair collapses
+        // to the enabled variant (matches pre-recursion behavior). Then folder,
+        // priority, id for deterministic output; JS re-sorts by priority on mount.
+        std::sort(layers.begin(), layers.end(), [](const InlineLayerScanEntry& a, const InlineLayerScanEntry& b) {
+            if (a.folder != b.folder) return a.folder < b.folder;
+            if (a.id != b.id) return a.id < b.id;
+            return a.enabled > b.enabled;
         });
 
         std::wostringstream ss;
         ss << L"{\"type\":\"inline_layers_state\",\"layers\":[";
         bool first = true;
-        std::wstring lastId;
+        std::wstring lastKey;
         for (const auto& layer : layers) {
-            if (!lastId.empty() && layer.first == lastId) continue;
-            lastId = layer.first;
+            const std::wstring key = layer.folder + L"/" + layer.id;
+            if (!lastKey.empty() && key == lastKey) continue;
+            lastKey = key;
 
             if (!first) ss << L',';
             first = false;
-            ss << L"{\"id\":\"" << EscapeJson(layer.first.c_str())
-               << L"\",\"name\":\"" << EscapeJson(layer.first.c_str())
-               << L"\",\"enabled\":" << (layer.second ? L"true" : L"false") << L'}';
+            ss << L"{\"id\":\"" << EscapeJson(layer.id.c_str())
+               << L"\",\"name\":\"" << EscapeJson(layer.displayName.c_str())
+               << L"\",\"folder\":\"" << EscapeJson(layer.folder.c_str())
+               << L"\",\"priority\":" << layer.priority
+               << L",\"enabled\":" << (layer.enabled ? L"true" : L"false") << L'}';
         }
         ss << L"]}";
 
@@ -6442,6 +6507,7 @@ public:
         bool includeLights = true;
         bool includeSplats = true;
         bool includeAudios = true;
+        bool includeGLTFs = true;
         bool includeInstances = true;
         bool includeDebugPayload = false;
         bool includeSnapshotUi = true;
@@ -8127,6 +8193,10 @@ public:
             ss << L",";
             WriteAudiosJson(ss, ip, t, true, false, false);
         }
+        if (options.includeGLTFs) {
+            ss << L",";
+            WriteGLTFsJson(ss, ip, t, true, false, false);
+        }
         if (options.includeAnimations) {
             WriteSnapshotAnimationsJson(
                 ss, nodes, ip, t, options, outAnimBinary, skinRigMeshHandles, lockedCameraHandle_);
@@ -8388,6 +8458,7 @@ public:
         lightHandles_.clear();
         splatHandles_.clear();
         audioHandles_.clear();
+        gltfHandles_.clear();
         hairHandles_.clear();
         deformHandles_.clear();
         fastDirtyHandles_.clear();
@@ -8397,6 +8468,7 @@ public:
         lightHashMap_.clear();
         splatHashMap_.clear();
         audioHashMap_.clear();
+        gltfHashMap_.clear();
         propHashMap_.clear();
         geoHashMap_.clear();
         jsmodStateMap_.clear();
@@ -8464,16 +8536,44 @@ public:
         }
     }
 
+    // Locate the directory (with trailing backslash) that contains the inline layer file
+    // matching `id` (either `.js` or `.js.disabled`). Handles nested folders. Returns
+    // empty string if not found.
+    static std::wstring FindInlineLayerFileDir(const std::wstring& rootDir, const std::wstring& id) {
+        if (!DirectoryExists(rootDir)) return {};
+        const std::wstring enabledName = GetInlineLayerFileName(id, true);
+        const std::wstring disabledName = GetInlineLayerFileName(id, false);
+        if (FileExists(rootDir + enabledName) || FileExists(rootDir + disabledName)) return rootDir;
+
+        const std::wstring pattern = rootDir + L"*";
+        WIN32_FIND_DATAW fd = {};
+        HANDLE hFind = FindFirstFileW(pattern.c_str(), &fd);
+        if (hFind == INVALID_HANDLE_VALUE) return {};
+        std::wstring found;
+        do {
+            if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
+            if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0) continue;
+            const std::wstring sub = rootDir + fd.cFileName + L"\\";
+            std::wstring hit = FindInlineLayerFileDir(sub, id);
+            if (!hit.empty()) { found = hit; break; }
+        } while (FindNextFileW(hFind, &fd));
+        FindClose(hFind);
+        return found;
+    }
+
     bool RemoveInlineLayerFile(const std::wstring& id, std::wstring& error) {
-        const std::wstring dir = GetInlineHotLayerDir();
-        if (dir.empty() || !DirectoryExists(dir)) {
+        const std::wstring rootDir = GetInlineHotLayerDir();
+        if (rootDir.empty() || !DirectoryExists(rootDir)) {
             error = L"Scene-local inline folder is not available";
             return false;
         }
-        const std::wstring enabledFileName = GetInlineLayerFileName(id, true);
-        const std::wstring disabledFileName = GetInlineLayerFileName(id, false);
-        const std::wstring enabledPath = dir + enabledFileName;
-        const std::wstring disabledPath = dir + disabledFileName;
+        const std::wstring dir = FindInlineLayerFileDir(rootDir, id);
+        if (dir.empty()) {
+            error = L"Inline layer file not found";
+            return false;
+        }
+        const std::wstring enabledPath = dir + GetInlineLayerFileName(id, true);
+        const std::wstring disabledPath = dir + GetInlineLayerFileName(id, false);
 
         bool found = false;
         if (FileExists(enabledPath)) {
@@ -8500,9 +8600,14 @@ public:
     }
 
     bool SetInlineLayerEnabled(const std::wstring& id, bool enabled, std::wstring& error) {
-        const std::wstring dir = GetInlineHotLayerDir();
-        if (dir.empty() || !DirectoryExists(dir)) {
+        const std::wstring rootDir = GetInlineHotLayerDir();
+        if (rootDir.empty() || !DirectoryExists(rootDir)) {
             error = L"Scene-local inline folder is not available";
+            return false;
+        }
+        const std::wstring dir = FindInlineLayerFileDir(rootDir, id);
+        if (dir.empty()) {
+            error = L"Inline layer file not found";
             return false;
         }
         const std::wstring enabledFileName = GetInlineLayerFileName(id, true);
@@ -8654,12 +8759,13 @@ public:
             || lightHandles_.find(handle) != lightHandles_.end()
             || splatHandles_.find(handle) != splatHandles_.end()
             || audioHandles_.find(handle) != audioHandles_.end()
+            || gltfHandles_.find(handle) != gltfHandles_.end()
             || hairHandles_.find(handle) != hairHandles_.end();
     }
 
     bool HasTrackedNodes() const {
         return !geomHandles_.empty() || !lightHandles_.empty() || !splatHandles_.empty()
-            || !audioHandles_.empty() || !hairHandles_.empty();
+            || !audioHandles_.empty() || !gltfHandles_.empty() || !hairHandles_.empty();
     }
 
     // Debounced dirty: coalesces rapid-fire notifications (e.g. clone) into one full sync
@@ -8789,6 +8895,7 @@ public:
                     lightHandles_.find(selH) == lightHandles_.end() &&
                     splatHandles_.find(selH) == splatHandles_.end() &&
                     audioHandles_.find(selH) == audioHandles_.end() &&
+                    gltfHandles_.find(selH) == gltfHandles_.end() &&
                     hairHandles_.find(selH) == hairHandles_.end()) {
                     // Something non-renderable is selected — assume it's a bone
                     // or controller driving the skin, and skip the hash.
@@ -9083,6 +9190,7 @@ public:
         if (!os.obj) return false;
         if (IsThreeJSSplatClassID(os.obj->ClassID())) return true;
         if (IsThreeJSAudioClassID(os.obj->ClassID())) return true;
+        if (IsThreeJSGLTFClassID(os.obj->ClassID())) return true;
 
         const SClass_ID superClass = os.obj->SuperClassID();
         return superClass == GEOMOBJECT_CLASS_ID || superClass == LIGHT_CLASS_ID
@@ -9293,6 +9401,32 @@ public:
         if (changed) MarkInteractiveActivity();
     }
 
+    void MarkTrackedGLTFTransformsDirty() {
+        if (gltfHandles_.empty()) return;
+
+        Interface* ip = GetCOREInterface();
+        if (!ip) return;
+
+        TimeValue t = ip->GetTime();
+        bool changed = false;
+
+        for (ULONG handle : gltfHandles_) {
+            INode* node = ip->GetINodeByHandle(handle);
+            if (!node) continue;
+
+            float xform[16];
+            GetTransform16(node, t, xform);
+
+            auto it = lastSentTransforms_.find(handle);
+            if (it == lastSentTransforms_.end() || !TransformEquals16(xform, it->second.data())) {
+                if (fastDirtyHandles_.insert(handle).second) changed = true;
+            }
+        }
+
+        if (changed) QueueFastFlush();
+        if (changed) MarkInteractiveActivity();
+    }
+
     void MarkVisibilityNodesDirty(const NodeEventNamespace::NodeKeyTab& nodes) {
         Interface* ip = GetCOREInterface();
         const TimeValue t = ip ? ip->GetTime() : 0;
@@ -9336,6 +9470,7 @@ public:
         fastDirtyHandles_.insert(lightHandles_.begin(), lightHandles_.end());
         fastDirtyHandles_.insert(splatHandles_.begin(), splatHandles_.end());
         fastDirtyHandles_.insert(audioHandles_.begin(), audioHandles_.end());
+        fastDirtyHandles_.insert(gltfHandles_.begin(), gltfHandles_.end());
         fastDirtyHandles_.insert(hairHandles_.begin(), hairHandles_.end());
         QueueFastFlush();
     }
@@ -9364,6 +9499,7 @@ public:
         for (ULONG handle : lightHandles_) markIfTransformChanged(handle);
         for (ULONG handle : splatHandles_) markIfTransformChanged(handle);
         for (ULONG handle : audioHandles_) markIfTransformChanged(handle);
+        for (ULONG handle : gltfHandles_) markIfTransformChanged(handle);
         for (ULONG handle : hairHandles_) markIfTransformChanged(handle);
 
         if (changed) {
@@ -9525,6 +9661,7 @@ public:
             ExtractJsonBool(msg, L"includeLights", options.includeLights);
             ExtractJsonBool(msg, L"includeSplats", options.includeSplats);
             ExtractJsonBool(msg, L"includeAudios", options.includeAudios);
+            ExtractJsonBool(msg, L"includeGLTFs", options.includeGLTFs);
             ExtractJsonBool(msg, L"includeInstances", options.includeInstances);
             ExtractJsonBool(msg, L"includeDebugPayload", options.includeDebugPayload);
             ExtractJsonBool(msg, L"includeSnapshotUi", options.includeSnapshotUi);
@@ -9624,9 +9761,11 @@ public:
             lightHandles_.clear();
             splatHandles_.clear();
             audioHandles_.clear();
+            gltfHandles_.clear();
         hairHandles_.clear();
         deformHandles_.clear();
             audioHashMap_.clear();
+            gltfHashMap_.clear();
             geoScanCursor_ = 0;
             skinnedControlIdxCache_.clear();
             lastSkinnedLivePollTick_ = 0;
@@ -9693,6 +9832,7 @@ public:
             // Audio is cheap (few nodes, 7 params each) — poll every tick
             // and ignore the interactive gate so spinner drags propagate live.
             DetectAudioChanges();
+            DetectGLTFChanges();
             if (allowHeavyGeometryPolling && slowPhase == 6) DetectGeometryChanges();
             if (allowIdlePolling && slowPhase == 9) DetectJsModChanges();
             if (allowIdlePolling && slowPhase == 12) DetectPluginInstanceChanges();
@@ -9901,6 +10041,7 @@ public:
         bool hasDirtyLights = false;
         bool hasDirtySplats = false;
         bool hasDirtyAudios = false;
+        bool hasDirtyGLTFs = false;
         for (ULONG handle : fastDirtyHandles_) {
             if (!hasDirtyLights && lightHandles_.find(handle) != lightHandles_.end()) {
                 hasDirtyLights = true;
@@ -9910,6 +10051,9 @@ public:
             }
             if (!hasDirtyAudios && audioHandles_.find(handle) != audioHandles_.end()) {
                 hasDirtyAudios = true;
+            }
+            if (!hasDirtyGLTFs && gltfHandles_.find(handle) != gltfHandles_.end()) {
+                hasDirtyGLTFs = true;
             }
         }
 
@@ -9968,6 +10112,9 @@ public:
             if (!hasDirtyAudios && audioHandles_.find(handle) != audioHandles_.end()) {
                 hasDirtyAudios = true;
             }
+            if (!hasDirtyGLTFs && gltfHandles_.find(handle) != gltfHandles_.end()) {
+                hasDirtyGLTFs = true;
+            }
         }
 
         // Hair fast path: re-extract world-space hair instances for any dirty
@@ -10009,11 +10156,13 @@ public:
                 lightHashMap_.erase(handle);
                 splatHashMap_.erase(handle);
                 audioHashMap_.erase(handle);
+                gltfHashMap_.erase(handle);
                 geoHashMap_.erase(handle);
                 geomHandles_.erase(handle);
                 lightHandles_.erase(handle);
                 splatHandles_.erase(handle);
                 audioHandles_.erase(handle);
+                gltfHandles_.erase(handle);
                 hairHandles_.erase(handle);
                 deformHandles_.erase(handle);
                 lastSentTransforms_.erase(handle);
@@ -10047,6 +10196,10 @@ public:
             }
             if (audioHandles_.find(handle) != audioHandles_.end()) {
                 frame.UpdateAudio(static_cast<std::uint32_t>(handle), xform, visible);
+                continue;
+            }
+            if (gltfHandles_.find(handle) != gltfHandles_.end()) {
+                frame.UpdateGLTF(static_cast<std::uint32_t>(handle), xform, visible);
                 continue;
             }
 
@@ -10558,6 +10711,38 @@ public:
         return HashFNV1a(payload.data(), payload.size() * sizeof(wchar_t));
     }
 
+    uint64_t ComputeGLTFStateHash(INode* node, TimeValue t) {
+        if (!node) return 0;
+
+        ObjectState os = node->EvalWorldState(t);
+        if (!os.obj || !IsThreeJSGLTFClassID(os.obj->ClassID())) {
+            const std::wstring payload = L"null";
+            return HashFNV1a(payload.data(), payload.size() * sizeof(wchar_t));
+        }
+
+        IParamBlock2* pb = os.obj->GetParamBlockByID(threejs_gltf_params);
+        if (!pb) {
+            const std::wstring payload = L"null";
+            return HashFNV1a(payload.data(), payload.size() * sizeof(wchar_t));
+        }
+
+        const MCHAR* rawPath = pb->GetStr(pg_gltf_file);
+        std::wstring mappedPath = rawPath ? MapAssetPath(rawPath, false) : std::wstring{};
+
+        const MCHAR* displayName = pb->GetStr(pg_display_name);
+
+        std::wostringstream ss;
+        ss.imbue(std::locale::classic());
+        ss << L"{\"v\":" << (IsMaxJsSyncDrawVisible(node) ? L'1' : L'0');
+        ss << L",\"url\":\"" << EscapeJson(mappedPath.c_str()) << L"\"";
+        ss << L",\"scale\":" << pb->GetFloat(pg_root_scale, t);
+        ss << L",\"autoplay\":" << (pb->GetInt(pg_autoplay) ? L'1' : L'0');
+        ss << L",\"name\":\"" << EscapeJson(displayName ? displayName : L"") << L"\"";
+        ss << L"}";
+        const std::wstring payload = ss.str();
+        return HashFNV1a(payload.data(), payload.size() * sizeof(wchar_t));
+    }
+
     // Supported material edits must use the full sync path. The lightweight scalar
     // fast path only carries color/roughness/metalness/opacity and cannot keep
     // physical properties in sync.
@@ -10693,6 +10878,48 @@ public:
             if (WriteAudioJson(audioJson, node, t, /*includeHandle*/ true, /*includeVisibility*/ true, /*trackHandle*/ false)) {
                 if (!first) ss << L',';
                 ss << audioJson.str();
+                first = false;
+            }
+        }
+        ss << L"]}";
+        webview_->PostWebMessageAsJson(ss.str().c_str());
+    }
+
+    void DetectGLTFChanges() {
+        Interface* ip = GetCOREInterface();
+        if (!ip || gltfHandles_.empty()) return;
+
+        TimeValue t = ip->GetTime();
+        std::vector<INode*> dirty;
+        dirty.reserve(gltfHandles_.size());
+
+        for (ULONG handle : gltfHandles_) {
+            INode* node = ip->GetINodeByHandle(handle);
+            if (!node) continue;
+
+            const uint64_t hash = ComputeGLTFStateHash(node, t);
+            auto it = gltfHashMap_.find(handle);
+            if (it == gltfHashMap_.end()) {
+                gltfHashMap_[handle] = hash;
+                dirty.push_back(node);
+            } else if (it->second != hash) {
+                it->second = hash;
+                dirty.push_back(node);
+            }
+        }
+
+        if (dirty.empty() || !webview_) return;
+
+        std::wostringstream ss;
+        ss.imbue(std::locale::classic());
+        ss << L"{\"type\":\"gltf_update\",\"gltfs\":[";
+        bool first = true;
+        for (INode* node : dirty) {
+            std::wostringstream gltfJson;
+            gltfJson.imbue(std::locale::classic());
+            if (WriteGLTFJson(gltfJson, node, t, /*includeHandle*/ true, /*includeVisibility*/ true, /*trackHandle*/ false)) {
+                if (!first) ss << L',';
+                ss << gltfJson.str();
                 first = false;
             }
         }
@@ -11542,6 +11769,70 @@ public:
         return true;
     }
 
+    bool WriteGLTFJson(std::wostringstream& ss, INode* node, TimeValue t,
+                       bool includeHandle = false, bool includeVisibility = false,
+                       bool trackHandle = false) {
+        if (!node) return false;
+
+        ObjectState os = node->EvalWorldState(t);
+        if (!os.obj || !IsThreeJSGLTFClassID(os.obj->ClassID())) return false;
+
+        IParamBlock2* pb = os.obj->GetParamBlockByID(threejs_gltf_params);
+        if (!pb) return false;
+
+        const MCHAR* rawPath = pb->GetStr(pg_gltf_file);
+        std::wstring url = rawPath ? MapAssetPath(rawPath, false) : std::wstring{};
+        const MCHAR* displayName = pb->GetStr(pg_display_name);
+
+        const ULONG handle = node->GetHandle();
+        float xform[16];
+        GetTransform16(node, t, xform);
+        if (trackHandle) {
+            gltfHandles_.insert(handle);
+            RememberSentTransform(handle, xform);
+        }
+
+        ss << L'{';
+        bool needsComma = false;
+        auto appendComma = [&]() {
+            if (needsComma) ss << L',';
+            needsComma = true;
+        };
+
+        if (includeHandle) {
+            appendComma();
+            ss << L"\"h\":" << handle;
+        }
+
+        appendComma();
+        ss << L"\"n\":\"" << EscapeJson(node->GetName()) << L'"';
+
+        if (includeVisibility) {
+            appendComma();
+            ss << L"\"v\":" << (IsMaxJsSyncDrawVisible(node) ? L'1' : L'0');
+        }
+
+        appendComma();
+        ss << L"\"t\":";
+        WriteFloats(ss, xform, 16);
+
+        appendComma();
+        ss << L"\"url\":\"" << EscapeJson(url.c_str()) << L"\"";
+
+        appendComma();
+        ss << L"\"displayName\":\"" << EscapeJson(displayName ? displayName : L"") << L"\"";
+
+        appendComma();
+        ss << L"\"rootScale\":";
+        WriteFloatValue(ss, pb->GetFloat(pg_root_scale, t), 1.0f);
+
+        appendComma();
+        ss << L"\"autoplay\":" << (pb->GetInt(pg_autoplay) ? L"true" : L"false");
+
+        ss << L'}';
+        return true;
+    }
+
     void WriteLightsJson(std::wostringstream& ss, Interface* ip, TimeValue t,
                          bool includeHandle = false, bool includeVisibility = false,
                          bool trackHandles = false) {
@@ -11634,6 +11925,38 @@ public:
                 }
             };
             collectAudios(root);
+        }
+        ss << L']';
+    }
+
+    void WriteGLTFsJson(std::wostringstream& ss, Interface* ip, TimeValue t,
+                        bool includeHandle = false, bool includeVisibility = false,
+                        bool trackHandles = false) {
+        ss << L"\"gltfs\":[";
+        bool firstGLTF = true;
+        INode* root = ip ? ip->GetRootNode() : nullptr;
+        if (root) {
+            std::function<void(INode*)> collectGLTFs = [&](INode* parent) {
+                for (int i = 0; i < parent->NumberOfChildren(); i++) {
+                    INode* node = parent->GetChildNode(i);
+                    if (!node) continue;
+                    if (node->IsNodeHidden(TRUE) && !includeVisibility) {
+                        collectGLTFs(node);
+                        continue;
+                    }
+
+                    std::wostringstream gltfJson;
+                    gltfJson.imbue(std::locale::classic());
+                    if (WriteGLTFJson(gltfJson, node, t, includeHandle, includeVisibility, trackHandles)) {
+                        if (!firstGLTF) ss << L',';
+                        ss << gltfJson.str();
+                        firstGLTF = false;
+                    }
+
+                    collectGLTFs(node);
+                }
+            };
+            collectGLTFs(root);
         }
         ss << L']';
     }
@@ -11795,6 +12118,7 @@ public:
         lightHandles_.clear();
         splatHandles_.clear();
         audioHandles_.clear();
+        gltfHandles_.clear();
         hairHandles_.clear();
         deformHandles_.clear();
         pluginInstHandles_.clear();
@@ -11837,6 +12161,8 @@ public:
         WriteSplatsJson(ss, ip, t, true, false, true);
         ss << L",";
         WriteAudiosJson(ss, ip, t, true, false, true);
+        ss << L",";
+        WriteGLTFsJson(ss, ip, t, true, false, true);
 
         // ForestPack + RailClone instance groups (GPU instancing)
         {
@@ -11936,7 +12262,7 @@ public:
             INode* node = parent->GetChildNode(i);
             if (!node) continue;
             ObjectState os = node->EvalWorldState(t);
-            if (os.obj && (IsThreeJSSplatClassID(os.obj->ClassID()) || IsThreeJSAudioClassID(os.obj->ClassID()))) {
+            if (os.obj && (IsThreeJSSplatClassID(os.obj->ClassID()) || IsThreeJSAudioClassID(os.obj->ClassID()) || IsThreeJSGLTFClassID(os.obj->ClassID()))) {
                 WriteSceneNodes(node, t, ss, first, prevGeom);
                 continue;
             }
@@ -12138,6 +12464,7 @@ public:
         lightHandles_.clear();
         splatHandles_.clear();
         audioHandles_.clear();
+        gltfHandles_.clear();
         hairHandles_.clear();
         deformHandles_.clear();
         pluginInstHandles_.clear();
@@ -12201,7 +12528,7 @@ public:
                 INode* node = parent->GetChildNode(i);
                 if (!node) continue;
                 ObjectState os = node->EvalWorldState(t);
-                if (os.obj && (IsThreeJSSplatClassID(os.obj->ClassID()) || IsThreeJSAudioClassID(os.obj->ClassID()))) {
+                if (os.obj && (IsThreeJSSplatClassID(os.obj->ClassID()) || IsThreeJSAudioClassID(os.obj->ClassID()) || IsThreeJSGLTFClassID(os.obj->ClassID()))) {
                     collect(node);
                     continue;
                 }
@@ -12350,6 +12677,10 @@ public:
             if (audioHandles_.find(it->first) == audioHandles_.end()) it = audioHashMap_.erase(it);
             else ++it;
         }
+        for (auto it = gltfHashMap_.begin(); it != gltfHashMap_.end(); ) {
+            if (gltfHandles_.find(it->first) == gltfHandles_.end()) it = gltfHashMap_.erase(it);
+            else ++it;
+        }
         for (auto it = groupCache_.begin(); it != groupCache_.end(); ) {
             if (geomHandles_.find(it->first) == geomHandles_.end()) it = groupCache_.erase(it);
             else ++it;
@@ -12472,6 +12803,8 @@ public:
         WriteSplatsJson(ss, ip, t, true, false, true);
         ss << L",";
         WriteAudiosJson(ss, ip, t, true, false, true);
+        ss << L",";
+        WriteGLTFsJson(ss, ip, t, true, false, true);
 
         // ForestPack + RailClone instance groups (GPU instancing)
         {
@@ -12599,6 +12932,7 @@ public:
                 lightHashMap_.erase(handle);
                 splatHashMap_.erase(handle);
                 audioHashMap_.erase(handle);
+                gltfHashMap_.erase(handle);
                 geoHashMap_.erase(handle);
                 lastSentTransforms_.erase(handle);
                 continue;
@@ -12653,6 +12987,8 @@ public:
         WriteSplatsJson(ss, ip, t, true, true, true);
         ss << L",";
         WriteAudiosJson(ss, ip, t, true, true, true);
+        ss << L",";
+        WriteGLTFsJson(ss, ip, t, true, true, true);
         ss << L'}';
         webview_->PostWebMessageAsJson(ss.str().c_str());
     }
@@ -13177,12 +13513,14 @@ public:
         lightHandles_.clear();
         splatHandles_.clear();
         audioHandles_.clear();
+        gltfHandles_.clear();
         hairHandles_.clear();
         deformHandles_.clear();
         mtlHashMap_.clear();
         lightHashMap_.clear();
         splatHashMap_.clear();
         audioHashMap_.clear();
+        gltfHashMap_.clear();
         propHashMap_.clear();
         geoHashMap_.clear();
         jsmodStateMap_.clear();
@@ -13479,7 +13817,7 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, ULONG fdwReason, LPVOID) {
 }
 
 __declspec(dllexport) const TCHAR* LibDescription()   { return MAXJS_NAME; }
-__declspec(dllexport) int LibNumberClasses()           { return 21; }
+__declspec(dllexport) int LibNumberClasses()           { return 22; }
 __declspec(dllexport) ClassDesc* LibClassDesc(int i) {
     switch (i) {
         case 0: return &maxJSDesc;
@@ -13503,6 +13841,7 @@ __declspec(dllexport) ClassDesc* LibClassDesc(int i) {
         case 18: return GetThreeJSDeformDesc();
         case 19: return GetThreeJSTSLTexDesc();
         case 20: return GetThreeJSHTMLTexDesc();
+        case 21: return GetThreeJSGLTFDesc();
         default: return nullptr;
     }
 }

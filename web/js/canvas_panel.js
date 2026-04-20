@@ -336,7 +336,7 @@ function buildApp(React) {
                     },
                         h('input', {
                             type: 'text',
-                            placeholder: 'panel.html',
+                            placeholder: 'example.html',
                             value: path,
                             onChange: (e) => setPath(e.target.value),
                             style: {
@@ -356,12 +356,12 @@ function buildApp(React) {
                     }, error),
                     h('div', {
                         style: { fontSize: '11px', color: '#666', lineHeight: '1.4' },
-                    }, 'Path is relative to the active Max project folder. The overlay renders as a real DOM element on top of the 3D viewport — full CSS, JS, and React support.'),
+                    }, 'Place HTML next to .max files. Full React support!'),
                 ),
                 h('section', { className: 'fx-section' },
                     h('div', { className: 'fx-section-header' },
                         h('div', { className: 'fx-section-title' },
-                            'Mounted (' + entries.length + ')'),
+                            'Loaded (' + entries.length + ')'),
                     ),
                     entries.length === 0
                         ? h('div', {
@@ -461,7 +461,7 @@ function buildApp(React) {
                         style: { fontSize: '11px', color: '#666', lineHeight: '1.4' },
                     },
                         'Front: z-index above the viewport. ',
-                        'Behind: z-index below the canvas — requires a transparent renderer clear + empty scene background to show through.',
+                        'Behind: z-index below the canvas.',
                     ),
                 ),
             ),

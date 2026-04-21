@@ -316,6 +316,38 @@ static bool TryParseInlineLayerFileName(const std::wstring& fileName, std::wstri
     return false;
 }
 
+static std::wstring BuildInlineLayerKey(const std::wstring& id, const std::wstring& folder) {
+    if (folder.empty()) return id;
+    return folder + L"/" + id;
+}
+
+static bool NormalizeInlineLayerFolder(const std::wstring& folder, std::wstring& normalizedOut) {
+    normalizedOut.clear();
+    std::wstring value = folder;
+    std::replace(value.begin(), value.end(), L'/', L'\\');
+    while (!value.empty() && (value.front() == L'\\' || value.front() == L'/')) value.erase(0, 1);
+    while (!value.empty() && (value.back() == L'\\' || value.back() == L'/')) value.pop_back();
+    if (value.empty()) return true;
+    if (value.find(L':') != std::wstring::npos) return false;
+    if (value.rfind(L"\\\\", 0) == 0) return false;
+
+    std::wstring current;
+    bool first = true;
+    for (size_t i = 0; i <= value.size(); ++i) {
+        const wchar_t ch = (i < value.size()) ? value[i] : L'\\';
+        if (ch == L'\\') {
+            if (current.empty() || current == L"." || current == L"..") return false;
+            if (!first) normalizedOut += L"\\";
+            normalizedOut += current;
+            current.clear();
+            first = false;
+            continue;
+        }
+        current.push_back(ch);
+    }
+    return !normalizedOut.empty();
+}
+
 // Parse leading `NN_` priority prefix from an inline layer id.
 // "10_gun" → priority=10, displayNameOut="gun"
 // "gun"    → priority=100, displayNameOut="gun"
@@ -5895,7 +5927,8 @@ public:
 
             if (!first) ss << L',';
             first = false;
-            ss << L"{\"id\":\"" << EscapeJson(layer.id.c_str())
+            ss << L"{\"key\":\"" << EscapeJson(BuildInlineLayerKey(layer.id, layer.folder).c_str())
+               << L"\",\"id\":\"" << EscapeJson(layer.id.c_str())
                << L"\",\"name\":\"" << EscapeJson(layer.displayName.c_str())
                << L"\",\"folder\":\"" << EscapeJson(layer.folder.c_str())
                << L"\",\"priority\":" << layer.priority
@@ -8561,15 +8594,94 @@ public:
         return found;
     }
 
-    bool RemoveInlineLayerFile(const std::wstring& id, std::wstring& error) {
-        const std::wstring rootDir = GetInlineHotLayerDir();
+    static bool ResolveInlineLayerFileDir(const std::wstring& rootDir,
+                                          const std::wstring& id,
+                                          const std::wstring& folder,
+                                          std::wstring& dirOut,
+                                          std::wstring& error) {
+        dirOut.clear();
         if (rootDir.empty() || !DirectoryExists(rootDir)) {
             error = L"Scene-local inline folder is not available";
             return false;
         }
-        const std::wstring dir = FindInlineLayerFileDir(rootDir, id);
-        if (dir.empty()) {
+
+        if (!folder.empty()) {
+            std::wstring normalizedFolder;
+            if (!NormalizeInlineLayerFolder(folder, normalizedFolder)) {
+                error = L"Invalid inline layer folder";
+                return false;
+            }
+            std::wstring exactDir = rootDir;
+            if (!normalizedFolder.empty()) exactDir += normalizedFolder + L"\\";
+            if (!DirectoryExists(exactDir)) {
+                error = L"Inline layer file not found";
+                return false;
+            }
+            const std::wstring enabledPath = exactDir + GetInlineLayerFileName(id, true);
+            const std::wstring disabledPath = exactDir + GetInlineLayerFileName(id, false);
+            if (!FileExists(enabledPath) && !FileExists(disabledPath)) {
+                error = L"Inline layer file not found";
+                return false;
+            }
+            dirOut = exactDir;
+            return true;
+        }
+
+        dirOut = FindInlineLayerFileDir(rootDir, id);
+        if (dirOut.empty()) {
             error = L"Inline layer file not found";
+            return false;
+        }
+        return true;
+    }
+
+    static bool ClearInlineLayerFilesRecursive(const std::wstring& dir,
+                                               std::wstring& error,
+                                               bool removeEmptyDir = false) {
+        if (dir.empty() || !DirectoryExists(dir)) return true;
+
+        const std::wstring pattern = dir + L"*";
+        WIN32_FIND_DATAW fd = {};
+        HANDLE hFind = FindFirstFileW(pattern.c_str(), &fd);
+        if (hFind == INVALID_HANDLE_VALUE) return true;
+
+        std::vector<std::wstring> childDirs;
+        do {
+            if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                childDirs.push_back(dir + fd.cFileName + L"\\");
+                continue;
+            }
+
+            std::wstring id;
+            bool enabled = false;
+            if (!TryParseInlineLayerFileName(fd.cFileName, id, enabled)) continue;
+
+            const std::wstring filePath = dir + fd.cFileName;
+            if (!DeleteFileW(filePath.c_str())) {
+                error = L"Failed to delete one or more inline layer files";
+                FindClose(hFind);
+                return false;
+            }
+        } while (FindNextFileW(hFind, &fd));
+        FindClose(hFind);
+
+        for (const auto& childDir : childDirs) {
+            if (!ClearInlineLayerFilesRecursive(childDir, error, true)) {
+                return false;
+            }
+        }
+
+        if (removeEmptyDir) {
+            RemoveDirectoryW(dir.c_str()); // best-effort cleanup of empty folders
+        }
+        return true;
+    }
+
+    bool RemoveInlineLayerFile(const std::wstring& id, const std::wstring& folder, std::wstring& error) {
+        const std::wstring rootDir = GetInlineHotLayerDir();
+        std::wstring dir;
+        if (!ResolveInlineLayerFileDir(rootDir, id, folder, dir, error)) {
             return false;
         }
         const std::wstring enabledPath = dir + GetInlineLayerFileName(id, true);
@@ -8599,15 +8711,13 @@ public:
         return true;
     }
 
-    bool SetInlineLayerEnabled(const std::wstring& id, bool enabled, std::wstring& error) {
+    bool SetInlineLayerEnabled(const std::wstring& id,
+                               const std::wstring& folder,
+                               bool enabled,
+                               std::wstring& error) {
         const std::wstring rootDir = GetInlineHotLayerDir();
-        if (rootDir.empty() || !DirectoryExists(rootDir)) {
-            error = L"Scene-local inline folder is not available";
-            return false;
-        }
-        const std::wstring dir = FindInlineLayerFileDir(rootDir, id);
-        if (dir.empty()) {
-            error = L"Inline layer file not found";
+        std::wstring dir;
+        if (!ResolveInlineLayerFileDir(rootDir, id, folder, dir, error)) {
             return false;
         }
         const std::wstring enabledFileName = GetInlineLayerFileName(id, true);
@@ -8650,24 +8760,7 @@ public:
             SendInlineLayersState(true);
             return true;
         }
-        const std::wstring pattern = dir + L"*";
-        WIN32_FIND_DATAW fd = {};
-        HANDLE hFind = FindFirstFileW(pattern.c_str(), &fd);
-        if (hFind != INVALID_HANDLE_VALUE) {
-            do {
-                if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-                std::wstring id;
-                bool enabled = false;
-                if (!TryParseInlineLayerFileName(fd.cFileName, id, enabled)) continue;
-                const std::wstring filePath = dir + fd.cFileName;
-                if (!DeleteFileW(filePath.c_str())) {
-                    error = L"Failed to delete one or more inline layer files";
-                    FindClose(hFind);
-                    return false;
-                }
-            } while (FindNextFileW(hFind, &fd));
-            FindClose(hFind);
-        }
+        if (!ClearInlineLayerFilesRecursive(dir, error)) return false;
 
         SendInlineLayersState(true);
         return true;
@@ -9705,22 +9798,26 @@ public:
         if (type == L"inline_layer_remove") {
             std::wstring requestId;
             std::wstring id;
+            std::wstring folder;
             ExtractJsonString(msg, L"requestId", requestId);
+            ExtractJsonString(msg, L"folder", folder);
             if (!ExtractJsonString(msg, L"id", id) || id.empty()) {
                 SendHostActionResult(type, requestId, false, L"Missing layer id");
                 return;
             }
 
             std::wstring error;
-            const bool ok = RemoveInlineLayerFile(id, error);
+            const bool ok = RemoveInlineLayerFile(id, folder, error);
             SendHostActionResult(type, requestId, ok, error);
             return;
         }
         if (type == L"inline_layer_set_enabled") {
             std::wstring requestId;
             std::wstring id;
+            std::wstring folder;
             bool enabled = true;
             ExtractJsonString(msg, L"requestId", requestId);
+            ExtractJsonString(msg, L"folder", folder);
             if (!ExtractJsonString(msg, L"id", id) || id.empty()) {
                 SendHostActionResult(type, requestId, false, L"Missing layer id");
                 return;
@@ -9731,7 +9828,7 @@ public:
             }
 
             std::wstring error;
-            const bool ok = SetInlineLayerEnabled(id, enabled, error);
+            const bool ok = SetInlineLayerEnabled(id, folder, enabled, error);
             SendHostActionResult(type, requestId, ok, error);
             return;
         }
@@ -10146,6 +10243,7 @@ public:
         TimeValue t = ip->GetTime();
         const std::uint32_t frameId = AllocateFrameId();
         maxjs::sync::DeltaFrameBuilder frame(frameId);
+        frame.ReserveBytes(32 + dirtyHandles.size() * 160 + visibilityDirty.size() * 12 + (hasDirtyCamera ? 64 : 0));
         frame.BeginFrame();
 
         for (ULONG handle : dirtyHandles) {
@@ -10357,6 +10455,7 @@ public:
         TimeValue t = ip->GetTime();
         const std::uint32_t frameId = AllocateFrameId();
         maxjs::sync::DeltaFrameBuilder frame(frameId);
+        frame.ReserveBytes(32 + geomHandles_.size() * (includeMaterialScalars ? 120 : 96) + 64);
         frame.BeginFrame();
 
         for (auto it = geomHandles_.begin(); it != geomHandles_.end(); ) {
@@ -13242,6 +13341,11 @@ public:
         haveLastFloatingRect_ = true;
     }
 
+    void NotifyWebViewParentWindowPositionChanged() {
+        if (!controller_) return;
+        controller_->NotifyParentWindowPositionChanged();
+    }
+
     void NormalizeFloatingWindow(bool forceRecenter = false) {
         if (!hwnd_ || IsViewportHosted() || !IsWindowVisible(hwnd_) || IsIconic(hwnd_)) return;
 
@@ -13306,14 +13410,19 @@ public:
         }
 
         const LONG hostedStyle = WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_CLIPSIBLINGS;
-        if (GetParent(hwnd_) != embeddedViewportHwnd_) {
+        bool reattached = false;
+        if (GetWindowLong(hwnd_, GWL_STYLE) != hostedStyle) {
             SetWindowLong(hwnd_, GWL_STYLE, hostedStyle);
+            reattached = true;
+        }
+        if (GetParent(hwnd_) != embeddedViewportHwnd_) {
             SetParent(hwnd_, embeddedViewportHwnd_);
+            reattached = true;
         }
 
         HWND hostRoot = GetAncestor(embeddedViewportHwnd_, GA_ROOT);
         if ((hostRoot && IsIconic(hostRoot)) || !IsWindowVisible(embeddedViewportHwnd_)) {
-            ShowWindow(hwnd_, SW_HIDE);
+            if (IsWindowVisible(hwnd_)) ShowWindow(hwnd_, SW_HIDE);
             return false;
         }
 
@@ -13327,13 +13436,22 @@ public:
         if (width < 64 || height < 64) {
             // Viewport layout transitions briefly report tiny/empty client
             // rects. Treat that as a suspended host, not a fatal condition.
-            ShowWindow(hwnd_, SW_HIDE);
+            if (IsWindowVisible(hwnd_)) ShowWindow(hwnd_, SW_HIDE);
             return false;
         }
 
-        ShowWindow(hwnd_, SW_SHOWNA);
-        SetWindowPos(hwnd_, HWND_TOP, 0, 0, width, height,
-            SWP_NOACTIVATE | SWP_NOCOPYBITS | SWP_SHOWWINDOW);
+        RECT childRect = {};
+        bool needReposition = reattached || !GetClientRect(hwnd_, &childRect) ||
+            (childRect.right - childRect.left) != width ||
+            (childRect.bottom - childRect.top) != height ||
+            !IsWindowVisible(hwnd_);
+        if (needReposition) {
+            UINT posFlags = SWP_NOACTIVATE | SWP_NOCOPYBITS | SWP_SHOWWINDOW;
+            if (reattached) posFlags |= SWP_FRAMECHANGED;
+            SetWindowPos(hwnd_, HWND_TOP, 0, 0, width, height, posFlags);
+        } else {
+            ShowWindow(hwnd_, SW_SHOWNA);
+        }
         Resize();
         return true;
     }
@@ -13491,6 +13609,7 @@ public:
         if (!GetClientRect(hwnd_, &b)) return;
         if ((b.right - b.left) <= 0 || (b.bottom - b.top) <= 0) return;
         controller_->put_Bounds(b);
+        NotifyWebViewParentWindowPositionChanged();
     }
 
     void Destroy() {

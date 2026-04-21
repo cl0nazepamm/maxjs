@@ -65,6 +65,7 @@ public:
     // frame (GetTicksPerFrame()). stateFlags: bit 0 = playing, bits 1-7 reserved.
     void UpdateTime(std::int32_t ticks, std::int32_t tpf, std::uint8_t stateFlags);
     void EndFrame();
+    void ReserveBytes(std::size_t totalBytes);
 
     std::uint32_t frame_id() const { return frameId_; }
     std::uint32_t command_count() const { return commandCount_; }

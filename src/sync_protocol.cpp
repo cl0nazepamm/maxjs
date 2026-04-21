@@ -8,6 +8,13 @@ namespace {
 
 constexpr std::uint16_t kCommandHeaderSize = 4;
 
+template <typename T>
+inline void AppendPod(std::vector<std::uint8_t>& bytes, const T& value) {
+    const std::size_t offset = bytes.size();
+    bytes.resize(offset + sizeof(T));
+    std::memcpy(bytes.data() + offset, &value, sizeof(T));
+}
+
 }  // namespace
 
 DeltaFrameBuilder::DeltaFrameBuilder(std::uint32_t frameId)
@@ -148,28 +155,31 @@ void DeltaFrameBuilder::UpdateTime(std::int32_t ticks, std::int32_t tpf, std::ui
 
 void DeltaFrameBuilder::EndFrame() {
     BeginCommand(CommandType::EndFrame, 0);
+    PatchU32(commandCountOffset_, commandCount_);
+}
+
+void DeltaFrameBuilder::ReserveBytes(std::size_t totalBytes) {
+    if (totalBytes > bytes_.capacity()) {
+        bytes_.reserve(totalBytes);
+    }
 }
 
 void DeltaFrameBuilder::BeginCommand(CommandType type, std::uint16_t payloadBytes) {
     AppendU16(static_cast<std::uint16_t>(type));
     AppendU16(static_cast<std::uint16_t>(kCommandHeaderSize + payloadBytes));
     ++commandCount_;
-    PatchU32(commandCountOffset_, commandCount_);
 }
 
 void DeltaFrameBuilder::AppendU16(std::uint16_t value) {
-    const auto* src = reinterpret_cast<const std::uint8_t*>(&value);
-    bytes_.insert(bytes_.end(), src, src + sizeof(value));
+    AppendPod(bytes_, value);
 }
 
 void DeltaFrameBuilder::AppendU32(std::uint32_t value) {
-    const auto* src = reinterpret_cast<const std::uint8_t*>(&value);
-    bytes_.insert(bytes_.end(), src, src + sizeof(value));
+    AppendPod(bytes_, value);
 }
 
 void DeltaFrameBuilder::AppendF32(float value) {
-    const auto* src = reinterpret_cast<const std::uint8_t*>(&value);
-    bytes_.insert(bytes_.end(), src, src + sizeof(value));
+    AppendPod(bytes_, value);
 }
 
 void DeltaFrameBuilder::PatchU32(std::size_t offset, std::uint32_t value) {

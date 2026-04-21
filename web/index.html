@@ -7240,8 +7240,7 @@
         function getPanelLayers() {
             // listEntries() is the single source of truth — driven by the
             // C++ inlines/ folder scan via inline_layers_state.
-            const layers = _projectRuntimeRef?.listEntries?.() ?? [];
-            return [...layers].sort((a, b) => a.name.localeCompare(b.name));
+            return _projectRuntimeRef?.listEntries?.() ?? [];
         }
 
         function getProjectRuntimeState() {
@@ -9185,6 +9184,7 @@
             layerManager.update(frameDt, frameElapsed);
             animationSystem?.update(frameDt);
             audioSystem?.update();
+            gltfSystem?.update?.(frameDt);
 
             const perfHudActive = perfHud.isDebugEnabled?.() ?? false;
             if (perfHudActive) perfHud.updateLayers(layerManager.getStats());
@@ -9609,6 +9609,7 @@
             layerManager.update(0, effectiveElapsed);
             if (Number.isFinite(renderTimeSeconds)) {
                 animationSystem?.seekAllClips?.(renderTimeSeconds);
+                gltfSystem?.setTime?.(renderTimeSeconds);
             } else {
                 animationSystem?.update(0);
             }

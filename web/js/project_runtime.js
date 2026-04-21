@@ -92,6 +92,35 @@ function deriveProjectName(projectDir) {
     return parts[parts.length - 1] || 'Active Project';
 }
 
+function normalizeInlineFolder(folder) {
+    return String(folder ?? '')
+        .replace(/\\/g, '/')
+        .replace(/^\/+|\/+$/g, '');
+}
+
+function buildInlineLayerKey(rawId, folder) {
+    const cleanId = String(rawId ?? '');
+    const cleanFolder = normalizeInlineFolder(folder);
+    return cleanFolder ? `${cleanFolder}/${cleanId}` : cleanId;
+}
+
+function splitInlineLayerKey(key) {
+    const normalized = String(key ?? '').replace(/\\/g, '/');
+    const slash = normalized.lastIndexOf('/');
+    if (slash < 0) {
+        return {
+            key: normalized,
+            rawId: normalized,
+            folder: '',
+        };
+    }
+    return {
+        key: normalized,
+        rawId: normalized.slice(slash + 1),
+        folder: normalizeInlineFolder(normalized.slice(0, slash)),
+    };
+}
+
 export function createProjectRuntime({ layerManager, bridge, perfHud, debugLog = () => {}, debugWarn = () => {} }) {
     let projectDir = '';
     let projectRootUrl = '';
@@ -519,8 +548,12 @@ export function createProjectRuntime({ layerManager, bridge, perfHud, debugLog =
         });
     }
 
-    async function removeInlineLayer(id) {
-        await requestHostAction('inline_layer_remove', { id });
+    async function removeInlineLayer(id, options = {}) {
+        const identity = splitInlineLayerKey(id);
+        await requestHostAction('inline_layer_remove', {
+            id: identity.rawId,
+            folder: options.folder ?? identity.folder,
+        });
     }
 
     async function setInlineLayerEnabled(id, enabled) {
@@ -529,10 +562,15 @@ export function createProjectRuntime({ layerManager, bridge, perfHud, debugLog =
         // of visual truth, set by the caller via layerManager.setActive.
         // We update local state immediately so the UI reflects the change
         // even if the host action is slow or fails.
-        const current = inlineLayerState.get(id) || { id, name: id };
-        inlineLayerState.set(id, { ...current, enabled: nextEnabled });
+        const identity = splitInlineLayerKey(id);
+        const current = inlineLayerState.get(identity.key) || { key: identity.key, id: identity.rawId, folder: identity.folder, name: identity.rawId };
+        inlineLayerState.set(identity.key, { ...current, enabled: nextEnabled });
         emitChange();
-        await requestHostAction('inline_layer_set_enabled', { id, enabled: nextEnabled });
+        await requestHostAction('inline_layer_set_enabled', {
+            id: identity.rawId,
+            folder: identity.folder,
+            enabled: nextEnabled,
+        });
     }
 
     async function clearInlineLayers() {
@@ -586,18 +624,19 @@ export function createProjectRuntime({ layerManager, bridge, perfHud, debugLog =
         // the layer hasn't been mounted yet (e.g. .js.disabled file).
         const runtimeLayers = new Map(layerManager.list().map(layer => [layer.id, layer]));
         const out = [];
-        for (const [id, state] of inlineLayerState.entries()) {
-            const runtime = runtimeLayers.get(id);
-            const mounted = mountedInlineLayers.has(id);
+        for (const [key, state] of inlineLayerState.entries()) {
+            const runtime = runtimeLayers.get(key);
+            const mounted = mountedInlineLayers.has(key);
             const enabled = mounted ? !!runtime?.active : state.enabled;
             const folder = runtime?.folder ?? state.folder ?? '';
             const priority = Number.isFinite(runtime?.priority)
                 ? runtime.priority
                 : Number.isFinite(state.priority) ? state.priority : 100;
             out.push({
-                id,
-                name: runtime?.name || state.name || id,
-                entry: inlineEntryRelPath(id, folder),
+                id: key,
+                rawId: state.id || splitInlineLayerKey(key).rawId,
+                name: runtime?.name || state.name || state.id || key,
+                entry: inlineEntryRelPath(state.id || splitInlineLayerKey(key).rawId, folder),
                 source: 'project',
                 persisted: true,
                 folder,
@@ -627,12 +666,13 @@ export function createProjectRuntime({ layerManager, bridge, perfHud, debugLog =
         );
 
         const entries = [];
-        for (const [id, state] of inlineLayerState.entries()) {
-            const runtime = runtimeLayers.get(id);
-            runtimeLayers.delete(id);
+        for (const [key, state] of inlineLayerState.entries()) {
+            const runtime = runtimeLayers.get(key);
+            runtimeLayers.delete(key);
             entries.push({
-                id,
-                name: runtime?.name || state.name || id,
+                id: key,
+                rawId: state.id || splitInlineLayerKey(key).rawId,
+                name: runtime?.name || state.name || state.id || key,
                 source: 'inline',
                 persisted: true,
                 enabled: state.enabled !== false,
@@ -642,6 +682,10 @@ export function createProjectRuntime({ layerManager, bridge, perfHud, debugLog =
                 anchors: runtime?.anchors ?? 0,
                 tracked: runtime?.tracked ?? 0,
                 profile: runtime?.profile ?? null,
+                folder: runtime?.folder ?? state.folder ?? '',
+                priority: Number.isFinite(runtime?.priority)
+                    ? runtime.priority
+                    : Number.isFinite(state.priority) ? state.priority : 100,
             });
         }
 
@@ -745,43 +789,51 @@ export function createProjectRuntime({ layerManager, bridge, perfHud, debugLog =
         return `${baseUrl}${sep}${f}${encodeURIComponent(id)}.js?v=${version}`;
     }
 
-    async function mountInlineLayer(id, name, meta = {}) {
+    async function mountInlineLayer(key, rawId, name, meta = {}) {
         const moduleVersion = ++revision;
         const folder = typeof meta.folder === 'string' ? meta.folder : '';
         const priority = Number.isFinite(meta.priority) ? meta.priority : 100;
-        const moduleUrl = inlineLayerUrlWithFolder(id, folder, moduleVersion) || inlineLayerUrl(id, moduleVersion);
-        if (!moduleUrl) throw new Error(`No inline directory configured for ${id}`);
+        const moduleUrl = inlineLayerUrlWithFolder(rawId, folder, moduleVersion) || inlineLayerUrl(rawId, moduleVersion);
+        if (!moduleUrl) throw new Error(`No inline directory configured for ${rawId}`);
 
         let moduleNamespace;
         try {
             moduleNamespace = await import(moduleUrl);
         } catch (error) {
             const detail = error?.message || String(error);
-            throw new Error(`inline layer import failed: ${id} -> ${detail}`);
+            throw new Error(`inline layer import failed: ${rawId} -> ${detail}`);
         }
         const factory = resolveFactory(moduleNamespace);
 
         const result = await layerManager.mount(
-            id,
-            async (ctx, THREE) => factory(ctx, THREE, { layer: { id, name, folder, priority } }),
+            key,
+            async (ctx, THREE) => factory(ctx, THREE, {
+                layer: {
+                    id: key,
+                    baseId: rawId,
+                    name,
+                    folder,
+                    priority,
+                },
+            }),
             {
-                name: name || id,
+                name: name || rawId,
                 code: moduleUrl,
                 source: 'project',
-                entry: inlineEntryRelPath(id, folder),
+                entry: inlineEntryRelPath(rawId, folder),
                 folder,
                 priority,
             },
         );
         if (result?.error) throw new Error(result.error);
 
-        mountedInlineLayers.set(id, { moduleUrl, folder, priority });
+        mountedInlineLayers.set(key, { moduleUrl, folder, priority });
     }
 
-    function unmountInlineLayer(id) {
-        try { layerManager.remove(id); }
-        catch (err) { debugWarn('[ProjectRuntime] inline unmount failed', id, err); }
-        mountedInlineLayers.delete(id);
+    function unmountInlineLayer(key) {
+        try { layerManager.remove(key); }
+        catch (err) { debugWarn('[ProjectRuntime] inline unmount failed', key, err); }
+        mountedInlineLayers.delete(key);
     }
 
     bridge.on('inline_layers_state', async msg => {
@@ -792,9 +844,10 @@ export function createProjectRuntime({ layerManager, bridge, perfHud, debugLog =
             .filter(l => l?.id)
             .map((l, originalIndex) => ({
                 id: String(l.id),
+                key: String(l.key || buildInlineLayerKey(l.id, l.folder)),
                 name: l.name || l.id,
                 enabled: l.enabled !== false,
-                folder: typeof l.folder === 'string' ? l.folder : '',
+                folder: normalizeInlineFolder(l.folder),
                 priority: Number.isFinite(Number(l.priority)) ? Number(l.priority) : 100,
                 originalIndex,
             }))
@@ -807,14 +860,15 @@ export function createProjectRuntime({ layerManager, bridge, perfHud, debugLog =
         debugLog('[ProjectRuntime] inline_layers_state', {
             inlineDir,
             layerCount: layers.length,
-            layers: layers.map(l => ({ id: l.id, enabled: l.enabled, folder: l.folder, priority: l.priority })),
+            layers: layers.map(l => ({ key: l.key, id: l.id, enabled: l.enabled, folder: l.folder, priority: l.priority })),
         });
 
         inlineLayerState.clear();
         const seen = new Set();
         for (const layer of layers) {
-            seen.add(layer.id);
-            inlineLayerState.set(layer.id, {
+            seen.add(layer.key);
+            inlineLayerState.set(layer.key, {
+                key: layer.key,
                 id: layer.id,
                 name: layer.name,
                 enabled: layer.enabled,
@@ -833,22 +887,22 @@ export function createProjectRuntime({ layerManager, bridge, perfHud, debugLog =
         // rename host action which triggers a fresh inline_layers_state.
         for (const layer of layers) {
             if (layer.enabled === false) {
-                if (mountedInlineLayers.has(layer.id)) unmountInlineLayer(layer.id);
+                if (mountedInlineLayers.has(layer.key)) unmountInlineLayer(layer.key);
                 continue;
             }
-            const mounted = mountedInlineLayers.get(layer.id);
+            const mounted = mountedInlineLayers.get(layer.key);
             if (!mounted) {
                 try {
-                    await mountInlineLayer(layer.id, layer.name, { folder: layer.folder, priority: layer.priority });
-                    debugLog('[ProjectRuntime] mounted inline layer', layer.id);
+                    await mountInlineLayer(layer.key, layer.id, layer.name, { folder: layer.folder, priority: layer.priority });
+                    debugLog('[ProjectRuntime] mounted inline layer', layer.key);
                 } catch (err) {
-                    debugWarn('[ProjectRuntime] inline mount failed', layer.id, err);
+                    debugWarn('[ProjectRuntime] inline mount failed', layer.key, err);
                 }
             } else if (mounted.folder !== layer.folder || mounted.priority !== layer.priority) {
                 // Meta changed (user moved file between folders or renamed prefix) — push
                 // onto the live layer record without a remount. Priority re-sort only
                 // matters on fresh mount order, not at steady-state.
-                layerManager.setLayerMeta?.(layer.id, {
+                layerManager.setLayerMeta?.(layer.key, {
                     folder: layer.folder,
                     priority: layer.priority,
                     name: layer.name,
@@ -858,7 +912,7 @@ export function createProjectRuntime({ layerManager, bridge, perfHud, debugLog =
             }
             // Apply the enabled flag as a runtime active state. For layers
             // already mounted, this is just a flag flip — no remount.
-            layerManager.setActive?.(layer.id, true);
+            layerManager.setActive?.(layer.key, true);
         }
 
         emitChange();

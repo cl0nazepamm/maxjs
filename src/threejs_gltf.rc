@@ -1,0 +1,35 @@
+#include "threejs_gltf_res.h"
+#include <windows.h>
+
+STRINGTABLE
+BEGIN
+    IDS_GLTF_PARAMS         "glTF Origin"
+    IDS_GLTF_DISPLAY_SIZE   "Display Size"
+    IDS_GLTF_FILE           "glTF File"
+    IDS_GLTF_ROOT_SCALE     "Root Scale"
+    IDS_GLTF_AUTOPLAY       "Autoplay"
+    IDS_GLTF_DISPLAY_NAME   "Display Name"
+END
+
+IDD_THREEJS_GLTF DIALOG 0, 0, 186, 82
+STYLE DS_SETFONT | WS_CHILD | WS_VISIBLE
+FONT 8, "Segoe UI"
+BEGIN
+    LTEXT           "File", -1, 8, 6, 14, 8
+    EDITTEXT        IDC_GLTF_PATH, 24, 4, 88, 12, ES_AUTOHSCROLL | ES_READONLY
+    PUSHBUTTON      "Load...", IDC_GLTF_LOAD, 116, 4, 30, 12
+    PUSHBUTTON      "Clear", IDC_GLTF_CLEAR, 150, 4, 28, 12
+
+    LTEXT           "Display", -1, 8, 22, 32, 8
+    CONTROL         "", IDC_GLTF_SIZE_EDIT, "CustEdit", WS_TABSTOP, 44, 20, 26, 10
+    CONTROL         "", IDC_GLTF_SIZE_SPIN, "SpinnerControl", 0, 70, 20, 11, 10
+
+    LTEXT           "Scale", -1, 92, 22, 20, 8
+    CONTROL         "", IDC_GLTF_SCALE_EDIT, "CustEdit", WS_TABSTOP, 114, 20, 32, 10
+    CONTROL         "", IDC_GLTF_SCALE_SPIN, "SpinnerControl", 0, 146, 20, 11, 10
+
+    CONTROL         "Autoplay", IDC_GLTF_AUTOPLAY, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 8, 38, 48, 10
+
+    LTEXT           "Name", -1, 64, 38, 22, 8
+    EDITTEXT        IDC_GLTF_DISPLAY_NAME_EDIT, 88, 36, 90, 12, ES_AUTOHSCROLL
+END

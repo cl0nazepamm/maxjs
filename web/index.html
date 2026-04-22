@@ -4409,28 +4409,29 @@
                 const count = grp.count || Math.floor((grp.xforms?.length || 0) / 16);
                 if (!count || !Array.isArray(grp.xforms) || grp.xforms.length < count * 16) continue;
                 const entry = hairMeshes.get(grp.h);
-                if (!entry?.mesh) continue;
-                const instMesh = entry.mesh;
-                if (instMesh.count === count) {
-                    for (let i = 0; i < count; i++) {
-                        m.fromArray(grp.xforms, i * 16);
-                        instMesh.setMatrixAt(i, m);
-                        if (grp.colors) {
-                            c.setRGB(
-                                grp.colors[i * 3] ?? 1,
-                                grp.colors[i * 3 + 1] ?? 1,
-                                grp.colors[i * 3 + 2] ?? 1
-                            );
-                            instMesh.setColorAt(i, c);
-                        }
-                    }
-                    instMesh.instanceMatrix.needsUpdate = true;
-                    if (instMesh.instanceColor) instMesh.instanceColor.needsUpdate = true;
-                } else {
-                    // Count changed — full rebuild via applyHairInstances
-                    applyHairInstances(msg.groups);
-                    return;
+                if (!entry?.mesh || entry.mesh.count !== count) {
+                    // No entry yet, or strand count changed — rebuild just this
+                    // handle. Never touch other hair groups (msg.groups is only
+                    // the dirty subset from SendHairFastUpdate).
+                    disposeHairEntry(grp.h);
+                    buildHairEntry(grp);
+                    continue;
                 }
+                const instMesh = entry.mesh;
+                for (let i = 0; i < count; i++) {
+                    m.fromArray(grp.xforms, i * 16);
+                    instMesh.setMatrixAt(i, m);
+                    if (grp.colors) {
+                        c.setRGB(
+                            grp.colors[i * 3] ?? 1,
+                            grp.colors[i * 3 + 1] ?? 1,
+                            grp.colors[i * 3 + 2] ?? 1
+                        );
+                        instMesh.setColorAt(i, c);
+                    }
+                }
+                instMesh.instanceMatrix.needsUpdate = true;
+                if (instMesh.instanceColor) instMesh.instanceColor.needsUpdate = true;
                 if (grp.vis != null) entry.root.visible = !!grp.vis;
             }
         });
@@ -6103,12 +6104,16 @@
 
         const hairBladeGeometry = createHairBladeGeometry();
 
+        function disposeHairEntry(handle) {
+            const entry = hairMeshes.get(handle);
+            if (!entry) return;
+            if (entry.root?.parent) entry.root.parent.remove(entry.root);
+            disposeSceneMaterial(entry.mesh?.material);
+            hairMeshes.delete(handle);
+        }
+
         function disposeHairInstances() {
-            for (const [, entry] of hairMeshes) {
-                if (entry?.root?.parent) entry.root.parent.remove(entry.root);
-                disposeSceneMaterial(entry?.mesh?.material);
-            }
-            hairMeshes.clear();
+            for (const handle of Array.from(hairMeshes.keys())) disposeHairEntry(handle);
         }
 
         function applyHairTransform(handle, matrixArray) {
@@ -6124,62 +6129,64 @@
             return true;
         }
 
-        function applyHairInstances(groups) {
-            disposeHairInstances();
-            if (!Array.isArray(groups) || groups.length === 0) return;
+        function buildHairEntry(grp) {
+            const count = grp.count || Math.floor((grp.xforms?.length || 0) / 16);
+            if (!count || !Array.isArray(grp.xforms) || grp.xforms.length < count * 16) return null;
+
+            let mat = grp.mat ? createMaterial(grp.mat) : new THREE.MeshPhysicalMaterial({
+                color: 0xffffff,
+                roughness: 0.8,
+                metalness: 0.0,
+                side: THREE.DoubleSide,
+            });
+            if (Array.isArray(mat)) {
+                mat = mat[0] ?? new THREE.MeshPhysicalMaterial({ color: 0xffffff, side: THREE.DoubleSide });
+            }
+            mat.side = THREE.DoubleSide;
+            mat.vertexColors = true;
+            if ((grp.mat?.opacity ?? 1) < 0.999) mat.transparent = true;
+            mat.needsUpdate = true;
+
+            const instMesh = new THREE.InstancedMesh(hairBladeGeometry, mat, count);
+            instMesh.matrixAutoUpdate = false;
+            instMesh.frustumCulled = false;
+            instMesh.castShadow = true;
+            instMesh.receiveShadow = true;
+            instMesh.name = `hair_${grp.h}_x${count}`;
 
             const m = new THREE.Matrix4();
             const c = new THREE.Color();
+            for (let i = 0; i < count; i++) {
+                m.fromArray(grp.xforms, i * 16);
+                instMesh.setMatrixAt(i, m);
 
-            for (const grp of groups) {
-                const count = grp.count || Math.floor((grp.xforms?.length || 0) / 16);
-                if (!count || !Array.isArray(grp.xforms) || grp.xforms.length < count * 16) continue;
-
-                let mat = grp.mat ? createMaterial(grp.mat) : new THREE.MeshPhysicalMaterial({
-                    color: 0xffffff,
-                    roughness: 0.8,
-                    metalness: 0.0,
-                    side: THREE.DoubleSide,
-                });
-                if (Array.isArray(mat)) {
-                    mat = mat[0] ?? new THREE.MeshPhysicalMaterial({ color: 0xffffff, side: THREE.DoubleSide });
-                }
-                mat.side = THREE.DoubleSide;
-                mat.vertexColors = true;
-                if ((grp.mat?.opacity ?? 1) < 0.999) mat.transparent = true;
-                mat.needsUpdate = true;
-
-                const instMesh = new THREE.InstancedMesh(hairBladeGeometry, mat, count);
-                instMesh.matrixAutoUpdate = false;
-                instMesh.frustumCulled = false;
-                instMesh.castShadow = true;
-                instMesh.receiveShadow = true;
-                instMesh.name = `hair_${grp.h}_x${count}`;
-
-                for (let i = 0; i < count; i++) {
-                    const off = i * 16;
-                    m.fromArray(grp.xforms, off);
-                    instMesh.setMatrixAt(i, m);
-
-                    const colorOff = i * 3;
-                    const r = grp.colors?.[colorOff + 0] ?? 1.0;
-                    const g = grp.colors?.[colorOff + 1] ?? 1.0;
-                    const b = grp.colors?.[colorOff + 2] ?? 1.0;
-                    c.setRGB(r, g, b);
-                    instMesh.setColorAt(i, c);
-                }
-                instMesh.instanceMatrix.needsUpdate = true;
-                if (instMesh.instanceColor) instMesh.instanceColor.needsUpdate = true;
-
-                const root = new THREE.Group();
-                root.matrixAutoUpdate = false;
-                root.name = `hair_root_${grp.h}`;
-                root.userData.maxjsHair = true;
-                root.visible = grp.vis == null ? true : !!grp.vis;
-                root.add(instMesh);
-                maxRoot.add(root);
-                hairMeshes.set(grp.h, { root, mesh: instMesh });
+                const colorOff = i * 3;
+                const r = grp.colors?.[colorOff + 0] ?? 1.0;
+                const g = grp.colors?.[colorOff + 1] ?? 1.0;
+                const b = grp.colors?.[colorOff + 2] ?? 1.0;
+                c.setRGB(r, g, b);
+                instMesh.setColorAt(i, c);
             }
+            instMesh.instanceMatrix.needsUpdate = true;
+            if (instMesh.instanceColor) instMesh.instanceColor.needsUpdate = true;
+
+            const root = new THREE.Group();
+            root.matrixAutoUpdate = false;
+            root.name = `hair_root_${grp.h}`;
+            root.userData.maxjsHair = true;
+            root.visible = grp.vis == null ? true : !!grp.vis;
+            root.add(instMesh);
+            maxRoot.add(root);
+
+            const entry = { root, mesh: instMesh };
+            hairMeshes.set(grp.h, entry);
+            return entry;
+        }
+
+        function applyHairInstances(groups) {
+            disposeHairInstances();
+            if (!Array.isArray(groups) || groups.length === 0) return;
+            for (const grp of groups) buildHairEntry(grp);
         }
 
         // ── ForestPack GPU Instancing ───────────────────────

@@ -48,6 +48,7 @@
 #include <ShlObj.h>
 #include <Shlwapi.h>
 #include <wincodec.h>
+#include <commctrl.h>
 #include <string>
 #include <vector>
 #include <array>
@@ -64,6 +65,7 @@
 #include <cwctype>
 #include <locale>
 #include <immintrin.h>
+#include <ppl.h>
 
 using namespace Microsoft::WRL;
 
@@ -3199,53 +3201,73 @@ static bool ExtractMeshFromMNMesh(MNMesh& mn,
             [](const FaceRef& a, const FaceRef& b) { return a.matID < b.matID; });
     }
 
-    std::vector<Point3> faceNormals;
-    struct SmNormKey { int posIdx; int faceIdx; };
-    struct SmNormKeyHash {
-        size_t operator()(const SmNormKey& k) const noexcept {
-            return size_t(k.posIdx) * 16777619u ^ size_t(k.faceIdx);
-        }
-    };
-    struct SmNormKeyEq {
-        bool operator()(const SmNormKey& a, const SmNormKey& b) const {
-            return a.posIdx == b.posIdx && a.faceIdx == b.faceIdx;
-        }
-    };
-    std::unordered_map<SmNormKey, Point3, SmNormKeyHash, SmNormKeyEq> smoothNormals;
+    // Per-corner smoothed normals, indexed by faceCornerStart[faceIdx] + localIdx.
+    // Avoids the hash-map-per-corner cost that dominated on 700k+ poly meshes and
+    // lets the face-normal and smooth-normal passes run on a PPL worker pool.
+    std::vector<int> faceCornerStart;
+    std::vector<Point3> cornerNormals;
     if (outNormals) {
-        // Compute face normals for all live faces (SSE cross product + normalize)
-        faceNormals.assign(numFaces, Point3(0, 0, 0));
-        for (auto& fr : liveFaces) {
-            MNFace* face = mn.F(fr.idx);
-            if (face->deg < 3) continue;
-            Point3 cross = CrossProductSSE(mn.P(face->vtx[0]), mn.P(face->vtx[1]), mn.P(face->vtx[2]));
-            faceNormals[fr.idx] = NormalizeSSE(cross);
-        }
+        faceCornerStart.assign(numFaces, 0);
+        std::vector<Point3> faceNormalsFlat(numFaces, Point3(0, 0, 0));
 
-        // Build per-vertex smooth normals respecting smoothing groups (bitwise).
-        struct VertFaceNormal { int faceIdx; DWORD smGrp; Point3 normal; };
-        std::unordered_map<int, std::vector<VertFaceNormal>> vertFaceNormals;
-        for (auto& fr : liveFaces) {
+        // Phase A: face normals — independent writes per faceIdx slot.
+        concurrency::parallel_for(size_t(0), liveFaces.size(), [&](size_t i) {
+            const FaceRef& fr = liveFaces[i];
             MNFace* face = mn.F(fr.idx);
-            const DWORD smGrp = face->smGroup;
+            if (face->deg < 3) return;
+            Point3 cross = CrossProductSSE(mn.P(face->vtx[0]), mn.P(face->vtx[1]), mn.P(face->vtx[2]));
+            faceNormalsFlat[fr.idx] = NormalizeSSE(cross);
+        });
+
+        // Phase B: build CSR vertex→corners index (serial; cheap O(totalCorners)).
+        std::vector<int> vertCornerOff(static_cast<size_t>(numVerts) + 1, 0);
+        int totalCorners = 0;
+        for (const FaceRef& fr : liveFaces) {
+            MNFace* face = mn.F(fr.idx);
+            faceCornerStart[fr.idx] = totalCorners;
+            totalCorners += face->deg;
             for (int v = 0; v < face->deg; v++) {
-                vertFaceNormals[face->vtx[v]].push_back({ fr.idx, smGrp, faceNormals[fr.idx] });
+                vertCornerOff[face->vtx[v] + 1]++;
+            }
+        }
+        for (int i = 1; i <= numVerts; i++) vertCornerOff[i] += vertCornerOff[i - 1];
+
+        struct VertCorner { int faceIdx; int localIdx; DWORD smGrp; };
+        std::vector<VertCorner> vertCornersFlat(static_cast<size_t>(totalCorners));
+        {
+            std::vector<int> cursor(numVerts, 0);
+            for (const FaceRef& fr : liveFaces) {
+                MNFace* face = mn.F(fr.idx);
+                const DWORD smGrp = face->smGroup;
+                for (int v = 0; v < face->deg; v++) {
+                    int pIdx = face->vtx[v];
+                    vertCornersFlat[vertCornerOff[pIdx] + cursor[pIdx]++] = { fr.idx, v, smGrp };
+                }
             }
         }
 
-        for (auto& [posIdx, faceNorms] : vertFaceNormals) {
-            for (auto& fn : faceNorms) {
-                Point3 accum = fn.normal;
-                if (fn.smGrp != 0) {
-                    for (auto& other : faceNorms) {
-                        if (other.faceIdx == fn.faceIdx) continue;
-                        if ((fn.smGrp & other.smGrp) != 0)
-                            accum += other.normal;
+        // Phase C: smooth-normal accumulation — each vertex index owns a disjoint
+        // slice of vertCornersFlat and writes to disjoint cornerNormals slots, so
+        // parallel_for is data-race-free.
+        cornerNormals.assign(static_cast<size_t>(totalCorners), Point3(0, 0, 0));
+        concurrency::parallel_for(0, numVerts, [&](int posIdx) {
+            const int beg = vertCornerOff[posIdx];
+            const int end = vertCornerOff[posIdx + 1];
+            for (int i = beg; i < end; i++) {
+                const VertCorner& c = vertCornersFlat[i];
+                Point3 accum = faceNormalsFlat[c.faceIdx];
+                if (c.smGrp != 0) {
+                    for (int j = beg; j < end; j++) {
+                        if (j == i) continue;
+                        const VertCorner& other = vertCornersFlat[j];
+                        if (other.faceIdx == c.faceIdx) continue;
+                        if ((c.smGrp & other.smGrp) != 0)
+                            accum += faceNormalsFlat[other.faceIdx];
                     }
                 }
-                smoothNormals[{ posIdx, fn.faceIdx }] = NormalizeSSE(accum);
+                cornerNormals[faceCornerStart[c.faceIdx] + c.localIdx] = NormalizeSSE(accum);
             }
-        }
+        });
     }
 
     // Estimate output sizes
@@ -3259,6 +3281,7 @@ static bool ExtractMeshFromMNMesh(MNMesh& mn,
     if (outControlIdx) outControlIdx->clear();
 
     std::unordered_map<MeshCornerKey, int, MeshCornerKeyHash> vertMap;
+    vertMap.reserve(static_cast<size_t>(estTris) * 3);
     Tab<int> triTab;
     int curMatID = -1;
 
@@ -3301,9 +3324,7 @@ static bool ExtractMeshFromMNMesh(MNMesh& mn,
                     verts.push_back(p.z);
 
                     if (outNormals) {
-                        SmNormKey nk = { (int)posIdx, fr.idx };
-                        auto nit = smoothNormals.find(nk);
-                        Point3 n = (nit != smoothNormals.end()) ? nit->second : faceNormals[fr.idx];
+                        const Point3& n = cornerNormals[faceCornerStart[fr.idx] + localIdx];
                         normals.push_back(n.x);
                         normals.push_back(n.y);
                         normals.push_back(n.z);
@@ -3438,33 +3459,59 @@ static bool ExtractMeshFromRawMesh(Mesh& mesh,
         });
     }
 
-    // Build smooth normals if requested
-    std::vector<Point3> faceNormals;
-    struct SmKey { int posIdx; DWORD smGrp; };
-    struct SmKeyHash { size_t operator()(const SmKey& k) const noexcept {
-        return size_t(k.posIdx) * 16777619u ^ size_t(k.smGrp); }};
-    struct SmKeyEq { bool operator()(const SmKey& a, const SmKey& b) const {
-        return a.posIdx == b.posIdx && a.smGrp == b.smGrp; }};
-    std::unordered_map<SmKey, Point3, SmKeyHash, SmKeyEq> smoothNormals;
+    // Per-corner smoothed normals: cornerNormals[f*3 + v]. Avoids the map
+    // hash cost that dominated on dense tri meshes and parallelizes the
+    // face-normal and smooth-normal passes.
+    std::vector<Point3> cornerNormals;
     if (outNormals) {
-        faceNormals.resize(nf, Point3(0,0,0));
-        for (int f = 0; f < nf; f++) {
-            Point3 a = mesh.getVert(mesh.faces[f].v[0]);
-            Point3 b = mesh.getVert(mesh.faces[f].v[1]);
-            Point3 c = mesh.getVert(mesh.faces[f].v[2]);
+        std::vector<Point3> faceNormals(nf);
+
+        concurrency::parallel_for(0, nf, [&](int f) {
+            const Point3 a = mesh.getVert(mesh.faces[f].v[0]);
+            const Point3 b = mesh.getVert(mesh.faces[f].v[1]);
+            const Point3 c = mesh.getVert(mesh.faces[f].v[2]);
             faceNormals[f] = Normalize((b - a) ^ (c - a));
-        }
+        });
+
+        std::vector<int> vertCornerOff(static_cast<size_t>(nv) + 1, 0);
         for (int f = 0; f < nf; f++) {
-            DWORD smGrp = mesh.faces[f].getSmGroup();
-            for (int v = 0; v < 3; v++) {
-                SmKey key = { (int)mesh.faces[f].v[v], smGrp };
-                smoothNormals[key] = smoothNormals[key] + faceNormals[f];
+            for (int v = 0; v < 3; v++) vertCornerOff[mesh.faces[f].v[v] + 1]++;
+        }
+        for (int i = 1; i <= nv; i++) vertCornerOff[i] += vertCornerOff[i - 1];
+
+        struct TriCorner { int faceIdx; int localV; DWORD smGrp; };
+        std::vector<TriCorner> vertCornersFlat(static_cast<size_t>(nf) * 3);
+        {
+            std::vector<int> cursor(nv, 0);
+            for (int f = 0; f < nf; f++) {
+                DWORD smGrp = mesh.faces[f].getSmGroup();
+                for (int v = 0; v < 3; v++) {
+                    int pIdx = mesh.faces[f].v[v];
+                    vertCornersFlat[vertCornerOff[pIdx] + cursor[pIdx]++] = { f, v, smGrp };
+                }
             }
         }
-        for (auto& kv : smoothNormals) kv.second = Normalize(kv.second);
+
+        cornerNormals.assign(static_cast<size_t>(nf) * 3, Point3(0, 0, 0));
+        concurrency::parallel_for(0, nv, [&](int posIdx) {
+            const int beg = vertCornerOff[posIdx];
+            const int end = vertCornerOff[posIdx + 1];
+            for (int i = beg; i < end; i++) {
+                const TriCorner& c = vertCornersFlat[i];
+                Point3 accum = faceNormals[c.faceIdx];
+                for (int j = beg; j < end; j++) {
+                    if (j == i) continue;
+                    const TriCorner& other = vertCornersFlat[j];
+                    if (other.faceIdx == c.faceIdx) continue;
+                    if (other.smGrp == c.smGrp) accum += faceNormals[other.faceIdx];
+                }
+                cornerNormals[c.faceIdx * 3 + c.localV] = Normalize(accum);
+            }
+        });
     }
 
     std::unordered_map<MeshCornerKey, int, MeshCornerKeyHash> vertMap;
+    vertMap.reserve(static_cast<size_t>(nf) * 3);
     verts.reserve(nv * 3);
     if (hasUVs) uvs.reserve(nv * 2);
     indices.reserve(nf * 3);
@@ -3500,9 +3547,7 @@ static bool ExtractMeshFromRawMesh(Mesh& mesh,
                 verts.push_back(p.z);
 
                 if (outNormals) {
-                    SmKey nk = { (int)posIdx, smGrp };
-                    auto nit = smoothNormals.find(nk);
-                    Point3 n = (nit != smoothNormals.end()) ? nit->second : faceNormals[f];
+                    const Point3& n = cornerNormals[f * 3 + v];
                     normals.push_back(n.x);
                     normals.push_back(n.y);
                     normals.push_back(n.z);
@@ -6305,12 +6350,25 @@ public:
         return name;
     }
 
-    // Get the export dist folder for a named project (or derive from scene name)
+    // Get the export dist folder for a named project (or derive from scene name).
+    // Lands next to the .max file: `<sceneDir>\<name>\dist`. If the scene folder
+    // is already named after the scene (e.g. `projects\flowerandbee\flowerandbee.max`)
+    // we skip the extra wrapper and use `<sceneDir>\dist` so a matching folder
+    // doesn't get nested twice.
     std::wstring GetNamedSnapshotDir(const std::wstring& exportName) {
         std::wstring name = exportName;
         if (name.empty()) name = DeriveSceneExportName();
         if (name.empty()) return GetSnapshotDir();  // fallback to active/dist
-        return GetProjectsRoot() + L"\\" + name + L"\\dist";
+
+        const std::wstring sceneDir = GetProjectDir();
+        if (sceneDir.empty()) return GetProjectsRoot() + L"\\" + name + L"\\dist";
+
+        const size_t split = sceneDir.find_last_of(L"\\/");
+        const std::wstring sceneFolderName = (split != std::wstring::npos) ? sceneDir.substr(split + 1) : sceneDir;
+        if (!sceneFolderName.empty() && _wcsicmp(sceneFolderName.c_str(), name.c_str()) == 0) {
+            return sceneDir + L"\\dist";
+        }
+        return sceneDir + L"\\" + name + L"\\dist";
     }
 
     bool CopySnapshotAsset(const std::wstring& rawPath,
@@ -9137,7 +9195,6 @@ public:
                 materialFastDirtyHandles_.clear();
                 SetDirtyImmediate();
                 return;
-                continue;
             }
 
             float col[3] = {0.8f, 0.8f, 0.8f};
@@ -10269,9 +10326,12 @@ public:
                 continue;
             }
 
-            // Hair handles are fully handled by SendHairFastUpdate — skip
-            // from the binary delta loop to avoid spurious transform commands.
-            if (hairHandles_.find(handle) != hairHandles_.end()) continue;
+            // Hair-only handles are fully handled by SendHairFastUpdate (strand
+            // matrices are world-space). But a hair-bearing mesh node also lives
+            // in geomHandles_ — its body still needs UpdateTransform, so only
+            // skip when the handle is hair-only.
+            if (hairHandles_.find(handle) != hairHandles_.end() &&
+                geomHandles_.find(handle) == geomHandles_.end()) continue;
 
             float xform[16];
             GetTransform16(node, t, xform);
@@ -13321,6 +13381,11 @@ public:
     RECT originalRect_ = {};
     RECT lastFloatingRect_ = {};
     bool haveLastFloatingRect_ = false;
+    RECT lastFloatingAnchorRect_ = {};
+    bool haveLastFloatingAnchorRect_ = false;
+    bool floatingInSizeMove_ = false;
+    bool hostSubclassAttached_ = false;
+    static constexpr UINT_PTR kHostSubclassId = 0xC0DE5A1Dull;
 
     bool IsViewportHosted() const {
         return originalParent_ != nullptr && embeddedViewportHwnd_ != nullptr;
@@ -13341,20 +13406,90 @@ public:
         haveLastFloatingRect_ = true;
     }
 
+    void BeginFloatingSizeMove() {
+        if (IsViewportHosted()) return;
+        floatingInSizeMove_ = true;
+    }
+
+    void EndFloatingSizeMove() {
+        if (IsViewportHosted()) return;
+        floatingInSizeMove_ = false;
+        RememberFloatingBounds();
+        haveLastFloatingAnchorRect_ = false;
+    }
+
+    static bool RectHasArea(const RECT& rect) {
+        return rect.right > rect.left && rect.bottom > rect.top;
+    }
+
+    static bool RectNear(const RECT& a, const RECT& b, int tolerance = 24) {
+        return std::abs(a.left - b.left) <= tolerance &&
+               std::abs(a.top - b.top) <= tolerance &&
+               std::abs(a.right - b.right) <= tolerance &&
+               std::abs(a.bottom - b.bottom) <= tolerance;
+    }
+
+    static bool RectSizeNear(const RECT& a, const RECT& b, int tolerance = 32) {
+        const int aWidth = a.right - a.left;
+        const int aHeight = a.bottom - a.top;
+        const int bWidth = b.right - b.left;
+        const int bHeight = b.bottom - b.top;
+        return std::abs(aWidth - bWidth) <= tolerance &&
+               std::abs(aHeight - bHeight) <= tolerance;
+    }
+
+    bool GetFloatingAnchorRect(RECT& anchorRect) const {
+        anchorRect = {};
+
+        HWND owner = GetWindow(hwnd_, GW_OWNER);
+        if ((!owner || !IsWindow(owner)) && GetCOREInterface()) {
+            owner = GetCOREInterface()->GetMAXHWnd();
+        }
+        if (!owner || !IsWindow(owner) || IsIconic(owner)) return false;
+        RECT clientRect = {};
+        if (GetClientRect(owner, &clientRect) && RectHasArea(clientRect)) {
+            POINT topLeft = { clientRect.left, clientRect.top };
+            POINT bottomRight = { clientRect.right, clientRect.bottom };
+            if (ClientToScreen(owner, &topLeft) && ClientToScreen(owner, &bottomRight)) {
+                anchorRect.left = topLeft.x;
+                anchorRect.top = topLeft.y;
+                anchorRect.right = bottomRight.x;
+                anchorRect.bottom = bottomRight.y;
+                if (RectHasArea(anchorRect)) return true;
+            }
+        }
+
+        if (!GetWindowRect(owner, &anchorRect)) return false;
+        return RectHasArea(anchorRect);
+    }
+
     void NotifyWebViewParentWindowPositionChanged() {
         if (!controller_) return;
         controller_->NotifyParentWindowPositionChanged();
     }
 
     void NormalizeFloatingWindow(bool forceRecenter = false) {
-        if (!hwnd_ || IsViewportHosted() || !IsWindowVisible(hwnd_) || IsIconic(hwnd_)) return;
+        if (!hwnd_ || IsViewportHosted() || !IsWindowVisible(hwnd_) || IsIconic(hwnd_) || floatingInSizeMove_) return;
 
         RECT rect = {};
         if (!GetWindowRect(hwnd_, &rect)) return;
 
+        RECT anchorRect = {};
+        const bool hasAnchorRect = GetFloatingAnchorRect(anchorRect);
+        const bool wasAnchoredToPreviousRect = haveLastFloatingAnchorRect_ &&
+            RectNear(rect, lastFloatingAnchorRect_, 8) &&
+            RectSizeNear(rect, lastFloatingAnchorRect_, 8);
+        const bool shouldTrackAnchor = hasAnchorRect &&
+            (IsZoomed(hwnd_) || wasAnchoredToPreviousRect);
+
         int width = rect.right - rect.left;
         int height = rect.bottom - rect.top;
         if (width < 320 || height < 240) forceRecenter = true;
+
+        if (shouldTrackAnchor) {
+            width = anchorRect.right - anchorRect.left;
+            height = anchorRect.bottom - anchorRect.top;
+        }
 
         HMONITOR monitor = MonitorFromRect(&rect, MONITOR_DEFAULTTONULL);
         if (!monitor) {
@@ -13380,7 +13515,10 @@ public:
 
         int x = rect.left;
         int y = rect.top;
-        if (forceRecenter) {
+        if (shouldTrackAnchor) {
+            x = anchorRect.left;
+            y = anchorRect.top;
+        } else if (forceRecenter) {
             x = static_cast<int>(work.left) + std::max(0, (workWidth - width) / 2);
             y = static_cast<int>(work.top) + std::max(0, (workHeight - height) / 2);
         } else {
@@ -13394,6 +13532,12 @@ public:
         }
 
         RememberFloatingBounds();
+        if (hasAnchorRect) {
+            lastFloatingAnchorRect_ = anchorRect;
+            haveLastFloatingAnchorRect_ = true;
+        } else {
+            haveLastFloatingAnchorRect_ = false;
+        }
     }
 
     bool MaintainViewportHost() {
@@ -13402,12 +13546,34 @@ public:
             return false;
         }
         if (!IsWindow(embeddedViewportHwnd_)) {
-            // The render session can legitimately end by tearing down the
-            // viewport host. Restore the floating panel instead of killing the
-            // entire MaxJS window.
-            RestoreFromViewport();
+            // Host HWND transiently invalid (3ds Max min/max, layout
+            // rebuilds, DPI changes). Don't tear down to floating —
+            // just hide and wait. ReparentIntoViewport reattaches on
+            // the next session; RestoreFromViewport is the only path
+            // that actually unhosts (EndSession / Escape / Destroy).
+            hostSubclassAttached_ = false;
+            if (IsWindowVisible(hwnd_)) ShowWindow(hwnd_, SW_HIDE);
             return false;
         }
+
+        // Alt+W maximizes the Nitrous viewport by expanding this very HWND to
+        // fill the whole Max window; mirroring that into the child would turn
+        // the WebView into a fullscreen takeover. Collapse the child to 0x0
+        // so it's effectively invisible without touching ShowWindow state
+        // (which races with Max's layout animation and causes flicker). On
+        // unmax, the normal reposition path below restores full size.
+        Interface* ip = GetCOREInterface();
+        if (ip && ip->IsViewportMaxed()) {
+            RECT cur = {};
+            if (GetClientRect(hwnd_, &cur) &&
+                (cur.right - cur.left != 0 || cur.bottom - cur.top != 0)) {
+                SetWindowPos(hwnd_, nullptr, 0, 0, 0, 0,
+                    SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS);
+            }
+            return false;
+        }
+
+        if (!hostSubclassAttached_) AttachHostSubclass();
 
         const LONG hostedStyle = WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_CLIPSIBLINGS;
         bool reattached = false;
@@ -13465,6 +13631,65 @@ public:
         return true;
     }
 
+    static LRESULT CALLBACK HostSubclassProc(HWND h, UINT msg, WPARAM w, LPARAM l,
+                                             UINT_PTR id, DWORD_PTR ref) {
+        auto* self = reinterpret_cast<MaxJSPanel*>(ref);
+        if (!self) return DefSubclassProc(h, msg, w, l);
+
+        switch (msg) {
+        case WM_SIZE:
+        case WM_WINDOWPOSCHANGED:
+            // ActiveShade host resized — mirror the new client rect to our
+            // WebView2 child immediately rather than waiting for the next
+            // 33ms timer tick. Keeps the child glued to the host during
+            // live drag-resizes and Max main-window maximize.
+            if (self->embeddedViewportHwnd_ == h && self->hwnd_ && IsWindow(self->hwnd_)) {
+                // Skip mirroring when the user hits Alt+W: Nitrous expands this
+                // HWND to cover the whole Max window, and MaintainViewportHost
+                // will hide the child on the next tick. Following the grown
+                // rect here would briefly fullscreen the WebView first.
+                Interface* ip = GetCOREInterface();
+                if (ip && ip->IsViewportMaxed()) break;
+                RECT vp = {};
+                if (GetClientRect(h, &vp)) {
+                    const int vw = vp.right - vp.left;
+                    const int vh = vp.bottom - vp.top;
+                    if (vw >= 64 && vh >= 64) {
+                        SetWindowPos(self->hwnd_, HWND_TOP, 0, 0, vw, vh,
+                            SWP_NOACTIVATE | SWP_NOCOPYBITS | SWP_SHOWWINDOW);
+                        self->Resize();
+                    }
+                }
+            }
+            break;
+        case WM_NCDESTROY:
+            RemoveWindowSubclass(h, &MaxJSPanel::HostSubclassProc, id);
+            if (self->embeddedViewportHwnd_ == h) {
+                self->hostSubclassAttached_ = false;
+            }
+            break;
+        }
+        return DefSubclassProc(h, msg, w, l);
+    }
+
+    void AttachHostSubclass() {
+        if (hostSubclassAttached_) return;
+        if (!embeddedViewportHwnd_ || !IsWindow(embeddedViewportHwnd_)) return;
+        if (SetWindowSubclass(embeddedViewportHwnd_, &MaxJSPanel::HostSubclassProc,
+                              kHostSubclassId, reinterpret_cast<DWORD_PTR>(this))) {
+            hostSubclassAttached_ = true;
+        }
+    }
+
+    void DetachHostSubclass() {
+        if (!hostSubclassAttached_) return;
+        if (embeddedViewportHwnd_ && IsWindow(embeddedViewportHwnd_)) {
+            RemoveWindowSubclass(embeddedViewportHwnd_,
+                                 &MaxJSPanel::HostSubclassProc, kHostSubclassId);
+        }
+        hostSubclassAttached_ = false;
+    }
+
     void StartActiveShade(Bitmap* target) {
         asTarget_ = target;
         asCapturing_ = true;
@@ -13486,6 +13711,8 @@ public:
             originalParent_ = GetParent(hwnd_);
             originalStyle_ = GetWindowLong(hwnd_, GWL_STYLE);
             GetWindowRect(hwnd_, &originalRect_);
+        } else if (embeddedViewportHwnd_ != viewportHwnd) {
+            DetachHostSubclass();
         }
         embeddedViewportHwnd_ = viewportHwnd;
 
@@ -13499,11 +13726,15 @@ public:
         SetWindowPos(hwnd_, HWND_TOP, 0, 0,
             vpRect.right, vpRect.bottom, SWP_SHOWWINDOW | SWP_NOACTIVATE | SWP_FRAMECHANGED);
         Resize();
+
+        AttachHostSubclass();
     }
 
     // Restore to original floating window
     void RestoreFromViewport() {
         if (!hwnd_ || !IsViewportHosted()) return;
+
+        DetachHostSubclass();
 
         HWND restoreParent = originalParent_;
         if (!restoreParent || !IsWindow(restoreParent)) {
@@ -13670,6 +13901,12 @@ public:
             return 0;
         case WM_MOVE:
             if (p) p->RememberFloatingBounds();
+            return 0;
+        case WM_ENTERSIZEMOVE:
+            if (p) p->BeginFloatingSizeMove();
+            return 0;
+        case WM_EXITSIZEMOVE:
+            if (p) p->EndFloatingSizeMove();
             return 0;
         case WM_FAST_FLUSH:
             if (p) p->FlushFastPath();

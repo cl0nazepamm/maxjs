@@ -655,6 +655,25 @@ function createMaxNodeAdapter({ handle, getObject, THREE, createAnchor, layerId,
             obj.getWorldScale(scale);
             return scale;
         },
+        get isLight() { return !!getObject()?.isLight; },
+        get isDirectionalLight() { return !!getObject()?.isDirectionalLight; },
+        /** For directional/spot lights: the normalized world-space direction the light shines toward.
+         *  For other lights/objects without a target: the object's local -Z transformed by world rotation. */
+        getLightDirection(target = new THREE.Vector3()) {
+            const obj = getObject();
+            if (!obj) return null;
+            if (obj.target) {
+                const p = new THREE.Vector3();
+                obj.getWorldPosition(p);
+                obj.target.getWorldPosition(target);
+                target.sub(p);
+            } else {
+                const q = new THREE.Quaternion();
+                obj.getWorldQuaternion(q);
+                target.set(0, 0, -1).applyQuaternion(q);
+            }
+            return target.lengthSq() > 0 ? target.normalize() : target.set(0, -1, 0);
+        },
         getBoundingBox() {
             const obj = getObject();
             return obj ? new THREE.Box3().setFromObject(obj) : null;
@@ -822,13 +841,35 @@ function createMaxSceneFacade({ scene, nodeMap, lightHandleMap, getAdapter, crea
     });
 }
 
-function createRendererFacade(renderer) {
+function createRendererFacade(renderer, THREE, scene) {
+    function pmremFromScene(sceneOrObj, sigma = 0, near = 0.1, far = 1_000_000) {
+        const pmrem = new THREE.PMREMGenerator(renderer);
+        const target = sceneOrObj?.isScene
+            ? sceneOrObj
+            : (() => {
+                const s = new THREE.Scene();
+                if (sceneOrObj) s.add(sceneOrObj);
+                return s;
+            })();
+        const rt = pmrem.fromScene(target, sigma, near, far);
+        pmrem.dispose();
+        return rt?.texture ?? null;
+    }
+    function pmremFromEquirectangular(texture) {
+        const pmrem = new THREE.PMREMGenerator(renderer);
+        const rt = pmrem.fromEquirectangular(texture);
+        pmrem.dispose();
+        return rt?.texture ?? null;
+    }
     return freezePlainObject({
         get capabilities() { return renderer.capabilities; },
         get info() { return renderer.info; },
         get domElement() { return renderer.domElement; },
         get width() { return renderer.domElement?.width ?? 0; },
         get height() { return renderer.domElement?.height ?? 0; },
+        get sceneRoot() { return scene; },
+        pmremFromScene,
+        pmremFromEquirectangular,
     });
 }
 
@@ -1524,7 +1565,7 @@ export function createLayerManager({
     }
 
     function buildContext(layer) {
-        const rendererFacade = createRendererFacade(renderer);
+        const rendererFacade = createRendererFacade(renderer, THREE, scene);
         const cameraFacade = createCameraAdapter(camera, THREE, ownForLayer, cameraControl, layer.id, debugWarn);
         const nodeMapFacade = createNodeMapFacade(nodeMap, handle => getLayerNodeAdapter(layer, handle));
         const maxSceneFacade = createMaxSceneFacade({

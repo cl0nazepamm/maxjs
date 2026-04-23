@@ -9037,6 +9037,18 @@
         // restoreInteractiveBrowserState() handles restore then sync.
 
         // ── Resize + Render ─────────────────────────────────
+        // WebGPU pipelines bound to the canvas swap chain get duplicated every
+        // time canvas.width / canvas.height change (forces context reconfigure
+        // and orphans the old swap-chain textures the pipelines reference).
+        // `renderer.setSize` touches canvas.width — so dragging a panel resize
+        // handle at 60fps used to fire 60 full pipeline rebuilds across every
+        // post-FX pass. The Inspector's "(not in use)" cascade on every pass
+        // was that churn being observed in-flight.
+        //
+        // Strategy: update camera + CSS immediately so the canvas visually
+        // tracks the drag (browser scales stale pixels smoothly), but defer
+        // the drawing-buffer resize + post-FX rebuild until dragging settles.
+        // One pipeline churn event per resize gesture instead of dozens.
         let resizeTimer = null;
         addEventListener('resize', () => {
             if (camera.isPerspectiveCamera) {
@@ -9048,10 +9060,21 @@
                 camera.bottom = -viewWidth / (2 * aspect);
             }
             camera.updateProjectionMatrix();
-            applyRendererPerformanceSettings({ resizePostFx: false });
-            // Debounce post-FX resize — only recompile after dragging stops
+            // CSS-only update keeps the canvas visually filling the viewport
+            // during drag. No drawing-buffer resize → no swap chain churn.
+            if (renderer?.domElement) {
+                renderer.domElement.style.width = innerWidth + 'px';
+                renderer.domElement.style.height = innerHeight + 'px';
+            }
+            if (splatOverlay?.renderer?.domElement) {
+                splatOverlay.renderer.domElement.style.width = innerWidth + 'px';
+                splatOverlay.renderer.domElement.style.height = innerHeight + 'px';
+            }
             clearTimeout(resizeTimer);
-            resizeTimer = setTimeout(() => ssgiFx.resize(), 200);
+            resizeTimer = setTimeout(() => {
+                applyRendererPerformanceSettings({ resizePostFx: false });
+                ssgiFx.resize();
+            }, 150);
         });
 
         // ── WebXR / VR ───────────────────────────────────────

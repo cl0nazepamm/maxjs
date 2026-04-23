@@ -735,6 +735,84 @@ static void WriteInts(std::wostringstream& ss, const int* d, size_t n) {
     ss << L']';
 }
 
+struct VertexColorAttributeRecord {
+    int channel = 0;
+    std::string attrName;
+    std::vector<float> values;
+    size_t off = 0;
+};
+
+static std::wstring WidenAscii(const std::string& s) {
+    return std::wstring(s.begin(), s.end());
+}
+
+static std::string GetVertexColorAttributeName(int channel) {
+    if (channel == 0) return "color";
+    if (channel == MAP_SHADING) return "maxjs_vc_shading";
+    if (channel == MAP_ALPHA) return "maxjs_vc_alpha";
+    return "maxjs_vc_" + std::to_string(channel);
+}
+
+static bool ShouldAllowVertexColorMapChannel1(INode* node) {
+    return node &&
+           node->GetVertexColorType() == nvct_map_channel &&
+           node->GetVertexColorMapChannel() == 1;
+}
+
+static void AppendVertexColorValue(std::vector<float>& dst, const UVVert& value, int channel) {
+    if (channel == MAP_ALPHA) {
+        dst.push_back(value.x);
+        dst.push_back(value.x);
+        dst.push_back(value.x);
+        dst.push_back(value.x);
+        return;
+    }
+
+    dst.push_back(value.x);
+    dst.push_back(value.y);
+    dst.push_back(value.z);
+    dst.push_back(1.0f);
+}
+
+static UVVert DefaultVertexColorValue(int channel) {
+    if (channel == MAP_ALPHA) return UVVert(1.0f, 1.0f, 1.0f);
+    return UVVert(0.0f, 0.0f, 0.0f);
+}
+
+static void WriteVertexColorAttributesJson(std::wostringstream& ss,
+                                           const std::vector<VertexColorAttributeRecord>& attrs) {
+    if (attrs.empty()) return;
+    ss << L",\"vc\":[";
+    for (size_t i = 0; i < attrs.size(); ++i) {
+        if (i) ss << L',';
+        const VertexColorAttributeRecord& attr = attrs[i];
+        ss << L"{\"ch\":" << attr.channel;
+        ss << L",\"name\":\"" << EscapeJson(WidenAscii(attr.attrName).c_str()) << L'"';
+        ss << L",\"itemSize\":4";
+        ss << L",\"v\":";
+        WriteFloats(ss, attr.values.data(), attr.values.size());
+        ss << L'}';
+    }
+    ss << L']';
+}
+
+static void WriteVertexColorOffsetsJson(std::wostringstream& ss,
+                                        const std::vector<VertexColorAttributeRecord>& attrs) {
+    if (attrs.empty()) return;
+    ss << L",\"vc\":[";
+    for (size_t i = 0; i < attrs.size(); ++i) {
+        if (i) ss << L',';
+        const VertexColorAttributeRecord& attr = attrs[i];
+        ss << L"{\"ch\":" << attr.channel;
+        ss << L",\"name\":\"" << EscapeJson(WidenAscii(attr.attrName).c_str()) << L'"';
+        ss << L",\"itemSize\":4";
+        ss << L",\"off\":" << attr.off;
+        ss << L",\"n\":" << attr.values.size();
+        ss << L'}';
+    }
+    ss << L']';
+}
+
 static uint64_t HashFNV1a(const void* data, size_t bytes, uint64_t seed = 1469598103934665603ULL) {
     const unsigned char* p = static_cast<const unsigned char*>(data);
     uint64_t h = seed;
@@ -768,7 +846,8 @@ static uint64_t HashIntervalState(const Interval& iv, uint64_t seed = 1469598103
 
 static uint64_t HashMeshData(const std::vector<float>& verts,
                              const std::vector<int>& indices,
-                             const std::vector<float>& uvs) {
+                             const std::vector<float>& uvs,
+                             const std::vector<VertexColorAttributeRecord>* vertexColors = nullptr) {
     uint64_t h = 1469598103934665603ULL;
     if (!verts.empty())
         h = HashFNV1a(verts.data(), verts.size() * sizeof(float), h);
@@ -776,6 +855,16 @@ static uint64_t HashMeshData(const std::vector<float>& verts,
         h = HashFNV1a(indices.data(), indices.size() * sizeof(int), h);
     if (!uvs.empty())
         h = HashFNV1a(uvs.data(), uvs.size() * sizeof(float), h);
+    if (vertexColors) {
+        const int count = static_cast<int>(vertexColors->size());
+        h = HashFNV1a(&count, sizeof(count), h);
+        for (const VertexColorAttributeRecord& attr : *vertexColors) {
+            h = HashFNV1a(&attr.channel, sizeof(attr.channel), h);
+            if (!attr.values.empty()) {
+                h = HashFNV1a(attr.values.data(), attr.values.size() * sizeof(float), h);
+            }
+        }
+    }
     return h;
 }
 
@@ -838,7 +927,113 @@ static uint64_t HashMNMeshState(MNMesh& mn) {
     return h;
 }
 
-static uint64_t HashMeshStateWithUVs(Mesh& mesh) {
+static bool ShouldExportMeshVertexColorChannel(Mesh& mesh, int channel, bool allowMapChannel1 = false) {
+    if (channel == 1 && !allowMapChannel1) return false;
+    if (!mesh.mapSupport(channel)) return false;
+
+    const MeshMap& map = mesh.Map(channel);
+    if (!map.IsUsed() || map.vnum <= 0 || map.fnum <= 0 || !map.tv || !map.tf) return false;
+    if (channel == 0 || channel == MAP_SHADING || channel == MAP_ALPHA) return true;
+    return (map.flags & MESHMAP_VERTCOLOR) != 0;
+}
+
+static std::vector<int> CollectMeshVertexColorChannels(Mesh& mesh, bool allowMapChannel1 = false) {
+    std::vector<int> channels;
+    if (ShouldExportMeshVertexColorChannel(mesh, 0, allowMapChannel1)) channels.push_back(0);
+    if (ShouldExportMeshVertexColorChannel(mesh, MAP_SHADING, allowMapChannel1)) channels.push_back(MAP_SHADING);
+    if (ShouldExportMeshVertexColorChannel(mesh, MAP_ALPHA, allowMapChannel1)) channels.push_back(MAP_ALPHA);
+    for (int channel = 1; channel < MAX_MESHMAPS; ++channel) {
+        if (channel == 0) continue;
+        if (ShouldExportMeshVertexColorChannel(mesh, channel, allowMapChannel1)) channels.push_back(channel);
+    }
+    return channels;
+}
+
+static MNMap* TryGetMNMap(MNMesh& mn, int channel) {
+    if (channel >= 0 && channel >= mn.MNum()) return nullptr;
+    return mn.M(channel);
+}
+
+static bool ShouldExportMNVertexColorChannel(MNMesh& mn, int channel, bool allowMapChannel1 = false) {
+    if (channel == 1 && !allowMapChannel1) return false;
+    MNMap* map = TryGetMNMap(mn, channel);
+    if (!map || map->GetFlag(MN_DEAD) != 0 || map->numv <= 0 || map->numf <= 0 || !map->v) return false;
+    if (channel == 0 || channel == MAP_SHADING || channel == MAP_ALPHA) return true;
+    return channel > 1 || (channel == 1 && allowMapChannel1);
+}
+
+static std::vector<int> CollectMNMeshVertexColorChannels(MNMesh& mn, bool allowMapChannel1 = false) {
+    std::vector<int> channels;
+    if (ShouldExportMNVertexColorChannel(mn, 0, allowMapChannel1)) channels.push_back(0);
+    if (ShouldExportMNVertexColorChannel(mn, MAP_SHADING, allowMapChannel1)) channels.push_back(MAP_SHADING);
+    if (ShouldExportMNVertexColorChannel(mn, MAP_ALPHA, allowMapChannel1)) channels.push_back(MAP_ALPHA);
+    for (int channel = 1; channel < mn.MNum(); ++channel) {
+        if (ShouldExportMNVertexColorChannel(mn, channel, allowMapChannel1)) channels.push_back(channel);
+    }
+    return channels;
+}
+
+static uint64_t HashMeshVertexColorChannels(Mesh& mesh,
+                                            const std::vector<int>& channels,
+                                            uint64_t seed) {
+    uint64_t h = seed;
+    const int count = static_cast<int>(channels.size());
+    h = HashFNV1a(&count, sizeof(count), h);
+    for (int channel : channels) {
+        h = HashFNV1a(&channel, sizeof(channel), h);
+        const MeshMap& map = mesh.Map(channel);
+        const int numVerts = map.vnum;
+        const int numFaces = map.fnum;
+        h = HashFNV1a(&numVerts, sizeof(numVerts), h);
+        h = HashFNV1a(&numFaces, sizeof(numFaces), h);
+        if (numVerts > 0 && map.tv) {
+            h = HashFNV1a(map.tv, static_cast<size_t>(numVerts) * sizeof(UVVert), h);
+        }
+        if (numFaces > 0 && map.tf) {
+            for (int i = 0; i < numFaces; ++i) {
+                h = HashFNV1a(map.tf[i].t, sizeof(map.tf[i].t), h);
+            }
+        }
+    }
+    return h;
+}
+
+static uint64_t HashMNMeshVertexColorChannels(MNMesh& mn,
+                                              const std::vector<int>& channels,
+                                              uint64_t seed) {
+    uint64_t h = seed;
+    const int count = static_cast<int>(channels.size());
+    h = HashFNV1a(&count, sizeof(count), h);
+    for (int channel : channels) {
+        h = HashFNV1a(&channel, sizeof(channel), h);
+        MNMap* map = TryGetMNMap(mn, channel);
+        const int numVerts = map ? map->numv : 0;
+        const int numFaces = map ? map->numf : 0;
+        h = HashFNV1a(&numVerts, sizeof(numVerts), h);
+        h = HashFNV1a(&numFaces, sizeof(numFaces), h);
+        if (!map) continue;
+        for (int i = 0; i < numVerts; ++i) {
+            const UVVert value = map->v[i];
+            h = HashFNV1a(&value, sizeof(value), h);
+        }
+        for (int i = 0; i < numFaces; ++i) {
+            MNMapFace* mapFace = map->F(i);
+            if (!mapFace) {
+                const int deg = -1;
+                h = HashFNV1a(&deg, sizeof(deg), h);
+                continue;
+            }
+            const int deg = mapFace->deg;
+            h = HashFNV1a(&deg, sizeof(deg), h);
+            if (deg > 0 && mapFace->tv) {
+                h = HashFNV1a(mapFace->tv, sizeof(int) * static_cast<size_t>(deg), h);
+            }
+        }
+    }
+    return h;
+}
+
+static uint64_t HashMeshStateWithUVs(Mesh& mesh, bool allowMapChannel1 = false) {
     uint64_t h = HashMeshState(mesh);
     const int numTVerts = mesh.getNumTVerts();
     h = HashFNV1a(&numTVerts, sizeof(numTVerts), h);
@@ -852,10 +1047,12 @@ static uint64_t HashMeshStateWithUVs(Mesh& mesh) {
             h = HashFNV1a(mesh.tvFace[i].t, sizeof(mesh.tvFace[i].t), h);
         }
     }
+    const std::vector<int> vertexColorChannels = CollectMeshVertexColorChannels(mesh, allowMapChannel1);
+    h = HashMeshVertexColorChannels(mesh, vertexColorChannels, h);
     return h;
 }
 
-static uint64_t HashMNMeshStateWithUVs(MNMesh& mn) {
+static uint64_t HashMNMeshStateWithUVs(MNMesh& mn, bool allowMapChannel1 = false) {
     uint64_t h = HashMNMeshState(mn);
 
     MNMap* uvMap = mn.M(1);
@@ -886,6 +1083,8 @@ static uint64_t HashMNMeshStateWithUVs(MNMesh& mn) {
         }
     }
 
+    const std::vector<int> vertexColorChannels = CollectMNMeshVertexColorChannels(mn, allowMapChannel1);
+    h = HashMNMeshVertexColorChannels(mn, vertexColorChannels, h);
     return h;
 }
 
@@ -3146,11 +3345,13 @@ struct MeshCornerKey {
     DWORD posIdx = 0;
     DWORD uvIdx = 0;
     DWORD smGroup = 0;
+    uint64_t colorSig = 0;
 
     bool operator==(const MeshCornerKey& other) const {
         return posIdx == other.posIdx &&
                uvIdx == other.uvIdx &&
-               smGroup == other.smGroup;
+               smGroup == other.smGroup &&
+               colorSig == other.colorSig;
     }
 };
 
@@ -3159,6 +3360,8 @@ struct MeshCornerKeyHash {
         size_t h = static_cast<size_t>(key.posIdx);
         h = h * 16777619u ^ static_cast<size_t>(key.uvIdx);
         h = h * 16777619u ^ static_cast<size_t>(key.smGroup);
+        h = h * 16777619u ^ static_cast<size_t>(key.colorSig);
+        h = h * 16777619u ^ static_cast<size_t>(key.colorSig >> 32);
         return h;
     }
 };
@@ -3170,7 +3373,9 @@ static bool ExtractMeshFromMNMesh(MNMesh& mn,
                                   std::vector<int>& indices,
                                   std::vector<MatGroup>& groups,
                                   std::vector<float>* outNormals = nullptr,
-                                  std::vector<int>* outControlIdx = nullptr) {
+                                  std::vector<int>* outControlIdx = nullptr,
+                                  std::vector<VertexColorAttributeRecord>* outVertexColors = nullptr,
+                                  bool allowMapChannel1 = false) {
     const int numFaces = mn.FNum();
     const int numVerts = mn.VNum();
     if (numFaces == 0 || numVerts == 0) return false;
@@ -3178,6 +3383,12 @@ static bool ExtractMeshFromMNMesh(MNMesh& mn,
     // UV map channel 1
     MNMap* uvMap = mn.M(1);
     const bool hasUVs = uvMap && uvMap->GetFlag(MN_DEAD) == 0 && uvMap->numv > 0;
+    const std::vector<int> vertexColorChannels = CollectMNMeshVertexColorChannels(mn, allowMapChannel1);
+    std::vector<MNMap*> vertexColorMaps;
+    vertexColorMaps.reserve(vertexColorChannels.size());
+    for (int channel : vertexColorChannels) {
+        vertexColorMaps.push_back(TryGetMNMap(mn, channel));
+    }
 
     // Count live faces + sort by matID
     struct FaceRef { int idx; MtlID matID; };
@@ -3279,6 +3490,18 @@ static bool ExtractMeshFromMNMesh(MNMesh& mn,
     std::vector<float> normals;
     if (outNormals) normals.reserve(numVerts * 3);
     if (outControlIdx) outControlIdx->clear();
+    if (outVertexColors) {
+        outVertexColors->clear();
+        outVertexColors->reserve(vertexColorChannels.size());
+        const size_t estVertexCount = static_cast<size_t>(std::max(numVerts, estTris * 3));
+        for (int channel : vertexColorChannels) {
+            VertexColorAttributeRecord attr;
+            attr.channel = channel;
+            attr.attrName = GetVertexColorAttributeName(channel);
+            attr.values.reserve(estVertexCount * 4);
+            outVertexColors->push_back(std::move(attr));
+        }
+    }
 
     std::unordered_map<MeshCornerKey, int, MeshCornerKeyHash> vertMap;
     vertMap.reserve(static_cast<size_t>(estTris) * 3);
@@ -3307,10 +3530,24 @@ static bool ExtractMeshFromMNMesh(MNMesh& mn,
                 int localIdx = triTab[ti * 3 + tv];
                 DWORD posIdx = face->vtx[localIdx];
                 DWORD uvIdx = (uvFace && localIdx < uvFace->deg) ? uvFace->tv[localIdx] : 0;
+                uint64_t colorSig = 1469598103934665603ULL;
+                for (size_t ci = 0; ci < vertexColorChannels.size(); ++ci) {
+                    const int channel = vertexColorChannels[ci];
+                    MNMap* colorMap = vertexColorMaps[ci];
+                    int colorIdx = -1;
+                    if (colorMap && fr.idx < colorMap->numf) {
+                        MNMapFace* colorFace = colorMap->F(fr.idx);
+                        if (colorFace && localIdx < colorFace->deg && colorFace->tv) {
+                            colorIdx = colorFace->tv[localIdx];
+                        }
+                    }
+                    colorSig = HashFNV1a(&channel, sizeof(channel), colorSig);
+                    colorSig = HashFNV1a(&colorIdx, sizeof(colorIdx), colorSig);
+                }
 
                 // smGrp 0 = no smoothing: force unique vertices per face for flat normals
                 DWORD keySmGrp = smGrp == 0 ? (DWORD)(0x80000000u | fr.idx) : smGrp;
-                MeshCornerKey key = { posIdx, uvIdx, keySmGrp };
+                MeshCornerKey key = { posIdx, uvIdx, keySmGrp, colorSig };
                 auto it = vertMap.find(key);
                 if (it != vertMap.end()) {
                     indices.push_back(it->second);
@@ -3339,6 +3576,25 @@ static bool ExtractMeshFromMNMesh(MNMesh& mn,
                         uvs.push_back(0.0f);
                     }
 
+                    if (outVertexColors) {
+                        for (size_t ci = 0; ci < vertexColorChannels.size(); ++ci) {
+                            const int channel = vertexColorChannels[ci];
+                            MNMap* colorMap = vertexColorMaps[ci];
+                            UVVert value = DefaultVertexColorValue(channel);
+                            int colorIdx = -1;
+                            if (colorMap && fr.idx < colorMap->numf) {
+                                MNMapFace* colorFace = colorMap->F(fr.idx);
+                                if (colorFace && localIdx < colorFace->deg && colorFace->tv) {
+                                    colorIdx = colorFace->tv[localIdx];
+                                }
+                            }
+                            if (colorMap && colorIdx >= 0 && colorIdx < colorMap->numv) {
+                                value = colorMap->v[colorIdx];
+                            }
+                            AppendVertexColorValue((*outVertexColors)[ci].values, value, channel);
+                        }
+                    }
+
                     if (outControlIdx) outControlIdx->push_back(static_cast<int>(posIdx));
                     indices.push_back(newIdx);
                 }
@@ -3347,6 +3603,7 @@ static bool ExtractMeshFromMNMesh(MNMesh& mn,
         }
     }
     if (outNormals) *outNormals = std::move(normals);
+    if (outVertexColors && outVertexColors->empty()) outVertexColors->clear();
     return !indices.empty();
 }
 
@@ -3356,7 +3613,9 @@ static bool ExtractMeshFromTriObject(TriObject* tri, Object* srcObj,
                                      std::vector<float>& uvs,
                                      std::vector<int>& indices,
                                      std::vector<MatGroup>& groups,
-                                     std::vector<int>* outControlIdx = nullptr) {
+                                     std::vector<int>* outControlIdx = nullptr,
+                                     std::vector<VertexColorAttributeRecord>* outVertexColors = nullptr,
+                                     bool allowMapChannel1 = false) {
     Mesh& mesh = tri->GetMesh();
     int nv = mesh.getNumVerts();
     int nf = mesh.getNumFaces();
@@ -3367,6 +3626,7 @@ static bool ExtractMeshFromTriObject(TriObject* tri, Object* srcObj,
     }
 
     bool hasUVs = mesh.getNumTVerts() > 0;
+    const std::vector<int> vertexColorChannels = CollectMeshVertexColorChannels(mesh, allowMapChannel1);
 
     std::vector<int> faceOrder;
     faceOrder.reserve(nf);
@@ -3387,6 +3647,17 @@ static bool ExtractMeshFromTriObject(TriObject* tri, Object* srcObj,
     if (hasUVs) uvs.reserve(nv * 2);
     indices.reserve(nf * 3);
     if (outControlIdx) outControlIdx->clear();
+    if (outVertexColors) {
+        outVertexColors->clear();
+        outVertexColors->reserve(vertexColorChannels.size());
+        for (int channel : vertexColorChannels) {
+            VertexColorAttributeRecord attr;
+            attr.channel = channel;
+            attr.attrName = GetVertexColorAttributeName(channel);
+            attr.values.reserve(static_cast<size_t>(nf) * 3 * 4);
+            outVertexColors->push_back(std::move(attr));
+        }
+    }
 
     int curMatID = -1;
     for (int fi = 0; fi < nf; fi++) {
@@ -3401,7 +3672,17 @@ static bool ExtractMeshFromTriObject(TriObject* tri, Object* srcObj,
         for (int v = 0; v < 3; v++) {
             DWORD posIdx = mesh.faces[f].v[v];
             DWORD uvIdx  = hasUVs ? mesh.tvFace[f].t[v] : 0;
-            MeshCornerKey key = { posIdx, uvIdx, mesh.faces[f].getSmGroup() };
+            uint64_t colorSig = 1469598103934665603ULL;
+            for (int channel : vertexColorChannels) {
+                int colorIdx = -1;
+                const MeshMap& colorMap = mesh.Map(channel);
+                if (colorMap.tf && f < colorMap.fnum) {
+                    colorIdx = colorMap.tf[f].t[v];
+                }
+                colorSig = HashFNV1a(&channel, sizeof(channel), colorSig);
+                colorSig = HashFNV1a(&colorIdx, sizeof(colorIdx), colorSig);
+            }
+            MeshCornerKey key = { posIdx, uvIdx, mesh.faces[f].getSmGroup(), colorSig };
 
             auto it = vertMap.find(key);
             if (it != vertMap.end()) {
@@ -3421,6 +3702,22 @@ static bool ExtractMeshFromTriObject(TriObject* tri, Object* srcObj,
                     uvs.push_back(uv.y);
                 }
 
+                if (outVertexColors) {
+                    for (size_t ci = 0; ci < vertexColorChannels.size(); ++ci) {
+                        const int channel = vertexColorChannels[ci];
+                        const MeshMap& colorMap = mesh.Map(channel);
+                        UVVert value = DefaultVertexColorValue(channel);
+                        int colorIdx = -1;
+                        if (colorMap.tf && f < colorMap.fnum) {
+                            colorIdx = colorMap.tf[f].t[v];
+                        }
+                        if (colorIdx >= 0 && colorIdx < colorMap.vnum && colorMap.tv) {
+                            value = colorMap.tv[colorIdx];
+                        }
+                        AppendVertexColorValue((*outVertexColors)[ci].values, value, channel);
+                    }
+                }
+
                 if (outControlIdx) outControlIdx->push_back(static_cast<int>(posIdx));
                 indices.push_back(newIdx);
             }
@@ -3438,12 +3735,15 @@ static bool ExtractMeshFromRawMesh(Mesh& mesh,
                                    std::vector<float>& uvs,
                                    std::vector<int>& indices,
                                    std::vector<MatGroup>& groups,
-                                   std::vector<float>* outNormals = nullptr) {
+                                   std::vector<float>* outNormals = nullptr,
+                                   std::vector<VertexColorAttributeRecord>* outVertexColors = nullptr,
+                                   bool allowMapChannel1 = false) {
     int nv = mesh.getNumVerts();
     int nf = mesh.getNumFaces();
     if (nv == 0 || nf == 0) return false;
 
     bool hasUVs = mesh.getNumTVerts() > 0;
+    const std::vector<int> vertexColorChannels = CollectMeshVertexColorChannels(mesh, allowMapChannel1);
 
     std::vector<int> faceOrder;
     faceOrder.reserve(nf);
@@ -3517,6 +3817,17 @@ static bool ExtractMeshFromRawMesh(Mesh& mesh,
     indices.reserve(nf * 3);
     std::vector<float> normals;
     if (outNormals) normals.reserve(nv * 3);
+    if (outVertexColors) {
+        outVertexColors->clear();
+        outVertexColors->reserve(vertexColorChannels.size());
+        for (int channel : vertexColorChannels) {
+            VertexColorAttributeRecord attr;
+            attr.channel = channel;
+            attr.attrName = GetVertexColorAttributeName(channel);
+            attr.values.reserve(static_cast<size_t>(nf) * 3 * 4);
+            outVertexColors->push_back(std::move(attr));
+        }
+    }
 
     int curMatID = -1;
     for (int fi = 0; fi < nf; fi++) {
@@ -3532,7 +3843,17 @@ static bool ExtractMeshFromRawMesh(Mesh& mesh,
             DWORD posIdx = mesh.faces[f].v[v];
             DWORD uvIdx  = hasUVs ? mesh.tvFace[f].t[v] : 0;
             DWORD smGrp  = mesh.faces[f].getSmGroup();
-            MeshCornerKey key = { posIdx, uvIdx, smGrp };
+            uint64_t colorSig = 1469598103934665603ULL;
+            for (int channel : vertexColorChannels) {
+                int colorIdx = -1;
+                const MeshMap& colorMap = mesh.Map(channel);
+                if (colorMap.tf && f < colorMap.fnum) {
+                    colorIdx = colorMap.tf[f].t[v];
+                }
+                colorSig = HashFNV1a(&channel, sizeof(channel), colorSig);
+                colorSig = HashFNV1a(&colorIdx, sizeof(colorIdx), colorSig);
+            }
+            MeshCornerKey key = { posIdx, uvIdx, smGrp, colorSig };
 
             auto it = vertMap.find(key);
             if (it != vertMap.end()) {
@@ -3557,6 +3878,22 @@ static bool ExtractMeshFromRawMesh(Mesh& mesh,
                     UVVert uv = mesh.tVerts[uvIdx];
                     uvs.push_back(uv.x);
                     uvs.push_back(uv.y);
+                }
+
+                if (outVertexColors) {
+                    for (size_t ci = 0; ci < vertexColorChannels.size(); ++ci) {
+                        const int channel = vertexColorChannels[ci];
+                        const MeshMap& colorMap = mesh.Map(channel);
+                        UVVert value = DefaultVertexColorValue(channel);
+                        int colorIdx = -1;
+                        if (colorMap.tf && f < colorMap.fnum) {
+                            colorIdx = colorMap.tf[f].t[v];
+                        }
+                        if (colorIdx >= 0 && colorIdx < colorMap.vnum && colorMap.tv) {
+                            value = colorMap.tv[colorIdx];
+                        }
+                        AppendVertexColorValue((*outVertexColors)[ci].values, value, channel);
+                    }
                 }
 
                 indices.push_back(newIdx);
@@ -3733,9 +4070,11 @@ static bool ExtractMesh(INode* node, TimeValue t,
                         std::vector<int>& indices,
                         std::vector<MatGroup>& groups,
                         std::vector<float>* normals = nullptr,
-                        std::vector<int>* controlIdx = nullptr) {
+                        std::vector<int>* controlIdx = nullptr,
+                        std::vector<VertexColorAttributeRecord>* outVertexColors = nullptr) {
+    const bool allowMapChannel1 = ShouldAllowVertexColorMapChannel1(node);
     if (MNMesh* liveMN = TryGetLiveEditablePolyMesh(node)) {
-        return ExtractMeshFromMNMesh(*liveMN, verts, uvs, indices, groups, normals, controlIdx);
+        return ExtractMeshFromMNMesh(*liveMN, verts, uvs, indices, groups, normals, controlIdx, outVertexColors, allowMapChannel1);
     }
 
     ObjectState os = node->EvalWorldState(t);
@@ -3750,7 +4089,7 @@ static bool ExtractMesh(INode* node, TimeValue t,
     if (os.obj->IsSubClassOf(polyObjectClassID)) {
         PolyObject* poly = static_cast<PolyObject*>(os.obj);
         MNMesh& mn = poly->GetMesh();
-        return ExtractMeshFromMNMesh(mn, verts, uvs, indices, groups, normals, controlIdx);
+        return ExtractMeshFromMNMesh(mn, verts, uvs, indices, groups, normals, controlIdx, outVertexColors, allowMapChannel1);
     }
 
     // Fallback: convert to TriObject for non-poly geometry (primitives, patches, etc.)
@@ -3758,15 +4097,16 @@ static bool ExtractMesh(INode* node, TimeValue t,
     TriObject* tri = static_cast<TriObject*>(
         os.obj->ConvertToType(t, Class_ID(TRIOBJ_CLASS_ID, 0)));
     if (!tri) return false;
-    return ExtractMeshFromTriObject(tri, os.obj, verts, uvs, indices, groups, controlIdx);
+    return ExtractMeshFromTriObject(tri, os.obj, verts, uvs, indices, groups, controlIdx, outVertexColors, allowMapChannel1);
 }
 
 static bool TryHashExtractedRenderableGeometry(INode* node, TimeValue t, uint64_t& outHash) {
     std::vector<float> verts, uvs;
     std::vector<int> indices;
     std::vector<MatGroup> groups;
-    if (ExtractMesh(node, t, verts, uvs, indices, groups)) {
-        outHash = HashMeshData(verts, indices, uvs);
+    std::vector<VertexColorAttributeRecord> vertexColors;
+    if (ExtractMesh(node, t, verts, uvs, indices, groups, nullptr, nullptr, &vertexColors)) {
+        outHash = HashMeshData(verts, indices, uvs, &vertexColors);
         return true;
     }
 
@@ -3779,8 +4119,9 @@ static bool TryHashExtractedRenderableGeometry(INode* node, TimeValue t, uint64_
 }
 
 static bool TryHashRenderableGeometryState(INode* node, TimeValue t, uint64_t& outHash) {
+    const bool allowMapChannel1 = ShouldAllowVertexColorMapChannel1(node);
     if (MNMesh* liveMN = TryGetLiveEditablePolyMesh(node)) {
-        outHash = HashMNMeshStateWithUVs(*liveMN);
+        outHash = HashMNMeshStateWithUVs(*liveMN, allowMapChannel1);
         return true;
     }
 
@@ -3800,7 +4141,7 @@ static bool TryHashRenderableGeometryState(INode* node, TimeValue t, uint64_t& o
 
     if (os.obj->IsSubClassOf(polyObjectClassID)) {
         PolyObject* poly = static_cast<PolyObject*>(os.obj);
-        outHash = HashMNMeshStateWithUVs(poly->GetMesh());
+        outHash = HashMNMeshStateWithUVs(poly->GetMesh(), allowMapChannel1);
         return true;
     }
 
@@ -3808,9 +4149,33 @@ static bool TryHashRenderableGeometryState(INode* node, TimeValue t, uint64_t& o
     TriObject* tri = static_cast<TriObject*>(os.obj->ConvertToType(t, Class_ID(TRIOBJ_CLASS_ID, 0)));
     if (!tri) return false;
 
-    outHash = HashMeshStateWithUVs(tri->GetMesh());
+    outHash = HashMeshStateWithUVs(tri->GetMesh(), allowMapChannel1);
     if (tri != os.obj) tri->DeleteThis();
     return true;
+}
+
+static bool NodeHasExtractableVertexColors(INode* node, TimeValue t) {
+    if (!node) return false;
+    const bool allowMapChannel1 = ShouldAllowVertexColorMapChannel1(node);
+    if (MNMesh* liveMN = TryGetLiveEditablePolyMesh(node)) {
+        return !CollectMNMeshVertexColorChannels(*liveMN, allowMapChannel1).empty();
+    }
+
+    ObjectState os = node->EvalWorldState(t);
+    if (!os.obj || os.obj->SuperClassID() != GEOMOBJECT_CLASS_ID) return false;
+    if (IsThreeJSSplatClassID(os.obj->ClassID())) return false;
+
+    if (os.obj->IsSubClassOf(polyObjectClassID)) {
+        PolyObject* poly = static_cast<PolyObject*>(os.obj);
+        return !CollectMNMeshVertexColorChannels(poly->GetMesh(), allowMapChannel1).empty();
+    }
+
+    if (!os.obj->CanConvertToType(Class_ID(TRIOBJ_CLASS_ID, 0))) return false;
+    TriObject* tri = static_cast<TriObject*>(os.obj->ConvertToType(t, Class_ID(TRIOBJ_CLASS_ID, 0)));
+    if (!tri) return false;
+    const bool hasVertexColors = !CollectMeshVertexColorChannels(tri->GetMesh(), allowMapChannel1).empty();
+    if (tri != os.obj) tri->DeleteThis();
+    return hasVertexColors;
 }
 
 static bool ExtractSkinnedFastPositions(INode* node,
@@ -5857,6 +6222,7 @@ public:
     CameraData lastSentCamera_ = {};
     ULONG lockedCameraHandle_ = 0;  // 0 = viewport (default), nonzero = scene camera handle
     SceneEventNamespace::CallbackKey fastNodeEventCallbackKey_ = 0;
+    bool callbacksRegistered_ = false;
     MaxJSFastNodeEventCallback fastNodeEvents_;
     MaxJSFastRedrawCallback fastRedrawCallback_;
     MaxJSFastTimeChangeCallback fastTimeChangeCallback_;
@@ -6147,7 +6513,7 @@ public:
         useBinary_ = SUCCEEDED(webview_->QueryInterface(IID_PPV_ARGS(&wv17))) && wv17
                   && SUCCEEDED(env_->QueryInterface(IID_PPV_ARGS(&env12))) && env12;
 
-        RegisterCallbacks();
+        RefreshCallbackRegistration();
         LoadContent();
     }
 
@@ -6505,6 +6871,7 @@ public:
         bool visible = true;
         bool spline = false;
         std::vector<float> verts, uvs, norms;
+        std::vector<VertexColorAttributeRecord> vertexColors;
         std::vector<int> indices;
         std::vector<MatGroup> groups;
         size_t vOff = 0, iOff = 0, uvOff = 0, nOff = 0;
@@ -8014,7 +8381,7 @@ public:
                     !node->IsNodeHidden(TRUE) && node->GetVisibility(t) > 0.0f && node->Renderable();
 
                 bool extracted = ExtractMesh(node, t, snapshotNode.verts, snapshotNode.uvs,
-                    snapshotNode.indices, snapshotNode.groups, &snapshotNode.norms);
+                    snapshotNode.indices, snapshotNode.groups, &snapshotNode.norms, nullptr, &snapshotNode.vertexColors);
 
                 if (!extracted && ShouldExtractRenderableShape(node, t, &os)) {
                     extracted = ExtractSpline(node, t, snapshotNode.verts, snapshotNode.indices);
@@ -8022,6 +8389,7 @@ public:
                     if (extracted) {
                         snapshotNode.uvs.clear();
                         snapshotNode.norms.clear();
+                        snapshotNode.vertexColors.clear();
                         snapshotNode.groups.clear();
                     }
                 }
@@ -8068,6 +8436,10 @@ public:
                     totalBytes += snapshotNode.uvs.size() * sizeof(float);
                     snapshotNode.nOff = totalBytes;
                     totalBytes += snapshotNode.norms.size() * sizeof(float);
+                    for (VertexColorAttributeRecord& attr : snapshotNode.vertexColors) {
+                        attr.off = totalBytes;
+                        totalBytes += attr.values.size() * sizeof(float);
+                    }
                     if (snapshotNode.skinRig) {
                         snapshotNode.skinWOff = totalBytes;
                         totalBytes += snapshotNode.skinWData.size() * sizeof(float);
@@ -8139,6 +8511,11 @@ public:
             if (!node.norms.empty()) {
                 memcpy(buffer + node.nOff, node.norms.data(), node.norms.size() * sizeof(float));
             }
+            for (const VertexColorAttributeRecord& attr : node.vertexColors) {
+                if (!attr.values.empty()) {
+                    memcpy(buffer + attr.off, attr.values.data(), attr.values.size() * sizeof(float));
+                }
+            }
             if (node.skinRig) {
                 if (!node.skinWData.empty()) {
                     memcpy(buffer + node.skinWOff, node.skinWData.data(), node.skinWData.size() * sizeof(float));
@@ -8182,6 +8559,7 @@ public:
                 ss << L",\"nOff\":" << node.nOff;
                 ss << L",\"nN\":" << node.norms.size();
             }
+            WriteVertexColorOffsetsJson(ss, node.vertexColors);
             ss << L'}';
             if (node.skinRig) {
                 ss << L",\"skin\":{";
@@ -9307,6 +9685,7 @@ public:
         if (IsSubObjectEditingActive()) return true;
         if (IsCreateTaskActive()) return true;
         if (!IsModifyTaskActive()) return false;
+        if (!ShouldFavorInteractivePerformance()) return false;
 
         Interface* ip = GetCOREInterface();
         if (!ip || !node) return false;
@@ -9673,6 +10052,7 @@ public:
     }
 
     void RegisterCallbacks() {
+        if (callbacksRegistered_) return;
         RegisterNotification(OnSceneChanged, this, NOTIFY_SCENE_ADDED_NODE);
         RegisterNotification(OnSceneChanged, this, NOTIFY_SCENE_PRE_DELETED_NODE);
         RegisterNotification(OnSceneChanged, this, NOTIFY_FILE_POST_OPEN);
@@ -9691,9 +10071,11 @@ public:
         }
 
         SetTimer(hwnd_, SYNC_TIMER_ID, SYNC_INTERVAL_MS, nullptr);
+        callbacksRegistered_ = true;
     }
 
     void UnregisterCallbacks() {
+        if (!callbacksRegistered_) return;
         KillTimer(hwnd_, SYNC_TIMER_ID);
 
         ISceneEventManager* sceneEvents = GetISceneEventManager();
@@ -9713,6 +10095,25 @@ public:
         UnRegisterNotification(OnSceneChanged, this, NOTIFY_FILE_POST_OPEN);
         UnRegisterNotification(OnSceneChanged, this, NOTIFY_SYSTEM_POST_RESET);
         // Hide/unhide handled in xform sync — no notification needed
+        callbacksRegistered_ = false;
+    }
+
+    bool ShouldKeepCallbacksRegistered() const {
+        if (!hwnd_ || !IsWindow(hwnd_)) return false;
+        if (renderLocked_ || asCapturing_ || IsViewportHosted()) return true;
+        return IsWindowVisible(hwnd_) && !IsIconic(hwnd_);
+    }
+
+    void RefreshCallbackRegistration(bool forceFullSyncOnResume = false) {
+        if (ShouldKeepCallbacksRegistered()) {
+            RegisterCallbacks();
+            if (forceFullSyncOnResume) {
+                SetDirtyImmediate();
+                ResetFastPathState(true);
+            }
+        } else {
+            UnregisterCallbacks();
+        }
     }
 
     void OnWebMessage(const wchar_t* json) {
@@ -10052,15 +10453,18 @@ public:
             const bool isDeforming =
                 skinnedHandles_.find(handle) != skinnedHandles_.end() ||
                 deformHandles_.find(handle) != deformHandles_.end();
+            const bool hasVertexColors = NodeHasExtractableVertexColors(node, t);
             bool usedSkinnedFastPositions = false;
-            if (wv17 && env12 && isDeforming) {
+            if (wv17 && env12 && isDeforming && !hasVertexColors) {
                 auto cacheIt = skinnedControlIdxCache_.find(handle);
                 if (cacheIt != skinnedControlIdxCache_.end()) {
                     usedSkinnedFastPositions = ExtractSkinnedFastPositions(node, t, cacheIt->second, verts);
                 }
             }
 
-            if (!usedSkinnedFastPositions && !ExtractMesh(node, t, verts, uvs, indices, groups, &norms)) {
+            std::vector<VertexColorAttributeRecord> vertexColors;
+            if (!usedSkinnedFastPositions &&
+                !ExtractMesh(node, t, verts, uvs, indices, groups, &norms, nullptr, &vertexColors)) {
                 ObjectState os = node->EvalWorldState(t);
                 if (!ShouldExtractRenderableShape(node, t, &os) ||
                     !ExtractSpline(node, t, verts, indices)) {
@@ -10075,7 +10479,7 @@ public:
                 // Store raw hash consistent with DetectGeometryChanges / TryHashRenderableGeometryState
                 uint64_t rawHash = 0;
                 if (!TryHashRenderableGeometryState(node, t, rawHash))
-                    rawHash = HashMeshData(verts, indices, uvs);
+                    rawHash = HashMeshData(verts, indices, uvs, &vertexColors);
                 geoHashMap_[handle] = rawHash;
             }
 
@@ -10086,6 +10490,9 @@ public:
                 size_t totalBytes = verts.size() * 4;
                 if (!usedSkinnedFastPositions) {
                     totalBytes += indices.size() * 4 + uvs.size() * 4 + norms.size() * 4;
+                    for (const VertexColorAttributeRecord& attr : vertexColors) {
+                        totalBytes += attr.values.size() * sizeof(float);
+                    }
                 }
                 if (totalBytes < 4) totalBytes = 4;
 
@@ -10105,6 +10512,13 @@ public:
                     if (!uvs.empty()) { memcpy(ptr + off, uvs.data(), uvs.size() * 4); off += uvs.size() * 4; }
                     nOff = off;
                     if (!norms.empty()) { memcpy(ptr + off, norms.data(), norms.size() * 4); off += norms.size() * 4; }
+                    for (VertexColorAttributeRecord& attr : vertexColors) {
+                        attr.off = off;
+                        if (!attr.values.empty()) {
+                            memcpy(ptr + off, attr.values.data(), attr.values.size() * sizeof(float));
+                            off += attr.values.size() * sizeof(float);
+                        }
+                    }
                 }
 
                 std::wostringstream ss;
@@ -10119,6 +10533,7 @@ public:
                     ss << L",\"iOff\":" << iOff << L",\"iN\":" << indices.size();
                     if (!uvs.empty()) ss << L",\"uvOff\":" << uvOff << L",\"uvN\":" << uvs.size();
                     if (!norms.empty()) ss << L",\"nOff\":" << nOff << L",\"nN\":" << norms.size();
+                    WriteVertexColorOffsetsJson(ss, vertexColors);
                 }
                 ss << L'}';
 
@@ -10135,6 +10550,7 @@ public:
                 ss << L",\"i\":"; WriteInts(ss, indices.data(), indices.size());
                 if (!uvs.empty()) { ss << L",\"uv\":"; WriteFloats(ss, uvs.data(), uvs.size()); }
                 if (!norms.empty()) { ss << L",\"norm\":"; WriteFloats(ss, norms.data(), norms.size()); }
+                WriteVertexColorAttributesJson(ss, vertexColors);
                 ss << L'}';
                 webview_->PostWebMessageAsJson(ss.str().c_str());
             }
@@ -12502,6 +12918,7 @@ public:
                 if (FindModifierOnNode(node, SKIN_CLASSID)) skinnedHandles_.insert(handle);
             } else {
                 std::vector<float> verts, uvs, norms;
+                std::vector<VertexColorAttributeRecord> vertexColors;
                 std::vector<int> indices;
                 std::vector<MatGroup> groups;
                 const bool isSkinned = FindModifierOnNode(node, SKIN_CLASSID) != nullptr;
@@ -12510,13 +12927,14 @@ public:
                 // stable deforming modifier (Skin, Path Deform, Bend, FFD, etc.)
                 // can then route through the fast-positions path instead of
                 // the full ExtractMesh (4x smaller payload, single EvalWorldState).
-                bool extracted = ExtractMesh(node, t, verts, uvs, indices, groups, &norms, &controlIdx);
+                bool extracted = ExtractMesh(node, t, verts, uvs, indices, groups, &norms, &controlIdx, &vertexColors);
 
                 // Spline fallback — extract as line geometry
                 bool isSpline = false;
                 if (!extracted && ShouldExtractRenderableShape(node, t, &os)) {
                     extracted = ExtractSpline(node, t, verts, indices);
                     isSpline = extracted;
+                    if (extracted) vertexColors.clear();
                 }
 
                 if (extracted) {
@@ -12562,6 +12980,7 @@ public:
                     if (!norms.empty()) {
                         ss << L",\"norm\":"; WriteFloats(ss, norms.data(), norms.size());
                     }
+                    WriteVertexColorAttributesJson(ss, vertexColors);
 
                     if (!isSpline) {
                         // Multi/Sub material support (meshes only)
@@ -12635,6 +13054,7 @@ public:
             ULONG handle;
             INode* node;
             std::vector<float> verts, uvs, norms;
+            std::vector<VertexColorAttributeRecord> vertexColors;
             std::vector<int> indices;
             std::vector<MatGroup> groups;
             bool changed;
@@ -12747,13 +13167,14 @@ public:
                 } else {
                     const bool isSkinned = FindModifierOnNode(node, SKIN_CLASSID) != nullptr;
                     std::vector<int> controlIdx;
-                    bool extracted = ExtractMesh(node, t, ng.verts, ng.uvs, ng.indices, ng.groups, &ng.norms, &controlIdx);
+                    bool extracted = ExtractMesh(node, t, ng.verts, ng.uvs, ng.indices, ng.groups, &ng.norms, &controlIdx, &ng.vertexColors);
                     if (!extracted && ShouldExtractRenderableShape(node, t, &os)) {
                         extracted = ExtractSpline(node, t, ng.verts, ng.indices);
                         ng.spline = extracted;
                         if (extracted) {
                             ng.uvs.clear();
                             ng.norms.clear();
+                            ng.vertexColors.clear();
                             ng.groups.clear();
                         }
                     }
@@ -12765,7 +13186,7 @@ public:
                     // Use raw hash consistent with DetectGeometryChanges
                     uint64_t hash = 0;
                     if (!TryHashRenderableGeometryState(node, t, hash))
-                        hash = HashMeshData(ng.verts, ng.indices, ng.uvs);
+                        hash = HashMeshData(ng.verts, ng.indices, ng.uvs, &ng.vertexColors);
                     auto it = geoHashMap_.find(ng.handle);
                     ng.changed = (it == geoHashMap_.end() || it->second != hash);
                     geoHashMap_[ng.handle] = hash;
@@ -12802,6 +13223,11 @@ public:
                         ng.nOff = totalBytes;
                         if (!ng.norms.empty())
                             totalBytes += ng.norms.size() * sizeof(float);
+                        for (VertexColorAttributeRecord& attr : ng.vertexColors) {
+                            attr.off = totalBytes;
+                            if (!attr.values.empty())
+                                totalBytes += attr.values.size() * sizeof(float);
+                        }
                     }
                     geos.push_back(std::move(ng));
                     geomHandles_.insert(node->GetHandle());
@@ -12899,6 +13325,11 @@ public:
                     memcpy(bufPtr + ng.uvOff, ng.uvs.data(), ng.uvs.size() * sizeof(float));
                 if (!ng.norms.empty())
                     memcpy(bufPtr + ng.nOff, ng.norms.data(), ng.norms.size() * sizeof(float));
+                for (const VertexColorAttributeRecord& attr : ng.vertexColors) {
+                    if (!attr.values.empty()) {
+                        memcpy(bufPtr + attr.off, attr.values.data(), attr.values.size() * sizeof(float));
+                    }
+                }
 
                 ss << L",\"geo\":{\"vOff\":" << ng.vOff;
                 ss << L",\"vN\":" << ng.verts.size();
@@ -12912,6 +13343,7 @@ public:
                     ss << L",\"nOff\":" << ng.nOff;
                     ss << L",\"nN\":" << ng.norms.size();
                 }
+                WriteVertexColorOffsetsJson(ss, ng.vertexColors);
                 ss << L'}';
             }
 
@@ -13694,12 +14126,14 @@ public:
         asTarget_ = target;
         asCapturing_ = true;
         if (hwnd_) SetTimer(hwnd_, AS_TIMER_ID, AS_INTERVAL_MS, nullptr);
+        RefreshCallbackRegistration(true);
     }
 
     void StopActiveShade() {
         asCapturing_ = false;
         asTarget_ = nullptr;
         if (hwnd_) KillTimer(hwnd_, AS_TIMER_ID);
+        RefreshCallbackRegistration();
     }
 
     // Reparent WebView2 into a viewport HWND — true GPU overlay
@@ -13728,6 +14162,7 @@ public:
         Resize();
 
         AttachHostSubclass();
+        RefreshCallbackRegistration(true);
     }
 
     // Restore to original floating window
@@ -13755,6 +14190,7 @@ public:
         originalParent_ = nullptr;
         Resize();
         NormalizeFloatingWindow(true);
+        RefreshCallbackRegistration(true);
     }
 
     void CaptureActiveShadeFrame() {
@@ -13908,6 +14344,9 @@ public:
         case WM_EXITSIZEMOVE:
             if (p) p->EndFloatingSizeMove();
             return 0;
+        case WM_SHOWWINDOW:
+            if (p) p->RefreshCallbackRegistration(wParam != 0);
+            break;
         case WM_FAST_FLUSH:
             if (p) p->FlushFastPath();
             return 0;
@@ -13936,7 +14375,9 @@ public:
 void MaxJSFastNodeEventCallback::ControllerStructured(NodeKeyTab& nodes) {
     // Modifier stack changes (add/remove modifier) can change object type
     // (e.g. spline → extruded mesh). Treat as topology change for full rebuild.
-    if (owner_) owner_->MarkGeometryTopologyDirty(nodes);
+    if (!owner_) return;
+    owner_->MarkInteractiveActivity();
+    owner_->MarkGeometryTopologyDirty(nodes);
 }
 
 void MaxJSFastNodeEventCallback::ControllerOtherEvent(NodeKeyTab& nodes) {
@@ -13953,7 +14394,9 @@ void MaxJSFastNodeEventCallback::ControllerOtherEvent(NodeKeyTab& nodes) {
 }
 
 void MaxJSFastNodeEventCallback::LinkChanged(NodeKeyTab& nodes) {
-    if (owner_) owner_->MarkTrackedNodesDirty(nodes);
+    if (!owner_) return;
+    owner_->MarkInteractiveActivity();
+    owner_->MarkTrackedNodesDirty(nodes);
 }
 
 void MaxJSFastNodeEventCallback::SelectionChanged(NodeKeyTab& nodes) {
@@ -13965,11 +14408,15 @@ void MaxJSFastNodeEventCallback::HideChanged(NodeKeyTab& nodes) {
 }
 
 void MaxJSFastNodeEventCallback::GeometryChanged(NodeKeyTab& nodes) {
-    if (owner_) owner_->MarkGeometryPositionsDirty(nodes);
+    if (!owner_) return;
+    owner_->MarkInteractiveActivity();
+    owner_->MarkGeometryPositionsDirty(nodes);
 }
 
 void MaxJSFastNodeEventCallback::TopologyChanged(NodeKeyTab& nodes) {
-    if (owner_) owner_->MarkGeometryTopologyDirty(nodes);
+    if (!owner_) return;
+    owner_->MarkInteractiveActivity();
+    owner_->MarkGeometryTopologyDirty(nodes);
 }
 
 void MaxJSFastRedrawCallback::proc(Interface*) {

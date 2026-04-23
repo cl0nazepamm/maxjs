@@ -1348,9 +1348,12 @@ public:
         std::vector<IColorSwatch*> dynSwatches;
         IParamBlock2* pb = nullptr;
         bool rebuildingUI = false;
+        std::wstring lastCommittedCode;
     };
 
     std::unordered_map<HWND, DialogState> states_;
+    static constexpr UINT_PTR kCodeCommitTimer = 0x54534C31; // TSL1
+    static constexpr UINT kCodeCommitDelayMs = 350;
 
     void DestroyDynamicControls(HWND dlgHwnd, DialogState& state) {
         for (auto* sp : state.dynSpinners) if (sp) ReleaseISpinner(sp);
@@ -1468,6 +1471,26 @@ public:
         }
     }
 
+    std::wstring ReadCodeEdit(HWND dlgHwnd) {
+        int len = GetWindowTextLength(GetDlgItem(dlgHwnd, IDC_TSL_CODE_EDIT));
+        std::wstring text(static_cast<size_t>(len) + 1, L'\0');
+        int copied = GetDlgItemText(dlgHwnd, IDC_TSL_CODE_EDIT, text.data(), len + 1);
+        if (copied >= 0) text.resize(static_cast<size_t>(copied)); else text.clear();
+        return text;
+    }
+
+    void CommitCodeEdit(HWND dlgHwnd, DialogState& state, bool rebuildParams) {
+        KillTimer(dlgHwnd, kCodeCommitTimer);
+        std::wstring text = ReadCodeEdit(dlgHwnd);
+        if (text == state.lastCommittedCode && !rebuildParams) return;
+        state.lastCommittedCode = text;
+        if (state.pb) {
+            state.pb->SetValue(pb_tsl_code, 0, text.c_str());
+            NotifyOwnerMaterialEdited(state.pb);
+        }
+        if (rebuildParams) RebuildDynamicControls(dlgHwnd, state, text);
+    }
+
     INT_PTR DlgProc(TimeValue t, IParamMap2* map, HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) override {
         IParamBlock2* pb = map ? map->GetParamBlock() : nullptr;
         switch (msg) {
@@ -1477,14 +1500,24 @@ public:
             if (pb) {
                 const MCHAR* code = pb->GetStr(pb_tsl_code);
                 if (code && code[0]) {
+                    state.lastCommittedCode = code;
                     SetDlgItemText(hWnd, IDC_TSL_CODE_EDIT, code);
                     RebuildDynamicControls(hWnd, state, code);
                 }
             }
             return TRUE;
         }
+        case WM_TIMER:
+            if (wParam == kCodeCommitTimer) {
+                if (auto it = states_.find(hWnd); it != states_.end()) {
+                    CommitCodeEdit(hWnd, it->second, false);
+                }
+                return TRUE;
+            }
+            break;
         case WM_DESTROY:
             if (auto it = states_.find(hWnd); it != states_.end()) {
+                KillTimer(hWnd, kCodeCommitTimer);
                 DestroyDynamicControls(hWnd, it->second);
                 states_.erase(it);
             }
@@ -1523,13 +1556,14 @@ public:
                             std::wstring wCode(wLen, L'\0');
                             MultiByteToWideChar(CP_UTF8, 0, buf.data(), (int)buf.size(), wCode.data(), wLen);
                             SetDlgItemText(hWnd, IDC_TSL_CODE_EDIT, wCode.c_str());
-                            if (pb) {
-                                pb->SetValue(pb_tsl_code, 0, wCode.c_str());
-                                NotifyOwnerMaterialEdited(pb);
-                            }
                             const wchar_t* fname = wcsrchr(filePath, L'\\');
                             SetDlgItemText(hWnd, IDC_TSL_FILE_LABEL, fname ? fname + 1 : filePath);
                             if (auto it = states_.find(hWnd); it != states_.end()) {
+                                it->second.lastCommittedCode = wCode;
+                                if (pb) {
+                                    pb->SetValue(pb_tsl_code, 0, wCode.c_str());
+                                    NotifyOwnerMaterialEdited(pb);
+                                }
                                 RebuildDynamicControls(hWnd, it->second, wCode);
                             }
                         }
@@ -1540,27 +1574,14 @@ public:
             }
             if (LOWORD(wParam) == IDC_TSL_CODE_EDIT && HIWORD(wParam) == EN_KILLFOCUS) {
                 // Rebuild params when code editor loses focus (avoids per-keystroke rebuild)
-                int len = GetWindowTextLength(GetDlgItem(hWnd, IDC_TSL_CODE_EDIT));
-                std::wstring text(static_cast<size_t>(len) + 1, L'\0');
-                int copied = GetDlgItemText(hWnd, IDC_TSL_CODE_EDIT, text.data(), len + 1);
-                if (copied >= 0) text.resize(static_cast<size_t>(copied)); else text.clear();
-                if (pb) {
-                    pb->SetValue(pb_tsl_code, 0, text.c_str());
-                    NotifyOwnerMaterialEdited(pb);
-                }
                 if (auto it = states_.find(hWnd); it != states_.end()) {
-                    RebuildDynamicControls(hWnd, it->second, text);
+                    CommitCodeEdit(hWnd, it->second, true);
                 }
                 return TRUE;
             }
             if (LOWORD(wParam) == IDC_TSL_CODE_EDIT && HIWORD(wParam) == EN_CHANGE) {
-                int len = GetWindowTextLength(GetDlgItem(hWnd, IDC_TSL_CODE_EDIT));
-                std::wstring text(static_cast<size_t>(len) + 1, L'\0');
-                int copied = GetDlgItemText(hWnd, IDC_TSL_CODE_EDIT, text.data(), len + 1);
-                if (copied >= 0) text.resize(static_cast<size_t>(copied)); else text.clear();
-                if (pb) {
-                    pb->SetValue(pb_tsl_code, 0, text.c_str());
-                    NotifyOwnerMaterialEdited(pb);
+                if (auto it = states_.find(hWnd); it != states_.end() && !it->second.rebuildingUI) {
+                    SetTimer(hWnd, kCodeCommitTimer, kCodeCommitDelayMs, nullptr);
                 }
                 return TRUE;
             }
@@ -1836,9 +1857,12 @@ public:
         std::vector<IColorSwatch*> dynSwatches;
         IParamBlock2* pb = nullptr;
         bool rebuildingUI = false;
+        std::wstring lastCommittedCode;
     };
 
     std::unordered_map<HWND, DialogState> states_;
+    static constexpr UINT_PTR kCodeCommitTimer = 0x54535458; // TSTX
+    static constexpr UINT kCodeCommitDelayMs = 350;
 
     // Use offset base to avoid collisions with TSL Material's dynamic IDs
     static constexpr int kBase = 9200;
@@ -1951,6 +1975,26 @@ public:
         }
     }
 
+    std::wstring ReadCodeEdit(HWND dlgHwnd) {
+        int len = GetWindowTextLength(GetDlgItem(dlgHwnd, IDC_TSL_TEX_CODE_EDIT));
+        std::wstring text(static_cast<size_t>(len) + 1, L'\0');
+        int copied = GetDlgItemText(dlgHwnd, IDC_TSL_TEX_CODE_EDIT, text.data(), len + 1);
+        if (copied >= 0) text.resize(static_cast<size_t>(copied)); else text.clear();
+        return text;
+    }
+
+    void CommitCodeEdit(HWND dlgHwnd, DialogState& state, bool rebuildParams) {
+        KillTimer(dlgHwnd, kCodeCommitTimer);
+        std::wstring text = ReadCodeEdit(dlgHwnd);
+        if (text == state.lastCommittedCode && !rebuildParams) return;
+        state.lastCommittedCode = text;
+        if (state.pb) {
+            state.pb->SetValue(ptsl_tex_code, 0, text.c_str());
+            NotifyOwnerMaterialEdited(state.pb);
+        }
+        if (rebuildParams) RebuildDynamicControls(dlgHwnd, state, text);
+    }
+
     INT_PTR DlgProc(TimeValue t, IParamMap2* map, HWND hWnd, UINT msg, WPARAM wParam, LPARAM) override {
         IParamBlock2* pb = map ? map->GetParamBlock() : nullptr;
         switch (msg) {
@@ -1960,14 +2004,24 @@ public:
             if (pb) {
                 const MCHAR* code = pb->GetStr(ptsl_tex_code);
                 if (code && code[0]) {
+                    state.lastCommittedCode = code;
                     SetDlgItemText(hWnd, IDC_TSL_TEX_CODE_EDIT, code);
                     RebuildDynamicControls(hWnd, state, code);
                 }
             }
             return TRUE;
         }
+        case WM_TIMER:
+            if (wParam == kCodeCommitTimer) {
+                if (auto it = states_.find(hWnd); it != states_.end()) {
+                    CommitCodeEdit(hWnd, it->second, false);
+                }
+                return TRUE;
+            }
+            break;
         case WM_DESTROY:
             if (auto it = states_.find(hWnd); it != states_.end()) {
+                KillTimer(hWnd, kCodeCommitTimer);
                 DestroyDynamicControls(hWnd, it->second);
                 states_.erase(it);
             }
@@ -2006,13 +2060,14 @@ public:
                             std::wstring wCode(wLen, L'\0');
                             MultiByteToWideChar(CP_UTF8, 0, buf.data(), (int)buf.size(), wCode.data(), wLen);
                             SetDlgItemText(hWnd, IDC_TSL_TEX_CODE_EDIT, wCode.c_str());
-                            if (pb) {
-                                pb->SetValue(ptsl_tex_code, 0, wCode.c_str());
-                                NotifyOwnerMaterialEdited(pb);
-                            }
                             const wchar_t* fname = wcsrchr(filePath, L'\\');
                             SetDlgItemText(hWnd, IDC_TSL_TEX_FILE_LABEL, fname ? fname + 1 : filePath);
                             if (auto it = states_.find(hWnd); it != states_.end()) {
+                                it->second.lastCommittedCode = wCode;
+                                if (pb) {
+                                    pb->SetValue(ptsl_tex_code, 0, wCode.c_str());
+                                    NotifyOwnerMaterialEdited(pb);
+                                }
                                 RebuildDynamicControls(hWnd, it->second, wCode);
                             }
                         }
@@ -2022,27 +2077,14 @@ public:
                 return TRUE;
             }
             if (LOWORD(wParam) == IDC_TSL_TEX_CODE_EDIT && HIWORD(wParam) == EN_KILLFOCUS) {
-                int len = GetWindowTextLength(GetDlgItem(hWnd, IDC_TSL_TEX_CODE_EDIT));
-                std::wstring text(static_cast<size_t>(len) + 1, L'\0');
-                int copied = GetDlgItemText(hWnd, IDC_TSL_TEX_CODE_EDIT, text.data(), len + 1);
-                if (copied >= 0) text.resize(static_cast<size_t>(copied)); else text.clear();
-                if (pb) {
-                    pb->SetValue(ptsl_tex_code, 0, text.c_str());
-                    NotifyOwnerMaterialEdited(pb);
-                }
                 if (auto it = states_.find(hWnd); it != states_.end()) {
-                    RebuildDynamicControls(hWnd, it->second, text);
+                    CommitCodeEdit(hWnd, it->second, true);
                 }
                 return TRUE;
             }
             if (LOWORD(wParam) == IDC_TSL_TEX_CODE_EDIT && HIWORD(wParam) == EN_CHANGE) {
-                int len = GetWindowTextLength(GetDlgItem(hWnd, IDC_TSL_TEX_CODE_EDIT));
-                std::wstring text(static_cast<size_t>(len) + 1, L'\0');
-                int copied = GetDlgItemText(hWnd, IDC_TSL_TEX_CODE_EDIT, text.data(), len + 1);
-                if (copied >= 0) text.resize(static_cast<size_t>(copied)); else text.clear();
-                if (pb) {
-                    pb->SetValue(ptsl_tex_code, 0, text.c_str());
-                    NotifyOwnerMaterialEdited(pb);
+                if (auto it = states_.find(hWnd); it != states_.end() && !it->second.rebuildingUI) {
+                    SetTimer(hWnd, kCodeCommitTimer, kCodeCommitDelayMs, nullptr);
                 }
                 return TRUE;
             }

@@ -2709,6 +2709,7 @@
         function applyLocalHDRISettings() {
             if (!isLocalHdriActive()) return;
             applyLocalHDRIToScene();
+            ssgiFx.markOutputChanged?.();
         }
 
         function toggleLocalHDRI(enabled) {
@@ -3103,6 +3104,28 @@
             maxjsDebugWarn(`[TSL] Legacy API shim: ${name} -> ${replacement}`);
         }
 
+        function normalizeMaxVertexColorChannel(channel = 0) {
+            if (typeof channel === 'string') {
+                const token = channel.trim().toLowerCase();
+                if (token === 'color' || token === 'rgb') return 0;
+                if (token === 'shading' || token === 'illum' || token === 'illumination') return -1;
+                if (token === 'alpha') return -2;
+                const parsed = Number.parseInt(token, 10);
+                if (Number.isFinite(parsed)) return parsed;
+                return 0;
+            }
+            if (!Number.isFinite(channel)) return 0;
+            return Math.trunc(channel);
+        }
+
+        function maxVertexColorAttributeName(channel = 0) {
+            const normalized = normalizeMaxVertexColorChannel(channel);
+            if (normalized === 0) return 'color';
+            if (normalized === -1) return 'maxjs_vc_shading';
+            if (normalized === -2) return 'maxjs_vc_alpha';
+            return `maxjs_vc_${normalized}`;
+        }
+
         function getTSLCompatNamespace() {
             if (tslCompatNamespace) return tslCompatNamespace;
             const compat = Object.assign({}, TSL);
@@ -3113,6 +3136,9 @@
             };
             compat.timerLocal = makeTimerShim('TSL.timerLocal');
             compat.timerGlobal = makeTimerShim('TSL.timerGlobal');
+            compat.maxVertexColor = (channel = 0) =>
+                TSL.attribute(maxVertexColorAttributeName(channel), 'vec4');
+            compat.vertexColorChannel = compat.maxVertexColor;
             tslCompatNamespace = compat;
             return compat;
         }
@@ -3835,10 +3861,12 @@
                             const hasIncomingIndex = meta.iOff != null && meta.iN != null;
                             const idxCount = hasIncomingIndex ? meta.iN : 0;
                             const existingIdx = mesh.geometry.getIndex();
+                            const incomingVertexColors = normalizeVertexColorDescriptors(meta.vc);
                             const sameTopology = wantsLine === hasLine
                                 && pos
                                 && pos.count === vertCount
-                                && (!hasIncomingIndex || (existingIdx && existingIdx.count === idxCount));
+                                && (!hasIncomingIndex || (existingIdx && existingIdx.count === idxCount))
+                                && vertexColorLayoutMatchesGeometry(mesh.geometry, incomingVertexColors);
 
                             if (sameTopology) {
                                 // Hot path: copy positions into existing GPU buffer
@@ -3874,6 +3902,8 @@
                                     scheduleNormals(mesh.geometry);
                                 }
 
+                                setGeometryVertexColorAttributes(mesh.geometry, incomingVertexColors, buf);
+
                                 // keepNormals signals a skinned fast-positions update:
                                 // bounding volumes are the hot path cost for skinned
                                 // meshes at 60fps and drive nothing visible (frustum
@@ -3902,6 +3932,7 @@
                                 } else {
                                     geom.computeVertexNormals();
                                 }
+                                setGeometryVertexColorAttributes(geom, incomingVertexColors, buf);
                                 geom.computeBoundingSphere();
                                 mesh.geometry.dispose();
                                 mesh.geometry = geom;
@@ -4253,7 +4284,10 @@
                 // Geometry: only rebuild if vertex data is present (skip for cached nodes)
                 let geom = mesh?.geometry;
                 if (nd.v && nd.i && !jsmodSkipGeo) {
-                    geom = buildGeometry(nd.v, nd.i, nd.uv, nd.norm, { isLine: !!nd.spline });
+                    geom = buildGeometry(nd.v, nd.i, nd.uv, nd.norm, {
+                        isLine: !!nd.spline,
+                        vertexColors: nd.vc,
+                    });
                     if (nd.groups) {
                         for (const [start, count, idx] of nd.groups) {
                             geom.addGroup(start, count, idx);
@@ -4370,7 +4404,10 @@
                 } else {
                     mesh.material?.dispose?.();
                 }
-                const geom = buildGeometry(msg.v, msg.i, msg.uv, msg.norm, { isLine: wantsLine });
+                const geom = buildGeometry(msg.v, msg.i, msg.uv, msg.norm, {
+                    isLine: wantsLine,
+                    vertexColors: msg.vc,
+                });
                 let newMesh;
                 if (wantsLine) {
                     newMesh = new THREE.LineSegments(geom, new THREE.LineBasicMaterial({ color: 0xffffff }));
@@ -4391,7 +4428,10 @@
                 return;
             }
 
-            const geom = buildGeometry(msg.v, msg.i, msg.uv, msg.norm, { isLine: wantsLine });
+            const geom = buildGeometry(msg.v, msg.i, msg.uv, msg.norm, {
+                isLine: wantsLine,
+                vertexColors: msg.vc,
+            });
             mesh.geometry.dispose();
             mesh.geometry = geom;
             // Vertex / topology data on the same Object3D — no scene-structure
@@ -4628,6 +4668,7 @@
                     } else if (!nd.spline) {
                         geom.computeVertexNormals();
                     }
+                    setGeometryVertexColorAttributes(geom, nd.geo.vc, buffer);
                     // Add material groups for Multi/Sub
                     if (nd.groups) {
                         for (const [start, count, idx] of nd.groups) {
@@ -4811,6 +4852,83 @@
             });
         }
 
+        function normalizeVertexColorDescriptors(vertexColors) {
+            if (!Array.isArray(vertexColors)) return [];
+            return vertexColors.map((entry) => {
+                const channel = normalizeMaxVertexColorChannel(entry?.ch ?? entry?.channel ?? 0);
+                const name = (typeof entry?.name === 'string' && entry.name.length)
+                    ? entry.name
+                    : maxVertexColorAttributeName(channel);
+                const itemSize = Number.isInteger(entry?.itemSize) && entry.itemSize > 0
+                    ? entry.itemSize
+                    : 4;
+                let valueCount = 0;
+                if (Number.isInteger(entry?.n) && entry.n >= 0) valueCount = entry.n;
+                else if (Array.isArray(entry?.v) || ArrayBuffer.isView(entry?.v)) valueCount = entry.v.length;
+                const count = itemSize > 0 ? Math.floor(valueCount / itemSize) : 0;
+                return { ...entry, channel, name, itemSize, count, valueCount };
+            }).filter((entry) => entry.count > 0);
+        }
+
+        function vertexColorLayoutMatchesGeometry(geometry, descriptors) {
+            const current = Array.isArray(geometry?.userData?.maxjsVertexColors)
+                ? geometry.userData.maxjsVertexColors
+                : [];
+            if (current.length !== descriptors.length) return false;
+            for (let i = 0; i < current.length; i++) {
+                const cur = current[i];
+                const next = descriptors[i];
+                if (!next) return false;
+                if (cur.name !== next.name || cur.itemSize !== next.itemSize || cur.count !== next.count) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        function setGeometryVertexColorAttributes(geometry, vertexColors, buffer = null) {
+            if (!geometry) return;
+            geometry.userData ??= {};
+            const descriptors = normalizeVertexColorDescriptors(vertexColors);
+            const previous = Array.isArray(geometry.userData.maxjsVertexColors)
+                ? geometry.userData.maxjsVertexColors
+                : [];
+            const keepNames = new Set(descriptors.map((entry) => entry.name));
+            for (const entry of previous) {
+                if (!keepNames.has(entry.name)) geometry.deleteAttribute(entry.name);
+            }
+
+            for (const entry of descriptors) {
+                let values = null;
+                if (buffer) {
+                    if (!binInRange(buffer, entry.off, entry.n || 0)) {
+                        console.warn('[MaxJS binary] Invalid vertex color range for', entry.name);
+                        continue;
+                    }
+                    values = new Float32Array(new Float32Array(buffer, entry.off, entry.n));
+                } else if (Array.isArray(entry.v) || ArrayBuffer.isView(entry.v)) {
+                    values = new Float32Array(entry.v);
+                } else {
+                    continue;
+                }
+
+                const current = geometry.getAttribute(entry.name);
+                if (current && current.itemSize === entry.itemSize && current.count === entry.count) {
+                    current.array.set(values);
+                    current.needsUpdate = true;
+                } else {
+                    geometry.setAttribute(entry.name, new THREE.BufferAttribute(values, entry.itemSize));
+                }
+            }
+
+            geometry.userData.maxjsVertexColors = descriptors.map(({ channel, name, itemSize, count }) => ({
+                channel, name, itemSize, count,
+            }));
+            geometry.userData.maxjsVertexColorChannels = geometry.userData.maxjsVertexColors.map(({ channel, name }) => ({
+                channel, name,
+            }));
+        }
+
         // ── Geometry Builder ────────────────────────────────
         function buildGeometry(vertices, indices, uvs, normals, options = {}) {
             const isLine = !!options.isLine;
@@ -4820,6 +4938,7 @@
             if (uvs?.length) geom.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
             if (normals?.length) geom.setAttribute('normal', new THREE.Float32BufferAttribute(normals, 3));
             else if (!isLine) geom.computeVertexNormals();
+            setGeometryVertexColorAttributes(geom, options.vertexColors);
             geom.computeBoundingBox();
             geom.computeBoundingSphere();
             return geom;

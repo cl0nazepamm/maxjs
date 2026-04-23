@@ -98,6 +98,7 @@ class ThreeJSRenderer : public Renderer {
     int renderWidth_ = 0;
     int renderHeight_ = 0;
     bool stopRequested_ = false;
+    bool inMaterialEditor_ = false;
 
 public:
     ThreeJSRenderer() {}
@@ -130,6 +131,11 @@ public:
         renderWidth_ = rp.width;
         renderHeight_ = rp.height;
         stopRequested_ = false;
+        inMaterialEditor_ = rp.inMtlEdit != FALSE;
+        if (inMaterialEditor_) {
+            return 1;
+        }
+
         // Ensure the MaxJS panel is up (non-toggling)
         EnsureMaxJSPanel();
         return 1;
@@ -142,6 +148,16 @@ public:
         int w = tobm->Width();
         int h = tobm->Height();
 
+        if (inMaterialEditor_) {
+            BMM_Color_fl swatchColor{};
+            swatchColor.r = 0.035f;
+            swatchColor.g = 0.035f;
+            swatchColor.b = 0.035f;
+            swatchColor.a = 1.0f;
+            tobm->Fill(swatchColor);
+            return 1;
+        }
+
         if (prog) prog->SetTitle(_T("three.js — rendering frame..."));
 
         bool ok = RenderMaxJSFrameToBitmap(tobm, w, h, t, prog);
@@ -150,6 +166,7 @@ public:
 
     void Close(HWND, RendProgressCallback* = nullptr) override {
         stopRequested_ = false;
+        inMaterialEditor_ = false;
     }
 
     RendParamDlg* CreateParamDialog(IRendParams*, BOOL = FALSE) override {

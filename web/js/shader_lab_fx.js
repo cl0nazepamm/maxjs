@@ -35,7 +35,7 @@ async function loadShaderLab() {
             // otherwise TSL stack state is per-module-instance and
             // shader-lab's assign() operations run against a stack
             // that was never opened by the MaxJS renderer.
-            import('https://esm.sh/@basementstudio/shader-lab?external=react,react-dom,three'),
+            import('https://esm.sh/@basementstudio/shader-lab@1.3.12?external=react,react-dom,three'),
         ]);
         const React = ReactMod.default ?? ReactMod;
         const useShaderLab = ShaderLabMod.useShaderLab ?? ShaderLabMod.default?.useShaderLab;

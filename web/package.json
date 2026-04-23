@@ -1,5 +1,6 @@
 {
   "dependencies": {
-    "@sparkjsdev/spark": "github:sparkjsdev/spark#v2.0.0-preview"
+    "@sparkjsdev/spark": "^2.0.0",
+    "@takram/three-atmosphere": "^0.18.0"
   }
 }

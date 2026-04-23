@@ -154,7 +154,6 @@ Per-resource disposal tracking for materials, textures, and geometries. Layers p
 
 # Missing - To do
 
-- Vertex Color processing
 - Morpher under Skin (do not use morphers with skin modifier you will write vertex for every frame). Otherwise you can use it.
 
 # Rendering frames
@@ -163,9 +162,6 @@ This tool targets web development but since it's registered as renderer I added 
 
 # Bugs
 - ActiveShade can bug out if you maximize or minimize windows. Just use registered "kill maxjs" command in search menu
-- No orthographic view (yet)
-- Hair and Fur modifier causes mesh offset. 
-
 
 # Build
 

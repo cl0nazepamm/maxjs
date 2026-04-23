@@ -13084,8 +13084,12 @@ public:
                     INodeTab instTab;
                     if (imgr) imgr->GetInstances(*node, instTab);
                     if (instTab.Count() > 1) {
-                        // First handle in the group is the source
-                        ULONG srcH = instTab[0] ? instTab[0]->GetHandle() : h;
+                        // Use the first handle we *traverse* as the source. GetInstances
+                        // returns group members in InstanceMgr order, which does NOT match
+                        // the scene DFS order used below in collect(). If the chosen source
+                        // is visited after its siblings, extractedSources is empty when
+                        // they're checked and nobody ever gets instOfHandle set.
+                        ULONG srcH = h;
                         for (int i = 0; i < instTab.Count(); i++) {
                             if (!instTab[i]) continue;
                             ULONG ih = instTab[i]->GetHandle();

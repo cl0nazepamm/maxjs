@@ -3861,12 +3861,11 @@
                             const hasIncomingIndex = meta.iOff != null && meta.iN != null;
                             const idxCount = hasIncomingIndex ? meta.iN : 0;
                             const existingIdx = mesh.geometry.getIndex();
-                            const incomingVertexColors = normalizeVertexColorDescriptors(meta.vc);
                             const sameTopology = wantsLine === hasLine
                                 && pos
                                 && pos.count === vertCount
-                                && (!hasIncomingIndex || (existingIdx && existingIdx.count === idxCount))
-                                && vertexColorLayoutMatchesGeometry(mesh.geometry, incomingVertexColors);
+                                && (!hasIncomingIndex || (existingIdx && existingIdx.count === idxCount));
+                            const incomingVertexColors = normalizeVertexColorDescriptors(meta.vc);
 
                             if (sameTopology) {
                                 // Hot path: copy positions into existing GPU buffer
@@ -4868,22 +4867,6 @@
                 const count = itemSize > 0 ? Math.floor(valueCount / itemSize) : 0;
                 return { ...entry, channel, name, itemSize, count, valueCount };
             }).filter((entry) => entry.count > 0);
-        }
-
-        function vertexColorLayoutMatchesGeometry(geometry, descriptors) {
-            const current = Array.isArray(geometry?.userData?.maxjsVertexColors)
-                ? geometry.userData.maxjsVertexColors
-                : [];
-            if (current.length !== descriptors.length) return false;
-            for (let i = 0; i < current.length; i++) {
-                const cur = current[i];
-                const next = descriptors[i];
-                if (!next) return false;
-                if (cur.name !== next.name || cur.itemSize !== next.itemSize || cur.count !== next.count) {
-                    return false;
-                }
-            }
-            return true;
         }
 
         function setGeometryVertexColorAttributes(geometry, vertexColors, buffer = null) {

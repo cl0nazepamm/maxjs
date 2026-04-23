@@ -4923,17 +4923,57 @@
                 ? geometry.userData.maxjsVertexColors
                 : [];
             const keepNames = new Set(descriptors.map((entry) => entry.name));
-            for (const entry of previous) {
-                if (!keepNames.has(entry.name)) geometry.deleteAttribute(entry.name);
+
+            // Only reap missing channels when the incoming payload actually has
+            // data. A transient empty VC update (partial tick, slow sync) would
+            // otherwise delete every attribute and re-add it next tick —
+            // deleteAttribute + setAttribute each invalidate the WebGPU vertex
+            // buffer layout and force every material sampling the attribute to
+            // rebuild its render pipeline. That pipeline churn is the root of
+            // the Inspector's "(not in use)" cascade across SSGI / Bloom / AO.
+            if (descriptors.length > 0) {
+                for (const entry of previous) {
+                    if (!keepNames.has(entry.name)) geometry.deleteAttribute(entry.name);
+                }
             }
 
             for (const entry of descriptors) {
+                const current = geometry.getAttribute(entry.name);
+                const fastPath = current
+                    && current.itemSize === entry.itemSize
+                    && current.count === entry.count
+                    && current.array;
+
+                if (fastPath) {
+                    // In-place update — zero allocation. Copy from the shared
+                    // binary buffer view directly into the existing typed array
+                    // rather than round-tripping through a standalone copy.
+                    if (buffer) {
+                        if (!binInRange(buffer, entry.off, entry.n || 0)) {
+                            console.warn('[MaxJS binary] Invalid vertex color range for', entry.name);
+                            continue;
+                        }
+                        current.array.set(new Float32Array(buffer, entry.off, entry.n));
+                        current.needsUpdate = true;
+                    } else if (Array.isArray(entry.v) || ArrayBuffer.isView(entry.v)) {
+                        current.array.set(entry.v);
+                        current.needsUpdate = true;
+                    }
+                    continue;
+                }
+
+                // Slow path: itemSize or count mismatch — must create a new
+                // BufferAttribute. Pipeline invalidation is unavoidable here,
+                // but it only fires on genuine topology changes (new channel,
+                // remesh, first-time attach).
                 let values = null;
                 if (buffer) {
                     if (!binInRange(buffer, entry.off, entry.n || 0)) {
                         console.warn('[MaxJS binary] Invalid vertex color range for', entry.name);
                         continue;
                     }
+                    // Standalone copy — the shared buffer may be released after
+                    // this handler returns.
                     values = new Float32Array(new Float32Array(buffer, entry.off, entry.n));
                 } else if (Array.isArray(entry.v) || ArrayBuffer.isView(entry.v)) {
                     values = new Float32Array(entry.v);
@@ -4941,13 +4981,7 @@
                     continue;
                 }
 
-                const current = geometry.getAttribute(entry.name);
-                if (current && current.itemSize === entry.itemSize && current.count === entry.count) {
-                    current.array.set(values);
-                    current.needsUpdate = true;
-                } else {
-                    geometry.setAttribute(entry.name, new THREE.BufferAttribute(values, entry.itemSize));
-                }
+                geometry.setAttribute(entry.name, new THREE.BufferAttribute(values, entry.itemSize));
             }
 
             geometry.userData.maxjsVertexColors = descriptors.map(({ channel, name, itemSize, count }) => ({

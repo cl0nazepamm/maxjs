@@ -10131,7 +10131,6 @@ public:
         GetActiveCamera(current);
         if (!haveLastSentCamera_ || !CameraEquals(lastSentCamera_, current)) {
             fastCameraDirty_ = true;
-            MarkInteractiveActivity();
             QueueFastFlush();
         }
     }
@@ -14639,7 +14638,6 @@ void MaxJSFastNodeEventCallback::TopologyChanged(NodeKeyTab& nodes) {
 void MaxJSFastRedrawCallback::proc(Interface*) {
     if (!owner_) return;
     const bool animPlaying = owner_->IsAnimationPlaying();
-    owner_->MarkCameraDirtyIfChanged();
     owner_->MarkSelectedTransformsDirty();
     owner_->CheckTrackedMaterialScalarsLive();
     if (!animPlaying && !owner_->ShouldFavorInteractivePerformance()) {
@@ -14649,6 +14647,7 @@ void MaxJSFastRedrawCallback::proc(Interface*) {
         owner_->MarkTrackedAudioTransformsDirty();
         owner_->PollViewportModes();
     }
+    owner_->MarkCameraDirtyIfChanged();
     owner_->CheckSelectedGeometryLive();
     owner_->CheckSkinnedGeometryLive();
 }

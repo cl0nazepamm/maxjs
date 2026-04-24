@@ -8,10 +8,17 @@
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         html, body { color-scheme: dark; }
+        :root {
+            --rail-left: 8px;
+            --rail-width: 54px;
+            --rail-accent: rgba(240, 240, 240, 0.9);
+            --rail-bg: rgba(20, 20, 22, 0.78);
+            --rail-border: rgba(255, 255, 255, 0.07);
+        }
         body { overflow: hidden; background: #353535; position: relative; width: 100vw; height: 100vh; }
         canvas { display: block; }
 #hud {
-            position: absolute; top: 8px; left: 64px;
+            position: absolute; top: 8px; left: calc(var(--rail-left) + var(--rail-width) + 14px);
             color: rgba(180, 180, 180, 0.8);
             font: 10px/1.4 'Segoe UI', system-ui, sans-serif;
             pointer-events: none;
@@ -160,7 +167,7 @@
             transition: left 0.22s cubic-bezier(0.2, 0.7, 0.2, 1),
                         right 0.22s cubic-bezier(0.2, 0.7, 0.2, 1);
         }
-        .rail-drag-handle { left: 40px; }
+        .rail-drag-handle { left: calc(var(--rail-left) + var(--rail-width)); }
         .dock-drag-handle { right: 248px; }
         #rightRail.is-hidden ~ .rail-drag-handle { left: 12px; }
         #rightDock.is-hidden ~ .dock-drag-handle { right: 12px; }
@@ -580,6 +587,28 @@
             border-radius: 1px;
             background: rgba(255, 255, 255, 0.1);
         }
+        .fx-number {
+            width: 100%;
+            min-height: 24px;
+            padding: 4px 7px;
+            border-radius: 4px;
+            background: rgba(255, 255, 255, 0.055);
+            color: #d8d8d8;
+            border: 1px solid rgba(255, 255, 255, 0.09);
+            outline: none;
+            font: 10px/1.2 'Segoe UI', system-ui, sans-serif;
+            font-variant-numeric: tabular-nums;
+            transition: border-color 0.12s ease, background 0.12s ease, box-shadow 0.12s ease;
+        }
+        .fx-number:hover {
+            background: rgba(255, 255, 255, 0.075);
+            border-color: rgba(255, 255, 255, 0.16);
+        }
+        .fx-number:focus {
+            background: rgba(255, 255, 255, 0.09);
+            border-color: rgba(255, 255, 255, 0.28);
+            box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.08);
+        }
         /* ── Custom Checkbox (toggle switch) ────────── */
         .fx-check input[type="checkbox"] {
             -webkit-appearance: none;
@@ -747,6 +776,21 @@
             border-color: #777;
             box-shadow: 0 1px 2px rgba(0, 0, 0, 0.25);
         }
+        body.light-mode .fx-number {
+            background: rgba(255, 255, 255, 0.52);
+            color: #222;
+            border-color: rgba(0, 0, 0, 0.16);
+            box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.05);
+        }
+        body.light-mode .fx-number:hover {
+            background: rgba(255, 255, 255, 0.68);
+            border-color: rgba(0, 0, 0, 0.24);
+        }
+        body.light-mode .fx-number:focus {
+            background: rgba(255, 255, 255, 0.82);
+            border-color: rgba(0, 0, 0, 0.34);
+            box-shadow: 0 0 0 2px rgba(0, 0, 0, 0.08);
+        }
         body.light-mode .fx-note { color: #666; }
 
         /* Toggle switch — metal */
@@ -838,34 +882,49 @@
         }
         body.light-mode #fx-hdri-name { color: #666 !important; }
         body.light-mode #rightRail {
-            background: rgba(245, 245, 245, 0.85);
-            border-color: rgba(0, 0, 0, 0.08);
-            box-shadow: 0 12px 40px rgba(0, 0, 0, 0.18);
+            background: linear-gradient(180deg, #d4d4d4 0%, #c0c0c0 3%, #d0d0d0 4%, #bcbcbc 100%);
+            border-color: #777;
+            border-top-color: #999;
+            border-radius: 0;
+            box-shadow:
+                0 6px 28px rgba(0, 0, 0, 0.55),
+                inset 0 1px 0 rgba(255, 255, 255, 0.5),
+                inset 0 -1px 0 rgba(0, 0, 0, 0.08);
         }
-        body.light-mode .rail-group-label { color: rgba(0, 0, 0, 0.42); }
-        body.light-mode .rail-sep { background: rgba(0, 0, 0, 0.08); }
+        body.light-mode .rail-group-label { color: rgba(20, 24, 28, 0.48); }
+        body.light-mode .rail-sep {
+            background: rgba(0, 0, 0, 0.18);
+            border-radius: 0;
+        }
         body.light-mode .rail-btn {
-            background: rgba(0, 0, 0, 0.03);
-            border-color: rgba(0, 0, 0, 0.08);
-            color: #555;
+            background: linear-gradient(180deg, #d8d8d8 0%, #b4b4b4 100%);
+            border-color: #888;
+            color: #333;
+            border-radius: 0;
+            box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.45), 0 1px 1px rgba(0, 0, 0, 0.12);
         }
         body.light-mode .rail-btn:hover {
-            background: rgba(0, 0, 0, 0.06);
-            border-color: rgba(0, 0, 0, 0.12);
-            color: #222;
+            background: linear-gradient(180deg, #e2e2e2 0%, #c4c4c4 100%);
+            border-color: #777;
+            color: #111;
+            box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.45), 0 1px 1px rgba(0, 0, 0, 0.12);
         }
         body.light-mode .rail-btn.active {
-            background: rgba(0, 0, 0, 0.08);
-            border-color: rgba(0, 0, 0, 0.2);
+            background: linear-gradient(180deg, #eeeeee 0%, #c9c9c9 100%);
+            border-color: #666;
             color: #111;
+            box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.55), 0 0 0 1px rgba(0, 0, 0, 0.08);
         }
+        body.light-mode .rail-btn::before { background: rgba(0, 0, 0, 0.28); border-radius: 0; }
+        body.light-mode .rail-btn.active::before { background: rgba(0, 0, 0, 0.72); }
         body.light-mode .rail-btn-badge {
-            background: rgba(0, 0, 0, 0.045);
-            border-color: rgba(0, 0, 0, 0.08);
-        }
-        body.light-mode .rail-btn.active .rail-btn-badge {
             background: rgba(0, 0, 0, 0.08);
             border-color: rgba(0, 0, 0, 0.14);
+            border-radius: 0;
+        }
+        body.light-mode .rail-btn.active .rail-btn-badge {
+            background: rgba(0, 0, 0, 0.12);
+            border-color: rgba(0, 0, 0, 0.22);
         }
         .ll-mode {
             background: rgba(255,255,255,0.06);
@@ -886,17 +945,17 @@
             top: 8px;
             left: 8px;
             bottom: 8px;
-            width: 40px;
+            width: var(--rail-width);
             transition: transform 0.22s cubic-bezier(0.2, 0.7, 0.2, 1);
             display: flex;
             flex-direction: column;
-            gap: 4px;
-            padding: 6px 3px;
-            background: rgba(20, 20, 22, 0.78);
+            gap: 6px;
+            padding: 7px 6px;
+            background: var(--rail-bg);
             backdrop-filter: blur(32px) saturate(1.4);
             -webkit-backdrop-filter: blur(32px) saturate(1.4);
-            border: 1px solid rgba(255, 255, 255, 0.07);
-            border-radius: 4px;
+            border: 1px solid var(--rail-border);
+            border-radius: 6px;
             box-shadow:
                 0 12px 40px rgba(0, 0, 0, 0.55),
                 0 1px 0 rgba(255, 255, 255, 0.04) inset,
@@ -904,84 +963,118 @@
             z-index: 40;
             overflow-y: auto;
             overflow-x: hidden;
-            scrollbar-width: thin;
-            scrollbar-color: rgba(120, 120, 120, 0.2) transparent;
+            scrollbar-width: none;
         }
-        #rightRail::-webkit-scrollbar { width: 4px; }
-        #rightRail::-webkit-scrollbar-track { background: transparent; }
-        #rightRail::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.08); }
+        #rightRail::-webkit-scrollbar { width: 0; height: 0; display: none; }
         .rail-group {
             display: flex;
             flex-direction: column;
-            gap: 2px;
+            gap: 5px;
             flex-shrink: 0;
         }
         .rail-group-label {
-            padding: 1px 4px 3px;
-            font: 700 8px/1 'Segoe UI', system-ui, sans-serif;
-            letter-spacing: 0.16em;
+            display: block;
+            padding: 1px 0 0;
+            font: 700 7px/1 'Segoe UI', system-ui, sans-serif;
+            letter-spacing: 0.14em;
             text-transform: uppercase;
-            color: rgba(255, 255, 255, 0.38);
+            color: rgba(255, 255, 255, 0.34);
+            text-align: center;
             user-select: none;
         }
         .rail-sep {
             height: 1px;
-            background: rgba(255, 255, 255, 0.06);
-            margin: 4px 2px;
+            margin: 1px 9px;
+            border-radius: 0;
+            background: rgba(255, 255, 255, 0.08);
             flex-shrink: 0;
         }
         /* Pushes the final group (Prefs) to the bottom of the rail. */
         .rail-spacer { flex: 1 1 auto; min-height: 4px; }
         .rail-btn {
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            justify-content: center;
-            min-height: 32px;
-            gap: 2px;
-            padding: 4px 2px;
+            display: block;
+            position: relative;
+            min-height: 40px;
+            height: 40px;
+            padding: 0;
             font: 8px/1 'Segoe UI', system-ui, sans-serif;
             font-weight: 600;
             text-transform: uppercase;
-            letter-spacing: 0.06em;
-            color: #888;
+            letter-spacing: 0.08em;
+            color: rgba(220, 225, 229, 0.7);
             background: rgba(255, 255, 255, 0.02);
             border: 1px solid rgba(255, 255, 255, 0.05);
-            border-radius: 3px;
+            border-radius: 4px;
             cursor: pointer;
-            transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
+            box-shadow: none;
+            transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease, box-shadow 0.12s ease;
             white-space: nowrap;
             overflow: hidden;
         }
+        .rail-btn::before {
+            content: '';
+            position: absolute;
+            left: 4px;
+            top: 8px;
+            bottom: 8px;
+            width: 2px;
+            border-radius: 0;
+            background: rgba(255, 255, 255, 0.38);
+            opacity: 0;
+            transform: scaleY(0.4);
+            transition: opacity 0.12s ease, transform 0.12s ease;
+        }
         .rail-btn svg {
-            width: 18px;
-            height: 18px;
-            flex-shrink: 0;
+            width: 20px;
+            height: 20px;
             display: block;
+            position: absolute;
+            left: 50%;
+            top: 50%;
+            transform: translate(-50%, -50%);
+            pointer-events: none;
         }
         .rail-btn svg.rail-btn-logo-lg {
-            width: 26px;
-            height: 26px;
-            transform: translateY(-1px);
+            width: 21px;
+            height: 27px;
+            transform: translate(-50%, -50%);
+        }
+        .rail-btn:has(.rail-btn-badge) svg,
+        .rail-btn:has(.rail-btn-label) svg {
+            top: 42%;
         }
         .rail-btn-label {
+            position: absolute;
+            left: 50%;
+            bottom: 5px;
+            transform: translateX(-50%);
             font-size: 7px;
             line-height: 1;
             letter-spacing: 0.12em;
-            opacity: 0.7;
+            opacity: 0.72;
+            pointer-events: none;
         }
         .rail-btn-badge {
-            min-width: 22px;
+            position: absolute;
+            left: 50%;
+            bottom: 4px;
+            transform: translateX(-50%);
+            min-width: 25px;
+            max-width: 34px;
             padding: 1px 4px;
             border-radius: 999px;
-            background: rgba(255, 255, 255, 0.06);
-            border: 1px solid rgba(255, 255, 255, 0.08);
+            background: rgba(9, 10, 12, 0.72);
+            border: 1px solid rgba(255, 255, 255, 0.12);
+            border-radius: 2px;
             color: inherit;
-            font-size: 7px;
+            font-size: 6px;
             line-height: 1.15;
-            letter-spacing: 0.1em;
+            letter-spacing: 0.06em;
             text-align: center;
             font-variant-numeric: tabular-nums;
+            overflow: hidden;
+            text-overflow: clip;
+            pointer-events: none;
         }
         /* Theme icon crossfade — both present, CSS swaps by mode. */
         .rail-btn .icon-sun { display: none; }
@@ -989,13 +1082,19 @@
         body.light-mode .rail-btn .icon-sun { display: block; }
         .rail-btn:hover {
             background: rgba(255, 255, 255, 0.05);
-            color: #ccc;
-            border-color: rgba(255, 255, 255, 0.1);
+            color: #f2f5f4;
+            border-color: rgba(255, 255, 255, 0.12);
+            box-shadow: none;
         }
         .rail-btn.active {
             background: rgba(255, 255, 255, 0.08);
-            color: #f0f0f0;
+            color: #ffffff;
             border-color: rgba(255, 255, 255, 0.18);
+            box-shadow: none;
+        }
+        .rail-btn.active::before {
+            opacity: 1;
+            transform: scaleY(1);
         }
         .rail-btn.active .rail-btn-badge {
             background: rgba(255, 255, 255, 0.12);
@@ -8304,14 +8403,14 @@
                                     <span>Near plane</span>
                                     <span class="fx-value" id="fx-camera-near-val">auto (${camera.near.toFixed(3)})</span>
                                 </div>
-                                <input class="fx-range" id="fx-camera-near" type="number" min="0" step="0.01" placeholder="auto" value="${cameraClip.near ?? ''}" style="background:rgba(255,255,255,0.05);color:#ccc;border:1px solid rgba(255,255,255,0.08);border-radius:0;padding:3px 6px;font:10px 'Segoe UI',system-ui,sans-serif;width:100%;outline:none">
+                                <input class="fx-number" id="fx-camera-near" type="number" min="0" step="0.01" placeholder="auto" value="${cameraClip.near ?? ''}">
                             </label>
                             <label class="fx-control" for="fx-camera-far">
                                 <div class="fx-control-head">
                                     <span>Far plane</span>
                                     <span class="fx-value" id="fx-camera-far-val">auto (${camera.far.toFixed(0)})</span>
                                 </div>
-                                <input class="fx-range" id="fx-camera-far" type="number" min="0" step="1" placeholder="auto" value="${cameraClip.far ?? ''}" style="background:rgba(255,255,255,0.05);color:#ccc;border:1px solid rgba(255,255,255,0.08);border-radius:0;padding:3px 6px;font:10px 'Segoe UI',system-ui,sans-serif;width:100%;outline:none">
+                                <input class="fx-number" id="fx-camera-far" type="number" min="0" step="1" placeholder="auto" value="${cameraClip.far ?? ''}">
                             </label>
                         </div>
                         <div class="fx-note">Leave empty for auto-fit. Raise Near (e.g. 1–10) on large scenes to eliminate distant-geometry z-fighting by reclaiming depth buffer precision.</div>

@@ -4783,11 +4783,6 @@ static bool IsClayModeActive() {
     return s && s->GetViewportVisualStyle() == MaxSDK::Graphics::VisualStyleClay;
 }
 
-static bool IsNitrousShadowsEnabled() {
-    auto* s = GetViewportSettings();
-    return s && s->GetShadowsEnabled();
-}
-
 static bool NearlyEqualFloat(float a, float b, float epsilon = 1.0e-4f) {
     return std::fabs(a - b) <= epsilon;
 }
@@ -6213,7 +6208,6 @@ public:
     std::map<std::wstring, std::wstring> texDirMap_;    // dir → host
     int texDirCount_ = 0;
     bool lastClayMode_ = false;
-    bool lastShadowMode_ = false;
     std::wstring activeWebDir_;
     std::uint64_t activeWebStamp_ = 0;
     std::wstring activeProjectDir_;
@@ -10137,6 +10131,7 @@ public:
         GetActiveCamera(current);
         if (!haveLastSentCamera_ || !CameraEquals(lastSentCamera_, current)) {
             fastCameraDirty_ = true;
+            MarkInteractiveActivity();
             QueueFastFlush();
         }
     }
@@ -10496,15 +10491,6 @@ public:
             std::wstring msg = clay
                 ? L"{\"type\":\"clay_mode\",\"enabled\":true}"
                 : L"{\"type\":\"clay_mode\",\"enabled\":false}";
-            webview_->PostWebMessageAsJson(msg.c_str());
-        }
-
-        bool shadow = IsNitrousShadowsEnabled();
-        if (shadow != lastShadowMode_) {
-            lastShadowMode_ = shadow;
-            std::wstring msg = shadow
-                ? L"{\"type\":\"shadow_mode\",\"enabled\":true}"
-                : L"{\"type\":\"shadow_mode\",\"enabled\":false}";
             webview_->PostWebMessageAsJson(msg.c_str());
         }
     }
@@ -14653,6 +14639,7 @@ void MaxJSFastNodeEventCallback::TopologyChanged(NodeKeyTab& nodes) {
 void MaxJSFastRedrawCallback::proc(Interface*) {
     if (!owner_) return;
     const bool animPlaying = owner_->IsAnimationPlaying();
+    owner_->MarkCameraDirtyIfChanged();
     owner_->MarkSelectedTransformsDirty();
     owner_->CheckTrackedMaterialScalarsLive();
     if (!animPlaying && !owner_->ShouldFavorInteractivePerformance()) {
@@ -14662,7 +14649,6 @@ void MaxJSFastRedrawCallback::proc(Interface*) {
         owner_->MarkTrackedAudioTransformsDirty();
         owner_->PollViewportModes();
     }
-    owner_->MarkCameraDirtyIfChanged();
     owner_->CheckSelectedGeometryLive();
     owner_->CheckSkinnedGeometryLive();
 }

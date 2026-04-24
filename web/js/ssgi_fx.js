@@ -1939,16 +1939,41 @@ export function createSSGIController({
         },
         setFogFromScene(fogData) {
             if (!fogData) return;
-            state.fog.enabled = !!fogData.active;
-            state.fog.type = fogData.type ?? 0;
-            if (Array.isArray(fogData.color)) state.fog.color = fogData.color;
-            if (Number.isFinite(fogData.opacity)) state.fog.opacity = fogData.opacity;
-            if (Number.isFinite(fogData.near)) state.fog.near = fogData.near;
-            if (Number.isFinite(fogData.far)) state.fog.far = fogData.far;
-            if (Number.isFinite(fogData.density)) state.fog.density = fogData.density;
-            if (Number.isFinite(fogData.noiseScale)) state.fog.noiseScale = fogData.noiseScale;
-            if (Number.isFinite(fogData.noiseSpeed)) state.fog.noiseSpeed = fogData.noiseSpeed;
-            if (Number.isFinite(fogData.height)) state.fog.height = fogData.height;
+            const f = state.fog;
+            const nextEnabled = !!fogData.active;
+            const nextType = fogData.type ?? 0;
+            const nextColor = Array.isArray(fogData.color) ? fogData.color : f.color;
+            const nextOpacity = Number.isFinite(fogData.opacity) ? fogData.opacity : f.opacity;
+            const nextNear = Number.isFinite(fogData.near) ? fogData.near : f.near;
+            const nextFar = Number.isFinite(fogData.far) ? fogData.far : f.far;
+            const nextDensity = Number.isFinite(fogData.density) ? fogData.density : f.density;
+            const nextNoiseScale = Number.isFinite(fogData.noiseScale) ? fogData.noiseScale : f.noiseScale;
+            const nextNoiseSpeed = Number.isFinite(fogData.noiseSpeed) ? fogData.noiseSpeed : f.noiseSpeed;
+            const nextHeight = Number.isFinite(fogData.height) ? fogData.height : f.height;
+            const changed =
+                f.enabled !== nextEnabled ||
+                f.type !== nextType ||
+                f.opacity !== nextOpacity ||
+                f.near !== nextNear ||
+                f.far !== nextFar ||
+                f.density !== nextDensity ||
+                f.noiseScale !== nextNoiseScale ||
+                f.noiseSpeed !== nextNoiseSpeed ||
+                f.height !== nextHeight ||
+                f.color[0] !== nextColor[0] ||
+                f.color[1] !== nextColor[1] ||
+                f.color[2] !== nextColor[2];
+            if (!changed) return;
+            f.enabled = nextEnabled;
+            f.type = nextType;
+            f.color = nextColor;
+            f.opacity = nextOpacity;
+            f.near = nextNear;
+            f.far = nextFar;
+            f.density = nextDensity;
+            f.noiseScale = nextNoiseScale;
+            f.noiseSpeed = nextNoiseSpeed;
+            f.height = nextHeight;
             applyFog();
             rebuildPipeline();
         },

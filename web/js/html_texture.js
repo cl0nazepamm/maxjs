@@ -99,16 +99,20 @@ export function createHTMLTexture(THREE, url, options = {}) {
 
     const wrap = document.createElement('div');
     wrap.className = 'maxjs-html-texture-wrap';
-    // Keep the wrapper inside the viewport and at full opacity so the
-    // canvas + host get a real paint pass (drawElementImage needs a cached
-    // paint record). Hide visually via `transform: scale(0)` — per the
-    // WICG spec, CSS transforms on the source element are *ignored* by
-    // drawElementImage for rasterization, so the texture still produces
-    // content at full size even though the wrapper is visually collapsed.
+    // Keep the canvas + host at full layout size so drawElementImage has
+    // a real paint record, but clip the wrapper to 1×1 so nothing leaks
+    // visually. A previous revision used `transform: scale(0)` — the
+    // WICG spec ignores transforms during rasterization, so the texture
+    // still rendered, BUT scale(0) on an ancestor collapses every
+    // descendant's getBoundingClientRect() to (0,0,0,0). That broke any
+    // user code inside the texture that measured layout (e.g. xp.html's
+    // window-drag reads `win.getBoundingClientRect().left` as its start
+    // offset, which pinned it to 0 and teleported windows on drag).
+    // overflow:hidden clips visually without affecting descendants'
+    // measured rects.
     wrap.style.cssText =
         'position:fixed;top:0;left:0;' +
-        'width:' + width + 'px;height:' + height + 'px;' +
-        'transform:scale(0);transform-origin:0 0;' +
+        'width:1px;height:1px;overflow:hidden;' +
         'pointer-events:none;z-index:-1;';
 
     const canvas = document.createElement('canvas');

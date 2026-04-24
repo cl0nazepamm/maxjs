@@ -389,10 +389,22 @@ function findHTMLTextureOnMaterial(material) {
     return null;
 }
 
-// Install a global click listener on the renderer's domElement. On click,
-// raycast into the scene; if the hit mesh has any material slot wired to
-// an HTML texture, forward the click to the matching DOM element via the
-// shadow tree's layout boxes.
+// Forward pointer + mouse events from the 3D viewport into the DOM tree
+// backing an HTML texture. Raycast hits a mesh whose material has any
+// HTML-texture map slot → convert UV hit to host-pixel coords → re-dispatch
+// the pointer stream on the matching DOM element inside the shadow tree (or
+// iframe contentDocument).
+//
+// Forwards the full stream so drag + dblclick work:
+//   pointerdown → mousedown            (once, on the initial hit target)
+//   pointermove → mousemove            (every move while pointer is held)
+//   pointerup   → mouseup → click      (release; click only if not dragged)
+//   second click within 400ms → dblclick
+//
+// While a drag session is active, subsequent pointermove events are
+// redispatched to the SAME host even if the pointer strays — that's what
+// lets `document.addEventListener('mousemove', …)` handlers inside xp.html
+// keep receiving motion while a window is being dragged.
 //
 // `getCameraScene` is a function so it stays current across active-camera
 // switches. Returns a teardown function.
@@ -402,14 +414,29 @@ export function attachHTMLClickForwarding(THREE, renderer, getCameraScene) {
     const el = renderer?.domElement;
     if (!el) return () => {};
 
-    function onClick(event) {
+    // Active drag session. Non-null between pointerdown-on-htmltex and
+    // pointerup. While set, move/up events are routed to this host and
+    // camera controls are suppressed via stopPropagation.
+    let active = null;
+
+    // Dblclick tracker.
+    let lastClickTarget = null;
+    let lastClickTime = 0;
+    const DBLCLICK_MS = 400;
+    // Movement beyond this (in HTML pixels) between down and up cancels the
+    // click — matches browser convention for "this was a drag, not a tap."
+    const DRAG_CANCELS_CLICK_PX = 5;
+
+    function pickHTMLTexture(event, restrictMesh) {
         const cs = getCameraScene();
-        if (!cs?.camera || !cs?.scene) return;
+        if (!cs?.camera) return null;
+        const root = restrictMesh || cs.scene;
+        if (!root) return null;
         const rect = el.getBoundingClientRect();
         ndc.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
         ndc.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
         raycaster.setFromCamera(ndc, cs.camera);
-        const hits = raycaster.intersectObject(cs.scene, true);
+        const hits = raycaster.intersectObject(root, true);
         for (const hit of hits) {
             if (!hit.uv || !hit.object?.material) continue;
             const mats = Array.isArray(hit.object.material) ? hit.object.material : [hit.object.material];
@@ -419,26 +446,176 @@ export function attachHTMLClickForwarding(THREE, renderer, getCameraScene) {
                 const host = tex.userData.maxjsHTMLHost;
                 const w = tex.userData.maxjsHTMLWidth || 1024;
                 const h = tex.userData.maxjsHTMLHeight || 1024;
-                const px = hit.uv.x * w;
-                const py = (1 - hit.uv.y) * h; // flip V: Three UV bottom-left → DOM top-left
-                const target = hitTestHost(host, px, py);
-                if (target && typeof target.click === 'function') {
-                    // Synthesize a pointerdown then click — terrain.html
-                    // listens for pointerdown specifically.
-                    target.dispatchEvent(new PointerEvent('pointerdown', {
-                        bubbles: true,
-                        clientX: 0,
-                        clientY: 0,
-                        pointerType: 'mouse',
-                    }));
-                    target.click();
-                }
-                return; // forward to first hit only
+                return {
+                    mesh: hit.object,
+                    host, tex, w, h,
+                    px: hit.uv.x * w,
+                    py: (1 - hit.uv.y) * h, // flip V: Three UV bottom-left → DOM top-left
+                };
             }
         }
+        return null;
     }
 
-    el.addEventListener('click', onClick);
-    return () => el.removeEventListener('click', onClick);
+    function baseInit(px, py, ev, buttons) {
+        const ix = Math.round(px);
+        const iy = Math.round(py);
+        return {
+            bubbles: true,
+            cancelable: true,
+            composed: true,
+            view: window,
+            clientX: ix, clientY: iy,
+            screenX: ix, screenY: iy,
+            pageX: ix, pageY: iy,
+            button: 0,
+            buttons: buttons,
+            ctrlKey: !!ev?.ctrlKey,
+            shiftKey: !!ev?.shiftKey,
+            altKey: !!ev?.altKey,
+            metaKey: !!ev?.metaKey,
+        };
+    }
+
+    function dispatchPointer(target, type, px, py, ev, buttons, pointerId) {
+        const init = baseInit(px, py, ev, buttons);
+        init.pointerId = pointerId ?? 1;
+        init.pointerType = 'mouse';
+        init.isPrimary = true;
+        target.dispatchEvent(new PointerEvent(type, init));
+    }
+
+    function dispatchMouse(target, type, px, py, ev, buttons, detail) {
+        const init = baseInit(px, py, ev, buttons);
+        init.detail = detail || 0;
+        target.dispatchEvent(new MouseEvent(type, init));
+    }
+
+    function onPointerDown(event) {
+        if (event.button !== 0) return; // LMB only
+        const pick = pickHTMLTexture(event);
+        if (!pick) return;
+        const target = hitTestHost(pick.host, pick.px, pick.py);
+        if (!target) return;
+
+        // Block OrbitControls / camera listeners on the same canvas from
+        // treating this press as the start of a rotate/pan gesture.
+        event.stopPropagation();
+        if (typeof event.stopImmediatePropagation === 'function') {
+            event.stopImmediatePropagation();
+        }
+
+        active = {
+            mesh: pick.mesh,
+            host: pick.host,
+            w: pick.w, h: pick.h,
+            startTarget: target,
+            startPx: pick.px, startPy: pick.py,
+            lastPx: pick.px, lastPy: pick.py,
+            pointerId: event.pointerId ?? 1,
+            moved: false,
+        };
+
+        // Keep subsequent moves flowing to this canvas even if the real
+        // pointer drifts outside it.
+        try { el.setPointerCapture?.(event.pointerId); } catch (_) { /* ignore */ }
+
+        dispatchPointer(target, 'pointerdown', pick.px, pick.py, event, 1, active.pointerId);
+        dispatchMouse(target, 'mousedown', pick.px, pick.py, event, 1, 1);
+    }
+
+    function onPointerMove(event) {
+        if (!active) return;
+        const pick = pickHTMLTexture(event, active.mesh);
+        if (!pick) return; // pointer slid off the htmltex mesh — freeze
+        event.stopPropagation();
+
+        const { px, py } = pick;
+        if (
+            Math.abs(px - active.startPx) > DRAG_CANCELS_CLICK_PX ||
+            Math.abs(py - active.startPy) > DRAG_CANCELS_CLICK_PX
+        ) {
+            active.moved = true;
+        }
+        active.lastPx = px;
+        active.lastPy = py;
+
+        // Dispatch against the start target so bubbling still reaches any
+        // capturing listeners bound via document.addEventListener('mousemove',
+        // handler, true) on the shadow root — that's the pattern xp.html
+        // uses for window dragging.
+        dispatchPointer(active.startTarget, 'pointermove', px, py, event, 1, active.pointerId);
+        dispatchMouse(active.startTarget, 'mousemove', px, py, event, 1, 0);
+    }
+
+    function onPointerUp(event) {
+        if (!active) return;
+        event.stopPropagation();
+        try { el.releasePointerCapture?.(event.pointerId); } catch (_) { /* ignore */ }
+
+        const pick = pickHTMLTexture(event, active.mesh);
+        let px = active.lastPx, py = active.lastPy;
+        let releaseTarget = active.startTarget;
+        if (pick) {
+            px = pick.px;
+            py = pick.py;
+            releaseTarget = hitTestHost(active.host, px, py) || active.startTarget;
+        }
+
+        dispatchPointer(active.startTarget, 'pointerup', px, py, event, 0, active.pointerId);
+        dispatchMouse(active.startTarget, 'mouseup', px, py, event, 0, 1);
+
+        // Browser click rule: fire click only if the release lands on the
+        // same target (or its subtree) and the press wasn't a drag.
+        const sameTarget =
+            releaseTarget === active.startTarget ||
+            active.startTarget.contains?.(releaseTarget) ||
+            releaseTarget.contains?.(active.startTarget);
+
+        if (!active.moved && sameTarget) {
+            const now = (typeof performance !== 'undefined') ? performance.now() : Date.now();
+            const isDbl =
+                lastClickTarget === active.startTarget &&
+                (now - lastClickTime) < DBLCLICK_MS;
+            dispatchMouse(active.startTarget, 'click', px, py, event, 0, isDbl ? 2 : 1);
+            if (isDbl) {
+                dispatchMouse(active.startTarget, 'dblclick', px, py, event, 0, 2);
+                lastClickTarget = null;
+                lastClickTime = 0;
+            } else {
+                lastClickTarget = active.startTarget;
+                lastClickTime = now;
+            }
+        } else {
+            // A drag, or released outside the start target — resets the
+            // dblclick window so it doesn't chain with a prior single click.
+            lastClickTarget = null;
+            lastClickTime = 0;
+        }
+
+        active = null;
+    }
+
+    function onPointerCancel(event) {
+        if (!active) return;
+        try { el.releasePointerCapture?.(event.pointerId); } catch (_) { /* ignore */ }
+        dispatchPointer(active.startTarget, 'pointercancel', active.lastPx, active.lastPy, event, 0, active.pointerId);
+        active = null;
+    }
+
+    // Capture phase so we run before OrbitControls / other gesture handlers
+    // attached to the same canvas. Only events whose raycast hits an HTML
+    // texture get stopPropagation'd — others pass through untouched.
+    el.addEventListener('pointerdown', onPointerDown, true);
+    el.addEventListener('pointermove', onPointerMove, true);
+    el.addEventListener('pointerup', onPointerUp, true);
+    el.addEventListener('pointercancel', onPointerCancel, true);
+
+    return () => {
+        el.removeEventListener('pointerdown', onPointerDown, true);
+        el.removeEventListener('pointermove', onPointerMove, true);
+        el.removeEventListener('pointerup', onPointerUp, true);
+        el.removeEventListener('pointercancel', onPointerCancel, true);
+    };
 }
 

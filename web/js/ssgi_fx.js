@@ -775,6 +775,27 @@ export function createSSGIController({
         snapshotRendererOutputState();
     }
 
+    function syncRendererResizeState() {
+        readRendererDrawBufferSize(rendererDrawBufferSize);
+        const nextPixelRatio = Number.isFinite(renderer.getPixelRatio?.()) ? renderer.getPixelRatio() : 1;
+        const sizeChanged =
+            rendererDrawBufferSize.x !== lastRenderWidth ||
+            rendererDrawBufferSize.y !== lastRenderHeight ||
+            Math.abs(nextPixelRatio - lastRenderPixelRatio) > 1.0e-6;
+        const toneMappingChanged =
+            renderer.toneMapping !== lastToneMapping ||
+            Math.abs((renderer.toneMappingExposure ?? 1) - (lastToneMappingExposure ?? 1)) > 1.0e-6;
+
+        if (sizeChanged || toneMappingChanged) {
+            // PassNode render targets resize themselves from the renderer dimensions.
+            // Rebuilding the whole post-FX graph here allocates a second full set of
+            // effect targets after panel resize in ActiveShade/WebView2.
+            queuePipelineUpdate({ output: true });
+        }
+
+        snapshotRendererOutputState();
+    }
+
     function flushPendingPipelineUpdates() {
         syncRendererOutputState();
         const needsRebuild = pendingPipelineRebuild;
@@ -1646,12 +1667,12 @@ export function createSSGIController({
          * toon-cache and post-pass hide list. Does NOT rebuild the pipeline graph.
          *
          * Pass `{ rebuild: true }` only when the post-FX node graph itself must be
-         * reconstructed (renderer size, effect toggled, env map swapped) — almost
+         * reconstructed (effect toggled, env map swapped) — almost
          * never needed from outside, since those have dedicated entry points.
          */
         markSceneChanged(options = {}) {
             // Three reasons to escalate a scene-structure change to a full rebuild:
-            //   1. Explicit {rebuild:true} from the caller (env swap, resize).
+            //   1. Explicit {rebuild:true} from the caller (env/effect graph swap).
             //   2. Toon outline is on — it binds per-mesh refs into the node
             //      graph at rebuild time, so scene-structure mutations break it.
             //   3. The current pipeline was built against an empty scene (cold
@@ -2164,7 +2185,7 @@ export function createSSGIController({
         },
 
         resize() {
-            syncRendererOutputState(true);
+            syncRendererResizeState();
         },
     };
 }

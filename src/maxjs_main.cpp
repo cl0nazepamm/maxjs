@@ -6402,9 +6402,23 @@ public:
         // copyElementImageToTexture — lets us render live HTML straight into
         // Three.js WebGPU textures for in-scene UI and billboards.
         auto options = Microsoft::WRL::Make<CoreWebView2EnvironmentOptions>();
-        options->put_AdditionalBrowserArguments(
+        std::wstring browserArgs =
             L"--enable-features=WebXR,WebXRARModule,OpenXR,CanvasDrawElement "
-            L"--enable-blink-features=CanvasDrawElement");
+            L"--enable-blink-features=CanvasDrawElement";
+        // Opt-in remote DevTools Protocol for profiling. Set MAXJS_DEBUG_PORT=9222
+        // (or any free port) before launching 3ds Max, then connect chrome://inspect
+        // or chrome-devtools MCP to http://127.0.0.1:9222 to get heap snapshots,
+        // render counters, and the full DevTools surface.
+        {
+            wchar_t portBuf[32] = {};
+            DWORD portLen = GetEnvironmentVariableW(L"MAXJS_DEBUG_PORT", portBuf,
+                static_cast<DWORD>(std::size(portBuf)));
+            if (portLen > 0 && portLen < std::size(portBuf)) {
+                browserArgs += L" --remote-debugging-port=";
+                browserArgs += portBuf;
+            }
+        }
+        options->put_AdditionalBrowserArguments(browserArgs.c_str());
 
         CreateCoreWebView2EnvironmentWithOptions(nullptr, udf.c_str(), options.Get(),
             Callback<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler>(
@@ -13811,6 +13825,12 @@ public:
 
     Bitmap* asTarget_ = nullptr;
     bool asCapturing_ = false;
+    bool asCaptureInFlight_ = false;
+    // Persistent scratch buffers reused across ActiveShade captures to avoid
+    // churning 8MB/frame at 1080p (~120MB/s alloc/free at 15fps cadence).
+    std::vector<BYTE> asPixelScratch_;
+    std::vector<BMM_Color_64> asLineScratch_;
+    ComPtr<IWICImagingFactory> asWicFactory_;
     HWND originalParent_ = nullptr;
     HWND embeddedViewportHwnd_ = nullptr;
     LONG originalStyle_ = 0;
@@ -13821,7 +13841,18 @@ public:
     bool haveLastFloatingAnchorRect_ = false;
     bool floatingInSizeMove_ = false;
     bool hostSubclassAttached_ = false;
+    RECT lastControllerBounds_ = {};
+    bool haveLastControllerBounds_ = false;
     static constexpr UINT_PTR kHostSubclassId = 0xC0DE5A1Dull;
+
+    // ActiveShade hosted resize defense. After the initial attach, the WebView
+    // backbuffer size stays fixed for the whole viewport-hosted session. Host
+    // WM_SIZE only updates this timestamp so capture can pause briefly; it
+    // must not flow into controller_->put_Bounds.
+    ULONGLONG lastHostResizeMs_ = 0;
+    static constexpr DWORD kCaptureSuppressMs = 150;
+    int activeShadeHostedWidth_ = 0;
+    int activeShadeHostedHeight_ = 0;
 
     bool IsViewportHosted() const {
         return originalParent_ != nullptr && embeddedViewportHwnd_ != nullptr;
@@ -13902,6 +13933,11 @@ public:
     void NotifyWebViewParentWindowPositionChanged() {
         if (!controller_) return;
         controller_->NotifyParentWindowPositionChanged();
+    }
+
+    void InvalidateControllerBoundsCache() {
+        haveLastControllerBounds_ = false;
+        lastControllerBounds_ = {};
     }
 
     void NormalizeFloatingWindow(bool forceRecenter = false) {
@@ -13993,19 +14029,12 @@ public:
         }
 
         // Alt+W maximizes the Nitrous viewport by expanding this very HWND to
-        // fill the whole Max window; mirroring that into the child would turn
-        // the WebView into a fullscreen takeover. Collapse the child to 0x0
-        // so it's effectively invisible without touching ShowWindow state
-        // (which races with Max's layout animation and causes flicker). On
-        // unmax, the normal reposition path below restores full size.
+        // fill the whole Max window. Do not resize/collapse the WebView here:
+        // even one hosted resize can leak renderer-side resources in
+        // ActiveShade. Hiding preserves the fixed backbuffer for unmax.
         Interface* ip = GetCOREInterface();
         if (ip && ip->IsViewportMaxed()) {
-            RECT cur = {};
-            if (GetClientRect(hwnd_, &cur) &&
-                (cur.right - cur.left != 0 || cur.bottom - cur.top != 0)) {
-                SetWindowPos(hwnd_, nullptr, 0, 0, 0, 0,
-                    SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS);
-            }
+            if (IsWindowVisible(hwnd_)) ShowWindow(hwnd_, SW_HIDE);
             return false;
         }
 
@@ -14042,19 +14071,42 @@ public:
             return false;
         }
 
-        RECT childRect = {};
-        bool needReposition = reattached || !GetClientRect(hwnd_, &childRect) ||
-            (childRect.right - childRect.left) != width ||
-            (childRect.bottom - childRect.top) != height ||
-            !IsWindowVisible(hwnd_);
-        if (needReposition) {
+        if (activeShadeHostedWidth_ <= 0 || activeShadeHostedHeight_ <= 0) {
+            RECT childRect = {};
+            if (GetClientRect(hwnd_, &childRect)) {
+                activeShadeHostedWidth_ = std::max(64, static_cast<int>(childRect.right - childRect.left));
+                activeShadeHostedHeight_ = std::max(64, static_cast<int>(childRect.bottom - childRect.top));
+            } else {
+                activeShadeHostedWidth_ = width;
+                activeShadeHostedHeight_ = height;
+            }
+        }
+
+        const int childW = activeShadeHostedWidth_;
+        const int childH = activeShadeHostedHeight_;
+        const int childX = std::min(0, (width - childW) / 2);
+        const int childY = std::min(0, (height - childH) / 2);
+
+        RECT childWin = {};
+        const bool haveChildWin = GetWindowRect(hwnd_, &childWin);
+        POINT childOrigin = { childWin.left, childWin.top };
+        if (haveChildWin) ScreenToClient(embeddedViewportHwnd_, &childOrigin);
+        const bool needMove =
+            reattached ||
+            !IsWindowVisible(hwnd_) ||
+            !haveChildWin ||
+            childOrigin.x != childX ||
+            childOrigin.y != childY ||
+            (childWin.right - childWin.left) != childW ||
+            (childWin.bottom - childWin.top) != childH;
+
+        if (needMove) {
             UINT posFlags = SWP_NOACTIVATE | SWP_NOCOPYBITS | SWP_SHOWWINDOW;
-            if (reattached) posFlags |= SWP_FRAMECHANGED;
-            SetWindowPos(hwnd_, HWND_TOP, 0, 0, width, height, posFlags);
+            if (!reattached) posFlags |= SWP_NOOWNERZORDER;
+            SetWindowPos(hwnd_, HWND_TOP, childX, childY, childW, childH, posFlags);
         } else {
             ShowWindow(hwnd_, SW_SHOWNA);
         }
-        Resize();
         return true;
     }
 
@@ -14075,15 +14127,13 @@ public:
         switch (msg) {
         case WM_SIZE:
         case WM_WINDOWPOSCHANGED:
-            // ActiveShade host resized — mirror the new client rect to our
-            // WebView2 child immediately rather than waiting for the next
-            // 33ms timer tick. Keeps the child glued to the host during
-            // live drag-resizes and Max main-window maximize.
+            // Host (Max viewport) resized. Do not mirror this to the child
+            // WebView. In ActiveShade, controller bounds changes after attach
+            // leak renderer-side resources in both WebGPU and WebGL. The fixed
+            // child/backbuffer is only moved or hidden by MaintainViewportHost.
             if (self->embeddedViewportHwnd_ == h && self->hwnd_ && IsWindow(self->hwnd_)) {
-                // Skip mirroring when the user hits Alt+W: Nitrous expands this
-                // HWND to cover the whole Max window, and MaintainViewportHost
-                // will hide the child on the next tick. Following the grown
-                // rect here would briefly fullscreen the WebView first.
+                // Alt+W expands this HWND to cover the whole Max window.
+                // MaintainViewportHost hides the fixed child until unmax.
                 Interface* ip = GetCOREInterface();
                 if (ip && ip->IsViewportMaxed()) break;
                 RECT vp = {};
@@ -14091,9 +14141,7 @@ public:
                     const int vw = vp.right - vp.left;
                     const int vh = vp.bottom - vp.top;
                     if (vw >= 64 && vh >= 64) {
-                        SetWindowPos(self->hwnd_, HWND_TOP, 0, 0, vw, vh,
-                            SWP_NOACTIVATE | SWP_NOCOPYBITS | SWP_SHOWWINDOW);
-                        self->Resize();
+                        self->lastHostResizeMs_ = GetTickCount64();
                     }
                 }
             }
@@ -14135,14 +14183,25 @@ public:
 
     void StopActiveShade() {
         asCapturing_ = false;
+        asCaptureInFlight_ = false;
         asTarget_ = nullptr;
         if (hwnd_) KillTimer(hwnd_, AS_TIMER_ID);
+        // Release the 1080p-sized scratch buffers so they don't sit idle
+        // between ActiveShade sessions. WIC factory is cheap to keep alive.
+        std::vector<BYTE>().swap(asPixelScratch_);
+        std::vector<BMM_Color_64>().swap(asLineScratch_);
         RefreshCallbackRegistration();
     }
 
     // Reparent WebView2 into a viewport HWND — true GPU overlay
     void ReparentIntoViewport(HWND viewportHwnd) {
         if (!hwnd_ || !viewportHwnd || !IsWindow(viewportHwnd)) return;
+
+        if (IsViewportHosted() && embeddedViewportHwnd_ == viewportHwnd) {
+            AttachHostSubclass();
+            RefreshCallbackRegistration(true);
+            return;
+        }
 
         if (!IsViewportHosted()) {
             RememberFloatingBounds();
@@ -14157,13 +14216,17 @@ public:
         // Strip window chrome, make it a child of the viewport
         SetWindowLong(hwnd_, GWL_STYLE, WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_CLIPSIBLINGS);
         SetParent(hwnd_, viewportHwnd);
+        InvalidateControllerBoundsCache();
 
-        // Fill the viewport
-        RECT vpRect;
+        // Initial attach is the only hosted path allowed to size WebView2.
+        RECT vpRect = {};
         GetClientRect(viewportHwnd, &vpRect);
+        activeShadeHostedWidth_ = std::max(64, static_cast<int>(vpRect.right - vpRect.left));
+        activeShadeHostedHeight_ = std::max(64, static_cast<int>(vpRect.bottom - vpRect.top));
         SetWindowPos(hwnd_, HWND_TOP, 0, 0,
-            vpRect.right, vpRect.bottom, SWP_SHOWWINDOW | SWP_NOACTIVATE | SWP_FRAMECHANGED);
-        Resize();
+            activeShadeHostedWidth_, activeShadeHostedHeight_,
+            SWP_SHOWWINDOW | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+        Resize(true);
 
         AttachHostSubclass();
         RefreshCallbackRegistration(true);
@@ -14184,6 +14247,7 @@ public:
 
         SetParent(hwnd_, restoreParent);
         SetWindowLong(hwnd_, GWL_STYLE, originalStyle_);
+        InvalidateControllerBoundsCache();
         const RECT& restoreRect = haveLastFloatingRect_ ? lastFloatingRect_ : originalRect_;
         SetWindowPos(hwnd_, nullptr,
             restoreRect.left, restoreRect.top,
@@ -14192,6 +14256,8 @@ public:
             SWP_NOZORDER | SWP_SHOWWINDOW | SWP_FRAMECHANGED | SWP_NOACTIVATE);
         embeddedViewportHwnd_ = nullptr;
         originalParent_ = nullptr;
+        activeShadeHostedWidth_ = 0;
+        activeShadeHostedHeight_ = 0;
         Resize();
         NormalizeFloatingWindow(true);
         RefreshCallbackRegistration(true);
@@ -14199,87 +14265,120 @@ public:
 
     void CaptureActiveShadeFrame() {
         if (!webview_ || !asTarget_ || !asCapturing_) return;
+        if (asCaptureInFlight_) return;
+
+        // Suppress captures while the host is mid-resize. CapturePreview is the
+        // single heaviest thing the plugin does — JPEG encode of the WebView,
+        // WIC decode + scale + BGRA convert + Max Bitmap blit — and firing it
+        // 15x/sec on top of a browser that's already fighting a resize storm
+        // is exactly what drops to 5fps and inflates GPU memory. Once the
+        // user stops dragging, normal capture cadence resumes on the next
+        // timer tick.
+        if (GetTickCount64() - lastHostResizeMs_ < kCaptureSuppressMs) return;
 
         ComPtr<IStream> stream;
         CreateStreamOnHGlobal(NULL, TRUE, &stream);
+        asCaptureInFlight_ = true;
 
-        webview_->CapturePreview(
+        HRESULT captureStart = webview_->CapturePreview(
             COREWEBVIEW2_CAPTURE_PREVIEW_IMAGE_FORMAT_JPEG,
             stream.Get(),
             Callback<ICoreWebView2CapturePreviewCompletedHandler>(
                 [this, stream](HRESULT hr) -> HRESULT {
-                    if (FAILED(hr) || !asTarget_) return S_OK;
+                    auto finish = [this]() -> HRESULT {
+                        asCaptureInFlight_ = false;
+                        return S_OK;
+                    };
+                    if (FAILED(hr) || !asTarget_ || !asCapturing_) return finish();
 
                     // Reset stream
                     LARGE_INTEGER zero = {};
                     stream->Seek(zero, STREAM_SEEK_SET, nullptr);
 
-                    // Decode JPEG via WIC
-                    ComPtr<IWICImagingFactory> wic;
-                    CoCreateInstance(CLSID_WICImagingFactory, nullptr,
-                        CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic));
-                    if (!wic) return S_OK;
+                    // WIC factory is expensive to create; cache it for the
+                    // lifetime of the panel and reuse across captures.
+                    if (!asWicFactory_) {
+                        CoCreateInstance(CLSID_WICImagingFactory, nullptr,
+                            CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&asWicFactory_));
+                        if (!asWicFactory_) return finish();
+                    }
 
                     ComPtr<IWICBitmapDecoder> decoder;
-                    wic->CreateDecoderFromStream(stream.Get(), nullptr,
+                    asWicFactory_->CreateDecoderFromStream(stream.Get(), nullptr,
                         WICDecodeMetadataCacheOnLoad, &decoder);
-                    if (!decoder) return S_OK;
+                    if (!decoder) return finish();
 
                     ComPtr<IWICBitmapFrameDecode> frame;
                     decoder->GetFrame(0, &frame);
-                    if (!frame) return S_OK;
+                    if (!frame) return finish();
 
                     UINT srcW, srcH;
                     frame->GetSize(&srcW, &srcH);
+                    if (srcW == 0 || srcH == 0) return finish();
 
                     // Scale to target bitmap size
                     int dstW = asTarget_->Width();
                     int dstH = asTarget_->Height();
+                    if (dstW <= 0 || dstH <= 0) return finish();
 
                     ComPtr<IWICBitmapScaler> scaler;
-                    wic->CreateBitmapScaler(&scaler);
-                    scaler->Initialize(frame.Get(), dstW, dstH,
-                        WICBitmapInterpolationModeLinear);
+                    if (FAILED(asWicFactory_->CreateBitmapScaler(&scaler)) || !scaler) return finish();
+                    if (FAILED(scaler->Initialize(frame.Get(), dstW, dstH,
+                        WICBitmapInterpolationModeLinear))) return finish();
 
                     // Convert to BGRA
                     ComPtr<IWICFormatConverter> converter;
-                    wic->CreateFormatConverter(&converter);
-                    converter->Initialize(scaler.Get(),
+                    if (FAILED(asWicFactory_->CreateFormatConverter(&converter)) || !converter) return finish();
+                    if (FAILED(converter->Initialize(scaler.Get(),
                         GUID_WICPixelFormat32bppBGRA,
                         WICBitmapDitherTypeNone, nullptr, 0,
-                        WICBitmapPaletteTypeCustom);
+                        WICBitmapPaletteTypeCustom))) return finish();
 
-                    // Read pixels
-                    std::vector<BYTE> pixels(dstW * dstH * 4);
-                    converter->CopyPixels(nullptr, dstW * 4,
-                        (UINT)pixels.size(), pixels.data());
+                    // Reuse persistent scratch buffers — this used to allocate
+                    // 8MB/frame at 1080p (~120MB/s churn) plus free on exit.
+                    const size_t pixelBytes = static_cast<size_t>(dstW) * dstH * 4;
+                    if (asPixelScratch_.size() < pixelBytes) asPixelScratch_.resize(pixelBytes);
+                    if (asLineScratch_.size() < static_cast<size_t>(dstW)) asLineScratch_.resize(dstW);
 
-                    // Write to Max Bitmap
-                    BMM_Color_64 line;
+                    if (FAILED(converter->CopyPixels(nullptr, dstW * 4,
+                        static_cast<UINT>(pixelBytes), asPixelScratch_.data()))) return finish();
+
+                    // Scanline-at-a-time write instead of per-pixel. The
+                    // per-pixel call was 2M PutPixels/frame at 1080p (30M/sec
+                    // at 15fps) — all SDK-boundary overhead. One call per
+                    // scanline cuts that ~2000x.
+                    BMM_Color_64* line = asLineScratch_.data();
+                    const BYTE* src = asPixelScratch_.data();
                     for (int y = 0; y < dstH; y++) {
                         for (int x = 0; x < dstW; x++) {
-                            int idx = (y * dstW + x) * 4;
-                            line.b = pixels[idx + 0] << 8;
-                            line.g = pixels[idx + 1] << 8;
-                            line.r = pixels[idx + 2] << 8;
-                            line.a = 0xFFFF;
-                            asTarget_->PutPixels(x, y, 1, &line);
+                            const int idx = x * 4;
+                            line[x].b = static_cast<WORD>(src[idx + 0]) << 8;
+                            line[x].g = static_cast<WORD>(src[idx + 1]) << 8;
+                            line[x].r = static_cast<WORD>(src[idx + 2]) << 8;
+                            line[x].a = 0xFFFF;
                         }
+                        asTarget_->PutPixels(0, y, dstW, line);
+                        src += dstW * 4;
                     }
                     asTarget_->RefreshWindow();
 
-                    return S_OK;
+                    return finish();
                 }).Get());
+        if (FAILED(captureStart)) asCaptureInFlight_ = false;
     }
 
     // ── Window management ────────────────────────────────────
 
-    void Resize() {
+    void Resize(bool allowHosted = false) {
+        if (!allowHosted && IsViewportHosted()) return;
         if (!controller_ || !hwnd_) return;
         RECT b;
         if (!GetClientRect(hwnd_, &b)) return;
         if ((b.right - b.left) <= 0 || (b.bottom - b.top) <= 0) return;
+        if (haveLastControllerBounds_ && EqualRect(&b, &lastControllerBounds_)) return;
         controller_->put_Bounds(b);
+        lastControllerBounds_ = b;
+        haveLastControllerBounds_ = true;
         NotifyWebViewParentWindowPositionChanged();
     }
 
@@ -14336,11 +14435,11 @@ public:
         case WM_SIZE:
             if (p) {
                 p->Resize();
-                p->RememberFloatingBounds();
+                if (!p->IsViewportHosted()) p->RememberFloatingBounds();
             }
             return 0;
         case WM_MOVE:
-            if (p) p->RememberFloatingBounds();
+            if (p && !p->IsViewportHosted()) p->RememberFloatingBounds();
             return 0;
         case WM_ENTERSIZEMOVE:
             if (p) p->BeginFloatingSizeMove();

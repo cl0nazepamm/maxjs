@@ -1649,6 +1649,33 @@
         const pmremGenerator = new PMREMGeneratorCtor(renderer);
         pmremGenerator.compileEquirectangularShader();
 
+        function retainPMREMTexture(renderTarget) {
+            const texture = renderTarget?.texture ?? null;
+            if (!texture) {
+                renderTarget?.dispose?.();
+                return null;
+            }
+            texture.userData ??= {};
+            if (!texture.userData.maxjsPMREMDisposeWrapped) {
+                let disposed = false;
+                const originalDispose = texture.dispose?.bind(texture);
+                texture.dispose = () => {
+                    if (disposed) return;
+                    disposed = true;
+                    const target = texture.userData?.maxjsPMREMRenderTarget;
+                    if (target) target.dispose?.();
+                    else originalDispose?.();
+                    if (texture.userData) {
+                        delete texture.userData.maxjsPMREMRenderTarget;
+                        delete texture.userData.maxjsPMREMDisposeWrapped;
+                    }
+                };
+                texture.userData.maxjsPMREMDisposeWrapped = true;
+            }
+            texture.userData.maxjsPMREMRenderTarget = renderTarget;
+            return texture;
+        }
+
         const textureCache = new Map();
         const materialCache = new Map();
         const materialXTemplateCache = new Map();
@@ -1656,6 +1683,7 @@
         const nodeMap = new Map();
         const maxInstanceBuckets = new Map(); // bucketKey -> { mesh, materialKey, sourceHandle, handles:Set, handleToIndex:Map, transforms:Map, visible:Map }
         const maxInstanceHandleToBucket = new Map(); // handle -> bucketKey
+        let lastMaxInstanceBucketSignature = '';
         let animationSystem = null;
         let audioSystem = null;
         let gltfSystem = null;
@@ -1937,6 +1965,7 @@
         let currentHdriUrl = null;
         let currentHdriProbeSignature = '';
         let currentEnvParams = null;
+        let currentHdriEnvMap = null;
         let hasLightProbeData = false;
         let hdriLoadGeneration = 0;
 
@@ -1958,6 +1987,16 @@
 
         function isLocalHdriLoaded() { return localHdriObjectUrl != null; }
         function isLocalHdriActive() { return isLocalHdriLoaded() && localHdriEnabled; }
+
+        function clearCurrentHdriEnvMap() {
+            if (currentHdriEnvMap) {
+                const oldEnvMap = currentHdriEnvMap;
+                currentHdriEnvMap = null;
+                if (scene.environment === oldEnvMap) scene.environment = null;
+                if (scene.background === oldEnvMap) scene.background = new THREE.Color(hiddenBackgroundColor);
+                oldEnvMap.dispose?.();
+            }
+        }
 
         function applyLightProbeState() {
             lightProbe.intensity = lightProbeEnabled ? lightProbeIntensity : 0.0;
@@ -2612,10 +2651,13 @@
                     return;
                 }
                 hdrTex.mapping = THREE.EquirectangularReflectionMapping;
-                const envMap = pmremGenerator.fromEquirectangular(hdrTex).texture;
+                const previousEnvMap = currentHdriEnvMap;
+                const envMap = retainPMREMTexture(pmremGenerator.fromEquirectangular(hdrTex));
+                currentHdriEnvMap = envMap;
                 scene.environment = envMap;
                 syncMaterialEnvMaps();
                 if (envVisible) scene.background = envMap;
+                if (previousEnvMap && previousEnvMap !== envMap) previousEnvMap.dispose?.();
                 defaultLights.visible = false;
                 if (lightProbeEnabled || shouldRefreshProbe) {
                     await updateLightProbeFromHDRI(hdrTex, probeSignature, loadGeneration);
@@ -2627,6 +2669,7 @@
                 currentHdriUrl = null;
                 currentHdriProbeSignature = null;
                 currentEnvParams = null;
+                clearCurrentHdriEnvMap();
                 scene.environment = null;
                 syncMaterialEnvMaps();
                 clearLightProbe();
@@ -2692,6 +2735,7 @@
         function loadLocalHDRIFile(file, { preserveEnabled = false, persist = true } = {}) {
             if (localHdriObjectUrl) URL.revokeObjectURL(localHdriObjectUrl);
             if (localHdriEnvMap) { localHdriEnvMap.dispose(); localHdriEnvMap = null; }
+            clearCurrentHdriEnvMap();
             localHdriObjectUrl = URL.createObjectURL(file);
             localHdriFileName = file.name;
             if (!preserveEnabled) localHdriEnabled = true;
@@ -2706,7 +2750,7 @@
             loader.load(localHdriObjectUrl, async (hdrTex) => {
                 if (loadGen !== hdriLoadGeneration) { hdrTex.dispose(); return; }
                 hdrTex.mapping = THREE.EquirectangularReflectionMapping;
-                localHdriEnvMap = pmremGenerator.fromEquirectangular(hdrTex).texture;
+                localHdriEnvMap = retainPMREMTexture(pmremGenerator.fromEquirectangular(hdrTex));
                 applyLocalHDRIToScene();
                 currentHdriUrl = localHdriObjectUrl;
                 if (lightProbeEnabled) {
@@ -2770,6 +2814,7 @@
             localHdriFileName = '';
             localHdriEnabled = true;
             if (localHdriEnvMap) { localHdriEnvMap.dispose(); localHdriEnvMap = null; }
+            clearCurrentHdriEnvMap();
             if (localHdriObjectUrl) { URL.revokeObjectURL(localHdriObjectUrl); localHdriObjectUrl = null; }
             void clearStashedHdri();
             currentHdriUrl = null;
@@ -2863,10 +2908,12 @@
                 const skyScene = new THREE.Scene();
                 const skyCopy = skyMesh.clone();
                 skyScene.add(skyCopy);
-                if (skyEnvMap) skyEnvMap.dispose();
-                skyEnvMap = pmremGenerator.fromScene(skyScene, 0, 0.1, 1000000).texture;
-                skyCopy.geometry?.dispose?.();
+                const nextSkyEnvMap = retainPMREMTexture(pmremGenerator.fromScene(skyScene, 0, 0.1, 1000000));
                 skyScene.clear();
+                if (!nextSkyEnvMap) return;
+                if (skyEnvMap) skyEnvMap.dispose();
+                skyEnvMap = nextSkyEnvMap;
+                clearCurrentHdriEnvMap();
 
                 scene.background = null;
                 scene.environment = skyEnvMap;
@@ -2916,7 +2963,13 @@
             if (skyMesh?.parent) skyMesh.parent.remove(skyMesh);
             if (skySunLight?.parent) skySunLight.parent.remove(skySunLight);
             if (skyFillLight?.parent) skyFillLight.parent.remove(skyFillLight);
-            if (skyEnvMap) { skyEnvMap.dispose(); skyEnvMap = null; }
+            if (skyEnvMap) {
+                const oldSkyEnvMap = skyEnvMap;
+                skyEnvMap = null;
+                if (scene.environment === oldSkyEnvMap) scene.environment = null;
+                if (scene.background === oldSkyEnvMap) scene.background = new THREE.Color(hiddenBackgroundColor);
+                oldSkyEnvMap.dispose();
+            }
         }
 
         // ── Material Creation ───────────────────────────────
@@ -2981,9 +3034,11 @@
         }
 
         function applyBridgeVisibility(mesh, visibleFlag) {
-            if (!mesh || mesh.userData.jsmod) return;
+            if (!mesh || mesh.userData.jsmod) return false;
             const visible = visibleFlag == null ? true : !!visibleFlag;
-            if (mesh.visible !== visible) mesh.visible = visible;
+            if (mesh.visible === visible) return false;
+            mesh.visible = visible;
+            return true;
         }
 
         function applyInstanceSyncState(mesh, instOfHandle) {
@@ -4016,9 +4071,30 @@
                 pendingMaterialDisposals.push(material);
             }
         }
+        function collectMaterialRefs(material, refs) {
+            if (Array.isArray(material)) {
+                for (const item of material) if (item) refs.add(item);
+            } else if (material) {
+                refs.add(material);
+            }
+        }
+        function collectLiveSceneMaterials() {
+            const live = new Set();
+            for (const mesh of nodeMap.values()) collectMaterialRefs(mesh?.material, live);
+            for (const [, bucket] of maxInstanceBuckets) collectMaterialRefs(bucket?.mesh?.material, live);
+            for (const [, entry] of hairMeshes) collectMaterialRefs(entry?.mesh?.material, live);
+            for (const [, mesh] of forestMeshes) collectMaterialRefs(mesh?.material, live);
+            return live;
+        }
         function flushMaterialDisposals() {
             if (pendingMaterialDisposals.length === 0) return;
-            for (const mat of pendingMaterialDisposals) mat.dispose?.();
+            const live = collectLiveSceneMaterials();
+            const disposed = new Set();
+            for (const mat of pendingMaterialDisposals) {
+                if (!mat || live.has(mat) || disposed.has(mat)) continue;
+                mat.dispose?.();
+                disposed.add(mat);
+            }
             pendingMaterialDisposals.length = 0;
         }
 
@@ -4028,31 +4104,68 @@
             });
         }
 
-        function applySceneRenderableMaterial(mesh, mat, wantsLine) {
-            if (wantsLine) {
-                disposeSceneMaterial(mesh.material);
-                mesh.material = createSceneLineMaterial(mat);
-                return;
-            }
-            mesh.material = mat;
+        function sceneMaterialSignature(nd, wantsLine) {
+            const payload = nd?.mats && nd?.groups
+                ? ['multi', nd.mats]
+                : (nd?.mat ? ['single', nd.mat] : ['default']);
+            return `${wantsLine ? 'line' : 'mesh'}:${JSON.stringify(payload)}`;
+        }
+
+        function isCachedMaterialTemplate(material) {
+            if (!material) return false;
+            for (const cached of materialCache.values()) if (cached === material) return true;
+            for (const cached of materialXTemplateCache.values()) if (cached === material) return true;
+            return false;
+        }
+
+        function createSceneRenderableMaterial(nd, wantsLine) {
+            const mat = createSceneMaterial(nd);
+            if (!wantsLine) return mat;
+            const lineMat = createSceneLineMaterial(mat);
+            if (!isCachedMaterialTemplate(mat)) disposeSceneMaterial(mat);
+            return lineMat;
+        }
+
+        function stampSceneMaterial(mesh, nd, wantsLine) {
+            mesh.userData ??= {};
+            mesh.userData.maxjsMaterialSignature = sceneMaterialSignature(nd, wantsLine);
+        }
+
+        function ensureSceneRenderableMaterial(mesh, nd, wantsLine) {
+            if (!mesh) return false;
+            const signature = sceneMaterialSignature(nd, wantsLine);
+            if (mesh.material && mesh.userData?.maxjsMaterialSignature === signature) return false;
+            const oldMaterial = mesh.material;
+            mesh.material = createSceneRenderableMaterial(nd, wantsLine);
+            mesh.userData ??= {};
+            mesh.userData.maxjsMaterialSignature = signature;
+            disposeSceneMaterial(oldMaterial);
+            return true;
         }
 
         function finalizeSceneNode(mesh, nd) {
+            if (nd?.h != null && getMaxInstanceBucketForHandle(nd.h)) {
+                return updateMaxInstanceBucketNode(nd.h, nd);
+            }
             if (mesh && nd && nd.h != null) mesh.userData.maxjsHandle = nd.h;
             applyJsmodSyncState(mesh, !!nd.jsmod);
             applyInstanceSyncState(mesh, nd.instOf);
-            applyBridgeVisibility(mesh, nd.vis);
+            const visibilityChanged = applyBridgeVisibility(mesh, nd.vis);
             mesh.frustumCulled = false;
             if (!nd.spline) applyMeshShadowState(mesh);
             applyNodeProps(mesh, nd.props);
-            applyTransform(mesh, nd.t);
+            const transformChanged = applyTransform(mesh, nd.t);
             applySelection(mesh, nd.s);
+            return !!(visibilityChanged || transformChanged);
         }
 
         function applyIncrementalNodeUpdate(mesh, nd, handleOverride = null) {
             if (!mesh || !nd) return;
             const handle = handleOverride ?? nd.h ?? null;
-            if (handle != null && updateMaxInstanceBucketNode(handle, nd)) return;
+            if (handle != null && getMaxInstanceBucketForHandle(handle)) {
+                updateMaxInstanceBucketNode(handle, nd);
+                return;
+            }
             if (nd.jsmod != null) applyJsmodSyncState(mesh, nd.jsmod === true);
             if (nd.vis != null) applyBridgeVisibility(mesh, nd.vis);
             if (isFiniteArray(nd.t, 16)) applyTransform(mesh, nd.t);
@@ -4089,11 +4202,16 @@
         function disposeMaxInstanceBuckets() {
             for (const [, bucket] of maxInstanceBuckets) {
                 if (bucket.mesh?.parent) bucket.mesh.parent.remove(bucket.mesh);
-                // Don't dispose geometry — it's shared with the source mesh
-                disposeSceneMaterial(bucket.mesh?.material);
+                // Don't dispose geometry OR material — both are shared with the
+                // source mesh (see buildMaxInstanceBuckets: `new InstancedMesh
+                // (sourceMesh.geometry, sourceMaterial, ...)`). Disposing the
+                // material here would kill the source mesh's pipeline too,
+                // forcing a full WebGPU recompile of that material on the
+                // next render pass.
             }
             maxInstanceBuckets.clear();
             maxInstanceHandleToBucket.clear();
+            lastMaxInstanceBucketSignature = '';
             // Restore visibility on nodes that were hidden by bucket merge
             for (const [, mesh] of nodeMap) {
                 if (mesh && !mesh.visible && mesh.userData?.maxjsInstOf) {
@@ -4107,17 +4225,26 @@
             return bucketKey ? maxInstanceBuckets.get(bucketKey) ?? null : null;
         }
 
+        const maxInstanceMatrixScratch = new THREE.Matrix4();
+
+        function matrixArraysAlmostEqual(a, b, eps = 1.0e-7) {
+            if (!a || !b || a.length < 16 || b.length < 16) return false;
+            for (let i = 0; i < 16; i++) {
+                if (Math.abs((a[i] ?? 0) - (b[i] ?? 0)) > eps) return false;
+            }
+            return true;
+        }
+
         function updateMaxInstanceBucketVisibility(bucket) {
             if (!bucket?.mesh) return;
             // Compact: rebuild instance matrices with only visible entries
-            const matrix = new THREE.Matrix4();
             let slot = 0;
             for (const handle of bucket.handles) {
                 if (bucket.visible.get(handle) === false) continue;
                 const xf = bucket.transforms.get(handle);
-                if (xf) matrix.fromArray(xf);
-                else matrix.identity();
-                bucket.mesh.setMatrixAt(slot, matrix);
+                if (xf) maxInstanceMatrixScratch.fromArray(xf);
+                else maxInstanceMatrixScratch.identity();
+                bucket.mesh.setMatrixAt(slot, maxInstanceMatrixScratch);
                 slot++;
             }
             bucket.mesh.count = slot;
@@ -4130,9 +4257,15 @@
             if (!bucket || !isFiniteArray(matrixArray, 16)) return false;
             const idx = bucket.handleToIndex.get(handle);
             if (idx == null) return false;
-            const matrix = new THREE.Matrix4().fromArray(matrixArray);
-            bucket.transforms.set(handle, Array.from(matrixArray));
-            bucket.mesh.setMatrixAt(idx, matrix);
+            const previous = bucket.transforms.get(handle);
+            if (matrixArraysAlmostEqual(previous, matrixArray)) return false;
+            if (previous) {
+                for (let i = 0; i < 16; i++) previous[i] = matrixArray[i];
+            } else {
+                bucket.transforms.set(handle, Array.from(matrixArray));
+            }
+            maxInstanceMatrixScratch.fromArray(matrixArray);
+            bucket.mesh.setMatrixAt(idx, maxInstanceMatrixScratch);
             bucket.mesh.instanceMatrix.needsUpdate = true;
             return true;
         }
@@ -4140,17 +4273,27 @@
         function updateMaxInstanceBucketNode(handle, nd) {
             const bucket = getMaxInstanceBucketForHandle(handle);
             if (!bucket) return false;
+            let changed = false;
             if (nd.vis != null) {
-                bucket.visible.set(handle, !!nd.vis);
-                updateMaxInstanceBucketVisibility(bucket);
+                const nextVisible = !!nd.vis;
+                if (bucket.visible.get(handle) !== nextVisible) {
+                    bucket.visible.set(handle, nextVisible);
+                    updateMaxInstanceBucketVisibility(bucket);
+                    changed = true;
+                }
             }
             if (isFiniteArray(nd.t, 16)) {
-                updateMaxInstanceBucketTransform(handle, nd.t);
+                if (updateMaxInstanceBucketTransform(handle, nd.t)) changed = true;
             }
             if (nd.mat) {
-                applyMaterialScalar(bucket.mesh, nd.mat);
+                const materialSignature = JSON.stringify(nd.mat);
+                if (bucket.lastMaterialScalarSignature !== materialSignature) {
+                    applyMaterialScalar(bucket.mesh, nd.mat);
+                    bucket.lastMaterialScalarSignature = materialSignature;
+                    changed = true;
+                }
             }
-            return true;
+            return changed;
         }
 
         function computeMaxInstanceBucketGroups(nodes) {
@@ -4180,10 +4323,41 @@
             return groups;
         }
 
-        function buildMaxInstanceBuckets(snapshotNodes) {
-            disposeMaxInstanceBuckets();
+        function planMaxInstanceBuckets(snapshotNodes) {
             const bucketGroups = computeMaxInstanceBucketGroups(snapshotNodes);
-            if (bucketGroups.size === 0) return;
+            const nodeByHandle = new Map();
+            for (const nd of snapshotNodes) nodeByHandle.set(nd.h, nd);
+            let signature = '';
+            const bucketHandles = new Set();
+            if (bucketGroups.size > 0) {
+                const parts = [];
+                for (const group of bucketGroups.values()) {
+                    const handles = group.nodes.map((nd) => nd.h).sort((a, b) => a - b);
+                    for (const handle of handles) bucketHandles.add(handle);
+                    const sourceMaterialSig = sceneMaterialSignature(nodeByHandle.get(group.sourceHandle), false);
+                    parts.push(`${group.key}@${sourceMaterialSig}#${group.nodes.length}:${handles.join(',')}`);
+                }
+                parts.sort();
+                signature = parts.join('||');
+            }
+            return { groups: bucketGroups, signature, handles: bucketHandles };
+        }
+
+        function buildMaxInstanceBuckets(snapshotNodes, bucketPlan = null) {
+            const plan = bucketPlan ?? planMaxInstanceBuckets(snapshotNodes);
+            const bucketGroups = plan.groups;
+            const signature = plan.signature;
+
+            if (signature === lastMaxInstanceBucketSignature) {
+                // Composition unchanged — keep existing buckets, let per-handle
+                // transform / visibility / material updates flow through
+                // updateMaxInstanceBucketNode without reallocating meshes.
+                return false;
+            }
+
+            disposeMaxInstanceBuckets();
+            lastMaxInstanceBucketSignature = signature;
+            if (bucketGroups.size === 0) return true;
 
             for (const group of bucketGroups.values()) {
                 const sourceMesh = nodeMap.get(group.sourceHandle);
@@ -4204,6 +4378,7 @@
                     handleToIndex: new Map(),
                     transforms: new Map(),
                     visible: new Map(),
+                    lastMaterialScalarSignature: '',
                 };
 
                 group.nodes.forEach((nd, index) => {
@@ -4221,9 +4396,14 @@
                 });
 
                 updateMaxInstanceBucketVisibility(bucket);
+                if (group.nodes[0]?.mat) {
+                    applyMaterialScalar(mesh, group.nodes[0].mat);
+                    bucket.lastMaterialScalarSignature = JSON.stringify(group.nodes[0].mat);
+                }
                 maxRoot.add(mesh);
                 maxInstanceBuckets.set(group.key, bucket);
             }
+            return true;
         }
 
         function profileSceneNodes(nodes) {
@@ -4267,7 +4447,7 @@
                 else if (snapshot.env?.hdri) { removeSky(); loadHDRI(snapshot.env); }
             }
             if (snapshot.fog) ssgiFx.setFogFromScene(snapshot.fog);
-            if (snapshot.lights) applyLights(snapshot.lights);
+            const lightsChanged = snapshot.lights ? applyLights(snapshot.lights) : false;
             if (snapshot.sceneCameras) updateSceneCameraList(snapshot.sceneCameras, snapshot.lockedCamera);
             reconcileSplats(snapshot.splats ?? []);
             audioSystem?.applyAudios(snapshot.audios ?? []);
@@ -4275,14 +4455,20 @@
             applyHairInstances(snapshot.hairInstances ?? []);
             applyForestInstances(snapshot.forestInstances ?? []);
             applyVolumes(snapshot.volumes ?? []);
-            buildMaxInstanceBuckets(snapshot.nodes);
+            const bucketPlan = options.bucketPlan ?? planMaxInstanceBuckets(snapshot.nodes);
+            const bucketChanged = buildMaxInstanceBuckets(snapshot.nodes, bucketPlan);
             profileSceneNodes(snapshot.nodes);
-            scene.updateMatrixWorld(true);
-            lightLinking.refreshSceneBindings?.();
+            scene.updateMatrixWorld(options.forceWorldUpdate === true);
+            const sceneChanged = !!(options.sceneChanged || bucketChanged);
+            if (sceneChanged) {
+                lightLinking.refreshSceneBindings?.();
+            } else if (lightsChanged) {
+                ssgiFx.markOutputChanged?.();
+            }
             // Full snapshot can add/remove many meshes — cheap scene refresh.
             // Effect toggles, env, and renderer size have their own dedicated
             // entry points, so a full pipeline rebuild is unnecessary here.
-            ssgiFx.markSceneChanged?.();
+            if (sceneChanged) ssgiFx.markSceneChanged?.();
             options.afterWorldUpdate?.();
 
             if (firstSync && snapshot.nodes.length > 0) {
@@ -4305,22 +4491,35 @@
             setTransportMode('json');
             const applyStart = performance.now();
             const incoming = new Set(msg.nodes.map(n => n.h));
-
-            // Clear material cache so changes are picked up (texture cache uses content-addressed keys)
-            materialCache.clear();
+            const bucketPlan = planMaxInstanceBuckets(msg.nodes);
+            const stableBucketHandles = bucketPlan.signature === lastMaxInstanceBucketSignature
+                ? bucketPlan.handles
+                : null;
+            let sceneChanged = false;
+            let transformsChanged = false;
 
             for (const [handle, mesh] of nodeMap) {
                 if (!incoming.has(handle)) {
                     maxRoot.remove(mesh);
                     mesh.geometry.dispose();
+                    disposeSceneMaterial(mesh.material);
                     nodeMap.delete(handle);
+                    sceneChanged = true;
                 }
             }
 
             for (const nd of msg.nodes) {
                 let mesh = nodeMap.get(nd.h);
 
-                const mat = createSceneMaterial(nd);
+                if (stableBucketHandles?.has(nd.h) && getMaxInstanceBucketForHandle(nd.h)) {
+                    if (updateMaxInstanceBucketNode(nd.h, nd)) transformsChanged = true;
+                    if (mesh) {
+                        applyJsmodSyncState(mesh, !!nd.jsmod);
+                        applyInstanceSyncState(mesh, nd.instOf);
+                        if (nd.s != null) applySelection(mesh, nd.s);
+                    }
+                    continue;
+                }
 
                 const jsmodFlag = !!nd.jsmod;
                 // jsmod flag: layers own vertices — skip geo rebuild for existing meshes
@@ -4354,6 +4553,7 @@
                     disposeSceneMaterial(mesh.material);
                     nodeMap.delete(nd.h);
                     mesh = null;
+                    sceneChanged = true;
                 }
 
                 if (mesh) {
@@ -4361,31 +4561,37 @@
                         mesh.geometry.dispose();
                         mesh.geometry = geom;
                     }
-                    applySceneRenderableMaterial(mesh, mat, wantsLine);
+                    if (ensureSceneRenderableMaterial(mesh, nd, wantsLine)) {
+                        sceneChanged = true;
+                        layerManager.applyMaterialOverrides?.(nd.h, mesh);
+                    }
                 } else {
                     if (!geom) continue;
+                    const material = createSceneRenderableMaterial(nd, wantsLine);
                     if (wantsLine) {
-                        mesh = new THREE.LineSegments(geom, createSceneLineMaterial(mat));
+                        mesh = new THREE.LineSegments(geom, material);
                     } else {
-                        mesh = new THREE.Mesh(geom, mat);
+                        mesh = new THREE.Mesh(geom, material);
                     }
                     mesh.matrixAutoUpdate = false;
                     mesh.name = nd.n;
                     mesh.frustumCulled = false;
                     mesh.userData.maxjsHandle = nd.h;
+                    stampSceneMaterial(mesh, nd, wantsLine);
                     maxRoot.add(mesh);
                     nodeMap.set(nd.h, mesh);
+                    sceneChanged = true;
+                    layerManager.applyMaterialOverrides?.(nd.h, mesh);
                 }
 
-                // Re-apply any layer-registered material map overrides for
-                // this handle so they survive the fresh material assignment.
-                layerManager.applyMaterialOverrides?.(nd.h, mesh);
-
-                finalizeSceneNode(mesh, nd);
+                if (finalizeSceneNode(mesh, nd)) transformsChanged = true;
             }
 
-            layerManager.markRuntimeTransformsDirty?.();
-            finalizeSceneSnapshot(msg, 'json', applyStart, msg.stats?.producerBytes ?? 0);
+            if (transformsChanged || sceneChanged) layerManager.markRuntimeTransformsDirty?.();
+            finalizeSceneSnapshot(msg, 'json', applyStart, msg.stats?.producerBytes ?? 0, {
+                bucketPlan,
+                sceneChanged,
+            });
         });
 
         // ── Camera-only sync (30fps) ─────────────────────────
@@ -4637,7 +4843,12 @@
             setTransportMode('binary-scene');
             const applyStart = performance.now();
             const incoming = new Set(meta.nodes.map(n => n.h));
-            materialCache.clear();
+            const bucketPlan = planMaxInstanceBuckets(meta.nodes);
+            const stableBucketHandles = bucketPlan.signature === lastMaxInstanceBucketSignature
+                ? bucketPlan.handles
+                : null;
+            let sceneChanged = false;
+            let transformsChanged = false;
             const geometryRefCounts = buildNodeGeometryRefCounts();
 
             // Remove deleted — collect first, then dispose non-shared geometries
@@ -4649,7 +4860,9 @@
                 const mesh = nodeMap.get(handle);
                 maxRoot.remove(mesh);
                 releaseGeometryRef(geometryRefCounts, mesh?.geometry);
+                disposeSceneMaterial(mesh?.material);
                 nodeMap.delete(handle);
+                sceneChanged = true;
             }
 
             // Geometry cache for instance sharing within this sync
@@ -4658,7 +4871,15 @@
             for (const nd of meta.nodes) {
                 let mesh = nodeMap.get(nd.h);
 
-                const mat = createSceneMaterial(nd);
+                if (stableBucketHandles?.has(nd.h) && getMaxInstanceBucketForHandle(nd.h)) {
+                    if (updateMaxInstanceBucketNode(nd.h, nd)) transformsChanged = true;
+                    if (mesh) {
+                        applyJsmodSyncState(mesh, !!nd.jsmod);
+                        applyInstanceSyncState(mesh, nd.instOf);
+                        if (nd.s != null) applySelection(mesh, nd.s);
+                    }
+                    continue;
+                }
 
                 const jsmodFlag = !!nd.jsmod;
                 const instSrcMesh = nd.instOf ? nodeMap.get(nd.instOf) : null;
@@ -4757,13 +4978,10 @@
                 if (mesh && nd.skin && !mesh.isSkinnedMesh && !wantsLine) {
                     maxRoot.remove(mesh);
                     releaseGeometryRef(geometryRefCounts, mesh?.geometry);
-                    if (Array.isArray(mesh.material)) {
-                        for (const material of mesh.material) material?.dispose?.();
-                    } else {
-                        mesh.material?.dispose?.();
-                    }
+                    disposeSceneMaterial(mesh.material);
                     nodeMap.delete(nd.h);
                     mesh = null;
+                    sceneChanged = true;
                 }
                 const hasLineRenderable = !!(mesh?.isLine || mesh?.isLineSegments);
                 const renderableTypeMismatch = !!mesh && wantsLine !== hasLineRenderable;
@@ -4773,6 +4991,7 @@
                     disposeSceneMaterial(mesh.material);
                     nodeMap.delete(nd.h);
                     mesh = null;
+                    sceneChanged = true;
                 }
 
                 if (mesh) {
@@ -4781,34 +5000,40 @@
                         retainGeometryRef(geometryRefCounts, geom);
                         mesh.geometry = geom;
                     }
-                    applySceneRenderableMaterial(mesh, mat, wantsLine);
+                    if (ensureSceneRenderableMaterial(mesh, nd, wantsLine)) {
+                        sceneChanged = true;
+                        layerManager.applyMaterialOverrides?.(nd.h, mesh);
+                    }
                 } else {
                     if (!geom) continue;
+                    const material = createSceneRenderableMaterial(nd, wantsLine);
                     if (wantsLine) {
-                        mesh = new THREE.LineSegments(geom, createSceneLineMaterial(mat));
+                        mesh = new THREE.LineSegments(geom, material);
                     } else if (nd.skin) {
-                        mesh = buildSkinnedMeshFromNd(geom, mat, nd, buffer);
-                        if (!mesh) mesh = new THREE.Mesh(geom, mat);
+                        mesh = buildSkinnedMeshFromNd(geom, material, nd, buffer);
+                        if (!mesh) mesh = new THREE.Mesh(geom, material);
                     } else {
-                        mesh = new THREE.Mesh(geom, mat);
+                        mesh = new THREE.Mesh(geom, material);
                     }
                     mesh.matrixAutoUpdate = false;
                     mesh.name = nd.n;
                     mesh.frustumCulled = false;
                     mesh.userData.maxjsHandle = nd.h;
+                    stampSceneMaterial(mesh, nd, wantsLine);
                     maxRoot.add(mesh);
                     nodeMap.set(nd.h, mesh);
                     retainGeometryRef(geometryRefCounts, mesh.geometry);
+                    sceneChanged = true;
+                    layerManager.applyMaterialOverrides?.(nd.h, mesh);
                 }
 
-                // Re-apply any layer-registered material map overrides.
-                layerManager.applyMaterialOverrides?.(nd.h, mesh);
-
-                finalizeSceneNode(mesh, nd);
+                if (finalizeSceneNode(mesh, nd)) transformsChanged = true;
             }
 
-            layerManager.markRuntimeTransformsDirty?.();
+            if (transformsChanged || sceneChanged) layerManager.markRuntimeTransformsDirty?.();
             finalizeSceneSnapshot(meta, 'binary-scene', applyStart, meta.stats?.producerBytes ?? buffer.byteLength, {
+                bucketPlan,
+                sceneChanged,
                 afterWorldUpdate() {
                     // Recalculate skeleton boneInverses for NEWLY created skinned meshes
                     // (only needed once — after the mesh is in the scene hierarchy under maxBasisRoot).
@@ -5018,10 +5243,21 @@
 
         function applyTransform(mesh, t) {
             if (!isFiniteArray(t, 16)) {
+                const alreadyIdentity = matrixArraysAlmostEqual(mesh.matrix.elements, [
+                    1, 0, 0, 0,
+                    0, 1, 0, 0,
+                    0, 0, 1, 0,
+                    0, 0, 0, 1,
+                ]);
+                if (alreadyIdentity) return false;
                 mesh.matrix.identity();
                 mesh.position.set(0, 0, 0);
                 mesh.quaternion.identity();
                 mesh.scale.set(1, 1, 1);
+                mesh.matrixWorldNeedsUpdate = true;
+                return true;
+            }
+            if (matrixArraysAlmostEqual(mesh.matrix.elements, t)) {
                 return false;
             }
             mesh.matrix.fromArray(t);
@@ -5132,6 +5368,7 @@
         const lightHandleMap = new Map();
         const lightHelperMap = new Map();
         let lightHelpersVisible = false;
+        let lastLightsSignature = '';
         const shadowBounds = new THREE.Box3();
         const shadowCenter = new THREE.Vector3();
         const shadowSize = new THREE.Vector3();
@@ -5414,10 +5651,18 @@
             }
         }
 
+        function sceneLightsSignature(lightsData) {
+            return JSON.stringify(Array.isArray(lightsData) ? lightsData : []);
+        }
+
         function applyLights(lightsData) {
+            const signature = sceneLightsSignature(lightsData);
+            if (signature === lastLightsSignature) return false;
             clearLights();
             finalizeLightState(lightsData);
             lightLinking.reapply();
+            lastLightsSignature = signature;
+            return true;
         }
 
         // ── Light Linking ────────────────────────────────────
@@ -6614,6 +6859,7 @@
 
         function applyLightUpdates(lightsData) {
             if (!Array.isArray(lightsData)) return;
+            lastLightsSignature = '';
 
             let appliedLightCount = 0;
             let mainDirectionalLight = null;

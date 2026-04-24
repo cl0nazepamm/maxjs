@@ -842,6 +842,33 @@ function createMaxSceneFacade({ scene, nodeMap, lightHandleMap, getAdapter, crea
 }
 
 function createRendererFacade(renderer, THREE, scene) {
+    function retainPMREMTexture(renderTarget) {
+        const texture = renderTarget?.texture ?? null;
+        if (!texture) {
+            renderTarget?.dispose?.();
+            return null;
+        }
+        texture.userData ??= {};
+        if (!texture.userData.maxjsPMREMDisposeWrapped) {
+            let disposed = false;
+            const originalDispose = texture.dispose?.bind(texture);
+            texture.dispose = () => {
+                if (disposed) return;
+                disposed = true;
+                const target = texture.userData?.maxjsPMREMRenderTarget;
+                if (target) target.dispose?.();
+                else originalDispose?.();
+                if (texture.userData) {
+                    delete texture.userData.maxjsPMREMRenderTarget;
+                    delete texture.userData.maxjsPMREMDisposeWrapped;
+                }
+            };
+            texture.userData.maxjsPMREMDisposeWrapped = true;
+        }
+        texture.userData.maxjsPMREMRenderTarget = renderTarget;
+        return texture;
+    }
+
     function pmremFromScene(sceneOrObj, sigma = 0, near = 0.1, far = 1_000_000) {
         const pmrem = new THREE.PMREMGenerator(renderer);
         const target = sceneOrObj?.isScene
@@ -853,13 +880,13 @@ function createRendererFacade(renderer, THREE, scene) {
             })();
         const rt = pmrem.fromScene(target, sigma, near, far);
         pmrem.dispose();
-        return rt?.texture ?? null;
+        return retainPMREMTexture(rt);
     }
     function pmremFromEquirectangular(texture) {
         const pmrem = new THREE.PMREMGenerator(renderer);
         const rt = pmrem.fromEquirectangular(texture);
         pmrem.dispose();
-        return rt?.texture ?? null;
+        return retainPMREMTexture(rt);
     }
     return freezePlainObject({
         get capabilities() { return renderer.capabilities; },

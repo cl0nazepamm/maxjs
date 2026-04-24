@@ -7971,7 +7971,7 @@
         };
         let currentToneMapping = DEFAULT_TONE_MAPPING;
         let currentExposure = 1.0;
-        let currentAAMode = 'msaa'; // 'msaa' | 'traa' | 'off'
+        let currentAAMode = 'off'; // 'traa' | 'off' (MSAA option removed — was a no-op with the deferred MRT pipeline)
 
         const postFxSections = [
             {
@@ -8348,12 +8348,11 @@
                         </div>
                         <div class="fx-grid">
                             <select id="fx-aa-mode" style="background:rgba(255,255,255,0.05);color:#aaa;border:1px solid rgba(255,255,255,0.08);border-radius:0;padding:3px 6px;font:10px 'Segoe UI',system-ui,sans-serif;width:100%;outline:none;cursor:pointer">
-                                <option value="msaa"${!ssgiFx.isTRAAEnabled() ? ' selected' : ''}>MSAA</option>
                                 <option value="traa"${ssgiFx.isTRAAEnabled() ? ' selected' : ''}>TRAA</option>
-                                <option value="off">Off</option>
+                                <option value="off"${!ssgiFx.isTRAAEnabled() ? ' selected' : ''}>Off</option>
                             </select>
                         </div>
-                        <div class="fx-note">MSAA: hardware multisample (default). TRAA: temporal reprojection (WebGPU only). Off: no anti-aliasing.</div>
+                        <div class="fx-note">TRAA: temporal reprojection (WebGPU only). Off: no anti-aliasing.</div>
                     </section>
                     <section class="fx-section collapsed" data-keep-on-shader-lab>
                         <div class="fx-section-header">
@@ -8581,7 +8580,7 @@
                 }
                 currentToneMapping = DEFAULT_TONE_MAPPING;
                 currentExposure = 1.0;
-                currentAAMode = 'msaa';
+                currentAAMode = 'off';
                 ssgiFx.setTRAAEnabled(false);
                 ssgiFx.setCloneEnabled(false);
                 ssgiFx.setCloneOptions({ threshold: 0.53, blurRadius: 0, minBlobSize: 0, opacity: 1.0, gridDensity: 0, smoothing: 0.75, invert: false, source: 'luma' });
@@ -9224,9 +9223,11 @@
                 }
                 if (toneMappingChanged) ssgiFx.markOutputChanged?.();
                 if (saved.aaMode && ['msaa', 'traa', 'off'].includes(saved.aaMode)) {
-                    currentAAMode = (!postFxInteractiveAvailable || !supportsScreenSpaceEffects) && saved.aaMode === 'traa'
-                        ? 'msaa'
-                        : saved.aaMode;
+                    // Legacy saved value: 'msaa' was a no-op alias for 'off' — normalize.
+                    const loaded = saved.aaMode === 'msaa' ? 'off' : saved.aaMode;
+                    currentAAMode = (!postFxInteractiveAvailable || !supportsScreenSpaceEffects) && loaded === 'traa'
+                        ? 'off'
+                        : loaded;
                     ssgiFx.setTRAAEnabled(currentAAMode === 'traa');
                 }
                 if (typeof saved.envVisible === 'boolean') {

@@ -610,16 +610,54 @@ export function createSSGIController({
         }
     }
 
+    // Deep-dispose a node. Three.js covers most of this inside each node's
+    // dispose() (PassNode, SSRNode, BloomNode, TRAANode etc. all clean up
+    // their own render targets / materials), BUT RTTNode (returned by
+    // `convertToTexture()`) doesn't override dispose — it inherits from
+    // TextureNode whose dispose only dispatches an event. Its internal
+    // `renderTarget` + `_quadMesh.material` leak WebGPU textures and
+    // compiled pipelines on every rebuild. Walk the common fields so this
+    // stays safe even if more node types get added later.
+    function disposeNodeDeep(node) {
+        if (!node) return;
+        try {
+            if (node.renderTarget && typeof node.renderTarget.dispose === 'function') {
+                node.renderTarget.dispose();
+            }
+            const quadMat = node._quadMesh?.material;
+            if (quadMat && typeof quadMat.dispose === 'function') {
+                quadMat.dispose();
+            }
+            if (typeof node.dispose === 'function') {
+                node.dispose();
+            }
+        } catch (_) {
+            // Cleanup must never break a rebuild.
+        }
+    }
+
     function clearNodes() {
         activeSSRPass = null;
         activeAOPass = null;
         activeContactShadowPass = null;
         for (const node of activeNodes) {
-            if (node && typeof node.dispose === 'function') {
-                node.dispose();
-            }
+            disposeNodeDeep(node);
         }
         activeNodes = [];
+
+        // The postProcessing (RenderPipeline) object holds a single
+        // NodeMaterial on `_quadMesh.material` and swaps its `fragmentNode`
+        // each rebuild. The WebGPU backend caches a compiled pipeline /
+        // bind group per material; reusing the material across many
+        // different outputNode graphs accumulates orphaned pipelines in
+        // the backend cache. Disposing the material dispatches the
+        // 'dispose' event that the backend listens for, releasing those
+        // cached resources. On the next render, the backend re-compiles
+        // for the new graph.
+        const quadMat = postProcessing?._quadMesh?.material;
+        if (quadMat && typeof quadMat.dispose === 'function') {
+            try { quadMat.dispose(); } catch (_) { /* best effort */ }
+        }
     }
 
     function disableWithError(prefix, error) {

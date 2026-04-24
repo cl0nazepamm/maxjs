@@ -1437,7 +1437,7 @@ struct MaxJSPBR {
     TexTransform specularIntensityMapTransform, specularColorMapTransform;
     std::wstring mtlName;
     std::wstring tslCode;
-    std::wstring tslMaps[4];
+    std::wstring tslMaps[16];
     std::wstring tslParamsJson;
     std::wstring materialModel = L"MeshStandardMaterial";
     std::wstring materialXFile;
@@ -2167,8 +2167,13 @@ static void ExtractThreeJSMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
         if (code && code[0]) d.tslCode = code;
         // Extract TSL texture map slots
         {
-            static const ParamID tslMapIDs[] = { pb_tsl_map1, pb_tsl_map2, pb_tsl_map3, pb_tsl_map4 };
-            for (int m = 0; m < 4; ++m) {
+            static const ParamID tslMapIDs[] = {
+                pb_tsl_map1, pb_tsl_map2, pb_tsl_map3, pb_tsl_map4,
+                pb_tsl_map5, pb_tsl_map6, pb_tsl_map7, pb_tsl_map8,
+                pb_tsl_map9, pb_tsl_map10, pb_tsl_map11, pb_tsl_map12,
+                pb_tsl_map13, pb_tsl_map14, pb_tsl_map15, pb_tsl_map16
+            };
+            for (int m = 0; m < static_cast<int>(std::size(tslMapIDs)); ++m) {
                 if (HasParam(pb, tslMapIDs[m])) {
                     Texmap* tm = pb->GetTexmap(tslMapIDs[m], t);
                     if (tm) {
@@ -6188,7 +6193,8 @@ public:
     std::unordered_set<ULONG> visibilityDirtyHandles_;
     std::unordered_map<ULONG, std::array<float, 16>> lastSentTransforms_;
     std::unordered_map<ULONG, uint64_t> mtlHashMap_;   // node handle → material structure hash
-    std::unordered_map<ULONG, uint64_t> mtlScalarHashMap_; // node handle → fast-sync scalar hash
+    std::unordered_map<ULONG, uint64_t> mtlScalarHashMap_; // node handle -> non-fast material scalar hash
+    std::unordered_map<ULONG, uint64_t> mtlFastScalarHashMap_; // node handle -> delta material scalar hash
     std::unordered_map<ULONG, uint64_t> lightHashMap_; // node handle → light state hash
     std::unordered_map<ULONG, uint64_t> splatHashMap_; // node handle → splat source state hash
     std::unordered_map<ULONG, uint64_t> audioHashMap_; // node handle → audio source state hash
@@ -8948,6 +8954,7 @@ public:
         lastSentTransforms_.clear();
         mtlHashMap_.clear();
         mtlScalarHashMap_.clear();
+        mtlFastScalarHashMap_.clear();
         lightHashMap_.clear();
         splatHashMap_.clear();
         audioHashMap_.clear();
@@ -9550,11 +9557,13 @@ public:
         Interface* ip = GetCOREInterface();
         if (!ip) return;
         TimeValue t = ip->GetTime();
+        bool changed = false;
 
         for (ULONG handle : geomHandles_) {
             INode* node = ip->GetINodeByHandle(handle);
             if (!node) {
                 mtlScalarHashMap_.erase(handle);
+                mtlFastScalarHashMap_.erase(handle);
                 materialFastDirtyHandles_.erase(handle);
                 continue;
             }
@@ -9568,25 +9577,35 @@ public:
                 const MaterialSyncState state = ComputeMaterialSyncState(node, t);
                 auto structureIt = mtlHashMap_.find(handle);
                 auto scalarIt = mtlScalarHashMap_.find(handle);
-                if (structureIt == mtlHashMap_.end() || scalarIt == mtlScalarHashMap_.end()) {
+                auto fastScalarIt = mtlFastScalarHashMap_.find(handle);
+                if (structureIt == mtlHashMap_.end() ||
+                    scalarIt == mtlScalarHashMap_.end() ||
+                    fastScalarIt == mtlFastScalarHashMap_.end()) {
                     mtlHashMap_[handle] = state.structureHash;
                     mtlScalarHashMap_[handle] = state.scalarHash;
+                    mtlFastScalarHashMap_[handle] = state.fastScalarHash;
                     continue;
                 }
 
                 const bool structureChanged = structureIt->second != state.structureHash;
                 const bool scalarChanged = scalarIt->second != state.scalarHash;
-                if (!structureChanged && !scalarChanged) continue;
+                const bool fastScalarChanged = fastScalarIt->second != state.fastScalarHash;
+                if (!structureChanged && !scalarChanged && !fastScalarChanged) continue;
 
                 structureIt->second = state.structureHash;
                 scalarIt->second = state.scalarHash;
+                fastScalarIt->second = state.fastScalarHash;
 
-                // Any supported-material edit must use the full sync path. The fast
-                // material scalar channel only carries color/roughness/metalness/opacity
-                // and will silently drop physical fields like clearcoat/IOR/specular.
-                materialFastDirtyHandles_.clear();
-                SetDirtyImmediate();
-                return;
+                if (structureChanged || scalarChanged || !state.canFastSync) {
+                    materialFastDirtyHandles_.clear();
+                    SetDirtyImmediate();
+                    return;
+                }
+
+                materialFastDirtyHandles_.insert(handle);
+                fastDirtyHandles_.insert(handle);
+                changed = true;
+                continue;
             }
 
             float col[3] = {0.8f, 0.8f, 0.8f};
@@ -9596,19 +9615,21 @@ public:
             ExtractMaterialScalarPreview(supportedMtl, node, t, col, rough, metal, opac);
 
             const uint64_t scalarHash = HashMaterialScalarPreviewValues(col, rough, metal, opac);
-            auto it = mtlScalarHashMap_.find(handle);
-            if (it == mtlScalarHashMap_.end()) {
-                mtlScalarHashMap_[handle] = scalarHash;
+            auto it = mtlFastScalarHashMap_.find(handle);
+            if (it == mtlFastScalarHashMap_.end()) {
+                mtlFastScalarHashMap_[handle] = scalarHash;
                 continue;
             }
 
             if (it->second != scalarHash) {
                 it->second = scalarHash;
-                materialFastDirtyHandles_.clear();
-                SetDirtyImmediate();
-                return;
+                materialFastDirtyHandles_.insert(handle);
+                fastDirtyHandles_.insert(handle);
+                changed = true;
             }
         }
+
+        if (changed) QueueFastFlush();
     }
 
     void RememberSentTransform(ULONG handle, const float* xform) {
@@ -9653,10 +9674,38 @@ public:
             if (!ReferenceTreeContains(supportedMtl, target)) continue;
 
             const MaterialSyncState state = ComputeMaterialSyncState(node, t);
+            auto structureIt = mtlHashMap_.find(handle);
+            auto scalarIt = mtlScalarHashMap_.find(handle);
+            auto fastScalarIt = mtlFastScalarHashMap_.find(handle);
+            if (structureIt == mtlHashMap_.end() ||
+                scalarIt == mtlScalarHashMap_.end() ||
+                fastScalarIt == mtlFastScalarHashMap_.end()) {
+                mtlHashMap_[handle] = state.structureHash;
+                mtlScalarHashMap_[handle] = state.scalarHash;
+                mtlFastScalarHashMap_[handle] = state.fastScalarHash;
+                materialFastDirtyHandles_.clear();
+                SetDirtyImmediate();
+                return;
+            }
+
+            const bool structureChanged = structureIt->second != state.structureHash;
+            const bool scalarChanged = scalarIt->second != state.scalarHash;
+            const bool fastScalarChanged = fastScalarIt->second != state.fastScalarHash;
             mtlHashMap_[handle] = state.structureHash;
             mtlScalarHashMap_[handle] = state.scalarHash;
-            materialFastDirtyHandles_.clear();
-            SetDirtyImmediate();
+            mtlFastScalarHashMap_[handle] = state.fastScalarHash;
+            if (structureChanged || scalarChanged || !state.canFastSync) {
+                materialFastDirtyHandles_.clear();
+                SetDirtyImmediate();
+                return;
+            }
+            if (fastScalarChanged) {
+                materialFastDirtyHandles_.insert(handle);
+                fastDirtyHandles_.insert(handle);
+                QueueFastFlush();
+            } else {
+                MarkMaterialInteractiveActivity();
+            }
             return;
         }
 
@@ -9802,27 +9851,54 @@ public:
 
     // Topology change (add/remove faces/verts) — needs full sync (debounced)
     void MarkGeometryTopologyDirty(const NodeEventNamespace::NodeKeyTab& nodes) {
+        Interface* ip = GetCOREInterface();
+        const TimeValue t = ip ? ip->GetTime() : 0;
         bool changed = false;
         bool needsFullSync = false;
         for (int i = 0; i < nodes.Count(); ++i) {
             INode* node = NodeEventNamespace::GetNodeByKey(nodes[i]);
             if (!node) continue;
-            VisitNodeSubtree(node, [this, &changed, &needsFullSync](INode* current) {
+            VisitNodeSubtree(node, [this, t, &changed, &needsFullSync](INode* current) {
                 const ULONG handle = current->GetHandle();
                 if (!IsTrackedHandle(handle)) return;
+
+                // Hash-dedupe before doing anything. Max fires spurious
+                // ControllerStructured / TopologyChanged events on viewport
+                // redraw for many cases: Editable Poly live cache flips,
+                // modifier validity-interval churn, procedural generators
+                // (RailClone / Forest Pack / TyFlow) re-evaluating per
+                // redraw, etc. If the current geometry state hashes
+                // identical to the last sent state, this is one of those
+                // spurious events — skip both the fast-path mark AND the
+                // full-sync escalation. Camera movement with nothing
+                // selected used to flip scene/delta at 30Hz because every
+                // spurious structural event escalated to a full binary
+                // sync (see MarkGeometryTopologyDirty / SetDirty path).
+                uint64_t liveHash = 0;
+                auto hashIt = geoHashMap_.find(handle);
+                if (hashIt != geoHashMap_.end() &&
+                    TryHashRenderableGeometryState(current, t, liveHash) &&
+                    liveHash == hashIt->second) {
+                    return;
+                }
                 geoHashMap_.erase(handle);
-                // Skinned + deforming + selected nodes: route through fast
-                // geo path. Max fires spurious TopologyChanged events on
-                // *parameter* edits to modifiers (sphere radius, Path Deform
-                // percent, FFD points, etc.) — these don't actually change
-                // topology, but firing a full scene sync on every animated
-                // frame is the ~100ms+ hitch the user sees during Path Deform
-                // playback. The fast-positions handler on the JS side rebuilds
-                // BufferGeometry if topology does change; real structural
-                // edits to unselected non-deforming meshes still escalate.
+
+                // Real change detected (or first-seen handle): route through
+                // fast path when possible, fall back to full sync only for
+                // unselected static meshes where topology/UV edits could be
+                // missed by the positions-only fast-positions path.
+                //
+                // Procedurals (RC/FP/Ty) always take the fast path — the
+                // hash dedupe above handles their spurious events, and when
+                // they do change, geo_fast correctly streams the new mesh.
+                const bool isProcedural =
+                    IsForestPackNode(current) ||
+                    IsRailCloneNode(current) ||
+                    (IsTyFlowAvailable() && IsTyFlowNode(current));
                 if (skinnedHandles_.count(handle) ||
                     deformHandles_.count(handle) ||
-                    current->Selected()) {
+                    current->Selected() ||
+                    isProcedural) {
                     geoFastDirtyHandles_.insert(handle);
                     if (fastDirtyHandles_.insert(handle).second) changed = true;
                 } else {
@@ -10320,6 +10396,7 @@ public:
             jsReady_ = true; SetDirtyImmediate();
             mtlHashMap_.clear();
             mtlScalarHashMap_.clear();
+            mtlFastScalarHashMap_.clear();
             lightHashMap_.clear();
             splatHashMap_.clear();
             propHashMap_.clear();
@@ -10449,6 +10526,23 @@ public:
         for (ULONG handle : handles) {
             INode* node = ip->GetINodeByHandle(handle);
             if (!node) continue;
+
+            // Hash-dedupe before extracting. RailClone / Forest Pack / TyFlow
+            // (and Max itself) fire spurious ControllerStructured events when
+            // the viewport redraws, even if the generated mesh is byte-identical
+            // to the last send. ExtractMesh + SharedBuffer allocation on every
+            // tick is what makes camera movement chop; this short-circuits the
+            // no-op case without losing real topology/UV edits (hash covers
+            // positions, indices, uvs, and vertex colors where applicable).
+            {
+                uint64_t preHash = 0;
+                auto it = geoHashMap_.find(handle);
+                if (it != geoHashMap_.end() &&
+                    TryHashRenderableGeometryState(node, t, preHash) &&
+                    preHash == it->second) {
+                    continue;
+                }
+            }
 
             std::vector<float> verts, uvs, norms;
             std::vector<int> indices;
@@ -10738,6 +10832,7 @@ public:
             if (!node) {
                 mtlHashMap_.erase(handle);
                 mtlScalarHashMap_.erase(handle);
+                mtlFastScalarHashMap_.erase(handle);
                 lightHashMap_.erase(handle);
                 splatHashMap_.erase(handle);
                 audioHashMap_.erase(handle);
@@ -10954,6 +11049,7 @@ public:
             if (!node) {
                 mtlHashMap_.erase(handle);
                 mtlScalarHashMap_.erase(handle);
+                mtlFastScalarHashMap_.erase(handle);
                 lightHashMap_.erase(handle);
                 geoHashMap_.erase(handle);
                 it = geomHandles_.erase(it);
@@ -11061,6 +11157,7 @@ public:
     struct MaterialSyncState {
         uint64_t structureHash = 0;
         uint64_t scalarHash = 0;
+        uint64_t fastScalarHash = 0;
         bool canFastSync = false;
     };
 
@@ -11078,6 +11175,8 @@ public:
 
         MaxJSPBR pbr;
         ExtractPBR(node, t, pbr);
+        state.fastScalarHash = HashMaterialScalarPreviewValues(
+            pbr.color, pbr.roughness, pbr.metalness, pbr.opacity);
 
         if (pbr.materialModel == L"MaterialXMaterial") {
             state.structureHash = HashMaterialPBRState(pbr);
@@ -11160,8 +11259,16 @@ public:
         structurePbr.anisotropy = 0.0f;
 
         state.structureHash = HashMaterialPBRState(structurePbr);
-        // Scalar hash: full material JSON so ANY param change is detected
-        state.scalarHash = HashMaterialPBRState(pbr);
+        MaxJSPBR slowScalarPbr = pbr;
+        slowScalarPbr.color[0] = 0.8f;
+        slowScalarPbr.color[1] = 0.8f;
+        slowScalarPbr.color[2] = 0.8f;
+        slowScalarPbr.roughness = 0.5f;
+        slowScalarPbr.metalness = 0.0f;
+        slowScalarPbr.opacity = 1.0f;
+        // Non-fast scalar hash: physical scalars still require full sync because
+        // delta_bin only carries color/roughness/metalness/opacity.
+        state.scalarHash = HashMaterialPBRState(slowScalarPbr);
         state.canFastSync = true;
         return state;
     }
@@ -11332,19 +11439,20 @@ public:
         return HashFNV1a(payload.data(), payload.size() * sizeof(wchar_t));
     }
 
-    // Supported material edits must use the full sync path. The lightweight scalar
-    // fast path only carries color/roughness/metalness/opacity and cannot keep
-    // physical properties in sync.
+    // Material graph/physical edits use full sync. Preview-safe scalar edits
+    // stay on delta_bin so interactive material work does not rebuild the scene.
     void DetectMaterialChanges() {
         Interface* ip = GetCOREInterface();
         if (!ip) return;
         TimeValue t = ip->GetTime();
+        bool changed = false;
 
         for (ULONG handle : geomHandles_) {
             INode* node = ip->GetINodeByHandle(handle);
             if (!node) {
                 mtlHashMap_.erase(handle);
                 mtlScalarHashMap_.erase(handle);
+                mtlFastScalarHashMap_.erase(handle);
                 materialFastDirtyHandles_.erase(handle);
                 continue;
             }
@@ -11353,29 +11461,43 @@ public:
 
             auto structureIt = mtlHashMap_.find(handle);
             auto scalarIt = mtlScalarHashMap_.find(handle);
-            if (structureIt == mtlHashMap_.end() || scalarIt == mtlScalarHashMap_.end()) {
+            auto fastScalarIt = mtlFastScalarHashMap_.find(handle);
+            if (structureIt == mtlHashMap_.end() ||
+                scalarIt == mtlScalarHashMap_.end() ||
+                fastScalarIt == mtlFastScalarHashMap_.end()) {
                 mtlHashMap_[handle] = state.structureHash;
                 mtlScalarHashMap_[handle] = state.scalarHash;
+                mtlFastScalarHashMap_[handle] = state.fastScalarHash;
                 continue;
             }
 
             const bool structureChanged = structureIt->second != state.structureHash;
             const bool scalarChanged = scalarIt->second != state.scalarHash;
-            if (!structureChanged && !scalarChanged) continue;
+            const bool fastScalarChanged = fastScalarIt->second != state.fastScalarHash;
+            if (!structureChanged && !scalarChanged && !fastScalarChanged) continue;
 
             structureIt->second = state.structureHash;
             scalarIt->second = state.scalarHash;
-            if (structureChanged) {
+            fastScalarIt->second = state.fastScalarHash;
+            if (structureChanged || scalarChanged || !state.canFastSync) {
                 // Material structure changed — invalidate geometry hash + group cache
                 // so next full sync re-extracts face matIDs for multi-sub materials
-                geoHashMap_.erase(handle);
-                groupCache_.erase(handle);
-                lastBBoxHash_.erase(handle);
+                if (structureChanged) {
+                    geoHashMap_.erase(handle);
+                    groupCache_.erase(handle);
+                    lastBBoxHash_.erase(handle);
+                }
+                materialFastDirtyHandles_.clear();
+                SetDirty();
+                return;
             }
-            materialFastDirtyHandles_.clear();
-            SetDirty();
-            return;
+
+            materialFastDirtyHandles_.insert(handle);
+            fastDirtyHandles_.insert(handle);
+            changed = true;
         }
+
+        if (changed) QueueFastFlush();
     }
 
     void DetectLightChanges() {
@@ -11910,12 +12032,12 @@ public:
             if (!pbr.tslParamsJson.empty() && IsProbablyJsonStructured(pbr.tslParamsJson))
                 ss << L",\"tslParams\":" << pbr.tslParamsJson;
             // TSL texture map slots
-            static const wchar_t* tslMapKeys[] = { L"tslMap1", L"tslMap2", L"tslMap3", L"tslMap4" };
-            for (int m = 0; m < 4; ++m) {
+            for (int m = 0; m < static_cast<int>(std::size(pbr.tslMaps)); ++m) {
                 if (!pbr.tslMaps[m].empty()) {
                     const std::wstring url = MapTexturePath(pbr.tslMaps[m]);
-                    if (!url.empty())
-                        ss << L",\"" << tslMapKeys[m] << L"\":\"" << EscapeJson(url.c_str()) << L"\"";
+                    if (!url.empty()) {
+                        ss << L",\"tslMap" << (m + 1) << L"\":\"" << EscapeJson(url.c_str()) << L"\"";
+                    }
                 }
             }
             if (!pbr.materialXInline.empty()) {
@@ -13268,6 +13390,10 @@ public:
             if (geomHandles_.find(it->first) == geomHandles_.end()) it = mtlScalarHashMap_.erase(it);
             else ++it;
         }
+        for (auto it = mtlFastScalarHashMap_.begin(); it != mtlFastScalarHashMap_.end(); ) {
+            if (geomHandles_.find(it->first) == geomHandles_.end()) it = mtlFastScalarHashMap_.erase(it);
+            else ++it;
+        }
         for (auto it = lightHashMap_.begin(); it != lightHashMap_.end(); ) {
             if (lightHandles_.find(it->first) == lightHandles_.end()) it = lightHashMap_.erase(it);
             else ++it;
@@ -13538,6 +13664,7 @@ public:
             if (!node) {
                 mtlHashMap_.erase(handle);
                 mtlScalarHashMap_.erase(handle);
+                mtlFastScalarHashMap_.erase(handle);
                 lightHashMap_.erase(handle);
                 splatHashMap_.erase(handle);
                 audioHashMap_.erase(handle);
@@ -14417,6 +14544,7 @@ public:
         lastBBoxHash_.clear();
         lastLiveGeomHash_.clear();
         mtlScalarHashMap_.clear();
+        mtlFastScalarHashMap_.clear();
         skinnedControlIdxCache_.clear();
         lastSkinnedLivePollTick_ = 0;
         if (hwnd_) { HWND h = hwnd_; hwnd_ = nullptr; DestroyWindow(h); }

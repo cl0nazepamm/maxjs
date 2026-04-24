@@ -21,6 +21,42 @@ static void NotifyOwnerMaterialEdited(IParamBlock2* pb) {
     MaxJSNotifyMaterialEdited(owner);
 }
 
+static const wchar_t* kTSLCodeEditOrigProcProp = L"MaxJS.TSLCodeEditOrigProc";
+
+static LRESULT CALLBACK TSLCodeEditSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    WNDPROC orig = reinterpret_cast<WNDPROC>(GetPropW(hwnd, kTSLCodeEditOrigProcProp));
+    if (!orig) return DefWindowProcW(hwnd, msg, wParam, lParam);
+
+    switch (msg) {
+    case WM_GETDLGCODE:
+        return CallWindowProcW(orig, hwnd, msg, wParam, lParam) |
+            DLGC_WANTCHARS | DLGC_WANTARROWS | DLGC_WANTTAB;
+    case WM_SETFOCUS:
+        DisableAccelerators();
+        break;
+    case WM_KILLFOCUS:
+        EnableAccelerators();
+        break;
+    case WM_NCDESTROY:
+        RemovePropW(hwnd, kTSLCodeEditOrigProcProp);
+        SetWindowLongPtrW(hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(orig));
+        return CallWindowProcW(orig, hwnd, msg, wParam, lParam);
+    }
+
+    return CallWindowProcW(orig, hwnd, msg, wParam, lParam);
+}
+
+static void InstallTSLCodeEditBehavior(HWND dlgHwnd, int ctrlId) {
+    HWND edit = GetDlgItem(dlgHwnd, ctrlId);
+    if (!edit || GetPropW(edit, kTSLCodeEditOrigProcProp)) return;
+
+    SendMessageW(edit, EM_SETLIMITTEXT, 1024 * 1024, 0);
+    SendMessageW(edit, WM_SETFONT, reinterpret_cast<WPARAM>(GetFixedFont()), TRUE);
+    WNDPROC orig = reinterpret_cast<WNDPROC>(
+        SetWindowLongPtrW(edit, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(TSLCodeEditSubclassProc)));
+    SetPropW(edit, kTSLCodeEditOrigProcProp, reinterpret_cast<HANDLE>(orig));
+}
+
 // IColorSwatch::GetColor() returns COLORREF on the 2026 SDK and Color on
 // 2027+. Overload here so call sites compile against either SDK without
 // version macros — the compiler picks the right one based on the return
@@ -53,7 +89,10 @@ static const ParamID kMapParamIDs[kNumMaps] = {
     pb_phys_specular_intensity_map, pb_phys_specular_color_map,
     pb_phys_clearcoat_map, pb_phys_clearcoat_roughness_map,
     pb_phys_clearcoat_normal_map, pb_phys_transmission_map,
-    pb_tsl_map1, pb_tsl_map2, pb_tsl_map3, pb_tsl_map4
+    pb_tsl_map1, pb_tsl_map2, pb_tsl_map3, pb_tsl_map4,
+    pb_tsl_map5, pb_tsl_map6, pb_tsl_map7, pb_tsl_map8,
+    pb_tsl_map9, pb_tsl_map10, pb_tsl_map11, pb_tsl_map12,
+    pb_tsl_map13, pb_tsl_map14, pb_tsl_map15, pb_tsl_map16
 };
 
 static const MCHAR* kMapSlotNames[kNumMaps] = {
@@ -64,7 +103,10 @@ static const MCHAR* kMapSlotNames[kNumMaps] = {
     _T("Specular Intensity Map"), _T("Specular Color Map"),
     _T("Clearcoat Map"), _T("Clearcoat Roughness Map"),
     _T("Clearcoat Normal Map"), _T("Transmission Map"),
-    _T("TSL Map 1"), _T("TSL Map 2"), _T("TSL Map 3"), _T("TSL Map 4")
+    _T("TSL Map 1"), _T("TSL Map 2"), _T("TSL Map 3"), _T("TSL Map 4"),
+    _T("TSL Map 5"), _T("TSL Map 6"), _T("TSL Map 7"), _T("TSL Map 8"),
+    _T("TSL Map 9"), _T("TSL Map 10"), _T("TSL Map 11"), _T("TSL Map 12"),
+    _T("TSL Map 13"), _T("TSL Map 14"), _T("TSL Map 15"), _T("TSL Map 16")
 };
 
 struct SupportedMapSlots {
@@ -113,7 +155,10 @@ static const int kUtilityBackdropMapSlots[] = {
 };
 
 static const int kTSLMapSlots[] = {
-    kMap_TSL1, kMap_TSL2, kMap_TSL3, kMap_TSL4
+    kMap_TSL1, kMap_TSL2, kMap_TSL3, kMap_TSL4,
+    kMap_TSL5, kMap_TSL6, kMap_TSL7, kMap_TSL8,
+    kMap_TSL9, kMap_TSL10, kMap_TSL11, kMap_TSL12,
+    kMap_TSL13, kMap_TSL14, kMap_TSL15, kMap_TSL16
 };
 
 enum class ThreeJSMaterialKind {
@@ -1497,6 +1542,7 @@ public:
         case WM_INITDIALOG: {
             DialogState& state = states_[hWnd];
             state.pb = pb;
+            InstallTSLCodeEditBehavior(hWnd, IDC_TSL_CODE_EDIT);
             if (pb) {
                 const MCHAR* code = pb->GetStr(pb_tsl_code);
                 if (code && code[0]) {
@@ -1516,6 +1562,7 @@ public:
             }
             break;
         case WM_DESTROY:
+            EnableAccelerators();
             if (auto it = states_.find(hWnd); it != states_.end()) {
                 KillTimer(hWnd, kCodeCommitTimer);
                 DestroyDynamicControls(hWnd, it->second);
@@ -1574,9 +1621,14 @@ public:
             }
             if (LOWORD(wParam) == IDC_TSL_CODE_EDIT && HIWORD(wParam) == EN_KILLFOCUS) {
                 // Rebuild params when code editor loses focus (avoids per-keystroke rebuild)
+                EnableAccelerators();
                 if (auto it = states_.find(hWnd); it != states_.end()) {
                     CommitCodeEdit(hWnd, it->second, true);
                 }
+                return TRUE;
+            }
+            if (LOWORD(wParam) == IDC_TSL_CODE_EDIT && HIWORD(wParam) == EN_SETFOCUS) {
+                DisableAccelerators();
                 return TRUE;
             }
             if (LOWORD(wParam) == IDC_TSL_CODE_EDIT && HIWORD(wParam) == EN_CHANGE) {
@@ -1600,6 +1652,12 @@ public:
 
 static ThreeJSTSLDlgProc tslDlgProc;
 
+#define TSL_MAP_PARAM(PARAM_ID, PARAM_NAME, SUBTEX_ID, CTRL_ID) \
+    PARAM_ID, _T(PARAM_NAME), TYPE_TEXMAP, 0, 0, \
+        p_subtexno, SUBTEX_ID, \
+        p_ui, TYPE_TEXMAPBUTTON, CTRL_ID, \
+        p_end,
+
 static ParamBlockDesc2 threejs_tsl_pb_desc(
     threejs_params,
     _T("three.js TSL Parameters"),
@@ -1612,26 +1670,28 @@ static ParamBlockDesc2 threejs_tsl_pb_desc(
         p_end,
     pb_tsl_source_mtl, _T("sourceMaterial"), TYPE_MTL, 0, 0,
         p_end,
-    pb_tsl_map1, _T("map1"), TYPE_TEXMAP, 0, 0,
-        p_subtexno, kMap_TSL1,
-        p_ui, TYPE_TEXMAPBUTTON, IDC_TSL_MAP1,
-        p_end,
-    pb_tsl_map2, _T("map2"), TYPE_TEXMAP, 0, 0,
-        p_subtexno, kMap_TSL2,
-        p_ui, TYPE_TEXMAPBUTTON, IDC_TSL_MAP2,
-        p_end,
-    pb_tsl_map3, _T("map3"), TYPE_TEXMAP, 0, 0,
-        p_subtexno, kMap_TSL3,
-        p_ui, TYPE_TEXMAPBUTTON, IDC_TSL_MAP3,
-        p_end,
-    pb_tsl_map4, _T("map4"), TYPE_TEXMAP, 0, 0,
-        p_subtexno, kMap_TSL4,
-        p_ui, TYPE_TEXMAPBUTTON, IDC_TSL_MAP4,
-        p_end,
+    TSL_MAP_PARAM(pb_tsl_map1, "map1", kMap_TSL1, IDC_TSL_MAP1)
+    TSL_MAP_PARAM(pb_tsl_map2, "map2", kMap_TSL2, IDC_TSL_MAP2)
+    TSL_MAP_PARAM(pb_tsl_map3, "map3", kMap_TSL3, IDC_TSL_MAP3)
+    TSL_MAP_PARAM(pb_tsl_map4, "map4", kMap_TSL4, IDC_TSL_MAP4)
+    TSL_MAP_PARAM(pb_tsl_map5, "map5", kMap_TSL5, IDC_TSL_MAP5)
+    TSL_MAP_PARAM(pb_tsl_map6, "map6", kMap_TSL6, IDC_TSL_MAP6)
+    TSL_MAP_PARAM(pb_tsl_map7, "map7", kMap_TSL7, IDC_TSL_MAP7)
+    TSL_MAP_PARAM(pb_tsl_map8, "map8", kMap_TSL8, IDC_TSL_MAP8)
+    TSL_MAP_PARAM(pb_tsl_map9, "map9", kMap_TSL9, IDC_TSL_MAP9)
+    TSL_MAP_PARAM(pb_tsl_map10, "map10", kMap_TSL10, IDC_TSL_MAP10)
+    TSL_MAP_PARAM(pb_tsl_map11, "map11", kMap_TSL11, IDC_TSL_MAP11)
+    TSL_MAP_PARAM(pb_tsl_map12, "map12", kMap_TSL12, IDC_TSL_MAP12)
+    TSL_MAP_PARAM(pb_tsl_map13, "map13", kMap_TSL13, IDC_TSL_MAP13)
+    TSL_MAP_PARAM(pb_tsl_map14, "map14", kMap_TSL14, IDC_TSL_MAP14)
+    TSL_MAP_PARAM(pb_tsl_map15, "map15", kMap_TSL15, IDC_TSL_MAP15)
+    TSL_MAP_PARAM(pb_tsl_map16, "map16", kMap_TSL16, IDC_TSL_MAP16)
     pb_tsl_params_json, _T("paramsJson"), TYPE_STRING, 0, 0,
         p_end,
     p_end
 );
+
+#undef TSL_MAP_PARAM
 
 // ══════════════════════════════════════════════════════════════
 //  three.js Video Texture — Texmap for video files in material slots
@@ -2001,6 +2061,7 @@ public:
         case WM_INITDIALOG: {
             DialogState& state = states_[hWnd];
             state.pb = pb;
+            InstallTSLCodeEditBehavior(hWnd, IDC_TSL_TEX_CODE_EDIT);
             if (pb) {
                 const MCHAR* code = pb->GetStr(ptsl_tex_code);
                 if (code && code[0]) {
@@ -2020,6 +2081,7 @@ public:
             }
             break;
         case WM_DESTROY:
+            EnableAccelerators();
             if (auto it = states_.find(hWnd); it != states_.end()) {
                 KillTimer(hWnd, kCodeCommitTimer);
                 DestroyDynamicControls(hWnd, it->second);
@@ -2077,9 +2139,14 @@ public:
                 return TRUE;
             }
             if (LOWORD(wParam) == IDC_TSL_TEX_CODE_EDIT && HIWORD(wParam) == EN_KILLFOCUS) {
+                EnableAccelerators();
                 if (auto it = states_.find(hWnd); it != states_.end()) {
                     CommitCodeEdit(hWnd, it->second, true);
                 }
+                return TRUE;
+            }
+            if (LOWORD(wParam) == IDC_TSL_TEX_CODE_EDIT && HIWORD(wParam) == EN_SETFOCUS) {
+                DisableAccelerators();
                 return TRUE;
             }
             if (LOWORD(wParam) == IDC_TSL_TEX_CODE_EDIT && HIWORD(wParam) == EN_CHANGE) {

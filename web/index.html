@@ -1451,8 +1451,8 @@
         function configureRenderer(nextRenderer) {
             nextRenderer.setSize(innerWidth, innerHeight);
             nextRenderer.setPixelRatio(getEffectivePixelRatio());
-            nextRenderer.toneMapping = THREE.ACESFilmicToneMapping;
-            nextRenderer.toneMappingExposure = 1.2;
+            nextRenderer.toneMapping = THREE.NeutralToneMapping;
+            nextRenderer.toneMappingExposure = 1.0;
             nextRenderer.shadowMap.enabled = true;
             nextRenderer.domElement.style.position = 'absolute';
             nextRenderer.domElement.style.inset = '0';
@@ -1698,6 +1698,7 @@
         perfHud.setStatus(`MaxJS - ${rendererBackendLabel} renderer ready`);
 
         const DEBUG_STORAGE_KEY = 'maxjs_debug';
+        const PROFILE_SCENE_STORAGE_KEY = 'maxjs_profile_scene';
         const isStandalone = !(window.chrome?.webview?.postMessage);
         const urlMode = new URLSearchParams(location.search).get('mode');
         let buildMode = urlMode || (isStandalone ? 'release' : 'dev');
@@ -1718,6 +1719,13 @@
         }
         function maxjsDebugWarn(...args) {
             if (debugMode) console.warn(...args);
+        }
+        function isSceneProfilingEnabled() {
+            try {
+                return localStorage.getItem(PROFILE_SCENE_STORAGE_KEY) === 'true';
+            } catch (_) {
+                return false;
+            }
         }
 
         const ssgiFx = createSSGIController({
@@ -3250,10 +3258,10 @@
                 material.side = md.side === 0 ? THREE.FrontSide : THREE.DoubleSide;
                 // Pre-load textures from material map slots
                 const maps = {};
-                if (md.tslMap1) maps.map1 = loadTexture(md.tslMap1);
-                if (md.tslMap2) maps.map2 = loadTexture(md.tslMap2);
-                if (md.tslMap3) maps.map3 = loadTexture(md.tslMap3);
-                if (md.tslMap4) maps.map4 = loadTexture(md.tslMap4);
+                for (let i = 1; i <= 16; i++) {
+                    const url = md[`tslMap${i}`];
+                    if (url) maps[`map${i}`] = loadTexture(url);
+                }
                 // Build dynamic params from @param declarations + stored values
                 const params = buildTSLParams(md.tslCode, md.tslParams || {});
                 // TSL code gets: material, THREE, TSL, loadTexture, maps, params (uniforms)
@@ -4407,7 +4415,7 @@
         }
 
         function profileSceneNodes(nodes) {
-            if (!debugMode || buildMode === 'release') return;
+            if (!debugMode || buildMode === 'release' || !isSceneProfilingEnabled()) return;
             const stats = [];
             for (const nd of nodes) {
                 const mesh = nodeMap.get(nd.h);
@@ -5285,6 +5293,8 @@
             }
             for (const m of mats) {
                 if (!m) continue;
+                let materialNeedsUpdate = false;
+                let nextTransparent = m.transparent;
                 if (c && m.color) m.color.setRGB(c[0], c[1], c[2]);
                 if (emissive && m.emissive) m.emissive.setRGB(emissive[0], emissive[1], emissive[2]);
                 if (specularColor && 'specularColor' in m && m.specularColor) {
@@ -5302,7 +5312,7 @@
                 if (metalness != null && 'metalness' in m) m.metalness = metalness;
                 if (material?.opacity != null) {
                     m.opacity = material.opacity;
-                    m.transparent = material.opacity < 0.999;
+                    nextTransparent = material.opacity < 0.999;
                 }
                 if (material?.emissiveIntensity != null || material?.emI != null) {
                     if ('emissiveIntensity' in m) m.emissiveIntensity = material?.emissiveIntensity ?? material?.emI;
@@ -5328,8 +5338,11 @@
                     m.iridescenceIOR = material.iridescenceIOR;
                 }
                 if (material?.transmission != null && 'transmission' in m) {
+                    const hadTransmission = (m.transmission ?? 0) > 0;
                     m.transmission = material.transmission;
-                    if (material.transmission > 0) m.transparent = true;
+                    const hasTransmission = material.transmission > 0;
+                    if (hadTransmission !== hasTransmission) materialNeedsUpdate = true;
+                    if (hasTransmission) nextTransparent = true;
                 }
                 if (material?.thickness != null && 'thickness' in m) m.thickness = material.thickness;
                 if (material?.specularIntensity != null && 'specularIntensity' in m) {
@@ -5356,7 +5369,11 @@
                 }
                 rememberMaterialEmissiveBase(m);
                 applyMaterialSelectionState(m, !!mesh.userData.maxjsSelected);
-                m.needsUpdate = true;
+                if (m.transparent !== nextTransparent) {
+                    m.transparent = nextTransparent;
+                    materialNeedsUpdate = true;
+                }
+                if (materialNeedsUpdate) m.needsUpdate = true;
             }
         }
 
@@ -7866,16 +7883,16 @@
         let lastPostFxSignature = '';
 
         // Tone mapping modes
+        const DEFAULT_TONE_MAPPING = 'Neutral';
         const toneMappingModes = {
             'None': THREE.NoToneMapping,
             'Linear': THREE.LinearToneMapping,
             'Reinhard': THREE.ReinhardToneMapping,
             'Cineon': THREE.CineonToneMapping,
-            'ACES Filmic': THREE.ACESFilmicToneMapping,
             'AgX': THREE.AgXToneMapping,
             'Neutral': THREE.NeutralToneMapping,
         };
-        let currentToneMapping = 'None';
+        let currentToneMapping = DEFAULT_TONE_MAPPING;
         let currentExposure = 1.0;
         let currentAAMode = 'msaa'; // 'msaa' | 'traa' | 'off'
 
@@ -8485,7 +8502,7 @@
                         if (defaults[section.key]) section.setValues(defaults[section.key]);
                     }
                 }
-                currentToneMapping = 'None';
+                currentToneMapping = DEFAULT_TONE_MAPPING;
                 currentExposure = 1.0;
                 currentAAMode = 'msaa';
                 ssgiFx.setTRAAEnabled(false);

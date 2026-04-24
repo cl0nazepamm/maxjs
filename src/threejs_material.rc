@@ -501,25 +501,49 @@ BEGIN
     LTEXT           "Models: Distance / Depth / Lambert / Matcap / Normal / Phong / Backdrop", IDC_MTL_MODEL_LABEL, 8, 456, 154, 24
 END
 
-IDD_THREEJS_TSL_MTL DIALOG 0, 0, 170, 540
+IDD_THREEJS_TSL_MTL DIALOG 0, 0, 170, 620
 STYLE DS_SETFONT | WS_CHILD | WS_VISIBLE
 FONT 8, "Segoe UI"
 BEGIN
-    GROUPBOX        "TSL Shader", -1,   2,   2, 166, 200
-    LTEXT           "Connect Source Material in Node Editor for MaterialX auto-compile", -1, 8, 14, 154, 16
+    GROUPBOX        "TSL Shader", -1,   2,   2, 166, 248
+    LTEXT           "Node material JS. Source material can be wired for MaterialX.", -1, 8, 14, 154, 16
     LTEXT           "No file loaded", IDC_TSL_FILE_LABEL, 8, 34, 100, 8
     PUSHBUTTON      "Load .js",   IDC_TSL_LOAD_BTN,  114, 31, 46, 14
-    EDITTEXT        IDC_TSL_CODE_EDIT, 6, 48, 158, 148, ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN | WS_VSCROLL | WS_TABSTOP
-    GROUPBOX        "Texture Maps", -1, 2, 206, 166, 60
-    LTEXT           "Map 1:", -1, 8, 220, 24, 8
-    CONTROL         "", IDC_TSL_MAP1, "CustButton", 0x50010000, 34, 218, 128, 12
-    LTEXT           "Map 2:", -1, 8, 234, 24, 8
-    CONTROL         "", IDC_TSL_MAP2, "CustButton", 0x50010000, 34, 232, 128, 12
-    LTEXT           "Map 3:", -1, 8, 248, 24, 8
-    CONTROL         "", IDC_TSL_MAP3, "CustButton", 0x50010000, 34, 246, 128, 12
-    LTEXT           "Map 4:", -1, 8, 262, 24, 8
-    CONTROL         "", IDC_TSL_MAP4, "CustButton", 0x50010000, 34, 260, 128, 12
-    GROUPBOX        "Dynamic Parameters", IDC_TSL_DYN_GROUP, 2, 272, 166, 264
+    EDITTEXT        IDC_TSL_CODE_EDIT, 6, 50, 158, 194, ES_MULTILINE | ES_AUTOVSCROLL | ES_AUTOHSCROLL | ES_WANTRETURN | WS_VSCROLL | WS_HSCROLL | WS_TABSTOP
+    GROUPBOX        "Texture Slots  maps.map1 - maps.map16", -1, 2, 254, 166, 136
+    LTEXT           "01", -1, 8, 268, 10, 8
+    CONTROL         "", IDC_TSL_MAP1, "CustButton", 0x50010000, 22, 266, 56, 12
+    LTEXT           "09", -1, 88, 268, 10, 8
+    CONTROL         "", IDC_TSL_MAP9, "CustButton", 0x50010000, 104, 266, 56, 12
+    LTEXT           "02", -1, 8, 282, 10, 8
+    CONTROL         "", IDC_TSL_MAP2, "CustButton", 0x50010000, 22, 280, 56, 12
+    LTEXT           "10", -1, 88, 282, 10, 8
+    CONTROL         "", IDC_TSL_MAP10, "CustButton", 0x50010000, 104, 280, 56, 12
+    LTEXT           "03", -1, 8, 296, 10, 8
+    CONTROL         "", IDC_TSL_MAP3, "CustButton", 0x50010000, 22, 294, 56, 12
+    LTEXT           "11", -1, 88, 296, 10, 8
+    CONTROL         "", IDC_TSL_MAP11, "CustButton", 0x50010000, 104, 294, 56, 12
+    LTEXT           "04", -1, 8, 310, 10, 8
+    CONTROL         "", IDC_TSL_MAP4, "CustButton", 0x50010000, 22, 308, 56, 12
+    LTEXT           "12", -1, 88, 310, 10, 8
+    CONTROL         "", IDC_TSL_MAP12, "CustButton", 0x50010000, 104, 308, 56, 12
+    LTEXT           "05", -1, 8, 324, 10, 8
+    CONTROL         "", IDC_TSL_MAP5, "CustButton", 0x50010000, 22, 322, 56, 12
+    LTEXT           "13", -1, 88, 324, 10, 8
+    CONTROL         "", IDC_TSL_MAP13, "CustButton", 0x50010000, 104, 322, 56, 12
+    LTEXT           "06", -1, 8, 338, 10, 8
+    CONTROL         "", IDC_TSL_MAP6, "CustButton", 0x50010000, 22, 336, 56, 12
+    LTEXT           "14", -1, 88, 338, 10, 8
+    CONTROL         "", IDC_TSL_MAP14, "CustButton", 0x50010000, 104, 336, 56, 12
+    LTEXT           "07", -1, 8, 352, 10, 8
+    CONTROL         "", IDC_TSL_MAP7, "CustButton", 0x50010000, 22, 350, 56, 12
+    LTEXT           "15", -1, 88, 352, 10, 8
+    CONTROL         "", IDC_TSL_MAP15, "CustButton", 0x50010000, 104, 350, 56, 12
+    LTEXT           "08", -1, 8, 366, 10, 8
+    CONTROL         "", IDC_TSL_MAP8, "CustButton", 0x50010000, 22, 364, 56, 12
+    LTEXT           "16", -1, 88, 366, 10, 8
+    CONTROL         "", IDC_TSL_MAP16, "CustButton", 0x50010000, 104, 364, 56, 12
+    GROUPBOX        "Dynamic Parameters", IDC_TSL_DYN_GROUP, 2, 394, 166, 220
 END
 
 IDD_THREEJS_VIDEO_TEX DIALOG 0, 0, 170, 80
@@ -545,7 +569,7 @@ BEGIN
     LTEXT           "Code returns a THREE.Texture or THREE.DataTexture", -1, 8, 14, 154, 16
     LTEXT           "No file loaded", IDC_TSL_TEX_FILE_LABEL, 8, 34, 100, 8
     PUSHBUTTON      "Load .js",   IDC_TSL_TEX_LOAD_BTN,  114, 31, 46, 14
-    EDITTEXT        IDC_TSL_TEX_CODE_EDIT, 6, 48, 158, 100, ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN | WS_VSCROLL | WS_TABSTOP
+    EDITTEXT        IDC_TSL_TEX_CODE_EDIT, 6, 48, 158, 100, ES_MULTILINE | ES_AUTOVSCROLL | ES_AUTOHSCROLL | ES_WANTRETURN | WS_VSCROLL | WS_HSCROLL | WS_TABSTOP
     GROUPBOX        "Dynamic Parameters", IDC_TSL_TEX_DYN_GROUP, 2, 158, 166, 264
 END
 

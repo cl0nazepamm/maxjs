@@ -23,6 +23,7 @@ const BLEND_MODES = [
 ];
 
 const COMPOSITE_MODES = ['filter', 'mask'];
+const TONEMAP_MODES = ['neutral', 'linear', 'reinhard'];
 
 // Per-effect default params — extracted from shader-lab 1.3.4's pass source
 // files. Users can tweak any value in the Params JSON editor. When the
@@ -175,7 +176,7 @@ const DEFAULT_PARAMS = {
         glowStrength: 0.18, glowThreshold: 0.62,
         grainAmount: 0.03,
         vignetteStrength: 0.18, vignetteRadius: 0.9, vignetteSoftness: 0.32,
-        noiseSeed: 0, noiseMode: 'simplex', tonemapMode: 'aces',
+        noiseSeed: 0, noiseMode: 'simplex', tonemapMode: 'neutral',
         warpIterations: 1,
     },
     'text': {
@@ -223,6 +224,21 @@ const DEFAULT_CONFIG = () => ({
     timeline: { duration: 6, loop: true, tracks: [] },
 });
 
+function normalizeConfig(config) {
+    const source = (config && typeof config === 'object') ? config : DEFAULT_CONFIG();
+    const layers = Array.isArray(source.layers)
+        ? source.layers.map(layer => {
+            if (!layer || typeof layer !== 'object') return layer;
+            const params = (layer.params && typeof layer.params === 'object') ? { ...layer.params } : layer.params;
+            if (params && typeof params.tonemapMode === 'string' && !TONEMAP_MODES.includes(params.tonemapMode)) {
+                params.tonemapMode = defaultParamsFor(layer.type).tonemapMode ?? TONEMAP_MODES[0];
+            }
+            return { ...layer, params };
+        })
+        : source.layers;
+    return { ...source, layers };
+}
+
 // ── Host store ──────────────────────────────────────────────
 // The panel's user-editable state (config + autoApply) lives in a module-
 // level snapshot so host code can persist it next to the .max file via the
@@ -244,7 +260,7 @@ export function getShaderLabSnapshot() {
 export function setShaderLabSnapshot(snapshot) {
     if (!snapshot || typeof snapshot !== 'object') return;
     _storeSnapshot = {
-        config: snapshot.config ?? DEFAULT_CONFIG(),
+        config: normalizeConfig(snapshot.config),
         autoApply: snapshot.autoApply !== false,
         enabled: !!snapshot.enabled,
     };
@@ -684,7 +700,7 @@ function buildApp({ React, htm, shaderLabFx }) {
         shape: ['circle', 'square', 'diamond'],
         fontFamily: ['display-serif', 'serif', 'sans-serif', 'monospace'],
         preset: ['architectural', 'vintage', 'industrial'],
-        tonemapMode: ['aces', 'linear', 'reinhard'],
+        tonemapMode: TONEMAP_MODES,
         channelMode: ['luminance', 'red', 'green', 'blue', 'alpha'],
         cmykBlend: ['subtractive', 'additive'],
         source: ['webcam', 'screen'],
@@ -786,10 +802,11 @@ function buildApp({ React, htm, shaderLabFx }) {
 
         if (typeof value === 'string' && PARAM_ENUMS[paramKey]) {
             const options = PARAM_ENUMS[paramKey];
+            const selected = options.includes(value) ? value : options[0];
             return html`
                 <label className="fx-control">
                     <div className="fx-control-head"><span>${label}</span></div>
-                    <select className="sl-select" value=${value}
+                    <select className="sl-select" value=${selected}
                         onChange=${(e) => onChange(e.target.value)}>
                         ${options.map(o => html`<option key=${o} value=${o}>${o}</option>`)}
                     </select>

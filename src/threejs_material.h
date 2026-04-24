@@ -79,6 +79,19 @@ enum ThreeJSParamIDs {
     pb_tsl_map4,
     // TSL dynamic params (JSON storage)
     pb_tsl_params_json,
+    // TSL texture map slots appended for scene compatibility
+    pb_tsl_map5,
+    pb_tsl_map6,
+    pb_tsl_map7,
+    pb_tsl_map8,
+    pb_tsl_map9,
+    pb_tsl_map10,
+    pb_tsl_map11,
+    pb_tsl_map12,
+    pb_tsl_map13,
+    pb_tsl_map14,
+    pb_tsl_map15,
+    pb_tsl_map16,
     // Utility extras (appended for scene compatibility)
     pb_specular_map,
     pb_reflectivity,
@@ -157,6 +170,18 @@ enum ThreeJSMapSlots {
     kMap_TSL2,
     kMap_TSL3,
     kMap_TSL4,
+    kMap_TSL5,
+    kMap_TSL6,
+    kMap_TSL7,
+    kMap_TSL8,
+    kMap_TSL9,
+    kMap_TSL10,
+    kMap_TSL11,
+    kMap_TSL12,
+    kMap_TSL13,
+    kMap_TSL14,
+    kMap_TSL15,
+    kMap_TSL16,
     kNumMaps
 };
 

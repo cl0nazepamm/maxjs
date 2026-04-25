@@ -771,7 +771,7 @@ function createMaxSceneFacade({ scene, nodeMap, lightHandleMap, getAdapter, crea
     return freezePlainObject({
         get size() { return nodeMap.size; },
         get background() { return scene.background?.clone?.() ?? scene.background ?? null; },
-        get environment() { return scene.environment?.clone?.() ?? null; },
+        get environment() { return scene.environment ?? null; },
         get fog() { return scene.fog?.clone?.() ?? null; },
         has(handle) { return nodeMap.has(handle); },
         getNode(handle) { return nodeMap.has(handle) ? getAdapter(handle) : null; },
@@ -842,6 +842,17 @@ function createMaxSceneFacade({ scene, nodeMap, lightHandleMap, getAdapter, crea
 }
 
 function createRendererFacade(renderer, THREE, scene) {
+    let pmremGenerator = null;
+
+    function getPMREMGenerator() {
+        if (!pmremGenerator) {
+            pmremGenerator = new THREE.PMREMGenerator(renderer);
+            pmremGenerator.compileEquirectangularShader?.();
+            pmremGenerator.compileCubemapShader?.();
+        }
+        return pmremGenerator;
+    }
+
     function retainPMREMTexture(renderTarget) {
         const texture = renderTarget?.texture ?? null;
         if (!texture) {
@@ -870,7 +881,7 @@ function createRendererFacade(renderer, THREE, scene) {
     }
 
     function pmremFromScene(sceneOrObj, sigma = 0, near = 0.1, far = 1_000_000) {
-        const pmrem = new THREE.PMREMGenerator(renderer);
+        const pmrem = getPMREMGenerator();
         const target = sceneOrObj?.isScene
             ? sceneOrObj
             : (() => {
@@ -879,13 +890,11 @@ function createRendererFacade(renderer, THREE, scene) {
                 return s;
             })();
         const rt = pmrem.fromScene(target, sigma, near, far);
-        pmrem.dispose();
         return retainPMREMTexture(rt);
     }
     function pmremFromEquirectangular(texture) {
-        const pmrem = new THREE.PMREMGenerator(renderer);
+        const pmrem = getPMREMGenerator();
         const rt = pmrem.fromEquirectangular(texture);
-        pmrem.dispose();
         return retainPMREMTexture(rt);
     }
     return freezePlainObject({

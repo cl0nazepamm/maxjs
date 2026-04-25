@@ -2694,6 +2694,7 @@
         function loadMapSlot(md, key, colorSpace, xfKey, fallback) {
             const htmlUrl = md[key + 'HTML'];
             if (htmlUrl) {
+                const normalizedXf = normalizeTextureTransform(xfKey ? md[xfKey] : null);
                 const baseUrl = md[key + 'HTMLBase'] || '';
                 const filename = md[key + 'HTMLName'] || '';
                 // Prefer baseUrl + filename so snapshot-mode relative URLs
@@ -2708,6 +2709,7 @@
                     params: md[key + 'HTMLParams'],
                     cacheKey: resolved,
                 });
+                applyTextureTransform(handle.texture, normalizedXf);
                 return handle.texture;
             }
             const tslCode = md[key + 'TSL'];
@@ -4047,6 +4049,7 @@
                             const hasIncomingIndex = meta.iOff != null && meta.iN != null;
                             const idxCount = hasIncomingIndex ? meta.iN : 0;
                             const existingIdx = mesh.geometry.getIndex();
+                            const skipBounds = !!(meta.keepNormals || meta.skipBounds);
                             const sameTopology = wantsLine === hasLine
                                 && pos
                                 && pos.count === vertCount
@@ -4089,13 +4092,11 @@
 
                                 setGeometryVertexColorAttributes(mesh.geometry, incomingVertexColors, buf);
 
-                                // keepNormals signals a skinned fast-positions update:
+                                // skipBounds signals a deformation-only fast update:
                                 // bounding volumes are the hot path cost for skinned
-                                // meshes at 60fps and drive nothing visible (frustum
-                                // culling is off, shadow maps tolerate stale bounds).
-                                // Skip the recompute. Initial bind-pose bounds are
-                                // typically a superset of any deformed pose anyway.
-                                if (!meta.keepNormals) {
+                                // meshes at 60fps and drive nothing visible here
+                                // (frustum culling is off).
+                                if (!skipBounds) {
                                     mesh.geometry.computeBoundingBox();
                                     mesh.geometry.computeBoundingSphere();
                                 }

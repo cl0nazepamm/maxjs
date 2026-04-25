@@ -88,6 +88,7 @@ export function createSSGIController({
 }) {
     const PipelineCtor = THREE.RenderPipeline || THREE.PostProcessing;
     const postProcessing = new PipelineCtor(renderer);
+    const emptyOutputNode = vec4(0, 0, 0, 0);
     const supportsScreenSpaceEffects = backendLabel === 'WebGPU';
     const SSR_REFERENCE_SIZE = 6.0;
     const hiddenBackground = new THREE.Color(hiddenBackgroundColor);
@@ -610,54 +611,74 @@ export function createSSGIController({
         }
     }
 
-    // Deep-dispose a node. Three.js covers most of this inside each node's
-    // dispose() (PassNode, SSRNode, BloomNode, TRAANode etc. all clean up
-    // their own render targets / materials), BUT RTTNode (returned by
-    // `convertToTexture()`) doesn't override dispose — it inherits from
-    // TextureNode whose dispose only dispatches an event. Its internal
-    // `renderTarget` + `_quadMesh.material` leak WebGPU textures and
-    // compiled pipelines on every rebuild. Walk the common fields so this
-    // stays safe even if more node types get added later.
-    function disposeNodeDeep(node) {
+    function disposeResource(resource, seen) {
+        if (!resource || seen.has(resource)) return;
+        seen.add(resource);
+        if (typeof resource.dispose === 'function') {
+            try { resource.dispose(); } catch (_) { /* best effort */ }
+        }
+    }
+
+    function disposeResourceMap(map, seen) {
+        if (!map) return;
+        const values = map instanceof Map ? map.values() : Object.values(map);
+        for (const value of values) {
+            disposeResource(value, seen);
+        }
+    }
+
+    function detachPostProcessingGraph() {
+        postProcessing.outputNode = emptyOutputNode;
+        postProcessing._context = null;
+        postProcessing.needsUpdate = true;
+
+        const quadMat = postProcessing?._quadMesh?.material;
+        if (!quadMat) return;
+
+        disposeResource(quadMat, new Set());
+        quadMat.fragmentNode = null;
+        quadMat.needsUpdate = true;
+    }
+
+    // Deep-dispose a post-FX node. PassNode owns render targets and temporal
+    // previous-frame texture clones; RTTNode from convertToTexture owns its
+    // render target plus a private quad material. Three's base Node.dispose()
+    // only dispatches an event, so walk the private ownership fields too.
+    function disposeNodeDeep(node, seen) {
         if (!node) return;
         try {
-            if (node.renderTarget && typeof node.renderTarget.dispose === 'function') {
-                node.renderTarget.dispose();
-            }
-            const quadMat = node._quadMesh?.material;
-            if (quadMat && typeof quadMat.dispose === 'function') {
-                quadMat.dispose();
-            }
-            if (typeof node.dispose === 'function') {
-                node.dispose();
-            }
+            disposeResource(node.renderTarget, seen);
+            disposeResourceMap(node._previousTextures, seen);
+            disposeResourceMap(node._textures, seen);
+            disposeResource(node._quadMesh?.material, seen);
+            disposeResource(node, seen);
+
+            node.scene = null;
+            node.camera = null;
+            node.contextNode = null;
+            node.renderTarget = null;
+            node._previousTextures = {};
+            node._previousTextureNodes = {};
+            node._textures = {};
+            node._textureNodes = {};
+            node._linearDepthNodes = {};
+            node._viewZNodes = {};
+            node._contextNodeCache = null;
         } catch (_) {
             // Cleanup must never break a rebuild.
         }
     }
 
     function clearNodes() {
+        detachPostProcessingGraph();
         activeSSRPass = null;
         activeAOPass = null;
         activeContactShadowPass = null;
+        const seen = new Set();
         for (const node of activeNodes) {
-            disposeNodeDeep(node);
+            disposeNodeDeep(node, seen);
         }
         activeNodes = [];
-
-        // The postProcessing (RenderPipeline) object holds a single
-        // NodeMaterial on `_quadMesh.material` and swaps its `fragmentNode`
-        // each rebuild. The WebGPU backend caches a compiled pipeline /
-        // bind group per material; reusing the material across many
-        // different outputNode graphs accumulates orphaned pipelines in
-        // the backend cache. Disposing the material dispatches the
-        // 'dispose' event that the backend listens for, releasing those
-        // cached resources. On the next render, the backend re-compiles
-        // for the new graph.
-        const quadMat = postProcessing?._quadMesh?.material;
-        if (quadMat && typeof quadMat.dispose === 'function') {
-            try { quadMat.dispose(); } catch (_) { /* best effort */ }
-        }
     }
 
     function disableWithError(prefix, error) {

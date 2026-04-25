@@ -431,6 +431,25 @@ export function attachHTMLClickForwarding(THREE, renderer, getCameraScene) {
     // click — matches browser convention for "this was a drag, not a tap."
     const DRAG_CANCELS_CLICK_PX = 5;
 
+    function wrapTextureCoord(value, mode) {
+        if (mode === THREE.ClampToEdgeWrapping) return Math.min(1, Math.max(0, value));
+
+        const repeated = value - Math.floor(value);
+        if (mode === THREE.MirroredRepeatWrapping) {
+            const band = Math.floor(value);
+            return (Math.abs(band) % 2) ? 1 - repeated : repeated;
+        }
+        return repeated;
+    }
+
+    function htmlTextureUV(tex, uv) {
+        const mapped = uv.clone();
+        if (tex?.matrix) mapped.applyMatrix3(tex.matrix);
+        mapped.x = wrapTextureCoord(mapped.x, tex?.wrapS);
+        mapped.y = wrapTextureCoord(mapped.y, tex?.wrapT);
+        return mapped;
+    }
+
     function pickHTMLTexture(event, restrictMesh) {
         const cs = getCameraScene();
         if (!cs?.camera) return null;
@@ -450,11 +469,12 @@ export function attachHTMLClickForwarding(THREE, renderer, getCameraScene) {
                 const host = tex.userData.maxjsHTMLHost;
                 const w = tex.userData.maxjsHTMLWidth || 1024;
                 const h = tex.userData.maxjsHTMLHeight || 1024;
+                const uv = htmlTextureUV(tex, hit.uv);
                 return {
                     mesh: hit.object,
                     host, tex, w, h,
-                    px: hit.uv.x * w,
-                    py: (1 - hit.uv.y) * h, // flip V: Three UV bottom-left → DOM top-left
+                    px: uv.x * w,
+                    py: (1 - uv.y) * h, // flip V: Three UV bottom-left → DOM top-left
                 };
             }
         }

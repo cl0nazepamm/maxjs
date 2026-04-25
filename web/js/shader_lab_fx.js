@@ -82,6 +82,7 @@ export function createShaderLabFx({ THREE, renderer, scene, camera }) {
     let displayScene = null;
     let displayCamera = null;
     let displayMaterial = null;
+    let displayQuad = null;
     let currentConfig = DEFAULT_COMPOSITION;
     let errorText = '';
     let loading = false;
@@ -126,6 +127,42 @@ export function createShaderLabFx({ THREE, renderer, scene, camera }) {
         const quad = new THREE.Mesh(geom, displayMaterial);
         quad.frustumCulled = false;
         displayScene.add(quad);
+        displayQuad = quad;
+    }
+
+    function disposePostprocessing(instance) {
+        if (!instance || typeof instance.dispose !== 'function') return;
+        try { instance.dispose(); } catch (_) { /* best effort */ }
+    }
+
+    function cleanupResources() {
+        const oldPostprocessing = postprocessing;
+        postprocessing = null;
+        ready = false;
+
+        try { reactRoot?.unmount(); } catch (_) {}
+        reactRoot = null;
+
+        try { hiddenDiv?.remove(); } catch (_) {}
+        hiddenDiv = null;
+
+        disposePostprocessing(oldPostprocessing);
+
+        try { sceneTarget?.dispose(); } catch (_) {}
+        sceneTarget = null;
+
+        if (displayMaterial) {
+            displayMaterial.map = null;
+        }
+        try { displayQuad?.geometry?.dispose?.(); } catch (_) {}
+        try { displayMaterial?.dispose?.(); } catch (_) {}
+        try {
+            if (displayScene && displayQuad) displayScene.remove(displayQuad);
+        } catch (_) {}
+        displayQuad = null;
+        displayMaterial = null;
+        displayCamera = null;
+        displayScene = null;
     }
 
     function emitStateChange() {
@@ -178,7 +215,9 @@ export function createShaderLabFx({ THREE, renderer, scene, camera }) {
         } catch (err) {
             errorText = err?.message || String(err);
             console.error('[shader-lab-fx] enable failed:', err);
+            enabled = false;
             loading = false;
+            cleanupResources();
             emitStateChange();
             throw err;
         }
@@ -187,14 +226,7 @@ export function createShaderLabFx({ THREE, renderer, scene, camera }) {
     function disable() {
         if (!enabled) return;
         enabled = false;
-        ready = false;
-        postprocessing = null;
-        try { reactRoot?.unmount(); } catch (_) {}
-        reactRoot = null;
-        try { hiddenDiv?.remove(); } catch (_) {}
-        hiddenDiv = null;
-        try { sceneTarget?.dispose(); } catch (_) {}
-        sceneTarget = null;
+        cleanupResources();
         emitStateChange();
     }
 

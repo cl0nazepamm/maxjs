@@ -2197,9 +2197,12 @@ ClassDesc2* GetThreeJSTSLTexDesc() { return &tslTexDesc; }
 class ThreeJSHTMLTex : public Texmap {
 public:
     IParamBlock2* pblock = nullptr;
+    UVGen* uvGen = nullptr;
+    ParamDlg* uvGenDlg = nullptr;
 
     ThreeJSHTMLTex(BOOL /*loading*/) {
         GetThreeJSHTMLTexDesc()->MakeAutoParamBlocks(this);
+        ReplaceReference(1, GetNewDefaultUVGen());
     }
     ~ThreeJSHTMLTex() override = default;
 
@@ -2208,16 +2211,32 @@ public:
     SClass_ID SuperClassID() override { return TEXMAP_CLASS_ID; }
     void GetClassName(MSTR& s, bool) const override { s = _T("three.js HTML"); }
 
-    int NumRefs() override { return 1; }
-    RefTargetHandle GetReference(int i) override { return i == 0 ? pblock : nullptr; }
-    void SetReference(int i, RefTargetHandle r) override { if (i == 0) pblock = static_cast<IParamBlock2*>(r); }
-    RefResult NotifyRefChanged(const Interval&, RefTargetHandle, PartID&, RefMessage, BOOL) override { return REF_SUCCEED; }
+    int NumRefs() override { return 2; }
+    RefTargetHandle GetReference(int i) override {
+        if (i == 0) return pblock;
+        if (i == 1) return uvGen;
+        return nullptr;
+    }
+    void SetReference(int i, RefTargetHandle r) override {
+        if (i == 0) pblock = static_cast<IParamBlock2*>(r);
+        else if (i == 1) uvGen = static_cast<UVGen*>(r);
+    }
+    RefResult NotifyRefChanged(const Interval&, RefTargetHandle hTarget, PartID&, RefMessage msg, BOOL) override {
+        if (msg == REFMSG_CHANGE) {
+            NotifyOwnerMaterialEdited(pblock);
+        } else if (msg == REFMSG_TARGET_DELETED) {
+            if (hTarget == pblock) pblock = nullptr;
+            if (hTarget == uvGen) uvGen = nullptr;
+        }
+        return REF_SUCCEED;
+    }
 
     RefTargetHandle Clone(RemapDir& remap) override {
         auto* c = new ThreeJSHTMLTex(FALSE);
         *static_cast<MtlBase*>(c) = *static_cast<MtlBase*>(this);
         BaseClone(this, c, remap);
         c->ReplaceReference(0, remap.CloneRef(pblock));
+        c->ReplaceReference(1, remap.CloneRef(uvGen));
         return c;
     }
 
@@ -2230,12 +2249,41 @@ public:
     IParamBlock2* GetParamBlockByID(BlockID id) override { return id == threejs_html_tex_params ? pblock : nullptr; }
 
     ParamDlg* CreateParamDlg(HWND hwMtlEdit, IMtlParams* imp) override {
-        return GetThreeJSHTMLTexDesc()->CreateParamDlgs(hwMtlEdit, imp, this);
+        IAutoMParamDlg* mainDlg = GetThreeJSHTMLTexDesc()->CreateParamDlgs(hwMtlEdit, imp, this);
+        if (mainDlg && uvGen) {
+            uvGenDlg = uvGen->CreateParamDlg(hwMtlEdit, imp);
+            mainDlg->AddDlg(uvGenDlg);
+        }
+        return mainDlg;
+    }
+    BOOL SetDlgThing(ParamDlg* dlg) override {
+        if (uvGen && dlg && dlg == uvGenDlg) {
+            dlg->SetThing(uvGen);
+            return TRUE;
+        }
+        return FALSE;
     }
 
     void Update(TimeValue, Interval& valid) override { valid = FOREVER; }
     Interval Validity(TimeValue) override { return FOREVER; }
-    void Reset() override { GetThreeJSHTMLTexDesc()->MakeAutoParamBlocks(this); }
+    void Reset() override {
+        GetThreeJSHTMLTexDesc()->MakeAutoParamBlocks(this);
+        if (uvGen) uvGen->Reset();
+        else ReplaceReference(1, GetNewDefaultUVGen());
+    }
+    void GetUVTransform(Matrix3& uvtrans) override {
+        if (uvGen) uvGen->GetUVTransform(uvtrans);
+    }
+    int GetTextureTiling() override {
+        return uvGen ? uvGen->GetTextureTiling() : 0;
+    }
+    int GetUVWSource() override {
+        return uvGen ? uvGen->GetUVWSource() : 0;
+    }
+    UVGen* GetTheUVGen() override { return uvGen; }
+    ULONG LocalRequirements(int subMtlNum) override {
+        return uvGen ? uvGen->Requirements(subMtlNum) : 0;
+    }
 
     AColor EvalColor(ShadeContext&) override { return AColor(0.5f, 0.5f, 0.5f, 1.0f); }
     float EvalMono(ShadeContext& sc) override { return Intens(EvalColor(sc)); }

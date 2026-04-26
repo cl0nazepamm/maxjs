@@ -9754,7 +9754,8 @@ public:
     }
 
     void QueueFastFlush() {
-        if (!hwnd_ || dirty_ || fastFlushPosted_) return;
+        if (!hwnd_ || fastFlushPosted_) return;
+        if (dirty_ && !CanFlushFastPathDuringPendingFullSync()) return;
         fastFlushPosted_ = true;
         if (!PostMessage(hwnd_, WM_FAST_FLUSH, 0, 0)) {
             fastFlushPosted_ = false;
@@ -10093,6 +10094,7 @@ public:
     }
 
     static constexpr ULONGLONG kInteractiveCooldownMs = 250;
+    static constexpr ULONGLONG kFullSyncInteractiveDeferMs = 650;
     static constexpr ULONGLONG kMaterialInteractiveCooldownMs = 400;
     static constexpr ULONGLONG kMaterialLivePollIntervalMs = 50;
     static constexpr size_t kMaxFastFlushHandlesPerPass = 128;
@@ -10187,6 +10189,16 @@ public:
         return lastInteractionTick_ != 0 && (now - lastInteractionTick_) <= kInteractiveCooldownMs;
     }
 
+    bool ShouldDeferFullSyncForInteraction(ULONGLONG now) const {
+        return lastInteractionTick_ != 0 &&
+               (now - lastInteractionTick_) <= kFullSyncInteractiveDeferMs;
+    }
+
+    bool CanFlushFastPathDuringPendingFullSync() const {
+        if (!dirty_) return true;
+        return ShouldDeferFullSyncForInteraction(GetTickCount64());
+    }
+
     bool ShouldRunInteractiveMaterialChecks() const {
         const ULONGLONG now = GetTickCount64();
         return lastMaterialInteractionTick_ != 0 &&
@@ -10213,6 +10225,14 @@ public:
         if (editObj->GetInterface(EPOLY_MOD_INTERFACE) != nullptr) return false;
         if (editObj->GetInterface(EPOLY_INTERFACE) != nullptr) return false;
         return true;
+    }
+
+    void PollInteractiveFastPathWhileFullSyncDeferred() {
+        CheckSkinnedGeometryLive();
+        CheckSelectedGeometryLive();
+        MarkSelectedTransformsDirty();
+        MarkCameraDirtyIfChanged();
+        if (ShouldRunInteractiveMaterialChecks()) CheckTrackedMaterialScalarsLive();
     }
 
     void ResetFastPathState(bool refreshCameraState = false) {
@@ -10904,8 +10924,17 @@ public:
         if (envPhase == 0) PollEnvFog();
 
         if (dirty_) {
-            // Debounce: wait for notifications to settle before expensive full sync
-            if (GetTickCount64() - dirtyStamp_ >= DIRTY_DEBOUNCE_MS) {
+            const ULONGLONG now = GetTickCount64();
+            const bool debounceReady =
+                dirtyStamp_ == 0 || (now - dirtyStamp_) >= DIRTY_DEBOUNCE_MS;
+            const bool deferForInteraction = ShouldDeferFullSyncForInteraction(now);
+
+            if (deferForInteraction) {
+                PollInteractiveFastPathWhileFullSyncDeferred();
+            }
+
+            // Debounce: wait for notifications and interactive drags to settle before expensive full sync.
+            if (debounceReady && !deferForInteraction) {
                 dirty_ = false;
                 if (useBinary_) SendFullSyncBinary(); else SendFullSync();
             }
@@ -11197,7 +11226,8 @@ public:
     void FlushFastPath() {
         fastFlushPosted_ = false;
 
-        if (!jsReady_ || !webview_ || dirty_) return;
+        if (!jsReady_ || !webview_) return;
+        if (dirty_ && !CanFlushFastPathDuringPendingFullSync()) return;
         if (!hwnd_ || !IsWindowVisible(hwnd_)) return;
 
         // Check for lights/splats/audios BEFORE batching to ensure consistent protocol

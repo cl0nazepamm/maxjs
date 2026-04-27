@@ -131,7 +131,7 @@ export function createHTMLTexture(THREE, url, options = {}) {
         host = document.createElement('iframe');
         host.style.cssText =
             'width:' + width + 'px;height:' + height + 'px;' +
-            'border:0;display:block;background:#000;';
+            'border:0;display:block;background:#000;pointer-events:auto;';
         // Fetch HTML text and inject via srcdoc — the iframe's document
         // then lives at about:srcdoc and is same-origin with the parent,
         // avoiding cross-origin-frame blocks from loading an asset URL.
@@ -155,7 +155,7 @@ export function createHTMLTexture(THREE, url, options = {}) {
         host.className = 'maxjs-html-texture-host';
         host.style.cssText =
             'width:' + width + 'px;height:' + height + 'px;' +
-            'box-sizing:border-box;overflow:hidden;background:#000;color:#fff;';
+            'box-sizing:border-box;overflow:hidden;background:#000;color:#fff;pointer-events:auto;';
     }
     canvas.appendChild(host);
     document.body.appendChild(wrap);
@@ -366,6 +366,15 @@ function hitTestHost(host, px, py) {
     let hit = null;
     const all = sr.querySelectorAll('*');
     for (const el of all) {
+        const style = window.getComputedStyle(el);
+        if (
+            style.display === 'none' ||
+            style.visibility === 'hidden' ||
+            style.visibility === 'collapse' ||
+            style.pointerEvents === 'none'
+        ) {
+            continue;
+        }
         const w = el.offsetWidth, h = el.offsetHeight;
         if (!w || !h) continue;
         const { x, y } = offsetWithinHost(el, host);
@@ -426,6 +435,7 @@ export function attachHTMLClickForwarding(THREE, renderer, getCameraScene) {
     // Dblclick tracker.
     let lastClickTarget = null;
     let lastClickTime = 0;
+    let suppressNativeClickUntil = 0;
     const DBLCLICK_MS = 400;
     // Movement beyond this (in HTML pixels) between down and up cancels the
     // click — matches browser convention for "this was a drag, not a tap."
@@ -481,14 +491,26 @@ export function attachHTMLClickForwarding(THREE, renderer, getCameraScene) {
         return null;
     }
 
-    function baseInit(px, py, ev, buttons) {
+    function eventWindowFor(target) {
+        return target?.ownerDocument?.defaultView || window;
+    }
+
+    function blockCanvasEvent(event) {
+        event.preventDefault();
+        event.stopPropagation();
+        if (typeof event.stopImmediatePropagation === 'function') {
+            event.stopImmediatePropagation();
+        }
+    }
+
+    function baseInit(target, px, py, ev, buttons) {
         const ix = Math.round(px);
         const iy = Math.round(py);
         return {
             bubbles: true,
             cancelable: true,
             composed: true,
-            view: window,
+            view: eventWindowFor(target),
             clientX: ix, clientY: iy,
             screenX: ix, screenY: iy,
             pageX: ix, pageY: iy,
@@ -502,17 +524,21 @@ export function attachHTMLClickForwarding(THREE, renderer, getCameraScene) {
     }
 
     function dispatchPointer(target, type, px, py, ev, buttons, pointerId) {
-        const init = baseInit(px, py, ev, buttons);
+        const init = baseInit(target, px, py, ev, buttons);
         init.pointerId = pointerId ?? 1;
         init.pointerType = 'mouse';
         init.isPrimary = true;
-        target.dispatchEvent(new PointerEvent(type, init));
+        const view = eventWindowFor(target);
+        const EventCtor = view.PointerEvent || PointerEvent;
+        target.dispatchEvent(new EventCtor(type, init));
     }
 
     function dispatchMouse(target, type, px, py, ev, buttons, detail) {
-        const init = baseInit(px, py, ev, buttons);
+        const init = baseInit(target, px, py, ev, buttons);
         init.detail = detail || 0;
-        target.dispatchEvent(new MouseEvent(type, init));
+        const view = eventWindowFor(target);
+        const EventCtor = view.MouseEvent || MouseEvent;
+        target.dispatchEvent(new EventCtor(type, init));
     }
 
     function onPointerDown(event) {
@@ -524,10 +550,8 @@ export function attachHTMLClickForwarding(THREE, renderer, getCameraScene) {
 
         // Block OrbitControls / camera listeners on the same canvas from
         // treating this press as the start of a rotate/pan gesture.
-        event.stopPropagation();
-        if (typeof event.stopImmediatePropagation === 'function') {
-            event.stopImmediatePropagation();
-        }
+        blockCanvasEvent(event);
+        suppressNativeClickUntil = (typeof performance !== 'undefined' ? performance.now() : Date.now()) + 800;
 
         active = {
             mesh: pick.mesh,
@@ -550,9 +574,9 @@ export function attachHTMLClickForwarding(THREE, renderer, getCameraScene) {
 
     function onPointerMove(event) {
         if (!active) return;
+        blockCanvasEvent(event);
         const pick = pickHTMLTexture(event, active.mesh);
         if (!pick) return; // pointer slid off the htmltex mesh — freeze
-        event.stopPropagation();
 
         const { px, py } = pick;
         if (
@@ -574,7 +598,8 @@ export function attachHTMLClickForwarding(THREE, renderer, getCameraScene) {
 
     function onPointerUp(event) {
         if (!active) return;
-        event.stopPropagation();
+        blockCanvasEvent(event);
+        suppressNativeClickUntil = (typeof performance !== 'undefined' ? performance.now() : Date.now()) + 800;
         try { el.releasePointerCapture?.(event.pointerId); } catch (_) { /* ignore */ }
 
         const pick = pickHTMLTexture(event, active.mesh);
@@ -592,6 +617,7 @@ export function attachHTMLClickForwarding(THREE, renderer, getCameraScene) {
         // Browser click rule: fire click only if the release lands on the
         // same target (or its subtree) and the press wasn't a drag.
         const sameTarget =
+            !pick ||
             releaseTarget === active.startTarget ||
             active.startTarget.contains?.(releaseTarget) ||
             releaseTarget.contains?.(active.startTarget);
@@ -622,9 +648,16 @@ export function attachHTMLClickForwarding(THREE, renderer, getCameraScene) {
 
     function onPointerCancel(event) {
         if (!active) return;
+        blockCanvasEvent(event);
         try { el.releasePointerCapture?.(event.pointerId); } catch (_) { /* ignore */ }
         dispatchPointer(active.startTarget, 'pointercancel', active.lastPx, active.lastPy, event, 0, active.pointerId);
         active = null;
+    }
+
+    function onNativeClick(event) {
+        const now = (typeof performance !== 'undefined') ? performance.now() : Date.now();
+        if (now > suppressNativeClickUntil) return;
+        blockCanvasEvent(event);
     }
 
     // Capture phase so we run before OrbitControls / other gesture handlers
@@ -634,12 +667,14 @@ export function attachHTMLClickForwarding(THREE, renderer, getCameraScene) {
     el.addEventListener('pointermove', onPointerMove, true);
     el.addEventListener('pointerup', onPointerUp, true);
     el.addEventListener('pointercancel', onPointerCancel, true);
+    el.addEventListener('click', onNativeClick, true);
 
     return () => {
         el.removeEventListener('pointerdown', onPointerDown, true);
         el.removeEventListener('pointermove', onPointerMove, true);
         el.removeEventListener('pointerup', onPointerUp, true);
         el.removeEventListener('pointercancel', onPointerCancel, true);
+        el.removeEventListener('click', onNativeClick, true);
     };
 }
 

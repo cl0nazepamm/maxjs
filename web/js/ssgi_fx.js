@@ -1104,16 +1104,53 @@ export function createSSGIController({
     let ps1SceneDirty = true;
     const ps1SavedNodes = new Map();
 
+    function ps1SavedVertexNode(saved) {
+        return saved && typeof saved === 'object' && Object.prototype.hasOwnProperty.call(saved, 'vertexNode')
+            ? saved.vertexNode
+            : saved;
+    }
+
+    function restorePS1Material(mat) {
+        if (!ps1SavedNodes.has(mat)) return;
+        mat.vertexNode = ps1SavedVertexNode(ps1SavedNodes.get(mat));
+        ps1SavedNodes.delete(mat);
+    }
+
+    function hasPS1ExcludedToken(value) {
+        const text = String(value || '').toLowerCase();
+        return /(^|[_\-\s])(sky|skydome|skybox|background|backdrop|environment|env)([_\-\s]|$)/.test(text);
+    }
+
+    function shouldSkipPS1Object(obj) {
+        if (!obj || (!obj.isMesh && !obj.isSkinnedMesh && !obj.isInstancedMesh)) return true;
+        const data = obj.userData || {};
+        if (data.maxjsNoPS1Wiggle || data.maxjsSky || data.maxjsBackground || data.maxjsBackdrop) return true;
+        if (obj.isSky || obj.isSkyMesh || hasPS1ExcludedToken(obj.name) || hasPS1ExcludedToken(obj.type)) return true;
+        return false;
+    }
+
+    function shouldSkipPS1Material(mat) {
+        if (!mat) return true;
+        const data = mat.userData || {};
+        if (data.maxjsNoPS1Wiggle || data.maxjsSky || data.maxjsBackground || data.maxjsBackdrop) return true;
+        return hasPS1ExcludedToken(mat.name) || hasPS1ExcludedToken(mat.type);
+    }
+
     function enablePS1Wiggle(strength = 5.0) {
         ps1SnapStrength.value = Math.max(1.0, strength);
         ps1WiggleActive = true;
         scene.traverse(obj => {
+            const skipObject = shouldSkipPS1Object(obj);
             const mats = obj.material
                 ? (Array.isArray(obj.material) ? obj.material : [obj.material])
                 : [];
             for (const mat of mats) {
+                if (skipObject || shouldSkipPS1Material(mat)) {
+                    restorePS1Material(mat);
+                    continue;
+                }
                 if (ps1SavedNodes.has(mat)) continue;
-                ps1SavedNodes.set(mat, mat.vertexNode || null);
+                ps1SavedNodes.set(mat, { vertexNode: mat.vertexNode || null, object: obj });
                 mat.vertexNode = ps1VertexSnap;
             }
         });
@@ -1122,8 +1159,8 @@ export function createSSGIController({
     function disablePS1Wiggle() {
         if (!ps1WiggleActive && ps1SavedNodes.size === 0) return;
         ps1WiggleActive = false;
-        for (const [mat, savedNode] of ps1SavedNodes) {
-            mat.vertexNode = savedNode;
+        for (const [mat, saved] of ps1SavedNodes) {
+            mat.vertexNode = ps1SavedVertexNode(saved);
         }
         ps1SavedNodes.clear();
     }

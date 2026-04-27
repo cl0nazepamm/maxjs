@@ -82,6 +82,9 @@ function cloneJsonValue(value) {
     return value == null ? value : JSON.parse(JSON.stringify(value));
 }
 
+const LAYER_SOURCE_INLINE = 'inline';
+const LAYER_SOURCE_PROJECT = 'project';
+
 function manifest404(error) {
     return String(error?.message || error).includes('404');
 }
@@ -143,8 +146,8 @@ export function createProjectRuntime({ layerManager, bridge, perfHud, debugLog =
     let nextRequestId = 1;
     let suppressProjectReloadCount = 0;
 
-    const activeLayerIds = new Set();
-    const activeProjectLayers = new Map();
+    const activeProjectLayerIds = new Set();
+    const mountedProjectLayers = new Map();
     const inlineLayerState = new Map();
     const listeners = new Set();
     const pendingHostActions = new Map();
@@ -196,12 +199,12 @@ export function createProjectRuntime({ layerManager, bridge, perfHud, debugLog =
         } catch (err) {
             debugWarn('[ProjectRuntime] layer remove failed', id, err);
         }
-        activeLayerIds.delete(id);
-        activeProjectLayers.delete(id);
+        activeProjectLayerIds.delete(id);
+        mountedProjectLayers.delete(id);
     }
 
     function clearProjectLayers() {
-        for (const id of [...activeLayerIds]) {
+        for (const id of [...activeProjectLayerIds]) {
             removeProjectLayer(id);
         }
     }
@@ -371,7 +374,7 @@ export function createProjectRuntime({ layerManager, bridge, perfHud, debugLog =
             {
                 name: entry.name || layerId,
                 code: moduleUrl,
-                source: 'project',
+                source: LAYER_SOURCE_PROJECT,
                 entry: entryPath,
             },
         );
@@ -380,8 +383,8 @@ export function createProjectRuntime({ layerManager, bridge, perfHud, debugLog =
             throw new Error(result.error);
         }
 
-        activeLayerIds.add(layerId);
-        activeProjectLayers.set(layerId, {
+        activeProjectLayerIds.add(layerId);
+        mountedProjectLayers.set(layerId, {
             signature: entry.signature,
             moduleUrl,
         });
@@ -395,8 +398,8 @@ export function createProjectRuntime({ layerManager, bridge, perfHud, debugLog =
         // Drop any project-source layers from the legacy active sets so
         // they don't shadow the inline mount path.
         manifestState = manifest;
-        if (activeLayerIds.size > 0) {
-            for (const id of [...activeLayerIds]) {
+        if (activeProjectLayerIds.size > 0) {
+            for (const id of [...activeProjectLayerIds]) {
                 if (!mountedInlineLayers.has(id)) removeProjectLayer(id);
             }
         }
@@ -637,7 +640,7 @@ export function createProjectRuntime({ layerManager, bridge, perfHud, debugLog =
                 rawId: state.id || splitInlineLayerKey(key).rawId,
                 name: runtime?.name || state.name || state.id || key,
                 entry: inlineEntryRelPath(state.id || splitInlineLayerKey(key).rawId, folder),
-                source: 'project',
+                source: LAYER_SOURCE_INLINE,
                 persisted: true,
                 folder,
                 priority,
@@ -661,7 +664,7 @@ export function createProjectRuntime({ layerManager, bridge, perfHud, debugLog =
     function listInlineEntries() {
         const runtimeLayers = new Map(
             layerManager.list()
-                .filter(layer => layer.source !== 'project')
+                .filter(layer => layer.source === LAYER_SOURCE_INLINE)
                 .map(layer => [layer.id, layer]),
         );
 
@@ -673,7 +676,7 @@ export function createProjectRuntime({ layerManager, bridge, perfHud, debugLog =
                 id: key,
                 rawId: state.id || splitInlineLayerKey(key).rawId,
                 name: runtime?.name || state.name || state.id || key,
-                source: 'inline',
+                source: LAYER_SOURCE_INLINE,
                 persisted: true,
                 enabled: state.enabled !== false,
                 active: runtime?.active ?? false,
@@ -693,7 +696,7 @@ export function createProjectRuntime({ layerManager, bridge, perfHud, debugLog =
             entries.push({
                 id: runtime.id,
                 name: runtime.name || runtime.id,
-                source: 'inline',
+                source: LAYER_SOURCE_INLINE,
                 persisted: false,
                 enabled: true,
                 active: runtime.active ?? true,
@@ -819,7 +822,7 @@ export function createProjectRuntime({ layerManager, bridge, perfHud, debugLog =
             {
                 name: name || rawId,
                 code: moduleUrl,
-                source: 'project',
+                source: LAYER_SOURCE_INLINE,
                 entry: inlineEntryRelPath(rawId, folder),
                 folder,
                 priority,
@@ -957,7 +960,9 @@ export function createProjectRuntime({ layerManager, bridge, perfHud, debugLog =
                 pollMs,
                 sceneSaved,
                 manifestExists,
-                activeLayers: Array.from(activeLayerIds),
+                activeLayers: layerManager.list().filter(layer => layer.active).map(layer => layer.id),
+                activeInlineLayers: Array.from(mountedInlineLayers.keys()),
+                activeProjectLayers: Array.from(activeProjectLayerIds),
                 manifest: manifestState,
             };
         },

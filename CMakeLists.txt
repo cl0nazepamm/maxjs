@@ -82,6 +82,7 @@ target_link_libraries(${PLUGIN_NAME} PRIVATE
     comctl32.lib
     comdlg32.lib
     shlwapi.lib
+    windowscodecs.lib
     # WebView2
     WebView2LoaderStatic.lib
 )

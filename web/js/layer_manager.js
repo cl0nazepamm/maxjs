@@ -2207,6 +2207,7 @@ export function createLayerManager({
                 id: layer.id,
                 name: layer.name,
                 source: layer.source,
+                entry: layer.entry || '',
                 folder: layer.folder || '',
                 priority: Number.isFinite(layer.priority) ? layer.priority : 100,
                 active: layer.active,

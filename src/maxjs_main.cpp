@@ -712,6 +712,95 @@ static const wchar_t* GetMimeTypeForPath(const std::wstring& path) {
     return L"application/octet-stream";
 }
 
+static bool IsTiffPath(const std::wstring& path) {
+    const wchar_t* ext = PathFindExtensionW(path.c_str());
+    return ext && (_wcsicmp(ext, L".tif") == 0 || _wcsicmp(ext, L".tiff") == 0);
+}
+
+static bool CreatePngStreamFromWicImage(const std::wstring& path, IStream** outStream) {
+    if (!outStream) return false;
+    *outStream = nullptr;
+
+    ComPtr<IWICImagingFactory> wic;
+    if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr,
+        CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic))) || !wic) {
+        return false;
+    }
+
+    ComPtr<IWICBitmapDecoder> decoder;
+    if (FAILED(wic->CreateDecoderFromFilename(path.c_str(), nullptr, GENERIC_READ,
+        WICDecodeMetadataCacheOnLoad, &decoder)) || !decoder) {
+        return false;
+    }
+
+    ComPtr<IWICBitmapFrameDecode> sourceFrame;
+    if (FAILED(decoder->GetFrame(0, &sourceFrame)) || !sourceFrame) {
+        return false;
+    }
+
+    UINT width = 0, height = 0;
+    if (FAILED(sourceFrame->GetSize(&width, &height)) || width == 0 || height == 0) {
+        return false;
+    }
+
+    ComPtr<IWICFormatConverter> converter;
+    if (FAILED(wic->CreateFormatConverter(&converter)) || !converter) {
+        return false;
+    }
+    if (FAILED(converter->Initialize(sourceFrame.Get(),
+        GUID_WICPixelFormat32bppRGBA,
+        WICBitmapDitherTypeNone,
+        nullptr,
+        0.0,
+        WICBitmapPaletteTypeCustom))) {
+        return false;
+    }
+
+    ComPtr<IStream> pngStream;
+    if (FAILED(CreateStreamOnHGlobal(nullptr, TRUE, &pngStream)) || !pngStream) {
+        return false;
+    }
+
+    ComPtr<IWICBitmapEncoder> encoder;
+    if (FAILED(wic->CreateEncoder(GUID_ContainerFormatPng, nullptr, &encoder)) || !encoder) {
+        return false;
+    }
+    if (FAILED(encoder->Initialize(pngStream.Get(), WICBitmapEncoderNoCache))) {
+        return false;
+    }
+
+    ComPtr<IWICBitmapFrameEncode> encodeFrame;
+    ComPtr<IPropertyBag2> frameProps;
+    if (FAILED(encoder->CreateNewFrame(&encodeFrame, &frameProps)) || !encodeFrame) {
+        return false;
+    }
+    if (FAILED(encodeFrame->Initialize(frameProps.Get()))) {
+        return false;
+    }
+    if (FAILED(encodeFrame->SetSize(width, height))) {
+        return false;
+    }
+
+    WICPixelFormatGUID pixelFormat = GUID_WICPixelFormat32bppRGBA;
+    if (FAILED(encodeFrame->SetPixelFormat(&pixelFormat))) {
+        return false;
+    }
+    if (FAILED(encodeFrame->WriteSource(converter.Get(), nullptr))) {
+        return false;
+    }
+    if (FAILED(encodeFrame->Commit()) || FAILED(encoder->Commit())) {
+        return false;
+    }
+
+    LARGE_INTEGER zero = {};
+    if (FAILED(pngStream->Seek(zero, STREAM_SEEK_SET, nullptr))) {
+        return false;
+    }
+
+    *outStream = pngStream.Detach();
+    return true;
+}
+
 static float SafeJsonFloat(float value, float fallback = 0.0f) {
     if (!std::isfinite(value)) return fallback;
     if (std::fabs(value) > 1.0e15f) return fallback;
@@ -1611,6 +1700,14 @@ static bool IsUtilityMaterialModel(const std::wstring& materialModel) {
            materialModel == L"MeshBackdropNodeMaterial";
 }
 
+static StdMat* AsLegacyStandardMaterial(Mtl* mtl) {
+    return mtl ? dynamic_cast<StdMat*>(mtl) : nullptr;
+}
+
+static bool IsLegacyStandardMaterial(Mtl* mtl) {
+    return AsLegacyStandardMaterial(mtl) != nullptr;
+}
+
 #define PHYSICAL_MTL_CLASS_ID Class_ID(1030429932, 3735928833)
 
 static bool IsSupportedMaterial(Mtl* mtl) {
@@ -1620,7 +1717,8 @@ static bool IsSupportedMaterial(Mtl* mtl) {
         || cid == USD_PREVIEW_SURFACE_CLASS_ID || cid == PHYSICAL_MTL_CLASS_ID
         || cid == VRAYMTL_CLASS_ID
         || cid == OPENPBR_MTL_CLASS_ID
-        || IsMaterialXMaterialClass(cid);
+        || IsMaterialXMaterialClass(cid)
+        || IsLegacyStandardMaterial(mtl);
 }
 
 // Find ThreeJS or glTF Material in material tree — uses ClassID only
@@ -2650,6 +2748,79 @@ static bool TrySplitCompositeAO(Texmap* map, TimeValue t,
            ExtractMaterialTexture(layer2, aoPath, aoXf);
 }
 
+static void ExtractLegacyStandardMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
+    StdMat* stdMtl = AsLegacyStandardMaterial(mtl);
+    if (!stdMtl) return;
+
+    MSTR name = mtl->GetName();
+    d.mtlName = name.data();
+    d.materialModel = L"MeshLambertMaterial";
+
+    const Color diffuse = stdMtl->GetDiffuse(t);
+    d.color[0] = diffuse.r;
+    d.color[1] = diffuse.g;
+    d.color[2] = diffuse.b;
+    d.opacity = std::clamp(stdMtl->GetOpacity(t), 0.0f, 1.0f);
+    d.roughness = 1.0f;
+    d.metalness = 0.0f;
+    d.doubleSided = stdMtl->GetTwoSided() != FALSE;
+    d.wireframe = stdMtl->GetWire() != FALSE;
+    d.reflectivity = 0.0f;
+
+    if (StdMat2* stdMtl2 = dynamic_cast<StdMat2*>(stdMtl)) {
+        if (stdMtl2->GetSelfIllumColorOn()) {
+            const Color em = stdMtl2->GetSelfIllumColor(t);
+            d.emission[0] = em.r;
+            d.emission[1] = em.g;
+            d.emission[2] = em.b;
+            d.emIntensity = (em.r + em.g + em.b) > 1.0e-4f ? 1.0f : 0.0f;
+        }
+    }
+    if (d.emIntensity <= 0.0f) {
+        const float selfIllum = std::clamp(stdMtl->GetSelfIllum(t), 0.0f, 1.0f);
+        if (selfIllum > 1.0e-4f) {
+            d.emission[0] = d.color[0];
+            d.emission[1] = d.color[1];
+            d.emission[2] = d.color[2];
+            d.emIntensity = selfIllum;
+        }
+    }
+
+    auto getStdMap = [&](int id) -> Texmap* {
+        if (!stdMtl->MapEnabled(id)) return nullptr;
+        if (id < 0 || id >= mtl->NumSubTexmaps()) return nullptr;
+        return mtl->GetSubTexmap(id);
+    };
+    auto readStdMap = [&](int id, std::wstring& outPath, MaxJSPBR::TexTransform& outXf) {
+        outPath.clear();
+        outXf = {};
+        ExtractMaterialTexture(getStdMap(id), outPath, outXf);
+    };
+
+    Texmap* diffuseMap = getStdMap(ID_DI);
+    if (!diffuseMap || !TrySplitCompositeAO(diffuseMap, t, d.colorMap, d.colorMapTransform, d.aoMap, d.aoMapTransform))
+        readStdMap(ID_DI, d.colorMap, d.colorMapTransform);
+    d.colorMapStrength = std::clamp(stdMtl->GetTexmapAmt(ID_DI, t), 0.0f, 1.0f);
+
+    readStdMap(ID_OP, d.opacityMap, d.opacityMapTransform);
+    d.opacityMapStrength = std::clamp(stdMtl->GetTexmapAmt(ID_OP, t), 0.0f, 1.0f);
+    readStdMap(ID_SI, d.emissionMap, d.emissionMapTransform);
+    d.emissiveMapStrength = std::clamp(stdMtl->GetTexmapAmt(ID_SI, t), 0.0f, 1.0f);
+    readStdMap(ID_DP, d.displacementMap, d.displacementMapTransform);
+    d.displacementScale = std::clamp(stdMtl->GetTexmapAmt(ID_DP, t), 0.0f, 1.0f);
+
+    if (Texmap* bumpSlot = getStdMap(ID_BU)) {
+        ExtractWrappedNormalBumpMaps(
+            bumpSlot,
+            d.normalMap,
+            d.normalMapTransform,
+            d.bumpMap,
+            d.bumpMapTransform
+        );
+        d.bumpScale = std::clamp(stdMtl->GetTexmapAmt(ID_BU, t), 0.0f, 1.0f);
+    }
+}
+
 // Extract PBR from 3ds Max Physical Material
 static void ExtractPhysicalMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
     MSTR name = mtl->GetName();
@@ -3244,6 +3415,8 @@ static void ExtractPBRFromMtl(Mtl* mtl, INode* node, TimeValue t, MaxJSPBR& d) {
                 ExtractVRayMtl(found, t, d);
             else if (cid == OPENPBR_MTL_CLASS_ID)
                 ExtractOpenPBRMtl(found, t, d);
+            else if (IsLegacyStandardMaterial(found))
+                ExtractLegacyStandardMtl(found, t, d);
             else
                 ExtractGltfMtl(found, t, d);
             return;
@@ -3295,6 +3468,8 @@ static void ExtractPBR(INode* node, TimeValue t, MaxJSPBR& d) {
             ExtractVRayMtl(found, t, d);
         else if (cid == OPENPBR_MTL_CLASS_ID)
             ExtractOpenPBRMtl(found, t, d);
+        else if (IsLegacyStandardMaterial(found))
+            ExtractLegacyStandardMtl(found, t, d);
         else
             ExtractGltfMtl(found, t, d);
         return;
@@ -5796,14 +5971,23 @@ static bool IsDerivedObjectRef(Object* obj) {
             obj->SuperClassID() == GEN_DERIVOB_CLASS_ID);
 }
 
-static bool NodeHasModifierStack(INode* node) {
-    Object* obj = node ? node->GetObjectRef() : nullptr;
+static bool ObjectChainHasModifierStack(Object* obj) {
     while (IsDerivedObjectRef(obj)) {
         auto* derived = static_cast<IDerivedObject*>(obj);
         if (derived->NumModifiers() > 0) return true;
         obj = derived->GetObjRef();
     }
     return false;
+}
+
+static bool NodeHasModifierStack(INode* node) {
+    if (!node) return false;
+    // Space warps such as Path Deform can live on the node WSM stack instead
+    // of the object ref stack; those still need live deform polling.
+    if (IDerivedObject* wsm = node->GetWSMDerivedObject()) {
+        if (ObjectChainHasModifierStack(static_cast<Object*>(wsm))) return true;
+    }
+    return ObjectChainHasModifierStack(node->GetObjectRef());
 }
 
 // Check base object ClassID (EvalWorldState returns collapsed mesh, not Forest Pack)
@@ -6952,8 +7136,13 @@ public:
                     }
 
                     ComPtr<IStream> stream;
-                    if (FAILED(SHCreateStreamOnFileEx(decodedPath.c_str(), STGM_READ | STGM_SHARE_DENY_NONE,
-                        FILE_ATTRIBUTE_NORMAL, FALSE, nullptr, &stream)) || !stream) {
+                    bool transcodedTiff = false;
+                    if (IsTiffPath(decodedPath)) {
+                        transcodedTiff = CreatePngStreamFromWicImage(decodedPath, &stream) && stream;
+                    }
+
+                    if (!stream && (FAILED(SHCreateStreamOnFileEx(decodedPath.c_str(), STGM_READ | STGM_SHARE_DENY_NONE,
+                        FILE_ATTRIBUTE_NORMAL, FALSE, nullptr, &stream)) || !stream)) {
                         ComPtr<ICoreWebView2WebResourceResponse> response;
                         env_->CreateWebResourceResponse(nullptr, 500, L"Open Failed",
                             L"Content-Type: text/plain\r\nCache-Control: no-store\r\nAccess-Control-Allow-Origin: https://maxjs.local\r\nCross-Origin-Resource-Policy: cross-origin\r\n", &response);
@@ -6962,8 +7151,9 @@ public:
                     }
 
                     std::wstring headers = L"Content-Type: ";
-                    headers += GetMimeTypeForPath(decodedPath);
+                    headers += transcodedTiff ? L"image/png" : GetMimeTypeForPath(decodedPath);
                     headers += L"\r\nCache-Control: no-store\r\nAccess-Control-Allow-Origin: https://maxjs.local\r\nCross-Origin-Resource-Policy: cross-origin\r\n";
+                    if (transcodedTiff) headers += L"X-MaxJS-Transcoded-From: image/tiff\r\n";
 
                     ComPtr<ICoreWebView2WebResourceResponse> response;
                     if (SUCCEEDED(env_->CreateWebResourceResponse(stream.Get(), 200, L"OK", headers.c_str(), &response)) && response) {
@@ -13698,6 +13888,8 @@ public:
                 first = false;
                 geomHandles_.insert(handle);
                 if (FindModifierOnNode(node, SKIN_CLASSID)) skinnedHandles_.insert(handle);
+                if (NodeHasModifierStack(node)) deformHandles_.insert(handle);
+                else deformHandles_.erase(handle);
             } else {
                 std::vector<float> verts, uvs, norms;
                 std::vector<VertexColorAttributeRecord> vertexColors;
@@ -13961,6 +14153,8 @@ public:
                     geos.push_back(std::move(ng));
                     geomHandles_.insert(node->GetHandle());
                     if (FindModifierOnNode(node, SKIN_CLASSID)) skinnedHandles_.insert(node->GetHandle());
+                    if (NodeHasModifierStack(node)) deformHandles_.insert(node->GetHandle());
+                    else deformHandles_.erase(node->GetHandle());
                 } else {
                     const bool isSkinned = FindModifierOnNode(node, SKIN_CLASSID) != nullptr;
                     std::vector<int> controlIdx;

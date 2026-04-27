@@ -11,6 +11,8 @@
         :root {
             --rail-left: 8px;
             --rail-width: 54px;
+            --dock-right: 8px;
+            --dock-width: 240px;
             --rail-accent: rgba(240, 240, 240, 0.9);
             --rail-bg: rgba(20, 20, 22, 0.78);
             --rail-border: rgba(255, 255, 255, 0.07);
@@ -105,9 +107,10 @@
         #rightDock {
             position: fixed;
             top: 8px;
-            right: 8px;
+            right: var(--dock-right);
             bottom: 8px;
-            width: 240px;
+            width: var(--dock-width);
+            max-width: calc(100vw - 16px);
             display: flex;
             flex-direction: column;
             transition: transform 0.22s cubic-bezier(0.2, 0.7, 0.2, 1);
@@ -168,7 +171,7 @@
                         right 0.22s cubic-bezier(0.2, 0.7, 0.2, 1);
         }
         .rail-drag-handle { left: calc(var(--rail-left) + var(--rail-width)); }
-        .dock-drag-handle { right: 248px; }
+        .dock-drag-handle { right: calc(var(--dock-right) + var(--dock-width)); }
         #rightRail.is-hidden ~ .rail-drag-handle { left: 12px; }
         #rightDock.is-hidden ~ .dock-drag-handle { right: 12px; }
         .rail-drag-handle::after,
@@ -1742,6 +1745,7 @@
         const exrLoader = new EXRLoader();
         textureLoader.setCrossOrigin?.('anonymous');
         rgbeLoader.setCrossOrigin?.('anonymous');
+        exrLoader.setCrossOrigin?.('anonymous');
         const PMREMGeneratorCtor = String(rendererBackendLabel || '').startsWith('WebGL2')
             ? THREE_STD.PMREMGenerator
             : THREE.PMREMGenerator;
@@ -1773,6 +1777,31 @@
             }
             texture.userData.maxjsPMREMRenderTarget = renderTarget;
             return texture;
+        }
+
+        function getTextureExtension(source) {
+            try {
+                const url = new URL(String(source || ''), window.location.href);
+                return (url.pathname.split('.').pop() || '').toLowerCase();
+            } catch {
+                const clean = String(source || '').split(/[?#]/, 1)[0];
+                return (clean.split('.').pop() || '').toLowerCase();
+            }
+        }
+
+        function loadEnvironmentTexture(url, sourceName, onLoad, onProgress, onError) {
+            const ext = getTextureExtension(sourceName || url);
+            const loader = ext === 'exr'
+                ? exrLoader
+                : (ext === 'hdr' ? rgbeLoader : textureLoader);
+
+            loader.load(url, (texture) => {
+                if (ext !== 'hdr' && ext !== 'exr') {
+                    texture.colorSpace = THREE.SRGBColorSpace;
+                }
+                texture.mapping = THREE.EquirectangularReflectionMapping;
+                onLoad(texture);
+            }, onProgress, onError);
         }
 
         const textureCache = new Map();
@@ -2754,12 +2783,11 @@
             hdriLoadGeneration += 1;
             const loadGeneration = hdriLoadGeneration;
 
-            rgbeLoader.load(hdriUrl, async (hdrTex) => {
+            loadEnvironmentTexture(hdriUrl, hdriUrl, async (hdrTex) => {
                 if (loadGeneration !== hdriLoadGeneration) {
                     hdrTex.dispose();
                     return;
                 }
-                hdrTex.mapping = THREE.EquirectangularReflectionMapping;
                 const previousEnvMap = currentHdriEnvMap;
                 const envMap = retainPMREMTexture(pmremGenerator.fromEquirectangular(hdrTex));
                 currentHdriEnvMap = envMap;
@@ -2850,15 +2878,11 @@
             if (!preserveEnabled) localHdriEnabled = true;
             void stashHdriFile(file);
 
-            const isExr = file.name.toLowerCase().endsWith('.exr');
-            const loader = isExr ? exrLoader : rgbeLoader;
-
             hdriLoadGeneration += 1;
             const loadGen = hdriLoadGeneration;
 
-            loader.load(localHdriObjectUrl, async (hdrTex) => {
+            loadEnvironmentTexture(localHdriObjectUrl, file.name, async (hdrTex) => {
                 if (loadGen !== hdriLoadGeneration) { hdrTex.dispose(); return; }
-                hdrTex.mapping = THREE.EquirectangularReflectionMapping;
                 localHdriEnvMap = retainPMREMTexture(pmremGenerator.fromEquirectangular(hdrTex));
                 applyLocalHDRIToScene();
                 currentHdriUrl = localHdriObjectUrl;
@@ -3497,10 +3521,53 @@
             return material;
         }
 
+        function finiteNumberOr(value, fallback) {
+            const n = Number(value);
+            return Number.isFinite(n) ? n : fallback;
+        }
+
+        function isBlackColorArray(value, epsilon = 1.0e-4) {
+            return Array.isArray(value)
+                && value.length >= 3
+                && Math.abs(finiteNumberOr(value[0], 1)) <= epsilon
+                && Math.abs(finiteNumberOr(value[1], 1)) <= epsilon
+                && Math.abs(finiteNumberOr(value[2], 1)) <= epsilon;
+        }
+
+        function hasMaterialMap(md, key) {
+            return typeof md?.[key] === 'string' && md[key].trim().length > 0;
+        }
+
+        function shouldRouteBlackSpecularToLambert(requestedModelName, md) {
+            if (
+                requestedModelName !== 'MeshPhysicalMaterial' &&
+                requestedModelName !== 'MeshStandardNodeMaterial'
+            ) {
+                return false;
+            }
+            if (hasMaterialMap(md, 'specIntMap') || hasMaterialMap(md, 'specColMap') || hasMaterialMap(md, 'specMap')) {
+                return false;
+            }
+            const blackSpecular =
+                isBlackColorArray(md.specularColor) ||
+                (md.specularIntensity != null && finiteNumberOr(md.specularIntensity, 1) <= 1.0e-4);
+            if (!blackSpecular) return false;
+
+            // Lambert intentionally drops PBR lobes. Only auto-route materials
+            // that are behaving as diffuse surfaces, not glass/metal/clearcoat.
+            return finiteNumberOr(md.metal, 0) <= 1.0e-4
+                && finiteNumberOr(md.clearcoat, 0) <= 1.0e-4
+                && finiteNumberOr(md.sheen, 0) <= 1.0e-4
+                && finiteNumberOr(md.iridescence, 0) <= 1.0e-4
+                && finiteNumberOr(md.transmission, 0) <= 1.0e-4
+                && finiteNumberOr(md.anisotropy, 0) <= 1.0e-4;
+        }
+
         function createMaterial(md) {
             const requestedModelName = md.model || 'MeshStandardMaterial';
+            const forceLambertForBlackSpecular = shouldRouteBlackSpecularToLambert(requestedModelName, md);
             const wantsMaterialXMaterial = requestedModelName === 'MaterialXMaterial';
-            const wantsUtilityMaterial = utilityMaterialModels.has(requestedModelName);
+            const wantsUtilityMaterial = forceLambertForBlackSpecular || utilityMaterialModels.has(requestedModelName);
             const wantsToonMaterial = requestedModelName === 'MeshToonMaterial';
             const wantsSSSMaterial = requestedModelName === 'MeshSSSNodeMaterial';
             const wantsTSLMaterial = requestedModelName === 'MeshTSLNodeMaterial';
@@ -3531,6 +3598,8 @@
                 typeof tslTexture === 'function';
             const runtimeModelName = wantsMaterialXMaterial
                 ? 'MaterialXMaterial'
+                : forceLambertForBlackSpecular
+                ? 'MeshLambertMaterial'
                 : wantsUtilityMaterial
                 ? ((hasUtilityCtor || canUseBackdropUtility) ? requestedModelName : 'MeshLambertMaterial')
                 : (canUseToonMaterial
@@ -3708,6 +3777,7 @@
                 template.userData.maxjsMaterialModel = runtimeModelName;
                 template.userData.maxjsUtilityMaterialFallback =
                     wantsUtilityMaterial && !(hasUtilityCtor || canUseBackdropUtility);
+                template.userData.maxjsLambertFromBlackSpecular = forceLambertForBlackSpecular;
                 template.userData.maxjsToonMaterialFallback =
                     wantsToonMaterial && !canUseToonMaterial;
                 template.userData.maxjsSSSMaterialFallback =
@@ -3863,6 +3933,55 @@
             const message = err?.message || String(err);
             console.error(`[MaxJS ${prefix}]`, err);
             setInfoText(`MaxJS - ${prefix}: ${message}`);
+        }
+
+        function typedArrayCanStore(array, expectedLength) {
+            try {
+                return !!array
+                    && array.length >= expectedLength
+                    && array.buffer
+                    && array.buffer.byteLength >= array.byteOffset + expectedLength * array.BYTES_PER_ELEMENT;
+            } catch {
+                return false;
+            }
+        }
+
+        function updateFloatGeometryAttribute(geometry, name, buffer, off, n, itemSize) {
+            if (!binInRange(buffer, off, n) || n % itemSize !== 0) {
+                console.warn('[MaxJS binary] Invalid attribute range for', name);
+                return false;
+            }
+            const source = new Float32Array(buffer, off, n);
+            const count = n / itemSize;
+            const current = geometry.getAttribute(name);
+            if (
+                current
+                && current.itemSize === itemSize
+                && current.count === count
+                && typedArrayCanStore(current.array, n)
+            ) {
+                current.array.set(source);
+                current.needsUpdate = true;
+                return true;
+            }
+            geometry.setAttribute(name, new THREE.BufferAttribute(new Float32Array(source), itemSize));
+            return true;
+        }
+
+        function updateGeometryIndexAttribute(geometry, buffer, off, n) {
+            if (!binInRange(buffer, off, n)) {
+                console.warn('[MaxJS binary] Invalid index range');
+                return false;
+            }
+            const source = new Int32Array(buffer, off, n);
+            const current = geometry.getIndex();
+            if (current && current.count === n && typedArrayCanStore(current.array, n)) {
+                current.array.set(source);
+                current.needsUpdate = true;
+                return true;
+            }
+            geometry.setIndex(new THREE.BufferAttribute(new Uint32Array(source), 1));
+            return true;
         }
 
         bridge.on('debug', msg => {
@@ -4058,34 +4177,18 @@
 
                             if (sameTopology) {
                                 // Hot path: copy positions into existing GPU buffer
-                                pos.array.set(new Float32Array(buf, meta.vOff, meta.vN));
-                                pos.needsUpdate = true;
+                                updateFloatGeometryAttribute(mesh.geometry, 'position', buf, meta.vOff, meta.vN, 3);
 
                                 if (hasIncomingIndex && existingIdx) {
-                                    existingIdx.array.set(new Int32Array(buf, meta.iOff, meta.iN));
-                                    existingIdx.needsUpdate = true;
+                                    updateGeometryIndexAttribute(mesh.geometry, buf, meta.iOff, meta.iN);
                                 }
 
                                 if (meta.uvOff != null && meta.uvN) {
-                                    const uvCount = meta.uvN / 2;
-                                    let uv = mesh.geometry.getAttribute('uv');
-                                    if (!uv || uv.count !== uvCount) {
-                                        mesh.geometry.setAttribute(
-                                            'uv',
-                                            new THREE.BufferAttribute(new Float32Array(buf, meta.uvOff, meta.uvN), 2),
-                                        );
-                                    } else {
-                                        uv.array.set(new Float32Array(buf, meta.uvOff, meta.uvN));
-                                        uv.needsUpdate = true;
-                                    }
+                                    updateFloatGeometryAttribute(mesh.geometry, 'uv', buf, meta.uvOff, meta.uvN, 2);
                                 }
 
                                 if (meta.nOff != null && meta.nN) {
-                                    const norm = mesh.geometry.getAttribute('normal');
-                                    if (norm && norm.count === meta.nN / 3) {
-                                        norm.array.set(new Float32Array(buf, meta.nOff, meta.nN));
-                                        norm.needsUpdate = true;
-                                    }
+                                    updateFloatGeometryAttribute(mesh.geometry, 'normal', buf, meta.nOff, meta.nN, 3);
                                 } else if (!meta.keepNormals) {
                                     scheduleNormals(mesh.geometry);
                                 }
@@ -5253,7 +5356,7 @@
                 const fastPath = current
                     && current.itemSize === entry.itemSize
                     && current.count === entry.count
-                    && current.array;
+                    && typedArrayCanStore(current.array, entry.n || 0);
 
                 if (fastPath) {
                     // In-place update — zero allocation. Copy from the shared
@@ -5357,6 +5460,32 @@
         }
 
         function applyMaterialScalar(mesh, material, materialIndex = null) {
+            const rebuildForBlackSpecularRoute = () => {
+                if (!mesh || !material) return false;
+                if (materialIndex != null) {
+                    if (!Array.isArray(mesh.material)) return false;
+                    const oldMaterial = mesh.material[materialIndex] ?? null;
+                    if (!oldMaterial) return false;
+                    const wantsRoute = shouldRouteBlackSpecularToLambert(material.model || 'MeshStandardMaterial', material);
+                    const isRouted = !!oldMaterial.userData?.maxjsLambertFromBlackSpecular;
+                    if (wantsRoute === isRouted) return false;
+                    const nextMaterials = mesh.material.slice();
+                    nextMaterials[materialIndex] = createMaterial(material);
+                    mesh.material = nextMaterials;
+                    if (!isCachedMaterialTemplate(oldMaterial)) disposeSceneMaterial(oldMaterial);
+                    return true;
+                }
+                if (Array.isArray(mesh.material)) return false;
+                const oldMaterial = mesh.material;
+                const wantsRoute = shouldRouteBlackSpecularToLambert(material.model || 'MeshStandardMaterial', material);
+                const isRouted = !!oldMaterial?.userData?.maxjsLambertFromBlackSpecular;
+                if (wantsRoute === isRouted) return false;
+                mesh.material = createMaterial(material);
+                if (!isCachedMaterialTemplate(oldMaterial)) disposeSceneMaterial(oldMaterial);
+                return true;
+            };
+            if (rebuildForBlackSpecularRoute()) return;
+
             const c = material?.color;
             const emissive = material?.emissive;
             const specularColor = material?.specularColor;
@@ -7786,8 +7915,13 @@
 
         function getLayerDetails(layer) {
             const details = [];
-            if (layer.source === 'project' && layer.entry) details.push(layer.entry);
-            if (layer.source === 'inline') details.push(`inlines/${layer.id}.js${layer.enabled === false ? '.disabled' : ''}`);
+            if (layer.entry) {
+                details.push(layer.source === 'inline' && layer.enabled === false
+                    ? `${layer.entry}.disabled`
+                    : layer.entry);
+            } else if (layer.source === 'inline') {
+                details.push(`inlines/${layer.id}.js${layer.enabled === false ? '.disabled' : ''}`);
+            }
             if (Number.isFinite(layer.profile?.avgUpdateMs) && layer.profile.updateCount > 0) {
                 details.push(`avg ${layer.profile.avgUpdateMs.toFixed(2)}ms`);
             }
@@ -7812,25 +7946,16 @@
 
         async function handleLayerRemove(layer) {
             try {
-                if (layer.source === 'project') {
-                    await _projectRuntimeRef?.removeLayer(layer.id);
-                } else if (_projectRuntimeRef?.removeInlineLayer) {
+                if (layer.source === 'inline' && _projectRuntimeRef?.removeInlineLayer) {
                     await _projectRuntimeRef.removeInlineLayer(layer.id);
                     _layerManagerRef?.remove(layer.id);
+                } else if (layer.source === 'project') {
+                    await _projectRuntimeRef?.removeLayer(layer.id);
                 } else {
                     _layerManagerRef?.remove(layer.id);
                 }
             } catch (error) {
                 reportBridgeError('layer remove', error);
-            }
-        }
-
-        async function handleLayerClearAll() {
-            try {
-                await _projectRuntimeRef?.clearInlineLayers?.();
-                _layerManagerRef?.clear?.();
-            } catch (error) {
-                reportBridgeError('layer clear', error);
             }
         }
 
@@ -7848,7 +7973,6 @@
             const layers = getPanelLayers();
             const projectReady = projectState.manifestExists === true;
             const canReleaseProject = projectState.sceneSaved === true && !projectReady;
-            const showClearAll = layers.length > 0 || projectReady;
             const emptyHtml = !projectState.sceneSaved
                 ? '<div class="layers-empty">Save the scene first. MaxJS creates <code>project.maxjs.json</code> and <code>inlines/</code> next to the <code>.max</code> file.</div>'
                 : !projectReady
@@ -7913,7 +8037,6 @@
                     </div>
                     <div style="display:flex;gap:4px">
                         ${canReleaseProject && layers.length > 0 ? '<button id="layersReleaseBtn">Release Project Manifest</button>' : ''}
-                        ${showClearAll ? '<button id="layersClearBtn">Remove All</button>' : ''}
                         <button id="layersHideBtn">Hide</button>
                     </div>
                 </div>
@@ -7921,7 +8044,6 @@
             `;
 
             layersPanel.querySelector('#layersHideBtn')?.addEventListener('click', () => setLayersPanelVisible(false));
-            layersPanel.querySelector('#layersClearBtn')?.addEventListener('click', () => { void handleLayerClearAll(); });
             layersPanel.querySelector('#layersReleaseBtn')?.addEventListener('click', () => { void handleReleaseProjectManifest(); });
             layersPanel.querySelectorAll('[data-layer-toggle]').forEach(btn => {
                 btn.addEventListener('click', () => {
@@ -7955,10 +8077,24 @@
         });
 
         const btnPostFxPanel = document.getElementById('btnPostFxPanel');
+        const rightDock = document.getElementById('rightDock');
         const postPanel = document.getElementById('postPanel');
         let postPanelVisible = false;
         let syncClonePanelFn = null;
         let lastPostFxSignature = '';
+
+        function clampDockWidth(width) {
+            const numeric = Number.parseFloat(width);
+            const maxWidth = Math.max(200, window.innerWidth - 16);
+            return Math.max(200, Math.min(Number.isFinite(numeric) ? numeric : 240, maxWidth));
+        }
+
+        function setRightDockWidth(width) {
+            const clamped = clampDockWidth(width);
+            document.documentElement.style.setProperty('--dock-width', `${clamped}px`);
+            if (rightDock) rightDock.style.width = '';
+            return clamped;
+        }
 
         // Tone mapping modes
         const DEFAULT_TONE_MAPPING = 'Neutral';
@@ -8423,7 +8559,7 @@
                                 <button id="fx-hdri-load" type="button">Load</button>
                                 <button id="fx-hdri-clear" type="button" style="border-color:#663030">Clear</button>
                             </div>
-                            <input type="file" id="fx-hdri-file" accept=".hdr,.exr" style="display:none">
+                            <input type="file" id="fx-hdri-file" style="display:none">
                         </div>
                         <div id="fx-hdri-name" style="font-size:9px;color:#777;padding:2px 0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">No HDRI loaded</div>
                         <div class="fx-grid">
@@ -8606,6 +8742,7 @@
                 ssgiFx.markOutputChanged?.();
                 try { localStorage.removeItem(POSTFX_STORAGE_KEY); localStorage.removeItem('maxjs_panel_width'); } catch {}
                 postPanel.style.width = '';
+                setRightDockWidth(240);
                 buildPostFxPanel();
                 syncPostFxPanel(true);
             };
@@ -8618,25 +8755,27 @@
                 resizing = true;
                 resizeHandle.classList.add('active');
                 const startX = e.clientX;
-                const startW = postPanel.offsetWidth;
+                const startW = rightDock?.offsetWidth || postPanel.offsetWidth;
                 const onMove = (ev) => {
                     const dx = startX - ev.clientX;
-                    const newW = Math.max(200, Math.min(startW + dx, window.innerWidth - 16));
-                    postPanel.style.width = newW + 'px';
+                    setRightDockWidth(startW + dx);
+                    postPanel.style.width = '';
                 };
                 const onUp = () => {
                     resizing = false;
                     resizeHandle.classList.remove('active');
                     document.removeEventListener('mousemove', onMove);
                     document.removeEventListener('mouseup', onUp);
-                    try { localStorage.setItem('maxjs_panel_width', postPanel.style.width); } catch {}
+                    const dockWidth = rightDock?.offsetWidth || postPanel.offsetWidth;
+                    try { localStorage.setItem('maxjs_panel_width', `${clampDockWidth(dockWidth)}px`); } catch {}
                 };
                 document.addEventListener('mousemove', onMove);
                 document.addEventListener('mouseup', onUp);
             });
             try {
                 const savedW = localStorage.getItem('maxjs_panel_width');
-                if (savedW) postPanel.style.width = savedW;
+                if (savedW) setRightDockWidth(savedW);
+                postPanel.style.width = '';
             } catch {}
 
             // Tone mapping controls
@@ -9951,27 +10090,46 @@
                             id: entry?.id || entry?.name || `layer_${index}`,
                             name: entry?.name || entry?.id || `layer_${index}`,
                             entryPath: entry?.entry || entry?.path || 'main.js',
+                            source: 'project',
                             enabled: entry?.enabled !== false,
                         }));
                     }
 
-                    async function tryReplaySnapshotProjectLayers() {
-                        let manifest;
-                        let manifestUrl;
+                    function buildSnapshotInlineLayers(runtimeScene) {
+                        const rawLayers = Array.isArray(runtimeScene?.layers) ? runtimeScene.layers : [];
+                        return rawLayers
+                            .filter(entry => entry?.source === 'inline' && entry?.entry)
+                            .map((entry, index) => ({
+                                id: entry.id || entry.name || `inline_${index}`,
+                                name: entry.name || entry.id || `inline_${index}`,
+                                entryPath: entry.entry,
+                                source: 'inline',
+                                enabled: entry.active !== false,
+                            }));
+                    }
+
+                    async function tryReplaySnapshotLayerModules() {
+                        let manifest = null;
+                        let baseUrl = new URL('./', window.location.href);
+                        let allLayers = [];
                         try {
-                            manifestUrl = new URL('./project.maxjs.json', window.location.href);
+                            const manifestUrl = new URL('./project.maxjs.json', window.location.href);
                             const response = await fetch(manifestUrl, { cache: 'no-store' });
-                            if (!response.ok) return false;
-                            manifest = await response.json();
+                            if (response.ok) {
+                                manifest = await response.json();
+                                baseUrl = new URL('./', manifestUrl);
+                                allLayers = buildSnapshotManifestLayers(manifest);
+                            }
                         } catch {
-                            return false;
+                            manifest = null;
                         }
 
-                        const manifestBaseUrl = new URL('./', manifestUrl);
                         // Snapshot always imports every layer in the manifest,
                         // regardless of the enabled flag. Disable is a live-mode
                         // concept only; snapshot releases ship the full set.
-                        const allLayers = buildSnapshotManifestLayers(manifest);
+                        if (allLayers.length === 0) {
+                            allLayers = buildSnapshotInlineLayers(meta.runtimeScene);
+                        }
                         if (allLayers.length === 0) return false;
 
                         const mountedIds = [];
@@ -9979,7 +10137,7 @@
                             for (const entry of allLayers) {
                                 const entryPath = String(entry.entryPath || entry.entry || entry.path || '').replace(/\\/g, '/');
                                 if (!entryPath) throw new Error(`Missing layer entry path for ${entry.id}`);
-                                const moduleUrl = new URL(entryPath, manifestBaseUrl);
+                                const moduleUrl = new URL(entryPath, baseUrl);
                                 moduleUrl.searchParams.set('v', `${Date.now()}_${entry.id}`);
                                 const moduleNamespace = await import(moduleUrl.toString());
                                 const factory = resolveSnapshotLayerFactory(moduleNamespace);
@@ -9989,7 +10147,7 @@
                                     {
                                         name: entry.name || entry.id,
                                         code: moduleUrl.toString(),
-                                        source: 'project',
+                                        source: entry.source || 'project',
                                         entry: entry.entryPath,
                                     },
                                 );
@@ -9998,7 +10156,7 @@
                             }
                             return true;
                         } catch (error) {
-                            maxjsDebugWarn('[MaxJS snapshot] project layer replay failed; falling back to baked runtimeScene', error);
+                            maxjsDebugWarn('[MaxJS snapshot] layer module replay failed; falling back to baked runtimeScene', error);
                             for (const id of mountedIds) {
                                 try { layerManager.remove(id); } catch {}
                             }
@@ -10006,7 +10164,7 @@
                         }
                     }
 
-                    const replayedProjectLayers = await tryReplaySnapshotProjectLayers();
+                    const replayedLayerModules = await tryReplaySnapshotLayerModules();
                     // Snapshot runtime trees are plain Object3D JSON, not node-material graphs.
                     // Prefer the standard ObjectLoader here; NodeObjectLoader can reject this payload.
                     const LoaderCtor = THREE_STD.ObjectLoader || THREE.ObjectLoader || THREE.NodeObjectLoader;
@@ -10048,7 +10206,7 @@
                         }
                         return objectLoader.parse(json);
                     }
-                    if (!replayedProjectLayers && meta.runtimeScene.jsRoot) {
+                    if (!replayedLayerModules && meta.runtimeScene.jsRoot) {
                         try {
                             const jsSnapshotRoot = await parseRuntimeSubtree(meta.runtimeScene.jsRoot);
                             if (jsSnapshotRoot?.isObject3D) {
@@ -10080,7 +10238,7 @@
                             maxjsDebugWarn('[MaxJS snapshot] runtimeScene.jsRoot parse failed (non-fatal)', err);
                         }
                     }
-                    if (!replayedProjectLayers && meta.runtimeScene.overlayRoot) {
+                    if (!replayedLayerModules && meta.runtimeScene.overlayRoot) {
                         try {
                             const overlaySnapshotRoot = await parseRuntimeSubtree(meta.runtimeScene.overlayRoot);
                             if (overlaySnapshotRoot?.isObject3D) {

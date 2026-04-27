@@ -509,7 +509,7 @@ BEGIN
     LTEXT           "Node material JS. Source material can be wired for MaterialX.", -1, 8, 14, 154, 16
     LTEXT           "No file loaded", IDC_TSL_FILE_LABEL, 8, 34, 100, 8
     PUSHBUTTON      "Load .js",   IDC_TSL_LOAD_BTN,  114, 31, 46, 14
-    EDITTEXT        IDC_TSL_CODE_EDIT, 6, 50, 158, 194, ES_MULTILINE | ES_AUTOVSCROLL | ES_AUTOHSCROLL | ES_WANTRETURN | WS_VSCROLL | WS_HSCROLL | WS_TABSTOP
+    EDITTEXT        IDC_TSL_CODE_EDIT, 6, 50, 158, 194, ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN | WS_VSCROLL | WS_TABSTOP
     GROUPBOX        "Texture Slots  maps.map1 - maps.map16", -1, 2, 254, 166, 136
     LTEXT           "01", -1, 8, 268, 10, 8
     CONTROL         "", IDC_TSL_MAP1, "CustButton", 0x50010000, 22, 266, 56, 12
@@ -569,7 +569,7 @@ BEGIN
     LTEXT           "Code returns a THREE.Texture or THREE.DataTexture", -1, 8, 14, 154, 16
     LTEXT           "No file loaded", IDC_TSL_TEX_FILE_LABEL, 8, 34, 100, 8
     PUSHBUTTON      "Load .js",   IDC_TSL_TEX_LOAD_BTN,  114, 31, 46, 14
-    EDITTEXT        IDC_TSL_TEX_CODE_EDIT, 6, 48, 158, 100, ES_MULTILINE | ES_AUTOVSCROLL | ES_AUTOHSCROLL | ES_WANTRETURN | WS_VSCROLL | WS_HSCROLL | WS_TABSTOP
+    EDITTEXT        IDC_TSL_TEX_CODE_EDIT, 6, 48, 158, 100, ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN | WS_VSCROLL | WS_TABSTOP
     GROUPBOX        "Dynamic Parameters", IDC_TSL_TEX_DYN_GROUP, 2, 158, 166, 264
 END
 

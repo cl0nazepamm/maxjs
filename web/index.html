@@ -9742,6 +9742,7 @@
 
             const perfHudActive = perfHud.isDebugEnabled?.() ?? false;
             if (perfHudActive) perfHud.updateLayers(layerManager.getStats());
+            ssgiFx.applySharedSceneEffects?.();
             const renderStart = performance.now();
             try {
                 if (asciiActive && asciiEffect) {

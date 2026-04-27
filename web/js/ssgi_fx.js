@@ -1101,11 +1101,11 @@ export function createSSGIController({
     })();
 
     let ps1WiggleActive = false;
+    let ps1SceneDirty = true;
     const ps1SavedNodes = new Map();
 
     function enablePS1Wiggle(strength = 5.0) {
         ps1SnapStrength.value = Math.max(1.0, strength);
-        if (ps1WiggleActive) return;
         ps1WiggleActive = true;
         scene.traverse(obj => {
             const mats = obj.material
@@ -1120,7 +1120,7 @@ export function createSSGIController({
     }
 
     function disablePS1Wiggle() {
-        if (!ps1WiggleActive) return;
+        if (!ps1WiggleActive && ps1SavedNodes.size === 0) return;
         ps1WiggleActive = false;
         for (const [mat, savedNode] of ps1SavedNodes) {
             mat.vertexNode = savedNode;
@@ -1128,8 +1128,23 @@ export function createSSGIController({
         ps1SavedNodes.clear();
     }
 
+    function syncSharedSceneEffects(force = false) {
+        const shouldUsePS1Wiggle = state.retro.enabled && state.retro.wiggle;
+        if (shouldUsePS1Wiggle) {
+            if (force || ps1SceneDirty || !ps1WiggleActive) {
+                enablePS1Wiggle(state.retro.affineDistortion);
+            } else {
+                ps1SnapStrength.value = Math.max(1.0, state.retro.affineDistortion);
+            }
+        } else {
+            disablePS1Wiggle();
+        }
+        ps1SceneDirty = false;
+    }
+
     function rebuildPipeline() {
         disablePS1Wiggle();
+        ps1SceneDirty = true;
         refreshToonMeshCache();
         refreshPostPassHideList();
         ensureMainLightSupportsContactShadow();
@@ -1150,9 +1165,7 @@ export function createSSGIController({
 
         try {
             // PS1 vertex snap — coexists with all post-FX, no takeover needed
-            if (state.retro.enabled && state.retro.wiggle) {
-                enablePS1Wiggle(state.retro.affineDistortion);
-            }
+            syncSharedSceneEffects(true);
 
             const useSharedPrePass =
                 state.gtao.enabled ||
@@ -1588,6 +1601,9 @@ export function createSSGIController({
         isAvailable() {
             return available;
         },
+        applySharedSceneEffects() {
+            syncSharedSceneEffects();
+        },
         getLastError() {
             return lastError;
         },
@@ -1730,6 +1746,7 @@ export function createSSGIController({
          * never needed from outside, since those have dedicated entry points.
          */
         markSceneChanged(options = {}) {
+            ps1SceneDirty = true;
             // Three reasons to escalate a scene-structure change to a full rebuild:
             //   1. Explicit {rebuild:true} from the caller (env/effect graph swap).
             //   2. Toon outline is on — it binds per-mesh refs into the node

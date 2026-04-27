@@ -8983,6 +8983,54 @@ public:
         return true;
     }
 
+    struct MaterialLibraryEntry {
+        int id = 0;
+        uint64_t hash = 0;
+        std::wstring json;
+    };
+
+    struct MaterialLibraryBuilder {
+        int nextId = 1;
+        std::unordered_map<std::wstring, int> keyToId;
+        std::vector<MaterialLibraryEntry> entries;
+    };
+
+    std::wstring SerializeMaterialJson(const MaxJSPBR& pbr) {
+        std::wostringstream mat;
+        mat.imbue(std::locale::classic());
+        WriteMaterialFull(mat, pbr);
+        return mat.str();
+    }
+
+    int InternMaterial(MaterialLibraryBuilder& library, const MaxJSPBR& pbr) {
+        MaxJSPBR keyPbr = pbr;
+        keyPbr.mtlName.clear();
+        const std::wstring key = SerializeMaterialJson(keyPbr);
+        auto found = library.keyToId.find(key);
+        if (found != library.keyToId.end()) return found->second;
+
+        MaterialLibraryEntry entry;
+        entry.id = library.nextId++;
+        entry.json = SerializeMaterialJson(pbr);
+        entry.hash = HashFNV1a(key.data(), key.size() * sizeof(wchar_t));
+        library.keyToId.emplace(key, entry.id);
+        library.entries.push_back(std::move(entry));
+        return library.entries.back().id;
+    }
+
+    void WriteMaterialLibraryJson(std::wostringstream& ss, const MaterialLibraryBuilder& library) {
+        ss << L"\"materials\":[";
+        for (size_t i = 0; i < library.entries.size(); ++i) {
+            const MaterialLibraryEntry& entry = library.entries[i];
+            if (i) ss << L',';
+            ss << L"{\"id\":" << entry.id;
+            ss << L",\"hash\":" << entry.hash;
+            ss << L",\"mat\":" << entry.json;
+            ss << L'}';
+        }
+        ss << L']';
+    }
+
     bool BuildSnapshotBinary(std::wstring& outMetaJson,
                              std::string& outBinary,
                              std::string& outAnimBinary,
@@ -9007,6 +9055,7 @@ public:
         std::vector<SnapshotNodeRecord> nodes;
         size_t totalBytes = 0;
         std::unordered_set<ULONG> skinRigMeshHandles;
+        MaterialLibraryBuilder materialLibrary;
 
         std::function<void(INode*)> collect = [&](INode* parent) {
             for (int i = 0; i < parent->NumberOfChildren(); ++i) {
@@ -9268,24 +9317,25 @@ public:
                     if (g) ss << L',';
                     ss << L'[' << node.groups[g].start << L',' << node.groups[g].count << L',' << g << L']';
                 }
-                ss << L"],\"mats\":[";
+                ss << L"],\"matRefs\":[";
                 for (size_t g = 0; g < node.groups.size(); ++g) {
                     if (g) ss << L',';
                     Mtl* subMtl = GetSubMtlFromMatID(multiMtl, node.groups[g].matID);
                     MaxJSPBR subPBR;
                     ExtractPBRFromMtl(subMtl, node.node, t, subPBR);
-                    WriteMaterialFull(ss, subPBR);
+                    ss << InternMaterial(materialLibrary, subPBR);
                 }
                 ss << L"]";
             } else {
-                ss << L",\"mat\":";
-                WriteMaterialFull(ss, pbr);
+                ss << L",\"matRef\":" << InternMaterial(materialLibrary, pbr);
             }
 
             ss << L'}';
         }
 
         ss << L"],";
+        WriteMaterialLibraryJson(ss, materialLibrary);
+        ss << L",";
         WriteCameraJson(ss);
         ss << L",";
         WriteSceneCamerasJson(ss);
@@ -10299,6 +10349,8 @@ public:
         if (!ip) return;
         TimeValue t = ip->GetTime();
         bool changed = false;
+        std::unordered_map<Mtl*, MaterialSyncState> materialStateCache;
+        std::unordered_map<Mtl*, uint64_t> scalarPreviewHashCache;
 
         for (ULONG handle : geomHandles_) {
             INode* node = ip->GetINodeByHandle(handle);
@@ -10315,7 +10367,7 @@ public:
 
             Mtl* supportedMtl = FindSupportedMaterial(rawMtl);
             if (supportedMtl && IsThreeJSMaterialClass(supportedMtl->ClassID())) {
-                const MaterialSyncState state = ComputeMaterialSyncState(node, t);
+                const MaterialSyncState state = ComputeMaterialSyncStateCached(node, t, materialStateCache);
                 auto structureIt = mtlHashMap_.find(handle);
                 auto scalarIt = mtlScalarHashMap_.find(handle);
                 auto fastScalarIt = mtlFastScalarHashMap_.find(handle);
@@ -10353,9 +10405,20 @@ public:
             float rough = 0.5f;
             float metal = 0.0f;
             float opac = 1.0f;
-            ExtractMaterialScalarPreview(supportedMtl, node, t, col, rough, metal, opac);
-
-            const uint64_t scalarHash = HashMaterialScalarPreviewValues(col, rough, metal, opac);
+            uint64_t scalarHash = 0;
+            if (supportedMtl) {
+                auto cachedScalar = scalarPreviewHashCache.find(supportedMtl);
+                if (cachedScalar != scalarPreviewHashCache.end()) {
+                    scalarHash = cachedScalar->second;
+                } else {
+                    ExtractMaterialScalarPreview(supportedMtl, nullptr, t, col, rough, metal, opac);
+                    scalarHash = HashMaterialScalarPreviewValues(col, rough, metal, opac);
+                    scalarPreviewHashCache[supportedMtl] = scalarHash;
+                }
+            } else {
+                ExtractMaterialScalarPreview(nullptr, node, t, col, rough, metal, opac);
+                scalarHash = HashMaterialScalarPreviewValues(col, rough, metal, opac);
+            }
             auto it = mtlFastScalarHashMap_.find(handle);
             if (it == mtlFastScalarHashMap_.end()) {
                 mtlFastScalarHashMap_[handle] = scalarHash;
@@ -12014,20 +12077,8 @@ public:
         bool canFastSync = false;
     };
 
-    MaterialSyncState ComputeMaterialSyncState(INode* node, TimeValue t) {
+    MaterialSyncState ComputeMaterialSyncStateFromPBR(const MaxJSPBR& pbr) {
         MaterialSyncState state;
-        if (!node) return state;
-
-        Mtl* rawMtl = node->GetMtl();
-        Mtl* multiMtl = FindMultiSubMtl(rawMtl);
-        if (multiMtl && multiMtl->NumSubMtls() > 1) {
-            state.structureHash = ComputeMaterialStateHash(node, t);
-            state.canFastSync = false;
-            return state;
-        }
-
-        MaxJSPBR pbr;
-        ExtractPBR(node, t, pbr);
         state.fastScalarHash = HashMaterialScalarPreviewValues(
             pbr.color, pbr.roughness, pbr.metalness, pbr.opacity);
 
@@ -12123,6 +12174,50 @@ public:
         // delta_bin only carries color/roughness/metalness/opacity.
         state.scalarHash = HashMaterialPBRState(slowScalarPbr);
         state.canFastSync = true;
+        return state;
+    }
+
+    MaterialSyncState ComputeMaterialSyncState(INode* node, TimeValue t) {
+        MaterialSyncState state;
+        if (!node) return state;
+
+        Mtl* rawMtl = node->GetMtl();
+        Mtl* multiMtl = FindMultiSubMtl(rawMtl);
+        if (multiMtl && multiMtl->NumSubMtls() > 1) {
+            state.structureHash = ComputeMaterialStateHash(node, t);
+            state.canFastSync = false;
+            return state;
+        }
+
+        MaxJSPBR pbr;
+        ExtractPBR(node, t, pbr);
+        return ComputeMaterialSyncStateFromPBR(pbr);
+    }
+
+    MaterialSyncState ComputeMaterialSyncStateCached(
+        INode* node,
+        TimeValue t,
+        std::unordered_map<Mtl*, MaterialSyncState>& materialStateCache) {
+        if (!node) return MaterialSyncState{};
+
+        Mtl* rawMtl = node->GetMtl();
+        Mtl* multiMtl = FindMultiSubMtl(rawMtl);
+        if (multiMtl && multiMtl->NumSubMtls() > 1) {
+            return ComputeMaterialSyncState(node, t);
+        }
+
+        Mtl* supportedMtl = FindSupportedMaterial(rawMtl);
+        if (!supportedMtl) {
+            return ComputeMaterialSyncState(node, t);
+        }
+
+        auto cached = materialStateCache.find(supportedMtl);
+        if (cached != materialStateCache.end()) return cached->second;
+
+        MaxJSPBR pbr;
+        ExtractPBRFromMtl(supportedMtl, nullptr, t, pbr);
+        MaterialSyncState state = ComputeMaterialSyncStateFromPBR(pbr);
+        materialStateCache[supportedMtl] = state;
         return state;
     }
 
@@ -12299,6 +12394,7 @@ public:
         if (!ip) return;
         TimeValue t = ip->GetTime();
         bool changed = false;
+        std::unordered_map<Mtl*, MaterialSyncState> materialStateCache;
 
         for (ULONG handle : geomHandles_) {
             INode* node = ip->GetINodeByHandle(handle);
@@ -12310,7 +12406,7 @@ public:
                 continue;
             }
 
-            const MaterialSyncState state = ComputeMaterialSyncState(node, t);
+            const MaterialSyncState state = ComputeMaterialSyncStateCached(node, t, materialStateCache);
 
             auto structureIt = mtlHashMap_.find(handle);
             auto scalarIt = mtlScalarHashMap_.find(handle);
@@ -13695,7 +13791,8 @@ public:
         ss.imbue(std::locale::classic());
         ss << L"{\"type\":\"scene\",\"frame\":" << frameId << L",\"nodes\":[";
         bool first = true;
-        WriteSceneNodes(root, t, ss, first, prevGeom);
+        MaterialLibraryBuilder materialLibrary;
+        WriteSceneNodes(root, t, ss, first, prevGeom, materialLibrary);
         for (auto it = skinnedControlIdxCache_.begin(); it != skinnedControlIdxCache_.end(); ) {
             if (skinnedHandles_.find(it->first) == skinnedHandles_.end() &&
                 deformHandles_.find(it->first) == deformHandles_.end()) it = skinnedControlIdxCache_.erase(it);
@@ -13707,6 +13804,8 @@ public:
             else ++it;
         }
         ss << L"],";
+        WriteMaterialLibraryJson(ss, materialLibrary);
+        ss << L",";
 
         // Camera + scene camera list
         WriteCameraJson(ss);
@@ -13829,26 +13928,27 @@ public:
 
     void WriteSceneNodes(INode* parent, TimeValue t,
                          std::wostringstream& ss, bool& first,
-                         const std::unordered_set<ULONG>& prevGeom) {
+                         const std::unordered_set<ULONG>& prevGeom,
+                         MaterialLibraryBuilder& materialLibrary) {
         for (int i = 0; i < parent->NumberOfChildren(); i++) {
             INode* node = parent->GetChildNode(i);
             if (!node) continue;
             ObjectState os = node->EvalWorldState(t);
             if (os.obj && (IsThreeJSSplatClassID(os.obj->ClassID()) || IsThreeJSAudioClassID(os.obj->ClassID()) || IsThreeJSGLTFClassID(os.obj->ClassID()))) {
-                WriteSceneNodes(node, t, ss, first, prevGeom);
+                WriteSceneNodes(node, t, ss, first, prevGeom, materialLibrary);
                 continue;
             }
             // Skip Forest Pack / ForestIvy / RailClone / tyFlow — handled via GPU instancing
             if (IsForestPackNode(node) || IsRailCloneNode(node) ||
                 (IsTyFlowAvailable() && IsTyFlowNode(node))) {
                 pluginInstHandles_.insert(node->GetHandle());
-                WriteSceneNodes(node, t, ss, first, prevGeom);
+                WriteSceneNodes(node, t, ss, first, prevGeom, materialLibrary);
                 continue;
             }
 
             // Hidden node — skip extraction but recurse into children
             if (node->IsNodeHidden(TRUE)) {
-                WriteSceneNodes(node, t, ss, first, prevGeom);
+                WriteSceneNodes(node, t, ss, first, prevGeom, materialLibrary);
                 continue;
             }
 
@@ -13893,20 +13993,19 @@ public:
                         if (g) ss << L',';
                         ss << L'[' << cachedGroups->second[g].start << L',' << cachedGroups->second[g].count << L',' << g << L']';
                     }
-                    ss << L"],\"mats\":[";
+                    ss << L"],\"matRefs\":[";
                     for (size_t g = 0; g < cachedGroups->second.size(); g++) {
                         if (g) ss << L',';
                         Mtl* subMtl = GetSubMtlFromMatID(multiMtl, cachedGroups->second[g].matID);
                         MaxJSPBR subPBR;
                         ExtractPBRFromMtl(subMtl, node, t, subPBR);
-                        WriteMaterialFull(ss, subPBR);
+                        ss << InternMaterial(materialLibrary, subPBR);
                     }
                     ss << L"]";
                 } else {
                     MaxJSPBR pbr;
                     ExtractPBR(node, t, pbr);
-                    ss << L",\"mat\":";
-                    WriteMaterialFull(ss, pbr);
+                    ss << L",\"matRef\":" << InternMaterial(materialLibrary, pbr);
                 }
 
                 ss << L'}';
@@ -13995,20 +14094,19 @@ public:
                                 if (g) ss << L',';
                                 ss << L'[' << groups[g].start << L',' << groups[g].count << L',' << g << L']';
                             }
-                            ss << L"],\"mats\":[";
+                            ss << L"],\"matRefs\":[";
                             for (size_t g = 0; g < groups.size(); g++) {
                                 if (g) ss << L',';
                                 Mtl* subMtl = GetSubMtlFromMatID(multiMtl, groups[g].matID);
                                 MaxJSPBR subPBR;
                                 ExtractPBRFromMtl(subMtl, node, t, subPBR);
-                                WriteMaterialFull(ss, subPBR);
+                                ss << InternMaterial(materialLibrary, subPBR);
                             }
                             ss << L"]";
                         } else {
                             MaxJSPBR pbr;
                             ExtractPBR(node, t, pbr);
-                            ss << L",\"mat\":";
-                            WriteMaterialFull(ss, pbr);
+                            ss << L",\"matRef\":" << InternMaterial(materialLibrary, pbr);
                         }
                     }
 
@@ -14019,7 +14117,7 @@ public:
                 }
             }
 
-            WriteSceneNodes(node, t, ss, first, prevGeom);
+            WriteSceneNodes(node, t, ss, first, prevGeom, materialLibrary);
         }
     }
 
@@ -14335,6 +14433,7 @@ public:
         // Build metadata JSON + copy geometry into buffer
         std::wostringstream ss;
         ss.imbue(std::locale::classic());
+        MaterialLibraryBuilder materialLibrary;
         ss << L"{\"type\":\"scene_bin\",\"frame\":" << frameId;
         ss << L",\"stats\":{\"producerBytes\":" << totalBytes << L"}";
         ss << L",\"nodes\":[";
@@ -14395,18 +14494,17 @@ public:
                     if (g) ss << L',';
                     ss << L'[' << ng.groups[g].start << L',' << ng.groups[g].count << L',' << g << L']';
                 }
-                ss << L"],\"mats\":[";
+                ss << L"],\"matRefs\":[";
                 for (size_t g = 0; g < ng.groups.size(); g++) {
                     if (g) ss << L',';
                     Mtl* subMtl = GetSubMtlFromMatID(multiMtl, ng.groups[g].matID);
                     MaxJSPBR subPBR;
                     ExtractPBRFromMtl(subMtl, ng.node, t, subPBR);
-                    WriteMaterialFull(ss, subPBR);
+                    ss << InternMaterial(materialLibrary, subPBR);
                 }
                 ss << L"]";
             } else {
-                ss << L",\"mat\":";
-                WriteMaterialFull(ss, pbr);
+                ss << L",\"matRef\":" << InternMaterial(materialLibrary, pbr);
             }
 
             ss << L'}';  // node
@@ -14414,6 +14512,8 @@ public:
         }
 
         ss << L"],";
+        WriteMaterialLibraryJson(ss, materialLibrary);
+        ss << L",";
         WriteCameraJson(ss);
 
         // Environment

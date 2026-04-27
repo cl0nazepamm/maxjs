@@ -1200,14 +1200,11 @@
                 <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="3" width="12" height="10" rx="2"/><path d="M5 1.5v3M8 1.5v3M11 1.5v3M5 12.5v2M8 12.5v2M11 12.5v2M1.5 6h3M1.5 10h3M11.5 6h3M11.5 10h3"/></svg>
                 <span class="rail-btn-badge">WGPU</span>
             </button>
-            <button id="btnRenderMode" class="rail-btn devonly" title="Render mode — Studio adds light linking / per-mesh HDRI / reflection paint; Standard stays within baseline WebGPU uniform-buffer limits." aria-label="Render mode">
+            <button id="btnRenderMode" class="rail-btn devonly" title="Render mode — Studio adds light linking / per-mesh HDRI; Standard stays within baseline WebGPU uniform-buffer limits." aria-label="Render mode">
                 <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 1.5 2.5 4.5v7L8 14.5l5.5-3v-7L8 1.5Z"/><path d="M8 1.5v13M2.5 4.5 8 8l5.5-3.5"/></svg>
             </button>
             <button id="btnLightLink" class="rail-btn devonly" title="Light Linking" aria-label="Light Linking">
                 <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6.5 8.5a2.5 2.5 0 0 0 3.5 0l2.5-2.5a2.5 2.5 0 0 0-3.5-3.5L8 3.5"/><path d="M9.5 7.5a2.5 2.5 0 0 0-3.5 0L3.5 10a2.5 2.5 0 0 0 3.5 3.5L8 12.5"/></svg>
-            </button>
-            <button id="btnReflPaint" class="rail-btn devonly" title="Reflection Paint" aria-label="Reflection Paint">
-                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 7-5 5a2 2 0 0 1-3-3l5-5"/><path d="m14 2-5 5M12 4l2 2"/></svg>
             </button>
             <button id="btnSwitchVR" class="rail-btn devonly" title="Switch to WebGL for XR (reload)" aria-label="XR — use WebGL backend">
                 <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="1" y="5" width="14" height="6" rx="2"/><circle cx="5" cy="8" r="1.2"/><circle cx="11" cy="8" r="1.2"/><path d="M8 6.5v3"/></svg>
@@ -1291,7 +1288,6 @@
         <aside id="canvasPanel" class="sidepanel" aria-hidden="true" inert></aside>
         <aside id="shaderLabPanel" class="sidepanel" aria-hidden="true" inert></aside>
         <aside id="lightLinkPanel" class="sidepanel" aria-hidden="true" inert></aside>
-        <aside id="reflPaintPanel" class="sidepanel" aria-hidden="true" inert></aside>
         <aside id="postPanel" class="sidepanel" aria-hidden="true" inert></aside>
     </div>
     <div class="dock-drag-handle" aria-hidden="true"></div>
@@ -1352,10 +1348,8 @@
         import {
             maxLights,
             ensureMeshMaskDefaults,
-            getReflectionPaintNode,
             LIGHT_MASK_LO_KEY,
             LIGHT_MASK_HI_KEY,
-            REFL_PAINT_INTENSITY_KEY,
         } from './js/max_lights_node.js';
         // Spark.js uses GLSL3/ShaderChunk — needs WebGL THREE build (scoped in importmap).
         // Lazy-import to avoid crashing on page load.
@@ -1636,9 +1630,8 @@
         }
 
         // ── Studio vs Standard render mode ────────────────────
-        // Studio  = MaxLightsNode (light linking, per-mesh HDRI intensity,
-        //           reflection paint). Adds several fragment-stage uniform
-        //           buffers on top of stock three.js.
+        // Studio  = MaxLightsNode (light linking + per-mesh HDRI intensity).
+        //           Unlinked lights stay on stock batched three.js light nodes.
         // Standard = stock three.js pipeline. No per-mesh tricks, but fits
         //            within baseline WebGPU uniform-buffer limits — use on
         //            heavier scenes that exceed 12 uniform buffers/stage.
@@ -1652,7 +1645,7 @@
             } catch { return 'standard'; }
         })();
         const isStudioMode = maxjsRenderMode === 'studio';
-        const STUDIO_ONLY_RAIL_IDS = ['btnLightLink', 'btnReflPaint'];
+        const STUDIO_ONLY_RAIL_IDS = ['btnLightLink'];
 
         function setRailButtonMeta(button, { label, badge } = {}) {
             if (!button) return;
@@ -1808,6 +1801,17 @@
         const materialCache = new Map();
         const materialXTemplateCache = new Map();
         const materialXLoadCache = new Map();
+        const materialRegistry = new Map();
+        let nextMaterialRegistryId = 1;
+        let materialRegistryFrame = 0;
+        let materialRegistryStats = {
+            uniqueMaterials: 0,
+            materialTemplates: 0,
+            materialRefs: 0,
+            bucketedRefs: 0,
+            instanceBuckets: 0,
+            maxRefsPerMaterial: 0,
+        };
         const nodeMap = new Map();
         const maxInstanceBuckets = new Map(); // bucketKey -> { mesh, materialKey, sourceHandle, handles:Set, handleToIndex:Map, transforms:Map, visible:Map }
         const maxInstanceHandleToBucket = new Map(); // handle -> bucketKey
@@ -3563,8 +3567,151 @@
                 && finiteNumberOr(md.anisotropy, 0) <= 1.0e-4;
         }
 
+        function materialIdentityValue(value) {
+            if (Array.isArray(value)) return value.map(materialIdentityValue);
+            if (!value || typeof value !== 'object') return value;
+            const normalized = {};
+            for (const key of Object.keys(value).sort()) {
+                if (key === 'name') continue;
+                const child = value[key];
+                if (child === undefined) continue;
+                normalized[key] = materialIdentityValue(child);
+            }
+            return normalized;
+        }
+
+        function materialIdentityKey(md) {
+            return JSON.stringify(materialIdentityValue(md ?? null));
+        }
+
+        function materialTemplateCacheKey(requestedModelName, runtimeModelName, md) {
+            return JSON.stringify([requestedModelName, runtimeModelName, materialIdentityValue(md ?? null)]);
+        }
+
+        function getMaterialPayloads(nd) {
+            if (nd?.mats && nd?.groups) return nd.mats.filter(Boolean);
+            if (nd?.mat) return [nd.mat];
+            return [null];
+        }
+
+        function countMaterialTextureSlots(md) {
+            if (!md || typeof md !== 'object') return 0;
+            let count = 0;
+            for (const [key, value] of Object.entries(md)) {
+                if (typeof value !== 'string' || value.length === 0) continue;
+                if (key === 'model' || key === 'name' || key === 'materialXFile' || key === 'materialXInline') continue;
+                if (key.endsWith('Map') || key.endsWith('Tex') || key.endsWith('Path') || key.endsWith('File')) count++;
+            }
+            return count;
+        }
+
+        function getOrCreateMaterialRegistryEntry(md) {
+            const key = md ? materialIdentityKey(md) : '__maxjs_default_material__';
+            let entry = materialRegistry.get(key);
+            if (!entry) {
+                entry = {
+                    id: nextMaterialRegistryId++,
+                    key,
+                    model: md?.model || 'MeshStandardMaterial',
+                    displayName: md?.name || 'default',
+                    names: new Set(),
+                    textureSlots: countMaterialTextureSlots(md),
+                    refCount: 0,
+                    bucketedRefCount: 0,
+                    lastSeenFrame: 0,
+                };
+                materialRegistry.set(key, entry);
+            }
+            if (md?.name) {
+                entry.displayName = md.name;
+                entry.names.add(md.name);
+            }
+            entry.model = md?.model || entry.model || 'MeshStandardMaterial';
+            entry.textureSlots = countMaterialTextureSlots(md);
+            return entry;
+        }
+
+        function refreshMaterialRegistry(nodes, bucketPlan = null) {
+            materialRegistryFrame++;
+            let materialRefs = 0;
+            let bucketedRefs = 0;
+            let maxRefsPerMaterial = 0;
+            for (const entry of materialRegistry.values()) {
+                entry.refCount = 0;
+                entry.bucketedRefCount = 0;
+            }
+            for (const nd of nodes || []) {
+                for (const md of getMaterialPayloads(nd)) {
+                    const entry = getOrCreateMaterialRegistryEntry(md);
+                    entry.refCount++;
+                    entry.lastSeenFrame = materialRegistryFrame;
+                    materialRefs++;
+                }
+            }
+            for (const group of bucketPlan?.groups?.values?.() || []) {
+                const entry = materialRegistry.get(group.materialKey);
+                if (!entry) continue;
+                entry.bucketedRefCount += group.nodes.length;
+                bucketedRefs += group.nodes.length;
+            }
+            for (const [key, entry] of [...materialRegistry.entries()]) {
+                if (entry.lastSeenFrame !== materialRegistryFrame) {
+                    materialRegistry.delete(key);
+                    continue;
+                }
+                maxRefsPerMaterial = Math.max(maxRefsPerMaterial, entry.refCount);
+            }
+            materialRegistryStats = {
+                uniqueMaterials: materialRegistry.size,
+                materialTemplates: materialCache.size + materialXTemplateCache.size,
+                materialRefs,
+                bucketedRefs,
+                instanceBuckets: bucketPlan?.groups?.size ?? maxInstanceBuckets.size,
+                maxRefsPerMaterial,
+            };
+            return materialRegistryStats;
+        }
+
+        function materialRegistryHudStats() {
+            return {
+                materialCount: materialRegistryStats.uniqueMaterials,
+                materialTemplateCount: materialRegistryStats.materialTemplates,
+                instanceBucketCount: materialRegistryStats.instanceBuckets,
+            };
+        }
+
+        function resolveSnapshotMaterialRefs(snapshot) {
+            if (!snapshot || !Array.isArray(snapshot.nodes) || !Array.isArray(snapshot.materials)) return snapshot;
+            const materialById = new Map();
+            for (const entry of snapshot.materials) {
+                const id = Number(entry?.id ?? entry?.i);
+                const material = entry?.mat ?? entry?.material;
+                if (Number.isFinite(id) && material && typeof material === 'object') {
+                    materialById.set(id, material);
+                }
+            }
+            if (materialById.size === 0) return snapshot;
+            for (const nd of snapshot.nodes) {
+                if (!nd || typeof nd !== 'object') continue;
+                if (nd.mat == null && nd.matRef != null) {
+                    const mat = materialById.get(Number(nd.matRef));
+                    if (mat) nd.mat = mat;
+                }
+                if (!Array.isArray(nd.mats) && Array.isArray(nd.matRefs)) {
+                    const mats = [];
+                    for (const ref of nd.matRefs) {
+                        const mat = materialById.get(Number(ref));
+                        if (mat) mats.push(mat);
+                    }
+                    if (mats.length > 0) nd.mats = mats;
+                }
+            }
+            return snapshot;
+        }
+
         function createMaterial(md) {
             const requestedModelName = md.model || 'MeshStandardMaterial';
+            const registryEntry = getOrCreateMaterialRegistryEntry(md);
             const forceLambertForBlackSpecular = shouldRouteBlackSpecularToLambert(requestedModelName, md);
             const wantsMaterialXMaterial = requestedModelName === 'MaterialXMaterial';
             const wantsUtilityMaterial = forceLambertForBlackSpecular || utilityMaterialModels.has(requestedModelName);
@@ -3612,7 +3759,7 @@
             const cacheableMd = (wantsTSLMaterial && md.tslParams)
                 ? Object.assign({}, md, { tslParams: undefined })
                 : md;
-            const key = JSON.stringify([requestedModelName, runtimeModelName, cacheableMd]);
+            const key = materialTemplateCacheKey(requestedModelName, runtimeModelName, cacheableMd);
             let template = materialCache.get(key);
             if (!template && wantsMaterialXMaterial) {
                 template = materialXTemplateCache.get(key);
@@ -3773,6 +3920,8 @@
                     }
                 }
                 template.userData ??= {};
+                template.userData.maxjsMaterialRegistryId = registryEntry.id;
+                template.userData.maxjsMaterialIdentityKey = registryEntry.key;
                 template.userData.maxjsRequestedMaterialModel = requestedModelName;
                 template.userData.maxjsMaterialModel = runtimeModelName;
                 template.userData.maxjsUtilityMaterialFallback =
@@ -3812,6 +3961,8 @@
 
             const material = template.clone();
             material.userData = { ...(template.userData || {}) };
+            material.userData.maxjsMaterialRegistryId = registryEntry.id;
+            material.userData.maxjsMaterialIdentityKey = registryEntry.key;
             material.userData.maxjsSourceMaterialName = md.name || material.name || 'default';
             if (md.name) material.name = md.name;
             rememberMaterialEmissiveBase(material);
@@ -3892,6 +4043,7 @@
                 applyMs: partial.applyMs ?? 0,
                 nodeCount: nodeMap.size,
                 instanceCount: countInstances(),
+                ...materialRegistryHudStats(),
                 textureCount: textureCache.size,
             });
         }
@@ -4243,12 +4395,34 @@
             setInfoText('MaxJS - no bridge (standalone mode)');
         }
         window.maxJS = bridge;
+        bridge.materials = {
+            getStats() {
+                return { ...materialRegistryStats };
+            },
+            getEntries() {
+                return [...materialRegistry.values()].map((entry) => ({
+                    id: entry.id,
+                    model: entry.model,
+                    displayName: entry.displayName,
+                    names: [...entry.names],
+                    textureSlots: entry.textureSlots,
+                    refCount: entry.refCount,
+                    bucketedRefCount: entry.bucketedRefCount,
+                    key: entry.key,
+                }));
+            },
+        };
 
         function createSceneMaterial(nd) {
             if (nd.mats && nd.groups) return nd.mats.map(m => createMaterial(m));
-            return nd.mat
-                ? createMaterial(nd.mat)
-                : new THREE.MeshStandardMaterial({ color: 0x888888, side: THREE.DoubleSide });
+            if (nd.mat) return createMaterial(nd.mat);
+            const entry = getOrCreateMaterialRegistryEntry(null);
+            const material = new THREE.MeshStandardMaterial({ color: 0x888888, side: THREE.DoubleSide });
+            material.userData ??= {};
+            material.userData.maxjsMaterialRegistryId = entry.id;
+            material.userData.maxjsMaterialIdentityKey = entry.key;
+            material.userData.maxjsSourceMaterialName = 'default';
+            return material;
         }
 
         const pendingMaterialDisposals = [];
@@ -4295,8 +4469,8 @@
 
         function sceneMaterialSignature(nd, wantsLine) {
             const payload = nd?.mats && nd?.groups
-                ? ['multi', nd.mats]
-                : (nd?.mat ? ['single', nd.mat] : ['default']);
+                ? ['multi', nd.mats.map(materialIdentityValue)]
+                : (nd?.mat ? ['single', materialIdentityValue(nd.mat)] : ['default']);
             return `${wantsLine ? 'line' : 'mesh'}:${JSON.stringify(payload)}`;
         }
 
@@ -4475,7 +4649,7 @@
                 if (updateMaxInstanceBucketTransform(handle, nd.t)) changed = true;
             }
             if (nd.mat) {
-                const materialSignature = JSON.stringify(nd.mat);
+                const materialSignature = materialIdentityKey(nd.mat);
                 if (bucket.lastMaterialScalarSignature !== materialSignature) {
                     applyMaterialScalar(bucket.mesh, nd.mat);
                     bucket.lastMaterialScalarSignature = materialSignature;
@@ -4492,7 +4666,7 @@
                 if (!Number.isFinite(nd?.instOf) || nd.instOf <= 0) continue;
                 if (nd.jsmod || nd.spline || nd.skin || nd.groups || nd.mats) continue;
                 const sourceHandle = nd.instOf;
-                const materialKey = nd.mat ? JSON.stringify(nd.mat) : '__default__';
+                const materialKey = nd.mat ? materialIdentityKey(nd.mat) : '__default__';
                 const bucketKey = `${sourceHandle}|${materialKey}`;
                 if (!groups.has(bucketKey)) {
                     groups.set(bucketKey, {
@@ -4587,7 +4761,7 @@
                 updateMaxInstanceBucketVisibility(bucket);
                 if (group.nodes[0]?.mat) {
                     applyMaterialScalar(mesh, group.nodes[0].mat);
-                    bucket.lastMaterialScalarSignature = JSON.stringify(group.nodes[0].mat);
+                    bucket.lastMaterialScalarSignature = materialIdentityKey(group.nodes[0].mat);
                 }
                 maxRoot.add(mesh);
                 maxInstanceBuckets.set(group.key, bucket);
@@ -4626,10 +4800,19 @@
             const totalTris = stats.reduce((s, n) => s + n.tris, 0);
             const totalVerts = stats.reduce((s, n) => s + n.verts, 0);
             console.log(`Total: ${totalVerts} verts, ${totalTris} tris, ${stats.length} nodes`);
+            console.log('[MaxJS Profile] material registry', {
+                uniqueMaterials: materialRegistryStats.uniqueMaterials,
+                materialTemplates: materialRegistryStats.materialTemplates,
+                materialRefs: materialRegistryStats.materialRefs,
+                bucketedRefs: materialRegistryStats.bucketedRefs,
+                instanceBuckets: materialRegistryStats.instanceBuckets,
+                maxRefsPerMaterial: materialRegistryStats.maxRefsPerMaterial,
+            });
             console.groupEnd();
         }
 
         function finalizeSceneSnapshot(snapshot, transport, applyStart, producerBytes, options = {}) {
+            resolveSnapshotMaterialRefs(snapshot);
             if (snapshot.camera) applyCamera(snapshot.camera);
             if (!isLocalHdriLoaded()) {
                 if (snapshot.env?.sky) applySky(snapshot.env.sky);
@@ -4645,6 +4828,7 @@
             applyForestInstances(snapshot.forestInstances ?? []);
             applyVolumes(snapshot.volumes ?? []);
             const bucketPlan = options.bucketPlan ?? planMaxInstanceBuckets(snapshot.nodes);
+            refreshMaterialRegistry(snapshot.nodes, bucketPlan);
             const bucketChanged = buildMaxInstanceBuckets(snapshot.nodes, bucketPlan);
             profileSceneNodes(snapshot.nodes);
             scene.updateMatrixWorld(options.forceWorldUpdate === true);
@@ -4677,6 +4861,7 @@
 
         // ── Scene Sync ──────────────────────────────────────
         bridge.on('scene', msg => {
+            resolveSnapshotMaterialRefs(msg);
             setTransportMode('json');
             const applyStart = performance.now();
             const incoming = new Set(msg.nodes.map(n => n.h));
@@ -5029,6 +5214,7 @@
 
         function handleBinaryScene(buffer, meta) {
             if (meta.type !== 'scene_bin') return;
+            resolveSnapshotMaterialRefs(meta);
             setTransportMode('binary-scene');
             const applyStart = performance.now();
             const incoming = new Set(meta.nodes.map(n => n.h));
@@ -5862,6 +6048,7 @@
                     const id = allocLightId(lightStableKey(light, ld));
                     light.userData ??= {};
                     light.userData.maxjsLightId = id;
+                    light.userData.maxjsLightLinked = false;
                 }
                 if (light.visible !== false) {
                     appliedLightCount++;
@@ -5890,8 +6077,8 @@
         }
 
         // ── Light Linking ────────────────────────────────────
-        // Per-mesh 64-bit light masks plus per-material HDRI / reflection-paint
-        // intensity state. Persisted by stable names so it survives re-sync.
+        // Per-mesh 64-bit light masks plus per-material HDRI intensity state.
+        // Persisted by stable names so it survives re-sync.
         const LIGHT_LINK_STORAGE_KEY = 'maxjs-light-linking';
 
         const lightLinking = (() => {
@@ -5900,7 +6087,6 @@
             // materialName -> float (0..1+) HDRI intensity. Keyed by Max material
             // name so it survives handle churn and scene rebuilds.
             const envIntensityByName = new Map();
-            const rpIntensityByName = new Map();
 
             function handleToken(handle) {
                 return handle == null ? '' : String(handle);
@@ -5995,42 +6181,52 @@
             function applyEnvIntensities() {
                 const seen = new Set();
                 forEachRenderableMesh((_h, mesh) => {
-                    ensureMeshMaskDefaults(mesh);
                     const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
                     for (const mat of materials) {
                         if (!mat || seen.has(mat)) continue;
                         seen.add(mat);
                         const matName = materialNameOf(mat);
                         const ev = envIntensityByName.get(matName);
-                        const rv = rpIntensityByName.get(matName);
                         mat.envMapIntensity = (typeof ev === 'number') ? ev : 1.0;
-                        mat[REFL_PAINT_INTENSITY_KEY] = (typeof rv === 'number') ? rv : 1.0;
                     }
                 });
             }
 
             function reapply() {
-                // Baseline: every mesh all-on.
-                forEachRenderableMesh((meshHandle, mesh) => {
-                    resetMask(mesh);
-                });
+                for (const [, light] of lightHandleMap) {
+                    if (!light?.userData) continue;
+                    light.userData.maxjsLightLinked = false;
+                }
                 // Apply each link as a bit-clear pattern.
-                for (const [lh, link] of links) {
-                    const light = getByHandle(lightHandleMap, lh);
-                    const lid = light?.userData?.maxjsLightId;
-                    if (!Number.isInteger(lid) || lid < 0 || lid >= 64) continue;
-                    if (link.mode === 'include') {
-                        forEachRenderableMesh((meshHandle, mesh) => {
-                            writeBit(mesh, lid, link.objects.has(meshHandle));
-                        });
-                    } else {
-                        for (const oh of link.objects) {
-                            const mesh = getByHandle(nodeMap, oh);
-                            if (mesh) writeBit(mesh, lid, false);
+                if (links.size > 0) {
+                    // Only linked lights need per-mesh masks. This avoids
+                    // walking every mesh on normal Studio scenes.
+                    forEachRenderableMesh((_meshHandle, mesh) => {
+                        resetMask(mesh);
+                    });
+                    for (const [lh, link] of links) {
+                        const light = getByHandle(lightHandleMap, lh);
+                        const lid = light?.userData?.maxjsLightId;
+                        if (!Number.isInteger(lid) || lid < 0 || lid >= 64) continue;
+                        light.userData.maxjsLightLinked = true;
+                        if (link.mode === 'include') {
+                            forEachRenderableMesh((meshHandle, mesh) => {
+                                writeBit(mesh, lid, link.objects.has(meshHandle));
+                            });
+                        } else {
+                            for (const oh of link.objects) {
+                                const mesh = getByHandle(nodeMap, oh);
+                                if (mesh) writeBit(mesh, lid, false);
+                            }
                         }
                     }
                 }
-                applyEnvIntensities();
+                if (envIntensityByName.size > 0) applyEnvIntensities();
+            }
+
+            function notifyLightLinkTopologyChanged() {
+                ssgiFx.markSceneChanged?.();
+                notifyLightingParamChanged();
             }
 
             function setLink(lightHandle, mode, objectHandles) {
@@ -6044,12 +6240,14 @@
                     });
                 }
                 reapply();
+                notifyLightLinkTopologyChanged();
                 save();
             }
 
             function removeLink(lightHandle) {
                 links.delete(handleToken(lightHandle));
                 reapply();
+                notifyLightLinkTopologyChanged();
                 save();
             }
 
@@ -6139,33 +6337,9 @@
                 return (typeof v === 'number') ? v : 1.0;
             }
 
-            function setRpIntensity(materialName, value) {
-                if (!materialName) return;
-                const v = Number.isFinite(value) ? value : 1.0;
-                if (v !== 1.0) rpIntensityByName.set(materialName, v);
-                else rpIntensityByName.delete(materialName);
-                let touched = false;
-                const baseEnv = envIntensityByName.get(materialName) ?? 1.0;
-                forEachMaterialByName(materialName, (mat) => {
-                    mat[REFL_PAINT_INTENSITY_KEY] = v;
-                    // Nudge a monitored property so NodeMaterialObserver
-                    // triggers a uniform refresh for every render object.
-                    mat._rpNudge = ((mat._rpNudge || 0) + 1) % 256;
-                    mat.envMapIntensity = baseEnv + mat._rpNudge * 1e-10;
-                    touched = true;
-                });
-                if (touched) notifyLightingParamChanged();
-                save();
-            }
-
-            function getRpIntensity(materialName) {
-                const v = rpIntensityByName.get(materialName);
-                return (typeof v === 'number') ? v : 1.0;
-            }
-
             function save() {
                 try {
-                    const data = { links: {}, env: {}, rp: {}, constrain: {} };
+                    const data = { links: {}, env: {}, constrain: {} };
                     data.constrain.hdri = hdriConstrainToCamera;
                     const constrainedLightNames = [];
                     for (const lh of lightCameraConstraints.keys()) {
@@ -6185,9 +6359,6 @@
                     }
                     for (const [materialName, v] of envIntensityByName) {
                         data.env[materialName] = v;
-                    }
-                    for (const [materialName, v] of rpIntensityByName) {
-                        data.rp[materialName] = v;
                     }
                     localStorage.setItem(LIGHT_LINK_STORAGE_KEY, JSON.stringify(data));
                 } catch {}
@@ -6227,17 +6398,12 @@
                         const lh = lightHandleByName(lName);
                         if (lh != null) setLightConstrainToCamera(lh, true);
                     }
-                    const rawRp = data.rp || {};
-                    for (const [materialName, v] of Object.entries(rawRp)) {
-                        if (Number.isFinite(v)) rpIntensityByName.set(materialName, v);
-                    }
                 } catch {}
             }
 
             function restoreFromStorage() {
                 links.clear();
                 envIntensityByName.clear();
-                rpIntensityByName.clear();
                 load();
                 reapply();
             }
@@ -6250,7 +6416,6 @@
                 },
                 setLink, removeLink, getLink, getAllLinks,
                 setEnvIntensity, getEnvIntensity,
-                setRpIntensity, getRpIntensity,
                 setHdriConstrainToCamera, getHdriConstrainToCamera,
                 setLightConstrainToCamera, getLightConstrainToCamera,
                 updateCameraConstraints,
@@ -6323,9 +6488,6 @@
                 for (const l of lights) {
                     html += `<option value="${l.h}">${l.name}</option>`;
                 }
-                if (getReflectionPaintNode().count > 0) {
-                    html += `<option value="__rp__">Reflection Paint (per-material intensity)</option>`;
-                }
                 html += `</select>`;
 
                 // Mode selector (hidden in HDRI mode)
@@ -6353,8 +6515,7 @@
             html += `</div>`;
             lightLinkPanel.innerHTML = html;
 
-            const rpActive = getReflectionPaintNode().count > 0;
-            if (lights.length === 0 && !hdriAvailable && !rpActive) return;
+            if (lights.length === 0 && !hdriAvailable) return;
 
             const lightSel = document.getElementById('ll-light-sel');
             const modeRow = document.getElementById('ll-mode-row');
@@ -6368,11 +6529,10 @@
             let sliderTargets = [];
 
             function isHdriMode() { return lightSel.value === '__hdri__'; }
-            function isRpMode() { return lightSel.value === '__rp__'; }
-            function isSliderMode() { return isHdriMode() || isRpMode(); }
+            function isSliderMode() { return isHdriMode(); }
             function getSelectedLight() {
                 const v = lightSel.value;
-                if (v === '__hdri__' || v === '__rp__') return v;
+                if (v === '__hdri__') return v;
                 return v;
             }
 
@@ -6394,9 +6554,7 @@
                 let inner = '';
                 if (isSliderMode()) {
                     sliderTargets = collectSliderMaterials();
-                    const getV = isHdriMode()
-                        ? (key) => lightLinking.getEnvIntensity(key)
-                        : (key) => lightLinking.getRpIntensity(key);
+                    const getV = (key) => lightLinking.getEnvIntensity(key);
                     for (let i = 0; i < sliderTargets.length; i++) {
                         const target = sliderTargets[i];
                         const v = getV(target.key);
@@ -6426,14 +6584,12 @@
                     modeRow.style.display = 'none';
                     hdriHint.style.display = '';
                     listLabel.textContent = 'Materials';
-                    hdriHint.textContent = isHdriMode()
-                        ? 'Drag sliders per material \u2014 0 removes HDRI contribution, 1 = default.'
-                        : 'Drag sliders per material \u2014 0 removes reflection paint, 1 = default.';
+                    hdriHint.textContent = 'Drag sliders per material \u2014 0 removes HDRI contribution, 1 = default.';
                     bulkBtns.style.display = 'none';
                     objList.style.opacity = '1';
                     objList.style.pointerEvents = 'auto';
                     constrainRow.style.display = 'flex';
-                    constrainCam.checked = (isHdriMode() || isRpMode()) && lightLinking.getHdriConstrainToCamera();
+                    constrainCam.checked = lightLinking.getHdriConstrainToCamera();
                     renderObjectList();
                     return;
                 }
@@ -6487,8 +6643,7 @@
                 const v = parseFloat(tgt.value);
                 const lbl = tgt.parentElement?.querySelector('span[data-index]');
                 if (lbl) lbl.textContent = v.toFixed(2);
-                if (isHdriMode()) lightLinking.setEnvIntensity(target.key, v);
-                else lightLinking.setRpIntensity(target.key, v);
+                lightLinking.setEnvIntensity(target.key, v);
             });
             objList.addEventListener('change', (ev) => {
                 if (isSliderMode()) return;
@@ -6508,7 +6663,7 @@
 
             constrainCam.addEventListener('change', () => {
                 const sel = getSelectedLight();
-                if (isHdriMode() || isRpMode()) {
+                if (isHdriMode()) {
                     lightLinking.setHdriConstrainToCamera(constrainCam.checked);
                 } else {
                     lightLinking.setLightConstrainToCamera(sel, constrainCam.checked);
@@ -6526,177 +6681,14 @@
             setLightLinkPanelVisible(!lightLinkPanelVisible);
         });
 
-        // ── Reflection Paint Panel ──────────────────────────
-        const reflPaintPanel = document.getElementById('reflPaintPanel');
-        const reflPaint = getReflectionPaintNode();
-        let reflPaintPanelVisible = false;
-        const REFL_PAINT_STORAGE_KEY = 'maxjs-reflection-paint';
-
-        function setReflPaintPanelVisible(v) {
-            if (v && !isStudioMode) return;
-            reflPaintPanelVisible = !!v;
-            reflPaintPanel.classList.toggle('visible', reflPaintPanelVisible);
-            reflPaintPanel.toggleAttribute('inert', !reflPaintPanelVisible);
-            reflPaintPanel.setAttribute('aria-hidden', String(!reflPaintPanelVisible));
-            document.getElementById('btnReflPaint')?.classList.toggle('active', reflPaintPanelVisible);
-            if (reflPaintPanelVisible) rebuildReflPaintPanel();
+        // Reflection Paint removed from Studio mode. Keeping a no-op closer
+        // prevents older UI restore paths from throwing during reload.
+        function setReflPaintPanelVisible(_v) {
+            const panel = document.getElementById('reflPaintPanel');
+            panel?.classList.remove('visible');
+            panel?.toggleAttribute('inert', true);
+            panel?.setAttribute('aria-hidden', 'true');
         }
-
-        function saveReflPaint() {
-            try {
-                localStorage.setItem(REFL_PAINT_STORAGE_KEY, JSON.stringify(reflPaint.getLights()));
-            } catch {}
-        }
-
-        function loadReflPaint() {
-            try {
-                const raw = localStorage.getItem(REFL_PAINT_STORAGE_KEY);
-                if (!raw) return;
-                const arr = JSON.parse(raw);
-                reflPaint.clearLights();
-                for (const l of arr) {
-                    reflPaint.addLight({
-                        lat: l.lat, lon: l.lon,
-                        color: l.color,
-                        colorOuter: l.colorOuter,
-                        intensity: l.intensity,
-                        radiusX: l.radiusX ?? l.radius ?? 0.15,
-                        radiusY: l.radiusY ?? l.radius ?? 0.15,
-                        edge: l.edge ?? 0.3,
-                        shape: l.shape ?? 'circle',
-                        rotation: l.rotation ?? 0,
-                    });
-                }
-            } catch {}
-        }
-        loadReflPaint();
-
-        function rpRow(cls, id, label, type, min, max, step, value, displayVal) {
-            return `<label class="fx-check"><span>${label}</span><div style="display:flex;align-items:center;gap:4px;flex:1;min-width:0;">` +
-                `<input type="range" class="fx-range ${cls}" data-id="${id}" min="${min}" max="${max}" step="${step}" value="${value}">` +
-                `<span class="${cls}-val" data-id="${id}" style="width:32px;font-size:9px;text-align:right;color:#999;font-variant-numeric:tabular-nums;flex-shrink:0;">${displayVal}</span></div></label>`;
-        }
-
-        function rebuildReflPaintPanel() {
-            const lights = reflPaint.getLights();
-            let html = `<div class="sidepanel-header"><div><div class="sidepanel-title">Reflection Paint</div>` +
-                `<div class="sidepanel-subtitle">Analytical environment highlights</div></div>` +
-                `<div style="display:flex;gap:4px"><button id="rp-add" type="button">+ Add</button>` +
-                `<button id="rp-hide" type="button">Hide</button></div></div>`;
-            html += `<div class="sidepanel-body">`;
-
-            if (lights.length === 0) {
-                html += `<div style="color:#555;font-size:10px;padding:4px 0;">No reflection lights. Click + Add to paint one on the environment sphere.</div>`;
-            }
-
-            for (const l of lights) {
-                const rotDeg = Math.round((l.rotation || 0) * 180 / Math.PI);
-                html += `<section class="fx-section" data-id="${l.id}">`;
-                html += `<div class="fx-section-title" style="margin-bottom:8px;">`;
-                html += `<span style="flex:1;">Light ${l.id}</span>`;
-                html += `<button class="rp-del" data-id="${l.id}" type="button" style="color:#c66;">Delete</button>`;
-                html += `</div>`;
-                html += `<div class="fx-grid">`;
-                // Direction
-                html += rpRow('rp-lat', l.id, 'Latitude', 'range', -90, 90, 1, Math.round(l.lat), Math.round(l.lat));
-                html += rpRow('rp-lon', l.id, 'Longitude', 'range', 0, 360, 1, Math.round(l.lon), Math.round(l.lon));
-                // Color row
-                html += `<label class="fx-check"><span>Color</span><div style="display:flex;align-items:center;gap:6px;">` +
-                    `<input type="color" class="rp-color" data-id="${l.id}" value="${l.color}" style="width:24px;height:16px;border:1px solid rgba(255,255,255,0.1);padding:0;background:none;cursor:pointer;" title="Center">` +
-                    `<span style="font-size:9px;color:#666;">Edge</span>` +
-                    `<input type="color" class="rp-color-outer" data-id="${l.id}" value="${l.colorOuter}" style="width:24px;height:16px;border:1px solid rgba(255,255,255,0.1);padding:0;background:none;cursor:pointer;" title="Edge gradient">` +
-                    `</div></label>`;
-                // Intensity
-                html += rpRow('rp-int', l.id, 'Intensity', 'range', 0, 10, 0.1, l.intensity, l.intensity.toFixed(1));
-                // Size
-                html += rpRow('rp-sx', l.id, 'Size X', 'range', 0.01, 1.5, 0.01, l.radiusX, l.radiusX.toFixed(2));
-                html += rpRow('rp-sy', l.id, 'Size Y', 'range', 0.01, 1.5, 0.01, l.radiusY, l.radiusY.toFixed(2));
-                // Shape + Rotation
-                html += `<label class="fx-check"><span>Shape</span>` +
-                    `<select class="rp-shape" data-id="${l.id}" style="background:rgba(255,255,255,0.05);color:#bbb;border:1px solid rgba(255,255,255,0.08);padding:3px 6px;font:9px/1 -apple-system,'Segoe UI',system-ui,sans-serif;">` +
-                    `<option value="circle"${l.shape === 'circle' ? ' selected' : ''}>Circle</option>` +
-                    `<option value="rect"${l.shape === 'rect' ? ' selected' : ''}>Rectangle</option></select></label>`;
-                html += rpRow('rp-rot', l.id, 'Rotation', 'range', 0, 360, 1, rotDeg, rotDeg);
-                // Edge
-                html += rpRow('rp-edge', l.id, 'Edge', 'range', 0.001, 1, 0.001, l.edge, l.edge.toFixed(3));
-                html += `</div></section>`;
-            }
-
-            html += `</div>`;
-            reflPaintPanel.innerHTML = html;
-
-            // Wire events
-            document.getElementById('rp-add')?.addEventListener('click', () => {
-                reflPaint.addLight({ lat: 45, lon: 90, intensity: 2.0, radiusX: 0.15, radiusY: 0.15, edge: 0.3, shape: 'circle', rotation: 0 });
-                saveReflPaint();
-                rebuildReflPaintPanel();
-            });
-            document.getElementById('rp-hide')?.addEventListener('click', () => {
-                setReflPaintPanelVisible(false);
-            });
-
-            for (const btn of reflPaintPanel.querySelectorAll('.rp-del')) {
-                btn.addEventListener('click', () => {
-                    reflPaint.removeLight(Number(btn.dataset.id));
-                    saveReflPaint();
-                    rebuildReflPaintPanel();
-                });
-            }
-
-            reflPaintPanel.addEventListener('input', (ev) => {
-                const el = ev.target;
-                const sec = el.closest('[data-id]');
-                const id = Number(sec?.dataset.id || el.dataset.id);
-                if (!id) return;
-                const props = {};
-                if (el.classList.contains('rp-lat') || el.classList.contains('rp-lon')) {
-                    const latEl = reflPaintPanel.querySelector(`.rp-lat[data-id="${id}"]`);
-                    const lonEl = reflPaintPanel.querySelector(`.rp-lon[data-id="${id}"]`);
-                    props.lat = parseFloat(latEl.value);
-                    props.lon = parseFloat(lonEl.value);
-                    const latV = reflPaintPanel.querySelector(`.rp-lat-val[data-id="${id}"]`);
-                    const lonV = reflPaintPanel.querySelector(`.rp-lon-val[data-id="${id}"]`);
-                    if (latV) latV.textContent = Math.round(props.lat);
-                    if (lonV) lonV.textContent = Math.round(props.lon);
-                } else if (el.classList.contains('rp-color')) {
-                    props.color = el.value;
-                } else if (el.classList.contains('rp-color-outer')) {
-                    props.colorOuter = el.value;
-                } else if (el.classList.contains('rp-int')) {
-                    props.intensity = parseFloat(el.value);
-                    const v = reflPaintPanel.querySelector(`.rp-int-val[data-id="${id}"]`);
-                    if (v) v.textContent = props.intensity.toFixed(1);
-                } else if (el.classList.contains('rp-sx')) {
-                    props.radiusX = parseFloat(el.value);
-                    const v = reflPaintPanel.querySelector(`.rp-sx-val[data-id="${id}"]`);
-                    if (v) v.textContent = props.radiusX.toFixed(2);
-                } else if (el.classList.contains('rp-sy')) {
-                    props.radiusY = parseFloat(el.value);
-                    const v = reflPaintPanel.querySelector(`.rp-sy-val[data-id="${id}"]`);
-                    if (v) v.textContent = props.radiusY.toFixed(2);
-                } else if (el.classList.contains('rp-shape')) {
-                    props.shape = el.value;
-                } else if (el.classList.contains('rp-rot')) {
-                    props.rotation = parseFloat(el.value) * Math.PI / 180;
-                    const v = reflPaintPanel.querySelector(`.rp-rot-val[data-id="${id}"]`);
-                    if (v) v.textContent = Math.round(parseFloat(el.value));
-                } else if (el.classList.contains('rp-edge')) {
-                    props.edge = parseFloat(el.value);
-                    const v = reflPaintPanel.querySelector(`.rp-edge-val[data-id="${id}"]`);
-                    if (v) v.textContent = props.edge.toFixed(3);
-                }
-                reflPaint.updateLight(id, props);
-                saveReflPaint();
-            });
-        }
-
-        document.getElementById('btnReflPaint')?.addEventListener('click', () => {
-            if (!isStudioMode) {
-                perfHud.setStatus('MaxJS - Reflection Paint is available in Studio mode only');
-                return;
-            }
-            setReflPaintPanelVisible(!reflPaintPanelVisible);
-        });
 
         // ── Hair And Fur GPU Instancing ─────────────────────
         const hairMeshes = new Map(); // handle -> { root, mesh }
@@ -7721,7 +7713,7 @@
         const btnRenderMode = document.getElementById('btnRenderMode');
         if (btnRenderMode) {
             btnRenderMode.classList.toggle('active', isStudioMode);
-            btnRenderMode.title = `Render mode: ${isStudioMode ? 'Studio' : 'Standard'} — Studio adds light linking / per-mesh HDRI / reflection paint; Standard stays within baseline WebGPU uniform-buffer limits. Toggling reloads the page.`;
+            btnRenderMode.title = `Render mode: ${isStudioMode ? 'Studio' : 'Standard'} — Studio adds light linking / per-mesh HDRI; Standard stays within baseline WebGPU uniform-buffer limits. Toggling reloads the page.`;
             btnRenderMode.addEventListener('click', () => {
                 const nextMode = isStudioMode ? 'standard' : 'studio';
                 if (!confirm(`Switch to ${nextMode === 'studio' ? 'Studio' : 'Standard'} mode? Reloads the page.`)) return;

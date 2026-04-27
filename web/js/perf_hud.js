@@ -31,6 +31,9 @@ export function createPerfHud(infoEl) {
         anchorCount: 0,
         nodeCount: 0,
         instanceCount: 0,
+        materialCount: 0,
+        materialTemplateCount: 0,
+        instanceBucketCount: 0,
         textureCount: 0,
         drawCalls: 0,
         triangleCount: 0,
@@ -62,6 +65,8 @@ export function createPerfHud(infoEl) {
             `MaxJS [${state.transport}] f${state.frameId || '-'} ${state.fps}fps ` +
             `| nodes ${state.nodeCount} ` +
             `| inst ${state.instanceCount} ` +
+            `| mat ${state.materialCount}/${state.materialTemplateCount} ` +
+            `| bkt ${state.instanceBucketCount} ` +
             `| tex ${state.textureCount} ` +
             `| bytes ${formatBytes(state.producerBytes)} ` +
             `| dec ${formatMs(state.decodeMs)} ` +

@@ -80,6 +80,8 @@ using namespace Microsoft::WRL;
 #define WM_TOGGLE_PANEL           (WM_USER + 1)
 #define WM_FAST_FLUSH             (WM_USER + 2)
 #define WM_KILL_PANEL             (WM_USER + 3)
+#define WM_SYNC_TICK              (WM_USER + 4)
+#define WM_AS_TICK                (WM_USER + 5)
 #define SETUP_TIMER_ID            2
 #define AS_TIMER_ID               3
 #define AS_INTERVAL_MS            66   // ~15fps ActiveShade
@@ -5787,6 +5789,23 @@ static Object* GetBaseObject(Object* obj) {
     return obj;
 }
 
+static bool IsDerivedObjectRef(Object* obj) {
+    return obj &&
+           (obj->ClassID() == derivObjClassID ||
+            obj->ClassID() == WSMDerivObjClassID ||
+            obj->SuperClassID() == GEN_DERIVOB_CLASS_ID);
+}
+
+static bool NodeHasModifierStack(INode* node) {
+    Object* obj = node ? node->GetObjectRef() : nullptr;
+    while (IsDerivedObjectRef(obj)) {
+        auto* derived = static_cast<IDerivedObject*>(obj);
+        if (derived->NumModifiers() > 0) return true;
+        obj = derived->GetObjRef();
+    }
+    return false;
+}
+
 // Check base object ClassID (EvalWorldState returns collapsed mesh, not Forest Pack)
 static bool IsForestPackNode(INode* node) {
     if (!node) return false;
@@ -6626,6 +6645,14 @@ public:
     std::unordered_map<ULONG, std::vector<FastVertexSource>> skinnedFastSourceCache_; // render vertex -> normal/position source
     ULONGLONG lastSkinnedLivePollTick_ = 0;
     ULONGLONG lastInteractionTick_ = 0;
+    bool haveLastTimerTime_ = false;
+    TimeValue lastTimerTime_ = 0;
+    HANDLE syncTimerQueueTimer_ = nullptr;
+    HANDLE activeShadeTimerQueueTimer_ = nullptr;
+    bool syncTimerUsesWndTimer_ = false;
+    bool activeShadeTimerUsesWndTimer_ = false;
+    volatile LONG syncTickPosted_ = 0;
+    volatile LONG activeShadeTickPosted_ = 0;
     std::unordered_set<ULONG> pluginInstHandles_;        // FP/RC/tyFlow node handles for change detection
     std::unordered_map<ULONG, uint64_t> pluginInstHash_; // plugin node → generated-instance dependency hash
 
@@ -9387,6 +9414,8 @@ public:
         skinnedControlIdxCache_.clear();
         skinnedFastSourceCache_.clear();
         lastSkinnedLivePollTick_ = 0;
+        haveLastTimerTime_ = false;
+        lastTimerTime_ = 0;
         ClearBakedMapCache();
         ResetFastPathState(false);
     }
@@ -9762,6 +9791,72 @@ public:
         }
     }
 
+    static VOID CALLBACK SyncTimerQueueProc(PVOID param, BOOLEAN) {
+        auto* self = static_cast<MaxJSPanel*>(param);
+        if (!self || !self->hwnd_) return;
+        if (InterlockedCompareExchange(&self->syncTickPosted_, 1, 0) != 0) return;
+        if (!PostMessage(self->hwnd_, WM_SYNC_TICK, 0, 0)) {
+            InterlockedExchange(&self->syncTickPosted_, 0);
+        }
+    }
+
+    static VOID CALLBACK ActiveShadeTimerQueueProc(PVOID param, BOOLEAN) {
+        auto* self = static_cast<MaxJSPanel*>(param);
+        if (!self || !self->hwnd_) return;
+        if (InterlockedCompareExchange(&self->activeShadeTickPosted_, 1, 0) != 0) return;
+        if (!PostMessage(self->hwnd_, WM_AS_TICK, 0, 0)) {
+            InterlockedExchange(&self->activeShadeTickPosted_, 0);
+        }
+    }
+
+    void StartSyncPump() {
+        if (!hwnd_ || syncTimerQueueTimer_ || syncTimerUsesWndTimer_) return;
+        InterlockedExchange(&syncTickPosted_, 0);
+        if (!CreateTimerQueueTimer(&syncTimerQueueTimer_, nullptr, SyncTimerQueueProc, this,
+                                   SYNC_INTERVAL_MS, SYNC_INTERVAL_MS, WT_EXECUTEDEFAULT)) {
+            syncTimerQueueTimer_ = nullptr;
+            SetTimer(hwnd_, SYNC_TIMER_ID, SYNC_INTERVAL_MS, nullptr);
+            syncTimerUsesWndTimer_ = true;
+        }
+    }
+
+    void StopSyncPump() {
+        if (syncTimerQueueTimer_) {
+            HANDLE timer = syncTimerQueueTimer_;
+            syncTimerQueueTimer_ = nullptr;
+            DeleteTimerQueueTimer(nullptr, timer, INVALID_HANDLE_VALUE);
+        }
+        if (syncTimerUsesWndTimer_ && hwnd_) {
+            KillTimer(hwnd_, SYNC_TIMER_ID);
+            syncTimerUsesWndTimer_ = false;
+        }
+        InterlockedExchange(&syncTickPosted_, 0);
+    }
+
+    void StartActiveShadePump() {
+        if (!hwnd_ || activeShadeTimerQueueTimer_ || activeShadeTimerUsesWndTimer_) return;
+        InterlockedExchange(&activeShadeTickPosted_, 0);
+        if (!CreateTimerQueueTimer(&activeShadeTimerQueueTimer_, nullptr, ActiveShadeTimerQueueProc, this,
+                                   AS_INTERVAL_MS, AS_INTERVAL_MS, WT_EXECUTEDEFAULT)) {
+            activeShadeTimerQueueTimer_ = nullptr;
+            SetTimer(hwnd_, AS_TIMER_ID, AS_INTERVAL_MS, nullptr);
+            activeShadeTimerUsesWndTimer_ = true;
+        }
+    }
+
+    void StopActiveShadePump() {
+        if (activeShadeTimerQueueTimer_) {
+            HANDLE timer = activeShadeTimerQueueTimer_;
+            activeShadeTimerQueueTimer_ = nullptr;
+            DeleteTimerQueueTimer(nullptr, timer, INVALID_HANDLE_VALUE);
+        }
+        if (activeShadeTimerUsesWndTimer_ && hwnd_) {
+            KillTimer(hwnd_, AS_TIMER_ID);
+            activeShadeTimerUsesWndTimer_ = false;
+        }
+        InterlockedExchange(&activeShadeTickPosted_, 0);
+    }
+
     void GetActiveCamera(CameraData& cam) {
         if (lockedCameraHandle_ != 0) {
             Interface* ip = GetCOREInterface();
@@ -9862,15 +9957,13 @@ public:
         // the hash check is wasted work — extraction will happen anyway:
         //   - Animation playback (time advancing every frame)
         //   - Interactive cooldown window (user dragged something recently)
-        //   - Other tracked handles are dirty this frame (bone, controller, anything)
         //   - Any non-renderable (bone/helper/controller) is currently selected
         //
         // Falling into the hash path is only correct for true idle where nothing
         // is moving — it avoids redundant sends when the mesh genuinely isn't
         // changing. But during any kind of activity, hashing doubles the work.
         bool skipHash = IsAnimationPlaying()
-                     || ShouldFavorInteractivePerformance()
-                     || !fastDirtyHandles_.empty();
+                     || ShouldFavorInteractivePerformance();
 
         if (!skipHash) {
             const int selCount = ip->GetSelNodeCount();
@@ -10171,6 +10264,24 @@ public:
     bool IsAnimationPlaying() const {
         Interface* ip = GetCOREInterface();
         return ip && ip->IsAnimPlaying() != 0;
+    }
+
+    void PumpTimelineSyncFromTimer() {
+        Interface* ip = GetCOREInterface();
+        if (!ip) return;
+
+        const TimeValue t = ip->GetTime();
+        if (!haveLastTimerTime_) {
+            haveLastTimerTime_ = true;
+            lastTimerTime_ = t;
+            return;
+        }
+        if (t == lastTimerTime_) return;
+
+        lastTimerTime_ = t;
+        MarkAnimatedTransformsDirty();
+        MarkCameraDirty();
+        MarkInteractiveActivity();
     }
 
     bool IsModifyTaskActive() const {
@@ -10638,13 +10749,13 @@ public:
             fastNodeEventCallbackKey_ = sceneEvents->RegisterCallback(&fastNodeEvents_, FALSE, 0, FALSE);
         }
 
-        SetTimer(hwnd_, SYNC_TIMER_ID, SYNC_INTERVAL_MS, nullptr);
+        StartSyncPump();
         callbacksRegistered_ = true;
     }
 
     void UnregisterCallbacks() {
         if (!callbacksRegistered_) return;
-        KillTimer(hwnd_, SYNC_TIMER_ID);
+        StopSyncPump();
 
         ISceneEventManager* sceneEvents = GetISceneEventManager();
         if (sceneEvents && fastNodeEventCallbackKey_) {
@@ -10896,6 +11007,8 @@ public:
             skinnedControlIdxCache_.clear();
             skinnedFastSourceCache_.clear();
             lastSkinnedLivePollTick_ = 0;
+            haveLastTimerTime_ = false;
+            lastTimerTime_ = 0;
             ResetFastPathState(false);
             SendProjectConfig();
             ScanInlineLayers();
@@ -10939,6 +11052,7 @@ public:
                 if (useBinary_) SendFullSyncBinary(); else SendFullSync();
             }
         } else {
+            PumpTimelineSyncFromTimer();
             // Poll deforming meshes every tick regardless of interactive state.
             // Max's RedrawViewsCallback only fires on full scene redraws
             // (animation, param edits, etc.) — NOT during interactive bone
@@ -13625,8 +13739,7 @@ public:
                         // firing a node event (e.g. Path Deform driven by time).
                         // Mark it for per-frame polling so playback catches it
                         // without waiting for the idle geometry detector.
-                        if (node->GetObjectRef() &&
-                            node->GetObjectRef()->SuperClassID() == GEN_DERIVOB_CLASS_ID) {
+                        if (NodeHasModifierStack(node)) {
                             deformHandles_.insert(handle);
                         } else {
                             deformHandles_.erase(handle);
@@ -13893,8 +14006,7 @@ public:
                             skinnedFastSourceCache_[ng.handle] = std::move(fastSources);
                         else
                             skinnedFastSourceCache_.erase(ng.handle);
-                        if (node->GetObjectRef() &&
-                            node->GetObjectRef()->SuperClassID() == GEN_DERIVOB_CLASS_ID) {
+                        if (NodeHasModifierStack(node)) {
                             deformHandles_.insert(ng.handle);
                         } else {
                             deformHandles_.erase(ng.handle);
@@ -14872,7 +14984,7 @@ public:
     void StartActiveShade(Bitmap* target) {
         asTarget_ = target;
         asCapturing_ = true;
-        if (hwnd_) SetTimer(hwnd_, AS_TIMER_ID, AS_INTERVAL_MS, nullptr);
+        StartActiveShadePump();
         RefreshCallbackRegistration(true);
     }
 
@@ -14880,7 +14992,7 @@ public:
         asCapturing_ = false;
         asCaptureInFlight_ = false;
         asTarget_ = nullptr;
-        if (hwnd_) KillTimer(hwnd_, AS_TIMER_ID);
+        StopActiveShadePump();
         // Release the 1080p-sized scratch buffers so they don't sit idle
         // between ActiveShade sessions. WIC factory is cheap to keep alive.
         std::vector<BYTE>().swap(asPixelScratch_);
@@ -15117,6 +15229,8 @@ public:
         skinnedControlIdxCache_.clear();
         skinnedFastSourceCache_.clear();
         lastSkinnedLivePollTick_ = 0;
+        haveLastTimerTime_ = false;
+        lastTimerTime_ = 0;
         if (hwnd_) { HWND h = hwnd_; hwnd_ = nullptr; DestroyWindow(h); }
     }
 
@@ -15150,6 +15264,18 @@ public:
             break;
         case WM_FAST_FLUSH:
             if (p) p->FlushFastPath();
+            return 0;
+        case WM_SYNC_TICK:
+            if (p) {
+                InterlockedExchange(&p->syncTickPosted_, 0);
+                p->OnTimer();
+            }
+            return 0;
+        case WM_AS_TICK:
+            if (p) {
+                InterlockedExchange(&p->activeShadeTickPosted_, 0);
+                p->CaptureActiveShadeFrame();
+            }
             return 0;
         case WM_TIMER:
             if (wParam == SYNC_TIMER_ID && p) p->OnTimer();
@@ -15223,18 +15349,24 @@ void MaxJSFastNodeEventCallback::TopologyChanged(NodeKeyTab& nodes) {
 void MaxJSFastRedrawCallback::proc(Interface*) {
     if (!owner_) return;
     const bool animPlaying = owner_->IsAnimationPlaying();
-    owner_->MarkSelectedTransformsDirty();
-    owner_->CheckTrackedMaterialScalarsLive();
-    if (!animPlaying && !owner_->ShouldFavorInteractivePerformance()) {
-        owner_->MarkTrackedLightTransformsDirty();
-        owner_->CheckTrackedLightsLive();
-        owner_->MarkTrackedSplatTransformsDirty();
-        owner_->MarkTrackedAudioTransformsDirty();
-        owner_->PollViewportModes();
-    }
+    const bool favorInteractive = owner_->ShouldFavorInteractivePerformance();
+
     owner_->MarkCameraDirtyIfChanged();
-    owner_->CheckSelectedGeometryLive();
-    owner_->CheckSkinnedGeometryLive();
+
+    // RedrawViewsCallback fires for viewport hover/selection highlight too.
+    // Keep that path light: pure mouse movement over a selected object must
+    // not evaluate every Skin/Path-Deform mesh in the scene. Real edits arrive
+    // through controller/time callbacks or the timer pump; redraw only helps
+    // while animation or an actual interactive edit is active.
+    if (animPlaying || favorInteractive) {
+        owner_->MarkSelectedTransformsDirty();
+        owner_->CheckSelectedGeometryLive();
+        owner_->CheckSkinnedGeometryLive();
+    }
+
+    if (owner_->ShouldRunInteractiveMaterialChecks()) {
+        owner_->CheckTrackedMaterialScalarsLive();
+    }
 }
 
 void MaxJSFastTimeChangeCallback::TimeChanged(TimeValue) {

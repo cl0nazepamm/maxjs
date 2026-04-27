@@ -1276,6 +1276,7 @@ static uint64_t MakeGeomValidityKey(const Interval& iv) {
 static constexpr int kSkinnedHashFullVertexThreshold = 16384;
 static constexpr int kSkinnedHashSampleCount = 256;
 static constexpr ULONGLONG kSkinnedLivePollIntervalMs = 16;
+static constexpr ULONGLONG kCameraLivePollIntervalMs = 16;
 
 static uint64_t HashSampledPoint3Array(const Point3* points,
                                        int count,
@@ -6828,6 +6829,8 @@ public:
     std::unordered_map<ULONG, std::vector<int>> skinnedControlIdxCache_; // render vertex -> control vertex
     std::unordered_map<ULONG, std::vector<FastVertexSource>> skinnedFastSourceCache_; // render vertex -> normal/position source
     ULONGLONG lastSkinnedLivePollTick_ = 0;
+    ULONGLONG lastCameraLivePollTick_ = 0;
+    ULONGLONG lastRedrawLivePollTick_ = 0;
     ULONGLONG lastInteractionTick_ = 0;
     bool haveLastTimerTime_ = false;
     TimeValue lastTimerTime_ = 0;
@@ -10506,6 +10509,16 @@ public:
                (now - lastMaterialInteractionTick_) <= kMaterialInteractiveCooldownMs;
     }
 
+    bool ConsumeRedrawLivePollSlot() {
+        const ULONGLONG now = GetTickCount64();
+        if (lastRedrawLivePollTick_ != 0 &&
+            (now - lastRedrawLivePollTick_) < kSkinnedLivePollIntervalMs) {
+            return false;
+        }
+        lastRedrawLivePollTick_ = now;
+        return true;
+    }
+
     bool IsCreateTaskActive() const {
         Interface* ip = GetCOREInterface();
         return ip && ip->GetCommandPanelTaskMode() == TASK_MODE_CREATE;
@@ -10543,6 +10556,8 @@ public:
         materialFastDirtyHandles_.clear();
         fastCameraDirty_ = false;
         fastFlushPosted_ = false;
+        lastCameraLivePollTick_ = 0;
+        lastRedrawLivePollTick_ = 0;
         if (refreshCameraState) CaptureCurrentCameraState();
         else haveLastSentCamera_ = false;
     }
@@ -10912,6 +10927,14 @@ public:
     }
 
     void MarkCameraDirtyIfChanged() {
+        if (fastCameraDirty_ && fastFlushPosted_) return;
+        const ULONGLONG now = GetTickCount64();
+        if (lastCameraLivePollTick_ != 0 &&
+            (now - lastCameraLivePollTick_) < kCameraLivePollIntervalMs) {
+            return;
+        }
+        lastCameraLivePollTick_ = now;
+
         CameraData current = {};
         GetActiveCamera(current);
         if (!haveLastSentCamera_ || !CameraEquals(lastSentCamera_, current)) {
@@ -11197,6 +11220,8 @@ public:
             skinnedControlIdxCache_.clear();
             skinnedFastSourceCache_.clear();
             lastSkinnedLivePollTick_ = 0;
+            lastCameraLivePollTick_ = 0;
+            lastRedrawLivePollTick_ = 0;
             haveLastTimerTime_ = false;
             lastTimerTime_ = 0;
             ResetFastPathState(false);
@@ -15543,18 +15568,19 @@ void MaxJSFastNodeEventCallback::TopologyChanged(NodeKeyTab& nodes) {
 void MaxJSFastRedrawCallback::proc(Interface*) {
     if (!owner_) return;
     const bool animPlaying = owner_->IsAnimationPlaying();
-    const bool favorInteractive = owner_->ShouldFavorInteractivePerformance();
+    const bool favorInteractive = !animPlaying && owner_->ShouldFavorInteractivePerformance();
 
     owner_->MarkCameraDirtyIfChanged();
 
     // RedrawViewsCallback fires for viewport hover/selection highlight too.
-    // Keep that path light: pure mouse movement over a selected object must
-    // not evaluate every Skin/Path-Deform mesh in the scene. Real edits arrive
-    // through controller/time callbacks or the timer pump; redraw only helps
-    // while animation or an actual interactive edit is active.
-    if (animPlaying || favorInteractive) {
+    // During playback, high-polling-rate mouse movement can multiply redraw
+    // callbacks without advancing time. Let TimeChanged/timer own playback
+    // sync, and use redraw as a capped helper for real interactive edits.
+    if (!animPlaying && favorInteractive && owner_->ConsumeRedrawLivePollSlot()) {
         owner_->MarkSelectedTransformsDirty();
         owner_->CheckSelectedGeometryLive();
+        owner_->CheckSkinnedGeometryLive();
+    } else if (animPlaying && owner_->ConsumeRedrawLivePollSlot()) {
         owner_->CheckSkinnedGeometryLive();
     }
 

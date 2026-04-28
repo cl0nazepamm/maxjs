@@ -4677,7 +4677,11 @@
             const payload = nd?.mats && nd?.groups
                 ? ['multi', nd.mats.map(materialIdentityValue)]
                 : (nd?.mat ? ['single', materialIdentityValue(nd.mat)] : ['default']);
-            return `${wantsLine ? 'line' : 'mesh'}:${bakeStateSignature()}:${JSON.stringify(payload)}`;
+            // Bake mode (beauty) is the only state that swaps material *type*; track it
+            // so material-type changes still trigger rebuild. Other bake fields (folder,
+            // intensity, suffixes) mutate the existing material in place.
+            const bakeKey = bakeOverrides.enabled && bakeOverrides.mode === 'beauty' ? 'beauty' : 'live';
+            return `${wantsLine ? 'line' : 'mesh'}:${bakeKey}:${JSON.stringify(payload)}`;
         }
 
         function isCachedMaterialTemplate(material) {
@@ -5058,7 +5062,6 @@
             }
             const applyMs = performance.now() - applyStart;
             markInitialSync();
-            maybeRequestBakeUv2Resync('scene_sync');
             updateSyncHud({
                 transport,
                 frameId: snapshot.frame ?? 0,
@@ -5144,7 +5147,6 @@
                     if (nd.v && nd.i && !jsmodSkipGeo && geom !== mesh.geometry) {
                         mesh.geometry.dispose();
                         mesh.geometry = geom;
-                        if (bakeOverrides.enabled) mesh.userData.maxjsMaterialSignature = '';
                     }
                     if (ensureSceneRenderableMaterial(mesh, nd, wantsLine)) {
                         sceneChanged = true;
@@ -5599,7 +5601,6 @@
                         releaseGeometryRef(geometryRefCounts, mesh.geometry);
                         retainGeometryRef(geometryRefCounts, geom);
                         mesh.geometry = geom;
-                        if (bakeOverrides.enabled) mesh.userData.maxjsMaterialSignature = '';
                     }
                     if (ensureSceneRenderableMaterial(mesh, nd, wantsLine)) {
                         sceneChanged = true;
@@ -7272,15 +7273,81 @@
             return { meshes, uv2 };
         }
 
+        function mutateLightmapBakeOnMaterial(material, nd, geom) {
+            if (!material) return false;
+            if (material.isLineBasicMaterial || material.isLineDashedMaterial) return false;
+            const wasOverride = material.userData?.maxjsBakeOverride;
+            const shouldApply = bakeOverrides.enabled && bakeOverrides.mode === 'lightmap';
+
+            if (!shouldApply) {
+                if (wasOverride === 'lightmap') {
+                    material.lightMap = null;
+                    material.lightMapIntensity = 1.0;
+                    if (material.userData) delete material.userData.maxjsBakeOverride;
+                    material.needsUpdate = true;
+                    return true;
+                }
+                return false;
+            }
+
+            const url = getBakeTextureUrl(nd, material, 'lightmap');
+            if (!url || !hasGeometryUV2(geom)) {
+                material.userData ??= {};
+                if (!url) {
+                    if (wasOverride === 'lightmap') {
+                        material.lightMap = null;
+                        material.lightMapIntensity = 1.0;
+                        delete material.userData.maxjsBakeOverride;
+                        material.needsUpdate = true;
+                        return true;
+                    }
+                    return false;
+                }
+                material.userData.maxjsBakeMissingUV2 = true;
+                return false;
+            }
+
+            const tex = loadTexture(url, THREE.LinearSRGBColorSpace, null, fallbackWhiteTexture);
+            if (!tex) return false;
+            const nextLightMap = applyTextureUvChannel(tex, 2, 2);
+            const intensity = bakeOverrides.intensity;
+            const lightMapChanged = material.lightMap !== nextLightMap;
+            const intensityChanged = material.lightMapIntensity !== intensity;
+            if (!lightMapChanged && !intensityChanged && wasOverride === 'lightmap') return false;
+            material.lightMap = nextLightMap;
+            material.lightMapIntensity = intensity;
+            material.userData ??= {};
+            material.userData.maxjsBakeOverride = 'lightmap';
+            if (lightMapChanged) material.needsUpdate = true;
+            return true;
+        }
+
         function reapplyBakeOverridesToScene() {
             let changed = false;
+            const wantsBeauty = bakeOverrides.enabled && bakeOverrides.mode === 'beauty';
+            const seenMats = new WeakSet();
+
             for (const mesh of nodeMap.values()) {
                 const nd = mesh?.userData?.maxjsLastNodePayload;
                 if (!mesh || !nd) continue;
-                const wantsLine = mesh.isLine || mesh.isLineSegments;
-                if (ensureSceneRenderableMaterial(mesh, nd, wantsLine)) {
-                    changed = true;
-                    if (nd.h != null) layerManager.applyMaterialOverrides?.(nd.h, mesh);
+                const mats = Array.isArray(mesh.material) ? mesh.material : (mesh.material ? [mesh.material] : []);
+                const hasBeautyOverride = mats.some(m => m?.userData?.maxjsBakeOverride === 'beauty');
+
+                if (wantsBeauty || hasBeautyOverride) {
+                    const wantsLine = mesh.isLine || mesh.isLineSegments;
+                    mesh.userData ??= {};
+                    mesh.userData.maxjsMaterialSignature = '';
+                    if (ensureSceneRenderableMaterial(mesh, nd, wantsLine)) {
+                        changed = true;
+                        if (nd.h != null) layerManager.applyMaterialOverrides?.(nd.h, mesh);
+                    }
+                    continue;
+                }
+
+                for (const m of mats) {
+                    if (!m || seenMats.has(m)) continue;
+                    seenMats.add(m);
+                    if (mutateLightmapBakeOnMaterial(m, nd, mesh.geometry)) changed = true;
                 }
             }
             if (changed) {
@@ -7291,28 +7358,22 @@
         }
 
         function applyBakeState(payload, { persist = false, rebuild = true, refreshPanel = true } = {}) {
-            bakeOverrides = normalizeBakeState(payload);
+            const next = normalizeBakeState(payload);
+            const prevSignature = bakeStateSignature();
+            const nextSignature = JSON.stringify(next);
+            if (prevSignature === nextSignature) {
+                if (refreshPanel && bakePanelVisible) rebuildBakePanel();
+                return;
+            }
+            bakeOverrides = next;
             if (rebuild) reapplyBakeOverridesToScene();
             if (refreshPanel && bakePanelVisible) rebuildBakePanel();
-            maybeRequestBakeUv2Resync('bake_state');
             if (persist) saveBakeState();
         }
 
         function saveBakeState() {
             const payload = serializeBakeState();
             const signature = JSON.stringify(payload);
-            const projectRuntime = _projectRuntimeRef;
-            if (projectRuntime?.setBakeState) {
-                if (signature === lastProjectBakeSignature) return;
-                lastProjectBakeSignature = signature;
-                clearTimeout(bakePersistTimer);
-                bakePersistTimer = setTimeout(() => {
-                    void projectRuntime.setBakeState(payload).catch(error => {
-                        reportBridgeError('bake state save', error);
-                    });
-                }, 180);
-                return;
-            }
             try {
                 localStorage.setItem(BAKE_STORAGE_KEY, signature);
             } catch {}

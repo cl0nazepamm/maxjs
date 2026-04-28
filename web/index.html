@@ -7254,7 +7254,17 @@
         let bakePanelVisible = false;
         let bakePersistTimer = 0;
         let lastProjectBakeSignature = '';
+        let suppressBakePersistenceDepth = 0;
         const BAKE_STORAGE_KEY = 'maxjs_bake_state';
+
+        function withBakePersistenceSuppressed(fn) {
+            suppressBakePersistenceDepth += 1;
+            try {
+                return fn();
+            } finally {
+                suppressBakePersistenceDepth = Math.max(0, suppressBakePersistenceDepth - 1);
+            }
+        }
 
         function escapeBakeHtml(value) {
             return String(value ?? '').replace(/[&<>"']/g, ch => ({
@@ -7372,6 +7382,7 @@
         }
 
         function saveBakeState() {
+            if (suppressBakePersistenceDepth > 0) return;
             const payload = serializeBakeState();
             const signature = JSON.stringify(payload);
             try {
@@ -7383,13 +7394,19 @@
             const projectPayload = _projectRuntimeRef?.getBakeState?.();
             if (projectPayload) {
                 lastProjectBakeSignature = JSON.stringify(projectPayload);
-                applyBakeState(projectPayload, { rebuild: true });
+                withBakePersistenceSuppressed(() => {
+                    applyBakeState(projectPayload, { rebuild: true });
+                });
                 return;
             }
             if (_projectRuntimeRef) return;
             try {
                 const raw = localStorage.getItem(BAKE_STORAGE_KEY);
-                if (raw) applyBakeState(JSON.parse(raw), { rebuild: true });
+                if (raw) {
+                    withBakePersistenceSuppressed(() => {
+                        applyBakeState(JSON.parse(raw), { rebuild: true });
+                    });
+                }
             } catch {}
         }
 
@@ -7399,7 +7416,9 @@
             const signature = JSON.stringify(payload);
             if (!signature || signature === lastProjectBakeSignature) return;
             lastProjectBakeSignature = signature;
-            applyBakeState(payload, { rebuild: true });
+            withBakePersistenceSuppressed(() => {
+                applyBakeState(payload, { rebuild: true });
+            });
         }
 
         function setBakePanelVisible(v) {

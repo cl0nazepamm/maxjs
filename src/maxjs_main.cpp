@@ -10015,7 +10015,7 @@ public:
         if (triggerReload) {
             SendProjectReload();
         } else {
-            suppressProjectReloadCount_ = std::max(suppressProjectReloadCount_, 2);
+            suppressProjectReloadCount_ = std::max(suppressProjectReloadCount_, 6);
         }
         return true;
     }

@@ -1206,6 +1206,9 @@
             <button id="btnLightLink" class="rail-btn devonly" title="Light Linking" aria-label="Light Linking">
                 <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6.5 8.5a2.5 2.5 0 0 0 3.5 0l2.5-2.5a2.5 2.5 0 0 0-3.5-3.5L8 3.5"/><path d="M9.5 7.5a2.5 2.5 0 0 0-3.5 0L3.5 10a2.5 2.5 0 0 0 3.5 3.5L8 12.5"/></svg>
             </button>
+            <button id="btnReflPaint" class="rail-btn devonly" title="Reflection Paint" aria-label="Reflection Paint">
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 7-5 5a2 2 0 0 1-3-3l5-5"/><path d="m14 2-5 5M12 4l2 2"/></svg>
+            </button>
             <button id="btnSwitchVR" class="rail-btn devonly" title="Switch to WebGL for XR (reload)" aria-label="XR — use WebGL backend">
                 <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="1" y="5" width="14" height="6" rx="2"/><circle cx="5" cy="8" r="1.2"/><circle cx="11" cy="8" r="1.2"/><path d="M8 6.5v3"/></svg>
                 <span class="rail-btn-label">XR</span>
@@ -1288,6 +1291,7 @@
         <aside id="canvasPanel" class="sidepanel" aria-hidden="true" inert></aside>
         <aside id="shaderLabPanel" class="sidepanel" aria-hidden="true" inert></aside>
         <aside id="lightLinkPanel" class="sidepanel" aria-hidden="true" inert></aside>
+        <aside id="reflPaintPanel" class="sidepanel" aria-hidden="true" inert></aside>
         <aside id="postPanel" class="sidepanel" aria-hidden="true" inert></aside>
     </div>
     <div class="dock-drag-handle" aria-hidden="true"></div>
@@ -1348,6 +1352,7 @@
         import {
             maxLights,
             ensureMeshMaskDefaults,
+            getReflectionPaintNode,
             LIGHT_MASK_LO_KEY,
             LIGHT_MASK_HI_KEY,
         } from './js/max_lights_node.js';
@@ -1645,7 +1650,7 @@
             } catch { return 'standard'; }
         })();
         const isStudioMode = maxjsRenderMode === 'studio';
-        const STUDIO_ONLY_RAIL_IDS = ['btnLightLink'];
+        const STUDIO_ONLY_RAIL_IDS = ['btnLightLink', 'btnReflPaint'];
 
         function setRailButtonMeta(button, { label, badge } = {}) {
             if (!button) return;
@@ -4070,8 +4075,8 @@
             if (hasInitialSync) return;
             hasInitialSync = true;
             stopReadyRetry();
-            // Restore light linking now that lights + meshes are populated.
-            lightLinking.restoreFromStorage();
+            // Restore Studio manifest state now that lights + meshes are populated.
+            restoreStudioState();
         }
 
         function startBridgeHandshake() {
@@ -6221,7 +6226,7 @@
                         }
                     }
                 }
-                if (envIntensityByName.size > 0) applyEnvIntensities();
+                applyEnvIntensities();
             }
 
             function notifyLightLinkTopologyChanged() {
@@ -6337,38 +6342,68 @@
                 return (typeof v === 'number') ? v : 1.0;
             }
 
-            function save() {
-                try {
-                    const data = { links: {}, env: {}, constrain: {} };
-                    data.constrain.hdri = hdriConstrainToCamera;
-                    const constrainedLightNames = [];
-                    for (const lh of lightCameraConstraints.keys()) {
-                        const n = getByHandle(lightHandleMap, lh)?.name;
-                        if (n) constrainedLightNames.push(n);
-                    }
-                    if (constrainedLightNames.length) data.constrain.lights = constrainedLightNames;
-                    for (const [lh, link] of links) {
-                        const lName = getByHandle(lightHandleMap, lh)?.name;
-                        if (!lName) continue;
-                        const objNames = [];
-                        for (const oh of link.objects) {
-                            const n = getByHandle(nodeMap, oh)?.name;
-                            if (n) objNames.push(n);
-                        }
-                        data.links[lName] = { mode: link.mode, objects: objNames };
-                    }
-                    for (const [materialName, v] of envIntensityByName) {
-                        data.env[materialName] = v;
-                    }
-                    localStorage.setItem(LIGHT_LINK_STORAGE_KEY, JSON.stringify(data));
-                } catch {}
+            function setReflectionPaintIntensity(value) {
+                const paint = getReflectionPaintNode();
+                const wasActive = paint.active;
+                const v = Number.isFinite(value) ? Math.max(0, value) : 1.0;
+                paint.setGlobalIntensity(v);
+                if (wasActive !== paint.active) notifyLightLinkTopologyChanged();
+                else notifyLightingParamChanged();
+                save();
             }
 
-            function load() {
+            function getReflectionPaintIntensity() {
+                return getReflectionPaintNode().getGlobalIntensity();
+            }
+
+            function serialize() {
+                const data = { links: {}, env: {}, constrain: {} };
+                data.reflectionPaintIntensity = getReflectionPaintIntensity();
+                data.constrain.hdri = hdriConstrainToCamera;
+                const constrainedLightNames = [];
+                for (const lh of lightCameraConstraints.keys()) {
+                    const n = getByHandle(lightHandleMap, lh)?.name;
+                    if (n) constrainedLightNames.push(n);
+                }
+                if (constrainedLightNames.length) data.constrain.lights = constrainedLightNames;
+                for (const [lh, link] of links) {
+                    const lName = getByHandle(lightHandleMap, lh)?.name;
+                    if (!lName) continue;
+                    const objNames = [];
+                    for (const oh of link.objects) {
+                        const n = getByHandle(nodeMap, oh)?.name;
+                        if (n) objNames.push(n);
+                    }
+                    data.links[lName] = { mode: link.mode, objects: objNames };
+                }
+                for (const [materialName, v] of envIntensityByName) {
+                    data.env[materialName] = v;
+                }
+                return data;
+            }
+
+            function save() {
+                saveStudioState();
+            }
+
+            function readLegacyStorage() {
                 try {
                     const raw = localStorage.getItem(LIGHT_LINK_STORAGE_KEY);
-                    if (!raw) return;
-                    const data = JSON.parse(raw);
+                    return raw ? JSON.parse(raw) : null;
+                } catch {
+                    return null;
+                }
+            }
+
+            function applyPayload(data) {
+                try {
+                    links.clear();
+                    envIntensityByName.clear();
+                    lightCameraConstraints.clear();
+                    if (!data || typeof data !== 'object') {
+                        reapply();
+                        return;
+                    }
                     // Back-compat: old format was flat { lightName: {mode, objects} }.
                     const rawLinks = data.links || (data.env === undefined ? data : {});
                     const rawEnv = data.env || {};
@@ -6398,24 +6433,26 @@
                         const lh = lightHandleByName(lName);
                         if (lh != null) setLightConstrainToCamera(lh, true);
                     }
+                    if (Number.isFinite(data.reflectionPaintIntensity)) {
+                        getReflectionPaintNode().setGlobalIntensity(data.reflectionPaintIntensity);
+                    }
+                    reapply();
                 } catch {}
             }
 
             function restoreFromStorage() {
-                links.clear();
-                envIntensityByName.clear();
-                load();
-                reapply();
+                applyPayload(readLegacyStorage());
             }
 
             return {
-                reapply, restoreFromStorage,
+                reapply, serialize, applyPayload, restoreFromStorage,
                 refreshSceneBindings: () => {
                     reapply();
                     notifyLightingParamChanged();
                 },
                 setLink, removeLink, getLink, getAllLinks,
                 setEnvIntensity, getEnvIntensity,
+                setReflectionPaintIntensity, getReflectionPaintIntensity,
                 setHdriConstrainToCamera, getHdriConstrainToCamera,
                 setLightConstrainToCamera, getLightConstrainToCamera,
                 updateCameraConstraints,
@@ -6476,7 +6513,8 @@
                 `<div class="sidepanel-body" style="gap:6px;">`;
 
             const hdriAvailable = !!scene.environment;
-            if (lights.length === 0 && !hdriAvailable) {
+            const reflectionPaintAvailable = getReflectionPaintNode().count > 0;
+            if (lights.length === 0 && !hdriAvailable && !reflectionPaintAvailable) {
                 html += `<div style="color:#666;padding:8px 0;">No lights or HDRI in scene</div>`;
             } else {
                 // Target selector: HDRI first, then individual lights.
@@ -6487,6 +6525,9 @@
                 }
                 for (const l of lights) {
                     html += `<option value="${l.h}">${l.name}</option>`;
+                }
+                if (reflectionPaintAvailable) {
+                    html += `<option value="__rp__">Reflection Paint (global intensity)</option>`;
                 }
                 html += `</select>`;
 
@@ -6515,7 +6556,7 @@
             html += `</div>`;
             lightLinkPanel.innerHTML = html;
 
-            if (lights.length === 0 && !hdriAvailable) return;
+            if (lights.length === 0 && !hdriAvailable && !reflectionPaintAvailable) return;
 
             const lightSel = document.getElementById('ll-light-sel');
             const modeRow = document.getElementById('ll-mode-row');
@@ -6529,10 +6570,11 @@
             let sliderTargets = [];
 
             function isHdriMode() { return lightSel.value === '__hdri__'; }
-            function isSliderMode() { return isHdriMode(); }
+            function isRpMode() { return lightSel.value === '__rp__'; }
+            function isSliderMode() { return isHdriMode() || isRpMode(); }
             function getSelectedLight() {
                 const v = lightSel.value;
-                if (v === '__hdri__') return v;
+                if (v === '__hdri__' || v === '__rp__') return v;
                 return v;
             }
 
@@ -6552,7 +6594,15 @@
 
             function renderObjectList() {
                 let inner = '';
-                if (isSliderMode()) {
+                if (isRpMode()) {
+                    const v = lightLinking.getReflectionPaintIntensity();
+                    sliderTargets = [{ key: '__reflection_paint_global__', name: 'Global Intensity' }];
+                    inner += `<div style="display:flex;align-items:center;gap:6px;padding:1px 2px;font-size:10px;">`;
+                    inner += `<span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">Global Intensity</span>`;
+                    inner += `<input type="range" data-index="0" min="0" max="2" step="0.01" value="${v}" style="width:90px;accent-color:#e8e8e8;">`;
+                    inner += `<span data-index="0" style="width:30px;text-align:right;color:#aaa;font-variant-numeric:tabular-nums;">${v.toFixed(2)}</span>`;
+                    inner += `</div>`;
+                } else if (isHdriMode()) {
                     sliderTargets = collectSliderMaterials();
                     const getV = (key) => lightLinking.getEnvIntensity(key);
                     for (let i = 0; i < sliderTargets.length; i++) {
@@ -6583,8 +6633,10 @@
                 if (isSliderMode()) {
                     modeRow.style.display = 'none';
                     hdriHint.style.display = '';
-                    listLabel.textContent = 'Materials';
-                    hdriHint.textContent = 'Drag sliders per material \u2014 0 removes HDRI contribution, 1 = default.';
+                    listLabel.textContent = isRpMode() ? 'Reflection Paint' : 'Materials';
+                    hdriHint.textContent = isRpMode()
+                        ? 'Global multiplier for the painted environment overlay.'
+                        : 'Drag sliders per material \u2014 0 removes HDRI contribution, 1 = default.';
                     bulkBtns.style.display = 'none';
                     objList.style.opacity = '1';
                     objList.style.pointerEvents = 'auto';
@@ -6643,7 +6695,8 @@
                 const v = parseFloat(tgt.value);
                 const lbl = tgt.parentElement?.querySelector('span[data-index]');
                 if (lbl) lbl.textContent = v.toFixed(2);
-                lightLinking.setEnvIntensity(target.key, v);
+                if (isRpMode()) lightLinking.setReflectionPaintIntensity(v);
+                else lightLinking.setEnvIntensity(target.key, v);
             });
             objList.addEventListener('change', (ev) => {
                 if (isSliderMode()) return;
@@ -6663,7 +6716,7 @@
 
             constrainCam.addEventListener('change', () => {
                 const sel = getSelectedLight();
-                if (isHdriMode()) {
+                if (isHdriMode() || isRpMode()) {
                     lightLinking.setHdriConstrainToCamera(constrainCam.checked);
                 } else {
                     lightLinking.setLightConstrainToCamera(sel, constrainCam.checked);
@@ -6681,13 +6734,292 @@
             setLightLinkPanelVisible(!lightLinkPanelVisible);
         });
 
-        // Reflection Paint removed from Studio mode. Keeping a no-op closer
-        // prevents older UI restore paths from throwing during reload.
-        function setReflPaintPanelVisible(_v) {
-            const panel = document.getElementById('reflPaintPanel');
-            panel?.classList.remove('visible');
-            panel?.toggleAttribute('inert', true);
-            panel?.setAttribute('aria-hidden', 'true');
+        // ── Reflection Paint Panel ──────────────────────────
+        const reflPaintPanel = document.getElementById('reflPaintPanel');
+        const reflPaint = getReflectionPaintNode();
+        let reflPaintPanelVisible = false;
+        const REFL_PAINT_STORAGE_KEY = 'maxjs-reflection-paint';
+
+        function notifyReflectionPaintChanged(wasActive) {
+            if (wasActive !== reflPaint.active) ssgiFx.markSceneChanged?.();
+            ssgiFx.markOutputChanged?.();
+            if (lightLinkPanelVisible) rebuildLightLinkPanel();
+        }
+
+        function setReflPaintPanelVisible(v) {
+            if (v && !isStudioMode) return;
+            reflPaintPanelVisible = !!v;
+            reflPaintPanel.classList.toggle('visible', reflPaintPanelVisible);
+            reflPaintPanel.toggleAttribute('inert', !reflPaintPanelVisible);
+            reflPaintPanel.setAttribute('aria-hidden', String(!reflPaintPanelVisible));
+            document.getElementById('btnReflPaint')?.classList.toggle('active', reflPaintPanelVisible);
+            if (reflPaintPanelVisible) rebuildReflPaintPanel();
+        }
+
+        function saveReflPaint() {
+            saveStudioState();
+        }
+
+        function serializeReflectionPaintState() {
+            return {
+                intensity: reflPaint.getGlobalIntensity?.() ?? 1.0,
+                lights: reflPaint.getLights(),
+            };
+        }
+
+        function applyReflectionPaintState(payload) {
+            try {
+                const lights = Array.isArray(payload) ? payload : payload?.lights;
+                const wasActive = reflPaint.active;
+                if (Number.isFinite(payload?.intensity)) {
+                    reflPaint.setGlobalIntensity(payload.intensity);
+                } else if (payload && !Array.isArray(payload)) {
+                    reflPaint.setGlobalIntensity(1.0);
+                }
+                reflPaint.clearLights();
+                for (const l of (Array.isArray(lights) ? lights : [])) {
+                    reflPaint.addLight({
+                        lat: l.lat, lon: l.lon,
+                        color: l.color,
+                        colorOuter: l.colorOuter,
+                        intensity: l.intensity,
+                        radiusX: l.radiusX ?? l.radius ?? 0.15,
+                        radiusY: l.radiusY ?? l.radius ?? 0.15,
+                        edge: l.edge ?? 0.3,
+                        shape: l.shape ?? 'circle',
+                        rotation: l.rotation ?? 0,
+                    });
+                }
+                notifyReflectionPaintChanged(wasActive);
+            } catch {}
+        }
+
+        function readLegacyReflectionPaintState() {
+            try {
+                const raw = localStorage.getItem(REFL_PAINT_STORAGE_KEY);
+                return raw ? { lights: JSON.parse(raw) } : null;
+            } catch {
+                return null;
+            }
+        }
+
+        function rpRow(cls, id, label, type, min, max, step, value, displayVal) {
+            return `<label class="fx-check"><span>${label}</span><div style="display:flex;align-items:center;gap:4px;flex:1;min-width:0;">` +
+                `<input type="${type}" class="fx-range ${cls}" data-id="${id}" min="${min}" max="${max}" step="${step}" value="${value}">` +
+                `<span class="${cls}-val" data-id="${id}" style="width:32px;font-size:9px;text-align:right;color:#999;font-variant-numeric:tabular-nums;flex-shrink:0;">${displayVal}</span></div></label>`;
+        }
+
+        function handleReflPaintInput(ev) {
+            const el = ev.target;
+            const sec = el.closest('[data-id]');
+            const id = Number(sec?.dataset.id || el.dataset.id);
+            if (!id) return;
+            const wasActive = reflPaint.active;
+            const props = {};
+            if (el.classList.contains('rp-lat') || el.classList.contains('rp-lon')) {
+                const latEl = reflPaintPanel.querySelector(`.rp-lat[data-id="${id}"]`);
+                const lonEl = reflPaintPanel.querySelector(`.rp-lon[data-id="${id}"]`);
+                props.lat = parseFloat(latEl.value);
+                props.lon = parseFloat(lonEl.value);
+                const latV = reflPaintPanel.querySelector(`.rp-lat-val[data-id="${id}"]`);
+                const lonV = reflPaintPanel.querySelector(`.rp-lon-val[data-id="${id}"]`);
+                if (latV) latV.textContent = Math.round(props.lat);
+                if (lonV) lonV.textContent = Math.round(props.lon);
+            } else if (el.classList.contains('rp-color')) {
+                props.color = el.value;
+            } else if (el.classList.contains('rp-color-outer')) {
+                props.colorOuter = el.value;
+            } else if (el.classList.contains('rp-int')) {
+                props.intensity = parseFloat(el.value);
+                const v = reflPaintPanel.querySelector(`.rp-int-val[data-id="${id}"]`);
+                if (v) v.textContent = props.intensity.toFixed(1);
+            } else if (el.classList.contains('rp-sx')) {
+                props.radiusX = parseFloat(el.value);
+                const v = reflPaintPanel.querySelector(`.rp-sx-val[data-id="${id}"]`);
+                if (v) v.textContent = props.radiusX.toFixed(2);
+            } else if (el.classList.contains('rp-sy')) {
+                props.radiusY = parseFloat(el.value);
+                const v = reflPaintPanel.querySelector(`.rp-sy-val[data-id="${id}"]`);
+                if (v) v.textContent = props.radiusY.toFixed(2);
+            } else if (el.classList.contains('rp-shape')) {
+                props.shape = el.value;
+            } else if (el.classList.contains('rp-rot')) {
+                props.rotation = parseFloat(el.value) * Math.PI / 180;
+                const v = reflPaintPanel.querySelector(`.rp-rot-val[data-id="${id}"]`);
+                if (v) v.textContent = Math.round(parseFloat(el.value));
+            } else if (el.classList.contains('rp-edge')) {
+                props.edge = parseFloat(el.value);
+                const v = reflPaintPanel.querySelector(`.rp-edge-val[data-id="${id}"]`);
+                if (v) v.textContent = props.edge.toFixed(3);
+            } else {
+                return;
+            }
+            reflPaint.updateLight(id, props);
+            saveReflPaint();
+            notifyReflectionPaintChanged(wasActive);
+        }
+
+        reflPaintPanel.addEventListener('input', handleReflPaintInput);
+
+        function rebuildReflPaintPanel() {
+            const lights = reflPaint.getLights();
+            let html = `<div class="sidepanel-header"><div><div class="sidepanel-title">Reflection Paint</div>` +
+                `<div class="sidepanel-subtitle">Global painted HDRI overlay</div></div>` +
+                `<div style="display:flex;gap:4px"><button id="rp-add" type="button">+ Add</button>` +
+                `<button id="rp-hide" type="button">Hide</button></div></div>`;
+            html += `<div class="sidepanel-body">`;
+
+            if (lights.length === 0) {
+                html += `<div style="color:#555;font-size:10px;padding:4px 0;">No paint lights. Click + Add to paint one on the environment sphere.</div>`;
+            }
+
+            for (const l of lights) {
+                const rotDeg = Math.round((l.rotation || 0) * 180 / Math.PI);
+                html += `<section class="fx-section" data-id="${l.id}">`;
+                html += `<div class="fx-section-title" style="margin-bottom:8px;">`;
+                html += `<span style="flex:1;">Paint ${l.id}</span>`;
+                html += `<button class="rp-del" data-id="${l.id}" type="button" style="color:#c66;">Delete</button>`;
+                html += `</div>`;
+                html += `<div class="fx-grid">`;
+                html += rpRow('rp-lat', l.id, 'Latitude', 'range', -90, 90, 1, Math.round(l.lat), Math.round(l.lat));
+                html += rpRow('rp-lon', l.id, 'Longitude', 'range', 0, 360, 1, Math.round(l.lon), Math.round(l.lon));
+                html += `<label class="fx-check"><span>Color</span><div style="display:flex;align-items:center;gap:6px;">` +
+                    `<input type="color" class="rp-color" data-id="${l.id}" value="${l.color}" style="width:24px;height:16px;border:1px solid rgba(255,255,255,0.1);padding:0;background:none;cursor:pointer;" title="Center">` +
+                    `<span style="font-size:9px;color:#666;">Edge</span>` +
+                    `<input type="color" class="rp-color-outer" data-id="${l.id}" value="${l.colorOuter}" style="width:24px;height:16px;border:1px solid rgba(255,255,255,0.1);padding:0;background:none;cursor:pointer;" title="Edge gradient">` +
+                    `</div></label>`;
+                html += rpRow('rp-int', l.id, 'Intensity', 'range', 0, 10, 0.1, l.intensity, l.intensity.toFixed(1));
+                html += rpRow('rp-sx', l.id, 'Size X', 'range', 0.01, 1.5, 0.01, l.radiusX, l.radiusX.toFixed(2));
+                html += rpRow('rp-sy', l.id, 'Size Y', 'range', 0.01, 1.5, 0.01, l.radiusY, l.radiusY.toFixed(2));
+                html += `<label class="fx-check"><span>Shape</span>` +
+                    `<select class="rp-shape" data-id="${l.id}" style="background:rgba(255,255,255,0.05);color:#bbb;border:1px solid rgba(255,255,255,0.08);padding:3px 6px;font:9px/1 -apple-system,'Segoe UI',system-ui,sans-serif;">` +
+                    `<option value="circle"${l.shape === 'circle' ? ' selected' : ''}>Circle</option>` +
+                    `<option value="rect"${l.shape === 'rect' ? ' selected' : ''}>Rectangle</option></select></label>`;
+                html += rpRow('rp-rot', l.id, 'Rotation', 'range', 0, 360, 1, rotDeg, rotDeg);
+                html += rpRow('rp-edge', l.id, 'Edge', 'range', 0.001, 1, 0.001, l.edge, l.edge.toFixed(3));
+                html += `</div></section>`;
+            }
+
+            html += `</div>`;
+            reflPaintPanel.innerHTML = html;
+
+            document.getElementById('rp-add')?.addEventListener('click', () => {
+                const wasActive = reflPaint.active;
+                reflPaint.addLight({ lat: 45, lon: 90, intensity: 2.0, radiusX: 0.15, radiusY: 0.15, edge: 0.3, shape: 'circle', rotation: 0 });
+                saveReflPaint();
+                notifyReflectionPaintChanged(wasActive);
+                rebuildReflPaintPanel();
+            });
+            document.getElementById('rp-hide')?.addEventListener('click', () => {
+                setReflPaintPanelVisible(false);
+            });
+
+            for (const btn of reflPaintPanel.querySelectorAll('.rp-del')) {
+                btn.addEventListener('click', () => {
+                    const wasActive = reflPaint.active;
+                    reflPaint.removeLight(Number(btn.dataset.id));
+                    saveReflPaint();
+                    notifyReflectionPaintChanged(wasActive);
+                    rebuildReflPaintPanel();
+                });
+            }
+        }
+
+        document.getElementById('btnReflPaint')?.addEventListener('click', () => {
+            if (!isStudioMode) {
+                perfHud.setStatus('MaxJS - Reflection Paint is available in Studio mode only');
+                return;
+            }
+            setReflPaintPanelVisible(!reflPaintPanelVisible);
+        });
+
+        // ── Studio State Persistence ────────────────────────
+        let studioPersistTimer = 0;
+        let lastProjectStudioSignature = '';
+        let suppressStudioPersistenceDepth = 0;
+
+        function withStudioPersistenceSuppressed(fn) {
+            suppressStudioPersistenceDepth += 1;
+            try {
+                return fn();
+            } finally {
+                suppressStudioPersistenceDepth = Math.max(0, suppressStudioPersistenceDepth - 1);
+            }
+        }
+
+        function serializeStudioState() {
+            return {
+                version: 1,
+                lightLinking: lightLinking.serialize(),
+                reflectionPaint: serializeReflectionPaintState(),
+            };
+        }
+
+        function applyStudioState(payload) {
+            if (!payload || typeof payload !== 'object') return;
+            withStudioPersistenceSuppressed(() => {
+                lightLinking.applyPayload(payload.lightLinking);
+                applyReflectionPaintState(payload.reflectionPaint ?? { lights: [], intensity: 1.0 });
+                if (lightLinkPanelVisible) rebuildLightLinkPanel();
+                if (reflPaintPanelVisible) rebuildReflPaintPanel();
+            });
+        }
+
+        function saveLegacyStudioStateFallback(payload) {
+            if (window.chrome?.webview) return;
+            try {
+                localStorage.setItem(LIGHT_LINK_STORAGE_KEY, JSON.stringify(payload.lightLinking ?? {}));
+                localStorage.setItem(REFL_PAINT_STORAGE_KEY, JSON.stringify(payload.reflectionPaint?.lights ?? []));
+            } catch {}
+        }
+
+        function restoreLegacyStudioStateFallback() {
+            if (window.chrome?.webview) return false;
+            withStudioPersistenceSuppressed(() => {
+                lightLinking.restoreFromStorage();
+                applyReflectionPaintState(readLegacyReflectionPaintState());
+            });
+            return true;
+        }
+
+        function saveStudioState() {
+            if (suppressStudioPersistenceDepth > 0) return;
+            const payload = serializeStudioState();
+            const signature = JSON.stringify(payload);
+            const projectRuntime = _projectRuntimeRef;
+            if (projectRuntime?.setStudioState) {
+                if (signature === lastProjectStudioSignature) return;
+                lastProjectStudioSignature = signature;
+                clearTimeout(studioPersistTimer);
+                studioPersistTimer = setTimeout(() => {
+                    void projectRuntime.setStudioState(payload).catch(error => {
+                        reportBridgeError('studio state save', error);
+                    });
+                }, 180);
+                return;
+            }
+            saveLegacyStudioStateFallback(payload);
+        }
+
+        function restoreStudioState() {
+            const projectRuntime = _projectRuntimeRef;
+            const projectPayload = projectRuntime?.getStudioState?.();
+            if (projectPayload) {
+                lastProjectStudioSignature = JSON.stringify(projectPayload);
+                applyStudioState(projectPayload);
+                return;
+            }
+            if (projectRuntime) return;
+            restoreLegacyStudioStateFallback();
+        }
+
+        function syncProjectStudioState() {
+            const payload = _projectRuntimeRef?.getStudioState?.();
+            if (!payload) return;
+            const signature = JSON.stringify(payload);
+            if (!signature || signature === lastProjectStudioSignature) return;
+            lastProjectStudioSignature = signature;
+            applyStudioState(payload);
         }
 
         // ── Hair And Fur GPU Instancing ─────────────────────
@@ -7884,6 +8216,7 @@
             _layerManagerUnsub = _layerManagerRef?.subscribe?.(() => queueLayersPanelRefresh()) ?? null;
             _projectRuntimeUnsub = _projectRuntimeRef?.subscribe?.(() => {
                 queueLayersPanelRefresh();
+                syncProjectStudioState();
                 syncProjectPostFxState();
             }) ?? null;
         }
@@ -9278,6 +9611,7 @@
                 cameraClip: { near: cameraClip.near, far: cameraClip.far },
                 ascii: { enabled: asciiActive, ...asciiSettings },
                 shaderLab: getShaderLabSnapshot(),
+                studio: serializeStudioState(),
                 timeline: {
                     fps: maxTimeline.fps(),
                     startFrame: 0,
@@ -9299,6 +9633,7 @@
         function serializePersistedPostFxState() {
             const payload = serializeSnapshotUiState();
             delete payload.camera;
+            delete payload.studio;
             return payload;
         }
 
@@ -10270,6 +10605,7 @@
                         meta.snapshotUi.fx.motionBlur.enabled = false;
                     }
                     applySavedPostFxPayload(meta.snapshotUi);
+                    applyStudioState(meta.snapshotUi.studio);
                     maxjsDebugLog('[MaxJS] Applying standalone camera:', meta.snapshotUi.camera);
                     applyStandaloneCameraState(meta.snapshotUi.camera);
                     maxjsDebugLog('[MaxJS] Camera after apply:', camera.position.toArray(), 'target:', controls.target.toArray());

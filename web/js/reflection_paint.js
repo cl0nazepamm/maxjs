@@ -12,11 +12,6 @@ import {
 } from 'three/tsl';
 
 export const MAX_REFLECTION_LIGHTS = 16;
-export const REFL_PAINT_INTENSITY_KEY = 'maxjsReflPaintIntensity';
-
-export const materialRpIntensity = /*@__PURE__*/ uniform(1)
-    .onReference(({ material }) => material)
-    .onObjectUpdate(({ material }) => material[REFL_PAINT_INTENSITY_KEY] ?? 1.0);
 
 let _instance = null;
 
@@ -41,12 +36,15 @@ export class ReflectionPaintNode extends LightingNode {
         }
         this.dataNode = uniformArray(this._packed, 'vec4').setGroup(renderGroup);
         this.countNode = uniform(0, 'int').setGroup(renderGroup);
+        this.intensityNode = uniform(1, 'float').setGroup(renderGroup);
+        this.globalIntensity = 1.0;
         this.updateType = NodeUpdateType.RENDER;
     }
 
     update() {
         const count = Math.min(this._lights.length, MAX_REFLECTION_LIGHTS);
         this.countNode.value = count;
+        this.intensityNode.value = this.globalIntensity;
         for (let i = 0; i < count; i++) {
             const l = this._lights[i];
             const base = i * 4;
@@ -62,7 +60,7 @@ export class ReflectionPaintNode extends LightingNode {
     setup(builder) {
         const incident = positionWorld.sub(cameraPosition).normalize();
         const worldReflect = incident.reflect(normalWorld).normalize();
-        const intensityNode = materialRpIntensity;
+        const intensityNode = this.intensityNode;
 
         const painted = vec3(0).toVar('reflPaintRadiance');
         Loop(this.countNode, ({ i }) => {
@@ -178,6 +176,16 @@ export class ReflectionPaintNode extends LightingNode {
         this._lights.length = 0;
     }
 
+    setGlobalIntensity(value) {
+        const next = Number.isFinite(value) ? Math.max(0, value) : 1.0;
+        this.globalIntensity = next;
+        this.intensityNode.value = next;
+    }
+
+    getGlobalIntensity() {
+        return this.globalIntensity;
+    }
+
     getLights() {
         return this._lights.map(l => ({
             id: l.id,
@@ -195,6 +203,7 @@ export class ReflectionPaintNode extends LightingNode {
     }
 
     get count() { return this._lights.length; }
+    get active() { return this.count > 0 && this.globalIntensity > 0; }
 }
 
 function dirFromLatLon(latDeg, lonDeg, target) {

@@ -133,6 +133,7 @@ export function createProjectRuntime({ layerManager, bridge, perfHud, debugLog =
     let sceneSaved = false;
     let manifestExists = false;
     let transientPostFxState = null;
+    let transientStudioState = null;
     let postFxState = null;
     let lastManifestText = '';
     let lastPostFxText = '';
@@ -584,6 +585,25 @@ export function createProjectRuntime({ layerManager, bridge, perfHud, debugLog =
         return cloneJsonValue(postFxState ?? transientPostFxState ?? manifestState?.postFx ?? null);
     }
 
+    function getStudioState() {
+        return cloneJsonValue(transientStudioState ?? manifestState?.studio ?? null);
+    }
+
+    async function setStudioState(nextState) {
+        const cloned = cloneJsonValue(nextState);
+        if (!sceneSaved || !manifestExists) {
+            transientStudioState = cloned;
+            emitChange();
+            return false;
+        }
+
+        transientStudioState = null;
+        await updateManifest(manifest => {
+            manifest.studio = cloned && typeof cloned === 'object' ? cloned : {};
+        }, { apply: false, silent: true });
+        return true;
+    }
+
     async function setPostFxState(nextState) {
         const cloned = cloneJsonValue(nextState);
         if (!sceneSaved || !manifestExists) {
@@ -616,6 +636,9 @@ export function createProjectRuntime({ layerManager, bridge, perfHud, debugLog =
         await reload(true);
         if (transientPostFxState != null) {
             await setPostFxState(transientPostFxState);
+        }
+        if (transientStudioState != null) {
+            await setStudioState(transientStudioState);
         }
         return true;
     }
@@ -736,6 +759,7 @@ export function createProjectRuntime({ layerManager, bridge, perfHud, debugLog =
         lastPostFxText = '';
         if (projectChanged) clearProjectLayers();
         if (projectChanged) transientPostFxState = null;
+        if (projectChanged) transientStudioState = null;
         schedulePolling();
         emitChange();
 
@@ -935,6 +959,8 @@ export function createProjectRuntime({ layerManager, bridge, perfHud, debugLog =
         clearInlineLayers,
         getPostFxState,
         setPostFxState,
+        getStudioState,
+        setStudioState,
         releaseManifest,
         setProjectDirectory,
         reload,
@@ -943,6 +969,7 @@ export function createProjectRuntime({ layerManager, bridge, perfHud, debugLog =
             clearProjectLayers();
             manifestState = null;
             lastManifestText = '';
+            transientStudioState = null;
             projectDir = '';
             projectRootUrl = '';
             manifestBaseUrl = '';
@@ -964,6 +991,7 @@ export function createProjectRuntime({ layerManager, bridge, perfHud, debugLog =
                 activeInlineLayers: Array.from(mountedInlineLayers.keys()),
                 activeProjectLayers: Array.from(activeProjectLayerIds),
                 manifest: manifestState,
+                studio: getStudioState(),
             };
         },
     };

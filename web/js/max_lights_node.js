@@ -21,6 +21,7 @@ import SpotLightDataNode from 'three/addons/tsl/lighting/data/SpotLightDataNode.
 import HemisphereLightDataNode from 'three/addons/tsl/lighting/data/HemisphereLightDataNode.js';
 import AmbientLightDataNode from 'three/addons/tsl/lighting/data/AmbientLightDataNode.js';
 import { NodeUtils } from 'three/webgpu';
+import { getReflectionPaintNode } from './reflection_paint.js';
 import {
     If, Loop, getDistanceAttenuation, mix, normalWorld, positionView, renderGroup,
     select, smoothstep, uniformArray, vec3, uint, int,
@@ -259,7 +260,19 @@ const isLinkedLight = (light) => light?.userData?.maxjsLightLinked === true;
 // ones frozen. Sharing _dataNodes gives every material the same UBO per light type.
 const SHARED_STOCK_DATA_NODES = new Map();
 const SHARED_MASKED_DATA_NODES = new Map();
+const FALLBACK_LIGHT_NODE_REF = new WeakMap();
 const HASH_DATA = [];
+
+function getOrCreateFallbackLightNode(light, nodeLibrary) {
+    const LightNodeClass = nodeLibrary.getLightNodeClass(light.constructor);
+    if (!LightNodeClass) return null;
+    let lightNode = FALLBACK_LIGHT_NODE_REF.get(light);
+    if (!lightNode) {
+        lightNode = new LightNodeClass(light);
+        FALLBACK_LIGHT_NODE_REF.set(light, lightNode);
+    }
+    return lightNode;
+}
 
 export default class MaxLightsNode extends DynamicLightsNode {
     static get type() { return 'MaxLightsNode'; }
@@ -299,6 +312,7 @@ export default class MaxLightsNode extends DynamicLightsNode {
                 HASH_DATA.push(light.colorNode ? light.colorNode.getCacheKey() : -1);
             }
         }
+        if (getReflectionPaintNode().active) typeSet.add('reflection-paint-global');
         for (const token of [...typeSet].sort()) HASH_DATA.push(NodeUtils.hashString(token));
         const key = NodeUtils.hashArray(HASH_DATA);
         HASH_DATA.length = 0;
@@ -359,8 +373,8 @@ export default class MaxLightsNode extends DynamicLightsNode {
                 if (list) list.push(light); else target.set(typeName, [light]);
                 continue;
             }
-            const cls = nodeLibrary.getLightNodeClass(light.constructor);
-            if (cls) lightNodes.push(new cls(light));
+            const lightNode = getOrCreateFallbackLightNode(light, nodeLibrary);
+            if (lightNode) lightNodes.push(lightNode);
         }
 
         // SHARED_DATA_NODES: each dataNode's _lights is driven ONLY by the scene
@@ -385,6 +399,9 @@ export default class MaxLightsNode extends DynamicLightsNode {
             lightNodes.push(dataNode);
         }
 
+        const reflectionPaintNode = getReflectionPaintNode();
+        if (reflectionPaintNode.active) lightNodes.push(reflectionPaintNode);
+
         this._lightNodes = lightNodes;
     }
 
@@ -396,3 +413,4 @@ export default class MaxLightsNode extends DynamicLightsNode {
 }
 
 export const maxLights = (options = {}) => new MaxLightsNode(options);
+export { getReflectionPaintNode } from './reflection_paint.js';

@@ -3628,12 +3628,14 @@ struct MatGroup { int matID; int start; int count; };
 struct MeshCornerKey {
     DWORD posIdx = 0;
     DWORD uvIdx = 0;
+    DWORD uv2Idx = 0;
     DWORD smGroup = 0;
     uint64_t colorSig = 0;
 
     bool operator==(const MeshCornerKey& other) const {
         return posIdx == other.posIdx &&
                uvIdx == other.uvIdx &&
+               uv2Idx == other.uv2Idx &&
                smGroup == other.smGroup &&
                colorSig == other.colorSig;
     }
@@ -3643,6 +3645,7 @@ struct MeshCornerKeyHash {
     size_t operator()(const MeshCornerKey& key) const noexcept {
         size_t h = static_cast<size_t>(key.posIdx);
         h = h * 16777619u ^ static_cast<size_t>(key.uvIdx);
+        h = h * 16777619u ^ static_cast<size_t>(key.uv2Idx);
         h = h * 16777619u ^ static_cast<size_t>(key.smGroup);
         h = h * 16777619u ^ static_cast<size_t>(key.colorSig);
         h = h * 16777619u ^ static_cast<size_t>(key.colorSig >> 32);
@@ -3666,7 +3669,8 @@ static bool ExtractMeshFromMNMesh(MNMesh& mn,
                                   std::vector<int>* outControlIdx = nullptr,
                                   std::vector<VertexColorAttributeRecord>* outVertexColors = nullptr,
                                   bool allowMapChannel1 = false,
-                                  std::vector<FastVertexSource>* outFastVertexSources = nullptr) {
+                                  std::vector<FastVertexSource>* outFastVertexSources = nullptr,
+                                  std::vector<float>* outUV2s = nullptr) {
     const int numFaces = mn.FNum();
     const int numVerts = mn.VNum();
     if (numFaces == 0 || numVerts == 0) return false;
@@ -3674,6 +3678,8 @@ static bool ExtractMeshFromMNMesh(MNMesh& mn,
     // UV map channel 1
     MNMap* uvMap = mn.M(1);
     const bool hasUVs = uvMap && uvMap->GetFlag(MN_DEAD) == 0 && uvMap->numv > 0;
+    MNMap* uv2Map = outUV2s ? TryGetMNMap(mn, 2) : nullptr;
+    const bool hasUV2s = uv2Map && uv2Map->GetFlag(MN_DEAD) == 0 && uv2Map->numv > 0 && uv2Map->numf > 0 && uv2Map->v;
     const std::vector<int> vertexColorChannels = CollectMNMeshVertexColorChannels(mn, allowMapChannel1);
     std::vector<MNMap*> vertexColorMaps;
     vertexColorMaps.reserve(vertexColorChannels.size());
@@ -3777,6 +3783,7 @@ static bool ExtractMeshFromMNMesh(MNMesh& mn,
     for (auto& fr : liveFaces) estTris += mn.F(fr.idx)->deg - 2;
     verts.reserve(numVerts * 3);
     if (hasUVs) uvs.reserve(numVerts * 2);
+    if (hasUV2s) outUV2s->reserve(numVerts * 2);
     indices.reserve(estTris * 3);
     std::vector<float> normals;
     if (outNormals) normals.reserve(numVerts * 3);
@@ -3812,6 +3819,7 @@ static bool ExtractMeshFromMNMesh(MNMesh& mn,
         }
 
         MNMapFace* uvFace = (hasUVs && fr.idx < uvMap->numf) ? uvMap->F(fr.idx) : nullptr;
+        MNMapFace* uv2Face = (hasUV2s && fr.idx < uv2Map->numf) ? uv2Map->F(fr.idx) : nullptr;
 
         triTab.SetCount(0);
         face->GetTriangles(triTab);
@@ -3822,6 +3830,7 @@ static bool ExtractMeshFromMNMesh(MNMesh& mn,
                 int localIdx = triTab[ti * 3 + tv];
                 DWORD posIdx = face->vtx[localIdx];
                 DWORD uvIdx = (uvFace && localIdx < uvFace->deg) ? uvFace->tv[localIdx] : 0;
+                DWORD uv2Idx = (uv2Face && localIdx < uv2Face->deg) ? uv2Face->tv[localIdx] : 0;
                 uint64_t colorSig = 1469598103934665603ULL;
                 for (size_t ci = 0; ci < vertexColorChannels.size(); ++ci) {
                     const int channel = vertexColorChannels[ci];
@@ -3839,7 +3848,7 @@ static bool ExtractMeshFromMNMesh(MNMesh& mn,
 
                 // smGrp 0 = no smoothing: force unique vertices per face for flat normals
                 DWORD keySmGrp = smGrp == 0 ? (DWORD)(0x80000000u | fr.idx) : smGrp;
-                MeshCornerKey key = { posIdx, uvIdx, keySmGrp, colorSig };
+                MeshCornerKey key = { posIdx, uvIdx, hasUV2s ? uv2Idx : 0, keySmGrp, colorSig };
                 auto it = vertMap.find(key);
                 if (it != vertMap.end()) {
                     indices.push_back(it->second);
@@ -3866,6 +3875,17 @@ static bool ExtractMeshFromMNMesh(MNMesh& mn,
                     } else if (hasUVs) {
                         uvs.push_back(0.0f);
                         uvs.push_back(0.0f);
+                    }
+
+                    if (hasUV2s) {
+                        if (uv2Idx < (DWORD)uv2Map->numv) {
+                            UVVert uv2 = uv2Map->v[uv2Idx];
+                            outUV2s->push_back(uv2.x);
+                            outUV2s->push_back(uv2.y);
+                        } else {
+                            outUV2s->push_back(0.0f);
+                            outUV2s->push_back(0.0f);
+                        }
                     }
 
                     if (outVertexColors) {
@@ -3911,7 +3931,8 @@ static bool ExtractMeshFromTriObject(TriObject* tri, Object* srcObj,
                                      std::vector<int>* outControlIdx = nullptr,
                                      std::vector<VertexColorAttributeRecord>* outVertexColors = nullptr,
                                      bool allowMapChannel1 = false,
-                                     std::vector<FastVertexSource>* outFastVertexSources = nullptr) {
+                                     std::vector<FastVertexSource>* outFastVertexSources = nullptr,
+                                     std::vector<float>* outUV2s = nullptr) {
     Mesh& mesh = tri->GetMesh();
     int nv = mesh.getNumVerts();
     int nf = mesh.getNumFaces();
@@ -3922,6 +3943,8 @@ static bool ExtractMeshFromTriObject(TriObject* tri, Object* srcObj,
     }
 
     bool hasUVs = mesh.getNumTVerts() > 0;
+    MeshMap* uv2Map = (outUV2s && mesh.mapSupport(2)) ? &mesh.Map(2) : nullptr;
+    const bool hasUV2s = uv2Map && uv2Map->tv && uv2Map->tf && uv2Map->vnum > 0 && uv2Map->fnum > 0;
     const std::vector<int> vertexColorChannels = CollectMeshVertexColorChannels(mesh, allowMapChannel1);
 
     std::vector<int> faceOrder;
@@ -3991,6 +4014,7 @@ static bool ExtractMeshFromTriObject(TriObject* tri, Object* srcObj,
     std::unordered_map<MeshCornerKey, int, MeshCornerKeyHash> vertMap;
     verts.reserve(nv * 3);
     if (hasUVs) uvs.reserve(nv * 2);
+    if (hasUV2s) outUV2s->reserve(nv * 2);
     indices.reserve(nf * 3);
     std::vector<float> normals;
     if (outNormals) normals.reserve(nv * 3);
@@ -4021,6 +4045,7 @@ static bool ExtractMeshFromTriObject(TriObject* tri, Object* srcObj,
         for (int v = 0; v < 3; v++) {
             DWORD posIdx = mesh.faces[f].v[v];
             DWORD uvIdx  = hasUVs ? mesh.tvFace[f].t[v] : 0;
+            DWORD uv2Idx = (hasUV2s && f < uv2Map->fnum) ? uv2Map->tf[f].t[v] : 0;
             DWORD smGrp  = mesh.faces[f].getSmGroup();
             uint64_t colorSig = 1469598103934665603ULL;
             for (int channel : vertexColorChannels) {
@@ -4035,7 +4060,7 @@ static bool ExtractMeshFromTriObject(TriObject* tri, Object* srcObj,
             const DWORD keySmGrp = smGrp == 0
                 ? (DWORD)(0x80000000u | static_cast<DWORD>(f))
                 : smGrp;
-            MeshCornerKey key = { posIdx, uvIdx, keySmGrp, colorSig };
+            MeshCornerKey key = { posIdx, uvIdx, hasUV2s ? uv2Idx : 0, keySmGrp, colorSig };
 
             auto it = vertMap.find(key);
             if (it != vertMap.end()) {
@@ -4060,6 +4085,17 @@ static bool ExtractMeshFromTriObject(TriObject* tri, Object* srcObj,
                     UVVert uv = mesh.tVerts[uvIdx];
                     uvs.push_back(uv.x);
                     uvs.push_back(uv.y);
+                }
+
+                if (hasUV2s) {
+                    if (uv2Idx < static_cast<DWORD>(uv2Map->vnum)) {
+                        UVVert uv2 = uv2Map->tv[uv2Idx];
+                        outUV2s->push_back(uv2.x);
+                        outUV2s->push_back(uv2.y);
+                    } else {
+                        outUV2s->push_back(0.0f);
+                        outUV2s->push_back(0.0f);
+                    }
                 }
 
                 if (outVertexColors) {
@@ -4221,7 +4257,7 @@ static bool ExtractMeshFromRawMesh(Mesh& mesh,
             const DWORD keySmGrp = smGrp == 0
                 ? (DWORD)(0x80000000u | static_cast<DWORD>(f))
                 : smGrp;
-            MeshCornerKey key = { posIdx, uvIdx, keySmGrp, colorSig };
+            MeshCornerKey key = { posIdx, uvIdx, 0, keySmGrp, colorSig };
 
             auto it = vertMap.find(key);
             if (it != vertMap.end()) {
@@ -4440,10 +4476,11 @@ static bool ExtractMesh(INode* node, TimeValue t,
                         std::vector<float>* normals = nullptr,
                         std::vector<int>* controlIdx = nullptr,
                         std::vector<VertexColorAttributeRecord>* outVertexColors = nullptr,
-                        std::vector<FastVertexSource>* outFastVertexSources = nullptr) {
+                        std::vector<FastVertexSource>* outFastVertexSources = nullptr,
+                        std::vector<float>* outUV2s = nullptr) {
     const bool allowMapChannel1 = ShouldAllowVertexColorMapChannel1(node);
     if (MNMesh* liveMN = TryGetLiveEditablePolyMesh(node)) {
-        return ExtractMeshFromMNMesh(*liveMN, verts, uvs, indices, groups, normals, controlIdx, outVertexColors, allowMapChannel1, outFastVertexSources);
+        return ExtractMeshFromMNMesh(*liveMN, verts, uvs, indices, groups, normals, controlIdx, outVertexColors, allowMapChannel1, outFastVertexSources, outUV2s);
     }
 
     ObjectState os = node->EvalWorldState(t);
@@ -4458,7 +4495,7 @@ static bool ExtractMesh(INode* node, TimeValue t,
     if (os.obj->IsSubClassOf(polyObjectClassID)) {
         PolyObject* poly = static_cast<PolyObject*>(os.obj);
         MNMesh& mn = poly->GetMesh();
-        return ExtractMeshFromMNMesh(mn, verts, uvs, indices, groups, normals, controlIdx, outVertexColors, allowMapChannel1, outFastVertexSources);
+        return ExtractMeshFromMNMesh(mn, verts, uvs, indices, groups, normals, controlIdx, outVertexColors, allowMapChannel1, outFastVertexSources, outUV2s);
     }
 
     // Fallback: convert to TriObject for non-poly geometry (primitives, patches, etc.)
@@ -4466,7 +4503,7 @@ static bool ExtractMesh(INode* node, TimeValue t,
     TriObject* tri = static_cast<TriObject*>(
         os.obj->ConvertToType(t, Class_ID(TRIOBJ_CLASS_ID, 0)));
     if (!tri) return false;
-    return ExtractMeshFromTriObject(tri, os.obj, verts, uvs, indices, groups, normals, controlIdx, outVertexColors, allowMapChannel1, outFastVertexSources);
+    return ExtractMeshFromTriObject(tri, os.obj, verts, uvs, indices, groups, normals, controlIdx, outVertexColors, allowMapChannel1, outFastVertexSources, outUV2s);
 }
 
 static bool TryHashExtractedRenderableGeometry(INode* node, TimeValue t, uint64_t& outHash) {
@@ -7528,11 +7565,11 @@ public:
         INode* node = nullptr;
         bool visible = true;
         bool spline = false;
-        std::vector<float> verts, uvs, norms;
+        std::vector<float> verts, uvs, uv2s, norms;
         std::vector<VertexColorAttributeRecord> vertexColors;
         std::vector<int> indices;
         std::vector<MatGroup> groups;
-        size_t vOff = 0, iOff = 0, uvOff = 0, nOff = 0;
+        size_t vOff = 0, iOff = 0, uvOff = 0, uv2Off = 0, nOff = 0;
         // Skeletal skin + optional Morpher (Morpher must be below Skin in the stack).
         bool skinRig = false;
         std::vector<ULONG> skinBoneHandles;
@@ -7574,7 +7611,7 @@ public:
 
     struct SnapshotGeometrySample {
         bool spline = false;
-        std::vector<float> verts, uvs, norms;
+        std::vector<float> verts, uvs, uv2s, norms;
         std::vector<int> indices;
         std::vector<MatGroup> groups;
     };
@@ -9088,13 +9125,15 @@ public:
                     !node->IsNodeHidden(TRUE) && node->GetVisibility(t) > 0.0f && node->Renderable();
 
                 bool extracted = ExtractMesh(node, t, snapshotNode.verts, snapshotNode.uvs,
-                    snapshotNode.indices, snapshotNode.groups, &snapshotNode.norms, nullptr, &snapshotNode.vertexColors);
+                    snapshotNode.indices, snapshotNode.groups, &snapshotNode.norms, nullptr,
+                    &snapshotNode.vertexColors, nullptr, &snapshotNode.uv2s);
 
                 if (!extracted && ShouldExtractRenderableShape(node, t, &os)) {
                     extracted = ExtractSpline(node, t, snapshotNode.verts, snapshotNode.indices);
                     snapshotNode.spline = extracted;
                     if (extracted) {
                         snapshotNode.uvs.clear();
+                        snapshotNode.uv2s.clear();
                         snapshotNode.norms.clear();
                         snapshotNode.vertexColors.clear();
                         snapshotNode.groups.clear();
@@ -9125,6 +9164,9 @@ public:
                                 morphInflTmp,
                                 morphChTmp)) {
                             snapshotNode.skinRig = true;
+                            if (snapshotNode.uv2s.size() / 2 != snapshotNode.verts.size() / 3) {
+                                snapshotNode.uv2s.clear();
+                            }
                             snapshotNode.morphNames = std::move(morphNamesTmp);
                             snapshotNode.morphChannelIds = std::move(morphChIdsTmp);
                             snapshotNode.morphInfluences = std::move(morphInflTmp);
@@ -9141,6 +9183,8 @@ public:
                     totalBytes += snapshotNode.indices.size() * sizeof(int);
                     snapshotNode.uvOff = totalBytes;
                     totalBytes += snapshotNode.uvs.size() * sizeof(float);
+                    snapshotNode.uv2Off = totalBytes;
+                    totalBytes += snapshotNode.uv2s.size() * sizeof(float);
                     snapshotNode.nOff = totalBytes;
                     totalBytes += snapshotNode.norms.size() * sizeof(float);
                     for (VertexColorAttributeRecord& attr : snapshotNode.vertexColors) {
@@ -9215,6 +9259,9 @@ public:
             if (!node.uvs.empty()) {
                 memcpy(buffer + node.uvOff, node.uvs.data(), node.uvs.size() * sizeof(float));
             }
+            if (!node.uv2s.empty()) {
+                memcpy(buffer + node.uv2Off, node.uv2s.data(), node.uv2s.size() * sizeof(float));
+            }
             if (!node.norms.empty()) {
                 memcpy(buffer + node.nOff, node.norms.data(), node.norms.size() * sizeof(float));
             }
@@ -9261,6 +9308,10 @@ public:
             if (!node.uvs.empty()) {
                 ss << L",\"uvOff\":" << node.uvOff;
                 ss << L",\"uvN\":" << node.uvs.size();
+            }
+            if (!node.uv2s.empty()) {
+                ss << L",\"uv2Off\":" << node.uv2Off;
+                ss << L",\"uv2N\":" << node.uv2s.size();
             }
             if (!node.norms.empty()) {
                 ss << L",\"nOff\":" << node.nOff;
@@ -14155,14 +14206,14 @@ public:
         struct NodeGeo {
             ULONG handle;
             INode* node;
-            std::vector<float> verts, uvs, norms;
+            std::vector<float> verts, uvs, uv2s, norms;
             std::vector<VertexColorAttributeRecord> vertexColors;
             std::vector<int> indices;
             std::vector<MatGroup> groups;
             bool changed;
             bool visible = true;
             bool spline = false;
-            size_t vOff, iOff, uvOff, nOff;
+            size_t vOff, iOff, uvOff, uv2Off, nOff;
             uint64_t objId = 0;      // evaluated Object* — instances share this
             ULONG instOfHandle = 0;  // 0 = owns geometry, else = shares from this handle
         };
@@ -14282,12 +14333,14 @@ public:
                     const bool isSkinned = FindModifierOnNode(node, SKIN_CLASSID) != nullptr;
                     std::vector<int> controlIdx;
                     std::vector<FastVertexSource> fastSources;
-                    bool extracted = ExtractMesh(node, t, ng.verts, ng.uvs, ng.indices, ng.groups, &ng.norms, &controlIdx, &ng.vertexColors, &fastSources);
+                    bool extracted = ExtractMesh(node, t, ng.verts, ng.uvs, ng.indices, ng.groups,
+                        &ng.norms, &controlIdx, &ng.vertexColors, &fastSources, &ng.uv2s);
                     if (!extracted && ShouldExtractRenderableShape(node, t, &os)) {
                         extracted = ExtractSpline(node, t, ng.verts, ng.indices);
                         ng.spline = extracted;
                         if (extracted) {
                             ng.uvs.clear();
+                            ng.uv2s.clear();
                             ng.norms.clear();
                             ng.vertexColors.clear();
                             ng.groups.clear();
@@ -14344,6 +14397,9 @@ public:
                         ng.uvOff = totalBytes;
                         if (!ng.uvs.empty())
                             totalBytes += ng.uvs.size() * sizeof(float);
+                        ng.uv2Off = totalBytes;
+                        if (!ng.uv2s.empty())
+                            totalBytes += ng.uv2s.size() * sizeof(float);
                         ng.nOff = totalBytes;
                         if (!ng.norms.empty())
                             totalBytes += ng.norms.size() * sizeof(float);
@@ -14462,6 +14518,8 @@ public:
                 memcpy(bufPtr + ng.iOff, ng.indices.data(), ng.indices.size() * sizeof(int));
                 if (!ng.uvs.empty())
                     memcpy(bufPtr + ng.uvOff, ng.uvs.data(), ng.uvs.size() * sizeof(float));
+                if (!ng.uv2s.empty())
+                    memcpy(bufPtr + ng.uv2Off, ng.uv2s.data(), ng.uv2s.size() * sizeof(float));
                 if (!ng.norms.empty())
                     memcpy(bufPtr + ng.nOff, ng.norms.data(), ng.norms.size() * sizeof(float));
                 for (const VertexColorAttributeRecord& attr : ng.vertexColors) {
@@ -14477,6 +14535,10 @@ public:
                 if (!ng.uvs.empty()) {
                     ss << L",\"uvOff\":" << ng.uvOff;
                     ss << L",\"uvN\":" << ng.uvs.size();
+                }
+                if (!ng.uv2s.empty()) {
+                    ss << L",\"uv2Off\":" << ng.uv2Off;
+                    ss << L",\"uv2N\":" << ng.uv2s.size();
                 }
                 if (!ng.norms.empty()) {
                     ss << L",\"nOff\":" << ng.nOff;

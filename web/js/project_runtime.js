@@ -134,6 +134,7 @@ export function createProjectRuntime({ layerManager, bridge, perfHud, debugLog =
     let manifestExists = false;
     let transientPostFxState = null;
     let transientStudioState = null;
+    let transientBakeState = null;
     let postFxState = null;
     let lastManifestText = '';
     let lastPostFxText = '';
@@ -589,6 +590,25 @@ export function createProjectRuntime({ layerManager, bridge, perfHud, debugLog =
         return cloneJsonValue(transientStudioState ?? manifestState?.studio ?? null);
     }
 
+    function getBakeState() {
+        return cloneJsonValue(transientBakeState ?? manifestState?.bake ?? null);
+    }
+
+    async function setBakeState(nextState) {
+        const cloned = cloneJsonValue(nextState);
+        if (!sceneSaved || !manifestExists) {
+            transientBakeState = cloned;
+            emitChange();
+            return false;
+        }
+
+        transientBakeState = null;
+        await updateManifest(manifest => {
+            manifest.bake = cloned && typeof cloned === 'object' ? cloned : {};
+        }, { apply: false, silent: true });
+        return true;
+    }
+
     async function setStudioState(nextState) {
         const cloned = cloneJsonValue(nextState);
         if (!sceneSaved || !manifestExists) {
@@ -639,6 +659,9 @@ export function createProjectRuntime({ layerManager, bridge, perfHud, debugLog =
         }
         if (transientStudioState != null) {
             await setStudioState(transientStudioState);
+        }
+        if (transientBakeState != null) {
+            await setBakeState(transientBakeState);
         }
         return true;
     }
@@ -760,6 +783,7 @@ export function createProjectRuntime({ layerManager, bridge, perfHud, debugLog =
         if (projectChanged) clearProjectLayers();
         if (projectChanged) transientPostFxState = null;
         if (projectChanged) transientStudioState = null;
+        if (projectChanged) transientBakeState = null;
         schedulePolling();
         emitChange();
 
@@ -961,6 +985,8 @@ export function createProjectRuntime({ layerManager, bridge, perfHud, debugLog =
         setPostFxState,
         getStudioState,
         setStudioState,
+        getBakeState,
+        setBakeState,
         releaseManifest,
         setProjectDirectory,
         reload,
@@ -970,6 +996,7 @@ export function createProjectRuntime({ layerManager, bridge, perfHud, debugLog =
             manifestState = null;
             lastManifestText = '';
             transientStudioState = null;
+            transientBakeState = null;
             projectDir = '';
             projectRootUrl = '';
             manifestBaseUrl = '';
@@ -992,6 +1019,7 @@ export function createProjectRuntime({ layerManager, bridge, perfHud, debugLog =
                 activeProjectLayers: Array.from(activeProjectLayerIds),
                 manifest: manifestState,
                 studio: getStudioState(),
+                bake: getBakeState(),
             };
         },
     };

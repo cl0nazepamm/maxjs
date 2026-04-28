@@ -1209,6 +1209,9 @@
             <button id="btnReflPaint" class="rail-btn devonly" title="Reflection Paint" aria-label="Reflection Paint">
                 <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 7-5 5a2 2 0 0 1-3-3l5-5"/><path d="m14 2-5 5M12 4l2 2"/></svg>
             </button>
+            <button id="btnBakeOverrides" class="rail-btn devonly" title="Bake Overrides" aria-label="Bake Overrides">
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2.5 4.5 8 1.5l5.5 3v7L8 14.5l-5.5-3v-7Z"/><path d="M2.5 4.5 8 7.5l5.5-3"/><path d="M8 7.5v7"/><path d="M5.2 10.2 3.6 9.3M12.4 9.3l-1.6.9"/></svg>
+            </button>
             <button id="btnSwitchVR" class="rail-btn devonly" title="Switch to WebGL for XR (reload)" aria-label="XR — use WebGL backend">
                 <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="1" y="5" width="14" height="6" rx="2"/><circle cx="5" cy="8" r="1.2"/><circle cx="11" cy="8" r="1.2"/><path d="M8 6.5v3"/></svg>
                 <span class="rail-btn-label">XR</span>
@@ -1292,6 +1295,7 @@
         <aside id="shaderLabPanel" class="sidepanel" aria-hidden="true" inert></aside>
         <aside id="lightLinkPanel" class="sidepanel" aria-hidden="true" inert></aside>
         <aside id="reflPaintPanel" class="sidepanel" aria-hidden="true" inert></aside>
+        <aside id="bakePanel" class="sidepanel" aria-hidden="true" inert></aside>
         <aside id="postPanel" class="sidepanel" aria-hidden="true" inert></aside>
     </div>
     <div class="dock-drag-handle" aria-hidden="true"></div>
@@ -1650,7 +1654,7 @@
             } catch { return 'standard'; }
         })();
         const isStudioMode = maxjsRenderMode === 'studio';
-        const STUDIO_ONLY_RAIL_IDS = ['btnLightLink', 'btnReflPaint'];
+        const STUDIO_ONLY_RAIL_IDS = ['btnLightLink', 'btnReflPaint', 'btnBakeOverrides'];
 
         function setRailButtonMeta(button, { label, badge } = {}) {
             if (!button) return;
@@ -4077,6 +4081,7 @@
             stopReadyRetry();
             // Restore Studio manifest state now that lights + meshes are populated.
             restoreStudioState();
+            restoreBakeState();
         }
 
         function startBridgeHandshake() {
@@ -4418,9 +4423,162 @@
             },
         };
 
-        function createSceneMaterial(nd) {
-            if (nd.mats && nd.groups) return nd.mats.map(m => createMaterial(m));
-            if (nd.mat) return createMaterial(nd.mat);
+        const DEFAULT_BAKE_STATE = Object.freeze({
+            version: 1,
+            enabled: false,
+            mode: 'lightmap',
+            match: 'scene',
+            folder: '',
+            sceneName: 'scene',
+            lightSuffix: '_lightmap',
+            beautySuffix: '_beauty',
+            extension: 'png',
+            intensity: 1.0,
+        });
+        let bakeOverrides = { ...DEFAULT_BAKE_STATE };
+
+        function normalizeBakeState(payload) {
+            const raw = payload && typeof payload === 'object' ? payload : {};
+            const next = { ...DEFAULT_BAKE_STATE, ...raw };
+            next.enabled = raw.enabled === true;
+            next.mode = next.mode === 'beauty' ? 'beauty' : 'lightmap';
+            next.match = ['scene', 'object', 'material'].includes(next.match) ? next.match : 'scene';
+            next.folder = String(next.folder ?? '').trim();
+            next.sceneName = String(next.sceneName || DEFAULT_BAKE_STATE.sceneName).trim() || DEFAULT_BAKE_STATE.sceneName;
+            next.lightSuffix = String(next.lightSuffix ?? DEFAULT_BAKE_STATE.lightSuffix);
+            next.beautySuffix = String(next.beautySuffix ?? DEFAULT_BAKE_STATE.beautySuffix);
+            next.extension = String(next.extension || DEFAULT_BAKE_STATE.extension).replace(/^\./, '') || DEFAULT_BAKE_STATE.extension;
+            next.intensity = Number.isFinite(Number(next.intensity)) ? Math.max(0, Number(next.intensity)) : 1.0;
+            return next;
+        }
+
+        function serializeBakeState() {
+            return { ...bakeOverrides };
+        }
+
+        function bakeStateSignature() {
+            return JSON.stringify(bakeOverrides);
+        }
+
+        function encodeAssetPath(path) {
+            const normalized = String(path ?? '').replace(/\\/g, '/');
+            const segments = normalized.split('/').filter((segment, index) => segment.length > 0 || index === 0);
+            return segments.map(segment => encodeURIComponent(segment)).join('/');
+        }
+
+        function normalizeBakeFolderUrl(folder) {
+            const raw = String(folder ?? '').trim();
+            if (!raw) return '';
+            if (/^https?:\/\//i.test(raw) || raw.startsWith('./') || raw.startsWith('../') || raw.startsWith('/')) {
+                return raw.endsWith('/') ? raw : `${raw}/`;
+            }
+            if (/^[a-zA-Z]:[\\/]/.test(raw) || /^\\\\/.test(raw)) {
+                return `https://maxjs-assets.local/${encodeAssetPath(raw).replace(/\/?$/, '/')}`;
+            }
+            return raw.endsWith('/') ? raw : `${raw}/`;
+        }
+
+        function sanitizeBakeFileStem(value) {
+            return String(value ?? '')
+                .trim()
+                .replace(/[\\/:*?"<>|]+/g, '_')
+                .replace(/\s+/g, '_')
+                .replace(/^_+|_+$/g, '') || 'scene';
+        }
+
+        function getMaterialBakeName(material) {
+            return String(
+                material?.userData?.maxjsSourceMaterialName ??
+                material?.name ??
+                'material'
+            ).trim() || 'material';
+        }
+
+        function getBakeTargetName(nd, material) {
+            if (bakeOverrides.match === 'object') return nd?.n || nd?.name || `node_${nd?.h ?? '0'}`;
+            if (bakeOverrides.match === 'material') return getMaterialBakeName(material);
+            return bakeOverrides.sceneName;
+        }
+
+        function getBakeTextureUrl(nd, material, kind) {
+            if (!bakeOverrides.enabled || !bakeOverrides.folder) return '';
+            const folder = normalizeBakeFolderUrl(bakeOverrides.folder);
+            if (!folder) return '';
+            const suffix = kind === 'beauty' ? bakeOverrides.beautySuffix : bakeOverrides.lightSuffix;
+            const stem = sanitizeBakeFileStem(getBakeTargetName(nd, material));
+            return `${folder}${encodeURIComponent(`${stem}${suffix}.${bakeOverrides.extension}`)}`;
+        }
+
+        function hasGeometryUV2(geom) {
+            return !!geom?.getAttribute?.('uv2');
+        }
+
+        function createBeautyBakeMaterial(source, texture) {
+            const mat = new THREE.MeshBasicMaterial({
+                color: 0xffffff,
+                map: texture,
+                side: source?.side ?? THREE.FrontSide,
+                transparent: !!source?.transparent || (Number.isFinite(source?.opacity) && source.opacity < 1),
+                opacity: Number.isFinite(source?.opacity) ? source.opacity : 1,
+                alphaMap: source?.alphaMap ?? null,
+                depthWrite: source?.depthWrite ?? true,
+                depthTest: source?.depthTest ?? true,
+            });
+            mat.name = source?.name ? `${source.name} bake beauty` : 'bake beauty';
+            mat.userData = { ...(source?.userData || {}), maxjsBakeOverride: 'beauty' };
+            return mat;
+        }
+
+        function applyBakeOverrideToMaterial(material, nd, geom) {
+            if (!material || !bakeOverrides.enabled) return material;
+            if (material.isLineBasicMaterial || material.isLineDashedMaterial) return material;
+            const kind = bakeOverrides.mode === 'beauty' ? 'beauty' : 'lightmap';
+            const url = getBakeTextureUrl(nd, material, kind);
+            if (!url) return material;
+
+            if (kind === 'beauty') {
+                const tex = loadTexture(url, THREE.SRGBColorSpace, null, fallbackWhiteTexture);
+                return tex ? createBeautyBakeMaterial(material, tex) : material;
+            }
+
+            if (!hasGeometryUV2(geom)) {
+                material.userData ??= {};
+                material.userData.maxjsBakeMissingUV2 = true;
+                return material;
+            }
+            const tex = loadTexture(url, THREE.LinearSRGBColorSpace, null, fallbackWhiteTexture);
+            if (!tex) return material;
+            material.lightMap = tex;
+            material.lightMapIntensity = bakeOverrides.intensity;
+            material.userData ??= {};
+            material.userData.maxjsBakeOverride = 'lightmap';
+            material.needsUpdate = true;
+            return material;
+        }
+
+        function applyBakeOverridesToSceneMaterial(material, nd, geom) {
+            if (Array.isArray(material)) {
+                return material.map(item => applyBakeOverrideToMaterial(item, nd, geom));
+            }
+            return applyBakeOverrideToMaterial(material, nd, geom);
+        }
+
+        function createSceneMaterial(nd, geom = null) {
+            let material = null;
+            if (nd?.mats && nd?.groups) material = nd.mats.map(m => createMaterial(m));
+            else if (nd?.mat) material = createMaterial(nd.mat);
+            else {
+                const entry = getOrCreateMaterialRegistryEntry(null);
+                material = new THREE.MeshStandardMaterial({ color: 0x888888, side: THREE.DoubleSide });
+                material.userData ??= {};
+                material.userData.maxjsMaterialRegistryId = entry.id;
+                material.userData.maxjsMaterialIdentityKey = entry.key;
+                material.userData.maxjsSourceMaterialName = 'default';
+            }
+            return applyBakeOverridesToSceneMaterial(material, nd, geom);
+        }
+
+        function createDefaultSceneMaterial() {
             const entry = getOrCreateMaterialRegistryEntry(null);
             const material = new THREE.MeshStandardMaterial({ color: 0x888888, side: THREE.DoubleSide });
             material.userData ??= {};
@@ -4476,7 +4634,7 @@
             const payload = nd?.mats && nd?.groups
                 ? ['multi', nd.mats.map(materialIdentityValue)]
                 : (nd?.mat ? ['single', materialIdentityValue(nd.mat)] : ['default']);
-            return `${wantsLine ? 'line' : 'mesh'}:${JSON.stringify(payload)}`;
+            return `${wantsLine ? 'line' : 'mesh'}:${bakeStateSignature()}:${JSON.stringify(payload)}`;
         }
 
         function isCachedMaterialTemplate(material) {
@@ -4486,8 +4644,8 @@
             return false;
         }
 
-        function createSceneRenderableMaterial(nd, wantsLine) {
-            const mat = createSceneMaterial(nd);
+        function createSceneRenderableMaterial(nd, wantsLine, geom = null) {
+            const mat = createSceneMaterial(nd, geom);
             if (!wantsLine) return mat;
             const lineMat = createSceneLineMaterial(mat);
             if (!isCachedMaterialTemplate(mat)) disposeSceneMaterial(mat);
@@ -4497,6 +4655,7 @@
         function stampSceneMaterial(mesh, nd, wantsLine) {
             mesh.userData ??= {};
             mesh.userData.maxjsMaterialSignature = sceneMaterialSignature(nd, wantsLine);
+            mesh.userData.maxjsLastNodePayload = nd;
         }
 
         function ensureSceneRenderableMaterial(mesh, nd, wantsLine) {
@@ -4504,9 +4663,10 @@
             const signature = sceneMaterialSignature(nd, wantsLine);
             if (mesh.material && mesh.userData?.maxjsMaterialSignature === signature) return false;
             const oldMaterial = mesh.material;
-            mesh.material = createSceneRenderableMaterial(nd, wantsLine);
+            mesh.material = createSceneRenderableMaterial(nd, wantsLine, mesh.geometry);
             mesh.userData ??= {};
             mesh.userData.maxjsMaterialSignature = signature;
+            mesh.userData.maxjsLastNodePayload = nd;
             disposeSceneMaterial(oldMaterial);
             return true;
         }
@@ -4910,6 +5070,7 @@
                     geom = buildGeometry(nd.v, nd.i, nd.uv, nd.norm, {
                         isLine: !!nd.spline,
                         vertexColors: nd.vc,
+                        uv2s: nd.uv2,
                     });
                     if (nd.groups) {
                         for (const [start, count, idx] of nd.groups) {
@@ -4939,6 +5100,7 @@
                     if (nd.v && nd.i && !jsmodSkipGeo && geom !== mesh.geometry) {
                         mesh.geometry.dispose();
                         mesh.geometry = geom;
+                        if (bakeOverrides.enabled) mesh.userData.maxjsMaterialSignature = '';
                     }
                     if (ensureSceneRenderableMaterial(mesh, nd, wantsLine)) {
                         sceneChanged = true;
@@ -4946,7 +5108,7 @@
                     }
                 } else {
                     if (!geom) continue;
-                    const material = createSceneRenderableMaterial(nd, wantsLine);
+                    const material = createSceneRenderableMaterial(nd, wantsLine, geom);
                     if (wantsLine) {
                         mesh = new THREE.LineSegments(geom, material);
                     } else {
@@ -5289,6 +5451,10 @@
                         console.warn('[MaxJS binary] Invalid UV range for', nd.n);
                         continue;
                     }
+                    if (nd.geo.uv2Off != null && !inRange(nd.geo.uv2Off, nd.geo.uv2N || 0)) {
+                        console.warn('[MaxJS binary] Invalid UV2 range for', nd.n);
+                        continue;
+                    }
                     const vertsCopy = new Float32Array(
                         new Float32Array(buffer, nd.geo.vOff, nd.geo.vN)
                     );
@@ -5305,6 +5471,12 @@
                             new Float32Array(buffer, nd.geo.uvOff, nd.geo.uvN)
                         );
                         geom.setAttribute('uv', new THREE.BufferAttribute(uvsCopy, 2));
+                    }
+                    if (nd.geo.uv2Off != null && nd.geo.uv2N) {
+                        const uv2sCopy = new Float32Array(
+                            new Float32Array(buffer, nd.geo.uv2Off, nd.geo.uv2N)
+                        );
+                        geom.setAttribute('uv2', new THREE.BufferAttribute(uv2sCopy, 2));
                     }
                     if (nd.geo.nOff != null && inRange(nd.geo.nOff, nd.geo.nN || 0)) {
                         const normalsCopy = new Float32Array(
@@ -5379,6 +5551,7 @@
                         releaseGeometryRef(geometryRefCounts, mesh.geometry);
                         retainGeometryRef(geometryRefCounts, geom);
                         mesh.geometry = geom;
+                        if (bakeOverrides.enabled) mesh.userData.maxjsMaterialSignature = '';
                     }
                     if (ensureSceneRenderableMaterial(mesh, nd, wantsLine)) {
                         sceneChanged = true;
@@ -5386,7 +5559,7 @@
                     }
                 } else {
                     if (!geom) continue;
-                    const material = createSceneRenderableMaterial(nd, wantsLine);
+                    const material = createSceneRenderableMaterial(nd, wantsLine, geom);
                     if (wantsLine) {
                         mesh = new THREE.LineSegments(geom, material);
                     } else if (nd.skin) {
@@ -5604,6 +5777,7 @@
             geom.setAttribute('position', new THREE.Float32BufferAttribute(vertices, 3));
             if (indices?.length) geom.setIndex(indices);
             if (uvs?.length) geom.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
+            if (options.uv2s?.length) geom.setAttribute('uv2', new THREE.Float32BufferAttribute(options.uv2s, 2));
             if (normals?.length) geom.setAttribute('normal', new THREE.Float32BufferAttribute(normals, 3));
             else if (!isLine) geom.computeVertexNormals();
             setGeometryVertexColorAttributes(geom, options.vertexColors);
@@ -7022,6 +7196,184 @@
             applyStudioState(payload);
         }
 
+        // ── Bake Overrides Panel ───────────────────────────
+        const bakePanel = document.getElementById('bakePanel');
+        let bakePanelVisible = false;
+        let bakePersistTimer = 0;
+        let lastProjectBakeSignature = '';
+        const BAKE_STORAGE_KEY = 'maxjs_bake_state';
+
+        function escapeBakeHtml(value) {
+            return String(value ?? '').replace(/[&<>"']/g, ch => ({
+                '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+            }[ch]));
+        }
+
+        function getBakeSceneStats() {
+            let meshes = 0;
+            let uv2 = 0;
+            for (const mesh of nodeMap.values()) {
+                if (!mesh?.isMesh) continue;
+                meshes++;
+                if (mesh.geometry?.getAttribute?.('uv2')) uv2++;
+            }
+            return { meshes, uv2 };
+        }
+
+        function reapplyBakeOverridesToScene() {
+            let changed = false;
+            for (const mesh of nodeMap.values()) {
+                const nd = mesh?.userData?.maxjsLastNodePayload;
+                if (!mesh || !nd) continue;
+                const wantsLine = mesh.isLine || mesh.isLineSegments;
+                if (ensureSceneRenderableMaterial(mesh, nd, wantsLine)) {
+                    changed = true;
+                    if (nd.h != null) layerManager.applyMaterialOverrides?.(nd.h, mesh);
+                }
+            }
+            if (changed) {
+                ssgiFx.markSceneChanged?.();
+                ssgiFx.markOutputChanged?.();
+            }
+            return changed;
+        }
+
+        function applyBakeState(payload, { persist = false, rebuild = true, refreshPanel = true } = {}) {
+            bakeOverrides = normalizeBakeState(payload);
+            if (rebuild) reapplyBakeOverridesToScene();
+            if (refreshPanel && bakePanelVisible) rebuildBakePanel();
+            if (persist) saveBakeState();
+        }
+
+        function saveBakeState() {
+            const payload = serializeBakeState();
+            const signature = JSON.stringify(payload);
+            const projectRuntime = _projectRuntimeRef;
+            if (projectRuntime?.setBakeState) {
+                if (signature === lastProjectBakeSignature) return;
+                lastProjectBakeSignature = signature;
+                clearTimeout(bakePersistTimer);
+                bakePersistTimer = setTimeout(() => {
+                    void projectRuntime.setBakeState(payload).catch(error => {
+                        reportBridgeError('bake state save', error);
+                    });
+                }, 180);
+                return;
+            }
+            try {
+                localStorage.setItem(BAKE_STORAGE_KEY, signature);
+            } catch {}
+        }
+
+        function restoreBakeState() {
+            const projectPayload = _projectRuntimeRef?.getBakeState?.();
+            if (projectPayload) {
+                lastProjectBakeSignature = JSON.stringify(projectPayload);
+                applyBakeState(projectPayload, { rebuild: true });
+                return;
+            }
+            if (_projectRuntimeRef) return;
+            try {
+                const raw = localStorage.getItem(BAKE_STORAGE_KEY);
+                if (raw) applyBakeState(JSON.parse(raw), { rebuild: true });
+            } catch {}
+        }
+
+        function syncProjectBakeState() {
+            const payload = _projectRuntimeRef?.getBakeState?.();
+            if (!payload) return;
+            const signature = JSON.stringify(payload);
+            if (!signature || signature === lastProjectBakeSignature) return;
+            lastProjectBakeSignature = signature;
+            applyBakeState(payload, { rebuild: true });
+        }
+
+        function setBakePanelVisible(v) {
+            if (v && !isStudioMode) return;
+            bakePanelVisible = !!v;
+            bakePanel.classList.toggle('visible', bakePanelVisible);
+            bakePanel.toggleAttribute('inert', !bakePanelVisible);
+            bakePanel.setAttribute('aria-hidden', String(!bakePanelVisible));
+            document.getElementById('btnBakeOverrides')?.classList.toggle('active', bakePanelVisible);
+            if (bakePanelVisible) rebuildBakePanel();
+        }
+
+        function updateBakeStateFromPanel() {
+            const next = normalizeBakeState({
+                enabled: bakePanel.querySelector('#bake-enabled')?.checked === true,
+                mode: bakePanel.querySelector('#bake-mode')?.value,
+                match: bakePanel.querySelector('#bake-match')?.value,
+                folder: bakePanel.querySelector('#bake-folder')?.value,
+                sceneName: bakePanel.querySelector('#bake-scene')?.value,
+                lightSuffix: bakePanel.querySelector('#bake-light-suffix')?.value,
+                beautySuffix: bakePanel.querySelector('#bake-beauty-suffix')?.value,
+                extension: bakePanel.querySelector('#bake-ext')?.value,
+                intensity: parseFloat(bakePanel.querySelector('#bake-intensity')?.value),
+            });
+            applyBakeState(next, { persist: true, rebuild: true, refreshPanel: false });
+            const intensityLabel = bakePanel.querySelector('#bake-intensity')?.nextElementSibling;
+            if (intensityLabel) intensityLabel.textContent = next.intensity.toFixed(2);
+        }
+
+        function rebuildBakePanel() {
+            const b = normalizeBakeState(bakeOverrides);
+            const stats = getBakeSceneStats();
+            const sampleLight = getBakeTextureUrl({ n: 'ObjectName', h: 0 }, null, 'lightmap') || 'Set a folder to preview path';
+            const sampleBeauty = getBakeTextureUrl({ n: 'ObjectName', h: 0 }, null, 'beauty') || 'Set a folder to preview path';
+            bakePanel.innerHTML = `
+                <div class="sidepanel-header">
+                    <div><div class="sidepanel-title">Bake Overrides</div>
+                    <div class="sidepanel-subtitle">UV2 lightmaps or beauty bakes</div></div>
+                    <button id="bake-hide" type="button">Hide</button>
+                </div>
+                <div class="sidepanel-body">
+                    <section class="fx-section">
+                        <div class="fx-section-title"><span>Runtime Bake Source</span></div>
+                        <label class="fx-check"><span>Enabled</span><input id="bake-enabled" type="checkbox" ${b.enabled ? 'checked' : ''}></label>
+                        <label class="fx-check"><span>Mode</span><select id="bake-mode"><option value="lightmap"${b.mode === 'lightmap' ? ' selected' : ''}>Lightmap</option><option value="beauty"${b.mode === 'beauty' ? ' selected' : ''}>Beauty</option></select></label>
+                        <label class="fx-check"><span>Match</span><select id="bake-match"><option value="scene"${b.match === 'scene' ? ' selected' : ''}>Scene atlas</option><option value="object"${b.match === 'object' ? ' selected' : ''}>Object name</option><option value="material"${b.match === 'material' ? ' selected' : ''}>Material name</option></select></label>
+                        <label class="fx-check"><span>Folder</span><input id="bake-folder" type="text" value="${escapeBakeHtml(b.folder)}" placeholder="F:\\bakes\\ or ./bakes/"></label>
+                    </section>
+                    <section class="fx-section">
+                        <div class="fx-section-title"><span>Naming</span></div>
+                        <label class="fx-check"><span>Scene Stem</span><input id="bake-scene" type="text" value="${escapeBakeHtml(b.sceneName)}"></label>
+                        <label class="fx-check"><span>Light Suffix</span><input id="bake-light-suffix" type="text" value="${escapeBakeHtml(b.lightSuffix)}"></label>
+                        <label class="fx-check"><span>Beauty Suffix</span><input id="bake-beauty-suffix" type="text" value="${escapeBakeHtml(b.beautySuffix)}"></label>
+                        <label class="fx-check"><span>Ext</span><input id="bake-ext" type="text" value="${escapeBakeHtml(b.extension)}"></label>
+                        <label class="fx-check"><span>Intensity</span><input id="bake-intensity" class="fx-range" type="range" min="0" max="4" step="0.05" value="${b.intensity}"><span style="width:32px;text-align:right;color:#888;font-size:9px;">${b.intensity.toFixed(2)}</span></label>
+                    </section>
+                    <section class="fx-section">
+                        <div class="fx-section-title"><span>Status</span><span>${stats.uv2}/${stats.meshes} UV2</span></div>
+                        <div style="font-size:10px;color:#888;line-height:1.45;">Lightmap mode keeps converted V-Ray materials and sets <code>material.lightMap</code>. Beauty mode swaps display to an unlit bake material.</div>
+                        <div style="font-size:9px;color:#666;margin-top:6px;word-break:break-all;">Light: ${escapeBakeHtml(sampleLight)}</div>
+                        <div style="font-size:9px;color:#666;margin-top:3px;word-break:break-all;">Beauty: ${escapeBakeHtml(sampleBeauty)}</div>
+                        <button id="bake-reapply" type="button" style="margin-top:8px;width:100%;">Reapply Bake Materials</button>
+                        <button id="bake-sync" type="button" style="margin-top:4px;width:100%;">Sync UV2 From Max</button>
+                    </section>
+                </div>`;
+            bakePanel.querySelector('#bake-hide')?.addEventListener('click', () => setBakePanelVisible(false));
+            bakePanel.querySelector('#bake-reapply')?.addEventListener('click', () => {
+                reapplyBakeOverridesToScene();
+                perfHud.setStatus('MaxJS - bake overrides reapplied');
+            });
+            bakePanel.querySelector('#bake-sync')?.addEventListener('click', () => {
+                bridge.send('ready');
+                perfHud.setStatus('MaxJS - requested full scene sync for UV2/lightmaps');
+            });
+            for (const el of bakePanel.querySelectorAll('input,select')) {
+                el.addEventListener('input', updateBakeStateFromPanel);
+                el.addEventListener('change', updateBakeStateFromPanel);
+            }
+        }
+
+        document.getElementById('btnBakeOverrides')?.addEventListener('click', () => {
+            if (!isStudioMode) {
+                perfHud.setStatus('MaxJS - Bake Overrides are available in Studio mode only');
+                return;
+            }
+            setBakePanelVisible(!bakePanelVisible);
+        });
+
         // ── Hair And Fur GPU Instancing ─────────────────────
         const hairMeshes = new Map(); // handle -> { root, mesh }
 
@@ -8217,6 +8569,7 @@
             _projectRuntimeUnsub = _projectRuntimeRef?.subscribe?.(() => {
                 queueLayersPanelRefresh();
                 syncProjectStudioState();
+                syncProjectBakeState();
                 syncProjectPostFxState();
             }) ?? null;
         }
@@ -9612,6 +9965,7 @@
                 ascii: { enabled: asciiActive, ...asciiSettings },
                 shaderLab: getShaderLabSnapshot(),
                 studio: serializeStudioState(),
+                bake: serializeBakeState(),
                 timeline: {
                     fps: maxTimeline.fps(),
                     startFrame: 0,
@@ -9634,6 +9988,7 @@
             const payload = serializeSnapshotUiState();
             delete payload.camera;
             delete payload.studio;
+            delete payload.bake;
             return payload;
         }
 
@@ -10606,6 +10961,7 @@
                     }
                     applySavedPostFxPayload(meta.snapshotUi);
                     applyStudioState(meta.snapshotUi.studio);
+                    applyBakeState(meta.snapshotUi.bake, { rebuild: true });
                     maxjsDebugLog('[MaxJS] Applying standalone camera:', meta.snapshotUi.camera);
                     applyStandaloneCameraState(meta.snapshotUi.camera);
                     maxjsDebugLog('[MaxJS] Camera after apply:', camera.position.toArray(), 'target:', controls.target.toArray());

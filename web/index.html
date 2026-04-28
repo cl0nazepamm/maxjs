@@ -1654,7 +1654,7 @@
             } catch { return 'standard'; }
         })();
         const isStudioMode = maxjsRenderMode === 'studio';
-        const STUDIO_ONLY_RAIL_IDS = ['btnLightLink', 'btnReflPaint', 'btnBakeOverrides'];
+        const STUDIO_ONLY_RAIL_IDS = ['btnLightLink', 'btnReflPaint'];
 
         function setRailButtonMeta(button, { label, badge } = {}) {
             if (!button) return;
@@ -2344,6 +2344,24 @@
 
             ctx.putImageData(imageData, 0, 0);
             tex.image = canvas;
+        }
+
+        function maxMapChannelToTextureChannel(maxMapChannel, fallbackMaxChannel = 1) {
+            const maxChannel = Number.isFinite(Number(maxMapChannel))
+                ? Math.max(1, Math.round(Number(maxMapChannel)))
+                : fallbackMaxChannel;
+            return Math.max(0, maxChannel - 1);
+        }
+
+        function applyTextureUvChannel(tex, maxMapChannel, fallbackMaxChannel = 1) {
+            if (!tex?.isTexture) return tex;
+            const nextChannel = maxMapChannelToTextureChannel(maxMapChannel, fallbackMaxChannel);
+            if (tex.channel !== nextChannel) {
+                tex.channel = nextChannel;
+                const image = tex.source?.data ?? tex.image;
+                if (image != null) tex.needsUpdate = true;
+            }
+            return tex;
         }
 
         function resolveColorSpace(slotColorSpace, xf) {
@@ -3524,7 +3542,11 @@
             applyMap('aoMap',      'aoMap',                  THREE.LinearSRGBColorSpace,   'aoMapXf',      W);
             applyMap('emMap',      'emissiveMap',            THREE.SRGBColorSpace,         'emMapXf',      W);
             applyMap('transMap',   'transmissionMap',        THREE.LinearSRGBColorSpace,   'transMapXf',   W);
-            applyMap('lmMap',      'lightMap',               THREE.LinearSRGBColorSpace,   'lmMapXf',      W);
+            const lmTex = applyMap('lmMap', 'lightMap', THREE.LinearSRGBColorSpace, 'lmMapXf', W);
+            if (lmTex) {
+                material.lightMap = applyTextureUvChannel(lmTex, md.lmCh, 2);
+                material.lightMapIntensity = md.lmI ?? material.lightMapIntensity ?? 1.0;
+            }
             applyMap('matcapMap',  'matcap',                 THREE.SRGBColorSpace,         'matcapMapXf',  W);
             applyMap('specMap',    'specularMap',            THREE.LinearSRGBColorSpace,   'specMapXf',    W);
             if (applyMap('opMap',  'alphaMap',               THREE.LinearSRGBColorSpace,   'opMapXf',      W)) material.transparent = true;
@@ -3919,7 +3941,7 @@
                     {
                         const lmTex = loadMapSlot(md, 'lmMap', THREE.LinearSRGBColorSpace, 'lmMapXf', fallbackWhiteTexture);
                         if (lmTex) {
-                            template.lightMap = lmTex;
+                            template.lightMap = applyTextureUvChannel(lmTex, md.lmCh, 2);
                             template.lightMapIntensity = md.lmI ?? 1.0;
                         }
                     }
@@ -4436,6 +4458,8 @@
             intensity: 1.0,
         });
         let bakeOverrides = { ...DEFAULT_BAKE_STATE };
+        let lastBakeUv2RequestKey = '';
+        let bakeUv2RequestTimer = 0;
 
         function normalizeBakeState(payload) {
             const raw = payload && typeof payload === 'object' ? payload : {};
@@ -4510,7 +4534,26 @@
         }
 
         function hasGeometryUV2(geom) {
-            return !!geom?.getAttribute?.('uv2');
+            return !!(geom?.getAttribute?.('uv1') || geom?.getAttribute?.('uv2'));
+        }
+
+        function maybeRequestBakeUv2Resync(reason = 'auto') {
+            const state = normalizeBakeState(bakeOverrides);
+            if (!state.enabled || state.mode !== 'lightmap') return;
+            if (!window.chrome?.webview) return;
+
+            const stats = getBakeSceneStats();
+            if (stats.meshes <= 0 || stats.uv2 >= stats.meshes) return;
+
+            const key = `${bakeStateSignature()}|${stats.meshes}|${stats.uv2}`;
+            if (key === lastBakeUv2RequestKey) return;
+            lastBakeUv2RequestKey = key;
+
+            clearTimeout(bakeUv2RequestTimer);
+            bakeUv2RequestTimer = setTimeout(() => {
+                bridge.send('sync_lightmap_uvs', { reason });
+                perfHud.setStatus('MaxJS - requesting native UV2/lightmap geometry resync');
+            }, 50);
         }
 
         function createBeautyBakeMaterial(source, texture) {
@@ -4548,7 +4591,7 @@
             }
             const tex = loadTexture(url, THREE.LinearSRGBColorSpace, null, fallbackWhiteTexture);
             if (!tex) return material;
-            material.lightMap = tex;
+            material.lightMap = applyTextureUvChannel(tex, 2, 2);
             material.lightMapIntensity = bakeOverrides.intensity;
             material.userData ??= {};
             material.userData.maxjsBakeOverride = 'lightmap';
@@ -5015,6 +5058,7 @@
             }
             const applyMs = performance.now() - applyStart;
             markInitialSync();
+            maybeRequestBakeUv2Resync('scene_sync');
             updateSyncHud({
                 transport,
                 frameId: snapshot.frame ?? 0,
@@ -5476,7 +5520,11 @@
                         const uv2sCopy = new Float32Array(
                             new Float32Array(buffer, nd.geo.uv2Off, nd.geo.uv2N)
                         );
-                        geom.setAttribute('uv2', new THREE.BufferAttribute(uv2sCopy, 2));
+                        // three r184 lightMap samples geometry attribute "uv1".
+                        // Keep "uv2" as a compatibility/debug alias for Max map channel 2.
+                        const uv2Attr = new THREE.BufferAttribute(uv2sCopy, 2);
+                        geom.setAttribute('uv1', uv2Attr);
+                        geom.setAttribute('uv2', uv2Attr);
                     }
                     if (nd.geo.nOff != null && inRange(nd.geo.nOff, nd.geo.nN || 0)) {
                         const normalsCopy = new Float32Array(
@@ -5777,7 +5825,11 @@
             geom.setAttribute('position', new THREE.Float32BufferAttribute(vertices, 3));
             if (indices?.length) geom.setIndex(indices);
             if (uvs?.length) geom.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
-            if (options.uv2s?.length) geom.setAttribute('uv2', new THREE.Float32BufferAttribute(options.uv2s, 2));
+            if (options.uv2s?.length) {
+                const uv2Attr = new THREE.Float32BufferAttribute(options.uv2s, 2);
+                geom.setAttribute('uv1', uv2Attr);
+                geom.setAttribute('uv2', uv2Attr);
+            }
             if (normals?.length) geom.setAttribute('normal', new THREE.Float32BufferAttribute(normals, 3));
             else if (!isLine) geom.computeVertexNormals();
             setGeometryVertexColorAttributes(geom, options.vertexColors);
@@ -7215,7 +7267,7 @@
             for (const mesh of nodeMap.values()) {
                 if (!mesh?.isMesh) continue;
                 meshes++;
-                if (mesh.geometry?.getAttribute?.('uv2')) uv2++;
+                if (hasGeometryUV2(mesh.geometry)) uv2++;
             }
             return { meshes, uv2 };
         }
@@ -7242,6 +7294,7 @@
             bakeOverrides = normalizeBakeState(payload);
             if (rebuild) reapplyBakeOverridesToScene();
             if (refreshPanel && bakePanelVisible) rebuildBakePanel();
+            maybeRequestBakeUv2Resync('bake_state');
             if (persist) saveBakeState();
         }
 
@@ -7289,7 +7342,6 @@
         }
 
         function setBakePanelVisible(v) {
-            if (v && !isStudioMode) return;
             bakePanelVisible = !!v;
             bakePanel.classList.toggle('visible', bakePanelVisible);
             bakePanel.toggleAttribute('inert', !bakePanelVisible);
@@ -7357,7 +7409,8 @@
                 perfHud.setStatus('MaxJS - bake overrides reapplied');
             });
             bakePanel.querySelector('#bake-sync')?.addEventListener('click', () => {
-                bridge.send('ready');
+                lastBakeUv2RequestKey = '';
+                bridge.send('sync_lightmap_uvs', { reason: 'manual' });
                 perfHud.setStatus('MaxJS - requested full scene sync for UV2/lightmaps');
             });
             for (const el of bakePanel.querySelectorAll('input,select')) {
@@ -7367,10 +7420,6 @@
         }
 
         document.getElementById('btnBakeOverrides')?.addEventListener('click', () => {
-            if (!isStudioMode) {
-                perfHud.setStatus('MaxJS - Bake Overrides are available in Studio mode only');
-                return;
-            }
             setBakePanelVisible(!bakePanelVisible);
         });
 

@@ -1045,10 +1045,27 @@ static MNMap* TryGetMNMap(MNMesh& mn, int channel) {
     return mn.M(channel);
 }
 
+static bool MNMeshHasUsableMapChannel(MNMesh& mn, int channel) {
+    MNMap* map = TryGetMNMap(mn, channel);
+    return map &&
+           map->GetFlag(MN_DEAD) == 0 &&
+           map->numv > 0 &&
+           map->numf > 0 &&
+           map->v;
+}
+
+static bool MeshHasUsableMapChannel(Mesh& mesh, int channel) {
+    if (!mesh.mapSupport(channel)) return false;
+    const MeshMap& map = mesh.Map(channel);
+    return map.vnum > 0 &&
+           map.fnum > 0 &&
+           map.tv &&
+           map.tf;
+}
+
 static bool ShouldExportMNVertexColorChannel(MNMesh& mn, int channel, bool allowMapChannel1 = false) {
     if (channel == 1 && !allowMapChannel1) return false;
-    MNMap* map = TryGetMNMap(mn, channel);
-    if (!map || map->GetFlag(MN_DEAD) != 0 || map->numv <= 0 || map->numf <= 0 || !map->v) return false;
+    if (!MNMeshHasUsableMapChannel(mn, channel)) return false;
     if (channel == 0 || channel == MAP_SHADING || channel == MAP_ALPHA) return true;
     return channel > 1 || (channel == 1 && allowMapChannel1);
 }
@@ -3679,7 +3696,7 @@ static bool ExtractMeshFromMNMesh(MNMesh& mn,
     MNMap* uvMap = mn.M(1);
     const bool hasUVs = uvMap && uvMap->GetFlag(MN_DEAD) == 0 && uvMap->numv > 0;
     MNMap* uv2Map = outUV2s ? TryGetMNMap(mn, 2) : nullptr;
-    const bool hasUV2s = uv2Map && uv2Map->GetFlag(MN_DEAD) == 0 && uv2Map->numv > 0 && uv2Map->numf > 0 && uv2Map->v;
+    const bool hasUV2s = outUV2s && MNMeshHasUsableMapChannel(mn, 2);
     const std::vector<int> vertexColorChannels = CollectMNMeshVertexColorChannels(mn, allowMapChannel1);
     std::vector<MNMap*> vertexColorMaps;
     vertexColorMaps.reserve(vertexColorChannels.size());
@@ -3943,8 +3960,8 @@ static bool ExtractMeshFromTriObject(TriObject* tri, Object* srcObj,
     }
 
     bool hasUVs = mesh.getNumTVerts() > 0;
-    MeshMap* uv2Map = (outUV2s && mesh.mapSupport(2)) ? &mesh.Map(2) : nullptr;
-    const bool hasUV2s = uv2Map && uv2Map->tv && uv2Map->tf && uv2Map->vnum > 0 && uv2Map->fnum > 0;
+    MeshMap* uv2Map = (outUV2s && MeshHasUsableMapChannel(mesh, 2)) ? &mesh.Map(2) : nullptr;
+    const bool hasUV2s = uv2Map != nullptr;
     const std::vector<int> vertexColorChannels = CollectMeshVertexColorChannels(mesh, allowMapChannel1);
 
     std::vector<int> faceOrder;
@@ -4480,7 +4497,13 @@ static bool ExtractMesh(INode* node, TimeValue t,
                         std::vector<float>* outUV2s = nullptr) {
     const bool allowMapChannel1 = ShouldAllowVertexColorMapChannel1(node);
     if (MNMesh* liveMN = TryGetLiveEditablePolyMesh(node)) {
-        return ExtractMeshFromMNMesh(*liveMN, verts, uvs, indices, groups, normals, controlIdx, outVertexColors, allowMapChannel1, outFastVertexSources, outUV2s);
+        // When UV2 is requested, prefer the evaluated object if the live
+        // Editable Poly mesh does not carry map channel 2. This catches UVW /
+        // Unwrap modifiers that author lightmap UVs above the base object
+        // without putting UV2 into the hot geo_fast path.
+        if (!outUV2s || MNMeshHasUsableMapChannel(*liveMN, 2)) {
+            return ExtractMeshFromMNMesh(*liveMN, verts, uvs, indices, groups, normals, controlIdx, outVertexColors, allowMapChannel1, outFastVertexSources, outUV2s);
+        }
     }
 
     ObjectState os = node->EvalWorldState(t);
@@ -10076,6 +10099,17 @@ public:
         dirtyStamp_ = 0;  // bypass debounce — sync on next tick
     }
 
+    void RequestFullGeometryResync() {
+        geoHashMap_.clear();
+        deformChannelHashMap_.clear();
+        lastBBoxHash_.clear();
+        lastLiveGeomHash_.clear();
+        geoFastDirtyHandles_.clear();
+        geoFullFastDirtyHandles_.clear();
+        geoScanCursor_ = 0;
+        SetDirtyImmediate();
+    }
+
     void QueueFastFlush() {
         if (!hwnd_ || fastFlushPosted_) return;
         if (dirty_ && !CanFlushFastPathDuringPendingFullSync()) return;
@@ -11307,6 +11341,10 @@ public:
         }
         if (type == L"render_to_image_ready") {
             if (renderImageEvent_) SetEvent(renderImageEvent_);
+            return;
+        }
+        if (type == L"sync_lightmap_uvs" || type == L"sync_uv2") {
+            RequestFullGeometryResync();
             return;
         }
         if (type == L"ready" || msg.find(L"\"ready\"") != std::wstring::npos) {
@@ -14066,7 +14104,7 @@ public:
                 if (NodeHasModifierStack(node)) deformHandles_.insert(handle);
                 else deformHandles_.erase(handle);
             } else {
-                std::vector<float> verts, uvs, norms;
+                std::vector<float> verts, uvs, uv2s, norms;
                 std::vector<VertexColorAttributeRecord> vertexColors;
                 std::vector<int> indices;
                 std::vector<MatGroup> groups;
@@ -14077,14 +14115,17 @@ public:
                 // stable deforming modifier (Skin, Path Deform, Bend, FFD, etc.)
                 // can then route through the fast-positions path instead of
                 // the full ExtractMesh (smaller payload, single EvalWorldState).
-                bool extracted = ExtractMesh(node, t, verts, uvs, indices, groups, &norms, &controlIdx, &vertexColors, &fastSources);
+                bool extracted = ExtractMesh(node, t, verts, uvs, indices, groups, &norms, &controlIdx, &vertexColors, &fastSources, &uv2s);
 
                 // Spline fallback — extract as line geometry
                 bool isSpline = false;
                 if (!extracted && ShouldExtractRenderableShape(node, t, &os)) {
                     extracted = ExtractSpline(node, t, verts, indices);
                     isSpline = extracted;
-                    if (extracted) vertexColors.clear();
+                    if (extracted) {
+                        uv2s.clear();
+                        vertexColors.clear();
+                    }
                 }
 
                 if (extracted) {
@@ -14130,6 +14171,9 @@ public:
                     ss << L",\"i\":"; WriteInts(ss, indices.data(), indices.size());
                     if (!uvs.empty()) {
                         ss << L",\"uv\":"; WriteFloats(ss, uvs.data(), uvs.size());
+                    }
+                    if (!uv2s.empty()) {
+                        ss << L",\"uv2\":"; WriteFloats(ss, uv2s.data(), uv2s.size());
                     }
                     if (!norms.empty()) {
                         ss << L",\"norm\":"; WriteFloats(ss, norms.data(), norms.size());

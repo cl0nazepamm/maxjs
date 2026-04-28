@@ -109,6 +109,9 @@ static const MCHAR* kMapSlotNames[kNumMaps] = {
     _T("TSL Map 13"), _T("TSL Map 14"), _T("TSL Map 15"), _T("TSL Map 16")
 };
 
+constexpr int kUiSubTexTokenBase = 1000;
+constexpr int UiSubTexToken(int slotIndex) { return kUiSubTexTokenBase + slotIndex; }
+
 struct SupportedMapSlots {
     const int* slots = nullptr;
     int count = 0;
@@ -397,14 +400,14 @@ public:
     }
     Texmap* GetSubTexmap(int i) override {
         if (!pblock) return nullptr;
-        const int slotIndex = GetSupportedMapSlotIndex(i);
+        const int slotIndex = ResolveSubTexSlotIndex(i);
         if (slotIndex < 0) return nullptr;
         const ParamID pid = kMapParamIDs[slotIndex];
         return HasParam(pblock, pid) ? pblock->GetTexmap(pid) : nullptr;
     }
     void SetSubTexmap(int i, Texmap* m) override {
         if (!pblock) return;
-        const int slotIndex = GetSupportedMapSlotIndex(i);
+        const int slotIndex = ResolveSubTexSlotIndex(i);
         if (slotIndex < 0) return;
         const ParamID pid = kMapParamIDs[slotIndex];
         if (HasParam(pblock, pid)) {
@@ -413,7 +416,7 @@ public:
         }
     }
     MSTR GetSubTexmapSlotName(int i, bool) override {
-        const int slotIndex = GetSupportedMapSlotIndex(i);
+        const int slotIndex = ResolveSubTexSlotIndex(i);
         if (slotIndex >= 0) return MSTR(kMapSlotNames[slotIndex]);
         return MSTR(_T(""));
     }
@@ -456,12 +459,33 @@ public:
     IParamBlock2* pblock = nullptr;
 
 private:
-    int GetSupportedMapSlotIndex(int visibleIndex) const {
+    bool IsSupportedGlobalMapSlot(int slotIndex) const {
+        if (slotIndex < 0 || slotIndex >= kNumMaps) {
+            return false;
+        }
         const SupportedMapSlots visibleSlots = GetSupportedMapSlots(kind_, pblock);
-        if (visibleIndex < 0 || visibleIndex >= visibleSlots.count || !visibleSlots.slots) {
+        if (!visibleSlots.slots) {
+            return false;
+        }
+        for (int i = 0; i < visibleSlots.count; ++i) {
+            if (visibleSlots.slots[i] == slotIndex) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    int ResolveSubTexSlotIndex(int requestedIndex) const {
+        if (requestedIndex >= kUiSubTexTokenBase) {
+            const int slotIndex = requestedIndex - kUiSubTexTokenBase;
+            return IsSupportedGlobalMapSlot(slotIndex) ? slotIndex : -1;
+        }
+
+        const SupportedMapSlots visibleSlots = GetSupportedMapSlots(kind_, pblock);
+        if (requestedIndex < 0 || requestedIndex >= visibleSlots.count || !visibleSlots.slots) {
             return -1;
         }
-        return visibleSlots.slots[visibleIndex];
+        return visibleSlots.slots[requestedIndex];
     }
 
     Texmap* GetViewportColorTexmap() const {
@@ -544,7 +568,7 @@ ClassDesc2* GetThreeJSTSLMtlDesc() { return &threeJSTSLMtlDesc; }
         p_ui, TYPE_COLORSWATCH, IDC_COLOR, \
         p_end, \
     pb_color_map, _T("colorMap"), TYPE_TEXMAP, 0, 0, \
-        p_subtexno, kMap_Color, \
+        p_subtexno, UiSubTexToken(kMap_Color), \
         p_ui, TYPE_TEXMAPBUTTON, IDC_COLOR_MAP, \
         p_end, \
     pb_color_map_strength, _T("colorMapStrength"), TYPE_FLOAT, P_ANIMATABLE, 0, \
@@ -558,7 +582,7 @@ ClassDesc2* GetThreeJSTSLMtlDesc() { return &threeJSTSLMtlDesc; }
         p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_ROUGH_EDIT, IDC_ROUGH_SPIN, 0.01f, \
         p_end, \
     pb_roughness_map, _T("roughnessMap"), TYPE_TEXMAP, 0, 0, \
-        p_subtexno, kMap_Roughness, \
+        p_subtexno, UiSubTexToken(kMap_Roughness), \
         p_ui, TYPE_TEXMAPBUTTON, IDC_ROUGH_MAP, \
         p_end, \
     pb_roughness_map_strength, _T("roughnessMapStrength"), TYPE_FLOAT, P_ANIMATABLE, 0, \
@@ -572,7 +596,7 @@ ClassDesc2* GetThreeJSTSLMtlDesc() { return &threeJSTSLMtlDesc; }
         p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_METAL_EDIT, IDC_METAL_SPIN, 0.01f, \
         p_end, \
     pb_metalness_map, _T("metalnessMap"), TYPE_TEXMAP, 0, 0, \
-        p_subtexno, kMap_Metalness, \
+        p_subtexno, UiSubTexToken(kMap_Metalness), \
         p_ui, TYPE_TEXMAPBUTTON, IDC_METAL_MAP, \
         p_end, \
     pb_metalness_map_strength, _T("metalnessMapStrength"), TYPE_FLOAT, P_ANIMATABLE, 0, \
@@ -581,7 +605,7 @@ ClassDesc2* GetThreeJSTSLMtlDesc() { return &threeJSTSLMtlDesc; }
         p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_MMAPSTR_EDIT, IDC_MMAPSTR_SPIN, 0.01f, \
         p_end, \
     pb_normal_map, _T("normalMap"), TYPE_TEXMAP, 0, 0, \
-        p_subtexno, kMap_Normal, \
+        p_subtexno, UiSubTexToken(kMap_Normal), \
         p_ui, TYPE_TEXMAPBUTTON, IDC_NORMAL_MAP, \
         p_end, \
     pb_normal_scale, _T("normalScale"), TYPE_FLOAT, P_ANIMATABLE, 0, \
@@ -590,7 +614,7 @@ ClassDesc2* GetThreeJSTSLMtlDesc() { return &threeJSTSLMtlDesc; }
         p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_NORMSCL_EDIT, IDC_NORMSCL_SPIN, 0.01f, \
         p_end, \
     pb_bump_map, _T("bumpMap"), TYPE_TEXMAP, 0, 0, \
-        p_subtexno, kMap_Bump, \
+        p_subtexno, UiSubTexToken(kMap_Bump), \
         p_ui, TYPE_TEXMAPBUTTON, IDC_BUMP_MAP, \
         p_end, \
     pb_bump_scale, _T("bumpScale"), TYPE_FLOAT, P_ANIMATABLE, 0, \
@@ -599,7 +623,7 @@ ClassDesc2* GetThreeJSTSLMtlDesc() { return &threeJSTSLMtlDesc; }
         p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_BUMP_EDIT, IDC_BUMP_SPIN, 0.01f, \
         p_end, \
     pb_displacement_map, _T("displacementMap"), TYPE_TEXMAP, 0, 0, \
-        p_subtexno, kMap_Displacement, \
+        p_subtexno, UiSubTexToken(kMap_Displacement), \
         p_ui, TYPE_TEXMAPBUTTON, IDC_DISP_MAP, \
         p_end, \
     pb_displacement_scale, _T("displacementScale"), TYPE_FLOAT, P_ANIMATABLE, 0, \
@@ -617,7 +641,7 @@ ClassDesc2* GetThreeJSTSLMtlDesc() { return &threeJSTSLMtlDesc; }
         p_ui, TYPE_COLORSWATCH, IDC_EM_COLOR, \
         p_end, \
     pb_emissive_map, _T("emissiveMap"), TYPE_TEXMAP, 0, 0, \
-        p_subtexno, kMap_Emissive, \
+        p_subtexno, UiSubTexToken(kMap_Emissive), \
         p_ui, TYPE_TEXMAPBUTTON, IDC_EM_MAP, \
         p_end, \
     pb_emissive_intensity, _T("emissiveIntensity"), TYPE_FLOAT, P_ANIMATABLE, 0, \
@@ -636,7 +660,7 @@ ClassDesc2* GetThreeJSTSLMtlDesc() { return &threeJSTSLMtlDesc; }
         p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_OPACITY_EDIT, IDC_OPACITY_SPIN, 0.01f, \
         p_end, \
     pb_opacity_map, _T("opacityMap"), TYPE_TEXMAP, 0, 0, \
-        p_subtexno, kMap_Opacity, \
+        p_subtexno, UiSubTexToken(kMap_Opacity), \
         p_ui, TYPE_TEXMAPBUTTON, IDC_OPACITY_MAP, \
         p_end, \
     pb_opacity_map_strength, _T("opacityMapStrength"), TYPE_FLOAT, P_ANIMATABLE, 0, \
@@ -645,7 +669,7 @@ ClassDesc2* GetThreeJSTSLMtlDesc() { return &threeJSTSLMtlDesc; }
         p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_OPMAPSTR_EDIT, IDC_OPMAPSTR_SPIN, 0.01f, \
         p_end, \
     pb_lightmap, _T("lightMap"), TYPE_TEXMAP, 0, 0, \
-        p_subtexno, kMap_Lightmap, \
+        p_subtexno, UiSubTexToken(kMap_Lightmap), \
         p_ui, TYPE_TEXMAPBUTTON, IDC_LM_MAP, \
         p_end, \
     pb_lightmap_intensity, _T("lightMapIntensity"), TYPE_FLOAT, P_ANIMATABLE, 0, \
@@ -659,7 +683,7 @@ ClassDesc2* GetThreeJSTSLMtlDesc() { return &threeJSTSLMtlDesc; }
         p_ui, TYPE_SPINNER, EDITTYPE_INT, IDC_LM_CH_EDIT, IDC_LM_CH_SPIN, 1.0f, \
         p_end, \
     pb_ao_map, _T("aoMap"), TYPE_TEXMAP, 0, 0, \
-        p_subtexno, kMap_AO, \
+        p_subtexno, UiSubTexToken(kMap_AO), \
         p_ui, TYPE_TEXMAPBUTTON, IDC_AO_MAP, \
         p_end, \
     pb_ao_intensity, _T("aoIntensity"), TYPE_FLOAT, P_ANIMATABLE, 0, \
@@ -679,7 +703,7 @@ ClassDesc2* GetThreeJSTSLMtlDesc() { return &threeJSTSLMtlDesc; }
 
 #define THREEJS_HIDDEN_LEGACY_PARAM_ITEMS \
     pb_parallax_map, _T("parallaxMap"), TYPE_TEXMAP, 0, 0, \
-        p_subtexno, kMap_Parallax, \
+        p_subtexno, UiSubTexToken(kMap_Parallax), \
         p_end, \
     pb_parallax_scale, _T("parallaxScale"), TYPE_FLOAT, P_ANIMATABLE, 0, \
         p_default, 0.0f, \
@@ -692,7 +716,7 @@ ClassDesc2* GetThreeJSTSLMtlDesc() { return &threeJSTSLMtlDesc; }
         p_ui, TYPE_COLORSWATCH, IDC_SSS_COLOR, \
         p_end, \
     pb_sss_color_map, _T("sssColorMap"), TYPE_TEXMAP, 0, 0, \
-        p_subtexno, kMap_SSSColor, \
+        p_subtexno, UiSubTexToken(kMap_SSSColor), \
         p_ui, TYPE_TEXMAPBUTTON, IDC_SSS_COLOR_MAP, \
         p_end, \
     pb_sss_distortion, _T("sssDistortion"), TYPE_FLOAT, P_ANIMATABLE, 0, \
@@ -800,22 +824,22 @@ ClassDesc2* GetThreeJSTSLMtlDesc() { return &threeJSTSLMtlDesc; }
         p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_PHYS_ANISOTROPY_EDIT, IDC_PHYS_ANISOTROPY_SPIN, 0.01f, \
         p_end, \
     pb_phys_specular_intensity_map, _T("physicalSpecularIntensityMap"), TYPE_TEXMAP, 0, 0, \
-        p_subtexno, kMap_PhysSpecularIntensity, \
+        p_subtexno, UiSubTexToken(kMap_PhysSpecularIntensity), \
         p_end, \
     pb_phys_specular_color_map, _T("physicalSpecularColorMap"), TYPE_TEXMAP, 0, 0, \
-        p_subtexno, kMap_PhysSpecularColor, \
+        p_subtexno, UiSubTexToken(kMap_PhysSpecularColor), \
         p_end, \
     pb_phys_clearcoat_map, _T("physicalClearcoatMap"), TYPE_TEXMAP, 0, 0, \
-        p_subtexno, kMap_ClearcoatMap, \
+        p_subtexno, UiSubTexToken(kMap_ClearcoatMap), \
         p_end, \
     pb_phys_clearcoat_roughness_map, _T("physicalClearcoatRoughnessMap"), TYPE_TEXMAP, 0, 0, \
-        p_subtexno, kMap_ClearcoatRoughnessMap, \
+        p_subtexno, UiSubTexToken(kMap_ClearcoatRoughnessMap), \
         p_end, \
     pb_phys_clearcoat_normal_map, _T("physicalClearcoatNormalMap"), TYPE_TEXMAP, 0, 0, \
-        p_subtexno, kMap_ClearcoatNormalMap, \
+        p_subtexno, UiSubTexToken(kMap_ClearcoatNormalMap), \
         p_end, \
     pb_phys_transmission_map, _T("physicalTransmissionMap"), TYPE_TEXMAP, 0, 0, \
-        p_subtexno, kMap_TransmissionMap, \
+        p_subtexno, UiSubTexToken(kMap_TransmissionMap), \
         p_end
 
 static void ShowUtilityControl(HWND hWnd, int controlID, bool visible) {
@@ -1050,7 +1074,7 @@ static ThreeJSUtilityDlgProc utilityDlgProc;
         p_ui, TYPE_COLORSWATCH, IDC_COLOR, \
         p_end, \
     pb_color_map, _T("colorMap"), TYPE_TEXMAP, 0, 0, \
-        p_subtexno, kMap_Color, \
+        p_subtexno, UiSubTexToken(kMap_Color), \
         p_ui, TYPE_TEXMAPBUTTON, IDC_COLOR_MAP, \
         p_end, \
     pb_color_map_strength, _T("colorMapStrength"), TYPE_FLOAT, P_ANIMATABLE, 0, \
@@ -1064,7 +1088,7 @@ static ThreeJSUtilityDlgProc utilityDlgProc;
         p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_UTILITY_BLUR_EDIT, IDC_UTILITY_BLUR_SPIN, 0.01f, \
         p_end, \
     pb_roughness_map, _T("roughnessMap"), TYPE_TEXMAP, 0, 0, \
-        p_subtexno, kMap_Roughness, \
+        p_subtexno, UiSubTexToken(kMap_Roughness), \
         p_end, \
     pb_roughness_map_strength, _T("roughnessMapStrength"), TYPE_FLOAT, P_ANIMATABLE, 0, \
         p_default, 1.0f, \
@@ -1075,14 +1099,14 @@ static ThreeJSUtilityDlgProc utilityDlgProc;
         p_range, 0.0f, 99999.0f, \
         p_end, \
     pb_metalness_map, _T("metalnessMap"), TYPE_TEXMAP, 0, 0, \
-        p_subtexno, kMap_Metalness, \
+        p_subtexno, UiSubTexToken(kMap_Metalness), \
         p_end, \
     pb_metalness_map_strength, _T("metalnessMapStrength"), TYPE_FLOAT, P_ANIMATABLE, 0, \
         p_default, 1.0f, \
         p_range, 0.0f, 99999.0f, \
         p_end, \
     pb_normal_map, _T("normalMap"), TYPE_TEXMAP, 0, 0, \
-        p_subtexno, kMap_Normal, \
+        p_subtexno, UiSubTexToken(kMap_Normal), \
         p_ui, TYPE_TEXMAPBUTTON, IDC_NORMAL_MAP, \
         p_end, \
     pb_normal_scale, _T("normalScale"), TYPE_FLOAT, P_ANIMATABLE, 0, \
@@ -1091,7 +1115,7 @@ static ThreeJSUtilityDlgProc utilityDlgProc;
         p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_NORMSCL_EDIT, IDC_NORMSCL_SPIN, 0.01f, \
         p_end, \
     pb_bump_map, _T("bumpMap"), TYPE_TEXMAP, 0, 0, \
-        p_subtexno, kMap_Bump, \
+        p_subtexno, UiSubTexToken(kMap_Bump), \
         p_ui, TYPE_TEXMAPBUTTON, IDC_BUMP_MAP, \
         p_end, \
     pb_bump_scale, _T("bumpScale"), TYPE_FLOAT, P_ANIMATABLE, 0, \
@@ -1100,7 +1124,7 @@ static ThreeJSUtilityDlgProc utilityDlgProc;
         p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_BUMP_EDIT, IDC_BUMP_SPIN, 0.01f, \
         p_end, \
     pb_displacement_map, _T("displacementMap"), TYPE_TEXMAP, 0, 0, \
-        p_subtexno, kMap_Displacement, \
+        p_subtexno, UiSubTexToken(kMap_Displacement), \
         p_ui, TYPE_TEXMAPBUTTON, IDC_DISP_MAP, \
         p_end, \
     pb_displacement_scale, _T("displacementScale"), TYPE_FLOAT, P_ANIMATABLE, 0, \
@@ -1118,7 +1142,7 @@ static ThreeJSUtilityDlgProc utilityDlgProc;
         p_ui, TYPE_COLORSWATCH, IDC_EM_COLOR, \
         p_end, \
     pb_emissive_map, _T("emissiveMap"), TYPE_TEXMAP, 0, 0, \
-        p_subtexno, kMap_Emissive, \
+        p_subtexno, UiSubTexToken(kMap_Emissive), \
         p_ui, TYPE_TEXMAPBUTTON, IDC_EM_MAP, \
         p_end, \
     pb_emissive_intensity, _T("emissiveIntensity"), TYPE_FLOAT, P_ANIMATABLE, 0, \
@@ -1137,7 +1161,7 @@ static ThreeJSUtilityDlgProc utilityDlgProc;
         p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_OPACITY_EDIT, IDC_OPACITY_SPIN, 0.01f, \
         p_end, \
     pb_opacity_map, _T("opacityMap"), TYPE_TEXMAP, 0, 0, \
-        p_subtexno, kMap_Opacity, \
+        p_subtexno, UiSubTexToken(kMap_Opacity), \
         p_ui, TYPE_TEXMAPBUTTON, IDC_OPACITY_MAP, \
         p_end, \
     pb_opacity_map_strength, _T("opacityMapStrength"), TYPE_FLOAT, P_ANIMATABLE, 0, \
@@ -1146,7 +1170,7 @@ static ThreeJSUtilityDlgProc utilityDlgProc;
         p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_OPMAPSTR_EDIT, IDC_OPMAPSTR_SPIN, 0.01f, \
         p_end, \
     pb_lightmap, _T("lightMap"), TYPE_TEXMAP, 0, 0, \
-        p_subtexno, kMap_Lightmap, \
+        p_subtexno, UiSubTexToken(kMap_Lightmap), \
         p_ui, TYPE_TEXMAPBUTTON, IDC_LM_MAP, \
         p_end, \
     pb_lightmap_intensity, _T("lightMapIntensity"), TYPE_FLOAT, P_ANIMATABLE, 0, \
@@ -1160,7 +1184,7 @@ static ThreeJSUtilityDlgProc utilityDlgProc;
         p_ui, TYPE_SPINNER, EDITTYPE_INT, IDC_LM_CH_EDIT, IDC_LM_CH_SPIN, 1.0f, \
         p_end, \
     pb_ao_map, _T("aoMap"), TYPE_TEXMAP, 0, 0, \
-        p_subtexno, kMap_AO, \
+        p_subtexno, UiSubTexToken(kMap_AO), \
         p_ui, TYPE_TEXMAPBUTTON, IDC_AO_MAP, \
         p_end, \
     pb_ao_intensity, _T("aoIntensity"), TYPE_FLOAT, P_ANIMATABLE, 0, \
@@ -1169,11 +1193,11 @@ static ThreeJSUtilityDlgProc utilityDlgProc;
         p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_AO_INT_EDIT, IDC_AO_INT_SPIN, 0.1f, \
         p_end, \
     pb_matcap_map, _T("matcapMap"), TYPE_TEXMAP, 0, 0, \
-        p_subtexno, kMap_Matcap, \
+        p_subtexno, UiSubTexToken(kMap_Matcap), \
         p_ui, TYPE_TEXMAPBUTTON, IDC_UTILITY_MATCAP_MAP, \
         p_end, \
     pb_specular_map, _T("specularMap"), TYPE_TEXMAP, 0, 0, \
-        p_subtexno, kMap_Specular, \
+        p_subtexno, UiSubTexToken(kMap_Specular), \
         p_ui, TYPE_TEXMAPBUTTON, IDC_UTILITY_SPECMAP, \
         p_end, \
     pb_specular_color, _T("specularColor"), TYPE_RGBA, P_ANIMATABLE, 0, \
@@ -1654,7 +1678,7 @@ static ThreeJSTSLDlgProc tslDlgProc;
 
 #define TSL_MAP_PARAM(PARAM_ID, PARAM_NAME, SUBTEX_ID, CTRL_ID) \
     PARAM_ID, _T(PARAM_NAME), TYPE_TEXMAP, 0, 0, \
-        p_subtexno, SUBTEX_ID, \
+        p_subtexno, UiSubTexToken(SUBTEX_ID), \
         p_ui, TYPE_TEXMAPBUTTON, CTRL_ID, \
         p_end,
 

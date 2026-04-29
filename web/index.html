@@ -2866,7 +2866,7 @@
                     applyTextureTransform(loadedTex, normalizedXf);
                     loadedTex.needsUpdate = true;
                     textureCache.set(cacheKey, loadedTex);
-                    reapplyBakeOverridesToScene();
+                    if (bakeOverrides.enabled) reapplyBakeOverridesToScene();
                     ssgiFx.markOutputChanged?.();
                 }, undefined, () => {});
                 return placeholder;
@@ -7580,13 +7580,15 @@
             const next = normalizeBakeState(payload);
             const prevSignature = bakeStateSignature();
             const nextSignature = JSON.stringify(next);
+            const activeEl = document.activeElement;
+            const bakePanelEditing = !!(bakePanelVisible && activeEl && bakePanel.contains(activeEl) && activeEl.matches?.('input,select,textarea'));
             if (prevSignature === nextSignature) {
-                if (refreshPanel && bakePanelVisible) rebuildBakePanel();
+                if (refreshPanel && bakePanelVisible && !bakePanelEditing) rebuildBakePanel();
                 return;
             }
             bakeOverrides = next;
             if (rebuild) reapplyBakeOverridesToScene();
-            if (refreshPanel && bakePanelVisible) rebuildBakePanel();
+            if (refreshPanel && bakePanelVisible && !bakePanelEditing) rebuildBakePanel();
             if (persist) saveBakeState();
         }
 
@@ -10111,28 +10113,29 @@
                 };
 
                 syncClonePanelFn = () => {
+                    const canSyncInput = (input) => !!input && document.activeElement !== input;
                     const s = ssgiFx.getState().clone;
                     cloneToggle.textContent = s.enabled ? 'On' : 'Off';
                     cloneToggle.classList.toggle('active', s.enabled);
-                    cloneSource.value = s.source;
+                    if (canSyncInput(cloneSource)) cloneSource.value = s.source;
                     for (const key of cloneSliders) {
                         const input = document.getElementById(`fx-clone-${key}`);
                         const valEl = document.getElementById(`fx-clone-${key}-val`);
-                        if (input) input.value = s[key];
+                        if (canSyncInput(input)) input.value = s[key];
                         if (valEl) valEl.textContent = s[key] >= 1 ? String(Math.round(s[key])) : s[key].toFixed(2);
                     }
-                    invertCheck.checked = !!s.invert;
+                    if (canSyncInput(invertCheck)) invertCheck.checked = !!s.invert;
                     const retro = ssgiFx.getState().retro;
                     wobbleToggle.textContent = retro.wiggle ? 'On' : 'Off';
                     wobbleToggle.classList.toggle('active', retro.wiggle);
-                    snapGridSlider.value = retro.affineDistortion;
+                    if (canSyncInput(snapGridSlider)) snapGridSlider.value = retro.affineDistortion;
                     snapGridVal.textContent = retro.affineDistortion.toFixed(1);
                     asciiToggle.textContent = asciiActive ? 'On' : 'Off';
                     asciiToggle.classList.toggle('active', asciiActive);
-                    asciiResSlider.value = asciiSettings.resolution;
+                    if (canSyncInput(asciiResSlider)) asciiResSlider.value = asciiSettings.resolution;
                     asciiResVal.textContent = asciiSettings.resolution.toFixed(2);
-                    asciiColorSelect.value = asciiSettings.color;
-                    asciiInvertCheck.checked = asciiSettings.invert;
+                    if (canSyncInput(asciiColorSelect)) asciiColorSelect.value = asciiSettings.color;
+                    if (canSyncInput(asciiInvertCheck)) asciiInvertCheck.checked = asciiSettings.invert;
                 };
                 syncClonePanelFn();
             }
@@ -10202,6 +10205,7 @@
 
             if (!force && signature === lastPostFxSignature) return;
             lastPostFxSignature = signature;
+            const canSyncInput = (input) => !!input && (force || document.activeElement !== input);
 
             const panelStatus = document.getElementById('postPanelStatus');
             if (panelStatus) {
@@ -10221,31 +10225,31 @@
             const instanceThresholdValue = document.getElementById('fx-performance-instancethreshold-val');
             const performanceNote = document.getElementById('fx-performance-note');
             const tmSelect = document.getElementById('fx-tonemapping-mode');
-            if (tmSelect) tmSelect.value = currentToneMapping;
+            if (canSyncInput(tmSelect)) tmSelect.value = currentToneMapping;
             const expSlider = document.getElementById('fx-tonemapping-exp');
             const expLabel = document.getElementById('fx-tonemapping-exp-val');
             const currentEV = Math.log2(currentExposure || 1);
-            if (expSlider) expSlider.value = String(currentEV);
+            if (canSyncInput(expSlider)) expSlider.value = String(currentEV);
             if (expLabel) expLabel.textContent = `${currentEV >= 0 ? '+' : ''}${currentEV.toFixed(1)} EV`;
             const cg = ssgiFx.getColorGrading();
             const brightnessSlider = document.getElementById('fx-tonemapping-brightness');
             const brightnessLabel = document.getElementById('fx-tonemapping-brightness-val');
             const contrastSlider = document.getElementById('fx-tonemapping-contrast');
             const contrastLabel = document.getElementById('fx-tonemapping-contrast-val');
-            if (brightnessSlider) brightnessSlider.value = String(cg.brightness);
+            if (canSyncInput(brightnessSlider)) brightnessSlider.value = String(cg.brightness);
             if (brightnessLabel) brightnessLabel.textContent = cg.brightness.toFixed(2);
-            if (contrastSlider) contrastSlider.value = String(cg.contrast);
+            if (canSyncInput(contrastSlider)) contrastSlider.value = String(cg.contrast);
             if (contrastLabel) contrastLabel.textContent = cg.contrast.toFixed(2);
             const aaSelect = document.getElementById('fx-aa-mode');
-            if (aaSelect) aaSelect.value = currentAAMode;
+            if (canSyncInput(aaSelect)) aaSelect.value = currentAAMode;
             const aaTraaOption = document.querySelector('#fx-aa-mode option[value="traa"]');
             if (aaTraaOption) aaTraaOption.disabled = !supportsScreenSpaceEffects;
-            if (fpsCapSelect) fpsCapSelect.value = String(performanceSettings.fpsCap || 0);
-            if (renderScaleSlider) renderScaleSlider.value = String(performanceSettings.renderScale);
+            if (canSyncInput(fpsCapSelect)) fpsCapSelect.value = String(performanceSettings.fpsCap || 0);
+            if (canSyncInput(renderScaleSlider)) renderScaleSlider.value = String(performanceSettings.renderScale);
             if (renderScaleValue) renderScaleValue.textContent = `${performanceSettings.renderScale.toFixed(2)}x`;
-            if (optimizeInstancesCheck) optimizeInstancesCheck.checked = !!performanceSettings.optimizeMaxInstances;
-            if (splatsEnabledCheck) splatsEnabledCheck.checked = performanceSettings.splatsEnabled !== false;
-            if (instanceThresholdSlider) instanceThresholdSlider.value = String(performanceSettings.maxInstanceBucketThreshold);
+            if (canSyncInput(optimizeInstancesCheck)) optimizeInstancesCheck.checked = !!performanceSettings.optimizeMaxInstances;
+            if (canSyncInput(splatsEnabledCheck)) splatsEnabledCheck.checked = performanceSettings.splatsEnabled !== false;
+            if (canSyncInput(instanceThresholdSlider)) instanceThresholdSlider.value = String(performanceSettings.maxInstanceBucketThreshold);
             if (instanceThresholdValue) instanceThresholdValue.textContent = String(performanceSettings.maxInstanceBucketThreshold);
             if (performanceNote) {
                 performanceNote.textContent =
@@ -10256,8 +10260,8 @@
             const cameraNearValue = document.getElementById('fx-camera-near-val');
             const cameraFarInput = document.getElementById('fx-camera-far');
             const cameraFarValue = document.getElementById('fx-camera-far-val');
-            if (cameraNearInput) cameraNearInput.value = cameraClip.near != null ? String(cameraClip.near) : '';
-            if (cameraFarInput) cameraFarInput.value = cameraClip.far != null ? String(cameraClip.far) : '';
+            if (canSyncInput(cameraNearInput)) cameraNearInput.value = cameraClip.near != null ? String(cameraClip.near) : '';
+            if (canSyncInput(cameraFarInput)) cameraFarInput.value = cameraClip.far != null ? String(cameraClip.far) : '';
             if (cameraNearValue) {
                 cameraNearValue.textContent = cameraClip.near != null
                     ? `${camera.near.toFixed(3)}`
@@ -10292,6 +10296,7 @@
                 for (const control of section.controls) {
                     const controlEl = section.controlEls[control.key];
                     if (!controlEl) continue;
+                    const editingControl = !force && document.activeElement === controlEl.input;
 
                     // Disable DOF sliders when "Auto from Camera" is on (Physical Camera drives them)
                     const dofAutoControls = ['focusDistance', 'focalLength', 'bokehScale'];
@@ -10299,9 +10304,9 @@
                     controlEl.input.disabled = disabled || autoLocked;
 
                     if (control.type === 'checkbox') {
-                        controlEl.input.checked = !!values[control.key];
+                        if (!editingControl) controlEl.input.checked = !!values[control.key];
                     } else {
-                        controlEl.input.value = values[control.key];
+                        if (!editingControl) controlEl.input.value = values[control.key];
                         if (controlEl.valueEl) {
                             controlEl.valueEl.textContent = formatControlValue(control, values[control.key]);
                         }

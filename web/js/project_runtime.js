@@ -180,13 +180,21 @@ export function createProjectRuntime({ layerManager, bridge, perfHud, debugLog =
         return value && typeof value === 'object' ? cloneJsonValue(value) : null;
     }
 
-    function mergeSettingsIntoPostFx(payload, settings) {
-        const nextPayload = cloneJsonValue(payload) ?? {};
-        const nextSettings = settings && typeof settings === 'object' ? cloneJsonValue(settings) : null;
-        if (nextSettings) nextPayload[POSTFX_SETTINGS_KEY] = nextSettings;
-        else delete nextPayload[POSTFX_SETTINGS_KEY];
-        return nextPayload;
+function mergeSettingsIntoPostFx(payload, settings) {
+    const nextPayload = cloneJsonValue(payload) ?? {};
+    const nextSettings = settings && typeof settings === 'object' ? cloneJsonValue(settings) : null;
+    if (nextSettings) nextPayload[POSTFX_SETTINGS_KEY] = nextSettings;
+    else delete nextPayload[POSTFX_SETTINGS_KEY];
+    return nextPayload;
+}
+
+function stripSettingsFromPostFx(payload) {
+    const nextPayload = cloneJsonValue(payload);
+    if (nextPayload && typeof nextPayload === 'object') {
+        delete nextPayload[POSTFX_SETTINGS_KEY];
     }
+    return nextPayload;
+}
 
     function subscribe(listener) {
         listeners.add(listener);
@@ -771,7 +779,7 @@ export function createProjectRuntime({ layerManager, bridge, perfHud, debugLog =
     }
 
     function getPostFxState() {
-        return cloneJsonValue(postFxState ?? transientPostFxState ?? manifestState?.postFx ?? null);
+        return stripSettingsFromPostFx(postFxState ?? transientPostFxState ?? manifestState?.postFx ?? null);
     }
 
     function getStudioState() {

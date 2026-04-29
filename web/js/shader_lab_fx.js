@@ -84,6 +84,7 @@ export function createShaderLabFx({ THREE, renderer, scene, camera }) {
     let displayMaterial = null;
     let displayQuad = null;
     let currentConfig = DEFAULT_COMPOSITION;
+    let configKey = 0;
     let errorText = '';
     let loading = false;
 
@@ -180,19 +181,20 @@ export function createShaderLabFx({ THREE, renderer, scene, camera }) {
         errorText = '';
         try {
             const { React, ReactDOMClient, useShaderLab } = await loadShaderLab();
+            _React = React;
             currentConfig = config || DEFAULT_COMPOSITION;
+            configKey++;
             ensureTarget();
             ensureDisplayQuad();
 
-            // Hidden React bridge component whose only job is to run the
-            // useShaderLab hook and hand us its postprocessing instance.
-            BridgeComponent = function Bridge({ config }) {
+            BridgeComponent = function Bridge({ config: cfg }) {
                 const { w, h } = getSize();
-                const hookResult = useShaderLab(config, { renderer, width: w, height: h });
-                React.useEffect(() => {
+                const hookResult = useShaderLab(cfg, { renderer, width: w, height: h });
+                React.useLayoutEffect(() => {
                     if (hookResult?.postprocessing) {
                         postprocessing = hookResult.postprocessing;
                         ready = true;
+                        emitStateChange();
                     }
                     return () => {
                         postprocessing = null;
@@ -207,7 +209,7 @@ export function createShaderLabFx({ THREE, renderer, scene, camera }) {
             hiddenDiv.setAttribute('aria-hidden', 'true');
             document.body.appendChild(hiddenDiv);
             reactRoot = ReactDOMClient.createRoot(hiddenDiv);
-            reactRoot.render(React.createElement(BridgeComponent, { config: currentConfig }));
+            reactRoot.render(React.createElement(BridgeComponent, { config: currentConfig, key: configKey }));
 
             enabled = true;
             loading = false;
@@ -217,6 +219,7 @@ export function createShaderLabFx({ THREE, renderer, scene, camera }) {
             console.error('[shader-lab-fx] enable failed:', err);
             enabled = false;
             loading = false;
+            _React = null;
             cleanupResources();
             emitStateChange();
             throw err;
@@ -226,31 +229,27 @@ export function createShaderLabFx({ THREE, renderer, scene, camera }) {
     function disable() {
         if (!enabled) return;
         enabled = false;
+        lastOutputTex = null;
         cleanupResources();
         emitStateChange();
     }
 
-    // Inner Bridge component reference (kept so a future optimization can
-    // re-render via a key change instead of full disable/enable).
     let BridgeComponent = null;
+    let _React = null;
 
     async function setConfig(config) {
         currentConfig = config || DEFAULT_COMPOSITION;
-        if (!enabled) return;
-        // shader-lab's useShaderLab hook captures the config on mount and
-        // doesn't re-run on prop change, so prop-level re-render has no
-        // effect. The reliable path is to fully tear down the React root
-        // and remount with the new config — cheap since the module load
-        // is cached from the first enable().
-        disable();
-        await enable(currentConfig);
+        if (!enabled || !_React || !reactRoot) return;
+        configKey++;
+        reactRoot.render(_React.createElement(BridgeComponent, { config: currentConfig, key: configKey }));
     }
 
     // Main render path when enabled. Called from the frame loop in place
     // of ssgiFx.render().
+    let lastOutputTex = null;
+
     function renderFrame(elapsedTime, delta) {
         if (!enabled || !ready || !postprocessing) {
-            // Fallback: draw scene directly while shader-lab loads.
             renderer.render(scene, activeCamera);
             return;
         }
@@ -266,12 +265,17 @@ export function createShaderLabFx({ THREE, renderer, scene, camera }) {
                 delta
             );
 
-            // Display the output texture to the visible canvas via a
-            // fullscreen quad. Some shader-lab builds may return a Texture
-            // directly; others wrap it in an object with `.texture`.
             const outputTex = output?.isTexture ? output : output?.texture ?? output;
-            displayMaterial.map = outputTex || null;
-            renderer.render(displayScene, displayCamera);
+            if (outputTex && displayMaterial) {
+                if (displayMaterial.map !== outputTex) {
+                    displayMaterial.map = outputTex;
+                    displayMaterial.needsUpdate = true;
+                    lastOutputTex = outputTex;
+                }
+                renderer.render(displayScene, displayCamera);
+            } else {
+                renderer.render(scene, activeCamera);
+            }
         } catch (err) {
             errorText = err?.message || String(err);
             console.error('[shader-lab-fx] frame render failed:', err);
@@ -281,6 +285,7 @@ export function createShaderLabFx({ THREE, renderer, scene, camera }) {
 
     function resize(width, height) {
         if (sceneTarget) sceneTarget.setSize(width, height);
+        if (postprocessing?.setSize) postprocessing.setSize(width, height);
     }
 
     return {

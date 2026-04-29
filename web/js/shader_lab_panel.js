@@ -253,17 +253,27 @@ let _storeSnapshot = {
 let _storeChangeHandler = null;
 let _storeApplyToReact = null;
 
+function snapshotSignature(snapshot) {
+    try {
+        return JSON.stringify(snapshot);
+    } catch (_) {
+        return '';
+    }
+}
+
 export function getShaderLabSnapshot() {
     return _storeSnapshot;
 }
 
 export function setShaderLabSnapshot(snapshot) {
     if (!snapshot || typeof snapshot !== 'object') return;
-    _storeSnapshot = {
+    const nextSnapshot = {
         config: normalizeConfig(snapshot.config),
         autoApply: snapshot.autoApply !== false,
         enabled: !!snapshot.enabled,
     };
+    if (snapshotSignature(nextSnapshot) === snapshotSignature(_storeSnapshot)) return;
+    _storeSnapshot = nextSnapshot;
     if (_storeApplyToReact) _storeApplyToReact(_storeSnapshot);
 }
 

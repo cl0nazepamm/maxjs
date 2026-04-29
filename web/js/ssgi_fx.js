@@ -98,6 +98,9 @@ export function createSSGIController({
     const opaqueBackdropGU = uniform(hiddenBackground.g);
     const opaqueBackdropBU = uniform(hiddenBackground.b);
 
+    const colorGradingBrightnessU = uniform(0);
+    const colorGradingContrastU = uniform(0);
+
     // Cached toon mesh detection — refreshed on pipeline rebuild, not every frame
     let cachedHasToonMeshes = false;
 
@@ -266,6 +269,10 @@ export function createSSGIController({
             gridDensity: 0,          // subdivision grid (0=off, 2-8=lines)
             smoothing: 0.75,         // lerp factor (0=frozen, 1=instant snap)
             invert: false,           // invert threshold (track dark regions)
+        },
+        colorGrading: {
+            brightness: 0,
+            contrast: 0,
         },
     };
 
@@ -770,6 +777,7 @@ export function createSSGIController({
             dof: { ...state.dof },
             opaqueBackdrop: { ...state.opaqueBackdrop },
             clone: { ...state.clone, color: [...state.clone.color] },  // blob tracker (CPU-only, no GPU pipeline)
+            colorGrading: { ...state.colorGrading },
         };
     }
 
@@ -1601,6 +1609,16 @@ export function createSSGIController({
                 beauty = vec4(mix(solidBg, beauty.rgb, beauty.a), float(1));
             }
 
+            // Global color grading — persistent uniforms, no rebuild needed on slider changes
+            colorGradingBrightnessU.value = state.colorGrading.brightness;
+            colorGradingContrastU.value = state.colorGrading.contrast;
+            {
+                let col = beauty.rgb;
+                col = col.add(colorGradingBrightnessU);
+                col = col.sub(0.5).mul(colorGradingContrastU.add(1.0)).add(0.5);
+                beauty = vec4(col, beauty.a);
+            }
+
             postProcessing.outputNode = beauty;
             postProcessing.needsUpdate = true;
             pipelineReady = true;
@@ -1945,6 +1963,19 @@ export function createSSGIController({
             assignFinite(state.pixel, 'saturation', options.saturation);
             rebuildPipeline();
             return { ...state.pixel };
+        },
+
+        // ── Global Color Grading ──
+
+        getColorGrading() {
+            return { ...state.colorGrading };
+        },
+        setColorGrading(options = {}) {
+            assignFinite(state.colorGrading, 'brightness', options.brightness);
+            assignFinite(state.colorGrading, 'contrast', options.contrast);
+            colorGradingBrightnessU.value = state.colorGrading.brightness;
+            colorGradingContrastU.value = state.colorGrading.contrast;
+            return { ...state.colorGrading };
         },
 
         // ── Depth of Field ──

@@ -2856,6 +2856,21 @@
             const normalizedXf = normalizeTextureTransform(xf);
             const cacheKey = JSON.stringify([url, String(colorSpace), normalizedXf]);
             if (textureCache.has(cacheKey)) return textureCache.get(cacheKey);
+            const ext = getTextureExtension(url);
+            if (ext === 'exr' || ext === 'hdr') {
+                const loader = ext === 'exr' ? exrLoader : rgbeLoader;
+                const placeholder = fallbackTex || fallbackWhiteTexture;
+                textureCache.set(cacheKey, placeholder);
+                loader.load(url, loadedTex => {
+                    applyTextureChannelSelection(loadedTex, normalizedXf);
+                    applyTextureTransform(loadedTex, normalizedXf);
+                    loadedTex.needsUpdate = true;
+                    textureCache.set(cacheKey, loadedTex);
+                    reapplyBakeOverridesToScene();
+                    ssgiFx.markOutputChanged?.();
+                }, undefined, () => {});
+                return placeholder;
+            }
             const tex = textureLoader.load(
                 url,
                 loadedTex => {
@@ -4600,6 +4615,7 @@
             beautySuffix: '_beauty',
             extension: 'png',
             intensity: 1.0,
+            bakeExposure: 0,
         });
         let bakeOverrides = { ...DEFAULT_BAKE_STATE };
         let lastBakeUv2RequestKey = '';
@@ -4617,6 +4633,7 @@
             next.beautySuffix = String(next.beautySuffix ?? DEFAULT_BAKE_STATE.beautySuffix);
             next.extension = String(next.extension || DEFAULT_BAKE_STATE.extension).replace(/^\./, '') || DEFAULT_BAKE_STATE.extension;
             next.intensity = Number.isFinite(Number(next.intensity)) ? Math.max(0, Number(next.intensity)) : 1.0;
+            next.bakeExposure = Number.isFinite(Number(next.bakeExposure)) ? Number(next.bakeExposure) : 0;
             return next;
         }
 
@@ -4715,8 +4732,9 @@
         }
 
         function createBeautyBakeMaterial(source, texture) {
+            const exposureMul = Math.pow(2, bakeOverrides.bakeExposure);
             const mat = new THREE.MeshBasicMaterial({
-                color: 0xffffff,
+                color: new THREE.Color(exposureMul, exposureMul, exposureMul),
                 map: applyTextureUvChannel(texture, 2, 2),
                 side: source?.side ?? THREE.FrontSide,
                 transparent: !!source?.transparent || (Number.isFinite(source?.opacity) && source.opacity < 1),
@@ -4750,7 +4768,7 @@
             const tex = loadTexture(url, THREE.LinearSRGBColorSpace, null, fallbackWhiteTexture);
             if (!tex) return material;
             material.lightMap = applyTextureUvChannel(tex, 2, 2);
-            material.lightMapIntensity = bakeOverrides.intensity;
+            material.lightMapIntensity = bakeOverrides.intensity * Math.pow(2, bakeOverrides.bakeExposure);
             material.userData ??= {};
             material.userData.maxjsBakeOverride = 'lightmap';
             material.needsUpdate = true;
@@ -7511,7 +7529,7 @@
             const tex = loadTexture(url, THREE.LinearSRGBColorSpace, null, fallbackWhiteTexture);
             if (!tex) return false;
             const nextLightMap = applyTextureUvChannel(tex, 2, 2);
-            const intensity = bakeOverrides.intensity;
+            const intensity = bakeOverrides.intensity * Math.pow(2, bakeOverrides.bakeExposure);
             const lightMapChanged = material.lightMap !== nextLightMap;
             const intensityChanged = material.lightMapIntensity !== intensity;
             if (!lightMapChanged && !intensityChanged && wasOverride === 'lightmap') return false;
@@ -7645,12 +7663,15 @@
                 beautySuffix: bakePanel.querySelector('#bake-beauty-suffix')?.value,
                 extension: bakePanel.querySelector('#bake-ext')?.value,
                 intensity: parseFloat(bakePanel.querySelector('#bake-intensity')?.value),
+                bakeExposure: parseFloat(bakePanel.querySelector('#bake-exposure')?.value),
             });
         }
 
         function updateBakePanelPreview(next) {
             const intensityLabel = bakePanel.querySelector('#bake-intensity')?.nextElementSibling;
             if (intensityLabel) intensityLabel.textContent = next.intensity.toFixed(2);
+            const exposureLabel = bakePanel.querySelector('#bake-exposure')?.nextElementSibling;
+            if (exposureLabel) exposureLabel.textContent = `${next.bakeExposure >= 0 ? '+' : ''}${next.bakeExposure.toFixed(1)} EV`;
             const previous = bakeOverrides;
             bakeOverrides = next;
             const sampleLight = getBakeTextureUrl({ n: 'ObjectName', h: 0 }, null, 'lightmap') || 'Set a folder to preview path';
@@ -7702,6 +7723,7 @@
                             <label class="bake-field"><span>Beauty Suffix</span><input id="bake-beauty-suffix" type="text" value="${escapeBakeHtml(b.beautySuffix)}"></label>
                             <label class="bake-field"><span>Ext</span><input id="bake-ext" type="text" value="${escapeBakeHtml(b.extension)}"></label>
                             <label class="bake-field"><span>Intensity</span><span class="bake-range"><input id="bake-intensity" class="fx-range" type="range" min="0" max="4" step="0.05" value="${b.intensity}"><span class="bake-value">${b.intensity.toFixed(2)}</span></span></label>
+                            <label class="bake-field"><span>Exposure</span><span class="bake-range"><input id="bake-exposure" class="fx-range" type="range" min="-6" max="6" step="0.1" value="${b.bakeExposure}"><span class="bake-value">${b.bakeExposure >= 0 ? '+' : ''}${b.bakeExposure.toFixed(1)} EV</span></span></label>
                         </div>
                     </section>
                     <section class="fx-section">
@@ -9521,6 +9543,20 @@
                                 </div>
                                 <input class="fx-range" id="fx-tonemapping-exp" type="range" min="-6" max="4" step="0.1" value="0" data-ev="true">
                             </label>
+                            <label class="fx-control" for="fx-tonemapping-brightness">
+                                <div class="fx-control-head">
+                                    <span>Brightness</span>
+                                    <span class="fx-value" id="fx-tonemapping-brightness-val">0.00</span>
+                                </div>
+                                <input class="fx-range" id="fx-tonemapping-brightness" type="range" min="-1" max="1" step="0.01" value="0">
+                            </label>
+                            <label class="fx-control" for="fx-tonemapping-contrast">
+                                <div class="fx-control-head">
+                                    <span>Contrast</span>
+                                    <span class="fx-value" id="fx-tonemapping-contrast-val">0.00</span>
+                                </div>
+                                <input class="fx-range" id="fx-tonemapping-contrast" type="range" min="-1" max="1" step="0.01" value="0">
+                            </label>
                         </div>
                     </section>
                     <section class="fx-section collapsed">
@@ -9765,6 +9801,7 @@
                 ssgiFx.setTRAAEnabled(false);
                 ssgiFx.setCloneEnabled(false);
                 ssgiFx.setCloneOptions({ threshold: 0.53, blurRadius: 0, minBlobSize: 0, opacity: 1.0, gridDensity: 0, smoothing: 0.75, invert: false, source: 'luma' });
+                ssgiFx.setColorGrading({ brightness: 0, contrast: 0 });
                 if (asciiActive) exitAsciiMode();
                 asciiSettings = { resolution: 0.15, color: 'white', invert: false };
                 performanceSettings = { ...PERFORMANCE_DEFAULTS };
@@ -9839,6 +9876,24 @@
                 expLabel.textContent = `${ev >= 0 ? '+' : ''}${ev.toFixed(1)} EV`;
             };
             expSlider.onchange = () => savePostFxState();
+
+            // Brightness / Contrast (global color grading, runs independently of Pixel FX)
+            const brightnessSlider = document.getElementById('fx-tonemapping-brightness');
+            const brightnessLabel = document.getElementById('fx-tonemapping-brightness-val');
+            const contrastSlider = document.getElementById('fx-tonemapping-contrast');
+            const contrastLabel = document.getElementById('fx-tonemapping-contrast-val');
+            brightnessSlider.oninput = (e) => {
+                const v = parseFloat(e.target.value);
+                ssgiFx.setColorGrading({ brightness: v });
+                brightnessLabel.textContent = v.toFixed(2);
+            };
+            brightnessSlider.onchange = () => savePostFxState();
+            contrastSlider.oninput = (e) => {
+                const v = parseFloat(e.target.value);
+                ssgiFx.setColorGrading({ contrast: v });
+                contrastLabel.textContent = v.toFixed(2);
+            };
+            contrastSlider.onchange = () => savePostFxState();
 
             // Anti-Aliasing mode
             const aaSelect = document.getElementById('fx-aa-mode');
@@ -10172,6 +10227,15 @@
             const currentEV = Math.log2(currentExposure || 1);
             if (expSlider) expSlider.value = String(currentEV);
             if (expLabel) expLabel.textContent = `${currentEV >= 0 ? '+' : ''}${currentEV.toFixed(1)} EV`;
+            const cg = ssgiFx.getColorGrading();
+            const brightnessSlider = document.getElementById('fx-tonemapping-brightness');
+            const brightnessLabel = document.getElementById('fx-tonemapping-brightness-val');
+            const contrastSlider = document.getElementById('fx-tonemapping-contrast');
+            const contrastLabel = document.getElementById('fx-tonemapping-contrast-val');
+            if (brightnessSlider) brightnessSlider.value = String(cg.brightness);
+            if (brightnessLabel) brightnessLabel.textContent = cg.brightness.toFixed(2);
+            if (contrastSlider) contrastSlider.value = String(cg.contrast);
+            if (contrastLabel) contrastLabel.textContent = cg.contrast.toFixed(2);
             const aaSelect = document.getElementById('fx-aa-mode');
             if (aaSelect) aaSelect.value = currentAAMode;
             const aaTraaOption = document.querySelector('#fx-aa-mode option[value="traa"]');
@@ -10503,6 +10567,11 @@
                     delete cl.enabled;
                     ssgiFx.setCloneOptions(cl);
                     if (wasEnabled) ssgiFx.setCloneEnabled(true);
+                }
+
+                // Global color grading restore
+                if (fx.colorGrading) {
+                    ssgiFx.setColorGrading(fx.colorGrading);
                 }
 
                 // ASCII restore

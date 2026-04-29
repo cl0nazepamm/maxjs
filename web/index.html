@@ -689,6 +689,150 @@
             font-size: 10px;
             color: #999;
         }
+        #bakePanel {
+            width: min(340px, calc(100vw - 16px));
+        }
+        #bakePanel .sidepanel-header {
+            align-items: center;
+            margin-bottom: 8px;
+        }
+        #bakePanel .sidepanel-body {
+            gap: 8px;
+        }
+        #bakePanel .fx-section {
+            padding: 8px;
+        }
+        #bakePanel .fx-section-title {
+            justify-content: space-between;
+            margin-bottom: 7px;
+        }
+        #bakePanel .fx-section-title::before {
+            display: none;
+        }
+        .bake-grid {
+            display: grid;
+            gap: 7px;
+        }
+        .bake-field {
+            display: grid;
+            grid-template-columns: 82px minmax(0, 1fr);
+            align-items: center;
+            gap: 8px;
+            min-height: 24px;
+            color: #aaa;
+            font-size: 10px;
+            font-weight: 500;
+        }
+        .bake-field > span:first-child {
+            color: #858585;
+            min-width: 0;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .bake-field input[type="text"],
+        .bake-field select {
+            width: 100%;
+            min-width: 0;
+            height: 24px;
+            padding: 4px 7px;
+            border: 1px solid rgba(255, 255, 255, 0.09);
+            border-radius: 4px;
+            background: rgba(255, 255, 255, 0.055);
+            color: #d8d8d8;
+            font: 10px/1.2 'Segoe UI', system-ui, sans-serif;
+            outline: none;
+        }
+        .bake-field input[type="text"]:hover,
+        .bake-field select:hover {
+            background: rgba(255, 255, 255, 0.075);
+            border-color: rgba(255, 255, 255, 0.16);
+        }
+        .bake-field input[type="text"]:focus,
+        .bake-field select:focus {
+            background: rgba(255, 255, 255, 0.09);
+            border-color: rgba(255, 255, 255, 0.28);
+            box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.08);
+        }
+        .bake-field .fx-range {
+            margin: 0;
+        }
+        .bake-range {
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) 34px;
+            align-items: center;
+            gap: 8px;
+        }
+        .bake-value {
+            color: #cfcfcf;
+            font-size: 10px;
+            font-weight: 700;
+            font-variant-numeric: tabular-nums;
+            text-align: right;
+        }
+        .bake-path-preview {
+            margin-top: 6px;
+            padding: 5px 6px;
+            border-radius: 4px;
+            background: rgba(0, 0, 0, 0.18);
+            color: #7f7f7f;
+            font: 9px/1.35 Consolas, 'Cascadia Mono', monospace;
+            word-break: break-all;
+        }
+        .bake-status-row {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 6px;
+        }
+        .bake-stat {
+            padding: 6px;
+            border-radius: 4px;
+            background: rgba(255, 255, 255, 0.04);
+            border: 1px solid rgba(255, 255, 255, 0.055);
+        }
+        .bake-stat span {
+            display: block;
+            color: #777;
+            font-size: 8px;
+            font-weight: 700;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+        }
+        .bake-stat strong {
+            display: block;
+            margin-top: 2px;
+            color: #e2e2e2;
+            font-size: 14px;
+            line-height: 1;
+            font-variant-numeric: tabular-nums;
+        }
+        .bake-actions {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 6px;
+            margin-top: 7px;
+        }
+        body.light-mode .bake-field,
+        body.light-mode .bake-field > span:first-child {
+            color: #444;
+        }
+        body.light-mode .bake-field input[type="text"],
+        body.light-mode .bake-field select {
+            background: rgba(255, 255, 255, 0.52);
+            color: #222;
+            border-color: rgba(0, 0, 0, 0.16);
+        }
+        body.light-mode .bake-path-preview {
+            background: rgba(0, 0, 0, 0.06);
+            color: #555;
+        }
+        body.light-mode .bake-stat {
+            background: rgba(255, 255, 255, 0.35);
+            border-color: rgba(0, 0, 0, 0.08);
+        }
+        body.light-mode .bake-stat span { color: #666; }
+        body.light-mode .bake-stat strong,
+        body.light-mode .bake-value { color: #222; }
         /* ── Light Mode — brushed metal / CLONE.LLC ── */
         body.light-mode { background: #2a2a2a; }
 
@@ -4467,7 +4611,7 @@
             next.enabled = raw.enabled === true;
             next.mode = next.mode === 'beauty' ? 'beauty' : 'lightmap';
             next.match = ['scene', 'object', 'material'].includes(next.match) ? next.match : 'scene';
-            next.folder = String(next.folder ?? '').trim();
+            next.folder = stripWrappingQuotes(next.folder);
             next.sceneName = String(next.sceneName || DEFAULT_BAKE_STATE.sceneName).trim() || DEFAULT_BAKE_STATE.sceneName;
             next.lightSuffix = String(next.lightSuffix ?? DEFAULT_BAKE_STATE.lightSuffix);
             next.beautySuffix = String(next.beautySuffix ?? DEFAULT_BAKE_STATE.beautySuffix);
@@ -4482,6 +4626,20 @@
 
         function bakeStateSignature() {
             return JSON.stringify(bakeOverrides);
+        }
+
+        function stripWrappingQuotes(value) {
+            let text = String(value ?? '').trim();
+            while (text.length >= 2) {
+                const first = text[0];
+                const last = text[text.length - 1];
+                if ((first === '"' && last === '"') || (first === "'" && last === "'")) {
+                    text = text.slice(1, -1).trim();
+                    continue;
+                }
+                break;
+            }
+            return text;
         }
 
         function encodeAssetPath(path) {
@@ -4559,7 +4717,7 @@
         function createBeautyBakeMaterial(source, texture) {
             const mat = new THREE.MeshBasicMaterial({
                 color: 0xffffff,
-                map: texture,
+                map: applyTextureUvChannel(texture, 2, 2),
                 side: source?.side ?? THREE.FrontSide,
                 transparent: !!source?.transparent || (Number.isFinite(source?.opacity) && source.opacity < 1),
                 opacity: Number.isFinite(source?.opacity) ? source.opacity : 1,
@@ -6983,8 +7141,8 @@
             if (reflPaintPanelVisible) rebuildReflPaintPanel();
         }
 
-        function saveReflPaint() {
-            saveStudioState();
+        function saveReflPaint(options = {}) {
+            saveStudioState(options);
         }
 
         function serializeReflectionPaintState() {
@@ -7087,6 +7245,7 @@
         }
 
         reflPaintPanel.addEventListener('input', handleReflPaintInput);
+        reflPaintPanel.addEventListener('change', () => saveReflPaint({ flush: true }));
 
         function rebuildReflPaintPanel() {
             const lights = reflPaint.getLights();
@@ -7133,7 +7292,7 @@
             document.getElementById('rp-add')?.addEventListener('click', () => {
                 const wasActive = reflPaint.active;
                 reflPaint.addLight({ lat: 45, lon: 90, intensity: 2.0, radiusX: 0.15, radiusY: 0.15, edge: 0.3, shape: 'circle', rotation: 0 });
-                saveReflPaint();
+                saveReflPaint({ flush: true });
                 notifyReflectionPaintChanged(wasActive);
                 rebuildReflPaintPanel();
             });
@@ -7145,7 +7304,7 @@
                 btn.addEventListener('click', () => {
                     const wasActive = reflPaint.active;
                     reflPaint.removeLight(Number(btn.dataset.id));
-                    saveReflPaint();
+                    saveReflPaint({ flush: true });
                     notifyReflectionPaintChanged(wasActive);
                     rebuildReflPaintPanel();
                 });
@@ -7163,7 +7322,11 @@
         // ── Studio State Persistence ────────────────────────
         let studioPersistTimer = 0;
         let lastProjectStudioSignature = '';
+        let queuedProjectStudioSignature = '';
+        let queuedProjectStudioPayload = null;
+        let studioPersistInFlight = false;
         let suppressStudioPersistenceDepth = 0;
+        const STUDIO_PERSIST_IDLE_MS = 550;
 
         function withStudioPersistenceSuppressed(fn) {
             suppressStudioPersistenceDepth += 1;
@@ -7209,20 +7372,46 @@
             return true;
         }
 
-        function saveStudioState() {
+        function scheduleProjectStudioSave(delayMs = STUDIO_PERSIST_IDLE_MS) {
+            clearTimeout(studioPersistTimer);
+            studioPersistTimer = setTimeout(() => {
+                studioPersistTimer = 0;
+                void flushProjectStudioSave();
+            }, delayMs);
+        }
+
+        async function flushProjectStudioSave() {
+            const projectRuntime = _projectRuntimeRef;
+            if (!projectRuntime?.setStudioState || studioPersistInFlight) return;
+            const payload = queuedProjectStudioPayload;
+            const signature = queuedProjectStudioSignature;
+            if (!payload || !signature) return;
+
+            queuedProjectStudioPayload = null;
+            queuedProjectStudioSignature = '';
+            studioPersistInFlight = true;
+            try {
+                await projectRuntime.setStudioState(payload);
+                lastProjectStudioSignature = signature;
+            } catch (error) {
+                reportBridgeError('studio state save', error);
+            } finally {
+                studioPersistInFlight = false;
+                if (queuedProjectStudioPayload) scheduleProjectStudioSave();
+            }
+        }
+
+        function saveStudioState(options = {}) {
             if (suppressStudioPersistenceDepth > 0) return;
             const payload = serializeStudioState();
             const signature = JSON.stringify(payload);
             const projectRuntime = _projectRuntimeRef;
             if (projectRuntime?.setStudioState) {
-                if (signature === lastProjectStudioSignature) return;
-                lastProjectStudioSignature = signature;
-                clearTimeout(studioPersistTimer);
-                studioPersistTimer = setTimeout(() => {
-                    void projectRuntime.setStudioState(payload).catch(error => {
-                        reportBridgeError('studio state save', error);
-                    });
-                }, 180);
+                if (signature === lastProjectStudioSignature && !queuedProjectStudioPayload) return;
+                if (signature === queuedProjectStudioSignature) return;
+                queuedProjectStudioPayload = payload;
+                queuedProjectStudioSignature = signature;
+                scheduleProjectStudioSave(options.flush ? 0 : STUDIO_PERSIST_IDLE_MS);
                 return;
             }
             saveLegacyStudioStateFallback(payload);
@@ -7233,6 +7422,8 @@
             const projectPayload = projectRuntime?.getStudioState?.();
             if (projectPayload) {
                 lastProjectStudioSignature = JSON.stringify(projectPayload);
+                queuedProjectStudioSignature = '';
+                queuedProjectStudioPayload = null;
                 applyStudioState(projectPayload);
                 return;
             }
@@ -7385,6 +7576,19 @@
             if (suppressBakePersistenceDepth > 0) return;
             const payload = serializeBakeState();
             const signature = JSON.stringify(payload);
+            const projectRuntime = _projectRuntimeRef;
+            if (projectRuntime?.setBakeState) {
+                if (signature === lastProjectBakeSignature) return;
+                lastProjectBakeSignature = signature;
+                clearTimeout(bakePersistTimer);
+                bakePersistTimer = setTimeout(() => {
+                    bakePersistTimer = 0;
+                    void projectRuntime.setBakeState(payload).catch(error => {
+                        reportBridgeError('bake state save', error);
+                    });
+                }, 550);
+                return;
+            }
             try {
                 localStorage.setItem(BAKE_STORAGE_KEY, signature);
             } catch {}
@@ -7430,8 +7634,8 @@
             if (bakePanelVisible) rebuildBakePanel();
         }
 
-        function updateBakeStateFromPanel() {
-            const next = normalizeBakeState({
+        function readBakeStateFromPanel() {
+            return normalizeBakeState({
                 enabled: bakePanel.querySelector('#bake-enabled')?.checked === true,
                 mode: bakePanel.querySelector('#bake-mode')?.value,
                 match: bakePanel.querySelector('#bake-match')?.value,
@@ -7442,9 +7646,31 @@
                 extension: bakePanel.querySelector('#bake-ext')?.value,
                 intensity: parseFloat(bakePanel.querySelector('#bake-intensity')?.value),
             });
-            applyBakeState(next, { persist: true, rebuild: true, refreshPanel: false });
+        }
+
+        function updateBakePanelPreview(next) {
             const intensityLabel = bakePanel.querySelector('#bake-intensity')?.nextElementSibling;
             if (intensityLabel) intensityLabel.textContent = next.intensity.toFixed(2);
+            const previous = bakeOverrides;
+            bakeOverrides = next;
+            const sampleLight = getBakeTextureUrl({ n: 'ObjectName', h: 0 }, null, 'lightmap') || 'Set a folder to preview path';
+            const sampleBeauty = getBakeTextureUrl({ n: 'ObjectName', h: 0 }, null, 'beauty') || 'Set a folder to preview path';
+            bakeOverrides = previous;
+            const lightPreview = bakePanel.querySelector('#bake-light-preview');
+            const beautyPreview = bakePanel.querySelector('#bake-beauty-preview');
+            if (lightPreview) lightPreview.textContent = `Light: ${sampleLight}`;
+            if (beautyPreview) beautyPreview.textContent = `Beauty: ${sampleBeauty}`;
+        }
+
+        function isBakeTextInput(el) {
+            return el?.tagName === 'INPUT' && String(el.type || '').toLowerCase() === 'text';
+        }
+
+        function updateBakeStateFromPanel(event) {
+            const next = readBakeStateFromPanel();
+            updateBakePanelPreview(next);
+            if (event?.type === 'input' && isBakeTextInput(event.target)) return;
+            applyBakeState(next, { persist: true, rebuild: true, refreshPanel: false });
         }
 
         function rebuildBakePanel() {
@@ -7461,31 +7687,40 @@
                 <div class="sidepanel-body">
                     <section class="fx-section">
                         <div class="fx-section-title"><span>Runtime Bake Source</span></div>
-                        <label class="fx-check"><span>Enabled</span><input id="bake-enabled" type="checkbox" ${b.enabled ? 'checked' : ''}></label>
-                        <label class="fx-check"><span>Mode</span><select id="bake-mode"><option value="lightmap"${b.mode === 'lightmap' ? ' selected' : ''}>Lightmap</option><option value="beauty"${b.mode === 'beauty' ? ' selected' : ''}>Beauty</option></select></label>
-                        <label class="fx-check"><span>Match</span><select id="bake-match"><option value="scene"${b.match === 'scene' ? ' selected' : ''}>Scene atlas</option><option value="object"${b.match === 'object' ? ' selected' : ''}>Object name</option><option value="material"${b.match === 'material' ? ' selected' : ''}>Material name</option></select></label>
-                        <label class="fx-check"><span>Folder</span><input id="bake-folder" type="text" value="${escapeBakeHtml(b.folder)}" placeholder="F:\\bakes\\ or ./bakes/"></label>
+                        <div class="bake-grid">
+                            <label class="fx-check"><span>Enabled</span><input id="bake-enabled" type="checkbox" ${b.enabled ? 'checked' : ''}></label>
+                            <label class="bake-field"><span>Mode</span><select id="bake-mode"><option value="lightmap"${b.mode === 'lightmap' ? ' selected' : ''}>Lightmap</option><option value="beauty"${b.mode === 'beauty' ? ' selected' : ''}>Beauty</option></select></label>
+                            <label class="bake-field"><span>Match</span><select id="bake-match"><option value="scene"${b.match === 'scene' ? ' selected' : ''}>Scene atlas</option><option value="object"${b.match === 'object' ? ' selected' : ''}>Object name</option><option value="material"${b.match === 'material' ? ' selected' : ''}>Material name</option></select></label>
+                            <label class="bake-field"><span>Folder</span><input id="bake-folder" type="text" value="${escapeBakeHtml(b.folder)}" placeholder="F:\\bakes\\ or ./bakes/"></label>
+                        </div>
                     </section>
                     <section class="fx-section">
                         <div class="fx-section-title"><span>Naming</span></div>
-                        <label class="fx-check"><span>Scene Stem</span><input id="bake-scene" type="text" value="${escapeBakeHtml(b.sceneName)}"></label>
-                        <label class="fx-check"><span>Light Suffix</span><input id="bake-light-suffix" type="text" value="${escapeBakeHtml(b.lightSuffix)}"></label>
-                        <label class="fx-check"><span>Beauty Suffix</span><input id="bake-beauty-suffix" type="text" value="${escapeBakeHtml(b.beautySuffix)}"></label>
-                        <label class="fx-check"><span>Ext</span><input id="bake-ext" type="text" value="${escapeBakeHtml(b.extension)}"></label>
-                        <label class="fx-check"><span>Intensity</span><input id="bake-intensity" class="fx-range" type="range" min="0" max="4" step="0.05" value="${b.intensity}"><span style="width:32px;text-align:right;color:#888;font-size:9px;">${b.intensity.toFixed(2)}</span></label>
+                        <div class="bake-grid">
+                            <label class="bake-field"><span>Scene Stem</span><input id="bake-scene" type="text" value="${escapeBakeHtml(b.sceneName)}"></label>
+                            <label class="bake-field"><span>Light Suffix</span><input id="bake-light-suffix" type="text" value="${escapeBakeHtml(b.lightSuffix)}"></label>
+                            <label class="bake-field"><span>Beauty Suffix</span><input id="bake-beauty-suffix" type="text" value="${escapeBakeHtml(b.beautySuffix)}"></label>
+                            <label class="bake-field"><span>Ext</span><input id="bake-ext" type="text" value="${escapeBakeHtml(b.extension)}"></label>
+                            <label class="bake-field"><span>Intensity</span><span class="bake-range"><input id="bake-intensity" class="fx-range" type="range" min="0" max="4" step="0.05" value="${b.intensity}"><span class="bake-value">${b.intensity.toFixed(2)}</span></span></label>
+                        </div>
                     </section>
                     <section class="fx-section">
-                        <div class="fx-section-title"><span>Status</span><span>${stats.uv2}/${stats.meshes} UV2</span></div>
-                        <div style="font-size:10px;color:#888;line-height:1.45;">Lightmap mode keeps converted V-Ray materials and sets <code>material.lightMap</code>. Beauty mode swaps display to an unlit bake material.</div>
-                        <div style="font-size:9px;color:#666;margin-top:6px;word-break:break-all;">Light: ${escapeBakeHtml(sampleLight)}</div>
-                        <div style="font-size:9px;color:#666;margin-top:3px;word-break:break-all;">Beauty: ${escapeBakeHtml(sampleBeauty)}</div>
-                        <button id="bake-reapply" type="button" style="margin-top:8px;width:100%;">Reapply Bake Materials</button>
-                        <button id="bake-sync" type="button" style="margin-top:4px;width:100%;">Sync UV2 From Max</button>
+                        <div class="fx-section-title"><span>Status</span></div>
+                        <div class="bake-status-row">
+                            <div class="bake-stat"><span>Meshes</span><strong>${stats.meshes}</strong></div>
+                            <div class="bake-stat"><span>UV2 Ready</span><strong>${stats.uv2}</strong></div>
+                        </div>
+                        <div id="bake-light-preview" class="bake-path-preview">Light: ${escapeBakeHtml(sampleLight)}</div>
+                        <div id="bake-beauty-preview" class="bake-path-preview">Beauty: ${escapeBakeHtml(sampleBeauty)}</div>
+                        <div class="bake-actions">
+                            <button id="bake-reapply" type="button">Reapply</button>
+                            <button id="bake-sync" type="button">Sync UV2</button>
+                        </div>
                     </section>
                 </div>`;
             bakePanel.querySelector('#bake-hide')?.addEventListener('click', () => setBakePanelVisible(false));
             bakePanel.querySelector('#bake-reapply')?.addEventListener('click', () => {
-                reapplyBakeOverridesToScene();
+                applyBakeState(readBakeStateFromPanel(), { persist: true, rebuild: true, refreshPanel: false });
                 perfHud.setStatus('MaxJS - bake overrides reapplied');
             });
             bakePanel.querySelector('#bake-sync')?.addEventListener('click', () => {
@@ -7494,7 +7729,9 @@
                 perfHud.setStatus('MaxJS - requested full scene sync for UV2/lightmaps');
             });
             for (const el of bakePanel.querySelectorAll('input,select')) {
-                el.addEventListener('input', updateBakeStateFromPanel);
+                if (isBakeTextInput(el) || el.id === 'bake-intensity') {
+                    el.addEventListener('input', updateBakeStateFromPanel);
+                }
                 el.addEventListener('change', updateBakeStateFromPanel);
             }
         }

@@ -5828,11 +5828,12 @@
         }
 
         function handleBinaryDelta(buffer, meta) {
+            let runtimeTransformsChanged = false;
             const result = applyDeltaFrame(buffer, {
                 onTransform(nodeHandle, matrix) {
                     const mesh = nodeMap.get(nodeHandle);
                     if (mesh) applyIncrementalNodeUpdate(mesh, { t: matrix });
-                    if (mesh) layerManager.markRuntimeTransformsDirty?.();
+                    if (mesh) runtimeTransformsChanged = true;
                     applyHairTransform(nodeHandle, matrix);
                 },
                 onMaterialScalar(nodeHandle, material) {
@@ -5889,6 +5890,7 @@
                     maxTimeline.onTime(td);
                 },
             });
+            if (runtimeTransformsChanged) layerManager.markRuntimeTransformsDirty?.();
             markInitialSync();
             setTransportMode('binary-delta');
             updateSyncHud({

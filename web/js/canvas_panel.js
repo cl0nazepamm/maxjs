@@ -44,11 +44,274 @@ function resolveProjectUrl(projectBaseUrl, relativePath) {
 }
 
 // Internal registry of mounted overlays (so React state and DOM stay in
-// sync). Each entry: { id, path, name, mode, visible, element }.
+// sync). Each entry: { id, path, name, mode, visible, element, _scope }.
 const overlays = new Map();
 let _overlayCounter = 0;
+const CANVAS_OVERLAY_MAX_FPS = 30;
+let _scopeBridgeInstalled = false;
+
+function ensureCanvasScopeBridge() {
+    if (_scopeBridgeInstalled) return;
+    Object.defineProperty(window, '__maxjsCanvasScope', {
+        configurable: true,
+        value(id) {
+            return overlays.get(id)?._scope?.api || null;
+        },
+    });
+    _scopeBridgeInstalled = true;
+}
+
+function createOverlayRuntimeScope(entry) {
+    const cleanupFns = new Set();
+    const scopedRafs = new Map();
+    const scopedTimers = new Set();
+    const scopedIntervals = new Set();
+    const realWindow = window;
+    const realDocument = document;
+    let disposed = false;
+    let lastRafAt = 0;
+    let nextRafId = 1;
+
+    function addCleanup(fn) {
+        if (typeof fn !== 'function') return () => {};
+        cleanupFns.add(fn);
+        return () => {
+            if (!cleanupFns.delete(fn)) return;
+            try { fn(); } catch (_) {}
+        };
+    }
+
+    function targetFrameMs() {
+        let timelineFps = 0;
+        try {
+            const timeline = realWindow.maxJS?.time;
+            timelineFps = typeof timeline?.fps === 'function' ? Number(timeline.fps()) : 0;
+        } catch (_) {}
+        const fps = Number.isFinite(timelineFps) && timelineFps > 0
+            ? Math.min(CANVAS_OVERLAY_MAX_FPS, timelineFps)
+            : CANVAS_OVERLAY_MAX_FPS;
+        return 1000 / Math.max(1, fps);
+    }
+
+    function scopedSetTimeout(fn, delay = 0, ...args) {
+        const id = realWindow.setTimeout(() => {
+            scopedTimers.delete(id);
+            if (!disposed) fn(...args);
+        }, delay);
+        scopedTimers.add(id);
+        return id;
+    }
+
+    function scopedClearTimeout(id) {
+        scopedTimers.delete(id);
+        realWindow.clearTimeout(id);
+    }
+
+    function scopedSetInterval(fn, delay = 0, ...args) {
+        const id = realWindow.setInterval(() => {
+            if (!disposed) fn(...args);
+        }, delay);
+        scopedIntervals.add(id);
+        return id;
+    }
+
+    function scopedClearInterval(id) {
+        scopedIntervals.delete(id);
+        realWindow.clearInterval(id);
+    }
+
+    function scopedRequestAnimationFrame(fn) {
+        if (disposed) return 0;
+        const id = nextRafId++;
+        const rec = { timeout: 0, raf: 0 };
+        scopedRafs.set(id, rec);
+
+        const now = performance.now();
+        const delay = Math.max(0, targetFrameMs() - (now - lastRafAt));
+        rec.timeout = realWindow.setTimeout(() => {
+            rec.timeout = 0;
+            rec.raf = realWindow.requestAnimationFrame((ts) => {
+                scopedRafs.delete(id);
+                rec.raf = 0;
+                if (disposed) return;
+                lastRafAt = ts;
+                fn(ts);
+            });
+        }, delay);
+        return id;
+    }
+
+    function scopedCancelAnimationFrame(id) {
+        const rec = scopedRafs.get(id);
+        if (!rec) return;
+        scopedRafs.delete(id);
+        if (rec.timeout) realWindow.clearTimeout(rec.timeout);
+        if (rec.raf) realWindow.cancelAnimationFrame(rec.raf);
+    }
+
+    function makeScopedTime(realTime) {
+        if (!realTime) return realTime;
+        return new Proxy(realTime, {
+            get(target, key) {
+                if (key === 'on') {
+                    return (event, fn) => {
+                        const off = typeof target.on === 'function' ? target.on(event, fn) : null;
+                        return addCleanup(off);
+                    };
+                }
+                const value = target[key];
+                return typeof value === 'function' ? value.bind(target) : value;
+            },
+        });
+    }
+
+    function makeScopedMaxJS(realMaxJS) {
+        if (!realMaxJS) return realMaxJS;
+        return new Proxy(realMaxJS, {
+            get(target, key) {
+                if (key === 'time') return makeScopedTime(target.time);
+                const value = target[key];
+                return typeof value === 'function' ? value.bind(target) : value;
+            },
+        });
+    }
+
+    const scopedDocument = new Proxy(realDocument, {
+        get(target, key) {
+            if (key === 'body') return entry.element.querySelector('.maxjs-canvas-body') || target.body;
+            if (key === 'head') return target.head;
+            if (key === 'documentElement') return entry.element;
+            if (key === 'getElementById') {
+                return (id) => {
+                    for (const el of entry.element.querySelectorAll('[id]')) {
+                        if (el.id === id) return el;
+                    }
+                    return target.getElementById(id);
+                };
+            }
+            if (key === 'querySelector') {
+                return (selector) => entry.element.querySelector(selector) || target.querySelector(selector);
+            }
+            if (key === 'querySelectorAll') {
+                return (selector) => {
+                    const local = entry.element.querySelectorAll(selector);
+                    return local.length ? local : target.querySelectorAll(selector);
+                };
+            }
+            if (key === 'addEventListener') {
+                return (type, fn, options) => {
+                    target.addEventListener(type, fn, options);
+                    addCleanup(() => target.removeEventListener(type, fn, options));
+                };
+            }
+            if (key === 'removeEventListener') {
+                return (type, fn, options) => target.removeEventListener(type, fn, options);
+            }
+            const value = target[key];
+            return typeof value === 'function' ? value.bind(target) : value;
+        },
+    });
+
+    let scopedWindow = null;
+    scopedWindow = new Proxy(realWindow, {
+        get(target, key) {
+            if (key === 'window' || key === 'self' || key === 'globalThis') return scopedWindow;
+            if (key === 'document') return scopedDocument;
+            if (key === 'maxJS') return makeScopedMaxJS(target.maxJS);
+            if (key === 'requestAnimationFrame') return scopedRequestAnimationFrame;
+            if (key === 'cancelAnimationFrame') return scopedCancelAnimationFrame;
+            if (key === 'setTimeout') return scopedSetTimeout;
+            if (key === 'clearTimeout') return scopedClearTimeout;
+            if (key === 'setInterval') return scopedSetInterval;
+            if (key === 'clearInterval') return scopedClearInterval;
+            if (key === 'addEventListener') {
+                return (type, fn, options) => {
+                    target.addEventListener(type, fn, options);
+                    addCleanup(() => target.removeEventListener(type, fn, options));
+                };
+            }
+            if (key === 'removeEventListener') {
+                return (type, fn, options) => target.removeEventListener(type, fn, options);
+            }
+            const value = target[key];
+            return typeof value === 'function' ? value.bind(target) : value;
+        },
+        set(target, key, value) {
+            target[key] = value;
+            return true;
+        },
+        has(target, key) {
+            return key in target;
+        },
+    });
+
+    return {
+        api: {
+            window: scopedWindow,
+            document: scopedDocument,
+            requestAnimationFrame: scopedRequestAnimationFrame,
+            cancelAnimationFrame: scopedCancelAnimationFrame,
+            setTimeout: scopedSetTimeout,
+            clearTimeout: scopedClearTimeout,
+            setInterval: scopedSetInterval,
+            clearInterval: scopedClearInterval,
+        },
+        cleanup() {
+            if (disposed) return;
+            disposed = true;
+            for (const rec of scopedRafs.values()) {
+                if (rec.timeout) realWindow.clearTimeout(rec.timeout);
+                if (rec.raf) realWindow.cancelAnimationFrame(rec.raf);
+            }
+            scopedRafs.clear();
+            for (const id of scopedTimers) realWindow.clearTimeout(id);
+            scopedTimers.clear();
+            for (const id of scopedIntervals) realWindow.clearInterval(id);
+            scopedIntervals.clear();
+            for (const fn of Array.from(cleanupFns)) {
+                cleanupFns.delete(fn);
+                try { fn(); } catch (_) {}
+            }
+        },
+    };
+}
+
+function overlayScriptScopePreamble(entryId, declaration = 'const') {
+    const id = JSON.stringify(entryId);
+    return [
+        declaration + ' __maxjsCanvasScope = globalThis.__maxjsCanvasScope && globalThis.__maxjsCanvasScope(' + id + ');',
+        declaration + ' window = (__maxjsCanvasScope && __maxjsCanvasScope.window) || globalThis;',
+        declaration + ' document = (__maxjsCanvasScope && __maxjsCanvasScope.document) || globalThis.document;',
+        declaration + ' requestAnimationFrame = (__maxjsCanvasScope && __maxjsCanvasScope.requestAnimationFrame) || globalThis.requestAnimationFrame.bind(globalThis);',
+        declaration + ' cancelAnimationFrame = (__maxjsCanvasScope && __maxjsCanvasScope.cancelAnimationFrame) || globalThis.cancelAnimationFrame.bind(globalThis);',
+        declaration + ' setTimeout = (__maxjsCanvasScope && __maxjsCanvasScope.setTimeout) || globalThis.setTimeout.bind(globalThis);',
+        declaration + ' clearTimeout = (__maxjsCanvasScope && __maxjsCanvasScope.clearTimeout) || globalThis.clearTimeout.bind(globalThis);',
+        declaration + ' setInterval = (__maxjsCanvasScope && __maxjsCanvasScope.setInterval) || globalThis.setInterval.bind(globalThis);',
+        declaration + ' clearInterval = (__maxjsCanvasScope && __maxjsCanvasScope.clearInterval) || globalThis.clearInterval.bind(globalThis);',
+    ].join('\n');
+}
+
+function patchOverlayScript(oldScript, entry) {
+    const fresh = document.createElement('script');
+    for (const attr of oldScript.attributes) fresh.setAttribute(attr.name, attr.value);
+    const code = oldScript.textContent || '';
+    if (!code || oldScript.hasAttribute('src')) return fresh;
+
+    const type = (fresh.getAttribute('type') || '').toLowerCase();
+    if (type === 'module') {
+        fresh.textContent = overlayScriptScopePreamble(entry.id, 'const') + '\n' + code;
+    } else {
+        fresh.textContent =
+            '(function(){\n' +
+            overlayScriptScopePreamble(entry.id, 'var') + '\n' +
+            code + '\n' +
+            '})();';
+    }
+    return fresh;
+}
 
 function mountOverlay(projectBaseUrl, path, mode = 'front') {
+    ensureCanvasScopeBridge();
     const id = `canvas-overlay-${++_overlayCounter}`;
     const url = resolveProjectUrl(projectBaseUrl, path);
     const zIndex = mode === 'behind' ? '-1' : '9998';
@@ -65,6 +328,22 @@ function mountOverlay(projectBaseUrl, path, mode = 'front') {
         'transform:translate(0px,0px)',
         'transform-origin:0 0',
     ].join(';');
+
+    const entry = {
+        id,
+        path,
+        name: path.split(/[\\/]/).pop() || path,
+        mode,
+        visible: true,
+        element: el,
+        offsetX: 0,
+        offsetY: 0,
+        moving: false,
+        _dragCleanup: null,
+        _scope: null,
+    };
+    entry._scope = createOverlayRuntimeScope(entry);
+    overlays.set(id, entry);
 
     // Fetch the HTML and inject. We preserve <script> execution by re-
     // creating script tags as live nodes (innerHTML alone doesn't run
@@ -106,9 +385,7 @@ function mountOverlay(projectBaseUrl, path, mode = 'front') {
 
             // Re-create scripts as live nodes so they execute.
             for (const oldScript of body.querySelectorAll('script')) {
-                const fresh = document.createElement('script');
-                for (const attr of oldScript.attributes) fresh.setAttribute(attr.name, attr.value);
-                if (oldScript.textContent) fresh.textContent = oldScript.textContent;
+                const fresh = patchOverlayScript(oldScript, entry);
                 oldScript.parentNode.replaceChild(fresh, oldScript);
             }
         })
@@ -123,20 +400,6 @@ function mountOverlay(projectBaseUrl, path, mode = 'front') {
         });
 
     document.body.appendChild(el);
-
-    const entry = {
-        id,
-        path,
-        name: path.split(/[\\/]/).pop() || path,
-        mode,
-        visible: true,
-        element: el,
-        offsetX: 0,
-        offsetY: 0,
-        moving: false,
-        _dragCleanup: null,
-    };
-    overlays.set(id, entry);
     return entry;
 }
 
@@ -148,7 +411,13 @@ function applyOverlayTransform(entry) {
 function unmountOverlay(id) {
     const entry = overlays.get(id);
     if (!entry) return;
+    try {
+        const ev = new CustomEvent('maxjs-canvas-unmount', { detail: { id, path: entry.path } });
+        entry.element.dispatchEvent(ev);
+        window.dispatchEvent(ev);
+    } catch (_) {}
     try { entry._dragCleanup?.(); } catch (_) {}
+    try { entry._scope?.cleanup(); } catch (_) {}
     try { entry.element.remove(); } catch (_) {}
     overlays.delete(id);
 }

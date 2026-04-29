@@ -6859,6 +6859,7 @@ public:
     std::uint32_t nextFrameId_ = 1;
     int tickCount_ = 0;
     size_t geoScanCursor_ = 0;
+    size_t deformLiveScanCursor_ = 0;
     std::unordered_set<ULONG> geomHandles_;
     std::unordered_set<ULONG> lightHandles_;
     std::unordered_set<ULONG> splatHandles_;
@@ -6894,6 +6895,8 @@ public:
     ULONGLONG lastInteractionTick_ = 0;
     bool haveLastTimerTime_ = false;
     TimeValue lastTimerTime_ = 0;
+    bool haveLastDeformLivePollTime_ = false;
+    TimeValue lastDeformLivePollTime_ = 0;
     HANDLE syncTimerQueueTimer_ = nullptr;
     HANDLE activeShadeTimerQueueTimer_ = nullptr;
     bool syncTimerUsesWndTimer_ = false;
@@ -6912,7 +6915,10 @@ public:
     std::uint64_t activeProjectStamp_ = 0;
     int suppressProjectReloadCount_ = 0;
     bool fastCameraDirty_ = false;
+    bool fastTimeDirty_ = false;
     bool fastFlushPosted_ = false;
+    bool fastFlushInProgress_ = false;
+    bool suppressFastFlushPost_ = false;
     bool haveLastSentCamera_ = false;
     ULONGLONG dirtyStamp_ = 0;   // when dirty_ was last set (for debounce)
     ULONGLONG lastMaterialInteractionTick_ = 0;
@@ -10113,10 +10119,21 @@ public:
     void QueueFastFlush() {
         if (!hwnd_ || fastFlushPosted_) return;
         if (dirty_ && !CanFlushFastPathDuringPendingFullSync()) return;
+        if (suppressFastFlushPost_) return;
         fastFlushPosted_ = true;
         if (!PostMessage(hwnd_, WM_FAST_FLUSH, 0, 0)) {
             fastFlushPosted_ = false;
         }
+    }
+
+    void FlushFastPathNow() {
+        if (fastFlushInProgress_) {
+            QueueFastFlush();
+            return;
+        }
+        fastFlushInProgress_ = true;
+        FlushFastPath();
+        fastFlushInProgress_ = false;
     }
 
     static VOID CALLBACK SyncTimerQueueProc(PVOID param, BOOLEAN) {
@@ -10269,17 +10286,25 @@ public:
         return true;
     }
 
-    void CheckSkinnedGeometryLive() {
+    void CheckSkinnedGeometryLive(bool forceForCurrentTime = false) {
         if (skinnedHandles_.empty() && deformHandles_.empty()) return;
         Interface* ip = GetCOREInterface();
         if (!ip) return;
+        TimeValue t = ip->GetTime();
+        if (forceForCurrentTime &&
+            haveLastDeformLivePollTime_ &&
+            lastDeformLivePollTime_ == t) {
+            return;
+        }
         const ULONGLONG now = GetTickCount64();
-        if (lastSkinnedLivePollTick_ != 0 &&
+        if (!forceForCurrentTime &&
+            lastSkinnedLivePollTick_ != 0 &&
             (now - lastSkinnedLivePollTick_) < kSkinnedLivePollIntervalMs) {
             return;
         }
         lastSkinnedLivePollTick_ = now;
-        TimeValue t = ip->GetTime();
+        haveLastDeformLivePollTime_ = true;
+        lastDeformLivePollTime_ = t;
 
         // Any of these means "something is actively changing this frame" and
         // the hash check is wasted work — extraction will happen anyway:
@@ -10314,10 +10339,17 @@ public:
         }
 
         bool changed = false;
-        // Union iteration: skinned handles + deforming non-skinned handles
-        // (Path Deform, Bend, FFD, etc.). Skinned handles are usually a strict
-        // subset of deform handles, but we track both sets explicitly so skin
-        // weight wiring can check skinnedHandles_ specifically.
+        std::vector<ULONG> deformingHandles;
+        deformingHandles.reserve(skinnedHandles_.size() + deformHandles_.size());
+        deformingHandles.insert(deformingHandles.end(), skinnedHandles_.begin(), skinnedHandles_.end());
+        for (ULONG handle : deformHandles_) {
+            // Skip handles already represented via skinnedHandles_ — most
+            // skinned meshes also have a derived-object wrapper, but one eval
+            // per handle per tick is the contract here.
+            if (skinnedHandles_.count(handle)) continue;
+            deformingHandles.push_back(handle);
+        }
+
         auto pollHandle = [&](ULONG handle) {
             if (geoFastDirtyHandles_.count(handle)) return;
             INode* node = ip->GetINodeByHandle(handle);
@@ -10377,13 +10409,19 @@ public:
             changed = true;
         };
 
-        for (ULONG handle : skinnedHandles_) pollHandle(handle);
-        for (ULONG handle : deformHandles_) {
-            // Skip handles already polled via skinnedHandles_ — most skinned
-            // meshes also have a derived-object wrapper, but we only need one
-            // eval per handle per tick.
-            if (skinnedHandles_.count(handle)) continue;
-            pollHandle(handle);
+        // Same rule as transform sync: playback and active manipulation must
+        // be complete per tick or the viewer appears to stutter/lag behind
+        // Max. Idle polling can stay budgeted because it is only a safety net
+        // for background validity churn.
+        if (skipHash) {
+            deformLiveScanCursor_ = 0;
+            for (ULONG handle : deformingHandles) pollHandle(handle);
+        } else {
+            VisitBudgetedHandles(
+                deformingHandles,
+                deformLiveScanCursor_,
+                kMaxDeformingGeometryHandlesPerTick,
+                pollHandle);
         }
         if (changed) QueueFastFlush();
     }
@@ -10532,6 +10570,30 @@ public:
     static constexpr ULONGLONG kMaterialInteractiveCooldownMs = 400;
     static constexpr ULONGLONG kMaterialLivePollIntervalMs = 50;
     static constexpr size_t kMaxFastFlushHandlesPerPass = 128;
+    static constexpr size_t kMaxDeformingGeometryHandlesPerTick = 64;
+
+    template <typename Fn>
+    void VisitBudgetedHandles(const std::vector<ULONG>& handles,
+                              size_t& cursor,
+                              size_t maxPerTick,
+                              Fn&& fn) {
+        if (handles.empty()) {
+            cursor = 0;
+            return;
+        }
+        if (handles.size() <= maxPerTick) {
+            cursor = 0;
+            for (ULONG handle : handles) fn(handle);
+            return;
+        }
+
+        const size_t start = cursor % handles.size();
+        const size_t count = std::min(maxPerTick, handles.size());
+        for (size_t i = 0; i < count; ++i) {
+            fn(handles[(start + i) % handles.size()]);
+        }
+        cursor = (start + count) % handles.size();
+    }
 
     void MarkInteractiveActivity() {
         lastInteractionTick_ = GetTickCount64();
@@ -10619,9 +10681,27 @@ public:
         }
         if (t == lastTimerTime_) return;
 
+        OnTimelineTimeChanged(t);
+    }
+
+    void OnTimelineTimeChanged(TimeValue t) {
+        haveLastTimerTime_ = true;
         lastTimerTime_ = t;
+        fastTimeDirty_ = true;
+
+        // Timeline playback and scrub are the latency-critical path. Avoid
+        // posting WM_FAST_FLUSH and waiting for the message pump when Max has
+        // already told us a new authored time is live. All dirty marks below
+        // accumulate in the normal fast-path sets, then we flush once
+        // immediately on this same callback.
+        const bool wasSuppressingPost = suppressFastFlushPost_;
+        suppressFastFlushPost_ = true;
         MarkAnimatedTransformsDirty();
-        MarkCameraDirty();
+        CheckSkinnedGeometryLive(true);
+        MarkCameraDirtyIfChanged(false);
+        suppressFastFlushPost_ = wasSuppressingPost;
+
+        FlushFastPathNow();
         MarkInteractiveActivity();
     }
 
@@ -10703,9 +10783,12 @@ public:
         geoFullFastDirtyHandles_.clear();
         materialFastDirtyHandles_.clear();
         fastCameraDirty_ = false;
+        fastTimeDirty_ = false;
         fastFlushPosted_ = false;
+        haveLastDeformLivePollTime_ = false;
         lastCameraLivePollTick_ = 0;
         lastRedrawLivePollTick_ = 0;
+        deformLiveScanCursor_ = 0;
         if (refreshCameraState) CaptureCurrentCameraState();
         else haveLastSentCamera_ = false;
     }
@@ -10750,7 +10833,7 @@ public:
 
     void MarkTrackedNodesDirty(const NodeEventNamespace::NodeKeyTab& nodes) {
         for (int i = 0; i < nodes.Count(); ++i) {
-            MarkTrackedNodeDirty(NodeEventNamespace::GetNodeByKey(nodes[i]));
+                MarkTrackedNodeDirty(NodeEventNamespace::GetNodeByKey(nodes[i]));
         }
     }
 
@@ -11056,6 +11139,10 @@ public:
             }
         };
 
+        // Timeline playback/scrubbing must be complete every Max time tick.
+        // Budgeting this loop makes low-poly scenes look like the time slider
+        // is skipping because only part of the scene reaches the web side on a
+        // given tick. Keep quality here; reduce cost in heavier hashing paths.
         for (ULONG handle : geomHandles_) markIfTransformChanged(handle);
         for (ULONG handle : lightHandles_) markIfTransformChanged(handle);
         for (ULONG handle : splatHandles_) markIfTransformChanged(handle);
@@ -11074,10 +11161,11 @@ public:
         QueueFastFlush();
     }
 
-    void MarkCameraDirtyIfChanged() {
+    void MarkCameraDirtyIfChanged(bool respectThrottle = true) {
         if (fastCameraDirty_ && fastFlushPosted_) return;
         const ULONGLONG now = GetTickCount64();
-        if (lastCameraLivePollTick_ != 0 &&
+        if (respectThrottle &&
+            lastCameraLivePollTick_ != 0 &&
             (now - lastCameraLivePollTick_) < kCameraLivePollIntervalMs) {
             return;
         }
@@ -11435,6 +11523,7 @@ public:
             const bool allowIdlePolling = !favorInteractive;
             const bool allowRealtimeAuxPolling = allowIdlePolling || animPlaying;
             const bool allowHeavyGeometryPolling = !favorInteractive && !animPlaying;
+            const bool allowTimelineAuxPolling = !animPlaying;
 
             // Source file polling must keep working even while favoring interactive redraw.
             // These are cheap timestamp checks, unlike the heavier scene/material scans below.
@@ -11442,14 +11531,16 @@ public:
             if (slowPhase == 3) CheckProjectContentChanges();
             if (allowIdlePolling && tickCount_ % MATERIAL_DETECT_TICKS == 2) DetectMaterialChanges();
             if (allowIdlePolling && lightPhase == 0) DetectPropertyChanges();
-            if (allowRealtimeAuxPolling && lightPhase == 1) {
+            if (allowTimelineAuxPolling && allowRealtimeAuxPolling && lightPhase == 1) {
                 DetectLightChanges();
                 DetectSplatChanges();
             }
             // Audio is cheap (few nodes, 7 params each) — poll every tick
             // and ignore the interactive gate so spinner drags propagate live.
-            DetectAudioChanges();
-            DetectGLTFChanges();
+            if (allowTimelineAuxPolling) {
+                DetectAudioChanges();
+                DetectGLTFChanges();
+            }
             if (allowHeavyGeometryPolling && slowPhase == 6) DetectGeometryChanges();
             if (allowIdlePolling && slowPhase == 9) DetectJsModChanges();
             if (allowIdlePolling && slowPhase == 12) DetectPluginInstanceChanges();
@@ -11490,6 +11581,16 @@ public:
             INode* node = ip->GetINodeByHandle(handle);
             if (!node) continue;
 
+            // Fast-deform path: positions and normals are re-sent without
+            // indices/UVs/material groups. Valid for meshes whose topology and
+            // non-position channels are stable between full syncs.
+            const bool isDeforming =
+                skinnedHandles_.find(handle) != skinnedHandles_.end() ||
+                deformHandles_.find(handle) != deformHandles_.end();
+            const bool hasVertexColors = isDeforming && NodeHasExtractableVertexColors(node, t);
+            const bool forceFullGeometry =
+                forceFullHandles && forceFullHandles->find(handle) != forceFullHandles->end();
+
             // Hash-dedupe before extracting. RailClone / Forest Pack / TyFlow
             // (and Max itself) fire spurious ControllerStructured events when
             // the viewport redraws, even if the generated mesh is byte-identical
@@ -11497,7 +11598,14 @@ public:
             // tick is what makes camera movement chop; this short-circuits the
             // no-op case without losing real topology/UV edits (hash covers
             // positions, indices, uvs, and vertex colors where applicable).
-            {
+            //
+            // Do NOT run this for active deform playback/manipulation: the
+            // fast path above already decided the mesh is changing, and this
+            // hash would EvalWorldState once before SendGeometryFastUpdate
+            // evaluates again to extract positions. That duplicate eval was a
+            // direct source of choppy Max playback.
+            if (!(isDeforming && !forceFullGeometry && !hasVertexColors &&
+                  (IsAnimationPlaying() || ShouldFavorInteractivePerformance()))) {
                 uint64_t preHash = 0;
                 auto it = geoHashMap_.find(handle);
                 if (it != geoHashMap_.end() &&
@@ -11518,16 +11626,10 @@ public:
             // frame's change is driven by a modifier's deformation, not by
             // a direct edit that could also change UVs or topology.
             //
-            // Gated on "is deforming" (Skin or any modifier-stack mesh),
-            // not just cache presence — static meshes with manual vertex
-            // edits need the full ExtractMesh path so UV/topology changes
-            // are not silently dropped.
-            const bool isDeforming =
-                skinnedHandles_.find(handle) != skinnedHandles_.end() ||
-                deformHandles_.find(handle) != deformHandles_.end();
-            const bool hasVertexColors = NodeHasExtractableVertexColors(node, t);
-            const bool forceFullGeometry =
-                forceFullHandles && forceFullHandles->find(handle) != forceFullHandles->end();
+            // Gated on "is deforming" (Skin or any modifier-stack mesh), not
+            // just cache presence — static meshes with manual vertex edits
+            // need the full ExtractMesh path so UV/topology changes are not
+            // silently dropped.
             bool usedSkinnedFastPositions = false;
             if (wv17 && env12 && isDeforming && !hasVertexColors && !forceFullGeometry) {
                 auto sourceIt = skinnedFastSourceCache_.find(handle);
@@ -11751,6 +11853,7 @@ public:
         }
 
         const bool hasDirtyCamera = fastCameraDirty_;
+        const bool hasDirtyTime = fastTimeDirty_;
 
         // Collect geometry-dirty handles before clearing
         std::unordered_set<ULONG> geoDirty;
@@ -11764,6 +11867,7 @@ public:
 
         for (ULONG handle : dirtyHandles) visibilityDirty.erase(handle);
         fastCameraDirty_ = false;
+        fastTimeDirty_ = false;
 
         std::vector<ULONG> combinedNodeHandles = dirtyHandles;
         combinedNodeHandles.reserve(dirtyHandles.size() + visibilityDirty.size());
@@ -11776,7 +11880,7 @@ public:
         }
 
         const bool hasAnyNodeUpdates = !combinedNodeHandles.empty();
-        if (!hasAnyNodeUpdates && !hasDirtyCamera) return;
+        if (!hasAnyNodeUpdates && !hasDirtyCamera && !hasDirtyTime) return;
 
         // Also check visibility dirty handles for lights/splats/audios
         for (ULONG handle : visibilityDirty) {
@@ -11823,7 +11927,7 @@ public:
         TimeValue t = ip->GetTime();
         const std::uint32_t frameId = AllocateFrameId();
         maxjs::sync::DeltaFrameBuilder frame(frameId);
-        frame.ReserveBytes(32 + dirtyHandles.size() * 160 + visibilityDirty.size() * 12 + (hasDirtyCamera ? 64 : 0));
+        frame.ReserveBytes(32 + dirtyHandles.size() * 160 + visibilityDirty.size() * 12 + (hasDirtyCamera ? 64 : 0) + 16);
         frame.BeginFrame();
 
         for (ULONG handle : dirtyHandles) {
@@ -15688,7 +15792,7 @@ public:
             if (p) p->RefreshCallbackRegistration(wParam != 0);
             break;
         case WM_FAST_FLUSH:
-            if (p) p->FlushFastPath();
+            if (p) p->FlushFastPathNow();
             return 0;
         case WM_SYNC_TICK:
             if (p) {
@@ -15795,11 +15899,9 @@ void MaxJSFastRedrawCallback::proc(Interface*) {
     }
 }
 
-void MaxJSFastTimeChangeCallback::TimeChanged(TimeValue) {
+void MaxJSFastTimeChangeCallback::TimeChanged(TimeValue t) {
     if (!owner_) return;
-    owner_->MarkAnimatedTransformsDirty();
-    owner_->MarkCameraDirty();
-    owner_->MarkInteractiveActivity();
+    owner_->OnTimelineTimeChanged(t);
 }
 
 static void OnSceneChanged(void* param, NotifyInfo*) {

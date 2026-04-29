@@ -88,6 +88,7 @@ export function createHTMLTexture(THREE, url, options = {}) {
     const width  = Math.max(64, Math.min(4096, options.width  || 1024));
     const height = Math.max(64, Math.min(4096, options.height || 1024));
     const initialParams = options.params;
+    const maxRedrawFps = Math.max(1, Math.min(60, Number(options.maxFps || options.fps || 30)));
     // 'shadow' (default) uses DOMParser + shadow root + script proxy.
     // Works for hand-authored HTML/CSS + vanilla JS with broad CSS feature
     // support (gradients, backdrop-filter, background-clip text, borders).
@@ -193,6 +194,20 @@ export function createHTMLTexture(THREE, url, options = {}) {
     let observer = null;
     let disposed = false;
     let loaded = false;
+    let dirty = true;
+    let lastRedrawAt = 0;
+
+    function redrawIntervalMs() {
+        let timelineFps = 0;
+        try {
+            const timeline = window.maxJS?.time;
+            timelineFps = typeof timeline?.fps === 'function' ? Number(timeline.fps()) : 0;
+        } catch (_) {}
+        const targetFps = Number.isFinite(timelineFps) && timelineFps > 0
+            ? Math.min(maxRedrawFps, timelineFps)
+            : maxRedrawFps;
+        return 1000 / Math.max(1, targetFps);
+    }
 
     function redraw() {
         if (disposed || !loaded) return;
@@ -219,9 +234,12 @@ export function createHTMLTexture(THREE, url, options = {}) {
     }
 
     function scheduleRedraw() {
+        dirty = true;
         if (disposed || rafHandle) return;
         rafHandle = requestAnimationFrame(() => {
             rafHandle = 0;
+            lastRedrawAt = performance.now();
+            dirty = false;
             redraw();
         });
     }
@@ -250,25 +268,33 @@ export function createHTMLTexture(THREE, url, options = {}) {
         } catch (_) { /* ignore */ }
     }
 
-    // Continuous redraw loop. Canvas pixel updates inside the shadow root
-    // don't trigger MutationObserver and may not trigger canvas.onpaint on
-    // the outer canvas, so we just drive the redraw at the host's animation
-    // frame rate. drawElementImage on a 1024² host is sub-millisecond on
-    // typical hardware and keeps any embedded animation (CSS or canvas)
-    // perfectly in sync with the 3D texture.
+    // Adaptive redraw loop. Animated HTML still needs a clock because
+    // canvas/CSS changes inside the authored page do not reliably trigger
+    // MutationObserver or canvas.onpaint on the outer canvas. The old path
+    // redrew and uploaded every HTML texture on every browser RAF, which
+    // made live Max playback pay for 60Hz DOM rasterization even when the
+    // Max timeline was 24/30fps. Keep animation live, but cap uploads to
+    // the authored timeline rate (or 30fps by default) and redraw
+    // immediately when params / DOM mutations mark the texture dirty.
     let loopHandle = 0;
-    function loop() {
+    function loop(now) {
         if (disposed) return;
-        redraw();
+        const elapsed = now - lastRedrawAt;
+        if (dirty || elapsed >= redrawIntervalMs()) {
+            dirty = false;
+            lastRedrawAt = now;
+            redraw();
+        }
         loopHandle = requestAnimationFrame(loop);
     }
 
     function onReady() {
         loaded = true;
-        if ('onpaint' in canvas) canvas.onpaint = redraw;
+        if ('onpaint' in canvas) canvas.onpaint = scheduleRedraw;
         attachObserver();
         postParams(initialParams);
-        loop();
+        dirty = true;
+        loopHandle = requestAnimationFrame(loop);
     }
 
     if (mode === 'iframe') {

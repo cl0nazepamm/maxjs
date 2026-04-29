@@ -77,16 +77,21 @@ function onTime({ ticks, tpf, stateFlags }) {
     // authoritative value is off by more than 1.5 frames, trust it
     // immediately rather than waiting for extrapolation to catch up.
     if (wasPlaying && nextPlaying) {
-        const projected = state._lastPushSeconds + (performance.now() - state._lastPushMono) / 1000;
+        const nowMono = performance.now();
+        const projected = state._lastPushSeconds + (nowMono - state._lastPushMono) / 1000;
         const driftFrames = Math.abs(projected - seconds) * fps;
         if (driftFrames < 1.5) {
-            // Within tolerance — keep the smoother extrapolation anchor only
-            // slightly updated so we don't visibly snap each push.
-            state._lastPushSeconds = seconds;
-            state._lastPushMono = performance.now();
+            // Within tolerance — converge toward the native clock instead of
+            // snapping the extrapolated value on every packet. Native Max
+            // messages are not perfectly cadence-stable under UI load, and
+            // hard-resetting here shows up as micro-jumps in timeline-driven
+            // layers even when the authoritative time is only a fraction of a
+            // frame away.
+            state._lastPushSeconds = projected + (seconds - projected) * 0.2;
+            state._lastPushMono = nowMono;
         } else {
             state._lastPushSeconds = seconds;
-            state._lastPushMono = performance.now();
+            state._lastPushMono = nowMono;
         }
     } else {
         state._lastPushSeconds = seconds;

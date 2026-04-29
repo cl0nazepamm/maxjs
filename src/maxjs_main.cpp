@@ -6919,6 +6919,9 @@ public:
     bool fastFlushPosted_ = false;
     bool fastFlushInProgress_ = false;
     bool suppressFastFlushPost_ = false;
+    bool pendingTimelineTransformScan_ = false;
+    bool pendingTimelineDeformScan_ = false;
+    bool pendingTimelineCameraCheck_ = false;
     bool haveLastSentCamera_ = false;
     ULONGLONG dirtyStamp_ = 0;   // when dirty_ was last set (for debounce)
     ULONGLONG lastMaterialInteractionTick_ = 0;
@@ -10689,11 +10692,20 @@ public:
         lastTimerTime_ = t;
         fastTimeDirty_ = true;
 
+        if (IsAnimationPlaying()) {
+            pendingTimelineTransformScan_ = true;
+            pendingTimelineDeformScan_ = true;
+            pendingTimelineCameraCheck_ = true;
+            QueueFastFlush();
+            MarkInteractiveActivity();
+            return;
+        }
+
         // Timeline playback and scrub are the latency-critical path. Avoid
         // posting WM_FAST_FLUSH and waiting for the message pump when Max has
-        // already told us a new authored time is live. All dirty marks below
-        // accumulate in the normal fast-path sets, then we flush once
-        // immediately on this same callback.
+        // already told us a scrubbed authored time is live. Continuous
+        // playback uses the queued path above so TimeChanged never blocks the
+        // Max playback step.
         const bool wasSuppressingPost = suppressFastFlushPost_;
         suppressFastFlushPost_ = true;
         MarkAnimatedTransformsDirty();
@@ -10777,6 +10789,28 @@ public:
         if (ShouldRunInteractiveMaterialChecks()) CheckTrackedMaterialScalarsLive();
     }
 
+    void ConsumePendingTimelineFastSyncWork() {
+        if (!pendingTimelineTransformScan_ &&
+            !pendingTimelineDeformScan_ &&
+            !pendingTimelineCameraCheck_) {
+            return;
+        }
+
+        const bool scanTransforms = pendingTimelineTransformScan_;
+        const bool scanDeform = pendingTimelineDeformScan_;
+        const bool checkCamera = pendingTimelineCameraCheck_;
+        pendingTimelineTransformScan_ = false;
+        pendingTimelineDeformScan_ = false;
+        pendingTimelineCameraCheck_ = false;
+
+        const bool wasSuppressingPost = suppressFastFlushPost_;
+        suppressFastFlushPost_ = true;
+        if (scanTransforms) MarkAnimatedTransformsDirty();
+        if (scanDeform) CheckSkinnedGeometryLive(true);
+        if (checkCamera) MarkCameraDirtyIfChanged(false);
+        suppressFastFlushPost_ = wasSuppressingPost;
+    }
+
     void ResetFastPathState(bool refreshCameraState = false) {
         fastDirtyHandles_.clear();
         visibilityDirtyHandles_.clear();
@@ -10785,6 +10819,9 @@ public:
         fastCameraDirty_ = false;
         fastTimeDirty_ = false;
         fastFlushPosted_ = false;
+        pendingTimelineTransformScan_ = false;
+        pendingTimelineDeformScan_ = false;
+        pendingTimelineCameraCheck_ = false;
         haveLastDeformLivePollTime_ = false;
         lastCameraLivePollTick_ = 0;
         lastRedrawLivePollTick_ = 0;
@@ -11812,6 +11849,8 @@ public:
         if (!jsReady_ || !webview_) return;
         if (dirty_ && !CanFlushFastPathDuringPendingFullSync()) return;
         if (!hwnd_ || !IsWindowVisible(hwnd_)) return;
+
+        ConsumePendingTimelineFastSyncWork();
 
         // Check for lights/splats/audios BEFORE batching to ensure consistent protocol
         // selection even when handles are deferred across frames.

@@ -82,6 +82,7 @@ function cloneJsonValue(value) {
     return value == null ? value : JSON.parse(JSON.stringify(value));
 }
 
+const POSTFX_SETTINGS_KEY = '__maxjsSettings';
 const LAYER_SOURCE_INLINE = 'inline';
 const LAYER_SOURCE_PROJECT = 'project';
 
@@ -136,14 +137,24 @@ export function createProjectRuntime({ layerManager, bridge, perfHud, debugLog =
     let transientStudioState = null;
     let transientBakeState = null;
     let postFxState = null;
+    let settingsState = null;
     let lastManifestText = '';
     let lastPostFxText = '';
+    let lastSettingsText = '';
     let lastStatus = '';
     let timer = 0;
     let revision = 0;
     let pollInFlight = false;
     /** Serializes manifest application so persist + poll reload cannot interleave mounts/removes. */
     let manifestApplyGate = Promise.resolve();
+    /** Serializes manifest read-modify-write saves so settings cannot overwrite each other. */
+    let manifestMutationGate = Promise.resolve();
+    let settingsWriteGate = Promise.resolve();
+    const pendingManifestSettingWrites = new Map();
+    const manifestSettingsSaveWaiters = [];
+    let manifestSettingsSaveInFlight = false;
+    let manifestSettingsSaveTimer = 0;
+    const MANIFEST_SETTINGS_SAVE_DEBOUNCE_MS = 180;
     let manifestState = null;
     let nextRequestId = 1;
     let suppressProjectReloadCount = 0;
@@ -162,6 +173,19 @@ export function createProjectRuntime({ layerManager, bridge, perfHud, debugLog =
                 console.error('[ProjectRuntime] listener error', error);
             }
         }
+    }
+
+    function extractSettingsFromPostFx(payload) {
+        const value = payload?.[POSTFX_SETTINGS_KEY];
+        return value && typeof value === 'object' ? cloneJsonValue(value) : null;
+    }
+
+    function mergeSettingsIntoPostFx(payload, settings) {
+        const nextPayload = cloneJsonValue(payload) ?? {};
+        const nextSettings = settings && typeof settings === 'object' ? cloneJsonValue(settings) : null;
+        if (nextSettings) nextPayload[POSTFX_SETTINGS_KEY] = nextSettings;
+        else delete nextPayload[POSTFX_SETTINGS_KEY];
+        return nextPayload;
     }
 
     function subscribe(listener) {
@@ -352,6 +376,45 @@ export function createProjectRuntime({ layerManager, bridge, perfHud, debugLog =
         }
     }
 
+    async function loadSettingsState(force = false) {
+        if (!projectRootUrl) {
+            settingsState = null;
+            lastSettingsText = '';
+            return false;
+        }
+
+        const settingsUrl = projectUrl(projectRootUrl, 'settings.maxjs.json', `${Date.now()}`);
+        try {
+            const text = await fetchText(settingsUrl);
+            if (!force && text === lastSettingsText) return false;
+
+            lastSettingsText = text;
+            settingsState = cloneJsonValue(JSON.parse(text));
+            emitChange();
+            return true;
+        } catch (error) {
+            if (!manifest404(error)) throw error;
+
+            lastSettingsText = '';
+            const embedded = extractSettingsFromPostFx(postFxState);
+            if (embedded) {
+                const changed = stableStringify(settingsState) !== stableStringify(embedded);
+                settingsState = embedded;
+                if (changed) emitChange();
+                return changed;
+            }
+            const fallback = {
+                studio: cloneJsonValue(manifestState?.studio ?? null),
+                bake: cloneJsonValue(manifestState?.bake ?? null),
+            };
+            const next = (fallback.studio || fallback.bake) ? fallback : null;
+            const changed = stableStringify(settingsState) !== stableStringify(next);
+            settingsState = next;
+            if (changed) emitChange();
+            return changed;
+        }
+    }
+
     async function mountLayer(entry, manifest) {
         const layerId = entry.id;
         const entryPath = entry.entryPath;
@@ -414,11 +477,14 @@ export function createProjectRuntime({ layerManager, bridge, perfHud, debugLog =
         try {
             const manifest = await loadManifest(force);
             if (!manifest) {
-                return await loadPostFxState(force);
+                const pfxChanged = await loadPostFxState(force);
+                const settingsChanged = await loadSettingsState(force);
+                return pfxChanged || settingsChanged;
             }
 
             await applyManifest(manifest, { forceReload: force });
             await loadPostFxState(force);
+            await loadSettingsState(force);
 
             if (Number.isFinite(manifest.pollMs) && manifest.pollMs >= 0) {
                 pollMs = manifest.pollMs;
@@ -431,8 +497,10 @@ export function createProjectRuntime({ layerManager, bridge, perfHud, debugLog =
             clearProjectLayers();
             manifestState = null;
             postFxState = null;
+            settingsState = null;
             lastManifestText = '';
             lastPostFxText = '';
+            lastSettingsText = '';
             emitChange();
 
             const is404 = manifest404(error);
@@ -487,11 +555,131 @@ export function createProjectRuntime({ layerManager, bridge, perfHud, debugLog =
         return true;
     }
 
+    function normalizeManifestSettingValue(value) {
+        return value && typeof value === 'object' ? value : {};
+    }
+
+    function setTransientManifestSetting(section, value) {
+        if (section === 'studio') transientStudioState = cloneJsonValue(value);
+        else if (section === 'bake') transientBakeState = cloneJsonValue(value);
+    }
+
+    function clearTransientManifestSetting(section) {
+        if (section === 'studio') transientStudioState = null;
+        else if (section === 'bake') transientBakeState = null;
+    }
+
+    function resolveManifestSettingsWaiters(error, value) {
+        const waiters = manifestSettingsSaveWaiters.splice(0);
+        for (const waiter of waiters) {
+            if (error) waiter.reject(error);
+            else waiter.resolve(value);
+        }
+    }
+
+    function scheduleManifestSettingsFlush() {
+        const promise = new Promise((resolve, reject) => {
+            manifestSettingsSaveWaiters.push({ resolve, reject });
+        });
+        clearTimeout(manifestSettingsSaveTimer);
+        manifestSettingsSaveTimer = setTimeout(() => {
+            manifestSettingsSaveTimer = 0;
+            void flushManifestSettingsNow().catch(error => {
+                debugWarn('[ProjectRuntime] settings save failed', error);
+            });
+        }, MANIFEST_SETTINGS_SAVE_DEBOUNCE_MS);
+        return promise;
+    }
+
+    async function flushManifestSettingsNow() {
+        if (manifestSettingsSaveInFlight) return;
+        manifestSettingsSaveInFlight = true;
+        clearTimeout(manifestSettingsSaveTimer);
+        manifestSettingsSaveTimer = 0;
+
+        try {
+            while (pendingManifestSettingWrites.size > 0) {
+                const writes = new Map(pendingManifestSettingWrites);
+                pendingManifestSettingWrites.clear();
+
+                const settings = cloneJsonValue(settingsState) ?? {};
+                for (const [section, value] of writes) {
+                    settings[section] = normalizeManifestSettingValue(value);
+                }
+                await persistSettings(settings);
+
+                for (const section of writes.keys()) {
+                    if (!pendingManifestSettingWrites.has(section)) {
+                        clearTransientManifestSetting(section);
+                    }
+                }
+            }
+            resolveManifestSettingsWaiters(null, true);
+        } catch (error) {
+            resolveManifestSettingsWaiters(error);
+            throw error;
+        } finally {
+            manifestSettingsSaveInFlight = false;
+            if (pendingManifestSettingWrites.size > 0) {
+                void scheduleManifestSettingsFlush().catch(error => {
+                    debugWarn('[ProjectRuntime] queued settings save failed', error);
+                });
+            }
+        }
+    }
+
+    async function writeSettingsToHost(nextSettings) {
+        const settingsToWrite = cloneJsonValue(nextSettings) ?? {};
+        const postFxToWrite = mergeSettingsIntoPostFx(postFxState ?? transientPostFxState ?? manifestState?.postFx ?? {}, settingsToWrite);
+        const text = `${JSON.stringify(postFxToWrite, null, 2)}\n`;
+        await requestHostAction('project_postfx_write', {
+            contentBase64: toBase64Utf8(text),
+        });
+        lastPostFxText = text;
+        settingsState = settingsToWrite;
+        postFxState = postFxToWrite;
+        emitChange();
+        return true;
+    }
+
+    async function persistSettings(nextSettings) {
+        const settingsToWrite = cloneJsonValue(nextSettings) ?? {};
+        const writeTask = settingsWriteGate.then(
+            () => writeSettingsToHost(settingsToWrite),
+            () => writeSettingsToHost(settingsToWrite));
+        settingsWriteGate = writeTask.catch(() => {});
+        return writeTask;
+    }
+
+    async function setManifestSettingState(section, nextState) {
+        const cloned = cloneJsonValue(nextState);
+        if (!sceneSaved) {
+            setTransientManifestSetting(section, cloned);
+            emitChange();
+            return false;
+        }
+
+        const normalized = normalizeManifestSettingValue(cloned);
+        pendingManifestSettingWrites.set(section, normalized);
+        const nextSettings = cloneJsonValue(settingsState) ?? {};
+        nextSettings[section] = normalized;
+        settingsState = nextSettings;
+        clearTransientManifestSetting(section);
+        emitChange();
+        await scheduleManifestSettingsFlush();
+        return true;
+    }
+
     async function updateManifest(mutator, options = {}) {
-        const manifest = cloneManifest(await ensureManifestLoaded());
-        mutator(manifest);
-        if (!Array.isArray(manifest.layers)) manifest.layers = [];
-        await persistManifest(manifest, options);
+        const run = async () => {
+            const manifest = cloneManifest(await ensureManifestLoaded());
+            mutator(manifest);
+            if (!Array.isArray(manifest.layers)) manifest.layers = [];
+            await persistManifest(manifest, options);
+        };
+        const task = manifestMutationGate.then(run, run);
+        manifestMutationGate = task.catch(() => {});
+        return task;
     }
 
     async function setLayerEnabled(id, enabled) {
@@ -587,45 +775,23 @@ export function createProjectRuntime({ layerManager, bridge, perfHud, debugLog =
     }
 
     function getStudioState() {
-        return cloneJsonValue(transientStudioState ?? manifestState?.studio ?? null);
+        return cloneJsonValue(transientStudioState ?? settingsState?.studio ?? manifestState?.studio ?? null);
     }
 
     function getBakeState() {
-        return cloneJsonValue(transientBakeState ?? manifestState?.bake ?? null);
+        return cloneJsonValue(transientBakeState ?? settingsState?.bake ?? manifestState?.bake ?? null);
     }
 
     async function setBakeState(nextState) {
-        const cloned = cloneJsonValue(nextState);
-        if (!sceneSaved || !manifestExists) {
-            transientBakeState = cloned;
-            emitChange();
-            return false;
-        }
-
-        transientBakeState = null;
-        await updateManifest(manifest => {
-            manifest.bake = cloned && typeof cloned === 'object' ? cloned : {};
-        }, { apply: false, silent: true });
-        return true;
+        return setManifestSettingState('bake', nextState);
     }
 
     async function setStudioState(nextState) {
-        const cloned = cloneJsonValue(nextState);
-        if (!sceneSaved || !manifestExists) {
-            transientStudioState = cloned;
-            emitChange();
-            return false;
-        }
-
-        transientStudioState = null;
-        await updateManifest(manifest => {
-            manifest.studio = cloned && typeof cloned === 'object' ? cloned : {};
-        }, { apply: false, silent: true });
-        return true;
+        return setManifestSettingState('studio', nextState);
     }
 
     async function setPostFxState(nextState) {
-        const cloned = cloneJsonValue(nextState);
+        const cloned = mergeSettingsIntoPostFx(nextState, settingsState);
         if (!sceneSaved || !manifestExists) {
             transientPostFxState = cloned;
             emitChange();
@@ -778,6 +944,8 @@ export function createProjectRuntime({ layerManager, bridge, perfHud, debugLog =
         manifestState = null;
         manifestBaseUrl = '';
         postFxState = null;
+        settingsState = null;
+        lastSettingsText = '';
         lastManifestText = '';
         lastPostFxText = '';
         if (projectChanged) clearProjectLayers();
@@ -994,6 +1162,8 @@ export function createProjectRuntime({ layerManager, bridge, perfHud, debugLog =
             clearTimer();
             clearProjectLayers();
             manifestState = null;
+            settingsState = null;
+            lastSettingsText = '';
             lastManifestText = '';
             transientStudioState = null;
             transientBakeState = null;

@@ -179,6 +179,7 @@ This tool targets web development but since it's registered as renderer I added 
 
 # Bugs
 - ActiveShade can bug out if you maximize or minimize windows. Just use registered "kill maxjs" command in search menu
+- Memory can build up when adjusting properties like postfx etc. Just CTRL+SHIFT+R to restart the viewer to clean up. 
 
 # Build
 

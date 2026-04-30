@@ -6915,6 +6915,7 @@ public:
     ULONGLONG lastRedrawLivePollTick_ = 0;
     ULONGLONG lastInteractionTick_ = 0;
     ULONGLONG lastTimelineInteractionTick_ = 0;
+    ULONGLONG lastTransformInteractionTick_ = 0;
     bool haveLastTimerTime_ = false;
     TimeValue lastTimerTime_ = 0;
     bool haveLastPlaybackPollTime_ = false;
@@ -10258,6 +10259,37 @@ public:
     std::unordered_set<ULONG> geoFullFastDirtyHandles_;
     std::unordered_set<ULONG> materialFastDirtyHandles_;
 
+    void PollSelectedTransformGizmoLive() {
+        Interface* ip = GetCOREInterface();
+        if (!ip) return;
+        const int selCount = ip->GetSelNodeCount();
+        if (selCount <= 0) return;
+
+        const TimeValue t = ip->GetTime();
+        const ULONGLONG now = GetTickCount64();
+        bool changed = false;
+        for (int i = 0; i < selCount; ++i) {
+            INode* node = ip->GetSelNode(i);
+            if (!node) continue;
+            const ULONG handle = node->GetHandle();
+            if (!IsTrackedHandle(handle)) continue;
+            if (IsSceneCameraNode(node)) {
+                MarkCameraDirtyIfChanged(false);
+                continue;
+            }
+            if (!HasPendingTransformChange(handle, node, t)) continue;
+
+            fastDirtyHandles_.insert(handle);
+            lastTransformInteractionTick_ = now;
+            changed = true;
+        }
+
+        if (changed) {
+            MarkInteractiveActivity();
+            QueueFastFlush();
+        }
+    }
+
     void CheckSelectedGeometryLive() {
         Interface* ip = GetCOREInterface();
         if (!ip) return;
@@ -10274,6 +10306,13 @@ public:
             ULONG handle = node->GetHandle();
             if (!IsTrackedHandle(handle)) continue;
             if (skinnedHandles_.count(handle)) continue;
+            if (HasPendingTransformChange(handle, node, t)) {
+                lastTransformInteractionTick_ = GetTickCount64();
+                fastDirtyHandles_.insert(handle);
+                changed = true;
+                continue;
+            }
+            if (ShouldSuppressSelectedGeometryForTransform()) continue;
 
             // Match DetectGeometryChanges / geo_fast payload: include UVs
             // (HashNodeGeometryState omits them). Never run this while the
@@ -10601,6 +10640,19 @@ public:
         std::array<float, 16> cached = {};
         std::copy(xform, xform + 16, cached.begin());
         lastSentTransforms_[handle] = cached;
+    }
+
+    bool HasPendingTransformChange(ULONG handle, INode* node, TimeValue t) const {
+        if (!node) return false;
+        auto it = lastSentTransforms_.find(handle);
+        if (it == lastSentTransforms_.end()) return false;
+
+        float xform[16];
+        GetTransform16(node, t, xform);
+        for (int i = 0; i < 16; ++i) {
+            if (!NearlyEqualFloat(xform[i], it->second[i], 1.0e-4f)) return true;
+        }
+        return false;
     }
 
     static constexpr ULONGLONG kInteractiveCooldownMs = 250;
@@ -10947,6 +10999,12 @@ public:
                (now - lastTimelineInteractionTick_) <= kInteractiveCooldownMs;
     }
 
+    bool ShouldSuppressSelectedGeometryForTransform() const {
+        const ULONGLONG now = GetTickCount64();
+        return lastTransformInteractionTick_ != 0 &&
+               (now - lastTransformInteractionTick_) <= kInteractiveCooldownMs;
+    }
+
     bool ShouldUseTimelineGeometryFastLane() const {
         return IsAnimationPlaying() || ShouldSuppressSelectedGeometryDuringTimeline();
     }
@@ -11001,9 +11059,9 @@ public:
 
     void PollInteractiveFastPathWhileFullSyncDeferred() {
         CheckSkinnedGeometryLive();
-        CheckSelectedGeometryLive();
         MarkSelectedTransformsDirty();
-        MarkCameraDirtyIfChanged();
+        CheckSelectedGeometryLive();
+        MarkCameraDirtyIfChanged(false);
         if (ShouldRunInteractiveMaterialChecks()) CheckTrackedMaterialScalarsLive();
     }
 
@@ -11044,6 +11102,7 @@ public:
         haveLastPlaybackPollTime_ = false;
         haveLastDeformLivePollTime_ = false;
         lastTimelineInteractionTick_ = 0;
+        lastTransformInteractionTick_ = 0;
         lastCameraLivePollTick_ = 0;
         lastRedrawLivePollTick_ = 0;
         deformLiveScanCursor_ = 0;
@@ -11781,6 +11840,8 @@ public:
                     FlushFastPathNow();
                 }
                 haveLastPlaybackPollTime_ = false;
+                MarkCameraDirtyIfChanged(false);
+                PollSelectedTransformGizmoLive();
                 PumpTimelineSyncFromTimer();
                 CheckSkinnedGeometryLive();
             }
@@ -16183,7 +16244,10 @@ void MaxJSFastRedrawCallback::proc(Interface*) {
     const bool animPlaying = owner_->IsAnimationPlaying();
     const bool favorInteractive = !animPlaying && owner_->ShouldFavorInteractivePerformance();
 
-    owner_->MarkCameraDirtyIfChanged();
+    // Camera is cheap and should not be throttled by selected-transform or
+    // geometry lanes; keep it on its own immediate dirty check.
+    owner_->MarkCameraDirtyIfChanged(false);
+    if (!animPlaying) owner_->PollSelectedTransformGizmoLive();
 
     // RedrawViewsCallback fires for viewport hover/selection highlight too.
     // During playback, high-polling-rate mouse movement can multiply redraw

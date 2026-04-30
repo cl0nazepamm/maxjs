@@ -8,7 +8,7 @@
 
 - **Realtime Sync** — Binary delta protocol over WebView2 shared memory.
 - **ActiveShade** — Docks into a Max viewport for live feedback on your design
-- **Layer Manager** — Early prototype / Outline for Playcanvas style script loading. (WIP)
+- **Layer Manager** — Scene-local runtime layer system for project scripts, inline scripts, and overlays.
 - **Snapshots** — Fast export your scene to standalone (WIP)
 - **Virtual Reality** — WebXR (only tested on Quest 3 VDXR) (WebGL only)
 
@@ -138,14 +138,31 @@ One-click export to a self-contained HTML site with:
 
 ---
 
-## Layer Manager (WIP)
+## Layer Manager
 
-Architecture:
-- **Max-owned layers** — read-only mirror of the 3ds Max scene
-- **JS-authored layers** — full ownership, hot-loaded from project folder, with access to 3dsmax objects + vibe coding potential.
-- **Overlay layers** — UI/HUD elements outside the scene graph
+Layer Manager is the scene-local runtime system for max.js projects. A saved `.max` scene can own runtime code beside the scene file instead of relying on machine-global temp scripts.
 
-Per-resource disposal tracking for materials, textures, and geometries. Layers persist per scene file.
+Scene-local layout:
+
+```text
+scene_folder/
+  your_scene.max
+  project.maxjs.json
+  inlines/
+    behavior.js
+    effects.js
+```
+
+Layer types:
+
+- **Max scene layers** — read-only synced 3ds Max objects, cameras, lights, splats, audio, and generated geometry.
+- **Project layers** — manifest-owned runtime modules declared in `project.maxjs.json`.
+- **Inline layers** — hot-loaded scene-local scripts from `inlines/`, ordered and enabled through the manifest.
+- **Overlay layers** — UI/HUD elements outside the scene graph.
+
+Use **Release Project Manifest** to initialize a saved scene for scene-local runtime work. It creates `project.maxjs.json` and `inlines/` next to the `.max` file, migrates existing temporary inline layers when present, and reloads the runtime from the scene-owned project files.
+
+Layer Manager tracks ownership and cleanup for runtime-created objects, materials, textures, and geometries. Layer state persists with the scene-local project files and is included by snapshot export when those sidecars exist.
 
 # Exporting your scene standalone
 

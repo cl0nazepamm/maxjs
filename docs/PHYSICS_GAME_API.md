@@ -96,5 +96,5 @@ MaxJS uses centimeters (cm) to match 3ds Max:
 
 ## Vendor Dependencies
 
-- `vendor/three-r183.2/` - Three.js
+- `vendor/three-r184/` - Three.js
 - `vendor/rapier/` - Rapier3D WASM physics

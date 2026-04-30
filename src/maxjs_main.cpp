@@ -6914,6 +6914,7 @@ public:
     ULONGLONG lastCameraLivePollTick_ = 0;
     ULONGLONG lastRedrawLivePollTick_ = 0;
     ULONGLONG lastInteractionTick_ = 0;
+    ULONGLONG lastTimelineInteractionTick_ = 0;
     bool haveLastTimerTime_ = false;
     TimeValue lastTimerTime_ = 0;
     bool haveLastPlaybackPollTime_ = false;
@@ -10262,6 +10263,7 @@ public:
         if (!ip) return;
         const int selCount = ip->GetSelNodeCount();
         if (selCount <= 0) return;
+        if (ShouldSuppressSelectedGeometryDuringTimeline()) return;
         TimeValue t = ip->GetTime();
 
         bool changed = false;
@@ -10273,7 +10275,10 @@ public:
             if (!IsTrackedHandle(handle)) continue;
             if (skinnedHandles_.count(handle)) continue;
 
-            // Match DetectGeometryChanges / geo_fast payload: include UVs (HashNodeGeometryState omits them).
+            // Match DetectGeometryChanges / geo_fast payload: include UVs
+            // (HashNodeGeometryState omits them). Never run this while the
+            // time slider is moving; high-poly UV hashes are exactly the
+            // scrub hitch path, and timeline scrubbing is not a topology edit.
             uint64_t geomHash = 0;
             if (!TryHashRenderableGeometryState(node, t, geomHash))
                 continue;
@@ -10343,7 +10348,8 @@ public:
         // Falling into the hash path is only correct for true idle where nothing
         // is moving — it avoids redundant sends when the mesh genuinely isn't
         // changing. But during any kind of activity, hashing doubles the work.
-        bool skipHash = IsAnimationPlaying()
+        const bool timelineFastLane = ShouldUseTimelineGeometryFastLane();
+        bool skipHash = timelineFastLane
                      || ShouldFavorInteractivePerformance();
 
         if (!skipHash) {
@@ -10387,7 +10393,8 @@ public:
             }
 
             if (skipHash) {
-                if (!IsAnimationPlaying() &&
+                if (!timelineFastLane &&
+                    !IsAnimationPlaying() &&
                     node->Selected() &&
                     HasDeformingChannelChange(handle, node, t, true)) {
                     geoHashMap_.erase(handle);
@@ -10775,6 +10782,7 @@ public:
         }
 
         fastTimeDirty_ = true;
+        lastTimelineInteractionTick_ = GetTickCount64();
 
         // Scrub: direct flush for lowest latency.
         const bool wasSuppressingPost = suppressFastFlushPost_;
@@ -10932,6 +10940,17 @@ public:
         return lastInteractionTick_ != 0 && (now - lastInteractionTick_) <= kInteractiveCooldownMs;
     }
 
+    bool ShouldSuppressSelectedGeometryDuringTimeline() const {
+        if (IsAnimationPlaying()) return true;
+        const ULONGLONG now = GetTickCount64();
+        return lastTimelineInteractionTick_ != 0 &&
+               (now - lastTimelineInteractionTick_) <= kInteractiveCooldownMs;
+    }
+
+    bool ShouldUseTimelineGeometryFastLane() const {
+        return IsAnimationPlaying() || ShouldSuppressSelectedGeometryDuringTimeline();
+    }
+
     bool ShouldDeferFullSyncForInteraction(ULONGLONG now) const {
         return lastInteractionTick_ != 0 &&
                (now - lastInteractionTick_) <= kFullSyncInteractiveDeferMs;
@@ -11024,6 +11043,7 @@ public:
         playbackFlushPending_ = false;
         haveLastPlaybackPollTime_ = false;
         haveLastDeformLivePollTime_ = false;
+        lastTimelineInteractionTick_ = 0;
         lastCameraLivePollTick_ = 0;
         lastRedrawLivePollTick_ = 0;
         deformLiveScanCursor_ = 0;
@@ -11675,6 +11695,7 @@ public:
         }
         if (type == L"ready" || msg.find(L"\"ready\"") != std::wstring::npos) {
             jsReady_ = true; SetDirtyImmediate();
+            PollViewportModes(true);
             mtlHashMap_.clear();
             mtlScalarHashMap_.clear();
             mtlFastScalarHashMap_.clear();
@@ -11802,11 +11823,11 @@ public:
         }
     }
 
-    void PollViewportModes() {
+    void PollViewportModes(bool force = false) {
         if (!webview_) return;
 
         bool clay = IsClayModeActive();
-        if (clay != lastClayMode_) {
+        if (force || clay != lastClayMode_) {
             lastClayMode_ = clay;
             std::wstring msg = clay
                 ? L"{\"type\":\"clay_mode\",\"enabled\":true}"
@@ -11835,16 +11856,23 @@ public:
             INode* node = ip->GetINodeByHandle(handle);
             if (!node) continue;
 
-            // Fast-deform path: positions and normals are re-sent without
+            // Fast-deform path: positions are re-sent without
             // indices/UVs/material groups. Valid for meshes whose topology and
             // non-position channels are stable between full syncs.
             const bool isDeforming =
                 skinnedHandles_.find(handle) != skinnedHandles_.end() ||
                 deformHandles_.find(handle) != deformHandles_.end();
             if (playbackActive && isDeforming && !IsMaxJsSyncDrawVisible(node)) continue;
-            const bool hasVertexColors = isDeforming && NodeHasExtractableVertexColors(node, t);
             const bool forceFullGeometry =
                 forceFullHandles && forceFullHandles->find(handle) != forceFullHandles->end();
+            const bool timelineFastLane = ShouldUseTimelineGeometryFastLane();
+            const bool preferPositionOnlyDeformSync =
+                isDeforming && !forceFullGeometry &&
+                (timelineFastLane || ShouldFavorInteractivePerformance());
+            const bool hasVertexColors =
+                !preferPositionOnlyDeformSync &&
+                isDeforming &&
+                NodeHasExtractableVertexColors(node, t);
 
             // Hash-dedupe before extracting. RailClone / Forest Pack / TyFlow
             // (and Max itself) fire spurious ControllerStructured events when
@@ -11859,8 +11887,7 @@ public:
             // hash would EvalWorldState once before SendGeometryFastUpdate
             // evaluates again to extract positions. That duplicate eval was a
             // direct source of choppy Max playback.
-            if (!(isDeforming && !forceFullGeometry && !hasVertexColors &&
-                  (playbackActive || ShouldFavorInteractivePerformance()))) {
+            if (!preferPositionOnlyDeformSync) {
                 uint64_t preHash = 0;
                 auto it = geoHashMap_.find(handle);
                 if (it != geoHashMap_.end() &&
@@ -11886,13 +11913,15 @@ public:
             // need the full ExtractMesh path so UV/topology changes are not
             // silently dropped.
             bool usedSkinnedFastPositions = false;
-            if (wv17 && env12 && isDeforming && !hasVertexColors && !forceFullGeometry) {
-                // Playback is latency-bound, not normal-bound. Normal extraction
-                // is exactly the expensive path on faceted Editable Mesh input:
-                // it walks smoothing islands and can multiply render vertices.
-                // Keep the current normal buffer while Max is playing; scrub,
-                // pause, and full sync refresh normals outside the timeline path.
-                const bool streamLiveNormals = !playbackActive;
+            if (wv17 && env12 && isDeforming && !forceFullGeometry &&
+                (!hasVertexColors || preferPositionOnlyDeformSync)) {
+                // Timeline/interactive deformation is latency-bound, not
+                // normal-bound. Normal extraction is exactly the expensive path
+                // on faceted Editable Mesh input: it walks smoothing islands
+                // and can multiply render vertices. Keep the current normal
+                // buffer while Max is playing or scrubbing; idle/full sync can
+                // refresh normals after the time slider settles.
+                const bool streamLiveNormals = !preferPositionOnlyDeformSync;
                 auto sourceIt = skinnedFastSourceCache_.find(handle);
                 if (sourceIt != skinnedFastSourceCache_.end()) {
                     usedSkinnedFastPositions = ExtractSkinnedFastGeometry(
@@ -11909,8 +11938,10 @@ public:
             std::vector<VertexColorAttributeRecord> vertexColors;
             std::vector<int> controlIdx;
             std::vector<FastVertexSource> fastSources;
+            std::vector<float>* extractNormals =
+                preferPositionOnlyDeformSync ? nullptr : &norms;
             if (!usedSkinnedFastPositions &&
-                !ExtractMesh(node, t, verts, uvs, indices, groups, &norms, &controlIdx, &vertexColors, &fastSources)) {
+                !ExtractMesh(node, t, verts, uvs, indices, groups, extractNormals, &controlIdx, &vertexColors, &fastSources)) {
                 ObjectState os = node->EvalWorldState(t);
                 if (!ShouldExtractRenderableShape(node, t, &os) ||
                     !ExtractSpline(node, t, verts, indices)) {
@@ -11923,15 +11954,17 @@ public:
 
             if (!usedSkinnedFastPositions) {
                 // Store raw hash consistent with DetectGeometryChanges / TryHashRenderableGeometryState
-                uint64_t rawHash = 0;
-                if (!TryHashRenderableGeometryState(node, t, rawHash))
-                    rawHash = HashMeshData(verts, indices, uvs, &vertexColors);
-                geoHashMap_[handle] = rawHash;
-                uint64_t channelHash = 0;
-                if (TryHashRenderableGeometryChannels(node, t, channelHash))
-                    deformChannelHashMap_[handle] = channelHash;
-                else
-                    deformChannelHashMap_.erase(handle);
+                if (!preferPositionOnlyDeformSync) {
+                    uint64_t rawHash = 0;
+                    if (!TryHashRenderableGeometryState(node, t, rawHash))
+                        rawHash = HashMeshData(verts, indices, uvs, &vertexColors);
+                    geoHashMap_[handle] = rawHash;
+                    uint64_t channelHash = 0;
+                    if (TryHashRenderableGeometryChannels(node, t, channelHash))
+                        deformChannelHashMap_[handle] = channelHash;
+                    else
+                        deformChannelHashMap_.erase(handle);
+                }
                 if (!isSpline && controlIdx.size() * 3 == verts.size()) {
                     skinnedControlIdxCache_[handle] = std::move(controlIdx);
                     if (fastSources.size() * 3 == verts.size())
@@ -12001,6 +12034,7 @@ public:
                     ss << L",\"iOff\":" << iOff << L",\"iN\":" << indices.size();
                     if (!uvs.empty()) ss << L",\"uvOff\":" << uvOff << L",\"uvN\":" << uvs.size();
                     if (!norms.empty()) ss << L",\"nOff\":" << nOff << L",\"nN\":" << norms.size();
+                    else ss << L",\"keepNormals\":true";
                     WriteVertexColorOffsetsJson(ss, vertexColors);
                 }
                 ss << L'}';

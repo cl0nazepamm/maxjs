@@ -4404,43 +4404,47 @@
         });
 
         function enterClayMode() {
-            // Snapshot current FX state
-            clayPreFxSnapshot = {
-                ssgi: ssgiFx.isEnabled(),
-                ssr: ssgiFx.isSSREnabled(),
-                gtao: ssgiFx.isGTAOEnabled(),
-                bloom: ssgiFx.isBloomEnabled(),
-                toonOutline: ssgiFx.isToonOutlineEnabled(),
-                motionBlur: ssgiFx.isMotionBlurEnabled(),
-                traa: ssgiFx.isTRAAEnabled(),
-                contactShadow: ssgiFx.isContactShadowEnabled(),
-                retro: ssgiFx.isRetroEnabled(),
-                volumetric: ssgiFx.isVolumetricEnabled(),
-                pixel: ssgiFx.isPixelEnabled(),
-                fog: ssgiFx.isFogEnabled(),
-                opaqueBackdrop: ssgiFx.isOpaqueBackdropEnabled(),
-                clone: ssgiFx.isCloneEnabled(),
-            };
-            // Disable everything
-            ssgiFx.setCloneEnabled(false);
-            ssgiFx.setEnabled(false);
-            ssgiFx.setSSREnabled(false);
-            ssgiFx.setBloomEnabled(false);
-            ssgiFx.setToonOutlineEnabled(false);
-            ssgiFx.setMotionBlurEnabled(false);
-            ssgiFx.setTRAAEnabled(false);
-            ssgiFx.setContactShadowEnabled(false);
-            ssgiFx.setRetroEnabled(false);
-            ssgiFx.setVolumetricEnabled(false);
-            ssgiFx.setPixelEnabled(false);
-            ssgiFx.setFogEnabled(false);
-            ssgiFx.setOpaqueBackdropEnabled(false);
+            if (!clayPreFxSnapshot) {
+                // Snapshot current FX state once. Forced native resends must not
+                // overwrite the user's restore target with the already-muted clay state.
+                clayPreFxSnapshot = {
+                    ssgi: ssgiFx.isEnabled(),
+                    ssr: ssgiFx.isSSREnabled(),
+                    gtao: ssgiFx.isGTAOEnabled(),
+                    bloom: ssgiFx.isBloomEnabled(),
+                    toonOutline: ssgiFx.isToonOutlineEnabled(),
+                    motionBlur: ssgiFx.isMotionBlurEnabled(),
+                    traa: ssgiFx.isTRAAEnabled(),
+                    contactShadow: ssgiFx.isContactShadowEnabled(),
+                    retro: ssgiFx.isRetroEnabled(),
+                    volumetric: ssgiFx.isVolumetricEnabled(),
+                    pixel: ssgiFx.isPixelEnabled(),
+                    fog: ssgiFx.isFogEnabled(),
+                    opaqueBackdrop: ssgiFx.isOpaqueBackdropEnabled(),
+                    clone: ssgiFx.isCloneEnabled(),
+                };
+                // Disable everything
+                ssgiFx.setCloneEnabled(false);
+                ssgiFx.setEnabled(false);
+                ssgiFx.setSSREnabled(false);
+                ssgiFx.setBloomEnabled(false);
+                ssgiFx.setToonOutlineEnabled(false);
+                ssgiFx.setMotionBlurEnabled(false);
+                ssgiFx.setTRAAEnabled(false);
+                ssgiFx.setContactShadowEnabled(false);
+                ssgiFx.setRetroEnabled(false);
+                ssgiFx.setVolumetricEnabled(false);
+                ssgiFx.setPixelEnabled(false);
+                ssgiFx.setFogEnabled(false);
+                ssgiFx.setOpaqueBackdropEnabled(false);
+                ssgiFx.setGTAOEnabled(false);
+            }
             if (ssgiFx.setClayOverride) ssgiFx.setClayOverride(true);
-            ssgiFx.setGTAOEnabled(false);
 
             // Use scene.overrideMaterial — renderer + shadow system use it natively,
             // no per-mesh swap needed, no stale WebGPU TextureNode references.
             scene.overrideMaterial = clayMat;
+            ssgiFx.markOutputChanged?.();
         }
 
         function exitClayMode() {
@@ -4465,12 +4469,16 @@
                 ssgiFx.setCloneEnabled(clayPreFxSnapshot.clone);
                 clayPreFxSnapshot = null;
             }
+            ssgiFx.markOutputChanged?.();
         }
 
         bridge.on('clay_mode', msg => {
             if (renderToImageActive) return;  // suppress during production render
             const enabled = !!msg.enabled;
-            if (enabled === clayModeActive) return;
+            const needsApply = enabled
+                ? (!clayModeActive || scene.overrideMaterial !== clayMat)
+                : (clayModeActive || scene.overrideMaterial === clayMat || !!clayPreFxSnapshot);
+            if (!needsApply) return;
             clayModeActive = enabled;
             if (enabled) enterClayMode(); else exitClayMode();
             syncPostFxPanel(true, { persist: false });
@@ -4532,8 +4540,6 @@
 
                                 if (meta.nOff != null && meta.nN) {
                                     updateFloatGeometryAttribute(mesh.geometry, 'normal', buf, meta.nOff, meta.nN, 3);
-                                } else if (!meta.keepNormals) {
-                                    scheduleNormals(mesh.geometry);
                                 }
 
                                 setGeometryVertexColorAttributes(mesh.geometry, incomingVertexColors, buf);
@@ -5384,22 +5390,6 @@
             }
             if (msg.fog) ssgiFx.setFogFromScene(msg.fog);
         });
-
-        // ── Geometry Fast Update (single mesh, real-time vertex editing) ──
-        const pendingNormals = new Set();
-        let normalTimer = null;
-        function scheduleNormals(geom) {
-            pendingNormals.add(geom);
-            clearTimeout(normalTimer);
-            normalTimer = setTimeout(() => {
-                for (const g of pendingNormals) {
-                    g.computeVertexNormals();
-                    const n = g.getAttribute('normal');
-                    if (n) n.needsUpdate = true;
-                }
-                pendingNormals.clear();
-            }, 80);
-        }
 
         bridge.on('geo_fast', msg => {
             const mesh = nodeMap.get(msg.h);

@@ -235,12 +235,14 @@ export function createHTMLTexture(THREE, url, options = {}) {
 
     function scheduleRedraw() {
         dirty = true;
+        if (loopTimer) { clearTimeout(loopTimer); loopTimer = 0; }
         if (disposed || rafHandle) return;
         rafHandle = requestAnimationFrame(() => {
             rafHandle = 0;
             lastRedrawAt = performance.now();
             dirty = false;
             redraw();
+            scheduleLoop(redrawIntervalMs());
         });
     }
 
@@ -275,17 +277,32 @@ export function createHTMLTexture(THREE, url, options = {}) {
     // made live Max playback pay for 60Hz DOM rasterization even when the
     // Max timeline was 24/30fps. Keep animation live, but cap uploads to
     // the authored timeline rate (or 30fps by default) and redraw
-    // immediately when params / DOM mutations mark the texture dirty.
+    // immediately when params / DOM mutations mark the texture dirty. Do not
+    // keep a permanent RAF alive per texture; sleeping on a timer between
+    // captures avoids stealing WebView UI-thread time from Max playback.
     let loopHandle = 0;
+    let loopTimer = 0;
+
+    function scheduleLoop(delayMs = redrawIntervalMs()) {
+        if (disposed || loopHandle || loopTimer) return;
+        loopTimer = setTimeout(() => {
+            loopTimer = 0;
+            if (disposed || loopHandle) return;
+            loopHandle = requestAnimationFrame(loop);
+        }, Math.max(0, delayMs));
+    }
+
     function loop(now) {
+        loopHandle = 0;
         if (disposed) return;
+        const interval = redrawIntervalMs();
         const elapsed = now - lastRedrawAt;
-        if (dirty || elapsed >= redrawIntervalMs()) {
+        if (dirty || elapsed >= interval) {
             dirty = false;
             lastRedrawAt = now;
             redraw();
         }
-        loopHandle = requestAnimationFrame(loop);
+        scheduleLoop(Math.max(0, interval - (performance.now() - lastRedrawAt)));
     }
 
     function onReady() {
@@ -294,7 +311,7 @@ export function createHTMLTexture(THREE, url, options = {}) {
         attachObserver();
         postParams(initialParams);
         dirty = true;
-        loopHandle = requestAnimationFrame(loop);
+        scheduleLoop(0);
     }
 
     if (mode === 'iframe') {
@@ -310,6 +327,7 @@ export function createHTMLTexture(THREE, url, options = {}) {
         disposed = true;
         if (rafHandle) { cancelAnimationFrame(rafHandle); rafHandle = 0; }
         if (loopHandle) { cancelAnimationFrame(loopHandle); loopHandle = 0; }
+        if (loopTimer) { clearTimeout(loopTimer); loopTimer = 0; }
         if (observer) { try { observer.disconnect(); } catch (_) {} observer = null; }
         if ('onpaint' in canvas) canvas.onpaint = null;
         try { wrap.remove(); } catch (_) {}

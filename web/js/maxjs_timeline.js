@@ -38,6 +38,7 @@ const listeners = {
     play: new Set(),
     pause: new Set(),
 };
+let liveChangeRaf = 0;
 
 function emit(event) {
     const set = listeners[event];
@@ -45,6 +46,23 @@ function emit(event) {
     for (const fn of set) {
         try { fn(snapshot()); } catch (err) { console.warn('[maxTimeline] listener threw:', err); }
     }
+}
+
+function emitChange(options = {}) {
+    const defer = options.defer === true;
+    if (defer && typeof requestAnimationFrame === 'function') {
+        if (liveChangeRaf) return;
+        liveChangeRaf = requestAnimationFrame(() => {
+            liveChangeRaf = 0;
+            emit('change');
+        });
+        return;
+    }
+    if (liveChangeRaf && typeof cancelAnimationFrame === 'function') {
+        cancelAnimationFrame(liveChangeRaf);
+        liveChangeRaf = 0;
+    }
+    emit('change');
 }
 
 function snapshot() {
@@ -105,7 +123,7 @@ function onTime({ ticks, tpf, stateFlags }) {
     state.frame = frame;
     state.playing = nextPlaying;
 
-    emit('change');
+    emitChange({ defer: nextPlaying });
     if (!wasPlaying && nextPlaying) emit('play');
     else if (wasPlaying && !nextPlaying) emit('pause');
 }
@@ -163,12 +181,12 @@ function initStandalone(options = {}) {
             state.ticks = Math.round(state.seconds * TICKS_PER_SECOND);
             state._lastPushSeconds = state.seconds;
             state._lastPushMono = performance.now();
-            emit('change');
+            emitChange();
         }
         state._standaloneRaf = requestAnimationFrame(tick);
     };
     state._standaloneRaf = requestAnimationFrame(tick);
-    emit('change');
+    emitChange();
     if (wantsPlay) emit('play');
 }
 
@@ -179,7 +197,7 @@ function standalonePlay() {
     state._standaloneStartSeconds = state.seconds;
     state.playing = true;
     emit('play');
-    emit('change');
+    emitChange();
 }
 
 function standalonePause() {
@@ -187,7 +205,7 @@ function standalonePause() {
     if (!state.playing) return;
     state.playing = false;
     emit('pause');
-    emit('change');
+    emitChange();
 }
 
 function standaloneSeek(seconds) {
@@ -199,7 +217,7 @@ function standaloneSeek(seconds) {
     state._standaloneStartSeconds = state.seconds;
     state._lastPushSeconds = state.seconds;
     state._lastPushMono = state._standaloneStartMono;
-    emit('change');
+    emitChange();
 }
 
 export const maxTimeline = {

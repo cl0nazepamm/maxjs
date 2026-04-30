@@ -82,6 +82,7 @@ using namespace Microsoft::WRL;
 #define WM_KILL_PANEL             (WM_USER + 3)
 #define WM_SYNC_TICK              (WM_USER + 4)
 #define WM_AS_TICK                (WM_USER + 5)
+#define WM_PLAYBACK_FLUSH         (WM_USER + 6)
 #define SETUP_TIMER_ID            2
 #define AS_TIMER_ID               3
 #define AS_INTERVAL_MS            66   // ~15fps ActiveShade
@@ -3726,6 +3727,18 @@ static bool ExtractMeshFromMNMesh(MNMesh& mn,
             [](const FaceRef& a, const FaceRef& b) { return a.matID < b.matID; });
     }
 
+    const bool smoothZeroSmoothingForDynamic =
+        outFastVertexSources != nullptr || outControlIdx != nullptr;
+    auto effectiveSmGrpForDynamic = [smoothZeroSmoothingForDynamic](DWORD smGrp) -> DWORD {
+        // Editable Mesh / Poly objects with smGroup 0 are often just bad
+        // imported/faceted normals. If we preserve that for deforming MaxJS
+        // nodes, extraction splits every face corner into a unique render
+        // vertex and playback payloads scale with face count instead of
+        // control vertices. For dynamic/deform sync, treat zero smoothing as
+        // one smooth island; static extraction keeps authored hard normals.
+        return (smoothZeroSmoothingForDynamic && smGrp == 0) ? 0x7fffffffu : smGrp;
+    };
+
     // Per-corner smoothed normals, indexed by faceCornerStart[faceIdx] + localIdx.
     // Avoids the hash-map-per-corner cost that dominated on 700k+ poly meshes and
     // lets the face-normal and smooth-normal passes run on a PPL worker pool.
@@ -3763,7 +3776,7 @@ static bool ExtractMeshFromMNMesh(MNMesh& mn,
             std::vector<int> cursor(numVerts, 0);
             for (const FaceRef& fr : liveFaces) {
                 MNFace* face = mn.F(fr.idx);
-                const DWORD smGrp = face->smGroup;
+                const DWORD smGrp = effectiveSmGrpForDynamic(face->smGroup);
                 for (int v = 0; v < face->deg; v++) {
                     int pIdx = face->vtx[v];
                     vertCornersFlat[vertCornerOff[pIdx] + cursor[pIdx]++] = { fr.idx, v, smGrp };
@@ -3827,7 +3840,7 @@ static bool ExtractMeshFromMNMesh(MNMesh& mn,
     for (auto& fr : liveFaces) {
         MNFace* face = mn.F(fr.idx);
         const int deg = face->deg;
-        const DWORD smGrp = face->smGroup;
+        const DWORD smGrp = effectiveSmGrpForDynamic(face->smGroup);
         const int matID = (int)face->material;
 
         if (matID != curMatID) {
@@ -3863,7 +3876,10 @@ static bool ExtractMeshFromMNMesh(MNMesh& mn,
                     colorSig = HashFNV1a(&colorIdx, sizeof(colorIdx), colorSig);
                 }
 
-                // smGrp 0 = no smoothing: force unique vertices per face for flat normals
+                // smGrp 0 = no smoothing: force unique vertices per face for flat normals.
+                // Dynamic/deform extraction maps zero smoothing to one smooth
+                // island above so bad faceted import normals do not explode
+                // live playback topology.
                 DWORD keySmGrp = smGrp == 0 ? (DWORD)(0x80000000u | fr.idx) : smGrp;
                 MeshCornerKey key = { posIdx, uvIdx, hasUV2s ? uv2Idx : 0, keySmGrp, colorSig };
                 auto it = vertMap.find(key);
@@ -3963,6 +3979,11 @@ static bool ExtractMeshFromTriObject(TriObject* tri, Object* srcObj,
     MeshMap* uv2Map = (outUV2s && MeshHasUsableMapChannel(mesh, 2)) ? &mesh.Map(2) : nullptr;
     const bool hasUV2s = uv2Map != nullptr;
     const std::vector<int> vertexColorChannels = CollectMeshVertexColorChannels(mesh, allowMapChannel1);
+    const bool smoothZeroSmoothingForDynamic =
+        outFastVertexSources != nullptr || outControlIdx != nullptr;
+    auto effectiveSmGrpForDynamic = [smoothZeroSmoothingForDynamic](DWORD smGrp) -> DWORD {
+        return (smoothZeroSmoothingForDynamic && smGrp == 0) ? 0x7fffffffu : smGrp;
+    };
 
     std::vector<int> faceOrder;
     faceOrder.reserve(nf);
@@ -4000,7 +4021,7 @@ static bool ExtractMeshFromTriObject(TriObject* tri, Object* srcObj,
         {
             std::vector<int> cursor(nv, 0);
             for (int f = 0; f < nf; f++) {
-                DWORD smGrp = mesh.faces[f].getSmGroup();
+                DWORD smGrp = effectiveSmGrpForDynamic(mesh.faces[f].getSmGroup());
                 for (int v = 0; v < 3; v++) {
                     int pIdx = mesh.faces[f].v[v];
                     vertCornersFlat[vertCornerOff[pIdx] + cursor[pIdx]++] = { f, v, smGrp };
@@ -4063,7 +4084,7 @@ static bool ExtractMeshFromTriObject(TriObject* tri, Object* srcObj,
             DWORD posIdx = mesh.faces[f].v[v];
             DWORD uvIdx  = hasUVs ? mesh.tvFace[f].t[v] : 0;
             DWORD uv2Idx = (hasUV2s && f < uv2Map->fnum) ? uv2Map->tf[f].t[v] : 0;
-            DWORD smGrp  = mesh.faces[f].getSmGroup();
+            DWORD smGrp  = effectiveSmGrpForDynamic(mesh.faces[f].getSmGroup());
             uint64_t colorSig = 1469598103934665603ULL;
             for (int channel : vertexColorChannels) {
                 int colorIdx = -1;
@@ -6895,6 +6916,8 @@ public:
     ULONGLONG lastInteractionTick_ = 0;
     bool haveLastTimerTime_ = false;
     TimeValue lastTimerTime_ = 0;
+    bool haveLastPlaybackPollTime_ = false;
+    TimeValue lastPlaybackPollTime_ = 0;
     bool haveLastDeformLivePollTime_ = false;
     TimeValue lastDeformLivePollTime_ = 0;
     HANDLE syncTimerQueueTimer_ = nullptr;
@@ -6922,6 +6945,8 @@ public:
     bool pendingTimelineTransformScan_ = false;
     bool pendingTimelineDeformScan_ = false;
     bool pendingTimelineCameraCheck_ = false;
+    bool playbackFlushPending_ = false;
+    TimeValue playbackFlushTime_ = 0;
     bool haveLastSentCamera_ = false;
     ULONGLONG dirtyStamp_ = 0;   // when dirty_ was last set (for debounce)
     ULONGLONG lastMaterialInteractionTick_ = 0;
@@ -10357,6 +10382,9 @@ public:
             if (geoFastDirtyHandles_.count(handle)) return;
             INode* node = ip->GetINodeByHandle(handle);
             if (!node) return;
+            if (forceForCurrentTime && IsAnimationPlaying() && !IsMaxJsSyncDrawVisible(node)) {
+                return;
+            }
 
             if (skipHash) {
                 if (!IsAnimationPlaying() &&
@@ -10687,25 +10715,68 @@ public:
         OnTimelineTimeChanged(t);
     }
 
+    void PumpPlaybackSyncFromTimer() {
+        Interface* ip = GetCOREInterface();
+        if (!ip) return;
+        if (!IsAnimationPlaying()) {
+            haveLastPlaybackPollTime_ = false;
+            return;
+        }
+        if (playbackFlushPending_) return;
+
+        const TimeValue t = ip->GetTime();
+        if (haveLastPlaybackPollTime_ && t == lastPlaybackPollTime_) return;
+        haveLastPlaybackPollTime_ = true;
+        lastPlaybackPollTime_ = t;
+
+        // Brute-force playback lane: sample the current evaluated Max time
+        // from our own pump and send the whole tracked transform/time state.
+        // This keeps viewer playback deterministic without blocking the
+        // timeline callback that advances Max itself.
+        SendPlaybackDeltaAtTime(t);
+
+        if (!skinnedHandles_.empty() || !deformHandles_.empty()) {
+            pendingTimelineDeformScan_ = true;
+            QueueFastFlush();
+        }
+    }
+
+    void FlushPostedPlaybackSync() {
+        if (!playbackFlushPending_) return;
+        playbackFlushPending_ = false;
+
+        const TimeValue t = playbackFlushTime_;
+        haveLastPlaybackPollTime_ = true;
+        lastPlaybackPollTime_ = t;
+
+        SendPlaybackDeltaAtTime(t);
+
+        if (!skinnedHandles_.empty() || !deformHandles_.empty()) {
+            pendingTimelineDeformScan_ = true;
+            QueueFastFlush();
+        }
+    }
+
     void OnTimelineTimeChanged(TimeValue t) {
         haveLastTimerTime_ = true;
         lastTimerTime_ = t;
-        fastTimeDirty_ = true;
 
         if (IsAnimationPlaying()) {
-            pendingTimelineTransformScan_ = true;
-            pendingTimelineDeformScan_ = true;
-            pendingTimelineCameraCheck_ = true;
-            QueueFastFlush();
-            MarkInteractiveActivity();
+            // Playback: do not produce sync from Max's timeline callback.
+            // This callback is on the path that advances Max's own time
+            // slider; any packing/eval/send work here directly harms Max
+            // playback cadence. Store the authored time and post a lightweight
+            // message so the real data read/send happens after the callback.
+            const bool alreadyPending = playbackFlushPending_;
+            playbackFlushTime_ = t;
+            playbackFlushPending_ = true;
+            if (!alreadyPending && hwnd_) PostMessage(hwnd_, WM_PLAYBACK_FLUSH, 0, 0);
             return;
         }
 
-        // Timeline playback and scrub are the latency-critical path. Avoid
-        // posting WM_FAST_FLUSH and waiting for the message pump when Max has
-        // already told us a scrubbed authored time is live. Continuous
-        // playback uses the queued path above so TimeChanged never blocks the
-        // Max playback step.
+        fastTimeDirty_ = true;
+
+        // Scrub: direct flush for lowest latency.
         const bool wasSuppressingPost = suppressFastFlushPost_;
         suppressFastFlushPost_ = true;
         MarkAnimatedTransformsDirty();
@@ -10715,6 +10786,134 @@ public:
 
         FlushFastPathNow();
         MarkInteractiveActivity();
+    }
+
+    bool SendSharedDeltaFrame(maxjs::sync::DeltaFrameBuilder& frame,
+                              std::uint32_t frameId,
+                              size_t producerBytesFallback = 0) {
+        if (!webview_ || !env_ || !useBinary_) return false;
+
+        ComPtr<ICoreWebView2_17> wv17;
+        ComPtr<ICoreWebView2Environment12> env12;
+        webview_->QueryInterface(IID_PPV_ARGS(&wv17));
+        env_->QueryInterface(IID_PPV_ARGS(&env12));
+        if (!wv17 || !env12) return false;
+
+        frame.EndFrame();
+        if (frame.command_count() == 0) return true;
+
+        const auto& frameBytes = frame.bytes();
+        const size_t totalBytes = frameBytes.empty() ? 4 : frameBytes.size();
+
+        ComPtr<ICoreWebView2SharedBuffer> sharedBuf;
+        HRESULT hr = env12->CreateSharedBuffer(totalBytes, &sharedBuf);
+        if (FAILED(hr) || !sharedBuf) return false;
+
+        BYTE* bufPtr = nullptr;
+        sharedBuf->get_Buffer(&bufPtr);
+        if (bufPtr && !frameBytes.empty()) {
+            memcpy(bufPtr, frameBytes.data(), frameBytes.size());
+        }
+
+        std::wostringstream meta;
+        meta.imbue(std::locale::classic());
+        meta << L"{\"type\":\"delta_bin\",\"frame\":" << frameId;
+        meta << L",\"stats\":{\"producerBytes\":"
+             << (frameBytes.empty() ? producerBytesFallback : frameBytes.size());
+        meta << L",\"commandCount\":" << frame.command_count() << L"}}";
+
+        wv17->PostSharedBufferToScript(
+            sharedBuf.Get(),
+            COREWEBVIEW2_SHARED_BUFFER_ACCESS_READ_ONLY,
+            meta.str().c_str());
+        return true;
+    }
+
+    void SendPlaybackDeltaAtTime(TimeValue t) {
+        if (!jsReady_ || !webview_ || !hwnd_ || !IsWindowVisible(hwnd_)) return;
+        if (!useBinary_ || !env_) {
+            pendingTimelineTransformScan_ = true;
+            pendingTimelineCameraCheck_ = true;
+            QueueFastFlush();
+            return;
+        }
+
+        Interface* ip = GetCOREInterface();
+        if (!ip) return;
+
+        const std::uint32_t frameId = AllocateFrameId();
+        maxjs::sync::DeltaFrameBuilder frame(frameId);
+        const size_t handleCount =
+            geomHandles_.size() +
+            lightHandles_.size() +
+            splatHandles_.size() +
+            audioHandles_.size() +
+            gltfHandles_.size();
+        frame.ReserveBytes(32 + handleCount * 96 + 80);
+        frame.BeginFrame();
+
+        auto appendHandle = [&](ULONG handle) {
+            INode* node = ip->GetINodeByHandle(handle);
+            if (!node) {
+                SetDirty();
+                return;
+            }
+
+            float xform[16];
+            GetTransform16(node, t, xform);
+            RememberSentTransform(handle, xform);
+            const bool visible = IsMaxJsSyncDrawVisible(node);
+
+            if (lightHandles_.find(handle) != lightHandles_.end()) {
+                maxjs::sync::DeltaFrameBuilder::LightData ld = {};
+                ld.matrix16 = xform;
+                ld.visible = visible;
+                if (ExtractLightBinaryData(node, t, ld)) {
+                    frame.UpdateLight(static_cast<std::uint32_t>(handle), ld);
+                }
+                return;
+            }
+            if (splatHandles_.find(handle) != splatHandles_.end()) {
+                frame.UpdateSplat(static_cast<std::uint32_t>(handle), xform, visible);
+                return;
+            }
+            if (audioHandles_.find(handle) != audioHandles_.end()) {
+                frame.UpdateAudio(static_cast<std::uint32_t>(handle), xform, visible);
+                return;
+            }
+            if (gltfHandles_.find(handle) != gltfHandles_.end()) {
+                frame.UpdateGLTF(static_cast<std::uint32_t>(handle), xform, visible);
+                return;
+            }
+
+            frame.UpdateTransform(static_cast<std::uint32_t>(handle), xform);
+            frame.UpdateVisibility(static_cast<std::uint32_t>(handle), visible);
+        };
+
+        for (ULONG handle : geomHandles_) appendHandle(handle);
+        for (ULONG handle : lightHandles_) appendHandle(handle);
+        for (ULONG handle : splatHandles_) appendHandle(handle);
+        for (ULONG handle : audioHandles_) appendHandle(handle);
+        for (ULONG handle : gltfHandles_) appendHandle(handle);
+
+        CameraData cam = {};
+        GetActiveCamera(cam);
+        if (!haveLastSentCamera_ || !CameraEquals(lastSentCamera_, cam)) {
+            frame.UpdateCamera(cam.pos, cam.target, cam.up, cam.fov, cam.perspective, cam.viewWidth,
+                               cam.dofEnabled, cam.dofFocusDistance, cam.dofFocalLength, cam.dofBokehScale);
+            lastSentCamera_ = cam;
+            haveLastSentCamera_ = true;
+            fastCameraDirty_ = false;
+        }
+
+        const std::int32_t tpf = GetTicksPerFrame();
+        frame.UpdateTime(static_cast<std::int32_t>(t), tpf, 0x01);
+
+        if (!SendSharedDeltaFrame(frame, frameId)) {
+            pendingTimelineTransformScan_ = true;
+            pendingTimelineCameraCheck_ = true;
+            QueueFastFlush();
+        }
     }
 
     bool IsModifyTaskActive() const {
@@ -10822,6 +11021,8 @@ public:
         pendingTimelineTransformScan_ = false;
         pendingTimelineDeformScan_ = false;
         pendingTimelineCameraCheck_ = false;
+        playbackFlushPending_ = false;
+        haveLastPlaybackPollTime_ = false;
         haveLastDeformLivePollTime_ = false;
         lastCameraLivePollTick_ = 0;
         lastRedrawLivePollTick_ = 0;
@@ -11529,6 +11730,11 @@ public:
         if (envPhase == 0) PollEnvFog();
 
         if (dirty_) {
+            if (IsAnimationPlaying()) {
+                PumpPlaybackSyncFromTimer();
+                return;
+            }
+
             const ULONGLONG now = GetTickCount64();
             const bool debounceReady =
                 dirtyStamp_ == 0 || (now - dirtyStamp_) >= DIRTY_DEBOUNCE_MS;
@@ -11544,7 +11750,19 @@ public:
                 if (useBinary_) SendFullSyncBinary(); else SendFullSync();
             }
         } else {
-            PumpTimelineSyncFromTimer();
+            const bool animPlaying = IsAnimationPlaying();
+            if (animPlaying) {
+                PumpPlaybackSyncFromTimer();
+            } else {
+                if (haveLastPlaybackPollTime_) {
+                    haveLastPlaybackPollTime_ = false;
+                    fastTimeDirty_ = true;
+                    FlushFastPathNow();
+                }
+                haveLastPlaybackPollTime_ = false;
+                PumpTimelineSyncFromTimer();
+                CheckSkinnedGeometryLive();
+            }
             // Poll deforming meshes every tick regardless of interactive state.
             // Max's RedrawViewsCallback only fires on full scene redraws
             // (animation, param edits, etc.) — NOT during interactive bone
@@ -11553,9 +11771,7 @@ public:
             // viewer even though the Skin modifier IS re-evaluating in Max.
             // The 16ms throttle inside the function dedups when the redraw
             // callback also runs during animation.
-            CheckSkinnedGeometryLive();
 
-            const bool animPlaying = IsAnimationPlaying();
             const bool favorInteractive = ShouldFavorInteractivePerformance();
             const bool allowIdlePolling = !favorInteractive;
             const bool allowRealtimeAuxPolling = allowIdlePolling || animPlaying;
@@ -11606,6 +11822,7 @@ public:
         Interface* ip = GetCOREInterface();
         if (!ip) return;
         TimeValue t = ip->GetTime();
+        const bool playbackActive = IsAnimationPlaying();
 
         ComPtr<ICoreWebView2_17> wv17;
         ComPtr<ICoreWebView2Environment12> env12;
@@ -11624,6 +11841,7 @@ public:
             const bool isDeforming =
                 skinnedHandles_.find(handle) != skinnedHandles_.end() ||
                 deformHandles_.find(handle) != deformHandles_.end();
+            if (playbackActive && isDeforming && !IsMaxJsSyncDrawVisible(node)) continue;
             const bool hasVertexColors = isDeforming && NodeHasExtractableVertexColors(node, t);
             const bool forceFullGeometry =
                 forceFullHandles && forceFullHandles->find(handle) != forceFullHandles->end();
@@ -11642,7 +11860,7 @@ public:
             // evaluates again to extract positions. That duplicate eval was a
             // direct source of choppy Max playback.
             if (!(isDeforming && !forceFullGeometry && !hasVertexColors &&
-                  (IsAnimationPlaying() || ShouldFavorInteractivePerformance()))) {
+                  (playbackActive || ShouldFavorInteractivePerformance()))) {
                 uint64_t preHash = 0;
                 auto it = geoHashMap_.find(handle);
                 if (it != geoHashMap_.end() &&
@@ -11669,9 +11887,16 @@ public:
             // silently dropped.
             bool usedSkinnedFastPositions = false;
             if (wv17 && env12 && isDeforming && !hasVertexColors && !forceFullGeometry) {
+                // Playback is latency-bound, not normal-bound. Normal extraction
+                // is exactly the expensive path on faceted Editable Mesh input:
+                // it walks smoothing islands and can multiply render vertices.
+                // Keep the current normal buffer while Max is playing; scrub,
+                // pause, and full sync refresh normals outside the timeline path.
+                const bool streamLiveNormals = !playbackActive;
                 auto sourceIt = skinnedFastSourceCache_.find(handle);
                 if (sourceIt != skinnedFastSourceCache_.end()) {
-                    usedSkinnedFastPositions = ExtractSkinnedFastGeometry(node, t, sourceIt->second, verts, &norms);
+                    usedSkinnedFastPositions = ExtractSkinnedFastGeometry(
+                        node, t, sourceIt->second, verts, streamLiveNormals ? &norms : nullptr);
                 }
                 if (!usedSkinnedFastPositions) {
                     auto cacheIt = skinnedControlIdxCache_.find(handle);
@@ -15833,6 +16058,9 @@ public:
         case WM_FAST_FLUSH:
             if (p) p->FlushFastPathNow();
             return 0;
+        case WM_PLAYBACK_FLUSH:
+            if (p) p->FlushPostedPlaybackSync();
+            return 0;
         case WM_SYNC_TICK:
             if (p) {
                 InterlockedExchange(&p->syncTickPosted_, 0);
@@ -15877,13 +16105,15 @@ void MaxJSFastNodeEventCallback::ControllerStructured(NodeKeyTab& nodes) {
 
 void MaxJSFastNodeEventCallback::ControllerOtherEvent(NodeKeyTab& nodes) {
     if (!owner_) return;
+    if (owner_->IsAnimationPlaying()) {
+        // During playback, TimeChanged already scans all transforms and
+        // deform geometry every frame. Bone controller events fire once
+        // per bone per frame — 50-bone rigs generate 50 callbacks with
+        // redundant VisitNodeSubtree + CheckSkinnedGeometryLive work
+        // that competes with Max's playback pacing and causes chop.
+        return;
+    }
     owner_->MarkTrackedNodesDirty(nodes);
-    // Controller change on ANY node (bones, helpers, dummies, etc.) can drive
-    // skin deformation via the modifier stack. Max doesn't fire a geometry
-    // event on the skinned mesh itself in this path — and the RedrawViewsCallback
-    // doesn't fire during interactive gizmo drags — so we poll deform meshes
-    // here directly. The 16ms throttle inside CheckSkinnedGeometryLive dedups
-    // against the tick-timer and redraw paths.
     owner_->MarkInteractiveActivity();
     owner_->CheckSkinnedGeometryLive();
 }
@@ -15928,8 +16158,6 @@ void MaxJSFastRedrawCallback::proc(Interface*) {
     if (!animPlaying && favorInteractive && owner_->ConsumeRedrawLivePollSlot()) {
         owner_->MarkSelectedTransformsDirty();
         owner_->CheckSelectedGeometryLive();
-        owner_->CheckSkinnedGeometryLive();
-    } else if (animPlaying && owner_->ConsumeRedrawLivePollSlot()) {
         owner_->CheckSkinnedGeometryLive();
     }
 

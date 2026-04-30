@@ -8234,12 +8234,43 @@
             }
         }
 
+        let renderToImageActive = false;
+        let pendingRenderToImage = null;
+
+        function getCameraProjectionAspect() {
+            if (renderToImageActive && pendingRenderToImage?.width > 0 && pendingRenderToImage?.height > 0) {
+                return pendingRenderToImage.width / pendingRenderToImage.height;
+            }
+            if (camera?.isPerspectiveCamera && Number.isFinite(camera.aspect) && camera.aspect > 0) {
+                return camera.aspect;
+            }
+            return innerHeight > 0 ? innerWidth / innerHeight : 1;
+        }
+
+        function applyCameraProjectionFromMax(cam) {
+            const aspect = getCameraProjectionAspect();
+            if (camera.isOrthographicCamera) {
+                const vw = Number.isFinite(cam.viewWidth) && cam.viewWidth > 0 ? cam.viewWidth : 500;
+                camera.left = -vw / 2;
+                camera.right = vw / 2;
+                camera.top = vw / (2 * aspect);
+                camera.bottom = -vw / (2 * aspect);
+                camera.near = -100000;
+                camera.far = 100000;
+            } else if (Number.isFinite(cam.fov) && cam.fov > 0 && cam.fov < 170) {
+                const hRad = cam.fov * Math.PI / 180;
+                camera.aspect = aspect;
+                camera.fov = 2 * Math.atan(Math.tan(hRad / 2) / aspect) * 180 / Math.PI;
+            }
+            applyCameraClipOverrides(camera);
+        }
+
         // ── Camera Sync (Max view → world camera) ───────────
         function applyCamera(cam) {
             const layerCameraMode = layerManager?.cameraMode ?? 'viewport';
             if (xrRuntime?.active) return;
             if (layerCameraMode === 'script') return;
-            if (!camLock && layerCameraMode !== 'physical') return;
+            if (!renderToImageActive && !camLock && layerCameraMode !== 'physical') return;
             if (!isFiniteArray(cam?.pos, 3) || !isFiniteArray(cam?.tgt, 3) || !isFiniteArray(cam?.up, 3)) {
                 return;
             }
@@ -8268,22 +8299,7 @@
             copyMaxArrayToWorld(cameraTargetWorld, cam.tgt);
             camera.lookAt(cameraTargetWorld);
 
-            if (wantOrtho) {
-                // viewWidth from Max (world units) defines the visible horizontal span
-                const vw = Number.isFinite(cam.viewWidth) && cam.viewWidth > 0 ? cam.viewWidth : 500;
-                const aspect = innerWidth / innerHeight;
-                camera.left = -vw / 2;
-                camera.right = vw / 2;
-                camera.top = vw / (2 * aspect);
-                camera.bottom = -vw / (2 * aspect);
-                camera.near = -100000;
-                camera.far = 100000;
-            } else if (Number.isFinite(cam.fov) && cam.fov > 0 && cam.fov < 170) {
-                const aspect = innerWidth / innerHeight;
-                const hRad = cam.fov * Math.PI / 180;
-                camera.fov = 2 * Math.atan(Math.tan(hRad / 2) / aspect) * 180 / Math.PI;
-            }
-            applyCameraClipOverrides(camera);
+            applyCameraProjectionFromMax(cam);
             controls.target.copy(cameraTargetWorld);
             syncOrbitNavigationFeel();
 
@@ -11045,9 +11061,9 @@
             }
             if (renderToImageActive && pendingRenderToImage) {
                 const syncReady = latestAppliedSyncFrame > pendingRenderToImage.observedSyncFrame;
-                const settledEnough = performance.now() >= (pendingRenderToImage.startedAtMs + 100);
+                const settledEnough = performance.now() >= (pendingRenderToImage.startedAtMs + pendingRenderToImage.warmupMs);
                 const timedOut = performance.now() >= pendingRenderToImage.syncDeadlineMs;
-                if (syncReady || settledEnough || timedOut) {
+                if ((syncReady && settledEnough) || timedOut) {
                     const renderTimeSeconds = pendingRenderToImage.renderTimeSeconds;
                     pendingRenderToImage = null;
                     requestAnimationFrame(() => {
@@ -11419,8 +11435,6 @@
 
         // ── Render to Image (production render) ──────────────
         let savedPerformanceSettings = null;
-        let renderToImageActive = false;
-        let pendingRenderToImage = null;
         let savedRenderToImageState = null;
 
         function renderCurrentFrameOnce(renderTimeSeconds = null) {
@@ -11463,10 +11477,14 @@
             const h = msg.height || innerHeight;
             const frameNumber = Number.isFinite(msg.frame) ? msg.frame : 0;
             const fps = Number.isFinite(msg.fps) && msg.fps > 0 ? msg.fps : 30;
+            const warmupMs = Number.isFinite(msg.warmupMs) ? Math.max(0, msg.warmupMs) : 250;
             renderToImageActive = true;
             pendingRenderToImage = {
                 observedSyncFrame: latestAppliedSyncFrame,
                 renderTimeSeconds: frameNumber / fps,
+                width: w,
+                height: h,
+                warmupMs,
                 startedAtMs: performance.now(),
                 syncDeadlineMs: performance.now() + 10000,
             };
@@ -11478,7 +11496,7 @@
                     el.style.display = 'none';
                 }
             }
-            // Transparent background for alpha channel
+            // Transparent background for alpha channel.
             document.body.style.background = 'transparent';
 
             // Save and bypass all performance throttling
@@ -11509,7 +11527,16 @@
             // Set renderer to exact requested resolution, pixel ratio 1:1
             renderer.setPixelRatio(1);
             renderer.setSize(w, h);
-            camera.aspect = w / h;
+            if (camera.isPerspectiveCamera) {
+                camera.aspect = w / h;
+            } else {
+                const viewWidth = Math.max(0.001, camera.right - camera.left);
+                const aspect = w / h;
+                camera.left = -viewWidth / 2;
+                camera.right = viewWidth / 2;
+                camera.top = viewWidth / (2 * aspect);
+                camera.bottom = -viewWidth / (2 * aspect);
+            }
             camera.updateProjectionMatrix();
             ssgiFx.resize();
             if (splatOverlay?.renderer) {

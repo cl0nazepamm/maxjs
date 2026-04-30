@@ -14,7 +14,9 @@ extern void StopMaxJSActiveShade();
 extern HWND GetMaxJSWebViewHWND();
 extern void ReparentMaxJSPanel(HWND newParent);
 extern void RestoreMaxJSPanel();
-extern bool RenderMaxJSFrameToBitmap(Bitmap* target, int width, int height, TimeValue t, RendProgressCallback* prog);
+extern bool RenderMaxJSFrameToBitmap(Bitmap* target, int width, int height, TimeValue t,
+                                     INode* renderViewNode, const ViewParams* renderViewParams,
+                                     RendProgressCallback* prog);
 
 // ══════════════════════════════════════════════════════════════
 //  ThreeJS Interactive Render (ActiveShade)
@@ -99,6 +101,9 @@ class ThreeJSRenderer : public Renderer {
     int renderHeight_ = 0;
     bool stopRequested_ = false;
     bool inMaterialEditor_ = false;
+    INode* renderViewNode_ = nullptr;
+    ViewParams renderViewParams_ = {};
+    bool haveRenderViewParams_ = false;
 
 public:
     ThreeJSRenderer() {}
@@ -126,12 +131,15 @@ public:
     }
 
     // ── Renderer core ────────────────────────────────────────
-    int Open(INode*, INode*, ViewParams*, RendParams& rp, HWND,
+    int Open(INode*, INode* vnode, ViewParams* viewPar, RendParams& rp, HWND,
              DefaultLight* = nullptr, int = 0, RendProgressCallback* = nullptr) override {
         renderWidth_ = rp.width;
         renderHeight_ = rp.height;
         stopRequested_ = false;
         inMaterialEditor_ = rp.inMtlEdit != FALSE;
+        renderViewNode_ = vnode;
+        haveRenderViewParams_ = viewPar != nullptr;
+        if (viewPar) renderViewParams_ = *viewPar;
         if (inMaterialEditor_) {
             return 1;
         }
@@ -142,7 +150,7 @@ public:
     }
 
     int Render(TimeValue t, Bitmap* tobm, FrameRendParams&, HWND,
-               RendProgressCallback* prog = nullptr, ViewParams* = nullptr) override {
+               RendProgressCallback* prog = nullptr, ViewParams* viewPar = nullptr) override {
         if (stopRequested_ || !tobm) return 0;
 
         int w = tobm->Width();
@@ -160,13 +168,16 @@ public:
 
         if (prog) prog->SetTitle(_T("three.js — rendering frame..."));
 
-        bool ok = RenderMaxJSFrameToBitmap(tobm, w, h, t, prog);
+        const ViewParams* effectiveViewParams = viewPar ? viewPar : (haveRenderViewParams_ ? &renderViewParams_ : nullptr);
+        bool ok = RenderMaxJSFrameToBitmap(tobm, w, h, t, renderViewNode_, effectiveViewParams, prog);
         return ok ? 1 : 0;
     }
 
     void Close(HWND, RendProgressCallback* = nullptr) override {
         stopRequested_ = false;
         inMaterialEditor_ = false;
+        renderViewNode_ = nullptr;
+        haveRenderViewParams_ = false;
     }
 
     RendParamDlg* CreateParamDialog(IRendParams*, BOOL = FALSE) override {

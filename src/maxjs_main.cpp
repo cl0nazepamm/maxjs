@@ -5445,6 +5445,62 @@ static bool GetSceneCameraData(INode* camNode, TimeValue t, CameraData& cam) {
     return true;
 }
 
+static bool GetRenderViewCameraData(INode* renderViewNode, const ViewParams* viewPar,
+                                    TimeValue t, CameraData& cam) {
+    CameraData nodeCam = {};
+    const bool haveNodeCamera = renderViewNode && GetSceneCameraData(renderViewNode, t, nodeCam);
+
+    if (!viewPar) {
+        if (!haveNodeCamera) return false;
+        cam = nodeCam;
+        return true;
+    }
+
+    Matrix3 camTM = Inverse(viewPar->affineTM);
+    Point3 pos = camTM.GetTrans();
+    Point3 fwd = -Normalize(camTM.GetRow(2));
+    Point3 up = Normalize(camTM.GetRow(1));
+
+    float targetDist = viewPar->distance;
+    if (renderViewNode && renderViewNode->GetTarget()) {
+        Point3 tgtPos = renderViewNode->GetTarget()->GetNodeTM(t).GetTrans();
+        targetDist = Length(tgtPos - pos);
+    }
+    if (targetDist < 1.0f) targetDist = 100.0f;
+    Point3 tgt = pos + fwd * targetDist;
+
+    cam.pos[0] = pos.x;    cam.pos[1] = pos.y;    cam.pos[2] = pos.z;
+    cam.target[0] = tgt.x; cam.target[1] = tgt.y; cam.target[2] = tgt.z;
+    cam.up[0] = up.x;      cam.up[1] = up.y;      cam.up[2] = up.z;
+
+    cam.perspective = viewPar->projType != 1; // PROJ_PARALLEL == 1
+    cam.fov = viewPar->fov > 1.0e-6f
+        ? viewPar->fov * (180.0f / 3.14159265f)
+        : (haveNodeCamera ? nodeCam.fov : 60.0f);
+    cam.viewWidth = 0.0f;
+    if (!cam.perspective) {
+        if (haveNodeCamera && !nodeCam.perspective && nodeCam.viewWidth > 1.0e-4f) {
+            cam.viewWidth = nodeCam.viewWidth;
+        } else if (viewPar->zoom > 1.0e-6f) {
+            cam.viewWidth = 2.0f / viewPar->zoom;
+        } else {
+            cam.viewWidth = std::max(1.0f, targetDist * 2.0f);
+        }
+    }
+
+    cam.dofEnabled = false;
+    cam.dofFocusDistance = 0.0f;
+    cam.dofFocalLength = 0.0f;
+    cam.dofBokehScale = 0.0f;
+    if (haveNodeCamera && nodeCam.dofEnabled) {
+        cam.dofEnabled = nodeCam.dofEnabled;
+        cam.dofFocusDistance = nodeCam.dofFocusDistance;
+        cam.dofFocalLength = nodeCam.dofFocalLength;
+        cam.dofBokehScale = nodeCam.dofBokehScale;
+    }
+    return true;
+}
+
 static bool IsSceneCameraNode(INode* node) {
     if (!node) return false;
     ObjectState os = node->EvalWorldState(GetCOREInterface()->GetTime());
@@ -6954,6 +7010,8 @@ public:
     ULONGLONG lastMaterialInteractionTick_ = 0;
     ULONGLONG lastMaterialLivePollTick_ = 0;
     CameraData lastSentCamera_ = {};
+    CameraData renderCameraOverride_ = {};
+    bool renderCameraOverrideActive_ = false;
     ULONG lockedCameraHandle_ = 0;  // 0 = viewport (default), nonzero = scene camera handle
     SceneEventNamespace::CallbackKey fastNodeEventCallbackKey_ = 0;
     bool callbacksRegistered_ = false;
@@ -10233,6 +10291,10 @@ public:
     }
 
     void GetActiveCamera(CameraData& cam) {
+        if (renderCameraOverrideActive_) {
+            cam = renderCameraOverride_;
+            return;
+        }
         if (lockedCameraHandle_ != 0) {
             Interface* ip = GetCOREInterface();
             INode* camNode = ip ? ip->GetINodeByHandle(lockedCameraHandle_) : nullptr;
@@ -15301,6 +15363,7 @@ public:
 
     HANDLE renderImageEvent_ = nullptr;  // signaled when JS confirms frame rendered
     bool renderLocked_ = false;          // panel is locked to render resolution
+    bool renderImageWarmed_ = false;     // first production capture needs camera/sync settle time
     RECT preRenderRect_ = {};            // saved window rect before render
     LONG preRenderStyle_ = 0;            // saved window style before render
 
@@ -15350,13 +15413,16 @@ public:
 
     // Render a single frame at the given resolution and write to a Max Bitmap.
     // Called from ThreeJSRenderer::Render() on the main thread.
-    bool RenderFrameToBitmap(Bitmap* target, int width, int height, TimeValue t, RendProgressCallback* prog) {
+    bool RenderFrameToBitmap(Bitmap* target, int width, int height, TimeValue t,
+                             INode* renderViewNode, const ViewParams* renderViewParams,
+                             RendProgressCallback* prog) {
         if (!webview_ || !target) return false;
 
         auto restoreRenderState = [this]() {
             if (webview_) {
                 webview_->PostWebMessageAsJson(L"{\"type\":\"render_to_image_done\"}");
             }
+            renderCameraOverrideActive_ = false;
             UnlockRenderSize();
             SetWebViewBackgroundTransparent(false);
         };
@@ -15379,7 +15445,8 @@ public:
             }
         }
 
-        // Lock panel to render resolution and set transparent background for alpha
+        // Lock panel to render resolution and keep the WebView controller transparent.
+        // The JS render path decides whether the scene/background is opaque or alpha.
         LockToRenderSize(width, height);
         SetWebViewBackgroundTransparent(true);
         if (prog) prog->SetTitle(_T("three.js — syncing frame..."));
@@ -15395,16 +15462,27 @@ public:
         // Tell JS to render at the requested resolution
         int fps = GetFrameRate();
         int frame = t / GetTicksPerFrame();
-        wchar_t msg[256];
-        swprintf_s(msg, L"{\"type\":\"render_to_image\",\"width\":%d,\"height\":%d,\"frame\":%d,\"fps\":%d}",
-                   width, height, frame, fps);
+        const int warmupMs = renderImageWarmed_ ? 250 : 2000;
+        wchar_t msg[320];
+        swprintf_s(msg, L"{\"type\":\"render_to_image\",\"width\":%d,\"height\":%d,\"frame\":%d,\"fps\":%d,\"warmupMs\":%d}",
+                   width, height, frame, fps, warmupMs);
 
-        // Force a fresh scene sync at the requested frame before asking JS to render.
+        // Force a fresh scene sync at the requested frame, using 3ds Max's render
+        // camera/view state instead of the live viewport or max.js UI camera lock.
         Interface* ip = GetCOREInterface();
         TimeValue previousTime = ip ? ip->GetTime() : t;
         if (ip && previousTime != t) ip->SetTime(t, FALSE);
-        if (useBinary_) SendFullSyncBinary(); else SendFullSync();
+        CameraData renderCam = {};
+        renderCameraOverrideActive_ = GetRenderViewCameraData(renderViewNode, renderViewParams, t, renderCam);
+        if (renderCameraOverrideActive_) {
+            renderCameraOverride_ = renderCam;
+        }
+
+        // Tell JS to resize into render mode before the full sync camera lands.
+        // Otherwise horizontal FOV is converted with the docked panel aspect and
+        // then appears to zoom when the canvas is resized to the final image size.
         webview_->PostWebMessageAsJson(msg);
+        if (useBinary_) SendFullSyncBinary(); else SendFullSync();
 
         // Pump messages until JS signals ready or timeout (10 seconds)
         const DWORD timeout = 10000;
@@ -15512,6 +15590,7 @@ public:
         // Tell JS to restore, unlock panel, restore opaque background
         if (ip && previousTime != t) ip->SetTime(previousTime, FALSE);
         restoreRenderState();
+        if (captureOk) renderImageWarmed_ = true;
 
         return captureOk;
     }
@@ -16355,7 +16434,14 @@ void RestoreMaxJSPanel() {
 bool RenderMaxJSFrameToBitmap(Bitmap* target, int width, int height, TimeValue t, RendProgressCallback* prog) {
     EnsurePanel();
     if (!g_panel) return false;
-    return g_panel->RenderFrameToBitmap(target, width, height, t, prog);
+    return g_panel->RenderFrameToBitmap(target, width, height, t, nullptr, nullptr, prog);
+}
+bool RenderMaxJSFrameToBitmap(Bitmap* target, int width, int height, TimeValue t,
+                              INode* renderViewNode, const ViewParams* renderViewParams,
+                              RendProgressCallback* prog) {
+    EnsurePanel();
+    if (!g_panel) return false;
+    return g_panel->RenderFrameToBitmap(target, width, height, t, renderViewNode, renderViewParams, prog);
 }
 
 static void RegisterMaxScript() {

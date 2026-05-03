@@ -402,7 +402,7 @@ export function createMaxJSAudioSystem({ THREE, parent, getActiveCamera }) {
                     if (entry.loadVersion !== version) return;
                     entry.buffer = null;
                     stopPlayback(entry, { clearOneShot: true });
-                    console.warn('[MaxJS audio] buffer load failed', error);
+                    console.warn('[max.js audio] buffer load failed', error);
                 });
             return;
         }

@@ -24,7 +24,7 @@ public:
     const TCHAR* NonLocalizedClassName() override { return _T("Splat Origin"); }
     SClass_ID SuperClassID() override { return GEOMOBJECT_CLASS_ID; }
     Class_ID ClassID() override { return THREEJS_SPLAT_CLASS_ID; }
-    const TCHAR* Category() override { return _T("MaxJS"); }
+    const TCHAR* Category() override { return _T("max.js"); }
     const TCHAR* InternalName() override { return _T("ThreeJSSplatOrigin"); }
     HINSTANCE HInstance() override { return hInstance; }
 };

@@ -16,7 +16,7 @@ function formatMs(ms) {
 
 export function createPerfHud(infoEl) {
     const state = {
-        statusText: 'MaxJS - booting...',
+        statusText: 'max.js - booting...',
         /** Shown after the main line; does not disable sync stats (unlike setStatus). */
         projectBanner: '',
         transport: 'waiting',
@@ -62,7 +62,7 @@ export function createPerfHud(infoEl) {
         }
 
         infoEl.textContent =
-            `MaxJS [${state.transport}] f${state.frameId || '-'} ${state.fps}fps ` +
+            `max.js [${state.transport}] f${state.frameId || '-'} ${state.fps}fps ` +
             `| nodes ${state.nodeCount} ` +
             `| inst ${state.instanceCount} ` +
             `| mat ${state.materialCount}/${state.materialTemplateCount} ` +

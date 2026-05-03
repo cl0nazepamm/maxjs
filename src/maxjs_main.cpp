@@ -71,8 +71,8 @@
 using namespace Microsoft::WRL;
 
 #define MAXJS_CLASS_ID  Class_ID(0x7F3A9B01, 0x4E2D8C05)
-#define MAXJS_NAME      _T("MaxJS")
-#define MAXJS_CATEGORY  _T("MaxJS")
+#define MAXJS_NAME      _T("max.js")
+#define MAXJS_CATEGORY  _T("max.js")
 
 #define SYNC_TIMER_ID             1
 #define SYNC_INTERVAL_MS          33   // background structural/material timer
@@ -7394,7 +7394,7 @@ public:
         }
         webview_->NavigateToString(L"<html><body style='background:#1a1a2e;color:#aaa;"
             L"font:14px monospace;display:flex;align-items:center;justify-content:center;"
-            L"height:100vh'><div>MaxJS: web files not found</div></body></html>");
+            L"height:100vh'><div>max.js: web files not found</div></body></html>");
     }
 
     std::wstring GetWebDir() {
@@ -10440,7 +10440,10 @@ public:
             fastDirtyHandles_.insert(handle);
             changed = true;
         }
-        if (changed) QueueFastFlush();
+        if (changed) {
+            MarkInteractiveActivity();
+            QueueFastFlush();
+        }
     }
 
     // Deforming-mesh live check — polled every viewport redraw to pick up
@@ -11116,6 +11119,10 @@ public:
 
     bool ShouldUseTimelineGeometryFastLane() const {
         return IsAnimationPlaying() || ShouldSuppressSelectedGeometryDuringTimeline();
+    }
+
+    bool ShouldPollSelectedGeometryLive() const {
+        return IsSubObjectEditingActive() || ShouldFavorInteractivePerformance();
     }
 
     bool ShouldDeferFullSyncForInteraction(ULONGLONG now) const {
@@ -11951,6 +11958,7 @@ public:
                 haveLastPlaybackPollTime_ = false;
                 MarkCameraDirtyIfChanged(false);
                 PollSelectedTransformGizmoLive();
+                if (ShouldPollSelectedGeometryLive()) CheckSelectedGeometryLive();
                 PumpTimelineSyncFromTimer();
                 CheckSkinnedGeometryLive();
             }
@@ -16368,7 +16376,6 @@ void MaxJSFastNodeEventCallback::TopologyChanged(NodeKeyTab& nodes) {
 void MaxJSFastRedrawCallback::proc(Interface*) {
     if (!owner_) return;
     const bool animPlaying = owner_->IsAnimationPlaying();
-    const bool favorInteractive = !animPlaying && owner_->ShouldFavorInteractivePerformance();
 
     // Camera is cheap and should not be throttled by selected-transform or
     // geometry lanes; keep it on its own immediate dirty check.
@@ -16379,7 +16386,7 @@ void MaxJSFastRedrawCallback::proc(Interface*) {
     // During playback, high-polling-rate mouse movement can multiply redraw
     // callbacks without advancing time. Let TimeChanged/timer own playback
     // sync, and use redraw as a capped helper for real interactive edits.
-    if (!animPlaying && favorInteractive && owner_->ConsumeRedrawLivePollSlot()) {
+    if (!animPlaying && owner_->ShouldPollSelectedGeometryLive() && owner_->ConsumeRedrawLivePollSlot()) {
         owner_->MarkSelectedTransformsDirty();
         owner_->CheckSelectedGeometryLive();
         owner_->CheckSkinnedGeometryLive();
@@ -16496,20 +16503,20 @@ static void RegisterMaxScript() {
     swprintf_s(script, 4096,
         L"global MaxJS_HWND = %lld\r\n"
         L"fn MaxJS_KillPanel = ( windows.sendMessage MaxJS_HWND %d 0 0 )\r\n"
-        L"macroScript MaxJS_Toggle category:\"MaxJS\" tooltip:\"Toggle MaxJS Viewport\" buttonText:\"MaxJS\" (\r\n"
+        L"macroScript MaxJS_Toggle category:\"max.js\" tooltip:\"Toggle max.js Viewport\" buttonText:\"max.js\" (\r\n"
         L"    windows.sendMessage MaxJS_HWND %d 0 0\r\n"
         L")\r\n"
-        L"macroScript MaxJS_Kill category:\"MaxJS\" tooltip:\"Kill MaxJS Viewport\" buttonText:\"Kill MaxJS\" (\r\n"
+        L"macroScript MaxJS_Kill category:\"max.js\" tooltip:\"Kill max.js Viewport\" buttonText:\"Kill max.js\" (\r\n"
         L"    windows.sendMessage MaxJS_HWND %d 0 0\r\n"
         L")\r\n"
-        L"if menuMan != undefined and menuMan.findMenu \"MaxJS\" == undefined do (\r\n"
-        L"    local subMenu = menuMan.createMenu \"MaxJS\"\r\n"
-        L"    local toggleItem = menuMan.createActionItem \"MaxJS_Toggle\" \"MaxJS\"\r\n"
-        L"    local killItem = menuMan.createActionItem \"MaxJS_Kill\" \"MaxJS\"\r\n"
+        L"if menuMan != undefined and menuMan.findMenu \"max.js\" == undefined do (\r\n"
+        L"    local subMenu = menuMan.createMenu \"max.js\"\r\n"
+        L"    local toggleItem = menuMan.createActionItem \"MaxJS_Toggle\" \"max.js\"\r\n"
+        L"    local killItem = menuMan.createActionItem \"MaxJS_Kill\" \"max.js\"\r\n"
         L"    subMenu.addItem toggleItem -1\r\n"
         L"    subMenu.addItem killItem -1\r\n"
         L"    local mainMenu = menuMan.getMainMenuBar()\r\n"
-        L"    local subMenuItem = menuMan.createSubMenuItem \"MaxJS\" subMenu\r\n"
+        L"    local subMenuItem = menuMan.createSubMenuItem \"max.js\" subMenu\r\n"
         L"    mainMenu.addItem subMenuItem 0\r\n"
         L"    menuMan.updateMenuBar()\r\n"
         L")\r\n",

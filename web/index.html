@@ -3,7 +3,7 @@
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>MaxJS</title>
+    <title>max.js</title>
     <link rel="icon" href="data:,">
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -1294,12 +1294,12 @@
 </head>
 <body>
     <div id="hud">
-        <div id="info">MaxJS</div>
+        <div id="info">max.js</div>
     </div>
     <aside id="rightRail" aria-label="Panel controls">
         <div class="rail-group">
             <div class="rail-group-label">Scene</div>
-            <button id="btnLayersPanel" class="rail-btn maxonly devonly" title="Load logic or custom effects, supports inter layer messaging." aria-label="Layers">
+            <button id="btnLayersPanel" class="rail-btn maxonly devonly" title="Load scene scripts or custom effects, supports inter layer messaging." aria-label="Scene Scripts (inlines)">
                 <svg class="rail-btn-logo-lg" viewBox="0 0 157 293" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" style="fill-rule:evenodd;clip-rule:evenodd;stroke-linejoin:round;stroke-miterlimit:2">
                     <path fill="currentColor" d="M78.041,292.681c0,0 -4.398,-33.779 -10.937,-45.784c-5.947,-10.919 -34.8,-16.618 -43.787,-18.399c-8.987,-1.781 -23.316,-1.526 -23.316,-1.526c0,0 50.071,-3.146 57.464,-11.695c8.436,-9.756 10.996,-34.004 11.844,-40.109c0.848,-6.105 4.578,-98.776 4.578,-98.776l4.155,-76.392l4.155,76.392c0,0 3.731,92.671 4.578,98.776c0.848,6.105 3.407,30.353 11.844,40.109c7.393,8.549 57.464,11.695 57.464,11.695c0,0 -37.567,2.399 -23.316,1.526c14.251,-0.873 -28.138,0.93 -43.787,18.399c-9.122,10.182 -10.937,45.784 -10.937,45.784Z"/>
                 </svg>
@@ -1467,6 +1467,9 @@
             "./vendor/three-r184/examples/objects/Sky.js": {
                 "three": "./vendor/three-r184/build/three.module.js"
             },
+            "./vendor/three-r184/examples/lighting/LightProbeGrid.js": {
+                "three": "./vendor/three-r184/build/three.module.js"
+            },
             "https://maxjs-assets.local/": {
                 "three": "https://maxjs.local/vendor/three-r184/build/three.webgpu.js",
                 "three-std": "https://maxjs.local/vendor/three-r184/build/three.module.js",
@@ -1476,6 +1479,9 @@
                 "@dimforge/rapier3d-compat": "https://maxjs.local/vendor/rapier/rapier.es.js"
             },
             "https://maxjs.local/vendor/three-r184/examples/objects/Sky.js": {
+                "three": "https://maxjs.local/vendor/three-r184/build/three.module.js"
+            },
+            "https://maxjs.local/vendor/three-r184/examples/lighting/LightProbeGrid.js": {
                 "three": "https://maxjs.local/vendor/three-r184/build/three.module.js"
             }
         }
@@ -1489,6 +1495,7 @@
         import { EXRLoader } from 'three/addons/loaders/EXRLoader.js';
         import { MaterialXLoader } from 'three/addons/loaders/MaterialXLoader.js';
         import { LightProbeGenerator } from 'three/addons/lights/LightProbeGenerator.js';
+        import { LightProbeGrid } from 'three/addons/lighting/LightProbeGrid.js';
         import { RectAreaLightTexturesLib } from 'three/addons/lights/RectAreaLightTexturesLib.js';
         import { hashBlur } from 'three/addons/tsl/display/hashBlur.js';
         import { XRButton } from 'three/addons/webxr/XRButton.js';
@@ -1756,7 +1763,7 @@
                     configureRenderer(nextRenderer);
                     await initializeRenderer(nextRenderer);
                 } catch (error) {
-                    console.warn('MaxJS WebGPU init failed, retrying with forced WebGL2 backend.', error);
+                    console.warn('max.js WebGPU init failed, retrying with forced WebGL2 backend.', error);
                     disposeRenderer(nextRenderer);
                     nextRenderer = new THREE.WebGPURenderer({ antialias: true, alpha: true, forceWebGL: true });
                     backendLabel = 'WebGL2 fallback';
@@ -1774,7 +1781,7 @@
             ({ renderer, backendLabel: rendererBackendLabel } = await createRenderer());
         } catch (error) {
             const message = error?.message || String(error);
-            document.getElementById('info').textContent = `MaxJS - renderer init failed: ${message}`;
+            document.getElementById('info').textContent = `max.js - renderer init failed: ${message}`;
             throw error;
         }
 
@@ -1980,7 +1987,7 @@
         let splatMutationQueue = Promise.resolve();
         let splatOverlay = null;
         const perfHud = createPerfHud(document.getElementById('info'));
-        perfHud.setStatus(`MaxJS - ${rendererBackendLabel} renderer ready`);
+        perfHud.setStatus(`max.js - ${rendererBackendLabel} renderer ready`);
 
         const DEBUG_STORAGE_KEY = 'maxjs_debug';
         const PROFILE_SCENE_STORAGE_KEY = 'maxjs_profile_scene';
@@ -2021,7 +2028,7 @@
             environmentVisible: false,
             hiddenBackgroundColor,
             onError(message) {
-                perfHud.setStatus(`MaxJS - ${message}`);
+                perfHud.setStatus(`max.js - ${message}`);
             },
         });
         // Default camera light available for contact shadows from the start
@@ -2172,13 +2179,13 @@
 
             const overlay = await ensureSplatOverlay();
             if (!overlay) return;
-            perfHud.setStatus(`MaxJS - Loading splat...`);
+            perfHud.setStatus(`max.js - Loading splat...`);
             const mesh = new Spark.SplatMesh({ url });
             mesh.name = splat.n || `Splat ${handle}`;
             overlay.scene.add(mesh);
             splatHandleMap.set(handle, { url, mesh });
             applySplatTransform(mesh, splat);
-            perfHud.setStatus(`MaxJS - Splat ready: ${mesh.name}`);
+            perfHud.setStatus(`max.js - Splat ready: ${mesh.name}`);
         }
 
         function reconcileSplats(splats = []) {
@@ -2260,6 +2267,8 @@
         let currentEnvParams = null;
         let currentHdriEnvMap = null;
         let hasLightProbeData = false;
+        let lightProbeGrid = null;
+        let hasLightProbeGridData = false;
         let hdriLoadGeneration = 0;
 
         // Local HDRI override (independent of Max environment)
@@ -2292,16 +2301,134 @@
         }
 
         function applyLightProbeState() {
-            lightProbe.intensity = lightProbeEnabled ? lightProbeIntensity : 0.0;
+            const useGrid = lightProbeEnabled && hasLightProbeGridData && !!lightProbeGrid;
+            lightProbe.intensity = lightProbeEnabled && !useGrid ? lightProbeIntensity : 0.0;
+            if (lightProbeGrid) lightProbeGrid.visible = useGrid;
         }
 
         function clearLightProbe() {
             lightProbe.copy(new THREE.LightProbe());
             hasLightProbeData = false;
+            hasLightProbeGridData = false;
+            if (lightProbeGrid) {
+                if (lightProbeGrid.parent) lightProbeGrid.parent.remove(lightProbeGrid);
+                lightProbeGrid.dispose?.();
+                lightProbeGrid = null;
+            }
             applyLightProbeState();
         }
 
+        function supportsWebGLLightProbeGrid() {
+            return renderer?.isWebGLRenderer === true && typeof LightProbeGrid === 'function';
+        }
+
+        function computeLightProbeGridBounds(target = new THREE.Box3()) {
+            target.makeEmpty();
+            for (const mesh of nodeMap.values()) {
+                if (!mesh?.visible || !mesh.isMesh || !mesh.geometry) continue;
+                const position = mesh.geometry.getAttribute?.('position');
+                if (!position || position.count <= 0) continue;
+                target.expandByObject(mesh);
+            }
+            if (target.isEmpty()) {
+                target.setFromCenterAndSize(
+                    new THREE.Vector3(0, 0, 0),
+                    new THREE.Vector3(200, 120, 200)
+                );
+            } else {
+                const size = target.getSize(new THREE.Vector3());
+                const pad = Math.max(10, Math.max(size.x, size.y, size.z) * 0.08);
+                target.expandByScalar(pad);
+            }
+            return target;
+        }
+
+        function chooseLightProbeGridResolution(size) {
+            const maxDim = Math.max(size.x, size.y, size.z, 1);
+            const axisCount = (axisSize) => THREE.MathUtils.clamp(Math.round(2 + 3 * axisSize / maxDim), 2, 5);
+            return new THREE.Vector3(
+                axisCount(size.x),
+                axisCount(size.y),
+                axisCount(size.z)
+            );
+        }
+
+        async function updateLightProbeGridFromScene(hdrTex, probeSignature, loadGeneration) {
+            if (!supportsWebGLLightProbeGrid()) return false;
+
+            const bounds = computeLightProbeGridBounds(new THREE.Box3());
+            const center = bounds.getCenter(new THREE.Vector3());
+            const size = bounds.getSize(new THREE.Vector3());
+            const resolution = chooseLightProbeGridResolution(size);
+            const nextGrid = new LightProbeGrid(
+                Math.max(size.x, 1),
+                Math.max(size.y, 1),
+                Math.max(size.z, 1),
+                resolution.x,
+                resolution.y,
+                resolution.z
+            );
+            nextGrid.name = '__maxjs_light_probe_grid__';
+            nextGrid.position.copy(center);
+            nextGrid.userData.maxjsExcludeFromRuntimeSnapshot = true;
+            nextGrid.userData.volumetricBoundsBypass = true;
+
+            const previousGrid = lightProbeGrid;
+            if (previousGrid?.parent) previousGrid.parent.remove(previousGrid);
+
+            const savedProbeIntensity = lightProbe.intensity;
+            const savedBackground = scene.background;
+            const savedBackgroundRotation = scene.backgroundRotation.clone();
+            lightProbe.intensity = 0.0;
+            if (hdrTex) scene.background = hdrTex;
+
+            try {
+                scene.updateMatrixWorld(true);
+                const maxDim = Math.max(size.x, size.y, size.z, 1);
+                nextGrid.bake(renderer, scene, {
+                    cubemapSize: 16,
+                    near: 0.1,
+                    far: Math.max(1000, maxDim * 4),
+                });
+
+                if (loadGeneration !== hdriLoadGeneration || probeSignature !== currentHdriProbeSignature) {
+                    nextGrid.dispose?.();
+                    if (previousGrid) scene.add(previousGrid);
+                    return true;
+                }
+
+                if (previousGrid) previousGrid.dispose?.();
+                lightProbeGrid = nextGrid;
+                hasLightProbeGridData = true;
+                hasLightProbeData = true;
+                scene.add(lightProbeGrid);
+                applyLightProbeState();
+                return true;
+            } catch (error) {
+                nextGrid.dispose?.();
+                if (previousGrid) {
+                    scene.add(previousGrid);
+                    lightProbeGrid = previousGrid;
+                    hasLightProbeGridData = true;
+                    applyLightProbeState();
+                    maxjsDebugWarn('max.js WebGL light probe grid bake failed; keeping previous grid:', error);
+                    return true;
+                }
+                hasLightProbeGridData = false;
+                maxjsDebugWarn('max.js WebGL light probe grid bake failed:', error);
+                return false;
+            } finally {
+                scene.background = savedBackground;
+                scene.backgroundRotation.copy(savedBackgroundRotation);
+                if (!hasLightProbeGridData) lightProbe.intensity = savedProbeIntensity;
+            }
+        }
+
         async function updateLightProbeFromHDRI(hdrTex, probeSignature, loadGeneration) {
+            if (await updateLightProbeGridFromScene(hdrTex, probeSignature, loadGeneration)) {
+                return;
+            }
+
             const captureScene = new THREE.Scene();
             captureScene.background = hdrTex;
             captureScene.backgroundRotation.copy(scene.environmentRotation);
@@ -2317,7 +2444,7 @@
 
             if (typeof CubeRenderTargetCtor !== 'function' || typeof CubeCameraCtor !== 'function') {
                 hasLightProbeData = false;
-                maxjsDebugWarn('MaxJS light probe generation unavailable: missing cube capture constructors');
+                maxjsDebugWarn('max.js light probe generation unavailable: missing cube capture constructors');
                 return;
             }
 
@@ -2337,10 +2464,11 @@
 
                 lightProbe.copy(nextProbe);
                 hasLightProbeData = true;
+                hasLightProbeGridData = false;
                 applyLightProbeState();
             } catch (error) {
                 hasLightProbeData = false;
-                maxjsDebugWarn('MaxJS light probe generation failed:', error);
+                maxjsDebugWarn('max.js light probe generation failed:', error);
             } finally {
                 cubeRenderTarget.dispose();
             }
@@ -2408,7 +2536,7 @@
             tex.colorSpace = colorSpace;
             applyTextureTransform(tex, xf);
             tex.needsUpdate = true;
-            console.warn('MaxJS missing texture, using fallback:', url);
+            console.warn('max.js missing texture, using fallback:', url);
         }
 
         function configureGradientTexture(tex) {
@@ -2992,7 +3120,7 @@
                 hdrTex.dispose();
                 ssgiFx.markEnvironmentChanged?.();
             }, undefined, (error) => {
-                console.error('MaxJS HDRI load failed', { hdriUrl, error });
+                console.error('max.js HDRI load failed', { hdriUrl, error });
                 currentHdriUrl = null;
                 currentHdriProbeSignature = null;
                 currentEnvParams = null;
@@ -3027,7 +3155,7 @@
                 const tx = db.transaction(HDRI_DB_STORE, 'readwrite');
                 tx.objectStore(HDRI_DB_STORE).put({ name: file.name, buffer: buf }, 'current');
                 db.close();
-            } catch (e) { maxjsDebugWarn('[MaxJS] HDRI stash failed:', e); }
+            } catch (e) { maxjsDebugWarn('[max.js] HDRI stash failed:', e); }
         }
 
         async function restoreStashedHdri() {
@@ -3084,7 +3212,7 @@
                 if (persist) savePostFxState();
                 syncHdriPanel();
             }, undefined, (error) => {
-                console.error('MaxJS local HDRI load failed', error);
+                console.error('max.js local HDRI load failed', error);
                 clearLocalHDRI();
             });
         }
@@ -3276,7 +3404,7 @@
                 ssgiFx.markEnvironmentChanged?.();
 
             } catch (err) {
-                console.error('[MaxJS] applySky error:', err);
+                console.error('[max.js] applySky error:', err);
             }
         }
 
@@ -4267,15 +4395,15 @@
 
         function startBridgeHandshake() {
             if (!window.chrome?.webview) return;
-            setInfoText('MaxJS - connected, waiting for sync...');
+            setInfoText('max.js - connected, waiting for sync...');
             bridge.send('ready');
             scheduleReadyRetry();
         }
 
         function reportBridgeError(prefix, err) {
             const message = err?.message || String(err);
-            console.error(`[MaxJS ${prefix}]`, err);
-            setInfoText(`MaxJS - ${prefix}: ${message}`);
+            console.error(`[max.js ${prefix}]`, err);
+            setInfoText(`max.js - ${prefix}: ${message}`);
         }
 
         function typedArrayCanStore(array, expectedLength) {
@@ -4291,7 +4419,7 @@
 
         function updateFloatGeometryAttribute(geometry, name, buffer, off, n, itemSize) {
             if (!binInRange(buffer, off, n) || n % itemSize !== 0) {
-                console.warn('[MaxJS binary] Invalid attribute range for', name);
+                console.warn('[max.js binary] Invalid attribute range for', name);
                 return false;
             }
             const source = new Float32Array(buffer, off, n);
@@ -4313,7 +4441,7 @@
 
         function updateGeometryIndexAttribute(geometry, buffer, off, n) {
             if (!binInRange(buffer, off, n)) {
-                console.warn('[MaxJS binary] Invalid index range');
+                console.warn('[max.js binary] Invalid index range');
                 return false;
             }
             const source = new Int32Array(buffer, off, n);
@@ -4329,9 +4457,9 @@
 
         bridge.on('debug', msg => {
             if (!hasInitialSync) {
-                setInfoText('MaxJS - ' + (msg.msg || 'debug'));
+                setInfoText('max.js - ' + (msg.msg || 'debug'));
             } else {
-                maxjsDebugLog('[MaxJS debug]', msg.msg || 'debug');
+                maxjsDebugLog('[max.js debug]', msg.msg || 'debug');
             }
         });
 
@@ -4589,7 +4717,7 @@
                 }
             });
         } else {
-            setInfoText('MaxJS - no bridge (standalone mode)');
+            setInfoText('max.js - no bridge (standalone mode)');
         }
         window.maxJS = bridge;
         bridge.materials = {
@@ -4733,7 +4861,7 @@
             clearTimeout(bakeUv2RequestTimer);
             bakeUv2RequestTimer = setTimeout(() => {
                 bridge.send('sync_lightmap_uvs', { reason });
-                perfHud.setStatus('MaxJS - requesting native UV2/lightmap geometry resync');
+                perfHud.setStatus('max.js - requesting native UV2/lightmap geometry resync');
             }, 50);
         }
 
@@ -5189,12 +5317,12 @@
             if (stats.length === 0) return;
             stats.sort((a, b) => b.tris - a.tris);
             const top = stats.slice(0, 10);
-            console.groupCollapsed(`[MaxJS Profile] ${stats.length} nodes, top 10 by tri count`);
+            console.groupCollapsed(`[max.js Profile] ${stats.length} nodes, top 10 by tri count`);
             console.table(top);
             const totalTris = stats.reduce((s, n) => s + n.tris, 0);
             const totalVerts = stats.reduce((s, n) => s + n.verts, 0);
             console.log(`Total: ${totalVerts} verts, ${totalTris} tris, ${stats.length} nodes`);
-            console.log('[MaxJS Profile] material registry', {
+            console.log('[max.js Profile] material registry', {
                 uniqueMaterials: materialRegistryStats.uniqueMaterials,
                 materialTemplates: materialRegistryStats.materialTemplates,
                 materialRefs: materialRegistryStats.materialRefs,
@@ -5656,15 +5784,15 @@
                         (off + n * 4) <= buffer.byteLength;
 
                     if (!inRange(nd.geo.vOff, nd.geo.vN) || !inRange(nd.geo.iOff, nd.geo.iN)) {
-                        console.warn('[MaxJS binary] Invalid vertex/index range for', nd.n);
+                        console.warn('[max.js binary] Invalid vertex/index range for', nd.n);
                         continue;
                     }
                     if (nd.geo.uvOff != null && !inRange(nd.geo.uvOff, nd.geo.uvN || 0)) {
-                        console.warn('[MaxJS binary] Invalid UV range for', nd.n);
+                        console.warn('[max.js binary] Invalid UV range for', nd.n);
                         continue;
                     }
                     if (nd.geo.uv2Off != null && !inRange(nd.geo.uv2Off, nd.geo.uv2N || 0)) {
-                        console.warn('[MaxJS binary] Invalid UV2 range for', nd.n);
+                        console.warn('[max.js binary] Invalid UV2 range for', nd.n);
                         continue;
                     }
                     const vertsCopy = new Float32Array(
@@ -5945,7 +6073,7 @@
                     // rather than round-tripping through a standalone copy.
                     if (buffer) {
                         if (!binInRange(buffer, entry.off, entry.n || 0)) {
-                            console.warn('[MaxJS binary] Invalid vertex color range for', entry.name);
+                            console.warn('[max.js binary] Invalid vertex color range for', entry.name);
                             continue;
                         }
                         current.array.set(new Float32Array(buffer, entry.off, entry.n));
@@ -5964,7 +6092,7 @@
                 let values = null;
                 if (buffer) {
                     if (!binInRange(buffer, entry.off, entry.n || 0)) {
-                        console.warn('[MaxJS binary] Invalid vertex color range for', entry.name);
+                        console.warn('[max.js binary] Invalid vertex color range for', entry.name);
                         continue;
                     }
                     // Standalone copy — the shared buffer may be released after
@@ -7123,7 +7251,7 @@
 
         document.getElementById('btnLightLink')?.addEventListener('click', () => {
             if (!isStudioMode) {
-                perfHud.setStatus('MaxJS - Light Linking is available in Studio mode only');
+                perfHud.setStatus('max.js - Light Linking is available in Studio mode only');
                 return;
             }
             setLightLinkPanelVisible(!lightLinkPanelVisible);
@@ -7323,7 +7451,7 @@
 
         document.getElementById('btnReflPaint')?.addEventListener('click', () => {
             if (!isStudioMode) {
-                perfHud.setStatus('MaxJS - Reflection Paint is available in Studio mode only');
+                perfHud.setStatus('max.js - Reflection Paint is available in Studio mode only');
                 return;
             }
             setReflPaintPanelVisible(!reflPaintPanelVisible);
@@ -7737,12 +7865,12 @@
             bakePanel.querySelector('#bake-hide')?.addEventListener('click', () => setBakePanelVisible(false));
             bakePanel.querySelector('#bake-reapply')?.addEventListener('click', () => {
                 applyBakeState(readBakeStateFromPanel(), { persist: true, rebuild: true, refreshPanel: false });
-                perfHud.setStatus('MaxJS - bake overrides reapplied');
+                perfHud.setStatus('max.js - bake overrides reapplied');
             });
             bakePanel.querySelector('#bake-sync')?.addEventListener('click', () => {
                 lastBakeUv2RequestKey = '';
                 bridge.send('sync_lightmap_uvs', { reason: 'manual' });
-                perfHud.setStatus('MaxJS - requested full scene sync for UV2/lightmaps');
+                perfHud.setStatus('max.js - requested full scene sync for UV2/lightmaps');
             });
             for (const el of bakePanel.querySelectorAll('input,select')) {
                 if (isBakeTextInput(el) || el.id === 'bake-intensity') {
@@ -8330,14 +8458,14 @@
         }
 
         function applyStandaloneCameraState(savedCamera) {
-            if (!savedCamera) { maxjsDebugLog('[MaxJS] applyStandaloneCameraState: no savedCamera'); return; }
+            if (!savedCamera) { maxjsDebugLog('[max.js] applyStandaloneCameraState: no savedCamera'); return; }
             if (!isFiniteArray(savedCamera.position, 3) ||
                 !isFiniteArray(savedCamera.up, 3) ||
                 !isFiniteArray(savedCamera.target, 3)) {
-                maxjsDebugLog('[MaxJS] applyStandaloneCameraState: invalid arrays', savedCamera);
+                maxjsDebugLog('[max.js] applyStandaloneCameraState: invalid arrays', savedCamera);
                 return;
             }
-            maxjsDebugLog('[MaxJS] applyStandaloneCameraState: applying', savedCamera.position, savedCamera.target);
+            maxjsDebugLog('[max.js] applyStandaloneCameraState: applying', savedCamera.position, savedCamera.target);
 
             const wantOrtho = savedCamera.perspective === false;
             const isOrtho = camera.isOrthographicCamera;
@@ -8622,7 +8750,7 @@
             if (status) {
                 status.textContent = window.chrome?.webview
                     ? `dist export • step ${effective.animationSampleStepFrames}f`
-                    : 'Available only inside MaxJS';
+                    : 'Available only inside max.js';
             }
             if (exportButton) {
                 exportButton.disabled = !window.chrome?.webview || !!pendingSnapshotRequestId;
@@ -8675,7 +8803,7 @@
                             && runtimeSnapshot.transformOverrides.length > 0;
                         if (layerRows > 0 && !runtimeSnapshot.jsRoot && !runtimeSnapshot.overlayRoot && !hasTransformOverrides) {
                             maxjsDebugWarn(
-                                '[MaxJS snapshot] Runtime scene has layer metadata but no serialized 3D (empty roots and no tracked orphans). '
+                                '[max.js snapshot] Runtime scene has layer metadata but no serialized 3D (empty roots and no tracked orphans). '
                                 + 'Parent effects with ctx.js.add(...) / overlay:true, or ctx.track() if you attach elsewhere.',
                             );
                         }
@@ -8688,7 +8816,7 @@
 
             pendingSnapshotRequestId = `snapshot_${Date.now()}`;
             syncSnapshotPanel();
-            setInfoText('MaxJS - writing snapshot...');
+            setInfoText('max.js - writing snapshot...');
             bridge.send('snapshot_export', {
                 requestId: pendingSnapshotRequestId,
                 snapshotBase64,
@@ -8707,7 +8835,7 @@
             pendingSnapshotRequestId = null;
             syncSnapshotPanel();
             if (msg.ok) {
-                setInfoText(`MaxJS - snapshot written: ${msg.path || 'dist'}`);
+                setInfoText(`max.js - snapshot written: ${msg.path || 'dist'}`);
             } else {
                 reportBridgeError('snapshot export', msg.error || 'snapshot export failed');
             }
@@ -8768,7 +8896,7 @@
         function restartWithRendererBackend(mode, options = {}) {
             const reason = options.reason || 'manual';
             const confirmMessage = options.confirmMessage
-                || `Restart MaxJS with ${mode === 'webgl' ? 'WebGL2' : 'WebGPU'} backend now?`;
+                || `Restart max.js with ${mode === 'webgl' ? 'WebGL2' : 'WebGPU'} backend now?`;
             if (mode === 'webgl' && reason === 'vr') {
                 sessionStorage.setItem('maxjs_force_webgl', '1');
             } else {
@@ -8788,7 +8916,7 @@
             const nextMode = isWebGLBackendActive() ? 'webgpu' : 'webgl';
             restartWithRendererBackend(nextMode, {
                 reason: 'manual',
-                confirmMessage: `Restart MaxJS with ${nextMode === 'webgl' ? 'WebGL2' : 'WebGPU'} backend now?`,
+                confirmMessage: `Restart max.js with ${nextMode === 'webgl' ? 'WebGL2' : 'WebGPU'} backend now?`,
             });
         });
 
@@ -8805,12 +8933,12 @@
         }
         btnSwitchVR?.addEventListener('click', () => {
             if (isWebGLBackendActive()) {
-                perfHud.setStatus('MaxJS - WebGL2 backend is already active for VR');
+                perfHud.setStatus('max.js - WebGL2 backend is already active for VR');
                 return;
             }
             restartWithRendererBackend('webgl', {
                 reason: 'vr',
-                confirmMessage: 'WebXR needs the WebGL backend.\n\nOnly tested on Quest 3 with VDXR (Virtual Desktop).\n\nRestart MaxJS in VR mode now?',
+                confirmMessage: 'WebXR needs the WebGL backend.\n\nOnly tested on Quest 3 with VDXR (Virtual Desktop).\n\nRestart max.js in VR mode now?',
             });
         });
         syncRendererButtonUi();
@@ -8854,7 +8982,7 @@
 
         // Toon outline is automatic — no UI button needed
 
-        // ── Layers Panel ─────────────────────────────────
+        // ── Scene Scripts Panel ──────────────────────────
         const btnLayersPanel = document.getElementById('btnLayersPanel');
         const layersPanel = document.getElementById('layersPanel');
         let layersPanelVisible = false;
@@ -9012,11 +9140,11 @@
             // no manifest write. File rename is fire-and-forget and never
             // blocks the UI or affects the visual state.
             try { _layerManagerRef?.setActive?.(layer.id, nextEnabled); }
-            catch (err) { maxjsDebugWarn('[MaxJS layer toggle] setActive failed', layer.id, err); }
+            catch (err) { maxjsDebugWarn('[max.js layer toggle] setActive failed', layer.id, err); }
             queueLayersPanelRefresh();
             _projectRuntimeRef?.setInlineLayerEnabled?.(layer.id, nextEnabled)
                 ?.catch?.(err => {
-                    maxjsDebugWarn('[MaxJS layer toggle] persist failed', layer.id, err);
+                    maxjsDebugWarn('[max.js layer toggle] persist failed', layer.id, err);
                 });
         }
 
@@ -9050,9 +9178,9 @@
             const projectReady = projectState.manifestExists === true;
             const canReleaseProject = projectState.sceneSaved === true && !projectReady;
             const emptyHtml = !projectState.sceneSaved
-                ? '<div class="layers-empty">Save the scene first. MaxJS creates <code>project.maxjs.json</code> and <code>inlines/</code> next to the <code>.max</code> file.</div>'
+                ? '<div class="layers-empty">Save the scene first. max.js creates <code>project.maxjs.json</code> and <code>inlines/</code> next to the <code>.max</code> file.</div>'
                 : !projectReady
-                    ? `<div class="layers-empty">This scene has no MaxJS project yet. Create scene-local runtime files next to the <code>.max</code> file.<div style="margin-top:10px"><button id="layersReleaseBtn">Release Project Manifest</button></div></div>`
+                    ? `<div class="layers-empty">This scene has no max.js project yet. Create scene-local runtime files next to the <code>.max</code> file.<div style="margin-top:10px"><button id="layersReleaseBtn">Release Project Manifest</button></div></div>`
                     : '<div class="layers-empty">No layers yet. Scene-local project files live in <code>project.maxjs.json</code> and <code>inlines/</code>.</div>';
 
             const renderLayerItem = (l) => `
@@ -9108,7 +9236,7 @@
             layersPanel.innerHTML = `
                 <div class="sidepanel-header">
                     <div>
-                        <div class="sidepanel-title">Layers</div>
+                        <div class="sidepanel-title">Scene Scripts (inlines)</div>
                         <div class="sidepanel-subtitle">${layers.length} tracked</div>
                     </div>
                     <div style="display:flex;gap:4px">
@@ -10160,7 +10288,7 @@
                     if (!enabled) {
                         const message = ssgiFx.getLastError();
                         if (message && (!ssgiFx.isAvailable() || section.requiresWebGPU)) {
-                            perfHud.setStatus(`MaxJS - ${section.title} unavailable: ${message}`);
+                            perfHud.setStatus(`max.js - ${section.title} unavailable: ${message}`);
                         }
                     }
                 };
@@ -10608,7 +10736,7 @@
                     }
                 }
             } catch (e) {
-                maxjsDebugWarn('MaxJS: failed to apply post-FX state', e);
+                maxjsDebugWarn('max.js: failed to apply post-FX state', e);
             }
         }
 
@@ -10626,7 +10754,7 @@
                     if (!raw) return;
                     applySavedPostFxPayload(JSON.parse(raw));
                 } catch (e) {
-                    maxjsDebugWarn('MaxJS: failed to restore post-FX state', e);
+                    maxjsDebugWarn('max.js: failed to restore post-FX state', e);
                 }
             });
         }
@@ -10703,6 +10831,9 @@
             if (isNativeWebGPU) {
                 return runtime;
             }
+            if (!('xr' in navigator)) {
+                return runtime;
+            }
 
             try {
                 renderer.xr.enabled = true;
@@ -10713,6 +10844,18 @@
                     optionalFeatures: ['local-floor', 'bounded-floor', 'hand-tracking'],
                 });
                 xrButton.style.zIndex = '100';
+                const suppressUnsupportedButton = () => {
+                    const text = String(xrButton.textContent || xrButton.innerText || '').trim().toUpperCase();
+                    if (/XR NOT SUPPORTED|XR NOT ALLOWED|WEBXR NOT AVAILABLE|WEBXR NEEDS HTTPS/.test(text)) {
+                        xrButtonObserver.disconnect();
+                        xrButton.remove();
+                        runtime.supportsXR = false;
+                    }
+                };
+                const xrButtonObserver = new MutationObserver(suppressUnsupportedButton);
+                xrButtonObserver.observe(xrButton, { childList: true, characterData: true, subtree: true });
+                setTimeout(suppressUnsupportedButton, 500);
+                setTimeout(suppressUnsupportedButton, 2000);
                 document.body.appendChild(xrButton);
 
                 const xrOrigin = new THREE.Group();
@@ -10860,7 +11003,7 @@
                     xrOrigin.add(camera);
                     syncControllerInputSources();
                     recenterOrigin();
-                    perfHud.setStatus('MaxJS - XR active');
+                    perfHud.setStatus('max.js - XR active');
                 }
 
                 function handleSessionEnd() {
@@ -10875,7 +11018,7 @@
                     camera.updateProjectionMatrix();
                     controls.enabled = !camLock;
                     controls.update();
-                    perfHud.setStatus(`MaxJS - ${rendererBackendLabel} renderer ready`);
+                    perfHud.setStatus(`max.js - ${rendererBackendLabel} renderer ready`);
                 }
 
                 function updateLocomotion(dt) {
@@ -10966,7 +11109,7 @@
                 renderer.xr.addEventListener('sessionend', handleSessionEnd);
                 runtime.update = updateLocomotion;
             } catch (error) {
-                console.warn('[MaxJS] WebXR init failed:', error);
+                console.warn('[max.js] WebXR init failed:', error);
             }
 
             return runtime;
@@ -11189,7 +11332,7 @@
                 // Pre-apply camLock from snapshotUi BEFORE handleBinaryScene to prevent fitCamera() override
                 if (meta.snapshotUi?.camLock != null) {
                     camLock = !!meta.snapshotUi.camLock;
-                    maxjsDebugLog('[MaxJS] Pre-set camLock from snapshotUi:', camLock);
+                    maxjsDebugLog('[max.js] Pre-set camLock from snapshotUi:', camLock);
                 }
                 if (meta.snapshotUi?.performance && typeof meta.snapshotUi.performance.splatsEnabled === 'boolean') {
                     performanceSettings.splatsEnabled = meta.snapshotUi.performance.splatsEnabled;
@@ -11286,7 +11429,7 @@
                             }
                             return true;
                         } catch (error) {
-                            maxjsDebugWarn('[MaxJS snapshot] layer module replay failed; falling back to baked runtimeScene', error);
+                            maxjsDebugWarn('[max.js snapshot] layer module replay failed; falling back to baked runtimeScene', error);
                             for (const id of mountedIds) {
                                 try { layerManager.remove(id); } catch {}
                             }
@@ -11365,7 +11508,7 @@
                                 }
                             }
                         } catch (err) {
-                            maxjsDebugWarn('[MaxJS snapshot] runtimeScene.jsRoot parse failed (non-fatal)', err);
+                            maxjsDebugWarn('[max.js snapshot] runtimeScene.jsRoot parse failed (non-fatal)', err);
                         }
                     }
                     if (!replayedLayerModules && meta.runtimeScene.overlayRoot) {
@@ -11377,7 +11520,7 @@
                                 overlaySnapshotRoot.updateMatrixWorld(true);
                             }
                         } catch (err) {
-                            maxjsDebugWarn('[MaxJS snapshot] runtimeScene.overlayRoot parse failed (non-fatal)', err);
+                            maxjsDebugWarn('[max.js snapshot] runtimeScene.overlayRoot parse failed (non-fatal)', err);
                         }
                     }
                     // Layers hide Max meshes and draw deformed clones under jsRoot; export still bakes Max geometry as visible.
@@ -11410,9 +11553,9 @@
                     applySavedPostFxPayload(meta.snapshotUi);
                     applyStudioState(meta.snapshotUi.studio);
                     applyBakeState(meta.snapshotUi.bake, { rebuild: true });
-                    maxjsDebugLog('[MaxJS] Applying standalone camera:', meta.snapshotUi.camera);
+                    maxjsDebugLog('[max.js] Applying standalone camera:', meta.snapshotUi.camera);
                     applyStandaloneCameraState(meta.snapshotUi.camera);
-                    maxjsDebugLog('[MaxJS] Camera after apply:', camera.position.toArray(), 'target:', controls.target.toArray());
+                    maxjsDebugLog('[max.js] Camera after apply:', camera.position.toArray(), 'target:', controls.target.toArray());
                     syncPostFxPanel(true);
                 }
                 animationSystem.invalidateTargets();
@@ -11424,7 +11567,7 @@
                 } else {
                     maxTimeline.initStandalone({ fps: 30, defaultPlaying: true });
                 }
-                setInfoText(`MaxJS Snapshot - ${meta.nodes?.length ?? 0} nodes`);
+                setInfoText(`max.js Snapshot - ${meta.nodes?.length ?? 0} nodes`);
                 return true;
             } catch (error) {
                 reportBridgeError('snapshot load', error);
@@ -11547,7 +11690,7 @@
             try {
                 // Wait for the fresh synced frame to land; renderFrame will perform the one-shot render.
             } catch (error) {
-                console.warn('[MaxJS render_to_image] render failed', error);
+                console.warn('[max.js render_to_image] render failed', error);
                 bridge.send('render_to_image_ready');
             }
         });

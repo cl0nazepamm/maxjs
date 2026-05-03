@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 # ╔══════════════════════════════════════════════════════════════╗
-# ║  MaxJS — Three.js Viewport for 3ds Max via WebView2          ║
+# ║  max.js — Three.js Viewport for 3ds Max via WebView2          ║
 # ╚══════════════════════════════════════════════════════════════╝
 set(PLUGIN_NAME "maxjs")
 set(PLUGIN_TYPE "gup")

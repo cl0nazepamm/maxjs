@@ -204,7 +204,7 @@ function stripSettingsFromPostFx(payload) {
     function setStatus(message) {
         if (message === lastStatus) return;
         lastStatus = message;
-        const line = `MaxJS - ${message}`;
+        const line = `max.js - ${message}`;
         if (typeof perfHud?.setProjectBanner === 'function') {
             perfHud.setProjectBanner(line);
         } else {

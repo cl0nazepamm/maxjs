@@ -34,7 +34,7 @@ public:
     const TCHAR* NonLocalizedClassName() override { return _T("three.js Deform"); }
     SClass_ID   SuperClassID() override { return OSM_CLASS_ID; }
     Class_ID    ClassID() override { return THREEJS_DEFORM_CLASS_ID; }
-    const TCHAR* Category() override { return _T("MaxJS"); }
+    const TCHAR* Category() override { return _T("max.js"); }
     const TCHAR* InternalName() override { return _T("ThreeJSDeform"); }
     HINSTANCE   HInstance() override { return hInstance; }
 };

@@ -194,7 +194,7 @@ public:
         return &interactiveRender_;
     }
 
-    void GetVendorInformation(MSTR& info) const override { info = _T("MaxJS"); }
+    void GetVendorInformation(MSTR& info) const override { info = _T("max.js"); }
     void GetPlatformInformation(MSTR& info) const override { info = _T("Three.js / WebView2"); }
 
     bool IsStopSupported() const override { return true; }
@@ -229,7 +229,7 @@ public:
     const TCHAR* NonLocalizedClassName() override { return _T("three.js"); }
     SClass_ID SuperClassID() override { return RENDERER_CLASS_ID; }
     Class_ID ClassID() override { return THREEJS_RENDERER_CLASS_ID; }
-    const TCHAR* Category() override { return _T("MaxJS"); }
+    const TCHAR* Category() override { return _T("max.js"); }
     const TCHAR* InternalName() override { return _T("ThreeJSRenderer"); }
     HINSTANCE HInstance() override { return hInstance; }
 };

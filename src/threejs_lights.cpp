@@ -94,7 +94,7 @@ float GetDisplayExtent(IParamBlock2* pblock, ThreeJSLightType type) {
 
 const LightClassSpec kLegacyLightSpec = {
     THREEJS_LIGHT_LEGACY_CLASS_ID, kLight_Directional,
-    _T("MaxJS Light"), _T("ThreeJSLight"), _T("TJS_Light"),
+    _T("max.js Light"), _T("ThreeJSLight"), _T("TJS_Light"),
     IDS_LIGHT_PARAMS_LEGACY, IDD_THREEJS_LIGHT_LEGACY, false, true
 };
 
@@ -164,7 +164,7 @@ public:
     const TCHAR* NonLocalizedClassName() override { return spec_->className; }
     SClass_ID SuperClassID() override { return LIGHT_CLASS_ID; }
     Class_ID ClassID() override { return spec_->classId; }
-    const TCHAR* Category() override { return _T("MaxJS"); }
+    const TCHAR* Category() override { return _T("max.js"); }
     const TCHAR* InternalName() override { return spec_->internalName; }
     HINSTANCE HInstance() override { return hInstance; }
 
@@ -495,7 +495,7 @@ CreateMouseCallBack* ThreeJSLight::GetCreateMouseCallBack() {
 }
 
 static ParamBlockDesc2 g_legacyLightPB(
-    threejs_light_params, _T("MaxJS Light Parameters"), IDS_LIGHT_PARAMS_LEGACY, &g_legacyLightDesc,
+    threejs_light_params, _T("max.js Light Parameters"), IDS_LIGHT_PARAMS_LEGACY, &g_legacyLightDesc,
     P_AUTO_CONSTRUCT + P_AUTO_UI, 0,
     IDD_THREEJS_LIGHT_LEGACY, IDS_LIGHT_PARAMS_LEGACY, 0, 0, nullptr,
     pl_type, _T("lightType"), TYPE_INT, 0, 0,

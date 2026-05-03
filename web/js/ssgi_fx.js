@@ -727,17 +727,14 @@ export function createSSGIController({
     }
 
     function hasAnyEffectEnabled() {
-        return hasPipelineEffectEnabled()
-            || (supportsScreenSpaceEffects && hasColorGradingEnabled());
+        return hasPipelineEffectEnabled();
     }
 
-    function syncCanvasColorGradingFallback() {
+    function syncCanvasColorGrading() {
         const canvas = renderer?.domElement;
         if (!canvas?.style) return;
 
-        const useFallback = hasColorGradingEnabled()
-            && (!available || (!supportsScreenSpaceEffects && !hasPipelineEffectEnabled()));
-        if (!useFallback) {
+        if (!hasColorGradingEnabled()) {
             canvas.style.filter = '';
             return;
         }
@@ -1229,12 +1226,12 @@ export function createSSGIController({
             postProcessing.outputNode = null;
             postProcessing.needsUpdate = true;
             forceEnvironmentBackground = false;
-            syncCanvasColorGradingFallback();
+            syncCanvasColorGrading();
             return;
         }
 
         clearNodes();
-        syncCanvasColorGradingFallback();
+        syncCanvasColorGrading();
 
         try {
             // PS1 vertex snap — coexists with all post-FX, no takeover needed
@@ -1637,16 +1634,6 @@ export function createSSGIController({
                 beauty = vec4(mix(solidBg, beauty.rgb, beauty.a), float(1));
             }
 
-            // Global color grading — persistent uniforms, no rebuild needed on slider changes
-            colorGradingBrightnessU.value = state.colorGrading.brightness;
-            colorGradingContrastU.value = state.colorGrading.contrast;
-            {
-                let col = beauty.rgb;
-                col = col.add(colorGradingBrightnessU);
-                col = col.sub(0.5).mul(colorGradingContrastU.add(1.0)).add(0.5);
-                beauty = vec4(col, beauty.a);
-            }
-
             postProcessing.outputNode = beauty;
             postProcessing.needsUpdate = true;
             pipelineReady = true;
@@ -1999,18 +1986,11 @@ export function createSSGIController({
             return { ...state.colorGrading };
         },
         setColorGrading(options = {}) {
-            const wasActive = hasColorGradingEnabled();
             assignFinite(state.colorGrading, 'brightness', options.brightness);
             assignFinite(state.colorGrading, 'contrast', options.contrast);
             colorGradingBrightnessU.value = state.colorGrading.brightness;
             colorGradingContrastU.value = state.colorGrading.contrast;
-            const isActive = hasColorGradingEnabled();
-            syncCanvasColorGradingFallback();
-            if (!supportsScreenSpaceEffects && !hasPipelineEffectEnabled()) {
-                return { ...state.colorGrading };
-            }
-            if (wasActive !== isActive) rebuildPipeline();
-            else queuePipelineUpdate({ output: true });
+            syncCanvasColorGrading();
             return { ...state.colorGrading };
         },
 
@@ -2245,7 +2225,7 @@ export function createSSGIController({
 
         render() {
             flushPendingPipelineUpdates();
-            syncCanvasColorGradingFallback();
+            syncCanvasColorGrading();
             // Update fog timer for procedural animation
             if (fogAnimationActive) {
                 fogTimer.value = performance.now() * 0.001 * state.fog.noiseSpeed;

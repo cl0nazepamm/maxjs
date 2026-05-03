@@ -75,6 +75,7 @@ target_link_libraries(${PLUGIN_NAME} PRIVATE
     Geom.lib
     mesh.lib
     bmm.lib
+    assetmanagement.lib
     Maxscrpt.lib
     poly.lib
     MNMath.lib

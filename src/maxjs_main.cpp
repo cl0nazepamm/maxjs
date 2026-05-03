@@ -16,6 +16,7 @@
 #include <notify.h>
 #include <stdmat.h>
 #include <AssetManagement/AssetUser.h>
+#include <IFileResolutionManager.h>
 #include <ISceneEventManager.h>
 #include <iInstanceMgr.h>
 #include <modstack.h>
@@ -1462,28 +1463,67 @@ static bool IsImageFile(const wchar_t* path) {
             _wcsicmp(ext, L".psd") == 0 || _wcsicmp(ext, L".tx") == 0);
 }
 
+static std::wstring ResolveTextureFilePath(const std::wstring& rawPath,
+                                           MaxSDK::AssetManagement::AssetType assetType = MaxSDK::AssetManagement::kBitmapAsset) {
+    if (rawPath.empty() || !IsImageFile(rawPath.c_str())) return {};
+    if (FileExists(rawPath)) return rawPath;
+
+    IFileResolutionManager* resolver = IFileResolutionManager::GetInstance();
+    if (resolver) {
+        MSTR resolved = resolver->GetFullFilePath(rawPath.c_str(), assetType, true);
+        if (resolved.Length() > 0) {
+            std::wstring resolvedPath(resolved.data());
+            if (IsImageFile(resolvedPath.c_str()) && FileExists(resolvedPath)) return resolvedPath;
+        }
+    }
+
+    return {};
+}
+
+static std::wstring ResolveTextureAssetPath(const MaxSDK::AssetManagement::AssetUser& asset) {
+    IFileResolutionManager* resolver = IFileResolutionManager::GetInstance();
+    if (resolver) {
+        MSTR resolved;
+        if (resolver->GetFullFilePath(asset, resolved, true) && resolved.Length() > 0) {
+            std::wstring resolvedPath(resolved.data());
+            if (IsImageFile(resolvedPath.c_str()) && FileExists(resolvedPath)) return resolvedPath;
+        }
+    }
+
+    MSTR fullPath;
+    if (asset.GetFullFilePath(fullPath) && fullPath.Length() > 0) {
+        std::wstring resolvedPath(fullPath.data());
+        if (IsImageFile(resolvedPath.c_str()) && FileExists(resolvedPath)) return resolvedPath;
+    }
+
+    const MSTR& filename = asset.GetFileName();
+    if (filename.Length() > 0) {
+        return ResolveTextureFilePath(filename.data(), asset.GetType());
+    }
+
+    return {};
+}
+
 // Standard BitmapTex keeps the path on the class + asset system, not always as TYPE_FILENAME in a param block.
 static std::wstring GetStandardBitmapTexFilename(Texmap* map) {
     if (!map || map->ClassID() != Class_ID(BMTEX_CLASS_ID, 0)) return {};
 
     auto* bt = static_cast<BitmapTex*>(map);
 
+    const MaxSDK::AssetManagement::AssetUser& au = bt->GetMap();
+    std::wstring assetPath = ResolveTextureAssetPath(au);
+    if (!assetPath.empty()) return assetPath;
+
     const MCHAR* mapName = bt->GetMapName();
     if (mapName && mapName[0]) {
-        std::wstring w(mapName);
-        if (IsImageFile(w.c_str())) return w;
+        std::wstring resolved = ResolveTextureFilePath(mapName);
+        if (!resolved.empty()) return resolved;
     }
 
-    const MaxSDK::AssetManagement::AssetUser& au = bt->GetMap();
-    MSTR fullPath;
-    if (au.GetFullFilePath(fullPath) && fullPath.Length() > 0) {
-        std::wstring w(fullPath.data());
-        if (IsImageFile(w.c_str())) return w;
-    }
     const MSTR& fn = au.GetFileName();
     if (fn.Length() > 0) {
-        std::wstring w(fn.data());
-        if (IsImageFile(w.c_str())) return w;
+        std::wstring resolved = ResolveTextureFilePath(fn.data(), au.GetType());
+        if (!resolved.empty()) return resolved;
     }
     return {};
 }
@@ -1506,7 +1546,10 @@ static std::wstring FindBitmapFileImpl(Texmap* map, std::unordered_set<Texmap*>&
             const ParamDef& pd = pblock->GetParamDef(pid);
             if (pd.type == TYPE_FILENAME || pd.type == TYPE_FILENAME_TAB) {
                 const MCHAR* fn = pblock->GetStr(pid);
-                if (fn && fn[0] && IsImageFile(fn)) return fn;
+                if (fn && fn[0]) {
+                    std::wstring resolved = ResolveTextureFilePath(fn);
+                    if (!resolved.empty()) return resolved;
+                }
             }
         }
     }
@@ -10159,7 +10202,11 @@ public:
     }
 
     std::wstring MapTexturePath(const std::wstring& filePath) {
-        return MapAssetPath(filePath, false);
+        std::wstring mapped = MapAssetPath(filePath, false);
+        if (!mapped.empty()) return mapped;
+
+        const std::wstring resolvedPath = ResolveTextureFilePath(filePath);
+        return resolvedPath.empty() ? std::wstring{} : MapAssetPath(resolvedPath, false);
     }
 
     // ── Callbacks & sync ─────────────────────────────────────

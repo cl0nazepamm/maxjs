@@ -21,6 +21,7 @@ projects/*/dist/node_modules/
 AGENTS.md
 docs/
 dev.bat
+dev2027.bat
 debug.bat
 install.bat
 snapshot-debug.bat

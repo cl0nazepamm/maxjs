@@ -655,6 +655,54 @@ function createMaxNodeAdapter({ handle, getObject, THREE, createAnchor, layerId,
             obj.getWorldScale(scale);
             return scale;
         },
+        getPivotWorldPosition(target = new THREE.Vector3()) {
+            const obj = getObject();
+            return obj ? obj.getWorldPosition(target) : null;
+        },
+        getVisualCenter(target = new THREE.Vector3()) {
+            const obj = getObject();
+            return obj ? new THREE.Box3().setFromObject(obj).getCenter(target) : null;
+        },
+        getPivotToVisualCenter(target = new THREE.Vector3()) {
+            const obj = getObject();
+            if (!obj) return null;
+            const pivot = obj.getWorldPosition(scratch.vA);
+            const center = new THREE.Box3().setFromObject(obj).getCenter(target);
+            return center.sub(pivot);
+        },
+        getLocalAxesWorld() {
+            const obj = getObject();
+            if (!obj) return null;
+            const q = obj.getWorldQuaternion(new THREE.Quaternion());
+            return {
+                x: new THREE.Vector3(1, 0, 0).applyQuaternion(q).normalize(),
+                y: new THREE.Vector3(0, 1, 0).applyQuaternion(q).normalize(),
+                z: new THREE.Vector3(0, 0, 1).applyQuaternion(q).normalize(),
+            };
+        },
+        getOrientationSnapshot() {
+            const obj = getObject();
+            if (!obj) return null;
+            const pivot = obj.getWorldPosition(new THREE.Vector3());
+            const bbox = new THREE.Box3().setFromObject(obj);
+            const center = bbox.getCenter(new THREE.Vector3());
+            const dimensions = bbox.getSize(new THREE.Vector3());
+            const axes = this.getLocalAxesWorld();
+            return {
+                handle,
+                name: obj.name,
+                pivot: pivot.toArray(),
+                visualCenter: center.toArray(),
+                dimensions: dimensions.toArray(),
+                pivotToVisualCenter: center.clone().sub(pivot).toArray(),
+                localAxesWorld: {
+                    x: axes.x.toArray(),
+                    y: axes.y.toArray(),
+                    z: axes.z.toArray(),
+                },
+                worldMatrix: obj.matrixWorld.toArray(),
+            };
+        },
         get isLight() { return !!getObject()?.isLight; },
         get isDirectionalLight() { return !!getObject()?.isDirectionalLight; },
         /** For directional/spot lights: the normalized world-space direction the light shines toward.
@@ -1632,6 +1680,94 @@ export function createLayerManager({
             },
         });
 
+        const readVectorLike = (value, target = new THREE.Vector3()) => {
+            if (value?.isVector3) return target.copy(value);
+            if (Array.isArray(value) || ArrayBuffer.isView(value)) {
+                return target.set(Number(value[0]) || 0, Number(value[1]) || 0, Number(value[2]) || 0);
+            }
+            if (value && typeof value === 'object') {
+                return target.set(Number(value.x) || 0, Number(value.y) || 0, Number(value.z) || 0);
+            }
+            return target.set(0, 0, 0);
+        };
+
+        const pointFromNodeLike = (value, target = new THREE.Vector3()) => {
+            if (value?.getVisualCenter) return value.getVisualCenter(target);
+            if (value?.getWorldPosition) return value.getWorldPosition(target);
+            return readVectorLike(value, target);
+        };
+
+        const runtimeSpaceFacade = freezePlainObject({
+            maxUpAxis: space?.maxUpAxis?.clone?.() ?? Object.freeze(new THREE.Vector3(0, 0, 1)),
+            worldUpAxis: space?.worldUpAxis?.clone?.() ?? Object.freeze(new THREE.Vector3(0, 1, 0)),
+            upAxis: Object.freeze(new THREE.Vector3(0, 1, 0)),
+            groundPlane: 'XZ',
+            units: 'cm',
+            maxToWorldMapping: 'x,z,-y',
+            toWorldPosition(value, target = new THREE.Vector3()) {
+                if (space?.toWorldPosition) return space.toWorldPosition(value, target);
+                readVectorLike(value, target);
+                return target.set(target.x, target.z, -target.y);
+            },
+            toWorldDirection(value, target = new THREE.Vector3()) {
+                if (space?.toWorldDirection) return space.toWorldDirection(value, target);
+                readVectorLike(value, target);
+                return target.set(target.x, target.z, -target.y).normalize();
+            },
+            toWorldMatrix(value, target = new THREE.Matrix4()) {
+                if (space?.toWorldMatrix) return space.toWorldMatrix(value, target);
+                if (value?.isMatrix4) return target.copy(value);
+                if (Array.isArray(value) || ArrayBuffer.isView(value)) return target.fromArray(value);
+                return target.identity();
+            },
+            toMaxPosition(value, target = new THREE.Vector3()) {
+                if (space?.toMaxPosition) return space.toMaxPosition(value, target);
+                readVectorLike(value, target);
+                return target.set(target.x, -target.z, target.y);
+            },
+            getPivotWorldPosition(node, target = new THREE.Vector3()) {
+                if (node?.getPivotWorldPosition) return node.getPivotWorldPosition(target);
+                if (node?.getWorldPosition) return node.getWorldPosition(target);
+                return readVectorLike(node, target);
+            },
+            getVisualCenter(node, target = new THREE.Vector3()) {
+                if (node?.getVisualCenter) return node.getVisualCenter(target);
+                if (node?.getBoundingBox) {
+                    const box = node.getBoundingBox();
+                    if (box) return box.getCenter(target);
+                }
+                if (node?.isObject3D) return new THREE.Box3().setFromObject(node).getCenter(target);
+                return readVectorLike(node, target);
+            },
+            getPivotToVisualCenter(node, target = new THREE.Vector3()) {
+                if (node?.getPivotToVisualCenter) return node.getPivotToVisualCenter(target);
+                const pivot = this.getPivotWorldPosition(node, new THREE.Vector3());
+                const center = this.getVisualCenter(node, target);
+                return center.sub(pivot);
+            },
+            getLocalAxesWorld(node) {
+                if (node?.getLocalAxesWorld) return node.getLocalAxesWorld();
+                const obj = node?.isObject3D ? node : null;
+                if (!obj) return null;
+                const q = obj.getWorldQuaternion(new THREE.Quaternion());
+                return {
+                    x: new THREE.Vector3(1, 0, 0).applyQuaternion(q).normalize(),
+                    y: new THREE.Vector3(0, 1, 0).applyQuaternion(q).normalize(),
+                    z: new THREE.Vector3(0, 0, 1).applyQuaternion(q).normalize(),
+                };
+            },
+            forwardFromAxles(frontLeft, frontRight, rearLeft, rearRight, target = new THREE.Vector3()) {
+                const front = pointFromNodeLike(frontLeft, new THREE.Vector3())
+                    .add(pointFromNodeLike(frontRight, new THREE.Vector3()))
+                    .multiplyScalar(0.5);
+                const rear = pointFromNodeLike(rearLeft, new THREE.Vector3())
+                    .add(pointFromNodeLike(rearRight, new THREE.Vector3()))
+                    .multiplyScalar(0.5);
+                target.subVectors(front, rear);
+                return target.lengthSq() > 0 ? target.normalize() : target.set(0, 0, 1);
+            },
+        });
+
         const runtimeFacade = freezePlainObject({
             get id() { return layer.id; },
             get name() { return layer.name; },
@@ -1641,7 +1777,7 @@ export function createLayerManager({
             // Scene coordinate info — world is Y-up (Three.js default), Max Z-up converted on input
             upAxis: Object.freeze(new THREE.Vector3(0, 1, 0)),
             gravity: Object.freeze(new THREE.Vector3(0, -980, 0)),
-            space,
+            space: runtimeSpaceFacade,
             units: 'cm',
             gltf: gltfFacade,
             log: (...args) => debugLog(`[Layer:${layer.id}]`, ...args),

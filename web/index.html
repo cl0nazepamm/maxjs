@@ -1346,6 +1346,7 @@
             </button>
             <button id="btnRenderMode" class="rail-btn devonly" title="Render mode — Studio adds light linking / per-mesh HDRI; Standard stays within baseline WebGPU uniform-buffer limits." aria-label="Render mode">
                 <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 1.5 2.5 4.5v7L8 14.5l5.5-3v-7L8 1.5Z"/><path d="M8 1.5v13M2.5 4.5 8 8l5.5-3.5"/></svg>
+                <span class="rail-btn-badge">STD</span>
             </button>
             <button id="btnLightLink" class="rail-btn devonly" title="Light Linking" aria-label="Light Linking">
                 <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6.5 8.5a2.5 2.5 0 0 0 3.5 0l2.5-2.5a2.5 2.5 0 0 0-3.5-3.5L8 3.5"/><path d="M9.5 7.5a2.5 2.5 0 0 0-3.5 0L3.5 10a2.5 2.5 0 0 0 3.5 3.5L8 12.5"/></svg>
@@ -1452,6 +1453,7 @@
             "three/tsl": "./vendor/three-r184/build/three.tsl.js",
             "three/addons/": "./vendor/three-r184/examples/",
             "three/examples/jsm/": "./vendor/three-r184/examples/",
+            "three-mesh-bvh": "./node_modules/three-mesh-bvh/src/index.js",
             "@sparkjsdev/spark": "./node_modules/@sparkjsdev/spark/dist/spark.module.js",
             "@dimforge/rapier3d-compat": "./vendor/rapier/rapier.es.js",
             "react": "https://esm.sh/react@18.3.1",
@@ -1468,6 +1470,13 @@
                 "three": "./vendor/three-r184/build/three.module.js"
             },
             "./vendor/three-r184/examples/lighting/LightProbeGrid.js": {
+                "three": "./vendor/three-r184/build/three.module.js"
+            },
+            "./node_modules/three-gpu-pathtracer/": {
+                "three": "./vendor/three-r184/build/three.module.js",
+                "three/examples/jsm/": "./vendor/three-r184/examples/"
+            },
+            "./node_modules/three-mesh-bvh/": {
                 "three": "./vendor/three-r184/build/three.module.js"
             },
             "https://maxjs-assets.local/": {
@@ -1497,6 +1506,7 @@
         import { LightProbeGenerator } from 'three/addons/lights/LightProbeGenerator.js';
         import { LightProbeGrid } from 'three/addons/lighting/LightProbeGrid.js';
         import { RectAreaLightTexturesLib } from 'three/addons/lights/RectAreaLightTexturesLib.js';
+        import { WebGLPathTracer } from './node_modules/three-gpu-pathtracer/src/core/WebGLPathTracer.js';
         import { hashBlur } from 'three/addons/tsl/display/hashBlur.js';
         import { XRButton } from 'three/addons/webxr/XRButton.js';
         import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
@@ -1536,6 +1546,7 @@
         import { maxTimeline } from './js/maxjs_timeline.js';
         import { createPerfHud } from './js/perf_hud.js';
         import { createSSGIController } from './js/ssgi_fx.js';
+        import { createPathTracingController } from './js/pathtracing_controller.js';
         import { createLayerManager } from './js/layer_manager.js';
         import { MAXJS_LAYER_SSR_EXCLUDE } from './js/render_layers.js';
         import { createMaxJSAnimationSystem } from './js/maxjs_animation.js';
@@ -1805,22 +1816,26 @@
             THREE.RectAreaLightNode.setLTC(RectAreaLightTexturesLib.init());
         }
 
-        // ── Studio vs Standard render mode ────────────────────
+        // ── Render mode ───────────────────────────────────────
         // Studio  = MaxLightsNode (light linking + per-mesh HDRI intensity).
         //           Unlinked lights stay on stock batched three.js light nodes.
         // Standard = stock three.js pipeline. No per-mesh tricks, but fits
         //            within baseline WebGPU uniform-buffer limits — use on
         //            heavier scenes that exceed 12 uniform buffers/stage.
+        // Pathtracing = progressive WebGL2 path tracer. It reuses scene meshes,
+        //               lights, materials, and textures without material rewrites.
         //
         // Mode is frozen at renderer init; switching requires reload.
         const MAXJS_MODE_KEY = 'maxjs-render-mode';
+        const MAXJS_RENDER_MODES = ['standard', 'studio', 'pathtracing'];
         const maxjsRenderMode = (() => {
             try {
                 const v = localStorage.getItem(MAXJS_MODE_KEY);
-                return v === 'studio' ? 'studio' : 'standard';
+                return MAXJS_RENDER_MODES.includes(v) ? v : 'standard';
             } catch { return 'standard'; }
         })();
         const isStudioMode = maxjsRenderMode === 'studio';
+        const isPathTracingMode = maxjsRenderMode === 'pathtracing';
         const STUDIO_ONLY_RAIL_IDS = ['btnLightLink', 'btnReflPaint'];
 
         function setRailButtonMeta(button, { label, badge } = {}) {
@@ -1905,6 +1920,14 @@
         defaultLights.add(defaultKey);
         defaultLights.add(defaultFill);
         scene.add(defaultLights);
+        function setDefaultLightsVisible(visible) {
+            const enabled = !isPathTracingMode && !!visible;
+            defaultLights.visible = enabled;
+            defaultAmbient.visible = enabled;
+            defaultKey.visible = enabled;
+            defaultFill.visible = enabled;
+        }
+        setDefaultLightsVisible(true);
         const lightProbe = new THREE.LightProbe();
         scene.add(lightProbe);
 
@@ -2061,6 +2084,19 @@
         // instead. Toggled from the right rail. Loads React +
         // @basementstudio/shader-lab from esm.sh on first enable.
         const shaderLabFx = createShaderLabFx({ THREE, renderer, scene, camera });
+        const pathTracingFx = createPathTracingController({
+            renderer,
+            scene,
+            camera,
+            WebGLPathTracer,
+            enabled: isPathTracingMode,
+            onStatus(message) {
+                perfHud.setStatus(message);
+            },
+            onError(error) {
+                reportBridgeError('pathtracing', error);
+            },
+        });
 
         // Clone blob overlay — 2D canvas for bounding rectangles
         const blobOverlayCvs = document.createElement('canvas');
@@ -3183,7 +3219,7 @@
                 syncMaterialEnvMaps();
                 if (envVisible) scene.background = envMap;
                 if (previousEnvMap && previousEnvMap !== envMap) previousEnvMap.dispose?.();
-                defaultLights.visible = false;
+                setDefaultLightsVisible(false);
                 if (lightProbeEnabled || shouldRefreshProbe) {
                     await updateLightProbeFromHDRI(hdrTex, probeSignature, loadGeneration);
                 }
@@ -3199,7 +3235,7 @@
                 syncMaterialEnvMaps();
                 clearLightProbe();
                 if (envVisible) scene.background = new THREE.Color(hiddenBackgroundColor);
-                defaultLights.visible = true;
+                setDefaultLightsVisible(true);
                 ssgiFx.markEnvironmentChanged?.();
             });
         }
@@ -3308,12 +3344,12 @@
                 } else {
                     scene.background = new THREE.Color(hiddenBackgroundColor);
                 }
-                defaultLights.visible = false;
+                setDefaultLightsVisible(false);
             } else {
                 scene.environment = null;
                 syncMaterialEnvMaps();
                 scene.background = new THREE.Color(hiddenBackgroundColor);
-                defaultLights.visible = true;
+                setDefaultLightsVisible(true);
             }
         }
 
@@ -3348,7 +3384,7 @@
             scene.backgroundBlurriness = 0;
             scene.background = new THREE.Color(hiddenBackgroundColor);
             clearLightProbe();
-            defaultLights.visible = true;
+            setDefaultLightsVisible(true);
             ssgiFx.markEnvironmentChanged?.();
             savePostFxState();
             syncHdriPanel();
@@ -3464,7 +3500,7 @@
                 if (skyFillLight.parent !== scene) scene.add(skyFillLight);
                 skyFillLight.intensity = 0.5 + sunStrength * 0.5;
 
-                defaultLights.visible = false;
+                setDefaultLightsVisible(false);
                 skyActive = true;
 
                 // Clear HDRI state
@@ -5117,17 +5153,18 @@
         }
 
         function applyIncrementalNodeUpdate(mesh, nd, handleOverride = null) {
-            if (!mesh || !nd) return;
+            if (!mesh || !nd) return false;
+            let changed = false;
             const handle = handleOverride ?? nd.h ?? null;
             if (handle != null && getMaxInstanceBucketForHandle(handle)) {
-                updateMaxInstanceBucketNode(handle, nd);
-                return;
+                return updateMaxInstanceBucketNode(handle, nd);
             }
             if (nd.jsmod != null) applyJsmodSyncState(mesh, nd.jsmod === true);
-            if (nd.vis != null) applyBridgeVisibility(mesh, nd.vis);
-            if (isFiniteArray(nd.t, 16)) applyTransform(mesh, nd.t);
+            if (nd.vis != null) changed = applyBridgeVisibility(mesh, nd.vis) || changed;
+            if (isFiniteArray(nd.t, 16)) changed = applyTransform(mesh, nd.t) || changed;
             if (nd.s != null) applySelection(mesh, nd.s);
             if (nd.mat && mesh.material) applyMaterialScalar(mesh, nd.mat);
+            return changed;
         }
 
         function buildNodeGeometryRefCounts() {
@@ -5437,6 +5474,9 @@
                 if (lightsChanged) markLightProbeSceneDirty();
                 scheduleLightProbeFromCurrentScene();
             }
+            if (sceneChanged || lightsChanged || options.pathTracingDirty === true) {
+                pathTracingFx.markSceneDirty?.();
+            }
             // Full snapshot can add/remove many meshes — cheap scene refresh.
             // Effect toggles, env, and renderer size have their own dedicated
             // entry points, so a full pipeline rebuild is unnecessary here.
@@ -5565,6 +5605,7 @@
             finalizeSceneSnapshot(msg, 'json', applyStart, msg.stats?.producerBytes ?? 0, {
                 bucketPlan,
                 sceneChanged,
+                pathTracingDirty: transformsChanged || sceneChanged,
             });
         });
 
@@ -6015,6 +6056,7 @@
             finalizeSceneSnapshot(meta, 'binary-scene', applyStart, meta.stats?.producerBytes ?? buffer.byteLength, {
                 bucketPlan,
                 sceneChanged,
+                pathTracingDirty: transformsChanged || sceneChanged,
                 afterWorldUpdate() {
                     // Recalculate skeleton boneInverses for NEWLY created skinned meshes
                     // (only needed once — after the mesh is in the scene hierarchy under maxBasisRoot).
@@ -6032,16 +6074,19 @@
 
         function handleBinaryDelta(buffer, meta) {
             let runtimeTransformsChanged = false;
+            let pathTracingSceneChanged = false;
             const result = applyDeltaFrame(buffer, {
                 onTransform(nodeHandle, matrix) {
                     const mesh = nodeMap.get(nodeHandle);
-                    if (mesh) applyIncrementalNodeUpdate(mesh, { t: matrix });
+                    const changed = mesh ? applyIncrementalNodeUpdate(mesh, { t: matrix }) : false;
                     if (mesh) runtimeTransformsChanged = true;
+                    if (changed) pathTracingSceneChanged = true;
                     applyHairTransform(nodeHandle, matrix);
                 },
                 onMaterialScalar(nodeHandle, material) {
                     const mesh = nodeMap.get(nodeHandle);
-                    if (mesh) applyIncrementalNodeUpdate(mesh, { mat: material });
+                    const changed = mesh ? applyIncrementalNodeUpdate(mesh, { mat: material }) : false;
+                    if (changed) pathTracingSceneChanged = true;
                 },
                 onSelection(nodeHandle, selected) {
                     const mesh = nodeMap.get(nodeHandle);
@@ -6049,7 +6094,8 @@
                 },
                 onVisibility(nodeHandle, visible) {
                     const mesh = nodeMap.get(nodeHandle);
-                    if (mesh) applyIncrementalNodeUpdate(mesh, { vis: visible });
+                    const changed = mesh ? applyIncrementalNodeUpdate(mesh, { vis: visible }) : false;
+                    if (changed) pathTracingSceneChanged = true;
                     applyHairVisibility(nodeHandle, visible);
                 },
                 onCamera(cameraState) {
@@ -6063,7 +6109,7 @@
                     const pos = [m[12], m[13], m[14]];
                     const len = Math.sqrt(m[4]*m[4] + m[5]*m[5] + m[6]*m[6]) || 1;
                     const dir = [-m[4]/len, -m[5]/len, -m[6]/len];
-                    applyLightData(light, {
+                    const lightChanged = applyLightData(light, {
                         h: handle, type: ld.type,
                         v: ld.visible ? 1 : 0,
                         pos, dir,
@@ -6077,8 +6123,11 @@
                         shadowMapSize: ld.shadowMapSize,
                         volContrib: ld.volContrib,
                     });
-                    markLightProbeSceneDirty();
-                    scheduleLightProbeFromCurrentScene({ delay: 350 });
+                    if (lightChanged) {
+                        markLightProbeSceneDirty();
+                        pathTracingSceneChanged = true;
+                        scheduleLightProbeFromCurrentScene({ delay: 350 });
+                    }
                 },
                 onSplat(handle, matrix, visible) {
                     const entry = splatHandleMap.get(handle);
@@ -6090,12 +6139,14 @@
                 },
                 onGLTF(handle, matrix, visible) {
                     gltfSystem?.applyGLTFTransformBinary(handle, matrix, visible);
+                    pathTracingSceneChanged = true;
                 },
                 onTime(td) {
                     maxTimeline.onTime(td);
                 },
             });
             if (runtimeTransformsChanged) layerManager.markRuntimeTransformsDirty?.();
+            if (pathTracingSceneChanged) pathTracingFx.markSceneDirty?.();
             markInitialSync();
             setTransportMode('binary-delta');
             updateSyncHud({
@@ -6261,6 +6312,14 @@
         }
 
         function applyMaterialScalar(mesh, material, materialIndex = null) {
+            if (!mesh || !material) return false;
+            const scalarKey = materialIndex == null ? '__all__' : String(materialIndex);
+            const scalarSignature = JSON.stringify(material);
+            mesh.userData ??= {};
+            mesh.userData.maxjsMaterialScalarSignatures ??= {};
+            if (mesh.userData.maxjsMaterialScalarSignatures[scalarKey] === scalarSignature) {
+                return false;
+            }
             const rebuildForBlackSpecularRoute = () => {
                 if (!mesh || !material) return false;
                 if (materialIndex != null) {
@@ -6285,7 +6344,10 @@
                 if (!isCachedMaterialTemplate(oldMaterial)) disposeSceneMaterial(oldMaterial);
                 return true;
             };
-            if (rebuildForBlackSpecularRoute()) return;
+            if (rebuildForBlackSpecularRoute()) {
+                mesh.userData.maxjsMaterialScalarSignatures[scalarKey] = scalarSignature;
+                return true;
+            }
 
             const c = material?.color;
             const emissive = material?.emissive;
@@ -6383,6 +6445,8 @@
                 }
                 if (materialNeedsUpdate) m.needsUpdate = true;
             }
+            mesh.userData.maxjsMaterialScalarSignatures[scalarKey] = scalarSignature;
+            return true;
         }
 
         // ── Lights Sync ──────────────────────────────────────
@@ -6513,7 +6577,10 @@
         }
 
         function applyLightData(light, ld) {
+            const signature = sceneLightsSignature([ld]);
+            const changedForPathTracing = light.userData?.maxjsPathTraceSignature !== signature;
             light.userData ??= {};
+            light.userData.maxjsPathTraceSignature = signature;
             light.userData.maxjsTypeId = ld.type;
             if (ld.h != null) light.userData.maxjsHandle = ld.h;
             if (ld.name) light.name = ld.name;
@@ -6586,6 +6653,7 @@
                     updateLightShadowCamera(light, ld);
                 }
             }
+            return changedForPathTracing;
         }
 
         function createLightFromData(ld) {
@@ -6671,7 +6739,7 @@
                 }
             }
 
-            defaultLights.visible = appliedLightCount === 0 && !currentHdriUrl && !skyActive;
+            setDefaultLightsVisible(appliedLightCount === 0 && !currentHdriUrl && !skyActive);
             if (ssgiFx.setMainLight) {
                 ssgiFx.setMainLight(mainDirectionalLight || (defaultLights.visible ? defaultKey : null));
             }
@@ -6690,6 +6758,7 @@
             finalizeLightState(lightsData);
             lightLinking.reapply();
             lastLightsSignature = signature;
+            pathTracingFx.markSceneDirty?.();
             return true;
         }
 
@@ -8535,6 +8604,7 @@
 
             let appliedLightCount = 0;
             let mainDirectionalLight = null;
+            let anyLightChanged = false;
 
             for (const ld of lightsData) {
                 const light = lightHandleMap.get(ld.h);
@@ -8543,17 +8613,18 @@
                     return;
                 }
 
-                applyLightData(light, ld);
+                anyLightChanged = applyLightData(light, ld) || anyLightChanged;
                 if (light.visible !== false) {
                     appliedLightCount++;
                     if (!mainDirectionalLight && ld.type === 0) mainDirectionalLight = light;
                 }
             }
 
-            defaultLights.visible = appliedLightCount === 0 && !currentHdriUrl && !skyActive;
+            setDefaultLightsVisible(appliedLightCount === 0 && !currentHdriUrl && !skyActive);
             if (ssgiFx.setMainLight) {
                 ssgiFx.setMainLight(mainDirectionalLight || (defaultLights.visible ? defaultKey : null));
             }
+            if (anyLightChanged) pathTracingFx.markSceneDirty?.();
         }
 
         // ── Scene Camera Lock ────────────────────────────────
@@ -8675,6 +8746,7 @@
                 controls.object = camera;
                 ssgiFx.setCamera?.(camera);
                 shaderLabFx.setCamera?.(camera);
+                pathTracingFx.setCamera?.(camera);
             } else if (!wantOrtho && isOrtho) {
                 scene.remove(camera);
                 camera = perspCamera;
@@ -8682,6 +8754,7 @@
                 controls.object = camera;
                 ssgiFx.setCamera?.(camera);
                 shaderLabFx.setCamera?.(camera);
+                pathTracingFx.setCamera?.(camera);
             }
 
             copyMaxArrayToWorld(camera.position, cam.pos);
@@ -8738,6 +8811,7 @@
                 controls.object = camera;
                 ssgiFx.setCamera?.(camera);
                 shaderLabFx.setCamera?.(camera);
+                pathTracingFx.setCamera?.(camera);
             } else if (!wantOrtho && isOrtho) {
                 scene.remove(camera);
                 camera = perspCamera;
@@ -8745,6 +8819,7 @@
                 controls.object = camera;
                 ssgiFx.setCamera?.(camera);
                 shaderLabFx.setCamera?.(camera);
+                pathTracingFx.setCamera?.(camera);
             }
 
             camera.position.fromArray(savedCamera.position);
@@ -9180,12 +9255,28 @@
 
         const btnRenderMode = document.getElementById('btnRenderMode');
         if (btnRenderMode) {
-            btnRenderMode.classList.toggle('active', isStudioMode);
-            btnRenderMode.title = `Render mode: ${isStudioMode ? 'Studio' : 'Standard'} — Studio adds light linking / per-mesh HDRI; Standard stays within baseline WebGPU uniform-buffer limits. Toggling reloads the page.`;
+            const renderModeLabels = {
+                standard: 'Standard',
+                studio: 'Studio',
+                pathtracing: 'Pathtracing',
+            };
+            const currentModeIndex = MAXJS_RENDER_MODES.indexOf(maxjsRenderMode);
+            const currentModeLabel = renderModeLabels[maxjsRenderMode] || 'Standard';
+            btnRenderMode.classList.toggle('active', maxjsRenderMode !== 'standard');
+            setRailButtonMeta(btnRenderMode, { badge: maxjsRenderMode === 'pathtracing' ? 'PT' : (isStudioMode ? 'STU' : 'STD') });
+            btnRenderMode.title = `Render mode: ${currentModeLabel} — Standard, Studio, Pathtracing. Toggling reloads the page.`;
             btnRenderMode.addEventListener('click', () => {
-                const nextMode = isStudioMode ? 'standard' : 'studio';
-                if (!confirm(`Switch to ${nextMode === 'studio' ? 'Studio' : 'Standard'} mode? Reloads the page.`)) return;
+                const nextMode = MAXJS_RENDER_MODES[(currentModeIndex + 1) % MAXJS_RENDER_MODES.length] || 'standard';
+                const nextLabel = renderModeLabels[nextMode] || nextMode;
+                const backendNote = nextMode === 'pathtracing' && !isWebGLBackendActive()
+                    ? ' This will also switch the backend to WebGL2.'
+                    : '';
+                if (!confirm(`Switch to ${nextLabel} mode? Reloads the page.${backendNote}`)) return;
                 try { localStorage.setItem(MAXJS_MODE_KEY, nextMode); } catch {}
+                if (nextMode === 'pathtracing') {
+                    persistRendererBackendPreference('webgl');
+                    sessionStorage.setItem('maxjs_renderer_backend', 'webgl');
+                }
                 location.reload();
             });
         }
@@ -11438,6 +11529,8 @@
                             delete obj.userData._vrSavedIntensity;
                         }
                     });
+                } else if (pathTracingFx.isEnabled()) {
+                    if (!pathTracingFx.render()) ssgiFx.render();
                 } else if (shaderLabFx.isEnabled()) {
                     // Shader Lab mode bypasses ssgiFx entirely and runs its
                     // own scene→target→shader-lab→fullscreen-quad pipeline.
@@ -11859,7 +11952,9 @@
             }
 
             try {
-                if (ssgiFx.hasEnabledEffects()) {
+                if (pathTracingFx.isEnabled()) {
+                    if (!pathTracingFx.render()) ssgiFx.render();
+                } else if (ssgiFx.hasEnabledEffects()) {
                     ssgiFx.render();
                 } else {
                     renderer.render(scene, camera);

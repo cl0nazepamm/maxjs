@@ -128,8 +128,13 @@ export class ReflectionPaintNode extends LightingNode {
     // ── JS API ──────────────────────────────────────────
 
     addLight(props = {}) {
+        const requestedId = Number(props.id);
+        const id = Number.isSafeInteger(requestedId) && requestedId > 0 && !this._lights.some(l => l.id === requestedId)
+            ? requestedId
+            : this._nextId++;
+        this._nextId = Math.max(this._nextId, id + 1);
         const light = {
-            id: this._nextId++,
+            id,
             direction: new Vector3(0, 1, 0),
             color: new Color(1, 1, 1),
             colorOuter: new Color(0, 0, 0),

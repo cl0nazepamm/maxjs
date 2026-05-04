@@ -1727,17 +1727,33 @@
             nextRenderer?.dispose?.();
         }
 
+        const RENDERER_BACKEND_STORAGE_KEY = 'maxjs_renderer_backend_preference';
+
+        function normalizeRendererBackend(value) {
+            return value === 'webgl' || value === 'webgpu' || value === 'webgl-vr' ? value : '';
+        }
+
+        function persistRendererBackendPreference(mode) {
+            const normalized = mode === 'webgl-vr' ? 'webgl' : normalizeRendererBackend(mode);
+            if (normalized === 'webgl' || normalized === 'webgpu') {
+                try { localStorage.setItem(RENDERER_BACKEND_STORAGE_KEY, normalized); } catch {}
+            }
+        }
+
         function consumeRequestedRendererBackend() {
             const explicit = sessionStorage.getItem('maxjs_renderer_backend');
             if (explicit) {
                 sessionStorage.removeItem('maxjs_renderer_backend');
-                return explicit;
+                return normalizeRendererBackend(explicit);
             }
             const forceVR = sessionStorage.getItem('maxjs_force_webgl') === '1';
             if (forceVR) {
                 sessionStorage.removeItem('maxjs_force_webgl');
                 return 'webgl-vr';
             }
+            try {
+                return normalizeRendererBackend(localStorage.getItem(RENDERER_BACKEND_STORAGE_KEY));
+            } catch {}
             return '';
         }
 
@@ -2270,6 +2286,8 @@
         let lightProbeGrid = null;
         let hasLightProbeGridData = false;
         let hdriLoadGeneration = 0;
+        let lightProbeSceneRevision = 0;
+        let lightProbeRefreshTimer = 0;
 
         // Local HDRI override (independent of Max environment)
         let localHdriObjectUrl = null;   // file loaded in memory
@@ -2353,6 +2371,29 @@
             );
         }
 
+        function markLightProbeSceneDirty() {
+            lightProbeSceneRevision += 1;
+        }
+
+        function currentLightProbeSceneSignature() {
+            const bounds = computeLightProbeGridBounds(new THREE.Box3());
+            const center = bounds.getCenter(new THREE.Vector3());
+            const size = bounds.getSize(new THREE.Vector3());
+            const quantize = (value) => Math.round(Number(value || 0) * 1000) / 1000;
+            return JSON.stringify([
+                'scene-grid',
+                currentHdriUrl || null,
+                isLocalHdriActive(),
+                !!scene.environment,
+                defaultLights.visible,
+                lastLightsSignature,
+                nodeMap.size,
+                lightProbeSceneRevision,
+                center.toArray().map(quantize),
+                size.toArray().map(quantize),
+            ]);
+        }
+
         async function updateLightProbeGridFromScene(hdrTex, probeSignature, loadGeneration) {
             if (!supportsWebGLLightProbeGrid()) return false;
 
@@ -2422,6 +2463,31 @@
                 scene.backgroundRotation.copy(savedBackgroundRotation);
                 if (!hasLightProbeGridData) lightProbe.intensity = savedProbeIntensity;
             }
+        }
+
+        async function updateLightProbeFromCurrentScene({ force = false } = {}) {
+            if (!lightProbeEnabled && !force) return;
+            if (!supportsWebGLLightProbeGrid()) {
+                if (!currentHdriUrl) clearLightProbe();
+                return;
+            }
+
+            scene.updateMatrixWorld(true);
+            const probeSignature = currentLightProbeSceneSignature();
+            if (!force && hasLightProbeGridData && probeSignature === currentHdriProbeSignature) return;
+
+            currentHdriProbeSignature = probeSignature;
+            hdriLoadGeneration += 1;
+            await updateLightProbeGridFromScene(null, probeSignature, hdriLoadGeneration);
+        }
+
+        function scheduleLightProbeFromCurrentScene({ force = false, delay = 180 } = {}) {
+            if (!lightProbeEnabled && !force) return;
+            if (lightProbeRefreshTimer) clearTimeout(lightProbeRefreshTimer);
+            lightProbeRefreshTimer = setTimeout(() => {
+                lightProbeRefreshTimer = 0;
+                void updateLightProbeFromCurrentScene({ force });
+            }, delay);
         }
 
         async function updateLightProbeFromHDRI(hdrTex, probeSignature, loadGeneration) {
@@ -3067,7 +3133,11 @@
         }
 
         function refreshLightProbeFromCurrentHDRI() {
-            if (!currentEnvParams?.hdri) return;
+            if (!currentEnvParams?.hdri) {
+                markLightProbeSceneDirty();
+                scheduleLightProbeFromCurrentScene({ force: true, delay: 0 });
+                return;
+            }
             loadHDRI(currentEnvParams, { forceProbeRefresh: true });
         }
 
@@ -4706,6 +4776,8 @@
                             // Geometry data on the same Object3D — no pipeline
                             // rebuild needed regardless of which branch ran.
                             ssgiFx?.markGeometryDataDirty?.();
+                            markLightProbeSceneDirty();
+                            scheduleLightProbeFromCurrentScene({ delay: 350 });
                             }
                         }
                     } else {
@@ -5357,8 +5429,13 @@
             const sceneChanged = !!(options.sceneChanged || bucketChanged);
             if (sceneChanged) {
                 lightLinking.refreshSceneBindings?.();
+                markLightProbeSceneDirty();
             } else if (lightsChanged) {
                 ssgiFx.markOutputChanged?.();
+            }
+            if (sceneChanged || lightsChanged) {
+                if (lightsChanged) markLightProbeSceneDirty();
+                scheduleLightProbeFromCurrentScene();
             }
             // Full snapshot can add/remove many meshes — cheap scene refresh.
             // Effect toggles, env, and renderer size have their own dedicated
@@ -5510,6 +5587,8 @@
             if (msg.env && !isLocalHdriLoaded()) {
                 if (msg.env.sky) {
                     applySky(msg.env.sky);
+                    markLightProbeSceneDirty();
+                    scheduleLightProbeFromCurrentScene();
                 } else if (msg.env.hdri) {
                     removeSky();
                     loadHDRI(msg.env);
@@ -5557,6 +5636,8 @@
                 // Renderable-type swap (mesh ↔ line) — scene structure changed,
                 // refresh the post-pass hide list / toon cache. Cheap.
                 ssgiFx.markSceneChanged?.();
+                markLightProbeSceneDirty();
+                scheduleLightProbeFromCurrentScene();
                 return;
             }
 
@@ -5570,6 +5651,8 @@
             // refresh, no pipeline rebuild. pass(scene, camera) picks up the new
             // BufferGeometry attributes on the next frame automatically.
             ssgiFx.markGeometryDataDirty?.();
+            markLightProbeSceneDirty();
+            scheduleLightProbeFromCurrentScene({ delay: 350 });
         });
 
         // ── Hair Fast Sync — re-extracted world-space instances ──
@@ -5627,6 +5710,8 @@
             if (visibilityChanged) {
                 // Visibility flip changes the post-pass hide list — cheap refresh.
                 ssgiFx.markSceneChanged?.();
+                markLightProbeSceneDirty();
+                scheduleLightProbeFromCurrentScene({ delay: 350 });
             }
             const applyMs = performance.now() - applyStart;
             updateSyncHud({
@@ -5992,6 +6077,8 @@
                         shadowMapSize: ld.shadowMapSize,
                         volContrib: ld.volContrib,
                     });
+                    markLightProbeSceneDirty();
+                    scheduleLightProbeFromCurrentScene({ delay: 350 });
                 },
                 onSplat(handle, matrix, visible) {
                     const entry = splatHandleMap.get(handle);
@@ -6588,6 +6675,8 @@
             if (ssgiFx.setMainLight) {
                 ssgiFx.setMainLight(mainDirectionalLight || (defaultLights.visible ? defaultKey : null));
             }
+            markLightProbeSceneDirty();
+            scheduleLightProbeFromCurrentScene({ delay: 350 });
         }
 
         function sceneLightsSignature(lightsData) {
@@ -6788,29 +6877,112 @@
             // Constrain-to-camera: HDRI rotation tracks camera yaw
             let hdriConstrainToCamera = false;
             let hdriBaseRotationY = 0;
+            function getCameraYaw() {
+                camera.updateMatrixWorld(true);
+                return Math.atan2(
+                    camera.matrixWorld.elements[8],
+                    camera.matrixWorld.elements[10]
+                );
+            }
+            function getCameraWorldQuaternion(target = new THREE.Quaternion()) {
+                camera.updateMatrixWorld(true);
+                return camera.getWorldQuaternion(target);
+            }
             function setHdriConstrainToCamera(v) {
                 hdriConstrainToCamera = !!v;
-                if (v) hdriBaseRotationY = scene.environmentRotation.y;
+                if (v) hdriBaseRotationY = scene.environmentRotation.y + getCameraYaw();
                 save();
             }
             function getHdriConstrainToCamera() { return hdriConstrainToCamera; }
 
+            let reflectionPaintConstrainToCamera = false;
+            const reflectionPaintCameraDirections = new Map();
+            const constraintCameraQuat = new THREE.Quaternion();
+            const constraintInverseQuat = new THREE.Quaternion();
+            function vectorFromPlain(value) {
+                if (value?.isVector3) return value.clone();
+                if (Array.isArray(value) && value.length >= 3) {
+                    return new THREE.Vector3(value[0] || 0, value[1] || 0, value[2] || 0);
+                }
+                if (value && typeof value === 'object') {
+                    return new THREE.Vector3(value.x || 0, value.y || 0, value.z || 0);
+                }
+                return null;
+            }
+            function captureReflectionPaintCameraDirections(saved = null) {
+                reflectionPaintCameraDirections.clear();
+                const savedById = new Map();
+                for (const item of (Array.isArray(saved) ? saved : [])) {
+                    const id = Number(item?.id);
+                    const direction = vectorFromPlain(item?.cameraDirection ?? item?.direction);
+                    if (Number.isFinite(id) && direction) savedById.set(id, direction.normalize());
+                }
+                getCameraWorldQuaternion(constraintCameraQuat);
+                constraintInverseQuat.copy(constraintCameraQuat).invert();
+                for (const l of getReflectionPaintNode().getLights()) {
+                    const savedDir = savedById.get(Number(l.id));
+                    if (savedDir) {
+                        reflectionPaintCameraDirections.set(Number(l.id), savedDir);
+                        continue;
+                    }
+                    const worldDir = vectorFromPlain(l.direction);
+                    if (!worldDir) continue;
+                    reflectionPaintCameraDirections.set(
+                        Number(l.id),
+                        worldDir.normalize().applyQuaternion(constraintInverseQuat).normalize()
+                    );
+                }
+            }
+            function setReflectionPaintConstrainToCamera(v) {
+                reflectionPaintConstrainToCamera = !!v;
+                if (reflectionPaintConstrainToCamera) captureReflectionPaintCameraDirections();
+                save({ flush: true });
+            }
+            function getReflectionPaintConstrainToCamera() { return reflectionPaintConstrainToCamera; }
+
             // Constrain-to-camera: per-light camera-relative offset
-            // lightHandle -> { posOffset: Vector3, dirOffset: Vector3 }
+            // lightHandle -> { posOffset: Vector3, targetOffset: Vector3 }
             const lightCameraConstraints = new Map();
+            const constraintWorldPos = new THREE.Vector3();
+            function vectorFromArray(value) {
+                return Array.isArray(value) && value.length >= 3
+                    ? new THREE.Vector3(value[0] || 0, value[1] || 0, value[2] || 0)
+                    : null;
+            }
+            function toCameraLocalOffset(worldPosition) {
+                camera.updateMatrixWorld(true);
+                return camera.worldToLocal(worldPosition.clone());
+            }
+            function applyWorldPosition(object, worldPosition) {
+                if (!object) return;
+                if (object.parent) {
+                    object.parent.updateMatrixWorld(true);
+                    object.position.copy(object.parent.worldToLocal(worldPosition.clone()));
+                } else {
+                    object.position.copy(worldPosition);
+                }
+                object.updateMatrixWorld(true);
+            }
+            function buildCameraConstraintForLight(lightHandle, saved = null) {
+                const light = getByHandle(lightHandleMap, lightHandle);
+                if (!light) return null;
+                light.updateMatrixWorld(true);
+                const posOffset = vectorFromArray(saved?.posOffset)
+                    || toCameraLocalOffset(light.getWorldPosition(new THREE.Vector3()));
+                let targetOffset = vectorFromArray(saved?.targetOffset ?? saved?.dirOffset);
+                const target = light.userData?.maxjsTarget || light.target;
+                if (!targetOffset && target) {
+                    target.updateMatrixWorld(true);
+                    targetOffset = toCameraLocalOffset(target.getWorldPosition(new THREE.Vector3()));
+                }
+                return { posOffset, targetOffset };
+            }
             function setLightConstrainToCamera(lightHandle, enabled) {
                 const lightKey = handleToken(lightHandle);
                 if (enabled) {
-                    const light = getByHandle(lightHandleMap, lightHandle);
-                    if (!light) return;
-                    const camPos = camera.position;
-                    const posOffset = light.position.clone().sub(camPos);
-                    let dirOffset = null;
-                    const target = light.userData?.maxjsTarget;
-                    if (target) {
-                        dirOffset = target.position.clone().sub(camPos);
-                    }
-                    lightCameraConstraints.set(lightKey, { posOffset, dirOffset });
+                    const constraint = buildCameraConstraintForLight(lightHandle);
+                    if (!constraint) return;
+                    lightCameraConstraints.set(lightKey, constraint);
                 } else {
                     lightCameraConstraints.delete(lightKey);
                 }
@@ -6823,24 +6995,43 @@
             // Called each frame from renderFrame — updates constrained transforms.
             function updateCameraConstraints() {
                 if (hdriConstrainToCamera) {
-                    const camYaw = Math.atan2(
-                        camera.matrixWorld.elements[8],
-                        camera.matrixWorld.elements[10]
-                    );
+                    const camYaw = getCameraYaw();
                     scene.environmentRotation.y = hdriBaseRotationY - camYaw;
                     scene.backgroundRotation.y = hdriBaseRotationY - camYaw;
                 }
+                if (reflectionPaintConstrainToCamera) {
+                    getCameraWorldQuaternion(constraintCameraQuat);
+                    const paint = getReflectionPaintNode();
+                    const liveIds = new Set();
+                    for (const l of paint.getLights()) {
+                        const id = Number(l.id);
+                        liveIds.add(id);
+                        let localDir = reflectionPaintCameraDirections.get(id);
+                        if (!localDir) {
+                            const worldDir = vectorFromPlain(l.direction);
+                            if (!worldDir) continue;
+                            constraintInverseQuat.copy(constraintCameraQuat).invert();
+                            localDir = worldDir.normalize().applyQuaternion(constraintInverseQuat).normalize();
+                            reflectionPaintCameraDirections.set(id, localDir);
+                        }
+                        paint.updateLight(id, {
+                            direction: localDir.clone().applyQuaternion(constraintCameraQuat).normalize(),
+                        });
+                    }
+                    for (const id of reflectionPaintCameraDirections.keys()) {
+                        if (!liveIds.has(id)) reflectionPaintCameraDirections.delete(id);
+                    }
+                    notifyLightingParamChanged();
+                }
                 if (lightCameraConstraints.size === 0) return;
-                const camPos = camera.position;
                 for (const [lh, c] of lightCameraConstraints) {
                     const light = getByHandle(lightHandleMap, lh);
                     if (!light) continue;
-                    light.position.copy(camPos).add(c.posOffset);
-                    if (c.dirOffset) {
-                        const target = light.userData?.maxjsTarget;
+                    applyWorldPosition(light, camera.localToWorld(constraintWorldPos.copy(c.posOffset)));
+                    if (c.targetOffset) {
+                        const target = light.userData?.maxjsTarget || light.target;
                         if (target) {
-                            target.position.copy(camPos).add(c.dirOffset);
-                            target.updateMatrixWorld();
+                            applyWorldPosition(target, camera.localToWorld(constraintWorldPos.copy(c.targetOffset)));
                         }
                     }
                 }
@@ -6883,12 +7074,29 @@
                 const data = { links: {}, env: {}, constrain: {} };
                 data.reflectionPaintIntensity = getReflectionPaintIntensity();
                 data.constrain.hdri = hdriConstrainToCamera;
-                const constrainedLightNames = [];
-                for (const lh of lightCameraConstraints.keys()) {
-                    const n = getByHandle(lightHandleMap, lh)?.name;
-                    if (n) constrainedLightNames.push(n);
+                data.constrain.reflectionPaint = reflectionPaintConstrainToCamera;
+                if (reflectionPaintCameraDirections.size > 0) {
+                    data.constrain.reflectionPaintDirections = [...reflectionPaintCameraDirections].map(([id, direction]) => ({
+                        id,
+                        cameraDirection: direction.toArray(),
+                    }));
                 }
-                if (constrainedLightNames.length) data.constrain.lights = constrainedLightNames;
+                const constrainedLightNames = [];
+                const constrainedLights = [];
+                for (const [lh, constraint] of lightCameraConstraints) {
+                    const n = getByHandle(lightHandleMap, lh)?.name;
+                    if (!n) continue;
+                    constrainedLightNames.push(n);
+                    constrainedLights.push({
+                        name: n,
+                        posOffset: constraint.posOffset.toArray(),
+                        targetOffset: constraint.targetOffset ? constraint.targetOffset.toArray() : null,
+                    });
+                }
+                if (constrainedLightNames.length) {
+                    data.constrain.lights = constrainedLightNames;
+                    data.constrain.lightOffsets = constrainedLights;
+                }
                 for (const [lh, link] of links) {
                     const lName = getByHandle(lightHandleMap, lh)?.name;
                     if (!lName) continue;
@@ -6905,8 +7113,8 @@
                 return data;
             }
 
-            function save() {
-                saveStudioState();
+            function save(options = {}) {
+                saveStudioState(options);
             }
 
             function readLegacyStorage() {
@@ -6918,7 +7126,7 @@
                 }
             }
 
-            function applyPayload(data) {
+            function applyPayload(data, options = {}) {
                 try {
                     links.clear();
                     envIntensityByName.clear();
@@ -6951,12 +7159,22 @@
                     }
                     const rawConstrain = data.constrain || {};
                     hdriConstrainToCamera = !!rawConstrain.hdri;
-                    if (hdriConstrainToCamera) hdriBaseRotationY = scene.environmentRotation.y;
-                    for (const lName of (rawConstrain.lights || [])) {
-                        const lh = lightHandleByName(lName);
-                        if (lh != null) setLightConstrainToCamera(lh, true);
+                    if (hdriConstrainToCamera) hdriBaseRotationY = scene.environmentRotation.y + getCameraYaw();
+                    reflectionPaintConstrainToCamera = !!rawConstrain.reflectionPaint;
+                    if (reflectionPaintConstrainToCamera) {
+                        captureReflectionPaintCameraDirections(rawConstrain.reflectionPaintDirections);
                     }
-                    if (Number.isFinite(data.reflectionPaintIntensity)) {
+                    const lightConstraints = Array.isArray(rawConstrain.lightOffsets)
+                        ? rawConstrain.lightOffsets
+                        : (rawConstrain.lights || []).map(name => ({ name }));
+                    for (const item of lightConstraints) {
+                        const lName = typeof item === 'string' ? item : item?.name;
+                        const lh = lightHandleByName(lName);
+                        if (lh == null) continue;
+                        const constraint = buildCameraConstraintForLight(lh, item);
+                        if (constraint) lightCameraConstraints.set(handleToken(lh), constraint);
+                    }
+                    if (options.applyReflectionPaintIntensity !== false && Number.isFinite(data.reflectionPaintIntensity)) {
                         getReflectionPaintNode().setGlobalIntensity(data.reflectionPaintIntensity);
                     }
                     reapply();
@@ -6977,6 +7195,8 @@
                 setEnvIntensity, getEnvIntensity,
                 setReflectionPaintIntensity, getReflectionPaintIntensity,
                 setHdriConstrainToCamera, getHdriConstrainToCamera,
+                setReflectionPaintConstrainToCamera, getReflectionPaintConstrainToCamera,
+                captureReflectionPaintCameraDirections,
                 setLightConstrainToCamera, getLightConstrainToCamera,
                 updateCameraConstraints,
             };
@@ -6985,6 +7205,7 @@
         // ── Light Linking Panel UI ───────────────────────────
         const lightLinkPanel = document.getElementById('lightLinkPanel');
         let lightLinkPanelVisible = false;
+        let lightLinkPanelSelectedTarget = '';
 
         function setLightLinkPanelVisible(v) {
             if (v && !isStudioMode) return;
@@ -6996,7 +7217,11 @@
             if (lightLinkPanelVisible) rebuildLightLinkPanel();
         }
 
-        function rebuildLightLinkPanel() {
+        function rebuildLightLinkPanel(preferredTarget = '') {
+            const previousTarget = preferredTarget
+                || lightLinkPanelSelectedTarget
+                || document.getElementById('ll-light-sel')?.value
+                || '';
             const collectSliderMaterials = () => {
                 const names = new Set();
                 const items = [];
@@ -7091,6 +7316,16 @@
             const objList = document.getElementById('ll-obj-list');
             const listLabel = document.getElementById('ll-list-label');
             let sliderTargets = [];
+            const availableTargetValues = new Set();
+            if (hdriAvailable) availableTargetValues.add('__hdri__');
+            for (const l of lights) availableTargetValues.add(String(l.h));
+            if (reflectionPaintAvailable) availableTargetValues.add('__rp__');
+            if (availableTargetValues.has(previousTarget)) {
+                lightSel.value = previousTarget;
+                lightLinkPanelSelectedTarget = previousTarget;
+            } else {
+                lightLinkPanelSelectedTarget = lightSel.value || '';
+            }
 
             function isHdriMode() { return lightSel.value === '__hdri__'; }
             function isRpMode() { return lightSel.value === '__rp__'; }
@@ -7164,7 +7399,9 @@
                     objList.style.opacity = '1';
                     objList.style.pointerEvents = 'auto';
                     constrainRow.style.display = 'flex';
-                    constrainCam.checked = lightLinking.getHdriConstrainToCamera();
+                    constrainCam.checked = isRpMode()
+                        ? lightLinking.getReflectionPaintConstrainToCamera()
+                        : lightLinking.getHdriConstrainToCamera();
                     renderObjectList();
                     return;
                 }
@@ -7202,7 +7439,10 @@
                 lightLinking.setLink(lh, mode, objs);
             }
 
-            lightSel.addEventListener('change', loadLightState);
+            lightSel.addEventListener('change', () => {
+                lightLinkPanelSelectedTarget = lightSel.value;
+                loadLightState();
+            });
 
             modeNone.addEventListener('click', () => { setActiveMode('none'); applyFromUI(); });
             modeInclude.addEventListener('click', () => { setActiveMode('include'); applyFromUI(); });
@@ -7239,7 +7479,9 @@
 
             constrainCam.addEventListener('change', () => {
                 const sel = getSelectedLight();
-                if (isHdriMode() || isRpMode()) {
+                if (isRpMode()) {
+                    lightLinking.setReflectionPaintConstrainToCamera(constrainCam.checked);
+                } else if (isHdriMode()) {
                     lightLinking.setHdriConstrainToCamera(constrainCam.checked);
                 } else {
                     lightLinking.setLightConstrainToCamera(sel, constrainCam.checked);
@@ -7263,10 +7505,12 @@
         let reflPaintPanelVisible = false;
         const REFL_PAINT_STORAGE_KEY = 'maxjs-reflection-paint';
 
-        function notifyReflectionPaintChanged(wasActive) {
+        function notifyReflectionPaintChanged(wasActive, options = {}) {
             if (wasActive !== reflPaint.active) ssgiFx.markSceneChanged?.();
             ssgiFx.markOutputChanged?.();
-            if (lightLinkPanelVisible) rebuildLightLinkPanel();
+            if (lightLinkPanelVisible && (options.rebuildLightPanel || wasActive !== reflPaint.active)) {
+                rebuildLightLinkPanel();
+            }
         }
 
         function setReflPaintPanelVisible(v) {
@@ -7302,6 +7546,7 @@
                 reflPaint.clearLights();
                 for (const l of (Array.isArray(lights) ? lights : [])) {
                     reflPaint.addLight({
+                        id: l.id,
                         lat: l.lat, lon: l.lon,
                         color: l.color,
                         colorOuter: l.colorOuter,
@@ -7378,6 +7623,9 @@
                 return;
             }
             reflPaint.updateLight(id, props);
+            if (lightLinking.getReflectionPaintConstrainToCamera()) {
+                lightLinking.captureReflectionPaintCameraDirections();
+            }
             saveReflPaint();
             notifyReflectionPaintChanged(wasActive);
         }
@@ -7430,8 +7678,11 @@
             document.getElementById('rp-add')?.addEventListener('click', () => {
                 const wasActive = reflPaint.active;
                 reflPaint.addLight({ lat: 45, lon: 90, intensity: 2.0, radiusX: 0.15, radiusY: 0.15, edge: 0.3, shape: 'circle', rotation: 0 });
+                if (lightLinking.getReflectionPaintConstrainToCamera()) {
+                    lightLinking.captureReflectionPaintCameraDirections();
+                }
                 saveReflPaint({ flush: true });
-                notifyReflectionPaintChanged(wasActive);
+                notifyReflectionPaintChanged(wasActive, { rebuildLightPanel: true });
                 rebuildReflPaintPanel();
             });
             document.getElementById('rp-hide')?.addEventListener('click', () => {
@@ -7442,6 +7693,9 @@
                 btn.addEventListener('click', () => {
                     const wasActive = reflPaint.active;
                     reflPaint.removeLight(Number(btn.dataset.id));
+                    if (lightLinking.getReflectionPaintConstrainToCamera()) {
+                        lightLinking.captureReflectionPaintCameraDirections();
+                    }
                     saveReflPaint({ flush: true });
                     notifyReflectionPaintChanged(wasActive);
                     rebuildReflPaintPanel();
@@ -7463,6 +7717,7 @@
         let queuedProjectStudioSignature = '';
         let queuedProjectStudioPayload = null;
         let studioPersistInFlight = false;
+        let newestLocalStudioSignature = '';
         let suppressStudioPersistenceDepth = 0;
         const STUDIO_PERSIST_IDLE_MS = 550;
 
@@ -7486,8 +7741,8 @@
         function applyStudioState(payload) {
             if (!payload || typeof payload !== 'object') return;
             withStudioPersistenceSuppressed(() => {
-                lightLinking.applyPayload(payload.lightLinking);
                 applyReflectionPaintState(payload.reflectionPaint ?? { lights: [], intensity: 1.0 });
+                lightLinking.applyPayload(payload.lightLinking);
                 if (lightLinkPanelVisible) rebuildLightLinkPanel();
                 if (reflPaintPanelVisible) rebuildReflPaintPanel();
             });
@@ -7531,6 +7786,9 @@
             try {
                 await projectRuntime.setStudioState(payload);
                 lastProjectStudioSignature = signature;
+                if (newestLocalStudioSignature === signature && !queuedProjectStudioPayload) {
+                    newestLocalStudioSignature = '';
+                }
             } catch (error) {
                 reportBridgeError('studio state save', error);
             } finally {
@@ -7547,6 +7805,8 @@
             if (projectRuntime?.setStudioState) {
                 if (signature === lastProjectStudioSignature && !queuedProjectStudioPayload) return;
                 if (signature === queuedProjectStudioSignature) return;
+                newestLocalStudioSignature = signature;
+                lastProjectStudioSignature = signature;
                 queuedProjectStudioPayload = payload;
                 queuedProjectStudioSignature = signature;
                 scheduleProjectStudioSave(options.flush ? 0 : STUDIO_PERSIST_IDLE_MS);
@@ -7560,6 +7820,7 @@
             const projectPayload = projectRuntime?.getStudioState?.();
             if (projectPayload) {
                 lastProjectStudioSignature = JSON.stringify(projectPayload);
+                newestLocalStudioSignature = '';
                 queuedProjectStudioSignature = '';
                 queuedProjectStudioPayload = null;
                 applyStudioState(projectPayload);
@@ -7574,6 +7835,7 @@
             if (!payload) return;
             const signature = JSON.stringify(payload);
             if (!signature || signature === lastProjectStudioSignature) return;
+            if (newestLocalStudioSignature && signature !== newestLocalStudioSignature) return;
             lastProjectStudioSignature = signature;
             applyStudioState(payload);
         }
@@ -8897,19 +9159,15 @@
             const reason = options.reason || 'manual';
             const confirmMessage = options.confirmMessage
                 || `Restart max.js with ${mode === 'webgl' ? 'WebGL2' : 'WebGPU'} backend now?`;
-            if (mode === 'webgl' && reason === 'vr') {
-                sessionStorage.setItem('maxjs_force_webgl', '1');
-            } else {
-                sessionStorage.setItem('maxjs_renderer_backend', mode);
-            }
             if (options.prompt === false || confirm(confirmMessage)) {
+                persistRendererBackendPreference(mode);
+                if (mode === 'webgl' && reason === 'vr') {
+                    sessionStorage.setItem('maxjs_force_webgl', '1');
+                } else {
+                    sessionStorage.setItem('maxjs_renderer_backend', mode);
+                }
                 location.reload();
                 return;
-            }
-            if (mode === 'webgl' && reason === 'vr') {
-                sessionStorage.removeItem('maxjs_force_webgl');
-            } else {
-                sessionStorage.removeItem('maxjs_renderer_backend');
             }
         }
         btnRenderer?.addEventListener('click', () => {

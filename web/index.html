@@ -1910,9 +1910,11 @@
 
         // ── Loaders & Caches ────────────────────────────────
         const textureLoader = new THREE.TextureLoader();
+        const webglTextureLoader = new THREE_STD.TextureLoader();
         const rgbeLoader = new HDRLoader();
         const exrLoader = new EXRLoader();
         textureLoader.setCrossOrigin?.('anonymous');
+        webglTextureLoader.setCrossOrigin?.('anonymous');
         rgbeLoader.setCrossOrigin?.('anonymous');
         exrLoader.setCrossOrigin?.('anonymous');
         const PMREMGeneratorCtor = String(rendererBackendLabel || '').startsWith('WebGL2')
@@ -1983,6 +1985,7 @@
         }
 
         const textureCache = new Map();
+        const failedTextureCache = new Set();
         const materialCache = new Map();
         const materialXTemplateCache = new Map();
         const materialXLoadCache = new Map();
@@ -3110,6 +3113,88 @@
             applyTextureTransform(tex, normalizedXf);
             textureCache.set(cacheKey, tex);
             return tex;
+        }
+
+        function isWebGLTexturePathActive() {
+            return !!renderer?.isWebGLRenderer || String(rendererBackendLabel || '').startsWith('WebGL2');
+        }
+
+        function prepareLoadedBakeTexture(loadedTex, colorSpace, maxMapChannel) {
+            if (!loadedTex?.isTexture) return null;
+            let tex = loadedTex;
+            if (isWebGLTexturePathActive() && loadedTex.isDataTexture && loadedTex.image?.data) {
+                const image = loadedTex.image;
+                tex = new THREE_STD.DataTexture(image.data, image.width, image.height);
+                tex.format = loadedTex.format;
+                tex.type = loadedTex.type;
+                tex.mapping = loadedTex.mapping;
+                tex.wrapS = loadedTex.wrapS;
+                tex.wrapT = loadedTex.wrapT;
+                tex.magFilter = loadedTex.magFilter;
+                tex.minFilter = loadedTex.minFilter;
+                tex.generateMipmaps = loadedTex.generateMipmaps;
+                tex.flipY = loadedTex.flipY;
+                tex.unpackAlignment = loadedTex.unpackAlignment;
+            }
+            tex.colorSpace = colorSpace;
+            applyTextureUvChannel(tex, maxMapChannel, 2);
+            tex.needsUpdate = true;
+            return tex;
+        }
+
+        function loadBakeTexture(url, colorSpace = THREE.LinearSRGBColorSpace, maxMapChannel = 2) {
+            if (!url) return null;
+            colorSpace = resolveColorSpace(colorSpace, null);
+            const channel = maxMapChannelToTextureChannel(maxMapChannel, 2);
+            const cacheKey = JSON.stringify(['bake', url, String(colorSpace), channel]);
+            const cached = textureCache.get(cacheKey);
+            if (cached?.isTexture) return cached;
+            if (cached?.pending) return null;
+            if (failedTextureCache.has(cacheKey)) return null;
+
+            const ext = getTextureExtension(url);
+            if (!canBrowserLoadTextureExtension(ext)) {
+                failedTextureCache.add(cacheKey);
+                console.warn('max.js skipped unsupported bake texture format:', url);
+                return null;
+            }
+
+            const loader = ext === 'exr'
+                ? exrLoader
+                : (ext === 'hdr' ? rgbeLoader : (isWebGLTexturePathActive() ? webglTextureLoader : textureLoader));
+            textureCache.set(cacheKey, { pending: true });
+            loader.load(
+                url,
+                loadedTex => {
+                    const bakeTex = prepareLoadedBakeTexture(loadedTex, colorSpace, maxMapChannel);
+                    if (!bakeTex) {
+                        failedTextureCache.add(cacheKey);
+                        textureCache.delete(cacheKey);
+                        return;
+                    }
+                    failedTextureCache.delete(cacheKey);
+                    textureCache.set(cacheKey, bakeTex);
+                    if (bakeOverrides.enabled) reapplyBakeOverridesToScene();
+                    ssgiFx.markOutputChanged?.();
+                },
+                undefined,
+                () => {
+                    failedTextureCache.add(cacheKey);
+                    textureCache.delete(cacheKey);
+                    if (bakeOverrides.enabled) reapplyBakeOverridesToScene();
+                    ssgiFx.markOutputChanged?.();
+                }
+            );
+            return null;
+        }
+
+        function clearBakeTextureLoadFailures() {
+            for (const key of [...failedTextureCache]) {
+                if (String(key).startsWith('["bake",')) failedTextureCache.delete(key);
+            }
+            for (const [key, value] of [...textureCache]) {
+                if (String(key).startsWith('["bake",') && value?.pending) textureCache.delete(key);
+            }
         }
 
         // Evaluate TSL texture code — code must return a THREE.Texture or THREE.DataTexture
@@ -5273,18 +5358,18 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             ).trim() || 'material';
         }
 
-        function getBakeTargetName(nd, material) {
-            if (bakeOverrides.match === 'object') return nd?.n || nd?.name || `node_${nd?.h ?? '0'}`;
+        function getBakeTargetName(nd, material, mesh = null) {
+            if (bakeOverrides.match === 'object') return mesh?.name || nd?.n || nd?.name || `node_${nd?.h ?? '0'}`;
             if (bakeOverrides.match === 'material') return getMaterialBakeName(material);
             return bakeOverrides.sceneName;
         }
 
-        function getBakeTextureUrl(nd, material, kind) {
+        function getBakeTextureUrl(nd, material, kind, mesh = null) {
             if (!bakeOverrides.enabled || !bakeOverrides.folder) return '';
             const folder = normalizeBakeFolderUrl(bakeOverrides.folder);
             if (!folder) return '';
             const suffix = kind === 'beauty' ? bakeOverrides.beautySuffix : bakeOverrides.lightSuffix;
-            const stem = sanitizeBakeFileStem(getBakeTargetName(nd, material));
+            const stem = sanitizeBakeFileStem(getBakeTargetName(nd, material, mesh));
             return `${folder}${encodeURIComponent(`${stem}${suffix}.${bakeOverrides.extension}`)}`;
         }
 
@@ -5294,7 +5379,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
 
         function maybeRequestBakeUv2Resync(reason = 'auto') {
             const state = normalizeBakeState(bakeOverrides);
-            if (!state.enabled || state.mode !== 'lightmap') return;
+            if (!state.enabled || (state.mode !== 'lightmap' && state.mode !== 'beauty')) return;
             if (!window.chrome?.webview) return;
 
             const stats = getBakeSceneStats();
@@ -5307,16 +5392,17 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             clearTimeout(bakeUv2RequestTimer);
             bakeUv2RequestTimer = setTimeout(() => {
                 bridge.send('sync_lightmap_uvs', { reason });
-                perfHud.setStatus('max.js - requesting native UV2/lightmap geometry resync');
+                perfHud.setStatus('max.js - requesting native UV2 bake geometry resync');
             }, 50);
         }
 
         function createBeautyBakeMaterial(source, texture) {
-            const exposureMul = Math.pow(2, bakeOverrides.bakeExposure);
-            const mat = new THREE.MeshBasicMaterial({
-                color: new THREE.Color(exposureMul, exposureMul, exposureMul),
+            const BakeTHREE = isWebGLTexturePathActive() ? THREE_STD : THREE;
+            const exposureMul = bakeOverrides.intensity * Math.pow(2, bakeOverrides.bakeExposure);
+            const mat = new BakeTHREE.MeshBasicMaterial({
+                color: new BakeTHREE.Color(exposureMul, exposureMul, exposureMul),
                 map: applyTextureUvChannel(texture, 2, 2),
-                side: source?.side ?? THREE.FrontSide,
+                side: source?.side ?? BakeTHREE.FrontSide,
                 transparent: !!source?.transparent || (Number.isFinite(source?.opacity) && source.opacity < 1),
                 opacity: Number.isFinite(source?.opacity) ? source.opacity : 1,
                 alphaMap: source?.alphaMap ?? null,
@@ -5328,15 +5414,20 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             return mat;
         }
 
-        function applyBakeOverrideToMaterial(material, nd, geom) {
+        function applyBakeOverrideToMaterial(material, nd, geom, mesh = null) {
             if (!material || !bakeOverrides.enabled) return material;
             if (material.isLineBasicMaterial || material.isLineDashedMaterial) return material;
             const kind = bakeOverrides.mode === 'beauty' ? 'beauty' : 'lightmap';
-            const url = getBakeTextureUrl(nd, material, kind);
+            const url = getBakeTextureUrl(nd, material, kind, mesh);
             if (!url) return material;
 
             if (kind === 'beauty') {
-                const tex = loadTexture(url, THREE.SRGBColorSpace, null, fallbackWhiteTexture);
+                if (!hasGeometryUV2(geom)) {
+                    material.userData ??= {};
+                    material.userData.maxjsBakeMissingUV2 = true;
+                    return material;
+                }
+                const tex = loadBakeTexture(url, THREE.SRGBColorSpace, 2);
                 return tex ? createBeautyBakeMaterial(material, tex) : material;
             }
 
@@ -5345,9 +5436,9 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 material.userData.maxjsBakeMissingUV2 = true;
                 return material;
             }
-            const tex = loadTexture(url, THREE.LinearSRGBColorSpace, null, fallbackWhiteTexture);
+            const tex = loadBakeTexture(url, THREE.LinearSRGBColorSpace, 2);
             if (!tex) return material;
-            material.lightMap = applyTextureUvChannel(tex, 2, 2);
+            material.lightMap = tex;
             material.lightMapIntensity = bakeOverrides.intensity * Math.pow(2, bakeOverrides.bakeExposure);
             material.userData ??= {};
             material.userData.maxjsBakeOverride = 'lightmap';
@@ -5355,14 +5446,14 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             return material;
         }
 
-        function applyBakeOverridesToSceneMaterial(material, nd, geom) {
+        function applyBakeOverridesToSceneMaterial(material, nd, geom, mesh = null) {
             if (Array.isArray(material)) {
-                return material.map(item => applyBakeOverrideToMaterial(item, nd, geom));
+                return material.map(item => applyBakeOverrideToMaterial(item, nd, geom, mesh));
             }
-            return applyBakeOverrideToMaterial(material, nd, geom);
+            return applyBakeOverrideToMaterial(material, nd, geom, mesh);
         }
 
-        function createSceneMaterial(nd, geom = null) {
+        function createSceneMaterial(nd, geom = null, mesh = null) {
             let material = null;
             if (nd?.mats && nd?.groups) {
                 material = nd.mats.map((m, materialIndex) => createMaterial(m, {
@@ -5385,7 +5476,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 material.userData.maxjsMaterialIdentityKey = entry.key;
                 material.userData.maxjsSourceMaterialName = 'default';
             }
-            return applyBakeOverridesToSceneMaterial(material, nd, geom);
+            return applyBakeOverridesToSceneMaterial(material, nd, geom, mesh);
         }
 
         function createDefaultSceneMaterial() {
@@ -5470,8 +5561,8 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             return false;
         }
 
-        function createSceneRenderableMaterial(nd, wantsLine, geom = null) {
-            const mat = createSceneMaterial(nd, geom);
+        function createSceneRenderableMaterial(nd, wantsLine, geom = null, mesh = null) {
+            const mat = createSceneMaterial(nd, geom, mesh);
             if (!wantsLine) return mat;
             const lineMat = createSceneLineMaterial(mat);
             if (!isCachedMaterialTemplate(mat)) disposeSceneMaterial(mat);
@@ -5490,7 +5581,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             const signature = sceneMaterialSignature(nd, wantsLine);
             if (mesh.material && mesh.userData?.maxjsMaterialSignature === signature) return false;
             const oldMaterial = mesh.material;
-            mesh.material = createSceneRenderableMaterial(nd, wantsLine, mesh.geometry);
+            mesh.material = createSceneRenderableMaterial(nd, wantsLine, mesh.geometry, mesh);
             mesh.userData ??= {};
             mesh.userData.maxjsMaterialSignature = signature;
             mesh.userData.maxjsLastNodePayload = nd;
@@ -8319,7 +8410,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             return { meshes, uv2 };
         }
 
-        function mutateLightmapBakeOnMaterial(material, nd, geom) {
+        function mutateLightmapBakeOnMaterial(material, nd, geom, mesh = null) {
             if (!material) return false;
             if (material.isLineBasicMaterial || material.isLineDashedMaterial) return false;
             const wasOverride = material.userData?.maxjsBakeOverride;
@@ -8336,7 +8427,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 return false;
             }
 
-            const url = getBakeTextureUrl(nd, material, 'lightmap');
+            const url = getBakeTextureUrl(nd, material, 'lightmap', mesh);
             if (!url || !hasGeometryUV2(geom)) {
                 material.userData ??= {};
                 if (!url) {
@@ -8353,9 +8444,9 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 return false;
             }
 
-            const tex = loadTexture(url, THREE.LinearSRGBColorSpace, null, fallbackWhiteTexture);
+            const tex = loadBakeTexture(url, THREE.LinearSRGBColorSpace, 2);
             if (!tex) return false;
-            const nextLightMap = applyTextureUvChannel(tex, 2, 2);
+            const nextLightMap = tex;
             const intensity = bakeOverrides.intensity * Math.pow(2, bakeOverrides.bakeExposure);
             const lightMapChanged = material.lightMap !== nextLightMap;
             const intensityChanged = material.lightMapIntensity !== intensity;
@@ -8393,7 +8484,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 for (const m of mats) {
                     if (!m || seenMats.has(m)) continue;
                     seenMats.add(m);
-                    if (mutateLightmapBakeOnMaterial(m, nd, mesh.geometry)) changed = true;
+                    if (mutateLightmapBakeOnMaterial(m, nd, mesh.geometry, mesh)) changed = true;
                 }
             }
             if (changed) {
@@ -8403,17 +8494,18 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             return changed;
         }
 
-        function applyBakeState(payload, { persist = false, rebuild = true, refreshPanel = true } = {}) {
+        function applyBakeState(payload, { persist = false, rebuild = true, refreshPanel = true, force = false } = {}) {
             const next = normalizeBakeState(payload);
             const prevSignature = bakeStateSignature();
             const nextSignature = JSON.stringify(next);
             const activeEl = document.activeElement;
             const bakePanelEditing = !!(bakePanelVisible && activeEl && bakePanel.contains(activeEl) && activeEl.matches?.('input,select,textarea'));
-            if (prevSignature === nextSignature) {
+            if (!force && prevSignature === nextSignature) {
                 if (refreshPanel && bakePanelVisible && !bakePanelEditing) rebuildBakePanel();
                 return;
             }
             bakeOverrides = next;
+            maybeRequestBakeUv2Resync('bake-overrides');
             if (rebuild) reapplyBakeOverridesToScene();
             if (refreshPanel && bakePanelVisible && !bakePanelEditing) rebuildBakePanel();
             if (persist) saveBakeState();
@@ -8512,6 +8604,27 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             if (beautyPreview) beautyPreview.textContent = `Beauty: ${sampleBeauty}`;
         }
 
+        function getBakeTargetPreviewRows(limit = 8) {
+            const kind = bakeOverrides.mode === 'beauty' ? 'beauty' : 'lightmap';
+            const rows = [];
+            const seen = new Set();
+            for (const mesh of nodeMap.values()) {
+                const nd = mesh?.userData?.maxjsLastNodePayload;
+                if (!mesh?.isMesh || !nd) continue;
+                const material = Array.isArray(mesh.material) ? mesh.material[0] : mesh.material;
+                const stem = sanitizeBakeFileStem(getBakeTargetName(nd, material, mesh));
+                const key = `${stem}|${kind}`;
+                if (seen.has(key)) continue;
+                seen.add(key);
+                rows.push({
+                    stem,
+                    url: getBakeTextureUrl(nd, material, kind, mesh) || '',
+                });
+                if (rows.length >= limit) break;
+            }
+            return rows;
+        }
+
         function isBakeTextInput(el) {
             return el?.tagName === 'INPUT' && String(el.type || '').toLowerCase() === 'text';
         }
@@ -8528,6 +8641,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             const stats = getBakeSceneStats();
             const sampleLight = getBakeTextureUrl({ n: 'ObjectName', h: 0 }, null, 'lightmap') || 'Set a folder to preview path';
             const sampleBeauty = getBakeTextureUrl({ n: 'ObjectName', h: 0 }, null, 'beauty') || 'Set a folder to preview path';
+            const targetRows = getBakeTargetPreviewRows();
             bakePanel.innerHTML = `
                 <div class="sidepanel-header">
                     <div><div class="sidepanel-title">Bake Overrides</div>
@@ -8563,6 +8677,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                         </div>
                         <div id="bake-light-preview" class="bake-path-preview">Light: ${escapeBakeHtml(sampleLight)}</div>
                         <div id="bake-beauty-preview" class="bake-path-preview">Beauty: ${escapeBakeHtml(sampleBeauty)}</div>
+                        ${targetRows.length > 0 ? `<div class="bake-path-preview">Targets: ${targetRows.map(row => `${escapeBakeHtml(row.stem)} -> ${escapeBakeHtml(row.url)}`).join(' | ')}</div>` : ''}
                         <div class="bake-actions">
                             <button id="bake-reapply" type="button">Reapply</button>
                             <button id="bake-sync" type="button">Sync UV2</button>
@@ -8571,7 +8686,8 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 </div>`;
             bakePanel.querySelector('#bake-hide')?.addEventListener('click', () => setBakePanelVisible(false));
             bakePanel.querySelector('#bake-reapply')?.addEventListener('click', () => {
-                applyBakeState(readBakeStateFromPanel(), { persist: true, rebuild: true, refreshPanel: false });
+                clearBakeTextureLoadFailures();
+                applyBakeState(readBakeStateFromPanel(), { persist: true, rebuild: true, refreshPanel: false, force: true });
                 perfHud.setStatus('max.js - bake overrides reapplied');
             });
             bakePanel.querySelector('#bake-sync')?.addEventListener('click', () => {

@@ -2410,6 +2410,10 @@ static ParamBlockDesc2 threejs_html_tex_pb_desc(
         p_end,
     phtml_tex_params_json, _T("paramsJson"), TYPE_STRING, 0, 0,
         p_end,
+    phtml_tex_override, _T("overrideMode"), TYPE_BOOL, 0, 0,
+        p_default, FALSE,
+        p_ui, TYPE_SINGLECHEKBOX, IDC_HTML_TEX_OVERRIDE,
+        p_end,
     p_end
 );
 

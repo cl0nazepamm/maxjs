@@ -1652,6 +1652,7 @@ struct MaxJSPBR {
         std::wstring htmlParamsJson;
         int   htmlWidth  = 1024;
         int   htmlHeight = 1024;
+        bool  htmlOverrideMode = false;
     };
 
     float color[3]    = {0.8f, 0.8f, 0.8f};
@@ -2321,6 +2322,9 @@ static bool ExtractMaterialTexture(Texmap* map, std::wstring& filePath, MaxJSPBR
         if (xf.htmlHeight > 4096) xf.htmlHeight = 4096;
         const MCHAR* pj = pb->GetStr(phtml_tex_params_json);
         if (pj && pj[0]) xf.htmlParamsJson = pj;
+        if (HasParam(pb, phtml_tex_override)) {
+            xf.htmlOverrideMode = pb->GetInt(phtml_tex_override, 0) != 0;
+        }
         return true;
     }
 
@@ -13813,6 +13817,8 @@ public:
                 ss << L",\"" << key << L"HTMLH\":" << xf.htmlHeight;
                 if (!xf.htmlParamsJson.empty() && IsProbablyJsonStructured(xf.htmlParamsJson))
                     ss << L",\"" << key << L"HTMLParams\":" << xf.htmlParamsJson;
+                if (xf.htmlOverrideMode)
+                    ss << L",\"" << key << L"HTMLOverride\":true";
                 if (xfKey) writeXf(xfKey, xf);
                 return;
             }

@@ -3188,6 +3188,46 @@
             return true;
         }
 
+        function wantsHTMLTextureOverrideMaterial(md) {
+            return !!md?.mapHTML && (md.mapHTMLOverride === true || md.mapHTMLOverride === 1);
+        }
+
+        function htmlTextureOverrideIdentity(md) {
+            return {
+                name: md?.name || '',
+                side: md?.side ?? 1,
+                mapHTML: md?.mapHTML || '',
+                mapHTMLBase: md?.mapHTMLBase || '',
+                mapHTMLName: md?.mapHTMLName || '',
+                mapHTMLW: md?.mapHTMLW || 1024,
+                mapHTMLH: md?.mapHTMLH || 1024,
+                mapHTMLParams: md?.mapHTMLParams || null,
+                mapXf: md?.mapXf || null,
+                mapHTMLOverride: true,
+            };
+        }
+
+        function createHTMLTextureOverrideMaterial(md) {
+            const tex = loadMapSlot(md, 'map', THREE.SRGBColorSpace, 'mapXf', fallbackWhiteTexture);
+            if (!isHTMLTexture(tex)) return null;
+            const material = new THREE.MeshBasicMaterial({
+                color: 0xffffff,
+                map: tex,
+                side: md.side === 0 ? THREE.FrontSide : THREE.DoubleSide,
+                transparent: true,
+                opacity: 1.0,
+                depthWrite: false,
+                fog: false,
+                toneMapped: false,
+            });
+            material.alphaTest = 0.0;
+            material.premultipliedAlpha = false;
+            material.userData ??= {};
+            material.userData.maxjsHTMLTextureOverride = true;
+            material.needsUpdate = true;
+            return material;
+        }
+
         function refreshLightProbeFromCurrentHDRI() {
             if (!currentEnvParams?.hdri) {
                 markLightProbeSceneDirty();
@@ -4156,6 +4196,36 @@
         function createMaterial(md) {
             const requestedModelName = md.model || 'MeshStandardMaterial';
             const registryEntry = getOrCreateMaterialRegistryEntry(md);
+            if (wantsHTMLTextureOverrideMaterial(md)) {
+                const runtimeModelName = 'HTMLTextureOverrideMaterial';
+                const key = materialTemplateCacheKey(requestedModelName, runtimeModelName, htmlTextureOverrideIdentity(md));
+                let template = materialCache.get(key);
+                if (!template) {
+                    template = createHTMLTextureOverrideMaterial(md);
+                    if (!template) {
+                        template = new THREE.MeshBasicMaterial({
+                            color: 0xff00ff,
+                            side: md.side === 0 ? THREE.FrontSide : THREE.DoubleSide,
+                            toneMapped: false,
+                        });
+                    }
+                    template.userData ??= {};
+                    template.userData.maxjsMaterialRegistryId = registryEntry.id;
+                    template.userData.maxjsMaterialIdentityKey = registryEntry.key;
+                    template.userData.maxjsRequestedMaterialModel = requestedModelName;
+                    template.userData.maxjsMaterialModel = runtimeModelName;
+                    template.userData.maxjsSourceMaterialName = md.name || template.name || 'default';
+                    if (md.name) template.name = md.name;
+                    materialCache.set(key, template);
+                }
+                const material = template.clone();
+                material.userData = { ...(template.userData || {}) };
+                material.userData.maxjsMaterialRegistryId = registryEntry.id;
+                material.userData.maxjsMaterialIdentityKey = registryEntry.key;
+                material.userData.maxjsSourceMaterialName = md.name || material.name || 'default';
+                if (md.name) material.name = md.name;
+                return material;
+            }
             const forceLambertForBlackSpecular = shouldRouteBlackSpecularToLambert(requestedModelName, md);
             const wantsMaterialXMaterial = requestedModelName === 'MaterialXMaterial';
             const wantsUtilityMaterial = forceLambertForBlackSpecular || utilityMaterialModels.has(requestedModelName);
@@ -6387,6 +6457,7 @@
             }
             for (const m of mats) {
                 if (!m) continue;
+                if (m.userData?.maxjsHTMLTextureOverride) continue;
                 let materialNeedsUpdate = false;
                 let nextTransparent = m.transparent;
                 if (c && m.color) m.color.setRGB(c[0], c[1], c[2]);

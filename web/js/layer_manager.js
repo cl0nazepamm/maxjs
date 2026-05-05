@@ -273,7 +273,7 @@ function createCameraAdapter(camera, THREE, ownForJs, cameraControl, layerId, de
 
     function usePhysicalCamera(handle) {
         const resolvedHandle = Number(handle?.handle ?? handle?.h ?? handle);
-        return cameraControl.setMode('physical', { handle: resolvedHandle });
+        return cameraControl.setMode('physical', { handle: resolvedHandle, layerId });
     }
 
     return freezePlainObject({
@@ -1094,7 +1094,7 @@ export function createLayerManager({
             } else if (mode === 'physical') {
                 // Lock to physical camera object
                 physicalCameraHandle = options.handle ?? null;
-                cameraClaimOwner = null;
+                cameraClaimOwner = options.layerId ?? null;
                 camera.matrixAutoUpdate = false;
                 if (controls) controls.enabled = false;
             } else if (mode === 'script') {
@@ -1124,6 +1124,9 @@ export function createLayerManager({
         },
         release(layerId) {
             if (cameraMode === 'script' && (!layerId || cameraClaimOwner === layerId)) {
+                return this.setMode('viewport');
+            }
+            if (cameraMode === 'physical' && (!cameraClaimOwner || !layerId || cameraClaimOwner === layerId)) {
                 return this.setMode('viewport');
             }
             return false;
@@ -2205,8 +2208,9 @@ export function createLayerManager({
         disposeOwnedResource(layer.group);
         disposeOwnedResource(layer.overlayGroup);
 
-        // Safety: release camera if this layer had claimed it
-        if (cameraControl.getOwner() === id) {
+        // Safety: release camera if this layer had claimed it. Older layers could
+        // also leave physical camera mode ownerless, so clear that on removal too.
+        if (cameraControl.getOwner() === id || (cameraControl.isPhysicalMode() && cameraControl.getOwner() == null)) {
             cameraControl.release(id);
         }
 

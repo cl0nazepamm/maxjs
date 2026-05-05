@@ -245,6 +245,37 @@ function createCameraAdapter(camera, THREE, ownForJs, cameraControl, layerId, de
         return true;
     }
 
+    function normalizeSceneCameraEntry(entry) {
+        const handle = Number(entry?.handle ?? entry?.h ?? entry?.id ?? 0);
+        const name = String(entry?.name ?? entry?.n ?? entry?.label ?? '').trim();
+        return freezePlainObject({
+            handle,
+            h: handle,
+            name,
+            n: name,
+        });
+    }
+
+    function listSceneCameras() {
+        return Array.from(cameraControl.getSceneCameras?.() ?? [], normalizeSceneCameraEntry)
+            .filter(entry => Number.isFinite(entry.handle) && entry.handle > 0);
+    }
+
+    function findSceneCamera(name, options = {}) {
+        const query = String(name ?? '').trim().toLowerCase();
+        if (!query) return null;
+        const exact = options.exact === true;
+        return listSceneCameras().find(entry => {
+            const current = String(entry.name ?? '').toLowerCase();
+            return exact ? current === query : current.includes(query);
+        }) ?? null;
+    }
+
+    function usePhysicalCamera(handle) {
+        const resolvedHandle = Number(handle?.handle ?? handle?.h ?? handle);
+        return cameraControl.setMode('physical', { handle: resolvedHandle });
+    }
+
     return freezePlainObject({
         get raw() { return getActiveCamera(); },
         get position() {
@@ -301,8 +332,13 @@ function createCameraAdapter(camera, THREE, ownForJs, cameraControl, layerId, de
         },
 
         // Switch to physical camera mode (lock to Max camera object)
-        usePhysicalCamera(handle) {
-            return cameraControl.setMode('physical', { handle });
+        usePhysicalCamera,
+
+        listSceneCameras,
+        findSceneCamera,
+        usePhysicalCameraByName(name, options = {}) {
+            const entry = findSceneCamera(name, options);
+            return entry ? usePhysicalCamera(entry.handle) : false;
         },
 
         // Switch to script/game mode (full JS control)
@@ -1004,6 +1040,7 @@ export function createLayerManager({
     controls = null,
     getCamera = null,
     onCameraModeChange = null,
+    getSceneCameras = () => [],
     getGLTFSystem = () => null,
     debugLog = () => {},
     debugWarn = () => {},
@@ -1099,6 +1136,7 @@ export function createLayerManager({
         getPhysicalCameraHandle() { return physicalCameraHandle; },
         getControls() { return controls; },
         getCamera() { return getCamera ? getCamera() : camera; },
+        getSceneCameras() { return getSceneCameras?.() ?? []; },
     };
 
     const isWebGPU = !!(renderer?.backend?.parameters?.forceWebGL === undefined

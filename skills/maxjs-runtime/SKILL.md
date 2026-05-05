@@ -123,6 +123,13 @@ Clear overrides in `dispose()` if the layer temporarily owns authored objects.
 - `ctx.runtime`: runtime metadata and helpers; includes `ctx.runtime.gltf`.
 - `ctx.THREE`: same Three.js namespace passed as the second factory arg.
 
+`ctx.camera` can lock to Max scene cameras and expose the live render camera:
+
+- `ctx.camera.raw` returns the underlying Three.js camera for last-mile render offsets such as handheld shake. This does not claim script ownership by itself.
+- `ctx.camera.listSceneCameras()` returns synced scene cameras as `{ handle, h, name, n }`.
+- `ctx.camera.findSceneCamera(name, { exact })` searches the scene camera list. Do this for Physical Cameras; `ctx.maxScene.findByName()` only searches synced meshes/lights.
+- `ctx.camera.usePhysicalCamera(handleOrEntry)` / `ctx.camera.usePhysicalCameraByName(name, { exact })` locks the viewer to a Max camera object while still allowing a layer to apply a post-sync camera offset through `ctx.camera.raw`.
+
 `ctx.runtime.gltf` reads MaxJS glTF Origin objects:
 
 - `get(handle)`

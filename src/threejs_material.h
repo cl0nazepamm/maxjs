@@ -213,6 +213,7 @@ enum ThreeJSHTMLTexParamIDs {
     phtml_tex_height,
     phtml_tex_params_json,
     phtml_tex_override,
+    phtml_tex_auto_fit,
 };
 ClassDesc2* GetThreeJSHTMLTexDesc();
 

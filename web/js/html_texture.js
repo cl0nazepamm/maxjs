@@ -26,6 +26,51 @@ function hasDrawElement(ctx2d) {
 
 let _hostIdCounter = 0;
 
+function rewriteScopedHTMLTextureCSS(css, viewport = {}) {
+    const width = Math.max(1, Number(viewport.width) || 1024);
+    const height = Math.max(1, Number(viewport.height) || 1024);
+    const vmin = Math.min(width, height);
+    const vmax = Math.max(width, height);
+    const unit = (base) => (_, value) => {
+        const n = Number(value);
+        if (!Number.isFinite(n)) return _;
+        return (n * base / 100).toFixed(3).replace(/\.?0+$/, '') + 'px';
+    };
+    return String(css || '')
+        .replace(/:root\b/g, ':host, html')
+        .replace(/(-?\d*\.?\d+)vw\b/g, unit(width))
+        .replace(/(-?\d*\.?\d+)vh\b/g, unit(height))
+        .replace(/(-?\d*\.?\d+)vmin\b/g, unit(vmin))
+        .replace(/(-?\d*\.?\d+)vmax\b/g, unit(vmax));
+}
+
+function rewriteScopedStyleAttribute(element, viewport) {
+    const value = element.getAttribute?.('style');
+    if (!value) return;
+    const next = rewriteScopedHTMLTextureCSS(value, viewport);
+    if (next !== value) element.setAttribute('style', next);
+}
+
+function rewriteScopedStyleElement(style, viewport) {
+    const value = style?.textContent || '';
+    const next = rewriteScopedHTMLTextureCSS(value, viewport);
+    if (next !== value) style.textContent = next;
+}
+
+function rewriteScopedSubtree(root, viewport) {
+    if (!root) return;
+    if (root.nodeType === Node.ELEMENT_NODE) {
+        if (root.tagName === 'STYLE') rewriteScopedStyleElement(root, viewport);
+        rewriteScopedStyleAttribute(root, viewport);
+    }
+    for (const style of Array.from(root.querySelectorAll?.('style') || [])) {
+        rewriteScopedStyleElement(style, viewport);
+    }
+    for (const el of Array.from(root.querySelectorAll?.('[style]') || [])) {
+        rewriteScopedStyleAttribute(el, viewport);
+    }
+}
+
 // Fetch an HTML document and inject its entire <html> tree into `host`'s
 // shadow root for style isolation (otherwise injected `<style>` rules and
 // universal `*` selectors leak into the host page).
@@ -35,11 +80,16 @@ let _hostIdCounter = 0;
 // document, not the shadow tree. We wrap inline user scripts in an IIFE that
 // shadows `document` with a small proxy that delegates query methods to the
 // shadow root and forwards everything else to the real document.
-async function injectHtmlDocument(host, url) {
+async function injectHtmlDocument(host, url, viewport = {}) {
     const response = await fetch(url, { cache: 'no-store' });
     if (!response.ok) throw new Error('HTTP ' + response.status + ' for ' + url);
     const text = await response.text();
     const parsed = new DOMParser().parseFromString(text, 'text/html');
+
+    // Documents authored as real pages often put CSS variables on `:root`
+    // and use viewport units. In shadow mode those need to be scoped to the
+    // texture size, not to the MaxJS panel viewport.
+    rewriteScopedSubtree(parsed.documentElement, viewport);
 
     // <base href> so relative URLs resolve against the source file's dir.
     const baseHref = url.replace(/[^/]*$/, '');
@@ -282,14 +332,41 @@ export function createHTMLTexture(THREE, url, options = {}) {
         });
     }
 
+    let rewriteHandle = 0;
+
+    function scheduleScopedRewrite() {
+        if (mode === 'iframe' || disposed || rewriteHandle) return;
+        rewriteHandle = requestAnimationFrame(() => {
+            rewriteHandle = 0;
+            const root = host.shadowRoot || host;
+            rewriteScopedSubtree(root, { width, height });
+            scheduleRedraw();
+        });
+    }
+
     function attachObserver() {
         if (mode === 'iframe') return; // iframes have their own render pipeline
-        observer = new MutationObserver(scheduleRedraw);
+        observer = new MutationObserver((mutations) => {
+            let shouldRewrite = false;
+            for (const mutation of mutations) {
+                if (
+                    mutation.type === 'childList' ||
+                    mutation.type === 'characterData' ||
+                    (mutation.type === 'attributes' && mutation.attributeName === 'style')
+                ) {
+                    shouldRewrite = true;
+                    break;
+                }
+            }
+            if (shouldRewrite) scheduleScopedRewrite();
+            else scheduleRedraw();
+        });
         observer.observe(host, {
             subtree: true,
             childList: true,
             characterData: true,
             attributes: true,
+            attributeFilter: ['style', 'class'],
         });
     }
 
@@ -353,7 +430,7 @@ export function createHTMLTexture(THREE, url, options = {}) {
     if (mode === 'iframe') {
         host.addEventListener('load', onReady, { once: true });
     } else {
-        injectHtmlDocument(host, url).then(onReady).catch(err => {
+        injectHtmlDocument(host, url, { width, height }).then(onReady).catch(err => {
             console.warn('[maxjs html_texture] failed to load', url, err);
         });
     }
@@ -363,6 +440,7 @@ export function createHTMLTexture(THREE, url, options = {}) {
         disposed = true;
         if (rafHandle) { cancelAnimationFrame(rafHandle); rafHandle = 0; }
         if (loopHandle) { cancelAnimationFrame(loopHandle); loopHandle = 0; }
+        if (rewriteHandle) { cancelAnimationFrame(rewriteHandle); rewriteHandle = 0; }
         if (loopTimer) { clearTimeout(loopTimer); loopTimer = 0; }
         if (observer) { try { observer.disconnect(); } catch (_) {} observer = null; }
         if ('onpaint' in canvas) canvas.onpaint = null;
@@ -391,7 +469,8 @@ const _htmlTextureCache = new Map();
 export function getOrCreateHTMLTexture(THREE, url, options = {}) {
     const width = options.width || 1024;
     const height = options.height || 1024;
-    const key = (options.cacheKey || url) + ':' + width + 'x' + height;
+    const mode = options.mode || 'shadow';
+    const key = (options.cacheKey || url) + ':' + width + 'x' + height + ':' + mode;
     const existing = _htmlTextureCache.get(key);
     if (existing) {
         if (options.params !== undefined) existing.updateParams(options.params);

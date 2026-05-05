@@ -1653,6 +1653,7 @@ struct MaxJSPBR {
         int   htmlWidth  = 1024;
         int   htmlHeight = 1024;
         bool  htmlOverrideMode = false;
+        bool  htmlAutoFit = true;
     };
 
     float color[3]    = {0.8f, 0.8f, 0.8f};
@@ -2324,6 +2325,9 @@ static bool ExtractMaterialTexture(Texmap* map, std::wstring& filePath, MaxJSPBR
         if (pj && pj[0]) xf.htmlParamsJson = pj;
         if (HasParam(pb, phtml_tex_override)) {
             xf.htmlOverrideMode = pb->GetInt(phtml_tex_override, 0) != 0;
+        }
+        if (HasParam(pb, phtml_tex_auto_fit)) {
+            xf.htmlAutoFit = pb->GetInt(phtml_tex_auto_fit, 0) != 0;
         }
         return true;
     }
@@ -13819,6 +13823,8 @@ public:
                     ss << L",\"" << key << L"HTMLParams\":" << xf.htmlParamsJson;
                 if (xf.htmlOverrideMode)
                     ss << L",\"" << key << L"HTMLOverride\":true";
+                if (xf.htmlAutoFit)
+                    ss << L",\"" << key << L"HTMLAutoFit\":true";
                 if (xfKey) writeXf(xfKey, xf);
                 return;
             }

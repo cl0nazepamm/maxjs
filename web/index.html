@@ -3133,8 +3133,199 @@
             return null;
         }
 
+        const HTML_TEXTURE_AUTO_FIT_KEYS = [
+            'map', 'opMap', 'emMap', 'roughMap', 'metalMap', 'normMap',
+            'bumpMap', 'dispMap', 'parallaxMap', 'aoMap', 'lmMap',
+            'gradMap', 'sssMap', 'matcapMap',
+            'specMap', 'specIntMap', 'specColMap', 'transMap',
+            'ccMap', 'ccRoughMap', 'ccNormMap',
+        ];
+        const HTML_TEXTURE_AUTO_FIT_MAX_TRIANGLES = 20000;
+
+        function materialFlagEnabled(value) {
+            return value === true || value === 1 || value === '1' || value === 'true';
+        }
+
+        function clampHTMLTextureDimension(value, fallback = 1024) {
+            const n = Math.round(Number(value));
+            if (!Number.isFinite(n)) return fallback;
+            return Math.max(64, Math.min(4096, n));
+        }
+
+        function manualHTMLTextureSize(md, key) {
+            return {
+                width: clampHTMLTextureDimension(md?.[key + 'HTMLW'], 1024),
+                height: clampHTMLTextureDimension(md?.[key + 'HTMLH'], 1024),
+            };
+        }
+
+        function htmlTextureAutoFitEnabled(md, key) {
+            return !!md?.[key + 'HTML'] && materialFlagEnabled(md?.[key + 'HTMLAutoFit']);
+        }
+
+        function fitHTMLTextureSizeToAspect(maxSize, aspect) {
+            if (!Number.isFinite(aspect) || aspect <= 0) return maxSize;
+            const maxW = clampHTMLTextureDimension(maxSize.width, 1024);
+            const maxH = clampHTMLTextureDimension(maxSize.height, 1024);
+            const maxAspect = maxW / Math.max(1, maxH);
+            let width = maxW;
+            let height = maxH;
+            if (aspect >= maxAspect) {
+                width = maxW;
+                height = maxW / aspect;
+            } else {
+                height = maxH;
+                width = maxH * aspect;
+            }
+            return {
+                width: clampHTMLTextureDimension(width, maxW),
+                height: clampHTMLTextureDimension(height, maxH),
+            };
+        }
+
+        function matrixScaleSignature(matrixArray) {
+            if (!isFiniteArray(matrixArray, 16)) return '1,1,1';
+            const sx = Math.hypot(matrixArray[0], matrixArray[1], matrixArray[2]);
+            const sy = Math.hypot(matrixArray[4], matrixArray[5], matrixArray[6]);
+            const sz = Math.hypot(matrixArray[8], matrixArray[9], matrixArray[10]);
+            const round = (value) => Number.isFinite(value) ? Math.round(value * 1000) / 1000 : 1;
+            return `${round(sx)},${round(sy)},${round(sz)}`;
+        }
+
+        function estimateGeometryUvAspect(geometry, materialIndex = null, matrixArray = null) {
+            const position = geometry?.getAttribute?.('position');
+            const uv = geometry?.getAttribute?.('uv');
+            if (!position || !uv || position.count < 3 || uv.count < 3) return 1;
+
+            const index = geometry.index;
+            const indexCount = index ? index.count : position.count;
+            const ranges = [];
+            if (materialIndex != null && Array.isArray(geometry.groups) && geometry.groups.length) {
+                for (const group of geometry.groups) {
+                    if (group?.materialIndex === materialIndex && group.count >= 3) {
+                        ranges.push({
+                            start: Math.max(0, group.start || 0),
+                            count: Math.max(0, Math.min(group.count || 0, indexCount - (group.start || 0))),
+                        });
+                    }
+                }
+            }
+            if (ranges.length === 0) ranges.push({ start: 0, count: indexCount });
+
+            let totalTriangles = 0;
+            for (const range of ranges) totalTriangles += Math.floor(range.count / 3);
+            if (totalTriangles <= 0) return 1;
+
+            const sampleStep = Math.max(1, Math.ceil(totalTriangles / HTML_TEXTURE_AUTO_FIT_MAX_TRIANGLES));
+            const p0 = new THREE.Vector3();
+            const p1 = new THREE.Vector3();
+            const p2 = new THREE.Vector3();
+            const dp1 = new THREE.Vector3();
+            const dp2 = new THREE.Vector3();
+            const tangent = new THREE.Vector3();
+            const bitangent = new THREE.Vector3();
+            const cross = new THREE.Vector3();
+            const matrix = isFiniteArray(matrixArray, 16) ? new THREE.Matrix4().fromArray(matrixArray) : null;
+            let tangentSum = 0;
+            let bitangentSum = 0;
+            let weightSum = 0;
+            let triangleOrdinal = 0;
+
+            const vertexIndexAt = (drawIndex) => index ? index.getX(drawIndex) : drawIndex;
+
+            for (const range of ranges) {
+                const end = range.start + range.count - 2;
+                for (let draw = range.start; draw < end; draw += 3) {
+                    if ((triangleOrdinal++ % sampleStep) !== 0) continue;
+                    const i0 = vertexIndexAt(draw);
+                    const i1 = vertexIndexAt(draw + 1);
+                    const i2 = vertexIndexAt(draw + 2);
+                    if (
+                        i0 < 0 || i1 < 0 || i2 < 0 ||
+                        i0 >= position.count || i1 >= position.count || i2 >= position.count ||
+                        i0 >= uv.count || i1 >= uv.count || i2 >= uv.count
+                    ) {
+                        continue;
+                    }
+
+                    p0.fromBufferAttribute(position, i0);
+                    p1.fromBufferAttribute(position, i1);
+                    p2.fromBufferAttribute(position, i2);
+                    if (matrix) {
+                        p0.applyMatrix4(matrix);
+                        p1.applyMatrix4(matrix);
+                        p2.applyMatrix4(matrix);
+                    }
+                    const u0 = uv.getX(i0), v0 = uv.getY(i0);
+                    const u1 = uv.getX(i1), v1 = uv.getY(i1);
+                    const u2 = uv.getX(i2), v2 = uv.getY(i2);
+                    const du1 = u1 - u0, dv1 = v1 - v0;
+                    const du2 = u2 - u0, dv2 = v2 - v0;
+                    const det = du1 * dv2 - du2 * dv1;
+                    if (Math.abs(det) < 1.0e-8) continue;
+
+                    dp1.subVectors(p1, p0);
+                    dp2.subVectors(p2, p0);
+                    const weight = cross.crossVectors(dp1, dp2).length();
+                    if (!Number.isFinite(weight) || weight <= 1.0e-8) continue;
+
+                    const invDet = 1 / det;
+                    tangent.copy(dp1).multiplyScalar(dv2).addScaledVector(dp2, -dv1).multiplyScalar(invDet);
+                    bitangent.copy(dp2).multiplyScalar(du1).addScaledVector(dp1, -du2).multiplyScalar(invDet);
+                    const tLen = tangent.length();
+                    const bLen = bitangent.length();
+                    if (!Number.isFinite(tLen) || !Number.isFinite(bLen) || tLen <= 1.0e-8 || bLen <= 1.0e-8) {
+                        continue;
+                    }
+
+                    tangentSum += tLen * weight;
+                    bitangentSum += bLen * weight;
+                    weightSum += weight;
+                }
+            }
+
+            if (weightSum <= 0 || bitangentSum <= 0) return 1;
+            const aspect = tangentSum / bitangentSum;
+            if (!Number.isFinite(aspect) || aspect <= 0) return 1;
+            return Math.max(0.05, Math.min(20, aspect));
+        }
+
+        function getMaterialContextUvAspect(materialContext) {
+            if (!materialContext?.geometry) return 1;
+            const materialIndex = materialContext.materialIndex ?? null;
+            const key = (materialIndex == null ? '__all__' : String(materialIndex)) + ':' +
+                matrixScaleSignature(materialContext.matrixArray);
+            materialContext.htmlTextureAutoFitAspectCache ??= new Map();
+            if (!materialContext.htmlTextureAutoFitAspectCache.has(key)) {
+                materialContext.htmlTextureAutoFitAspectCache.set(
+                    key,
+                    estimateGeometryUvAspect(materialContext.geometry, materialIndex, materialContext.matrixArray)
+                );
+            }
+            return materialContext.htmlTextureAutoFitAspectCache.get(key);
+        }
+
+        function resolveHTMLTextureSize(md, key, materialContext = null) {
+            const manualSize = manualHTMLTextureSize(md, key);
+            if (!htmlTextureAutoFitEnabled(md, key)) return manualSize;
+            const aspect = getMaterialContextUvAspect(materialContext);
+            return fitHTMLTextureSizeToAspect(manualSize, aspect);
+        }
+
+        function withHTMLAutoFitIdentity(md, materialContext = null) {
+            if (!md || typeof md !== 'object') return md;
+            let sizes = null;
+            for (const key of HTML_TEXTURE_AUTO_FIT_KEYS) {
+                if (!htmlTextureAutoFitEnabled(md, key)) continue;
+                const size = resolveHTMLTextureSize(md, key, materialContext);
+                sizes ??= {};
+                sizes[key] = size.width + 'x' + size.height;
+            }
+            return sizes ? { ...md, __maxjsHTMLAutoFitSizes: sizes } : md;
+        }
+
         // Load a map slot — priority: HTML texmap → TSL procedural → URL bitmap.
-        function loadMapSlot(md, key, colorSpace, xfKey, fallback) {
+        function loadMapSlot(md, key, colorSpace, xfKey, fallback, materialContext = null) {
             const htmlUrl = md[key + 'HTML'];
             if (htmlUrl) {
                 const normalizedXf = normalizeTextureTransform(xfKey ? md[xfKey] : null);
@@ -3146,9 +3337,10 @@
                 const resolved = (baseUrl && filename)
                     ? (baseUrl + encodeURIComponent(filename))
                     : htmlUrl;
+                const htmlSize = resolveHTMLTextureSize(md, key, materialContext);
                 const handle = getOrCreateHTMLTexture(THREE, resolved, {
-                    width:  md[key + 'HTMLW']  || 1024,
-                    height: md[key + 'HTMLH'] || 1024,
+                    width: htmlSize.width,
+                    height: htmlSize.height,
                     params: md[key + 'HTMLParams'],
                     cacheKey: resolved,
                 });
@@ -3182,9 +3374,48 @@
             return true;
         }
 
-        function markTransparentForHTMLTexture(material, tex) {
+        const MAXJS_HTML_COLOR_MAP_FRAGMENT = `
+vec4 maxjsHTMLColor = vec4( 0.0 );
+#ifdef USE_MAP
+    vec4 sampledDiffuseColor = texture2D( map, vMapUv );
+    #ifdef DECODE_VIDEO_TEXTURE
+        sampledDiffuseColor = sRGBTransferEOTF( sampledDiffuseColor );
+    #endif
+    maxjsHTMLColor = sampledDiffuseColor;
+#endif
+`;
+
+        const MAXJS_HTML_COLOR_OVERLAY_FRAGMENT = `
+#ifdef USE_MAP
+    outgoingLight = mix( outgoingLight, maxjsHTMLColor.rgb, maxjsHTMLColor.a );
+#endif
+#include <opaque_fragment>
+`;
+
+        function preserveOpacityForHTMLColorMap(material, tex) {
             if (!material || !isHTMLTexture(tex)) return false;
-            material.transparent = true;
+            material.userData ??= {};
+            material.userData.maxjsHTMLColorMapPreserveOpacity = true;
+
+            if (!material.onBeforeCompile?.maxjsHTMLColorMapPreserveOpacity) {
+                const previousOnBeforeCompile = material.onBeforeCompile;
+                const patchedOnBeforeCompile = function(shader, renderer) {
+                    previousOnBeforeCompile?.call(this, shader, renderer);
+                    shader.fragmentShader = shader.fragmentShader.replace(
+                        '#include <map_fragment>',
+                        MAXJS_HTML_COLOR_MAP_FRAGMENT
+                    );
+                    shader.fragmentShader = shader.fragmentShader.replace(
+                        '#include <opaque_fragment>',
+                        MAXJS_HTML_COLOR_OVERLAY_FRAGMENT
+                    );
+                };
+                patchedOnBeforeCompile.maxjsHTMLColorMapPreserveOpacity = true;
+                material.onBeforeCompile = patchedOnBeforeCompile;
+                material.customProgramCacheKey = () => 'maxjs-html-color-map-preserve-opacity-v1';
+            }
+
+            material.needsUpdate = true;
             return true;
         }
 
@@ -3192,23 +3423,25 @@
             return !!md?.mapHTML && (md.mapHTMLOverride === true || md.mapHTMLOverride === 1);
         }
 
-        function htmlTextureOverrideIdentity(md) {
+        function htmlTextureOverrideIdentity(md, materialContext = null) {
+            const size = resolveHTMLTextureSize(md, 'map', materialContext);
             return {
                 name: md?.name || '',
                 side: md?.side ?? 1,
                 mapHTML: md?.mapHTML || '',
                 mapHTMLBase: md?.mapHTMLBase || '',
                 mapHTMLName: md?.mapHTMLName || '',
-                mapHTMLW: md?.mapHTMLW || 1024,
-                mapHTMLH: md?.mapHTMLH || 1024,
+                mapHTMLW: size.width,
+                mapHTMLH: size.height,
                 mapHTMLParams: md?.mapHTMLParams || null,
                 mapXf: md?.mapXf || null,
                 mapHTMLOverride: true,
+                mapHTMLAutoFit: !!md?.mapHTMLAutoFit,
             };
         }
 
-        function createHTMLTextureOverrideMaterial(md) {
-            const tex = loadMapSlot(md, 'map', THREE.SRGBColorSpace, 'mapXf', fallbackWhiteTexture);
+        function createHTMLTextureOverrideMaterial(md, materialContext = null) {
+            const tex = loadMapSlot(md, 'map', THREE.SRGBColorSpace, 'mapXf', fallbackWhiteTexture, materialContext);
             if (!isHTMLTexture(tex)) return null;
             const material = new THREE.MeshBasicMaterial({
                 color: 0xffffff,
@@ -3905,7 +4138,7 @@
             return material;
         }
 
-        function createUtilityMaterial(runtimeModelName, md) {
+        function createUtilityMaterial(runtimeModelName, md, materialContext = null) {
             if (runtimeModelName === 'MeshBackdropNodeMaterial') {
                 return createBackdropUtilityMaterial(md);
             }
@@ -3980,12 +4213,12 @@
 
             // Apply texture maps (all slots support TSL Texture)
             const applyMap = (key, prop, cs, xf, fb) => {
-                const tex = loadMapSlot(md, key, cs, xf, fb);
+                const tex = loadMapSlot(md, key, cs, xf, fb, materialContext);
                 if (tex && prop in material) material[prop] = tex;
                 return tex;
             };
             const W = fallbackWhiteTexture, N = fallbackFlatNormalTexture, H = fallbackHeightTexture;
-            markTransparentForHTMLTexture(material, applyMap('map', 'map', THREE.SRGBColorSpace, 'mapXf', W));
+            preserveOpacityForHTMLColorMap(material, applyMap('map', 'map', THREE.SRGBColorSpace, 'mapXf', W));
             applyMap('normMap',    'normalMap',              THREE.LinearSRGBColorSpace,   'normMapXf',    N);
             applyMap('bumpMap',    'bumpMap',                THREE.NoColorSpace,           'bumpMapXf',    H);
             applyMap('ccMap',      'clearcoatMap',           THREE.LinearSRGBColorSpace,   'ccMapXf',      W);
@@ -4002,7 +4235,7 @@
             }
             applyMap('matcapMap',  'matcap',                 THREE.SRGBColorSpace,         'matcapMapXf',  W);
             applyMap('specMap',    'specularMap',            THREE.LinearSRGBColorSpace,   'specMapXf',    W);
-            applyOpacityTextureSlot(material, loadMapSlot(md, 'opMap', THREE.LinearSRGBColorSpace, 'opMapXf', W));
+            applyOpacityTextureSlot(material, loadMapSlot(md, 'opMap', THREE.LinearSRGBColorSpace, 'opMapXf', W, materialContext));
 
             rememberMaterialEmissiveBase(material);
             material.needsUpdate = true;
@@ -4193,15 +4426,15 @@
             return snapshot;
         }
 
-        function createMaterial(md) {
+        function createMaterial(md, materialContext = null) {
             const requestedModelName = md.model || 'MeshStandardMaterial';
             const registryEntry = getOrCreateMaterialRegistryEntry(md);
             if (wantsHTMLTextureOverrideMaterial(md)) {
                 const runtimeModelName = 'HTMLTextureOverrideMaterial';
-                const key = materialTemplateCacheKey(requestedModelName, runtimeModelName, htmlTextureOverrideIdentity(md));
+                const key = materialTemplateCacheKey(requestedModelName, runtimeModelName, htmlTextureOverrideIdentity(md, materialContext));
                 let template = materialCache.get(key);
                 if (!template) {
-                    template = createHTMLTextureOverrideMaterial(md);
+                    template = createHTMLTextureOverrideMaterial(md, materialContext);
                     if (!template) {
                         template = new THREE.MeshBasicMaterial({
                             color: 0xff00ff,
@@ -4270,9 +4503,10 @@
                     : ((wantsAdvancedMaterial || wantsSSSMaterial) ? 'MeshPhysicalMaterial' : 'MeshStandardMaterial')));
             // Exclude tslParams from cache key — param changes should update
             // existing uniforms, not trigger a full material rebuild.
-            const cacheableMd = (wantsTSLMaterial && md.tslParams)
+            const cacheableBaseMd = (wantsTSLMaterial && md.tslParams)
                 ? Object.assign({}, md, { tslParams: undefined })
                 : md;
+            const cacheableMd = withHTMLAutoFitIdentity(cacheableBaseMd, materialContext);
             const key = materialTemplateCacheKey(requestedModelName, runtimeModelName, cacheableMd);
             let template = materialCache.get(key);
             if (!template && wantsMaterialXMaterial) {
@@ -4294,7 +4528,7 @@
                 } else if (wantsTSLMaterial) {
                     template = createMissingTSLMaterial(md);
                 } else if (wantsUtilityMaterial) {
-                    template = createUtilityMaterial(runtimeModelName, md);
+                    template = createUtilityMaterial(runtimeModelName, md, materialContext);
                 } else {
                     const params = {
                         color: new THREE.Color(md.color[0], md.color[1], md.color[2]),
@@ -4394,12 +4628,12 @@
                     // Textures (all slots support TSL Texture)
                     {
                         const apply = (key, prop, cs, xf, fb) => {
-                            const tex = loadMapSlot(md, key, cs, xf, fb);
+                            const tex = loadMapSlot(md, key, cs, xf, fb, materialContext);
                             if (tex) template[prop] = tex;
                             return tex;
                         };
                         const W = fallbackWhiteTexture, N = fallbackFlatNormalTexture, H = fallbackHeightTexture;
-                        markTransparentForHTMLTexture(template, apply('map', 'map', THREE.SRGBColorSpace, 'mapXf', W));
+                        preserveOpacityForHTMLColorMap(template, apply('map', 'map', THREE.SRGBColorSpace, 'mapXf', W));
                         if (!wantsToonMaterial) {
                             apply('roughMap', 'roughnessMap',  THREE.LinearSRGBColorSpace, 'roughMapXf', W);
                             apply('metalMap', 'metalnessMap',  THREE.LinearSRGBColorSpace, 'metalMapXf', W);
@@ -4409,12 +4643,12 @@
                         apply('dispMap',  'displacementMap',   THREE.NoColorSpace,         'dispMapXf',  H);
                         apply('aoMap',    'aoMap',             THREE.LinearSRGBColorSpace, 'aoMapXf',    W);
                         apply('emMap',    'emissiveMap',       THREE.SRGBColorSpace,       'emMapXf',    W);
-                        applyOpacityTextureSlot(template, loadMapSlot(md, 'opMap', THREE.LinearSRGBColorSpace, 'opMapXf', W));
+                        applyOpacityTextureSlot(template, loadMapSlot(md, 'opMap', THREE.LinearSRGBColorSpace, 'opMapXf', W, materialContext));
                         if ('transmissionMap' in template)
                             apply('transMap', 'transmissionMap', THREE.LinearSRGBColorSpace, 'transMapXf', W);
                     }
                     if (canUseToonMaterial) {
-                        const gradTex = loadMapSlot(md, 'gradMap', THREE.NoColorSpace, null, fallbackToonGradientTexture);
+                        const gradTex = loadMapSlot(md, 'gradMap', THREE.NoColorSpace, null, fallbackToonGradientTexture, materialContext);
                         template.gradientMap = gradTex
                             ? configureGradientTexture(gradTex)
                             : fallbackToonGradientTexture;
@@ -4422,7 +4656,7 @@
 
                     // Lightmap
                     {
-                        const lmTex = loadMapSlot(md, 'lmMap', THREE.LinearSRGBColorSpace, 'lmMapXf', fallbackWhiteTexture);
+                        const lmTex = loadMapSlot(md, 'lmMap', THREE.LinearSRGBColorSpace, 'lmMapXf', fallbackWhiteTexture, materialContext);
                         if (lmTex) {
                             template.lightMap = applyTextureUvChannel(lmTex, md.lmCh, 2);
                             template.lightMapIntensity = md.lmI ?? 1.0;
@@ -4479,6 +4713,9 @@
             material.userData.maxjsMaterialIdentityKey = registryEntry.key;
             material.userData.maxjsSourceMaterialName = md.name || material.name || 'default';
             if (md.name) material.name = md.name;
+            if (material.userData.maxjsHTMLColorMapPreserveOpacity) {
+                preserveOpacityForHTMLColorMap(material, material.map);
+            }
             rememberMaterialEmissiveBase(material);
             return material;
         }
@@ -5127,8 +5364,19 @@
 
         function createSceneMaterial(nd, geom = null) {
             let material = null;
-            if (nd?.mats && nd?.groups) material = nd.mats.map(m => createMaterial(m));
-            else if (nd?.mat) material = createMaterial(nd.mat);
+            if (nd?.mats && nd?.groups) {
+                material = nd.mats.map((m, materialIndex) => createMaterial(m, {
+                    geometry: geom,
+                    materialIndex,
+                    matrixArray: nd?.t,
+                }));
+            } else if (nd?.mat) {
+                material = createMaterial(nd.mat, {
+                    geometry: geom,
+                    materialIndex: null,
+                    matrixArray: nd?.t,
+                });
+            }
             else {
                 const entry = getOrCreateMaterialRegistryEntry(null);
                 material = new THREE.MeshStandardMaterial({ color: 0x888888, side: THREE.DoubleSide });
@@ -5148,6 +5396,17 @@
             material.userData.maxjsMaterialIdentityKey = entry.key;
             material.userData.maxjsSourceMaterialName = 'default';
             return material;
+        }
+
+        function materialPayloadHasHTMLAutoFit(md) {
+            if (!md || typeof md !== 'object') return false;
+            return HTML_TEXTURE_AUTO_FIT_KEYS.some(key => htmlTextureAutoFitEnabled(md, key));
+        }
+
+        function nodePayloadHasHTMLAutoFit(nd) {
+            if (!nd || typeof nd !== 'object') return false;
+            if (materialPayloadHasHTMLAutoFit(nd.mat)) return true;
+            return Array.isArray(nd.mats) && nd.mats.some(materialPayloadHasHTMLAutoFit);
         }
 
         const pendingMaterialDisposals = [];
@@ -5200,7 +5459,8 @@
             // so material-type changes still trigger rebuild. Other bake fields (folder,
             // intensity, suffixes) mutate the existing material in place.
             const bakeKey = bakeOverrides.enabled && bakeOverrides.mode === 'beauty' ? 'beauty' : 'live';
-            return `${wantsLine ? 'line' : 'mesh'}:${bakeKey}:${JSON.stringify(payload)}`;
+            const htmlFitKey = nodePayloadHasHTMLAutoFit(nd) ? `:htmlfit:${matrixScaleSignature(nd?.t)}` : '';
+            return `${wantsLine ? 'line' : 'mesh'}:${bakeKey}:${JSON.stringify(payload)}${htmlFitKey}`;
         }
 
         function isCachedMaterialTemplate(material) {
@@ -5222,6 +5482,7 @@
             mesh.userData ??= {};
             mesh.userData.maxjsMaterialSignature = sceneMaterialSignature(nd, wantsLine);
             mesh.userData.maxjsLastNodePayload = nd;
+            mesh.userData.maxjsHasHTMLAutoFit = nodePayloadHasHTMLAutoFit(nd);
         }
 
         function ensureSceneRenderableMaterial(mesh, nd, wantsLine) {
@@ -5233,6 +5494,7 @@
             mesh.userData ??= {};
             mesh.userData.maxjsMaterialSignature = signature;
             mesh.userData.maxjsLastNodePayload = nd;
+            mesh.userData.maxjsHasHTMLAutoFit = nodePayloadHasHTMLAutoFit(nd);
             disposeSceneMaterial(oldMaterial);
             return true;
         }
@@ -5262,7 +5524,22 @@
             }
             if (nd.jsmod != null) applyJsmodSyncState(mesh, nd.jsmod === true);
             if (nd.vis != null) applyBridgeVisibility(mesh, nd.vis);
-            if (isFiniteArray(nd.t, 16)) applyTransform(mesh, nd.t);
+            if (isFiniteArray(nd.t, 16)) {
+                const hadHTMLAutoFit = !!mesh.userData?.maxjsHasHTMLAutoFit;
+                const oldScaleSignature = hadHTMLAutoFit
+                    ? matrixScaleSignature(mesh.userData?.maxjsLastNodePayload?.t)
+                    : '';
+                applyTransform(mesh, nd.t);
+                if (hadHTMLAutoFit) {
+                    const lastPayload = mesh.userData?.maxjsLastNodePayload;
+                    if (lastPayload) {
+                        lastPayload.t = nd.t;
+                        if (matrixScaleSignature(nd.t) !== oldScaleSignature) {
+                            ensureSceneRenderableMaterial(mesh, lastPayload, !!lastPayload.spline);
+                        }
+                    }
+                }
+            }
             if (nd.s != null) applySelection(mesh, nd.s);
             if (nd.mat && mesh.material) applyMaterialScalar(mesh, nd.mat);
         }
@@ -6134,6 +6411,9 @@
                         releaseGeometryRef(geometryRefCounts, mesh.geometry);
                         retainGeometryRef(geometryRefCounts, geom);
                         mesh.geometry = geom;
+                        if (nodePayloadHasHTMLAutoFit(nd)) {
+                            mesh.userData.maxjsMaterialSignature = null;
+                        }
                     }
                     if (ensureSceneRenderableMaterial(mesh, nd, wantsLine)) {
                         sceneChanged = true;
@@ -6427,7 +6707,11 @@
                     const isRouted = !!oldMaterial.userData?.maxjsLambertFromBlackSpecular;
                     if (wantsRoute === isRouted) return false;
                     const nextMaterials = mesh.material.slice();
-                    nextMaterials[materialIndex] = createMaterial(material);
+                    nextMaterials[materialIndex] = createMaterial(material, {
+                        geometry: mesh.geometry,
+                        materialIndex,
+                        matrixArray: mesh.matrix?.elements,
+                    });
                     mesh.material = nextMaterials;
                     if (!isCachedMaterialTemplate(oldMaterial)) disposeSceneMaterial(oldMaterial);
                     return true;
@@ -6437,7 +6721,11 @@
                 const wantsRoute = shouldRouteBlackSpecularToLambert(material.model || 'MeshStandardMaterial', material);
                 const isRouted = !!oldMaterial?.userData?.maxjsLambertFromBlackSpecular;
                 if (wantsRoute === isRouted) return false;
-                mesh.material = createMaterial(material);
+                mesh.material = createMaterial(material, {
+                    geometry: mesh.geometry,
+                    materialIndex: null,
+                    matrixArray: mesh.matrix?.elements,
+                });
                 if (!isCachedMaterialTemplate(oldMaterial)) disposeSceneMaterial(oldMaterial);
                 return true;
             };
@@ -8389,7 +8677,10 @@
             const count = grp.count || Math.floor((grp.xforms?.length || 0) / 16);
             if (!count || !Array.isArray(grp.xforms) || grp.xforms.length < count * 16) return null;
 
-            let mat = grp.mat ? createMaterial(grp.mat) : new THREE.MeshPhysicalMaterial({
+            let mat = grp.mat ? createMaterial(grp.mat, {
+                geometry: hairBladeGeometry,
+                materialIndex: null,
+            }) : new THREE.MeshPhysicalMaterial({
                 color: 0xffffff,
                 roughness: 0.8,
                 metalness: 0.0,
@@ -8471,12 +8762,12 @@
                 let mat;
                 if (grp.mats && grp.groups) {
                     // Multi/Sub material — create material array + geometry groups
-                    mat = grp.mats.map(m => createMaterial(m));
                     for (const [start, count, idx] of grp.groups) {
                         geom.addGroup(start, count, idx);
                     }
+                    mat = grp.mats.map((m, materialIndex) => createMaterial(m, { geometry: geom, materialIndex }));
                 } else if (grp.mat) {
-                    mat = createMaterial(grp.mat);
+                    mat = createMaterial(grp.mat, { geometry: geom, materialIndex: null });
                 } else {
                     mat = new THREE.MeshStandardMaterial({ color: 0x888888, roughness: 0.7, side: THREE.DoubleSide });
                 }

@@ -2414,6 +2414,10 @@ static ParamBlockDesc2 threejs_html_tex_pb_desc(
         p_default, FALSE,
         p_ui, TYPE_SINGLECHEKBOX, IDC_HTML_TEX_OVERRIDE,
         p_end,
+    phtml_tex_auto_fit, _T("autoFit"), TYPE_BOOL, 0, 0,
+        p_default, TRUE,
+        p_ui, TYPE_SINGLECHEKBOX, IDC_HTML_TEX_AUTOFIT,
+        p_end,
     p_end
 );
 

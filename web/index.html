@@ -3163,6 +3163,31 @@
             return null;
         }
 
+        function isHTMLTexture(tex) {
+            return !!tex?.userData?.maxjsHTMLHost;
+        }
+
+        function applyOpacityTextureSlot(material, tex) {
+            if (!tex || !material) return false;
+            material.transparent = true;
+            if (isHTMLTexture(tex) && !material.map) {
+                // HTML texmaps commonly carry both color and alpha. Treating
+                // them as alphaMap-only discards the color and renders the
+                // material's white diffuse through the mask.
+                material.map = tex;
+                if ('alphaMap' in material) material.alphaMap = null;
+                return true;
+            }
+            if ('alphaMap' in material) material.alphaMap = tex;
+            return true;
+        }
+
+        function markTransparentForHTMLTexture(material, tex) {
+            if (!material || !isHTMLTexture(tex)) return false;
+            material.transparent = true;
+            return true;
+        }
+
         function refreshLightProbeFromCurrentHDRI() {
             if (!currentEnvParams?.hdri) {
                 markLightProbeSceneDirty();
@@ -3920,7 +3945,7 @@
                 return tex;
             };
             const W = fallbackWhiteTexture, N = fallbackFlatNormalTexture, H = fallbackHeightTexture;
-            applyMap('map',        'map',                    THREE.SRGBColorSpace,         'mapXf',        W);
+            markTransparentForHTMLTexture(material, applyMap('map', 'map', THREE.SRGBColorSpace, 'mapXf', W));
             applyMap('normMap',    'normalMap',              THREE.LinearSRGBColorSpace,   'normMapXf',    N);
             applyMap('bumpMap',    'bumpMap',                THREE.NoColorSpace,           'bumpMapXf',    H);
             applyMap('ccMap',      'clearcoatMap',           THREE.LinearSRGBColorSpace,   'ccMapXf',      W);
@@ -3937,7 +3962,7 @@
             }
             applyMap('matcapMap',  'matcap',                 THREE.SRGBColorSpace,         'matcapMapXf',  W);
             applyMap('specMap',    'specularMap',            THREE.LinearSRGBColorSpace,   'specMapXf',    W);
-            if (applyMap('opMap',  'alphaMap',               THREE.LinearSRGBColorSpace,   'opMapXf',      W)) material.transparent = true;
+            applyOpacityTextureSlot(material, loadMapSlot(md, 'opMap', THREE.LinearSRGBColorSpace, 'opMapXf', W));
 
             rememberMaterialEmissiveBase(material);
             material.needsUpdate = true;
@@ -4304,7 +4329,7 @@
                             return tex;
                         };
                         const W = fallbackWhiteTexture, N = fallbackFlatNormalTexture, H = fallbackHeightTexture;
-                        apply('map',      'map',               THREE.SRGBColorSpace,       'mapXf',      W);
+                        markTransparentForHTMLTexture(template, apply('map', 'map', THREE.SRGBColorSpace, 'mapXf', W));
                         if (!wantsToonMaterial) {
                             apply('roughMap', 'roughnessMap',  THREE.LinearSRGBColorSpace, 'roughMapXf', W);
                             apply('metalMap', 'metalnessMap',  THREE.LinearSRGBColorSpace, 'metalMapXf', W);
@@ -4314,7 +4339,7 @@
                         apply('dispMap',  'displacementMap',   THREE.NoColorSpace,         'dispMapXf',  H);
                         apply('aoMap',    'aoMap',             THREE.LinearSRGBColorSpace, 'aoMapXf',    W);
                         apply('emMap',    'emissiveMap',       THREE.SRGBColorSpace,       'emMapXf',    W);
-                        if (apply('opMap', 'alphaMap',         THREE.LinearSRGBColorSpace, 'opMapXf',    W)) template.transparent = true;
+                        applyOpacityTextureSlot(template, loadMapSlot(md, 'opMap', THREE.LinearSRGBColorSpace, 'opMapXf', W));
                         if ('transmissionMap' in template)
                             apply('transMap', 'transmissionMap', THREE.LinearSRGBColorSpace, 'transMapXf', W);
                     }

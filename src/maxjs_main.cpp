@@ -16014,9 +16014,11 @@ public:
     // WM_SIZE only updates this timestamp so capture can pause briefly; it
     // must not flow into controller_->put_Bounds.
     ULONGLONG lastHostResizeMs_ = 0;
-    static constexpr DWORD kCaptureSuppressMs = 150;
+    static constexpr DWORD kCaptureSuppressMs = 750;
     int activeShadeHostedWidth_ = 0;
     int activeShadeHostedHeight_ = 0;
+    int activeShadeHostClientWidth_ = 0;
+    int activeShadeHostClientHeight_ = 0;
 
     bool IsViewportHosted() const {
         return originalParent_ != nullptr && embeddedViewportHwnd_ != nullptr;
@@ -16235,6 +16237,25 @@ public:
             return false;
         }
 
+        const ULONGLONG now = GetTickCount64();
+        const bool hostSizeChanged =
+            activeShadeHostClientWidth_ > 0 &&
+            activeShadeHostClientHeight_ > 0 &&
+            (activeShadeHostClientWidth_ != width || activeShadeHostClientHeight_ != height);
+        activeShadeHostClientWidth_ = width;
+        activeShadeHostClientHeight_ = height;
+        if (hostSizeChanged) {
+            lastHostResizeMs_ = now;
+        }
+
+        if (lastHostResizeMs_ != 0 && now - lastHostResizeMs_ < kCaptureSuppressMs) {
+            // During a live 3ds Max/ActiveShade host resize, even moving the
+            // WebView child can stall WebView2 hard. Keep the fixed backbuffer
+            // hidden until the host rect settles, then re-show on the next tick.
+            if (IsWindowVisible(hwnd_)) ShowWindow(hwnd_, SW_HIDE);
+            return false;
+        }
+
         if (activeShadeHostedWidth_ <= 0 || activeShadeHostedHeight_ <= 0) {
             RECT childRect = {};
             if (GetClientRect(hwnd_, &childRect)) {
@@ -16387,6 +16408,9 @@ public:
         GetClientRect(viewportHwnd, &vpRect);
         activeShadeHostedWidth_ = std::max(64, static_cast<int>(vpRect.right - vpRect.left));
         activeShadeHostedHeight_ = std::max(64, static_cast<int>(vpRect.bottom - vpRect.top));
+        activeShadeHostClientWidth_ = activeShadeHostedWidth_;
+        activeShadeHostClientHeight_ = activeShadeHostedHeight_;
+        lastHostResizeMs_ = 0;
         SetWindowPos(hwnd_, HWND_TOP, 0, 0,
             activeShadeHostedWidth_, activeShadeHostedHeight_,
             SWP_SHOWWINDOW | SWP_NOACTIVATE | SWP_FRAMECHANGED);
@@ -16422,6 +16446,9 @@ public:
         originalParent_ = nullptr;
         activeShadeHostedWidth_ = 0;
         activeShadeHostedHeight_ = 0;
+        activeShadeHostClientWidth_ = 0;
+        activeShadeHostClientHeight_ = 0;
+        lastHostResizeMs_ = 0;
         Resize();
         NormalizeFloatingWindow(true);
         RefreshCallbackRegistration(true);
@@ -16430,6 +16457,7 @@ public:
     void CaptureActiveShadeFrame() {
         if (!webview_ || !asTarget_ || !asCapturing_) return;
         if (asCaptureInFlight_) return;
+        if (!MaintainWindowState()) return;
 
         // Suppress captures while the host is mid-resize. CapturePreview is the
         // single heaviest thing the plugin does — JPEG encode of the WebView,

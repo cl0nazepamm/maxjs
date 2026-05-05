@@ -32,9 +32,9 @@ let _hostIdCounter = 0;
 //
 // Scripts inside shadow DOM execute when re-created as live nodes, BUT
 // `document.getElementById(...)` etc. inside them would target the main
-// document, not the shadow tree. We wrap each user script in an IIFE that
-// shadows `document` with a small proxy that delegates query methods to
-// the shadow root and forwards everything else to the real document.
+// document, not the shadow tree. We wrap inline user scripts in an IIFE that
+// shadows `document` with a small proxy that delegates query methods to the
+// shadow root and forwards everything else to the real document.
 async function injectHtmlDocument(host, url) {
     const response = await fetch(url, { cache: 'no-store' });
     if (!response.ok) throw new Error('HTTP ' + response.status + ' for ' + url);
@@ -52,35 +52,71 @@ async function injectHtmlDocument(host, url) {
     const shadow = host.attachShadow({ mode: 'open' });
     shadow.appendChild(parsed.documentElement);
 
-    // Re-create scripts so they execute. Wrap user code with a `document`
-    // proxy bound to the host's shadow root. Inline modules / external
-    // src= scripts skip the wrapper since they have their own scope.
-    for (const oldScript of shadow.querySelectorAll('script')) {
+    const documentProxyExpr =
+        "(function(){" +
+            "var __host=window.document.getElementById(" + JSON.stringify(hostId) + ");" +
+            "var __sr=__host&&__host.shadowRoot;" +
+            "var __real=window.document;" +
+            "return new Proxy(__sr||__real,{get:function(t,k){" +
+                "if(k==='body')return t.querySelector('body')||t;" +
+                "if(k==='head')return t.querySelector('head')||t;" +
+                "if(k==='documentElement')return t.querySelector('html')||t;" +
+                "var v=t[k];" +
+                "if(typeof v==='function')return v.bind(t);" +
+                "if(v!==undefined)return v;" +
+                "var r=__real[k];" +
+                "return typeof r==='function'?r.bind(__real):r;" +
+            "}});" +
+        "})()";
+    const wrapInlineCode = (code) =>
+        "(function(document){" + code + "\n}).call(this," + documentProxyExpr + ");";
+    const babelTypes = new Set(['text/babel', 'text/jsx', 'application/babel', 'application/jsx']);
+
+    async function executeScript(oldScript) {
         const fresh = document.createElement('script');
-        for (const attr of oldScript.attributes) fresh.setAttribute(attr.name, attr.value);
-        const code = oldScript.textContent || '';
-        const isInline = !oldScript.hasAttribute('src');
-        if (isInline && code) {
-            fresh.textContent =
-                "(function(document){" + code + "}).call(this," +
-                "(function(){" +
-                    "var __sr=window.document.getElementById(" + JSON.stringify(hostId) + ").shadowRoot;" +
-                    "var __real=window.document;" +
-                    "return new Proxy(__sr,{get:function(t,k){" +
-                        "if(k==='body')return t.querySelector('body')||t;" +
-                        "if(k==='head')return t.querySelector('head')||t;" +
-                        "if(k==='documentElement')return t.querySelector('html')||t;" +
-                        "var v=t[k];" +
-                        "if(typeof v==='function')return v.bind(t);" +
-                        "if(v!==undefined)return v;" +
-                        "var r=__real[k];" +
-                        "return typeof r==='function'?r.bind(__real):r;" +
-                    "}});" +
-                "})());";
-        } else if (code) {
-            fresh.textContent = code;
+        fresh.async = false;
+        for (const attr of oldScript.attributes) {
+            if (attr.name.toLowerCase() !== 'type') fresh.setAttribute(attr.name, attr.value);
         }
-        oldScript.parentNode.replaceChild(fresh, oldScript);
+        const code = oldScript.textContent || '';
+        const type = (oldScript.getAttribute('type') || '').trim().toLowerCase();
+        const isInline = !oldScript.hasAttribute('src');
+        const isModule = type === 'module';
+        const isBabel = babelTypes.has(type);
+        if (isModule) fresh.type = 'module';
+
+        if (isInline && code) {
+            if (isBabel) {
+                if (!window.Babel?.transform) {
+                    console.warn('[maxjs html_texture] Babel script found before Babel standalone loaded.');
+                    fresh.textContent = wrapInlineCode(code);
+                } else {
+                    const transformed = window.Babel.transform(code, {
+                        presets: ['env', 'react'],
+                        sourceType: 'script',
+                    }).code;
+                    fresh.textContent = wrapInlineCode(transformed);
+                }
+            } else {
+                fresh.textContent = isModule ? code : wrapInlineCode(code);
+            }
+        }
+        await new Promise((resolve) => {
+            fresh.onload = resolve;
+            fresh.onerror = (err) => {
+                console.warn('[maxjs html_texture] script failed:', fresh.src || '[inline]', err);
+                resolve();
+            };
+            oldScript.parentNode.replaceChild(fresh, oldScript);
+            if (isInline && !isModule) resolve();
+        });
+    }
+
+    // Execute scripts in document order. React UMD pages depend on this:
+    // react.js -> react-dom.js -> inline createRoot(...). Running all script
+    // replacements at once races the inline app against the CDN loads.
+    for (const oldScript of Array.from(shadow.querySelectorAll('script'))) {
+        await executeScript(oldScript);
     }
 }
 
@@ -132,7 +168,7 @@ export function createHTMLTexture(THREE, url, options = {}) {
         host = document.createElement('iframe');
         host.style.cssText =
             'width:' + width + 'px;height:' + height + 'px;' +
-            'border:0;display:block;background:#000;pointer-events:auto;';
+            'border:0;display:block;background:transparent;pointer-events:auto;';
         // Fetch HTML text and inject via srcdoc — the iframe's document
         // then lives at about:srcdoc and is same-origin with the parent,
         // avoiding cross-origin-frame blocks from loading an asset URL.
@@ -143,7 +179,8 @@ export function createHTMLTexture(THREE, url, options = {}) {
             return r.text();
         }).then(text => {
             const baseHref = url.replace(/[^/]*$/, '');
-            const baseTag = '<base href="' + baseHref + '">';
+            const baseTag = '<base href="' + baseHref + '">' +
+                '<style id="maxjs-html-texture-base">html,body{background:transparent;}</style>';
             const patched = /<head[^>]*>/i.test(text)
                 ? text.replace(/<head[^>]*>/i, m => m + baseTag)
                 : '<head>' + baseTag + '</head>' + text;
@@ -156,14 +193,13 @@ export function createHTMLTexture(THREE, url, options = {}) {
         host.className = 'maxjs-html-texture-host';
         host.style.cssText =
             'width:' + width + 'px;height:' + height + 'px;' +
-            'box-sizing:border-box;overflow:hidden;background:#000;color:#fff;pointer-events:auto;';
+            'box-sizing:border-box;overflow:hidden;background:transparent;color:#fff;pointer-events:auto;';
     }
     canvas.appendChild(host);
     document.body.appendChild(wrap);
 
     const ctx2d = canvas.getContext('2d');
-    ctx2d.fillStyle = '#000';
-    ctx2d.fillRect(0, 0, width, height);
+    ctx2d.clearRect(0, 0, width, height);
 
     const texture = new THREE.CanvasTexture(canvas);
     texture.colorSpace = THREE.SRGBColorSpace;

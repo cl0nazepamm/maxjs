@@ -1958,6 +1958,15 @@
             }
         }
 
+        const browserTextureExtensions = new Set([
+            'png', 'jpg', 'jpeg', 'webp', 'bmp', 'gif', 'avif', 'svg',
+            'exr', 'hdr',
+        ]);
+
+        function canBrowserLoadTextureExtension(ext) {
+            return !ext || browserTextureExtensions.has(ext);
+        }
+
         function loadEnvironmentTexture(url, sourceName, onLoad, onProgress, onError) {
             const ext = getTextureExtension(sourceName || url);
             const loader = ext === 'exr'
@@ -2562,6 +2571,7 @@
                 realHeight: Number.isFinite(xf.realHeight) && Math.abs(xf.realHeight) > 1e-6 ? xf.realHeight : 1.0,
                 wrap: typeof xf.wrap === 'string' ? xf.wrap : 'periodic',
                 channel: Number.isFinite(xf.channel) ? Math.max(1, Math.round(xf.channel)) : 1,
+                uvChannel: Number.isFinite(xf.uvChannel) ? Math.max(1, Math.round(xf.uvChannel)) : 1,
                 invert: !!xf.invert,
                 colorSpace: typeof xf.colorSpace === 'string' ? xf.colorSpace : '',
                 manualGamma: Number.isFinite(xf.manualGamma) ? xf.manualGamma : 1.0,
@@ -2584,6 +2594,7 @@
             tex.wrapS = tex.wrapT = wrap;
 
             if (!xf) return;
+            applyTextureUvChannel(tex, xf.uvChannel, 1);
 
             const worldScaleU = xf.realWorld ? xf.realWidth : 1.0;
             const worldScaleV = xf.realWorld ? xf.realHeight : 1.0;
@@ -2700,6 +2711,19 @@
                 if (image != null) tex.needsUpdate = true;
             }
             return tex;
+        }
+
+        function optimizedTextureTransformForSlot(key, xf) {
+            if (!xf) return xf;
+            const channel = Number.isFinite(xf.channel) ? Math.max(1, Math.round(xf.channel)) : 1;
+            const nativeChannels = {
+                aoMap: 2,       // Three samples red for aoMap.
+                roughMap: 3,    // Three samples green for roughnessMap.
+                ccRoughMap: 3,  // Three samples green for clearcoatRoughnessMap.
+                metalMap: 4,    // Three samples blue for metalnessMap.
+            };
+            if (nativeChannels[key] !== channel || xf.invert) return xf;
+            return { ...xf, channel: 1 };
         }
 
         function resolveColorSpace(slotColorSpace, xf) {
@@ -3051,6 +3075,12 @@
             const cacheKey = JSON.stringify([url, String(colorSpace), normalizedXf]);
             if (textureCache.has(cacheKey)) return textureCache.get(cacheKey);
             const ext = getTextureExtension(url);
+            if (!canBrowserLoadTextureExtension(ext)) {
+                const placeholder = fallbackTex || fallbackWhiteTexture;
+                textureCache.set(cacheKey, placeholder);
+                console.warn('max.js skipped unsupported browser texture format:', url);
+                return placeholder;
+            }
             if (ext === 'exr' || ext === 'hdr') {
                 const loader = ext === 'exr' ? exrLoader : rgbeLoader;
                 const placeholder = fallbackTex || fallbackWhiteTexture;
@@ -3123,12 +3153,13 @@
                     cacheKey: resolved,
                 });
                 applyTextureTransform(handle.texture, normalizedXf);
+                applyTextureUvChannel(handle.texture, normalizedXf?.uvChannel, 1);
                 return handle.texture;
             }
             const tslCode = md[key + 'TSL'];
             if (tslCode) return evalTSLTexture(tslCode, md[key + 'TSLParams']);
             const url = md[key];
-            if (url) return loadTexture(url, colorSpace, xfKey ? md[xfKey] : null, fallback);
+            if (url) return loadTexture(url, colorSpace, optimizedTextureTransformForSlot(key, xfKey ? md[xfKey] : null), fallback);
             return null;
         }
 
@@ -4717,7 +4748,7 @@
                             const hasIncomingIndex = meta.iOff != null && meta.iN != null;
                             const idxCount = hasIncomingIndex ? meta.iN : 0;
                             const existingIdx = mesh.geometry.getIndex();
-                            const skipBounds = !!(meta.keepNormals || meta.skipBounds);
+                            const skipBounds = !!(meta.keepNormals || meta.skipBounds || meta.compactChannels);
                             const sameTopology = wantsLine === hasLine
                                 && pos
                                 && pos.count === vertCount
@@ -4753,6 +4784,8 @@
                             } else {
                                 if (!hasIncomingIndex) return;
                                 // Topology changed — full rebuild
+                                const oldUv = mesh.geometry.getAttribute('uv');
+                                const oldNormal = mesh.geometry.getAttribute('normal');
                                 const verts = new Float32Array(new Float32Array(buf, meta.vOff, meta.vN));
                                 const idx = new Uint32Array(new Int32Array(buf, meta.iOff, meta.iN));
                                 const geom = new THREE.BufferGeometry();
@@ -4761,15 +4794,24 @@
                                 if (meta.uvOff != null && meta.uvN) {
                                     const uvs = new Float32Array(new Float32Array(buf, meta.uvOff, meta.uvN));
                                     geom.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
+                                } else if (meta.compactChannels && oldUv && oldUv.count === vertCount) {
+                                    geom.setAttribute('uv', oldUv.clone());
                                 }
                                 if (meta.nOff != null && meta.nN) {
                                     const norms = new Float32Array(new Float32Array(buf, meta.nOff, meta.nN));
                                     geom.setAttribute('normal', new THREE.BufferAttribute(norms, 3));
-                                } else {
+                                } else if (meta.compactChannels && oldNormal && oldNormal.count === vertCount) {
+                                    geom.setAttribute('normal', oldNormal.clone());
+                                } else if (!meta.compactChannels) {
                                     geom.computeVertexNormals();
                                 }
                                 setGeometryVertexColorAttributes(geom, incomingVertexColors, buf);
-                                geom.computeBoundingSphere();
+                                if (meta.compactChannels) {
+                                    if (mesh.geometry.boundingBox) geom.boundingBox = mesh.geometry.boundingBox.clone();
+                                    if (mesh.geometry.boundingSphere) geom.boundingSphere = mesh.geometry.boundingSphere.clone();
+                                } else {
+                                    geom.computeBoundingSphere();
+                                }
                                 mesh.geometry.dispose();
                                 mesh.geometry = geom;
                             }
@@ -5641,10 +5683,27 @@
                 return;
             }
 
+            const oldUv = mesh.geometry?.getAttribute?.('uv');
+            const oldNormal = mesh.geometry?.getAttribute?.('normal');
+            const oldBoundingBox = mesh.geometry?.boundingBox?.clone?.();
+            const oldBoundingSphere = mesh.geometry?.boundingSphere?.clone?.();
             const geom = buildGeometry(msg.v, msg.i, msg.uv, msg.norm, {
                 isLine: wantsLine,
                 vertexColors: msg.vc,
+                skipNormalCompute: !!msg.compactChannels,
+                skipBoundsCompute: !!msg.compactChannels,
             });
+            if (msg.compactChannels) {
+                const vertCount = Math.floor((msg.v?.length || 0) / 3);
+                if (!msg.uv && oldUv && oldUv.count === vertCount) {
+                    geom.setAttribute('uv', oldUv.clone());
+                }
+                if (!msg.norm && oldNormal && oldNormal.count === vertCount) {
+                    geom.setAttribute('normal', oldNormal.clone());
+                }
+                if (oldBoundingBox) geom.boundingBox = oldBoundingBox;
+                if (oldBoundingSphere) geom.boundingSphere = oldBoundingSphere;
+            }
             mesh.geometry.dispose();
             mesh.geometry = geom;
             // Vertex / topology data on the same Object3D — no scene-structure
@@ -6215,10 +6274,12 @@
                 geom.setAttribute('uv2', uv2Attr);
             }
             if (normals?.length) geom.setAttribute('normal', new THREE.Float32BufferAttribute(normals, 3));
-            else if (!isLine) geom.computeVertexNormals();
+            else if (!isLine && !options.skipNormalCompute) geom.computeVertexNormals();
             setGeometryVertexColorAttributes(geom, options.vertexColors);
-            geom.computeBoundingBox();
-            geom.computeBoundingSphere();
+            if (!options.skipBoundsCompute) {
+                geom.computeBoundingBox();
+                geom.computeBoundingSphere();
+            }
             return geom;
         }
 

@@ -1294,6 +1294,7 @@ static uint64_t MakeGeomValidityKey(const Interval& iv) {
 
 static constexpr int kSkinnedHashFullVertexThreshold = 16384;
 static constexpr int kSkinnedHashSampleCount = 256;
+static constexpr int kMaxBinaryDeltaTriangles = 600000;
 static constexpr ULONGLONG kSkinnedLivePollIntervalMs = 16;
 static constexpr ULONGLONG kCameraLivePollIntervalMs = 16;
 
@@ -1388,6 +1389,45 @@ static MNMesh* TryGetLiveEditablePolyMesh(INode* node) {
     }
 
     return nullptr;
+}
+
+static int CountMNMeshTrianglesCapped(MNMesh& mn, int cap) {
+    long long triangles = 0;
+    const int faceCount = mn.FNum();
+    for (int i = 0; i < faceCount; ++i) {
+        const MNFace* face = mn.F(i);
+        if (!face || face->GetFlag(MN_DEAD) || face->deg < 3) continue;
+        triangles += static_cast<long long>(face->deg - 2);
+        if (triangles > cap) return cap + 1;
+    }
+    return static_cast<int>(triangles);
+}
+
+static int EstimateRenderableTriangleCountCapped(INode* node, TimeValue t, int cap) {
+    if (!node) return 0;
+
+    if (MNMesh* liveMN = TryGetLiveEditablePolyMesh(node)) {
+        return CountMNMeshTrianglesCapped(*liveMN, cap);
+    }
+
+    ObjectState os = node->EvalWorldState(t);
+    if (!os.obj || os.obj->SuperClassID() != GEOMOBJECT_CLASS_ID) return 0;
+    if (IsThreeJSSplatClassID(os.obj->ClassID())) return 0;
+
+    if (os.obj->IsSubClassOf(polyObjectClassID)) {
+        MNMesh& mn = static_cast<PolyObject*>(os.obj)->GetMesh();
+        return CountMNMeshTrianglesCapped(mn, cap);
+    }
+
+    if (!os.obj->CanConvertToType(Class_ID(TRIOBJ_CLASS_ID, 0))) return 0;
+    TriObject* tri = static_cast<TriObject*>(
+        os.obj->ConvertToType(t, Class_ID(TRIOBJ_CLASS_ID, 0)));
+    if (!tri) return 0;
+
+    const int faces = tri->GetMesh().getNumFaces();
+    const int cappedFaces = (faces > cap) ? (cap + 1) : faces;
+    if (tri != os.obj) tri->DeleteThis();
+    return cappedFaces;
 }
 
 static bool ExtractSpline(INode* node, TimeValue t,
@@ -1589,6 +1629,7 @@ struct MaxJSPBR {
         bool  isUberBitmap = false;
         bool  hasChannelSelect = false;
         int   outputChannelIndex = 1;
+        int   uvChannel = 1;
         bool  invert = false;
         float scale = 1.0f;
         float tiling[2] = {1.0f, 1.0f};
@@ -1739,6 +1780,16 @@ static bool IsMaterialXMaterialClass(const Class_ID& cid) {
     return cid == MATERIALX_MTL_CLASS_ID || cid == MATERIALX_MTL_ALT_CLASS_ID;
 }
 
+static bool IsVRayBitmapTexmap(Texmap* map) {
+    if (!map) return false;
+    return map->ClassID() == VRAYBITMAP_CLASS_ID;
+}
+
+static bool IsVRayNormalMapTexmap(Texmap* map) {
+    if (!map) return false;
+    return map->ClassID() == VRAYNORMALMAP_CLASS_ID;
+}
+
 static std::wstring GetUtilityMaterialModelName(int utilityModel) {
     switch (utilityModel) {
         case threejs_utility_depth: return L"MeshDepthMaterial";
@@ -1870,6 +1921,97 @@ static Texmap* FindPBMap(Texmap* map, const MCHAR* name) {
     return nullptr;
 }
 
+static bool PBNameEquals(const MCHAR* lhs, const MCHAR* rhs) {
+    return lhs && rhs && _tcsicmp(lhs, rhs) == 0;
+}
+
+static Texmap* FindPBMapByNames(Texmap* map, const MCHAR* const* names, size_t nameCount) {
+    if (!map || !names || nameCount == 0) return nullptr;
+    for (size_t n = 0; n < nameCount; ++n) {
+        if (Texmap* found = FindPBMap(map, names[n]))
+            return found;
+    }
+    return nullptr;
+}
+
+static int FindPBIntByNames(Texmap* map, const MCHAR* const* names, size_t nameCount, int def) {
+    if (!map || !names || nameCount == 0) return def;
+    for (int b = 0; b < map->NumParamBlocks(); b++) {
+        IParamBlock2* pb = map->GetParamBlock(b);
+        if (!pb) continue;
+        for (int i = 0; i < pb->NumParams(); i++) {
+            ParamID pid = pb->IndextoID(i);
+            const ParamDef& pd = pb->GetParamDef(pid);
+            if (!pd.int_name || (pd.type != TYPE_INT && pd.type != TYPE_BOOL)) continue;
+            for (size_t n = 0; n < nameCount; ++n) {
+                if (PBNameEquals(pd.int_name, names[n]))
+                    return pb->GetInt(pid);
+            }
+        }
+    }
+    return def;
+}
+
+static std::wstring FindPBImagePathByNames(Texmap* map,
+                                           const MCHAR* const* names,
+                                           size_t nameCount) {
+    if (!map || !names || nameCount == 0) return {};
+    for (int b = 0; b < map->NumParamBlocks(); b++) {
+        IParamBlock2* pb = map->GetParamBlock(b);
+        if (!pb) continue;
+        for (int i = 0; i < pb->NumParams(); i++) {
+            ParamID pid = pb->IndextoID(i);
+            const ParamDef& pd = pb->GetParamDef(pid);
+            if (!pd.int_name || (pd.type != TYPE_STRING && pd.type != TYPE_FILENAME)) continue;
+            bool nameMatches = false;
+            for (size_t n = 0; n < nameCount; ++n) {
+                if (PBNameEquals(pd.int_name, names[n])) {
+                    nameMatches = true;
+                    break;
+                }
+            }
+            if (!nameMatches) continue;
+
+            const MCHAR* raw = pb->GetStr(pid);
+            if (!raw || !raw[0]) continue;
+            return raw;
+        }
+    }
+    return {};
+}
+
+static std::wstring FindVRayBitmapFilename(Texmap* map) {
+    if (!map) return {};
+
+    static const MCHAR* const kVRayBitmapFilenameParams[] = {
+        _T("HDRIMapName"),
+        _T("HDRI"),
+        _T("filename"),
+        _T("fileName"),
+        _T("file"),
+        _T("bitmap"),
+        _T("mapName"),
+        _T("BitmapBuffer")
+    };
+
+    std::wstring raw = FindPBImagePathByNames(
+            map,
+            kVRayBitmapFilenameParams,
+            sizeof(kVRayBitmapFilenameParams) / sizeof(kVRayBitmapFilenameParams[0]));
+    if (!raw.empty()) {
+        std::wstring resolved = ResolveTextureFilePath(raw);
+        if (!resolved.empty()) return resolved;
+        if (IsImageFile(raw.c_str()))
+            return raw;
+    }
+
+    std::wstring resolved = FindBitmapFile(map);
+    if (!resolved.empty())
+        return resolved;
+
+    return {};
+}
+
 static bool IsAutodeskUberBitmap(Texmap* map) {
     if (!map) return false;
 
@@ -1924,6 +2066,7 @@ static void ExtractStdUVTransform(Texmap* map, MaxJSPBR::TexTransform& xf) {
         xf.offset[0] = stdUv->GetUOffs(0);
         xf.offset[1] = stdUv->GetVOffs(0);
         xf.rotate = stdUv->GetWAng(0) * (180.0f / PI);
+        xf.uvChannel = std::max(1, stdUv->GetMapChannel());
 
         const int tilingFlags = stdUv->GetTextureTiling();
         if ((tilingFlags & (U_MIRROR | V_MIRROR)) != 0) {
@@ -2204,17 +2347,59 @@ static bool ExtractMaterialTexture(Texmap* map, std::wstring& filePath, MaxJSPBR
     }
 
     // VRayNormalMap — walk through to the inner normal map texture
-    if (resolved->ClassID() == VRAYNORMALMAP_CLASS_ID) {
-        Texmap* innerNormal = FindPBMap(resolved, _T("normal_map"));
-        if (innerNormal) return ExtractMaterialTexture(innerNormal, filePath, xf);
-        Texmap* innerBump = FindPBMap(resolved, _T("bump_map"));
-        if (innerBump) return ExtractMaterialTexture(innerBump, filePath, xf);
+    if (IsVRayNormalMapTexmap(resolved)) {
+        static const MCHAR* const kNormalMapParams[] = {
+            _T("normal_map"),
+            _T("normalMap"),
+            _T("normal_texmap"),
+            _T("texmap_normal"),
+            _T("normal")
+        };
+        static const MCHAR* const kBumpMapParams[] = {
+            _T("bump_map"),
+            _T("bumpMap"),
+            _T("bump_texmap"),
+            _T("texmap_bump"),
+            _T("bump")
+        };
+
+        const int wrapperMapChannel = std::max(1, FindPBInt(resolved, _T("map_channel"), 1));
+        const bool normalEnabled = FindPBInt(resolved, _T("normal_map_on"), 1) != 0;
+        const bool bumpEnabled = FindPBInt(resolved, _T("bump_map_on"), 1) != 0;
+        Texmap* innerNormal = FindPBMapByNames(
+            resolved,
+            kNormalMapParams,
+            sizeof(kNormalMapParams) / sizeof(kNormalMapParams[0]));
+        if (normalEnabled && innerNormal) {
+            if (ExtractMaterialTexture(innerNormal, filePath, xf)) {
+                if (xf.uvChannel == 1) xf.uvChannel = wrapperMapChannel;
+                return true;
+            }
+        }
+        Texmap* innerBump = FindPBMapByNames(
+            resolved,
+            kBumpMapParams,
+            sizeof(kBumpMapParams) / sizeof(kBumpMapParams[0]));
+        if (bumpEnabled && innerBump) {
+            if (ExtractMaterialTexture(innerBump, filePath, xf)) {
+                if (xf.uvChannel == 1) xf.uvChannel = wrapperMapChannel;
+                return true;
+            }
+        }
+        for (int i = 0; i < resolved->NumSubTexmaps(); ++i) {
+            if ((i == 0 && !normalEnabled) || (i == 1 && !bumpEnabled)) continue;
+            Texmap* sub = resolved->GetSubTexmap(i);
+            if (sub && ExtractMaterialTexture(sub, filePath, xf)) {
+                if (xf.uvChannel == 1) xf.uvChannel = wrapperMapChannel;
+                return true;
+            }
+        }
         return false;
     }
 
     // VRayBitmap (VRayHDRI)
-    if (resolved->ClassID() == VRAYBITMAP_CLASS_ID) {
-        const std::wstring filename = FindPBString(resolved, _T("HDRIMapName"));
+    if (IsVRayBitmapTexmap(resolved)) {
+        const std::wstring filename = FindVRayBitmapFilename(resolved);
         if (filename.empty() || !IsImageFile(filename.c_str()))
             return false;
         filePath = filename;
@@ -2226,6 +2411,7 @@ static bool ExtractMaterialTexture(Texmap* map, std::wstring& filePath, MaxJSPBR
         if (xf.colorSpace.empty())
             xf.colorSpace = FindPBString(resolved, _T("rgbColorSpace"));
         xf.manualGamma = FindPBFloat(resolved, _T("gamma"), 1.0f);
+        xf.uvChannel = std::max(1, FindPBInt(resolved, _T("mapChannel"), xf.uvChannel));
         return true;
     }
 
@@ -2271,21 +2457,65 @@ static void ExtractWrappedNormalBumpMaps(
 {
     if (!map) return;
 
-    if (map->ClassID() == NORMAL_BUMP_CLASS_ID || map->ClassID() == VRAYNORMALMAP_CLASS_ID) {
-        Texmap* normalMap = FindPBMap(map, _T("normal_map"));
-        Texmap* bumpMap = FindPBMap(map, _T("bump_map"));
-        const bool normalEnabled = FindPBInt(map, _T("map1on"), 1) != 0;
-        const bool bumpEnabled = FindPBInt(map, _T("map2on"), 1) != 0;
+    if (map->ClassID() == NORMAL_BUMP_CLASS_ID || IsVRayNormalMapTexmap(map)) {
+        static const MCHAR* const kNormalMapParams[] = {
+            _T("normal_map"),
+            _T("normalMap"),
+            _T("normal_texmap"),
+            _T("texmap_normal"),
+            _T("normal")
+        };
+        static const MCHAR* const kBumpMapParams[] = {
+            _T("bump_map"),
+            _T("bumpMap"),
+            _T("bump_texmap"),
+            _T("texmap_bump"),
+            _T("bump")
+        };
+        static const MCHAR* const kNormalEnabledParams[] = {
+            _T("map1on"),
+            _T("normal_map_on"),
+            _T("normalMap_on"),
+            _T("texmap_normal_on")
+        };
+        static const MCHAR* const kBumpEnabledParams[] = {
+            _T("map2on"),
+            _T("bump_map_on"),
+            _T("bumpMap_on"),
+            _T("texmap_bump_on")
+        };
+
+        Texmap* normalMap = FindPBMapByNames(
+            map,
+            kNormalMapParams,
+            sizeof(kNormalMapParams) / sizeof(kNormalMapParams[0]));
+        Texmap* bumpMap = FindPBMapByNames(
+            map,
+            kBumpMapParams,
+            sizeof(kBumpMapParams) / sizeof(kBumpMapParams[0]));
+        const bool normalEnabled = FindPBIntByNames(
+            map,
+            kNormalEnabledParams,
+            sizeof(kNormalEnabledParams) / sizeof(kNormalEnabledParams[0]),
+            1) != 0;
+        const bool bumpEnabled = FindPBIntByNames(
+            map,
+            kBumpEnabledParams,
+            sizeof(kBumpEnabledParams) / sizeof(kBumpEnabledParams[0]),
+            1) != 0;
 
         if (!normalMap && map->NumSubTexmaps() > 0)
             normalMap = map->GetSubTexmap(0);
         if (!bumpMap && map->NumSubTexmaps() > 1)
             bumpMap = map->GetSubTexmap(1);
 
-        if (normalEnabled && normalMap)
-            ExtractMaterialTexture(normalMap, normalPath, normalXf);
-        if (bumpEnabled && bumpMap)
-            ExtractMaterialTexture(bumpMap, bumpPath, bumpXf);
+        const int wrapperMapChannel = std::max(1, FindPBInt(map, _T("map_channel"), 1));
+        if (normalEnabled && normalMap && ExtractMaterialTexture(normalMap, normalPath, normalXf)) {
+            if (normalXf.uvChannel == 1) normalXf.uvChannel = wrapperMapChannel;
+        }
+        if (bumpEnabled && bumpMap && ExtractMaterialTexture(bumpMap, bumpPath, bumpXf)) {
+            if (bumpXf.uvChannel == 1) bumpXf.uvChannel = wrapperMapChannel;
+        }
         return;
     }
 
@@ -3731,7 +3961,8 @@ static bool ExtractMeshFromMNMesh(MNMesh& mn,
                                   std::vector<VertexColorAttributeRecord>* outVertexColors = nullptr,
                                   bool allowMapChannel1 = false,
                                   std::vector<FastVertexSource>* outFastVertexSources = nullptr,
-                                  std::vector<float>* outUV2s = nullptr) {
+                                  std::vector<float>* outUV2s = nullptr,
+                                  bool emitPrimaryUVs = true) {
     const int numFaces = mn.FNum();
     const int numVerts = mn.VNum();
     if (numFaces == 0 || numVerts == 0) return false;
@@ -3855,7 +4086,7 @@ static bool ExtractMeshFromMNMesh(MNMesh& mn,
     int estTris = 0;
     for (auto& fr : liveFaces) estTris += mn.F(fr.idx)->deg - 2;
     verts.reserve(numVerts * 3);
-    if (hasUVs) uvs.reserve(numVerts * 2);
+    if (emitPrimaryUVs && hasUVs) uvs.reserve(numVerts * 2);
     if (hasUV2s) outUV2s->reserve(numVerts * 2);
     indices.reserve(estTris * 3);
     std::vector<float> normals;
@@ -3944,11 +4175,11 @@ static bool ExtractMeshFromMNMesh(MNMesh& mn,
                         normals.push_back(n.z);
                     }
 
-                    if (hasUVs && uvIdx < (DWORD)uvMap->numv) {
+                    if (emitPrimaryUVs && hasUVs && uvIdx < (DWORD)uvMap->numv) {
                         UVVert uv = uvMap->v[uvIdx];
                         uvs.push_back(uv.x);
                         uvs.push_back(uv.y);
-                    } else if (hasUVs) {
+                    } else if (emitPrimaryUVs && hasUVs) {
                         uvs.push_back(0.0f);
                         uvs.push_back(0.0f);
                     }
@@ -4008,7 +4239,8 @@ static bool ExtractMeshFromTriObject(TriObject* tri, Object* srcObj,
                                      std::vector<VertexColorAttributeRecord>* outVertexColors = nullptr,
                                      bool allowMapChannel1 = false,
                                      std::vector<FastVertexSource>* outFastVertexSources = nullptr,
-                                     std::vector<float>* outUV2s = nullptr) {
+                                     std::vector<float>* outUV2s = nullptr,
+                                     bool emitPrimaryUVs = true) {
     Mesh& mesh = tri->GetMesh();
     int nv = mesh.getNumVerts();
     int nf = mesh.getNumFaces();
@@ -4018,7 +4250,7 @@ static bool ExtractMeshFromTriObject(TriObject* tri, Object* srcObj,
         return false;
     }
 
-    bool hasUVs = mesh.getNumTVerts() > 0;
+    bool hasUVs = mesh.getNumTVerts() > 0 && mesh.tvFace != nullptr;
     MeshMap* uv2Map = (outUV2s && MeshHasUsableMapChannel(mesh, 2)) ? &mesh.Map(2) : nullptr;
     const bool hasUV2s = uv2Map != nullptr;
     const std::vector<int> vertexColorChannels = CollectMeshVertexColorChannels(mesh, allowMapChannel1);
@@ -4094,7 +4326,7 @@ static bool ExtractMeshFromTriObject(TriObject* tri, Object* srcObj,
 
     std::unordered_map<MeshCornerKey, int, MeshCornerKeyHash> vertMap;
     verts.reserve(nv * 3);
-    if (hasUVs) uvs.reserve(nv * 2);
+    if (emitPrimaryUVs && hasUVs) uvs.reserve(nv * 2);
     if (hasUV2s) outUV2s->reserve(nv * 2);
     indices.reserve(nf * 3);
     std::vector<float> normals;
@@ -4162,7 +4394,7 @@ static bool ExtractMeshFromTriObject(TriObject* tri, Object* srcObj,
                     normals.push_back(n.z);
                 }
 
-                if (hasUVs) {
+                if (emitPrimaryUVs && hasUVs) {
                     UVVert uv = mesh.tVerts[uvIdx];
                     uvs.push_back(uv.x);
                     uvs.push_back(uv.y);
@@ -4558,7 +4790,8 @@ static bool ExtractMesh(INode* node, TimeValue t,
                         std::vector<int>* controlIdx = nullptr,
                         std::vector<VertexColorAttributeRecord>* outVertexColors = nullptr,
                         std::vector<FastVertexSource>* outFastVertexSources = nullptr,
-                        std::vector<float>* outUV2s = nullptr) {
+                        std::vector<float>* outUV2s = nullptr,
+                        bool emitPrimaryUVs = true) {
     const bool allowMapChannel1 = ShouldAllowVertexColorMapChannel1(node);
     if (MNMesh* liveMN = TryGetLiveEditablePolyMesh(node)) {
         // When UV2 is requested, prefer the evaluated object if the live
@@ -4566,7 +4799,7 @@ static bool ExtractMesh(INode* node, TimeValue t,
         // Unwrap modifiers that author lightmap UVs above the base object
         // without putting UV2 into the hot geo_fast path.
         if (!outUV2s || MNMeshHasUsableMapChannel(*liveMN, 2)) {
-            return ExtractMeshFromMNMesh(*liveMN, verts, uvs, indices, groups, normals, controlIdx, outVertexColors, allowMapChannel1, outFastVertexSources, outUV2s);
+            return ExtractMeshFromMNMesh(*liveMN, verts, uvs, indices, groups, normals, controlIdx, outVertexColors, allowMapChannel1, outFastVertexSources, outUV2s, emitPrimaryUVs);
         }
     }
 
@@ -4582,7 +4815,7 @@ static bool ExtractMesh(INode* node, TimeValue t,
     if (os.obj->IsSubClassOf(polyObjectClassID)) {
         PolyObject* poly = static_cast<PolyObject*>(os.obj);
         MNMesh& mn = poly->GetMesh();
-        return ExtractMeshFromMNMesh(mn, verts, uvs, indices, groups, normals, controlIdx, outVertexColors, allowMapChannel1, outFastVertexSources, outUV2s);
+        return ExtractMeshFromMNMesh(mn, verts, uvs, indices, groups, normals, controlIdx, outVertexColors, allowMapChannel1, outFastVertexSources, outUV2s, emitPrimaryUVs);
     }
 
     // Fallback: convert to TriObject for non-poly geometry (primitives, patches, etc.)
@@ -4590,7 +4823,7 @@ static bool ExtractMesh(INode* node, TimeValue t,
     TriObject* tri = static_cast<TriObject*>(
         os.obj->ConvertToType(t, Class_ID(TRIOBJ_CLASS_ID, 0)));
     if (!tri) return false;
-    return ExtractMeshFromTriObject(tri, os.obj, verts, uvs, indices, groups, normals, controlIdx, outVertexColors, allowMapChannel1, outFastVertexSources, outUV2s);
+    return ExtractMeshFromTriObject(tri, os.obj, verts, uvs, indices, groups, normals, controlIdx, outVertexColors, allowMapChannel1, outFastVertexSources, outUV2s, emitPrimaryUVs);
 }
 
 static bool TryHashExtractedRenderableGeometry(INode* node, TimeValue t, uint64_t& outHash) {
@@ -4645,6 +4878,60 @@ static bool TryHashRenderableGeometryState(INode* node, TimeValue t, uint64_t& o
     outHash = HashMeshStateWithUVs(tri->GetMesh(), allowMapChannel1);
     if (tri != os.obj) tri->DeleteThis();
     return true;
+}
+
+static bool TryHashRenderableGeometryStateWithoutUVs(INode* node, TimeValue t, uint64_t& outHash) {
+    const bool allowMapChannel1 = ShouldAllowVertexColorMapChannel1(node);
+    if (MNMesh* liveMN = TryGetLiveEditablePolyMesh(node)) {
+        outHash = HashMNMeshState(*liveMN);
+        const std::vector<int> channels = CollectMNMeshVertexColorChannels(*liveMN, allowMapChannel1);
+        outHash = HashMNMeshVertexColorChannels(*liveMN, channels, outHash);
+        return true;
+    }
+
+    ObjectState os = node->EvalWorldState(t);
+    if (!os.obj) return false;
+
+    if (os.obj->SuperClassID() == SHAPE_CLASS_ID) {
+        outHash = HashNodeGeometryState(node, t);
+        return outHash != 0;
+    }
+
+    if (os.obj->SuperClassID() != GEOMOBJECT_CLASS_ID) return false;
+    if (IsThreeJSSplatClassID(os.obj->ClassID())) return false;
+
+    if (ShouldUseHairRenderMeshFallback(node)) {
+        outHash = HashNodeGeometryState(node, t);
+        return outHash != 0;
+    }
+
+    if (os.obj->IsSubClassOf(polyObjectClassID)) {
+        MNMesh& mn = static_cast<PolyObject*>(os.obj)->GetMesh();
+        outHash = HashMNMeshState(mn);
+        const std::vector<int> channels = CollectMNMeshVertexColorChannels(mn, allowMapChannel1);
+        outHash = HashMNMeshVertexColorChannels(mn, channels, outHash);
+        return true;
+    }
+
+    if (!os.obj->CanConvertToType(Class_ID(TRIOBJ_CLASS_ID, 0))) return false;
+    TriObject* tri = static_cast<TriObject*>(os.obj->ConvertToType(t, Class_ID(TRIOBJ_CLASS_ID, 0)));
+    if (!tri) return false;
+
+    Mesh& mesh = tri->GetMesh();
+    outHash = HashMeshState(mesh);
+    const std::vector<int> channels = CollectMeshVertexColorChannels(mesh, allowMapChannel1);
+    outHash = HashMeshVertexColorChannels(mesh, channels, outHash);
+    if (tri != os.obj) tri->DeleteThis();
+    return true;
+}
+
+static bool TryHashRenderableGeometryFastState(INode* node,
+                                               TimeValue t,
+                                               bool omitChannels,
+                                               uint64_t& outHash) {
+    return omitChannels
+        ? TryHashRenderableGeometryStateWithoutUVs(node, t, outHash)
+        : TryHashRenderableGeometryState(node, t, outHash);
 }
 
 static bool TryHashRenderableGeometryChannels(INode* node, TimeValue t, uint64_t& outHash) {
@@ -7002,6 +7289,7 @@ public:
     std::unordered_map<ULONG, uint64_t> audioHashMap_; // node handle → audio source state hash
     std::unordered_map<ULONG, uint64_t> gltfHashMap_;  // node handle → gltf source state hash
     std::unordered_map<ULONG, uint64_t> geoHashMap_;   // node handle → geometry topology hash
+    std::unordered_map<ULONG, int> geoFastTriangleCountMap_; // node handle -> capped triangle count for geo_fast eligibility
     std::unordered_map<ULONG, uint64_t> deformChannelHashMap_; // node handle -> UV/topology hash for deform fast path
     std::unordered_map<ULONG, std::vector<MatGroup>> groupCache_; // cached material groups per node
     std::unordered_map<ULONG, uint64_t> propHashMap_;  // node handle → object properties hash
@@ -9860,6 +10148,7 @@ public:
         gltfHashMap_.clear();
         propHashMap_.clear();
         geoHashMap_.clear();
+        geoFastTriangleCountMap_.clear();
         deformChannelHashMap_.clear();
         jsmodStateMap_.clear();
         groupCache_.clear();
@@ -10242,6 +10531,7 @@ public:
 
     void RequestFullGeometryResync() {
         geoHashMap_.clear();
+        geoFastTriangleCountMap_.clear();
         deformChannelHashMap_.clear();
         lastBBoxHash_.clear();
         lastLiveGeomHash_.clear();
@@ -10359,6 +10649,19 @@ public:
         haveLastSentCamera_ = true;
     }
 
+    bool ShouldOmitGeometryFastChannels(INode* node, TimeValue t) {
+        if (!node) return false;
+        const ULONG handle = node->GetHandle();
+        auto it = geoFastTriangleCountMap_.find(handle);
+        if (it == geoFastTriangleCountMap_.end()) {
+            const int triCount = EstimateRenderableTriangleCountCapped(
+                node, t, kMaxBinaryDeltaTriangles);
+            if (triCount <= 0) return false;
+            it = geoFastTriangleCountMap_.emplace(handle, triCount).first;
+        }
+        return it->second > kMaxBinaryDeltaTriangles;
+    }
+
     // Live geometry signature for redraw-driven edit detection
     std::unordered_map<ULONG, uint64_t> lastBBoxHash_;
     std::unordered_map<ULONG, uint64_t> lastLiveGeomHash_;
@@ -10422,13 +10725,13 @@ public:
                 continue;
             }
             if (ShouldSuppressSelectedGeometryForTransform()) continue;
+            const bool omitFastChannels = ShouldOmitGeometryFastChannels(node, t);
 
-            // Match DetectGeometryChanges / geo_fast payload: include UVs
-            // (HashNodeGeometryState omits them). Never run this while the
-            // time slider is moving; high-poly UV hashes are exactly the
-            // scrub hitch path, and timeline scrubbing is not a topology edit.
+            // Match DetectGeometryChanges / geo_fast payload. For oversized
+            // meshes this deliberately ignores UVs so live edits do not walk
+            // and ship heavy channel data.
             uint64_t geomHash = 0;
-            if (!TryHashRenderableGeometryState(node, t, geomHash))
+            if (!TryHashRenderableGeometryFastState(node, t, omitFastChannels, geomHash))
                 continue;
             auto it = lastLiveGeomHash_.find(handle);
             if (it != lastLiveGeomHash_.end() && it->second == geomHash) continue;
@@ -10542,9 +10845,11 @@ public:
             if (forceForCurrentTime && IsAnimationPlaying() && !IsMaxJsSyncDrawVisible(node)) {
                 return;
             }
+            const bool omitFastChannels = ShouldOmitGeometryFastChannels(node, t);
 
             if (skipHash) {
-                if (!timelineFastLane &&
+                if (!omitFastChannels &&
+                    !timelineFastLane &&
                     !IsAnimationPlaying() &&
                     node->Selected() &&
                     HasDeformingChannelChange(handle, node, t, true)) {
@@ -10563,7 +10868,7 @@ public:
                 return;
             }
 
-            if (HasDeformingChannelChange(handle, node, t, false)) {
+            if (!omitFastChannels && HasDeformingChannelChange(handle, node, t, false)) {
                 geoHashMap_.erase(handle);
                 geoFastDirtyHandles_.insert(handle);
                 geoFullFastDirtyHandles_.insert(handle);
@@ -11272,20 +11577,22 @@ public:
 
     // Geometry position change (deform/vertex edit) — fast path, no full sync
     void MarkGeometryPositionsDirty(const NodeEventNamespace::NodeKeyTab& nodes) {
+        Interface* ip = GetCOREInterface();
+        const TimeValue t = ip ? ip->GetTime() : 0;
         bool changed = false;
         for (int i = 0; i < nodes.Count(); ++i) {
             INode* node = NodeEventNamespace::GetNodeByKey(nodes[i]);
             if (!node) continue;
-            VisitNodeSubtree(node, [this, &changed](INode* current) {
+            VisitNodeSubtree(node, [this, t, &changed](INode* current) {
                 const ULONG handle = current->GetHandle();
                 if (!IsTrackedHandle(handle)) return;
-                geoHashMap_.erase(handle);
                 // Hair handles get full re-extraction via SendHairFastUpdate —
                 // they don't go through geoFastDirtyHandles_ (no mesh to send).
                 if (hairHandles_.count(handle)) {
                     if (fastDirtyHandles_.insert(handle).second) changed = true;
                     return;
                 }
+                geoHashMap_.erase(handle);
                 geoFastDirtyHandles_.insert(handle);
                 // Skinned + Path-Deform + any other deforming mesh only needs
                 // vertex data updates via geo_fast. The node transform doesn't
@@ -11316,6 +11623,11 @@ public:
             VisitNodeSubtree(node, [this, t, &changed, &needsFullSync](INode* current) {
                 const ULONG handle = current->GetHandle();
                 if (!IsTrackedHandle(handle)) return;
+                if (hairHandles_.count(handle)) {
+                    if (fastDirtyHandles_.insert(handle).second) changed = true;
+                    return;
+                }
+                const bool omitFastChannels = ShouldOmitGeometryFastChannels(current, t);
 
                 // Hash-dedupe before doing anything. Max fires spurious
                 // ControllerStructured / TopologyChanged events on viewport
@@ -11332,7 +11644,7 @@ public:
                 uint64_t liveHash = 0;
                 auto hashIt = geoHashMap_.find(handle);
                 if (hashIt != geoHashMap_.end() &&
-                    TryHashRenderableGeometryState(current, t, liveHash) &&
+                    TryHashRenderableGeometryFastState(current, t, omitFastChannels, liveHash) &&
                     liveHash == hashIt->second) {
                     return;
                 }
@@ -11353,7 +11665,8 @@ public:
                 const bool isDeformingHandle =
                     skinnedHandles_.count(handle) ||
                     deformHandles_.count(handle);
-                if (isDeformingHandle ||
+                if (omitFastChannels ||
+                    isDeformingHandle ||
                     current->Selected() ||
                     isProcedural) {
                     geoFastDirtyHandles_.insert(handle);
@@ -11709,6 +12022,7 @@ public:
         if (type == L"scene_dirty" || msg.find(L"\"scene_dirty\"") != std::wstring::npos) {
             jsmodStateMap_.clear();
             geoHashMap_.clear();
+            geoFastTriangleCountMap_.clear();
             deformChannelHashMap_.clear();
             lastLiveGeomHash_.clear();
             SetDirtyImmediate();
@@ -11878,6 +12192,7 @@ public:
             splatHashMap_.clear();
             propHashMap_.clear();
             geoHashMap_.clear();  // force all geometry to be sent
+            geoFastTriangleCountMap_.clear();
             deformChannelHashMap_.clear();
             jsmodStateMap_.clear();
             inlineLayersStateSignature_.clear();  // re-scan inline layers on reconnect
@@ -12033,6 +12348,7 @@ public:
         for (ULONG handle : handles) {
             INode* node = ip->GetINodeByHandle(handle);
             if (!node) continue;
+            const bool omitFastChannels = ShouldOmitGeometryFastChannels(node, t);
 
             // Fast-deform path: positions are re-sent without
             // indices/UVs/material groups. Valid for meshes whose topology and
@@ -12057,8 +12373,9 @@ public:
             // the viewport redraws, even if the generated mesh is byte-identical
             // to the last send. ExtractMesh + SharedBuffer allocation on every
             // tick is what makes camera movement chop; this short-circuits the
-            // no-op case without losing real topology/UV edits (hash covers
-            // positions, indices, uvs, and vertex colors where applicable).
+            // no-op case without losing real topology/UV edits. Above the
+            // compact-channel threshold, UVs are intentionally ignored and
+            // preserved on the JS side instead of being re-sent.
             //
             // Do NOT run this for active deform playback/manipulation: the
             // fast path above already decided the mesh is changing, and this
@@ -12069,7 +12386,7 @@ public:
                 uint64_t preHash = 0;
                 auto it = geoHashMap_.find(handle);
                 if (it != geoHashMap_.end() &&
-                    TryHashRenderableGeometryState(node, t, preHash) &&
+                    TryHashRenderableGeometryFastState(node, t, omitFastChannels, preHash) &&
                     preHash == it->second) {
                     continue;
                 }
@@ -12099,7 +12416,7 @@ public:
                 // and can multiply render vertices. Keep the current normal
                 // buffer while Max is playing or scrubbing; idle/full sync can
                 // refresh normals after the time slider settles.
-                const bool streamLiveNormals = !preferPositionOnlyDeformSync;
+                const bool streamLiveNormals = !omitFastChannels && !preferPositionOnlyDeformSync;
                 auto sourceIt = skinnedFastSourceCache_.find(handle);
                 if (sourceIt != skinnedFastSourceCache_.end()) {
                     usedSkinnedFastPositions = ExtractSkinnedFastGeometry(
@@ -12117,9 +12434,9 @@ public:
             std::vector<int> controlIdx;
             std::vector<FastVertexSource> fastSources;
             std::vector<float>* extractNormals =
-                preferPositionOnlyDeformSync ? nullptr : &norms;
+                (omitFastChannels || preferPositionOnlyDeformSync) ? nullptr : &norms;
             if (!usedSkinnedFastPositions &&
-                !ExtractMesh(node, t, verts, uvs, indices, groups, extractNormals, &controlIdx, &vertexColors, &fastSources)) {
+                !ExtractMesh(node, t, verts, uvs, indices, groups, extractNormals, &controlIdx, &vertexColors, &fastSources, nullptr, !omitFastChannels)) {
                 ObjectState os = node->EvalWorldState(t);
                 if (!ShouldExtractRenderableShape(node, t, &os) ||
                     !ExtractSpline(node, t, verts, indices)) {
@@ -12134,11 +12451,11 @@ public:
                 // Store raw hash consistent with DetectGeometryChanges / TryHashRenderableGeometryState
                 if (!preferPositionOnlyDeformSync) {
                     uint64_t rawHash = 0;
-                    if (!TryHashRenderableGeometryState(node, t, rawHash))
+                    if (!TryHashRenderableGeometryFastState(node, t, omitFastChannels, rawHash))
                         rawHash = HashMeshData(verts, indices, uvs, &vertexColors);
                     geoHashMap_[handle] = rawHash;
                     uint64_t channelHash = 0;
-                    if (TryHashRenderableGeometryChannels(node, t, channelHash))
+                    if (!omitFastChannels && TryHashRenderableGeometryChannels(node, t, channelHash))
                         deformChannelHashMap_[handle] = channelHash;
                     else
                         deformChannelHashMap_.erase(handle);
@@ -12202,6 +12519,7 @@ public:
                 ss.imbue(std::locale::classic());
                 ss << L"{\"type\":\"geo_fast\",\"h\":" << handle;
                 ss << L",\"jsmod\":" << (jmFast.found ? L"true" : L"false");
+                if (omitFastChannels) ss << L",\"compactChannels\":true";
                 if (isSpline) ss << L",\"spline\":true";
                 ss << L",\"vOff\":" << vOff << L",\"vN\":" << verts.size();
                 if (usedSkinnedFastPositions) {
@@ -12225,6 +12543,7 @@ public:
                 ss.imbue(std::locale::classic());
                 ss << L"{\"type\":\"geo_fast\",\"h\":" << handle;
                 ss << L",\"jsmod\":" << (jmFast.found ? L"true" : L"false");
+                if (omitFastChannels) ss << L",\"compactChannels\":true";
                 if (isSpline) ss << L",\"spline\":true";
                 ss << L",\"v\":"; WriteFloats(ss, verts.data(), verts.size());
                 ss << L",\"i\":"; WriteInts(ss, indices.data(), indices.size());
@@ -13290,12 +13609,21 @@ public:
                     skinnedHandles_.count(handle) ||
                     deformHandles_.count(handle);
                 if (!handledByLivePoll) {
+                    const bool omitFastChannels = ShouldOmitGeometryFastChannels(node, t);
                     uint64_t hash = 0;
-                    if (TryHashRenderableGeometryState(node, t, hash)) {
+                    if (TryHashRenderableGeometryFastState(node, t, omitFastChannels, hash)) {
                         auto it = geoHashMap_.find(handle);
                         if (it == geoHashMap_.end() || it->second != hash) {
-                            SetDirty();
-                            return;
+                            if (omitFastChannels) {
+                                geoHashMap_.erase(handle);
+                                geoFastDirtyHandles_.insert(handle);
+                                fastDirtyHandles_.insert(handle);
+                                QueueFastFlush();
+                                return;
+                            } else {
+                                SetDirty();
+                                return;
+                            }
                         }
                     }
                 }
@@ -13388,6 +13716,7 @@ public:
         auto hasTransformData = [](const MaxJSPBR::TexTransform& xf) {
             return xf.isUberBitmap ||
                    xf.hasChannelSelect ||
+                   xf.uvChannel != 1 ||
                    xf.isVideo ||
                    xf.invert ||
                    std::fabs(xf.scale - 1.0f) > 1.0e-6f ||
@@ -13426,6 +13755,8 @@ public:
             ss << L",\"realHeight\":";
             WriteFloatValue(ss, xf.realHeight, 0.2f);
             ss << L",\"wrap\":\"" << EscapeJson(xf.wrapMode.c_str()) << L"\"";
+            if (xf.uvChannel != 1)
+                ss << L",\"uvChannel\":" << xf.uvChannel;
             if (xf.invert)
                 ss << L",\"invert\":true";
             if (!xf.colorSpace.empty())
@@ -15046,6 +15377,10 @@ public:
             if (geomHandles_.find(it->first) == geomHandles_.end()) it = geoHashMap_.erase(it);
             else ++it;
         }
+        for (auto it = geoFastTriangleCountMap_.begin(); it != geoFastTriangleCountMap_.end(); ) {
+            if (geomHandles_.find(it->first) == geomHandles_.end()) it = geoFastTriangleCountMap_.erase(it);
+            else ++it;
+        }
         for (auto it = mtlHashMap_.begin(); it != mtlHashMap_.end(); ) {
             if (geomHandles_.find(it->first) == geomHandles_.end()) it = mtlHashMap_.erase(it);
             else ++it;
@@ -16241,6 +16576,7 @@ public:
         gltfHashMap_.clear();
         propHashMap_.clear();
         geoHashMap_.clear();
+        geoFastTriangleCountMap_.clear();
         deformChannelHashMap_.clear();
         jsmodStateMap_.clear();
         groupCache_.clear();

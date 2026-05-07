@@ -70,6 +70,7 @@ import {
 } from './scene_init.js';
 import { applySceneBin } from './scene_applier.js';
 import { createSceneLights } from './scene_lights.js';
+import { createSky } from './scene_sky.js';
 import { createMaterialBuilder } from './material_builder.js';
 import { copyMaxArrayToWorld } from './max_basis.js';
 import { geometryFromNodeBinary } from './scene_binary.js';
@@ -132,6 +133,30 @@ function detectFeaturesLegacy(meta) {
     });
 }
 
+function normalizeRuntimeFeatures(meta) {
+    const raw = meta?.runtimeFeatures && typeof meta.runtimeFeatures === 'object'
+        ? meta.runtimeFeatures
+        : detectFeaturesLegacy(meta);
+    const rendererPref = String(raw.renderer_pref ?? raw.rendererBackend ?? '').toLowerCase();
+    const arrayOrEmpty = (value) => Array.isArray(value) ? value.slice() : [];
+
+    return Object.freeze({
+        ...raw,
+        renderer_pref: rendererPref.includes('webgl') ? 'webgl' : 'webgpu',
+        post_fx: arrayOrEmpty(raw.post_fx),
+        three_addons: arrayOrEmpty(raw.three_addons),
+        audio: !!raw.audio,
+        splats: !!raw.splats,
+        html_textures: !!(raw.html_textures ?? raw.htmlTextures),
+        volumes: !!raw.volumes,
+        physics: !!raw.physics,
+        gltf: !!(raw.gltf ?? raw.gltfs),
+        animations: !!raw.animations,
+        exports: raw.exports && typeof raw.exports === 'object' ? raw.exports : {},
+        counts: raw.counts && typeof raw.counts === 'object' ? raw.counts : {},
+    });
+}
+
 // ─── Phase 1: metadata ─────────────────────────────────────────────────
 async function loadMeta(root) {
     const response = await fetch(`${root}/snapshot.json`, { cache: 'no-store' });
@@ -146,7 +171,7 @@ async function loadMeta(root) {
 // snapshot.json represents materials as an interned table:
 //   meta.materials = [{ id: 1, hash: ..., mat: { ... } }, ...]
 //   meta.nodes[i].matRef = 1                      // single material
-//   meta.nodes[i].matsRef = [1, 2, 3]             // multi/sub-object
+//   meta.nodes[i].matRefs = [1, 2, 3]             // multi/sub-object
 //
 // The applier and material_builder both read `nd.mat` / `nd.mats`. Walk
 // the table once on load and inline the descriptors. Live mode does the
@@ -164,8 +189,9 @@ function resolveSnapshotMaterialRefs(meta) {
             const md = byId.get(nd.matRef);
             if (md) nd.mat = md;
         }
-        if (Array.isArray(nd.matsRef) && (!nd.mats || nd.mats.length === 0)) {
-            nd.mats = nd.matsRef.map((id) => byId.get(id)).filter(Boolean);
+        const matRefs = Array.isArray(nd.matRefs) ? nd.matRefs : nd.matsRef;
+        if (Array.isArray(matRefs) && (!nd.mats || nd.mats.length === 0)) {
+            nd.mats = matRefs.map((id) => byId.get(id)).filter(Boolean);
         }
     }
 }
@@ -596,7 +622,7 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
     // Phase 1: meta
     const meta = await loadMeta(root);
     const features = {
-        ...(meta.runtimeFeatures ?? detectFeaturesLegacy(meta)),
+        ...normalizeRuntimeFeatures(meta),
         ...(options.rendererBackend ? { renderer_pref: options.rendererBackend } : {}),
     };
 
@@ -670,11 +696,8 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
     };
     await applyDelta(buffer, applierCtx);
 
-    // Lights from snapshot.json (Stage 4). Default lights remain visible
-    // only when the scene declares none; once env/HDRI extraction lands
-    // this condition tightens further.
+    // Lights from snapshot.json (Stage 4).
     const lightsResult = sceneLights.apply(meta.lights);
-    defaultLights.visible = lightsResult.count === 0;
 
     // Phase 7a: snapshotUi (postfx state, tone-map, exposure, bg)
     if (meta.snapshotUi) {
@@ -683,6 +706,20 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
             ssgiFx: optionalModules.ssgiFx,
         });
     }
+
+    // Phase 7d: sky environment.
+    // Always apply — the procedural Sky shader is cheap, gives the scene an
+    // outdoor backdrop + warm sun + hemisphere fill, and is closer to what
+    // the live viewer shows than a flat #353535. Authored params land at
+    // meta.env.sky once the exporter writes them; until then we fall through
+    // to SNAPSHOT_DEFAULT_SKY in scene_sky.js.
+    //
+    // When the sky is on, the Max-authored lights still apply, but we hide
+    // the (always-default-off) defaultLights group regardless. The sky's
+    // own sun + hemisphere are what we want for the empty-scene case.
+    const sky = createSky({ scene, renderer });
+    sky.apply(meta.env?.sky);
+    defaultLights.visible = false;
 
     // Phase 7b: top-level camera state. Lives at meta.camera independently
     // of snapshotUi (which is gated by the "Viewer UI State" export toggle
@@ -750,6 +787,8 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
 
     return {
         renderer, scene, camera, controls, layerManager,
+        meta, features,
+        nodeMap, lightHandleMap,
         maxBasisRoot, maxRoot, jsRoot, overlayRoot, defaultLights,
         sceneLights,
         animationSystem, maxTimeline,

@@ -62,12 +62,20 @@ function parseMaterialTrackPath(path) {
     return null;
 }
 
+function isTrackArray(value) {
+    return Array.isArray(value) || ArrayBuffer.isView(value);
+}
+
+function asTrackArray(value) {
+    return isTrackArray(value) ? value : [];
+}
+
 function createTrack(THREE, trackDef) {
     const bindingPath = normalizeBindingPath(trackDef?.path ?? trackDef?.property);
     if (!bindingPath) return null;
 
-    const times = Array.isArray(trackDef?.times) ? trackDef.times : [];
-    const values = Array.isArray(trackDef?.values) ? trackDef.values : [];
+    const times = asTrackArray(trackDef?.times);
+    const values = asTrackArray(trackDef?.values);
     if (times.length === 0 || values.length === 0) return null;
 
     const type = normalizeTrackType(trackDef?.type, bindingPath);
@@ -266,7 +274,7 @@ export function createMaxJSAnimationSystem({
     }
 
     function findTrackSegment(times, timeSeconds) {
-        const count = Array.isArray(times) ? times.length : 0;
+        const count = isTrackArray(times) ? times.length : 0;
         if (count === 0) return null;
         if (count === 1 || timeSeconds <= times[0]) {
             return { indexA: 0, indexB: 0, alpha: 0 };
@@ -307,8 +315,8 @@ export function createMaxJSAnimationSystem({
     }
 
     function sampleVectorTrack(trackDef, timeSeconds, target) {
-        const times = Array.isArray(trackDef?.times) ? trackDef.times : [];
-        const values = Array.isArray(trackDef?.values) ? trackDef.values : [];
+        const times = asTrackArray(trackDef?.times);
+        const values = asTrackArray(trackDef?.values);
         if (times.length === 0 || values.length < times.length * 3) return false;
 
         const segment = findTrackSegment(times, timeSeconds);
@@ -326,8 +334,8 @@ export function createMaxJSAnimationSystem({
     }
 
     function sampleNumberTrack(trackDef, timeSeconds) {
-        const times = Array.isArray(trackDef?.times) ? trackDef.times : [];
-        const values = Array.isArray(trackDef?.values) ? trackDef.values : [];
+        const times = asTrackArray(trackDef?.times);
+        const values = asTrackArray(trackDef?.values);
         if (times.length === 0 || values.length < times.length) return null;
 
         const segment = findTrackSegment(times, timeSeconds);
@@ -343,8 +351,8 @@ export function createMaxJSAnimationSystem({
     }
 
     function sampleBooleanTrack(trackDef, timeSeconds) {
-        const times = Array.isArray(trackDef?.times) ? trackDef.times : [];
-        const values = Array.isArray(trackDef?.values) ? trackDef.values : [];
+        const times = asTrackArray(trackDef?.times);
+        const values = asTrackArray(trackDef?.values);
         if (times.length === 0 || values.length < times.length) return null;
 
         const segment = findTrackSegment(times, timeSeconds);
@@ -356,18 +364,58 @@ export function createMaxJSAnimationSystem({
         if (!(loadedBinary instanceof ArrayBuffer)) return null;
         if (!Number.isInteger(offset) || !Number.isInteger(count) || offset < 0 || count < 0) return null;
         if ((offset % 4) !== 0 || (offset + count * 4) > loadedBinary.byteLength) return null;
-        return new Float32Array(loadedBinary.slice(offset, offset + count * 4));
+        return new Float32Array(loadedBinary, offset, count);
     }
 
     function readBinaryIndexArray(offset, count) {
         if (!(loadedBinary instanceof ArrayBuffer)) return null;
         if (!Number.isInteger(offset) || !Number.isInteger(count) || offset < 0 || count < 0) return null;
         if ((offset % 4) !== 0 || (offset + count * 4) > loadedBinary.byteLength) return null;
-        return new Uint32Array(loadedBinary.slice(offset, offset + count * 4));
+        return new Uint32Array(loadedBinary, offset, count);
+    }
+
+    function readBinaryUint8Array(offset, count) {
+        if (!(loadedBinary instanceof ArrayBuffer)) return null;
+        if (!Number.isInteger(offset) || !Number.isInteger(count) || offset < 0 || count < 0) return null;
+        if ((offset + count) > loadedBinary.byteLength) return null;
+        return new Uint8Array(loadedBinary, offset, count);
+    }
+
+    function readTrackBinaryRef(ref) {
+        if (!ref || typeof ref !== 'object') return null;
+        const offset = Number(ref.off);
+        const count = Number(ref.n);
+        if (!Number.isInteger(offset) || !Number.isInteger(count)) return null;
+        const type = String(ref.type ?? 'f32').trim().toLowerCase();
+        if (type === 'f32' || type === 'float32') return readBinaryFloatArray(offset, count);
+        if (type === 'u8' || type === 'uint8' || type === 'bool') return readBinaryUint8Array(offset, count);
+        return null;
+    }
+
+    function materializeBinaryTrackRefs(payload) {
+        if (!payload || !Array.isArray(payload.clips)) return payload;
+        for (const clipDef of payload.clips) {
+            const targets = Array.isArray(clipDef?.targets) ? clipDef.targets : [];
+            for (const targetDef of targets) {
+                const tracks = Array.isArray(targetDef?.tracks) ? targetDef.tracks : [];
+                for (const trackDef of tracks) {
+                    if (!trackDef || typeof trackDef !== 'object') continue;
+                    if (!isTrackArray(trackDef.times)) {
+                        const times = readTrackBinaryRef(trackDef.timesRef);
+                        if (times) trackDef.times = times;
+                    }
+                    if (!isTrackArray(trackDef.values)) {
+                        const values = readTrackBinaryRef(trackDef.valuesRef);
+                        if (values) trackDef.values = values;
+                    }
+                }
+            }
+        }
+        return payload;
     }
 
     function sampleGeometryFrame(trackDef, timeSeconds) {
-        const times = Array.isArray(trackDef?.times) ? trackDef.times : [];
+        const times = asTrackArray(trackDef?.times);
         const frames = Array.isArray(trackDef?.frames) ? trackDef.frames : [];
         if (times.length === 0 || frames.length < times.length) return null;
 
@@ -377,8 +425,8 @@ export function createMaxJSAnimationSystem({
     }
 
     function sampleMatrixTrack(trackDef, timeSeconds, targetMatrix) {
-        const times = Array.isArray(trackDef?.times) ? trackDef.times : [];
-        const values = Array.isArray(trackDef?.values) ? trackDef.values : [];
+        const times = asTrackArray(trackDef?.times);
+        const values = asTrackArray(trackDef?.values);
         if (times.length === 0 || values.length < times.length * 16) return false;
 
         const segment = findTrackSegment(times, timeSeconds);
@@ -677,6 +725,7 @@ export function createMaxJSAnimationSystem({
         if (registryDirty) rebuildTargetRegistry();
         clear();
         loadedBinary = binaryBuffer instanceof ArrayBuffer ? binaryBuffer : null;
+        materializeBinaryTrackRefs(payload);
         return mountPayload(payload);
     }
 
@@ -758,10 +807,14 @@ export function createMaxJSAnimationSystem({
             targetCount: targetRegistry.size,
             clipCount: clipGroups.size,
             loaded: !!loadedPayload,
+            binaryBytes: loadedBinary?.byteLength ?? 0,
+            binary: loadedPayload?.binary ?? null,
             clips: [...clipGroups.values()].map(group => ({
                 id: group.id,
                 name: group.name,
-                targets: group.entries.length,
+                targets: group.entries.length + group.customEntries.length,
+                mixerTargets: group.entries.length,
+                customTargets: group.customEntries.length,
                 playing: group.playing,
                 speed: group.speed,
             })),

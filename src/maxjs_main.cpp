@@ -8043,12 +8043,21 @@ public:
     };
 
     struct SnapshotAnimationTrackDef {
+        struct BinaryRef {
+            size_t off = 0;
+            size_t n = 0;
+            std::wstring type;
+            bool valid = false;
+        };
+
         std::wstring path;
         std::wstring type;
         std::wstring interpolation;
         std::vector<float> times;
         std::vector<float> values;
         std::vector<unsigned char> boolValues;
+        BinaryRef timesRef;
+        BinaryRef valuesRef;
         struct GeometryFrameRef {
             size_t vOff = 0, iOff = 0, uvOff = 0, nOff = 0;
             size_t vN = 0, iN = 0, uvN = 0, nN = 0;
@@ -8170,6 +8179,12 @@ public:
             static_cast<double>(value - rangeStart) / GetAnimationTicksPerSecond());
     }
 
+    static void AlignBinaryBuffer(std::string& binary, size_t alignment = 4) {
+        if (alignment <= 1) return;
+        const size_t pad = (alignment - (binary.size() % alignment)) % alignment;
+        if (pad > 0) binary.append(pad, '\0');
+    }
+
     static void AppendUniqueTimeValue(std::vector<TimeValue>& times, TimeValue value) {
         if (std::find(times.begin(), times.end(), value) == times.end()) {
             times.push_back(value);
@@ -8192,6 +8207,7 @@ public:
                                    const std::vector<float>& values,
                                    size_t& outOffset,
                                    size_t& outCount) {
+        AlignBinaryBuffer(outBinary, alignof(float));
         outOffset = outBinary.size();
         outCount = values.size();
         if (values.empty()) return;
@@ -8204,12 +8220,25 @@ public:
                                  const std::vector<int>& values,
                                  size_t& outOffset,
                                  size_t& outCount) {
+        AlignBinaryBuffer(outBinary, alignof(int));
         outOffset = outBinary.size();
         outCount = values.size();
         if (values.empty()) return;
         outBinary.append(
             reinterpret_cast<const char*>(values.data()),
             values.size() * sizeof(int));
+    }
+
+    static void AppendBinaryBytes(std::string& outBinary,
+                                  const std::vector<unsigned char>& values,
+                                  size_t& outOffset,
+                                  size_t& outCount) {
+        outOffset = outBinary.size();
+        outCount = values.size();
+        if (values.empty()) return;
+        outBinary.append(
+            reinterpret_cast<const char*>(values.data()),
+            values.size() * sizeof(unsigned char));
     }
 
     static bool ExtractSnapshotGeometrySample(INode* node,
@@ -9173,6 +9202,98 @@ public:
         return !outTarget.tracks.empty();
     }
 
+    struct SnapshotAnimationBinaryStats {
+        size_t trackCount = 0;
+        size_t timeTrackCount = 0;
+        size_t valueTrackCount = 0;
+        size_t boolTrackCount = 0;
+        size_t reusedTimeTrackCount = 0;
+    };
+
+    static std::string MakeFloatVectorBinaryKey(const std::vector<float>& values) {
+        if (values.empty()) return {};
+        return std::string(
+            reinterpret_cast<const char*>(values.data()),
+            values.size() * sizeof(float));
+    }
+
+    static SnapshotAnimationTrackDef::BinaryRef AppendTrackFloatBuffer(
+        std::string& binary,
+        const std::vector<float>& values) {
+        SnapshotAnimationTrackDef::BinaryRef ref;
+        if (values.empty()) return ref;
+        AppendBinaryFloats(binary, values, ref.off, ref.n);
+        ref.type = L"f32";
+        ref.valid = true;
+        return ref;
+    }
+
+    static SnapshotAnimationTrackDef::BinaryRef AppendTrackByteBuffer(
+        std::string& binary,
+        const std::vector<unsigned char>& values) {
+        SnapshotAnimationTrackDef::BinaryRef ref;
+        if (values.empty()) return ref;
+        AppendBinaryBytes(binary, values, ref.off, ref.n);
+        ref.type = L"u8";
+        ref.valid = true;
+        return ref;
+    }
+
+    static SnapshotAnimationBinaryStats PrepareSnapshotAnimationBinaryTracks(
+        std::vector<SnapshotAnimationTargetDef>& targets,
+        std::string& binary) {
+        SnapshotAnimationBinaryStats stats;
+        std::unordered_map<std::string, SnapshotAnimationTrackDef::BinaryRef> timeRefCache;
+
+        for (SnapshotAnimationTargetDef& target : targets) {
+            for (SnapshotAnimationTrackDef& track : target.tracks) {
+                stats.trackCount += 1;
+
+                if (!track.times.empty()) {
+                    const std::string key = MakeFloatVectorBinaryKey(track.times);
+                    auto cached = timeRefCache.find(key);
+                    if (cached != timeRefCache.end()) {
+                        track.timesRef = cached->second;
+                        stats.reusedTimeTrackCount += 1;
+                    } else {
+                        track.timesRef = AppendTrackFloatBuffer(binary, track.times);
+                        if (track.timesRef.valid) {
+                            timeRefCache.emplace(key, track.timesRef);
+                            stats.timeTrackCount += 1;
+                        }
+                    }
+                }
+
+                if (track.isGeometryFrames) {
+                    continue;
+                }
+
+                if (track.isBoolean) {
+                    track.valuesRef = AppendTrackByteBuffer(binary, track.boolValues);
+                    if (track.valuesRef.valid) {
+                        stats.valueTrackCount += 1;
+                        stats.boolTrackCount += 1;
+                    }
+                } else {
+                    track.valuesRef = AppendTrackFloatBuffer(binary, track.values);
+                    if (track.valuesRef.valid) {
+                        stats.valueTrackCount += 1;
+                    }
+                }
+            }
+        }
+
+        return stats;
+    }
+
+    static void WriteSnapshotAnimationBinaryRefJson(
+        std::wostringstream& ss,
+        const SnapshotAnimationTrackDef::BinaryRef& ref) {
+        ss << L"{\"off\":" << ref.off
+           << L",\"n\":" << ref.n
+           << L",\"type\":\"" << EscapeJson(ref.type.c_str()) << L"\"}";
+    }
+
     static void WriteSnapshotAnimationTrackJson(std::wostringstream& ss,
                                                 const SnapshotAnimationTrackDef& track) {
         ss << L"{\"path\":\"" << EscapeJson(track.path.c_str()) << L"\"";
@@ -9182,8 +9303,13 @@ public:
         if (!track.interpolation.empty()) {
             ss << L",\"interpolation\":\"" << EscapeJson(track.interpolation.c_str()) << L"\"";
         }
-        ss << L",\"times\":";
-        WriteFloats(ss, track.times.data(), track.times.size());
+        if (track.timesRef.valid) {
+            ss << L",\"timesRef\":";
+            WriteSnapshotAnimationBinaryRefJson(ss, track.timesRef);
+        } else {
+            ss << L",\"times\":";
+            WriteFloats(ss, track.times.data(), track.times.size());
+        }
         if (track.isGeometryFrames) {
             ss << L",\"frames\":[";
             for (size_t i = 0; i < track.geometryFrames.size(); ++i) {
@@ -9216,8 +9342,11 @@ public:
             }
             ss << L']';
         } else {
-            ss << L",\"values\":";
-            if (track.isBoolean) {
+            if (track.valuesRef.valid) {
+                ss << L",\"valuesRef\":";
+                WriteSnapshotAnimationBinaryRefJson(ss, track.valuesRef);
+            } else if (track.isBoolean) {
+                ss << L",\"values\":";
                 ss << L'[';
                 for (size_t i = 0; i < track.boolValues.size(); ++i) {
                     if (i) ss << L',';
@@ -9225,6 +9354,7 @@ public:
                 }
                 ss << L']';
             } else {
+                ss << L",\"values\":";
                 WriteFloats(ss, track.values.data(), track.values.size());
             }
         }
@@ -9290,7 +9420,7 @@ public:
         return anyTrack;
     }
 
-    static void WriteSnapshotAnimationsJson(std::wostringstream& ss,
+    static bool WriteSnapshotAnimationsJson(std::wostringstream& ss,
                                             const std::vector<SnapshotNodeRecord>& nodes,
                                             Interface* ip,
                                             TimeValue currentTime,
@@ -9298,11 +9428,11 @@ public:
                                             std::string& outAnimBinary,
                                             const std::unordered_set<ULONG>& skinRigMeshHandles,
                                             ULONG lockedCameraHandle) {
-        if (!ip) return;
+        if (!ip) return false;
 
         const Interval range = ip->GetAnimRange();
         if (range.End() <= range.Start()) {
-            return;
+            return false;
         }
 
         std::vector<SnapshotAnimationTargetDef> targets;
@@ -9398,17 +9528,31 @@ public:
         }
 
         if (targets.empty()) {
-            return;
+            return false;
         }
+
+        const SnapshotAnimationBinaryStats binaryStats =
+            PrepareSnapshotAnimationBinaryTracks(targets, outAnimBinary);
 
         const float duration = TimeValueToAnimationSeconds(range.End(), range.Start());
         const TimeValue clampedTime = std::clamp(currentTime, range.Start(), range.End());
         const float currentSeconds = TimeValueToAnimationSeconds(clampedTime, range.Start());
 
         ss << L",\"animations\":{";
-        ss << L"\"version\":1,";
+        ss << L"\"version\":2,";
         if (!outAnimBinary.empty()) {
             ss << L"\"bin\":\"scene_anim.bin\",";
+            ss << L"\"binary\":{";
+            ss << L"\"version\":1";
+            ss << L",\"layout\":\"maxjs_track_refs\"";
+            ss << L",\"endianness\":\"little\"";
+            ss << L",\"bytes\":" << outAnimBinary.size();
+            ss << L",\"tracks\":" << binaryStats.trackCount;
+            ss << L",\"timeBuffers\":" << binaryStats.timeTrackCount;
+            ss << L",\"valueBuffers\":" << binaryStats.valueTrackCount;
+            ss << L",\"u8Buffers\":" << binaryStats.boolTrackCount;
+            ss << L",\"reusedTimeRefs\":" << binaryStats.reusedTimeTrackCount;
+            ss << L"},";
         }
         ss << L"\"clips\":[{";
         ss << L"\"id\":\"scene\",";
@@ -9433,6 +9577,7 @@ public:
             ss << L"]}";
         }
         ss << L"]}]}";
+        return true;
     }
 
     bool CopySnapshotRuntime(const std::wstring& webDir,
@@ -9488,6 +9633,30 @@ public:
         std::vector<MaterialLibraryEntry> entries;
     };
 
+    struct SnapshotRuntimeFeatures {
+        bool audio = false;
+        bool splats = false;
+        bool htmlTextures = false;
+        bool volumes = false;
+        bool physics = false;
+        bool gltfs = false;
+        bool animations = false;
+        bool runtimeScene = false;
+        bool projectManifest = false;
+        bool inlineLayers = false;
+        bool snapshotUi = false;
+        std::wstring rendererPref = L"webgpu";
+        std::vector<std::wstring> postFx;
+        std::vector<std::wstring> threeAddons;
+        int meshNodes = 0;
+        int materialCount = 0;
+        int skinnedMeshes = 0;
+        int morphTargets = 0;
+        int vertexColorAttrs = 0;
+        int lights = 0;
+        int instanceGroups = 0;
+    };
+
     std::wstring SerializeMaterialJson(const MaxJSPBR& pbr) {
         std::wostringstream mat;
         mat.imbue(std::locale::classic());
@@ -9524,6 +9693,181 @@ public:
         ss << L']';
     }
 
+    static void AddUniqueRuntimeFeature(std::vector<std::wstring>& values, const wchar_t* value) {
+        if (!value || !*value) return;
+        const std::wstring v(value);
+        if (std::find(values.begin(), values.end(), v) == values.end()) {
+            values.push_back(v);
+        }
+    }
+
+    static std::wstring LowerAsciiCopy(std::wstring value) {
+        std::transform(value.begin(), value.end(), value.begin(), [](wchar_t ch) {
+            return static_cast<wchar_t>(std::towlower(ch));
+        });
+        return value;
+    }
+
+    static bool JsonObjectHasEnabledTrue(const std::wstring& json, const wchar_t* key) {
+        if (json.empty() || !key || !*key) return false;
+        const std::wstring needle = L"\"" + std::wstring(key) + L"\"";
+        const size_t pos = json.find(needle);
+        if (pos == std::wstring::npos) return false;
+        const size_t len = std::min<size_t>(json.size() - pos, 768);
+        const std::wstring slice = json.substr(pos, len);
+        return slice.find(L"\"enabled\":true") != std::wstring::npos ||
+               slice.find(L"\"enabled\": true") != std::wstring::npos;
+    }
+
+    static std::wstring DetectRendererPrefFromSnapshotUi(const std::wstring& snapshotUiJson) {
+        const std::wstring lower = LowerAsciiCopy(snapshotUiJson);
+        if (lower.find(L"\"rendererbackend\":\"webgl") != std::wstring::npos ||
+            lower.find(L"\"rendererbackend\": \"webgl") != std::wstring::npos ||
+            lower.find(L"\"backend\":\"webgl") != std::wstring::npos ||
+            lower.find(L"\"backend\": \"webgl") != std::wstring::npos ||
+            lower.find(L"webgl2") != std::wstring::npos) {
+            return L"webgl";
+        }
+        return L"webgpu";
+    }
+
+    static bool HasHtmlTextureSlot(const MaxJSPBR& pbr) {
+        auto has = [](const MaxJSPBR::TexTransform& xf) { return !xf.htmlFile.empty(); };
+        return has(pbr.colorMapTransform) || has(pbr.gradientMapTransform) ||
+               has(pbr.roughnessMapTransform) || has(pbr.metalnessMapTransform) ||
+               has(pbr.normalMapTransform) || has(pbr.bumpMapTransform) ||
+               has(pbr.displacementMapTransform) || has(pbr.parallaxMapTransform) ||
+               has(pbr.sssColorMapTransform) || has(pbr.aoMapTransform) ||
+               has(pbr.emissionMapTransform) || has(pbr.lightmapTransform) ||
+               has(pbr.opacityMapTransform) || has(pbr.matcapMapTransform) ||
+               has(pbr.specularMapTransform) || has(pbr.transmissionMapTransform) ||
+               has(pbr.clearcoatMapTransform) || has(pbr.clearcoatRoughnessMapTransform) ||
+               has(pbr.clearcoatNormalMapTransform) ||
+               has(pbr.specularIntensityMapTransform) || has(pbr.specularColorMapTransform);
+    }
+
+    static void AccumulateMaterialRuntimeFeatures(SnapshotRuntimeFeatures& features,
+                                                  const MaxJSPBR& pbr) {
+        if (HasHtmlTextureSlot(pbr)) {
+            features.htmlTextures = true;
+        }
+    }
+
+    static void DetectSnapshotPostFxFeatures(SnapshotRuntimeFeatures& features,
+                                             const std::wstring& snapshotUiJson) {
+        if (snapshotUiJson.empty()) return;
+
+        auto addIfEnabled = [&](const wchar_t* jsonKey, const wchar_t* featureName) {
+            if (JsonObjectHasEnabledTrue(snapshotUiJson, jsonKey)) {
+                AddUniqueRuntimeFeature(features.postFx, featureName);
+            }
+        };
+
+        addIfEnabled(L"ssgi", L"ssgi");
+        addIfEnabled(L"ssr", L"ssr");
+        addIfEnabled(L"gtao", L"gtao");
+        addIfEnabled(L"motionBlur", L"motion_blur");
+        addIfEnabled(L"traa", L"traa");
+        addIfEnabled(L"bloom", L"bloom");
+        addIfEnabled(L"toonOutline", L"toon_outline");
+        addIfEnabled(L"contactShadow", L"contact_shadow");
+        addIfEnabled(L"retro", L"retro");
+        addIfEnabled(L"fog", L"post_fog");
+        addIfEnabled(L"pixel", L"pixel");
+        addIfEnabled(L"volumetric", L"volumetric");
+        addIfEnabled(L"dof", L"dof");
+        addIfEnabled(L"opaqueBackdrop", L"opaque_backdrop");
+        addIfEnabled(L"clone", L"clone_overlay");
+        addIfEnabled(L"ascii", L"ascii");
+    }
+
+    static void AccumulateRuntimeFeatureTextHints(SnapshotRuntimeFeatures& features,
+                                                  const std::wstring& text) {
+        if (text.empty()) return;
+        const std::wstring lower = LowerAsciiCopy(text);
+        if (lower.find(L"rapier") != std::wstring::npos ||
+            lower.find(L"physics") != std::wstring::npos) {
+            features.physics = true;
+        }
+        if (lower.find(L"gltf") != std::wstring::npos) {
+            features.gltfs = true;
+            AddUniqueRuntimeFeature(features.threeAddons, L"GLTFLoader");
+        }
+        if (lower.find(L"audio") != std::wstring::npos) {
+            features.audio = true;
+        }
+        if (lower.find(L"splat") != std::wstring::npos) {
+            features.splats = true;
+        }
+        if (lower.find(L"htmltexture") != std::wstring::npos ||
+            lower.find(L"html_texture") != std::wstring::npos ||
+            lower.find(L"maxjshtml") != std::wstring::npos) {
+            features.htmlTextures = true;
+        }
+    }
+
+    static void AccumulateSidecarRuntimeFeatures(SnapshotRuntimeFeatures& features,
+                                                 const std::wstring& manifestPath,
+                                                 const std::wstring& inlineDir) {
+        if (!manifestPath.empty() && FileExists(manifestPath)) {
+            AccumulateRuntimeFeatureTextHints(features, ReadUtf8File(manifestPath));
+        }
+        if (inlineDir.empty() || !DirectoryExists(inlineDir)) return;
+
+        std::error_code ec;
+        for (const auto& entry : std::filesystem::recursive_directory_iterator(
+                 std::filesystem::path(inlineDir), ec)) {
+            if (ec) break;
+            if (!entry.is_regular_file(ec) || ec) continue;
+            const std::filesystem::path path = entry.path();
+            const std::wstring ext = LowerAsciiCopy(path.extension().wstring());
+            if (ext != L".js" && ext != L".mjs" && ext != L".json") continue;
+            AccumulateRuntimeFeatureTextHints(features, ReadUtf8File(path.wstring()));
+        }
+    }
+
+    static void WriteStringVectorJson(std::wostringstream& ss,
+                                      const std::vector<std::wstring>& values) {
+        ss << L'[';
+        for (size_t i = 0; i < values.size(); ++i) {
+            if (i) ss << L',';
+            ss << L'"' << EscapeJson(values[i].c_str()) << L'"';
+        }
+        ss << L']';
+    }
+
+    static void WriteRuntimeFeaturesJson(std::wostringstream& ss,
+                                         const SnapshotRuntimeFeatures& features) {
+        ss << L"\"runtimeFeatures\":{\"version\":1";
+        ss << L",\"renderer_pref\":\"" << EscapeJson(features.rendererPref.c_str()) << L"\"";
+        ss << L",\"audio\":" << (features.audio ? L"true" : L"false");
+        ss << L",\"splats\":" << (features.splats ? L"true" : L"false");
+        ss << L",\"html_textures\":" << (features.htmlTextures ? L"true" : L"false");
+        ss << L",\"volumes\":" << (features.volumes ? L"true" : L"false");
+        ss << L",\"physics\":" << (features.physics ? L"true" : L"false");
+        ss << L",\"gltf\":" << (features.gltfs ? L"true" : L"false");
+        ss << L",\"animations\":" << (features.animations ? L"true" : L"false");
+        ss << L",\"post_fx\":";
+        WriteStringVectorJson(ss, features.postFx);
+        ss << L",\"three_addons\":";
+        WriteStringVectorJson(ss, features.threeAddons);
+        ss << L",\"exports\":{";
+        ss << L"\"snapshotUi\":" << (features.snapshotUi ? L"true" : L"false");
+        ss << L",\"runtimeScene\":" << (features.runtimeScene ? L"true" : L"false");
+        ss << L",\"project\":" << (features.projectManifest ? L"true" : L"false");
+        ss << L",\"inlines\":" << (features.inlineLayers ? L"true" : L"false");
+        ss << L"}";
+        ss << L",\"counts\":{";
+        ss << L"\"meshes\":" << features.meshNodes;
+        ss << L",\"materials\":" << features.materialCount;
+        ss << L",\"skinnedMeshes\":" << features.skinnedMeshes;
+        ss << L",\"morphTargets\":" << features.morphTargets;
+        ss << L",\"vertexColorAttrs\":" << features.vertexColorAttrs;
+        ss << L",\"lights\":" << features.lights;
+        ss << L",\"instanceGroups\":" << features.instanceGroups;
+        ss << L"}}";
+    }
+
     bool BuildSnapshotBinary(std::wstring& outMetaJson,
                              std::string& outBinary,
                              std::string& outAnimBinary,
@@ -9549,6 +9893,19 @@ public:
         size_t totalBytes = 0;
         std::unordered_set<ULONG> skinRigMeshHandles;
         MaterialLibraryBuilder materialLibrary;
+        SnapshotRuntimeFeatures runtimeFeatures;
+        runtimeFeatures.snapshotUi = options.includeSnapshotUi && !snapshotUiJson.empty();
+        runtimeFeatures.runtimeScene = options.includeRuntimeScene && !runtimeSceneJson.empty();
+        runtimeFeatures.rendererPref = DetectRendererPrefFromSnapshotUi(snapshotUiJson);
+        const std::wstring projectManifestPath = GetProjectManifestPath();
+        const std::wstring inlineLayerDir = GetInlineLayerDir();
+        runtimeFeatures.projectManifest =
+            !projectManifestPath.empty() && FileExists(projectManifestPath);
+        runtimeFeatures.inlineLayers =
+            !inlineLayerDir.empty() && DirectoryExists(inlineLayerDir);
+        AddUniqueRuntimeFeature(runtimeFeatures.threeAddons, L"OrbitControls");
+        DetectSnapshotPostFxFeatures(runtimeFeatures, snapshotUiJson);
+        AccumulateSidecarRuntimeFeatures(runtimeFeatures, projectManifestPath, inlineLayerDir);
 
         std::function<void(INode*)> collect = [&](INode* parent) {
             for (int i = 0; i < parent->NumberOfChildren(); ++i) {
@@ -9559,8 +9916,29 @@ public:
                 // (e.g. PointHelper on a hidden layer) may have visible children.
                 ObjectState os = node->EvalWorldState(t);
                 if (os.obj && IsThreeJSSplatClassID(os.obj->ClassID())) {
+                    if (options.includeSplats && !node->IsNodeHidden(TRUE)) {
+                        runtimeFeatures.splats = true;
+                    }
                     collect(node);
                     continue;
+                }
+                if (os.obj && IsThreeJSAudioClassID(os.obj->ClassID())) {
+                    if (options.includeAudios && !node->IsNodeHidden(TRUE)) {
+                        runtimeFeatures.audio = true;
+                    }
+                    collect(node);
+                    continue;
+                }
+                if (os.obj && IsThreeJSGLTFClassID(os.obj->ClassID())) {
+                    if (options.includeGLTFs && !node->IsNodeHidden(TRUE)) {
+                        runtimeFeatures.gltfs = true;
+                    }
+                    collect(node);
+                    continue;
+                }
+                if (os.obj && IsThreeJSLightClassID(os.obj->ClassID()) &&
+                    options.includeLights && !node->IsNodeHidden(TRUE)) {
+                    runtimeFeatures.lights += 1;
                 }
                 if (IsForestPackNode(node) || IsRailCloneNode(node) ||
                     (IsTyFlowAvailable() && IsTyFlowNode(node))) {
@@ -9747,6 +10125,7 @@ public:
 
             MaxJSPBR pbr;
             ExtractPBR(node.node, t, pbr);
+            AccumulateMaterialRuntimeFeatures(runtimeFeatures, pbr);
 
             ss << L"{\"h\":" << node.handle;
             ss << L",\"n\":\"" << EscapeJson(node.node->GetName()) << L'"';
@@ -9830,6 +10209,7 @@ public:
                     Mtl* subMtl = GetSubMtlFromMatID(multiMtl, node.groups[g].matID);
                     MaxJSPBR subPBR;
                     ExtractPBRFromMtl(subMtl, node.node, t, subPBR);
+                    AccumulateMaterialRuntimeFeatures(runtimeFeatures, subPBR);
                     ss << InternMaterial(materialLibrary, subPBR);
                 }
                 ss << L"]";
@@ -9858,6 +10238,16 @@ public:
             ss << L",";
             WriteEnvJson(ss, envData, hdriUrl);
         }
+        if (!envData.isSky && !envData.hdriPath.empty()) {
+            const std::wstring lowerHdri = LowerAsciiCopy(envData.hdriPath);
+            if (lowerHdri.size() >= 4 &&
+                lowerHdri.compare(lowerHdri.size() - 4, 4, L".hdr") == 0) {
+                AddUniqueRuntimeFeature(runtimeFeatures.threeAddons, L"RGBELoader");
+            } else if (lowerHdri.size() >= 4 &&
+                       lowerHdri.compare(lowerHdri.size() - 4, 4, L".exr") == 0) {
+                AddUniqueRuntimeFeature(runtimeFeatures.threeAddons, L"EXRLoader");
+            }
+        }
 
         FogData fogData;
         GetFogData(fogData);
@@ -9882,7 +10272,7 @@ public:
             WriteGLTFsJson(ss, ip, t, true, false, false);
         }
         if (options.includeAnimations) {
-            WriteSnapshotAnimationsJson(
+            runtimeFeatures.animations = WriteSnapshotAnimationsJson(
                 ss, nodes, ip, t, options, outAnimBinary, skinRigMeshHandles, lockedCameraHandle_);
         }
 
@@ -9916,6 +10306,7 @@ public:
                     if (group.verts.empty() || group.transforms.empty()) continue;
                     if (!firstGroup) ss << L',';
                     firstGroup = false;
+                    runtimeFeatures.instanceGroups += 1;
                     ss << L"{\"src\":" << group.groupKey;
                     ss << L",\"count\":" << group.instanceCount;
                     ss << L",\"v\":"; WriteFloats(ss, group.verts.data(), group.verts.size());
@@ -9935,6 +10326,17 @@ public:
             }
             WriteHairInstanceGroupsJson(ss, root, t);
         }
+
+        runtimeFeatures.meshNodes = static_cast<int>(nodes.size());
+        runtimeFeatures.materialCount = static_cast<int>(materialLibrary.entries.size());
+        for (const auto& node : nodes) {
+            if (node.skinRig) runtimeFeatures.skinnedMeshes += 1;
+            runtimeFeatures.morphTargets += static_cast<int>(node.morphNames.size());
+            runtimeFeatures.vertexColorAttrs += static_cast<int>(node.vertexColors.size());
+        }
+
+        ss << L",";
+        WriteRuntimeFeaturesJson(ss, runtimeFeatures);
 
         if (options.includeSnapshotUi && !snapshotUiJson.empty()) {
             ss << L",\"snapshotUi\":" << snapshotUiJson;

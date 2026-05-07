@@ -1,6 +1,6 @@
 // snapshot_boot.js — handwritten standalone snapshot bootstrapper.
 //
-// Stage 2 deliverable from docs/SNAPSHOT_REFACTOR.md.
+// Stage 3 deliverable from docs/SNAPSHOT_REFACTOR.md.
 //
 // This module is the canonical entry point for *deployed* snapshot pages.
 // Live mode (inside Max via WebView2) still goes through index.html.
@@ -33,22 +33,26 @@
 //   9. Bind layer project (inlines/ + project.maxjs.json)
 //  10. Run (setAnimationLoop)
 //
-// STAGE 2 STATUS (this file)
+// STAGE 3 STATUS (this file)
 // --------------------------
 // Real code:    1 (meta), 2 (renderer), 3 (scene/camera/controls),
-//               4 (layer manager), 7 partial (tone-map/exposure/bg/cam),
-//               9 (layer project bind), 10 (render loop), animation +
-//               timeline plumbing.
+//               4 (layer manager), 6 (applier via scene_applier.js with
+//               flat-gray default material), 7 partial (tone-map/
+//               exposure/bg/camera), 9 (layer project bind), 10
+//               (render loop), animation + timeline plumbing.
 // Deferred:     5 (optional modules — warns and continues),
-//               6 with-nodes (applier — empty scenes pass; non-empty
-//                            throw with the extraction pointer),
-//               7 fx/studio/bake (warns), 8 runtimeScene (warns).
+//               7 fx/studio/bake (warns), 8 runtimeScene (warns),
+//               material fidelity (PBR/TSL/MaterialX), instance buckets,
+//               vertex colors, env/HDRI/sky/fog, lights from snapshot.
 //
-// What WORKS today: empty-scene snapshots boot end-to-end (renderer +
-// scene + camera + controls + layer manager + layer modules from
-// project.maxjs.json + idle render loop). Custom-site embedders can
-// `boot()` the runtime and add their own Three.js content. Snapshots
-// with Max-authored geometry still wait on the applier extraction.
+// What WORKS today: snapshots with Max-authored meshes render — geometry
+// is visible with a flat MeshStandardMaterial. Skinned meshes assemble
+// correctly (Skeleton wired, bind pose calculated). Animation tracks load
+// and the mixer ticks. Splines render as LineSegments.
+//
+// What's MISSING (visible regressions vs. live mode): real materials,
+// real lights from the scene, HDRI/sky environment, post-FX, splats,
+// audio playback, instance bucket merging.
 
 import * as THREE from 'three/webgpu';
 import * as THREE_STD from 'three';
@@ -59,6 +63,7 @@ import { createLayerManager } from './layer_manager.js';
 import { createAnimationSystem } from './maxjs_animation.js';
 import { maxTimeline } from './maxjs_timeline.js';
 import { createRenderer as createRendererImpl, createScene as createSceneImpl } from './scene_init.js';
+import { applySceneBin } from './scene_applier.js';
 // Optional modules — imported lazily inside Phase 5 once runtimeFeatures
 // declare them. Keep them out of the static import graph so Minimal mode
 // does not pay for what the scene does not use.
@@ -178,26 +183,42 @@ async function registerOptionalModules(features, ctx) {
 }
 
 // ─── Phase 6: apply scene.bin ──────────────────────────────────────────
-// Stage 2 partial. Empty snapshots (no nodes) are a real, useful case for
-// custom-site embedders that want to run a Three.js scene with the maxjs
-// runtime modules but no Max-authored content. Those pass through as
-// no-ops here. Non-empty scenes still need the full applier (handleBinaryScene
-// + ~18 closure helpers) extracted to js/scene_applier.js.
+// Stage 3: real applier landed. js/scene_applier.js does the geometry
+// build / mesh creation / transform / removal pass. Defaults give every
+// node a flat MeshStandardMaterial — visible but uncolored. Real material
+// fidelity (PBR maps, TSL, MaterialX, VRay/OpenPBR mapping) lives in
+// js/material_builder.js once it's extracted from index.html.
 async function applyDelta(buffer, ctx) {
     const meta = ctx?.meta;
-    const nodeCount = meta?.nodes?.length ?? 0;
     if (meta?.type !== 'scene_bin') {
         console.warn('[snapshot_boot] meta.type is not "scene_bin"; skipping applier.');
         return;
     }
-    if (nodeCount === 0) {
+    if ((meta.nodes?.length ?? 0) === 0) {
         console.info('[snapshot_boot] empty scene.bin (0 nodes) — applier no-op.');
         return;
     }
-    requireExtraction(
-        'applyDelta',
-        'index.html:6329-6556 (handleBinaryScene + planMaxInstanceBuckets, ensureSceneRenderableMaterial, finalizeSceneNode/finalizeSceneSnapshot, etc.)',
-    );
+    return applySceneBin({
+        buffer,
+        meta,
+        ctx: {
+            nodeMap: ctx.nodeMap,
+            maxRoot: ctx.maxRoot,
+            scene: ctx.scene,
+            lastInstanceBucketSignature: '',
+        },
+        hooks: {
+            onMaterialApplied: (handle, mesh) => {
+                ctx.layerManager?.applyMaterialOverrides?.(handle, mesh);
+            },
+            markRuntimeTransformsDirty: () => {
+                ctx.layerManager?.markRuntimeTransformsDirty?.();
+            },
+            finalizeSceneSnapshot: () => {
+                ctx.animationSystem?.invalidateTargets?.();
+            },
+        },
+    });
 }
 
 // ─── Phase 7: snapshotUi ───────────────────────────────────────────────
@@ -403,6 +424,10 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
     // Phase 3: scene
     const sceneCtx = createScene({ meta, renderer, canvas });
     const { scene, camera, controls, maxBasisRoot, maxRoot, jsRoot, overlayRoot, defaultLights, resize } = sceneCtx;
+    // Stage 3 stopgap: enable default lights so meshes are visible.
+    // Once lights extraction lands, this should flip to "on if scene has
+    // no synced lights AND no env/HDRI"; for now always on.
+    defaultLights.visible = true;
 
     // Wire window resize → renderer + camera. Custom-site embedders that
     // host the canvas in a non-fullscreen context can call resize(w, h)
@@ -437,7 +462,11 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
     const binResp = await fetch(`${root}/${meta.bin || 'scene.bin'}`, { cache: 'no-store' });
     if (!binResp.ok) throw new Error(`scene.bin fetch failed: HTTP ${binResp.status}`);
     const buffer = await binResp.arrayBuffer();
-    await applyDelta(buffer, { scene, meta, nodeMap, lightHandleMap, maxRoot });
+    const applierCtx = {
+        scene, meta, nodeMap, lightHandleMap, maxRoot,
+        layerManager, animationSystem,
+    };
+    await applyDelta(buffer, applierCtx);
 
     // Phase 7: snapshotUi
     if (meta.snapshotUi) {
@@ -486,7 +515,7 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
         maxBasisRoot, maxRoot, jsRoot, overlayRoot, defaultLights,
         animationSystem, maxTimeline,
         resize,
-        applyDelta: (newBuffer) => applyDelta(newBuffer, { scene, meta, nodeMap, lightHandleMap, maxRoot }),
+        applyDelta: (newBuffer) => applyDelta(newBuffer, applierCtx),
         dispose() {
             try { stopLoop(); } catch {}
             try { removeEventListener('resize', onResize); } catch {}

@@ -1,0 +1,332 @@
+// scene_applier.js — minimal-viable applier for the maxjs binary scene
+// payload (`scene.bin`).
+//
+// Stage 3 deliverable from docs/SNAPSHOT_REFACTOR.md.
+//
+// Lifts a deliberately reduced version of `handleBinaryScene` from
+// web/index.html (lines 6329-6556) into a standalone module. The goal of
+// this stage is **visible geometry** for snapshot pages, not full live-
+// mode parity.
+//
+// SCOPE — what's IN
+// -----------------
+//   - Mesh / line / SkinnedMesh construction from scene.bin via
+//     `js/scene_binary.js` helpers.
+//   - Transform from `nd.t` (16-float matrix).
+//   - Visibility from `nd.vis`.
+//   - Multi/sub material groups via `geom.addGroup`.
+//   - Removal of stale nodes not present in the new payload.
+//   - Skeleton bind-pose calculation after the world matrix updates.
+//
+// SCOPE — what's OUT (by design, lifts in later stages)
+// -----------------------------------------------------
+//   - Real material building (PBR / VRay / OpenPBR / glTF / TSL / MaterialX).
+//     Replaced with a flat MeshStandardMaterial via `materialBuilder`.
+//   - Forest Pack / Rail Clone instance buckets.
+//     `planInstanceBuckets` is invoked but the default returns "no buckets."
+//   - Vertex color attribute updates.
+//   - jsmod (three.js Deform) sync state.
+//   - HTML auto-fit, selection state stamping.
+//   - Light linking / light probes / scene profiling.
+//   - `finalizeSceneSnapshot` side effects (camera fit, HDRI load, fog,
+//     splats, audio, gltf, hairInstances, forestInstances, volumes).
+//
+// All of the above are wired through the `hooks` parameter so caller code
+// can opt in incrementally. The default hooks are no-ops.
+//
+// CONTRACT
+// --------
+//   applySceneBin({ buffer, meta, ctx, hooks?, options? })
+//
+// Returns:
+//   { sceneChanged, transformsChanged, applyMs, addedHandles, removedHandles }
+
+import * as THREE from 'three/webgpu';
+import {
+    geometryFromNodeBinary,
+    attachSkinAttributes,
+    buildSkinnedMeshFromNd,
+} from './scene_binary.js';
+
+// ─── Default hooks ─────────────────────────────────────────────────────
+//
+// All hooks are best-effort opt-in. Snapshot pages with the simplest
+// scenes can run with the defaults; full parity needs each subsystem
+// (material registry, instance buckets, etc.) plugged in.
+const NOOP = () => {};
+const RETURNS_FALSE = () => false;
+
+const DEFAULT_HOOKS = Object.freeze({
+    /** ({ nd, geom, wantsLine }) → THREE.Material — required */
+    materialBuilder: ({ wantsLine }) =>
+        wantsLine
+            ? new THREE.LineBasicMaterial({ color: 0xcccccc })
+            : new THREE.MeshStandardMaterial({ color: 0xb0b0b0, roughness: 0.6, metalness: 0.0 }),
+
+    /** ({ mesh, nd }) → bool changed — for incremental material edits */
+    materialUpdater: RETURNS_FALSE,
+
+    /** (material) → void — material disposal hook */
+    disposeMaterial: (mat) => {
+        if (!mat) return;
+        if (Array.isArray(mat)) mat.forEach((m) => m?.dispose?.());
+        else mat.dispose?.();
+    },
+
+    /** (nodes) → { signature, handles: Set<handle> } — instance bucket plan */
+    planInstanceBuckets: () => ({ signature: '', handles: new Set() }),
+
+    /** (handle) → bucket | null — lookup */
+    getInstanceBucketFor: () => null,
+
+    /** (handle, nd) → bool transformsChanged */
+    updateInstanceBucketNode: RETURNS_FALSE,
+
+    /** (mesh, isJsmod) → void */
+    applyJsmodSyncState: NOOP,
+
+    /** (mesh, instOfHandle) → void */
+    applyInstanceSyncState: NOOP,
+
+    /** (mesh, selected) → void */
+    applySelection: NOOP,
+
+    /** (geometry, vc, buffer) → void — vertex color attribute updates */
+    setVertexColors: NOOP,
+
+    /** ({ snapshot, transport, applyStart, producerBytes, options }) → void */
+    finalizeSceneSnapshot: NOOP,
+
+    /** Layer manager hooks (called when present) */
+    onMaterialApplied: NOOP, // (handle, mesh) → void; live calls layerManager.applyMaterialOverrides
+    markRuntimeTransformsDirty: NOOP,
+
+    /** (mesh, nd) → void — additional userData stamping (HTML autofit, signatures, etc.) */
+    stampMaterial: NOOP,
+
+    /** (mesh, nd) — visibility from nd.vis */
+    applyVisibility: (mesh, vis) => {
+        if (!mesh) return false;
+        const next = vis === undefined ? mesh.visible : !!vis;
+        if (next === mesh.visible) return false;
+        mesh.visible = next;
+        return true;
+    },
+});
+
+// ─── Geometry refcount tracking (lifted from index.html) ─────────────
+function buildNodeGeometryRefCounts(nodeMap) {
+    const counts = new Map();
+    for (const mesh of nodeMap.values()) {
+        const geom = mesh?.geometry;
+        if (!geom) continue;
+        counts.set(geom, (counts.get(geom) || 0) + 1);
+    }
+    return counts;
+}
+function retainGeometryRef(refCounts, geom) {
+    if (!refCounts || !geom) return;
+    refCounts.set(geom, (refCounts.get(geom) || 0) + 1);
+}
+function releaseGeometryRef(refCounts, geom) {
+    if (!refCounts || !geom) return;
+    const next = (refCounts.get(geom) || 0) - 1;
+    if (next <= 0) { refCounts.delete(geom); geom.dispose?.(); }
+    else { refCounts.set(geom, next); }
+}
+
+// ─── applyTransform (lifted) ──────────────────────────────────────────
+const I16 = [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1];
+function arraysAlmostEqual(a, b, eps = 1e-6) {
+    if (!a || !b || a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) if (Math.abs(a[i] - b[i]) > eps) return false;
+    return true;
+}
+function isFiniteArray(arr, len) {
+    if (!arr || (len != null && arr.length !== len)) return false;
+    for (let i = 0; i < arr.length; i++) if (!Number.isFinite(arr[i])) return false;
+    return true;
+}
+function applyTransform(mesh, t) {
+    if (!isFiniteArray(t, 16)) {
+        if (arraysAlmostEqual(mesh.matrix.elements, I16)) return false;
+        mesh.matrix.identity();
+        mesh.position.set(0, 0, 0);
+        mesh.quaternion.identity();
+        mesh.scale.set(1, 1, 1);
+        mesh.matrixWorldNeedsUpdate = true;
+        return true;
+    }
+    if (arraysAlmostEqual(mesh.matrix.elements, t)) return false;
+    mesh.matrix.fromArray(t);
+    mesh.matrixWorldNeedsUpdate = true;
+    return true;
+}
+
+// ─── applySceneBin ─────────────────────────────────────────────────────
+export async function applySceneBin({ buffer, meta, ctx, hooks: userHooks = {}, options = {} } = {}) {
+    if (!buffer) throw new Error('applySceneBin: buffer is required');
+    if (!meta || meta.type !== 'scene_bin') throw new Error('applySceneBin: meta.type must be "scene_bin"');
+    if (!ctx?.nodeMap || !ctx?.maxRoot) throw new Error('applySceneBin: ctx.nodeMap + ctx.maxRoot required');
+
+    const hooks = { ...DEFAULT_HOOKS, ...userHooks };
+    const { nodeMap, maxRoot, lastInstanceBucketSignature = '', scene } = ctx;
+
+    const applyStart = performance.now();
+    const incoming = new Set(meta.nodes.map((n) => n.h));
+    const bucketPlan = hooks.planInstanceBuckets(meta.nodes);
+    const stableBucketHandles = bucketPlan.signature === lastInstanceBucketSignature
+        ? bucketPlan.handles
+        : null;
+
+    let sceneChanged = false;
+    let transformsChanged = false;
+    const addedHandles = [];
+    const removedHandles = [];
+    const refCounts = buildNodeGeometryRefCounts(nodeMap);
+
+    // ─── Remove deleted nodes ───────────────────────────────────────
+    const toRemove = [];
+    for (const [handle, mesh] of nodeMap) {
+        if (!incoming.has(handle)) toRemove.push(handle);
+    }
+    for (const handle of toRemove) {
+        const mesh = nodeMap.get(handle);
+        if (mesh) {
+            maxRoot.remove(mesh);
+            releaseGeometryRef(refCounts, mesh.geometry);
+            hooks.disposeMaterial(mesh.material);
+        }
+        nodeMap.delete(handle);
+        removedHandles.push(handle);
+        sceneChanged = true;
+    }
+
+    // Geometry cache for instance sharing within this sync.
+    const geoByHandle = new Map();
+
+    for (const nd of meta.nodes) {
+        let mesh = nodeMap.get(nd.h);
+
+        // Instance buckets — early-out if this handle is currently bucketed.
+        if (stableBucketHandles?.has(nd.h) && hooks.getInstanceBucketFor(nd.h)) {
+            if (hooks.updateInstanceBucketNode(nd.h, nd)) transformsChanged = true;
+            if (mesh) {
+                hooks.applyJsmodSyncState(mesh, !!nd.jsmod);
+                hooks.applyInstanceSyncState(mesh, nd.instOf);
+                if (nd.s != null) hooks.applySelection(mesh, nd.s);
+            }
+            continue;
+        }
+
+        const jsmodFlag = !!nd.jsmod;
+        const instSrcMesh = nd.instOf ? nodeMap.get(nd.instOf) : null;
+        const sharesInstGeom = !!(mesh && instSrcMesh && mesh.geometry === instSrcMesh.geometry);
+        const jsmodSkipGeo = jsmodFlag && mesh && !sharesInstGeom;
+
+        // Geometry — instance share, fresh build, or reuse.
+        let geom = mesh?.geometry;
+        if (nd.instOf && !nd.geo) {
+            const srcGeom = geoByHandle.get(nd.instOf) || instSrcMesh?.geometry;
+            if (srcGeom) geom = jsmodFlag ? srcGeom.clone() : srcGeom;
+        } else if (nd.geo && !jsmodSkipGeo) {
+            const built = geometryFromNodeBinary(nd, buffer);
+            if (!built) continue;
+            geom = built;
+            hooks.setVertexColors(geom, nd.geo.vc, buffer);
+            if (nd.groups) {
+                for (const [start, count, idx] of nd.groups) geom.addGroup(start, count, idx);
+            }
+            if (nd.skin && !nd.spline) attachSkinAttributes(geom, nd, buffer);
+        } else if (geom && nd.groups) {
+            geom.clearGroups();
+            for (const [start, count, idx] of nd.groups) geom.addGroup(start, count, idx);
+        }
+
+        if (geom) geoByHandle.set(nd.h, geom);
+
+        const wantsLine = !!nd.spline;
+        const hasLineRenderable = !!(mesh?.isLine || mesh?.isLineSegments);
+        const renderableTypeMismatch = !!mesh && wantsLine !== hasLineRenderable;
+        const skinTypeMismatch = !!mesh && nd.skin && !mesh.isSkinnedMesh && !wantsLine;
+
+        if (renderableTypeMismatch || skinTypeMismatch) {
+            maxRoot.remove(mesh);
+            releaseGeometryRef(refCounts, mesh.geometry);
+            hooks.disposeMaterial(mesh.material);
+            nodeMap.delete(nd.h);
+            mesh = null;
+            sceneChanged = true;
+        }
+
+        if (mesh) {
+            // Existing mesh — update geometry if changed, ask hooks if material changed.
+            if (!jsmodSkipGeo && geom && geom !== mesh.geometry) {
+                releaseGeometryRef(refCounts, mesh.geometry);
+                retainGeometryRef(refCounts, geom);
+                mesh.geometry = geom;
+            }
+            if (hooks.materialUpdater({ mesh, nd, wantsLine, geom })) {
+                sceneChanged = true;
+                hooks.onMaterialApplied(nd.h, mesh);
+            }
+        } else {
+            if (!geom) continue;
+            const material = hooks.materialBuilder({ nd, geom, wantsLine });
+            if (wantsLine) {
+                mesh = new THREE.LineSegments(geom, material);
+            } else if (nd.skin) {
+                mesh = buildSkinnedMeshFromNd({ nd, geom, material, buffer, nodeMap })
+                    ?? new THREE.Mesh(geom, material);
+            } else {
+                mesh = new THREE.Mesh(geom, material);
+            }
+            mesh.matrixAutoUpdate = false;
+            mesh.frustumCulled = false;
+            mesh.name = nd.n ?? '';
+            mesh.userData.maxjsHandle = nd.h;
+            hooks.stampMaterial(mesh, nd);
+            maxRoot.add(mesh);
+            nodeMap.set(nd.h, mesh);
+            retainGeometryRef(refCounts, mesh.geometry);
+            addedHandles.push(nd.h);
+            sceneChanged = true;
+            hooks.onMaterialApplied(nd.h, mesh);
+        }
+
+        // Transform + visibility (a tiny subset of finalizeSceneNode).
+        const visChanged = hooks.applyVisibility(mesh, nd.vis);
+        const xformChanged = applyTransform(mesh, nd.t);
+        if (nd.s != null) hooks.applySelection(mesh, nd.s);
+        if (visChanged || xformChanged) transformsChanged = true;
+    }
+
+    if (transformsChanged || sceneChanged) hooks.markRuntimeTransformsDirty();
+
+    // World matrix update + skinned bind pose pass.
+    scene?.updateMatrixWorld(true);
+    for (const mesh of nodeMap.values()) {
+        if (mesh?.isSkinnedMesh && mesh.skeleton && !mesh.userData._skelBound) {
+            mesh.skeleton.calculateInverses();
+            mesh.bind(mesh.skeleton, mesh.matrixWorld);
+            mesh.userData._skelBound = true;
+        }
+    }
+
+    hooks.finalizeSceneSnapshot({
+        snapshot: meta,
+        transport: 'binary-scene',
+        applyStart,
+        producerBytes: meta.stats?.producerBytes ?? buffer.byteLength,
+        options: { ...options, bucketPlan, sceneChanged },
+    });
+
+    return {
+        sceneChanged,
+        transformsChanged,
+        applyMs: performance.now() - applyStart,
+        addedHandles,
+        removedHandles,
+        bucketSignature: bucketPlan.signature,
+    };
+}

@@ -45,8 +45,6 @@ export function createPerfHud(infoEl) {
 
     let debugEnabled = false;
     let lastRenderPaintMs = 0;
-    let prevCalls = 0;
-    let prevTriangles = 0;
     let fpsFrames = 0;
     let fpsLastSample = 0;
 
@@ -105,12 +103,14 @@ export function createPerfHud(infoEl) {
         updateRender(renderMs, renderInfo, memoryInfo) {
             if (!debugEnabled) return;
             state.renderMs = renderMs;
-            const currCalls = renderInfo?.calls ?? 0;
-            const currTriangles = renderInfo?.triangles ?? 0;
-            state.drawCalls = currCalls - prevCalls;
-            state.triangleCount = currTriangles - prevTriangles;
-            prevCalls = currCalls;
-            prevTriangles = currTriangles;
+            // r184 backends disagree on `info.render` shape:
+            //   WebGLInfo:  `calls` is per-frame (auto-reset inside render()).
+            //   WebGPU Info: `calls` is monotonic since app start; `drawCalls`
+            //                is the per-frame count (reset each RAF tick).
+            // Prefer `drawCalls` when present so both backends report the
+            // current frame's draw count without delta math.
+            state.drawCalls = renderInfo?.drawCalls ?? renderInfo?.calls ?? 0;
+            state.triangleCount = renderInfo?.triangles ?? 0;
             state.memGeometries = memoryInfo?.geometries ?? 0;
             state.memTextures = memoryInfo?.textures ?? 0;
 
@@ -133,10 +133,6 @@ export function createPerfHud(infoEl) {
         },
         setDebugEnabled(enabled) {
             debugEnabled = enabled;
-            if (!enabled) {
-                prevCalls = 0;
-                prevTriangles = 0;
-            }
         },
         isDebugEnabled() {
             return debugEnabled;

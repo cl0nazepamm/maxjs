@@ -1,6 +1,6 @@
 // snapshot_boot.js — handwritten standalone snapshot bootstrapper.
 //
-// Stage 3 deliverable from docs/SNAPSHOT_REFACTOR.md.
+// Stage 4 deliverable from docs/SNAPSHOT_REFACTOR.md.
 //
 // This module is the canonical entry point for *deployed* snapshot pages.
 // Live mode (inside Max via WebView2) still goes through index.html.
@@ -33,26 +33,29 @@
 //   9. Bind layer project (inlines/ + project.maxjs.json)
 //  10. Run (setAnimationLoop)
 //
-// STAGE 3 STATUS (this file)
+// STAGE 4 STATUS (this file)
 // --------------------------
 // Real code:    1 (meta), 2 (renderer), 3 (scene/camera/controls),
 //               4 (layer manager), 6 (applier via scene_applier.js with
 //               flat-gray default material), 7 partial (tone-map/
-//               exposure/bg/camera), 9 (layer project bind), 10
-//               (render loop), animation + timeline plumbing.
+//               exposure/bg/camera + scene lights via scene_lights.js),
+//               9 (layer project bind), 10 (render loop), animation +
+//               timeline plumbing.
 // Deferred:     5 (optional modules — warns and continues),
 //               7 fx/studio/bake (warns), 8 runtimeScene (warns),
 //               material fidelity (PBR/TSL/MaterialX), instance buckets,
-//               vertex colors, env/HDRI/sky/fog, lights from snapshot.
+//               vertex colors, env/HDRI/sky/fog, splats/audio/gltf.
 //
-// What WORKS today: snapshots with Max-authored meshes render — geometry
-// is visible with a flat MeshStandardMaterial. Skinned meshes assemble
-// correctly (Skeleton wired, bind pose calculated). Animation tracks load
-// and the mixer ticks. Splines render as LineSegments.
+// What WORKS today: snapshots with Max-authored meshes render with
+// proper lighting — Directional/Point/Spot/RectArea/Hemisphere/Ambient
+// lights from snapshot.json drive a flat MeshStandardMaterial on each
+// mesh. Shadows render for shadow-casting types. Skinned meshes assemble
+// (Skeleton wired, bind pose calculated). Animations tick. Splines
+// render as LineSegments.
 //
 // What's MISSING (visible regressions vs. live mode): real materials,
-// real lights from the scene, HDRI/sky environment, post-FX, splats,
-// audio playback, instance bucket merging.
+// HDRI/sky environment, post-FX, splats, audio playback, instance
+// bucket merging.
 
 import * as THREE from 'three/webgpu';
 import * as THREE_STD from 'three';
@@ -64,6 +67,7 @@ import { createAnimationSystem } from './maxjs_animation.js';
 import { maxTimeline } from './maxjs_timeline.js';
 import { createRenderer as createRendererImpl, createScene as createSceneImpl } from './scene_init.js';
 import { applySceneBin } from './scene_applier.js';
+import { createSceneLights } from './scene_lights.js';
 // Optional modules — imported lazily inside Phase 5 once runtimeFeatures
 // declare them. Keep them out of the static import graph so Minimal mode
 // does not pay for what the scene does not use.
@@ -424,10 +428,6 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
     // Phase 3: scene
     const sceneCtx = createScene({ meta, renderer, canvas });
     const { scene, camera, controls, maxBasisRoot, maxRoot, jsRoot, overlayRoot, defaultLights, resize } = sceneCtx;
-    // Stage 3 stopgap: enable default lights so meshes are visible.
-    // Once lights extraction lands, this should flip to "on if scene has
-    // no synced lights AND no env/HDRI"; for now always on.
-    defaultLights.visible = true;
 
     // Wire window resize → renderer + camera. Custom-site embedders that
     // host the canvas in a non-fullscreen context can call resize(w, h)
@@ -438,6 +438,9 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
     // Maps populated by the applier in phase 6, consumed by layer manager and animation.
     const nodeMap = new Map();
     const lightHandleMap = new Map();
+
+    // Lights — bound here so phase 7 / phase 6 hooks can both reach in.
+    const sceneLights = createSceneLights({ scene, lightHandleMap });
 
     // Phase 4: layer manager
     const layerManager = buildLayerManager({
@@ -467,6 +470,12 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
         layerManager, animationSystem,
     };
     await applyDelta(buffer, applierCtx);
+
+    // Lights from snapshot.json (Stage 4). Default lights remain visible
+    // only when the scene declares none; once env/HDRI extraction lands
+    // this condition tightens further.
+    const lightsResult = sceneLights.apply(meta.lights);
+    defaultLights.visible = lightsResult.count === 0;
 
     // Phase 7: snapshotUi
     if (meta.snapshotUi) {
@@ -513,12 +522,19 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
     return {
         renderer, scene, camera, controls, layerManager,
         maxBasisRoot, maxRoot, jsRoot, overlayRoot, defaultLights,
+        sceneLights,
         animationSystem, maxTimeline,
         resize,
         applyDelta: (newBuffer) => applyDelta(newBuffer, applierCtx),
+        applyLights: (lightsData) => {
+            const r = sceneLights.apply(lightsData);
+            defaultLights.visible = r.count === 0;
+            return r;
+        },
         dispose() {
             try { stopLoop(); } catch {}
             try { removeEventListener('resize', onResize); } catch {}
+            try { sceneLights.dispose(); } catch {}
             try { renderer?.dispose?.(); } catch {}
         },
     };

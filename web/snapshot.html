@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+    <title>max.js snapshot</title>
+    <link rel="icon" href="data:,">
+    <style>
+        html,body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+        #stage { display: block; width: 100vw; height: 100vh; }
+        /* Pre-boot status — replaced by canvas content once boot() resolves. */
+        #boot-status {
+            position: fixed; inset: 0;
+            display: flex; align-items: center; justify-content: center;
+            color: #888; font: 12px/1.4 'Segoe UI', system-ui, sans-serif;
+            background: #000;
+            pointer-events: none;
+            transition: opacity 0.3s ease;
+        }
+        #boot-status.hidden { opacity: 0; }
+        #boot-status.error { color: #f55; pointer-events: auto; }
+        #boot-status pre {
+            margin: 8px 0 0; max-width: 80vw; white-space: pre-wrap;
+            font: 11px/1.5 'Consolas', monospace;
+        }
+    </style>
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "./vendor/three-r184/build/three.webgpu.js",
+            "three-std": "./vendor/three-r184/build/three.module.js",
+            "three/webgpu": "./vendor/three-r184/build/three.webgpu.js",
+            "three/tsl": "./vendor/three-r184/build/three.tsl.js",
+            "three/addons/": "./vendor/three-r184/examples/",
+            "three/examples/jsm/": "./vendor/three-r184/examples/",
+            "@sparkjsdev/spark": "./node_modules/@sparkjsdev/spark/dist/spark.module.js",
+            "@dimforge/rapier3d-compat": "./vendor/rapier/rapier.es.js"
+        },
+        "scopes": {
+            "./node_modules/@sparkjsdev/spark/": {
+                "three": "./vendor/three-r184/build/three.module.js"
+            },
+            "./vendor/three-r184/examples/objects/Sky.js": {
+                "three": "./vendor/three-r184/build/three.module.js"
+            },
+            "./vendor/three-r184/examples/lighting/LightProbeGrid.js": {
+                "three": "./vendor/three-r184/build/three.module.js"
+            }
+        }
+    }
+    </script>
+</head>
+<body>
+    <canvas id="stage"></canvas>
+    <div id="boot-status">booting…</div>
+    <script type="module">
+        import { boot } from './js/snapshot_boot.js';
+
+        const status = document.getElementById('boot-status');
+        const canvas = document.getElementById('stage');
+
+        try {
+            const player = await boot({
+                root: '.',
+                canvas,
+                options: {
+                    debug: new URLSearchParams(location.search).has('debug'),
+                },
+            });
+            // Expose for console poking and for custom-site embedding.
+            window.maxjsPlayer = player;
+            status.classList.add('hidden');
+            setTimeout(() => status.remove(), 400);
+        } catch (err) {
+            console.error('[max.js snapshot] boot failed', err);
+            status.classList.add('error');
+            status.innerHTML =
+                '<div>snapshot boot failed</div>' +
+                '<pre>' + (err?.stack ?? err?.message ?? String(err)) + '</pre>';
+        }
+
+        addEventListener('resize', () => {
+            // Stage 1: nothing to do here yet — phase 2/3 will install a
+            // resize handler when renderer + camera are real.
+        });
+    </script>
+</body>
+</html>

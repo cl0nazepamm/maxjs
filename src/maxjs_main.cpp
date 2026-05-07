@@ -10005,24 +10005,24 @@ public:
             return false;
         }
 
-        // Copy project layers when runtimeScene is included (needed for layer replay in snapshot)
-        if (options.includeRuntimeScene) {
-            const std::wstring projectManifestPath = GetProjectManifestPath();
-            if (!projectManifestPath.empty() && FileExists(projectManifestPath)) {
-                if (!CopyFileEnsuringDirectories(projectManifestPath, outDir + L"\\project.maxjs.json")) {
-                    error = L"Failed to copy project.maxjs.json into snapshot";
-                    cleanupOnFail();
-                    return false;
-                }
+        // Copy project layers when present. They are sidecars, not part of the
+        // baked runtimeScene JSON, so snapshots can replay inlines even when
+        // runtimeScene export is omitted or empty.
+        const std::wstring projectManifestPath = GetProjectManifestPath();
+        if (!projectManifestPath.empty() && FileExists(projectManifestPath)) {
+            if (!CopyFileEnsuringDirectories(projectManifestPath, outDir + L"\\project.maxjs.json")) {
+                error = L"Failed to copy project.maxjs.json into snapshot";
+                cleanupOnFail();
+                return false;
             }
+        }
 
-            const std::wstring inlineDir = GetInlineLayerDir();
-            if (!inlineDir.empty() && DirectoryExists(inlineDir)) {
-                if (!CopyDirectoryRecursive(inlineDir, outDir + L"\\inlines")) {
-                    error = L"Failed to copy inlines into snapshot";
-                    cleanupOnFail();
-                    return false;
-                }
+        const std::wstring inlineDir = GetInlineLayerDir();
+        if (!inlineDir.empty() && DirectoryExists(inlineDir)) {
+            if (!CopyDirectoryRecursive(inlineDir, outDir + L"\\inlines")) {
+                error = L"Failed to copy inlines into snapshot";
+                cleanupOnFail();
+                return false;
             }
         }
 

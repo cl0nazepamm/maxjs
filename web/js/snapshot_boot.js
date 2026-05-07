@@ -109,8 +109,17 @@ function noteExtractionDeferred(name, sourceLocation, detail = '') {
 // Matches the old "load everything" behavior so existing snapshots that
 // predate runtimeFeatures keep working. The exporter will populate this
 // block in a later session and the wrapper will tighten its imports.
+//
+// renderer_pref comes from whatever backend the live maxjs viewer was
+// using when the user exported. Lives at meta.snapshotUi.rendererBackend
+// (or .backend on older payloads). When the field is absent, default
+// to whatever the live editor defaults to (WebGPU).
 function detectFeaturesLegacy(meta) {
-    const savedBackend = String(meta?.snapshotUi?.rendererBackend ?? meta?.snapshotUi?.backend ?? '').toLowerCase();
+    const savedBackend = String(
+        meta?.snapshotUi?.rendererBackend
+        ?? meta?.snapshotUi?.backend
+        ?? '',
+    ).toLowerCase();
     return Object.freeze({
         renderer_pref: savedBackend.includes('webgl') ? 'webgl' : 'webgpu',
         post_fx: ['ssgi'], // index.html always wires ssgiFx today
@@ -709,12 +718,10 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
         });
     }
 
-    // Phase 9: layer project. Match the legacy snapshot path: project
-    // sidecars are replayed as part of runtimeScene handling, so plain
-    // geometry-only snapshots do not emit a noisy project.maxjs.json 404.
-    if (meta.runtimeScene) {
-        await bindLayerProject(root, meta, layerManager);
-    }
+    // Phase 9: layer project. Project sidecars are independent of the baked
+    // runtimeScene payload: a snapshot may ship project.maxjs.json + inlines/
+    // even when runtimeScene was omitted or empty.
+    await bindLayerProject(root, meta, layerManager);
 
     // Animation tracks
     if (meta.animations) {

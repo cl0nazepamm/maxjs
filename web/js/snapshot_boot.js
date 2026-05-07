@@ -1,6 +1,6 @@
 // snapshot_boot.js — handwritten standalone snapshot bootstrapper.
 //
-// Stage 4 deliverable from docs/SNAPSHOT_REFACTOR.md.
+// Stage 5 deliverable from docs/SNAPSHOT_REFACTOR.md.
 //
 // This module is the canonical entry point for *deployed* snapshot pages.
 // Live mode (inside Max via WebView2) still goes through index.html.
@@ -33,29 +33,30 @@
 //   9. Bind layer project (inlines/ + project.maxjs.json)
 //  10. Run (setAnimationLoop)
 //
-// STAGE 4 STATUS (this file)
+// STAGE 5 STATUS (this file)
 // --------------------------
 // Real code:    1 (meta), 2 (renderer), 3 (scene/camera/controls),
-//               4 (layer manager), 6 (applier via scene_applier.js with
-//               flat-gray default material), 7 partial (tone-map/
-//               exposure/bg/camera + scene lights via scene_lights.js),
-//               9 (layer project bind), 10 (render loop), animation +
-//               timeline plumbing.
+//               4 (layer manager), 6 (applier with simple-PBR materials
+//               via material_builder.js), 7 partial (tone-map/exposure/
+//               bg/camera + scene lights via scene_lights.js), 9 (layer
+//               project bind), 10 (render loop), animation + timeline.
 // Deferred:     5 (optional modules — warns and continues),
 //               7 fx/studio/bake (warns), 8 runtimeScene (warns),
-//               material fidelity (PBR/TSL/MaterialX), instance buckets,
+//               TSL / MaterialX / VRay / OpenPBR / Toon material types
+//               (degrade to MeshStandardMaterial), instance buckets,
 //               vertex colors, env/HDRI/sky/fog, splats/audio/gltf.
 //
-// What WORKS today: snapshots with Max-authored meshes render with
-// proper lighting — Directional/Point/Spot/RectArea/Hemisphere/Ambient
-// lights from snapshot.json drive a flat MeshStandardMaterial on each
-// mesh. Shadows render for shadow-casting types. Skinned meshes assemble
-// (Skeleton wired, bind pose calculated). Animations tick. Splines
-// render as LineSegments.
+// What WORKS today: snapshots with Max-authored meshes render with PBR
+// materials — color, roughness, metalness, opacity, emissive, plus the
+// six common map slots (diffuse / normal / roughness / metalness / AO /
+// emissive). Multi/sub-object materials honor their groups. Lights from
+// snapshot.json drive shading; shadows render for shadow-casters.
+// Skinned meshes assemble (Skeleton + bind pose). Animations tick.
 //
-// What's MISSING (visible regressions vs. live mode): real materials,
-// HDRI/sky environment, post-FX, splats, audio playback, instance
-// bucket merging.
+// What's MISSING (visible regressions vs. live mode): TSL / MaterialX /
+// VRay / OpenPBR materials (degrade to MeshStandardMaterial), HDRI/sky
+// environment, post-FX, splats, audio playback, instance bucket merging,
+// vertex colors.
 
 import * as THREE from 'three/webgpu';
 import * as THREE_STD from 'three';
@@ -68,6 +69,7 @@ import { maxTimeline } from './maxjs_timeline.js';
 import { createRenderer as createRendererImpl, createScene as createSceneImpl } from './scene_init.js';
 import { applySceneBin } from './scene_applier.js';
 import { createSceneLights } from './scene_lights.js';
+import { createMaterialBuilder } from './material_builder.js';
 // Optional modules — imported lazily inside Phase 5 once runtimeFeatures
 // declare them. Keep them out of the static import graph so Minimal mode
 // does not pay for what the scene does not use.
@@ -212,6 +214,27 @@ async function applyDelta(buffer, ctx) {
             lastInstanceBucketSignature: '',
         },
         hooks: {
+            materialBuilder: ({ nd, geom, wantsLine }) =>
+                ctx.materialBuilder.buildForNode({ nd, geom, wantsLine }),
+            materialUpdater: ({ mesh, nd, wantsLine }) => {
+                if (!ctx.materialBuilder.shouldUpdate({ mesh, nd })) return false;
+                const next = ctx.materialBuilder.buildForNode({ nd, geom: mesh.geometry, wantsLine });
+                const old = mesh.material;
+                mesh.material = next;
+                // Defer disposal a tick to avoid pulling textures still bound
+                // to in-flight WebGPU pipelines.
+                queueMicrotask(() => {
+                    if (Array.isArray(old)) old.forEach((m) => m?.dispose?.());
+                    else old?.dispose?.();
+                });
+                return true;
+            },
+            stampMaterial: (mesh, nd) => {
+                mesh.userData ??= {};
+                mesh.userData.maxjsMaterialSignature =
+                    ctx.materialBuilder ? ctx.materialBuilder['signature']?.(nd) : null;
+                mesh.userData.maxjsLastNodePayload = nd;
+            },
             onMaterialApplied: (handle, mesh) => {
                 ctx.layerManager?.applyMaterialOverrides?.(handle, mesh);
             },
@@ -442,6 +465,9 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
     // Lights — bound here so phase 7 / phase 6 hooks can both reach in.
     const sceneLights = createSceneLights({ scene, lightHandleMap });
 
+    // Material builder — owns the per-snapshot texture cache.
+    const materialBuilder = createMaterialBuilder({ rootUrl: root });
+
     // Phase 4: layer manager
     const layerManager = buildLayerManager({
         scene, camera, renderer, THREE,
@@ -467,7 +493,7 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
     const buffer = await binResp.arrayBuffer();
     const applierCtx = {
         scene, meta, nodeMap, lightHandleMap, maxRoot,
-        layerManager, animationSystem,
+        layerManager, animationSystem, materialBuilder,
     };
     await applyDelta(buffer, applierCtx);
 
@@ -535,6 +561,7 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
             try { stopLoop(); } catch {}
             try { removeEventListener('resize', onResize); } catch {}
             try { sceneLights.dispose(); } catch {}
+            try { materialBuilder.dispose(); } catch {}
             try { renderer?.dispose?.(); } catch {}
         },
     };

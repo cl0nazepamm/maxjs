@@ -11978,6 +11978,11 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             if (perfHudActive) perfHud.updateLayers(layerManager.getStats());
             ssgiFx.applySharedSceneEffects?.();
             const renderStart = performance.now();
+            // Last-mile render-only camera offsets (handheld shake, etc.).
+            // Applied after layer.update + camera sync so they survive until
+            // draw, restored after draw so authored state is what the rest of
+            // the system sees between frames.
+            layerManager.beforeRender?.(frameElapsed);
             try {
                 if (asciiActive && asciiEffect) {
                     asciiEffect.render(scene, camera);
@@ -12013,6 +12018,8 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 }
             } catch (error) {
                 reportBridgeError('runtime error', error);
+            } finally {
+                layerManager.afterRender?.(frameElapsed);
             }
             // Clone blob overlay — draw bounding rects on 2D canvas
             if (ssgiFx.isCloneEnabled() && !renderToImageActive) {

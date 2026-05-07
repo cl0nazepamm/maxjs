@@ -12,16 +12,33 @@
 // later reach into these directly the same way they do in live mode.
 
 import * as THREE from 'three/webgpu';
-import * as THREE_STD from 'three';
+import * as THREE_STD from 'three-std';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 
 import { copyMaxComponentsToWorld } from './max_basis.js';
 
 // ─── Renderer ─────────────────────────────────────────────────────────
 
+export function measureCanvasSize(canvas, width, height) {
+    const rect = canvas?.getBoundingClientRect?.();
+    const fallbackWidth = globalThis.innerWidth || canvas?.clientWidth || canvas?.width || 1;
+    const fallbackHeight = globalThis.innerHeight || canvas?.clientHeight || canvas?.height || 1;
+    const rawWidth = Number.isFinite(width) && width > 0
+        ? width
+        : (rect?.width || canvas?.clientWidth || fallbackWidth);
+    const rawHeight = Number.isFinite(height) && height > 0
+        ? height
+        : (rect?.height || canvas?.clientHeight || fallbackHeight);
+    return {
+        width: Math.max(1, Math.round(rawWidth)),
+        height: Math.max(1, Math.round(rawHeight)),
+    };
+}
+
 function configureRenderer(renderer, canvas) {
-    renderer.setSize(canvas.clientWidth || innerWidth, canvas.clientHeight || innerHeight);
+    const { width, height } = measureCanvasSize(canvas);
     renderer.setPixelRatio(devicePixelRatio || 1);
+    renderer.setSize(width, height, /* updateStyle */ false);
     renderer.toneMapping = THREE.NeutralToneMapping;
     renderer.toneMappingExposure = 1.0;
     renderer.shadowMap.enabled = true;
@@ -117,7 +134,8 @@ export function createScene({ renderer, canvas } = {}) {
     // ortho switch, but snapshots always export a single camera state).
     const cameraDefaultPosition = copyMaxComponentsToWorld(new THREE.Vector3(), 200, -200, 150);
 
-    const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.1, 100000);
+    const initialSize = measureCanvasSize(canvas ?? renderer.domElement);
+    const camera = new THREE.PerspectiveCamera(60, initialSize.width / initialSize.height, 0.1, 100000);
     camera.up.set(0, 1, 0);
     camera.position.copy(cameraDefaultPosition);
     camera.layers.enable(MAXJS_LAYER_SSR_EXCLUDE);
@@ -173,11 +191,12 @@ export function createScene({ renderer, canvas } = {}) {
 
     // Resize handler — call from the wrapper on window resize / canvas changes.
     function resize(width, height) {
-        const w = width ?? innerWidth;
-        const h = height ?? innerHeight;
+        const { width: w, height: h } = measureCanvasSize(canvas ?? renderer.domElement, width, height);
+        renderer.setPixelRatio(devicePixelRatio || 1);
         renderer.setSize(w, h, /* updateStyle */ false);
         camera.aspect = w / h;
         camera.updateProjectionMatrix();
+        return { width: w, height: h, aspect: w / h };
     }
 
     return {

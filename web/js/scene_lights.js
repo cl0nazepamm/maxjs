@@ -176,12 +176,13 @@ function createLightFromData(ld, lightGroup) {
  *   lights.apply(meta.lights ?? []);
  *   // → returns { count, mainDirectional, signature }
  */
-export function createSceneLights({ scene, lightHandleMap = new Map() } = {}) {
+export function createSceneLights({ scene, parent = scene, lightHandleMap = new Map() } = {}) {
     if (!scene) throw new Error('createSceneLights: scene required');
+    if (!parent?.add) throw new Error('createSceneLights: parent Object3D required');
 
     const lightGroup = new THREE.Group();
     lightGroup.name = '__maxjs_lights__';
-    scene.add(lightGroup);
+    parent.add(lightGroup);
 
     let lastSignature = '';
 
@@ -224,7 +225,7 @@ export function createSceneLights({ scene, lightHandleMap = new Map() } = {}) {
 
     function dispose() {
         clear();
-        scene.remove(lightGroup);
+        parent.remove(lightGroup);
     }
 
     return { apply, clear, dispose, group: lightGroup, lightHandleMap };

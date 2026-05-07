@@ -2305,6 +2305,44 @@ export function createLayerManager({
         });
     }
 
+    /**
+     * Render-time hooks for last-mile camera offsets such as handheld shake.
+     *
+     * Called every frame from renderFrame:
+     *   - beforeRender(elapsed) runs after layer.update() and after all camera
+     *     sync (controls.update / applyCamera), but before renderer.render().
+     *     Layers can mutate ctx.camera.raw here knowing nothing else will
+     *     overwrite it before the draw.
+     *   - afterRender(elapsed) runs immediately after the draw. Layers that
+     *     applied a transient camera offset should restore the camera here so
+     *     the authored state is what other systems (controls, applyCamera,
+     *     anchors, sync) see between frames.
+     *
+     * Mutations made here are NOT seen by anchors, raycasts, or any other
+     * system that reads camera state outside the render call.
+     */
+    function dispatchRenderHook(hookName, frameElapsed) {
+        if (Number.isFinite(frameElapsed)) elapsed = frameElapsed;
+        for (const layer of layers.values()) {
+            if (layer.loading || !layer.active || !layer.hooks) continue;
+            const fn = layer.hooks[hookName];
+            if (typeof fn !== 'function') continue;
+            try {
+                fn(layer.ctx, elapsed);
+            } catch (err) {
+                layer.errorCount++;
+                if (layer.errorCount >= MAX_CONSECUTIVE_ERRORS) {
+                    layer.active = false;
+                    layer.error = `Auto-deactivated after ${MAX_CONSECUTIVE_ERRORS} errors in ${hookName}: ${err.message}`;
+                    console.error(`[LayerManager] Layer "${layer.id}" deactivated:`, err);
+                    emitChange('deactivated');
+                }
+            }
+        }
+    }
+    function beforeRender(frameElapsed) { dispatchRenderHook('onBeforeRender', frameElapsed); }
+    function afterRender(frameElapsed)  { dispatchRenderHook('onAfterRender',  frameElapsed); }
+
     function getLayerCode(id) {
         return layers.get(id)?.code ?? null;
     }
@@ -2466,6 +2504,8 @@ export function createLayerManager({
         getLayerSnapshot,
         getStats,
         update,
+        beforeRender,
+        afterRender,
         getLayerCode,
         serializeSnapshot,
         restoreTransformOverrides: restoreRuntimeTransformOverrides,

@@ -38,7 +38,7 @@
 //   - Material-template caching (per-snapshot textureCache only)
 
 import * as THREE from 'three/webgpu';
-import * as THREE_STD from 'three';
+import * as THREE_STD from 'three-std';
 
 const FALLBACK_COLOR = 0x888888;
 

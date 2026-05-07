@@ -59,17 +59,21 @@
 // vertex colors.
 
 import * as THREE from 'three/webgpu';
-import * as THREE_STD from 'three';
-import * as TSL from 'three/tsl';
-import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 
 import { createLayerManager } from './layer_manager.js';
-import { createAnimationSystem } from './maxjs_animation.js';
+import { createMaxJSAnimationSystem } from './maxjs_animation.js';
 import { maxTimeline } from './maxjs_timeline.js';
-import { createRenderer as createRendererImpl, createScene as createSceneImpl } from './scene_init.js';
+import {
+    createRenderer as createRendererImpl,
+    createScene as createSceneImpl,
+    measureCanvasSize,
+} from './scene_init.js';
 import { applySceneBin } from './scene_applier.js';
 import { createSceneLights } from './scene_lights.js';
 import { createMaterialBuilder } from './material_builder.js';
+import { copyMaxArrayToWorld } from './max_basis.js';
+import { geometryFromNodeBinary } from './scene_binary.js';
+import { sceneSpace } from './max_basis.js';
 // Optional modules — imported lazily inside Phase 5 once runtimeFeatures
 // declare them. Keep them out of the static import graph so Minimal mode
 // does not pay for what the scene does not use.
@@ -106,14 +110,15 @@ function noteExtractionDeferred(name, sourceLocation, detail = '') {
 // predate runtimeFeatures keep working. The exporter will populate this
 // block in a later session and the wrapper will tighten its imports.
 function detectFeaturesLegacy(meta) {
+    const savedBackend = String(meta?.snapshotUi?.rendererBackend ?? meta?.snapshotUi?.backend ?? '').toLowerCase();
     return Object.freeze({
-        renderer_pref: meta?.snapshotUi?.rendererBackend ?? 'webgpu',
+        renderer_pref: savedBackend.includes('webgl') ? 'webgl' : 'webgpu',
         post_fx: ['ssgi'], // index.html always wires ssgiFx today
-        audio: !!meta?.audioNodes?.length,
-        splats: !!meta?.splats?.length,
-        html_textures: !!meta?.htmlTextures?.length,
-        volumes: !!meta?.volumes?.length,
-        physics: false,
+        audio: true,
+        splats: true,
+        html_textures: true,
+        volumes: true,
+        physics: true,
         three_addons: ['OrbitControls'],
     });
 }
@@ -124,7 +129,36 @@ async function loadMeta(root) {
     if (!response.ok) {
         throw new Error(`snapshot.json fetch failed: HTTP ${response.status}`);
     }
-    return response.json();
+    const meta = await response.json();
+    resolveSnapshotMaterialRefs(meta);
+    return meta;
+}
+
+// snapshot.json represents materials as an interned table:
+//   meta.materials = [{ id: 1, hash: ..., mat: { ... } }, ...]
+//   meta.nodes[i].matRef = 1                      // single material
+//   meta.nodes[i].matsRef = [1, 2, 3]             // multi/sub-object
+//
+// The applier and material_builder both read `nd.mat` / `nd.mats`. Walk
+// the table once on load and inline the descriptors. Live mode does the
+// same in `resolveSnapshotMaterialRefs` (index.html) before applying.
+function resolveSnapshotMaterialRefs(meta) {
+    if (!meta?.nodes?.length) return;
+    const byId = new Map();
+    for (const entry of (meta.materials ?? [])) {
+        if (entry?.id != null && entry.mat) byId.set(entry.id, entry.mat);
+    }
+    if (byId.size === 0) return;
+    for (const nd of meta.nodes) {
+        if (!nd) continue;
+        if (nd.matRef != null && !nd.mat) {
+            const md = byId.get(nd.matRef);
+            if (md) nd.mat = md;
+        }
+        if (Array.isArray(nd.matsRef) && (!nd.mats || nd.mats.length === 0)) {
+            nd.mats = nd.matsRef.map((id) => byId.get(id)).filter(Boolean);
+        }
+    }
 }
 
 // ─── Phase 2: renderer ─────────────────────────────────────────────────
@@ -149,7 +183,18 @@ function createScene({ meta, renderer, canvas } = {}) {
 
 // ─── Phase 4: layer manager core ──────────────────────────────────────
 // Already in js/layer_manager.js. The wiring requires inputs from phase 3.
-function buildLayerManager({ scene, camera, renderer, THREE, nodeMap, lightHandleMap, maxRoot, jsRoot, overlayRoot }) {
+function buildLayerManager({
+    scene,
+    camera,
+    renderer,
+    THREE,
+    nodeMap,
+    lightHandleMap,
+    maxRoot,
+    jsRoot,
+    overlayRoot,
+    controls,
+}) {
     return createLayerManager({
         scene,
         camera,
@@ -160,6 +205,11 @@ function buildLayerManager({ scene, camera, renderer, THREE, nodeMap, lightHandl
         maxRoot,
         jsRoot,
         overlayRoot,
+        space: sceneSpace,
+        controls,
+        getCamera: () => camera,
+        debugLog: (...args) => console.debug('[snapshot_boot]', ...args),
+        debugWarn: (...args) => console.warn('[snapshot_boot]', ...args),
     });
 }
 
@@ -302,6 +352,91 @@ function applySnapshotUi(snapshotUi, ctx) {
     }
 }
 
+// Helper: re-derive vertical fov from the stashed horizontal Max fov +
+// current canvas aspect. Called both at boot (initial apply) and on every
+// window resize so framing doesn't drift as the canvas reshapes.
+function getCanvasAspect(canvas, width, height) {
+    const size = measureCanvasSize(canvas, width, height);
+    return size.width / size.height;
+}
+
+function applyHorizontalFovToVertical(camera, aspect) {
+    const hFov = Number.isFinite(camera?.userData?.maxjsHorizontalFov)
+        ? camera.userData.maxjsHorizontalFov
+        : camera?.userData?.maxjsHFovDeg;
+    if (!camera?.isPerspectiveCamera) return;
+    if (!Number.isFinite(hFov) || hFov <= 0 || hFov >= 170) return;
+    const safeAspect = Number.isFinite(aspect) && aspect > 0 ? aspect : camera.aspect || 1;
+    const hRad = hFov * Math.PI / 180;
+    camera.aspect = safeAspect;
+    camera.fov = 2 * Math.atan(Math.tan(hRad / 2) / safeAspect) * 180 / Math.PI;
+    camera.updateProjectionMatrix();
+}
+
+// ─── Phase 7b: top-level camera ───────────────────────────────────────
+// Mirrors the live-mode `applyCamera` / `applyStandaloneCameraState` from
+// index.html. Sequence matters:
+//
+//   1. Convert pos/up/tgt from Max (Z-up) to world (Y-up).
+//   2. position + up + lookAt(target) — single pass that resets rotation
+//      cleanly (just setting position leaves stale quaternion).
+//   3. Convert Max horizontal FOV → Three.js vertical FOV using current
+//      canvas aspect; clamp out-of-range values.
+//   4. controls.target = same target world vector; controls.update() so
+//      OrbitControls re-anchors instead of snapping the camera back.
+//
+// Ortho persp is intentionally NOT supported here yet — snapshot mode is
+// perspective-only. If the snapshot was authored in ortho, we log and
+// fall through to perspective with a sensible default.
+function applyTopLevelCamera(cam, { camera, controls, scratch, getAspect }) {
+    if (!cam || !camera) return;
+
+    const posOk = Array.isArray(cam.pos) && cam.pos.length === 3;
+    const tgtOk = Array.isArray(cam.tgt) && cam.tgt.length === 3;
+    const upOk  = Array.isArray(cam.up)  && cam.up.length  === 3;
+    if (!posOk || !tgtOk || !upOk) {
+        console.warn('[snapshot_boot] meta.camera missing pos/tgt/up arrays; skipping camera apply.', cam);
+        return;
+    }
+    if (cam.persp === false) {
+        console.warn('[snapshot_boot] orthographic camera in snapshot — falling back to perspective (ortho support pending).');
+    }
+
+    // Basis convert all three vectors first.
+    copyMaxArrayToWorld(camera.position, cam.pos);
+    copyMaxArrayToWorld(camera.up, cam.up);
+    const targetWorld = scratch ?? new THREE.Vector3();
+    copyMaxArrayToWorld(targetWorld, cam.tgt);
+
+    // Single rotation reset: position + up + lookAt locks the basis cleanly.
+    camera.lookAt(targetWorld);
+
+    // Max stores HORIZONTAL fov; Three.js wants VERTICAL fov, derived from
+    // the canvas aspect. Stash the source horizontal degrees on userData so
+    // the resize handler can re-derive vertical fov on every aspect change
+    // — without that, the framing skews inversely to window resize.
+    if (camera.isPerspectiveCamera && Number.isFinite(cam.fov) && cam.fov > 0 && cam.fov < 170) {
+        camera.userData ??= {};
+        camera.userData.maxjsHorizontalFov = cam.fov;
+        applyHorizontalFovToVertical(camera, getAspect?.());
+    }
+
+    if (controls) {
+        controls.target.copy(targetWorld);
+        controls.update();
+    }
+
+    // Stash DOF + persp for future post-FX consumer.
+    camera.userData ??= {};
+    camera.userData.maxjsCameraSnapshot = {
+        persp: cam.persp,
+        dofEnabled: cam.dofEnabled,
+        dofFocusDistance: cam.dofFocusDistance,
+        dofFocalLength: cam.dofFocalLength,
+        dofBokehScale: cam.dofBokehScale,
+    };
+}
+
 // ─── Phase 8: runtimeScene ────────────────────────────────────────────
 // Stage 2: deferred. Full implementation reuses index.html's ObjectLoader
 // path (with NodeMaterial → standard-material rewrite) and the TSL re-bind
@@ -417,21 +552,29 @@ async function bindLayerProject(root, meta, layerManager) {
 }
 
 // ─── Phase 10: render loop ────────────────────────────────────────────
-function startRenderLoop({ renderer, scene, camera, controls, layerManager, ssgiFx, optionalModules }) {
+function startRenderLoop({ renderer, scene, camera, controls, layerManager, animationSystem, ssgiFx, optionalModules }) {
     const inlineClock = new THREE.Clock();
     const loop = () => {
         const dt = inlineClock.getDelta();
+        const elapsed = inlineClock.getElapsedTime();
         if (controls) controls.update();
-        if (layerManager?.beforeRender) layerManager.beforeRender(dt);
-
-        // Default render path. ssgiFx (when present) takes over.
-        if (ssgiFx?.isEnabled?.()) {
-            ssgiFx.render();
-        } else {
-            renderer.render(scene, camera);
+        layerManager?.update?.(dt, elapsed);
+        animationSystem?.update?.(dt);
+        for (const module of Object.values(optionalModules ?? {})) {
+            module?.update?.(dt, elapsed);
         }
 
-        if (layerManager?.afterRender) layerManager.afterRender(dt);
+        layerManager?.beforeRender?.(elapsed);
+        try {
+            // Default render path. ssgiFx (when present) takes over.
+            if (ssgiFx?.isEnabled?.()) {
+                ssgiFx.render();
+            } else {
+                renderer.render(scene, camera);
+            }
+        } finally {
+            layerManager?.afterRender?.(elapsed);
+        }
     };
     renderer.setAnimationLoop(loop);
     return () => renderer.setAnimationLoop(null);
@@ -443,27 +586,44 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
 
     // Phase 1: meta
     const meta = await loadMeta(root);
-    const features = meta.runtimeFeatures ?? detectFeaturesLegacy(meta);
+    const features = {
+        ...(meta.runtimeFeatures ?? detectFeaturesLegacy(meta)),
+        ...(options.rendererBackend ? { renderer_pref: options.rendererBackend } : {}),
+    };
 
     // Phase 2: renderer
     const renderer = await createRenderer(canvas, features);
 
     // Phase 3: scene
     const sceneCtx = createScene({ meta, renderer, canvas });
-    const { scene, camera, controls, maxBasisRoot, maxRoot, jsRoot, overlayRoot, defaultLights, resize } = sceneCtx;
+    const { scene, camera, controls, maxBasisRoot, maxRoot, jsRoot, overlayRoot, defaultLights } = sceneCtx;
+
+    const getViewportAspect = (width, height) => getCanvasAspect(canvas, width, height);
+    const resize = (width, height) => {
+        const result = sceneCtx.resize(width, height);
+        applyHorizontalFovToVertical(camera, result.aspect);
+        return result;
+    };
 
     // Wire window resize → renderer + camera. Custom-site embedders that
     // host the canvas in a non-fullscreen context can call resize(w, h)
-    // directly via the returned player handle.
-    const onResize = () => resize(innerWidth, innerHeight);
+    // directly via the returned player handle. ResizeObserver catches CSS
+    // container changes that don't emit window.resize.
+    const onResize = () => resize();
     addEventListener('resize', onResize);
+    let resizeObserver = null;
+    if (typeof ResizeObserver === 'function') {
+        resizeObserver = new ResizeObserver(() => resize());
+        resizeObserver.observe(canvas);
+        if (canvas.parentElement) resizeObserver.observe(canvas.parentElement);
+    }
 
     // Maps populated by the applier in phase 6, consumed by layer manager and animation.
     const nodeMap = new Map();
     const lightHandleMap = new Map();
 
     // Lights — bound here so phase 7 / phase 6 hooks can both reach in.
-    const sceneLights = createSceneLights({ scene, lightHandleMap });
+    const sceneLights = createSceneLights({ scene, parent: maxRoot, lightHandleMap });
 
     // Material builder — owns the per-snapshot texture cache.
     const materialBuilder = createMaterialBuilder({ rootUrl: root });
@@ -471,14 +631,18 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
     // Phase 4: layer manager
     const layerManager = buildLayerManager({
         scene, camera, renderer, THREE,
-        nodeMap, lightHandleMap, maxRoot, jsRoot, overlayRoot,
+        nodeMap, lightHandleMap, maxRoot, jsRoot, overlayRoot, controls,
     });
 
-    const animationSystem = createAnimationSystem({
+    const animationSystem = createMaxJSAnimationSystem({
+        THREE,
         nodeMap, lightHandleMap,
         getCamera: () => camera,
+        getControls: () => controls,
         getJsRoot: () => jsRoot,
         getOverlayRoot: () => overlayRoot,
+        getViewportAspect,
+        buildGeometry: (nd, buffer) => geometryFromNodeBinary(nd, buffer),
     });
 
     // Phase 5: optional modules
@@ -503,12 +667,39 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
     const lightsResult = sceneLights.apply(meta.lights);
     defaultLights.visible = lightsResult.count === 0;
 
-    // Phase 7: snapshotUi
+    // Phase 7a: snapshotUi (postfx state, tone-map, exposure, bg)
     if (meta.snapshotUi) {
         applySnapshotUi(meta.snapshotUi, {
             renderer, scene, camera, controls,
             ssgiFx: optionalModules.ssgiFx,
         });
+    }
+
+    // Phase 7b: top-level camera state. Lives at meta.camera independently
+    // of snapshotUi (which is gated by the "Viewer UI State" export toggle
+    // and may be absent). meta.camera shape:
+    //   { pos:[x,y,z], tgt:[x,y,z], up:[x,y,z], fov, persp, dofEnabled, ... }
+    // Coordinates are in Max world space (Z-up), so they get parented
+    // under maxBasisRoot via the camera's existing position math, but
+    // OrbitControls.target needs the world-space (Y-up) value.
+    applyTopLevelCamera(meta.camera, { camera, controls, getAspect: getViewportAspect });
+    resize();
+
+    // Phase 7c: lock state. Snapshots authored with camera-lock active in
+    // Max should ship without orbit controls — the snapshot represents a
+    // directed view, not a free-orbit demo. Two possible signals:
+    //   - meta.snapshotUi.camLock (authoritative when "Viewer UI State" is
+    //     in the export)
+    //   - meta.lockedCamera != null (proxy — present when the user locked
+    //     onto a specific scene camera, even without snapshotUi)
+    // Either says locked → disable controls. Custom-site embedders can
+    // still call player.controls.enabled = true to override.
+    const explicitLock = meta.snapshotUi?.camLock;
+    const inferredLock = meta.lockedCamera != null;
+    const locked = explicitLock === true || (explicitLock !== false && inferredLock);
+    if (controls) {
+        controls.enabled = !locked;
+        if (locked) console.info('[snapshot_boot] camera locked — orbit controls disabled');
     }
 
     // Phase 8: runtimeScene
@@ -518,8 +709,12 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
         });
     }
 
-    // Phase 9: layer project
-    await bindLayerProject(root, meta, layerManager);
+    // Phase 9: layer project. Match the legacy snapshot path: project
+    // sidecars are replayed as part of runtimeScene handling, so plain
+    // geometry-only snapshots do not emit a noisy project.maxjs.json 404.
+    if (meta.runtimeScene) {
+        await bindLayerProject(root, meta, layerManager);
+    }
 
     // Animation tracks
     if (meta.animations) {
@@ -541,6 +736,7 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
     // Phase 10: run
     const stopLoop = startRenderLoop({
         renderer, scene, camera, controls, layerManager,
+        animationSystem,
         ssgiFx: optionalModules.ssgiFx,
         optionalModules,
     });
@@ -560,6 +756,7 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
         dispose() {
             try { stopLoop(); } catch {}
             try { removeEventListener('resize', onResize); } catch {}
+            try { resizeObserver?.disconnect?.(); } catch {}
             try { sceneLights.dispose(); } catch {}
             try { materialBuilder.dispose(); } catch {}
             try { renderer?.dispose?.(); } catch {}

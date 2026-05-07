@@ -15,7 +15,7 @@
 // group and reason in standard Three.js Y-up world space.
 
 import * as THREE from 'three/webgpu';
-import * as THREE_STD from 'three';
+import * as THREE_STD from 'three-std';
 
 export const MAX_TO_WORLD_ROTATION_X = -Math.PI / 2;
 

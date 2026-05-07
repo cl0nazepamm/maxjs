@@ -185,7 +185,6 @@ export function createMaxJSAnimationSystem({
         loadedBinary = null;
         const camera = getCamera?.();
         if (camera?.userData) {
-            delete camera.userData.maxjsHorizontalFov;
             delete camera.userData.maxjsViewWidth;
             delete camera.userData.maxjsAnimatedTarget;
         }

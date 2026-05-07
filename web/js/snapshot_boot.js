@@ -1,6 +1,6 @@
 // snapshot_boot.js — handwritten standalone snapshot bootstrapper.
 //
-// Stage 1 deliverable from docs/SNAPSHOT_REFACTOR.md.
+// Stage 2 deliverable from docs/SNAPSHOT_REFACTOR.md.
 //
 // This module is the canonical entry point for *deployed* snapshot pages.
 // Live mode (inside Max via WebView2) still goes through index.html.
@@ -33,21 +33,22 @@
 //   9. Bind layer project (inlines/ + project.maxjs.json)
 //  10. Run (setAnimationLoop)
 //
-// STAGE 1 STATUS (this file)
+// STAGE 2 STATUS (this file)
 // --------------------------
-// Skeleton with stubs. Heavy lifters that currently live inline in
-// index.html — scene applier, material builder, renderer init, scene-graph
-// math — are stubbed via `requireExtraction()` calls. Future sessions will
-// extract them into real modules per the roadmap in SNAPSHOT_REFACTOR.md.
+// Real code:    1 (meta), 2 (renderer), 3 (scene/camera/controls),
+//               4 (layer manager), 7 partial (tone-map/exposure/bg/cam),
+//               9 (layer project bind), 10 (render loop), animation +
+//               timeline plumbing.
+// Deferred:     5 (optional modules — warns and continues),
+//               6 with-nodes (applier — empty scenes pass; non-empty
+//                            throw with the extraction pointer),
+//               7 fx/studio/bake (warns), 8 runtimeScene (warns).
 //
-// What is wired right now:
-//   - Phase 1: real
-//   - Phases 2-9: stubbed; throw with a pointer to the extraction work
-//   - Phase 10: real once 2-9 land
-//
-// What WORKS today: nothing renders. This file establishes the contract,
-// the file layout, and the import surface so the extraction work in later
-// sessions has a stable target.
+// What WORKS today: empty-scene snapshots boot end-to-end (renderer +
+// scene + camera + controls + layer manager + layer modules from
+// project.maxjs.json + idle render loop). Custom-site embedders can
+// `boot()` the runtime and add their own Three.js content. Snapshots
+// with Max-authored geometry still wait on the applier extraction.
 
 import * as THREE from 'three/webgpu';
 import * as THREE_STD from 'three';
@@ -57,6 +58,7 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { createLayerManager } from './layer_manager.js';
 import { createAnimationSystem } from './maxjs_animation.js';
 import { maxTimeline } from './maxjs_timeline.js';
+import { createRenderer as createRendererImpl, createScene as createSceneImpl } from './scene_init.js';
 // Optional modules — imported lazily inside Phase 5 once runtimeFeatures
 // declare them. Keep them out of the static import graph so Minimal mode
 // does not pay for what the scene does not use.
@@ -67,12 +69,25 @@ import { maxTimeline } from './maxjs_timeline.js';
 //   import { VolumeRenderer }         from './VolumeRenderer.js';
 //   import { createProjectRuntime }   from './project_runtime.js';
 
-// ─── Stub helper ────────────────────────────────────────────────────────
+// ─── Stub helpers ──────────────────────────────────────────────────────
+// `requireExtraction` is reserved for paths that genuinely cannot proceed
+// without the extraction landing (e.g. trying to apply a non-empty
+// scene.bin without the applier). `noteExtractionDeferred` is the
+// warn-and-continue variant used by phases where skipping is acceptable
+// for the empty/minimal snapshot path that Stage 2 supports.
 function requireExtraction(name, sourceLocation) {
     const message =
         `[snapshot_boot] '${name}' not yet extracted from index.html ` +
         `(${sourceLocation}). See docs/SNAPSHOT_REFACTOR.md → Implementation order.`;
     throw new Error(message);
+}
+
+function noteExtractionDeferred(name, sourceLocation, detail = '') {
+    const tail = detail ? ` ${detail}` : '';
+    console.warn(
+        `[snapshot_boot] '${name}' not yet extracted from index.html ` +
+        `(${sourceLocation}); skipping in Stage 2.${tail}`,
+    );
 }
 
 // ─── Default features — used when runtimeFeatures block is absent ──────
@@ -101,22 +116,24 @@ async function loadMeta(root) {
     return response.json();
 }
 
-// ─── Phase 2: renderer (STUB) ──────────────────────────────────────────
-// Pure code-motion target: web/index.html lines ~1730-1810 (`createRenderer`,
-// `configureRenderer`, `initializeRenderer`). Picks WebGPU > WebGL2 with
-// a forceWebGL fallback on init failure.
+// ─── Phase 2: renderer ─────────────────────────────────────────────────
+// Slim WebGPU > WebGL2 picker with forceWebGL fallback. Lives in
+// js/scene_init.js. Pref source: runtimeFeatures.renderer_pref ('webgpu' default).
 async function createRenderer(canvas, features) {
-    requireExtraction('createRenderer', 'index.html:1730-1810');
+    const backend = features?.renderer_pref === 'webgl' ? 'webgl' : 'webgpu';
+    const { renderer, backendLabel } = await createRendererImpl(canvas, { backend });
+    renderer.userData ??= {};
+    renderer.userData.maxjsBackendLabel = backendLabel;
+    return renderer;
 }
 
-// ─── Phase 3: scene + camera + controls (STUB) ────────────────────────
-// Code-motion target: web/index.html lines ~1565-1860 covering:
-//   - the three rooted groups (maxBasisRoot, maxRoot, jsRoot, overlayRoot)
-//   - max-basis quaternion / matrix helpers
-//   - perspective + ortho cameras with persisted preference
-//   - OrbitControls instantiation
-function createScene(meta) {
-    requireExtraction('createScene', 'index.html:1565-1860');
+// ─── Phase 3: scene + camera + controls ────────────────────────────────
+// Lives in js/scene_init.js. Returns the canonical scene topology
+// (scene + maxBasisRoot/maxRoot/jsRoot/overlayRoot), a perspective camera,
+// OrbitControls (interactive by default in snapshot mode), and a default
+// lights group hidden until the applier decides whether to use it.
+function createScene({ meta, renderer, canvas } = {}) {
+    return createSceneImpl({ renderer, canvas });
 }
 
 // ─── Phase 4: layer manager core ──────────────────────────────────────
@@ -135,62 +152,220 @@ function buildLayerManager({ scene, camera, renderer, THREE, nodeMap, lightHandl
     });
 }
 
-// ─── Phase 5: conditional module registration (STUB) ──────────────────
+// ─── Phase 5: conditional module registration ─────────────────────────
 // Lazy-imports each optional module only when runtimeFeatures asks for it.
-// In Stage 1 this is gated and returns nothing usable; the import shape
-// below shows the eventual contract.
+// Stage 2: skipped unconditionally with a deferred-extraction note. Empty
+// snapshots and pure-Three.js host pages (where the user wires their own
+// post-FX) work fine without this. Real wiring lands once each subsystem's
+// init/dispose lifecycle is documented and stubs in index.html are
+// replaced with the same lazy imports.
 async function registerOptionalModules(features, ctx) {
-    const registered = {};
-
-    // if (features.post_fx?.length) {
-    //     const { createSsgiFx } = await import('./ssgi_fx.js');
-    //     registered.ssgiFx = createSsgiFx({ ...ctx, enabled: features.post_fx });
-    // }
-    // if (features.audio) {
-    //     const { createAudioSystem } = await import('./maxjs_audio.js');
-    //     registered.audio = createAudioSystem(ctx);
-    // }
-    // ...etc per the optional list at the top of this file.
-
-    requireExtraction('registerOptionalModules', 'index.html:various — ssgiFx, audio, splat, html_texture, volume init');
-
-    return registered;
+    const wanted = [];
+    if (features.post_fx?.length)  wanted.push('post_fx');
+    if (features.audio)            wanted.push('audio');
+    if (features.splats)           wanted.push('splats');
+    if (features.html_textures)    wanted.push('html_textures');
+    if (features.volumes)          wanted.push('volumes');
+    if (features.physics)          wanted.push('physics');
+    if (wanted.length) {
+        noteExtractionDeferred(
+            'registerOptionalModules',
+            'index.html — ssgiFx / audio / splat / html_texture / volume init',
+            `(scene declares: ${wanted.join(', ')})`,
+        );
+    }
+    return {};
 }
 
-// ─── Phase 6: apply scene.bin (STUB) ──────────────────────────────────
-// Code-motion target: web/index.html `handleBinaryScene` at lines 6329-6556
-// plus its closure dependencies (planMaxInstanceBuckets, geometry ref
-// counting, material resolve helpers, etc.). The big one. Plan to extract
-// to js/scene_applier.js.
+// ─── Phase 6: apply scene.bin ──────────────────────────────────────────
+// Stage 2 partial. Empty snapshots (no nodes) are a real, useful case for
+// custom-site embedders that want to run a Three.js scene with the maxjs
+// runtime modules but no Max-authored content. Those pass through as
+// no-ops here. Non-empty scenes still need the full applier (handleBinaryScene
+// + ~18 closure helpers) extracted to js/scene_applier.js.
 async function applyDelta(buffer, ctx) {
-    requireExtraction('applyDelta', 'index.html:6329-6556 (handleBinaryScene + closure helpers)');
+    const meta = ctx?.meta;
+    const nodeCount = meta?.nodes?.length ?? 0;
+    if (meta?.type !== 'scene_bin') {
+        console.warn('[snapshot_boot] meta.type is not "scene_bin"; skipping applier.');
+        return;
+    }
+    if (nodeCount === 0) {
+        console.info('[snapshot_boot] empty scene.bin (0 nodes) — applier no-op.');
+        return;
+    }
+    requireExtraction(
+        'applyDelta',
+        'index.html:6329-6556 (handleBinaryScene + planMaxInstanceBuckets, ensureSceneRenderableMaterial, finalizeSceneNode/finalizeSceneSnapshot, etc.)',
+    );
 }
 
-// ─── Phase 7: snapshotUi (STUB) ───────────────────────────────────────
-// Code-motion targets in index.html:
-//   - applyBuildMode
-//   - applySavedPostFxPayload
-//   - applyStudioState
-//   - applyBakeState
-//   - applyStandaloneCameraState
-//   - syncPostFxPanel
+// ─── Phase 7: snapshotUi ───────────────────────────────────────────────
+// Stage 2 partial. Honors the simple, side-effect-free fields here:
+//   - tone mapping & exposure on the renderer
+//   - background color on the scene
+//   - basic camera position/target if present
+// The complex bits (postfx state restore, studio lighting, bake state)
+// require their corresponding modules to land first; they are flagged via
+// noteExtractionDeferred and skipped.
 function applySnapshotUi(snapshotUi, ctx) {
-    requireExtraction('applySnapshotUi', 'index.html: applyBuildMode / applySavedPostFxPayload / applyStudioState / applyBakeState / applyStandaloneCameraState');
+    const { renderer, scene, camera, controls } = ctx;
+
+    // Tone mapping
+    const tm = snapshotUi.toneMapping;
+    if (tm && THREE[tm.type] != null) {
+        renderer.toneMapping = THREE[tm.type];
+    }
+    if (Number.isFinite(snapshotUi.exposure)) {
+        renderer.toneMappingExposure = snapshotUi.exposure;
+    }
+
+    // Background — accept hex int or [r,g,b]
+    const bg = snapshotUi.background;
+    if (typeof bg === 'number') {
+        scene.background = new THREE.Color(bg);
+    } else if (Array.isArray(bg) && bg.length === 3) {
+        scene.background = new THREE.Color(bg[0], bg[1], bg[2]);
+    }
+
+    // Camera state — minimal subset; full applyStandaloneCameraState is bigger.
+    const cam = snapshotUi.camera;
+    if (cam) {
+        if (Array.isArray(cam.position) && cam.position.length === 3) {
+            camera.position.fromArray(cam.position);
+        }
+        if (Array.isArray(cam.target) && cam.target.length === 3 && controls) {
+            controls.target.fromArray(cam.target);
+            controls.update();
+        }
+        if (Number.isFinite(cam.fov) && camera.isPerspectiveCamera) {
+            camera.fov = cam.fov;
+            camera.updateProjectionMatrix();
+        }
+    }
+
+    // Defer the rest.
+    if (snapshotUi.fx || snapshotUi.studio || snapshotUi.bake) {
+        noteExtractionDeferred(
+            'applySnapshotUi (full)',
+            'index.html applySavedPostFxPayload / applyStudioState / applyBakeState',
+            '(simple tone-map/exposure/bg/camera applied; postfx/studio/bake skipped)',
+        );
+    }
 }
 
-// ─── Phase 8: runtimeScene (STUB) ─────────────────────────────────────
-// Code-motion target: index.html lines 12174-12365 (runtimeScene parse +
-// jsRoot/overlayRoot replay + TSL material rebind + transformOverrides).
+// ─── Phase 8: runtimeScene ────────────────────────────────────────────
+// Stage 2: deferred. Full implementation reuses index.html's ObjectLoader
+// path (with NodeMaterial → standard-material rewrite) and the TSL re-bind
+// pass. None of that is useful without phase 6 anyway, so noting and
+// continuing is correct here.
 async function applyRuntimeScene(runtimeScene, ctx) {
-    requireExtraction('applyRuntimeScene', 'index.html:12174-12365');
+    noteExtractionDeferred(
+        'applyRuntimeScene',
+        'index.html:12174-12365',
+        '(jsRoot/overlayRoot baked Object3D JSON + TSL re-bind + transform overrides)',
+    );
 }
 
 // ─── Phase 9: layer project bind ──────────────────────────────────────
-// Mirrors index.html `tryReplaySnapshotLayerModules` (lines 12213-12267).
-// Snapshot mode imports every layer in the manifest regardless of the
-// `enabled` flag — disable is a live-mode concept only.
+// Real implementation — small enough to live here. Mirrors
+// `tryReplaySnapshotLayerModules` from index.html.
+//
+// Snapshot mode imports EVERY layer in the manifest regardless of the
+// `enabled` flag — disable is a live-mode concept only. The exporter
+// already trims disabled layers out of the shipped folder when the user
+// wants them gone.
+function resolveSnapshotLayerFactory(moduleNamespace) {
+    const directHooks = ['init', 'update', 'dispose']
+        .some(key => typeof moduleNamespace?.[key] === 'function');
+    if (directHooks) return async () => moduleNamespace;
+
+    const candidate = moduleNamespace?.default
+        ?? moduleNamespace?.createLayer
+        ?? moduleNamespace?.mount;
+
+    if (typeof candidate === 'function') return candidate;
+    if (candidate && typeof candidate === 'object') return async () => candidate;
+
+    throw new Error('Snapshot layer module must export default/createLayer/mount or layer hooks');
+}
+
+function buildSnapshotManifestLayers(manifest) {
+    const rawLayers = Array.isArray(manifest?.layers) ? manifest.layers : [];
+    return rawLayers.map((entry, index) => ({
+        id: entry?.id || entry?.name || `layer_${index}`,
+        name: entry?.name || entry?.id || `layer_${index}`,
+        entryPath: entry?.entry || entry?.path || 'main.js',
+        source: 'project',
+        enabled: entry?.enabled !== false,
+    }));
+}
+
+function buildSnapshotInlineLayers(runtimeScene) {
+    const rawLayers = Array.isArray(runtimeScene?.layers) ? runtimeScene.layers : [];
+    return rawLayers
+        .filter(entry => entry?.source === 'inline' && entry?.entry)
+        .map((entry, index) => ({
+            id: entry.id || entry.name || `inline_${index}`,
+            name: entry.name || entry.id || `inline_${index}`,
+            entryPath: entry.entry,
+            source: 'inline',
+            enabled: entry.active !== false,
+        }));
+}
+
 async function bindLayerProject(root, meta, layerManager) {
-    requireExtraction('bindLayerProject', 'index.html:12213-12267 (tryReplaySnapshotLayerModules)');
+    let manifest = null;
+    let baseUrl = new URL('./', new URL(`${root}/`, location.href));
+    let allLayers = [];
+
+    try {
+        const manifestUrl = new URL('./project.maxjs.json', baseUrl);
+        const response = await fetch(manifestUrl, { cache: 'no-store' });
+        if (response.ok) {
+            manifest = await response.json();
+            baseUrl = new URL('./', manifestUrl);
+            allLayers = buildSnapshotManifestLayers(manifest);
+        }
+    } catch {
+        manifest = null;
+    }
+
+    if (allLayers.length === 0) {
+        allLayers = buildSnapshotInlineLayers(meta.runtimeScene);
+    }
+    if (allLayers.length === 0) return { mounted: 0, manifest };
+
+    const mountedIds = [];
+    try {
+        for (const entry of allLayers) {
+            const entryPath = String(entry.entryPath || entry.entry || entry.path || '').replace(/\\/g, '/');
+            if (!entryPath) throw new Error(`Missing layer entry path for ${entry.id}`);
+            const moduleUrl = new URL(entryPath, baseUrl);
+            moduleUrl.searchParams.set('v', `${Date.now()}_${entry.id}`);
+            const moduleNamespace = await import(moduleUrl.toString());
+            const factory = resolveSnapshotLayerFactory(moduleNamespace);
+            const result = await layerManager.mount(
+                entry.id,
+                async (ctx, THREE_arg) => factory(ctx, THREE_arg, { manifest, layer: entry }),
+                {
+                    name: entry.name || entry.id,
+                    code: moduleUrl.toString(),
+                    source: entry.source || 'project',
+                    entry: entry.entryPath,
+                },
+            );
+            if (result?.error) throw new Error(result.error);
+            mountedIds.push(entry.id);
+        }
+        return { mounted: mountedIds.length, manifest };
+    } catch (error) {
+        console.warn('[snapshot_boot] layer module replay failed', error);
+        for (const id of mountedIds) {
+            try { layerManager.remove(id); } catch {}
+        }
+        return { mounted: 0, manifest, error };
+    }
 }
 
 // ─── Phase 10: render loop ────────────────────────────────────────────
@@ -226,8 +401,14 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
     const renderer = await createRenderer(canvas, features);
 
     // Phase 3: scene
-    const sceneCtx = createScene(meta);
-    const { scene, camera, controls, maxRoot, jsRoot, overlayRoot } = sceneCtx;
+    const sceneCtx = createScene({ meta, renderer, canvas });
+    const { scene, camera, controls, maxBasisRoot, maxRoot, jsRoot, overlayRoot, defaultLights, resize } = sceneCtx;
+
+    // Wire window resize → renderer + camera. Custom-site embedders that
+    // host the canvas in a non-fullscreen context can call resize(w, h)
+    // directly via the returned player handle.
+    const onResize = () => resize(innerWidth, innerHeight);
+    addEventListener('resize', onResize);
 
     // Maps populated by the applier in phase 6, consumed by layer manager and animation.
     const nodeMap = new Map();
@@ -302,12 +483,14 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
 
     return {
         renderer, scene, camera, controls, layerManager,
+        maxBasisRoot, maxRoot, jsRoot, overlayRoot, defaultLights,
         animationSystem, maxTimeline,
+        resize,
         applyDelta: (newBuffer) => applyDelta(newBuffer, { scene, meta, nodeMap, lightHandleMap, maxRoot }),
         dispose() {
             try { stopLoop(); } catch {}
+            try { removeEventListener('resize', onResize); } catch {}
             try { renderer?.dispose?.(); } catch {}
-            try { renderer?.domElement?.remove?.(); } catch {}
         },
     };
 }

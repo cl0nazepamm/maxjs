@@ -44,7 +44,7 @@
 //               7 fx/studio/bake (warns), 8 runtimeScene (warns),
 //               TSL / MaterialX / VRay / OpenPBR / Toon material types
 //               (degrade to MeshStandardMaterial), instance buckets,
-//               vertex colors, env/HDRI/sky/fog, splats/audio/gltf.
+//               vertex colors, fog, splats/audio/gltf.
 //
 // What WORKS today: snapshots with Max-authored meshes render with PBR
 // materials — color, roughness, metalness, opacity, emissive, plus the
@@ -54,11 +54,10 @@
 // Skinned meshes assemble (Skeleton + bind pose). Animations tick.
 //
 // What's MISSING (visible regressions vs. live mode): TSL / MaterialX /
-// VRay / OpenPBR materials (degrade to MeshStandardMaterial), HDRI/sky
-// environment, post-FX, splats, audio playback, instance bucket merging,
-// vertex colors.
+// VRay / OpenPBR materials (degrade to MeshStandardMaterial), post-FX,
+// splats, audio playback, instance bucket merging, vertex colors.
 
-import * as THREE from 'three/webgpu';
+import * as THREE from 'three';
 
 import { createLayerManager } from './layer_manager.js';
 import { createMaxJSAnimationSystem } from './maxjs_animation.js';
@@ -70,7 +69,7 @@ import {
 } from './scene_init.js';
 import { applySceneBin } from './scene_applier.js';
 import { createSceneLights } from './scene_lights.js';
-import { createSky } from './scene_sky.js';
+import { createSnapshotEnvironment } from './snapshot_environment.js';
 import { createMaterialBuilder } from './material_builder.js';
 import { copyMaxArrayToWorld } from './max_basis.js';
 import { geometryFromNodeBinary } from './scene_binary.js';
@@ -111,18 +110,13 @@ function noteExtractionDeferred(name, sourceLocation, detail = '') {
 // predate runtimeFeatures keep working. The exporter will populate this
 // block in a later session and the wrapper will tighten its imports.
 //
-// renderer_pref comes from whatever backend the live maxjs viewer was
-// using when the user exported. Lives at meta.snapshotUi.rendererBackend
-// (or .backend on older payloads). When the field is absent, default
-// to whatever the live editor defaults to (WebGPU).
+// Standalone snapshots are deployed as WebGL-first pages. Do not inherit
+// the live editor's backend here: a WebGPU panel inside Max and a public
+// WebGL snapshot are separate targets with different browser coverage and
+// material/texture behavior.
 function detectFeaturesLegacy(meta) {
-    const savedBackend = String(
-        meta?.snapshotUi?.rendererBackend
-        ?? meta?.snapshotUi?.backend
-        ?? '',
-    ).toLowerCase();
     return Object.freeze({
-        renderer_pref: savedBackend.includes('webgl') ? 'webgl' : 'webgpu',
+        renderer_pref: 'webgl',
         post_fx: ['ssgi'], // index.html always wires ssgiFx today
         audio: true,
         splats: true,
@@ -130,6 +124,7 @@ function detectFeaturesLegacy(meta) {
         volumes: true,
         physics: true,
         three_addons: ['OrbitControls'],
+        environment: true,
     });
 }
 
@@ -137,12 +132,18 @@ function normalizeRuntimeFeatures(meta) {
     const raw = meta?.runtimeFeatures && typeof meta.runtimeFeatures === 'object'
         ? meta.runtimeFeatures
         : detectFeaturesLegacy(meta);
-    const rendererPref = String(raw.renderer_pref ?? raw.rendererBackend ?? '').toLowerCase();
+    const rendererPref = normalizeRendererBackend(
+        raw.renderer_pref
+        ?? raw.rendererPref
+        ?? raw.rendererBackend
+        ?? raw.backend
+        ?? 'webgl',
+    );
     const arrayOrEmpty = (value) => Array.isArray(value) ? value.slice() : [];
 
     return Object.freeze({
         ...raw,
-        renderer_pref: rendererPref.includes('webgl') ? 'webgl' : 'webgpu',
+        renderer_pref: rendererPref,
         post_fx: arrayOrEmpty(raw.post_fx),
         three_addons: arrayOrEmpty(raw.three_addons),
         audio: !!raw.audio,
@@ -152,9 +153,72 @@ function normalizeRuntimeFeatures(meta) {
         physics: !!raw.physics,
         gltf: !!(raw.gltf ?? raw.gltfs),
         animations: !!raw.animations,
+        environment: !!(raw.environment ?? raw.hdri ?? raw.sky),
+        binary_instances: !!(raw.binary_instances ?? raw.binaryInstances),
         exports: raw.exports && typeof raw.exports === 'object' ? raw.exports : {},
         counts: raw.counts && typeof raw.counts === 'object' ? raw.counts : {},
     });
+}
+
+function normalizeRendererBackend(value) {
+    const raw = String(value || '').toLowerCase();
+    if (raw.includes('webgpu')) return 'webgpu';
+    return 'webgl';
+}
+
+function isKnownWebglPrecisionProgramLog(value) {
+    const lines = String(value || '')
+        .split(/\r?\n/)
+        .map(line => line.trim())
+        .filter(Boolean);
+    return lines.length > 0 && lines.every(line =>
+        line.includes('warning X4122:') &&
+        line.toLowerCase().includes('double precision'));
+}
+
+function installThreeConsoleFilter({ debug = false } = {}) {
+    if (debug ||
+        typeof THREE.setConsoleFunction !== 'function' ||
+        typeof THREE.getConsoleFunction !== 'function') {
+        return () => {};
+    }
+
+    const previous = THREE.getConsoleFunction();
+    const filter = (type, message, ...params) => {
+        const detail = params
+            .map(value => String(value ?? ''))
+            .join('\n')
+            .replace(/\u0000/g, '')
+            .trim();
+        if (type === 'warn' &&
+            message === 'THREE.WebGLProgram: Program Info Log:' &&
+            isKnownWebglPrecisionProgramLog(detail)) {
+            return;
+        }
+
+        if (typeof previous === 'function') {
+            previous(type, message, ...params);
+            return;
+        }
+
+        const fn = console[type] || console.log;
+        fn.call(console, message, ...params);
+    };
+
+    THREE.setConsoleFunction(filter);
+    return () => {
+        if (THREE.getConsoleFunction() === filter) {
+            THREE.setConsoleFunction(previous);
+        }
+    };
+}
+
+function countVisibleLightPayload(lightsData) {
+    if (!Array.isArray(lightsData)) return 0;
+    return lightsData.reduce((count, light) => {
+        if (!light || light.type < 0 || light.type > 5) return count;
+        return light.v === false || light.v === 0 ? count : count + 1;
+    }, 0);
 }
 
 // ─── Phase 1: metadata ─────────────────────────────────────────────────
@@ -197,10 +261,10 @@ function resolveSnapshotMaterialRefs(meta) {
 }
 
 // ─── Phase 2: renderer ─────────────────────────────────────────────────
-// Slim WebGPU > WebGL2 picker with forceWebGL fallback. Lives in
-// js/scene_init.js. Pref source: runtimeFeatures.renderer_pref ('webgpu' default).
+// WebGL2 snapshot renderer. WebGPU is a separate explicit target, not a
+// transparent fallback, because backend switching changes material behavior.
 async function createRenderer(canvas, features) {
-    const backend = features?.renderer_pref === 'webgl' ? 'webgl' : 'webgpu';
+    const backend = normalizeRendererBackend(features?.renderer_pref);
     const { renderer, backendLabel } = await createRendererImpl(canvas, { backend });
     renderer.userData ??= {};
     renderer.userData.maxjsBackendLabel = backendLabel;
@@ -296,11 +360,14 @@ async function applyDelta(buffer, ctx) {
             nodeMap: ctx.nodeMap,
             maxRoot: ctx.maxRoot,
             scene: ctx.scene,
+            forestMeshes: ctx.forestMeshes,
             lastInstanceBucketSignature: '',
         },
         hooks: {
             materialBuilder: ({ nd, geom, wantsLine }) =>
                 ctx.materialBuilder.buildForNode({ nd, geom, wantsLine }),
+            instanceMaterialBuilder: ({ grp, geom }) =>
+                ctx.materialBuilder.buildForNode({ nd: grp, geom, wantsLine: false }),
             materialUpdater: ({ mesh, nd, wantsLine }) => {
                 if (!ctx.materialBuilder.shouldUpdate({ mesh, nd })) return false;
                 const next = ctx.materialBuilder.buildForNode({ nd, geom: mesh.geometry, wantsLine });
@@ -333,25 +400,82 @@ async function applyDelta(buffer, ctx) {
     });
 }
 
-// ─── Phase 7: snapshotUi ───────────────────────────────────────────────
-// Stage 2 partial. Honors the simple, side-effect-free fields here:
-//   - tone mapping & exposure on the renderer
-//   - background color on the scene
-//   - basic camera position/target if present
-// The complex bits (postfx state restore, studio lighting, bake state)
-// require their corresponding modules to land first; they are flagged via
-// noteExtractionDeferred and skipped.
-function applySnapshotUi(snapshotUi, ctx) {
-    const { renderer, scene, camera, controls } = ctx;
+const SNAPSHOT_TONE_MAPPING_MODES = Object.freeze({
+    None: THREE.NoToneMapping,
+    NoToneMapping: THREE.NoToneMapping,
+    Linear: THREE.LinearToneMapping,
+    LinearToneMapping: THREE.LinearToneMapping,
+    Reinhard: THREE.ReinhardToneMapping,
+    ReinhardToneMapping: THREE.ReinhardToneMapping,
+    Cineon: THREE.CineonToneMapping,
+    CineonToneMapping: THREE.CineonToneMapping,
+    AgX: THREE.AgXToneMapping,
+    AgXToneMapping: THREE.AgXToneMapping,
+    Neutral: THREE.NeutralToneMapping,
+    NeutralToneMapping: THREE.NeutralToneMapping,
+});
 
-    // Tone mapping
-    const tm = snapshotUi.toneMapping;
-    if (tm && THREE[tm.type] != null) {
-        renderer.toneMapping = THREE[tm.type];
+function resolveSnapshotToneMapping(value) {
+    if (Number.isFinite(value)) return value;
+    const raw = typeof value === 'string' ? value : value?.type;
+    if (!raw) return null;
+    if (SNAPSHOT_TONE_MAPPING_MODES[raw] != null) return SNAPSHOT_TONE_MAPPING_MODES[raw];
+    const canonical = raw.endsWith('ToneMapping') ? raw : `${raw}ToneMapping`;
+    return THREE[canonical] ?? null;
+}
+
+function getSnapshotCoreBrightness(snapshotUi) {
+    const candidates = [
+        snapshotUi?.fx?.colorGrading?.brightness,
+        snapshotUi?.postFx?.colorGrading?.brightness,
+        snapshotUi?.postFx?.brightness,
+        snapshotUi?.brightness,
+    ];
+    for (const value of candidates) {
+        const n = Number(value);
+        if (Number.isFinite(n)) return n;
     }
+    return null;
+}
+
+function applySnapshotCoreLook(snapshotUi, { renderer } = {}) {
+    if (!snapshotUi || !renderer) return;
+
+    const toneMapping = resolveSnapshotToneMapping(snapshotUi.toneMapping);
+    if (toneMapping != null) renderer.toneMapping = toneMapping;
     if (Number.isFinite(snapshotUi.exposure)) {
         renderer.toneMappingExposure = snapshotUi.exposure;
     }
+
+    const brightness = getSnapshotCoreBrightness(snapshotUi);
+    const canvas = renderer.domElement;
+    if (canvas?.style && Number.isFinite(brightness)) {
+        const amount = Math.max(0, 1 + brightness);
+        canvas.style.filter = Math.abs(amount - 1) > 1.0e-6
+            ? `brightness(${amount})`
+            : '';
+    }
+
+    renderer.userData ??= {};
+    renderer.userData.maxjsSnapshotCoreLook = {
+        toneMapping: snapshotUi.toneMapping ?? null,
+        exposure: Number.isFinite(snapshotUi.exposure) ? snapshotUi.exposure : null,
+        brightness,
+    };
+}
+
+// ─── Phase 7: snapshotUi ───────────────────────────────────────────────
+// Honors the export-critical fields here:
+//   - tone mapping, exposure, and brightness on the renderer/canvas
+//   - background color on the scene
+//   - basic camera position/target if present
+// Bake overrides are consumed by material_builder during scene.bin apply.
+// The deeper post stack and studio lighting are still intentionally out of
+// the lightweight snapshot boot path.
+function applySnapshotUi(snapshotUi, ctx) {
+    const { renderer, scene, camera, controls } = ctx;
+
+    applySnapshotCoreLook(snapshotUi, { renderer });
 
     // Background — accept hex int or [r,g,b]
     const bg = snapshotUi.background;
@@ -378,11 +502,11 @@ function applySnapshotUi(snapshotUi, ctx) {
     }
 
     // Defer the rest.
-    if (snapshotUi.fx || snapshotUi.studio || snapshotUi.bake) {
+    if (snapshotUi.studio) {
         noteExtractionDeferred(
-            'applySnapshotUi (full)',
-            'index.html applySavedPostFxPayload / applyStudioState / applyBakeState',
-            '(simple tone-map/exposure/bg/camera applied; postfx/studio/bake skipped)',
+            'applySnapshotUi (studio)',
+            'index.html applyStudioState',
+            '(core look and bake overrides applied; studio lighting skipped)',
         );
     }
 }
@@ -588,10 +712,13 @@ async function bindLayerProject(root, meta, layerManager) {
 
 // ─── Phase 10: render loop ────────────────────────────────────────────
 function startRenderLoop({ renderer, scene, camera, controls, layerManager, animationSystem, ssgiFx, optionalModules }) {
-    const inlineClock = new THREE.Clock();
+    let lastTimeMs = performance.now();
+    let elapsed = 0;
     const loop = () => {
-        const dt = inlineClock.getDelta();
-        const elapsed = inlineClock.getElapsedTime();
+        const nowMs = performance.now();
+        const dt = Math.min(0.25, Math.max(0, (nowMs - lastTimeMs) / 1000));
+        lastTimeMs = nowMs;
+        elapsed += dt;
         if (controls) controls.update();
         layerManager?.update?.(dt, elapsed);
         animationSystem?.update?.(dt);
@@ -618,12 +745,16 @@ function startRenderLoop({ renderer, scene, camera, controls, layerManager, anim
 // ─── boot() ───────────────────────────────────────────────────────────
 export async function boot({ root = '.', canvas, options = {} } = {}) {
     if (!canvas) throw new Error('boot(): canvas is required');
+    const restoreThreeConsole = installThreeConsoleFilter({ debug: !!options.debug });
 
     // Phase 1: meta
     const meta = await loadMeta(root);
+    const normalizedFeatures = normalizeRuntimeFeatures(meta);
     const features = {
-        ...normalizeRuntimeFeatures(meta),
-        ...(options.rendererBackend ? { renderer_pref: options.rendererBackend } : {}),
+        ...normalizedFeatures,
+        renderer_pref: options.rendererBackend != null
+            ? normalizeRendererBackend(options.rendererBackend)
+            : normalizedFeatures.renderer_pref,
     };
 
     // Phase 2: renderer
@@ -660,8 +791,20 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
     // Lights — bound here so phase 7 / phase 6 hooks can both reach in.
     const sceneLights = createSceneLights({ scene, parent: maxRoot, lightHandleMap });
 
-    // Material builder — owns the per-snapshot texture cache.
-    const materialBuilder = createMaterialBuilder({ rootUrl: root });
+    // Material builder — owns the per-snapshot texture cache and applies
+    // export-time bake overrides before meshes enter the scene.
+    const materialBuilder = createMaterialBuilder({
+        rootUrl: root,
+        bakeState: meta.snapshotUi?.bake,
+    });
+
+    // Authored environment/HDRI from snapshot.json. This stays separate
+    // from inlines: script-authored sky belongs to the layer runtime.
+    const snapshotEnvironment = createSnapshotEnvironment({ scene, renderer, rootUrl: root });
+    let authoredLightCount = 0;
+    const syncDefaultLights = () => {
+        defaultLights.visible = authoredLightCount === 0 && !snapshotEnvironment.isLightingActive();
+    };
 
     // Phase 4: layer manager
     const layerManager = buildLayerManager({
@@ -693,11 +836,15 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
     const applierCtx = {
         scene, meta, nodeMap, lightHandleMap, maxRoot,
         layerManager, animationSystem, materialBuilder,
+        forestMeshes: new Map(),
     };
     await applyDelta(buffer, applierCtx);
 
-    // Lights from snapshot.json (Stage 4).
-    const lightsResult = sceneLights.apply(meta.lights);
+    // Lights from snapshot.json (Stage 4). Default lights remain visible
+    // only when there are neither authored lights nor authored environment.
+    sceneLights.apply(meta.lights);
+    authoredLightCount = countVisibleLightPayload(meta.lights);
+    syncDefaultLights();
 
     // Phase 7a: snapshotUi (postfx state, tone-map, exposure, bg)
     if (meta.snapshotUi) {
@@ -707,19 +854,15 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
         });
     }
 
-    // Phase 7d: sky environment.
-    // Always apply — the procedural Sky shader is cheap, gives the scene an
-    // outdoor backdrop + warm sun + hemisphere fill, and is closer to what
-    // the live viewer shows than a flat #353535. Authored params land at
-    // meta.env.sky once the exporter writes them; until then we fall through
-    // to SNAPSHOT_DEFAULT_SKY in scene_sky.js.
-    //
-    // When the sky is on, the Max-authored lights still apply, but we hide
-    // the (always-default-off) defaultLights group regardless. The sky's
-    // own sun + hemisphere are what we want for the empty-scene case.
-    const sky = createSky({ scene, renderer });
-    sky.apply(meta.env?.sky);
-    defaultLights.visible = false;
+    // Phase 7d: authored environment / HDRI.
+    // Explicit only: no default sky is synthesized here.
+    await snapshotEnvironment.apply(meta.env, meta.snapshotUi);
+    // HDRI import can author renderer exposure; snapshot UI is the final
+    // artist look and must win for exported pages.
+    if (meta.snapshotUi) {
+        applySnapshotCoreLook(meta.snapshotUi, { renderer });
+    }
+    syncDefaultLights();
 
     // Phase 7b: top-level camera state. Lives at meta.camera independently
     // of snapshotUi (which is gated by the "Viewer UI State" export toggle
@@ -791,21 +934,46 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
         nodeMap, lightHandleMap,
         maxBasisRoot, maxRoot, jsRoot, overlayRoot, defaultLights,
         sceneLights,
+        environment: snapshotEnvironment,
         animationSystem, maxTimeline,
         resize,
         applyDelta: (newBuffer) => applyDelta(newBuffer, applierCtx),
         applyLights: (lightsData) => {
             const r = sceneLights.apply(lightsData);
-            defaultLights.visible = r.count === 0;
+            authoredLightCount = countVisibleLightPayload(lightsData);
+            syncDefaultLights();
             return r;
         },
+        setEnvironmentEnabled: (enabled) => {
+            const state = snapshotEnvironment.setEnabled(enabled);
+            syncDefaultLights();
+            return state;
+        },
+        setEnvironmentVisible: (enabled) => {
+            const state = snapshotEnvironment.setEnabled(enabled);
+            syncDefaultLights();
+            return state;
+        },
+        setEnvironmentBackgroundVisible: (visible) =>
+            snapshotEnvironment.setBackgroundVisible(visible),
         dispose() {
             try { stopLoop(); } catch {}
             try { removeEventListener('resize', onResize); } catch {}
             try { resizeObserver?.disconnect?.(); } catch {}
+            try { snapshotEnvironment.dispose(); } catch {}
             try { sceneLights.dispose(); } catch {}
+            try {
+                for (const mesh of applierCtx.forestMeshes.values()) {
+                    mesh.parent?.remove(mesh);
+                    mesh.geometry?.dispose?.();
+                    if (Array.isArray(mesh.material)) mesh.material.forEach((m) => m?.dispose?.());
+                    else mesh.material?.dispose?.();
+                }
+                applierCtx.forestMeshes.clear();
+            } catch {}
             try { materialBuilder.dispose(); } catch {}
             try { renderer?.dispose?.(); } catch {}
+            try { restoreThreeConsole(); } catch {}
         },
     };
 }

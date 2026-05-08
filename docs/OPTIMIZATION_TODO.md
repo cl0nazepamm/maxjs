@@ -378,3 +378,20 @@ Ship this next:
 4. geometry dedup
 
 That is the highest ROI set for the next visible leap.
+
+## Snapshot Beauty Flatten Pass
+
+Later snapshot export work should make beauty mode an actual export flattening step, not only a runtime material override.
+
+Current behavior:
+
+- beauty mode swaps the live/runtime material in memory to a clean beauty-map material when the bake texture is available
+- snapshot export still serializes the original Max material/map payloads and stores bake override state separately
+- asset rewriting only rebases URLs it can see during export, so raw local bake folders need explicit copy/rebase handling before a snapshot can be considered portable
+
+Goal for the snapshot improvement pass:
+
+- when exporting with beauty mode enabled, rewrite exported materials to beauty-only payloads
+- copy/rebase the required beauty textures into the snapshot output
+- omit or avoid shipping the original heavy material maps/lightmaps when they are replaced by beauty output
+- keep live mode and standalone snapshot replay visually matched

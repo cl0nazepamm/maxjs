@@ -2057,26 +2057,84 @@ static void ExtractUberBitmapTransform(Texmap* map, MaxJSPBR::TexTransform& xf, 
     xf.manualGamma = FindPBFloat(map, _T("ManualGamma"), 1.0f);
 }
 
-static void ExtractStdUVTransform(Texmap* map, MaxJSPBR::TexTransform& xf) {
-    if (!map) return;
+static bool TexTransformHasUvData(const MaxJSPBR::TexTransform& xf) {
+    return xf.uvChannel != 1 ||
+           std::fabs(xf.scale - 1.0f) > 1.0e-6f ||
+           std::fabs(xf.tiling[0] - 1.0f) > 1.0e-6f ||
+           std::fabs(xf.tiling[1] - 1.0f) > 1.0e-6f ||
+           std::fabs(xf.offset[0]) > 1.0e-6f ||
+           std::fabs(xf.offset[1]) > 1.0e-6f ||
+           std::fabs(xf.rotate) > 1.0e-6f ||
+           std::fabs(xf.center[0] - 0.5f) > 1.0e-6f ||
+           std::fabs(xf.center[1] - 0.5f) > 1.0e-6f ||
+           xf.realWorld ||
+           (!xf.wrapMode.empty() && xf.wrapMode != L"periodic");
+}
+
+static void CopyUvTransform(MaxJSPBR::TexTransform& dst, const MaxJSPBR::TexTransform& src) {
+    dst.scale = src.scale;
+    dst.tiling[0] = src.tiling[0];
+    dst.tiling[1] = src.tiling[1];
+    dst.offset[0] = src.offset[0];
+    dst.offset[1] = src.offset[1];
+    dst.rotate = src.rotate;
+    dst.center[0] = src.center[0];
+    dst.center[1] = src.center[1];
+    dst.realWorld = src.realWorld;
+    dst.realWidth = src.realWidth;
+    dst.realHeight = src.realHeight;
+    dst.wrapMode = src.wrapMode;
+    dst.uvChannel = src.uvChannel;
+}
+
+static StdUVGen* GetStdUVGenForTexmap(Texmap* map) {
+    if (!map) return nullptr;
+
+    // Standard BitmapTex exposes its UV generator on BitmapTex::GetUVGen().
+    // Some BitmapTex instances do not return it through Texmap::GetTheUVGen().
+    if (map->ClassID() == Class_ID(BMTEX_CLASS_ID, 0)) {
+        auto* bitmapTex = static_cast<BitmapTex*>(map);
+        if (StdUVGen* uv = bitmapTex->GetUVGen())
+            return uv;
+    }
 
     UVGen* uvGen = map->GetTheUVGen();
-    if (uvGen && uvGen->IsStdUVGen()) {
-        auto* stdUv = static_cast<StdUVGen*>(uvGen);
-        xf.tiling[0] = stdUv->GetUScl(0);
-        xf.tiling[1] = stdUv->GetVScl(0);
-        xf.offset[0] = stdUv->GetUOffs(0);
-        xf.offset[1] = stdUv->GetVOffs(0);
-        xf.rotate = stdUv->GetWAng(0) * (180.0f / PI);
-        xf.uvChannel = std::max(1, stdUv->GetMapChannel());
+    if (uvGen && uvGen->IsStdUVGen())
+        return static_cast<StdUVGen*>(uvGen);
 
-        const int tilingFlags = stdUv->GetTextureTiling();
-        if ((tilingFlags & (U_MIRROR | V_MIRROR)) != 0) {
-            xf.wrapMode = L"mirror";
-        } else if ((tilingFlags & (U_WRAP | V_WRAP)) != (U_WRAP | V_WRAP)) {
-            xf.wrapMode = L"clamp";
-        }
+    return nullptr;
+}
+
+static bool ExtractStdUVTransform(Texmap* map, MaxJSPBR::TexTransform& xf) {
+    StdUVGen* stdUv = GetStdUVGenForTexmap(map);
+    if (!stdUv) return false;
+
+    const TimeValue t = GetCOREInterface() ? GetCOREInterface()->GetTime() : 0;
+    const bool useRealWorldScale = stdUv->GetUseRealWorldScale() != FALSE;
+    const float uScale = stdUv->GetUScl(t);
+    const float vScale = stdUv->GetVScl(t);
+    if (useRealWorldScale) {
+        xf.realWorld = true;
+        xf.realWidth = std::fabs(uScale) > 1.0e-6f ? std::fabs(uScale) : 1.0f;
+        xf.realHeight = std::fabs(vScale) > 1.0e-6f ? std::fabs(vScale) : 1.0f;
+        xf.tiling[0] = 1.0f;
+        xf.tiling[1] = 1.0f;
+    } else {
+        xf.tiling[0] = uScale;
+        xf.tiling[1] = vScale;
     }
+    xf.offset[0] = stdUv->GetUOffs(t);
+    xf.offset[1] = stdUv->GetVOffs(t);
+    xf.rotate = stdUv->GetWAng(t) * (180.0f / PI);
+    xf.uvChannel = std::max(1, stdUv->GetMapChannel());
+
+    const int tilingFlags = stdUv->GetTextureTiling();
+    if ((tilingFlags & (U_MIRROR | V_MIRROR)) != 0) {
+        xf.wrapMode = L"mirror";
+    } else if ((tilingFlags & (U_WRAP | V_WRAP)) != (U_WRAP | V_WRAP)) {
+        xf.wrapMode = L"clamp";
+    }
+    return true;
 }
 
 // ── Procedural Map Baking ──────────────────────────────────
@@ -2313,7 +2371,9 @@ static bool ExtractMaterialTexture(Texmap* map, std::wstring& filePath, MaxJSPBR
         if (resolved != map && IsAutodeskUberBitmap(map)) {
             ExtractUberBitmapTransform(map, xf, outputChannelIndex);
         } else {
-            ExtractStdUVTransform(map, xf);
+            const bool gotOuterTransform = ExtractStdUVTransform(map, xf) && TexTransformHasUvData(xf);
+            if (!gotOuterTransform && resolved != map)
+                ExtractStdUVTransform(resolved, xf);
         }
         xf.htmlWidth  = pb->GetInt(phtml_tex_width,  0);
         xf.htmlHeight = pb->GetInt(phtml_tex_height, 0);
@@ -2338,6 +2398,7 @@ static bool ExtractMaterialTexture(Texmap* map, std::wstring& filePath, MaxJSPBR
             return false;
 
         filePath = filename;
+        xf = {};
         ExtractUberBitmapTransform(resolved, xf, outputChannelIndex);
         return true;
     }
@@ -2349,6 +2410,15 @@ static bool ExtractMaterialTexture(Texmap* map, std::wstring& filePath, MaxJSPBR
         filePath = filename;
         xf = {};
         ExtractStdUVTransform(resolved, xf);
+        if (resolved != map) {
+            if (IsAutodeskUberBitmap(map)) {
+                ExtractUberBitmapTransform(map, xf, outputChannelIndex);
+            } else {
+                MaxJSPBR::TexTransform outerXf;
+                if (ExtractStdUVTransform(map, outerXf) && TexTransformHasUvData(outerXf))
+                    CopyUvTransform(xf, outerXf);
+            }
+        }
         xf.hasChannelSelect = outputChannelIndex != 1;
         xf.outputChannelIndex = outputChannelIndex;
         return true;
@@ -2413,6 +2483,15 @@ static bool ExtractMaterialTexture(Texmap* map, std::wstring& filePath, MaxJSPBR
         filePath = filename;
         xf = {};
         ExtractStdUVTransform(resolved, xf);
+        if (resolved != map) {
+            if (IsAutodeskUberBitmap(map)) {
+                ExtractUberBitmapTransform(map, xf, outputChannelIndex);
+            } else {
+                MaxJSPBR::TexTransform outerXf;
+                if (ExtractStdUVTransform(map, outerXf) && TexTransformHasUvData(outerXf))
+                    CopyUvTransform(xf, outerXf);
+            }
+        }
         xf.hasChannelSelect = outputChannelIndex != 1;
         xf.outputChannelIndex = outputChannelIndex;
         xf.colorSpace = FindPBString(resolved, _T("color_space"));
@@ -2431,6 +2510,9 @@ static bool ExtractMaterialTexture(Texmap* map, std::wstring& filePath, MaxJSPBR
         if (!fn || !fn[0]) return false;
         filePath = fn;
         xf = {};
+        const bool gotOuterTransform = ExtractStdUVTransform(map, xf) && TexTransformHasUvData(xf);
+        if (!gotOuterTransform && resolved != map)
+            ExtractStdUVTransform(resolved, xf);
         xf.isVideo = true;
         xf.videoLoop = vpb->GetInt(pvid_loop, 0) != 0;
         xf.videoMuted = vpb->GetInt(pvid_muted, 0) != 0;
@@ -5387,20 +5469,85 @@ static Modifier* FindModifierOnNode(INode* node, Class_ID cid) {
     return proc.mod;
 }
 
-// Returns stack index of first modifier matching cid on the node's pipeline, or -1.
-static int FindModifierStackIndexOnNode(INode* node, Class_ID cid) {
-    if (!node) return -1;
+struct ModifierStackMatch {
+    Modifier* mod = nullptr;
+    int topToBottomIndex = -1;
+    int derivedDepth = -1;
+    int localIndex = -1;
+};
+
+static bool IsDerivedObjectForStackWalk(Object* obj) {
+    return obj &&
+           (obj->ClassID() == derivObjClassID ||
+            obj->ClassID() == WSMDerivObjClassID ||
+            obj->SuperClassID() == GEN_DERIVOB_CLASS_ID);
+}
+
+// Walks the object-space modifier stack from top to bottom. In 3ds Max's
+// IDerivedObject contract, index 0 is the top/end of the pipeline and
+// NumModifiers()-1 is lower/earlier in evaluation.
+static bool FindModifierStackMatchOnNode(INode* node, Class_ID cid, ModifierStackMatch& out) {
+    out = ModifierStackMatch();
+    if (!node) return false;
     Object* cur = node->GetObjectRef();
-    while (cur && (cur->ClassID() == derivObjClassID || cur->ClassID() == WSMDerivObjClassID)) {
+    int linearIndex = 0;
+    int derivedDepth = 0;
+    while (IsDerivedObjectForStackWalk(cur)) {
         IDerivedObject* d = static_cast<IDerivedObject*>(cur);
         for (int i = 0; i < d->NumModifiers(); ++i) {
             Modifier* m = d->GetModifier(i);
-            if (m && m->ClassID() == cid)
-                return i;
+            if (m && m->ClassID() == cid) {
+                out.mod = m;
+                out.topToBottomIndex = linearIndex;
+                out.derivedDepth = derivedDepth;
+                out.localIndex = i;
+                return true;
+            }
+            linearIndex++;
         }
         cur = d->GetObjRef();
+        derivedDepth++;
     }
-    return -1;
+    return false;
+}
+
+// Returns local index of the first modifier matching cid in the matching
+// derived object, or -1. Kept for older call sites/debugging.
+static int FindModifierStackIndexOnNode(INode* node, Class_ID cid) {
+    ModifierStackMatch match;
+    return FindModifierStackMatchOnNode(node, cid, match) ? match.localIndex : -1;
+}
+
+static bool ModifierEvaluatesBefore(const ModifierStackMatch& earlier,
+                                    const ModifierStackMatch& later) {
+    return earlier.topToBottomIndex >= 0 &&
+           later.topToBottomIndex >= 0 &&
+           earlier.topToBottomIndex > later.topToBottomIndex;
+}
+
+static void RestoreModifierEnabled(Modifier* mod, int wasEnabled) {
+    if (!mod) return;
+    if (wasEnabled) mod->EnableMod();
+    else mod->DisableMod();
+}
+
+static float ReadMorpherChannelInfluence(IMorpherChannel* channel, TimeValue t) {
+    if (!channel) return 0.0f;
+    float percent = static_cast<float>(channel->GetInitPercent());
+    if (Control* control = channel->GetControl()) {
+        Interval valid = FOREVER;
+        control->GetValue(t, &percent, valid, CTRL_ABSOLUTE);
+    }
+    if (!std::isfinite(percent)) percent = 0.0f;
+    return std::clamp(percent / 100.0f, -10.0f, 10.0f);
+}
+
+static float ReadMorpherPointWeight(IMorpherChannel* channel, int pointIndex) {
+    if (!channel || pointIndex < 0 || pointIndex >= channel->NumPoints()) return 1.0f;
+    float weight = static_cast<float>(channel->GetWeight(pointIndex));
+    if (!std::isfinite(weight)) return 1.0f;
+    if (std::fabs(weight) > 1.0f) weight /= 100.0f;
+    return std::clamp(weight, -10.0f, 10.0f);
 }
 
 static void Mat4IdentityCM(float o[16]) {
@@ -5416,8 +5563,10 @@ static bool SkinWeightPairGreater(const SkinWeightSortPair& a, const SkinWeightS
     return a.w > b.w;
 }
 
-// Fills skin + optional morph data for snapshot export. Replaces verts/uvs/norms with bind-pose
-// mesh (Skin disabled). Morpher must be applied before Skin (lower stack index than Skin).
+// Fills skin + optional morph data for snapshot export. Replaces verts/uvs/norms
+// with the pre-Skin bind mesh. If a Morpher evaluates before Skin, export its
+// channel deltas once and animate morphTargetInfluences separately; never bake
+// animated Morpher output into sampled geometry for this path.
 static bool TryExtractSkinRigData(
     INode* meshNode,
     TimeValue t,
@@ -5445,20 +5594,44 @@ static bool TryExtractSkinRigData(
     outMorphInfl.clear();
     outMorphDeltas.clear();
 
-    Modifier* skinMod = FindModifierOnNode(meshNode, SKIN_CLASSID);
-    if (!skinMod) return false;
+    ModifierStackMatch skinMatch;
+    if (!FindModifierStackMatchOnNode(meshNode, SKIN_CLASSID, skinMatch) || !skinMatch.mod) {
+        return false;
+    }
+    Modifier* skinMod = skinMatch.mod;
 
     ISkin* skin = static_cast<ISkin*>(skinMod->GetInterface(I_SKIN));
     if (!skin) return false;
 
-    // Disable Skin to get undeformed bind pose mesh.
+    ModifierStackMatch morphMatch;
+    Modifier* morphMod = nullptr;
+    IMorpher* morpher = nullptr;
+    if (FindModifierStackMatchOnNode(meshNode, MR3_CLASS_ID, morphMatch) &&
+        morphMatch.mod &&
+        morphMatch.mod->IsEnabled() &&
+        ModifierEvaluatesBefore(morphMatch, skinMatch)) {
+        IMorpher* maybeMorpher = static_cast<IMorpher*>(
+            morphMatch.mod->GetInterface(I_MORPHER_INTERFACE_ID));
+        if (maybeMorpher) {
+            morphMod = morphMatch.mod;
+            morpher = maybeMorpher;
+        }
+    }
+
+    // Disable Skin to get undeformed bind pose mesh. If a safe Morpher sits
+    // under Skin, disable it too so current channel weights do not pollute
+    // the exported base geometry.
     // controlIdx maps split render vertices back to control vertices for skin weight lookup.
+    const int skinWasEnabled = skinMod->IsEnabled();
+    const int morphWasEnabled = morphMod ? morphMod->IsEnabled() : 0;
     skinMod->DisableMod();
+    if (morphMod) morphMod->DisableMod();
     std::vector<float> bindVerts, bindUvs, bindNorms;
     std::vector<int> bindIdx, controlIdx;
     std::vector<MatGroup> bindGroups;
     const bool bindOk = ExtractMesh(meshNode, t, bindVerts, bindUvs, bindIdx, bindGroups, &bindNorms, &controlIdx);
-    skinMod->EnableMod();
+    if (morphMod) RestoreModifierEnabled(morphMod, morphWasEnabled);
+    RestoreModifierEnabled(skinMod, skinWasEnabled);
     if (!bindOk) return false;
 
     const int vCount = static_cast<int>(bindVerts.size() / 3);
@@ -5598,6 +5771,47 @@ static bool TryExtractSkinRigData(
                     outSkinW[static_cast<size_t>(vi) * 4u + static_cast<size_t>(k)] = 0.0f;
                 }
             }
+        }
+    }
+
+    if (morpher && morphMod) {
+        const int numChannels = morpher->NumChannels();
+        const int skinPointCount = skinData->GetNumPoints();
+        for (int channelId = 0; channelId < numChannels; ++channelId) {
+            IMorpherChannel* channel = morpher->GetChannel(channelId, false);
+            if (!channel || !channel->IsActive()) continue;
+            if (channel->IsProgressive()) continue;
+            const int morphPointCount = channel->NumPoints();
+            if (morphPointCount <= 0 || morphPointCount < skinPointCount) continue;
+
+            std::vector<float> deltas(static_cast<size_t>(vCount) * 3u, 0.0f);
+            bool anyDelta = false;
+            for (int vi = 0; vi < vCount; ++vi) {
+                const int ci = (vi < static_cast<int>(controlIdx.size())) ? controlIdx[vi] : vi;
+                if (ci < 0 || ci >= morphPointCount) continue;
+                Point3 delta = channel->GetDelta(ci);
+                delta *= ReadMorpherPointWeight(channel, ci);
+                const size_t off = static_cast<size_t>(vi) * 3u;
+                deltas[off + 0] = delta.x;
+                deltas[off + 1] = delta.y;
+                deltas[off + 2] = delta.z;
+                if (!anyDelta &&
+                    (std::fabs(delta.x) > 1.0e-7f ||
+                     std::fabs(delta.y) > 1.0e-7f ||
+                     std::fabs(delta.z) > 1.0e-7f)) {
+                    anyDelta = true;
+                }
+            }
+            if (!anyDelta) continue;
+
+            const TCHAR* rawName = channel->GetName(false);
+            std::wstring name = rawName && rawName[0]
+                ? std::wstring(rawName)
+                : (L"Morph " + std::to_wstring(channelId + 1));
+            outMorphNames.push_back(std::move(name));
+            outMorphChannelIds.push_back(channelId);
+            outMorphInfl.push_back(ReadMorpherChannelInfluence(channel, t));
+            outMorphDeltas.push_back(std::move(deltas));
         }
     }
 
@@ -6495,6 +6709,11 @@ struct ForestInstanceGroup {
     int instanceCount = 0;
     Mtl* mtl = nullptr;               // material for this group (may be multi-sub)
     INode* mtlNode = nullptr;         // node for wire color fallback
+    size_t vOff = 0, vN = 0;
+    size_t iOff = 0, iN = 0;
+    size_t uvOff = 0, uvN = 0;
+    size_t nOff = 0, nN = 0;
+    size_t xformOff = 0, xformN = 0;
 };
 
 // Register MaxJS as a Forest Pack render engine (once per session)
@@ -6990,6 +7209,8 @@ static bool ExtractTyFlowVolumes(INode* tyNode, TimeValue t,
 // ══════════════════════════════════════════════════════════════
 
 struct EnvData {
+    bool hasMap = false;
+    bool hasHdri = false;
     std::wstring hdriPath;
     float rotation = 0;
     float exposure = 0;
@@ -7091,8 +7312,10 @@ static int FindPBInt(Mtl* mtl, const MCHAR* name, int def) {
 }
 
 static void GetEnvironment(EnvData& env) {
+    env = EnvData{};
     Texmap* envMap = GetCOREInterface()->GetEnvironmentMap();
     if (!envMap) return;
+    env.hasMap = true;
 
     // Check if env map is ThreeJS Sky
     if (IsThreeJSSkyClassID(envMap->ClassID())) {
@@ -7116,6 +7339,7 @@ static void GetEnvironment(EnvData& env) {
         // Fallback: walk for any image file
         env.hdriPath = FindBitmapFile(envMap);
     }
+    env.hasHdri = !env.hdriPath.empty() && IsImageFile(env.hdriPath.c_str());
 
     // Read OSL HDRI Environment params
     env.rotation = FindPBFloat(envMap, _T("rotation"), 0);
@@ -7188,9 +7412,13 @@ static void WriteFogJson(std::wostringstream& ss, const FogData& fog) {
 // Helper: write full env JSON block (includes sky or HDRI data)
 static void WriteEnvJson(std::wostringstream& ss, const EnvData& env,
                          const std::wstring& hdriUrl = {}) {
+    const bool hasHdriUrl = !hdriUrl.empty();
+    const bool enabled = env.isSky || hasHdriUrl;
     ss << L"\"env\":{";
+    ss << L"\"enabled\":" << (enabled ? L"true" : L"false");
     if (env.isSky) {
-        ss << L"\"sky\":{";
+        ss << L",\"type\":\"sky\"";
+        ss << L",\"sky\":{";
         ss << L"\"turbidity\":" << env.skyTurbidity;
         ss << L",\"rayleigh\":" << env.skyRayleigh;
         ss << L",\"mieCoefficient\":" << env.skyMieCoeff;
@@ -7199,11 +7427,10 @@ static void WriteEnvJson(std::wostringstream& ss, const EnvData& env,
         ss << L",\"azimuth\":" << env.skyAzimuth;
         ss << L",\"exposure\":" << env.skyExposure;
         ss << L'}';
-    } else {
-        if (!hdriUrl.empty()) {
-            ss << L"\"hdri\":\"" << EscapeJson(hdriUrl.c_str()) << L"\",";
-        }
-        ss << L"\"rot\":";
+    } else if (hasHdriUrl) {
+        ss << L",\"type\":\"hdri\"";
+        ss << L",\"hdri\":\"" << EscapeJson(hdriUrl.c_str()) << L"\"";
+        ss << L",\"rot\":";
         WriteFloatValue(ss, env.rotation, 0.0f);
         ss << L",\"exp\":";
         WriteFloatValue(ss, env.exposure, 0.0f);
@@ -7211,6 +7438,8 @@ static void WriteEnvJson(std::wostringstream& ss, const EnvData& env,
         WriteFloatValue(ss, env.gamma, 1.0f);
         ss << L",\"zup\":" << env.zup;
         ss << L",\"flip\":" << env.flip;
+    } else {
+        ss << L",\"type\":\"none\"";
     }
     ss << L'}';
 }
@@ -8026,7 +8255,8 @@ public:
         std::vector<int> indices;
         std::vector<MatGroup> groups;
         size_t vOff = 0, iOff = 0, uvOff = 0, uv2Off = 0, nOff = 0;
-        // Skeletal skin + optional Morpher (Morpher must be below Skin in the stack).
+        // Skeletal skin + optional Morpher. Morpher is exported only when it
+        // evaluates before Skin, as static deltas + animated channel weights.
         bool skinRig = false;
         std::vector<ULONG> skinBoneHandles;
         std::vector<int> skinBoneParents;
@@ -8183,6 +8413,32 @@ public:
         if (alignment <= 1) return;
         const size_t pad = (alignment - (binary.size() % alignment)) % alignment;
         if (pad > 0) binary.append(pad, '\0');
+    }
+
+    static void AlignBinarySize(size_t& byteSize, size_t alignment = 4) {
+        if (alignment <= 1) return;
+        const size_t pad = (alignment - (byteSize % alignment)) % alignment;
+        byteSize += pad;
+    }
+
+    static void ReserveBinaryFloatRange(size_t& byteSize,
+                                        const std::vector<float>& values,
+                                        size_t& outOffset,
+                                        size_t& outCount) {
+        AlignBinarySize(byteSize, alignof(float));
+        outOffset = byteSize;
+        outCount = values.size();
+        byteSize += values.size() * sizeof(float);
+    }
+
+    static void ReserveBinaryIntRange(size_t& byteSize,
+                                      const std::vector<int>& values,
+                                      size_t& outOffset,
+                                      size_t& outCount) {
+        AlignBinarySize(byteSize, alignof(int));
+        outOffset = byteSize;
+        outCount = values.size();
+        byteSize += values.size() * sizeof(int);
     }
 
     static void AppendUniqueTimeValue(std::vector<TimeValue>& times, TimeValue value) {
@@ -9361,6 +9617,40 @@ public:
         ss << L'}';
     }
 
+    static bool AppendMorpherChannelTimeSamples(IMorpherChannel* channel,
+                                                const Interval& range,
+                                                std::vector<TimeValue>& outTimes) {
+        if (!channel) return false;
+        bool hasAuthoredKeys = false;
+        Tab<long> keyTimes;
+        Tab<float> keyValues;
+        if (channel->GetAnimationKeysData(keyTimes, keyValues)) {
+            for (int i = 0; i < keyTimes.Count(); ++i) {
+                const TimeValue tv = static_cast<TimeValue>(keyTimes[i]);
+                if (tv >= range.Start() && tv <= range.End()) {
+                    AppendUniqueTimeValue(outTimes, tv);
+                    hasAuthoredKeys = true;
+                }
+            }
+        }
+
+        if (Control* control = channel->GetControl()) {
+            std::vector<TimeValue> controllerTimes;
+            std::unordered_set<const Animatable*> visited;
+            CollectAnimatableKeyTimesRecursive(control, range, controllerTimes, visited);
+            for (TimeValue tv : controllerTimes) {
+                AppendUniqueTimeValue(outTimes, tv);
+                hasAuthoredKeys = true;
+            }
+        }
+        if (!hasAuthoredKeys) return false;
+
+        AppendUniqueTimeValue(outTimes, range.Start());
+        AppendUniqueTimeValue(outTimes, range.End());
+        SortUniqueTimeValues(outTimes);
+        return outTimes.size() >= 2;
+    }
+
     static bool BuildMorpherInfluenceAnimationTracks(Interface* ip,
                                                      INode* meshNode,
                                                      const Interval& range,
@@ -9368,23 +9658,34 @@ public:
                                                      const SnapshotExportOptions& options,
                                                      const std::vector<int>& morphChannelIds,
                                                      SnapshotAnimationTargetDef& outTarget) {
+        (void)options;
         (void)currentTime;
         if (!ip || !meshNode || morphChannelIds.empty()) return false;
-        Modifier* morphMod = FindModifierOnNode(meshNode, MR3_CLASS_ID);
-        if (!morphMod) return false;
+
+        ModifierStackMatch skinMatch;
+        ModifierStackMatch morphMatch;
+        if (!FindModifierStackMatchOnNode(meshNode, SKIN_CLASSID, skinMatch) ||
+            !FindModifierStackMatchOnNode(meshNode, MR3_CLASS_ID, morphMatch) ||
+            !morphMatch.mod ||
+            !morphMatch.mod->IsEnabled() ||
+            !ModifierEvaluatesBefore(morphMatch, skinMatch)) {
+            return false;
+        }
+
+        Modifier* morphMod = morphMatch.mod;
         IMorpher* morpher = static_cast<IMorpher*>(morphMod->GetInterface(I_MORPHER_INTERFACE_ID));
         if (!morpher) return false;
 
-        std::vector<TimeValue> sampleTimes;
-        AppendFrameSampleTimes(sampleTimes, range, options.animationSampleStepFrames);
-        SortUniqueTimeValues(sampleTimes);
-        if (sampleTimes.size() < 2) return false;
-
-        const TimeValue savedTime = ip->GetTime();
         bool anyTrack = false;
 
         for (size_t mi = 0; mi < morphChannelIds.size(); ++mi) {
             const int cid = morphChannelIds[mi];
+            IMorpherChannel* ch = morpher->GetChannel(cid, false);
+            if (!ch || !ch->IsActive()) continue;
+
+            std::vector<TimeValue> sampleTimes;
+            if (!AppendMorpherChannelTimeSamples(ch, range, sampleTimes)) continue;
+
             SnapshotAnimationTrackDef tr;
             tr.path = L".morphTargetInfluences[" + std::to_wstring(mi) + L"]";
             tr.type = L"number";
@@ -9393,11 +9694,7 @@ public:
             std::vector<float> vals;
             vals.reserve(sampleTimes.size());
             for (TimeValue tv : sampleTimes) {
-                ip->SetTime(tv);
-                IMorpherChannel* ch = morpher->GetChannel(cid, false);
-                double pct = 0.0;
-                if (ch) pct = ch->GetTargetPercent(0);
-                vals.push_back(static_cast<float>(pct / 100.0));
+                vals.push_back(ReadMorpherChannelInfluence(ch, tv));
             }
             bool changed = false;
             for (size_t i = 1; i < vals.size(); ++i) {
@@ -9416,7 +9713,6 @@ public:
             anyTrack = true;
         }
 
-        ip->SetTime(savedTime);
         return anyTrack;
     }
 
@@ -9584,7 +9880,22 @@ public:
                              const std::wstring& outDir,
                              bool copySparkDist,
                              std::wstring& error) {
-        if (!CopyFileEnsuringDirectories(webDir + L"\\index.html", outDir + L"\\index.html")) {
+        const std::wstring snapshotHtml = webDir + L"\\snapshot.html";
+        if (!FileExists(snapshotHtml)) {
+            error = L"Snapshot runtime dependency missing: web/snapshot.html";
+            return false;
+        }
+
+        if (!CopyFileEnsuringDirectories(snapshotHtml, outDir + L"\\snapshot.html")) {
+            error = L"Failed to copy snapshot runtime snapshot.html";
+            return false;
+        }
+
+        // A deployed snapshot should open directly into the minimal player.
+        // Keep snapshot.html as an explicit target, and make index.html the
+        // same wrapper so static hosts and double-click workflows do not boot
+        // the editor/WebView2 page.
+        if (!CopyFileEnsuringDirectories(snapshotHtml, outDir + L"\\index.html")) {
             error = L"Failed to copy snapshot runtime index.html";
             return false;
         }
@@ -9645,7 +9956,11 @@ public:
         bool projectManifest = false;
         bool inlineLayers = false;
         bool snapshotUi = false;
-        std::wstring rendererPref = L"webgpu";
+        bool environment = false;
+        bool hdri = false;
+        bool sky = false;
+        bool binaryInstances = false;
+        std::wstring rendererPref = L"webgl";
         std::vector<std::wstring> postFx;
         std::vector<std::wstring> threeAddons;
         int meshNodes = 0;
@@ -9721,14 +10036,13 @@ public:
 
     static std::wstring DetectRendererPrefFromSnapshotUi(const std::wstring& snapshotUiJson) {
         const std::wstring lower = LowerAsciiCopy(snapshotUiJson);
-        if (lower.find(L"\"rendererbackend\":\"webgl") != std::wstring::npos ||
-            lower.find(L"\"rendererbackend\": \"webgl") != std::wstring::npos ||
-            lower.find(L"\"backend\":\"webgl") != std::wstring::npos ||
-            lower.find(L"\"backend\": \"webgl") != std::wstring::npos ||
-            lower.find(L"webgl2") != std::wstring::npos) {
-            return L"webgl";
+        if (lower.find(L"\"snapshotrendererbackend\":\"webgpu") != std::wstring::npos ||
+            lower.find(L"\"snapshotrendererbackend\": \"webgpu") != std::wstring::npos ||
+            lower.find(L"\"snapshot_backend\":\"webgpu") != std::wstring::npos ||
+            lower.find(L"\"snapshot_backend\": \"webgpu") != std::wstring::npos) {
+            return L"webgpu";
         }
-        return L"webgpu";
+        return L"webgl";
     }
 
     static bool HasHtmlTextureSlot(const MaxJSPBR& pbr) {
@@ -9847,6 +10161,10 @@ public:
         ss << L",\"physics\":" << (features.physics ? L"true" : L"false");
         ss << L",\"gltf\":" << (features.gltfs ? L"true" : L"false");
         ss << L",\"animations\":" << (features.animations ? L"true" : L"false");
+        ss << L",\"environment\":" << (features.environment ? L"true" : L"false");
+        ss << L",\"hdri\":" << (features.hdri ? L"true" : L"false");
+        ss << L",\"sky\":" << (features.sky ? L"true" : L"false");
+        ss << L",\"binary_instances\":" << (features.binaryInstances ? L"true" : L"false");
         ss << L",\"post_fx\":";
         WriteStringVectorJson(ss, features.postFx);
         ss << L",\"three_addons\":";
@@ -10050,6 +10368,49 @@ public:
             collect(root);
         }
 
+        std::vector<ForestInstanceGroup> snapshotInstanceGroups;
+        if (options.includeInstances) {
+            std::function<void(INode*)> collectInstances = [&](INode* parent) {
+                for (int c = 0; c < parent->NumberOfChildren(); ++c) {
+                    INode* node = parent->GetChildNode(c);
+                    if (!node) continue;
+                    if (node->IsNodeHidden(TRUE)) {
+                        collectInstances(node);
+                        continue;
+                    }
+                    if (IsMaxJsSyncDrawVisible(node)) {
+                        if (IsForestPackAvailable() && IsForestPackNode(node))
+                            ExtractForestPackInstances(node, t, snapshotInstanceGroups);
+                        else if (IsRailCloneAvailable() && IsRailCloneNode(node))
+                            ExtractRailCloneInstances(node, t, snapshotInstanceGroups);
+                        else if (IsTyFlowAvailable() && IsTyFlowNode(node))
+                            ExtractTyFlowInstances(node, t, snapshotInstanceGroups);
+                    }
+                    collectInstances(node);
+                }
+            };
+            collectInstances(root);
+        }
+
+        const size_t instanceBytesStart = totalBytes;
+        for (ForestInstanceGroup& group : snapshotInstanceGroups) {
+            const int transformCount = static_cast<int>(group.transforms.size() / 16);
+            if (group.instanceCount <= 0 || group.instanceCount > transformCount) {
+                group.instanceCount = transformCount;
+            }
+            if (group.verts.empty() || group.indices.empty() ||
+                group.transforms.size() < static_cast<size_t>(group.instanceCount) * 16) {
+                continue;
+            }
+
+            ReserveBinaryFloatRange(totalBytes, group.verts, group.vOff, group.vN);
+            ReserveBinaryIntRange(totalBytes, group.indices, group.iOff, group.iN);
+            ReserveBinaryFloatRange(totalBytes, group.uvs, group.uvOff, group.uvN);
+            ReserveBinaryFloatRange(totalBytes, group.norms, group.nOff, group.nN);
+            ReserveBinaryFloatRange(totalBytes, group.transforms, group.xformOff, group.xformN);
+        }
+        const size_t instanceBinaryBytes = totalBytes - instanceBytesStart;
+
         outBinary.assign(std::max<size_t>(totalBytes, 4), '\0');
         BYTE* buffer = reinterpret_cast<BYTE*>(outBinary.data());
 
@@ -10057,7 +10418,11 @@ public:
         ss.imbue(std::locale::classic());
         ss << L"{\"type\":\"scene_bin\",\"frame\":1";
         ss << L",\"bin\":\"scene.bin\"";
-        ss << L",\"stats\":{\"producerBytes\":" << totalBytes << L"}";
+        ss << L",\"stats\":{\"producerBytes\":" << totalBytes;
+        if (instanceBinaryBytes > 0) {
+            ss << L",\"instanceBytes\":" << instanceBinaryBytes;
+        }
+        ss << L"}";
         ss << L",\"nodes\":[";
 
         bool first = true;
@@ -10238,11 +10603,19 @@ public:
             ss << L",";
             WriteEnvJson(ss, envData, hdriUrl);
         }
-        if (!envData.isSky && !envData.hdriPath.empty()) {
+        if (options.includeEnvironment && envData.isSky) {
+            runtimeFeatures.environment = true;
+            runtimeFeatures.sky = true;
+            AddUniqueRuntimeFeature(runtimeFeatures.threeAddons, L"Sky");
+            AddUniqueRuntimeFeature(runtimeFeatures.threeAddons, L"SkyMesh");
+        }
+        if (options.includeEnvironment && !envData.isSky && !envData.hdriPath.empty()) {
+            runtimeFeatures.environment = !hdriUrl.empty();
+            runtimeFeatures.hdri = !hdriUrl.empty();
             const std::wstring lowerHdri = LowerAsciiCopy(envData.hdriPath);
             if (lowerHdri.size() >= 4 &&
                 lowerHdri.compare(lowerHdri.size() - 4, 4, L".hdr") == 0) {
-                AddUniqueRuntimeFeature(runtimeFeatures.threeAddons, L"RGBELoader");
+                AddUniqueRuntimeFeature(runtimeFeatures.threeAddons, L"HDRLoader");
             } else if (lowerHdri.size() >= 4 &&
                        lowerHdri.compare(lowerHdri.size() - 4, 4, L".exr") == 0) {
                 AddUniqueRuntimeFeature(runtimeFeatures.threeAddons, L"EXRLoader");
@@ -10277,48 +10650,54 @@ public:
         }
 
         if (options.includeInstances) {
-            std::vector<ForestInstanceGroup> allInstGroups;
-            std::function<void(INode*)> collectInstances = [&](INode* parent) {
-                for (int c = 0; c < parent->NumberOfChildren(); ++c) {
-                    INode* node = parent->GetChildNode(c);
-                    if (!node) continue;
-                    if (node->IsNodeHidden(TRUE)) {
-                        collectInstances(node);
-                        continue;
-                    }
-                    if (IsMaxJsSyncDrawVisible(node)) {
-                        if (IsForestPackAvailable() && IsForestPackNode(node))
-                            ExtractForestPackInstances(node, t, allInstGroups);
-                        else if (IsRailCloneAvailable() && IsRailCloneNode(node))
-                            ExtractRailCloneInstances(node, t, allInstGroups);
-                        else if (IsTyFlowAvailable() && IsTyFlowNode(node))
-                            ExtractTyFlowInstances(node, t, allInstGroups);
-                    }
-                    collectInstances(node);
-                }
-            };
-            collectInstances(root);
-
-            if (!allInstGroups.empty()) {
+            if (!snapshotInstanceGroups.empty()) {
                 ss << L",\"forestInstances\":[";
                 bool firstGroup = true;
-                for (auto& group : allInstGroups) {
-                    if (group.verts.empty() || group.transforms.empty()) continue;
+                for (auto& group : snapshotInstanceGroups) {
+                    if (group.verts.empty() || group.indices.empty() ||
+                        group.transforms.size() < static_cast<size_t>(group.instanceCount) * 16 ||
+                        group.vN == 0 || group.iN == 0 || group.xformN == 0) {
+                        continue;
+                    }
                     if (!firstGroup) ss << L',';
                     firstGroup = false;
                     runtimeFeatures.instanceGroups += 1;
-                    ss << L"{\"src\":" << group.groupKey;
-                    ss << L",\"count\":" << group.instanceCount;
-                    ss << L",\"v\":"; WriteFloats(ss, group.verts.data(), group.verts.size());
-                    ss << L",\"i\":"; WriteInts(ss, group.indices.data(), group.indices.size());
+                    runtimeFeatures.binaryInstances = true;
+                    if (!group.verts.empty()) {
+                        memcpy(buffer + group.vOff, group.verts.data(), group.verts.size() * sizeof(float));
+                    }
+                    if (!group.indices.empty()) {
+                        memcpy(buffer + group.iOff, group.indices.data(), group.indices.size() * sizeof(int));
+                    }
                     if (!group.uvs.empty()) {
-                        ss << L",\"uv\":"; WriteFloats(ss, group.uvs.data(), group.uvs.size());
+                        memcpy(buffer + group.uvOff, group.uvs.data(), group.uvs.size() * sizeof(float));
                     }
                     if (!group.norms.empty()) {
-                        ss << L",\"norm\":"; WriteFloats(ss, group.norms.data(), group.norms.size());
+                        memcpy(buffer + group.nOff, group.norms.data(), group.norms.size() * sizeof(float));
                     }
-                    ss << L",\"xforms\":";
-                    WriteFloats(ss, group.transforms.data(), group.transforms.size());
+                    if (!group.transforms.empty()) {
+                        memcpy(buffer + group.xformOff, group.transforms.data(), group.transforms.size() * sizeof(float));
+                    }
+
+                    ss << L"{\"src\":" << group.groupKey;
+                    ss << L",\"key\":\"" << group.groupKey << L"\"";
+                    ss << L",\"count\":" << group.instanceCount;
+                    ss << L",\"geo\":{\"vOff\":" << group.vOff
+                       << L",\"vN\":" << group.vN
+                       << L",\"iOff\":" << group.iOff
+                       << L",\"iN\":" << group.iN;
+                    if (group.uvN > 0) {
+                        ss << L",\"uvOff\":" << group.uvOff
+                           << L",\"uvN\":" << group.uvN;
+                    }
+                    if (group.nN > 0) {
+                        ss << L",\"nOff\":" << group.nOff
+                           << L",\"nN\":" << group.nN;
+                    }
+                    ss << L"}";
+                    ss << L",\"xformOff\":" << group.xformOff;
+                    ss << L",\"xformN\":" << group.xformN;
+                    ss << L",\"xformType\":\"f32m16\"";
                     WriteInstanceGroupMaterial(ss, group, t);
                     ss << L'}';
                 }

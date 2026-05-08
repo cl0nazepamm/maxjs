@@ -1368,6 +1368,9 @@
                 <svg class="icon-moon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 10.5A6 6 0 1 1 5.5 2a5 5 0 0 0 8.5 8.5Z"/></svg>
                 <svg class="icon-sun" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="8" cy="8" r="3"/><path d="M8 1v2M8 13v2M1 8h2M13 8h2M3.1 3.1l1.4 1.4M11.5 11.5l1.4 1.4M3.1 12.9l1.4-1.4M11.5 4.5l1.4-1.4"/></svg>
             </button>
+            <button id="btnMuteAudio" class="rail-btn" title="Mute audio" aria-label="Mute audio">
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 6.25h2.4L8.5 3v10L4.4 9.75H2z"/><path d="m11 6 3 4M14 6l-3 4"/></svg>
+            </button>
             <button id="btnKill" class="rail-btn maxonly devonly" title="Kill panel" aria-label="Kill panel">
                 <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 4 4 12M4 4l8 8"/></svg>
             </button>
@@ -1552,13 +1555,31 @@
             onShaderLabSnapshotChange,
             updateShaderLabEnabled,
         } from './js/shader_lab_panel.js';
+        import {
+            applyTextureChannelSelection as applyTextureChannelSelectionShared,
+            applyTextureTransform as applyTextureTransformShared,
+            applyTextureUvChannel as applyTextureUvChannelShared,
+            maxMapChannelToTextureChannel as maxMapChannelToTextureChannelShared,
+            normalizeTextureTransform as normalizeTextureTransformShared,
+            optimizedTextureTransformForSlot as optimizedTextureTransformForSlotShared,
+            resolveTextureColorSpace as resolveTextureColorSpaceShared,
+            shouldRouteBlackSpecularToLambert as shouldRouteBlackSpecularToLambertShared,
+        } from './js/material_contract.js';
 
         const THEME_STORAGE_KEY = 'maxjs-theme';
+        const AUDIO_MUTED_STORAGE_KEY = 'maxjs-audio-muted';
         const DARK_BG = 0x353535;
         const LIGHT_BG = 0x2a2a2a;
         function readPersistedLightMode() {
             try {
                 return localStorage.getItem(THEME_STORAGE_KEY) === 'light';
+            } catch {
+                return false;
+            }
+        }
+        function readPersistedAudioMuted() {
+            try {
+                return localStorage.getItem(AUDIO_MUTED_STORAGE_KEY) === 'true';
             } catch {
                 return false;
             }
@@ -1881,15 +1902,15 @@
         grid.userData.maxjsExcludeFromRuntimeSnapshot = true;
         overlayRoot.add(grid);
 
-        // Lights (fallback, hidden when HDRI loads)
-        // Default lighting — neutral, camera-aligned
+        // Live viewer fallback lighting — camera-following headlight rig used
+        // when the Max scene has no authored lights or environment.
         const defaultLights = new THREE.Group();
         const defaultAmbient = new THREE.AmbientLight(0xffffff, 0.4);
         defaultAmbient.userData.volumetricBypass = true;
         defaultLights.add(defaultAmbient);
         const defaultKey = new THREE.DirectionalLight(0xffffff, 2.5);
         defaultKey.userData.volumetricBypass = true;
-        defaultKey.castShadow = true;
+        defaultKey.castShadow = false;
         defaultKey.shadow.mapSize.set(2048, 2048);
         defaultKey.shadow.camera.near = 0.1;
         defaultKey.shadow.camera.far = 2000;
@@ -1913,6 +1934,7 @@
         const webglTextureLoader = new THREE_STD.TextureLoader();
         const rgbeLoader = new HDRLoader();
         const exrLoader = new EXRLoader();
+        suppressKnownExrMetadataWarnings(exrLoader);
         textureLoader.setCrossOrigin?.('anonymous');
         webglTextureLoader.setCrossOrigin?.('anonymous');
         rgbeLoader.setCrossOrigin?.('anonymous');
@@ -1960,6 +1982,38 @@
             }
         }
 
+        const hdrTextureExtensions = new Set(['hdr', 'exr']);
+
+        function colorSpaceForTextureExtension(ext, requestedColorSpace) {
+            return hdrTextureExtensions.has(ext) && requestedColorSpace === THREE.SRGBColorSpace
+                ? THREE.LinearSRGBColorSpace
+                : requestedColorSpace;
+        }
+
+        function suppressKnownExrMetadataWarnings(loader) {
+            if (!loader || loader.userData?.maxjsQuietM44fHeader) return loader;
+            const originalParse = typeof loader.parse === 'function' ? loader.parse.bind(loader) : null;
+            if (!originalParse) return loader;
+            loader.parse = (...args) => {
+                const previousWarn = console.warn;
+                console.warn = (...warnArgs) => {
+                    const msg = String(warnArgs?.[0] ?? '');
+                    if (msg.includes('THREE.EXRLoader: Skipped unknown header attribute type') &&
+                        msg.includes('m44f')) {
+                        return;
+                    }
+                    previousWarn.apply(console, warnArgs);
+                };
+                try {
+                    return originalParse(...args);
+                } finally {
+                    console.warn = previousWarn;
+                }
+            };
+            loader.userData = { ...(loader.userData || {}), maxjsQuietM44fHeader: true };
+            return loader;
+        }
+
         const browserTextureExtensions = new Set([
             'png', 'jpg', 'jpeg', 'webp', 'bmp', 'gif', 'avif', 'svg',
             'exr', 'hdr',
@@ -1976,9 +2030,7 @@
                 : (ext === 'hdr' ? rgbeLoader : textureLoader);
 
             loader.load(url, (texture) => {
-                if (ext !== 'hdr' && ext !== 'exr') {
-                    texture.colorSpace = THREE.SRGBColorSpace;
-                }
+                texture.colorSpace = colorSpaceForTextureExtension(ext, THREE.SRGBColorSpace);
                 texture.mapping = THREE.EquirectangularReflectionMapping;
                 onLoad(texture);
             }, onProgress, onError);
@@ -2006,6 +2058,7 @@
         let lastMaxInstanceBucketSignature = '';
         let animationSystem = null;
         let audioSystem = null;
+        let audioMuted = readPersistedAudioMuted();
         let gltfSystem = null;
         const splatHandleMap = new Map();
         const splatMatrix = new THREE_STD.Matrix4();
@@ -2023,6 +2076,25 @@
         const urlMode = new URLSearchParams(location.search).get('mode');
         let buildMode = urlMode || (isStandalone ? 'release' : 'dev');
         let debugMode = false;
+
+        function syncAudioMuteButtonUi() {
+            const button = document.getElementById('btnMuteAudio');
+            if (!button) return;
+            const label = audioMuted ? 'Unmute audio' : 'Mute audio';
+            button.classList.toggle('active', audioMuted);
+            button.title = label;
+            button.setAttribute('aria-label', label);
+        }
+
+        function setAudioMuted(nextMuted, { persist = true } = {}) {
+            audioMuted = !!nextMuted;
+            audioSystem?.setMuted?.(audioMuted);
+            if (persist) {
+                try { localStorage.setItem(AUDIO_MUTED_STORAGE_KEY, audioMuted ? 'true' : 'false'); } catch {}
+            }
+            syncAudioMuteButtonUi();
+        }
+
         try {
             const raw = localStorage.getItem(DEBUG_STORAGE_KEY);
             if (raw === 'true') debugMode = true;
@@ -2553,62 +2625,11 @@
         }
 
         function normalizeTextureTransform(xf) {
-            if (!xf) return null;
-            return {
-                scale: Number.isFinite(xf.scale) && Math.abs(xf.scale) > 1e-6 ? xf.scale : 1.0,
-                tiling: [
-                    Number.isFinite(xf.tiling?.[0]) ? xf.tiling[0] : 1.0,
-                    Number.isFinite(xf.tiling?.[1]) ? xf.tiling[1] : 1.0,
-                ],
-                offset: [
-                    Number.isFinite(xf.offset?.[0]) ? xf.offset[0] : 0.0,
-                    Number.isFinite(xf.offset?.[1]) ? xf.offset[1] : 0.0,
-                ],
-                rotate: Number.isFinite(xf.rotate) ? xf.rotate : 0.0,
-                center: [
-                    Number.isFinite(xf.center?.[0]) ? xf.center[0] : 0.5,
-                    Number.isFinite(xf.center?.[1]) ? xf.center[1] : 0.5,
-                ],
-                realWorld: !!xf.realWorld,
-                realWidth: Number.isFinite(xf.realWidth) && Math.abs(xf.realWidth) > 1e-6 ? xf.realWidth : 1.0,
-                realHeight: Number.isFinite(xf.realHeight) && Math.abs(xf.realHeight) > 1e-6 ? xf.realHeight : 1.0,
-                wrap: typeof xf.wrap === 'string' ? xf.wrap : 'periodic',
-                channel: Number.isFinite(xf.channel) ? Math.max(1, Math.round(xf.channel)) : 1,
-                uvChannel: Number.isFinite(xf.uvChannel) ? Math.max(1, Math.round(xf.uvChannel)) : 1,
-                invert: !!xf.invert,
-                colorSpace: typeof xf.colorSpace === 'string' ? xf.colorSpace : '',
-                manualGamma: Number.isFinite(xf.manualGamma) ? xf.manualGamma : 1.0,
-            };
-        }
-
-        function wrapModeToThree(mode) {
-            switch ((mode || 'periodic').toLowerCase()) {
-                case 'mirror': return THREE.MirroredRepeatWrapping;
-                case 'clamp':
-                case 'black': return THREE.ClampToEdgeWrapping;
-                case 'default':
-                case 'periodic':
-                default: return THREE.RepeatWrapping;
-            }
+            return normalizeTextureTransformShared(xf);
         }
 
         function applyTextureTransform(tex, xf) {
-            const wrap = wrapModeToThree(xf?.wrap);
-            tex.wrapS = tex.wrapT = wrap;
-
-            if (!xf) return;
-            applyTextureUvChannel(tex, xf.uvChannel, 1);
-
-            const worldScaleU = xf.realWorld ? xf.realWidth : 1.0;
-            const worldScaleV = xf.realWorld ? xf.realHeight : 1.0;
-            const repeatU = xf.tiling[0] / worldScaleU / xf.scale;
-            const repeatV = xf.tiling[1] / worldScaleV / xf.scale;
-
-            tex.repeat.set(repeatU, repeatV);
-            tex.offset.set(-xf.offset[0] * repeatU, -xf.offset[1] * repeatV);
-            tex.center.set(xf.center[0], xf.center[1]);
-            tex.rotation = THREE.MathUtils.degToRad(xf.rotate);
-            tex.updateMatrix();
+            return applyTextureTransformShared(tex, xf);
         }
 
         function applyFallbackImage(tex, fallbackTex, colorSpace, xf, url) {
@@ -2630,113 +2651,23 @@
         }
 
         function applyTextureChannelSelection(tex, xf) {
-            const channel = xf?.channel ?? 1;
-            const invert = !!xf?.invert;
-            if (channel <= 1 && !invert) return;
-
-            const image = tex?.image;
-            const width = image?.width ?? image?.videoWidth ?? 0;
-            const height = image?.height ?? image?.videoHeight ?? 0;
-            if (!width || !height) return;
-
-            const canvas = document.createElement('canvas');
-            canvas.width = width;
-            canvas.height = height;
-            const ctx = canvas.getContext('2d', { willReadFrequently: true });
-            if (!ctx) return;
-
-            ctx.drawImage(image, 0, 0, width, height);
-            const imageData = ctx.getImageData(0, 0, width, height);
-            const { data } = imageData;
-
-            for (let i = 0; i < data.length; i += 4) {
-                const r = data[i];
-                const g = data[i + 1];
-                const b = data[i + 2];
-                const a = data[i + 3];
-                if (channel <= 1) {
-                    data[i] = 255 - r;
-                    data[i + 1] = 255 - g;
-                    data[i + 2] = 255 - b;
-                    continue;
-                }
-
-                let value = r;
-
-                switch (channel) {
-                case 2:
-                    value = r;
-                    break;
-                case 3:
-                    value = g;
-                    break;
-                case 4:
-                    value = b;
-                    break;
-                case 5:
-                    value = a;
-                    break;
-                case 6:
-                    value = Math.round((0.2126 * r) + (0.7152 * g) + (0.0722 * b));
-                    break;
-                case 7:
-                    value = Math.round((r + g + b) / 3);
-                    break;
-                default:
-                    value = r;
-                    break;
-                }
-
-                if (invert) value = 255 - value;
-                data[i] = value;
-                data[i + 1] = value;
-                data[i + 2] = value;
-                data[i + 3] = channel === 5 ? value : a;
-            }
-
-            ctx.putImageData(imageData, 0, 0);
-            tex.image = canvas;
+            return applyTextureChannelSelectionShared(tex, xf);
         }
 
         function maxMapChannelToTextureChannel(maxMapChannel, fallbackMaxChannel = 1) {
-            const maxChannel = Number.isFinite(Number(maxMapChannel))
-                ? Math.max(1, Math.round(Number(maxMapChannel)))
-                : fallbackMaxChannel;
-            return Math.max(0, maxChannel - 1);
+            return maxMapChannelToTextureChannelShared(maxMapChannel, fallbackMaxChannel);
         }
 
         function applyTextureUvChannel(tex, maxMapChannel, fallbackMaxChannel = 1) {
-            if (!tex?.isTexture) return tex;
-            const nextChannel = maxMapChannelToTextureChannel(maxMapChannel, fallbackMaxChannel);
-            if (tex.channel !== nextChannel) {
-                tex.channel = nextChannel;
-                const image = tex.source?.data ?? tex.image;
-                if (image != null) tex.needsUpdate = true;
-            }
-            return tex;
+            return applyTextureUvChannelShared(tex, maxMapChannel, fallbackMaxChannel);
         }
 
         function optimizedTextureTransformForSlot(key, xf) {
-            if (!xf) return xf;
-            const channel = Number.isFinite(xf.channel) ? Math.max(1, Math.round(xf.channel)) : 1;
-            const nativeChannels = {
-                aoMap: 2,       // Three samples red for aoMap.
-                roughMap: 3,    // Three samples green for roughnessMap.
-                ccRoughMap: 3,  // Three samples green for clearcoatRoughnessMap.
-                metalMap: 4,    // Three samples blue for metalnessMap.
-            };
-            if (nativeChannels[key] !== channel || xf.invert) return xf;
-            return { ...xf, channel: 1 };
+            return optimizedTextureTransformForSlotShared(key, xf);
         }
 
         function resolveColorSpace(slotColorSpace, xf) {
-            const cs = xf?.colorSpace;
-            if (!cs) return slotColorSpace;
-            const lc = cs.toLowerCase();
-            if (lc === 'srgb' || lc === 'srgb texture') return THREE.SRGBColorSpace;
-            if (lc === 'linear' || lc === 'raw' || lc === 'data' || lc === 'non-color') return THREE.LinearSRGBColorSpace;
-            // "auto" — fall back to slot default
-            return slotColorSpace;
+            return resolveTextureColorSpaceShared(slotColorSpace, xf);
         }
 
         function isAbsoluteWindowsPath(path) {
@@ -3074,10 +3005,11 @@
             if (!url) return null;
             if (xf?.video) return loadVideoTexture(url, xf);
             colorSpace = resolveColorSpace(colorSpace, xf);
-            const normalizedXf = normalizeTextureTransform(xf);
-            const cacheKey = JSON.stringify([url, String(colorSpace), normalizedXf]);
-            if (textureCache.has(cacheKey)) return textureCache.get(cacheKey);
             const ext = getTextureExtension(url);
+            const textureColorSpace = colorSpaceForTextureExtension(ext, colorSpace);
+            const normalizedXf = normalizeTextureTransform(xf);
+            const cacheKey = JSON.stringify([url, String(textureColorSpace), normalizedXf]);
+            if (textureCache.has(cacheKey)) return textureCache.get(cacheKey);
             if (!canBrowserLoadTextureExtension(ext)) {
                 const placeholder = fallbackTex || fallbackWhiteTexture;
                 textureCache.set(cacheKey, placeholder);
@@ -3090,6 +3022,7 @@
                 textureCache.set(cacheKey, placeholder);
                 loader.load(url, loadedTex => {
                     applyTextureChannelSelection(loadedTex, normalizedXf);
+                    loadedTex.colorSpace = textureColorSpace;
                     applyTextureTransform(loadedTex, normalizedXf);
                     loadedTex.needsUpdate = true;
                     textureCache.set(cacheKey, loadedTex);
@@ -3102,14 +3035,14 @@
                 url,
                 loadedTex => {
                     applyTextureChannelSelection(loadedTex, normalizedXf);
-                    loadedTex.colorSpace = colorSpace;
+                    loadedTex.colorSpace = textureColorSpace;
                     applyTextureTransform(loadedTex, normalizedXf);
                     loadedTex.needsUpdate = true;
                 },
                 undefined,
-                () => applyFallbackImage(tex, fallbackTex, colorSpace, normalizedXf, url)
+                () => applyFallbackImage(tex, fallbackTex, textureColorSpace, normalizedXf, url)
             );
-            tex.colorSpace = colorSpace;
+            tex.colorSpace = textureColorSpace;
             applyTextureTransform(tex, normalizedXf);
             textureCache.set(cacheKey, tex);
             return tex;
@@ -3145,14 +3078,15 @@
         function loadBakeTexture(url, colorSpace = THREE.LinearSRGBColorSpace, maxMapChannel = 2) {
             if (!url) return null;
             colorSpace = resolveColorSpace(colorSpace, null);
+            const ext = getTextureExtension(url);
+            const textureColorSpace = colorSpaceForTextureExtension(ext, colorSpace);
             const channel = maxMapChannelToTextureChannel(maxMapChannel, 2);
-            const cacheKey = JSON.stringify(['bake', url, String(colorSpace), channel]);
+            const cacheKey = JSON.stringify(['bake', url, String(textureColorSpace), channel]);
             const cached = textureCache.get(cacheKey);
             if (cached?.isTexture) return cached;
             if (cached?.pending) return null;
             if (failedTextureCache.has(cacheKey)) return null;
 
-            const ext = getTextureExtension(url);
             if (!canBrowserLoadTextureExtension(ext)) {
                 failedTextureCache.add(cacheKey);
                 console.warn('max.js skipped unsupported bake texture format:', url);
@@ -3166,7 +3100,7 @@
             loader.load(
                 url,
                 loadedTex => {
-                    const bakeTex = prepareLoadedBakeTexture(loadedTex, colorSpace, maxMapChannel);
+                    const bakeTex = prepareLoadedBakeTexture(loadedTex, textureColorSpace, maxMapChannel);
                     if (!bakeTex) {
                         failedTextureCache.add(cacheKey);
                         textureCache.delete(cacheKey);
@@ -3907,6 +3841,23 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             }
         }
 
+        function removeAuthoredEnvironment() {
+            removeSky();
+            currentHdriUrl = null;
+            currentHdriProbeSignature = '';
+            currentEnvParams = null;
+            clearCurrentHdriEnvMap();
+            scene.environment = null;
+            syncMaterialEnvMaps();
+            scene.environmentIntensity = 1.0;
+            scene.environmentRotation.set(0, 0, 0);
+            scene.backgroundRotation.set(0, 0, 0);
+            scene.backgroundBlurriness = 0;
+            scene.background = new THREE.Color(hiddenBackgroundColor);
+            clearLightProbe();
+            defaultLights.visible = lightHandleMap.size === 0;
+        }
+
         // ── Material Creation ───────────────────────────────
         function rememberMaterialEmissiveBase(material) {
             if (!material?.emissive) return;
@@ -4327,46 +4278,8 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             return material;
         }
 
-        function finiteNumberOr(value, fallback) {
-            const n = Number(value);
-            return Number.isFinite(n) ? n : fallback;
-        }
-
-        function isBlackColorArray(value, epsilon = 1.0e-4) {
-            return Array.isArray(value)
-                && value.length >= 3
-                && Math.abs(finiteNumberOr(value[0], 1)) <= epsilon
-                && Math.abs(finiteNumberOr(value[1], 1)) <= epsilon
-                && Math.abs(finiteNumberOr(value[2], 1)) <= epsilon;
-        }
-
-        function hasMaterialMap(md, key) {
-            return typeof md?.[key] === 'string' && md[key].trim().length > 0;
-        }
-
         function shouldRouteBlackSpecularToLambert(requestedModelName, md) {
-            if (
-                requestedModelName !== 'MeshPhysicalMaterial' &&
-                requestedModelName !== 'MeshStandardNodeMaterial'
-            ) {
-                return false;
-            }
-            if (hasMaterialMap(md, 'specIntMap') || hasMaterialMap(md, 'specColMap') || hasMaterialMap(md, 'specMap')) {
-                return false;
-            }
-            const blackSpecular =
-                isBlackColorArray(md.specularColor) ||
-                (md.specularIntensity != null && finiteNumberOr(md.specularIntensity, 1) <= 1.0e-4);
-            if (!blackSpecular) return false;
-
-            // Lambert intentionally drops PBR lobes. Only auto-route materials
-            // that are behaving as diffuse surfaces, not glass/metal/clearcoat.
-            return finiteNumberOr(md.metal, 0) <= 1.0e-4
-                && finiteNumberOr(md.clearcoat, 0) <= 1.0e-4
-                && finiteNumberOr(md.sheen, 0) <= 1.0e-4
-                && finiteNumberOr(md.iridescence, 0) <= 1.0e-4
-                && finiteNumberOr(md.transmission, 0) <= 1.0e-4
-                && finiteNumberOr(md.anisotropy, 0) <= 1.0e-4;
+            return shouldRouteBlackSpecularToLambertShared(requestedModelName, md);
         }
 
         function materialIdentityValue(value) {
@@ -5916,6 +5829,9 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             if (!isLocalHdriLoaded()) {
                 if (snapshot.env?.sky) applySky(snapshot.env.sky);
                 else if (snapshot.env?.hdri) { removeSky(); loadHDRI(snapshot.env); }
+                else if (snapshot.env?.enabled === false || snapshot.env?.type === 'none') {
+                    removeAuthoredEnvironment();
+                }
             }
             if (snapshot.fog) ssgiFx.setFogFromScene(snapshot.fog);
             const lightsChanged = snapshot.lights ? applyLights(snapshot.lights) : false;
@@ -6097,6 +6013,8 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 } else if (msg.env.hdri) {
                     removeSky();
                     loadHDRI(msg.env);
+                } else if (msg.env.enabled === false || msg.env.type === 'none') {
+                    removeAuthoredEnvironment();
                 }
                 ssgiFx.markEnvironmentChanged?.();
             }
@@ -6459,10 +6377,12 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                                 const cnt = nd.morph.dN[mi];
                                 if (!binInRange(buffer, off, cnt)) continue;
                                 const d = new Float32Array(new Float32Array(buffer, off, cnt));
-                                geom.morphAttributes.position.push(new THREE.BufferAttribute(d, 3));
+                                const attr = new THREE.BufferAttribute(d, 3);
+                                attr.name = String(nd.morph.names[mi] ?? `morph_${mi}`);
+                                geom.morphAttributes.position.push(attr);
                             }
                             if (geom.morphAttributes.position.length > 0) {
-                                geom.morphTargetRelative = false;
+                                geom.morphTargetRelative = true;
                             }
                         }
                     }
@@ -9787,6 +9707,12 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
 
         // ── Theme Toggle ─────────────────────────────────
         // Icon swap is CSS-driven (body.light-mode toggles .icon-moon / .icon-sun)
+        const btnMuteAudio = document.getElementById('btnMuteAudio');
+        btnMuteAudio?.addEventListener('click', () => {
+            setAudioMuted(!audioMuted);
+        });
+        syncAudioMuteButtonUi();
+
         const btnTheme = document.getElementById('btnTheme');
         btnTheme.onclick = () => {
             lightMode = !lightMode;
@@ -11953,8 +11879,9 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 if (lastRenderTimestamp !== 0 && (frameTimeMs - lastRenderTimestamp) < minFrameMs) return;
             }
             lastRenderTimestamp = frameTimeMs;
+            inlineTimer.update(frameTimeMs);
             const frameDt = inlineClock.getDelta();
-            const frameElapsed = inlineClock.getElapsedTime();
+            const frameElapsed = inlineClock.getElapsed();
             xrRuntime.update(frameDt);
             if (!xrRuntime.active) syncOrbitNavigationFeel();
             if (!xrRuntime.active && !(animationSystem?.isDrivingSceneCamera?.())) controls.update();
@@ -12068,7 +11995,9 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         }
 
         // ── JS_Inline Layer Manager ──────────────────────────
-        const inlineClock = new THREE.Clock();
+        const inlineTimer = new THREE.Timer();
+        inlineTimer.connect?.(document);
+        const inlineClock = inlineTimer;
         const layerManager = createLayerManager({
             scene,
             camera,
@@ -12105,6 +12034,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             parent: maxBasisRoot,
             getActiveCamera: () => renderer.xr?.isPresenting ? renderer.xr.getCamera(camera) : camera,
         });
+        setAudioMuted(audioMuted, { persist: false });
         gltfSystem = createMaxJSGLTFSystem({
             THREE,
             parent: maxBasisRoot,
@@ -12422,7 +12352,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             updateVolumeUniforms();
             const effectiveElapsed = Number.isFinite(renderTimeSeconds)
                 ? renderTimeSeconds
-                : inlineClock.getElapsedTime();
+                : inlineClock.getElapsed();
             layerManager.update(0, effectiveElapsed);
             if (Number.isFinite(renderTimeSeconds)) {
                 animationSystem?.seekAllClips?.(renderTimeSeconds);

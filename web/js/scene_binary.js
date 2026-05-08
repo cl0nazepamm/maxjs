@@ -10,7 +10,7 @@
 // material building stay inline for now — they have larger closure
 // dependencies that come along in the next extraction pass.
 
-import * as THREE from 'three/webgpu';
+import * as THREE from 'three';
 
 /**
  * Range check for a [Float32 / Int32] buffer view of `n` elements at
@@ -106,10 +106,12 @@ export function attachSkinAttributes(geom, nd, buffer) {
             const cnt = nd.morph.dN[mi];
             if (!binInRange(buffer, off, cnt)) continue;
             const d = new Float32Array(new Float32Array(buffer, off, cnt));
-            geom.morphAttributes.position.push(new THREE.BufferAttribute(d, 3));
+            const attr = new THREE.BufferAttribute(d, 3);
+            attr.name = String(nd.morph.names[mi] ?? `morph_${mi}`);
+            geom.morphAttributes.position.push(attr);
         }
         if (geom.morphAttributes.position.length > 0) {
-            geom.morphTargetRelative = false;
+            geom.morphTargetRelative = true;
         }
     }
 }

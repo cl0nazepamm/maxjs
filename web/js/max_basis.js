@@ -14,8 +14,7 @@
 // group with rotation.x = -PI/2; runtime objects (jsRoot) live outside that
 // group and reason in standard Three.js Y-up world space.
 
-import * as THREE from 'three/webgpu';
-import * as THREE_STD from 'three-std';
+import * as THREE from 'three';
 
 export const MAX_TO_WORLD_ROTATION_X = -Math.PI / 2;
 
@@ -27,7 +26,7 @@ export const WORLD_TO_MAX_QUATERNION = MAX_TO_WORLD_QUATERNION.clone().invert();
 export const MAX_TO_WORLD_MATRIX = new THREE.Matrix4()
     .makeRotationFromQuaternion(MAX_TO_WORLD_QUATERNION);
 
-export const MAX_TO_WORLD_MATRIX_STD = new THREE_STD.Matrix4()
+export const MAX_TO_WORLD_MATRIX_STD = new THREE.Matrix4()
     .makeRotationX(MAX_TO_WORLD_ROTATION_X);
 
 /** Reads `[x, y, z]` array, plain object, or typed-array into a Vector3 target. */

@@ -24,7 +24,7 @@
 // Type IDs match index.html's:
 //   0 Directional, 1 Point, 2 Spot, 3 RectArea, 4 Hemisphere, 5 Ambient
 
-import * as THREE from 'three/webgpu';
+import * as THREE from 'three';
 
 const TARGET_DISTANCE = 1000;
 

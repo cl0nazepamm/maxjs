@@ -433,6 +433,10 @@ export function createMaxJSAudioSystem({ THREE, parent, getActiveCamera }) {
         masterGain.gain.setTargetAtTime(muted ? 0 : 1, ctx.currentTime, 0.03);
     }
 
+    function getMuted() {
+        return muted;
+    }
+
     function update() {
         if (!context && entryMap.size === 0) return;
         const ctx = context || ensureContext();
@@ -481,6 +485,7 @@ export function createMaxJSAudioSystem({ THREE, parent, getActiveCamera }) {
         applyAudioUpdates,
         applyAudioTransformBinary,
         destroyEntry,
+        getMuted,
         setMuted,
         update,
     };

@@ -4,15 +4,14 @@
 //
 // Snapshot-mode scope (intentional differences from live):
 //   - No WebXR / VR backend. XR is explicitly out of snapshot parity.
-//   - No backend persistence (snapshot.json declares the preference).
+//   - No backend persistence (the snapshot wrapper declares the target).
 //   - No editor performance panel coupling — uses devicePixelRatio at 1×scale.
 //   - No grid helper, no postfx panel.
 //
 // Returns concrete handles only — no facades. The applier and layer manager
 // later reach into these directly the same way they do in live mode.
 
-import * as THREE from 'three/webgpu';
-import * as THREE_STD from 'three-std';
+import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 
 import { copyMaxComponentsToWorld } from './max_basis.js';
@@ -48,44 +47,74 @@ async function initializeRenderer(renderer) {
     if (typeof renderer.init === 'function') await renderer.init();
 }
 
-function disposeRenderer(renderer) {
-    try { renderer?.dispose?.(); } catch {}
-}
-
 /**
  * Picks the renderer backend.
  *   backend === 'webgl'  → WebGLRenderer
- *   backend === 'webgpu' → WebGPURenderer with forceWebGL fallback on init failure
- *   default              → 'webgpu'
+ *   backend === 'webgpu' → WebGPURenderer, native WebGPU required
+ *   default              → 'webgl'
  *
  * Always renders into the supplied canvas (no implicit DOM injection).
  */
-export async function createRenderer(canvas, { backend = 'webgpu' } = {}) {
+export async function createRenderer(canvas, { backend = 'webgl' } = {}) {
     if (!canvas) throw new Error('createRenderer: canvas is required');
 
-    if (backend === 'webgl') {
-        const renderer = new THREE_STD.WebGLRenderer({
-            canvas, antialias: true, alpha: true, powerPreference: 'high-performance',
-        });
-        configureRenderer(renderer, canvas);
-        await initializeRenderer(renderer);
-        return { renderer, backendLabel: 'WebGL2' };
+    const normalizedBackend = String(backend || 'webgl').toLowerCase().includes('webgpu')
+        ? 'webgpu'
+        : 'webgl';
+    const renderer = normalizedBackend === 'webgpu'
+        ? await createWebGpuRenderer(canvas)
+        : createWebGlRenderer(canvas);
+    configureRenderer(renderer, canvas);
+    await initializeRenderer(renderer);
+
+    if (normalizedBackend === 'webgpu' && renderer.backend?.isWebGPUBackend !== true) {
+        renderer.dispose?.();
+        throw new Error(
+            '[scene_init] Native WebGPU is not available. ' +
+            'Open snapshot.html for the WebGL deploy target instead.',
+        );
     }
 
-    // WebGPU path with forceWebGL fallback.
-    let renderer = new THREE.WebGPURenderer({ canvas, antialias: true, alpha: true });
-    try {
-        configureRenderer(renderer, canvas);
-        await initializeRenderer(renderer);
-        return { renderer, backendLabel: 'WebGPU' };
-    } catch (error) {
-        console.warn('[scene_init] WebGPU init failed, retrying with forceWebGL.', error);
-        disposeRenderer(renderer);
-        renderer = new THREE.WebGPURenderer({ canvas, antialias: true, alpha: true, forceWebGL: true });
-        configureRenderer(renderer, canvas);
-        await initializeRenderer(renderer);
-        return { renderer, backendLabel: 'WebGPU(forceWebGL)' };
+    return {
+        renderer,
+        backendLabel: normalizedBackend === 'webgpu' ? 'WebGPU' : 'WebGL2',
+    };
+}
+
+function createWebGlRenderer(canvas) {
+    if (typeof THREE.WebGLRenderer !== 'function') {
+        throw new Error('[scene_init] THREE.WebGLRenderer is not available in this snapshot wrapper.');
     }
+    return new THREE.WebGLRenderer({
+        canvas, antialias: true, alpha: true, powerPreference: 'high-performance',
+    });
+}
+
+async function createWebGpuRenderer(canvas) {
+    if (typeof THREE.WebGPURenderer !== 'function') {
+        throw new Error(
+            '[scene_init] THREE.WebGPURenderer is not available in this snapshot wrapper. ' +
+            'Use snapshot_webgpu.html for the WebGPU deploy target.',
+        );
+    }
+    if (!globalThis.navigator?.gpu) {
+        throw new Error(
+            '[scene_init] Native WebGPU is not available. ' +
+            'Open snapshot.html for the WebGL deploy target instead.',
+        );
+    }
+    const adapter = await globalThis.navigator.gpu.requestAdapter({
+        powerPreference: 'high-performance',
+    }).catch(() => null);
+    if (!adapter) {
+        throw new Error(
+            '[scene_init] Native WebGPU adapter is not available. ' +
+            'Open snapshot.html for the WebGL deploy target instead.',
+        );
+    }
+    return new THREE.WebGPURenderer({
+        canvas, antialias: true, alpha: true, powerPreference: 'high-performance',
+    });
 }
 
 // ─── Scene + groups + cameras + controls ──────────────────────────────
@@ -168,17 +197,17 @@ export function createScene({ renderer, canvas } = {}) {
     // cam-lock is on by default. Snapshots are demos; users expect to drag.
     controls.enabled = true;
 
-    // Default lighting — hidden until phase 6 / 7 decides. Existence here so
-    // an empty scene still has the option of showing something.
+    // Default light handles — intentionally inert. They preserve the old
+    // fallback group/API shape without adding synthetic lighting to snapshots.
     const defaultLights = new THREE.Group();
     defaultLights.name = '__maxjs_default_lights__';
     defaultLights.visible = false;
-    const defaultAmbient = new THREE.AmbientLight(0xffffff, 0.4);
+    const defaultAmbient = new THREE.AmbientLight(0xffffff, 0.0);
     defaultAmbient.userData.volumetricBypass = true;
     defaultLights.add(defaultAmbient);
-    const defaultKey = new THREE.DirectionalLight(0xffffff, 2.5);
+    const defaultKey = new THREE.DirectionalLight(0xffffff, 0.0);
     defaultKey.userData.volumetricBypass = true;
-    defaultKey.castShadow = true;
+    defaultKey.castShadow = false;
     defaultKey.shadow.mapSize.set(2048, 2048);
     defaultKey.shadow.camera.near = 0.1;
     defaultKey.shadow.camera.far = 2000;

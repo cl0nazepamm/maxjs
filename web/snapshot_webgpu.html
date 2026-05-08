@@ -3,12 +3,11 @@
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-    <title>max.js snapshot</title>
+    <title>max.js snapshot WebGPU</title>
     <link rel="icon" href="data:,">
     <style>
         html,body { margin: 0; height: 100%; background: #000; overflow: hidden; }
         #stage { display: block; width: 100vw; height: 100vh; }
-        /* Pre-boot status — replaced by canvas content once boot() resolves. */
         #boot-status {
             position: fixed; inset: 0;
             display: flex; align-items: center; justify-content: center;
@@ -27,7 +26,7 @@
     <script type="importmap">
     {
         "imports": {
-            "three": "./vendor/three-r184/build/three.module.js",
+            "three": "./vendor/three-r184/build/three.webgpu.js",
             "three-std": "./vendor/three-r184/build/three.module.js",
             "three/webgpu": "./vendor/three-r184/build/three.webgpu.js",
             "three/tsl": "./vendor/three-r184/build/three.tsl.js",
@@ -40,9 +39,6 @@
             "./node_modules/@sparkjsdev/spark/": {
                 "three": "./vendor/three-r184/build/three.module.js"
             },
-            "./vendor/three-r184/examples/objects/Sky.js": {
-                "three": "./vendor/three-r184/build/three.module.js"
-            },
             "./vendor/three-r184/examples/lighting/LightProbeGrid.js": {
                 "three": "./vendor/three-r184/build/three.module.js"
             }
@@ -52,17 +48,12 @@
 </head>
 <body>
     <canvas id="stage"></canvas>
-    <div id="boot-status">booting…</div>
+    <div id="boot-status">booting...</div>
     <script type="module">
         import { boot } from './js/snapshot_boot.js';
 
         const status = document.getElementById('boot-status');
         const canvas = document.getElementById('stage');
-
-        // Default workflow: always export from Max into web/snapshots/current/
-        // and keep this tab open at /snapshot.html. The page auto-reloads on
-        // every fresh export. Override with ?root=... when you want a specific
-        // iter folder, or ?noreload to disable the watcher.
         const params = new URLSearchParams(location.search);
         async function hasSnapshotAt(candidateRoot) {
             try {
@@ -72,23 +63,8 @@
         }
         const root = params.get('root') ?? ((await hasSnapshotAt('.')) ? '.' : 'snapshots/current');
         const reloadEnabled = !params.has('noreload');
-        const rendererBackend = (() => {
-            const raw = String(
-                params.get('renderer')
-                ?? params.get('backend')
-                ?? params.get('rendererBackend')
-                ?? '',
-            ).toLowerCase();
-            if (params.has('webgpu') || raw.includes('webgpu')) return 'webgpu';
-            if (params.has('webgl') || raw.includes('webgl')) return 'webgl';
-            return 'webgl';
-        })();
+        const rendererBackend = 'webgpu';
 
-        // ── Auto-reload watcher ───────────────────────────────────────
-        // Polls snapshot.json. When its Last-Modified changes (or it
-        // appears for the first time after a "waiting" state), reload the
-        // page so the new scene replaces the old. Cheap: HEAD request
-        // every 1500 ms, no body bytes.
         async function pollForUpdates(initialKey) {
             const url = `${root}/snapshot.json`;
             let lastKey = initialKey;
@@ -99,12 +75,12 @@
                     if (!head.ok) continue;
                     const key = head.headers.get('last-modified') ?? head.headers.get('etag') ?? '';
                     if (key && lastKey && key !== lastKey) {
-                        console.log('[snapshot.html] new export detected, reloading');
+                        console.log('[snapshot_webgpu.html] new export detected, reloading');
                         location.reload();
                         return;
                     }
                     if (!lastKey) lastKey = key;
-                } catch { /* network blip — keep polling */ }
+                } catch {}
             }
         }
 
@@ -118,9 +94,9 @@
 
         async function waitForFirstSnapshot() {
             status.innerHTML =
-                '<div>waiting for first export…</div>' +
+                '<div>waiting for first export...</div>' +
                 `<pre style="opacity:0.7">root: ${root}/snapshot.json</pre>` +
-                '<pre style="opacity:0.5">click Export Snapshot in Max → this tab will pick it up</pre>';
+                '<pre style="opacity:0.5">click Export Snapshot in Max -> this tab will pick it up</pre>';
             while (true) {
                 await new Promise(r => setTimeout(r, 1200));
                 if ((await snapshotKey()) != null) return;
@@ -128,9 +104,6 @@
         }
 
         try {
-            // If the snapshot doesn't exist yet, sit in a "waiting" state
-            // instead of throwing. Lets the user open the tab BEFORE the
-            // first export.
             if ((await snapshotKey()) == null) {
                 await waitForFirstSnapshot();
             }
@@ -147,19 +120,14 @@
 
             if (reloadEnabled) pollForUpdates(initialKey);
         } catch (err) {
-            console.error('[max.js snapshot] boot failed', err);
+            console.error('[max.js snapshot WebGPU] boot failed', err);
             status.classList.add('error');
             status.innerHTML =
-                '<div>snapshot boot failed</div>' +
+                '<div>snapshot WebGPU boot failed</div>' +
                 '<pre>' + (err?.stack ?? err?.message ?? String(err)) + '</pre>' +
-                '<pre style="opacity:0.7">retry: refresh the page after fixing the issue</pre>';
-            // Still poll for the next export so a fix can land without manual reload.
+                '<pre style="opacity:0.7">WebGPU deploys require native browser WebGPU. Use snapshot.html for WebGL.</pre>';
             if (reloadEnabled) pollForUpdates(await snapshotKey());
         }
-
-        // boot() installs its own resize handler that updates renderer
-        // size + re-derives camera fov from Max's horizontal fov. No
-        // wrapper handler needed here.
     </script>
 </body>
 </html>

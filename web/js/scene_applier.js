@@ -15,6 +15,8 @@
 //   - Transform from `nd.t` (16-float matrix).
 //   - Visibility from `nd.vis`.
 //   - Multi/sub material groups via `geom.addGroup`.
+//   - Forest Pack / RailClone / tyFlow instance groups from binary ranges
+//     in `scene.bin`, with legacy JSON-array fallback.
 //   - Removal of stale nodes not present in the new payload.
 //   - Skeleton bind-pose calculation after the world matrix updates.
 //
@@ -22,14 +24,12 @@
 // -----------------------------------------------------
 //   - Real material building (PBR / VRay / OpenPBR / glTF / TSL / MaterialX).
 //     Replaced with a flat MeshStandardMaterial via `materialBuilder`.
-//   - Forest Pack / Rail Clone instance buckets.
-//     `planInstanceBuckets` is invoked but the default returns "no buckets."
 //   - Vertex color attribute updates.
 //   - jsmod (three.js Deform) sync state.
 //   - HTML auto-fit, selection state stamping.
 //   - Light linking / light probes / scene profiling.
 //   - `finalizeSceneSnapshot` side effects (camera fit, HDRI load, fog,
-//     splats, audio, gltf, hairInstances, forestInstances, volumes).
+//     splats, audio, gltf, hairInstances, volumes).
 //
 // All of the above are wired through the `hooks` parameter so caller code
 // can opt in incrementally. The default hooks are no-ops.
@@ -41,8 +41,9 @@
 // Returns:
 //   { sceneChanged, transformsChanged, applyMs, addedHandles, removedHandles }
 
-import * as THREE from 'three/webgpu';
+import * as THREE from 'three';
 import {
+    binInRange,
     geometryFromNodeBinary,
     attachSkinAttributes,
     buildSkinnedMeshFromNd,
@@ -62,6 +63,10 @@ const DEFAULT_HOOKS = Object.freeze({
         wantsLine
             ? new THREE.LineBasicMaterial({ color: 0xcccccc })
             : new THREE.MeshStandardMaterial({ color: 0xb0b0b0, roughness: 0.6, metalness: 0.0 }),
+
+    /** ({ grp, geom }) -> THREE.Material | THREE.Material[] */
+    instanceMaterialBuilder: () =>
+        new THREE.MeshStandardMaterial({ color: 0x888888, roughness: 0.7, side: THREE.DoubleSide }),
 
     /** ({ mesh, nd }) → bool changed — for incremental material edits */
     materialUpdater: RETURNS_FALSE,
@@ -161,6 +166,156 @@ function applyTransform(mesh, t) {
     mesh.matrix.fromArray(t);
     mesh.matrixWorldNeedsUpdate = true;
     return true;
+}
+
+// ─── Binary instance groups ───────────────────────────────────────────
+function binaryFloatView(buffer, off, n, label) {
+    if (!binInRange(buffer, off, n)) {
+        console.warn(`[scene_applier] Invalid ${label} float range`, { off, n });
+        return null;
+    }
+    return new Float32Array(buffer, off, n);
+}
+
+function binaryIntView(buffer, off, n, label) {
+    if (!binInRange(buffer, off, n)) {
+        console.warn(`[scene_applier] Invalid ${label} int range`, { off, n });
+        return null;
+    }
+    return new Int32Array(buffer, off, n);
+}
+
+function vectorPayloadToFloat32(arrayLike) {
+    return Array.isArray(arrayLike) || ArrayBuffer.isView(arrayLike)
+        ? new Float32Array(arrayLike)
+        : null;
+}
+
+function vectorPayloadToUint32(arrayLike) {
+    return Array.isArray(arrayLike) || ArrayBuffer.isView(arrayLike)
+        ? new Uint32Array(arrayLike)
+        : null;
+}
+
+function buildInstanceGeometry(grp, buffer) {
+    const geo = grp?.geo;
+    let verts = null;
+    let indices = null;
+    let uvs = null;
+    let norms = null;
+
+    if (geo) {
+        const vView = binaryFloatView(buffer, geo.vOff, geo.vN, 'instance position');
+        const iView = binaryIntView(buffer, geo.iOff, geo.iN, 'instance index');
+        if (!vView || !iView) return null;
+        verts = new Float32Array(vView);
+        indices = new Uint32Array(iView);
+        if (geo.uvOff != null && geo.uvN) {
+            const uvView = binaryFloatView(buffer, geo.uvOff, geo.uvN, 'instance uv');
+            if (uvView) uvs = new Float32Array(uvView);
+        }
+        if (geo.nOff != null && geo.nN) {
+            const nView = binaryFloatView(buffer, geo.nOff, geo.nN, 'instance normal');
+            if (nView) norms = new Float32Array(nView);
+        }
+    } else {
+        verts = vectorPayloadToFloat32(grp?.v);
+        indices = vectorPayloadToUint32(grp?.i);
+        uvs = vectorPayloadToFloat32(grp?.uv);
+        norms = vectorPayloadToFloat32(grp?.norm);
+    }
+
+    if (!verts?.length || !indices?.length) return null;
+
+    const geom = new THREE.BufferGeometry();
+    geom.setAttribute('position', new THREE.BufferAttribute(verts, 3));
+    geom.setIndex(new THREE.BufferAttribute(indices, 1));
+    if (uvs?.length) geom.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
+    if (norms?.length) geom.setAttribute('normal', new THREE.BufferAttribute(norms, 3));
+    else geom.computeVertexNormals();
+
+    if (Array.isArray(grp.groups)) {
+        for (const [start, count, idx] of grp.groups) geom.addGroup(start, count, idx);
+    }
+    return geom;
+}
+
+function getInstanceTransformPayload(grp, buffer) {
+    if (Number.isInteger(grp?.xformOff) && Number.isInteger(grp?.xformN)) {
+        return binaryFloatView(buffer, grp.xformOff, grp.xformN, 'instance transform');
+    }
+    return Array.isArray(grp?.xforms) || ArrayBuffer.isView(grp?.xforms)
+        ? grp.xforms
+        : null;
+}
+
+function setMatrixFromRowMajor16(matrix, values, off) {
+    // Instance payloads preserve Max row-major Matrix3 layout. Three's
+    // Matrix4.set takes row-major arguments and stores column-major internally.
+    matrix.set(
+        values[off + 0], values[off + 4], values[off + 8],  values[off + 12],
+        values[off + 1], values[off + 5], values[off + 9],  values[off + 13],
+        values[off + 2], values[off + 6], values[off + 10], values[off + 14],
+        values[off + 3], values[off + 7], values[off + 11], values[off + 15],
+    );
+}
+
+function disposeInstanceMeshes(ctx, hooks) {
+    const forestMeshes = ctx.forestMeshes;
+    if (!forestMeshes?.size) return 0;
+    let removed = 0;
+    for (const mesh of forestMeshes.values()) {
+        if (!mesh) continue;
+        mesh.parent?.remove(mesh);
+        mesh.geometry?.dispose?.();
+        hooks.disposeMaterial(mesh.material);
+        removed++;
+    }
+    forestMeshes.clear();
+    return removed;
+}
+
+function applyForestInstances(groups, buffer, ctx, hooks) {
+    ctx.forestMeshes ??= new Map();
+    const removed = disposeInstanceMeshes(ctx, hooks);
+    let added = 0;
+
+    if (!Array.isArray(groups) || groups.length === 0) {
+        return { sceneChanged: removed > 0, added, removed };
+    }
+
+    const matrix = new THREE.Matrix4();
+    for (const grp of groups) {
+        const xforms = getInstanceTransformPayload(grp, buffer);
+        const count = grp?.count || Math.floor((xforms?.length || 0) / 16);
+        if (!count || !xforms || xforms.length < count * 16) continue;
+
+        const geom = buildInstanceGeometry(grp, buffer);
+        if (!geom) continue;
+
+        const material = hooks.instanceMaterialBuilder({ grp, geom });
+        const instMesh = new THREE.InstancedMesh(geom, material, count);
+        instMesh.matrixAutoUpdate = false;
+        instMesh.frustumCulled = false;
+        instMesh.castShadow = true;
+        instMesh.receiveShadow = true;
+        const groupKey = String(grp.key ?? grp.src ?? added);
+        instMesh.name = `forest_${groupKey}_x${count}`;
+        instMesh.userData.maxjsInstanceGroup = true;
+        instMesh.userData.maxjsSource = groupKey;
+
+        for (let i = 0; i < count; i++) {
+            setMatrixFromRowMajor16(matrix, xforms, i * 16);
+            instMesh.setMatrixAt(i, matrix);
+        }
+        instMesh.instanceMatrix.needsUpdate = true;
+
+        ctx.maxRoot.add(instMesh);
+        ctx.forestMeshes.set(groupKey, instMesh);
+        added++;
+    }
+
+    return { sceneChanged: removed > 0 || added > 0, added, removed };
 }
 
 // ─── applySceneBin ─────────────────────────────────────────────────────
@@ -299,6 +454,11 @@ export async function applySceneBin({ buffer, meta, ctx, hooks: userHooks = {}, 
         const xformChanged = applyTransform(mesh, nd.t);
         if (nd.s != null) hooks.applySelection(mesh, nd.s);
         if (visChanged || xformChanged) transformsChanged = true;
+    }
+
+    if (Object.prototype.hasOwnProperty.call(meta, 'forestInstances') || ctx.forestMeshes?.size) {
+        const instanced = applyForestInstances(meta.forestInstances ?? [], buffer, ctx, hooks);
+        if (instanced.sceneChanged) sceneChanged = true;
     }
 
     if (transformsChanged || sceneChanged) hooks.markRuntimeTransformsDirty();

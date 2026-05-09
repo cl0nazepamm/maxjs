@@ -164,6 +164,7 @@ const DEFAULT_BAKE_STATE = Object.freeze({
     extension: 'png',
     intensity: 1.0,
     bakeExposure: 0,
+    proxyDisplay: false,
 });
 
 function normalizeBakeState(payload) {
@@ -188,6 +189,7 @@ function normalizeBakeState(payload) {
     next.extension = String(next.extension || DEFAULT_BAKE_STATE.extension).replace(/^\./, '') || DEFAULT_BAKE_STATE.extension;
     next.intensity = Number.isFinite(Number(next.intensity)) ? Math.max(0, Number(next.intensity)) : 1.0;
     next.bakeExposure = Number.isFinite(Number(next.bakeExposure)) ? Number(next.bakeExposure) : 0;
+    next.proxyDisplay = raw.proxyDisplay === true;
     next.files = Array.isArray(raw.files)
         ? raw.files.map(file => String(file || '')).filter(Boolean)
         : null;
@@ -724,9 +726,22 @@ export function createMaterialBuilder({ rootUrl = '.', bakeState = null } = {}) 
         return loadTextureEntry(url, colorSpace, xf, fallbackTexture, { silent: true });
     }
 
-    function createBeautyBakeMaterial(source, texture) {
+    function bakeExposureScale() {
+        const scale = bakeOverrides.intensity * Math.pow(2, bakeOverrides.bakeExposure);
+        return Number.isFinite(scale) ? Math.max(0, scale) : 1;
+    }
+
+    function isDisplayBakedBeautyProxy(url = '') {
+        if (bakeOverrides.proxyDisplay !== true || bakeOverrides.mode !== 'beauty') return false;
+        const ext = getTextureExtension(url);
+        return ext !== 'exr' && ext !== 'hdr';
+    }
+
+    function createBeautyBakeMaterial(source, texture, url = '') {
+        const displayProxy = isDisplayBakedBeautyProxy(url);
+        const exposureScale = displayProxy ? 1 : bakeExposureScale();
         const material = new THREE.MeshBasicMaterial({
-            color: new THREE.Color(1, 1, 1),
+            color: new THREE.Color(exposureScale, exposureScale, exposureScale),
             map: texture,
             side: source?.side ?? THREE.FrontSide,
             transparent: !!source?.transparent || (Number.isFinite(source?.opacity) && source.opacity < 1),
@@ -734,7 +749,7 @@ export function createMaterialBuilder({ rootUrl = '.', bakeState = null } = {}) 
             alphaMap: source?.alphaMap ?? null,
             depthWrite: source?.depthWrite ?? true,
             depthTest: source?.depthTest ?? true,
-            toneMapped: !!source?.toneMapped,
+            toneMapped: !displayProxy,
         });
         material.name = source?.name ? `${source.name} bake beauty` : 'bake beauty';
         material.userData = { ...(source?.userData || {}), maxjsBakeOverride: 'beauty' };
@@ -747,8 +762,6 @@ export function createMaterialBuilder({ rootUrl = '.', bakeState = null } = {}) 
         const bakeNameSource = { name: descriptor?.name ?? 'material' };
         const url = getBakeTextureUrl(context.nd, descriptor, bakeNameSource, 'beauty');
         if (!url) return null;
-        const ext = getTextureExtension(url);
-        const hdrBake = ext === 'exr' || ext === 'hdr';
 
         const source = {
             name: descriptor?.name ?? 'material',
@@ -757,7 +770,7 @@ export function createMaterialBuilder({ rootUrl = '.', bakeState = null } = {}) 
             opacity: Number.isFinite(params.opacity) ? params.opacity : 1,
             depthWrite: params.depthWrite ?? true,
             depthTest: params.depthTest ?? true,
-            toneMapped: hdrBake,
+            toneMapped: true,
             userData: {
                 maxjsSourceMaterialName: descriptor?.name ?? 'material',
                 maxjsRequestedMaterialModel: 'MeshBasicMaterial',
@@ -768,7 +781,7 @@ export function createMaterialBuilder({ rootUrl = '.', bakeState = null } = {}) 
         const fallback = colorFallbackTexture(params.color, THREE.SRGBColorSpace);
         const entry = loadBakeTextureEntry(url, THREE.SRGBColorSpace, 2, fallback);
         if (!entry) return null;
-        const baked = createBeautyBakeMaterial(source, entry.texture);
+        const baked = createBeautyBakeMaterial(source, entry.texture, url);
         baked.userData.maxjsBeautyBakeReplacement = true;
         baked.userData.maxjsBoundTextureSlots = ['map'];
         baked.userData.maxjsBakeSourceUrl = url;
@@ -797,10 +810,10 @@ export function createMaterialBuilder({ rootUrl = '.', bakeState = null } = {}) 
         if (kind === 'beauty') {
             material.userData ??= {};
             material.userData.maxjsSourceMaterialName = material.userData.maxjsSourceMaterialName ?? getMaterialBakeName(md, material);
-            material.toneMapped = getTextureExtension(url) === 'exr' || getTextureExtension(url) === 'hdr';
+            material.toneMapped = !isDisplayBakedBeautyProxy(url);
             const entry = loadBakeTextureEntry(url, THREE.SRGBColorSpace, 2, fallbackTextures.black);
             if (!entry) return material;
-            const baked = createBeautyBakeMaterial(material, entry.texture);
+            const baked = createBeautyBakeMaterial(material, entry.texture, url);
             if (!entry.loaded && !entry.failed) {
                 entry.callbacks.push((texture) => {
                     baked.map = texture;
@@ -815,7 +828,7 @@ export function createMaterialBuilder({ rootUrl = '.', bakeState = null } = {}) 
         const assign = (texture) => {
             if (!textureReadyForMaterialBinding(texture)) return;
             material.lightMap = texture;
-            material.lightMapIntensity = bakeOverrides.intensity * Math.pow(2, bakeOverrides.bakeExposure);
+            material.lightMapIntensity = bakeExposureScale();
             material.userData ??= {};
             material.userData.maxjsBakeOverride = 'lightmap';
             material.needsUpdate = true;

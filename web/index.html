@@ -3122,6 +3122,17 @@
             return null;
         }
 
+        function bakeExposureScale() {
+            const scale = bakeOverrides.intensity * Math.pow(2, bakeOverrides.bakeExposure);
+            return Number.isFinite(scale) ? Math.max(0, scale) : 1;
+        }
+
+        function isDisplayBakedBeautyProxy(url = '') {
+            if (bakeOverrides.proxyDisplay !== true || bakeOverrides.mode !== 'beauty') return false;
+            const ext = getTextureExtension(url);
+            return ext !== 'exr' && ext !== 'hdr';
+        }
+
         function clearBakeTextureLoadFailures() {
             for (const key of [...failedTextureCache]) {
                 if (String(key).startsWith('["bake",')) failedTextureCache.delete(key);
@@ -4726,6 +4737,9 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             on(type, fn) { (this.handlers[type] ??= []).push(fn); },
             dispatch(msg) { (this.handlers[msg.type] || []).forEach(fn => fn(msg)); }
         };
+        const pendingHostActions = new Map();
+        let nextHostActionId = 1;
+
         function toBase64Utf8(text) {
             const bytes = new TextEncoder().encode(String(text ?? ''));
             let binary = '';
@@ -4734,6 +4748,30 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
             }
             return btoa(binary);
+        }
+
+        function bytesToBase64(bytes) {
+            let binary = '';
+            const chunkSize = 0x8000;
+            for (let i = 0; i < bytes.length; i += chunkSize) {
+                binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+            }
+            return btoa(binary);
+        }
+
+        function requestHostAction(action, data = {}, timeoutMs = 60000) {
+            if (!window.chrome?.webview) {
+                return Promise.reject(new Error(`${action} requires the 3ds Max host`));
+            }
+            const requestId = `host_${Date.now()}_${nextHostActionId++}`;
+            return new Promise((resolve, reject) => {
+                const timeout = setTimeout(() => {
+                    pendingHostActions.delete(requestId);
+                    reject(new Error(`${action} timed out`));
+                }, timeoutMs);
+                pendingHostActions.set(requestId, { action, resolve, reject, timeout });
+                bridge.send(action, { requestId, ...data });
+            });
         }
 
         let hasInitialSync = false;
@@ -5194,6 +5232,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             extension: 'png',
             intensity: 1.0,
             bakeExposure: 0,
+            proxyDisplay: false,
         });
         let bakeOverrides = { ...DEFAULT_BAKE_STATE };
         let lastBakeUv2RequestKey = '';
@@ -5212,6 +5251,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             next.extension = String(next.extension || DEFAULT_BAKE_STATE.extension).replace(/^\./, '') || DEFAULT_BAKE_STATE.extension;
             next.intensity = Number.isFinite(Number(next.intensity)) ? Math.max(0, Number(next.intensity)) : 1.0;
             next.bakeExposure = Number.isFinite(Number(next.bakeExposure)) ? Number(next.bakeExposure) : 0;
+            next.proxyDisplay = raw.proxyDisplay === true;
             return next;
         }
 
@@ -5285,13 +5325,14 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             return bakeOverrides.sceneName;
         }
 
-        function getBakeTextureUrl(nd, material, kind, mesh = null) {
+        function getBakeTextureUrl(nd, material, kind, mesh = null, extensionOverride = null) {
             if (!bakeOverrides.enabled || !bakeOverrides.folder) return '';
             const folder = normalizeBakeFolderUrl(bakeOverrides.folder);
             if (!folder) return '';
             const suffix = kind === 'beauty' ? bakeOverrides.beautySuffix : bakeOverrides.lightSuffix;
             const stem = sanitizeBakeFileStem(getBakeTargetName(nd, material, mesh));
-            return `${folder}${encodeURIComponent(`${stem}${suffix}.${bakeOverrides.extension}`)}`;
+            const extension = String(extensionOverride || bakeOverrides.extension || DEFAULT_BAKE_STATE.extension).replace(/^\./, '');
+            return `${folder}${encodeURIComponent(`${stem}${suffix}.${extension}`)}`;
         }
 
         function hasGeometryUV2(geom) {
@@ -5317,10 +5358,12 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             }, 50);
         }
 
-        function createBeautyBakeMaterial(source, texture) {
+        function createBeautyBakeMaterial(source, texture, url = '') {
             const BakeTHREE = isWebGLTexturePathActive() ? THREE_STD : THREE;
+            const displayProxy = isDisplayBakedBeautyProxy(url);
+            const exposureScale = displayProxy ? 1 : bakeExposureScale();
             const mat = new BakeTHREE.MeshBasicMaterial({
-                color: new BakeTHREE.Color(1, 1, 1),
+                color: new BakeTHREE.Color(exposureScale, exposureScale, exposureScale),
                 map: applyTextureUvChannel(texture, 2, 2),
                 side: source?.side ?? BakeTHREE.FrontSide,
                 transparent: !!source?.transparent || (Number.isFinite(source?.opacity) && source.opacity < 1),
@@ -5328,7 +5371,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 alphaMap: source?.alphaMap ?? null,
                 depthWrite: source?.depthWrite ?? true,
                 depthTest: source?.depthTest ?? true,
-                toneMapped: !!source?.toneMapped,
+                toneMapped: !displayProxy,
             });
             mat.name = source?.name ? `${source.name} bake beauty` : 'bake beauty';
             mat.userData = { ...(source?.userData || {}), maxjsBakeOverride: 'beauty' };
@@ -5349,11 +5392,10 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     return material;
                 }
                 const tex = loadBakeTexture(url, THREE.SRGBColorSpace, 2);
-                const ext = getTextureExtension(url);
                 material.userData ??= {};
                 material.userData.maxjsBakeSourceUrl = url;
-                material.toneMapped = ext === 'exr' || ext === 'hdr';
-                return tex ? createBeautyBakeMaterial(material, tex) : material;
+                material.toneMapped = !isDisplayBakedBeautyProxy(url);
+                return tex ? createBeautyBakeMaterial(material, tex, url) : material;
             }
 
             if (!hasGeometryUV2(geom)) {
@@ -5364,7 +5406,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             const tex = loadBakeTexture(url, THREE.LinearSRGBColorSpace, 2);
             if (!tex) return material;
             material.lightMap = tex;
-            material.lightMapIntensity = bakeOverrides.intensity * Math.pow(2, bakeOverrides.bakeExposure);
+            material.lightMapIntensity = bakeExposureScale();
             material.userData ??= {};
             material.userData.maxjsBakeOverride = 'lightmap';
             material.needsUpdate = true;
@@ -8379,7 +8421,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             const tex = loadBakeTexture(url, THREE.LinearSRGBColorSpace, 2);
             if (!tex) return false;
             const nextLightMap = tex;
-            const intensity = bakeOverrides.intensity * Math.pow(2, bakeOverrides.bakeExposure);
+            const intensity = bakeExposureScale();
             const lightMapChanged = material.lightMap !== nextLightMap;
             const intensityChanged = material.lightMapIntensity !== intensity;
             if (!lightMapChanged && !intensityChanged && wasOverride === 'lightmap') return false;
@@ -8557,6 +8599,249 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             return rows;
         }
 
+        function getAllBakeProxyTargets() {
+            const rows = [];
+            const seen = new Set();
+            const suffix = bakeOverrides.beautySuffix ?? '';
+            for (const mesh of nodeMap.values()) {
+                const nd = mesh?.userData?.maxjsLastNodePayload;
+                if (!mesh?.isMesh || !nd || !hasGeometryUV2(mesh.geometry)) continue;
+                const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+                for (const material of materials) {
+                    const stem = sanitizeBakeFileStem(getBakeTargetName(nd, material, mesh));
+                    const filename = `${stem}${suffix}.png`;
+                    if (seen.has(filename)) continue;
+                    seen.add(filename);
+                    rows.push({
+                        stem,
+                        filename,
+                        sourceUrl: getBakeTextureUrl(nd, material, 'beauty', mesh, 'exr'),
+                        maxDimension: /containers?_main/i.test(stem) ? 2048 : 1024,
+                    });
+                }
+            }
+            rows.sort((a, b) => {
+                const knownA = /^(containers?_main|containers?_bg|ground_main|ground_bg|character|bg)$/i.test(a.stem);
+                const knownB = /^(containers?_main|containers?_bg|ground_main|ground_bg|character|bg)$/i.test(b.stem);
+                if (knownA !== knownB) return knownA ? -1 : 1;
+                return a.stem.localeCompare(b.stem, undefined, { sensitivity: 'base' });
+            });
+            return rows;
+        }
+
+        function loadProxySourceTexture(url) {
+            return new Promise((resolve, reject) => {
+                const ext = getTextureExtension(url);
+                const loader = ext === 'exr'
+                    ? exrLoader
+                    : (ext === 'hdr' ? rgbeLoader : textureLoader);
+                loader.load(
+                    url,
+                    texture => {
+                        texture.colorSpace = colorSpaceForTextureExtension(ext, THREE.SRGBColorSpace);
+                        texture.needsUpdate = true;
+                        resolve(texture);
+                    },
+                    undefined,
+                    error => reject(error || new Error(`Failed to load ${url}`)),
+                );
+            });
+        }
+
+        function cloneProxyTextureForWebGL(texture) {
+            if (!texture?.isTexture) return null;
+            let result = null;
+            if (texture.isDataTexture && texture.image?.data) {
+                const image = texture.image;
+                result = new THREE_STD.DataTexture(
+                    image.data,
+                    image.width,
+                    image.height,
+                    texture.format,
+                    texture.type,
+                );
+                result.unpackAlignment = texture.unpackAlignment;
+            } else if (texture.image) {
+                result = new THREE_STD.Texture(texture.image);
+            }
+            if (!result) return null;
+            result.colorSpace = texture.colorSpace;
+            result.flipY = texture.flipY;
+            result.wrapS = result.wrapT = THREE_STD.ClampToEdgeWrapping;
+            result.minFilter = THREE_STD.LinearFilter;
+            result.magFilter = THREE_STD.LinearFilter;
+            result.generateMipmaps = false;
+            result.channel = 0;
+            result.needsUpdate = true;
+            return result;
+        }
+
+        let bakeProxyRenderer = null;
+        function getBakeProxyRenderer() {
+            if (bakeProxyRenderer) return bakeProxyRenderer;
+            bakeProxyRenderer = new THREE_STD.WebGLRenderer({
+                antialias: false,
+                alpha: false,
+                premultipliedAlpha: false,
+                preserveDrawingBuffer: false,
+            });
+            bakeProxyRenderer.outputColorSpace = THREE_STD.SRGBColorSpace;
+            bakeProxyRenderer.setPixelRatio(1);
+            return bakeProxyRenderer;
+        }
+
+        function stdToneMappingForCurrentMode() {
+            return {
+                None: THREE_STD.NoToneMapping,
+                Linear: THREE_STD.LinearToneMapping,
+                Reinhard: THREE_STD.ReinhardToneMapping,
+                Cineon: THREE_STD.CineonToneMapping,
+                AgX: THREE_STD.AgXToneMapping,
+                Neutral: THREE_STD.NeutralToneMapping,
+            }[currentToneMapping] ?? THREE_STD.NeutralToneMapping;
+        }
+
+        async function renderBakeTextureProxy(target) {
+            const source = await loadProxySourceTexture(target.sourceUrl);
+            const image = source.image || {};
+            const sourceWidth = Math.max(1, Number(image.width) || 1);
+            const sourceHeight = Math.max(1, Number(image.height) || 1);
+            const scale = Math.min(1, target.maxDimension / Math.max(sourceWidth, sourceHeight));
+            const width = Math.max(1, Math.round(sourceWidth * scale));
+            const height = Math.max(1, Math.round(sourceHeight * scale));
+
+            const proxyTexture = cloneProxyTextureForWebGL(source);
+            if (!proxyTexture) throw new Error(`Unsupported proxy source texture: ${target.sourceUrl}`);
+
+            const rendererProxy = getBakeProxyRenderer();
+            const previousTarget = rendererProxy.getRenderTarget();
+            const previousToneMapping = rendererProxy.toneMapping;
+            const previousExposure = rendererProxy.toneMappingExposure;
+            const previousOutputColorSpace = rendererProxy.outputColorSpace;
+            rendererProxy.setSize(width, height, false);
+            rendererProxy.outputColorSpace = THREE_STD.SRGBColorSpace;
+            rendererProxy.toneMapping = stdToneMappingForCurrentMode();
+            rendererProxy.toneMappingExposure = currentExposure;
+
+            const sceneProxy = new THREE_STD.Scene();
+            const cameraProxy = new THREE_STD.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+            const exposureScale = bakeExposureScale();
+            const materialProxy = new THREE_STD.MeshBasicMaterial({
+                color: new THREE_STD.Color(exposureScale, exposureScale, exposureScale),
+                map: proxyTexture,
+                toneMapped: true,
+            });
+            const meshProxy = new THREE_STD.Mesh(new THREE_STD.PlaneGeometry(2, 2), materialProxy);
+            sceneProxy.add(meshProxy);
+
+            const renderTarget = new THREE_STD.WebGLRenderTarget(width, height, {
+                format: THREE_STD.RGBAFormat,
+                type: THREE_STD.UnsignedByteType,
+                depthBuffer: false,
+                stencilBuffer: false,
+            });
+            renderTarget.texture.colorSpace = THREE_STD.SRGBColorSpace;
+
+            try {
+                rendererProxy.setRenderTarget(renderTarget);
+                rendererProxy.clear(true, true, true);
+                rendererProxy.render(sceneProxy, cameraProxy);
+                const rgba = new Uint8Array(width * height * 4);
+                rendererProxy.readRenderTargetPixels(renderTarget, 0, 0, width, height, rgba);
+                const rgb = new Uint8Array(width * height * 3);
+                for (let y = 0; y < height; y++) {
+                    const srcRow = height - 1 - y;
+                    for (let x = 0; x < width; x++) {
+                        const src = (srcRow * width + x) * 4;
+                        const dst = (y * width + x) * 3;
+                        rgb[dst + 0] = rgba[src + 0];
+                        rgb[dst + 1] = rgba[src + 1];
+                        rgb[dst + 2] = rgba[src + 2];
+                    }
+                }
+                return { width, height, rgb };
+            } finally {
+                rendererProxy.setRenderTarget(previousTarget);
+                rendererProxy.toneMapping = previousToneMapping;
+                rendererProxy.toneMappingExposure = previousExposure;
+                rendererProxy.outputColorSpace = previousOutputColorSpace;
+                renderTarget.dispose();
+                materialProxy.dispose();
+                meshProxy.geometry.dispose();
+                proxyTexture.dispose?.();
+                source.dispose?.();
+            }
+        }
+
+        let bakeProxyExportActive = false;
+        async function encodeBeautyBakeProxyMaps() {
+            if (bakeProxyExportActive) return;
+            if (!window.chrome?.webview) {
+                reportBridgeError('bake proxy encode', 'Available only inside max.js');
+                return;
+            }
+            const current = bakePanelVisible ? readBakeStateFromPanel() : bakeOverrides;
+            if (current.mode !== 'beauty') {
+                reportBridgeError('bake proxy encode', 'Switch Bake Overrides mode to Beauty first');
+                return;
+            }
+            if (!current.folder) {
+                reportBridgeError('bake proxy encode', 'Set a bake folder first');
+                return;
+            }
+
+            applyBakeState(current, { persist: true, rebuild: true, refreshPanel: false, force: true });
+            const targets = getAllBakeProxyTargets();
+            if (targets.length === 0) {
+                reportBridgeError('bake proxy encode', 'No UV2 beauty bake targets found');
+                return;
+            }
+
+            bakeProxyExportActive = true;
+            if (bakePanelVisible) rebuildBakePanel();
+            try {
+                let written = 0;
+                let skipped = 0;
+                for (let i = 0; i < targets.length; i++) {
+                    const target = targets[i];
+                    perfHud.setStatus(`max.js - encoding beauty proxy ${i + 1}/${targets.length}: ${target.filename}`);
+                    try {
+                        const rendered = await renderBakeTextureProxy(target);
+                        await requestHostAction('bake_proxy_image_write', {
+                            folder: current.folder,
+                            filename: target.filename,
+                            width: rendered.width,
+                            height: rendered.height,
+                            rgbBase64: bytesToBase64(rendered.rgb),
+                        }, 120000);
+                        written++;
+                    } catch (error) {
+                        skipped++;
+                        maxjsDebugWarn(
+                            `[max.js bake proxy] skipped ${target.filename} from ${target.sourceUrl}:`,
+                            error,
+                        );
+                    }
+                }
+                if (written <= 0) {
+                    throw new Error(`No beauty proxy maps were written (${skipped} skipped)`);
+                }
+
+                applyBakeState({ ...bakeOverrides, extension: 'png', proxyDisplay: true }, {
+                    persist: true,
+                    rebuild: true,
+                    refreshPanel: true,
+                    force: true,
+                });
+                perfHud.setStatus(`max.js - encoded ${written} display-baked PNG beauty proxies${skipped ? ` (${skipped} skipped)` : ''}`);
+            } catch (error) {
+                reportBridgeError('bake proxy encode', error);
+            } finally {
+                bakeProxyExportActive = false;
+                if (bakePanelVisible) rebuildBakePanel();
+            }
+        }
+
         function isBakeTextInput(el) {
             return el?.tagName === 'INPUT' && String(el.type || '').toLowerCase() === 'text';
         }
@@ -8613,6 +8898,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                         <div class="bake-actions">
                             <button id="bake-reapply" type="button">Reapply</button>
                             <button id="bake-sync" type="button">Sync UV2</button>
+                            <button id="bake-proxy" type="button" ${bakeProxyExportActive ? 'disabled' : ''}>Encode PNG Proxy</button>
                         </div>
                     </section>
                 </div>`;
@@ -8626,6 +8912,9 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 lastBakeUv2RequestKey = '';
                 bridge.send('sync_lightmap_uvs', { reason: 'manual' });
                 perfHud.setStatus('max.js - requested full scene sync for UV2/lightmaps');
+            });
+            bakePanel.querySelector('#bake-proxy')?.addEventListener('click', () => {
+                void encodeBeautyBakeProxyMaps();
             });
             for (const el of bakePanel.querySelectorAll('input,select')) {
                 if (isBakeTextInput(el) || el.id === 'bake-intensity') {
@@ -9592,6 +9881,14 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         };
 
         bridge.on('host_action_result', msg => {
+            const pending = pendingHostActions.get(msg.requestId);
+            if (pending && (!msg.action || msg.action === pending.action)) {
+                pendingHostActions.delete(msg.requestId);
+                clearTimeout(pending.timeout);
+                if (msg.ok) pending.resolve(msg);
+                else pending.reject(new Error(msg.error || `${pending.action} failed`));
+            }
+
             if (msg.action !== 'snapshot_export') return;
             if (pendingSnapshotRequestId && msg.requestId && msg.requestId !== pendingSnapshotRequestId) return;
             pendingSnapshotRequestId = null;

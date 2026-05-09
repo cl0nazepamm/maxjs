@@ -442,6 +442,92 @@ static bool WriteUtf8File(const std::wstring& path, const std::wstring& text) {
     return WriteBinaryFile(path, WideToUtf8(text));
 }
 
+static bool WriteRgb24PngFile(const std::wstring& path,
+                              UINT width,
+                              UINT height,
+                              const std::string& rgb,
+                              std::wstring& error) {
+    if (width == 0 || height == 0) {
+        error = L"Invalid proxy image dimensions";
+        return false;
+    }
+    const size_t expectedBytes = static_cast<size_t>(width) * static_cast<size_t>(height) * 3u;
+    if (rgb.size() != expectedBytes) {
+        error = L"Proxy image byte count does not match dimensions";
+        return false;
+    }
+
+    std::vector<BYTE> bgr(expectedBytes);
+    for (size_t i = 0; i < expectedBytes; i += 3) {
+        bgr[i + 0] = static_cast<BYTE>(rgb[i + 2]);
+        bgr[i + 1] = static_cast<BYTE>(rgb[i + 1]);
+        bgr[i + 2] = static_cast<BYTE>(rgb[i + 0]);
+    }
+
+    ComPtr<IWICImagingFactory> wic;
+    if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr,
+        CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic))) || !wic) {
+        error = L"Failed to create WIC imaging factory";
+        return false;
+    }
+
+    const std::filesystem::path dstPath(path);
+    std::error_code ec;
+    std::filesystem::create_directories(dstPath.parent_path(), ec);
+    if (ec) {
+        error = L"Failed to create proxy image output directory";
+        return false;
+    }
+
+    ComPtr<IWICStream> stream;
+    if (FAILED(wic->CreateStream(&stream)) || !stream) {
+        error = L"Failed to create WIC stream";
+        return false;
+    }
+    if (FAILED(stream->InitializeFromFilename(path.c_str(), GENERIC_WRITE))) {
+        error = L"Failed to open proxy image output file";
+        return false;
+    }
+
+    ComPtr<IWICBitmapEncoder> encoder;
+    if (FAILED(wic->CreateEncoder(GUID_ContainerFormatPng, nullptr, &encoder)) || !encoder) {
+        error = L"Failed to create PNG encoder";
+        return false;
+    }
+    if (FAILED(encoder->Initialize(stream.Get(), WICBitmapEncoderNoCache))) {
+        error = L"Failed to initialize PNG encoder";
+        return false;
+    }
+
+    ComPtr<IWICBitmapFrameEncode> frame;
+    ComPtr<IPropertyBag2> props;
+    if (FAILED(encoder->CreateNewFrame(&frame, &props)) || !frame) {
+        error = L"Failed to create PNG frame";
+        return false;
+    }
+    if (FAILED(frame->Initialize(props.Get())) || FAILED(frame->SetSize(width, height))) {
+        error = L"Failed to initialize PNG frame";
+        return false;
+    }
+
+    WICPixelFormatGUID pixelFormat = GUID_WICPixelFormat24bppBGR;
+    if (FAILED(frame->SetPixelFormat(&pixelFormat)) ||
+        !IsEqualGUID(pixelFormat, GUID_WICPixelFormat24bppBGR)) {
+        error = L"PNG encoder did not accept RGB output format";
+        return false;
+    }
+
+    const UINT stride = width * 3u;
+    if (FAILED(frame->WritePixels(height, stride, static_cast<UINT>(bgr.size()), bgr.data())) ||
+        FAILED(frame->Commit()) ||
+        FAILED(encoder->Commit())) {
+        error = L"Failed to write proxy PNG";
+        return false;
+    }
+
+    return true;
+}
+
 static std::wstring HexU64(uint64_t value) {
     wchar_t buffer[17] = {};
     swprintf_s(buffer, L"%016llx", static_cast<unsigned long long>(value));
@@ -11452,6 +11538,56 @@ public:
         return true;
     }
 
+    bool WriteBakeProxyImage(const std::wstring& folder,
+                             const std::wstring& filename,
+                             int width,
+                             int height,
+                             const std::wstring& rgbBase64,
+                             std::wstring& error) {
+        std::wstring outDir = folder;
+        while (!outDir.empty() && iswspace(outDir.front())) outDir.erase(outDir.begin());
+        while (!outDir.empty() && iswspace(outDir.back())) outDir.pop_back();
+        if (outDir.size() >= 2 &&
+            ((outDir.front() == L'"' && outDir.back() == L'"') ||
+             (outDir.front() == L'\'' && outDir.back() == L'\''))) {
+            outDir = outDir.substr(1, outDir.size() - 2);
+        }
+        std::replace(outDir.begin(), outDir.end(), L'/', L'\\');
+
+        const bool absoluteDrivePath = outDir.size() >= 3 &&
+            iswalpha(outDir[0]) && outDir[1] == L':' &&
+            (outDir[2] == L'\\' || outDir[2] == L'/');
+        const bool uncPath = outDir.rfind(L"\\\\", 0) == 0;
+        if (!absoluteDrivePath && !uncPath) {
+            error = L"Bake proxy output folder must be an absolute local path";
+            return false;
+        }
+        if (filename.empty() ||
+            filename.find(L"..") != std::wstring::npos ||
+            filename.find_first_of(L"\\/:*?\"<>|") != std::wstring::npos ||
+            _wcsicmp(PathFindExtensionW(filename.c_str()), L".png") != 0) {
+            error = L"Invalid bake proxy filename";
+            return false;
+        }
+        if (width <= 0 || height <= 0 || width > 8192 || height > 8192) {
+            error = L"Invalid bake proxy dimensions";
+            return false;
+        }
+
+        std::string rgb;
+        if (!DecodeBase64Wide(rgbBase64, rgb)) {
+            error = L"Invalid bake proxy RGB payload";
+            return false;
+        }
+
+        if (!outDir.empty() && outDir.back() != L'\\') outDir.push_back(L'\\');
+        return WriteRgb24PngFile(outDir + filename,
+                                 static_cast<UINT>(width),
+                                 static_cast<UINT>(height),
+                                 rgb,
+                                 error);
+    }
+
     // ── Same-origin asset serving via WebResourceRequested ──
 
     std::wstring MapAssetPath(const std::wstring& path, bool allowDirectory = false) {
@@ -13037,6 +13173,29 @@ public:
 
             std::wstring error;
             const bool ok = WriteProjectPostFxContent(contentBase64, error);
+            SendHostActionResult(type, requestId, ok, error);
+            return;
+        }
+        if (type == L"bake_proxy_image_write") {
+            std::wstring requestId;
+            std::wstring folder;
+            std::wstring filename;
+            std::wstring rgbBase64;
+            int width = 0;
+            int height = 0;
+            ExtractJsonString(msg, L"requestId", requestId);
+            ExtractJsonString(msg, L"folder", folder);
+            ExtractJsonString(msg, L"filename", filename);
+            ExtractJsonString(msg, L"rgbBase64", rgbBase64);
+            ExtractJsonInt(msg, L"width", width);
+            ExtractJsonInt(msg, L"height", height);
+            if (folder.empty() || filename.empty() || rgbBase64.empty()) {
+                SendHostActionResult(type, requestId, false, L"Missing bake proxy image payload");
+                return;
+            }
+
+            std::wstring error;
+            const bool ok = WriteBakeProxyImage(folder, filename, width, height, rgbBase64, error);
             SendHostActionResult(type, requestId, ok, error);
             return;
         }

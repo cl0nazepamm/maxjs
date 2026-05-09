@@ -1784,13 +1784,21 @@
             let nextRenderer;
             let backendLabel;
 
-            if (requestedBackend === 'webgl' || requestedBackend === 'webgl-vr') {
+            if (requestedBackend === 'webgl-vr') {
                 nextRenderer = new THREE_STD.WebGLRenderer({
                     antialias: true,
                     alpha: true,
                     powerPreference: 'high-performance',
                 });
-                backendLabel = requestedBackend === 'webgl-vr' ? 'WebGL2 (VR)' : 'WebGL2';
+                backendLabel = 'WebGL2 (VR)';
+                configureRenderer(nextRenderer);
+                await initializeRenderer(nextRenderer);
+            } else if (requestedBackend === 'webgl') {
+                // Normal viewer WebGL should still use the modern renderer
+                // stack so TSL / Shader Lab can compile to the WebGL2 backend.
+                // The legacy WebGLRenderer path is kept isolated for WebXR.
+                nextRenderer = new THREE.WebGPURenderer({ antialias: true, alpha: true, forceWebGL: true });
+                backendLabel = 'WebGL2 (TSL)';
                 configureRenderer(nextRenderer);
                 await initializeRenderer(nextRenderer);
             } else {
@@ -9941,6 +9949,9 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         function isWebGLBackendActive() {
             return String(rendererBackendLabel || '').startsWith('WebGL2');
         }
+        function isLegacyWebGLVrBackendActive() {
+            return renderer?.isWebGLRenderer === true && String(rendererBackendLabel || '').includes('(VR)');
+        }
         function syncRendererButtonUi() {
             if (!btnRenderer) return;
             const webgl = isWebGLBackendActive();
@@ -9948,8 +9959,11 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             btnRenderer.classList.toggle('active', webgl);
             btnRenderer.title = `Renderer backend: ${webgl ? 'WebGL2' : 'WebGPU'}`;
             if (btnSwitchVR) {
-                btnSwitchVR.classList.toggle('active', webgl);
-                btnSwitchVR.title = webgl ? 'WebGL2 active — XR-ready' : 'Switch to WebGL for XR (reload)';
+                const vrReady = isLegacyWebGLVrBackendActive();
+                btnSwitchVR.classList.toggle('active', vrReady);
+                btnSwitchVR.title = vrReady
+                    ? 'Legacy WebGL2 VR backend active'
+                    : 'Switch to legacy WebGL2 for XR (reload)';
             }
         }
         function restartWithRendererBackend(mode, options = {}) {
@@ -9987,8 +10001,8 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             });
         }
         btnSwitchVR?.addEventListener('click', () => {
-            if (isWebGLBackendActive()) {
-                perfHud.setStatus('max.js - WebGL2 backend is already active for VR');
+            if (isLegacyWebGLVrBackendActive()) {
+                perfHud.setStatus('max.js - legacy WebGL2 backend is already active for VR');
                 return;
             }
             restartWithRendererBackend('webgl', {
@@ -11889,8 +11903,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 update() {},
             };
 
-            const isNativeWebGPU = rendererBackendLabel === 'WebGPU';
-            if (isNativeWebGPU) {
+            if (renderer?.isWebGLRenderer !== true) {
                 return runtime;
             }
             if (!('xr' in navigator)) {

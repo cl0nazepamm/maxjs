@@ -2,7 +2,7 @@
 //
 // When enabled, MaxJS's main render loop skips ssgiFx.render() and calls
 // shaderLabFx.renderFrame() instead. The scene renders to an internal
-// WebGPU render target, that target's texture is piped into shader-lab's
+// renderer render target, that target's texture is piped into shader-lab's
 // postprocessing pipeline, and the output is blitted to the canvas via a
 // fullscreen quad. No ssgiFx modifications — it's a parallel path.
 //
@@ -14,7 +14,7 @@
 // Known costs:
 //   - Loses SSGI / SSR / GTAO / bloom / DOF / tone-mapping in this mode
 //   - React + shader-lab loaded from esm.sh on first enable (needs net)
-//   - Extra WebGPU render target for the scene pass
+//   - Extra render target for the scene pass
 
 let _loadPromise = null;
 

@@ -576,6 +576,39 @@ static bool CopyDirectoryRecursive(const std::wstring& src, const std::wstring& 
     return true;
 }
 
+static bool CopyDirectoryRecursiveWithExtensionFilter(const std::wstring& src,
+                                                      const std::wstring& dst,
+                                                      const std::wstring& extensionNoDot) {
+    if (src.empty() || dst.empty() || extensionNoDot.empty() || !DirectoryExists(src)) return false;
+    std::wstring wantedExt = L"." + extensionNoDot;
+    std::error_code ec;
+    const auto srcPath = std::filesystem::path(src);
+    const auto dstPath = std::filesystem::path(dst);
+    std::filesystem::create_directories(dstPath, ec);
+    if (ec) return false;
+
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(srcPath, ec)) {
+        if (ec) return false;
+        const auto relative = std::filesystem::relative(entry.path(), srcPath, ec);
+        if (ec) return false;
+        const auto target = dstPath / relative;
+        if (entry.is_directory()) {
+            std::filesystem::create_directories(target, ec);
+            if (ec) return false;
+            continue;
+        }
+        if (!entry.is_regular_file()) continue;
+        const std::wstring ext = entry.path().extension().wstring();
+        if (_wcsicmp(ext.c_str(), wantedExt.c_str()) != 0) continue;
+        std::filesystem::create_directories(target.parent_path(), ec);
+        if (ec) return false;
+        std::filesystem::copy_file(entry.path(), target,
+            std::filesystem::copy_options::overwrite_existing, ec);
+        if (ec) return false;
+    }
+    return true;
+}
+
 static bool CopyDirectoryRecursiveMissingOnly(const std::wstring& src, const std::wstring& dst) {
     if (src.empty() || dst.empty() || !DirectoryExists(src)) return false;
     std::error_code ec;
@@ -8262,7 +8295,8 @@ public:
                            const std::wstring& exportDir,
                            std::unordered_map<std::wstring, std::wstring>& copiedPaths,
                            std::wstring& relativePath,
-                           std::wstring& error) {
+                           std::wstring& error,
+                           const std::wstring& directoryExtensionFilter = {}) {
         std::wstring sourcePath = rawPath;
         std::replace(sourcePath.begin(), sourcePath.end(), L'/', L'\\');
         while (isDirectory && !sourcePath.empty() &&
@@ -8310,7 +8344,9 @@ public:
         const std::wstring targetPath = assetsDir + L"\\" + targetName;
         bool ok = false;
         if (isDirectory) {
-            ok = CopyDirectoryRecursive(sourcePath, targetPath);
+            ok = directoryExtensionFilter.empty()
+                ? CopyDirectoryRecursive(sourcePath, targetPath)
+                : CopyDirectoryRecursiveWithExtensionFilter(sourcePath, targetPath, directoryExtensionFilter);
             relativePath = L"./assets/" + targetName + L"/";
         } else {
             SHCreateDirectoryExW(nullptr, assetsDir.c_str(), nullptr);
@@ -8361,6 +8397,9 @@ public:
                                   bool skipMaterialAssets = false) {
         static const std::wstring httpsPrefix = L"https://maxjs";
         std::unordered_map<std::wstring, std::wstring> copiedPaths;
+        std::wstring bakeFolderUrl;
+        std::wstring bakeExtensionFilter;
+        ExtractSnapshotBakeCopyFilter(json, bakeFolderUrl, bakeExtensionFilter);
         const size_t materialsStart = skipMaterialAssets ? json.find(L"\"materials\":[") : std::wstring::npos;
         const size_t materialsEnd = materialsStart != std::wstring::npos
             ? json.find(L",\"camera\"", materialsStart)
@@ -8385,9 +8424,13 @@ public:
             }
 
             const bool isDirectory = !localPath.empty() && localPath.back() == L'/';
+            std::wstring directoryExtensionFilter;
+            if (isDirectory && !bakeFolderUrl.empty() && url == bakeFolderUrl) {
+                directoryExtensionFilter = bakeExtensionFilter;
+            }
 
             std::wstring relativePath;
-            if (!CopySnapshotAsset(localPath, isDirectory, exportDir, copiedPaths, relativePath, error)) {
+            if (!CopySnapshotAsset(localPath, isDirectory, exportDir, copiedPaths, relativePath, error, directoryExtensionFilter)) {
                 return false;
             }
 
@@ -8422,6 +8465,63 @@ public:
             }
         }
         return std::wstring::npos;
+    }
+
+    static bool ExtractJsonStringInRange(const std::wstring& json,
+                                         size_t start,
+                                         size_t end,
+                                         const wchar_t* key,
+                                         std::wstring& out) {
+        out.clear();
+        if (!key || start == std::wstring::npos || end == std::wstring::npos || start >= end || end > json.size()) {
+            return false;
+        }
+        const std::wstring needle = L"\"" + std::wstring(key) + L"\":\"";
+        const size_t keyPos = json.find(needle, start);
+        if (keyPos == std::wstring::npos || keyPos >= end) return false;
+        size_t pos = keyPos + needle.size();
+        std::wstring result;
+        bool esc = false;
+        for (; pos < end && pos < json.size(); ++pos) {
+            const wchar_t c = json[pos];
+            if (esc) {
+                result.push_back(c);
+                esc = false;
+                continue;
+            }
+            if (c == L'\\') {
+                esc = true;
+                continue;
+            }
+            if (c == L'"') {
+                out = result;
+                return true;
+            }
+            result.push_back(c);
+        }
+        return false;
+    }
+
+    static bool ExtractSnapshotBakeCopyFilter(const std::wstring& json,
+                                              std::wstring& folderUrl,
+                                              std::wstring& extensionNoDot) {
+        folderUrl.clear();
+        extensionNoDot.clear();
+
+        const size_t bakeKey = json.find(L"\"bake\":{");
+        if (bakeKey == std::wstring::npos) return false;
+        const size_t bakeObj = json.find(L'{', bakeKey);
+        const size_t bakeEnd = FindJsonObjectEnd(json, bakeObj);
+        if (bakeEnd == std::wstring::npos) return false;
+
+        if (!ExtractJsonStringInRange(json, bakeObj, bakeEnd, L"folder", folderUrl) ||
+            !ExtractJsonStringInRange(json, bakeObj, bakeEnd, L"extension", extensionNoDot)) {
+            return false;
+        }
+        if (folderUrl.empty() || extensionNoDot.empty()) return false;
+        if (folderUrl.back() != L'/' && folderUrl.back() != L'\\') folderUrl.push_back(L'/');
+        if (!extensionNoDot.empty() && extensionNoDot.front() == L'.') extensionNoDot.erase(extensionNoDot.begin());
+        return !extensionNoDot.empty();
     }
 
     void InjectSnapshotBakeFileManifest(std::wstring& json, const std::wstring& exportDir) {

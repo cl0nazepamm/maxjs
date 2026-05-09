@@ -5219,6 +5219,14 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             return { ...bakeOverrides };
         }
 
+        function serializeSnapshotBakeState() {
+            const state = serializeBakeState();
+            if (state.enabled && state.folder) {
+                state.folder = normalizeBakeFolderUrl(state.folder);
+            }
+            return state;
+        }
+
         function bakeStateSignature() {
             return JSON.stringify(bakeOverrides);
         }
@@ -5311,9 +5319,8 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
 
         function createBeautyBakeMaterial(source, texture) {
             const BakeTHREE = isWebGLTexturePathActive() ? THREE_STD : THREE;
-            const exposureMul = bakeOverrides.intensity * Math.pow(2, bakeOverrides.bakeExposure);
             const mat = new BakeTHREE.MeshBasicMaterial({
-                color: new BakeTHREE.Color(exposureMul, exposureMul, exposureMul),
+                color: new BakeTHREE.Color(1, 1, 1),
                 map: applyTextureUvChannel(texture, 2, 2),
                 side: source?.side ?? BakeTHREE.FrontSide,
                 transparent: !!source?.transparent || (Number.isFinite(source?.opacity) && source.opacity < 1),
@@ -5321,6 +5328,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 alphaMap: source?.alphaMap ?? null,
                 depthWrite: source?.depthWrite ?? true,
                 depthTest: source?.depthTest ?? true,
+                toneMapped: !!source?.toneMapped,
             });
             mat.name = source?.name ? `${source.name} bake beauty` : 'bake beauty';
             mat.userData = { ...(source?.userData || {}), maxjsBakeOverride: 'beauty' };
@@ -5341,6 +5349,10 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     return material;
                 }
                 const tex = loadBakeTexture(url, THREE.SRGBColorSpace, 2);
+                const ext = getTextureExtension(url);
+                material.userData ??= {};
+                material.userData.maxjsBakeSourceUrl = url;
+                material.toneMapped = ext === 'exr' || ext === 'hdr';
                 return tex ? createBeautyBakeMaterial(material, tex) : material;
             }
 
@@ -9346,6 +9358,9 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             const settings = sanitizeSnapshotSettings(snapshotSettings);
             // NOTE: snapshotUi (post-fx, camera) and runtimeScene (layers) are essential
             // for working snapshots - don't gate them behind includeDebugPayload
+            if (bakeOverrides.enabled) {
+                settings.includeSnapshotUi = true;
+            }
             if (!settings.includeAnimations) {
                 settings.includeTransformAnimation = false;
                 settings.includeGeometryAnimation = false;
@@ -9533,6 +9548,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
 
             if (settings.includeSnapshotUi) {
                 const uiState = serializeSnapshotUiState({ includeDebug: settings.includeDebugPayload });
+                uiState.bake = serializeSnapshotBakeState();
                 if (!settings.includeSplats && uiState.performance) {
                     uiState.performance = { ...uiState.performance, splatsEnabled: false };
                 }

@@ -456,6 +456,13 @@ static bool RecreateDirectory(const std::wstring& path) {
     return std::filesystem::create_directories(std::filesystem::path(path), ec) || DirectoryExists(path);
 }
 
+static bool EnsureDirectoryExists(const std::wstring& path) {
+    if (path.empty()) return false;
+    std::error_code ec;
+    std::filesystem::create_directories(std::filesystem::path(path), ec);
+    return !ec && DirectoryExists(path);
+}
+
 static bool CopyDirectoryRecursive(const std::wstring& src, const std::wstring& dst) {
     if (src.empty() || dst.empty() || !DirectoryExists(src)) return false;
     std::error_code ec;
@@ -483,6 +490,37 @@ static bool CopyDirectoryRecursive(const std::wstring& src, const std::wstring& 
     return true;
 }
 
+static bool CopyDirectoryRecursiveMissingOnly(const std::wstring& src, const std::wstring& dst) {
+    if (src.empty() || dst.empty() || !DirectoryExists(src)) return false;
+    std::error_code ec;
+    const auto srcPath = std::filesystem::path(src);
+    const auto dstPath = std::filesystem::path(dst);
+    std::filesystem::create_directories(dstPath, ec);
+    if (ec) return false;
+
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(srcPath, ec)) {
+        if (ec) return false;
+        const auto relative = std::filesystem::relative(entry.path(), srcPath, ec);
+        if (ec) return false;
+        const auto target = dstPath / relative;
+        if (entry.is_directory()) {
+            std::filesystem::create_directories(target, ec);
+            if (ec) return false;
+            continue;
+        }
+        if (std::filesystem::exists(target, ec)) {
+            if (ec) return false;
+            continue;
+        }
+        std::filesystem::create_directories(target.parent_path(), ec);
+        if (ec) return false;
+        std::filesystem::copy_file(entry.path(), target,
+            std::filesystem::copy_options::none, ec);
+        if (ec) return false;
+    }
+    return true;
+}
+
 static bool CopyFileEnsuringDirectories(const std::wstring& src, const std::wstring& dst) {
     if (!FileExists(src)) return false;
     std::error_code ec;
@@ -490,6 +528,16 @@ static bool CopyFileEnsuringDirectories(const std::wstring& src, const std::wstr
     std::filesystem::create_directories(dstPath.parent_path(), ec);
     if (ec) return false;
     return CopyFileW(src.c_str(), dst.c_str(), FALSE) != FALSE;
+}
+
+static bool CopyFileIfMissingEnsuringDirectories(const std::wstring& src, const std::wstring& dst) {
+    if (!FileExists(src)) return false;
+    if (FileExists(dst)) return true;
+    std::error_code ec;
+    const auto dstPath = std::filesystem::path(dst);
+    std::filesystem::create_directories(dstPath.parent_path(), ec);
+    if (ec) return false;
+    return CopyFileW(src.c_str(), dst.c_str(), TRUE) != FALSE;
 }
 
 static int Base64Value(wchar_t ch) {
@@ -7971,6 +8019,12 @@ public:
         return projectDir + L"\\postfx.maxjs.json";
     }
 
+    std::wstring GetProjectSiteShellPath() {
+        const std::wstring projectDir = GetProjectDir();
+        if (projectDir.empty()) return {};
+        return projectDir + L"\\site.html";
+    }
+
     std::wstring GetSnapshotDir() {
         const std::wstring projectDir = GetProjectDir();
         if (!projectDir.empty()) return projectDir + L"\\dist";
@@ -8217,15 +8271,27 @@ public:
 
     bool RewriteSnapshotAssetUrls(std::wstring& json,
                                   const std::wstring& exportDir,
-                                  std::wstring& error) {
+                                  std::wstring& error,
+                                  bool skipMaterialAssets = false) {
         static const std::wstring httpsPrefix = L"https://maxjs";
         std::unordered_map<std::wstring, std::wstring> copiedPaths;
+        const size_t materialsStart = skipMaterialAssets ? json.find(L"\"materials\":[") : std::wstring::npos;
+        const size_t materialsEnd = materialsStart != std::wstring::npos
+            ? json.find(L",\"camera\"", materialsStart)
+            : std::wstring::npos;
         size_t pos = 0;
         while ((pos = json.find(httpsPrefix, pos)) != std::wstring::npos) {
             const size_t end = json.find(L'"', pos);
             if (end == std::wstring::npos) break;
 
             const std::wstring url = json.substr(pos, end - pos);
+            if (materialsStart != std::wstring::npos &&
+                materialsEnd != std::wstring::npos &&
+                pos > materialsStart && pos < materialsEnd) {
+                pos += url.size();
+                continue;
+            }
+
             std::wstring localPath;
             if (!ResolveVirtualHostUrl(url, localPath)) {
                 pos += url.size();
@@ -8243,6 +8309,95 @@ public:
             pos += relativePath.size();
         }
         return true;
+    }
+
+    static size_t FindJsonObjectEnd(const std::wstring& json, size_t objectStart) {
+        if (objectStart == std::wstring::npos || objectStart >= json.size() || json[objectStart] != L'{') {
+            return std::wstring::npos;
+        }
+        bool inStr = false;
+        bool esc = false;
+        int depth = 0;
+        for (size_t i = objectStart; i < json.size(); ++i) {
+            const wchar_t c = json[i];
+            if (inStr) {
+                if (esc) { esc = false; continue; }
+                if (c == L'\\') { esc = true; continue; }
+                if (c == L'"') inStr = false;
+                continue;
+            }
+            if (c == L'"') { inStr = true; continue; }
+            if (c == L'{') {
+                ++depth;
+            } else if (c == L'}') {
+                --depth;
+                if (depth == 0) return i;
+                if (depth < 0) return std::wstring::npos;
+            }
+        }
+        return std::wstring::npos;
+    }
+
+    void InjectSnapshotBakeFileManifest(std::wstring& json, const std::wstring& exportDir) {
+        const size_t bakeKey = json.find(L"\"bake\":{");
+        if (bakeKey == std::wstring::npos) return;
+        const size_t bakeObj = json.find(L'{', bakeKey);
+        const size_t bakeEnd = FindJsonObjectEnd(json, bakeObj);
+        if (bakeEnd == std::wstring::npos) return;
+        if (json.find(L"\"files\"", bakeObj) < bakeEnd) return;
+
+        const size_t folderKey = json.find(L"\"folder\":\"", bakeObj);
+        if (folderKey == std::wstring::npos || folderKey > bakeEnd) return;
+        const size_t folderStart = folderKey + wcslen(L"\"folder\":\"");
+        const size_t folderEnd = json.find(L'"', folderStart);
+        if (folderEnd == std::wstring::npos || folderEnd > bakeEnd) return;
+
+        std::wstring folder = json.substr(folderStart, folderEnd - folderStart);
+        std::replace(folder.begin(), folder.end(), L'/', L'\\');
+        std::wstring folderPath;
+        if (folder.rfind(L".\\", 0) == 0) {
+            folderPath = exportDir + L"\\" + folder.substr(2);
+        } else if (folder.rfind(L"\\", 0) == 0) {
+            folderPath = folder;
+        } else {
+            return;
+        }
+        while (!folderPath.empty() && (folderPath.back() == L'\\' || folderPath.back() == L'/')) {
+            folderPath.pop_back();
+        }
+        if (!DirectoryExists(folderPath)) return;
+
+        std::vector<std::wstring> files;
+        std::error_code ec;
+        for (const auto& entry : std::filesystem::directory_iterator(std::filesystem::path(folderPath), ec)) {
+            if (ec) return;
+            if (!entry.is_regular_file()) continue;
+            files.push_back(entry.path().filename().wstring());
+        }
+        std::sort(files.begin(), files.end());
+
+        std::wstringstream ss;
+        ss << L",\"files\":[";
+        for (size_t i = 0; i < files.size(); ++i) {
+            if (i) ss << L',';
+            ss << L'"' << EscapeJson(files[i].c_str()) << L'"';
+        }
+        ss << L']';
+        json.insert(bakeEnd, ss.str());
+    }
+
+    void DeleteSnapshotGeneratedAssets(const std::wstring& exportDir) {
+        const std::filesystem::path assetsDir = std::filesystem::path(exportDir) / L"assets";
+        std::error_code ec;
+        if (!std::filesystem::exists(assetsDir, ec) || ec) return;
+
+        for (const auto& entry : std::filesystem::directory_iterator(assetsDir, ec)) {
+            if (ec) return;
+            const std::wstring name = entry.path().filename().wstring();
+            if (name.rfind(L"file_", 0) != 0 && name.rfind(L"dir_", 0) != 0) continue;
+            std::filesystem::remove_all(entry.path(), ec);
+            ec.clear();
+        }
     }
 
     struct SnapshotNodeRecord {
@@ -9876,10 +10031,10 @@ public:
         return true;
     }
 
-    bool CopySnapshotRuntime(const std::wstring& webDir,
-                             const std::wstring& outDir,
-                             bool copySparkDist,
-                             std::wstring& error) {
+    bool CopySnapshotRuntimeSeed(const std::wstring& webDir,
+                                 const std::wstring& outDir,
+                                 bool copySparkDist,
+                                 std::wstring& error) {
         const std::wstring snapshotHtml = webDir + L"\\snapshot.html";
         if (!FileExists(snapshotHtml)) {
             error = L"Snapshot runtime dependency missing: web/snapshot.html";
@@ -9891,11 +10046,9 @@ public:
             return false;
         }
 
-        // A deployed snapshot should open directly into the minimal player.
-        // Keep snapshot.html as an explicit target, and make index.html the
-        // same wrapper so static hosts and double-click workflows do not boot
-        // the editor/WebView2 page.
-        if (!CopyFileEnsuringDirectories(snapshotHtml, outDir + L"\\index.html")) {
+        // Seed index.html only once. After that the snapshot exporter owns
+        // scene data, not the standalone site's shell/UI.
+        if (!CopyFileIfMissingEnsuringDirectories(snapshotHtml, outDir + L"\\index.html")) {
             error = L"Failed to copy snapshot runtime index.html";
             return false;
         }
@@ -10043,6 +10196,21 @@ public:
             return L"webgpu";
         }
         return L"webgl";
+    }
+
+    static bool SnapshotBeautyBakeEnabled(const std::wstring& snapshotUiJson) {
+        const std::wstring lower = LowerAsciiCopy(snapshotUiJson);
+        const size_t bakePos = lower.find(L"\"bake\"");
+        if (bakePos == std::wstring::npos) return false;
+        const size_t len = std::min<size_t>(lower.size() - bakePos, 1024);
+        const std::wstring bakeSlice = lower.substr(bakePos, len);
+        const bool enabled =
+            bakeSlice.find(L"\"enabled\":true") != std::wstring::npos ||
+            bakeSlice.find(L"\"enabled\": true") != std::wstring::npos;
+        const bool beauty =
+            bakeSlice.find(L"\"mode\":\"beauty\"") != std::wstring::npos ||
+            bakeSlice.find(L"\"mode\": \"beauty\"") != std::wstring::npos;
+        return enabled && beauty;
     }
 
     static bool HasHtmlTextureSlot(const MaxJSPBR& pbr) {
@@ -10741,18 +10909,23 @@ public:
         }
 
         outDir = GetNamedSnapshotDir(options.exportName);
-        if (!RecreateDirectory(outDir)) {
-            error = L"Failed to recreate snapshot directory";
+        if (!EnsureDirectoryExists(outDir)) {
+            error = L"Failed to prepare snapshot directory";
             return false;
         }
 
-        // Helper: clean up dist/ on any failure after this point
+        // Helper: clean up generated data on failure. Never remove the whole
+        // folder: users may turn dist/ into a custom website shell.
         auto cleanupOnFail = [&]() {
             std::error_code ec;
-            std::filesystem::remove_all(std::filesystem::path(outDir), ec);
+            std::filesystem::remove(std::filesystem::path(outDir) / L"snapshot.json", ec);
+            ec.clear();
+            std::filesystem::remove(std::filesystem::path(outDir) / L"scene.bin", ec);
+            ec.clear();
+            std::filesystem::remove(std::filesystem::path(outDir) / L"scene_anim.bin", ec);
         };
 
-        if (!CopySnapshotRuntime(webDir, outDir, options.includeSplats, error)) {
+        if (!CopySnapshotRuntimeSeed(webDir, outDir, options.includeSplats, error)) {
             cleanupOnFail();
             return false;
         }
@@ -10765,9 +10938,13 @@ public:
             return false;
         }
 
-        if (options.copyAssets && !RewriteSnapshotAssetUrls(metaJson, outDir, error)) {
-            cleanupOnFail();
-            return false;
+        if (options.copyAssets) {
+            DeleteSnapshotGeneratedAssets(outDir);
+            if (!RewriteSnapshotAssetUrls(metaJson, outDir, error, false)) {
+                cleanupOnFail();
+                return false;
+            }
+            InjectSnapshotBakeFileManifest(metaJson, outDir);
         }
 
         if (!WriteUtf8File(outDir + L"\\snapshot.json", metaJson)) {
@@ -10784,6 +10961,10 @@ public:
             error = L"Failed to write scene_anim.bin";
             cleanupOnFail();
             return false;
+        }
+        if (animBinary.empty()) {
+            std::error_code ec;
+            std::filesystem::remove(std::filesystem::path(outDir) / L"scene_anim.bin", ec);
         }
 
         // Copy project layers when present. They are sidecars, not part of the
@@ -10816,6 +10997,18 @@ public:
                     cleanupOnFail();
                     return false;
                 }
+            }
+        }
+
+        // Optional project website shell. This is deliberately copied as a
+        // sidecar instead of replacing snapshot.html: MaxJS owns the neutral
+        // snapshot player, projects can layer their own deployable UI on top.
+        const std::wstring siteShellPath = GetProjectSiteShellPath();
+        if (!siteShellPath.empty() && FileExists(siteShellPath)) {
+            if (!CopyFileEnsuringDirectories(siteShellPath, outDir + L"\\site.html")) {
+                error = L"Failed to copy site.html into snapshot";
+                cleanupOnFail();
+                return false;
             }
         }
 

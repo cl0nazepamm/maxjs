@@ -88,7 +88,7 @@ import { sceneSpace } from './max_basis.js';
 // `requireExtraction` is reserved for paths that genuinely cannot proceed
 // without the extraction landing (e.g. trying to apply a non-empty
 // scene.bin without the applier). `noteExtractionDeferred` is the
-// warn-and-continue variant used by phases where skipping is acceptable
+// debug-and-continue variant used by phases where skipping is acceptable
 // for the empty/minimal snapshot path that Stage 2 supports.
 function requireExtraction(name, sourceLocation) {
     const message =
@@ -99,7 +99,7 @@ function requireExtraction(name, sourceLocation) {
 
 function noteExtractionDeferred(name, sourceLocation, detail = '') {
     const tail = detail ? ` ${detail}` : '';
-    console.warn(
+    console.debug(
         `[snapshot_boot] '${name}' not yet extracted from index.html ` +
         `(${sourceLocation}); skipping in Stage 2.${tail}`,
     );
@@ -464,11 +464,35 @@ function applySnapshotCoreLook(snapshotUi, { renderer } = {}) {
     };
 }
 
+function normalizeSnapshotCameraClip(cameraClip) {
+    const near = Number(cameraClip?.near);
+    const far = Number(cameraClip?.far);
+    return {
+        near: Number.isFinite(near) && near > 0 ? near : null,
+        far: Number.isFinite(far) && far > 0 ? far : null,
+    };
+}
+
+function applySnapshotCameraClip(camera, cameraClip) {
+    if (!camera) return;
+    const clip = normalizeSnapshotCameraClip(cameraClip);
+    let changed = false;
+    if (clip.near != null && camera.near !== clip.near) {
+        camera.near = clip.near;
+        changed = true;
+    }
+    if (clip.far != null && clip.far > camera.near && camera.far !== clip.far) {
+        camera.far = clip.far;
+        changed = true;
+    }
+    if (changed) camera.updateProjectionMatrix();
+}
+
 // ─── Phase 7: snapshotUi ───────────────────────────────────────────────
 // Honors the export-critical fields here:
 //   - tone mapping, exposure, and brightness on the renderer/canvas
 //   - background color on the scene
-//   - basic camera position/target if present
+//   - basic camera position/target and user clip planes if present
 // Bake overrides are consumed by material_builder during scene.bin apply.
 // The deeper post stack and studio lighting are still intentionally out of
 // the lightweight snapshot boot path.
@@ -500,6 +524,7 @@ function applySnapshotUi(snapshotUi, ctx) {
             camera.updateProjectionMatrix();
         }
     }
+    applySnapshotCameraClip(camera, snapshotUi.cameraClip);
 
     // Defer the rest.
     if (snapshotUi.studio) {
@@ -763,11 +788,13 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
     // Phase 3: scene
     const sceneCtx = createScene({ meta, renderer, canvas });
     const { scene, camera, controls, maxBasisRoot, maxRoot, jsRoot, overlayRoot, defaultLights } = sceneCtx;
+    const snapshotCameraClip = meta.snapshotUi?.cameraClip ?? null;
 
     const getViewportAspect = (width, height) => getCanvasAspect(canvas, width, height);
     const resize = (width, height) => {
         const result = sceneCtx.resize(width, height);
         applyHorizontalFovToVertical(camera, result.aspect);
+        applySnapshotCameraClip(camera, snapshotCameraClip);
         return result;
     };
 
@@ -795,7 +822,7 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
     // export-time bake overrides before meshes enter the scene.
     const materialBuilder = createMaterialBuilder({
         rootUrl: root,
-        bakeState: meta.snapshotUi?.bake,
+        bakeState: meta.bake ?? meta.snapshotUi?.bake,
     });
 
     // Authored environment/HDRI from snapshot.json. This stays separate
@@ -873,6 +900,7 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
     // OrbitControls.target needs the world-space (Y-up) value.
     applyTopLevelCamera(meta.camera, { camera, controls, getAspect: getViewportAspect });
     resize();
+    applySnapshotCameraClip(camera, snapshotCameraClip);
 
     // Phase 7c: lock state. Snapshots authored with camera-lock active in
     // Max should ship without orbit controls — the snapshot represents a

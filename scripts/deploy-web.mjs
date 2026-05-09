@@ -35,6 +35,10 @@ const REPO_ROOT  = path.resolve(__dirname, '..');
 const SRC_DEFAULT = path.join(REPO_ROOT, 'web');
 const DST_DEFAULT = path.resolve(REPO_ROOT, '..', 'clone-llc');
 
+// Subpaths under web/ that are generated runtime data and should never be
+// mirrored into a project folder.
+const ARTIFACT_SUBPATHS = new Set(['snapshots']);
+
 // Subpaths under web/ that are huge but worth syncing the first time.
 // Watch mode skips these by default unless --include-vendor is passed,
 // since they don't change during normal iteration.
@@ -117,6 +121,7 @@ async function syncOnce({ src, dst, paths, skipHeavy }) {
         : (await readdir(src, { withFileTypes: true })).map(e => e.name);
 
     for (const name of targets) {
+        if (ARTIFACT_SUBPATHS.has(name)) continue;
         if (skipHeavy && HEAVY_SUBPATHS.has(name)) continue;
         const subSrc = path.join(src, name);
         const subDst = path.join(dst, name);
@@ -168,9 +173,8 @@ function watchMode({ src, dst, paths }) {
         const norm = filename.replaceAll('\\', '/');
         // Skip heavy subtrees in watch mode entirely.
         const top = norm.split('/')[0];
+        if (ARTIFACT_SUBPATHS.has(top)) return;
         if (HEAVY_SUBPATHS.has(top)) return;
-        // Skip the snapshots/ output folder — that's runtime data, not source.
-        if (top === 'snapshots') return;
 
         if (pending) clearTimeout(pending);
         pending = setTimeout(() => {

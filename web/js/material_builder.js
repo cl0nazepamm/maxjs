@@ -7,6 +7,8 @@
 // runtime-only material sources.
 
 import * as THREE from 'three';
+import { HDRLoader } from 'three/addons/loaders/HDRLoader.js';
+import { EXRLoader } from 'three/addons/loaders/EXRLoader.js';
 import {
     FALLBACK_COLOR,
     applyTextureChannelSelection,
@@ -17,6 +19,7 @@ import {
     finiteNumberOr,
     getEmissiveColor,
     getEmissiveIntensity,
+    getTextureExtension,
     optimizedTextureTransformForSlot,
     pickMaterialSide,
     resolveTextureColorSpace,
@@ -36,6 +39,32 @@ function hasNonZeroColor(rgb) {
 
 function hasWritableProperty(material, property) {
     return material && (property in material || typeof material[property] !== 'undefined');
+}
+
+function suppressKnownExrMetadataWarnings(loader) {
+    if (!loader || loader.userData?.maxjsQuietM44fHeader) return loader;
+    const originalParse = typeof loader.parse === 'function' ? loader.parse.bind(loader) : null;
+    if (!originalParse) return loader;
+    loader.parse = (...args) => {
+        const previousWarn = console.warn;
+        console.warn = (...warnArgs) => {
+            const msg = String(warnArgs?.[0] ?? '');
+            if (
+                msg.includes('THREE.EXRLoader: Skipped unknown header attribute type') &&
+                msg.includes('m44f')
+            ) {
+                return;
+            }
+            previousWarn.apply(console, warnArgs);
+        };
+        try {
+            return originalParse(...args);
+        } finally {
+            console.warn = previousWarn;
+        }
+    };
+    loader.userData = { ...(loader.userData || {}), maxjsQuietM44fHeader: true };
+    return loader;
 }
 
 function firstField(md, keys) {
@@ -94,6 +123,26 @@ function configureGradientTexture(texture) {
     return texture;
 }
 
+function colorFallbackTexture(color, colorSpace = THREE.SRGBColorSpace) {
+    const c = color?.isColor ? color : colorFromArray(color);
+    const texture = new THREE.DataTexture(
+        new Uint8Array([
+            Math.round(THREE.MathUtils.clamp(c.r, 0, 1) * 255),
+            Math.round(THREE.MathUtils.clamp(c.g, 0, 1) * 255),
+            Math.round(THREE.MathUtils.clamp(c.b, 0, 1) * 255),
+            255,
+        ]),
+        1,
+        1,
+        THREE.RGBAFormat,
+        THREE.UnsignedByteType,
+    );
+    texture.colorSpace = colorSpace;
+    texture.wrapS = texture.wrapT = THREE.RepeatWrapping;
+    texture.needsUpdate = true;
+    return texture;
+}
+
 function cloneFallbackTexture(texture, colorSpace, xf) {
     if (!texture?.isTexture) return null;
     const clone = texture.clone();
@@ -139,6 +188,15 @@ function normalizeBakeState(payload) {
     next.extension = String(next.extension || DEFAULT_BAKE_STATE.extension).replace(/^\./, '') || DEFAULT_BAKE_STATE.extension;
     next.intensity = Number.isFinite(Number(next.intensity)) ? Math.max(0, Number(next.intensity)) : 1.0;
     next.bakeExposure = Number.isFinite(Number(next.bakeExposure)) ? Number(next.bakeExposure) : 0;
+    next.files = Array.isArray(raw.files)
+        ? raw.files.map(file => String(file || '')).filter(Boolean)
+        : null;
+    next.fileSet = next.files
+        ? new Set(next.files.map(file => file.toLowerCase()))
+        : null;
+    next.fileMap = next.files
+        ? new Map(next.files.map(file => [file.toLowerCase(), file]))
+        : null;
     return next;
 }
 
@@ -505,10 +563,15 @@ function createMaterialForRuntimeModel(runtimeModelName, params) {
  */
 export function createMaterialBuilder({ rootUrl = '.', bakeState = null } = {}) {
     const loader = new THREE.TextureLoader();
+    const hdrLoader = new HDRLoader();
+    const exrLoader = suppressKnownExrMetadataWarnings(new EXRLoader());
     loader.setCrossOrigin?.('anonymous');
+    hdrLoader.setCrossOrigin?.('anonymous');
+    exrLoader.setCrossOrigin?.('anonymous');
     const textureCache = new Map();
     let bakeOverrides = normalizeBakeState(bakeState);
     const fallbackTextures = {
+        black: createSolidTexture(0, 0, 0, 255, THREE.NoColorSpace),
         white: createSolidTexture(255, 255, 255, 255, THREE.NoColorSpace),
         whiteSrgb: createSolidTexture(255, 255, 255, 255, THREE.SRGBColorSpace),
         flatNormal: createSolidTexture(128, 128, 255, 255, THREE.NoColorSpace),
@@ -524,6 +587,22 @@ export function createMaterialBuilder({ rootUrl = '.', bakeState = null } = {}) 
         }
     }
 
+    function loaderForExtension(ext) {
+        if (ext === 'exr') return exrLoader;
+        if (ext === 'hdr') return hdrLoader;
+        return loader;
+    }
+
+    function isUnresolvedVirtualAssetUrl(url) {
+        try {
+            const parsed = new URL(url, location.href);
+            return parsed.hostname === 'maxjs-assets.local' &&
+                globalThis.location?.hostname !== 'maxjs-assets.local';
+        } catch {
+            return String(url || '').startsWith('https://maxjs-assets.local/');
+        }
+    }
+
     function fallbackForSlot(slot, colorSpace, xf) {
         const base = slot.fallback === 'white' && colorSpace === THREE.SRGBColorSpace
             ? fallbackTextures.whiteSrgb
@@ -531,10 +610,49 @@ export function createMaterialBuilder({ rootUrl = '.', bakeState = null } = {}) 
         return cloneFallbackTexture(base, colorSpace, xf);
     }
 
-    function loadTextureEntry(url, colorSpace = THREE.LinearSRGBColorSpace, xf = null, fallbackTexture = fallbackTextures.white) {
+    function finishTextureLoad(entry, loaded, textureColorSpace, xf) {
+        loaded.colorSpace = textureColorSpace;
+        applyTextureChannelSelection(loaded, xf);
+        applyTextureTransform(loaded, xf);
+        loaded.needsUpdate = true;
+        entry.texture = loaded;
+        entry.loaded = true;
+        const callbacks = entry.callbacks.splice(0);
+        for (const callback of callbacks) callback(loaded);
+    }
+
+    function failTextureLoad(entry, err, { silent = false } = {}) {
+        entry.failed = true;
+        entry.loaded = true;
+        entry.error = err;
+        entry.callbacks.splice(0);
+        if (!silent) console.warn('[material_builder] texture load failed:', entry.resolved, err);
+    }
+
+    function beginTextureLoad(entry, activeLoader, textureColorSpace, xf, { silent = false } = {}) {
+        const loadedTexture = activeLoader.load(
+            entry.resolved,
+            (loaded) => finishTextureLoad(entry, loaded, textureColorSpace, xf),
+            undefined,
+            (err) => failTextureLoad(entry, err, { silent }),
+        );
+        loadedTexture.colorSpace = textureColorSpace;
+        applyTextureTransform(loadedTexture, xf);
+        return loadedTexture;
+    }
+
+    function loadTextureEntry(
+        url,
+        colorSpace = THREE.LinearSRGBColorSpace,
+        xf = null,
+        fallbackTexture = fallbackTextures.white,
+        options = {},
+    ) {
         if (!url) return null;
         const resolved = resolveUrl(url);
+        if (isUnresolvedVirtualAssetUrl(resolved)) return null;
         const textureColorSpace = resolveTextureColorSpace(colorSpace, xf, resolved);
+        const activeLoader = loaderForExtension(getTextureExtension(resolved));
         const xfKey = xf ? JSON.stringify(xf) : '';
         const key = `${resolved}::${textureColorSpace}::${xfKey}`;
         if (textureCache.has(key)) return textureCache.get(key);
@@ -548,30 +666,7 @@ export function createMaterialBuilder({ rootUrl = '.', bakeState = null } = {}) 
         };
         textureCache.set(key, entry);
 
-        const loadedTexture = loader.load(
-            resolved,
-            (loaded) => {
-                loaded.colorSpace = textureColorSpace;
-                applyTextureChannelSelection(loaded, xf);
-                applyTextureTransform(loaded, xf);
-                loaded.needsUpdate = true;
-                entry.texture = loaded;
-                entry.loaded = true;
-                const callbacks = entry.callbacks.splice(0);
-                for (const callback of callbacks) callback(loaded);
-            },
-            undefined,
-            (err) => {
-                entry.failed = true;
-                entry.loaded = true;
-                entry.error = err;
-                entry.callbacks.splice(0);
-                console.warn('[material_builder] texture load failed:', resolved, err);
-            },
-        );
-
-        loadedTexture.colorSpace = textureColorSpace;
-        applyTextureTransform(loadedTexture, xf);
+        beginTextureLoad(entry, activeLoader, textureColorSpace, xf, { silent: options.silent });
         return entry;
     }
 
@@ -601,18 +696,37 @@ export function createMaterialBuilder({ rootUrl = '.', bakeState = null } = {}) 
         if (!folder) return '';
         const suffix = kind === 'beauty' ? bakeOverrides.beautySuffix : bakeOverrides.lightSuffix;
         const stem = sanitizeBakeFileStem(getBakeTargetName(nd, md, material));
-        return `${folder}${encodeURIComponent(`${stem}${suffix}.${bakeOverrides.extension}`)}`;
+        const requestedFilename = `${stem}${suffix}.${bakeOverrides.extension}`;
+        const exactFilename = bakeOverrides.fileMap?.get(requestedFilename.toLowerCase()) ?? requestedFilename;
+        return `${folder}${encodeURIComponent(exactFilename)}`;
     }
 
-    function loadBakeTextureEntry(url, colorSpace = THREE.LinearSRGBColorSpace, maxMapChannel = 2) {
+    function bakeFileExistsForUrl(url) {
+        if (!bakeOverrides.fileSet) return true;
+        try {
+            const parsed = new URL(url, new URL(`${rootUrl}/`, location.href));
+            const filename = decodeURIComponent(parsed.pathname.split('/').pop() || '').toLowerCase();
+            return bakeOverrides.fileSet.has(filename);
+        } catch {
+            const filename = decodeURIComponent(String(url || '').split(/[\\/]/).pop() || '').toLowerCase();
+            return bakeOverrides.fileSet.has(filename);
+        }
+    }
+
+    function loadBakeTextureEntry(
+        url,
+        colorSpace = THREE.LinearSRGBColorSpace,
+        maxMapChannel = 2,
+        fallbackTexture = fallbackTextures.white,
+    ) {
+        if (!bakeFileExistsForUrl(url)) return null;
         const xf = bakeIdentityXf(maxMapChannel);
-        return loadTextureEntry(url, colorSpace, xf, fallbackTextures.white);
+        return loadTextureEntry(url, colorSpace, xf, fallbackTexture, { silent: true });
     }
 
     function createBeautyBakeMaterial(source, texture) {
-        const exposureMul = bakeOverrides.intensity * Math.pow(2, bakeOverrides.bakeExposure);
         const material = new THREE.MeshBasicMaterial({
-            color: new THREE.Color(exposureMul, exposureMul, exposureMul),
+            color: new THREE.Color(1, 1, 1),
             map: texture,
             side: source?.side ?? THREE.FrontSide,
             transparent: !!source?.transparent || (Number.isFinite(source?.opacity) && source.opacity < 1),
@@ -620,10 +734,51 @@ export function createMaterialBuilder({ rootUrl = '.', bakeState = null } = {}) 
             alphaMap: source?.alphaMap ?? null,
             depthWrite: source?.depthWrite ?? true,
             depthTest: source?.depthTest ?? true,
+            toneMapped: !!source?.toneMapped,
         });
         material.name = source?.name ? `${source.name} bake beauty` : 'bake beauty';
         material.userData = { ...(source?.userData || {}), maxjsBakeOverride: 'beauty' };
         return material;
+    }
+
+    function buildBeautyBakeReplacement(descriptor, params, context = {}) {
+        if (!bakeOverrides.enabled || bakeOverrides.mode !== 'beauty' || context.wantsLine) return null;
+        if (!hasGeometryUV2(context.geom)) return null;
+        const bakeNameSource = { name: descriptor?.name ?? 'material' };
+        const url = getBakeTextureUrl(context.nd, descriptor, bakeNameSource, 'beauty');
+        if (!url) return null;
+        const ext = getTextureExtension(url);
+        const hdrBake = ext === 'exr' || ext === 'hdr';
+
+        const source = {
+            name: descriptor?.name ?? 'material',
+            side: params.side ?? THREE.FrontSide,
+            transparent: !!params.transparent,
+            opacity: Number.isFinite(params.opacity) ? params.opacity : 1,
+            depthWrite: params.depthWrite ?? true,
+            depthTest: params.depthTest ?? true,
+            toneMapped: hdrBake,
+            userData: {
+                maxjsSourceMaterialName: descriptor?.name ?? 'material',
+                maxjsRequestedMaterialModel: 'MeshBasicMaterial',
+                maxjsMaterialModel: 'MeshBasicMaterial',
+            },
+        };
+
+        const fallback = colorFallbackTexture(params.color, THREE.SRGBColorSpace);
+        const entry = loadBakeTextureEntry(url, THREE.SRGBColorSpace, 2, fallback);
+        if (!entry) return null;
+        const baked = createBeautyBakeMaterial(source, entry.texture);
+        baked.userData.maxjsBeautyBakeReplacement = true;
+        baked.userData.maxjsBoundTextureSlots = ['map'];
+        baked.userData.maxjsBakeSourceUrl = url;
+        if (!entry.loaded && !entry.failed) {
+            entry.callbacks.push((texture) => {
+                baked.map = texture;
+                baked.needsUpdate = true;
+            });
+        }
+        return baked;
     }
 
     function applyBakeOverrideToMaterial(material, md, { nd = null, geom = null, wantsLine = false } = {}) {
@@ -640,7 +795,10 @@ export function createMaterialBuilder({ rootUrl = '.', bakeState = null } = {}) 
         }
 
         if (kind === 'beauty') {
-            const entry = loadBakeTextureEntry(url, THREE.SRGBColorSpace, 2);
+            material.userData ??= {};
+            material.userData.maxjsSourceMaterialName = material.userData.maxjsSourceMaterialName ?? getMaterialBakeName(md, material);
+            material.toneMapped = getTextureExtension(url) === 'exr' || getTextureExtension(url) === 'hdr';
+            const entry = loadBakeTextureEntry(url, THREE.SRGBColorSpace, 2, fallbackTextures.black);
             if (!entry) return material;
             const baked = createBeautyBakeMaterial(material, entry.texture);
             if (!entry.loaded && !entry.failed) {
@@ -733,6 +891,9 @@ export function createMaterialBuilder({ rootUrl = '.', bakeState = null } = {}) 
         const descriptor = md && typeof md === 'object' ? md : { color: [0.53, 0.53, 0.53] };
         const info = classifyRuntimeMaterial(descriptor, THREE);
         const params = createParams(descriptor, info);
+        const beautyReplacement = buildBeautyBakeReplacement(descriptor, params, context);
+        if (beautyReplacement) return beautyReplacement;
+
         let material = createMaterialForRuntimeModel(info.runtimeModelName, params);
         const boundSlots = [];
 

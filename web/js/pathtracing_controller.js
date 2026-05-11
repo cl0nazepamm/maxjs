@@ -35,6 +35,11 @@ const NODE_GRAPH_OVERRIDE_KEYS = [
     'outputNode',
 ];
 
+const SCENE_REBUILD_COALESCE_MS = 25;
+const SCENE_REBUILD_MIN_INTERVAL_MS = 50;
+const SCENE_REBUILD_RETRY_MS = 1000;
+const CAMERA_MATRIX_EPSILON = 1e-6;
+
 function isPathTraceableMaterial(material) {
     if (!material) return false;
     if (material.isShaderMaterial || material.isRawShaderMaterial) return false;
@@ -52,10 +57,26 @@ function meshMaterials(mesh) {
     return Array.isArray(mesh.material) ? mesh.material : [mesh.material];
 }
 
+function isCompatibleAttribute(attribute) {
+    return !!attribute
+        && Number.isFinite(attribute.count)
+        && attribute.count > 0
+        && Number.isFinite(attribute.itemSize)
+        && attribute.itemSize > 0
+        && !!attribute.array?.constructor;
+}
+
+function isPathTraceableGeometry(geometry) {
+    if (!geometry?.attributes) return false;
+    if (!isCompatibleAttribute(geometry.attributes.position)) return false;
+    if (geometry.index && !isCompatibleAttribute(geometry.index)) return false;
+    return true;
+}
+
 function isPathTraceableMesh(mesh) {
     if (!mesh?.isMesh) return false;
     if (mesh.name === '__maxjs_sky__') return false;
-    if (!mesh.geometry?.attributes?.position?.count) return false;
+    if (!isPathTraceableGeometry(mesh.geometry)) return false;
     const materials = meshMaterials(mesh);
     if (materials.length === 0) return false;
     return materials.every(isPathTraceableMaterial);
@@ -74,6 +95,14 @@ function groupsForMaterialRemap(source) {
     if (explicit.length > 0) return explicit;
     const total = geom.index ? geom.index.count : geom.attributes.position.count;
     return [{ start: 0, count: total, materialIndex: 0 }];
+}
+
+function getGeneratorSourceMeshes(tracer) {
+    const generator = tracer?._generator?.staticGeometryGenerator;
+    if (!generator) return [];
+    if (Array.isArray(generator._maxjsLastMeshes)) return generator._maxjsLastMeshes;
+    if (typeof generator._getMeshes === 'function') return generator._getMeshes();
+    return [];
 }
 
 function ensureMaterialIndexAttribute(geometry, materialCount) {
@@ -105,7 +134,7 @@ function writeMaterialIndexRange(geometry, materialArray, start, count, material
 function patchGeneratedMaterialIndices(tracer, results) {
     const geometry = results?.geometry;
     const materials = results?.materials;
-    const sourceMeshes = tracer?._generator?.staticGeometryGenerator?._getMeshes?.();
+    const sourceMeshes = getGeneratorSourceMeshes(tracer);
     if (!geometry?.attributes?.position || !Array.isArray(materials) || !Array.isArray(sourceMeshes)) return false;
     if (sourceMeshes.length === 0) return false;
 
@@ -159,7 +188,7 @@ function patchGeneratedMaterialIndices(tracer, results) {
 
 function compactGeneratedGroups(tracer, results) {
     const geometry = results?.geometry;
-    const sourceMeshes = tracer?._generator?.staticGeometryGenerator?._getMeshes?.();
+    const sourceMeshes = getGeneratorSourceMeshes(tracer);
     if (!geometry || !Array.isArray(sourceMeshes) || sourceMeshes.length === 0) return false;
 
     const groups = Array.isArray(geometry.groups) ? geometry.groups : [];
@@ -175,7 +204,7 @@ function compactGeneratedGroups(tracer, results) {
 }
 
 function materialIndexSignature(tracer) {
-    const sourceMeshes = tracer?._generator?.staticGeometryGenerator?._getMeshes?.();
+    const sourceMeshes = getGeneratorSourceMeshes(tracer);
     if (!Array.isArray(sourceMeshes)) return '';
     return sourceMeshes.map(source => {
         const geom = source.geometry;
@@ -194,12 +223,25 @@ const RAY_OFFSET_BIAS_TARGET = '#define RAY_OFFSET 5e-4';
 
 const DEPRECATED_CLOCK_WARNING = 'THREE.Clock: This module has been deprecated';
 
-function matrixKey(matrix) {
-    const e = matrix?.elements;
-    if (!e) return '';
-    let out = '';
-    for (let i = 0; i < 16; i += 1) out += e[i].toFixed(6) + ',';
-    return out;
+function matrixChanged(matrix, cache, epsilon = CAMERA_MATRIX_EPSILON) {
+    const elements = matrix?.elements;
+    if (!elements) return false;
+    if (!cache.initialized) {
+        cache.values.set(elements);
+        cache.initialized = true;
+        return true;
+    }
+    for (let i = 0; i < 16; i += 1) {
+        if (Math.abs(cache.values[i] - elements[i]) > epsilon) {
+            cache.values.set(elements);
+            return true;
+        }
+    }
+    return false;
+}
+
+function resetMatrixCache(cache) {
+    cache.initialized = false;
 }
 
 function suppressClockDeprecationWarning(fn) {
@@ -229,16 +271,22 @@ export function createPathTracingController({
     let tracer = null;
     let PathTracerCtor = null;
     let modulePromise = null;
+    let disposed = false;
 
     let sceneDirty = true;
-    let lastCameraWorldKey = '';
-    let lastCameraProjKey = '';
+    let sceneDirtyAt = 0;
+    let hasSceneBuilt = false;
+    let lastSceneRebuildAt = -Infinity;
+    let nextRebuildRetryAt = 0;
+    let lastRebuildErrorKey = '';
+    const lastCameraWorld = { initialized: false, values: new Float64Array(16) };
+    const lastCameraProj = { initialized: false, values: new Float64Array(16) };
     let warnedUnsupportedRenderer = false;
 
     const visibilityScratch = [];
 
     function isEnabled() {
-        return enabled === true;
+        return enabled === true && !disposed;
     }
 
     function hasLegacyWebGLRenderer() {
@@ -251,8 +299,31 @@ export function createPathTracingController({
     }
 
     function resetCameraKeys() {
-        lastCameraWorldKey = '';
-        lastCameraProjKey = '';
+        resetMatrixCache(lastCameraWorld);
+        resetMatrixCache(lastCameraProj);
+    }
+
+    function requestSceneRebuild({ immediate = false, reset = false } = {}) {
+        const wasDirty = sceneDirty;
+        sceneDirty = true;
+        const now = performance.now();
+        if (immediate) {
+            sceneDirtyAt = now;
+        } else if (!wasDirty || sceneDirtyAt <= now) {
+            sceneDirtyAt = now + SCENE_REBUILD_COALESCE_MS;
+        }
+        if (reset) tracer?.reset?.();
+    }
+
+    function shouldRebuildSceneNow(now = performance.now()) {
+        if (!sceneDirty) return false;
+        if (now < nextRebuildRetryAt) return false;
+        if (now < sceneDirtyAt) return false;
+        if (Number.isFinite(lastSceneRebuildAt) && now - lastSceneRebuildAt < SCENE_REBUILD_MIN_INTERVAL_MS) {
+            sceneDirtyAt = lastSceneRebuildAt + SCENE_REBUILD_MIN_INTERVAL_MS;
+            return false;
+        }
+        return true;
     }
 
     // ─── Lazy module load ──────────────────────────────────────
@@ -269,12 +340,13 @@ export function createPathTracingController({
         modulePromise = Promise.resolve()
             .then(() => loadWebGLPathTracer())
             .then(mod => {
+                if (disposed) return null;
                 PathTracerCtor = mod?.WebGLPathTracer || mod?.default || mod;
                 if (typeof PathTracerCtor !== 'function') {
                     throw new Error('three-gpu-pathtracer: WebGLPathTracer export not found');
                 }
                 onStatus('max.js - Pathtracer ready');
-                sceneDirty = true;
+                requestSceneRebuild({ immediate: true });
                 return PathTracerCtor;
             })
             .catch(error => {
@@ -321,6 +393,35 @@ export function createPathTracingController({
         material.needsUpdate = true;
     }
 
+    function installGeneratorGuards(t) {
+        const generator = t?._generator?.staticGeometryGenerator;
+        if (!generator || generator._maxjsGeneratorGuardsInstalled) return;
+
+        if (typeof generator._getMeshes === 'function') {
+            const originalGetMeshes = generator._getMeshes.bind(generator);
+            generator._getMeshes = () => {
+                const meshes = originalGetMeshes();
+                generator._maxjsLastMeshes = meshes;
+                return meshes;
+            };
+        }
+
+        if (typeof generator._updateIntermediateGeometries === 'function') {
+            const originalUpdateIntermediateGeometries = generator._updateIntermediateGeometries.bind(generator);
+            generator._updateIntermediateGeometries = () => {
+                const before = new Map(generator._intermediateGeometry || []);
+                originalUpdateIntermediateGeometries();
+                const current = generator._intermediateGeometry;
+                if (!current) return;
+                for (const [key, geometry] of before) {
+                    if (!current.has(key)) geometry?.dispose?.();
+                }
+            };
+        }
+
+        generator._maxjsGeneratorGuardsInstalled = true;
+    }
+
     function installMaterialIndexPatch(t) {
         if (!t || t._maxjsMaterialIndexPatchInstalled) return;
         const originalUpdateFromResults = t._updateFromResults.bind(t);
@@ -340,7 +441,7 @@ export function createPathTracingController({
     }
 
     function ensureTracer() {
-        if (!isEnabled()) return false;
+        if (!isEnabled() || disposed) return false;
         if (!hasLegacyWebGLRenderer()) {
             if (!warnedUnsupportedRenderer) {
                 warnedUnsupportedRenderer = true;
@@ -365,9 +466,10 @@ export function createPathTracingController({
             // normal mapping) and zero/one-fills color/uv2 when meshes don't carry them.
             // The earlier `['position','normal','uv']` override stripped those and replaced
             // them with constants, which broke normal mapping and vertex colors.
+            installGeneratorGuards(tracer);
             installMaterialIndexPatch(tracer);
             biasRayOffset(tracer._pathTracer?.material);
-            sceneDirty = true;
+            requestSceneRebuild({ immediate: true });
             resetCameraKeys();
             return true;
         } catch (error) {
@@ -417,17 +519,49 @@ export function createPathTracingController({
         }
     }
 
+    function rememberUserData(restorers, target, seen) {
+        if (!target || seen.has(target)) return;
+        seen.add(target);
+        if (!target.userData || Object.keys(target.userData).length === 0) return;
+        restorers.push({ kind: 'userData', object: target, value: target.userData });
+        target.userData = {};
+    }
+
+    function rememberMaterialUserData(restorers, material, seen) {
+        if (!material) return;
+        rememberUserData(restorers, material, seen);
+        for (const key in material) {
+            const value = material[key];
+            if (value?.isTexture) rememberUserData(restorers, value, seen);
+        }
+    }
+
+    function scrubPathTraceUserData(restorers) {
+        const seen = new WeakSet();
+        rememberUserData(restorers, scene, seen);
+        rememberUserData(restorers, scene.environment, seen);
+        rememberUserData(restorers, scene.background, seen);
+        scene.traverseVisible(object => {
+            rememberUserData(restorers, object, seen);
+            if (!object?.isMesh) return;
+            const materials = meshMaterials(object);
+            for (const material of materials) rememberMaterialUserData(restorers, material, seen);
+        });
+    }
+
     function withPreparedScene(callback) {
         const restorers = [];
         try {
             hideUnsupportedMeshes(restorers);
             bindPathTraceEnvironment(restorers);
+            scrubPathTraceUserData(restorers);
             return callback();
         } finally {
             for (let i = restorers.length - 1; i >= 0; i -= 1) {
                 const r = restorers[i];
                 if (r.kind === 'visible') r.object.visible = r.value;
                 else if (r.kind === 'scene') scene[r.name] = r.value;
+                else if (r.kind === 'userData') r.object.userData = r.value;
             }
         }
     }
@@ -441,11 +575,22 @@ export function createPathTracingController({
             activeCamera.updateMatrixWorld(true);
             withPreparedScene(() => tracer.setScene(scene, activeCamera));
             sceneDirty = false;
+            hasSceneBuilt = true;
+            sceneDirtyAt = 0;
+            lastSceneRebuildAt = performance.now();
+            nextRebuildRetryAt = 0;
+            lastRebuildErrorKey = '';
             resetCameraKeys();
             return true;
         } catch (error) {
             sceneDirty = true;
-            onError(error);
+            const key = error?.stack || error?.message || String(error);
+            const now = performance.now();
+            nextRebuildRetryAt = now + SCENE_REBUILD_RETRY_MS;
+            if (key !== lastRebuildErrorKey) {
+                lastRebuildErrorKey = key;
+                onError(error);
+            }
             return false;
         }
     }
@@ -453,12 +598,10 @@ export function createPathTracingController({
     function syncCameraIfChanged() {
         if (!tracer || !activeCamera) return;
         activeCamera.updateMatrixWorld();
-        const worldKey = matrixKey(activeCamera.matrixWorld);
-        const projKey = matrixKey(activeCamera.projectionMatrix);
-        if (worldKey === lastCameraWorldKey && projKey === lastCameraProjKey) return;
+        const worldChanged = matrixChanged(activeCamera.matrixWorld, lastCameraWorld);
+        const projectionChanged = matrixChanged(activeCamera.projectionMatrix, lastCameraProj);
+        if (!worldChanged && !projectionChanged) return;
         tracer.setCamera(activeCamera);
-        lastCameraWorldKey = worldKey;
-        lastCameraProjKey = projKey;
     }
 
     function clearFrame() {
@@ -476,9 +619,16 @@ export function createPathTracingController({
             clearFrame();
             return true;
         }
-        if (sceneDirty && !rebuildScene()) {
-            clearFrame();
-            return true;
+        if (sceneDirty) {
+            if (shouldRebuildSceneNow()) {
+                if (!rebuildScene()) {
+                    clearFrame();
+                    return true;
+                }
+            } else if (!hasSceneBuilt) {
+                clearFrame();
+                return true;
+            }
         }
         try {
             syncCameraIfChanged();
@@ -492,8 +642,7 @@ export function createPathTracingController({
     }
 
     function markSceneDirty() {
-        sceneDirty = true;
-        tracer?.reset?.();
+        requestSceneRebuild();
     }
 
     function setCamera(nextCamera) {
@@ -503,9 +652,33 @@ export function createPathTracingController({
         if (tracer) tracer.setCamera(activeCamera);
     }
 
+    function disposeGeneratedSceneState(t) {
+        const sceneGenerator = t?._generator;
+        const staticGenerator = sceneGenerator?.staticGeometryGenerator;
+        staticGenerator?._intermediateGeometry?.forEach(geometry => geometry?.dispose?.());
+        staticGenerator?._intermediateGeometry?.clear?.();
+        if (staticGenerator) staticGenerator._maxjsLastMeshes = null;
+        sceneGenerator?.geometry?.dispose?.();
+        if (sceneGenerator) sceneGenerator.bvh = null;
+    }
+
     function dispose() {
-        tracer?.dispose?.();
+        disposed = true;
+        if (tracer) {
+            disposeGeneratedSceneState(tracer);
+            tracer._internalBackground?.dispose?.();
+            tracer._colorBackground?.dispose?.();
+            tracer._lowResPathTracer?.dispose?.();
+            tracer.dispose?.();
+        }
         tracer = null;
+        hasSceneBuilt = false;
+        sceneDirty = false;
+        modulePromise = null;
+    }
+
+    if (typeof window !== 'undefined' && isEnabled()) {
+        window.addEventListener('pagehide', dispose, { once: true });
     }
 
     return {

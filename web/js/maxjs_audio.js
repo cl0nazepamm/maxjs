@@ -480,6 +480,25 @@ export function createMaxJSAudioSystem({ THREE, parent, getActiveCamera }) {
         }
     }
 
+    function dispose() {
+        for (const handle of [...entryMap.keys()]) destroyEntry(handle);
+        bufferCache.clear();
+        removeActivationHandlers();
+        try {
+            masterGain?.disconnect?.();
+        } catch (_) {
+        }
+        if (context && context.state !== 'closed') {
+            try {
+                context.close?.();
+            } catch (_) {
+            }
+        }
+        context = null;
+        masterGain = null;
+        if (audioRoot.parent) audioRoot.parent.remove(audioRoot);
+    }
+
     return {
         applyAudios,
         applyAudioUpdates,
@@ -488,5 +507,6 @@ export function createMaxJSAudioSystem({ THREE, parent, getActiveCamera }) {
         getMuted,
         setMuted,
         update,
+        dispose,
     };
 }

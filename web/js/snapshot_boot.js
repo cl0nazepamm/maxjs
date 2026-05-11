@@ -44,7 +44,7 @@
 //               7 fx/studio/bake (warns), 8 runtimeScene (warns),
 //               TSL / MaterialX / VRay / OpenPBR / Toon material types
 //               (degrade to MeshStandardMaterial), instance buckets,
-//               vertex colors, fog, splats/audio/gltf.
+//               vertex colors, fog, splats/gltf.
 //
 // What WORKS today: snapshots with Max-authored meshes render with PBR
 // materials — color, roughness, metalness, opacity, emissive, plus the
@@ -55,7 +55,7 @@
 //
 // What's MISSING (visible regressions vs. live mode): TSL / MaterialX /
 // VRay / OpenPBR materials (degrade to MeshStandardMaterial), post-FX,
-// splats, audio playback, instance bucket merging, vertex colors.
+// splats, instance bucket merging, vertex colors.
 
 import * as THREE from 'three';
 
@@ -77,7 +77,7 @@ import { sceneSpace } from './max_basis.js';
 // Optional modules — imported lazily inside Phase 5 once runtimeFeatures
 // declare them. Keep them out of the static import graph so Minimal mode
 // does not pay for what the scene does not use.
-//   import { createAudioSystem }      from './maxjs_audio.js';
+//   import { createMaxJSAudioSystem } from './maxjs_audio.js';
 //   import { createGltfRegistry }     from './maxjs_gltf.js';
 //   import { createHtmlTextureSlot }  from './html_texture.js';
 //   import { createSsgiFx }           from './ssgi_fx.js';
@@ -164,6 +164,27 @@ function normalizeRendererBackend(value) {
     const raw = String(value || '').toLowerCase();
     if (raw.includes('webgpu')) return 'webgpu';
     return 'webgl';
+}
+
+function resolveSnapshotAssetUrl(root, url) {
+    if (typeof url !== 'string' || url.length === 0) return '';
+    if (/^(?:[a-z][a-z0-9+.-]*:|\/\/)/i.test(url)) return url;
+    if (url.startsWith('/')) return url;
+
+    const rootText = String(root || '.');
+    const base = new URL(rootText.endsWith('/') ? rootText : `${rootText}/`, window.location.href);
+    return new URL(url, base).href;
+}
+
+function resolveSnapshotAudioUrls(audioData, root) {
+    if (!Array.isArray(audioData) || audioData.length === 0) return [];
+    return audioData.map((entry) => {
+        if (!entry || typeof entry !== 'object') return entry;
+        return {
+            ...entry,
+            url: resolveSnapshotAssetUrl(root, entry.url),
+        };
+    });
 }
 
 function isKnownWebglPrecisionProgramLog(value) {
@@ -322,7 +343,6 @@ function buildLayerManager({
 async function registerOptionalModules(features, ctx) {
     const wanted = [];
     if (features.post_fx?.length)  wanted.push('post_fx');
-    if (features.audio)            wanted.push('audio');
     if (features.splats)           wanted.push('splats');
     if (features.html_textures)    wanted.push('html_textures');
     if (features.volumes)          wanted.push('volumes');
@@ -334,7 +354,25 @@ async function registerOptionalModules(features, ctx) {
             `(scene declares: ${wanted.join(', ')})`,
         );
     }
-    return {};
+
+    const modules = {};
+    const hasAudioPayload = Array.isArray(ctx?.meta?.audios) && ctx.meta.audios.length > 0;
+    if (features.audio || hasAudioPayload) {
+        try {
+            const { createMaxJSAudioSystem } = await import('./maxjs_audio.js');
+            modules.audio = createMaxJSAudioSystem({
+                THREE,
+                parent: ctx.maxBasisRoot ?? ctx.scene,
+                getActiveCamera: () => ctx.renderer?.xr?.isPresenting
+                    ? ctx.renderer.xr.getCamera(ctx.camera)
+                    : ctx.camera,
+            });
+        } catch (error) {
+            console.warn('[snapshot_boot] audio module init failed', error);
+        }
+    }
+
+    return modules;
 }
 
 // ─── Phase 6: apply scene.bin ──────────────────────────────────────────
@@ -853,7 +891,7 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
     // Phase 5: optional modules
     const optionalModules = await registerOptionalModules(features, {
         scene, camera, renderer, layerManager, nodeMap, lightHandleMap,
-        jsRoot, overlayRoot,
+        maxBasisRoot, jsRoot, overlayRoot, meta,
     });
 
     // Phase 6: apply scene.bin
@@ -872,6 +910,11 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
     sceneLights.apply(meta.lights);
     authoredLightCount = countVisibleLightPayload(meta.lights);
     syncDefaultLights();
+
+    // Audio source URLs in snapshot.json are relative to the snapshot root.
+    // A project site can host the player from a shell page above that root,
+    // so rebase them before the audio system fetches buffers.
+    optionalModules.audio?.applyAudios(resolveSnapshotAudioUrls(meta.audios ?? [], root));
 
     // Phase 7a: snapshotUi (postfx state, tone-map, exposure, bg)
     if (meta.snapshotUi) {
@@ -963,6 +1006,7 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
         maxBasisRoot, maxRoot, jsRoot, overlayRoot, defaultLights,
         sceneLights,
         environment: snapshotEnvironment,
+        audioSystem: optionalModules.audio ?? null,
         animationSystem, maxTimeline,
         resize,
         applyDelta: (newBuffer) => applyDelta(newBuffer, applierCtx),
@@ -988,6 +1032,11 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
             try { stopLoop(); } catch {}
             try { removeEventListener('resize', onResize); } catch {}
             try { resizeObserver?.disconnect?.(); } catch {}
+            try {
+                for (const module of Object.values(optionalModules ?? {})) {
+                    module?.dispose?.();
+                }
+            } catch {}
             try { snapshotEnvironment.dispose(); } catch {}
             try { sceneLights.dispose(); } catch {}
             try {

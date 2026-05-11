@@ -1670,6 +1670,15 @@ static bool IsImageFile(const wchar_t* path) {
             _wcsicmp(ext, L".psd") == 0 || _wcsicmp(ext, L".tx") == 0);
 }
 
+static bool IsAudioFile(const wchar_t* path) {
+    if (!path || !path[0]) return false;
+    const wchar_t* ext = wcsrchr(path, L'.');
+    if (!ext) return false;
+    return (_wcsicmp(ext, L".mp3") == 0 || _wcsicmp(ext, L".wav") == 0 ||
+            _wcsicmp(ext, L".ogg") == 0 || _wcsicmp(ext, L".m4a") == 0 ||
+            _wcsicmp(ext, L".aac") == 0 || _wcsicmp(ext, L".flac") == 0);
+}
+
 static std::wstring ResolveTextureFilePath(const std::wstring& rawPath,
                                            MaxSDK::AssetManagement::AssetType assetType = MaxSDK::AssetManagement::kBitmapAsset) {
     if (rawPath.empty() || !IsImageFile(rawPath.c_str())) return {};
@@ -1681,6 +1690,22 @@ static std::wstring ResolveTextureFilePath(const std::wstring& rawPath,
         if (resolved.Length() > 0) {
             std::wstring resolvedPath(resolved.data());
             if (IsImageFile(resolvedPath.c_str()) && FileExists(resolvedPath)) return resolvedPath;
+        }
+    }
+
+    return {};
+}
+
+static std::wstring ResolveAudioFilePath(const std::wstring& rawPath) {
+    if (rawPath.empty() || !IsAudioFile(rawPath.c_str())) return {};
+    if (FileExists(rawPath)) return rawPath;
+
+    IFileResolutionManager* resolver = IFileResolutionManager::GetInstance();
+    if (resolver) {
+        MSTR resolved = resolver->GetFullFilePath(rawPath.c_str(), MaxSDK::AssetManagement::kSoundAsset, true);
+        if (resolved.Length() > 0) {
+            std::wstring resolvedPath(resolved.data());
+            if (IsAudioFile(resolvedPath.c_str()) && FileExists(resolvedPath)) return resolvedPath;
         }
     }
 
@@ -11716,6 +11741,14 @@ public:
         return resolvedPath.empty() ? std::wstring{} : MapAssetPath(resolvedPath, false);
     }
 
+    std::wstring MapAudioPath(const std::wstring& filePath) {
+        std::wstring mapped = MapAssetPath(filePath, false);
+        if (!mapped.empty()) return mapped;
+
+        const std::wstring resolvedPath = ResolveAudioFilePath(filePath);
+        return resolvedPath.empty() ? std::wstring{} : MapAssetPath(resolvedPath, false);
+    }
+
     // ── Callbacks & sync ─────────────────────────────────────
 
     bool IsTrackedHandle(ULONG handle) const {
@@ -14567,7 +14600,7 @@ public:
         }
 
         const MCHAR* rawPath = pb->GetStr(pa_audio_file);
-        std::wstring mappedPath = rawPath ? MapAssetPath(rawPath, false) : std::wstring{};
+        std::wstring mappedPath = rawPath ? MapAudioPath(rawPath) : std::wstring{};
 
         std::wostringstream ss;
         ss.imbue(std::locale::classic());
@@ -15612,7 +15645,7 @@ public:
         if (!pb) return false;
 
         const MCHAR* rawPath = pb->GetStr(pa_audio_file);
-        std::wstring url = rawPath ? MapAssetPath(rawPath, false) : std::wstring{};
+        std::wstring url = rawPath ? MapAudioPath(rawPath) : std::wstring{};
 
         const ULONG handle = node->GetHandle();
         float xform[16];

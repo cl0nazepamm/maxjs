@@ -66,7 +66,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "Copy-Item -Force '%PLUGI
 if errorlevel 1 goto :deploy_fail
 
 echo [4/4] Deploying web runtime...
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$dst='%WEB_DST%'; New-Item -ItemType Directory -Force -Path $dst | Out-Null; Copy-Item -Recurse -Force '%ROOT%\web\*' $dst" >nul
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$src='%ROOT%\web'; $dst='%WEB_DST%'; New-Item -ItemType Directory -Force -Path $dst | Out-Null; Remove-Item -Recurse -Force -LiteralPath (Join-Path $dst 'snapshots') -ErrorAction SilentlyContinue; Get-ChildItem -LiteralPath $src -Force | Where-Object { $_.Name -ne 'snapshots' } | Copy-Item -Destination $dst -Recurse -Force" >nul
 if errorlevel 1 goto :deploy_fail
 
 echo.

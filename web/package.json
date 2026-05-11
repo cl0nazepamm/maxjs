@@ -1,6 +1,9 @@
 {
   "dependencies": {
     "@sparkjsdev/spark": "^2.0.0",
-    "@takram/three-atmosphere": "^0.18.0"
+    "@takram/three-atmosphere": "^0.18.0",
+    "three-gpu-pathtracer": "^0.0.24",
+    "three-mesh-bvh": "0.8.3",
+    "xatlas-web": "^0.1.0"
   }
 }

@@ -1073,6 +1073,24 @@
             background: rgba(0, 0, 0, 0.12);
             border-color: rgba(0, 0, 0, 0.22);
         }
+        body.light-mode .rail-mode-switch {
+            background: rgba(0, 0, 0, 0.05);
+            border-color: rgba(0, 0, 0, 0.16);
+        }
+        body.light-mode .rail-mode-option {
+            color: rgba(20, 24, 28, 0.54);
+            border-color: rgba(0, 0, 0, 0.08);
+        }
+        body.light-mode .rail-mode-option:hover {
+            color: #111;
+            background: rgba(0, 0, 0, 0.06);
+        }
+        body.light-mode .rail-mode-option.active {
+            color: #111;
+            background: linear-gradient(180deg, #eeeeee 0%, #c9c9c9 100%);
+            border-color: rgba(0, 0, 0, 0.25);
+            box-shadow: inset 2px 0 0 rgba(0, 0, 0, 0.7);
+        }
         .ll-mode {
             background: rgba(255,255,255,0.06);
             border: 1px solid rgba(255,255,255,0.08);
@@ -1223,6 +1241,42 @@
             text-overflow: clip;
             pointer-events: none;
         }
+        .rail-mode-switch {
+            display: grid;
+            gap: 2px;
+            width: 40px;
+            padding: 3px;
+            margin: 0 auto;
+            background: rgba(255, 255, 255, 0.025);
+            border: 1px solid rgba(255, 255, 255, 0.055);
+            border-radius: 4px;
+        }
+        .rail-mode-option {
+            display: block;
+            height: 18px;
+            width: 100%;
+            padding: 0;
+            border: 1px solid rgba(255, 255, 255, 0.045);
+            border-radius: 2px;
+            background: transparent;
+            color: rgba(220, 225, 229, 0.52);
+            font: 700 6px/1 'Segoe UI', system-ui, sans-serif;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            cursor: pointer;
+            transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease, box-shadow 0.12s ease;
+        }
+        .rail-mode-option:hover {
+            color: rgba(245, 248, 250, 0.9);
+            background: rgba(255, 255, 255, 0.04);
+            border-color: rgba(255, 255, 255, 0.1);
+        }
+        .rail-mode-option.active {
+            color: #f2f7f5;
+            background: rgba(255, 255, 255, 0.075);
+            border-color: rgba(255, 255, 255, 0.16);
+            box-shadow: inset 2px 0 0 var(--accent);
+        }
         /* Theme icon crossfade — both present, CSS swaps by mode. */
         .rail-btn .icon-sun { display: none; }
         body.light-mode .rail-btn .icon-moon { display: none; }
@@ -1344,9 +1398,11 @@
                 <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="3" width="12" height="10" rx="2"/><path d="M5 1.5v3M8 1.5v3M11 1.5v3M5 12.5v2M8 12.5v2M11 12.5v2M1.5 6h3M1.5 10h3M11.5 6h3M11.5 10h3"/></svg>
                 <span class="rail-btn-badge">WGPU</span>
             </button>
-            <button id="btnRenderMode" class="rail-btn devonly" title="Render mode — Studio adds light linking / per-mesh HDRI; Standard stays within baseline WebGPU uniform-buffer limits." aria-label="Render mode">
-                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 1.5 2.5 4.5v7L8 14.5l5.5-3v-7L8 1.5Z"/><path d="M8 1.5v13M2.5 4.5 8 8l5.5-3.5"/></svg>
-            </button>
+            <div id="renderModeSwitch" class="rail-mode-switch devonly" role="group" aria-label="Render mode">
+                <button class="rail-mode-option" type="button" data-render-mode="standard" title="Standard render mode">STD</button>
+                <button class="rail-mode-option" type="button" data-render-mode="studio" title="Studio render mode">STU</button>
+                <button class="rail-mode-option" type="button" data-render-mode="pathtracing" title="Pathtracing render mode">PT</button>
+            </div>
             <button id="btnLightLink" class="rail-btn devonly" title="Light Linking" aria-label="Light Linking">
                 <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6.5 8.5a2.5 2.5 0 0 0 3.5 0l2.5-2.5a2.5 2.5 0 0 0-3.5-3.5L8 3.5"/><path d="M9.5 7.5a2.5 2.5 0 0 0-3.5 0L3.5 10a2.5 2.5 0 0 0 3.5 3.5L8 12.5"/></svg>
             </button>
@@ -1455,6 +1511,8 @@
             "three/tsl": "./vendor/three-r184/build/three.tsl.js",
             "three/addons/": "./vendor/three-r184/examples/",
             "three/examples/jsm/": "./vendor/three-r184/examples/",
+            "three-mesh-bvh": "./node_modules/three-mesh-bvh/src/index.js",
+            "xatlas-web": "./node_modules/xatlas-web/dist/xatlas-web.js",
             "@sparkjsdev/spark": "./node_modules/@sparkjsdev/spark/dist/spark.module.js",
             "@dimforge/rapier3d-compat": "./vendor/rapier/rapier.es.js",
             "react": "https://esm.sh/react@18.3.1",
@@ -1471,6 +1529,13 @@
                 "three": "./vendor/three-r184/build/three.module.js"
             },
             "./vendor/three-r184/examples/lighting/LightProbeGrid.js": {
+                "three": "./vendor/three-r184/build/three.module.js"
+            },
+            "./node_modules/three-gpu-pathtracer/": {
+                "three": "./vendor/three-r184/build/three.module.js",
+                "three/examples/jsm/": "./vendor/three-r184/examples/"
+            },
+            "./node_modules/three-mesh-bvh/": {
                 "three": "./vendor/three-r184/build/three.module.js"
             },
             "https://maxjs-assets.local/": {
@@ -1539,6 +1604,7 @@
         import { maxTimeline } from './js/maxjs_timeline.js';
         import { createPerfHud } from './js/perf_hud.js';
         import { createSSGIController } from './js/ssgi_fx.js';
+        import { createPathTracingController } from './js/pathtracing_controller.js';
         import { createLayerManager } from './js/layer_manager.js';
         import { MAXJS_LAYER_SSR_EXCLUDE } from './js/render_layers.js';
         import { createMaxJSAnimationSystem } from './js/maxjs_animation.js';
@@ -1749,6 +1815,22 @@
         }
 
         const RENDERER_BACKEND_STORAGE_KEY = 'maxjs_renderer_backend_preference';
+        const MAXJS_MODE_KEY = 'maxjs-render-mode';
+        const MAXJS_RENDER_MODES = ['standard', 'studio', 'pathtracing'];
+        const isHostedWebView = !!window.chrome?.webview?.postMessage;
+
+        function readMaxjsRenderMode() {
+            try {
+                const value = localStorage.getItem(MAXJS_MODE_KEY);
+                return MAXJS_RENDER_MODES.includes(value) ? value : 'standard';
+            } catch {
+                return 'standard';
+            }
+        }
+
+        const maxjsRenderMode = readMaxjsRenderMode();
+        const isStudioMode = maxjsRenderMode === 'studio';
+        const isPathTracingMode = isHostedWebView && maxjsRenderMode === 'pathtracing';
 
         function normalizeRendererBackend(value) {
             return value === 'webgl' || value === 'webgpu' || value === 'webgl-vr' ? value : '';
@@ -1784,7 +1866,16 @@
             let nextRenderer;
             let backendLabel;
 
-            if (requestedBackend === 'webgl-vr') {
+            if (isPathTracingMode) {
+                nextRenderer = new THREE_STD.WebGLRenderer({
+                    antialias: true,
+                    alpha: true,
+                    powerPreference: 'high-performance',
+                });
+                backendLabel = 'WebGL2 (Pathtracing)';
+                configureRenderer(nextRenderer);
+                await initializeRenderer(nextRenderer);
+            } else if (requestedBackend === 'webgl-vr') {
                 nextRenderer = new THREE_STD.WebGLRenderer({
                     antialias: true,
                     alpha: true,
@@ -1834,22 +1925,16 @@
             THREE.RectAreaLightNode.setLTC(RectAreaLightTexturesLib.init());
         }
 
-        // ── Studio vs Standard render mode ────────────────────
+        // ── Render mode ───────────────────────────────────────
         // Studio  = MaxLightsNode (light linking + per-mesh HDRI intensity).
         //           Unlinked lights stay on stock batched three.js light nodes.
         // Standard = stock three.js pipeline. No per-mesh tricks, but fits
         //            within baseline WebGPU uniform-buffer limits — use on
         //            heavier scenes that exceed 12 uniform buffers/stage.
+        // Pathtracing = isolated legacy WebGL2 progressive path tracer.
+        //               This is live-viewer only and is not exported to snapshots.
         //
-        // Mode is frozen at renderer init; switching requires reload.
-        const MAXJS_MODE_KEY = 'maxjs-render-mode';
-        const maxjsRenderMode = (() => {
-            try {
-                const v = localStorage.getItem(MAXJS_MODE_KEY);
-                return v === 'studio' ? 'studio' : 'standard';
-            } catch { return 'standard'; }
-        })();
-        const isStudioMode = maxjsRenderMode === 'studio';
+        // Mode is frozen before renderer init; switching requires reload.
         const STUDIO_ONLY_RAIL_IDS = ['btnLightLink', 'btnReflPaint'];
 
         function setRailButtonMeta(button, { label, badge } = {}) {
@@ -1934,6 +2019,14 @@
         defaultLights.add(defaultKey);
         defaultLights.add(defaultFill);
         scene.add(defaultLights);
+        function setDefaultLightsVisible(visible) {
+            const enabled = !isPathTracingMode && !!visible;
+            defaultLights.visible = enabled;
+            defaultAmbient.visible = enabled;
+            defaultKey.visible = enabled;
+            defaultFill.visible = enabled;
+        }
+        setDefaultLightsVisible(true);
         const lightProbe = new THREE.LightProbe();
         scene.add(lightProbe);
 
@@ -2153,6 +2246,19 @@
         // instead. Toggled from the right rail. Loads React +
         // @basementstudio/shader-lab from esm.sh on first enable.
         const shaderLabFx = createShaderLabFx({ THREE, renderer, scene, camera });
+        const pathTracingFx = createPathTracingController({
+            renderer,
+            scene,
+            camera,
+            enabled: isPathTracingMode,
+            loadWebGLPathTracer: async () => import('./node_modules/three-gpu-pathtracer/src/core/WebGLPathTracer.js'),
+            onStatus(message) {
+                perfHud.setStatus(message);
+            },
+            onError(error) {
+                reportBridgeError('pathtracing', error);
+            },
+        });
 
         // Clone blob overlay — 2D canvas for bounding rectangles
         const blobOverlayCvs = document.createElement('canvas');
@@ -2374,6 +2480,7 @@
         let currentHdriProbeSignature = '';
         let currentEnvParams = null;
         let currentHdriEnvMap = null;
+        let currentHdriRawTexture = null;
         let hasLightProbeData = false;
         let lightProbeGrid = null;
         let hasLightProbeGridData = false;
@@ -2384,6 +2491,7 @@
         // Local HDRI override (independent of Max environment)
         let localHdriObjectUrl = null;   // file loaded in memory
         let localHdriEnvMap = null;      // cached PMREM texture
+        let localHdriRawTexture = null;  // equirect source for pathtracing
 
         // No-op — env intensity is now controlled per-material via
         // material.envMapIntensity using the patched materialEnvIntensity
@@ -2408,6 +2516,16 @@
                 if (scene.background === oldEnvMap) scene.background = new THREE.Color(hiddenBackgroundColor);
                 oldEnvMap.dispose?.();
             }
+            if (currentHdriRawTexture) {
+                if (scene.userData.maxjsPathTraceEnvironment === currentHdriRawTexture) {
+                    scene.userData.maxjsPathTraceEnvironment = null;
+                }
+                if (scene.userData.maxjsPathTraceBackground === currentHdriRawTexture) {
+                    scene.userData.maxjsPathTraceBackground = null;
+                }
+                currentHdriRawTexture.dispose?.();
+                currentHdriRawTexture = null;
+            }
         }
 
         function applyLightProbeState() {
@@ -2429,7 +2547,7 @@
         }
 
         function supportsWebGLLightProbeGrid() {
-            return renderer?.isWebGLRenderer === true && typeof LightProbeGrid === 'function';
+            return !isPathTracingMode && renderer?.isWebGLRenderer === true && typeof LightProbeGrid === 'function';
         }
 
         function computeLightProbeGridBounds(target = new THREE.Box3()) {
@@ -2583,6 +2701,11 @@
         }
 
         async function updateLightProbeFromHDRI(hdrTex, probeSignature, loadGeneration) {
+            if (isPathTracingMode) {
+                clearLightProbe();
+                return;
+            }
+
             if (await updateLightProbeGridFromScene(hdrTex, probeSignature, loadGeneration)) {
                 return;
             }
@@ -3543,18 +3666,23 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     hdrTex.dispose();
                     return;
                 }
+                if (currentHdriRawTexture && currentHdriRawTexture !== hdrTex) currentHdriRawTexture.dispose?.();
+                currentHdriRawTexture = hdrTex;
+                scene.userData.maxjsPathTraceEnvironment = hdrTex;
+                scene.userData.maxjsPathTraceBackground = envVisible ? hdrTex : null;
                 const previousEnvMap = currentHdriEnvMap;
-                const envMap = retainPMREMTexture(pmremGenerator.fromEquirectangular(hdrTex));
+                const envMap = isPathTracingMode
+                    ? null
+                    : retainPMREMTexture(pmremGenerator.fromEquirectangular(hdrTex));
                 currentHdriEnvMap = envMap;
                 scene.environment = envMap;
                 syncMaterialEnvMaps();
-                if (envVisible) scene.background = envMap;
+                if (envVisible) scene.background = envMap || new THREE.Color(hiddenBackgroundColor);
                 if (previousEnvMap && previousEnvMap !== envMap) previousEnvMap.dispose?.();
-                defaultLights.visible = false;
+                setDefaultLightsVisible(false);
                 if (lightProbeEnabled || shouldRefreshProbe) {
                     await updateLightProbeFromHDRI(hdrTex, probeSignature, loadGeneration);
                 }
-                hdrTex.dispose();
                 ssgiFx.markEnvironmentChanged?.();
             }, undefined, (error) => {
                 console.error('max.js HDRI load failed', { hdriUrl, error });
@@ -3563,10 +3691,12 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 currentEnvParams = null;
                 clearCurrentHdriEnvMap();
                 scene.environment = null;
+                scene.userData.maxjsPathTraceEnvironment = null;
+                scene.userData.maxjsPathTraceBackground = null;
                 syncMaterialEnvMaps();
                 clearLightProbe();
                 if (envVisible) scene.background = new THREE.Color(hiddenBackgroundColor);
-                defaultLights.visible = true;
+                setDefaultLightsVisible(true);
                 ssgiFx.markEnvironmentChanged?.();
             });
         }
@@ -3627,6 +3757,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         function loadLocalHDRIFile(file, { preserveEnabled = false, persist = true } = {}) {
             if (localHdriObjectUrl) URL.revokeObjectURL(localHdriObjectUrl);
             if (localHdriEnvMap) { localHdriEnvMap.dispose(); localHdriEnvMap = null; }
+            if (localHdriRawTexture) { localHdriRawTexture.dispose?.(); localHdriRawTexture = null; }
             clearCurrentHdriEnvMap();
             localHdriObjectUrl = URL.createObjectURL(file);
             localHdriFileName = file.name;
@@ -3638,13 +3769,15 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
 
             loadEnvironmentTexture(localHdriObjectUrl, file.name, async (hdrTex) => {
                 if (loadGen !== hdriLoadGeneration) { hdrTex.dispose(); return; }
-                localHdriEnvMap = retainPMREMTexture(pmremGenerator.fromEquirectangular(hdrTex));
+                localHdriRawTexture = hdrTex;
+                localHdriEnvMap = isPathTracingMode
+                    ? null
+                    : retainPMREMTexture(pmremGenerator.fromEquirectangular(hdrTex));
                 applyLocalHDRIToScene();
                 currentHdriUrl = localHdriObjectUrl;
                 if (lightProbeEnabled) {
                     await updateLightProbeFromHDRI(hdrTex, 'local-' + localHdriFileName, loadGen);
                 }
-                hdrTex.dispose();
                 ssgiFx.markEnvironmentChanged?.();
                 if (persist) savePostFxState();
                 syncHdriPanel();
@@ -3655,10 +3788,12 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         }
 
         function applyLocalHDRIToScene() {
-            if (!localHdriEnvMap) return;
+            if (!localHdriEnvMap && !localHdriRawTexture) return;
             if (localHdriEnabled) {
                 localHdriShowBg = envVisible;
                 scene.environment = localHdriEnvMap;
+                scene.userData.maxjsPathTraceEnvironment = localHdriRawTexture || null;
+                scene.userData.maxjsPathTraceBackground = localHdriShowBg ? (localHdriRawTexture || null) : null;
                 syncMaterialEnvMaps();
                 scene.environmentIntensity = localHdriIntensity;
                 const rot = localHdriRotation * Math.PI / 180;
@@ -3670,17 +3805,19 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 }
                 scene.backgroundBlurriness = localHdriBlur;
                 if (localHdriShowBg) {
-                    scene.background = localHdriEnvMap;
+                    scene.background = localHdriEnvMap || new THREE.Color(hiddenBackgroundColor);
                     scene.backgroundIntensity = localHdriIntensity;
                 } else {
                     scene.background = new THREE.Color(hiddenBackgroundColor);
                 }
-                defaultLights.visible = false;
+                setDefaultLightsVisible(false);
             } else {
                 scene.environment = null;
+                scene.userData.maxjsPathTraceEnvironment = currentHdriRawTexture || null;
+                scene.userData.maxjsPathTraceBackground = null;
                 syncMaterialEnvMaps();
                 scene.background = new THREE.Color(hiddenBackgroundColor);
-                defaultLights.visible = true;
+                setDefaultLightsVisible(true);
             }
         }
 
@@ -3702,12 +3839,15 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             localHdriFileName = '';
             localHdriEnabled = true;
             if (localHdriEnvMap) { localHdriEnvMap.dispose(); localHdriEnvMap = null; }
+            if (localHdriRawTexture) { localHdriRawTexture.dispose?.(); localHdriRawTexture = null; }
             clearCurrentHdriEnvMap();
             if (localHdriObjectUrl) { URL.revokeObjectURL(localHdriObjectUrl); localHdriObjectUrl = null; }
             void clearStashedHdri();
             currentHdriUrl = null;
             currentHdriProbeSignature = '';
             scene.environment = null;
+            scene.userData.maxjsPathTraceEnvironment = null;
+            scene.userData.maxjsPathTraceBackground = null;
             syncMaterialEnvMaps();
             scene.environmentIntensity = 1.0;
             scene.environmentRotation.set(0, 0, 0);
@@ -3715,7 +3855,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             scene.backgroundBlurriness = 0;
             scene.background = new THREE.Color(hiddenBackgroundColor);
             clearLightProbe();
-            defaultLights.visible = true;
+            setDefaultLightsVisible(true);
             ssgiFx.markEnvironmentChanged?.();
             savePostFxState();
             syncHdriPanel();
@@ -3792,19 +3932,29 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
 
                 if (skyMesh.parent !== scene) scene.add(skyMesh);
 
-                // Generate environment map from sky for PBR reflections
-                const skyScene = new THREE.Scene();
-                const skyCopy = skyMesh.clone();
-                skyScene.add(skyCopy);
-                const nextSkyEnvMap = retainPMREMTexture(pmremGenerator.fromScene(skyScene, 0, 0.1, 1000000));
-                skyScene.clear();
-                if (!nextSkyEnvMap) return;
-                if (skyEnvMap) skyEnvMap.dispose();
-                skyEnvMap = nextSkyEnvMap;
                 clearCurrentHdriEnvMap();
 
                 scene.background = null;
-                scene.environment = skyEnvMap;
+                // Legacy WebGL2 sky is a visible sky mesh + lights only.
+                // PMREM-from-scene can hit unsupported texture targets there,
+                // so keep the generated sky env map on WebGPU/WebGPU-forceWebGL.
+                if (useLegacySky) {
+                    if (skyEnvMap) {
+                        skyEnvMap.dispose();
+                        skyEnvMap = null;
+                    }
+                    scene.environment = null;
+                } else {
+                    const skyScene = new THREE.Scene();
+                    const skyCopy = skyMesh.clone();
+                    skyScene.add(skyCopy);
+                    const nextSkyEnvMap = retainPMREMTexture(pmremGenerator.fromScene(skyScene, 0, 0.1, 1000000));
+                    skyScene.clear();
+                    if (!nextSkyEnvMap) return;
+                    if (skyEnvMap) skyEnvMap.dispose();
+                    skyEnvMap = nextSkyEnvMap;
+                    scene.environment = skyEnvMap;
+                }
                 syncMaterialEnvMaps();
                 scene.environmentRotation.set(0, 0, 0);
                 scene.backgroundRotation.set(0, 0, 0);
@@ -3831,7 +3981,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 if (skyFillLight.parent !== scene) scene.add(skyFillLight);
                 skyFillLight.intensity = 0.5 + sunStrength * 0.5;
 
-                defaultLights.visible = false;
+                setDefaultLightsVisible(false);
                 skyActive = true;
 
                 // Clear HDRI state
@@ -3874,7 +4024,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             scene.backgroundBlurriness = 0;
             scene.background = new THREE.Color(hiddenBackgroundColor);
             clearLightProbe();
-            defaultLights.visible = lightHandleMap.size === 0;
+            setDefaultLightsVisible(lightHandleMap.size === 0);
         }
 
         // ── Material Creation ───────────────────────────────
@@ -5920,6 +6070,9 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 if (lightsChanged) markLightProbeSceneDirty();
                 scheduleLightProbeFromCurrentScene();
             }
+            if (pathTracingFx.isEnabled?.()) {
+                pathTracingFx.markSceneDirty?.();
+            }
             // Full snapshot can add/remove many meshes — cheap scene refresh.
             // Effect toggles, env, and renderer size have their own dedicated
             // entry points, so a full pipeline rebuild is unnecessary here.
@@ -6603,6 +6756,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 },
             });
             if (runtimeTransformsChanged) layerManager.markRuntimeTransformsDirty?.();
+            if (pathTracingFx.isEnabled?.()) pathTracingFx.markSceneDirty?.();
             markInitialSync();
             setTransportMode('binary-delta');
             updateSyncHud({
@@ -7189,7 +7343,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 }
             }
 
-            defaultLights.visible = appliedLightCount === 0 && !currentHdriUrl && !skyActive;
+            setDefaultLightsVisible(appliedLightCount === 0 && !currentHdriUrl && !skyActive);
             if (ssgiFx.setMainLight) {
                 ssgiFx.setMainLight(mainDirectionalLight || (defaultLights.visible ? defaultKey : null));
             }
@@ -9343,7 +9497,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 }
             }
 
-            defaultLights.visible = appliedLightCount === 0 && !currentHdriUrl && !skyActive;
+            setDefaultLightsVisible(appliedLightCount === 0 && !currentHdriUrl && !skyActive);
             if (ssgiFx.setMainLight) {
                 ssgiFx.setMainLight(mainDirectionalLight || (defaultLights.visible ? defaultKey : null));
             }
@@ -9468,6 +9622,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 controls.object = camera;
                 ssgiFx.setCamera?.(camera);
                 shaderLabFx.setCamera?.(camera);
+                pathTracingFx.setCamera?.(camera);
             } else if (!wantOrtho && isOrtho) {
                 scene.remove(camera);
                 camera = perspCamera;
@@ -9475,6 +9630,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 controls.object = camera;
                 ssgiFx.setCamera?.(camera);
                 shaderLabFx.setCamera?.(camera);
+                pathTracingFx.setCamera?.(camera);
             }
 
             copyMaxArrayToWorld(camera.position, cam.pos);
@@ -9531,6 +9687,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 controls.object = camera;
                 ssgiFx.setCamera?.(camera);
                 shaderLabFx.setCamera?.(camera);
+                pathTracingFx.setCamera?.(camera);
             } else if (!wantOrtho && isOrtho) {
                 scene.remove(camera);
                 camera = perspCamera;
@@ -9538,6 +9695,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 controls.object = camera;
                 ssgiFx.setCamera?.(camera);
                 shaderLabFx.setCamera?.(camera);
+                pathTracingFx.setCamera?.(camera);
             }
 
             camera.position.fromArray(savedCamera.position);
@@ -9927,6 +10085,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             } else {
                 scene.background = envVisible && scene.environment
                     ? scene.environment : new THREE.Color(hiddenBackgroundColor);
+                scene.userData.maxjsPathTraceBackground = envVisible ? (currentHdriRawTexture || null) : null;
                 if (envVisible) scene.backgroundBlurriness = localHdriBlur;
             }
             savePostFxState();
@@ -9989,15 +10148,27 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             });
         });
 
-        const btnRenderMode = document.getElementById('btnRenderMode');
-        if (btnRenderMode) {
-            btnRenderMode.classList.toggle('active', isStudioMode);
-            btnRenderMode.title = `Render mode: ${isStudioMode ? 'Studio' : 'Standard'} — Studio adds light linking / per-mesh HDRI; Standard stays within baseline WebGPU uniform-buffer limits. Toggling reloads the page.`;
-            btnRenderMode.addEventListener('click', () => {
-                const nextMode = isStudioMode ? 'standard' : 'studio';
-                if (!confirm(`Switch to ${nextMode === 'studio' ? 'Studio' : 'Standard'} mode? Reloads the page.`)) return;
-                try { localStorage.setItem(MAXJS_MODE_KEY, nextMode); } catch {}
-                location.reload();
+        const renderModeSwitch = document.getElementById('renderModeSwitch');
+        if (renderModeSwitch) {
+            const modeLabels = {
+                standard: 'Standard',
+                studio: 'Studio',
+                pathtracing: 'Pathtracing',
+            };
+            renderModeSwitch.title = 'Render mode: Standard, Studio, or live-only Pathtracing';
+            renderModeSwitch.querySelectorAll('[data-render-mode]').forEach(button => {
+                const mode = button.dataset.renderMode;
+                const active = mode === maxjsRenderMode;
+                button.classList.toggle('active', active);
+                button.setAttribute('aria-pressed', active ? 'true' : 'false');
+                button.title = `${modeLabels[mode] || mode} mode${active ? ' active' : ''}`;
+                button.addEventListener('click', () => {
+                    if (mode === maxjsRenderMode) return;
+                    const label = modeLabels[mode] || mode;
+                    if (!confirm(`Switch to ${label} mode? Reloads the page.`)) return;
+                    try { localStorage.setItem(MAXJS_MODE_KEY, mode); } catch {}
+                    location.reload();
+                });
             });
         }
         btnSwitchVR?.addEventListener('click', () => {
@@ -11581,9 +11752,10 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         }
 
         function serializeSnapshotUiState({ includeDebug = false } = {}) {
+            const snapshotRendererBackend = isPathTracingMode ? 'WebGL2' : rendererBackendLabel;
             const payload = {
                 buildMode: includeDebug ? 'dev' : 'release',
-                rendererBackend: rendererBackendLabel,
+                rendererBackend: snapshotRendererBackend,
                 toneMapping: currentToneMapping,
                 exposure: currentExposure,
                 aaMode: currentAAMode,
@@ -11623,7 +11795,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             if (includeDebug) {
                 payload.debug = {
                     buildMode, debugMode, standalone: isStandalone,
-                    backend: rendererBackendLabel,
+                    backend: snapshotRendererBackend,
                     nodeMapSize: nodeMap.size,
                     memory: renderer?.info?.memory ?? null,
                 };
@@ -12238,7 +12410,11 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             // the system sees between frames.
             layerManager.beforeRender?.(frameElapsed);
             try {
-                if (asciiActive && asciiEffect) {
+                if (pathTracingFx.isEnabled?.()) {
+                    // Pathtracing is a live-viewer-only renderer mode. It
+                    // bypasses post FX and never participates in snapshots.
+                    if (!pathTracingFx.render?.()) renderer.render(scene, camera);
+                } else if (asciiActive && asciiEffect) {
                     asciiEffect.render(scene, camera);
                 } else if (xrRuntime.shouldBypassPostFx) {
                     // Reduce brightness for VR (no post-fx tone mapping)

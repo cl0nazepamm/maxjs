@@ -5,17 +5,16 @@
 // (`handleBinaryScene` in index.html) and the snapshot applier (future
 // `js/scene_applier.js`) can share one canonical implementation.
 //
-// Stage 2 scope: the small, pure pieces only. Geometry-from-node, skin
-// rig assembly, and bounds checks. Vertex-color attribute updates and
-// material building stay inline for now — they have larger closure
-// dependencies that come along in the next extraction pass.
+// Scope: pure shared-buffer geometry pieces only. Scene ownership,
+// vertex-color descriptors, and material building stay in the caller because
+// they depend on live viewer registries and layer state.
 
 import * as THREE from 'three';
 
 /**
  * Range check for a [Float32 / Int32] buffer view of `n` elements at
- * byte offset `off`. Mirrors `binInRange` from index.html — assumes the
- * payload aligns to 4-byte boundaries (the producer guarantees this).
+ * byte offset `off`. Assumes the payload aligns to 4-byte boundaries (the
+ * producer guarantees this).
  */
 export function binInRange(buffer, off, n) {
     return (
@@ -26,6 +25,55 @@ export function binInRange(buffer, off, n) {
         (off % 4) === 0 &&
         (off + n * 4) <= buffer.byteLength
     );
+}
+
+export function typedArrayCanStore(array, expectedLength) {
+    try {
+        return !!array
+            && array.length >= expectedLength
+            && array.buffer
+            && array.buffer.byteLength >= array.byteOffset + expectedLength * array.BYTES_PER_ELEMENT;
+    } catch {
+        return false;
+    }
+}
+
+export function updateFloatGeometryAttribute(geometry, name, buffer, off, n, itemSize) {
+    if (!binInRange(buffer, off, n) || n % itemSize !== 0) {
+        console.warn('[max.js binary] Invalid attribute range for', name);
+        return false;
+    }
+    const source = new Float32Array(buffer, off, n);
+    const count = n / itemSize;
+    const current = geometry.getAttribute(name);
+    if (
+        current
+        && current.itemSize === itemSize
+        && current.count === count
+        && typedArrayCanStore(current.array, n)
+    ) {
+        current.array.set(source);
+        current.needsUpdate = true;
+        return true;
+    }
+    geometry.setAttribute(name, new THREE.BufferAttribute(new Float32Array(source), itemSize));
+    return true;
+}
+
+export function updateGeometryIndexAttribute(geometry, buffer, off, n) {
+    if (!binInRange(buffer, off, n)) {
+        console.warn('[max.js binary] Invalid index range');
+        return false;
+    }
+    const source = new Int32Array(buffer, off, n);
+    const current = geometry.getIndex();
+    if (current && current.count === n && typedArrayCanStore(current.array, n)) {
+        current.array.set(source);
+        current.needsUpdate = true;
+        return true;
+    }
+    geometry.setIndex(new THREE.BufferAttribute(new Uint32Array(source), 1));
+    return true;
 }
 
 /**

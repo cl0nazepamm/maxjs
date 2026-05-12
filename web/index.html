@@ -222,6 +222,15 @@
         // scene.environment — no custom environmentNode or envMap stamping.
         materialEnvIntensity.onObjectUpdate(({ material }) => material.envMapIntensity);
         import { applyDeltaFrame } from './js/protocol.js';
+        import {
+            attachSkinAttributes,
+            binInRange,
+            buildSkinnedMeshFromNd as buildSkinnedMeshFromBinary,
+            geometryFromNodeBinary,
+            typedArrayCanStore,
+            updateFloatGeometryAttribute,
+            updateGeometryIndexAttribute,
+        } from './js/scene_binary.js';
         import { maxTimeline } from './js/maxjs_timeline.js';
         import { createPerfHud } from './js/perf_hud.js';
         import { createSSGIController } from './js/ssgi_fx.js';
@@ -3747,55 +3756,6 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             setInfoText(`max.js - ${prefix}: ${message}`);
         }
 
-        function typedArrayCanStore(array, expectedLength) {
-            try {
-                return !!array
-                    && array.length >= expectedLength
-                    && array.buffer
-                    && array.buffer.byteLength >= array.byteOffset + expectedLength * array.BYTES_PER_ELEMENT;
-            } catch {
-                return false;
-            }
-        }
-
-        function updateFloatGeometryAttribute(geometry, name, buffer, off, n, itemSize) {
-            if (!binInRange(buffer, off, n) || n % itemSize !== 0) {
-                console.warn('[max.js binary] Invalid attribute range for', name);
-                return false;
-            }
-            const source = new Float32Array(buffer, off, n);
-            const count = n / itemSize;
-            const current = geometry.getAttribute(name);
-            if (
-                current
-                && current.itemSize === itemSize
-                && current.count === count
-                && typedArrayCanStore(current.array, n)
-            ) {
-                current.array.set(source);
-                current.needsUpdate = true;
-                return true;
-            }
-            geometry.setAttribute(name, new THREE.BufferAttribute(new Float32Array(source), itemSize));
-            return true;
-        }
-
-        function updateGeometryIndexAttribute(geometry, buffer, off, n) {
-            if (!binInRange(buffer, off, n)) {
-                console.warn('[max.js binary] Invalid index range');
-                return false;
-            }
-            const source = new Int32Array(buffer, off, n);
-            const current = geometry.getIndex();
-            if (current && current.count === n && typedArrayCanStore(current.array, n)) {
-                current.array.set(source);
-                current.needsUpdate = true;
-                return true;
-            }
-            geometry.setIndex(new THREE.BufferAttribute(new Uint32Array(source), 1));
-            return true;
-        }
-
         bridge.on('debug', msg => {
             if (!hasInitialSync) {
                 setInfoText('max.js - ' + (msg.msg || 'debug'));
@@ -5141,74 +5101,6 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         });
 
         // ── Binary Scene Handler (SharedBuffer) ──────────────
-        function binInRange(buffer, off, n) {
-            return (
-                Number.isInteger(off) &&
-                Number.isInteger(n) &&
-                off >= 0 &&
-                n >= 0 &&
-                (off % 4) === 0 &&
-                (off + n * 4) <= buffer.byteLength
-            );
-        }
-
-        function buildSkinnedMeshFromNd(geom, mat, nd, buffer) {
-            const sk = nd.skin;
-            const nB = sk.bones?.length ?? 0;
-            if (!nB || !geom) return null;
-            const bones = [];
-            for (let i = 0; i < nB; i++) {
-                const bone = new THREE.Bone();
-                bone.name = `bone_${i}`;
-                const bo = sk.bindOff + i * 16 * 4;
-                if (binInRange(buffer, bo, 16)) {
-                    bone.matrix.fromArray(new Float32Array(buffer, bo, 16));
-                    bone.matrix.decompose(bone.position, bone.quaternion, bone.scale);
-                }
-                bone.matrixAutoUpdate = false;
-                bones.push(bone);
-            }
-            const skinned = new THREE.SkinnedMesh(geom, mat);
-            skinned.matrixAutoUpdate = false;
-            const pending = new Set(bones.map((_, i) => i));
-            let guard = 0;
-            while (pending.size > 0 && guard++ < nB * 4) {
-                for (const i of [...pending]) {
-                    const pi = sk.parent[i];
-                    if (pi < 0) {
-                        skinned.add(bones[i]);
-                        pending.delete(i);
-                    } else if (!pending.has(pi)) {
-                        bones[pi].add(bones[i]);
-                        pending.delete(i);
-                    }
-                }
-            }
-            for (const i of pending) {
-                skinned.add(bones[i]);
-            }
-            const skeleton = new THREE.Skeleton(bones);
-            skinned.bind(skeleton);
-            skinned.userData.maxjsSkinRig = true;
-            if (nd.morph?.names?.length) {
-                const nM = nd.morph.names.length;
-                skinned.morphTargetInfluences =
-                    nd.morph.infl?.length === nM
-                        ? nd.morph.infl.slice()
-                        : new Array(nM).fill(0);
-            }
-            for (let i = 0; i < nB; i++) {
-                const h = sk.bones[i];
-                if (h) {
-                    // Scope bone handles per mesh to avoid collisions between characters
-                    const scopedKey = `${nd.h}:${h}`;
-                    bones[i].userData.maxjsHandle = scopedKey;
-                    nodeMap.set(scopedKey, bones[i]);
-                }
-            }
-            return skinned;
-        }
-
         function handleBinaryScene(buffer, meta) {
             if (meta.type !== 'scene_bin') return;
             resolveSnapshotMaterialRefs(meta);
@@ -5265,61 +5157,8 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     const srcGeom = geoByHandle.get(nd.instOf) || instSrcMesh?.geometry;
                     if (srcGeom) geom = jsmodFlag ? srcGeom.clone() : srcGeom;
                 } else if (nd.geo && !jsmodSkipGeo) {
-                    const inRange = (off, n) =>
-                        Number.isInteger(off) &&
-                        Number.isInteger(n) &&
-                        off >= 0 &&
-                        n >= 0 &&
-                        (off % 4) === 0 &&
-                        (off + n * 4) <= buffer.byteLength;
-
-                    if (!inRange(nd.geo.vOff, nd.geo.vN) || !inRange(nd.geo.iOff, nd.geo.iN)) {
-                        console.warn('[max.js binary] Invalid vertex/index range for', nd.n);
-                        continue;
-                    }
-                    if (nd.geo.uvOff != null && !inRange(nd.geo.uvOff, nd.geo.uvN || 0)) {
-                        console.warn('[max.js binary] Invalid UV range for', nd.n);
-                        continue;
-                    }
-                    if (nd.geo.uv2Off != null && !inRange(nd.geo.uv2Off, nd.geo.uv2N || 0)) {
-                        console.warn('[max.js binary] Invalid UV2 range for', nd.n);
-                        continue;
-                    }
-                    const vertsCopy = new Float32Array(
-                        new Float32Array(buffer, nd.geo.vOff, nd.geo.vN)
-                    );
-                    const idxCopy = new Uint32Array(
-                        new Int32Array(buffer, nd.geo.iOff, nd.geo.iN)
-                    );
-
-                    geom = new THREE.BufferGeometry();
-                    geom.setAttribute('position', new THREE.BufferAttribute(vertsCopy, 3));
-                    geom.setIndex(new THREE.BufferAttribute(idxCopy, 1));
-
-                    if (nd.geo.uvOff != null && nd.geo.uvN) {
-                        const uvsCopy = new Float32Array(
-                            new Float32Array(buffer, nd.geo.uvOff, nd.geo.uvN)
-                        );
-                        geom.setAttribute('uv', new THREE.BufferAttribute(uvsCopy, 2));
-                    }
-                    if (nd.geo.uv2Off != null && nd.geo.uv2N) {
-                        const uv2sCopy = new Float32Array(
-                            new Float32Array(buffer, nd.geo.uv2Off, nd.geo.uv2N)
-                        );
-                        // three r184 lightMap samples geometry attribute "uv1".
-                        // Keep "uv2" as a compatibility/debug alias for Max map channel 2.
-                        const uv2Attr = new THREE.BufferAttribute(uv2sCopy, 2);
-                        geom.setAttribute('uv1', uv2Attr);
-                        geom.setAttribute('uv2', uv2Attr);
-                    }
-                    if (nd.geo.nOff != null && inRange(nd.geo.nOff, nd.geo.nN || 0)) {
-                        const normalsCopy = new Float32Array(
-                            new Float32Array(buffer, nd.geo.nOff, nd.geo.nN)
-                        );
-                        geom.setAttribute('normal', new THREE.BufferAttribute(normalsCopy, 3));
-                    } else if (!nd.spline) {
-                        geom.computeVertexNormals();
-                    }
+                    geom = geometryFromNodeBinary(nd, buffer);
+                    if (!geom) continue;
                     setGeometryVertexColorAttributes(geom, nd.geo.vc, buffer);
                     // Add material groups for Multi/Sub
                     if (nd.groups) {
@@ -5327,30 +5166,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                             geom.addGroup(start, count, idx);
                         }
                     }
-                    if (nd.skin && geom && !nd.spline) {
-                        const sk = nd.skin;
-                        if (binInRange(buffer, sk.wOff, sk.wN) && binInRange(buffer, sk.iOff, sk.iN)) {
-                            const w = new Float32Array(new Float32Array(buffer, sk.wOff, sk.wN));
-                            const si = new Float32Array(new Float32Array(buffer, sk.iOff, sk.iN));
-                            geom.setAttribute('skinWeight', new THREE.Float32BufferAttribute(w, 4));
-                            geom.setAttribute('skinIndex', new THREE.Float32BufferAttribute(si, 4));
-                        }
-                        if (nd.morph?.dOff?.length && nd.morph?.dN?.length && nd.morph?.names?.length) {
-                            geom.morphAttributes = { position: [] };
-                            for (let mi = 0; mi < nd.morph.names.length; mi++) {
-                                const off = nd.morph.dOff[mi];
-                                const cnt = nd.morph.dN[mi];
-                                if (!binInRange(buffer, off, cnt)) continue;
-                                const d = new Float32Array(new Float32Array(buffer, off, cnt));
-                                const attr = new THREE.BufferAttribute(d, 3);
-                                attr.name = String(nd.morph.names[mi] ?? `morph_${mi}`);
-                                geom.morphAttributes.position.push(attr);
-                            }
-                            if (geom.morphAttributes.position.length > 0) {
-                                geom.morphTargetRelative = true;
-                            }
-                        }
-                    }
+                    attachSkinAttributes(geom, nd, buffer);
                 } else if (geom && nd.groups) {
                     // Geometry unchanged, but keep groups/material indexing synced.
                     geom.clearGroups();
@@ -5401,7 +5217,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     if (wantsLine) {
                         mesh = new THREE.LineSegments(geom, material);
                     } else if (nd.skin) {
-                        mesh = buildSkinnedMeshFromNd(geom, material, nd, buffer);
+                        mesh = buildSkinnedMeshFromBinary({ nd, geom, material, buffer, nodeMap });
                         if (!mesh) mesh = new THREE.Mesh(geom, material);
                     } else {
                         mesh = new THREE.Mesh(geom, material);

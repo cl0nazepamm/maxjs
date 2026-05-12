@@ -39,6 +39,15 @@ const SCENE_REBUILD_COALESCE_MS = 25;
 const SCENE_REBUILD_MIN_INTERVAL_MS = 50;
 const SCENE_REBUILD_RETRY_MS = 1000;
 const CAMERA_MATRIX_EPSILON = 1e-6;
+const DEFAULT_SAMPLES_PER_FRAME = 1;
+const MIN_SAMPLES_PER_FRAME = 1;
+const MAX_SAMPLES_PER_FRAME = 64;
+const DEFAULT_GI_CLAMP = 20.0;
+const MIN_GI_CLAMP = 1.0;
+const MAX_GI_CLAMP = 1000.0;
+const GI_CLAMP_UNIFORM_DECL = 'uniform float maxjsGIClamp;';
+const GI_CLAMP_SHADER_SOURCE = 'min( 1.0 / rrProb, 20.0 )';
+const GI_CLAMP_SHADER_TARGET = 'min( 1.0 / rrProb, maxjsGIClamp )';
 
 function isPathTraceableMaterial(material) {
     if (!material) return false;
@@ -244,6 +253,18 @@ function resetMatrixCache(cache) {
     cache.initialized = false;
 }
 
+function normalizeSamplesPerFrame(value) {
+    const number = Math.round(Number(value));
+    if (!Number.isFinite(number)) return DEFAULT_SAMPLES_PER_FRAME;
+    return Math.max(MIN_SAMPLES_PER_FRAME, Math.min(MAX_SAMPLES_PER_FRAME, number));
+}
+
+function normalizeGIClamp(value) {
+    const number = Number(value);
+    if (!Number.isFinite(number)) return DEFAULT_GI_CLAMP;
+    return Math.max(MIN_GI_CLAMP, Math.min(MAX_GI_CLAMP, number));
+}
+
 function suppressClockDeprecationWarning(fn) {
     const originalWarn = console.warn;
     console.warn = (...args) => {
@@ -266,12 +287,14 @@ export function createPathTracingController({
     loadWebGLPathTracer = null,
     onStatus = () => {},
     onError = () => {},
+    settings = {},
 } = {}) {
     let activeCamera = camera;
     let tracer = null;
     let PathTracerCtor = null;
     let modulePromise = null;
     let disposed = false;
+    let started = false;
 
     let sceneDirty = true;
     let sceneDirtyAt = 0;
@@ -279,14 +302,22 @@ export function createPathTracingController({
     let lastSceneRebuildAt = -Infinity;
     let nextRebuildRetryAt = 0;
     let lastRebuildErrorKey = '';
+    let renderedSamples = 0;
     const lastCameraWorld = { initialized: false, values: new Float64Array(16) };
     const lastCameraProj = { initialized: false, values: new Float64Array(16) };
     let warnedUnsupportedRenderer = false;
+    let samplesPerFrame = normalizeSamplesPerFrame(settings.samplesPerFrame);
+    let giClamp = normalizeGIClamp(settings.giClamp);
+    let freezeSync = settings.freezeSync === true;
 
     const visibilityScratch = [];
 
     function isEnabled() {
         return enabled === true && !disposed;
+    }
+
+    function isStarted() {
+        return started === true && isEnabled();
     }
 
     function hasLegacyWebGLRenderer() {
@@ -357,10 +388,14 @@ export function createPathTracingController({
         return modulePromise;
     }
 
-    // Eagerly start loading if we know we're enabled — this overlaps
-    // with the rest of the boot sequence so we have pixels on first
-    // render-mode flip instead of waiting for the dynamic import.
-    if (isEnabled()) loadModule();
+    function start() {
+        if (!isEnabled()) return false;
+        if (started) return true;
+        started = true;
+        loadModule();
+        requestSceneRebuild({ immediate: true });
+        return true;
+    }
 
     // ─── Tracer setup ──────────────────────────────────────────
 
@@ -440,8 +475,38 @@ export function createPathTracingController({
         t._maxjsMaterialIndexPatchInstalled = true;
     }
 
+    function applyGIClampUniform(t, { reset = false } = {}) {
+        const material = t?._pathTracer?.material;
+        if (!material) return;
+        material.uniforms ??= {};
+        if (!material.uniforms.maxjsGIClamp) {
+            material.uniforms.maxjsGIClamp = { value: giClamp };
+        }
+        material.uniforms.maxjsGIClamp.value = giClamp;
+
+        let shaderPatched = false;
+        if (typeof material.fragmentShader === 'string' && !material.fragmentShader.includes(GI_CLAMP_UNIFORM_DECL)) {
+            material.fragmentShader = material.fragmentShader.replace(
+                'uniform float filterGlossyFactor;',
+                `uniform float filterGlossyFactor;\n\t\t\t\t${GI_CLAMP_UNIFORM_DECL}`,
+            );
+            shaderPatched = true;
+        }
+        if (typeof material.fragmentShader === 'string' && material.fragmentShader.includes(GI_CLAMP_SHADER_SOURCE)) {
+            material.fragmentShader = material.fragmentShader.replace(GI_CLAMP_SHADER_SOURCE, GI_CLAMP_SHADER_TARGET);
+            shaderPatched = true;
+        }
+        if (shaderPatched) material.needsUpdate = true;
+        if (reset) t.reset?.();
+    }
+
+    function applyRuntimeSettings({ reset = false } = {}) {
+        if (!tracer) return;
+        applyGIClampUniform(tracer, { reset });
+    }
+
     function ensureTracer() {
-        if (!isEnabled() || disposed) return false;
+        if (!isStarted() || disposed) return false;
         if (!hasLegacyWebGLRenderer()) {
             if (!warnedUnsupportedRenderer) {
                 warnedUnsupportedRenderer = true;
@@ -469,6 +534,7 @@ export function createPathTracingController({
             installGeneratorGuards(tracer);
             installMaterialIndexPatch(tracer);
             biasRayOffset(tracer._pathTracer?.material);
+            applyRuntimeSettings({ reset: false });
             requestSceneRebuild({ immediate: true });
             resetCameraKeys();
             return true;
@@ -580,6 +646,7 @@ export function createPathTracingController({
             lastSceneRebuildAt = performance.now();
             nextRebuildRetryAt = 0;
             lastRebuildErrorKey = '';
+            renderedSamples = 0;
             resetCameraKeys();
             return true;
         } catch (error) {
@@ -612,37 +679,73 @@ export function createPathTracingController({
     }
 
     function render() {
-        if (!isEnabled()) return false;
+        if (!isStarted()) return false;
         if (!hasLegacyWebGLRenderer()) return false;
 
         if (!tracer && !ensureTracer()) {
-            clearFrame();
-            return true;
+            return false;
         }
         if (sceneDirty) {
             if (shouldRebuildSceneNow()) {
                 if (!rebuildScene()) {
-                    clearFrame();
-                    return true;
+                    return hasSceneBuilt;
                 }
             } else if (!hasSceneBuilt) {
-                clearFrame();
-                return true;
+                return false;
             }
         }
         try {
             syncCameraIfChanged();
-            tracer.renderSample();
+            const count = samplesPerFrame;
+            for (let i = 0; i < count; i += 1) tracer.renderSample();
+            renderedSamples += count;
             return true;
         } catch (error) {
             onError(error);
-            clearFrame();
-            return true;
+            return false;
         }
     }
 
     function markSceneDirty() {
         requestSceneRebuild();
+    }
+
+    function getSampleCount() {
+        return renderedSamples;
+    }
+
+    function isCaptureReady(minSamples = 1) {
+        return isStarted() && hasSceneBuilt && renderedSamples >= Math.max(1, minSamples | 0);
+    }
+
+    function setOptions(options = {}) {
+        const previousGIClamp = giClamp;
+        let changed = false;
+        if (options.samplesPerFrame != null) {
+            const next = normalizeSamplesPerFrame(options.samplesPerFrame);
+            changed = changed || next !== samplesPerFrame;
+            samplesPerFrame = next;
+        }
+        if (options.giClamp != null) {
+            const next = normalizeGIClamp(options.giClamp);
+            changed = changed || next !== giClamp;
+            giClamp = next;
+        }
+        if (options.freezeSync != null) {
+            const next = options.freezeSync === true;
+            changed = changed || next !== freezeSync;
+            freezeSync = next;
+        }
+        if (giClamp !== previousGIClamp) applyRuntimeSettings({ reset: true });
+        return changed;
+    }
+
+    function getSettings() {
+        return { samplesPerFrame, giClamp, freezeSync };
+    }
+
+    function isSyncFrozen() {
+        return freezeSync === true;
     }
 
     function setCamera(nextCamera) {
@@ -683,9 +786,16 @@ export function createPathTracingController({
 
     return {
         isEnabled,
+        isStarted,
+        start,
         isSupported,
         render,
         markSceneDirty,
+        getSampleCount,
+        isCaptureReady,
+        setOptions,
+        getSettings,
+        isSyncFrozen,
         setCamera,
         dispose,
     };

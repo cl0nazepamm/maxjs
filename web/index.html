@@ -1277,6 +1277,9 @@
             border-color: rgba(255, 255, 255, 0.16);
             box-shadow: inset 2px 0 0 var(--accent);
         }
+        .pathtrace-only { display: none; }
+        body.pathtracing-mode .pathtrace-only { display: block; }
+        body.pathtracing-mode .pathtrace-only.rail-btn { display: flex; }
         /* Theme icon crossfade — both present, CSS swaps by mode. */
         .rail-btn .icon-sun { display: none; }
         body.light-mode .rail-btn .icon-moon { display: none; }
@@ -1403,6 +1406,10 @@
                 <button class="rail-mode-option" type="button" data-render-mode="studio" title="Studio render mode">STU</button>
                 <button class="rail-mode-option" type="button" data-render-mode="pathtracing" title="Pathtracing render mode">PT</button>
             </div>
+            <button id="btnPathTraceFreeze" class="rail-btn pathtrace-only devonly" title="Freeze Max scene sync while pathtracing" aria-label="Freeze pathtracing sync">
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="7" width="10" height="7" rx="1"/><path d="M5 7V5a3 3 0 0 1 6 0v2"/><path d="M8 10v2"/></svg>
+                <span class="rail-btn-label">FRZ</span>
+            </button>
             <button id="btnLightLink" class="rail-btn devonly" title="Light Linking" aria-label="Light Linking">
                 <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6.5 8.5a2.5 2.5 0 0 0 3.5 0l2.5-2.5a2.5 2.5 0 0 0-3.5-3.5L8 3.5"/><path d="M9.5 7.5a2.5 2.5 0 0 0-3.5 0L3.5 10a2.5 2.5 0 0 0 3.5 3.5L8 12.5"/></svg>
             </button>
@@ -1831,6 +1838,7 @@
         const maxjsRenderMode = readMaxjsRenderMode();
         const isStudioMode = maxjsRenderMode === 'studio';
         const isPathTracingMode = isHostedWebView && maxjsRenderMode === 'pathtracing';
+        document.body.classList.toggle('pathtracing-mode', isPathTracingMode);
 
         function normalizeRendererBackend(value) {
             return value === 'webgl' || value === 'webgpu' || value === 'webgl-vr' ? value : '';
@@ -2139,6 +2147,7 @@
 
         const textureCache = new Map();
         const failedTextureCache = new Set();
+        let pendingTextureLoads = 0;
         const materialCache = new Map();
         const materialXTemplateCache = new Map();
         const materialXLoadCache = new Map();
@@ -2246,11 +2255,25 @@
         // instead. Toggled from the right rail. Loads React +
         // @basementstudio/shader-lab from esm.sh on first enable.
         const shaderLabFx = createShaderLabFx({ THREE, renderer, scene, camera });
+        const pathTracingSettings = {
+            samplesPerFrame: 1,
+            giClamp: 20.0,
+            freezeSync: false,
+        };
+
+        function beginTextureLoad() {
+            pendingTextureLoads += 1;
+        }
+
+        function endTextureLoad() {
+            pendingTextureLoads = Math.max(0, pendingTextureLoads - 1);
+        }
         const pathTracingFx = createPathTracingController({
             renderer,
             scene,
             camera,
             enabled: isPathTracingMode,
+            settings: pathTracingSettings,
             loadWebGLPathTracer: async () => import('./node_modules/three-gpu-pathtracer/src/core/WebGLPathTracer.js'),
             onStatus(message) {
                 perfHud.setStatus(message);
@@ -2259,6 +2282,116 @@
                 reportBridgeError('pathtracing', error);
             },
         });
+        const PATH_TRACING_RASTER_WARMUP_FRAMES = 2;
+        const PATH_TRACING_TEXTURE_WAIT_MS = 3000;
+        const PATH_TRACING_CAPTURE_DEFAULT_SAMPLES = 32;
+        const PATH_TRACING_LIVE_REBUILD_DELAY_MS = 180;
+        let pathTracingRasterWarmupFrames = 0;
+        let pathTracingWarmupStartedAt = 0;
+        let pathTracingLiveRebuildTimer = 0;
+        let pathTracingLiveRebuildQueued = false;
+
+        function normalizePathTracingSamplesPerFrame(value) {
+            const n = Math.round(Number(value));
+            if (!Number.isFinite(n)) return 1;
+            return Math.max(1, Math.min(64, n));
+        }
+
+        function normalizePathTracingGIClamp(value) {
+            const n = Number(value);
+            if (!Number.isFinite(n)) return 20.0;
+            return Math.max(1.0, Math.min(1000.0, n));
+        }
+
+        function syncPathTracingSettingsUi() {
+            const freezeButton = document.getElementById('btnPathTraceFreeze');
+            if (freezeButton) {
+                freezeButton.classList.toggle('active', pathTracingSettings.freezeSync === true);
+                freezeButton.setAttribute('aria-pressed', pathTracingSettings.freezeSync ? 'true' : 'false');
+                freezeButton.title = pathTracingSettings.freezeSync
+                    ? 'Pathtracing sync is frozen'
+                    : 'Freeze Max scene sync while pathtracing';
+            }
+        }
+
+        function resetPathTracingStartupWarmup() {
+            pathTracingRasterWarmupFrames = 0;
+            pathTracingWarmupStartedAt = 0;
+        }
+
+        function canStartPathTracingNow() {
+            if (!isPathTracingMode || !hasInitialSync) return false;
+            if (pathTracingWarmupStartedAt <= 0) pathTracingWarmupStartedAt = performance.now();
+            if (pathTracingRasterWarmupFrames < PATH_TRACING_RASTER_WARMUP_FRAMES) return false;
+            const waitedMs = performance.now() - pathTracingWarmupStartedAt;
+            if (pendingTextureLoads > 0 && waitedMs < PATH_TRACING_TEXTURE_WAIT_MS) return false;
+            return true;
+        }
+
+        function clearScheduledPathTracingLiveRebuild() {
+            if (pathTracingLiveRebuildTimer) {
+                clearTimeout(pathTracingLiveRebuildTimer);
+                pathTracingLiveRebuildTimer = 0;
+            }
+            pathTracingLiveRebuildQueued = false;
+        }
+
+        function markPathTracingSceneDirtyNow() {
+            clearScheduledPathTracingLiveRebuild();
+            if (pathTracingFx.isEnabled?.()) {
+                pathTracingFx.markSceneDirty?.();
+            }
+        }
+
+        function schedulePathTracingLiveRebuild() {
+            if (!isPathTracingMode || !pathTracingFx.isStarted?.()) return;
+            if (pathTracingSettings.freezeSync) return;
+            if (pathTracingLiveRebuildQueued) return;
+            pathTracingLiveRebuildQueued = true;
+            pathTracingLiveRebuildTimer = setTimeout(() => {
+                pathTracingLiveRebuildTimer = 0;
+                pathTracingLiveRebuildQueued = false;
+                if (isPathTracingMode && !pathTracingSettings.freezeSync) {
+                    pathTracingFx.markSceneDirty?.();
+                }
+            }, PATH_TRACING_LIVE_REBUILD_DELAY_MS);
+        }
+
+        function sendPathTracingRuntimeState() {
+            bridge.send('pathtracing_settings', {
+                samplesPerFrame: pathTracingSettings.samplesPerFrame,
+                giClamp: pathTracingSettings.giClamp,
+                freezeSync: pathTracingSettings.freezeSync,
+                active: isPathTracingMode,
+            });
+        }
+
+        function applyPathTracingSettings(next = {}, { notify = false, sendHost = false } = {}) {
+            const wasFrozen = pathTracingSettings.freezeSync === true;
+            pathTracingSettings.samplesPerFrame = normalizePathTracingSamplesPerFrame(
+                next.samplesPerFrame ?? pathTracingSettings.samplesPerFrame,
+            );
+            pathTracingSettings.giClamp = normalizePathTracingGIClamp(
+                next.giClamp ?? pathTracingSettings.giClamp,
+            );
+            if (next.freezeSync != null) pathTracingSettings.freezeSync = next.freezeSync === true;
+            pathTracingFx.setOptions?.(pathTracingSettings);
+            if (wasFrozen && !pathTracingSettings.freezeSync && isPathTracingMode && hasInitialSync) {
+                // C++ still advanced its sent-state caches while JS was ignoring updates.
+                // Ask for one authoritative resync when accumulation is unfrozen.
+                bridge.send('scene_dirty', { reason: 'pathtracing_unfreeze' });
+                markPathTracingSceneDirtyNow();
+            }
+            if (sendHost && window.chrome?.webview) {
+                sendPathTracingRuntimeState();
+            }
+            syncPathTracingSettingsUi();
+            if (notify && isPathTracingMode) {
+                perfHud.setStatus(
+                    `max.js - PT samples/frame ${pathTracingSettings.samplesPerFrame}, GI clamp ${pathTracingSettings.giClamp.toFixed(1)}, sync ${pathTracingSettings.freezeSync ? 'frozen' : 'live'}`,
+                );
+            }
+        }
 
         // Clone blob overlay — 2D canvas for bounding rectangles
         const blobOverlayCvs = document.createElement('canvas');
@@ -3151,7 +3284,9 @@
                 const loader = ext === 'exr' ? exrLoader : rgbeLoader;
                 const placeholder = fallbackTex || fallbackWhiteTexture;
                 textureCache.set(cacheKey, placeholder);
+                beginTextureLoad();
                 loader.load(url, loadedTex => {
+                    endTextureLoad();
                     applyTextureChannelSelection(loadedTex, normalizedXf);
                     loadedTex.colorSpace = textureColorSpace;
                     applyTextureTransform(loadedTex, normalizedXf);
@@ -3159,19 +3294,26 @@
                     textureCache.set(cacheKey, loadedTex);
                     if (bakeOverrides.enabled) reapplyBakeOverridesToScene();
                     ssgiFx.markOutputChanged?.();
-                }, undefined, () => {});
+                }, undefined, () => {
+                    endTextureLoad();
+                });
                 return placeholder;
             }
+            beginTextureLoad();
             const tex = textureLoader.load(
                 url,
                 loadedTex => {
+                    endTextureLoad();
                     applyTextureChannelSelection(loadedTex, normalizedXf);
                     loadedTex.colorSpace = textureColorSpace;
                     applyTextureTransform(loadedTex, normalizedXf);
                     loadedTex.needsUpdate = true;
                 },
                 undefined,
-                () => applyFallbackImage(tex, fallbackTex, textureColorSpace, normalizedXf, url)
+                () => {
+                    endTextureLoad();
+                    applyFallbackImage(tex, fallbackTex, textureColorSpace, normalizedXf, url);
+                }
             );
             tex.colorSpace = textureColorSpace;
             applyTextureTransform(tex, normalizedXf);
@@ -4898,6 +5040,14 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         const pendingHostActions = new Map();
         let nextHostActionId = 1;
 
+        bridge.on('pathtracing_settings', msg => {
+            applyPathTracingSettings({
+                samplesPerFrame: msg.samplesPerFrame,
+                giClamp: msg.giClamp,
+                freezeSync: msg.freezeSync,
+            }, { notify: true });
+        });
+
         function toBase64Utf8(text) {
             const bytes = new TextEncoder().encode(String(text ?? ''));
             let binary = '';
@@ -4936,6 +5086,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         let readyRetryTimer = 0;
         let transportMode = 'waiting';
         let latestAppliedSyncFrame = 0;
+        let latestAppliedSyncSerial = 0;
 
         function setInfoText(text) {
             perfHud.setStatus(text);
@@ -4975,6 +5126,9 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         }
 
         function updateSyncHud(partial = {}) {
+            if (partial.countAsAppliedSync !== false) {
+                latestAppliedSyncSerial += 1;
+            }
             if (Number.isFinite(partial.frameId) && partial.frameId > 0) {
                 latestAppliedSyncFrame = Math.max(latestAppliedSyncFrame, partial.frameId);
             }
@@ -5023,6 +5177,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         function startBridgeHandshake() {
             if (!window.chrome?.webview) return;
             setInfoText('max.js - connected, waiting for sync...');
+            sendPathTracingRuntimeState();
             bridge.send('ready');
             scheduleReadyRetry();
         }
@@ -5346,6 +5501,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                             ssgiFx?.markGeometryDataDirty?.();
                             markLightProbeSceneDirty();
                             scheduleLightProbeFromCurrentScene({ delay: 350 });
+                            schedulePathTracingLiveRebuild();
                             }
                         }
                     } else {
@@ -6071,7 +6227,8 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 scheduleLightProbeFromCurrentScene();
             }
             if (pathTracingFx.isEnabled?.()) {
-                pathTracingFx.markSceneDirty?.();
+                resetPathTracingStartupWarmup();
+                markPathTracingSceneDirtyNow();
             }
             // Full snapshot can add/remove many meshes — cheap scene refresh.
             // Effect toggles, env, and renderer size have their own dedicated
@@ -6220,20 +6377,28 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
 
         // ── Environment/Fog live update (standalone, change-only) ──
         bridge.on('env_update', msg => {
+            let pathTraceSceneChanged = false;
             if (msg.env && !isLocalHdriLoaded()) {
                 if (msg.env.sky) {
                     applySky(msg.env.sky);
                     markLightProbeSceneDirty();
                     scheduleLightProbeFromCurrentScene();
+                    pathTraceSceneChanged = true;
                 } else if (msg.env.hdri) {
                     removeSky();
                     loadHDRI(msg.env);
+                    pathTraceSceneChanged = true;
                 } else if (msg.env.enabled === false || msg.env.type === 'none') {
                     removeAuthoredEnvironment();
+                    pathTraceSceneChanged = true;
                 }
                 ssgiFx.markEnvironmentChanged?.();
             }
-            if (msg.fog) ssgiFx.setFogFromScene(msg.fog);
+            if (msg.fog) {
+                ssgiFx.setFogFromScene(msg.fog);
+                pathTraceSceneChanged = true;
+            }
+            if (pathTraceSceneChanged) schedulePathTracingLiveRebuild();
         });
 
         bridge.on('geo_fast', msg => {
@@ -6276,6 +6441,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 ssgiFx.markSceneChanged?.();
                 markLightProbeSceneDirty();
                 scheduleLightProbeFromCurrentScene();
+                schedulePathTracingLiveRebuild();
                 return;
             }
 
@@ -6308,11 +6474,13 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             ssgiFx.markGeometryDataDirty?.();
             markLightProbeSceneDirty();
             scheduleLightProbeFromCurrentScene({ delay: 350 });
+            schedulePathTracingLiveRebuild();
         });
 
         // ── Hair Fast Sync — re-extracted world-space instances ──
         bridge.on('hair_fast', msg => {
             if (!Array.isArray(msg.groups)) return;
+            let pathTraceSceneChanged = false;
             const m = new THREE.Matrix4();
             const c = new THREE.Color();
             for (const grp of msg.groups) {
@@ -6325,6 +6493,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     // the dirty subset from SendHairFastUpdate).
                     disposeHairEntry(grp.h);
                     buildHairEntry(grp);
+                    pathTraceSceneChanged = true;
                     continue;
                 }
                 const instMesh = entry.mesh;
@@ -6343,24 +6512,45 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 instMesh.instanceMatrix.needsUpdate = true;
                 if (instMesh.instanceColor) instMesh.instanceColor.needsUpdate = true;
                 if (grp.vis != null) entry.root.visible = !!grp.vis;
+                pathTraceSceneChanged = true;
             }
+            if (pathTraceSceneChanged) schedulePathTracingLiveRebuild();
         });
 
         // ── Transform Sync (+ material scalars, ~6fps) ──────
         bridge.on('xform', msg => {
             const applyStart = performance.now();
             let visibilityChanged = false;
+            let pathTraceSceneChanged = false;
             for (const nd of msg.nodes) {
                 const mesh = nodeMap.get(nd.h);
                 if (nd.vis != null) visibilityChanged = true;
-                if (mesh) applyIncrementalNodeUpdate(mesh, nd);
-                if (nd.t) applyHairTransform(nd.h, nd.t);
-                if (nd.vis != null) applyHairVisibility(nd.h, nd.vis);
+                if (mesh) {
+                    applyIncrementalNodeUpdate(mesh, nd);
+                    if (nd.t || nd.mat || nd.vis != null) pathTraceSceneChanged = true;
+                }
+                if (nd.t) {
+                    applyHairTransform(nd.h, nd.t);
+                    pathTraceSceneChanged = true;
+                }
+                if (nd.vis != null) {
+                    applyHairVisibility(nd.h, nd.vis);
+                    pathTraceSceneChanged = true;
+                }
             }
-            if (msg.lights) applyLightUpdates(msg.lights);
-            if (msg.splats) applySplatUpdates(msg.splats);
+            if (msg.lights) {
+                applyLightUpdates(msg.lights);
+                pathTraceSceneChanged = true;
+            }
+            if (msg.splats) {
+                applySplatUpdates(msg.splats);
+                pathTraceSceneChanged = true;
+            }
             if (msg.audios) audioSystem?.applyAudioUpdates(msg.audios);
-            if (msg.gltfs) gltfSystem?.applyGLTFUpdates(msg.gltfs);
+            if (msg.gltfs) {
+                gltfSystem?.applyGLTFUpdates(msg.gltfs);
+                pathTraceSceneChanged = true;
+            }
             if (msg.camera) applyCamera(msg.camera);
             if (visibilityChanged) {
                 // Visibility flip changes the post-pass hide list — cheap refresh.
@@ -6368,6 +6558,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 markLightProbeSceneDirty();
                 scheduleLightProbeFromCurrentScene({ delay: 350 });
             }
+            if (pathTraceSceneChanged) schedulePathTracingLiveRebuild();
             const applyMs = performance.now() - applyStart;
             updateSyncHud({
                 transport: 'json',
@@ -6692,16 +6883,23 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
 
         function handleBinaryDelta(buffer, meta) {
             let runtimeTransformsChanged = false;
+            let pathTraceSceneChanged = false;
             const result = applyDeltaFrame(buffer, {
                 onTransform(nodeHandle, matrix) {
                     const mesh = nodeMap.get(nodeHandle);
                     if (mesh) applyIncrementalNodeUpdate(mesh, { t: matrix });
-                    if (mesh) runtimeTransformsChanged = true;
+                    if (mesh) {
+                        runtimeTransformsChanged = true;
+                        pathTraceSceneChanged = true;
+                    }
                     applyHairTransform(nodeHandle, matrix);
                 },
                 onMaterialScalar(nodeHandle, material) {
                     const mesh = nodeMap.get(nodeHandle);
-                    if (mesh) applyIncrementalNodeUpdate(mesh, { mat: material });
+                    if (mesh) {
+                        applyIncrementalNodeUpdate(mesh, { mat: material });
+                        pathTraceSceneChanged = true;
+                    }
                 },
                 onSelection(nodeHandle, selected) {
                     const mesh = nodeMap.get(nodeHandle);
@@ -6709,7 +6907,10 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 },
                 onVisibility(nodeHandle, visible) {
                     const mesh = nodeMap.get(nodeHandle);
-                    if (mesh) applyIncrementalNodeUpdate(mesh, { vis: visible });
+                    if (mesh) {
+                        applyIncrementalNodeUpdate(mesh, { vis: visible });
+                        pathTraceSceneChanged = true;
+                    }
                     applyHairVisibility(nodeHandle, visible);
                 },
                 onCamera(cameraState) {
@@ -6739,24 +6940,27 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     });
                     markLightProbeSceneDirty();
                     scheduleLightProbeFromCurrentScene({ delay: 350 });
+                    pathTraceSceneChanged = true;
                 },
                 onSplat(handle, matrix, visible) {
                     const entry = splatHandleMap.get(handle);
                     if (!entry?.mesh) return;
                     applySplatTransform(entry.mesh, { t: matrix, v: visible ? 1 : 0 });
+                    pathTraceSceneChanged = true;
                 },
                 onAudio(handle, matrix, visible) {
                     audioSystem?.applyAudioTransformBinary(handle, matrix, visible);
                 },
                 onGLTF(handle, matrix, visible) {
                     gltfSystem?.applyGLTFTransformBinary(handle, matrix, visible);
+                    pathTraceSceneChanged = true;
                 },
                 onTime(td) {
                     maxTimeline.onTime(td);
                 },
             });
             if (runtimeTransformsChanged) layerManager.markRuntimeTransformsDirty?.();
-            if (pathTracingFx.isEnabled?.()) pathTracingFx.markSceneDirty?.();
+            if (pathTraceSceneChanged) schedulePathTracingLiveRebuild();
             markInitialSync();
             setTransportMode('binary-delta');
             updateSyncHud({
@@ -10171,6 +10375,13 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 });
             });
         }
+        const btnPathTraceFreeze = document.getElementById('btnPathTraceFreeze');
+        btnPathTraceFreeze?.addEventListener('click', () => {
+            applyPathTracingSettings({
+                freezeSync: !pathTracingSettings.freezeSync,
+            }, { notify: true, sendHost: true });
+        });
+        syncPathTracingSettingsUi();
         btnSwitchVR?.addEventListener('click', () => {
             if (isLegacyWebGLVrBackendActive()) {
                 perfHud.setStatus('max.js - legacy WebGL2 backend is already active for VR');
@@ -12413,7 +12624,23 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 if (pathTracingFx.isEnabled?.()) {
                     // Pathtracing is a live-viewer-only renderer mode. It
                     // bypasses post FX and never participates in snapshots.
-                    if (!pathTracingFx.render?.()) renderer.render(scene, camera);
+                    // Let normal WebGL draw the synced scene first; the
+                    // pathtracer packs the current scene/material/texture state
+                    // and must not race the initial sync or async texture loads.
+                    if (renderToImageActive && pendingRenderToImage?.pathTracing) {
+                        if (pendingRenderToImage.pathTracingStarted) {
+                            pathTracingFx.start?.();
+                            if (!pathTracingFx.render?.()) renderer.render(scene, camera);
+                        } else {
+                            renderer.render(scene, camera);
+                        }
+                    } else if (!canStartPathTracingNow()) {
+                        renderer.render(scene, camera);
+                        if (hasInitialSync) pathTracingRasterWarmupFrames += 1;
+                    } else {
+                        pathTracingFx.start?.();
+                        if (!pathTracingFx.render?.()) renderer.render(scene, camera);
+                    }
                 } else if (asciiActive && asciiEffect) {
                     asciiEffect.render(scene, camera);
                 } else if (xrRuntime.shouldBypassPostFx) {
@@ -12464,8 +12691,10 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             if (renderToImageActive && pendingRenderToImage) {
                 const syncReady = latestAppliedSyncFrame > pendingRenderToImage.observedSyncFrame;
                 const settledEnough = performance.now() >= (pendingRenderToImage.startedAtMs + pendingRenderToImage.warmupMs);
+                const pathTracingReady = !pendingRenderToImage.pathTracing
+                    || pathTracingFx.isCaptureReady?.(pendingRenderToImage.pathTracingMinSamples) === true;
                 const timedOut = performance.now() >= pendingRenderToImage.syncDeadlineMs;
-                if ((syncReady && settledEnough) || timedOut) {
+                if ((syncReady && settledEnough && pathTracingReady) || timedOut) {
                     const renderTimeSeconds = pendingRenderToImage.renderTimeSeconds;
                     pendingRenderToImage = null;
                     requestAnimationFrame(() => {
@@ -12864,7 +13093,9 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             }
 
             try {
-                if (ssgiFx.hasEnabledEffects()) {
+                if (pathTracingFx.isEnabled?.()) {
+                    if (!pathTracingFx.render?.()) renderer.render(scene, camera);
+                } else if (ssgiFx.hasEnabledEffects()) {
                     ssgiFx.render();
                 } else {
                     renderer.render(scene, camera);
@@ -12884,15 +13115,23 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             const frameNumber = Number.isFinite(msg.frame) ? msg.frame : 0;
             const fps = Number.isFinite(msg.fps) && msg.fps > 0 ? msg.fps : 30;
             const warmupMs = Number.isFinite(msg.warmupMs) ? Math.max(0, msg.warmupMs) : 250;
+            const ptMinSamples = Number.isFinite(msg.pathTracingSamples)
+                ? Math.max(1, Math.floor(msg.pathTracingSamples))
+                : PATH_TRACING_CAPTURE_DEFAULT_SAMPLES;
             renderToImageActive = true;
             pendingRenderToImage = {
-                observedSyncFrame: latestAppliedSyncFrame,
+                observedSyncSerial: latestAppliedSyncSerial,
                 renderTimeSeconds: frameNumber / fps,
                 width: w,
                 height: h,
                 warmupMs,
+                pathTracing: pathTracingFx.isEnabled?.() === true,
+                pathTracingMinSamples: ptMinSamples,
                 startedAtMs: performance.now(),
-                syncDeadlineMs: performance.now() + 10000,
+                textureWaitStartedAt: 0,
+                textureWaitMs: pathTracingFx.isEnabled?.() ? PATH_TRACING_TEXTURE_WAIT_MS : 0,
+                pathTracingStarted: false,
+                syncDeadlineMs: performance.now() + (pathTracingFx.isEnabled?.() ? 30000 : 10000),
             };
 
             // Hide all UI — keep only canvas elements visible
@@ -12925,6 +13164,10 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 ssgiFx.setOpaqueBackdropEnabled(false);
             }
             scene.background = null;
+            if (pendingRenderToImage.pathTracing) {
+                resetPathTracingStartupWarmup();
+                pathTracingFx.markSceneDirty?.();
+            }
 
             if (frameNumber >= 0) {
                 animationSystem?.seekAllClips?.(frameNumber / fps);

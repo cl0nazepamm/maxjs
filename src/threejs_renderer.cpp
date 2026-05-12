@@ -1,9 +1,15 @@
 #include "threejs_renderer.h"
 #include "threejs_material.h"
+#include "threejs_renderer_res.h"
+#include <custcont.h>
 #include <iparamb2.h>
 #include <plugapi.h>
 #include <maxapi.h>
 #include <bitmap.h>
+#include <algorithm>
+#include <cmath>
+#include <locale>
+#include <sstream>
 
 extern HINSTANCE hInstance;
 
@@ -14,9 +20,27 @@ extern void StopMaxJSActiveShade();
 extern HWND GetMaxJSWebViewHWND();
 extern void ReparentMaxJSPanel(HWND newParent);
 extern void RestoreMaxJSPanel();
+extern void SetMaxJSPathTracingSettings(int samplesPerFrame, float giClamp, bool freezeSync);
 extern bool RenderMaxJSFrameToBitmap(Bitmap* target, int width, int height, TimeValue t,
                                      INode* renderViewNode, const ViewParams* renderViewParams,
                                      RendProgressCallback* prog);
+
+static constexpr int kPathTracingDefaultSamplesPerFrame = 1;
+static constexpr int kPathTracingMinSamplesPerFrame = 1;
+static constexpr int kPathTracingMaxSamplesPerFrame = 64;
+static constexpr float kPathTracingDefaultGIClamp = 20.0f;
+static constexpr float kPathTracingMinGIClamp = 1.0f;
+static constexpr float kPathTracingMaxGIClamp = 1000.0f;
+static constexpr USHORT kThreeJSRendererSettingsChunk = 0x5100;
+
+static int ClampPathTracingSamplesPerFrame(int value) {
+    return std::clamp(value, kPathTracingMinSamplesPerFrame, kPathTracingMaxSamplesPerFrame);
+}
+
+static float ClampPathTracingGIClamp(float value) {
+    if (!std::isfinite(value)) return kPathTracingDefaultGIClamp;
+    return std::clamp(value, kPathTracingMinGIClamp, kPathTracingMaxGIClamp);
+}
 
 // ══════════════════════════════════════════════════════════════
 //  ThreeJS Interactive Render (ActiveShade)
@@ -104,6 +128,9 @@ class ThreeJSRenderer : public Renderer {
     INode* renderViewNode_ = nullptr;
     ViewParams renderViewParams_ = {};
     bool haveRenderViewParams_ = false;
+    int pathTracingSamplesPerFrame_ = kPathTracingDefaultSamplesPerFrame;
+    float pathTracingGIClamp_ = kPathTracingDefaultGIClamp;
+    bool pathTracingFreezeSync_ = false;
 
 public:
     ThreeJSRenderer() {}
@@ -126,8 +153,26 @@ public:
     // ── ReferenceTarget ──────────────────────────────────────
     RefTargetHandle Clone(RemapDir& remap) override {
         ThreeJSRenderer* r = new ThreeJSRenderer();
+        r->pathTracingSamplesPerFrame_ = pathTracingSamplesPerFrame_;
+        r->pathTracingGIClamp_ = pathTracingGIClamp_;
+        r->pathTracingFreezeSync_ = pathTracingFreezeSync_;
         BaseClone(this, r, remap);
         return r;
+    }
+
+    int GetPathTracingSamplesPerFrame() const { return pathTracingSamplesPerFrame_; }
+    float GetPathTracingGIClamp() const { return pathTracingGIClamp_; }
+    bool GetPathTracingFreezeSync() const { return pathTracingFreezeSync_; }
+
+    void BroadcastPathTracingSettings() const {
+        SetMaxJSPathTracingSettings(pathTracingSamplesPerFrame_, pathTracingGIClamp_, pathTracingFreezeSync_);
+    }
+
+    void SetPathTracingSettings(int samplesPerFrame, float giClamp, bool freezeSync, bool broadcast = true) {
+        pathTracingSamplesPerFrame_ = ClampPathTracingSamplesPerFrame(samplesPerFrame);
+        pathTracingGIClamp_ = ClampPathTracingGIClamp(giClamp);
+        pathTracingFreezeSync_ = freezeSync;
+        if (broadcast) BroadcastPathTracingSettings();
     }
 
     // ── Renderer core ────────────────────────────────────────
@@ -146,6 +191,7 @@ public:
 
         // Ensure the MaxJS panel is up (non-toggling)
         EnsureMaxJSPanel();
+        BroadcastPathTracingSettings();
         return 1;
     }
 
@@ -180,11 +226,15 @@ public:
         haveRenderViewParams_ = false;
     }
 
-    RendParamDlg* CreateParamDialog(IRendParams*, BOOL = FALSE) override {
-        return nullptr;  // No render settings dialog yet
-    }
+    RendParamDlg* CreateParamDialog(IRendParams*, BOOL = FALSE) override;
 
-    void ResetParams() override {}
+    void ResetParams() override {
+        SetPathTracingSettings(
+            kPathTracingDefaultSamplesPerFrame,
+            kPathTracingDefaultGIClamp,
+            false
+        );
+    }
 
     // ── Required overrides ───────────────────────────────────
     bool CompatibleWithAnyRenderElement() const override { return false; }
@@ -215,9 +265,201 @@ public:
     }
 
     // ── I/O ──────────────────────────────────────────────────
-    IOResult Save(ISave* isave) override { return Renderer::Save(isave); }
-    IOResult Load(ILoad* iload) override { return Renderer::Load(iload); }
+    IOResult Save(ISave* isave) override {
+        IOResult result = Renderer::Save(isave);
+        if (result != IO_OK) return result;
+
+        std::ostringstream payload;
+        payload.imbue(std::locale::classic());
+        payload << 1 << ' '
+                << pathTracingSamplesPerFrame_ << ' '
+                << pathTracingGIClamp_ << ' '
+                << (pathTracingFreezeSync_ ? 1 : 0);
+
+        isave->BeginChunk(kThreeJSRendererSettingsChunk);
+        result = isave->WriteCString(payload.str().c_str());
+        isave->EndChunk();
+        return result;
+    }
+
+    IOResult Load(ILoad* iload) override {
+        IOResult result = Renderer::Load(iload);
+        if (result != IO_OK) return result;
+
+        while (IO_OK == (result = iload->OpenChunk())) {
+            if (iload->CurChunkID() == kThreeJSRendererSettingsChunk) {
+                char* payload = nullptr;
+                const IOResult readResult = iload->ReadCStringChunk(&payload);
+                if (readResult != IO_OK) {
+                    iload->CloseChunk();
+                    return readResult;
+                }
+                if (payload) {
+                    int version = 0;
+                    int samplesPerFrame = kPathTracingDefaultSamplesPerFrame;
+                    float giClamp = kPathTracingDefaultGIClamp;
+                    int freezeSync = 0;
+                    std::istringstream input(payload);
+                    input.imbue(std::locale::classic());
+                    if (input >> version >> samplesPerFrame >> giClamp >> freezeSync) {
+                        SetPathTracingSettings(samplesPerFrame, giClamp, freezeSync != 0, false);
+                    }
+                }
+            }
+            result = iload->CloseChunk();
+            if (result != IO_OK) return result;
+        }
+        return result == IO_END ? IO_OK : result;
+    }
 };
+
+class ThreeJSRendererParamDlg : public RendParamDlg {
+    ThreeJSRenderer* renderer_ = nullptr;
+    IRendParams* rendParams_ = nullptr;
+    HWND panel_ = nullptr;
+    BOOL prog_ = FALSE;
+    ISpinnerControl* samplesSpin_ = nullptr;
+    ISpinnerControl* giClampSpin_ = nullptr;
+    bool updating_ = false;
+    int samplesPerFrame_ = kPathTracingDefaultSamplesPerFrame;
+    float giClamp_ = kPathTracingDefaultGIClamp;
+    bool freezeSync_ = false;
+
+public:
+    ThreeJSRendererParamDlg(ThreeJSRenderer* renderer, IRendParams* rendParams, BOOL prog)
+        : renderer_(renderer), rendParams_(rendParams), prog_(prog) {
+        samplesPerFrame_ = renderer_ ? renderer_->GetPathTracingSamplesPerFrame() : kPathTracingDefaultSamplesPerFrame;
+        giClamp_ = renderer_ ? renderer_->GetPathTracingGIClamp() : kPathTracingDefaultGIClamp;
+        freezeSync_ = renderer_ ? renderer_->GetPathTracingFreezeSync() : false;
+
+        panel_ = rendParams_->AddRollupPage(
+            hInstance,
+            MAKEINTRESOURCE(IDD_THREEJS_RENDERER_PT),
+            DialogProc,
+            _T("Pathtracing"),
+            reinterpret_cast<LPARAM>(this)
+        );
+    }
+
+    ~ThreeJSRendererParamDlg() override {
+        ReleaseControls();
+        if (rendParams_ && panel_) {
+            rendParams_->DeleteRollupPage(panel_);
+            panel_ = nullptr;
+        }
+    }
+
+    void AcceptParams() override {
+        CommitFromControls();
+    }
+
+    void RejectParams() override {}
+    void DeleteThis() override { delete this; }
+
+private:
+    void Init(HWND hWnd) {
+        updating_ = true;
+        samplesSpin_ = SetupIntSpinner(
+            hWnd,
+            IDC_RENDERER_PT_SPF_SPIN,
+            IDC_RENDERER_PT_SPF_EDIT,
+            kPathTracingMinSamplesPerFrame,
+            kPathTracingMaxSamplesPerFrame,
+            samplesPerFrame_
+        );
+        if (samplesSpin_) samplesSpin_->SetScale(1.0f);
+
+        giClampSpin_ = SetupFloatSpinner(
+            hWnd,
+            IDC_RENDERER_PT_GI_CLAMP_SPIN,
+            IDC_RENDERER_PT_GI_CLAMP_EDIT,
+            kPathTracingMinGIClamp,
+            kPathTracingMaxGIClamp,
+            giClamp_,
+            1.0f
+        );
+        if (giClampSpin_) giClampSpin_->SetScale(1.0f);
+
+        CheckDlgButton(hWnd, IDC_RENDERER_PT_FREEZE_SYNC, freezeSync_ ? BST_CHECKED : BST_UNCHECKED);
+        if (prog_) {
+            EnableWindow(GetDlgItem(hWnd, IDC_RENDERER_PT_SPF_EDIT), FALSE);
+            EnableWindow(GetDlgItem(hWnd, IDC_RENDERER_PT_SPF_SPIN), FALSE);
+            EnableWindow(GetDlgItem(hWnd, IDC_RENDERER_PT_GI_CLAMP_EDIT), FALSE);
+            EnableWindow(GetDlgItem(hWnd, IDC_RENDERER_PT_GI_CLAMP_SPIN), FALSE);
+            EnableWindow(GetDlgItem(hWnd, IDC_RENDERER_PT_FREEZE_SYNC), FALSE);
+        }
+        updating_ = false;
+    }
+
+    void ReleaseControls() {
+        if (samplesSpin_) {
+            ReleaseISpinner(samplesSpin_);
+            samplesSpin_ = nullptr;
+        }
+        if (giClampSpin_) {
+            ReleaseISpinner(giClampSpin_);
+            giClampSpin_ = nullptr;
+        }
+    }
+
+    void ReadControls(HWND hWnd) {
+        if (samplesSpin_) {
+            samplesPerFrame_ = ClampPathTracingSamplesPerFrame(samplesSpin_->GetIVal());
+        }
+        if (giClampSpin_) {
+            giClamp_ = ClampPathTracingGIClamp(giClampSpin_->GetFVal());
+        }
+        freezeSync_ = IsDlgButtonChecked(hWnd, IDC_RENDERER_PT_FREEZE_SYNC) == BST_CHECKED;
+    }
+
+    void CommitFromControls(HWND hWnd = nullptr) {
+        if (updating_ || prog_ || !renderer_) return;
+        if (!hWnd && panel_) hWnd = panel_;
+        if (hWnd) ReadControls(hWnd);
+        renderer_->SetPathTracingSettings(samplesPerFrame_, giClamp_, freezeSync_, true);
+    }
+
+    INT_PTR WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+        switch (msg) {
+        case WM_INITDIALOG:
+            Init(hWnd);
+            return TRUE;
+        case WM_DESTROY:
+            ReleaseControls();
+            return TRUE;
+        case WM_LBUTTONDOWN:
+        case WM_MOUSEMOVE:
+        case WM_LBUTTONUP:
+            if (rendParams_) rendParams_->RollupMouseMessage(hWnd, msg, wParam, lParam);
+            return FALSE;
+        case WM_COMMAND:
+            if (LOWORD(wParam) == IDC_RENDERER_PT_FREEZE_SYNC) {
+                CommitFromControls(hWnd);
+                return TRUE;
+            }
+            break;
+        case CC_SPINNER_CHANGE:
+        case CC_SPINNER_BUTTONUP:
+            CommitFromControls(hWnd);
+            return TRUE;
+        }
+        return FALSE;
+    }
+
+    static INT_PTR CALLBACK DialogProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+        ThreeJSRendererParamDlg* dlg =
+            reinterpret_cast<ThreeJSRendererParamDlg*>(GetWindowLongPtr(hWnd, GWLP_USERDATA));
+        if (msg == WM_INITDIALOG) {
+            dlg = reinterpret_cast<ThreeJSRendererParamDlg*>(lParam);
+            SetWindowLongPtr(hWnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(dlg));
+        }
+        return dlg ? dlg->WndProc(hWnd, msg, wParam, lParam) : FALSE;
+    }
+};
+
+RendParamDlg* ThreeJSRenderer::CreateParamDialog(IRendParams* ir, BOOL prog) {
+    return new ThreeJSRendererParamDlg(this, ir, prog);
+}
 
 // ── Class Descriptor ──────────────────────────────────────────
 

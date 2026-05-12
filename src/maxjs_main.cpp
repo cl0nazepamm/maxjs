@@ -95,6 +95,9 @@ class MaxJSPanel;
 static MaxJSPanel* g_panel = nullptr;
 void MaxJSNotifyMaterialEdited(ReferenceTarget* target = nullptr);
 static HWND g_helperHwnd = nullptr;
+static int g_pathTracingSamplesPerFrame = 1;
+static float g_pathTracingGIClamp = 20.0f;
+static bool g_pathTracingFreezeSync = false;
 
 // Forward — used by renderer's ActiveShade
 static void TogglePanel();
@@ -768,6 +771,44 @@ static bool ExtractJsonInt(const std::wstring& json, const wchar_t* key, int& ou
     try {
         out = std::stoi(json.substr(start, pos - start));
         return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+static bool ExtractJsonFloat(const std::wstring& json, const wchar_t* key, float& out) {
+    const std::wstring needle = std::wstring(L"\"") + key + L"\":";
+    size_t pos = json.find(needle);
+    if (pos == std::wstring::npos) return false;
+    pos += needle.size();
+    while (pos < json.size() && iswspace(json[pos])) ++pos;
+
+    size_t start = pos;
+    if (pos < json.size() && (json[pos] == L'-' || json[pos] == L'+')) ++pos;
+    bool hasDigit = false;
+    while (pos < json.size() && iswdigit(json[pos])) {
+        hasDigit = true;
+        ++pos;
+    }
+    if (pos < json.size() && json[pos] == L'.') {
+        ++pos;
+        while (pos < json.size() && iswdigit(json[pos])) {
+            hasDigit = true;
+            ++pos;
+        }
+    }
+    if (!hasDigit) return false;
+    if (pos < json.size() && (json[pos] == L'e' || json[pos] == L'E')) {
+        const size_t exponentStart = pos++;
+        if (pos < json.size() && (json[pos] == L'-' || json[pos] == L'+')) ++pos;
+        size_t exponentDigits = pos;
+        while (pos < json.size() && iswdigit(json[pos])) ++pos;
+        if (pos == exponentDigits) pos = exponentStart;
+    }
+
+    try {
+        out = std::stof(json.substr(start, pos - start));
+        return std::isfinite(out);
     } catch (...) {
         return false;
     }
@@ -7773,6 +7814,11 @@ public:
     CameraData renderCameraOverride_ = {};
     bool renderCameraOverrideActive_ = false;
     ULONG lockedCameraHandle_ = 0;  // 0 = viewport (default), nonzero = scene camera handle
+    int pathTracingSamplesPerFrame_ = 1;
+    float pathTracingGIClamp_ = 20.0f;
+    bool pathTracingFreezeSync_ = false;
+    bool pathTracingViewerActive_ = false;
+    bool pathTracingHasSceneSync_ = false;
     SceneEventNamespace::CallbackKey fastNodeEventCallbackKey_ = 0;
     bool callbacksRegistered_ = false;
     MaxJSFastNodeEventCallback fastNodeEvents_;
@@ -11259,6 +11305,47 @@ public:
         webview_->PostWebMessageAsJson(ss.str().c_str());
     }
 
+    void SendPathTracingSettings() {
+        if (!webview_ || !jsReady_) return;
+        std::wostringstream ss;
+        ss.imbue(std::locale::classic());
+        ss << L"{\"type\":\"pathtracing_settings\""
+           << L",\"samplesPerFrame\":" << pathTracingSamplesPerFrame_
+           << L",\"giClamp\":";
+        WriteFloatValue(ss, pathTracingGIClamp_, 20.0f);
+        ss
+           << L",\"freezeSync\":" << (pathTracingFreezeSync_ ? L"true" : L"false")
+           << L"}";
+        webview_->PostWebMessageAsJson(ss.str().c_str());
+    }
+
+    bool IsPathTracingNativeFreezeActive() const {
+        return pathTracingViewerActive_ && pathTracingFreezeSync_;
+    }
+
+    void SetPathTracingSettings(int samplesPerFrame, float giClamp, bool freezeSync) {
+        const bool wasFrozen = IsPathTracingNativeFreezeActive();
+        pathTracingSamplesPerFrame_ = std::clamp(samplesPerFrame, 1, 64);
+        if (!std::isfinite(giClamp)) giClamp = 20.0f;
+        pathTracingGIClamp_ = std::clamp(giClamp, 1.0f, 1000.0f);
+        pathTracingFreezeSync_ = freezeSync;
+        SendPathTracingSettings();
+        if (wasFrozen && !IsPathTracingNativeFreezeActive()) {
+            ResetFastPathState(true);
+            SetDirtyImmediate();
+        }
+    }
+
+    void SetPathTracingRuntimeSettings(int samplesPerFrame, float giClamp, bool freezeSync, bool viewerActive) {
+        const bool wasFrozen = IsPathTracingNativeFreezeActive();
+        pathTracingViewerActive_ = viewerActive;
+        SetPathTracingSettings(samplesPerFrame, giClamp, freezeSync);
+        if (wasFrozen && !IsPathTracingNativeFreezeActive()) {
+            ResetFastPathState(true);
+            SetDirtyImmediate();
+        }
+    }
+
     void SendProjectConfig() {
         if (!webview_) return;
 
@@ -13269,6 +13356,18 @@ public:
             QueueFastFlush();
             return;
         }
+        if (type == L"pathtracing_settings") {
+            int samplesPerFrame = pathTracingSamplesPerFrame_;
+            float giClamp = pathTracingGIClamp_;
+            bool freezeSync = pathTracingFreezeSync_;
+            bool viewerActive = false;
+            ExtractJsonInt(msg, L"samplesPerFrame", samplesPerFrame);
+            ExtractJsonFloat(msg, L"giClamp", giClamp);
+            ExtractJsonBool(msg, L"freezeSync", freezeSync);
+            ExtractJsonBool(msg, L"active", viewerActive);
+            SetPathTracingRuntimeSettings(samplesPerFrame, giClamp, freezeSync, viewerActive);
+            return;
+        }
         // Layer mount/remove or host-side sync repair — full resend without reloading WebView2
         if (type == L"scene_dirty" || msg.find(L"\"scene_dirty\"") != std::wstring::npos) {
             jsmodStateMap_.clear();
@@ -13458,6 +13557,8 @@ public:
         }
         if (type == L"ready" || msg.find(L"\"ready\"") != std::wstring::npos) {
             jsReady_ = true; SetDirtyImmediate();
+            pathTracingHasSceneSync_ = false;
+            SetPathTracingSettings(g_pathTracingSamplesPerFrame, g_pathTracingGIClamp, g_pathTracingFreezeSync);
             PollViewportModes(true);
             mtlHashMap_.clear();
             mtlScalarHashMap_.clear();
@@ -13511,6 +13612,9 @@ public:
         const int lightPhase = tickCount_ % LIGHT_DETECT_TICKS;
         const int slowPhase = tickCount_ % 15;
 
+        const bool pathTracingFreezePolling =
+            IsPathTracingNativeFreezeActive() && pathTracingHasSceneSync_;
+
         // Poll env+fog at reduced cadence (~200ms)
         if (envPhase == 0) PollEnvFog();
 
@@ -13533,6 +13637,7 @@ public:
             if (debounceReady && !deferForInteraction) {
                 dirty_ = false;
                 if (useBinary_) SendFullSyncBinary(); else SendFullSync();
+                pathTracingHasSceneSync_ = true;
             }
         } else {
             const bool animPlaying = IsAnimationPlaying();
@@ -13563,15 +13668,16 @@ public:
             const bool favorInteractive = ShouldFavorInteractivePerformance();
             const bool allowIdlePolling = !favorInteractive;
             const bool allowRealtimeAuxPolling = allowIdlePolling || animPlaying;
-            const bool allowHeavyGeometryPolling = !favorInteractive && !animPlaying;
+            const bool allowHeavyPolling = !pathTracingFreezePolling;
+            const bool allowHeavyGeometryPolling = allowHeavyPolling && !favorInteractive && !animPlaying;
             const bool allowTimelineAuxPolling = !animPlaying;
 
             // Source file polling must keep working even while favoring interactive redraw.
             // These are cheap timestamp checks, unlike the heavier scene/material scans below.
             if (slowPhase == 0) CheckWebContentChanges();
             if (slowPhase == 3) CheckProjectContentChanges();
-            if (allowIdlePolling && tickCount_ % MATERIAL_DETECT_TICKS == 2) DetectMaterialChanges();
-            if (allowIdlePolling && lightPhase == 0) DetectPropertyChanges();
+            if (allowHeavyPolling && allowIdlePolling && tickCount_ % MATERIAL_DETECT_TICKS == 2) DetectMaterialChanges();
+            if (allowHeavyPolling && allowIdlePolling && lightPhase == 0) DetectPropertyChanges();
             if (allowTimelineAuxPolling && allowRealtimeAuxPolling && lightPhase == 1) {
                 DetectLightChanges();
                 DetectSplatChanges();
@@ -18109,6 +18215,20 @@ static void EnsurePanel() {
     }
 }
 void EnsureMaxJSPanel() { EnsurePanel(); }
+
+void SetMaxJSPathTracingSettings(int samplesPerFrame, float giClamp, bool freezeSync) {
+    g_pathTracingSamplesPerFrame = std::clamp(samplesPerFrame, 1, 64);
+    if (!std::isfinite(giClamp)) giClamp = 20.0f;
+    g_pathTracingGIClamp = std::clamp(giClamp, 1.0f, 1000.0f);
+    g_pathTracingFreezeSync = freezeSync;
+    if (g_panel) {
+        g_panel->SetPathTracingSettings(
+            g_pathTracingSamplesPerFrame,
+            g_pathTracingGIClamp,
+            g_pathTracingFreezeSync
+        );
+    }
+}
 
 void StartMaxJSActiveShade(Bitmap* target) {
     if (!g_panel) EnsurePanel();

@@ -2,6 +2,8 @@
 
 #define IDD_THREEJS_SKY              510
 #define IDS_THREEJS_SKY_PARAMS       530
+#define IDS_SKY_MODEL_CLASSIC        531
+#define IDS_SKY_MODEL_PLANETARY      532
 
 #define IDC_SKY_TURBIDITY_EDIT       3100
 #define IDC_SKY_TURBIDITY_SPIN       3101
@@ -17,3 +19,7 @@
 #define IDC_SKY_AZIMUTH_SPIN         3113
 #define IDC_SKY_EXPOSURE_EDIT        3114
 #define IDC_SKY_EXPOSURE_SPIN        3115
+#define IDC_SKY_MODEL                3120
+#define IDC_SKY_SHOW_SUN_DISC        3131
+#define IDC_SKY_PLANET_ALTITUDE_EDIT 3132
+#define IDC_SKY_PLANET_ALTITUDE_SPIN 3133

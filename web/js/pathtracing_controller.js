@@ -114,6 +114,28 @@ function getGeneratorSourceMeshes(tracer) {
     return [];
 }
 
+function collectGeneratorMaterials(tracer) {
+    const sourceMeshes = getGeneratorSourceMeshes(tracer);
+    if (!Array.isArray(sourceMeshes)) return [];
+
+    const materials = [];
+    for (const source of sourceMeshes) {
+        for (const material of meshMaterials(source)) {
+            if (material) materials.push(material);
+        }
+    }
+    return materials;
+}
+
+function normalizeGeneratedResults(tracer, results) {
+    if (!results || typeof results !== 'object') return results;
+    if (Array.isArray(results.materials)) return results;
+
+    results.materials = collectGeneratorMaterials(tracer);
+    results.needsMaterialIndexUpdate = true;
+    return results;
+}
+
 function ensureMaterialIndexAttribute(geometry, materialCount) {
     const vertexCount = geometry.attributes.position.count;
     const current = geometry.getAttribute('materialIndex');
@@ -462,6 +484,7 @@ export function createPathTracingController({
         const originalUpdateFromResults = t._updateFromResults.bind(t);
         let lastMaterialIndexSignature = '';
         t._updateFromResults = (nextScene, nextCamera, results) => {
+            results = normalizeGeneratedResults(t, results);
             const nextSignature = materialIndexSignature(t);
             if (results?.needsMaterialIndexUpdate || nextSignature !== lastMaterialIndexSignature) {
                 if (patchGeneratedMaterialIndices(t, results)) {

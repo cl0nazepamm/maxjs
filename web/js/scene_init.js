@@ -3,7 +3,7 @@
 // lines ~1565-1875.
 //
 // Snapshot-mode scope (intentional differences from live):
-//   - No WebXR / VR backend. XR is explicitly out of snapshot parity.
+//   - No TSL_GL backend or headset runtime. Snapshots stay renderer-only.
 //   - No backend persistence (the snapshot wrapper declares the target).
 //   - No editor performance panel coupling — uses devicePixelRatio at 1×scale.
 //   - No grid helper, no postfx panel.

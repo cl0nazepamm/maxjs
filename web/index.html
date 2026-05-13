@@ -59,6 +59,11 @@
                 <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="3" width="12" height="10" rx="2"/><path d="M5 1.5v3M8 1.5v3M11 1.5v3M5 12.5v2M8 12.5v2M11 12.5v2M1.5 6h3M1.5 10h3M11.5 6h3M11.5 10h3"/></svg>
                 <span class="rail-btn-badge">WGPU</span>
             </button>
+            <div id="rendererPipelineSwitch" class="rail-mode-switch devonly" role="group" aria-label="Renderer pipeline">
+                <button class="rail-mode-option" type="button" data-renderer-pipeline="webgl2" title="WGL2 Mode">WGL2</button>
+                <button class="rail-mode-option" type="button" data-renderer-pipeline="webgpu" title="WebGPU Mode">WGPU</button>
+                <button class="rail-mode-option" type="button" data-renderer-pipeline="webgl-fallback" title="TSL_GL Mode">TSL_GL</button>
+            </div>
             <div id="renderModeSwitch" class="rail-mode-switch devonly" role="group" aria-label="Render mode">
                 <button class="rail-mode-option" type="button" data-render-mode="standard" title="Standard render mode">STD</button>
                 <button class="rail-mode-option" type="button" data-render-mode="studio" title="Studio render mode">STU</button>
@@ -77,9 +82,9 @@
             <button id="btnBakeOverrides" class="rail-btn devonly" title="Bake Overrides" aria-label="Bake Overrides">
                 <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2.5 4.5 8 1.5l5.5 3v7L8 14.5l-5.5-3v-7Z"/><path d="M2.5 4.5 8 7.5l5.5-3"/><path d="M8 7.5v7"/><path d="M5.2 10.2 3.6 9.3M12.4 9.3l-1.6.9"/></svg>
             </button>
-            <button id="btnSwitchVR" class="rail-btn devonly" title="Switch to WebGL for XR (reload)" aria-label="XR — use WebGL backend">
+            <button id="btnSwitchFallback" class="rail-btn devonly" title="TSL_GL mode status" aria-label="TSL_GL mode status">
                 <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="1" y="5" width="14" height="6" rx="2"/><circle cx="5" cy="8" r="1.2"/><circle cx="11" cy="8" r="1.2"/><path d="M8 6.5v3"/></svg>
-                <span class="rail-btn-label">XR</span>
+                <span class="rail-btn-label">TSL_GL</span>
             </button>
         </div>
         <div class="rail-spacer"></div>
@@ -130,11 +135,19 @@
             "three-std": "./vendor/three-r184/build/three.module.js",
             "three/webgpu": "./vendor/three-r184/build/three.webgpu.js",
             "three/tsl": "./vendor/three-r184/build/three.tsl.js",
+            "three/src/": "./node_modules/three/src/",
             "three/addons/": "./vendor/three-r184/examples/",
             "three/examples/jsm/": "./vendor/three-r184/examples/",
             "three-mesh-bvh": "./node_modules/three-mesh-bvh/src/index.js",
             "xatlas-web": "./node_modules/xatlas-web/dist/xatlas-web.js",
             "@sparkjsdev/spark": "./node_modules/@sparkjsdev/spark/dist/spark.module.js",
+            "@takram/three-atmosphere": "./node_modules/@takram/three-atmosphere/build/index.js",
+            "@takram/three-atmosphere/webgpu": "./node_modules/@takram/three-atmosphere/build/webgpu.js",
+            "@takram/three-atmosphere/shaders/bruneton": "./node_modules/@takram/three-atmosphere/build/shaders/bruneton.js",
+            "@takram/three-geospatial": "./node_modules/@takram/three-geospatial/build/index.js",
+            "@takram/three-geospatial/shaders": "./node_modules/@takram/three-geospatial/build/shaders.js",
+            "@takram/three-geospatial/webgpu": "./node_modules/@takram/three-geospatial/build/webgpu.js",
+            "postprocessing": "./node_modules/postprocessing/build/index.js",
             "@dimforge/rapier3d-compat": "./vendor/rapier/rapier.es.js",
             "react": "https://esm.sh/react@18.3.1",
             "react/jsx-runtime": "https://esm.sh/react@18.3.1/jsx-runtime",
@@ -159,18 +172,60 @@
             "./node_modules/three-mesh-bvh/": {
                 "three": "./vendor/three-r184/build/three.module.js"
             },
+            "./node_modules/@takram/three-atmosphere/": {
+                "three": "./vendor/three-r184/build/three.module.js",
+                "three/webgpu": "./vendor/three-r184/build/three.webgpu.js",
+                "three/tsl": "./vendor/three-r184/build/three.tsl.js",
+                "three/src/": "./node_modules/three/src/",
+                "three/addons/": "./vendor/three-r184/examples/"
+            },
+            "./node_modules/@takram/three-geospatial/": {
+                "three": "./vendor/three-r184/build/three.module.js",
+                "three/webgpu": "./vendor/three-r184/build/three.webgpu.js",
+                "three/tsl": "./vendor/three-r184/build/three.tsl.js",
+                "three/src/": "./node_modules/three/src/",
+                "three/addons/": "./vendor/three-r184/examples/"
+            },
+            "./node_modules/postprocessing/": {
+                "three": "./vendor/three-r184/build/three.module.js"
+            },
             "https://maxjs-assets.local/": {
                 "three": "https://maxjs.local/vendor/three-r184/build/three.webgpu.js",
                 "three-std": "https://maxjs.local/vendor/three-r184/build/three.module.js",
                 "three/webgpu": "https://maxjs.local/vendor/three-r184/build/three.webgpu.js",
                 "three/tsl": "https://maxjs.local/vendor/three-r184/build/three.tsl.js",
+                "three/src/": "https://maxjs.local/node_modules/three/src/",
                 "three/addons/": "https://maxjs.local/vendor/three-r184/examples/",
+                "@takram/three-atmosphere": "https://maxjs.local/node_modules/@takram/three-atmosphere/build/index.js",
+                "@takram/three-atmosphere/webgpu": "https://maxjs.local/node_modules/@takram/three-atmosphere/build/webgpu.js",
+                "@takram/three-atmosphere/shaders/bruneton": "https://maxjs.local/node_modules/@takram/three-atmosphere/build/shaders/bruneton.js",
+                "@takram/three-geospatial": "https://maxjs.local/node_modules/@takram/three-geospatial/build/index.js",
+                "@takram/three-geospatial/shaders": "https://maxjs.local/node_modules/@takram/three-geospatial/build/shaders.js",
+                "@takram/three-geospatial/webgpu": "https://maxjs.local/node_modules/@takram/three-geospatial/build/webgpu.js",
+                "postprocessing": "https://maxjs.local/node_modules/postprocessing/build/index.js",
                 "@dimforge/rapier3d-compat": "https://maxjs.local/vendor/rapier/rapier.es.js"
             },
             "https://maxjs.local/vendor/three-r184/examples/objects/Sky.js": {
                 "three": "https://maxjs.local/vendor/three-r184/build/three.module.js"
             },
             "https://maxjs.local/vendor/three-r184/examples/lighting/LightProbeGrid.js": {
+                "three": "https://maxjs.local/vendor/three-r184/build/three.module.js"
+            },
+            "https://maxjs.local/node_modules/@takram/three-atmosphere/": {
+                "three": "https://maxjs.local/vendor/three-r184/build/three.module.js",
+                "three/webgpu": "https://maxjs.local/vendor/three-r184/build/three.webgpu.js",
+                "three/tsl": "https://maxjs.local/vendor/three-r184/build/three.tsl.js",
+                "three/src/": "https://maxjs.local/node_modules/three/src/",
+                "three/addons/": "https://maxjs.local/vendor/three-r184/examples/"
+            },
+            "https://maxjs.local/node_modules/@takram/three-geospatial/": {
+                "three": "https://maxjs.local/vendor/three-r184/build/three.module.js",
+                "three/webgpu": "https://maxjs.local/vendor/three-r184/build/three.webgpu.js",
+                "three/tsl": "https://maxjs.local/vendor/three-r184/build/three.tsl.js",
+                "three/src/": "https://maxjs.local/node_modules/three/src/",
+                "three/addons/": "https://maxjs.local/vendor/three-r184/examples/"
+            },
+            "https://maxjs.local/node_modules/postprocessing/": {
                 "three": "https://maxjs.local/vendor/three-r184/build/three.module.js"
             }
         }
@@ -219,7 +274,7 @@
         // even when no per-material envMap is set (default three.js falls back
         // to scene.environmentIntensity which is global).  This makes the
         // native EnvironmentNode respect per-material envMapIntensity with
-        // scene.environment — no custom environmentNode or envMap stamping.
+        // scene.environment. Planetary WebGPU sky owns environmentNode separately.
         materialEnvIntensity.onObjectUpdate(({ material }) => material.envMapIntensity);
         import { applyDeltaFrame } from './js/protocol.js';
         import {
@@ -237,6 +292,7 @@
         import { createPathTracingController } from './js/pathtracing_controller.js';
         import { createLayerManager } from './js/layer_manager.js';
         import { MAXJS_LAYER_SSR_EXCLUDE } from './js/render_layers.js';
+        import { createGeospatialSkyController } from './js/geospatial_sky.js';
         import { createMaxJSAnimationSystem } from './js/maxjs_animation.js';
         import { createMaxJSAudioSystem } from './js/maxjs_audio.js';
         import { createMaxJSGLTFSystem } from './js/maxjs_gltf.js';
@@ -409,12 +465,14 @@
         document.body.classList.toggle('pathtracing-mode', isPathTracingMode);
 
         function normalizeRendererBackend(value) {
-            return value === 'webgl' || value === 'webgpu' || value === 'webgl-vr' ? value : '';
+            if (value === 'webgl-vr' || value === 'webgl-xr' || value === 'webgl-headset') return 'webgl2';
+            if (value === 'webgl') return 'webgl-fallback';
+            return value === 'webgl2' || value === 'webgpu' || value === 'webgl-fallback' ? value : '';
         }
 
         function persistRendererBackendPreference(mode) {
-            const normalized = mode === 'webgl-vr' ? 'webgl' : normalizeRendererBackend(mode);
-            if (normalized === 'webgl' || normalized === 'webgpu') {
+            const normalized = normalizeRendererBackend(mode);
+            if (normalized === 'webgl2' || normalized === 'webgl-fallback' || normalized === 'webgpu') {
                 try { localStorage.setItem(RENDERER_BACKEND_STORAGE_KEY, normalized); } catch {}
             }
         }
@@ -425,10 +483,10 @@
                 sessionStorage.removeItem('maxjs_renderer_backend');
                 return normalizeRendererBackend(explicit);
             }
-            const forceVR = sessionStorage.getItem('maxjs_force_webgl') === '1';
-            if (forceVR) {
+            const forceFallback = sessionStorage.getItem('maxjs_force_webgl') === '1';
+            if (forceFallback) {
                 sessionStorage.removeItem('maxjs_force_webgl');
-                return 'webgl-vr';
+                return 'webgl-fallback';
             }
             try {
                 return normalizeRendererBackend(localStorage.getItem(RENDERER_BACKEND_STORAGE_KEY));
@@ -451,21 +509,20 @@
                 backendLabel = 'WebGL2 (Pathtracing)';
                 configureRenderer(nextRenderer);
                 await initializeRenderer(nextRenderer);
-            } else if (requestedBackend === 'webgl-vr') {
+            } else if (requestedBackend === 'webgl2') {
                 nextRenderer = new THREE_STD.WebGLRenderer({
                     antialias: true,
                     alpha: true,
                     powerPreference: 'high-performance',
                 });
-                backendLabel = 'WebGL2 (VR)';
+                backendLabel = 'WGL2 Mode';
                 configureRenderer(nextRenderer);
                 await initializeRenderer(nextRenderer);
-            } else if (requestedBackend === 'webgl') {
-                // Normal viewer WebGL should still use the modern renderer
-                // stack so TSL / Shader Lab can compile to the WebGL2 backend.
-                // The legacy WebGLRenderer path is kept isolated for WebXR.
+            } else if (requestedBackend === 'webgl-fallback') {
+                // Normal viewer WebGL2 uses the modern renderer stack so TSL /
+                // Shader Lab can compile to the forced WebGL backend.
                 nextRenderer = new THREE.WebGPURenderer({ antialias: true, alpha: true, forceWebGL: true });
-                backendLabel = 'WebGL2 (TSL)';
+                backendLabel = 'TSL_GL';
                 configureRenderer(nextRenderer);
                 await initializeRenderer(nextRenderer);
             } else {
@@ -478,7 +535,7 @@
                     console.warn('max.js WebGPU init failed, retrying with forced WebGL2 backend.', error);
                     disposeRenderer(nextRenderer);
                     nextRenderer = new THREE.WebGPURenderer({ antialias: true, alpha: true, forceWebGL: true });
-                    backendLabel = 'WebGL2 fallback';
+                    backendLabel = 'TSL_GL';
                     configureRenderer(nextRenderer);
                     await initializeRenderer(nextRenderer);
                 }
@@ -605,6 +662,28 @@
         setDefaultLightsVisible(true);
         const lightProbe = new THREE.LightProbe();
         scene.add(lightProbe);
+        const skyProbeSH = new THREE.SphericalHarmonics3();
+        const skyProbeBasis = new Array(9).fill(0);
+        const skyProbeColor = new THREE.Vector3();
+        const skyProbeSunColor = new THREE.Vector3();
+        const skyReflectionDir = new THREE.Vector3();
+        const skyReflectionColor = new THREE.Vector3();
+        const skyProbeDirections = [
+            new THREE.Vector3(0, 1, 0),
+            new THREE.Vector3(0, -1, 0),
+            new THREE.Vector3(1, 0, 0),
+            new THREE.Vector3(-1, 0, 0),
+            new THREE.Vector3(0, 0, 1),
+            new THREE.Vector3(0, 0, -1),
+            new THREE.Vector3(0.58, 0.58, 0.58).normalize(),
+            new THREE.Vector3(-0.58, 0.58, 0.58).normalize(),
+            new THREE.Vector3(0.58, 0.58, -0.58).normalize(),
+            new THREE.Vector3(-0.58, 0.58, -0.58).normalize(),
+            new THREE.Vector3(0.58, -0.58, 0.58).normalize(),
+            new THREE.Vector3(-0.58, -0.58, 0.58).normalize(),
+            new THREE.Vector3(0.58, -0.58, -0.58).normalize(),
+            new THREE.Vector3(-0.58, -0.58, -0.58).normalize(),
+        ];
 
         // ── Loaders & Caches ────────────────────────────────
         const textureLoader = new THREE.TextureLoader();
@@ -616,7 +695,7 @@
         webglTextureLoader.setCrossOrigin?.('anonymous');
         rgbeLoader.setCrossOrigin?.('anonymous');
         exrLoader.setCrossOrigin?.('anonymous');
-        const PMREMGeneratorCtor = String(rendererBackendLabel || '').startsWith('WebGL2')
+        const PMREMGeneratorCtor = renderer?.isWebGLRenderer === true
             ? THREE_STD.PMREMGenerator
             : THREE.PMREMGenerator;
         const pmremGenerator = new PMREMGeneratorCtor(renderer);
@@ -1247,8 +1326,234 @@
             applyLightProbeState();
         }
 
+        function addSkyProbeSample(direction, radiance, weight) {
+            THREE.SphericalHarmonics3.getBasisAt(direction, skyProbeBasis);
+            for (let i = 0; i < 9; i++) {
+                skyProbeSH.coefficients[i].addScaledVector(radiance, skyProbeBasis[i] * weight);
+            }
+        }
+
+        function sampleSkyProbeRadiance(direction, params, sunDir, target) {
+            const up = THREE.MathUtils.clamp(direction.y * 0.5 + 0.5, 0, 1);
+            const horizon = 1.0 - Math.abs(direction.y);
+            const sunAmount = Math.pow(Math.max(direction.dot(sunDir), 0), 48);
+            const exposure = Math.max(0.25, skyNumber(params?.exposure, 0.5));
+            const sunStrength = Math.max(0.1, THREE.MathUtils.clamp(sunDir.y, -1, 1));
+
+            target.set(0.06, 0.065, 0.07);
+            target.lerp(new THREE.Vector3(0.22, 0.34, 0.58), Math.pow(up, 0.75));
+            target.addScaledVector(new THREE.Vector3(0.55, 0.62, 0.72), horizon * 0.12);
+            if (direction.y < 0) {
+                target.lerp(new THREE.Vector3(0.055, 0.05, 0.04), Math.min(1, -direction.y * 0.9));
+            }
+
+            skyProbeSunColor.set(1.0, 0.82, 0.56).multiplyScalar(sunAmount * (0.25 + sunStrength * 0.35));
+            target.add(skyProbeSunColor);
+            return target.multiplyScalar(0.55 + exposure * 0.35);
+        }
+
+        function sampleSkyReflectionRadiance(direction, params, sunDir, target) {
+            const up = THREE.MathUtils.clamp(direction.y * 0.5 + 0.5, 0, 1);
+            const horizon = Math.pow(1.0 - Math.abs(direction.y), 1.6);
+            const below = direction.y < 0 ? Math.min(1, -direction.y * 1.35) : 0;
+            const sunDot = Math.max(direction.dot(sunDir), 0);
+            const sunDisc = Math.pow(sunDot, 360);
+            const sunGlow = Math.pow(sunDot, 18);
+            const exposure = Math.max(0.25, skyNumber(params?.exposure, 0.5));
+            const rayleigh = THREE.MathUtils.clamp(skyNumber(params?.rayleigh, 3), 0, 8) / 8;
+            const turbidity = THREE.MathUtils.clamp(skyNumber(params?.turbidity, 10), 0, 20) / 20;
+
+            const zenithR = THREE.MathUtils.lerp(0.08, 0.18, turbidity);
+            const zenithG = THREE.MathUtils.lerp(0.22, 0.34, rayleigh);
+            const zenithB = THREE.MathUtils.lerp(0.72, 1.15, rayleigh);
+            const horizonR = THREE.MathUtils.lerp(0.55, 0.92, turbidity);
+            const horizonG = THREE.MathUtils.lerp(0.72, 0.78, turbidity);
+            const horizonB = THREE.MathUtils.lerp(0.98, 0.58, turbidity);
+
+            target.set(zenithR, zenithG, zenithB);
+            target.lerp(skyProbeColor.set(horizonR, horizonG, horizonB), horizon);
+            if (below > 0) {
+                target.lerp(skyProbeColor.set(0.028, 0.03, 0.034), below);
+            }
+            target.addScaledVector(skyProbeSunColor.set(1.0, 0.78, 0.42), sunGlow * 0.9 + sunDisc * 8.0);
+            return target.multiplyScalar(0.85 + exposure * 0.45);
+        }
+
+        function disposeSkyReflectionEnvironment() {
+            if (!skyEnvMap) return;
+            const oldSkyEnvMap = skyEnvMap;
+            skyEnvMap = null;
+            if (scene.environment === oldSkyEnvMap) scene.environment = null;
+            if (scene.background === oldSkyEnvMap) scene.background = new THREE.Color(hiddenBackgroundColor);
+            oldSkyEnvMap.dispose?.();
+        }
+
+        function disposeSkyPathTraceEnvironment() {
+            if (!skyPathTraceTexture) return;
+            const oldSkyPathTraceTexture = skyPathTraceTexture;
+            skyPathTraceTexture = null;
+            if (scene.userData.maxjsPathTraceEnvironment === oldSkyPathTraceTexture) {
+                scene.userData.maxjsPathTraceEnvironment = null;
+            }
+            if (scene.userData.maxjsPathTraceBackground === oldSkyPathTraceTexture) {
+                scene.userData.maxjsPathTraceBackground = null;
+            }
+            oldSkyPathTraceTexture.dispose?.();
+        }
+
+        function updateSkyPathTraceEnvironment(params, sunDir) {
+            if (!isPathTracingMode) return;
+            const canvas = document.createElement('canvas');
+            canvas.width = 384;
+            canvas.height = 192;
+            const ctx2d = canvas.getContext('2d', { willReadFrequently: false });
+            if (!ctx2d) return;
+            const image = ctx2d.createImageData(canvas.width, canvas.height);
+            const data = image.data;
+            let ptr = 0;
+            for (let y = 0; y < canvas.height; y++) {
+                const v = (y + 0.5) / canvas.height;
+                const phi = v * Math.PI;
+                const sinPhi = Math.sin(phi);
+                skyReflectionDir.y = Math.cos(phi);
+                for (let x = 0; x < canvas.width; x++) {
+                    const u = (x + 0.5) / canvas.width;
+                    const theta = u * Math.PI * 2 - Math.PI;
+                    skyReflectionDir.x = sinPhi * Math.sin(theta);
+                    skyReflectionDir.z = sinPhi * Math.cos(theta);
+                    sampleSkyReflectionRadiance(skyReflectionDir, params, sunDir, skyReflectionColor);
+                    data[ptr++] = Math.round(255 * Math.pow(THREE.MathUtils.clamp(skyReflectionColor.x, 0, 1), 1 / 2.2));
+                    data[ptr++] = Math.round(255 * Math.pow(THREE.MathUtils.clamp(skyReflectionColor.y, 0, 1), 1 / 2.2));
+                    data[ptr++] = Math.round(255 * Math.pow(THREE.MathUtils.clamp(skyReflectionColor.z, 0, 1), 1 / 2.2));
+                    data[ptr++] = 255;
+                }
+            }
+            ctx2d.putImageData(image, 0, 0);
+
+            const SkyTextureTHREE = renderer?.isWebGLRenderer === true ? THREE_STD : THREE;
+            const textureData = new Uint8Array(data);
+            const texture = new SkyTextureTHREE.DataTexture(
+                textureData,
+                canvas.width,
+                canvas.height,
+                SkyTextureTHREE.RGBAFormat || THREE.RGBAFormat,
+                SkyTextureTHREE.UnsignedByteType || THREE.UnsignedByteType,
+            );
+            texture.name = 'MaxJSSkyPathTraceEquirect';
+            texture.colorSpace = SkyTextureTHREE.SRGBColorSpace || THREE.SRGBColorSpace;
+            texture.mapping = SkyTextureTHREE.EquirectangularReflectionMapping || THREE.EquirectangularReflectionMapping;
+            texture.flipY = false;
+            texture.needsUpdate = true;
+
+            disposeSkyPathTraceEnvironment();
+            skyPathTraceTexture = texture;
+            scene.userData.maxjsPathTraceEnvironment = texture;
+            scene.userData.maxjsPathTraceBackground = texture;
+        }
+
+        function buildProceduralSkyReflectionEnvironment(params, sunDir) {
+            const SkyTextureTHREE = renderer?.isWebGLRenderer === true ? THREE_STD : THREE;
+            const canvas = document.createElement('canvas');
+            canvas.width = 256;
+            canvas.height = 128;
+            const ctx2d = canvas.getContext('2d', { willReadFrequently: false });
+            if (!ctx2d) return null;
+            const image = ctx2d.createImageData(canvas.width, canvas.height);
+            const data = image.data;
+            let ptr = 0;
+            for (let y = 0; y < canvas.height; y++) {
+                const v = (y + 0.5) / canvas.height;
+                const phi = v * Math.PI;
+                const sinPhi = Math.sin(phi);
+                skyReflectionDir.y = Math.cos(phi);
+                for (let x = 0; x < canvas.width; x++) {
+                    const u = (x + 0.5) / canvas.width;
+                    const theta = u * Math.PI * 2 - Math.PI;
+                    skyReflectionDir.x = sinPhi * Math.sin(theta);
+                    skyReflectionDir.z = sinPhi * Math.cos(theta);
+                    sampleSkyReflectionRadiance(skyReflectionDir, params, sunDir, skyReflectionColor);
+                    data[ptr++] = Math.round(255 * Math.pow(THREE.MathUtils.clamp(skyReflectionColor.x, 0, 1), 1 / 2.2));
+                    data[ptr++] = Math.round(255 * Math.pow(THREE.MathUtils.clamp(skyReflectionColor.y, 0, 1), 1 / 2.2));
+                    data[ptr++] = Math.round(255 * Math.pow(THREE.MathUtils.clamp(skyReflectionColor.z, 0, 1), 1 / 2.2));
+                    data[ptr++] = 255;
+                }
+            }
+            ctx2d.putImageData(image, 0, 0);
+
+            const texture = new SkyTextureTHREE.CanvasTexture(canvas);
+            texture.colorSpace = SkyTextureTHREE.SRGBColorSpace || THREE.SRGBColorSpace;
+            texture.mapping = SkyTextureTHREE.EquirectangularReflectionMapping || THREE.EquirectangularReflectionMapping;
+            const envMap = retainPMREMTexture(pmremGenerator.fromEquirectangular(texture));
+            texture.dispose?.();
+            if (envMap) envMap.name = 'MaxJSSkyReflectionProceduralPMREM';
+            return envMap;
+        }
+
+        function buildSkyMeshReflectionEnvironment(sourceSkyMesh) {
+            if (!sourceSkyMesh) return null;
+            const skyScene = new THREE.Scene();
+            const skyCopy = sourceSkyMesh.clone();
+            skyCopy.frustumCulled = false;
+            skyScene.add(skyCopy);
+            try {
+                const envMap = retainPMREMTexture(pmremGenerator.fromScene(skyScene, 0, 0.1, 1000000));
+                if (envMap) envMap.name = 'MaxJSSkyReflectionPMREM';
+                return envMap;
+            } finally {
+                skyScene.clear();
+            }
+        }
+
+        function updateSkyReflectionEnvironment(params, sunDir, sourceSkyMesh = null) {
+            const usesGeospatialSky = params?.model === SKY_MODEL_PLANETARY
+                && allowGeospatialSky;
+            if (isPathTracingMode || usesGeospatialSky) {
+                disposeSkyReflectionEnvironment();
+                return;
+            }
+            let nextEnvMap = null;
+            if (sourceSkyMesh) {
+                try {
+                    nextEnvMap = buildSkyMeshReflectionEnvironment(sourceSkyMesh);
+                } catch (error) {
+                    maxjsDebugWarn('max.js sky reflection PMREM from Sky failed; using procedural fallback:', error);
+                }
+            }
+            nextEnvMap ??= buildProceduralSkyReflectionEnvironment(params, sunDir);
+            if (!nextEnvMap) return;
+
+            disposeSkyReflectionEnvironment();
+            skyEnvMap = nextEnvMap;
+            scene.environment = skyEnvMap;
+            scene.environmentIntensity = 1.0;
+            syncMaterialEnvMaps();
+        }
+
+        function updateSkyAmbientLightProbe(params, sunDir) {
+            if (isPathTracingMode) {
+                clearLightProbe();
+                return;
+            }
+            if (lightProbeGrid) {
+                if (lightProbeGrid.parent) lightProbeGrid.parent.remove(lightProbeGrid);
+                lightProbeGrid.dispose?.();
+                lightProbeGrid = null;
+            }
+            skyProbeSH.zero();
+            const weight = (Math.PI * 4) / skyProbeDirections.length;
+            for (const direction of skyProbeDirections) {
+                addSkyProbeSample(direction, sampleSkyProbeRadiance(direction, params, sunDir, skyProbeColor), weight);
+            }
+            lightProbe.sh.copy(skyProbeSH);
+            hasLightProbeData = true;
+            hasLightProbeGridData = false;
+            applyLightProbeState();
+        }
+
         function supportsWebGLLightProbeGrid() {
-            return !isPathTracingMode && renderer?.isWebGLRenderer === true && typeof LightProbeGrid === 'function';
+            return !isPathTracingMode
+                && typeof LightProbeGrid === 'function'
+                && renderer?.isWebGLRenderer === true;
         }
 
         function computeLightProbeGridBounds(target = new THREE.Box3()) {
@@ -1379,6 +1684,7 @@
         async function updateLightProbeFromCurrentScene({ force = false } = {}) {
             if (!lightProbeEnabled && !force) return;
             if (!supportsWebGLLightProbeGrid()) {
+                if (refreshSkyAmbientLightProbeFromCurrentSky()) return;
                 if (!currentHdriUrl) clearLightProbe();
                 return;
             }
@@ -1890,7 +2196,8 @@
         }
 
         function isWebGLTexturePathActive() {
-            return !!renderer?.isWebGLRenderer || String(rendererBackendLabel || '').startsWith('WebGL2');
+            const label = String(rendererBackendLabel || '');
+            return !!renderer?.isWebGLRenderer || label.startsWith('WGL2') || label === 'TSL_GL';
         }
 
         function prepareLoadedBakeTexture(loadedTex, colorSpace, maxMapChannel) {
@@ -2412,7 +2719,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         }
 
         // ── Local HDRI (independent of Max) ─────────────────
-        // Persist HDRI across page reloads (VR mode switch) via IndexedDB
+        // Persist HDRI across page reloads (TSL_GL pipeline switch) via IndexedDB
         const HDRI_DB_NAME = 'maxjs_hdri_cache';
         const HDRI_DB_STORE = 'files';
 
@@ -2592,19 +2899,219 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         let skySunLight = null;
         let skyFillLight = null;
         let skyEnvMap = null;
+        let skyPathTraceTexture = null;
         let lastSkySig = '';
+        let lastSkySourceParams = null;
         let skyActive = false;
+        let skyPlanetaryActive = false;
+        let geospatialSky = null;
+        const skyLinkedSunDirection = new THREE.Vector3();
+        const skyLinkedSunPosition = new THREE.Vector3();
+        const skyLinkedSunTarget = new THREE.Vector3();
+        const skySunDirectionScratch = new THREE.Vector3();
+        const SKY_MODEL_PLANETARY = 1;
+        const SKY_DEFAULTS = Object.freeze({
+            turbidity: 10,
+            rayleigh: 3,
+            mieCoefficient: 0.005,
+            mieDirectionalG: 0.7,
+            elevation: 2,
+            azimuth: 180,
+            exposure: 0.5,
+            model: 0,
+            showSunDisc: true,
+            cameraAltitude: 1200,
+        });
         // Pure WebGLRenderer cannot render NodeMaterial. WebGPURenderer({forceWebGL:true}) still can.
         const useLegacySky = !(renderer instanceof THREE.WebGPURenderer);
+        const allowGeospatialSky = rendererBackendLabel !== 'TSL_GL';
+
+        function skyNumber(value, fallback) {
+            const n = Number(value);
+            return Number.isFinite(n) ? n : fallback;
+        }
+
+        function normalizeSkyParams(rawParams) {
+            const params = { ...SKY_DEFAULTS, ...(rawParams || {}) };
+            params.turbidity = skyNumber(params.turbidity, SKY_DEFAULTS.turbidity);
+            params.rayleigh = skyNumber(params.rayleigh, SKY_DEFAULTS.rayleigh);
+            params.mieCoefficient = skyNumber(params.mieCoefficient, SKY_DEFAULTS.mieCoefficient);
+            params.mieDirectionalG = skyNumber(params.mieDirectionalG, SKY_DEFAULTS.mieDirectionalG);
+            params.elevation = skyNumber(params.elevation, SKY_DEFAULTS.elevation);
+            params.azimuth = skyNumber(params.azimuth, SKY_DEFAULTS.azimuth);
+            params.exposure = skyNumber(params.exposure, SKY_DEFAULTS.exposure);
+            params.model = Math.trunc(skyNumber(params.model, SKY_DEFAULTS.model));
+            params.showSunDisc = params.showSunDisc !== false && params.showSunDisc !== 0;
+            params.cameraAltitude = Math.max(0, skyNumber(params.cameraAltitude, SKY_DEFAULTS.cameraAltitude));
+            return params;
+        }
+
+        function getSkySunDirectionWorld(params, target = skySunDirectionScratch) {
+            if (Array.isArray(params?.sunDirectionWorld)) {
+                target.set(
+                    Number(params.sunDirectionWorld[0]),
+                    Number(params.sunDirectionWorld[1]),
+                    Number(params.sunDirectionWorld[2])
+                );
+                if (target.lengthSq() > 1e-8) return target.normalize();
+            }
+            const elevRad = THREE.MathUtils.degToRad(skyNumber(params?.elevation, SKY_DEFAULTS.elevation));
+            const azimRad = THREE.MathUtils.degToRad(skyNumber(params?.azimuth, SKY_DEFAULTS.azimuth));
+            return copyMaxComponentsToWorld(target,
+                Math.cos(elevRad) * Math.sin(azimRad),
+                Math.cos(elevRad) * Math.cos(azimRad),
+                Math.sin(elevRad)
+            ).normalize();
+        }
+
+        function isSkyLinkCandidateLight(light) {
+            if (!light?.isDirectionalLight || light.visible === false) return false;
+            if (light.name === '__maxjs_sky_sun__' || light.name === '__maxjs_geospatial_sky_sun__') return false;
+            return light.userData?.maxjsHandle != null;
+        }
+
+        function getDirectionalLightSunVector(light, target = new THREE.Vector3()) {
+            if (!light) return null;
+            light.updateMatrixWorld?.();
+            light.target?.updateMatrixWorld?.();
+            skyLinkedSunPosition.setFromMatrixPosition(light.matrixWorld);
+            if (light.target?.matrixWorld) skyLinkedSunTarget.setFromMatrixPosition(light.target.matrixWorld);
+            else skyLinkedSunTarget.set(0, 0, 0);
+            target.copy(skyLinkedSunPosition).sub(skyLinkedSunTarget);
+            return target.lengthSq() > 1.0e-8 ? target.normalize() : null;
+        }
+
+        function findSkyLinkedSunDirection(target = skyLinkedSunDirection) {
+            const directional = [];
+            for (const light of lightHandleMap.values()) {
+                if (isSkyLinkCandidateLight(light)) directional.push(light);
+            }
+            if (!directional.length) return null;
+            const named = directional.find((light) => {
+                const name = String(light.name || '').toLowerCase();
+                return /\b(sun|sunlight|solar|daylight)\b/.test(name)
+                    || name.includes('sun')
+                    || name.includes('solar')
+                    || name.includes('daylight');
+            });
+            return getDirectionalLightSunVector(named || (directional.length === 1 ? directional[0] : null), target);
+        }
+
+        function withLinkedSkySun(rawParams) {
+            const linkedDir = findSkyLinkedSunDirection();
+            if (!linkedDir) return rawParams;
+            return {
+                ...(rawParams || {}),
+                sunDirectionWorld: [linkedDir.x, linkedDir.y, linkedDir.z],
+                sunLinkedLight: true,
+            };
+        }
+
+        function updateSkyTime(elapsedSeconds) {
+            if (!skyActive || !skyPlanetaryActive) return;
+            refreshSkyFromLinkedSun();
+            geospatialSky?.update({ camera, elapsedSeconds });
+        }
+
+        function refreshSkyFromLinkedSun() {
+            if (!skyActive || !lastSkySourceParams) return false;
+            const params = normalizeSkyParams(withLinkedSkySun(lastSkySourceParams));
+            if (!params.sunLinkedLight) return false;
+            const sig = JSON.stringify(params);
+            if (sig === lastSkySig) return false;
+            applySky(lastSkySourceParams);
+            return true;
+        }
+
+        function refreshSkyAmbientLightProbeFromCurrentSky() {
+            if (!skyActive || !lastSkySourceParams) return false;
+            const params = normalizeSkyParams(withLinkedSkySun(lastSkySourceParams));
+            const sunDir = getSkySunDirectionWorld(params, skySunDirectionScratch);
+            if (params.model === SKY_MODEL_PLANETARY && allowGeospatialSky) {
+                clearLightProbe();
+                hasLightProbeData = true;
+                disposeSkyReflectionEnvironment();
+                if (skyEnvMap && scene.environment === skyEnvMap) scene.environment = null;
+                scene.environmentIntensity = 1.0;
+                currentHdriProbeSignature = JSON.stringify([
+                    'geospatial-probe',
+                    params.model,
+                    params.exposure,
+                    params.elevation,
+                    params.azimuth,
+                    params.sunDirectionWorld || null,
+                ]);
+                return true;
+            }
+            updateSkyAmbientLightProbe(params, sunDir);
+            if (!skyEnvMap || scene.environment !== skyEnvMap) {
+                updateSkyReflectionEnvironment(params, sunDir, skyMesh);
+            }
+            currentHdriProbeSignature = JSON.stringify([
+                'sky-probe',
+                params.model,
+                params.exposure,
+                params.elevation,
+                params.azimuth,
+                params.sunDirectionWorld || null,
+            ]);
+            return true;
+        }
+
+        function removeClassicSkyObjects() {
+            if (skyMesh?.parent) skyMesh.parent.remove(skyMesh);
+            if (skySunLight?.parent) skySunLight.parent.remove(skySunLight);
+            if (skyFillLight?.parent) skyFillLight.parent.remove(skyFillLight);
+        }
 
         function applySky(skyParams) {
             if (!skyParams) return;
+            lastSkySourceParams = skyParams;
 
-            const sig = JSON.stringify(skyParams);
-            if (sig === lastSkySig) return;
+            const params = normalizeSkyParams(withLinkedSkySun(skyParams));
+            const sig = JSON.stringify(params);
+            if (sig === lastSkySig) {
+                if (!hasLightProbeData) refreshSkyAmbientLightProbeFromCurrentSky();
+                return;
+            }
             lastSkySig = sig;
 
             try {
+                const planetary = params.model === SKY_MODEL_PLANETARY && allowGeospatialSky;
+                if (planetary) {
+                    removeClassicSkyObjects();
+                    geospatialSky ??= createGeospatialSkyController({
+                        scene,
+                        renderer,
+                        backendLabel: rendererBackendLabel,
+                        fallbackBackground: hiddenBackgroundColor,
+                    });
+
+                    clearCurrentHdriEnvMap();
+                    disposeSkyReflectionEnvironment();
+                    disposeSkyPathTraceEnvironment();
+                    scene.environment = null;
+                    scene.environmentIntensity = 1.0;
+                    syncMaterialEnvMaps();
+                    scene.environmentRotation.set(0, 0, 0);
+                    scene.backgroundRotation.set(0, 0, 0);
+
+                    geospatialSky.apply(params, { camera });
+                    setDefaultLightsVisible(false);
+                    clearLightProbe();
+                    hasLightProbeData = true;
+                    skyActive = true;
+                    skyPlanetaryActive = true;
+                    currentHdriUrl = null;
+                    currentHdriProbeSignature = '';
+                    ssgiFx.markEnvironmentChanged?.();
+                    return;
+                }
+
+                geospatialSky?.dispose();
+                geospatialSky = null;
+                skyPlanetaryActive = false;
+
                 if (!skyMesh) {
                     skyMesh = useLegacySky ? new Sky() : new SkyMesh();
                     skyMesh.scale.setScalar(450000);
@@ -2613,59 +3120,38 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     skyMesh.userData.volumetricBoundsBypass = true;
                 }
 
-                const elevRad = THREE.MathUtils.degToRad(skyParams.elevation);
-                const azimRad = THREE.MathUtils.degToRad(skyParams.azimuth);
-                const sunDir = copyMaxComponentsToWorld(new THREE.Vector3(),
-                    Math.cos(elevRad) * Math.sin(azimRad),
-                    Math.cos(elevRad) * Math.cos(azimRad),
-                    Math.sin(elevRad)
-                );
+                const sunDir = getSkySunDirectionWorld(params, skySunDirectionScratch);
 
                 if (useLegacySky) {
                     const u = skyMesh.material.uniforms;
-                    u.turbidity.value = skyParams.turbidity;
-                    u.rayleigh.value = skyParams.rayleigh;
-                    u.mieCoefficient.value = skyParams.mieCoefficient;
-                    u.mieDirectionalG.value = skyParams.mieDirectionalG;
+                    u.turbidity.value = params.turbidity;
+                    u.rayleigh.value = params.rayleigh;
+                    u.mieCoefficient.value = params.mieCoefficient;
+                    u.mieDirectionalG.value = params.mieDirectionalG;
                     u.up.value.set(0, 1, 0);
                     u.sunPosition.value.copy(sunDir);
                 } else {
-                    skyMesh.turbidity.value = skyParams.turbidity;
-                    skyMesh.rayleigh.value = skyParams.rayleigh;
-                    skyMesh.mieCoefficient.value = skyParams.mieCoefficient;
-                    skyMesh.mieDirectionalG.value = skyParams.mieDirectionalG;
+                    skyMesh.turbidity.value = params.turbidity;
+                    skyMesh.rayleigh.value = params.rayleigh;
+                    skyMesh.mieCoefficient.value = params.mieCoefficient;
+                    skyMesh.mieDirectionalG.value = params.mieDirectionalG;
                     skyMesh.upUniform.value.set(0, 1, 0);
                     skyMesh.sunPosition.value.copy(sunDir);
                 }
 
-                renderer.toneMappingExposure = skyParams.exposure;
+                renderer.toneMappingExposure = params.exposure;
 
                 if (skyMesh.parent !== scene) scene.add(skyMesh);
 
                 clearCurrentHdriEnvMap();
 
-                scene.background = null;
-                // Legacy WebGL2 sky is a visible sky mesh + lights only.
-                // PMREM-from-scene can hit unsupported texture targets there,
-                // so keep the generated sky env map on WebGPU/WebGPU-forceWebGL.
-                if (useLegacySky) {
-                    if (skyEnvMap) {
-                        skyEnvMap.dispose();
-                        skyEnvMap = null;
-                    }
-                    scene.environment = null;
-                } else {
-                    const skyScene = new THREE.Scene();
-                    const skyCopy = skyMesh.clone();
-                    skyScene.add(skyCopy);
-                    const nextSkyEnvMap = retainPMREMTexture(pmremGenerator.fromScene(skyScene, 0, 0.1, 1000000));
-                    skyScene.clear();
-                    if (!nextSkyEnvMap) return;
-                    if (skyEnvMap) skyEnvMap.dispose();
-                    skyEnvMap = nextSkyEnvMap;
-                    scene.environment = skyEnvMap;
-                }
-                syncMaterialEnvMaps();
+                // Keep an opaque clear target under the sky mesh. The viewer
+                // canvas is alpha-enabled and post-FX can render transparent
+                // scene passes; a null background can leave previous pixels
+                // behind when switching the sky material on/off.
+                scene.background = new THREE.Color(hiddenBackgroundColor);
+                updateSkyReflectionEnvironment(params, sunDir, skyMesh);
+                updateSkyPathTraceEnvironment(params, sunDir);
                 scene.environmentRotation.set(0, 0, 0);
                 scene.backgroundRotation.set(0, 0, 0);
 
@@ -2676,7 +3162,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     skySunLight.userData.volumetricBypass = true;
                 }
                 if (skySunLight.parent !== scene) scene.add(skySunLight);
-                const sunStrength = Math.max(0.1, Math.sin(elevRad));
+                const sunStrength = Math.max(0.1, THREE.MathUtils.clamp(sunDir.y, -1, 1));
                 const warmth = 1.0 - sunStrength * 0.2;
                 skySunLight.color.setRGB(1.0, warmth, warmth * 0.85);
                 skySunLight.intensity = 1.0 + sunStrength * 3.0;
@@ -2692,6 +3178,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 skyFillLight.intensity = 0.5 + sunStrength * 0.5;
 
                 setDefaultLightsVisible(false);
+                updateSkyAmbientLightProbe(params, sunDir);
                 skyActive = true;
 
                 // Clear HDRI state
@@ -2708,15 +3195,40 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         function removeSky() {
             lastSkySig = '';
             skyActive = false;
+            skyPlanetaryActive = false;
+            geospatialSky?.dispose();
+            geospatialSky = null;
             if (skyMesh?.parent) skyMesh.parent.remove(skyMesh);
             if (skySunLight?.parent) skySunLight.parent.remove(skySunLight);
             if (skyFillLight?.parent) skyFillLight.parent.remove(skyFillLight);
-            if (skyEnvMap) {
-                const oldSkyEnvMap = skyEnvMap;
-                skyEnvMap = null;
-                if (scene.environment === oldSkyEnvMap) scene.environment = null;
-                if (scene.background === oldSkyEnvMap) scene.background = new THREE.Color(hiddenBackgroundColor);
-                oldSkyEnvMap.dispose();
+            disposeSkyReflectionEnvironment();
+            disposeSkyPathTraceEnvironment();
+        }
+
+        function materialListHasRawShader(material) {
+            if (Array.isArray(material)) return material.some((entry) => entry?.isRawShaderMaterial);
+            return !!material?.isRawShaderMaterial;
+        }
+
+        function removeWebGPUIncompatibleSceneMaterials() {
+            if (rendererBackendLabel !== 'WebGPU') return;
+            const removals = [];
+            scene.traverse((object) => {
+                if (!object?.parent) return;
+                if (
+                    materialListHasRawShader(object.material)
+                    || materialListHasRawShader(object.customDepthMaterial)
+                    || materialListHasRawShader(object.customDistanceMaterial)
+                ) {
+                    removals.push(object);
+                }
+            });
+            for (const object of removals) {
+                object.parent?.remove(object);
+                if (!object.userData?.maxjsRawShaderPurgeLogged) {
+                    object.userData.maxjsRawShaderPurgeLogged = true;
+                    console.warn('[max.js] removed WebGPU-incompatible RawShaderMaterial object:', object.name || object.type || '(unnamed)');
+                }
             }
         }
 
@@ -5926,6 +6438,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             if (ssgiFx.setMainLight) {
                 ssgiFx.setMainLight(mainDirectionalLight || (defaultLights.visible ? defaultKey : null));
             }
+            refreshSkyFromLinkedSun();
             markLightProbeSceneDirty();
             scheduleLightProbeFromCurrentScene({ delay: 350 });
         }
@@ -8080,6 +8593,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             if (ssgiFx.setMainLight) {
                 ssgiFx.setMainLight(mainDirectionalLight || (defaultLights.visible ? defaultKey : null));
             }
+            refreshSkyFromLinkedSun();
         }
 
         // ── Scene Camera Lock ────────────────────────────────
@@ -8683,49 +9197,99 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         };
 
         const btnRenderer = document.getElementById('btnRenderer');
-        const btnSwitchVR = document.getElementById('btnSwitchVR');
-        function isWebGLBackendActive() {
-            return String(rendererBackendLabel || '').startsWith('WebGL2');
+        const btnSwitchFallback = document.getElementById('btnSwitchFallback');
+        const rendererPipelineSwitch = document.getElementById('rendererPipelineSwitch');
+        const RENDERER_PIPELINE_LABELS = {
+            webgl2: 'WGL2 Mode',
+            webgpu: 'WebGPU Mode',
+            'webgl-fallback': 'TSL_GL Mode',
+        };
+        const RENDERER_PIPELINE_BADGES = {
+            webgl2: 'WGL2',
+            webgpu: 'WGPU',
+            'webgl-fallback': 'TSL_GL',
+        };
+        function isWgl2FallbackBackendActive() {
+            const label = String(rendererBackendLabel || '');
+            return label === 'TSL_GL' || label === 'WGL2 Fallback';
         }
-        function isLegacyWebGLVrBackendActive() {
-            return renderer?.isWebGLRenderer === true && String(rendererBackendLabel || '').includes('(VR)');
+        function isWgl2BackendActive() {
+            return renderer?.isWebGLRenderer === true && String(rendererBackendLabel || '') === 'WGL2 Mode';
+        }
+        function getRendererPipelineMode() {
+            if (isWgl2BackendActive()) return 'webgl2';
+            if (isWgl2FallbackBackendActive()) return 'webgl-fallback';
+            if (String(rendererBackendLabel || '') === 'WebGPU') return 'webgpu';
+            return 'webgl-fallback';
         }
         function syncRendererButtonUi() {
-            if (!btnRenderer) return;
-            const webgl = isWebGLBackendActive();
-            setRailButtonMeta(btnRenderer, { badge: webgl ? 'WGL2' : 'WGPU' });
-            btnRenderer.classList.toggle('active', webgl);
-            btnRenderer.title = `Renderer backend: ${webgl ? 'WebGL2' : 'WebGPU'}`;
-            if (btnSwitchVR) {
-                const vrReady = isLegacyWebGLVrBackendActive();
-                btnSwitchVR.classList.toggle('active', vrReady);
-                btnSwitchVR.title = vrReady
-                    ? 'Legacy WebGL2 VR backend active'
-                    : 'Switch to legacy WebGL2 for XR (reload)';
+            const pipelineMode = getRendererPipelineMode();
+            const pipelineLabel = RENDERER_PIPELINE_LABELS[pipelineMode] || pipelineMode;
+            if (btnRenderer) {
+                setRailButtonMeta(btnRenderer, { badge: RENDERER_PIPELINE_BADGES[pipelineMode] || 'WGPU' });
+                btnRenderer.classList.toggle('active', pipelineMode !== 'webgpu');
+                btnRenderer.title = `Renderer pipeline: ${pipelineLabel}`;
+            }
+            if (rendererPipelineSwitch) {
+                rendererPipelineSwitch.querySelectorAll('[data-renderer-pipeline]').forEach(button => {
+                    const mode = normalizeRendererBackend(button.dataset.rendererPipeline);
+                    const active = mode === pipelineMode;
+                    button.classList.toggle('active', active);
+                    button.setAttribute('aria-pressed', active ? 'true' : 'false');
+                    button.title = `${RENDERER_PIPELINE_LABELS[mode] || mode} pipeline${active ? ' active' : ''}`;
+                });
+            }
+            if (btnSwitchFallback) {
+                const fallbackReady = pipelineMode === 'webgl-fallback';
+                btnSwitchFallback.disabled = !fallbackReady;
+                btnSwitchFallback.classList.toggle('active', fallbackReady);
+                btnSwitchFallback.classList.toggle('is-gated', !fallbackReady);
+                btnSwitchFallback.setAttribute('aria-disabled', fallbackReady ? 'false' : 'true');
+                btnSwitchFallback.title = fallbackReady
+                    ? 'TSL_GL Mode active'
+                    : 'TSL_GL Mode is isolated from WGL2 Mode and WebGPU Mode';
             }
         }
         function restartWithRendererBackend(mode, options = {}) {
+            const normalizedMode = normalizeRendererBackend(mode) || 'webgpu';
             const reason = options.reason || 'manual';
+            const label = RENDERER_PIPELINE_LABELS[normalizedMode] || normalizedMode;
             const confirmMessage = options.confirmMessage
-                || `Restart max.js with ${mode === 'webgl' ? 'WebGL2' : 'WebGPU'} backend now?`;
+                || `Restart max.js with ${label} pipeline now?`;
             if (options.prompt === false || confirm(confirmMessage)) {
-                persistRendererBackendPreference(mode);
-                if (mode === 'webgl' && reason === 'vr') {
-                    sessionStorage.setItem('maxjs_force_webgl', '1');
-                } else {
-                    sessionStorage.setItem('maxjs_renderer_backend', mode);
-                }
+                persistRendererBackendPreference(normalizedMode);
+                sessionStorage.setItem('maxjs_renderer_backend', normalizedMode);
                 location.reload();
                 return;
             }
         }
+        function getNextRendererPipelineMode() {
+            const order = ['webgl2', 'webgpu', 'webgl-fallback'];
+            const current = getRendererPipelineMode();
+            const index = order.indexOf(current);
+            return order[(index + 1) % order.length] || 'webgl-fallback';
+        }
         btnRenderer?.addEventListener('click', () => {
-            const nextMode = isWebGLBackendActive() ? 'webgpu' : 'webgl';
+            const nextMode = getNextRendererPipelineMode();
             restartWithRendererBackend(nextMode, {
                 reason: 'manual',
-                confirmMessage: `Restart max.js with ${nextMode === 'webgl' ? 'WebGL2' : 'WebGPU'} backend now?`,
+                confirmMessage: `Restart max.js with ${RENDERER_PIPELINE_LABELS[nextMode]} pipeline now?`,
             });
         });
+        if (rendererPipelineSwitch) {
+            rendererPipelineSwitch.querySelectorAll('[data-renderer-pipeline]').forEach(button => {
+                const mode = normalizeRendererBackend(button.dataset.rendererPipeline);
+                button.addEventListener('click', () => {
+                    if (!mode || mode === getRendererPipelineMode()) return;
+                    restartWithRendererBackend(mode, {
+                        reason: mode === 'webgl-fallback' ? 'fallback' : 'manual',
+                        confirmMessage: mode === 'webgl-fallback'
+                            ? 'TSL_GL Mode uses forced WebGL through the modern TSL renderer stack and reloads the panel.\n\nUse this when WebGPU Mode is not usable.\n\nSwitch to TSL_GL Mode now?'
+                            : `Restart max.js with ${RENDERER_PIPELINE_LABELS[mode]} pipeline now?`,
+                    });
+                });
+            });
+        }
 
         const renderModeSwitch = document.getElementById('renderModeSwitch');
         if (renderModeSwitch) {
@@ -8757,15 +9321,10 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             }, { notify: true, sendHost: true });
         });
         syncPathTracingSettingsUi();
-        btnSwitchVR?.addEventListener('click', () => {
-            if (isLegacyWebGLVrBackendActive()) {
-                perfHud.setStatus('max.js - legacy WebGL2 backend is already active for VR');
-                return;
+        btnSwitchFallback?.addEventListener('click', () => {
+            if (isWgl2FallbackBackendActive()) {
+                perfHud.setStatus('max.js - TSL_GL Mode is active');
             }
-            restartWithRendererBackend('webgl', {
-                reason: 'vr',
-                confirmMessage: 'WebXR needs the WebGL backend.\n\nOnly tested on Quest 3 with VDXR (Virtual Desktop).\n\nRestart max.js in VR mode now?',
-            });
         });
         syncRendererButtonUi();
 
@@ -9577,7 +10136,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                                 <input class="fx-range" id="fx-performance-instancethreshold" type="range" min="2" max="500" step="1" value="${performanceSettings.maxInstanceBucketThreshold}">
                             </label>
                         </div>
-                        <div class="fx-note" id="fx-performance-note">Caps viewer frame rate (12 = stop-motion look, 24 = cinema) and scales device pixel ratio to reduce GPU load. Splats off skips Spark (no second WebGL pass). XR stays uncapped.</div>
+                        <div class="fx-note" id="fx-performance-note">Caps viewer frame rate (12 = stop-motion look, 24 = cinema) and scales device pixel ratio to reduce GPU load. Splats off skips Spark (no second WebGL pass). Headset sessions stay uncapped.</div>
                     </section>
                     <section class="fx-section collapsed" data-keep-on-shader-lab>
                         <div class="fx-section-header">
@@ -10221,7 +10780,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             if (instanceThresholdValue) instanceThresholdValue.textContent = String(performanceSettings.maxInstanceBucketThreshold);
             if (performanceNote) {
                 performanceNote.textContent =
-                    `Caps the viewer frame rate and scales device pixel ratio to reduce GPU load. Effective DPR ${getEffectivePixelRatio().toFixed(2)}. Splats off skips Spark. Large plain Max instance groups can collapse into InstancedMesh buckets. XR stays uncapped.`;
+                    `Caps the viewer frame rate and scales device pixel ratio to reduce GPU load. Effective DPR ${getEffectivePixelRatio().toFixed(2)}. Splats off skips Spark. Large plain Max instance groups can collapse into InstancedMesh buckets. Headset sessions stay uncapped.`;
             }
 
             const cameraNearInput = document.getElementById('fx-camera-near');
@@ -10650,7 +11209,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             }, 150);
         });
 
-        // ── WebXR / VR ───────────────────────────────────────
+        // ── Headset runtime ──────────────────────────────────
         // Fragile integration: this path is intentionally isolated from snapshots/export
         // and has only been tested on Quest 3 via Virtual Desktop (VDXR).
         function createWebXRRuntime() {
@@ -10831,12 +11390,12 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     captureCameraState();
                     controls.enabled = false;
                     xrOrigin.visible = true;
-                    // Scale up for cm units (Max) vs meters (VR headset)
+                    // Scale up for cm units (Max) vs meters (headset session)
                     xrOrigin.scale.setScalar(100);
                     xrOrigin.add(camera);
                     syncControllerInputSources();
                     recenterOrigin();
-                    perfHud.setStatus('max.js - XR active');
+                    perfHud.setStatus('max.js - headset session active');
                 }
 
                 function handleSessionEnd() {
@@ -10966,6 +11525,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             inlineTimer.update(frameTimeMs);
             const frameDt = inlineClock.getDelta();
             const frameElapsed = inlineClock.getElapsed();
+            updateSkyTime(frameElapsed);
             xrRuntime.update(frameDt);
             if (!xrRuntime.active) syncOrbitNavigationFeel();
             if (!xrRuntime.active && !(animationSystem?.isDrivingSceneCamera?.())) controls.update();
@@ -10989,6 +11549,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             const perfHudActive = perfHud.isDebugEnabled?.() ?? false;
             if (perfHudActive) perfHud.updateLayers(layerManager.getStats());
             ssgiFx.applySharedSceneEffects?.();
+            removeWebGPUIncompatibleSceneMaterials();
             const renderStart = performance.now();
             // Last-mile render-only camera offsets (handheld shake, etc.).
             // Applied after layer.update + camera sync so they survive until
@@ -11019,24 +11580,24 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 } else if (asciiActive && asciiEffect) {
                     asciiEffect.render(scene, camera);
                 } else if (xrRuntime.shouldBypassPostFx) {
-                    // Reduce brightness for VR (no post-fx tone mapping)
+                    // Reduce brightness for headset sessions (no post-fx tone mapping)
                     const savedExposure = renderer.toneMappingExposure;
-                    const vrLightScale = 0.1;
+                    const xrLightScale = 0.1;
                     renderer.toneMappingExposure = savedExposure * 0.15;
                     // Scale down lights temporarily
                     scene.traverse(obj => {
                         if (obj.isLight && obj.intensity !== undefined) {
-                            obj.userData._vrSavedIntensity = obj.intensity;
-                            obj.intensity *= vrLightScale;
+                            obj.userData._xrSavedIntensity = obj.intensity;
+                            obj.intensity *= xrLightScale;
                         }
                     });
                     renderer.render(scene, camera);
                     // Restore
                     renderer.toneMappingExposure = savedExposure;
                     scene.traverse(obj => {
-                        if (obj.isLight && obj.userData._vrSavedIntensity !== undefined) {
-                            obj.intensity = obj.userData._vrSavedIntensity;
-                            delete obj.userData._vrSavedIntensity;
+                        if (obj.isLight && obj.userData._xrSavedIntensity !== undefined) {
+                            obj.intensity = obj.userData._xrSavedIntensity;
+                            delete obj.userData._xrSavedIntensity;
                         }
                     });
                 } else if (shaderLabFx.isEnabled()) {

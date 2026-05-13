@@ -4,9 +4,11 @@
 STRINGTABLE
 BEGIN
     IDS_THREEJS_SKY_PARAMS "three.js Sky"
+    IDS_SKY_MODEL_CLASSIC "Classic"
+    IDS_SKY_MODEL_PLANETARY "Geospatial"
 END
 
-IDD_THREEJS_SKY DIALOG 0, 0, 217, 120
+IDD_THREEJS_SKY DIALOG 0, 0, 217, 136
 STYLE DS_SETFONT | WS_CHILD | WS_VISIBLE
 FONT 8, "Segoe UI"
 BEGIN
@@ -37,6 +39,15 @@ BEGIN
     CONTROL         "", IDC_SKY_EXPOSURE_EDIT, "CustEdit", WS_TABSTOP, 60, 74, 40, 10
     CONTROL         "", IDC_SKY_EXPOSURE_SPIN, "SpinnerControl", 0, 100, 74, 11, 10
 
-    GROUPBOX        "", -1, 2, 92, 213, 24
-    LTEXT           "Assign to Environment Map slot for live sky.", -1, 8, 100, 200, 10
+    GROUPBOX        "Geospatial Planet", -1, 2, 92, 213, 30
+    LTEXT           "Model", -1, 8, 104, 48, 8
+    COMBOBOX        IDC_SKY_MODEL, 60, 102, 84, 60, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    CONTROL         "Sun disc", IDC_SKY_SHOW_SUN_DISC, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 152, 103, 52, 10
+
+    LTEXT           "Altitude m", -1, 8, 118, 48, 8
+    CONTROL         "", IDC_SKY_PLANET_ALTITUDE_EDIT, "CustEdit", WS_TABSTOP, 60, 116, 40, 10
+    CONTROL         "", IDC_SKY_PLANET_ALTITUDE_SPIN, "SpinnerControl", 0, 100, 116, 11, 10
+
+    GROUPBOX        "", -1, 2, 122, 213, 12
+    LTEXT           "Assign to Environment Map slot for live sky.", -1, 8, 127, 200, 8
 END

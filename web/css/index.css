@@ -1265,6 +1265,17 @@ body.light-mode .rail-mode-option.active {
     background: rgba(255, 255, 255, 0.04);
     border-color: rgba(255, 255, 255, 0.1);
 }
+.rail-mode-option:disabled,
+.rail-mode-option.is-gated {
+    opacity: 0.36;
+    cursor: not-allowed;
+}
+.rail-mode-option:disabled:hover,
+.rail-mode-option.is-gated:hover {
+    color: rgba(220, 225, 229, 0.52);
+    background: transparent;
+    border-color: rgba(255, 255, 255, 0.045);
+}
 .rail-mode-option.active {
     color: #f2f7f5;
     background: rgba(255, 255, 255, 0.075);

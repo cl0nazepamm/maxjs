@@ -1521,7 +1521,7 @@ static void ExtractGltfMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
         }
         return def;
     };
-    auto readMap = [&](const MCHAR* pname, std::wstring& outPath, MaxJSPBR::TexTransform& outXf) {
+    auto readMap = [&](const MCHAR* pname, std::wstring& outPath, MaxJSPBR::TexTransform& outXf) -> bool {
         outPath.clear();
         outXf = {};
         for (int b = 0; b < mtl->NumParamBlocks(); b++) {
@@ -1533,10 +1533,11 @@ static void ExtractGltfMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
                 if (pd.int_name && _tcsicmp(pd.int_name, pname) == 0 && pd.type == TYPE_TEXMAP) {
                     Texmap* map = pb->GetTexmap(pid, t);
                     ExtractMaterialTexture(map, outPath, outXf);
-                    return;
+                    return map != nullptr;
                 }
             }
         }
+        return false;
     };
 
     readColor(_T("baseColor"), d.color);
@@ -1551,7 +1552,10 @@ static void ExtractGltfMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
     readColor(_T("emissionColor"), d.emission);
     d.emIntensity = (d.emission[0] + d.emission[1] + d.emission[2] > 0) ? 1.0f : 0.0f;
 
-    readMap(_T("baseColorMap"), d.colorMap, d.colorMapTransform);
+    const bool hasBaseColorMap = readMap(_T("baseColorMap"), d.colorMap, d.colorMapTransform);
+    if (hasBaseColorMap) {
+        d.color[0] = 1.0f; d.color[1] = 1.0f; d.color[2] = 1.0f;
+    }
     readMap(_T("roughnessMap"), d.roughnessMap, d.roughnessMapTransform);
     readMap(_T("metalnessMap"), d.metalnessMap, d.metalnessMapTransform);
     readMap(_T("normalMap"), d.normalMap, d.normalMapTransform);
@@ -1595,7 +1599,7 @@ static void ExtractUsdPreviewSurfaceMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
         }
         return def;
     };
-    auto readMap = [&](const MCHAR* pname, std::wstring& outPath, MaxJSPBR::TexTransform& outXf) {
+    auto readMap = [&](const MCHAR* pname, std::wstring& outPath, MaxJSPBR::TexTransform& outXf) -> bool {
         outPath.clear();
         outXf = {};
         for (int b = 0; b < mtl->NumParamBlocks(); b++) {
@@ -1607,10 +1611,11 @@ static void ExtractUsdPreviewSurfaceMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
                 if (pd.int_name && _tcsicmp(pd.int_name, pname) == 0 && pd.type == TYPE_TEXMAP) {
                     Texmap* map = pb->GetTexmap(pid, t);
                     ExtractMaterialTexture(map, outPath, outXf);
-                    return;
+                    return map != nullptr;
                 }
             }
         }
+        return false;
     };
 
     readColor(_T("diffuseColor"), d.color);
@@ -1628,7 +1633,10 @@ static void ExtractUsdPreviewSurfaceMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
     readColor(_T("emissiveColor"), d.emission);
     d.emIntensity = (d.emission[0] + d.emission[1] + d.emission[2] > 0) ? 1.0f : 0.0f;
 
-    readMap(_T("diffuseColor_map"),      d.colorMap,        d.colorMapTransform);
+    const bool hasDiffuseColorMap = readMap(_T("diffuseColor_map"), d.colorMap, d.colorMapTransform);
+    if (hasDiffuseColorMap) {
+        d.color[0] = 1.0f; d.color[1] = 1.0f; d.color[2] = 1.0f;
+    }
     readMap(_T("roughness_map"),          d.roughnessMap,    d.roughnessMapTransform);
     readMap(_T("metallic_map"),           d.metalnessMap,    d.metalnessMapTransform);
     readMap(_T("normal_map"),             d.normalMap,       d.normalMapTransform);
@@ -2225,7 +2233,10 @@ static void ExtractVRayMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
     d.roughness = useRoughnessWorkflow ? reflectionGlossiness : (1.0f - reflectionGlossiness);
     d.metalness = readFloat(_T("reflection_metalness"), 0.0f);
     d.ior = readFloat(_T("refraction_ior"), readFloat(_T("reflection_ior"), 1.6f));
-    d.normalScale = readFloat(_T("bump_multiplier"), 30.0f) / 30.0f; // normalize to ~1.0
+    // VRayMtl drives both height bump and VRayNormalMap through the bump slot.
+    // Its amount is a percentage in common scenes, so 100 should become a
+    // Three.js normalScale/bumpScale of 1.0 instead of the old overdriven value.
+    d.normalScale = std::max(0.0f, readFloat(_T("bump_multiplier"), 100.0f) / 100.0f);
     d.doubleSided = readBool(_T("option_doubleSided"), true);
 
     // Emission

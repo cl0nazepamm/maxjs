@@ -258,10 +258,9 @@
     bool haveLastControllerBounds_ = false;
     static constexpr UINT_PTR kHostSubclassId = 0xC0DE5A1Dull;
 
-    // ActiveShade hosted resize defense. After the initial attach, the WebView
-    // backbuffer size stays fixed for the whole viewport-hosted session. Host
-    // WM_SIZE only updates this timestamp so capture can pause briefly; it
-    // must not flow into controller_->put_Bounds.
+    // ActiveShade hosted mode: attach once and leave the WebView2 backbuffer
+    // alone. Panel resizes must not call controller_->put_Bounds, restart the
+    // renderer, or run an aspect-correction recovery path.
     ULONGLONG lastHostResizeMs_ = 0;
     static constexpr DWORD kCaptureSuppressMs = 750;
     int activeShadeHostedWidth_ = 0;
@@ -480,66 +479,33 @@
         const int width = vpRect.right - vpRect.left;
         const int height = vpRect.bottom - vpRect.top;
         if (width < 64 || height < 64) {
-            // Viewport layout transitions briefly report tiny/empty client
-            // rects. Treat that as a suspended host, not a fatal condition.
             if (IsWindowVisible(hwnd_)) ShowWindow(hwnd_, SW_HIDE);
             return false;
         }
 
-        const ULONGLONG now = GetTickCount64();
-        const bool hostSizeChanged =
-            activeShadeHostClientWidth_ > 0 &&
-            activeShadeHostClientHeight_ > 0 &&
-            (activeShadeHostClientWidth_ != width || activeShadeHostClientHeight_ != height);
         activeShadeHostClientWidth_ = width;
         activeShadeHostClientHeight_ = height;
-        if (hostSizeChanged) {
-            lastHostResizeMs_ = now;
-        }
-
-        if (lastHostResizeMs_ != 0 && now - lastHostResizeMs_ < kCaptureSuppressMs) {
-            // During a live 3ds Max/ActiveShade host resize, even moving the
-            // WebView child can stall WebView2 hard. Keep the fixed backbuffer
-            // hidden until the host rect settles, then re-show on the next tick.
-            if (IsWindowVisible(hwnd_)) ShowWindow(hwnd_, SW_HIDE);
-            return false;
-        }
-
-        if (activeShadeHostedWidth_ <= 0 || activeShadeHostedHeight_ <= 0) {
-            RECT childRect = {};
-            if (GetClientRect(hwnd_, &childRect)) {
-                activeShadeHostedWidth_ = std::max(64, static_cast<int>(childRect.right - childRect.left));
-                activeShadeHostedHeight_ = std::max(64, static_cast<int>(childRect.bottom - childRect.top));
-            } else {
-                activeShadeHostedWidth_ = width;
-                activeShadeHostedHeight_ = height;
-            }
-        }
-
-        const int childW = activeShadeHostedWidth_;
-        const int childH = activeShadeHostedHeight_;
-        const int childX = std::min(0, (width - childW) / 2);
-        const int childY = std::min(0, (height - childH) / 2);
 
         RECT childWin = {};
         const bool haveChildWin = GetWindowRect(hwnd_, &childWin);
         POINT childOrigin = { childWin.left, childWin.top };
         if (haveChildWin) ScreenToClient(embeddedViewportHwnd_, &childOrigin);
-        const bool needMove =
+        const bool shellNeedsPanelFit =
             reattached ||
             !IsWindowVisible(hwnd_) ||
             !haveChildWin ||
-            childOrigin.x != childX ||
-            childOrigin.y != childY ||
-            (childWin.right - childWin.left) != childW ||
-            (childWin.bottom - childWin.top) != childH;
+            childOrigin.x != 0 ||
+            childOrigin.y != 0 ||
+            (childWin.right - childWin.left) != width ||
+            (childWin.bottom - childWin.top) != height;
 
-        if (needMove) {
-            UINT posFlags = SWP_NOACTIVATE | SWP_NOCOPYBITS | SWP_SHOWWINDOW;
-            if (!reattached) posFlags |= SWP_NOOWNERZORDER;
-            SetWindowPos(hwnd_, HWND_TOP, childX, childY, childW, childH, posFlags);
-        } else {
-            ShowWindow(hwnd_, SW_SHOWNA);
+        // Fit the native shell to the ActiveShade panel, but deliberately do
+        // not call Resize(true). The WebView2 controller keeps the initial
+        // backbuffer size for the whole session.
+        if (shellNeedsPanelFit) {
+            SetWindowPos(hwnd_, HWND_TOP, 0, 0,
+                width, height,
+                SWP_NOACTIVATE | SWP_NOCOPYBITS | SWP_SHOWWINDOW);
         }
         return true;
     }
@@ -561,23 +527,10 @@
         switch (msg) {
         case WM_SIZE:
         case WM_WINDOWPOSCHANGED:
-            // Host (Max viewport) resized. Do not mirror this to the child
-            // WebView. In ActiveShade, controller bounds changes after attach
-            // leak renderer-side resources in both WebGPU and WebGL. The fixed
-            // child/backbuffer is only moved or hidden by MaintainViewportHost.
+            // Host (Max viewport) resized. Ignore it. ActiveShade keeps the
+            // first WebView2 size for the whole session.
             if (self->embeddedViewportHwnd_ == h && self->hwnd_ && IsWindow(self->hwnd_)) {
-                // Alt+W expands this HWND to cover the whole Max window.
-                // MaintainViewportHost hides the fixed child until unmax.
-                Interface* ip = GetCOREInterface();
-                if (ip && ip->IsViewportMaxed()) break;
-                RECT vp = {};
-                if (GetClientRect(h, &vp)) {
-                    const int vw = vp.right - vp.left;
-                    const int vh = vp.bottom - vp.top;
-                    if (vw >= 64 && vh >= 64) {
-                        self->lastHostResizeMs_ = GetTickCount64();
-                    }
-                }
+                self->lastHostResizeMs_ = 0;
             }
             break;
         case WM_NCDESTROY:

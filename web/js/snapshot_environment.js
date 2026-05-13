@@ -350,8 +350,13 @@ export function createSnapshotEnvironment({ scene, renderer, rootUrl = '.' } = {
         try { pmremGenerator.dispose?.(); } catch {}
     }
 
+    function update(dt, elapsed, camera) {
+        skyController?.update?.(dt, elapsed, camera);
+    }
+
     return {
         apply,
+        update,
         setEnabled,
         setVisible: setEnabled,
         setBackgroundVisible,

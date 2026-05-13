@@ -774,7 +774,7 @@ async function bindLayerProject(root, meta, layerManager) {
 }
 
 // ─── Phase 10: render loop ────────────────────────────────────────────
-function startRenderLoop({ renderer, scene, camera, controls, layerManager, animationSystem, ssgiFx, optionalModules }) {
+function startRenderLoop({ renderer, scene, camera, controls, layerManager, animationSystem, ssgiFx, snapshotEnvironment, optionalModules }) {
     let lastTimeMs = performance.now();
     let elapsed = 0;
     const loop = () => {
@@ -788,6 +788,7 @@ function startRenderLoop({ renderer, scene, camera, controls, layerManager, anim
         for (const module of Object.values(optionalModules ?? {})) {
             module?.update?.(dt, elapsed);
         }
+        snapshotEnvironment?.update?.(dt, elapsed, camera);
 
         layerManager?.beforeRender?.(elapsed);
         try {
@@ -996,6 +997,7 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
         renderer, scene, camera, controls, layerManager,
         animationSystem,
         ssgiFx: optionalModules.ssgiFx,
+        snapshotEnvironment,
         optionalModules,
     });
 

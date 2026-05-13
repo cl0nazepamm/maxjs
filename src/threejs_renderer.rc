@@ -1,0 +1,17 @@
+#include "threejs_renderer_res.h"
+#include <windows.h>
+
+IDD_THREEJS_RENDERER_PT DIALOGEX 0, 0, 260, 96
+STYLE DS_SETFONT | WS_CHILD | WS_CLIPSIBLINGS
+FONT 8, "MS Shell Dlg"
+BEGIN
+    GROUPBOX        "Pathtracing", -1, 6, 6, 248, 82
+    LTEXT           "Samples / frame", -1, 16, 24, 68, 8
+    CONTROL         "", IDC_RENDERER_PT_SPF_EDIT, "CustEdit", WS_TABSTOP, 96, 21, 34, 10
+    CONTROL         "", IDC_RENDERER_PT_SPF_SPIN, "SpinnerControl", 0, 132, 21, 11, 10
+    LTEXT           "GI clamp", -1, 16, 40, 68, 8
+    CONTROL         "", IDC_RENDERER_PT_GI_CLAMP_EDIT, "CustEdit", WS_TABSTOP, 96, 37, 34, 10
+    CONTROL         "", IDC_RENDERER_PT_GI_CLAMP_SPIN, "SpinnerControl", 0, 132, 37, 11, 10
+    CONTROL         "Freeze scene sync while pathtracing", IDC_RENDERER_PT_FREEZE_SYNC, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 16, 58, 160, 10
+    LTEXT           "Changes push to the max.js viewer immediately. Use PT render mode in the viewer.", -1, 16, 74, 220, 8
+END

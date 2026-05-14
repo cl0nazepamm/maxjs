@@ -47,6 +47,18 @@ void MaxJSFastNodeEventCallback::TopologyChanged(NodeKeyTab& nodes) {
     owner_->MarkGeometryTopologyDirty(nodes);
 }
 
+void MaxJSFastNodeEventCallback::MaterialStructured(NodeKeyTab& nodes) {
+    if (!owner_) return;
+    owner_->MarkInteractiveActivity();
+    owner_->MarkMaterialNodesDirty(nodes, true);
+}
+
+void MaxJSFastNodeEventCallback::MaterialOtherEvent(NodeKeyTab& nodes) {
+    if (!owner_) return;
+    owner_->MarkInteractiveActivity();
+    owner_->MarkMaterialNodesDirty(nodes, false);
+}
+
 void MaxJSFastRedrawCallback::proc(Interface*) {
     if (!owner_) return;
     const bool animPlaying = owner_->IsAnimationPlaying();

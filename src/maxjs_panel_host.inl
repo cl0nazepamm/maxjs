@@ -33,6 +33,7 @@
     std::unordered_map<ULONG, uint64_t> mtlHashMap_;   // node handle → material structure hash
     std::unordered_map<ULONG, uint64_t> mtlScalarHashMap_; // node handle -> non-fast material scalar hash
     std::unordered_map<ULONG, uint64_t> mtlFastScalarHashMap_; // node handle -> delta material scalar hash
+    std::unordered_map<ReferenceTarget*, std::vector<ULONG>> materialEditHandleCache_; // edited material/map -> dependent node handles
     std::unordered_map<ULONG, uint64_t> lightHashMap_; // node handle → light state hash
     std::unordered_map<ULONG, uint64_t> splatHashMap_; // node handle → splat source state hash
     std::unordered_map<ULONG, uint64_t> audioHashMap_; // node handle → audio source state hash

@@ -2922,9 +2922,11 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             showSunDisc: true,
             cameraAltitude: 1200,
         });
-        // Pure WebGLRenderer cannot render NodeMaterial. WebGPURenderer({forceWebGL:true}) still can.
+        // Geospatial sky is supported by WebGPU and plain WGL2. Keep it out of
+        // TSL_GL because that forced-WebGL TSL path conflicts with post effects.
         const useLegacySky = !(renderer instanceof THREE.WebGPURenderer);
-        const allowGeospatialSky = rendererBackendLabel !== 'TSL_GL';
+        const allowGeospatialSky = rendererBackendLabel === 'WebGPU'
+            || String(rendererBackendLabel || '').startsWith('WGL2');
 
         function skyNumber(value, fallback) {
             const n = Number(value);
@@ -3000,9 +3002,10 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         function withLinkedSkySun(rawParams) {
             const linkedDir = findSkyLinkedSunDirection();
             if (!linkedDir) return rawParams;
+            const snap = (value) => Math.round(value * 10000) / 10000;
             return {
                 ...(rawParams || {}),
-                sunDirectionWorld: [linkedDir.x, linkedDir.y, linkedDir.z],
+                sunDirectionWorld: [snap(linkedDir.x), snap(linkedDir.y), snap(linkedDir.z)],
                 sunLinkedLight: true,
             };
         }
@@ -3010,6 +3013,13 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         function updateSkyTime(elapsedSeconds) {
             if (!skyActive || !skyPlanetaryActive) return;
             geospatialSky?.update({ camera, elapsedSeconds });
+        }
+
+        function refreshSkyFromLinkedSun() {
+            if (!skyActive || !lastSkySourceParams) return false;
+            const beforeSig = lastSkySig;
+            applySky(lastSkySourceParams);
+            return beforeSig !== lastSkySig;
         }
 
         function refreshSkyAmbientLightProbeFromCurrentSky() {
@@ -5814,6 +5824,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                         shadowMapSize: ld.shadowMapSize,
                         volContrib: ld.volContrib,
                     });
+                    if (ld.type === 0) refreshSkyFromLinkedSun();
                     markLightProbeSceneDirty();
                     scheduleLightProbeFromCurrentScene({ delay: 350 });
                     pathTraceSceneChanged = true;
@@ -6441,6 +6452,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             clearLights();
             finalizeLightState(lightsData);
             lightLinking.reapply();
+            refreshSkyFromLinkedSun();
             lastLightsSignature = signature;
             return true;
         }
@@ -8580,6 +8592,10 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             setDefaultLightsVisible(appliedLightCount === 0 && !currentHdriUrl && !skyActive);
             if (ssgiFx.setMainLight) {
                 ssgiFx.setMainLight(mainDirectionalLight || (defaultLights.visible ? defaultKey : null));
+            }
+            if (refreshSkyFromLinkedSun()) {
+                markLightProbeSceneDirty();
+                scheduleLightProbeFromCurrentScene({ delay: 350 });
             }
         }
 

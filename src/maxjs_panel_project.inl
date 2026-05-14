@@ -148,6 +148,7 @@
         mtlHashMap_.clear();
         mtlScalarHashMap_.clear();
         mtlFastScalarHashMap_.clear();
+        ClearMaterialEditHandleCache();
         lightHashMap_.clear();
         splatHashMap_.clear();
         audioHashMap_.clear();

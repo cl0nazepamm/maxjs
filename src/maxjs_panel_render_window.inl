@@ -800,6 +800,7 @@
         hairHandles_.clear();
         deformHandles_.clear();
         mtlHashMap_.clear();
+        ClearMaterialEditHandleCache();
         lightHashMap_.clear();
         splatHashMap_.clear();
         audioHashMap_.clear();
@@ -814,6 +815,7 @@
         lastLiveGeomHash_.clear();
         mtlScalarHashMap_.clear();
         mtlFastScalarHashMap_.clear();
+        ClearMaterialEditHandleCache();
         skinnedControlIdxCache_.clear();
         skinnedFastSourceCache_.clear();
         lastSkinnedLivePollTick_ = 0;

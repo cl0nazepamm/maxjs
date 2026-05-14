@@ -566,6 +566,10 @@
         idlePropertyFullSyncCandidateHash_.clear();
     }
 
+    void ClearMaterialEditHandleCache() {
+        materialEditHandleCache_.clear();
+    }
+
     bool ShouldRunIdlePollAudit(ULONGLONG now) {
         if (idlePollAuditUntilTick_ == 0) return false;
         if (now <= idlePollAuditUntilTick_) return true;
@@ -611,6 +615,46 @@
         SetDirty(false);
     }
 
+    std::vector<ULONG> FindMaterialEditHandles(ReferenceTarget* target) {
+        if (!target) return {};
+        auto cached = materialEditHandleCache_.find(target);
+        if (cached != materialEditHandleCache_.end()) return cached->second;
+
+        Interface* ip = GetCOREInterface();
+        if (!ip) return {};
+
+        std::vector<ULONG> handles;
+        Mtl* targetMtl = dynamic_cast<Mtl*>(target);
+        if (targetMtl) {
+            handles.reserve(geomHandles_.size());
+            for (ULONG handle : geomHandles_) {
+                INode* node = ip->GetINodeByHandle(handle);
+                if (!node) continue;
+                if (FindSupportedMaterial(node->GetMtl()) == targetMtl) {
+                    handles.push_back(handle);
+                }
+            }
+            if (!handles.empty()) {
+                materialEditHandleCache_[target] = handles;
+                return handles;
+            }
+            handles.clear();
+        }
+
+        handles.reserve(geomHandles_.size());
+        for (ULONG handle : geomHandles_) {
+            INode* node = ip->GetINodeByHandle(handle);
+            if (!node) continue;
+            Mtl* supportedMtl = FindSupportedMaterial(node->GetMtl());
+            if (supportedMtl && ReferenceTreeContains(supportedMtl, target)) {
+                handles.push_back(handle);
+            }
+        }
+
+        materialEditHandleCache_[target] = handles;
+        return handles;
+    }
+
     void NotifyMaterialEditedTarget(ReferenceTarget* target) {
         if (!target) {
             MarkMaterialInteractiveActivity();
@@ -622,17 +666,33 @@
         Interface* ip = GetCOREInterface();
         if (!ip) return;
         TimeValue t = ip->GetTime();
+        bool changed = false;
+        bool cacheStale = false;
+        std::unordered_map<Mtl*, MaterialSyncState> materialStateCache;
+        const std::vector<ULONG> handles = FindMaterialEditHandles(target);
+        Mtl* targetMtl = dynamic_cast<Mtl*>(target);
+        if (handles.empty()) {
+            MarkInteractiveActivity();
+            return;
+        }
 
-        for (ULONG handle : geomHandles_) {
+        for (ULONG handle : handles) {
             INode* node = ip->GetINodeByHandle(handle);
-            if (!node) continue;
+            if (!node) {
+                cacheStale = true;
+                continue;
+            }
 
             Mtl* rawMtl = node->GetMtl();
             Mtl* supportedMtl = FindSupportedMaterial(rawMtl);
-            if (!supportedMtl) continue;
-            if (!ReferenceTreeContains(supportedMtl, target)) continue;
+            const bool stillMatches = supportedMtl &&
+                ((targetMtl && supportedMtl == targetMtl) || ReferenceTreeContains(supportedMtl, target));
+            if (!stillMatches) {
+                cacheStale = true;
+                continue;
+            }
 
-            const MaterialSyncState state = ComputeMaterialSyncState(node, t);
+            const MaterialSyncState state = ComputeMaterialSyncStateCached(node, t, materialStateCache);
             auto structureIt = mtlHashMap_.find(handle);
             auto scalarIt = mtlScalarHashMap_.find(handle);
             auto fastScalarIt = mtlFastScalarHashMap_.find(handle);
@@ -642,9 +702,16 @@
                 mtlHashMap_[handle] = state.structureHash;
                 mtlScalarHashMap_[handle] = state.scalarHash;
                 mtlFastScalarHashMap_[handle] = state.fastScalarHash;
-                materialFastDirtyHandles_.clear();
-                SetDirtyImmediate();
-                return;
+                if (!state.canFastSync) {
+                    materialFastDirtyHandles_.clear();
+                    ClearMaterialEditHandleCache();
+                    SetDirtyImmediate();
+                    return;
+                }
+                materialFastDirtyHandles_.insert(handle);
+                fastDirtyHandles_.insert(handle);
+                changed = true;
+                continue;
             }
 
             const bool structureChanged = structureIt->second != state.structureHash;
@@ -655,20 +722,24 @@
             mtlFastScalarHashMap_[handle] = state.fastScalarHash;
             if (structureChanged || scalarChanged || !state.canFastSync) {
                 materialFastDirtyHandles_.clear();
+                ClearMaterialEditHandleCache();
                 SetDirtyImmediate();
                 return;
             }
             if (fastScalarChanged) {
                 materialFastDirtyHandles_.insert(handle);
                 fastDirtyHandles_.insert(handle);
-                QueueFastFlush();
-            } else {
-                MarkMaterialInteractiveActivity();
+                changed = true;
             }
+        }
+
+        if (changed) {
+            QueueFastFlush();
             return;
         }
 
-        MarkMaterialInteractiveActivity();
+        if (cacheStale) ClearMaterialEditHandleCache();
+        MarkInteractiveActivity();
     }
 
     bool IsAnimationPlaying() const {
@@ -1072,6 +1143,87 @@
     void MarkTrackedNodesDirty(const NodeEventNamespace::NodeKeyTab& nodes) {
         for (int i = 0; i < nodes.Count(); ++i) {
                 MarkTrackedNodeDirty(NodeEventNamespace::GetNodeByKey(nodes[i]));
+        }
+    }
+
+    void MarkMaterialNodesDirty(const NodeEventNamespace::NodeKeyTab& nodes, bool structured) {
+        if (nodes.Count() <= 0) return;
+        Interface* ip = GetCOREInterface();
+        if (!ip) return;
+
+        const TimeValue t = ip->GetTime();
+        bool changed = false;
+        bool needsFullSync = false;
+        std::unordered_map<Mtl*, MaterialSyncState> materialStateCache;
+
+        if (structured) ClearMaterialEditHandleCache();
+
+        for (int i = 0; i < nodes.Count(); ++i) {
+            INode* node = NodeEventNamespace::GetNodeByKey(nodes[i]);
+            if (!node) continue;
+            VisitNodeSubtree(node, [this, t, structured, &changed, &needsFullSync, &materialStateCache](INode* current) {
+                const ULONG handle = current->GetHandle();
+                if (!IsTrackedHandle(handle)) return;
+                if (geomHandles_.find(handle) == geomHandles_.end()) return;
+
+                if (structured) {
+                    mtlHashMap_.erase(handle);
+                    mtlScalarHashMap_.erase(handle);
+                    mtlFastScalarHashMap_.erase(handle);
+                    needsFullSync = true;
+                    return;
+                }
+
+                const MaterialSyncState state = ComputeMaterialSyncStateCached(current, t, materialStateCache);
+                auto structureIt = mtlHashMap_.find(handle);
+                auto scalarIt = mtlScalarHashMap_.find(handle);
+                auto fastScalarIt = mtlFastScalarHashMap_.find(handle);
+                if (structureIt == mtlHashMap_.end() ||
+                    scalarIt == mtlScalarHashMap_.end() ||
+                    fastScalarIt == mtlFastScalarHashMap_.end()) {
+                    mtlHashMap_[handle] = state.structureHash;
+                    mtlScalarHashMap_[handle] = state.scalarHash;
+                    mtlFastScalarHashMap_[handle] = state.fastScalarHash;
+                    if (!state.canFastSync) {
+                        needsFullSync = true;
+                        return;
+                    }
+                    materialFastDirtyHandles_.insert(handle);
+                    if (fastDirtyHandles_.insert(handle).second) changed = true;
+                    return;
+                }
+
+                const bool structureChanged = structureIt->second != state.structureHash;
+                const bool scalarChanged = scalarIt->second != state.scalarHash;
+                const bool fastScalarChanged = fastScalarIt->second != state.fastScalarHash;
+                if (!structureChanged && !scalarChanged && !fastScalarChanged) return;
+
+                structureIt->second = state.structureHash;
+                scalarIt->second = state.scalarHash;
+                fastScalarIt->second = state.fastScalarHash;
+
+                if (structureChanged || scalarChanged || !state.canFastSync) {
+                    if (structureChanged) {
+                        groupCache_.erase(handle);
+                        geoHashMap_.erase(handle);
+                        lastBBoxHash_.erase(handle);
+                    }
+                    needsFullSync = true;
+                    return;
+                }
+
+                materialFastDirtyHandles_.insert(handle);
+                if (fastDirtyHandles_.insert(handle).second) changed = true;
+            });
+            if (needsFullSync) break;
+        }
+
+        if (needsFullSync) {
+            materialFastDirtyHandles_.clear();
+            ClearMaterialEditHandleCache();
+            SetDirtyImmediate();
+        } else if (changed) {
+            QueueFastFlush();
         }
     }
 
@@ -1725,6 +1877,7 @@
             mtlHashMap_.clear();
             mtlScalarHashMap_.clear();
             mtlFastScalarHashMap_.clear();
+            ClearMaterialEditHandleCache();
             lightHashMap_.clear();
             splatHashMap_.clear();
             propHashMap_.clear();
@@ -1835,6 +1988,7 @@
             const bool allowIdlePolling = !favorInteractive && ShouldRunIdlePollAudit(now);
             const bool allowRealtimeAuxPolling = allowIdlePolling || animPlaying;
             const bool allowHeavyPolling = !pathTracingFreezePolling;
+            const bool allowMaterialPolling = allowHeavyPolling && allowIdlePolling && !animPlaying;
             const bool allowHeavyGeometryPolling = allowHeavyPolling && !favorInteractive && !animPlaying;
             const bool allowTimelineAuxPolling = !animPlaying;
 
@@ -1842,7 +1996,7 @@
             // These are cheap timestamp checks, unlike the heavier scene/material scans below.
             if (slowPhase == 0) CheckWebContentChanges();
             if (slowPhase == 3) CheckProjectContentChanges();
-            if (allowHeavyPolling && allowIdlePolling && tickCount_ % MATERIAL_DETECT_TICKS == 2) DetectMaterialChanges();
+            if (allowMaterialPolling && tickCount_ % MATERIAL_DETECT_TICKS == 2) DetectMaterialChanges();
             if (allowHeavyPolling && allowIdlePolling && lightPhase == 0) DetectPropertyChanges();
             if (allowTimelineAuxPolling && allowRealtimeAuxPolling && lightPhase == 1) {
                 DetectLightChanges();
@@ -2178,8 +2332,9 @@
         std::vector<ULONG> dirtyHandles;
         dirtyHandles.reserve(fastDirtyHandles_.size());
         for (ULONG handle : fastDirtyHandles_) dirtyHandles.push_back(handle);
+        std::vector<ULONG> deferredHandles;
         if (dirtyHandles.size() > kMaxFastFlushHandlesPerPass) {
-            std::vector<ULONG> deferredHandles(
+            deferredHandles.assign(
                 dirtyHandles.begin() + static_cast<std::ptrdiff_t>(kMaxFastFlushHandlesPerPass),
                 dirtyHandles.end());
             dirtyHandles.resize(kMaxFastFlushHandlesPerPass);
@@ -2203,6 +2358,13 @@
         geoFullDirty.swap(geoFullFastDirtyHandles_);
         std::unordered_set<ULONG> materialDirty;
         materialDirty.swap(materialFastDirtyHandles_);
+        for (ULONG handle : deferredHandles) {
+            auto it = materialDirty.find(handle);
+            if (it != materialDirty.end()) {
+                materialFastDirtyHandles_.insert(handle);
+                materialDirty.erase(it);
+            }
+        }
         std::unordered_set<ULONG> visibilityDirty;
         visibilityDirty.swap(visibilityDirtyHandles_);
 

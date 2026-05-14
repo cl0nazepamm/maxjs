@@ -2158,6 +2158,8 @@ public:
     void HideChanged(NodeKeyTab& nodes) override;
     void GeometryChanged(NodeKeyTab& nodes) override;
     void TopologyChanged(NodeKeyTab& nodes) override;
+    void MaterialStructured(NodeKeyTab& nodes) override;
+    void MaterialOtherEvent(NodeKeyTab& nodes) override;
 
 private:
     MaxJSPanel* owner_;

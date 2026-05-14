@@ -18,6 +18,7 @@
         deformHandles_.clear();
         pluginInstHandles_.clear();
         pluginInstHash_.clear();
+        ClearMaterialEditHandleCache();
         lastSentTransforms_.clear();
 
         std::wostringstream ss;
@@ -378,6 +379,7 @@
 
         // Save previous tracking so we can skip extraction for unchanged nodes
         std::unordered_set<ULONG> prevGeom = std::move(geomHandles_);
+        ClearMaterialEditHandleCache();
         geomHandles_.clear();
         skinnedHandles_.clear();
         lightHandles_.clear();

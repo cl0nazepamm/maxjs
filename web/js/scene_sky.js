@@ -42,7 +42,12 @@ export function createSky({ scene, renderer }) {
     let lastRawParams = null;
     let visible = true;
     let planetaryActive = false;
-    const useLegacySky = !(typeof THREE.WebGPURenderer === 'function' && renderer instanceof THREE.WebGPURenderer);
+    const isWebGpuRenderer = typeof THREE.WebGPURenderer === 'function' && renderer instanceof THREE.WebGPURenderer;
+    const rendererBackendLabel = String(renderer?.userData?.maxjsBackendLabel || '');
+    const useLegacySky = !isWebGpuRenderer;
+    const allowGeospatialSky = rendererBackendLabel
+        ? rendererBackendLabel === 'WebGPU' || rendererBackendLabel.startsWith('WGL2')
+        : isWebGpuRenderer;
     const linkedSunDirection = new THREE.Vector3();
     const linkedSunPosition = new THREE.Vector3();
     const linkedSunTarget = new THREE.Vector3();
@@ -152,7 +157,7 @@ export function createSky({ scene, renderer }) {
         if (sig === lastSig) return { params, changed: false };
         lastSig = sig;
 
-        const planetary = params.model === SKY_MODEL_PLANETARY;
+        const planetary = params.model === SKY_MODEL_PLANETARY && allowGeospatialSky;
         if (planetary) {
             removeClassicObjects();
             geospatialSky ??= createGeospatialSkyController({

@@ -60,7 +60,7 @@
 import * as THREE from 'three';
 
 import { createLayerManager } from './layer_manager.js';
-import { createMaxJSAnimationSystem } from './maxjs_animation.js';
+import { createMaxJSAnimationSystem } from './maxjs_animation.js?v=20260514-loop1';
 import { maxTimeline } from './maxjs_timeline.js';
 import {
     createRenderer as createRendererImpl,
@@ -559,8 +559,14 @@ function applySnapshotUi(snapshotUi, ctx) {
         }
         if (Number.isFinite(cam.fov) && camera.isPerspectiveCamera) {
             camera.fov = cam.fov;
-            camera.updateProjectionMatrix();
         }
+        if (camera.isPerspectiveCamera && Number.isFinite(cam.near) && cam.near > 0) {
+            camera.near = cam.near;
+        }
+        if (camera.isPerspectiveCamera && Number.isFinite(cam.far) && cam.far > camera.near) {
+            camera.far = cam.far;
+        }
+        camera.updateProjectionMatrix();
     }
     applySnapshotCameraClip(camera, snapshotUi.cameraClip);
 
@@ -642,6 +648,13 @@ function applyTopLevelCamera(cam, { camera, controls, scratch, getAspect }) {
         camera.userData.maxjsHorizontalFov = cam.fov;
         applyHorizontalFovToVertical(camera, getAspect?.());
     }
+    if (camera.isPerspectiveCamera && Number.isFinite(cam.near) && cam.near > 0) {
+        camera.near = cam.near;
+    }
+    if (camera.isPerspectiveCamera && Number.isFinite(cam.far) && cam.far > camera.near) {
+        camera.far = cam.far;
+    }
+    camera.updateProjectionMatrix();
 
     if (controls) {
         controls.target.copy(targetWorld);

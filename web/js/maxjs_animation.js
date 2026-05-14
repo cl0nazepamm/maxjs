@@ -105,14 +105,18 @@ function createTrack(THREE, trackDef) {
 
 function applyLoopMode(THREE, action, clipDef) {
     const loop = String(clipDef?.loop ?? 'repeat').trim().toLowerCase();
+    applyActionLoopMode(THREE, action, loop, clipDef?.repetitions);
+    action.clampWhenFinished = clipDef?.clampWhenFinished !== false;
+}
+
+function applyActionLoopMode(THREE, action, loop, repetitions = Infinity) {
     if (loop === 'once') {
         action.setLoop(THREE.LoopOnce, 0);
     } else if (loop === 'pingpong') {
-        action.setLoop(THREE.LoopPingPong, clipDef?.repetitions ?? Infinity);
+        action.setLoop(THREE.LoopPingPong, repetitions ?? Infinity);
     } else {
-        action.setLoop(THREE.LoopRepeat, clipDef?.repetitions ?? Infinity);
+        action.setLoop(THREE.LoopRepeat, repetitions ?? Infinity);
     }
-    action.clampWhenFinished = clipDef?.clampWhenFinished !== false;
 }
 
 function collectRuntimeTargets(root, registry) {
@@ -802,6 +806,19 @@ export function createMaxJSAnimationSystem({
         return true;
     }
 
+    function setClipLoop(clipId, loop, repetitions = Infinity) {
+        const group = clipGroups.get(clipId);
+        if (!group) return false;
+        const normalized = String(loop ?? '').trim().toLowerCase();
+        if (!normalized) return false;
+        group.loop = normalized;
+        for (const entry of group.entries) {
+            applyActionLoopMode(THREE, entry.action, normalized, repetitions);
+        }
+        syncAnimatedTargets();
+        return true;
+    }
+
     function getState() {
         return {
             targetCount: targetRegistry.size,
@@ -817,6 +834,7 @@ export function createMaxJSAnimationSystem({
                 customTargets: group.customEntries.length,
                 playing: group.playing,
                 speed: group.speed,
+                loop: group.loop,
             })),
         };
     }
@@ -873,6 +891,7 @@ export function createMaxJSAnimationSystem({
         setClipPlaying,
         setClipTime,
         setClipSpeed,
+        setClipLoop,
         seekAllClips,
         capturePlaybackState,
         restorePlaybackState,

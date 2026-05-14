@@ -53,14 +53,17 @@
     // Debounced dirty: coalesces rapid-fire notifications (e.g. clone) into one full sync
     static constexpr ULONGLONG DIRTY_DEBOUNCE_MS = 150;
 
-    void SetDirty() {
+    void SetDirty(bool armIdlePollAudit = true) {
+        if (armIdlePollAudit) ArmIdlePollAuditWindow();
         if (!dirty_) {
             dirty_ = true;
             dirtyStamp_ = GetTickCount64();
         }
     }
 
-    void SetDirtyImmediate() {
+    void SetDirtyImmediate(bool armIdlePollAudit = true) {
+        idlePollFullSyncPending_ = false;
+        if (armIdlePollAudit) ArmIdlePollAuditWindow();
         dirty_ = true;
         dirtyStamp_ = 0;  // bypass debounce — sync on next tick
     }

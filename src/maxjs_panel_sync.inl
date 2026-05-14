@@ -515,8 +515,16 @@
     static constexpr ULONGLONG kFullSyncInteractiveDeferMs = 650;
     static constexpr ULONGLONG kMaterialInteractiveCooldownMs = 400;
     static constexpr ULONGLONG kMaterialLivePollIntervalMs = 50;
+    static constexpr ULONGLONG kIdlePollFullSyncMinIntervalMs = 1500;
+    static constexpr ULONGLONG kIdlePollAuditWindowMs = 4000;
     static constexpr size_t kMaxFastFlushHandlesPerPass = 128;
     static constexpr size_t kMaxDeformingGeometryHandlesPerTick = 64;
+    static constexpr size_t kMaxIdleMaterialHandlesPerTick = 16;
+    static constexpr size_t kMaxIdleLightHandlesPerTick = 64;
+    static constexpr size_t kMaxIdleSplatHandlesPerTick = 64;
+    static constexpr size_t kMaxIdleJsModHandlesPerTick = 64;
+    static constexpr size_t kMaxIdlePluginInstanceHandlesPerTick = 16;
+    static constexpr size_t kMaxIdlePropertyHandlesPerTick = 64;
 
     template <typename Fn>
     void VisitBudgetedHandles(const std::vector<ULONG>& handles,
@@ -545,9 +553,62 @@
         lastInteractionTick_ = GetTickCount64();
     }
 
+    void ArmIdlePollAuditWindow() {
+        const ULONGLONG now = GetTickCount64();
+        const ULONGLONG until = now + kIdlePollAuditWindowMs;
+        if (until > idlePollAuditUntilTick_) idlePollAuditUntilTick_ = until;
+    }
+
+    void ClearIdlePollFullSyncCandidates() {
+        idleMaterialFullSyncCandidateHash_.clear();
+        idleJsModFullSyncCandidateHash_.clear();
+        idlePluginInstFullSyncCandidateHash_.clear();
+        idlePropertyFullSyncCandidateHash_.clear();
+    }
+
+    bool ShouldRunIdlePollAudit(ULONGLONG now) {
+        if (idlePollAuditUntilTick_ == 0) return false;
+        if (now <= idlePollAuditUntilTick_) return true;
+        idlePollAuditUntilTick_ = 0;
+        idlePollFullSyncPending_ = false;
+        ClearIdlePollFullSyncCandidates();
+        return false;
+    }
+
+    bool ConfirmIdleFullSyncCandidate(std::unordered_map<ULONG, uint64_t>& candidates,
+                                      ULONG handle,
+                                      uint64_t candidateHash) {
+        auto it = candidates.find(handle);
+        if (it != candidates.end() && it->second == candidateHash) {
+            candidates.erase(it);
+            return true;
+        }
+        candidates[handle] = candidateHash;
+        return false;
+    }
+
     void MarkMaterialInteractiveActivity() {
         lastMaterialInteractionTick_ = GetTickCount64();
         MarkInteractiveActivity();
+    }
+
+    void RequestIdlePollFullSync() {
+        const ULONGLONG now = GetTickCount64();
+        if (nextIdlePollFullSyncTick_ == 0 || now >= nextIdlePollFullSyncTick_) {
+            idlePollFullSyncPending_ = false;
+            nextIdlePollFullSyncTick_ = now + kIdlePollFullSyncMinIntervalMs;
+            SetDirty(false);
+        } else {
+            idlePollFullSyncPending_ = true;
+        }
+    }
+
+    void PumpDeferredIdlePollFullSync(ULONGLONG now) {
+        if (!idlePollFullSyncPending_) return;
+        if (nextIdlePollFullSyncTick_ != 0 && now < nextIdlePollFullSyncTick_) return;
+        idlePollFullSyncPending_ = false;
+        nextIdlePollFullSyncTick_ = now + kIdlePollFullSyncMinIntervalMs;
+        SetDirty(false);
     }
 
     void NotifyMaterialEditedTarget(ReferenceTarget* target) {
@@ -1719,13 +1780,15 @@
         // Poll env+fog at reduced cadence (~200ms)
         if (envPhase == 0) PollEnvFog();
 
+        const ULONGLONG now = GetTickCount64();
+        PumpDeferredIdlePollFullSync(now);
+
         if (dirty_) {
             if (IsAnimationPlaying()) {
                 PumpPlaybackSyncFromTimer();
                 return;
             }
 
-            const ULONGLONG now = GetTickCount64();
             const bool debounceReady =
                 dirtyStamp_ == 0 || (now - dirtyStamp_) >= DIRTY_DEBOUNCE_MS;
             const bool deferForInteraction = ShouldDeferFullSyncForInteraction(now);
@@ -1737,6 +1800,8 @@
             // Debounce: wait for notifications and interactive drags to settle before expensive full sync.
             if (debounceReady && !deferForInteraction) {
                 dirty_ = false;
+                idlePollFullSyncPending_ = false;
+                ClearIdlePollFullSyncCandidates();
                 if (useBinary_) SendFullSyncBinary(); else SendFullSync();
                 pathTracingHasSceneSync_ = true;
             }
@@ -1767,7 +1832,7 @@
             // callback also runs during animation.
 
             const bool favorInteractive = ShouldFavorInteractivePerformance();
-            const bool allowIdlePolling = !favorInteractive;
+            const bool allowIdlePolling = !favorInteractive && ShouldRunIdlePollAudit(now);
             const bool allowRealtimeAuxPolling = allowIdlePolling || animPlaying;
             const bool allowHeavyPolling = !pathTracingFreezePolling;
             const bool allowHeavyGeometryPolling = allowHeavyPolling && !favorInteractive && !animPlaying;
@@ -2863,16 +2928,22 @@
         if (!ip) return;
         TimeValue t = ip->GetTime();
         bool changed = false;
+        bool requestedFullSync = false;
         std::unordered_map<Mtl*, MaterialSyncState> materialStateCache;
+        std::vector<ULONG> handles;
+        handles.reserve(geomHandles_.size());
+        for (ULONG handle : geomHandles_) handles.push_back(handle);
 
-        for (ULONG handle : geomHandles_) {
+        VisitBudgetedHandles(handles, materialScanCursor_, kMaxIdleMaterialHandlesPerTick, [&](ULONG handle) {
+            if (requestedFullSync) return;
             INode* node = ip->GetINodeByHandle(handle);
             if (!node) {
                 mtlHashMap_.erase(handle);
                 mtlScalarHashMap_.erase(handle);
                 mtlFastScalarHashMap_.erase(handle);
                 materialFastDirtyHandles_.erase(handle);
-                continue;
+                idleMaterialFullSyncCandidateHash_.erase(handle);
+                return;
             }
 
             const MaterialSyncState state = ComputeMaterialSyncStateCached(node, t, materialStateCache);
@@ -2886,18 +2957,29 @@
                 mtlHashMap_[handle] = state.structureHash;
                 mtlScalarHashMap_[handle] = state.scalarHash;
                 mtlFastScalarHashMap_[handle] = state.fastScalarHash;
-                continue;
+                return;
             }
 
             const bool structureChanged = structureIt->second != state.structureHash;
             const bool scalarChanged = scalarIt->second != state.scalarHash;
             const bool fastScalarChanged = fastScalarIt->second != state.fastScalarHash;
-            if (!structureChanged && !scalarChanged && !fastScalarChanged) continue;
+            if (!structureChanged && !scalarChanged && !fastScalarChanged) {
+                idleMaterialFullSyncCandidateHash_.erase(handle);
+                return;
+            }
 
-            structureIt->second = state.structureHash;
-            scalarIt->second = state.scalarHash;
-            fastScalarIt->second = state.fastScalarHash;
             if (structureChanged || scalarChanged || !state.canFastSync) {
+                uint64_t candidateHash = HashFNV1a(&state.structureHash, sizeof(state.structureHash));
+                candidateHash = HashFNV1a(&state.scalarHash, sizeof(state.scalarHash), candidateHash);
+                candidateHash = HashFNV1a(&state.fastScalarHash, sizeof(state.fastScalarHash), candidateHash);
+                const uint8_t canFastSync = state.canFastSync ? 1 : 0;
+                candidateHash = HashFNV1a(&canFastSync, sizeof(canFastSync), candidateHash);
+                if (!ConfirmIdleFullSyncCandidate(idleMaterialFullSyncCandidateHash_, handle, candidateHash)) {
+                    return;
+                }
+                structureIt->second = state.structureHash;
+                scalarIt->second = state.scalarHash;
+                fastScalarIt->second = state.fastScalarHash;
                 // Material structure changed — invalidate geometry hash + group cache
                 // so next full sync re-extracts face matIDs for multi-sub materials
                 if (structureChanged) {
@@ -2906,14 +2988,19 @@
                     lastBBoxHash_.erase(handle);
                 }
                 materialFastDirtyHandles_.clear();
-                SetDirty();
+                requestedFullSync = true;
+                RequestIdlePollFullSync();
                 return;
             }
 
+            structureIt->second = state.structureHash;
+            scalarIt->second = state.scalarHash;
+            fastScalarIt->second = state.fastScalarHash;
+            idleMaterialFullSyncCandidateHash_.erase(handle);
             materialFastDirtyHandles_.insert(handle);
             fastDirtyHandles_.insert(handle);
             changed = true;
-        }
+        });
 
         if (changed) QueueFastFlush();
     }
@@ -2924,12 +3011,15 @@
 
         TimeValue t = ip->GetTime();
         bool changed = false;
+        std::vector<ULONG> handles;
+        handles.reserve(lightHandles_.size());
+        for (ULONG handle : lightHandles_) handles.push_back(handle);
 
-        for (ULONG handle : lightHandles_) {
+        VisitBudgetedHandles(handles, lightScanCursor_, kMaxIdleLightHandlesPerTick, [&](ULONG handle) {
             INode* node = ip->GetINodeByHandle(handle);
             if (!node) {
                 lightHashMap_.erase(handle);
-                continue;
+                return;
             }
 
             const uint64_t hash = ComputeLightStateHash(node, t);
@@ -2940,7 +3030,7 @@
                 it->second = hash;
                 if (fastDirtyHandles_.insert(handle).second) changed = true;
             }
-        }
+        });
 
         if (changed) QueueFastFlush();
     }
@@ -2951,10 +3041,13 @@
 
         TimeValue t = ip->GetTime();
         bool changed = false;
+        std::vector<ULONG> handles;
+        handles.reserve(splatHandles_.size());
+        for (ULONG handle : splatHandles_) handles.push_back(handle);
 
-        for (ULONG handle : splatHandles_) {
+        VisitBudgetedHandles(handles, splatScanCursor_, kMaxIdleSplatHandlesPerTick, [&](ULONG handle) {
             INode* node = ip->GetINodeByHandle(handle);
-            if (!node) continue;
+            if (!node) return;
 
             const uint64_t hash = ComputeSplatStateHash(node, t);
             auto it = splatHashMap_.find(handle);
@@ -2964,7 +3057,7 @@
                 it->second = hash;
                 if (fastDirtyHandles_.insert(handle).second) changed = true;
             }
-        }
+        });
 
         if (changed) QueueFastFlush();
     }
@@ -3102,7 +3195,10 @@
                                 QueueFastFlush();
                                 return;
                             } else {
-                                SetDirty();
+                                geoFastDirtyHandles_.insert(handle);
+                                geoFullFastDirtyHandles_.insert(handle);
+                                fastDirtyHandles_.insert(handle);
+                                QueueFastFlush();
                                 return;
                             }
                         }
@@ -3125,26 +3221,42 @@
         Interface* ip = GetCOREInterface();
         if (!ip || geomHandles_.empty()) return;
         const TimeValue t = ip->GetTime();
-        for (ULONG handle : geomHandles_) {
+        bool requestedFullSync = false;
+        std::vector<ULONG> handles;
+        handles.reserve(geomHandles_.size());
+        for (ULONG handle : geomHandles_) handles.push_back(handle);
+        VisitBudgetedHandles(handles, jsmodScanCursor_, kMaxIdleJsModHandlesPerTick, [&](ULONG handle) {
+            if (requestedFullSync) return;
             INode* node = ip->GetINodeByHandle(handle);
-            if (!node) continue;
+            if (!node) {
+                idleJsModFullSyncCandidateHash_.erase(handle);
+                return;
+            }
             JsModData jm;
             GetJsModData(node, t, jm);
             const bool found = jm.found;
             auto it = jsmodStateMap_.find(handle);
             if (it == jsmodStateMap_.end()) {
                 jsmodStateMap_[handle] = found;
-                continue;
+                idleJsModFullSyncCandidateHash_.erase(handle);
+                return;
             }
             if (it->second != found) {
+                const uint64_t candidateHash = found ? 1ULL : 0ULL;
+                if (!ConfirmIdleFullSyncCandidate(idleJsModFullSyncCandidateHash_, handle, candidateHash)) {
+                    return;
+                }
                 it->second = found;
                 geoHashMap_.erase(handle);
                 deformChannelHashMap_.erase(handle);
                 lastLiveGeomHash_.erase(handle);
-                SetDirty();
+                requestedFullSync = true;
+                RequestIdlePollFullSync();
                 return;
+            } else {
+                idleJsModFullSyncCandidateHash_.erase(handle);
             }
-        }
+        });
     }
 
     void DetectPluginInstanceChanges() {
@@ -3152,21 +3264,36 @@
         Interface* ip = GetCOREInterface();
         if (!ip) return;
         TimeValue t = ip->GetTime();
+        bool requestedFullSync = false;
+        std::vector<ULONG> handles;
+        handles.reserve(pluginInstHandles_.size());
+        for (ULONG handle : pluginInstHandles_) handles.push_back(handle);
 
-        for (ULONG handle : pluginInstHandles_) {
+        VisitBudgetedHandles(handles, pluginInstScanCursor_, kMaxIdlePluginInstanceHandlesPerTick, [&](ULONG handle) {
+            if (requestedFullSync) return;
             INode* node = ip->GetINodeByHandle(handle);
-            if (!node) continue;
+            if (!node) {
+                idlePluginInstFullSyncCandidateHash_.erase(handle);
+                return;
+            }
             const uint64_t stateHash = ComputePluginInstanceStateHash(node, t, ip);
 
             auto it = pluginInstHash_.find(handle);
             if (it == pluginInstHash_.end()) {
                 pluginInstHash_[handle] = stateHash;
+                idlePluginInstFullSyncCandidateHash_.erase(handle);
             } else if (it->second != stateHash) {
+                if (!ConfirmIdleFullSyncCandidate(idlePluginInstFullSyncCandidateHash_, handle, stateHash)) {
+                    return;
+                }
                 it->second = stateHash;
-                SetDirty();
+                requestedFullSync = true;
+                RequestIdlePollFullSync();
                 return;
+            } else {
+                idlePluginInstFullSyncCandidateHash_.erase(handle);
             }
-        }
+        });
     }
 
     // Detect object property changes — triggers full sync (same pattern as DetectMaterialChanges)
@@ -3174,21 +3301,36 @@
         Interface* ip = GetCOREInterface();
         if (!ip) return;
         TimeValue t = ip->GetTime();
+        bool requestedFullSync = false;
+        std::vector<ULONG> handles;
+        handles.reserve(geomHandles_.size());
+        for (ULONG handle : geomHandles_) handles.push_back(handle);
 
-        for (ULONG handle : geomHandles_) {
+        VisitBudgetedHandles(handles, propertyScanCursor_, kMaxIdlePropertyHandlesPerTick, [&](ULONG handle) {
+            if (requestedFullSync) return;
             INode* node = ip->GetINodeByHandle(handle);
-            if (!node) continue;
+            if (!node) {
+                idlePropertyFullSyncCandidateHash_.erase(handle);
+                return;
+            }
 
             uint64_t h = ComputeNodePropHash(node, t);
             auto it = propHashMap_.find(handle);
             if (it == propHashMap_.end()) {
                 propHashMap_[handle] = h;
+                idlePropertyFullSyncCandidateHash_.erase(handle);
             } else if (it->second != h) {
+                if (!ConfirmIdleFullSyncCandidate(idlePropertyFullSyncCandidateHash_, handle, h)) {
+                    return;
+                }
                 it->second = h;
-                SetDirty();
+                requestedFullSync = true;
+                RequestIdlePollFullSync();
                 return;
+            } else {
+                idlePropertyFullSyncCandidateHash_.erase(handle);
             }
-        }
+        });
     }
 
     // ── Camera JSON fragment ─────────────────────────────────

@@ -7,6 +7,12 @@ import * as THREE from 'three';
 
 export const FALLBACK_COLOR = 0x888888;
 export const HDR_TEXTURE_EXTS = new Set(['hdr', 'exr']);
+const MAX_SYNC_DRAWABLE_CHANNEL_EXTRACTION_PIXELS = 512 * 512;
+const pendingChannelSelections = new WeakMap();
+const pendingChannelWorkerJobs = new Map();
+const completedChannelSelections = new WeakMap();
+let channelExtractionWorker = null;
+let nextChannelWorkerJobId = 1;
 export const UTILITY_MATERIAL_MODELS = new Set([
     'MeshDepthMaterial',
     'MeshLambertMaterial',
@@ -228,6 +234,332 @@ export function applyTextureTransform(tex, xf) {
     return tex;
 }
 
+function isTypedTextureImage(image) {
+    return image?.data && ArrayBuffer.isView(image.data) && image.width > 0 && image.height > 0;
+}
+
+function halfFloatToNumber(value) {
+    return THREE.DataUtils?.fromHalfFloat ? THREE.DataUtils.fromHalfFloat(value) : value / 65535;
+}
+
+function textureComponentToByte(data, index, tex) {
+    const raw = data[index];
+    if (!Number.isFinite(raw)) return 0;
+    if (data instanceof Uint8Array || data instanceof Uint8ClampedArray) return raw;
+    if (data instanceof Uint16Array) {
+        if (tex?.type === THREE.HalfFloatType) {
+            return Math.round(THREE.MathUtils.clamp(halfFloatToNumber(raw), 0, 1) * 255);
+        }
+        return Math.round(THREE.MathUtils.clamp(raw / 65535, 0, 1) * 255);
+    }
+    if (data instanceof Int8Array || data instanceof Int16Array || data instanceof Int32Array || data instanceof Uint32Array) {
+        return Math.round(THREE.MathUtils.clamp(raw, 0, 255));
+    }
+    return Math.round(THREE.MathUtils.clamp(raw, 0, 1) * 255);
+}
+
+function writeSelectedChannelBytes(r, g, b, a, channel, invert, out, outIndex) {
+    if (channel <= 1) {
+        out[outIndex] = invert ? 255 - r : r;
+        out[outIndex + 1] = invert ? 255 - g : g;
+        out[outIndex + 2] = invert ? 255 - b : b;
+        out[outIndex + 3] = a;
+        return;
+    }
+
+    let value = r;
+    switch (channel) {
+        case 3: value = g; break;
+        case 4: value = b; break;
+        case 5: value = a; break;
+        case 6: value = Math.round((0.2126 * r) + (0.7152 * g) + (0.0722 * b)); break;
+        case 7: value = Math.round((r + g + b) / 3); break;
+        case 2:
+        default: value = r; break;
+    }
+    if (invert) value = 255 - value;
+    out[outIndex] = value;
+    out[outIndex + 1] = value;
+    out[outIndex + 2] = value;
+    out[outIndex + 3] = channel === 5 ? value : a;
+}
+
+function writeSelectedTypedTextureChannel(data, pixelIndex, componentCount, tex, channel, invert, out, outIndex) {
+    const base = pixelIndex * componentCount;
+    const r = textureComponentToByte(data, base, tex);
+    const g = componentCount > 1 ? textureComponentToByte(data, base + 1, tex) : r;
+    const b = componentCount > 2 ? textureComponentToByte(data, base + 2, tex) : r;
+    const a = componentCount > 3 ? textureComponentToByte(data, base + 3, tex) : 255;
+    writeSelectedChannelBytes(r, g, b, a, channel, invert, out, outIndex);
+}
+
+function applyChannelTexture(tex, image, out, signature) {
+    if (pendingChannelSelections.get(tex) !== signature) return;
+    const convertedImage = { data: out, width: image.width, height: image.height };
+    tex.image = convertedImage;
+    tex.format = THREE.RGBAFormat;
+    tex.type = THREE.UnsignedByteType;
+    tex.internalFormat = null;
+    tex.needsUpdate = true;
+    completedChannelSelections.set(tex, { image: convertedImage, signature });
+    pendingChannelSelections.delete(tex);
+}
+
+function applyTypedTextureChannelSelection(tex, image, channel, invert, signature) {
+    const width = image.width;
+    const height = image.height;
+    const pixelCount = width * height;
+    const source = image.data;
+    const componentCount = Math.max(1, Math.floor(source.length / pixelCount));
+    if (!pixelCount || !componentCount) return false;
+
+    const out = new Uint8Array(pixelCount * 4);
+    for (let pixel = 0, outIndex = 0; pixel < pixelCount; pixel += 1, outIndex += 4) {
+        writeSelectedTypedTextureChannel(source, pixel, componentCount, tex, channel, invert, out, outIndex);
+    }
+    applyChannelTexture(tex, image, out, signature);
+    return true;
+}
+
+function installPendingChannelTexture(tex, pendingImage) {
+    tex.image = pendingImage;
+    tex.format = THREE.RGBAFormat;
+    tex.type = THREE.UnsignedByteType;
+    tex.internalFormat = null;
+    tex.needsUpdate = true;
+}
+
+function createChannelExtractionWorker() {
+    if (channelExtractionWorker) return channelExtractionWorker;
+    if (typeof Worker === 'undefined' || typeof Blob === 'undefined' || typeof URL === 'undefined') return null;
+
+    const workerSource = `
+const ARRAY_TYPES = {
+  Uint8Array, Uint8ClampedArray, Uint16Array, Int8Array, Int16Array, Int32Array, Uint32Array, Float32Array, Float64Array
+};
+
+function halfFloatToNumber(value) {
+  const s = (value & 0x8000) >> 15;
+  const e = (value & 0x7c00) >> 10;
+  const f = value & 0x03ff;
+  if (e === 0) return (s ? -1 : 1) * Math.pow(2, -14) * (f / 1024);
+  if (e === 0x1f) return f ? NaN : ((s ? -1 : 1) * Infinity);
+  return (s ? -1 : 1) * Math.pow(2, e - 15) * (1 + f / 1024);
+}
+
+function clamp01(value) {
+  return Math.min(1, Math.max(0, value));
+}
+
+function componentToByte(data, index, sourceType, isHalfFloat) {
+  const raw = data[index];
+  if (!Number.isFinite(raw)) return 0;
+  if (sourceType === 'Uint8Array' || sourceType === 'Uint8ClampedArray') return raw;
+  if (sourceType === 'Uint16Array') {
+    return Math.round(clamp01(isHalfFloat ? halfFloatToNumber(raw) : raw / 65535) * 255);
+  }
+  if (sourceType === 'Int8Array' || sourceType === 'Int16Array' || sourceType === 'Int32Array' || sourceType === 'Uint32Array') {
+    return Math.round(Math.min(255, Math.max(0, raw)));
+  }
+  return Math.round(clamp01(raw) * 255);
+}
+
+function writeBytes(r, g, b, a, channel, invert, out, outIndex) {
+  if (channel <= 1) {
+    out[outIndex] = invert ? 255 - r : r;
+    out[outIndex + 1] = invert ? 255 - g : g;
+    out[outIndex + 2] = invert ? 255 - b : b;
+    out[outIndex + 3] = a;
+    return;
+  }
+  let value = r;
+  switch (channel) {
+    case 3: value = g; break;
+    case 4: value = b; break;
+    case 5: value = a; break;
+    case 6: value = Math.round((0.2126 * r) + (0.7152 * g) + (0.0722 * b)); break;
+    case 7: value = Math.round((r + g + b) / 3); break;
+    case 2:
+    default: value = r; break;
+  }
+  if (invert) value = 255 - value;
+  out[outIndex] = value;
+  out[outIndex + 1] = value;
+  out[outIndex + 2] = value;
+  out[outIndex + 3] = channel === 5 ? value : a;
+}
+
+self.onmessage = event => {
+  const job = event.data;
+  try {
+    const TypedArray = ARRAY_TYPES[job.sourceType] || Float32Array;
+    const sourceLength = Math.floor(job.sourceByteLength / TypedArray.BYTES_PER_ELEMENT);
+    const source = new TypedArray(job.sourceBuffer, job.sourceByteOffset || 0, sourceLength);
+    const pixelCount = job.width * job.height;
+    const componentCount = Math.max(1, Math.floor(source.length / pixelCount));
+    const out = new Uint8Array(pixelCount * 4);
+    for (let pixel = 0, outIndex = 0; pixel < pixelCount; pixel += 1, outIndex += 4) {
+      const base = pixel * componentCount;
+      const r = componentToByte(source, base, job.sourceType, job.isHalfFloat);
+      const g = componentCount > 1 ? componentToByte(source, base + 1, job.sourceType, job.isHalfFloat) : r;
+      const b = componentCount > 2 ? componentToByte(source, base + 2, job.sourceType, job.isHalfFloat) : r;
+      const a = componentCount > 3 ? componentToByte(source, base + 3, job.sourceType, job.isHalfFloat) : 255;
+      writeBytes(r, g, b, a, job.channel, job.invert, out, outIndex);
+    }
+    self.postMessage({ id: job.id, width: job.width, height: job.height, buffer: out.buffer }, [out.buffer]);
+  } catch (error) {
+    self.postMessage({ id: job.id, error: String(error && error.message || error) });
+  }
+};
+`;
+
+    try {
+        const blob = new Blob([workerSource], { type: 'text/javascript' });
+        const url = URL.createObjectURL(blob);
+        channelExtractionWorker = new Worker(url);
+        channelExtractionWorker.onmessage = (event) => {
+            const { id, width, height, buffer, error } = event.data || {};
+            const job = pendingChannelWorkerJobs.get(id);
+            if (!job) return;
+            pendingChannelWorkerJobs.delete(id);
+            if (error) {
+                console.warn('[material_contract] channel extraction failed:', error);
+                if (pendingChannelSelections.get(job.tex) === job.signature) {
+                    pendingChannelSelections.delete(job.tex);
+                }
+                return;
+            }
+            if (pendingChannelSelections.get(job.tex) !== job.signature) return;
+            if (job.tex.image !== job.pendingImage) {
+                pendingChannelSelections.delete(job.tex);
+                return;
+            }
+            const convertedImage = { data: new Uint8Array(buffer), width, height };
+            job.tex.image = convertedImage;
+            job.tex.format = THREE.RGBAFormat;
+            job.tex.type = THREE.UnsignedByteType;
+            job.tex.internalFormat = null;
+            job.tex.needsUpdate = true;
+            completedChannelSelections.set(job.tex, { image: convertedImage, signature: job.signature });
+            pendingChannelSelections.delete(job.tex);
+        };
+        channelExtractionWorker.onerror = (error) => {
+            console.warn('[material_contract] channel extraction worker failed:', error);
+        };
+    } catch (error) {
+        console.warn('[material_contract] channel extraction worker unavailable:', error);
+        channelExtractionWorker = null;
+    }
+    return channelExtractionWorker;
+}
+
+function channelSelectionKey(image, channel, invert) {
+    return `${image?.width || 0}x${image?.height || 0}:${image?.data?.length || 0}:${channel}:${invert ? 1 : 0}`;
+}
+
+function hasCompletedChannelSelection(tex, image, signature) {
+    const completed = completedChannelSelections.get(tex);
+    return completed?.image === image && completed?.signature === signature;
+}
+
+function scheduleTypedTextureChannelSelection(tex, image, channel, invert) {
+    const width = image.width;
+    const height = image.height;
+    const pixelCount = width * height;
+    const source = image.data;
+    if (!pixelCount || !source?.length) return false;
+
+    const signature = `typed:${channelSelectionKey(image, channel, invert)}`;
+    if (hasCompletedChannelSelection(tex, image, signature)) return true;
+    if (pendingChannelSelections.has(tex)) return true;
+    pendingChannelSelections.set(tex, signature);
+
+    const worker = createChannelExtractionWorker();
+    if (!worker) return applyTypedTextureChannelSelection(tex, image, channel, invert, signature);
+
+    const id = nextChannelWorkerJobId++;
+    const pendingImage = { data: new Uint8Array([255, 255, 255, 255]), width: 1, height: 1 };
+    const sourceBuffer = source.buffer;
+    pendingChannelWorkerJobs.set(id, { tex, pendingImage, signature });
+    try {
+        worker.postMessage({
+            id,
+            width,
+            height,
+            sourceType: source.constructor?.name || 'Float32Array',
+            sourceBuffer,
+            sourceByteOffset: source.byteOffset,
+            sourceByteLength: source.byteLength,
+            isHalfFloat: tex?.type === THREE.HalfFloatType,
+            channel,
+            invert,
+        }, [sourceBuffer]);
+        installPendingChannelTexture(tex, pendingImage);
+    } catch (error) {
+        pendingChannelWorkerJobs.delete(id);
+        console.warn('[material_contract] channel extraction worker transfer failed:', error);
+        pendingChannelSelections.set(tex, signature);
+        return applyTypedTextureChannelSelection(tex, image, channel, invert, signature);
+    }
+    return true;
+}
+
+function scheduleDeferredTask(callback) {
+    setTimeout(callback, 0);
+}
+
+function isDrawableImageSource(image) {
+    if (!image) return false;
+    return (typeof HTMLCanvasElement !== 'undefined' && image instanceof HTMLCanvasElement) ||
+        (typeof HTMLImageElement !== 'undefined' && image instanceof HTMLImageElement) ||
+        (typeof HTMLVideoElement !== 'undefined' && image instanceof HTMLVideoElement) ||
+        (typeof ImageBitmap !== 'undefined' && image instanceof ImageBitmap) ||
+        (typeof OffscreenCanvas !== 'undefined' && image instanceof OffscreenCanvas) ||
+        (typeof SVGImageElement !== 'undefined' && image instanceof SVGImageElement) ||
+        (typeof VideoFrame !== 'undefined' && image instanceof VideoFrame);
+}
+
+function applyCanvasChannelSelection(tex, image, width, height, channel, invert, signature) {
+    const canvas = document.createElement('canvas');
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    if (!ctx) return false;
+    ctx.drawImage(image, 0, 0, width, height);
+    const imageData = ctx.getImageData(0, 0, width, height);
+    const { data } = imageData;
+    for (let i = 0; i < data.length; i += 4) {
+        const r = data[i];
+        const g = data[i + 1];
+        const b = data[i + 2];
+        const a = data[i + 3];
+        writeSelectedChannelBytes(r, g, b, a, channel, invert, data, i);
+    }
+    ctx.putImageData(imageData, 0, 0);
+    tex.image = canvas;
+    tex.needsUpdate = true;
+    if (signature) completedChannelSelections.set(tex, { image: canvas, signature });
+    return true;
+}
+
+function scheduleCanvasChannelSelection(tex, image, width, height, channel, invert) {
+    const signature = `canvas:${width}x${height}:${channel}:${invert ? 1 : 0}`;
+    if (hasCompletedChannelSelection(tex, image, signature)) return true;
+    if (pendingChannelSelections.has(tex)) return true;
+    pendingChannelSelections.set(tex, signature);
+    scheduleDeferredTask(() => {
+        if (pendingChannelSelections.get(tex) !== signature) return;
+        try {
+            if (tex.image === image) applyCanvasChannelSelection(tex, image, width, height, channel, invert, signature);
+        } catch (error) {
+            console.warn('[material_contract] channel extraction failed:', error);
+        } finally {
+            if (pendingChannelSelections.get(tex) === signature) pendingChannelSelections.delete(tex);
+        }
+    });
+    return true;
+}
+
 export function applyTextureChannelSelection(tex, xf) {
     const channel = xf?.channel ?? 1;
     const invert = !!xf?.invert;
@@ -236,48 +568,24 @@ export function applyTextureChannelSelection(tex, xf) {
     const image = tex?.image;
     const width = image?.width ?? image?.videoWidth ?? 0;
     const height = image?.height ?? image?.videoHeight ?? 0;
-    if (!width || !height || typeof document === 'undefined') return tex;
+    if (!width || !height) return tex;
+
+    if (isTypedTextureImage(image)) {
+        scheduleTypedTextureChannelSelection(tex, image, channel, invert);
+        return tex;
+    }
+
+    const pixelCount = width * height;
+    if (typeof document === 'undefined' || !isDrawableImageSource(image)) return tex;
+    const signature = `canvas:${width}x${height}:${channel}:${invert ? 1 : 0}`;
+    if (hasCompletedChannelSelection(tex, image, signature)) return tex;
+    if (pixelCount > MAX_SYNC_DRAWABLE_CHANNEL_EXTRACTION_PIXELS) {
+        scheduleCanvasChannelSelection(tex, image, width, height, channel, invert);
+        return tex;
+    }
 
     try {
-        const canvas = document.createElement('canvas');
-        canvas.width = width;
-        canvas.height = height;
-        const ctx = canvas.getContext('2d', { willReadFrequently: true });
-        if (!ctx) return tex;
-        ctx.drawImage(image, 0, 0, width, height);
-        const imageData = ctx.getImageData(0, 0, width, height);
-        const { data } = imageData;
-        for (let i = 0; i < data.length; i += 4) {
-            const r = data[i];
-            const g = data[i + 1];
-            const b = data[i + 2];
-            const a = data[i + 3];
-            if (channel <= 1) {
-                data[i] = invert ? 255 - r : r;
-                data[i + 1] = invert ? 255 - g : g;
-                data[i + 2] = invert ? 255 - b : b;
-                data[i + 3] = a;
-                continue;
-            }
-            let value = r;
-            switch (channel) {
-                case 3: value = g; break;
-                case 4: value = b; break;
-                case 5: value = a; break;
-                case 6: value = Math.round((0.2126 * r) + (0.7152 * g) + (0.0722 * b)); break;
-                case 7: value = Math.round((r + g + b) / 3); break;
-                case 2:
-                default: value = r; break;
-            }
-            if (invert) value = 255 - value;
-            data[i] = value;
-            data[i + 1] = value;
-            data[i + 2] = value;
-            data[i + 3] = channel === 5 ? value : a;
-        }
-        ctx.putImageData(imageData, 0, 0);
-        tex.image = canvas;
-        tex.needsUpdate = true;
+        applyCanvasChannelSelection(tex, image, width, height, channel, invert, signature);
     } catch (error) {
         console.warn('[material_contract] channel extraction failed:', error);
     }

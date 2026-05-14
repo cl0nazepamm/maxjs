@@ -91,7 +91,6 @@ export function createSky({ scene, renderer }) {
     }
 
     function update(_dt, elapsed, camera) {
-        refreshLinkedSun();
         if (!planetaryActive) return;
         geospatialSky?.update({ camera, elapsedSeconds: elapsed });
     }
@@ -133,16 +132,6 @@ export function createSky({ scene, renderer }) {
             sunDirectionWorld: [linkedDir.x, linkedDir.y, linkedDir.z],
             sunLinkedLight: true,
         };
-    }
-
-    function refreshLinkedSun() {
-        if (!lastRawParams) return false;
-        const params = { ...SKY_FALLBACKS, ...withLinkedSun(lastRawParams) };
-        if (!params.sunLinkedLight) return false;
-        const sig = JSON.stringify(params);
-        if (sig === lastSig) return false;
-        apply(lastRawParams);
-        return true;
     }
 
     function apply(rawParams) {

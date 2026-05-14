@@ -3009,18 +3009,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
 
         function updateSkyTime(elapsedSeconds) {
             if (!skyActive || !skyPlanetaryActive) return;
-            refreshSkyFromLinkedSun();
             geospatialSky?.update({ camera, elapsedSeconds });
-        }
-
-        function refreshSkyFromLinkedSun() {
-            if (!skyActive || !lastSkySourceParams) return false;
-            const params = normalizeSkyParams(withLinkedSkySun(lastSkySourceParams));
-            if (!params.sunLinkedLight) return false;
-            const sig = JSON.stringify(params);
-            if (sig === lastSkySig) return false;
-            applySky(lastSkySourceParams);
-            return true;
         }
 
         function refreshSkyAmbientLightProbeFromCurrentSky() {
@@ -6438,7 +6427,6 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             if (ssgiFx.setMainLight) {
                 ssgiFx.setMainLight(mainDirectionalLight || (defaultLights.visible ? defaultKey : null));
             }
-            refreshSkyFromLinkedSun();
             markLightProbeSceneDirty();
             scheduleLightProbeFromCurrentScene({ delay: 350 });
         }
@@ -8593,7 +8581,6 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             if (ssgiFx.setMainLight) {
                 ssgiFx.setMainLight(mainDirectionalLight || (defaultLights.visible ? defaultKey : null));
             }
-            refreshSkyFromLinkedSun();
         }
 
         // ── Scene Camera Lock ────────────────────────────────

@@ -9,6 +9,12 @@
     std::uint32_t nextFrameId_ = 1;
     int tickCount_ = 0;
     size_t geoScanCursor_ = 0;
+    size_t materialScanCursor_ = 0;
+    size_t lightScanCursor_ = 0;
+    size_t splatScanCursor_ = 0;
+    size_t jsmodScanCursor_ = 0;
+    size_t pluginInstScanCursor_ = 0;
+    size_t propertyScanCursor_ = 0;
     size_t deformLiveScanCursor_ = 0;
     std::unordered_set<ULONG> geomHandles_;
     std::unordered_set<ULONG> lightHandles_;
@@ -79,6 +85,13 @@
     bool pendingTimelineCameraCheck_ = false;
     bool playbackFlushPending_ = false;
     TimeValue playbackFlushTime_ = 0;
+    ULONGLONG idlePollAuditUntilTick_ = 0;
+    bool idlePollFullSyncPending_ = false;
+    ULONGLONG nextIdlePollFullSyncTick_ = 0;
+    std::unordered_map<ULONG, uint64_t> idleMaterialFullSyncCandidateHash_;
+    std::unordered_map<ULONG, uint64_t> idleJsModFullSyncCandidateHash_;
+    std::unordered_map<ULONG, uint64_t> idlePluginInstFullSyncCandidateHash_;
+    std::unordered_map<ULONG, uint64_t> idlePropertyFullSyncCandidateHash_;
     bool haveLastSentCamera_ = false;
     ULONGLONG dirtyStamp_ = 0;   // when dirty_ was last set (for debounce)
     ULONGLONG lastMaterialInteractionTick_ = 0;

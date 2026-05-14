@@ -106,6 +106,8 @@
     bool pathTracingFreezeSync_ = false;
     bool pathTracingViewerActive_ = false;
     bool pathTracingHasSceneSync_ = false;
+    bool slowJsonSyncMode_ = false;
+    ULONGLONG lastSlowJsonSyncTick_ = 0;
     SceneEventNamespace::CallbackKey fastNodeEventCallbackKey_ = 0;
     bool callbacksRegistered_ = false;
     MaxJSFastNodeEventCallback fastNodeEvents_;

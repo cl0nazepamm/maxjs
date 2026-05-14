@@ -69,10 +69,6 @@
                 <button class="rail-mode-option" type="button" data-render-mode="studio" title="Studio render mode">STU</button>
                 <button class="rail-mode-option" type="button" data-render-mode="pathtracing" title="Pathtracing render mode">PT</button>
             </div>
-            <button id="btnPathTraceFreeze" class="rail-btn pathtrace-only devonly" title="Freeze Max scene sync while pathtracing" aria-label="Freeze pathtracing sync">
-                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="7" width="10" height="7" rx="1"/><path d="M5 7V5a3 3 0 0 1 6 0v2"/><path d="M8 10v2"/></svg>
-                <span class="rail-btn-label">FRZ</span>
-            </button>
             <button id="btnLightLink" class="rail-btn devonly" title="Light Linking" aria-label="Light Linking">
                 <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6.5 8.5a2.5 2.5 0 0 0 3.5 0l2.5-2.5a2.5 2.5 0 0 0-3.5-3.5L8 3.5"/><path d="M9.5 7.5a2.5 2.5 0 0 0-3.5 0L3.5 10a2.5 2.5 0 0 0 3.5 3.5L8 12.5"/></svg>
             </button>
@@ -103,6 +99,7 @@
             <button id="btnRefresh" class="rail-btn maxonly devonly" title="Refresh" aria-label="Refresh">
                 <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13.5 4.5a6 6 0 1 0 1.5 4"/><path d="M14 2v3h-3"/></svg>
             </button>
+            <button id="btnLiveSync" class="rail-btn rail-btn-text maxonly devonly active" title="Live fast sync enabled" aria-label="Toggle sync mode">LIVE</button>
             <button id="btnLightHelpers" class="rail-btn devonly" title="Light helpers" aria-label="Light helpers">
                 <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 12.5h4M6.5 14h3"/><path d="M4.5 8.5a4 4 0 1 1 7 0c-.5 1-1.5 1.5-1.5 3h-4c0-1.5-1-2-1.5-3Z"/></svg>
             </button>
@@ -829,10 +826,13 @@
 
         const DEBUG_STORAGE_KEY = 'maxjs_debug';
         const PROFILE_SCENE_STORAGE_KEY = 'maxjs_profile_scene';
+        const SLOW_JSON_SYNC_STORAGE_KEY = 'maxjs_slow_json_sync';
+        const LEGACY_LIVE_SYNC_DISABLED_STORAGE_KEY = 'maxjs_live_sync_disabled';
         const isStandalone = !(window.chrome?.webview?.postMessage);
         const urlMode = new URLSearchParams(location.search).get('mode');
         let buildMode = urlMode || (isStandalone ? 'release' : 'dev');
         let debugMode = false;
+        let slowJsonSyncMode = false;
 
         function syncAudioMuteButtonUi() {
             const button = document.getElementById('btnMuteAudio');
@@ -862,6 +862,13 @@
             }
         } catch (_) {
             debugMode = !isStandalone;
+        }
+        try {
+            slowJsonSyncMode =
+                localStorage.getItem(SLOW_JSON_SYNC_STORAGE_KEY) === 'true' ||
+                localStorage.getItem(LEGACY_LIVE_SYNC_DISABLED_STORAGE_KEY) === 'true';
+        } catch (_) {
+            slowJsonSyncMode = false;
         }
         function maxjsDebugLog(...args) {
             if (debugMode) console.log(...args);
@@ -950,17 +957,6 @@
             return Math.max(1.0, Math.min(1000.0, n));
         }
 
-        function syncPathTracingSettingsUi() {
-            const freezeButton = document.getElementById('btnPathTraceFreeze');
-            if (freezeButton) {
-                freezeButton.classList.toggle('active', pathTracingSettings.freezeSync === true);
-                freezeButton.setAttribute('aria-pressed', pathTracingSettings.freezeSync ? 'true' : 'false');
-                freezeButton.title = pathTracingSettings.freezeSync
-                    ? 'Pathtracing sync is frozen'
-                    : 'Freeze Max scene sync while pathtracing';
-            }
-        }
-
         function resetPathTracingStartupWarmup() {
             pathTracingRasterWarmupFrames = 0;
             pathTracingWarmupStartedAt = 0;
@@ -1032,7 +1028,6 @@
             if (sendHost && window.chrome?.webview) {
                 sendPathTracingRuntimeState();
             }
-            syncPathTracingSettingsUi();
             if (notify && isPathTracingMode) {
                 perfHud.setStatus(
                     `max.js - PT samples/frame ${pathTracingSettings.samplesPerFrame}, GI clamp ${pathTracingSettings.giClamp.toFixed(1)}, sync ${pathTracingSettings.freezeSync ? 'frozen' : 'live'}`,
@@ -4118,6 +4113,46 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         };
         const pendingHostActions = new Map();
         let nextHostActionId = 1;
+
+        function syncLiveSyncButtonUi() {
+            const button = document.getElementById('btnLiveSync');
+            if (!button) return;
+            button.textContent = slowJsonSyncMode ? 'SLOW' : 'LIVE';
+            button.classList.toggle('active', !slowJsonSyncMode);
+            button.classList.toggle('is-gated', slowJsonSyncMode);
+            button.setAttribute('aria-pressed', slowJsonSyncMode ? 'false' : 'true');
+            button.title = slowJsonSyncMode
+                ? 'Slow JSON sync: fastsync callbacks disabled'
+                : 'Live fast sync enabled';
+            button.setAttribute('aria-label', slowJsonSyncMode ? 'Switch to live fast sync' : 'Switch to slow JSON sync');
+        }
+
+        function applyLiveSyncSettings(next = {}, { notify = false, sendHost = false, persist = true } = {}) {
+            if (next.disabled != null) slowJsonSyncMode = next.disabled === true;
+            if (persist) {
+                try {
+                    localStorage.setItem(SLOW_JSON_SYNC_STORAGE_KEY, slowJsonSyncMode ? 'true' : 'false');
+                    localStorage.removeItem(LEGACY_LIVE_SYNC_DISABLED_STORAGE_KEY);
+                } catch {}
+            }
+            syncLiveSyncButtonUi();
+            if (sendHost && window.chrome?.webview) {
+                bridge.send('live_sync_settings', { disabled: slowJsonSyncMode });
+            }
+            if (notify) {
+                perfHud.setStatus(`max.js - ${slowJsonSyncMode ? 'slow JSON sync' : 'live fast sync'}`);
+            }
+        }
+
+        document.getElementById('btnLiveSync')?.addEventListener('click', () => {
+            applyLiveSyncSettings({ disabled: !slowJsonSyncMode }, { notify: true, sendHost: true });
+        });
+
+        bridge.on('live_sync_settings', msg => {
+            applyLiveSyncSettings({ disabled: msg.disabled === true }, { notify: true, sendHost: false });
+        });
+
+        applyLiveSyncSettings({ disabled: slowJsonSyncMode }, { sendHost: true, persist: false });
 
         bridge.on('pathtracing_settings', msg => {
             applyPathTracingSettings({
@@ -9317,13 +9352,6 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 });
             });
         }
-        const btnPathTraceFreeze = document.getElementById('btnPathTraceFreeze');
-        btnPathTraceFreeze?.addEventListener('click', () => {
-            applyPathTracingSettings({
-                freezeSync: !pathTracingSettings.freezeSync,
-            }, { notify: true, sendHost: true });
-        });
-        syncPathTracingSettingsUi();
         btnSwitchFallback?.addEventListener('click', () => {
             if (isWgl2FallbackBackendActive()) {
                 perfHud.setStatus('max.js - TSL_GL Mode is active');

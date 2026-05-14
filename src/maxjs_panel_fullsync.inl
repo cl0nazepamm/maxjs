@@ -892,7 +892,7 @@
 
     // ── Transform-only sync ──────────────────────────────────
 
-    void SendTransformSync(const std::vector<ULONG>* handles = nullptr) {
+    void SendTransformSync(const std::vector<ULONG>* handles = nullptr, bool includeMaterialScalars = true) {
         if (!handles && !HasTrackedNodes()) return;
         Interface* ip = GetCOREInterface();
         if (!ip) return;
@@ -935,11 +935,12 @@
             float xform[16]; GetTransform16(node, t, xform);
             RememberSentTransform(handle, xform);
 
-            // Lightweight material scalars (no texture walks)
             float col[3] = {0.8f,0.8f,0.8f};
             float rough = 0.5f, metal = 0.0f, opac = 1.0f;
-            Mtl* foundMtl = FindSupportedMaterial(node->GetMtl());
-            ExtractMaterialScalarPreview(foundMtl, node, t, col, rough, metal, opac);
+            if (includeMaterialScalars) {
+                Mtl* foundMtl = FindSupportedMaterial(node->GetMtl());
+                ExtractMaterialScalarPreview(foundMtl, node, t, col, rough, metal, opac);
+            }
 
             const bool visible = IsMaxJsSyncDrawVisible(node);
 
@@ -951,8 +952,8 @@
             ss << L",\"t\":"; WriteFloats(ss, xform, 16);
             // For Multi/Sub objects, skip scalar material pushes to avoid
             // corrupting material arrays on the web side.
-            Mtl* multiMtl = FindMultiSubMtl(node->GetMtl());
-            if (!(multiMtl && multiMtl->NumSubMtls() > 1)) {
+            Mtl* multiMtl = includeMaterialScalars ? FindMultiSubMtl(node->GetMtl()) : nullptr;
+            if (includeMaterialScalars && !(multiMtl && multiMtl->NumSubMtls() > 1)) {
                 ss << L",\"mat\":{\"color\":[";
                 WriteFloatValue(ss, col[0], 0.8f); ss << L',';
                 WriteFloatValue(ss, col[1], 0.8f); ss << L',';

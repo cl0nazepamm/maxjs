@@ -52,8 +52,10 @@
 
     // Debounced dirty: coalesces rapid-fire notifications (e.g. clone) into one full sync
     static constexpr ULONGLONG DIRTY_DEBOUNCE_MS = 150;
+    static constexpr ULONGLONG SLOW_JSON_SYNC_INTERVAL_MS = 1000;
 
     void SetDirty(bool armIdlePollAudit = true) {
+        if (slowJsonSyncMode_) return;
         if (armIdlePollAudit) ArmIdlePollAuditWindow();
         if (!dirty_) {
             dirty_ = true;
@@ -62,6 +64,7 @@
     }
 
     void SetDirtyImmediate(bool armIdlePollAudit = true) {
+        if (slowJsonSyncMode_) return;
         idlePollFullSyncPending_ = false;
         if (armIdlePollAudit) ArmIdlePollAuditWindow();
         dirty_ = true;
@@ -81,6 +84,7 @@
     }
 
     void QueueFastFlush() {
+        if (slowJsonSyncMode_) return;
         if (!hwnd_ || fastFlushPosted_) return;
         if (dirty_ && !CanFlushFastPathDuringPendingFullSync()) return;
         if (suppressFastFlushPost_) return;
@@ -91,6 +95,7 @@
     }
 
     void FlushFastPathNow() {
+        if (slowJsonSyncMode_) return;
         if (fastFlushInProgress_) {
             QueueFastFlush();
             return;

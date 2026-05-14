@@ -1578,6 +1578,7 @@
     }
 
     void RegisterCallbacks() {
+        if (slowJsonSyncMode_) return;
         if (callbacksRegistered_) return;
         RegisterNotification(OnSceneChanged, this, NOTIFY_SCENE_ADDED_NODE);
         RegisterNotification(OnSceneChanged, this, NOTIFY_SCENE_PRE_DELETED_NODE);
@@ -1625,12 +1626,18 @@
     }
 
     bool ShouldKeepCallbacksRegistered() const {
+        if (slowJsonSyncMode_) return false;
         if (!hwnd_ || !IsWindow(hwnd_)) return false;
         if (renderLocked_ || asCapturing_ || IsViewportHosted()) return true;
         return IsWindowVisible(hwnd_) && !IsIconic(hwnd_);
     }
 
     void RefreshCallbackRegistration(bool forceFullSyncOnResume = false) {
+        if (slowJsonSyncMode_) {
+            UnregisterCallbacks();
+            StartSyncPump();
+            return;
+        }
         if (ShouldKeepCallbacksRegistered()) {
             RegisterCallbacks();
             if (forceFullSyncOnResume) {
@@ -1640,6 +1647,41 @@
         } else {
             UnregisterCallbacks();
         }
+    }
+
+    void SendLiveSyncSettings() {
+        if (!webview_) return;
+        std::wostringstream ss;
+        ss << L"{\"type\":\"live_sync_settings\",\"disabled\":"
+           << (slowJsonSyncMode_ ? L"true" : L"false")
+           << L",\"mode\":\"" << (slowJsonSyncMode_ ? L"slow-json" : L"live-fast") << L"\"}";
+        webview_->PostWebMessageAsJson(ss.str().c_str());
+    }
+
+    void SetSlowJsonSyncMode(bool enabled) {
+        if (slowJsonSyncMode_ == enabled) {
+            SendLiveSyncSettings();
+            return;
+        }
+
+        slowJsonSyncMode_ = enabled;
+        lastSlowJsonSyncTick_ = 0;
+        ResetFastPathState(true);
+        idlePollFullSyncPending_ = false;
+        idlePollAuditUntilTick_ = 0;
+        ClearIdlePollFullSyncCandidates();
+        ClearMaterialEditHandleCache();
+
+        if (slowJsonSyncMode_) {
+            dirty_ = false;
+            dirtyStamp_ = 0;
+            UnregisterCallbacks();
+            StartSyncPump();
+        } else {
+            RefreshCallbackRegistration(true);
+        }
+
+        SendLiveSyncSettings();
     }
 
     void OnWebMessage(const wchar_t* json) {
@@ -1680,6 +1722,12 @@
             ExtractJsonBool(msg, L"freezeSync", freezeSync);
             ExtractJsonBool(msg, L"active", viewerActive);
             SetPathTracingRuntimeSettings(samplesPerFrame, giClamp, freezeSync, viewerActive);
+            return;
+        }
+        if (type == L"live_sync_settings") {
+            bool disabled = false;
+            ExtractJsonBool(msg, L"disabled", disabled);
+            SetSlowJsonSyncMode(disabled);
             return;
         }
         // Layer mount/remove or host-side sync repair — full resend without reloading WebView2
@@ -1923,6 +1971,16 @@
         if (!jsReady_ || !webview_) return;
         tickCount_++;
 
+        const ULONGLONG now = GetTickCount64();
+        if (slowJsonSyncMode_) {
+            if (lastSlowJsonSyncTick_ == 0 ||
+                (now - lastSlowJsonSyncTick_) >= SLOW_JSON_SYNC_INTERVAL_MS) {
+                lastSlowJsonSyncTick_ = now;
+                SendTransformSync(nullptr, false);
+            }
+            return;
+        }
+
         const int envPhase = tickCount_ % ENV_FOG_POLL_TICKS;
         const int lightPhase = tickCount_ % LIGHT_DETECT_TICKS;
         const int slowPhase = tickCount_ % 15;
@@ -1933,7 +1991,6 @@
         // Poll env+fog at reduced cadence (~200ms)
         if (envPhase == 0) PollEnvFog();
 
-        const ULONGLONG now = GetTickCount64();
         PumpDeferredIdlePollFullSync(now);
 
         if (dirty_) {

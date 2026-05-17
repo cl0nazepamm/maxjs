@@ -3979,6 +3979,12 @@
             ss << L",\"viewWidth\":";
             WriteFloatValue(ss, cam.viewWidth, 500.0f);
         }
+        if (cam.clipEnabled) {
+            ss << L",\"near\":";
+            WriteFloatValue(ss, cam.nearClip, 1.0f);
+            ss << L",\"far\":";
+            WriteFloatValue(ss, cam.farClip, 100000.0f);
+        }
         ss << L",\"dofEnabled\":" << (cam.dofEnabled ? L"true" : L"false");
         if (cam.dofEnabled) {
             ss << L",\"dofFocusDistance\":";

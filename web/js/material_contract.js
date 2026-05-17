@@ -213,6 +213,26 @@ export function applyTextureUvChannel(tex, maxMapChannel, fallbackMaxChannel = 1
     return tex;
 }
 
+export function maxMapChannelFromMapName(value, fallbackMaxChannel = 2) {
+    const fallback = Number.isFinite(Number(fallbackMaxChannel))
+        ? Math.max(1, Math.round(Number(fallbackMaxChannel)))
+        : 2;
+    let filename = String(value ?? '');
+    try {
+        const baseUrl = typeof location !== 'undefined' ? location.href : 'http://maxjs.local/';
+        const parsed = new URL(filename, baseUrl);
+        filename = parsed.pathname.split('/').pop() || filename;
+    } catch {
+        filename = filename.split(/[?#]/, 1)[0].split(/[\\/]/).pop() || filename;
+    }
+    try {
+        filename = decodeURIComponent(filename);
+    } catch {}
+    const baseName = filename.replace(/\.[^./\\]+$/, '');
+    const match = baseName.match(/(?:^|[_.\-\s])UV([12])(?:$|[_.\-\s])/i);
+    return match ? Number(match[1]) : fallback;
+}
+
 export function applyTextureTransform(tex, xf) {
     if (!tex) return tex;
     tex.wrapS = tex.wrapT = wrapModeToThree(xf?.wrap);

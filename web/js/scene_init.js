@@ -164,7 +164,7 @@ export function createScene({ renderer, canvas } = {}) {
     const cameraDefaultPosition = copyMaxComponentsToWorld(new THREE.Vector3(), 200, -200, 150);
 
     const initialSize = measureCanvasSize(canvas ?? renderer.domElement);
-    const camera = new THREE.PerspectiveCamera(60, initialSize.width / initialSize.height, 0.1, 100000);
+    const camera = new THREE.PerspectiveCamera(60, initialSize.width / initialSize.height, 1, 100000);
     camera.up.set(0, 1, 0);
     camera.position.copy(cameraDefaultPosition);
     camera.layers.enable(MAXJS_LAYER_SSR_EXCLUDE);

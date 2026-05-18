@@ -294,6 +294,7 @@
         import { createMaxJSAudioSystem } from './js/maxjs_audio.js';
         import { createMaxJSGLTFSystem } from './js/maxjs_gltf.js';
         import { createProjectRuntime } from './js/project_runtime.js';
+        import * as css3dOverlay from './js/css3d_overlay.js';
         import { getOrCreateHTMLTexture, releaseHTMLTexture, disposeAllHTMLTextures, attachHTMLClickForwarding } from './js/html_texture.js';
         import { createCanvasPanel } from './js/canvas_panel.js';
         import { createShaderLabFx } from './js/shader_lab_fx.js';
@@ -1277,6 +1278,7 @@
         let hdriLoadGeneration = 0;
         let lightProbeSceneRevision = 0;
         let lightProbeRefreshTimer = 0;
+        let lightProbeGridActive = null;
 
         // Local HDRI override (independent of Max environment)
         let localHdriObjectUrl = null;   // file loaded in memory
@@ -1322,6 +1324,10 @@
             const useGrid = lightProbeEnabled && hasLightProbeGridData && !!lightProbeGrid;
             lightProbe.intensity = lightProbeEnabled && !useGrid ? lightProbeIntensity : 0.0;
             if (lightProbeGrid) lightProbeGrid.visible = useGrid;
+            if (lightProbeGridActive !== useGrid) {
+                lightProbeGridActive = useGrid;
+                markLightProbeMaterialsDirty();
+            }
         }
 
         function clearLightProbe() {
@@ -1601,11 +1607,34 @@
             lightProbeSceneRevision += 1;
         }
 
+        function markLightProbeMaterialsDirty() {
+            const seen = new WeakSet();
+            const markMaterial = (material) => {
+                if (!material || seen.has(material)) return;
+                seen.add(material);
+                if (material.isMeshBasicMaterial || material.isLineBasicMaterial || material.isLineDashedMaterial) return;
+                if (material.visible === false) return;
+                material.needsUpdate = true;
+            };
+            scene.traverse((object) => {
+                if (!object?.material) return;
+                if (Array.isArray(object.material)) {
+                    for (const material of object.material) markMaterial(material);
+                } else {
+                    markMaterial(object.material);
+                }
+            });
+        }
+
         function currentLightProbeSceneSignature() {
             const bounds = computeLightProbeGridBounds(new THREE.Box3());
             const center = bounds.getCenter(new THREE.Vector3());
             const size = bounds.getSize(new THREE.Vector3());
             const quantize = (value) => Math.round(Number(value || 0) * 1000) / 1000;
+            let bakeSignature = '';
+            try {
+                bakeSignature = bakeStateSignature();
+            } catch {}
             return JSON.stringify([
                 'scene-grid',
                 currentHdriUrl || null,
@@ -1613,6 +1642,7 @@
                 !!scene.environment,
                 defaultLights.visible,
                 lastLightsSignature,
+                bakeSignature,
                 nodeMap.size,
                 lightProbeSceneRevision,
                 center.toArray().map(quantize),
@@ -2684,6 +2714,9 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
 
             // Exposure
             renderer.toneMappingExposure = Math.pow(2, envParams.exp || 0) * (envParams.gamma || 1.0);
+            // Post FX owns the final view transform; Max HDRI exposure is
+            // environment metadata and must not stomp a restored custom look.
+            applyCoreToneMappingState({ markOutput: false });
 
             const rot = (envParams.rot || 0) * Math.PI / 180;
             scene.environmentRotation.set(0, -rot, 0);
@@ -3119,6 +3152,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     scene.backgroundRotation.set(0, 0, 0);
 
                     geospatialSky.apply(params, { camera });
+                    applyCoreToneMappingState({ markOutput: false });
                     setDefaultLightsVisible(false);
                     clearLightProbe();
                     hasLightProbeData = true;
@@ -3162,6 +3196,8 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 }
 
                 renderer.toneMappingExposure = params.exposure;
+                // Keep the user-selected Post FX tonemapper/exposure authoritative.
+                applyCoreToneMappingState({ markOutput: false });
 
                 if (skyMesh.parent !== scene) scene.add(skyMesh);
 
@@ -4746,8 +4782,8 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             const names = bakeFilenameHasExplicitUvChannel(exact)
                 ? [exact]
                 : [
-                    `${stem}_UV1.${extension}`,
                     `${stem}_UV2.${extension}`,
+                    `${stem}_UV1.${extension}`,
                     exact,
                     ...(suffix ? [`${stem}.${extension}`] : []),
                 ];
@@ -7856,6 +7892,8 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             if (changed) {
                 ssgiFx.markSceneChanged?.();
                 ssgiFx.markOutputChanged?.();
+                markLightProbeSceneDirty();
+                scheduleLightProbeFromCurrentScene({ delay: 250 });
             }
             return changed;
         }
@@ -9869,6 +9907,15 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         let currentExposure = 1.0;
         let currentAAMode = 'off'; // 'traa' | 'off' (MSAA option removed — was a no-op with the deferred MRT pipeline)
 
+        function applyCoreToneMappingState({ markOutput = true } = {}) {
+            renderer.toneMapping = toneMappingModes[currentToneMapping] ?? toneMappingModes[DEFAULT_TONE_MAPPING];
+            renderer.toneMappingExposure = currentExposure;
+            renderer.userData ??= {};
+            renderer.userData.maxjsToneMappingMode = currentToneMapping;
+            renderer.userData.maxjsToneMappingExposure = currentExposure;
+            if (markOutput) ssgiFx.markOutputChanged?.();
+        }
+
         const postFxSections = [
             {
                 key: 'ssgi',
@@ -10511,9 +10558,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     }
                 }
                 applyRendererPerformanceSettings({ resizePostFx: true });
-                renderer.toneMapping = toneMappingModes[currentToneMapping];
-                renderer.toneMappingExposure = currentExposure;
-                ssgiFx.markOutputChanged?.();
+                applyCoreToneMappingState();
                 try { localStorage.removeItem(POSTFX_STORAGE_KEY); localStorage.removeItem('maxjs_panel_width'); } catch {}
                 postPanel.style.width = '';
                 setRightDockWidth(240);
@@ -10555,8 +10600,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             // Tone mapping controls
             document.getElementById('fx-tonemapping-mode').onchange = (e) => {
                 currentToneMapping = e.target.value;
-                renderer.toneMapping = toneMappingModes[currentToneMapping];
-                ssgiFx.markOutputChanged?.();
+                applyCoreToneMappingState();
                 savePostFxState();
             };
             const expSlider = document.getElementById('fx-tonemapping-exp');
@@ -10564,8 +10608,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             expSlider.oninput = (e) => {
                 const ev = parseFloat(e.target.value);
                 currentExposure = Math.pow(2, ev);
-                renderer.toneMappingExposure = currentExposure;
-                ssgiFx.markOutputChanged?.();
+                applyCoreToneMappingState();
                 expLabel.textContent = `${ev >= 0 ? '+' : ''}${ev.toFixed(1)} EV`;
             };
             expSlider.onchange = () => savePostFxState();
@@ -11163,15 +11206,13 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 let toneMappingChanged = false;
                 if (saved.toneMapping && toneMappingModes[saved.toneMapping] != null) {
                     currentToneMapping = saved.toneMapping;
-                    renderer.toneMapping = toneMappingModes[currentToneMapping];
                     toneMappingChanged = true;
                 }
                 if (Number.isFinite(saved.exposure)) {
                     currentExposure = saved.exposure;
-                    renderer.toneMappingExposure = currentExposure;
                     toneMappingChanged = true;
                 }
-                if (toneMappingChanged) ssgiFx.markOutputChanged?.();
+                if (toneMappingChanged) applyCoreToneMappingState();
                 if (saved.aaMode && ['msaa', 'traa', 'off'].includes(saved.aaMode)) {
                     // Legacy saved value: 'msaa' was a no-op alias for 'off' — normalize.
                     const loaded = saved.aaMode === 'msaa' ? 'off' : saved.aaMode;
@@ -11192,6 +11233,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     lightProbeEnabled = saved.lightProbeEnabled;
                     btnLightProbe.classList.toggle('active', lightProbeEnabled);
                     applyLightProbeState();
+                    if (lightProbeEnabled) refreshLightProbeFromCurrentHDRI();
                 }
 
                 // Restore HDRI settings (file must be re-picked, but sliders persist)
@@ -11366,6 +11408,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 splatOverlay.renderer.domElement.style.width = innerWidth + 'px';
                 splatOverlay.renderer.domElement.style.height = innerHeight + 'px';
             }
+            css3dOverlay.setSize(innerWidth, innerHeight);
             clearTimeout(resizeTimer);
             resizeTimer = setTimeout(() => {
                 applyRendererPerformanceSettings({ resizePostFx: false });
@@ -11778,6 +11821,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             } finally {
                 layerManager.afterRender?.(frameElapsed);
             }
+            css3dOverlay.tick(scene, camera);
             // Clone blob overlay — draw bounding rects on 2D canvas
             if (ssgiFx.isCloneEnabled() && !renderToImageActive) {
                 ssgiFx.drawBlobOverlay(blobOverlayCtx, blobOverlayCvs.width, blobOverlayCvs.height);

@@ -729,8 +729,8 @@ export function createMaterialBuilder({ rootUrl = '.', bakeState = null } = {}) 
         const names = bakeFilenameHasExplicitUvChannel(exact)
             ? [exact]
             : [
-                `${stem}_UV1.${extension}`,
                 `${stem}_UV2.${extension}`,
+                `${stem}_UV1.${extension}`,
                 exact,
                 ...(suffix ? [`${stem}.${extension}`] : []),
             ];

@@ -19,6 +19,7 @@ import {
     setSnapshotTargetId,
 } from './layer_ownership.js';
 import { freezePlainObject, normalizeFolder, normalizePriority } from './layer_utils.js';
+import { createWebappLayer } from './webapp_layer.js';
 
 const MAX_CONSECUTIVE_ERRORS = 60;
 
@@ -465,6 +466,13 @@ export function createLayerManager({
             },
         });
 
+        const ctxRef = { current: null };
+        const webappFacade = freezePlainObject({
+            create(spec) {
+                return createWebappLayer(ctxRef.current, THREE, spec);
+            },
+        });
+
         const busFacade = freezePlainObject({
             on(event, handler) {
                 if (typeof event !== 'string' || !event) throw new TypeError('bus.on: event must be a non-empty string');
@@ -619,7 +627,7 @@ export function createLayerManager({
             },
         });
 
-        return {
+        const ctx = {
             layer: freezePlainObject({ id: layer.id, name: layer.name }),
             group: layer.group,
             overlayGroup: layer.overlayGroup,
@@ -648,10 +656,13 @@ export function createLayerManager({
             project: projectFacade,
             bus: busFacade,
             services: servicesFacade,
+            webapp: webappFacade,
             track(resource, options = {}) {
                 return jsFacade.track(resource, options);
             },
         };
+        ctxRef.current = ctx;
+        return ctx;
     }
 
     function syncAnchors(layer, syncCache) {

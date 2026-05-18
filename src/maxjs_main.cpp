@@ -2364,19 +2364,263 @@ public:
         return L"webgl";
     }
 
-    static bool SnapshotBeautyBakeEnabled(const std::wstring& snapshotUiJson) {
-        const std::wstring lower = LowerAsciiCopy(snapshotUiJson);
-        const size_t bakePos = lower.find(L"\"bake\"");
-        if (bakePos == std::wstring::npos) return false;
-        const size_t len = std::min<size_t>(lower.size() - bakePos, 1024);
-        const std::wstring bakeSlice = lower.substr(bakePos, len);
+    struct BeautyBakeExportState {
+        bool active = false;
+        std::wstring match = L"scene";
+        std::wstring folderPath;
+        std::wstring sceneName = L"scene";
+        std::wstring suffix = L"_beauty";
+        std::wstring extension = L"png";
+    };
+
+    static bool JsonRangeHasLiteral(const std::wstring& json,
+                                    size_t start,
+                                    size_t end,
+                                    const std::wstring& literal) {
+        if (start == std::wstring::npos || end == std::wstring::npos || start >= end) return false;
+        const std::wstring lower = LowerAsciiCopy(json.substr(start, end - start));
+        return lower.find(LowerAsciiCopy(literal)) != std::wstring::npos;
+    }
+
+    static std::wstring TrimBakeFolderPath(std::wstring path) {
+        std::replace(path.begin(), path.end(), L'/', L'\\');
+        while (!path.empty() && (path.back() == L'\\' || path.back() == L'/')) {
+            path.pop_back();
+        }
+        return path;
+    }
+
+    static std::wstring SanitizeBakeFileStemCpp(const std::wstring& value) {
+        std::wstring result;
+        result.reserve(value.size());
+        bool pendingUnderscore = false;
+        auto flushUnderscore = [&]() {
+            if (!result.empty() && result.back() != L'_') result.push_back(L'_');
+        };
+        for (wchar_t ch : value) {
+            const bool invalid =
+                ch == L'\\' || ch == L'/' || ch == L':' || ch == L'*' ||
+                ch == L'?' || ch == L'"' || ch == L'<' || ch == L'>' || ch == L'|';
+            if (invalid || std::iswspace(ch)) {
+                pendingUnderscore = true;
+                continue;
+            }
+            if (pendingUnderscore) {
+                flushUnderscore();
+                pendingUnderscore = false;
+            }
+            result.push_back(ch);
+        }
+        while (!result.empty() && result.front() == L'_') result.erase(result.begin());
+        while (!result.empty() && result.back() == L'_') result.pop_back();
+        return result.empty() ? L"scene" : result;
+    }
+
+    static bool IsBakeUvTokenBoundary(wchar_t ch) {
+        return ch == L'_' || ch == L'.' || ch == L'-' || std::iswspace(ch) != 0;
+    }
+
+    static int BakeUvChannelFromMapName(const std::wstring& filename) {
+        std::wstring base = filename;
+        const size_t slash = base.find_last_of(L"/\\");
+        if (slash != std::wstring::npos) base = base.substr(slash + 1);
+        const size_t dot = base.find_last_of(L'.');
+        if (dot != std::wstring::npos) base = base.substr(0, dot);
+        base = LowerAsciiCopy(base);
+
+        for (size_t pos = 0; pos + 2 < base.size(); ++pos) {
+            if (base[pos] != L'u' || base[pos + 1] != L'v') continue;
+            const wchar_t channel = base[pos + 2];
+            if (channel != L'1' && channel != L'2') continue;
+            const bool beforeOk = pos == 0 || IsBakeUvTokenBoundary(base[pos - 1]);
+            const bool afterOk = pos + 3 >= base.size() || IsBakeUvTokenBoundary(base[pos + 3]);
+            if (beforeOk && afterOk) return channel == L'1' ? 1 : 2;
+        }
+        return 0;
+    }
+
+    static std::vector<std::wstring> BuildBakeFilenameCandidatesCpp(const std::wstring& stem,
+                                                                    const std::wstring& suffix,
+                                                                    const std::wstring& extension) {
+        std::vector<std::wstring> names;
+        auto add = [&](const std::wstring& name) {
+            if (std::find(names.begin(), names.end(), name) == names.end()) names.push_back(name);
+        };
+        const std::wstring ext = extension.empty() || extension.front() != L'.'
+            ? L"." + extension
+            : extension;
+        const std::wstring exact = stem + suffix + ext;
+        if (BakeUvChannelFromMapName(exact) != 0) {
+            add(exact);
+        } else {
+            add(stem + L"_UV2" + ext);
+            add(stem + L"_UV1" + ext);
+            add(exact);
+            if (!suffix.empty()) add(stem + ext);
+        }
+        return names;
+    }
+
+    BeautyBakeExportState DetectBeautyBakeExportState(const std::wstring& snapshotUiJson) {
+        BeautyBakeExportState state;
+        const size_t bakeKey = snapshotUiJson.find(L"\"bake\":{");
+        if (bakeKey == std::wstring::npos) return state;
+        const size_t bakeObj = snapshotUiJson.find(L'{', bakeKey);
+        const size_t bakeEnd = FindJsonObjectEnd(snapshotUiJson, bakeObj);
+        if (bakeEnd == std::wstring::npos) return state;
+
         const bool enabled =
-            bakeSlice.find(L"\"enabled\":true") != std::wstring::npos ||
-            bakeSlice.find(L"\"enabled\": true") != std::wstring::npos;
+            JsonRangeHasLiteral(snapshotUiJson, bakeObj, bakeEnd, L"\"enabled\":true") ||
+            JsonRangeHasLiteral(snapshotUiJson, bakeObj, bakeEnd, L"\"enabled\": true");
         const bool beauty =
-            bakeSlice.find(L"\"mode\":\"beauty\"") != std::wstring::npos ||
-            bakeSlice.find(L"\"mode\": \"beauty\"") != std::wstring::npos;
-        return enabled && beauty;
+            JsonRangeHasLiteral(snapshotUiJson, bakeObj, bakeEnd, L"\"mode\":\"beauty\"") ||
+            JsonRangeHasLiteral(snapshotUiJson, bakeObj, bakeEnd, L"\"mode\": \"beauty\"");
+        if (!enabled || !beauty) return state;
+
+        state.active = true;
+        ExtractJsonStringInRange(snapshotUiJson, bakeObj, bakeEnd, L"match", state.match);
+        ExtractJsonStringInRange(snapshotUiJson, bakeObj, bakeEnd, L"sceneName", state.sceneName);
+        ExtractJsonStringInRange(snapshotUiJson, bakeObj, bakeEnd, L"beautySuffix", state.suffix);
+        ExtractJsonStringInRange(snapshotUiJson, bakeObj, bakeEnd, L"extension", state.extension);
+        state.match = LowerAsciiCopy(state.match);
+        if (state.match != L"object" && state.match != L"material") state.match = L"scene";
+        if (state.sceneName.empty()) state.sceneName = L"scene";
+        if (state.extension.empty()) state.extension = L"png";
+        if (!state.extension.empty() && state.extension.front() == L'.') state.extension.erase(state.extension.begin());
+
+        std::wstring folderUrl;
+        if (ExtractJsonStringInRange(snapshotUiJson, bakeObj, bakeEnd, L"folder", folderUrl) && !folderUrl.empty()) {
+            std::wstring localPath;
+            if (ResolveVirtualHostUrl(folderUrl, localPath)) {
+                state.folderPath = TrimBakeFolderPath(localPath);
+            } else if (folderUrl.size() >= 3 && folderUrl[1] == L':' &&
+                       (folderUrl[2] == L'\\' || folderUrl[2] == L'/')) {
+                state.folderPath = TrimBakeFolderPath(folderUrl);
+            }
+        }
+        return state;
+    }
+
+    static void AddBeautyBakeTargetStem(std::vector<std::wstring>& stems,
+                                        const std::wstring& value) {
+        const std::wstring stem = SanitizeBakeFileStemCpp(value);
+        if (std::find(stems.begin(), stems.end(), stem) == stems.end()) stems.push_back(stem);
+    }
+
+    static std::vector<std::wstring> GetBeautyBakeTargetStems(INode* node,
+                                                             const SnapshotNodeRecord& snapshotNode,
+                                                             const BeautyBakeExportState& state) {
+        std::vector<std::wstring> stems;
+        if (state.match == L"object") {
+            AddBeautyBakeTargetStem(stems, node ? std::wstring(node->GetName()) : L"node");
+        } else if (state.match == L"material") {
+            Mtl* mtl = node ? node->GetMtl() : nullptr;
+            Mtl* multiMtl = FindMultiSubMtl(mtl);
+            if (multiMtl && multiMtl->NumSubMtls() > 0 && snapshotNode.groups.size() > 1) {
+                for (const MatGroup& group : snapshotNode.groups) {
+                    Mtl* subMtl = GetSubMtlFromMatID(multiMtl, group.matID);
+                    if (!subMtl) continue;
+                    MSTR name = subMtl->GetName();
+                    AddBeautyBakeTargetStem(stems, name.data());
+                }
+            }
+            if (stems.empty() && mtl) {
+                MSTR name = mtl->GetName();
+                AddBeautyBakeTargetStem(stems, name.data());
+            }
+            if (stems.empty()) AddBeautyBakeTargetStem(stems, L"material");
+        } else {
+            AddBeautyBakeTargetStem(stems, state.sceneName);
+        }
+        return stems;
+    }
+
+    static std::vector<std::wstring> GetBeautyBakeTargetStems(const ForestInstanceGroup& group,
+                                                             const BeautyBakeExportState& state) {
+        std::vector<std::wstring> stems;
+        if (state.match == L"object") {
+            AddBeautyBakeTargetStem(
+                stems,
+                group.mtlNode ? std::wstring(group.mtlNode->GetName()) : L"instance");
+        } else if (state.match == L"material") {
+            Mtl* multiMtl = FindMultiSubMtl(group.mtl);
+            if (multiMtl && multiMtl->NumSubMtls() > 0 && group.groups.size() > 1) {
+                for (const MatGroup& matGroup : group.groups) {
+                    Mtl* subMtl = GetSubMtlFromMatID(multiMtl, matGroup.matID);
+                    if (!subMtl) continue;
+                    MSTR name = subMtl->GetName();
+                    AddBeautyBakeTargetStem(stems, name.data());
+                }
+            }
+            if (stems.empty() && group.mtl) {
+                MSTR name = group.mtl->GetName();
+                AddBeautyBakeTargetStem(stems, name.data());
+            }
+            if (stems.empty()) AddBeautyBakeTargetStem(stems, L"material");
+        } else {
+            AddBeautyBakeTargetStem(stems, state.sceneName);
+        }
+        return stems;
+    }
+
+    static int ResolveBeautyBakeStemUvChannel(const BeautyBakeExportState& state,
+                                              const std::wstring& stem) {
+        const std::vector<std::wstring> candidates =
+            BuildBakeFilenameCandidatesCpp(stem, state.suffix, state.extension);
+        if (!state.folderPath.empty() && !DirectoryExists(state.folderPath)) return 0;
+        const bool hasResolvableFolder = !state.folderPath.empty();
+        for (const std::wstring& filename : candidates) {
+            const int channel = BakeUvChannelFromMapName(filename);
+            if (hasResolvableFolder) {
+                const std::filesystem::path path =
+                    std::filesystem::path(state.folderPath) / std::filesystem::path(filename);
+                if (FileExists(path.wstring())) return channel != 0 ? channel : 2;
+                continue;
+            }
+            if (channel != 0) return channel;
+        }
+        if (hasResolvableFolder) return 0;
+        return 2;
+    }
+
+    static int RequiredBeautyBakeUvMask(INode* node,
+                                        const SnapshotNodeRecord& snapshotNode,
+                                        const BeautyBakeExportState& state) {
+        if (!state.active) return 0;
+        int mask = 0;
+        for (const std::wstring& stem : GetBeautyBakeTargetStems(node, snapshotNode, state)) {
+            const int channel = ResolveBeautyBakeStemUvChannel(state, stem);
+            if (channel == 1) mask |= 1;
+            else if (channel == 2) mask |= 2;
+        }
+        return mask;
+    }
+
+    static int RequiredBeautyBakeUvMask(const ForestInstanceGroup& group,
+                                        const BeautyBakeExportState& state) {
+        if (!state.active) return 0;
+        int mask = 0;
+        for (const std::wstring& stem : GetBeautyBakeTargetStems(group, state)) {
+            const int channel = ResolveBeautyBakeStemUvChannel(state, stem);
+            if (channel == 1) mask |= 1;
+            else if (channel == 2) mask |= 2;
+        }
+        return mask;
+    }
+
+    static void TrimBeautyBakeUnusedUvs(SnapshotNodeRecord& snapshotNode,
+                                        int requiredUvMask) {
+        if (snapshotNode.spline) return;
+        const size_t vertCount = snapshotNode.verts.size() / 3;
+        if (snapshotNode.uvs.size() / 2 != vertCount) snapshotNode.uvs.clear();
+        if (snapshotNode.uv2s.size() / 2 != vertCount) snapshotNode.uv2s.clear();
+        if ((requiredUvMask & 1) == 0) snapshotNode.uvs.clear();
+        if ((requiredUvMask & 2) == 0) snapshotNode.uv2s.clear();
+    }
+
+    static void TrimBeautyBakeUnusedUvs(ForestInstanceGroup& group,
+                                        int requiredUvMask) {
+        if ((requiredUvMask & 1) == 0) group.uvs.clear();
     }
 
     static bool HasHtmlTextureSlot(const MaxJSPBR& pbr) {
@@ -2558,6 +2802,7 @@ public:
         AddUniqueRuntimeFeature(runtimeFeatures.threeAddons, L"OrbitControls");
         DetectSnapshotPostFxFeatures(runtimeFeatures, snapshotUiJson);
         AccumulateSidecarRuntimeFeatures(runtimeFeatures, projectManifestPath, inlineLayerDir);
+        const BeautyBakeExportState beautyBakeExportState = DetectBeautyBakeExportState(snapshotUiJson);
 
         std::function<void(INode*)> collect = [&](INode* parent) {
             for (int i = 0; i < parent->NumberOfChildren(); ++i) {
@@ -2661,6 +2906,12 @@ public:
                         }
                     }
 
+                    if (beautyBakeExportState.active) {
+                        TrimBeautyBakeUnusedUvs(
+                            snapshotNode,
+                            RequiredBeautyBakeUvMask(node, snapshotNode, beautyBakeExportState));
+                    }
+
                     // Calculate ALL binary offsets after skin/morph extraction
                     // (bind pose replaces verts/uvs/norms/indices — use final sizes)
                     snapshotNode.vOff = totalBytes;
@@ -2735,6 +2986,11 @@ public:
             if (group.verts.empty() || group.indices.empty() ||
                 group.transforms.size() < static_cast<size_t>(group.instanceCount) * 16) {
                 continue;
+            }
+            if (beautyBakeExportState.active) {
+                TrimBeautyBakeUnusedUvs(
+                    group,
+                    RequiredBeautyBakeUvMask(group, beautyBakeExportState));
             }
 
             ReserveBinaryFloatRange(totalBytes, group.verts, group.vOff, group.vN);

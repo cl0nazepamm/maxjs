@@ -2,7 +2,7 @@
 
 This file records how realtime sync currently works in MaxJS and what was changed to make it reliable for live editing.
 
-Date: 2026-04-07
+Date: 2026-05-15
 
 Terminology used elsewhere in docs:
 
@@ -24,7 +24,7 @@ The design goal is:
 
 ## High-Level Design
 
-There are two sync modes:
+There are three sync modes:
 
 1. Full sync
    Sends the whole scene state.
@@ -33,6 +33,11 @@ There are two sync modes:
 2. Fast sync
    Sends only what changed.
    Used for transforms, camera, selection, visibility, lights, material scalars, and live geometry edits.
+
+3. Slow JSON sync
+   Debug mode exposed as `SLOW` in the viewer rail.
+   Stops fast native callbacks/material event churn and polls lightweight JSON `xform` state at low frequency.
+   It is meant for isolating 3ds Max stutter in heavy scenes without fully disabling viewer updates.
 
 The producer is native C++ in `src/maxjs_main.cpp`.
 The consumer is the Three.js app in `web/index.html` plus binary delta decoding in `web/js/protocol.js`.
@@ -72,6 +77,16 @@ Examples:
 
 This whole delta path is what we refer to as `fastsync`.
 
+### Slow JSON sync
+
+- `live_sync_settings`
+  Browser-to-host toggle for normal `LIVE` mode versus `SLOW` JSON mode.
+- `xform`
+  In `SLOW`, the native side sends this at a low cadence with transforms, camera, lights, splats, audio, and glTF state.
+  Material scalar extraction is skipped in this mode to avoid the Max-side material walk that can cause stutter in complex scenes.
+
+`SLOW` intentionally does not queue full scene syncs or fast flushes. New geometry/topology/texture structure may require switching back to `LIVE`, refreshing, or triggering a normal scene rebuild. Existing object transforms, visibility, camera, and light state continue to update.
+
 ### Other messages
 
 - `env_update`
@@ -97,6 +112,10 @@ Important flags and caches:
   Material scalar-only fast updates.
 - `fastCameraDirty_`
   Camera delta needed.
+- `slowJsonSyncMode_`
+  Debug sync mode flag. When true, callbacks are unregistered but the timer pump stays alive for low-frequency `xform` JSON polling.
+- `lastSlowJsonSyncTick_`
+  Last low-frequency JSON poll tick.
 - `lastSentTransforms_`
   Last transform per tracked handle.
 - `geoHashMap_`
@@ -367,7 +386,7 @@ Tracked on redraw:
 - node transforms
 - selection
 - visibility
-- camera matrix and target
+- camera matrix, target, FOV, and near/far clip when provided by Max manual clipping or render `ViewParams`
 
 This is the simplest and cheapest part of the sync system.
 
@@ -391,6 +410,17 @@ Use full sync for:
 - Multi/Sub material edits
 - plugin-instance changes that affect generated structure
 - anything where the web-side object graph must be rebuilt
+
+Use slow JSON sync for:
+
+- debugging scenes where fast material/event sync is suspected of stuttering 3ds Max
+- keeping existing transforms/camera/lights alive at a lower cadence without walking material graphs
+
+Do not use slow JSON sync for:
+
+- validating topology creation/deletion behavior
+- texture/map structure edits
+- measuring normal live viewport responsiveness
 
 ## Recent Work Summary
 
@@ -467,6 +497,9 @@ Fix: `IsCreateTaskActive()` check added so creation mode gets the same redraw-dr
 - Light and material fast sync rely on redraws for the best feel.
   If Max is not redrawing, timer polling is still the fallback.
 
+- Slow JSON sync deliberately skips material scalar extraction and full rebuild scheduling.
+  It is a diagnostic mode, not a replacement for normal `LIVE` sync.
+
 - The MCP bridge is separate from MaxJS and is not required for this sync path.
 
 ## Design Principles To Keep
@@ -508,10 +541,10 @@ Check these first:
 6. Is `CheckSelectedGeometryLive` being throttled or skipped? It must run on every redraw with no guards.
 7. Is anything doing per-mesh extraction inside `TimeChanged`? That callback must only mark dirty, never extract.
 8. Is the full sync debounce missing? Without it, rapid-fire `SetDirty` calls trigger expensive full syncs every 33ms tick.
-
 9. Are `geoHashMap_` writes using the same hash function as `DetectGeometryChanges`? A domain mismatch causes infinite full sync loops.
 10. Is `MarkGeometryTopologyDirty` escalating to full sync for the selected node? Parametric objects fire `TopologyChanged` on every parameter drag — selected nodes must route through `geo_fast`.
 11. Is `ShouldRunInteractiveGeometryChecks` returning false for the active task mode? It must cover Create, Modify, and SubObject modes.
+12. Is the viewer in `SLOW` mode? If yes, fast callbacks and full rebuild scheduling are intentionally suppressed.
 
 ### What went wrong before (lesson from 38f09c4)
 

@@ -7966,8 +7966,8 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             bakeOverrides = previous;
             const lightPreview = bakePanel.querySelector('#bake-light-preview');
             const beautyPreview = bakePanel.querySelector('#bake-beauty-preview');
-            if (lightPreview) lightPreview.textContent = `Light: ${sampleLight}`;
-            if (beautyPreview) beautyPreview.textContent = `Beauty: ${sampleBeauty}`;
+            if (lightPreview) lightPreview.innerHTML = `<span class="bake-path-label">Light</span>${escapeBakeHtml(sampleLight)}`;
+            if (beautyPreview) beautyPreview.innerHTML = `<span class="bake-path-label">Beauty</span>${escapeBakeHtml(sampleBeauty)}`;
         }
 
         function getBakeTargetPreviewRows(limit = 8) {
@@ -7989,6 +7989,17 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 if (rows.length >= limit) break;
             }
             return rows;
+        }
+
+        function renderBakeTargetPreview(rows) {
+            if (!rows.length) return '';
+            const html = rows.map(row => `
+                <div class="bake-target-row">
+                    <span class="bake-target-name">${escapeBakeHtml(row.stem)}</span>
+                    <span class="bake-target-url">${escapeBakeHtml(row.url)}</span>
+                </div>
+            `).join('');
+            return `<div class="bake-path-preview bake-target-list"><span class="bake-path-label">Targets</span>${html}</div>`;
         }
 
         function getAllBakeProxyTargets() {
@@ -8254,6 +8265,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             const sampleLight = getBakeTextureUrl({ n: 'ObjectName', h: 0 }, null, 'lightmap') || 'Set a folder to preview path';
             const sampleBeauty = getBakeTextureUrl({ n: 'ObjectName', h: 0 }, null, 'beauty') || 'Set a folder to preview path';
             const targetRows = getBakeTargetPreviewRows();
+            const targetPreview = renderBakeTargetPreview(targetRows);
             bakePanel.innerHTML = `
                 <div class="sidepanel-header">
                     <div><div class="sidepanel-title">Bake Overrides</div>
@@ -8279,6 +8291,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                             <label class="bake-field"><span>Ext</span><input id="bake-ext" type="text" value="${escapeBakeHtml(b.extension)}"></label>
                             <label class="bake-field"><span>Intensity</span><span class="bake-range"><input id="bake-intensity" class="fx-range" type="range" min="0" max="4" step="0.05" value="${b.intensity}"><span class="bake-value">${b.intensity.toFixed(2)}</span></span></label>
                             <label class="bake-field"><span>Exposure</span><span class="bake-range"><input id="bake-exposure" class="fx-range" type="range" min="-6" max="6" step="0.1" value="${b.bakeExposure}"><span class="bake-value">${b.bakeExposure >= 0 ? '+' : ''}${b.bakeExposure.toFixed(1)} EV</span></span></label>
+                            <button id="bake-reset-look" class="bake-reset-look" type="button">Reset Look</button>
                         </div>
                     </section>
                     <section class="fx-section">
@@ -8288,9 +8301,9 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                             <div class="bake-stat"><span>UV1 Ready</span><strong>${stats.uv1}</strong></div>
                             <div class="bake-stat"><span>UV2 Ready</span><strong>${stats.uv2}</strong></div>
                         </div>
-                        <div id="bake-light-preview" class="bake-path-preview">Light: ${escapeBakeHtml(sampleLight)}</div>
-                        <div id="bake-beauty-preview" class="bake-path-preview">Beauty: ${escapeBakeHtml(sampleBeauty)}</div>
-                        ${targetRows.length > 0 ? `<div class="bake-path-preview">Targets: ${targetRows.map(row => `${escapeBakeHtml(row.stem)} -> ${escapeBakeHtml(row.url)}`).join(' | ')}</div>` : ''}
+                        <div id="bake-light-preview" class="bake-path-preview"><span class="bake-path-label">Light</span>${escapeBakeHtml(sampleLight)}</div>
+                        <div id="bake-beauty-preview" class="bake-path-preview"><span class="bake-path-label">Beauty</span>${escapeBakeHtml(sampleBeauty)}</div>
+                        ${targetPreview}
                         <div class="bake-actions">
                             <button id="bake-reapply" type="button">Reapply</button>
                             <button id="bake-sync" type="button">Sync UV2</button>
@@ -8299,6 +8312,15 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     </section>
                 </div>`;
             bakePanel.querySelector('#bake-hide')?.addEventListener('click', () => setBakePanelVisible(false));
+            bakePanel.querySelector('#bake-reset-look')?.addEventListener('click', () => {
+                const intensity = bakePanel.querySelector('#bake-intensity');
+                const exposure = bakePanel.querySelector('#bake-exposure');
+                if (intensity) intensity.value = DEFAULT_BAKE_STATE.intensity;
+                if (exposure) exposure.value = DEFAULT_BAKE_STATE.bakeExposure;
+                const next = readBakeStateFromPanel();
+                updateBakePanelPreview(next);
+                applyBakeState(next, { persist: true, rebuild: true, refreshPanel: false, force: true });
+            });
             bakePanel.querySelector('#bake-reapply')?.addEventListener('click', () => {
                 clearBakeTextureLoadFailures();
                 applyBakeState(readBakeStateFromPanel(), { persist: true, rebuild: true, refreshPanel: false, force: true });
@@ -8313,7 +8335,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 void encodeBeautyBakeProxyMaps();
             });
             for (const el of bakePanel.querySelectorAll('input,select')) {
-                if (isBakeTextInput(el) || el.id === 'bake-intensity') {
+                if (isBakeTextInput(el) || el.id === 'bake-intensity' || el.id === 'bake-exposure') {
                     el.addEventListener('input', updateBakeStateFromPanel);
                 }
                 el.addEventListener('change', updateBakeStateFromPanel);

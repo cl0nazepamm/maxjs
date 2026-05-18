@@ -1,5 +1,7 @@
 # MaxJS Optimization TODO
 
+**Status:** Historical optimization plan. The binary scene/delta path, perf HUD, instancing, and most fastsync work have since landed. Keep this file for older rationale; use `REALTIME_SYNC_ARCHITECTURE.md` for current sync behavior.
+
 ## Goal
 
 Turn MaxJS from a live web viewport into a fast alternate viewport:
@@ -62,7 +64,7 @@ Replace normal full-scene resend with a binary command stream.
   - selection dirty
   - visibility dirty
 - Add binary frame builder in the sync path
-- Keep JSON full sync as fallback/debug path
+- Keep JSON full sync and `SLOW` JSON polling as fallback/debug paths
 
 ### Web Tasks
 
@@ -367,17 +369,6 @@ Run these in both scenes:
 - multi-select does not collapse cadence
 - add/delete/hide recover cleanly via full sync
 - stress scene degrades gracefully instead of falling apart
-
-## Best Next Milestone
-
-Ship this next:
-
-1. binary delta transform/material/camera commands
-2. triple-buffer shared memory
-3. runtime perf HUD
-4. geometry dedup
-
-That is the highest ROI set for the next visible leap.
 
 ## Snapshot Beauty Flatten Pass
 

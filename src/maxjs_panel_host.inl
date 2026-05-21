@@ -402,9 +402,79 @@
                         return S_OK;
                     }
 
-                    std::wstring headers = L"Content-Type: ";
-                    headers += transcodedTiff ? L"image/png" : GetMimeTypeForPath(decodedPath);
-                    headers += L"\r\nCache-Control: no-store\r\nAccess-Control-Allow-Origin: https://maxjs.local\r\nCross-Origin-Resource-Policy: cross-origin\r\n";
+                    const std::wstring mimeType =
+                        transcodedTiff ? std::wstring(L"image/png") : std::wstring(GetMimeTypeForPath(decodedPath));
+                    const wchar_t* kBaseHeaders =
+                        L"Cache-Control: no-store\r\nAccess-Control-Allow-Origin: https://maxjs.local\r\nCross-Origin-Resource-Policy: cross-origin\r\n";
+
+                    // Honor HTTP Range requests so <video>/<audio> media elements
+                    // can stream and seek. Chromium issues "Range: bytes=0-" for
+                    // media and expects a 206; a plain 200 leaves video textures
+                    // stuck/black. TIFF transcodes are small in-memory PNGs —
+                    // serve those whole.
+                    unsigned long long totalSize = 0;
+                    if (!transcodedTiff) {
+                        STATSTG st = {};
+                        if (SUCCEEDED(stream->Stat(&st, STATFLAG_NONAME)))
+                            totalSize = st.cbSize.QuadPart;
+                    }
+
+                    unsigned long long rangeStart = 0, rangeEnd = 0;
+                    bool isRange = false;
+                    if (!transcodedTiff && totalSize > 0) {
+                        ComPtr<ICoreWebView2HttpRequestHeaders> reqHeaders;
+                        if (SUCCEEDED(request->get_Headers(&reqHeaders)) && reqHeaders) {
+                            BOOL hasRange = FALSE;
+                            LPWSTR rangeVal = nullptr;
+                            if (SUCCEEDED(reqHeaders->Contains(L"Range", &hasRange)) && hasRange &&
+                                SUCCEEDED(reqHeaders->GetHeader(L"Range", &rangeVal)) && rangeVal) {
+                                isRange = ParseHttpByteRange(rangeVal, totalSize, rangeStart, rangeEnd);
+                                CoTaskMemFree(rangeVal);
+                            }
+                        }
+                    }
+
+                    if (isRange) {
+                        // Cap the slice so an open-ended "bytes=0-" doesn't buffer a
+                        // whole movie into memory; Chromium re-requests as it plays.
+                        constexpr unsigned long long kMaxRangeChunk = 8ull * 1024 * 1024;
+                        if (rangeEnd - rangeStart + 1 > kMaxRangeChunk)
+                            rangeEnd = rangeStart + kMaxRangeChunk - 1;
+                        const unsigned long long length = rangeEnd - rangeStart + 1;
+
+                        std::vector<BYTE> buf(static_cast<size_t>(length));
+                        LARGE_INTEGER seek;
+                        seek.QuadPart = static_cast<LONGLONG>(rangeStart);
+                        ULONG readBytes = 0;
+                        if (SUCCEEDED(stream->Seek(seek, STREAM_SEEK_SET, nullptr)) &&
+                            SUCCEEDED(stream->Read(buf.data(), static_cast<ULONG>(length), &readBytes)) &&
+                            readBytes > 0) {
+                            ComPtr<IStream> memStream;
+                            memStream.Attach(SHCreateMemStream(buf.data(), readBytes));
+                            if (memStream) {
+                                std::wstring h = L"Content-Type: " + mimeType + L"\r\n";
+                                h += kBaseHeaders;
+                                h += L"Accept-Ranges: bytes\r\n";
+                                h += L"Content-Range: bytes " + std::to_wstring(rangeStart) + L"-" +
+                                     std::to_wstring(rangeStart + readBytes - 1) + L"/" +
+                                     std::to_wstring(totalSize) + L"\r\n";
+                                h += L"Content-Length: " + std::to_wstring(readBytes) + L"\r\n";
+                                ComPtr<ICoreWebView2WebResourceResponse> response;
+                                if (SUCCEEDED(env_->CreateWebResourceResponse(
+                                        memStream.Get(), 206, L"Partial Content", h.c_str(), &response)) && response) {
+                                    args->put_Response(response.Get());
+                                    return S_OK;
+                                }
+                            }
+                        }
+                        // Any failure falls through to a full 200 response below.
+                        LARGE_INTEGER rewind = {};
+                        stream->Seek(rewind, STREAM_SEEK_SET, nullptr);
+                    }
+
+                    std::wstring headers = L"Content-Type: " + mimeType + L"\r\n";
+                    headers += kBaseHeaders;
+                    if (!transcodedTiff) headers += L"Accept-Ranges: bytes\r\n";
                     if (transcodedTiff) headers += L"X-MaxJS-Transcoded-From: image/tiff\r\n";
 
                     ComPtr<ICoreWebView2WebResourceResponse> response;

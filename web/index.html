@@ -795,6 +795,12 @@
             return !ext || browserTextureExtensions.has(ext);
         }
 
+        const videoTextureExtensions = new Set(['mp4', 'm4v', 'webm', 'mov', 'ogv']);
+
+        function isVideoTextureExtension(ext) {
+            return !!ext && videoTextureExtensions.has(ext);
+        }
+
         function loadEnvironmentTexture(url, sourceName, onLoad, onProgress, onError) {
             const ext = getTextureExtension(sourceName || url);
             const loader = ext === 'exr'
@@ -2212,12 +2218,14 @@
         }
 
         function loadVideoTexture(url, xf) {
+            const normalizedXf = normalizeTextureTransform(xf);
             const playbackKey = JSON.stringify({
                 loop: xf?.loop !== false,
                 muted: xf?.muted !== false,
                 rate: xf?.rate ?? 1.0,
             });
-            const cacheKey = `video:${url}:${playbackKey}`;
+            // Distinct UV transforms must not clobber a shared cached texture.
+            const cacheKey = `video:${url}:${playbackKey}:${JSON.stringify(normalizedXf)}`;
             if (textureCache.has(cacheKey)) return textureCache.get(cacheKey);
             const video = document.createElement('video');
             video.src = url;
@@ -2232,6 +2240,11 @@
             tex.colorSpace = THREE.SRGBColorSpace;
             tex.minFilter = THREE.LinearFilter;
             tex.magFilter = THREE.LinearFilter;
+            // Honor Max UV tiling/offset/rotation/wrap + channel select, the
+            // same as still-image textures (loadTexture) — video previously
+            // ignored all of these.
+            applyTextureChannelSelection(tex, normalizedXf);
+            applyTextureTransform(tex, normalizedXf);
             textureCache.set(cacheKey, tex);
             return tex;
         }
@@ -2241,6 +2254,10 @@
             if (xf?.video) return loadVideoTexture(url, xf);
             colorSpace = resolveColorSpace(colorSpace, xf);
             const ext = getTextureExtension(url);
+            // A plain Max Bitmap can point straight at a video file (no custom
+            // Video Texture map). Route those to the video loader instead of
+            // rejecting them as an unsupported still-image format.
+            if (isVideoTextureExtension(ext)) return loadVideoTexture(url, xf);
             const textureColorSpace = colorSpaceForTextureExtension(ext, colorSpace);
             const normalizedXf = normalizeTextureTransform(xf);
             const cacheKey = JSON.stringify([url, String(textureColorSpace), normalizedXf]);

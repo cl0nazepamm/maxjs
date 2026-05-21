@@ -68,6 +68,7 @@
 #include <filesystem>
 #include <cmath>
 #include <cwctype>
+#include <cstdint>
 #include <locale>
 #include <immintrin.h>
 #include <ppl.h>
@@ -575,7 +576,11 @@ public:
         std::vector<VertexColorAttributeRecord> vertexColors;
         std::vector<int> indices;
         std::vector<MatGroup> groups;
-        size_t vOff = 0, iOff = 0, uvOff = 0, uv2Off = 0, nOff = 0;
+        size_t vOff = 0, iOff = 0, iN = 0, uvOff = 0, uv2Off = 0, nOff = 0;
+        std::wstring iType;
+        std::wstring uvType;
+        std::wstring uv2Type;
+        std::wstring nType;
         // Skeletal skin + optional Morpher. Morpher is exported only when it
         // evaluates before Skin, as static deltas + animated channel weights.
         bool skinRig = false;
@@ -585,6 +590,8 @@ public:
         std::vector<float> skinWData;
         std::vector<float> skinIdxData;
         size_t skinWOff = 0, skinIndOff = 0, skinBoneBindOff = 0;
+        std::wstring skinWType;
+        std::wstring skinIdxType;
         std::vector<std::wstring> morphNames;
         std::vector<int> morphChannelIds;
         std::vector<float> morphInfluences;
@@ -612,6 +619,9 @@ public:
         struct GeometryFrameRef {
             size_t vOff = 0, iOff = 0, uvOff = 0, nOff = 0;
             size_t vN = 0, iN = 0, uvN = 0, nN = 0;
+            std::wstring iType;
+            std::wstring uvType;
+            std::wstring nType;
             bool spline = false;
             std::vector<MatGroup> groups;
         };
@@ -762,6 +772,171 @@ public:
         byteSize += values.size() * sizeof(int);
     }
 
+    static bool CanPackIndicesU16(const std::vector<int>& values) {
+        if (values.empty()) return false;
+        for (int value : values) {
+            if (value < 0 || value > 65535) return false;
+        }
+        return true;
+    }
+
+    static int RoundedFloatIndexValue(float value) {
+        if (!std::isfinite(value)) return 0;
+        return static_cast<int>(std::lround(value));
+    }
+
+    static std::wstring PackedSkinIndexType(const std::vector<float>& values) {
+        if (values.empty()) return {};
+        bool fitsU8 = true;
+        for (float value : values) {
+            const int idx = RoundedFloatIndexValue(value);
+            if (idx < 0 || idx > 65535) return {};
+            if (idx > 255) fitsU8 = false;
+        }
+        return fitsU8 ? L"u8" : L"u16";
+    }
+
+    static void ReserveBinarySkinWeightRange(size_t& byteSize,
+                                             const std::vector<float>& values,
+                                             size_t& outOffset,
+                                             std::wstring& outType) {
+        outType.clear();
+        if (values.empty()) {
+            AlignBinarySize(byteSize, alignof(float));
+            outOffset = byteSize;
+            return;
+        }
+        AlignBinarySize(byteSize, alignof(std::uint16_t));
+        outOffset = byteSize;
+        byteSize += values.size() * sizeof(std::uint16_t);
+        outType = L"u16n";
+    }
+
+    static void ReserveBinarySkinIndexRange(size_t& byteSize,
+                                            const std::vector<float>& values,
+                                            size_t& outOffset,
+                                            std::wstring& outType) {
+        outType = PackedSkinIndexType(values);
+        if (outType == L"u8") {
+            outOffset = byteSize;
+            byteSize += values.size() * sizeof(std::uint8_t);
+            return;
+        }
+        if (outType == L"u16") {
+            AlignBinarySize(byteSize, alignof(std::uint16_t));
+            outOffset = byteSize;
+            byteSize += values.size() * sizeof(std::uint16_t);
+            return;
+        }
+        AlignBinarySize(byteSize, alignof(float));
+        outOffset = byteSize;
+        byteSize += values.size() * sizeof(float);
+    }
+
+    static bool CanPackAffine12Transforms(const std::vector<float>& values) {
+        if (values.empty() || (values.size() % 16u) != 0) return false;
+        constexpr float epsilon = 1.0e-6f;
+        for (size_t off = 0; off < values.size(); off += 16u) {
+            if (std::fabs(values[off + 3]) > epsilon ||
+                std::fabs(values[off + 7]) > epsilon ||
+                std::fabs(values[off + 11]) > epsilon ||
+                std::fabs(values[off + 15] - 1.0f) > epsilon) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static void ReserveBinaryInstanceTransformRange(size_t& byteSize,
+                                                    const std::vector<float>& values,
+                                                    size_t& outOffset,
+                                                    size_t& outCount,
+                                                    std::wstring& outType) {
+        outType.clear();
+        AlignBinarySize(byteSize, alignof(float));
+        outOffset = byteSize;
+        if (CanPackAffine12Transforms(values)) {
+            outCount = (values.size() / 16u) * 12u;
+            byteSize += outCount * sizeof(float);
+            outType = L"affine12";
+            return;
+        }
+        outCount = values.size();
+        byteSize += values.size() * sizeof(float);
+        outType = L"f32m16";
+    }
+
+    static bool CanPackNormalsI16N(const std::vector<float>& values) {
+        if (values.empty() || (values.size() % 3u) != 0) return false;
+        for (float value : values) {
+            if (!std::isfinite(value) || value < -1.0001f || value > 1.0001f) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static bool CanPackUvsU16N(const std::vector<float>& values) {
+        if (values.empty() || (values.size() % 2u) != 0) return false;
+        for (float value : values) {
+            if (!std::isfinite(value) || value < -0.00001f || value > 1.00001f) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static void ReserveBinaryUvRange(size_t& byteSize,
+                                     const std::vector<float>& values,
+                                     size_t& outOffset,
+                                     size_t& outCount,
+                                     std::wstring& outType) {
+        outType.clear();
+        if (CanPackUvsU16N(values)) {
+            AlignBinarySize(byteSize, alignof(std::uint16_t));
+            outOffset = byteSize;
+            outCount = values.size();
+            byteSize += values.size() * sizeof(std::uint16_t);
+            outType = L"u16n";
+            return;
+        }
+        ReserveBinaryFloatRange(byteSize, values, outOffset, outCount);
+    }
+
+    static void ReserveBinaryNormalRange(size_t& byteSize,
+                                         const std::vector<float>& values,
+                                         size_t& outOffset,
+                                         size_t& outCount,
+                                         std::wstring& outType) {
+        outType.clear();
+        if (CanPackNormalsI16N(values)) {
+            AlignBinarySize(byteSize, alignof(std::int16_t));
+            outOffset = byteSize;
+            outCount = values.size();
+            byteSize += values.size() * sizeof(std::int16_t);
+            outType = L"i16n";
+            return;
+        }
+        ReserveBinaryFloatRange(byteSize, values, outOffset, outCount);
+    }
+
+    static void ReserveBinaryIndexRange(size_t& byteSize,
+                                        const std::vector<int>& values,
+                                        size_t& outOffset,
+                                        size_t& outCount,
+                                        std::wstring& outType) {
+        outType.clear();
+        if (CanPackIndicesU16(values)) {
+            AlignBinarySize(byteSize, alignof(std::uint16_t));
+            outOffset = byteSize;
+            outCount = values.size();
+            byteSize += values.size() * sizeof(std::uint16_t);
+            outType = L"u16";
+            return;
+        }
+        ReserveBinaryIntRange(byteSize, values, outOffset, outCount);
+    }
+
     static void AppendUniqueTimeValue(std::vector<TimeValue>& times, TimeValue value) {
         if (std::find(times.begin(), times.end(), value) == times.end()) {
             times.push_back(value);
@@ -806,6 +981,217 @@ public:
             values.size() * sizeof(int));
     }
 
+    static void AppendBinaryIndices(std::string& outBinary,
+                                    const std::vector<int>& values,
+                                    size_t& outOffset,
+                                    size_t& outCount,
+                                    std::wstring& outType) {
+        outType.clear();
+        if (CanPackIndicesU16(values)) {
+            AlignBinaryBuffer(outBinary, alignof(std::uint16_t));
+            outOffset = outBinary.size();
+            outCount = values.size();
+            outType = L"u16";
+            if (values.empty()) return;
+            std::vector<std::uint16_t> packed;
+            packed.reserve(values.size());
+            for (int value : values) packed.push_back(static_cast<std::uint16_t>(value));
+            outBinary.append(
+                reinterpret_cast<const char*>(packed.data()),
+                packed.size() * sizeof(std::uint16_t));
+            return;
+        }
+        AppendBinaryInts(outBinary, values, outOffset, outCount);
+    }
+
+    static void CopyBinaryIndices(BYTE* buffer,
+                                  size_t offset,
+                                  const std::vector<int>& values,
+                                  const std::wstring& type) {
+        if (!buffer || values.empty()) return;
+        if (type == L"u16") {
+            auto* dst = reinterpret_cast<std::uint16_t*>(buffer + offset);
+            for (size_t i = 0; i < values.size(); ++i) {
+                dst[i] = static_cast<std::uint16_t>(values[i]);
+            }
+            return;
+        }
+        memcpy(buffer + offset, values.data(), values.size() * sizeof(int));
+    }
+
+    static void CopyBinarySkinWeights(BYTE* buffer,
+                                      size_t offset,
+                                      const std::vector<float>& values,
+                                      const std::wstring& type) {
+        if (!buffer || values.empty()) return;
+        if (type == L"u16n") {
+            auto* dst = reinterpret_cast<std::uint16_t*>(buffer + offset);
+            for (size_t base = 0; base < values.size(); base += 4) {
+                int q[4] = {0, 0, 0, 0};
+                float maxWeight = -1.0f;
+                int maxIndex = 0;
+                int sum = 0;
+                const size_t laneCount = std::min<size_t>(4, values.size() - base);
+                for (size_t lane = 0; lane < laneCount; ++lane) {
+                    const float w = std::clamp(values[base + lane], 0.0f, 1.0f);
+                    q[lane] = static_cast<int>(std::lround(w * 65535.0f));
+                    sum += q[lane];
+                    if (w > maxWeight) {
+                        maxWeight = w;
+                        maxIndex = static_cast<int>(lane);
+                    }
+                }
+                if (sum > 0) {
+                    q[maxIndex] = std::clamp(q[maxIndex] + (65535 - sum), 0, 65535);
+                }
+                for (size_t lane = 0; lane < laneCount; ++lane) {
+                    dst[base + lane] = static_cast<std::uint16_t>(q[lane]);
+                }
+            }
+            return;
+        }
+        memcpy(buffer + offset, values.data(), values.size() * sizeof(float));
+    }
+
+    static void CopyBinarySkinIndices(BYTE* buffer,
+                                      size_t offset,
+                                      const std::vector<float>& values,
+                                      const std::wstring& type) {
+        if (!buffer || values.empty()) return;
+        if (type == L"u8") {
+            auto* dst = reinterpret_cast<std::uint8_t*>(buffer + offset);
+            for (size_t i = 0; i < values.size(); ++i) {
+                dst[i] = static_cast<std::uint8_t>(
+                    std::clamp(RoundedFloatIndexValue(values[i]), 0, 255));
+            }
+            return;
+        }
+        if (type == L"u16") {
+            auto* dst = reinterpret_cast<std::uint16_t*>(buffer + offset);
+            for (size_t i = 0; i < values.size(); ++i) {
+                dst[i] = static_cast<std::uint16_t>(
+                    std::clamp(RoundedFloatIndexValue(values[i]), 0, 65535));
+            }
+            return;
+        }
+        memcpy(buffer + offset, values.data(), values.size() * sizeof(float));
+    }
+
+    static void CopyBinaryInstanceTransforms(BYTE* buffer,
+                                             size_t offset,
+                                             const std::vector<float>& values,
+                                             const std::wstring& type) {
+        if (!buffer || values.empty()) return;
+        if (type == L"affine12") {
+            auto* dst = reinterpret_cast<float*>(buffer + offset);
+            size_t di = 0;
+            for (size_t si = 0; si + 15 < values.size(); si += 16u) {
+                dst[di++] = values[si + 0];
+                dst[di++] = values[si + 1];
+                dst[di++] = values[si + 2];
+                dst[di++] = values[si + 4];
+                dst[di++] = values[si + 5];
+                dst[di++] = values[si + 6];
+                dst[di++] = values[si + 8];
+                dst[di++] = values[si + 9];
+                dst[di++] = values[si + 10];
+                dst[di++] = values[si + 12];
+                dst[di++] = values[si + 13];
+                dst[di++] = values[si + 14];
+            }
+            return;
+        }
+        memcpy(buffer + offset, values.data(), values.size() * sizeof(float));
+    }
+
+    static void CopyBinaryNormals(BYTE* buffer,
+                                  size_t offset,
+                                  const std::vector<float>& values,
+                                  const std::wstring& type) {
+        if (!buffer || values.empty()) return;
+        if (type == L"i16n") {
+            auto* dst = reinterpret_cast<std::int16_t*>(buffer + offset);
+            for (size_t i = 0; i < values.size(); ++i) {
+                const float n = std::clamp(values[i], -1.0f, 1.0f);
+                dst[i] = static_cast<std::int16_t>(
+                    std::clamp(static_cast<int>(std::lround(n * 32767.0f)), -32767, 32767));
+            }
+            return;
+        }
+        memcpy(buffer + offset, values.data(), values.size() * sizeof(float));
+    }
+
+    static void CopyBinaryUvs(BYTE* buffer,
+                              size_t offset,
+                              const std::vector<float>& values,
+                              const std::wstring& type) {
+        if (!buffer || values.empty()) return;
+        if (type == L"u16n") {
+            auto* dst = reinterpret_cast<std::uint16_t*>(buffer + offset);
+            for (size_t i = 0; i < values.size(); ++i) {
+                const float uv = std::clamp(values[i], 0.0f, 1.0f);
+                dst[i] = static_cast<std::uint16_t>(
+                    std::clamp(static_cast<int>(std::lround(uv * 65535.0f)), 0, 65535));
+            }
+            return;
+        }
+        memcpy(buffer + offset, values.data(), values.size() * sizeof(float));
+    }
+
+    static void AppendBinaryUvs(std::string& outBinary,
+                                const std::vector<float>& values,
+                                size_t& outOffset,
+                                size_t& outCount,
+                                std::wstring& outType) {
+        outType.clear();
+        if (CanPackUvsU16N(values)) {
+            AlignBinaryBuffer(outBinary, alignof(std::uint16_t));
+            outOffset = outBinary.size();
+            outCount = values.size();
+            outType = L"u16n";
+            if (values.empty()) return;
+            std::vector<std::uint16_t> packed;
+            packed.reserve(values.size());
+            for (float value : values) {
+                const float uv = std::clamp(value, 0.0f, 1.0f);
+                packed.push_back(static_cast<std::uint16_t>(
+                    std::clamp(static_cast<int>(std::lround(uv * 65535.0f)), 0, 65535)));
+            }
+            outBinary.append(
+                reinterpret_cast<const char*>(packed.data()),
+                packed.size() * sizeof(std::uint16_t));
+            return;
+        }
+        AppendBinaryFloats(outBinary, values, outOffset, outCount);
+    }
+
+    static void AppendBinaryNormals(std::string& outBinary,
+                                    const std::vector<float>& values,
+                                    size_t& outOffset,
+                                    size_t& outCount,
+                                    std::wstring& outType) {
+        outType.clear();
+        if (CanPackNormalsI16N(values)) {
+            AlignBinaryBuffer(outBinary, alignof(std::int16_t));
+            outOffset = outBinary.size();
+            outCount = values.size();
+            outType = L"i16n";
+            if (values.empty()) return;
+            std::vector<std::int16_t> packed;
+            packed.reserve(values.size());
+            for (float value : values) {
+                const float n = std::clamp(value, -1.0f, 1.0f);
+                packed.push_back(static_cast<std::int16_t>(
+                    std::clamp(static_cast<int>(std::lround(n * 32767.0f)), -32767, 32767)));
+            }
+            outBinary.append(
+                reinterpret_cast<const char*>(packed.data()),
+                packed.size() * sizeof(std::int16_t));
+            return;
+        }
+        AppendBinaryFloats(outBinary, values, outOffset, outCount);
+    }
+
     static void AppendBinaryBytes(std::string& outBinary,
                                   const std::vector<unsigned char>& values,
                                   size_t& outOffset,
@@ -816,6 +1202,11 @@ public:
         outBinary.append(
             reinterpret_cast<const char*>(values.data()),
             values.size() * sizeof(unsigned char));
+    }
+
+    static std::string MakeRawBinaryKey(const void* data, size_t byteCount) {
+        if (!data || byteCount == 0) return {};
+        return std::string(reinterpret_cast<const char*>(data), byteCount);
     }
 
     static bool ExtractSnapshotGeometrySample(INode* node,
@@ -1150,13 +1541,126 @@ public:
             std::make_move_iterator(src.tracks.end()));
     }
 
+    struct BinaryFloatRangeRef {
+        size_t off = 0;
+        size_t n = 0;
+    };
+
+    struct BinaryIndexRangeRef {
+        size_t off = 0;
+        size_t n = 0;
+        std::wstring type;
+    };
+
+    struct GeometryFrameBinaryCache {
+        std::unordered_map<std::string, BinaryFloatRangeRef> floats;
+        std::unordered_map<std::string, BinaryIndexRangeRef> indices;
+        std::unordered_map<std::string, BinaryIndexRangeRef> uvs;
+        std::unordered_map<std::string, BinaryIndexRangeRef> normals;
+    };
+
+    static void AppendCachedGeometryFloats(std::string& binary,
+                                           const std::vector<float>& values,
+                                           GeometryFrameBinaryCache& cache,
+                                           size_t& outOffset,
+                                           size_t& outCount) {
+        const std::string key = MakeRawBinaryKey(
+            values.empty() ? nullptr : values.data(),
+            values.size() * sizeof(float));
+        if (!key.empty()) {
+            auto it = cache.floats.find(key);
+            if (it != cache.floats.end()) {
+                outOffset = it->second.off;
+                outCount = it->second.n;
+                return;
+            }
+        }
+        AppendBinaryFloats(binary, values, outOffset, outCount);
+        if (!key.empty()) {
+            cache.floats.emplace(key, BinaryFloatRangeRef{outOffset, outCount});
+        }
+    }
+
+    static void AppendCachedGeometryIndices(std::string& binary,
+                                            const std::vector<int>& values,
+                                            GeometryFrameBinaryCache& cache,
+                                            size_t& outOffset,
+                                            size_t& outCount,
+                                            std::wstring& outType) {
+        const std::string key = MakeRawBinaryKey(
+            values.empty() ? nullptr : values.data(),
+            values.size() * sizeof(int));
+        if (!key.empty()) {
+            auto it = cache.indices.find(key);
+            if (it != cache.indices.end()) {
+                outOffset = it->second.off;
+                outCount = it->second.n;
+                outType = it->second.type;
+                return;
+            }
+        }
+        AppendBinaryIndices(binary, values, outOffset, outCount, outType);
+        if (!key.empty()) {
+            cache.indices.emplace(key, BinaryIndexRangeRef{outOffset, outCount, outType});
+        }
+    }
+
+    static void AppendCachedGeometryNormals(std::string& binary,
+                                            const std::vector<float>& values,
+                                            GeometryFrameBinaryCache& cache,
+                                            size_t& outOffset,
+                                            size_t& outCount,
+                                            std::wstring& outType) {
+        const std::string key = MakeRawBinaryKey(
+            values.empty() ? nullptr : values.data(),
+            values.size() * sizeof(float));
+        if (!key.empty()) {
+            auto it = cache.normals.find(key);
+            if (it != cache.normals.end()) {
+                outOffset = it->second.off;
+                outCount = it->second.n;
+                outType = it->second.type;
+                return;
+            }
+        }
+        AppendBinaryNormals(binary, values, outOffset, outCount, outType);
+        if (!key.empty()) {
+            cache.normals.emplace(key, BinaryIndexRangeRef{outOffset, outCount, outType});
+        }
+    }
+
+    static void AppendCachedGeometryUvs(std::string& binary,
+                                        const std::vector<float>& values,
+                                        GeometryFrameBinaryCache& cache,
+                                        size_t& outOffset,
+                                        size_t& outCount,
+                                        std::wstring& outType) {
+        const std::string key = MakeRawBinaryKey(
+            values.empty() ? nullptr : values.data(),
+            values.size() * sizeof(float));
+        if (!key.empty()) {
+            auto it = cache.uvs.find(key);
+            if (it != cache.uvs.end()) {
+                outOffset = it->second.off;
+                outCount = it->second.n;
+                outType = it->second.type;
+                return;
+            }
+        }
+        AppendBinaryUvs(binary, values, outOffset, outCount, outType);
+        if (!key.empty()) {
+            cache.uvs.emplace(key, BinaryIndexRangeRef{outOffset, outCount, outType});
+        }
+    }
+
     static void AppendGeometryFrame(std::string& binary,
                                     const SnapshotGeometrySample& sample,
-                                    SnapshotAnimationTrackDef::GeometryFrameRef& frame) {
-        AppendBinaryFloats(binary, sample.verts, frame.vOff, frame.vN);
-        AppendBinaryInts(binary, sample.indices, frame.iOff, frame.iN);
-        AppendBinaryFloats(binary, sample.uvs, frame.uvOff, frame.uvN);
-        AppendBinaryFloats(binary, sample.norms, frame.nOff, frame.nN);
+                                    SnapshotAnimationTrackDef::GeometryFrameRef& frame,
+                                    GeometryFrameBinaryCache& cache) {
+        AppendCachedGeometryFloats(binary, sample.verts, cache, frame.vOff, frame.vN);
+        AppendCachedGeometryIndices(binary, sample.indices, cache, frame.iOff, frame.iN, frame.iType);
+        AppendCachedGeometryUvs(binary, sample.uvs, cache, frame.uvOff, frame.uvN, frame.uvType);
+        AppendCachedGeometryNormals(binary, sample.norms, cache, frame.nOff, frame.nN, frame.nType);
         frame.spline = sample.spline;
         frame.groups = sample.groups;
     }
@@ -1203,6 +1707,7 @@ public:
         geometryTrack.isGeometryFrames = true;
 
         std::string localBinary;
+        GeometryFrameBinaryCache localBinaryCache;
         bool geometryChanged = false;
         bool havePrevious = false;
         SnapshotGeometrySample previousSample;
@@ -1215,7 +1720,7 @@ public:
 
             geometryTrack.times.push_back(TimeValueToAnimationSeconds(sampleTime, range.Start()));
             SnapshotAnimationTrackDef::GeometryFrameRef frame;
-            AppendGeometryFrame(localBinary, sample, frame);
+            AppendGeometryFrame(localBinary, sample, frame, localBinaryCache);
             geometryTrack.geometryFrames.push_back(std::move(frame));
 
             if (havePrevious && !SnapshotGeometrySamplesEqual(sample, previousSample)) {
@@ -1431,7 +1936,7 @@ public:
         outTarget.target = L"handle:" + std::to_wstring(node->GetHandle());
 
         Mtl* multiMtl = FindMultiSubMtl(mtl);
-        if (multiMtl && multiMtl->NumSubMtls() > 0 && nodeRecord.groups.size() > 1) {
+        if (ShouldEmitMultiSubMaterialGroups(multiMtl, nodeRecord.groups)) {
             for (size_t groupIndex = 0; groupIndex < nodeRecord.groups.size(); ++groupIndex) {
                 std::vector<SnapshotMaterialSample> samples;
                 samples.reserve(sampleTimes.size());
@@ -1896,13 +2401,22 @@ public:
                    << L",\"vN\":" << frame.vN
                    << L",\"iOff\":" << frame.iOff
                    << L",\"iN\":" << frame.iN;
+                if (!frame.iType.empty()) {
+                    ss << L",\"iType\":\"" << frame.iType << L"\"";
+                }
                 if (frame.uvN > 0) {
                     ss << L",\"uvOff\":" << frame.uvOff
                        << L",\"uvN\":" << frame.uvN;
+                    if (!frame.uvType.empty()) {
+                        ss << L",\"uvType\":\"" << frame.uvType << L"\"";
+                    }
                 }
                 if (frame.nN > 0) {
                     ss << L",\"nOff\":" << frame.nOff
                        << L",\"nN\":" << frame.nN;
+                    if (!frame.nType.empty()) {
+                        ss << L",\"nType\":\"" << frame.nType << L"\"";
+                    }
                 }
                 if (frame.spline) ss << L",\"spline\":true";
                 if (!frame.groups.empty()) {
@@ -2516,7 +3030,7 @@ public:
         } else if (state.match == L"material") {
             Mtl* mtl = node ? node->GetMtl() : nullptr;
             Mtl* multiMtl = FindMultiSubMtl(mtl);
-            if (multiMtl && multiMtl->NumSubMtls() > 0 && snapshotNode.groups.size() > 1) {
+            if (ShouldEmitMultiSubMaterialGroups(multiMtl, snapshotNode.groups)) {
                 for (const MatGroup& group : snapshotNode.groups) {
                     Mtl* subMtl = GetSubMtlFromMatID(multiMtl, group.matID);
                     if (!subMtl) continue;
@@ -2544,7 +3058,7 @@ public:
                 group.mtlNode ? std::wstring(group.mtlNode->GetName()) : L"instance");
         } else if (state.match == L"material") {
             Mtl* multiMtl = FindMultiSubMtl(group.mtl);
-            if (multiMtl && multiMtl->NumSubMtls() > 0 && group.groups.size() > 1) {
+            if (ShouldEmitMultiSubMaterialGroups(multiMtl, group.groups)) {
                 for (const MatGroup& matGroup : group.groups) {
                     Mtl* subMtl = GetSubMtlFromMatID(multiMtl, matGroup.matID);
                     if (!subMtl) continue;
@@ -2596,6 +3110,69 @@ public:
         return mask;
     }
 
+    static void AccumulateTextureUvMask(int& mask,
+                                        const std::wstring& path,
+                                        const MaxJSPBR::TexTransform& xf) {
+        const bool hasSource = !path.empty() || !xf.htmlFile.empty() || !xf.tslCode.empty();
+        if (!hasSource) return;
+        if (xf.uvChannel <= 1) mask |= 1;
+        else if (xf.uvChannel == 2) mask |= 2;
+        else mask |= 1;
+    }
+
+    static int OriginalMaterialUvMask(const MaxJSPBR& pbr) {
+        int mask = 0;
+        AccumulateTextureUvMask(mask, pbr.colorMap, pbr.colorMapTransform);
+        AccumulateTextureUvMask(mask, pbr.gradientMap, pbr.gradientMapTransform);
+        AccumulateTextureUvMask(mask, pbr.roughnessMap, pbr.roughnessMapTransform);
+        AccumulateTextureUvMask(mask, pbr.metalnessMap, pbr.metalnessMapTransform);
+        AccumulateTextureUvMask(mask, pbr.normalMap, pbr.normalMapTransform);
+        AccumulateTextureUvMask(mask, pbr.bumpMap, pbr.bumpMapTransform);
+        AccumulateTextureUvMask(mask, pbr.displacementMap, pbr.displacementMapTransform);
+        AccumulateTextureUvMask(mask, pbr.parallaxMap, pbr.parallaxMapTransform);
+        AccumulateTextureUvMask(mask, pbr.sssColorMap, pbr.sssColorMapTransform);
+        AccumulateTextureUvMask(mask, pbr.aoMap, pbr.aoMapTransform);
+        AccumulateTextureUvMask(mask, pbr.emissionMap, pbr.emissionMapTransform);
+        AccumulateTextureUvMask(mask, pbr.lightmapFile, pbr.lightmapTransform);
+        AccumulateTextureUvMask(mask, pbr.opacityMap, pbr.opacityMapTransform);
+        AccumulateTextureUvMask(mask, pbr.matcapMap, pbr.matcapMapTransform);
+        AccumulateTextureUvMask(mask, pbr.specularMap, pbr.specularMapTransform);
+        AccumulateTextureUvMask(mask, pbr.transmissionMap, pbr.transmissionMapTransform);
+        AccumulateTextureUvMask(mask, pbr.clearcoatMap, pbr.clearcoatMapTransform);
+        AccumulateTextureUvMask(mask, pbr.clearcoatRoughnessMap, pbr.clearcoatRoughnessMapTransform);
+        AccumulateTextureUvMask(mask, pbr.clearcoatNormalMap, pbr.clearcoatNormalMapTransform);
+        AccumulateTextureUvMask(mask, pbr.specularIntensityMap, pbr.specularIntensityMapTransform);
+        AccumulateTextureUvMask(mask, pbr.specularColorMap, pbr.specularColorMapTransform);
+        for (const std::wstring& tslMap : pbr.tslMaps) {
+            if (!tslMap.empty()) mask |= 1;
+        }
+        if (!pbr.materialXFile.empty() || !pbr.materialXInline.empty()) {
+            mask |= 1;
+        }
+        return mask;
+    }
+
+    static int OriginalMaterialUvMask(INode* node,
+                                      const SnapshotNodeRecord& snapshotNode,
+                                      TimeValue t) {
+        if (!node) return 0;
+        int mask = 0;
+        Mtl* multiMtl = FindMultiSubMtl(node->GetMtl());
+        if (ShouldEmitMultiSubMaterialGroups(multiMtl, snapshotNode.groups)) {
+            for (const MatGroup& group : snapshotNode.groups) {
+                Mtl* subMtl = GetSubMtlFromMatID(multiMtl, group.matID);
+                MaxJSPBR subPBR;
+                ExtractPBRFromMtl(subMtl, node, t, subPBR);
+                mask |= OriginalMaterialUvMask(subPBR);
+            }
+        } else {
+            MaxJSPBR pbr;
+            ExtractPBR(node, t, pbr);
+            mask |= OriginalMaterialUvMask(pbr);
+        }
+        return mask;
+    }
+
     static int RequiredBeautyBakeUvMask(const ForestInstanceGroup& group,
                                         const BeautyBakeExportState& state) {
         if (!state.active) return 0;
@@ -2604,6 +3181,24 @@ public:
             const int channel = ResolveBeautyBakeStemUvChannel(state, stem);
             if (channel == 1) mask |= 1;
             else if (channel == 2) mask |= 2;
+        }
+        return mask;
+    }
+
+    static int OriginalMaterialUvMask(const ForestInstanceGroup& group, TimeValue t) {
+        int mask = 0;
+        Mtl* multiMtl = FindMultiSubMtl(group.mtl);
+        if (ShouldEmitMultiSubMaterialGroups(multiMtl, group.groups)) {
+            for (const MatGroup& matGroup : group.groups) {
+                Mtl* subMtl = GetSubMtlFromMatID(multiMtl, matGroup.matID);
+                MaxJSPBR subPBR;
+                ExtractPBRFromMtl(subMtl, group.mtlNode, t, subPBR);
+                mask |= OriginalMaterialUvMask(subPBR);
+            }
+        } else if (group.mtl) {
+            MaxJSPBR pbr;
+            ExtractPBRFromMtl(group.mtl, group.mtlNode, t, pbr);
+            mask |= OriginalMaterialUvMask(pbr);
         }
         return mask;
     }
@@ -2621,6 +3216,14 @@ public:
     static void TrimBeautyBakeUnusedUvs(ForestInstanceGroup& group,
                                         int requiredUvMask) {
         if ((requiredUvMask & 1) == 0) group.uvs.clear();
+    }
+
+    static void TrimBeautyBakeNormals(SnapshotNodeRecord& snapshotNode) {
+        if (!snapshotNode.spline) snapshotNode.norms.clear();
+    }
+
+    static void TrimBeautyBakeNormals(ForestInstanceGroup& group) {
+        group.norms.clear();
     }
 
     static bool HasHtmlTextureSlot(const MaxJSPBR& pbr) {
@@ -2907,32 +3510,74 @@ public:
                     }
 
                     if (beautyBakeExportState.active) {
+                        const int bakeUvMask =
+                            RequiredBeautyBakeUvMask(node, snapshotNode, beautyBakeExportState);
+                        int requiredUvMask = bakeUvMask;
+                        if (requiredUvMask == 0) {
+                            requiredUvMask = OriginalMaterialUvMask(node, snapshotNode, t);
+                        } else {
+                            TrimBeautyBakeNormals(snapshotNode);
+                        }
                         TrimBeautyBakeUnusedUvs(
                             snapshotNode,
-                            RequiredBeautyBakeUvMask(node, snapshotNode, beautyBakeExportState));
+                            requiredUvMask);
                     }
 
                     // Calculate ALL binary offsets after skin/morph extraction
                     // (bind pose replaces verts/uvs/norms/indices — use final sizes)
+                    AlignBinarySize(totalBytes, alignof(float));
                     snapshotNode.vOff = totalBytes;
                     totalBytes += snapshotNode.verts.size() * sizeof(float);
-                    snapshotNode.iOff = totalBytes;
-                    totalBytes += snapshotNode.indices.size() * sizeof(int);
-                    snapshotNode.uvOff = totalBytes;
-                    totalBytes += snapshotNode.uvs.size() * sizeof(float);
-                    snapshotNode.uv2Off = totalBytes;
-                    totalBytes += snapshotNode.uv2s.size() * sizeof(float);
-                    snapshotNode.nOff = totalBytes;
-                    totalBytes += snapshotNode.norms.size() * sizeof(float);
+                    ReserveBinaryIndexRange(
+                        totalBytes,
+                        snapshotNode.indices,
+                        snapshotNode.iOff,
+                        snapshotNode.iN,
+                        snapshotNode.iType);
+                    {
+                        size_t uvCount = 0;
+                        ReserveBinaryUvRange(
+                            totalBytes,
+                            snapshotNode.uvs,
+                            snapshotNode.uvOff,
+                            uvCount,
+                            snapshotNode.uvType);
+                    }
+                    {
+                        size_t uv2Count = 0;
+                        ReserveBinaryUvRange(
+                            totalBytes,
+                            snapshotNode.uv2s,
+                            snapshotNode.uv2Off,
+                            uv2Count,
+                            snapshotNode.uv2Type);
+                    }
+                    {
+                        size_t normalCount = 0;
+                        ReserveBinaryNormalRange(
+                            totalBytes,
+                            snapshotNode.norms,
+                            snapshotNode.nOff,
+                            normalCount,
+                            snapshotNode.nType);
+                    }
                     for (VertexColorAttributeRecord& attr : snapshotNode.vertexColors) {
+                        AlignBinarySize(totalBytes, alignof(float));
                         attr.off = totalBytes;
                         totalBytes += attr.values.size() * sizeof(float);
                     }
                     if (snapshotNode.skinRig) {
-                        snapshotNode.skinWOff = totalBytes;
-                        totalBytes += snapshotNode.skinWData.size() * sizeof(float);
-                        snapshotNode.skinIndOff = totalBytes;
-                        totalBytes += snapshotNode.skinIdxData.size() * sizeof(float);
+                        ReserveBinarySkinWeightRange(
+                            totalBytes,
+                            snapshotNode.skinWData,
+                            snapshotNode.skinWOff,
+                            snapshotNode.skinWType);
+                        ReserveBinarySkinIndexRange(
+                            totalBytes,
+                            snapshotNode.skinIdxData,
+                            snapshotNode.skinIndOff,
+                            snapshotNode.skinIdxType);
+                        AlignBinarySize(totalBytes, alignof(float));
                         snapshotNode.skinBoneBindOff = totalBytes;
                         totalBytes += snapshotNode.skinBoneBindLocal.size() * sizeof(float);
                         for (size_t mi = 0; mi < snapshotNode.morphChannelsData.size(); ++mi) {
@@ -2988,16 +3633,28 @@ public:
                 continue;
             }
             if (beautyBakeExportState.active) {
+                const int bakeUvMask = RequiredBeautyBakeUvMask(group, beautyBakeExportState);
+                int requiredUvMask = bakeUvMask;
+                if (requiredUvMask == 0) {
+                    requiredUvMask = OriginalMaterialUvMask(group, t);
+                } else {
+                    TrimBeautyBakeNormals(group);
+                }
                 TrimBeautyBakeUnusedUvs(
                     group,
-                    RequiredBeautyBakeUvMask(group, beautyBakeExportState));
+                    requiredUvMask);
             }
 
             ReserveBinaryFloatRange(totalBytes, group.verts, group.vOff, group.vN);
-            ReserveBinaryIntRange(totalBytes, group.indices, group.iOff, group.iN);
-            ReserveBinaryFloatRange(totalBytes, group.uvs, group.uvOff, group.uvN);
-            ReserveBinaryFloatRange(totalBytes, group.norms, group.nOff, group.nN);
-            ReserveBinaryFloatRange(totalBytes, group.transforms, group.xformOff, group.xformN);
+            ReserveBinaryIndexRange(totalBytes, group.indices, group.iOff, group.iN, group.iType);
+            ReserveBinaryUvRange(totalBytes, group.uvs, group.uvOff, group.uvN, group.uvType);
+            ReserveBinaryNormalRange(totalBytes, group.norms, group.nOff, group.nN, group.nType);
+            ReserveBinaryInstanceTransformRange(
+                totalBytes,
+                group.transforms,
+                group.xformOff,
+                group.xformN,
+                group.xformType);
         }
         const size_t instanceBinaryBytes = totalBytes - instanceBytesStart;
 
@@ -3043,16 +3700,16 @@ public:
                 memcpy(buffer + node.vOff, node.verts.data(), node.verts.size() * sizeof(float));
             }
             if (!node.indices.empty()) {
-                memcpy(buffer + node.iOff, node.indices.data(), node.indices.size() * sizeof(int));
+                CopyBinaryIndices(buffer, node.iOff, node.indices, node.iType);
             }
             if (!node.uvs.empty()) {
-                memcpy(buffer + node.uvOff, node.uvs.data(), node.uvs.size() * sizeof(float));
+                CopyBinaryUvs(buffer, node.uvOff, node.uvs, node.uvType);
             }
             if (!node.uv2s.empty()) {
-                memcpy(buffer + node.uv2Off, node.uv2s.data(), node.uv2s.size() * sizeof(float));
+                CopyBinaryUvs(buffer, node.uv2Off, node.uv2s, node.uv2Type);
             }
             if (!node.norms.empty()) {
-                memcpy(buffer + node.nOff, node.norms.data(), node.norms.size() * sizeof(float));
+                CopyBinaryNormals(buffer, node.nOff, node.norms, node.nType);
             }
             for (const VertexColorAttributeRecord& attr : node.vertexColors) {
                 if (!attr.values.empty()) {
@@ -3061,10 +3718,10 @@ public:
             }
             if (node.skinRig) {
                 if (!node.skinWData.empty()) {
-                    memcpy(buffer + node.skinWOff, node.skinWData.data(), node.skinWData.size() * sizeof(float));
+                    CopyBinarySkinWeights(buffer, node.skinWOff, node.skinWData, node.skinWType);
                 }
                 if (!node.skinIdxData.empty()) {
-                    memcpy(buffer + node.skinIndOff, node.skinIdxData.data(), node.skinIdxData.size() * sizeof(float));
+                    CopyBinarySkinIndices(buffer, node.skinIndOff, node.skinIdxData, node.skinIdxType);
                 }
                 if (!node.skinBoneBindLocal.empty()) {
                     memcpy(buffer + node.skinBoneBindOff, node.skinBoneBindLocal.data(),
@@ -3094,18 +3751,30 @@ public:
             ss << L",\"geo\":{\"vOff\":" << node.vOff;
             ss << L",\"vN\":" << node.verts.size();
             ss << L",\"iOff\":" << node.iOff;
-            ss << L",\"iN\":" << node.indices.size();
+            ss << L",\"iN\":" << node.iN;
+            if (!node.iType.empty()) {
+                ss << L",\"iType\":\"" << node.iType << L"\"";
+            }
             if (!node.uvs.empty()) {
                 ss << L",\"uvOff\":" << node.uvOff;
                 ss << L",\"uvN\":" << node.uvs.size();
+                if (!node.uvType.empty()) {
+                    ss << L",\"uvType\":\"" << node.uvType << L"\"";
+                }
             }
             if (!node.uv2s.empty()) {
                 ss << L",\"uv2Off\":" << node.uv2Off;
                 ss << L",\"uv2N\":" << node.uv2s.size();
+                if (!node.uv2Type.empty()) {
+                    ss << L",\"uv2Type\":\"" << node.uv2Type << L"\"";
+                }
             }
             if (!node.norms.empty()) {
                 ss << L",\"nOff\":" << node.nOff;
                 ss << L",\"nN\":" << node.norms.size();
+                if (!node.nType.empty()) {
+                    ss << L",\"nType\":\"" << node.nType << L"\"";
+                }
             }
             WriteVertexColorOffsetsJson(ss, node.vertexColors);
             ss << L'}';
@@ -3127,6 +3796,12 @@ public:
                    << L",\"iN\":" << node.skinIdxData.size()
                    << L",\"bindOff\":" << node.skinBoneBindOff
                    << L",\"bindN\":" << node.skinBoneBindLocal.size();
+                if (!node.skinWType.empty()) {
+                    ss << L",\"wType\":\"" << node.skinWType << L"\"";
+                }
+                if (!node.skinIdxType.empty()) {
+                    ss << L",\"iType\":\"" << node.skinIdxType << L"\"";
+                }
                 ss << L"}";
                 if (!node.morphNames.empty()) {
                     ss << L",\"morph\":{";
@@ -3152,7 +3827,7 @@ public:
             }
 
             Mtl* multiMtl = FindMultiSubMtl(node.node->GetMtl());
-            if (!node.spline && multiMtl && multiMtl->NumSubMtls() > 0 && node.groups.size() > 1) {
+            if (!node.spline && ShouldEmitMultiSubMaterialGroups(multiMtl, node.groups)) {
                 ss << L",\"groups\":[";
                 for (size_t g = 0; g < node.groups.size(); ++g) {
                     if (g) ss << L',';
@@ -3257,16 +3932,20 @@ public:
                         memcpy(buffer + group.vOff, group.verts.data(), group.verts.size() * sizeof(float));
                     }
                     if (!group.indices.empty()) {
-                        memcpy(buffer + group.iOff, group.indices.data(), group.indices.size() * sizeof(int));
+                        CopyBinaryIndices(buffer, group.iOff, group.indices, group.iType);
                     }
                     if (!group.uvs.empty()) {
-                        memcpy(buffer + group.uvOff, group.uvs.data(), group.uvs.size() * sizeof(float));
+                        CopyBinaryUvs(buffer, group.uvOff, group.uvs, group.uvType);
                     }
                     if (!group.norms.empty()) {
-                        memcpy(buffer + group.nOff, group.norms.data(), group.norms.size() * sizeof(float));
+                        CopyBinaryNormals(buffer, group.nOff, group.norms, group.nType);
                     }
                     if (!group.transforms.empty()) {
-                        memcpy(buffer + group.xformOff, group.transforms.data(), group.transforms.size() * sizeof(float));
+                        CopyBinaryInstanceTransforms(
+                            buffer,
+                            group.xformOff,
+                            group.transforms,
+                            group.xformType);
                     }
 
                     ss << L"{\"src\":" << group.groupKey;
@@ -3276,18 +3955,27 @@ public:
                        << L",\"vN\":" << group.vN
                        << L",\"iOff\":" << group.iOff
                        << L",\"iN\":" << group.iN;
+                    if (!group.iType.empty()) {
+                        ss << L",\"iType\":\"" << group.iType << L"\"";
+                    }
                     if (group.uvN > 0) {
                         ss << L",\"uvOff\":" << group.uvOff
                            << L",\"uvN\":" << group.uvN;
+                        if (!group.uvType.empty()) {
+                            ss << L",\"uvType\":\"" << group.uvType << L"\"";
+                        }
                     }
                     if (group.nN > 0) {
                         ss << L",\"nOff\":" << group.nOff
                            << L",\"nN\":" << group.nN;
+                        if (!group.nType.empty()) {
+                            ss << L",\"nType\":\"" << group.nType << L"\"";
+                        }
                     }
                     ss << L"}";
                     ss << L",\"xformOff\":" << group.xformOff;
                     ss << L",\"xformN\":" << group.xformN;
-                    ss << L",\"xformType\":\"f32m16\"";
+                    ss << L",\"xformType\":\"" << (group.xformType.empty() ? L"f32m16" : group.xformType) << L"\"";
                     WriteInstanceGroupMaterial(ss, group, t);
                     ss << L'}';
                 }

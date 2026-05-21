@@ -221,7 +221,7 @@
 
                 auto cachedGroups = groupCache_.find(handle);
                 Mtl* multiMtl = FindMultiSubMtl(node->GetMtl());
-                if (multiMtl && multiMtl->NumSubMtls() > 0 && cachedGroups != groupCache_.end() && cachedGroups->second.size() > 1) {
+                if (cachedGroups != groupCache_.end() && ShouldEmitMultiSubMaterialGroups(multiMtl, cachedGroups->second)) {
                     ss << L",\"groups\":[";
                     for (size_t g = 0; g < cachedGroups->second.size(); g++) {
                         if (g) ss << L',';
@@ -328,7 +328,7 @@
                     if (!isSpline) {
                         // Multi/Sub material support (meshes only)
                         Mtl* multiMtl = FindMultiSubMtl(node->GetMtl());
-                        if (multiMtl && multiMtl->NumSubMtls() > 0 && groups.size() > 1) {
+                        if (ShouldEmitMultiSubMaterialGroups(multiMtl, groups)) {
                             ss << L",\"groups\":[";
                             for (size_t g = 0; g < groups.size(); g++) {
                                 if (g) ss << L',';
@@ -744,7 +744,7 @@
 
             // Multi/Sub material support
             Mtl* multiMtl = FindMultiSubMtl(ng.node->GetMtl());
-            if (multiMtl && multiMtl->NumSubMtls() > 0 && ng.groups.size() > 1) {
+            if (ShouldEmitMultiSubMaterialGroups(multiMtl, ng.groups)) {
                 ss << L",\"groups\":[";
                 for (size_t g = 0; g < ng.groups.size(); g++) {
                     if (g) ss << L',';

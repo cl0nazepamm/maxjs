@@ -2395,9 +2395,21 @@ static Mtl* GetSubMtlFromMatID(Mtl* multiMtl, int matID) {
     if (!multiMtl) return nullptr;
     const int subCount = multiMtl->NumSubMtls();
     if (subCount <= 0) return nullptr;
-    int idx = matID % subCount;
-    if (idx < 0) idx += subCount;
+
+    // Max face material IDs are 1-based for the common sequential Multi/Sub
+    // case. A separated mesh can have one face-ID group, e.g. only ID 2, and it
+    // still needs slot 2 rather than falling back to slot 1.
+    int idx = (matID > 0) ? (matID - 1) : 0;
+    if (idx < 0 || idx >= subCount) {
+        idx = matID % subCount;
+        if (idx < 0) idx += subCount;
+    }
     return multiMtl->GetSubMtl(idx);
+}
+
+template <typename TGroupList>
+static bool ShouldEmitMultiSubMaterialGroups(Mtl* multiMtl, const TGroupList& groups) {
+    return multiMtl && multiMtl->NumSubMtls() > 0 && !groups.empty();
 }
 
 static void ExtractPBR(INode* node, TimeValue t, MaxJSPBR& d) {

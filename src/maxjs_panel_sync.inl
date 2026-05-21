@@ -2289,6 +2289,25 @@
                     if (!norms.empty()) ss << L",\"nOff\":" << nOff << L",\"nN\":" << norms.size();
                     else ss << L",\"keepNormals\":true";
                     WriteVertexColorOffsetsJson(ss, vertexColors);
+                    if (!isSpline) {
+                        Mtl* multiMtl = FindMultiSubMtl(node->GetMtl());
+                        if (ShouldEmitMultiSubMaterialGroups(multiMtl, groups)) {
+                            ss << L",\"groups\":[";
+                            for (size_t g = 0; g < groups.size(); ++g) {
+                                if (g) ss << L',';
+                                ss << L'[' << groups[g].start << L',' << groups[g].count << L',' << g << L']';
+                            }
+                            ss << L"],\"mats\":[";
+                            for (size_t g = 0; g < groups.size(); ++g) {
+                                if (g) ss << L',';
+                                Mtl* subMtl = GetSubMtlFromMatID(multiMtl, groups[g].matID);
+                                MaxJSPBR subPBR;
+                                ExtractPBRFromMtl(subMtl, node, t, subPBR);
+                                WriteMaterialFull(ss, subPBR);
+                            }
+                            ss << L"]";
+                        }
+                    }
                 }
                 ss << L'}';
 
@@ -2307,6 +2326,25 @@
                 if (!uvs.empty()) { ss << L",\"uv\":"; WriteFloats(ss, uvs.data(), uvs.size()); }
                 if (!norms.empty()) { ss << L",\"norm\":"; WriteFloats(ss, norms.data(), norms.size()); }
                 WriteVertexColorAttributesJson(ss, vertexColors);
+                if (!usedSkinnedFastPositions && !isSpline) {
+                    Mtl* multiMtl = FindMultiSubMtl(node->GetMtl());
+                    if (ShouldEmitMultiSubMaterialGroups(multiMtl, groups)) {
+                        ss << L",\"groups\":[";
+                        for (size_t g = 0; g < groups.size(); ++g) {
+                            if (g) ss << L',';
+                            ss << L'[' << groups[g].start << L',' << groups[g].count << L',' << g << L']';
+                        }
+                        ss << L"],\"mats\":[";
+                        for (size_t g = 0; g < groups.size(); ++g) {
+                            if (g) ss << L',';
+                            Mtl* subMtl = GetSubMtlFromMatID(multiMtl, groups[g].matID);
+                            MaxJSPBR subPBR;
+                            ExtractPBRFromMtl(subMtl, node, t, subPBR);
+                            WriteMaterialFull(ss, subPBR);
+                        }
+                        ss << L"]";
+                    }
+                }
                 ss << L'}';
                 webview_->PostWebMessageAsJson(ss.str().c_str());
             }
@@ -4492,7 +4530,7 @@
         }
 
         Mtl* multiMtl = FindMultiSubMtl(grp.mtl);
-        if (multiMtl && multiMtl->NumSubMtls() > 0 && grp.groups.size() > 1) {
+        if (ShouldEmitMultiSubMaterialGroups(multiMtl, grp.groups)) {
             // Multi/Sub: write groups + per-group sub-materials
             ss << L",\"groups\":[";
             for (size_t g = 0; g < grp.groups.size(); g++) {

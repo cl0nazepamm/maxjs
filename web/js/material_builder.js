@@ -729,8 +729,8 @@ export function createMaterialBuilder({ rootUrl = '.', bakeState = null } = {}) 
         const names = bakeFilenameHasExplicitUvChannel(exact)
             ? [exact]
             : [
-                `${stem}_UV2.${extension}`,
                 `${stem}_UV1.${extension}`,
+                `${stem}_UV2.${extension}`,
                 exact,
                 ...(suffix ? [`${stem}.${extension}`] : []),
             ];
@@ -876,11 +876,22 @@ export function createMaterialBuilder({ rootUrl = '.', bakeState = null } = {}) 
             return material;
         }
 
+        // If both explicit UV variants exist, prefer the authored lightmap
+        // channel and otherwise fall back to UV1.
+        const preferredChannel = Number.isFinite(Number(md?.lmCh))
+            ? Math.max(1, Math.round(Number(md.lmCh)))
+            : 1;
+        const orderedCandidates = [...usableCandidates].sort((a, b) => {
+            const aMatch = a.maxMapChannel === preferredChannel ? 0 : 1;
+            const bMatch = b.maxMapChannel === preferredChannel ? 0 : 1;
+            return aMatch - bMatch;
+        });
+
         if (kind === 'beauty') {
             material.userData ??= {};
             clearBakeMissingUv(material);
             material.userData.maxjsSourceMaterialName = material.userData.maxjsSourceMaterialName ?? getMaterialBakeName(md, material);
-            const bake = loadBakeTextureEntryFromCandidates(usableCandidates, THREE.SRGBColorSpace, fallbackTextures.black);
+            const bake = loadBakeTextureEntryFromCandidates(orderedCandidates, THREE.SRGBColorSpace, fallbackTextures.black);
             if (!bake) return material;
             const { entry } = bake;
             material.toneMapped = !isDisplayBakedBeautyProxy(bake.url);
@@ -888,6 +899,7 @@ export function createMaterialBuilder({ rootUrl = '.', bakeState = null } = {}) 
             const baked = createBeautyBakeMaterial(material, entry.texture, bake.url, bake.maxMapChannel);
             if (!entry.loaded && !entry.failed) {
                 entry.callbacks.push((texture) => {
+                    applyTextureUvChannel(texture, bake.maxMapChannel, 2);
                     baked.map = texture;
                     baked.needsUpdate = true;
                 });
@@ -895,11 +907,12 @@ export function createMaterialBuilder({ rootUrl = '.', bakeState = null } = {}) 
             return baked;
         }
 
-        const bake = loadBakeTextureEntryFromCandidates(usableCandidates, THREE.LinearSRGBColorSpace);
+        const bake = loadBakeTextureEntryFromCandidates(orderedCandidates, THREE.LinearSRGBColorSpace);
         if (!bake) return material;
         const { entry } = bake;
         const assign = (texture) => {
             if (!textureReadyForMaterialBinding(texture)) return;
+            applyTextureUvChannel(texture, bake.maxMapChannel, 2);
             material.lightMap = texture;
             material.lightMapIntensity = bakeExposureScale();
             material.userData ??= {};
@@ -940,8 +953,17 @@ export function createMaterialBuilder({ rootUrl = '.', bakeState = null } = {}) 
         return true;
     }
 
+    // Bake override owns lightMap while enabled; the regular lmMap callback
+    // must not race it after async texture load.
+    function slotIsSuppressedByBakeOverride(slot) {
+        if (!bakeOverrides.enabled) return false;
+        if (bakeOverrides.mode !== 'lightmap') return false;
+        return slot.property === 'lightMap';
+    }
+
     function bindSlots(material, md, slots, boundSlots) {
         for (const slot of slots) {
+            if (slotIsSuppressedByBakeOverride(slot)) continue;
             if (bindTexture(material, slot, md)) boundSlots.push(slot.property);
         }
     }

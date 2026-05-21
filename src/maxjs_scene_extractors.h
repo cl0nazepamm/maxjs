@@ -1439,9 +1439,13 @@ struct ForestInstanceGroup {
     INode* mtlNode = nullptr;         // node for wire color fallback
     size_t vOff = 0, vN = 0;
     size_t iOff = 0, iN = 0;
+    std::wstring iType;
     size_t uvOff = 0, uvN = 0;
+    std::wstring uvType;
     size_t nOff = 0, nN = 0;
+    std::wstring nType;
     size_t xformOff = 0, xformN = 0;
+    std::wstring xformType;
 };
 
 // Register MaxJS as a Forest Pack render engine (once per session)

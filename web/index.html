@@ -279,6 +279,9 @@
             binInRange,
             buildSkinnedMeshFromNd as buildSkinnedMeshFromBinary,
             geometryFromNodeBinary,
+            indexArrayFromBinary,
+            normalAttributeFromBinary,
+            uvAttributeFromBinary,
             typedArrayCanStore,
             updateFloatGeometryAttribute,
             updateGeometryIndexAttribute,
@@ -1844,6 +1847,56 @@
             return applyTextureUvChannelShared(tex, maxMapChannel, fallbackMaxChannel);
         }
 
+        function explicitMaxMapChannelFromName(value) {
+            let filename = String(value ?? '');
+            try {
+                const parsed = new URL(filename, location.href);
+                filename = parsed.pathname || filename;
+            } catch {}
+            filename = filename.replace(/\\/g, '/').split('/').pop() || filename;
+            const baseName = filename.replace(/\.[^./\\]+$/, '');
+            const match = baseName.match(/(?:^|[_.\-\s])UV([12])(?:$|[_.\-\s])/i);
+            return match ? Number(match[1]) : null;
+        }
+
+        const textureUvChannelViews = new WeakMap();
+
+        function textureWithUvChannel(tex, maxMapChannel, fallbackMaxChannel = 1) {
+            if (!tex?.isTexture) return tex;
+            const channel = maxMapChannelToTextureChannel(maxMapChannel, fallbackMaxChannel);
+            if (tex.channel === channel) return tex;
+
+            let byChannel = textureUvChannelViews.get(tex);
+            if (!byChannel) {
+                byChannel = new Map();
+                textureUvChannelViews.set(tex, byChannel);
+            }
+            let view = byChannel.get(channel);
+            if (!view) {
+                view = tex.clone();
+                view.userData = { ...(tex.userData || {}), maxjsUvChannelViewOf: tex.uuid };
+                byChannel.set(channel, view);
+            }
+            view.channel = channel;
+            view.needsUpdate = true;
+            return view;
+        }
+
+        function resolveLightMapMaxMapChannel(md) {
+            const explicit = explicitMaxMapChannelFromName(md?.lmMap ?? md?.lightMap ?? '');
+            if (explicit === 1 || explicit === 2) return explicit;
+            if (Number.isFinite(Number(md?.lmCh))) return Math.max(1, Math.round(Number(md.lmCh)));
+            const xf = normalizeTextureTransform(md?.lmMapXf ?? md?.lightMapXf);
+            if (Number.isFinite(Number(xf?.uvChannel))) return Math.max(1, Math.round(Number(xf.uvChannel)));
+            return 2;
+        }
+
+        function withMaxMapChannelOverride(xf, maxMapChannel) {
+            if (!Number.isFinite(Number(maxMapChannel))) return xf;
+            const uvChannel = Math.max(1, Math.round(Number(maxMapChannel)));
+            return { ...((xf && typeof xf === 'object') ? xf : {}), uvChannel };
+        }
+
         function optimizedTextureTransformForSlot(key, xf) {
             return optimizedTextureTransformForSlotShared(key, xf);
         }
@@ -2556,10 +2609,11 @@
         }
 
         // Load a map slot — priority: HTML texmap → TSL procedural → URL bitmap.
-        function loadMapSlot(md, key, colorSpace, xfKey, fallback, materialContext = null) {
+        function loadMapSlot(md, key, colorSpace, xfKey, fallback, materialContext = null, maxMapChannelOverride = null) {
+            const xfSource = withMaxMapChannelOverride(xfKey ? md[xfKey] : null, maxMapChannelOverride);
             const htmlUrl = md[key + 'HTML'];
             if (htmlUrl) {
-                const normalizedXf = normalizeTextureTransform(xfKey ? md[xfKey] : null);
+                const normalizedXf = normalizeTextureTransform(xfSource);
                 const baseUrl = md[key + 'HTMLBase'] || '';
                 const filename = md[key + 'HTMLName'] || '';
                 // Prefer baseUrl + filename so snapshot-mode relative URLs
@@ -2582,7 +2636,7 @@
             const tslCode = md[key + 'TSL'];
             if (tslCode) return evalTSLTexture(tslCode, md[key + 'TSLParams']);
             const url = md[key];
-            if (url) return loadTexture(url, colorSpace, optimizedTextureTransformForSlot(key, xfKey ? md[xfKey] : null), fallback);
+            if (url) return loadTexture(url, colorSpace, optimizedTextureTransformForSlot(key, xfSource), fallback);
             return null;
         }
 
@@ -3713,9 +3767,12 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             applyMap('aoMap',      'aoMap',                  THREE.LinearSRGBColorSpace,   'aoMapXf',      W);
             applyMap('emMap',      'emissiveMap',            THREE.SRGBColorSpace,         'emMapXf',      W);
             applyMap('transMap',   'transmissionMap',        THREE.LinearSRGBColorSpace,   'transMapXf',   W);
-            const lmTex = applyMap('lmMap', 'lightMap', THREE.LinearSRGBColorSpace, 'lmMapXf', W);
+            const lightMapChannel = resolveLightMapMaxMapChannel(md);
+            const lmTex = loadMapSlot(md, 'lmMap', THREE.LinearSRGBColorSpace, 'lmMapXf', W, materialContext, lightMapChannel);
+            if (lmTex && 'lightMap' in material) material.lightMap = lmTex;
             if (lmTex) {
-                material.lightMap = applyTextureUvChannel(lmTex, md.lmCh, 2);
+                material.lightMap = textureWithUvChannel(lmTex, lightMapChannel, 2);
+                applyWebGpuLightMapUvContext(material, lightMapChannel);
                 material.lightMapIntensity = md.lmI ?? material.lightMapIntensity ?? 1.0;
             }
             applyMap('matcapMap',  'matcap',                 THREE.SRGBColorSpace,         'matcapMapXf',  W);
@@ -4103,9 +4160,11 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
 
                     // Lightmap
                     {
-                        const lmTex = loadMapSlot(md, 'lmMap', THREE.LinearSRGBColorSpace, 'lmMapXf', fallbackWhiteTexture, materialContext);
+                        const lightMapChannel = resolveLightMapMaxMapChannel(md);
+                        const lmTex = loadMapSlot(md, 'lmMap', THREE.LinearSRGBColorSpace, 'lmMapXf', fallbackWhiteTexture, materialContext, lightMapChannel);
                         if (lmTex) {
-                            template.lightMap = applyTextureUvChannel(lmTex, md.lmCh, 2);
+                            template.lightMap = textureWithUvChannel(lmTex, lightMapChannel, 2);
+                            applyWebGpuLightMapUvContext(template, lightMapChannel);
                             template.lightMapIntensity = md.lmI ?? 1.0;
                         }
                     }
@@ -4564,6 +4623,32 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                                 && pos.count === vertCount
                                 && (!hasIncomingIndex || (existingIdx && existingIdx.count === idxCount));
                             const incomingVertexColors = normalizeVertexColorDescriptors(meta.vc);
+                            const applyIncomingGroups = () => {
+                                if (!Array.isArray(meta.groups)) return;
+                                mesh.geometry.clearGroups();
+                                for (const [start, count, idx] of meta.groups) {
+                                    mesh.geometry.addGroup(start, count, idx);
+                                }
+                            };
+                            const applyIncomingMaterial = () => {
+                                if (!Array.isArray(meta.groups) || !Array.isArray(meta.mats)) return;
+                                const ndForMaterial = {
+                                    ...(mesh.userData?.maxjsLastNodePayload || {}),
+                                    h: meta.h,
+                                    n: mesh.name,
+                                    t: mesh.matrix?.elements,
+                                    groups: meta.groups,
+                                    mats: meta.mats,
+                                };
+                                delete ndForMaterial.mat;
+                                delete ndForMaterial.matRef;
+                                delete ndForMaterial.matRefs;
+                                const oldMaterial = mesh.material;
+                                mesh.material = createSceneRenderableMaterial(ndForMaterial, wantsLine, mesh.geometry, mesh);
+                                stampSceneMaterial(mesh, ndForMaterial, wantsLine);
+                                disposeSceneMaterial(oldMaterial);
+                                layerManager.applyMaterialOverrides?.(meta.h, mesh);
+                            };
 
                             if (sameTopology) {
                                 // Hot path: copy positions into existing GPU buffer
@@ -4591,6 +4676,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                                     mesh.geometry.computeBoundingBox();
                                     mesh.geometry.computeBoundingSphere();
                                 }
+                                applyIncomingGroups();
                             } else {
                                 if (!hasIncomingIndex) return;
                                 // Topology changed — full rebuild
@@ -4624,7 +4710,9 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                                 }
                                 mesh.geometry.dispose();
                                 mesh.geometry = geom;
+                                applyIncomingGroups();
                             }
+                            applyIncomingMaterial();
                             // Geometry data on the same Object3D — no pipeline
                             // rebuild needed regardless of which branch ran.
                             ssgiFx?.markGeometryDataDirty?.();
@@ -4821,6 +4909,54 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             return false;
         }
 
+        const webGpuLightMapUvContexts = new WeakMap();
+
+        function restoreWebGpuLightMapUvContext(material) {
+            const state = material ? webGpuLightMapUvContexts.get(material) : null;
+            if (!state) return false;
+            const ownsContext = material.contextNode === state.contextNode;
+            webGpuLightMapUvContexts.delete(material);
+            if (!ownsContext) return false;
+            material.contextNode = state.previousContext ?? null;
+            material.needsUpdate = true;
+            return true;
+        }
+
+        function applyWebGpuLightMapUvContext(material, maxMapChannel = 2) {
+            if (!material) return false;
+            if (String(rendererBackendLabel || '') !== 'WebGPU') return restoreWebGpuLightMapUvContext(material);
+            const channel = Number.isFinite(Number(maxMapChannel))
+                ? Math.max(1, Math.round(Number(maxMapChannel)))
+                : 2;
+            if (channel !== 1) return restoreWebGpuLightMapUvContext(material);
+            const lightMap = material.lightMap;
+            if (!lightMap?.isTexture || typeof TSL?.replaceDefaultUV !== 'function' || typeof TSL?.uv !== 'function') {
+                return restoreWebGpuLightMapUvContext(material);
+            }
+
+            const lightMapUuid = lightMap.uuid;
+            const previousState = webGpuLightMapUvContexts.get(material);
+            if (previousState?.textureUuid === lightMapUuid &&
+                previousState?.maxMapChannel === channel &&
+                material.contextNode === previousState.contextNode) {
+                return false;
+            }
+            const previousContext = previousState?.previousContext ?? material.contextNode ?? null;
+            const contextNode = TSL.replaceDefaultUV((textureNode) => {
+                const tex = textureNode?.value;
+                if (tex === lightMap || tex?.uuid === lightMapUuid) return TSL.uv(0);
+                if (textureNode?.uvNode) return textureNode.uvNode;
+                const fallbackChannel = Number.isFinite(Number(tex?.channel))
+                    ? Math.max(0, Math.round(Number(tex.channel)))
+                    : 0;
+                return TSL.uv(fallbackChannel);
+            });
+            material.contextNode = contextNode;
+            webGpuLightMapUvContexts.set(material, { previousContext, contextNode, textureUuid: lightMapUuid, maxMapChannel: channel });
+            material.needsUpdate = true;
+            return true;
+        }
+
         function markBakeMissingUv(material, maxMapChannel = 2) {
             material.userData ??= {};
             material.userData.maxjsBakeMissingUV = maxMapChannel;
@@ -4859,7 +4995,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             const exposureScale = displayProxy ? 1 : bakeExposureScale();
             const mat = new BakeTHREE.MeshBasicMaterial({
                 color: new BakeTHREE.Color(exposureScale, exposureScale, exposureScale),
-                map: applyTextureUvChannel(texture, maxMapChannel, 2),
+                map: textureWithUvChannel(texture, maxMapChannel, 2),
                 side: source?.side ?? BakeTHREE.FrontSide,
                 transparent: !!source?.transparent || (Number.isFinite(source?.opacity) && source.opacity < 1),
                 opacity: Number.isFinite(source?.opacity) ? source.opacity : 1,
@@ -4873,10 +5009,42 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             return mat;
         }
 
+        function bakeOverrideOwnerKey(nd, mesh = null) {
+            const handle = nd?.h ?? mesh?.userData?.maxjsHandle;
+            if (handle != null) return `h:${handle}`;
+            return `n:${mesh?.name || nd?.n || nd?.name || ''}`;
+        }
+
+        function stampBakeOverrideOwner(material, nd, mesh = null) {
+            if (!material) return;
+            material.userData ??= {};
+            material.userData.maxjsBakeOwnerKey = bakeOverrideOwnerKey(nd, mesh);
+            material.userData.maxjsBakeOwnerName = mesh?.name || nd?.n || nd?.name || '';
+        }
+
+        function ensureBakeOverrideMaterialInstance(material, nd, mesh = null) {
+            if (!material) return material;
+            const ownerKey = bakeOverrideOwnerKey(nd, mesh);
+            const existingOwnerKey = material.userData?.maxjsBakeOwnerKey;
+            const needsClone = isCachedMaterialTemplate(material) ||
+                (existingOwnerKey && existingOwnerKey !== ownerKey);
+            if (!needsClone) {
+                stampBakeOverrideOwner(material, nd, mesh);
+                return material;
+            }
+            const clone = material.clone();
+            clone.userData = { ...(material.userData || {}) };
+            stampBakeOverrideOwner(clone, nd, mesh);
+            rememberMaterialEmissiveBase(clone);
+            clone.needsUpdate = true;
+            return clone;
+        }
+
         function applyBakeOverrideToMaterial(material, nd, geom, mesh = null) {
             if (!material || !bakeOverrides.enabled) return material;
             if (material.isLineBasicMaterial || material.isLineDashedMaterial) return material;
             const kind = bakeOverrides.mode === 'beauty' ? 'beauty' : 'lightmap';
+            if (kind === 'lightmap') material = ensureBakeOverrideMaterialInstance(material, nd, mesh);
             const candidates = getBakeTextureCandidates(nd, material, kind, mesh);
             if (!candidates.length) return material;
             const usableCandidates = candidates.filter(candidate => hasGeometryMaxMapChannel(geom, candidate.maxMapChannel));
@@ -4898,12 +5066,16 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
 
             const bake = loadBakeTextureFromCandidates(usableCandidates, THREE.LinearSRGBColorSpace);
             if (!bake) return material;
-            material.lightMap = bake.texture;
+            material.lightMap = textureWithUvChannel(bake.texture, bake.maxMapChannel, 2);
+            applyWebGpuLightMapUvContext(material, bake.maxMapChannel);
             material.lightMapIntensity = bakeExposureScale();
             material.userData ??= {};
+            stampBakeOverrideOwner(material, nd, mesh);
             clearBakeMissingUv(material);
             material.userData.maxjsBakeOverride = 'lightmap';
+            material.userData.maxjsBakeSourceUrl = bake.url;
             material.userData.maxjsBakeUvChannel = bake.maxMapChannel;
+            material.userData.maxjsBakeTextureChannel = material.lightMap?.channel ?? null;
             material.needsUpdate = true;
             return material;
         }
@@ -5389,7 +5561,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             audioSystem?.applyAudios(snapshot.audios ?? []);
             gltfSystem?.applyGLTFs(snapshot.gltfs ?? []);
             applyHairInstances(snapshot.hairInstances ?? []);
-            applyForestInstances(snapshot.forestInstances ?? []);
+            applyForestInstances(snapshot.forestInstances ?? [], options.binaryBuffer ?? null);
             applyVolumes(snapshot.volumes ?? []);
             const bucketPlan = options.bucketPlan ?? planMaxInstanceBuckets(snapshot.nodes);
             refreshMaterialRegistry(snapshot.nodes, bucketPlan);
@@ -7819,6 +7991,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 if (wasOverride === 'lightmap') {
                     material.lightMap = null;
                     material.lightMapIntensity = 1.0;
+                    restoreWebGpuLightMapUvContext(material);
                     if (material.userData) delete material.userData.maxjsBakeOverride;
                     material.needsUpdate = true;
                     return true;
@@ -7834,6 +8007,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     if (wasOverride === 'lightmap') {
                         material.lightMap = null;
                         material.lightMapIntensity = 1.0;
+                        restoreWebGpuLightMapUvContext(material);
                         delete material.userData.maxjsBakeOverride;
                         material.needsUpdate = true;
                         return true;
@@ -7846,18 +8020,24 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
 
             const bake = loadBakeTextureFromCandidates(usableCandidates, THREE.LinearSRGBColorSpace);
             if (!bake) return false;
-            const nextLightMap = bake.texture;
+            const nextLightMap = textureWithUvChannel(bake.texture, bake.maxMapChannel, 2);
             const intensity = bakeExposureScale();
             const lightMapChanged = material.lightMap !== nextLightMap;
             const intensityChanged = material.lightMapIntensity !== intensity;
-            if (!lightMapChanged && !intensityChanged && wasOverride === 'lightmap') return false;
+            const uvChannelChanged = material.userData?.maxjsBakeUvChannel !== bake.maxMapChannel ||
+                material.userData?.maxjsBakeTextureChannel !== (nextLightMap?.channel ?? null);
             material.lightMap = nextLightMap;
+            const uvContextChanged = applyWebGpuLightMapUvContext(material, bake.maxMapChannel);
+            if (!lightMapChanged && !intensityChanged && !uvChannelChanged && !uvContextChanged && wasOverride === 'lightmap') return false;
             material.lightMapIntensity = intensity;
             material.userData ??= {};
+            stampBakeOverrideOwner(material, nd, mesh);
             clearBakeMissingUv(material);
             material.userData.maxjsBakeOverride = 'lightmap';
+            material.userData.maxjsBakeSourceUrl = bake.url;
             material.userData.maxjsBakeUvChannel = bake.maxMapChannel;
-            if (lightMapChanged) material.needsUpdate = true;
+            material.userData.maxjsBakeTextureChannel = nextLightMap?.channel ?? null;
+            if (lightMapChanged || uvChannelChanged || uvContextChanged) material.needsUpdate = true;
             return true;
         }
 
@@ -7883,8 +8063,18 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     continue;
                 }
 
-                for (const m of mats) {
-                    if (!m || seenMats.has(m)) continue;
+                for (let materialIndex = 0; materialIndex < mats.length; materialIndex++) {
+                    let m = mats[materialIndex];
+                    if (!m) continue;
+                    const unique = ensureBakeOverrideMaterialInstance(m, nd, mesh);
+                    if (unique !== m) {
+                        if (Array.isArray(mesh.material)) mesh.material[materialIndex] = unique;
+                        else mesh.material = unique;
+                        disposeSceneMaterial(m);
+                        m = unique;
+                        changed = true;
+                    }
+                    if (seenMats.has(m)) continue;
                     seenMats.add(m);
                     if (mutateLightmapBakeOnMaterial(m, nd, mesh.geometry, mesh)) changed = true;
                 }
@@ -8059,7 +8249,6 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                             stem,
                             filename,
                             sourceUrl: candidate.url,
-                            maxDimension: /containers?_main/i.test(stem) ? 2048 : 1024,
                         });
                     }
                 }
@@ -8121,6 +8310,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         }
 
         let bakeProxyRenderer = null;
+        const BAKE_PROXY_MAX_SOURCE_DIMENSION = 8192;
         function getBakeProxyRenderer() {
             if (bakeProxyRenderer) return bakeProxyRenderer;
             bakeProxyRenderer = new THREE_STD.WebGLRenderer({
@@ -8150,9 +8340,11 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             const image = source.image || {};
             const sourceWidth = Math.max(1, Number(image.width) || 1);
             const sourceHeight = Math.max(1, Number(image.height) || 1);
-            const scale = Math.min(1, target.maxDimension / Math.max(sourceWidth, sourceHeight));
-            const width = Math.max(1, Math.round(sourceWidth * scale));
-            const height = Math.max(1, Math.round(sourceHeight * scale));
+            const width = Math.round(sourceWidth);
+            const height = Math.round(sourceHeight);
+            if (width > BAKE_PROXY_MAX_SOURCE_DIMENSION || height > BAKE_PROXY_MAX_SOURCE_DIMENSION) {
+                throw new Error(`Bake proxy source is ${width}x${height}; PNG proxy export preserves source size and supports up to ${BAKE_PROXY_MAX_SOURCE_DIMENSION}px per side`);
+            }
 
             const proxyTexture = cloneProxyTextureForWebGL(source);
             if (!proxyTexture) throw new Error(`Unsupported proxy source texture: ${target.sourceUrl}`);
@@ -8532,7 +8724,76 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         // ── ForestPack GPU Instancing ───────────────────────
         const forestMeshes = new Map(); // key → InstancedMesh
 
-        function applyForestInstances(groups) {
+        function getForestBinaryFloatView(buffer, off, n, label) {
+            if (!(buffer instanceof ArrayBuffer) || !binInRange(buffer, off, n)) {
+                console.warn(`[max.js binary] Invalid ${label} range`);
+                return null;
+            }
+            return new Float32Array(buffer, off, n);
+        }
+
+        function getForestGeometryPayload(grp, binaryBuffer) {
+            const geo = grp?.geo;
+            if (geo && binaryBuffer instanceof ArrayBuffer) {
+                const v = getForestBinaryFloatView(binaryBuffer, geo.vOff, geo.vN, 'forest position');
+                const i = indexArrayFromBinary(binaryBuffer, geo.iOff, geo.iN, geo.iType, {
+                    copy: true,
+                    label: 'forest index',
+                });
+                if (!v || !i) return null;
+                const uvAttr = geo.uvOff != null && geo.uvN
+                    ? uvAttributeFromBinary(binaryBuffer, geo.uvOff, geo.uvN, geo.uvType, 'forest uv')
+                    : null;
+                const normalAttr = geo.nOff != null && geo.nN
+                    ? normalAttributeFromBinary(binaryBuffer, geo.nOff, geo.nN, geo.nType, 'forest normal')
+                    : null;
+                return {
+                    v: new Float32Array(v),
+                    i,
+                    uv: null,
+                    uvAttr,
+                    norm: null,
+                    normalAttr,
+                };
+            }
+            if (!grp?.v?.length || !grp?.i?.length) return null;
+            return { v: grp.v, i: grp.i, uv: grp.uv, uvAttr: null, norm: grp.norm, normalAttr: null };
+        }
+
+        function getForestTransformPayload(grp, binaryBuffer) {
+            if (Number.isInteger(grp?.xformOff) && Number.isInteger(grp?.xformN) && binaryBuffer instanceof ArrayBuffer) {
+                const values = getForestBinaryFloatView(binaryBuffer, grp.xformOff, grp.xformN, 'forest transform');
+                if (!values) return null;
+                const type = String(grp.xformType ?? 'f32m16').trim().toLowerCase();
+                return { values, type, stride: type === 'affine12' ? 12 : 16 };
+            }
+            if (Array.isArray(grp?.xforms) || ArrayBuffer.isView(grp?.xforms)) {
+                return { values: grp.xforms, type: 'f32m16', stride: 16 };
+            }
+            return null;
+        }
+
+        function setForestInstanceMatrix(matrix, payload, index) {
+            const values = payload.values;
+            const off = index * payload.stride;
+            if (payload.type === 'affine12') {
+                matrix.set(
+                    values[off+0], values[off+3], values[off+6],  values[off+9],
+                    values[off+1], values[off+4], values[off+7],  values[off+10],
+                    values[off+2], values[off+5], values[off+8],  values[off+11],
+                    0,             0,             0,              1
+                );
+                return;
+            }
+            matrix.set(
+                values[off+0], values[off+4], values[off+8],  values[off+12],
+                values[off+1], values[off+5], values[off+9],  values[off+13],
+                values[off+2], values[off+6], values[off+10], values[off+14],
+                values[off+3], values[off+7], values[off+11], values[off+15]
+            );
+        }
+
+        function applyForestInstances(groups, binaryBuffer = null) {
             // Remove old forest meshes
             for (const [key, mesh] of forestMeshes) {
                 maxRoot.remove(mesh);
@@ -8547,9 +8808,19 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             const m = new THREE.Matrix4();
 
             for (const grp of groups) {
-                if (!grp.v?.length || !grp.i?.length || !grp.xforms?.length) continue;
+                const geoPayload = getForestGeometryPayload(grp, binaryBuffer);
+                const xformPayload = getForestTransformPayload(grp, binaryBuffer);
+                const count = grp.count || Math.floor((xformPayload?.values?.length || 0) / (xformPayload?.stride || 16));
+                if (!geoPayload || !xformPayload?.values || !count ||
+                    xformPayload.values.length < count * xformPayload.stride) {
+                    continue;
+                }
 
-                const geom = buildGeometry(grp.v, grp.i, grp.uv, grp.norm);
+                const geom = buildGeometry(geoPayload.v, geoPayload.i, geoPayload.uv, geoPayload.norm, {
+                    skipNormalCompute: !!geoPayload.normalAttr,
+                });
+                if (geoPayload.uvAttr) geom.setAttribute('uv', geoPayload.uvAttr);
+                if (geoPayload.normalAttr) geom.setAttribute('normal', geoPayload.normalAttr);
 
                 // Material: use data from C++ (single or multi-sub), fallback to gray
                 let mat;
@@ -8565,7 +8836,6 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     mat = new THREE.MeshStandardMaterial({ color: 0x888888, roughness: 0.7, side: THREE.DoubleSide });
                 }
 
-                const count = grp.count || (grp.xforms.length / 16);
                 const instMesh = new THREE.InstancedMesh(geom, mat, count);
                 instMesh.matrixAutoUpdate = false;
                 instMesh.frustumCulled = false;
@@ -8573,16 +8843,8 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 instMesh.receiveShadow = true;
                 instMesh.name = `forest_${grp.src}_x${count}`;
 
-                // xforms is a flat array: [m0_0..m0_15, m1_0..m1_15, ...]
                 for (let i = 0; i < count; i++) {
-                    const off = i * 16;
-                    // Max row-major → Three.js column-major (transpose)
-                    m.set(
-                        grp.xforms[off+0], grp.xforms[off+4], grp.xforms[off+8],  grp.xforms[off+12],
-                        grp.xforms[off+1], grp.xforms[off+5], grp.xforms[off+9],  grp.xforms[off+13],
-                        grp.xforms[off+2], grp.xforms[off+6], grp.xforms[off+10], grp.xforms[off+14],
-                        grp.xforms[off+3], grp.xforms[off+7], grp.xforms[off+11], grp.xforms[off+15]
-                    );
+                    setForestInstanceMatrix(m, xformPayload, i);
                     instMesh.setMatrixAt(i, m);
                 }
                 instMesh.instanceMatrix.needsUpdate = true;

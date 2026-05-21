@@ -426,6 +426,15 @@ body.light-mode .dock-drag-handle.dragging::after { background: rgba(0, 0, 0, 0.
 .snapshot-actions button {
     flex: 1 1 0;
 }
+.snapshot-location {
+    color: #b9c7d9;
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    padding: 6px 7px;
+    font: 10px/1.35 Consolas, 'Cascadia Mono', monospace;
+    overflow-wrap: anywhere;
+    user-select: text;
+}
 .snapshot-note {
     color: #777;
     font-size: 9px;

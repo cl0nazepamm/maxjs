@@ -1054,6 +1054,7 @@
         MarkSelectedTransformsDirty();
         CheckSelectedGeometryLive();
         MarkCameraDirtyIfChanged(false);
+        PollViewportModes();
         if (ShouldRunInteractiveMaterialChecks()) CheckTrackedMaterialScalarsLive();
     }
 

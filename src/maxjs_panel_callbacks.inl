@@ -66,6 +66,7 @@ void MaxJSFastRedrawCallback::proc(Interface*) {
     // Camera is cheap and should not be throttled by selected-transform or
     // geometry lanes; keep it on its own immediate dirty check.
     owner_->MarkCameraDirtyIfChanged(false);
+    owner_->PollViewportModes();
     if (!animPlaying) owner_->PollSelectedTransformGizmoLive();
 
     // RedrawViewsCallback fires for viewport hover/selection highlight too.

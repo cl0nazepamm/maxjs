@@ -2217,6 +2217,82 @@
             return pending;
         }
 
+        function canUploadVideoFrame(video) {
+            return !!video &&
+                !video.error &&
+                !video.seeking &&
+                video.readyState >= video.HAVE_CURRENT_DATA &&
+                video.videoWidth > 0 &&
+                video.videoHeight > 0;
+        }
+
+        function installSafeVideoTexturePump(tex, video) {
+            if (!tex || !video) return;
+            let disposed = false;
+            let frameCallbackId = 0;
+            if (tex.source) tex.source.dataReady = false;
+
+            if (tex._requestVideoFrameCallbackId &&
+                typeof video.cancelVideoFrameCallback === 'function') {
+                try { video.cancelVideoFrameCallback(tex._requestVideoFrameCallbackId); } catch {}
+                tex._requestVideoFrameCallbackId = 0;
+            }
+
+            const markReadyFrame = () => {
+                if (!canUploadVideoFrame(video)) return;
+                if (tex.source) tex.source.dataReady = true;
+                tex.needsUpdate = true;
+            };
+
+            tex.update = markReadyFrame;
+
+            const scheduleFrameCallback = () => {
+                if (disposed || typeof video.requestVideoFrameCallback !== 'function') return;
+                frameCallbackId = video.requestVideoFrameCallback(() => {
+                    frameCallbackId = 0;
+                    markReadyFrame();
+                    scheduleFrameCallback();
+                });
+                tex._requestVideoFrameCallbackId = frameCallbackId;
+            };
+
+            const onReady = () => {
+                markReadyFrame();
+                if (!frameCallbackId) scheduleFrameCallback();
+            };
+            const onNotReady = () => {
+                if (tex.source) tex.source.dataReady = false;
+            };
+
+            video.addEventListener('loadeddata', onReady);
+            video.addEventListener('canplay', onReady);
+            video.addEventListener('playing', onReady);
+            video.addEventListener('seeked', onReady);
+            video.addEventListener('seeking', onNotReady);
+            video.addEventListener('waiting', onNotReady);
+            video.addEventListener('stalled', onNotReady);
+
+            const disposeBase = tex.dispose.bind(tex);
+            tex.dispose = () => {
+                disposed = true;
+                video.removeEventListener('loadeddata', onReady);
+                video.removeEventListener('canplay', onReady);
+                video.removeEventListener('playing', onReady);
+                video.removeEventListener('seeked', onReady);
+                video.removeEventListener('seeking', onNotReady);
+                video.removeEventListener('waiting', onNotReady);
+                video.removeEventListener('stalled', onNotReady);
+                if (frameCallbackId && typeof video.cancelVideoFrameCallback === 'function') {
+                    try { video.cancelVideoFrameCallback(frameCallbackId); } catch {}
+                }
+                frameCallbackId = 0;
+                tex._requestVideoFrameCallbackId = 0;
+                disposeBase();
+            };
+
+            onReady();
+        }
+
         function loadVideoTexture(url, xf) {
             const normalizedXf = normalizeTextureTransform(xf);
             const playbackKey = JSON.stringify({
@@ -2228,18 +2304,21 @@
             const cacheKey = `video:${url}:${playbackKey}:${JSON.stringify(normalizedXf)}`;
             if (textureCache.has(cacheKey)) return textureCache.get(cacheKey);
             const video = document.createElement('video');
-            video.src = url;
             video.crossOrigin = 'anonymous';
             video.loop = xf?.loop !== false;
             video.muted = xf?.muted !== false;
             video.playbackRate = xf?.rate ?? 1.0;
             video.playsInline = true;
             video.autoplay = true;
+            video.preload = 'auto';
+            video.src = url;
+            video.load?.();
             video.play().catch(() => {});
             const tex = new THREE.VideoTexture(video);
             tex.colorSpace = THREE.SRGBColorSpace;
             tex.minFilter = THREE.LinearFilter;
             tex.magFilter = THREE.LinearFilter;
+            installSafeVideoTexturePump(tex, video);
             // Honor Max UV tiling/offset/rotation/wrap + channel select, the
             // same as still-image textures (loadTexture) — video previously
             // ignored all of these.
@@ -9427,6 +9506,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         const snapshotPanel = document.getElementById('snapshotPanel');
         let snapshotPanelVisible = false;
         let pendingSnapshotRequestId = null;
+        let lastSnapshotExportPath = '';
 
         function setSnapshotPanelVisible(visible) {
             snapshotPanelVisible = !!visible;
@@ -9517,6 +9597,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                         <div class="snapshot-actions">
                             <button id="snapshotExportBtn" type="button">Export Snapshot</button>
                         </div>
+                        <div id="snapshotExportLocation" class="snapshot-location" hidden></div>
                         <div class="snapshot-note">Settings persist across sessions.</div>
                     </section>
                 </div>
@@ -9544,10 +9625,23 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             const effective = getSnapshotExportSettings();
             const exportButton = snapshotPanel.querySelector('#snapshotExportBtn');
             const status = snapshotPanel.querySelector('#snapshotPanelStatus');
+            const location = snapshotPanel.querySelector('#snapshotExportLocation');
             if (status) {
-                status.textContent = window.chrome?.webview
-                    ? `dist export • step ${effective.animationSampleStepFrames}f`
-                    : 'Available only inside max.js';
+                if (!window.chrome?.webview) status.textContent = 'Available only inside max.js';
+                else if (pendingSnapshotRequestId) status.textContent = 'Writing snapshot...';
+                else if (lastSnapshotExportPath) status.textContent = 'Snapshot saved';
+                else status.textContent = `dist export • step ${effective.animationSampleStepFrames}f`;
+            }
+            if (location) {
+                if (lastSnapshotExportPath) {
+                    location.hidden = false;
+                    location.textContent = `Snapshot saved to ${lastSnapshotExportPath}`;
+                    location.title = lastSnapshotExportPath;
+                } else {
+                    location.hidden = true;
+                    location.textContent = '';
+                    location.removeAttribute('title');
+                }
             }
             if (exportButton) {
                 exportButton.disabled = !window.chrome?.webview || !!pendingSnapshotRequestId;
@@ -9639,10 +9733,12 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             if (msg.action !== 'snapshot_export') return;
             if (pendingSnapshotRequestId && msg.requestId && msg.requestId !== pendingSnapshotRequestId) return;
             pendingSnapshotRequestId = null;
-            syncSnapshotPanel();
             if (msg.ok) {
-                setInfoText(`max.js - snapshot written: ${msg.path || 'dist'}`);
+                lastSnapshotExportPath = msg.path || 'dist';
+                setInfoText(`max.js - Snapshot saved to ${lastSnapshotExportPath}`);
+                syncSnapshotPanel();
             } else {
+                syncSnapshotPanel();
                 reportBridgeError('snapshot export', msg.error || 'snapshot export failed');
             }
         });

@@ -3,6 +3,8 @@
 #include <max.h>
 #include <triobj.h>
 #include <polyobj.h>
+#include <MeshNormalSpec.h>
+#include <MNNormalSpec.h>
 #include <iepoly.h>
 #include <iEPolyMod.h>
 #include <mnmesh.h>
@@ -781,6 +783,40 @@ static void BatchNormalizeSSE(float* data, size_t count) {
     }
 }
 
+static Point3 NormalizeNormalOrFallback(const Point3& value, const Point3& fallback = Point3(0.0f, 0.0f, 1.0f)) {
+    if (!std::isfinite(value.x) || !std::isfinite(value.y) || !std::isfinite(value.z)) return fallback;
+    return DotProd(value, value) > 1.0e-20f ? NormalizeSSE(value) : fallback;
+}
+
+static Point3 ComputeMNMeshFaceNormalSafe(MNMesh& mn, int faceIdx) {
+    const Point3 fallback(0.0f, 0.0f, 1.0f);
+    if (faceIdx < 0 || faceIdx >= mn.FNum()) return fallback;
+    MNFace* face = mn.F(faceIdx);
+    if (!face || face->GetFlag(MN_DEAD) || face->deg < 3 || !face->vtx) return fallback;
+
+    Point3 n(0.0f, 0.0f, 0.0f);
+    for (int c = 0; c < face->deg; ++c) {
+        const int ci = face->vtx[c];
+        const int ni = face->vtx[(c + 1) % face->deg];
+        if (ci < 0 || ci >= mn.VNum() || ni < 0 || ni >= mn.VNum()) return fallback;
+        const Point3 cur = mn.P(ci);
+        const Point3 nxt = mn.P(ni);
+        n.x += (cur.y - nxt.y) * (cur.z + nxt.z);
+        n.y += (cur.z - nxt.z) * (cur.x + nxt.x);
+        n.z += (cur.x - nxt.x) * (cur.y + nxt.y);
+    }
+    return NormalizeNormalOrFallback(n, fallback);
+}
+
+static Point3 ComputeMeshFaceNormalSafe(Mesh& mesh, int faceIdx) {
+    const Point3 fallback(0.0f, 0.0f, 1.0f);
+    if (faceIdx < 0 || faceIdx >= mesh.getNumFaces()) return fallback;
+    const Point3 a = mesh.getVert(mesh.faces[faceIdx].v[0]);
+    const Point3 b = mesh.getVert(mesh.faces[faceIdx].v[1]);
+    const Point3 c = mesh.getVert(mesh.faces[faceIdx].v[2]);
+    return NormalizeNormalOrFallback((b - a) ^ (c - a), fallback);
+}
+
 // ══════════════════════════════════════════════════════════════
 //  Mesh Extraction with UV coordinates + Multi/Sub material groups
 // ══════════════════════════════════════════════════════════════
@@ -793,13 +829,18 @@ struct MeshCornerKey {
     DWORD uv2Idx = 0;
     DWORD smGroup = 0;
     uint64_t colorSig = 0;
+    // Explicit (specified) normal index, or -1 when the corner's normal is
+    // implicit (derived from smoothing groups). Two corners that share a
+    // position/uv/color but carry different explicit normals must not merge.
+    int normalId = -1;
 
     bool operator==(const MeshCornerKey& other) const {
         return posIdx == other.posIdx &&
                uvIdx == other.uvIdx &&
                uv2Idx == other.uv2Idx &&
                smGroup == other.smGroup &&
-               colorSig == other.colorSig;
+               colorSig == other.colorSig &&
+               normalId == other.normalId;
     }
 };
 
@@ -811,6 +852,7 @@ struct MeshCornerKeyHash {
         h = h * 16777619u ^ static_cast<size_t>(key.smGroup);
         h = h * 16777619u ^ static_cast<size_t>(key.colorSig);
         h = h * 16777619u ^ static_cast<size_t>(key.colorSig >> 32);
+        h = h * 16777619u ^ static_cast<size_t>(static_cast<unsigned>(key.normalId));
         return h;
     }
 };
@@ -819,6 +861,7 @@ struct FastVertexSource {
     int controlIdx = -1;
     DWORD smGroup = 0;
     int faceIdx = -1;
+    int localIdx = -1;
 };
 
 // ── MNMesh (PolyObject) extraction — handles ngons correctly ──
@@ -872,45 +915,61 @@ static bool ExtractMeshFromMNMesh(MNMesh& mn,
             [](const FaceRef& a, const FaceRef& b) { return a.matID < b.matID; });
     }
 
+    // Explicit (specified) normals — Edit Normals modifier, weighted normals,
+    // imported custom normals, etc. When present these override the implicit
+    // smoothing-group computation; otherwise normals are derived below.
+    MNNormalSpec* normalSpec = mn.GetSpecifiedNormals();
+    const bool hasNormalSpec = normalSpec &&
+        normalSpec->GetNumFaces() == numFaces &&
+        normalSpec->GetNumNormals() > 0;
+    const int specNormalCount = hasNormalSpec ? normalSpec->GetNumNormals() : 0;
+    auto resolveSpecNormalId = [&](int faceIdx, int localIdx) -> int {
+        if (!hasNormalSpec) return -1;
+        MNNormalFace& nf = normalSpec->Face(faceIdx);
+        if (localIdx < 0 || localIdx >= nf.GetDegree()) return -1;
+        if (!nf.GetSpecified(localIdx)) return -1;
+        const int nid = nf.GetNormalID(localIdx);
+        return (nid >= 0 && nid < specNormalCount) ? nid : -1;
+    };
+
     const bool smoothZeroSmoothingForDynamic =
-        outFastVertexSources != nullptr || outControlIdx != nullptr;
+        !outNormals && (outFastVertexSources != nullptr || outControlIdx != nullptr);
     auto effectiveSmGrpForDynamic = [smoothZeroSmoothingForDynamic](DWORD smGrp) -> DWORD {
         // Editable Mesh / Poly objects with smGroup 0 are often just bad
         // imported/faceted normals. If we preserve that for deforming MaxJS
         // nodes, extraction splits every face corner into a unique render
         // vertex and playback payloads scale with face count instead of
-        // control vertices. For dynamic/deform sync, treat zero smoothing as
-        // one smooth island; static extraction keeps authored hard normals.
+        // control vertices. Keep authored hard normals whenever this payload
+        // includes normals; the compatibility shortcut is only for position-only
+        // dynamic/deform extraction.
         return (smoothZeroSmoothingForDynamic && smGrp == 0) ? 0x7fffffffu : smGrp;
     };
 
-    // Per-corner smoothed normals, indexed by faceCornerStart[faceIdx] + localIdx.
-    // Avoids the hash-map-per-corner cost that dominated on 700k+ poly meshes and
-    // lets the face-normal and smooth-normal passes run on a PPL worker pool.
+    // Per-corner implicit normals. Keep this local and read-only; Max's
+    // ComputeRenderNormal path can update internal accel/cache state and is
+    // unsafe on the live sync mesh.
     std::vector<int> faceCornerStart;
+    std::vector<Point3> faceNormalsFlat;
     std::vector<Point3> cornerNormals;
     if (outNormals) {
         faceCornerStart.assign(numFaces, 0);
-        std::vector<Point3> faceNormalsFlat(numFaces, Point3(0, 0, 0));
+        faceNormalsFlat.assign(numFaces, Point3(0, 0, 0));
 
-        // Phase A: face normals — independent writes per faceIdx slot.
         concurrency::parallel_for(size_t(0), liveFaces.size(), [&](size_t i) {
             const FaceRef& fr = liveFaces[i];
-            MNFace* face = mn.F(fr.idx);
-            if (face->deg < 3) return;
-            Point3 cross = CrossProductSSE(mn.P(face->vtx[0]), mn.P(face->vtx[1]), mn.P(face->vtx[2]));
-            faceNormalsFlat[fr.idx] = NormalizeSSE(cross);
+            faceNormalsFlat[fr.idx] = ComputeMNMeshFaceNormalSafe(mn, fr.idx);
         });
 
-        // Phase B: build CSR vertex→corners index (serial; cheap O(totalCorners)).
         std::vector<int> vertCornerOff(static_cast<size_t>(numVerts) + 1, 0);
         int totalCorners = 0;
         for (const FaceRef& fr : liveFaces) {
             MNFace* face = mn.F(fr.idx);
+            if (!face || !face->vtx) continue;
             faceCornerStart[fr.idx] = totalCorners;
             totalCorners += face->deg;
             for (int v = 0; v < face->deg; v++) {
-                vertCornerOff[face->vtx[v] + 1]++;
+                const int pIdx = face->vtx[v];
+                if (pIdx >= 0 && pIdx < numVerts) vertCornerOff[pIdx + 1]++;
             }
         }
         for (int i = 1; i <= numVerts; i++) vertCornerOff[i] += vertCornerOff[i - 1];
@@ -921,17 +980,16 @@ static bool ExtractMeshFromMNMesh(MNMesh& mn,
             std::vector<int> cursor(numVerts, 0);
             for (const FaceRef& fr : liveFaces) {
                 MNFace* face = mn.F(fr.idx);
+                if (!face || !face->vtx) continue;
                 const DWORD smGrp = effectiveSmGrpForDynamic(face->smGroup);
                 for (int v = 0; v < face->deg; v++) {
-                    int pIdx = face->vtx[v];
+                    const int pIdx = face->vtx[v];
+                    if (pIdx < 0 || pIdx >= numVerts) continue;
                     vertCornersFlat[vertCornerOff[pIdx] + cursor[pIdx]++] = { fr.idx, v, smGrp };
                 }
             }
         }
 
-        // Phase C: smooth-normal accumulation — each vertex index owns a disjoint
-        // slice of vertCornersFlat and writes to disjoint cornerNormals slots, so
-        // parallel_for is data-race-free.
         cornerNormals.assign(static_cast<size_t>(totalCorners), Point3(0, 0, 0));
         concurrency::parallel_for(0, numVerts, [&](int posIdx) {
             const int beg = vertCornerOff[posIdx];
@@ -948,7 +1006,7 @@ static bool ExtractMeshFromMNMesh(MNMesh& mn,
                             accum += faceNormalsFlat[other.faceIdx];
                     }
                 }
-                cornerNormals[faceCornerStart[c.faceIdx] + c.localIdx] = NormalizeSSE(accum);
+                cornerNormals[faceCornerStart[c.faceIdx] + c.localIdx] = NormalizeNormalOrFallback(accum);
             }
         });
     }
@@ -1021,12 +1079,18 @@ static bool ExtractMeshFromMNMesh(MNMesh& mn,
                     colorSig = HashFNV1a(&colorIdx, sizeof(colorIdx), colorSig);
                 }
 
+                const int specNid = resolveSpecNormalId(fr.idx, localIdx);
                 // smGrp 0 = no smoothing: force unique vertices per face for flat normals.
                 // Dynamic/deform extraction maps zero smoothing to one smooth
                 // island above so bad faceted import normals do not explode
-                // live playback topology.
-                DWORD keySmGrp = smGrp == 0 ? (DWORD)(0x80000000u | fr.idx) : smGrp;
+                // live playback topology. Explicit-normal corners merge by
+                // their normal ID instead (handled via key.normalId), so they
+                // skip the per-face smGrp split.
+                DWORD keySmGrp = (specNid < 0 && smGrp == 0)
+                    ? (DWORD)(0x80000000u | fr.idx)
+                    : smGrp;
                 MeshCornerKey key = { posIdx, uvIdx, hasUV2s ? uv2Idx : 0, keySmGrp, colorSig };
+                key.normalId = specNid;
                 auto it = vertMap.find(key);
                 if (it != vertMap.end()) {
                     indices.push_back(it->second);
@@ -1040,7 +1104,9 @@ static bool ExtractMeshFromMNMesh(MNMesh& mn,
                     verts.push_back(p.z);
 
                     if (outNormals) {
-                        const Point3& n = cornerNormals[faceCornerStart[fr.idx] + localIdx];
+                        const Point3 n = specNid >= 0
+                            ? NormalizeNormalOrFallback(normalSpec->Normal(specNid), faceNormalsFlat[fr.idx])
+                            : cornerNormals[faceCornerStart[fr.idx] + localIdx];
                         normals.push_back(n.x);
                         normals.push_back(n.y);
                         normals.push_back(n.z);
@@ -1087,7 +1153,7 @@ static bool ExtractMeshFromMNMesh(MNMesh& mn,
 
                     if (outControlIdx) outControlIdx->push_back(static_cast<int>(posIdx));
                     if (outFastVertexSources)
-                        outFastVertexSources->push_back({ static_cast<int>(posIdx), smGrp, fr.idx });
+                        outFastVertexSources->push_back({ static_cast<int>(posIdx), smGrp, fr.idx, localIdx });
                     indices.push_back(newIdx);
                 }
             }
@@ -1126,7 +1192,7 @@ static bool ExtractMeshFromTriObject(TriObject* tri, Object* srcObj,
     const bool hasUV2s = uv2Map != nullptr;
     const std::vector<int> vertexColorChannels = CollectMeshVertexColorChannels(mesh, allowMapChannel1);
     const bool smoothZeroSmoothingForDynamic =
-        outFastVertexSources != nullptr || outControlIdx != nullptr;
+        !outNormals && (outFastVertexSources != nullptr || outControlIdx != nullptr);
     auto effectiveSmGrpForDynamic = [smoothZeroSmoothingForDynamic](DWORD smGrp) -> DWORD {
         return (smoothZeroSmoothingForDynamic && smGrp == 0) ? 0x7fffffffu : smGrp;
     };
@@ -1145,15 +1211,29 @@ static bool ExtractMeshFromTriObject(TriObject* tri, Object* srcObj,
         });
     }
 
+    // Explicit (specified) normals — Edit Normals modifier, weighted normals,
+    // imported custom normals, etc. Override the implicit smoothing-group
+    // computation per corner when present.
+    MeshNormalSpec* normalSpec = mesh.GetSpecifiedNormals();
+    const bool hasNormalSpec = normalSpec &&
+        normalSpec->GetNumFaces() == nf &&
+        normalSpec->GetNumNormals() > 0;
+    const int specNormalCount = hasNormalSpec ? normalSpec->GetNumNormals() : 0;
+    auto resolveSpecNormalId = [&](int faceIdx, int corner) -> int {
+        if (!hasNormalSpec || corner < 0 || corner > 2) return -1;
+        MeshNormalFace& nf = normalSpec->Face(faceIdx);
+        if (!nf.GetSpecified(corner)) return -1;
+        const int nid = nf.GetNormalID(corner);
+        return (nid >= 0 && nid < specNormalCount) ? nid : -1;
+    };
+
+    std::vector<Point3> faceNormals;
     std::vector<Point3> cornerNormals;
     if (outNormals) {
-        std::vector<Point3> faceNormals(nf);
+        faceNormals.assign(nf, Point3(0, 0, 0));
 
         concurrency::parallel_for(0, nf, [&](int f) {
-            const Point3 a = mesh.getVert(mesh.faces[f].v[0]);
-            const Point3 b = mesh.getVert(mesh.faces[f].v[1]);
-            const Point3 c = mesh.getVert(mesh.faces[f].v[2]);
-            faceNormals[f] = NormalizeSSE((b - a) ^ (c - a));
+            faceNormals[f] = ComputeMeshFaceNormalSafe(mesh, f);
         });
 
         std::vector<int> vertCornerOff(static_cast<size_t>(nv) + 1, 0);
@@ -1190,7 +1270,7 @@ static bool ExtractMeshFromTriObject(TriObject* tri, Object* srcObj,
                         if ((other.smGrp & c.smGrp) != 0) accum += faceNormals[other.faceIdx];
                     }
                 }
-                cornerNormals[c.faceIdx * 3 + c.localV] = NormalizeSSE(accum);
+                cornerNormals[c.faceIdx * 3 + c.localV] = NormalizeNormalOrFallback(accum);
             }
         });
     }
@@ -1241,10 +1321,12 @@ static bool ExtractMeshFromTriObject(TriObject* tri, Object* srcObj,
                 colorSig = HashFNV1a(&channel, sizeof(channel), colorSig);
                 colorSig = HashFNV1a(&colorIdx, sizeof(colorIdx), colorSig);
             }
-            const DWORD keySmGrp = smGrp == 0
+            const int specNid = resolveSpecNormalId(f, v);
+            const DWORD keySmGrp = (specNid < 0 && smGrp == 0)
                 ? (DWORD)(0x80000000u | static_cast<DWORD>(f))
                 : smGrp;
             MeshCornerKey key = { posIdx, uvIdx, hasUV2s ? uv2Idx : 0, keySmGrp, colorSig };
+            key.normalId = specNid;
 
             auto it = vertMap.find(key);
             if (it != vertMap.end()) {
@@ -1259,7 +1341,9 @@ static bool ExtractMeshFromTriObject(TriObject* tri, Object* srcObj,
                 verts.push_back(p.z);
 
                 if (outNormals) {
-                    const Point3& n = cornerNormals[f * 3 + v];
+                    const Point3 n = specNid >= 0
+                        ? NormalizeNormalOrFallback(normalSpec->Normal(specNid), faceNormals[f])
+                        : cornerNormals[f * 3 + v];
                     normals.push_back(n.x);
                     normals.push_back(n.y);
                     normals.push_back(n.z);
@@ -1300,7 +1384,7 @@ static bool ExtractMeshFromTriObject(TriObject* tri, Object* srcObj,
 
                 if (outControlIdx) outControlIdx->push_back(static_cast<int>(posIdx));
                 if (outFastVertexSources)
-                    outFastVertexSources->push_back({ static_cast<int>(posIdx), smGrp, f });
+                    outFastVertexSources->push_back({ static_cast<int>(posIdx), smGrp, f, v });
                 indices.push_back(newIdx);
             }
         }
@@ -1342,18 +1426,13 @@ static bool ExtractMeshFromRawMesh(Mesh& mesh,
         });
     }
 
-    // Per-corner smoothed normals: cornerNormals[f*3 + v]. Avoids the map
-    // hash cost that dominated on dense tri meshes and parallelizes the
-    // face-normal and smooth-normal passes.
+    std::vector<Point3> faceNormals;
     std::vector<Point3> cornerNormals;
     if (outNormals) {
-        std::vector<Point3> faceNormals(nf);
+        faceNormals.assign(nf, Point3(0, 0, 0));
 
         concurrency::parallel_for(0, nf, [&](int f) {
-            const Point3 a = mesh.getVert(mesh.faces[f].v[0]);
-            const Point3 b = mesh.getVert(mesh.faces[f].v[1]);
-            const Point3 c = mesh.getVert(mesh.faces[f].v[2]);
-            faceNormals[f] = Normalize((b - a) ^ (c - a));
+            faceNormals[f] = ComputeMeshFaceNormalSafe(mesh, f);
         });
 
         std::vector<int> vertCornerOff(static_cast<size_t>(nv) + 1, 0);
@@ -1390,7 +1469,7 @@ static bool ExtractMeshFromRawMesh(Mesh& mesh,
                         if ((other.smGrp & c.smGrp) != 0) accum += faceNormals[other.faceIdx];
                     }
                 }
-                cornerNormals[c.faceIdx * 3 + c.localV] = Normalize(accum);
+                cornerNormals[c.faceIdx * 3 + c.localV] = NormalizeNormalOrFallback(accum);
             }
         });
     }
@@ -1924,10 +2003,6 @@ static bool ExtractSkinnedFastPositions(INode* node,
     return ok;
 }
 
-static Point3 NormalizeFastNormalOrFallback(const Point3& value, const Point3& fallback) {
-    return DotProd(value, value) > 1.0e-20f ? NormalizeSSE(value) : fallback;
-}
-
 static bool ExtractMNMeshFastGeometry(MNMesh& mn,
                                       const std::vector<FastVertexSource>& sources,
                                       std::vector<float>& outVerts,
@@ -1957,9 +2032,7 @@ static bool ExtractMNMeshFastGeometry(MNMesh& mn,
 
     std::vector<Point3> faceNormals(nf, Point3(0, 0, 0));
     concurrency::parallel_for(0, nf, [&](int f) {
-        MNFace* face = mn.F(f);
-        if (!face || face->GetFlag(MN_DEAD) || face->deg < 3) return;
-        faceNormals[f] = NormalizeSSE(CrossProductSSE(mn.P(face->vtx[0]), mn.P(face->vtx[1]), mn.P(face->vtx[2])));
+        faceNormals[f] = ComputeMNMeshFaceNormalSafe(mn, f);
     });
 
     std::vector<int> vertCornerOff(static_cast<size_t>(nv) + 1, 0);
@@ -2013,7 +2086,7 @@ static bool ExtractMNMeshFastGeometry(MNMesh& mn,
                 accum = faceNormals[src.faceIdx];
             }
         }
-        const Point3 n = NormalizeFastNormalOrFallback(accum, fallback);
+        const Point3 n = NormalizeNormalOrFallback(accum, fallback);
         (*outNormals)[i * 3 + 0] = n.x;
         (*outNormals)[i * 3 + 1] = n.y;
         (*outNormals)[i * 3 + 2] = n.z;
@@ -2050,10 +2123,7 @@ static bool ExtractMeshFastGeometry(Mesh& mesh,
 
     std::vector<Point3> faceNormals(nf, Point3(0, 0, 0));
     concurrency::parallel_for(0, nf, [&](int f) {
-        const Point3 a = mesh.getVert(mesh.faces[f].v[0]);
-        const Point3 b = mesh.getVert(mesh.faces[f].v[1]);
-        const Point3 c = mesh.getVert(mesh.faces[f].v[2]);
-        faceNormals[f] = NormalizeSSE((b - a) ^ (c - a));
+        faceNormals[f] = ComputeMeshFaceNormalSafe(mesh, f);
     });
 
     std::vector<int> vertCornerOff(static_cast<size_t>(nv) + 1, 0);
@@ -2096,7 +2166,7 @@ static bool ExtractMeshFastGeometry(Mesh& mesh,
                 accum = faceNormals[src.faceIdx];
             }
         }
-        const Point3 n = NormalizeFastNormalOrFallback(accum, fallback);
+        const Point3 n = NormalizeNormalOrFallback(accum, fallback);
         (*outNormals)[i * 3 + 0] = n.x;
         (*outNormals)[i * 3 + 1] = n.y;
         (*outNormals)[i * 3 + 2] = n.z;

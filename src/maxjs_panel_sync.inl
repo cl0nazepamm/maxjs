@@ -2281,13 +2281,11 @@
                 ss << L",\"vOff\":" << vOff << L",\"vN\":" << verts.size();
                 if (usedSkinnedFastPositions) {
                     if (!norms.empty()) ss << L",\"nOff\":" << nOff << L",\"nN\":" << norms.size();
-                    else ss << L",\"keepNormals\":true";
                     ss << L",\"skipBounds\":true";
                 } else {
                     ss << L",\"iOff\":" << iOff << L",\"iN\":" << indices.size();
                     if (!uvs.empty()) ss << L",\"uvOff\":" << uvOff << L",\"uvN\":" << uvs.size();
                     if (!norms.empty()) ss << L",\"nOff\":" << nOff << L",\"nN\":" << norms.size();
-                    else ss << L",\"keepNormals\":true";
                     WriteVertexColorOffsetsJson(ss, vertexColors);
                     if (!isSpline) {
                         Mtl* multiMtl = FindMultiSubMtl(node->GetMtl());

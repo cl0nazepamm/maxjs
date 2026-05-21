@@ -2030,6 +2030,12 @@ static bool ExtractMNMeshFastGeometry(MNMesh& mn,
     outNormals->clear();
     if (nf <= 0) return true;
 
+    MNNormalSpec* normalSpec = mn.GetSpecifiedNormals();
+    const bool hasNormalSpec = normalSpec &&
+        normalSpec->GetNumFaces() == nf &&
+        normalSpec->GetNumNormals() > 0;
+    const int specNormalCount = hasNormalSpec ? normalSpec->GetNumNormals() : 0;
+
     std::vector<Point3> faceNormals(nf, Point3(0, 0, 0));
     concurrency::parallel_for(0, nf, [&](int f) {
         faceNormals[f] = ComputeMNMeshFaceNormalSafe(mn, f);
@@ -2070,6 +2076,22 @@ static bool ExtractMNMeshFastGeometry(MNMesh& mn,
     concurrency::parallel_for(size_t(0), sources.size(), [&](size_t i) {
         const FastVertexSource& src = sources[i];
         const bool validFace = src.faceIdx >= 0 && src.faceIdx < nf;
+        if (hasNormalSpec && validFace) {
+            MNNormalFace& nfSpec = normalSpec->Face(src.faceIdx);
+            if (src.localIdx >= 0 &&
+                src.localIdx < nfSpec.GetDegree() &&
+                nfSpec.GetSpecified(src.localIdx)) {
+                const int nid = nfSpec.GetNormalID(src.localIdx);
+                if (nid >= 0 && nid < specNormalCount) {
+                    const Point3 n = NormalizeNormalOrFallback(normalSpec->Normal(nid), faceNormals[src.faceIdx]);
+                    (*outNormals)[i * 3 + 0] = n.x;
+                    (*outNormals)[i * 3 + 1] = n.y;
+                    (*outNormals)[i * 3 + 2] = n.z;
+                    return;
+                }
+            }
+        }
+
         Point3 accum(0, 0, 0);
         if (src.smGroup == 0) {
             accum = validFace ? faceNormals[src.faceIdx] : fallback;
@@ -2121,6 +2143,12 @@ static bool ExtractMeshFastGeometry(Mesh& mesh,
     outNormals->clear();
     if (nf <= 0) return true;
 
+    MeshNormalSpec* normalSpec = mesh.GetSpecifiedNormals();
+    const bool hasNormalSpec = normalSpec &&
+        normalSpec->GetNumFaces() == nf &&
+        normalSpec->GetNumNormals() > 0;
+    const int specNormalCount = hasNormalSpec ? normalSpec->GetNumNormals() : 0;
+
     std::vector<Point3> faceNormals(nf, Point3(0, 0, 0));
     concurrency::parallel_for(0, nf, [&](int f) {
         faceNormals[f] = ComputeMeshFaceNormalSafe(mesh, f);
@@ -2150,6 +2178,22 @@ static bool ExtractMeshFastGeometry(Mesh& mesh,
     concurrency::parallel_for(size_t(0), sources.size(), [&](size_t i) {
         const FastVertexSource& src = sources[i];
         const bool validFace = src.faceIdx >= 0 && src.faceIdx < nf;
+        if (hasNormalSpec && validFace) {
+            MeshNormalFace& nfSpec = normalSpec->Face(src.faceIdx);
+            if (src.localIdx >= 0 &&
+                src.localIdx < 3 &&
+                nfSpec.GetSpecified(src.localIdx)) {
+                const int nid = nfSpec.GetNormalID(src.localIdx);
+                if (nid >= 0 && nid < specNormalCount) {
+                    const Point3 n = NormalizeNormalOrFallback(normalSpec->Normal(nid), faceNormals[src.faceIdx]);
+                    (*outNormals)[i * 3 + 0] = n.x;
+                    (*outNormals)[i * 3 + 1] = n.y;
+                    (*outNormals)[i * 3 + 2] = n.z;
+                    return;
+                }
+            }
+        }
+
         Point3 accum(0, 0, 0);
         if (src.smGroup == 0) {
             accum = validFace ? faceNormals[src.faceIdx] : fallback;

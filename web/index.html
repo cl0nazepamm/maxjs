@@ -4634,7 +4634,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                             const hasIncomingIndex = meta.iOff != null && meta.iN != null;
                             const idxCount = hasIncomingIndex ? meta.iN : 0;
                             const existingIdx = mesh.geometry.getIndex();
-                            const skipBounds = !!(meta.keepNormals || meta.skipBounds || meta.compactChannels);
+                            const skipBounds = !!(meta.skipBounds || meta.compactChannels);
                             const sameTopology = wantsLine === hasLine
                                 && pos
                                 && pos.count === vertCount

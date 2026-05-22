@@ -1,16 +1,17 @@
 # max.js - Three.js integration for 3dsmax
 
- Comes with a nice postfx stack and it's very fun to play around with! Runs on WebGPU backend.
+Comes with a postfx stack, live 3ds Max scene sync, standalone snapshots, and switchable Three.js renderer pipelines.
 
 ![max.js demo](img/maxjs.gif)
 
 # Features
 
-- **Realtime Sync** — Binary delta protocol over WebView2 shared memory.
-- **ActiveShade** — Docks into a Max viewport for live feedback on your design
+- **Realtime Sync** — Binary delta protocol over WebView2 shared memory, with a slow JSON debug mode for heavy Max scenes.
+- **ActiveShade** — Docks into a Max viewport for live feedback on your design.
 - **Layer Manager** — Scene-local runtime layer system for project scripts, inline scripts, and overlays.
-- **Snapshots** — Fast export your scene to standalone (WIP)
-- **Virtual Reality** — WebXR (only tested on Quest 3 VDXR) (WebGL only)
+- **Snapshots** — Export a scene to a deployable standalone web package.
+- **Renderer pipelines** — WGL2, WebGPU, and TSL_GL modes.
+- **Pathtracing** — Live-only preview mode. Not part of snapshot export.
 
 ---
 
@@ -20,11 +21,11 @@ Supports rendering of splines (as lines) and all types of meshes.
 
 - **Splat Origin** — Gaussian Splat loading via [Spark](https://github.com/sparkjsdev/spark) (`@sparkjsdev/spark`).
 - **Audio Origin** — Load audio tracks
-- **WebGPU instancing** - Instance handling is automatic including forest pack and railclone geo
+- **Instancing** — Instance handling is automatic, including Forest Pack and RailClone-style generated geometry.
 
 ## Materials
 
-Most 3dsmax materials are supported. Three.js materials can be created in material editor also. You might have to switch renderer to Three.js for it to show up.
+Most 3ds Max materials are supported. Three.js materials can also be created in the Material Editor.
 
 ### Supported Material Types
 
@@ -42,7 +43,7 @@ Most 3dsmax materials are supported. Three.js materials can be created in materi
 | **MaterialX** | Load external MaterialX | 
 | **Shell Material** | Reads viewport slot so you don't have to overwrite existing |
 
-Auto-promotion to MeshPhysicalMaterial triggers when clearcoat, sheen, transmission, iridescence, anisotropy, or non-default IOR is detected. Map colors always drive result even if a bitmap is connected.
+Auto-promotion to MeshPhysicalMaterial triggers when clearcoat, sheen, transmission, iridescence, anisotropy, or non-default IOR is detected. For glTF and USD Preview materials, connected maps are treated as the authored color source and scalar color multipliers stay neutral.
 MaterialX Compiler slot can be used to convert 3dsMax OSL into MaterialX quickly (via MtlxIOUtil).
 
 ---
@@ -73,7 +74,7 @@ All shadow-casting lights support configurable bias, blur radius, and map resolu
 
 ## Post-Processing
 
-Most effects require WebGPU backend. Supplied by three.js team with few of my own added (not in the list).
+Most screen-space effects require the WebGPU backend. Simpler viewer paths remain available through WGL2 and TSL_GL.
 
 | Effect | Key Parameters |
 |---|---|
@@ -120,12 +121,13 @@ HTML can be loaded directly to viewer with React support.
 ## Environment
 
 - **HDRIEnviron.osl** with exposure, gamma, and rotation controls
-- **Sky** (three.js Sky): turbidity, rayleigh, mie coefficient/direction, sun elevation/azimuth, exposure
+- **Sky**: classic three.js sky plus geospatial atmosphere where supported by the active renderer mode. Directional sunlight can be linked to sky azimuth/elevation.
 - **Fog (postfx):** linear (near/far), exponential (density), procedural noise (scale, speed, height falloff, animated turbulence)
+- **Camera clipping:** manual near/far overrides persist with postfx/snapshot UI state. Default near plane is 1 for better depth precision.
 
 ---
 
-## Snapshots (WIP)
+## Snapshots
 
 One-click export to a self-contained HTML site with:
 - Full scene hierarchy with transforms
@@ -135,6 +137,7 @@ One-click export to a self-contained HTML site with:
 - Gaussian splats
 - Layers
 - Automatic asset URL rewriting for portability
+- Viewer UI state, camera clipping, HDRI/post-FX state, and scene-local project sidecars when enabled
 
 ---
 
@@ -166,43 +169,23 @@ Layer Manager tracks ownership and cleanup for runtime-created objects, material
 
 # Exporting your scene standalone
 
-- **Snapshot sites**: Click snapshot and it saves. That's it. Your mileage may vary when it comes to performance or missing stuff.
-- This is work in progress. Do not actually try anything serious with this.
+- **Snapshot sites**: Click snapshot and export a deployable viewer folder.
+- Runtime layers are replayed from `project.maxjs.json` and `inlines/` when those sidecars exist.
 
 # Missing - To do
 
 - Morpher under Skin (do not use morphers with skin modifier you will write vertex for every frame). Otherwise you can use it.
-
-# Rendering frames
-
-This tool targets web development but since it's registered as renderer I added some functions to get pictures out.
-
-# Bugs
-- ActiveShade can bug out if you maximize or minimize windows. Just use registered "kill maxjs" command in search menu
-- Memory can build up when adjusting properties like postfx etc. Just CTRL+SHIFT+R to restart the viewer to clean up. 
 
 # Build
 
 **Requirements:** Visual Studio 2022 (v143 toolset), CMake 3.20+, 3ds Max SDK
 
 ```bash
-# 1. Pull WebView2 SDK (one time)
-setup_webview2.bat
-
-# 2. Configure
-cmake -B build -G "Visual Studio 17 2022" -A x64 .
-
-# If your SDK isn't in the default path:
-# cmake -B build -G "Visual Studio 17 2022" -A x64 -DMAXSDK_PATH="D:/your/sdk/maxsdk" .
-
-# 3. Build
-cmake --build build --config Release
-
-# 4. Deploy (needs admin if Max is in Program Files)
-copy build\Release\maxjs.gup "C:\Program Files\Autodesk\3ds Max 2026\plugins\"
+build.bat
+build.bat 2027
 ```
 
-Restart Max to load the plugin.
+`build.bat` configures, builds, and deploys the plugin plus `maxjs_web` runtime. Restart Max to load a replaced `.gup`.
 
 ## Acknowledgments
 

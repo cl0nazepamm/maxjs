@@ -2395,9 +2395,52 @@ static Mtl* GetSubMtlFromMatID(Mtl* multiMtl, int matID) {
     if (!multiMtl) return nullptr;
     const int subCount = multiMtl->NumSubMtls();
     if (subCount <= 0) return nullptr;
-    int idx = matID % subCount;
-    if (idx < 0) idx += subCount;
+
+    // Multi/Sub-Object keeps two parallel, compacted per-slot tables in its
+    // param block: materialIDList (the ID column) and materialList (the
+    // sub-materials). Slots can carry arbitrary, non-sequential IDs — common
+    // after detaching part of a multi-material mesh, where the fragment keeps
+    // a single face-ID group (e.g. only ID 2) against the original material.
+    // Resolve the face's material ID against the ID table and pull the
+    // sub-material from the matching slot of materialList, instead of assuming
+    // the slot index equals matID - 1. Reading materialList directly avoids
+    // depending on whether GetSubMtl() exposes a compacted or ID-sparse view.
+    for (int b = 0; b < multiMtl->NumParamBlocks(); b++) {
+        IParamBlock2* pb = multiMtl->GetParamBlock(b);
+        if (!pb) continue;
+        ParamID idListId = -1;
+        ParamID mtlListId = -1;
+        for (int i = 0; i < pb->NumParams(); i++) {
+            const ParamID pid = pb->IndextoID(i);
+            const ParamDef& pd = pb->GetParamDef(pid);
+            if (!pd.int_name) continue;
+            if (pd.type == TYPE_INT_TAB && PBNameEquals(pd.int_name, _T("materialIDList")))
+                idListId = pid;
+            else if (pd.type == TYPE_MTL_TAB && PBNameEquals(pd.int_name, _T("materialList")))
+                mtlListId = pid;
+        }
+        if (idListId < 0) continue;
+        const int idCount = pb->Count(idListId);
+        for (int s = 0; s < idCount; s++) {
+            if (pb->GetInt(idListId, 0, s) != matID) continue;
+            if (mtlListId >= 0 && s < pb->Count(mtlListId))
+                return pb->GetMtl(mtlListId, 0, s);
+            return (s < subCount) ? multiMtl->GetSubMtl(s) : nullptr;
+        }
+    }
+
+    // No usable ID table (legacy / non-standard multi material): fall back to
+    // the sequential mapping, wrapping out-of-range IDs the way the renderer
+    // does for the common contiguous case.
+    int idx = (matID > 0 && matID <= subCount)
+                  ? (matID - 1)
+                  : (((matID % subCount) + subCount) % subCount);
     return multiMtl->GetSubMtl(idx);
+}
+
+template <typename TGroupList>
+static bool ShouldEmitMultiSubMaterialGroups(Mtl* multiMtl, const TGroupList& groups) {
+    return multiMtl && multiMtl->NumSubMtls() > 0 && !groups.empty();
 }
 
 static void ExtractPBR(INode* node, TimeValue t, MaxJSPBR& d) {

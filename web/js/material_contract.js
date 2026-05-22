@@ -202,15 +202,54 @@ export function maxMapChannelToTextureChannel(maxMapChannel, fallbackMaxChannel 
     return Math.max(0, maxChannel - 1);
 }
 
+function isVideoTextureImage(image) {
+    return typeof HTMLVideoElement !== 'undefined' && image instanceof HTMLVideoElement;
+}
+
+function canUploadVideoFrame(image) {
+    if (!isVideoTextureImage(image)) return true;
+    return !image.error &&
+        !image.seeking &&
+        image.readyState >= image.HAVE_CURRENT_DATA &&
+        image.videoWidth > 0 &&
+        image.videoHeight > 0;
+}
+
+function markTextureUploadReady(tex, image = tex?.source?.data ?? tex?.image) {
+    if (image == null) return;
+    if (!canUploadVideoFrame(image)) return;
+    if (tex.source) tex.source.dataReady = true;
+    tex.needsUpdate = true;
+}
+
 export function applyTextureUvChannel(tex, maxMapChannel, fallbackMaxChannel = 1) {
     if (!tex?.isTexture) return tex;
     const nextChannel = maxMapChannelToTextureChannel(maxMapChannel, fallbackMaxChannel);
     if (tex.channel !== nextChannel) {
         tex.channel = nextChannel;
-        const image = tex.source?.data ?? tex.image;
-        if (image != null) tex.needsUpdate = true;
+        markTextureUploadReady(tex);
     }
     return tex;
+}
+
+export function maxMapChannelFromMapName(value, fallbackMaxChannel = 2) {
+    const fallback = Number.isFinite(Number(fallbackMaxChannel))
+        ? Math.max(1, Math.round(Number(fallbackMaxChannel)))
+        : 2;
+    let filename = String(value ?? '');
+    try {
+        const baseUrl = typeof location !== 'undefined' ? location.href : 'http://maxjs.local/';
+        const parsed = new URL(filename, baseUrl);
+        filename = parsed.pathname.split('/').pop() || filename;
+    } catch {
+        filename = filename.split(/[?#]/, 1)[0].split(/[\\/]/).pop() || filename;
+    }
+    try {
+        filename = decodeURIComponent(filename);
+    } catch {}
+    const baseName = filename.replace(/\.[^./\\]+$/, '');
+    const match = baseName.match(/(?:^|[_.\-\s])UV([12])(?:$|[_.\-\s])/i);
+    return match ? Number(match[1]) : fallback;
 }
 
 export function applyTextureTransform(tex, xf) {
@@ -229,8 +268,7 @@ export function applyTextureTransform(tex, xf) {
     tex.center.set(xf.center[0], xf.center[1]);
     tex.rotation = THREE.MathUtils.degToRad(xf.rotate);
     tex.updateMatrix?.();
-    const image = tex.source?.data ?? tex.image;
-    if (image != null) tex.needsUpdate = true;
+    markTextureUploadReady(tex);
     return tex;
 }
 
@@ -566,6 +604,7 @@ export function applyTextureChannelSelection(tex, xf) {
     if (channel <= 1 && !invert) return tex;
 
     const image = tex?.image;
+    if (isVideoTextureImage(image)) return tex;
     const width = image?.width ?? image?.videoWidth ?? 0;
     const height = image?.height ?? image?.videoHeight ?? 0;
     if (!width || !height) return tex;
@@ -611,5 +650,6 @@ export function textureReadyForMaterialBinding(tex) {
     if (!tex?.isTexture) return false;
     const image = tex.source?.data ?? tex.image;
     if (!image) return false;
+    if (isVideoTextureImage(image)) return canUploadVideoFrame(image);
     return image.complete !== false;
 }

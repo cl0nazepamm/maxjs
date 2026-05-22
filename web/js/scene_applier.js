@@ -47,6 +47,9 @@ import {
     geometryFromNodeBinary,
     attachSkinAttributes,
     buildSkinnedMeshFromNd,
+    indexArrayFromBinary,
+    normalAttributeFromBinary,
+    uvAttributeFromBinary,
 } from './scene_binary.js';
 
 // ─── Default hooks ─────────────────────────────────────────────────────
@@ -177,14 +180,6 @@ function binaryFloatView(buffer, off, n, label) {
     return new Float32Array(buffer, off, n);
 }
 
-function binaryIntView(buffer, off, n, label) {
-    if (!binInRange(buffer, off, n)) {
-        console.warn(`[scene_applier] Invalid ${label} int range`, { off, n });
-        return null;
-    }
-    return new Int32Array(buffer, off, n);
-}
-
 function vectorPayloadToFloat32(arrayLike) {
     return Array.isArray(arrayLike) || ArrayBuffer.isView(arrayLike)
         ? new Float32Array(arrayLike)
@@ -202,21 +197,20 @@ function buildInstanceGeometry(grp, buffer) {
     let verts = null;
     let indices = null;
     let uvs = null;
+    let uvAttr = null;
     let norms = null;
 
     if (geo) {
         const vView = binaryFloatView(buffer, geo.vOff, geo.vN, 'instance position');
-        const iView = binaryIntView(buffer, geo.iOff, geo.iN, 'instance index');
+        const iView = indexArrayFromBinary(buffer, geo.iOff, geo.iN, geo.iType, {
+            copy: true,
+            label: 'instance index',
+        });
         if (!vView || !iView) return null;
         verts = new Float32Array(vView);
-        indices = new Uint32Array(iView);
+        indices = iView;
         if (geo.uvOff != null && geo.uvN) {
-            const uvView = binaryFloatView(buffer, geo.uvOff, geo.uvN, 'instance uv');
-            if (uvView) uvs = new Float32Array(uvView);
-        }
-        if (geo.nOff != null && geo.nN) {
-            const nView = binaryFloatView(buffer, geo.nOff, geo.nN, 'instance normal');
-            if (nView) norms = new Float32Array(nView);
+            uvAttr = uvAttributeFromBinary(buffer, geo.uvOff, geo.uvN, geo.uvType, 'instance uv');
         }
     } else {
         verts = vectorPayloadToFloat32(grp?.v);
@@ -230,9 +224,20 @@ function buildInstanceGeometry(grp, buffer) {
     const geom = new THREE.BufferGeometry();
     geom.setAttribute('position', new THREE.BufferAttribute(verts, 3));
     geom.setIndex(new THREE.BufferAttribute(indices, 1));
-    if (uvs?.length) geom.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
-    if (norms?.length) geom.setAttribute('normal', new THREE.BufferAttribute(norms, 3));
-    else geom.computeVertexNormals();
+    if (uvAttr) geom.setAttribute('uv', uvAttr);
+    else if (uvs?.length) geom.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
+    let normalSet = false;
+    if (geo?.nOff != null && geo?.nN) {
+        const normalAttr = normalAttributeFromBinary(buffer, geo.nOff, geo.nN, geo.nType, 'instance normal');
+        if (normalAttr) {
+            geom.setAttribute('normal', normalAttr);
+            normalSet = true;
+        }
+    }
+    if (!normalSet) {
+        if (norms?.length) geom.setAttribute('normal', new THREE.BufferAttribute(norms, 3));
+        else geom.computeVertexNormals();
+    }
 
     if (Array.isArray(grp.groups)) {
         for (const [start, count, idx] of grp.groups) geom.addGroup(start, count, idx);
@@ -242,14 +247,30 @@ function buildInstanceGeometry(grp, buffer) {
 
 function getInstanceTransformPayload(grp, buffer) {
     if (Number.isInteger(grp?.xformOff) && Number.isInteger(grp?.xformN)) {
-        return binaryFloatView(buffer, grp.xformOff, grp.xformN, 'instance transform');
+        const values = binaryFloatView(buffer, grp.xformOff, grp.xformN, 'instance transform');
+        if (!values) return null;
+        const type = String(grp.xformType ?? 'f32m16').trim().toLowerCase();
+        const stride = type === 'affine12' ? 12 : 16;
+        return { values, type, stride };
     }
-    return Array.isArray(grp?.xforms) || ArrayBuffer.isView(grp?.xforms)
-        ? grp.xforms
-        : null;
+    if (Array.isArray(grp?.xforms) || ArrayBuffer.isView(grp?.xforms)) {
+        return { values: grp.xforms, type: 'f32m16', stride: 16 };
+    }
+    return null;
 }
 
-function setMatrixFromRowMajor16(matrix, values, off) {
+function setMatrixFromInstancePayload(matrix, payload, index) {
+    const values = payload?.values;
+    const off = index * (payload?.stride || 16);
+    if (payload?.type === 'affine12') {
+        matrix.set(
+            values[off + 0], values[off + 3], values[off + 6],  values[off + 9],
+            values[off + 1], values[off + 4], values[off + 7],  values[off + 10],
+            values[off + 2], values[off + 5], values[off + 8],  values[off + 11],
+            0,               0,               0,                1,
+        );
+        return;
+    }
     // Instance payloads preserve Max row-major Matrix3 layout. Three's
     // Matrix4.set takes row-major arguments and stores column-major internally.
     matrix.set(
@@ -287,8 +308,8 @@ function applyForestInstances(groups, buffer, ctx, hooks) {
     const matrix = new THREE.Matrix4();
     for (const grp of groups) {
         const xforms = getInstanceTransformPayload(grp, buffer);
-        const count = grp?.count || Math.floor((xforms?.length || 0) / 16);
-        if (!count || !xforms || xforms.length < count * 16) continue;
+        const count = grp?.count || Math.floor((xforms?.values?.length || 0) / (xforms?.stride || 16));
+        if (!count || !xforms?.values || xforms.values.length < count * xforms.stride) continue;
 
         const geom = buildInstanceGeometry(grp, buffer);
         if (!geom) continue;
@@ -305,7 +326,7 @@ function applyForestInstances(groups, buffer, ctx, hooks) {
         instMesh.userData.maxjsSource = groupKey;
 
         for (let i = 0; i < count; i++) {
-            setMatrixFromRowMajor16(matrix, xforms, i * 16);
+            setMatrixFromInstancePayload(matrix, xforms, i);
             instMesh.setMatrixAt(i, matrix);
         }
         instMesh.instanceMatrix.needsUpdate = true;

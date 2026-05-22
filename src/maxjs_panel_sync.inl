@@ -1054,6 +1054,7 @@
         MarkSelectedTransformsDirty();
         CheckSelectedGeometryLive();
         MarkCameraDirtyIfChanged(false);
+        PollViewportModes();
         if (ShouldRunInteractiveMaterialChecks()) CheckTrackedMaterialScalarsLive();
     }
 
@@ -2281,14 +2282,31 @@
                 ss << L",\"vOff\":" << vOff << L",\"vN\":" << verts.size();
                 if (usedSkinnedFastPositions) {
                     if (!norms.empty()) ss << L",\"nOff\":" << nOff << L",\"nN\":" << norms.size();
-                    else ss << L",\"keepNormals\":true";
                     ss << L",\"skipBounds\":true";
                 } else {
                     ss << L",\"iOff\":" << iOff << L",\"iN\":" << indices.size();
                     if (!uvs.empty()) ss << L",\"uvOff\":" << uvOff << L",\"uvN\":" << uvs.size();
                     if (!norms.empty()) ss << L",\"nOff\":" << nOff << L",\"nN\":" << norms.size();
-                    else ss << L",\"keepNormals\":true";
                     WriteVertexColorOffsetsJson(ss, vertexColors);
+                    if (!isSpline) {
+                        Mtl* multiMtl = FindMultiSubMtl(node->GetMtl());
+                        if (ShouldEmitMultiSubMaterialGroups(multiMtl, groups)) {
+                            ss << L",\"groups\":[";
+                            for (size_t g = 0; g < groups.size(); ++g) {
+                                if (g) ss << L',';
+                                ss << L'[' << groups[g].start << L',' << groups[g].count << L',' << g << L']';
+                            }
+                            ss << L"],\"mats\":[";
+                            for (size_t g = 0; g < groups.size(); ++g) {
+                                if (g) ss << L',';
+                                Mtl* subMtl = GetSubMtlFromMatID(multiMtl, groups[g].matID);
+                                MaxJSPBR subPBR;
+                                ExtractPBRFromMtl(subMtl, node, t, subPBR);
+                                WriteMaterialFull(ss, subPBR);
+                            }
+                            ss << L"]";
+                        }
+                    }
                 }
                 ss << L'}';
 
@@ -2307,6 +2325,25 @@
                 if (!uvs.empty()) { ss << L",\"uv\":"; WriteFloats(ss, uvs.data(), uvs.size()); }
                 if (!norms.empty()) { ss << L",\"norm\":"; WriteFloats(ss, norms.data(), norms.size()); }
                 WriteVertexColorAttributesJson(ss, vertexColors);
+                if (!usedSkinnedFastPositions && !isSpline) {
+                    Mtl* multiMtl = FindMultiSubMtl(node->GetMtl());
+                    if (ShouldEmitMultiSubMaterialGroups(multiMtl, groups)) {
+                        ss << L",\"groups\":[";
+                        for (size_t g = 0; g < groups.size(); ++g) {
+                            if (g) ss << L',';
+                            ss << L'[' << groups[g].start << L',' << groups[g].count << L',' << g << L']';
+                        }
+                        ss << L"],\"mats\":[";
+                        for (size_t g = 0; g < groups.size(); ++g) {
+                            if (g) ss << L',';
+                            Mtl* subMtl = GetSubMtlFromMatID(multiMtl, groups[g].matID);
+                            MaxJSPBR subPBR;
+                            ExtractPBRFromMtl(subMtl, node, t, subPBR);
+                            WriteMaterialFull(ss, subPBR);
+                        }
+                        ss << L"]";
+                    }
+                }
                 ss << L'}';
                 webview_->PostWebMessageAsJson(ss.str().c_str());
             }
@@ -3979,6 +4016,12 @@
             ss << L",\"viewWidth\":";
             WriteFloatValue(ss, cam.viewWidth, 500.0f);
         }
+        if (cam.clipEnabled) {
+            ss << L",\"near\":";
+            WriteFloatValue(ss, cam.nearClip, 1.0f);
+            ss << L",\"far\":";
+            WriteFloatValue(ss, cam.farClip, 100000.0f);
+        }
         ss << L",\"dofEnabled\":" << (cam.dofEnabled ? L"true" : L"false");
         if (cam.dofEnabled) {
             ss << L",\"dofFocusDistance\":";
@@ -4486,7 +4529,7 @@
         }
 
         Mtl* multiMtl = FindMultiSubMtl(grp.mtl);
-        if (multiMtl && multiMtl->NumSubMtls() > 0 && grp.groups.size() > 1) {
+        if (ShouldEmitMultiSubMaterialGroups(multiMtl, grp.groups)) {
             // Multi/Sub: write groups + per-group sub-materials
             ss << L",\"groups\":[";
             for (size_t g = 0; g < grp.groups.size(); g++) {

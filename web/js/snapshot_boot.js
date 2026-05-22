@@ -476,6 +476,20 @@ function getSnapshotCoreBrightness(snapshotUi) {
     return null;
 }
 
+function getSnapshotCoreContrast(snapshotUi) {
+    const candidates = [
+        snapshotUi?.fx?.colorGrading?.contrast,
+        snapshotUi?.postFx?.colorGrading?.contrast,
+        snapshotUi?.postFx?.contrast,
+        snapshotUi?.contrast,
+    ];
+    for (const value of candidates) {
+        const n = Number(value);
+        if (Number.isFinite(n)) return n;
+    }
+    return null;
+}
+
 function applySnapshotCoreLook(snapshotUi, { renderer } = {}) {
     if (!snapshotUi || !renderer) return;
 
@@ -486,12 +500,19 @@ function applySnapshotCoreLook(snapshotUi, { renderer } = {}) {
     }
 
     const brightness = getSnapshotCoreBrightness(snapshotUi);
+    const contrast = getSnapshotCoreContrast(snapshotUi);
     const canvas = renderer.domElement;
-    if (canvas?.style && Number.isFinite(brightness)) {
-        const amount = Math.max(0, 1 + brightness);
-        canvas.style.filter = Math.abs(amount - 1) > 1.0e-6
-            ? `brightness(${amount})`
-            : '';
+    if (canvas?.style) {
+        const filters = [];
+        if (Number.isFinite(brightness)) {
+            const amount = Math.max(0, 1 + brightness);
+            if (Math.abs(amount - 1) > 1.0e-6) filters.push(`brightness(${amount})`);
+        }
+        if (Number.isFinite(contrast)) {
+            const amount = Math.max(0, 1 + contrast);
+            if (Math.abs(amount - 1) > 1.0e-6) filters.push(`contrast(${amount})`);
+        }
+        canvas.style.filter = filters.join(' ');
     }
 
     renderer.userData ??= {};
@@ -499,6 +520,7 @@ function applySnapshotCoreLook(snapshotUi, { renderer } = {}) {
         toneMapping: snapshotUi.toneMapping ?? null,
         exposure: Number.isFinite(snapshotUi.exposure) ? snapshotUi.exposure : null,
         brightness,
+        contrast,
     };
 }
 
@@ -528,7 +550,7 @@ function applySnapshotCameraClip(camera, cameraClip) {
 
 // ─── Phase 7: snapshotUi ───────────────────────────────────────────────
 // Honors the export-critical fields here:
-//   - tone mapping, exposure, and brightness on the renderer/canvas
+//   - tone mapping, exposure, and brightness/contrast on the renderer/canvas
 //   - background color on the scene
 //   - basic camera position/target and user clip planes if present
 // Bake overrides are consumed by material_builder during scene.bin apply.

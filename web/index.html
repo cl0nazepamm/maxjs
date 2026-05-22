@@ -279,6 +279,9 @@
             binInRange,
             buildSkinnedMeshFromNd as buildSkinnedMeshFromBinary,
             geometryFromNodeBinary,
+            indexArrayFromBinary,
+            normalAttributeFromBinary,
+            uvAttributeFromBinary,
             typedArrayCanStore,
             updateFloatGeometryAttribute,
             updateGeometryIndexAttribute,
@@ -294,6 +297,7 @@
         import { createMaxJSAudioSystem } from './js/maxjs_audio.js';
         import { createMaxJSGLTFSystem } from './js/maxjs_gltf.js';
         import { createProjectRuntime } from './js/project_runtime.js';
+        import * as css3dOverlay from './js/css3d_overlay.js';
         import { getOrCreateHTMLTexture, releaseHTMLTexture, disposeAllHTMLTextures, attachHTMLClickForwarding } from './js/html_texture.js';
         import { createCanvasPanel } from './js/canvas_panel.js';
         import { createShaderLabFx } from './js/shader_lab_fx.js';
@@ -315,6 +319,7 @@
             applyTextureChannelSelection as applyTextureChannelSelectionShared,
             applyTextureTransform as applyTextureTransformShared,
             applyTextureUvChannel as applyTextureUvChannelShared,
+            maxMapChannelFromMapName as maxMapChannelFromMapNameShared,
             maxMapChannelToTextureChannel as maxMapChannelToTextureChannelShared,
             normalizeTextureTransform as normalizeTextureTransformShared,
             optimizedTextureTransformForSlot as optimizedTextureTransformForSlotShared,
@@ -372,8 +377,10 @@
             return activeCamera.getWorldPosition(target);
         }
 
-        const perspCamera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.1, 100000);
-        const orthoCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 100000);
+        const DEFAULT_CAMERA_NEAR = 1.0;
+        const DEFAULT_CAMERA_FAR = 100000;
+        const perspCamera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, DEFAULT_CAMERA_NEAR, DEFAULT_CAMERA_FAR);
+        const orthoCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, DEFAULT_CAMERA_NEAR, DEFAULT_CAMERA_FAR);
         perspCamera.up.set(0, 1, 0);
         orthoCamera.up.set(0, 1, 0);
         perspCamera.position.copy(cameraDefaultPosition);
@@ -398,6 +405,18 @@
             if (Number.isFinite(cameraClip.near) && cameraClip.near > 0) cam.near = cameraClip.near;
             if (Number.isFinite(cameraClip.far) && cameraClip.far > cam.near) cam.far = cameraClip.far;
             cam.updateProjectionMatrix();
+        }
+        function applySyncedCameraClip(cam, source = null) {
+            if (!cam || cam.isOrthographicCamera) return;
+            const near = Number(source?.near);
+            const far = Number(source?.far);
+            if (Number.isFinite(near) && near > 0 && Number.isFinite(far) && far > near) {
+                cam.near = near;
+                cam.far = far;
+                return;
+            }
+            if (!Number.isFinite(cam.near) || cam.near < DEFAULT_CAMERA_NEAR) cam.near = DEFAULT_CAMERA_NEAR;
+            if (!Number.isFinite(cam.far) || cam.far <= cam.near) cam.far = DEFAULT_CAMERA_FAR;
         }
         let lastRenderTimestamp = 0;
 
@@ -774,6 +793,12 @@
 
         function canBrowserLoadTextureExtension(ext) {
             return !ext || browserTextureExtensions.has(ext);
+        }
+
+        const videoTextureExtensions = new Set(['mp4', 'm4v', 'webm', 'mov', 'ogv']);
+
+        function isVideoTextureExtension(ext) {
+            return !!ext && videoTextureExtensions.has(ext);
         }
 
         function loadEnvironmentTexture(url, sourceName, onLoad, onProgress, onError) {
@@ -1262,6 +1287,7 @@
         let hdriLoadGeneration = 0;
         let lightProbeSceneRevision = 0;
         let lightProbeRefreshTimer = 0;
+        let lightProbeGridActive = null;
 
         // Local HDRI override (independent of Max environment)
         let localHdriObjectUrl = null;   // file loaded in memory
@@ -1307,6 +1333,10 @@
             const useGrid = lightProbeEnabled && hasLightProbeGridData && !!lightProbeGrid;
             lightProbe.intensity = lightProbeEnabled && !useGrid ? lightProbeIntensity : 0.0;
             if (lightProbeGrid) lightProbeGrid.visible = useGrid;
+            if (lightProbeGridActive !== useGrid) {
+                lightProbeGridActive = useGrid;
+                markLightProbeMaterialsDirty();
+            }
         }
 
         function clearLightProbe() {
@@ -1586,11 +1616,34 @@
             lightProbeSceneRevision += 1;
         }
 
+        function markLightProbeMaterialsDirty() {
+            const seen = new WeakSet();
+            const markMaterial = (material) => {
+                if (!material || seen.has(material)) return;
+                seen.add(material);
+                if (material.isMeshBasicMaterial || material.isLineBasicMaterial || material.isLineDashedMaterial) return;
+                if (material.visible === false) return;
+                material.needsUpdate = true;
+            };
+            scene.traverse((object) => {
+                if (!object?.material) return;
+                if (Array.isArray(object.material)) {
+                    for (const material of object.material) markMaterial(material);
+                } else {
+                    markMaterial(object.material);
+                }
+            });
+        }
+
         function currentLightProbeSceneSignature() {
             const bounds = computeLightProbeGridBounds(new THREE.Box3());
             const center = bounds.getCenter(new THREE.Vector3());
             const size = bounds.getSize(new THREE.Vector3());
             const quantize = (value) => Math.round(Number(value || 0) * 1000) / 1000;
+            let bakeSignature = '';
+            try {
+                bakeSignature = bakeStateSignature();
+            } catch {}
             return JSON.stringify([
                 'scene-grid',
                 currentHdriUrl || null,
@@ -1598,6 +1651,7 @@
                 !!scene.environment,
                 defaultLights.visible,
                 lastLightsSignature,
+                bakeSignature,
                 nodeMap.size,
                 lightProbeSceneRevision,
                 center.toArray().map(quantize),
@@ -1791,8 +1845,62 @@
             return maxMapChannelToTextureChannelShared(maxMapChannel, fallbackMaxChannel);
         }
 
+        function maxMapChannelFromMapName(value, fallbackMaxChannel = 2) {
+            return maxMapChannelFromMapNameShared(value, fallbackMaxChannel);
+        }
+
         function applyTextureUvChannel(tex, maxMapChannel, fallbackMaxChannel = 1) {
             return applyTextureUvChannelShared(tex, maxMapChannel, fallbackMaxChannel);
+        }
+
+        function explicitMaxMapChannelFromName(value) {
+            let filename = String(value ?? '');
+            try {
+                const parsed = new URL(filename, location.href);
+                filename = parsed.pathname || filename;
+            } catch {}
+            filename = filename.replace(/\\/g, '/').split('/').pop() || filename;
+            const baseName = filename.replace(/\.[^./\\]+$/, '');
+            const match = baseName.match(/(?:^|[_.\-\s])UV([12])(?:$|[_.\-\s])/i);
+            return match ? Number(match[1]) : null;
+        }
+
+        const textureUvChannelViews = new WeakMap();
+
+        function textureWithUvChannel(tex, maxMapChannel, fallbackMaxChannel = 1) {
+            if (!tex?.isTexture) return tex;
+            const channel = maxMapChannelToTextureChannel(maxMapChannel, fallbackMaxChannel);
+            if (tex.channel === channel) return tex;
+
+            let byChannel = textureUvChannelViews.get(tex);
+            if (!byChannel) {
+                byChannel = new Map();
+                textureUvChannelViews.set(tex, byChannel);
+            }
+            let view = byChannel.get(channel);
+            if (!view) {
+                view = tex.clone();
+                view.userData = { ...(tex.userData || {}), maxjsUvChannelViewOf: tex.uuid };
+                byChannel.set(channel, view);
+            }
+            view.channel = channel;
+            view.needsUpdate = true;
+            return view;
+        }
+
+        function resolveLightMapMaxMapChannel(md) {
+            const explicit = explicitMaxMapChannelFromName(md?.lmMap ?? md?.lightMap ?? '');
+            if (explicit === 1 || explicit === 2) return explicit;
+            if (Number.isFinite(Number(md?.lmCh))) return Math.max(1, Math.round(Number(md.lmCh)));
+            const xf = normalizeTextureTransform(md?.lmMapXf ?? md?.lightMapXf);
+            if (Number.isFinite(Number(xf?.uvChannel))) return Math.max(1, Math.round(Number(xf.uvChannel)));
+            return 2;
+        }
+
+        function withMaxMapChannelOverride(xf, maxMapChannel) {
+            if (!Number.isFinite(Number(maxMapChannel))) return xf;
+            const uvChannel = Math.max(1, Math.round(Number(maxMapChannel)));
+            return { ...((xf && typeof xf === 'object') ? xf : {}), uvChannel };
         }
 
         function optimizedTextureTransformForSlot(key, xf) {
@@ -2109,27 +2217,113 @@
             return pending;
         }
 
+        function canUploadVideoFrame(video) {
+            return !!video &&
+                !video.error &&
+                !video.seeking &&
+                video.readyState >= video.HAVE_CURRENT_DATA &&
+                video.videoWidth > 0 &&
+                video.videoHeight > 0;
+        }
+
+        function installSafeVideoTexturePump(tex, video) {
+            if (!tex || !video) return;
+            let disposed = false;
+            let frameCallbackId = 0;
+            if (tex.source) tex.source.dataReady = false;
+
+            if (tex._requestVideoFrameCallbackId &&
+                typeof video.cancelVideoFrameCallback === 'function') {
+                try { video.cancelVideoFrameCallback(tex._requestVideoFrameCallbackId); } catch {}
+                tex._requestVideoFrameCallbackId = 0;
+            }
+
+            const markReadyFrame = () => {
+                if (!canUploadVideoFrame(video)) return;
+                if (tex.source) tex.source.dataReady = true;
+                tex.needsUpdate = true;
+            };
+
+            tex.update = markReadyFrame;
+
+            const scheduleFrameCallback = () => {
+                if (disposed || typeof video.requestVideoFrameCallback !== 'function') return;
+                frameCallbackId = video.requestVideoFrameCallback(() => {
+                    frameCallbackId = 0;
+                    markReadyFrame();
+                    scheduleFrameCallback();
+                });
+                tex._requestVideoFrameCallbackId = frameCallbackId;
+            };
+
+            const onReady = () => {
+                markReadyFrame();
+                if (!frameCallbackId) scheduleFrameCallback();
+            };
+            const onNotReady = () => {
+                if (tex.source) tex.source.dataReady = false;
+            };
+
+            video.addEventListener('loadeddata', onReady);
+            video.addEventListener('canplay', onReady);
+            video.addEventListener('playing', onReady);
+            video.addEventListener('seeked', onReady);
+            video.addEventListener('seeking', onNotReady);
+            video.addEventListener('waiting', onNotReady);
+            video.addEventListener('stalled', onNotReady);
+
+            const disposeBase = tex.dispose.bind(tex);
+            tex.dispose = () => {
+                disposed = true;
+                video.removeEventListener('loadeddata', onReady);
+                video.removeEventListener('canplay', onReady);
+                video.removeEventListener('playing', onReady);
+                video.removeEventListener('seeked', onReady);
+                video.removeEventListener('seeking', onNotReady);
+                video.removeEventListener('waiting', onNotReady);
+                video.removeEventListener('stalled', onNotReady);
+                if (frameCallbackId && typeof video.cancelVideoFrameCallback === 'function') {
+                    try { video.cancelVideoFrameCallback(frameCallbackId); } catch {}
+                }
+                frameCallbackId = 0;
+                tex._requestVideoFrameCallbackId = 0;
+                disposeBase();
+            };
+
+            onReady();
+        }
+
         function loadVideoTexture(url, xf) {
+            const normalizedXf = normalizeTextureTransform(xf);
             const playbackKey = JSON.stringify({
                 loop: xf?.loop !== false,
                 muted: xf?.muted !== false,
                 rate: xf?.rate ?? 1.0,
             });
-            const cacheKey = `video:${url}:${playbackKey}`;
+            // Distinct UV transforms must not clobber a shared cached texture.
+            const cacheKey = `video:${url}:${playbackKey}:${JSON.stringify(normalizedXf)}`;
             if (textureCache.has(cacheKey)) return textureCache.get(cacheKey);
             const video = document.createElement('video');
-            video.src = url;
             video.crossOrigin = 'anonymous';
             video.loop = xf?.loop !== false;
             video.muted = xf?.muted !== false;
             video.playbackRate = xf?.rate ?? 1.0;
             video.playsInline = true;
             video.autoplay = true;
+            video.preload = 'auto';
+            video.src = url;
+            video.load?.();
             video.play().catch(() => {});
             const tex = new THREE.VideoTexture(video);
             tex.colorSpace = THREE.SRGBColorSpace;
             tex.minFilter = THREE.LinearFilter;
             tex.magFilter = THREE.LinearFilter;
+            installSafeVideoTexturePump(tex, video);
+            // Honor Max UV tiling/offset/rotation/wrap + channel select, the
+            // same as still-image textures (loadTexture) — video previously
+            // ignored all of these.
+            applyTextureChannelSelection(tex, normalizedXf);
+            applyTextureTransform(tex, normalizedXf);
             textureCache.set(cacheKey, tex);
             return tex;
         }
@@ -2139,6 +2333,10 @@
             if (xf?.video) return loadVideoTexture(url, xf);
             colorSpace = resolveColorSpace(colorSpace, xf);
             const ext = getTextureExtension(url);
+            // A plain Max Bitmap can point straight at a video file (no custom
+            // Video Texture map). Route those to the video loader instead of
+            // rejecting them as an unsupported still-image format.
+            if (isVideoTextureExtension(ext)) return loadVideoTexture(url, xf);
             const textureColorSpace = colorSpaceForTextureExtension(ext, colorSpace);
             const normalizedXf = normalizeTextureTransform(xf);
             const cacheKey = JSON.stringify([url, String(textureColorSpace), normalizedXf]);
@@ -2263,6 +2461,15 @@
                 }
             );
             return null;
+        }
+
+        function loadBakeTextureFromCandidates(candidates, colorSpace = THREE.LinearSRGBColorSpace) {
+            let selected = null;
+            for (const candidate of candidates || []) {
+                const tex = loadBakeTexture(candidate.url, colorSpace, candidate.maxMapChannel);
+                if (tex && !selected) selected = { ...candidate, texture: tex };
+            }
+            return selected;
         }
 
         function bakeExposureScale() {
@@ -2498,10 +2705,11 @@
         }
 
         // Load a map slot — priority: HTML texmap → TSL procedural → URL bitmap.
-        function loadMapSlot(md, key, colorSpace, xfKey, fallback, materialContext = null) {
+        function loadMapSlot(md, key, colorSpace, xfKey, fallback, materialContext = null, maxMapChannelOverride = null) {
+            const xfSource = withMaxMapChannelOverride(xfKey ? md[xfKey] : null, maxMapChannelOverride);
             const htmlUrl = md[key + 'HTML'];
             if (htmlUrl) {
-                const normalizedXf = normalizeTextureTransform(xfKey ? md[xfKey] : null);
+                const normalizedXf = normalizeTextureTransform(xfSource);
                 const baseUrl = md[key + 'HTMLBase'] || '';
                 const filename = md[key + 'HTMLName'] || '';
                 // Prefer baseUrl + filename so snapshot-mode relative URLs
@@ -2524,7 +2732,7 @@
             const tslCode = md[key + 'TSL'];
             if (tslCode) return evalTSLTexture(tslCode, md[key + 'TSLParams']);
             const url = md[key];
-            if (url) return loadTexture(url, colorSpace, optimizedTextureTransformForSlot(key, xfKey ? md[xfKey] : null), fallback);
+            if (url) return loadTexture(url, colorSpace, optimizedTextureTransformForSlot(key, xfSource), fallback);
             return null;
         }
 
@@ -2656,6 +2864,9 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
 
             // Exposure
             renderer.toneMappingExposure = Math.pow(2, envParams.exp || 0) * (envParams.gamma || 1.0);
+            // Post FX owns the final view transform; Max HDRI exposure is
+            // environment metadata and must not stomp a restored custom look.
+            applyCoreToneMappingState({ markOutput: false });
 
             const rot = (envParams.rot || 0) * Math.PI / 180;
             scene.environmentRotation.set(0, -rot, 0);
@@ -3091,6 +3302,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     scene.backgroundRotation.set(0, 0, 0);
 
                     geospatialSky.apply(params, { camera });
+                    applyCoreToneMappingState({ markOutput: false });
                     setDefaultLightsVisible(false);
                     clearLightProbe();
                     hasLightProbeData = true;
@@ -3134,6 +3346,8 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 }
 
                 renderer.toneMappingExposure = params.exposure;
+                // Keep the user-selected Post FX tonemapper/exposure authoritative.
+                applyCoreToneMappingState({ markOutput: false });
 
                 if (skyMesh.parent !== scene) scene.add(skyMesh);
 
@@ -3649,9 +3863,12 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             applyMap('aoMap',      'aoMap',                  THREE.LinearSRGBColorSpace,   'aoMapXf',      W);
             applyMap('emMap',      'emissiveMap',            THREE.SRGBColorSpace,         'emMapXf',      W);
             applyMap('transMap',   'transmissionMap',        THREE.LinearSRGBColorSpace,   'transMapXf',   W);
-            const lmTex = applyMap('lmMap', 'lightMap', THREE.LinearSRGBColorSpace, 'lmMapXf', W);
+            const lightMapChannel = resolveLightMapMaxMapChannel(md);
+            const lmTex = loadMapSlot(md, 'lmMap', THREE.LinearSRGBColorSpace, 'lmMapXf', W, materialContext, lightMapChannel);
+            if (lmTex && 'lightMap' in material) material.lightMap = lmTex;
             if (lmTex) {
-                material.lightMap = applyTextureUvChannel(lmTex, md.lmCh, 2);
+                material.lightMap = textureWithUvChannel(lmTex, lightMapChannel, 2);
+                applyWebGpuLightMapUvContext(material, lightMapChannel);
                 material.lightMapIntensity = md.lmI ?? material.lightMapIntensity ?? 1.0;
             }
             applyMap('matcapMap',  'matcap',                 THREE.SRGBColorSpace,         'matcapMapXf',  W);
@@ -4039,9 +4256,11 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
 
                     // Lightmap
                     {
-                        const lmTex = loadMapSlot(md, 'lmMap', THREE.LinearSRGBColorSpace, 'lmMapXf', fallbackWhiteTexture, materialContext);
+                        const lightMapChannel = resolveLightMapMaxMapChannel(md);
+                        const lmTex = loadMapSlot(md, 'lmMap', THREE.LinearSRGBColorSpace, 'lmMapXf', fallbackWhiteTexture, materialContext, lightMapChannel);
                         if (lmTex) {
-                            template.lightMap = applyTextureUvChannel(lmTex, md.lmCh, 2);
+                            template.lightMap = textureWithUvChannel(lmTex, lightMapChannel, 2);
+                            applyWebGpuLightMapUvContext(template, lightMapChannel);
                             template.lightMapIntensity = md.lmI ?? 1.0;
                         }
                     }
@@ -4494,12 +4713,38 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                             const hasIncomingIndex = meta.iOff != null && meta.iN != null;
                             const idxCount = hasIncomingIndex ? meta.iN : 0;
                             const existingIdx = mesh.geometry.getIndex();
-                            const skipBounds = !!(meta.keepNormals || meta.skipBounds || meta.compactChannels);
+                            const skipBounds = !!(meta.skipBounds || meta.compactChannels);
                             const sameTopology = wantsLine === hasLine
                                 && pos
                                 && pos.count === vertCount
                                 && (!hasIncomingIndex || (existingIdx && existingIdx.count === idxCount));
                             const incomingVertexColors = normalizeVertexColorDescriptors(meta.vc);
+                            const applyIncomingGroups = () => {
+                                if (!Array.isArray(meta.groups)) return;
+                                mesh.geometry.clearGroups();
+                                for (const [start, count, idx] of meta.groups) {
+                                    mesh.geometry.addGroup(start, count, idx);
+                                }
+                            };
+                            const applyIncomingMaterial = () => {
+                                if (!Array.isArray(meta.groups) || !Array.isArray(meta.mats)) return;
+                                const ndForMaterial = {
+                                    ...(mesh.userData?.maxjsLastNodePayload || {}),
+                                    h: meta.h,
+                                    n: mesh.name,
+                                    t: mesh.matrix?.elements,
+                                    groups: meta.groups,
+                                    mats: meta.mats,
+                                };
+                                delete ndForMaterial.mat;
+                                delete ndForMaterial.matRef;
+                                delete ndForMaterial.matRefs;
+                                const oldMaterial = mesh.material;
+                                mesh.material = createSceneRenderableMaterial(ndForMaterial, wantsLine, mesh.geometry, mesh);
+                                stampSceneMaterial(mesh, ndForMaterial, wantsLine);
+                                disposeSceneMaterial(oldMaterial);
+                                layerManager.applyMaterialOverrides?.(meta.h, mesh);
+                            };
 
                             if (sameTopology) {
                                 // Hot path: copy positions into existing GPU buffer
@@ -4527,6 +4772,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                                     mesh.geometry.computeBoundingBox();
                                     mesh.geometry.computeBoundingSphere();
                                 }
+                                applyIncomingGroups();
                             } else {
                                 if (!hasIncomingIndex) return;
                                 // Topology changed — full rebuild
@@ -4560,7 +4806,9 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                                 }
                                 mesh.geometry.dispose();
                                 mesh.geometry = geom;
+                                applyIncomingGroups();
                             }
+                            applyIncomingMaterial();
                             // Geometry data on the same Object3D — no pipeline
                             // rebuild needed regardless of which branch ran.
                             ssgiFx?.markGeometryDataDirty?.();
@@ -4705,17 +4953,117 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         }
 
         function getBakeTextureUrl(nd, material, kind, mesh = null, extensionOverride = null) {
-            if (!bakeOverrides.enabled || !bakeOverrides.folder) return '';
+            return getBakeTextureCandidates(nd, material, kind, mesh, extensionOverride)[0]?.url || '';
+        }
+
+        function bakeFilenameHasExplicitUvChannel(filename) {
+            const baseName = String(filename ?? '').replace(/\.[^./\\]+$/, '');
+            return /(?:^|[_.\-\s])UV[12](?:$|[_.\-\s])/i.test(baseName);
+        }
+
+        function getBakeFilenameCandidates(stem, suffix, extension) {
+            const exact = `${stem}${suffix}.${extension}`;
+            const names = bakeFilenameHasExplicitUvChannel(exact)
+                ? [exact]
+                : [
+                    `${stem}_UV2.${extension}`,
+                    `${stem}_UV1.${extension}`,
+                    exact,
+                    ...(suffix ? [`${stem}.${extension}`] : []),
+                ];
+            return [...new Set(names)];
+        }
+
+        function getBakeTextureCandidates(nd, material, kind, mesh = null, extensionOverride = null) {
+            if (!bakeOverrides.enabled || !bakeOverrides.folder) return [];
             const folder = normalizeBakeFolderUrl(bakeOverrides.folder);
-            if (!folder) return '';
+            if (!folder) return [];
             const suffix = kind === 'beauty' ? bakeOverrides.beautySuffix : bakeOverrides.lightSuffix;
             const stem = sanitizeBakeFileStem(getBakeTargetName(nd, material, mesh));
             const extension = String(extensionOverride || bakeOverrides.extension || DEFAULT_BAKE_STATE.extension).replace(/^\./, '');
-            return `${folder}${encodeURIComponent(`${stem}${suffix}.${extension}`)}`;
+            return getBakeFilenameCandidates(stem, suffix, extension).map(filename => ({
+                filename,
+                url: `${folder}${encodeURIComponent(filename)}`,
+                maxMapChannel: getBakeMaxMapChannel(filename),
+            }));
         }
 
         function hasGeometryUV2(geom) {
             return !!(geom?.getAttribute?.('uv1') || geom?.getAttribute?.('uv2'));
+        }
+
+        function getBakeMaxMapChannel(url = '') {
+            return maxMapChannelFromMapName(url, 2);
+        }
+
+        function hasGeometryMaxMapChannel(geom, maxMapChannel = 2) {
+            const channel = Number.isFinite(Number(maxMapChannel))
+                ? Math.max(1, Math.round(Number(maxMapChannel)))
+                : 2;
+            if (channel === 1) return !!geom?.getAttribute?.('uv');
+            if (channel === 2) return hasGeometryUV2(geom);
+            return false;
+        }
+
+        const webGpuLightMapUvContexts = new WeakMap();
+
+        function restoreWebGpuLightMapUvContext(material) {
+            const state = material ? webGpuLightMapUvContexts.get(material) : null;
+            if (!state) return false;
+            const ownsContext = material.contextNode === state.contextNode;
+            webGpuLightMapUvContexts.delete(material);
+            if (!ownsContext) return false;
+            material.contextNode = state.previousContext ?? null;
+            material.needsUpdate = true;
+            return true;
+        }
+
+        function applyWebGpuLightMapUvContext(material, maxMapChannel = 2) {
+            if (!material) return false;
+            if (String(rendererBackendLabel || '') !== 'WebGPU') return restoreWebGpuLightMapUvContext(material);
+            const channel = Number.isFinite(Number(maxMapChannel))
+                ? Math.max(1, Math.round(Number(maxMapChannel)))
+                : 2;
+            if (channel !== 1) return restoreWebGpuLightMapUvContext(material);
+            const lightMap = material.lightMap;
+            if (!lightMap?.isTexture || typeof TSL?.replaceDefaultUV !== 'function' || typeof TSL?.uv !== 'function') {
+                return restoreWebGpuLightMapUvContext(material);
+            }
+
+            const lightMapUuid = lightMap.uuid;
+            const previousState = webGpuLightMapUvContexts.get(material);
+            if (previousState?.textureUuid === lightMapUuid &&
+                previousState?.maxMapChannel === channel &&
+                material.contextNode === previousState.contextNode) {
+                return false;
+            }
+            const previousContext = previousState?.previousContext ?? material.contextNode ?? null;
+            const contextNode = TSL.replaceDefaultUV((textureNode) => {
+                const tex = textureNode?.value;
+                if (tex === lightMap || tex?.uuid === lightMapUuid) return TSL.uv(0);
+                if (textureNode?.uvNode) return textureNode.uvNode;
+                const fallbackChannel = Number.isFinite(Number(tex?.channel))
+                    ? Math.max(0, Math.round(Number(tex.channel)))
+                    : 0;
+                return TSL.uv(fallbackChannel);
+            });
+            material.contextNode = contextNode;
+            webGpuLightMapUvContexts.set(material, { previousContext, contextNode, textureUuid: lightMapUuid, maxMapChannel: channel });
+            material.needsUpdate = true;
+            return true;
+        }
+
+        function markBakeMissingUv(material, maxMapChannel = 2) {
+            material.userData ??= {};
+            material.userData.maxjsBakeMissingUV = maxMapChannel;
+            if (maxMapChannel === 2) material.userData.maxjsBakeMissingUV2 = true;
+            else delete material.userData.maxjsBakeMissingUV2;
+        }
+
+        function clearBakeMissingUv(material) {
+            if (!material?.userData) return;
+            delete material.userData.maxjsBakeMissingUV;
+            delete material.userData.maxjsBakeMissingUV2;
         }
 
         function maybeRequestBakeUv2Resync(reason = 'auto') {
@@ -4723,10 +5071,10 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             if (!state.enabled || (state.mode !== 'lightmap' && state.mode !== 'beauty')) return;
             if (!window.chrome?.webview) return;
 
-            const stats = getBakeSceneStats();
-            if (stats.meshes <= 0 || stats.uv2 >= stats.meshes) return;
+            const stats = getBakeUv2RequirementStats(state.mode);
+            if (stats.required <= 0 || stats.ready >= stats.required) return;
 
-            const key = `${bakeStateSignature()}|${stats.meshes}|${stats.uv2}`;
+            const key = `${bakeStateSignature()}|${stats.required}|${stats.ready}`;
             if (key === lastBakeUv2RequestKey) return;
             lastBakeUv2RequestKey = key;
 
@@ -4737,13 +5085,13 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             }, 50);
         }
 
-        function createBeautyBakeMaterial(source, texture, url = '') {
+        function createBeautyBakeMaterial(source, texture, url = '', maxMapChannel = 2) {
             const BakeTHREE = isWebGLTexturePathActive() ? THREE_STD : THREE;
             const displayProxy = isDisplayBakedBeautyProxy(url);
             const exposureScale = displayProxy ? 1 : bakeExposureScale();
             const mat = new BakeTHREE.MeshBasicMaterial({
                 color: new BakeTHREE.Color(exposureScale, exposureScale, exposureScale),
-                map: applyTextureUvChannel(texture, 2, 2),
+                map: textureWithUvChannel(texture, maxMapChannel, 2),
                 side: source?.side ?? BakeTHREE.FrontSide,
                 transparent: !!source?.transparent || (Number.isFinite(source?.opacity) && source.opacity < 1),
                 opacity: Number.isFinite(source?.opacity) ? source.opacity : 1,
@@ -4753,41 +5101,77 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 toneMapped: !displayProxy,
             });
             mat.name = source?.name ? `${source.name} bake beauty` : 'bake beauty';
-            mat.userData = { ...(source?.userData || {}), maxjsBakeOverride: 'beauty' };
+            mat.userData = { ...(source?.userData || {}), maxjsBakeOverride: 'beauty', maxjsBakeUvChannel: maxMapChannel };
             return mat;
+        }
+
+        function bakeOverrideOwnerKey(nd, mesh = null) {
+            const handle = nd?.h ?? mesh?.userData?.maxjsHandle;
+            if (handle != null) return `h:${handle}`;
+            return `n:${mesh?.name || nd?.n || nd?.name || ''}`;
+        }
+
+        function stampBakeOverrideOwner(material, nd, mesh = null) {
+            if (!material) return;
+            material.userData ??= {};
+            material.userData.maxjsBakeOwnerKey = bakeOverrideOwnerKey(nd, mesh);
+            material.userData.maxjsBakeOwnerName = mesh?.name || nd?.n || nd?.name || '';
+        }
+
+        function ensureBakeOverrideMaterialInstance(material, nd, mesh = null) {
+            if (!material) return material;
+            const ownerKey = bakeOverrideOwnerKey(nd, mesh);
+            const existingOwnerKey = material.userData?.maxjsBakeOwnerKey;
+            const needsClone = isCachedMaterialTemplate(material) ||
+                (existingOwnerKey && existingOwnerKey !== ownerKey);
+            if (!needsClone) {
+                stampBakeOverrideOwner(material, nd, mesh);
+                return material;
+            }
+            const clone = material.clone();
+            clone.userData = { ...(material.userData || {}) };
+            stampBakeOverrideOwner(clone, nd, mesh);
+            rememberMaterialEmissiveBase(clone);
+            clone.needsUpdate = true;
+            return clone;
         }
 
         function applyBakeOverrideToMaterial(material, nd, geom, mesh = null) {
             if (!material || !bakeOverrides.enabled) return material;
             if (material.isLineBasicMaterial || material.isLineDashedMaterial) return material;
             const kind = bakeOverrides.mode === 'beauty' ? 'beauty' : 'lightmap';
-            const url = getBakeTextureUrl(nd, material, kind, mesh);
-            if (!url) return material;
-
-            if (kind === 'beauty') {
-                if (!hasGeometryUV2(geom)) {
-                    material.userData ??= {};
-                    material.userData.maxjsBakeMissingUV2 = true;
-                    return material;
-                }
-                const tex = loadBakeTexture(url, THREE.SRGBColorSpace, 2);
-                material.userData ??= {};
-                material.userData.maxjsBakeSourceUrl = url;
-                material.toneMapped = !isDisplayBakedBeautyProxy(url);
-                return tex ? createBeautyBakeMaterial(material, tex, url) : material;
-            }
-
-            if (!hasGeometryUV2(geom)) {
-                material.userData ??= {};
-                material.userData.maxjsBakeMissingUV2 = true;
+            if (kind === 'lightmap') material = ensureBakeOverrideMaterialInstance(material, nd, mesh);
+            const candidates = getBakeTextureCandidates(nd, material, kind, mesh);
+            if (!candidates.length) return material;
+            const usableCandidates = candidates.filter(candidate => hasGeometryMaxMapChannel(geom, candidate.maxMapChannel));
+            if (!usableCandidates.length) {
+                markBakeMissingUv(material, candidates[0]?.maxMapChannel ?? 2);
                 return material;
             }
-            const tex = loadBakeTexture(url, THREE.LinearSRGBColorSpace, 2);
-            if (!tex) return material;
-            material.lightMap = tex;
+
+            if (kind === 'beauty') {
+                const bake = loadBakeTextureFromCandidates(usableCandidates, THREE.SRGBColorSpace);
+                if (!bake) return material;
+                material.userData ??= {};
+                clearBakeMissingUv(material);
+                material.userData.maxjsBakeSourceUrl = bake.url;
+                material.userData.maxjsBakeUvChannel = bake.maxMapChannel;
+                material.toneMapped = !isDisplayBakedBeautyProxy(bake.url);
+                return createBeautyBakeMaterial(material, bake.texture, bake.url, bake.maxMapChannel);
+            }
+
+            const bake = loadBakeTextureFromCandidates(usableCandidates, THREE.LinearSRGBColorSpace);
+            if (!bake) return material;
+            material.lightMap = textureWithUvChannel(bake.texture, bake.maxMapChannel, 2);
+            applyWebGpuLightMapUvContext(material, bake.maxMapChannel);
             material.lightMapIntensity = bakeExposureScale();
             material.userData ??= {};
+            stampBakeOverrideOwner(material, nd, mesh);
+            clearBakeMissingUv(material);
             material.userData.maxjsBakeOverride = 'lightmap';
+            material.userData.maxjsBakeSourceUrl = bake.url;
+            material.userData.maxjsBakeUvChannel = bake.maxMapChannel;
+            material.userData.maxjsBakeTextureChannel = material.lightMap?.channel ?? null;
             material.needsUpdate = true;
             return material;
         }
@@ -5273,7 +5657,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             audioSystem?.applyAudios(snapshot.audios ?? []);
             gltfSystem?.applyGLTFs(snapshot.gltfs ?? []);
             applyHairInstances(snapshot.hairInstances ?? []);
-            applyForestInstances(snapshot.forestInstances ?? []);
+            applyForestInstances(snapshot.forestInstances ?? [], options.binaryBuffer ?? null);
             applyVolumes(snapshot.volumes ?? []);
             const bucketPlan = options.bucketPlan ?? planMaxInstanceBuckets(snapshot.nodes);
             refreshMaterialRegistry(snapshot.nodes, bucketPlan);
@@ -7664,13 +8048,33 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
 
         function getBakeSceneStats() {
             let meshes = 0;
+            let uv1 = 0;
             let uv2 = 0;
             for (const mesh of nodeMap.values()) {
                 if (!mesh?.isMesh) continue;
                 meshes++;
+                if (hasGeometryMaxMapChannel(mesh.geometry, 1)) uv1++;
                 if (hasGeometryUV2(mesh.geometry)) uv2++;
             }
-            return { meshes, uv2 };
+            return { meshes, uv1, uv2 };
+        }
+
+        function getBakeUv2RequirementStats(kind = bakeOverrides.mode === 'beauty' ? 'beauty' : 'lightmap') {
+            let required = 0;
+            let ready = 0;
+            for (const mesh of nodeMap.values()) {
+                const nd = mesh?.userData?.maxjsLastNodePayload;
+                if (!mesh?.isMesh || !nd) continue;
+                const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+                for (const material of materials) {
+                    const needsUv2 = getBakeTextureCandidates(nd, material, kind, mesh)
+                        .some(candidate => candidate.maxMapChannel === 2);
+                    if (!needsUv2) continue;
+                    required++;
+                    if (hasGeometryUV2(mesh.geometry)) ready++;
+                }
+            }
+            return { required, ready };
         }
 
         function mutateLightmapBakeOnMaterial(material, nd, geom, mesh = null) {
@@ -7683,6 +8087,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 if (wasOverride === 'lightmap') {
                     material.lightMap = null;
                     material.lightMapIntensity = 1.0;
+                    restoreWebGpuLightMapUvContext(material);
                     if (material.userData) delete material.userData.maxjsBakeOverride;
                     material.needsUpdate = true;
                     return true;
@@ -7690,35 +8095,45 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 return false;
             }
 
-            const url = getBakeTextureUrl(nd, material, 'lightmap', mesh);
-            if (!url || !hasGeometryUV2(geom)) {
+            const candidates = getBakeTextureCandidates(nd, material, 'lightmap', mesh);
+            const usableCandidates = candidates.filter(candidate => hasGeometryMaxMapChannel(geom, candidate.maxMapChannel));
+            if (!candidates.length || !usableCandidates.length) {
                 material.userData ??= {};
-                if (!url) {
+                if (!candidates.length) {
                     if (wasOverride === 'lightmap') {
                         material.lightMap = null;
                         material.lightMapIntensity = 1.0;
+                        restoreWebGpuLightMapUvContext(material);
                         delete material.userData.maxjsBakeOverride;
                         material.needsUpdate = true;
                         return true;
                     }
                     return false;
                 }
-                material.userData.maxjsBakeMissingUV2 = true;
+                markBakeMissingUv(material, candidates[0]?.maxMapChannel ?? 2);
                 return false;
             }
 
-            const tex = loadBakeTexture(url, THREE.LinearSRGBColorSpace, 2);
-            if (!tex) return false;
-            const nextLightMap = tex;
+            const bake = loadBakeTextureFromCandidates(usableCandidates, THREE.LinearSRGBColorSpace);
+            if (!bake) return false;
+            const nextLightMap = textureWithUvChannel(bake.texture, bake.maxMapChannel, 2);
             const intensity = bakeExposureScale();
             const lightMapChanged = material.lightMap !== nextLightMap;
             const intensityChanged = material.lightMapIntensity !== intensity;
-            if (!lightMapChanged && !intensityChanged && wasOverride === 'lightmap') return false;
+            const uvChannelChanged = material.userData?.maxjsBakeUvChannel !== bake.maxMapChannel ||
+                material.userData?.maxjsBakeTextureChannel !== (nextLightMap?.channel ?? null);
             material.lightMap = nextLightMap;
+            const uvContextChanged = applyWebGpuLightMapUvContext(material, bake.maxMapChannel);
+            if (!lightMapChanged && !intensityChanged && !uvChannelChanged && !uvContextChanged && wasOverride === 'lightmap') return false;
             material.lightMapIntensity = intensity;
             material.userData ??= {};
+            stampBakeOverrideOwner(material, nd, mesh);
+            clearBakeMissingUv(material);
             material.userData.maxjsBakeOverride = 'lightmap';
-            if (lightMapChanged) material.needsUpdate = true;
+            material.userData.maxjsBakeSourceUrl = bake.url;
+            material.userData.maxjsBakeUvChannel = bake.maxMapChannel;
+            material.userData.maxjsBakeTextureChannel = nextLightMap?.channel ?? null;
+            if (lightMapChanged || uvChannelChanged || uvContextChanged) material.needsUpdate = true;
             return true;
         }
 
@@ -7744,8 +8159,18 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     continue;
                 }
 
-                for (const m of mats) {
-                    if (!m || seenMats.has(m)) continue;
+                for (let materialIndex = 0; materialIndex < mats.length; materialIndex++) {
+                    let m = mats[materialIndex];
+                    if (!m) continue;
+                    const unique = ensureBakeOverrideMaterialInstance(m, nd, mesh);
+                    if (unique !== m) {
+                        if (Array.isArray(mesh.material)) mesh.material[materialIndex] = unique;
+                        else mesh.material = unique;
+                        disposeSceneMaterial(m);
+                        m = unique;
+                        changed = true;
+                    }
+                    if (seenMats.has(m)) continue;
                     seenMats.add(m);
                     if (mutateLightmapBakeOnMaterial(m, nd, mesh.geometry, mesh)) changed = true;
                 }
@@ -7753,6 +8178,8 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             if (changed) {
                 ssgiFx.markSceneChanged?.();
                 ssgiFx.markOutputChanged?.();
+                markLightProbeSceneDirty();
+                scheduleLightProbeFromCurrentScene({ delay: 250 });
             }
             return changed;
         }
@@ -7863,8 +8290,8 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             bakeOverrides = previous;
             const lightPreview = bakePanel.querySelector('#bake-light-preview');
             const beautyPreview = bakePanel.querySelector('#bake-beauty-preview');
-            if (lightPreview) lightPreview.textContent = `Light: ${sampleLight}`;
-            if (beautyPreview) beautyPreview.textContent = `Beauty: ${sampleBeauty}`;
+            if (lightPreview) lightPreview.innerHTML = `<span class="bake-path-label">Light</span>${escapeBakeHtml(sampleLight)}`;
+            if (beautyPreview) beautyPreview.innerHTML = `<span class="bake-path-label">Beauty</span>${escapeBakeHtml(sampleBeauty)}`;
         }
 
         function getBakeTargetPreviewRows(limit = 8) {
@@ -7888,25 +8315,38 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             return rows;
         }
 
+        function renderBakeTargetPreview(rows) {
+            if (!rows.length) return '';
+            const html = rows.map(row => `
+                <div class="bake-target-row">
+                    <span class="bake-target-name">${escapeBakeHtml(row.stem)}</span>
+                    <span class="bake-target-url">${escapeBakeHtml(row.url)}</span>
+                </div>
+            `).join('');
+            return `<div class="bake-path-preview bake-target-list"><span class="bake-path-label">Targets</span>${html}</div>`;
+        }
+
         function getAllBakeProxyTargets() {
             const rows = [];
             const seen = new Set();
-            const suffix = bakeOverrides.beautySuffix ?? '';
             for (const mesh of nodeMap.values()) {
                 const nd = mesh?.userData?.maxjsLastNodePayload;
-                if (!mesh?.isMesh || !nd || !hasGeometryUV2(mesh.geometry)) continue;
+                if (!mesh?.isMesh || !nd) continue;
                 const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
                 for (const material of materials) {
                     const stem = sanitizeBakeFileStem(getBakeTargetName(nd, material, mesh));
-                    const filename = `${stem}${suffix}.png`;
-                    if (seen.has(filename)) continue;
-                    seen.add(filename);
-                    rows.push({
-                        stem,
-                        filename,
-                        sourceUrl: getBakeTextureUrl(nd, material, 'beauty', mesh, 'exr'),
-                        maxDimension: /containers?_main/i.test(stem) ? 2048 : 1024,
-                    });
+                    const candidates = getBakeTextureCandidates(nd, material, 'beauty', mesh, 'exr')
+                        .filter(candidate => hasGeometryMaxMapChannel(mesh.geometry, candidate.maxMapChannel));
+                    for (const candidate of candidates) {
+                        const filename = candidate.filename.replace(/\.[^./\\]+$/, '.png');
+                        if (seen.has(filename)) continue;
+                        seen.add(filename);
+                        rows.push({
+                            stem,
+                            filename,
+                            sourceUrl: candidate.url,
+                        });
+                    }
                 }
             }
             rows.sort((a, b) => {
@@ -7966,6 +8406,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         }
 
         let bakeProxyRenderer = null;
+        const BAKE_PROXY_MAX_SOURCE_DIMENSION = 8192;
         function getBakeProxyRenderer() {
             if (bakeProxyRenderer) return bakeProxyRenderer;
             bakeProxyRenderer = new THREE_STD.WebGLRenderer({
@@ -7995,9 +8436,11 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             const image = source.image || {};
             const sourceWidth = Math.max(1, Number(image.width) || 1);
             const sourceHeight = Math.max(1, Number(image.height) || 1);
-            const scale = Math.min(1, target.maxDimension / Math.max(sourceWidth, sourceHeight));
-            const width = Math.max(1, Math.round(sourceWidth * scale));
-            const height = Math.max(1, Math.round(sourceHeight * scale));
+            const width = Math.round(sourceWidth);
+            const height = Math.round(sourceHeight);
+            if (width > BAKE_PROXY_MAX_SOURCE_DIMENSION || height > BAKE_PROXY_MAX_SOURCE_DIMENSION) {
+                throw new Error(`Bake proxy source is ${width}x${height}; PNG proxy export preserves source size and supports up to ${BAKE_PROXY_MAX_SOURCE_DIMENSION}px per side`);
+            }
 
             const proxyTexture = cloneProxyTextureForWebGL(source);
             if (!proxyTexture) throw new Error(`Unsupported proxy source texture: ${target.sourceUrl}`);
@@ -8082,7 +8525,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             applyBakeState(current, { persist: true, rebuild: true, refreshPanel: false, force: true });
             const targets = getAllBakeProxyTargets();
             if (targets.length === 0) {
-                reportBridgeError('bake proxy encode', 'No UV2 beauty bake targets found');
+                reportBridgeError('bake proxy encode', 'No UV1/UV2 beauty bake targets found');
                 return;
             }
 
@@ -8148,10 +8591,11 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             const sampleLight = getBakeTextureUrl({ n: 'ObjectName', h: 0 }, null, 'lightmap') || 'Set a folder to preview path';
             const sampleBeauty = getBakeTextureUrl({ n: 'ObjectName', h: 0 }, null, 'beauty') || 'Set a folder to preview path';
             const targetRows = getBakeTargetPreviewRows();
+            const targetPreview = renderBakeTargetPreview(targetRows);
             bakePanel.innerHTML = `
                 <div class="sidepanel-header">
                     <div><div class="sidepanel-title">Bake Overrides</div>
-                    <div class="sidepanel-subtitle">UV2 lightmaps or beauty bakes</div></div>
+                    <div class="sidepanel-subtitle">UV1/UV2 bake maps</div></div>
                     <button id="bake-hide" type="button">Hide</button>
                 </div>
                 <div class="sidepanel-body">
@@ -8173,17 +8617,19 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                             <label class="bake-field"><span>Ext</span><input id="bake-ext" type="text" value="${escapeBakeHtml(b.extension)}"></label>
                             <label class="bake-field"><span>Intensity</span><span class="bake-range"><input id="bake-intensity" class="fx-range" type="range" min="0" max="4" step="0.05" value="${b.intensity}"><span class="bake-value">${b.intensity.toFixed(2)}</span></span></label>
                             <label class="bake-field"><span>Exposure</span><span class="bake-range"><input id="bake-exposure" class="fx-range" type="range" min="-6" max="6" step="0.1" value="${b.bakeExposure}"><span class="bake-value">${b.bakeExposure >= 0 ? '+' : ''}${b.bakeExposure.toFixed(1)} EV</span></span></label>
+                            <button id="bake-reset-look" class="bake-reset-look" type="button">Reset Look</button>
                         </div>
                     </section>
                     <section class="fx-section">
                         <div class="fx-section-title"><span>Status</span></div>
                         <div class="bake-status-row">
                             <div class="bake-stat"><span>Meshes</span><strong>${stats.meshes}</strong></div>
+                            <div class="bake-stat"><span>UV1 Ready</span><strong>${stats.uv1}</strong></div>
                             <div class="bake-stat"><span>UV2 Ready</span><strong>${stats.uv2}</strong></div>
                         </div>
-                        <div id="bake-light-preview" class="bake-path-preview">Light: ${escapeBakeHtml(sampleLight)}</div>
-                        <div id="bake-beauty-preview" class="bake-path-preview">Beauty: ${escapeBakeHtml(sampleBeauty)}</div>
-                        ${targetRows.length > 0 ? `<div class="bake-path-preview">Targets: ${targetRows.map(row => `${escapeBakeHtml(row.stem)} -> ${escapeBakeHtml(row.url)}`).join(' | ')}</div>` : ''}
+                        <div id="bake-light-preview" class="bake-path-preview"><span class="bake-path-label">Light</span>${escapeBakeHtml(sampleLight)}</div>
+                        <div id="bake-beauty-preview" class="bake-path-preview"><span class="bake-path-label">Beauty</span>${escapeBakeHtml(sampleBeauty)}</div>
+                        ${targetPreview}
                         <div class="bake-actions">
                             <button id="bake-reapply" type="button">Reapply</button>
                             <button id="bake-sync" type="button">Sync UV2</button>
@@ -8192,6 +8638,15 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     </section>
                 </div>`;
             bakePanel.querySelector('#bake-hide')?.addEventListener('click', () => setBakePanelVisible(false));
+            bakePanel.querySelector('#bake-reset-look')?.addEventListener('click', () => {
+                const intensity = bakePanel.querySelector('#bake-intensity');
+                const exposure = bakePanel.querySelector('#bake-exposure');
+                if (intensity) intensity.value = DEFAULT_BAKE_STATE.intensity;
+                if (exposure) exposure.value = DEFAULT_BAKE_STATE.bakeExposure;
+                const next = readBakeStateFromPanel();
+                updateBakePanelPreview(next);
+                applyBakeState(next, { persist: true, rebuild: true, refreshPanel: false, force: true });
+            });
             bakePanel.querySelector('#bake-reapply')?.addEventListener('click', () => {
                 clearBakeTextureLoadFailures();
                 applyBakeState(readBakeStateFromPanel(), { persist: true, rebuild: true, refreshPanel: false, force: true });
@@ -8206,7 +8661,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 void encodeBeautyBakeProxyMaps();
             });
             for (const el of bakePanel.querySelectorAll('input,select')) {
-                if (isBakeTextInput(el) || el.id === 'bake-intensity') {
+                if (isBakeTextInput(el) || el.id === 'bake-intensity' || el.id === 'bake-exposure') {
                     el.addEventListener('input', updateBakeStateFromPanel);
                 }
                 el.addEventListener('change', updateBakeStateFromPanel);
@@ -8365,7 +8820,76 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         // ── ForestPack GPU Instancing ───────────────────────
         const forestMeshes = new Map(); // key → InstancedMesh
 
-        function applyForestInstances(groups) {
+        function getForestBinaryFloatView(buffer, off, n, label) {
+            if (!(buffer instanceof ArrayBuffer) || !binInRange(buffer, off, n)) {
+                console.warn(`[max.js binary] Invalid ${label} range`);
+                return null;
+            }
+            return new Float32Array(buffer, off, n);
+        }
+
+        function getForestGeometryPayload(grp, binaryBuffer) {
+            const geo = grp?.geo;
+            if (geo && binaryBuffer instanceof ArrayBuffer) {
+                const v = getForestBinaryFloatView(binaryBuffer, geo.vOff, geo.vN, 'forest position');
+                const i = indexArrayFromBinary(binaryBuffer, geo.iOff, geo.iN, geo.iType, {
+                    copy: true,
+                    label: 'forest index',
+                });
+                if (!v || !i) return null;
+                const uvAttr = geo.uvOff != null && geo.uvN
+                    ? uvAttributeFromBinary(binaryBuffer, geo.uvOff, geo.uvN, geo.uvType, 'forest uv')
+                    : null;
+                const normalAttr = geo.nOff != null && geo.nN
+                    ? normalAttributeFromBinary(binaryBuffer, geo.nOff, geo.nN, geo.nType, 'forest normal')
+                    : null;
+                return {
+                    v: new Float32Array(v),
+                    i,
+                    uv: null,
+                    uvAttr,
+                    norm: null,
+                    normalAttr,
+                };
+            }
+            if (!grp?.v?.length || !grp?.i?.length) return null;
+            return { v: grp.v, i: grp.i, uv: grp.uv, uvAttr: null, norm: grp.norm, normalAttr: null };
+        }
+
+        function getForestTransformPayload(grp, binaryBuffer) {
+            if (Number.isInteger(grp?.xformOff) && Number.isInteger(grp?.xformN) && binaryBuffer instanceof ArrayBuffer) {
+                const values = getForestBinaryFloatView(binaryBuffer, grp.xformOff, grp.xformN, 'forest transform');
+                if (!values) return null;
+                const type = String(grp.xformType ?? 'f32m16').trim().toLowerCase();
+                return { values, type, stride: type === 'affine12' ? 12 : 16 };
+            }
+            if (Array.isArray(grp?.xforms) || ArrayBuffer.isView(grp?.xforms)) {
+                return { values: grp.xforms, type: 'f32m16', stride: 16 };
+            }
+            return null;
+        }
+
+        function setForestInstanceMatrix(matrix, payload, index) {
+            const values = payload.values;
+            const off = index * payload.stride;
+            if (payload.type === 'affine12') {
+                matrix.set(
+                    values[off+0], values[off+3], values[off+6],  values[off+9],
+                    values[off+1], values[off+4], values[off+7],  values[off+10],
+                    values[off+2], values[off+5], values[off+8],  values[off+11],
+                    0,             0,             0,              1
+                );
+                return;
+            }
+            matrix.set(
+                values[off+0], values[off+4], values[off+8],  values[off+12],
+                values[off+1], values[off+5], values[off+9],  values[off+13],
+                values[off+2], values[off+6], values[off+10], values[off+14],
+                values[off+3], values[off+7], values[off+11], values[off+15]
+            );
+        }
+
+        function applyForestInstances(groups, binaryBuffer = null) {
             // Remove old forest meshes
             for (const [key, mesh] of forestMeshes) {
                 maxRoot.remove(mesh);
@@ -8380,9 +8904,19 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             const m = new THREE.Matrix4();
 
             for (const grp of groups) {
-                if (!grp.v?.length || !grp.i?.length || !grp.xforms?.length) continue;
+                const geoPayload = getForestGeometryPayload(grp, binaryBuffer);
+                const xformPayload = getForestTransformPayload(grp, binaryBuffer);
+                const count = grp.count || Math.floor((xformPayload?.values?.length || 0) / (xformPayload?.stride || 16));
+                if (!geoPayload || !xformPayload?.values || !count ||
+                    xformPayload.values.length < count * xformPayload.stride) {
+                    continue;
+                }
 
-                const geom = buildGeometry(grp.v, grp.i, grp.uv, grp.norm);
+                const geom = buildGeometry(geoPayload.v, geoPayload.i, geoPayload.uv, geoPayload.norm, {
+                    skipNormalCompute: !!geoPayload.normalAttr,
+                });
+                if (geoPayload.uvAttr) geom.setAttribute('uv', geoPayload.uvAttr);
+                if (geoPayload.normalAttr) geom.setAttribute('normal', geoPayload.normalAttr);
 
                 // Material: use data from C++ (single or multi-sub), fallback to gray
                 let mat;
@@ -8398,7 +8932,6 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     mat = new THREE.MeshStandardMaterial({ color: 0x888888, roughness: 0.7, side: THREE.DoubleSide });
                 }
 
-                const count = grp.count || (grp.xforms.length / 16);
                 const instMesh = new THREE.InstancedMesh(geom, mat, count);
                 instMesh.matrixAutoUpdate = false;
                 instMesh.frustumCulled = false;
@@ -8406,16 +8939,8 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 instMesh.receiveShadow = true;
                 instMesh.name = `forest_${grp.src}_x${count}`;
 
-                // xforms is a flat array: [m0_0..m0_15, m1_0..m1_15, ...]
                 for (let i = 0; i < count; i++) {
-                    const off = i * 16;
-                    // Max row-major → Three.js column-major (transpose)
-                    m.set(
-                        grp.xforms[off+0], grp.xforms[off+4], grp.xforms[off+8],  grp.xforms[off+12],
-                        grp.xforms[off+1], grp.xforms[off+5], grp.xforms[off+9],  grp.xforms[off+13],
-                        grp.xforms[off+2], grp.xforms[off+6], grp.xforms[off+10], grp.xforms[off+14],
-                        grp.xforms[off+3], grp.xforms[off+7], grp.xforms[off+11], grp.xforms[off+15]
-                    );
+                    setForestInstanceMatrix(m, xformPayload, i);
                     instMesh.setMatrixAt(i, m);
                 }
                 instMesh.instanceMatrix.needsUpdate = true;
@@ -8729,6 +9254,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 const hRad = cam.fov * Math.PI / 180;
                 camera.aspect = aspect;
                 camera.fov = 2 * Math.atan(Math.tan(hRad / 2) / aspect) * 180 / Math.PI;
+                applySyncedCameraClip(camera, cam);
             }
             applyCameraClipOverrides(camera);
         }
@@ -8796,6 +9322,8 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 target: controls.target.toArray(),
                 fov: camera.isPerspectiveCamera ? camera.fov : null,
                 viewWidth: camera.isOrthographicCamera ? (camera.right - camera.left) : null,
+                near: Number.isFinite(camera.near) ? camera.near : null,
+                far: Number.isFinite(camera.far) ? camera.far : null,
             };
         }
 
@@ -8847,6 +9375,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 camera.far = 100000;
             } else if (Number.isFinite(savedCamera.fov) && savedCamera.fov > 0 && savedCamera.fov < 170) {
                 camera.fov = savedCamera.fov;
+                applySyncedCameraClip(camera, savedCamera);
             }
 
             applyCameraClipOverrides(camera);
@@ -8870,7 +9399,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             } else {
                 camera.position.copy(center).addScaledVector(cameraDefaultDirection, Math.max(maxDim, 1) * 1.15);
             }
-            camera.near = Math.max(0.01, maxDim * 0.001);
+            camera.near = Math.max(DEFAULT_CAMERA_NEAR, maxDim * 0.001);
             camera.far = Math.max(1000, maxDim * 100);
             applyCameraClipOverrides(camera);
             syncOrbitNavigationFeel();
@@ -8977,6 +9506,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         const snapshotPanel = document.getElementById('snapshotPanel');
         let snapshotPanelVisible = false;
         let pendingSnapshotRequestId = null;
+        let lastSnapshotExportPath = '';
 
         function setSnapshotPanelVisible(visible) {
             snapshotPanelVisible = !!visible;
@@ -9067,6 +9597,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                         <div class="snapshot-actions">
                             <button id="snapshotExportBtn" type="button">Export Snapshot</button>
                         </div>
+                        <div id="snapshotExportLocation" class="snapshot-location" hidden></div>
                         <div class="snapshot-note">Settings persist across sessions.</div>
                     </section>
                 </div>
@@ -9094,10 +9625,23 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             const effective = getSnapshotExportSettings();
             const exportButton = snapshotPanel.querySelector('#snapshotExportBtn');
             const status = snapshotPanel.querySelector('#snapshotPanelStatus');
+            const location = snapshotPanel.querySelector('#snapshotExportLocation');
             if (status) {
-                status.textContent = window.chrome?.webview
-                    ? `dist export • step ${effective.animationSampleStepFrames}f`
-                    : 'Available only inside max.js';
+                if (!window.chrome?.webview) status.textContent = 'Available only inside max.js';
+                else if (pendingSnapshotRequestId) status.textContent = 'Writing snapshot...';
+                else if (lastSnapshotExportPath) status.textContent = 'Snapshot saved';
+                else status.textContent = `dist export • step ${effective.animationSampleStepFrames}f`;
+            }
+            if (location) {
+                if (lastSnapshotExportPath) {
+                    location.hidden = false;
+                    location.textContent = `Snapshot saved to ${lastSnapshotExportPath}`;
+                    location.title = lastSnapshotExportPath;
+                } else {
+                    location.hidden = true;
+                    location.textContent = '';
+                    location.removeAttribute('title');
+                }
             }
             if (exportButton) {
                 exportButton.disabled = !window.chrome?.webview || !!pendingSnapshotRequestId;
@@ -9189,10 +9733,12 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             if (msg.action !== 'snapshot_export') return;
             if (pendingSnapshotRequestId && msg.requestId && msg.requestId !== pendingSnapshotRequestId) return;
             pendingSnapshotRequestId = null;
-            syncSnapshotPanel();
             if (msg.ok) {
-                setInfoText(`max.js - snapshot written: ${msg.path || 'dist'}`);
+                lastSnapshotExportPath = msg.path || 'dist';
+                setInfoText(`max.js - Snapshot saved to ${lastSnapshotExportPath}`);
+                syncSnapshotPanel();
             } else {
+                syncSnapshotPanel();
                 reportBridgeError('snapshot export', msg.error || 'snapshot export failed');
             }
         });
@@ -9735,6 +10281,15 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         let currentToneMapping = DEFAULT_TONE_MAPPING;
         let currentExposure = 1.0;
         let currentAAMode = 'off'; // 'traa' | 'off' (MSAA option removed — was a no-op with the deferred MRT pipeline)
+
+        function applyCoreToneMappingState({ markOutput = true } = {}) {
+            renderer.toneMapping = toneMappingModes[currentToneMapping] ?? toneMappingModes[DEFAULT_TONE_MAPPING];
+            renderer.toneMappingExposure = currentExposure;
+            renderer.userData ??= {};
+            renderer.userData.maxjsToneMappingMode = currentToneMapping;
+            renderer.userData.maxjsToneMappingExposure = currentExposure;
+            if (markOutput) ssgiFx.markOutputChanged?.();
+        }
 
         const postFxSections = [
             {
@@ -10372,15 +10927,13 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     if (!bounds.isEmpty()) {
                         const size = bounds.getSize(new THREE.Vector3());
                         const maxDim = Math.max(size.x, size.y, size.z);
-                        camera.near = Math.max(0.01, maxDim * 0.001);
+                        camera.near = Math.max(DEFAULT_CAMERA_NEAR, maxDim * 0.001);
                         camera.far = Math.max(1000, maxDim * 100);
                         applyCameraClipOverrides(camera);
                     }
                 }
                 applyRendererPerformanceSettings({ resizePostFx: true });
-                renderer.toneMapping = toneMappingModes[currentToneMapping];
-                renderer.toneMappingExposure = currentExposure;
-                ssgiFx.markOutputChanged?.();
+                applyCoreToneMappingState();
                 try { localStorage.removeItem(POSTFX_STORAGE_KEY); localStorage.removeItem('maxjs_panel_width'); } catch {}
                 postPanel.style.width = '';
                 setRightDockWidth(240);
@@ -10422,8 +10975,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             // Tone mapping controls
             document.getElementById('fx-tonemapping-mode').onchange = (e) => {
                 currentToneMapping = e.target.value;
-                renderer.toneMapping = toneMappingModes[currentToneMapping];
-                ssgiFx.markOutputChanged?.();
+                applyCoreToneMappingState();
                 savePostFxState();
             };
             const expSlider = document.getElementById('fx-tonemapping-exp');
@@ -10431,8 +10983,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             expSlider.oninput = (e) => {
                 const ev = parseFloat(e.target.value);
                 currentExposure = Math.pow(2, ev);
-                renderer.toneMappingExposure = currentExposure;
-                ssgiFx.markOutputChanged?.();
+                applyCoreToneMappingState();
                 expLabel.textContent = `${ev >= 0 ? '+' : ''}${ev.toFixed(1)} EV`;
             };
             expSlider.onchange = () => savePostFxState();
@@ -10532,6 +11083,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     ? `${camera.far.toFixed(0)}`
                     : `auto (${camera.far.toFixed(0)})`;
                 ssgiFx.markSceneChanged?.();
+                savePostFxState();
             }
             cameraNearInput.oninput = commitCameraClip;
             cameraFarInput.oninput = commitCameraClip;
@@ -10989,7 +11541,6 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
 
         function savePostFxState() {
             if (suppressPostFxPersistenceDepth > 0) return;
-            if (rendererBackendLabel !== 'WebGPU') return;
             const projectRuntime = _projectRuntimeRef;
             if (projectRuntime?.setPostFxState) {
                 const payload = serializePersistedPostFxState();
@@ -11030,15 +11581,13 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 let toneMappingChanged = false;
                 if (saved.toneMapping && toneMappingModes[saved.toneMapping] != null) {
                     currentToneMapping = saved.toneMapping;
-                    renderer.toneMapping = toneMappingModes[currentToneMapping];
                     toneMappingChanged = true;
                 }
                 if (Number.isFinite(saved.exposure)) {
                     currentExposure = saved.exposure;
-                    renderer.toneMappingExposure = currentExposure;
                     toneMappingChanged = true;
                 }
-                if (toneMappingChanged) ssgiFx.markOutputChanged?.();
+                if (toneMappingChanged) applyCoreToneMappingState();
                 if (saved.aaMode && ['msaa', 'traa', 'off'].includes(saved.aaMode)) {
                     // Legacy saved value: 'msaa' was a no-op alias for 'off' — normalize.
                     const loaded = saved.aaMode === 'msaa' ? 'off' : saved.aaMode;
@@ -11059,6 +11608,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     lightProbeEnabled = saved.lightProbeEnabled;
                     btnLightProbe.classList.toggle('active', lightProbeEnabled);
                     applyLightProbeState();
+                    if (lightProbeEnabled) refreshLightProbeFromCurrentHDRI();
                 }
 
                 // Restore HDRI settings (file must be re-picked, but sliders persist)
@@ -11233,6 +11783,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 splatOverlay.renderer.domElement.style.width = innerWidth + 'px';
                 splatOverlay.renderer.domElement.style.height = innerHeight + 'px';
             }
+            css3dOverlay.setSize(innerWidth, innerHeight);
             clearTimeout(resizeTimer);
             resizeTimer = setTimeout(() => {
                 applyRendererPerformanceSettings({ resizePostFx: false });
@@ -11645,6 +12196,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             } finally {
                 layerManager.afterRender?.(frameElapsed);
             }
+            css3dOverlay.tick(scene, camera);
             // Clone blob overlay — draw bounding rects on 2D canvas
             if (ssgiFx.isCloneEnabled() && !renderToImageActive) {
                 ssgiFx.drawBlobOverlay(blobOverlayCtx, blobOverlayCvs.width, blobOverlayCvs.height);

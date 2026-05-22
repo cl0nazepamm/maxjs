@@ -164,7 +164,7 @@ export function createScene({ renderer, canvas } = {}) {
     const cameraDefaultPosition = copyMaxComponentsToWorld(new THREE.Vector3(), 200, -200, 150);
 
     const initialSize = measureCanvasSize(canvas ?? renderer.domElement);
-    const camera = new THREE.PerspectiveCamera(60, initialSize.width / initialSize.height, 0.1, 100000);
+    const camera = new THREE.PerspectiveCamera(60, initialSize.width / initialSize.height, 1, 100000);
     camera.up.set(0, 1, 0);
     camera.position.copy(cameraDefaultPosition);
     camera.layers.enable(MAXJS_LAYER_SSR_EXCLUDE);
@@ -197,15 +197,15 @@ export function createScene({ renderer, canvas } = {}) {
     // cam-lock is on by default. Snapshots are demos; users expect to drag.
     controls.enabled = true;
 
-    // Default light handles — intentionally inert. They preserve the old
-    // fallback group/API shape without adding synthetic lighting to snapshots.
+    // Snapshot fallback lighting mirrors the live viewer headlight rig.
+    // It is only made visible when there are no authored lights/environment.
     const defaultLights = new THREE.Group();
     defaultLights.name = '__maxjs_default_lights__';
     defaultLights.visible = false;
-    const defaultAmbient = new THREE.AmbientLight(0xffffff, 0.0);
+    const defaultAmbient = new THREE.AmbientLight(0xffffff, 0.4);
     defaultAmbient.userData.volumetricBypass = true;
     defaultLights.add(defaultAmbient);
-    const defaultKey = new THREE.DirectionalLight(0xffffff, 0.0);
+    const defaultKey = new THREE.DirectionalLight(0xffffff, 2.5);
     defaultKey.userData.volumetricBypass = true;
     defaultKey.castShadow = false;
     defaultKey.shadow.mapSize.set(2048, 2048);
@@ -215,7 +215,13 @@ export function createScene({ renderer, canvas } = {}) {
     defaultKey.shadow.camera.right = 500;
     defaultKey.shadow.camera.top = 500;
     defaultKey.shadow.camera.bottom = -500;
+    defaultKey.shadow.bias = -0.001;
+    defaultKey.shadow.normalBias = 0.02;
+    const defaultFill = new THREE.DirectionalLight(0xe8e8e8, 0.8);
+    defaultFill.userData.volumetricBypass = true;
+    defaultFill.position.set(-1, 1, 0.5);
     defaultLights.add(defaultKey);
+    defaultLights.add(defaultFill);
     scene.add(defaultLights);
 
     // Resize handler — call from the wrapper on window resize / canvas changes.

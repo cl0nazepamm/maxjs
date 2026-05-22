@@ -371,11 +371,40 @@ export function createMaxJSAnimationSystem({
         return new Float32Array(loadedBinary, offset, count);
     }
 
-    function readBinaryIndexArray(offset, count) {
+    function readBinaryIndexArray(offset, count, type = '') {
         if (!(loadedBinary instanceof ArrayBuffer)) return null;
         if (!Number.isInteger(offset) || !Number.isInteger(count) || offset < 0 || count < 0) return null;
+        const normalized = String(type ?? '').trim().toLowerCase();
+        if (normalized === 'u16' || normalized === 'uint16') {
+            if ((offset % 2) !== 0 || (offset + count * 2) > loadedBinary.byteLength) return null;
+            return new Uint16Array(loadedBinary, offset, count);
+        }
         if ((offset % 4) !== 0 || (offset + count * 4) > loadedBinary.byteLength) return null;
         return new Uint32Array(loadedBinary, offset, count);
+    }
+
+    function readBinaryNormalAttribute(offset, count, type = '') {
+        if (!(loadedBinary instanceof ArrayBuffer)) return null;
+        if (!Number.isInteger(offset) || !Number.isInteger(count) || offset < 0 || count < 0) return null;
+        const normalized = String(type ?? '').trim().toLowerCase();
+        if (normalized === 'i16n' || normalized === 'int16n') {
+            if ((offset % 2) !== 0 || (offset + count * 2) > loadedBinary.byteLength) return null;
+            return new THREE.BufferAttribute(new Int16Array(loadedBinary, offset, count), 3, true);
+        }
+        if ((offset % 4) !== 0 || (offset + count * 4) > loadedBinary.byteLength) return null;
+        return new THREE.BufferAttribute(new Float32Array(loadedBinary, offset, count), 3);
+    }
+
+    function readBinaryUvAttribute(offset, count, type = '') {
+        if (!(loadedBinary instanceof ArrayBuffer)) return null;
+        if (!Number.isInteger(offset) || !Number.isInteger(count) || offset < 0 || count < 0) return null;
+        const normalized = String(type ?? '').trim().toLowerCase();
+        if (normalized === 'u16n' || normalized === 'uint16n') {
+            if ((offset % 2) !== 0 || (offset + count * 2) > loadedBinary.byteLength) return null;
+            return new THREE.BufferAttribute(new Uint16Array(loadedBinary, offset, count), 2, true);
+        }
+        if ((offset % 4) !== 0 || (offset + count * 4) > loadedBinary.byteLength) return null;
+        return new THREE.BufferAttribute(new Float32Array(loadedBinary, offset, count), 2);
     }
 
     function readBinaryUint8Array(offset, count) {
@@ -460,11 +489,11 @@ export function createMaxJSAnimationSystem({
         if (!!frame.spline !== isLineTarget) return;
 
         const vertices = readBinaryFloatArray(frame.vOff, frame.vN);
-        const indices = readBinaryIndexArray(frame.iOff, frame.iN);
+        const indices = readBinaryIndexArray(frame.iOff, frame.iN, frame.iType);
         if (!vertices || !indices) return;
 
-        const uvs = frame.uvOff != null && frame.uvN ? readBinaryFloatArray(frame.uvOff, frame.uvN) : null;
-        const normals = frame.nOff != null && frame.nN ? readBinaryFloatArray(frame.nOff, frame.nN) : null;
+        const uvAttr = frame.uvOff != null && frame.uvN ? readBinaryUvAttribute(frame.uvOff, frame.uvN, frame.uvType) : null;
+        const normalAttr = frame.nOff != null && frame.nN ? readBinaryNormalAttribute(frame.nOff, frame.nN, frame.nType) : null;
         const geometry = target.geometry;
 
         const currentPosition = geometry.getAttribute('position');
@@ -476,32 +505,43 @@ export function createMaxJSAnimationSystem({
         }
 
         const currentIndex = geometry.getIndex();
-        if (currentIndex?.array?.length === indices.length) {
+        if (
+            currentIndex?.array?.length === indices.length &&
+            currentIndex.array.BYTES_PER_ELEMENT >= indices.BYTES_PER_ELEMENT
+        ) {
             currentIndex.copyArray(indices);
             currentIndex.needsUpdate = true;
         } else {
             geometry.setIndex(new THREE.BufferAttribute(indices, 1));
         }
 
-        if (uvs) {
+        if (uvAttr) {
             const currentUv = geometry.getAttribute('uv');
-            if (currentUv?.array?.length === uvs.length) {
-                currentUv.copyArray(uvs);
+            if (
+                currentUv?.array?.length === uvAttr.array.length &&
+                currentUv.array.constructor === uvAttr.array.constructor &&
+                currentUv.normalized === uvAttr.normalized
+            ) {
+                currentUv.copyArray(uvAttr.array);
                 currentUv.needsUpdate = true;
             } else {
-                geometry.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
+                geometry.setAttribute('uv', uvAttr);
             }
         } else if (geometry.getAttribute('uv')) {
             geometry.deleteAttribute('uv');
         }
 
-        if (normals && !frame.spline) {
+        if (normalAttr && !frame.spline) {
             const currentNormal = geometry.getAttribute('normal');
-            if (currentNormal?.array?.length === normals.length) {
-                currentNormal.copyArray(normals);
+            if (
+                currentNormal?.array?.length === normalAttr.array.length &&
+                currentNormal.array.constructor === normalAttr.array.constructor &&
+                currentNormal.normalized === normalAttr.normalized
+            ) {
+                currentNormal.copyArray(normalAttr.array);
                 currentNormal.needsUpdate = true;
             } else {
-                geometry.setAttribute('normal', new THREE.BufferAttribute(normals, 3));
+                geometry.setAttribute('normal', normalAttr);
             }
         } else {
             if (geometry.getAttribute('normal')) {

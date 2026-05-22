@@ -807,6 +807,10 @@ static const wchar_t* GetMimeTypeForPath(const std::wstring& path) {
     if (_wcsicmp(ext, L".hdr") == 0) return L"image/vnd.radiance";
     if (_wcsicmp(ext, L".exr") == 0) return L"image/x-exr";
     if (_wcsicmp(ext, L".ktx2") == 0) return L"image/ktx2";
+    if (_wcsicmp(ext, L".mp4") == 0 || _wcsicmp(ext, L".m4v") == 0) return L"video/mp4";
+    if (_wcsicmp(ext, L".webm") == 0) return L"video/webm";
+    if (_wcsicmp(ext, L".mov") == 0) return L"video/quicktime";
+    if (_wcsicmp(ext, L".ogv") == 0) return L"video/ogg";
     if (_wcsicmp(ext, L".ply") == 0) return L"application/octet-stream";
     if (_wcsicmp(ext, L".splat") == 0) return L"application/octet-stream";
     if (_wcsicmp(ext, L".ksplat") == 0) return L"application/octet-stream";
@@ -827,6 +831,54 @@ static const wchar_t* GetMimeTypeForPath(const std::wstring& path) {
     if (_wcsicmp(ext, L".wasm") == 0) return L"application/wasm";
     if (_wcsicmp(ext, L".html") == 0 || _wcsicmp(ext, L".htm") == 0) return L"text/html";
     return L"application/octet-stream";
+}
+
+// Parse a single HTTP byte-range header ("bytes=start-end", "bytes=start-",
+// or suffix "bytes=-N"). Returns false when unparseable or unsatisfiable.
+// On success outStart/outEnd are inclusive and clamped to [0, totalSize-1].
+static bool ParseHttpByteRange(const std::wstring& header,
+                               unsigned long long totalSize,
+                               unsigned long long& outStart,
+                               unsigned long long& outEnd) {
+    if (totalSize == 0) return false;
+    const wchar_t* p = header.c_str();
+    while (*p == L' ' || *p == L'\t') ++p;
+    if (_wcsnicmp(p, L"bytes=", 6) != 0) return false;
+    p += 6;
+
+    std::wstring spec(p);
+    const size_t comma = spec.find(L',');  // honor only the first range
+    if (comma != std::wstring::npos) spec.resize(comma);
+    const size_t dash = spec.find(L'-');
+    if (dash == std::wstring::npos) return false;
+
+    std::wstring startStr = spec.substr(0, dash);
+    std::wstring endStr = spec.substr(dash + 1);
+    auto trim = [](std::wstring& s) {
+        while (!s.empty() && iswspace(s.front())) s.erase(s.begin());
+        while (!s.empty() && iswspace(s.back())) s.pop_back();
+    };
+    trim(startStr);
+    trim(endStr);
+
+    unsigned long long start = 0;
+    unsigned long long end = totalSize - 1;
+    if (startStr.empty()) {
+        if (endStr.empty()) return false;             // "bytes=-" is invalid
+        unsigned long long n = wcstoull(endStr.c_str(), nullptr, 10);
+        if (n == 0) return false;
+        if (n > totalSize) n = totalSize;
+        start = totalSize - n;
+        end = totalSize - 1;
+    } else {
+        start = wcstoull(startStr.c_str(), nullptr, 10);
+        if (!endStr.empty()) end = wcstoull(endStr.c_str(), nullptr, 10);
+    }
+    if (start > end || start >= totalSize) return false;
+    if (end >= totalSize) end = totalSize - 1;
+    outStart = start;
+    outEnd = end;
+    return true;
 }
 
 static bool IsTiffPath(const std::wstring& path) {

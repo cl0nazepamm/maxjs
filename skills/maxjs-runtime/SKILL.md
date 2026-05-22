@@ -44,13 +44,15 @@ return {
 
 ## How Scene Data Is Accessed
 
-Data flow:
+Normal live data flow:
 
 ```text
 3ds Max -> native fastsync -> nodeMap/lightHandleMap -> ctx.maxScene facades -> layer code
 ```
 
 `ctx.maxScene` is the authored scene read surface. It reads the same live maps fastsync updates; it is not a copied scene graph.
+
+When the viewer is switched to `SLOW` sync, the same facades still update through low-frequency JSON `xform` polling, but material scalar/event fast paths and full rebuild scheduling are intentionally suppressed. Do not use `SLOW` mode as proof that structure, texture, or topology sync is broken.
 
 Useful calls:
 
@@ -126,6 +128,7 @@ Clear overrides in `dispose()` if the layer temporarily owns authored objects.
 `ctx.camera` can lock to Max scene cameras and expose the live render camera:
 
 - `ctx.camera.raw` returns the underlying Three.js camera for last-mile render offsets such as handheld shake. This does not claim script ownership by itself.
+- Camera near/far clipping may come from Max camera manual clipping, render `ViewParams`, or viewer UI overrides. Snapshot UI state persists camera clip overrides.
 - `ctx.camera.listSceneCameras()` returns synced scene cameras as `{ handle, h, name, n }`.
 - `ctx.camera.findSceneCamera(name, { exact })` searches the scene camera list. Do this for Physical Cameras; `ctx.maxScene.findByName()` only searches synced meshes/lights.
 - `ctx.camera.usePhysicalCamera(handleOrEntry)` / `ctx.camera.usePhysicalCameraByName(name, { exact })` locks the viewer to a Max camera object while still allowing a layer to apply a post-sync camera offset through `ctx.camera.raw`.

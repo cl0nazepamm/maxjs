@@ -519,6 +519,9 @@ struct CameraData {
     float fov;         // degrees (horizontal) for perspective
     float viewWidth;   // world-unit width for orthographic
     bool perspective;
+    bool clipEnabled;
+    float nearClip;
+    float farClip;
     // DOF from Physical Camera
     bool dofEnabled;
     float dofFocusDistance;  // world units
@@ -543,6 +546,9 @@ static void GetViewportCamera(CameraData& cam) {
     Point3 up  = Normalize(camTM.GetRow(1));
     Point3 tgt = pos + fwd * 100.0f;
     cam.viewWidth = cam.perspective ? 0.0f : vp.GetVPWorldWidth(tgt);
+    cam.clipEnabled = false;
+    cam.nearClip = 0.0f;
+    cam.farClip = 0.0f;
 
     // Raw Z-up coordinates — JS handles conversion
     cam.pos[0] = pos.x;    cam.pos[1] = pos.y;    cam.pos[2] = pos.z;
@@ -632,12 +638,27 @@ static bool GetSceneCameraData(INode* camNode, TimeValue t, CameraData& cam) {
     // FOV
     cam.perspective = true;
     cam.viewWidth = 0.0f;
+    cam.clipEnabled = false;
+    cam.nearClip = 0.0f;
+    cam.farClip = 0.0f;
     if (genCam) {
         float fovRad = genCam->GetFOV(t);
         cam.fov = fovRad * (180.0f / 3.14159265f);
         if (genCam->IsOrtho()) {
             cam.perspective = false;
             cam.viewWidth = targetDist * 2.0f;
+        }
+        CameraObject* cameraObj = dynamic_cast<CameraObject*>(os.obj);
+        if (cameraObj && cameraObj->GetManualClip()) {
+            Interval valid = FOREVER;
+            const float nearClip = cameraObj->GetClipDist(t, CAM_HITHER_CLIP, valid);
+            valid = FOREVER;
+            const float farClip = cameraObj->GetClipDist(t, CAM_YON_CLIP, valid);
+            if (nearClip > 0.0f && farClip > nearClip) {
+                cam.clipEnabled = true;
+                cam.nearClip = nearClip;
+                cam.farClip = farClip;
+            }
         }
     } else {
         cam.fov = 45.0f;
@@ -720,6 +741,9 @@ static bool GetRenderViewCameraData(INode* renderViewNode, const ViewParams* vie
         ? viewPar->fov * (180.0f / 3.14159265f)
         : (haveNodeCamera ? nodeCam.fov : 60.0f);
     cam.viewWidth = 0.0f;
+    cam.clipEnabled = false;
+    cam.nearClip = 0.0f;
+    cam.farClip = 0.0f;
     if (!cam.perspective) {
         if (haveNodeCamera && !nodeCam.perspective && nodeCam.viewWidth > 1.0e-4f) {
             cam.viewWidth = nodeCam.viewWidth;
@@ -728,6 +752,15 @@ static bool GetRenderViewCameraData(INode* renderViewNode, const ViewParams* vie
         } else {
             cam.viewWidth = std::max(1.0f, targetDist * 2.0f);
         }
+    }
+    if (haveNodeCamera && nodeCam.clipEnabled) {
+        cam.clipEnabled = true;
+        cam.nearClip = nodeCam.nearClip;
+        cam.farClip = nodeCam.farClip;
+    } else if (viewPar->hither > 0.0f && viewPar->yon > viewPar->hither) {
+        cam.clipEnabled = true;
+        cam.nearClip = viewPar->hither;
+        cam.farClip = viewPar->yon;
     }
 
     cam.dofEnabled = false;
@@ -774,6 +807,11 @@ static bool CameraEquals(const CameraData& a, const CameraData& b) {
     }
     if (!NearlyEqualFloat(a.fov, b.fov, 1.0e-3f)) return false;
     if (a.perspective != b.perspective) return false;
+    if (a.clipEnabled != b.clipEnabled) return false;
+    if (a.clipEnabled) {
+        if (!NearlyEqualFloat(a.nearClip, b.nearClip, 0.01f)) return false;
+        if (!NearlyEqualFloat(a.farClip, b.farClip, 0.01f)) return false;
+    }
     if (a.dofEnabled != b.dofEnabled) return false;
     if (a.dofEnabled) {
         if (!NearlyEqualFloat(a.dofFocusDistance, b.dofFocusDistance, 0.01f)) return false;
@@ -1401,9 +1439,13 @@ struct ForestInstanceGroup {
     INode* mtlNode = nullptr;         // node for wire color fallback
     size_t vOff = 0, vN = 0;
     size_t iOff = 0, iN = 0;
+    std::wstring iType;
     size_t uvOff = 0, uvN = 0;
+    std::wstring uvType;
     size_t nOff = 0, nN = 0;
+    std::wstring nType;
     size_t xformOff = 0, xformN = 0;
+    std::wstring xformType;
 };
 
 // Register MaxJS as a Forest Pack render engine (once per session)

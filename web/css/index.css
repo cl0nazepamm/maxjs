@@ -426,6 +426,15 @@ body.light-mode .dock-drag-handle.dragging::after { background: rgba(0, 0, 0, 0.
 .snapshot-actions button {
     flex: 1 1 0;
 }
+.snapshot-location {
+    color: #b9c7d9;
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    padding: 6px 7px;
+    font: 10px/1.35 Consolas, 'Cascadia Mono', monospace;
+    overflow-wrap: anywhere;
+    user-select: text;
+}
 .snapshot-note {
     color: #777;
     font-size: 9px;
@@ -684,7 +693,7 @@ body.light-mode .fx-warn {
     color: #999;
 }
 #bakePanel {
-    width: min(340px, calc(100vw - 16px));
+    width: min(380px, calc(100vw - 16px));
 }
 #bakePanel .sidepanel-header {
     align-items: center;
@@ -705,11 +714,12 @@ body.light-mode .fx-warn {
 }
 .bake-grid {
     display: grid;
+    grid-template-columns: minmax(0, 1fr);
     gap: 7px;
 }
 .bake-field {
     display: grid;
-    grid-template-columns: 82px minmax(0, 1fr);
+    grid-template-columns: 86px minmax(0, 1fr);
     align-items: center;
     gap: 8px;
     min-height: 24px;
@@ -753,7 +763,7 @@ body.light-mode .fx-warn {
 }
 .bake-range {
     display: grid;
-    grid-template-columns: minmax(0, 1fr) 34px;
+    grid-template-columns: minmax(88px, 1fr) 48px;
     align-items: center;
     gap: 8px;
 }
@@ -764,21 +774,67 @@ body.light-mode .fx-warn {
     font-variant-numeric: tabular-nums;
     text-align: right;
 }
+.bake-reset-look {
+    grid-column: 1 / -1;
+    justify-self: stretch;
+    width: 100%;
+}
 .bake-path-preview {
     margin-top: 6px;
-    padding: 5px 6px;
+    padding: 6px 7px;
     border-radius: 4px;
     background: rgba(0, 0, 0, 0.18);
-    color: #7f7f7f;
-    font: 9px/1.35 Consolas, 'Cascadia Mono', monospace;
-    word-break: break-all;
+    color: #8b8f92;
+    font: 9px/1.4 Consolas, 'Cascadia Mono', monospace;
+    overflow-wrap: anywhere;
+}
+.bake-path-label {
+    display: block;
+    margin-bottom: 2px;
+    color: #b9c0c5;
+    font: 8px/1.2 'Segoe UI', system-ui, sans-serif;
+    font-weight: 800;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+}
+.bake-target-list {
+    max-height: 132px;
+    overflow: auto;
+    padding-right: 2px;
+}
+.bake-target-list::-webkit-scrollbar { width: 4px; }
+.bake-target-list::-webkit-scrollbar-track { background: transparent; }
+.bake-target-list::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.12); border-radius: 2px; }
+.bake-target-row {
+    padding: 5px 0;
+    border-top: 1px solid rgba(255, 255, 255, 0.06);
+}
+.bake-target-row:first-child {
+    padding-top: 0;
+    border-top: 0;
+}
+.bake-target-name {
+    display: block;
+    color: #d0d5d8;
+    font: 9px/1.25 'Segoe UI', system-ui, sans-serif;
+    font-weight: 700;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.bake-target-url {
+    display: block;
+    margin-top: 2px;
+    color: #868c90;
+    overflow-wrap: anywhere;
 }
 .bake-status-row {
     display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-columns: repeat(3, minmax(0, 1fr));
     gap: 6px;
 }
 .bake-stat {
+    min-width: 0;
     padding: 6px;
     border-radius: 4px;
     background: rgba(255, 255, 255, 0.04);
@@ -819,6 +875,16 @@ body.light-mode .bake-field select {
 body.light-mode .bake-path-preview {
     background: rgba(0, 0, 0, 0.06);
     color: #555;
+}
+body.light-mode .bake-path-label,
+body.light-mode .bake-target-name {
+    color: #333;
+}
+body.light-mode .bake-target-url {
+    color: #666;
+}
+body.light-mode .bake-target-row {
+    border-top-color: rgba(0, 0, 0, 0.08);
 }
 body.light-mode .bake-stat {
     background: rgba(255, 255, 255, 0.35);

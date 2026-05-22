@@ -377,7 +377,8 @@
         } from './js/scene_binary.js';
         import { maxTimeline } from './js/maxjs_timeline.js';
         import { createPerfHud } from './js/perf_hud.js';
-        import { createSSGIController } from './js/ssgi_fx.js';
+        import { createMaxJSFxController } from './js/maxjs_fx.js';
+        import { createWebGLBasicFx } from './js/webgl_basicfx.js';
         import { createPathTracingController } from './js/pathtracing_controller.js';
         import { createLayerManager } from './js/layer_manager.js';
         import { MAXJS_LAYER_SSR_EXCLUDE } from './js/render_layers.js';
@@ -524,7 +525,10 @@
                 splatOverlay.renderer.setSize(innerWidth, innerHeight, false);
             }
             lastRenderTimestamp = 0;
-            if (resizePostFx) ssgiFx.resize();
+            if (resizePostFx) {
+                maxjsFx.resize();
+                webglBasicFx.resize?.();
+            }
         }
 
         function configureRenderer(nextRenderer) {
@@ -998,7 +1002,7 @@
             }
         }
 
-        const ssgiFx = createSSGIController({
+        const maxjsFx = createMaxJSFxController({
             renderer,
             scene,
             camera,
@@ -1010,7 +1014,18 @@
             },
         });
         // Default camera light available for contact shadows from the start
-        if (ssgiFx.setMainLight) ssgiFx.setMainLight(defaultKey);
+        if (maxjsFx.setMainLight) maxjsFx.setMainLight(defaultKey);
+        const webglBasicFx = createWebGLBasicFx({
+            THREE: THREE_STD,
+            renderer,
+            scene,
+            camera,
+            backendLabel: rendererBackendLabel,
+            onError(message, error) {
+                console.warn(message, error);
+            },
+        });
+        window.maxjsWebGLBasicFx = webglBasicFx;
 
         // Forward viewport clicks to HTML texmap content. Raycast hits a
         // mesh whose material has any HTML-texture map slot → convert UV
@@ -1022,7 +1037,7 @@
         // Post FX controller. Toggled from the right rail. Loads React +
         // @basementstudio/shader-lab from esm.sh on first enable.
         const shaderLabFx = createShaderLabFx({ THREE, renderer, scene, camera });
-        ssgiFx.setShaderLabFx?.(shaderLabFx);
+        maxjsFx.setShaderLabFx?.(shaderLabFx);
         const pathTracingSettings = {
             samplesPerFrame: 1,
             giClamp: 20.0,
@@ -2449,7 +2464,7 @@
                     loadedTex.needsUpdate = true;
                     textureCache.set(cacheKey, loadedTex);
                     if (bakeOverrides.enabled) reapplyBakeOverridesToScene();
-                    ssgiFx.markOutputChanged?.();
+                    maxjsFx.markOutputChanged?.();
                 }, undefined, () => {
                     endTextureLoad();
                 });
@@ -2539,14 +2554,14 @@
                     failedTextureCache.delete(cacheKey);
                     textureCache.set(cacheKey, bakeTex);
                     if (bakeOverrides.enabled) reapplyBakeOverridesToScene();
-                    ssgiFx.markOutputChanged?.();
+                    maxjsFx.markOutputChanged?.();
                 },
                 undefined,
                 () => {
                     failedTextureCache.add(cacheKey);
                     textureCache.delete(cacheKey);
                     if (bakeOverrides.enabled) reapplyBakeOverridesToScene();
-                    ssgiFx.markOutputChanged?.();
+                    maxjsFx.markOutputChanged?.();
                 }
             );
             return null;
@@ -2995,7 +3010,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 if (lightProbeEnabled || shouldRefreshProbe) {
                     await updateLightProbeFromHDRI(hdrTex, probeSignature, loadGeneration);
                 }
-                ssgiFx.markEnvironmentChanged?.();
+                maxjsFx.markEnvironmentChanged?.();
             }, undefined, (error) => {
                 console.error('max.js HDRI load failed', { hdriUrl, error });
                 currentHdriUrl = null;
@@ -3009,7 +3024,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 clearLightProbe();
                 if (envVisible) scene.background = new THREE.Color(hiddenBackgroundColor);
                 setDefaultLightsVisible(true);
-                ssgiFx.markEnvironmentChanged?.();
+                maxjsFx.markEnvironmentChanged?.();
             });
         }
 
@@ -3090,7 +3105,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 if (lightProbeEnabled) {
                     await updateLightProbeFromHDRI(hdrTex, 'local-' + localHdriFileName, loadGen);
                 }
-                ssgiFx.markEnvironmentChanged?.();
+                maxjsFx.markEnvironmentChanged?.();
                 if (persist) savePostFxState();
                 syncHdriPanel();
             }, undefined, (error) => {
@@ -3136,13 +3151,13 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         function applyLocalHDRISettings() {
             if (!isLocalHdriActive()) return;
             applyLocalHDRIToScene();
-            ssgiFx.markOutputChanged?.();
+            maxjsFx.markOutputChanged?.();
         }
 
         function toggleLocalHDRI(enabled) {
             localHdriEnabled = enabled;
             applyLocalHDRIToScene();
-            ssgiFx.markEnvironmentChanged?.();
+            maxjsFx.markEnvironmentChanged?.();
             savePostFxState();
             syncHdriPanel();
         }
@@ -3168,7 +3183,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             scene.background = new THREE.Color(hiddenBackgroundColor);
             clearLightProbe();
             setDefaultLightsVisible(true);
-            ssgiFx.markEnvironmentChanged?.();
+            maxjsFx.markEnvironmentChanged?.();
             savePostFxState();
             syncHdriPanel();
         }
@@ -3399,7 +3414,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     skyPlanetaryActive = true;
                     currentHdriUrl = null;
                     currentHdriProbeSignature = '';
-                    ssgiFx.markEnvironmentChanged?.();
+                    maxjsFx.markEnvironmentChanged?.();
                     return;
                 }
 
@@ -3482,7 +3497,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 currentHdriUrl = null;
                 currentHdriProbeSignature = '';
 
-                ssgiFx.markEnvironmentChanged?.();
+                maxjsFx.markEnvironmentChanged?.();
 
             } catch (err) {
                 console.error('[max.js] applySky error:', err);
@@ -4632,19 +4647,19 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         function enterAsciiMode() {
             if (asciiActive) return;
             asciiPreFxSnapshot = {
-                ssgi: ssgiFx.isEnabled(), ssr: ssgiFx.isSSREnabled(), gtao: ssgiFx.isGTAOEnabled(),
-                bloom: ssgiFx.isBloomEnabled(), toonOutline: ssgiFx.isToonOutlineEnabled(),
-                motionBlur: ssgiFx.isMotionBlurEnabled(), traa: ssgiFx.isTRAAEnabled(),
-                contactShadow: ssgiFx.isContactShadowEnabled(), retro: ssgiFx.isRetroEnabled(),
-                volumetric: ssgiFx.isVolumetricEnabled(), pixel: ssgiFx.isPixelEnabled(),
-                fog: ssgiFx.isFogEnabled(), opaqueBackdrop: ssgiFx.isOpaqueBackdropEnabled(),
+                ssgi: maxjsFx.isEnabled(), ssr: maxjsFx.isSSREnabled(), gtao: maxjsFx.isGTAOEnabled(),
+                bloom: maxjsFx.isBloomEnabled(), toonOutline: maxjsFx.isToonOutlineEnabled(),
+                motionBlur: maxjsFx.isMotionBlurEnabled(), traa: maxjsFx.isTRAAEnabled(),
+                contactShadow: maxjsFx.isContactShadowEnabled(), retro: maxjsFx.isRetroEnabled(),
+                volumetric: maxjsFx.isVolumetricEnabled(), pixel: maxjsFx.isPixelEnabled(),
+                fog: maxjsFx.isFogEnabled(), opaqueBackdrop: maxjsFx.isOpaqueBackdropEnabled(),
             };
-            ssgiFx.setEnabled(false); ssgiFx.setSSREnabled(false); ssgiFx.setGTAOEnabled(false);
-            ssgiFx.setBloomEnabled(false); ssgiFx.setToonOutlineEnabled(false);
-            ssgiFx.setMotionBlurEnabled(false); ssgiFx.setTRAAEnabled(false);
-            ssgiFx.setContactShadowEnabled(false); ssgiFx.setRetroEnabled(false);
-            ssgiFx.setVolumetricEnabled(false); ssgiFx.setPixelEnabled(false);
-            ssgiFx.setFogEnabled(false); ssgiFx.setOpaqueBackdropEnabled(false);
+            maxjsFx.setEnabled(false); maxjsFx.setSSREnabled(false); maxjsFx.setGTAOEnabled(false);
+            maxjsFx.setBloomEnabled(false); maxjsFx.setToonOutlineEnabled(false);
+            maxjsFx.setMotionBlurEnabled(false); maxjsFx.setTRAAEnabled(false);
+            maxjsFx.setContactShadowEnabled(false); maxjsFx.setRetroEnabled(false);
+            maxjsFx.setVolumetricEnabled(false); maxjsFx.setPixelEnabled(false);
+            maxjsFx.setFogEnabled(false); maxjsFx.setOpaqueBackdropEnabled(false);
             rebuildAsciiEffect();
             asciiActive = true;
             renderer.domElement.style.display = 'none';
@@ -4659,13 +4674,13 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             document.querySelector('.sidepanel-body')?.classList.remove('ascii-takeover');
             if (asciiPreFxSnapshot) {
                 const s = asciiPreFxSnapshot;
-                ssgiFx.setGTAOEnabled(s.gtao); ssgiFx.setEnabled(s.ssgi);
-                ssgiFx.setSSREnabled(s.ssr); ssgiFx.setBloomEnabled(s.bloom);
-                ssgiFx.setToonOutlineEnabled(s.toonOutline); ssgiFx.setMotionBlurEnabled(s.motionBlur);
-                ssgiFx.setTRAAEnabled(s.traa); ssgiFx.setContactShadowEnabled(s.contactShadow);
-                ssgiFx.setRetroEnabled(s.retro); ssgiFx.setVolumetricEnabled(s.volumetric);
-                ssgiFx.setPixelEnabled(s.pixel); ssgiFx.setFogEnabled(s.fog);
-                ssgiFx.setOpaqueBackdropEnabled(s.opaqueBackdrop);
+                maxjsFx.setGTAOEnabled(s.gtao); maxjsFx.setEnabled(s.ssgi);
+                maxjsFx.setSSREnabled(s.ssr); maxjsFx.setBloomEnabled(s.bloom);
+                maxjsFx.setToonOutlineEnabled(s.toonOutline); maxjsFx.setMotionBlurEnabled(s.motionBlur);
+                maxjsFx.setTRAAEnabled(s.traa); maxjsFx.setContactShadowEnabled(s.contactShadow);
+                maxjsFx.setRetroEnabled(s.retro); maxjsFx.setVolumetricEnabled(s.volumetric);
+                maxjsFx.setPixelEnabled(s.pixel); maxjsFx.setFogEnabled(s.fog);
+                maxjsFx.setOpaqueBackdropEnabled(s.opaqueBackdrop);
                 asciiPreFxSnapshot = null;
             }
             syncPostFxPanel(true);
@@ -4691,43 +4706,43 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 // Snapshot current FX state once. Forced native resends must not
                 // overwrite the user's restore target with the already-muted clay state.
                 clayPreFxSnapshot = {
-                    ssgi: ssgiFx.isEnabled(),
-                    ssr: ssgiFx.isSSREnabled(),
-                    gtao: ssgiFx.isGTAOEnabled(),
-                    bloom: ssgiFx.isBloomEnabled(),
-                    toonOutline: ssgiFx.isToonOutlineEnabled(),
-                    motionBlur: ssgiFx.isMotionBlurEnabled(),
-                    traa: ssgiFx.isTRAAEnabled(),
-                    contactShadow: ssgiFx.isContactShadowEnabled(),
-                    retro: ssgiFx.isRetroEnabled(),
-                    volumetric: ssgiFx.isVolumetricEnabled(),
-                    pixel: ssgiFx.isPixelEnabled(),
-                    fog: ssgiFx.isFogEnabled(),
-                    opaqueBackdrop: ssgiFx.isOpaqueBackdropEnabled(),
-                    clone: ssgiFx.isCloneEnabled(),
+                    ssgi: maxjsFx.isEnabled(),
+                    ssr: maxjsFx.isSSREnabled(),
+                    gtao: maxjsFx.isGTAOEnabled(),
+                    bloom: maxjsFx.isBloomEnabled(),
+                    toonOutline: maxjsFx.isToonOutlineEnabled(),
+                    motionBlur: maxjsFx.isMotionBlurEnabled(),
+                    traa: maxjsFx.isTRAAEnabled(),
+                    contactShadow: maxjsFx.isContactShadowEnabled(),
+                    retro: maxjsFx.isRetroEnabled(),
+                    volumetric: maxjsFx.isVolumetricEnabled(),
+                    pixel: maxjsFx.isPixelEnabled(),
+                    fog: maxjsFx.isFogEnabled(),
+                    opaqueBackdrop: maxjsFx.isOpaqueBackdropEnabled(),
+                    clone: maxjsFx.isCloneEnabled(),
                 };
                 // Disable everything
-                ssgiFx.setCloneEnabled(false);
-                ssgiFx.setEnabled(false);
-                ssgiFx.setSSREnabled(false);
-                ssgiFx.setBloomEnabled(false);
-                ssgiFx.setToonOutlineEnabled(false);
-                ssgiFx.setMotionBlurEnabled(false);
-                ssgiFx.setTRAAEnabled(false);
-                ssgiFx.setContactShadowEnabled(false);
-                ssgiFx.setRetroEnabled(false);
-                ssgiFx.setVolumetricEnabled(false);
-                ssgiFx.setPixelEnabled(false);
-                ssgiFx.setFogEnabled(false);
-                ssgiFx.setOpaqueBackdropEnabled(false);
-                ssgiFx.setGTAOEnabled(false);
+                maxjsFx.setCloneEnabled(false);
+                maxjsFx.setEnabled(false);
+                maxjsFx.setSSREnabled(false);
+                maxjsFx.setBloomEnabled(false);
+                maxjsFx.setToonOutlineEnabled(false);
+                maxjsFx.setMotionBlurEnabled(false);
+                maxjsFx.setTRAAEnabled(false);
+                maxjsFx.setContactShadowEnabled(false);
+                maxjsFx.setRetroEnabled(false);
+                maxjsFx.setVolumetricEnabled(false);
+                maxjsFx.setPixelEnabled(false);
+                maxjsFx.setFogEnabled(false);
+                maxjsFx.setOpaqueBackdropEnabled(false);
+                maxjsFx.setGTAOEnabled(false);
             }
-            if (ssgiFx.setClayOverride) ssgiFx.setClayOverride(true);
+            if (maxjsFx.setClayOverride) maxjsFx.setClayOverride(true);
 
             // Use scene.overrideMaterial — renderer + shadow system use it natively,
             // no per-mesh swap needed, no stale WebGPU TextureNode references.
             scene.overrideMaterial = clayMat;
-            ssgiFx.markOutputChanged?.();
+            maxjsFx.markOutputChanged?.();
         }
 
         function exitClayMode() {
@@ -4735,24 +4750,24 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
 
             // Restore FX state
             if (clayPreFxSnapshot) {
-                if (ssgiFx.setClayOverride) ssgiFx.setClayOverride(false);
-                ssgiFx.setGTAOEnabled(clayPreFxSnapshot.gtao);
-                ssgiFx.setEnabled(clayPreFxSnapshot.ssgi);
-                ssgiFx.setSSREnabled(clayPreFxSnapshot.ssr);
-                ssgiFx.setBloomEnabled(clayPreFxSnapshot.bloom);
-                ssgiFx.setToonOutlineEnabled(clayPreFxSnapshot.toonOutline);
-                ssgiFx.setMotionBlurEnabled(clayPreFxSnapshot.motionBlur);
-                ssgiFx.setTRAAEnabled(clayPreFxSnapshot.traa);
-                ssgiFx.setContactShadowEnabled(clayPreFxSnapshot.contactShadow);
-                ssgiFx.setRetroEnabled(clayPreFxSnapshot.retro);
-                ssgiFx.setVolumetricEnabled(clayPreFxSnapshot.volumetric);
-                ssgiFx.setPixelEnabled(clayPreFxSnapshot.pixel);
-                ssgiFx.setFogEnabled(clayPreFxSnapshot.fog);
-                ssgiFx.setOpaqueBackdropEnabled(clayPreFxSnapshot.opaqueBackdrop);
-                ssgiFx.setCloneEnabled(clayPreFxSnapshot.clone);
+                if (maxjsFx.setClayOverride) maxjsFx.setClayOverride(false);
+                maxjsFx.setGTAOEnabled(clayPreFxSnapshot.gtao);
+                maxjsFx.setEnabled(clayPreFxSnapshot.ssgi);
+                maxjsFx.setSSREnabled(clayPreFxSnapshot.ssr);
+                maxjsFx.setBloomEnabled(clayPreFxSnapshot.bloom);
+                maxjsFx.setToonOutlineEnabled(clayPreFxSnapshot.toonOutline);
+                maxjsFx.setMotionBlurEnabled(clayPreFxSnapshot.motionBlur);
+                maxjsFx.setTRAAEnabled(clayPreFxSnapshot.traa);
+                maxjsFx.setContactShadowEnabled(clayPreFxSnapshot.contactShadow);
+                maxjsFx.setRetroEnabled(clayPreFxSnapshot.retro);
+                maxjsFx.setVolumetricEnabled(clayPreFxSnapshot.volumetric);
+                maxjsFx.setPixelEnabled(clayPreFxSnapshot.pixel);
+                maxjsFx.setFogEnabled(clayPreFxSnapshot.fog);
+                maxjsFx.setOpaqueBackdropEnabled(clayPreFxSnapshot.opaqueBackdrop);
+                maxjsFx.setCloneEnabled(clayPreFxSnapshot.clone);
                 clayPreFxSnapshot = null;
             }
-            ssgiFx.markOutputChanged?.();
+            maxjsFx.markOutputChanged?.();
         }
 
         bridge.on('clay_mode', msg => {
@@ -4900,7 +4915,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                             applyIncomingMaterial();
                             // Geometry data on the same Object3D — no pipeline
                             // rebuild needed regardless of which branch ran.
-                            ssgiFx?.markGeometryDataDirty?.();
+                            maxjsFx?.markGeometryDataDirty?.();
                             markLightProbeSceneDirty();
                             scheduleLightProbeFromCurrentScene({ delay: 350 });
                             schedulePathTracingLiveRebuild();
@@ -5739,7 +5754,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     removeAuthoredEnvironment();
                 }
             }
-            if (snapshot.fog) ssgiFx.setFogFromScene(snapshot.fog);
+            if (snapshot.fog) maxjsFx.setFogFromScene(snapshot.fog);
             const lightsChanged = snapshot.lights ? applyLights(snapshot.lights) : false;
             if (snapshot.sceneCameras) updateSceneCameraList(snapshot.sceneCameras, snapshot.lockedCamera);
             reconcileSplats(snapshot.splats ?? []);
@@ -5758,7 +5773,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 lightLinking.refreshSceneBindings?.();
                 markLightProbeSceneDirty();
             } else if (lightsChanged) {
-                ssgiFx.markOutputChanged?.();
+                maxjsFx.markOutputChanged?.();
             }
             if (sceneChanged || lightsChanged) {
                 if (lightsChanged) markLightProbeSceneDirty();
@@ -5771,7 +5786,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             // Full snapshot can add/remove many meshes — cheap scene refresh.
             // Effect toggles, env, and renderer size have their own dedicated
             // entry points, so a full pipeline rebuild is unnecessary here.
-            if (sceneChanged) ssgiFx.markSceneChanged?.();
+            if (sceneChanged) maxjsFx.markSceneChanged?.();
             options.afterWorldUpdate?.();
 
             if (firstSync && snapshot.nodes.length > 0) {
@@ -5930,10 +5945,10 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     removeAuthoredEnvironment();
                     pathTraceSceneChanged = true;
                 }
-                ssgiFx.markEnvironmentChanged?.();
+                maxjsFx.markEnvironmentChanged?.();
             }
             if (msg.fog) {
-                ssgiFx.setFogFromScene(msg.fog);
+                maxjsFx.setFogFromScene(msg.fog);
                 pathTraceSceneChanged = true;
             }
             if (pathTraceSceneChanged) schedulePathTracingLiveRebuild();
@@ -5976,7 +5991,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 nodeMap.set(msg.h, newMesh);
                 // Renderable-type swap (mesh ↔ line) — scene structure changed,
                 // refresh the post-pass hide list / toon cache. Cheap.
-                ssgiFx.markSceneChanged?.();
+                maxjsFx.markSceneChanged?.();
                 markLightProbeSceneDirty();
                 scheduleLightProbeFromCurrentScene();
                 schedulePathTracingLiveRebuild();
@@ -6009,7 +6024,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             // Vertex / topology data on the same Object3D — no scene-structure
             // refresh, no pipeline rebuild. pass(scene, camera) picks up the new
             // BufferGeometry attributes on the next frame automatically.
-            ssgiFx.markGeometryDataDirty?.();
+            maxjsFx.markGeometryDataDirty?.();
             markLightProbeSceneDirty();
             scheduleLightProbeFromCurrentScene({ delay: 350 });
             schedulePathTracingLiveRebuild();
@@ -6092,7 +6107,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             if (msg.camera) applyCamera(msg.camera);
             if (visibilityChanged) {
                 // Visibility flip changes the post-pass hide list — cheap refresh.
-                ssgiFx.markSceneChanged?.();
+                maxjsFx.markSceneChanged?.();
                 markLightProbeSceneDirty();
                 scheduleLightProbeFromCurrentScene({ delay: 350 });
             }
@@ -6943,8 +6958,8 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             }
 
             setDefaultLightsVisible(appliedLightCount === 0 && !currentHdriUrl && !skyActive);
-            if (ssgiFx.setMainLight) {
-                ssgiFx.setMainLight(mainDirectionalLight || (defaultLights.visible ? defaultKey : null));
+            if (maxjsFx.setMainLight) {
+                maxjsFx.setMainLight(mainDirectionalLight || (defaultLights.visible ? defaultKey : null));
             }
             markLightProbeSceneDirty();
             scheduleLightProbeFromCurrentScene({ delay: 350 });
@@ -7024,7 +7039,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 lightingParamRefreshQueued = true;
                 requestAnimationFrame(() => {
                     lightingParamRefreshQueued = false;
-                    ssgiFx.markOutputChanged?.();
+                    maxjsFx.markOutputChanged?.();
                 });
             }
 
@@ -7114,7 +7129,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             }
 
             function notifyLightLinkTopologyChanged() {
-                ssgiFx.markSceneChanged?.();
+                maxjsFx.markSceneChanged?.();
                 notifyLightingParamChanged();
             }
 
@@ -7778,8 +7793,8 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         const REFL_PAINT_STORAGE_KEY = 'maxjs-reflection-paint';
 
         function notifyReflectionPaintChanged(wasActive, options = {}) {
-            if (wasActive !== reflPaint.active) ssgiFx.markSceneChanged?.();
-            ssgiFx.markOutputChanged?.();
+            if (wasActive !== reflPaint.active) maxjsFx.markSceneChanged?.();
+            maxjsFx.markOutputChanged?.();
             if (lightLinkPanelVisible && (options.rebuildLightPanel || wasActive !== reflPaint.active)) {
                 rebuildLightLinkPanel();
             }
@@ -8265,8 +8280,8 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 }
             }
             if (changed) {
-                ssgiFx.markSceneChanged?.();
-                ssgiFx.markOutputChanged?.();
+                maxjsFx.markSceneChanged?.();
+                maxjsFx.markOutputChanged?.();
                 markLightProbeSceneDirty();
                 scheduleLightProbeFromCurrentScene({ delay: 250 });
             }
@@ -9239,8 +9254,8 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             }
 
             setDefaultLightsVisible(appliedLightCount === 0 && !currentHdriUrl && !skyActive);
-            if (ssgiFx.setMainLight) {
-                ssgiFx.setMainLight(mainDirectionalLight || (defaultLights.visible ? defaultKey : null));
+            if (maxjsFx.setMainLight) {
+                maxjsFx.setMainLight(mainDirectionalLight || (defaultLights.visible ? defaultKey : null));
             }
             if (refreshSkyFromLinkedSun()) {
                 markLightProbeSceneDirty();
@@ -9366,7 +9381,8 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 camera = orthoCamera;
                 scene.add(camera);
                 controls.object = camera;
-                ssgiFx.setCamera?.(camera);
+                maxjsFx.setCamera?.(camera);
+                webglBasicFx.setCamera?.(camera);
                 shaderLabFx.setCamera?.(camera);
                 pathTracingFx.setCamera?.(camera);
             } else if (!wantOrtho && isOrtho) {
@@ -9374,7 +9390,8 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 camera = perspCamera;
                 scene.add(camera);
                 controls.object = camera;
-                ssgiFx.setCamera?.(camera);
+                maxjsFx.setCamera?.(camera);
+                webglBasicFx.setCamera?.(camera);
                 shaderLabFx.setCamera?.(camera);
                 pathTracingFx.setCamera?.(camera);
             }
@@ -9390,8 +9407,8 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
 
             // Forward Physical Camera DOF to post-fx when available
             physicalCameraDofActive = !!cam.dofEnabled;
-            if (physicalCameraDofActive && ssgiFx?.updateDofFromPhysicalCamera) {
-                ssgiFx.updateDofFromPhysicalCamera(cam, () => syncPostFxPanel(false, { persist: false }));
+            if (physicalCameraDofActive && maxjsFx?.updateDofFromPhysicalCamera) {
+                maxjsFx.updateDofFromPhysicalCamera(cam, () => syncPostFxPanel(false, { persist: false }));
             }
         }
 
@@ -9433,7 +9450,8 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 camera = orthoCamera;
                 scene.add(camera);
                 controls.object = camera;
-                ssgiFx.setCamera?.(camera);
+                maxjsFx.setCamera?.(camera);
+                webglBasicFx.setCamera?.(camera);
                 shaderLabFx.setCamera?.(camera);
                 pathTracingFx.setCamera?.(camera);
             } else if (!wantOrtho && isOrtho) {
@@ -9441,7 +9459,8 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 camera = perspCamera;
                 scene.add(camera);
                 controls.object = camera;
-                ssgiFx.setCamera?.(camera);
+                maxjsFx.setCamera?.(camera);
+                webglBasicFx.setCamera?.(camera);
                 shaderLabFx.setCamera?.(camera);
                 pathTracingFx.setCamera?.(camera);
             }
@@ -9844,7 +9863,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         btnEnv.onclick = () => {
             envVisible = !envVisible;
             syncEnvButtonUi();
-            ssgiFx.setEnvironmentVisible(envVisible);
+            maxjsFx.setEnvironmentVisible(envVisible);
             if (isLocalHdriActive()) {
                 localHdriShowBg = envVisible;
                 applyLocalHDRIToScene();
@@ -10018,7 +10037,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             if (!envVisible && !isLocalHdriActive()) {
                 scene.background = bgColor;
             }
-            ssgiFx.setOpaqueBackdropOptions({ red: bgColor.r, green: bgColor.g, blue: bgColor.b });
+            maxjsFx.setOpaqueBackdropOptions({ red: bgColor.r, green: bgColor.g, blue: bgColor.b });
         };
 
         // Toon outline is automatic — no UI button needed
@@ -10049,8 +10068,29 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         let shaderLabPanelVisible = false;
         let shaderLabPanelApp = null;
 
+        function isShaderLabBackendAvailable() {
+            return !!maxjsFx.supportsScreenSpaceEffects?.();
+        }
+
+        function syncShaderLabAvailability() {
+            const available = isShaderLabBackendAvailable();
+            if (btnShaderLabPanel) {
+                const row = btnShaderLabPanel.closest('.vpmenu-row');
+                if (row) row.hidden = !available;
+                btnShaderLabPanel.disabled = !available;
+                btnShaderLabPanel.classList.toggle('disabled', !available);
+                btnShaderLabPanel.title = available
+                    ? 'Shader Lab by basement.studio'
+                    : 'Shader Lab requires WebGPU or TSL_GL';
+            }
+            if (!available && shaderLabPanelVisible) {
+                setShaderLabPanelVisible(false);
+            }
+            return available;
+        }
+
         function setShaderLabPanelVisible(visible) {
-            shaderLabPanelVisible = !!visible;
+            shaderLabPanelVisible = !!visible && isShaderLabBackendAvailable();
             if (!shaderLabPanelVisible) {
                 const ae = document.activeElement;
                 if (ae instanceof HTMLElement && shaderLabPanel.contains(ae)) btnShaderLabPanel?.focus();
@@ -10074,6 +10114,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     console.error('[ShaderLabPanel] React load failed:', err);
                 });
             }
+            syncShaderLabAvailability();
         }
 
         // ── Canvas Panel ────────────────────────────────────
@@ -10315,7 +10356,15 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
 
         btnLayersPanel.addEventListener('click', () => setLayersPanelVisible(!layersPanelVisible));
         btnCanvasPanel?.addEventListener('click', () => setCanvasPanelVisible(!canvasPanelVisible));
-        btnShaderLabPanel?.addEventListener('click', () => setShaderLabPanelVisible(!shaderLabPanelVisible));
+        btnShaderLabPanel?.addEventListener('click', () => {
+            if (!isShaderLabBackendAvailable()) {
+                perfHud.setStatus('max.js - Shader Lab requires WebGPU or TSL_GL');
+                syncShaderLabAvailability();
+                return;
+            }
+            setShaderLabPanelVisible(!shaderLabPanelVisible);
+        });
+        syncShaderLabAvailability();
 
         document.getElementById('btnLightHelpers')?.addEventListener('click', () => {
             setLightHelpersVisible(!lightHelpersVisible);
@@ -10361,7 +10410,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             renderer.userData ??= {};
             renderer.userData.maxjsToneMappingMode = currentToneMapping;
             renderer.userData.maxjsToneMappingExposure = currentExposure;
-            if (markOutput) ssgiFx.markOutputChanged?.();
+            if (markOutput) maxjsFx.markOutputChanged?.();
         }
 
         const postFxSections = [
@@ -10371,10 +10420,10 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 copy: 'Diffuse bounce lighting and ambient occlusion from the current frame.',
                 note: 'Requires WebGPU or TSL_GL.',
                 requiresWebGPU: true,
-                isEnabled: () => ssgiFx.isEnabled(),
-                setEnabled: (enabled) => ssgiFx.setEnabled(enabled),
+                isEnabled: () => maxjsFx.isEnabled(),
+                setEnabled: (enabled) => maxjsFx.setEnabled(enabled),
                 getValues: (state) => state.ssgi,
-                setValues: (patch) => ssgiFx.setSSGIOptions(patch),
+                setValues: (patch) => maxjsFx.setSSGIOptions(patch),
                 controls: [
                     { key: 'radius', label: 'Radius', min: 1, max: 24, step: 0.5 },
                     { key: 'thickness', label: 'Thickness', min: 0.01, max: 10, step: 0.01 },
@@ -10392,10 +10441,10 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 copy: 'Screen-space reflections for glossy and mirror-like surfaces.',
                 note: 'Requires WebGPU or TSL_GL.',
                 requiresWebGPU: true,
-                isEnabled: () => ssgiFx.isSSREnabled(),
-                setEnabled: (enabled) => ssgiFx.setSSREnabled(enabled),
+                isEnabled: () => maxjsFx.isSSREnabled(),
+                setEnabled: (enabled) => maxjsFx.setSSREnabled(enabled),
                 getValues: (state) => state.ssr,
-                setValues: (patch) => ssgiFx.setSSROptions(patch),
+                setValues: (patch) => maxjsFx.setSSROptions(patch),
                 controls: [
                     { key: 'quality', label: 'Quality', min: 0, max: 1, step: 0.01 },
                     { key: 'blurQuality', label: 'Blur Quality', min: 1, max: 3, step: 1, integer: true },
@@ -10410,10 +10459,10 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 copy: 'Ground-truth ambient occlusion from a dedicated depth and normal pre-pass.',
                 note: 'Requires WebGPU or TSL_GL.',
                 requiresWebGPU: true,
-                isEnabled: () => ssgiFx.isGTAOEnabled(),
-                setEnabled: (enabled) => ssgiFx.setGTAOEnabled(enabled),
+                isEnabled: () => maxjsFx.isGTAOEnabled(),
+                setEnabled: (enabled) => maxjsFx.setGTAOEnabled(enabled),
                 getValues: (state) => state.gtao,
-                setValues: (patch) => ssgiFx.setGTAOOptions(patch),
+                setValues: (patch) => maxjsFx.setGTAOOptions(patch),
                 controls: [
                     { key: 'radius', label: 'Radius', min: 0.05, max: 2, step: 0.01 },
                     { key: 'thickness', label: 'Thickness', min: 0.01, max: 2, step: 0.01 },
@@ -10430,10 +10479,10 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 copy: 'Highlights bleed for emissive and high-energy surfaces.',
                 note: 'Requires WebGPU or TSL_GL.',
                 requiresWebGPU: true,
-                isEnabled: () => ssgiFx.isBloomEnabled(),
-                setEnabled: (enabled) => ssgiFx.setBloomEnabled(enabled),
+                isEnabled: () => maxjsFx.isBloomEnabled(),
+                setEnabled: (enabled) => maxjsFx.setBloomEnabled(enabled),
                 getValues: (state) => state.bloom,
-                setValues: (patch) => ssgiFx.setBloomOptions(patch),
+                setValues: (patch) => maxjsFx.setBloomOptions(patch),
                 controls: [
                     { key: 'strength', label: 'Strength', min: 0, max: 3, step: 0.01 },
                     { key: 'radius', label: 'Radius', min: 0, max: 1, step: 0.01 },
@@ -10447,10 +10496,10 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 warn: 'NOTICE: This particular effect will turn off max.js fastsync and vertex updates will lag.',
                 note: 'Only visible on MeshToonMaterial objects.',
                 requiresWebGPU: true,
-                isEnabled: () => ssgiFx.isToonOutlineEnabled(),
-                setEnabled: (enabled) => ssgiFx.setToonOutlineEnabled(enabled),
+                isEnabled: () => maxjsFx.isToonOutlineEnabled(),
+                setEnabled: (enabled) => maxjsFx.setToonOutlineEnabled(enabled),
                 getValues: (state) => state.toonOutline,
-                setValues: (patch) => ssgiFx.setToonOutlineOptions(patch),
+                setValues: (patch) => maxjsFx.setToonOutlineOptions(patch),
                 controls: [
                     { key: 'thickness', label: 'Thickness', min: 0.001, max: 0.02, step: 0.001 },
                     { key: 'alpha', label: 'Opacity', min: 0, max: 1, step: 0.01 },
@@ -10467,10 +10516,10 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 disabledBy: (state) => state.pixel.enabled
                     ? 'Disabled while Pixel FX is on.'
                     : null,
-                isEnabled: () => ssgiFx.isMotionBlurEnabled(),
-                setEnabled: (enabled) => ssgiFx.setMotionBlurEnabled(enabled),
+                isEnabled: () => maxjsFx.isMotionBlurEnabled(),
+                setEnabled: (enabled) => maxjsFx.setMotionBlurEnabled(enabled),
                 getValues: (state) => state.motionBlur,
-                setValues: (patch) => ssgiFx.setMotionBlurOptions(patch),
+                setValues: (patch) => maxjsFx.setMotionBlurOptions(patch),
                 controls: [
                     { key: 'amount', label: 'Amount', min: 0, max: 3, step: 0.01 },
                     { key: 'samples', label: 'Samples', min: 4, max: 32, step: 1, integer: true },
@@ -10483,10 +10532,10 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 copy: 'Screen-space shadows for detailed close-range shadowing.',
                 note: 'Requires WebGPU or TSL_GL and a DirectionalLight.',
                 requiresWebGPU: true,
-                isEnabled: () => ssgiFx.isContactShadowEnabled(),
-                setEnabled: (enabled) => ssgiFx.setContactShadowEnabled(enabled),
+                isEnabled: () => maxjsFx.isContactShadowEnabled(),
+                setEnabled: (enabled) => maxjsFx.setContactShadowEnabled(enabled),
                 getValues: (state) => state.contactShadow,
-                setValues: (patch) => ssgiFx.setContactShadowOptions(patch),
+                setValues: (patch) => maxjsFx.setContactShadowOptions(patch),
                 controls: [
                     { key: 'maxDistance', label: 'Max Distance', min: 0.01, max: 1, step: 0.01 },
                     { key: 'thickness', label: 'Thickness', min: 0.001, max: 0.1, step: 0.001 },
@@ -10499,12 +10548,12 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 key: 'retro',
                 title: 'Retro',
                 copy: 'PS1-style posterization, scanlines, barrel distortion, and CRT effects.',
-                note: 'Works on WebGPU and WebGL fallback.',
-                requiresWebGPU: false,
-                isEnabled: () => ssgiFx.isRetroEnabled(),
-                setEnabled: (enabled) => ssgiFx.setRetroEnabled(enabled),
+                note: 'Requires WebGPU or TSL_GL.',
+                requiresWebGPU: true,
+                isEnabled: () => maxjsFx.isRetroEnabled(),
+                setEnabled: (enabled) => maxjsFx.setRetroEnabled(enabled),
                 getValues: (state) => state.retro,
-                setValues: (patch) => ssgiFx.setRetroOptions(patch),
+                setValues: (patch) => maxjsFx.setRetroOptions(patch),
                 controls: [
                     { key: 'dither', label: 'Dither', type: 'checkbox' },
                     { key: 'colorDepth', label: 'Color Depth', min: 2, max: 64, step: 1, integer: true },
@@ -10523,10 +10572,10 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 copy: 'Ray-marched light scattering through fog volume. Reacts to scene lights.',
                 note: 'Requires WebGPU or TSL_GL.',
                 requiresWebGPU: true,
-                isEnabled: () => ssgiFx.isVolumetricEnabled(),
-                setEnabled: (enabled) => ssgiFx.setVolumetricEnabled(enabled),
+                isEnabled: () => maxjsFx.isVolumetricEnabled(),
+                setEnabled: (enabled) => maxjsFx.setVolumetricEnabled(enabled),
                 getValues: (state) => state.volumetric,
-                setValues: (patch) => ssgiFx.setVolumetricOptions(patch),
+                setValues: (patch) => maxjsFx.setVolumetricOptions(patch),
                 controls: [
                     { key: 'intensity', label: 'Intensity', min: 0, max: 5, step: 0.05 },
                     { key: 'density', label: 'Density', min: 0, max: 1, step: 0.01 },
@@ -10539,19 +10588,19 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 key: 'pixel',
                 title: 'Pixel FX',
                 copy: 'Pixelation, chromatic aberration, sharpen, color grading, and film grain.',
-                note: 'Works on WebGPU and WebGL fallback. Mutually exclusive with Motion Blur.',
-                requiresWebGPU: false,
-                isEnabled: () => ssgiFx.isPixelEnabled(),
+                note: 'Requires WebGPU or TSL_GL. Mutually exclusive with Motion Blur.',
+                requiresWebGPU: true,
+                isEnabled: () => maxjsFx.isPixelEnabled(),
                 setEnabled: (enabled) => {
                     // Pixel FX and Motion Blur are mutually exclusive — turning on
                     // Pixel forces Motion Blur off so the disabled-by gate is honored.
-                    if (enabled && ssgiFx.isMotionBlurEnabled()) {
-                        ssgiFx.setMotionBlurEnabled(false);
+                    if (enabled && maxjsFx.isMotionBlurEnabled()) {
+                        maxjsFx.setMotionBlurEnabled(false);
                     }
-                    return ssgiFx.setPixelEnabled(enabled);
+                    return maxjsFx.setPixelEnabled(enabled);
                 },
                 getValues: (state) => state.pixel,
-                setValues: (patch) => ssgiFx.setPixelOptions(patch),
+                setValues: (patch) => maxjsFx.setPixelOptions(patch),
                 controls: [
                     { key: 'pixelate', label: 'Pixelate', type: 'checkbox' },
                     { key: 'pixelSize', label: 'Pixel Size', min: 1, max: 32, step: 1, integer: true },
@@ -10572,10 +10621,10 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 copy: 'Physical camera DOF with bokeh blur. Auto-syncs from Max Physical Camera when enabled.',
                 note: 'Requires WebGPU or TSL_GL. Enable DOF on the Physical Camera in Max for auto mode.',
                 requiresWebGPU: true,
-                isEnabled: () => ssgiFx.isDofEnabled(),
-                setEnabled: (enabled) => ssgiFx.setDofEnabled(enabled),
+                isEnabled: () => maxjsFx.isDofEnabled(),
+                setEnabled: (enabled) => maxjsFx.setDofEnabled(enabled),
                 getValues: (state) => state.dof,
-                setValues: (patch) => ssgiFx.setDofOptions(patch),
+                setValues: (patch) => maxjsFx.setDofOptions(patch),
                 controls: [
                     { key: 'autoFromCamera', label: 'Auto from Camera', type: 'checkbox' },
                     { key: 'focusDistance', label: 'Focus Distance', min: 0.1, max: 10000, step: 1 },
@@ -10587,12 +10636,12 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 key: 'fog',
                 title: 'Fog',
                 copy: 'Distance fog, density fog, or animated procedural ground fog.',
-                note: 'Also controllable via Rendering > Environment > Atmosphere in Max.',
-                requiresWebGPU: false,
-                isEnabled: () => ssgiFx.isFogEnabled(),
-                setEnabled: (enabled) => ssgiFx.setFogEnabled(enabled),
+                note: 'Requires WebGPU or TSL_GL. Also controllable via Rendering > Environment > Atmosphere in Max.',
+                requiresWebGPU: true,
+                isEnabled: () => maxjsFx.isFogEnabled(),
+                setEnabled: (enabled) => maxjsFx.setFogEnabled(enabled),
                 getValues: (state) => state.fog,
-                setValues: (patch) => ssgiFx.setFogOptions(patch),
+                setValues: (patch) => maxjsFx.setFogOptions(patch),
                 controls: [
                     { key: 'type', label: 'Type', min: 0, max: 2, step: 1, integer: true },
                     { key: 'opacity', label: 'Opacity', min: 0, max: 1, step: 0.01 },
@@ -10608,12 +10657,12 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 key: 'opaqueBackdrop',
                 title: 'Opaque backdrop',
                 copy: 'Composite the frame onto a solid color and force alpha to 1. Use with fog without enabling SSR.',
-                note: 'Linear RGB (0–1). Matches viewport “empty” look when set to your scene background color.',
-                requiresWebGPU: false,
-                isEnabled: () => ssgiFx.isOpaqueBackdropEnabled(),
-                setEnabled: (enabled) => ssgiFx.setOpaqueBackdropEnabled(enabled),
+                note: 'Requires WebGPU or TSL_GL. Linear RGB (0–1). Matches viewport “empty” look when set to your scene background color.',
+                requiresWebGPU: true,
+                isEnabled: () => maxjsFx.isOpaqueBackdropEnabled(),
+                setEnabled: (enabled) => maxjsFx.setOpaqueBackdropEnabled(enabled),
                 getValues: (state) => state.opaqueBackdrop,
-                setValues: (patch) => ssgiFx.setOpaqueBackdropOptions(patch),
+                setValues: (patch) => maxjsFx.setOpaqueBackdropOptions(patch),
                 controls: [
                     { key: 'red', label: 'Red', min: 0, max: 1, step: 0.01 },
                     { key: 'green', label: 'Green', min: 0, max: 1, step: 0.01 },
@@ -10753,8 +10802,8 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                         </div>
                         <div class="fx-grid">
                             <select id="fx-aa-mode" style="background:rgba(255,255,255,0.05);color:#aaa;border:1px solid rgba(255,255,255,0.08);border-radius:0;padding:3px 6px;font:10px 'Segoe UI',system-ui,sans-serif;width:100%;outline:none;cursor:pointer">
-                                <option value="traa"${ssgiFx.isTRAAEnabled() ? ' selected' : ''}>TRAA</option>
-                                <option value="off"${!ssgiFx.isTRAAEnabled() ? ' selected' : ''}>Off</option>
+                                <option value="traa"${maxjsFx.isTRAAEnabled() ? ' selected' : ''}>TRAA</option>
+                                <option value="off"${!maxjsFx.isTRAAEnabled() ? ' selected' : ''}>Off</option>
                             </select>
                         </div>
                         <div class="fx-note">TRAA: temporal reprojection (WebGPU only). Off: no anti-aliasing.</div>
@@ -10897,7 +10946,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                             </div>
                         </div>
 
-                        <div class="clone-subsection" style="margin-top:8px;padding:6px 0 4px;border-top:1px solid rgba(255,255,255,0.08)">
+                        <div class="clone-subsection" data-post-stack-only style="margin-top:8px;padding:6px 0 4px;border-top:1px solid rgba(255,255,255,0.08)">
                             <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">
                                 <span style="font-size:11px;color:#ccc;font-weight:600;letter-spacing:0.3px">Playstation Wobble</span>
                                 <button class="fx-toggle" type="button" id="fx-toggle-wobble">Off</button>
@@ -10986,10 +11035,10 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 currentToneMapping = DEFAULT_TONE_MAPPING;
                 currentExposure = 1.0;
                 currentAAMode = 'off';
-                ssgiFx.setTRAAEnabled(false);
-                ssgiFx.setCloneEnabled(false);
-                ssgiFx.setCloneOptions({ threshold: 0.53, blurRadius: 0, minBlobSize: 0, opacity: 1.0, gridDensity: 0, smoothing: 0.75, invert: false, source: 'luma' });
-                ssgiFx.setColorGrading({ brightness: 0, contrast: 0 });
+                maxjsFx.setTRAAEnabled(false);
+                maxjsFx.setCloneEnabled(false);
+                maxjsFx.setCloneOptions({ threshold: 0.53, blurRadius: 0, minBlobSize: 0, opacity: 1.0, gridDensity: 0, smoothing: 0.75, invert: false, source: 'luma' });
+                maxjsFx.setColorGrading({ brightness: 0, contrast: 0 });
                 if (asciiActive) exitAsciiMode();
                 asciiSettings = { resolution: 0.15, color: 'white', invert: false };
                 performanceSettings = { ...PERFORMANCE_DEFAULTS };
@@ -11068,13 +11117,13 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             const contrastLabel = document.getElementById('fx-tonemapping-contrast-val');
             brightnessSlider.oninput = (e) => {
                 const v = parseFloat(e.target.value);
-                ssgiFx.setColorGrading({ brightness: v });
+                maxjsFx.setColorGrading({ brightness: v });
                 brightnessLabel.textContent = v.toFixed(2);
             };
             brightnessSlider.onchange = () => savePostFxState();
             contrastSlider.oninput = (e) => {
                 const v = parseFloat(e.target.value);
-                ssgiFx.setColorGrading({ contrast: v });
+                maxjsFx.setColorGrading({ contrast: v });
                 contrastLabel.textContent = v.toFixed(2);
             };
             contrastSlider.onchange = () => savePostFxState();
@@ -11083,7 +11132,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             const aaSelect = document.getElementById('fx-aa-mode');
             aaSelect.onchange = (e) => {
                 const mode = e.target.value;
-                ssgiFx.setTRAAEnabled(mode === 'traa');
+                maxjsFx.setTRAAEnabled(mode === 'traa');
                 currentAAMode = mode;
                 savePostFxState();
                 syncPostFxPanel(true);
@@ -11155,7 +11204,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 cameraFarValue.textContent = cameraClip.far != null
                     ? `${camera.far.toFixed(0)}`
                     : `auto (${camera.far.toFixed(0)})`;
-                ssgiFx.markSceneChanged?.();
+                maxjsFx.markSceneChanged?.();
                 savePostFxState();
             }
             cameraNearInput.oninput = commitCameraClip;
@@ -11220,13 +11269,13 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 const cloneSliders = ['threshold', 'blurRadius', 'minBlobSize', 'gridDensity', 'smoothing', 'opacity'];
 
                 cloneToggle.onclick = () => {
-                    const enabled = ssgiFx.setCloneEnabled(!ssgiFx.isCloneEnabled());
+                    const enabled = maxjsFx.setCloneEnabled(!maxjsFx.isCloneEnabled());
                     cloneToggle.textContent = enabled ? 'On' : 'Off';
                     cloneToggle.classList.toggle('active', enabled);
                     syncPostFxPanel(true);
                 };
                 cloneSource.onchange = () => {
-                    ssgiFx.setCloneOptions({ source: cloneSource.value });
+                    maxjsFx.setCloneOptions({ source: cloneSource.value });
                     savePostFxState();
                 };
                 for (const key of cloneSliders) {
@@ -11234,34 +11283,41 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     const valEl = document.getElementById(`fx-clone-${key}-val`);
                     input.oninput = () => {
                         const v = Number(input.value);
-                        ssgiFx.setCloneOptions({ [key]: v });
+                        maxjsFx.setCloneOptions({ [key]: v });
                         if (valEl) valEl.textContent = v >= 1 ? String(Math.round(v)) : v.toFixed(2);
                     };
                     input.onchange = () => savePostFxState();
                 }
                 const invertCheck = document.getElementById('fx-clone-invert');
                 invertCheck.onchange = () => {
-                    ssgiFx.setCloneOptions({ invert: invertCheck.checked });
+                    maxjsFx.setCloneOptions({ invert: invertCheck.checked });
                     savePostFxState();
                 };
 
                 // Playstation Wobble controls (drives retro.wiggle / retro.affineDistortion)
                 const wobbleToggle = document.getElementById('fx-toggle-wobble');
+                const wobbleSection = wobbleToggle?.closest('[data-post-stack-only]');
                 const snapGridSlider = document.getElementById('fx-clone-snapGrid');
                 const snapGridVal = document.getElementById('fx-clone-snapGrid-val');
                 wobbleToggle.onclick = () => {
-                    const retro = ssgiFx.getState().retro;
+                    if (!maxjsFx.supportsScreenSpaceEffects()) {
+                        perfHud.setStatus('max.js - Playstation Wobble requires WebGPU or TSL_GL');
+                        syncPostFxPanel(true);
+                        return;
+                    }
+                    const retro = maxjsFx.getState().retro;
                     const next = !retro.wiggle;
-                    ssgiFx.setRetroOptions({ wiggle: next });
-                    if (next && !ssgiFx.isRetroEnabled()) ssgiFx.setRetroEnabled(true);
+                    maxjsFx.setRetroOptions({ wiggle: next });
+                    if (next && !maxjsFx.isRetroEnabled()) maxjsFx.setRetroEnabled(true);
                     wobbleToggle.textContent = next ? 'On' : 'Off';
                     wobbleToggle.classList.toggle('active', next);
                     savePostFxState();
                     syncPostFxPanel(true);
                 };
                 snapGridSlider.oninput = () => {
+                    if (!maxjsFx.supportsScreenSpaceEffects()) return;
                     const v = Number(snapGridSlider.value);
-                    ssgiFx.setRetroOptions({ affineDistortion: v });
+                    maxjsFx.setRetroOptions({ affineDistortion: v });
                     snapGridVal.textContent = v.toFixed(1);
                 };
                 snapGridSlider.onchange = () => savePostFxState();
@@ -11297,7 +11353,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
 
                 syncClonePanelFn = () => {
                     const canSyncInput = (input) => !!input && document.activeElement !== input;
-                    const s = ssgiFx.getState().clone;
+                    const s = maxjsFx.getState().clone;
                     cloneToggle.textContent = s.enabled ? 'On' : 'Off';
                     cloneToggle.classList.toggle('active', s.enabled);
                     if (canSyncInput(cloneSource)) cloneSource.value = s.source;
@@ -11308,9 +11364,13 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                         if (valEl) valEl.textContent = s[key] >= 1 ? String(Math.round(s[key])) : s[key].toFixed(2);
                     }
                     if (canSyncInput(invertCheck)) invertCheck.checked = !!s.invert;
-                    const retro = ssgiFx.getState().retro;
+                    const retro = maxjsFx.getState().retro;
+                    const supportsPostStack = maxjsFx.supportsScreenSpaceEffects();
+                    if (wobbleSection) wobbleSection.hidden = !supportsPostStack;
                     wobbleToggle.textContent = retro.wiggle ? 'On' : 'Off';
                     wobbleToggle.classList.toggle('active', retro.wiggle);
+                    wobbleToggle.disabled = !supportsPostStack;
+                    snapGridSlider.disabled = !supportsPostStack;
                     if (canSyncInput(snapGridSlider)) snapGridSlider.value = retro.affineDistortion;
                     snapGridVal.textContent = retro.affineDistortion.toFixed(1);
                     asciiToggle.textContent = asciiActive ? 'On' : 'Off';
@@ -11333,8 +11393,8 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     const enabled = section.setEnabled(!section.isEnabled());
                     syncPostFxPanel(true);
                     if (!enabled) {
-                        const message = ssgiFx.getLastError();
-                        if (message && (!ssgiFx.isAvailable() || section.requiresWebGPU)) {
+                        const message = maxjsFx.getLastError();
+                        if (message && (!maxjsFx.isAvailable() || section.requiresWebGPU)) {
                             perfHud.setStatus(`max.js - ${section.title} unavailable: ${message}`);
                         }
                     }
@@ -11368,11 +11428,11 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         }
 
         function syncPostFxPanel(force = false, { persist = true } = {}) {
-            const state = ssgiFx.getState();
-            const derived = postPanelVisible ? ssgiFx.getDerivedState() : null;
-            const available = ssgiFx.isAvailable();
-            const supportsScreenSpaceEffects = ssgiFx.supportsScreenSpaceEffects();
-            const lastError = ssgiFx.getLastError();
+            const state = maxjsFx.getState();
+            const derived = postPanelVisible ? maxjsFx.getDerivedState() : null;
+            const available = maxjsFx.isAvailable();
+            const supportsScreenSpaceEffects = maxjsFx.supportsScreenSpaceEffects();
+            const lastError = maxjsFx.getLastError();
             const signature = JSON.stringify({
                 panel: postPanelVisible,
                 available,
@@ -11386,6 +11446,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
 
             if (!force && signature === lastPostFxSignature) return;
             lastPostFxSignature = signature;
+            syncShaderLabAvailability();
             const canSyncInput = (input) => !!input && (force || document.activeElement !== input);
 
             const panelStatus = document.getElementById('postPanelStatus');
@@ -11393,7 +11454,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 panelStatus.textContent = available
                     ? (supportsScreenSpaceEffects
                         ? `${rendererBackendLabel} backend`
-                        : `${rendererBackendLabel} backend • Common FX`)
+                        : `${rendererBackendLabel} backend • utility controls`)
                     : `${rendererBackendLabel} backend • ${lastError || 'unavailable'}`;
             }
 
@@ -11412,7 +11473,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             const currentEV = Math.log2(currentExposure || 1);
             if (canSyncInput(expSlider)) expSlider.value = String(currentEV);
             if (expLabel) expLabel.textContent = `${currentEV >= 0 ? '+' : ''}${currentEV.toFixed(1)} EV`;
-            const cg = ssgiFx.getColorGrading();
+            const cg = maxjsFx.getColorGrading();
             const brightnessSlider = document.getElementById('fx-tonemapping-brightness');
             const brightnessLabel = document.getElementById('fx-tonemapping-brightness-val');
             const contrastSlider = document.getElementById('fx-tonemapping-contrast');
@@ -11422,9 +11483,16 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             if (canSyncInput(contrastSlider)) contrastSlider.value = String(cg.contrast);
             if (contrastLabel) contrastLabel.textContent = cg.contrast.toFixed(2);
             const aaSelect = document.getElementById('fx-aa-mode');
-            if (canSyncInput(aaSelect)) aaSelect.value = currentAAMode;
+            if (canSyncInput(aaSelect)) {
+                aaSelect.value = (!supportsScreenSpaceEffects && currentAAMode === 'traa')
+                    ? 'off'
+                    : currentAAMode;
+            }
             const aaTraaOption = document.querySelector('#fx-aa-mode option[value="traa"]');
-            if (aaTraaOption) aaTraaOption.disabled = !supportsScreenSpaceEffects;
+            if (aaTraaOption) {
+                aaTraaOption.disabled = !supportsScreenSpaceEffects;
+                aaTraaOption.hidden = !supportsScreenSpaceEffects;
+            }
             if (canSyncInput(fpsCapSelect)) fpsCapSelect.value = String(performanceSettings.fpsCap || 0);
             if (canSyncInput(renderScaleSlider)) renderScaleSlider.value = String(performanceSettings.renderScale);
             if (renderScaleValue) renderScaleValue.textContent = `${performanceSettings.renderScale.toFixed(2)}x`;
@@ -11454,24 +11522,28 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     : `auto (${camera.far.toFixed(0)})`;
             }
 
-            const hasEnabledEffects = ssgiFx.hasEnabledEffects();
+            const hasEnabledEffects = maxjsFx.hasEnabledEffects();
             btnPostFxPanel.classList.toggle('active', postPanelVisible || hasEnabledEffects);
 
             for (const section of postFxSections) {
                 const values = section.getValues(state);
                 const enabled = section.isEnabled();
                 const disabledByOther = section.disabledBy ? section.disabledBy(state) : null;
+                const hiddenByBackend = section.requiresWebGPU && !supportsScreenSpaceEffects;
                 const disabled =
                     !available ||
-                    (section.requiresWebGPU && !supportsScreenSpaceEffects) ||
+                    hiddenByBackend ||
                     !!disabledByOther;
+
+                if (section.sectionEl) {
+                    section.sectionEl.hidden = hiddenByBackend;
+                    section.sectionEl.classList.toggle('disabled-by-other', !!disabledByOther);
+                }
+                if (hiddenByBackend) continue;
 
                 section.toggleEl.textContent = enabled ? 'On' : 'Off';
                 section.toggleEl.classList.toggle('active', enabled);
                 section.toggleEl.disabled = disabled;
-                if (section.sectionEl) {
-                    section.sectionEl.classList.toggle('disabled-by-other', !!disabledByOther);
-                }
 
                 for (const control of section.controls) {
                     const controlEl = section.controlEls[control.key];
@@ -11557,7 +11629,8 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 envVisible,
                 camLock,
                 lightProbeEnabled,
-                fx: ssgiFx.getState(),
+                fx: maxjsFx.getState(),
+                webglBasicFx: webglBasicFx.getState?.(),
                 camera: serializeCurrentCameraState(),
                 hdri: {
                     rotation: localHdriRotation,
@@ -11657,8 +11730,8 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     // Legacy saved value: 'msaa' was a no-op alias for 'off' — normalize.
                     const loaded = saved.aaMode === 'msaa' ? 'off' : saved.aaMode;
                     currentAAMode = loaded;
-                    if (ssgiFx.supportsScreenSpaceEffects()) {
-                        ssgiFx.setTRAAEnabled(currentAAMode === 'traa');
+                    if (maxjsFx.supportsScreenSpaceEffects()) {
+                        maxjsFx.setTRAAEnabled(currentAAMode === 'traa');
                     }
                 }
                 if (typeof saved.envVisible === 'boolean') {
@@ -11717,12 +11790,15 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 localHdriShowBg = envVisible;
 
                 syncEnvButtonUi();
-                ssgiFx.setEnvironmentVisible(envVisible);
+                maxjsFx.setEnvironmentVisible(envVisible);
 
                 const fx = saved.fx;
                 if (!fx) return;
 
-                ssgiFx.restoreState?.(fx);
+                maxjsFx.restoreState?.(fx);
+                if (saved.webglBasicFx) {
+                    webglBasicFx.restoreState?.(saved.webglBasicFx);
+                }
 
                 // ASCII restore
                 if (saved.ascii) {
@@ -11739,7 +11815,10 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 if (saved.shaderLab) {
                     setShaderLabSnapshot(saved.shaderLab);
                     shaderLabFx.setState?.(saved.shaderLab);
-                    if (saved.shaderLab.enabled && !shaderLabFx.isEnabled()) {
+                    if (!maxjsFx.supportsScreenSpaceEffects()) {
+                        shaderLabFx.disable?.();
+                        syncShaderLabAvailability();
+                    } else if (saved.shaderLab.enabled && !shaderLabFx.isEnabled()) {
                         shaderLabFx.enable(saved.shaderLab).catch(err => {
                             console.error('[ShaderLab] restore enable failed:', err);
                         });
@@ -11823,7 +11902,8 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             clearTimeout(resizeTimer);
             resizeTimer = setTimeout(() => {
                 applyRendererPerformanceSettings({ resizePostFx: false });
-                ssgiFx.resize();
+                maxjsFx.resize();
+                webglBasicFx.resize?.();
             }, 150);
         });
 
@@ -12180,6 +12260,16 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
 
         let standaloneHudFrame = 0;
         let lastPostFxPanelSyncMs = 0;
+
+        function renderViewerFrame() {
+            if (webglBasicFx.isAvailable?.()) {
+                webglBasicFx.render(() => renderer.render(scene, camera));
+                maxjsFx.afterExternalRender?.();
+                return;
+            }
+            maxjsFx.render();
+        }
+
         function renderFrame(frameTimeMs = performance.now()) {
             flushMaterialDisposals();
             if (renderToImageActive && !pendingRenderToImage) return;
@@ -12199,7 +12289,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             // Auto-update DOF focus distance from camera-to-target when enabled
             // Skip when Physical Camera DOF is driving the values (Camera Lock ON + Physical Camera has DOF)
             if (!xrRuntime.active && (!physicalCameraDofActive || !camLock)) {
-                ssgiFx.updateDofFocusFromCamera(camera.position.distanceTo(controls.target));
+                maxjsFx.updateDofFocusFromCamera(camera.position.distanceTo(controls.target));
             }
             // Default key light follows camera
             if (defaultLights.visible) {
@@ -12215,7 +12305,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
 
             const perfHudActive = perfHud.isDebugEnabled?.() ?? false;
             if (perfHudActive) perfHud.updateLayers(layerManager.getStats());
-            ssgiFx.applySharedSceneEffects?.();
+            maxjsFx.applySharedSceneEffects?.();
             removeWebGPUIncompatibleSceneMaterials();
             const renderStart = performance.now();
             // Last-mile render-only camera offsets (handheld shake, etc.).
@@ -12268,7 +12358,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                         }
                     });
                 } else {
-                    ssgiFx.render();
+                    renderViewerFrame();
                 }
             } catch (error) {
                 reportBridgeError('runtime error', error);
@@ -12277,8 +12367,8 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             }
             css3dOverlay.tick(scene, camera);
             // Clone blob overlay — draw bounding rects on 2D canvas
-            if (ssgiFx.isCloneEnabled() && !renderToImageActive) {
-                ssgiFx.drawBlobOverlay(blobOverlayCtx, blobOverlayCvs.width, blobOverlayCvs.height);
+            if (maxjsFx.isCloneEnabled() && !renderToImageActive) {
+                maxjsFx.drawBlobOverlay(blobOverlayCtx, blobOverlayCvs.width, blobOverlayCvs.height);
             } else if (blobOverlayCtx) {
                 blobOverlayCtx.clearRect(0, 0, blobOverlayCvs.width, blobOverlayCvs.height);
             }
@@ -12373,7 +12463,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         layerManager.subscribe?.(() => {
             animationSystem.invalidateTargets();
             // Layer mutations can add/remove meshes — cheap scene refresh.
-            ssgiFx.markSceneChanged?.();
+            maxjsFx.markSceneChanged?.();
         });
         const projectRuntime = window.chrome?.webview
             ? createProjectRuntime({ layerManager, bridge, perfHud, debugLog: maxjsDebugLog, debugWarn: maxjsDebugWarn })
@@ -12673,7 +12763,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         function renderCurrentFrameOnce(renderTimeSeconds = null) {
             if (!xrRuntime.active) controls.update();
             if (!xrRuntime.active && (!physicalCameraDofActive || !camLock)) {
-                ssgiFx.updateDofFocusFromCamera(camera.position.distanceTo(controls.target));
+                maxjsFx.updateDofFocusFromCamera(camera.position.distanceTo(controls.target));
             }
             if (defaultLights.visible) {
                 defaultKey.position.copy(getActiveCameraWorldPosition(cameraPositionWorld));
@@ -12693,8 +12783,8 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             try {
                 if (pathTracingFx.isEnabled?.()) {
                     if (!pathTracingFx.render?.()) renderer.render(scene, camera);
-                } else if (ssgiFx.hasEnabledEffects()) {
-                    ssgiFx.render();
+                } else if (webglBasicFx.isAvailable?.() || maxjsFx.hasEnabledEffects()) {
+                    renderViewerFrame();
                 } else {
                     renderer.render(scene, camera);
                 }
@@ -12750,16 +12840,16 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             savedRenderToImageState = {
                 envVisible,
                 localHdriShowBg,
-                opaqueBackdropEnabled: ssgiFx.isOpaqueBackdropEnabled(),
+                opaqueBackdropEnabled: maxjsFx.isOpaqueBackdropEnabled(),
                 playbackState: animationSystem?.capturePlaybackState?.() ?? null,
             };
 
             // Force transparent background for capture while keeping environment reflections.
             envVisible = false;
             localHdriShowBg = false;
-            ssgiFx.setEnvironmentVisible(false);
+            maxjsFx.setEnvironmentVisible(false);
             if (savedRenderToImageState.opaqueBackdropEnabled) {
-                ssgiFx.setOpaqueBackdropEnabled(false);
+                maxjsFx.setOpaqueBackdropEnabled(false);
             }
             scene.background = null;
             if (pendingRenderToImage.pathTracing) {
@@ -12785,7 +12875,8 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 camera.bottom = -viewWidth / (2 * aspect);
             }
             camera.updateProjectionMatrix();
-            ssgiFx.resize();
+            maxjsFx.resize();
+            webglBasicFx.resize?.();
             if (splatOverlay?.renderer) {
                 splatOverlay.renderer.setPixelRatio(1);
                 splatOverlay.renderer.setSize(w, h, false);
@@ -12820,8 +12911,8 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             if (savedRenderToImageState) {
                 envVisible = savedRenderToImageState.envVisible;
                 localHdriShowBg = savedRenderToImageState.localHdriShowBg;
-                ssgiFx.setEnvironmentVisible(envVisible);
-                ssgiFx.setOpaqueBackdropEnabled(savedRenderToImageState.opaqueBackdropEnabled);
+                maxjsFx.setEnvironmentVisible(envVisible);
+                maxjsFx.setOpaqueBackdropEnabled(savedRenderToImageState.opaqueBackdropEnabled);
                 animationSystem?.restorePlaybackState?.(savedRenderToImageState.playbackState);
                 savedRenderToImageState = null;
                 syncEnvButtonUi();
@@ -12936,6 +13027,6 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         renderer.setAnimationLoop(renderFrame);
 
         startBridgeHandshake();
-    </script>
+</script>
 </body>
 </html>

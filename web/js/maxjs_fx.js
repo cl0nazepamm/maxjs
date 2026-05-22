@@ -77,7 +77,7 @@ function setTexturePrecision(scenePass) {
     if (metalRoughTexture) metalRoughTexture.type = THREE.UnsignedByteType;
 }
 
-export function createSSGIController({
+export function createMaxJSFxController({
     renderer,
     scene,
     camera,
@@ -359,7 +359,8 @@ export function createSSGIController({
     }
 
     function hasShaderLabPassEnabled() {
-        return !!activeShaderLabFx?.isEnabled?.()
+        return supportsScreenSpaceEffects
+            && !!activeShaderLabFx?.isEnabled?.()
             && activeShaderLabFx.canRenderWithInputs?.(getShaderLabInputs()) !== false;
     }
 
@@ -569,6 +570,19 @@ export function createSSGIController({
             lastBlobs = [];
         }
     }
+
+    function updateCloneBlobAnalysis() {
+        if (state.clone.enabled && blobCtx) {
+            if (++blobSkip >= 2) {
+                blobSkip = 0;
+                analyzeBlobsFromCanvas();
+            }
+        } else {
+            lastBlobs = [];
+            stableBlobs = [];
+        }
+    }
+
     let forcedContactShadowLightState = null;
 
     // Cache objects that need hiding during post pass — rebuilt on pipeline rebuild only
@@ -747,12 +761,12 @@ export function createSSGIController({
             || isScreenSpaceActive('motionBlur') || isScreenSpaceActive('traa') || isBloomActive()
             || (isToonOutlineActive() && cachedHasToonMeshes)
             || isContactShadowActive()
-            || state.retro.enabled
-            || state.pixel.enabled
+            || isScreenSpaceActive('retro')
+            || isScreenSpaceActive('pixel')
             || isScreenSpaceActive('volumetric')
             || isScreenSpaceActive('dof')
-            || state.fog.enabled
-            || state.opaqueBackdrop.enabled;
+            || isScreenSpaceActive('fog')
+            || isScreenSpaceActive('opaqueBackdrop');
     }
 
     function hasAnyEffectEnabled() {
@@ -807,7 +821,7 @@ export function createSSGIController({
             effectiveGTAOThickness: state.gtao.thickness * ssrUnitScale,
             effectiveContactShadowMaxDistance: state.contactShadow.maxDistance * ssrUnitScale,
             effectiveContactShadowThickness: state.contactShadow.thickness * ssrUnitScale,
-            ps1SnapActive: state.retro.enabled && state.retro.wiggle,
+            ps1SnapActive: isScreenSpaceActive('retro') && state.retro.wiggle,
         };
     }
 
@@ -1156,7 +1170,7 @@ export function createSSGIController({
 
     function applyFog() {
         const f = state.fog;
-        if (!f.enabled) {
+        if (!supportsScreenSpaceEffects || !f.enabled) {
             scene.fogNode = null;
             fogAnimationActive = false;
             return;
@@ -1291,7 +1305,7 @@ export function createSSGIController({
     }
 
     function syncSharedSceneEffects(force = false) {
-        const shouldUsePS1Wiggle = state.retro.enabled && state.retro.wiggle;
+        const shouldUsePS1Wiggle = isScreenSpaceActive('retro') && state.retro.wiggle;
         if (shouldUsePS1Wiggle) {
             if (force || ps1SceneDirty || !ps1WiggleActive) {
                 enablePS1Wiggle(state.retro.affineDistortion);
@@ -1388,7 +1402,7 @@ export function createSSGIController({
                 !!scene.environment && !environmentVisible;
             const useEnvironmentBackdropCompensation =
                 hiddenEnvironmentBackdrop
-                && (isSSRActive() || state.fog.enabled || state.opaqueBackdrop.enabled);
+                && (isSSRActive() || isScreenSpaceActive('fog') || isScreenSpaceActive('opaqueBackdrop'));
 
             let beauty;
             let scenePassNode = null;
@@ -1572,7 +1586,7 @@ export function createSSGIController({
                 );
             }
 
-            if (state.retro.enabled) {
+            if (isScreenSpaceActive('retro')) {
                 const r = state.retro;
 
                 // CRT barrel distortion + color bleeding
@@ -1601,7 +1615,7 @@ export function createSSGIController({
             }
 
             // ── Pixel FX ──
-            if (state.pixel.enabled) {
+            if (isScreenSpaceActive('pixel')) {
                 const p = state.pixel;
 
                 // Pixelate — snap UVs to a coarse grid
@@ -1691,7 +1705,7 @@ export function createSSGIController({
             }
 
             // Fog: blend fog color based on depth, works over geometry AND background
-            if (state.fog.enabled && scenePassDepth) {
+            if (isScreenSpaceActive('fog') && scenePassDepth) {
                 const f = state.fog;
                 const d = scenePassDepth.r;
                 const cn = float(camera.near);
@@ -1715,13 +1729,13 @@ export function createSSGIController({
 
             // Opaque backdrop alpha mask: set background alpha=0 when env is visible (HDRI has alpha=1)
             // Skip when fog is enabled (fog already set proper alpha) or when env compensation ran (already alpha=0)
-            if (state.opaqueBackdrop.enabled && scenePassDepth && !state.fog.enabled && !useEnvironmentBackdropCompensation) {
+            if (isScreenSpaceActive('opaqueBackdrop') && scenePassDepth && !isScreenSpaceActive('fog') && !useEnvironmentBackdropCompensation) {
                 const hasGeom = scenePassDepth.r.lessThan(float(0.999999));
                 beauty = vec4(beauty.rgb, hasGeom.select(beauty.a, float(0)));
             }
 
             // Solid backdrop + force a=1 — straight-alpha composite (no transparent canvas / no SSR workaround)
-            if (state.opaqueBackdrop.enabled) {
+            if (isScreenSpaceActive('opaqueBackdrop')) {
                 opaqueBackdropRU.value = state.opaqueBackdrop.red;
                 opaqueBackdropGU.value = state.opaqueBackdrop.green;
                 opaqueBackdropBU.value = state.opaqueBackdrop.blue;
@@ -2042,6 +2056,13 @@ export function createSSGIController({
             return state.retro.enabled;
         },
         setRetroEnabled(enabled) {
+            if (enabled && !supportsScreenSpaceEffects) {
+                lastError = 'Retro requires WebGPU or TSL_GL';
+                onError(lastError);
+                state.retro.enabled = true;
+                rebuildPipeline();
+                return false;
+            }
             state.retro.enabled = !!enabled;
             rebuildPipeline();
             return state.retro.enabled;
@@ -2069,6 +2090,13 @@ export function createSSGIController({
             return state.pixel.enabled;
         },
         setPixelEnabled(enabled) {
+            if (enabled && !supportsScreenSpaceEffects) {
+                lastError = 'Pixel FX requires WebGPU or TSL_GL';
+                onError(lastError);
+                state.pixel.enabled = true;
+                rebuildPipeline();
+                return false;
+            }
             state.pixel.enabled = !!enabled;
             rebuildPipeline();
             return state.pixel.enabled;
@@ -2210,6 +2238,14 @@ export function createSSGIController({
             return state.fog.enabled;
         },
         setFogEnabled(enabled) {
+            if (enabled && !supportsScreenSpaceEffects) {
+                lastError = 'Fog requires WebGPU or TSL_GL';
+                onError(lastError);
+                state.fog.enabled = true;
+                applyFog();
+                rebuildPipeline();
+                return false;
+            }
             state.fog.enabled = !!enabled;
             applyFog();
             rebuildPipeline();
@@ -2274,6 +2310,13 @@ export function createSSGIController({
             return state.opaqueBackdrop.enabled;
         },
         setOpaqueBackdropEnabled(enabled) {
+            if (enabled && !supportsScreenSpaceEffects) {
+                lastError = 'Opaque backdrop requires WebGPU or TSL_GL';
+                onError(lastError);
+                state.opaqueBackdrop.enabled = true;
+                rebuildPipeline();
+                return false;
+            }
             state.opaqueBackdrop.enabled = !!enabled;
             rebuildPipeline();
             return state.opaqueBackdrop.enabled;
@@ -2329,8 +2372,8 @@ export function createSSGIController({
                 backendLabel,
                 screenSpace: supportsScreenSpaceEffects,
                 tslPostEffects: supportsTslPostEffects,
-                commonPostFx: true,
-                shaderLab: !!activeShaderLabFx,
+                commonPostFx: supportsScreenSpaceEffects,
+                shaderLab: supportsScreenSpaceEffects && !!activeShaderLabFx,
             };
         },
 
@@ -2338,7 +2381,7 @@ export function createSSGIController({
         // this when Max toggles between perspective and orthographic so the
         // pipeline's pass(scene, camera) nodes re-capture the right camera.
         // Without this, the pipeline was stuck rendering with whichever
-        // camera was passed into createSSGIController().
+        // camera was passed into createMaxJSFxController().
         setCamera(nextCamera) {
             if (!nextCamera || nextCamera === camera) return;
             camera = nextCamera;
@@ -2353,7 +2396,7 @@ export function createSSGIController({
                 fogTimer.value = performance.now() * 0.001 * state.fog.noiseSpeed;
             }
             // Update pixel grain timer
-            if (state.pixel.enabled && state.pixel.grain) {
+            if (isScreenSpaceActive('pixel') && state.pixel.grain) {
                 pixelTimer.value = performance.now() * 0.001;
             }
 
@@ -2366,10 +2409,7 @@ export function createSSGIController({
                 } else {
                     renderer.render(scene, camera);
                 }
-                // Clone blob analysis still runs even without post-processing pipeline
-                if (state.clone.enabled && blobCtx) {
-                    if (++blobSkip >= 2) { blobSkip = 0; analyzeBlobsFromCanvas(); }
-                }
+                updateCloneBlobAnalysis();
                 return;
             }
 
@@ -2399,16 +2439,11 @@ export function createSSGIController({
                 }
             }
 
-            // Clone blob analysis — readback tiny canvas + CCL every 2 frames
-            if (state.clone.enabled && blobCtx) {
-                if (++blobSkip >= 2) {
-                    blobSkip = 0;
-                    analyzeBlobsFromCanvas();
-                }
-            } else {
-                lastBlobs = [];
-                stableBlobs = [];
-            }
+            updateCloneBlobAnalysis();
+        },
+
+        afterExternalRender() {
+            updateCloneBlobAnalysis();
         },
 
         getBlobs() {
@@ -2484,3 +2519,5 @@ export function createSSGIController({
         },
     };
 }
+
+export { createMaxJSFxController as createSSGIController };

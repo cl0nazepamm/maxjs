@@ -1,7 +1,7 @@
 // Shader Lab FX — optional custom pass for the MaxJS post-FX controller.
 //
-// The main render loop always routes through ssgiFx.render(). When Shader Lab
-// is enabled, ssgiFx renders its native stack to a texture and lets this module
+// The main render loop routes through the MaxJS FX controller. When Shader Lab
+// is enabled, MaxJS FX renders its native stack to a texture and lets this module
 // consume that texture as a final custom pass. This keeps SSGI / SSR / GTAO /
 // bloom / DOF / tone output in front of Shader Lab instead of bypassing it.
 //
@@ -363,7 +363,7 @@ export function createShaderLabFx({ THREE, renderer, scene, camera }) {
         }
     }
 
-    // Integrated render path. ssgiFx owns the native render stack and passes
+    // Integrated render path. MaxJS FX owns the native render stack and passes
     // its final texture here only when Shader Lab has a compatible final pass.
     let lastOutputTex = null;
 

@@ -80,7 +80,7 @@ import { sceneSpace } from './max_basis.js';
 //   import { createMaxJSAudioSystem } from './maxjs_audio.js';
 //   import { createGltfRegistry }     from './maxjs_gltf.js';
 //   import { createHtmlTextureSlot }  from './html_texture.js';
-//   import { createSsgiFx }           from './ssgi_fx.js';
+//   import { createMaxJSFxController } from './maxjs_fx.js';
 //   import { VolumeRenderer }         from './VolumeRenderer.js';
 //   import { createProjectRuntime }   from './project_runtime.js';
 
@@ -117,7 +117,7 @@ function noteExtractionDeferred(name, sourceLocation, detail = '') {
 function detectFeaturesLegacy(meta) {
     return Object.freeze({
         renderer_pref: 'webgl',
-        post_fx: ['ssgi'], // index.html always wires ssgiFx today
+        post_fx: ['ssgi'], // index.html wires MaxJS FX today
         audio: true,
         splats: true,
         html_textures: true,
@@ -350,7 +350,7 @@ async function registerOptionalModules(features, ctx) {
     if (wanted.length) {
         noteExtractionDeferred(
             'registerOptionalModules',
-            'index.html — ssgiFx / audio / splat / html_texture / volume init',
+            'index.html — MaxJS FX / audio / splat / html_texture / volume init',
             `(scene declares: ${wanted.join(', ')})`,
         );
     }
@@ -809,7 +809,7 @@ async function bindLayerProject(root, meta, layerManager) {
 }
 
 // ─── Phase 10: render loop ────────────────────────────────────────────
-function startRenderLoop({ renderer, scene, camera, controls, layerManager, animationSystem, ssgiFx, snapshotEnvironment, optionalModules }) {
+function startRenderLoop({ renderer, scene, camera, controls, layerManager, animationSystem, maxjsFx, snapshotEnvironment, optionalModules }) {
     let lastTimeMs = performance.now();
     let elapsed = 0;
     const loop = () => {
@@ -827,9 +827,9 @@ function startRenderLoop({ renderer, scene, camera, controls, layerManager, anim
 
         layerManager?.beforeRender?.(elapsed);
         try {
-            // Default render path. ssgiFx (when present) takes over.
-            if (ssgiFx?.isEnabled?.()) {
-                ssgiFx.render();
+            // Default render path. MaxJS FX (when present) takes over.
+            if (maxjsFx?.isEnabled?.()) {
+                maxjsFx.render();
             } else {
                 renderer.render(scene, camera);
             }
@@ -956,7 +956,7 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
     if (meta.snapshotUi) {
         applySnapshotUi(meta.snapshotUi, {
             renderer, scene, camera, controls,
-            ssgiFx: optionalModules.ssgiFx,
+            maxjsFx: optionalModules.maxjsFx ?? optionalModules.ssgiFx,
         });
     }
 
@@ -1031,7 +1031,7 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
     const stopLoop = startRenderLoop({
         renderer, scene, camera, controls, layerManager,
         animationSystem,
-        ssgiFx: optionalModules.ssgiFx,
+        maxjsFx: optionalModules.maxjsFx ?? optionalModules.ssgiFx,
         snapshotEnvironment,
         optionalModules,
     });

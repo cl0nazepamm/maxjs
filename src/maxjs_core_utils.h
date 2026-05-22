@@ -200,6 +200,7 @@ static bool EndsWithInsensitive(const std::wstring& value, const std::wstring& s
 
 static bool IsProjectRuntimeFile(const std::wstring& fileName) {
     if (EndsWithInsensitive(fileName, L"postfx.maxjs.json")) return false;
+    if (EndsWithInsensitive(fileName, L"settings.maxjs.json")) return false;
     const size_t dot = fileName.find_last_of(L'.');
     if (dot == std::wstring::npos) return false;
 

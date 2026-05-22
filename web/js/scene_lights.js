@@ -27,6 +27,9 @@
 import * as THREE from 'three';
 
 const TARGET_DISTANCE = 1000;
+const shadowBounds = new THREE.Box3();
+const shadowCenter = new THREE.Vector3();
+const shadowSize = new THREE.Vector3();
 
 function setLightTargetFromData(light, ld) {
     const target = light.userData?.maxjsTarget;
@@ -39,7 +42,27 @@ function setLightTargetFromData(light, ld) {
     target.updateMatrixWorld();
 }
 
-function applyLightShadowDefaults(light, ld) {
+function getShadowSceneFocus(nodeMap) {
+    shadowBounds.makeEmpty();
+    for (const mesh of nodeMap?.values?.() ?? []) {
+        if (!mesh?.isMesh || !mesh.visible) continue;
+        shadowBounds.expandByObject(mesh);
+    }
+
+    if (shadowBounds.isEmpty()) {
+        shadowBounds.min.set(-100, -100, -100);
+        shadowBounds.max.set(100, 100, 100);
+    }
+
+    shadowBounds.getCenter(shadowCenter);
+    shadowBounds.getSize(shadowSize);
+    return {
+        center: shadowCenter,
+        radius: Math.max(shadowSize.x, shadowSize.y, shadowSize.z, 50),
+    };
+}
+
+function applyLightShadowDefaults(light, ld, nodeMap) {
     if (!light.shadow) return;
     light.castShadow = !!ld.castShadow;
     if (!light.castShadow) return;
@@ -48,29 +71,28 @@ function applyLightShadowDefaults(light, ld) {
     const mapSz = ld.shadowMapSize ?? 1024;
     light.shadow.mapSize.set(mapSz, mapSz);
 
-    // Snapshot-mode shadow camera defaults — wide enough for most scenes.
-    // Live mode recomputes per-frame from scene bounds (`getShadowSceneFocus`);
-    // skipping that here keeps things deterministic and cheap.
+    const { radius } = getShadowSceneFocus(nodeMap);
     const cam = light.shadow.camera;
     if (ld.type === 0 && cam?.isOrthographicCamera) {
-        const radius = 500;
         cam.left = -radius;
         cam.right = radius;
         cam.top = radius;
         cam.bottom = -radius;
         cam.near = 0.1;
-        cam.far = Math.max(radius * 8, 2000);
+        const target = light.userData?.maxjsTarget;
+        const targetDistance = target ? light.position.distanceTo(target.position) : 0;
+        cam.far = Math.max(radius * 8, targetDistance, 200);
         cam.updateProjectionMatrix();
     } else if ((ld.type === 1 || ld.type === 2) && cam?.isPerspectiveCamera) {
-        cam.near = 0.1;
-        cam.far = ld.distance > 0 ? ld.distance : 2000;
+        cam.near = Math.max(radius * 0.01, 0.1);
+        cam.far = ld.distance > 0 ? ld.distance : Math.max(radius * 6, 200);
         if (ld.type === 2) cam.fov = THREE.MathUtils.radToDeg((ld.angle ?? Math.PI / 4) * 2);
         cam.updateProjectionMatrix();
     }
     light.shadow.needsUpdate = true;
 }
 
-function applyLightData(light, ld) {
+function applyLightData(light, ld, nodeMap) {
     light.userData ??= {};
     light.userData.maxjsTypeId = ld.type;
     if (ld.h != null) light.userData.maxjsHandle = ld.h;
@@ -85,6 +107,11 @@ function applyLightData(light, ld) {
     }
     if ('intensity' in light && Number.isFinite(ld.intensity)) {
         light.intensity = ld.intensity;
+    }
+    if (Number.isFinite(ld.volContrib)) {
+        light.userData.volContrib = ld.volContrib;
+    } else {
+        delete light.userData.volContrib;
     }
 
     switch (ld.type) {
@@ -131,10 +158,10 @@ function applyLightData(light, ld) {
         break;
     }
 
-    applyLightShadowDefaults(light, ld);
+    applyLightShadowDefaults(light, ld, nodeMap);
 }
 
-function createLightFromData(ld, lightGroup) {
+function createLightFromData(ld, lightGroup, nodeMap) {
     let light;
     switch (ld.type) {
     case 0:
@@ -162,7 +189,7 @@ function createLightFromData(ld, lightGroup) {
     default:
         return null;
     }
-    applyLightData(light, ld);
+    applyLightData(light, ld, nodeMap);
     return light;
 }
 
@@ -176,7 +203,7 @@ function createLightFromData(ld, lightGroup) {
  *   lights.apply(meta.lights ?? []);
  *   // → returns { count, mainDirectional, signature }
  */
-export function createSceneLights({ scene, parent = scene, lightHandleMap = new Map() } = {}) {
+export function createSceneLights({ scene, parent = scene, lightHandleMap = new Map(), nodeMap = null } = {}) {
     if (!scene) throw new Error('createSceneLights: scene required');
     if (!parent?.add) throw new Error('createSceneLights: parent Object3D required');
 
@@ -209,7 +236,7 @@ export function createSceneLights({ scene, parent = scene, lightHandleMap = new 
         let count = 0;
         let mainDirectional = null;
         for (const ld of (lightsData ?? [])) {
-            const light = createLightFromData(ld, lightGroup);
+            const light = createLightFromData(ld, lightGroup, nodeMap);
             if (!light) continue;
             lightGroup.add(light);
             if (ld.h != null) lightHandleMap.set(ld.h, light);

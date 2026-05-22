@@ -112,6 +112,46 @@ function retainPMREMTexture(renderTarget) {
 function normalizeEnv(env, snapshotUi) {
     const hasSky = !!env?.sky;
     const hasHdri = typeof env?.hdri === 'string' && env.hdri.length > 0;
+    const hasAuthoredEnvironment = env?.enabled !== false && (hasSky || hasHdri);
+    if (hasAuthoredEnvironment) {
+        const type = env?.type || (hasSky ? 'sky' : 'hdri');
+        const backgroundVisible = typeof snapshotUi?.envVisible === 'boolean'
+            ? snapshotUi.envVisible
+            : (typeof env?.showBg === 'boolean' ? env.showBg : true);
+        return {
+            raw: env || null,
+            type,
+            enabled: true,
+            backgroundVisible,
+            source: hasHdri ? env.hdri : null,
+        };
+    }
+
+    const uiHdri = snapshotUi?.hdri;
+    const uiHdriSource = typeof uiHdri?.url === 'string' && uiHdri.url.length > 0
+        ? uiHdri.url
+        : (typeof uiHdri?.source === 'string' && uiHdri.source.length > 0 ? uiHdri.source : '');
+    if (uiHdri?.enabled !== false && uiHdriSource) {
+        return {
+            raw: {
+                rot: Number(uiHdri.rotation) || 0,
+                exp: 0,
+                gamma: 1,
+                flip: uiHdri.flip ? 1 : 0,
+                blur: Number(uiHdri.blur) || 0,
+                intensity: Number.isFinite(Number(uiHdri.intensity)) ? Number(uiHdri.intensity) : 1,
+                fileName: uiHdri.fileName || '',
+                maxjsLocal: true,
+            },
+            type: 'hdri',
+            enabled: true,
+            backgroundVisible: typeof uiHdri.showBg === 'boolean'
+                ? uiHdri.showBg
+                : (typeof snapshotUi?.envVisible === 'boolean' ? snapshotUi.envVisible : false),
+            source: uiHdriSource,
+        };
+    }
+
     const type = env?.type || (hasSky ? 'sky' : (hasHdri ? 'hdri' : 'none'));
     const enabled = env?.enabled !== false && (type === 'sky' || type === 'hdri');
     const backgroundVisible = typeof snapshotUi?.envVisible === 'boolean'
@@ -196,13 +236,16 @@ export function createSnapshotEnvironment({ scene, renderer, rootUrl = '.' } = {
         lastHdriRaw = params.raw || lastHdriRaw || { rot: 0, exp: 0, gamma: 1, flip: 0 };
         if (params.enabled && envMap) {
             scene.environment = envMap;
-            if ('environmentIntensity' in scene) scene.environmentIntensity = 1;
+            const intensity = Number.isFinite(Number(lastHdriRaw?.intensity)) ? Number(lastHdriRaw.intensity) : 1;
+            if ('environmentIntensity' in scene) scene.environmentIntensity = intensity;
             setRotations(Number(lastHdriRaw?.rot) || 0, !!lastHdriRaw?.flip);
-            renderer.toneMappingExposure =
-                Math.pow(2, Number(lastHdriRaw?.exp) || 0) * (Number(lastHdriRaw?.gamma) || 1);
+            if (!lastHdriRaw?.maxjsLocal) {
+                renderer.toneMappingExposure =
+                    Math.pow(2, Number(lastHdriRaw?.exp) || 0) * (Number(lastHdriRaw?.gamma) || 1);
+            }
             if (params.backgroundVisible) {
                 scene.background = envMap;
-                if ('backgroundIntensity' in scene) scene.backgroundIntensity = 1;
+                if ('backgroundIntensity' in scene) scene.backgroundIntensity = intensity;
                 if ('backgroundBlurriness' in scene) {
                     scene.backgroundBlurriness = Number(lastHdriRaw?.blur) || 0;
                 }
@@ -226,7 +269,7 @@ export function createSnapshotEnvironment({ scene, renderer, rootUrl = '.' } = {
 
     async function applyHdri(params) {
         const url = resolveUrl(params.source, rootUrl);
-        const ext = getExtension(url);
+        const ext = getExtension(params.raw?.fileName || url);
         const signature = JSON.stringify(['hdri', url, params.raw?.rot || 0, params.raw?.exp || 0,
             params.raw?.gamma || 1, params.raw?.flip || 0, params.backgroundVisible]);
 

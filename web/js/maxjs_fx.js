@@ -1512,6 +1512,20 @@ export function createMaxJSFxController({
                 beauty = vec4(max(beauty.rgb, ssrBlended.rgb), beauty.a);
             }
 
+            let environmentBackdropCompensated = false;
+            // SSR needs the HDRI temporarily visible as a background source when
+            // the user hides the environment, but downstream effects should see
+            // a transparent/hidden backdrop. Do this before bloom so glow can
+            // rebuild alpha around geometry instead of being wiped later.
+            if (useEnvironmentBackdropCompensation && scenePassDepth) {
+                const hasGeom = scenePassDepth.r.lessThan(float(0.999999));
+                beauty = vec4(
+                    hasGeom.select(beauty.rgb, hiddenBackgroundNode),
+                    hasGeom.select(beauty.a, float(0))
+                );
+                environmentBackdropCompensated = true;
+            }
+
             if (isBloomActive()) {
                 const bloomPass = bloom(
                     beauty,
@@ -1695,8 +1709,10 @@ export function createMaxJSFxController({
                 }
             }
 
-            // Environment backdrop compensation: hide HDRI on background when not visible
-            if (useEnvironmentBackdropCompensation && scenePassDepth) {
+            // Environment backdrop compensation: hide HDRI on background when not visible.
+            // Usually handled before bloom; this late fallback preserves older paths
+            // where the early compensation could not run.
+            if (useEnvironmentBackdropCompensation && scenePassDepth && !environmentBackdropCompensated) {
                 const hasGeom = scenePassDepth.r.lessThan(float(0.999999));
                 beauty = vec4(
                     hasGeom.select(beauty.rgb, hiddenBackgroundNode),

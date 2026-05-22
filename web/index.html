@@ -5,6 +5,14 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>max.js</title>
     <link rel="icon" href="data:,">
+    <script>
+        if (!window.chrome?.webview?.postMessage) {
+            const maxjsSnapshotTarget = new URL('snapshot.html', window.location.href);
+            maxjsSnapshotTarget.search = window.location.search;
+            maxjsSnapshotTarget.hash = window.location.hash;
+            window.location.replace(maxjsSnapshotTarget.href);
+        }
+    </script>
     <link rel="stylesheet" href="./css/index.css">
 </head>
 <body>
@@ -1409,6 +1417,7 @@
         let localHdriObjectUrl = null;   // file loaded in memory
         let localHdriEnvMap = null;      // cached PMREM texture
         let localHdriRawTexture = null;  // equirect source for pathtracing
+        let localHdriFile = null;        // original picked/restored file for snapshot export
 
         // No-op — env intensity is now controlled per-material via
         // material.envMapIntensity using the patched materialEnvIntensity
@@ -1630,37 +1639,14 @@
             return envMap;
         }
 
-        function buildSkyMeshReflectionEnvironment(sourceSkyMesh) {
-            if (!sourceSkyMesh) return null;
-            const skyScene = new THREE.Scene();
-            const skyCopy = sourceSkyMesh.clone();
-            skyCopy.frustumCulled = false;
-            skyScene.add(skyCopy);
-            try {
-                const envMap = retainPMREMTexture(pmremGenerator.fromScene(skyScene, 0, 0.1, 1000000));
-                if (envMap) envMap.name = 'MaxJSSkyReflectionPMREM';
-                return envMap;
-            } finally {
-                skyScene.clear();
-            }
-        }
-
-        function updateSkyReflectionEnvironment(params, sunDir, sourceSkyMesh = null) {
+        function updateSkyReflectionEnvironment(params, sunDir) {
             const usesGeospatialSky = params?.model === SKY_MODEL_PLANETARY
                 && allowGeospatialSky;
             if (isPathTracingMode || usesGeospatialSky) {
                 disposeSkyReflectionEnvironment();
                 return;
             }
-            let nextEnvMap = null;
-            if (sourceSkyMesh) {
-                try {
-                    nextEnvMap = buildSkyMeshReflectionEnvironment(sourceSkyMesh);
-                } catch (error) {
-                    maxjsDebugWarn('max.js sky reflection PMREM from Sky failed; using procedural fallback:', error);
-                }
-            }
-            nextEnvMap ??= buildProceduralSkyReflectionEnvironment(params, sunDir);
+            const nextEnvMap = buildProceduralSkyReflectionEnvironment(params, sunDir);
             if (!nextEnvMap) return;
 
             disposeSkyReflectionEnvironment();
@@ -3023,6 +3009,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     await updateLightProbeFromHDRI(hdrTex, probeSignature, loadGeneration);
                 }
                 maxjsFx.markEnvironmentChanged?.();
+                syncHdriPanel();
             }, undefined, (error) => {
                 console.error('max.js HDRI load failed', { hdriUrl, error });
                 currentHdriUrl = null;
@@ -3037,6 +3024,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 if (envVisible) scene.background = new THREE.Color(hiddenBackgroundColor);
                 setDefaultLightsVisible(true);
                 maxjsFx.markEnvironmentChanged?.();
+                syncHdriPanel();
             });
         }
 
@@ -3097,7 +3085,10 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             if (localHdriObjectUrl) URL.revokeObjectURL(localHdriObjectUrl);
             if (localHdriEnvMap) { localHdriEnvMap.dispose(); localHdriEnvMap = null; }
             if (localHdriRawTexture) { localHdriRawTexture.dispose?.(); localHdriRawTexture = null; }
-            clearCurrentHdriEnvMap();
+            if (!hasAuthoredEnvironmentActive()) {
+                clearCurrentHdriEnvMap();
+            }
+            localHdriFile = file;
             localHdriObjectUrl = URL.createObjectURL(file);
             localHdriFileName = file.name;
             if (!preserveEnabled) localHdriEnabled = true;
@@ -3114,7 +3105,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     : retainPMREMTexture(pmremGenerator.fromEquirectangular(hdrTex));
                 applyLocalHDRIToScene();
                 currentHdriUrl = localHdriObjectUrl;
-                if (lightProbeEnabled) {
+                if (!hasAuthoredEnvironmentActive() && lightProbeEnabled) {
                     await updateLightProbeFromHDRI(hdrTex, 'local-' + localHdriFileName, loadGen);
                 }
                 maxjsFx.markEnvironmentChanged?.();
@@ -3127,6 +3118,10 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         }
 
         function applyLocalHDRIToScene() {
+            if (hasAuthoredEnvironmentActive()) {
+                restoreAuthoredEnvironmentAfterLocalHDRIChange();
+                return;
+            }
             if (!localHdriEnvMap && !localHdriRawTexture) return;
             if (localHdriEnabled) {
                 localHdriShowBg = envVisible;
@@ -3161,6 +3156,10 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         }
 
         function applyLocalHDRISettings() {
+            if (hasAuthoredEnvironmentActive()) {
+                restoreAuthoredEnvironmentAfterLocalHDRIChange();
+                return;
+            }
             if (!isLocalHdriActive()) return;
             applyLocalHDRIToScene();
             maxjsFx.markOutputChanged?.();
@@ -3175,7 +3174,9 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         }
 
         function clearLocalHDRI() {
+            const authoredEnvironmentActive = hasAuthoredEnvironmentActive();
             localHdriFileName = '';
+            localHdriFile = null;
             localHdriEnabled = true;
             if (localHdriEnvMap) { localHdriEnvMap.dispose(); localHdriEnvMap = null; }
             if (localHdriRawTexture) { localHdriRawTexture.dispose?.(); localHdriRawTexture = null; }
@@ -3184,6 +3185,13 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             void clearStashedHdri();
             currentHdriUrl = null;
             currentHdriProbeSignature = '';
+            if (authoredEnvironmentActive) {
+                restoreAuthoredEnvironmentAfterLocalHDRIChange();
+                maxjsFx.markEnvironmentChanged?.();
+                savePostFxState();
+                syncHdriPanel();
+                return;
+            }
             scene.environment = null;
             scene.userData.maxjsPathTraceEnvironment = null;
             scene.userData.maxjsPathTraceBackground = null;
@@ -3203,14 +3211,21 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         function syncHdriPanel() {
             const nameEl = document.getElementById('fx-hdri-name');
             const toggleEl = document.getElementById('fx-hdri-toggle');
+            const authoredEnvironmentActive = hasAuthoredEnvironmentActive();
             if (nameEl) {
-                nameEl.textContent = isLocalHdriLoaded()
+                nameEl.textContent = authoredEnvironmentActive
+                    ? 'Max environment active'
+                    : isLocalHdriLoaded()
                     ? localHdriFileName + (localHdriEnabled ? '' : ' (off)')
                     : 'No HDRI loaded';
             }
             if (toggleEl) {
                 toggleEl.textContent = localHdriEnabled ? 'On' : 'Off';
-                toggleEl.classList.toggle('active', localHdriEnabled && isLocalHdriLoaded());
+                toggleEl.classList.toggle('active', !authoredEnvironmentActive && localHdriEnabled && isLocalHdriLoaded());
+            }
+            for (const id of ['fx-hdri-toggle', 'fx-hdri-load', 'fx-hdri-clear', 'fx-hdri-rotation', 'fx-hdri-intensity', 'fx-hdri-blur', 'fx-hdri-flip']) {
+                const el = document.getElementById(id);
+                if (el) el.disabled = authoredEnvironmentActive;
             }
         }
 
@@ -3253,6 +3268,23 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         function skyNumber(value, fallback) {
             const n = Number(value);
             return Number.isFinite(n) ? n : fallback;
+        }
+
+        function hasAuthoredEnvironmentActive() {
+            return !!(skyActive || currentEnvParams?.hdri);
+        }
+
+        function restoreAuthoredEnvironmentAfterLocalHDRIChange() {
+            if (skyActive && lastSkySourceParams) {
+                lastSkySig = '';
+                applySky(lastSkySourceParams);
+                return true;
+            }
+            if (currentEnvParams?.hdri) {
+                loadHDRI(currentEnvParams, { forceProbeRefresh: true });
+                return true;
+            }
+            return false;
         }
 
         function normalizeSkyParams(rawParams) {
@@ -3366,7 +3398,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             }
             updateSkyAmbientLightProbe(params, sunDir);
             if (!skyEnvMap || scene.environment !== skyEnvMap) {
-                updateSkyReflectionEnvironment(params, sunDir, skyMesh);
+                updateSkyReflectionEnvironment(params, sunDir);
             }
             currentHdriProbeSignature = JSON.stringify([
                 'sky-probe',
@@ -3427,6 +3459,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     currentHdriUrl = null;
                     currentHdriProbeSignature = '';
                     maxjsFx.markEnvironmentChanged?.();
+                    syncHdriPanel();
                     return;
                 }
 
@@ -3474,7 +3507,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 // scene passes; a null background can leave previous pixels
                 // behind when switching the sky material on/off.
                 scene.background = new THREE.Color(hiddenBackgroundColor);
-                updateSkyReflectionEnvironment(params, sunDir, skyMesh);
+                updateSkyReflectionEnvironment(params, sunDir);
                 updateSkyPathTraceEnvironment(params, sunDir);
                 scene.environmentRotation.set(0, 0, 0);
                 scene.backgroundRotation.set(0, 0, 0);
@@ -3510,6 +3543,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 currentHdriProbeSignature = '';
 
                 maxjsFx.markEnvironmentChanged?.();
+                syncHdriPanel();
 
             } catch (err) {
                 console.error('[max.js] applySky error:', err);
@@ -3571,6 +3605,10 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             scene.background = new THREE.Color(hiddenBackgroundColor);
             clearLightProbe();
             setDefaultLightsVisible(lightHandleMap.size === 0);
+            if (isLocalHdriLoaded()) {
+                applyLocalHDRIToScene();
+            }
+            syncHdriPanel();
         }
 
         // ── Material Creation ───────────────────────────────
@@ -5756,15 +5794,54 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             console.groupEnd();
         }
 
+        function findSnapshotSkySunDirection(lightsData) {
+            const directional = (Array.isArray(lightsData) ? lightsData : [])
+                .filter(light => light?.type === 0 && light.v !== false && light.v !== 0 && Array.isArray(light.dir));
+            if (!directional.length) return null;
+            const named = directional.find((light) => {
+                const name = String(light.name || '').toLowerCase();
+                return /\b(sun|sunlight|solar|daylight)\b/.test(name)
+                    || name.includes('sun')
+                    || name.includes('solar')
+                    || name.includes('daylight');
+            });
+            const light = named || (directional.length === 1 ? directional[0] : null);
+            if (!light) return null;
+            const dir = light.dir;
+            const world = copyMaxComponentsToWorld(
+                new THREE.Vector3(),
+                -Number(dir[0]),
+                -Number(dir[1]),
+                -Number(dir[2]),
+            );
+            return world.lengthSq() > 1.0e-8 ? world.normalize().toArray() : null;
+        }
+
+        function withSnapshotLinkedSkySun(env, lightsData) {
+            if (!env?.sky) return env;
+            const sunDirectionWorld = findSnapshotSkySunDirection(lightsData);
+            if (!sunDirectionWorld) return env;
+            return {
+                ...env,
+                sky: {
+                    ...env.sky,
+                    sunDirectionWorld,
+                    sunLinkedLight: true,
+                },
+            };
+        }
+
         function finalizeSceneSnapshot(snapshot, transport, applyStart, producerBytes, options = {}) {
             resolveSnapshotMaterialRefs(snapshot);
             if (snapshot.camera) applyCamera(snapshot.camera);
-            if (!isLocalHdriLoaded()) {
-                if (snapshot.env?.sky) applySky(snapshot.env.sky);
-                else if (snapshot.env?.hdri) { removeSky(); loadHDRI(snapshot.env); }
-                else if (snapshot.env?.enabled === false || snapshot.env?.type === 'none') {
-                    removeAuthoredEnvironment();
-                }
+            const snapshotEnv = withSnapshotLinkedSkySun(snapshot.env, snapshot.lights);
+            if (snapshotEnv?.sky) {
+                applySky(snapshotEnv.sky);
+            } else if (snapshotEnv?.hdri) {
+                removeSky();
+                loadHDRI(snapshotEnv);
+            } else if (snapshotEnv?.enabled === false || snapshotEnv?.type === 'none') {
+                removeAuthoredEnvironment();
             }
             if (snapshot.fog) maxjsFx.setFogFromScene(snapshot.fog);
             const lightsChanged = snapshot.lights ? applyLights(snapshot.lights) : false;
@@ -5943,7 +6020,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         // ── Environment/Fog live update (standalone, change-only) ──
         bridge.on('env_update', msg => {
             let pathTraceSceneChanged = false;
-            if (msg.env && !isLocalHdriLoaded()) {
+            if (msg.env) {
                 if (msg.env.sky) {
                     applySky(msg.env.sky);
                     markLightProbeSceneDirty();
@@ -8046,6 +8123,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         }
 
         function applyStudioState(payload) {
+            if (!isStudioMode) return;
             if (!payload || typeof payload !== 'object') return;
             withStudioPersistenceSuppressed(() => {
                 applyReflectionPaintState(payload.reflectionPaint ?? { lights: [], intensity: 1.0 });
@@ -8105,6 +8183,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         }
 
         function saveStudioState(options = {}) {
+            if (!isStudioMode) return;
             if (suppressStudioPersistenceDepth > 0) return;
             const payload = serializeStudioState();
             const signature = JSON.stringify(payload);
@@ -9601,9 +9680,8 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             const settings = sanitizeSnapshotSettings(snapshotSettings);
             // NOTE: snapshotUi (post-fx, camera) and runtimeScene (layers) are essential
             // for working snapshots - don't gate them behind includeDebugPayload
-            if (bakeOverrides.enabled) {
-                settings.includeSnapshotUi = true;
-            }
+            settings.includeSnapshotUi = true;
+            settings.includeRuntimeScene = true;
             if (!settings.includeAnimations) {
                 settings.includeTransformAnimation = false;
                 settings.includeGeometryAnimation = false;
@@ -9791,6 +9869,16 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 if (input) input.disabled = !animationsEnabled || !sceneNodesEnabled;
             }
             // NOTE: snapshotUi and runtimeScene are NOT gated by debugPayload - they're essential
+            const snapshotUiInput = snapshotPanel.querySelector('#snapshot-includeSnapshotUi');
+            if (snapshotUiInput) {
+                snapshotUiInput.checked = true;
+                snapshotUiInput.disabled = true;
+            }
+            const runtimeSceneInput = snapshotPanel.querySelector('#snapshot-includeRuntimeScene');
+            if (runtimeSceneInput) {
+                runtimeSceneInput.checked = true;
+                runtimeSceneInput.disabled = true;
+            }
             const cameraInput = snapshotPanel.querySelector('#snapshot-includeCameraAnimation');
             if (cameraInput) cameraInput.disabled = !animationsEnabled;
             const stepInput = snapshotPanel.querySelector('#snapshot-animationSampleStepFrames');
@@ -9803,12 +9891,24 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             const settings = getSnapshotExportSettings();
             let snapshotBase64 = '';
             let runtimeSnapshotBase64 = '';
+            let localHdriBase64 = '';
+            let localHdriFileNameForExport = '';
+            const authoredEnvironmentActive = !!(skyActive || currentEnvParams?.hdri);
 
             if (settings.includeSnapshotUi) {
                 const uiState = serializeSnapshotUiState({ includeDebug: settings.includeDebugPayload });
                 uiState.bake = serializeSnapshotBakeState();
                 if (!settings.includeSplats && uiState.performance) {
                     uiState.performance = { ...uiState.performance, splatsEnabled: false };
+                }
+                if (!authoredEnvironmentActive && settings.copyAssets && isLocalHdriLoaded() && localHdriFile instanceof Blob) {
+                    try {
+                        localHdriBase64 = bytesToBase64(new Uint8Array(await localHdriFile.arrayBuffer()));
+                        localHdriFileNameForExport = localHdriFile.name || localHdriFileName || 'local_hdri.hdr';
+                    } catch (error) {
+                        reportBridgeError('snapshot HDRI export', error);
+                        return;
+                    }
                 }
                 snapshotBase64 = toBase64Utf8(JSON.stringify(uiState));
             }
@@ -9841,9 +9941,15 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 requestId: pendingSnapshotRequestId,
                 snapshotBase64,
                 runtimeBase64: runtimeSnapshotBase64,
+                localHdriBase64,
+                localHdriFileName: localHdriFileNameForExport,
                 ...settings,
             });
         }
+
+        bridge.on('snapshot_export_request', () => {
+            void exportSnapshotWithSettings();
+        });
 
         btnSnapshotPanel.onclick = () => {
             setSnapshotPanelVisible(!snapshotPanelVisible);
@@ -11753,6 +11859,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
 
         function serializeSnapshotUiState({ includeDebug = false } = {}) {
             const snapshotRendererBackend = isPathTracingMode ? 'WebGL2' : rendererBackendLabel;
+            const authoredEnvironmentActive = !!(skyActive || currentEnvParams?.hdri);
             const payload = {
                 buildMode: includeDebug ? 'dev' : 'release',
                 rendererBackend: snapshotRendererBackend,
@@ -11771,8 +11878,8 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     showBg: localHdriShowBg,
                     blur: localHdriBlur,
                     flip: localHdriFlip,
-                    enabled: localHdriEnabled,
-                    fileName: isLocalHdriLoaded() ? localHdriFileName : '',
+                    enabled: authoredEnvironmentActive ? false : localHdriEnabled,
+                    fileName: !authoredEnvironmentActive && isLocalHdriLoaded() ? localHdriFileName : '',
                 },
                 performance: {
                     fpsCap: performanceSettings.fpsCap,
@@ -11784,7 +11891,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 cameraClip: { near: cameraClip.near, far: cameraClip.far },
                 ascii: { enabled: asciiActive, ...asciiSettings },
                 shaderLab: getShaderLabSnapshot(),
-                studio: serializeStudioState(),
+                studio: isStudioMode ? serializeStudioState() : null,
                 bake: serializeBakeState(),
                 timeline: {
                     fps: maxTimeline.fps(),
@@ -12404,7 +12511,6 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             setTimeout(syncVrState, 2100);
         })();
 
-        let standaloneHudFrame = 0;
         let lastPostFxPanelSyncMs = 0;
 
         function renderViewerFrame() {
@@ -12547,17 +12653,6 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             if (perfHudActive) {
                 perfHud.updateRender(performance.now() - renderStart, renderer.info?.render, renderer.info?.memory);
             }
-            // Standalone / snapshot viewers have no bridge sync — drive the perf HUD from the render loop.
-            if (!(window.chrome?.webview?.postMessage) && debugMode && buildMode !== 'release') {
-                standaloneHudFrame++;
-                updateSyncHud({
-                    transport: 'snapshot',
-                    frameId: standaloneHudFrame,
-                    producerBytes: 0,
-                    decodeMs: 0,
-                    applyMs: 0,
-                });
-            }
         }
 
         // ── JS_Inline Layer Manager ──────────────────────────
@@ -12628,279 +12723,6 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         _projectRuntimeRef = projectRuntime;
         attachLayerPanelSubscriptions();
         queueLayersPanelRefresh();
-
-        function getSyncedObjectForSnapshotHandle(h) {
-            if (nodeMap.has(h)) return nodeMap.get(h);
-            const n = typeof h === 'string' ? Number(h) : h;
-            if (Number.isFinite(n) && nodeMap.has(n)) return nodeMap.get(n);
-            if (typeof h === 'number' && nodeMap.has(String(h))) return nodeMap.get(String(h));
-            return undefined;
-        }
-
-        async function loadStandaloneSnapshot() {
-            if (window.chrome?.webview) return false;
-            try {
-                const metaResponse = await fetch('./snapshot.json', { cache: 'no-store' });
-                if (!metaResponse.ok) return false;
-                const meta = await metaResponse.json();
-                const binResponse = await fetch(meta.bin || './scene.bin', { cache: 'no-store' });
-                if (!binResponse.ok) {
-                    throw new Error(`HTTP ${binResponse.status} for ${meta.bin || './scene.bin'}`);
-                }
-                const buffer = await binResponse.arrayBuffer();
-                let animationBuffer = null;
-                if (meta.animations?.bin) {
-                    const animationResponse = await fetch(meta.animations.bin, { cache: 'no-store' });
-                    if (!animationResponse.ok) {
-                        throw new Error(`HTTP ${animationResponse.status} for ${meta.animations.bin}`);
-                    }
-                    animationBuffer = await animationResponse.arrayBuffer();
-                }
-                // Pre-apply camLock from snapshotUi BEFORE handleBinaryScene to prevent fitCamera() override
-                if (meta.snapshotUi?.camLock != null) {
-                    camLock = !!meta.snapshotUi.camLock;
-                    maxjsDebugLog('[max.js] Pre-set camLock from snapshotUi:', camLock);
-                }
-                if (meta.snapshotUi?.performance && typeof meta.snapshotUi.performance.splatsEnabled === 'boolean') {
-                    performanceSettings.splatsEnabled = meta.snapshotUi.performance.splatsEnabled;
-                    if (!performanceSettings.splatsEnabled) {
-                        splatMutationQueue = Promise.resolve();
-                        await shutdownSplatViewer();
-                    }
-                }
-                handleBinaryScene(buffer, meta);
-                if (meta.runtimeScene) {
-                    function resolveSnapshotLayerFactory(moduleNamespace) {
-                        const directHooks = ['init', 'update', 'dispose'].some(key => typeof moduleNamespace?.[key] === 'function');
-                        if (directHooks) return async () => moduleNamespace;
-
-                        const candidate = moduleNamespace?.default
-                            ?? moduleNamespace?.createLayer
-                            ?? moduleNamespace?.mount;
-
-                        if (typeof candidate === 'function') return candidate;
-                        if (candidate && typeof candidate === 'object') return async () => candidate;
-
-                        throw new Error('Snapshot layer module must export default/createLayer/mount or layer hooks');
-                    }
-
-                    function buildSnapshotManifestLayers(manifest) {
-                        const rawLayers = Array.isArray(manifest?.layers) ? manifest.layers : [];
-                        return rawLayers.map((entry, index) => ({
-                            id: entry?.id || entry?.name || `layer_${index}`,
-                            name: entry?.name || entry?.id || `layer_${index}`,
-                            entryPath: entry?.entry || entry?.path || 'main.js',
-                            source: 'project',
-                            enabled: entry?.enabled !== false,
-                        }));
-                    }
-
-                    function buildSnapshotInlineLayers(runtimeScene) {
-                        const rawLayers = Array.isArray(runtimeScene?.layers) ? runtimeScene.layers : [];
-                        return rawLayers
-                            .filter(entry => entry?.source === 'inline' && entry?.entry)
-                            .map((entry, index) => ({
-                                id: entry.id || entry.name || `inline_${index}`,
-                                name: entry.name || entry.id || `inline_${index}`,
-                                entryPath: entry.entry,
-                                source: 'inline',
-                                enabled: entry.active !== false,
-                            }));
-                    }
-
-                    async function tryReplaySnapshotLayerModules() {
-                        let manifest = null;
-                        let baseUrl = new URL('./', window.location.href);
-                        let allLayers = [];
-                        try {
-                            const manifestUrl = new URL('./project.maxjs.json', window.location.href);
-                            const response = await fetch(manifestUrl, { cache: 'no-store' });
-                            if (response.ok) {
-                                manifest = await response.json();
-                                baseUrl = new URL('./', manifestUrl);
-                                allLayers = buildSnapshotManifestLayers(manifest);
-                            }
-                        } catch {
-                            manifest = null;
-                        }
-
-                        // Snapshot always imports every layer in the manifest,
-                        // regardless of the enabled flag. Disable is a live-mode
-                        // concept only; snapshot releases ship the full set.
-                        if (allLayers.length === 0) {
-                            allLayers = buildSnapshotInlineLayers(meta.runtimeScene);
-                        }
-                        if (allLayers.length === 0) return false;
-
-                        const mountedIds = [];
-                        try {
-                            for (const entry of allLayers) {
-                                const entryPath = String(entry.entryPath || entry.entry || entry.path || '').replace(/\\/g, '/');
-                                if (!entryPath) throw new Error(`Missing layer entry path for ${entry.id}`);
-                                const moduleUrl = new URL(entryPath, baseUrl);
-                                moduleUrl.searchParams.set('v', `${Date.now()}_${entry.id}`);
-                                const moduleNamespace = await import(moduleUrl.toString());
-                                const factory = resolveSnapshotLayerFactory(moduleNamespace);
-                                const result = await layerManager.mount(
-                                    entry.id,
-                                    async (ctx, THREE) => factory(ctx, THREE, { manifest, layer: entry }),
-                                    {
-                                        name: entry.name || entry.id,
-                                        code: moduleUrl.toString(),
-                                        source: entry.source || 'project',
-                                        entry: entry.entryPath,
-                                    },
-                                );
-                                if (result?.error) throw new Error(result.error);
-                                mountedIds.push(entry.id);
-                            }
-                            return true;
-                        } catch (error) {
-                            maxjsDebugWarn('[max.js snapshot] layer module replay failed; falling back to baked runtimeScene', error);
-                            for (const id of mountedIds) {
-                                try { layerManager.remove(id); } catch {}
-                            }
-                            return false;
-                        }
-                    }
-
-                    const replayedLayerModules = await tryReplaySnapshotLayerModules();
-                    // Snapshot runtime trees are plain Object3D JSON, not node-material graphs.
-                    // Prefer the standard ObjectLoader here; NodeObjectLoader can reject this payload.
-                    const LoaderCtor = THREE_STD.ObjectLoader || THREE.ObjectLoader || THREE.NodeObjectLoader;
-                    const objectLoader = LoaderCtor ? new LoaderCtor() : null;
-                    if (!objectLoader) {
-                        throw new Error('Three.js ObjectLoader unavailable for snapshot runtime scene');
-                    }
-                    // WebGPU node materials serialize with "NodeMaterial" suffix that
-                    // the standard ObjectLoader doesn't know. Rewrite to standard types.
-                    const nodeMaterialTypeMap = {
-                        MeshPhysicalNodeMaterial: 'MeshStandardMaterial',
-                        MeshStandardNodeMaterial: 'MeshStandardMaterial',
-                        MeshBasicNodeMaterial: 'MeshBasicMaterial',
-                        MeshLambertNodeMaterial: 'MeshLambertMaterial',
-                        MeshPhongNodeMaterial: 'MeshPhongMaterial',
-                        MeshPhysicalMaterial: 'MeshStandardMaterial',
-                        LineBasicNodeMaterial: 'LineBasicMaterial',
-                        PointsNodeMaterial: 'PointsMaterial',
-                        SpriteNodeMaterial: 'SpriteMaterial',
-                    };
-                    function patchMaterialTypes(json) {
-                        if (!json?.materials) return;
-                        for (const mat of json.materials) {
-                            if (mat.type && nodeMaterialTypeMap[mat.type]) {
-                                mat.type = nodeMaterialTypeMap[mat.type];
-                            }
-                            // Final fallback: if type still isn't a known standard type,
-                            // force MeshStandardMaterial so ObjectLoader doesn't throw.
-                            if (mat.type && mat.type.includes('Node')) {
-                                mat.type = 'MeshStandardMaterial';
-                            }
-                        }
-                    }
-                    async function parseRuntimeSubtree(json) {
-                        if (!json || typeof json !== 'object') return null;
-                        patchMaterialTypes(json);
-                        if (typeof objectLoader.parseAsync === 'function') {
-                            return objectLoader.parseAsync(json);
-                        }
-                        return objectLoader.parse(json);
-                    }
-                    if (!replayedLayerModules && meta.runtimeScene.jsRoot) {
-                        try {
-                            const jsSnapshotRoot = await parseRuntimeSubtree(meta.runtimeScene.jsRoot);
-                            if (jsSnapshotRoot?.isObject3D) {
-                                jsSnapshotRoot.visible = true;
-                                jsRoot.add(jsSnapshotRoot);
-                                jsSnapshotRoot.updateMatrixWorld(true);
-                                // Re-apply TSL materials from Max meshes onto runtime scene meshes.
-                                // ObjectLoader can't round-trip NodeMaterial shader graphs, so the
-                                // deformed clones lose their TSL effect. Match by userData.maxjsOwnerHandle
-                                // or name and swap the material from the hidden Max mesh.
-                                const handleToTSLMat = new Map();
-                                for (const nd of (meta.nodes || [])) {
-                                    if (nd.mat?.model === 'MeshTSLNodeMaterial' && nd.mat?.tslCode) {
-                                        const maxMesh = getSyncedObjectForSnapshotHandle(nd.h);
-                                        if (maxMesh?.material) handleToTSLMat.set(nd.h, maxMesh.material);
-                                    }
-                                }
-                                if (handleToTSLMat.size > 0) {
-                                    jsSnapshotRoot.traverse(child => {
-                                        if (!child.isMesh) return;
-                                        const srcH = child.userData?.maxjsSourceHandle
-                                                  ?? child.userData?.maxjsHandle;
-                                        const tslMat = srcH != null ? handleToTSLMat.get(srcH) : null;
-                                        if (tslMat) child.material = tslMat;
-                                    });
-                                }
-                            }
-                        } catch (err) {
-                            maxjsDebugWarn('[max.js snapshot] runtimeScene.jsRoot parse failed (non-fatal)', err);
-                        }
-                    }
-                    if (!replayedLayerModules && meta.runtimeScene.overlayRoot) {
-                        try {
-                            const overlaySnapshotRoot = await parseRuntimeSubtree(meta.runtimeScene.overlayRoot);
-                            if (overlaySnapshotRoot?.isObject3D) {
-                                overlaySnapshotRoot.visible = true;
-                                overlayRoot.add(overlaySnapshotRoot);
-                                overlaySnapshotRoot.updateMatrixWorld(true);
-                            }
-                        } catch (err) {
-                            maxjsDebugWarn('[max.js snapshot] runtimeScene.overlayRoot parse failed (non-fatal)', err);
-                        }
-                    }
-                    // Layers hide Max meshes and draw deformed clones under jsRoot; export still bakes Max geometry as visible.
-                    const hideHandles = meta.runtimeScene.hideMaxSyncHandles;
-                    if (Array.isArray(hideHandles) && hideHandles.length) {
-                        for (const h of hideHandles) {
-                            const m = getSyncedObjectForSnapshotHandle(h);
-                            if (m) m.visible = false;
-                        }
-                    }
-                    if (Array.isArray(meta.runtimeScene.transformOverrides) && meta.runtimeScene.transformOverrides.length) {
-                        layerManager.restoreTransformOverrides?.(meta.runtimeScene.transformOverrides);
-                    }
-                }
-                if (meta.snapshotUi) {
-                    // Apply snapshot's buildMode if no URL override
-                    // Fallback: if debug object exists, treat as dev mode (for older snapshots)
-                    if (!urlMode) {
-                        const snapshotBuildMode = meta.snapshotUi.buildMode
-                            || (meta.snapshotUi.debug ? 'dev' : 'release');
-                        if (snapshotBuildMode !== buildMode) {
-                            buildMode = snapshotBuildMode;
-                            applyBuildMode();
-                        }
-                    }
-                    // Force disable motion blur in standalone — no velocity data
-                    if (meta.snapshotUi.fx?.motionBlur) {
-                        meta.snapshotUi.fx.motionBlur.enabled = false;
-                    }
-                    applySavedPostFxPayload(meta.snapshotUi);
-                    applyStudioState(meta.snapshotUi.studio);
-                    applyBakeState(meta.snapshotUi.bake, { rebuild: true });
-                    maxjsDebugLog('[max.js] Applying standalone camera:', meta.snapshotUi.camera);
-                    applyStandaloneCameraState(meta.snapshotUi.camera);
-                    maxjsDebugLog('[max.js] Camera after apply:', camera.position.toArray(), 'target:', controls.target.toArray());
-                    syncPostFxPanel(true);
-                }
-                animationSystem.invalidateTargets();
-                if (meta.animations) animationSystem.loadSnapshotAnimations(meta.animations, animationBuffer);
-                else animationSystem.clear();
-                // Standalone has no Max — kick a local clock with the same API.
-                if (meta.snapshotUi?.timeline) {
-                    maxTimeline.initStandalone(meta.snapshotUi.timeline);
-                } else {
-                    maxTimeline.initStandalone({ fps: 30, defaultPlaying: true });
-                }
-                setInfoText(`max.js Snapshot - ${meta.nodes?.length ?? 0} nodes`);
-                return true;
-            } catch (error) {
-                reportBridgeError('snapshot load', error);
-                return false;
-            }
-        }
 
 
         // ── Render to Image (production render) ──────────────
@@ -13104,13 +12926,6 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             if (file && !isLocalHdriLoaded()) loadLocalHDRIFile(file, { preserveEnabled: true, persist: false });
         }
 
-        async function bootStandaloneSnapshot() {
-            const loaded = await loadStandaloneSnapshot();
-            if (loaded) return true;
-            await restoreInteractiveBrowserState();
-            return false;
-        }
-
         function applyBuildMode() {
             const hud = document.getElementById('hud');
             const rail = document.getElementById('viewportMenu');
@@ -13142,11 +12957,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             applyBuildMode();
         }
 
-        if (isStandalone) {
-            void bootStandaloneSnapshot();
-        } else {
-            void restoreInteractiveBrowserState();
-        }
+        void restoreInteractiveBrowserState();
 
         addEventListener('focus', () => {
             lastRenderTimestamp = 0;

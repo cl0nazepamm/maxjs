@@ -461,6 +461,8 @@ export async function applySceneBin({ buffer, meta, ctx, hooks: userHooks = {}, 
             mesh.frustumCulled = false;
             mesh.name = nd.n ?? '';
             mesh.userData.maxjsHandle = nd.h;
+            mesh.castShadow = nd.props?.cshadow !== false && nd.props?.cshadow !== 0;
+            mesh.receiveShadow = nd.props?.rshadow !== false && nd.props?.rshadow !== 0;
             hooks.stampMaterial(mesh, nd);
             maxRoot.add(mesh);
             nodeMap.set(nd.h, mesh);
@@ -469,6 +471,9 @@ export async function applySceneBin({ buffer, meta, ctx, hooks: userHooks = {}, 
             sceneChanged = true;
             hooks.onMaterialApplied(nd.h, mesh);
         }
+
+        mesh.castShadow = nd.props?.cshadow !== false && nd.props?.cshadow !== 0;
+        mesh.receiveShadow = nd.props?.rshadow !== false && nd.props?.rshadow !== 0;
 
         // Transform + visibility (a tiny subset of finalizeSceneNode).
         const visChanged = hooks.applyVisibility(mesh, nd.vis);

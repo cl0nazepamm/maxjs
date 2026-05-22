@@ -71,7 +71,7 @@ import { applySceneBin } from './scene_applier.js';
 import { createSceneLights } from './scene_lights.js';
 import { createSnapshotEnvironment } from './snapshot_environment.js';
 import { createMaterialBuilder } from './material_builder.js';
-import { copyMaxArrayToWorld } from './max_basis.js';
+import { copyMaxArrayToWorld, copyMaxComponentsToWorld } from './max_basis.js';
 import { geometryFromNodeBinary } from './scene_binary.js';
 import { sceneSpace } from './max_basis.js';
 // Optional modules — imported lazily inside Phase 5 once runtimeFeatures
@@ -242,6 +242,43 @@ function countVisibleLightPayload(lightsData) {
     }, 0);
 }
 
+function findSnapshotSkySunDirection(lightsData) {
+    const directional = (Array.isArray(lightsData) ? lightsData : [])
+        .filter(light => light?.type === 0 && light.v !== false && light.v !== 0 && Array.isArray(light.dir));
+    if (!directional.length) return null;
+    const named = directional.find((light) => {
+        const name = String(light.name || '').toLowerCase();
+        return /\b(sun|sunlight|solar|daylight)\b/.test(name)
+            || name.includes('sun')
+            || name.includes('solar')
+            || name.includes('daylight');
+    });
+    const light = named || (directional.length === 1 ? directional[0] : null);
+    if (!light) return null;
+    const dir = light.dir;
+    const world = copyMaxComponentsToWorld(
+        new THREE.Vector3(),
+        -Number(dir[0]),
+        -Number(dir[1]),
+        -Number(dir[2]),
+    );
+    return world.lengthSq() > 1.0e-8 ? world.normalize().toArray() : null;
+}
+
+function withSnapshotLinkedSkySun(env, lightsData) {
+    if (!env?.sky) return env;
+    const sunDirectionWorld = findSnapshotSkySunDirection(lightsData);
+    if (!sunDirectionWorld) return env;
+    return {
+        ...env,
+        sky: {
+            ...env.sky,
+            sunDirectionWorld,
+            sunLinkedLight: true,
+        },
+    };
+}
+
 // ─── Phase 1: metadata ─────────────────────────────────────────────────
 async function loadMeta(root) {
     const response = await fetch(`${root}/snapshot.json`, { cache: 'no-store' });
@@ -314,6 +351,7 @@ function buildLayerManager({
     jsRoot,
     overlayRoot,
     controls,
+    sceneCameras = [],
 }) {
     return createLayerManager({
         scene,
@@ -328,6 +366,7 @@ function buildLayerManager({
         space: sceneSpace,
         controls,
         getCamera: () => camera,
+        getSceneCameras: () => sceneCameras,
         debugLog: (...args) => console.debug('[snapshot_boot]', ...args),
         debugWarn: (...args) => console.warn('[snapshot_boot]', ...args),
     });
@@ -890,7 +929,7 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
     const lightHandleMap = new Map();
 
     // Lights — bound here so phase 7 / phase 6 hooks can both reach in.
-    const sceneLights = createSceneLights({ scene, parent: maxRoot, lightHandleMap });
+    const sceneLights = createSceneLights({ scene, parent: maxRoot, lightHandleMap, nodeMap });
 
     // Material builder — owns the per-snapshot texture cache and applies
     // export-time bake overrides before meshes enter the scene.
@@ -911,6 +950,7 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
     const layerManager = buildLayerManager({
         scene, camera, renderer, THREE,
         nodeMap, lightHandleMap, maxRoot, jsRoot, overlayRoot, controls,
+        sceneCameras: Array.isArray(meta.sceneCameras) ? meta.sceneCameras : [],
     });
 
     const animationSystem = createMaxJSAnimationSystem({
@@ -962,7 +1002,7 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
 
     // Phase 7d: authored environment / HDRI.
     // Explicit only: no default sky is synthesized here.
-    await snapshotEnvironment.apply(meta.env, meta.snapshotUi);
+    await snapshotEnvironment.apply(withSnapshotLinkedSkySun(meta.env, meta.lights), meta.snapshotUi);
     // HDRI import can author renderer exposure; snapshot UI is the final
     // artist look and must win for exported pages.
     if (meta.snapshotUi) {

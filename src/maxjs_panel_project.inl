@@ -477,6 +477,30 @@
         return true;
     }
 
+    bool WriteProjectSettingsContent(const std::wstring& contentBase64, std::wstring& error) {
+        const std::wstring projectDir = GetProjectDir();
+        if (projectDir.empty()) {
+            error = L"Save the scene first";
+            return false;
+        }
+
+        SHCreateDirectoryExW(nullptr, projectDir.c_str(), nullptr);
+
+        std::string decoded;
+        if (!DecodeBase64Wide(contentBase64, decoded)) {
+            error = L"Invalid base64 settings payload";
+            return false;
+        }
+
+        const std::wstring settingsPath = GetProjectSettingsPath();
+        if (!WriteBinaryFile(settingsPath, decoded)) {
+            error = L"Failed to write project settings";
+            return false;
+        }
+
+        return true;
+    }
+
     bool WriteBakeProxyImage(const std::wstring& folder,
                              const std::wstring& filename,
                              int width,

@@ -59,6 +59,11 @@ static void EnsurePanel() {
 }
 void EnsureMaxJSPanel() { EnsurePanel(); }
 
+void ExportMaxJSSnapshot() {
+    EnsurePanel();
+    if (g_panel) g_panel->RequestSnapshotExport();
+}
+
 void SetMaxJSPathTracingSettings(int samplesPerFrame, float giClamp, bool freezeSync) {
     g_pathTracingSamplesPerFrame = std::clamp(samplesPerFrame, 1, 64);
     if (!std::isfinite(giClamp)) giClamp = 20.0f;
@@ -108,17 +113,23 @@ static void RegisterMaxScript() {
     swprintf_s(script, 4096,
         L"global MaxJS_HWND = %lld\r\n"
         L"fn MaxJS_KillPanel = ( windows.sendMessage MaxJS_HWND %d 0 0 )\r\n"
+        L"fn MaxJS_ExportSnapshot = ( windows.sendMessage MaxJS_HWND %d 0 0 )\r\n"
         L"macroScript MaxJS_Toggle category:\"max.js\" tooltip:\"Toggle max.js Viewport\" buttonText:\"max.js\" (\r\n"
         L"    windows.sendMessage MaxJS_HWND %d 0 0\r\n"
         L")\r\n"
         L"macroScript MaxJS_Kill category:\"max.js\" tooltip:\"Kill max.js Viewport\" buttonText:\"Kill max.js\" (\r\n"
         L"    windows.sendMessage MaxJS_HWND %d 0 0\r\n"
         L")\r\n"
+        L"macroScript MaxJS_Snapshot category:\"max.js\" tooltip:\"Export max.js Snapshot\" buttonText:\"Snapshot\" (\r\n"
+        L"    windows.sendMessage MaxJS_HWND %d 0 0\r\n"
+        L")\r\n"
         L"if menuMan != undefined and menuMan.findMenu \"max.js\" == undefined do (\r\n"
         L"    local subMenu = menuMan.createMenu \"max.js\"\r\n"
         L"    local toggleItem = menuMan.createActionItem \"MaxJS_Toggle\" \"max.js\"\r\n"
         L"    local killItem = menuMan.createActionItem \"MaxJS_Kill\" \"max.js\"\r\n"
+        L"    local snapshotItem = menuMan.createActionItem \"MaxJS_Snapshot\" \"max.js\"\r\n"
         L"    subMenu.addItem toggleItem -1\r\n"
+        L"    subMenu.addItem snapshotItem -1\r\n"
         L"    subMenu.addItem killItem -1\r\n"
         L"    local mainMenu = menuMan.getMainMenuBar()\r\n"
         L"    local subMenuItem = menuMan.createSubMenuItem \"max.js\" subMenu\r\n"
@@ -127,8 +138,10 @@ static void RegisterMaxScript() {
         L")\r\n",
         (long long)(intptr_t)g_helperHwnd,
         (int)WM_KILL_PANEL,
+        (int)WM_EXPORT_SNAPSHOT,
         (int)WM_TOGGLE_PANEL,
-        (int)WM_KILL_PANEL);
+        (int)WM_KILL_PANEL,
+        (int)WM_EXPORT_SNAPSHOT);
     ExecuteMAXScriptScript(script, MAXScript::ScriptSource::NonEmbedded);
 }
 
@@ -136,6 +149,7 @@ static LRESULT CALLBACK HelperWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
     switch (msg) {
     case WM_TOGGLE_PANEL: TogglePanel(); return 0;
     case WM_KILL_PANEL: KillPanel(); return 0;
+    case WM_EXPORT_SNAPSHOT: ExportMaxJSSnapshot(); return 0;
     case WM_TIMER:
         if (wParam == SETUP_TIMER_ID) { KillTimer(hwnd, SETUP_TIMER_ID); RegisterMaxScript(); }
         return 0;

@@ -1771,6 +1771,20 @@
             SendHostActionResult(type, requestId, ok, error);
             return;
         }
+        if (type == L"project_settings_write") {
+            std::wstring requestId;
+            std::wstring contentBase64;
+            ExtractJsonString(msg, L"requestId", requestId);
+            if (!ExtractJsonString(msg, L"contentBase64", contentBase64)) {
+                SendHostActionResult(type, requestId, false, L"Missing contentBase64");
+                return;
+            }
+
+            std::wstring error;
+            const bool ok = WriteProjectSettingsContent(contentBase64, error);
+            SendHostActionResult(type, requestId, ok, error);
+            return;
+        }
         if (type == L"bake_proxy_image_write") {
             std::wstring requestId;
             std::wstring folder;
@@ -1816,8 +1830,12 @@
             std::wstring requestId;
             std::wstring snapshotBase64;
             std::wstring runtimeBase64;
+            std::wstring localHdriBase64;
+            std::wstring localHdriFileName;
             SnapshotExportOptions options;
             ExtractJsonString(msg, L"requestId", requestId);
+            ExtractJsonString(msg, L"localHdriBase64", localHdriBase64);
+            ExtractJsonString(msg, L"localHdriFileName", localHdriFileName);
             ExtractJsonBool(msg, L"includeSceneNodes", options.includeSceneNodes);
             ExtractJsonBool(msg, L"includeEnvironment", options.includeEnvironment);
             ExtractJsonBool(msg, L"includeFog", options.includeFog);
@@ -1861,7 +1879,14 @@
 
             std::wstring exportPath;
             std::wstring error;
-            const bool ok = ExportSnapshotSite(snapshotUiJson, runtimeSceneJson, options, exportPath, error);
+            const bool ok = ExportSnapshotSite(
+                snapshotUiJson,
+                runtimeSceneJson,
+                options,
+                localHdriFileName,
+                localHdriBase64,
+                exportPath,
+                error);
             SendHostActionResult(type, requestId, ok, error, exportPath);
             return;
         }
@@ -1955,6 +1980,7 @@
             ResetFastPathState(false);
             SendProjectConfig();
             ScanInlineLayers();
+            if (pendingSnapshotExportRequest_) RequestSnapshotExport();
         }
     }
 

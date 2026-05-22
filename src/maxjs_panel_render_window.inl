@@ -870,6 +870,9 @@
                 p->CaptureActiveShadeFrame();
             }
             return 0;
+        case WM_EXPORT_SNAPSHOT:
+            if (p) p->RequestSnapshotExport();
+            return 0;
         case WM_TIMER:
             if (wParam == SYNC_TIMER_ID && p) p->OnTimer();
             if (wParam == AS_TIMER_ID && p) p->CaptureActiveShadeFrame();

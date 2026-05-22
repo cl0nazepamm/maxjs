@@ -89,6 +89,7 @@ using namespace Microsoft::WRL;
 #define WM_SYNC_TICK              (WM_USER + 4)
 #define WM_AS_TICK                (WM_USER + 5)
 #define WM_PLAYBACK_FLUSH         (WM_USER + 6)
+#define WM_EXPORT_SNAPSHOT        (WM_USER + 7)
 #define SETUP_TIMER_ID            2
 #define AS_TIMER_ID               3
 #define AS_INTERVAL_MS            66   // ~15fps ActiveShade
@@ -341,6 +342,62 @@ public:
         }
 
         copiedPaths.emplace(cacheKey, relativePath);
+        return true;
+    }
+
+    std::wstring SanitizeSnapshotAssetExtension(const std::wstring& fileName, const std::wstring& fallback = L".hdr") {
+        const wchar_t* extPtr = PathFindExtensionW(fileName.c_str());
+        std::wstring ext = (extPtr && *extPtr) ? extPtr : fallback;
+        if (ext.empty() || ext.front() != L'.') ext = fallback;
+        std::wstring out;
+        out.reserve(ext.size());
+        out.push_back(L'.');
+        for (size_t i = 1; i < ext.size(); ++i) {
+            const wchar_t ch = static_cast<wchar_t>(towlower(ext[i]));
+            if ((ch >= L'a' && ch <= L'z') || (ch >= L'0' && ch <= L'9')) out.push_back(ch);
+        }
+        return out.size() > 1 ? out : fallback;
+    }
+
+    bool WriteSnapshotInlineAsset(const std::string& bytes,
+                                  const std::wstring& fileName,
+                                  const std::wstring& exportDir,
+                                  const std::wstring& prefix,
+                                  std::wstring& relativePath,
+                                  std::wstring& error) {
+        if (bytes.empty()) {
+            error = L"Snapshot inline asset is empty";
+            return false;
+        }
+
+        const std::wstring assetsDir = exportDir + L"\\assets";
+        SHCreateDirectoryExW(nullptr, assetsDir.c_str(), nullptr);
+
+        uint64_t hash = HashFNV1a(bytes.data(), bytes.size());
+        if (!fileName.empty()) {
+            hash = HashFNV1a(fileName.data(), fileName.size() * sizeof(wchar_t), hash);
+        }
+
+        const std::wstring targetName = prefix + L"_" + HexU64(hash) + SanitizeSnapshotAssetExtension(fileName);
+        const std::wstring targetPath = assetsDir + L"\\" + targetName;
+        if (!WriteBinaryFile(targetPath, bytes)) {
+            error = L"Failed to write snapshot asset: " + targetPath;
+            return false;
+        }
+
+        relativePath = L"./assets/" + targetName;
+        return true;
+    }
+
+    bool InjectSnapshotUiHdriUrl(std::wstring& snapshotUiJson, const std::wstring& hdriUrl) {
+        if (snapshotUiJson.empty() || hdriUrl.empty()) return false;
+        const size_t key = snapshotUiJson.find(L"\"hdri\":");
+        if (key == std::wstring::npos) return false;
+        const size_t objectStart = snapshotUiJson.find(L'{', key);
+        if (objectStart == std::wstring::npos) return false;
+        const std::wstring escapedUrl = EscapeJson(hdriUrl.c_str());
+        const std::wstring insert = L"\"url\":\"" + escapedUrl + L"\",\"source\":\"" + escapedUrl + L"\",";
+        snapshotUiJson.insert(objectStart + 1, insert);
         return true;
     }
 
@@ -2727,7 +2784,8 @@ public:
         }
 
         // Seed index.html only once. After that the snapshot exporter owns
-        // scene data, not the standalone site's shell/UI.
+        // scene data, not the standalone site's shell/UI. Project-authored
+        // standalone edits may live at index.html, so never overwrite it.
         if (!CopyFileIfMissingEnsuringDirectories(snapshotHtml, outDir + L"\\index.html")) {
             error = L"Failed to copy snapshot runtime index.html";
             return false;
@@ -4010,6 +4068,8 @@ public:
     bool ExportSnapshotSite(const std::wstring& snapshotUiJson,
                             const std::wstring& runtimeSceneJson,
                             const SnapshotExportOptions& options,
+                            const std::wstring& localHdriFileName,
+                            const std::wstring& localHdriBase64,
                             std::wstring& outDir,
                             std::wstring& error) {
         const std::wstring webDir = GetWebDir();
@@ -4040,16 +4100,42 @@ public:
             return false;
         }
 
+        if (options.copyAssets) {
+            DeleteSnapshotGeneratedAssets(outDir);
+        }
+
+        std::wstring snapshotUiJsonForExport = snapshotUiJson;
+        if (options.includeSnapshotUi && !localHdriBase64.empty()) {
+            std::string localHdriBytes;
+            if (!DecodeBase64Wide(localHdriBase64, localHdriBytes)) {
+                error = L"Invalid local HDRI snapshot payload";
+                cleanupOnFail();
+                return false;
+            }
+
+            std::wstring localHdriRelativePath;
+            if (!WriteSnapshotInlineAsset(
+                    localHdriBytes,
+                    localHdriFileName.empty() ? L"local_hdri.hdr" : localHdriFileName,
+                    outDir,
+                    L"hdri",
+                    localHdriRelativePath,
+                    error)) {
+                cleanupOnFail();
+                return false;
+            }
+            InjectSnapshotUiHdriUrl(snapshotUiJsonForExport, localHdriRelativePath);
+        }
+
         std::wstring metaJson;
         std::string binary;
         std::string animBinary;
-        if (!BuildSnapshotBinary(metaJson, binary, animBinary, snapshotUiJson, runtimeSceneJson, options, error)) {
+        if (!BuildSnapshotBinary(metaJson, binary, animBinary, snapshotUiJsonForExport, runtimeSceneJson, options, error)) {
             cleanupOnFail();
             return false;
         }
 
         if (options.copyAssets) {
-            DeleteSnapshotGeneratedAssets(outDir);
             if (!RewriteSnapshotAssetUrls(metaJson, outDir, error, false)) {
                 cleanupOnFail();
                 return false;
@@ -4107,6 +4193,15 @@ public:
                     cleanupOnFail();
                     return false;
                 }
+            }
+        }
+
+        const std::wstring settingsPath = GetProjectSettingsPath();
+        if (!settingsPath.empty() && FileExists(settingsPath)) {
+            if (!CopyFileEnsuringDirectories(settingsPath, outDir + L"\\settings.maxjs.json")) {
+                error = L"Failed to copy settings.maxjs.json into snapshot";
+                cleanupOnFail();
+                return false;
             }
         }
 

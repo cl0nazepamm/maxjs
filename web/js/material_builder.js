@@ -514,7 +514,9 @@ function applyPhysicalScalarParams(params, md) {
     setNumber(params, 'thickness', md?.thickness);
     setNumber(params, 'dispersion', md?.dispersion);
     if (Array.isArray(md?.attenuationColor)) params.attenuationColor = colorFromArray(md.attenuationColor, 0xffffff);
-    setNumber(params, 'attenuationDistance', md?.attenuationDistance);
+    if (Number.isFinite(Number(md?.attenuationDistance)) && Number(md.attenuationDistance) > 0) {
+        params.attenuationDistance = Number(md.attenuationDistance);
+    }
     setNumber(params, 'anisotropy', md?.anisotropy);
     setNumber(params, 'anisotropyRotation', md?.anisotropyRotation);
     if ((md?.transmission ?? 0) > 0) params.transparent = true;
@@ -586,6 +588,65 @@ function createMaterialForRuntimeModel(runtimeModelName, params) {
     }
 }
 
+const VIDEO_TEXTURE_EXTS = new Set(['mp4', 'm4v', 'webm', 'mov', 'ogv']);
+
+function canUploadVideoFrame(video) {
+    return !!video &&
+        !video.error &&
+        !video.seeking &&
+        video.readyState >= video.HAVE_CURRENT_DATA &&
+        video.videoWidth > 0 &&
+        video.videoHeight > 0;
+}
+
+function installSafeVideoTexturePump(texture, video) {
+    if (!texture || !video) return;
+    if (texture.source) texture.source.dataReady = false;
+
+    let disposed = false;
+    let frameCallbackId = 0;
+    const originalDispose = texture.dispose?.bind(texture);
+
+    function markReady() {
+        if (disposed || !canUploadVideoFrame(video)) return;
+        if (texture.source) texture.source.dataReady = true;
+        texture.needsUpdate = true;
+    }
+
+    function markNotReady() {
+        if (texture.source) texture.source.dataReady = false;
+    }
+
+    function requestFrame() {
+        if (disposed || typeof video.requestVideoFrameCallback !== 'function') return;
+        frameCallbackId = video.requestVideoFrameCallback(() => {
+            markReady();
+            requestFrame();
+        });
+    }
+
+    video.addEventListener('loadeddata', markReady);
+    video.addEventListener('canplay', markReady);
+    video.addEventListener('playing', markReady);
+    video.addEventListener('seeked', markReady);
+    video.addEventListener('seeking', markNotReady);
+    video.addEventListener('waiting', markNotReady);
+    video.addEventListener('stalled', markNotReady);
+    requestFrame();
+
+    texture.dispose = () => {
+        if (disposed) return;
+        disposed = true;
+        if (frameCallbackId && typeof video.cancelVideoFrameCallback === 'function') {
+            try { video.cancelVideoFrameCallback(frameCallbackId); } catch {}
+        }
+        video.pause?.();
+        video.removeAttribute?.('src');
+        video.load?.();
+        originalDispose?.();
+    };
+}
+
 /**
  * Creates a material-builder instance tied to a snapshot root URL.
  * Owns its own texture cache so re-applies do not refetch.
@@ -620,6 +681,10 @@ export function createMaterialBuilder({ rootUrl = '.', bakeState = null } = {}) 
         if (ext === 'exr') return exrLoader;
         if (ext === 'hdr') return hdrLoader;
         return loader;
+    }
+
+    function isVideoTextureSource(resolved, xf) {
+        return !!xf?.video || VIDEO_TEXTURE_EXTS.has(getTextureExtension(resolved));
     }
 
     function isUnresolvedVirtualAssetUrl(url) {
@@ -670,6 +735,36 @@ export function createMaterialBuilder({ rootUrl = '.', bakeState = null } = {}) 
         return loadedTexture;
     }
 
+    function beginVideoTextureLoad(entry, textureColorSpace, xf, { silent = false } = {}) {
+        const video = document.createElement('video');
+        video.crossOrigin = 'anonymous';
+        video.loop = xf?.loop !== false;
+        video.muted = xf?.muted !== false;
+        video.playbackRate = Number.isFinite(Number(xf?.rate)) ? Number(xf.rate) : 1.0;
+        video.playsInline = true;
+        video.autoplay = true;
+        video.preload = 'auto';
+        video.src = entry.resolved;
+
+        const texture = new THREE.VideoTexture(video);
+        texture.colorSpace = textureColorSpace;
+        applyTextureChannelSelection(texture, xf);
+        applyTextureTransform(texture, xf);
+        installSafeVideoTexturePump(texture, video);
+        entry.texture = texture;
+
+        const onReady = () => {
+            if (!canUploadVideoFrame(video)) return;
+            finishTextureLoad(entry, texture, textureColorSpace, xf);
+        };
+        video.addEventListener('loadeddata', onReady, { once: true });
+        video.addEventListener('canplay', onReady, { once: true });
+        video.addEventListener('error', (event) => failTextureLoad(entry, event, { silent }), { once: true });
+        video.load?.();
+        video.play?.().catch(() => {});
+        return texture;
+    }
+
     function loadTextureEntry(
         url,
         colorSpace = THREE.LinearSRGBColorSpace,
@@ -681,7 +776,8 @@ export function createMaterialBuilder({ rootUrl = '.', bakeState = null } = {}) 
         const resolved = resolveUrl(url);
         if (isUnresolvedVirtualAssetUrl(resolved)) return null;
         const textureColorSpace = resolveTextureColorSpace(colorSpace, xf, resolved);
-        const activeLoader = loaderForExtension(getTextureExtension(resolved));
+        const isVideoTexture = isVideoTextureSource(resolved, xf);
+        const activeLoader = isVideoTexture ? null : loaderForExtension(getTextureExtension(resolved));
         const xfKey = xf ? JSON.stringify(xf) : '';
         const key = `${resolved}::${textureColorSpace}::${xfKey}`;
         if (textureCache.has(key)) return textureCache.get(key);
@@ -695,7 +791,11 @@ export function createMaterialBuilder({ rootUrl = '.', bakeState = null } = {}) 
         };
         textureCache.set(key, entry);
 
-        beginTextureLoad(entry, activeLoader, textureColorSpace, xf, { silent: options.silent });
+        if (isVideoTexture) {
+            beginVideoTextureLoad(entry, textureColorSpace, xf, { silent: options.silent });
+        } else {
+            beginTextureLoad(entry, activeLoader, textureColorSpace, xf, { silent: options.silent });
+        }
         return entry;
     }
 

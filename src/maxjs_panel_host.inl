@@ -106,6 +106,7 @@
     bool pathTracingFreezeSync_ = false;
     bool pathTracingViewerActive_ = false;
     bool pathTracingHasSceneSync_ = false;
+    bool pendingSnapshotExportRequest_ = false;
     bool slowJsonSyncMode_ = false;
     ULONGLONG lastSlowJsonSyncTick_ = 0;
     SceneEventNamespace::CallbackKey fastNodeEventCallbackKey_ = 0;
@@ -238,6 +239,14 @@
         if (!force && payload == inlineLayersStateSignature_) return;
         inlineLayersStateSignature_ = payload;
         webview_->PostWebMessageAsJson(payload.c_str());
+    }
+
+    void RequestSnapshotExport() {
+        pendingSnapshotExportRequest_ = true;
+        if (!webview_ || !jsReady_) return;
+
+        pendingSnapshotExportRequest_ = false;
+        webview_->PostWebMessageAsJson(L"{\"type\":\"snapshot_export_request\",\"source\":\"maxscript\"}");
     }
 
     // Inline-folder scan — just notifies the JS project runtime of the
@@ -566,6 +575,12 @@
         const std::wstring projectDir = GetProjectDir();
         if (projectDir.empty()) return {};
         return projectDir + L"\\postfx.maxjs.json";
+    }
+
+    std::wstring GetProjectSettingsPath() {
+        const std::wstring projectDir = GetProjectDir();
+        if (projectDir.empty()) return {};
+        return projectDir + L"\\settings.maxjs.json";
     }
 
     std::wstring GetProjectSiteShellPath() {

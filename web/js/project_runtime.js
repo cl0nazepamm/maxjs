@@ -180,14 +180,6 @@ export function createProjectRuntime({ layerManager, bridge, perfHud, debugLog =
         return value && typeof value === 'object' ? cloneJsonValue(value) : null;
     }
 
-function mergeSettingsIntoPostFx(payload, settings) {
-    const nextPayload = cloneJsonValue(payload) ?? {};
-    const nextSettings = settings && typeof settings === 'object' ? cloneJsonValue(settings) : null;
-    if (nextSettings) nextPayload[POSTFX_SETTINGS_KEY] = nextSettings;
-    else delete nextPayload[POSTFX_SETTINGS_KEY];
-    return nextPayload;
-}
-
 function stripSettingsFromPostFx(payload) {
     const nextPayload = cloneJsonValue(payload);
     if (nextPayload && typeof nextPayload === 'object') {
@@ -195,6 +187,11 @@ function stripSettingsFromPostFx(payload) {
     }
     return nextPayload;
 }
+
+    function hasEmbeddedSettings(payload) {
+        const value = payload?.[POSTFX_SETTINGS_KEY];
+        return !!(value && typeof value === 'object');
+    }
 
     function subscribe(listener) {
         listeners.add(listener);
@@ -409,6 +406,11 @@ function stripSettingsFromPostFx(payload) {
                 const changed = stableStringify(settingsState) !== stableStringify(embedded);
                 settingsState = embedded;
                 if (changed) emitChange();
+                if (sceneSaved && manifestExists) {
+                    void persistSettings(embedded).catch(error => {
+                        debugWarn('[ProjectRuntime] embedded settings migration failed', error);
+                    });
+                }
                 return changed;
             }
             const fallback = {
@@ -636,16 +638,30 @@ function stripSettingsFromPostFx(payload) {
         }
     }
 
-    async function writeSettingsToHost(nextSettings) {
-        const settingsToWrite = cloneJsonValue(nextSettings) ?? {};
-        const postFxToWrite = mergeSettingsIntoPostFx(postFxState ?? transientPostFxState ?? manifestState?.postFx ?? {}, settingsToWrite);
-        const text = `${JSON.stringify(postFxToWrite, null, 2)}\n`;
+    async function writePostFxToHost(nextPayload) {
+        const cleanPayload = stripSettingsFromPostFx(nextPayload) ?? {};
+        const text = `${JSON.stringify(cleanPayload, null, 2)}\n`;
         await requestHostAction('project_postfx_write', {
             contentBase64: toBase64Utf8(text),
         });
         lastPostFxText = text;
+        postFxState = cleanPayload;
+        return cleanPayload;
+    }
+
+    async function writeSettingsToHost(nextSettings) {
+        const settingsToWrite = cloneJsonValue(nextSettings) ?? {};
+        const text = `${JSON.stringify(settingsToWrite, null, 2)}\n`;
+        await requestHostAction('project_settings_write', {
+            contentBase64: toBase64Utf8(text),
+        });
         settingsState = settingsToWrite;
-        postFxState = postFxToWrite;
+
+        const currentPostFx = postFxState ?? transientPostFxState ?? manifestState?.postFx ?? null;
+        if (hasEmbeddedSettings(currentPostFx)) {
+            await writePostFxToHost(currentPostFx);
+        }
+
         emitChange();
         return true;
     }
@@ -799,7 +815,7 @@ function stripSettingsFromPostFx(payload) {
     }
 
     async function setPostFxState(nextState) {
-        const cloned = mergeSettingsIntoPostFx(nextState, settingsState);
+        const cloned = stripSettingsFromPostFx(nextState) ?? {};
         if (!sceneSaved || !manifestExists) {
             transientPostFxState = cloned;
             emitChange();
@@ -807,12 +823,7 @@ function stripSettingsFromPostFx(payload) {
         }
 
         transientPostFxState = null;
-        const text = `${JSON.stringify(cloned, null, 2)}\n`;
-        await requestHostAction('project_postfx_write', {
-            contentBase64: toBase64Utf8(text),
-        });
-        lastPostFxText = text;
-        postFxState = cloned;
+        await writePostFxToHost(cloned);
         emitChange();
         return true;
     }

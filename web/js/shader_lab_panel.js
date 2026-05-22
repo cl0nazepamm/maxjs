@@ -1,4 +1,4 @@
-// Shader Lab configurator panel — full layer-stack editor for the
+// Shader Lab configurator panel — final custom-pass editor for the
 // shader-lab post-fx pipeline. React + htm UI mounted into the side
 // panel, drives shaderLabFx via setConfig() with auto-debounced apply.
 //
@@ -249,6 +249,13 @@ let _storeSnapshot = {
     config: DEFAULT_CONFIG(),
     autoApply: true,
     enabled: false,
+    passes: [{
+        id: 'legacy-main',
+        enabled: false,
+        slot: 'finalStylize',
+        requires: ['color'],
+        config: DEFAULT_CONFIG(),
+    }],
 };
 let _storeChangeHandler = null;
 let _storeApplyToReact = null;
@@ -265,12 +272,41 @@ export function getShaderLabSnapshot() {
     return _storeSnapshot;
 }
 
+function normalizeShaderLabPasses(snapshot, config) {
+    const legacyPass = {
+        id: 'legacy-main',
+        enabled: !!snapshot.enabled,
+        slot: 'finalStylize',
+        requires: ['color'],
+        config,
+    };
+    if (!Array.isArray(snapshot.passes) || !snapshot.passes.length) return [legacyPass];
+    return snapshot.passes.map((pass, index) => {
+        const source = pass && typeof pass === 'object' ? pass : {};
+        return {
+            id: typeof source.id === 'string' && source.id ? source.id : (index === 0 ? 'legacy-main' : `shader-lab-${index}`),
+            enabled: source.enabled != null ? !!source.enabled : !!snapshot.enabled,
+            slot: ['preGrade', 'postLighting', 'finalStylize', 'depthStylize'].includes(source.slot)
+                ? source.slot
+                : 'finalStylize',
+            requires: Array.isArray(source.requires) && source.requires.length
+                ? [...new Set(source.requires.filter(name => ['color', 'depth', 'normal', 'motion'].includes(name)))]
+                : ['color'],
+            config: normalizeConfig(source.config || config),
+        };
+    });
+}
+
 export function setShaderLabSnapshot(snapshot) {
     if (!snapshot || typeof snapshot !== 'object') return;
+    const config = normalizeConfig(snapshot.config);
+    const passes = normalizeShaderLabPasses(snapshot, config);
+    const finalPass = passes.find(pass => pass.slot === 'finalStylize') || passes[0];
     const nextSnapshot = {
-        config: normalizeConfig(snapshot.config),
+        config: normalizeConfig(finalPass?.config || config),
         autoApply: snapshot.autoApply !== false,
         enabled: !!snapshot.enabled,
+        passes,
     };
     if (snapshotSignature(nextSnapshot) === snapshotSignature(_storeSnapshot)) return;
     _storeSnapshot = nextSnapshot;
@@ -286,7 +322,15 @@ export function onShaderLabSnapshotChange(handler) {
 // the lifetime of the page. Used to keep the persisted snapshot in sync.
 export function updateShaderLabEnabled(enabled) {
     if (_storeSnapshot.enabled === !!enabled) return;
-    _storeSnapshot = { ..._storeSnapshot, enabled: !!enabled };
+    _storeSnapshot = {
+        ..._storeSnapshot,
+        enabled: !!enabled,
+        passes: normalizeShaderLabPasses(_storeSnapshot, _storeSnapshot.config).map(pass =>
+            pass.id === 'legacy-main' || pass.slot === 'finalStylize'
+                ? { ...pass, enabled: !!enabled, config: _storeSnapshot.config }
+                : pass
+        ),
+    };
     if (_storeChangeHandler) _storeChangeHandler(_storeSnapshot);
 }
 
@@ -983,7 +1027,12 @@ function buildApp({ React, htm, shaderLabFx }) {
         // replace so fields tracked outside React (currently `enabled`,
         // which is driven by shaderLabFx event, not by the panel) survive.
         useEffect(() => {
-            _storeSnapshot = { ..._storeSnapshot, config, autoApply };
+            const passes = normalizeShaderLabPasses(_storeSnapshot, config).map(pass =>
+                pass.id === 'legacy-main' || pass.slot === 'finalStylize'
+                    ? { ...pass, config, enabled: _storeSnapshot.enabled }
+                    : pass
+            );
+            _storeSnapshot = { ..._storeSnapshot, config, autoApply, passes };
             if (_storeChangeHandler) _storeChangeHandler(_storeSnapshot);
         }, [config, autoApply]);
 
@@ -1022,6 +1071,7 @@ function buildApp({ React, htm, shaderLabFx }) {
                 setStatus('applying...');
                 setStatusColor('#fa5');
                 await shaderLabFx.setConfig(cfg);
+                shaderLabFx.setPasses?.(normalizeShaderLabPasses(_storeSnapshot, cfg));
                 setStatus('live');
                 setStatusColor('rgb(255, 77, 0)');
             } catch (err) {
@@ -1048,7 +1098,12 @@ function buildApp({ React, htm, shaderLabFx }) {
             setStatus('loading...');
             setStatusColor('#fa5');
             try {
-                await shaderLabFx.enable(config);
+                await shaderLabFx.enable({
+                    config,
+                    enabled: true,
+                    autoApply,
+                    passes: normalizeShaderLabPasses({ ..._storeSnapshot, enabled: true }, config),
+                });
             } catch (err) {
                 setStatus('error: ' + (err?.message || err));
                 setStatusColor('#f66');
@@ -1113,7 +1168,7 @@ function buildApp({ React, htm, shaderLabFx }) {
                             ${enabled ? 'Deactivate' : 'Activate'}
                         </button>
                         <div className="fx-note" style=${{ marginTop: '6px' }}>
-                            Post FX will be limited when Shader Lab is active.
+                            Runs after the native Post FX stack as a custom final pass.
                         </div>
                         <label className="fx-check" style=${{ marginTop: '10px' }}>
                             <span>Auto-apply layer changes</span>

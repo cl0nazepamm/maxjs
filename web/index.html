@@ -1018,11 +1018,11 @@
         // element inside the texture's shadow tree.
         attachHTMLClickForwarding(THREE, renderer, () => ({ camera, scene }));
 
-        // Shader Lab FX — alternate post-fx path that bypasses ssgiFx.
-        // When enabled, the main render loop routes through shaderLabFx
-        // instead. Toggled from the right rail. Loads React +
+        // Shader Lab FX — optional custom pass consumed by the unified
+        // Post FX controller. Toggled from the right rail. Loads React +
         // @basementstudio/shader-lab from esm.sh on first enable.
         const shaderLabFx = createShaderLabFx({ THREE, renderer, scene, camera });
+        ssgiFx.setShaderLabFx?.(shaderLabFx);
         const pathTracingSettings = {
             samplesPerFrame: 1,
             giClamp: 20.0,
@@ -10369,7 +10369,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 key: 'ssgi',
                 title: 'SSGI',
                 copy: 'Diffuse bounce lighting and ambient occlusion from the current frame.',
-                note: 'Requires the real WebGPU backend.',
+                note: 'Requires WebGPU or TSL_GL.',
                 requiresWebGPU: true,
                 isEnabled: () => ssgiFx.isEnabled(),
                 setEnabled: (enabled) => ssgiFx.setEnabled(enabled),
@@ -10390,7 +10390,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 key: 'ssr',
                 title: 'SSR',
                 copy: 'Screen-space reflections for glossy and mirror-like surfaces.',
-                note: 'Requires the real WebGPU backend.',
+                note: 'Requires WebGPU or TSL_GL.',
                 requiresWebGPU: true,
                 isEnabled: () => ssgiFx.isSSREnabled(),
                 setEnabled: (enabled) => ssgiFx.setSSREnabled(enabled),
@@ -10408,7 +10408,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 key: 'gtao',
                 title: 'GTAO',
                 copy: 'Ground-truth ambient occlusion from a dedicated depth and normal pre-pass.',
-                note: 'Requires the real WebGPU backend.',
+                note: 'Requires WebGPU or TSL_GL.',
                 requiresWebGPU: true,
                 isEnabled: () => ssgiFx.isGTAOEnabled(),
                 setEnabled: (enabled) => ssgiFx.setGTAOEnabled(enabled),
@@ -10428,8 +10428,8 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 key: 'bloom',
                 title: 'Bloom',
                 copy: 'Highlights bleed for emissive and high-energy surfaces.',
-                note: 'Bloom works on WebGPU and WebGL fallback.',
-                requiresWebGPU: false,
+                note: 'Requires WebGPU or TSL_GL.',
+                requiresWebGPU: true,
                 isEnabled: () => ssgiFx.isBloomEnabled(),
                 setEnabled: (enabled) => ssgiFx.setBloomEnabled(enabled),
                 getValues: (state) => state.bloom,
@@ -10460,7 +10460,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 key: 'motionBlur',
                 title: 'Motion Blur',
                 copy: 'Velocity-based blur from camera and object motion in the current frame.',
-                note: 'Requires the real WebGPU backend.',
+                note: 'Requires WebGPU or TSL_GL.',
                 requiresWebGPU: true,
                 // Pixel FX takes the post-pass output; motion blur on top is meaningless
                 // (it would smear the pixelated image). Mutually exclusive.
@@ -10481,7 +10481,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 key: 'contactShadow',
                 title: 'Contact Shadows',
                 copy: 'Screen-space shadows for detailed close-range shadowing.',
-                note: 'Requires WebGPU and a DirectionalLight.',
+                note: 'Requires WebGPU or TSL_GL and a DirectionalLight.',
                 requiresWebGPU: true,
                 isEnabled: () => ssgiFx.isContactShadowEnabled(),
                 setEnabled: (enabled) => ssgiFx.setContactShadowEnabled(enabled),
@@ -10521,7 +10521,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 key: 'volumetric',
                 title: 'Volumetric Light',
                 copy: 'Ray-marched light scattering through fog volume. Reacts to scene lights.',
-                note: 'Requires the real WebGPU backend.',
+                note: 'Requires WebGPU or TSL_GL.',
                 requiresWebGPU: true,
                 isEnabled: () => ssgiFx.isVolumetricEnabled(),
                 setEnabled: (enabled) => ssgiFx.setVolumetricEnabled(enabled),
@@ -10570,7 +10570,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 key: 'dof',
                 title: 'Depth of Field',
                 copy: 'Physical camera DOF with bokeh blur. Auto-syncs from Max Physical Camera when enabled.',
-                note: 'Requires the real WebGPU backend. Enable DOF on the Physical Camera in Max for auto mode.',
+                note: 'Requires WebGPU or TSL_GL. Enable DOF on the Physical Camera in Max for auto mode.',
                 requiresWebGPU: true,
                 isEnabled: () => ssgiFx.isDofEnabled(),
                 setEnabled: (enabled) => ssgiFx.setDofEnabled(enabled),
@@ -11372,13 +11372,11 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             const derived = postPanelVisible ? ssgiFx.getDerivedState() : null;
             const available = ssgiFx.isAvailable();
             const supportsScreenSpaceEffects = ssgiFx.supportsScreenSpaceEffects();
-            const postFxInteractiveAvailable = rendererBackendLabel === 'WebGPU';
             const lastError = ssgiFx.getLastError();
             const signature = JSON.stringify({
                 panel: postPanelVisible,
                 available,
                 supportsScreenSpaceEffects,
-                postFxInteractiveAvailable,
                 lastError,
                 performanceSettings,
                 cameraClip,
@@ -11392,10 +11390,10 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
 
             const panelStatus = document.getElementById('postPanelStatus');
             if (panelStatus) {
-                panelStatus.textContent = !postFxInteractiveAvailable
-                    ? `${rendererBackendLabel} backend • Post FX disabled on WebGL`
-                    : available
-                    ? `${rendererBackendLabel} backend`
+                panelStatus.textContent = available
+                    ? (supportsScreenSpaceEffects
+                        ? `${rendererBackendLabel} backend`
+                        : `${rendererBackendLabel} backend • Common FX`)
                     : `${rendererBackendLabel} backend • ${lastError || 'unavailable'}`;
             }
 
@@ -11464,7 +11462,6 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 const enabled = section.isEnabled();
                 const disabledByOther = section.disabledBy ? section.disabledBy(state) : null;
                 const disabled =
-                    !postFxInteractiveAvailable ||
                     !available ||
                     (section.requiresWebGPU && !supportsScreenSpaceEffects) ||
                     !!disabledByOther;
@@ -11501,11 +11498,8 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 if (!available && lastError) {
                     note = lastError;
                     isError = true;
-                } else if (!postFxInteractiveAvailable) {
-                    note = 'Post FX is disabled on WebGL. Switch back to WebGPU to use these effects.';
-                    isError = true;
                 } else if (section.requiresWebGPU && !supportsScreenSpaceEffects) {
-                    note = 'Requires the real WebGPU backend.';
+                    note = 'Requires WebGPU or TSL_GL.';
                     isError = true;
                 } else if (disabledByOther) {
                     note = disabledByOther;
@@ -11649,8 +11643,6 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
 
         function applySavedPostFxPayload(saved) {
             try {
-                const supportsScreenSpaceEffects = ssgiFx.supportsScreenSpaceEffects();
-                const postFxInteractiveAvailable = rendererBackendLabel === 'WebGPU';
                 let toneMappingChanged = false;
                 if (saved.toneMapping && toneMappingModes[saved.toneMapping] != null) {
                     currentToneMapping = saved.toneMapping;
@@ -11664,10 +11656,10 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 if (saved.aaMode && ['msaa', 'traa', 'off'].includes(saved.aaMode)) {
                     // Legacy saved value: 'msaa' was a no-op alias for 'off' — normalize.
                     const loaded = saved.aaMode === 'msaa' ? 'off' : saved.aaMode;
-                    currentAAMode = (!postFxInteractiveAvailable || !supportsScreenSpaceEffects) && loaded === 'traa'
-                        ? 'off'
-                        : loaded;
-                    ssgiFx.setTRAAEnabled(currentAAMode === 'traa');
+                    currentAAMode = loaded;
+                    if (ssgiFx.supportsScreenSpaceEffects()) {
+                        ssgiFx.setTRAAEnabled(currentAAMode === 'traa');
+                    }
                 }
                 if (typeof saved.envVisible === 'boolean') {
                     envVisible = saved.envVisible;
@@ -11730,37 +11722,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 const fx = saved.fx;
                 if (!fx) return;
 
-                if (postFxInteractiveAvailable) {
-                    for (const section of postFxSections) {
-                        const saved = fx[section.key];
-                        if (!saved) continue;
-                        if (section.requiresWebGPU && !supportsScreenSpaceEffects) continue;
-                        const wasEnabled = saved.enabled;
-                        delete saved.enabled;
-                        // Apply values first (without triggering rebuild per-param)
-                        section.setValues(saved);
-                        // Then enable/disable
-                        if (wasEnabled) section.setEnabled(true);
-                    }
-                }
-
-                if (!postFxInteractiveAvailable || !supportsScreenSpaceEffects) {
-                    ssgiFx.sanitizeForCurrentBackend?.();
-                }
-
-                // Clone blob tracker restore
-                if (fx.clone) {
-                    const cl = fx.clone;
-                    const wasEnabled = cl.enabled;
-                    delete cl.enabled;
-                    ssgiFx.setCloneOptions(cl);
-                    if (wasEnabled) ssgiFx.setCloneEnabled(true);
-                }
-
-                // Global color grading restore
-                if (fx.colorGrading) {
-                    ssgiFx.setColorGrading(fx.colorGrading);
-                }
+                ssgiFx.restoreState?.(fx);
 
                 // ASCII restore
                 if (saved.ascii) {
@@ -11776,8 +11738,9 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 // it so the refresh keeps the effect on screen.
                 if (saved.shaderLab) {
                     setShaderLabSnapshot(saved.shaderLab);
+                    shaderLabFx.setState?.(saved.shaderLab);
                     if (saved.shaderLab.enabled && !shaderLabFx.isEnabled()) {
-                        shaderLabFx.enable(saved.shaderLab.config).catch(err => {
+                        shaderLabFx.enable(saved.shaderLab).catch(err => {
                             console.error('[ShaderLab] restore enable failed:', err);
                         });
                     }
@@ -12304,12 +12267,6 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                             delete obj.userData._xrSavedIntensity;
                         }
                     });
-                } else if (shaderLabFx.isEnabled()) {
-                    // Shader Lab mode bypasses ssgiFx entirely and runs its
-                    // own scene→target→shader-lab→fullscreen-quad pipeline.
-                    const nowS = performance.now() * 0.001;
-                    shaderLabFx.renderFrame(nowS, nowS - (shaderLabFx._lastT || nowS));
-                    shaderLabFx._lastT = nowS;
                 } else {
                     ssgiFx.render();
                 }

@@ -1,10 +1,9 @@
-// Shader Lab FX — bypass-ssgi post-processing mode.
+// Shader Lab FX — optional custom pass for the MaxJS post-FX controller.
 //
-// When enabled, MaxJS's main render loop skips ssgiFx.render() and calls
-// shaderLabFx.renderFrame() instead. The scene renders to an internal
-// renderer render target, that target's texture is piped into shader-lab's
-// postprocessing pipeline, and the output is blitted to the canvas via a
-// fullscreen quad. No ssgiFx modifications — it's a parallel path.
+// The main render loop always routes through ssgiFx.render(). When Shader Lab
+// is enabled, ssgiFx renders its native stack to a texture and lets this module
+// consume that texture as a final custom pass. This keeps SSGI / SSR / GTAO /
+// bloom / DOF / tone output in front of Shader Lab instead of bypassing it.
 //
 // shader-lab is React-only (useShaderLab hook) so we spin up a hidden
 // React root whose sole purpose is to hold the hook instance and hand
@@ -12,9 +11,8 @@
 // render loop drives it from there.
 //
 // Known costs:
-//   - Loses SSGI / SSR / GTAO / bloom / DOF / tone-mapping in this mode
 //   - React + shader-lab loaded from esm.sh on first enable (needs net)
-//   - Extra render target for the scene pass
+//   - One extra render target only while Shader Lab is active
 
 let _loadPromise = null;
 
@@ -71,6 +69,67 @@ const DEFAULT_COMPOSITION = {
     timeline: { duration: 6, loop: true, tracks: [] },
 };
 
+const DEFAULT_PASS = {
+    id: 'legacy-main',
+    enabled: false,
+    slot: 'finalStylize',
+    requires: ['color'],
+    config: DEFAULT_COMPOSITION,
+};
+
+const VALID_SLOTS = new Set(['preGrade', 'postLighting', 'finalStylize', 'depthStylize']);
+const VALID_INPUTS = new Set(['color', 'depth', 'normal', 'motion']);
+
+function isCompositionConfig(value) {
+    return !!value && typeof value === 'object' && (
+        Array.isArray(value.layers) ||
+        !!value.composition ||
+        !!value.timeline
+    );
+}
+
+function normalizeRequires(requires) {
+    if (!Array.isArray(requires)) return ['color'];
+    const result = requires.filter(item => VALID_INPUTS.has(item));
+    return result.length ? [...new Set(result)] : ['color'];
+}
+
+function normalizePass(pass, fallback = DEFAULT_PASS) {
+    const source = pass && typeof pass === 'object' ? pass : {};
+    const config = isCompositionConfig(source.config)
+        ? source.config
+        : isCompositionConfig(source)
+        ? source
+        : fallback.config || DEFAULT_COMPOSITION;
+    return {
+        id: typeof source.id === 'string' && source.id ? source.id : fallback.id || 'legacy-main',
+        enabled: source.enabled != null ? !!source.enabled : !!fallback.enabled,
+        slot: VALID_SLOTS.has(source.slot) ? source.slot : fallback.slot || 'finalStylize',
+        requires: normalizeRequires(source.requires || fallback.requires),
+        config,
+    };
+}
+
+function normalizeState(input, fallbackConfig = DEFAULT_COMPOSITION) {
+    if (isCompositionConfig(input)) {
+        return {
+            config: input,
+            passes: [{ ...DEFAULT_PASS, enabled: true, config: input }],
+        };
+    }
+    const source = input && typeof input === 'object' ? input : {};
+    const config = isCompositionConfig(source.config) ? source.config : fallbackConfig;
+    const fallbackPass = {
+        ...DEFAULT_PASS,
+        enabled: !!source.enabled,
+        config,
+    };
+    const passes = Array.isArray(source.passes) && source.passes.length
+        ? source.passes.map(pass => normalizePass(pass, fallbackPass))
+        : [fallbackPass];
+    return { config, passes };
+}
+
 export function createShaderLabFx({ THREE, renderer, scene, camera }) {
     let activeCamera = camera;
     let enabled = false;
@@ -84,6 +143,7 @@ export function createShaderLabFx({ THREE, renderer, scene, camera }) {
     let displayMaterial = null;
     let displayQuad = null;
     let currentConfig = DEFAULT_COMPOSITION;
+    let currentPasses = [{ ...DEFAULT_PASS }];
     let configKey = 0;
     let errorText = '';
     let loading = false;
@@ -174,7 +234,25 @@ export function createShaderLabFx({ THREE, renderer, scene, camera }) {
         } catch (_) { /* ignore */ }
     }
 
-    async function enable(config) {
+    function getActivePass(slot = 'finalStylize') {
+        return currentPasses.find(pass => pass.enabled && pass.slot === slot) || null;
+    }
+
+    function getUnavailableReason(inputs = {}) {
+        if (!enabled) return 'Shader Lab disabled';
+        const slot = inputs.slot || 'finalStylize';
+        const pass = getActivePass(slot);
+        if (!pass) return `No enabled Shader Lab pass for ${slot}`;
+        const missing = pass.requires.filter(name => !inputs[name]);
+        if (missing.length) return `Shader Lab pass missing ${missing.join(', ')}`;
+        return '';
+    }
+
+    function canRenderWithInputs(inputs = {}) {
+        return getUnavailableReason({ color: true, slot: 'finalStylize', ...inputs }) === '';
+    }
+
+    async function enable(configOrState) {
         if (enabled) return;
         if (loading) return;
         loading = true;
@@ -182,9 +260,14 @@ export function createShaderLabFx({ THREE, renderer, scene, camera }) {
         try {
             const { React, ReactDOMClient, useShaderLab } = await loadShaderLab();
             _React = React;
-            currentConfig = config || DEFAULT_COMPOSITION;
+            const normalized = normalizeState(configOrState, currentConfig);
+            currentConfig = normalized.config;
+            currentPasses = normalized.passes.map(pass => ({
+                ...pass,
+                enabled: pass.enabled || pass.id === 'legacy-main',
+                config: pass.config || normalized.config,
+            }));
             configKey++;
-            ensureTarget();
             ensureDisplayQuad();
 
             BridgeComponent = function Bridge({ config: cfg }) {
@@ -212,6 +295,9 @@ export function createShaderLabFx({ THREE, renderer, scene, camera }) {
             reactRoot.render(React.createElement(BridgeComponent, { config: currentConfig, key: configKey }));
 
             enabled = true;
+            currentPasses = currentPasses.map(pass =>
+                pass.id === 'legacy-main' ? { ...pass, enabled: true, config: currentConfig } : pass
+            );
             loading = false;
             emitStateChange();
         } catch (err) {
@@ -230,6 +316,7 @@ export function createShaderLabFx({ THREE, renderer, scene, camera }) {
         if (!enabled) return;
         enabled = false;
         lastOutputTex = null;
+        currentPasses = currentPasses.map(pass => ({ ...pass, enabled: false }));
         cleanupResources();
         emitStateChange();
     }
@@ -239,15 +326,92 @@ export function createShaderLabFx({ THREE, renderer, scene, camera }) {
 
     async function setConfig(config) {
         currentConfig = config || DEFAULT_COMPOSITION;
+        currentPasses = currentPasses.map(pass =>
+            pass.id === 'legacy-main' || pass.slot === 'finalStylize'
+                ? { ...pass, config: currentConfig }
+                : pass
+        );
         if (!enabled || !_React || !reactRoot) return;
         configKey++;
         reactRoot.render(_React.createElement(BridgeComponent, { config: currentConfig, key: configKey }));
     }
 
-    // Main render path when enabled. Called from the frame loop in place
-    // of ssgiFx.render().
+    function setPasses(passes) {
+        const normalized = normalizeState({ config: currentConfig, passes }, currentConfig);
+        currentPasses = normalized.passes;
+        const finalPass = getActivePass('finalStylize') || currentPasses.find(pass => pass.slot === 'finalStylize');
+        if (finalPass?.config) {
+            currentConfig = finalPass.config;
+            void setConfig(currentConfig);
+        }
+    }
+
+    function getPasses() {
+        return currentPasses.map(pass => ({
+            ...pass,
+            requires: [...pass.requires],
+            config: pass.config,
+        }));
+    }
+
+    function setState(snapshot) {
+        const normalized = normalizeState(snapshot, currentConfig);
+        currentConfig = normalized.config;
+        currentPasses = normalized.passes;
+        if (enabled && _React && reactRoot) {
+            void setConfig(currentConfig);
+        }
+    }
+
+    // Integrated render path. ssgiFx owns the native render stack and passes
+    // its final texture here only when Shader Lab has a compatible final pass.
     let lastOutputTex = null;
 
+    function blitTexture(texture, outputTarget = null) {
+        ensureDisplayQuad();
+        if (!texture || !displayMaterial) return false;
+        if (displayMaterial.map !== texture) {
+            displayMaterial.map = texture;
+            displayMaterial.needsUpdate = true;
+        }
+        renderer.setRenderTarget(outputTarget);
+        renderer.render(displayScene, displayCamera);
+        return true;
+    }
+
+    function renderTexture(inputTexture, elapsedTime, delta, options = {}) {
+        const inputs = { color: true, slot: 'finalStylize', ...(options.inputs || {}) };
+        const unavailable = getUnavailableReason(inputs);
+        if (unavailable) {
+            errorText = unavailable;
+            return false;
+        }
+        if (!ready || !postprocessing) {
+            return blitTexture(inputTexture, options.outputTarget || null);
+        }
+        try {
+            const output = postprocessing.render(
+                inputTexture,
+                elapsedTime,
+                delta
+            );
+
+            const outputTex = output?.isTexture ? output : output?.texture ?? output;
+            if (outputTex) {
+                lastOutputTex = outputTex;
+                return blitTexture(outputTex, options.outputTarget || null);
+            }
+            return blitTexture(inputTexture, options.outputTarget || null);
+        } catch (err) {
+            errorText = err?.message || String(err);
+            console.error('[shader-lab-fx] frame render failed:', err);
+            return blitTexture(inputTexture, options.outputTarget || null);
+        }
+    }
+
+    // Backward-compatible fallback for old callers. The MaxJS frame loop no
+    // longer uses this path, but keeping it prevents stale debug hooks from
+    // hard-failing during development.
     function renderFrame(elapsedTime, delta) {
         if (!enabled || !ready || !postprocessing) {
             renderer.render(scene, activeCamera);
@@ -258,27 +422,11 @@ export function createShaderLabFx({ THREE, renderer, scene, camera }) {
             renderer.setRenderTarget(sceneTarget);
             renderer.render(scene, activeCamera);
             renderer.setRenderTarget(null);
-
-            const output = postprocessing.render(
-                sceneTarget.texture,
-                elapsedTime,
-                delta
-            );
-
-            const outputTex = output?.isTexture ? output : output?.texture ?? output;
-            if (outputTex && displayMaterial) {
-                if (displayMaterial.map !== outputTex) {
-                    displayMaterial.map = outputTex;
-                    displayMaterial.needsUpdate = true;
-                    lastOutputTex = outputTex;
-                }
-                renderer.render(displayScene, displayCamera);
-            } else {
-                renderer.render(scene, activeCamera);
-            }
+            renderTexture(sceneTarget.texture, elapsedTime, delta);
         } catch (err) {
             errorText = err?.message || String(err);
-            console.error('[shader-lab-fx] frame render failed:', err);
+            console.error('[shader-lab-fx] legacy frame render failed:', err);
+            renderer.setRenderTarget(null);
             renderer.render(scene, activeCamera);
         }
     }
@@ -292,6 +440,12 @@ export function createShaderLabFx({ THREE, renderer, scene, camera }) {
         enable,
         disable,
         setConfig,
+        setPasses,
+        getPasses,
+        setState,
+        canRenderWithInputs,
+        getUnavailableReason,
+        renderTexture,
         renderFrame,
         resize,
         setCamera(nextCamera) { if (nextCamera) activeCamera = nextCamera; },

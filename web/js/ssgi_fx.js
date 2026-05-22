@@ -81,6 +81,7 @@ export function createSSGIController({
     renderer,
     scene,
     camera,
+    shaderLabFx = null,
     backendLabel = '',
     onError = () => {},
     environmentVisible = true,
@@ -89,7 +90,8 @@ export function createSSGIController({
     const PipelineCtor = THREE.RenderPipeline || THREE.PostProcessing;
     const postProcessing = new PipelineCtor(renderer);
     const emptyOutputNode = vec4(0, 0, 0, 0);
-    const supportsScreenSpaceEffects = backendLabel === 'WebGPU';
+    const supportsScreenSpaceEffects = backendLabel === 'WebGPU' || backendLabel === 'TSL_GL';
+    const supportsTslPostEffects = supportsScreenSpaceEffects;
     const SSR_REFERENCE_SIZE = 6.0;
     const hiddenBackground = new THREE.Color(hiddenBackgroundColor);
     const hiddenBackgroundNode = vec3(hiddenBackground.r, hiddenBackground.g, hiddenBackground.b);
@@ -293,6 +295,9 @@ export function createSSGIController({
     let activeSSRPass = null;
     let activeAOPass = null;
     let activeContactShadowPass = null;
+    let activeShaderLabFx = shaderLabFx;
+    let shaderLabInputTarget = null;
+    let lastShaderLabFrameTime = 0;
     const dofFocusDistanceU = uniform(100);
     const dofFocalLengthU = uniform(50);
     const dofBokehScaleU = uniform(5);
@@ -316,23 +321,46 @@ export function createSSGIController({
     const BLOB_MATCH_DIST = 0.3;    // max centroid distance to match (normalized)
     const BLOB_FADE_FRAMES = 8;     // frames before an unmatched blob disappears
 
-    function disableUnsupportedRealtimeEffects() {
+    function cleanupUnsupportedRealtimeResources() {
         if (supportsScreenSpaceEffects) return;
-        state.ssgi.enabled = false;
-        state.ssr.enabled = false;
-        state.gtao.enabled = false;
-        state.motionBlur.enabled = false;
-        state.traa.enabled = false;
-        state.bloom.enabled = false;
-        state.toonOutline.enabled = false;
-        state.contactShadow.enabled = false;
-        state.retro.enabled = false;
-        state.pixel.enabled = false;
-        state.volumetric.enabled = false;
-        state.dof.enabled = false;
-        state.fog.enabled = false;
-        state.opaqueBackdrop.enabled = false;
-        state.clone.enabled = false;
+        restoreForcedContactShadowLight();
+        removeVolumetricMesh();
+        activeContactShadowPass = null;
+    }
+
+    function isScreenSpaceActive(key) {
+        return supportsScreenSpaceEffects && !!state[key]?.enabled;
+    }
+
+    function isSSRActive() {
+        return supportsTslPostEffects && !!state.ssr.enabled;
+    }
+
+    function isContactShadowActive() {
+        return supportsScreenSpaceEffects && !!state.contactShadow.enabled && !!mainLight;
+    }
+
+    function isToonOutlineActive() {
+        return supportsScreenSpaceEffects && !!state.toonOutline.enabled;
+    }
+
+    function isBloomActive() {
+        return supportsTslPostEffects && !!state.bloom.enabled;
+    }
+
+    function getShaderLabInputs() {
+        return {
+            color: true,
+            depth: false,
+            normal: false,
+            motion: false,
+            slot: 'finalStylize',
+        };
+    }
+
+    function hasShaderLabPassEnabled() {
+        return !!activeShaderLabFx?.isEnabled?.()
+            && activeShaderLabFx.canRenderWithInputs?.(getShaderLabInputs()) !== false;
     }
 
     function matchAndSmooth(rawBlobs) {
@@ -715,19 +743,20 @@ export function createSSGIController({
     }
 
     function hasPipelineEffectEnabled() {
-        return state.ssgi.enabled || state.ssr.enabled || state.gtao.enabled || state.motionBlur.enabled || state.traa.enabled || state.bloom.enabled
-            || (state.toonOutline.enabled && cachedHasToonMeshes)
-            || (state.contactShadow.enabled && mainLight)
+        return isScreenSpaceActive('ssgi') || isSSRActive() || isScreenSpaceActive('gtao')
+            || isScreenSpaceActive('motionBlur') || isScreenSpaceActive('traa') || isBloomActive()
+            || (isToonOutlineActive() && cachedHasToonMeshes)
+            || isContactShadowActive()
             || state.retro.enabled
             || state.pixel.enabled
-            || state.volumetric.enabled
-            || state.dof.enabled
+            || isScreenSpaceActive('volumetric')
+            || isScreenSpaceActive('dof')
             || state.fog.enabled
             || state.opaqueBackdrop.enabled;
     }
 
     function hasAnyEffectEnabled() {
-        return hasPipelineEffectEnabled();
+        return hasPipelineEffectEnabled() || hasShaderLabPassEnabled();
     }
 
     function syncCanvasColorGrading() {
@@ -783,7 +812,6 @@ export function createSSGIController({
     }
 
     function snapshotState() {
-        disableUnsupportedRealtimeEffects();
         return {
             ssgi: { ...state.ssgi },
             ssr: { ...state.ssr },
@@ -802,6 +830,33 @@ export function createSSGIController({
             clone: { ...state.clone, color: [...state.clone.color] },  // blob tracker (CPU-only, no GPU pipeline)
             colorGrading: { ...state.colorGrading },
         };
+    }
+
+    function restoreStateSnapshot(fx = {}) {
+        const keys = [
+            'ssgi', 'ssr', 'gtao', 'motionBlur', 'traa', 'bloom',
+            'toonOutline', 'contactShadow', 'retro', 'fog', 'pixel',
+            'volumetric', 'dof', 'opaqueBackdrop', 'clone', 'colorGrading',
+        ];
+        for (const key of keys) {
+            const source = fx[key];
+            if (!source || typeof source !== 'object') continue;
+            state[key] = { ...state[key], ...source };
+        }
+        if (Array.isArray(fx.toonOutline?.color)) {
+            state.toonOutline.color = [...fx.toonOutline.color];
+        }
+        if (Array.isArray(fx.fog?.color)) {
+            state.fog.color = [...fx.fog.color];
+        }
+        if (Array.isArray(fx.clone?.color)) {
+            state.clone.color = [...fx.clone.color];
+        }
+        colorGradingBrightnessU.value = state.colorGrading.brightness;
+        colorGradingContrastU.value = state.colorGrading.contrast;
+        cleanupUnsupportedRealtimeResources();
+        rebuildPipeline();
+        return snapshotState();
     }
 
     // ── Fog — applied via scene.fogNode (independent of post-processing) ──
@@ -884,6 +939,45 @@ export function createSSGIController({
         }
 
         snapshotRendererOutputState();
+    }
+
+    function ensureShaderLabInputTarget() {
+        readRendererDrawBufferSize(rendererDrawBufferSize);
+        const width = Math.max(1, Math.round(rendererDrawBufferSize.x || renderer.domElement?.width || 1));
+        const height = Math.max(1, Math.round(rendererDrawBufferSize.y || renderer.domElement?.height || 1));
+        activeShaderLabFx?.resize?.(width, height);
+        if (shaderLabInputTarget && shaderLabInputTarget.width === width && shaderLabInputTarget.height === height) {
+            return shaderLabInputTarget;
+        }
+        try { shaderLabInputTarget?.dispose?.(); } catch (_) {}
+        shaderLabInputTarget = new THREE.RenderTarget(width, height, {
+            type: THREE.HalfFloatType,
+            colorSpace: THREE.LinearSRGBColorSpace,
+            depthBuffer: true,
+            stencilBuffer: false,
+        });
+        return shaderLabInputTarget;
+    }
+
+    function renderShaderLabFinal(renderNativeToCurrentTarget) {
+        if (!hasShaderLabPassEnabled()) return false;
+        const target = ensureShaderLabInputTarget();
+        const previousTarget = renderer.getRenderTarget?.() || null;
+        const now = performance.now() * 0.001;
+        const delta = lastShaderLabFrameTime > 0 ? now - lastShaderLabFrameTime : 0;
+        lastShaderLabFrameTime = now;
+
+        try {
+            renderer.setRenderTarget(target);
+            renderNativeToCurrentTarget();
+        } finally {
+            renderer.setRenderTarget(previousTarget);
+        }
+
+        return activeShaderLabFx.renderTexture?.(target.texture, now, delta, {
+            inputs: getShaderLabInputs(),
+            outputTarget: previousTarget,
+        }) === true;
     }
 
     function flushPendingPipelineUpdates() {
@@ -1216,9 +1310,10 @@ export function createSSGIController({
         refreshToonMeshCache();
         refreshPostPassHideList();
         ensureMainLightSupportsContactShadow();
-        if (!state.volumetric.enabled) removeVolumetricMesh();
+        cleanupUnsupportedRealtimeResources();
+        if (!isScreenSpaceActive('volumetric')) removeVolumetricMesh();
 
-        if (!hasAnyEffectEnabled() || !available) {
+        if (!hasPipelineEffectEnabled() || !available) {
             pipelineReady = false;
             disablePS1Wiggle();
             restoreForcedContactShadowLight();
@@ -1238,10 +1333,10 @@ export function createSSGIController({
             syncSharedSceneEffects(true);
 
             const useSharedPrePass =
-                state.gtao.enabled ||
-                state.motionBlur.enabled ||
-                state.traa.enabled ||
-                (state.contactShadow.enabled && mainLight);
+                isScreenSpaceActive('gtao') ||
+                isScreenSpaceActive('motionBlur') ||
+                isScreenSpaceActive('traa') ||
+                isContactShadowActive();
 
             let prePassDepth = null;
             let prePassNormal = null;
@@ -1249,7 +1344,7 @@ export function createSSGIController({
 
             if (useSharedPrePass) {
                 // TRAA copies depth — MSAA sample count must be 1 to avoid mismatch
-                const prePass = state.traa.enabled
+                const prePass = isScreenSpaceActive('traa')
                     ? pass(scene, camera, { samples: 1 })
                     : pass(scene, camera);
                 activeNodes.push(prePass);
@@ -1269,9 +1364,9 @@ export function createSSGIController({
             }
 
             let sceneContext = null;
-            if (state.contactShadow.enabled && mainLight && prePassDepth) {
+            if (isContactShadowActive() && prePassDepth) {
                 const derived = computeDerivedState();
-                const contactShadowTemporal = state.contactShadow.temporal && state.traa.enabled;
+                const contactShadowTemporal = state.contactShadow.temporal && isScreenSpaceActive('traa');
                 const sssPass = sss(prePassDepth, camera, mainLight);
                 sssPass.maxDistance.value = derived.effectiveContactShadowMaxDistance;
                 sssPass.thickness.value = derived.effectiveContactShadowThickness;
@@ -1293,7 +1388,7 @@ export function createSSGIController({
                 !!scene.environment && !environmentVisible;
             const useEnvironmentBackdropCompensation =
                 hiddenEnvironmentBackdrop
-                && (state.ssr.enabled || state.fog.enabled || state.opaqueBackdrop.enabled);
+                && (isSSRActive() || state.fog.enabled || state.opaqueBackdrop.enabled);
 
             let beauty;
             let scenePassNode = null;
@@ -1306,7 +1401,7 @@ export function createSSGIController({
                     roughness.oneMinus().mul(0.35).add(float(0.04))
                 ).mul(roughness.smoothstep(0.85, 0.75));
 
-                if (state.gtao.enabled && prePassDepth && prePassNormal) {
+                if (isScreenSpaceActive('gtao') && prePassDepth && prePassNormal) {
                     const aoPass = ao(prePassDepth, prePassNormal, camera);
                     aoPass.samples.value = state.gtao.samples;
                     aoPass.distanceExponent.value = state.gtao.distanceExponent;
@@ -1315,7 +1410,7 @@ export function createSSGIController({
                     aoPass.scale.value = state.gtao.scale;
                     aoPass.thickness.value = derived.effectiveGTAOThickness;
                     aoPass.resolutionScale = state.gtao.resolutionScale;
-                    aoPass.useTemporalFiltering = state.traa.enabled;
+                    aoPass.useTemporalFiltering = isScreenSpaceActive('traa');
                     activeNodes.push(aoPass);
                     activeAOPass = aoPass;
 
@@ -1324,7 +1419,7 @@ export function createSSGIController({
                 }
 
                 // Use toonOutlinePass as scene pass when toon materials exist — outlines + MRT
-                const useToonPass = state.toonOutline.enabled && getToonMeshes().length > 0;
+                const useToonPass = isToonOutlineActive() && getToonMeshes().length > 0;
                 const toc = state.toonOutline;
                 const scenePass = useToonPass
                     ? toonOutlinePass(scene, camera,
@@ -1358,7 +1453,7 @@ export function createSSGIController({
                 ssrReflectivity = scenePassMetalRough.r;
             }
 
-            if (state.ssgi.enabled) {
+            if (isScreenSpaceActive('ssgi')) {
                 const ssgiPass = ssgi(scenePassColor, scenePassDepth, sceneNormal, camera);
                 ssgiPass.sliceCount.value = state.ssgi.sliceCount;
                 ssgiPass.stepCount.value = state.ssgi.stepCount;
@@ -1379,7 +1474,7 @@ export function createSSGIController({
                 );
             }
 
-            if (state.ssr.enabled) {
+            if (isSSRActive()) {
                 const derived = computeDerivedState();
                 const ssrPass = ssr(
                     scenePassColor,
@@ -1403,7 +1498,7 @@ export function createSSGIController({
                 beauty = vec4(max(beauty.rgb, ssrBlended.rgb), beauty.a);
             }
 
-            if (state.bloom.enabled) {
+            if (isBloomActive()) {
                 const bloomPass = bloom(
                     beauty,
                     state.bloom.strength,
@@ -1415,7 +1510,7 @@ export function createSSGIController({
                 beauty = vec4(beauty.rgb.add(bloomPass.rgb), max(beauty.a, bloomLuma));
             }
 
-            if (state.dof.enabled && scenePassNode) {
+            if (isScreenSpaceActive('dof') && scenePassNode) {
                 dofFocusDistanceU.value = state.dof.focusDistance;
                 dofFocalLengthU.value = state.dof.focalLength;
                 dofBokehScaleU.value = state.dof.bokehScale;
@@ -1430,7 +1525,7 @@ export function createSSGIController({
             // toonOutlinePass replaces pass() so MRT + SSGI/SSR/Bloom all stack on top.
 
             // ── Volumetric Lighting ──
-            if (state.volumetric.enabled && supportsScreenSpaceEffects) {
+            if (isScreenSpaceActive('volumetric')) {
                 try {
                     ensureVolumetricMesh();
                     volDensityU.value = state.volumetric.density;
@@ -1454,7 +1549,7 @@ export function createSSGIController({
                 }
             }
 
-            if (state.traa.enabled && prePassDepth && prePassVelocity) {
+            if (isScreenSpaceActive('traa') && prePassDepth && prePassVelocity) {
                 const traaInput = convertToTexture(beauty);
                 activeNodes.push(traaInput);
 
@@ -1467,7 +1562,7 @@ export function createSSGIController({
                 beauty = traaPass;
             }
 
-            if (state.motionBlur.enabled && prePassVelocity) {
+            if (isScreenSpaceActive('motionBlur') && prePassVelocity) {
                 const motionBlurInput = convertToTexture(beauty);
                 activeNodes.push(motionBlurInput);
                 beauty = motionBlur(
@@ -1682,9 +1777,10 @@ export function createSSGIController({
         },
         setEnabled(enabled) {
             if (enabled && !supportsScreenSpaceEffects) {
-                lastError = 'SSGI requires the real WebGPU backend';
-                state.ssgi.enabled = false;
+                lastError = 'SSGI requires WebGPU or TSL_GL';
                 onError(lastError);
+                state.ssgi.enabled = true;
+                rebuildPipeline();
                 return false;
             }
             state.ssgi.enabled = !!enabled && available;
@@ -1707,10 +1803,11 @@ export function createSSGIController({
             return state.ssr.enabled;
         },
         setSSREnabled(enabled) {
-            if (enabled && !supportsScreenSpaceEffects) {
-                lastError = 'SSR requires the real WebGPU backend';
-                state.ssr.enabled = false;
+            if (enabled && !supportsTslPostEffects) {
+                lastError = 'SSR requires WebGPU or TSL_GL';
                 onError(lastError);
+                state.ssr.enabled = true;
+                rebuildPipeline();
                 return false;
             }
             state.ssr.enabled = !!enabled && available;
@@ -1731,9 +1828,10 @@ export function createSSGIController({
         },
         setGTAOEnabled(enabled) {
             if (enabled && !supportsScreenSpaceEffects) {
-                lastError = 'GTAO requires the real WebGPU backend';
-                state.gtao.enabled = false;
+                lastError = 'GTAO requires WebGPU or TSL_GL';
                 onError(lastError);
+                state.gtao.enabled = true;
+                rebuildPipeline();
                 return false;
             }
             state.gtao.enabled = !!enabled && available;
@@ -1756,9 +1854,10 @@ export function createSSGIController({
         },
         setMotionBlurEnabled(enabled) {
             if (enabled && !supportsScreenSpaceEffects) {
-                lastError = 'Motion blur requires the real WebGPU backend';
-                state.motionBlur.enabled = false;
+                lastError = 'Motion blur requires WebGPU or TSL_GL';
                 onError(lastError);
+                state.motionBlur.enabled = true;
+                rebuildPipeline();
                 return false;
             }
             state.motionBlur.enabled = !!enabled && available;
@@ -1776,9 +1875,10 @@ export function createSSGIController({
         },
         setTRAAEnabled(enabled) {
             if (enabled && !supportsScreenSpaceEffects) {
-                lastError = 'TRAA requires the real WebGPU backend';
-                state.traa.enabled = false;
+                lastError = 'TRAA requires WebGPU or TSL_GL';
                 onError(lastError);
+                state.traa.enabled = true;
+                rebuildPipeline();
                 return false;
             }
             state.traa.enabled = !!enabled && available;
@@ -1855,6 +1955,13 @@ export function createSSGIController({
             return state.bloom.enabled;
         },
         setBloomEnabled(enabled) {
+            if (enabled && !supportsTslPostEffects) {
+                lastError = 'Bloom requires WebGPU or TSL_GL';
+                onError(lastError);
+                state.bloom.enabled = true;
+                rebuildPipeline();
+                return false;
+            }
             state.bloom.enabled = !!enabled && available;
             rebuildPipeline();
             return state.bloom.enabled;
@@ -1871,9 +1978,10 @@ export function createSSGIController({
         },
         setToonOutlineEnabled(enabled) {
             if (enabled && !supportsScreenSpaceEffects) {
-                lastError = 'Toon outline requires the real WebGPU backend';
-                state.toonOutline.enabled = false;
+                lastError = 'Toon outline requires WebGPU or TSL_GL';
                 onError(lastError);
+                state.toonOutline.enabled = true;
+                rebuildPipeline();
                 return false;
             }
             state.toonOutline.enabled = !!enabled;
@@ -1892,9 +2000,10 @@ export function createSSGIController({
         },
         setContactShadowEnabled(enabled) {
             if (enabled && !supportsScreenSpaceEffects) {
-                lastError = 'Contact shadows require the real WebGPU backend';
-                state.contactShadow.enabled = false;
+                lastError = 'Contact shadows require WebGPU or TSL_GL';
                 onError(lastError);
+                state.contactShadow.enabled = true;
+                rebuildPipeline();
                 return false;
             }
             if (enabled && !mainLight) {
@@ -2001,9 +2110,10 @@ export function createSSGIController({
         },
         setDofEnabled(enabled) {
             if (enabled && !supportsScreenSpaceEffects) {
-                lastError = 'DOF requires the real WebGPU backend';
-                state.dof.enabled = false;
+                lastError = 'DOF requires WebGPU or TSL_GL';
                 onError(lastError);
+                state.dof.enabled = true;
+                rebuildPipeline();
                 return false;
             }
             state.dof.enabled = !!enabled && available;
@@ -2059,9 +2169,10 @@ export function createSSGIController({
         },
         setVolumetricEnabled(enabled) {
             if (enabled && !supportsScreenSpaceEffects) {
-                lastError = 'Volumetric lighting requires the real WebGPU backend';
-                state.volumetric.enabled = false;
+                lastError = 'Volumetric lighting requires WebGPU or TSL_GL';
                 onError(lastError);
+                state.volumetric.enabled = true;
+                rebuildPipeline();
                 return false;
             }
             state.volumetric.enabled = !!enabled && available;
@@ -2203,13 +2314,24 @@ export function createSSGIController({
             return { ...state.clone };
         },
         sanitizeForCurrentBackend() {
-            disableUnsupportedRealtimeEffects();
-            if (!supportsScreenSpaceEffects) {
-                restoreForcedContactShadowLight();
-                removeVolumetricMesh();
-            }
+            cleanupUnsupportedRealtimeResources();
             rebuildPipeline();
             return snapshotState();
+        },
+        restoreState(fx = {}) {
+            return restoreStateSnapshot(fx);
+        },
+        setShaderLabFx(fx) {
+            activeShaderLabFx = fx || null;
+        },
+        getCapabilities() {
+            return {
+                backendLabel,
+                screenSpace: supportsScreenSpaceEffects,
+                tslPostEffects: supportsTslPostEffects,
+                commonPostFx: true,
+                shaderLab: !!activeShaderLabFx,
+            };
         },
 
         // Hot-swap the camera used by every pass/effect node. Callers hit
@@ -2235,8 +2357,15 @@ export function createSSGIController({
                 pixelTimer.value = performance.now() * 0.001;
             }
 
-            if (!hasAnyEffectEnabled() || !pipelineReady) {
-                renderer.render(scene, camera);
+            const shaderLabActive = hasShaderLabPassEnabled();
+
+            if (!hasPipelineEffectEnabled() || !pipelineReady) {
+                if (shaderLabActive) {
+                    const consumed = renderShaderLabFinal(() => renderer.render(scene, camera));
+                    if (!consumed) renderer.render(scene, camera);
+                } else {
+                    renderer.render(scene, camera);
+                }
                 // Clone blob analysis still runs even without post-processing pipeline
                 if (state.clone.enabled && blobCtx) {
                     if (++blobSkip >= 2) { blobSkip = 0; analyzeBlobsFromCanvas(); }
@@ -2251,10 +2380,15 @@ export function createSSGIController({
                     scene.background = scene.environment;
                 }
                 updateActiveScreenSpaceParams();
-                if (state.volumetric.enabled && supportsScreenSpaceEffects) {
+                if (isScreenSpaceActive('volumetric')) {
                     syncVolumetricLightLayers();
                 }
-                postProcessing.render();
+                if (shaderLabActive) {
+                    const consumed = renderShaderLabFinal(() => postProcessing.render());
+                    if (!consumed) postProcessing.render();
+                } else {
+                    postProcessing.render();
+                }
             } catch (error) {
                 restoreSceneAfterPostPass();
                 disableWithError('Post pipeline render failed', error);

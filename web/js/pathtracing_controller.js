@@ -699,6 +699,7 @@ export function createPathTracingController({
         // raster MaxJS NodeMaterials, so we must NOT fall back to
         // `renderer.render(scene, camera)`; we claim the frame instead.
         try { renderer.clear(true, true, true); } catch {}
+        return true;
     }
 
     function render() {
@@ -706,15 +707,15 @@ export function createPathTracingController({
         if (!hasLegacyWebGLRenderer()) return false;
 
         if (!tracer && !ensureTracer()) {
-            return false;
+            return clearFrame();
         }
         if (sceneDirty) {
             if (shouldRebuildSceneNow()) {
                 if (!rebuildScene()) {
-                    return hasSceneBuilt;
+                    return hasSceneBuilt || clearFrame();
                 }
             } else if (!hasSceneBuilt) {
-                return false;
+                return clearFrame();
             }
         }
         try {
@@ -810,6 +811,8 @@ export function createPathTracingController({
     return {
         isEnabled,
         isStarted,
+        preload: loadModule,
+        clearFrame,
         start,
         isSupported,
         render,

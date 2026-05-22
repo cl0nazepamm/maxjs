@@ -79,7 +79,7 @@
     }
     syncPovLabel();
 
-    // Mirror the active renderer pipeline (WebGL / WGPU / TSL_GL) into the
+    // Mirror the active renderer pipeline (WebGL / WGPU) into the
     // Standard trigger label. The app marks the active pipeline button with
     // `.active`; we read its short name straight off the segmented switch.
     var pipeSwitch = document.getElementById('rendererPipelineSwitch');

@@ -90,7 +90,12 @@
                     <div id="rendererPipelineSwitch" class="rail-mode-switch" role="group" aria-label="Renderer pipeline">
                         <button class="rail-mode-option" type="button" data-renderer-pipeline="webgl2" title="WebGL Mode">WebGL</button>
                         <button class="rail-mode-option" type="button" data-renderer-pipeline="webgpu" title="WebGPU Mode">WGPU</button>
-                        <button class="rail-mode-option" type="button" data-renderer-pipeline="webgl-fallback" title="TSL_GL Mode">TSL_GL</button>
+                    </div>
+                </div>
+                <div id="forceWebGLRow" class="vpmenu-row vpmenu-row-switch devonly">
+                    <span class="vpmenu-label">WebGPU</span>
+                    <div class="rail-mode-switch" role="group" aria-label="WebGPU options">
+                        <button id="btnForceWebGL" class="rail-mode-option" type="button" title="Run the WebGPU renderer stack through WebGL">Force WebGL</button>
                     </div>
                 </div>
                 <div class="vpmenu-row vpmenu-row-switch devonly">
@@ -561,9 +566,6 @@
 
         function readMaxjsRenderMode() {
             try {
-                const requestedBackend = sessionStorage.getItem('maxjs_renderer_backend')
-                    || localStorage.getItem(RENDERER_BACKEND_STORAGE_KEY);
-                if (requestedBackend === 'webgl2' || requestedBackend === 'webgl') return 'standard';
                 const value = localStorage.getItem(MAXJS_MODE_KEY);
                 return MAXJS_RENDER_MODES.includes(value) ? value : 'standard';
             } catch {
@@ -1068,6 +1070,9 @@
                 reportBridgeError('pathtracing', error);
             },
         });
+        if (isPathTracingMode || String(rendererBackendLabel || '') === 'WebGL Mode') {
+            pathTracingFx.preload?.();
+        }
         const PATH_TRACING_RASTER_WARMUP_FRAMES = 2;
         const PATH_TRACING_TEXTURE_WAIT_MS = 3000;
         const PATH_TRACING_CAPTURE_DEFAULT_SAMPLES = 32;
@@ -1101,6 +1106,10 @@
             const waitedMs = performance.now() - pathTracingWarmupStartedAt;
             if (pendingTextureLoads > 0 && waitedMs < PATH_TRACING_TEXTURE_WAIT_MS) return false;
             return true;
+        }
+
+        function renderPathTracingFallbackFrame() {
+            return pathTracingFx.clearFrame?.() === true;
         }
 
         function clearScheduledPathTracingLiveRebuild() {
@@ -3032,7 +3041,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         }
 
         // ── Local HDRI (independent of Max) ─────────────────
-        // Persist HDRI across page reloads (TSL_GL pipeline switch) via IndexedDB
+        // Persist HDRI across page reloads (Force WebGL pipeline switch) via IndexedDB
         const HDRI_DB_NAME = 'maxjs_hdri_cache';
         const HDRI_DB_STORE = 'files';
 
@@ -3236,7 +3245,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             cameraAltitude: 1200,
         });
         // Geospatial sky is supported by WebGPU and plain WebGL. Keep it out of
-        // TSL_GL because that forced-WebGL TSL path conflicts with post effects.
+        // Force WebGL because that TSL path conflicts with post effects.
         const useLegacySky = !(renderer instanceof THREE.WebGPURenderer);
         const allowGeospatialSky = rendererBackendLabel === 'WebGPU'
             || String(rendererBackendLabel || '').startsWith('WebGL');
@@ -9901,15 +9910,17 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
 
         const btnRenderer = document.getElementById('btnRenderer');
         const rendererPipelineSwitch = document.getElementById('rendererPipelineSwitch');
+        const btnForceWebGL = document.getElementById('btnForceWebGL');
+        const forceWebGLRow = document.getElementById('forceWebGLRow');
         const RENDERER_PIPELINE_LABELS = {
             webgl2: 'WebGL Mode',
             webgpu: 'WebGPU Mode',
-            'webgl-fallback': 'TSL_GL Mode',
+            'webgl-fallback': 'WebGPU Mode (Force WebGL)',
         };
         const RENDERER_PIPELINE_BADGES = {
             webgl2: 'WebGL',
             webgpu: 'WGPU',
-            'webgl-fallback': 'TSL_GL',
+            'webgl-fallback': 'WGPU',
         };
         const WEBGL_PIPELINE_CONFIRM_MESSAGE =
             'This is the simple WebGL pipeline. It is snapshot friendly, supported by every browser and has superior light probing. But you will lose rendering modes, TSL materials and the max.js post processing stack.';
@@ -9918,9 +9929,14 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             return label === 'TSL_GL' || label === 'WGL2 Fallback';
         }
         function isWgl2BackendActive() {
-            return renderer?.isWebGLRenderer === true && String(rendererBackendLabel || '') === 'WebGL Mode';
+            const label = String(rendererBackendLabel || '');
+            return renderer?.isWebGLRenderer === true
+                && (label === 'WebGL Mode' || label === 'WebGL (Pathtracing)');
         }
         function isSimpleWebGLPipelineActive() {
+            return isWgl2BackendActive() && !isPathTracingMode;
+        }
+        function isWebGLPipelineActive() {
             return isWgl2BackendActive();
         }
         function getRendererPipelineMode() {
@@ -9940,11 +9956,23 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             if (rendererPipelineSwitch) {
                 rendererPipelineSwitch.querySelectorAll('[data-renderer-pipeline]').forEach(button => {
                     const mode = normalizeRendererBackend(button.dataset.rendererPipeline);
-                    const active = mode === pipelineMode;
+                    const active = mode === pipelineMode
+                        || (mode === 'webgpu' && pipelineMode === 'webgl-fallback');
                     button.classList.toggle('active', active);
                     button.setAttribute('aria-pressed', active ? 'true' : 'false');
-                    button.title = `${RENDERER_PIPELINE_LABELS[mode] || mode} pipeline${active ? ' active' : ''}`;
+                    button.title = mode === 'webgpu' && pipelineMode === 'webgl-fallback'
+                        ? 'WebGPU pipeline active with Force WebGL enabled'
+                        : `${RENDERER_PIPELINE_LABELS[mode] || mode} pipeline${active ? ' active' : ''}`;
                 });
+            }
+            const forceWebGLActive = pipelineMode === 'webgl-fallback';
+            setViewportMenuItemHidden(forceWebGLRow, pipelineMode === 'webgl2');
+            if (btnForceWebGL) {
+                btnForceWebGL.classList.toggle('active', forceWebGLActive);
+                btnForceWebGL.setAttribute('aria-pressed', forceWebGLActive ? 'true' : 'false');
+                btnForceWebGL.title = forceWebGLActive
+                    ? 'Force WebGL is active. Click to restart in native WebGPU.'
+                    : 'Restart WebGPU mode using the forced WebGL backend.';
             }
         }
         function restartWithRendererBackend(mode, options = {}) {
@@ -9955,7 +9983,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 || `Restart max.js with ${label} pipeline now?`;
             if (options.prompt === false || confirm(confirmMessage)) {
                 persistRendererBackendPreference(normalizedMode);
-                if (normalizedMode === 'webgl2') {
+                if (normalizedMode === 'webgl2' || maxjsRenderMode === 'pathtracing') {
                     try { localStorage.setItem(MAXJS_MODE_KEY, 'standard'); } catch {}
                 }
                 sessionStorage.setItem('maxjs_renderer_backend', normalizedMode);
@@ -9988,20 +10016,29 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                         confirmMessage: mode === 'webgl2'
                             ? WEBGL_PIPELINE_CONFIRM_MESSAGE
                             : mode === 'webgl-fallback'
-                            ? 'TSL_GL Mode uses forced WebGL through the modern TSL renderer stack and reloads the panel.\n\nUse this when WebGPU Mode is not usable.\n\nSwitch to TSL_GL Mode now?'
+                            ? 'Force WebGL runs the WebGPU renderer stack through WebGL and reloads the panel.\n\nUse this when native WebGPU is not usable.\n\nEnable Force WebGL now?'
                             : `Restart max.js with ${RENDERER_PIPELINE_LABELS[mode]} pipeline now?`,
                     });
                 });
             });
         }
+        btnForceWebGL?.addEventListener('click', () => {
+            const forceWebGLActive = getRendererPipelineMode() === 'webgl-fallback';
+            restartWithRendererBackend(forceWebGLActive ? 'webgpu' : 'webgl-fallback', {
+                reason: forceWebGLActive ? 'manual' : 'fallback',
+                confirmMessage: forceWebGLActive
+                    ? 'Disable Force WebGL and restart with native WebGPU now?'
+                    : 'Force WebGL runs the WebGPU renderer stack through WebGL and reloads the panel.\n\nUse this when native WebGPU is not usable.\n\nEnable Force WebGL now?',
+            });
+        });
 
         const renderModeSwitch = document.getElementById('renderModeSwitch');
+        const modeLabels = {
+            standard: 'Standard',
+            studio: 'Studio',
+            pathtracing: 'Pathtracing',
+        };
         if (renderModeSwitch) {
-            const modeLabels = {
-                standard: 'Standard',
-                studio: 'Studio',
-                pathtracing: 'Pathtracing',
-            };
             renderModeSwitch.title = 'Render mode: Standard, Studio, or live-only Pathtracing';
             renderModeSwitch.querySelectorAll('[data-render-mode]').forEach(button => {
                 const mode = button.dataset.renderMode;
@@ -10013,6 +10050,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     if (mode === maxjsRenderMode) return;
                     const label = modeLabels[mode] || mode;
                     if (!confirm(`Switch to ${label} mode? Reloads the page.`)) return;
+                    if (mode === 'pathtracing') persistRendererBackendPreference('webgl2');
                     try { localStorage.setItem(MAXJS_MODE_KEY, mode); } catch {}
                     location.reload();
                 });
@@ -10033,21 +10071,33 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
 
         function syncSimpleWebGLPipelineUi() {
             const simpleWebGL = isSimpleWebGLPipelineActive();
+            const webGLPipeline = isWebGLPipelineActive();
+            const tslGl = isWgl2FallbackBackendActive();
             const renderModeRow = renderModeSwitch?.closest('.vpmenu-row');
-            setViewportMenuItemHidden(renderModeRow, simpleWebGL);
+            setViewportMenuItemHidden(renderModeRow, false);
             renderModeSwitch?.querySelectorAll('[data-render-mode]').forEach(button => {
-                button.disabled = simpleWebGL;
-                button.classList.toggle('is-gated', simpleWebGL);
-                button.setAttribute('aria-disabled', simpleWebGL ? 'true' : 'false');
+                const mode = button.dataset.renderMode;
+                const hideForPipeline = webGLPipeline
+                    ? mode === 'studio'
+                    : mode === 'pathtracing';
+                setViewportMenuItemHidden(button, hideForPipeline);
+                const gated = hideForPipeline;
+                button.disabled = gated;
+                button.classList.toggle('is-gated', gated);
+                button.setAttribute('aria-disabled', gated ? 'true' : 'false');
+                button.title = `${modeLabels[mode] || mode} mode${mode === maxjsRenderMode ? ' active' : ''}`;
+                if (tslGl && mode === 'pathtracing') {
+                    button.title = 'Pathtracing is available from the WebGL pipeline';
+                }
             });
 
             const vrButton = document.getElementById('btnEnterVR');
             const vrRow = vrButton?.closest('.vpmenu-row');
-            setViewportMenuItemHidden(vrRow, simpleWebGL);
+            setViewportMenuItemHidden(vrRow, webGLPipeline);
             if (vrButton) {
-                vrButton.disabled = simpleWebGL || vrButton.disabled;
-                vrButton.classList.toggle('is-gated', simpleWebGL || vrButton.disabled);
-                if (simpleWebGL) vrButton.title = 'VR is unavailable in the simple WebGL pipeline';
+                vrButton.disabled = webGLPipeline || vrButton.disabled;
+                vrButton.classList.toggle('is-gated', webGLPipeline || vrButton.disabled);
+                if (webGLPipeline) vrButton.title = 'VR is unavailable in the WebGL/pathtracing pipeline';
             }
 
             for (const id of STUDIO_ONLY_RAIL_IDS) {
@@ -10164,7 +10214,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 btnShaderLabPanel.classList.toggle('disabled', !available);
                 btnShaderLabPanel.title = available
                     ? 'Shader Lab by basement.studio'
-                    : 'Shader Lab requires WebGPU or TSL_GL';
+                    : 'Shader Lab requires WebGPU or Force WebGL';
             }
             if (!available && shaderLabPanelVisible) {
                 setShaderLabPanelVisible(false);
@@ -10441,7 +10491,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         btnCanvasPanel?.addEventListener('click', () => setCanvasPanelVisible(!canvasPanelVisible));
         btnShaderLabPanel?.addEventListener('click', () => {
             if (!isShaderLabBackendAvailable()) {
-                perfHud.setStatus('max.js - Shader Lab requires WebGPU or TSL_GL');
+                perfHud.setStatus('max.js - Shader Lab requires WebGPU or Force WebGL');
                 syncShaderLabAvailability();
                 return;
             }
@@ -10501,7 +10551,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 key: 'ssgi',
                 title: 'SSGI',
                 copy: 'Diffuse bounce lighting and ambient occlusion from the current frame.',
-                note: 'Requires WebGPU or TSL_GL.',
+                note: 'Requires WebGPU or Force WebGL.',
                 requiresWebGPU: true,
                 isEnabled: () => maxjsFx.isEnabled(),
                 setEnabled: (enabled) => maxjsFx.setEnabled(enabled),
@@ -10522,7 +10572,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 key: 'ssr',
                 title: 'SSR',
                 copy: 'Screen-space reflections for glossy and mirror-like surfaces.',
-                note: 'Requires WebGPU or TSL_GL.',
+                note: 'Requires WebGPU or Force WebGL.',
                 requiresWebGPU: true,
                 isEnabled: () => maxjsFx.isSSREnabled(),
                 setEnabled: (enabled) => maxjsFx.setSSREnabled(enabled),
@@ -10540,7 +10590,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 key: 'gtao',
                 title: 'GTAO',
                 copy: 'Ground-truth ambient occlusion from a dedicated depth and normal pre-pass.',
-                note: 'Requires WebGPU or TSL_GL.',
+                note: 'Requires WebGPU or Force WebGL.',
                 requiresWebGPU: true,
                 isEnabled: () => maxjsFx.isGTAOEnabled(),
                 setEnabled: (enabled) => maxjsFx.setGTAOEnabled(enabled),
@@ -10560,7 +10610,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 key: 'bloom',
                 title: 'Bloom',
                 copy: 'Highlights bleed for emissive and high-energy surfaces.',
-                note: 'Requires WebGPU or TSL_GL.',
+                note: 'Requires WebGPU or Force WebGL.',
                 requiresWebGPU: true,
                 isEnabled: () => maxjsFx.isBloomEnabled(),
                 setEnabled: (enabled) => maxjsFx.setBloomEnabled(enabled),
@@ -10592,7 +10642,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 key: 'motionBlur',
                 title: 'Motion Blur',
                 copy: 'Velocity-based blur from camera and object motion in the current frame.',
-                note: 'Requires WebGPU or TSL_GL.',
+                note: 'Requires WebGPU or Force WebGL.',
                 requiresWebGPU: true,
                 // Pixel FX takes the post-pass output; motion blur on top is meaningless
                 // (it would smear the pixelated image). Mutually exclusive.
@@ -10613,7 +10663,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 key: 'contactShadow',
                 title: 'Contact Shadows',
                 copy: 'Screen-space shadows for detailed close-range shadowing.',
-                note: 'Requires WebGPU or TSL_GL and a DirectionalLight.',
+                note: 'Requires WebGPU or Force WebGL and a DirectionalLight.',
                 requiresWebGPU: true,
                 isEnabled: () => maxjsFx.isContactShadowEnabled(),
                 setEnabled: (enabled) => maxjsFx.setContactShadowEnabled(enabled),
@@ -10631,7 +10681,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 key: 'retro',
                 title: 'Retro',
                 copy: 'PS1-style posterization, scanlines, barrel distortion, and CRT effects.',
-                note: 'Requires WebGPU or TSL_GL.',
+                note: 'Requires WebGPU or Force WebGL.',
                 requiresWebGPU: true,
                 isEnabled: () => maxjsFx.isRetroEnabled(),
                 setEnabled: (enabled) => maxjsFx.setRetroEnabled(enabled),
@@ -10653,7 +10703,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 key: 'volumetric',
                 title: 'Volumetric Light',
                 copy: 'Ray-marched light scattering through fog volume. Reacts to scene lights.',
-                note: 'Requires WebGPU or TSL_GL.',
+                note: 'Requires WebGPU or Force WebGL.',
                 requiresWebGPU: true,
                 isEnabled: () => maxjsFx.isVolumetricEnabled(),
                 setEnabled: (enabled) => maxjsFx.setVolumetricEnabled(enabled),
@@ -10671,7 +10721,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 key: 'pixel',
                 title: 'Pixel FX',
                 copy: 'Pixelation, chromatic aberration, sharpen, color grading, and film grain.',
-                note: 'Requires WebGPU or TSL_GL. Mutually exclusive with Motion Blur.',
+                note: 'Requires WebGPU or Force WebGL. Mutually exclusive with Motion Blur.',
                 requiresWebGPU: true,
                 isEnabled: () => maxjsFx.isPixelEnabled(),
                 setEnabled: (enabled) => {
@@ -10702,7 +10752,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 key: 'dof',
                 title: 'Depth of Field',
                 copy: 'Physical camera DOF with bokeh blur. Auto-syncs from Max Physical Camera when enabled.',
-                note: 'Requires WebGPU or TSL_GL. Enable DOF on the Physical Camera in Max for auto mode.',
+                note: 'Requires WebGPU or Force WebGL. Enable DOF on the Physical Camera in Max for auto mode.',
                 requiresWebGPU: true,
                 isEnabled: () => maxjsFx.isDofEnabled(),
                 setEnabled: (enabled) => maxjsFx.setDofEnabled(enabled),
@@ -10719,7 +10769,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 key: 'fog',
                 title: 'Fog',
                 copy: 'Distance fog, density fog, or animated procedural ground fog.',
-                note: 'Requires WebGPU or TSL_GL. Also controllable via Rendering > Environment > Atmosphere in Max.',
+                note: 'Requires WebGPU or Force WebGL. Also controllable via Rendering > Environment > Atmosphere in Max.',
                 requiresWebGPU: true,
                 isEnabled: () => maxjsFx.isFogEnabled(),
                 setEnabled: (enabled) => maxjsFx.setFogEnabled(enabled),
@@ -10740,7 +10790,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 key: 'opaqueBackdrop',
                 title: 'Opaque backdrop',
                 copy: 'Composite the frame onto a solid color and force alpha to 1. Use with fog without enabling SSR.',
-                note: 'Requires WebGPU or TSL_GL. Linear RGB (0–1). Matches viewport “empty” look when set to your scene background color.',
+                note: 'Requires WebGPU or Force WebGL. Linear RGB (0–1). Matches viewport “empty” look when set to your scene background color.',
                 requiresWebGPU: true,
                 isEnabled: () => maxjsFx.isOpaqueBackdropEnabled(),
                 setEnabled: (enabled) => maxjsFx.setOpaqueBackdropEnabled(enabled),
@@ -11384,7 +11434,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 const snapGridVal = document.getElementById('fx-clone-snapGrid-val');
                 wobbleToggle.onclick = () => {
                     if (!maxjsFx.supportsScreenSpaceEffects()) {
-                        perfHud.setStatus('max.js - Playstation Wobble requires WebGPU or TSL_GL');
+                        perfHud.setStatus('max.js - Playstation Wobble requires WebGPU or Force WebGL');
                         syncPostFxPanel(true);
                         return;
                     }
@@ -11654,7 +11704,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     note = lastError;
                     isError = true;
                 } else if (section.requiresWebGPU && !supportsScreenSpaceEffects) {
-                    note = 'Requires WebGPU or TSL_GL.';
+                    note = 'Requires WebGPU or Force WebGL.';
                     isError = true;
                 } else if (disabledByOther) {
                     note = disabledByOther;
@@ -12001,7 +12051,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 update() {},
             };
 
-            if (renderer?.isWebGLRenderer !== true) {
+            if (renderer?.isWebGLRenderer !== true && !isWgl2FallbackBackendActive()) {
                 return runtime;
             }
             if (!('xr' in navigator)) {
@@ -12307,12 +12357,12 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             const vrLabel = vrBtn.closest('.vpmenu-row')?.querySelector('.vpmenu-label');
             const setLabel = (text) => { if (vrLabel) vrLabel.textContent = text; };
             function syncVrState() {
-                if (isSimpleWebGLPipelineActive()) {
+                if (isWebGLPipelineActive()) {
                     setViewportMenuItemHidden(vrRow, true);
                     vrBtn.disabled = true;
                     vrBtn.classList.add('is-gated');
                     vrBtn.classList.remove('active');
-                    vrBtn.title = 'VR is unavailable in the simple WebGL pipeline';
+                    vrBtn.title = 'VR is unavailable in the WebGL/pathtracing pipeline';
                     setLabel('VR Unavailable');
                     return;
                 }
@@ -12320,7 +12370,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 const xrButton = xrRuntime?.xrButton;
                 const ready = !!xrRuntime?.supportsXR && !!xrButton && xrButton.isConnected;
                 if (!ready) {
-                    setViewportMenuItemHidden(vrRow, true);
+                    setViewportMenuItemHidden(vrRow, !isWgl2FallbackBackendActive());
                     vrBtn.disabled = true;
                     vrBtn.classList.add('is-gated');
                     vrBtn.classList.remove('active');
@@ -12413,22 +12463,23 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 if (pathTracingFx.isEnabled?.()) {
                     // Pathtracing is a live-viewer-only renderer mode. It
                     // bypasses post FX and never participates in snapshots.
-                    // Let normal WebGL draw the synced scene first; the
-                    // pathtracer packs the current scene/material/texture state
-                    // and must not race the initial sync or async texture loads.
+                    // Claim warmup frames with the PT controller instead of
+                    // rasterizing the scene through legacy WebGL; synced
+                    // scenes can contain TSL/Node materials that the legacy
+                    // renderer cannot draw.
                     if (renderToImageActive && pendingRenderToImage?.pathTracing) {
                         if (pendingRenderToImage.pathTracingStarted) {
                             pathTracingFx.start?.();
-                            if (!pathTracingFx.render?.()) renderer.render(scene, camera);
+                            if (!pathTracingFx.render?.()) renderPathTracingFallbackFrame();
                         } else {
-                            renderer.render(scene, camera);
+                            renderPathTracingFallbackFrame();
                         }
                     } else if (!canStartPathTracingNow()) {
-                        renderer.render(scene, camera);
+                        renderPathTracingFallbackFrame();
                         if (hasInitialSync) pathTracingRasterWarmupFrames += 1;
                     } else {
                         pathTracingFx.start?.();
-                        if (!pathTracingFx.render?.()) renderer.render(scene, camera);
+                        if (!pathTracingFx.render?.()) renderPathTracingFallbackFrame();
                     }
                 } else if (asciiActive && asciiEffect) {
                     asciiEffect.render(scene, camera);
@@ -12878,7 +12929,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
 
             try {
                 if (pathTracingFx.isEnabled?.()) {
-                    if (!pathTracingFx.render?.()) renderer.render(scene, camera);
+                    if (!pathTracingFx.render?.()) renderPathTracingFallbackFrame();
                 } else if (webglBasicFx.isAvailable?.() || maxjsFx.hasEnabledEffects()) {
                     renderViewerFrame();
                 } else {

@@ -88,7 +88,7 @@
                 <div class="vpmenu-row vpmenu-row-switch devonly">
                     <span class="vpmenu-label">Pipeline</span>
                     <div id="rendererPipelineSwitch" class="rail-mode-switch" role="group" aria-label="Renderer pipeline">
-                        <button class="rail-mode-option" type="button" data-renderer-pipeline="webgl2" title="WGL2 Mode">WGL2</button>
+                        <button class="rail-mode-option" type="button" data-renderer-pipeline="webgl2" title="WebGL Mode">WebGL</button>
                         <button class="rail-mode-option" type="button" data-renderer-pipeline="webgpu" title="WebGPU Mode">WGPU</button>
                         <button class="rail-mode-option" type="button" data-renderer-pipeline="webgl-fallback" title="TSL_GL Mode">TSL_GL</button>
                     </div>
@@ -561,6 +561,9 @@
 
         function readMaxjsRenderMode() {
             try {
+                const requestedBackend = sessionStorage.getItem('maxjs_renderer_backend')
+                    || localStorage.getItem(RENDERER_BACKEND_STORAGE_KEY);
+                if (requestedBackend === 'webgl2' || requestedBackend === 'webgl') return 'standard';
                 const value = localStorage.getItem(MAXJS_MODE_KEY);
                 return MAXJS_RENDER_MODES.includes(value) ? value : 'standard';
             } catch {
@@ -575,7 +578,7 @@
 
         function normalizeRendererBackend(value) {
             if (value === 'webgl-vr' || value === 'webgl-xr' || value === 'webgl-headset') return 'webgl2';
-            if (value === 'webgl') return 'webgl-fallback';
+            if (value === 'webgl') return 'webgl2';
             return value === 'webgl2' || value === 'webgpu' || value === 'webgl-fallback' ? value : '';
         }
 
@@ -615,7 +618,7 @@
                     alpha: true,
                     powerPreference: 'high-performance',
                 });
-                backendLabel = 'WebGL2 (Pathtracing)';
+                backendLabel = 'WebGL (Pathtracing)';
                 configureRenderer(nextRenderer);
                 await initializeRenderer(nextRenderer);
             } else if (requestedBackend === 'webgl2') {
@@ -624,7 +627,7 @@
                     alpha: true,
                     powerPreference: 'high-performance',
                 });
-                backendLabel = 'WGL2 Mode';
+                backendLabel = 'WebGL Mode';
                 configureRenderer(nextRenderer);
                 await initializeRenderer(nextRenderer);
             } else if (requestedBackend === 'webgl-fallback') {
@@ -2494,7 +2497,7 @@
 
         function isWebGLTexturePathActive() {
             const label = String(rendererBackendLabel || '');
-            return !!renderer?.isWebGLRenderer || label.startsWith('WGL2') || label === 'TSL_GL';
+            return !!renderer?.isWebGLRenderer || label.startsWith('WebGL') || label === 'TSL_GL';
         }
 
         function prepareLoadedBakeTexture(loadedTex, colorSpace, maxMapChannel) {
@@ -3232,11 +3235,11 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             showSunDisc: true,
             cameraAltitude: 1200,
         });
-        // Geospatial sky is supported by WebGPU and plain WGL2. Keep it out of
+        // Geospatial sky is supported by WebGPU and plain WebGL. Keep it out of
         // TSL_GL because that forced-WebGL TSL path conflicts with post effects.
         const useLegacySky = !(renderer instanceof THREE.WebGPURenderer);
         const allowGeospatialSky = rendererBackendLabel === 'WebGPU'
-            || String(rendererBackendLabel || '').startsWith('WGL2');
+            || String(rendererBackendLabel || '').startsWith('WebGL');
 
         function skyNumber(value, fallback) {
             const n = Number(value);
@@ -7779,6 +7782,10 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         }
 
         document.getElementById('btnLightLink')?.addEventListener('click', () => {
+            if (isSimpleWebGLPipelineActive()) {
+                perfHud.setStatus('max.js - Light Linking is unavailable in the simple WebGL pipeline');
+                return;
+            }
             if (!isStudioMode) {
                 perfHud.setStatus('max.js - Light Linking is available in Studio mode only');
                 return;
@@ -7991,6 +7998,10 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         }
 
         document.getElementById('btnReflPaint')?.addEventListener('click', () => {
+            if (isSimpleWebGLPipelineActive()) {
+                perfHud.setStatus('max.js - Reflection Paint is unavailable in the simple WebGL pipeline');
+                return;
+            }
             if (!isStudioMode) {
                 perfHud.setStatus('max.js - Reflection Paint is available in Studio mode only');
                 return;
@@ -9891,21 +9902,26 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         const btnRenderer = document.getElementById('btnRenderer');
         const rendererPipelineSwitch = document.getElementById('rendererPipelineSwitch');
         const RENDERER_PIPELINE_LABELS = {
-            webgl2: 'WGL2 Mode',
+            webgl2: 'WebGL Mode',
             webgpu: 'WebGPU Mode',
             'webgl-fallback': 'TSL_GL Mode',
         };
         const RENDERER_PIPELINE_BADGES = {
-            webgl2: 'WGL2',
+            webgl2: 'WebGL',
             webgpu: 'WGPU',
             'webgl-fallback': 'TSL_GL',
         };
+        const WEBGL_PIPELINE_CONFIRM_MESSAGE =
+            'This is the simple WebGL pipeline. It is snapshot friendly, supported by every browser and has superior light probing. But you will lose rendering modes, TSL materials and the max.js post processing stack.';
         function isWgl2FallbackBackendActive() {
             const label = String(rendererBackendLabel || '');
             return label === 'TSL_GL' || label === 'WGL2 Fallback';
         }
         function isWgl2BackendActive() {
-            return renderer?.isWebGLRenderer === true && String(rendererBackendLabel || '') === 'WGL2 Mode';
+            return renderer?.isWebGLRenderer === true && String(rendererBackendLabel || '') === 'WebGL Mode';
+        }
+        function isSimpleWebGLPipelineActive() {
+            return isWgl2BackendActive();
         }
         function getRendererPipelineMode() {
             if (isWgl2BackendActive()) return 'webgl2';
@@ -9939,6 +9955,9 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 || `Restart max.js with ${label} pipeline now?`;
             if (options.prompt === false || confirm(confirmMessage)) {
                 persistRendererBackendPreference(normalizedMode);
+                if (normalizedMode === 'webgl2') {
+                    try { localStorage.setItem(MAXJS_MODE_KEY, 'standard'); } catch {}
+                }
                 sessionStorage.setItem('maxjs_renderer_backend', normalizedMode);
                 location.reload();
                 return;
@@ -9954,7 +9973,9 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             const nextMode = getNextRendererPipelineMode();
             restartWithRendererBackend(nextMode, {
                 reason: 'manual',
-                confirmMessage: `Restart max.js with ${RENDERER_PIPELINE_LABELS[nextMode]} pipeline now?`,
+                confirmMessage: nextMode === 'webgl2'
+                    ? WEBGL_PIPELINE_CONFIRM_MESSAGE
+                    : `Restart max.js with ${RENDERER_PIPELINE_LABELS[nextMode]} pipeline now?`,
             });
         });
         if (rendererPipelineSwitch) {
@@ -9964,7 +9985,9 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     if (!mode || mode === getRendererPipelineMode()) return;
                     restartWithRendererBackend(mode, {
                         reason: mode === 'webgl-fallback' ? 'fallback' : 'manual',
-                        confirmMessage: mode === 'webgl-fallback'
+                        confirmMessage: mode === 'webgl2'
+                            ? WEBGL_PIPELINE_CONFIRM_MESSAGE
+                            : mode === 'webgl-fallback'
                             ? 'TSL_GL Mode uses forced WebGL through the modern TSL renderer stack and reloads the panel.\n\nUse this when WebGPU Mode is not usable.\n\nSwitch to TSL_GL Mode now?'
                             : `Restart max.js with ${RENDERER_PIPELINE_LABELS[mode]} pipeline now?`,
                     });
@@ -9997,11 +10020,70 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         }
         syncRendererButtonUi();
 
+        function setViewportMenuItemHidden(el, hidden) {
+            if (!el) return;
+            el.hidden = !!hidden;
+            el.classList.toggle('is-hidden', !!hidden);
+            if (hidden) {
+                el.style.setProperty('display', 'none', 'important');
+            } else {
+                el.style.removeProperty('display');
+            }
+        }
+
+        function syncSimpleWebGLPipelineUi() {
+            const simpleWebGL = isSimpleWebGLPipelineActive();
+            const renderModeRow = renderModeSwitch?.closest('.vpmenu-row');
+            setViewportMenuItemHidden(renderModeRow, simpleWebGL);
+            renderModeSwitch?.querySelectorAll('[data-render-mode]').forEach(button => {
+                button.disabled = simpleWebGL;
+                button.classList.toggle('is-gated', simpleWebGL);
+                button.setAttribute('aria-disabled', simpleWebGL ? 'true' : 'false');
+            });
+
+            const vrButton = document.getElementById('btnEnterVR');
+            const vrRow = vrButton?.closest('.vpmenu-row');
+            setViewportMenuItemHidden(vrRow, simpleWebGL);
+            if (vrButton) {
+                vrButton.disabled = simpleWebGL || vrButton.disabled;
+                vrButton.classList.toggle('is-gated', simpleWebGL || vrButton.disabled);
+                if (simpleWebGL) vrButton.title = 'VR is unavailable in the simple WebGL pipeline';
+            }
+
+            for (const id of STUDIO_ONLY_RAIL_IDS) {
+                const button = document.getElementById(id);
+                const row = button?.closest('.vpmenu-row');
+                setViewportMenuItemHidden(row, simpleWebGL);
+                if (button && simpleWebGL) {
+                    button.disabled = true;
+                    button.classList.add('is-gated');
+                    button.setAttribute('aria-disabled', 'true');
+                }
+            }
+            const renderMenuSep = document.querySelector('[data-menu="render"] .vpmenu-sep');
+            setViewportMenuItemHidden(renderMenuSep, simpleWebGL || !isStudioMode);
+
+            const shaderLabButton = document.getElementById('btnShaderLabPanel');
+            const shaderLabRow = shaderLabButton?.closest('.vpmenu-row');
+            setViewportMenuItemHidden(shaderLabRow, simpleWebGL || !isShaderLabBackendAvailable());
+
+            if (simpleWebGL) {
+                setLightLinkPanelVisible(false);
+                setReflPaintPanelVisible(false);
+            }
+        }
+
         function syncStudioOnlyUi() {
             const gated = !isStudioMode;
             for (const id of STUDIO_ONLY_RAIL_IDS) {
                 const button = document.getElementById(id);
                 if (!button) continue;
+                const row = button.closest('.vpmenu-row');
+                if (isSimpleWebGLPipelineActive()) {
+                    setViewportMenuItemHidden(row, true);
+                    continue;
+                }
+                setViewportMenuItemHidden(row, gated);
                 if (!button.dataset.baseTitle) button.dataset.baseTitle = button.title || '';
                 button.disabled = gated;
                 button.classList.toggle('is-gated', gated);
@@ -10014,6 +10096,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 setLightLinkPanelVisible(false);
                 setReflPaintPanelVisible(false);
             }
+            syncSimpleWebGLPipelineUi();
         }
         syncStudioOnlyUi();
 
@@ -10076,7 +10159,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             const available = isShaderLabBackendAvailable();
             if (btnShaderLabPanel) {
                 const row = btnShaderLabPanel.closest('.vpmenu-row');
-                if (row) row.hidden = !available;
+                setViewportMenuItemHidden(row, !available || isSimpleWebGLPipelineActive());
                 btnShaderLabPanel.disabled = !available;
                 btnShaderLabPanel.classList.toggle('disabled', !available);
                 btnShaderLabPanel.title = available
@@ -12215,24 +12298,37 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             : createWebXRRuntime();
 
         // "Enter VR" menu button: proxies the (hidden) three.js XRButton and
-        // mirrors its state. VR needs a WebGL pipeline (WGL2 / TSL_GL) + a
-        // headset, so it stays disabled under WebGPU or when unsupported.
+        // mirrors its state. VR is hidden in the simple WebGL pipeline and only
+        // surfaced for renderer modes where we intentionally support it.
         (function wireEnterVrButton() {
             const vrBtn = document.getElementById('btnEnterVR');
             if (!vrBtn) return;
+            const vrRow = vrBtn.closest('.vpmenu-row');
             const vrLabel = vrBtn.closest('.vpmenu-row')?.querySelector('.vpmenu-label');
             const setLabel = (text) => { if (vrLabel) vrLabel.textContent = text; };
             function syncVrState() {
-                const xrButton = xrRuntime?.xrButton;
-                const ready = !!xrRuntime?.supportsXR && !!xrButton && xrButton.isConnected;
-                if (!ready) {
+                if (isSimpleWebGLPipelineActive()) {
+                    setViewportMenuItemHidden(vrRow, true);
                     vrBtn.disabled = true;
                     vrBtn.classList.add('is-gated');
                     vrBtn.classList.remove('active');
-                    vrBtn.title = 'VR unavailable — needs a WebGL pipeline (WGL2 / TSL_GL) and a headset';
+                    vrBtn.title = 'VR is unavailable in the simple WebGL pipeline';
                     setLabel('VR Unavailable');
                     return;
                 }
+                setViewportMenuItemHidden(vrRow, false);
+                const xrButton = xrRuntime?.xrButton;
+                const ready = !!xrRuntime?.supportsXR && !!xrButton && xrButton.isConnected;
+                if (!ready) {
+                    setViewportMenuItemHidden(vrRow, true);
+                    vrBtn.disabled = true;
+                    vrBtn.classList.add('is-gated');
+                    vrBtn.classList.remove('active');
+                    vrBtn.title = 'VR unavailable — needs a supported WebGL pipeline and a headset';
+                    setLabel('VR Unavailable');
+                    return;
+                }
+                setViewportMenuItemHidden(vrRow, false);
                 vrBtn.disabled = false;
                 vrBtn.classList.remove('is-gated');
                 const presenting = !!renderer.xr?.isPresenting

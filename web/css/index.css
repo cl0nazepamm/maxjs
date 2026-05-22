@@ -1539,6 +1539,10 @@ body.is-dev .devonly { display: revert !important; }
    Restore the row flex layout whenever a gated row is actually shown. */
 body.is-dev .vpmenu-row.devonly,
 body.is-max-host .vpmenu-row.maxonly { display: flex !important; }
+.vpmenu-row[hidden],
+.vpmenu-sep[hidden],
+.vpmenu-row.is-hidden,
+.vpmenu-sep.is-hidden { display: none !important; }
 .vpmenu-row-switch, .vpmenu-row-cam { cursor: default; }
 .vpmenu-row-switch:hover { background: transparent; }
 .vpmenu-label {

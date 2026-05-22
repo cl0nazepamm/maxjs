@@ -1,8 +1,8 @@
-// webgl_basicfx.js - tiny WGL2-only post stack for user-authored WebGL effects.
+// webgl_basicfx.js - tiny WebGL-only post stack for user-authored WebGL effects.
 //
 // This intentionally stays separate from maxjs_fx.js. It has no TSL imports,
 // no SSGI/SSR/GTAO concepts, and no built-in heavy passes. It only provides a
-// stable place for GLSL/fullscreen passes to own final presentation in WGL2.
+// stable place for GLSL/fullscreen passes to own final presentation in WebGL.
 
 export function createWebGLBasicFx({
     THREE,
@@ -12,7 +12,7 @@ export function createWebGLBasicFx({
     backendLabel = '',
     onError = console.warn,
 } = {}) {
-    const isWgl2 = backendLabel === 'WGL2 Mode' || backendLabel === 'WebGL2';
+    const isWebGL = backendLabel === 'WebGL Mode' || backendLabel === 'WebGL2';
     const passes = new Map();
     const drawSize = new THREE.Vector2();
     let readTarget = null;
@@ -28,7 +28,7 @@ export function createWebGLBasicFx({
     };
 
     function isAvailable() {
-        return !!isWgl2 && !!renderer && !!scene && !!camera && !disposed;
+        return !!isWebGL && !!renderer && !!scene && !!camera && !disposed;
     }
 
     function getDrawSize() {

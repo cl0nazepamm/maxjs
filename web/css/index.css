@@ -14,7 +14,7 @@ html, body { color-scheme: dark; }
 body { overflow: hidden; background: #353535; position: relative; width: 100vw; height: 100vh; }
 canvas { display: block; }
 #hud {
-    position: absolute; top: 8px; left: calc(var(--rail-left) + var(--rail-width) + 14px);
+    position: absolute; top: 46px; left: 10px;
     color: rgba(180, 180, 180, 0.8);
     font: 10px/1.4 'Segoe UI', system-ui, sans-serif;
     pointer-events: none;
@@ -1418,3 +1418,255 @@ body.is-dev .devonly { display: revert !important; }
    separators that follow them, so we don't leave dangling labels. */
 .rail-group.rail-empty { display: none; }
 .rail-group.rail-empty + .rail-sep { display: none; }
+
+/* ── Viewport label menu (3ds Max-style top bar) ──────────────
+   Replaces the vertical rail. The control elements keep their old
+   ids/classes (.rail-btn, .rail-mode-switch, .rail-cam) so the app
+   keeps wiring behaviour by id; these rules only re-lay them out
+   into a horizontal bar of dropdown menus. */
+#viewportMenu {
+    position: fixed;
+    top: var(--rail-left);
+    left: var(--rail-left);
+    z-index: 40;
+    display: flex;
+    align-items: stretch;
+    gap: 1px;
+    padding: 3px;
+    background: var(--rail-bg);
+    backdrop-filter: blur(32px) saturate(1.4);
+    -webkit-backdrop-filter: blur(32px) saturate(1.4);
+    border: 1px solid var(--rail-border);
+    border-radius: 6px;
+    box-shadow:
+        0 12px 40px rgba(0, 0, 0, 0.55),
+        0 1px 0 rgba(255, 255, 255, 0.04) inset,
+        0 -1px 0 rgba(0, 0, 0, 0.25) inset;
+    font: 11px/1 'Segoe UI', system-ui, sans-serif;
+    user-select: none;
+}
+.vpmenu-item { position: relative; display: flex; }
+.vpmenu-item.vpmenu-empty { display: none; }
+/* Thin divider between adjacent visible menus. */
+.vpmenu-item + .vpmenu-item::before {
+    content: '';
+    align-self: center;
+    width: 1px;
+    height: 16px;
+    margin: 0 2px;
+    background: rgba(255, 255, 255, 0.08);
+}
+.vpmenu-trigger {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    height: 24px;
+    padding: 0 9px;
+    border: 0;
+    border-radius: 4px;
+    background: transparent;
+    color: rgba(220, 225, 229, 0.82);
+    font: inherit;
+    font-weight: 500;
+    letter-spacing: 0.01em;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: background 0.12s ease, color 0.12s ease;
+}
+.vpmenu-trigger:hover { background: rgba(255, 255, 255, 0.06); color: #f2f5f4; }
+.vpmenu-item.open > .vpmenu-trigger { background: rgba(255, 255, 255, 0.1); color: #fff; }
+.vpmenu-trigger-plus { font-size: 15px; font-weight: 400; padding: 0 11px; line-height: 1; }
+.vpmenu-trigger-funnel { padding: 0 10px; }
+.vpmenu-trigger-funnel svg { width: 14px; height: 14px; display: block; }
+.vpmenu-trigger-text {
+    display: inline-block;
+    max-width: 140px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.vpmenu-caret {
+    width: 0; height: 0;
+    border-left: 3px solid transparent;
+    border-right: 3px solid transparent;
+    border-top: 4px solid currentColor;
+    opacity: 0.7;
+}
+.vpmenu-dropdown {
+    position: absolute;
+    top: calc(100% + 5px);
+    left: 0;
+    min-width: 196px;
+    padding: 5px;
+    background: var(--rail-bg);
+    backdrop-filter: blur(32px) saturate(1.4);
+    -webkit-backdrop-filter: blur(32px) saturate(1.4);
+    border: 1px solid var(--rail-border);
+    border-radius: 6px;
+    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.55);
+    opacity: 0;
+    transform: translateY(-4px) scale(0.98);
+    transform-origin: top left;
+    pointer-events: none;
+    transition: opacity 0.14s ease, transform 0.14s cubic-bezier(0.16, 1, 0.3, 1);
+    z-index: 1;
+}
+.vpmenu-dropdown-end { left: auto; right: 0; transform-origin: top right; }
+.vpmenu-item.open > .vpmenu-dropdown {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+    pointer-events: auto;
+}
+.vpmenu-section {
+    padding: 3px 8px 5px;
+    font-size: 8px;
+    font-weight: 700;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: rgba(255, 255, 255, 0.34);
+}
+.vpmenu-sep { height: 1px; margin: 4px 6px; background: rgba(255, 255, 255, 0.08); }
+.vpmenu-row {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    padding: 2px 8px 2px 4px;
+    border-radius: 4px;
+    cursor: pointer;
+}
+.vpmenu-row:hover { background: rgba(255, 255, 255, 0.05); }
+/* The maxonly/devonly gate un-hides rows with `display: revert`, which
+   resolves to block for a <div> and would stack the icon above its label.
+   Restore the row flex layout whenever a gated row is actually shown. */
+body.is-dev .vpmenu-row.devonly,
+body.is-max-host .vpmenu-row.maxonly { display: flex !important; }
+.vpmenu-row-switch, .vpmenu-row-cam { cursor: default; }
+.vpmenu-row-switch:hover { background: transparent; }
+.vpmenu-label {
+    flex: 1 1 auto;
+    color: rgba(220, 225, 229, 0.85);
+    font-size: 11px;
+    white-space: nowrap;
+}
+.vpmenu-row-switch .vpmenu-label { flex: 0 0 auto; min-width: 54px; }
+/* Debug row stays hidden until the app un-hides #btnDebug (non-release). */
+.vpmenu-row-debug { display: none; }
+.vpmenu-row-debug:has(> #btnDebug:not([style*="none"])) { display: flex; }
+
+/* Old rail buttons, re-laid-out as menu rows. */
+.vpmenu-dropdown .rail-btn {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    min-height: 28px;
+    border-radius: 4px;
+}
+/* Drop the rail's left accent bar — irrelevant in the menu icon boxes. */
+.vpmenu-dropdown .rail-btn::before { display: none; }
+.vpmenu-dropdown .rail-btn svg {
+    position: static;
+    transform: none;
+    left: auto;
+    top: auto;
+    width: 17px;
+    height: 17px;
+    margin: auto;
+}
+.vpmenu-dropdown .rail-btn svg.rail-btn-logo-lg { width: 15px; height: 19px; }
+.vpmenu-dropdown .rail-btn.rail-btn-text {
+    width: auto;
+    min-width: 38px;
+    padding: 0 7px;
+    font-size: 8px;
+}
+/* In-button badge/label (set by setRailButtonMeta) is redundant in the
+   menu — the row label and segmented switch already convey state. */
+.vpmenu-dropdown .rail-btn-badge,
+.vpmenu-dropdown .rail-btn-label { display: none; }
+/* Segmented switches → horizontal inside the row. */
+.vpmenu-row-switch .rail-mode-switch {
+    display: flex;
+    gap: 2px;
+    width: auto;
+    margin: 0;
+}
+.vpmenu-row-switch .rail-mode-option {
+    width: auto;
+    flex: 1 0 auto;
+    min-width: 36px;
+    padding: 0 7px;
+}
+/* Camera picker → [icon box] [native select], consistent with other rows.
+   The select is a sibling of the icon box (not an invisible overlay). */
+.vpmenu-row-cam .rail-cam { pointer-events: none; }
+.vpmenu-row-cam .rail-cam-native {
+    position: static;
+    inset: auto;
+    flex: 1 1 auto;
+    min-width: 0;
+    width: auto;
+    height: 26px;
+    opacity: 1;
+    color: rgba(220, 225, 229, 0.9);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 4px;
+    background-color: rgba(255, 255, 255, 0.03);
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='5' viewBox='0 0 8 5'%3E%3Cpath d='M1 1l3 3 3-3' fill='none' stroke='%23bcc2c6' stroke-width='1.3' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 7px center;
+    appearance: none;
+    -webkit-appearance: none;
+    -moz-appearance: none;
+    font: 11px/1 'Segoe UI', system-ui, sans-serif;
+    cursor: pointer;
+    padding: 0 20px 0 8px;
+    transition: border-color 0.12s ease, background-color 0.12s ease, color 0.12s ease;
+}
+.vpmenu-row-cam .rail-cam-native:hover {
+    color: #f2f5f4;
+    border-color: rgba(255, 255, 255, 0.16);
+    background-color: rgba(255, 255, 255, 0.06);
+}
+.vpmenu-row-cam .rail-cam-native:focus-visible {
+    outline: none;
+    border-color: rgba(255, 255, 255, 0.28);
+}
+.vpmenu-row-cam .rail-cam-native option { background: #1b1b1d; color: #e4e6e8; }
+/* Inverted highlight for the focused/selected item in the open list. */
+.vpmenu-row-cam .rail-cam-native option:checked,
+.vpmenu-row-cam .rail-cam-native option:hover,
+.vpmenu-row-cam .rail-cam-native option:focus {
+    background: #e4e6e8;
+    color: #1b1b1d;
+}
+body.light-mode .vpmenu-row-cam .rail-cam-native {
+    color: rgba(20, 24, 28, 0.9);
+    border-color: rgba(0, 0, 0, 0.12);
+    background-color: rgba(0, 0, 0, 0.04);
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='5' viewBox='0 0 8 5'%3E%3Cpath d='M1 1l3 3 3-3' fill='none' stroke='%23474e53' stroke-width='1.3' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+}
+body.light-mode .vpmenu-row-cam .rail-cam-native option { background: #f4f5f7; color: #111; }
+body.light-mode .vpmenu-row-cam .rail-cam-native option:checked,
+body.light-mode .vpmenu-row-cam .rail-cam-native option:hover,
+body.light-mode .vpmenu-row-cam .rail-cam-native option:focus {
+    background: #1b1b1d;
+    color: #f4f5f7;
+}
+
+/* Light mode */
+body.light-mode #viewportMenu,
+body.light-mode .vpmenu-dropdown {
+    background: rgba(238, 240, 243, 0.86);
+    border-color: rgba(0, 0, 0, 0.1);
+}
+body.light-mode .vpmenu-trigger { color: rgba(20, 24, 28, 0.8); }
+body.light-mode .vpmenu-trigger:hover { background: rgba(0, 0, 0, 0.06); color: #111; }
+body.light-mode .vpmenu-item.open > .vpmenu-trigger { background: rgba(0, 0, 0, 0.1); color: #000; }
+body.light-mode .vpmenu-item + .vpmenu-item::before { background: rgba(0, 0, 0, 0.12); }
+body.light-mode .vpmenu-section { color: rgba(20, 24, 28, 0.45); }
+body.light-mode .vpmenu-sep { background: rgba(0, 0, 0, 0.1); }
+body.light-mode .vpmenu-label { color: rgba(20, 24, 28, 0.8); }
+body.light-mode .vpmenu-row:hover { background: rgba(0, 0, 0, 0.05); }
+body.light-mode .vpmenu-row-cam .rail-cam-native { color: rgba(20, 24, 28, 0.85); }

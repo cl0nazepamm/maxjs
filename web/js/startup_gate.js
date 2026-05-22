@@ -23,23 +23,29 @@
         if (isMaxHost) document.body.classList.add('is-max-host');
         if (isDev) document.body.classList.add('is-dev');
 
-        // Mark rail-groups whose only remaining children are labels /
-        // separators (so the CSS can collapse them). Runs once — the
-        // DOM isn't reordered after this point.
-        var groups = document.querySelectorAll('#rightRail .rail-group');
-        for (var i = 0; i < groups.length; i++) {
-            var g = groups[i];
+        // Collapse viewport-menu items whose every row is gated out by the
+        // maxonly/devonly host filters (e.g. a standalone release demo only
+        // keeps Theme + Mute, so View/Renderer/Shading/Tools vanish). Runs
+        // once — the DOM isn't reordered after this point.
+        // A row is shown by the maxonly/devonly CSS gate when it carries no
+        // gate class, or when one of its gates is active. Mirror that here so
+        // we only collapse menus whose every row is truly hidden.
+        function rowLive(r) {
+            if (r.classList.contains('vpmenu-row-debug')) return false; // shown only when app un-hides #btnDebug
+            var hasMax = r.classList.contains('maxonly');
+            var hasDev = r.classList.contains('devonly');
+            if (!hasMax && !hasDev) return true;
+            return (hasMax && isMaxHost) || (hasDev && isDev);
+        }
+        var items = document.querySelectorAll('#viewportMenu .vpmenu-item');
+        for (var i = 0; i < items.length; i++) {
+            var item = items[i];
+            var rows = item.querySelectorAll('.vpmenu-row');
             var hasLive = false;
-            var kids = g.children;
-            for (var j = 0; j < kids.length; j++) {
-                var c = kids[j];
-                if (c.classList.contains('rail-group-label')) continue;
-                if (c.classList.contains('maxonly') && !isMaxHost) continue;
-                if (c.classList.contains('devonly') && !isDev) continue;
-                hasLive = true;
-                break;
+            for (var j = 0; j < rows.length; j++) {
+                if (rowLive(rows[j])) { hasLive = true; break; }
             }
-            if (!hasLive) g.classList.add('rail-empty');
+            if (!hasLive) item.classList.add('vpmenu-empty');
         }
     } catch (e) { /* defensive — don't break boot on rail cleanup */ }
 })();

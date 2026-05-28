@@ -254,18 +254,22 @@ export function createLayerManager({
         const owner = options.overlay ? OWNER_OVERLAY : OWNER_JS;
         const clone = source.clone(false);
         clone.name = options.name || `${source.name || 'node'}_clone`;
-        clone.matrixAutoUpdate = false;
-        clone.matrix.copy(source.matrixWorld);
+        clone.matrixAutoUpdate = true;
+        source.updateWorldMatrix?.(true, false);
+        source.matrixWorld.decompose(clone.position, clone.quaternion, clone.scale);
+        clone.matrix.compose(clone.position, clone.quaternion, clone.scale);
         clone.matrixWorld.copy(source.matrixWorld);
         clone.matrixWorldNeedsUpdate = true;
         clone.visible = true;
+        clone.userData ??= {};
+        clone.userData.maxjsRuntimeClone = true;
+        clone.userData.maxjsSourceHandle = handle;
         if (source.geometry?.clone) clone.geometry = markOwned(source.geometry.clone(), owner);
         if (source.material) {
             if (source.userData?.jsmod) {
                 // three.js Deform layers own geometry, but material edits from Max
                 // should keep flowing to the runtime clone without a refresh.
                 clone.material = source.material;
-                clone.userData.maxjsSourceHandle = handle;
                 clone.userData.maxjsFollowSourceMaterial = true;
             } else {
                 clone.material = cloneMaterialForLayer(source.material, owner);
@@ -346,6 +350,10 @@ export function createLayerManager({
 
         const readVectorLike = (value, target = new THREE.Vector3()) => {
             if (value?.isVector3) return target.copy(value);
+            if (value?.point?.isVector3) return target.copy(value.point);
+            if (Array.isArray(value?.point) || ArrayBuffer.isView(value?.point)) {
+                return target.set(Number(value.point[0]) || 0, Number(value.point[1]) || 0, Number(value.point[2]) || 0);
+            }
             if (Array.isArray(value) || ArrayBuffer.isView(value)) {
                 return target.set(Number(value[0]) || 0, Number(value[1]) || 0, Number(value[2]) || 0);
             }
@@ -359,6 +367,101 @@ export function createLayerManager({
             if (value?.getVisualCenter) return value.getVisualCenter(target);
             if (value?.getWorldPosition) return value.getWorldPosition(target);
             return readVectorLike(value, target);
+        };
+
+        const readQuaternionLike = (value, target = new THREE.Quaternion()) => {
+            if (value?.isQuaternion) return target.copy(value);
+            if (Array.isArray(value) || ArrayBuffer.isView(value)) {
+                return target.set(
+                    Number(value[0]) || 0,
+                    Number(value[1]) || 0,
+                    Number(value[2]) || 0,
+                    Number(value[3]) || 1
+                ).normalize();
+            }
+            if (value?.isEuler) return target.setFromEuler(value);
+            if (value && typeof value === 'object') {
+                if (Number.isFinite(Number(value.w))) {
+                    return target.set(
+                        Number(value.x) || 0,
+                        Number(value.y) || 0,
+                        Number(value.z) || 0,
+                        Number(value.w)
+                    ).normalize();
+                }
+                if (Number.isFinite(Number(value.x)) || Number.isFinite(Number(value.y)) || Number.isFinite(Number(value.z))) {
+                    return target.setFromEuler(new THREE.Euler(
+                        Number(value.x) || 0,
+                        Number(value.y) || 0,
+                        Number(value.z) || 0,
+                        value.order || 'XYZ'
+                    ));
+                }
+            }
+            return target.identity();
+        };
+
+        const readScaleLike = (value, target = new THREE.Vector3()) => {
+            if (Number.isFinite(Number(value))) {
+                const uniform = Number(value);
+                return target.set(uniform, uniform, uniform);
+            }
+            return readVectorLike(value, target);
+        };
+
+        const resolveNodeAdapter = (value, options = {}) => {
+            if (value?.handle != null) return getLayerNodeAdapter(layer, Number(value.handle));
+            if (Number.isFinite(Number(value))) return getLayerNodeAdapter(layer, Number(value));
+            if (typeof value === 'string') {
+                return maxSceneFacade.findOne(value, { exact: options.exact !== false })
+                    ?? maxSceneFacade.findOne(value, { exact: false });
+            }
+            return null;
+        };
+
+        const setObjectWorldTransform = (obj, parent, position, quaternion, scale) => {
+            parent.add(obj);
+            parent.updateWorldMatrix?.(true, false);
+            const world = new THREE.Matrix4().compose(position, quaternion, scale);
+            const local = parent.matrixWorld
+                ? new THREE.Matrix4().copy(parent.matrixWorld).invert().multiply(world)
+                : world;
+            local.decompose(obj.position, obj.quaternion, obj.scale);
+            obj.matrixAutoUpdate = true;
+            obj.updateMatrix();
+            obj.updateMatrixWorld(true);
+            return obj;
+        };
+
+        const placeRuntimeClone = (clone, sourceAdapter, parent, options = {}) => {
+            const sourceObj = nodeMap.get(sourceAdapter.handle);
+            const position = sourceAdapter.getWorldPosition(new THREE.Vector3()) ?? new THREE.Vector3();
+            const quaternion = sourceAdapter.getWorldQuaternion(new THREE.Quaternion()) ?? new THREE.Quaternion();
+            const scale = sourceAdapter.getWorldScale(new THREE.Vector3()) ?? new THREE.Vector3(1, 1, 1);
+
+            if (options.quaternion != null || options.rotation != null || options.rotationEuler != null) {
+                readQuaternionLike(options.quaternion ?? options.rotation ?? options.rotationEuler, quaternion);
+            }
+            if (options.scale != null) readScaleLike(options.scale, scale);
+            if (options.scaleMultiplier != null && Number.isFinite(Number(options.scaleMultiplier))) {
+                scale.multiplyScalar(Number(options.scaleMultiplier));
+            }
+            if (scale.lengthSq() < 1e-12) scale.set(1, 1, 1);
+
+            const requestedPosition = options.at ?? options.position ?? options.worldPosition;
+            if (requestedPosition != null) {
+                readVectorLike(requestedPosition, position);
+                const align = String(options.align ?? options.anchor ?? 'pivot').toLowerCase();
+                if (align === 'center' || align === 'visualcenter' || align === 'visual-center') {
+                    const pivot = sourceAdapter.getWorldPosition(new THREE.Vector3());
+                    const center = sourceAdapter.getVisualCenter(new THREE.Vector3());
+                    if (pivot && center) position.sub(center.sub(pivot));
+                }
+            } else if (sourceObj?.matrixWorld) {
+                sourceObj.matrixWorld.decompose(position, quaternion, scale);
+            }
+
+            return setObjectWorldTransform(clone, parent, position, quaternion, scale);
         };
 
         const runtimeSpaceFacade = freezePlainObject({
@@ -564,6 +667,19 @@ export function createLayerManager({
             },
         });
 
+        const cloneFromMaxForLayer = (source, options = {}) => {
+            const adapter = resolveNodeAdapter(source, options);
+            if (!adapter?.isMesh) return null;
+            const clone = cloneMaxNode(adapter.handle, options);
+            if (!clone) return null;
+            if (options.snapshotId) setSnapshotTargetId(clone, `runtime:${layer.id}:${options.snapshotId}`);
+            const parent = options.overlay ? layer.overlayGroup : layer.group;
+            const targetParent = options.parent?.isObject3D ? options.parent : parent;
+            placeRuntimeClone(clone, adapter, targetParent, options);
+            if (clone.userData?.maxjsFollowSourceMaterial) layer.liveMaterialClones.add(clone);
+            return clone;
+        };
+
         const jsFacade = freezePlainObject({
             root: layer.group,
             overlayRoot: layer.overlayGroup,
@@ -597,14 +713,18 @@ export function createLayerManager({
             createAnchor(handle, options = {}) {
                 return createAnchorForLayer(layer, handle, options);
             },
-            cloneFromMax(handle, options = {}) {
-                const clone = cloneMaxNode(handle, options);
-                if (!clone) return null;
-                if (options.snapshotId) setSnapshotTargetId(clone, `runtime:${layer.id}:${options.snapshotId}`);
-                const parent = options.overlay ? layer.overlayGroup : layer.group;
-                parent.add(clone);
-                if (clone.userData?.maxjsFollowSourceMaterial) layer.liveMaterialClones.add(clone);
-                return clone;
+            cloneFromMax(source, options = {}) {
+                return cloneFromMaxForLayer(source, options);
+            },
+            cloneManyFromMax(sources, options = {}) {
+                const list = Array.isArray(sources) ? sources : Array.from(sources ?? []);
+                const out = [];
+                for (let i = 0; i < list.length; i += 1) {
+                    const itemOptions = typeof options === 'function' ? options(list[i], i) : options;
+                    const clone = cloneFromMaxForLayer(list[i], itemOptions ?? {});
+                    if (clone) out.push(clone);
+                }
+                return Object.freeze(out);
             },
             track(resource, options = {}) {
                 if (!resource) return resource;

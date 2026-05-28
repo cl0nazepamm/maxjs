@@ -58,6 +58,9 @@ Useful calls:
 
 - `ctx.maxScene.getNode(handle)` returns a node adapter.
 - `ctx.maxScene.findByName(name, { exact })` returns matching adapters; unwrap `[0]` when expecting one.
+- `ctx.maxScene.findOne(name, { exact })` returns the first matching adapter; exact matching is the default.
+- `ctx.maxScene.resolve(handleOrNameOrAdapter)` normalizes simple inputs to a node adapter.
+- `ctx.maxScene.under(parent, { meshOnly, visibleOnly, includeSelf })` returns synced descendants under a parent name, handle, or adapter.
 - `ctx.maxScene.listNodes()` / `listHandles()` enumerate synced meshes and lights.
 - `ctx.maxScene.listJsmodNodes()` finds meshes with the three.js Deform/jsmod flag.
 - `ctx.maxScene.raycast(origin, direction, { near, far })` hits visible synced meshes.
@@ -71,7 +74,8 @@ Adapters represent synced Max objects.
 
 - Metadata: `node.handle`, `node.name`, `node.isMesh`, `node.visible`, `node.jsmod`.
 - Live reads: `node.position`, `node.quaternion`, `node.scale`, `node.matrixWorld`.
-- Geometry sampling: `node.sampleSurface({ point, normal, rng })`.
+- Three-style world reads: `getWorldPosition(target)`, `getWorldQuaternion(target)`, `getWorldScale(target)`, `getWorldMatrix(target)`. Passing a target is safe; omitting it returns a new object.
+- Geometry sampling: `node.sampleSurface({ point, normal, rng })` returns `{ point, normal, barycentric, triangleIndex, mesh, meshHandle, meshName }`. Use `count` for multiple area-weighted samples.
 - Anchors: `node.createAnchor(options)`.
 - Orientation helpers: `getPivotWorldPosition()`, `getVisualCenter()`, `getPivotToVisualCenter()`, `getLocalAxesWorld()`, `getOrientationSnapshot()`.
 
@@ -89,7 +93,28 @@ Use orientation helpers before gameplay/rig work. MaxJS runtime is Three.js Y-up
 - `ctx.js.track(obj)` / `ctx.js.dispose(obj)`
 - `ctx.js.own(resource)` for textures/materials/geometries
 - `ctx.js.setSnapshotId(obj, id)` so snapshot export can target stable objects
-- `ctx.js.cloneFromMax(handle)` only when the runtime clone should replace the authored render truth
+- `ctx.js.cloneFromMax(handleOrNameOrAdapter, options)` creates a runtime-owned clone from a synced Max mesh and registers it under the layer root for cleanup/snapshot export.
+- `ctx.js.cloneManyFromMax(nodes, optionsOrFn)` clones a list of adapters/handles/names.
+
+Clone placement options are intentionally direct:
+
+```js
+const product = ctx.maxScene.findOne('items007');
+const chute = ctx.maxScene.findOne('Emission_Guide');
+const clone = ctx.js.cloneFromMax(product, {
+    at: chute.getWorldPosition(),
+    align: 'visualCenter',
+    snapshotId: `vend-${product.handle}-${Date.now()}`
+});
+```
+
+For parent-driven effects:
+
+```js
+const cans = ctx.maxScene.under('Items_Grp', { meshOnly: true });
+const sample = ctx.maxScene.findOne('Shelf_Surface')?.sampleSurface();
+if (sample) ctx.js.cloneFromMax(cans[0], { at: sample, align: 'visualCenter' });
+```
 
 ## Moving Synced Objects
 

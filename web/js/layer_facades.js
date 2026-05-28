@@ -31,11 +31,73 @@ function createMaxSceneFacade({ scene, nodeMap, lightHandleMap, getAdapter, crea
         const h = Number(obj?.userData?.maxjsParentHandle);
         return Number.isFinite(h) && h > 0 ? h : null;
     };
+    const adapterMatches = (adapter, options = {}) => {
+        if (!adapter) return false;
+        if (options.meshOnly === true && !adapter.isMesh) return false;
+        if (options.visibleOnly === true && !adapter.visible) return false;
+        return true;
+    };
+    const resolveAdapter = (value, options = {}) => {
+        if (value?.handle != null) return getAdapter(Number(value.handle));
+        if (Number.isFinite(Number(value))) return getAdapter(Number(value));
+        if (typeof value === 'string') {
+            const hits = [];
+            const query = value.toLowerCase();
+            const exact = options.exact !== false;
+            for (const handle of nodeMap.keys()) {
+                const adapter = getAdapter(handle);
+                const current = String(adapter?.name ?? '').toLowerCase();
+                if ((exact && current === query) || (!exact && current.includes(query))) hits.push(adapter);
+            }
+            if (lightHandleMap) {
+                for (const [handle, light] of lightHandleMap.entries()) {
+                    const current = String(light?.name ?? '').toLowerCase();
+                    if ((exact && current === query) || (!exact && current.includes(query))) hits.push(getAdapter(handle, light));
+                }
+            }
+            return hits[0] ?? null;
+        }
+        return null;
+    };
     const pushChildrenFromMap = (out, map, parentHandle) => {
         if (!map) return;
         for (const [handle, obj] of map.entries()) {
             if (parentHandleOf(obj) === parentHandle) out.push(getAdapter(handle, obj));
         }
+    };
+    const collectDescendants = (out, parentHandle, options = {}, seen = new Set()) => {
+        if (seen.has(parentHandle)) return;
+        seen.add(parentHandle);
+        const children = [];
+        pushChildrenFromMap(children, nodeMap, parentHandle);
+        pushChildrenFromMap(children, lightHandleMap, parentHandle);
+        for (const child of children) {
+            if (adapterMatches(child, options)) out.push(child);
+            collectDescendants(out, child.handle, options, seen);
+        }
+    };
+    const findByNameInternal = (name, options = {}) => {
+        const query = String(name ?? '').toLowerCase();
+        const exact = options.exact === true;
+        const matches = [];
+        for (const handle of nodeMap.keys()) {
+            const adapter = getAdapter(handle);
+            const current = String(adapter?.name ?? '').toLowerCase();
+            if (!query) continue;
+            if ((exact && current === query) || (!exact && current.includes(query))) {
+                matches.push(adapter);
+            }
+        }
+        if (lightHandleMap) {
+            for (const [handle, light] of lightHandleMap.entries()) {
+                const current = String(light?.name ?? '').toLowerCase();
+                if (!query) continue;
+                if ((exact && current === query) || (!exact && current.includes(query))) {
+                    matches.push(getAdapter(handle, light));
+                }
+            }
+        }
+        return matches;
     };
     return freezePlainObject({
         get size() { return nodeMap.size; },
@@ -71,6 +133,20 @@ function createMaxSceneFacade({ scene, nodeMap, lightHandleMap, getAdapter, crea
         },
         listHandles() { return Array.from(nodeMap.keys()); },
         listNodes() { return Array.from(nodeMap.keys(), handle => getAdapter(handle)); },
+        findOne(name, options = {}) {
+            return findByNameInternal(name, { exact: options.exact !== false })[0] ?? null;
+        },
+        resolve(value, options = {}) {
+            return resolveAdapter(value, options);
+        },
+        under(parent, options = {}) {
+            const root = resolveAdapter(parent, options);
+            if (!root) return Object.freeze([]);
+            const out = [];
+            if (options.includeSelf === true && adapterMatches(root, options)) out.push(root);
+            collectDescendants(out, root.handle, options);
+            return Object.freeze(out);
+        },
         /** Meshes whose Max stack has three.js Deform (bridge sets adapter.jsmod). Safe to poll every frame — nodeMap grows as sync arrives. */
         listJsmodNodes() {
             const out = [];
@@ -81,29 +157,7 @@ function createMaxSceneFacade({ scene, nodeMap, lightHandleMap, getAdapter, crea
             return out;
         },
         findByName(name, options = {}) {
-            const query = String(name ?? '').toLowerCase();
-            const exact = options.exact === true;
-            const matches = [];
-            // Search meshes in nodeMap
-            for (const handle of nodeMap.keys()) {
-                const adapter = getAdapter(handle);
-                const current = String(adapter?.name ?? '').toLowerCase();
-                if (!query) continue;
-                if ((exact && current === query) || (!exact && current.includes(query))) {
-                    matches.push(adapter);
-                }
-            }
-            // Search lights in lightHandleMap
-            if (lightHandleMap) {
-                for (const [handle, light] of lightHandleMap.entries()) {
-                    const current = String(light?.name ?? '').toLowerCase();
-                    if (!query) continue;
-                    if ((exact && current === query) || (!exact && current.includes(query))) {
-                        matches.push(getAdapter(handle, light));
-                    }
-                }
-            }
-            return matches;
+            return findByNameInternal(name, options);
         },
         createAnchor(handle, options = {}) {
             return createAnchor(handle, options);
@@ -116,7 +170,9 @@ function createMaxSceneFacade({ scene, nodeMap, lightHandleMap, getAdapter, crea
             for (const obj of nodeMap.values()) {
                 if (obj?.visible) targets.push(obj);
             }
-            return rc.intersectObjects(targets, true).map((hit) => {
+            return rc.intersectObjects(targets, true).filter((hit) => {
+                return hit.object?.userData?.maxjsVisible !== false;
+            }).map((hit) => {
                 let normal = hit.face?.normal?.clone() ?? new THREE.Vector3(0, 1, 0);
                 if (hit.face?.normal && hit.object?.matrixWorld) {
                     normal.transformDirection(hit.object.matrixWorld);

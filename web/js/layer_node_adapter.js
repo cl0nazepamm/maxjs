@@ -518,6 +518,8 @@ function createMaxNodeAdapter({ handle, getObject, THREE, createAnchor, layerId,
             normal,
             barycentric,
             triangleIndex,
+            object: mesh,
+            mesh,
             meshHandle: mesh.userData?.maxjsHandle ?? handle,
             meshName: mesh.name ?? '',
         };
@@ -528,10 +530,28 @@ function createMaxNodeAdapter({ handle, getObject, THREE, createAnchor, layerId,
         get exists() { return !!getObject(); },
         get name() { return getObject()?.name ?? ''; },
         get type() { return getObject()?.type ?? null; },
-        get visible() { return !!getObject()?.visible; },
-        setVisible(v) { const obj = getObject(); if (obj) obj.visible = !!v; },
         get isMesh() { return !!getObject()?.isMesh; },
         get isHelper() { return !!getObject()?.userData?.maxjsHelper; },
+        get visible() {
+            const obj = getObject();
+            if (!obj) return false;
+            return obj.userData?.maxjsVisible !== false && obj.visible !== false;
+        },
+        setVisible(v) {
+            const obj = getObject();
+            if (!obj) return;
+            const next = !!v;
+            obj.userData ??= {};
+            obj.userData.maxjsVisible = next;
+            obj.visible = true;
+            obj.layers?.set?.(next ? 0 : 31);
+            const materials = Array.isArray(obj.material)
+                ? obj.material
+                : (obj.material ? [obj.material] : []);
+            for (const material of materials) {
+                if (material) material.visible = true;
+            }
+        },
         get jsmod() { return !!getObject()?.userData?.jsmod; },
         get parentHandle() {
             const h = Number(getObject()?.userData?.maxjsParentHandle);
@@ -554,7 +574,7 @@ function createMaxNodeAdapter({ handle, getObject, THREE, createAnchor, layerId,
             }
             return Object.freeze(out);
         },
-        descendants() {
+        descendants(options = {}) {
             const obj = getObject();
             if (!obj?.children?.length) return Object.freeze([]);
             const out = [];
@@ -563,7 +583,10 @@ function createMaxNodeAdapter({ handle, getObject, THREE, createAnchor, layerId,
                 const h = child?.userData?.maxjsHandle;
                 if (h != null) {
                     const adapter = getNodeAdapter?.(h);
-                    if (adapter) out.push(adapter);
+                    if (!adapter) return;
+                    if (options.meshOnly === true && !adapter.isMesh) return;
+                    if (options.visibleOnly === true && !adapter.visible) return;
+                    out.push(adapter);
                 }
             });
             return Object.freeze(out);
@@ -573,30 +596,27 @@ function createMaxNodeAdapter({ handle, getObject, THREE, createAnchor, layerId,
             const mat = Array.isArray(obj?.material) ? obj.material[0] : obj?.material;
             return mat?.type ?? null;
         },
-        getWorldMatrix() {
+        getWorldMatrix(target = new THREE.Matrix4()) {
             const obj = getObject();
-            return obj ? obj.matrixWorld.clone() : null;
+            return obj ? target.copy(obj.matrixWorld) : null;
         },
-        getWorldPosition() {
+        getWorldPosition(target = new THREE.Vector3()) {
             const obj = getObject();
             if (!obj) return null;
-            const position = new THREE.Vector3();
-            obj.getWorldPosition(position);
-            return position;
+            obj.getWorldPosition(target);
+            return target;
         },
-        getWorldQuaternion() {
+        getWorldQuaternion(target = new THREE.Quaternion()) {
             const obj = getObject();
             if (!obj) return null;
-            const quaternion = new THREE.Quaternion();
-            obj.getWorldQuaternion(quaternion);
-            return quaternion;
+            obj.getWorldQuaternion(target);
+            return target;
         },
-        getWorldScale() {
+        getWorldScale(target = new THREE.Vector3()) {
             const obj = getObject();
             if (!obj) return null;
-            const scale = new THREE.Vector3();
-            obj.getWorldScale(scale);
-            return scale;
+            obj.getWorldScale(target);
+            return target;
         },
         getPivotWorldPosition(target = new THREE.Vector3()) {
             const obj = getObject();
@@ -665,9 +685,9 @@ function createMaxNodeAdapter({ handle, getObject, THREE, createAnchor, layerId,
             }
             return target.lengthSq() > 0 ? target.normalize() : target.set(0, -1, 0);
         },
-        getBoundingBox() {
+        getBoundingBox(target = new THREE.Box3()) {
             const obj = getObject();
-            return obj ? new THREE.Box3().setFromObject(obj) : null;
+            return obj ? target.setFromObject(obj) : null;
         },
         transform,
         // Override a material map slot on the synced mesh. Survives
@@ -699,7 +719,19 @@ function createMaxNodeAdapter({ handle, getObject, THREE, createAnchor, layerId,
         createAnchor(options = {}) {
             return createAnchor(handle, options);
         },
-        sampleSurface(options = {}) {
+        sampleSurface: function sampleSurface(options = {}) {
+            const count = Math.max(0, Math.floor(Number(options.count) || 0));
+            if (count > 1) {
+                const out = [];
+                const nextOptions = { ...options };
+                delete nextOptions.count;
+                for (let i = 0; i < count; i += 1) {
+                    const hit = sampleSurface(nextOptions);
+                    if (hit) out.push(hit);
+                }
+                return Object.freeze(out);
+            }
+
             const obj = getObject();
             if (!obj?.isObject3D) return null;
             if (!options.includeInvisible && !obj.visible) return null;

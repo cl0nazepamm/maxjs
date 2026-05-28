@@ -144,7 +144,7 @@
         <!-- Default Shading: look & post FX menu -->
         <div class="vpmenu-item" data-menu="shading">
             <button class="vpmenu-trigger" type="button" aria-haspopup="true" aria-expanded="false" title="Shading, look &amp; post FX">
-                <span class="vpmenu-trigger-text">Default Shading</span>
+                <span class="vpmenu-trigger-text" data-shading-label>Default Shading</span>
                 <span class="vpmenu-caret" aria-hidden="true"></span>
             </button>
             <div class="vpmenu-dropdown" role="menu">
@@ -3321,7 +3321,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         }
 
         function isSkyLinkCandidateLight(light) {
-            if (!light?.isDirectionalLight || light.visible === false) return false;
+            if (!light?.isDirectionalLight || light.userData?.maxjsVisible === false) return false;
             if (light.name === '__maxjs_sky_sun__' || light.name === '__maxjs_geospatial_sky_sun__') return false;
             return light.userData?.maxjsHandle != null;
         }
@@ -3646,7 +3646,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         function applyNodeProps(mesh, props) {
             if (!props) return;
             // Renderable toggle — works for both meshes and splines
-            if (props.rend === 0) { mesh.visible = false; }
+            if (props.rend === 0) applyMaxObjectVisibility(mesh, false);
             if (!mesh?.isMesh) return;
             mesh.castShadow = props.cshadow !== 0;
             mesh.receiveShadow = props.rshadow !== 0;
@@ -3672,12 +3672,51 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             else delete mesh.userData.jsmod;
         }
 
+        const MAXJS_SELF_HIDDEN_LAYER = 31;
+
+        function setObjectSelfVisibleLayer(object, visible) {
+            if (!object?.layers?.set) return false;
+            const layer = visible ? 0 : MAXJS_SELF_HIDDEN_LAYER;
+            const mask = 1 << layer;
+            if (object.layers.mask === mask) return false;
+            object.layers.set(layer);
+            return true;
+        }
+
+        function restoreRenderableMaterialVisibility(object) {
+            const materials = Array.isArray(object?.material)
+                ? object.material
+                : (object?.material ? [object.material] : []);
+            let changed = false;
+            for (const material of materials) {
+                if (!material) continue;
+                if (material.visible !== true) {
+                    material.visible = true;
+                    changed = true;
+                }
+            }
+            return changed;
+        }
+
+        function applyMaxObjectVisibility(object, visible) {
+            if (!object) return false;
+            object.userData ??= {};
+            const next = visible !== false;
+            let changed = object.userData.maxjsVisible !== next;
+            object.userData.maxjsVisible = next;
+            if (object.visible !== true) {
+                object.visible = true;
+                changed = true;
+            }
+            changed = setObjectSelfVisibleLayer(object, next) || changed;
+            changed = restoreRenderableMaterialVisibility(object) || changed;
+            return changed;
+        }
+
         function applyBridgeVisibility(mesh, visibleFlag) {
             if (!mesh || mesh.userData.jsmod) return false;
             const visible = visibleFlag == null ? true : !!visibleFlag;
-            if (mesh.visible === visible) return false;
-            mesh.visible = visible;
-            return true;
+            return applyMaxObjectVisibility(mesh, visible);
         }
 
         function applyInstanceSyncState(mesh, instOfHandle) {
@@ -4685,6 +4724,14 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
 
         // ── Clay Mode ───────────────────────────────────
         let clayModeActive = false;
+        const defaultShadingLabel = 'Default Shading';
+        const shadingMenuLabel = document.querySelector('[data-shading-label]');
+
+        function updateShadingMenuLabel(isClay) {
+            if (!shadingMenuLabel) return;
+            const label = isClay ? 'Clay' : defaultShadingLabel;
+            if (shadingMenuLabel.textContent !== label) shadingMenuLabel.textContent = label;
+        }
 
         // ── ASCII Effect (full takeover) ──
         let asciiActive = false;
@@ -4826,8 +4873,12 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             const needsApply = enabled
                 ? (!clayModeActive || scene.overrideMaterial !== clayMat)
                 : (clayModeActive || scene.overrideMaterial === clayMat || !!clayPreFxSnapshot);
-            if (!needsApply) return;
+            if (!needsApply) {
+                updateShadingMenuLabel(enabled);
+                return;
+            }
             clayModeActive = enabled;
+            updateShadingMenuLabel(enabled);
             if (enabled) enterClayMode(); else exitClayMode();
             syncPostFxPanel(true, { persist: false });
         });
@@ -7044,14 +7095,17 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             syncLightParent(light, ld);
 
             const visible = ld.v == null ? true : !!ld.v;
-            light.visible = visible;
-            if (light.userData.maxjsTarget) light.userData.maxjsTarget.visible = visible;
+            light.userData.maxjsVisible = visible;
+            light.visible = true;
+            light.layers?.set?.(visible ? 0 : MAXJS_SELF_HIDDEN_LAYER);
+            if (light.userData.maxjsTarget) light.userData.maxjsTarget.visible = true;
 
             if (light.color && Array.isArray(ld.color)) {
                 light.color.setRGB(ld.color[0], ld.color[1], ld.color[2]);
             }
             if ('intensity' in light && Number.isFinite(ld.intensity)) {
-                light.intensity = ld.intensity;
+                light.userData.maxjsAuthoredIntensity = ld.intensity;
+                light.intensity = visible ? ld.intensity : 0;
             }
             if (Number.isFinite(ld.volContrib)) {
                 light.userData.volContrib = ld.volContrib;
@@ -7105,7 +7159,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             }
 
             if (light.shadow) {
-                light.castShadow = !!ld.castShadow;
+                light.castShadow = visible && !!ld.castShadow;
                 if (light.castShadow) {
                     light.shadow.bias = ld.shadowBias ?? -0.0001;
                     light.shadow.radius = ld.shadowRadius ?? 1;
@@ -7193,7 +7247,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     light.userData.maxjsLightId = id;
                     light.userData.maxjsLightLinked = false;
                 }
-                if (light.visible !== false) {
+                if (light.userData?.maxjsVisible !== false) {
                     appliedLightCount++;
                     if (!mainDirectionalLight && ld.type === 0) mainDirectionalLight = light;
                 }
@@ -9499,7 +9553,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 }
 
                 applyLightData(light, ld);
-                if (light.visible !== false) {
+                if (light.userData?.maxjsVisible !== false) {
                     appliedLightCount++;
                     if (!mainDirectionalLight && ld.type === 0) mainDirectionalLight = light;
                 }

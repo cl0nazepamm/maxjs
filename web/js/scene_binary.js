@@ -80,6 +80,14 @@ function scalarArrayFromBinary(buffer, off, n, type = '', { copy = true, label =
     return copy ? new Float32Array(source) : source;
 }
 
+function normalizedInt16ToFloat32(source) {
+    const out = new Float32Array(source.length);
+    for (let i = 0; i < source.length; i++) {
+        out[i] = Math.max(-1, source[i] / 32767);
+    }
+    return out;
+}
+
 function skinWeightAttributeFromBinary(buffer, off, n, type = '') {
     const normalized = String(type ?? '').trim().toLowerCase();
     const data = scalarArrayFromBinary(buffer, off, n, normalized, { copy: true, label: 'skin weight' });
@@ -114,7 +122,13 @@ export function normalAttributeFromBinary(buffer, off, n, type = '', label = 'no
     const normalized = String(type ?? '').trim().toLowerCase();
     const data = scalarArrayFromBinary(buffer, off, n, normalized, { copy: true, label });
     if (!data) return null;
-    const normalize = normalized === 'i16n' || normalized === 'int16n';
+    if (normalized === 'i16n' || normalized === 'int16n') {
+        // WebGPU rejects 3-component Int16 vertex attributes because the
+        // resulting 6-byte stride is not 4-byte aligned. Expand packed normals
+        // to Float32 while preserving the same normalized values.
+        return new THREE.BufferAttribute(normalizedInt16ToFloat32(data), 3);
+    }
+    const normalize = false;
     return new THREE.BufferAttribute(data, 3, normalize);
 }
 

@@ -34,6 +34,7 @@ const lightLocalPos = new THREE.Vector3();
 const lightWorldPos = new THREE.Vector3();
 const lightTargetLocal = new THREE.Vector3();
 const lightTargetWorld = new THREE.Vector3();
+const MAXJS_SELF_HIDDEN_LAYER = 31;
 
 function getLightParentObject(light, ld, parent, nodeMap) {
     const explicitParent = Object.prototype.hasOwnProperty.call(ld ?? {}, 'p')
@@ -124,7 +125,8 @@ function getShadowSceneFocus(nodeMap) {
 
 function applyLightShadowDefaults(light, ld, nodeMap) {
     if (!light.shadow) return;
-    light.castShadow = !!ld.castShadow;
+    const visible = light.userData?.maxjsVisible !== false;
+    light.castShadow = visible && !!ld.castShadow;
     if (!light.castShadow) return;
     light.shadow.bias = ld.shadowBias ?? -0.0001;
     light.shadow.radius = ld.shadowRadius ?? 1;
@@ -160,14 +162,17 @@ function applyLightData(light, ld, nodeMap, parent) {
     syncLightParent(light, ld, parent, nodeMap);
 
     const visible = ld.v == null ? true : !!ld.v;
-    light.visible = visible;
-    if (light.userData.maxjsTarget) light.userData.maxjsTarget.visible = visible;
+    light.userData.maxjsVisible = visible;
+    light.visible = true;
+    light.layers?.set?.(visible ? 0 : MAXJS_SELF_HIDDEN_LAYER);
+    if (light.userData.maxjsTarget) light.userData.maxjsTarget.visible = true;
 
     if (light.color && Array.isArray(ld.color)) {
         light.color.setRGB(ld.color[0], ld.color[1], ld.color[2]);
     }
     if ('intensity' in light && Number.isFinite(ld.intensity)) {
-        light.intensity = ld.intensity;
+        light.userData.maxjsAuthoredIntensity = ld.intensity;
+        light.intensity = visible ? ld.intensity : 0;
     }
     if (Number.isFinite(ld.volContrib)) {
         light.userData.volContrib = ld.volContrib;
@@ -312,7 +317,7 @@ export function createSceneLights({ scene, parent = scene, lightHandleMap = new 
             if (!light) continue;
             if (!light.parent) lightGroup.add(light);
             if (ld.h != null) lightHandleMap.set(ld.h, light);
-            if (light.visible !== false) {
+            if (light.userData?.maxjsVisible !== false) {
                 count++;
                 if (!mainDirectional && ld.type === 0) mainDirectional = light;
             }

@@ -59,6 +59,7 @@ import {
 // (material registry, instance buckets, etc.) plugged in.
 const NOOP = () => {};
 const RETURNS_FALSE = () => false;
+const MAXJS_SELF_HIDDEN_LAYER = 31;
 
 const DEFAULT_HOOKS = Object.freeze({
     /** ({ nd, geom, wantsLine }) → THREE.Material — required */
@@ -116,9 +117,32 @@ const DEFAULT_HOOKS = Object.freeze({
     applyVisibility: (mesh, vis) => {
         if (!mesh) return false;
         const next = vis === undefined ? mesh.visible : !!vis;
-        if (next === mesh.visible) return false;
-        mesh.visible = next;
-        return true;
+        mesh.userData ??= {};
+        let changed = mesh.userData.maxjsVisible !== next;
+        mesh.userData.maxjsVisible = next;
+        if (mesh.visible !== true) {
+            mesh.visible = true;
+            changed = true;
+        }
+        if (mesh.layers?.set) {
+            const layer = next ? 0 : MAXJS_SELF_HIDDEN_LAYER;
+            const mask = 1 << layer;
+            if (mesh.layers.mask !== mask) {
+                mesh.layers.set(layer);
+                changed = true;
+            }
+        }
+        const materials = Array.isArray(mesh.material)
+            ? mesh.material
+            : (mesh.material ? [mesh.material] : []);
+        for (const material of materials) {
+            if (!material) continue;
+            if (material.visible !== true) {
+                material.visible = true;
+                changed = true;
+            }
+        }
+        return changed;
     },
 });
 

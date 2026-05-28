@@ -36,6 +36,7 @@ export function createLayerManager({
     space = null,
     controls = null,
     getCamera = null,
+    getCameraTarget = null,
     onCameraModeChange = null,
     getSceneCameras = () => [],
     getGLTFSystem = () => null,
@@ -136,6 +137,7 @@ export function createLayerManager({
         getPhysicalCameraHandle() { return physicalCameraHandle; },
         getControls() { return controls; },
         getCamera() { return getCamera ? getCamera() : camera; },
+        getCameraTarget(target) { return getCameraTarget?.(target) ?? null; },
         getSceneCameras() { return getSceneCameras?.() ?? []; },
     };
 

@@ -153,6 +153,9 @@ Clear overrides in `dispose()` if the layer temporarily owns authored objects.
 `ctx.camera` can lock to Max scene cameras and expose the live render camera:
 
 - `ctx.camera.raw` returns the underlying Three.js camera for last-mile render offsets such as handheld shake. This does not claim script ownership by itself.
+- `ctx.camera.target` / `ctx.camera.getTarget(out)` returns the current synced look-at target. In physical-camera mode this is the Max target node position when the camera has a target; moving the Max target dirties camera sync.
+- For a fixed look-at effect, capture `ctx.camera.getTarget(out)` once after `usePhysicalCamera(...)` settles, then reuse that vector. Do not call `getTarget()` every frame unless you want to follow the moving Max target.
+- `ctx.camera.setPositionKeepingTarget(positionOrX, y, z, target?)` moves the layer-owned camera and re-aims it at the current target, or at an explicit target if supplied.
 - Camera near/far clipping may come from Max camera manual clipping, render `ViewParams`, or viewer UI overrides. Snapshot UI state persists camera clip overrides.
 - `ctx.camera.listSceneCameras()` returns synced scene cameras as `{ handle, h, name, n }`.
 - `ctx.camera.findSceneCamera(name, { exact })` searches the scene camera list. Do this for Physical Cameras; `ctx.maxScene.findByName()` only searches synced meshes/lights.

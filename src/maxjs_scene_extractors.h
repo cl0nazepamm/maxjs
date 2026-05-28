@@ -622,14 +622,19 @@ static bool GetSceneCameraData(INode* camNode, TimeValue t, CameraData& cam) {
     Point3 fwd = -Normalize(camTM.GetRow(2));
     Point3 up  = Normalize(camTM.GetRow(1));
 
-    // Target distance: use target node if it exists, otherwise default
+    // Target camera: use the actual target node position. This is the camera
+    // API contract for layer code; do not derive a moving target from camera
+    // forward unless the Max camera has no target node.
     float targetDist = 100.0f;
+    Point3 tgt;
     if (camNode->GetTarget()) {
         Point3 tgtPos = camNode->GetTarget()->GetNodeTM(t).GetTrans();
         targetDist = Length(tgtPos - pos);
         if (targetDist < 1.0f) targetDist = 100.0f;
+        tgt = tgtPos;
+    } else {
+        tgt = pos + fwd * targetDist;
     }
-    Point3 tgt = pos + fwd * targetDist;
 
     cam.pos[0] = pos.x;    cam.pos[1] = pos.y;    cam.pos[2] = pos.z;
     cam.target[0] = tgt.x; cam.target[1] = tgt.y;  cam.target[2] = tgt.z;
@@ -725,12 +730,15 @@ static bool GetRenderViewCameraData(INode* renderViewNode, const ViewParams* vie
     Point3 up = Normalize(camTM.GetRow(1));
 
     float targetDist = viewPar->distance;
+    bool hasTargetNode = false;
+    Point3 targetNodePos;
     if (renderViewNode && renderViewNode->GetTarget()) {
-        Point3 tgtPos = renderViewNode->GetTarget()->GetNodeTM(t).GetTrans();
-        targetDist = Length(tgtPos - pos);
+        targetNodePos = renderViewNode->GetTarget()->GetNodeTM(t).GetTrans();
+        targetDist = Length(targetNodePos - pos);
+        hasTargetNode = true;
     }
     if (targetDist < 1.0f) targetDist = 100.0f;
-    Point3 tgt = pos + fwd * targetDist;
+    Point3 tgt = hasTargetNode ? targetNodePos : pos + fwd * targetDist;
 
     cam.pos[0] = pos.x;    cam.pos[1] = pos.y;    cam.pos[2] = pos.z;
     cam.target[0] = tgt.x; cam.target[1] = tgt.y; cam.target[2] = tgt.z;

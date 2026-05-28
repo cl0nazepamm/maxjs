@@ -56,6 +56,13 @@ ctx.camera.lookAt(0, 0, 0);
 ctx.camera.setFov(60);
 ```
 
+Physical camera offset example:
+```javascript
+ctx.camera.usePhysicalCameraByName('Camera001', { exact: true });
+const target = ctx.camera.getTarget();
+ctx.camera.setPositionKeepingTarget(20, 140, 260, target);
+```
+
 ## Example: Shooting Game
 
 Located at: `examples/shooting_game.js`

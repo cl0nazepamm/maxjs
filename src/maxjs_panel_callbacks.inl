@@ -8,6 +8,7 @@ void MaxJSFastNodeEventCallback::ControllerStructured(NodeKeyTab& nodes) {
 
 void MaxJSFastNodeEventCallback::ControllerOtherEvent(NodeKeyTab& nodes) {
     if (!owner_) return;
+    owner_->MarkCameraDirtyIfTargetNodeChanged(nodes);
     if (owner_->IsAnimationPlaying()) {
         // During playback, TimeChanged already scans all transforms and
         // deform geometry every frame. Bone controller events fire once
@@ -24,11 +25,15 @@ void MaxJSFastNodeEventCallback::ControllerOtherEvent(NodeKeyTab& nodes) {
 void MaxJSFastNodeEventCallback::LinkChanged(NodeKeyTab& nodes) {
     if (!owner_) return;
     owner_->MarkInteractiveActivity();
+    owner_->MarkCameraDirtyIfTargetNodeChanged(nodes);
     owner_->MarkTrackedNodesDirty(nodes);
 }
 
 void MaxJSFastNodeEventCallback::SelectionChanged(NodeKeyTab& nodes) {
-    if (owner_) owner_->MarkTrackedNodesDirty(nodes);
+    if (owner_) {
+        owner_->MarkCameraDirtyIfTargetNodeChanged(nodes);
+        owner_->MarkTrackedNodesDirty(nodes);
+    }
 }
 
 void MaxJSFastNodeEventCallback::HideChanged(NodeKeyTab& nodes) {

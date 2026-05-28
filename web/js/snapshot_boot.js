@@ -366,6 +366,10 @@ function buildLayerManager({
         space: sceneSpace,
         controls,
         getCamera: () => camera,
+        getCameraTarget: (target) => {
+            if (controls?.target?.isVector3) return target?.copy(controls.target) ?? controls.target.clone();
+            return null;
+        },
         getSceneCameras: () => sceneCameras,
         debugLog: (...args) => console.debug('[snapshot_boot]', ...args),
         debugWarn: (...args) => console.warn('[snapshot_boot]', ...args),

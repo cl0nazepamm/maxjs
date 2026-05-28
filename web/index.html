@@ -12889,6 +12889,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             space: sceneSpace,
             controls,
             getCamera: () => camera,
+            getCameraTarget: (target) => target?.copy(cameraTargetWorld) ?? cameraTargetWorld.clone(),
             getSceneCameras: () => knownSceneCameras,
             onCameraModeChange: applyLayerCameraMode,
             getGLTFSystem: () => gltfSystem,

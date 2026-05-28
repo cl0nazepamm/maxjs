@@ -61,6 +61,40 @@ function createCameraAdapter(camera, THREE, ownForJs, cameraControl, layerId, de
         return cameraControl.setMode('physical', { handle: resolvedHandle, layerId });
     }
 
+    function readVector3Like(value, target = new THREE.Vector3()) {
+        if (value?.isVector3) return target.copy(value);
+        if (Array.isArray(value) || ArrayBuffer.isView(value)) {
+            return target.set(Number(value[0]) || 0, Number(value[1]) || 0, Number(value[2]) || 0);
+        }
+        if (value && typeof value === 'object') {
+            return target.set(Number(value.x) || 0, Number(value.y) || 0, Number(value.z) || 0);
+        }
+        return target.set(0, 0, 0);
+    }
+
+    function getLookAtTarget(out = new THREE.Vector3()) {
+        const synced = cameraControl.getCameraTarget?.(out);
+        if (synced?.isVector3) return out;
+        const ctrl = cameraControl.getControls?.();
+        if (ctrl?.target?.isVector3) return out.copy(ctrl.target);
+        const cam = getActiveCamera();
+        return out.set(0, 0, -1).applyQuaternion(cam.quaternion).add(cam.position);
+    }
+
+    function applyLookAtTarget(cam, target) {
+        cam.lookAt(target);
+        cam.updateMatrix();
+        cam.updateMatrixWorld(true);
+        const ctrl = cameraControl.getControls?.();
+        if (ctrl?.target) ctrl.target.copy(target);
+        return true;
+    }
+
+    function updateCameraTransform(cam) {
+        cam.updateMatrix();
+        cam.updateMatrixWorld(true);
+    }
+
     return freezePlainObject({
         get raw() { return getActiveCamera(); },
         get position() {
@@ -77,6 +111,9 @@ function createCameraAdapter(camera, THREE, ownForJs, cameraControl, layerId, de
         get aspect() { return getActiveCamera().aspect; },
         get isPerspective() { return getActiveCamera().isPerspectiveCamera; },
         get isOrthographic() { return getActiveCamera().isOrthographicCamera; },
+        get target() {
+            return getLookAtTarget(new THREE.Vector3());
+        },
 
         getState() {
             const cam = getActiveCamera();
@@ -87,6 +124,7 @@ function createCameraAdapter(camera, THREE, ownForJs, cameraControl, layerId, de
                 far: cam.far,
                 up: cam.up.toArray(),
                 position: cam.position.toArray(),
+                target: getLookAtTarget(scratch.target).toArray(),
                 quaternion: cam.quaternion.toArray(),
                 matrix: cam.matrix.toArray(),
                 matrixWorld: cam.matrixWorld.toArray(),
@@ -145,7 +183,7 @@ function createCameraAdapter(camera, THREE, ownForJs, cameraControl, layerId, de
             if (!ensureOwnership()) return false;
             const cam = getActiveCamera();
             cam.position.set(x, y, z);
-            cam.updateMatrixWorld();
+            updateCameraTransform(cam);
             return true;
         },
 
@@ -153,7 +191,7 @@ function createCameraAdapter(camera, THREE, ownForJs, cameraControl, layerId, de
             if (!ensureOwnership()) return false;
             const cam = getActiveCamera();
             cam.position.copy(vec);
-            cam.updateMatrixWorld();
+            updateCameraTransform(cam);
             return true;
         },
 
@@ -162,7 +200,7 @@ function createCameraAdapter(camera, THREE, ownForJs, cameraControl, layerId, de
             if (!ensureOwnership()) return false;
             const cam = getActiveCamera();
             cam.quaternion.set(x, y, z, w).normalize();
-            cam.updateMatrixWorld();
+            updateCameraTransform(cam);
             return true;
         },
 
@@ -170,7 +208,7 @@ function createCameraAdapter(camera, THREE, ownForJs, cameraControl, layerId, de
             if (!ensureOwnership()) return false;
             const cam = getActiveCamera();
             cam.quaternion.copy(quat).normalize();
-            cam.updateMatrixWorld();
+            updateCameraTransform(cam);
             return true;
         },
 
@@ -179,7 +217,7 @@ function createCameraAdapter(camera, THREE, ownForJs, cameraControl, layerId, de
             const cam = getActiveCamera();
             scratch.euler.set(x, y, z, order);
             cam.quaternion.setFromEuler(scratch.euler);
-            cam.updateMatrixWorld();
+            updateCameraTransform(cam);
             return true;
         },
 
@@ -188,21 +226,24 @@ function createCameraAdapter(camera, THREE, ownForJs, cameraControl, layerId, de
             if (!ensureOwnership()) return false;
             const cam = getActiveCamera();
             if (typeof x === 'object' && x !== null) {
-                cam.lookAt(x.x ?? x[0] ?? 0, x.y ?? x[1] ?? 0, x.z ?? x[2] ?? 0);
+                readVector3Like(x, scratch.target);
             } else {
-                cam.lookAt(x, y, z);
+                scratch.target.set(x, y, z);
             }
-            cam.updateMatrixWorld();
-            // Sync controls target if available
-            const ctrl = cameraControl.getControls?.();
-            if (ctrl?.target) {
-                if (typeof x === 'object' && x !== null) {
-                    ctrl.target.set(x.x ?? x[0] ?? 0, x.y ?? x[1] ?? 0, x.z ?? x[2] ?? 0);
-                } else {
-                    ctrl.target.set(x, y, z);
-                }
-            }
-            return true;
+            return applyLookAtTarget(cam, scratch.target);
+        },
+
+        getTarget(out = new THREE.Vector3()) {
+            return getLookAtTarget(out);
+        },
+
+        lookAtTarget(target = null) {
+            if (!ensureOwnership()) return false;
+            const cam = getActiveCamera();
+            const pivot = target == null
+                ? getLookAtTarget(scratch.target)
+                : readVector3Like(target, scratch.target);
+            return applyLookAtTarget(cam, pivot);
         },
 
         // Combined position + lookAt
@@ -210,11 +251,22 @@ function createCameraAdapter(camera, THREE, ownForJs, cameraControl, layerId, de
             if (!ensureOwnership()) return false;
             const cam = getActiveCamera();
             cam.position.set(px, py, pz);
-            cam.lookAt(tx, ty, tz);
-            cam.updateMatrixWorld();
-            const ctrl = cameraControl.getControls?.();
-            if (ctrl?.target) ctrl.target.set(tx, ty, tz);
-            return true;
+            scratch.target.set(tx, ty, tz);
+            return applyLookAtTarget(cam, scratch.target);
+        },
+
+        setPositionKeepingTarget(x, y, z, target = null) {
+            if (!ensureOwnership()) return false;
+            const cam = getActiveCamera();
+            const pivot = target == null
+                ? getLookAtTarget(scratch.target)
+                : readVector3Like(target, scratch.target);
+            if (typeof x === 'object' && x !== null) {
+                readVector3Like(x, cam.position);
+            } else {
+                cam.position.set(x, y, z);
+            }
+            return applyLookAtTarget(cam, pivot);
         },
 
         // Full transform
@@ -223,7 +275,7 @@ function createCameraAdapter(camera, THREE, ownForJs, cameraControl, layerId, de
             const cam = getActiveCamera();
             cam.position.set(px, py, pz);
             cam.quaternion.set(qx, qy, qz, qw).normalize();
-            cam.updateMatrixWorld();
+            updateCameraTransform(cam);
             return true;
         },
 
@@ -236,7 +288,7 @@ function createCameraAdapter(camera, THREE, ownForJs, cameraControl, layerId, de
                 cam.matrix.fromArray(matrix);
             }
             cam.matrix.decompose(cam.position, cam.quaternion, scratch.position); // scale to scratch
-            cam.updateMatrixWorld();
+            cam.updateMatrixWorld(true);
             return true;
         },
 
@@ -286,7 +338,7 @@ function createCameraAdapter(camera, THREE, ownForJs, cameraControl, layerId, de
             );
             cam.position.copy(scratch.position).add(pivot);
             cam.lookAt(pivot);
-            cam.updateMatrixWorld();
+            updateCameraTransform(cam);
             if (ctrl?.target) ctrl.target.copy(pivot);
             return true;
         },
@@ -301,7 +353,7 @@ function createCameraAdapter(camera, THREE, ownForJs, cameraControl, layerId, de
 
             scratch.direction.copy(cam.position).sub(pivot).normalize();
             cam.position.addScaledVector(scratch.direction, delta);
-            cam.updateMatrixWorld();
+            updateCameraTransform(cam);
             return true;
         },
 
@@ -316,7 +368,7 @@ function createCameraAdapter(camera, THREE, ownForJs, cameraControl, layerId, de
 
             cam.position.addScaledVector(scratch.direction, deltaX);
             cam.position.addScaledVector(scratch.up, deltaY);
-            cam.updateMatrixWorld();
+            updateCameraTransform(cam);
 
             if (ctrl?.target) {
                 ctrl.target.addScaledVector(scratch.direction, deltaX);

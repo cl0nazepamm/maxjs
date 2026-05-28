@@ -511,6 +511,102 @@
         return false;
     }
 
+    INode* GetDirectTrackedParentNode(INode* node) const {
+        if (!node) return nullptr;
+        INode* parent = node->GetParentNode();
+        if (!parent || parent->IsRootNode()) return nullptr;
+        return IsTrackedHandle(parent->GetHandle()) ? parent : nullptr;
+    }
+
+    bool TryGetParentRelativeTransform16(INode* node,
+                                         TimeValue t,
+                                         const float* world,
+                                         float out[16]) const {
+        INode* parent = GetDirectTrackedParentNode(node);
+        if (!parent) return false;
+
+        float parentWorld[16];
+        GetTransform16(parent, t, parentWorld);
+
+        float invParent[16];
+        if (!InvertMat4CM(parentWorld, invParent)) return false;
+        MulMat4CM(invParent, world, out);
+        return true;
+    }
+
+    bool TryGetPreviousParentRelativeTransform16(ULONG handle, INode* node, float out[16]) const {
+        INode* parent = GetDirectTrackedParentNode(node);
+        if (!parent) return false;
+
+        auto nodeIt = lastSentTransforms_.find(handle);
+        if (nodeIt == lastSentTransforms_.end()) return false;
+
+        auto parentIt = lastSentTransforms_.find(parent->GetHandle());
+        if (parentIt == lastSentTransforms_.end()) return false;
+
+        float invParent[16];
+        if (!InvertMat4CM(parentIt->second.data(), invParent)) return false;
+        MulMat4CM(invParent, nodeIt->second.data(), out);
+        return true;
+    }
+
+    bool SupportsParentedDeltaHandle(ULONG handle) const {
+        return helperHandles_.find(handle) != helperHandles_.end() ||
+               geomHandles_.find(handle) != geomHandles_.end() ||
+               lightHandles_.find(handle) != lightHandles_.end();
+    }
+
+    bool HasTransformChangedForSync(ULONG handle,
+                                    INode* node,
+                                    TimeValue t,
+                                    float currentWorldOut[16] = nullptr) const {
+        if (!node) return false;
+
+        auto worldIt = lastSentTransforms_.find(handle);
+        if (worldIt == lastSentTransforms_.end()) return true;
+
+        float world[16];
+        GetTransform16(node, t, world);
+        if (currentWorldOut) std::copy(world, world + 16, currentWorldOut);
+
+        float local[16];
+        float previousLocal[16];
+        if (SupportsParentedDeltaHandle(handle) &&
+            TryGetParentRelativeTransform16(node, t, world, local) &&
+            TryGetPreviousParentRelativeTransform16(handle, node, previousLocal)) {
+            return !TransformEquals16(local, previousLocal);
+        }
+
+        return !TransformEquals16(world, worldIt->second.data());
+    }
+
+    void RememberSkippedParentedTransform(ULONG handle, INode* node, const float* world) {
+        if (!SupportsParentedDeltaHandle(handle) || !GetDirectTrackedParentNode(node)) return;
+        RememberSentTransform(handle, world);
+    }
+
+    int GetTrackedHierarchyDepth(INode* node) const {
+        int depth = 0;
+        for (INode* parent = node ? node->GetParentNode() : nullptr;
+             parent && !parent->IsRootNode();
+             parent = parent->GetParentNode()) {
+            if (IsTrackedHandle(parent->GetHandle())) ++depth;
+        }
+        return depth;
+    }
+
+    void SortHandlesByHierarchyDepth(std::vector<ULONG>& handles, Interface* ip) const {
+        if (!ip || handles.size() < 2) return;
+        std::stable_sort(handles.begin(), handles.end(), [this, ip](ULONG a, ULONG b) {
+            INode* an = ip->GetINodeByHandle(a);
+            INode* bn = ip->GetINodeByHandle(b);
+            const int ad = GetTrackedHierarchyDepth(an);
+            const int bd = GetTrackedHierarchyDepth(bn);
+            if (ad != bd) return ad < bd;
+            return a < b;
+        });
+    }
+
     static constexpr ULONGLONG kInteractiveCooldownMs = 250;
     static constexpr ULONGLONG kFullSyncInteractiveDeferMs = 650;
     static constexpr ULONGLONG kMaterialInteractiveCooldownMs = 400;
@@ -892,6 +988,7 @@
         const std::uint32_t frameId = AllocateFrameId();
         maxjs::sync::DeltaFrameBuilder frame(frameId);
         const size_t handleCount =
+            helperHandles_.size() +
             geomHandles_.size() +
             lightHandles_.size() +
             splatHandles_.size() +
@@ -899,6 +996,30 @@
             gltfHandles_.size();
         frame.ReserveBytes(32 + handleCount * 96 + 80);
         frame.BeginFrame();
+
+        auto shouldSendPlaybackHandle = [&](ULONG handle) -> bool {
+            INode* node = ip->GetINodeByHandle(handle);
+            if (!node) return true;
+            if (!SupportsParentedDeltaHandle(handle)) return true;
+            if (!GetDirectTrackedParentNode(node)) return true;
+            float currentWorld[16];
+            if (HasTransformChangedForSync(handle, node, t, currentWorld)) return true;
+            RememberSkippedParentedTransform(handle, node, currentWorld);
+            return false;
+        };
+
+        std::vector<ULONG> playbackHandles;
+        playbackHandles.reserve(handleCount);
+        auto collectHandle = [&](ULONG handle) {
+            if (shouldSendPlaybackHandle(handle)) playbackHandles.push_back(handle);
+        };
+        for (ULONG handle : helperHandles_) collectHandle(handle);
+        for (ULONG handle : geomHandles_) collectHandle(handle);
+        for (ULONG handle : lightHandles_) collectHandle(handle);
+        for (ULONG handle : splatHandles_) collectHandle(handle);
+        for (ULONG handle : audioHandles_) collectHandle(handle);
+        for (ULONG handle : gltfHandles_) collectHandle(handle);
+        SortHandlesByHierarchyDepth(playbackHandles, ip);
 
         auto appendHandle = [&](ULONG handle) {
             INode* node = ip->GetINodeByHandle(handle);
@@ -935,14 +1056,13 @@
             }
 
             frame.UpdateTransform(static_cast<std::uint32_t>(handle), xform);
+            if (helperHandles_.find(handle) != helperHandles_.end()) {
+                frame.UpdateSelection(static_cast<std::uint32_t>(handle), node->Selected() != 0);
+            }
             frame.UpdateVisibility(static_cast<std::uint32_t>(handle), visible);
         };
 
-        for (ULONG handle : geomHandles_) appendHandle(handle);
-        for (ULONG handle : lightHandles_) appendHandle(handle);
-        for (ULONG handle : splatHandles_) appendHandle(handle);
-        for (ULONG handle : audioHandles_) appendHandle(handle);
-        for (ULONG handle : gltfHandles_) appendHandle(handle);
+        for (ULONG handle : playbackHandles) appendHandle(handle);
 
         CameraData cam = {};
         GetActiveCamera(cam);
@@ -1105,6 +1225,7 @@
 
     bool ShouldBootstrapVisibleNode(INode* node, TimeValue t) const {
         if (!node) return false;
+        if (IsMaxJSHierarchyNode(node, t)) return true;
         if (IsForestPackNode(node) || IsRailCloneNode(node) ||
             (IsTyFlowAvailable() && IsTyFlowNode(node))) {
             return true;
@@ -1132,6 +1253,12 @@
     }
 
     void MarkTrackedNodeDirty(INode* node) {
+        if (!node) return;
+        const ULONG rootHandle = node->GetHandle();
+        if (IsTrackedHandle(rootHandle)) {
+            if (fastDirtyHandles_.insert(rootHandle).second) QueueFastFlush();
+            return;
+        }
         bool changed = false;
         VisitNodeSubtree(node, [this, &changed](INode* current) {
             const ULONG handle = current->GetHandle();
@@ -1352,12 +1479,11 @@
                 const ULONG handle = current->GetHandle();
                 if (!IsTrackedHandle(handle)) return;
 
-                float xform[16];
-                GetTransform16(current, t, xform);
-
-                auto it = lastSentTransforms_.find(handle);
-                if (it == lastSentTransforms_.end() || !TransformEquals16(xform, it->second.data())) {
+                float currentWorld[16];
+                if (HasTransformChangedForSync(handle, current, t, currentWorld)) {
                     if (fastDirtyHandles_.insert(handle).second) changed = true;
+                } else {
+                    RememberSkippedParentedTransform(handle, current, currentWorld);
                 }
             });
         }
@@ -1379,12 +1505,11 @@
             INode* node = ip->GetINodeByHandle(handle);
             if (!node) continue;
 
-            float xform[16];
-            GetTransform16(node, t, xform);
-
-            auto it = lastSentTransforms_.find(handle);
-            if (it == lastSentTransforms_.end() || !TransformEquals16(xform, it->second.data())) {
+            float currentWorld[16];
+            if (HasTransformChangedForSync(handle, node, t, currentWorld)) {
                 if (fastDirtyHandles_.insert(handle).second) changed = true;
+            } else {
+                RememberSkippedParentedTransform(handle, node, currentWorld);
             }
         }
 
@@ -1515,6 +1640,7 @@
         fastDirtyHandles_.insert(audioHandles_.begin(), audioHandles_.end());
         fastDirtyHandles_.insert(gltfHandles_.begin(), gltfHandles_.end());
         fastDirtyHandles_.insert(hairHandles_.begin(), hairHandles_.end());
+        fastDirtyHandles_.insert(helperHandles_.begin(), helperHandles_.end());
         QueueFastFlush();
     }
 
@@ -1529,12 +1655,11 @@
             INode* node = GetCOREInterface() ? GetCOREInterface()->GetINodeByHandle(handle) : nullptr;
             if (!node) return;
 
-            float xform[16];
-            GetTransform16(node, t, xform);
-
-            auto it = lastSentTransforms_.find(handle);
-            if (it == lastSentTransforms_.end() || !TransformEquals16(xform, it->second.data())) {
+            float currentWorld[16];
+            if (HasTransformChangedForSync(handle, node, t, currentWorld)) {
                 if (fastDirtyHandles_.insert(handle).second) changed = true;
+            } else {
+                RememberSkippedParentedTransform(handle, node, currentWorld);
             }
         };
 
@@ -1548,6 +1673,7 @@
         for (ULONG handle : audioHandles_) markIfTransformChanged(handle);
         for (ULONG handle : gltfHandles_) markIfTransformChanged(handle);
         for (ULONG handle : hairHandles_) markIfTransformChanged(handle);
+        for (ULONG handle : helperHandles_) markIfTransformChanged(handle);
 
         if (changed) {
             QueueFastFlush();
@@ -1848,6 +1974,7 @@
             ExtractJsonBool(msg, L"includeSnapshotUi", options.includeSnapshotUi);
             ExtractJsonBool(msg, L"includeRuntimeScene", options.includeRuntimeScene);
             ExtractJsonBool(msg, L"copyAssets", options.copyAssets);
+            ExtractJsonBool(msg, L"includeRapierVendor", options.includeRapierVendor);
             ExtractJsonBool(msg, L"includeAnimations", options.includeAnimations);
             ExtractJsonBool(msg, L"includeTransformAnimation", options.includeTransformAnimation);
             ExtractJsonBool(msg, L"includeGeometryAnimation", options.includeGeometryAnimation);
@@ -1965,8 +2092,9 @@
             splatHandles_.clear();
             audioHandles_.clear();
             gltfHandles_.clear();
-        hairHandles_.clear();
-        deformHandles_.clear();
+            hairHandles_.clear();
+            helperHandles_.clear();
+            deformHandles_.clear();
             audioHashMap_.clear();
             gltfHashMap_.clear();
             geoScanCursor_ = 0;
@@ -2452,6 +2580,8 @@
         std::vector<ULONG> dirtyHandles;
         dirtyHandles.reserve(fastDirtyHandles_.size());
         for (ULONG handle : fastDirtyHandles_) dirtyHandles.push_back(handle);
+        Interface* sortIp = GetCOREInterface();
+        SortHandlesByHierarchyDepth(dirtyHandles, sortIp);
         std::vector<ULONG> deferredHandles;
         if (dirtyHandles.size() > kMaxFastFlushHandlesPerPass) {
             deferredHandles.assign(
@@ -2495,6 +2625,7 @@
         std::vector<ULONG> combinedNodeHandles = dirtyHandles;
         combinedNodeHandles.reserve(dirtyHandles.size() + visibilityDirty.size());
         for (ULONG handle : visibilityDirty) combinedNodeHandles.push_back(handle);
+        SortHandlesByHierarchyDepth(combinedNodeHandles, sortIp);
 
         // Geometry fast path: send changed mesh vertex data via binary geo_fast.
         // Then fall through to binary delta for transform/visibility/etc updates.
@@ -2573,6 +2704,7 @@
                 audioHandles_.erase(handle);
                 gltfHandles_.erase(handle);
                 hairHandles_.erase(handle);
+                helperHandles_.erase(handle);
                 deformHandles_.erase(handle);
                 lastSentTransforms_.erase(handle);
                 materialFastDirtyHandles_.erase(handle);
@@ -2769,11 +2901,10 @@
         TimeValue t = ip->GetTime();
         const std::uint32_t frameId = AllocateFrameId();
         maxjs::sync::DeltaFrameBuilder frame(frameId);
-        frame.ReserveBytes(32 + geomHandles_.size() * (includeMaterialScalars ? 120 : 96) + 64);
+        frame.ReserveBytes(32 + (geomHandles_.size() + helperHandles_.size()) * (includeMaterialScalars ? 120 : 96) + 64);
         frame.BeginFrame();
 
-        for (auto it = geomHandles_.begin(); it != geomHandles_.end(); ) {
-            ULONG handle = *it;
+        auto appendHandle = [&](ULONG handle, bool isHelper) {
             INode* node = ip->GetINodeByHandle(handle);
             if (!node) {
                 mtlHashMap_.erase(handle);
@@ -2784,8 +2915,10 @@
                 deformChannelHashMap_.erase(handle);
                 skinnedControlIdxCache_.erase(handle);
                 skinnedFastSourceCache_.erase(handle);
-                it = geomHandles_.erase(it);
-                continue;
+                lastSentTransforms_.erase(handle);
+                if (isHelper) helperHandles_.erase(handle);
+                else geomHandles_.erase(handle);
+                return;
             }
 
             float xform[16];
@@ -2794,7 +2927,7 @@
             frame.UpdateSelection(static_cast<std::uint32_t>(handle), node->Selected() != 0);
             frame.UpdateVisibility(static_cast<std::uint32_t>(handle), IsMaxJsSyncDrawVisible(node));
 
-            if (includeMaterialScalars) {
+            if (!isHelper && includeMaterialScalars) {
                 float col[3] = {0.8f, 0.8f, 0.8f};
                 float rough = 0.5f;
                 float metal = 0.0f;
@@ -2807,8 +2940,17 @@
                     frame.UpdateMaterialScalar(static_cast<std::uint32_t>(handle), col, rough, metal, opac);
                 }
             }
+        };
 
-            ++it;
+        {
+            std::vector<ULONG> handles(helperHandles_.begin(), helperHandles_.end());
+            SortHandlesByHierarchyDepth(handles, ip);
+            for (ULONG handle : handles) appendHandle(handle, true);
+        }
+        {
+            std::vector<ULONG> handles(geomHandles_.begin(), geomHandles_.end());
+            SortHandlesByHierarchyDepth(handles, ip);
+            for (ULONG handle : handles) appendHandle(handle, false);
         }
 
         CameraData cam = {};
@@ -4115,6 +4257,13 @@
         if (includeVisibility) {
             appendComma();
             ss << L"\"v\":" << (IsMaxJsSyncDrawVisible(node) ? L'1' : L'0');
+        }
+        {
+            const ULONG parentHandle = GetMaxJSParentHandle(node);
+            if (parentHandle != 0) {
+                appendComma();
+                ss << L"\"p\":" << parentHandle;
+            }
         }
 
         // Node name

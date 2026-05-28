@@ -1353,6 +1353,25 @@ static void WriteJsModJson(std::wostringstream& ss, const JsModData&) {
     ss << L"\"jsmod\":true";
 }
 
+static bool IsMaxJSHierarchyNode(INode* node, TimeValue t) {
+    if (!node || node->IsRootNode()) return false;
+    if (node->IsGroupHead()) return true;
+    ObjectState os = node->EvalWorldState(t);
+    return os.obj && os.obj->SuperClassID() == HELPER_CLASS_ID;
+}
+
+static ULONG GetMaxJSParentHandle(INode* node) {
+    if (!node) return 0;
+    INode* parent = node->GetParentNode();
+    if (!parent || parent->IsRootNode()) return 0;
+    return parent->GetHandle();
+}
+
+static void WriteNodeParentJson(std::wostringstream& ss, INode* node) {
+    const ULONG parentHandle = GetMaxJSParentHandle(node);
+    if (parentHandle != 0) ss << L",\"p\":" << parentHandle;
+}
+
 static void WriteNodePropsJson(std::wostringstream& ss, INode* node, TimeValue t) {
     ss << L"\"rend\":" << (node->Renderable() ? L'1' : L'0');
     ss << L",\"bcull\":" << (node->GetBackCull() ? L'1' : L'0');

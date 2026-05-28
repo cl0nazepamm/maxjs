@@ -441,7 +441,7 @@ function createCameraAdapter(camera, THREE, ownForJs, cameraControl, layerId, de
     });
 }
 
-function createMaxNodeAdapter({ handle, getObject, THREE, createAnchor, layerId, getTransformApi, setMaterialMap }) {
+function createMaxNodeAdapter({ handle, getObject, THREE, createAnchor, layerId, getTransformApi, setMaterialMap, getNodeAdapter }) {
     const scratch = {
         vA: new THREE.Vector3(),
         vB: new THREE.Vector3(),
@@ -531,7 +531,43 @@ function createMaxNodeAdapter({ handle, getObject, THREE, createAnchor, layerId,
         get visible() { return !!getObject()?.visible; },
         setVisible(v) { const obj = getObject(); if (obj) obj.visible = !!v; },
         get isMesh() { return !!getObject()?.isMesh; },
+        get isHelper() { return !!getObject()?.userData?.maxjsHelper; },
         get jsmod() { return !!getObject()?.userData?.jsmod; },
+        get parentHandle() {
+            const h = Number(getObject()?.userData?.maxjsParentHandle);
+            return Number.isFinite(h) && h > 0 ? h : null;
+        },
+        get parent() {
+            const h = Number(getObject()?.userData?.maxjsParentHandle);
+            return Number.isFinite(h) && h > 0 ? getNodeAdapter?.(h) ?? null : null;
+        },
+        get children() {
+            const obj = getObject();
+            if (!obj?.children?.length) return Object.freeze([]);
+            const out = [];
+            for (const child of obj.children) {
+                const h = child?.userData?.maxjsHandle;
+                if (h != null) {
+                    const adapter = getNodeAdapter?.(h);
+                    if (adapter) out.push(adapter);
+                }
+            }
+            return Object.freeze(out);
+        },
+        descendants() {
+            const obj = getObject();
+            if (!obj?.children?.length) return Object.freeze([]);
+            const out = [];
+            obj.traverse(child => {
+                if (child === obj) return;
+                const h = child?.userData?.maxjsHandle;
+                if (h != null) {
+                    const adapter = getNodeAdapter?.(h);
+                    if (adapter) out.push(adapter);
+                }
+            });
+            return Object.freeze(out);
+        },
         get materialType() {
             const obj = getObject();
             const mat = Array.isArray(obj?.material) ? obj.material[0] : obj?.material;

@@ -305,6 +305,7 @@ export function createLayerManager({
                 layerId: layer.id,
                 getTransformApi: createTransformApi,
                 setMaterialMap: (h, slot, tex) => setMaterialMapOverride(layer.id, h, slot, tex),
+                getNodeAdapter: (nextHandle) => getLayerNodeAdapter(layer, nextHandle),
             });
             layer.nodeAdapters.set(handle, adapter);
         }

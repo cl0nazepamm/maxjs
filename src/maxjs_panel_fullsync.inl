@@ -15,6 +15,7 @@
         audioHandles_.clear();
         gltfHandles_.clear();
         hairHandles_.clear();
+        helperHandles_.clear();
         deformHandles_.clear();
         pluginInstHandles_.clear();
         pluginInstHash_.clear();
@@ -180,13 +181,30 @@
                 continue;
             }
 
-            // Hidden node — skip extraction but recurse into children
+            ULONG handle = node->GetHandle();
+            if (IsMaxJSHierarchyNode(node, t)) {
+                float xform[16]; GetTransform16(node, t, xform);
+                if (!first) ss << L',';
+                ss << L"{\"h\":" << handle;
+                ss << L",\"n\":\"" << EscapeJson(node->GetName()) << L'"';
+                ss << L",\"helper\":true";
+                ss << L",\"s\":" << (node->Selected() ? L'1' : L'0');
+                ss << L",\"vis\":" << (IsMaxJsSyncDrawVisible(node) ? L'1' : L'0');
+                WriteNodeParentJson(ss, node);
+                ss << L",\"t\":"; WriteFloats(ss, xform, 16);
+                ss << L'}';
+                first = false;
+                helperHandles_.insert(handle);
+                RememberSentTransform(handle, xform);
+                WriteSceneNodes(node, t, ss, first, prevGeom, materialLibrary);
+                continue;
+            }
+            // Hidden render nodes are skipped, but their helper/group parents
+            // above still stay in sync as transform-only hierarchy carriers.
             if (node->IsNodeHidden(TRUE)) {
                 WriteSceneNodes(node, t, ss, first, prevGeom, materialLibrary);
                 continue;
             }
-
-            ULONG handle = node->GetHandle();
             if (HasEnabledHairModifier(node)) {
                 pluginInstHandles_.insert(handle);
             }
@@ -214,6 +232,7 @@
                 ss << L"{\"h\":" << handle;
                 ss << L",\"n\":\"" << EscapeJson(node->GetName()) << L'"';
                 ss << L",\"s\":" << (node->Selected() ? L'1' : L'0');
+                WriteNodeParentJson(ss, node);
                 ss << L",\"props\":{"; WriteNodePropsJson(ss, node, t); ss << L'}';
                 { JsModData jm; GetJsModData(node, t, jm); if (jm.found) { ss << L","; WriteJsModJson(ss, jm); } }
                 ss << L",\"t\":"; WriteFloats(ss, xform, 16);
@@ -307,6 +326,7 @@
                     ss << L"{\"h\":" << handle;
                     ss << L",\"n\":\"" << EscapeJson(node->GetName()) << L'"';
                     ss << L",\"s\":" << (node->Selected() ? L'1' : L'0');
+                    WriteNodeParentJson(ss, node);
                     ss << L",\"props\":{"; WriteNodePropsJson(ss, node, t); ss << L'}';
                     { JsModData jm; GetJsModData(node, t, jm); if (jm.found) { ss << L","; WriteJsModJson(ss, jm); } }
                     ss << L",\"t\":"; WriteFloats(ss, xform, 16);
@@ -387,6 +407,7 @@
         audioHandles_.clear();
         gltfHandles_.clear();
         hairHandles_.clear();
+        helperHandles_.clear();
         deformHandles_.clear();
         pluginInstHandles_.clear();
         pluginInstHash_.clear();
@@ -396,6 +417,7 @@
         struct NodeGeo {
             ULONG handle;
             INode* node;
+            ULONG parentHandle = 0;
             std::vector<float> verts, uvs, uv2s, norms;
             std::vector<VertexColorAttributeRecord> vertexColors;
             std::vector<int> indices;
@@ -403,6 +425,7 @@
             bool changed;
             bool visible = true;
             bool spline = false;
+            bool helper = false;
             size_t vOff, iOff, uvOff, uv2Off, nOff;
             uint64_t objId = 0;      // evaluated Object* — instances share this
             ULONG instOfHandle = 0;  // 0 = owns geometry, else = shares from this handle
@@ -464,9 +487,22 @@
                     collect(node);
                     continue;
                 }
+                if (IsMaxJSHierarchyNode(node, t)) {
+                    NodeGeo helper = {};
+                    helper.node = node;
+                    helper.handle = node->GetHandle();
+                    helper.parentHandle = GetMaxJSParentHandle(node);
+                    helper.visible = IsMaxJsSyncDrawVisible(node);
+                    helper.helper = true;
+                    geos.push_back(std::move(helper));
+                    helperHandles_.insert(node->GetHandle());
+                    collect(node);
+                    continue;
+                }
                 NodeGeo ng;
                 ng.node = node;
                 ng.handle = node->GetHandle();
+                ng.parentHandle = GetMaxJSParentHandle(node);
                 ng.changed = false;
                 ng.visible = IsMaxJsSyncDrawVisible(node);
                 if (HasEnabledHairModifier(node)) {
@@ -692,12 +728,21 @@
         for (auto& ng : geos) {
             float xform[16]; GetTransform16(ng.node, t, xform);
             RememberSentTransform(ng.handle, xform);
-            MaxJSPBR pbr; ExtractPBR(ng.node, t, pbr);
 
             if (!first) ss << L',';
             ss << L"{\"h\":" << ng.handle;
             ss << L",\"n\":\"" << EscapeJson(ng.node->GetName()) << L'"';
             ss << L",\"s\":" << (ng.node->Selected() ? L'1' : L'0');
+            if (ng.parentHandle != 0) ss << L",\"p\":" << ng.parentHandle;
+            if (ng.helper) {
+                ss << L",\"helper\":true";
+                ss << L",\"vis\":" << (ng.visible ? L'1' : L'0');
+                ss << L",\"t\":"; WriteFloats(ss, xform, 16);
+                ss << L'}';
+                first = false;
+                continue;
+            }
+            MaxJSPBR pbr; ExtractPBR(ng.node, t, pbr);
             ss << L",\"props\":{"; WriteNodePropsJson(ss, ng.node, t); ss << L'}';
             { JsModData jm; GetJsModData(ng.node, t, jm); if (jm.found) { ss << L","; WriteJsModJson(ss, jm); } }
             ss << L",\"vis\":" << (ng.visible ? L'1' : L'0');
@@ -901,9 +946,15 @@
 
         std::vector<ULONG> scratchHandles;
         const std::vector<ULONG>* sourceHandles = handles;
-        if (!sourceHandles) {
-            scratchHandles.reserve(geomHandles_.size());
+        if (sourceHandles) {
+            scratchHandles.assign(sourceHandles->begin(), sourceHandles->end());
+            SortHandlesByHierarchyDepth(scratchHandles, ip);
+            sourceHandles = &scratchHandles;
+        } else {
+            scratchHandles.reserve(geomHandles_.size() + helperHandles_.size());
+            for (ULONG handle : helperHandles_) scratchHandles.push_back(handle);
             for (ULONG handle : geomHandles_) scratchHandles.push_back(handle);
+            SortHandlesByHierarchyDepth(scratchHandles, ip);
             sourceHandles = &scratchHandles;
         }
 
@@ -925,22 +976,17 @@
                 deformChannelHashMap_.erase(handle);
                 skinnedControlIdxCache_.erase(handle);
                 skinnedFastSourceCache_.erase(handle);
+                helperHandles_.erase(handle);
                 lastSentTransforms_.erase(handle);
                 continue;
             }
 
-            if (geomHandles_.find(handle) == geomHandles_.end()) {
+            const bool isHelper = helperHandles_.find(handle) != helperHandles_.end();
+            if (!isHelper && geomHandles_.find(handle) == geomHandles_.end()) {
                 continue;
             }
             float xform[16]; GetTransform16(node, t, xform);
             RememberSentTransform(handle, xform);
-
-            float col[3] = {0.8f,0.8f,0.8f};
-            float rough = 0.5f, metal = 0.0f, opac = 1.0f;
-            if (includeMaterialScalars) {
-                Mtl* foundMtl = FindSupportedMaterial(node->GetMtl());
-                ExtractMaterialScalarPreview(foundMtl, node, t, col, rough, metal, opac);
-            }
 
             const bool visible = IsMaxJsSyncDrawVisible(node);
 
@@ -948,12 +994,21 @@
             ss << L"{\"h\":" << handle;
             ss << L",\"s\":" << (node->Selected() ? L'1' : L'0');
             ss << L",\"vis\":" << (visible ? L'1' : L'0');
-            { JsModData jm; GetJsModData(node, t, jm); ss << L",\"jsmod\":" << (jm.found ? L"true" : L"false"); }
+            if (isHelper) {
+                ss << L",\"helper\":true";
+                WriteNodeParentJson(ss, node);
+            } else {
+                { JsModData jm; GetJsModData(node, t, jm); ss << L",\"jsmod\":" << (jm.found ? L"true" : L"false"); }
+            }
             ss << L",\"t\":"; WriteFloats(ss, xform, 16);
             // For Multi/Sub objects, skip scalar material pushes to avoid
             // corrupting material arrays on the web side.
-            Mtl* multiMtl = includeMaterialScalars ? FindMultiSubMtl(node->GetMtl()) : nullptr;
-            if (includeMaterialScalars && !(multiMtl && multiMtl->NumSubMtls() > 1)) {
+            Mtl* multiMtl = (!isHelper && includeMaterialScalars) ? FindMultiSubMtl(node->GetMtl()) : nullptr;
+            if (!isHelper && includeMaterialScalars && !(multiMtl && multiMtl->NumSubMtls() > 1)) {
+                float col[3] = {0.8f,0.8f,0.8f};
+                float rough = 0.5f, metal = 0.0f, opac = 1.0f;
+                Mtl* foundMtl = FindSupportedMaterial(node->GetMtl());
+                ExtractMaterialScalarPreview(foundMtl, node, t, col, rough, metal, opac);
                 ss << L",\"mat\":{\"color\":[";
                 WriteFloatValue(ss, col[0], 0.8f); ss << L',';
                 WriteFloatValue(ss, col[1], 0.8f); ss << L',';

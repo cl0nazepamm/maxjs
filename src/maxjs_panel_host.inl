@@ -22,6 +22,7 @@
     std::unordered_set<ULONG> audioHandles_;
     std::unordered_set<ULONG> gltfHandles_;
     std::unordered_set<ULONG> hairHandles_;
+    std::unordered_set<ULONG> helperHandles_;
     // Meshes with a modifier stack whose output can change between frames
     // independent of transform events (Path Deform, Skin, Bend, FFD, etc.).
     // Polled every redraw so animation playback catches deformation without
@@ -156,6 +157,7 @@
         std::wstring id;           // raw filename (sans extension) — stable identity, incl. NN_ prefix
         std::wstring displayName;  // NN_ prefix stripped
         std::wstring folder;       // forward-slash path relative to inlines/, empty for top-level
+        std::wstring stamp;        // content identity from file write time + size
         int priority;              // 100 default, from NN_ prefix
         bool enabled;
     };
@@ -185,6 +187,14 @@
             entry.id = id;
             entry.priority = ParseInlinePriorityPrefix(id, entry.displayName);
             entry.enabled = enabled;
+
+            ULARGE_INTEGER size = {};
+            size.LowPart = fd.nFileSizeLow;
+            size.HighPart = fd.nFileSizeHigh;
+            entry.stamp =
+                std::to_wstring(FileTimeToUint64(fd.ftLastWriteTime)) +
+                L"-" +
+                std::to_wstring(size.QuadPart);
 
             std::wstring folder = subPath;
             std::replace(folder.begin(), folder.end(), L'\\', L'/');
@@ -216,7 +226,8 @@
         });
 
         std::wostringstream ss;
-        ss << L"{\"type\":\"inline_layers_state\",\"layers\":[";
+        const std::uint64_t dirStamp = dir.empty() ? 0 : GetDirectoryWriteStamp(dir);
+        ss << L"{\"type\":\"inline_layers_state\",\"stamp\":\"" << dirStamp << L"\",\"layers\":[";
         bool first = true;
         std::wstring lastKey;
         for (const auto& layer : layers) {
@@ -230,6 +241,7 @@
                << L"\",\"id\":\"" << EscapeJson(layer.id.c_str())
                << L"\",\"name\":\"" << EscapeJson(layer.displayName.c_str())
                << L"\",\"folder\":\"" << EscapeJson(layer.folder.c_str())
+               << L"\",\"stamp\":\"" << EscapeJson(layer.stamp.c_str())
                << L"\",\"priority\":" << layer.priority
                << L",\"enabled\":" << (layer.enabled ? L"true" : L"false") << L'}';
         }

@@ -155,7 +155,35 @@ function isFiniteArray(arr, len) {
     for (let i = 0; i < arr.length; i++) if (!Number.isFinite(arr[i])) return false;
     return true;
 }
-function applyTransform(mesh, t) {
+const transformScratch = {
+    raw: new THREE.Matrix4(),
+    parentInRoot: new THREE.Matrix4(),
+    parentInv: new THREE.Matrix4(),
+    rootInv: new THREE.Matrix4(),
+};
+function getParentObject(nd, obj, nodeMap, maxRoot) {
+    const parentHandle = Number(nd?.p);
+    const parent = Number.isFinite(parentHandle) && parentHandle > 0
+        ? nodeMap.get(parentHandle)
+        : null;
+    if (!parent || parent === obj) return maxRoot;
+    for (let cursor = parent; cursor; cursor = cursor.parent) {
+        if (cursor === obj) return maxRoot;
+    }
+    return parent;
+}
+function syncParent(obj, nd, nodeMap, maxRoot) {
+    if (!obj) return maxRoot;
+    const parent = getParentObject(nd, obj, nodeMap, maxRoot);
+    obj.userData ??= {};
+    obj.userData.maxjsParentHandle = parent === maxRoot ? 0 : (Number(nd?.p) || 0);
+    if (obj.parent !== parent) parent.add(obj);
+    return parent;
+}
+function removeNodeObject(obj) {
+    obj?.parent?.remove(obj);
+}
+function applyTransform(mesh, t, maxRoot) {
     if (!isFiniteArray(t, 16)) {
         if (arraysAlmostEqual(mesh.matrix.elements, I16)) return false;
         mesh.matrix.identity();
@@ -165,8 +193,19 @@ function applyTransform(mesh, t) {
         mesh.matrixWorldNeedsUpdate = true;
         return true;
     }
-    if (arraysAlmostEqual(mesh.matrix.elements, t)) return false;
-    mesh.matrix.fromArray(t);
+    transformScratch.raw.fromArray(t);
+    if (mesh.parent && maxRoot && mesh.parent !== maxRoot) {
+        maxRoot.updateMatrixWorld(true);
+        mesh.parent.updateMatrixWorld(true);
+        transformScratch.rootInv.copy(maxRoot.matrixWorld).invert();
+        transformScratch.parentInRoot
+            .copy(transformScratch.rootInv)
+            .multiply(mesh.parent.matrixWorld);
+        transformScratch.parentInv.copy(transformScratch.parentInRoot).invert();
+        transformScratch.raw.premultiply(transformScratch.parentInv);
+    }
+    if (arraysAlmostEqual(mesh.matrix.elements, transformScratch.raw.elements)) return false;
+    mesh.matrix.copy(transformScratch.raw);
     mesh.matrixWorldNeedsUpdate = true;
     return true;
 }
@@ -369,7 +408,7 @@ export async function applySceneBin({ buffer, meta, ctx, hooks: userHooks = {}, 
     for (const handle of toRemove) {
         const mesh = nodeMap.get(handle);
         if (mesh) {
-            maxRoot.remove(mesh);
+            removeNodeObject(mesh);
             releaseGeometryRef(refCounts, mesh.geometry);
             hooks.disposeMaterial(mesh.material);
         }
@@ -383,6 +422,33 @@ export async function applySceneBin({ buffer, meta, ctx, hooks: userHooks = {}, 
 
     for (const nd of meta.nodes) {
         let mesh = nodeMap.get(nd.h);
+        if (nd.helper === true) {
+            if (mesh && mesh.userData?.maxjsHelper !== true) {
+                removeNodeObject(mesh);
+                releaseGeometryRef(refCounts, mesh.geometry);
+                hooks.disposeMaterial(mesh.material);
+                mesh.geometry?.dispose?.();
+                mesh = null;
+            }
+            if (!mesh) {
+                mesh = new THREE.Object3D();
+                mesh.matrixAutoUpdate = false;
+                mesh.frustumCulled = false;
+                nodeMap.set(nd.h, mesh);
+                addedHandles.push(nd.h);
+                sceneChanged = true;
+            }
+            mesh.name = nd.n ?? '';
+            mesh.userData ??= {};
+            mesh.userData.maxjsHandle = nd.h;
+            mesh.userData.maxjsHelper = true;
+            syncParent(mesh, nd, nodeMap, maxRoot);
+            const visChanged = hooks.applyVisibility(mesh, nd.vis);
+            const xformChanged = applyTransform(mesh, nd.t, maxRoot);
+            if (nd.s != null) hooks.applySelection(mesh, nd.s);
+            if (visChanged || xformChanged) transformsChanged = true;
+            continue;
+        }
 
         // Instance buckets — early-out if this handle is currently bucketed.
         if (stableBucketHandles?.has(nd.h) && hooks.getInstanceBucketFor(nd.h)) {
@@ -427,7 +493,7 @@ export async function applySceneBin({ buffer, meta, ctx, hooks: userHooks = {}, 
         const skinTypeMismatch = !!mesh && nd.skin && !mesh.isSkinnedMesh && !wantsLine;
 
         if (renderableTypeMismatch || skinTypeMismatch) {
-            maxRoot.remove(mesh);
+            removeNodeObject(mesh);
             releaseGeometryRef(refCounts, mesh.geometry);
             hooks.disposeMaterial(mesh.material);
             nodeMap.delete(nd.h);
@@ -464,7 +530,7 @@ export async function applySceneBin({ buffer, meta, ctx, hooks: userHooks = {}, 
             mesh.castShadow = nd.props?.cshadow !== false && nd.props?.cshadow !== 0;
             mesh.receiveShadow = nd.props?.rshadow !== false && nd.props?.rshadow !== 0;
             hooks.stampMaterial(mesh, nd);
-            maxRoot.add(mesh);
+            syncParent(mesh, nd, nodeMap, maxRoot);
             nodeMap.set(nd.h, mesh);
             retainGeometryRef(refCounts, mesh.geometry);
             addedHandles.push(nd.h);
@@ -476,8 +542,9 @@ export async function applySceneBin({ buffer, meta, ctx, hooks: userHooks = {}, 
         mesh.receiveShadow = nd.props?.rshadow !== false && nd.props?.rshadow !== 0;
 
         // Transform + visibility (a tiny subset of finalizeSceneNode).
+        syncParent(mesh, nd, nodeMap, maxRoot);
         const visChanged = hooks.applyVisibility(mesh, nd.vis);
-        const xformChanged = applyTransform(mesh, nd.t);
+        const xformChanged = applyTransform(mesh, nd.t, maxRoot);
         if (nd.s != null) hooks.applySelection(mesh, nd.s);
         if (visChanged || xformChanged) transformsChanged = true;
     }

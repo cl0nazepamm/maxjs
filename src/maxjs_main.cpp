@@ -626,9 +626,11 @@ public:
 
     struct SnapshotNodeRecord {
         ULONG handle = 0;
+        ULONG parentHandle = 0;
         INode* node = nullptr;
         bool visible = true;
         bool spline = false;
+        bool helper = false;
         std::vector<float> verts, uvs, uv2s, norms;
         std::vector<VertexColorAttributeRecord> vertexColors;
         std::vector<int> indices;
@@ -749,6 +751,7 @@ public:
         bool includeSnapshotUi = true;
         bool includeRuntimeScene = true;
         bool copyAssets = true;
+        bool includeRapierVendor = false;
         bool includeAnimations = true;
         bool includeTransformAnimation = true;
         bool includeGeometryAnimation = true;
@@ -1437,6 +1440,7 @@ public:
                                          const Interval& range,
                                          TimeValue currentTime,
                                          const SnapshotExportOptions& options,
+                                         INode* localParentNode,
                                          SnapshotAnimationTargetDef& outTarget) {
         if (!node) return false;
 
@@ -1445,10 +1449,14 @@ public:
             BuildAnimatableTimeSamples(node->GetTMController(), range, currentTime, discoveryTimes);
         const bool hasVisibilityAnimation =
             BuildAnimatableTimeSamples(node->GetVisController(), range, currentTime, discoveryTimes);
-        // Parent-driven motion still changes this node's world transform in the snapshot.
-        for (INode* parent = node->GetParentNode(); parent; parent = parent->GetParentNode()) {
-            if (parent->IsRootNode()) break;
-            BuildAnimatableTimeSamples(parent->GetTMController(), range, currentTime, discoveryTimes);
+        if (!localParentNode) {
+            // Only world-space targets need parent key discovery. Parented
+            // snapshot nodes write local matrices, so parent motion belongs to
+            // the parent track instead of being duplicated on every child.
+            for (INode* parent = node->GetParentNode(); parent; parent = parent->GetParentNode()) {
+                if (parent->IsRootNode()) break;
+                BuildAnimatableTimeSamples(parent->GetTMController(), range, currentTime, discoveryTimes);
+            }
         }
         if (!hasTransformAnimation && !hasVisibilityAnimation) {
             if (discoveryTimes.empty()) {
@@ -1484,6 +1492,16 @@ public:
             const float seconds = TimeValueToAnimationSeconds(sampleTime, range.Start());
             float matrixValues[16];
             GetTransform16(node, sampleTime, matrixValues);
+            if (localParentNode) {
+                float parentWorld[16];
+                GetTransform16(localParentNode, sampleTime, parentWorld);
+                float invParent[16];
+                if (!InvertMat4CM(parentWorld, invParent))
+                    Mat4IdentityCM(invParent);
+                float localMatrix[16];
+                MulMat4CM(invParent, matrixValues, localMatrix);
+                std::copy(std::begin(localMatrix), std::end(localMatrix), matrixValues);
+            }
 
             const bool visible =
                 !node->IsNodeHidden(TRUE) && node->GetVisibility(sampleTime) > 0.0f;
@@ -2626,22 +2644,34 @@ public:
         std::vector<SnapshotAnimationTargetDef> targets;
         targets.reserve(nodes.size() + 1);
         std::unordered_set<std::wstring> skinBonesAnimated;
+        std::unordered_set<ULONG> exportedNodeHandles;
+        exportedNodeHandles.reserve(nodes.size());
+        for (const auto& node : nodes) {
+            if (node.handle != 0) exportedNodeHandles.insert(node.handle);
+        }
 
         for (const auto& node : nodes) {
             SnapshotAnimationTargetDef target;
             SnapshotAnimationTargetDef part;
+            INode* localParentNode = nullptr;
+            if (node.parentHandle != 0 &&
+                exportedNodeHandles.find(node.parentHandle) != exportedNodeHandles.end()) {
+                localParentNode = ip->GetINodeByHandle(node.parentHandle);
+            }
             if (options.includeTransformAnimation &&
-                BuildNodeAnimationTarget(node.node, range, currentTime, options, part)) {
+                BuildNodeAnimationTarget(node.node, range, currentTime, options, localParentNode, part)) {
                 MergeSnapshotAnimationTarget(target, std::move(part));
             }
             part = SnapshotAnimationTargetDef();
             if (options.includeGeometryAnimation &&
+                !node.helper &&
                 skinRigMeshHandles.find(node.handle) == skinRigMeshHandles.end() &&
                 BuildNodeGeometryAnimationTarget(node.node, range, currentTime, options, part, outAnimBinary)) {
                 MergeSnapshotAnimationTarget(target, std::move(part));
             }
             part = SnapshotAnimationTargetDef();
             if (options.includeMaterialAnimation &&
+                !node.helper &&
                 BuildNodeMaterialAnimationTarget(node, range, currentTime, options, part)) {
                 MergeSnapshotAnimationTarget(target, std::move(part));
             }
@@ -2697,7 +2727,7 @@ public:
                     ObjectState os = node->EvalWorldState(currentTime);
                     if (os.obj && IsThreeJSLightClassID(os.obj->ClassID())) {
                         SnapshotAnimationTargetDef lightTarget;
-                        if (BuildNodeAnimationTarget(node, range, currentTime, options, lightTarget)) {
+                        if (BuildNodeAnimationTarget(node, range, currentTime, options, nullptr, lightTarget)) {
                             targets.push_back(std::move(lightTarget));
                         }
                     }
@@ -2771,6 +2801,7 @@ public:
     bool CopySnapshotRuntimeSeed(const std::wstring& webDir,
                                  const std::wstring& outDir,
                                  bool copySparkDist,
+                                 bool copyRapierVendor,
                                  std::wstring& error) {
         const std::wstring snapshotHtml = webDir + L"\\snapshot.html";
         if (!FileExists(snapshotHtml)) {
@@ -2796,13 +2827,49 @@ public:
             return false;
         }
 
-        if (!DirectoryExists(webDir + L"\\vendor")) {
-            error = L"Snapshot runtime dependency missing: web/vendor (three.js, etc.)";
+        const std::wstring threeVendor = webDir + L"\\vendor\\three-r184";
+        if (!DirectoryExists(threeVendor + L"\\build")) {
+            error = L"Snapshot runtime dependency missing: web/vendor/three-r184/build";
             return false;
         }
-        if (!CopyDirectoryRecursive(webDir + L"\\vendor", outDir + L"\\vendor")) {
-            error = L"Failed to copy snapshot runtime vendor directory";
+        if (!CopyDirectoryRecursive(threeVendor + L"\\build", outDir + L"\\vendor\\three-r184\\build")) {
+            error = L"Failed to copy snapshot runtime three.js build vendor";
             return false;
+        }
+        const std::vector<std::wstring> threeRootFiles = {
+            L"LICENSE", L"package.json", L"README.md"
+        };
+        for (const std::wstring& fileName : threeRootFiles) {
+            const std::wstring src = threeVendor + L"\\" + fileName;
+            if (FileExists(src)) {
+                CopyFileEnsuringDirectories(src, outDir + L"\\vendor\\three-r184\\" + fileName);
+            }
+        }
+
+        const std::wstring threeExamples = threeVendor + L"\\examples";
+        if (!DirectoryExists(threeExamples)) {
+            error = L"Snapshot runtime dependency missing: web/vendor/three-r184/examples";
+            return false;
+        }
+        if (!CopyDirectoryRecursive(threeExamples, outDir + L"\\vendor\\three-r184\\examples")) {
+            error = L"Failed to copy snapshot runtime three.js examples vendor";
+            return false;
+        }
+
+        const std::wstring outRapierVendor = outDir + L"\\vendor\\rapier";
+        if (copyRapierVendor) {
+            const std::wstring rapierVendor = webDir + L"\\vendor\\rapier";
+            if (!DirectoryExists(rapierVendor)) {
+                error = L"Snapshot runtime dependency missing: web/vendor/rapier";
+                return false;
+            }
+            if (!CopyDirectoryRecursive(rapierVendor, outRapierVendor)) {
+                error = L"Failed to copy snapshot runtime Rapier vendor";
+                return false;
+            }
+        } else {
+            std::error_code ec;
+            std::filesystem::remove_all(std::filesystem::path(outRapierVendor), ec);
         }
 
         if (copySparkDist) {
@@ -3504,17 +3571,27 @@ public:
                     continue;
                 }
 
-                // Skip hidden nodes from extraction but still recurse below
-                if (node->IsNodeHidden(TRUE)) {
+                SnapshotNodeRecord snapshotNode;
+                snapshotNode.handle = node->GetHandle();
+                snapshotNode.parentHandle = GetMaxJSParentHandle(node);
+                snapshotNode.node = node;
+                snapshotNode.visible =
+                    !node->IsNodeHidden(TRUE) && node->GetVisibility(t) > 0.0f && node->Renderable();
+
+                if (IsMaxJSHierarchyNode(node, t)) {
+                    snapshotNode.visible = IsMaxJsSyncDrawVisible(node);
+                    snapshotNode.helper = true;
+                    nodes.push_back(std::move(snapshotNode));
                     collect(node);
                     continue;
                 }
 
-                SnapshotNodeRecord snapshotNode;
-                snapshotNode.handle = node->GetHandle();
-                snapshotNode.node = node;
-                snapshotNode.visible =
-                    !node->IsNodeHidden(TRUE) && node->GetVisibility(t) > 0.0f && node->Renderable();
+                // Skip hidden render nodes from extraction but still recurse below.
+                // Hidden helper/group parents above still export transform-only.
+                if (node->IsNodeHidden(TRUE)) {
+                    collect(node);
+                    continue;
+                }
 
                 bool extracted = ExtractMesh(node, t, snapshotNode.verts, snapshotNode.uvs,
                     snapshotNode.indices, snapshotNode.groups, &snapshotNode.norms, nullptr,
@@ -3754,6 +3831,18 @@ public:
             if (!first) ss << L',';
             first = false;
 
+            if (node.helper) {
+                ss << L"{\"h\":" << node.handle;
+                ss << L",\"n\":\"" << EscapeJson(node.node->GetName()) << L'"';
+                ss << L",\"helper\":true";
+                ss << L",\"s\":" << (node.node->Selected() ? L'1' : L'0');
+                if (node.parentHandle != 0) ss << L",\"p\":" << node.parentHandle;
+                ss << L",\"vis\":" << (node.visible ? L'1' : L'0');
+                ss << L",\"t\":"; WriteFloats(ss, xform, 16);
+                ss << L'}';
+                continue;
+            }
+
             if (!node.verts.empty()) {
                 memcpy(buffer + node.vOff, node.verts.data(), node.verts.size() * sizeof(float));
             }
@@ -3800,6 +3889,7 @@ public:
             ss << L"{\"h\":" << node.handle;
             ss << L",\"n\":\"" << EscapeJson(node.node->GetName()) << L'"';
             ss << L",\"s\":" << (node.node->Selected() ? L'1' : L'0');
+            if (node.parentHandle != 0) ss << L",\"p\":" << node.parentHandle;
             ss << L",\"props\":{"; WriteNodePropsJson(ss, node.node, t); ss << L'}';
             { JsModData jm; GetJsModData(node.node, t, jm); if (jm.found) { ss << L","; WriteJsModJson(ss, jm); } }
             ss << L",\"vis\":" << (node.visible ? L'1' : L'0');
@@ -4095,7 +4185,12 @@ public:
             std::filesystem::remove(std::filesystem::path(outDir) / L"scene_anim.bin", ec);
         };
 
-        if (!CopySnapshotRuntimeSeed(webDir, outDir, options.includeSplats, error)) {
+        if (!CopySnapshotRuntimeSeed(
+                webDir,
+                outDir,
+                options.includeSplats,
+                options.includeRapierVendor,
+                error)) {
             cleanupOnFail();
             return false;
         }

@@ -30,15 +30,75 @@ const TARGET_DISTANCE = 1000;
 const shadowBounds = new THREE.Box3();
 const shadowCenter = new THREE.Vector3();
 const shadowSize = new THREE.Vector3();
+const lightLocalPos = new THREE.Vector3();
+const lightWorldPos = new THREE.Vector3();
+const lightTargetLocal = new THREE.Vector3();
+const lightTargetWorld = new THREE.Vector3();
 
-function setLightTargetFromData(light, ld) {
+function getLightParentObject(light, ld, parent, nodeMap) {
+    const explicitParent = Object.prototype.hasOwnProperty.call(ld ?? {}, 'p')
+        ? Number(ld.p)
+        : Number(light?.userData?.maxjsParentHandle);
+    const parentObject = Number.isFinite(explicitParent) && explicitParent > 0
+        ? nodeMap?.get?.(explicitParent)
+        : null;
+    if (!parentObject || parentObject === light) return parent;
+    for (let cursor = parentObject; cursor; cursor = cursor.parent) {
+        if (cursor === light) return parent;
+    }
+    return parentObject;
+}
+
+function syncLightParent(light, ld, parent, nodeMap) {
+    light.userData ??= {};
+    if (Object.prototype.hasOwnProperty.call(ld ?? {}, 'p')) {
+        const parentHandle = Number(ld.p);
+        light.userData.maxjsParentHandle =
+            Number.isFinite(parentHandle) && parentHandle > 0 ? parentHandle : 0;
+    } else {
+        light.userData.maxjsParentHandle = Number(light.userData.maxjsParentHandle) || 0;
+    }
+    const parentObject = getLightParentObject(light, ld, parent, nodeMap);
+    if (light.parent !== parentObject) parentObject.add(light);
+    const target = light.userData.maxjsTarget;
+    if (target && target.parent !== parentObject) parentObject.add(target);
+    return parentObject;
+}
+
+function setPositionFromRootSpace(obj, pos, rootParent) {
+    if (!obj || !Array.isArray(pos)) return;
+    lightLocalPos.set(pos[0], pos[1], pos[2]);
+    const parent = obj.parent || rootParent;
+    if (parent !== rootParent) {
+        rootParent.updateMatrixWorld(true);
+        parent.updateMatrixWorld(true);
+        lightWorldPos.copy(lightLocalPos);
+        rootParent.localToWorld(lightWorldPos);
+        lightLocalPos.copy(lightWorldPos);
+        parent.worldToLocal(lightLocalPos);
+    }
+    obj.position.copy(lightLocalPos);
+}
+
+function setLightTargetFromData(light, ld, rootParent) {
     const target = light.userData?.maxjsTarget;
     if (!target || !ld?.pos || !ld?.dir) return;
-    target.position.set(
+    lightTargetLocal.set(
         ld.pos[0] + ld.dir[0] * TARGET_DISTANCE,
         ld.pos[1] + ld.dir[1] * TARGET_DISTANCE,
         ld.pos[2] + ld.dir[2] * TARGET_DISTANCE,
     );
+    lightTargetWorld.copy(lightTargetLocal);
+    rootParent.updateMatrixWorld(true);
+    rootParent.localToWorld(lightTargetWorld);
+    const parent = target.parent || rootParent;
+    if (parent !== rootParent) {
+        parent.updateMatrixWorld(true);
+        target.position.copy(lightTargetWorld);
+        parent.worldToLocal(target.position);
+    } else {
+        target.position.copy(lightTargetLocal);
+    }
     target.updateMatrixWorld();
 }
 
@@ -92,11 +152,12 @@ function applyLightShadowDefaults(light, ld, nodeMap) {
     light.shadow.needsUpdate = true;
 }
 
-function applyLightData(light, ld, nodeMap) {
+function applyLightData(light, ld, nodeMap, parent) {
     light.userData ??= {};
     light.userData.maxjsTypeId = ld.type;
     if (ld.h != null) light.userData.maxjsHandle = ld.h;
     if (ld.name) light.name = ld.name;
+    syncLightParent(light, ld, parent, nodeMap);
 
     const visible = ld.v == null ? true : !!ld.v;
     light.visible = visible;
@@ -116,36 +177,41 @@ function applyLightData(light, ld, nodeMap) {
 
     switch (ld.type) {
     case 0: // Directional
-        if (ld.pos) light.position.set(ld.pos[0], ld.pos[1], ld.pos[2]);
-        setLightTargetFromData(light, ld);
+        setPositionFromRootSpace(light, ld.pos, parent);
+        setLightTargetFromData(light, ld, parent);
         break;
     case 1: // Point
-        if (ld.pos) light.position.set(ld.pos[0], ld.pos[1], ld.pos[2]);
+        setPositionFromRootSpace(light, ld.pos, parent);
         light.distance = ld.distance || 0;
         light.decay = ld.decay ?? 2;
         break;
     case 2: // Spot
-        if (ld.pos) light.position.set(ld.pos[0], ld.pos[1], ld.pos[2]);
+        setPositionFromRootSpace(light, ld.pos, parent);
         light.distance = ld.distance || 0;
         light.decay = ld.decay ?? 2;
         light.angle = ld.angle ?? Math.PI / 4;
         light.penumbra = ld.penumbra ?? 0.1;
-        setLightTargetFromData(light, ld);
+        setLightTargetFromData(light, ld, parent);
         break;
     case 3: // RectArea — orient toward dir
-        if (ld.pos) light.position.set(ld.pos[0], ld.pos[1], ld.pos[2]);
+        setPositionFromRootSpace(light, ld.pos, parent);
         light.width = ld.width || 20;
         light.height = ld.height || 20;
         if (ld.pos && ld.dir) {
-            light.lookAt(
+            lightTargetLocal.set(
                 ld.pos[0] + ld.dir[0],
                 ld.pos[1] + ld.dir[1],
                 ld.pos[2] + ld.dir[2],
             );
+            lightTargetWorld.copy(lightTargetLocal);
+            parent.updateMatrixWorld(true);
+            parent.localToWorld(lightTargetWorld);
+            light.updateMatrixWorld(true);
+            light.lookAt(lightTargetWorld);
         }
         break;
     case 4: // Hemisphere
-        if (ld.pos) light.position.set(ld.pos[0], ld.pos[1], ld.pos[2]);
+        setPositionFromRootSpace(light, ld.pos, parent);
         if (light.groundColor) {
             light.groundColor.setRGB(
                 ld.groundColor?.[0] ?? 0.2666666667,
@@ -189,7 +255,7 @@ function createLightFromData(ld, lightGroup, nodeMap) {
     default:
         return null;
     }
-    applyLightData(light, ld, nodeMap);
+    applyLightData(light, ld, nodeMap, lightGroup);
     return light;
 }
 
@@ -214,6 +280,12 @@ export function createSceneLights({ scene, parent = scene, lightHandleMap = new 
     let lastSignature = '';
 
     function clear() {
+        for (const [, light] of lightHandleMap) {
+            const target = light.userData?.maxjsTarget;
+            if (target?.parent) target.parent.remove(target);
+            if (light.parent) light.parent.remove(light);
+            light.dispose?.();
+        }
         lightHandleMap.clear();
         while (lightGroup.children.length) {
             const c = lightGroup.children[0];
@@ -238,7 +310,7 @@ export function createSceneLights({ scene, parent = scene, lightHandleMap = new 
         for (const ld of (lightsData ?? [])) {
             const light = createLightFromData(ld, lightGroup, nodeMap);
             if (!light) continue;
-            lightGroup.add(light);
+            if (!light.parent) lightGroup.add(light);
             if (ld.h != null) lightHandleMap.set(ld.h, light);
             if (light.visible !== false) {
                 count++;

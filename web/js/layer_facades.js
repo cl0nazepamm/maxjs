@@ -27,6 +27,16 @@ function createNodeMapFacade(nodeMap, getAdapter) {
 }
 
 function createMaxSceneFacade({ scene, nodeMap, lightHandleMap, getAdapter, createAnchor, THREE }) {
+    const parentHandleOf = (obj) => {
+        const h = Number(obj?.userData?.maxjsParentHandle);
+        return Number.isFinite(h) && h > 0 ? h : null;
+    };
+    const pushChildrenFromMap = (out, map, parentHandle) => {
+        if (!map) return;
+        for (const [handle, obj] of map.entries()) {
+            if (parentHandleOf(obj) === parentHandle) out.push(getAdapter(handle, obj));
+        }
+    };
     return freezePlainObject({
         get size() { return nodeMap.size; },
         get background() { return scene.background?.clone?.() ?? scene.background ?? null; },
@@ -34,6 +44,31 @@ function createMaxSceneFacade({ scene, nodeMap, lightHandleMap, getAdapter, crea
         get fog() { return scene.fog?.clone?.() ?? null; },
         has(handle) { return nodeMap.has(handle); },
         getNode(handle) { return nodeMap.has(handle) ? getAdapter(handle) : null; },
+        getParent(handle) {
+            const obj = nodeMap.get(handle) ?? lightHandleMap?.get(handle) ?? null;
+            const parentHandle = parentHandleOf(obj);
+            return parentHandle != null ? getAdapter(parentHandle) : null;
+        },
+        getChildren(handle) {
+            const parentHandle = Number(handle);
+            if (!Number.isFinite(parentHandle)) return Object.freeze([]);
+            const out = [];
+            pushChildrenFromMap(out, nodeMap, parentHandle);
+            pushChildrenFromMap(out, lightHandleMap, parentHandle);
+            return Object.freeze(out);
+        },
+        listRoots() {
+            const out = [];
+            for (const [handle, obj] of nodeMap.entries()) {
+                if (parentHandleOf(obj) == null) out.push(getAdapter(handle));
+            }
+            if (lightHandleMap) {
+                for (const [handle, light] of lightHandleMap.entries()) {
+                    if (parentHandleOf(light) == null) out.push(getAdapter(handle, light));
+                }
+            }
+            return Object.freeze(out);
+        },
         listHandles() { return Array.from(nodeMap.keys()); },
         listNodes() { return Array.from(nodeMap.keys(), handle => getAdapter(handle)); },
         /** Meshes whose Max stack has three.js Deform (bridge sets adapter.jsmod). Safe to poll every frame — nodeMap grows as sync arrives. */

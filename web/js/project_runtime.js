@@ -1031,6 +1031,7 @@ function stripSettingsFromPostFx(payload) {
         const moduleVersion = ++revision;
         const folder = typeof meta.folder === 'string' ? meta.folder : '';
         const priority = Number.isFinite(meta.priority) ? meta.priority : 100;
+        const signature = String(meta.signature || '');
         const moduleUrl = inlineLayerUrlWithFolder(rawId, folder, moduleVersion) || inlineLayerUrl(rawId, moduleVersion);
         if (!moduleUrl) throw new Error(`No inline directory configured for ${rawId}`);
 
@@ -1065,7 +1066,7 @@ function stripSettingsFromPostFx(payload) {
         );
         if (result?.error) throw new Error(result.error);
 
-        mountedInlineLayers.set(key, { moduleUrl, folder, priority });
+        mountedInlineLayers.set(key, { moduleUrl, folder, priority, signature });
     }
 
     function unmountInlineLayer(key) {
@@ -1076,6 +1077,7 @@ function stripSettingsFromPostFx(payload) {
 
     bridge.on('inline_layers_state', async msg => {
         const layersRaw = Array.isArray(msg?.layers) ? msg.layers : [];
+        const scanStamp = String(msg?.stamp || '');
         // Augment with folder/priority and sort. C++ scanner emits these; older builds
         // without them fall through to ('', 100, alpha) which reproduces the pre-upgrade order.
         const layers = layersRaw
@@ -1086,8 +1088,21 @@ function stripSettingsFromPostFx(payload) {
                 name: l.name || l.id,
                 enabled: l.enabled !== false,
                 folder: normalizeInlineFolder(l.folder),
+                stamp: String(l.stamp || ''),
                 priority: Number.isFinite(Number(l.priority)) ? Number(l.priority) : 100,
                 originalIndex,
+            }))
+            .map(layer => ({
+                ...layer,
+                signature: [
+                    layer.id,
+                    layer.name,
+                    layer.folder,
+                    layer.priority,
+                    layer.enabled ? 1 : 0,
+                    layer.stamp,
+                    scanStamp,
+                ].join('|'),
             }))
             .sort((a, b) => {
                 if (a.priority !== b.priority) return a.priority - b.priority;
@@ -1111,6 +1126,9 @@ function stripSettingsFromPostFx(payload) {
                 name: layer.name,
                 enabled: layer.enabled,
                 folder: layer.folder,
+                stamp: layer.stamp,
+                scanStamp,
+                signature: layer.signature,
                 priority: layer.priority,
             });
         }
@@ -1131,22 +1149,27 @@ function stripSettingsFromPostFx(payload) {
             const mounted = mountedInlineLayers.get(layer.key);
             if (!mounted) {
                 try {
-                    await mountInlineLayer(layer.key, layer.id, layer.name, { folder: layer.folder, priority: layer.priority });
+                    await mountInlineLayer(layer.key, layer.id, layer.name, {
+                        folder: layer.folder,
+                        priority: layer.priority,
+                        signature: layer.signature,
+                    });
                     debugLog('[ProjectRuntime] mounted inline layer', layer.key);
                 } catch (err) {
                     debugWarn('[ProjectRuntime] inline mount failed', layer.key, err);
                 }
-            } else if (mounted.folder !== layer.folder || mounted.priority !== layer.priority) {
-                // Meta changed (user moved file between folders or renamed prefix) — push
-                // onto the live layer record without a remount. Priority re-sort only
-                // matters on fresh mount order, not at steady-state.
-                layerManager.setLayerMeta?.(layer.key, {
-                    folder: layer.folder,
-                    priority: layer.priority,
-                    name: layer.name,
-                });
-                mounted.folder = layer.folder;
-                mounted.priority = layer.priority;
+            } else if (mounted.signature !== layer.signature) {
+                unmountInlineLayer(layer.key);
+                try {
+                    await mountInlineLayer(layer.key, layer.id, layer.name, {
+                        folder: layer.folder,
+                        priority: layer.priority,
+                        signature: layer.signature,
+                    });
+                    debugLog('[ProjectRuntime] reloaded inline layer', layer.key);
+                } catch (err) {
+                    debugWarn('[ProjectRuntime] inline reload failed', layer.key, err);
+                }
             }
             // Apply the enabled flag as a runtime active state. For layers
             // already mounted, this is just a flag flip — no remount.

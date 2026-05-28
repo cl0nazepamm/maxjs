@@ -142,6 +142,7 @@
         audioHandles_.clear();
         gltfHandles_.clear();
         hairHandles_.clear();
+        helperHandles_.clear();
         deformHandles_.clear();
         fastDirtyHandles_.clear();
         lastSentTransforms_.clear();

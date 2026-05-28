@@ -42,12 +42,14 @@
             || splatHandles_.find(handle) != splatHandles_.end()
             || audioHandles_.find(handle) != audioHandles_.end()
             || gltfHandles_.find(handle) != gltfHandles_.end()
-            || hairHandles_.find(handle) != hairHandles_.end();
+            || hairHandles_.find(handle) != hairHandles_.end()
+            || helperHandles_.find(handle) != helperHandles_.end();
     }
 
     bool HasTrackedNodes() const {
         return !geomHandles_.empty() || !lightHandles_.empty() || !splatHandles_.empty()
-            || !audioHandles_.empty() || !gltfHandles_.empty() || !hairHandles_.empty();
+            || !audioHandles_.empty() || !gltfHandles_.empty() || !hairHandles_.empty()
+            || !helperHandles_.empty();
     }
 
     // Debounced dirty: coalesces rapid-fire notifications (e.g. clone) into one full sync

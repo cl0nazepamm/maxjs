@@ -5497,6 +5497,9 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 updateMaxInstanceBucketNode(handle, nd);
                 return;
             }
+            if (handle != null) mesh.userData.maxjsHandle = handle;
+            if (nd.helper === true) mesh.userData.maxjsHelper = true;
+            if (Object.prototype.hasOwnProperty.call(nd, 'p')) syncNodeParent(mesh, nd);
             if (nd.jsmod != null) applyJsmodSyncState(mesh, nd.jsmod === true);
             if (nd.vis != null) applyBridgeVisibility(mesh, nd.vis);
             if (isFiniteArray(nd.t, 16)) {
@@ -5908,8 +5911,8 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
 
             for (const [handle, mesh] of nodeMap) {
                 if (!incoming.has(handle)) {
-                    maxRoot.remove(mesh);
-                    mesh.geometry.dispose();
+                    removeMaxNodeObject(mesh);
+                    mesh.geometry?.dispose?.();
                     disposeSceneMaterial(mesh.material);
                     nodeMap.delete(handle);
                     sceneChanged = true;
@@ -5918,6 +5921,11 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
 
             for (const nd of msg.nodes) {
                 let mesh = nodeMap.get(nd.h);
+                if (nd.helper === true) {
+                    ensureTransformOnlyNode(nd, mesh);
+                    transformsChanged = true;
+                    continue;
+                }
 
                 if (stableBucketHandles?.has(nd.h) && getMaxInstanceBucketForHandle(nd.h)) {
                     if (updateMaxInstanceBucketNode(nd.h, nd)) transformsChanged = true;
@@ -5957,7 +5965,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 const hasLineRenderable = !!(mesh?.isLine || mesh?.isLineSegments);
                 const renderableTypeMismatch = !!mesh && wantsLine !== hasLineRenderable;
                 if (renderableTypeMismatch) {
-                    maxRoot.remove(mesh);
+                    removeMaxNodeObject(mesh);
                     mesh.geometry?.dispose?.();
                     disposeSceneMaterial(mesh.material);
                     nodeMap.delete(nd.h);
@@ -5987,12 +5995,13 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     mesh.frustumCulled = false;
                     mesh.userData.maxjsHandle = nd.h;
                     stampSceneMaterial(mesh, nd, wantsLine);
-                    maxRoot.add(mesh);
+                    syncNodeParent(mesh, nd);
                     nodeMap.set(nd.h, mesh);
                     sceneChanged = true;
                     layerManager.applyMaterialOverrides?.(nd.h, mesh);
                 }
 
+                syncNodeParent(mesh, nd);
                 if (finalizeSceneNode(mesh, nd)) transformsChanged = true;
             }
 
@@ -6053,7 +6062,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
 
             // Type changed (spline ↔ mesh) — need full rebuild, can't just swap geometry
             if (wantsLine !== hasLine) {
-                maxRoot.remove(mesh);
+                removeMaxNodeObject(mesh);
                 mesh.geometry?.dispose?.();
                 if (Array.isArray(mesh.material)) {
                     for (const m of mesh.material) m?.dispose?.();
@@ -6245,7 +6254,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             }
             for (const handle of toRemove) {
                 const mesh = nodeMap.get(handle);
-                maxRoot.remove(mesh);
+                removeMaxNodeObject(mesh);
                 releaseGeometryRef(geometryRefCounts, mesh?.geometry);
                 disposeSceneMaterial(mesh?.material);
                 nodeMap.delete(handle);
@@ -6257,6 +6266,11 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
 
             for (const nd of meta.nodes) {
                 let mesh = nodeMap.get(nd.h);
+                if (nd.helper === true) {
+                    ensureTransformOnlyNode(nd, mesh);
+                    transformsChanged = true;
+                    continue;
+                }
 
                 if (stableBucketHandles?.has(nd.h) && getMaxInstanceBucketForHandle(nd.h)) {
                     if (updateMaxInstanceBucketNode(nd.h, nd)) transformsChanged = true;
@@ -6303,7 +6317,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
 
                 const wantsLine = !!nd.spline;
                 if (mesh && nd.skin && !mesh.isSkinnedMesh && !wantsLine) {
-                    maxRoot.remove(mesh);
+                    removeMaxNodeObject(mesh);
                     releaseGeometryRef(geometryRefCounts, mesh?.geometry);
                     disposeSceneMaterial(mesh.material);
                     nodeMap.delete(nd.h);
@@ -6313,7 +6327,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 const hasLineRenderable = !!(mesh?.isLine || mesh?.isLineSegments);
                 const renderableTypeMismatch = !!mesh && wantsLine !== hasLineRenderable;
                 if (renderableTypeMismatch) {
-                    maxRoot.remove(mesh);
+                    removeMaxNodeObject(mesh);
                     releaseGeometryRef(geometryRefCounts, mesh?.geometry);
                     disposeSceneMaterial(mesh.material);
                     nodeMap.delete(nd.h);
@@ -6350,13 +6364,14 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     mesh.frustumCulled = false;
                     mesh.userData.maxjsHandle = nd.h;
                     stampSceneMaterial(mesh, nd, wantsLine);
-                    maxRoot.add(mesh);
+                    syncNodeParent(mesh, nd);
                     nodeMap.set(nd.h, mesh);
                     retainGeometryRef(geometryRefCounts, mesh.geometry);
                     sceneChanged = true;
                     layerManager.applyMaterialOverrides?.(nd.h, mesh);
                 }
 
+                syncNodeParent(mesh, nd);
                 if (finalizeSceneNode(mesh, nd)) transformsChanged = true;
             }
 
@@ -6597,6 +6612,63 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             return true;
         }
 
+        const maxNodeParentScratch = {
+            raw: new THREE.Matrix4(),
+            parentInRoot: new THREE.Matrix4(),
+            parentInv: new THREE.Matrix4(),
+            rootInv: new THREE.Matrix4(),
+        };
+
+        function removeMaxNodeObject(obj) {
+            if (!obj) return;
+            obj.parent?.remove(obj);
+        }
+
+        function getNodeParentObject(nd, obj = null) {
+            const parentHandle = Number(nd?.p);
+            const parent = Number.isFinite(parentHandle) && parentHandle > 0
+                ? nodeMap.get(parentHandle)
+                : null;
+            if (!parent || parent === obj) return maxRoot;
+            for (let cursor = parent; cursor; cursor = cursor.parent) {
+                if (cursor === obj) return maxRoot;
+            }
+            return parent;
+        }
+
+        function syncNodeParent(obj, nd) {
+            if (!obj) return maxRoot;
+            const parent = getNodeParentObject(nd, obj);
+            const parentHandle = parent === maxRoot ? 0 : (Number(nd?.p) || 0);
+            obj.userData ??= {};
+            obj.userData.maxjsParentHandle = parentHandle;
+            if (obj.parent !== parent) parent.add(obj);
+            return parent;
+        }
+
+        function ensureTransformOnlyNode(nd, existing = null) {
+            let obj = existing;
+            if (obj && obj.userData?.maxjsHelper !== true) {
+                removeMaxNodeObject(obj);
+                obj.geometry?.dispose?.();
+                disposeSceneMaterial(obj.material);
+                obj = null;
+            }
+            if (!obj) {
+                obj = new THREE.Object3D();
+                obj.matrixAutoUpdate = false;
+                obj.frustumCulled = false;
+            }
+            obj.name = nd.n ?? obj.name ?? '';
+            obj.userData ??= {};
+            obj.userData.maxjsHandle = nd.h;
+            obj.userData.maxjsHelper = true;
+            syncNodeParent(obj, nd);
+            finalizeSceneNode(obj, nd);
+            nodeMap.set(nd.h, obj);
+            return obj;
+        }
+
         function applyTransform(mesh, t) {
             if (!isFiniteArray(t, 16)) {
                 const alreadyIdentity = matrixArraysAlmostEqual(mesh.matrix.elements, [
@@ -6613,10 +6685,21 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 mesh.matrixWorldNeedsUpdate = true;
                 return true;
             }
-            if (matrixArraysAlmostEqual(mesh.matrix.elements, t)) {
+            maxNodeParentScratch.raw.fromArray(t);
+            if (mesh.parent && mesh.parent !== maxRoot) {
+                maxRoot.updateMatrixWorld(true);
+                mesh.parent.updateMatrixWorld(true);
+                maxNodeParentScratch.rootInv.copy(maxRoot.matrixWorld).invert();
+                maxNodeParentScratch.parentInRoot
+                    .copy(maxNodeParentScratch.rootInv)
+                    .multiply(mesh.parent.matrixWorld);
+                maxNodeParentScratch.parentInv.copy(maxNodeParentScratch.parentInRoot).invert();
+                maxNodeParentScratch.raw.premultiply(maxNodeParentScratch.parentInv);
+            }
+            if (matrixArraysAlmostEqual(mesh.matrix.elements, maxNodeParentScratch.raw.elements)) {
                 return false;
             }
-            mesh.matrix.fromArray(t);
+            mesh.matrix.copy(maxNodeParentScratch.raw);
             mesh.matrixWorldNeedsUpdate = true;
             return true;
         }
@@ -6773,6 +6856,9 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         const shadowCenter = new THREE.Vector3();
         const shadowSize = new THREE.Vector3();
         const shadowTarget = new THREE.Vector3();
+        const lightLocalPos = new THREE.Vector3();
+        const lightWorldPos = new THREE.Vector3();
+        const lightTargetLocal = new THREE.Vector3();
 
         function getShadowSceneFocus() {
             shadowBounds.makeEmpty();
@@ -6804,7 +6890,8 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 shadowCamera.top = radius;
                 shadowCamera.bottom = -radius;
                 shadowCamera.near = 0.1;
-                shadowCamera.far = Math.max(radius * 8, light.position.distanceTo(shadowTarget), 200);
+                light.getWorldPosition(lightWorldPos);
+                shadowCamera.far = Math.max(radius * 8, lightWorldPos.distanceTo(shadowTarget), 200);
                 shadowCamera.updateProjectionMatrix();
             } else if (ld.type === 1 && shadowCamera?.isPerspectiveCamera) {
                 shadowCamera.near = Math.max(radius * 0.01, 0.1);
@@ -6861,13 +6948,63 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         }
 
         function clearLights() {
-            lightHandleMap.clear();
             clearLightHelpers();
+            for (const [, light] of lightHandleMap) {
+                const target = light.userData?.maxjsTarget;
+                if (target?.parent) target.parent.remove(target);
+                if (light.parent) light.parent.remove(light);
+                if (light.dispose) light.dispose();
+            }
+            lightHandleMap.clear();
             while (lightGroup.children.length) {
                 const c = lightGroup.children[0];
                 lightGroup.remove(c);
                 if (c.dispose) c.dispose();
             }
+        }
+
+        function getLightParentObject(light) {
+            const parentHandle = Number(light?.userData?.maxjsParentHandle);
+            const parent = Number.isFinite(parentHandle) && parentHandle > 0
+                ? nodeMap.get(parentHandle)
+                : null;
+            if (!parent || parent === light) return lightGroup;
+            for (let cursor = parent; cursor; cursor = cursor.parent) {
+                if (cursor === light) return lightGroup;
+            }
+            return parent;
+        }
+
+        function syncLightParent(light, ld) {
+            if (!light) return lightGroup;
+            light.userData ??= {};
+            if (Object.prototype.hasOwnProperty.call(ld, 'p')) {
+                const parentHandle = Number(ld.p);
+                light.userData.maxjsParentHandle =
+                    Number.isFinite(parentHandle) && parentHandle > 0 ? parentHandle : 0;
+            } else {
+                light.userData.maxjsParentHandle = Number(light.userData.maxjsParentHandle) || 0;
+            }
+            const parent = getLightParentObject(light);
+            if (light.parent !== parent) parent.add(light);
+            const target = light.userData.maxjsTarget;
+            if (target && target.parent !== parent) parent.add(target);
+            return parent;
+        }
+
+        function setLightPositionFromMaxRoot(light, pos) {
+            if (!light || !Array.isArray(pos)) return;
+            lightLocalPos.set(pos[0], pos[1], pos[2]);
+            const parent = light.parent || lightGroup;
+            if (parent !== lightGroup) {
+                maxRoot.updateMatrixWorld(true);
+                parent.updateMatrixWorld(true);
+                lightWorldPos.copy(lightLocalPos);
+                maxRoot.localToWorld(lightWorldPos);
+                lightLocalPos.copy(lightWorldPos);
+                parent.worldToLocal(lightLocalPos);
+            }
+            light.position.copy(lightLocalPos);
         }
 
         function setLightTargetFromData(light, ld) {
@@ -6878,13 +7015,25 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             // per call via getShadowSceneFocus(), which iterated every mesh and
             // hitched animation playback with parented lights.
             const targetDistance = 1000;
-            target.position.set(
+            lightTargetLocal.set(
                 ld.pos[0] + ld.dir[0] * targetDistance,
                 ld.pos[1] + ld.dir[1] * targetDistance,
                 ld.pos[2] + ld.dir[2] * targetDistance
             );
+            lightTargetWorld.copy(lightTargetLocal);
+            maxRoot.updateMatrixWorld(true);
+            maxRoot.localToWorld(lightTargetWorld);
+            shadowTarget.copy(lightTargetWorld);
+
+            const parent = target.parent || lightGroup;
+            if (parent !== lightGroup) {
+                parent.updateMatrixWorld(true);
+                target.position.copy(lightTargetWorld);
+                parent.worldToLocal(target.position);
+            } else {
+                target.position.copy(lightTargetLocal);
+            }
             target.updateMatrixWorld();
-            shadowTarget.copy(target.position);
         }
 
         function applyLightData(light, ld) {
@@ -6892,6 +7041,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             light.userData.maxjsTypeId = ld.type;
             if (ld.h != null) light.userData.maxjsHandle = ld.h;
             if (ld.name) light.name = ld.name;
+            syncLightParent(light, ld);
 
             const visible = ld.v == null ? true : !!ld.v;
             light.visible = visible;
@@ -6911,16 +7061,16 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
 
             switch (ld.type) {
             case 0:
-                light.position.set(ld.pos[0], ld.pos[1], ld.pos[2]);
+                setLightPositionFromMaxRoot(light, ld.pos);
                 setLightTargetFromData(light, ld);
                 break;
             case 1:
-                light.position.set(ld.pos[0], ld.pos[1], ld.pos[2]);
+                setLightPositionFromMaxRoot(light, ld.pos);
                 light.distance = ld.distance || 0;
                 light.decay = ld.decay ?? 2;
                 break;
             case 2:
-                light.position.set(ld.pos[0], ld.pos[1], ld.pos[2]);
+                setLightPositionFromMaxRoot(light, ld.pos);
                 light.distance = ld.distance || 0;
                 light.decay = ld.decay ?? 2;
                 light.angle = ld.angle ?? Math.PI / 4;
@@ -6928,19 +7078,22 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 setLightTargetFromData(light, ld);
                 break;
             case 3:
-                light.position.set(ld.pos[0], ld.pos[1], ld.pos[2]);
+                setLightPositionFromMaxRoot(light, ld.pos);
                 light.width = ld.width || 20;
                 light.height = ld.height || 20;
-                copyMaxComponentsToWorld(
-                    lightTargetWorld,
+                lightTargetLocal.set(
                     ld.pos[0] + ld.dir[0],
                     ld.pos[1] + ld.dir[1],
                     ld.pos[2] + ld.dir[2]
                 );
+                lightTargetWorld.copy(lightTargetLocal);
+                maxRoot.updateMatrixWorld(true);
+                maxRoot.localToWorld(lightTargetWorld);
+                light.updateMatrixWorld(true);
                 light.lookAt(lightTargetWorld);
                 break;
             case 4:
-                light.position.set(ld.pos[0], ld.pos[1], ld.pos[2]);
+                setLightPositionFromMaxRoot(light, ld.pos);
                 light.groundColor.setRGB(
                     ld.groundColor?.[0] ?? 0.2666666667,
                     ld.groundColor?.[1] ?? 0.2666666667,
@@ -7030,7 +7183,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             for (const ld of lightsData) {
                 const light = createLightFromData(ld);
                 if (!light) continue;
-                lightGroup.add(light);
+                if (!light.parent) lightGroup.add(light);
                 if (ld.h != null) {
                     lightHandleMap.set(ld.h, light);
                     const helper = createLightHelper(light, ld.type);
@@ -9653,6 +9806,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             includeSnapshotUi: true,
             includeRuntimeScene: true,
             copyAssets: true,
+            includeRapierVendor: false,
             includeAnimations: true,
             includeTransformAnimation: true,
             includeGeometryAnimation: true,
@@ -9778,6 +9932,15 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                             <label class="fx-check" for="snapshot-copyAssets"><span>Copy Assets</span><input id="snapshot-copyAssets" type="checkbox"></label>
                         </div>
                         <div class="snapshot-note">Copy Assets should stay on for deployable snapshots. Debug Payload controls viewer UI, runtime scene, and debug-side snapshot extras.</div>
+                    </section>
+                    <section class="fx-section">
+                        <div class="fx-section-header">
+                            <div class="fx-section-title">Vendor</div>
+                        </div>
+                        <div class="snapshot-grid">
+                            <label class="fx-check" for="snapshot-includeRapierVendor"><span>Rapier Physics</span><input id="snapshot-includeRapierVendor" type="checkbox"></label>
+                        </div>
+                        <div class="snapshot-note">Only needed for physics runtime layers.</div>
                     </section>
                     <section class="fx-section">
                         <div class="fx-section-header">

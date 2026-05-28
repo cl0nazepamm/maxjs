@@ -1,5 +1,6 @@
 #include "sync_protocol.h"
 
+#include <cassert>
 #include <cstring>
 
 namespace maxjs::sync {
@@ -30,12 +31,12 @@ DeltaFrameBuilder::DeltaFrameBuilder(std::uint32_t frameId)
 }
 
 void DeltaFrameBuilder::BeginFrame() {
-    BeginCommand(CommandType::BeginFrame, 4);
+    BeginCommand(CommandType::BeginFrame, BeginFrameLayout::size);
     AppendU32(frameId_);
 }
 
 void DeltaFrameBuilder::UpdateTransform(std::uint32_t nodeHandle, const float* matrix16) {
-    BeginCommand(CommandType::UpdateTransform, 4 + 16 * sizeof(float));
+    BeginCommand(CommandType::UpdateTransform, TransformLayout::size);
     AppendU32(nodeHandle);
     for (int i = 0; i < 16; ++i) {
         AppendF32(matrix16[i]);
@@ -44,7 +45,7 @@ void DeltaFrameBuilder::UpdateTransform(std::uint32_t nodeHandle, const float* m
 
 void DeltaFrameBuilder::UpdateMaterialScalar(std::uint32_t nodeHandle, const float* color3,
                                              float roughness, float metalness, float opacity) {
-    BeginCommand(CommandType::UpdateMaterialScalar, 4 + 3 * sizeof(float) + 3 * sizeof(float));
+    BeginCommand(CommandType::UpdateMaterialScalar, MaterialScalarLayout::size);
     AppendU32(nodeHandle);
     AppendF32(color3[0]);
     AppendF32(color3[1]);
@@ -55,13 +56,13 @@ void DeltaFrameBuilder::UpdateMaterialScalar(std::uint32_t nodeHandle, const flo
 }
 
 void DeltaFrameBuilder::UpdateSelection(std::uint32_t nodeHandle, bool selected) {
-    BeginCommand(CommandType::UpdateSelection, 8);
+    BeginCommand(CommandType::UpdateSelection, SelectionLayout::size);
     AppendU32(nodeHandle);
     AppendU32(selected ? 1u : 0u);
 }
 
 void DeltaFrameBuilder::UpdateVisibility(std::uint32_t nodeHandle, bool visible) {
-    BeginCommand(CommandType::UpdateVisibility, 8);
+    BeginCommand(CommandType::UpdateVisibility, VisibilityLayout::size);
     AppendU32(nodeHandle);
     AppendU32(visible ? 1u : 0u);
 }
@@ -70,7 +71,7 @@ void DeltaFrameBuilder::UpdateCamera(const float* position3, const float* target
                                      float fov, bool perspective, float viewWidth,
                                      bool dofEnabled, float dofFocusDistance,
                                      float dofFocalLength, float dofBokehScale) {
-    BeginCommand(CommandType::UpdateCamera, 11 * sizeof(float) + 4 + 4 + 3 * sizeof(float));
+    BeginCommand(CommandType::UpdateCamera, CameraLayout::size);
     for (int i = 0; i < 3; ++i) {
         AppendF32(position3[i]);
     }
@@ -90,11 +91,9 @@ void DeltaFrameBuilder::UpdateCamera(const float* position3, const float* target
 }
 
 void DeltaFrameBuilder::UpdateLight(std::uint32_t handle, const LightData& d) {
-    // 4 handle + 64 matrix + 4 vis + 4 type + 12 color + 4 intensity
-    // + 4 distance + 4 decay + 4 angle + 4 penumbra + 4 width + 4 height
-    // + 12 groundColor + 4 castShadow + 4 shadowBias + 4 shadowRadius
-    // + 4 shadowMapSize + 4 volContrib = 148 bytes
-    BeginCommand(CommandType::UpdateLight, 148);
+    // Payload layout (and its 148-byte size) is described by LightLayout in
+    // sync_protocol.h; the appends below must stay in that field order.
+    BeginCommand(CommandType::UpdateLight, LightLayout::size);
     AppendU32(handle);
     for (int i = 0; i < 16; ++i) AppendF32(d.matrix16[i]);
     AppendU32(d.visible ? 1u : 0u);
@@ -116,7 +115,7 @@ void DeltaFrameBuilder::UpdateLight(std::uint32_t handle, const LightData& d) {
 }
 
 void DeltaFrameBuilder::UpdateSplat(std::uint32_t handle, const float* matrix16, bool visible) {
-    BeginCommand(CommandType::UpdateSplat, 4 + 16 * sizeof(float) + 4);
+    BeginCommand(CommandType::UpdateSplat, SplatLayout::size);
     AppendU32(handle);
     for (int i = 0; i < 16; ++i) {
         AppendF32(matrix16[i]);
@@ -125,7 +124,7 @@ void DeltaFrameBuilder::UpdateSplat(std::uint32_t handle, const float* matrix16,
 }
 
 void DeltaFrameBuilder::UpdateAudio(std::uint32_t handle, const float* matrix16, bool visible) {
-    BeginCommand(CommandType::UpdateAudio, 4 + 16 * sizeof(float) + 4);
+    BeginCommand(CommandType::UpdateAudio, AudioLayout::size);
     AppendU32(handle);
     for (int i = 0; i < 16; ++i) {
         AppendF32(matrix16[i]);
@@ -134,7 +133,7 @@ void DeltaFrameBuilder::UpdateAudio(std::uint32_t handle, const float* matrix16,
 }
 
 void DeltaFrameBuilder::UpdateGLTF(std::uint32_t handle, const float* matrix16, bool visible) {
-    BeginCommand(CommandType::UpdateGLTF, 4 + 16 * sizeof(float) + 4);
+    BeginCommand(CommandType::UpdateGLTF, GLTFLayout::size);
     AppendU32(handle);
     for (int i = 0; i < 16; ++i) {
         AppendF32(matrix16[i]);
@@ -143,8 +142,8 @@ void DeltaFrameBuilder::UpdateGLTF(std::uint32_t handle, const float* matrix16, 
 }
 
 void DeltaFrameBuilder::UpdateTime(std::int32_t ticks, std::int32_t tpf, std::uint8_t stateFlags) {
-    // 4 ticks + 4 tpf + 1 flags + 3 pad = 12 payload
-    BeginCommand(CommandType::UpdateTime, 12);
+    // 4 ticks + 4 tpf + 1 flags + 3 pad = 12 payload (see TimeLayout)
+    BeginCommand(CommandType::UpdateTime, TimeLayout::size);
     AppendU32(static_cast<std::uint32_t>(ticks));
     AppendU32(static_cast<std::uint32_t>(tpf));
     bytes_.push_back(stateFlags);
@@ -154,7 +153,7 @@ void DeltaFrameBuilder::UpdateTime(std::int32_t ticks, std::int32_t tpf, std::ui
 }
 
 void DeltaFrameBuilder::EndFrame() {
-    BeginCommand(CommandType::EndFrame, 0);
+    BeginCommand(CommandType::EndFrame, EndFrameLayout::size);
     PatchU32(commandCountOffset_, commandCount_);
 }
 
@@ -164,10 +163,19 @@ void DeltaFrameBuilder::ReserveBytes(std::size_t totalBytes) {
     }
 }
 
-void DeltaFrameBuilder::BeginCommand(CommandType type, std::uint16_t payloadBytes) {
+void DeltaFrameBuilder::BeginCommand(CommandType type, std::size_t payloadBytes) {
+#ifndef NDEBUG
+    // The previous command must have appended exactly the bytes it declared.
+    assert((!hasOpenCommand_ || bytes_.size() == expectedCommandEnd_) &&
+           "DeltaFrameBuilder: previous command appended wrong byte count");
+#endif
     AppendU16(static_cast<std::uint16_t>(type));
     AppendU16(static_cast<std::uint16_t>(kCommandHeaderSize + payloadBytes));
     ++commandCount_;
+#ifndef NDEBUG
+    expectedCommandEnd_ = bytes_.size() + payloadBytes;
+    hasOpenCommand_ = true;
+#endif
 }
 
 void DeltaFrameBuilder::AppendU16(std::uint16_t value) {

@@ -1,4 +1,6 @@
 build/
+build-*/
+release/
 thirdparty/
 test_scene/
 node_modules/

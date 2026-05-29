@@ -3895,27 +3895,14 @@
                 if (xfKey) writeXf(xfKey, xf);
             }
         };
-        writeMap(L"map", L"mapXf", pbr.colorMap, pbr.colorMapTransform);
-        writeMap(L"gradMap", nullptr, pbr.gradientMap, pbr.gradientMapTransform);
-        writeMap(L"roughMap", L"roughMapXf", pbr.roughnessMap, pbr.roughnessMapTransform);
-        writeMap(L"metalMap", L"metalMapXf", pbr.metalnessMap, pbr.metalnessMapTransform);
-        writeMap(L"normMap", L"normMapXf", pbr.normalMap, pbr.normalMapTransform);
-        writeMap(L"bumpMap", L"bumpMapXf", pbr.bumpMap, pbr.bumpMapTransform);
-        writeMap(L"dispMap", L"dispMapXf", pbr.displacementMap, pbr.displacementMapTransform);
-        writeMap(L"parallaxMap", L"parallaxMapXf", pbr.parallaxMap, pbr.parallaxMapTransform);
-        writeMap(L"aoMap", L"aoMapXf", pbr.aoMap, pbr.aoMapTransform);
-        writeMap(L"sssMap", L"sssMapXf", pbr.sssColorMap, pbr.sssColorMapTransform);
-        writeMap(L"matcapMap", L"matcapMapXf", pbr.matcapMap, pbr.matcapMapTransform);
-        writeMap(L"specMap", L"specMapXf", pbr.specularMap, pbr.specularMapTransform);
-        writeMap(L"specIntMap", L"specIntMapXf", pbr.specularIntensityMap, pbr.specularIntensityMapTransform);
-        writeMap(L"specColMap", L"specColMapXf", pbr.specularColorMap, pbr.specularColorMapTransform);
-        writeMap(L"emMap", L"emMapXf", pbr.emissionMap, pbr.emissionMapTransform);
-        writeMap(L"lmMap", L"lmMapXf", pbr.lightmapFile, pbr.lightmapTransform);
-        writeMap(L"opMap", L"opMapXf", pbr.opacityMap, pbr.opacityMapTransform);
-        writeMap(L"transMap", L"transMapXf", pbr.transmissionMap, pbr.transmissionMapTransform);
-        writeMap(L"ccMap", L"ccMapXf", pbr.clearcoatMap, pbr.clearcoatMapTransform);
-        writeMap(L"ccRoughMap", L"ccRoughMapXf", pbr.clearcoatRoughnessMap, pbr.clearcoatRoughnessMapTransform);
-        writeMap(L"ccNormMap", L"ccNormMapXf", pbr.clearcoatNormalMap, pbr.clearcoatNormalMapTransform);
+        // Per-slot texture emission is driven by the single ordered slot table in
+        // maxjs_material_slots.h (kMaterialSlots). Array order is byte-identical to
+        // the previous hand-written writeMap() sequence and the writeMap lambda above
+        // is unchanged, so keys / emission order / value shapes / omit-when-empty all
+        // match exactly. xfKey == nullptr (gradMap) suppresses the transform sibling.
+        for (const maxjs::MaterialSlot& slot : maxjs::kMaterialSlots) {
+            writeMap(slot.jsonKey, slot.xfKey, pbr.*(slot.path), pbr.*(slot.transform));
+        }
     }
 
     void WriteMaterialFull(std::wostringstream& ss, const MaxJSPBR& pbr) {

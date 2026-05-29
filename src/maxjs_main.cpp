@@ -36,6 +36,7 @@
 #include "threejs_splat.h"
 #include "maxjs_geometry_sync.h"
 #include "maxjs_material_sync.h"
+#include "maxjs_material_slots.h"
 #include "maxjs_scene_extractors.h"
 #include "threejs_audio.h"
 #include "threejs_toon.h"

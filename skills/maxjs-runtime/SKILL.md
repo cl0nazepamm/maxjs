@@ -142,6 +142,7 @@ Clear overrides in `dispose()` if the layer temporarily owns authored objects.
 
 - `ctx.camera`: camera adapter.
 - `ctx.renderer`: renderer info/capabilities.
+- `ctx.instances`: read/write synced instanced groups (ForestPack / RailClone / tyFlow scatters) that render as `THREE.InstancedMesh`.
 - `ctx.input`: event helper with auto-cleanup.
 - `ctx.clock`: JS runtime time, `{ dt, elapsed }`.
 - `ctx.maxTime`: Max timeline, `{ seconds, frame, fps, playing, source }`.
@@ -169,6 +170,14 @@ Clear overrides in `dispose()` if the layer temporarily owns authored objects.
 - `onReady(handle, cb)`
 
 Check `entry.state` before using `entry.root` or `entry.clips`.
+
+`ctx.instances` exposes synced instanced groups — ForestPack / RailClone / tyFlow scatters — which land as one `THREE.InstancedMesh` per source, tagged `userData.maxjsInstanceGroup`. It behaves identically in the live viewer and in exported standalone snapshots, so a layer that drives a scatter keeps working after export.
+
+- `ctx.instances.count` / `keys()` / `has(key)` / `forEach((group, key) => …)` / iteration enumerate the groups.
+- `ctx.instances.get(key)` returns a group handle (or `null`). Resolve it once and hold it — the per-instance accessors then go straight to the mesh with no scene traversal.
+- A group handle exposes `key`, `count`, `raw` (the `InstancedMesh`), `getMatrixAt(i, out?)`, `setMatrixAt(i, m)`, `getPositionAt(i, out?)`, `setPositionAt(i, x, y, z | vec)`, `forEach((i, matrix) => …)`, and `flush()`. The set/move helpers flag the GPU upload automatically; call `flush()` only if you wrote `raw.instanceMatrix` yourself.
+- Groups are keyed by their baked source (`userData.maxjsSource`), currently derived from a `Mesh*` pointer C++-side — stable WITHIN one exported snapshot but not reproducible across re-exports. For code that must survive a re-export, resolve by iteration/index rather than a hard-coded key.
+- `InstancedMesh` count is fixed at allocation: moving, hiding (scale-to-zero), or re-transforming existing instances is free; adding instances beyond the exported count needs a rebuild. All instances in a group share one geometry + material, so a single instance's model cannot be swapped in place.
 
 ## TSL Material Snippets
 

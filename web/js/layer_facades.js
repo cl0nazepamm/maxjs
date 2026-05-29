@@ -26,6 +26,114 @@ function createNodeMapFacade(nodeMap, getAdapter) {
     return freezePlainObject(facade);
 }
 
+// ctx.instances — read/write access to synced instanced groups (ForestPack /
+// RailClone / tyFlow scatters). Each group lands as a THREE.InstancedMesh tagged
+// userData.maxjsInstanceGroup and keyed by userData.maxjsSource (see
+// scene_applier.js applyForestInstances). Built through createLayerManager, so it
+// behaves identically in the live viewer and in exported standalone snapshots.
+//
+// Groups are addressed by their baked source key. NOTE: that key is currently
+// derived from a Mesh* pointer on the C++ side, so it is stable WITHIN one exported
+// snapshot but NOT reproducible across re-exports. For code that must survive a
+// re-export, resolve by iteration/index rather than a hard-coded key (a stable-id
+// follow-up on the C++ extractor would remove this caveat).
+//
+// Typical use: resolve the group ONCE (cheap traverse) and hold the handle; the
+// per-instance accessors then go straight to the mesh with no traversal.
+//   const bricks = ctx.instances.get('...');
+//   bricks.setPositionAt(3, x, y, z);   // moves instance 3, flags an upload
+function createInstancesFacade({ THREE, getRoot }) {
+    const scratch = new THREE.Matrix4();      // used by the mutation helpers
+    const iterScratch = new THREE.Matrix4();  // separate, so a mutating forEach
+                                              // callback can't clobber iteration
+    const handleCache = new WeakMap();        // one stable wrapper per mesh
+
+    function eachGroupMesh(visit) {
+        const root = typeof getRoot === 'function' ? getRoot() : null;
+        if (!root) return;
+        const stack = [root];
+        while (stack.length) {
+            const o = stack.pop();
+            if (o && o.isInstancedMesh && o.userData && o.userData.maxjsInstanceGroup) visit(o);
+            const kids = o && o.children;
+            if (kids) for (let i = 0; i < kids.length; i++) stack.push(kids[i]);
+        }
+    }
+
+    function findMesh(key) {
+        const want = String(key);
+        let hit = null;
+        eachGroupMesh(m => { if (!hit && String(m.userData.maxjsSource) === want) hit = m; });
+        return hit;
+    }
+
+    function wrap(mesh) {
+        if (!mesh) return null;
+        const cached = handleCache.get(mesh);
+        if (cached) return cached;
+        const inRange = (i) => Number.isInteger(i) && i >= 0 && i < mesh.count;
+        const handle = freezePlainObject({
+            get key() { return mesh.userData.maxjsSource; },
+            get count() { return mesh.count; },
+            get raw() { return mesh; },
+            getMatrixAt(i, out = new THREE.Matrix4()) {
+                if (!inRange(i)) return null;
+                mesh.getMatrixAt(i, out);
+                return out;
+            },
+            setMatrixAt(i, matrix) {
+                if (!inRange(i) || !matrix || !matrix.isMatrix4) return false;
+                mesh.setMatrixAt(i, matrix);
+                mesh.instanceMatrix.needsUpdate = true;
+                return true;
+            },
+            getPositionAt(i, out = new THREE.Vector3()) {
+                if (!inRange(i)) return null;
+                mesh.getMatrixAt(i, scratch);
+                return out.setFromMatrixPosition(scratch);
+            },
+            // Move instance i, preserving its rotation/scale. Accepts (x,y,z) or a
+            // Vector3 / array-like as the first argument.
+            setPositionAt(i, x, y, z) {
+                if (!inRange(i)) return false;
+                mesh.getMatrixAt(i, scratch);
+                if (x && typeof x === 'object') {
+                    scratch.setPosition(x.x ?? x[0] ?? 0, x.y ?? x[1] ?? 0, x.z ?? x[2] ?? 0);
+                } else {
+                    scratch.setPosition(x, y, z);
+                }
+                mesh.setMatrixAt(i, scratch);
+                mesh.instanceMatrix.needsUpdate = true;
+                return true;
+            },
+            forEach(fn) {
+                if (typeof fn !== 'function') return;
+                for (let i = 0; i < mesh.count; i++) {
+                    mesh.getMatrixAt(i, iterScratch);
+                    fn(i, iterScratch, handle);
+                }
+            },
+            // Call after a batch of setMatrixAt() if you bypassed the helpers.
+            flush() { mesh.instanceMatrix.needsUpdate = true; return true; },
+        });
+        handleCache.set(mesh, handle);
+        return handle;
+    }
+
+    return freezePlainObject({
+        get count() { let n = 0; eachGroupMesh(() => { n++; }); return n; },
+        keys() { const out = []; eachGroupMesh(m => out.push(m.userData.maxjsSource)); return out; },
+        has(key) { return findMesh(key) !== null; },
+        get(key) { return wrap(findMesh(key)); },
+        all() { const out = []; eachGroupMesh(m => out.push(wrap(m))); return out; },
+        forEach(fn) {
+            if (typeof fn !== 'function') return;
+            eachGroupMesh(m => fn(wrap(m), m.userData.maxjsSource));
+        },
+        [Symbol.iterator]() { return this.all()[Symbol.iterator](); },
+    });
+}
+
 function createMaxSceneFacade({ scene, nodeMap, lightHandleMap, getAdapter, createAnchor, THREE }) {
     const parentHandleOf = (obj) => {
         const h = Number(obj?.userData?.maxjsParentHandle);
@@ -279,6 +387,7 @@ function createInputHelper(renderer) {
 }
 export {
     createNodeMapFacade,
+    createInstancesFacade,
     createMaxSceneFacade,
     createRendererFacade,
     createInputHelper,

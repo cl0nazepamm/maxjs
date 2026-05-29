@@ -4,7 +4,7 @@
 
 import { maxTimeline } from './maxjs_timeline.js';
 import { createCameraAdapter } from './layer_camera_adapter.js';
-import { createInputHelper, createMaxSceneFacade, createNodeMapFacade, createRendererFacade } from './layer_facades.js';
+import { createInputHelper, createInstancesFacade, createMaxSceneFacade, createNodeMapFacade, createRendererFacade } from './layer_facades.js';
 import { createMaxNodeAdapter } from './layer_node_adapter.js';
 import { createRuntimeOverrideController } from './layer_runtime_overrides.js';
 import {
@@ -320,6 +320,7 @@ export function createLayerManager({
 
     function buildContext(layer) {
         const rendererFacade = createRendererFacade(renderer, THREE, scene);
+        const instancesFacade = createInstancesFacade({ THREE, getRoot: () => maxRoot ?? scene });
         const cameraFacade = createCameraAdapter(camera, THREE, ownForLayer, cameraControl, layer.id, debugWarn);
         const nodeMapFacade = createNodeMapFacade(nodeMap, handle => getLayerNodeAdapter(layer, handle));
         const maxSceneFacade = createMaxSceneFacade({
@@ -760,6 +761,7 @@ export function createLayerManager({
             nodeMap: nodeMapFacade,
             camera: cameraFacade,
             renderer: rendererFacade,
+            instances: instancesFacade,
             get input() {
                 return getOrCreateLayerInput(layer);
             },

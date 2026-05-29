@@ -244,6 +244,10 @@ static uint64_t HashMNMeshState(MNMesh& mn) {
 
 static bool ShouldExportMeshVertexColorChannel(Mesh& mesh, int channel, bool allowMapChannel1 = false) {
     if (channel == 1 && !allowMapChannel1) return false;
+    // Map channel 2 is the uv2 (second UV / lightmap-UV) slot — it is exported as
+    // uv2, never as a vertex color. Excluding it here prevents the same channel
+    // from being written twice (once u16n as uv2, once f32 as a vertex color).
+    if (channel == 2) return false;
     if (!mesh.mapSupport(channel)) return false;
 
     const MeshMap& map = mesh.Map(channel);
@@ -289,6 +293,10 @@ static bool MeshHasUsableMapChannel(Mesh& mesh, int channel) {
 
 static bool ShouldExportMNVertexColorChannel(MNMesh& mn, int channel, bool allowMapChannel1 = false) {
     if (channel == 1 && !allowMapChannel1) return false;
+    // Map channel 2 is the uv2 (second UV / lightmap-UV) slot — it is exported as
+    // uv2, never as a vertex color. Excluding it here prevents the same channel
+    // from being written twice (once u16n as uv2, once f32 as a vertex color).
+    if (channel == 2) return false;
     if (!MNMeshHasUsableMapChannel(mn, channel)) return false;
     if (channel == 0 || channel == MAP_SHADING || channel == MAP_ALPHA) return true;
     return channel > 1 || (channel == 1 && allowMapChannel1);

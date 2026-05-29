@@ -1992,6 +1992,7 @@
             ExtractJsonBool(msg, L"includeAudios", options.includeAudios);
             ExtractJsonBool(msg, L"includeGLTFs", options.includeGLTFs);
             ExtractJsonBool(msg, L"includeInstances", options.includeInstances);
+            ExtractJsonBool(msg, L"includeUnusedChannels", options.includeUnusedChannels);
             ExtractJsonBool(msg, L"includeDebugPayload", options.includeDebugPayload);
             ExtractJsonBool(msg, L"includeSnapshotUi", options.includeSnapshotUi);
             ExtractJsonBool(msg, L"includeRuntimeScene", options.includeRuntimeScene);

@@ -748,6 +748,7 @@ public:
         bool includeAudios = true;
         bool includeGLTFs = true;
         bool includeInstances = true;
+        bool includeUnusedChannels = true;  // export stray vertex-color map channels (>= 3); UI defaults this off for a lean export
         bool includeDebugPayload = false;
         bool includeSnapshotUi = true;
         bool includeRuntimeScene = true;
@@ -3500,6 +3501,13 @@ public:
                              const std::wstring& runtimeSceneJson,
                              const SnapshotExportOptions& options,
                              std::wstring& error) {
+        // "Export unused channels": when off, drop non-canonical vertex-color
+        // channels (map channel >= 3) for THIS export only; restored on return so
+        // the live viewport keeps every channel.
+        const bool prevIncludeUnusedVc = g_includeUnusedVertexColorChannels;
+        g_includeUnusedVertexColorChannels = options.includeUnusedChannels;
+        struct VcChannelGuard { bool prev; ~VcChannelGuard() { g_includeUnusedVertexColorChannels = prev; } } vcChannelGuard{ prevIncludeUnusedVc };
+
         Interface* ip = GetCOREInterface();
         if (!ip) {
             error = L"3ds Max interface unavailable";

@@ -9856,6 +9856,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             includeSplats: true,
             includeAudios: true,
             includeInstances: true,
+            includeUnusedChannels: false,
             includeDebugPayload: false,
             includeSnapshotUi: true,
             includeRuntimeScene: true,
@@ -9980,6 +9981,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                             <label class="fx-check" for="snapshot-includeSplats"><span>Splats</span><input id="snapshot-includeSplats" type="checkbox"></label>
                             <label class="fx-check" for="snapshot-includeAudios"><span>Audio</span><input id="snapshot-includeAudios" type="checkbox"></label>
                             <label class="fx-check" for="snapshot-includeInstances"><span>Instances</span><input id="snapshot-includeInstances" type="checkbox"></label>
+                            <label class="fx-check" for="snapshot-includeUnusedChannels" title="Export stray vertex-color map channels (≥3, e.g. extra UVW sets). Off = lean export; tick only if a material reads maxjs_vc_N."><span>Unused VC Channels</span><input id="snapshot-includeUnusedChannels" type="checkbox"></label>
                             <label class="fx-check" for="snapshot-includeDebugPayload"><span>Debug Payload</span><input id="snapshot-includeDebugPayload" type="checkbox"></label>
                             <label class="fx-check" for="snapshot-includeSnapshotUi"><span>Viewer UI State</span><input id="snapshot-includeSnapshotUi" type="checkbox"></label>
                             <label class="fx-check" for="snapshot-includeRuntimeScene"><span>JS Runtime Scene</span><input id="snapshot-includeRuntimeScene" type="checkbox"></label>

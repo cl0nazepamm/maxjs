@@ -242,6 +242,13 @@ static uint64_t HashMNMeshState(MNMesh& mn) {
     return h;
 }
 
+// Export-scoped toggle backing the "Export unused channels" snapshot option. When
+// false, only the canonical vertex-color channels (0 / shading / alpha) are
+// collected; higher map channels (>= 3, which are UVW unless a material reads
+// maxjs_vc_N) are dropped. Default true so the live viewport keeps every channel —
+// BuildSnapshotBinary flips it from the export option under a scope guard.
+inline bool g_includeUnusedVertexColorChannels = true;
+
 static bool ShouldExportMeshVertexColorChannel(Mesh& mesh, int channel, bool allowMapChannel1 = false) {
     if (channel == 1 && !allowMapChannel1) return false;
     // Map channel 2 is the uv2 (second UV / lightmap-UV) slot — it is exported as
@@ -253,6 +260,7 @@ static bool ShouldExportMeshVertexColorChannel(Mesh& mesh, int channel, bool all
     const MeshMap& map = mesh.Map(channel);
     if (!map.IsUsed() || map.vnum <= 0 || map.fnum <= 0 || !map.tv || !map.tf) return false;
     if (channel == 0 || channel == MAP_SHADING || channel == MAP_ALPHA) return true;
+    if (!g_includeUnusedVertexColorChannels) return false;  // "Export unused channels" off → drop non-canonical
     return (map.flags & MESHMAP_VERTCOLOR) != 0;
 }
 
@@ -299,6 +307,7 @@ static bool ShouldExportMNVertexColorChannel(MNMesh& mn, int channel, bool allow
     if (channel == 2) return false;
     if (!MNMeshHasUsableMapChannel(mn, channel)) return false;
     if (channel == 0 || channel == MAP_SHADING || channel == MAP_ALPHA) return true;
+    if (!g_includeUnusedVertexColorChannels) return false;  // "Export unused channels" off → drop non-canonical
     return channel > 1 || (channel == 1 && allowMapChannel1);
 }
 

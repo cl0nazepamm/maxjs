@@ -116,6 +116,7 @@ export {
     OWNER_JS,
     OWNER_OVERLAY,
     setOwner,
+    isOwnedByJs,
     getOwner,
     markOwned,
     setSnapshotTargetId,

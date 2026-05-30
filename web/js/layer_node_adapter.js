@@ -89,6 +89,336 @@ function getMeshVertexPosition(mesh, vertexIndex, target) {
     return target;
 }
 
+function finiteNumber(value, fallback = 0) {
+    const n = Number(value);
+    return Number.isFinite(n) ? n : fallback;
+}
+
+function readVectorInput(value, target, fallbackX = 0, fallbackY = fallbackX, fallbackZ = fallbackX) {
+    if (typeof value === 'number') {
+        const scalar = finiteNumber(value, fallbackX);
+        return target.set(scalar, scalar, scalar);
+    }
+    if (Array.isArray(value) || ArrayBuffer.isView(value)) {
+        return target.set(
+            finiteNumber(value[0], fallbackX),
+            finiteNumber(value[1], fallbackY),
+            finiteNumber(value[2], fallbackZ)
+        );
+    }
+    if (value && typeof value === 'object') {
+        return target.set(
+            finiteNumber(value.x ?? value[0], fallbackX),
+            finiteNumber(value.y ?? value[1], fallbackY),
+            finiteNumber(value.z ?? value[2], fallbackZ)
+        );
+    }
+    return target.set(fallbackX, fallbackY, fallbackZ);
+}
+
+function readQuaternionInput(value, target) {
+    if (value?.isEuler) {
+        return target.setFromEuler(value);
+    }
+    if (Array.isArray(value) || ArrayBuffer.isView(value)) {
+        return target.set(
+            finiteNumber(value[0], 0),
+            finiteNumber(value[1], 0),
+            finiteNumber(value[2], 0),
+            finiteNumber(value[3], 1)
+        ).normalize();
+    }
+    if (value && typeof value === 'object') {
+        return target.set(
+            finiteNumber(value.x ?? value[0], 0),
+            finiteNumber(value.y ?? value[1], 0),
+            finiteNumber(value.z ?? value[2], 0),
+            finiteNumber(value.w ?? value[3], 1)
+        ).normalize();
+    }
+    return target.identity();
+}
+
+function readEulerInput(value, target) {
+    if (value?.isQuaternion) {
+        return target.setFromQuaternion(value);
+    }
+    if (Array.isArray(value) || ArrayBuffer.isView(value)) {
+        const order = typeof value[3] === 'string' ? value[3] : (target.order || 'XYZ');
+        return target.set(
+            finiteNumber(value[0], 0),
+            finiteNumber(value[1], 0),
+            finiteNumber(value[2], 0),
+            order
+        );
+    }
+    if (value && typeof value === 'object') {
+        return target.set(
+            finiteNumber(value.x ?? value[0], 0),
+            finiteNumber(value.y ?? value[1], 0),
+            finiteNumber(value.z ?? value[2], 0),
+            value.order || target.order || 'XYZ'
+        );
+    }
+    return target.set(0, 0, 0, target.order || 'XYZ');
+}
+
+const VECTOR3_MUTATORS = [
+    'set', 'setScalar', 'setX', 'setY', 'setZ', 'setComponent',
+    'copy', 'add', 'addScalar', 'addVectors', 'addScaledVector',
+    'sub', 'subScalar', 'subVectors', 'multiply', 'multiplyScalar',
+    'multiplyVectors', 'applyEuler', 'applyAxisAngle', 'applyMatrix3',
+    'applyNormalMatrix', 'applyMatrix4', 'applyQuaternion', 'project',
+    'unproject', 'transformDirection', 'divide', 'divideScalar', 'min',
+    'max', 'clamp', 'clampScalar', 'clampLength', 'floor', 'ceil',
+    'round', 'roundToZero', 'negate', 'normalize', 'setLength', 'lerp',
+    'lerpVectors', 'cross', 'crossVectors', 'projectOnVector',
+    'projectOnPlane', 'reflect', 'setFromMatrixPosition',
+    'setFromMatrixScale', 'setFromMatrixColumn', 'setFromMatrix3Column',
+    'fromArray', 'fromBufferAttribute', 'random', 'randomDirection',
+];
+
+const QUATERNION_MUTATORS = [
+    'set', 'copy', 'setFromEuler', 'setFromAxisAngle', 'setFromRotationMatrix',
+    'setFromUnitVectors', 'rotateTowards', 'identity', 'invert', 'conjugate',
+    'normalize', 'multiply', 'premultiply', 'multiplyQuaternions', 'slerp',
+    'slerpQuaternions', 'fromArray', 'random',
+];
+
+const EULER_MUTATORS = [
+    'set', 'copy', 'setFromRotationMatrix', 'setFromQuaternion',
+    'setFromVector3', 'reorder', 'fromArray',
+];
+
+function createLiveVector3Facade(THREE, readInto, writeFrom, fallback = [0, 0, 0]) {
+    const vector = new THREE.Vector3();
+    const backing = new THREE.Vector3();
+    let suppressWrite = false;
+
+    function syncFromScene() {
+        if (!suppressWrite) readInto(backing);
+        return backing;
+    }
+
+    function commitToScene() {
+        writeFrom(backing);
+    }
+
+    function defineComponent(key, index) {
+        Object.defineProperty(vector, key, {
+            enumerable: true,
+            configurable: true,
+            get() {
+                syncFromScene();
+                return backing[key];
+            },
+            set(value) {
+                if (!suppressWrite) syncFromScene();
+                backing[key] = finiteNumber(value, fallback[index]);
+                if (!suppressWrite) commitToScene();
+            },
+        });
+    }
+
+    defineComponent('x', 0);
+    defineComponent('y', 1);
+    defineComponent('z', 2);
+
+    for (const method of VECTOR3_MUTATORS) {
+        const original = THREE.Vector3.prototype[method];
+        if (typeof original !== 'function') continue;
+        Object.defineProperty(vector, method, {
+            configurable: true,
+            value(...args) {
+                syncFromScene();
+                suppressWrite = true;
+                let result;
+                try {
+                    result = original.apply(vector, args);
+                } finally {
+                    suppressWrite = false;
+                }
+                commitToScene();
+                return result === vector ? vector : result;
+            },
+        });
+    }
+
+    Object.defineProperty(vector, '_maxjsSync', {
+        configurable: true,
+        value() {
+            syncFromScene();
+            return vector;
+        },
+    });
+
+    return vector;
+}
+
+function createLiveQuaternionFacade(THREE, readInto, writeFrom) {
+    const quaternion = new THREE.Quaternion();
+    const backing = new THREE.Quaternion();
+    let suppressWrite = false;
+
+    function syncFromScene() {
+        if (!suppressWrite) {
+            readInto(backing);
+            quaternion._x = backing.x;
+            quaternion._y = backing.y;
+            quaternion._z = backing.z;
+            quaternion._w = backing.w;
+        }
+        return backing;
+    }
+
+    function commitFromFacade() {
+        backing.set(
+            finiteNumber(quaternion._x, 0),
+            finiteNumber(quaternion._y, 0),
+            finiteNumber(quaternion._z, 0),
+            finiteNumber(quaternion._w, 1)
+        ).normalize();
+        quaternion._x = backing.x;
+        quaternion._y = backing.y;
+        quaternion._z = backing.z;
+        quaternion._w = backing.w;
+        writeFrom(backing);
+    }
+
+    function defineComponent(key, internalKey, fallback) {
+        Object.defineProperty(quaternion, key, {
+            enumerable: true,
+            configurable: true,
+            get() {
+                syncFromScene();
+                return quaternion[internalKey];
+            },
+            set(value) {
+                syncFromScene();
+                quaternion[internalKey] = finiteNumber(value, fallback);
+                if (!suppressWrite) commitFromFacade();
+            },
+        });
+    }
+
+    defineComponent('x', '_x', 0);
+    defineComponent('y', '_y', 0);
+    defineComponent('z', '_z', 0);
+    defineComponent('w', '_w', 1);
+
+    for (const method of QUATERNION_MUTATORS) {
+        const original = THREE.Quaternion.prototype[method];
+        if (typeof original !== 'function') continue;
+        Object.defineProperty(quaternion, method, {
+            configurable: true,
+            value(...args) {
+                syncFromScene();
+                suppressWrite = true;
+                let result;
+                try {
+                    result = original.apply(quaternion, args);
+                } finally {
+                    suppressWrite = false;
+                }
+                commitFromFacade();
+                return result === quaternion ? quaternion : result;
+            },
+        });
+    }
+
+    Object.defineProperty(quaternion, '_maxjsSync', {
+        configurable: true,
+        value() {
+            syncFromScene();
+            return quaternion;
+        },
+    });
+
+    return quaternion;
+}
+
+function createLiveEulerFacade(THREE, readInto, writeFrom) {
+    const euler = new THREE.Euler();
+    const backing = new THREE.Euler();
+    let suppressWrite = false;
+
+    function syncFromScene() {
+        if (!suppressWrite) {
+            readInto(backing);
+            euler._x = backing.x;
+            euler._y = backing.y;
+            euler._z = backing.z;
+            euler._order = backing.order || 'XYZ';
+        }
+        return backing;
+    }
+
+    function commitFromFacade() {
+        backing.set(
+            finiteNumber(euler._x, 0),
+            finiteNumber(euler._y, 0),
+            finiteNumber(euler._z, 0),
+            euler._order || 'XYZ'
+        );
+        euler._x = backing.x;
+        euler._y = backing.y;
+        euler._z = backing.z;
+        euler._order = backing.order;
+        writeFrom(backing);
+    }
+
+    function defineComponent(key, internalKey, fallback) {
+        Object.defineProperty(euler, key, {
+            enumerable: true,
+            configurable: true,
+            get() {
+                syncFromScene();
+                return euler[internalKey];
+            },
+            set(value) {
+                syncFromScene();
+                euler[internalKey] = key === 'order' ? (value || 'XYZ') : finiteNumber(value, fallback);
+                if (!suppressWrite) commitFromFacade();
+            },
+        });
+    }
+
+    defineComponent('x', '_x', 0);
+    defineComponent('y', '_y', 0);
+    defineComponent('z', '_z', 0);
+    defineComponent('order', '_order', 'XYZ');
+
+    for (const method of EULER_MUTATORS) {
+        const original = THREE.Euler.prototype[method];
+        if (typeof original !== 'function') continue;
+        Object.defineProperty(euler, method, {
+            configurable: true,
+            value(...args) {
+                syncFromScene();
+                suppressWrite = true;
+                let result;
+                try {
+                    result = original.apply(euler, args);
+                } finally {
+                    suppressWrite = false;
+                }
+                commitFromFacade();
+                return result === euler ? euler : result;
+            },
+        });
+    }
+
+    Object.defineProperty(euler, '_maxjsSync', {
+        configurable: true,
+        value() {
+            syncFromScene();
+            return euler;
+        },
+    });
+
+    return euler;
+}
+
 function createCameraAdapter(camera, THREE, ownForJs, cameraControl, layerId, debugWarn = () => {}) {
     const scratch = {
         position: new THREE.Vector3(),
@@ -441,7 +771,19 @@ function createCameraAdapter(camera, THREE, ownForJs, cameraControl, layerId, de
     });
 }
 
-function createMaxNodeAdapter({ handle, getObject, THREE, createAnchor, layerId, getTransformApi, setMaterialMap, getNodeAdapter }) {
+function createMaxNodeAdapter({
+    handle,
+    getObject,
+    THREE,
+    createAnchor,
+    layerId,
+    getTransformApi,
+    setMaterialMap,
+    getNodeAdapter,
+    cloneFromMax,
+    setVisibilityOverride,
+    clearVisibilityOverride,
+}) {
     const scratch = {
         vA: new THREE.Vector3(),
         vB: new THREE.Vector3(),
@@ -451,8 +793,122 @@ function createMaxNodeAdapter({ handle, getObject, THREE, createAnchor, layerId,
         localPoint: new THREE.Vector3(),
         localNormal: new THREE.Vector3(),
         normalMatrix: new THREE.Matrix3(),
+        position: new THREE.Vector3(),
+        scale: new THREE.Vector3(),
+        quaternion: new THREE.Quaternion(),
+        euler: new THREE.Euler(),
     };
     const transform = getTransformApi(handle, getObject, layerId);
+
+    function readLocalPosition(target) {
+        const obj = getObject();
+        return obj?.isObject3D ? target.copy(obj.position) : target.set(0, 0, 0);
+    }
+
+    function readLocalScale(target) {
+        const obj = getObject();
+        return obj?.isObject3D ? target.copy(obj.scale) : target.set(1, 1, 1);
+    }
+
+    function readLocalQuaternion(target) {
+        const obj = getObject();
+        return obj?.isObject3D ? target.copy(obj.quaternion) : target.identity();
+    }
+
+    function readLocalRotation(target) {
+        const obj = getObject();
+        if (!obj?.isObject3D) return target.set(0, 0, 0, target.order || 'XYZ');
+        return target.copy(obj.rotation);
+    }
+
+    function setLocalPosition(value) {
+        readVectorInput(value, scratch.position, 0, 0, 0);
+        return transform.setPosition(scratch.position.x, scratch.position.y, scratch.position.z);
+    }
+
+    function setLocalScale(value) {
+        readVectorInput(value, scratch.scale, 1, 1, 1);
+        return transform.setScale(scratch.scale.x, scratch.scale.y, scratch.scale.z);
+    }
+
+    function setLocalQuaternion(value) {
+        readQuaternionInput(value, scratch.quaternion);
+        return transform.setQuaternion(
+            scratch.quaternion.x,
+            scratch.quaternion.y,
+            scratch.quaternion.z,
+            scratch.quaternion.w
+        );
+    }
+
+    function setLocalRotation(value) {
+        readEulerInput(value, scratch.euler);
+        return transform.setRotationEuler(
+            scratch.euler.x,
+            scratch.euler.y,
+            scratch.euler.z,
+            { order: scratch.euler.order }
+        );
+    }
+
+    function applyLocalVisibility(obj, next) {
+        if (!obj?.isObject3D) return false;
+        obj.userData ??= {};
+        obj.userData.maxjsVisible = next;
+        obj.visible = true;
+        obj.layers?.set?.(next ? 0 : 31);
+        const materials = Array.isArray(obj.material)
+            ? obj.material
+            : (obj.material ? [obj.material] : []);
+        for (const material of materials) {
+            if (material) material.visible = true;
+        }
+        return true;
+    }
+
+    function setNodeVisible(value) {
+        const obj = getObject();
+        if (!obj) return false;
+        const next = value !== false;
+        setVisibilityOverride?.(handle, next, obj);
+        return applyLocalVisibility(obj, next);
+    }
+
+    function resetNodeVisibility() {
+        const obj = getObject();
+        if (clearVisibilityOverride) return clearVisibilityOverride(handle, obj);
+        if (obj?.isObject3D) {
+            obj.userData ??= {};
+            delete obj.userData.maxjsVisible;
+            obj.visible = true;
+            obj.layers?.set?.(0);
+            return true;
+        }
+        return false;
+    }
+
+    const positionFacade = createLiveVector3Facade(
+        THREE,
+        readLocalPosition,
+        value => transform.setPosition(value.x, value.y, value.z),
+        [0, 0, 0]
+    );
+    const scaleFacade = createLiveVector3Facade(
+        THREE,
+        readLocalScale,
+        value => transform.setScale(value.x, value.y, value.z),
+        [1, 1, 1]
+    );
+    const quaternionFacade = createLiveQuaternionFacade(
+        THREE,
+        readLocalQuaternion,
+        value => transform.setQuaternion(value.x, value.y, value.z, value.w)
+    );
+    const rotationFacade = createLiveEulerFacade(
+        THREE,
+        readLocalRotation,
+        value => transform.setRotationEuler(value.x, value.y, value.z, { order: value.order })
+    );
 
     function collectSampleableMeshes(root, includeInvisible = false) {
         if (!root?.isObject3D) return [];
@@ -527,31 +983,51 @@ function createMaxNodeAdapter({ handle, getObject, THREE, createAnchor, layerId,
 
     return freezePlainObject({
         handle,
+        get raw() { return getObject(); },
+        get object() { return getObject(); },
         get exists() { return !!getObject(); },
         get name() { return getObject()?.name ?? ''; },
         get type() { return getObject()?.type ?? null; },
         get isMesh() { return !!getObject()?.isMesh; },
         get isHelper() { return !!getObject()?.userData?.maxjsHelper; },
+        get position() {
+            positionFacade._maxjsSync();
+            return positionFacade;
+        },
+        set position(value) { setLocalPosition(value); },
+        get rotation() {
+            rotationFacade._maxjsSync();
+            return rotationFacade;
+        },
+        set rotation(value) { setLocalRotation(value); },
+        get quaternion() {
+            quaternionFacade._maxjsSync();
+            return quaternionFacade;
+        },
+        set quaternion(value) { setLocalQuaternion(value); },
+        get scale() {
+            scaleFacade._maxjsSync();
+            return scaleFacade;
+        },
+        set scale(value) { setLocalScale(value); },
+        get matrix() {
+            const obj = getObject();
+            return obj?.matrix?.clone?.() ?? null;
+        },
+        get matrixWorld() {
+            const obj = getObject();
+            return obj?.matrixWorld?.clone?.() ?? null;
+        },
         get visible() {
             const obj = getObject();
             if (!obj) return false;
             return obj.userData?.maxjsVisible !== false && obj.visible !== false;
         },
-        setVisible(v) {
-            const obj = getObject();
-            if (!obj) return;
-            const next = !!v;
-            obj.userData ??= {};
-            obj.userData.maxjsVisible = next;
-            obj.visible = true;
-            obj.layers?.set?.(next ? 0 : 31);
-            const materials = Array.isArray(obj.material)
-                ? obj.material
-                : (obj.material ? [obj.material] : []);
-            for (const material of materials) {
-                if (material) material.visible = true;
-            }
-        },
+        set visible(v) { setNodeVisible(v); },
+        setVisible(v) { return setNodeVisible(v); },
+        show() { setNodeVisible(true); return this; },
+        hide() { setNodeVisible(false); return this; },
+        resetVisibility() { return resetNodeVisibility(); },
         get jsmod() { return !!getObject()?.userData?.jsmod; },
         get parentHandle() {
             const h = Number(getObject()?.userData?.maxjsParentHandle);
@@ -690,6 +1166,16 @@ function createMaxNodeAdapter({ handle, getObject, THREE, createAnchor, layerId,
             return obj ? target.setFromObject(obj) : null;
         },
         transform,
+        get base() { return transform.baseSnapshot(); },
+        resetTransform() { return transform.clear(); },
+        reset() {
+            const transformChanged = transform.clear();
+            const visibilityChanged = resetNodeVisibility();
+            return transformChanged || visibilityChanged;
+        },
+        clone(options = {}) {
+            return cloneFromMax?.(handle, options) ?? null;
+        },
         // Override a material map slot on the synced mesh. Survives
         // fastsync rebuilds — registered against the handle, reapplied
         // on every scene message after the material is rebuilt. Pass

@@ -282,8 +282,7 @@ public:
                            const std::wstring& directoryExtensionFilter = {}) {
         std::wstring sourcePath = rawPath;
         std::replace(sourcePath.begin(), sourcePath.end(), L'/', L'\\');
-        while (isDirectory && !sourcePath.empty() &&
-               (sourcePath.back() == L'\\' || sourcePath.back() == L'/')) {
+        while (!sourcePath.empty() && sourcePath.back() == L'\\') {
             sourcePath.pop_back();
         }
 

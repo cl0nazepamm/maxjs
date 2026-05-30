@@ -33,11 +33,17 @@ function createCameraAdapter(camera, THREE, ownForJs, cameraControl, layerId, de
     function normalizeSceneCameraEntry(entry) {
         const handle = Number(entry?.handle ?? entry?.h ?? entry?.id ?? 0);
         const name = String(entry?.name ?? entry?.n ?? entry?.label ?? '').trim();
+        const targetHandle = Number(entry?.targetHandle ?? entry?.targetH ?? entry?.th ?? 0);
+        const targetName = String(entry?.targetName ?? entry?.targetN ?? entry?.tn ?? '').trim();
         return freezePlainObject({
             handle,
             h: handle,
             name,
             n: name,
+            targetHandle: Number.isFinite(targetHandle) && targetHandle > 0 ? targetHandle : null,
+            targetH: Number.isFinite(targetHandle) && targetHandle > 0 ? targetHandle : null,
+            targetName,
+            targetN: targetName,
         });
     }
 

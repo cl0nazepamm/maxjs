@@ -11,6 +11,8 @@ function createRuntimeOverrideController({ THREE, nodeMap }) {
     // (HTML, canvas, anything) reach displacement / color / etc. on the
     // synced mesh without cloning.
     const materialOverrides = new Map();
+    const runtimeVisibilityOverrides = new Map();
+    let runtimeVisibilityReapplyNeeded = false;
     const transformScratch = {
         localMatrix: new THREE.Matrix4(),
         finalMatrix: new THREE.Matrix4(),
@@ -221,6 +223,81 @@ function createRuntimeOverrideController({ THREE, nodeMap }) {
     
     function markRuntimeTransformOverridesDirty() {
         if (runtimeTransformOverrides.size > 0) runtimeTransformReapplyNeeded = true;
+        if (runtimeVisibilityOverrides.size > 0) runtimeVisibilityReapplyNeeded = true;
+    }
+
+    function applyRuntimeVisibilityOverrideToObject(state, obj) {
+        if (!state || !obj?.isObject3D) return false;
+        const next = state.visible !== false;
+        let changed = obj.userData?.maxjsVisible !== next;
+        obj.userData ??= {};
+        obj.userData.maxjsVisible = next;
+        if (obj.visible !== true) {
+            obj.visible = true;
+            changed = true;
+        }
+        if (obj.layers?.set) {
+            const layer = next ? 0 : 31;
+            const mask = 1 << layer;
+            if (obj.layers.mask !== mask) {
+                obj.layers.set(layer);
+                changed = true;
+            }
+        }
+        const materials = Array.isArray(obj.material)
+            ? obj.material
+            : (obj.material ? [obj.material] : []);
+        for (const material of materials) {
+            if (material && material.visible !== true) {
+                material.visible = true;
+                changed = true;
+            }
+        }
+        return changed;
+    }
+
+    function setRuntimeVisibilityOverride(layerId, handle, visible, explicitObj = null) {
+        const obj = explicitObj?.isObject3D ? explicitObj : nodeMap.get(handle);
+        const current = runtimeVisibilityOverrides.get(handle);
+        const state = {
+            handle,
+            ownerLayer: layerId ?? null,
+            visible: visible !== false,
+            baseVisible: current?.baseVisible ?? (obj ? obj.userData?.maxjsVisible !== false && obj.visible !== false : true),
+            object: obj ?? current?.object ?? null,
+        };
+        runtimeVisibilityOverrides.set(handle, state);
+        runtimeVisibilityReapplyNeeded = true;
+        return applyRuntimeVisibilityOverrideToObject(state, obj);
+    }
+
+    function clearRuntimeVisibilityOverride(handle, explicitObj = null) {
+        const state = runtimeVisibilityOverrides.get(handle);
+        if (!state) return false;
+        runtimeVisibilityOverrides.delete(handle);
+        if (runtimeVisibilityOverrides.size === 0) runtimeVisibilityReapplyNeeded = false;
+        const obj = explicitObj?.isObject3D ? explicitObj : (nodeMap.get(handle) ?? state.object);
+        applyRuntimeVisibilityOverrideToObject({ visible: state.baseVisible !== false }, obj);
+        return true;
+    }
+
+    function clearRuntimeVisibilityOverridesForLayer(layerId) {
+        if (!layerId) return;
+        for (const [handle, state] of [...runtimeVisibilityOverrides.entries()]) {
+            if (state.ownerLayer === layerId) clearRuntimeVisibilityOverride(handle);
+        }
+    }
+
+    function applyAllRuntimeVisibilityOverrides(force = false) {
+        if (!force && !runtimeVisibilityReapplyNeeded) return false;
+        runtimeVisibilityReapplyNeeded = false;
+        let applied = false;
+        for (const [handle, state] of runtimeVisibilityOverrides.entries()) {
+            const obj = nodeMap.get(handle) ?? state.object;
+            if (!obj?.isObject3D) continue;
+            if (applyRuntimeVisibilityOverrideToObject(state, obj)) applied = true;
+        }
+        return applied;
     }
     
     function getRuntimeTransformStateSnapshot(handle) {
@@ -310,6 +387,20 @@ function createRuntimeOverrideController({ THREE, nodeMap }) {
             get mode() { return runtimeTransformOverrides.get(handle)?.mode ?? null; },
             clear() { return clearRuntimeTransformOverride(handle); },
             snapshot() { return getRuntimeTransformStateSnapshot(handle); },
+            baseSnapshot() {
+                const obj = getSceneObject();
+                const state = runtimeTransformOverrides.get(handle);
+                const matrix = state?.baseMatrix ?? obj?.matrix ?? null;
+                if (!matrix) return null;
+                matrix.decompose(transformScratch.position, transformScratch.quaternion, transformScratch.scale);
+                return freezePlainObject({
+                    handle,
+                    position: transformScratch.position.toArray(),
+                    quaternion: transformScratch.quaternion.toArray(),
+                    scale: transformScratch.scale.toArray(),
+                    matrix: matrix.toArray(),
+                });
+            },
             setMode(mode, options = {}) {
                 const validMode = mode === 'world' ? 'world' : (mode === 'absolute' ? 'absolute' : 'additive');
                 const payload = ensureState(validMode, options.preserveCurrent !== false);
@@ -329,12 +420,12 @@ function createRuntimeOverrideController({ THREE, nodeMap }) {
             },
             setRotationEuler(x = 0, y = 0, z = 0, options = {}) {
                 return mutate(options.mode === 'additive' ? 'additive' : 'absolute', (position, quaternion) => {
-                    quaternion.setFromEuler(transformScratch.euler.set(x, y, z, 'XYZ'));
+                    quaternion.setFromEuler(transformScratch.euler.set(x, y, z, options.order || 'XYZ'));
                 }, options);
             },
-            offsetRotationEuler(x = 0, y = 0, z = 0) {
+            offsetRotationEuler(x = 0, y = 0, z = 0, options = {}) {
                 return mutate('additive', (position, quaternion) => {
-                    transformScratch.deltaQuaternion.setFromEuler(transformScratch.euler.set(x, y, z, 'XYZ'));
+                    transformScratch.deltaQuaternion.setFromEuler(transformScratch.euler.set(x, y, z, options.order || 'XYZ'));
                     quaternion.multiply(transformScratch.deltaQuaternion);
                 });
             },
@@ -364,9 +455,9 @@ function createRuntimeOverrideController({ THREE, nodeMap }) {
                     quaternion.set(x, y, z, w).normalize();
                 });
             },
-            setWorldRotationEuler(x = 0, y = 0, z = 0) {
+            setWorldRotationEuler(x = 0, y = 0, z = 0, options = {}) {
                 return mutate('world', (position, quaternion) => {
-                    quaternion.setFromEuler(transformScratch.euler.set(x, y, z, 'XYZ'));
+                    quaternion.setFromEuler(transformScratch.euler.set(x, y, z, options.order || 'XYZ'));
                 });
             },
             setWorldTransform(px = 0, py = 0, pz = 0, qx = 0, qy = 0, qz = 0, qw = 1, sx = 1, sy = sx, sz = sx) {
@@ -395,11 +486,15 @@ function createRuntimeOverrideController({ THREE, nodeMap }) {
         setMaterialMapOverride,
         clearMaterialOverridesForLayer,
         applyAllRuntimeTransformOverrides,
+        applyAllRuntimeVisibilityOverrides,
         markRuntimeTransformOverridesDirty,
         serializeRuntimeTransformOverrides,
         restoreRuntimeTransformOverrides,
         createTransformApi,
         clearRuntimeTransformOverridesForLayer,
+        setRuntimeVisibilityOverride,
+        clearRuntimeVisibilityOverride,
+        clearRuntimeVisibilityOverridesForLayer,
     };
 }
 

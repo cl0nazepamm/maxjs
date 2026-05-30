@@ -14,6 +14,7 @@ import {
     OWNER_OVERLAY,
     disposeOwnedResource,
     getOwner,
+    isOwnedByJs,
     markOwned,
     setOwner,
     setSnapshotTargetId,
@@ -185,11 +186,15 @@ export function createLayerManager({
         setMaterialMapOverride,
         clearMaterialOverridesForLayer,
         applyAllRuntimeTransformOverrides,
+        applyAllRuntimeVisibilityOverrides,
         markRuntimeTransformOverridesDirty,
         serializeRuntimeTransformOverrides,
         restoreRuntimeTransformOverrides,
         createTransformApi,
         clearRuntimeTransformOverridesForLayer,
+        setRuntimeVisibilityOverride,
+        clearRuntimeVisibilityOverride,
+        clearRuntimeVisibilityOverridesForLayer,
     } = createRuntimeOverrideController({ THREE, nodeMap });
 
     function emitChange(reason = 'state') {
@@ -312,6 +317,9 @@ export function createLayerManager({
                 getTransformApi: createTransformApi,
                 setMaterialMap: (h, slot, tex) => setMaterialMapOverride(layer.id, h, slot, tex),
                 getNodeAdapter: (nextHandle) => getLayerNodeAdapter(layer, nextHandle),
+                cloneFromMax: (source, options) => layer.cloneFromMax?.(source, options) ?? null,
+                setVisibilityOverride: (h, visible, obj) => setRuntimeVisibilityOverride(layer.id, h, visible, obj),
+                clearVisibilityOverride: (h, obj) => clearRuntimeVisibilityOverride(h, obj),
             });
             layer.nodeAdapters.set(handle, adapter);
         }
@@ -682,6 +690,7 @@ export function createLayerManager({
             if (clone.userData?.maxjsFollowSourceMaterial) layer.liveMaterialClones.add(clone);
             return clone;
         };
+        layer.cloneFromMax = cloneFromMaxForLayer;
 
         const jsFacade = freezePlainObject({
             root: layer.group,
@@ -741,6 +750,11 @@ export function createLayerManager({
                 return setSnapshotTargetId(resource, `runtime:${layer.id}:${id}`);
             },
             dispose(resource) {
+                // Detach Object3D resources from the scene graph before freeing them.
+                // Without this, dispose() frees geometry/material but leaves the object
+                // parented — it lingers as a dead, un-rendered-but-present husk (and any
+                // layer still toggling its ancestor's visibility brings it back "stuck").
+                if (resource?.isObject3D) resource.parent?.remove(resource);
                 disposeOwnedResource(resource);
             },
             traverse(cb) {
@@ -878,6 +892,7 @@ export function createLayerManager({
             nodeAdapters: new Map(),
             disposers: [],
             input: null,
+            cloneFromMax: null,
             profile: {
                 mountMs: 0,
                 lastUpdateMs: 0,
@@ -948,6 +963,7 @@ export function createLayerManager({
 
         for (const resource of layer.tracked) {
             try {
+                if (resource?.isObject3D) resource.parent?.remove(resource);
                 disposeOwnedResource(resource);
             } catch (err) {
                 debugWarn(`[LayerManager] Layer "${id}" tracked dispose error:`, err);
@@ -958,6 +974,7 @@ export function createLayerManager({
         layer.nodeAdapters.clear();
         if (layer.input) { layer.input.dispose(); layer.input = null; }
         clearRuntimeTransformOverridesForLayer(id);
+        clearRuntimeVisibilityOverridesForLayer(id);
         clearMaterialOverridesForLayer(id);
 
         jsWorldRoot.remove(layer.group);
@@ -1012,6 +1029,7 @@ export function createLayerManager({
         let totalUpdateMs = 0;
 
         applyAllRuntimeTransformOverrides();
+        applyAllRuntimeVisibilityOverrides();
 
         for (const layer of layers.values()) {
             anchorCount += layer.anchors.length;

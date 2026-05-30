@@ -1274,28 +1274,6 @@
         }
     }
 
-    bool MarkCameraDirtyIfTargetNodeChanged(const NodeEventNamespace::NodeKeyTab& nodes) {
-        if (nodes.Count() <= 0 || lockedCameraHandle_ == 0) return false;
-        Interface* ip = GetCOREInterface();
-        INode* cameraNode = ip ? ip->GetINodeByHandle(lockedCameraHandle_) : nullptr;
-        INode* targetNode = cameraNode ? cameraNode->GetTarget() : nullptr;
-        if (!targetNode) return false;
-        const ULONG targetHandle = targetNode->GetHandle();
-        for (int i = 0; i < nodes.Count(); ++i) {
-            INode* node = NodeEventNamespace::GetNodeByKey(nodes[i]);
-            if (!node) continue;
-            bool matched = false;
-            VisitNodeSubtree(node, [targetHandle, &matched](INode* current) {
-                if (!matched && current && current->GetHandle() == targetHandle) matched = true;
-            });
-            if (matched) {
-                MarkCameraDirty();
-                return true;
-            }
-        }
-        return false;
-    }
-
     void MarkMaterialNodesDirty(const NodeEventNamespace::NodeKeyTab& nodes, bool structured) {
         if (nodes.Count() <= 0) return;
         Interface* ip = GetCOREInterface();
@@ -4160,7 +4138,12 @@
                     if (IsSceneCameraNode(node)) {
                         if (!first) ss << L',';
                         ss << L"{\"h\":" << node->GetHandle()
-                           << L",\"n\":\"" << EscapeJson(node->GetName()) << L"\"}";
+                           << L",\"n\":\"" << EscapeJson(node->GetName()) << L"\"";
+                        if (INode* target = node->GetTarget()) {
+                            ss << L",\"targetH\":" << target->GetHandle()
+                               << L",\"targetN\":\"" << EscapeJson(target->GetName()) << L"\"";
+                        }
+                        ss << L"}";
                         first = false;
                     }
                     collect(node);

@@ -73,10 +73,14 @@ Useful calls:
 Adapters represent synced Max objects.
 
 - Metadata: `node.handle`, `node.name`, `node.isMesh`, `node.visible`, `node.jsmod`.
-- Live reads: `node.position`, `node.quaternion`, `node.scale`, `node.matrixWorld`.
+- Writable local transforms: `node.position`, `node.rotation`, `node.quaternion`, `node.scale`. They behave like Three.js `Vector3`/`Euler`/`Quaternion` handles and write through MaxJS runtime overrides so fastsync does not stomp the edit.
+- Writable visibility: `node.visible = false` / `node.visible = true`, plus `node.hide()`, `node.show()`, and `node.resetVisibility()`.
+- Read surfaces: `node.raw` / `node.object` for the current `Object3D`, `node.matrix`, `node.matrixWorld`, `node.base`, and `node.snapshot()`.
 - Three-style world reads: `getWorldPosition(target)`, `getWorldQuaternion(target)`, `getWorldScale(target)`, `getWorldMatrix(target)`. Passing a target is safe; omitting it returns a new object.
 - Geometry sampling: `node.sampleSurface({ point, normal, rng })` returns `{ point, normal, barycentric, triangleIndex, mesh, meshHandle, meshName }`. Use `count` for multiple area-weighted samples.
 - Anchors: `node.createAnchor(options)`.
+- Runtime clone: `node.clone(options)` mirrors `ctx.js.cloneFromMax(node, options)` and returns a runtime-owned `Object3D`.
+- Reset: `node.resetTransform()` clears runtime transform overrides; `node.reset()` clears transform and visibility overrides.
 - Orientation helpers: `getPivotWorldPosition()`, `getVisualCenter()`, `getPivotToVisualCenter()`, `getLocalAxesWorld()`, `getOrientationSnapshot()`.
 
 Use orientation helpers before gameplay/rig work. MaxJS runtime is Three.js Y-up: ground plane is XZ, height is Y, and Max-space vectors map as `x,z,-y`.
@@ -95,6 +99,12 @@ Use orientation helpers before gameplay/rig work. MaxJS runtime is Three.js Y-up
 - `ctx.js.setSnapshotId(obj, id)` so snapshot export can target stable objects
 - `ctx.js.cloneFromMax(handleOrNameOrAdapter, options)` creates a runtime-owned clone from a synced Max mesh and registers it under the layer root for cleanup/snapshot export.
 - `ctx.js.cloneManyFromMax(nodes, optionsOrFn)` clones a list of adapters/handles/names.
+
+After changing runtime object ownership, cleanup, clone placement, or layer teardown, run:
+
+```powershell
+node scripts/runtime-layer-smoke.mjs
+```
 
 Clone placement options are intentionally direct:
 
@@ -118,7 +128,17 @@ if (sample) ctx.js.cloneFromMax(cans[0], { at: sample, align: 'visualCenter' });
 
 ## Moving Synced Objects
 
-Use `node.transform`, not raw Three.js transforms:
+Use Three-style local properties for common authored-object edits:
+
+```js
+const node = ctx.maxScene.findOne('Door');
+node.position.y += 12;
+node.rotation.y += Math.PI * 0.5;
+node.scale.setScalar(1.1);
+node.visible = false;
+```
+
+Use `node.transform` when you need explicit modes or world-space writes:
 
 ```js
 node.transform.setPosition(x, y, z);
@@ -154,11 +174,11 @@ Clear overrides in `dispose()` if the layer temporarily owns authored objects.
 `ctx.camera` can lock to Max scene cameras and expose the live render camera:
 
 - `ctx.camera.raw` returns the underlying Three.js camera for last-mile render offsets such as handheld shake. This does not claim script ownership by itself.
-- `ctx.camera.target` / `ctx.camera.getTarget(out)` returns the current synced look-at target. In physical-camera mode this is the Max target node position when the camera has a target; moving the Max target dirties camera sync.
-- For a fixed look-at effect, capture `ctx.camera.getTarget(out)` once after `usePhysicalCamera(...)` settles, then reuse that vector. Do not call `getTarget()` every frame unless you want to follow the moving Max target.
+- `ctx.camera.target` / `ctx.camera.getTarget(out)` returns the viewer look-at point, not the Max camera target node. Max target nodes are exposed as regular transform-only scene graph nodes; use `ctx.camera.findSceneCamera(...).targetHandle` with `ctx.maxScene.getNode(handle)` to script them.
+- Moving a Max camera target node should not dirty camera sync directly. Camera sync follows the Max camera transform; target nodes are regular scene graph data.
 - `ctx.camera.setPositionKeepingTarget(positionOrX, y, z, target?)` moves the layer-owned camera and re-aims it at the current target, or at an explicit target if supplied.
 - Camera near/far clipping may come from Max camera manual clipping, render `ViewParams`, or viewer UI overrides. Snapshot UI state persists camera clip overrides.
-- `ctx.camera.listSceneCameras()` returns synced scene cameras as `{ handle, h, name, n }`.
+- `ctx.camera.listSceneCameras()` returns synced scene cameras as `{ handle, h, name, n, targetHandle, targetName }`.
 - `ctx.camera.findSceneCamera(name, { exact })` searches the scene camera list. Do this for Physical Cameras; `ctx.maxScene.findByName()` only searches synced meshes/lights.
 - `ctx.camera.usePhysicalCamera(handleOrEntry)` / `ctx.camera.usePhysicalCameraByName(name, { exact })` locks the viewer to a Max camera object while still allowing a layer to apply a post-sync camera offset through `ctx.camera.raw`.
 

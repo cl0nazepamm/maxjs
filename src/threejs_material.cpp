@@ -11,6 +11,7 @@
 #include <sstream>
 #include <vector>
 #include <string>
+#include <unordered_map>
 #include <custcont.h>
 
 extern HINSTANCE hInstance;

@@ -7,7 +7,6 @@
 #include <ISceneEventManager.h>
 #include <iInstanceMgr.h>
 #include <iskin.h>
-#include <imorpher.h>
 #include <modstack.h>
 #include <Graphics/IViewportViewSetting.h>
 #include <Graphics/GraphicsEnums.h>
@@ -17,6 +16,7 @@
 #include "tyParticleObjectExt.h"
 #include "tyVolumeObjectExt.h"
 #include "maxjs_core_utils.h"
+#include "maxjs_morpher_compat.h"
 #include "maxjs_geometry_sync.h"
 #include "maxjs_material_sync.h"
 #include "threejs_audio.h"

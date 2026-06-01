@@ -31,6 +31,7 @@
 #include "tyVolumeObjectExt.h"
 #include "sync_protocol.h"
 #include "maxjs_core_utils.h"
+#include "maxjs_morpher_compat.h"
 #include "threejs_material.h"
 #include "threejs_lights.h"
 #include "threejs_splat.h"
@@ -46,7 +47,6 @@
 #include "threejs_deform.h"
 #include "threejs_gltf.h"
 #include <iskin.h>
-#include <imorpher.h>
 
 #include <wrl.h>
 #include <WebView2.h>

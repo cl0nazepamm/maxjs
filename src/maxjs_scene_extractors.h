@@ -300,10 +300,10 @@ static bool TryExtractSkinRigData(
         morphMatch.mod &&
         morphMatch.mod->IsEnabled() &&
         ModifierEvaluatesBefore(morphMatch, skinMatch)) {
+        morphMod = morphMatch.mod;
         IMorpher* maybeMorpher = static_cast<IMorpher*>(
             morphMatch.mod->GetInterface(I_MORPHER_INTERFACE_ID));
         if (maybeMorpher) {
-            morphMod = morphMatch.mod;
             morpher = maybeMorpher;
         }
     }

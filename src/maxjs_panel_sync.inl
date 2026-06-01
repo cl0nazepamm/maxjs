@@ -3904,6 +3904,12 @@
             ss << L",\"opacity\":";
             WriteFloatValue(ss, pbr.opacity, 1.0f);
         }
+        if (pbr.alphaTest > 0.0f) {
+            ss << L",\"alphaTest\":";
+            WriteFloatValue(ss, pbr.alphaTest, 0.0f);
+        }
+        if (pbr.transparent) ss << L",\"transparent\":true";
+        if (!pbr.depthWrite) ss << L",\"depthWrite\":false";
         if (!pbr.doubleSided) ss << L",\"side\":0";
         if (pbr.colorMapStrength < 0.999f || pbr.colorMapStrength > 1.001f) {
             ss << L",\"mapS\":";

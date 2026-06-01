@@ -2844,7 +2844,9 @@
 
         function applyOpacityTextureSlot(material, tex) {
             if (!tex || !material) return false;
-            material.transparent = true;
+            if (!(Number.isFinite(material.alphaTest) && material.alphaTest > 0)) {
+                material.transparent = true;
+            }
             if (isHTMLTexture(tex) && !material.map) {
                 // HTML texmaps commonly carry both color and alpha. Treating
                 // them as alphaMap-only discards the color and renders the
@@ -3993,7 +3995,10 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
 
             material.side = md.side === 0 ? THREE.FrontSide : THREE.DoubleSide;
             material.opacity = md.opacity ?? 1.0;
-            material.transparent = material.opacity < 0.999;
+            material.transparent = !!md.transparent || material.opacity < 0.999;
+            if ('depthWrite' in material && md.depthWrite != null) material.depthWrite = !!md.depthWrite;
+            if ('depthTest' in material && md.depthTest != null) material.depthTest = !!md.depthTest;
+            if ('alphaTest' in material && Number.isFinite(md.alphaTest)) material.alphaTest = md.alphaTest;
 
             if ('color' in material && Array.isArray(md.color)) {
                 material.color.setRGB(md.color[0], md.color[1], md.color[2]);
@@ -4338,6 +4343,12 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                         params.transparent = true;
                         params.opacity = md.opacity;
                     }
+                    if (Number.isFinite(md.alphaTest) && md.alphaTest > 0) {
+                        params.alphaTest = md.alphaTest;
+                    }
+                    if (md.transparent === true) params.transparent = true;
+                    if (md.depthWrite != null) params.depthWrite = !!md.depthWrite;
+                    if (md.depthTest != null) params.depthTest = !!md.depthTest;
 
                     if (wantsAdvancedMaterial) {
                         if (Array.isArray(md.specularColor)) {
@@ -6829,8 +6840,12 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 if (metalness != null && 'metalness' in m) m.metalness = metalness;
                 if (material?.opacity != null) {
                     m.opacity = material.opacity;
-                    nextTransparent = material.opacity < 0.999;
+                    nextTransparent = !!material.transparent || material.opacity < 0.999;
                 }
+                if (material?.transparent === true) nextTransparent = true;
+                if (material?.depthWrite != null && 'depthWrite' in m) m.depthWrite = !!material.depthWrite;
+                if (material?.depthTest != null && 'depthTest' in m) m.depthTest = !!material.depthTest;
+                if (Number.isFinite(material?.alphaTest) && 'alphaTest' in m) m.alphaTest = material.alphaTest;
                 if (material?.emissiveIntensity != null || material?.emI != null) {
                     if ('emissiveIntensity' in m) m.emissiveIntensity = material?.emissiveIntensity ?? material?.emI;
                 }

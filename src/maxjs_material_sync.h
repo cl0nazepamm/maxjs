@@ -222,6 +222,7 @@ struct MaxJSPBR {
     float emission[3] = {0, 0, 0};
     float emIntensity = 0.0f;
     float opacity     = 1.0f;
+    float alphaTest   = 0.0f;
     float colorMapStrength = 1.0f;
     float roughnessMapStrength = 1.0f;
     float metalnessMapStrength = 1.0f;
@@ -235,6 +236,8 @@ struct MaxJSPBR {
     float lightmapIntensity = 1.0f;
     int   lightmapChannel = 2;
     bool  doubleSided = true;
+    bool  transparent = false;
+    bool  depthWrite = true;
     float envIntensity = 1.0f;
     float sssColor[3] = {1.0f, 1.0f, 1.0f};
     float sssDistortion = 0.1f;
@@ -1476,8 +1479,7 @@ static void ExtractGltfMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
     MSTR name = mtl->GetName();
     d.mtlName = name.data();
 
-    // glTF colors are 0-255 in Max, need /255
-    auto readColor = [&](const MCHAR* pname, float out[3]) {
+    auto readColorAlpha = [&](const MCHAR* pname, float out[3], float* alpha = nullptr) {
         for (int b = 0; b < mtl->NumParamBlocks(); b++) {
             IParamBlock2* pb = mtl->GetParamBlock(b);
             if (!pb) continue;
@@ -1485,14 +1487,22 @@ static void ExtractGltfMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
                 ParamID pid = pb->IndextoID(i);
                 const ParamDef& pd = pb->GetParamDef(pid);
                 if (pd.int_name && _tcsicmp(pd.int_name, pname) == 0) {
-                    if (pd.type == TYPE_RGBA || pd.type == TYPE_FRGBA) {
+                    if (pd.type == TYPE_FRGBA) {
+                        AColor c = pb->GetAColor(pid, t);
+                        out[0] = c.r; out[1] = c.g; out[2] = c.b;
+                        if (alpha) *alpha = std::clamp(c.a, 0.0f, 1.0f);
+                    } else if (pd.type == TYPE_RGBA) {
                         Color c = pb->GetColor(pid, t);
                         out[0] = c.r; out[1] = c.g; out[2] = c.b;
+                        if (alpha) *alpha = 1.0f;
                     }
                     return;
                 }
             }
         }
+    };
+    auto readColor = [&](const MCHAR* pname, float out[3]) {
+        readColorAlpha(pname, out, nullptr);
     };
     auto readFloat = [&](const MCHAR* pname, float def) -> float {
         for (int b = 0; b < mtl->NumParamBlocks(); b++) {
@@ -1521,6 +1531,9 @@ static void ExtractGltfMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
         }
         return def;
     };
+    auto readBool = [&](const MCHAR* pname, bool def) -> bool {
+        return readInt(pname, def ? 1 : 0) != 0;
+    };
     auto readMap = [&](const MCHAR* pname, std::wstring& outPath, MaxJSPBR::TexTransform& outXf) -> bool {
         outPath.clear();
         outXf = {};
@@ -1540,13 +1553,18 @@ static void ExtractGltfMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
         return false;
     };
 
-    readColor(_T("baseColor"), d.color);
+    float baseColorAlpha = 1.0f;
+    readColorAlpha(_T("baseColor"), d.color, &baseColorAlpha);
 
     d.roughness   = readFloat(_T("roughness"), 0.5f);
     d.metalness   = readFloat(_T("metalness"), 0.0f);
     d.normalScale = readFloat(_T("normal"), 1.0f);
     d.aoIntensity = readFloat(_T("ambientOcclusion"), 1.0f);
-    d.opacity     = 1.0f;  // glTF uses alphaMode, not direct opacity
+    const int alphaMode = readInt(_T("alphaMode"), 1);
+    d.opacity     = (alphaMode >= 2) ? std::clamp(baseColorAlpha, 0.0f, 1.0f) : 1.0f;
+    d.alphaTest   = (alphaMode == 2) ? std::clamp(readFloat(_T("alphaCutoff"), 0.5f), 0.0f, 1.0f) : 0.0f;
+    d.transparent = (alphaMode == 3);
+    d.depthWrite  = (alphaMode != 3);
     d.doubleSided = readInt(_T("DoubleSided"), 0) != 0;
 
     readColor(_T("emissionColor"), d.emission);
@@ -1561,7 +1579,41 @@ static void ExtractGltfMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
     readMap(_T("normalMap"), d.normalMap, d.normalMapTransform);
     readMap(_T("ambientOcclusionMap"), d.aoMap, d.aoMapTransform);
     readMap(_T("emissionMap"), d.emissionMap, d.emissionMapTransform);
-    readMap(_T("AlphaMap"), d.opacityMap, d.opacityMapTransform);
+    readMap(_T("alphaMap"), d.opacityMap, d.opacityMapTransform);
+
+    const bool enableClearcoat = readBool(_T("enableClearcoat"), false);
+    const bool enableSpecular = readBool(_T("enableSpecular"), false);
+    const bool enableTransmission = readBool(_T("enableTransmission"), false);
+    const bool enableVolume = readBool(_T("enableVolume"), false);
+    const bool enableIor = readBool(_T("enableIndexOfRefraction"), false);
+    if (enableClearcoat || enableSpecular || enableTransmission || enableVolume || enableIor) {
+        d.materialModel = L"MeshPhysicalMaterial";
+    }
+    if (enableClearcoat) {
+        d.clearcoat = std::clamp(readFloat(_T("clearcoat"), 1.0f), 0.0f, 1.0f);
+        d.clearcoatRoughness = std::clamp(readFloat(_T("clearcoatRoughness"), 0.0f), 0.0f, 1.0f);
+        readMap(_T("clearcoatMap"), d.clearcoatMap, d.clearcoatMapTransform);
+        readMap(_T("clearcoatRoughnessMap"), d.clearcoatRoughnessMap, d.clearcoatRoughnessMapTransform);
+        readMap(_T("clearcoatNormalMap"), d.clearcoatNormalMap, d.clearcoatNormalMapTransform);
+    }
+    if (enableSpecular) {
+        d.physicalSpecularIntensity = std::clamp(readFloat(_T("specular"), 1.0f), 0.0f, 1.0f);
+        readColor(_T("specularColor"), d.physicalSpecularColor);
+        readMap(_T("specularMap"), d.specularIntensityMap, d.specularIntensityMapTransform);
+        readMap(_T("specularColorMap"), d.specularColorMap, d.specularColorMapTransform);
+    }
+    if (enableTransmission) {
+        d.transmission = std::clamp(readFloat(_T("transmission"), 1.0f), 0.0f, 1.0f);
+        readMap(_T("transmissionMap"), d.transmissionMap, d.transmissionMapTransform);
+    }
+    if (enableIor) {
+        d.ior = std::clamp(readFloat(_T("indexOfRefraction"), 1.5f), 1.0f, 50.0f);
+    }
+    if (enableVolume) {
+        d.thickness = std::max(0.0f, readFloat(_T("volumeThickness"), 0.0f));
+        d.attenuationDistance = std::max(0.0f, readFloat(_T("volumeDistance"), 0.0f));
+        readColor(_T("volumeColor"), d.attenuationColor);
+    }
 }
 
 // Extract PBR from USD Preview Surface — generic paramblock reader

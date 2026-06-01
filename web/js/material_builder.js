@@ -362,7 +362,9 @@ const COMMON_TEXTURE_SLOTS = [
         colorSpace: () => THREE.LinearSRGBColorSpace,
         fallback: 'white',
         onAssign: (material) => {
-            material.transparent = true;
+            if (!(Number.isFinite(material.alphaTest) && material.alphaTest > 0)) {
+                material.transparent = true;
+            }
         },
     },
     {
@@ -480,6 +482,9 @@ function applyCommonScalarParams(params, md) {
     }
     if (Number.isFinite(emissiveIntensity)) params.emissiveIntensity = emissiveIntensity;
     if (Number.isFinite(md?.alphaTest) && md.alphaTest > 0) params.alphaTest = md.alphaTest;
+    if (md?.transparent === true) params.transparent = true;
+    if (md?.depthWrite != null) params.depthWrite = !!md.depthWrite;
+    if (md?.depthTest != null) params.depthTest = !!md.depthTest;
     if (md?.opacity != null && md.opacity < 0.999) {
         params.transparent = true;
         params.opacity = md.opacity;
@@ -529,7 +534,9 @@ function applyPhysicalScalarParams(params, md) {
 function applyUtilityScalarParams(material, md) {
     material.side = pickMaterialSide(md);
     material.opacity = md?.opacity ?? 1.0;
-    material.transparent = material.opacity < 0.999;
+    material.transparent = !!md?.transparent || material.opacity < 0.999;
+    if ('depthWrite' in material && md?.depthWrite != null) material.depthWrite = !!md.depthWrite;
+    if ('depthTest' in material && md?.depthTest != null) material.depthTest = !!md.depthTest;
 
     if ('color' in material && Array.isArray(md?.color)) {
         material.color.setRGB(md.color[0], md.color[1], md.color[2]);

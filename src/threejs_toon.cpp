@@ -1,5 +1,6 @@
 #include "threejs_toon.h"
 #include "threejs_toon_res.h"
+#include "threejs_category.h"
 #include <max.h>
 #include <iparamb2.h>
 #include <iparamm2.h>
@@ -127,7 +128,7 @@ public:
     const TCHAR* NonLocalizedClassName() override { return _T("three.js Toon"); }
     SClass_ID SuperClassID() override { return MATERIAL_CLASS_ID; }
     Class_ID ClassID() override { return THREEJS_TOON_CLASS_ID; }
-    const TCHAR* Category() override { return _T("max.js"); }
+    const TCHAR* Category() override { return THREEJS_MTL_CATEGORY; }
     const TCHAR* InternalName() override { return _T("ThreeJSToon"); }
     HINSTANCE HInstance() override { return hInstance; }
 };

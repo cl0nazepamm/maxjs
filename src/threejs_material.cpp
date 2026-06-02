@@ -1,4 +1,5 @@
 #include "threejs_material.h"
+#include "threejs_category.h"
 #include "resource.h"
 #include <max.h>
 #include <iparamb2.h>
@@ -541,7 +542,7 @@ public:
     const TCHAR* NonLocalizedClassName() override { return className_; }
     SClass_ID SuperClassID() override { return MATERIAL_CLASS_ID; }
     Class_ID ClassID() override { return classID_; }
-    const TCHAR* Category() override { return _T("max.js"); }
+    const TCHAR* Category() override { return THREEJS_MTL_CATEGORY; }
     const TCHAR* InternalName() override { return internalName_; }
     HINSTANCE HInstance() override { return hInstance; }
 
@@ -1781,7 +1782,7 @@ public:
     const TCHAR* NonLocalizedClassName() override { return _T("three.js Video"); }
     SClass_ID SuperClassID() override { return TEXMAP_CLASS_ID; }
     Class_ID ClassID() override { return THREEJS_VIDEO_TEX_CLASS_ID; }
-    const TCHAR* Category() override { return _T("max.js"); }
+    const TCHAR* Category() override { return THREEJS_MAP_CATEGORY; }
     const TCHAR* InternalName() override { return _T("ThreeJSVideoTexture"); }
     HINSTANCE HInstance() override { return hInstance; }
 };
@@ -1927,7 +1928,7 @@ public:
     const TCHAR* NonLocalizedClassName() override { return _T("three.js TSL Texture"); }
     SClass_ID SuperClassID() override { return TEXMAP_CLASS_ID; }
     Class_ID ClassID() override { return THREEJS_TSL_TEX_CLASS_ID; }
-    const TCHAR* Category() override { return _T("max.js"); }
+    const TCHAR* Category() override { return THREEJS_MAP_CATEGORY; }
     const TCHAR* InternalName() override { return _T("ThreeJSTSLTexture"); }
     HINSTANCE HInstance() override { return hInstance; }
 };
@@ -2326,7 +2327,7 @@ public:
     const TCHAR* NonLocalizedClassName() override { return _T("three.js HTML"); }
     SClass_ID SuperClassID() override { return TEXMAP_CLASS_ID; }
     Class_ID ClassID() override { return THREEJS_HTML_TEX_CLASS_ID; }
-    const TCHAR* Category() override { return _T("max.js"); }
+    const TCHAR* Category() override { return THREEJS_MAP_CATEGORY; }
     const TCHAR* InternalName() override { return _T("ThreeJSHTMLTexture"); }
     HINSTANCE HInstance() override { return hInstance; }
 };

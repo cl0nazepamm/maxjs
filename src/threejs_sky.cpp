@@ -1,5 +1,6 @@
 #include "threejs_sky.h"
 #include "threejs_sky_res.h"
+#include "threejs_category.h"
 
 #include <max.h>
 #include <iparamb2.h>
@@ -32,7 +33,7 @@ public:
     const TCHAR* NonLocalizedClassName() override { return _T("three.js Sky"); }
     SClass_ID   SuperClassID() override { return TEXMAP_CLASS_ID; }
     Class_ID    ClassID() override { return THREEJS_SKY_CLASS_ID; }
-    const TCHAR* Category() override { return _T("max.js"); }
+    const TCHAR* Category() override { return THREEJS_MAP_CATEGORY; }
     const TCHAR* InternalName() override { return _T("ThreeJSSky"); }
     HINSTANCE   HInstance() override { return hInstance; }
 };

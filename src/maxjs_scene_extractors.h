@@ -394,16 +394,12 @@ static bool TryExtractSkinRigData(
             }
         }
 
-        // Get mesh's initial transform from Skin for root bone parent
+        // Root bones are parented to the exported SkinnedMesh. Use the node's
+        // actual object transform here: some Genesis/Daz split skin parts
+        // report an identity Skin init TM even though their mesh node has a
+        // non-zero origin, which offsets eyes/brows/mouth in snapshots.
         float meshInitWorld[16];
-        {
-            Matrix3 skinInitTM;
-            if (skin->GetSkinInitTM(meshNode, skinInitTM) == SKIN_OK) {
-                MatrixToFloat16(skinInitTM, meshInitWorld);
-            } else {
-                GetTransform16(meshNode, t, meshInitWorld);
-            }
-        }
+        GetTransform16(meshNode, t, meshInitWorld);
 
         outBoneBindLocal.resize(static_cast<size_t>(numBones) * 16u);
         for (int bi = 0; bi < numBones; bi++) {

@@ -94,6 +94,8 @@ export function classifyRuntimeMaterial(md, THREE_NS = THREE) {
     let runtimeModelName = 'MeshStandardMaterial';
     if (forceLambertForBlackSpecular) {
         runtimeModelName = 'MeshLambertMaterial';
+    } else if (wantsSSSMaterial && typeof THREE_NS.MeshSSSNodeMaterial === 'function') {
+        runtimeModelName = 'MeshSSSNodeMaterial';
     } else if (wantsMaterialXMaterial || wantsTSLMaterial || wantsSSSMaterial || wantsAdvancedMaterial) {
         runtimeModelName = 'MeshPhysicalMaterial';
     } else if (wantsUtilityMaterial) {

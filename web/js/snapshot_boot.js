@@ -318,6 +318,28 @@ function resolveSnapshotMaterialRefs(meta) {
     }
 }
 
+function valueReferencesTslTextures(value, seen = new Set()) {
+    if (typeof value === 'string') return /\bTEXTURES\b/.test(value);
+    if (!value || typeof value !== 'object') return false;
+    if (seen.has(value)) return false;
+    seen.add(value);
+    if (Array.isArray(value)) {
+        return value.some((entry) => valueReferencesTslTextures(entry, seen));
+    }
+    return Object.values(value).some((entry) => valueReferencesTslTextures(entry, seen));
+}
+
+function snapshotNeedsTslTextures(meta) {
+    for (const entry of (meta?.materials ?? [])) {
+        if (valueReferencesTslTextures(entry?.mat)) return true;
+    }
+    for (const nd of (meta?.nodes ?? [])) {
+        if (valueReferencesTslTextures(nd?.mat)) return true;
+        if (valueReferencesTslTextures(nd?.mats)) return true;
+    }
+    return false;
+}
+
 // ─── Phase 2: renderer ─────────────────────────────────────────────────
 // WebGL2 snapshot renderer. WebGPU is a separate explicit target, not a
 // transparent fallback, because backend switching changes material behavior.
@@ -762,10 +784,8 @@ async function applyRuntimeScene(runtimeScene, ctx) {
 // Real implementation — small enough to live here. Mirrors
 // `tryReplaySnapshotLayerModules` from index.html.
 //
-// Snapshot mode imports EVERY layer in the manifest regardless of the
-// `enabled` flag — disable is a live-mode concept only. The exporter
-// already trims disabled layers out of the shipped folder when the user
-// wants them gone.
+// Snapshot mode honors disabled layer state. Disabled sources may still be
+// archived into a snapshot, but they should not be imported or started.
 function resolveSnapshotLayerFactory(moduleNamespace) {
     const directHooks = ['init', 'update', 'dispose']
         .some(key => typeof moduleNamespace?.[key] === 'function');
@@ -783,25 +803,27 @@ function resolveSnapshotLayerFactory(moduleNamespace) {
 
 function buildSnapshotManifestLayers(manifest) {
     const rawLayers = Array.isArray(manifest?.layers) ? manifest.layers : [];
-    return rawLayers.map((entry, index) => ({
-        id: entry?.id || entry?.name || `layer_${index}`,
-        name: entry?.name || entry?.id || `layer_${index}`,
-        entryPath: entry?.entry || entry?.path || 'main.js',
-        source: 'project',
-        enabled: entry?.enabled !== false,
-    }));
+    return rawLayers
+        .filter(entry => entry?.enabled !== false)
+        .map((entry, index) => ({
+            id: entry?.id || entry?.name || `layer_${index}`,
+            name: entry?.name || entry?.id || `layer_${index}`,
+            entryPath: entry?.entry || entry?.path || 'main.js',
+            source: 'project',
+            enabled: true,
+        }));
 }
 
-function buildSnapshotInlineLayers(runtimeScene) {
+function buildSnapshotRuntimeLayers(runtimeScene) {
     const rawLayers = Array.isArray(runtimeScene?.layers) ? runtimeScene.layers : [];
     return rawLayers
-        .filter(entry => entry?.source === 'inline' && entry?.entry)
+        .filter(entry => entry?.entry && entry?.active !== false)
         .map((entry, index) => ({
             id: entry.id || entry.name || `inline_${index}`,
             name: entry.name || entry.id || `inline_${index}`,
             entryPath: entry.entry,
-            source: 'inline',
-            enabled: entry.active !== false,
+            source: entry.source || 'inline',
+            enabled: true,
         }));
 }
 
@@ -816,20 +838,24 @@ async function bindLayerProject(root, meta, layerManager) {
         if (response.ok) {
             manifest = await response.json();
             baseUrl = new URL('./', manifestUrl);
-            allLayers = buildSnapshotManifestLayers(manifest);
         }
     } catch {
         manifest = null;
     }
 
+    // Prefer runtimeScene because it reflects the live layer manager state at export
+    // time. The project manifest can be stale when inline layers are disabled by
+    // filename (foo.js.disabled), so it is only a fallback.
+    allLayers = buildSnapshotRuntimeLayers(meta.runtimeScene);
     if (allLayers.length === 0) {
-        allLayers = buildSnapshotInlineLayers(meta.runtimeScene);
+        allLayers = buildSnapshotManifestLayers(manifest);
     }
     if (allLayers.length === 0) return { mounted: 0, manifest };
 
     const mountedIds = [];
     try {
         for (const entry of allLayers) {
+            if (entry?.enabled === false) continue;
             const entryPath = String(entry.entryPath || entry.entry || entry.path || '').replace(/\\/g, '/');
             if (!entryPath) throw new Error(`Missing layer entry path for ${entry.id}`);
             const moduleUrl = new URL(entryPath, baseUrl);
@@ -950,9 +976,9 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
         bakeState: meta.bake ?? meta.snapshotUi?.bake,
         renderer, // enables real TSL node materials + texture baking on the WebGPU target
     });
-    // Ensure the procedural-texture preset library is ready before materials build
-    // (no-op on WebGL, where node materials are unavailable).
-    await materialBuilder.loadTslTextures();
+    // Only preset-authored TSL snippets need the vendored TEXTURES namespace.
+    // Snapshots without those snippets intentionally do not bundle this vendor.
+    await materialBuilder.loadTslTextures({ required: snapshotNeedsTslTextures(meta) });
 
     // Authored environment/HDRI from snapshot.json. This stays separate
     // from inlines: script-authored sky belongs to the layer runtime.

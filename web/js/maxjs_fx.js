@@ -288,6 +288,7 @@ export function createMaxJSFxController({
     let activeSSRPass = null;
     let activeAOPass = null;
     let activeContactShadowPass = null;
+    let activeScenePass = null;
     let activeShaderLabFx = shaderLabFx;
     let shaderLabInputTarget = null;
     let lastShaderLabFrameTime = 0;
@@ -753,6 +754,7 @@ export function createMaxJSFxController({
         activeSSRPass = null;
         activeAOPass = null;
         activeContactShadowPass = null;
+        activeScenePass = null;
         const seen = new Set();
         for (const node of activeNodes) {
             disposeNodeDeep(node, seen);
@@ -1241,6 +1243,9 @@ export function createMaxJSFxController({
     }
 
     function updateActiveScreenSpaceParams() {
+        if (activeScenePass) {
+            activeScenePass.transparent = true;
+        }
         const derived = computeDerivedState();
         if (activeSSRPass) {
             activeSSRPass.maxDistance.value = derived.effectiveSSRMaxDistance;
@@ -1520,10 +1525,11 @@ export function createMaxJSFxController({
                     : pass(scene, camera);
                 activeNodes.push(scenePass);
                 scenePassNode = scenePass;
-                // Opaque scene pass when the viewport shows a solid color background so
-                // scene.background updates apply immediately. Transparent when an
-                // environment/HDRI image is shown as the backdrop (WebView2 alpha).
-                scenePass.transparent = environmentVisible;
+                activeScenePass = scenePass;
+                // Keep the transparent render list enabled regardless of backdrop.
+                // PassNode.transparent controls whether transparent objects render,
+                // so tying it to the HDRI visibility toggle drops opacity maps.
+                scenePass.transparent = true;
 
                 if (sceneContext) scenePass.contextNode = sceneContext;
 
@@ -1546,6 +1552,13 @@ export function createMaxJSFxController({
                 ssrReflectivity = scenePassMetalRough.r;
             }
 
+            let beautyAlpha = scenePassColor.a;
+            const withBeautyAlpha = (node) => vec4(node.rgb, beautyAlpha);
+            const raiseBeautyAlpha = (alphaNode) => {
+                beautyAlpha = max(beautyAlpha, alphaNode);
+                return beautyAlpha;
+            };
+
             if (isScreenSpaceActive('ssgi')) {
                 const ssgiPass = ssgi(scenePassColor, scenePassDepth, sceneNormal, camera);
                 ssgiPass.sliceCount.value = state.ssgi.sliceCount;
@@ -1563,7 +1576,7 @@ export function createMaxJSFxController({
                         beauty.rgb.mul(ssgiPass.a),
                         scenePassDiffuse.rgb.mul(ssgiPass.rgb)
                     ),
-                    beauty.a
+                    beautyAlpha
                 );
             }
 
@@ -1588,7 +1601,7 @@ export function createMaxJSFxController({
                 // the existing beauty pass. Keep the brighter of the base lighting
                 // (including HDRI/IBL) and the SSR-composited result.
                 const ssrBlended = blendColor(beauty, ssrPass);
-                beauty = vec4(max(beauty.rgb, ssrBlended.rgb), beauty.a);
+                beauty = vec4(max(beauty.rgb, ssrBlended.rgb), beautyAlpha);
             }
 
             let environmentBackdropCompensated = false;
@@ -1598,9 +1611,10 @@ export function createMaxJSFxController({
             // rebuild alpha around geometry instead of being wiped later.
             if (useEnvironmentBackdropCompensation && scenePassDepth) {
                 const hasGeom = scenePassDepth.r.lessThan(float(0.999999));
+                beautyAlpha = hasGeom.select(beautyAlpha, backgroundAlphaNode);
                 beauty = vec4(
                     hasGeom.select(beauty.rgb, backgroundFillNode),
-                    hasGeom.select(beauty.a, backgroundAlphaNode)
+                    beautyAlpha
                 );
                 environmentBackdropCompensated = true;
             }
@@ -1614,18 +1628,17 @@ export function createMaxJSFxController({
                 );
                 activeNodes.push(bloomPass);
                 const bloomLuma = bloomPass.r.mul(0.2126).add(bloomPass.g.mul(0.7152)).add(bloomPass.b.mul(0.0722));
-                beauty = vec4(beauty.rgb.add(bloomPass.rgb), max(beauty.a, bloomLuma));
+                beauty = vec4(beauty.rgb.add(bloomPass.rgb), raiseBeautyAlpha(bloomLuma));
             }
 
             if (isScreenSpaceActive('dof') && scenePassNode) {
                 dofFocusDistanceU.value = state.dof.focusDistance;
                 dofFocalLengthU.value = state.dof.focalLength;
                 dofBokehScaleU.value = state.dof.bokehScale;
-                const beautyBeforeDof = beauty;
                 const dofPass = dof(beauty, scenePassNode.getViewZNode(), dofFocusDistanceU, dofFocalLengthU, dofBokehScaleU);
                 activeNodes.push(dofPass);
                 // DepthOfFieldNode composite forces a=1; keep scene alpha for transparent backdrop + fog
-                beauty = vec4(dofPass.rgb, beautyBeforeDof.a);
+                beauty = vec4(dofPass.rgb, beautyAlpha);
             }
 
             // Toon outline is handled at the scene pass level (line above) —
@@ -1649,7 +1662,7 @@ export function createMaxJSFxController({
 
                     const volResult = blurredVol.mul(volIntensityU).mul(volLightContribU);
                     const volLuma = volResult.r.mul(0.2126).add(volResult.g.mul(0.7152)).add(volResult.b.mul(0.0722));
-                    beauty = vec4(beauty.rgb.add(volResult.rgb), max(beauty.a, volLuma));
+                    beauty = vec4(beauty.rgb.add(volResult.rgb), raiseBeautyAlpha(volLuma));
                 } catch (e) {
                     console.warn('Volumetric pass failed:', e);
                     removeVolumetricMesh();
@@ -1666,17 +1679,18 @@ export function createMaxJSFxController({
                 traaPass.edgeDepthDiff = state.traa.edgeDepthDiff;
                 traaPass.maxVelocityLength = state.traa.maxVelocityLength;
                 activeNodes.push(traaPass);
-                beauty = traaPass;
+                beauty = vec4(traaPass.rgb, beautyAlpha);
             }
 
             if (isScreenSpaceActive('motionBlur') && prePassVelocity) {
                 const motionBlurInput = convertToTexture(beauty);
                 activeNodes.push(motionBlurInput);
-                beauty = motionBlur(
+                const motionBlurPass = motionBlur(
                     motionBlurInput,
                     prePassVelocity.mul(uniform(state.motionBlur.amount)),
                     int(Math.max(2, Math.round(state.motionBlur.samples)))
                 );
+                beauty = vec4(motionBlurPass.rgb, beautyAlpha);
             }
 
             if (isRetroActive()) {
@@ -1705,6 +1719,7 @@ export function createMaxJSFxController({
                 if (r.scanlines) {
                     beauty = scanlines(beauty, retroScanlineIntensityU, screenSize.y.mul(retroScanlineDensityU), 0.0);
                 }
+                beauty = withBeautyAlpha(beauty);
             }
 
             // ── Pixel FX ──
@@ -1783,6 +1798,7 @@ export function createMaxJSFxController({
                     const noise = fract(sin(dot(seed, vec2(12.9898, 78.233))).mul(43758.5453));
                     beauty = vec4(beauty.rgb.add(noise.sub(0.5).mul(pixelGrainIntensityU)), beauty.a);
                 }
+                beauty = withBeautyAlpha(beauty);
             }
 
             // Environment backdrop compensation: hide HDRI on background when not visible.
@@ -1790,9 +1806,10 @@ export function createMaxJSFxController({
             // where the early compensation could not run.
             if (useEnvironmentBackdropCompensation && scenePassDepth && !environmentBackdropCompensated) {
                 const hasGeom = scenePassDepth.r.lessThan(float(0.999999));
+                beautyAlpha = hasGeom.select(beautyAlpha, backgroundAlphaNode);
                 beauty = vec4(
                     hasGeom.select(beauty.rgb, backgroundFillNode),
-                    hasGeom.select(beauty.a, backgroundAlphaNode)
+                    beautyAlpha
                 );
             }
 
@@ -1816,10 +1833,10 @@ export function createMaxJSFxController({
                 const fogCol = vec3(f.color[0], f.color[1], f.color[2]);
                 // Blend fog color over scene based on depth-computed alpha
                 const blended = beauty.rgb.mul(fogAlpha.oneMinus()).add(fogCol.mul(fogAlpha));
-                beauty = vec4(blended, max(beauty.a, fogAlpha));
+                beauty = vec4(blended, raiseBeautyAlpha(fogAlpha));
             }
 
-            postProcessing.outputNode = beauty;
+            postProcessing.outputNode = withBeautyAlpha(beauty);
             postProcessing.needsUpdate = true;
             pipelineReady = true;
             lastError = '';

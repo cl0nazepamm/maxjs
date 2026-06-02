@@ -1,3 +1,5 @@
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <max.h>
 #include <gup.h>
 #include <iparamb2.h>
@@ -53,6 +55,7 @@
 #include <WebView2EnvironmentOptions.h>
 #include <ShlObj.h>
 #include <Shlwapi.h>
+#include <shellapi.h>
 #include <wincodec.h>
 #include <commctrl.h>
 #include <string>
@@ -505,6 +508,32 @@ public:
         return std::wstring::npos;
     }
 
+    static size_t FindJsonArrayEnd(const std::wstring& json, size_t arrayStart) {
+        if (arrayStart == std::wstring::npos || arrayStart >= json.size() || json[arrayStart] != L'[') {
+            return std::wstring::npos;
+        }
+        bool inStr = false;
+        bool esc = false;
+        int depth = 0;
+        for (size_t i = arrayStart; i < json.size(); ++i) {
+            const wchar_t c = json[i];
+            if (inStr) {
+                if (esc) { esc = false; continue; }
+                if (c == L'\\') { esc = true; continue; }
+                if (c == L'"') inStr = false;
+                continue;
+            }
+            if (c == L'"') { inStr = true; continue; }
+            if (c == L'[') ++depth;
+            else if (c == L']') {
+                --depth;
+                if (depth == 0) return i + 1;
+                if (depth < 0) return std::wstring::npos;
+            }
+        }
+        return std::wstring::npos;
+    }
+
     static bool ExtractJsonStringInRange(const std::wstring& json,
                                          size_t start,
                                          size_t end,
@@ -608,20 +637,6 @@ public:
         }
         ss << L']';
         json.insert(bakeEnd, ss.str());
-    }
-
-    void DeleteSnapshotGeneratedAssets(const std::wstring& exportDir) {
-        const std::filesystem::path assetsDir = std::filesystem::path(exportDir) / L"assets";
-        std::error_code ec;
-        if (!std::filesystem::exists(assetsDir, ec) || ec) return;
-
-        for (const auto& entry : std::filesystem::directory_iterator(assetsDir, ec)) {
-            if (ec) return;
-            const std::wstring name = entry.path().filename().wstring();
-            if (name.rfind(L"file_", 0) != 0 && name.rfind(L"dir_", 0) != 0) continue;
-            std::filesystem::remove_all(entry.path(), ec);
-            ec.clear();
-        }
     }
 
     struct SnapshotNodeRecord {
@@ -751,6 +766,7 @@ public:
         bool includeDebugPayload = false;
         bool includeSnapshotUi = true;
         bool includeRuntimeScene = true;
+        bool includeDisabledLayers = false;
         bool copyAssets = true;
         bool includeRapierVendor = false;
         bool includeAnimations = true;
@@ -773,6 +789,143 @@ public:
             options.includeMaterialAnimation = false;
             options.includeCameraAnimation = false;
         }
+    }
+
+    static bool ShouldPreserveSnapshotSidecarDestination(const std::filesystem::path& src,
+                                                        const std::filesystem::path& dst) {
+        std::error_code ec;
+        if (!std::filesystem::exists(dst, ec) || ec) return false;
+        const auto dstTime = std::filesystem::last_write_time(dst, ec);
+        if (ec) return false;
+        const auto srcTime = std::filesystem::last_write_time(src, ec);
+        if (ec) return false;
+        return dstTime > srcTime;
+    }
+
+    static bool CopySnapshotSidecarFilePreservingStandaloneEdits(const std::wstring& src,
+                                                                 const std::wstring& dst) {
+        if (src.empty() || dst.empty() || !FileExists(src)) return false;
+        const auto srcPath = std::filesystem::path(src);
+        const auto dstPath = std::filesystem::path(dst);
+        if (ShouldPreserveSnapshotSidecarDestination(srcPath, dstPath)) return true;
+
+        std::error_code ec;
+        std::filesystem::create_directories(dstPath.parent_path(), ec);
+        if (ec) return false;
+        std::filesystem::copy_file(
+            srcPath,
+            dstPath,
+            std::filesystem::copy_options::overwrite_existing,
+            ec);
+        return !ec;
+    }
+
+    static bool CopyInlineDirectoryForSnapshot(const std::wstring& src,
+                                               const std::wstring& dst,
+                                               bool includeDisabledLayers) {
+        if (src.empty() || dst.empty() || !DirectoryExists(src)) return false;
+
+        std::error_code ec;
+        const auto srcPath = std::filesystem::path(src);
+        const auto dstPath = std::filesystem::path(dst);
+        std::filesystem::create_directories(dstPath, ec);
+        if (ec) return false;
+
+        for (const auto& entry : std::filesystem::recursive_directory_iterator(srcPath, ec)) {
+            if (ec) return false;
+            const auto relative = std::filesystem::relative(entry.path(), srcPath, ec);
+            if (ec) return false;
+            const auto target = dstPath / relative;
+            if (entry.is_directory(ec)) {
+                if (ec) return false;
+                std::filesystem::create_directories(target, ec);
+                if (ec) return false;
+                continue;
+            }
+            if (!entry.is_regular_file(ec)) {
+                if (ec) return false;
+                continue;
+            }
+            if (EndsWithInsensitive(entry.path().filename().wstring(), L".js.disabled")) {
+                if (!includeDisabledLayers) {
+                    // Export folders are reused and may contain standalone edits.
+                    // Do not delete stale files here; snapshot replay is gated by
+                    // runtimeScene/manifest state instead.
+                    continue;
+                }
+            }
+            if (ShouldPreserveSnapshotSidecarDestination(entry.path(), target)) continue;
+            std::filesystem::create_directories(target.parent_path(), ec);
+            if (ec) return false;
+            std::filesystem::copy_file(
+                entry.path(),
+                target,
+                std::filesystem::copy_options::overwrite_existing,
+                ec);
+            if (ec) return false;
+        }
+        return true;
+    }
+
+    static bool IsDisabledInlineEntryForSnapshot(const std::wstring& entryPath,
+                                                 const std::wstring& inlineDir) {
+        if (entryPath.empty() || inlineDir.empty()) return false;
+        std::wstring normalized = entryPath;
+        std::replace(normalized.begin(), normalized.end(), L'\\', L'/');
+        while (!normalized.empty() && normalized.front() == L'/') normalized.erase(0, 1);
+        const std::wstring prefix = L"inlines/";
+        if (normalized.rfind(prefix, 0) != 0) return false;
+        const std::wstring rel = normalized.substr(prefix.size());
+        if (rel.empty() || !EndsWithInsensitive(rel, L".js")) return false;
+
+        std::wstring relWin = rel;
+        std::replace(relWin.begin(), relWin.end(), L'/', L'\\');
+        const std::wstring enabledPath = inlineDir + L"\\" + relWin;
+        const std::wstring disabledPath = enabledPath + L".disabled";
+        return FileExists(disabledPath) && !FileExists(enabledPath);
+    }
+
+    static std::wstring FilterProjectManifestForSnapshot(const std::wstring& manifestText,
+                                                         const std::wstring& inlineDir) {
+        if (manifestText.empty() || inlineDir.empty()) return manifestText;
+        const size_t layersKey = manifestText.find(L"\"layers\"");
+        if (layersKey == std::wstring::npos) return manifestText;
+        const size_t arrayStart = manifestText.find(L'[', layersKey);
+        if (arrayStart == std::wstring::npos) return manifestText;
+        const size_t arrayEnd = FindJsonArrayEnd(manifestText, arrayStart);
+        if (arrayEnd == std::wstring::npos || arrayEnd <= arrayStart + 1) return manifestText;
+
+        std::vector<std::wstring> keptObjects;
+        bool changed = false;
+        size_t pos = arrayStart + 1;
+        while (pos < arrayEnd - 1) {
+            const size_t objectStart = manifestText.find(L'{', pos);
+            if (objectStart == std::wstring::npos || objectStart >= arrayEnd) break;
+            const size_t objectEnd = FindJsonObjectEnd(manifestText, objectStart);
+            if (objectEnd == std::wstring::npos || objectEnd > arrayEnd) break;
+
+            std::wstring entry;
+            ExtractJsonStringInRange(manifestText, objectStart, objectEnd, L"entry", entry);
+            if (IsDisabledInlineEntryForSnapshot(entry, inlineDir)) {
+                changed = true;
+            } else {
+                keptObjects.push_back(manifestText.substr(objectStart, objectEnd - objectStart));
+            }
+            pos = objectEnd;
+        }
+        if (!changed) return manifestText;
+
+        std::wostringstream layers;
+        layers << L'[';
+        for (size_t i = 0; i < keptObjects.size(); ++i) {
+            if (i) layers << L',';
+            layers << keptObjects[i];
+        }
+        layers << L']';
+
+        std::wstring filtered = manifestText;
+        filtered.replace(arrayStart, arrayEnd - arrayStart, layers.str());
+        return filtered;
     }
 
     static Point3 MaxPointToWorld(const Point3& point) {
@@ -2920,9 +3073,6 @@ public:
                 error = L"Failed to copy snapshot runtime Rapier vendor";
                 return false;
             }
-        } else {
-            std::error_code ec;
-            std::filesystem::remove_all(std::filesystem::path(outRapierVendor), ec);
         }
 
         if (copySparkDist) {
@@ -3871,23 +4021,7 @@ public:
         bool first = true;
         for (auto& node : nodes) {
             float xform[16];
-            if (node.skinRig) {
-                // Skinned mesh: use Skin's init transform to match bind pose
-                Modifier* sm = FindModifierOnNode(node.node, SKIN_CLASSID);
-                ISkin* sk = sm ? static_cast<ISkin*>(sm->GetInterface(I_SKIN)) : nullptr;
-                Matrix3 initTM;
-                if (sk && sk->GetSkinInitTM(node.node, initTM) == SKIN_OK) {
-                    Point3 r0 = initTM.GetRow(0), r1 = initTM.GetRow(1), r2 = initTM.GetRow(2), tr = initTM.GetTrans();
-                    xform[0]=r0.x; xform[1]=r0.y; xform[2]=r0.z; xform[3]=0;
-                    xform[4]=r1.x; xform[5]=r1.y; xform[6]=r1.z; xform[7]=0;
-                    xform[8]=r2.x; xform[9]=r2.y; xform[10]=r2.z; xform[11]=0;
-                    xform[12]=tr.x; xform[13]=tr.y; xform[14]=tr.z; xform[15]=1;
-                } else {
-                    GetTransform16(node.node, t, xform);
-                }
-            } else {
-                GetTransform16(node.node, t, xform);
-            }
+            GetTransform16(node.node, t, xform);
 
             if (!first) ss << L',';
             first = false;
@@ -4256,10 +4390,6 @@ public:
             return false;
         }
 
-        if (options.copyAssets) {
-            DeleteSnapshotGeneratedAssets(outDir);
-        }
-
         std::wstring snapshotUiJsonForExport = snapshotUiJson;
         if (options.includeSnapshotUi && !localHdriBase64.empty()) {
             std::string localHdriBytes;
@@ -4306,9 +4436,9 @@ public:
         }
 
         // Gate the tsl-textures preset library into the snapshot only when the scene
-        // actually references it (preset snippets use the injected TEXTURES namespace). Mirrors the
-        // Rapier vendor gating: copy when used, remove stale otherwise — so snapshots
-        // without TSL presets stay byte-identical and unbloated.
+        // actually references it (preset snippets use the injected TEXTURES namespace).
+        // Do not delete an existing vendor folder when unused; re-export must preserve
+        // standalone site edits.
         {
             const std::wstring outTslVendor = outDir + L"\\vendor\\tsl-textures";
             if (metaJson.find(L"TEXTURES") != std::wstring::npos) {
@@ -4316,9 +4446,6 @@ public:
                 if (DirectoryExists(tslVendor)) {
                     CopyDirectoryRecursive(tslVendor, outTslVendor);
                 }
-            } else {
-                std::error_code ec;
-                std::filesystem::remove_all(std::filesystem::path(outTslVendor), ec);
             }
         }
         if (!WriteBinaryFile(outDir + L"\\scene.bin", binary)) {
@@ -4341,16 +4468,27 @@ public:
         // runtimeScene export is omitted or empty.
         const std::wstring projectManifestPath = GetProjectManifestPath();
         if (!projectManifestPath.empty() && FileExists(projectManifestPath)) {
-            if (!CopyFileEnsuringDirectories(projectManifestPath, outDir + L"\\project.maxjs.json")) {
-                error = L"Failed to copy project.maxjs.json into snapshot";
-                cleanupOnFail();
-                return false;
+            const std::wstring snapshotManifestPath = outDir + L"\\project.maxjs.json";
+            if (!ShouldPreserveSnapshotSidecarDestination(
+                    std::filesystem::path(projectManifestPath),
+                    std::filesystem::path(snapshotManifestPath))) {
+                const std::wstring manifestText = FilterProjectManifestForSnapshot(
+                    ReadUtf8File(projectManifestPath),
+                    GetInlineLayerDir());
+                if (!WriteUtf8File(snapshotManifestPath, manifestText)) {
+                    error = L"Failed to copy project.maxjs.json into snapshot";
+                    cleanupOnFail();
+                    return false;
+                }
             }
         }
 
         const std::wstring inlineDir = GetInlineLayerDir();
         if (!inlineDir.empty() && DirectoryExists(inlineDir)) {
-            if (!CopyDirectoryRecursive(inlineDir, outDir + L"\\inlines")) {
+            if (!CopyInlineDirectoryForSnapshot(
+                    inlineDir,
+                    outDir + L"\\inlines",
+                    options.includeDisabledLayers)) {
                 error = L"Failed to copy inlines into snapshot";
                 cleanupOnFail();
                 return false;
@@ -4361,7 +4499,7 @@ public:
         if (options.includeSnapshotUi) {
             const std::wstring postFxPath = GetProjectPostFxPath();
             if (!postFxPath.empty() && FileExists(postFxPath)) {
-                if (!CopyFileEnsuringDirectories(postFxPath, outDir + L"\\postfx.maxjs.json")) {
+                if (!CopySnapshotSidecarFilePreservingStandaloneEdits(postFxPath, outDir + L"\\postfx.maxjs.json")) {
                     error = L"Failed to copy postfx.maxjs.json into snapshot";
                     cleanupOnFail();
                     return false;
@@ -4371,7 +4509,7 @@ public:
 
         const std::wstring settingsPath = GetProjectSettingsPath();
         if (!settingsPath.empty() && FileExists(settingsPath)) {
-            if (!CopyFileEnsuringDirectories(settingsPath, outDir + L"\\settings.maxjs.json")) {
+            if (!CopySnapshotSidecarFilePreservingStandaloneEdits(settingsPath, outDir + L"\\settings.maxjs.json")) {
                 error = L"Failed to copy settings.maxjs.json into snapshot";
                 cleanupOnFail();
                 return false;
@@ -4383,7 +4521,7 @@ public:
         // snapshot player, projects can layer their own deployable UI on top.
         const std::wstring siteShellPath = GetProjectSiteShellPath();
         if (!siteShellPath.empty() && FileExists(siteShellPath)) {
-            if (!CopyFileEnsuringDirectories(siteShellPath, outDir + L"\\site.html")) {
+            if (!CopySnapshotSidecarFilePreservingStandaloneEdits(siteShellPath, outDir + L"\\site.html")) {
                 error = L"Failed to copy site.html into snapshot";
                 cleanupOnFail();
                 return false;
@@ -4391,6 +4529,113 @@ public:
         }
 
         return true;
+    }
+
+    bool ServeSnapshotSite(const std::wstring& snapshotDir,
+                           std::wstring& url,
+                           std::wstring& error) {
+        url.clear();
+        error.clear();
+        if (snapshotDir.empty()) {
+            error = L"Export a snapshot first";
+            return false;
+        }
+        if (!DirectoryExists(snapshotDir)) {
+            error = L"Snapshot folder not found";
+            return false;
+        }
+        if (!FileExists(snapshotDir + L"\\snapshot.json")) {
+            error = L"Snapshot folder is missing snapshot.json";
+            return false;
+        }
+        if (!FileExists(snapshotDir + L"\\index.html") && !FileExists(snapshotDir + L"\\snapshot.html")) {
+            error = L"Snapshot folder is missing index.html";
+            return false;
+        }
+
+        if (snapshotServePath_ == snapshotDir && !snapshotServeUrl_.empty()) {
+            url = snapshotServeUrl_;
+            ShellExecuteW(nullptr, L"open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+            return true;
+        }
+
+        const int port = PickSnapshotServePort();
+        if (port <= 0) {
+            error = L"No free localhost port found for snapshot server";
+            return false;
+        }
+        std::wstring command =
+            L"cmd.exe /d /s /c npx --yes http-server \".\" -p " +
+            std::to_wstring(port) +
+            L" -a 127.0.0.1 -c-1";
+
+        STARTUPINFOW si = {};
+        si.cb = sizeof(si);
+        si.dwFlags = STARTF_USESHOWWINDOW;
+        si.wShowWindow = SW_HIDE;
+        PROCESS_INFORMATION pi = {};
+        if (!CreateProcessW(
+                nullptr,
+                command.data(),
+                nullptr,
+                nullptr,
+                FALSE,
+                CREATE_NO_WINDOW,
+                nullptr,
+                snapshotDir.c_str(),
+                &si,
+                &pi)) {
+            error = L"Failed to start snapshot server. Install Node/npm or run the snapshot from disk.";
+            return false;
+        }
+
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+
+        snapshotServePath_ = snapshotDir;
+        snapshotServeUrl_ = L"http://127.0.0.1:" + std::to_wstring(port) + L"/snapshot.html?root=.";
+        url = snapshotServeUrl_;
+        Sleep(600);
+        ShellExecuteW(nullptr, L"open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        return true;
+    }
+
+    static bool IsLocalTcpPortAvailable(int port) {
+        if (port <= 0 || port > 65535) return false;
+
+        WSADATA wsaData = {};
+        if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) return false;
+
+        SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (s == INVALID_SOCKET) {
+            WSACleanup();
+            return false;
+        }
+
+        sockaddr_in addr = {};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_port = htons(static_cast<u_short>(port));
+
+        const bool available = bind(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0;
+        closesocket(s);
+        WSACleanup();
+        return available;
+    }
+
+    int PickSnapshotServePort() {
+        const int first = 9876 + (snapshotServeSerial_ % 200);
+        for (int i = 0; i < 200; ++i) {
+            const int port = 9876 + ((first - 9876 + i) % 200);
+            if (IsLocalTcpPortAvailable(port)) {
+                snapshotServeSerial_ = (port - 9876 + 1) % 200;
+                return port;
+            }
+        }
+        for (int port = 12000; port < 13000; ++port) {
+            if (IsLocalTcpPortAvailable(port)) return port;
+        }
+        return 0;
     }
 
 #include "maxjs_panel_project.inl"

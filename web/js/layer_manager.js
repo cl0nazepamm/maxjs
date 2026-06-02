@@ -863,12 +863,14 @@ export function createLayerManager({
         group.name = `__inline_${id}__`;
         group.matrixAutoUpdate = false;
         group.matrix.identity();
+        group.userData.maxjsLayerId = id;
         setSnapshotTargetId(group, `runtime:${id}:root`);
 
         const overlayGroup = markOwned(new THREE.Group(), OWNER_OVERLAY);
         overlayGroup.name = `__inline_overlay_${id}__`;
         overlayGroup.matrixAutoUpdate = false;
         overlayGroup.matrix.identity();
+        overlayGroup.userData.maxjsLayerId = id;
         setSnapshotTargetId(overlayGroup, `runtime:${id}:overlay_root`);
 
         const layer = {
@@ -1163,7 +1165,7 @@ export function createLayerManager({
      * Snapshot everything under a runtime world root (all layer groups + any future direct children),
      * plus tracked Object3Ds that are not already in that subtree (e.g. ctx.track only).
      */
-    function buildRuntimeSubtreeJson(worldRoot, snapshotName, trackedOwnerFilter) {
+    function buildRuntimeSubtreeJson(worldRoot, snapshotName, trackedOwnerFilter, includeLayer) {
         const snapshot = new THREE.Group();
         snapshot.name = snapshotName;
 
@@ -1171,12 +1173,15 @@ export function createLayerManager({
             for (const child of worldRoot.children) {
                 if (!child?.isObject3D) continue;
                 if (child.userData?.maxjsExcludeFromRuntimeSnapshot) continue;
+                const layerId = child.userData?.maxjsLayerId;
+                if (layerId && includeLayer && !includeLayer(layerId)) continue;
                 snapshot.add(child.clone(true));
             }
         }
 
         if (trackedOwnerFilter != null) {
             for (const layer of layers.values()) {
+                if (includeLayer && !includeLayer(layer.id)) continue;
                 for (const t of layer.tracked) {
                     if (!t?.isObject3D) continue;
                     if (getOwner(t) !== trackedOwnerFilter) continue;
@@ -1189,12 +1194,18 @@ export function createLayerManager({
         return snapshot.children.length > 0 ? snapshot.toJSON() : null;
     }
 
-    function serializeSnapshot() {
-        const jsRoot = buildRuntimeSubtreeJson(jsWorldRoot, '__maxjs_snapshot_js_root__', OWNER_JS);
-        const overlayRoot = buildRuntimeSubtreeJson(overlayWorldRoot, '__maxjs_snapshot_overlay_root__', OWNER_OVERLAY);
+    function serializeSnapshot(options = {}) {
+        const includeDisabledLayers = options.includeDisabledLayers === true;
+        const includeLayer = includeDisabledLayers
+            ? null
+            : (id) => layers.get(id)?.active !== false;
+        const serializedLayers = [...layers.values()]
+            .filter(layer => includeDisabledLayers || layer.active !== false);
+        const jsRoot = buildRuntimeSubtreeJson(jsWorldRoot, '__maxjs_snapshot_js_root__', OWNER_JS, includeLayer);
+        const overlayRoot = buildRuntimeSubtreeJson(overlayWorldRoot, '__maxjs_snapshot_overlay_root__', OWNER_OVERLAY, includeLayer);
         const payload = {
             version: 1,
-            layers: [...layers.values()].map(layer => ({
+            layers: serializedLayers.map(layer => ({
                 id: layer.id,
                 name: layer.name,
                 source: layer.source,

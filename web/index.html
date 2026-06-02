@@ -3867,6 +3867,25 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             else delete mesh.userData.maxjsInstOf;
         }
 
+        function getSSSRoughnessInfluence(roughness) {
+            const r = THREE.MathUtils.clamp(Number.isFinite(roughness) ? roughness : 0.5, 0, 1);
+            return {
+                attenuationScale: THREE.MathUtils.lerp(0.35, 1.0, r),
+                powerScale: THREE.MathUtils.lerp(1.6, 0.55, r),
+            };
+        }
+
+        function applySSSRoughnessInfluence(material, roughness) {
+            if (!material || material.type !== 'MeshSSSNodeMaterial') return;
+            const base = material.userData?.maxjsSSSBase || {};
+            const baseAttenuation = Number.isFinite(base.attenuation) ? base.attenuation : 0.1;
+            const basePower = Number.isFinite(base.power) ? base.power : 2.0;
+            const influence = getSSSRoughnessInfluence(roughness);
+            material.thicknessAttenuationNode = tslFloat(baseAttenuation * influence.attenuationScale);
+            material.thicknessPowerNode = tslFloat(Math.max(0.01, basePower * influence.powerScale));
+            material.needsUpdate = true;
+        }
+
         function applySSSMaterialNodes(material, md) {
             if (!material || typeof material !== 'object') return;
 
@@ -3883,9 +3902,13 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             material.thicknessColorNode = thicknessColorNode;
             material.thicknessDistortionNode = tslFloat(md.sssDistortion ?? 0.1);
             material.thicknessAmbientNode = tslFloat(md.sssAmbient ?? 0.0);
-            material.thicknessAttenuationNode = tslFloat(md.sssAttenuation ?? 0.1);
-            material.thicknessPowerNode = tslFloat(md.sssPower ?? 2.0);
             material.thicknessScaleNode = tslFloat(md.sssScale ?? 10.0);
+            material.userData ??= {};
+            material.userData.maxjsSSSBase = {
+                attenuation: md.sssAttenuation ?? 0.1,
+                power: md.sssPower ?? 2.0,
+            };
+            applySSSRoughnessInfluence(material, md.rough ?? material.roughness ?? 0.5);
         }
 
         const utilityMaterialModels = new Set([
@@ -6846,7 +6869,10 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 }
                 const roughness = material?.roughness ?? material?.rough;
                 const metalness = material?.metalness ?? material?.metal;
-                if (roughness != null && 'roughness' in m) m.roughness = roughness;
+                if (roughness != null && 'roughness' in m) {
+                    m.roughness = roughness;
+                    applySSSRoughnessInfluence(m, roughness);
+                }
                 if (metalness != null && 'metalness' in m) m.metalness = metalness;
                 if (material?.opacity != null) {
                     m.opacity = material.opacity;
@@ -9885,6 +9911,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             includeDebugPayload: false,
             includeSnapshotUi: true,
             includeRuntimeScene: true,
+            includeDisabledLayers: false,
             copyAssets: true,
             includeRapierVendor: false,
             includeAnimations: true,
@@ -9946,7 +9973,10 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         const snapshotPanel = document.getElementById('snapshotPanel');
         let snapshotPanelVisible = false;
         let pendingSnapshotRequestId = null;
+        let pendingSnapshotServeRequestId = null;
+        let pendingSnapshotServeAfterExport = false;
         let lastSnapshotExportPath = '';
+        let lastSnapshotServeUrl = '';
 
         function setSnapshotPanelVisible(visible) {
             snapshotPanelVisible = !!visible;
@@ -10010,6 +10040,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                             <label class="fx-check" for="snapshot-includeDebugPayload"><span>Debug Payload</span><input id="snapshot-includeDebugPayload" type="checkbox"></label>
                             <label class="fx-check" for="snapshot-includeSnapshotUi"><span>Viewer UI State</span><input id="snapshot-includeSnapshotUi" type="checkbox"></label>
                             <label class="fx-check" for="snapshot-includeRuntimeScene"><span>JS Runtime Scene</span><input id="snapshot-includeRuntimeScene" type="checkbox"></label>
+                            <label class="fx-check" for="snapshot-includeDisabledLayers" title="Archive disabled scene-script sources and runtime data into the snapshot. Off keeps deploy exports lean and prevents disabled layers from being replayed."><span>Disabled Layers</span><input id="snapshot-includeDisabledLayers" type="checkbox"></label>
                             <label class="fx-check" for="snapshot-copyAssets"><span>Copy Assets</span><input id="snapshot-copyAssets" type="checkbox"></label>
                         </div>
                         <div class="snapshot-note">Copy Assets should stay on for deployable snapshots. Debug Payload controls viewer UI, runtime scene, and debug-side snapshot extras.</div>
@@ -10046,6 +10077,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                         </div>
                         <div class="snapshot-actions">
                             <button id="snapshotExportBtn" type="button">Export Snapshot</button>
+                            <button id="snapshotServeBtn" type="button">Serve Snapshot</button>
                         </div>
                         <div id="snapshotExportLocation" class="snapshot-location" hidden></div>
                         <div class="snapshot-note">Settings persist across sessions.</div>
@@ -10057,6 +10089,9 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             snapshotPanel.querySelector('#snapshotResetBtn')?.addEventListener('click', () => resetSnapshotSettings());
             snapshotPanel.querySelector('#snapshotExportBtn')?.addEventListener('click', () => {
                 void exportSnapshotWithSettings();
+            });
+            snapshotPanel.querySelector('#snapshotServeBtn')?.addEventListener('click', () => {
+                void serveSnapshotWithSettings();
             });
 
             for (const key of Object.keys(SNAPSHOT_SETTINGS_DEFAULTS)) {
@@ -10074,16 +10109,23 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
 
             const effective = getSnapshotExportSettings();
             const exportButton = snapshotPanel.querySelector('#snapshotExportBtn');
+            const serveButton = snapshotPanel.querySelector('#snapshotServeBtn');
             const status = snapshotPanel.querySelector('#snapshotPanelStatus');
             const location = snapshotPanel.querySelector('#snapshotExportLocation');
             if (status) {
                 if (!window.chrome?.webview) status.textContent = 'Available only inside max.js';
+                else if (pendingSnapshotServeRequestId) status.textContent = 'Serving snapshot...';
                 else if (pendingSnapshotRequestId) status.textContent = 'Writing snapshot...';
+                else if (lastSnapshotServeUrl) status.textContent = 'Snapshot served';
                 else if (lastSnapshotExportPath) status.textContent = 'Snapshot saved';
                 else status.textContent = `dist export • step ${effective.animationSampleStepFrames}f`;
             }
             if (location) {
-                if (lastSnapshotExportPath) {
+                if (lastSnapshotServeUrl) {
+                    location.hidden = false;
+                    location.textContent = `Snapshot served at ${lastSnapshotServeUrl}`;
+                    location.title = lastSnapshotServeUrl;
+                } else if (lastSnapshotExportPath) {
                     location.hidden = false;
                     location.textContent = `Snapshot saved to ${lastSnapshotExportPath}`;
                     location.title = lastSnapshotExportPath;
@@ -10094,8 +10136,12 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 }
             }
             if (exportButton) {
-                exportButton.disabled = !window.chrome?.webview || !!pendingSnapshotRequestId;
+                exportButton.disabled = !window.chrome?.webview || !!pendingSnapshotRequestId || !!pendingSnapshotServeRequestId;
                 exportButton.textContent = pendingSnapshotRequestId ? 'Writing...' : 'Export Snapshot';
+            }
+            if (serveButton) {
+                serveButton.disabled = !window.chrome?.webview || !!pendingSnapshotRequestId || !!pendingSnapshotServeRequestId;
+                serveButton.textContent = pendingSnapshotServeRequestId ? 'Serving...' : 'Serve Snapshot';
             }
 
             for (const [key, defaultValue] of Object.entries(SNAPSHOT_SETTINGS_DEFAULTS)) {
@@ -10129,7 +10175,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             if (stepInput) stepInput.disabled = !animationsEnabled;
         }
 
-        async function exportSnapshotWithSettings() {
+        async function exportSnapshotWithSettings(options = {}) {
             if (!window.chrome?.webview || pendingSnapshotRequestId) return;
 
             const settings = getSnapshotExportSettings();
@@ -10159,7 +10205,9 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
 
             if (settings.includeRuntimeScene) {
                 try {
-                    const runtimeSnapshot = layerManager.serializeSnapshot?.() ?? null;
+                    const runtimeSnapshot = layerManager.serializeSnapshot?.({
+                        includeDisabledLayers: settings.includeDisabledLayers,
+                    }) ?? null;
                     if (runtimeSnapshot) {
                         runtimeSnapshotBase64 = toBase64Utf8(JSON.stringify(runtimeSnapshot));
                         const layerRows = runtimeSnapshot.layers?.length ?? 0;
@@ -10179,6 +10227,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             }
 
             pendingSnapshotRequestId = `snapshot_${Date.now()}`;
+            pendingSnapshotServeAfterExport = !!options.serveAfter;
             syncSnapshotPanel();
             setInfoText('max.js - writing snapshot...');
             bridge.send('snapshot_export', {
@@ -10188,6 +10237,23 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 localHdriBase64,
                 localHdriFileName: localHdriFileNameForExport,
                 ...settings,
+            });
+        }
+
+        async function serveSnapshotWithSettings() {
+            if (!window.chrome?.webview || pendingSnapshotRequestId || pendingSnapshotServeRequestId) return;
+            if (!lastSnapshotExportPath) {
+                await exportSnapshotWithSettings({ serveAfter: true });
+                return;
+            }
+
+            pendingSnapshotServeRequestId = `snapshot_serve_${Date.now()}`;
+            lastSnapshotServeUrl = '';
+            syncSnapshotPanel();
+            setInfoText('max.js - serving snapshot...');
+            bridge.send('snapshot_serve', {
+                requestId: pendingSnapshotServeRequestId,
+                path: lastSnapshotExportPath,
             });
         }
 
@@ -10208,16 +10274,36 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 else pending.reject(new Error(msg.error || `${pending.action} failed`));
             }
 
-            if (msg.action !== 'snapshot_export') return;
-            if (pendingSnapshotRequestId && msg.requestId && msg.requestId !== pendingSnapshotRequestId) return;
-            pendingSnapshotRequestId = null;
-            if (msg.ok) {
-                lastSnapshotExportPath = msg.path || 'dist';
-                setInfoText(`max.js - Snapshot saved to ${lastSnapshotExportPath}`);
+            if (msg.action === 'snapshot_export') {
+                if (pendingSnapshotRequestId && msg.requestId && msg.requestId !== pendingSnapshotRequestId) return;
+                pendingSnapshotRequestId = null;
+                if (msg.ok) {
+                    lastSnapshotExportPath = msg.path || 'dist';
+                    lastSnapshotServeUrl = '';
+                    setInfoText(`max.js - Snapshot saved to ${lastSnapshotExportPath}`);
+                    syncSnapshotPanel();
+                    if (pendingSnapshotServeAfterExport) {
+                        pendingSnapshotServeAfterExport = false;
+                        void serveSnapshotWithSettings();
+                    }
+                } else {
+                    pendingSnapshotServeAfterExport = false;
+                    syncSnapshotPanel();
+                    reportBridgeError('snapshot export', msg.error || 'snapshot export failed');
+                }
+                return;
+            }
+
+            if (msg.action === 'snapshot_serve') {
+                if (pendingSnapshotServeRequestId && msg.requestId && msg.requestId !== pendingSnapshotServeRequestId) return;
+                pendingSnapshotServeRequestId = null;
+                if (msg.ok) {
+                    lastSnapshotServeUrl = msg.path || '';
+                    setInfoText(`max.js - Snapshot served at ${lastSnapshotServeUrl || 'localhost'}`);
+                } else {
+                    reportBridgeError('snapshot serve', msg.error || 'snapshot serve failed');
+                }
                 syncSnapshotPanel();
-            } else {
-                syncSnapshotPanel();
-                reportBridgeError('snapshot export', msg.error || 'snapshot export failed');
             }
         });
 

@@ -406,7 +406,6 @@
         TimeValue t = ip->GetTime();
         bool changed = false;
         std::unordered_map<Mtl*, MaterialSyncState> materialStateCache;
-        std::unordered_map<Mtl*, uint64_t> scalarPreviewHashCache;
 
         for (ULONG handle : geomHandles_) {
             INode* node = ip->GetINodeByHandle(handle);
@@ -422,7 +421,7 @@
             if (multiMtl && multiMtl->NumSubMtls() > 1) continue;
 
             Mtl* supportedMtl = FindSupportedMaterial(rawMtl);
-            if (supportedMtl && IsThreeJSMaterialClass(supportedMtl->ClassID())) {
+            if (supportedMtl) {
                 const MaterialSyncState state = ComputeMaterialSyncStateCached(node, t, materialStateCache);
                 auto structureIt = mtlHashMap_.find(handle);
                 auto scalarIt = mtlScalarHashMap_.find(handle);
@@ -461,20 +460,8 @@
             float rough = 0.5f;
             float metal = 0.0f;
             float opac = 1.0f;
-            uint64_t scalarHash = 0;
-            if (supportedMtl) {
-                auto cachedScalar = scalarPreviewHashCache.find(supportedMtl);
-                if (cachedScalar != scalarPreviewHashCache.end()) {
-                    scalarHash = cachedScalar->second;
-                } else {
-                    ExtractMaterialScalarPreview(supportedMtl, nullptr, t, col, rough, metal, opac);
-                    scalarHash = HashMaterialScalarPreviewValues(col, rough, metal, opac);
-                    scalarPreviewHashCache[supportedMtl] = scalarHash;
-                }
-            } else {
-                ExtractMaterialScalarPreview(nullptr, node, t, col, rough, metal, opac);
-                scalarHash = HashMaterialScalarPreviewValues(col, rough, metal, opac);
-            }
+            ExtractMaterialScalarPreview(nullptr, node, t, col, rough, metal, opac);
+            const uint64_t scalarHash = HashMaterialScalarPreviewValues(col, rough, metal, opac);
             auto it = mtlFastScalarHashMap_.find(handle);
             if (it == mtlFastScalarHashMap_.end()) {
                 mtlFastScalarHashMap_[handle] = scalarHash;
@@ -1974,6 +1961,7 @@
             ExtractJsonBool(msg, L"includeDebugPayload", options.includeDebugPayload);
             ExtractJsonBool(msg, L"includeSnapshotUi", options.includeSnapshotUi);
             ExtractJsonBool(msg, L"includeRuntimeScene", options.includeRuntimeScene);
+            ExtractJsonBool(msg, L"includeDisabledLayers", options.includeDisabledLayers);
             ExtractJsonBool(msg, L"copyAssets", options.copyAssets);
             ExtractJsonBool(msg, L"includeRapierVendor", options.includeRapierVendor);
             ExtractJsonBool(msg, L"includeAnimations", options.includeAnimations);
@@ -2015,7 +2003,23 @@
                 localHdriBase64,
                 exportPath,
                 error);
+            if (ok) {
+                lastSnapshotExportPath_ = exportPath;
+            }
             SendHostActionResult(type, requestId, ok, error, exportPath);
+            return;
+        }
+        if (type == L"snapshot_serve") {
+            std::wstring requestId;
+            std::wstring path;
+            ExtractJsonString(msg, L"requestId", requestId);
+            ExtractJsonString(msg, L"path", path);
+            if (path.empty()) path = lastSnapshotExportPath_;
+
+            std::wstring url;
+            std::wstring error;
+            const bool ok = ServeSnapshotSite(path, url, error);
+            SendHostActionResult(type, requestId, ok, error, url);
             return;
         }
         if (type == L"inline_layer_remove") {
@@ -3091,6 +3095,22 @@
             clear(stable.clearcoatNormalMapTransform);
             clear(stable.specularIntensityMapTransform); clear(stable.specularColorMapTransform);
             state.structureHash = HashMaterialPBRState(stable);
+            state.canFastSync = false;
+            return state;
+        }
+
+        // Any serialized texture slot makes scalar-only deltas unsafe: a color
+        // tweak must resend the full material payload so sibling maps such as
+        // OpenPBR opacity stay attached in the viewer.
+        bool hasTextureSlot = false;
+        for (const maxjs::MaterialSlot& slot : maxjs::kMaterialSlots) {
+            if (!(pbr.*(slot.path)).empty()) {
+                hasTextureSlot = true;
+                break;
+            }
+        }
+        if (hasTextureSlot) {
+            state.structureHash = HashMaterialPBRState(pbr);
             state.canFastSync = false;
             return state;
         }

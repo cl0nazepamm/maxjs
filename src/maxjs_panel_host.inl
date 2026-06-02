@@ -108,6 +108,10 @@
     bool pathTracingViewerActive_ = false;
     bool pathTracingHasSceneSync_ = false;
     bool pendingSnapshotExportRequest_ = false;
+    std::wstring lastSnapshotExportPath_;
+    std::wstring snapshotServePath_;
+    std::wstring snapshotServeUrl_;
+    int snapshotServeSerial_ = 0;
     bool slowJsonSyncMode_ = false;
     ULONGLONG lastSlowJsonSyncTick_ = 0;
     SceneEventNamespace::CallbackKey fastNodeEventCallbackKey_ = 0;

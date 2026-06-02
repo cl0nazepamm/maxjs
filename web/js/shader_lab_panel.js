@@ -6,7 +6,7 @@
 // classes so it matches the rest of the panels (no blue native sliders).
 
 const EFFECT_TYPES = [
-    'ascii', 'circuit-bent', 'directional-blur', 'chromatic-aberration',
+    'ascii', 'bloom', 'circuit-bent', 'directional-blur', 'chromatic-aberration',
     'crt', 'displacement-map', 'dithering', 'edge-detect', 'fluted-glass',
     'halftone', 'ink', 'particle-grid', 'pattern', 'pixelation',
     'pixel-sorting', 'plotter', 'posterize', 'slice', 'smear', 'threshold',
@@ -23,22 +23,28 @@ const BLEND_MODES = [
 ];
 
 const COMPOSITE_MODES = ['filter', 'mask'];
-const TONEMAP_MODES = ['neutral', 'linear', 'reinhard'];
+const TONEMAP_MODES = ['aces', 'none', 'reinhard', 'totos', 'cinematic'];
 
-// Per-effect default params — extracted from shader-lab 1.3.4's pass source
+// Per-effect default params — matched to shader-lab 1.3.12's pass source
 // files. Users can tweak any value in the Params JSON editor. When the
 // user picks a new effect type, the params get reset to that type's defaults
 // so every layer starts with a working, editable config instead of an
 // empty {} that offers zero discoverability.
 const DEFAULT_PARAMS = {
     'ascii': {
-        cellSize: 12, colorMode: 1, invert: 0,
-        monoRed: 0.96, monoGreen: 0.96, monoBlue: 0.94,
+        cellSize: 12, charset: 'light', customChars: ' .:-=+*#%@',
+        fontWeight: 'regular', colorMode: 'monochrome', monoColor: '#f5f5f0',
+        toneMapping: 'none', glyphSignalMode: 'luminance', colorSignalMode: 'luminance',
+        invert: false, bgOpacity: 0,
         signalBlackPoint: 0, signalWhitePoint: 1, signalGamma: 1,
         presenceThreshold: 0, presenceSoftness: 0,
         shimmerAmount: 0, shimmerSpeed: 1, directionBias: 0,
         bloomEnabled: false, bloomIntensity: 1.25, bloomRadius: 6,
         bloomSoftness: 0.35, bloomThreshold: 0.6,
+    },
+    'bloom': {
+        bloomIntensity: 1.25, bloomRadius: 6, bloomSoftness: 0.35,
+        bloomThreshold: 0.6, bloomKnee: 0.2, highlightDrive: 1.5,
     },
     'circuit-bent': {
         colorMode: 'source', invert: false,
@@ -54,8 +60,7 @@ const DEFAULT_PARAMS = {
         centerX: 0.5, centerY: 0.5,
     },
     'chromatic-aberration': {
-        intensity: 5, centerX: 0.5, centerY: 0.5, angle: 0,
-        directionMode: 0,
+        intensity: 5, center: [0.5, 0.5], angle: 0, direction: 'radial',
     },
     'crt': {
         cellSize: 3, scanlineIntensity: 0.17, maskIntensity: 1,
@@ -74,12 +79,11 @@ const DEFAULT_PARAMS = {
         channelMode: 'luminance',
     },
     'dithering': {
-        levels: 4, matrixSize: 4, pixelSize: 1, spread: 0.5,
-        colorRed: 0.96, colorGreen: 0.96, colorBlue: 0.94,
-        shadowRed: 0.06, shadowGreen: 0.06, shadowBlue: 0.06,
-        highlightRed: 0.96, highlightGreen: 0.95, highlightBlue: 0.91,
-        dotScale: 1.0, animateDither: 0, ditherSpeed: 1.0,
-        chromaticSplit: 0, colorMode: 'source',
+        levels: 4, pixelSize: 1, spread: 0.5, algorithm: 'bayer-4x4',
+        colorMode: 'source', monoColor: '#f5f5f0',
+        shadowColor: '#101010', highlightColor: '#f5f2e8',
+        dotScale: 1.0, animateDither: false, ditherSpeed: 1.0,
+        chromaticSplit: false,
     },
     'edge-detect': {
         threshold: 0.1, strength: 1, invert: 0,
@@ -127,33 +131,36 @@ const DEFAULT_PARAMS = {
     'particle-grid': {
         gridResolution: 64, displacement: 0.5, pointSize: 3.0,
         noiseAmount: 0, noiseScale: 3.0, noiseSpeed: 0.5,
-        bgColor: '#000000',
+        backgroundColor: '#000000',
         bloomEnabled: false, bloomIntensity: 1.25, bloomRadius: 6,
         bloomSoftness: 0.35, bloomThreshold: 0.6,
     },
     'pattern': {
-        cellSize: 12, colorMode: 0, invert: 0,
-        numPatterns: 1, bgOpacity: 0,
-        monoRed: 0.96, monoGreen: 0.96, monoBlue: 0.94,
+        cellSize: 12, preset: 'bars', colorMode: 'source', invert: false,
+        bgOpacity: 0, monoColor: '#f5f5f0',
         customColorCount: 4, customLuminanceBias: 0,
+        customBgColor: '#F5F5F0', customColor1: '#0d1014',
+        customColor2: '#4d5057', customColor3: '#969aa2',
+        customColor4: '#e1e2de',
+        bloomEnabled: false, bloomIntensity: 1.25, bloomRadius: 6,
+        bloomSoftness: 0.35, bloomThreshold: 0.6,
     },
     'pixelation': {
         cellSize: 8, aspectRatio: 1,
     },
     'pixel-sorting': {
         threshold: 0.25, upperThreshold: 1,
-        direction: 0, mode: 0, reverse: 0,
-        passCount: 150, passOffset: 0,
+        direction: 'horizontal', mode: 'luminance', reverse: false,
+        range: 0.5,
     },
     'plotter': {
-        colorMode: 0, gap: 12, weight: 1.5,
-        angle: 90, crossAngle: 135, crosshatch: 1,
+        colorMode: 'ink', gap: 12, weight: 1.5,
+        angle: 90, crossAngle: 135, crosshatch: true,
         threshold: 0.5, wobble: 0.3,
-        paperColorR: 0.96, paperColorG: 0.94, paperColorB: 0.91,
-        inkColorR: 0.1, inkColorG: 0.1, inkColorB: 0.1,
+        paperColor: '#f5f0e8', inkColor: '#1a1a1a',
     },
     'posterize': {
-        levels: 5, gamma: 1, inverseGamma: 1, mode: 0,
+        levels: 5, gamma: 1, mode: 'rgb',
     },
     'slice': {
         amount: 180, sliceHeight: 28, blockWidth: 120,
@@ -165,7 +172,7 @@ const DEFAULT_PARAMS = {
         strength: 24, samples: 12,
     },
     'threshold': {
-        threshold: 0.5, softness: 0.02, noise: 0.08, invert: 0,
+        threshold: 0.5, softness: 0.02, noise: 0.08, invert: false,
     },
     // Source layers
     'gradient': {
@@ -176,8 +183,13 @@ const DEFAULT_PARAMS = {
         glowStrength: 0.18, glowThreshold: 0.62,
         grainAmount: 0.03,
         vignetteStrength: 0.18, vignetteRadius: 0.9, vignetteSoftness: 0.32,
-        noiseSeed: 0, noiseMode: 'simplex', tonemapMode: 'neutral',
+        noiseSeed: 0, noiseType: 'simplex', tonemapMode: 'aces',
         warpIterations: 1,
+        point1Color: '#ff4d00', point1Position: [0.18, 0.28], point1Weight: 1,
+        point2Color: '#00c9a7', point2Position: [0.82, 0.24], point2Weight: 1,
+        point3Color: '#fffde8', point3Position: [0.48, 0.72], point3Weight: 1,
+        point4Color: '#6236ff', point4Position: [0.25, 0.82], point4Weight: 1,
+        point5Color: '#c8f542', point5Position: [0.78, 0.78], point5Weight: 1,
     },
     'text': {
         text: 'basement.studio',
@@ -185,10 +197,16 @@ const DEFAULT_PARAMS = {
         letterSpacing: -0.02, fontFamily: 'display-serif',
         textColor: '#ffffff', backgroundColor: '#000000',
     },
-    'image': { url: '' },
-    'video': { url: '', loop: true, muted: true },
-    'live': { source: 'webcam' },
-    'custom-shader': { code: '// WGSL / TSL shader code' },
+    'image': { fitMode: 'cover', scale: 1, offset: [0, 0] },
+    'video': { fitMode: 'cover', scale: 1, offset: [0, 0], playbackRate: 1 },
+    'live': { facingMode: 'user', fitMode: 'cover', scale: 1, offset: [0, 0], mirror: true },
+    'custom-shader': {
+        effectMode: false,
+        entryExport: 'sketch',
+        sourceFileName: 'custom-shader.ts',
+        sourceRevision: 0,
+        sourceCode: 'export function sketch() {\n  return vec4(vec3(1, 0.3, 0), 1)\n}',
+    },
 };
 
 function defaultParamsFor(type) {
@@ -203,7 +221,7 @@ function nextId() {
 }
 
 function makeLayer(type = 'crt', kind = 'effect') {
-    return {
+    const layer = {
         id: nextId(),
         kind,
         type,
@@ -216,6 +234,10 @@ function makeLayer(type = 'crt', kind = 'effect') {
         compositeMode: 'filter',
         params: defaultParamsFor(type),
     };
+    if (type === 'image' || type === 'video') {
+        layer.asset = { kind: type, src: '' };
+    }
+    return layer;
 }
 
 const DEFAULT_CONFIG = () => ({
@@ -229,11 +251,46 @@ function normalizeConfig(config) {
     const layers = Array.isArray(source.layers)
         ? source.layers.map(layer => {
             if (!layer || typeof layer !== 'object') return layer;
-            const params = (layer.params && typeof layer.params === 'object') ? { ...layer.params } : layer.params;
+            const defaults = defaultParamsFor(layer.type);
+            const sourceParams = (layer.params && typeof layer.params === 'object') ? layer.params : null;
+            let params = sourceParams
+                ? { ...defaults, ...sourceParams }
+                : defaults;
+            if (
+                layer.type === 'chromatic-aberration' &&
+                sourceParams &&
+                !Array.isArray(sourceParams.center) &&
+                (typeof sourceParams.centerX === 'number' || typeof sourceParams.centerY === 'number')
+            ) {
+                const x = typeof sourceParams.centerX === 'number' ? sourceParams.centerX : 0.5;
+                const y = typeof sourceParams.centerY === 'number' ? sourceParams.centerY : 0.5;
+                params = { ...params, center: [x, y] };
+            }
+            if (
+                layer.type === 'pixel-sorting' &&
+                sourceParams &&
+                typeof sourceParams.range !== 'number' &&
+                typeof sourceParams.passCount === 'number'
+            ) {
+                params = { ...params, range: Math.max(0.01, Math.min(1, sourceParams.passCount / 300)) };
+            }
+            delete params.centerX;
+            delete params.centerY;
+            delete params.directionMode;
+            delete params.passCount;
+            delete params.passOffset;
+            let asset = layer.asset;
+            if ((layer.type === 'image' || layer.type === 'video')) {
+                const src = asset?.src || params.url || '';
+                asset = { fileName: asset?.fileName, kind: layer.type, src };
+                delete params.url;
+                delete params.loop;
+                delete params.muted;
+            }
             if (params && typeof params.tonemapMode === 'string' && !TONEMAP_MODES.includes(params.tonemapMode)) {
                 params.tonemapMode = defaultParamsFor(layer.type).tonemapMode ?? TONEMAP_MODES[0];
             }
-            return { ...layer, params };
+            return { ...layer, asset, params };
         })
         : source.layers;
     return { ...source, layers };
@@ -666,6 +723,17 @@ function injectStyles() {
         .sl-text-input:focus {
             border-color: rgba(255, 255, 255, 0.2);
         }
+        .sl-vector-block {
+            display: grid;
+            gap: 5px;
+            min-width: 0;
+        }
+        .sl-vector-title {
+            font: 600 9px/1 -apple-system, 'Segoe UI', system-ui, sans-serif;
+            color: #777;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+        }
         .sl-params-editor {
             width: 100%;
             background: rgba(0, 0, 0, 0.25);
@@ -684,6 +752,9 @@ function injectStyles() {
         .sl-params-editor:focus {
             border-color: rgba(255, 255, 255, 0.2);
             background: rgba(0, 0, 0, 0.35);
+        }
+        .sl-code-input {
+            min-height: 112px;
         }
         .sl-switch {
             display: flex;
@@ -724,6 +795,7 @@ function buildApp({ React, htm, shaderLabFx }) {
     const { useState, useEffect, useRef, useCallback } = React;
 
     function FxSlider({ label, value, min, max, step, format, onChange }) {
+        const commit = (e) => onChange(parseFloat(e.target.value));
         const display = format ? format(value) : (
             Math.abs(value) < 10 ? value.toFixed(2) : value.toFixed(0)
         );
@@ -737,7 +809,8 @@ function buildApp({ React, htm, shaderLabFx }) {
                     className="fx-range"
                     type="range"
                     min=${min} max=${max} step=${step ?? 0.01} value=${value}
-                    onInput=${(e) => onChange(parseFloat(e.target.value))}
+                    onInput=${commit}
+                    onChange=${commit}
                 />
             </label>
         `;
@@ -761,10 +834,36 @@ function buildApp({ React, htm, shaderLabFx }) {
     // shader-lab pass source. If a string key isn't in this map, it falls
     // back to a text input.
     const PARAM_ENUMS = {
-        colorMode: ['source', 'mono', 'cmyk', 'duotone', 'custom', '0', '1', '2'],
+        'ascii.charset': ['light', 'dense', 'blocks', 'binary', 'hatching', 'custom'],
+        'ascii.colorMode': ['monochrome', 'green-terminal', 'source'],
+        'ascii.fontWeight': ['regular', 'bold', 'thin'],
+        'ascii.toneMapping': ['none', 'aces', 'cinematic', 'reinhard', 'totos'],
+        'ascii.glyphSignalMode': ['luminance', 'lightness', 'red', 'green', 'blue'],
+        'ascii.colorSignalMode': ['luminance', 'lightness', 'red', 'green', 'blue'],
+        'circuit-bent.colorMode': ['source', 'monochrome'],
+        'dithering.colorMode': ['source', 'monochrome', 'duo-tone'],
+        'dithering.algorithm': ['bayer-2x2', 'bayer-4x4', 'bayer-8x8', 'noise'],
+        'halftone.colorMode': ['cmyk', 'duotone', 'custom', 'source', 'monochrome'],
+        'halftone.cmykBlend': ['subtractive', 'overprint'],
+        'plotter.colorMode': ['ink', 'source'],
+        'pattern.colorMode': ['source', 'quantized', 'monochrome', 'custom'],
+        'pattern.preset': ['bars', 'candles', 'shapes'],
+        'directional-blur.mode': ['linear', 'radial'],
+        'pixel-sorting.mode': ['luminance', 'hue', 'saturation'],
+        'posterize.mode': ['rgb', 'luma'],
+        'chromatic-aberration.direction': ['radial', 'horizontal', 'vertical'],
+        'pixel-sorting.direction': ['horizontal', 'vertical'],
+        'slice.direction': ['right', 'left', 'both'],
+        'gradient.noiseType': ['simplex', 'perlin', 'ridge', 'turbulence', 'value', 'voronoi'],
+        'gradient.tonemapMode': TONEMAP_MODES,
+        'image.fitMode': ['cover', 'contain'],
+        'video.fitMode': ['cover', 'contain'],
+        'live.fitMode': ['cover', 'contain'],
+        'live.facingMode': ['user', 'environment'],
+        colorMode: ['source', 'monochrome', 'cmyk', 'duotone', 'custom'],
         mode: ['linear', 'radial'],
-        direction: ['right', 'left', 'up', 'down'],
-        noiseMode: ['simplex', 'turbulence', 'perlin'],
+        direction: ['right', 'left', 'both', 'horizontal', 'vertical', 'radial'],
+        noiseMode: ['sine', 'turbulence', 'perlin'],
         shape: ['circle', 'square', 'diamond'],
         fontFamily: ['display-serif', 'serif', 'sans-serif', 'monospace'],
         preset: ['architectural', 'vintage', 'industrial'],
@@ -773,6 +872,89 @@ function buildApp({ React, htm, shaderLabFx }) {
         cmykBlend: ['subtractive', 'additive'],
         source: ['webcam', 'screen'],
     };
+
+    const PARAM_RANGES = {
+        'chromatic-aberration.center': { min: 0, max: 1, step: 0.01 },
+        'gradient.point1Position': { min: 0, max: 1, step: 0.01 },
+        'gradient.point2Position': { min: 0, max: 1, step: 0.01 },
+        'gradient.point3Position': { min: 0, max: 1, step: 0.01 },
+        'gradient.point4Position': { min: 0, max: 1, step: 0.01 },
+        'gradient.point5Position': { min: 0, max: 1, step: 0.01 },
+        'image.offset': { min: -1, max: 1, step: 0.01 },
+        'video.offset': { min: -1, max: 1, step: 0.01 },
+        'live.offset': { min: -1, max: 1, step: 0.01 },
+        activePoints: { min: 2, max: 5, step: 1, isInt: true },
+        algorithm: null,
+        angle: { min: 0, max: 360, step: 1 },
+        barrelDistortion: { min: 0, max: 1, step: 0.01 },
+        bloomKnee: { min: 0, max: 0.5, step: 0.01 },
+        bloomRadius: { min: 0, max: 24, step: 0.1 },
+        bloomSoftness: { min: 0, max: 1, step: 0.01 },
+        bloomThreshold: { min: 0, max: 1, step: 0.01 },
+        cellSize: { min: 2, max: 64, step: 1, isInt: true },
+        centerX: { min: 0, max: 1, step: 0.01 },
+        centerY: { min: 0, max: 1, step: 0.01 },
+        chromaticAberration: { min: 0, max: 16, step: 0.1 },
+        chromaticSplit: { min: 0, max: 1, step: 0.01 },
+        contrast: { min: 0, max: 4, step: 0.01 },
+        density: { min: 0, max: 1, step: 0.01 },
+        dispersion: { min: 0, max: 0.5, step: 0.01 },
+        dotGain: { min: 0, max: 1, step: 0.01 },
+        dotMin: { min: 0, max: 1, step: 0.01 },
+        dotMorph: { min: 0, max: 1, step: 0.01 },
+        dotScale: { min: 0, max: 4, step: 0.01 },
+        dotSize: { min: 0, max: 4, step: 0.01 },
+        falloff: { min: 0.25, max: 5, step: 0.01 },
+        fontSize: { min: 48, max: 512, step: 1, isInt: true },
+        fontWeight: { min: 100, max: 900, step: 100, isInt: true },
+        gamma: { min: 0.4, max: 2.5, step: 0.01 },
+        gap: { min: 10, max: 120, step: 1 },
+        gcr: { min: 0, max: 1, step: 0.01 },
+        glitchIntensity: { min: 0, max: 1, step: 0.01 },
+        glowThreshold: { min: 0, max: 1, step: 0.01 },
+        gridResolution: { min: 2, max: 128, step: 1, isInt: true },
+        highlightDrive: { min: 1, max: 8, step: 0.05 },
+        intensity: { min: 0, max: 50, step: 0.1 },
+        levels: { min: 2, max: 16, step: 1, isInt: true },
+        lineAngle: { min: 0, max: 180, step: 1 },
+        linePitch: { min: 2, max: 48, step: 0.1 },
+        lineThickness: { min: 0.5, max: 8, step: 0.1 },
+        matrixSize: { min: 2, max: 8, step: 1, isInt: true },
+        noise: { min: 0, max: 0.3, step: 0.01 },
+        noiseAmount: { min: 0, max: 1, step: 0.01 },
+        opacity: { min: 0, max: 1, step: 0.01 },
+        playbackRate: { min: 0.1, max: 4, step: 0.05 },
+        pixelSize: { min: 1, max: 64, step: 1, isInt: true },
+        pointSize: { min: 0, max: 16, step: 0.1 },
+        presenceSoftness: { min: 0, max: 1, step: 0.01 },
+        presenceThreshold: { min: 0, max: 1, step: 0.01 },
+        range: { min: 0.01, max: 1, step: 0.01 },
+        scale: { min: 0.1, max: 4, step: 0.01 },
+        samples: { min: 1, max: 32, step: 1, isInt: true },
+        signalBlackPoint: { min: 0, max: 1, step: 0.01 },
+        signalGamma: { min: 0.1, max: 5, step: 0.01 },
+        signalWhitePoint: { min: 0, max: 1, step: 0.01 },
+        softness: { min: 0, max: 1, step: 0.01 },
+        spread: { min: 0, max: 1, step: 0.01 },
+        start: { min: 0, max: 1, step: 0.01 },
+        end: { min: 0, max: 1, step: 0.01 },
+        threshold: { min: 0, max: 1, step: 0.01 },
+        upperThreshold: { min: 0, max: 1, step: 0.01 },
+        warpBias: { min: 0, max: 1, step: 0.01 },
+        warpIterations: { min: 1, max: 5, step: 1, isInt: true },
+        weight: { min: 0.5, max: 5, step: 0.01 },
+        wobble: { min: 0, max: 1, step: 0.01 },
+    };
+
+    function getParamEnum(layerType, paramKey) {
+        return PARAM_ENUMS[`${layerType}.${paramKey}`] || PARAM_ENUMS[paramKey] || null;
+    }
+
+    function getParamRange(layerType, paramKey, defaultValue, currentValue) {
+        return PARAM_RANGES[`${layerType}.${paramKey}`]
+            || PARAM_RANGES[paramKey]
+            || inferNumericRange(paramKey, defaultValue, currentValue);
+    }
 
     // Humanize camelCase / kebab-case param keys for display
     const humanize = (k) => k.replace(/([a-z])([A-Z])/g, '$1 $2')
@@ -820,13 +1002,20 @@ function buildApp({ React, htm, shaderLabFx }) {
         return { min, max, step, isInt };
     }
 
+    function parseRangeValue(value, range) {
+        const parsed = range.isInt ? parseInt(value, 10) : parseFloat(value);
+        if (!Number.isFinite(parsed)) return range.isInt ? 0 : 0;
+        const clamped = Math.max(range.min, Math.min(range.max, parsed));
+        return range.isInt ? Math.round(clamped) : clamped;
+    }
+
     const isHexColor = (s) => typeof s === 'string' && /^#[0-9a-fA-F]{3,8}$/.test(s);
 
     // Auto-generated per-param control renderer. Looks at each key in the
     // current params object and picks an appropriate widget based on the
     // value type (number → slider, bool → checkbox, hex string → color
     // picker, known enum → dropdown, other string → text input).
-    function AutoParamControl({ paramKey, value, defaultValue, onChange }) {
+    function AutoParamControl({ layerType, paramKey, value, defaultValue, onChange }) {
         const label = humanize(paramKey);
 
         if (typeof value === 'boolean') {
@@ -840,8 +1029,9 @@ function buildApp({ React, htm, shaderLabFx }) {
         }
 
         if (typeof value === 'number') {
-            const range = inferNumericRange(paramKey, defaultValue, value);
+            const range = getParamRange(layerType, paramKey, defaultValue, value);
             const display = range.isInt ? Math.round(value) : value.toFixed(2);
+            const commit = (e) => onChange(parseRangeValue(e.target.value, range));
             return html`
                 <label className="fx-control">
                     <div className="fx-control-head">
@@ -851,10 +1041,40 @@ function buildApp({ React, htm, shaderLabFx }) {
                     <input className="fx-range" type="range"
                         min=${range.min} max=${range.max} step=${range.step}
                         value=${value}
-                        onInput=${(e) => onChange(range.isInt
-                            ? parseInt(e.target.value, 10)
-                            : parseFloat(e.target.value))} />
+                        onInput=${commit}
+                        onChange=${commit} />
                 </label>
+            `;
+        }
+
+        if (Array.isArray(value) && value.every(v => typeof v === 'number')) {
+            const defaults = Array.isArray(defaultValue) ? defaultValue : value;
+            const range = getParamRange(layerType, paramKey, defaults[0], value[0]);
+            const labels = ['X', 'Y', 'Z', 'W'];
+            return html`
+                <div className="sl-vector-block">
+                    <div className="sl-vector-title">${label}</div>
+                    ${value.map((component, index) => {
+                        const commit = (e) => {
+                            const next = [...value];
+                            next[index] = parseRangeValue(e.target.value, range);
+                            onChange(next);
+                        };
+                        return html`
+                            <label key=${index} className="fx-control">
+                                <div className="fx-control-head">
+                                    <span>${labels[index] || index}</span>
+                                    <span className="fx-value">${component.toFixed(2)}</span>
+                                </div>
+                                <input className="fx-range" type="range"
+                                    min=${range.min} max=${range.max} step=${range.step}
+                                    value=${component}
+                                    onInput=${commit}
+                                    onChange=${commit} />
+                            </label>
+                        `;
+                    })}
+                </div>
             `;
         }
 
@@ -863,13 +1083,15 @@ function buildApp({ React, htm, shaderLabFx }) {
                 <label className="fx-control sl-color-row">
                     <span>${label}</span>
                     <input type="color" value=${value}
+                        onInput=${(e) => onChange(e.target.value)}
                         onChange=${(e) => onChange(e.target.value)} />
                 </label>
             `;
         }
 
-        if (typeof value === 'string' && PARAM_ENUMS[paramKey]) {
-            const options = PARAM_ENUMS[paramKey];
+        const enumOptions = typeof value === 'string' ? getParamEnum(layerType, paramKey) : null;
+        if (typeof value === 'string' && enumOptions) {
+            const options = enumOptions;
             const selected = options.includes(value) ? value : options[0];
             return html`
                 <label className="fx-control">
@@ -882,11 +1104,26 @@ function buildApp({ React, htm, shaderLabFx }) {
             `;
         }
 
+        if (typeof value === 'string' && /(?:code|sourceCode)$/i.test(paramKey)) {
+            return html`
+                <label className="fx-control">
+                    <div className="fx-control-head"><span>${label}</span></div>
+                    <textarea className="sl-params-editor sl-code-input"
+                        spellcheck=${false}
+                        rows=${6}
+                        value=${value}
+                        onInput=${(e) => onChange(e.target.value)}
+                        onChange=${(e) => onChange(e.target.value)} />
+                </label>
+            `;
+        }
+
         // Fallback: text input (free-form strings, unknown types, etc.)
         return html`
             <label className="fx-control">
                 <div className="fx-control-head"><span>${label}</span></div>
                 <input className="sl-text-input" type="text" value=${String(value ?? '')}
+                    onInput=${(e) => onChange(e.target.value)}
                     onChange=${(e) => onChange(e.target.value)} />
             </label>
         `;
@@ -895,7 +1132,7 @@ function buildApp({ React, htm, shaderLabFx }) {
     // Full params editor — auto-generates widgets for every key with a
     // "raw JSON" toggle for power users who want to paste shader-lab configs
     // directly or tweak keys we don't have defaults for.
-    function ParamsEditor({ value, defaults, onChange }) {
+    function ParamsEditor({ layerType, value, defaults, onChange }) {
         const [rawMode, setRawMode] = useState(false);
         const [text, setText] = useState(() => JSON.stringify(value ?? {}, null, 2));
         const [error, setError] = useState('');
@@ -952,6 +1189,7 @@ function buildApp({ React, htm, shaderLabFx }) {
                             : paramKeys.map(k => html`
                                 <${AutoParamControl}
                                     key=${k}
+                                    layerType=${layerType}
                                     paramKey=${k}
                                     value=${value[k]}
                                     defaultValue=${defaults?.[k]}
@@ -968,6 +1206,7 @@ function buildApp({ React, htm, shaderLabFx }) {
         const update = (patch) => onUpdate({ ...layer, ...patch });
         const isSource = layer.kind === 'source';
         const typeOptions = isSource ? SOURCE_TYPES : EFFECT_TYPES;
+        const showAsset = isSource && (layer.type === 'image' || layer.type === 'video');
 
         return html`
             <div className=${'sl-card' + (open ? ' expanded' : '')}>
@@ -992,10 +1231,28 @@ function buildApp({ React, htm, shaderLabFx }) {
                         <${FxSelect} label="Kind" value=${layer.kind} options=${['effect', 'source']}
                             onChange=${(v) => {
                                 const nextType = v === 'source' ? SOURCE_TYPES[0] : EFFECT_TYPES[0];
-                                update({ kind: v, type: nextType, params: defaultParamsFor(nextType) });
+                                const next = { kind: v, type: nextType, params: defaultParamsFor(nextType) };
+                                if (nextType === 'image' || nextType === 'video') next.asset = { kind: nextType, src: '' };
+                                else next.asset = undefined;
+                                update(next);
                             }} />
                         <${FxSelect} label="Type" value=${layer.type} options=${typeOptions}
-                            onChange=${(v) => update({ type: v, params: defaultParamsFor(v) })} />
+                            onChange=${(v) => {
+                                const next = { type: v, params: defaultParamsFor(v) };
+                                if (v === 'image' || v === 'video') next.asset = { kind: v, src: '' };
+                                else next.asset = undefined;
+                                update(next);
+                            }} />
+                        ${showAsset && html`
+                            <label className="fx-control">
+                                <div className="fx-control-head"><span>Asset URL</span></div>
+                                <input className="sl-text-input" type="text"
+                                    value=${layer.asset?.src || ''}
+                                    placeholder=${layer.type === 'image' ? 'image URL' : 'video URL'}
+                                    onInput=${(e) => update({ asset: { ...(layer.asset ?? {}), kind: layer.type, src: e.target.value } })}
+                                    onChange=${(e) => update({ asset: { ...(layer.asset ?? {}), kind: layer.type, src: e.target.value } })} />
+                            </label>
+                        `}
                         <${FxSlider} label="Opacity" value=${layer.opacity} min=${0} max=${1} step=${0.01}
                             onChange=${(v) => update({ opacity: v })} />
                         <${FxSlider} label="Hue" value=${layer.hue} min=${-180} max=${180} step=${1}
@@ -1007,7 +1264,7 @@ function buildApp({ React, htm, shaderLabFx }) {
                             onChange=${(v) => update({ blendMode: v })} />
                         <${FxSelect} label="Composite" value=${layer.compositeMode} options=${COMPOSITE_MODES}
                             onChange=${(v) => update({ compositeMode: v })} />
-                        <${ParamsEditor} value=${layer.params}
+                        <${ParamsEditor} layerType=${layer.type} value=${layer.params}
                             defaults=${DEFAULT_PARAMS[layer.type]}
                             onChange=${(v) => update({ params: v })} />
                         <div className="sl-row-actions">

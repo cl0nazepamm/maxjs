@@ -589,6 +589,8 @@ function createMaterialForRuntimeModel(runtimeModelName, params) {
             return new THREE.MeshPhongMaterial(params);
         case 'MeshToonMaterial':
             return new THREE.MeshToonMaterial(params);
+        case 'MeshSSSNodeMaterial':
+            return new THREE.MeshSSSNodeMaterial(params);
         case 'MeshPhysicalMaterial':
             return new THREE.MeshPhysicalMaterial(params);
         case 'MeshStandardMaterial':
@@ -1105,6 +1107,59 @@ export function createMaterialBuilder({ rootUrl = '.', bakeState = null, rendere
         }
     }
 
+    function getSSSRoughnessInfluence(roughness) {
+        const r = THREE.MathUtils.clamp(Number.isFinite(roughness) ? roughness : 0.5, 0, 1);
+        return {
+            attenuationScale: THREE.MathUtils.lerp(0.35, 1.0, r),
+            powerScale: THREE.MathUtils.lerp(1.6, 0.55, r),
+        };
+    }
+
+    function applySSSRoughnessInfluence(material, roughness) {
+        if (!material || material.type !== 'MeshSSSNodeMaterial') return;
+        const base = material.userData?.maxjsSSSBase || {};
+        const baseAttenuation = Number.isFinite(base.attenuation) ? base.attenuation : 0.1;
+        const basePower = Number.isFinite(base.power) ? base.power : 2.0;
+        const influence = getSSSRoughnessInfluence(roughness);
+        material.thicknessAttenuationNode = TSL.float(baseAttenuation * influence.attenuationScale);
+        material.thicknessPowerNode = TSL.float(Math.max(0.01, basePower * influence.powerScale));
+        material.needsUpdate = true;
+    }
+
+    function applySSSMaterialNodes(material, md, boundSlots) {
+        if (!material || material.type !== 'MeshSSSNodeMaterial') return;
+
+        let thicknessColorNode = TSL.color(colorFromArray(md?.sssColor, 0xffffff));
+        const { value: sssMapUrl } = firstField(md, ['sssMap', 'sssColorMap']);
+        if (sssMapUrl) {
+            const rawXf = firstTransform(md, ['sssMapXf', 'sssColorMapXf']);
+            const xf = optimizedTextureTransformForSlot('sssMap', rawXf);
+            const entry = loadTextureEntry(sssMapUrl, THREE.SRGBColorSpace, xf, fallbackTextures.whiteSrgb);
+            const assign = (texture) => {
+                if (!textureReadyForMaterialBinding(texture)) return;
+                thicknessColorNode = TSL.texture(texture).rgb.mul(TSL.color(colorFromArray(md?.sssColor, 0xffffff)));
+                material.thicknessColorNode = thicknessColorNode;
+                material.needsUpdate = true;
+            };
+            if (entry) {
+                assign(entry.texture);
+                if (!entry.loaded && !entry.failed) entry.callbacks.push(assign);
+                boundSlots?.push('thicknessColorNode');
+            }
+        }
+
+        material.thicknessColorNode = thicknessColorNode;
+        material.thicknessDistortionNode = TSL.float(md?.sssDistortion ?? 0.1);
+        material.thicknessAmbientNode = TSL.float(md?.sssAmbient ?? 0.0);
+        material.thicknessScaleNode = TSL.float(md?.sssScale ?? 10.0);
+        material.userData ??= {};
+        material.userData.maxjsSSSBase = {
+            attenuation: md?.sssAttenuation ?? 0.1,
+            power: md?.sssPower ?? 2.0,
+        };
+        applySSSRoughnessInfluence(material, md?.rough ?? material.roughness ?? 0.5);
+    }
+
     function createParams(md, info) {
         const params = {
             color: colorFromArray(md?.color),
@@ -1118,7 +1173,7 @@ export function createMaterialBuilder({ rootUrl = '.', bakeState = null, rendere
         ) {
             applyPbrScalarParams(params, md);
         }
-        if (info.runtimeModelName === 'MeshPhysicalMaterial') {
+        if (info.runtimeModelName === 'MeshPhysicalMaterial' || info.runtimeModelName === 'MeshSSSNodeMaterial') {
             applyPhysicalScalarParams(params, md);
         }
 
@@ -1183,8 +1238,11 @@ export function createMaterialBuilder({ rootUrl = '.', bakeState = null, rendere
             if (!info.wantsUtilityMaterial) {
                 bindSlots(material, descriptor, STANDARD_TEXTURE_SLOTS, boundSlots);
             }
-            if (info.runtimeModelName === 'MeshPhysicalMaterial') {
+            if (info.runtimeModelName === 'MeshPhysicalMaterial' || info.runtimeModelName === 'MeshSSSNodeMaterial') {
                 bindSlots(material, descriptor, PHYSICAL_TEXTURE_SLOTS, boundSlots);
+            }
+            if (info.runtimeModelName === 'MeshSSSNodeMaterial') {
+                applySSSMaterialNodes(material, descriptor, boundSlots);
             }
         }
 
@@ -1273,8 +1331,9 @@ export function createMaterialBuilder({ rootUrl = '.', bakeState = null, rendere
     // Lazily pull in the vendored tsl-textures preset library (WebGPU only).
     // snapshot_boot awaits this before applying the scene so preset materials
     // that reference the TEXTURES namespace compile correctly.
-    async function loadTslTextures() {
+    async function loadTslTextures({ required = true } = {}) {
         if (!tslCompiler.nodeMaterialsAvailable || tslCompiler.textures) return;
+        if (!required) return;
         try {
             const ns = await import('tsl-textures');
             tslCompiler.setTextures(ns);

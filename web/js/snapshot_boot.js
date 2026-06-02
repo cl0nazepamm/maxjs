@@ -594,23 +594,31 @@ function applySnapshotCameraClip(camera, cameraClip) {
 // ─── Phase 7: snapshotUi ───────────────────────────────────────────────
 // Honors the export-critical fields here:
 //   - tone mapping, exposure, and brightness/contrast on the renderer/canvas
-//   - background color on the scene
+//   - background: solid viewport color (Display → Background slot)
+//   - envVisible: show environment map on the viewport background (Environment btn)
 //   - basic camera position/target and user clip planes if present
 // Bake overrides are consumed by material_builder during scene.bin apply.
 // The deeper post stack and studio lighting are still intentionally out of
 // the lightweight snapshot boot path.
+export function applySnapshotSolidBackground(snapshotUi, scene) {
+    if (!snapshotUi || !scene) return;
+    // Environment map on the background wins when envVisible is true.
+    if (snapshotUi.envVisible === true && scene.background && !scene.background.isColor) {
+        return;
+    }
+    const bg = snapshotUi.background;
+    if (typeof bg === 'number') {
+        scene.background = new THREE.Color(bg >>> 0);
+    } else if (Array.isArray(bg) && bg.length >= 3) {
+        scene.background = new THREE.Color(bg[0], bg[1], bg[2]);
+    }
+}
+
 function applySnapshotUi(snapshotUi, ctx) {
     const { renderer, scene, camera, controls } = ctx;
 
     applySnapshotCoreLook(snapshotUi, { renderer });
-
-    // Background — accept hex int or [r,g,b]
-    const bg = snapshotUi.background;
-    if (typeof bg === 'number') {
-        scene.background = new THREE.Color(bg);
-    } else if (Array.isArray(bg) && bg.length === 3) {
-        scene.background = new THREE.Color(bg[0], bg[1], bg[2]);
-    }
+    applySnapshotSolidBackground(snapshotUi, scene);
 
     // Camera state — minimal subset; full applyStandaloneCameraState is bigger.
     const cam = snapshotUi.camera;
@@ -1007,9 +1015,10 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
     // Phase 7d: authored environment / HDRI.
     // Explicit only: no default sky is synthesized here.
     await snapshotEnvironment.apply(withSnapshotLinkedSkySun(meta.env, meta.lights), meta.snapshotUi);
-    // HDRI import can author renderer exposure; snapshot UI is the final
-    // artist look and must win for exported pages.
     if (meta.snapshotUi) {
+        applySnapshotSolidBackground(meta.snapshotUi, scene);
+        // HDRI import can author renderer exposure; snapshot UI is the final
+        // artist look and must win for exported pages.
         applySnapshotCoreLook(meta.snapshotUi, { renderer });
     }
     syncDefaultLights();
@@ -1102,11 +1111,8 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
             syncDefaultLights();
             return state;
         },
-        setEnvironmentVisible: (enabled) => {
-            const state = snapshotEnvironment.setEnabled(enabled);
-            syncDefaultLights();
-            return state;
-        },
+        setEnvironmentVisible: (visible) =>
+            snapshotEnvironment.setBackgroundVisible(visible),
         setEnvironmentBackgroundVisible: (visible) =>
             snapshotEnvironment.setBackgroundVisible(visible),
         dispose() {

@@ -840,10 +840,21 @@ export function createGeospatialSkyController({ scene, renderer, backendLabel = 
         state.fillLight = null;
     }
 
+    function setFallbackBackground(color) {
+        const hex = typeof color === 'number'
+            ? (color >>> 0)
+            : (color?.isColor ? color.getHex() : state.fallbackBackground);
+        state.fallbackBackground = hex;
+        if (state.active && !state.visible) {
+            state.scene.background = new THREE.Color(state.fallbackBackground);
+        }
+    }
+
     return {
         apply,
         update,
         setVisible,
+        setFallbackBackground,
         dispose,
         get active() { return state.active; },
     };

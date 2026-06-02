@@ -3397,7 +3397,6 @@ public:
         addIfEnabled(L"pixel", L"pixel");
         addIfEnabled(L"volumetric", L"volumetric");
         addIfEnabled(L"dof", L"dof");
-        addIfEnabled(L"opaqueBackdrop", L"opaque_backdrop");
         addIfEnabled(L"clone", L"clone_overlay");
         addIfEnabled(L"ascii", L"ascii");
     }

@@ -94,11 +94,10 @@ export function createMaxJSFxController({
     const supportsTslPostEffects = supportsScreenSpaceEffects;
     const SSR_REFERENCE_SIZE = 6.0;
     const hiddenBackground = new THREE.Color(hiddenBackgroundColor);
-    const hiddenBackgroundNode = vec3(hiddenBackground.r, hiddenBackground.g, hiddenBackground.b);
-
-    const opaqueBackdropRU = uniform(hiddenBackground.r);
-    const opaqueBackdropGU = uniform(hiddenBackground.g);
-    const opaqueBackdropBU = uniform(hiddenBackground.b);
+    const hiddenBackgroundRU = uniform(hiddenBackground.r);
+    const hiddenBackgroundGU = uniform(hiddenBackground.g);
+    const hiddenBackgroundBU = uniform(hiddenBackground.b);
+    const hiddenBackgroundNode = vec3(hiddenBackgroundRU, hiddenBackgroundGU, hiddenBackgroundBU);
 
     const colorGradingBrightnessU = uniform(0);
     const colorGradingContrastU = uniform(0);
@@ -254,12 +253,6 @@ export function createMaxJSFxController({
             focalLength: 50,
             bokehScale: 5,
         },
-        opaqueBackdrop: {
-            enabled: false,
-            red: hiddenBackground.r,
-            green: hiddenBackground.g,
-            blue: hiddenBackground.b,
-        },
         clone: {
             enabled: false,
             source: 'luma',          // 'luma', 'depth'
@@ -346,6 +339,25 @@ export function createMaxJSFxController({
 
     function isBloomActive() {
         return supportsTslPostEffects && !!state.bloom.enabled;
+    }
+
+    function syncHiddenBackgroundUniforms() {
+        hiddenBackgroundRU.value = hiddenBackground.r;
+        hiddenBackgroundGU.value = hiddenBackground.g;
+        hiddenBackgroundBU.value = hiddenBackground.b;
+    }
+
+    function setHiddenBackgroundColor(color) {
+        if (typeof color === 'number') {
+            hiddenBackground.setHex(color);
+        } else if (color?.isColor) {
+            hiddenBackground.copy(color);
+        } else {
+            return hiddenBackground.getHex();
+        }
+        syncHiddenBackgroundUniforms();
+        queuePipelineUpdate({ output: true });
+        return hiddenBackground.getHex();
     }
 
     function getShaderLabInputs() {
@@ -765,8 +777,7 @@ export function createMaxJSFxController({
             || isScreenSpaceActive('pixel')
             || isScreenSpaceActive('volumetric')
             || isScreenSpaceActive('dof')
-            || isScreenSpaceActive('fog')
-            || isScreenSpaceActive('opaqueBackdrop');
+            || isScreenSpaceActive('fog');
     }
 
     function hasAnyEffectEnabled() {
@@ -840,7 +851,6 @@ export function createMaxJSFxController({
             pixel: { ...state.pixel },
             volumetric: { ...state.volumetric },
             dof: { ...state.dof },
-            opaqueBackdrop: { ...state.opaqueBackdrop },
             clone: { ...state.clone, color: [...state.clone.color] },  // blob tracker (CPU-only, no GPU pipeline)
             colorGrading: { ...state.colorGrading },
         };
@@ -850,7 +860,7 @@ export function createMaxJSFxController({
         const keys = [
             'ssgi', 'ssr', 'gtao', 'motionBlur', 'traa', 'bloom',
             'toonOutline', 'contactShadow', 'retro', 'fog', 'pixel',
-            'volumetric', 'dof', 'opaqueBackdrop', 'clone', 'colorGrading',
+            'volumetric', 'dof', 'clone', 'colorGrading',
         ];
         for (const key of keys) {
             const source = fx[key];
@@ -866,6 +876,7 @@ export function createMaxJSFxController({
         if (Array.isArray(fx.clone?.color)) {
             state.clone.color = [...fx.clone.color];
         }
+        syncHiddenBackgroundUniforms();
         colorGradingBrightnessU.value = state.colorGrading.brightness;
         colorGradingContrastU.value = state.colorGrading.contrast;
         cleanupUnsupportedRealtimeResources();
@@ -1396,13 +1407,14 @@ export function createMaxJSFxController({
 
             // When HDRI is loaded but not shown as the viewport background, the scene pass still
             // sees environment in reflections; far-depth pixels must be normalized to hidden fill + a=0
-            // so SSR, fog (isBg), and opaque backdrop (mix) behave. This was SSR-only before, which
-            // broke fog / opaque backdrop whenever SSR was off.
+            // so SSR and fog (isBg) behave. This was SSR-only before, which broke fog whenever SSR was off.
             const hiddenEnvironmentBackdrop =
                 !!scene.environment && !environmentVisible;
             const useEnvironmentBackdropCompensation =
                 hiddenEnvironmentBackdrop
-                && (isSSRActive() || isScreenSpaceActive('fog') || isScreenSpaceActive('opaqueBackdrop'));
+                && (isSSRActive() || isScreenSpaceActive('fog'));
+            const backgroundFillNode = hiddenBackgroundNode;
+            const backgroundAlphaNode = float(0);
 
             let beauty;
             let scenePassNode = null;
@@ -1443,8 +1455,10 @@ export function createMaxJSFxController({
                     : pass(scene, camera);
                 activeNodes.push(scenePass);
                 scenePassNode = scenePass;
-                // Transparent pass + RGBA beauty so empty pixels stay a=0 (HTML/WebView2 backdrop + fog alpha comp)
-                scenePass.transparent = true;
+                // Opaque scene pass when the viewport shows a solid color background so
+                // scene.background updates apply immediately. Transparent when an
+                // environment/HDRI image is shown as the backdrop (WebView2 alpha).
+                scenePass.transparent = environmentVisible;
 
                 if (sceneContext) scenePass.contextNode = sceneContext;
 
@@ -1520,8 +1534,8 @@ export function createMaxJSFxController({
             if (useEnvironmentBackdropCompensation && scenePassDepth) {
                 const hasGeom = scenePassDepth.r.lessThan(float(0.999999));
                 beauty = vec4(
-                    hasGeom.select(beauty.rgb, hiddenBackgroundNode),
-                    hasGeom.select(beauty.a, float(0))
+                    hasGeom.select(beauty.rgb, backgroundFillNode),
+                    hasGeom.select(beauty.a, backgroundAlphaNode)
                 );
                 environmentBackdropCompensated = true;
             }
@@ -1715,8 +1729,8 @@ export function createMaxJSFxController({
             if (useEnvironmentBackdropCompensation && scenePassDepth && !environmentBackdropCompensated) {
                 const hasGeom = scenePassDepth.r.lessThan(float(0.999999));
                 beauty = vec4(
-                    hasGeom.select(beauty.rgb, hiddenBackgroundNode),
-                    hasGeom.select(beauty.a, float(0))
+                    hasGeom.select(beauty.rgb, backgroundFillNode),
+                    hasGeom.select(beauty.a, backgroundAlphaNode)
                 );
             }
 
@@ -1741,22 +1755,6 @@ export function createMaxJSFxController({
                 // Blend fog color over scene based on depth-computed alpha
                 const blended = beauty.rgb.mul(fogAlpha.oneMinus()).add(fogCol.mul(fogAlpha));
                 beauty = vec4(blended, max(beauty.a, fogAlpha));
-            }
-
-            // Opaque backdrop alpha mask: set background alpha=0 when env is visible (HDRI has alpha=1)
-            // Skip when fog is enabled (fog already set proper alpha) or when env compensation ran (already alpha=0)
-            if (isScreenSpaceActive('opaqueBackdrop') && scenePassDepth && !isScreenSpaceActive('fog') && !useEnvironmentBackdropCompensation) {
-                const hasGeom = scenePassDepth.r.lessThan(float(0.999999));
-                beauty = vec4(beauty.rgb, hasGeom.select(beauty.a, float(0)));
-            }
-
-            // Solid backdrop + force a=1 — straight-alpha composite (no transparent canvas / no SSR workaround)
-            if (isScreenSpaceActive('opaqueBackdrop')) {
-                opaqueBackdropRU.value = state.opaqueBackdrop.red;
-                opaqueBackdropGU.value = state.opaqueBackdrop.green;
-                opaqueBackdropBU.value = state.opaqueBackdrop.blue;
-                const solidBg = vec3(opaqueBackdropRU, opaqueBackdropGU, opaqueBackdropBU);
-                beauty = vec4(mix(solidBg, beauty.rgb, beauty.a), float(1));
             }
 
             postProcessing.outputNode = beauty;
@@ -2322,32 +2320,8 @@ export function createMaxJSFxController({
             rebuildPipeline();
         },
 
-        isOpaqueBackdropEnabled() {
-            return state.opaqueBackdrop.enabled;
-        },
-        setOpaqueBackdropEnabled(enabled) {
-            if (enabled && !supportsScreenSpaceEffects) {
-                lastError = 'Opaque backdrop requires WebGPU or TSL_GL';
-                onError(lastError);
-                state.opaqueBackdrop.enabled = true;
-                rebuildPipeline();
-                return false;
-            }
-            state.opaqueBackdrop.enabled = !!enabled;
-            rebuildPipeline();
-            return state.opaqueBackdrop.enabled;
-        },
-        setOpaqueBackdropOptions(options = {}) {
-            assignFinite(state.opaqueBackdrop, 'red', options.red);
-            assignFinite(state.opaqueBackdrop, 'green', options.green);
-            assignFinite(state.opaqueBackdrop, 'blue', options.blue);
-            opaqueBackdropRU.value = state.opaqueBackdrop.red;
-            opaqueBackdropGU.value = state.opaqueBackdrop.green;
-            opaqueBackdropBU.value = state.opaqueBackdrop.blue;
-            if (pipelineReady && state.opaqueBackdrop.enabled) {
-                postProcessing.needsUpdate = true;
-            }
-            return { ...state.opaqueBackdrop };
+        setHiddenBackgroundColor(color) {
+            return setHiddenBackgroundColor(color);
         },
 
         // ── Clone Blob Tracker ──

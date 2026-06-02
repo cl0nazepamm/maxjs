@@ -1555,6 +1555,24 @@ body.is-max-host .vpmenu-row.maxonly { display: flex !important; }
 /* Debug row stays hidden until the app un-hides #btnDebug (non-release). */
 .vpmenu-row-debug { display: none; }
 .vpmenu-row-debug:has(> #btnDebug:not([style*="none"])) { display: flex; }
+.vpmenu-row-bg-slot { cursor: default; }
+.vpmenu-row-bg-slot:hover { background: transparent; }
+.vpmenu-dropdown .rail-btn.vpmenu-bg-slot {
+    --vpmenu-bg-fill: #353535;
+}
+.vpmenu-bg-swatch-fill {
+    fill: var(--vpmenu-bg-fill, #353535);
+}
+.vpmenu-bg-color-input {
+    position: fixed;
+    left: -10000px;
+    width: 1px;
+    height: 1px;
+    opacity: 0;
+    pointer-events: none;
+    border: 0;
+    padding: 0;
+}
 
 /* Old rail buttons, re-laid-out as menu rows. */
 .vpmenu-dropdown .rail-btn {

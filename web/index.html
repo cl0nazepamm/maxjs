@@ -202,6 +202,15 @@
                     </button>
                     <span class="vpmenu-label">Light Helpers</span>
                 </div>
+                <div class="vpmenu-row vpmenu-row-bg-slot">
+                    <button type="button" class="rail-btn vpmenu-bg-slot" id="btnBackgroundColor" title="Background color" aria-label="Background color">
+                        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                            <rect class="vpmenu-bg-swatch-fill" x="3" y="5" width="10" height="8" rx="1.25" stroke="currentColor"/>
+                        </svg>
+                    </button>
+                    <input type="color" id="bgColorSlot" class="vpmenu-bg-color-input" value="#353535" tabindex="-1" aria-hidden="true">
+                    <span class="vpmenu-label">Background</span>
+                </div>
                 <div class="vpmenu-sep maxonly devonly"></div>
                 <div class="vpmenu-row maxonly devonly">
                     <button id="btnLiveSync" class="rail-btn rail-btn-text active" title="Live fast sync enabled" aria-label="Toggle sync mode">LIVE</button>
@@ -432,8 +441,40 @@
 
         const THEME_STORAGE_KEY = 'maxjs-theme';
         const AUDIO_MUTED_STORAGE_KEY = 'maxjs-audio-muted';
-        const DARK_BG = 0x353535;
-        const LIGHT_BG = 0x2a2a2a;
+        const BACKGROUND_COLOR_STORAGE_KEY = 'maxjs-background-color';
+        const DEFAULT_BACKGROUND_COLOR = 0x353535;
+        function hexColorInputValue(hex) {
+            return `#${(hex >>> 0).toString(16).padStart(6, '0')}`;
+        }
+        function parseHexColorInput(value) {
+            if (typeof value !== 'string' || !/^#[0-9a-fA-F]{6}$/.test(value)) return null;
+            return parseInt(value.slice(1), 16);
+        }
+        function readPersistedBackgroundColor() {
+            try {
+                const raw = localStorage.getItem(BACKGROUND_COLOR_STORAGE_KEY);
+                if (raw) {
+                    const value = Number(raw);
+                    if (Number.isFinite(value) && value >= 0 && value <= 0xffffff) {
+                        return value >>> 0;
+                    }
+                }
+                const legacy = localStorage.getItem('maxjs-bg-colors');
+                if (legacy) {
+                    const parsed = JSON.parse(legacy);
+                    const migrated = parsed?.custom ?? parsed?.dark ?? parsed?.light;
+                    if (Number.isFinite(migrated) && migrated >= 0 && migrated <= 0xffffff) {
+                        return migrated >>> 0;
+                    }
+                }
+            } catch { /* private mode / corrupt */ }
+            return DEFAULT_BACKGROUND_COLOR;
+        }
+        function saveBackgroundColor() {
+            try {
+                localStorage.setItem(BACKGROUND_COLOR_STORAGE_KEY, String(hiddenBackgroundColor));
+            } catch { /* private mode */ }
+        }
         function readPersistedLightMode() {
             try {
                 return localStorage.getItem(THEME_STORAGE_KEY) === 'light';
@@ -452,9 +493,10 @@
         document.body.classList.toggle('light-mode', lightMode);
 
         // ── Scene Setup (Y-up world + Max basis boundary) ───
-        let hiddenBackgroundColor = lightMode ? LIGHT_BG : DARK_BG;
+        let hiddenBackgroundColor = readPersistedBackgroundColor();
+        const viewportBackgroundColor = new THREE.Color(hiddenBackgroundColor);
         const scene = new THREE.Scene();
-        scene.background = new THREE.Color(hiddenBackgroundColor);
+        scene.background = viewportBackgroundColor;
         const maxBasisRoot = new THREE.Group();
         maxBasisRoot.name = '__maxjs_max_basis_root__';
         maxBasisRoot.rotation.x = -Math.PI / 2;
@@ -1028,6 +1070,74 @@
         });
         // Default camera light available for contact shadows from the start
         if (maxjsFx.setMainLight) maxjsFx.setMainLight(defaultKey);
+
+        function setBackgroundColor(hex = hiddenBackgroundColor) {
+            hiddenBackgroundColor = hex >>> 0;
+            viewportBackgroundColor.setHex(hiddenBackgroundColor);
+            const wasEnvironmentMapBackground = !!(scene.background && !scene.background.isColor);
+            scene.background = viewportBackgroundColor;
+            maxjsFx.setHiddenBackgroundColor(hiddenBackgroundColor);
+            geospatialSky?.setFallbackBackground?.(hiddenBackgroundColor);
+            if (wasEnvironmentMapBackground) {
+                maxjsFx.setEnvironmentVisible(false);
+            }
+            saveBackgroundColor();
+            syncBackgroundColorSlot();
+        }
+
+        function getEnvironmentBackgroundMap() {
+            if (isLocalHdriActive() && localHdriEnvMap) return localHdriEnvMap;
+            if (currentHdriEnvMap) return currentHdriEnvMap;
+            const bg = scene.environment;
+            return bg && !bg.isColor ? bg : null;
+        }
+
+        function syncEnvironmentDisplay() {
+            localHdriShowBg = envVisible;
+            const envMap = getEnvironmentBackgroundMap();
+            if (envVisible && envMap) {
+                scene.background = envMap;
+                if (isLocalHdriActive()) {
+                    scene.backgroundIntensity = localHdriIntensity;
+                    scene.userData.maxjsPathTraceBackground = localHdriRawTexture || null;
+                } else {
+                    scene.userData.maxjsPathTraceBackground = currentHdriRawTexture || null;
+                    if (localHdriBlur) scene.backgroundBlurriness = localHdriBlur;
+                }
+                maxjsFx.setEnvironmentVisible(true);
+            } else {
+                scene.background = viewportBackgroundColor;
+                if (!envVisible) scene.userData.maxjsPathTraceBackground = null;
+                maxjsFx.setEnvironmentVisible(false);
+            }
+            maxjsFx.markEnvironmentChanged?.();
+        }
+
+        function syncDefaultLightsVisibility() {
+            const environmentLightingActive = !!(
+                currentHdriUrl
+                || (isLocalHdriLoaded() && localHdriEnabled)
+                || skyActive
+            );
+            setDefaultLightsVisible(lightHandleMap.size === 0 && !environmentLightingActive);
+        }
+
+        function resetEnvironmentLighting({ restoreDefaultLights = true } = {}) {
+            if (lightProbeRefreshTimer) {
+                clearTimeout(lightProbeRefreshTimer);
+                lightProbeRefreshTimer = 0;
+            }
+            currentHdriProbeSignature = '';
+            hdriLoadGeneration += 1;
+            clearLightProbe();
+            markLightProbeSceneDirty();
+            markLightProbeMaterialsDirty();
+            if (restoreDefaultLights) {
+                syncDefaultLightsVisibility();
+            }
+            maxjsFx.markEnvironmentChanged?.();
+        }
+
         const webglBasicFx = createWebGLBasicFx({
             THREE: THREE_STD,
             renderer,
@@ -1439,7 +1549,7 @@
                 const oldEnvMap = currentHdriEnvMap;
                 currentHdriEnvMap = null;
                 if (scene.environment === oldEnvMap) scene.environment = null;
-                if (scene.background === oldEnvMap) scene.background = new THREE.Color(hiddenBackgroundColor);
+                if (scene.background === oldEnvMap) scene.background = viewportBackgroundColor;
                 oldEnvMap.dispose?.();
             }
             if (currentHdriRawTexture) {
@@ -1534,7 +1644,7 @@
             const oldSkyEnvMap = skyEnvMap;
             skyEnvMap = null;
             if (scene.environment === oldSkyEnvMap) scene.environment = null;
-            if (scene.background === oldSkyEnvMap) scene.background = new THREE.Color(hiddenBackgroundColor);
+            if (scene.background === oldSkyEnvMap) scene.background = viewportBackgroundColor;
             oldSkyEnvMap.dispose?.();
         }
 
@@ -2996,7 +3106,6 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 if (currentHdriRawTexture && currentHdriRawTexture !== hdrTex) currentHdriRawTexture.dispose?.();
                 currentHdriRawTexture = hdrTex;
                 scene.userData.maxjsPathTraceEnvironment = hdrTex;
-                scene.userData.maxjsPathTraceBackground = envVisible ? hdrTex : null;
                 const previousEnvMap = currentHdriEnvMap;
                 const envMap = isPathTracingMode
                     ? null
@@ -3004,9 +3113,9 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 currentHdriEnvMap = envMap;
                 scene.environment = envMap;
                 syncMaterialEnvMaps();
-                if (envVisible) scene.background = envMap || new THREE.Color(hiddenBackgroundColor);
+                syncEnvironmentDisplay();
                 if (previousEnvMap && previousEnvMap !== envMap) previousEnvMap.dispose?.();
-                setDefaultLightsVisible(false);
+                syncDefaultLightsVisibility();
                 if (lightProbeEnabled || shouldRefreshProbe) {
                     await updateLightProbeFromHDRI(hdrTex, probeSignature, loadGeneration);
                 }
@@ -3015,17 +3124,14 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             }, undefined, (error) => {
                 console.error('max.js HDRI load failed', { hdriUrl, error });
                 currentHdriUrl = null;
-                currentHdriProbeSignature = null;
                 currentEnvParams = null;
                 clearCurrentHdriEnvMap();
                 scene.environment = null;
                 scene.userData.maxjsPathTraceEnvironment = null;
                 scene.userData.maxjsPathTraceBackground = null;
                 syncMaterialEnvMaps();
-                clearLightProbe();
-                if (envVisible) scene.background = new THREE.Color(hiddenBackgroundColor);
-                setDefaultLightsVisible(true);
-                maxjsFx.markEnvironmentChanged?.();
+                syncEnvironmentDisplay();
+                resetEnvironmentLighting();
                 syncHdriPanel();
             });
         }
@@ -3126,10 +3232,8 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             }
             if (!localHdriEnvMap && !localHdriRawTexture) return;
             if (localHdriEnabled) {
-                localHdriShowBg = envVisible;
                 scene.environment = localHdriEnvMap;
                 scene.userData.maxjsPathTraceEnvironment = localHdriRawTexture || null;
-                scene.userData.maxjsPathTraceBackground = localHdriShowBg ? (localHdriRawTexture || null) : null;
                 syncMaterialEnvMaps();
                 scene.environmentIntensity = localHdriIntensity;
                 const rot = localHdriRotation * Math.PI / 180;
@@ -3140,20 +3244,16 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     scene.backgroundRotation.y += Math.PI;
                 }
                 scene.backgroundBlurriness = localHdriBlur;
-                if (localHdriShowBg) {
-                    scene.background = localHdriEnvMap || new THREE.Color(hiddenBackgroundColor);
-                    scene.backgroundIntensity = localHdriIntensity;
-                } else {
-                    scene.background = new THREE.Color(hiddenBackgroundColor);
-                }
-                setDefaultLightsVisible(false);
+                syncEnvironmentDisplay();
+                syncDefaultLightsVisibility();
             } else {
                 scene.environment = null;
                 scene.userData.maxjsPathTraceEnvironment = currentHdriRawTexture || null;
                 scene.userData.maxjsPathTraceBackground = null;
                 syncMaterialEnvMaps();
-                scene.background = new THREE.Color(hiddenBackgroundColor);
-                setDefaultLightsVisible(true);
+                setBackgroundColor(hiddenBackgroundColor);
+                maxjsFx.setEnvironmentVisible(false);
+                resetEnvironmentLighting();
             }
         }
 
@@ -3202,10 +3302,8 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             scene.environmentRotation.set(0, 0, 0);
             scene.backgroundRotation.set(0, 0, 0);
             scene.backgroundBlurriness = 0;
-            scene.background = new THREE.Color(hiddenBackgroundColor);
-            clearLightProbe();
-            setDefaultLightsVisible(true);
-            maxjsFx.markEnvironmentChanged?.();
+            syncEnvironmentDisplay();
+            resetEnvironmentLighting();
             savePostFxState();
             syncHdriPanel();
         }
@@ -3453,7 +3551,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
 
                     geospatialSky.apply(params, { camera });
                     applyCoreToneMappingState({ markOutput: false });
-                    setDefaultLightsVisible(false);
+                    syncDefaultLightsVisibility();
                     clearLightProbe();
                     hasLightProbeData = true;
                     skyActive = true;
@@ -3508,7 +3606,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 // canvas is alpha-enabled and post-FX can render transparent
                 // scene passes; a null background can leave previous pixels
                 // behind when switching the sky material on/off.
-                scene.background = new THREE.Color(hiddenBackgroundColor);
+                scene.background = viewportBackgroundColor;
                 updateSkyReflectionEnvironment(params, sunDir);
                 updateSkyPathTraceEnvironment(params, sunDir);
                 scene.environmentRotation.set(0, 0, 0);
@@ -3536,7 +3634,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 if (skyFillLight.parent !== scene) scene.add(skyFillLight);
                 skyFillLight.intensity = 0.5 + sunStrength * 0.5;
 
-                setDefaultLightsVisible(false);
+                syncDefaultLightsVisibility();
                 updateSkyAmbientLightProbe(params, sunDir);
                 skyActive = true;
 
@@ -3604,9 +3702,8 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             scene.environmentRotation.set(0, 0, 0);
             scene.backgroundRotation.set(0, 0, 0);
             scene.backgroundBlurriness = 0;
-            scene.background = new THREE.Color(hiddenBackgroundColor);
-            clearLightProbe();
-            setDefaultLightsVisible(lightHandleMap.size === 0);
+            syncEnvironmentDisplay();
+            resetEnvironmentLighting();
             if (isLocalHdriLoaded()) {
                 applyLocalHDRIToScene();
             }
@@ -4760,14 +4857,14 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 motionBlur: maxjsFx.isMotionBlurEnabled(), traa: maxjsFx.isTRAAEnabled(),
                 contactShadow: maxjsFx.isContactShadowEnabled(), retro: maxjsFx.isRetroEnabled(),
                 volumetric: maxjsFx.isVolumetricEnabled(), pixel: maxjsFx.isPixelEnabled(),
-                fog: maxjsFx.isFogEnabled(), opaqueBackdrop: maxjsFx.isOpaqueBackdropEnabled(),
+                fog: maxjsFx.isFogEnabled(),
             };
             maxjsFx.setEnabled(false); maxjsFx.setSSREnabled(false); maxjsFx.setGTAOEnabled(false);
             maxjsFx.setBloomEnabled(false); maxjsFx.setToonOutlineEnabled(false);
             maxjsFx.setMotionBlurEnabled(false); maxjsFx.setTRAAEnabled(false);
             maxjsFx.setContactShadowEnabled(false); maxjsFx.setRetroEnabled(false);
             maxjsFx.setVolumetricEnabled(false); maxjsFx.setPixelEnabled(false);
-            maxjsFx.setFogEnabled(false); maxjsFx.setOpaqueBackdropEnabled(false);
+            maxjsFx.setFogEnabled(false);
             rebuildAsciiEffect();
             asciiActive = true;
             renderer.domElement.style.display = 'none';
@@ -4787,8 +4884,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 maxjsFx.setToonOutlineEnabled(s.toonOutline); maxjsFx.setMotionBlurEnabled(s.motionBlur);
                 maxjsFx.setTRAAEnabled(s.traa); maxjsFx.setContactShadowEnabled(s.contactShadow);
                 maxjsFx.setRetroEnabled(s.retro); maxjsFx.setVolumetricEnabled(s.volumetric);
-                maxjsFx.setPixelEnabled(s.pixel); maxjsFx.setFogEnabled(s.fog);
-                maxjsFx.setOpaqueBackdropEnabled(s.opaqueBackdrop);
+                maxjsFx.setPixelEnabled(s.pixel);                 maxjsFx.setFogEnabled(s.fog);
                 asciiPreFxSnapshot = null;
             }
             syncPostFxPanel(true);
@@ -4826,7 +4922,6 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     volumetric: maxjsFx.isVolumetricEnabled(),
                     pixel: maxjsFx.isPixelEnabled(),
                     fog: maxjsFx.isFogEnabled(),
-                    opaqueBackdrop: maxjsFx.isOpaqueBackdropEnabled(),
                     clone: maxjsFx.isCloneEnabled(),
                 };
                 // Disable everything
@@ -4842,7 +4937,6 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 maxjsFx.setVolumetricEnabled(false);
                 maxjsFx.setPixelEnabled(false);
                 maxjsFx.setFogEnabled(false);
-                maxjsFx.setOpaqueBackdropEnabled(false);
                 maxjsFx.setGTAOEnabled(false);
             }
             if (maxjsFx.setClayOverride) maxjsFx.setClayOverride(true);
@@ -4871,7 +4965,6 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 maxjsFx.setVolumetricEnabled(clayPreFxSnapshot.volumetric);
                 maxjsFx.setPixelEnabled(clayPreFxSnapshot.pixel);
                 maxjsFx.setFogEnabled(clayPreFxSnapshot.fog);
-                maxjsFx.setOpaqueBackdropEnabled(clayPreFxSnapshot.opaqueBackdrop);
                 maxjsFx.setCloneEnabled(clayPreFxSnapshot.clone);
                 clayPreFxSnapshot = null;
             }
@@ -7268,7 +7361,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 }
             }
 
-            setDefaultLightsVisible(appliedLightCount === 0 && !currentHdriUrl && !skyActive);
+            syncDefaultLightsVisibility();
             if (maxjsFx.setMainLight) {
                 maxjsFx.setMainLight(mainDirectionalLight || (defaultLights.visible ? defaultKey : null));
             }
@@ -9574,7 +9667,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 }
             }
 
-            setDefaultLightsVisible(appliedLightCount === 0 && !currentHdriUrl && !skyActive);
+            syncDefaultLightsVisibility();
             if (maxjsFx.setMainLight) {
                 maxjsFx.setMainLight(mainDirectionalLight || (defaultLights.visible ? defaultKey : null));
             }
@@ -9625,9 +9718,9 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             const el = document.getElementById('btnEnv');
             if (!el) return;
             el.classList.toggle('active', envVisible);
-            el.title = envVisible ? 'Environment background visible' : 'Environment background hidden';
+            el.title = envVisible ? 'Environment map visible' : 'Environment map hidden';
             el.setAttribute('aria-pressed', envVisible ? 'true' : 'false');
-            el.setAttribute('aria-label', envVisible ? 'Environment visible' : 'Environment hidden');
+            el.setAttribute('aria-label', envVisible ? 'Environment map visible' : 'Environment map hidden');
         }
 
         function applyLayerCameraMode(mode, options = {}) {
@@ -10223,15 +10316,10 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         btnEnv.onclick = () => {
             envVisible = !envVisible;
             syncEnvButtonUi();
-            maxjsFx.setEnvironmentVisible(envVisible);
             if (isLocalHdriActive()) {
-                localHdriShowBg = envVisible;
                 applyLocalHDRIToScene();
             } else {
-                scene.background = envVisible && scene.environment
-                    ? scene.environment : new THREE.Color(hiddenBackgroundColor);
-                scene.userData.maxjsPathTraceBackground = envVisible ? (currentHdriRawTexture || null) : null;
-                if (envVisible) scene.backgroundBlurriness = localHdriBlur;
+                syncEnvironmentDisplay();
             }
             savePostFxState();
         };
@@ -10490,6 +10578,14 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         }
         syncStudioOnlyUi();
 
+        function syncBackgroundColorSlot() {
+            const input = document.getElementById('bgColorSlot');
+            const btn = document.getElementById('btnBackgroundColor');
+            const hex = hexColorInputValue(hiddenBackgroundColor);
+            if (input) input.value = hex;
+            if (btn) btn.style.setProperty('--vpmenu-bg-fill', hex);
+        }
+
         // ── Theme Toggle ─────────────────────────────────
         // Icon swap is CSS-driven (body.light-mode toggles .icon-moon / .icon-sun)
         const btnMuteAudio = document.getElementById('btnMuteAudio');
@@ -10502,16 +10598,28 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         btnTheme.onclick = () => {
             lightMode = !lightMode;
             document.body.classList.toggle('light-mode', lightMode);
-            hiddenBackgroundColor = lightMode ? LIGHT_BG : DARK_BG;
             try {
                 localStorage.setItem(THEME_STORAGE_KEY, lightMode ? 'light' : 'dark');
             } catch (e) { /* private mode */ }
-            const bgColor = new THREE.Color(hiddenBackgroundColor);
-            if (!envVisible && !isLocalHdriActive()) {
-                scene.background = bgColor;
-            }
-            maxjsFx.setOpaqueBackdropOptions({ red: bgColor.r, green: bgColor.g, blue: bgColor.b });
         };
+
+        const btnBackgroundColor = document.getElementById('btnBackgroundColor');
+        const bgColorSlotInput = document.getElementById('bgColorSlot');
+        btnBackgroundColor?.addEventListener('click', () => {
+            if (typeof bgColorSlotInput?.showPicker === 'function') {
+                try {
+                    bgColorSlotInput.showPicker();
+                    return;
+                } catch { /* fallback below */ }
+            }
+            bgColorSlotInput?.click();
+        });
+        bgColorSlotInput?.addEventListener('input', () => {
+            const next = parseHexColorInput(bgColorSlotInput.value);
+            if (next == null) return;
+            setBackgroundColor(next);
+        });
+        syncBackgroundColorSlot();
 
         // Toon outline is automatic — no UI button needed
 
@@ -11126,22 +11234,6 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     { key: 'height', label: 'Height', min: 0, max: 9999, step: 1 },
                 ],
             },
-            {
-                key: 'opaqueBackdrop',
-                title: 'Opaque backdrop',
-                copy: 'Composite the frame onto a solid color and force alpha to 1. Use with fog without enabling SSR.',
-                note: 'Requires WebGPU or Force WebGL. Linear RGB (0–1). Matches viewport “empty” look when set to your scene background color.',
-                requiresWebGPU: true,
-                isEnabled: () => maxjsFx.isOpaqueBackdropEnabled(),
-                setEnabled: (enabled) => maxjsFx.setOpaqueBackdropEnabled(enabled),
-                getValues: (state) => state.opaqueBackdrop,
-                setValues: (patch) => maxjsFx.setOpaqueBackdropOptions(patch),
-                controls: [
-                    { key: 'red', label: 'Red', min: 0, max: 1, step: 0.01 },
-                    { key: 'green', label: 'Green', min: 0, max: 1, step: 0.01 },
-                    { key: 'blue', label: 'Blue', min: 0, max: 1, step: 0.01 },
-                ],
-            },
         ];
 
         function formatControlValue(control, value) {
@@ -11485,16 +11577,12 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     volumetric: { intensity: 1.0, steps: 12, density: 0.5, denoise: 0.6, resolution: 0.25 },
                     pixel: { pixelate: false, pixelSize: 4, chromatic: false, chromaticIntensity: 0.005, sharpen: false, sharpenStrength: 0.5, grain: false, grainIntensity: 0.08, brightness: 0, contrast: 0, saturation: 0 },
                     fog: { type: 0, opacity: 1.0, near: 10, far: 500, density: 0.01, noiseScale: 0.005, noiseSpeed: 0.2, height: 20 },
-                    opaqueBackdrop: (() => {
-                        const c = new THREE.Color(hiddenBackgroundColor);
-                        return { red: c.r, green: c.g, blue: c.b };
-                    })(),
                 };
                 if (clayModeActive) {
                     // Clay owns the live FX state — reset the snapshot so exit restores to defaults
                     clayPreFxSnapshot = { ssgi: false, ssr: false, gtao: false, bloom: false,
                         toonOutline: false, motionBlur: false, traa: false, contactShadow: false,
-                        retro: false, volumetric: false, pixel: false, fog: false, opaqueBackdrop: false, clone: false };
+                        retro: false, volumetric: false, pixel: false, fog: false, clone: false };
                     // Still push default values so they're ready when clay exits
                     for (const section of postFxSections) {
                         if (defaults[section.key]) section.setValues(defaults[section.key]);
@@ -12103,13 +12191,15 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 envVisible,
                 camLock,
                 lightProbeEnabled,
+                lightMode,
+                background: hiddenBackgroundColor,
                 fx: maxjsFx.getState(),
                 webglBasicFx: webglBasicFx.getState?.(),
                 camera: serializeCurrentCameraState(),
                 hdri: {
                     rotation: localHdriRotation,
                     intensity: localHdriIntensity,
-                    showBg: localHdriShowBg,
+                    showBg: envVisible,
                     blur: localHdriBlur,
                     flip: localHdriFlip,
                     enabled: authoredEnvironmentActive ? false : localHdriEnabled,
@@ -12222,6 +12312,16 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     applyLightProbeState();
                     if (lightProbeEnabled) refreshLightProbeFromCurrentHDRI();
                 }
+                if (typeof saved.lightMode === 'boolean') {
+                    lightMode = saved.lightMode;
+                    document.body.classList.toggle('light-mode', lightMode);
+                }
+                if (Number.isFinite(saved.background)) {
+                    setBackgroundColor(saved.background >>> 0);
+                } else if (saved.backgroundPresets && typeof saved.backgroundPresets === 'object') {
+                    const legacy = saved.backgroundPresets.custom ?? saved.backgroundPresets.dark ?? saved.backgroundPresets.light;
+                    if (Number.isFinite(legacy)) setBackgroundColor(legacy >>> 0);
+                }
 
                 // Restore HDRI settings (file must be re-picked, but sliders persist)
                 if (saved.hdri) {
@@ -12261,10 +12361,12 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     }
                     applyRendererPerformanceSettings({ resizePostFx: true });
                 }
-                localHdriShowBg = envVisible;
-
                 syncEnvButtonUi();
-                maxjsFx.setEnvironmentVisible(envVisible);
+                if (isLocalHdriActive()) {
+                    applyLocalHDRIToScene();
+                } else {
+                    syncEnvironmentDisplay();
+                }
 
                 const fx = saved.fx;
                 if (!fx) return;
@@ -13044,7 +13146,6 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             savedRenderToImageState = {
                 envVisible,
                 localHdriShowBg,
-                opaqueBackdropEnabled: maxjsFx.isOpaqueBackdropEnabled(),
                 playbackState: animationSystem?.capturePlaybackState?.() ?? null,
             };
 
@@ -13052,9 +13153,6 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             envVisible = false;
             localHdriShowBg = false;
             maxjsFx.setEnvironmentVisible(false);
-            if (savedRenderToImageState.opaqueBackdropEnabled) {
-                maxjsFx.setOpaqueBackdropEnabled(false);
-            }
             scene.background = null;
             if (pendingRenderToImage.pathTracing) {
                 resetPathTracingStartupWarmup();
@@ -13115,17 +13213,13 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             if (savedRenderToImageState) {
                 envVisible = savedRenderToImageState.envVisible;
                 localHdriShowBg = savedRenderToImageState.localHdriShowBg;
-                maxjsFx.setEnvironmentVisible(envVisible);
-                maxjsFx.setOpaqueBackdropEnabled(savedRenderToImageState.opaqueBackdropEnabled);
                 animationSystem?.restorePlaybackState?.(savedRenderToImageState.playbackState);
                 savedRenderToImageState = null;
                 syncEnvButtonUi();
                 if (isLocalHdriActive()) {
                     applyLocalHDRIToScene();
                 } else {
-                    scene.background = envVisible && scene.environment
-                        ? scene.environment : new THREE.Color(hiddenBackgroundColor);
-                    if (envVisible) scene.backgroundBlurriness = localHdriBlur;
+                    syncEnvironmentDisplay();
                 }
             }
             camera.aspect = innerWidth / innerHeight;

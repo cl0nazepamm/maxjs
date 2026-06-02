@@ -145,9 +145,9 @@ function normalizeEnv(env, snapshotUi) {
             },
             type: 'hdri',
             enabled: true,
-            backgroundVisible: typeof uiHdri.showBg === 'boolean'
-                ? uiHdri.showBg
-                : (typeof snapshotUi?.envVisible === 'boolean' ? snapshotUi.envVisible : false),
+            backgroundVisible: typeof snapshotUi?.envVisible === 'boolean'
+                ? snapshotUi.envVisible
+                : (typeof uiHdri.showBg === 'boolean' ? uiHdri.showBg : false),
             source: uiHdriSource,
         };
     }
@@ -306,12 +306,28 @@ export function createSnapshotEnvironment({ scene, renderer, rootUrl = '.' } = {
         current = {
             type: 'sky',
             enabled: !!params.enabled,
-            backgroundVisible: !!params.enabled,
+            backgroundVisible: !!params.backgroundVisible,
             source: null,
             active: !!params.enabled,
             error: null,
         };
+        if (!params.backgroundVisible) {
+            restoreBackground();
+        }
         return getState();
+    }
+
+    function applySnapshotSolidBackgroundFromUi(snapshotUi) {
+        if (!snapshotUi) return;
+        const bg = snapshotUi.background;
+        if (typeof bg === 'number') {
+            fallbackBackground = new THREE.Color(bg >>> 0);
+        } else if (Array.isArray(bg) && bg.length >= 3) {
+            fallbackBackground = new THREE.Color(bg[0], bg[1], bg[2]);
+        }
+        if (!current.backgroundVisible) {
+            scene.background = cloneBackground(fallbackBackground);
+        }
     }
 
     async function apply(env, snapshotUi = null) {
@@ -319,11 +335,17 @@ export function createSnapshotEnvironment({ scene, renderer, rootUrl = '.' } = {
         const params = normalizeEnv(env, snapshotUi);
 
         try {
+            let result;
             if (params.type === 'sky' && params.raw?.sky) {
-                return await applySky(params);
+                result = await applySky(params);
+            } else if (params.type === 'hdri' && params.source) {
+                result = await applyHdri(params);
+            } else {
+                result = null;
             }
-            if (params.type === 'hdri' && params.source) {
-                return await applyHdri(params);
+            if (result) {
+                applySnapshotSolidBackgroundFromUi(snapshotUi);
+                return result;
             }
         } catch (error) {
             console.error('[snapshot_environment] apply failed:', error);
@@ -338,6 +360,7 @@ export function createSnapshotEnvironment({ scene, renderer, rootUrl = '.' } = {
                 active: false,
                 error: error?.message || String(error),
             };
+            applySnapshotSolidBackgroundFromUi(snapshotUi);
             return getState();
         }
 
@@ -353,6 +376,7 @@ export function createSnapshotEnvironment({ scene, renderer, rootUrl = '.' } = {
             active: false,
             error: null,
         };
+        applySnapshotSolidBackgroundFromUi(snapshotUi);
         return getState();
     }
 

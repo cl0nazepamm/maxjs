@@ -3,7 +3,8 @@
 // The main render loop routes through the MaxJS FX controller. When Shader Lab
 // is enabled, MaxJS FX renders its native stack to a texture and lets this module
 // consume that texture as a final custom pass. This keeps SSGI / SSR / GTAO /
-// bloom / DOF / tone output in front of Shader Lab instead of bypassing it.
+// bloom / DOF in front of Shader Lab, then lets the final screen blit apply
+// the renderer's output tonemapping once.
 //
 // shader-lab is React-only (useShaderLab hook) so we spin up a hidden
 // React root whose sole purpose is to hold the hook instance and hand
@@ -144,7 +145,6 @@ export function createShaderLabFx({ THREE, renderer, scene, camera }) {
     let displayQuad = null;
     let currentConfig = DEFAULT_COMPOSITION;
     let currentPasses = [{ ...DEFAULT_PASS }];
-    let configKey = 0;
     let errorText = '';
     let loading = false;
 
@@ -175,7 +175,7 @@ export function createShaderLabFx({ THREE, renderer, scene, camera }) {
             map: null,
             depthTest: false,
             depthWrite: false,
-            toneMapped: false,
+            toneMapped: true,
             side: THREE.DoubleSide,
         });
         const geom = new THREE.PlaneGeometry(2, 2);
@@ -252,6 +252,11 @@ export function createShaderLabFx({ THREE, renderer, scene, camera }) {
         return getUnavailableReason({ color: true, slot: 'finalStylize', ...inputs }) === '';
     }
 
+    function renderBridge() {
+        if (!enabled || !_React || !reactRoot || !BridgeComponent) return;
+        reactRoot.render(_React.createElement(BridgeComponent, { config: currentConfig }));
+    }
+
     async function enable(configOrState) {
         if (enabled) return;
         if (loading) return;
@@ -267,7 +272,6 @@ export function createShaderLabFx({ THREE, renderer, scene, camera }) {
                 enabled: pass.enabled || pass.id === 'legacy-main',
                 config: pass.config || normalized.config,
             }));
-            configKey++;
             ensureDisplayQuad();
 
             BridgeComponent = function Bridge({ config: cfg }) {
@@ -292,7 +296,7 @@ export function createShaderLabFx({ THREE, renderer, scene, camera }) {
             hiddenDiv.setAttribute('aria-hidden', 'true');
             document.body.appendChild(hiddenDiv);
             reactRoot = ReactDOMClient.createRoot(hiddenDiv);
-            reactRoot.render(React.createElement(BridgeComponent, { config: currentConfig, key: configKey }));
+            reactRoot.render(React.createElement(BridgeComponent, { config: currentConfig }));
 
             enabled = true;
             currentPasses = currentPasses.map(pass =>
@@ -331,9 +335,7 @@ export function createShaderLabFx({ THREE, renderer, scene, camera }) {
                 ? { ...pass, config: currentConfig }
                 : pass
         );
-        if (!enabled || !_React || !reactRoot) return;
-        configKey++;
-        reactRoot.render(_React.createElement(BridgeComponent, { config: currentConfig, key: configKey }));
+        renderBridge();
     }
 
     function setPasses(passes) {
@@ -342,7 +344,7 @@ export function createShaderLabFx({ THREE, renderer, scene, camera }) {
         const finalPass = getActivePass('finalStylize') || currentPasses.find(pass => pass.slot === 'finalStylize');
         if (finalPass?.config) {
             currentConfig = finalPass.config;
-            void setConfig(currentConfig);
+            renderBridge();
         }
     }
 
@@ -358,9 +360,7 @@ export function createShaderLabFx({ THREE, renderer, scene, camera }) {
         const normalized = normalizeState(snapshot, currentConfig);
         currentConfig = normalized.config;
         currentPasses = normalized.passes;
-        if (enabled && _React && reactRoot) {
-            void setConfig(currentConfig);
-        }
+        renderBridge();
     }
 
     // Integrated render path. MaxJS FX owns the native render stack and passes
@@ -379,6 +379,22 @@ export function createShaderLabFx({ THREE, renderer, scene, camera }) {
         return true;
     }
 
+    function renderWithoutOutputToneMapping(fn) {
+        const previousToneMapping = renderer.toneMapping;
+        const previousExposure = renderer.toneMappingExposure;
+        const previousOutputColorSpace = renderer.outputColorSpace;
+        try {
+            renderer.toneMapping = THREE.NoToneMapping;
+            renderer.toneMappingExposure = 1.0;
+            renderer.outputColorSpace = THREE.LinearSRGBColorSpace;
+            return fn();
+        } finally {
+            renderer.toneMapping = previousToneMapping;
+            renderer.toneMappingExposure = previousExposure;
+            renderer.outputColorSpace = previousOutputColorSpace;
+        }
+    }
+
     function renderTexture(inputTexture, elapsedTime, delta, options = {}) {
         const inputs = { color: true, slot: 'finalStylize', ...(options.inputs || {}) };
         const unavailable = getUnavailableReason(inputs);
@@ -390,10 +406,12 @@ export function createShaderLabFx({ THREE, renderer, scene, camera }) {
             return blitTexture(inputTexture, options.outputTarget || null);
         }
         try {
-            const output = postprocessing.render(
-                inputTexture,
-                elapsedTime,
-                delta
+            const output = renderWithoutOutputToneMapping(() =>
+                postprocessing.render(
+                    inputTexture,
+                    elapsedTime,
+                    delta
+                )
             );
 
             const outputTex = output?.isTexture ? output : output?.texture ?? output;

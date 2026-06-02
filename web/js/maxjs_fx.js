@@ -988,15 +988,24 @@ export function createMaxJSFxController({
         if (!hasShaderLabPassEnabled()) return false;
         const target = ensureShaderLabInputTarget();
         const previousTarget = renderer.getRenderTarget?.() || null;
+        const previousToneMapping = renderer.toneMapping;
+        const previousExposure = renderer.toneMappingExposure;
+        const previousOutputColorSpace = renderer.outputColorSpace;
         const now = performance.now() * 0.001;
         const delta = lastShaderLabFrameTime > 0 ? now - lastShaderLabFrameTime : 0;
         lastShaderLabFrameTime = now;
 
         try {
+            renderer.toneMapping = THREE.NoToneMapping;
+            renderer.toneMappingExposure = 1.0;
+            renderer.outputColorSpace = THREE.LinearSRGBColorSpace;
             renderer.setRenderTarget(target);
             renderNativeToCurrentTarget();
         } finally {
             renderer.setRenderTarget(previousTarget);
+            renderer.toneMapping = previousToneMapping;
+            renderer.toneMappingExposure = previousExposure;
+            renderer.outputColorSpace = previousOutputColorSpace;
         }
 
         return activeShaderLabFx.renderTexture?.(target.texture, now, delta, {

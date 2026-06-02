@@ -1,6 +1,6 @@
 // Shader Lab configurator panel — final custom-pass editor for the
 // shader-lab post-fx pipeline. React + htm UI mounted into the side
-// panel, drives shaderLabFx via setConfig() with auto-debounced apply.
+// panel, drives shaderLabFx through a single live state pipe.
 //
 // Visual style reuses MaxJS's existing .fx-control / .fx-range / .fx-check
 // classes so it matches the rest of the panels (no blue native sliders).
@@ -295,6 +295,20 @@ function normalizeShaderLabPasses(snapshot, config) {
             config: normalizeConfig(source.config || config),
         };
     });
+}
+
+function buildShaderLabRuntimeState(config, enabled, autoApply, baseSnapshot = _storeSnapshot) {
+    const passes = normalizeShaderLabPasses({ ...baseSnapshot, enabled }, config).map(pass =>
+        pass.id === 'legacy-main' || pass.slot === 'finalStylize'
+            ? { ...pass, config, enabled: !!enabled }
+            : pass
+    );
+    return {
+        config,
+        autoApply,
+        enabled: !!enabled,
+        passes,
+    };
 }
 
 export function setShaderLabSnapshot(snapshot) {
@@ -1019,7 +1033,8 @@ function buildApp({ React, htm, shaderLabFx }) {
         const [statusColor, setStatusColor] = useState('#777');
         const [autoApply, setAutoApply] = useState(() => _storeSnapshot.autoApply);
         const [addType, setAddType] = useState(EFFECT_TYPES[0]);
-        const debounceTimer = useRef(0);
+        const applyFrame = useRef(0);
+        const lastAppliedSignature = useRef('');
 
         // Mirror React state → module store, notify host on every change so
         // persistence lands in project.maxjs.json (or localStorage fallback)
@@ -1027,12 +1042,7 @@ function buildApp({ React, htm, shaderLabFx }) {
         // replace so fields tracked outside React (currently `enabled`,
         // which is driven by shaderLabFx event, not by the panel) survive.
         useEffect(() => {
-            const passes = normalizeShaderLabPasses(_storeSnapshot, config).map(pass =>
-                pass.id === 'legacy-main' || pass.slot === 'finalStylize'
-                    ? { ...pass, config, enabled: _storeSnapshot.enabled }
-                    : pass
-            );
-            _storeSnapshot = { ..._storeSnapshot, config, autoApply, passes };
+            _storeSnapshot = buildShaderLabRuntimeState(config, _storeSnapshot.enabled, autoApply);
             if (_storeChangeHandler) _storeChangeHandler(_storeSnapshot);
         }, [config, autoApply]);
 
@@ -1065,27 +1075,40 @@ function buildApp({ React, htm, shaderLabFx }) {
             return () => window.removeEventListener('maxjs-shader-lab-state', onChange);
         }, []);
 
-        const applyNow = useCallback(async (cfg) => {
+        const applyNow = useCallback(async (cfg, options = {}) => {
             if (!shaderLabFx.isEnabled()) return;
             try {
-                setStatus('applying...');
-                setStatusColor('#fa5');
-                await shaderLabFx.setConfig(cfg);
-                shaderLabFx.setPasses?.(normalizeShaderLabPasses(_storeSnapshot, cfg));
-                setStatus('live');
-                setStatusColor('rgb(255, 77, 0)');
+                const runtimeState = buildShaderLabRuntimeState(cfg, true, autoApply);
+                const signature = snapshotSignature(runtimeState);
+                if (signature === lastAppliedSignature.current) return;
+                lastAppliedSignature.current = signature;
+                if (!options.quiet) {
+                    setStatus('applying...');
+                    setStatusColor('#fa5');
+                }
+                await shaderLabFx.setState?.(runtimeState);
+                if (!options.quiet) {
+                    setStatus('live');
+                    setStatusColor('rgb(255, 77, 0)');
+                }
             } catch (err) {
                 setStatus('apply failed');
                 setStatusColor('#f66');
-                console.error('[ShaderLab] setConfig failed:', err);
+                console.error('[ShaderLab] apply failed:', err);
             }
-        }, []);
+        }, [autoApply]);
 
         useEffect(() => {
             if (!autoApply || !enabled) return;
-            clearTimeout(debounceTimer.current);
-            debounceTimer.current = setTimeout(() => applyNow(config), 350);
-            return () => clearTimeout(debounceTimer.current);
+            if (applyFrame.current) cancelAnimationFrame(applyFrame.current);
+            applyFrame.current = requestAnimationFrame(() => {
+                applyFrame.current = 0;
+                void applyNow(config, { quiet: true });
+            });
+            return () => {
+                if (applyFrame.current) cancelAnimationFrame(applyFrame.current);
+                applyFrame.current = 0;
+            };
         }, [config, enabled, autoApply, applyNow]);
 
         const selectBackend = useCallback(async (backend) => {
@@ -1098,18 +1121,15 @@ function buildApp({ React, htm, shaderLabFx }) {
             setStatus('loading...');
             setStatusColor('#fa5');
             try {
-                await shaderLabFx.enable({
-                    config,
-                    enabled: true,
-                    autoApply,
-                    passes: normalizeShaderLabPasses({ ..._storeSnapshot, enabled: true }, config),
-                });
+                const runtimeState = buildShaderLabRuntimeState(config, true, autoApply);
+                lastAppliedSignature.current = snapshotSignature(runtimeState);
+                await shaderLabFx.enable(runtimeState);
             } catch (err) {
                 setStatus('error: ' + (err?.message || err));
                 setStatusColor('#f66');
                 console.error('[ShaderLab] enable failed:', err);
             }
-        }, [config]);
+        }, [config, autoApply]);
 
         const addLayer = useCallback(() => {
             const isSource = SOURCE_TYPES.includes(addType);

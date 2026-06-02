@@ -1,6 +1,7 @@
 #include "threejs_material.h"
 #include "threejs_category.h"
 #include "resource.h"
+#include "threejs_tsl_presets.inl"
 #include <max.h>
 #include <iparamb2.h>
 #include <iparamm2.h>
@@ -21,6 +22,15 @@ extern void MaxJSNotifyMaterialEdited(ReferenceTarget* target);
 static void NotifyOwnerMaterialEdited(IParamBlock2* pb) {
     ReferenceTarget* owner = pb ? dynamic_cast<ReferenceTarget*>(pb->GetOwner()) : nullptr;
     MaxJSNotifyMaterialEdited(owner);
+}
+
+static void NameOwnerFromPreset(IParamBlock2* pb, const MCHAR* label, const MCHAR* prefix) {
+    if (!pb || !label || !label[0]) return;
+    MtlBase* owner = dynamic_cast<MtlBase*>(pb->GetOwner());
+    if (!owner) return;
+    MSTR name(prefix ? prefix : _T(""));
+    name += label;
+    owner->SetName(name.data());
 }
 
 static const wchar_t* kTSLCodeEditOrigProcProp = L"MaxJS.TSLCodeEditOrigProc";
@@ -1411,6 +1421,31 @@ static constexpr int kTSLDynEdit  = 1;   // +i*3
 static constexpr int kTSLDynCtrl  = 2;   // +i*3 (spinner / swatch / checkbox)
 
 // ── TSL Material DlgProc ────────────────────────────────────
+// ── TSL preset dropdown helpers (shared by the TSL material + texture dialogs) ──
+// The combo lists presets from threejs_tsl_presets.inl whose category matches the
+// dialog. Item 0 is a non-applying header; each item stores its kTSLPresets index.
+static void PopulateTSLPresetCombo(HWND combo, int catA, int catB = -1) {
+    if (!combo) return;
+    SendMessageW(combo, CB_RESETCONTENT, 0, 0);
+    LRESULT header = SendMessageW(combo, CB_ADDSTRING, 0, (LPARAM)L"Choose preset...");
+    SendMessageW(combo, CB_SETITEMDATA, (WPARAM)header, (LPARAM)-1);
+    for (int i = 0; i < maxjs_tsl_presets::kTSLPresetCount; ++i) {
+        int cat = maxjs_tsl_presets::kTSLPresets[i].category;
+        if (cat != catA && cat != catB) continue;
+        LRESULT idx = SendMessageW(combo, CB_ADDSTRING, 0, (LPARAM)maxjs_tsl_presets::kTSLPresets[i].label);
+        SendMessageW(combo, CB_SETITEMDATA, (WPARAM)idx, (LPARAM)i);
+    }
+    SendMessageW(combo, CB_SETCURSEL, 0, 0);
+}
+
+// Resolve the current combo selection to a kTSLPresets index, or -1 for the header.
+static int SelectedTSLPresetIndex(HWND combo) {
+    if (!combo) return -1;
+    LRESULT sel = SendMessageW(combo, CB_GETCURSEL, 0, 0);
+    if (sel == CB_ERR) return -1;
+    return (int)SendMessageW(combo, CB_GETITEMDATA, (WPARAM)sel, 0);
+}
+
 class ThreeJSTSLDlgProc : public ParamMap2UserDlgProc {
 public:
     struct DialogState {
@@ -1538,7 +1573,7 @@ public:
         if (state.pb) {
             std::wstring json = BuildParamsJson(state.dynParams);
             state.pb->SetValue(pb_tsl_params_json, 0, json.c_str());
-            if (notify) NotifyOwnerMaterialEdited(state.pb);
+            if (notify) MaxJSNotifyMaterialEdited(nullptr);
         }
     }
 
@@ -1569,6 +1604,8 @@ public:
             DialogState& state = states_[hWnd];
             state.pb = pb;
             InstallTSLCodeEditBehavior(hWnd, IDC_TSL_CODE_EDIT);
+            PopulateTSLPresetCombo(GetDlgItem(hWnd, IDC_TSL_PRESET_COMBO),
+                maxjs_tsl_presets::TSL_PRESET_MATERIAL, maxjs_tsl_presets::TSL_PRESET_DISPLACEMENT);
             if (pb) {
                 const MCHAR* code = pb->GetStr(pb_tsl_code);
                 if (code && code[0]) {
@@ -1641,6 +1678,25 @@ public:
                             }
                         }
                         CloseHandle(hFile);
+                    }
+                }
+                return TRUE;
+            }
+            if (LOWORD(wParam) == IDC_TSL_PRESET_COMBO && HIWORD(wParam) == CBN_SELCHANGE) {
+                int pi = SelectedTSLPresetIndex(GetDlgItem(hWnd, IDC_TSL_PRESET_COMBO));
+                if (pi >= 0 && pi < maxjs_tsl_presets::kTSLPresetCount) {
+                    const MCHAR* code = maxjs_tsl_presets::kTSLPresets[pi].code;
+                    const MCHAR* label = maxjs_tsl_presets::kTSLPresets[pi].label;
+                    SetDlgItemText(hWnd, IDC_TSL_CODE_EDIT, code);
+                    SetDlgItemText(hWnd, IDC_TSL_FILE_LABEL, label);
+                    if (auto it = states_.find(hWnd); it != states_.end()) {
+                        it->second.lastCommittedCode = code;
+                        if (pb) {
+                            NameOwnerFromPreset(pb, label, _T("TSL "));
+                            pb->SetValue(pb_tsl_code, 0, const_cast<MCHAR*>(code));
+                            NotifyOwnerMaterialEdited(pb);
+                        }
+                        RebuildDynamicControls(hWnd, it->second, code);
                     }
                 }
                 return TRUE;
@@ -2057,7 +2113,7 @@ public:
         if (state.pb) {
             std::wstring json = BuildParamsJson(state.dynParams);
             state.pb->SetValue(ptsl_tex_params_json, 0, json.c_str());
-            if (notify) NotifyOwnerMaterialEdited(state.pb);
+            if (notify) MaxJSNotifyMaterialEdited(nullptr);
         }
     }
 
@@ -2088,6 +2144,8 @@ public:
             DialogState& state = states_[hWnd];
             state.pb = pb;
             InstallTSLCodeEditBehavior(hWnd, IDC_TSL_TEX_CODE_EDIT);
+            PopulateTSLPresetCombo(GetDlgItem(hWnd, IDC_TSL_TEX_PRESET_COMBO),
+                maxjs_tsl_presets::TSL_PRESET_BITMAP);
             if (pb) {
                 const MCHAR* code = pb->GetStr(ptsl_tex_code);
                 if (code && code[0]) {
@@ -2160,6 +2218,25 @@ public:
                             }
                         }
                         CloseHandle(hFile);
+                    }
+                }
+                return TRUE;
+            }
+            if (LOWORD(wParam) == IDC_TSL_TEX_PRESET_COMBO && HIWORD(wParam) == CBN_SELCHANGE) {
+                int pi = SelectedTSLPresetIndex(GetDlgItem(hWnd, IDC_TSL_TEX_PRESET_COMBO));
+                if (pi >= 0 && pi < maxjs_tsl_presets::kTSLPresetCount) {
+                    const MCHAR* code = maxjs_tsl_presets::kTSLPresets[pi].code;
+                    const MCHAR* label = maxjs_tsl_presets::kTSLPresets[pi].label;
+                    SetDlgItemText(hWnd, IDC_TSL_TEX_CODE_EDIT, code);
+                    SetDlgItemText(hWnd, IDC_TSL_TEX_FILE_LABEL, label);
+                    if (auto it = states_.find(hWnd); it != states_.end()) {
+                        it->second.lastCommittedCode = code;
+                        if (pb) {
+                            NameOwnerFromPreset(pb, label, _T("TSL Tex "));
+                            pb->SetValue(ptsl_tex_code, 0, const_cast<MCHAR*>(code));
+                            NotifyOwnerMaterialEdited(pb);
+                        }
+                        RebuildDynamicControls(hWnd, it->second, code);
                     }
                 }
                 return TRUE;

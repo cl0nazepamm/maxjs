@@ -36,6 +36,7 @@
 #define IDC_TSL_MAP3               1146
 #define IDC_TSL_MAP4               1147
 #define IDC_TSL_DYN_GROUP          1148
+#define IDC_TSL_PRESET_COMBO       1149
 #define IDC_TSL_MAP5               1240
 #define IDC_TSL_MAP6               1241
 #define IDC_TSL_MAP7               1242
@@ -56,6 +57,7 @@
 #define IDC_TSL_TEX_LOAD_BTN       1211
 #define IDC_TSL_TEX_FILE_LABEL     1212
 #define IDC_TSL_TEX_DYN_GROUP      1213
+#define IDC_TSL_TEX_PRESET_COMBO   1252
 #define IDD_THREEJS_HTML_TEX       139
 #define IDS_HTML_TEX_PARAMS        140
 #define IDC_HTML_TEX_FILE_LABEL    1230

@@ -7,10 +7,49 @@
     <link rel="icon" href="data:,">
     <script>
         if (!window.chrome?.webview?.postMessage) {
-            const maxjsSnapshotTarget = new URL('snapshot.html', window.location.href);
-            maxjsSnapshotTarget.search = window.location.search;
-            maxjsSnapshotTarget.hash = window.location.hash;
-            window.location.replace(maxjsSnapshotTarget.href);
+            (async () => {
+                const params = new URLSearchParams(window.location.search);
+                const rawBackend = String(
+                    params.get('renderer')
+                    ?? params.get('backend')
+                    ?? params.get('rendererBackend')
+                    ?? '',
+                ).toLowerCase();
+                let targetPage = (params.has('webgpu') || rawBackend.includes('webgpu'))
+                    ? 'snapshot_webgpu.html'
+                    : 'snapshot.html';
+
+                if (targetPage !== 'snapshot_webgpu.html' && !params.has('webgl') && !rawBackend.includes('webgl')) {
+                    try {
+                        const hasSnapshotAt = async (candidateRoot) => {
+                            try {
+                                const head = await fetch(`${candidateRoot}/snapshot.json`, { method: 'HEAD', cache: 'no-store' });
+                                return head.ok;
+                            } catch {
+                                return false;
+                            }
+                        };
+                        const root = params.get('root')
+                            ?? ((await hasSnapshotAt('.')) ? '.' : 'snapshots/current');
+                        const response = await fetch(`${root}/snapshot.json`, { cache: 'no-store' });
+                        if (response.ok) {
+                            const meta = await response.json();
+                            const metaBackend = String(
+                                meta?.runtimeFeatures?.renderer_pref
+                                ?? meta?.runtimeFeatures?.rendererBackend
+                                ?? meta?.snapshotUi?.rendererBackend
+                                ?? '',
+                            ).toLowerCase();
+                            if (metaBackend.includes('webgpu')) targetPage = 'snapshot_webgpu.html';
+                        }
+                    } catch {}
+                }
+
+                const maxjsSnapshotTarget = new URL(targetPage, window.location.href);
+                maxjsSnapshotTarget.search = window.location.search;
+                maxjsSnapshotTarget.hash = window.location.hash;
+                window.location.replace(maxjsSnapshotTarget.href);
+            })();
         }
     </script>
     <link rel="stylesheet" href="./css/index.css">
@@ -243,6 +282,7 @@
             "three-std": "./vendor/three-r184/build/three.module.js",
             "three/webgpu": "./vendor/three-r184/build/three.webgpu.js",
             "three/tsl": "./vendor/three-r184/build/three.tsl.js",
+            "tsl-textures": "./vendor/tsl-textures/tsl-textures.js",
             "three/src/": "./node_modules/three/src/",
             "three/addons/": "./vendor/three-r184/examples/",
             "three/examples/jsm/": "./vendor/three-r184/examples/",
@@ -377,6 +417,7 @@
             viewportSharedTexture,
         } from 'three/tsl';
         import * as TSL from 'three/tsl';
+        import { createTSLCompiler, makeBakeNodeToTexture } from './js/tsl_materials.js';
 
         // Patch materialEnvIntensity to always read material.envMapIntensity,
         // even when no per-material envMap is set (default three.js falls back
@@ -1083,6 +1124,7 @@
             }
             saveBackgroundColor();
             syncBackgroundColorSlot();
+            savePostFxState();
         }
 
         function getEnvironmentBackgroundMap() {
@@ -2399,7 +2441,7 @@
                     console.error('[MaterialX] Load failed:', error);
                     if (md.model === 'MeshTSLNodeMaterial' && md.tslCode) {
                         try {
-                            const fallback = createTSLMaterial({
+                            const fallback = tslCompiler.createTSLMaterial({
                                 ...md,
                                 materialXFile: '',
                                 materialXInline: '',
@@ -2600,6 +2642,26 @@
             return tex;
         }
 
+        // Shared TSL material/texture compiler (extracted to js/tsl_materials.js so the
+        // standalone snapshot path can run the exact same code). The vendored tsl-textures
+        // namespace and the node->texture bake helper are wired in lazily below.
+        const tslCompiler = createTSLCompiler({
+            THREE,
+            TSL,
+            loadTexture,
+            textureCache,
+            debugWarn: maxjsDebugWarn,
+            // Bake TSL color nodes (bitmap presets) into textures; redraw when ready.
+            bakeNodeToTexture: makeBakeNodeToTexture(renderer, THREE, {
+                onComplete: () => maxjsFx.markOutputChanged?.(),
+            }),
+        });
+        // Load the procedural-texture preset library before materials can compile
+        // so first-use preset snippets resolve the injected TEXTURES namespace.
+        await import('tsl-textures')
+            .then((ns) => tslCompiler.setTextures(ns))
+            .catch(() => { /* only present when tsl-textures presets are used */ });
+
         function isWebGLTexturePathActive() {
             const label = String(rendererBackendLabel || '');
             return !!renderer?.isWebGLRenderer || label.startsWith('WebGL') || label === 'TSL_GL';
@@ -2704,26 +2766,7 @@
             }
         }
 
-        // Evaluate TSL texture code — code must return a THREE.Texture or THREE.DataTexture
-        function evalTSLTexture(code, tslParams) {
-            if (!code) return null;
-            const cacheKey = 'tsl_tex:' + code + JSON.stringify(tslParams || {});
-            if (textureCache.has(cacheKey)) return textureCache.get(cacheKey);
-            try {
-                const params = buildTSLParams(code, tslParams || {});
-                const fn = new Function('THREE', 'TSL', 'params', code);
-                const result = fn(THREE, TSL, params);
-                if (result && result.isTexture) {
-                    result.needsUpdate = true;
-                    textureCache.set(cacheKey, result);
-                    return result;
-                }
-                maxjsDebugWarn('[TSL Texture] Code did not return a Texture');
-            } catch (err) {
-                console.error('[TSL Texture] Eval error:', err);
-            }
-            return null;
-        }
+        // TSL texture/material compile moved to js/tsl_materials.js (tslCompiler.evalTSLTexture).
 
         const HTML_TEXTURE_AUTO_FIT_KEYS = [
             'map', 'opMap', 'emMap', 'roughMap', 'metalMap', 'normMap',
@@ -2942,7 +2985,7 @@
                 return handle.texture;
             }
             const tslCode = md[key + 'TSL'];
-            if (tslCode) return evalTSLTexture(tslCode, md[key + 'TSLParams']);
+            if (tslCode) return tslCompiler.evalTSLTexture(tslCode, md[key + 'TSLParams']);
             const url = md[key];
             if (url) return loadTexture(url, colorSpace, optimizedTextureTransformForSlot(key, xfSource), fallback);
             return null;
@@ -3909,78 +3952,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             return material;
         }
 
-        function coerceTSLFloat(value, fallback) {
-            const n = Number(value);
-            return Number.isFinite(n) ? n : fallback;
-        }
-
-        function coerceTSLColor(value, fallbackR, fallbackG, fallbackB) {
-            if (Array.isArray(value) && value.length >= 3) {
-                return new THREE.Color(
-                    coerceTSLFloat(value[0], fallbackR),
-                    coerceTSLFloat(value[1], fallbackG),
-                    coerceTSLFloat(value[2], fallbackB),
-                );
-            }
-            if (value && typeof value === 'object' &&
-                Number.isFinite(value.r) &&
-                Number.isFinite(value.g) &&
-                Number.isFinite(value.b)) {
-                return new THREE.Color(value.r, value.g, value.b);
-            }
-            if (typeof value === 'string' && value.trim()) {
-                try {
-                    return new THREE.Color(value);
-                } catch {}
-            }
-            return new THREE.Color(fallbackR, fallbackG, fallbackB);
-        }
-
-        function coerceTSLBool(value, fallback) {
-            if (typeof value === 'boolean') return value;
-            if (typeof value === 'number') return value !== 0;
-            if (typeof value === 'string') {
-                const normalized = value.trim().toLowerCase();
-                if (normalized === 'true' || normalized === '1' || normalized === 'on') return true;
-                if (normalized === 'false' || normalized === '0' || normalized === 'off') return false;
-            }
-            return fallback;
-        }
-
-        // Parse @param declarations from TSL code and build uniform params object
-        function buildTSLParams(code, values) {
-            const params = {};
-            const lines = code.split('\n');
-            for (const line of lines) {
-                const m = line.match(/\/\/\s*@param\s+(float|color|bool)\s+(\w+)\s*(.*)/);
-                if (!m) continue;
-                const [, type, name, rest] = m;
-                const parts = rest.trim().split(/\s+/).map(Number);
-                if (type === 'float') {
-                    const fallback = isFinite(parts[0]) ? parts[0] : 0.5;
-                    params[name] = TSL.uniform(coerceTSLFloat(values?.[name], fallback));
-                } else if (type === 'color') {
-                    const r = isFinite(parts[0]) ? parts[0] : 1;
-                    const g = isFinite(parts[1]) ? parts[1] : 1;
-                    const b = isFinite(parts[2]) ? parts[2] : 1;
-                    params[name] = TSL.uniform(coerceTSLColor(values?.[name], r, g, b));
-                } else if (type === 'bool') {
-                    const val = coerceTSLBool(values?.[name], rest.trim() === 'true');
-                    params[name] = TSL.uniform(val ? 1.0 : 0.0);
-                }
-            }
-            return params;
-        }
-
-        const tslCompatWarnings = new Set();
-        let tslCompatNamespace = null;
-
-        function warnTSLLegacy(name, replacement) {
-            const key = `${name}->${replacement}`;
-            if (tslCompatWarnings.has(key)) return;
-            tslCompatWarnings.add(key);
-            maxjsDebugWarn(`[TSL] Legacy API shim: ${name} -> ${replacement}`);
-        }
+        // TSL coerce/buildTSLParams/compat-warn helpers moved to js/tsl_materials.js.
 
         function normalizeMaxVertexColorChannel(channel = 0) {
             if (typeof channel === 'string') {
@@ -4004,66 +3976,8 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             return `maxjs_vc_${normalized}`;
         }
 
-        function getTSLCompatNamespace() {
-            if (tslCompatNamespace) return tslCompatNamespace;
-            const compat = Object.assign({}, TSL);
-            const makeTimerShim = (name) => (scale = 1.0) => {
-                warnTSLLegacy(name, 'TSL.time');
-                const s = Number.isFinite(scale) ? scale : 1.0;
-                return s === 1.0 ? TSL.time : TSL.time.mul(s);
-            };
-            compat.timerLocal = makeTimerShim('TSL.timerLocal');
-            compat.timerGlobal = makeTimerShim('TSL.timerGlobal');
-            compat.maxVertexColor = (channel = 0) =>
-                TSL.attribute(maxVertexColorAttributeName(channel), 'vec4');
-            compat.vertexColorChannel = compat.maxVertexColor;
-            tslCompatNamespace = compat;
-            return compat;
-        }
-
-        function createTSLMaterial(md) {
-            try {
-                const material = new THREE.MeshPhysicalNodeMaterial();
-                material.side = md.side === 0 ? THREE.FrontSide : THREE.DoubleSide;
-                // Pre-load textures from material map slots
-                const maps = {};
-                for (let i = 1; i <= 16; i++) {
-                    const url = md[`tslMap${i}`];
-                    if (url) maps[`map${i}`] = loadTexture(url);
-                }
-                // Build dynamic params from @param declarations + stored values
-                const params = buildTSLParams(md.tslCode, md.tslParams || {});
-                // TSL code gets: material, THREE, TSL, loadTexture, maps, params (uniforms)
-                const code = md.tslCode;
-                const fn = new Function('material', 'THREE', 'TSL', 'loadTexture', 'maps', 'params', code);
-                fn(material, THREE, getTSLCompatNamespace(), loadTexture, maps, params);
-                // Store params on material for live uniform updates
-                material.userData.tslParams = params;
-                material.needsUpdate = true;
-                return material;
-            } catch (err) {
-                console.error('[TSL Material] Compile error:', err);
-                return new THREE.MeshStandardMaterial({ color: 0xff00ff, wireframe: true });
-            }
-        }
-
-        function createMissingTSLMaterial(md) {
-            if (md.materialXBridgeConnected) {
-                const sourceName = md.materialXBridgeSourceName || 'connected source material';
-                const reason = md.materialXBridgeError || 'auto-compile produced no MaterialX payload';
-                console.error(`[MaterialX] Auto-compile bridge failed for ${sourceName}: ${reason}`);
-            }
-            maxjsDebugWarn('[TSL Material] Missing MaterialX source and tslCode. Rendering debug fallback.', md);
-            const material = new THREE.MeshStandardMaterial({
-                color: 0xff00ff,
-                wireframe: true,
-                side: md.side === 0 ? THREE.FrontSide : THREE.DoubleSide,
-            });
-            material.userData ??= {};
-            material.userData.maxjsTSLMissingSource = true;
-            material.needsUpdate = true;
-            return material;
-        }
+        // TSL compat-namespace + material builders moved to js/tsl_materials.js
+        // (tslCompiler.createTSLMaterial / createMissingTSLMaterial).
 
         function createUtilityMaterial(runtimeModelName, md, materialContext = null) {
             if (runtimeModelName === 'MeshBackdropNodeMaterial') {
@@ -4419,9 +4333,9 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     materialXTemplateCache.set(key, template);
                     ensureMaterialXTemplateLoaded(key, template, md);
                 } else if (wantsTSLMaterial && md.tslCode) {
-                    template = createTSLMaterial(md);
+                    template = tslCompiler.createTSLMaterial(md);
                 } else if (wantsTSLMaterial) {
-                    template = createMissingTSLMaterial(md);
+                    template = tslCompiler.createMissingTSLMaterial(md);
                 } else if (wantsUtilityMaterial) {
                     template = createUtilityMaterial(runtimeModelName, md, materialContext);
                 } else {
@@ -11148,10 +11062,10 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 getValues: (state) => state.volumetric,
                 setValues: (patch) => maxjsFx.setVolumetricOptions(patch),
                 controls: [
-                    { key: 'intensity', label: 'Intensity', min: 0, max: 5, step: 0.05 },
-                    { key: 'density', label: 'Density', min: 0, max: 1, step: 0.01 },
+                    { key: 'intensity', label: 'Intensity', min: 0.001, max: 5, dynamic: 'log', realtime: true },
+                    { key: 'density', label: 'Density', min: 0, max: 1, step: 0.01, realtime: true },
                     { key: 'steps', label: 'Steps', min: 2, max: 32, step: 1, integer: true },
-                    { key: 'denoise', label: 'Denoise', min: 0, max: 2, step: 0.05 },
+                    { key: 'denoise', label: 'Denoise', min: 0, max: 2, step: 0.05, realtime: true },
                     { key: 'resolution', label: 'Resolution', min: 0.1, max: 1, step: 0.05 },
                 ],
             },
@@ -11215,20 +11129,68 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 setValues: (patch) => maxjsFx.setFogOptions(patch),
                 controls: [
                     { key: 'type', label: 'Type', min: 0, max: 2, step: 1, integer: true },
-                    { key: 'opacity', label: 'Opacity', min: 0, max: 1, step: 0.01 },
-                    { key: 'near', label: 'Near', min: 0, max: 9999, step: 1 },
-                    { key: 'far', label: 'Far', min: 1, max: 9999, step: 5 },
-                    { key: 'density', label: 'Density', min: 0.0001, max: 0.5, step: 0.001 },
-                    { key: 'noiseScale', label: 'Noise Scale', min: 0.0001, max: 0.1, step: 0.001 },
-                    { key: 'noiseSpeed', label: 'Noise Speed', min: 0, max: 5, step: 0.05 },
-                    { key: 'height', label: 'Height', min: 0, max: 9999, step: 1 },
+                    { key: 'opacity', label: 'Opacity', min: 0, max: 1, step: 0.01, realtime: true },
+                    { key: 'near', label: 'Near', min: 0, max: 9999, step: 1, realtime: true },
+                    { key: 'far', label: 'Far', min: 1, max: 9999, step: 5, realtime: true },
+                    { key: 'density', label: 'Density', min: 0.0001, max: 0.5, step: 0.001, realtime: true },
+                    { key: 'noiseScale', label: 'Noise Scale', min: 0.0001, max: 0.1, step: 0.001, realtime: true },
+                    { key: 'noiseSpeed', label: 'Noise Speed', min: 0, max: 5, step: 0.05, realtime: true },
+                    { key: 'height', label: 'Height', min: 0, max: 9999, step: 1, realtime: true },
                 ],
             },
         ];
 
+        const LOG_SLIDER_STEPS = 1000;
+
+        function logSliderMin(control) {
+            return Number.isFinite(control.min) ? control.min : 0.001;
+        }
+
+        function logSliderMax(control, currentValue) {
+            const cap = Number.isFinite(control.max) ? control.max : 5;
+            const cur = Number(currentValue);
+            return Number.isFinite(cur) && cur > cap ? cur : cap;
+        }
+
+        function valueToLogSliderInput(value, min, max) {
+            const v = Math.max(min, Math.min(max, Number(value) || min));
+            if (max <= min) return 0;
+            const t = Math.log(v / min) / Math.log(max / min);
+            return Math.round(Math.max(0, Math.min(1, t)) * LOG_SLIDER_STEPS);
+        }
+
+        function logSliderInputToValue(input, min, max) {
+            const t = Math.max(0, Math.min(1, Number(input) / LOG_SLIDER_STEPS));
+            return min * Math.pow(max / min, t);
+        }
+
+        function readPostFxControlValue(control, input, getValues) {
+            if (control.type === 'checkbox') return input.checked;
+            if (control.dynamic === 'log') {
+                const values = getValues();
+                const min = logSliderMin(control);
+                const max = logSliderMax(control, values[control.key]);
+                return logSliderInputToValue(input.value, min, max);
+            }
+            const raw = Number(input.value);
+            return control.integer ? Math.round(raw) : raw;
+        }
+
+        /** Scrub preview only — no maxjsFx / pipeline work (keeps range inputs responsive). */
+        function previewPostFxControlLabel(control, input, valueEl, getValues) {
+            if (!valueEl || control.type === 'checkbox') return;
+            const value = readPostFxControlValue(control, input, getValues);
+            valueEl.textContent = formatControlValue(control, value);
+        }
+
         function formatControlValue(control, value) {
             if (control.type === 'checkbox') return value ? 'On' : 'Off';
             if (!Number.isFinite(value)) return '--';
+            if (control.dynamic === 'log') {
+                if (value < 0.01) return value.toFixed(3);
+                if (value < 1) return value.toFixed(2);
+                return value.toFixed(2);
+            }
             if (control.integer) return String(Math.round(value));
             if (control.step >= 1) return value.toFixed(0);
             if (control.step >= 0.1) return value.toFixed(1);
@@ -11270,6 +11232,10 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                                 `;
                             }
 
+                            const useLogSlider = control.dynamic === 'log';
+                            const rangeMin = useLogSlider ? 0 : control.min;
+                            const rangeMax = useLogSlider ? LOG_SLIDER_STEPS : control.max;
+                            const rangeStep = useLogSlider ? 1 : control.step;
                             return `
                                 <label class="fx-control" for="${inputId}">
                                     <div class="fx-control-head">
@@ -11280,9 +11246,9 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                                         class="fx-range"
                                         id="${inputId}"
                                         type="range"
-                                        min="${control.min}"
-                                        max="${control.max}"
-                                        step="${control.step}"
+                                        min="${rangeMin}"
+                                        max="${rangeMax}"
+                                        step="${rangeStep}"
                                     >
                                 </label>
                             `;
@@ -11703,11 +11669,14 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 syncPostFxPanel(true);
             };
             renderScaleSlider.oninput = (e) => {
-                performanceSettings.renderScale = Math.max(0.25, Math.min(1.0, Number(e.target.value) || 1.0));
-                renderScaleValue.textContent = `${performanceSettings.renderScale.toFixed(2)}x`;
-                applyRendererPerformanceSettings({ resizePostFx: true });
+                const scale = Math.max(0.25, Math.min(1.0, Number(e.target.value) || 1.0));
+                renderScaleValue.textContent = `${scale.toFixed(2)}x`;
             };
-            renderScaleSlider.onchange = () => savePostFxState();
+            renderScaleSlider.onchange = (e) => {
+                performanceSettings.renderScale = Math.max(0.25, Math.min(1.0, Number(e.target.value) || 1.0));
+                applyRendererPerformanceSettings({ resizePostFx: true });
+                savePostFxState();
+            };
             optimizeInstancesCheck.onchange = () => {
                 performanceSettings.optimizeMaxInstances = optimizeInstancesCheck.checked;
                 disposeMaxInstanceBuckets();
@@ -11731,12 +11700,13 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 };
             }
             instanceThresholdSlider.oninput = (e) => {
-                performanceSettings.maxInstanceBucketThreshold = Math.max(2, Math.round(Number(e.target.value) || 50));
-                instanceThresholdValue.textContent = String(performanceSettings.maxInstanceBucketThreshold);
-                disposeMaxInstanceBuckets();
-                syncPostFxPanel(true, { persist: false });
+                instanceThresholdValue.textContent = String(Math.max(2, Math.round(Number(e.target.value) || 50)));
             };
-            instanceThresholdSlider.onchange = () => savePostFxState();
+            instanceThresholdSlider.onchange = (e) => {
+                performanceSettings.maxInstanceBucketThreshold = Math.max(2, Math.round(Number(e.target.value) || 50));
+                disposeMaxInstanceBuckets();
+                savePostFxState();
+            };
 
             // Camera clipping controls
             const cameraNearInput = document.getElementById('fx-camera-near');
@@ -11758,8 +11728,18 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 maxjsFx.markSceneChanged?.();
                 savePostFxState();
             }
-            cameraNearInput.oninput = commitCameraClip;
-            cameraFarInput.oninput = commitCameraClip;
+            function previewCameraClip() {
+                const nearRaw = parseFloat(cameraNearInput.value);
+                const farRaw = parseFloat(cameraFarInput.value);
+                cameraNearValue.textContent = Number.isFinite(nearRaw) && nearRaw > 0
+                    ? nearRaw.toFixed(3)
+                    : `auto (${camera.near.toFixed(3)})`;
+                cameraFarValue.textContent = Number.isFinite(farRaw) && farRaw > 0
+                    ? farRaw.toFixed(0)
+                    : `auto (${camera.far.toFixed(0)})`;
+            }
+            cameraNearInput.oninput = previewCameraClip;
+            cameraFarInput.oninput = previewCameraClip;
             cameraNearInput.onchange = () => { commitCameraClip(); savePostFxState(); };
             cameraFarInput.onchange = () => { commitCameraClip(); savePostFxState(); };
 
@@ -11777,7 +11757,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             const hdriRotVal = document.getElementById('fx-hdri-rotation-val');
             hdriRotSlider.oninput = (e) => {
                 localHdriRotation = parseFloat(e.target.value);
-                hdriRotVal.textContent = Math.round(localHdriRotation);
+                hdriRotVal.textContent = String(Math.round(localHdriRotation));
                 applyLocalHDRISettings();
             };
             hdriRotSlider.onchange = () => savePostFxState();
@@ -11834,10 +11814,12 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     const valEl = document.getElementById(`fx-clone-${key}-val`);
                     input.oninput = () => {
                         const v = Number(input.value);
-                        maxjsFx.setCloneOptions({ [key]: v });
                         if (valEl) valEl.textContent = v >= 1 ? String(Math.round(v)) : v.toFixed(2);
                     };
-                    input.onchange = () => savePostFxState();
+                    input.onchange = () => {
+                        maxjsFx.setCloneOptions({ [key]: Number(input.value) });
+                        savePostFxState();
+                    };
                 }
                 const invertCheck = document.getElementById('fx-clone-invert');
                 invertCheck.onchange = () => {
@@ -11866,12 +11848,13 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     syncPostFxPanel(true);
                 };
                 snapGridSlider.oninput = () => {
-                    if (!maxjsFx.supportsScreenSpaceEffects()) return;
-                    const v = Number(snapGridSlider.value);
-                    maxjsFx.setRetroOptions({ affineDistortion: v });
-                    snapGridVal.textContent = v.toFixed(1);
+                    snapGridVal.textContent = Number(snapGridSlider.value).toFixed(1);
                 };
-                snapGridSlider.onchange = () => savePostFxState();
+                snapGridSlider.onchange = () => {
+                    if (!maxjsFx.supportsScreenSpaceEffects()) return;
+                    maxjsFx.setRetroOptions({ affineDistortion: Number(snapGridSlider.value) });
+                    savePostFxState();
+                };
 
                 // ASCII controls
                 const asciiToggle = document.getElementById('fx-toggle-ascii');
@@ -11886,11 +11869,13 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     syncPostFxPanel(true);
                 };
                 asciiResSlider.oninput = () => {
-                    asciiSettings.resolution = Number(asciiResSlider.value);
-                    asciiResVal.textContent = asciiSettings.resolution.toFixed(2);
-                    if (asciiActive) rebuildAsciiEffect();
+                    asciiResVal.textContent = Number(asciiResSlider.value).toFixed(2);
                 };
-                asciiResSlider.onchange = () => savePostFxState();
+                asciiResSlider.onchange = () => {
+                    asciiSettings.resolution = Number(asciiResSlider.value);
+                    if (asciiActive) rebuildAsciiEffect();
+                    savePostFxState();
+                };
                 asciiColorSelect.onchange = () => {
                     asciiSettings.color = asciiColorSelect.value;
                     if (asciiActive) rebuildAsciiEffect();
@@ -11959,20 +11944,29 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
 
                     section.controlEls[control.key] = { input, valueEl };
 
-                    const applyControlValue = (persist) => {
-                        const rawValue = control.type === 'checkbox'
-                            ? input.checked
-                            : Number(input.value);
-                        const value = control.integer ? Math.round(rawValue) : rawValue;
+                    const getSectionValues = () => section.getValues(maxjsFx.getState());
+                    const applyControlValueLive = () => {
+                        const value = readPostFxControlValue(control, input, getSectionValues);
                         section.setValues({ [control.key]: value });
+                    };
+                    const commitControlValue = (persist) => {
+                        applyControlValueLive();
                         syncPostFxPanel(true, { persist });
                     };
 
                     if (control.type === 'checkbox') {
-                        input.addEventListener('change', () => applyControlValue(true));
+                        input.addEventListener('change', () => commitControlValue(true));
+                    } else if (control.realtime) {
+                        input.addEventListener('input', () => {
+                            previewPostFxControlLabel(control, input, valueEl, getSectionValues);
+                            applyControlValueLive();
+                        });
+                        input.addEventListener('change', () => savePostFxState());
                     } else {
-                        input.addEventListener('input', () => applyControlValue(false));
-                        input.addEventListener('change', () => applyControlValue(true));
+                        input.addEventListener('input', () => {
+                            previewPostFxControlLabel(control, input, valueEl, getSectionValues);
+                        });
+                        input.addEventListener('change', () => commitControlValue(true));
                     }
                 }
             }
@@ -12108,6 +12102,15 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
 
                     if (control.type === 'checkbox') {
                         if (!editingControl) controlEl.input.checked = !!values[control.key];
+                    } else if (control.dynamic === 'log') {
+                        const min = logSliderMin(control);
+                        const max = logSliderMax(control, values[control.key]);
+                        if (!editingControl) {
+                            controlEl.input.value = valueToLogSliderInput(values[control.key], min, max);
+                        }
+                        if (controlEl.valueEl) {
+                            controlEl.valueEl.textContent = formatControlValue(control, values[control.key]);
+                        }
                     } else {
                         if (!editingControl) controlEl.input.value = values[control.key];
                         if (controlEl.valueEl) {

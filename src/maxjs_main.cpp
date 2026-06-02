@@ -2823,6 +2823,14 @@ public:
             return false;
         }
 
+        // WebGPU snapshot target — the only target that runs real TSL node
+        // materials. Copied alongside snapshot.html so TSL scenes can be opened
+        // via snapshot_webgpu.html (cheap; harmless when unused).
+        const std::wstring snapshotWebgpuHtml = webDir + L"\\snapshot_webgpu.html";
+        if (FileExists(snapshotWebgpuHtml)) {
+            CopyFileEnsuringDirectories(snapshotWebgpuHtml, outDir + L"\\snapshot_webgpu.html");
+        }
+
         if (!CopyDirectoryRecursive(webDir + L"\\js", outDir + L"\\js")) {
             error = L"Failed to copy snapshot runtime js directory";
             return false;
@@ -2995,7 +3003,9 @@ public:
 
     static std::wstring DetectRendererPrefFromSnapshotUi(const std::wstring& snapshotUiJson) {
         const std::wstring lower = LowerAsciiCopy(snapshotUiJson);
-        if (lower.find(L"\"snapshotrendererbackend\":\"webgpu") != std::wstring::npos ||
+        if (lower.find(L"\"rendererbackend\":\"webgpu") != std::wstring::npos ||
+            lower.find(L"\"rendererbackend\": \"webgpu") != std::wstring::npos ||
+            lower.find(L"\"snapshotrendererbackend\":\"webgpu") != std::wstring::npos ||
             lower.find(L"\"snapshotrendererbackend\": \"webgpu") != std::wstring::npos ||
             lower.find(L"\"snapshot_backend\":\"webgpu") != std::wstring::npos ||
             lower.find(L"\"snapshot_backend\": \"webgpu") != std::wstring::npos) {
@@ -4249,6 +4259,23 @@ public:
             error = L"Failed to write snapshot.json";
             cleanupOnFail();
             return false;
+        }
+
+        // Gate the tsl-textures preset library into the snapshot only when the scene
+        // actually references it (preset snippets use the injected TEXTURES namespace). Mirrors the
+        // Rapier vendor gating: copy when used, remove stale otherwise — so snapshots
+        // without TSL presets stay byte-identical and unbloated.
+        {
+            const std::wstring outTslVendor = outDir + L"\\vendor\\tsl-textures";
+            if (metaJson.find(L"TEXTURES") != std::wstring::npos) {
+                const std::wstring tslVendor = webDir + L"\\vendor\\tsl-textures";
+                if (DirectoryExists(tslVendor)) {
+                    CopyDirectoryRecursive(tslVendor, outTslVendor);
+                }
+            } else {
+                std::error_code ec;
+                std::filesystem::remove_all(std::filesystem::path(outTslVendor), ec);
+            }
         }
         if (!WriteBinaryFile(outDir + L"\\scene.bin", binary)) {
             error = L"Failed to write scene.bin";

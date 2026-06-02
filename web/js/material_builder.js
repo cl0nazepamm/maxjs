@@ -26,6 +26,8 @@ import {
     resolveTextureColorSpace,
     textureReadyForMaterialBinding,
 } from './material_contract.js';
+import * as TSL from 'three/tsl';
+import { createTSLCompiler, makeBakeNodeToTexture } from './tsl_materials.js';
 
 function setNumber(target, key, value) {
     const n = Number(value);
@@ -658,7 +660,7 @@ function installSafeVideoTexturePump(texture, video) {
  * Creates a material-builder instance tied to a snapshot root URL.
  * Owns its own texture cache so re-applies do not refetch.
  */
-export function createMaterialBuilder({ rootUrl = '.', bakeState = null } = {}) {
+export function createMaterialBuilder({ rootUrl = '.', bakeState = null, renderer = null } = {}) {
     const loader = new THREE.TextureLoader();
     const hdrLoader = new HDRLoader();
     const exrLoader = suppressKnownExrMetadataWarnings(new EXRLoader());
@@ -667,6 +669,20 @@ export function createMaterialBuilder({ rootUrl = '.', bakeState = null } = {}) 
     exrLoader.setCrossOrigin?.('anonymous');
     const textureCache = new Map();
     let bakeOverrides = normalizeBakeState(bakeState);
+    // Shared TSL compiler — the exact module the live viewer uses, so WebGPU
+    // snapshots render real TSL instead of a PBR fallback. On the WebGL build
+    // THREE has no node materials, so nodeMaterialsAvailable is false and the
+    // TSL hooks below are skipped (the existing path is left untouched).
+    // Its own raw-texture cache (the builder's textureCache holds entry objects).
+    const tslTextureCache = new Map();
+    const tslCompiler = createTSLCompiler({
+        THREE,
+        TSL,
+        loadTexture: (url) => loadTex(url),
+        textureCache: tslTextureCache,
+        debugWarn: (...args) => console.warn(...args),
+        bakeNodeToTexture: makeBakeNodeToTexture(renderer, THREE),
+    });
     const fallbackTextures = {
         black: createSolidTexture(0, 0, 0, 255, THREE.NoColorSpace),
         white: createSolidTexture(255, 255, 255, 255, THREE.NoColorSpace),
@@ -1035,6 +1051,20 @@ export function createMaterialBuilder({ rootUrl = '.', bakeState = null } = {}) 
 
     function bindTexture(material, slot, md) {
         if (!hasWritableProperty(material, slot.property)) return false;
+        // Procedural TSL texmap in this slot (WebGPU only). Mirrors the viewer's
+        // loadMapSlot precheck: md.<slot>TSL holds code, md.<slot>TSLParams the values.
+        if (tslCompiler.nodeMaterialsAvailable) {
+            const tslField = firstField(md, slot.urlKeys.map((k) => `${k}TSL`));
+            if (tslField.value) {
+                const tex = tslCompiler.evalTSLTexture(tslField.value, md?.[`${tslField.key}Params`]);
+                if (tex) {
+                    material[slot.property] = tex;
+                    slot.onAssign?.(material, tex, md);
+                    material.needsUpdate = true;
+                    return true;
+                }
+            }
+        }
         const { value: url } = firstField(md, slot.urlKeys);
         if (!url) return false;
 
@@ -1110,6 +1140,20 @@ export function createMaterialBuilder({ rootUrl = '.', bakeState = null } = {}) 
         const params = createParams(descriptor, info);
         const beautyReplacement = buildBeautyBakeReplacement(descriptor, params, context);
         if (beautyReplacement) return beautyReplacement;
+
+        // Real TSL node material — WebGPU snapshot target only. On WebGL,
+        // nodeMaterialsAvailable is false so we fall through to the existing path.
+        if (info.wantsTSLMaterial && descriptor.tslCode && tslCompiler.nodeMaterialsAvailable) {
+            const tslMaterial = tslCompiler.createTSLMaterial(descriptor);
+            if (tslMaterial) {
+                if (descriptor.name) tslMaterial.name = descriptor.name;
+                tslMaterial.userData ??= {};
+                tslMaterial.userData.maxjsRequestedMaterialModel = info.requestedModelName;
+                tslMaterial.userData.maxjsMaterialModel = 'MeshTSLNodeMaterial';
+                tslMaterial.userData.maxjsSourceMaterialName = descriptor.name ?? 'material';
+                return applyBakeOverrideToMaterial(tslMaterial, descriptor, context);
+            }
+        }
 
         let material = createMaterialForRuntimeModel(info.runtimeModelName, params);
         const boundSlots = [];
@@ -1221,8 +1265,23 @@ export function createMaterialBuilder({ rootUrl = '.', bakeState = null } = {}) 
             entry.texture?.dispose?.();
         }
         textureCache.clear();
+        for (const texture of tslTextureCache.values()) texture?.dispose?.();
+        tslTextureCache.clear();
         for (const texture of Object.values(fallbackTextures)) texture?.dispose?.();
     }
 
-    return { buildForNode, shouldUpdate, signature, loadTex, setBakeState, textureCache, dispose };
+    // Lazily pull in the vendored tsl-textures preset library (WebGPU only).
+    // snapshot_boot awaits this before applying the scene so preset materials
+    // that reference the TEXTURES namespace compile correctly.
+    async function loadTslTextures() {
+        if (!tslCompiler.nodeMaterialsAvailable || tslCompiler.textures) return;
+        try {
+            const ns = await import('tsl-textures');
+            tslCompiler.setTextures(ns);
+        } catch (err) {
+            console.warn('[material_builder] tsl-textures preset library unavailable:', err?.message || err);
+        }
+    }
+
+    return { buildForNode, shouldUpdate, signature, loadTex, setBakeState, textureCache, dispose, loadTslTextures };
 }

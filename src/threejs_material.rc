@@ -32,6 +32,7 @@ BEGIN
     IDS_UTILITY_COMBINE_MIX "Mix"
     IDS_UTILITY_COMBINE_ADD "Add"
     IDS_TSL_PARAMS "three.js TSL"
+    IDS_TSL_TEX_PARAMS "three.js TSL Texture"
     IDS_VIDEO_TEX_PARAMS "three.js Video"
     IDS_HTML_TEX_PARAMS "three.js HTML"
 END
@@ -506,7 +507,9 @@ STYLE DS_SETFONT | WS_CHILD | WS_VISIBLE
 FONT 8, "Segoe UI"
 BEGIN
     GROUPBOX        "TSL Shader", -1,   2,   2, 166, 248
-    LTEXT           "Node material JS. Source material can be wired for MaterialX.", -1, 8, 14, 154, 16
+    LTEXT           "Preset", -1, 8, 13, 28, 8
+    COMBOBOX        IDC_TSL_PRESET_COMBO, 38, 11, 122, 120, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    LTEXT           "Node material JS / MaterialX source.", -1, 8, 26, 154, 8
     LTEXT           "No file loaded", IDC_TSL_FILE_LABEL, 8, 34, 100, 8
     PUSHBUTTON      "Load .js",   IDC_TSL_LOAD_BTN,  114, 31, 46, 14
     EDITTEXT        IDC_TSL_CODE_EDIT, 6, 50, 158, 194, ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN | WS_VSCROLL | WS_TABSTOP
@@ -566,7 +569,9 @@ STYLE DS_SETFONT | WS_CHILD | WS_VISIBLE
 FONT 8, "Segoe UI"
 BEGIN
     GROUPBOX        "TSL Texture", -1, 2, 2, 166, 152
-    LTEXT           "Code returns a THREE.Texture or THREE.DataTexture", -1, 8, 14, 154, 16
+    LTEXT           "Preset", -1, 8, 13, 28, 8
+    COMBOBOX        IDC_TSL_TEX_PRESET_COMBO, 38, 11, 122, 120, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    LTEXT           "Returns a THREE.Texture (or a TSL node to bake).", -1, 8, 26, 154, 8
     LTEXT           "No file loaded", IDC_TSL_TEX_FILE_LABEL, 8, 34, 100, 8
     PUSHBUTTON      "Load .js",   IDC_TSL_TEX_LOAD_BTN,  114, 31, 46, 14
     EDITTEXT        IDC_TSL_TEX_CODE_EDIT, 6, 48, 158, 100, ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN | WS_VSCROLL | WS_TABSTOP

@@ -2275,6 +2275,7 @@ export function createMaxJSFxController({
             return state.fog.enabled;
         },
         setFogOptions(options = {}) {
+            const prevType = state.fog.type;
             if (Number.isFinite(options.type)) state.fog.type = options.type;
             if (Array.isArray(options.color)) state.fog.color = options.color;
             assignFinite(state.fog, 'opacity', options.opacity);
@@ -2285,7 +2286,9 @@ export function createMaxJSFxController({
             assignFinite(state.fog, 'noiseSpeed', options.noiseSpeed);
             assignFinite(state.fog, 'height', options.height);
             applyFog();
-            rebuildPipeline();
+            if (Number.isFinite(options.type) && options.type !== prevType) {
+                rebuildPipeline();
+            }
             return { ...state.fog };
         },
         setFogFromScene(fogData) {

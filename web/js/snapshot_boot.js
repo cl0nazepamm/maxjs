@@ -948,7 +948,11 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
     const materialBuilder = createMaterialBuilder({
         rootUrl: root,
         bakeState: meta.bake ?? meta.snapshotUi?.bake,
+        renderer, // enables real TSL node materials + texture baking on the WebGPU target
     });
+    // Ensure the procedural-texture preset library is ready before materials build
+    // (no-op on WebGL, where node materials are unavailable).
+    await materialBuilder.loadTslTextures();
 
     // Authored environment/HDRI from snapshot.json. This stays separate
     // from inlines: script-authored sky belongs to the layer runtime.

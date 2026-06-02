@@ -44,7 +44,7 @@
         if (!row) return;
         // Real interactive children (icon button, segmented switch, camera
         // select) handle their own clicks — only forward bare label clicks.
-        var interactive = e.target.closest('.rail-btn, .rail-mode-switch, select');
+        var interactive = e.target.closest('.rail-btn, .rail-mode-switch, select, input[type="color"]');
         if (!interactive) {
             var btn = row.querySelector('.rail-btn');
             if (btn) btn.click(); // re-enters here with interactive set

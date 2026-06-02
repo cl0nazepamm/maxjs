@@ -1559,19 +1559,27 @@ body.is-max-host .vpmenu-row.maxonly { display: flex !important; }
 .vpmenu-row-bg-slot:hover { background: transparent; }
 .vpmenu-dropdown .rail-btn.vpmenu-bg-slot {
     --vpmenu-bg-fill: #353535;
+    position: relative;
+    overflow: hidden;
+    cursor: pointer;
 }
 .vpmenu-bg-swatch-fill {
     fill: var(--vpmenu-bg-fill, #353535);
-}
-.vpmenu-bg-color-input {
-    position: fixed;
-    left: -10000px;
-    width: 1px;
-    height: 1px;
-    opacity: 0;
     pointer-events: none;
-    border: 0;
+}
+.vpmenu-bg-slot .vpmenu-bg-color-input {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    margin: 0;
     padding: 0;
+    opacity: 0;
+    cursor: pointer;
+    border: 0;
+}
+.vpmenu-bg-slot svg {
+    pointer-events: none;
 }
 
 /* Old rail buttons, re-laid-out as menu rows. */

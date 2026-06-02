@@ -900,6 +900,15 @@ static bool ExtractMaterialTexture(Texmap* map, std::wstring& filePath, MaxJSPBR
     if (Texmap* sourceMap = FindPBMap(map, _T("sourceMap")))
         resolved = sourceMap;
 
+    /*
+    TODO(maxjs): Potential Color Correction pass-through.
+    The live Color Correction sample is:
+      Color Correction -> Map Output Selector -> OSL: Uber Bitmap.
+    A simple unwrap keeps the bitmap visible, but the Color Correction class and
+    its map slot behavior may change across Max versions, so leave this disabled
+    until we support it deliberately instead of silently bypassing correction math.
+    */
+
     // TSL Texture — procedural texmap with TSL code
     if (resolved->ClassID() == THREEJS_TSL_TEX_CLASS_ID) {
         for (int b = 0; b < resolved->NumParamBlocks(); b++) {

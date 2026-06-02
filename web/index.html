@@ -4293,13 +4293,16 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 requestedModelName !== 'MeshBackdropNodeMaterial' &&
                 typeof THREE[requestedModelName] === 'function';
             const canUseToonMaterial = wantsToonMaterial && typeof THREE.MeshToonMaterial === 'function';
+            const isPlainWebGLMaterialBackend = String(rendererBackendLabel || '').startsWith('WebGL');
+            const canUseNodeMaterialBackend = !isPlainWebGLMaterialBackend;
             const canUseSSSMaterial =
                 wantsSSSMaterial &&
+                canUseNodeMaterialBackend &&
                 typeof THREE.MeshSSSNodeMaterial === 'function' &&
                 typeof tslColor === 'function' &&
                 typeof tslFloat === 'function' &&
                 typeof tslTexture === 'function';
-            const runtimeModelName = wantsMaterialXMaterial
+            const runtimeModelName = (wantsMaterialXMaterial && canUseNodeMaterialBackend)
                 ? 'MaterialXMaterial'
                 : forceLambertForBlackSpecular
                 ? 'MeshLambertMaterial'
@@ -4309,7 +4312,9 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 ? 'MeshToonMaterial'
                 : (canUseSSSMaterial
                     ? 'MeshSSSNodeMaterial'
-                    : ((wantsAdvancedMaterial || wantsSSSMaterial) ? 'MeshPhysicalMaterial' : 'MeshStandardMaterial')));
+                    : ((wantsAdvancedMaterial || wantsSSSMaterial || wantsTSLMaterial || wantsMaterialXMaterial)
+                        ? 'MeshPhysicalMaterial'
+                        : 'MeshStandardMaterial')));
             // Exclude tslParams from cache key — param changes should update
             // existing uniforms, not trigger a full material rebuild.
             const cacheableBaseMd = (wantsTSLMaterial && md.tslParams)
@@ -4323,18 +4328,18 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             }
 
             if (!template) {
-                if (wantsMaterialXMaterial) {
+                if (wantsMaterialXMaterial && canUseNodeMaterialBackend) {
                     template = createPendingMaterialXMaterial(md);
                     materialXTemplateCache.set(key, template);
                     ensureMaterialXTemplateLoaded(key, template, md);
-                } else if (wantsTSLMaterial && hasMaterialXSource) {
+                } else if (wantsTSLMaterial && canUseNodeMaterialBackend && hasMaterialXSource) {
                     // TSL material with MaterialX source — use MaterialXLoader
                     template = createPendingMaterialXMaterial(md);
                     materialXTemplateCache.set(key, template);
                     ensureMaterialXTemplateLoaded(key, template, md);
-                } else if (wantsTSLMaterial && md.tslCode) {
+                } else if (wantsTSLMaterial && canUseNodeMaterialBackend && md.tslCode) {
                     template = tslCompiler.createTSLMaterial(md);
-                } else if (wantsTSLMaterial) {
+                } else if (wantsTSLMaterial && canUseNodeMaterialBackend) {
                     template = tslCompiler.createMissingTSLMaterial(md);
                 } else if (wantsUtilityMaterial) {
                     template = createUtilityMaterial(runtimeModelName, md, materialContext);
@@ -4361,7 +4366,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     if (md.depthWrite != null) params.depthWrite = !!md.depthWrite;
                     if (md.depthTest != null) params.depthTest = !!md.depthTest;
 
-                    if (wantsAdvancedMaterial) {
+                    if (wantsAdvancedMaterial || wantsSSSMaterial || wantsTSLMaterial || wantsMaterialXMaterial) {
                         if (Array.isArray(md.specularColor)) {
                             params.specularColor = new THREE.Color(md.specularColor[0], md.specularColor[1], md.specularColor[2]);
                         }
@@ -4432,9 +4437,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                         template = new THREE.MeshToonMaterial(params);
                     } else if (canUseSSSMaterial) {
                         template = new THREE.MeshSSSNodeMaterial(params);
-                    } else if (wantsAdvancedMaterial) {
-                        template = new THREE.MeshPhysicalMaterial(params);
-                    } else if (wantsSSSMaterial) {
+                    } else if (wantsAdvancedMaterial || wantsSSSMaterial || wantsTSLMaterial || wantsMaterialXMaterial) {
                         template = new THREE.MeshPhysicalMaterial(params);
                     } else {
                         template = new THREE.MeshStandardMaterial(params);
@@ -4507,7 +4510,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 materialCache.set(key, template);
             }
 
-            if (wantsMaterialXMaterial || (wantsTSLMaterial && hasMaterialXSource)) {
+            if ((wantsMaterialXMaterial || (wantsTSLMaterial && hasMaterialXSource)) && canUseNodeMaterialBackend) {
                 return template;
             }
 

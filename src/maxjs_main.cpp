@@ -2799,6 +2799,52 @@ public:
         return true;
     }
 
+    bool ReadSmallTextFile(const std::wstring& path, std::string& out, DWORD maxBytes = 1024u * 1024u) {
+        out.clear();
+        HANDLE hFile = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (hFile == INVALID_HANDLE_VALUE) return false;
+
+        LARGE_INTEGER size{};
+        if (!GetFileSizeEx(hFile, &size) || size.QuadPart < 0 || size.QuadPart > maxBytes) {
+            CloseHandle(hFile);
+            return false;
+        }
+
+        out.resize(static_cast<size_t>(size.QuadPart));
+        DWORD bytesRead = 0;
+        const BOOL ok = out.empty()
+            ? TRUE
+            : ReadFile(hFile, out.data(), static_cast<DWORD>(out.size()), &bytesRead, nullptr);
+        CloseHandle(hFile);
+        if (!ok || bytesRead != out.size()) {
+            out.clear();
+            return false;
+        }
+        return true;
+    }
+
+    bool IsGeneratedSnapshotShell(const std::wstring& path) {
+        std::string html;
+        if (!ReadSmallTextFile(path, html)) return false;
+        return html.find("<title>max.js snapshot</title>") != std::string::npos &&
+            html.find("import { boot } from './js/snapshot_boot.js';") != std::string::npos &&
+            html.find("const root = params.get('root')") != std::string::npos;
+    }
+
+    bool CopySnapshotIndexSeed(const std::wstring& snapshotHtml,
+                               const std::wstring& indexHtml,
+                               std::wstring& error) {
+        if (FileExists(indexHtml) && !IsGeneratedSnapshotShell(indexHtml)) {
+            return true;
+        }
+        if (!CopyFileEnsuringDirectories(snapshotHtml, indexHtml)) {
+            error = L"Failed to copy snapshot runtime index.html";
+            return false;
+        }
+        return true;
+    }
+
     bool CopySnapshotRuntimeSeed(const std::wstring& webDir,
                                  const std::wstring& outDir,
                                  bool copySparkDist,
@@ -2815,11 +2861,9 @@ public:
             return false;
         }
 
-        // Seed index.html only once. After that the snapshot exporter owns
-        // scene data, not the standalone site's shell/UI. Project-authored
-        // standalone edits may live at index.html, so never overwrite it.
-        if (!CopyFileIfMissingEnsuringDirectories(snapshotHtml, outDir + L"\\index.html")) {
-            error = L"Failed to copy snapshot runtime index.html";
+        // Keep generated root wrappers current while preserving project-authored
+        // standalone pages that intentionally live at index.html.
+        if (!CopySnapshotIndexSeed(snapshotHtml, outDir + L"\\index.html", error)) {
             return false;
         }
 

@@ -1573,7 +1573,7 @@ public:
         if (state.pb) {
             std::wstring json = BuildParamsJson(state.dynParams);
             state.pb->SetValue(pb_tsl_params_json, 0, json.c_str());
-            if (notify) MaxJSNotifyMaterialEdited(nullptr);
+            if (notify) NotifyOwnerMaterialEdited(state.pb);
         }
     }
 

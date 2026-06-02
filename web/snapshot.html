@@ -80,7 +80,7 @@
         }
         const root = params.get('root') ?? ((await hasSnapshotAt('.')) ? '.' : 'snapshots/current');
         const reloadEnabled = !params.has('noreload');
-        const rendererBackend = (() => {
+        const explicitRendererBackend = (() => {
             const raw = String(
                 params.get('renderer')
                 ?? params.get('backend')
@@ -89,8 +89,39 @@
             ).toLowerCase();
             if (params.has('webgpu') || raw.includes('webgpu')) return 'webgpu';
             if (params.has('webgl') || raw.includes('webgl')) return 'webgl';
-            return 'webgl';
+            return null;
         })();
+        function inferSnapshotRendererBackend(meta) {
+            const backend = String(
+                meta?.runtimeFeatures?.renderer_pref
+                ?? meta?.runtimeFeatures?.rendererBackend
+                ?? meta?.snapshotUi?.rendererBackend
+                ?? '',
+            ).toLowerCase();
+            if (backend.includes('webgpu')) return 'webgpu';
+            if (backend.includes('webgl')) return 'webgl';
+            return 'webgl';
+        }
+        async function loadSnapshotMeta() {
+            try {
+                const response = await fetch(`${root}/snapshot.json`, { cache: 'no-store' });
+                if (!response.ok) return null;
+                return await response.json();
+            } catch {
+                return null;
+            }
+        }
+        function redirectToWebGpuSnapshotIfNeeded(meta) {
+            if (explicitRendererBackend != null) return false;
+            if (location.pathname.toLowerCase().endsWith('/snapshot_webgpu.html')) return false;
+            if (inferSnapshotRendererBackend(meta) !== 'webgpu') return false;
+            const target = new URL('snapshot_webgpu.html', location.href);
+            target.search = location.search;
+            target.hash = location.hash;
+            status.textContent = 'switching to WebGPU snapshot...';
+            location.replace(target.href);
+            return true;
+        }
 
         // ── Auto-reload watcher ───────────────────────────────────────
         // Polls snapshot.json. When its Last-Modified changes (or it
@@ -143,17 +174,20 @@
                 await waitForFirstSnapshot();
             }
             const initialKey = await snapshotKey();
+            const snapshotMeta = await loadSnapshotMeta();
 
-            const player = await boot({
-                root,
-                canvas,
-                options: { debug: params.has('debug'), rendererBackend },
-            });
-            window.maxjsPlayer = player;
-            status.classList.add('hidden');
-            setTimeout(() => status.remove(), 400);
+            if (!redirectToWebGpuSnapshotIfNeeded(snapshotMeta)) {
+                const player = await boot({
+                    root,
+                    canvas,
+                    options: { debug: params.has('debug'), rendererBackend: explicitRendererBackend ?? 'webgl' },
+                });
+                window.maxjsPlayer = player;
+                status.classList.add('hidden');
+                setTimeout(() => status.remove(), 400);
 
-            if (reloadEnabled) pollForUpdates(initialKey);
+                if (reloadEnabled) pollForUpdates(initialKey);
+            }
         } catch (err) {
             console.error('[max.js snapshot] boot failed', err);
             status.classList.add('error');

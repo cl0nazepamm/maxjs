@@ -10978,7 +10978,6 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 key: 'toonOutline',
                 title: 'Toon Outline',
                 copy: 'Black ink outline on objects with ThreeJS Toon material. Auto-detected.',
-                warn: 'NOTICE: This particular effect will turn off max.js fastsync and vertex updates will lag.',
                 note: 'Only visible on MeshToonMaterial objects.',
                 requiresWebGPU: true,
                 isEnabled: () => maxjsFx.isToonOutlineEnabled(),
@@ -11034,6 +11033,9 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 title: 'Retro',
                 copy: 'PS1-style posterization, scanlines, barrel distortion, and CRT effects.',
                 note: 'Requires WebGPU or Force WebGL.',
+                disabledBy: () => (shaderLabFx?.isEnabled?.()
+                    ? 'Disabled while Shader Lab is active.'
+                    : null),
                 requiresWebGPU: true,
                 isEnabled: () => maxjsFx.isRetroEnabled(),
                 setEnabled: (enabled) => maxjsFx.setRetroEnabled(enabled),
@@ -11041,14 +11043,14 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 setValues: (patch) => maxjsFx.setRetroOptions(patch),
                 controls: [
                     { key: 'dither', label: 'Dither', type: 'checkbox' },
-                    { key: 'colorDepth', label: 'Color Depth', min: 2, max: 64, step: 1, integer: true },
+                    { key: 'colorDepth', label: 'Color Depth', min: 2, max: 64, step: 1, integer: true, realtime: true },
                     { key: 'scanlines', label: 'Scanlines', type: 'checkbox' },
-                    { key: 'scanlineIntensity', label: 'Scan Intensity', min: 0, max: 1, step: 0.01 },
-                    { key: 'scanlineDensity', label: 'Scan Density', min: 0.02, max: 1, step: 0.01 },
+                    { key: 'scanlineIntensity', label: 'Scan Intensity', min: 0, max: 1, step: 0.01, realtime: true },
+                    { key: 'scanlineDensity', label: 'Scan Density', min: 0.02, max: 1, step: 0.01, realtime: true },
                     { key: 'crt', label: 'CRT Distortion', type: 'checkbox' },
-                    { key: 'curvature', label: 'Curvature', min: 0, max: 0.2, step: 0.01 },
-                    { key: 'bleeding', label: 'Color Bleed', min: 0, max: 0.01, step: 0.001 },
-                    { key: 'vignetteIntensity', label: 'Vignette', min: 0, max: 1, step: 0.01 },
+                    { key: 'curvature', label: 'Curvature', min: 0, max: 0.2, step: 0.01, realtime: true },
+                    { key: 'bleeding', label: 'Color Bleed', min: 0, max: 0.01, step: 0.001, realtime: true },
+                    { key: 'vignetteIntensity', label: 'Vignette', min: 0, max: 1, step: 0.01, realtime: true },
                 ],
             },
             {
@@ -11088,22 +11090,23 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 setValues: (patch) => maxjsFx.setPixelOptions(patch),
                 controls: [
                     { key: 'pixelate', label: 'Pixelate', type: 'checkbox' },
-                    { key: 'pixelSize', label: 'Pixel Size', min: 1, max: 32, step: 1, integer: true },
+                    { key: 'pixelSize', label: 'Pixel Size', min: 1, max: 32, step: 1, integer: true, realtime: true },
                     { key: 'chromatic', label: 'Chromatic Aberr', type: 'checkbox' },
-                    { key: 'chromaticIntensity', label: 'CA Intensity', min: 0, max: 0.05, step: 0.001 },
+                    { key: 'chromaticIntensity', label: 'CA Intensity', min: 0, max: 0.05, step: 0.001, realtime: true },
                     { key: 'sharpen', label: 'Sharpen', type: 'checkbox' },
-                    { key: 'sharpenStrength', label: 'Sharp Strength', min: 0, max: 3, step: 0.05 },
+                    { key: 'sharpenStrength', label: 'Sharp Strength', min: 0, max: 3, step: 0.05, realtime: true },
                     { key: 'grain', label: 'Film Grain', type: 'checkbox' },
-                    { key: 'grainIntensity', label: 'Grain Amount', min: 0, max: 0.5, step: 0.01 },
-                    { key: 'brightness', label: 'Brightness', min: -1, max: 1, step: 0.01 },
-                    { key: 'contrast', label: 'Contrast', min: -1, max: 1, step: 0.01 },
-                    { key: 'saturation', label: 'Saturation', min: -1, max: 1, step: 0.01 },
+                    { key: 'grainIntensity', label: 'Grain Amount', min: 0, max: 0.5, step: 0.01, realtime: true },
+                    { key: 'brightness', label: 'Brightness', min: -1, max: 1, step: 0.01, realtime: true },
+                    { key: 'contrast', label: 'Contrast', min: -1, max: 1, step: 0.01, realtime: true },
+                    { key: 'saturation', label: 'Saturation', min: -1, max: 1, step: 0.01, realtime: true },
                 ],
             },
             {
                 key: 'dof',
                 title: 'Depth of Field',
                 copy: 'Physical camera DOF with bokeh blur. Auto-syncs from Max Physical Camera when enabled.',
+                warn: 'NOTICE: Changing parameters while active can cause temporary flickering.',
                 note: 'Requires WebGPU or Force WebGL. Enable DOF on the Physical Camera in Max for auto mode.',
                 requiresWebGPU: true,
                 isEnabled: () => maxjsFx.isDofEnabled(),
@@ -11112,9 +11115,9 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 setValues: (patch) => maxjsFx.setDofOptions(patch),
                 controls: [
                     { key: 'autoFromCamera', label: 'Auto from Camera', type: 'checkbox' },
-                    { key: 'focusDistance', label: 'Focus Distance', min: 0.1, max: 10000, step: 1 },
-                    { key: 'focalLength', label: 'DOF Range', min: 0.1, max: 5000, step: 1 },
-                    { key: 'bokehScale', label: 'Bokeh Scale', min: 0.5, max: 30, step: 0.5 },
+                    { key: 'focusDistance', label: 'Focus Distance', min: 0.1, max: 10000, step: 1, realtime: true },
+                    { key: 'focalLength', label: 'DOF Range', min: 0.1, max: 5000, step: 1, realtime: true },
+                    { key: 'bokehScale', label: 'Bokeh Scale', min: 0.5, max: 30, step: 0.5, realtime: true },
                 ],
             },
             {
@@ -11141,6 +11144,28 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         ];
 
         const LOG_SLIDER_STEPS = 1000;
+        const EXPOSURE_EV_MIN = -6;
+        const EXPOSURE_EV_MAX = 4;
+        const EXPOSURE_LINEAR_MIN = Math.pow(2, EXPOSURE_EV_MIN);
+        const EXPOSURE_LINEAR_MAX = Math.pow(2, EXPOSURE_EV_MAX);
+
+        function exposureLinearToEv(linear) {
+            const safe = Math.max(EXPOSURE_LINEAR_MIN, Math.min(EXPOSURE_LINEAR_MAX, Number(linear) || 1));
+            return Math.log2(safe);
+        }
+
+        function exposureLinearToSliderInput(linear) {
+            return valueToLogSliderInput(linear, EXPOSURE_LINEAR_MIN, EXPOSURE_LINEAR_MAX);
+        }
+
+        function exposureSliderInputToLinear(input) {
+            return logSliderInputToValue(input, EXPOSURE_LINEAR_MIN, EXPOSURE_LINEAR_MAX);
+        }
+
+        function formatExposureEvLabel(linear) {
+            const ev = exposureLinearToEv(linear);
+            return `${ev >= 0 ? '+' : ''}${ev.toFixed(2)} EV`;
+        }
 
         function logSliderMin(control) {
             return Number.isFinite(control.min) ? control.min : 0.001;
@@ -11297,9 +11322,9 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                             <label class="fx-control" for="fx-tonemapping-exp">
                                 <div class="fx-control-head">
                                     <span>Exposure</span>
-                                    <span class="fx-value" id="fx-tonemapping-exp-val">+0.0 EV</span>
+                                    <span class="fx-value" id="fx-tonemapping-exp-val">${formatExposureEvLabel(currentExposure)}</span>
                                 </div>
-                                <input class="fx-range" id="fx-tonemapping-exp" type="range" min="-6" max="4" step="0.1" value="0" data-ev="true">
+                                <input class="fx-range" id="fx-tonemapping-exp" type="range" min="0" max="${LOG_SLIDER_STEPS}" step="1" value="${exposureLinearToSliderInput(currentExposure)}">
                             </label>
                             <label class="fx-control" for="fx-tonemapping-brightness">
                                 <div class="fx-control-head">
@@ -11321,6 +11346,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                         <div class="fx-section-header">
                             <div class="fx-section-title">Anti-Aliasing</div>
                         </div>
+                        <div class="fx-warn">NOTICE: Changing parameters while active can cause temporary flickering.</div>
                         <div class="fx-grid">
                             <select id="fx-aa-mode" style="background:rgba(255,255,255,0.05);color:#aaa;border:1px solid rgba(255,255,255,0.08);border-radius:0;padding:3px 6px;font:10px 'Segoe UI',system-ui,sans-serif;width:100%;outline:none;cursor:pointer">
                                 <option value="traa"${maxjsFx.isTRAAEnabled() ? ' selected' : ''}>TRAA</option>
@@ -11619,11 +11645,10 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             };
             const expSlider = document.getElementById('fx-tonemapping-exp');
             const expLabel = document.getElementById('fx-tonemapping-exp-val');
-            expSlider.oninput = (e) => {
-                const ev = parseFloat(e.target.value);
-                currentExposure = Math.pow(2, ev);
+            expSlider.oninput = () => {
+                currentExposure = exposureSliderInputToLinear(expSlider.value);
                 applyCoreToneMappingState();
-                expLabel.textContent = `${ev >= 0 ? '+' : ''}${ev.toFixed(1)} EV`;
+                expLabel.textContent = formatExposureEvLabel(currentExposure);
             };
             expSlider.onchange = () => savePostFxState();
 
@@ -11812,14 +11837,13 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 for (const key of cloneSliders) {
                     const input = document.getElementById(`fx-clone-${key}`);
                     const valEl = document.getElementById(`fx-clone-${key}-val`);
-                    input.oninput = () => {
+                    const applyCloneSlider = () => {
                         const v = Number(input.value);
                         if (valEl) valEl.textContent = v >= 1 ? String(Math.round(v)) : v.toFixed(2);
+                        maxjsFx.setCloneOptions({ [key]: v });
                     };
-                    input.onchange = () => {
-                        maxjsFx.setCloneOptions({ [key]: Number(input.value) });
-                        savePostFxState();
-                    };
+                    input.oninput = applyCloneSlider;
+                    input.onchange = () => savePostFxState();
                 }
                 const invertCheck = document.getElementById('fx-clone-invert');
                 invertCheck.onchange = () => {
@@ -11838,6 +11862,11 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                         syncPostFxPanel(true);
                         return;
                     }
+                    if (shaderLabFx?.isEnabled?.()) {
+                        perfHud.setStatus('max.js - Playstation Wobble unavailable while Shader Lab is active');
+                        syncPostFxPanel(true);
+                        return;
+                    }
                     const retro = maxjsFx.getState().retro;
                     const next = !retro.wiggle;
                     maxjsFx.setRetroOptions({ wiggle: next });
@@ -11848,13 +11877,12 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     syncPostFxPanel(true);
                 };
                 snapGridSlider.oninput = () => {
-                    snapGridVal.textContent = Number(snapGridSlider.value).toFixed(1);
-                };
-                snapGridSlider.onchange = () => {
                     if (!maxjsFx.supportsScreenSpaceEffects()) return;
-                    maxjsFx.setRetroOptions({ affineDistortion: Number(snapGridSlider.value) });
-                    savePostFxState();
+                    const v = Number(snapGridSlider.value);
+                    snapGridVal.textContent = v.toFixed(1);
+                    maxjsFx.setRetroOptions({ affineDistortion: v });
                 };
+                snapGridSlider.onchange = () => savePostFxState();
 
                 // ASCII controls
                 const asciiToggle = document.getElementById('fx-toggle-ascii');
@@ -11869,13 +11897,11 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     syncPostFxPanel(true);
                 };
                 asciiResSlider.oninput = () => {
-                    asciiResVal.textContent = Number(asciiResSlider.value).toFixed(2);
-                };
-                asciiResSlider.onchange = () => {
                     asciiSettings.resolution = Number(asciiResSlider.value);
+                    asciiResVal.textContent = asciiSettings.resolution.toFixed(2);
                     if (asciiActive) rebuildAsciiEffect();
-                    savePostFxState();
                 };
+                asciiResSlider.onchange = () => savePostFxState();
                 asciiColorSelect.onchange = () => {
                     asciiSettings.color = asciiColorSelect.value;
                     if (asciiActive) rebuildAsciiEffect();
@@ -11902,11 +11928,12 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     if (canSyncInput(invertCheck)) invertCheck.checked = !!s.invert;
                     const retro = maxjsFx.getState().retro;
                     const supportsPostStack = maxjsFx.supportsScreenSpaceEffects();
+                    const retroBlockedByShaderLab = !!shaderLabFx?.isEnabled?.();
                     if (wobbleSection) wobbleSection.hidden = !supportsPostStack;
                     wobbleToggle.textContent = retro.wiggle ? 'On' : 'Off';
                     wobbleToggle.classList.toggle('active', retro.wiggle);
-                    wobbleToggle.disabled = !supportsPostStack;
-                    snapGridSlider.disabled = !supportsPostStack;
+                    wobbleToggle.disabled = !supportsPostStack || retroBlockedByShaderLab;
+                    snapGridSlider.disabled = !supportsPostStack || retroBlockedByShaderLab;
                     if (canSyncInput(snapGridSlider)) snapGridSlider.value = retro.affineDistortion;
                     snapGridVal.textContent = retro.affineDistortion.toFixed(1);
                     asciiToggle.textContent = asciiActive ? 'On' : 'Off';
@@ -12015,9 +12042,10 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             if (canSyncInput(tmSelect)) tmSelect.value = currentToneMapping;
             const expSlider = document.getElementById('fx-tonemapping-exp');
             const expLabel = document.getElementById('fx-tonemapping-exp-val');
-            const currentEV = Math.log2(currentExposure || 1);
-            if (canSyncInput(expSlider)) expSlider.value = String(currentEV);
-            if (expLabel) expLabel.textContent = `${currentEV >= 0 ? '+' : ''}${currentEV.toFixed(1)} EV`;
+            if (canSyncInput(expSlider)) {
+                expSlider.value = String(exposureLinearToSliderInput(currentExposure));
+            }
+            if (expLabel) expLabel.textContent = formatExposureEvLabel(currentExposure);
             const cg = maxjsFx.getColorGrading();
             const brightnessSlider = document.getElementById('fx-tonemapping-brightness');
             const brightnessLabel = document.getElementById('fx-tonemapping-brightness-val');
@@ -12269,6 +12297,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         // brings the effect back (same UX as ssgi effects being sticky).
         window.addEventListener('maxjs-shader-lab-state', () => {
             updateShaderLabEnabled(shaderLabFx.isEnabled());
+            syncPostFxPanel(true, { persist: false });
         });
 
         function applySavedPostFxPayload(saved) {

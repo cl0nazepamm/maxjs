@@ -294,6 +294,19 @@ export function createMaxJSFxController({
     const dofFocusDistanceU = uniform(100);
     const dofFocalLengthU = uniform(50);
     const dofBokehScaleU = uniform(5);
+    const retroCurvatureU = uniform(0.02);
+    const retroBleedingU = uniform(0.001);
+    const retroColorDepthU = uniform(32);
+    const retroScanlineIntensityU = uniform(0.3);
+    const retroScanlineDensityU = uniform(1);
+    const retroVignetteIntensityU = uniform(0.3);
+    const pixelSizeU = uniform(4);
+    const pixelChromaticIntensityU = uniform(0.005);
+    const pixelSharpenStrengthU = uniform(0.5);
+    const pixelGrainIntensityU = uniform(0.08);
+    const pixelBrightnessU = uniform(0);
+    const pixelContrastU = uniform(0);
+    const pixelSaturationU = uniform(0);
     let hiddenDuringPost = [];
     let forceEnvironmentBackground = false;
 
@@ -374,6 +387,11 @@ export function createMaxJSFxController({
         return supportsScreenSpaceEffects
             && !!activeShaderLabFx?.isEnabled?.()
             && activeShaderLabFx.canRenderWithInputs?.(getShaderLabInputs()) !== false;
+    }
+
+    /** Retro post-pass and PS1 wiggle conflict with Shader Lab final stylize. */
+    function isRetroActive() {
+        return isScreenSpaceActive('retro') && !hasShaderLabPassEnabled();
     }
 
     function matchAndSmooth(rawBlobs) {
@@ -773,7 +791,7 @@ export function createMaxJSFxController({
             || isScreenSpaceActive('motionBlur') || isScreenSpaceActive('traa') || isBloomActive()
             || (isToonOutlineActive() && cachedHasToonMeshes)
             || isContactShadowActive()
-            || isScreenSpaceActive('retro')
+            || isRetroActive()
             || isScreenSpaceActive('pixel')
             || isScreenSpaceActive('volumetric')
             || isScreenSpaceActive('dof')
@@ -832,7 +850,7 @@ export function createMaxJSFxController({
             effectiveGTAOThickness: state.gtao.thickness * ssrUnitScale,
             effectiveContactShadowMaxDistance: state.contactShadow.maxDistance * ssrUnitScale,
             effectiveContactShadowThickness: state.contactShadow.thickness * ssrUnitScale,
-            ps1SnapActive: isScreenSpaceActive('retro') && state.retro.wiggle,
+            ps1SnapActive: isRetroActive() && state.retro.wiggle,
         };
     }
 
@@ -1324,8 +1342,46 @@ export function createMaxJSFxController({
         ps1SavedNodes.clear();
     }
 
+    function syncRetroUniforms() {
+        const r = state.retro;
+        retroCurvatureU.value = r.curvature;
+        retroBleedingU.value = r.bleeding;
+        retroColorDepthU.value = r.colorDepth;
+        retroScanlineIntensityU.value = r.scanlineIntensity;
+        retroScanlineDensityU.value = r.scanlineDensity;
+        retroVignetteIntensityU.value = r.vignetteIntensity;
+    }
+
+    function syncPixelUniforms() {
+        const p = state.pixel;
+        pixelSizeU.value = p.pixelSize;
+        pixelChromaticIntensityU.value = p.chromaticIntensity;
+        pixelSharpenStrengthU.value = p.sharpenStrength;
+        pixelGrainIntensityU.value = p.grainIntensity;
+        pixelBrightnessU.value = p.brightness;
+        pixelContrastU.value = p.contrast;
+        pixelSaturationU.value = p.saturation;
+    }
+
+    function retroOptionsNeedRebuild(options = {}) {
+        if (typeof options.wiggle === 'boolean' && options.wiggle !== state.retro.wiggle) return true;
+        if (typeof options.dither === 'boolean' && options.dither !== state.retro.dither) return true;
+        if (typeof options.scanlines === 'boolean' && options.scanlines !== state.retro.scanlines) return true;
+        if (typeof options.crt === 'boolean' && options.crt !== state.retro.crt) return true;
+        if (typeof options.filterTextures === 'boolean' && options.filterTextures !== state.retro.filterTextures) return true;
+        return false;
+    }
+
+    function pixelOptionsNeedRebuild(options = {}) {
+        if (typeof options.pixelate === 'boolean' && options.pixelate !== state.pixel.pixelate) return true;
+        if (typeof options.chromatic === 'boolean' && options.chromatic !== state.pixel.chromatic) return true;
+        if (typeof options.sharpen === 'boolean' && options.sharpen !== state.pixel.sharpen) return true;
+        if (typeof options.grain === 'boolean' && options.grain !== state.pixel.grain) return true;
+        return false;
+    }
+
     function syncSharedSceneEffects(force = false) {
-        const shouldUsePS1Wiggle = isScreenSpaceActive('retro') && state.retro.wiggle;
+        const shouldUsePS1Wiggle = isRetroActive() && state.retro.wiggle;
         if (shouldUsePS1Wiggle) {
             if (force || ps1SceneDirty || !ps1WiggleActive) {
                 enablePS1Wiggle(state.retro.affineDistortion);
@@ -1623,44 +1679,44 @@ export function createMaxJSFxController({
                 );
             }
 
-            if (isScreenSpaceActive('retro')) {
+            if (isRetroActive()) {
                 const r = state.retro;
+                syncRetroUniforms();
 
                 // CRT barrel distortion + color bleeding
                 if (r.crt) {
-                    const distortedUV = barrelUV(uniform(r.curvature));
+                    const distortedUV = barrelUV(retroCurvatureU);
                     beauty = replaceDefaultUV(distortedUV, beauty);
-                    beauty = colorBleeding(beauty, uniform(r.bleeding));
+                    beauty = colorBleeding(beauty, retroBleedingU);
                 }
 
                 // Dither + posterize
                 if (r.dither) {
-                    const colorSteps = uniform(r.colorDepth);
-                    beauty = bayerDither(beauty, colorSteps);
-                    beauty = posterize(beauty, colorSteps);
+                    beauty = bayerDither(beauty, retroColorDepthU);
+                    beauty = posterize(beauty, retroColorDepthU);
                 }
 
                 // Vignette
                 if (r.vignetteIntensity > 0) {
-                    beauty = vignette(beauty, uniform(r.vignetteIntensity), 0.6);
+                    beauty = vignette(beauty, retroVignetteIntensityU, 0.6);
                 }
 
                 // Scanlines
                 if (r.scanlines) {
-                    beauty = scanlines(beauty, uniform(r.scanlineIntensity), screenSize.y.mul(uniform(r.scanlineDensity)), 0.0);
+                    beauty = scanlines(beauty, retroScanlineIntensityU, screenSize.y.mul(retroScanlineDensityU), 0.0);
                 }
             }
 
             // ── Pixel FX ──
             if (isScreenSpaceActive('pixel')) {
                 const p = state.pixel;
+                syncPixelUniforms();
 
                 // Pixelate — snap UVs to a coarse grid
                 if (p.pixelate && p.pixelSize > 1) {
-                    const pxSize = uniform(p.pixelSize);
                     const px = vec2(
-                        max(screenSize.x.div(pxSize), float(1.0)),
-                        max(screenSize.y.div(pxSize), float(1.0))
+                        max(screenSize.x.div(pixelSizeU), float(1.0)),
+                        max(screenSize.y.div(pixelSizeU), float(1.0))
                     );
                     beauty = replaceDefaultUV(() => screenUV.mul(px).floor().div(px), beauty);
                 }
@@ -1675,10 +1731,9 @@ export function createMaxJSFxController({
 
                     // Chromatic Aberration — radial RGB split
                     if (p.chromatic && p.chromaticIntensity > 0) {
-                        const caI = uniform(p.chromaticIntensity);
                         const dir = screenUV.sub(vec2(0.5, 0.5));
-                        const uvR = screenUV.add(dir.mul(caI));
-                        const uvB = screenUV.sub(dir.mul(caI));
+                        const uvR = screenUV.add(dir.mul(pixelChromaticIntensityU));
+                        const uvB = screenUV.sub(dir.mul(pixelChromaticIntensityU));
                         beauty = vec4(
                             bTex.sample(uvR).r,
                             bTex.sample(screenUV).g,
@@ -1694,7 +1749,6 @@ export function createMaxJSFxController({
 
                     // Sharpen — unsharp mask kernel
                     if (p.sharpen && p.sharpenStrength > 0) {
-                        const str = uniform(p.sharpenStrength);
                         const txX = float(1).div(screenSize.x);
                         const txY = float(1).div(screenSize.y);
                         const ctr = bTex.sample(screenUV);
@@ -1703,7 +1757,7 @@ export function createMaxJSFxController({
                         const st  = bTex.sample(screenUV.sub(vec2(0, txY)));
                         const sb  = bTex.sample(screenUV.add(vec2(0, txY)));
                         const avg = sl.add(sr).add(st).add(sb).mul(0.25);
-                        beauty = vec4(ctr.rgb.add(ctr.rgb.sub(avg.rgb).mul(str)), ctr.a);
+                        beauty = vec4(ctr.rgb.add(ctr.rgb.sub(avg.rgb).mul(pixelSharpenStrengthU)), ctr.a);
                     }
                 }
 
@@ -1711,24 +1765,23 @@ export function createMaxJSFxController({
                 if (p.brightness !== 0 || p.contrast !== 0 || p.saturation !== 0) {
                     let col = beauty.rgb;
                     if (p.brightness !== 0) {
-                        col = col.add(uniform(p.brightness));
+                        col = col.add(pixelBrightnessU);
                     }
                     if (p.contrast !== 0) {
-                        col = col.sub(0.5).mul(uniform(p.contrast).add(1.0)).add(0.5);
+                        col = col.sub(0.5).mul(pixelContrastU.add(1.0)).add(0.5);
                     }
                     if (p.saturation !== 0) {
                         const luma = col.r.mul(0.2126).add(col.g.mul(0.7152)).add(col.b.mul(0.0722));
-                        col = mix(vec3(luma, luma, luma), col, uniform(p.saturation).add(1.0));
+                        col = mix(vec3(luma, luma, luma), col, pixelSaturationU.add(1.0));
                     }
                     beauty = vec4(col, beauty.a);
                 }
 
                 // Film Grain — animated hash noise
                 if (p.grain && p.grainIntensity > 0) {
-                    const gi = uniform(p.grainIntensity);
                     const seed = screenUV.add(vec2(pixelTimer.mul(0.17), pixelTimer.mul(0.31)));
                     const noise = fract(sin(dot(seed, vec2(12.9898, 78.233))).mul(43758.5453));
-                    beauty = vec4(beauty.rgb.add(noise.sub(0.5).mul(gi)), beauty.a);
+                    beauty = vec4(beauty.rgb.add(noise.sub(0.5).mul(pixelGrainIntensityU)), beauty.a);
                 }
             }
 
@@ -1787,7 +1840,7 @@ export function createMaxJSFxController({
         }
     }
 
-    return {
+    const fxApi = {
         getState() {
             return snapshotState();
         },
@@ -2079,6 +2132,11 @@ export function createMaxJSFxController({
             return state.retro.enabled;
         },
         setRetroEnabled(enabled) {
+            if (enabled && hasShaderLabPassEnabled()) {
+                lastError = 'Retro is unavailable while Shader Lab is active.';
+                onError(lastError);
+                return false;
+            }
             if (enabled && !supportsScreenSpaceEffects) {
                 lastError = 'Retro requires WebGPU or TSL_GL';
                 onError(lastError);
@@ -2090,7 +2148,11 @@ export function createMaxJSFxController({
             rebuildPipeline();
             return state.retro.enabled;
         },
+        isRetroBlockedByShaderLab() {
+            return hasShaderLabPassEnabled();
+        },
         setRetroOptions(options = {}) {
+            const needsRebuild = retroOptionsNeedRebuild(options);
             if (typeof options.wiggle === 'boolean') state.retro.wiggle = options.wiggle;
             assignFinite(state.retro, 'affineDistortion', options.affineDistortion);
             assignFinite(state.retro, 'resolutionScale', options.resolutionScale);
@@ -2104,7 +2166,13 @@ export function createMaxJSFxController({
             assignFinite(state.retro, 'vignetteIntensity', options.vignetteIntensity);
             assignFinite(state.retro, 'bleeding', options.bleeding);
             assignFinite(state.retro, 'curvature', options.curvature);
-            rebuildPipeline();
+            syncRetroUniforms();
+            if (needsRebuild) {
+                rebuildPipeline();
+            } else {
+                syncSharedSceneEffects();
+                if (state.retro.enabled) queuePipelineUpdate({ output: true });
+            }
             return { ...state.retro };
         },
         // ── Pixel FX ──
@@ -2125,6 +2193,7 @@ export function createMaxJSFxController({
             return state.pixel.enabled;
         },
         setPixelOptions(options = {}) {
+            const needsRebuild = pixelOptionsNeedRebuild(options);
             if (typeof options.pixelate === 'boolean') state.pixel.pixelate = options.pixelate;
             assignFinite(state.pixel, 'pixelSize', options.pixelSize);
             if (typeof options.chromatic === 'boolean') state.pixel.chromatic = options.chromatic;
@@ -2136,7 +2205,12 @@ export function createMaxJSFxController({
             assignFinite(state.pixel, 'brightness', options.brightness);
             assignFinite(state.pixel, 'contrast', options.contrast);
             assignFinite(state.pixel, 'saturation', options.saturation);
-            rebuildPipeline();
+            syncPixelUniforms();
+            if (needsRebuild) {
+                rebuildPipeline();
+            } else if (state.pixel.enabled) {
+                queuePipelineUpdate({ output: true });
+            }
             return { ...state.pixel };
         },
 
@@ -2520,6 +2594,17 @@ export function createMaxJSFxController({
             syncRendererResizeState();
         },
     };
+
+    if (typeof window !== 'undefined') {
+        window.addEventListener('maxjs-shader-lab-state', () => {
+            syncSharedSceneEffects(true);
+            if (supportsScreenSpaceEffects && state.retro.enabled) {
+                rebuildPipeline();
+            }
+        });
+    }
+
+    return fxApi;
 }
 
 export { createMaxJSFxController as createSSGIController };

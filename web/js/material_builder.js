@@ -685,6 +685,7 @@ export function createMaterialBuilder({ rootUrl = '.', bakeState = null, rendere
         debugWarn: (...args) => console.warn(...args),
         bakeNodeToTexture: makeBakeNodeToTexture(renderer, THREE),
     });
+    const materialXLoadCache = new Map();
     const fallbackTextures = {
         black: createSolidTexture(0, 0, 0, 255, THREE.NoColorSpace),
         white: createSolidTexture(255, 255, 255, 255, THREE.NoColorSpace),
@@ -827,6 +828,235 @@ export function createMaterialBuilder({ rootUrl = '.', bakeState = null, rendere
     function loadTex(url, colorSpace = THREE.LinearSRGBColorSpace, xf = null) {
         const normalizedXf = optimizedTextureTransformForSlot('map', xf);
         return loadTextureEntry(url, colorSpace, normalizedXf, fallbackTextures.white)?.texture ?? null;
+    }
+
+    function createPendingMaterialXMaterial(md) {
+        if (typeof THREE.MeshPhysicalNodeMaterial !== 'function') return null;
+        const material = new THREE.MeshPhysicalNodeMaterial({
+            color: colorFromArray(md?.color),
+            roughness: md?.rough ?? 0.5,
+            metalness: md?.metal ?? 0.0,
+            side: pickMaterialSide(md),
+        });
+        if (md?.opacity != null && md.opacity < 0.999) {
+            material.transparent = true;
+            material.opacity = md.opacity;
+        }
+        material.userData ??= {};
+        material.userData.maxjsMaterialXPending = true;
+        material.needsUpdate = true;
+        return material;
+    }
+
+    function normalizeMaterialXResourceUrl(url) {
+        const value = String(url ?? '').trim();
+        if (!value) return value;
+        if (/^(?:data:|blob:|https?:)/i.test(value)) return value;
+        return value.replace(/\\/g, '/');
+    }
+
+    function pickMaterialXMaterial(materials, md) {
+        const entries = Object.entries(materials ?? {});
+        if (!entries.length) return null;
+
+        const requestedName = String(md?.materialXName ?? '').trim();
+        if (requestedName) {
+            const namedEntry = entries.find(([name]) => name === requestedName);
+            if (namedEntry) return namedEntry[1];
+        }
+
+        const requestedIndex = Number.isFinite(md?.materialXIndex)
+            ? Math.max(1, Math.round(md.materialXIndex))
+            : 1;
+        return entries[Math.min(entries.length - 1, requestedIndex - 1)]?.[1] ?? null;
+    }
+
+    function normalizeMaterialXDocument(text) {
+        const source = String(text ?? '');
+        if (!source.trim()) return source;
+
+        const parser = new DOMParser();
+        const doc = parser.parseFromString(source, 'application/xml');
+        if (doc.querySelector('parsererror')) return source;
+
+        const hasNamedChild = (node, name) => Array.from(node.children).some(child => child.getAttribute('name') === name);
+        const appendElement = (node, tagName, attrs) => {
+            const child = doc.createElement(tagName);
+            for (const [key, value] of Object.entries(attrs)) child.setAttribute(key, value);
+            node.appendChild(child);
+        };
+        const ensureNamedChild = (selector, name, tagName, attrs) => {
+            for (const node of doc.querySelectorAll(selector)) {
+                if (!hasNamedChild(node, name)) appendElement(node, tagName, { name, ...attrs });
+            }
+        };
+
+        ensureNamedChild('noise2d, cellnoise2d, worleynoise2d, unifiednoise2d', 'texcoord', 'texcoord', { type: 'vector2' });
+        ensureNamedChild('noise3d, cellnoise3d, worleynoise3d, unifiednoise3d', 'texcoord', 'position', { type: 'vector3' });
+        ensureNamedChild('fractal3d', 'position', 'position', { type: 'vector3' });
+        ensureNamedChild('image', 'texcoord', 'texcoord', { type: 'vector2' });
+        ensureNamedChild('tiledimage', 'uvtiling', 'input', { type: 'vector2', value: '1, 1' });
+        ensureNamedChild('tiledimage', 'uvoffset', 'input', { type: 'vector2', value: '0, 0' });
+
+        for (const ss of doc.querySelectorAll('standard_surface')) {
+            const emissionInput = Array.from(ss.children).find(c => c.getAttribute('name') === 'emission');
+            const emColorInput = Array.from(ss.children).find(c => c.getAttribute('name') === 'emission_color');
+            if (emissionInput && !emColorInput) {
+                emissionInput.setAttribute('value', '0');
+            } else if (emissionInput && emColorInput && !emColorInput.getAttribute('nodename')) {
+                const parts = (emColorInput.getAttribute('value') || '0, 0, 0')
+                    .split(',')
+                    .map(v => parseFloat(v.trim()));
+                if (parts.every(v => v < 0.001)) emissionInput.setAttribute('value', '0');
+            }
+        }
+
+        const root = doc.documentElement;
+        if (!root.querySelector('surfacematerial')) {
+            const shaderNode = root.querySelector('standard_surface, gltf_pbr');
+            if (shaderNode && !shaderNode.closest('surfacematerial')) {
+                const shaderName = shaderNode.getAttribute('name') || 'SR_default';
+                const sm = doc.createElement('surfacematerial');
+                sm.setAttribute('name', `${shaderName}_material`);
+                sm.setAttribute('type', 'material');
+                const inp = doc.createElement('input');
+                inp.setAttribute('name', 'surfaceshader');
+                inp.setAttribute('type', 'surfaceshader');
+                inp.setAttribute('nodename', shaderName);
+                sm.appendChild(inp);
+                root.appendChild(sm);
+            }
+        }
+
+        for (const output of doc.querySelectorAll('output[value]')) {
+            if (output.getAttribute('nodename')) continue;
+            const name = output.getAttribute('name');
+            const type = output.getAttribute('type');
+            const value = output.getAttribute('value');
+            if (!name || !type || !value) continue;
+            const constName = `${name}_const`;
+            const constant = doc.createElement('constant');
+            constant.setAttribute('name', constName);
+            constant.setAttribute('type', type);
+            const valInput = doc.createElement('input');
+            valInput.setAttribute('name', 'value');
+            valInput.setAttribute('type', type);
+            valInput.setAttribute('value', value);
+            constant.appendChild(valInput);
+            output.parentNode.insertBefore(constant, output);
+            output.removeAttribute('value');
+            output.setAttribute('nodename', constName);
+        }
+
+        return new XMLSerializer().serializeToString(doc);
+    }
+
+    function applyLoadedMaterialXTemplate(target, source, md) {
+        target.copy(source);
+        for (const key of Object.keys(source)) {
+            if (key.endsWith('Node')) target[key] = source[key];
+        }
+        target.name = source.name || target.name;
+        target.side = pickMaterialSide(md);
+        target.userData ??= {};
+        target.userData.maxjsMaterialXPending = false;
+        target.userData.maxjsMaterialXSourceName = source.name || '';
+        target.needsUpdate = true;
+    }
+
+    function resolveMaterialXUrl(url) {
+        const normalized = normalizeMaterialXResourceUrl(url);
+        if (!normalized) return normalized;
+        if (/^(?:data:|blob:|https?:)/i.test(normalized)) return normalized;
+        return resolveUrl(normalized);
+    }
+
+    async function ensureMaterialXTemplateLoaded(cacheKey, template, md) {
+        if (!template || (!md?.materialXFile && !md?.materialXInline)) return template;
+        if (materialXLoadCache.has(cacheKey)) return materialXLoadCache.get(cacheKey);
+
+        const pending = (async () => {
+            try {
+                const { MaterialXLoader } = await import('three/addons/loaders/MaterialXLoader.js');
+                const manager = new THREE.LoadingManager();
+                const materialXBase = md.materialXBase ? resolveMaterialXUrl(md.materialXBase) : '';
+                const isDataTextureUrl = (url) => {
+                    const lower = String(url || '').toLowerCase();
+                    return lower.includes('normal') || lower.includes('rough') || lower.includes('metal') ||
+                        lower.includes('orm') || lower.includes('ao') || lower.includes('occlusion') ||
+                        lower.includes('height') || lower.includes('displace') || lower.includes('bump') ||
+                        lower.includes('mask');
+                };
+
+                manager.setURLModifier(url => {
+                    const normalized = normalizeMaterialXResourceUrl(url);
+                    if (!normalized) return normalized;
+                    if (/^(?:data:|blob:|https?:)/i.test(normalized)) return normalized;
+                    if (materialXBase) return new URL(normalized, materialXBase.endsWith('/') ? materialXBase : `${materialXBase}/`).href;
+                    return resolveUrl(normalized);
+                });
+                manager.onError = url => console.error('[MaterialX] Failed to load:', url);
+
+                const imgLoader = {
+                    load(url, onLoad, _onProgress, onError) {
+                        const resolvedUrl = manager.resolveURL(url);
+                        const img = new Image();
+                        img.crossOrigin = 'anonymous';
+                        img.onload = () => { manager.itemEnd(resolvedUrl); onLoad?.(img); };
+                        img.onerror = (event) => { manager.itemEnd(resolvedUrl); manager.itemError(resolvedUrl); onError?.(event); };
+                        manager.itemStart(resolvedUrl);
+                        img.src = resolvedUrl;
+                    },
+                };
+                const exrHandler = {
+                    load(url, onLoad, onProgress, onError) {
+                        const resolvedUrl = manager.resolveURL(url);
+                        manager.itemStart(resolvedUrl);
+                        exrLoader.load(
+                            resolvedUrl,
+                            (texture) => {
+                                texture.colorSpace = isDataTextureUrl(resolvedUrl)
+                                    ? THREE.NoColorSpace
+                                    : THREE.LinearSRGBColorSpace;
+                                manager.itemEnd(resolvedUrl);
+                                onLoad?.(texture);
+                            },
+                            onProgress,
+                            (event) => { manager.itemEnd(resolvedUrl); manager.itemError(resolvedUrl); onError?.(event); },
+                        );
+                    },
+                };
+                manager.addHandler(/\.exr(?:[?#].*)?$/i, exrHandler);
+                manager.addHandler(/\.(?:png|jpe?g|webp|gif|bmp|hdr|ktx2?)(?:[?#].*)?$/i, imgLoader);
+
+                const loader = new MaterialXLoader(manager);
+                const xml = md.materialXInline
+                    ? md.materialXInline
+                    : await fetch(resolveMaterialXUrl(md.materialXFile), { cache: 'no-store' }).then(response => {
+                        if (!response.ok) throw new Error(`MaterialX fetch failed: ${response.status} ${response.statusText}`);
+                        return response.text();
+                    });
+                const { materials } = loader.parse(normalizeMaterialXDocument(xml));
+                const loadedMaterial = pickMaterialXMaterial(materials, md);
+                if (!loadedMaterial) throw new Error(`No MaterialX material resolved for ${md.materialXFile || 'inline'}`);
+                applyLoadedMaterialXTemplate(template, loadedMaterial, md);
+                return template;
+            } catch (error) {
+                console.error('[MaterialX] Load failed:', error);
+                template.color?.set?.(0xff00ff);
+                template.wireframe = true;
+                template.userData ??= {};
+                template.userData.maxjsMaterialXPending = false;
+                template.userData.maxjsMaterialXError = String(error?.message ?? error);
+                template.needsUpdate = true;
+                return template;
+            } finally {
+                materialXLoadCache.delete(cacheKey);
+            }
+        })();
+
+        materialXLoadCache.set(cacheKey, pending);
+        return pending;
     }
 
     function getMaterialBakeName(md, material) {
@@ -1207,6 +1437,20 @@ export function createMaterialBuilder({ rootUrl = '.', bakeState = null, rendere
                 tslMaterial.userData.maxjsMaterialModel = 'MeshTSLNodeMaterial';
                 tslMaterial.userData.maxjsSourceMaterialName = descriptor.name ?? 'material';
                 return applyBakeOverrideToMaterial(tslMaterial, descriptor, context);
+            }
+        }
+
+        if (info.wantsMaterialXMaterial && info.hasAdvancedSource && tslCompiler.nodeMaterialsAvailable) {
+            const materialXMaterial = createPendingMaterialXMaterial(descriptor);
+            if (materialXMaterial) {
+                if (descriptor.name) materialXMaterial.name = descriptor.name;
+                materialXMaterial.userData ??= {};
+                materialXMaterial.userData.maxjsRequestedMaterialModel = info.requestedModelName;
+                materialXMaterial.userData.maxjsMaterialModel = 'MaterialXMaterial';
+                materialXMaterial.userData.maxjsSourceMaterialName = descriptor.name ?? 'material';
+                materialXMaterial.userData.maxjsAdvancedSourceFallback = false;
+                ensureMaterialXTemplateLoaded(JSON.stringify(materialIdentityValue(descriptor)), materialXMaterial, descriptor);
+                return applyBakeOverrideToMaterial(materialXMaterial, descriptor, context);
             }
         }
 

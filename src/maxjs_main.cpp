@@ -3576,6 +3576,13 @@ public:
         if (HasHtmlTextureSlot(pbr)) {
             features.htmlTextures = true;
         }
+        if (pbr.materialModel == L"MaterialXMaterial") {
+            features.rendererPref = L"webgpu";
+            AddUniqueRuntimeFeature(features.threeAddons, L"MaterialXLoader");
+        } else if (pbr.materialModel == L"MeshTSLNodeMaterial" ||
+                   pbr.materialModel == L"MeshSSSNodeMaterial") {
+            features.rendererPref = L"webgpu";
+        }
     }
 
     static void DetectSnapshotPostFxFeatures(SnapshotRuntimeFeatures& features,

@@ -1,6 +1,6 @@
 # Stage 3 Dual-World Runtime
 
-This document describes the Stage 3 runtime split for file-backed Three.js projects inside MaxJS.
+This document describes the Stage 3 runtime split for file-backed Three.js projects inside max.js.
 
 Usage-facing naming:
 
@@ -15,7 +15,7 @@ Usage-facing naming:
 
 ## Goal
 
-MaxJS needs two different authoring worlds:
+max.js needs two different authoring worlds:
 
 - `maxRoot`: content mirrored from 3ds Max and owned by the native sync.
 - `jsRoot`: content authored directly in Three.js by inline modules, AI, or project code.

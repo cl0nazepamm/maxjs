@@ -1,4 +1,4 @@
-# MaxJS Refactor Roadmap
+# max.js Refactor Roadmap
 
 Date: 2026-04-04
 
@@ -81,7 +81,7 @@ Deliverables:
 
 - add a short architecture map doc naming the current authoritative modules
 - list every native-to-web message currently used
-- list every registered native MaxJS class
+- list every registered native max.js class
 - define which parts are intentionally legacy and which are current direction
 
 Why first:

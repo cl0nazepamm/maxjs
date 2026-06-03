@@ -30,7 +30,7 @@ max.js exposes three stable viewer pipelines:
 | Mode | Purpose |
 |---|---|
 | **WGL2** | Simple WebGL2 compatibility path with a small safe FX stack. Comes with the experimental pathtracer mode. |
-| **WebGPU** | Main advanced renderer path for the full MaxJS FX stack. Supports forcing WebGL. |
+| **WebGPU** | Main advanced renderer path for the full max.js FX stack. Supports forcing WebGL. |
 
 ## Scene Data
 
@@ -110,7 +110,7 @@ Snapshots export a standalone web package from the current 3ds Max scene.
 Exported snapshot folders can include:
 
 - `index.html` seeded only when missing, so user-authored standalone edits are not overwritten.
-- `snapshot.html` as the MaxJS-owned standalone runtime.
+- `snapshot.html` as the max.js-owned standalone runtime.
 - `snapshot.json` scene metadata.
 - `scene.bin` packed scene payload.
 - `scene_anim.bin` optional binary animation payload.

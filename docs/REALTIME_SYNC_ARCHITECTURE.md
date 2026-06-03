@@ -1,6 +1,6 @@
-# MaxJS Realtime Sync Architecture
+# max.js Realtime Sync Architecture
 
-This file records how realtime sync currently works in MaxJS and what was changed to make it reliable for live editing.
+This file records how realtime sync currently works in max.js and what was changed to make it reliable for live editing.
 
 Date: 2026-05-15
 
@@ -13,7 +13,7 @@ Terminology used elsewhere in docs:
 
 ## Goal
 
-MaxJS keeps a Three.js scene inside WebView2 synchronized with the live 3ds Max scene.
+max.js keeps a Three.js scene inside WebView2 synchronized with the live 3ds Max scene.
 
 The design goal is:
 
@@ -279,7 +279,7 @@ Additional rich fast fields:
 
 These are sent through:
 
-- JSON `xform` payloads when MaxJS is already on the JSON fast path
+- JSON `xform` payloads when max.js is already on the JSON fast path
 - binary `delta_bin` using `UpdateMaterialScalar` for the compact base PBR subset
 - JSON `mat_fast` as an overlay for richer native ThreeJS material scalars on top of binary delta sync
 
@@ -324,7 +324,7 @@ That means material scalars now behave like lights: interactive changes flush on
 
 The binary material delta format is intentionally still small and only carries the compact base subset.
 
-To avoid expanding the binary protocol for every advanced material feature, MaxJS now overlays a JSON `mat_fast` message on top of `delta_bin` whenever richer scalar-only native ThreeJS material fields changed.
+To avoid expanding the binary protocol for every advanced material feature, max.js now overlays a JSON `mat_fast` message on top of `delta_bin` whenever richer scalar-only native ThreeJS material fields changed.
 
 This keeps:
 
@@ -486,7 +486,7 @@ Fix: `IsCreateTaskActive()` check added so creation mode gets the same redraw-dr
 ## Known Limitations
 
 - Editable Poly under higher modifiers is still conservative.
-  If a higher modifier changes the final result, MaxJS falls back to the evaluated path rather than pretending the lower Edit Poly output is the final mesh.
+  If a higher modifier changes the final result, max.js falls back to the evaluated path rather than pretending the lower Edit Poly output is the final mesh.
 
 - Multi/Sub material scalar fast updates are still disabled.
 
@@ -500,7 +500,7 @@ Fix: `IsCreateTaskActive()` check added so creation mode gets the same redraw-dr
 - Slow JSON sync deliberately skips material scalar extraction and full rebuild scheduling.
   It is a diagnostic mode, not a replacement for normal `LIVE` sync.
 
-- The MCP bridge is separate from MaxJS and is not required for this sync path.
+- The MCP bridge is separate from max.js and is not required for this sync path.
 
 ## Design Principles To Keep
 

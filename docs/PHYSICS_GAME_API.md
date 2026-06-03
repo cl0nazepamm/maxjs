@@ -1,8 +1,8 @@
-# MaxJS Physics & Game API
+# max.js Physics & Game API
 
 ## Overview
 
-MaxJS supports interactive physics-driven gameplay via Rapier3D (WASM) integrated with the layer system. Scene objects from 3ds Max can be controlled by physics, and custom game logic can be implemented in JS layers.
+max.js supports interactive physics-driven gameplay via Rapier3D (WASM) integrated with the layer system. Scene objects from 3ds Max can be controlled by physics, and custom game logic can be implemented in JS layers.
 
 ## Physics Engine
 
@@ -96,7 +96,7 @@ node.transform.setWorldTransform(pos.x, pos.y, pos.z, rot.x, rot.y, rot.z, rot.w
 
 ## Units
 
-MaxJS uses centimeters (cm) to match 3ds Max:
+max.js uses centimeters (cm) to match 3ds Max:
 - Gravity: 980 cm/s²
 - Typical object sizes: 10-100 cm
 - Ball speed: 500-1500 cm/s

@@ -1,10 +1,10 @@
-# MaxJS Optimization TODO
+# max.js Optimization TODO
 
 **Status:** Historical optimization plan. The binary scene/delta path, perf HUD, instancing, and most fastsync work have since landed. Keep this file for older rationale; use `REALTIME_SYNC_ARCHITECTURE.md` for current sync behavior.
 
 ## Goal
 
-Turn MaxJS from a live web viewport into a fast alternate viewport:
+Turn max.js from a live web viewport into a fast alternate viewport:
 
 - one-time geometry upload
 - binary delta commands after bootstrap

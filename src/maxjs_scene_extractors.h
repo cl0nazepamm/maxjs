@@ -1439,8 +1439,24 @@ static bool IsForestPackAvailable() {
     return cached == 1;
 }
 
+enum class InstanceGroupKind {
+    ForestPack,
+    RailClone,
+    TyFlow
+};
+
+static const wchar_t* InstanceGroupKindName(InstanceGroupKind kind) {
+    switch (kind) {
+    case InstanceGroupKind::RailClone: return L"railclone";
+    case InstanceGroupKind::TyFlow: return L"tyflow";
+    case InstanceGroupKind::ForestPack:
+    default: return L"forestpack";
+    }
+}
+
 struct ForestInstanceGroup {
-    uintptr_t groupKey;               // unique key: source node handle or mesh pointer
+    InstanceGroupKind kind = InstanceGroupKind::ForestPack;
+    uintptr_t groupKey = 0;           // unique key: source node handle or mesh pointer
     std::vector<float> verts, uvs, norms;
     std::vector<int> indices;
     std::vector<MatGroup> groups;
@@ -1457,6 +1473,7 @@ struct ForestInstanceGroup {
     std::wstring nType;
     size_t xformOff = 0, xformN = 0;
     std::wstring xformType;
+    bool requiresSubobjectMaterials = false;
 };
 
 // Register MaxJS as a Forest Pack render engine (once per session)
@@ -1552,6 +1569,7 @@ static bool ExtractForestPackInstances(INode* fpNode, TimeValue t,
             keyToGroupIdx[groupKey] = groupIdx;
             outGroups.emplace_back();
             ForestInstanceGroup& grp = outGroups.back();
+            grp.kind = InstanceGroupKind::ForestPack;
             grp.groupKey = groupKey;
 
             // Extract geometry — prefer fi.mesh (raw Mesh*), fall back to fi.node
@@ -1678,7 +1696,9 @@ static bool ExtractRailCloneInstances(INode* rcNode, TimeValue t,
             meshToGroupIdx[key] = idx;
             outGroups.emplace_back();
             ForestInstanceGroup& grp = outGroups.back();
+            grp.kind = InstanceGroupKind::RailClone;
             grp.groupKey = key;
+            grp.requiresSubobjectMaterials = true;
             ExtractMeshFromRawMesh(*pmeshes[m], grp.verts, grp.uvs, grp.indices, grp.groups, &grp.norms);
             // RailClone: all segments use the RC node's material
             grp.mtl = rcNode->GetMtl();
@@ -1705,7 +1725,9 @@ static bool ExtractRailCloneInstances(INode* rcNode, TimeValue t,
                 meshToGroupIdx[key] = idx;
                 outGroups.emplace_back();
                 ForestInstanceGroup& grp = outGroups.back();
+                grp.kind = InstanceGroupKind::RailClone;
                 grp.groupKey = key;
+                grp.requiresSubobjectMaterials = true;
                 ExtractMeshFromRawMesh(*inst->mesh, grp.verts, grp.uvs, grp.indices, grp.groups, &grp.norms);
                 // Per-segment material override (RCv4+), or RC node material
                 if (RCisV4(g_rcFeatures)) {
@@ -1811,6 +1833,7 @@ static bool ExtractTyFlowInstances(INode* tyNode, TimeValue t,
             meshToGroupIdx[key] = idx;
             outGroups.emplace_back();
             ForestInstanceGroup& grp = outGroups.back();
+            grp.kind = InstanceGroupKind::TyFlow;
             grp.groupKey = key;
             ExtractMeshFromRawMesh(*srcMesh, grp.verts, grp.uvs, grp.indices, grp.groups, &grp.norms);
             // tyFlow: use node material (instance overrides handled below)

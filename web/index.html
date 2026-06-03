@@ -450,6 +450,7 @@
         import { createMaxJSAudioSystem } from './js/maxjs_audio.js';
         import { createMaxJSGLTFSystem } from './js/maxjs_gltf.js';
         import { createProjectRuntime } from './js/project_runtime.js';
+        import { getInstancedMeshBatchSize, instanceGroupKey } from './js/instance_batching.js';
         import * as css3dOverlay from './js/css3d_overlay.js';
         import { getOrCreateHTMLTexture, releaseHTMLTexture, disposeAllHTMLTextures, attachHTMLClickForwarding } from './js/html_texture.js';
         import { createCanvasPanel } from './js/canvas_panel.js';
@@ -9352,10 +9353,14 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
 
         function applyForestInstances(groups, binaryBuffer = null) {
             // Remove old forest meshes
+            const disposedGeometries = new Set();
             for (const [key, mesh] of forestMeshes) {
                 maxRoot.remove(mesh);
-                mesh.geometry.dispose();
-                mesh.dispose();
+                if (mesh.geometry && !disposedGeometries.has(mesh.geometry)) {
+                    disposedGeometries.add(mesh.geometry);
+                    mesh.geometry.dispose();
+                }
+                mesh.dispose?.();
             }
             forestMeshes.clear();
 
@@ -9393,21 +9398,37 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     mat = new THREE.MeshStandardMaterial({ color: 0x888888, roughness: 0.7, side: THREE.DoubleSide });
                 }
 
-                const instMesh = new THREE.InstancedMesh(geom, mat, count);
-                instMesh.matrixAutoUpdate = false;
-                instMesh.frustumCulled = false;
-                instMesh.castShadow = true;
-                instMesh.receiveShadow = true;
-                instMesh.name = `forest_${grp.src}_x${count}`;
+                const groupKey = instanceGroupKey(grp);
+                const batchSize = Math.max(1, getInstancedMeshBatchSize({
+                    renderer,
+                    backendLabel: rendererBackendLabel,
+                    count,
+                }));
+                const batchCount = Math.ceil(count / batchSize);
+                for (let batchIndex = 0, start = 0; start < count; batchIndex++, start += batchSize) {
+                    const sliceCount = Math.min(batchSize, count - start);
+                    const instMesh = new THREE.InstancedMesh(geom, mat, sliceCount);
+                    instMesh.matrixAutoUpdate = false;
+                    instMesh.frustumCulled = false;
+                    instMesh.castShadow = true;
+                    instMesh.receiveShadow = true;
+                    instMesh.name = batchCount > 1
+                        ? `forest_${groupKey}_part${batchIndex + 1}_x${sliceCount}`
+                        : `forest_${groupKey}_x${sliceCount}`;
+                    instMesh.userData.maxjsInstanceGroup = true;
+                    instMesh.userData.maxjsSource = groupKey;
+                    instMesh.userData.maxjsInstanceStart = start;
+                    instMesh.userData.maxjsInstanceTotal = count;
 
-                for (let i = 0; i < count; i++) {
-                    setForestInstanceMatrix(m, xformPayload, i);
-                    instMesh.setMatrixAt(i, m);
+                    for (let i = 0; i < sliceCount; i++) {
+                        setForestInstanceMatrix(m, xformPayload, start + i);
+                        instMesh.setMatrixAt(i, m);
+                    }
+                    instMesh.instanceMatrix.needsUpdate = true;
+
+                    maxRoot.add(instMesh);
+                    forestMeshes.set(batchCount > 1 ? `${groupKey}:${batchIndex}` : groupKey, instMesh);
                 }
-                instMesh.instanceMatrix.needsUpdate = true;
-
-                maxRoot.add(instMesh);
-                forestMeshes.set(`${grp.src}`, instMesh);
             }
         }
 

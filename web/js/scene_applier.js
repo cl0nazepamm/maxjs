@@ -51,6 +51,7 @@ import {
     normalAttributeFromBinary,
     uvAttributeFromBinary,
 } from './scene_binary.js';
+import { getInstancedMeshBatchSize, instanceGroupKey } from './instance_batching.js';
 
 // ─── Default hooks ─────────────────────────────────────────────────────
 //
@@ -348,11 +349,24 @@ function disposeInstanceMeshes(ctx, hooks) {
     const forestMeshes = ctx.forestMeshes;
     if (!forestMeshes?.size) return 0;
     let removed = 0;
+    const disposedGeometries = new Set();
+    const disposedMaterials = new Set();
     for (const mesh of forestMeshes.values()) {
         if (!mesh) continue;
         mesh.parent?.remove(mesh);
-        mesh.geometry?.dispose?.();
-        hooks.disposeMaterial(mesh.material);
+        if (mesh.geometry && !disposedGeometries.has(mesh.geometry)) {
+            disposedGeometries.add(mesh.geometry);
+            mesh.geometry.dispose?.();
+        }
+        const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+        const pending = [];
+        for (const material of materials) {
+            if (!material || disposedMaterials.has(material)) continue;
+            disposedMaterials.add(material);
+            pending.push(material);
+        }
+        if (pending.length === 1) hooks.disposeMaterial(pending[0]);
+        else if (pending.length > 1) hooks.disposeMaterial(pending);
         removed++;
     }
     forestMeshes.clear();
@@ -377,26 +391,40 @@ function applyForestInstances(groups, buffer, ctx, hooks) {
         const geom = buildInstanceGeometry(grp, buffer);
         if (!geom) continue;
 
+        const groupKey = instanceGroupKey(grp, added);
         const material = hooks.instanceMaterialBuilder({ grp, geom });
-        const instMesh = new THREE.InstancedMesh(geom, material, count);
-        instMesh.matrixAutoUpdate = false;
-        instMesh.frustumCulled = false;
-        instMesh.castShadow = true;
-        instMesh.receiveShadow = true;
-        const groupKey = String(grp.key ?? grp.src ?? added);
-        instMesh.name = `forest_${groupKey}_x${count}`;
-        instMesh.userData.maxjsInstanceGroup = true;
-        instMesh.userData.maxjsSource = groupKey;
+        const batchSize = Math.max(1, getInstancedMeshBatchSize({
+            renderer: ctx.renderer,
+            backendLabel: ctx.rendererBackendLabel,
+            count,
+        }));
+        const batchCount = Math.ceil(count / batchSize);
 
-        for (let i = 0; i < count; i++) {
-            setMatrixFromInstancePayload(matrix, xforms, i);
-            instMesh.setMatrixAt(i, matrix);
+        for (let batchIndex = 0, start = 0; start < count; batchIndex++, start += batchSize) {
+            const sliceCount = Math.min(batchSize, count - start);
+            const instMesh = new THREE.InstancedMesh(geom, material, sliceCount);
+            instMesh.matrixAutoUpdate = false;
+            instMesh.frustumCulled = false;
+            instMesh.castShadow = true;
+            instMesh.receiveShadow = true;
+            instMesh.name = batchCount > 1
+                ? `forest_${groupKey}_part${batchIndex + 1}_x${sliceCount}`
+                : `forest_${groupKey}_x${sliceCount}`;
+            instMesh.userData.maxjsInstanceGroup = true;
+            instMesh.userData.maxjsSource = groupKey;
+            instMesh.userData.maxjsInstanceStart = start;
+            instMesh.userData.maxjsInstanceTotal = count;
+
+            for (let i = 0; i < sliceCount; i++) {
+                setMatrixFromInstancePayload(matrix, xforms, start + i);
+                instMesh.setMatrixAt(i, matrix);
+            }
+            instMesh.instanceMatrix.needsUpdate = true;
+
+            ctx.maxRoot.add(instMesh);
+            ctx.forestMeshes.set(batchCount > 1 ? `${groupKey}:${batchIndex}` : groupKey, instMesh);
+            added++;
         }
-        instMesh.instanceMatrix.needsUpdate = true;
-
-        ctx.maxRoot.add(instMesh);
-        ctx.forestMeshes.set(groupKey, instMesh);
-        added++;
     }
 
     return { sceneChanged: removed > 0 || added > 0, added, removed };

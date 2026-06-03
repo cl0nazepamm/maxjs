@@ -67,6 +67,16 @@ function createInstancesFacade({ THREE, getRoot }) {
         return hit;
     }
 
+    function findMeshes(key) {
+        const want = String(key);
+        const hits = [];
+        eachGroupMesh(m => { if (String(m.userData.maxjsSource) === want) hits.push(m); });
+        hits.sort((a, b) =>
+            (Number(a.userData.maxjsInstanceStart) || 0) -
+            (Number(b.userData.maxjsInstanceStart) || 0));
+        return hits;
+    }
+
     function wrap(mesh) {
         if (!mesh) return null;
         const cached = handleCache.get(mesh);
@@ -120,15 +130,95 @@ function createInstancesFacade({ THREE, getRoot }) {
         return handle;
     }
 
+    function wrapMany(meshes, key) {
+        if (!Array.isArray(meshes) || meshes.length === 0) return null;
+        if (meshes.length === 1) return wrap(meshes[0]);
+        const totalFromPayload = Number(meshes[0]?.userData?.maxjsInstanceTotal);
+        const totalCount = Number.isFinite(totalFromPayload) && totalFromPayload > 0
+            ? totalFromPayload
+            : meshes.reduce((sum, mesh) => sum + (mesh?.count || 0), 0);
+
+        function locate(globalIndex) {
+            if (!Number.isInteger(globalIndex) || globalIndex < 0 || globalIndex >= totalCount) return null;
+            let runningStart = 0;
+            for (const mesh of meshes) {
+                const declaredStart = Number(mesh.userData.maxjsInstanceStart);
+                const start = Number.isFinite(declaredStart) ? declaredStart : runningStart;
+                const end = start + mesh.count;
+                if (globalIndex >= start && globalIndex < end) {
+                    return { mesh, localIndex: globalIndex - start };
+                }
+                runningStart = end;
+            }
+            return null;
+        }
+
+        return freezePlainObject({
+            get key() { return key; },
+            get count() { return totalCount; },
+            get raw() { return meshes[0]; },
+            get rawMeshes() { return meshes.slice(); },
+            getMatrixAt(i, out = new THREE.Matrix4()) {
+                const hit = locate(i);
+                if (!hit) return null;
+                hit.mesh.getMatrixAt(hit.localIndex, out);
+                return out;
+            },
+            setMatrixAt(i, matrix) {
+                const hit = locate(i);
+                if (!hit || !matrix || !matrix.isMatrix4) return false;
+                hit.mesh.setMatrixAt(hit.localIndex, matrix);
+                hit.mesh.instanceMatrix.needsUpdate = true;
+                return true;
+            },
+            getPositionAt(i, out = new THREE.Vector3()) {
+                const hit = locate(i);
+                if (!hit) return null;
+                hit.mesh.getMatrixAt(hit.localIndex, scratch);
+                return out.setFromMatrixPosition(scratch);
+            },
+            setPositionAt(i, x, y, z) {
+                const hit = locate(i);
+                if (!hit) return false;
+                hit.mesh.getMatrixAt(hit.localIndex, scratch);
+                if (x && typeof x === 'object') {
+                    scratch.setPosition(x.x ?? x[0] ?? 0, x.y ?? x[1] ?? 0, x.z ?? x[2] ?? 0);
+                } else {
+                    scratch.setPosition(x, y, z);
+                }
+                hit.mesh.setMatrixAt(hit.localIndex, scratch);
+                hit.mesh.instanceMatrix.needsUpdate = true;
+                return true;
+            },
+            forEach(fn) {
+                if (typeof fn !== 'function') return;
+                let runningStart = 0;
+                for (const mesh of meshes) {
+                    const declaredStart = Number(mesh.userData.maxjsInstanceStart);
+                    const start = Number.isFinite(declaredStart) ? declaredStart : runningStart;
+                    for (let i = 0; i < mesh.count; i++) {
+                        mesh.getMatrixAt(i, iterScratch);
+                        fn(start + i, iterScratch, this);
+                    }
+                    runningStart = start + mesh.count;
+                }
+            },
+            flush() {
+                for (const mesh of meshes) mesh.instanceMatrix.needsUpdate = true;
+                return true;
+            },
+        });
+    }
+
     return freezePlainObject({
-        get count() { let n = 0; eachGroupMesh(() => { n++; }); return n; },
-        keys() { const out = []; eachGroupMesh(m => out.push(m.userData.maxjsSource)); return out; },
+        get count() { return this.keys().length; },
+        keys() { const out = new Set(); eachGroupMesh(m => out.add(m.userData.maxjsSource)); return [...out]; },
         has(key) { return findMesh(key) !== null; },
-        get(key) { return wrap(findMesh(key)); },
-        all() { const out = []; eachGroupMesh(m => out.push(wrap(m))); return out; },
+        get(key) { return wrapMany(findMeshes(key), String(key)); },
+        all() { return this.keys().map(key => this.get(key)).filter(Boolean); },
         forEach(fn) {
             if (typeof fn !== 'function') return;
-            eachGroupMesh(m => fn(wrap(m), m.userData.maxjsSource));
+            for (const key of this.keys()) fn(this.get(key), key);
         },
         [Symbol.iterator]() { return this.all()[Symbol.iterator](); },
     });

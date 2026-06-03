@@ -101,6 +101,7 @@
                     if (!firstGrp) ss << L',';
                     firstGrp = false;
                     ss << L"{\"src\":" << grp.groupKey;
+                    ss << L",\"kind\":\"" << InstanceGroupKindName(grp.kind) << L"\"";
                     ss << L",\"count\":" << grp.instanceCount;
                     ss << L",\"v\":"; WriteFloats(ss, grp.verts.data(), grp.verts.size());
                     ss << L",\"i\":"; WriteInts(ss, grp.indices.data(), grp.indices.size());
@@ -871,6 +872,7 @@
                     firstGrp = false;
 
                     ss << L"{\"src\":" << grp.groupKey;
+                    ss << L",\"kind\":\"" << InstanceGroupKindName(grp.kind) << L"\"";
                     ss << L",\"count\":" << grp.instanceCount;
                     ss << L",\"v\":"; WriteFloats(ss, grp.verts.data(), grp.verts.size());
                     ss << L",\"i\":"; WriteInts(ss, grp.indices.data(), grp.indices.size());

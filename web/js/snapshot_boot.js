@@ -463,6 +463,8 @@ async function applyDelta(buffer, ctx) {
             nodeMap: ctx.nodeMap,
             maxRoot: ctx.maxRoot,
             scene: ctx.scene,
+            renderer: ctx.renderer,
+            rendererBackendLabel: ctx.renderer?.userData?.maxjsBackendLabel,
             forestMeshes: ctx.forestMeshes,
             lastInstanceBucketSignature: '',
         },
@@ -1157,11 +1159,20 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
             try { snapshotEnvironment.dispose(); } catch {}
             try { sceneLights.dispose(); } catch {}
             try {
+                const disposedGeometries = new Set();
+                const disposedMaterials = new Set();
                 for (const mesh of applierCtx.forestMeshes.values()) {
                     mesh.parent?.remove(mesh);
-                    mesh.geometry?.dispose?.();
-                    if (Array.isArray(mesh.material)) mesh.material.forEach((m) => m?.dispose?.());
-                    else mesh.material?.dispose?.();
+                    if (mesh.geometry && !disposedGeometries.has(mesh.geometry)) {
+                        disposedGeometries.add(mesh.geometry);
+                        mesh.geometry.dispose?.();
+                    }
+                    const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+                    for (const material of materials) {
+                        if (!material || disposedMaterials.has(material)) continue;
+                        disposedMaterials.add(material);
+                        material.dispose?.();
+                    }
                 }
                 applierCtx.forestMeshes.clear();
             } catch {}

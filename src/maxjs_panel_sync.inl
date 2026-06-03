@@ -4801,8 +4801,12 @@
         }
 
         Mtl* multiMtl = FindMultiSubMtl(grp.mtl);
-        if (ShouldEmitMultiSubMaterialGroups(multiMtl, grp.groups)) {
-            // Multi/Sub: write groups + per-group sub-materials
+        const bool emitSubobjectGroups =
+            ShouldEmitMultiSubMaterialGroups(multiMtl, grp.groups) ||
+            (grp.requiresSubobjectMaterials && multiMtl && !grp.groups.empty());
+        if (emitSubobjectGroups) {
+            // RailClone segments rely on subobject material IDs; keep the
+            // generic groups/mats payload explicit for every grouped segment.
             ss << L",\"groups\":[";
             for (size_t g = 0; g < grp.groups.size(); g++) {
                 if (g) ss << L',';

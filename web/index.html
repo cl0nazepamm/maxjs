@@ -450,7 +450,7 @@
         import { createMaxJSAudioSystem } from './js/maxjs_audio.js';
         import { createMaxJSGLTFSystem } from './js/maxjs_gltf.js';
         import { createProjectRuntime } from './js/project_runtime.js';
-        import { getInstancedMeshBatchSize, instanceGroupKey } from './js/instance_batching.js';
+        import { getInstancedMeshBatchSize, instanceGroupKey, isWebGpuInstancingPath } from './js/instance_batching.js';
         import * as css3dOverlay from './js/css3d_overlay.js';
         import { getOrCreateHTMLTexture, releaseHTMLTexture, disposeAllHTMLTextures, attachHTMLClickForwarding } from './js/html_texture.js';
         import { createCanvasPanel } from './js/canvas_panel.js';
@@ -9281,6 +9281,8 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
 
         // ── ForestPack GPU Instancing ───────────────────────
         const forestMeshes = new Map(); // key → InstancedMesh
+        let forestBuildSerial = 0;
+        const FOREST_INSTANCE_UPLOAD_CHUNK = 4096;
 
         function getForestBinaryFloatView(buffer, off, n, label) {
             if (!(buffer instanceof ArrayBuffer) || !binInRange(buffer, off, n)) {
@@ -9351,7 +9353,132 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             );
         }
 
+        function writeForestInstanceMatrixAt(target, targetOff, payload, index) {
+            const values = payload.values;
+            const off = index * payload.stride;
+            if (payload.type === 'affine12') {
+                target[targetOff + 0] = values[off + 0];
+                target[targetOff + 1] = values[off + 1];
+                target[targetOff + 2] = values[off + 2];
+                target[targetOff + 3] = 0;
+                target[targetOff + 4] = values[off + 3];
+                target[targetOff + 5] = values[off + 4];
+                target[targetOff + 6] = values[off + 5];
+                target[targetOff + 7] = 0;
+                target[targetOff + 8] = values[off + 6];
+                target[targetOff + 9] = values[off + 7];
+                target[targetOff + 10] = values[off + 8];
+                target[targetOff + 11] = 0;
+                target[targetOff + 12] = values[off + 9];
+                target[targetOff + 13] = values[off + 10];
+                target[targetOff + 14] = values[off + 11];
+                target[targetOff + 15] = 1;
+                return;
+            }
+            if (typeof values.subarray === 'function') {
+                target.set(values.subarray(off, off + 16), targetOff);
+                return;
+            }
+            for (let i = 0; i < 16; i++) {
+                target[targetOff + i] = values[off + i];
+            }
+        }
+
+        function nextForestBuildFrame() {
+            return new Promise(resolve => requestAnimationFrame(resolve));
+        }
+
+        function disposeForestBuildMaterial(material, disposedMaterials) {
+            const materials = Array.isArray(material) ? material : [material];
+            for (const item of materials) {
+                if (!item || disposedMaterials.has(item)) continue;
+                disposedMaterials.add(item);
+                disposeSceneMaterial(item);
+            }
+        }
+
+        function disposeForestBuildResources(geometry, material) {
+            geometry?.dispose?.();
+            disposeForestBuildMaterial(material, new Set());
+        }
+
+        function usingWebGpuInstanceMaterials() {
+            return isWebGpuInstancingPath({ renderer, backendLabel: rendererBackendLabel });
+        }
+
+        function copyInstanceTextureSlot(source, target, fromKey, toKey = fromKey) {
+            const url = source?.[fromKey];
+            if (typeof url === 'string' && url.length > 0) target[toKey] = url;
+            const xf = source?.[`${fromKey}Xf`];
+            if (xf != null) target[`${toKey}Xf`] = xf;
+        }
+
+        function webGpuSafeInstanceMaterialDescriptor(md) {
+            if (!usingWebGpuInstanceMaterials() || !md || typeof md !== 'object') return md;
+
+            const safe = {
+                model: 'MeshStandardMaterial',
+                name: md.name,
+                color: Array.isArray(md.color) ? md.color.slice(0, 3) : [0.8, 0.8, 0.8],
+                side: md.side,
+                rough: Number.isFinite(md.rough) ? md.rough : 0.65,
+                metal: Number.isFinite(md.metal) ? md.metal : 0.0,
+                envI: Number.isFinite(md.envI) ? md.envI : 1.0,
+            };
+
+            if (md.opacity != null) safe.opacity = md.opacity;
+            if (md.transparent === true) safe.transparent = true;
+            if (md.depthWrite != null) safe.depthWrite = md.depthWrite;
+            if (md.depthTest != null) safe.depthTest = md.depthTest;
+            if (Number.isFinite(md.alphaTest) && md.alphaTest > 0) safe.alphaTest = md.alphaTest;
+            if (Array.isArray(md.em) && md.emI > 0) {
+                safe.em = md.em.slice(0, 3);
+                safe.emI = md.emI;
+            }
+
+            copyInstanceTextureSlot(md, safe, 'map');
+            if (!safe.map) copyInstanceTextureSlot(md, safe, 'diffMap', 'map');
+            copyInstanceTextureSlot(md, safe, 'opMap');
+            if (!safe.opMap) copyInstanceTextureSlot(md, safe, 'alphaMap', 'opMap');
+            if (!safe.opMap) copyInstanceTextureSlot(md, safe, 'opacityMap', 'opMap');
+
+            if (safe.opMap && !(Number.isFinite(safe.alphaTest) && safe.alphaTest > 0)) {
+                safe.alphaTest = 0.35;
+                safe.transparent = false;
+            }
+
+            return safe;
+        }
+
+        function dominantForestMaterialIndex(grp) {
+            if (!Array.isArray(grp?.groups) || grp.groups.length === 0) return 0;
+            let bestIndex = 0;
+            let bestCount = -1;
+            for (const group of grp.groups) {
+                const materialIndex = Number(group?.[2]);
+                const indexCount = Number(group?.[1]);
+                if (Number.isFinite(materialIndex) && Number.isFinite(indexCount) && indexCount > bestCount) {
+                    bestIndex = materialIndex;
+                    bestCount = indexCount;
+                }
+            }
+            return bestIndex;
+        }
+
+        function shouldCollapseForestMaterialsForWebGpu(grp) {
+            if (!usingWebGpuInstanceMaterials()) return false;
+            if (String(grp?.kind || '').toLowerCase() === 'railclone') return false;
+            if (!Array.isArray(grp?.mats) || !Array.isArray(grp?.groups)) return false;
+            const textureSlots = grp.mats.reduce((sum, material) => sum + countMaterialTextureSlots(material), 0);
+            return grp.groups.length > 8 || textureSlots > 4;
+        }
+
+        function createForestInstanceMaterial(md, materialContext = null) {
+            return createMaterial(webGpuSafeInstanceMaterialDescriptor(md), materialContext);
+        }
+
         function applyForestInstances(groups, binaryBuffer = null) {
+            const buildSerial = ++forestBuildSerial;
             // Remove old forest meshes
             const disposedGeometries = new Set();
             const disposedMaterials = new Set();
@@ -9361,12 +9488,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     disposedGeometries.add(mesh.geometry);
                     mesh.geometry.dispose();
                 }
-                const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
-                for (const material of materials) {
-                    if (!material || disposedMaterials.has(material)) continue;
-                    disposedMaterials.add(material);
-                    disposeSceneMaterial(material);
-                }
+                disposeForestBuildMaterial(mesh.material, disposedMaterials);
                 mesh.dispose?.();
             }
             forestMeshes.clear();
@@ -9374,9 +9496,9 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             if (!Array.isArray(groups) || groups.length === 0) return;
             maxjsDebugLog('[ForestPack]', groups.length, 'groups, total instances:', groups.reduce((s, g) => s + (g.count || 0), 0));
 
-            const m = new THREE.Matrix4();
-
-            for (const grp of groups) {
+            const buildForestInstances = async () => {
+                for (const grp of groups) {
+                    if (buildSerial !== forestBuildSerial) return;
                 const geoPayload = getForestGeometryPayload(grp, binaryBuffer);
                 const xformPayload = getForestTransformPayload(grp, binaryBuffer);
                 const count = grp.count || Math.floor((xformPayload?.values?.length || 0) / (xformPayload?.stride || 16));
@@ -9393,14 +9515,20 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
 
                 // Material: use data from C++ (single or multi-sub), fallback to gray
                 let mat;
-                if (grp.mats && grp.groups) {
+                if (shouldCollapseForestMaterialsForWebGpu(grp)) {
+                    const materialIndex = dominantForestMaterialIndex(grp);
+                    const sourceMaterial = grp.mats?.[materialIndex] ?? grp.mats?.[0] ?? grp.mat;
+                    mat = sourceMaterial
+                        ? createForestInstanceMaterial(sourceMaterial, { geometry: geom, materialIndex: null })
+                        : new THREE.MeshStandardMaterial({ color: 0x888888, roughness: 0.7, side: THREE.DoubleSide });
+                } else if (grp.mats && grp.groups) {
                     // Multi/Sub material — create material array + geometry groups
                     for (const [start, count, idx] of grp.groups) {
                         geom.addGroup(start, count, idx);
                     }
-                    mat = grp.mats.map((m, materialIndex) => createMaterial(m, { geometry: geom, materialIndex }));
+                    mat = grp.mats.map((m, materialIndex) => createForestInstanceMaterial(m, { geometry: geom, materialIndex }));
                 } else if (grp.mat) {
-                    mat = createMaterial(grp.mat, { geometry: geom, materialIndex: null });
+                    mat = createForestInstanceMaterial(grp.mat, { geometry: geom, materialIndex: null });
                 } else {
                     mat = new THREE.MeshStandardMaterial({ color: 0x888888, roughness: 0.7, side: THREE.DoubleSide });
                 }
@@ -9413,6 +9541,10 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 }));
                 const batchCount = Math.ceil(count / batchSize);
                 for (let batchIndex = 0, start = 0; start < count; batchIndex++, start += batchSize) {
+                    if (buildSerial !== forestBuildSerial) {
+                        disposeForestBuildResources(geom, mat);
+                        return;
+                    }
                     const sliceCount = Math.min(batchSize, count - start);
                     const instMesh = new THREE.InstancedMesh(geom, mat, sliceCount);
                     instMesh.matrixAutoUpdate = false;
@@ -9426,17 +9558,30 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     instMesh.userData.maxjsSource = groupKey;
                     instMesh.userData.maxjsInstanceStart = start;
                     instMesh.userData.maxjsInstanceTotal = count;
+                    const matrixArray = instMesh.instanceMatrix.array;
 
                     for (let i = 0; i < sliceCount; i++) {
-                        setForestInstanceMatrix(m, xformPayload, start + i);
-                        instMesh.setMatrixAt(i, m);
+                        if ((i > 0) && (i % FOREST_INSTANCE_UPLOAD_CHUNK) === 0) {
+                            await nextForestBuildFrame();
+                            if (buildSerial !== forestBuildSerial) {
+                                disposeForestBuildResources(instMesh.geometry, instMesh.material);
+                                return;
+                            }
+                        }
+                        writeForestInstanceMatrixAt(matrixArray, i * 16, xformPayload, start + i);
                     }
                     instMesh.instanceMatrix.needsUpdate = true;
 
+                    if (buildSerial !== forestBuildSerial) {
+                        disposeForestBuildResources(instMesh.geometry, instMesh.material);
+                        return;
+                    }
                     maxRoot.add(instMesh);
                     forestMeshes.set(batchCount > 1 ? `${groupKey}:${batchIndex}` : groupKey, instMesh);
                 }
             }
+            };
+            buildForestInstances().catch(err => console.error('[ForestPack] async build failed', err));
         }
 
         // ── tyFlow Volume Rendering (smoke/fire) ─────────────

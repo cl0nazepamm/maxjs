@@ -3973,7 +3973,6 @@ public:
                 }
             };
             collectInstances(root);
-            CoalesceInstanceGroups(snapshotInstanceGroups);
         }
 
         const size_t instanceBytesStart = totalBytes;
@@ -4301,7 +4300,7 @@ public:
 
                     ss << L"{\"src\":" << group.groupKey;
                     ss << L",\"kind\":\"" << InstanceGroupKindName(group.kind) << L"\"";
-                    ss << L",\"key\":\"" << InstanceGroupKindName(group.kind) << L":" << group.runtimeKey << L"\"";
+                    ss << L",\"key\":\"" << InstanceGroupKindName(group.kind) << L":" << group.ownerKey << L":" << group.groupKey << L"\"";
                     ss << L",\"count\":" << group.instanceCount;
                     ss << L",\"geo\":{\"vOff\":" << group.vOff
                        << L",\"vN\":" << group.vN

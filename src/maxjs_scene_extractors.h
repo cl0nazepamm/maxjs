@@ -1458,7 +1458,6 @@ struct ForestInstanceGroup {
     InstanceGroupKind kind = InstanceGroupKind::ForestPack;
     uintptr_t groupKey = 0;           // unique key: source node handle or mesh pointer
     uintptr_t ownerKey = 0;           // plugin object handle that produced this group
-    uintptr_t runtimeKey = 0;         // stable emitted key after native coalescing
     std::vector<float> verts, uvs, norms;
     std::vector<int> indices;
     std::vector<MatGroup> groups;
@@ -1477,94 +1476,6 @@ struct ForestInstanceGroup {
     std::wstring xformType;
     bool requiresSubobjectMaterials = false;
 };
-
-static bool SameInstanceMatGroups(const std::vector<MatGroup>& a,
-                                  const std::vector<MatGroup>& b) {
-    if (a.size() != b.size()) return false;
-    for (size_t i = 0; i < a.size(); ++i) {
-        if (a[i].matID != b[i].matID ||
-            a[i].start != b[i].start ||
-            a[i].count != b[i].count) {
-            return false;
-        }
-    }
-    return true;
-}
-
-static bool CanMergeInstanceGroups(const ForestInstanceGroup& a,
-                                   const ForestInstanceGroup& b) {
-    if (a.kind != b.kind ||
-        a.groupKey != b.groupKey ||
-        a.mtl != b.mtl ||
-        a.requiresSubobjectMaterials != b.requiresSubobjectMaterials) {
-        return false;
-    }
-
-    // If there is no material, WriteInstanceGroupMaterial falls back to the
-    // node wire color, so only merge groups with the same fallback node.
-    if (!a.mtl && a.mtlNode != b.mtlNode) return false;
-
-    return SameInstanceMatGroups(a.groups, b.groups);
-}
-
-static uintptr_t MakeVariantInstanceKey(const ForestInstanceGroup& group, size_t variantIndex) {
-    uint64_t h = HashFNV1a(&group.kind, sizeof(group.kind));
-    h = HashFNV1a(&group.groupKey, sizeof(group.groupKey), h);
-    h = HashFNV1a(&group.ownerKey, sizeof(group.ownerKey), h);
-    const uintptr_t mtlKey = reinterpret_cast<uintptr_t>(group.mtl);
-    h = HashFNV1a(&mtlKey, sizeof(mtlKey), h);
-    h = HashFNV1a(&variantIndex, sizeof(variantIndex), h);
-    if (h == 0) h = 1;
-    return static_cast<uintptr_t>(h);
-}
-
-static void CoalesceInstanceGroups(std::vector<ForestInstanceGroup>& groups) {
-    if (groups.size() < 2) {
-        for (ForestInstanceGroup& group : groups) {
-            if (group.runtimeKey == 0) group.runtimeKey = group.groupKey;
-        }
-        return;
-    }
-
-    std::vector<ForestInstanceGroup> merged;
-    merged.reserve(groups.size());
-
-    for (ForestInstanceGroup& group : groups) {
-        if (group.runtimeKey == 0) group.runtimeKey = group.groupKey;
-
-        auto it = std::find_if(merged.begin(), merged.end(),
-            [&](const ForestInstanceGroup& existing) {
-                return CanMergeInstanceGroups(existing, group);
-            });
-
-        if (it != merged.end()) {
-            it->transforms.insert(it->transforms.end(), group.transforms.begin(), group.transforms.end());
-            it->instanceCount += group.instanceCount;
-            continue;
-        }
-
-        merged.push_back(std::move(group));
-    }
-
-    std::unordered_map<std::wstring, size_t> baseCounts;
-    for (const ForestInstanceGroup& group : merged) {
-        std::wstring base = std::wstring(InstanceGroupKindName(group.kind)) + L":" + std::to_wstring(group.groupKey);
-        baseCounts[base] += 1;
-    }
-
-    std::unordered_map<std::wstring, size_t> variantCounts;
-    for (ForestInstanceGroup& group : merged) {
-        std::wstring base = std::wstring(InstanceGroupKindName(group.kind)) + L":" + std::to_wstring(group.groupKey);
-        if (baseCounts[base] <= 1) {
-            group.runtimeKey = group.groupKey;
-        } else {
-            const size_t variant = variantCounts[base]++;
-            group.runtimeKey = MakeVariantInstanceKey(group, variant);
-        }
-    }
-
-    groups = std::move(merged);
-}
 
 // Register MaxJS as a Forest Pack render engine (once per session)
 static bool g_forestEngineRegistered = false;

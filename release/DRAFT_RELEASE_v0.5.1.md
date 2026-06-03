@@ -16,9 +16,10 @@ Baseline: `v0.5.0`.
 ## Improved
 
 - **WebGPU instancing** - large Forest Pack, RailClone, and tyFlow groups are batched into WebGPU-safe `THREE.InstancedMesh` slices to avoid `bindGroup_object` failures on very high instance counts.
-- **Performance** - compatible Forest Pack, RailClone, and tyFlow scatters are coalesced natively before emission, reducing draw groups when multiple scatter objects reuse the same source geometry/material. Heavy scatters stay on the GPU instancing path and are not expanded into individual meshes.
+- **Forest Pack material stability** - WebGPU Forest Pack instancing now uses a constrained material profile for complex tree sources, preserving diffuse/alpha cutout readability while avoiding advanced material bind-group failures.
+- **Performance** - heavy scatters stay on the GPU instancing path and are not expanded into individual meshes. Large instance matrix uploads are chunked across frames so huge Forest Pack, RailClone, and tyFlow scenes do not freeze the viewer while loading.
 - **Runtime layers** - `ctx.instances` aggregates sliced WebGPU batches back into one logical handle, so scripts can keep using global instance indices for `getMatrixAt`, `setMatrixAt`, position helpers, iteration, and flushing.
-- **RailClone materials** - RailClone now explicitly preserves subobject material grouping for segment material IDs.
+- **RailClone materials** - RailClone explicitly preserves subobject material grouping for segment material IDs and is excluded from Forest Pack's WebGPU material-collapse path.
 - **Snapshot / Viewer parity** - standalone snapshot replay uses the same instance batching behavior as the live viewer.
 - **Resource cleanup** - live and standalone instance rebuilds now retire old instanced geometry and materials through the deferred disposal path so WebGPU does not keep stale object bindings alive.
 

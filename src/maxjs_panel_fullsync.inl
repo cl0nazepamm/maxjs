@@ -93,7 +93,6 @@
                 }
             };
             collectInstances(root);
-            CoalesceInstanceGroups(allInstGroups);
             if (!allInstGroups.empty()) {
                 ss << L",\"forestInstances\":[";
                 bool firstGrp = true;
@@ -103,7 +102,7 @@
                     firstGrp = false;
                     ss << L"{\"src\":" << grp.groupKey;
                     ss << L",\"kind\":\"" << InstanceGroupKindName(grp.kind) << L"\"";
-                    ss << L",\"key\":\"" << InstanceGroupKindName(grp.kind) << L":" << grp.runtimeKey << L"\"";
+                    ss << L",\"key\":\"" << InstanceGroupKindName(grp.kind) << L":" << grp.ownerKey << L":" << grp.groupKey << L"\"";
                     ss << L",\"count\":" << grp.instanceCount;
                     ss << L",\"v\":"; WriteFloats(ss, grp.verts.data(), grp.verts.size());
                     ss << L",\"i\":"; WriteInts(ss, grp.indices.data(), grp.indices.size());
@@ -864,7 +863,6 @@
                 }
             };
             collectInstances(root);
-            CoalesceInstanceGroups(allInstGroups);
 
             if (!allInstGroups.empty()) {
                 ss << L",\"forestInstances\":[";
@@ -876,7 +874,7 @@
 
                     ss << L"{\"src\":" << grp.groupKey;
                     ss << L",\"kind\":\"" << InstanceGroupKindName(grp.kind) << L"\"";
-                    ss << L",\"key\":\"" << InstanceGroupKindName(grp.kind) << L":" << grp.runtimeKey << L"\"";
+                    ss << L",\"key\":\"" << InstanceGroupKindName(grp.kind) << L":" << grp.ownerKey << L":" << grp.groupKey << L"\"";
                     ss << L",\"count\":" << grp.instanceCount;
                     ss << L",\"v\":"; WriteFloats(ss, grp.verts.data(), grp.verts.size());
                     ss << L",\"i\":"; WriteInts(ss, grp.indices.data(), grp.indices.size());

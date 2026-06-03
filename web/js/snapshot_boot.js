@@ -471,8 +471,23 @@ async function applyDelta(buffer, ctx) {
         hooks: {
             materialBuilder: ({ nd, geom, wantsLine }) =>
                 ctx.materialBuilder.buildForNode({ nd, geom, wantsLine }),
-            instanceMaterialBuilder: ({ grp, geom }) =>
-                ctx.materialBuilder.buildForNode({ nd: grp, geom, wantsLine: false }),
+            instanceMaterialBuilder: ({ grp, geom, materialDescriptor, materialIndex }) => {
+                if (materialDescriptor) {
+                    return ctx.materialBuilder.buildForNode({
+                        nd: { mat: materialDescriptor },
+                        geom,
+                        wantsLine: false,
+                    });
+                }
+                if (Array.isArray(grp?.mats) && Array.isArray(grp?.groups) && Number.isInteger(materialIndex)) {
+                    return ctx.materialBuilder.buildForNode({
+                        nd: { mat: grp.mats[materialIndex] },
+                        geom,
+                        wantsLine: false,
+                    });
+                }
+                return ctx.materialBuilder.buildForNode({ nd: grp, geom, wantsLine: false });
+            },
             materialUpdater: ({ mesh, nd, wantsLine }) => {
                 if (!ctx.materialBuilder.shouldUpdate({ mesh, nd })) return false;
                 const next = ctx.materialBuilder.buildForNode({ nd, geom: mesh.geometry, wantsLine });

@@ -51,7 +51,7 @@ import {
     normalAttributeFromBinary,
     uvAttributeFromBinary,
 } from './scene_binary.js';
-import { getInstancedMeshBatchSize, instanceGroupKey } from './instance_batching.js';
+import { getInstancedMeshBatchSize, instanceGroupKey, isWebGpuInstancingPath } from './instance_batching.js';
 
 // ─── Default hooks ─────────────────────────────────────────────────────
 //
@@ -69,7 +69,7 @@ const DEFAULT_HOOKS = Object.freeze({
             ? new THREE.LineBasicMaterial({ color: 0xcccccc })
             : new THREE.MeshStandardMaterial({ color: 0xb0b0b0, roughness: 0.6, metalness: 0.0 }),
 
-    /** ({ grp, geom }) -> THREE.Material | THREE.Material[] */
+    /** ({ grp, geom, materialDescriptor?, materialIndex? }) -> THREE.Material | THREE.Material[] */
     instanceMaterialBuilder: () =>
         new THREE.MeshStandardMaterial({ color: 0x888888, roughness: 0.7, side: THREE.DoubleSide }),
 
@@ -303,10 +303,12 @@ function buildInstanceGeometry(grp, buffer) {
         else geom.computeVertexNormals();
     }
 
-    if (Array.isArray(grp.groups)) {
-        for (const [start, count, idx] of grp.groups) geom.addGroup(start, count, idx);
-    }
     return geom;
+}
+
+function addInstanceGeometryGroups(geom, groups) {
+    if (!geom || !Array.isArray(groups)) return;
+    for (const [start, count, idx] of groups) geom.addGroup(start, count, idx);
 }
 
 function getInstanceTransformPayload(grp, buffer) {
@@ -373,6 +375,131 @@ function disposeInstanceMeshes(ctx, hooks) {
     return removed;
 }
 
+function countMaterialTextureSlots(md) {
+    if (!md || typeof md !== 'object') return 0;
+    let count = 0;
+    for (const [key, value] of Object.entries(md)) {
+        if (typeof value !== 'string' || value.length === 0) continue;
+        if (key === 'model' || key === 'name' || key === 'materialXFile' || key === 'materialXInline') continue;
+        if (key.endsWith('Map') || key.endsWith('Tex') || key.endsWith('Path') || key.endsWith('File')) count++;
+    }
+    return count;
+}
+
+function usingWebGpuInstanceMaterials(ctx) {
+    return isWebGpuInstancingPath({
+        renderer: ctx?.renderer,
+        backendLabel: ctx?.rendererBackendLabel,
+    });
+}
+
+function copyInstanceTextureSlot(source, target, fromKey, toKey = fromKey) {
+    const url = source?.[fromKey];
+    if (typeof url === 'string' && url.length > 0) target[toKey] = url;
+    const xf = source?.[`${fromKey}Xf`];
+    if (xf != null) target[`${toKey}Xf`] = xf;
+}
+
+function webGpuSafeInstanceMaterialDescriptor(md, ctx) {
+    if (!usingWebGpuInstanceMaterials(ctx) || !md || typeof md !== 'object') return md;
+
+    const safe = {
+        model: 'MeshStandardMaterial',
+        name: md.name,
+        color: Array.isArray(md.color) ? md.color.slice(0, 3) : [0.8, 0.8, 0.8],
+        side: md.side,
+        rough: Number.isFinite(md.rough) ? md.rough : 0.65,
+        metal: Number.isFinite(md.metal) ? md.metal : 0.0,
+        envI: Number.isFinite(md.envI) ? md.envI : 1.0,
+    };
+
+    if (md.opacity != null) safe.opacity = md.opacity;
+    if (md.transparent === true) safe.transparent = true;
+    if (md.depthWrite != null) safe.depthWrite = md.depthWrite;
+    if (md.depthTest != null) safe.depthTest = md.depthTest;
+    if (Number.isFinite(md.alphaTest) && md.alphaTest > 0) safe.alphaTest = md.alphaTest;
+    if (Array.isArray(md.em) && md.emI > 0) {
+        safe.em = md.em.slice(0, 3);
+        safe.emI = md.emI;
+    }
+
+    copyInstanceTextureSlot(md, safe, 'map');
+    if (!safe.map) copyInstanceTextureSlot(md, safe, 'diffMap', 'map');
+    copyInstanceTextureSlot(md, safe, 'opMap');
+    if (!safe.opMap) copyInstanceTextureSlot(md, safe, 'alphaMap', 'opMap');
+    if (!safe.opMap) copyInstanceTextureSlot(md, safe, 'opacityMap', 'opMap');
+
+    if (safe.opMap && !(Number.isFinite(safe.alphaTest) && safe.alphaTest > 0)) {
+        safe.alphaTest = 0.35;
+        safe.transparent = false;
+    }
+
+    return safe;
+}
+
+function dominantForestMaterialIndex(grp) {
+    if (!Array.isArray(grp?.groups) || grp.groups.length === 0) return 0;
+    let bestIndex = 0;
+    let bestCount = -1;
+    for (const group of grp.groups) {
+        const materialIndex = Number(group?.[2]);
+        const indexCount = Number(group?.[1]);
+        if (Number.isFinite(materialIndex) && Number.isFinite(indexCount) && indexCount > bestCount) {
+            bestIndex = materialIndex;
+            bestCount = indexCount;
+        }
+    }
+    return bestIndex;
+}
+
+function shouldCollapseForestMaterialsForWebGpu(grp, ctx) {
+    if (!usingWebGpuInstanceMaterials(ctx)) return false;
+    if (String(grp?.kind || '').toLowerCase() === 'railclone') return false;
+    if (!Array.isArray(grp?.mats) || !Array.isArray(grp?.groups)) return false;
+    const textureSlots = grp.mats.reduce((sum, material) => sum + countMaterialTextureSlots(material), 0);
+    return grp.groups.length > 8 || textureSlots > 4;
+}
+
+function buildInstanceMaterial(grp, geom, ctx, hooks) {
+    if (shouldCollapseForestMaterialsForWebGpu(grp, ctx)) {
+        const materialIndex = dominantForestMaterialIndex(grp);
+        const sourceMaterial = grp.mats?.[materialIndex] ?? grp.mats?.[0] ?? grp.mat;
+        if (!sourceMaterial) return hooks.instanceMaterialBuilder({ grp, geom });
+        return hooks.instanceMaterialBuilder({
+            grp,
+            geom,
+            materialDescriptor: webGpuSafeInstanceMaterialDescriptor(sourceMaterial, ctx),
+            materialIndex: null,
+            collapsedWebGpuForestMaterial: true,
+        });
+    }
+
+    if (Array.isArray(grp?.mats) && Array.isArray(grp?.groups)) {
+        addInstanceGeometryGroups(geom, grp.groups);
+        return grp.mats.map((materialDescriptor, materialIndex) =>
+            hooks.instanceMaterialBuilder({
+                grp,
+                geom,
+                materialDescriptor: webGpuSafeInstanceMaterialDescriptor(materialDescriptor, ctx),
+                materialIndex,
+                collapsedWebGpuForestMaterial: false,
+            }),
+        );
+    }
+
+    if (grp?.mat) {
+        return hooks.instanceMaterialBuilder({
+            grp,
+            geom,
+            materialDescriptor: webGpuSafeInstanceMaterialDescriptor(grp.mat, ctx),
+            materialIndex: null,
+            collapsedWebGpuForestMaterial: false,
+        });
+    }
+
+    return hooks.instanceMaterialBuilder({ grp, geom });
+}
+
 function applyForestInstances(groups, buffer, ctx, hooks) {
     ctx.forestMeshes ??= new Map();
     const removed = disposeInstanceMeshes(ctx, hooks);
@@ -392,7 +519,7 @@ function applyForestInstances(groups, buffer, ctx, hooks) {
         if (!geom) continue;
 
         const groupKey = instanceGroupKey(grp, added);
-        const material = hooks.instanceMaterialBuilder({ grp, geom });
+        const material = buildInstanceMaterial(grp, geom, ctx, hooks);
         const batchSize = Math.max(1, getInstancedMeshBatchSize({
             renderer: ctx.renderer,
             backendLabel: ctx.rendererBackendLabel,

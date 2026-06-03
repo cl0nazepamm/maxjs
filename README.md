@@ -1,70 +1,73 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="img/Asset%2022%20white.png">
+    <img src="img/Asset%2022.png" alt="max.js — Three.js Editor" width="640">
+  </picture>
+</p>
+
 # max.js
 
-**max.js** is a 3ds Max plugin that embeds a Three.js viewport through WebView2. It syncs the live 3ds Max scene into a browser renderer, supports WebGPU and WebGL pipelines, and exports scenes as standalone web snapshots.
+**max.js** is a 3ds Max plugin that embeds a Three.js viewport through WebView2. Accelerated with shared buffers and compatible with modern 3ds Max workflows, it turns Autodesk 3ds Max into a seamless Three.js work environment.
 
-It is built for using 3ds Max as the authoring tool and the web runtime as the final interactive presentation layer.
+Architecture is split between viewer and standalone into two optimized paths: the fully featured live viewer inside 3ds Max for authoring and the Snapshot Builder that builds a heavily optimized version of what you see in the viewer. Further optimizations can be made after export. 
 
-![max.js demo](img/maxjs.gif)
+It does not export the advanced post processing stack yet. But it is coming soon! 
 
-## Highlights
+## Features
 
-- **Live 3ds Max sync** using native callbacks, shared-buffer binary deltas, and a slow JSON debug mode.
-- **Three.js viewport inside 3ds Max** with WGL2, WebGPU, and TSL_GL renderer paths.
-- **ActiveShade viewport hosting** for live feedback inside a Max viewport.
-- **Deployable snapshots** that export a scene to a clean standalone web folder.
-- **Scene-local runtime layers** through `project.maxjs.json` and `inlines/*.js`.
-- **Post FX and look controls** shared between WebGPU and TSL_GL, with a smaller WGL2-safe stack.
-- **Material, texture, light, animation, HDRI, sky, fog, splat, audio, and glTF sync** from 3ds Max to Three.js.
+- **Fast Sync** using native callbacks, shared buffer binary deltas.
+- **Three.js Renderer** with WGL2, WebGPU and WebGPU with forced WebGL.
+- **ActiveShade** can directly embed into 3ds Max viewport. Uses a custom workaround instead of Autodesk's API so it does not lag or choke 3ds Max down.
+- **Snapshot Builder** exports your scene to a deployable website in one click, with optimized packed geometry, copied assets, runtime layers, camera/look state, lighting, materials, animation, and standalone viewer files ready to host.
+- **Programmable (`ctx`)** — edit the live synced scene via `ctx.maxScene` (transforms, visibility, queries) and add JS-owned objects via `ctx.js`, wired from `project.maxjs.json` and `inlines/*.js`.
+- **PostFX** includes SSGI, SSR, Bloom, Toon and much more. See full list below.
+- **Materials** Huge material coverage including automatic translation of 3ds Max materials.
 
-Path tracing exists as an experimental live-only preview path. It is not part of the stable snapshot/export contract.
+## Renderer
 
-## Renderer Modes
-
-MaxJS exposes three stable viewer pipelines:
+max.js exposes three stable viewer pipelines:
 
 | Mode | Purpose |
 |---|---|
-| **WGL2** | Simple WebGL2 compatibility path with a small safe FX stack. |
-| **WebGPU** | Main advanced renderer path for the full MaxJS FX stack. |
-| **TSL_GL** | Three.js WebGPU renderer forced to WebGL, used when TSL-style materials and the advanced FX controller should run through WebGL. |
+| **WGL2** | Simple WebGL2 compatibility path with a small safe FX stack. Comes with the experimental pathtracer mode. |
+| **WebGPU** | Main advanced renderer path for the full MaxJS FX stack. Supports forcing WebGL. |
 
-WebGPU and TSL_GL share the advanced MaxJS FX state. WGL2 intentionally hides unsupported effects and keeps only the stable compatibility features.
-
-## Supported Scene Data
+## Scene Data
 
 ### Geometry
 
-- Meshes, splines as lines, and generated geometry.
-- Automatic instancing, including Forest Pack and RailClone-style generated output.
-- Skinned geometry and morph targets when they evaluate into a compatible render mesh.
-- Vertex color, UV1/UV2, normals, material groups, and packed binary snapshot geometry.
+- Meshes, splines, and generated geometry with vertex color, normals and UV channels.
+- Automatic instancing, includes Forest Pack and RailClone generated output.
 - Gaussian splats through [Spark](https://github.com/sparkjsdev/spark).
+- HTML loading as a texture or scene object. You can load webpages to viewer. (uses in-canvas API)
 
 ### Materials
 
-MaxJS maps common 3ds Max materials to Three.js PBR output:
+Supported Max materials are extracted into a portable PBR descriptor (`materialModel`, maps, scalars) and rebuilt in Three.js for the live viewer and snapshots.
 
-| 3ds Max Material | Three.js Output |
-|---|---|
-| Physical Material | `MeshStandardMaterial` / `MeshPhysicalMaterial` |
-| glTF Material | `MeshStandardMaterial` |
-| USD Preview Surface | `MeshStandardMaterial` / `MeshPhysicalMaterial` |
-| V-Ray Material | `MeshPhysicalMaterial` where fields can be mapped |
-| OpenPBR Material | `MeshPhysicalMaterial` |
-| Shell Material | Viewport slot passthrough |
-| three.js Material | Native Three.js material params |
-| three.js TSL | Node/TSL material path |
-| three.js Toon | `MeshToonMaterial` |
-| MaterialX | External MaterialX loading where available |
+| 3ds Max material | Synced model | Notes |
+|---|---|---|
+| **Physical Material** | `MeshPhysicalMaterial` | Autodesk physical shading path |
+| **OpenPBR Material** | `MeshPhysicalMaterial` | OpenPBR field mapping |
+| **V-Ray Material** | `MeshPhysicalMaterial` | Mapped fields only; unmapped inputs are ignored |
+| **glTF Material** | `MeshStandardMaterial` → `MeshPhysicalMaterial` | Promoted when clearcoat, specular, transmission, volume, or IOR extensions are enabled |
+| **USD Preview Surface** | `MeshStandardMaterial` → `MeshPhysicalMaterial` | Promoted when clearcoat is used or IOR ≠ 1.5 |
+| **MaterialX** | `MaterialXMaterial` | File path, inline export, or live graph |
+| **Standard / legacy** | `MeshLambertMaterial` | Diffuse, opacity, self-illum, and common map slots |
+| **three.js Material** | `MeshStandardMaterial`, `MeshPhysicalMaterial`, or `MeshSSSNodeMaterial` | Mode selected on the native max.js material |
+| **three.js Utility** | `MeshDepthMaterial`, `MeshLambertMaterial`, `MeshMatcapMaterial`, `MeshNormalMaterial`, `MeshPhongMaterial`, `MeshBackdropNodeMaterial` | Per utility preset |
+| **three.js TSL** | `MeshTSLNodeMaterial` | JS shader source and/or MaterialX compiler sub-slot |
+| **three.js Toon** | `MeshToonMaterial` | Gradient, outline, and map slots |
+| **Shell Material** | *(first supported sub-material)* | Walks Shell slots for a supported material above |
+| **Multi/Sub-Object** | Per face/material ID | Emits per-group materials when mesh groups carry distinct IDs |
 
-Auto-promotion to `MeshPhysicalMaterial` is used when clearcoat, sheen, transmission, iridescence, anisotropy, or non-default IOR is detected.
+Unsupported assignments fall back to the object wire color. TSL and MaterialX compile on the active renderer path (WebGPU or WGPU forced WebGL).
 
 ### Textures
 
 - `UberBitmap.osl` translation.
-- Bitmap, video, HTML, and TSL texture paths.
-- MP4/WebM video textures with MIME and HTTP Range support.
-- HTML-in-canvas textures for controlled local UI surfaces.
+- Bitmap, video, HTML, and TSL code paths.
+- MP4/WebM video textures.
 - Bake override maps with `_UV1` / `_UV2` suffix routing and UV2 fallback.
 
 ### Lights And Environment
@@ -80,9 +83,9 @@ Auto-promotion to `MeshPhysicalMaterial` is used when clearcoat, sheen, transmis
 
 Environment support includes HDRI, authored Three.js sky, geospatial atmosphere where supported, fog, camera clipping, and sky/sun linking.
 
-## Post FX
+## PostFX
 
-WebGPU and TSL_GL use the unified MaxJS FX controller. WGL2 uses `webgl_basicfx.js`, a smaller compatibility stack.
+WebGPU and TSL_GL use the unified max.js PostFX controller. WGL2 uses `webgl_basicfx.js`, a smaller compatibility stack.
 
 Stable viewer effects include:
 
@@ -97,9 +100,8 @@ Stable viewer effects include:
 - Contact shadows
 - Volumetric/fog look controls
 - Pixel, retro, CRT, film, color, exposure, and tone controls
-- Shader Lab custom passes where the active renderer supports them
+- Shader Lab
 
-Unavailable effects are hidden or disabled per renderer mode without deleting saved settings.
 
 ## Snapshots
 
@@ -117,9 +119,9 @@ Exported snapshot folders can include:
 - `postfx.maxjs.json` for saved look state.
 - `vendor/` runtime dependencies.
 
-Snapshot export preserves scene hierarchy, transforms, materials, textures, lights, shadows, camera state, environment, sky, fog, animation, splats, runtime layers, and selected viewer UI state.
+Snapshot export preserves scene hierarchy, transforms, materials, textures, lights, shadows, camera state, environment, sky, fog, animation, splats, runtime layers, and selected viewer UI state. PostFX coming later.
 
-MaxJS treats runtime files as plugin-owned and `index.html` as project-owned. Re-exporting should refresh the runtime and scene payload without destroying standalone site edits.
+max.js treats runtime files as plugin-owned and `index.html` as project-owned. Re-exporting should refresh the runtime and scene payload without destroying standalone edits.
 
 ## Runtime Layers
 
@@ -144,19 +146,10 @@ Snapshot animation can include:
 
 - Transform animation.
 - Material scalar animation.
-- Geometry and vertex-level animation.
-- Camera animation and camera cuts.
+- Geometry, bone and vertex-level animation.
+- Camera animation.
 - Visibility tracks.
-- Runtime-layer animation when replayed from project sidecars.
-
-## Sync Modes
-
-| Mode | Meaning |
-|---|---|
-| **LIVE** | Normal fast native sync using callbacks, shared buffers, and binary deltas. |
-| **SLOW** | Debug mode that suppresses fast callback/material churn and polls lightweight JSON state. It is not sync-off. |
-
-Use `LIVE` for normal work. Use `SLOW` only when isolating heavy-scene behavior or callback churn.
+- Runtime layer animation when replayed from project sidecars.
 
 ## Build
 
@@ -192,13 +185,6 @@ Release ZIP shape:
 maxjs.gup
 maxjs_web/
 ```
-
-Package one ZIP per Max target:
-
-- `release/maxjs-2026.zip`
-- `release/maxjs-2027.zip`
-
-The web runtime should include Three.js r184 and the required MaxJS runtime files. Generic root `node_modules`, package manifests, and development-only files should not be shipped, except for explicitly required runtime modules such as Spark's bundled dist file.
 
 ## Acknowledgments
 

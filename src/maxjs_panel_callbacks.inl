@@ -16,9 +16,10 @@ void MaxJSFastNodeEventCallback::ControllerOtherEvent(NodeKeyTab& nodes) {
         // that competes with Max's playback pacing and causes chop.
         return;
     }
-    owner_->MarkTrackedNodesDirty(nodes);
-    owner_->MarkInteractiveActivity();
-    owner_->CheckSkinnedGeometryLive();
+    if (owner_->MarkControllerNodesDirty(nodes)) {
+        owner_->MarkInteractiveActivity();
+        owner_->CheckSkinnedGeometryLive();
+    }
 }
 
 void MaxJSFastNodeEventCallback::LinkChanged(NodeKeyTab& nodes) {
@@ -28,7 +29,7 @@ void MaxJSFastNodeEventCallback::LinkChanged(NodeKeyTab& nodes) {
 }
 
 void MaxJSFastNodeEventCallback::SelectionChanged(NodeKeyTab& nodes) {
-    if (owner_) owner_->MarkTrackedNodesDirty(nodes);
+    if (owner_) owner_->MarkSelectionNodesDirty(nodes);
 }
 
 void MaxJSFastNodeEventCallback::HideChanged(NodeKeyTab& nodes) {

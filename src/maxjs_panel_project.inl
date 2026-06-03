@@ -145,6 +145,8 @@
         helperHandles_.clear();
         deformHandles_.clear();
         fastDirtyHandles_.clear();
+        selectionDirtyHandles_.clear();
+        selectionRescanDirty_ = false;
         lastSentTransforms_.clear();
         mtlHashMap_.clear();
         mtlScalarHashMap_.clear();

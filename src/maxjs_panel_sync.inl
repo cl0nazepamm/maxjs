@@ -124,7 +124,7 @@
             if (!node) continue;
             const ULONG handle = node->GetHandle();
             if (!IsTrackedHandle(handle)) continue;
-            if (IsSceneCameraNode(node)) {
+            if (helperHandles_.find(handle) == helperHandles_.end() && IsSceneCameraNode(node)) {
                 MarkCameraDirtyIfChanged(false);
                 continue;
             }
@@ -156,6 +156,7 @@
             if (!ShouldRunInteractiveGeometryChecks(node)) continue;
             ULONG handle = node->GetHandle();
             if (!IsTrackedHandle(handle)) continue;
+            if (geomHandles_.find(handle) == geomHandles_.end()) continue;
             if (skinnedHandles_.count(handle)) continue;
             if (HasPendingTransformChange(handle, node, t)) {
                 lastTransformInteractionTick_ = GetTickCount64();
@@ -236,34 +237,12 @@
         // the hash check is wasted work — extraction will happen anyway:
         //   - Animation playback (time advancing every frame)
         //   - Interactive cooldown window (user dragged something recently)
-        //   - Any non-renderable (bone/helper/controller) is currently selected
-        //
         // Falling into the hash path is only correct for true idle where nothing
         // is moving — it avoids redundant sends when the mesh genuinely isn't
         // changing. But during any kind of activity, hashing doubles the work.
         const bool timelineFastLane = ShouldUseTimelineGeometryFastLane();
         bool skipHash = timelineFastLane
                      || ShouldFavorInteractivePerformance();
-
-        if (!skipHash) {
-            const int selCount = ip->GetSelNodeCount();
-            for (int i = 0; i < selCount; ++i) {
-                INode* sel = ip->GetSelNode(i);
-                if (!sel) continue;
-                const ULONG selH = sel->GetHandle();
-                if (geomHandles_.find(selH) == geomHandles_.end() &&
-                    lightHandles_.find(selH) == lightHandles_.end() &&
-                    splatHandles_.find(selH) == splatHandles_.end() &&
-                    audioHandles_.find(selH) == audioHandles_.end() &&
-                    gltfHandles_.find(selH) == gltfHandles_.end() &&
-                    hairHandles_.find(selH) == hairHandles_.end()) {
-                    // Something non-renderable is selected — assume it's a bone
-                    // or controller driving the skin, and skip the hash.
-                    skipHash = true;
-                    break;
-                }
-            }
-        }
 
         bool changed = false;
         std::vector<ULONG> deformingHandles;
@@ -1189,6 +1168,8 @@
 
     void ResetFastPathState(bool refreshCameraState = false) {
         fastDirtyHandles_.clear();
+        selectionDirtyHandles_.clear();
+        selectionRescanDirty_ = false;
         visibilityDirtyHandles_.clear();
         geoFullFastDirtyHandles_.clear();
         materialFastDirtyHandles_.clear();
@@ -1259,6 +1240,39 @@
         for (int i = 0; i < nodes.Count(); ++i) {
                 MarkTrackedNodeDirty(NodeEventNamespace::GetNodeByKey(nodes[i]));
         }
+    }
+
+    bool MarkControllerNodesDirty(const NodeEventNamespace::NodeKeyTab& nodes) {
+        bool changed = false;
+        Interface* ip = GetCOREInterface();
+        const TimeValue t = ip ? ip->GetTime() : 0;
+        for (int i = 0; i < nodes.Count(); ++i) {
+            INode* node = NodeEventNamespace::GetNodeByKey(nodes[i]);
+            if (!node) continue;
+            const ULONG handle = node->GetHandle();
+
+            if (helperHandles_.find(handle) != helperHandles_.end()) {
+                float currentWorld[16];
+                if (HasTransformChangedForSync(handle, node, t, currentWorld)) {
+                    if (fastDirtyHandles_.insert(handle).second) changed = true;
+                } else {
+                    RememberSkippedParentedTransform(handle, node, currentWorld);
+                }
+                continue;
+            }
+
+            const size_t before = fastDirtyHandles_.size();
+            MarkTrackedNodeDirty(node);
+            if (fastDirtyHandles_.size() != before) changed = true;
+        }
+        if (changed) QueueFastFlush();
+        return changed;
+    }
+
+    void MarkSelectionNodesDirty(const NodeEventNamespace::NodeKeyTab& nodes) {
+        (void)nodes;
+        selectionRescanDirty_ = true;
+        QueueFastFlush();
     }
 
     void MarkMaterialNodesDirty(const NodeEventNamespace::NodeKeyTab& nodes, bool structured) {
@@ -1458,21 +1472,28 @@
 
         TimeValue t = ip->GetTime();
         bool changed = false;
+        auto markHandleIfChanged = [this, t, &changed](INode* current) {
+            if (!current) return;
+            const ULONG handle = current->GetHandle();
+            if (!IsTrackedHandle(handle)) return;
+
+            float currentWorld[16];
+            if (HasTransformChangedForSync(handle, current, t, currentWorld)) {
+                if (fastDirtyHandles_.insert(handle).second) changed = true;
+            } else {
+                RememberSkippedParentedTransform(handle, current, currentWorld);
+            }
+        };
+
         for (int i = 0; i < selCount; ++i) {
             INode* node = ip->GetSelNode(i);
             if (!node) continue;
+            if (IsTrackedHandle(node->GetHandle())) {
+                markHandleIfChanged(node);
+                continue;
+            }
 
-            VisitNodeSubtree(node, [this, t, &changed](INode* current) {
-                const ULONG handle = current->GetHandle();
-                if (!IsTrackedHandle(handle)) return;
-
-                float currentWorld[16];
-                if (HasTransformChangedForSync(handle, current, t, currentWorld)) {
-                    if (fastDirtyHandles_.insert(handle).second) changed = true;
-                } else {
-                    RememberSkippedParentedTransform(handle, current, currentWorld);
-                }
-            });
+            VisitNodeSubtree(node, markHandleIfChanged);
         }
 
         if (changed) QueueFastFlush();
@@ -2552,6 +2573,30 @@
         webview_->PostWebMessageAsJson(ss.str().c_str());
     }
 
+    void SendSelectionSync(const std::vector<ULONG>& handles) {
+        if (!webview_ || handles.empty()) return;
+        Interface* ip = GetCOREInterface();
+        if (!ip) return;
+
+        const std::uint32_t frameId = AllocateFrameId();
+        std::wostringstream ss;
+        ss.imbue(std::locale::classic());
+        ss << L"{\"type\":\"xform\",\"frame\":" << frameId << L",\"nodes\":[";
+        bool first = true;
+        for (ULONG handle : handles) {
+            INode* node = ip->GetINodeByHandle(handle);
+            if (!node) continue;
+            if (!IsTrackedHandle(handle)) continue;
+            if (!first) ss << L',';
+            ss << L"{\"h\":" << handle
+               << L",\"s\":" << (node->Selected() ? L'1' : L'0')
+               << L"}";
+            first = false;
+        }
+        ss << L"]}";
+        if (!first) webview_->PostWebMessageAsJson(ss.str().c_str());
+    }
+
     void FlushFastPath() {
         fastFlushPosted_ = false;
 
@@ -2622,6 +2667,18 @@
         }
         std::unordered_set<ULONG> visibilityDirty;
         visibilityDirty.swap(visibilityDirtyHandles_);
+        std::unordered_set<ULONG> selectionDirty;
+        selectionDirty.swap(selectionDirtyHandles_);
+        const bool selectionRescanDirty = selectionRescanDirty_;
+        selectionRescanDirty_ = false;
+        if (selectionRescanDirty) {
+            selectionDirty.insert(geomHandles_.begin(), geomHandles_.end());
+            selectionDirty.insert(lightHandles_.begin(), lightHandles_.end());
+            selectionDirty.insert(splatHandles_.begin(), splatHandles_.end());
+            selectionDirty.insert(audioHandles_.begin(), audioHandles_.end());
+            selectionDirty.insert(gltfHandles_.begin(), gltfHandles_.end());
+            selectionDirty.insert(hairHandles_.begin(), hairHandles_.end());
+        }
 
         for (ULONG handle : dirtyHandles) visibilityDirty.erase(handle);
         fastCameraDirty_ = false;
@@ -2639,7 +2696,8 @@
         }
 
         const bool hasAnyNodeUpdates = !combinedNodeHandles.empty();
-        if (!hasAnyNodeUpdates && !hasDirtyCamera && !hasDirtyTime) return;
+        const bool hasSelectionUpdates = !selectionDirty.empty();
+        if (!hasAnyNodeUpdates && !hasSelectionUpdates && !hasDirtyCamera && !hasDirtyTime) return;
 
         // Also check visibility dirty handles for lights/splats/audios
         for (ULONG handle : visibilityDirty) {
@@ -2664,7 +2722,11 @@
 
         if (!useBinary_) {
             if (hasAnyNodeUpdates) SendTransformSync(&combinedNodeHandles);
-            else SendCameraSync();
+            if (hasSelectionUpdates) {
+                std::vector<ULONG> selectionHandles(selectionDirty.begin(), selectionDirty.end());
+                SendSelectionSync(selectionHandles);
+            }
+            if (!hasAnyNodeUpdates && !hasSelectionUpdates) SendCameraSync();
             CaptureCurrentCameraState();
             return;
         }
@@ -2675,7 +2737,11 @@
         env_->QueryInterface(IID_PPV_ARGS(&env12));
         if (!wv17 || !env12) {
             if (hasAnyNodeUpdates) SendTransformSync(&combinedNodeHandles);
-            else SendCameraSync();
+            if (hasSelectionUpdates) {
+                std::vector<ULONG> selectionHandles(selectionDirty.begin(), selectionDirty.end());
+                SendSelectionSync(selectionHandles);
+            }
+            if (!hasAnyNodeUpdates && !hasSelectionUpdates) SendCameraSync();
             CaptureCurrentCameraState();
             return;
         }
@@ -2686,7 +2752,8 @@
         TimeValue t = ip->GetTime();
         const std::uint32_t frameId = AllocateFrameId();
         maxjs::sync::DeltaFrameBuilder frame(frameId);
-        frame.ReserveBytes(32 + dirtyHandles.size() * 160 + visibilityDirty.size() * 12 + (hasDirtyCamera ? 64 : 0) + 16);
+        frame.ReserveBytes(32 + dirtyHandles.size() * 160 + visibilityDirty.size() * 12 +
+            selectionDirty.size() * 12 + (hasDirtyCamera ? 64 : 0) + 16);
         frame.BeginFrame();
 
         for (ULONG handle : dirtyHandles) {
@@ -2713,6 +2780,7 @@
                 deformHandles_.erase(handle);
                 lastSentTransforms_.erase(handle);
                 materialFastDirtyHandles_.erase(handle);
+                selectionDirtyHandles_.erase(handle);
                 SetDirty();
                 continue;
             }
@@ -2778,6 +2846,12 @@
             frame.UpdateVisibility(static_cast<std::uint32_t>(handle), IsMaxJsSyncDrawVisible(node));
         }
 
+        for (ULONG handle : selectionDirty) {
+            INode* node = ip->GetINodeByHandle(handle);
+            if (!node || !IsTrackedHandle(handle)) continue;
+            frame.UpdateSelection(static_cast<std::uint32_t>(handle), node->Selected() != 0);
+        }
+
         if (hasDirtyCamera) {
             CameraData cam = {};
             GetActiveCamera(cam);
@@ -2803,7 +2877,11 @@
         HRESULT hr = env12->CreateSharedBuffer(totalBytes, &sharedBuf);
         if (FAILED(hr) || !sharedBuf) {
             if (hasAnyNodeUpdates) SendTransformSync(&combinedNodeHandles);
-            else SendCameraSync();
+            if (hasSelectionUpdates) {
+                std::vector<ULONG> selectionHandles(selectionDirty.begin(), selectionDirty.end());
+                SendSelectionSync(selectionHandles);
+            }
+            if (!hasAnyNodeUpdates && !hasSelectionUpdates) SendCameraSync();
             CaptureCurrentCameraState();
             return;
         }

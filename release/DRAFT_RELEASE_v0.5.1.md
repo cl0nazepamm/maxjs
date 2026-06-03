@@ -20,7 +20,7 @@ Baseline: `v0.5.0`.
 - **Runtime layers** - `ctx.instances` aggregates sliced WebGPU batches back into one logical handle, so scripts can keep using global instance indices for `getMatrixAt`, `setMatrixAt`, position helpers, iteration, and flushing.
 - **RailClone materials** - RailClone now explicitly preserves subobject material grouping for segment material IDs.
 - **Snapshot / Viewer parity** - standalone snapshot replay uses the same instance batching behavior as the live viewer.
-- **Resource cleanup** - shared instanced geometry and materials are disposed once per logical group instead of once per slice.
+- **Resource cleanup** - live and standalone instance rebuilds now retire old instanced geometry and materials through the deferred disposal path so WebGPU does not keep stale object bindings alive.
 
 ## Supported 3ds Max versions
 

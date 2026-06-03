@@ -1,4 +1,4 @@
-const WEBGPU_INSTANCED_MESH_BATCH_SIZE = 65536;
+const WEBGPU_INSTANCED_MESH_BATCH_SIZE = 32768;
 
 export function isWebGpuInstancingPath({ renderer = null, backendLabel = '' } = {}) {
     const label = String(backendLabel || renderer?.userData?.maxjsBackendLabel || '');

@@ -976,6 +976,7 @@
                 deformChannelHashMap_.erase(handle);
                 skinnedControlIdxCache_.erase(handle);
                 skinnedFastSourceCache_.erase(handle);
+                selectionDirtyHandles_.erase(handle);
                 helperHandles_.erase(handle);
                 lastSentTransforms_.erase(handle);
                 continue;

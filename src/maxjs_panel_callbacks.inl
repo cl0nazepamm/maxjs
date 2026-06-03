@@ -28,7 +28,7 @@ void MaxJSFastNodeEventCallback::LinkChanged(NodeKeyTab& nodes) {
 }
 
 void MaxJSFastNodeEventCallback::SelectionChanged(NodeKeyTab& nodes) {
-    if (owner_) owner_->MarkTrackedNodesDirty(nodes);
+    if (owner_) owner_->MarkSelectionNodesDirty(nodes);
 }
 
 void MaxJSFastNodeEventCallback::HideChanged(NodeKeyTab& nodes) {

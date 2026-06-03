@@ -29,6 +29,8 @@
     // waiting for DetectGeometryChanges (~500ms) to run.
     std::unordered_set<ULONG> deformHandles_;
     std::unordered_set<ULONG> fastDirtyHandles_;
+    std::unordered_set<ULONG> selectionDirtyHandles_;
+    bool selectionRescanDirty_ = false;
     std::unordered_set<ULONG> visibilityDirtyHandles_;
     std::unordered_map<ULONG, std::array<float, 16>> lastSentTransforms_;
     std::unordered_map<ULONG, uint64_t> mtlHashMap_;   // node handle → material structure hash

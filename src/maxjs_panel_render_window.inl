@@ -790,6 +790,8 @@
         embeddedViewportHwnd_ = nullptr;
         haveLastFloatingRect_ = false;
         fastDirtyHandles_.clear();
+        selectionDirtyHandles_.clear();
+        selectionRescanDirty_ = false;
         lastSentTransforms_.clear();
         geomHandles_.clear();
         skinnedHandles_.clear();

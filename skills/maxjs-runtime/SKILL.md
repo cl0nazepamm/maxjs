@@ -1,11 +1,11 @@
 ---
 name: maxjs-runtime
-description: Write max.js runtime code for scene scripts, project layers, TSL materials, TSL textures, HTML texmaps, gameplay layers, and snapshot-safe Three.js behavior. Use when touching layer ctx APIs, synced scene data, transform overrides, sampleSurface, TSL shader code, TSL parameters, lightmap UV channels, or live-vs-snapshot parity.
+description: Write MaxJS runtime code for scene scripts, project layers, TSL materials, TSL textures, HTML texmaps, gameplay layers, and snapshot-safe Three.js behavior. Use when touching layer ctx APIs, synced scene data, transform overrides, sampleSurface, TSL shader code, TSL parameters, lightmap UV channels, or live-vs-snapshot parity.
 ---
 
-# max.js Runtime
+# MaxJS Runtime
 
-max.js runs Three.js code against scene data synced from 3ds Max. Treat 3ds Max as the editor/source of truth, and write runtime behavior on top of the live synced scene.
+MaxJS runs Three.js code against scene data synced from 3ds Max. Treat 3ds Max as the editor/source of truth, and write runtime behavior on top of the live synced scene.
 
 ## Core Rules
 
@@ -73,7 +73,7 @@ Useful calls:
 Adapters represent synced Max objects.
 
 - Metadata: `node.handle`, `node.name`, `node.isMesh`, `node.visible`, `node.jsmod`.
-- Writable local transforms: `node.position`, `node.rotation`, `node.quaternion`, `node.scale`. They behave like Three.js `Vector3`/`Euler`/`Quaternion` handles and write through max.js runtime overrides so fastsync does not stomp the edit.
+- Writable local transforms: `node.position`, `node.rotation`, `node.quaternion`, `node.scale`. They behave like Three.js `Vector3`/`Euler`/`Quaternion` handles and write through MaxJS runtime overrides so fastsync does not stomp the edit.
 - Writable visibility: `node.visible = false` / `node.visible = true`, plus `node.hide()`, `node.show()`, and `node.resetVisibility()`.
 - Read surfaces: `node.raw` / `node.object` for the current `Object3D`, `node.matrix`, `node.matrixWorld`, `node.base`, and `node.snapshot()`.
 - Three-style world reads: `getWorldPosition(target)`, `getWorldQuaternion(target)`, `getWorldScale(target)`, `getWorldMatrix(target)`. Passing a target is safe; omitting it returns a new object.
@@ -83,7 +83,7 @@ Adapters represent synced Max objects.
 - Reset: `node.resetTransform()` clears runtime transform overrides; `node.reset()` clears transform and visibility overrides.
 - Orientation helpers: `getPivotWorldPosition()`, `getVisualCenter()`, `getPivotToVisualCenter()`, `getLocalAxesWorld()`, `getOrientationSnapshot()`.
 
-Use orientation helpers before gameplay/rig work. max.js runtime is Three.js Y-up: ground plane is XZ, height is Y, and Max-space vectors map as `x,z,-y`.
+Use orientation helpers before gameplay/rig work. MaxJS runtime is Three.js Y-up: ground plane is XZ, height is Y, and Max-space vectors map as `x,z,-y`.
 
 ## Writing Runtime Objects
 
@@ -182,7 +182,7 @@ Clear overrides in `dispose()` if the layer temporarily owns authored objects.
 - `ctx.camera.findSceneCamera(name, { exact })` searches the scene camera list. Do this for Physical Cameras; `ctx.maxScene.findByName()` only searches synced meshes/lights.
 - `ctx.camera.usePhysicalCamera(handleOrEntry)` / `ctx.camera.usePhysicalCameraByName(name, { exact })` locks the viewer to a Max camera object while still allowing a layer to apply a post-sync camera offset through `ctx.camera.raw`.
 
-`ctx.runtime.gltf` reads max.js glTF Origin objects:
+`ctx.runtime.gltf` reads MaxJS glTF Origin objects:
 
 - `get(handle)`
 - `findByName(name)`

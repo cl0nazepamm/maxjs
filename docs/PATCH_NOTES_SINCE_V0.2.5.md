@@ -146,7 +146,6 @@ scripts/deploy-web.mjs
 ## Materials And Textures
 
 - Physical, glTF, USD Preview, V-Ray, OpenPBR, Shell, three.js, three.js TSL, three.js Toon, and MaterialX serializers were tightened.
-- MaterialX materials now build in the standalone snapshot runtime (`web/js/material_builder.js`), so they survive export instead of only syncing in the live viewer.
 - glTF alpha material handling was improved.
 - V-Ray texture metadata and high-poly update behavior improved.
 - Video textures now serve correct MIME types, support HTTP Range requests, and route bitmap paths to the video loader.

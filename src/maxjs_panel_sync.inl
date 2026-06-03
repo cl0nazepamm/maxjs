@@ -237,34 +237,12 @@
         // the hash check is wasted work — extraction will happen anyway:
         //   - Animation playback (time advancing every frame)
         //   - Interactive cooldown window (user dragged something recently)
-        //   - Any non-renderable (bone/helper/controller) is currently selected
-        //
         // Falling into the hash path is only correct for true idle where nothing
         // is moving — it avoids redundant sends when the mesh genuinely isn't
         // changing. But during any kind of activity, hashing doubles the work.
         const bool timelineFastLane = ShouldUseTimelineGeometryFastLane();
         bool skipHash = timelineFastLane
                      || ShouldFavorInteractivePerformance();
-
-        if (!skipHash) {
-            const int selCount = ip->GetSelNodeCount();
-            for (int i = 0; i < selCount; ++i) {
-                INode* sel = ip->GetSelNode(i);
-                if (!sel) continue;
-                const ULONG selH = sel->GetHandle();
-                if (geomHandles_.find(selH) == geomHandles_.end() &&
-                    lightHandles_.find(selH) == lightHandles_.end() &&
-                    splatHandles_.find(selH) == splatHandles_.end() &&
-                    audioHandles_.find(selH) == audioHandles_.end() &&
-                    gltfHandles_.find(selH) == gltfHandles_.end() &&
-                    hairHandles_.find(selH) == hairHandles_.end()) {
-                    // Something non-renderable is selected — assume it's a bone
-                    // or controller driving the skin, and skip the hash.
-                    skipHash = true;
-                    break;
-                }
-            }
-        }
 
         bool changed = false;
         std::vector<ULONG> deformingHandles;
@@ -1262,6 +1240,33 @@
         for (int i = 0; i < nodes.Count(); ++i) {
                 MarkTrackedNodeDirty(NodeEventNamespace::GetNodeByKey(nodes[i]));
         }
+    }
+
+    bool MarkControllerNodesDirty(const NodeEventNamespace::NodeKeyTab& nodes) {
+        bool changed = false;
+        Interface* ip = GetCOREInterface();
+        const TimeValue t = ip ? ip->GetTime() : 0;
+        for (int i = 0; i < nodes.Count(); ++i) {
+            INode* node = NodeEventNamespace::GetNodeByKey(nodes[i]);
+            if (!node) continue;
+            const ULONG handle = node->GetHandle();
+
+            if (helperHandles_.find(handle) != helperHandles_.end()) {
+                float currentWorld[16];
+                if (HasTransformChangedForSync(handle, node, t, currentWorld)) {
+                    if (fastDirtyHandles_.insert(handle).second) changed = true;
+                } else {
+                    RememberSkippedParentedTransform(handle, node, currentWorld);
+                }
+                continue;
+            }
+
+            const size_t before = fastDirtyHandles_.size();
+            MarkTrackedNodeDirty(node);
+            if (fastDirtyHandles_.size() != before) changed = true;
+        }
+        if (changed) QueueFastFlush();
+        return changed;
     }
 
     void MarkSelectionNodesDirty(const NodeEventNamespace::NodeKeyTab& nodes) {

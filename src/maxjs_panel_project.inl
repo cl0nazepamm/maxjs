@@ -38,7 +38,7 @@
         ss << L"{\"type\":\"pathtracing_settings\""
            << L",\"samplesPerFrame\":" << pathTracingSamplesPerFrame_
            << L",\"giClamp\":";
-        WriteFloatValue(ss, pathTracingGIClamp_, 20.0f);
+        WriteFloatValue(ss, pathTracingGIClamp_, 8.0f);
         ss
            << L",\"freezeSync\":" << (pathTracingFreezeSync_ ? L"true" : L"false")
            << L"}";
@@ -51,8 +51,8 @@
 
     void SetPathTracingSettings(int samplesPerFrame, float giClamp, bool freezeSync) {
         const bool wasFrozen = IsPathTracingNativeFreezeActive();
-        pathTracingSamplesPerFrame_ = std::clamp(samplesPerFrame, 1, 64);
-        if (!std::isfinite(giClamp)) giClamp = 20.0f;
+        pathTracingSamplesPerFrame_ = std::clamp(samplesPerFrame, 1, 512);
+        if (!std::isfinite(giClamp)) giClamp = 8.0f;
         pathTracingGIClamp_ = std::clamp(giClamp, 1.0f, 1000.0f);
         pathTracingFreezeSync_ = freezeSync;
         SendPathTracingSettings();

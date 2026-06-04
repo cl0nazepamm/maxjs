@@ -1226,8 +1226,8 @@
         const shaderLabFx = createShaderLabFx({ THREE, renderer, scene, camera });
         maxjsFx.setShaderLabFx?.(shaderLabFx);
         const pathTracingSettings = {
-            samplesPerFrame: 1,
-            giClamp: 20.0,
+            samplesPerFrame: 64,
+            giClamp: 8.0,
             freezeSync: false,
         };
 
@@ -1257,7 +1257,7 @@
         }
         const PATH_TRACING_RASTER_WARMUP_FRAMES = 2;
         const PATH_TRACING_TEXTURE_WAIT_MS = 3000;
-        const PATH_TRACING_CAPTURE_DEFAULT_SAMPLES = 32;
+        const PATH_TRACING_CAPTURE_DEFAULT_SAMPLES = 64;
         const PATH_TRACING_LIVE_REBUILD_DELAY_MS = 180;
         let pathTracingRasterWarmupFrames = 0;
         let pathTracingWarmupStartedAt = 0;
@@ -1266,13 +1266,13 @@
 
         function normalizePathTracingSamplesPerFrame(value) {
             const n = Math.round(Number(value));
-            if (!Number.isFinite(n)) return 1;
-            return Math.max(1, Math.min(64, n));
+            if (!Number.isFinite(n)) return 64;
+            return Math.max(1, Math.min(512, n));
         }
 
         function normalizePathTracingGIClamp(value) {
             const n = Number(value);
-            if (!Number.isFinite(n)) return 20.0;
+            if (!Number.isFinite(n)) return 8.0;
             return Math.max(1.0, Math.min(1000.0, n));
         }
 
@@ -13236,8 +13236,15 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             }
             lastRenderTimestamp = frameTimeMs;
             inlineTimer.update(frameTimeMs);
-            const frameDt = inlineClock.getDelta();
-            const frameElapsed = inlineClock.getElapsed();
+            const liveFrameDt = inlineClock.getDelta();
+            const liveFrameElapsed = inlineClock.getElapsed();
+            const captureFrameTime = renderToImageActive
+                && pendingRenderToImage
+                && Number.isFinite(pendingRenderToImage.renderTimeSeconds)
+                ? pendingRenderToImage.renderTimeSeconds
+                : null;
+            const frameDt = captureFrameTime == null ? liveFrameDt : 0;
+            const frameElapsed = captureFrameTime ?? liveFrameElapsed;
             updateSkyTime(frameElapsed);
             xrRuntime.update(frameDt);
             if (!xrRuntime.active) syncOrbitNavigationFeel();
@@ -13255,9 +13262,17 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             lightLinking.updateCameraConstraints();
             if (lightHelpersVisible) updateLightHelpers();
             layerManager.update(frameDt, frameElapsed);
-            animationSystem?.update(frameDt);
+            if (captureFrameTime == null) {
+                animationSystem?.update(frameDt);
+            } else {
+                animationSystem?.seekAllClips?.(captureFrameTime);
+            }
             audioSystem?.update();
-            gltfSystem?.update?.(frameDt);
+            if (captureFrameTime == null) {
+                gltfSystem?.update?.(frameDt);
+            } else {
+                gltfSystem?.setTime?.(captureFrameTime);
+            }
 
             const perfHudActive = perfHud.isDebugEnabled?.() ?? false;
             if (perfHudActive) perfHud.updateLayers(layerManager.getStats());
@@ -13334,12 +13349,42 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 splatOverlay.renderer.render(splatOverlay.scene, splatOverlay.camera);
             }
             if (renderToImageActive && pendingRenderToImage) {
+                const nowMs = performance.now();
                 const syncReady = latestAppliedSyncSerial > pendingRenderToImage.observedSyncSerial;
-                const settledEnough = performance.now() >= (pendingRenderToImage.startedAtMs + pendingRenderToImage.warmupMs);
+                const settledEnough = nowMs >= (pendingRenderToImage.startedAtMs + pendingRenderToImage.warmupMs);
+                if (
+                    pendingRenderToImage.pathTracing
+                    && !pendingRenderToImage.pathTracingStarted
+                    && syncReady
+                    && settledEnough
+                ) {
+                    if (pendingRenderToImage.textureWaitStartedAt <= 0) {
+                        pendingRenderToImage.textureWaitStartedAt = nowMs;
+                    }
+                    const texturesReady = pendingTextureLoads <= 0;
+                    const textureWaitExpired = nowMs >= (
+                        pendingRenderToImage.textureWaitStartedAt + pendingRenderToImage.textureWaitMs
+                    );
+                    if (texturesReady || textureWaitExpired) {
+                        pendingRenderToImage.pathTracingStarted = true;
+                        pathTracingFx.start?.();
+                        pathTracingFx.markSceneDirty?.();
+                    }
+                }
                 const pathTracingReady = !pendingRenderToImage.pathTracing
-                    || pathTracingFx.isCaptureReady?.(pendingRenderToImage.pathTracingMinSamples) === true;
-                const timedOut = performance.now() >= pendingRenderToImage.syncDeadlineMs;
-                if ((syncReady && settledEnough && pathTracingReady) || timedOut) {
+                    || (
+                        pendingRenderToImage.pathTracingStarted
+                        && pathTracingFx.isCaptureReady?.(pendingRenderToImage.pathTracingMinSamples) === true
+                    );
+                const timedOut = nowMs >= pendingRenderToImage.syncDeadlineMs;
+                if (timedOut && pendingRenderToImage.pathTracing && !pathTracingReady) {
+                    const sampleCount = Math.floor(pathTracingFx.getSampleCount?.() ?? 0);
+                    perfHud.setStatus(
+                        `max.js - PT accumulating ${sampleCount}/${pendingRenderToImage.pathTracingMinSamples}`,
+                    );
+                    pendingRenderToImage.syncDeadlineMs = nowMs + 30000;
+                }
+                if ((syncReady && settledEnough && pathTracingReady) || (!pendingRenderToImage.pathTracing && timedOut)) {
                     const capture = pendingRenderToImage;
                     const renderTimeSeconds = capture.renderTimeSeconds;
                     pendingRenderToImage = null;
@@ -13490,10 +13535,10 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             const isSequenceFrame = responseType === 'render_sequence_frame_file';
             const captureMime = typeof msg.mime === 'string' && msg.mime ? msg.mime : 'image/png';
             const wantsAlpha = msg.alpha === true && mimeSupportsAlpha(captureMime);
-            const usePathTracing = !isSequenceFrame && pathTracingFx.isEnabled?.() === true;
+            const usePathTracing = pathTracingFx.isEnabled?.() === true;
             const ptMinSamples = Number.isFinite(msg.pathTracingSamples)
                 ? Math.max(1, Math.floor(msg.pathTracingSamples))
-                : PATH_TRACING_CAPTURE_DEFAULT_SAMPLES;
+                : Math.max(PATH_TRACING_CAPTURE_DEFAULT_SAMPLES, pathTracingSettings.samplesPerFrame);
             const wasAlreadyActive = renderToImageActive === true;
             renderToImageActive = true;
             pendingRenderToImage = {
@@ -13511,7 +13556,11 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 textureWaitStartedAt: 0,
                 textureWaitMs: usePathTracing ? PATH_TRACING_TEXTURE_WAIT_MS : 0,
                 pathTracingStarted: false,
-                syncDeadlineMs: performance.now() + (usePathTracing ? 30000 : 10000),
+                syncDeadlineMs: performance.now() + (
+                    usePathTracing
+                        ? Math.max(30000, Math.min(600000, ptMinSamples * 1000))
+                        : 10000
+                ),
             };
 
             // Hide all UI — keep only canvas elements visible
@@ -13578,7 +13627,10 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             }
             if (pendingRenderToImage.pathTracing) {
                 resetPathTracingStartupWarmup();
+                pathTracingFx.setCaptureMode?.(true);
                 pathTracingFx.markSceneDirty?.();
+            } else {
+                pathTracingFx.setCaptureMode?.(false);
             }
 
             if (frameNumber >= 0) {
@@ -13622,6 +13674,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             renderToImageActive = false;
             pendingRenderToImage = null;
             renderToImageForcePathTracing = false;
+            pathTracingFx.setCaptureMode?.(false);
 
             // Restore all UI elements
             for (const el of document.body.children) {

@@ -89,8 +89,8 @@ void ExportMaxJSSnapshot() {
 }
 
 void SetMaxJSPathTracingSettings(int samplesPerFrame, float giClamp, bool freezeSync) {
-    g_pathTracingSamplesPerFrame = std::clamp(samplesPerFrame, 1, 64);
-    if (!std::isfinite(giClamp)) giClamp = 20.0f;
+    g_pathTracingSamplesPerFrame = std::clamp(samplesPerFrame, 1, 512);
+    if (!std::isfinite(giClamp)) giClamp = 8.0f;
     g_pathTracingGIClamp = std::clamp(giClamp, 1.0f, 1000.0f);
     g_pathTracingFreezeSync = freezeSync;
     if (g_panel) {

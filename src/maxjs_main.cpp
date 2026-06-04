@@ -107,8 +107,8 @@ class MaxJSPanel;
 static MaxJSPanel* g_panel = nullptr;
 void MaxJSNotifyMaterialEdited(ReferenceTarget* target = nullptr);
 static HWND g_helperHwnd = nullptr;
-static int g_pathTracingSamplesPerFrame = 1;
-static float g_pathTracingGIClamp = 20.0f;
+static int g_pathTracingSamplesPerFrame = 64;
+static float g_pathTracingGIClamp = 8.0f;
 static bool g_pathTracingFreezeSync = false;
 
 // Forward — used by renderer's ActiveShade
@@ -2685,31 +2685,23 @@ public:
 
     static bool AppendMorpherChannelTimeSamples(IMorpherChannel* channel,
                                                 const Interval& range,
+                                                int sampleStepFrames,
                                                 std::vector<TimeValue>& outTimes) {
         if (!channel) return false;
-        bool hasAuthoredKeys = false;
-        Tab<long> keyTimes;
-        Tab<float> keyValues;
-        if (channel->GetAnimationKeysData(keyTimes, keyValues)) {
-            for (int i = 0; i < keyTimes.Count(); ++i) {
-                const TimeValue tv = static_cast<TimeValue>(keyTimes[i]);
-                if (tv >= range.Start() && tv <= range.End()) {
-                    AppendUniqueTimeValue(outTimes, tv);
-                    hasAuthoredKeys = true;
-                }
-            }
+        Control* control = channel->GetControl();
+        if (!control) return false;
+
+        std::vector<TimeValue> controllerTimes;
+        std::unordered_set<const Animatable*> visited;
+        CollectAnimatableKeyTimesRecursive(control, range, controllerTimes, visited);
+        for (TimeValue tv : controllerTimes) {
+            AppendUniqueTimeValue(outTimes, tv);
         }
 
-        if (Control* control = channel->GetControl()) {
-            std::vector<TimeValue> controllerTimes;
-            std::unordered_set<const Animatable*> visited;
-            CollectAnimatableKeyTimesRecursive(control, range, controllerTimes, visited);
-            for (TimeValue tv : controllerTimes) {
-                AppendUniqueTimeValue(outTimes, tv);
-                hasAuthoredKeys = true;
-            }
+        if (outTimes.empty()) {
+            if (control->IsAnimated() == FALSE) return false;
+            AppendFrameSampleTimes(outTimes, range, sampleStepFrames);
         }
-        if (!hasAuthoredKeys) return false;
 
         AppendUniqueTimeValue(outTimes, range.Start());
         AppendUniqueTimeValue(outTimes, range.End());
@@ -2750,7 +2742,13 @@ public:
             if (!ch || !ch->IsActive()) continue;
 
             std::vector<TimeValue> sampleTimes;
-            if (!AppendMorpherChannelTimeSamples(ch, range, sampleTimes)) continue;
+            if (!AppendMorpherChannelTimeSamples(
+                    ch,
+                    range,
+                    options.animationSampleStepFrames,
+                    sampleTimes)) {
+                continue;
+            }
 
             SnapshotAnimationTrackDef tr;
             tr.path = L".morphTargetInfluences[" + std::to_wstring(mi) + L"]";

@@ -39,10 +39,10 @@ const SCENE_REBUILD_COALESCE_MS = 25;
 const SCENE_REBUILD_MIN_INTERVAL_MS = 50;
 const SCENE_REBUILD_RETRY_MS = 1000;
 const CAMERA_MATRIX_EPSILON = 1e-6;
-const DEFAULT_SAMPLES_PER_FRAME = 1;
+const DEFAULT_SAMPLES_PER_FRAME = 64;
 const MIN_SAMPLES_PER_FRAME = 1;
-const MAX_SAMPLES_PER_FRAME = 64;
-const DEFAULT_GI_CLAMP = 20.0;
+const MAX_SAMPLES_PER_FRAME = 512;
+const DEFAULT_GI_CLAMP = 8.0;
 const MIN_GI_CLAMP = 1.0;
 const MAX_GI_CLAMP = 1000.0;
 const GI_CLAMP_UNIFORM_DECL = 'uniform float maxjsGIClamp;';
@@ -325,6 +325,7 @@ export function createPathTracingController({
     let nextRebuildRetryAt = 0;
     let lastRebuildErrorKey = '';
     let renderedSamples = 0;
+    let captureMode = false;
     const lastCameraWorld = { initialized: false, values: new Float64Array(16) };
     const lastCameraProj = { initialized: false, values: new Float64Array(16) };
     let warnedUnsupportedRenderer = false;
@@ -443,6 +444,19 @@ export function createPathTracingController({
         t.rasterizeSceneCallback = () => {};
     }
 
+    function configureForCapture(t) {
+        configureForLowLatency(t);
+        t.tiles.set(1, 1);
+        t.fadeDuration = 0;
+        t.dynamicLowRes = false;
+    }
+
+    function configureTracerMode(t) {
+        if (!t) return;
+        if (captureMode) configureForCapture(t);
+        else configureForLowLatency(t);
+    }
+
     function biasRayOffset(material) {
         if (!material || typeof material.fragmentShader !== 'string') return;
         if (!material.fragmentShader.includes(RAY_OFFSET_BIAS)) return;
@@ -548,7 +562,7 @@ export function createPathTracingController({
 
         try {
             tracer = suppressClockDeprecationWarning(() => new PathTracerCtor(renderer));
-            configureForLowLatency(tracer);
+            configureTracerMode(tracer);
             // Library defaults are correct: ['position','normal','color','tangent','uv','uv2'].
             // setCommonAttributes runs computeTangents when normal+uv exist (gives correct
             // normal mapping) and zero/one-fills color/uv2 when meshes don't carry them.
@@ -722,7 +736,7 @@ export function createPathTracingController({
             syncCameraIfChanged();
             const count = samplesPerFrame;
             for (let i = 0; i < count; i += 1) tracer.renderSample();
-            renderedSamples += count;
+            renderedSamples = getActualSampleCount();
             return true;
         } catch (error) {
             onError(error);
@@ -735,11 +749,28 @@ export function createPathTracingController({
     }
 
     function getSampleCount() {
-        return renderedSamples;
+        return getActualSampleCount();
     }
 
     function isCaptureReady(minSamples = 1) {
-        return isStarted() && hasSceneBuilt && renderedSamples >= Math.max(1, minSamples | 0);
+        return isStarted() && hasSceneBuilt && getActualSampleCount() >= Math.max(1, minSamples | 0);
+    }
+
+    function getActualSampleCount() {
+        const samples = Number(tracer?.samples);
+        return Number.isFinite(samples) ? samples : renderedSamples;
+    }
+
+    function setCaptureMode(enabled) {
+        const next = enabled === true;
+        if (captureMode === next) return false;
+        captureMode = next;
+        if (tracer) {
+            configureTracerMode(tracer);
+            renderedSamples = 0;
+            tracer.reset?.();
+        }
+        return true;
     }
 
     function setOptions(options = {}) {
@@ -819,6 +850,7 @@ export function createPathTracingController({
         markSceneDirty,
         getSampleCount,
         isCaptureReady,
+        setCaptureMode,
         setOptions,
         getSettings,
         isSyncFrozen,

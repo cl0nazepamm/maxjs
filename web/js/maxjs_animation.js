@@ -389,7 +389,15 @@ export function createMaxJSAnimationSystem({
         const normalized = String(type ?? '').trim().toLowerCase();
         if (normalized === 'i16n' || normalized === 'int16n') {
             if ((offset % 2) !== 0 || (offset + count * 2) > loadedBinary.byteLength) return null;
-            return new THREE.BufferAttribute(new Int16Array(loadedBinary, offset, count), 3, true);
+            // WebGPU rejects 3-component Int16 vertex attributes because the
+            // resulting 6-byte stride is not 4-byte aligned. Expand packed normals
+            // to Float32 (same as normalAttributeFromBinary on the base-geometry
+            // path) so the geometry never gets a stride-6 normal swapped in, and so
+            // frame updates stay on the copyArray fast path instead of setAttribute.
+            const packed = new Int16Array(loadedBinary, offset, count);
+            const expanded = new Float32Array(count);
+            for (let i = 0; i < count; i++) expanded[i] = Math.max(-1, packed[i] / 32767);
+            return new THREE.BufferAttribute(expanded, 3);
         }
         if ((offset % 4) !== 0 || (offset + count * 4) > loadedBinary.byteLength) return null;
         return new THREE.BufferAttribute(new Float32Array(loadedBinary, offset, count), 3);

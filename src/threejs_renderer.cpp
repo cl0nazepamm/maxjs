@@ -38,10 +38,10 @@ extern bool StartMaxJSRenderSequence(const std::wstring& outputPath,
                                      INode* renderViewNode,
                                      const ViewParams* renderViewParams);
 
-static constexpr int kPathTracingDefaultSamplesPerFrame = 1;
+static constexpr int kPathTracingDefaultSamplesPerFrame = 64;
 static constexpr int kPathTracingMinSamplesPerFrame = 1;
-static constexpr int kPathTracingMaxSamplesPerFrame = 64;
-static constexpr float kPathTracingDefaultGIClamp = 20.0f;
+static constexpr int kPathTracingMaxSamplesPerFrame = 512;
+static constexpr float kPathTracingDefaultGIClamp = 8.0f;
 static constexpr float kPathTracingMinGIClamp = 1.0f;
 static constexpr float kPathTracingMaxGIClamp = 1000.0f;
 static constexpr bool kDefaultUseMaxJSOrchestrator = true;

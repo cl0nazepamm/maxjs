@@ -124,8 +124,8 @@
     bool renderSequenceAlpha_ = false;
     std::wstring renderSequenceLastError_;
     ULONG lockedCameraHandle_ = 0;  // 0 = viewport (default), nonzero = scene camera handle
-    int pathTracingSamplesPerFrame_ = 1;
-    float pathTracingGIClamp_ = 20.0f;
+    int pathTracingSamplesPerFrame_ = 64;
+    float pathTracingGIClamp_ = 8.0f;
     bool pathTracingFreezeSync_ = false;
     bool pathTracingViewerActive_ = false;
     bool pathTracingHasSceneSync_ = false;

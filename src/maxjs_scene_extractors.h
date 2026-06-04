@@ -223,11 +223,14 @@ static void RestoreModifierEnabled(Modifier* mod, int wasEnabled) {
 
 static float ReadMorpherChannelInfluence(IMorpherChannel* channel, TimeValue t) {
     if (!channel) return 0.0f;
-    float percent = static_cast<float>(channel->GetInitPercent());
     if (Control* control = channel->GetControl()) {
+        float percent = 0.0f;
         Interval valid = FOREVER;
         control->GetValue(t, &percent, valid, CTRL_ABSOLUTE);
+        if (!std::isfinite(percent)) percent = 0.0f;
+        return std::clamp(percent / 100.0f, -10.0f, 10.0f);
     }
+    float percent = static_cast<float>(channel->GetInitPercent());
     if (!std::isfinite(percent)) percent = 0.0f;
     return std::clamp(percent / 100.0f, -10.0f, 10.0f);
 }
@@ -238,6 +241,10 @@ static float ReadMorpherPointWeight(IMorpherChannel* channel, int pointIndex) {
     if (!std::isfinite(weight)) return 1.0f;
     if (std::fabs(weight) > 1.0f) weight /= 100.0f;
     return std::clamp(weight, -10.0f, 10.0f);
+}
+
+static bool IsFinitePoint3(const Point3& value) {
+    return std::isfinite(value.x) && std::isfinite(value.y) && std::isfinite(value.z);
 }
 
 static void Mat4IdentityCM(float o[16]) {
@@ -476,7 +483,9 @@ static bool TryExtractSkinRigData(
                 const int ci = (vi < static_cast<int>(controlIdx.size())) ? controlIdx[vi] : vi;
                 if (ci < 0 || ci >= morphPointCount) continue;
                 Point3 delta = channel->GetDelta(ci);
+                if (!IsFinitePoint3(delta)) continue;
                 delta *= ReadMorpherPointWeight(channel, ci);
+                if (!IsFinitePoint3(delta)) continue;
                 const size_t off = static_cast<size_t>(vi) * 3u;
                 deltas[off + 0] = delta.x;
                 deltas[off + 1] = delta.y;

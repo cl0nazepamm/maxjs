@@ -170,9 +170,10 @@
         const int fps = GetFrameRate();
         const int frame = t / GetTicksPerFrame();
         const int warmupMs = renderImageWarmed_ ? 250 : 2000;
-        wchar_t msg[320];
-        swprintf_s(msg, L"{\"type\":\"render_to_image\",\"width\":%d,\"height\":%d,\"frame\":%d,\"fps\":%d,\"warmupMs\":%d,\"alpha\":%s}",
-                   width, height, frame, fps, warmupMs, wantsAlpha ? L"true" : L"false");
+        wchar_t msg[384];
+        swprintf_s(msg, L"{\"type\":\"render_to_image\",\"width\":%d,\"height\":%d,\"frame\":%d,\"fps\":%d,\"warmupMs\":%d,\"alpha\":%s,\"pathTracingSamples\":%d}",
+                   width, height, frame, fps, warmupMs, wantsAlpha ? L"true" : L"false",
+                   pathTracingSamplesPerFrame_);
 
         Interface* ip = GetCOREInterface();
         TimeValue previousTime = ip ? ip->GetTime() : t;
@@ -186,7 +187,13 @@
         webview_->PostWebMessageAsJson(msg);
         if (useBinary_) SendFullSyncBinary(); else SendFullSync();
 
-        const DWORD timeout = 10000;
+        const DWORD timeout = pathTracingViewerActive_
+            ? static_cast<DWORD>(std::clamp(
+                pathTracingSamplesPerFrame_ * 1000,
+                15000,
+                600000
+            ))
+            : 10000;
         const DWORD start = GetTickCount();
         while (WaitForSingleObject(renderImageEvent_, 0) != WAIT_OBJECT_0) {
             if (GetTickCount() - start > timeout) {
@@ -383,6 +390,7 @@
             << L",\"fps\":" << fps
             << L",\"warmupMs\":" << warmupMs
             << L",\"alpha\":" << (renderSequenceAlpha_ ? L"true" : L"false")
+            << L",\"pathTracingSamples\":" << pathTracingSamplesPerFrame_
             << L",\"mime\":\"" << EscapeJson(renderSequenceMime_.c_str()) << L"\"}";
 
         webview_->PostWebMessageAsJson(msg.str().c_str());

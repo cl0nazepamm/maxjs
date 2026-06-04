@@ -65,12 +65,12 @@
             <div class="vpmenu-dropdown" role="menu">
                 <div class="vpmenu-section maxonly devonly">Tools</div>
                 <div class="vpmenu-row maxonly devonly" data-vpmenu-close>
-                    <button id="btnLayersPanel" class="rail-btn" title="Load scene scripts or custom effects, supports inter layer messaging." aria-label="Scene Scripts (inlines)">
+                    <button id="btnLayersPanel" class="rail-btn" title="Load runtime layers or custom effects, supports inter layer messaging." aria-label="Runtime Layers (inlines)">
                         <svg class="rail-btn-logo-lg" viewBox="0 0 157 293" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" style="fill-rule:evenodd;clip-rule:evenodd;stroke-linejoin:round;stroke-miterlimit:2">
                             <path fill="currentColor" d="M78.041,292.681c0,0 -4.398,-33.779 -10.937,-45.784c-5.947,-10.919 -34.8,-16.618 -43.787,-18.399c-8.987,-1.781 -23.316,-1.526 -23.316,-1.526c0,0 50.071,-3.146 57.464,-11.695c8.436,-9.756 10.996,-34.004 11.844,-40.109c0.848,-6.105 4.578,-98.776 4.578,-98.776l4.155,-76.392l4.155,76.392c0,0 3.731,92.671 4.578,98.776c0.848,6.105 3.407,30.353 11.844,40.109c7.393,8.549 57.464,11.695 57.464,11.695c0,0 -37.567,2.399 -23.316,1.526c14.251,-0.873 -28.138,0.93 -43.787,18.399c-9.122,10.182 -10.937,45.784 -10.937,45.784Z"/>
                         </svg>
                     </button>
-                    <span class="vpmenu-label">Scene Scripts</span>
+                    <span class="vpmenu-label">Runtime Layers</span>
                 </div>
                 <div class="vpmenu-row maxonly devonly" data-vpmenu-close>
                     <button id="btnCanvasPanel" class="rail-btn" title="You can use Canvas to load HTML on your viewport." aria-label="Canvas">
@@ -4798,7 +4798,12 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         const ASCII_CHARS = ' .:-=+*#%@';
 
         function enterAsciiMode() {
-            if (asciiActive) return;
+            if (asciiActive) return true;
+            if (shaderLabFx?.isEnabled?.()) {
+                perfHud?.setStatus?.('max.js - ASCII unavailable while Shader Lab is active');
+                syncPostFxPanel(true);
+                return false;
+            }
             asciiPreFxSnapshot = {
                 ssgi: maxjsFx.isEnabled(), ssr: maxjsFx.isSSREnabled(), gtao: maxjsFx.isGTAOEnabled(),
                 bloom: maxjsFx.isBloomEnabled(), toonOutline: maxjsFx.isToonOutlineEnabled(),
@@ -4817,6 +4822,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             asciiActive = true;
             renderer.domElement.style.display = 'none';
             document.querySelector('.sidepanel-body')?.classList.add('ascii-takeover');
+            return true;
         }
 
         function exitAsciiMode() {
@@ -10852,7 +10858,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
 
         // Toon outline is automatic — no UI button needed
 
-        // ── Scene Scripts Panel ──────────────────────────
+        // ── Runtime Layers Panel ─────────────────────────
         const btnLayersPanel = document.getElementById('btnLayersPanel');
         const layersPanel = document.getElementById('layersPanel');
         let layersPanelVisible = false;
@@ -11128,7 +11134,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             layersPanel.innerHTML = `
                 <div class="sidepanel-header">
                     <div>
-                        <div class="sidepanel-title">Scene Scripts (inlines)</div>
+                        <div class="sidepanel-title">Runtime Layers (inlines)</div>
                         <div class="sidepanel-subtitle">${layers.length} tracked</div>
                     </div>
                     <div style="display:flex;gap:4px">
@@ -12187,15 +12193,11 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                         syncPostFxPanel(true);
                         return;
                     }
-                    if (shaderLabFx?.isEnabled?.()) {
-                        perfHud.setStatus('max.js - Playstation Wobble unavailable while Shader Lab is active');
-                        syncPostFxPanel(true);
-                        return;
-                    }
                     const retro = maxjsFx.getState().retro;
+                    const shaderLabActive = !!shaderLabFx?.isEnabled?.();
                     const next = !retro.wiggle;
                     maxjsFx.setRetroOptions({ wiggle: next });
-                    if (next && !maxjsFx.isRetroEnabled()) maxjsFx.setRetroEnabled(true);
+                    if (next && !shaderLabActive && !maxjsFx.isRetroEnabled()) maxjsFx.setRetroEnabled(true);
                     wobbleToggle.textContent = next ? 'On' : 'Off';
                     wobbleToggle.classList.toggle('active', next);
                     savePostFxState();
@@ -12216,7 +12218,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 const asciiColorSelect = document.getElementById('fx-clone-ascii-color');
                 const asciiInvertCheck = document.getElementById('fx-clone-ascii-invert');
                 asciiToggle.onclick = () => {
-                    if (asciiActive) exitAsciiMode(); else enterAsciiMode();
+                    if (asciiActive) exitAsciiMode(); else if (!enterAsciiMode()) return;
                     asciiToggle.textContent = asciiActive ? 'On' : 'Off';
                     asciiToggle.classList.toggle('active', asciiActive);
                     syncPostFxPanel(true);
@@ -12253,16 +12255,20 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     if (canSyncInput(invertCheck)) invertCheck.checked = !!s.invert;
                     const retro = maxjsFx.getState().retro;
                     const supportsPostStack = maxjsFx.supportsScreenSpaceEffects();
-                    const retroBlockedByShaderLab = !!shaderLabFx?.isEnabled?.();
+                    const asciiBlockedByShaderLab = !!shaderLabFx?.isEnabled?.();
                     if (wobbleSection) wobbleSection.hidden = !supportsPostStack;
                     wobbleToggle.textContent = retro.wiggle ? 'On' : 'Off';
                     wobbleToggle.classList.toggle('active', retro.wiggle);
-                    wobbleToggle.disabled = !supportsPostStack || retroBlockedByShaderLab;
-                    snapGridSlider.disabled = !supportsPostStack || retroBlockedByShaderLab;
+                    wobbleToggle.disabled = !supportsPostStack;
+                    snapGridSlider.disabled = !supportsPostStack;
                     if (canSyncInput(snapGridSlider)) snapGridSlider.value = retro.affineDistortion;
                     snapGridVal.textContent = retro.affineDistortion.toFixed(1);
                     asciiToggle.textContent = asciiActive ? 'On' : 'Off';
                     asciiToggle.classList.toggle('active', asciiActive);
+                    asciiToggle.disabled = asciiBlockedByShaderLab;
+                    asciiResSlider.disabled = asciiBlockedByShaderLab;
+                    asciiColorSelect.disabled = asciiBlockedByShaderLab;
+                    asciiInvertCheck.disabled = asciiBlockedByShaderLab;
                     if (canSyncInput(asciiResSlider)) asciiResSlider.value = asciiSettings.resolution;
                     asciiResVal.textContent = asciiSettings.resolution.toFixed(2);
                     if (canSyncInput(asciiColorSelect)) asciiColorSelect.value = asciiSettings.color;
@@ -12621,7 +12627,9 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         // Track the Activate state in the store whenever it flips so a refresh
         // brings the effect back (same UX as ssgi effects being sticky).
         window.addEventListener('maxjs-shader-lab-state', () => {
-            updateShaderLabEnabled(shaderLabFx.isEnabled());
+            const shaderLabEnabled = shaderLabFx.isEnabled();
+            if (shaderLabEnabled && asciiActive) exitAsciiMode();
+            updateShaderLabEnabled(shaderLabEnabled);
             syncPostFxPanel(true, { persist: false });
         });
 
@@ -12728,7 +12736,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     if (Number.isFinite(saved.ascii.resolution)) asciiSettings.resolution = saved.ascii.resolution;
                     if (saved.ascii.color) asciiSettings.color = saved.ascii.color;
                     if (typeof saved.ascii.invert === 'boolean') asciiSettings.invert = saved.ascii.invert;
-                    if (saved.ascii.enabled) enterAsciiMode();
+                    if (saved.ascii.enabled && !saved.shaderLab?.enabled) enterAsciiMode();
                 }
 
                 // Shader Lab restore (config + autoApply + enabled) —
@@ -13329,11 +13337,11 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                         } finally {
                             renderToImageForcePathTracing = false;
                         }
-                        if (capture.responseType === 'render_to_image_ready') {
-                            requestAnimationFrame(() => bridge.send('render_to_image_ready'));
-                        } else {
-                            void sendCurrentCanvasRenderFile(capture);
-                        }
+                        // Both paths read the canvas back to C++. The Max-bitmap
+                        // path (render_to_image_ready) needs the pixels too — its
+                        // alpha channel only survives from the canvas, not from
+                        // WebView2 CapturePreview.
+                        void sendCurrentCanvasRenderFile(capture);
                     });
                 }
             }
@@ -13532,12 +13540,16 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 );
             } catch {}
 
+            // Single background decision shared by both paths (legacy + orchestrator):
+            // gated only on wantsAlpha, never on which path triggered the render.
             if (wantsAlpha) {
+                // Transparent matte — no background fill.
                 envVisible = false;
                 localHdriShowBg = false;
                 maxjsFx.setEnvironmentVisible(false);
                 scene.background = null;
-            } else if (isSequenceFrame) {
+            } else {
+                // Opaque output — fill the viewer background (or environment).
                 maxjsFx.setEnvironmentVisible(envVisible);
                 if (isLocalHdriActive()) {
                     localHdriShowBg = envVisible;
@@ -13547,11 +13559,6 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                         ? scene.environment
                         : new THREE.Color(hiddenBackgroundColor);
                 }
-            } else {
-                envVisible = false;
-                localHdriShowBg = false;
-                maxjsFx.setEnvironmentVisible(false);
-                scene.background = null;
             }
             if (pendingRenderToImage.pathTracing) {
                 resetPathTracingStartupWarmup();

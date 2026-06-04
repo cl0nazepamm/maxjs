@@ -2111,6 +2111,8 @@
             return;
         }
         if (type == L"render_to_image_ready") {
+            renderToImageBase64_.clear();
+            ExtractJsonString(msg, L"imageBase64", renderToImageBase64_);
             if (renderImageEvent_) SetEvent(renderImageEvent_);
             return;
         }

@@ -390,9 +390,14 @@ export function createMaxJSFxController({
             && activeShaderLabFx.canRenderWithInputs?.(getShaderLabInputs()) !== false;
     }
 
-    /** Retro post-pass and PS1 wiggle conflict with Shader Lab final stylize. */
     function isRetroActive() {
         return isScreenSpaceActive('retro') && !hasShaderLabPassEnabled();
+    }
+
+    function isPS1WiggleActive() {
+        return supportsScreenSpaceEffects
+            && !!state.retro.wiggle
+            && (state.retro.enabled || hasShaderLabPassEnabled());
     }
 
     function matchAndSmooth(rawBlobs) {
@@ -852,7 +857,7 @@ export function createMaxJSFxController({
             effectiveGTAOThickness: state.gtao.thickness * ssrUnitScale,
             effectiveContactShadowMaxDistance: state.contactShadow.maxDistance * ssrUnitScale,
             effectiveContactShadowThickness: state.contactShadow.thickness * ssrUnitScale,
-            ps1SnapActive: isRetroActive() && state.retro.wiggle,
+            ps1SnapActive: isPS1WiggleActive(),
         };
     }
 
@@ -1386,7 +1391,7 @@ export function createMaxJSFxController({
     }
 
     function syncSharedSceneEffects(force = false) {
-        const shouldUsePS1Wiggle = isRetroActive() && state.retro.wiggle;
+        const shouldUsePS1Wiggle = isPS1WiggleActive();
         if (shouldUsePS1Wiggle) {
             if (force || ps1SceneDirty || !ps1WiggleActive) {
                 enablePS1Wiggle(state.retro.affineDistortion);
@@ -1410,7 +1415,7 @@ export function createMaxJSFxController({
 
         if (!hasPipelineEffectEnabled() || !available) {
             pipelineReady = false;
-            disablePS1Wiggle();
+            syncSharedSceneEffects(true);
             restoreForcedContactShadowLight();
             clearNodes();
             postProcessing.outputNode = null;
@@ -1552,7 +1557,17 @@ export function createMaxJSFxController({
                 ssrReflectivity = scenePassMetalRough.r;
             }
 
-            let beautyAlpha = scenePassColor.a;
+            // The MRT scene-pass output alpha is unreliable for opaque geometry
+            // when there is no background fill (alpha render / transparent
+            // export): opaque pixels can read a=0, which then premultiplies the
+            // whole matte to transparent black on the canvas. Derive coverage
+            // from scene depth (already reliable, drives the env-backdrop
+            // compensation below) and keep the higher of the two so glow/bloom
+            // can still extend alpha past the geometry. This is a no-op for
+            // live/opaque renders, where the background fills depth=far with a=1
+            // — there scenePassColor.a is already 1 and dominates the max().
+            const geometryCoverageAlpha = scenePassDepth.r.lessThan(float(0.999999)).select(float(1), float(0));
+            let beautyAlpha = max(scenePassColor.a, geometryCoverageAlpha);
             const withBeautyAlpha = (node) => vec4(node.rgb, beautyAlpha);
             const raiseBeautyAlpha = (alphaNode) => {
                 beautyAlpha = max(beautyAlpha, alphaNode);

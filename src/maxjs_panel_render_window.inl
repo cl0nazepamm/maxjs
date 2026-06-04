@@ -1,6 +1,7 @@
     // ── Render-to-image (production render) ────────────────
 
     HANDLE renderImageEvent_ = nullptr;  // signaled when JS confirms a Max-path frame rendered
+    std::wstring renderToImageBase64_;   // canvas PNG (straight alpha) sent by JS for the Max path
     bool renderLocked_ = false;          // panel is locked to render resolution
     bool renderImageWarmed_ = false;     // first Max-path capture needs camera/sync settle time
     RECT preRenderRect_ = {};            // saved window rect before render
@@ -55,6 +56,69 @@
                _wcsicmp(mime.c_str(), L"image/webp") == 0;
     }
 
+    // Decode a PNG from an IStream into a Max bitmap, preserving the alpha
+    // channel. Scales to the bitmap's resolution (identity when the canvas was
+    // already rendered at the render size). Shared by the canvas-pixel capture.
+    bool DecodePngStreamToBitmap(IStream* stream, Bitmap* target) {
+        if (!stream || !target) return false;
+
+        LARGE_INTEGER zero = {};
+        stream->Seek(zero, STREAM_SEEK_SET, nullptr);
+
+        ComPtr<IWICImagingFactory> wic;
+        CoCreateInstance(CLSID_WICImagingFactory, nullptr,
+            CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic));
+        if (!wic) return false;
+
+        ComPtr<IWICBitmapDecoder> decoder;
+        wic->CreateDecoderFromStream(stream, nullptr,
+            WICDecodeMetadataCacheOnLoad, &decoder);
+        if (!decoder) return false;
+
+        ComPtr<IWICBitmapFrameDecode> frame;
+        decoder->GetFrame(0, &frame);
+        if (!frame) return false;
+
+        const int dstW = target->Width();
+        const int dstH = target->Height();
+        if (dstW <= 0 || dstH <= 0) return false;
+
+        ComPtr<IWICBitmapScaler> scaler;
+        wic->CreateBitmapScaler(&scaler);
+        scaler->Initialize(frame.Get(), dstW, dstH,
+            WICBitmapInterpolationModeHighQualityCubic);
+
+        ComPtr<IWICFormatConverter> converter;
+        wic->CreateFormatConverter(&converter);
+        converter->Initialize(scaler.Get(),
+            GUID_WICPixelFormat32bppBGRA,
+            WICBitmapDitherTypeNone, nullptr, 0,
+            WICBitmapPaletteTypeCustom);
+
+        std::vector<BYTE> pixels(static_cast<size_t>(dstW) * dstH * 4);
+        if (FAILED(converter->CopyPixels(nullptr, dstW * 4,
+                static_cast<UINT>(pixels.size()), pixels.data()))) {
+            return false;
+        }
+
+        std::vector<BMM_Color_64> line(dstW);
+        const BYTE* src = pixels.data();
+        for (int y = 0; y < dstH; y++) {
+            for (int x = 0; x < dstW; x++) {
+                const int idx = x * 4;
+                line[x].b = src[idx + 0] << 8;
+                line[x].g = src[idx + 1] << 8;
+                line[x].r = src[idx + 2] << 8;
+                line[x].a = src[idx + 3] << 8;
+            }
+            target->PutPixels(0, y, dstW, line.data());
+            target->ShowProgressLine(y);
+            src += static_cast<size_t>(dstW) * 4;
+        }
+        target->RefreshWindow();
+        return true;
+    }
+
     bool RenderFrameToBitmap(Bitmap* target, int width, int height, TimeValue t,
                              INode* renderViewNode, const ViewParams* renderViewParams,
                              RendProgressCallback* prog) {
@@ -86,8 +150,15 @@
             }
         }
 
+        // One shared alpha decision for both render paths: render with alpha
+        // only when the output actually wants it. Legacy path keys off the Max
+        // output bitmap's alpha channel (the PNG/TGA "alpha channel" setting);
+        // the orchestrator path keys off RenderMimeSupportsAlpha(mime). Both end
+        // up at the same JS wantsAlpha gate.
+        const bool wantsAlpha = target->HasAlpha() != 0;
+
         LockToRenderSize(width, height);
-        SetWebViewBackgroundTransparent(true);
+        SetWebViewBackgroundTransparent(wantsAlpha);
         if (prog) prog->SetTitle(_T("three.js - syncing frame..."));
 
         target->UseScaleColors(0);
@@ -100,8 +171,8 @@
         const int frame = t / GetTicksPerFrame();
         const int warmupMs = renderImageWarmed_ ? 250 : 2000;
         wchar_t msg[320];
-        swprintf_s(msg, L"{\"type\":\"render_to_image\",\"width\":%d,\"height\":%d,\"frame\":%d,\"fps\":%d,\"warmupMs\":%d,\"alpha\":true}",
-                   width, height, frame, fps, warmupMs);
+        swprintf_s(msg, L"{\"type\":\"render_to_image\",\"width\":%d,\"height\":%d,\"frame\":%d,\"fps\":%d,\"warmupMs\":%d,\"alpha\":%s}",
+                   width, height, frame, fps, warmupMs, wantsAlpha ? L"true" : L"false");
 
         Interface* ip = GetCOREInterface();
         TimeValue previousTime = ip ? ip->GetTime() : t;
@@ -131,87 +202,25 @@
             Sleep(1);
         }
 
-        HANDLE captureEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        // WebView2 CapturePreview composites the transparent canvas onto an
+        // opaque background, so it can never deliver an alpha matte. Instead the
+        // frame arrives in renderToImageBase64_ — the canvas read back by JS as a
+        // straight-alpha PNG (render_to_image_ready payload) — and we decode that
+        // so the alpha channel survives into the Max bitmap.
         bool captureOk = false;
         if (prog) prog->SetTitle(_T("three.js - capturing frame..."));
 
-        ComPtr<IStream> stream;
-        CreateStreamOnHGlobal(NULL, TRUE, &stream);
-
-        webview_->CapturePreview(
-            COREWEBVIEW2_CAPTURE_PREVIEW_IMAGE_FORMAT_PNG,
-            stream.Get(),
-            Callback<ICoreWebView2CapturePreviewCompletedHandler>(
-                [&captureOk, &captureEvent, stream, target](HRESULT hr) -> HRESULT {
-                    if (SUCCEEDED(hr)) {
-                        LARGE_INTEGER zero = {};
-                        stream->Seek(zero, STREAM_SEEK_SET, nullptr);
-
-                        ComPtr<IWICImagingFactory> wic;
-                        CoCreateInstance(CLSID_WICImagingFactory, nullptr,
-                            CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic));
-                        if (wic) {
-                            ComPtr<IWICBitmapDecoder> decoder;
-                            wic->CreateDecoderFromStream(stream.Get(), nullptr,
-                                WICDecodeMetadataCacheOnLoad, &decoder);
-                            if (decoder) {
-                                ComPtr<IWICBitmapFrameDecode> frame;
-                                decoder->GetFrame(0, &frame);
-                                if (frame) {
-                                    const int dstW = target->Width();
-                                    const int dstH = target->Height();
-
-                                    ComPtr<IWICBitmapScaler> scaler;
-                                    wic->CreateBitmapScaler(&scaler);
-                                    scaler->Initialize(frame.Get(), dstW, dstH,
-                                        WICBitmapInterpolationModeHighQualityCubic);
-
-                                    ComPtr<IWICFormatConverter> converter;
-                                    wic->CreateFormatConverter(&converter);
-                                    converter->Initialize(scaler.Get(),
-                                        GUID_WICPixelFormat32bppBGRA,
-                                        WICBitmapDitherTypeNone, nullptr, 0,
-                                        WICBitmapPaletteTypeCustom);
-
-                                    std::vector<BYTE> pixels(dstW * dstH * 4);
-                                    converter->CopyPixels(nullptr, dstW * 4,
-                                        static_cast<UINT>(pixels.size()), pixels.data());
-
-                                    std::vector<BMM_Color_64> line(dstW);
-                                    const BYTE* src = pixels.data();
-                                    for (int y = 0; y < dstH; y++) {
-                                        for (int x = 0; x < dstW; x++) {
-                                            const int idx = x * 4;
-                                            line[x].b = src[idx + 0] << 8;
-                                            line[x].g = src[idx + 1] << 8;
-                                            line[x].r = src[idx + 2] << 8;
-                                            line[x].a = src[idx + 3] << 8;
-                                        }
-                                        target->PutPixels(0, y, dstW, line.data());
-                                        target->ShowProgressLine(y);
-                                        src += dstW * 4;
-                                    }
-                                    target->RefreshWindow();
-                                    captureOk = true;
-                                }
-                            }
-                        }
-                    }
-                    SetEvent(captureEvent);
-                    return S_OK;
-                }).Get());
-
-        const DWORD captureStart = GetTickCount();
-        while (WaitForSingleObject(captureEvent, 0) != WAIT_OBJECT_0) {
-            if (GetTickCount() - captureStart > timeout) break;
-            MSG winMsg;
-            while (PeekMessage(&winMsg, nullptr, 0, 0, PM_REMOVE)) {
-                TranslateMessage(&winMsg);
-                DispatchMessage(&winMsg);
+        std::string pngBytes;
+        if (DecodeBase64Wide(renderToImageBase64_, pngBytes) && !pngBytes.empty()) {
+            ComPtr<IStream> stream;
+            if (SUCCEEDED(CreateStreamOnHGlobal(nullptr, TRUE, &stream)) && stream) {
+                ULONG written = 0;
+                stream->Write(pngBytes.data(),
+                    static_cast<ULONG>(pngBytes.size()), &written);
+                captureOk = DecodePngStreamToBitmap(stream.Get(), target);
             }
-            Sleep(1);
         }
-        CloseHandle(captureEvent);
+        renderToImageBase64_.clear();
 
         if (ip && previousTime != t) ip->SetTime(previousTime, FALSE);
         restoreRenderState();

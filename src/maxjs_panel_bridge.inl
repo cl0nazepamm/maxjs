@@ -119,6 +119,18 @@ void ReparentMaxJSPanel(HWND newParent) {
 void RestoreMaxJSPanel() {
     if (g_panel) g_panel->RestoreFromViewport();
 }
+bool RenderMaxJSFrameToBitmap(Bitmap* target, int width, int height, TimeValue t, RendProgressCallback* prog) {
+    EnsurePanel();
+    if (!g_panel) return false;
+    return g_panel->RenderFrameToBitmap(target, width, height, t, nullptr, nullptr, prog);
+}
+bool RenderMaxJSFrameToBitmap(Bitmap* target, int width, int height, TimeValue t,
+                              INode* renderViewNode, const ViewParams* renderViewParams,
+                              RendProgressCallback* prog) {
+    EnsurePanel();
+    if (!g_panel) return false;
+    return g_panel->RenderFrameToBitmap(target, width, height, t, renderViewNode, renderViewParams, prog);
+}
 bool StartMaxJSRenderSequence(const std::wstring& outputPath,
                               const std::wstring& mime,
                               int width,

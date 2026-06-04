@@ -2110,6 +2110,10 @@
             }
             return;
         }
+        if (type == L"render_to_image_ready") {
+            if (renderImageEvent_) SetEvent(renderImageEvent_);
+            return;
+        }
         if (type == L"sync_lightmap_uvs" || type == L"sync_uv2") {
             RequestFullGeometryResync();
             return;

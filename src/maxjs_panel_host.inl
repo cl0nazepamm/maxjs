@@ -121,6 +121,7 @@
     bool renderSequenceHaveViewParams_ = false;
     bool renderSequenceRestoreTime_ = false;
     bool renderSequenceFirstFrame_ = true;
+    bool renderSequenceAlpha_ = false;
     std::wstring renderSequenceLastError_;
     ULONG lockedCameraHandle_ = 0;  // 0 = viewport (default), nonzero = scene camera handle
     int pathTracingSamplesPerFrame_ = 1;

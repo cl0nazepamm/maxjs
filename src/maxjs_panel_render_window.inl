@@ -1,6 +1,8 @@
     // ── Render-to-image (production render) ────────────────
 
+    HANDLE renderImageEvent_ = nullptr;  // signaled when JS confirms a Max-path frame rendered
     bool renderLocked_ = false;          // panel is locked to render resolution
+    bool renderImageWarmed_ = false;     // first Max-path capture needs camera/sync settle time
     RECT preRenderRect_ = {};            // saved window rect before render
     LONG preRenderStyle_ = 0;            // saved window style before render
 
@@ -46,6 +48,176 @@
             bg.A = transparent ? 0 : 255;
             ctrl2->put_DefaultBackgroundColor(bg);
         }
+    }
+
+    bool RenderMimeSupportsAlpha(const std::wstring& mime) const {
+        return _wcsicmp(mime.c_str(), L"image/png") == 0 ||
+               _wcsicmp(mime.c_str(), L"image/webp") == 0;
+    }
+
+    bool RenderFrameToBitmap(Bitmap* target, int width, int height, TimeValue t,
+                             INode* renderViewNode, const ViewParams* renderViewParams,
+                             RendProgressCallback* prog) {
+        if (!webview_ || !target) return false;
+
+        auto restoreRenderState = [this]() {
+            if (webview_) {
+                webview_->PostWebMessageAsJson(L"{\"type\":\"render_to_image_done\"}");
+            }
+            renderCameraOverrideActive_ = false;
+            UnlockRenderSize();
+            SetWebViewBackgroundTransparent(false);
+        };
+
+        if (!jsReady_) {
+            const DWORD readyTimeout = 15000;
+            const DWORD readyStart = GetTickCount();
+            while (!jsReady_) {
+                if (GetTickCount() - readyStart > readyTimeout) {
+                    restoreRenderState();
+                    return false;
+                }
+                MSG winMsg;
+                while (PeekMessage(&winMsg, nullptr, 0, 0, PM_REMOVE)) {
+                    TranslateMessage(&winMsg);
+                    DispatchMessage(&winMsg);
+                }
+                Sleep(1);
+            }
+        }
+
+        LockToRenderSize(width, height);
+        SetWebViewBackgroundTransparent(true);
+        if (prog) prog->SetTitle(_T("three.js - syncing frame..."));
+
+        target->UseScaleColors(0);
+
+        if (!renderImageEvent_)
+            renderImageEvent_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        ResetEvent(renderImageEvent_);
+
+        const int fps = GetFrameRate();
+        const int frame = t / GetTicksPerFrame();
+        const int warmupMs = renderImageWarmed_ ? 250 : 2000;
+        wchar_t msg[320];
+        swprintf_s(msg, L"{\"type\":\"render_to_image\",\"width\":%d,\"height\":%d,\"frame\":%d,\"fps\":%d,\"warmupMs\":%d,\"alpha\":true}",
+                   width, height, frame, fps, warmupMs);
+
+        Interface* ip = GetCOREInterface();
+        TimeValue previousTime = ip ? ip->GetTime() : t;
+        if (ip && previousTime != t) ip->SetTime(t, FALSE);
+        CameraData renderCam = {};
+        renderCameraOverrideActive_ = GetRenderViewCameraData(renderViewNode, renderViewParams, t, renderCam);
+        if (renderCameraOverrideActive_) {
+            renderCameraOverride_ = renderCam;
+        }
+
+        webview_->PostWebMessageAsJson(msg);
+        if (useBinary_) SendFullSyncBinary(); else SendFullSync();
+
+        const DWORD timeout = 10000;
+        const DWORD start = GetTickCount();
+        while (WaitForSingleObject(renderImageEvent_, 0) != WAIT_OBJECT_0) {
+            if (GetTickCount() - start > timeout) {
+                if (ip && previousTime != t) ip->SetTime(previousTime, FALSE);
+                restoreRenderState();
+                return false;
+            }
+            MSG winMsg;
+            while (PeekMessage(&winMsg, nullptr, 0, 0, PM_REMOVE)) {
+                TranslateMessage(&winMsg);
+                DispatchMessage(&winMsg);
+            }
+            Sleep(1);
+        }
+
+        HANDLE captureEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        bool captureOk = false;
+        if (prog) prog->SetTitle(_T("three.js - capturing frame..."));
+
+        ComPtr<IStream> stream;
+        CreateStreamOnHGlobal(NULL, TRUE, &stream);
+
+        webview_->CapturePreview(
+            COREWEBVIEW2_CAPTURE_PREVIEW_IMAGE_FORMAT_PNG,
+            stream.Get(),
+            Callback<ICoreWebView2CapturePreviewCompletedHandler>(
+                [&captureOk, &captureEvent, stream, target](HRESULT hr) -> HRESULT {
+                    if (SUCCEEDED(hr)) {
+                        LARGE_INTEGER zero = {};
+                        stream->Seek(zero, STREAM_SEEK_SET, nullptr);
+
+                        ComPtr<IWICImagingFactory> wic;
+                        CoCreateInstance(CLSID_WICImagingFactory, nullptr,
+                            CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic));
+                        if (wic) {
+                            ComPtr<IWICBitmapDecoder> decoder;
+                            wic->CreateDecoderFromStream(stream.Get(), nullptr,
+                                WICDecodeMetadataCacheOnLoad, &decoder);
+                            if (decoder) {
+                                ComPtr<IWICBitmapFrameDecode> frame;
+                                decoder->GetFrame(0, &frame);
+                                if (frame) {
+                                    const int dstW = target->Width();
+                                    const int dstH = target->Height();
+
+                                    ComPtr<IWICBitmapScaler> scaler;
+                                    wic->CreateBitmapScaler(&scaler);
+                                    scaler->Initialize(frame.Get(), dstW, dstH,
+                                        WICBitmapInterpolationModeHighQualityCubic);
+
+                                    ComPtr<IWICFormatConverter> converter;
+                                    wic->CreateFormatConverter(&converter);
+                                    converter->Initialize(scaler.Get(),
+                                        GUID_WICPixelFormat32bppBGRA,
+                                        WICBitmapDitherTypeNone, nullptr, 0,
+                                        WICBitmapPaletteTypeCustom);
+
+                                    std::vector<BYTE> pixels(dstW * dstH * 4);
+                                    converter->CopyPixels(nullptr, dstW * 4,
+                                        static_cast<UINT>(pixels.size()), pixels.data());
+
+                                    std::vector<BMM_Color_64> line(dstW);
+                                    const BYTE* src = pixels.data();
+                                    for (int y = 0; y < dstH; y++) {
+                                        for (int x = 0; x < dstW; x++) {
+                                            const int idx = x * 4;
+                                            line[x].b = src[idx + 0] << 8;
+                                            line[x].g = src[idx + 1] << 8;
+                                            line[x].r = src[idx + 2] << 8;
+                                            line[x].a = src[idx + 3] << 8;
+                                        }
+                                        target->PutPixels(0, y, dstW, line.data());
+                                        target->ShowProgressLine(y);
+                                        src += dstW * 4;
+                                    }
+                                    target->RefreshWindow();
+                                    captureOk = true;
+                                }
+                            }
+                        }
+                    }
+                    SetEvent(captureEvent);
+                    return S_OK;
+                }).Get());
+
+        const DWORD captureStart = GetTickCount();
+        while (WaitForSingleObject(captureEvent, 0) != WAIT_OBJECT_0) {
+            if (GetTickCount() - captureStart > timeout) break;
+            MSG winMsg;
+            while (PeekMessage(&winMsg, nullptr, 0, 0, PM_REMOVE)) {
+                TranslateMessage(&winMsg);
+                DispatchMessage(&winMsg);
+            }
+            Sleep(1);
+        }
+        CloseHandle(captureEvent);
+
+        if (ip && previousTime != t) ip->SetTime(previousTime, FALSE);
+        restoreRenderState();
+        if (captureOk) renderImageWarmed_ = true;
+
+        return captureOk;
     }
 
     void PrepareProductionRenderWindow() {
@@ -140,6 +312,7 @@
         renderSequenceHaveViewParams_ = false;
         renderSequenceRestoreTime_ = false;
         renderSequenceFirstFrame_ = true;
+        renderSequenceAlpha_ = false;
         renderCameraOverrideActive_ = false;
         UnlockRenderSize();
         SetWebViewBackgroundTransparent(false);
@@ -187,7 +360,7 @@
         if (renderCameraOverrideActive_) renderCameraOverride_ = renderCam;
 
         LockToRenderSize(renderSequenceWidth_, renderSequenceHeight_);
-        SetWebViewBackgroundTransparent(false);
+        SetWebViewBackgroundTransparent(renderSequenceAlpha_);
 
         const int fps = GetFrameRate();
         const int warmupMs = renderSequenceFirstFrame_ ? 100 : 0;
@@ -200,6 +373,7 @@
             << L",\"frame\":" << renderSequenceCurrentFrame_
             << L",\"fps\":" << fps
             << L",\"warmupMs\":" << warmupMs
+            << L",\"alpha\":" << (renderSequenceAlpha_ ? L"true" : L"false")
             << L",\"mime\":\"" << EscapeJson(renderSequenceMime_.c_str()) << L"\"}";
 
         webview_->PostWebMessageAsJson(msg.str().c_str());
@@ -230,6 +404,7 @@
         renderSequenceFrameInFlight_ = false;
         renderSequenceBasePath_ = basePath;
         renderSequenceMime_ = mime.empty() ? L"image/png" : mime;
+        renderSequenceAlpha_ = RenderMimeSupportsAlpha(renderSequenceMime_);
         renderSequenceWidth_ = width;
         renderSequenceHeight_ = height;
         renderSequenceStartFrame_ = startFrame;
@@ -792,6 +967,7 @@
         StopActiveShade();
         if (hwnd_) KillTimer(hwnd_, RENDER_SEQUENCE_TIMER_ID);
         FinishRenderSequence(false);
+        if (renderImageEvent_) { CloseHandle(renderImageEvent_); renderImageEvent_ = nullptr; }
         if (originalParent_) RestoreFromViewport();
         UnregisterCallbacks();
         if (controller_) { controller_->Close(); controller_ = nullptr; }

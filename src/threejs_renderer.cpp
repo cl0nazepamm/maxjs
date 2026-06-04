@@ -25,6 +25,9 @@ extern HWND GetMaxJSWebViewHWND();
 extern void ReparentMaxJSPanel(HWND newParent);
 extern void RestoreMaxJSPanel();
 extern void SetMaxJSPathTracingSettings(int samplesPerFrame, float giClamp, bool freezeSync);
+extern bool RenderMaxJSFrameToBitmap(Bitmap* target, int width, int height, TimeValue t,
+                                     INode* renderViewNode, const ViewParams* renderViewParams,
+                                     RendProgressCallback* prog);
 extern bool StartMaxJSRenderSequence(const std::wstring& outputPath,
                                      const std::wstring& mime,
                                      int width,
@@ -41,6 +44,7 @@ static constexpr int kPathTracingMaxSamplesPerFrame = 64;
 static constexpr float kPathTracingDefaultGIClamp = 20.0f;
 static constexpr float kPathTracingMinGIClamp = 1.0f;
 static constexpr float kPathTracingMaxGIClamp = 1000.0f;
+static constexpr bool kDefaultUseMaxJSOrchestrator = true;
 static constexpr USHORT kThreeJSRendererSettingsChunk = 0x5100;
 
 static int ClampPathTracingSamplesPerFrame(int value) {
@@ -210,6 +214,7 @@ class ThreeJSRenderer : public Renderer {
     int pathTracingSamplesPerFrame_ = kPathTracingDefaultSamplesPerFrame;
     float pathTracingGIClamp_ = kPathTracingDefaultGIClamp;
     bool pathTracingFreezeSync_ = false;
+    bool useMaxJSOrchestrator_ = kDefaultUseMaxJSOrchestrator;
 
 public:
     ThreeJSRenderer() {}
@@ -235,6 +240,7 @@ public:
         r->pathTracingSamplesPerFrame_ = pathTracingSamplesPerFrame_;
         r->pathTracingGIClamp_ = pathTracingGIClamp_;
         r->pathTracingFreezeSync_ = pathTracingFreezeSync_;
+        r->useMaxJSOrchestrator_ = useMaxJSOrchestrator_;
         BaseClone(this, r, remap);
         return r;
     }
@@ -242,6 +248,7 @@ public:
     int GetPathTracingSamplesPerFrame() const { return pathTracingSamplesPerFrame_; }
     float GetPathTracingGIClamp() const { return pathTracingGIClamp_; }
     bool GetPathTracingFreezeSync() const { return pathTracingFreezeSync_; }
+    bool GetUseMaxJSOrchestrator() const { return useMaxJSOrchestrator_; }
 
     void BroadcastPathTracingSettings() const {
         SetMaxJSPathTracingSettings(pathTracingSamplesPerFrame_, pathTracingGIClamp_, pathTracingFreezeSync_);
@@ -252,6 +259,10 @@ public:
         pathTracingGIClamp_ = ClampPathTracingGIClamp(giClamp);
         pathTracingFreezeSync_ = freezeSync;
         if (broadcast) BroadcastPathTracingSettings();
+    }
+
+    void SetUseMaxJSOrchestrator(bool enabled) {
+        useMaxJSOrchestrator_ = enabled;
     }
 
     // ── Renderer core ────────────────────────────────────────
@@ -273,9 +284,14 @@ public:
             return 1;
         }
 
-        // The 3ds Max Render button is only the trigger. The WebView stays
-        // alive and writes the actual sequence.
-        PrepareMaxJSProductionRenderWindow();
+        if (useMaxJSOrchestrator_) {
+            // The 3ds Max Render button is only the trigger. The WebView stays
+            // alive and writes the actual sequence.
+            PrepareMaxJSProductionRenderWindow();
+        } else {
+            // Legacy Max bitmap path: Max owns the frame loop/VFB/output.
+            EnsureMaxJSPanel();
+        }
         BroadcastPathTracingSettings();
         return 1;
     }
@@ -301,10 +317,16 @@ public:
 
         if (prog) prog->SetTitle(_T("three.js — rendering frame..."));
 
+        const ViewParams* effectiveViewParams = viewPar ? viewPar : (haveRenderViewParams_ ? &renderViewParams_ : nullptr);
+        if (!useMaxJSOrchestrator_) {
+            if (!tobm) return 0;
+            const bool ok = RenderMaxJSFrameToBitmap(tobm, w, h, t, renderViewNode_, effectiveViewParams, prog);
+            return ok ? 1 : 0;
+        }
+
         if (sequenceStarted_) return 1;
         sequenceStarted_ = true;
 
-        const ViewParams* effectiveViewParams = viewPar ? viewPar : (haveRenderViewParams_ ? &renderViewParams_ : nullptr);
         const std::wstring outputPath = ResolveBrowserRenderOutputPath(tobm);
         const std::wstring mime = BrowserMimeForRenderPath(outputPath);
         const int step = renderEndFrame_ >= renderStartFrame_ ? 1 : -1;
@@ -322,7 +344,7 @@ public:
     }
 
     void Close(HWND, RendProgressCallback* = nullptr) override {
-        RestoreMaxJSProductionRenderWindow();
+        if (useMaxJSOrchestrator_) RestoreMaxJSProductionRenderWindow();
         stopRequested_ = false;
         sequenceStarted_ = false;
         inMaterialEditor_ = false;
@@ -338,6 +360,7 @@ public:
             kPathTracingDefaultGIClamp,
             false
         );
+        SetUseMaxJSOrchestrator(kDefaultUseMaxJSOrchestrator);
     }
 
     // ── Required overrides ───────────────────────────────────
@@ -362,8 +385,8 @@ public:
 
     bool HasRequirement(Requirement requirement) override {
         switch (requirement) {
-            case Requirement::kRequirement_NoVFB: return true;
-            case Requirement::kRequirement_DontSaveRenderOutput: return true;
+            case Requirement::kRequirement_NoVFB: return useMaxJSOrchestrator_;
+            case Requirement::kRequirement_DontSaveRenderOutput: return useMaxJSOrchestrator_;
             default: return false;
         }
     }
@@ -375,10 +398,11 @@ public:
 
         std::ostringstream payload;
         payload.imbue(std::locale::classic());
-        payload << 1 << ' '
+        payload << 2 << ' '
                 << pathTracingSamplesPerFrame_ << ' '
                 << pathTracingGIClamp_ << ' '
-                << (pathTracingFreezeSync_ ? 1 : 0);
+                << (pathTracingFreezeSync_ ? 1 : 0) << ' '
+                << (useMaxJSOrchestrator_ ? 1 : 0);
 
         isave->BeginChunk(kThreeJSRendererSettingsChunk);
         result = isave->WriteCString(payload.str().c_str());
@@ -403,10 +427,14 @@ public:
                     int samplesPerFrame = kPathTracingDefaultSamplesPerFrame;
                     float giClamp = kPathTracingDefaultGIClamp;
                     int freezeSync = 0;
+                    int useOrchestrator = kDefaultUseMaxJSOrchestrator ? 1 : 0;
                     std::istringstream input(payload);
                     input.imbue(std::locale::classic());
                     if (input >> version >> samplesPerFrame >> giClamp >> freezeSync) {
                         SetPathTracingSettings(samplesPerFrame, giClamp, freezeSync != 0, false);
+                        if (version >= 2 && (input >> useOrchestrator)) {
+                            SetUseMaxJSOrchestrator(useOrchestrator != 0);
+                        }
                     }
                 }
             }
@@ -428,6 +456,7 @@ class ThreeJSRendererParamDlg : public RendParamDlg {
     int samplesPerFrame_ = kPathTracingDefaultSamplesPerFrame;
     float giClamp_ = kPathTracingDefaultGIClamp;
     bool freezeSync_ = false;
+    bool useMaxJSOrchestrator_ = kDefaultUseMaxJSOrchestrator;
 
 public:
     ThreeJSRendererParamDlg(ThreeJSRenderer* renderer, IRendParams* rendParams, BOOL prog)
@@ -435,6 +464,7 @@ public:
         samplesPerFrame_ = renderer_ ? renderer_->GetPathTracingSamplesPerFrame() : kPathTracingDefaultSamplesPerFrame;
         giClamp_ = renderer_ ? renderer_->GetPathTracingGIClamp() : kPathTracingDefaultGIClamp;
         freezeSync_ = renderer_ ? renderer_->GetPathTracingFreezeSync() : false;
+        useMaxJSOrchestrator_ = renderer_ ? renderer_->GetUseMaxJSOrchestrator() : kDefaultUseMaxJSOrchestrator;
 
         panel_ = rendParams_->AddRollupPage(
             hInstance,
@@ -485,12 +515,14 @@ private:
         if (giClampSpin_) giClampSpin_->SetScale(1.0f);
 
         CheckDlgButton(hWnd, IDC_RENDERER_PT_FREEZE_SYNC, freezeSync_ ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(hWnd, IDC_RENDERER_USE_ORCHESTRATOR, useMaxJSOrchestrator_ ? BST_CHECKED : BST_UNCHECKED);
         if (prog_) {
             EnableWindow(GetDlgItem(hWnd, IDC_RENDERER_PT_SPF_EDIT), FALSE);
             EnableWindow(GetDlgItem(hWnd, IDC_RENDERER_PT_SPF_SPIN), FALSE);
             EnableWindow(GetDlgItem(hWnd, IDC_RENDERER_PT_GI_CLAMP_EDIT), FALSE);
             EnableWindow(GetDlgItem(hWnd, IDC_RENDERER_PT_GI_CLAMP_SPIN), FALSE);
             EnableWindow(GetDlgItem(hWnd, IDC_RENDERER_PT_FREEZE_SYNC), FALSE);
+            EnableWindow(GetDlgItem(hWnd, IDC_RENDERER_USE_ORCHESTRATOR), FALSE);
         }
         updating_ = false;
     }
@@ -514,6 +546,7 @@ private:
             giClamp_ = ClampPathTracingGIClamp(giClampSpin_->GetFVal());
         }
         freezeSync_ = IsDlgButtonChecked(hWnd, IDC_RENDERER_PT_FREEZE_SYNC) == BST_CHECKED;
+        useMaxJSOrchestrator_ = IsDlgButtonChecked(hWnd, IDC_RENDERER_USE_ORCHESTRATOR) == BST_CHECKED;
     }
 
     void CommitFromControls(HWND hWnd = nullptr) {
@@ -521,6 +554,7 @@ private:
         if (!hWnd && panel_) hWnd = panel_;
         if (hWnd) ReadControls(hWnd);
         renderer_->SetPathTracingSettings(samplesPerFrame_, giClamp_, freezeSync_, true);
+        renderer_->SetUseMaxJSOrchestrator(useMaxJSOrchestrator_);
     }
 
     INT_PTR WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -537,7 +571,8 @@ private:
             if (rendParams_) rendParams_->RollupMouseMessage(hWnd, msg, wParam, lParam);
             return FALSE;
         case WM_COMMAND:
-            if (LOWORD(wParam) == IDC_RENDERER_PT_FREEZE_SYNC) {
+            if (LOWORD(wParam) == IDC_RENDERER_PT_FREEZE_SYNC ||
+                LOWORD(wParam) == IDC_RENDERER_USE_ORCHESTRATOR) {
                 CommitFromControls(hWnd);
                 return TRUE;
             }

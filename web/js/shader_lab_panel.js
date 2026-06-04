@@ -242,7 +242,7 @@ function makeLayer(type = 'crt', kind = 'effect') {
 
 const DEFAULT_CONFIG = () => ({
     composition: { width: 1920, height: 1080 },
-    layers: [makeLayer('crt')],
+    layers: [],
     timeline: { duration: 6, loop: true, tracks: [] },
 });
 

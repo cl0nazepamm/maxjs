@@ -517,6 +517,17 @@
                 localStorage.setItem(BACKGROUND_COLOR_STORAGE_KEY, String(hiddenBackgroundColor));
             } catch { /* private mode */ }
         }
+        function applyViewportBackdropColor(hex = null) {
+            if (hex == null) {
+                document.documentElement.style.setProperty('--maxjs-viewport-bg', 'transparent');
+                return;
+            }
+            const value = Number.isFinite(hex) ? (hex >>> 0) : DEFAULT_BACKGROUND_COLOR;
+            document.documentElement.style.setProperty(
+                '--maxjs-viewport-bg',
+                `#${value.toString(16).padStart(6, '0')}`
+            );
+        }
         function readPersistedLightMode() {
             try {
                 return localStorage.getItem(THEME_STORAGE_KEY) === 'light';
@@ -536,9 +547,10 @@
 
         // ── Scene Setup (Y-up world + Max basis boundary) ───
         let hiddenBackgroundColor = readPersistedBackgroundColor();
+        applyViewportBackdropColor(null);
         const viewportBackgroundColor = new THREE.Color(hiddenBackgroundColor);
         const scene = new THREE.Scene();
-        scene.background = viewportBackgroundColor;
+        scene.background = null;
         const maxBasisRoot = new THREE.Group();
         maxBasisRoot.name = '__maxjs_max_basis_root__';
         maxBasisRoot.rotation.x = -Math.PI / 2;
@@ -634,6 +646,7 @@
             nextRenderer.toneMapping = THREE.NeutralToneMapping;
             nextRenderer.toneMappingExposure = 1.0;
             nextRenderer.shadowMap.enabled = true;
+            nextRenderer.setClearColor?.(0x000000, 0);
             nextRenderer.domElement.style.position = 'absolute';
             nextRenderer.domElement.style.inset = '0';
             nextRenderer.domElement.style.zIndex = '0';
@@ -1123,13 +1136,9 @@
         function setBackgroundColor(hex = hiddenBackgroundColor) {
             hiddenBackgroundColor = hex >>> 0;
             viewportBackgroundColor.setHex(hiddenBackgroundColor);
-            const wasEnvironmentMapBackground = !!(scene.background && !scene.background.isColor);
-            scene.background = viewportBackgroundColor;
+            syncViewportBackdrop();
             maxjsFx.setHiddenBackgroundColor(hiddenBackgroundColor);
             geospatialSky?.setFallbackBackground?.(hiddenBackgroundColor);
-            if (wasEnvironmentMapBackground) {
-                maxjsFx.setEnvironmentVisible(false);
-            }
             saveBackgroundColor();
             syncBackgroundColorSlot();
             savePostFxState();
@@ -1142,9 +1151,14 @@
             return bg && !bg.isColor ? bg : null;
         }
 
+        function syncViewportBackdrop(envMap = getEnvironmentBackgroundMap()) {
+            applyViewportBackdropColor(envVisible && !envMap ? hiddenBackgroundColor : null);
+        }
+
         function syncEnvironmentDisplay() {
-            localHdriShowBg = envVisible;
             const envMap = getEnvironmentBackgroundMap();
+            localHdriShowBg = envVisible && !!envMap;
+            syncViewportBackdrop(envMap);
             if (envVisible && envMap) {
                 scene.background = envMap;
                 if (isLocalHdriActive()) {
@@ -1156,7 +1170,7 @@
                 }
                 maxjsFx.setEnvironmentVisible(true);
             } else {
-                scene.background = viewportBackgroundColor;
+                scene.background = null;
                 if (!envVisible) scene.userData.maxjsPathTraceBackground = null;
                 maxjsFx.setEnvironmentVisible(false);
             }
@@ -1599,7 +1613,7 @@
                 const oldEnvMap = currentHdriEnvMap;
                 currentHdriEnvMap = null;
                 if (scene.environment === oldEnvMap) scene.environment = null;
-                if (scene.background === oldEnvMap) scene.background = viewportBackgroundColor;
+                if (scene.background === oldEnvMap) scene.background = null;
                 oldEnvMap.dispose?.();
             }
             if (currentHdriRawTexture) {
@@ -1694,7 +1708,7 @@
             const oldSkyEnvMap = skyEnvMap;
             skyEnvMap = null;
             if (scene.environment === oldSkyEnvMap) scene.environment = null;
-            if (scene.background === oldSkyEnvMap) scene.background = viewportBackgroundColor;
+            if (scene.background === oldSkyEnvMap) scene.background = null;
             oldSkyEnvMap.dispose?.();
         }
 
@@ -3653,11 +3667,10 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
 
                 clearCurrentHdriEnvMap();
 
-                // Keep an opaque clear target under the sky mesh. The viewer
-                // canvas is alpha-enabled and post-FX can render transparent
-                // scene passes; a null background can leave previous pixels
-                // behind when switching the sky material on/off.
-                scene.background = viewportBackgroundColor;
+                // The sky mesh is the environment surface. Keep the scene
+                // background transparent so it never enters Bloom/SSGI as a
+                // matte when the environment backdrop is hidden.
+                scene.background = null;
                 updateSkyReflectionEnvironment(params, sunDir);
                 updateSkyPathTraceEnvironment(params, sunDir);
                 scene.environmentRotation.set(0, 0, 0);
@@ -9847,9 +9860,9 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             const el = document.getElementById('btnEnv');
             if (!el) return;
             el.classList.toggle('active', envVisible);
-            el.title = envVisible ? 'Environment map visible' : 'Environment map hidden';
+            el.title = envVisible ? 'Environment backdrop visible' : 'Environment backdrop hidden';
             el.setAttribute('aria-pressed', envVisible ? 'true' : 'false');
-            el.setAttribute('aria-label', envVisible ? 'Environment map visible' : 'Environment map hidden');
+            el.setAttribute('aria-label', envVisible ? 'Environment backdrop visible' : 'Environment backdrop hidden');
         }
 
         function applyLayerCameraMode(mode, options = {}) {
@@ -13509,9 +13522,10 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                         el.style.display = 'none';
                     }
                 }
-                document.body.style.background = wantsAlpha
-                    ? 'transparent'
-                    : `#${hiddenBackgroundColor.toString(16).padStart(6, '0')}`;
+                const captureBackdropColor = !wantsAlpha && envVisible && !getEnvironmentBackgroundMap()
+                    ? `#${hiddenBackgroundColor.toString(16).padStart(6, '0')}`
+                    : 'transparent';
+                document.body.style.background = captureBackdropColor;
 
                 // Save and bypass all performance throttling
                 savedPerformanceSettings = { ...performanceSettings };
@@ -13536,7 +13550,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             try {
                 renderer.setClearColor?.(
                     wantsAlpha ? 0x000000 : hiddenBackgroundColor,
-                    wantsAlpha ? 0 : 1
+                    0
                 );
             } catch {}
 
@@ -13549,7 +13563,9 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 maxjsFx.setEnvironmentVisible(false);
                 scene.background = null;
             } else {
-                // Opaque output — fill the viewer background (or environment).
+                // Opaque output still renders the scene against alpha. File
+                // formats without alpha may matte later, but Bloom never sees
+                // the viewport background as source pixels.
                 maxjsFx.setEnvironmentVisible(envVisible);
                 if (isLocalHdriActive()) {
                     localHdriShowBg = envVisible;
@@ -13557,7 +13573,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 } else {
                     scene.background = envVisible && scene.environment
                         ? scene.environment
-                        : new THREE.Color(hiddenBackgroundColor);
+                        : null;
                 }
             }
             if (pendingRenderToImage.pathTracing) {

@@ -52,21 +52,7 @@ async function loadShaderLab() {
 // layer to be silently skipped.
 const DEFAULT_COMPOSITION = {
     composition: { width: 1920, height: 1080 },
-    layers: [
-        {
-            id: 'crt-1',
-            kind: 'effect',
-            type: 'crt',
-            name: 'CRT',
-            visible: true,
-            opacity: 1,
-            hue: 0,
-            saturation: 1,
-            blendMode: 'normal',
-            compositeMode: 'filter',
-            params: {},
-        },
-    ],
+    layers: [],
     timeline: { duration: 6, loop: true, tracks: [] },
 };
 
@@ -131,6 +117,15 @@ function normalizeState(input, fallbackConfig = DEFAULT_COMPOSITION) {
     return { config, passes };
 }
 
+function hasRenderableLayer(config) {
+    const layers = Array.isArray(config?.layers) ? config.layers : [];
+    return layers.some(layer =>
+        layer
+        && layer.visible !== false
+        && (typeof layer.opacity !== 'number' || layer.opacity > 0)
+    );
+}
+
 export function createShaderLabFx({ THREE, renderer, scene, camera }) {
     let activeCamera = camera;
     let enabled = false;
@@ -175,6 +170,8 @@ export function createShaderLabFx({ THREE, renderer, scene, camera }) {
             map: null,
             depthTest: false,
             depthWrite: false,
+            transparent: true,
+            premultipliedAlpha: false,
             toneMapped: true,
             side: THREE.DoubleSide,
         });
@@ -235,7 +232,11 @@ export function createShaderLabFx({ THREE, renderer, scene, camera }) {
     }
 
     function getActivePass(slot = 'finalStylize') {
-        return currentPasses.find(pass => pass.enabled && pass.slot === slot) || null;
+        return currentPasses.find(pass =>
+            pass.enabled
+            && pass.slot === slot
+            && hasRenderableLayer(pass.config || currentConfig)
+        ) || null;
     }
 
     function getUnavailableReason(inputs = {}) {
@@ -269,7 +270,7 @@ export function createShaderLabFx({ THREE, renderer, scene, camera }) {
             currentConfig = normalized.config;
             currentPasses = normalized.passes.map(pass => ({
                 ...pass,
-                enabled: pass.enabled || pass.id === 'legacy-main',
+                enabled: !!pass.enabled,
                 config: pass.config || normalized.config,
             }));
             ensureDisplayQuad();
@@ -299,9 +300,6 @@ export function createShaderLabFx({ THREE, renderer, scene, camera }) {
             reactRoot.render(React.createElement(BridgeComponent, { config: currentConfig }));
 
             enabled = true;
-            currentPasses = currentPasses.map(pass =>
-                pass.id === 'legacy-main' ? { ...pass, enabled: true, config: currentConfig } : pass
-            );
             loading = false;
             emitStateChange();
         } catch (err) {
@@ -374,6 +372,7 @@ export function createShaderLabFx({ THREE, renderer, scene, camera }) {
             displayMaterial.map = texture;
             displayMaterial.needsUpdate = true;
         }
+        renderer.setClearColor?.(0x000000, 0);
         renderer.setRenderTarget(outputTarget);
         renderer.render(displayScene, displayCamera);
         return true;

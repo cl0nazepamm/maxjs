@@ -385,19 +385,22 @@ export function createMaxJSFxController({
     }
 
     function hasShaderLabPassEnabled() {
-        return supportsScreenSpaceEffects
-            && !!activeShaderLabFx?.isEnabled?.()
+        return isShaderLabEnabled()
             && activeShaderLabFx.canRenderWithInputs?.(getShaderLabInputs()) !== false;
     }
 
+    function isShaderLabEnabled() {
+        return supportsScreenSpaceEffects && !!activeShaderLabFx?.isEnabled?.();
+    }
+
     function isRetroActive() {
-        return isScreenSpaceActive('retro') && !hasShaderLabPassEnabled();
+        return isScreenSpaceActive('retro') && !isShaderLabEnabled();
     }
 
     function isPS1WiggleActive() {
         return supportsScreenSpaceEffects
             && !!state.retro.wiggle
-            && (state.retro.enabled || hasShaderLabPassEnabled());
+            && (state.retro.enabled || isShaderLabEnabled());
     }
 
     function matchAndSmooth(rawBlobs) {
@@ -1016,6 +1019,11 @@ export function createMaxJSFxController({
         const previousToneMapping = renderer.toneMapping;
         const previousExposure = renderer.toneMappingExposure;
         const previousOutputColorSpace = renderer.outputColorSpace;
+        const previousClearColor = new THREE.Color();
+        try { renderer.getClearColor?.(previousClearColor); } catch (_) {}
+        const previousClearAlpha = typeof renderer.getClearAlpha === 'function'
+            ? renderer.getClearAlpha()
+            : null;
         const now = performance.now() * 0.001;
         const delta = lastShaderLabFrameTime > 0 ? now - lastShaderLabFrameTime : 0;
         lastShaderLabFrameTime = now;
@@ -1024,6 +1032,7 @@ export function createMaxJSFxController({
             renderer.toneMapping = THREE.NoToneMapping;
             renderer.toneMappingExposure = 1.0;
             renderer.outputColorSpace = THREE.LinearSRGBColorSpace;
+            renderer.setClearColor?.(0x000000, 0);
             renderer.setRenderTarget(target);
             renderNativeToCurrentTarget();
         } finally {
@@ -1031,6 +1040,9 @@ export function createMaxJSFxController({
             renderer.toneMapping = previousToneMapping;
             renderer.toneMappingExposure = previousExposure;
             renderer.outputColorSpace = previousOutputColorSpace;
+            if (previousClearAlpha != null) {
+                try { renderer.setClearColor?.(previousClearColor, previousClearAlpha); } catch (_) {}
+            }
         }
 
         return activeShaderLabFx.renderTexture?.(target.texture, now, delta, {
@@ -1488,7 +1500,10 @@ export function createMaxJSFxController({
             const useEnvironmentBackdropCompensation =
                 hiddenEnvironmentBackdrop
                 && (isSSRActive() || isScreenSpaceActive('fog'));
-            const backgroundFillNode = hiddenBackgroundNode;
+            // Hidden environment/background means transparent scene input.
+            // The CSS viewport backdrop may still be visible behind the canvas,
+            // but it must never enter Bloom/SSGI/SSR source pixels.
+            const backgroundFillNode = vec3(0, 0, 0);
             const backgroundAlphaNode = float(0);
 
             let beauty;
@@ -2164,7 +2179,7 @@ export function createMaxJSFxController({
             return state.retro.enabled;
         },
         setRetroEnabled(enabled) {
-            if (enabled && hasShaderLabPassEnabled()) {
+            if (enabled && isShaderLabEnabled()) {
                 lastError = 'Retro is unavailable while Shader Lab is active.';
                 onError(lastError);
                 return false;
@@ -2181,7 +2196,7 @@ export function createMaxJSFxController({
             return state.retro.enabled;
         },
         isRetroBlockedByShaderLab() {
-            return hasShaderLabPassEnabled();
+            return isShaderLabEnabled();
         },
         setRetroOptions(options = {}) {
             const needsRebuild = retroOptionsNeedRebuild(options);

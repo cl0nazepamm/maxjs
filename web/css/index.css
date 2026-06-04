@@ -11,7 +11,7 @@ html, body { color-scheme: dark; }
     --rail-bg: rgba(20, 20, 22, 0.78);
     --rail-border: rgba(255, 255, 255, 0.07);
 }
-body { overflow: hidden; background: #353535; position: relative; width: 100vw; height: 100vh; }
+body { overflow: hidden; background: var(--maxjs-viewport-bg, #353535); position: relative; width: 100vw; height: 100vh; }
 canvas { display: block; }
 #hud {
     position: absolute; top: 46px; left: 10px;
@@ -894,7 +894,7 @@ body.light-mode .bake-stat span { color: #666; }
 body.light-mode .bake-stat strong,
 body.light-mode .bake-value { color: #222; }
 /* ── Light Mode — brushed metal / CLONE.LLC ── */
-body.light-mode { background: #2a2a2a; }
+body.light-mode { background: var(--maxjs-viewport-bg, #2a2a2a); }
 
 /* HUD info — dark translucent terminal style */
 body.light-mode #info {

@@ -76,6 +76,7 @@
     bool lastClayMode_ = false;
     std::wstring activeWebDir_;
     std::uint64_t activeWebStamp_ = 0;
+    bool productionRenderContentActive_ = false;
     std::wstring activeProjectDir_;
     std::uint64_t activeProjectStamp_ = 0;
     int suppressProjectReloadCount_ = 0;
@@ -103,6 +104,24 @@
     CameraData lastSentCamera_ = {};
     CameraData renderCameraOverride_ = {};
     bool renderCameraOverrideActive_ = false;
+    bool renderSequenceActive_ = false;
+    bool renderSequenceQueued_ = false;
+    bool renderSequenceFrameInFlight_ = false;
+    std::wstring renderSequenceBasePath_;
+    std::wstring renderSequenceMime_;
+    int renderSequenceWidth_ = 0;
+    int renderSequenceHeight_ = 0;
+    int renderSequenceStartFrame_ = 0;
+    int renderSequenceEndFrame_ = 0;
+    int renderSequenceStep_ = 1;
+    int renderSequenceCurrentFrame_ = 0;
+    TimeValue renderSequencePreviousTime_ = 0;
+    INode* renderSequenceViewNode_ = nullptr;
+    ViewParams renderSequenceViewParams_ = {};
+    bool renderSequenceHaveViewParams_ = false;
+    bool renderSequenceRestoreTime_ = false;
+    bool renderSequenceFirstFrame_ = true;
+    std::wstring renderSequenceLastError_;
     ULONG lockedCameraHandle_ = 0;  // 0 = viewport (default), nonzero = scene camera handle
     int pathTracingSamplesPerFrame_ = 1;
     float pathTracingGIClamp_ = 20.0f;
@@ -521,11 +540,13 @@
         LoadContent();
     }
 
-    void LoadContent() {
+    void LoadContent(bool productionRender = false) {
         std::wstring webDir = GetWebDir();
         activeWebDir_ = webDir;
         activeWebStamp_ = GetDirectoryWriteStamp(webDir);
+        productionRenderContentActive_ = productionRender;
         texDirMap_.clear();
+        jsReady_ = false;
 
         if (!webDir.empty()) {
             ComPtr<ICoreWebView2_3> wv3;
@@ -536,7 +557,9 @@
                     COREWEBVIEW2_HOST_RESOURCE_ACCESS_KIND_ALLOW);
                 // Cache-bust: append tick count to URL so WebView2 never serves stale HTML
                 wchar_t navUrl[128];
-                swprintf_s(navUrl, L"https://maxjs.local/index.html?v=%lld", GetTickCount64());
+                swprintf_s(navUrl, L"https://maxjs.local/index.html?v=%lld%s",
+                    GetTickCount64(),
+                    productionRender ? L"&productionRender=1&renderer=webgl-fallback" : L"");
                 webview_->Navigate(navUrl);
                 return;
             }

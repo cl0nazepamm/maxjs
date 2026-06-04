@@ -2088,8 +2088,26 @@
             SendHostActionResult(type, requestId, ok, error);
             return;
         }
-        if (type == L"render_to_image_ready") {
-            if (renderImageEvent_) SetEvent(renderImageEvent_);
+        if (type == L"render_sequence_frame_file") {
+            std::wstring jsError;
+            std::wstring imageBase64;
+            if (ExtractJsonString(msg, L"error", jsError) && !jsError.empty()) {
+                renderSequenceLastError_ = jsError;
+                FinishRenderSequence(false);
+            } else if (!ExtractJsonString(msg, L"imageBase64", imageBase64) || imageBase64.empty()) {
+                renderSequenceLastError_ = L"Missing browser render payload";
+                FinishRenderSequence(false);
+            } else {
+                std::wstring error;
+                if (!WriteRenderSequenceFrame(imageBase64, error)) {
+                    renderSequenceLastError_ = error;
+                    FinishRenderSequence(false);
+                } else {
+                    renderSequenceFrameInFlight_ = false;
+                    renderSequenceCurrentFrame_ += renderSequenceStep_;
+                    QueueRenderSequenceStep();
+                }
+            }
             return;
         }
         if (type == L"sync_lightmap_uvs" || type == L"sync_uv2") {

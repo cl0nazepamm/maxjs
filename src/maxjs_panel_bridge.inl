@@ -44,6 +44,18 @@ void TogglePanel() {
 
 void ToggleMaxJSPanel() { TogglePanel(); }
 
+static void PumpPanelMessages(DWORD durationMs) {
+    const DWORD start = GetTickCount();
+    do {
+        MSG msg;
+        while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&msg);
+            DispatchMessage(&msg);
+        }
+        Sleep(1);
+    } while (GetTickCount() - start < durationMs);
+}
+
 // Ensure panel exists and is visible (non-toggling)
 static void EnsurePanel() {
     Interface* ip = GetCOREInterface();
@@ -58,6 +70,18 @@ static void EnsurePanel() {
     }
 }
 void EnsureMaxJSPanel() { EnsurePanel(); }
+
+void PrepareMaxJSProductionRenderWindow() {
+    EnsurePanel();
+    if (g_panel) {
+        g_panel->PrepareProductionRenderWindow();
+        PumpPanelMessages(50);
+    }
+}
+
+void RestoreMaxJSProductionRenderWindow() {
+    if (g_panel) g_panel->RestoreProductionRenderWindow();
+}
 
 void ExportMaxJSSnapshot() {
     EnsurePanel();
@@ -95,17 +119,19 @@ void ReparentMaxJSPanel(HWND newParent) {
 void RestoreMaxJSPanel() {
     if (g_panel) g_panel->RestoreFromViewport();
 }
-bool RenderMaxJSFrameToBitmap(Bitmap* target, int width, int height, TimeValue t, RendProgressCallback* prog) {
+bool StartMaxJSRenderSequence(const std::wstring& outputPath,
+                              const std::wstring& mime,
+                              int width,
+                              int height,
+                              int startFrame,
+                              int endFrame,
+                              int step,
+                              INode* renderViewNode,
+                              const ViewParams* renderViewParams) {
     EnsurePanel();
     if (!g_panel) return false;
-    return g_panel->RenderFrameToBitmap(target, width, height, t, nullptr, nullptr, prog);
-}
-bool RenderMaxJSFrameToBitmap(Bitmap* target, int width, int height, TimeValue t,
-                              INode* renderViewNode, const ViewParams* renderViewParams,
-                              RendProgressCallback* prog) {
-    EnsurePanel();
-    if (!g_panel) return false;
-    return g_panel->RenderFrameToBitmap(target, width, height, t, renderViewNode, renderViewParams, prog);
+    return g_panel->StartRenderSequence(outputPath, mime, width, height,
+        startFrame, endFrame, step, renderViewNode, renderViewParams);
 }
 
 static void RegisterMaxScript() {

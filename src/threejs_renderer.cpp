@@ -8,6 +8,8 @@
 #include <bitmap.h>
 #include <algorithm>
 #include <cmath>
+#include <cwctype>
+#include <filesystem>
 #include <locale>
 #include <sstream>
 
@@ -15,15 +17,23 @@ extern HINSTANCE hInstance;
 
 // Forward — panel access from maxjs_main.cpp
 extern void EnsureMaxJSPanel();
+extern void PrepareMaxJSProductionRenderWindow();
+extern void RestoreMaxJSProductionRenderWindow();
 extern void StartMaxJSActiveShade(Bitmap* target);
 extern void StopMaxJSActiveShade();
 extern HWND GetMaxJSWebViewHWND();
 extern void ReparentMaxJSPanel(HWND newParent);
 extern void RestoreMaxJSPanel();
 extern void SetMaxJSPathTracingSettings(int samplesPerFrame, float giClamp, bool freezeSync);
-extern bool RenderMaxJSFrameToBitmap(Bitmap* target, int width, int height, TimeValue t,
-                                     INode* renderViewNode, const ViewParams* renderViewParams,
-                                     RendProgressCallback* prog);
+extern bool StartMaxJSRenderSequence(const std::wstring& outputPath,
+                                     const std::wstring& mime,
+                                     int width,
+                                     int height,
+                                     int startFrame,
+                                     int endFrame,
+                                     int step,
+                                     INode* renderViewNode,
+                                     const ViewParams* renderViewParams);
 
 static constexpr int kPathTracingDefaultSamplesPerFrame = 1;
 static constexpr int kPathTracingMinSamplesPerFrame = 1;
@@ -40,6 +50,72 @@ static int ClampPathTracingSamplesPerFrame(int value) {
 static float ClampPathTracingGIClamp(float value) {
     if (!std::isfinite(value)) return kPathTracingDefaultGIClamp;
     return std::clamp(value, kPathTracingMinGIClamp, kPathTracingMaxGIClamp);
+}
+
+static std::wstring ToLowerCopy(std::wstring value) {
+    std::transform(value.begin(), value.end(), value.begin(),
+        [](wchar_t ch) { return static_cast<wchar_t>(towlower(ch)); });
+    return value;
+}
+
+static std::wstring BrowserMimeForRenderPath(const std::wstring& path) {
+    const std::wstring ext = ToLowerCopy(std::filesystem::path(path).extension().wstring());
+    if (ext == L".jpg" || ext == L".jpeg") return L"image/jpeg";
+    if (ext == L".webp") return L"image/webp";
+    return L"image/png";
+}
+
+static bool BrowserCanWriteExtension(const std::wstring& ext) {
+    const std::wstring lower = ToLowerCopy(ext);
+    return lower == L".png" || lower == L".jpg" || lower == L".jpeg" || lower == L".webp";
+}
+
+static std::wstring NormalizeBrowserRenderPath(std::wstring path) {
+    std::filesystem::path fsPath(path);
+    std::wstring ext = fsPath.extension().wstring();
+    if (ext.empty()) {
+        path += L".png";
+    } else if (!BrowserCanWriteExtension(ext)) {
+        fsPath.replace_extension(L".png");
+        path = fsPath.wstring();
+    }
+    return path;
+}
+
+static std::wstring DefaultBrowserRenderPath() {
+    wchar_t tempDir[MAX_PATH] = {};
+    DWORD len = GetTempPathW(MAX_PATH, tempDir);
+    std::wstringstream ss;
+    if (len > 0 && len < MAX_PATH) ss << tempDir;
+    ss << L"maxjs_render.png";
+    return ss.str();
+}
+
+static std::wstring ResolveBrowserRenderOutputPath(Bitmap* bitmap) {
+    BitmapInfo bi;
+    bool haveBi = false;
+    if (bitmap) {
+        bi = bitmap->GetBitmapInfo();
+        haveBi = bi.Name() && bi.Name()[0] != 0;
+    }
+
+    if (!haveBi) {
+        Interface* ip = GetCOREInterface();
+        if (ip) {
+            bi = ip->GetRendFileBI();
+            haveBi = bi.Name() && bi.Name()[0] != 0;
+        }
+    }
+
+    if (!haveBi) {
+        return DefaultBrowserRenderPath();
+    }
+
+    BMMGetFullFilename(&bi);
+
+    std::wstring outputPath = bi.Name() ? bi.Name() : L"";
+    if (outputPath.empty()) outputPath = DefaultBrowserRenderPath();
+    return NormalizeBrowserRenderPath(outputPath);
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -128,6 +204,9 @@ class ThreeJSRenderer : public Renderer {
     INode* renderViewNode_ = nullptr;
     ViewParams renderViewParams_ = {};
     bool haveRenderViewParams_ = false;
+    bool sequenceStarted_ = false;
+    int renderStartFrame_ = 0;
+    int renderEndFrame_ = 0;
     int pathTracingSamplesPerFrame_ = kPathTracingDefaultSamplesPerFrame;
     float pathTracingGIClamp_ = kPathTracingDefaultGIClamp;
     bool pathTracingFreezeSync_ = false;
@@ -181,28 +260,36 @@ public:
         renderWidth_ = rp.width;
         renderHeight_ = rp.height;
         stopRequested_ = false;
+        sequenceStarted_ = false;
         inMaterialEditor_ = rp.inMtlEdit != FALSE;
         renderViewNode_ = vnode;
         haveRenderViewParams_ = viewPar != nullptr;
         if (viewPar) renderViewParams_ = *viewPar;
+        Interface* ip = GetCOREInterface();
+        const int ticksPerFrame = std::max(1, GetTicksPerFrame());
+        renderStartFrame_ = ip ? (ip->GetRendStart() / ticksPerFrame) : 0;
+        renderEndFrame_ = ip ? (ip->GetRendEnd() / ticksPerFrame) : renderStartFrame_;
         if (inMaterialEditor_) {
             return 1;
         }
 
-        // Ensure the MaxJS panel is up (non-toggling)
-        EnsureMaxJSPanel();
+        // The 3ds Max Render button is only the trigger. The WebView stays
+        // alive and writes the actual sequence.
+        PrepareMaxJSProductionRenderWindow();
         BroadcastPathTracingSettings();
         return 1;
     }
 
     int Render(TimeValue t, Bitmap* tobm, FrameRendParams&, HWND,
                RendProgressCallback* prog = nullptr, ViewParams* viewPar = nullptr) override {
-        if (stopRequested_ || !tobm) return 0;
+        if (stopRequested_) return 0;
 
-        int w = tobm->Width();
-        int h = tobm->Height();
+        int w = tobm ? tobm->Width() : renderWidth_;
+        int h = tobm ? tobm->Height() : renderHeight_;
+        if (w <= 0 || h <= 0) return 0;
 
         if (inMaterialEditor_) {
+            if (!tobm) return 1;
             BMM_Color_fl swatchColor{};
             swatchColor.r = 0.035f;
             swatchColor.g = 0.035f;
@@ -214,13 +301,30 @@ public:
 
         if (prog) prog->SetTitle(_T("three.js — rendering frame..."));
 
+        if (sequenceStarted_) return 1;
+        sequenceStarted_ = true;
+
         const ViewParams* effectiveViewParams = viewPar ? viewPar : (haveRenderViewParams_ ? &renderViewParams_ : nullptr);
-        bool ok = RenderMaxJSFrameToBitmap(tobm, w, h, t, renderViewNode_, effectiveViewParams, prog);
+        const std::wstring outputPath = ResolveBrowserRenderOutputPath(tobm);
+        const std::wstring mime = BrowserMimeForRenderPath(outputPath);
+        const int step = renderEndFrame_ >= renderStartFrame_ ? 1 : -1;
+        const bool ok = StartMaxJSRenderSequence(
+            outputPath,
+            mime,
+            w,
+            h,
+            renderStartFrame_,
+            renderEndFrame_,
+            step,
+            renderViewNode_,
+            effectiveViewParams);
         return ok ? 1 : 0;
     }
 
     void Close(HWND, RendProgressCallback* = nullptr) override {
+        RestoreMaxJSProductionRenderWindow();
         stopRequested_ = false;
+        sequenceStarted_ = false;
         inMaterialEditor_ = false;
         renderViewNode_ = nullptr;
         haveRenderViewParams_ = false;
@@ -258,8 +362,8 @@ public:
 
     bool HasRequirement(Requirement requirement) override {
         switch (requirement) {
-            case Requirement::kRequirement_NoVFB: return false;  // show VFB for production renders
-            case Requirement::kRequirement_DontSaveRenderOutput: return false;
+            case Requirement::kRequirement_NoVFB: return true;
+            case Requirement::kRequirement_DontSaveRenderOutput: return true;
             default: return false;
         }
     }

@@ -1,8 +1,6 @@
     // ── Render-to-image (production render) ────────────────
 
-    HANDLE renderImageEvent_ = nullptr;  // signaled when JS confirms frame rendered
     bool renderLocked_ = false;          // panel is locked to render resolution
-    bool renderImageWarmed_ = false;     // first production capture needs camera/sync settle time
     RECT preRenderRect_ = {};            // saved window rect before render
     LONG preRenderStyle_ = 0;            // saved window style before render
 
@@ -50,188 +48,202 @@
         }
     }
 
-    // Render a single frame at the given resolution and write to a Max Bitmap.
-    // Called from ThreeJSRenderer::Render() on the main thread.
-    bool RenderFrameToBitmap(Bitmap* target, int width, int height, TimeValue t,
-                             INode* renderViewNode, const ViewParams* renderViewParams,
-                             RendProgressCallback* prog) {
-        if (!webview_ || !target) return false;
+    void PrepareProductionRenderWindow() {
+        const bool wasHosted = IsViewportHosted();
+        const bool wasCapturingActiveShade = asCapturing_;
 
-        auto restoreRenderState = [this]() {
-            if (webview_) {
-                webview_->PostWebMessageAsJson(L"{\"type\":\"render_to_image_done\"}");
-            }
-            renderCameraOverrideActive_ = false;
-            UnlockRenderSize();
-            SetWebViewBackgroundTransparent(false);
-        };
+        StopActiveShade();
+        if (wasHosted) RestoreFromViewport();
 
-        // Wait for JS to be ready (panel may have just been created)
-        if (!jsReady_) {
-            const DWORD readyTimeout = 15000;
-            const DWORD readyStart = GetTickCount();
-            while (!jsReady_) {
-                if (GetTickCount() - readyStart > readyTimeout) {
-                    restoreRenderState();
-                    return false;
-                }
-                MSG winMsg;
-                while (PeekMessage(&winMsg, nullptr, 0, 0, PM_REMOVE)) {
-                    TranslateMessage(&winMsg);
-                    DispatchMessage(&winMsg);
-                }
-                Sleep(1);
-            }
+        if (hwnd_) {
+            ShowWindow(hwnd_, SW_SHOWNORMAL);
+            NormalizeFloatingWindow(true);
+            InvalidateControllerBoundsCache();
+            Resize();
         }
 
-        // Lock panel to render resolution and keep the WebView controller transparent.
-        // The JS render path decides whether the scene/background is opaque or alpha.
-        LockToRenderSize(width, height);
-        SetWebViewBackgroundTransparent(true);
-        if (prog) prog->SetTitle(_T("three.js — syncing frame..."));
+        (void)wasCapturingActiveShade;
+    }
 
-        // Disable gamma/color transforms — Three.js output is already display-referred sRGB
-        target->UseScaleColors(0);
+    void RestoreProductionRenderWindow() {
+        // Production render no longer swaps pages. The live WebView stays
+        // intact; render sequencing only resizes and drives frames.
+    }
 
-        // Create event for synchronization
-        if (!renderImageEvent_)
-            renderImageEvent_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-        ResetEvent(renderImageEvent_);
+    std::wstring RenderSequenceFramePath() const {
+        if (renderSequenceBasePath_.empty()) return {};
+        const bool multiFrame = renderSequenceStartFrame_ != renderSequenceEndFrame_;
+        if (!multiFrame) return renderSequenceBasePath_;
 
-        // Tell JS to render at the requested resolution
-        int fps = GetFrameRate();
-        int frame = t / GetTicksPerFrame();
-        const int warmupMs = renderImageWarmed_ ? 250 : 2000;
-        wchar_t msg[320];
-        swprintf_s(msg, L"{\"type\":\"render_to_image\",\"width\":%d,\"height\":%d,\"frame\":%d,\"fps\":%d,\"warmupMs\":%d}",
-                   width, height, frame, fps, warmupMs);
+        MCHAR numbered[4096] = {};
+        if (BMMCreateNumberedFilename(renderSequenceBasePath_.c_str(),
+                                      renderSequenceCurrentFrame_,
+                                      numbered) != 0 && numbered[0] != 0) {
+            return numbered;
+        }
 
-        // Force a fresh scene sync at the requested frame, using 3ds Max's render
-        // camera/view state instead of the live viewport or max.js UI camera lock.
+        std::filesystem::path base(renderSequenceBasePath_);
+        std::wstringstream fallback;
+        fallback << base.parent_path().wstring();
+        if (!base.parent_path().empty()) fallback << L"\\";
+        fallback << base.stem().wstring() << L"_" << renderSequenceCurrentFrame_
+                 << base.extension().wstring();
+        return fallback.str();
+    }
+
+    bool WriteRenderSequenceFrame(const std::wstring& imageBase64, std::wstring& error) {
+        std::string imageBytes;
+        if (!DecodeBase64Wide(imageBase64, imageBytes)) {
+            error = L"Invalid browser render payload";
+            return false;
+        }
+
+        const std::wstring outputPath = RenderSequenceFramePath();
+        if (outputPath.empty()) {
+            error = L"Missing render output path";
+            return false;
+        }
+
+        std::error_code ec;
+        const std::filesystem::path fsPath(outputPath);
+        const std::filesystem::path parent = fsPath.parent_path();
+        if (!parent.empty()) std::filesystem::create_directories(parent, ec);
+        if (ec) {
+            error = L"Failed to create render output directory";
+            return false;
+        }
+
+        if (!WriteBinaryFile(outputPath, imageBytes)) {
+            error = L"Failed to write browser render frame";
+            return false;
+        }
+
+        return true;
+    }
+
+    void FinishRenderSequence(bool restoreTime = true) {
+        if (webview_) {
+            webview_->PostWebMessageAsJson(L"{\"type\":\"render_sequence_done\"}");
+        }
+
         Interface* ip = GetCOREInterface();
-        TimeValue previousTime = ip ? ip->GetTime() : t;
-        if (ip && previousTime != t) ip->SetTime(t, FALSE);
+        if (restoreTime && renderSequenceRestoreTime_ && ip) {
+            ip->SetTime(renderSequencePreviousTime_, TRUE);
+        }
+
+        renderSequenceActive_ = false;
+        renderSequenceQueued_ = false;
+        renderSequenceFrameInFlight_ = false;
+        renderSequenceBasePath_.clear();
+        renderSequenceMime_.clear();
+        renderSequenceViewNode_ = nullptr;
+        renderSequenceHaveViewParams_ = false;
+        renderSequenceRestoreTime_ = false;
+        renderSequenceFirstFrame_ = true;
+        renderCameraOverrideActive_ = false;
+        UnlockRenderSize();
+        SetWebViewBackgroundTransparent(false);
+    }
+
+    void QueueRenderSequenceStep(bool delayed = false) {
+        if (!hwnd_ || renderSequenceQueued_) return;
+        renderSequenceQueued_ = true;
+        if (delayed) {
+            SetTimer(hwnd_, RENDER_SEQUENCE_TIMER_ID, 16, nullptr);
+        } else {
+            PostMessage(hwnd_, WM_RENDER_SEQUENCE_STEP, 0, 0);
+        }
+    }
+
+    void PumpRenderSequenceStep() {
+        renderSequenceQueued_ = false;
+        if (!renderSequenceActive_ || renderSequenceFrameInFlight_) return;
+        if (!webview_ || !jsReady_) {
+            QueueRenderSequenceStep(true);
+            return;
+        }
+
+        const int direction = renderSequenceStep_ >= 0 ? 1 : -1;
+        if ((direction > 0 && renderSequenceCurrentFrame_ > renderSequenceEndFrame_) ||
+            (direction < 0 && renderSequenceCurrentFrame_ < renderSequenceEndFrame_)) {
+            FinishRenderSequence(true);
+            return;
+        }
+
+        Interface* ip = GetCOREInterface();
+        if (!ip) {
+            FinishRenderSequence(false);
+            return;
+        }
+
+        const TimeValue t = renderSequenceCurrentFrame_ * GetTicksPerFrame();
+        ip->SetTime(t, FALSE);
         CameraData renderCam = {};
-        renderCameraOverrideActive_ = GetRenderViewCameraData(renderViewNode, renderViewParams, t, renderCam);
-        if (renderCameraOverrideActive_) {
-            renderCameraOverride_ = renderCam;
-        }
+        renderCameraOverrideActive_ = GetRenderViewCameraData(
+            renderSequenceViewNode_,
+            renderSequenceHaveViewParams_ ? &renderSequenceViewParams_ : nullptr,
+            t,
+            renderCam);
+        if (renderCameraOverrideActive_) renderCameraOverride_ = renderCam;
 
-        // Tell JS to resize into render mode before the full sync camera lands.
-        // Otherwise horizontal FOV is converted with the docked panel aspect and
-        // then appears to zoom when the canvas is resized to the final image size.
-        webview_->PostWebMessageAsJson(msg);
+        LockToRenderSize(renderSequenceWidth_, renderSequenceHeight_);
+        SetWebViewBackgroundTransparent(false);
+
+        const int fps = GetFrameRate();
+        const int warmupMs = renderSequenceFirstFrame_ ? 100 : 0;
+        renderSequenceFrameInFlight_ = true;
+
+        std::wstringstream msg;
+        msg << L"{\"type\":\"render_sequence_frame\""
+            << L",\"width\":" << renderSequenceWidth_
+            << L",\"height\":" << renderSequenceHeight_
+            << L",\"frame\":" << renderSequenceCurrentFrame_
+            << L",\"fps\":" << fps
+            << L",\"warmupMs\":" << warmupMs
+            << L",\"mime\":\"" << EscapeJson(renderSequenceMime_.c_str()) << L"\"}";
+
+        webview_->PostWebMessageAsJson(msg.str().c_str());
         if (useBinary_) SendFullSyncBinary(); else SendFullSync();
+        renderSequenceFirstFrame_ = false;
+    }
 
-        // Pump messages until JS signals ready or timeout (10 seconds)
-        const DWORD timeout = 10000;
-        const DWORD start = GetTickCount();
-        while (WaitForSingleObject(renderImageEvent_, 0) != WAIT_OBJECT_0) {
-            if (GetTickCount() - start > timeout) {
-                if (ip && previousTime != t) ip->SetTime(previousTime, FALSE);
-                restoreRenderState();
-                return false;
-            }
-            MSG winMsg;
-            while (PeekMessage(&winMsg, nullptr, 0, 0, PM_REMOVE)) {
-                TranslateMessage(&winMsg);
-                DispatchMessage(&winMsg);
-            }
-            Sleep(1);
-        }
+    bool StartRenderSequence(const std::wstring& basePath,
+                             const std::wstring& mime,
+                             int width,
+                             int height,
+                             int startFrame,
+                             int endFrame,
+                             int step,
+                             INode* renderViewNode,
+                             const ViewParams* renderViewParams) {
+        if (basePath.empty() || width <= 0 || height <= 0) return false;
 
-        // JS has rendered — capture the WebView2 content
-        HANDLE captureEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-        bool captureOk = false;
-        if (prog) prog->SetTitle(_T("three.js — capturing frame..."));
+        FinishRenderSequence(false);
+        PrepareProductionRenderWindow();
+        if (!hwnd_) return false;
 
-        ComPtr<IStream> stream;
-        CreateStreamOnHGlobal(NULL, TRUE, &stream);
+        Interface* ip = GetCOREInterface();
+        renderSequencePreviousTime_ = ip ? ip->GetTime() : 0;
+        renderSequenceRestoreTime_ = ip != nullptr;
+        renderSequenceActive_ = true;
+        renderSequenceQueued_ = false;
+        renderSequenceFrameInFlight_ = false;
+        renderSequenceBasePath_ = basePath;
+        renderSequenceMime_ = mime.empty() ? L"image/png" : mime;
+        renderSequenceWidth_ = width;
+        renderSequenceHeight_ = height;
+        renderSequenceStartFrame_ = startFrame;
+        renderSequenceEndFrame_ = endFrame;
+        renderSequenceStep_ = step == 0 ? 1 : step;
+        renderSequenceCurrentFrame_ = startFrame;
+        renderSequenceViewNode_ = renderViewNode;
+        renderSequenceHaveViewParams_ = renderViewParams != nullptr;
+        if (renderViewParams) renderSequenceViewParams_ = *renderViewParams;
+        renderSequenceFirstFrame_ = true;
+        renderSequenceLastError_.clear();
 
-        webview_->CapturePreview(
-            COREWEBVIEW2_CAPTURE_PREVIEW_IMAGE_FORMAT_PNG,
-            stream.Get(),
-            Callback<ICoreWebView2CapturePreviewCompletedHandler>(
-                [&captureOk, &captureEvent, stream, target](HRESULT hr) -> HRESULT {
-                    if (SUCCEEDED(hr)) {
-                        LARGE_INTEGER zero = {};
-                        stream->Seek(zero, STREAM_SEEK_SET, nullptr);
-
-                        ComPtr<IWICImagingFactory> wic;
-                        CoCreateInstance(CLSID_WICImagingFactory, nullptr,
-                            CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic));
-                        if (wic) {
-                            ComPtr<IWICBitmapDecoder> decoder;
-                            wic->CreateDecoderFromStream(stream.Get(), nullptr,
-                                WICDecodeMetadataCacheOnLoad, &decoder);
-                            if (decoder) {
-                                ComPtr<IWICBitmapFrameDecode> frame;
-                                decoder->GetFrame(0, &frame);
-                                if (frame) {
-                                    int dstW = target->Width();
-                                    int dstH = target->Height();
-
-                                    UINT srcW, srcH;
-                                    frame->GetSize(&srcW, &srcH);
-
-                                    ComPtr<IWICBitmapScaler> scaler;
-                                    wic->CreateBitmapScaler(&scaler);
-                                    scaler->Initialize(frame.Get(), dstW, dstH,
-                                        WICBitmapInterpolationModeHighQualityCubic);
-
-                                    ComPtr<IWICFormatConverter> converter;
-                                    wic->CreateFormatConverter(&converter);
-                                    converter->Initialize(scaler.Get(),
-                                        GUID_WICPixelFormat32bppBGRA,
-                                        WICBitmapDitherTypeNone, nullptr, 0,
-                                        WICBitmapPaletteTypeCustom);
-
-                                    std::vector<BYTE> pixels(dstW * dstH * 4);
-                                    converter->CopyPixels(nullptr, dstW * 4,
-                                        (UINT)pixels.size(), pixels.data());
-
-                                    // Write to Max Bitmap — preserve alpha from capture
-                                    BMM_Color_64 px;
-                                    for (int y = 0; y < dstH; y++) {
-                                        for (int x = 0; x < dstW; x++) {
-                                            int idx = (y * dstW + x) * 4;
-                                            px.b = pixels[idx + 0] << 8;
-                                            px.g = pixels[idx + 1] << 8;
-                                            px.r = pixels[idx + 2] << 8;
-                                            px.a = pixels[idx + 3] << 8;
-                                            target->PutPixels(x, y, 1, &px);
-                                        }
-                                        target->ShowProgressLine(y);
-                                    }
-                                    target->RefreshWindow();
-                                    captureOk = true;
-                                }
-                            }
-                        }
-                    }
-                    SetEvent(captureEvent);
-                    return S_OK;
-                }).Get());
-
-        // Wait for capture to finish
-        const DWORD captureStart = GetTickCount();
-        while (WaitForSingleObject(captureEvent, 0) != WAIT_OBJECT_0) {
-            if (GetTickCount() - captureStart > timeout) break;
-            MSG winMsg;
-            while (PeekMessage(&winMsg, nullptr, 0, 0, PM_REMOVE)) {
-                TranslateMessage(&winMsg);
-                DispatchMessage(&winMsg);
-            }
-            Sleep(1);
-        }
-        CloseHandle(captureEvent);
-
-        // Tell JS to restore, unlock panel, restore opaque background
-        if (ip && previousTime != t) ip->SetTime(previousTime, FALSE);
-        restoreRenderState();
-        if (captureOk) renderImageWarmed_ = true;
-
-        return captureOk;
+        QueueRenderSequenceStep();
+        return true;
     }
 
     // ── ActiveShade capture ─────────────────────────────────
@@ -778,7 +790,8 @@
 
     void Destroy() {
         StopActiveShade();
-        if (renderImageEvent_) { CloseHandle(renderImageEvent_); renderImageEvent_ = nullptr; }
+        if (hwnd_) KillTimer(hwnd_, RENDER_SEQUENCE_TIMER_ID);
+        FinishRenderSequence(false);
         if (originalParent_) RestoreFromViewport();
         UnregisterCallbacks();
         if (controller_) { controller_->Close(); controller_ = nullptr; }
@@ -876,9 +889,16 @@
         case WM_EXPORT_SNAPSHOT:
             if (p) p->RequestSnapshotExport();
             return 0;
+        case WM_RENDER_SEQUENCE_STEP:
+            if (p) p->PumpRenderSequenceStep();
+            return 0;
         case WM_TIMER:
             if (wParam == SYNC_TIMER_ID && p) p->OnTimer();
             if (wParam == AS_TIMER_ID && p) p->CaptureActiveShadeFrame();
+            if (wParam == RENDER_SEQUENCE_TIMER_ID && p) {
+                KillTimer(hwnd, RENDER_SEQUENCE_TIMER_ID);
+                p->PumpRenderSequenceStep();
+            }
             return 0;
         case WM_KILL_PANEL:
             KillPanel();

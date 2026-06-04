@@ -703,10 +703,24 @@ static bool GetRenderViewCameraData(INode* renderViewNode, const ViewParams* vie
     CameraData nodeCam = {};
     const bool haveNodeCamera = renderViewNode && GetSceneCameraData(renderViewNode, t, nodeCam);
 
-    if (!viewPar) {
-        if (!haveNodeCamera) return false;
+    // When a render camera node is available its world transform is
+    // authoritative. The ViewParams handed to this GUP-triggered production
+    // render do not reliably carry a populated affineTM; Inverse() then
+    // collapses the camera to the world origin and the whole frame renders
+    // black (object framed from off-screen). Always prefer the camera node.
+    if (haveNodeCamera) {
         cam = nodeCam;
         return true;
+    }
+
+    // No camera node: a pure viewport render. Guard against an unpopulated /
+    // degenerate affineTM (near-zero basis) — bail so the caller falls back to
+    // the live viewport camera instead of placing the camera at the origin.
+    if (!viewPar ||
+        viewPar->affineTM.GetRow(0).LengthSquared() < 1e-8f ||
+        viewPar->affineTM.GetRow(1).LengthSquared() < 1e-8f ||
+        viewPar->affineTM.GetRow(2).LengthSquared() < 1e-8f) {
+        return false;
     }
 
     Matrix3 camTM = Inverse(viewPar->affineTM);

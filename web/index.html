@@ -655,8 +655,12 @@
         const MAXJS_MODE_KEY = 'maxjs-render-mode';
         const MAXJS_RENDER_MODES = ['standard', 'studio', 'pathtracing'];
         const isHostedWebView = !!window.chrome?.webview?.postMessage;
+        const pageParams = new URLSearchParams(window.location.search);
+        const isProductionRenderPage = pageParams.has('productionRender');
+        const shouldPreserveCanvasForCapture = isHostedWebView || isProductionRenderPage;
 
         function readMaxjsRenderMode() {
+            if (isProductionRenderPage) return 'standard';
             try {
                 const value = localStorage.getItem(MAXJS_MODE_KEY);
                 return MAXJS_RENDER_MODES.includes(value) ? value : 'standard';
@@ -684,6 +688,7 @@
         }
 
         function consumeRequestedRendererBackend() {
+            if (isProductionRenderPage) return 'webgl-fallback';
             const explicit = sessionStorage.getItem('maxjs_renderer_backend');
             if (explicit) {
                 sessionStorage.removeItem('maxjs_renderer_backend');
@@ -710,6 +715,7 @@
                 nextRenderer = new THREE_STD.WebGLRenderer({
                     antialias: true,
                     alpha: true,
+                    preserveDrawingBuffer: shouldPreserveCanvasForCapture,
                     powerPreference: 'high-performance',
                 });
                 backendLabel = 'WebGL (Pathtracing)';
@@ -719,6 +725,7 @@
                 nextRenderer = new THREE_STD.WebGLRenderer({
                     antialias: true,
                     alpha: true,
+                    preserveDrawingBuffer: shouldPreserveCanvasForCapture,
                     powerPreference: 'high-performance',
                 });
                 backendLabel = 'WebGL Mode';
@@ -727,12 +734,12 @@
             } else if (requestedBackend === 'webgl-fallback') {
                 // Normal viewer WebGL2 uses the modern renderer stack so TSL /
                 // Shader Lab can compile to the forced WebGL backend.
-                nextRenderer = new THREE.WebGPURenderer({ antialias: true, alpha: true, forceWebGL: true });
+                nextRenderer = new THREE.WebGPURenderer({ antialias: true, alpha: true, forceWebGL: true, preserveDrawingBuffer: shouldPreserveCanvasForCapture });
                 backendLabel = 'TSL_GL';
                 configureRenderer(nextRenderer);
                 await initializeRenderer(nextRenderer);
             } else {
-                nextRenderer = new THREE.WebGPURenderer({ antialias: true, alpha: true });
+                nextRenderer = new THREE.WebGPURenderer({ antialias: true, alpha: true, preserveDrawingBuffer: shouldPreserveCanvasForCapture });
                 backendLabel = 'WebGPU';
                 try {
                     configureRenderer(nextRenderer);
@@ -740,7 +747,7 @@
                 } catch (error) {
                     console.warn('max.js WebGPU init failed, retrying with forced WebGL2 backend.', error);
                     disposeRenderer(nextRenderer);
-                    nextRenderer = new THREE.WebGPURenderer({ antialias: true, alpha: true, forceWebGL: true });
+                    nextRenderer = new THREE.WebGPURenderer({ antialias: true, alpha: true, forceWebGL: true, preserveDrawingBuffer: shouldPreserveCanvasForCapture });
                     backendLabel = 'TSL_GL';
                     configureRenderer(nextRenderer);
                     await initializeRenderer(nextRenderer);
@@ -9864,6 +9871,56 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         let renderToImageActive = false;
         let pendingRenderToImage = null;
 
+        function readBlobAsDataUrl(blob) {
+            return new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onload = () => resolve(String(reader.result || ''));
+                reader.onerror = () => reject(reader.error || new Error('FileReader failed'));
+                reader.readAsDataURL(blob);
+            });
+        }
+
+        function canvasToBlob(canvas, mime, quality) {
+            return new Promise(resolve => {
+                try {
+                    canvas.toBlob(blob => resolve(blob), mime, quality);
+                } catch {
+                    resolve(null);
+                }
+            });
+        }
+
+        async function sendCurrentCanvasRenderFile(capture) {
+            const responseType = capture?.responseType || 'render_sequence_frame_file';
+            try {
+                const requestedMime = typeof capture?.mime === 'string' && capture.mime
+                    ? capture.mime
+                    : 'image/png';
+                const quality = requestedMime === 'image/jpeg' || requestedMime === 'image/webp'
+                    ? 0.95
+                    : undefined;
+                let blob = await canvasToBlob(renderer.domElement, requestedMime, quality);
+                if (!blob && requestedMime !== 'image/png') {
+                    blob = await canvasToBlob(renderer.domElement, 'image/png');
+                }
+                if (!blob) throw new Error('Canvas image export failed');
+
+                const dataUrl = await readBlobAsDataUrl(blob);
+                const comma = dataUrl.indexOf(',');
+                if (comma < 0) throw new Error('Canvas image payload missing data URL header');
+                bridge.send(responseType, {
+                    imageBase64: dataUrl.slice(comma + 1),
+                    mime: blob.type || requestedMime,
+                    width: capture?.width || renderer.domElement.width || 0,
+                    height: capture?.height || renderer.domElement.height || 0,
+                });
+            } catch (error) {
+                bridge.send(responseType, {
+                    error: error?.message || String(error),
+                });
+            }
+        }
+
         function getCameraProjectionAspect() {
             if (renderToImageActive && pendingRenderToImage?.width > 0 && pendingRenderToImage?.height > 0) {
                 return pendingRenderToImage.width / pendingRenderToImage.height;
@@ -13186,7 +13243,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             // the system sees between frames.
             layerManager.beforeRender?.(frameElapsed);
             try {
-                if (pathTracingFx.isEnabled?.()) {
+                if (pathTracingFx.isEnabled?.() && !renderToImageActive) {
                     // Pathtracing is a live-viewer-only renderer mode. It
                     // bypasses post FX and never participates in snapshots.
                     // Claim warmup frames with the PT controller instead of
@@ -13250,17 +13307,18 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 splatOverlay.renderer.render(splatOverlay.scene, splatOverlay.camera);
             }
             if (renderToImageActive && pendingRenderToImage) {
-                const syncReady = latestAppliedSyncFrame > pendingRenderToImage.observedSyncFrame;
+                const syncReady = latestAppliedSyncSerial > pendingRenderToImage.observedSyncSerial;
                 const settledEnough = performance.now() >= (pendingRenderToImage.startedAtMs + pendingRenderToImage.warmupMs);
                 const pathTracingReady = !pendingRenderToImage.pathTracing
                     || pathTracingFx.isCaptureReady?.(pendingRenderToImage.pathTracingMinSamples) === true;
                 const timedOut = performance.now() >= pendingRenderToImage.syncDeadlineMs;
                 if ((syncReady && settledEnough && pathTracingReady) || timedOut) {
-                    const renderTimeSeconds = pendingRenderToImage.renderTimeSeconds;
+                    const capture = pendingRenderToImage;
+                    const renderTimeSeconds = capture.renderTimeSeconds;
                     pendingRenderToImage = null;
                     requestAnimationFrame(() => {
                         renderCurrentFrameOnce(renderTimeSeconds);
-                        requestAnimationFrame(() => bridge.send('render_to_image_ready'));
+                        void sendCurrentCanvasRenderFile(capture);
                     });
                 }
             }
@@ -13371,7 +13429,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             }
 
             try {
-                if (pathTracingFx.isEnabled?.()) {
+                if (pathTracingFx.isEnabled?.() && !renderToImageActive) {
                     if (!pathTracingFx.render?.()) renderPathTracingFallbackFrame();
                 } else if (webglBasicFx.isAvailable?.() || maxjsFx.hasEnabledEffects()) {
                     renderViewerFrame();
@@ -13387,15 +13445,13 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             }
         }
 
-        bridge.on('render_to_image', async msg => {
+        function beginRenderSequenceFrame(msg) {
             const w = msg.width || innerWidth;
             const h = msg.height || innerHeight;
             const frameNumber = Number.isFinite(msg.frame) ? msg.frame : 0;
             const fps = Number.isFinite(msg.fps) && msg.fps > 0 ? msg.fps : 30;
             const warmupMs = Number.isFinite(msg.warmupMs) ? Math.max(0, msg.warmupMs) : 250;
-            const ptMinSamples = Number.isFinite(msg.pathTracingSamples)
-                ? Math.max(1, Math.floor(msg.pathTracingSamples))
-                : PATH_TRACING_CAPTURE_DEFAULT_SAMPLES;
+            const wasAlreadyActive = renderToImageActive === true;
             renderToImageActive = true;
             pendingRenderToImage = {
                 observedSyncSerial: latestAppliedSyncSerial,
@@ -13403,41 +13459,48 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 width: w,
                 height: h,
                 warmupMs,
-                pathTracing: pathTracingFx.isEnabled?.() === true,
-                pathTracingMinSamples: ptMinSamples,
+                responseType: 'render_sequence_frame_file',
+                mime: typeof msg.mime === 'string' && msg.mime ? msg.mime : 'image/png',
+                pathTracing: false,
+                pathTracingMinSamples: 1,
                 startedAtMs: performance.now(),
                 textureWaitStartedAt: 0,
-                textureWaitMs: pathTracingFx.isEnabled?.() ? PATH_TRACING_TEXTURE_WAIT_MS : 0,
+                textureWaitMs: 0,
                 pathTracingStarted: false,
-                syncDeadlineMs: performance.now() + (pathTracingFx.isEnabled?.() ? 30000 : 10000),
+                syncDeadlineMs: performance.now() + 10000,
             };
 
             // Hide all UI — keep only canvas elements visible
-            for (const el of document.body.children) {
-                if (el.tagName !== 'CANVAS' && el.tagName !== 'SCRIPT') {
-                    el._rtiPrevDisplay = el.style.display;
-                    el.style.display = 'none';
+            if (!wasAlreadyActive) {
+                for (const el of document.body.children) {
+                    if (el.tagName !== 'CANVAS' && el.tagName !== 'SCRIPT') {
+                        el._rtiPrevDisplay = el.style.display;
+                        el.style.display = 'none';
+                    }
                 }
+                document.body.style.background = `#${hiddenBackgroundColor.toString(16).padStart(6, '0')}`;
+
+                // Save and bypass all performance throttling
+                savedPerformanceSettings = { ...performanceSettings };
+                performanceSettings.renderScale = 1.0;
+                performanceSettings.fpsCap = 0;
+
+                savedRenderToImageState = {
+                    envVisible,
+                    localHdriShowBg,
+                    playbackState: animationSystem?.capturePlaybackState?.() ?? null,
+                };
             }
-            // Transparent background for alpha channel.
-            document.body.style.background = 'transparent';
 
-            // Save and bypass all performance throttling
-            savedPerformanceSettings = { ...performanceSettings };
-            performanceSettings.renderScale = 1.0;
-            performanceSettings.fpsCap = 0;
-
-            savedRenderToImageState = {
-                envVisible,
-                localHdriShowBg,
-                playbackState: animationSystem?.capturePlaybackState?.() ?? null,
-            };
-
-            // Force transparent background for capture while keeping environment reflections.
-            envVisible = false;
-            localHdriShowBg = false;
-            maxjsFx.setEnvironmentVisible(false);
-            scene.background = null;
+            maxjsFx.setEnvironmentVisible(envVisible);
+            if (isLocalHdriActive()) {
+                localHdriShowBg = envVisible;
+                applyLocalHDRIToScene();
+            } else {
+                scene.background = envVisible && scene.environment
+                    ? scene.environment
+                    : new THREE.Color(hiddenBackgroundColor);
+            }
             if (pendingRenderToImage.pathTracing) {
                 resetPathTracingStartupWarmup();
                 pathTracingFx.markSceneDirty?.();
@@ -13471,12 +13534,12 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             try {
                 // Wait for the fresh synced frame to land; renderFrame will perform the one-shot render.
             } catch (error) {
-                console.warn('[max.js render_to_image] render failed', error);
-                bridge.send('render_to_image_ready');
+                console.warn('[max.js render_sequence_frame] render failed', error);
+                bridge.send('render_sequence_frame_file', { error: error?.message || String(error) });
             }
-        });
+        }
 
-        bridge.on('render_to_image_done', () => {
+        function finishRenderSequence() {
             renderToImageActive = false;
             pendingRenderToImage = null;
 
@@ -13509,7 +13572,10 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             camera.aspect = innerWidth / innerHeight;
             camera.updateProjectionMatrix();
             applyRendererPerformanceSettings({ resizePostFx: true });
-        });
+        }
+
+        bridge.on('render_sequence_frame', beginRenderSequenceFrame);
+        bridge.on('render_sequence_done', finishRenderSequence);
 
         // ── Build mode / Standalone / Debug ──
         // buildMode / isStandalone / urlMode are initialized near perfHud (early).

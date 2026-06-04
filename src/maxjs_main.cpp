@@ -94,8 +94,10 @@ using namespace Microsoft::WRL;
 #define WM_AS_TICK                (WM_USER + 5)
 #define WM_PLAYBACK_FLUSH         (WM_USER + 6)
 #define WM_EXPORT_SNAPSHOT        (WM_USER + 7)
+#define WM_RENDER_SEQUENCE_STEP   (WM_USER + 8)
 #define SETUP_TIMER_ID            2
 #define AS_TIMER_ID               3
+#define RENDER_SEQUENCE_TIMER_ID  4
 #define AS_INTERVAL_MS            66   // ~15fps ActiveShade
 
 extern HINSTANCE hInstance;

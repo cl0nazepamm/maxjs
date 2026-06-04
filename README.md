@@ -1,9 +1,4 @@
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="img/Asset%2022%20white.png">
-    <img src="img/Asset%2022.png" alt="max.js — Three.js Editor" width="640">
-  </picture>
-</p>
+
 
 # max.js
 
@@ -23,14 +18,28 @@ It does not export the advanced post processing stack yet. But it is coming soon
 - **PostFX** includes SSGI, SSR, Bloom, Toon and much more. See full list below.
 - **Materials** Huge material coverage including automatic translation of 3ds Max materials.
 
+### Quick Start
+
+**Starting the viewer:** You can start the viewer via macroscripts in search menu called "max.js" or stop using "kill max.js" 
+
+**Releasing project manifest:** You must save your .max file and release the manifest using "Layers" menu to save your post processing and display settings.
+
+**Three.js Materials:** All three.js materials and nodes will be registered to Material Editor including TSL, Toon, HTML and other ones.
+
+**Three.js Objects:** In create menu you can find max.js objects like "Audio Origin" or "Splat Origin (spark)"
+
+**ActiveShade:** Assign the **three.js** renderer in settings and start ActiveShade to embed the same WebView2 viewport in the Max viewport. This is a hack so expect it to go off view sometimes. Use the kill macroscript or restart via CTRL+SHIFT+R
+
 ## Renderer
 
 max.js exposes three stable viewer pipelines:
 
-| Mode | Purpose |
-|---|---|
-| **WGL2** | Simple WebGL2 compatibility path with a small safe FX stack. Comes with the experimental pathtracer mode. |
-| **WebGPU** | Main advanced renderer path for the full max.js FX stack. Supports forcing WebGL. |
+
+| Mode       | Purpose                                                                                                   |
+| ---------- | --------------------------------------------------------------------------------------------------------- |
+| **WGL2**   | Simple WebGL2 compatibility path with a small safe FX stack. Comes with the experimental pathtracer mode. |
+| **WebGPU** | Main advanced renderer path for the full max.js FX stack. Supports forcing WebGL.                         |
+
 
 ## Scene Data
 
@@ -45,21 +54,23 @@ max.js exposes three stable viewer pipelines:
 
 Supported Max materials are extracted into a portable PBR descriptor (`materialModel`, maps, scalars) and rebuilt in Three.js for the live viewer and snapshots.
 
-| 3ds Max material | Synced model | Notes |
-|---|---|---|
-| **Physical Material** | `MeshPhysicalMaterial` | Autodesk physical shading path |
-| **OpenPBR Material** | `MeshPhysicalMaterial` | OpenPBR field mapping |
-| **V-Ray Material** | `MeshPhysicalMaterial` | Mapped fields only; unmapped inputs are ignored |
-| **glTF Material** | `MeshStandardMaterial` → `MeshPhysicalMaterial` | Promoted when clearcoat, specular, transmission, volume, or IOR extensions are enabled |
-| **USD Preview Surface** | `MeshStandardMaterial` → `MeshPhysicalMaterial` | Promoted when clearcoat is used or IOR ≠ 1.5 |
-| **MaterialX** | `MaterialXMaterial` | File path, inline export, or live graph |
-| **Standard / legacy** | `MeshLambertMaterial` | Diffuse, opacity, self-illum, and common map slots |
-| **three.js Material** | `MeshStandardMaterial`, `MeshPhysicalMaterial`, or `MeshSSSNodeMaterial` | Mode selected on the native max.js material |
-| **three.js Utility** | `MeshDepthMaterial`, `MeshLambertMaterial`, `MeshMatcapMaterial`, `MeshNormalMaterial`, `MeshPhongMaterial`, `MeshBackdropNodeMaterial` | Per utility preset |
-| **three.js TSL** | `MeshTSLNodeMaterial` | JS shader source and/or MaterialX compiler sub-slot |
-| **three.js Toon** | `MeshToonMaterial` | Gradient, outline, and map slots |
-| **Shell Material** | *(first supported sub-material)* | Walks Shell slots for a supported material above |
-| **Multi/Sub-Object** | Per face/material ID | Emits per-group materials when mesh groups carry distinct IDs |
+
+| 3ds Max material        | Synced model                                                                                                                            | Notes                                                                                  |
+| ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------- |
+| **Physical Material**   | `MeshPhysicalMaterial`                                                                                                                  | Autodesk physical shading path                                                         |
+| **OpenPBR Material**    | `MeshPhysicalMaterial`                                                                                                                  | OpenPBR field mapping                                                                  |
+| **V-Ray Material**      | `MeshPhysicalMaterial`                                                                                                                  | Mapped fields only; unmapped inputs are ignored                                        |
+| **glTF Material**       | `MeshStandardMaterial` → `MeshPhysicalMaterial`                                                                                         | Promoted when clearcoat, specular, transmission, volume, or IOR extensions are enabled |
+| **USD Preview Surface** | `MeshStandardMaterial` → `MeshPhysicalMaterial`                                                                                         | Promoted when clearcoat is used or IOR ≠ 1.5                                           |
+| **MaterialX**           | `MaterialXMaterial`                                                                                                                     | File path, inline export, or live graph                                                |
+| **Standard / legacy**   | `MeshLambertMaterial`                                                                                                                   | Diffuse, opacity, self-illum, and common map slots                                     |
+| **three.js Material**   | `MeshStandardMaterial`, `MeshPhysicalMaterial`, or `MeshSSSNodeMaterial`                                                                | Mode selected on the native max.js material                                            |
+| **three.js Utility**    | `MeshDepthMaterial`, `MeshLambertMaterial`, `MeshMatcapMaterial`, `MeshNormalMaterial`, `MeshPhongMaterial`, `MeshBackdropNodeMaterial` | Per utility preset                                                                     |
+| **three.js TSL**        | `MeshTSLNodeMaterial`                                                                                                                   | JS shader source and/or MaterialX compiler sub-slot                                    |
+| **three.js Toon**       | `MeshToonMaterial`                                                                                                                      | Gradient, outline, and map slots                                                       |
+| **Shell Material**      | *(first supported sub-material)*                                                                                                        | Walks Shell slots for a supported material above                                       |
+| **Multi/Sub-Object**    | Per face/material ID                                                                                                                    | Emits per-group materials when mesh groups carry distinct IDs                          |
+
 
 Unsupported assignments fall back to the object wire color. TSL and MaterialX compile on the active renderer path (WebGPU or WGPU forced WebGL).
 
@@ -72,14 +83,16 @@ Unsupported assignments fall back to the object wire color. TSL and MaterialX co
 
 ### Lights And Environment
 
-| Light Type | Shadows | Synced Parameters |
-|---|---|---|
-| Directional | Yes | color, intensity, bias, radius, map size |
-| Point | Yes | color, intensity, distance, decay |
-| Spot | Yes | color, intensity, distance, decay, angle, penumbra |
-| Rect Area | No | color, intensity, width, height |
-| Hemisphere | No | sky color, ground color, intensity |
-| Ambient | No | color, intensity |
+
+| Light Type  | Shadows | Synced Parameters                                  |
+| ----------- | ------- | -------------------------------------------------- |
+| Directional | Yes     | color, intensity, bias, radius, map size           |
+| Point       | Yes     | color, intensity, distance, decay                  |
+| Spot        | Yes     | color, intensity, distance, decay, angle, penumbra |
+| Rect Area   | No      | color, intensity, width, height                    |
+| Hemisphere  | No      | sky color, ground color, intensity                 |
+| Ambient     | No      | color, intensity                                   |
+
 
 Environment support includes HDRI, authored Three.js sky, geospatial atmosphere where supported, fog, camera clipping, and sky/sun linking.
 
@@ -101,7 +114,6 @@ Stable viewer effects include:
 - Volumetric/fog look controls
 - Pixel, retro, CRT, film, color, exposure, and tone controls
 - Shader Lab
-
 
 ## Snapshots
 

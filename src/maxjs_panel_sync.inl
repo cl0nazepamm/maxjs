@@ -2043,6 +2043,49 @@
             SendHostActionResult(type, requestId, ok, error, url);
             return;
         }
+        if (type == L"snapshot_analyze") {
+            std::wstring requestId;
+            std::wstring path;
+            ExtractJsonString(msg, L"requestId", requestId);
+            ExtractJsonString(msg, L"path", path);
+            if (path.empty()) path = lastSnapshotExportPath_;
+
+            std::wstring snapshotJson;
+            unsigned long long snapshotJsonBytes = 0;
+            unsigned long long sceneBinBytes = 0;
+            unsigned long long sceneAnimBytes = 0;
+            std::wstring error;
+            const bool ok = ReadSnapshotAnalysisPayload(
+                path,
+                snapshotJson,
+                snapshotJsonBytes,
+                sceneBinBytes,
+                sceneAnimBytes,
+                error);
+
+            if (!webview_) return;
+            std::wostringstream ss;
+            ss << L"{\"type\":\"host_action_result\",\"action\":\"snapshot_analyze\"";
+            if (!requestId.empty()) {
+                ss << L",\"requestId\":\"" << EscapeJson(requestId.c_str()) << L"\"";
+            }
+            ss << L",\"ok\":" << (ok ? L"true" : L"false");
+            if (!error.empty()) {
+                ss << L",\"error\":\"" << EscapeJson(error.c_str()) << L"\"";
+            }
+            if (!path.empty()) {
+                ss << L",\"path\":\"" << EscapeJson(path.c_str()) << L"\"";
+            }
+            if (ok) {
+                ss << L",\"snapshotJsonBytes\":" << snapshotJsonBytes
+                   << L",\"sceneBinBytes\":" << sceneBinBytes
+                   << L",\"sceneAnimBytes\":" << sceneAnimBytes
+                   << L",\"snapshotJson\":\"" << EscapeJson(snapshotJson.c_str()) << L"\"";
+            }
+            ss << L'}';
+            webview_->PostWebMessageAsJson(ss.str().c_str());
+            return;
+        }
         if (type == L"inline_layer_remove") {
             std::wstring requestId;
             std::wstring id;

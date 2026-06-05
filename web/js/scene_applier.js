@@ -46,6 +46,7 @@ import {
     binInRange,
     geometryFromNodeBinary,
     attachSkinAttributes,
+    attachMorphAttributes,
     buildSkinnedMeshFromNd,
     indexArrayFromBinary,
     normalAttributeFromBinary,
@@ -659,6 +660,7 @@ export async function applySceneBin({ buffer, meta, ctx, hooks: userHooks = {}, 
                 for (const [start, count, idx] of nd.groups) geom.addGroup(start, count, idx);
             }
             if (nd.skin && !nd.spline) attachSkinAttributes(geom, nd, buffer);
+            if (!nd.spline) attachMorphAttributes(geom, nd, buffer);
         } else if (geom && nd.groups) {
             geom.clearGroups();
             for (const [start, count, idx] of nd.groups) geom.addGroup(start, count, idx);
@@ -686,6 +688,15 @@ export async function applySceneBin({ buffer, meta, ctx, hooks: userHooks = {}, 
                 releaseGeometryRef(refCounts, mesh.geometry);
                 retainGeometryRef(refCounts, geom);
                 mesh.geometry = geom;
+                mesh.updateMorphTargets?.();
+                const infl = nd.morph?.infl;
+                if (Array.isArray(mesh.morphTargetInfluences) && infl?.length) {
+                    const n = Math.min(mesh.morphTargetInfluences.length, infl.length);
+                    for (let i = 0; i < n; i++) {
+                        const v = Number(infl[i]);
+                        mesh.morphTargetInfluences[i] = Number.isFinite(v) ? v : 0;
+                    }
+                }
             }
             if (hooks.materialUpdater({ mesh, nd, wantsLine, geom })) {
                 sceneChanged = true;
@@ -701,6 +712,18 @@ export async function applySceneBin({ buffer, meta, ctx, hooks: userHooks = {}, 
                     ?? new THREE.Mesh(geom, material);
             } else {
                 mesh = new THREE.Mesh(geom, material);
+                // Plain mesh with morph targets: the Mesh ctor's updateMorphTargets()
+                // built morphTargetInfluences/Dictionary from geom.morphAttributes;
+                // seed the initial influences (the mixer drives them per-frame via
+                // `.morphTargetInfluences[i]`). Mutate in place so mixer bindings hold.
+                const infl = nd.morph?.infl;
+                if (Array.isArray(mesh.morphTargetInfluences) && infl?.length) {
+                    const n = Math.min(mesh.morphTargetInfluences.length, infl.length);
+                    for (let i = 0; i < n; i++) {
+                        const v = Number(infl[i]);
+                        mesh.morphTargetInfluences[i] = Number.isFinite(v) ? v : 0;
+                    }
+                }
             }
             mesh.matrixAutoUpdate = false;
             mesh.frustumCulled = false;

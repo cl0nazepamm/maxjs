@@ -246,9 +246,10 @@ export function geometryFromNodeBinary(nd, buffer) {
 }
 
 /**
- * Attaches skin (skinWeight + skinIndex) and morph-target attributes to a
- * geometry already built by `geometryFromNodeBinary`. Splines never carry
- * skin — caller should guard.
+ * Attaches skin (skinWeight + skinIndex) attributes to a geometry already built
+ * by `geometryFromNodeBinary`. Splines never carry skin — caller should guard.
+ * Morph targets are handled separately by `attachMorphAttributes` so plain
+ * (non-skinned) meshes can carry them too.
  */
 export function attachSkinAttributes(geom, nd, buffer) {
     if (!geom || !nd?.skin || nd.spline) return;
@@ -262,20 +263,46 @@ export function attachSkinAttributes(geom, nd, buffer) {
             geom.setAttribute('skinIndex', indexAttr);
         }
     }
-    if (nd.morph?.dOff?.length && nd.morph?.dN?.length && nd.morph?.names?.length) {
-        geom.morphAttributes = { position: [] };
-        for (let mi = 0; mi < nd.morph.names.length; mi++) {
-            const off = nd.morph.dOff[mi];
-            const cnt = nd.morph.dN[mi];
-            if (!binInRange(buffer, off, cnt)) continue;
-            const d = new Float32Array(new Float32Array(buffer, off, cnt));
-            const attr = new THREE.BufferAttribute(d, 3);
-            attr.name = String(nd.morph.names[mi] ?? `morph_${mi}`);
-            geom.morphAttributes.position.push(attr);
+}
+
+/**
+ * Attaches Three.js morph-target attributes (relative position deltas) to a
+ * geometry built by `geometryFromNodeBinary`. Skin-independent: any mesh whose
+ * node descriptor carries `nd.morph` gets morph targets. No-op otherwise.
+ */
+export function attachMorphAttributes(geom, nd, buffer) {
+    if (!geom || nd?.spline) return;
+    if (!(nd.morph?.dOff?.length && nd.morph?.dN?.length && nd.morph?.names?.length)) return;
+    const basePosition = geom.getAttribute('position');
+    const expectedFloats = basePosition?.count * 3;
+    if (!Number.isInteger(expectedFloats) || expectedFloats <= 0) return;
+    const channelCount = nd.morph.names.length;
+    if (nd.morph.dOff.length < channelCount || nd.morph.dN.length < channelCount) return;
+    const positions = [];
+    for (let mi = 0; mi < channelCount; mi++) {
+        const off = nd.morph.dOff[mi];
+        const cnt = nd.morph.dN[mi];
+        if (cnt !== expectedFloats || !binInRange(buffer, off, cnt)) {
+            const label = nd.name || nd.n || nd.h || 'mesh';
+            console.warn('[max.js] skipped malformed morph payload', {
+                mesh: label,
+                morph: nd.morph.names[mi],
+                expectedFloats,
+                gotFloats: cnt
+            });
+            return;
         }
-        if (geom.morphAttributes.position.length > 0) {
-            geom.morphTargetRelative = true;
-        }
+        // Defensive copy so the attribute owns its data (does not alias scene.bin).
+        const d = new Float32Array(new Float32Array(buffer, off, cnt));
+        const attr = new THREE.BufferAttribute(d, 3);
+        attr.name = String(nd.morph.names[mi] ?? `morph_${mi}`);
+        positions.push(attr);
+    }
+    if (positions.length > 0) {
+        geom.morphAttributes = { position: positions };
+        // Exported deltas are relative to the base shape (Three.js spec property is
+        // `morphTargetsRelative`, plural — the singular form is silently ignored).
+        geom.morphTargetsRelative = true;
     }
 }
 

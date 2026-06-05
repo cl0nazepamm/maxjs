@@ -657,8 +657,9 @@ public:
         std::wstring uvType;
         std::wstring uv2Type;
         std::wstring nType;
-        // Skeletal skin + optional Morpher. Morpher is exported only when it
-        // evaluates before Skin, as static deltas + animated channel weights.
+        // Skeletal skin + optional Morpher. Morph targets are exported as static
+        // relative deltas + animated morphTargetInfluences whenever a Morpher is
+        // present (with or without Skin); never baked as per-frame vertices.
         bool skinRig = false;
         std::vector<ULONG> skinBoneHandles;
         std::vector<int> skinBoneParents;
@@ -668,12 +669,7 @@ public:
         size_t skinWOff = 0, skinIndOff = 0, skinBoneBindOff = 0;
         std::wstring skinWType;
         std::wstring skinIdxType;
-        std::vector<std::wstring> morphNames;
-        std::vector<int> morphChannelIds;
-        std::vector<float> morphInfluences;
-        std::vector<size_t> morphDOff;
-        std::vector<int> morphDN;
-        std::vector<std::vector<float>> morphChannelsData;
+        MorphTargetSet morphTargets;
     };
 
     struct SnapshotAnimationTrackDef {
@@ -2709,23 +2705,59 @@ public:
         return outTimes.size() >= 2;
     }
 
+    // Samples a scalar animatable across sampleTimes, drops the track when it never
+    // deviates from its first value (within epsilon), and emits seconds/value pairs.
+    // Generic over the per-time sampler so any float source reuses the same change
+    // detection + keyframe emission.
+    template <typename SampleAt>
+    static bool BuildSparseScalarTrack(const std::vector<TimeValue>& sampleTimes,
+                                       TimeValue rangeStart,
+                                       float epsilon,
+                                       SampleAt&& sampleAt,
+                                       std::vector<float>& outTimes,
+                                       std::vector<float>& outValues) {
+        if (sampleTimes.size() < 2) return false;
+        std::vector<float> vals;
+        vals.reserve(sampleTimes.size());
+        for (TimeValue tv : sampleTimes) vals.push_back(static_cast<float>(sampleAt(tv)));
+        bool changed = false;
+        for (size_t i = 1; i < vals.size(); ++i) {
+            if (std::fabs(vals[i] - vals[0]) > epsilon) { changed = true; break; }
+        }
+        if (!changed) return false;
+        outTimes.clear();
+        outValues.clear();
+        outTimes.reserve(sampleTimes.size());
+        outValues.reserve(vals.size());
+        for (size_t i = 0; i < sampleTimes.size(); ++i) {
+            outTimes.push_back(TimeValueToAnimationSeconds(sampleTimes[i], rangeStart));
+            outValues.push_back(vals[i]);
+        }
+        return true;
+    }
+
     static bool BuildMorpherInfluenceAnimationTracks(Interface* ip,
                                                      INode* meshNode,
                                                      const Interval& range,
                                                      TimeValue currentTime,
                                                      const SnapshotExportOptions& options,
-                                                     const std::vector<int>& morphChannelIds,
+                                                     const MorphTargetSet& morphTargets,
                                                      SnapshotAnimationTargetDef& outTarget) {
-        (void)options;
         (void)currentTime;
-        if (!ip || !meshNode || morphChannelIds.empty()) return false;
+        if (!ip || !meshNode || morphTargets.empty()) return false;
 
-        ModifierStackMatch skinMatch;
         ModifierStackMatch morphMatch;
-        if (!FindModifierStackMatchOnNode(meshNode, SKIN_CLASSID, skinMatch) ||
-            !FindModifierStackMatchOnNode(meshNode, MR3_CLASS_ID, morphMatch) ||
+        if (!FindModifierStackMatchOnNode(meshNode, MR3_CLASS_ID, morphMatch) ||
             !morphMatch.mod ||
-            !morphMatch.mod->IsEnabled() ||
+            !morphMatch.mod->IsEnabled()) {
+            return false;
+        }
+        // With a Skin rig present the Morpher must evaluate before it (the order the
+        // deltas were captured against); a standalone Morpher has no such constraint.
+        ModifierStackMatch skinMatch;
+        if (FindModifierStackMatchOnNode(meshNode, SKIN_CLASSID, skinMatch) &&
+            skinMatch.mod &&
+            skinMatch.mod->IsEnabled() &&
             !ModifierEvaluatesBefore(morphMatch, skinMatch)) {
             return false;
         }
@@ -2736,17 +2768,14 @@ public:
 
         bool anyTrack = false;
 
-        for (size_t mi = 0; mi < morphChannelIds.size(); ++mi) {
-            const int cid = morphChannelIds[mi];
-            IMorpherChannel* ch = morpher->GetChannel(cid, false);
+        // Channel order in morphTargets IS the morphTargetInfluences[] index order.
+        for (size_t mi = 0; mi < morphTargets.channels.size(); ++mi) {
+            IMorpherChannel* ch = morpher->GetChannel(morphTargets.channels[mi].channelId, false);
             if (!ch || !ch->IsActive()) continue;
 
             std::vector<TimeValue> sampleTimes;
             if (!AppendMorpherChannelTimeSamples(
-                    ch,
-                    range,
-                    options.animationSampleStepFrames,
-                    sampleTimes)) {
+                    ch, range, options.animationSampleStepFrames, sampleTimes)) {
                 continue;
             }
 
@@ -2754,29 +2783,22 @@ public:
             tr.path = L".morphTargetInfluences[" + std::to_wstring(mi) + L"]";
             tr.type = L"number";
             tr.interpolation = L"linear";
-
-            std::vector<float> vals;
-            vals.reserve(sampleTimes.size());
-            for (TimeValue tv : sampleTimes) {
-                vals.push_back(ReadMorpherChannelInfluence(ch, tv));
-            }
-            bool changed = false;
-            for (size_t i = 1; i < vals.size(); ++i) {
-                if (std::fabs(vals[i] - vals[0]) > 1.0e-5f) {
-                    changed = true;
-                    break;
-                }
-            }
-            if (!changed) continue;
-
-            for (size_t i = 0; i < sampleTimes.size(); ++i) {
-                tr.times.push_back(TimeValueToAnimationSeconds(sampleTimes[i], range.Start()));
-                tr.values.push_back(vals[i]);
+            if (!BuildSparseScalarTrack(
+                    sampleTimes, range.Start(), 1.0e-5f,
+                    [ch](TimeValue tv) { return ReadMorpherChannelInfluence(ch, tv); },
+                    tr.times, tr.values)) {
+                continue;
             }
             outTarget.tracks.push_back(std::move(tr));
             anyTrack = true;
         }
 
+        // Bind influences to this mesh. Required for morph-only meshes (no transform/
+        // geometry track to seed the target), else MergeSnapshotAnimationTarget leaves
+        // the target empty and the clip never resolves.
+        if (anyTrack) {
+            outTarget.target = L"handle:" + std::to_wstring(meshNode->GetHandle());
+        }
         return anyTrack;
     }
 
@@ -2798,6 +2820,8 @@ public:
         std::vector<SnapshotAnimationTargetDef> targets;
         targets.reserve(nodes.size() + 1);
         std::unordered_set<std::wstring> skinBonesAnimated;
+        std::unordered_map<std::wstring, SnapshotAnimationTargetDef> skinBoneTrackCache;
+        std::unordered_set<std::wstring> skinBoneTrackMisses;
         std::unordered_set<ULONG> exportedNodeHandles;
         exportedNodeHandles.reserve(nodes.size());
         for (const auto& node : nodes) {
@@ -2819,6 +2843,7 @@ public:
             part = SnapshotAnimationTargetDef();
             if (options.includeGeometryAnimation &&
                 !node.helper &&
+                node.morphTargets.empty() &&  // morph meshes animate via influences, not baked vertices
                 skinRigMeshHandles.find(node.handle) == skinRigMeshHandles.end() &&
                 BuildNodeGeometryAnimationTarget(node.node, range, currentTime, options, part, outAnimBinary)) {
                 MergeSnapshotAnimationTarget(target, std::move(part));
@@ -2830,9 +2855,9 @@ public:
                 MergeSnapshotAnimationTarget(target, std::move(part));
             }
             part = SnapshotAnimationTargetDef();
-            if (node.skinRig && options.includeGeometryAnimation && !node.morphChannelIds.empty() &&
+            if (options.includeGeometryAnimation && !node.morphTargets.empty() &&
                 BuildMorpherInfluenceAnimationTracks(
-                    ip, node.node, range, currentTime, options, node.morphChannelIds, part)) {
+                    ip, node.node, range, currentTime, options, node.morphTargets, part)) {
                 MergeSnapshotAnimationTarget(target, std::move(part));
             }
             if (!target.tracks.empty()) {
@@ -2860,8 +2885,26 @@ public:
                         parentNode = node.node;
                     }
 
-                    SnapshotAnimationTargetDef boneTarget;
-                    if (BuildBoneAnimationTarget(bn, parentNode, range, currentTime, options, boneTarget)) {
+                    const ULONG parentHandle = parentNode ? parentNode->GetHandle() : 0;
+                    const std::wstring cacheKey =
+                        std::to_wstring(bh) + L":" + std::to_wstring(parentHandle);
+                    if (skinBoneTrackMisses.find(cacheKey) != skinBoneTrackMisses.end()) {
+                        skinBonesAnimated.insert(scopedKey);
+                        continue;
+                    }
+
+                    auto cached = skinBoneTrackCache.find(cacheKey);
+                    if (cached == skinBoneTrackCache.end()) {
+                        SnapshotAnimationTargetDef sampledTarget;
+                        if (BuildBoneAnimationTarget(bn, parentNode, range, currentTime, options, sampledTarget)) {
+                            cached = skinBoneTrackCache.emplace(cacheKey, std::move(sampledTarget)).first;
+                        } else {
+                            skinBoneTrackMisses.insert(cacheKey);
+                        }
+                    }
+
+                    if (cached != skinBoneTrackCache.end()) {
+                        SnapshotAnimationTargetDef boneTarget = cached->second;
                         boneTarget.target = L"handle:" + scopedKey;
                         targets.push_back(std::move(boneTarget));
                         skinBonesAnimated.insert(scopedKey);
@@ -3829,10 +3872,6 @@ public:
 
                 if (extracted) {
                     if (!snapshotNode.spline) {
-                        std::vector<std::wstring> morphNamesTmp;
-                        std::vector<int> morphChIdsTmp;
-                        std::vector<float> morphInflTmp;
-                        std::vector<std::vector<float>> morphChTmp;
                         if (TryExtractSkinRigData(
                                 snapshotNode.node,
                                 t,
@@ -3846,19 +3885,28 @@ public:
                                 snapshotNode.skinBoneBindLocal,
                                 snapshotNode.skinWData,
                                 snapshotNode.skinIdxData,
-                                morphNamesTmp,
-                                morphChIdsTmp,
-                                morphInflTmp,
-                                morphChTmp)) {
+                                snapshotNode.morphTargets)) {
                             snapshotNode.skinRig = true;
                             if (snapshotNode.uv2s.size() / 2 != snapshotNode.verts.size() / 3) {
                                 snapshotNode.uv2s.clear();
                             }
-                            snapshotNode.morphNames = std::move(morphNamesTmp);
-                            snapshotNode.morphChannelIds = std::move(morphChIdsTmp);
-                            snapshotNode.morphInfluences = std::move(morphInflTmp);
-                            snapshotNode.morphChannelsData = std::move(morphChTmp);
                             skinRigMeshHandles.insert(snapshotNode.handle);
+                        } else if (TryExtractMorphTargets(
+                                snapshotNode.node,
+                                t,
+                                snapshotNode.verts,
+                                snapshotNode.uvs,
+                                snapshotNode.norms,
+                                snapshotNode.indices,
+                                snapshotNode.groups,
+                                snapshotNode.morphTargets)) {
+                            // Standalone Morpher (no Skin): geometry is now the rest
+                            // mesh; uv2 and vertex colors from the initially evaluated
+                            // mesh must not be paired with the replaced base geometry.
+                            snapshotNode.vertexColors.clear();
+                            if (snapshotNode.uv2s.size() / 2 != snapshotNode.verts.size() / 3) {
+                                snapshotNode.uv2s.clear();
+                            }
                         }
                     }
 
@@ -3933,12 +3981,14 @@ public:
                         AlignBinarySize(totalBytes, alignof(float));
                         snapshotNode.skinBoneBindOff = totalBytes;
                         totalBytes += snapshotNode.skinBoneBindLocal.size() * sizeof(float);
-                        for (size_t mi = 0; mi < snapshotNode.morphChannelsData.size(); ++mi) {
-                            snapshotNode.morphDOff.push_back(totalBytes);
-                            snapshotNode.morphDN.push_back(
-                                static_cast<int>(snapshotNode.morphChannelsData[mi].size()));
-                            totalBytes += snapshotNode.morphChannelsData[mi].size() * sizeof(float);
-                        }
+                    }
+                    // Morph delta streams: any mesh carrying morph targets, skinned
+                    // or not. Float-aligned so the viewer can map them as Float32Array.
+                    for (auto& ch : snapshotNode.morphTargets.channels) {
+                        AlignBinarySize(totalBytes, alignof(float));
+                        ch.binaryOffset = totalBytes;
+                        ch.floatCount = static_cast<int>(ch.deltas.size());
+                        totalBytes += ch.deltas.size() * sizeof(float);
                     }
 
                     nodes.push_back(std::move(snapshotNode));
@@ -4076,11 +4126,12 @@ public:
                     memcpy(buffer + node.skinBoneBindOff, node.skinBoneBindLocal.data(),
                            node.skinBoneBindLocal.size() * sizeof(float));
                 }
-                for (size_t mi = 0; mi < node.morphChannelsData.size(); ++mi) {
-                    if (!node.morphChannelsData[mi].empty() && mi < node.morphDOff.size()) {
-                        memcpy(buffer + node.morphDOff[mi], node.morphChannelsData[mi].data(),
-                               node.morphChannelsData[mi].size() * sizeof(float));
-                    }
+            }
+            // Morph delta streams: any mesh carrying morph targets, skinned or not.
+            for (const auto& ch : node.morphTargets.channels) {
+                if (!ch.deltas.empty()) {
+                    memcpy(buffer + ch.binaryOffset, ch.deltas.data(),
+                           ch.deltas.size() * sizeof(float));
                 }
             }
 
@@ -4153,27 +4204,32 @@ public:
                     ss << L",\"iType\":\"" << node.skinIdxType << L"\"";
                 }
                 ss << L"}";
-                if (!node.morphNames.empty()) {
-                    ss << L",\"morph\":{";
-                    ss << L"\"names\":[";
-                    for (size_t mi = 0; mi < node.morphNames.size(); ++mi) {
-                        if (mi) ss << L',';
-                        ss << L'"' << EscapeJson(node.morphNames[mi].c_str()) << L'"';
-                    }
-                    ss << L"],\"infl\":";
-                    WriteFloats(ss, node.morphInfluences.data(), node.morphInfluences.size());
-                    ss << L",\"dOff\":[";
-                    for (size_t mi = 0; mi < node.morphDOff.size(); ++mi) {
-                        if (mi) ss << L',';
-                        ss << node.morphDOff[mi];
-                    }
-                    ss << L"],\"dN\":[";
-                    for (size_t mi = 0; mi < node.morphDN.size(); ++mi) {
-                        if (mi) ss << L',';
-                        ss << node.morphDN[mi];
-                    }
-                    ss << L"]}";
+            }
+            // Morph manifest: any mesh carrying morph targets, skinned or not.
+            if (!node.morphTargets.empty()) {
+                const auto& channels = node.morphTargets.channels;
+                std::vector<float> infl;
+                infl.reserve(channels.size());
+                for (const auto& ch : channels) infl.push_back(ch.influence);
+                ss << L",\"morph\":{";
+                ss << L"\"names\":[";
+                for (size_t mi = 0; mi < channels.size(); ++mi) {
+                    if (mi) ss << L',';
+                    ss << L'"' << EscapeJson(channels[mi].name.c_str()) << L'"';
                 }
+                ss << L"],\"infl\":";
+                WriteFloats(ss, infl.data(), infl.size());
+                ss << L",\"dOff\":[";
+                for (size_t mi = 0; mi < channels.size(); ++mi) {
+                    if (mi) ss << L',';
+                    ss << channels[mi].binaryOffset;
+                }
+                ss << L"],\"dN\":[";
+                for (size_t mi = 0; mi < channels.size(); ++mi) {
+                    if (mi) ss << L',';
+                    ss << channels[mi].floatCount;
+                }
+                ss << L"]}";
             }
 
             Mtl* multiMtl = FindMultiSubMtl(node.node->GetMtl());
@@ -4339,7 +4395,7 @@ public:
         runtimeFeatures.materialCount = static_cast<int>(materialLibrary.entries.size());
         for (const auto& node : nodes) {
             if (node.skinRig) runtimeFeatures.skinnedMeshes += 1;
-            runtimeFeatures.morphTargets += static_cast<int>(node.morphNames.size());
+            runtimeFeatures.morphTargets += static_cast<int>(node.morphTargets.size());
             runtimeFeatures.vertexColorAttrs += static_cast<int>(node.vertexColors.size());
         }
 

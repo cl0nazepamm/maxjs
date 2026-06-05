@@ -128,13 +128,6 @@ static bool InvertMat4CM(const float m[16], float invOut[16]) {
     return true;
 }
 
-static void DeltaPoint3ToYUp(const Point3& d, float out[3]) {
-    // Same linear map as MaxJSPanel::MaxPointToWorld for vectors (no translation).
-    out[0] = d.x;
-    out[1] = d.z;
-    out[2] = -d.y;
-}
-
 class FindModifierOnStackEnum : public GeomPipelineEnumProc {
 public:
     Class_ID cid;
@@ -215,6 +208,40 @@ static bool ModifierEvaluatesBefore(const ModifierStackMatch& earlier,
            earlier.topToBottomIndex > later.topToBottomIndex;
 }
 
+static bool ExtractEvaluatedMeshForSnapshot(INode* node,
+                                            TimeValue t,
+                                            std::vector<float>& verts,
+                                            std::vector<float>& uvs,
+                                            std::vector<int>& indices,
+                                            std::vector<MatGroup>& groups,
+                                            std::vector<float>* normals = nullptr,
+                                            std::vector<int>* controlIdx = nullptr,
+                                            std::vector<VertexColorAttributeRecord>* outVertexColors = nullptr,
+                                            std::vector<float>* outUV2s = nullptr,
+                                            bool emitPrimaryUVs = true) {
+    if (!node) return false;
+    const bool allowMapChannel1 = ShouldAllowVertexColorMapChannel1(node);
+    ObjectState os = node->EvalWorldState(t);
+    if (!os.obj || os.obj->SuperClassID() != GEOMOBJECT_CLASS_ID) return false;
+    if (IsThreeJSSplatClassID(os.obj->ClassID())) return false;
+
+    if (os.obj->IsSubClassOf(polyObjectClassID)) {
+        PolyObject* poly = static_cast<PolyObject*>(os.obj);
+        MNMesh& mn = poly->GetMesh();
+        return ExtractMeshFromMNMesh(
+            mn, verts, uvs, indices, groups, normals, controlIdx,
+            outVertexColors, allowMapChannel1, nullptr, outUV2s, emitPrimaryUVs);
+    }
+
+    if (!os.obj->CanConvertToType(Class_ID(TRIOBJ_CLASS_ID, 0))) return false;
+    TriObject* tri = static_cast<TriObject*>(
+        os.obj->ConvertToType(t, Class_ID(TRIOBJ_CLASS_ID, 0)));
+    if (!tri) return false;
+    return ExtractMeshFromTriObject(
+        tri, os.obj, verts, uvs, indices, groups, normals, controlIdx,
+        outVertexColors, allowMapChannel1, nullptr, outUV2s, emitPrimaryUVs);
+}
+
 static void RestoreModifierEnabled(Modifier* mod, int wasEnabled) {
     if (!mod) return;
     if (wasEnabled) mod->EnableMod();
@@ -235,14 +262,6 @@ static float ReadMorpherChannelInfluence(IMorpherChannel* channel, TimeValue t) 
     return std::clamp(percent / 100.0f, -10.0f, 10.0f);
 }
 
-static float ReadMorpherPointWeight(IMorpherChannel* channel, int pointIndex) {
-    if (!channel || pointIndex < 0 || pointIndex >= channel->NumPoints()) return 1.0f;
-    float weight = static_cast<float>(channel->GetWeight(pointIndex));
-    if (!std::isfinite(weight)) return 1.0f;
-    if (std::fabs(weight) > 1.0f) weight /= 100.0f;
-    return std::clamp(weight, -10.0f, 10.0f);
-}
-
 static bool IsFinitePoint3(const Point3& value) {
     return std::isfinite(value.x) && std::isfinite(value.y) && std::isfinite(value.z);
 }
@@ -258,6 +277,101 @@ struct SkinWeightSortPair {
 };
 static bool SkinWeightPairGreater(const SkinWeightSortPair& a, const SkinWeightSortPair& b) {
     return a.w > b.w;
+}
+
+// ══════════════════════════════════════════════════════════════
+//  Morph targets (Three.js spec: static relative deltas + animated influences)
+// ══════════════════════════════════════════════════════════════
+
+// One Three.js morph target distilled from a Morpher channel: a named relative
+// position-delta stream (morphTargetsRelative = true) plus its current influence.
+// Holding the channels as an array-of-structs keeps name / channelId / influence /
+// deltas / binary placement index-locked by construction — the parallel-array
+// desync that ".morphTargetInfluences[i]" binding depends on becomes unrepresentable.
+struct MorphChannel {
+    std::wstring name;
+    int channelId = -1;
+    float influence = 0.0f;
+    std::vector<float> deltas;        // vCount*3 relative deltas
+    std::size_t binaryOffset = 0;     // assigned during snapshot binary assembly
+    int floatCount = 0;               // deltas.size(), cached for the manifest
+};
+
+struct MorphTargetSet {
+    std::vector<MorphChannel> channels;
+    bool empty() const { return channels.empty(); }
+    std::size_t size() const { return channels.size(); }
+};
+
+// Reads every active, non-progressive Morpher channel into morph targets, mapping
+// split render vertices back to control points via controlIdx. Shared by the
+// skinned and skin-free extraction paths so both emit byte-identical morph data.
+// baseControlPointCount guards against channels authored for a different (lower
+// resolution) mesh whose deltas would not correspond to these vertices.
+static void ExtractMorpherChannels(IMorpher* morpher,
+                                   const std::vector<int>& controlIdx,
+                                   int vCount,
+                                   int baseControlPointCount,
+                                   TimeValue t,
+                                   MorphTargetSet& outMorph) {
+    outMorph.channels.clear();
+    if (!morpher || vCount <= 0) return;
+
+    const int numChannels = morpher->NumChannels();
+    for (int channelId = 0; channelId < numChannels; ++channelId) {
+        IMorpherChannel* channel = morpher->GetChannel(channelId, false);
+        if (!channel || !channel->IsActive()) continue;
+        if (channel->IsProgressive()) continue;
+        const int morphPointCount = channel->NumPoints();
+        if (morphPointCount <= 0 || morphPointCount < baseControlPointCount) continue;
+
+        Tab<Point3> baseDeltas;
+        const bool haveBaseDeltas =
+            channel->GetBaseDeltas(baseDeltas) &&
+            baseDeltas.Count() >= morphPointCount;
+        const bool haveTargetPoints = channel->GetTargetCount() > 0;
+
+        std::vector<float> deltas(static_cast<size_t>(vCount) * 3u, 0.0f);
+        bool anyDelta = false;
+        for (int vi = 0; vi < vCount; ++vi) {
+            const int ci = (vi < static_cast<int>(controlIdx.size())) ? controlIdx[vi] : vi;
+            if (ci < 0 || ci >= morphPointCount) continue;
+            Point3 delta = haveBaseDeltas ? baseDeltas[ci] : channel->GetDelta(ci);
+            if (!IsFinitePoint3(delta)) continue;
+            if (haveTargetPoints &&
+                std::fabs(delta.x) <= 1.0e-7f &&
+                std::fabs(delta.y) <= 1.0e-7f &&
+                std::fabs(delta.z) <= 1.0e-7f) {
+                const Point3 basePoint = channel->GetPoint(ci);
+                const Point3 targetPoint = channel->GetTargetPoint(0, ci);
+                const Point3 targetDelta = targetPoint - basePoint;
+                if (IsFinitePoint3(targetDelta)) {
+                    delta = targetDelta;
+                }
+            }
+            const size_t off = static_cast<size_t>(vi) * 3u;
+            deltas[off + 0] = delta.x;
+            deltas[off + 1] = delta.y;
+            deltas[off + 2] = delta.z;
+            if (!anyDelta &&
+                (std::fabs(delta.x) > 1.0e-7f ||
+                 std::fabs(delta.y) > 1.0e-7f ||
+                 std::fabs(delta.z) > 1.0e-7f)) {
+                anyDelta = true;
+            }
+        }
+        if (!anyDelta) continue;
+
+        MorphChannel ch;
+        const TCHAR* rawName = channel->GetName(false);
+        ch.name = (rawName && rawName[0])
+            ? std::wstring(rawName)
+            : (L"Morph " + std::to_wstring(channelId + 1));
+        ch.channelId = channelId;
+        ch.influence = ReadMorpherChannelInfluence(channel, t);
+        ch.deltas = std::move(deltas);
+        outMorph.channels.push_back(std::move(ch));
+    }
 }
 
 // Fills skin + optional morph data for snapshot export. Replaces verts/uvs/norms
@@ -277,25 +391,22 @@ static bool TryExtractSkinRigData(
     std::vector<float>& outBoneBindLocal,
     std::vector<float>& outSkinW,
     std::vector<float>& outSkinIdx,
-    std::vector<std::wstring>& outMorphNames,
-    std::vector<int>& outMorphChannelIds,
-    std::vector<float>& outMorphInfl,
-    std::vector<std::vector<float>>& outMorphDeltas) {
+    MorphTargetSet& outMorph) {
     outBoneHandles.clear();
     outBoneParents.clear();
     outBoneBindLocal.clear();
     outSkinW.clear();
     outSkinIdx.clear();
-    outMorphNames.clear();
-    outMorphChannelIds.clear();
-    outMorphInfl.clear();
-    outMorphDeltas.clear();
+    outMorph.channels.clear();
 
     ModifierStackMatch skinMatch;
     if (!FindModifierStackMatchOnNode(meshNode, SKIN_CLASSID, skinMatch) || !skinMatch.mod) {
         return false;
     }
     Modifier* skinMod = skinMatch.mod;
+    if (!skinMod->IsEnabled()) {
+        return false;
+    }
 
     ISkin* skin = static_cast<ISkin*>(skinMod->GetInterface(I_SKIN));
     if (!skin) return false;
@@ -326,7 +437,8 @@ static bool TryExtractSkinRigData(
     std::vector<float> bindVerts, bindUvs, bindNorms;
     std::vector<int> bindIdx, controlIdx;
     std::vector<MatGroup> bindGroups;
-    const bool bindOk = ExtractMesh(meshNode, t, bindVerts, bindUvs, bindIdx, bindGroups, &bindNorms, &controlIdx);
+    const bool bindOk = ExtractEvaluatedMeshForSnapshot(
+        meshNode, t, bindVerts, bindUvs, bindIdx, bindGroups, &bindNorms, &controlIdx);
     if (morphMod) RestoreModifierEnabled(morphMod, morphWasEnabled);
     RestoreModifierEnabled(skinMod, skinWasEnabled);
     if (!bindOk) return false;
@@ -468,48 +580,72 @@ static bool TryExtractSkinRigData(
     }
 
     if (morpher && morphMod) {
-        const int numChannels = morpher->NumChannels();
-        const int skinPointCount = skinData->GetNumPoints();
-        for (int channelId = 0; channelId < numChannels; ++channelId) {
-            IMorpherChannel* channel = morpher->GetChannel(channelId, false);
-            if (!channel || !channel->IsActive()) continue;
-            if (channel->IsProgressive()) continue;
-            const int morphPointCount = channel->NumPoints();
-            if (morphPointCount <= 0 || morphPointCount < skinPointCount) continue;
-
-            std::vector<float> deltas(static_cast<size_t>(vCount) * 3u, 0.0f);
-            bool anyDelta = false;
-            for (int vi = 0; vi < vCount; ++vi) {
-                const int ci = (vi < static_cast<int>(controlIdx.size())) ? controlIdx[vi] : vi;
-                if (ci < 0 || ci >= morphPointCount) continue;
-                Point3 delta = channel->GetDelta(ci);
-                if (!IsFinitePoint3(delta)) continue;
-                delta *= ReadMorpherPointWeight(channel, ci);
-                if (!IsFinitePoint3(delta)) continue;
-                const size_t off = static_cast<size_t>(vi) * 3u;
-                deltas[off + 0] = delta.x;
-                deltas[off + 1] = delta.y;
-                deltas[off + 2] = delta.z;
-                if (!anyDelta &&
-                    (std::fabs(delta.x) > 1.0e-7f ||
-                     std::fabs(delta.y) > 1.0e-7f ||
-                     std::fabs(delta.z) > 1.0e-7f)) {
-                    anyDelta = true;
-                }
-            }
-            if (!anyDelta) continue;
-
-            const TCHAR* rawName = channel->GetName(false);
-            std::wstring name = rawName && rawName[0]
-                ? std::wstring(rawName)
-                : (L"Morph " + std::to_wstring(channelId + 1));
-            outMorphNames.push_back(std::move(name));
-            outMorphChannelIds.push_back(channelId);
-            outMorphInfl.push_back(ReadMorpherChannelInfluence(channel, t));
-            outMorphDeltas.push_back(std::move(deltas));
-        }
+        // Morpher sits under Skin: deltas are relative to the same bind mesh the
+        // skin weights were captured against, so they must cover every skin point.
+        ExtractMorpherChannels(morpher, controlIdx, vCount, skinData->GetNumPoints(), t, outMorph);
     }
 
+    return true;
+}
+
+// Extracts Three.js morph targets from a mesh whose Morpher is NOT paired with a
+// Skin rig (the standalone-Morpher case). Disables the Morpher to capture the rest
+// (base) mesh — deltas are relative to it (morphTargetsRelative = true) — then
+// reads its channels. On success the geometry out-params are replaced with the base
+// mesh so the snapshot stores the un-morphed shape plus animated influences instead
+// of baking deformed vertices every frame.
+static bool TryExtractMorphTargets(
+    INode* meshNode,
+    TimeValue t,
+    std::vector<float>& verts,
+    std::vector<float>& uvs,
+    std::vector<float>& norms,
+    std::vector<int>& indices,
+    std::vector<MatGroup>& groups,
+    MorphTargetSet& outMorph) {
+    outMorph.channels.clear();
+
+    ModifierStackMatch morphMatch;
+    if (!FindModifierStackMatchOnNode(meshNode, MR3_CLASS_ID, morphMatch) ||
+        !morphMatch.mod ||
+        !morphMatch.mod->IsEnabled()) {
+        return false;
+    }
+    Modifier* morphMod = morphMatch.mod;
+    IMorpher* morpher = static_cast<IMorpher*>(morphMod->GetInterface(I_MORPHER_INTERFACE_ID));
+    if (!morpher) return false;
+
+    // Disable the Morpher to capture the rest mesh; controlIdx maps split render
+    // vertices back to control vertices for channel delta lookup.
+    const int morphWasEnabled = morphMod->IsEnabled();
+    morphMod->DisableMod();
+    std::vector<float> baseVerts, baseUvs, baseNorms;
+    std::vector<int> baseIdx, controlIdx;
+    std::vector<MatGroup> baseGroups;
+    const bool baseOk = ExtractEvaluatedMeshForSnapshot(
+        meshNode, t, baseVerts, baseUvs, baseIdx, baseGroups, &baseNorms, &controlIdx);
+    RestoreModifierEnabled(morphMod, morphWasEnabled);
+    if (!baseOk) return false;
+
+    const int vCount = static_cast<int>(baseVerts.size() / 3);
+    if (vCount <= 0) return false;
+    if (static_cast<int>(controlIdx.size()) != vCount) return false;
+
+    // Highest control index referenced = control-point count for the coverage guard.
+    int baseControlPointCount = 0;
+    for (int ci : controlIdx) {
+        if (ci + 1 > baseControlPointCount) baseControlPointCount = ci + 1;
+    }
+    if (baseControlPointCount <= 0) baseControlPointCount = vCount;
+
+    ExtractMorpherChannels(morpher, controlIdx, vCount, baseControlPointCount, t, outMorph);
+    if (outMorph.empty()) return false;
+
+    verts = std::move(baseVerts);
+    uvs = std::move(baseUvs);
+    norms = std::move(baseNorms);
+    indices = std::move(baseIdx);
+    groups = std::move(baseGroups);
     return true;
 }
 

@@ -122,6 +122,43 @@ static std::wstring ResolveBrowserRenderOutputPath(Bitmap* bitmap) {
     return NormalizeBrowserRenderPath(outputPath);
 }
 
+static int TimeValueToFrame(TimeValue t, int ticksPerFrame) {
+    if (ticksPerFrame <= 0) ticksPerFrame = std::max(1, GetTicksPerFrame());
+    return static_cast<int>(t / ticksPerFrame);
+}
+
+static void ResolveBrowserRenderFrameRange(TimeValue renderTime,
+                                           int& startFrame,
+                                           int& endFrame,
+                                           int& step) {
+    Interface* ip = GetCOREInterface();
+    const int ticksPerFrame = std::max(1, GetTicksPerFrame());
+    startFrame = TimeValueToFrame(renderTime, ticksPerFrame);
+    endFrame = startFrame;
+    step = 1;
+    if (!ip) return;
+
+    switch (ip->GetRendTimeType()) {
+        case REND_TIMESEGMENT: {
+            const Interval animRange = ip->GetAnimRange();
+            startFrame = TimeValueToFrame(animRange.Start(), ticksPerFrame);
+            endFrame = TimeValueToFrame(animRange.End(), ticksPerFrame);
+            break;
+        }
+        case REND_TIMERANGE:
+            startFrame = TimeValueToFrame(ip->GetRendStart(), ticksPerFrame);
+            endFrame = TimeValueToFrame(ip->GetRendEnd(), ticksPerFrame);
+            break;
+        case REND_TIMESINGLE:
+        case REND_TIMEPICKUP:
+        default:
+            break;
+    }
+
+    const int nthFrame = std::max(1, ip->GetRendNThFrame());
+    step = (endFrame >= startFrame) ? nthFrame : -nthFrame;
+}
+
 // ══════════════════════════════════════════════════════════════
 //  ThreeJS Interactive Render (ActiveShade)
 //  Opens the MaxJS panel as the "render" output.
@@ -211,6 +248,7 @@ class ThreeJSRenderer : public Renderer {
     bool sequenceStarted_ = false;
     int renderStartFrame_ = 0;
     int renderEndFrame_ = 0;
+    int renderFrameStep_ = 1;
     int pathTracingSamplesPerFrame_ = kPathTracingDefaultSamplesPerFrame;
     float pathTracingGIClamp_ = kPathTracingDefaultGIClamp;
     bool pathTracingFreezeSync_ = false;
@@ -276,10 +314,7 @@ public:
         renderViewNode_ = vnode;
         haveRenderViewParams_ = viewPar != nullptr;
         if (viewPar) renderViewParams_ = *viewPar;
-        Interface* ip = GetCOREInterface();
-        const int ticksPerFrame = std::max(1, GetTicksPerFrame());
-        renderStartFrame_ = ip ? (ip->GetRendStart() / ticksPerFrame) : 0;
-        renderEndFrame_ = ip ? (ip->GetRendEnd() / ticksPerFrame) : renderStartFrame_;
+        ResolveBrowserRenderFrameRange(0, renderStartFrame_, renderEndFrame_, renderFrameStep_);
         if (inMaterialEditor_) {
             return 1;
         }
@@ -327,9 +362,9 @@ public:
         if (sequenceStarted_) return 1;
         sequenceStarted_ = true;
 
+        ResolveBrowserRenderFrameRange(t, renderStartFrame_, renderEndFrame_, renderFrameStep_);
         const std::wstring outputPath = ResolveBrowserRenderOutputPath(tobm);
         const std::wstring mime = BrowserMimeForRenderPath(outputPath);
-        const int step = renderEndFrame_ >= renderStartFrame_ ? 1 : -1;
         const bool ok = StartMaxJSRenderSequence(
             outputPath,
             mime,
@@ -337,7 +372,7 @@ public:
             h,
             renderStartFrame_,
             renderEndFrame_,
-            step,
+            renderFrameStep_,
             renderViewNode_,
             effectiveViewParams);
         return ok ? 1 : 0;

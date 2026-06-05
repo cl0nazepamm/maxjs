@@ -23,6 +23,16 @@
             font: 11px/1.5 'Consolas', monospace;
         }
     </style>
+    <!--
+        WebGPU snapshot import-map trap:
+        keep @takram package scopes below. Takram's shared/non-WebGPU entrypoints
+        import classic Three exports such as WebGLRenderer, so bare "three" inside
+        @takram must resolve to three.module.js even on snapshot_webgpu.html.
+        The WebGPU-specific Takram entrypoints still resolve three/webgpu and
+        three/tsl explicitly. Removing these scopes makes geospatial sky fail with:
+        "The requested module 'three' does not provide an export named
+        'WebGLRenderer'".
+    -->
     <script type="importmap">
     {
         "imports": {

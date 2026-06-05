@@ -761,6 +761,7 @@ public:
         bool includeGLTFs = true;
         bool includeInstances = true;
         bool includeUnusedChannels = true;  // export stray vertex-color map channels (>= 3); UI defaults this off for a lean export
+        bool includeAllMorphTargets = false; // keep zero unkeyed Morpher channels; UI defaults this off for a lean export
         bool includeDebugPayload = false;
         bool includeSnapshotUi = true;
         bool includeRuntimeScene = true;

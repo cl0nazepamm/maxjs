@@ -420,11 +420,15 @@ body.light-mode .dock-drag-handle.dragging::after { background: rgba(0, 0, 0, 0.
     font: 10px/1 'Segoe UI', system-ui, sans-serif;
 }
 .snapshot-actions {
-    display: flex;
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: 6px;
 }
 .snapshot-actions button {
-    flex: 1 1 0;
+    min-width: 0;
+}
+.snapshot-actions button:nth-child(3) {
+    grid-column: 1 / -1;
 }
 .snapshot-location {
     color: #b9c7d9;
@@ -439,6 +443,151 @@ body.light-mode .dock-drag-handle.dragging::after { background: rgba(0, 0, 0, 0.
     color: #777;
     font-size: 9px;
     line-height: 1.35;
+}
+.snapshot-diagnostics {
+    position: fixed;
+    inset: 0;
+    z-index: 90;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+    background: rgba(0, 0, 0, 0.58);
+}
+.snapshot-diagnostics-window {
+    width: min(980px, calc(100vw - 48px));
+    max-height: calc(100vh - 48px);
+    display: grid;
+    grid-template-rows: auto minmax(0, 1fr);
+    background: #15171a;
+    color: #d8dde5;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    box-shadow: 0 18px 70px rgba(0, 0, 0, 0.58);
+    overflow: hidden;
+}
+.snapshot-diagnostics-header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 12px 14px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+    background: rgba(255, 255, 255, 0.035);
+}
+.snapshot-diagnostics-title {
+    font: 700 13px/1.2 -apple-system, 'Segoe UI', system-ui, sans-serif;
+    color: #f3f5f8;
+}
+.snapshot-diagnostics-path {
+    margin-top: 4px;
+    max-width: 720px;
+    color: #8f9aaa;
+    font: 10px/1.35 Consolas, 'Cascadia Mono', monospace;
+    overflow-wrap: anywhere;
+    user-select: text;
+}
+.snapshot-diagnostics button {
+    background: rgba(255, 255, 255, 0.06);
+    color: #d8dde5;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    padding: 5px 10px;
+    font: 600 10px/1 -apple-system, 'Segoe UI', system-ui, sans-serif;
+    text-transform: uppercase;
+    cursor: pointer;
+}
+.snapshot-diagnostics button:hover {
+    background: rgba(255, 255, 255, 0.11);
+}
+.snapshot-diagnostics-body {
+    display: grid;
+    gap: 10px;
+    padding: 12px;
+    overflow: auto;
+}
+.snapshot-diagnostics-grid {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 10px;
+}
+.snapshot-diagnostics-card,
+.snapshot-diagnostics-table,
+.snapshot-diagnostics-alert {
+    background: rgba(255, 255, 255, 0.035);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+}
+.snapshot-diagnostics-card,
+.snapshot-diagnostics-table {
+    padding: 10px;
+}
+.snapshot-diagnostics-alert {
+    padding: 8px 10px;
+    color: #ffd58a;
+    border-color: rgba(255, 190, 90, 0.28);
+    background: rgba(255, 170, 50, 0.08);
+    font: 11px/1.45 -apple-system, 'Segoe UI', system-ui, sans-serif;
+}
+.snapshot-diagnostics h3 {
+    margin: 0 0 8px;
+    color: #f0f2f5;
+    font: 700 10px/1.2 -apple-system, 'Segoe UI', system-ui, sans-serif;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+}
+.snapshot-diagnostics-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 8px;
+    align-items: baseline;
+    padding: 4px 0;
+    border-top: 1px solid rgba(255, 255, 255, 0.055);
+}
+.snapshot-diagnostics-row:first-of-type {
+    border-top: 0;
+}
+.snapshot-diagnostics-row span {
+    color: #8f9aaa;
+    overflow-wrap: anywhere;
+}
+.snapshot-diagnostics-row strong {
+    color: #f3f5f8;
+    font-weight: 650;
+    text-align: right;
+    white-space: nowrap;
+}
+.snapshot-diagnostics table {
+    width: 100%;
+    border-collapse: collapse;
+    table-layout: fixed;
+    font: 10px/1.35 -apple-system, 'Segoe UI', system-ui, sans-serif;
+}
+.snapshot-diagnostics th,
+.snapshot-diagnostics td {
+    padding: 5px 6px;
+    border-top: 1px solid rgba(255, 255, 255, 0.06);
+    text-align: left;
+    vertical-align: top;
+    overflow-wrap: anywhere;
+}
+.snapshot-diagnostics th {
+    color: #8f9aaa;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+.snapshot-diagnostics td {
+    color: #d8dde5;
+}
+@media (max-width: 820px) {
+    .snapshot-diagnostics {
+        padding: 10px;
+    }
+    .snapshot-diagnostics-window {
+        width: calc(100vw - 20px);
+        max-height: calc(100vh - 20px);
+    }
+    .snapshot-diagnostics-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
 }
 /* ── FX Sections ───────────────────────────── */
 .fx-section {
@@ -1049,6 +1198,47 @@ body.light-mode .snapshot-inline input[type="number"] {
     color: #222;
     border: 1px solid rgba(0, 0, 0, 0.18);
     box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.08);
+}
+body.light-mode .snapshot-diagnostics {
+    background: rgba(30, 30, 30, 0.38);
+}
+body.light-mode .snapshot-diagnostics-window {
+    background: #d2d2d2;
+    color: #222;
+    border-color: #777;
+    box-shadow: 0 18px 60px rgba(0, 0, 0, 0.4);
+}
+body.light-mode .snapshot-diagnostics-header {
+    background: rgba(255, 255, 255, 0.35);
+    border-bottom-color: rgba(0, 0, 0, 0.13);
+}
+body.light-mode .snapshot-diagnostics-title,
+body.light-mode .snapshot-diagnostics-row strong,
+body.light-mode .snapshot-diagnostics h3 {
+    color: #1f1f1f;
+}
+body.light-mode .snapshot-diagnostics-path,
+body.light-mode .snapshot-diagnostics-row span,
+body.light-mode .snapshot-diagnostics th {
+    color: #565656;
+}
+body.light-mode .snapshot-diagnostics button {
+    background: linear-gradient(180deg, #d8d8d8 0%, #b4b4b4 100%);
+    color: #333;
+    border-color: #888;
+}
+body.light-mode .snapshot-diagnostics-card,
+body.light-mode .snapshot-diagnostics-table {
+    background: rgba(255, 255, 255, 0.34);
+    border-color: rgba(0, 0, 0, 0.1);
+}
+body.light-mode .snapshot-diagnostics-row,
+body.light-mode .snapshot-diagnostics th,
+body.light-mode .snapshot-diagnostics td {
+    border-top-color: rgba(0, 0, 0, 0.08);
+}
+body.light-mode .snapshot-diagnostics td {
+    color: #2a2a2a;
 }
 
 body.light-mode .sidepanel::-webkit-scrollbar-thumb {

@@ -456,6 +456,7 @@
         import { createCanvasPanel } from './js/canvas_panel.js';
         import { createShaderLabFx } from './js/shader_lab_fx.js';
         import { installDockDragHide } from './js/dock_drag.js';
+        import { analyzeSnapshotPayload, formatBytes, formatPercent } from './js/snapshot_diagnostics.js';
         import {
             copyMaxArrayToWorld,
             copyMaxComponentsToWorld,
@@ -10163,6 +10164,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             includeAudios: true,
             includeInstances: true,
             includeUnusedChannels: false,
+            includeAllMorphTargets: false,
             includeDebugPayload: false,
             includeSnapshotUi: true,
             includeRuntimeScene: true,
@@ -10230,6 +10232,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         let pendingSnapshotRequestId = null;
         let pendingSnapshotServeRequestId = null;
         let pendingSnapshotServeAfterExport = false;
+        let pendingSnapshotAnalyze = false;
         let lastSnapshotExportPath = '';
         let lastSnapshotServeUrl = '';
 
@@ -10292,6 +10295,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                             <label class="fx-check" for="snapshot-includeAudios"><span>Audio</span><input id="snapshot-includeAudios" type="checkbox"></label>
                             <label class="fx-check" for="snapshot-includeInstances"><span>Instances</span><input id="snapshot-includeInstances" type="checkbox"></label>
                             <label class="fx-check" for="snapshot-includeUnusedChannels" title="Export stray vertex-color map channels (≥3, e.g. extra UVW sets). Off = lean export; tick only if a material reads maxjs_vc_N."><span>Unused VC Channels</span><input id="snapshot-includeUnusedChannels" type="checkbox"></label>
+                            <label class="fx-check" for="snapshot-includeAllMorphTargets" title="Keep zero unkeyed Morpher channels in the snapshot. Off prunes channels that sit at 0 and have no keys."><span>All Morph Channels</span><input id="snapshot-includeAllMorphTargets" type="checkbox"></label>
                             <label class="fx-check" for="snapshot-includeDebugPayload"><span>Debug Payload</span><input id="snapshot-includeDebugPayload" type="checkbox"></label>
                             <label class="fx-check" for="snapshot-includeSnapshotUi"><span>Viewer UI State</span><input id="snapshot-includeSnapshotUi" type="checkbox"></label>
                             <label class="fx-check" for="snapshot-includeRuntimeScene"><span>JS Runtime Scene</span><input id="snapshot-includeRuntimeScene" type="checkbox"></label>
@@ -10333,6 +10337,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                         <div class="snapshot-actions">
                             <button id="snapshotExportBtn" type="button">Export Snapshot</button>
                             <button id="snapshotServeBtn" type="button">Serve Snapshot</button>
+                            <button id="snapshotAnalyzeBtn" type="button">Analyze Snapshot</button>
                         </div>
                         <div id="snapshotExportLocation" class="snapshot-location" hidden></div>
                         <div class="snapshot-note">Settings persist across sessions.</div>
@@ -10347,6 +10352,9 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             });
             snapshotPanel.querySelector('#snapshotServeBtn')?.addEventListener('click', () => {
                 void serveSnapshotWithSettings();
+            });
+            snapshotPanel.querySelector('#snapshotAnalyzeBtn')?.addEventListener('click', () => {
+                void analyzeSnapshotFromHost();
             });
 
             for (const key of Object.keys(SNAPSHOT_SETTINGS_DEFAULTS)) {
@@ -10365,10 +10373,12 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             const effective = getSnapshotExportSettings();
             const exportButton = snapshotPanel.querySelector('#snapshotExportBtn');
             const serveButton = snapshotPanel.querySelector('#snapshotServeBtn');
+            const analyzeButton = snapshotPanel.querySelector('#snapshotAnalyzeBtn');
             const status = snapshotPanel.querySelector('#snapshotPanelStatus');
             const location = snapshotPanel.querySelector('#snapshotExportLocation');
             if (status) {
                 if (!window.chrome?.webview) status.textContent = 'Available only inside max.js';
+                else if (pendingSnapshotAnalyze) status.textContent = 'Analyzing snapshot...';
                 else if (pendingSnapshotServeRequestId) status.textContent = 'Serving snapshot...';
                 else if (pendingSnapshotRequestId) status.textContent = 'Writing snapshot...';
                 else if (lastSnapshotServeUrl) status.textContent = 'Snapshot served';
@@ -10391,12 +10401,16 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 }
             }
             if (exportButton) {
-                exportButton.disabled = !window.chrome?.webview || !!pendingSnapshotRequestId || !!pendingSnapshotServeRequestId;
+                exportButton.disabled = !window.chrome?.webview || !!pendingSnapshotRequestId || !!pendingSnapshotServeRequestId || pendingSnapshotAnalyze;
                 exportButton.textContent = pendingSnapshotRequestId ? 'Writing...' : 'Export Snapshot';
             }
             if (serveButton) {
-                serveButton.disabled = !window.chrome?.webview || !!pendingSnapshotRequestId || !!pendingSnapshotServeRequestId;
+                serveButton.disabled = !window.chrome?.webview || !!pendingSnapshotRequestId || !!pendingSnapshotServeRequestId || pendingSnapshotAnalyze;
                 serveButton.textContent = pendingSnapshotServeRequestId ? 'Serving...' : 'Serve Snapshot';
+            }
+            if (analyzeButton) {
+                analyzeButton.disabled = !window.chrome?.webview || !!pendingSnapshotRequestId || !!pendingSnapshotServeRequestId || pendingSnapshotAnalyze;
+                analyzeButton.textContent = pendingSnapshotAnalyze ? 'Analyzing...' : 'Analyze Snapshot';
             }
 
             for (const [key, defaultValue] of Object.entries(SNAPSHOT_SETTINGS_DEFAULTS)) {
@@ -10428,6 +10442,178 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             if (cameraInput) cameraInput.disabled = !animationsEnabled;
             const stepInput = snapshotPanel.querySelector('#snapshot-animationSampleStepFrames');
             if (stepInput) stepInput.disabled = !animationsEnabled;
+        }
+
+        function escapeSnapshotDiagnosticHtml(value) {
+            return String(value ?? '').replace(/[&<>"']/g, ch => ({
+                '&': '&amp;',
+                '<': '&lt;',
+                '>': '&gt;',
+                '"': '&quot;',
+                "'": '&#39;',
+            }[ch]));
+        }
+
+        function snapshotDiagnosticRow(label, value) {
+            return `
+                <div class="snapshot-diagnostics-row">
+                    <span>${escapeSnapshotDiagnosticHtml(label)}</span>
+                    <strong>${escapeSnapshotDiagnosticHtml(value)}</strong>
+                </div>
+            `;
+        }
+
+        function renderSnapshotDiagnosticsOverlay(report, path) {
+            const sceneBinBytes = report.files.sceneBin || 0;
+            const channelRows = Object.entries(report.sceneBinChannels || {})
+                .filter(([, bytes]) => bytes > 0)
+                .sort((a, b) => b[1] - a[1])
+                .map(([name, bytes]) => `
+                    <tr>
+                        <td>${escapeSnapshotDiagnosticHtml(name)}</td>
+                        <td>${escapeSnapshotDiagnosticHtml(formatBytes(bytes))}</td>
+                        <td>${escapeSnapshotDiagnosticHtml(formatPercent(bytes, sceneBinBytes))}</td>
+                    </tr>
+                `).join('');
+            const morphRows = (report.morphNodes || []).slice(0, 18).map(node => `
+                <tr>
+                    <td>${escapeSnapshotDiagnosticHtml(node.name)}</td>
+                    <td>${escapeSnapshotDiagnosticHtml(node.channels)}</td>
+                    <td>${escapeSnapshotDiagnosticHtml(node.nonzero)}</td>
+                    <td>${escapeSnapshotDiagnosticHtml(formatBytes(node.bytes))}</td>
+                    <td>${escapeSnapshotDiagnosticHtml((node.names || []).join(', '))}</td>
+                </tr>
+            `).join('');
+            const topRows = (report.topNodes || []).map(node => {
+                const rigData = [
+                    node.skin ? 'Skin' : '',
+                    node.morphChannels ? `Morph ${node.morphChannels}` : '',
+                ].filter(Boolean).join(' + ');
+                return `
+                    <tr>
+                        <td>${escapeSnapshotDiagnosticHtml(node.name)}</td>
+                        <td>${escapeSnapshotDiagnosticHtml(formatBytes(node.bytes))}</td>
+                        <td>${escapeSnapshotDiagnosticHtml(Math.round(node.verts || 0).toLocaleString())}</td>
+                        <td>${escapeSnapshotDiagnosticHtml(rigData)}</td>
+                    </tr>
+                `;
+            }).join('');
+            const vertexColor = report.vertexColor || {};
+            const warnings = [];
+            if (report.overlap > 0) warnings.push(`${formatBytes(report.overlap)} overlapping scene.bin ranges`);
+            if (report.gap > 0) warnings.push(`${formatBytes(report.gap)} unaccounted scene.bin gaps`);
+            if ((report.unknownTypes || []).length) warnings.push(`Unknown buffer types: ${report.unknownTypes.join(', ')}`);
+            if (vertexColor.bytesStoredAsF32 > 0) warnings.push(`${formatBytes(vertexColor.bytesStoredAsF32)} vertex colors stored as f32`);
+
+            return `
+                <div class="snapshot-diagnostics-window" role="dialog" aria-modal="true" aria-labelledby="snapshotDiagnosticsTitle">
+                    <div class="snapshot-diagnostics-header">
+                        <div>
+                            <div id="snapshotDiagnosticsTitle" class="snapshot-diagnostics-title">Snapshot Diagnostics</div>
+                            <div class="snapshot-diagnostics-path">${escapeSnapshotDiagnosticHtml(path || 'Last exported snapshot')}</div>
+                        </div>
+                        <button id="snapshotDiagnosticsClose" type="button" aria-label="Close snapshot diagnostics">Close</button>
+                    </div>
+                    <div class="snapshot-diagnostics-body">
+                        ${warnings.length ? `<section class="snapshot-diagnostics-alert">${warnings.map(escapeSnapshotDiagnosticHtml).join('<br>')}</section>` : ''}
+                        <section class="snapshot-diagnostics-grid">
+                            <div class="snapshot-diagnostics-card">
+                                <h3>Files</h3>
+                                ${snapshotDiagnosticRow('snapshot.json', formatBytes(report.files.snapshotJson))}
+                                ${snapshotDiagnosticRow('scene.bin', formatBytes(report.files.sceneBin))}
+                                ${snapshotDiagnosticRow('scene_anim.bin', report.files.sceneAnimBin ? formatBytes(report.files.sceneAnimBin) : 'none')}
+                            </div>
+                            <div class="snapshot-diagnostics-card">
+                                <h3>Scene</h3>
+                                ${snapshotDiagnosticRow('Nodes', report.totals.nodes.toLocaleString())}
+                                ${snapshotDiagnosticRow('Materials', report.totals.materials.toLocaleString())}
+                                ${snapshotDiagnosticRow('Vertices', report.totals.verts.toLocaleString())}
+                                ${snapshotDiagnosticRow('Triangles', report.totals.tris.toLocaleString())}
+                                ${snapshotDiagnosticRow('Animation clips', report.totals.animationClips.toLocaleString())}
+                                ${snapshotDiagnosticRow('Morph tracks', report.totals.morphTracks.toLocaleString())}
+                            </div>
+                            <div class="snapshot-diagnostics-card">
+                                <h3>Layout</h3>
+                                ${snapshotDiagnosticRow('Accounted bytes', `${formatBytes(report.accounted)} (${formatPercent(report.accounted, sceneBinBytes)})`)}
+                                ${snapshotDiagnosticRow('High water', `${formatBytes(report.highWater)} (${formatPercent(report.highWater, sceneBinBytes)})`)}
+                                ${snapshotDiagnosticRow('Gaps', formatBytes(report.gap))}
+                                ${snapshotDiagnosticRow('Overlaps', formatBytes(report.overlap))}
+                            </div>
+                            <div class="snapshot-diagnostics-card">
+                                <h3>Vertex Colors</h3>
+                                ${snapshotDiagnosticRow('Total', formatBytes(vertexColor.total))}
+                                ${snapshotDiagnosticRow('Channels', (vertexColor.channels || 0).toLocaleString())}
+                                ${snapshotDiagnosticRow('UV2 duplicates', formatBytes(vertexColor.bytesOnUv2Duplicates))}
+                                ${snapshotDiagnosticRow('Channels >= 3', formatBytes(vertexColor.bytesOnChannelsGE3))}
+                            </div>
+                        </section>
+                        <section class="snapshot-diagnostics-table">
+                            <h3>scene.bin Channels</h3>
+                            <table><thead><tr><th>Channel</th><th>Bytes</th><th>Share</th></tr></thead><tbody>${channelRows || '<tr><td colspan="3">No binary channels found</td></tr>'}</tbody></table>
+                        </section>
+                        <section class="snapshot-diagnostics-table">
+                            <h3>Morph Targets</h3>
+                            <table><thead><tr><th>Node</th><th>Channels</th><th>Nonzero</th><th>Bytes</th><th>Registered Names</th></tr></thead><tbody>${morphRows || '<tr><td colspan="5">No morph targets registered in snapshot</td></tr>'}</tbody></table>
+                        </section>
+                        <section class="snapshot-diagnostics-table">
+                            <h3>Top Nodes By Bytes</h3>
+                            <table><thead><tr><th>Node</th><th>Bytes</th><th>Verts</th><th>Rig Data</th></tr></thead><tbody>${topRows || '<tr><td colspan="4">No node byte data</td></tr>'}</tbody></table>
+                        </section>
+                    </div>
+                </div>
+            `;
+        }
+
+        function closeSnapshotDiagnosticsOverlay() {
+            const overlay = document.getElementById('snapshotDiagnosticsOverlay');
+            if (overlay) overlay.remove();
+            document.removeEventListener('keydown', handleSnapshotDiagnosticsKeydown);
+        }
+
+        function handleSnapshotDiagnosticsKeydown(event) {
+            if (event.key === 'Escape') closeSnapshotDiagnosticsOverlay();
+        }
+
+        function showSnapshotDiagnosticsOverlay(report, path) {
+            closeSnapshotDiagnosticsOverlay();
+            const overlay = document.createElement('div');
+            overlay.id = 'snapshotDiagnosticsOverlay';
+            overlay.className = 'snapshot-diagnostics';
+            overlay.innerHTML = renderSnapshotDiagnosticsOverlay(report, path);
+            overlay.addEventListener('click', event => {
+                if (event.target === overlay) closeSnapshotDiagnosticsOverlay();
+            });
+            document.body.appendChild(overlay);
+            document.getElementById('snapshotDiagnosticsClose')?.addEventListener('click', closeSnapshotDiagnosticsOverlay);
+            document.addEventListener('keydown', handleSnapshotDiagnosticsKeydown);
+        }
+
+        async function analyzeSnapshotFromHost() {
+            if (!window.chrome?.webview || pendingSnapshotRequestId || pendingSnapshotServeRequestId || pendingSnapshotAnalyze) return;
+            pendingSnapshotAnalyze = true;
+            syncSnapshotPanel();
+            setInfoText('max.js - analyzing snapshot...');
+            try {
+                const msg = await requestHostAction('snapshot_analyze', { path: lastSnapshotExportPath || '' }, 120000);
+                const report = analyzeSnapshotPayload({
+                    snapshotJson: msg.snapshotJson,
+                    files: {
+                        snapshotJsonBytes: msg.snapshotJsonBytes,
+                        sceneBinBytes: msg.sceneBinBytes,
+                        sceneAnimBytes: msg.sceneAnimBytes,
+                    },
+                    options: { top: 18, morphNameLimit: 24 },
+                });
+                const analyzedPath = msg.path || lastSnapshotExportPath || '';
+                lastSnapshotExportPath = analyzedPath || lastSnapshotExportPath;
+                showSnapshotDiagnosticsOverlay(report, analyzedPath);
+                setInfoText('max.js - snapshot diagnostics ready');
+            } catch (error) {
+                reportBridgeError('snapshot analyze', error);
+            } finally {
+                pendingSnapshotAnalyze = false;
+                syncSnapshotPanel();
+            }
         }
 
         async function exportSnapshotWithSettings(options = {}) {

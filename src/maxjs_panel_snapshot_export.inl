@@ -971,7 +971,7 @@
                                 snapshotNode.uv2s.clear();
                             }
                         }
-                        if (!snapshotNode.morphTargets.empty()) {
+                        if (!options.includeAllMorphTargets && !snapshotNode.morphTargets.empty()) {
                             PruneZeroUnkeyedMorphTargets(
                                 snapshotNode.node,
                                 snapshotAnimRange,

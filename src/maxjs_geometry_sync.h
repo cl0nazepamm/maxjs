@@ -94,6 +94,43 @@ static UVVert DefaultVertexColorValue(int channel) {
     return UVVert(0.0f, 0.0f, 0.0f);
 }
 
+static bool IsDefaultVertexColorAttribute(const VertexColorAttributeRecord& attr,
+                                          float epsilon = 1.0e-6f) {
+    if (attr.values.empty() || (attr.values.size() % 4) != 0) return false;
+
+    const bool alphaChannel = attr.channel == MAP_ALPHA;
+    for (size_t i = 0; i < attr.values.size(); i += 4) {
+        const float expectedRgb = alphaChannel ? 1.0f : 0.0f;
+        const float expectedAlpha = 1.0f;
+        const float r = attr.values[i + 0];
+        const float g = attr.values[i + 1];
+        const float b = attr.values[i + 2];
+        const float a = attr.values[i + 3];
+        if (!std::isfinite(r) || !std::isfinite(g) ||
+            !std::isfinite(b) || !std::isfinite(a)) {
+            return false;
+        }
+        if (std::fabs(r - expectedRgb) > epsilon ||
+            std::fabs(g - expectedRgb) > epsilon ||
+            std::fabs(b - expectedRgb) > epsilon ||
+            std::fabs(a - expectedAlpha) > epsilon) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void TrimDefaultVertexColorAttributes(std::vector<VertexColorAttributeRecord>& attrs) {
+    attrs.erase(
+        std::remove_if(
+            attrs.begin(),
+            attrs.end(),
+            [](const VertexColorAttributeRecord& attr) {
+                return attr.values.empty() || IsDefaultVertexColorAttribute(attr);
+            }),
+        attrs.end());
+}
+
 static void WriteVertexColorAttributesJson(std::wostringstream& ss,
                                            const std::vector<VertexColorAttributeRecord>& attrs) {
     if (attrs.empty()) return;

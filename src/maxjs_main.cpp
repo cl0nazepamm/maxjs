@@ -223,7 +223,7 @@ public:
         return true;
     }
 
-    // Returns the projects root folder (parent of "active", "bee", etc.)
+    // Returns the projects root folder (parent of "active" and named project folders).
     std::wstring GetProjectsRoot() {
         // Parent of GetProjectDir(). If no scene is saved, falls back to the
         // plugin's sibling projects folder.
@@ -259,7 +259,7 @@ public:
 
     // Get the export dist folder for a named project (or derive from scene name).
     // Lands next to the .max file: `<sceneDir>\<name>\dist`. If the scene folder
-    // is already named after the scene (e.g. `projects\flowerandbee\flowerandbee.max`)
+    // is already named after the scene (e.g. `projects\my_scene\my_scene.max`)
     // we skip the extra wrapper and use `<sceneDir>\dist` so a matching folder
     // doesn't get nested twice.
     std::wstring GetNamedSnapshotDir(const std::wstring& exportName) {
@@ -768,6 +768,7 @@ public:
         bool includeDisabledLayers = false;
         bool copyAssets = true;
         bool includeRapierVendor = false;
+        bool includeGeospatialSky = false;  // bundle @takram atmosphere + three/src for the planetary sky; off keeps exports lean
         bool includeAnimations = true;
         bool includeTransformAnimation = true;
         bool includeGeometryAnimation = true;

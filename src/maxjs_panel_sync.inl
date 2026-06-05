@@ -1986,6 +1986,7 @@
             ExtractJsonBool(msg, L"includeDisabledLayers", options.includeDisabledLayers);
             ExtractJsonBool(msg, L"copyAssets", options.copyAssets);
             ExtractJsonBool(msg, L"includeRapierVendor", options.includeRapierVendor);
+            ExtractJsonBool(msg, L"includeGeospatialSky", options.includeGeospatialSky);
             ExtractJsonBool(msg, L"includeAnimations", options.includeAnimations);
             ExtractJsonBool(msg, L"includeTransformAnimation", options.includeTransformAnimation);
             ExtractJsonBool(msg, L"includeGeometryAnimation", options.includeGeometryAnimation);

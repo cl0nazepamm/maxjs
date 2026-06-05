@@ -107,6 +107,7 @@
                                  const std::wstring& outDir,
                                  bool copySparkDist,
                                  bool copyRapierVendor,
+                                 bool copyGeospatialVendor,
                                  std::wstring& error) {
         const std::wstring snapshotHtml = webDir + L"\\snapshot.html";
         if (!FileExists(snapshotHtml)) {
@@ -167,6 +168,75 @@
             return false;
         }
 
+        // Geospatial / planetary atmosphere sky vendor (@takram + three/src node
+        // sources). Heavy (~6 MB) and only consumed by geospatial_sky.js when a
+        // scene runs the planetary sky model, so it is gated behind its own export
+        // toggle to keep ordinary snapshots lean.
+        if (copyGeospatialVendor) {
+            const std::wstring takramRoot = webDir + L"\\node_modules\\@takram";
+            const std::wstring takramOutRoot = outDir + L"\\node_modules\\@takram";
+            const std::wstring atmosphereRoot = takramRoot + L"\\three-atmosphere";
+            const std::wstring geospatialRoot = takramRoot + L"\\three-geospatial";
+            if (!DirectoryExists(atmosphereRoot + L"\\build")) {
+                error = L"Snapshot runtime dependency missing: @takram/three-atmosphere/build";
+                return false;
+            }
+            if (!DirectoryExists(atmosphereRoot + L"\\assets")) {
+                error = L"Snapshot runtime dependency missing: @takram/three-atmosphere/assets";
+                return false;
+            }
+            if (!DirectoryExists(geospatialRoot + L"\\build")) {
+                error = L"Snapshot runtime dependency missing: @takram/three-geospatial/build";
+                return false;
+            }
+            if (!CopyDirectoryRecursive(
+                    atmosphereRoot + L"\\build",
+                    takramOutRoot + L"\\three-atmosphere\\build")) {
+                error = L"Failed to copy snapshot runtime three-atmosphere build";
+                return false;
+            }
+            if (!CopyDirectoryRecursive(
+                    atmosphereRoot + L"\\assets",
+                    takramOutRoot + L"\\three-atmosphere\\assets")) {
+                error = L"Failed to copy snapshot runtime three-atmosphere assets";
+                return false;
+            }
+            if (!CopyDirectoryRecursive(
+                    geospatialRoot + L"\\build",
+                    takramOutRoot + L"\\three-geospatial\\build")) {
+                error = L"Failed to copy snapshot runtime three-geospatial build";
+                return false;
+            }
+
+            // The takram WebGPU builds (three-atmosphere/build/webgpu.js,
+            // three-geospatial/build/webgpu.js) deep-import three node sources such
+            // as `three/src/nodes/core/NodeUtils.js`. The bundled vendor three.js is
+            // a single-file build with no `src/` tree, so the importmap resolves
+            // `three/src/` to node_modules/three/src — which must ship alongside the
+            // takram builds, or the WebGPU sky fails with a 404 on NodeUtils.js.
+            const std::wstring threeSrc = webDir + L"\\node_modules\\three\\src";
+            if (!DirectoryExists(threeSrc)) {
+                error = L"Snapshot runtime dependency missing: node_modules/three/src";
+                return false;
+            }
+            if (!CopyDirectoryRecursive(threeSrc, outDir + L"\\node_modules\\three\\src")) {
+                error = L"Failed to copy snapshot runtime three.js node sources (three/src)";
+                return false;
+            }
+
+            const std::wstring postprocessingBuild = webDir + L"\\node_modules\\postprocessing\\build";
+            if (!DirectoryExists(postprocessingBuild)) {
+                error = L"Snapshot runtime dependency missing: postprocessing/build";
+                return false;
+            }
+            if (!CopyDirectoryRecursive(
+                    postprocessingBuild,
+                    outDir + L"\\node_modules\\postprocessing\\build")) {
+                error = L"Failed to copy snapshot runtime postprocessing build";
+                return false;
+            }
+        }
+
         const std::wstring outRapierVendor = outDir + L"\\vendor\\rapier";
         if (copyRapierVendor) {
             const std::wstring rapierVendor = webDir + L"\\vendor\\rapier";
@@ -225,6 +295,7 @@
         bool environment = false;
         bool hdri = false;
         bool sky = false;
+        bool geospatialSky = false;
         bool binaryInstances = false;
         std::wstring rendererPref = L"webgl";
         std::vector<std::wstring> postFx;
@@ -786,6 +857,7 @@
         ss << L",\"environment\":" << (features.environment ? L"true" : L"false");
         ss << L",\"hdri\":" << (features.hdri ? L"true" : L"false");
         ss << L",\"sky\":" << (features.sky ? L"true" : L"false");
+        ss << L",\"geospatial_sky\":" << (features.geospatialSky ? L"true" : L"false");
         ss << L",\"binary_instances\":" << (features.binaryInstances ? L"true" : L"false");
         ss << L",\"post_fx\":";
         WriteStringVectorJson(ss, features.postFx);
@@ -977,6 +1049,7 @@
                                 snapshotAnimRange,
                                 snapshotNode.morphTargets);
                         }
+                        TrimDefaultVertexColorAttributes(snapshotNode.vertexColors);
                     }
 
                     if (beautyBakeExportState.active) {
@@ -1346,6 +1419,9 @@
         if (options.includeEnvironment && envData.isSky) {
             runtimeFeatures.environment = true;
             runtimeFeatures.sky = true;
+            runtimeFeatures.geospatialSky =
+                options.includeGeospatialSky &&
+                envData.skyModel == threejs_sky_model_planetary;
             AddUniqueRuntimeFeature(runtimeFeatures.threeAddons, L"Sky");
             AddUniqueRuntimeFeature(runtimeFeatures.threeAddons, L"SkyMesh");
         }
@@ -1518,6 +1594,7 @@
                 outDir,
                 options.includeSplats,
                 options.includeRapierVendor,
+                options.includeGeospatialSky,
                 error)) {
             cleanupOnFail();
             return false;
@@ -1770,4 +1847,3 @@
         }
         return 0;
     }
-

@@ -167,7 +167,7 @@ function normalizeEnv(env, snapshotUi) {
     };
 }
 
-export function createSnapshotEnvironment({ scene, renderer, rootUrl = '.' } = {}) {
+export function createSnapshotEnvironment({ scene, renderer, camera = null, rootUrl = '.', allowGeospatialSky = true } = {}) {
     if (!scene) throw new Error('createSnapshotEnvironment: scene is required');
     if (!renderer) throw new Error('createSnapshotEnvironment: renderer is required');
 
@@ -185,6 +185,7 @@ export function createSnapshotEnvironment({ scene, renderer, rootUrl = '.' } = {
     let envMap = null;
     let lastSignature = '';
     let lastHdriRaw = null;
+    let lastCamera = camera;
     let current = {
         type: 'none',
         enabled: false,
@@ -199,6 +200,7 @@ export function createSnapshotEnvironment({ scene, renderer, rootUrl = '.' } = {
     }
 
     function restoreBackground() {
+        if ('backgroundNode' in scene) scene.backgroundNode = null;
         scene.background = cloneBackground(fallbackBackground);
         if ('backgroundBlurriness' in scene) scene.backgroundBlurriness = 0;
         if ('backgroundIntensity' in scene) scene.backgroundIntensity = 1;
@@ -297,12 +299,13 @@ export function createSnapshotEnvironment({ scene, renderer, rootUrl = '.' } = {
         disposeEnvMap();
         const signature = JSON.stringify(['sky', params.raw?.sky, params.enabled, params.backgroundVisible]);
         if (!skyController || lastSignature !== signature) {
-            lastSignature = signature;
             const mod = await import('./scene_sky.js');
-            skyController ??= mod.createSky({ scene, renderer });
-            skyController.apply(params.raw.sky);
+            skyController ??= mod.createSky({ scene, renderer, allowGeospatialSky });
+            await skyController.apply(params.raw.sky, { camera: lastCamera });
+            lastSignature = signature;
         }
         skyController.setVisible?.(params.enabled);
+        skyController.setBackgroundVisible?.(params.enabled && params.backgroundVisible);
         current = {
             type: 'sky',
             enabled: !!params.enabled,
@@ -385,7 +388,9 @@ export function createSnapshotEnvironment({ scene, renderer, rootUrl = '.' } = {
         current.enabled = next;
         if (current.type === 'sky') {
             skyController?.setVisible?.(next);
+            skyController?.setBackgroundVisible?.(next && current.backgroundVisible);
             current.active = next;
+            if (!next || !current.backgroundVisible) restoreBackground();
         } else if (current.type === 'hdri') {
             applyHdriState({
                 raw: lastHdriRaw,
@@ -401,7 +406,10 @@ export function createSnapshotEnvironment({ scene, renderer, rootUrl = '.' } = {
 
     function setBackgroundVisible(visible) {
         current.backgroundVisible = !!visible;
-        if (current.type === 'hdri') {
+        if (current.type === 'sky') {
+            skyController?.setBackgroundVisible?.(current.enabled && current.backgroundVisible);
+            if (!current.backgroundVisible) restoreBackground();
+        } else if (current.type === 'hdri') {
             if (current.enabled && envMap && current.backgroundVisible) {
                 scene.background = envMap;
             } else {
@@ -418,6 +426,7 @@ export function createSnapshotEnvironment({ scene, renderer, rootUrl = '.' } = {
     }
 
     function update(dt, elapsed, camera) {
+        lastCamera = camera || lastCamera;
         skyController?.update?.(dt, elapsed, camera);
     }
 

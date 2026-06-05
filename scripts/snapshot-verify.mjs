@@ -592,8 +592,8 @@ async function main() {
     for (const d of [args.expected, args.actual]) {
         if (!existsSync(d)) {
             console.error(`error: folder not found: ${d}`);
-            if (/flowerandbee[\\/]dist/.test(d)) {
-                console.error('  (the flowerandbee/dist fixture is not present in this checkout;');
+            if (/[\\/]dist$/.test(d)) {
+                console.error('  (snapshot dist fixture is not present in this checkout;');
                 console.error('   generate a golden snapshot pair before running the gate.)');
             }
             return 2;

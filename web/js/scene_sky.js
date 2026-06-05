@@ -4,13 +4,14 @@
 // handled by project/inlines and should not be replaced by default sky data.
 
 import * as THREE from 'three';
-import { Sky } from 'three/addons/objects/Sky.js';
-import { SkyMesh } from 'three/addons/objects/SkyMesh.js';
 
-import { createGeospatialSkyController } from './geospatial_sky.js';
 import { copyMaxComponentsToWorld } from './max_basis.js';
 
 const SKY_MODEL_PLANETARY = 1;
+
+let legacySkyModulePromise = null;
+let nodeSkyModulePromise = null;
+let geospatialSkyModulePromise = null;
 
 const SKY_FALLBACKS = Object.freeze({
     turbidity: 10,
@@ -47,7 +48,7 @@ function numberOr(value, fallback) {
     return Number.isFinite(n) ? n : fallback;
 }
 
-export function createSky({ scene, renderer }) {
+export function createSky({ scene, renderer, allowGeospatialSky = true } = {}) {
     if (!scene) throw new Error('createSky: scene is required');
     if (!renderer) throw new Error('createSky: renderer is required');
 
@@ -63,13 +64,14 @@ export function createSky({ scene, renderer }) {
     let lastSig = '';
     let lastRawParams = null;
     let visible = true;
+    let backgroundVisible = true;
     let planetaryActive = false;
     const isWebGpuRenderer = typeof THREE.WebGPURenderer === 'function' && renderer instanceof THREE.WebGPURenderer;
     const rendererBackendLabel = String(renderer?.userData?.maxjsBackendLabel || '');
     const useLegacySky = !isWebGpuRenderer;
-    const allowGeospatialSky = rendererBackendLabel
+    const allowGeospatialSkyRuntime = allowGeospatialSky && (rendererBackendLabel
         ? rendererBackendLabel === 'WebGPU' || rendererBackendLabel.startsWith('WebGL')
-        : isWebGpuRenderer;
+        : isWebGpuRenderer);
     const linkedSunDirection = new THREE.Vector3();
     const linkedSunPosition = new THREE.Vector3();
     const linkedSunTarget = new THREE.Vector3();
@@ -80,9 +82,27 @@ export function createSky({ scene, renderer }) {
     const skyReflectionDir = new THREE.Vector3();
     const skyReflectionColor = new THREE.Vector3();
 
-    function ensureMesh() {
+    async function loadClassicSkyClass() {
+        if (useLegacySky) {
+            legacySkyModulePromise ??= import('three/addons/objects/Sky.js');
+            const mod = await legacySkyModulePromise;
+            return mod.Sky;
+        }
+        nodeSkyModulePromise ??= import('three/addons/objects/SkyMesh.js');
+        const mod = await nodeSkyModulePromise;
+        return mod.SkyMesh;
+    }
+
+    async function loadGeospatialSkyController() {
+        geospatialSkyModulePromise ??= import('./geospatial_sky.js');
+        const mod = await geospatialSkyModulePromise;
+        return mod.createGeospatialSkyController;
+    }
+
+    async function ensureMesh() {
         if (mesh) return;
-        mesh = useLegacySky ? new Sky() : new SkyMesh();
+        const SkyClass = await loadClassicSkyClass();
+        mesh = new SkyClass();
         mesh.scale.setScalar(450000);
         mesh.name = '__maxjs_sky__';
         mesh.frustumCulled = false;
@@ -120,12 +140,19 @@ export function createSky({ scene, renderer }) {
 
     function setVisible(nextVisible) {
         visible = !!nextVisible;
-        if (mesh) mesh.visible = visible;
+        if (mesh) mesh.visible = visible && backgroundVisible;
         if (sun) sun.visible = visible;
         if (fill) fill.visible = visible;
         if (lightProbe) lightProbe.visible = visible;
         geospatialSky?.setVisible?.(visible);
+        geospatialSky?.setBackgroundVisible?.(visible && backgroundVisible);
         if (!visible) scene.background = new THREE.Color(0x353535);
+    }
+
+    function setBackgroundVisible(nextVisible) {
+        backgroundVisible = !!nextVisible;
+        if (mesh) mesh.visible = visible && backgroundVisible;
+        geospatialSky?.setBackgroundVisible?.(visible && backgroundVisible);
     }
 
     function removeClassicObjects() {
@@ -358,7 +385,7 @@ export function createSky({ scene, renderer }) {
         };
     }
 
-    function apply(rawParams) {
+    async function apply(rawParams, { camera } = {}) {
         lastRawParams = rawParams;
         const params = { ...SKY_FALLBACKS, ...withLinkedSun(rawParams) };
         params.turbidity = numberOr(params.turbidity, SKY_FALLBACKS.turbidity);
@@ -374,29 +401,38 @@ export function createSky({ scene, renderer }) {
 
         const sig = JSON.stringify(params);
         if (sig === lastSig) return { params, changed: false };
-        lastSig = sig;
 
-        const planetary = params.model === SKY_MODEL_PLANETARY && allowGeospatialSky;
+        const planetary = params.model === SKY_MODEL_PLANETARY && allowGeospatialSkyRuntime;
         if (planetary) {
             removeClassicObjects();
             removeLightProbe();
             disposeSkyEnvironment();
-            geospatialSky ??= createGeospatialSkyController({
-                scene,
-                renderer,
-                backendLabel: renderer?.userData?.maxjsBackendLabel || '',
-            });
-            geospatialSky.apply(params);
-            geospatialSky.setVisible(visible);
-            planetaryActive = true;
-            return { params, changed: true };
+            try {
+                const createGeospatialSkyController = await loadGeospatialSkyController();
+                geospatialSky ??= createGeospatialSkyController({
+                    scene,
+                    renderer,
+                    backendLabel: renderer?.userData?.maxjsBackendLabel || '',
+                });
+                await geospatialSky.apply(params, { camera, throwOnError: true });
+                geospatialSky.setVisible(visible);
+                geospatialSky.setBackgroundVisible?.(visible && backgroundVisible);
+                planetaryActive = true;
+                lastSig = sig;
+                return { params, changed: true };
+            } catch (error) {
+                console.error('[snapshot sky] geospatial sky unavailable; using procedural sky fallback:', error);
+                try { geospatialSky?.dispose?.(); } catch {}
+                geospatialSky = null;
+                planetaryActive = false;
+            }
         }
 
         geospatialSky?.dispose();
         geospatialSky = null;
         planetaryActive = false;
 
-        ensureMesh();
+        await ensureMesh();
         ensureLights();
 
         const elevRad = THREE.MathUtils.degToRad(params.elevation);
@@ -443,6 +479,7 @@ export function createSky({ scene, renderer }) {
         fill.intensity = 0.5 + sunStrength * 0.5;
         setVisible(visible);
 
+        lastSig = sig;
         return { params, changed: true };
     }
 
@@ -475,6 +512,7 @@ export function createSky({ scene, renderer }) {
         apply,
         update,
         setVisible,
+        setBackgroundVisible,
         dispose,
         get mesh() { return mesh; },
         get sun() { return sun; },

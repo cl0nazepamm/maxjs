@@ -154,6 +154,7 @@ function normalizeRuntimeFeatures(meta) {
         gltf: !!(raw.gltf ?? raw.gltfs),
         animations: !!raw.animations,
         environment: !!(raw.environment ?? raw.hdri ?? raw.sky),
+        geospatial_sky: !!(raw.geospatial_sky ?? raw.geospatialSky),
         binary_instances: !!(raw.binary_instances ?? raw.binaryInstances),
         exports: raw.exports && typeof raw.exports === 'object' ? raw.exports : {},
         counts: raw.counts && typeof raw.counts === 'object' ? raw.counts : {},
@@ -999,7 +1000,13 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
 
     // Authored environment/HDRI from snapshot.json. This stays separate
     // from inlines: script-authored sky belongs to the layer runtime.
-    const snapshotEnvironment = createSnapshotEnvironment({ scene, renderer, rootUrl: root });
+    const snapshotEnvironment = createSnapshotEnvironment({
+        scene,
+        renderer,
+        camera,
+        rootUrl: root,
+        allowGeospatialSky: !!features.geospatial_sky,
+    });
     let authoredLightCount = 0;
     const syncDefaultLights = () => {
         defaultLights.visible = authoredLightCount === 0 && !snapshotEnvironment.isLightingActive();
@@ -1061,9 +1068,14 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
 
     // Phase 7d: authored environment / HDRI.
     // Explicit only: no default sky is synthesized here.
-    await snapshotEnvironment.apply(withSnapshotLinkedSkySun(meta.env, meta.lights), meta.snapshotUi);
+    const snapshotEnvironmentState = await snapshotEnvironment.apply(
+        withSnapshotLinkedSkySun(meta.env, meta.lights),
+        meta.snapshotUi,
+    );
     if (meta.snapshotUi) {
-        applySnapshotSolidBackground(meta.snapshotUi, scene);
+        if (!snapshotEnvironmentState?.active || !snapshotEnvironmentState?.backgroundVisible) {
+            applySnapshotSolidBackground(meta.snapshotUi, scene);
+        }
         // HDRI import can author renderer exposure; snapshot UI is the final
         // artist look and must win for exported pages.
         applySnapshotCoreLook(meta.snapshotUi, { renderer });
@@ -1095,7 +1107,6 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
     const locked = explicitLock === true || (explicitLock !== false && inferredLock);
     if (controls) {
         controls.enabled = !locked;
-        if (locked) console.info('[snapshot_boot] camera locked — orbit controls disabled');
     }
 
     // Phase 8: runtimeScene

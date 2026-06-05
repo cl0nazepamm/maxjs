@@ -414,7 +414,7 @@ function syncBackdropCanvas(state) {
     if (!canvas) return;
     canvas.style.width = `${window.innerWidth || 1}px`;
     canvas.style.height = `${window.innerHeight || 1}px`;
-    canvas.style.display = state.visible ? 'block' : 'none';
+    canvas.style.display = state.visible && state.backgroundVisible ? 'block' : 'none';
 }
 
 function ensureBackdropSkyRenderer(state) {
@@ -450,7 +450,7 @@ function ensureBackdropSkyRenderer(state) {
 function renderBackdropSky(state, camera) {
     if (!state.backdropRenderer || !state.backdropScene || !state.backdropCamera) return;
     syncBackdropCanvas(state);
-    if (!state.visible) return;
+    if (!state.visible || !state.backgroundVisible) return;
     syncBackdropCamera(state, camera);
     state.backdropRenderer.toneMappingExposure = state.skyExposure ?? state.renderer?.toneMappingExposure ?? 1.0;
     state.backdropRenderer.render(state.backdropScene, state.backdropCamera);
@@ -474,14 +474,26 @@ function disposeBackdropSky(state) {
     state.backdropTexture = null;
 }
 
-async function loadCoreModules(state) {
-    if (!state.coreModulesPromise) {
-        state.coreModulesPromise = Promise.all([
-            import('@takram/three-atmosphere'),
-            import('@takram/three-geospatial'),
-        ]).then(([atmosphere, geospatial]) => ({ atmosphere, geospatial }));
+// Shared geodesy math (Geodetic/Ellipsoid/radians/QuadGeometry). Needed by BOTH
+// the WebGL and WebGPU(node) paths. In WebGPU snapshots this package must inherit
+// the page-level WebGPU `three` mapping; pinning @takram scopes to three.module.js
+// splits Three classes inside the atmosphere context and can black out the sky.
+async function loadGeospatialModule(state) {
+    if (!state.geospatialModulePromise) {
+        state.geospatialModulePromise = import('@takram/three-geospatial');
     }
-    return state.coreModulesPromise;
+    return state.geospatialModulePromise;
+}
+
+// WebGL-only sky materials/texture loaders. This build drags in `postprocessing`
+// (AerialPerspectiveEffect) and WebGLRenderer, so it must NEVER be imported on
+// the WebGPU(node) path — that path uses `@takram/three-atmosphere/webgpu` (TSL)
+// instead. Keeping it off the WebGPU path is what makes the split clean.
+async function loadAtmosphereModule(state) {
+    if (!state.atmosphereModulePromise) {
+        state.atmosphereModulePromise = import('@takram/three-atmosphere');
+    }
+    return state.atmosphereModulePromise;
 }
 
 async function loadNodeModules(state) {
@@ -495,7 +507,10 @@ async function loadNodeModules(state) {
 }
 
 async function ensureWebGLSky(state) {
-    const { atmosphere, geospatial } = await loadCoreModules(state);
+    const [atmosphere, geospatial] = await Promise.all([
+        loadAtmosphereModule(state),
+        loadGeospatialModule(state),
+    ]);
     if (!state.webglMesh) {
         if (rendererUsesLegacyWebGL(state.renderer) || rendererUsesForcedWebGL(state)) {
             if (rendererUsesForcedWebGL(state)) ensureBackdropSkyRenderer(state);
@@ -568,7 +583,8 @@ async function ensureWebGLSky(state) {
 }
 
 async function ensureNodeSky(state) {
-    const { geospatial } = await loadCoreModules(state);
+    // WebGPU path: pull ONLY the geodesy math (no WebGL atmosphere/postprocessing).
+    const geospatial = await loadGeospatialModule(state);
     const { atmosphereWebGPU, tsl } = await loadNodeModules(state);
 
     removeWebGPUIncompatibleObjects(state);
@@ -677,14 +693,19 @@ function applyWebGLState(state, params, camera) {
         updateSkyEnvironmentCapture(state, params, state.skyEnvironmentWorldToECEF);
     }
 
+    const showBackground = state.visible && state.backgroundVisible;
     if (state.backdropRenderer) {
-        state.webglMesh.visible = state.visible;
+        state.webglMesh.visible = showBackground;
         renderBackdropSky(state, camera);
-        state.scene.background = state.backdropTexture || null;
+        if (showBackground) {
+            state.scene.background = state.backdropTexture || null;
+        } else if (state.scene.background === state.backdropTexture) {
+            state.scene.background = null;
+        }
     } else {
         if (state.webglMesh.parent !== state.scene) state.scene.add(state.webglMesh);
-        state.webglMesh.visible = state.visible;
-        state.scene.background = new THREE.Color(state.fallbackBackground);
+        state.webglMesh.visible = showBackground;
+        if (showBackground) state.scene.background = new THREE.Color(state.fallbackBackground);
     }
     updatePhysicalLights(state, params);
 }
@@ -706,9 +727,13 @@ function applyNodeState(state, params, camera) {
     state.nodeContext.matrixECIToECEF.value.identity();
 
     if (state.visible) {
-        state.scene.backgroundNode = state.nodeBackground;
+        if (state.backgroundVisible) {
+            state.scene.backgroundNode = state.nodeBackground;
+            state.scene.background = null;
+        } else if (state.scene.backgroundNode === state.nodeBackground) {
+            state.scene.backgroundNode = null;
+        }
         state.scene.environmentNode = state.nodeEnvironment;
-        state.scene.background = null;
         state.scene.environmentIntensity = Math.max(
             WEBGPU_ATMOSPHERE_ENV_INTENSITY_FLOOR,
             state.skyExposure ?? numberOr(params?.exposure, 0.5),
@@ -732,10 +757,13 @@ export function createGeospatialSkyController({ scene, renderer, backendLabel = 
         fallbackBackground,
         active: false,
         visible: true,
+        backgroundVisible: true,
         camera: null,
         params: {},
-        coreModulesPromise: null,
+        geospatialModulePromise: null,
+        atmosphereModulePromise: null,
         nodeModulesPromise: null,
+        applyPromise: null,
         textureLoadPromise: null,
         webglMesh: null,
         webglMaterial: null,
@@ -766,17 +794,28 @@ export function createGeospatialSkyController({ scene, renderer, backendLabel = 
         skyExposure: 1,
     };
 
-    function apply(params, { camera } = {}) {
+    function apply(params, { camera, throwOnError = false } = {}) {
         applyCommonState(state, params, camera);
+        const finish = (promise, label) => {
+            const handled = promise.catch((error) => {
+                state.active = false;
+                console.error(`[max.js] ${label} failed:`, error);
+                if (throwOnError) throw error;
+                return null;
+            });
+            state.applyPromise = handled;
+            return handled;
+        };
         if (isNodeRenderer(state)) {
-            ensureNodeSky(state)
-                .then(() => applyNodeState(state, state.params, state.camera))
-                .catch((error) => console.error('[max.js] geospatial node sky failed:', error));
-        } else {
-            ensureWebGLSky(state)
-                .then(() => applyWebGLState(state, state.params, state.camera))
-                .catch((error) => console.error('[max.js] geospatial WebGL sky failed:', error));
+            return finish(
+                ensureNodeSky(state).then(() => applyNodeState(state, state.params, state.camera)),
+                'geospatial node sky',
+            );
         }
+        return finish(
+            ensureWebGLSky(state).then(() => applyWebGLState(state, state.params, state.camera)),
+            'geospatial WebGL sky',
+        );
     }
 
     function update({ camera, elapsedSeconds } = {}) {
@@ -792,7 +831,7 @@ export function createGeospatialSkyController({ scene, renderer, backendLabel = 
 
     function setVisible(visible) {
         state.visible = !!visible;
-        if (state.webglMesh) state.webglMesh.visible = state.visible;
+        if (state.webglMesh) state.webglMesh.visible = state.visible && state.backgroundVisible;
         syncBackdropCanvas(state);
         if (state.skyLightProbe) {
             state.skyLightProbe.visible = state.visible;
@@ -805,7 +844,19 @@ export function createGeospatialSkyController({ scene, renderer, backendLabel = 
             if (state.scene.environmentNode === state.nodeEnvironment) state.scene.environmentNode = null;
             state.scene.background = new THREE.Color(state.fallbackBackground);
         } else if (state.active) {
-            if (state.backdropTexture) state.scene.background = state.backdropTexture;
+            if (state.backgroundVisible && state.backdropTexture) state.scene.background = state.backdropTexture;
+            update({ camera: state.camera });
+        }
+    }
+
+    function setBackgroundVisible(visible) {
+        state.backgroundVisible = !!visible;
+        if (state.webglMesh) state.webglMesh.visible = state.visible && state.backgroundVisible;
+        syncBackdropCanvas(state);
+        if (!state.backgroundVisible) {
+            if (state.scene.backgroundNode === state.nodeBackground) state.scene.backgroundNode = null;
+            if (state.scene.background === state.backdropTexture) state.scene.background = null;
+        } else if (state.active && state.visible) {
             update({ camera: state.camera });
         }
     }
@@ -854,6 +905,7 @@ export function createGeospatialSkyController({ scene, renderer, backendLabel = 
         apply,
         update,
         setVisible,
+        setBackgroundVisible,
         setFallbackBackground,
         dispose,
         get active() { return state.active; },

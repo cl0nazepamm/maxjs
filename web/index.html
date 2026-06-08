@@ -13915,6 +13915,23 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         // buildMode / isStandalone / urlMode are initialized near perfHud (early).
         // three.js r184 Inspector — lazily created, gated by debug mode.
         let threeInspector = null;
+        function placeThreeInspectorToggle() {
+            const shell = threeInspector?.domElement;
+            const toggle = shell?.querySelector?.('#profiler-toggle');
+            const miniPanel = shell?.querySelector?.('#profiler-mini-panel');
+            if (toggle) {
+                toggle.style.top = 'auto';
+                toggle.style.right = 'auto';
+                toggle.style.bottom = '15px';
+                toggle.style.left = '15px';
+            }
+            if (miniPanel) {
+                miniPanel.style.top = 'auto';
+                miniPanel.style.right = 'auto';
+                miniPanel.style.bottom = '60px';
+                miniPanel.style.left = '15px';
+            }
+        }
         function syncInspector() {
             if (debugMode && buildMode !== 'release') {
                 if (!threeInspector) {
@@ -13924,8 +13941,10 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     if (parent && !threeInspector.domElement.parentElement) {
                         parent.appendChild(threeInspector.domElement);
                     }
+                    placeThreeInspectorToggle();
                 }
                 threeInspector.domElement.style.display = '';
+                placeThreeInspectorToggle();
             } else if (threeInspector) {
                 threeInspector.domElement.style.display = 'none';
             }

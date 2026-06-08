@@ -271,6 +271,7 @@ export function createMaxJSFxController({
             analogChromaBleed: 0.76,
             analogRinging: 0.62,
             analogTapeNoise: 0.70,
+            analogBandMask: 0.35,
             analogEdgeWave: 0.34,
             analogDropouts: 0.32,
             analogScanlines: 0.54,
@@ -474,6 +475,7 @@ export function createMaxJSFxController({
             analogChromaBleed: preset.analog_chroma_bleed ?? 0.75,
             analogRinging: preset.analog_ringing ?? 0.65,
             analogTapeNoise: preset.analog_tape_noise ?? 0.75,
+            analogBandMask: preset.analog_band_mask ?? 0.35,
             analogEdgeWave: preset.analog_edge_wave ?? 0.35,
             analogDropouts: preset.analog_dropouts ?? 0.35,
             analogScanlines: preset.analog_scanlines ?? 0.55,
@@ -530,6 +532,7 @@ export function createMaxJSFxController({
         p.analogChromaBleed = THREE.MathUtils.clamp(finiteOr(p.analogChromaBleed, 0.76), 0, 3);
         p.analogRinging = THREE.MathUtils.clamp(finiteOr(p.analogRinging, 0.62), 0, 3);
         p.analogTapeNoise = THREE.MathUtils.clamp(finiteOr(p.analogTapeNoise, 0.70), 0, 3);
+        p.analogBandMask = THREE.MathUtils.clamp(finiteOr(p.analogBandMask, 0.35), 0, 3);
         p.analogEdgeWave = THREE.MathUtils.clamp(finiteOr(p.analogEdgeWave, 0.34), 0, 3);
         p.analogDropouts = THREE.MathUtils.clamp(finiteOr(p.analogDropouts, 0.32), 0, 3);
         p.analogScanlines = THREE.MathUtils.clamp(finiteOr(p.analogScanlines, 0.54), 0, 3);
@@ -561,6 +564,7 @@ export function createMaxJSFxController({
         powerShotPipeline.ctx.P.analogChromaBleed.value = p.analogChromaBleed;
         powerShotPipeline.ctx.P.analogRinging.value = p.analogRinging;
         powerShotPipeline.ctx.P.analogTapeNoise.value = p.analogTapeNoise;
+        powerShotPipeline.ctx.P.analogBandMask.value = p.analogBandMask;
         powerShotPipeline.ctx.P.analogEdgeWave.value = p.analogEdgeWave;
         powerShotPipeline.ctx.P.analogDropouts.value = p.analogDropouts;
         powerShotPipeline.ctx.P.analogScanlines.value = p.analogScanlines;
@@ -2643,6 +2647,7 @@ export function createMaxJSFxController({
             assignFinite(state.powershot, 'analogChromaBleed', options.analogChromaBleed);
             assignFinite(state.powershot, 'analogRinging', options.analogRinging);
             assignFinite(state.powershot, 'analogTapeNoise', options.analogTapeNoise);
+            assignFinite(state.powershot, 'analogBandMask', options.analogBandMask);
             assignFinite(state.powershot, 'analogEdgeWave', options.analogEdgeWave);
             assignFinite(state.powershot, 'analogDropouts', options.analogDropouts);
             assignFinite(state.powershot, 'analogScanlines', options.analogScanlines);

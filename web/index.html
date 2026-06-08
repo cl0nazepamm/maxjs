@@ -11794,6 +11794,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     analogChromaBleed: 0.76,
                     analogRinging: 0.62,
                     analogTapeNoise: 0.70,
+                    analogBandMask: 0.35,
                     analogEdgeWave: 0.34,
                     analogDropouts: 0.32,
                     analogScanlines: 0.54,
@@ -11841,6 +11842,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     { key: 'analogChromaBleed', label: 'Chroma Bleed', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotAnalogActive },
                     { key: 'analogRinging', label: 'Ringing', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotAnalogActive },
                     { key: 'analogTapeNoise', label: 'Tape Noise', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotAnalogActive },
+                    { key: 'analogBandMask', label: 'Band Mask', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotAnalogActive },
                     { key: 'analogEdgeWave', label: 'Edge Wave', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotAnalogActive },
                     { key: 'analogDropouts', label: 'Dropouts', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotAnalogActive },
                     { key: 'analogScanlines', label: 'Scanlines', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotAnalogActive },
@@ -12364,7 +12366,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     retro: { wiggle: false, affineDistortion: 5.0, resolutionScale: 0.25, filterTextures: false, dither: false, colorDepth: 32, scanlines: false, scanlineIntensity: 0.3, scanlineDensity: 1.0, crt: false, vignetteIntensity: 0.3, bleeding: 0.001, curvature: 0.02 },
                     volumetric: { intensity: 1.0, steps: 12, density: 0.5, denoise: 0.6, resolution: 0.25 },
                     pixel: { pixelate: false, pixelSize: 4, chromatic: false, chromaticIntensity: 0.005, sharpen: false, sharpenStrength: 0.5, grain: false, grainIntensity: 0.08, brightness: 0, contrast: 0, saturation: 0 },
-                    powershot: { mode: 'digital', preset: 'powershot', amount: 1.0, resolutionScale: 0.75, lensSoftness: 0.32, ccdBloom: 0.35, noiseScale: 1.06, bayerNR: 0.5, chromaNR: 1.0, jpegStrength: 0.2, jpegQuality: 60, jpegChroma420: 0.75, jpegMidtone: 0.45, jpegHighlight: 1.0, brightness: 0, contrast: 0, analogStrength: 0.72, analogTracking: 0.46, analogChromaBleed: 0.76, analogRinging: 0.62, analogTapeNoise: 0.70, analogEdgeWave: 0.34, analogDropouts: 0.32, analogScanlines: 0.54, analogHeadSwitch: 0.42, freezeNoise: false },
+                    powershot: { mode: 'digital', preset: 'powershot', amount: 1.0, resolutionScale: 0.75, lensSoftness: 0.32, ccdBloom: 0.35, noiseScale: 1.06, bayerNR: 0.5, chromaNR: 1.0, jpegStrength: 0.2, jpegQuality: 60, jpegChroma420: 0.75, jpegMidtone: 0.45, jpegHighlight: 1.0, brightness: 0, contrast: 0, analogStrength: 0.72, analogTracking: 0.46, analogChromaBleed: 0.76, analogRinging: 0.62, analogTapeNoise: 0.70, analogBandMask: 0.35, analogEdgeWave: 0.34, analogDropouts: 0.32, analogScanlines: 0.54, analogHeadSwitch: 0.42, freezeNoise: false },
                     fog: { type: 0, opacity: 1.0, near: 10, far: 500, density: 0.01, noiseScale: 0.005, noiseSpeed: 0.2, height: 20 },
                 };
                 if (clayModeActive) {

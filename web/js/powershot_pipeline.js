@@ -535,6 +535,7 @@ function stAnalogVhs(tex, ctx) {
   const chromaBleed = ctx.P.analogChromaBleed.clamp(0.0, 3.0);
   const ringing = ctx.P.analogRinging.clamp(0.0, 3.0);
   const tapeNoise = ctx.P.analogTapeNoise.clamp(0.0, 3.0);
+  const bandMask = ctx.P.analogBandMask.clamp(0.0, 3.0);
   const edgeWaveAmount = ctx.P.analogEdgeWave.clamp(0.0, 3.0);
   const dropoutAmount = ctx.P.analogDropouts.clamp(0.0, 3.0);
   const scanlines = ctx.P.analogScanlines.clamp(0.0, 3.0);
@@ -616,12 +617,26 @@ function stAnalogVhs(tex, ctx) {
   ).mul(tapeNoise.mul(1.35));
   chroma = chroma.add(chromaNoise).add(vec2(carrier.mul(crawl).mul(0.34), carrierQ.mul(crawl).mul(-0.22)));
 
-  const dropoutSeed = hash12(vec2(fieldLine.mul(0.071), floor(ctx.frame.mul(0.13))).add(73.0));
-  const dropoutGate = step(float(1.0).sub(dropoutAmount.mul(0.045).clamp(0.0, 0.22)), dropoutSeed);
-  const dropoutBand = dropoutGate.mul(softBand(fract(p.x.mul(0.003).add(dropoutSeed)), 0.1, 0.9));
-  const chromaLoss = dropoutBand.mul(dropoutAmount.mul(0.85)).clamp(0.0, 1.0);
+  const dropoutFrame = floor(ctx.frame.mul(0.13));
+  const dropoutLineSeed = hash13(vec3(fieldLine.mul(2.37), dropoutFrame, 73.0));
+  const dropoutSegmentWidth = float(88.0).add(hash12(vec2(fieldLine, dropoutFrame).add(19.0)).mul(96.0));
+  const dropoutSegment = floor(p.x.div(dropoutSegmentWidth));
+  const dropoutSegmentSeed = hash13(vec3(
+    dropoutSegment.mul(5.37).add(dropoutLineSeed.mul(17.0)),
+    fieldLine.mul(3.11),
+    dropoutFrame.add(73.0),
+  ));
+  const dropoutLineGate = step(float(1.0).sub(dropoutAmount.mul(0.075).clamp(0.0, 0.26)), dropoutLineSeed);
+  const dropoutSegmentGate = step(float(1.0).sub(dropoutAmount.mul(0.32).clamp(0.0, 0.92)), dropoutSegmentSeed);
+  const dropoutSegmentPos = fract(p.x.div(dropoutSegmentWidth).add(dropoutLineSeed));
+  const dropoutSegmentEnvelope = softBand(dropoutSegmentPos, 0.04, 0.18)
+    .mul(float(1.0).sub(softBand(dropoutSegmentPos, 0.74, 0.96)));
+  const dropoutBand = dropoutLineGate.mul(dropoutSegmentGate).mul(dropoutSegmentEnvelope);
+  const bandDamage = dropoutAmount.mul(bandMask);
+  const chromaLoss = dropoutBand.mul(bandDamage.mul(0.85)).clamp(0.0, 1.0);
   chroma = mix(chroma, chroma.mul(0.08), chromaLoss);
-  y = y.add(dropoutBand.mul(hash12(vec2(p.x, ctx.frame).add(12.0)).sub(0.5)).mul(tapeNoise.mul(dropoutAmount).mul(34.0)));
+  const dropoutStatic = hash13(vec3(p.x.mul(0.91), p.y.mul(1.73), ctx.frame.add(12.0))).sub(0.5);
+  y = y.add(dropoutBand.mul(dropoutStatic).mul(tapeNoise.mul(bandDamage).mul(34.0)));
 
   const scan = sin(p.y.mul(3.1415927)).mul(0.5).add(0.5);
   const interlace = step(0.5, mod(p.y.add(ctx.frame), 2.0));
@@ -880,7 +895,7 @@ export function makeUniforms() {
       jpegMidtone: uniform(0.45), jpegHighlight: uniform(1.0),
       analogStrength: uniform(0.65), analogTracking: uniform(0.45),
       analogChromaBleed: uniform(0.75), analogRinging: uniform(0.65), analogTapeNoise: uniform(0.75),
-      analogEdgeWave: uniform(0.35), analogDropouts: uniform(0.35), analogScanlines: uniform(0.55),
+      analogBandMask: uniform(0.35), analogEdgeWave: uniform(0.35), analogDropouts: uniform(0.35), analogScanlines: uniform(0.55),
       analogHeadSwitch: uniform(0.45),
     },
   };
@@ -934,6 +949,7 @@ export function applyPreset(ctx, preset) {
   P.analogChromaBleed.value = preset.analog_chroma_bleed ?? 0.75;
   P.analogRinging.value = preset.analog_ringing ?? 0.65;
   P.analogTapeNoise.value = preset.analog_tape_noise ?? 0.75;
+  P.analogBandMask.value = preset.analog_band_mask ?? 0.35;
   P.analogEdgeWave.value = preset.analog_edge_wave ?? 0.35;
   P.analogDropouts.value = preset.analog_dropouts ?? 0.35;
   P.analogScanlines.value = preset.analog_scanlines ?? 0.55;

@@ -11548,6 +11548,14 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             if (markOutput) maxjsFx.markOutputChanged?.();
         }
 
+        const isPowerShotDigitalMode = (values) => values.mode !== 'analog';
+        const isPowerShotAnalogMode = (values) => values.mode === 'analog';
+        const isPowerShotJpegActive = (values) => isPowerShotDigitalMode(values) && Number(values.jpegStrength) > 1.0e-6;
+        const isPowerShotAnalogActive = (values) => isPowerShotAnalogMode(values) && Number(values.analogStrength) > 1.0e-6;
+        const isPowerShotTemporalNoiseActive = (values) =>
+            (isPowerShotDigitalMode(values) && Number(values.noiseScale) > 1.0e-6)
+            || isPowerShotAnalogActive(values);
+
         const postFxSections = [
             {
                 key: 'ssgi',
@@ -11808,7 +11816,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                         key: 'preset',
                         label: 'Preset',
                         type: 'select',
-                        visibleWhen: (values) => values.mode !== 'analog',
+                        visibleWhen: isPowerShotDigitalMode,
                         options: maxjsFx.getPowerShotPresets().map((preset) => ({
                             value: preset.key,
                             label: `${preset.key} - ${preset.label}`,
@@ -11816,28 +11824,28 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     },
                     { key: 'amount', label: 'Amount', min: 0, max: 1, step: 0.01, realtime: true },
                     { key: 'resolutionScale', label: 'Resolution', min: 0.1, max: 1, step: 0.05 },
-                    { key: 'lensSoftness', label: 'Lens Softness', min: 0, max: 1, step: 0.01, realtime: true, visibleWhen: (values) => values.mode !== 'analog' },
-                    { key: 'ccdBloom', label: 'CCD Bloom', min: 0, max: 2, step: 0.01, realtime: true, visibleWhen: (values) => values.mode !== 'analog' },
-                    { key: 'noiseScale', label: 'Noise', min: 0, max: 2, step: 0.01, realtime: true, visibleWhen: (values) => values.mode !== 'analog' },
-                    { key: 'bayerNR', label: 'Bayer NR', min: 0, max: 1, step: 0.01, realtime: true, visibleWhen: (values) => values.mode !== 'analog' },
-                    { key: 'chromaNR', label: 'Chroma NR', min: 0, max: 1, step: 0.01, realtime: true, visibleWhen: (values) => values.mode !== 'analog' },
-                    { key: 'jpegStrength', label: 'JPEG', min: 0, max: 1, step: 0.01, realtime: true, visibleWhen: (values) => values.mode !== 'analog' },
-                    { key: 'jpegQuality', label: 'JPEG Quality', min: 1, max: 100, step: 1, integer: true, realtime: true, visibleWhen: (values) => values.mode !== 'analog' },
-                    { key: 'jpegChroma420', label: 'JPEG Chroma', min: 0, max: 1, step: 0.01, realtime: true, visibleWhen: (values) => values.mode !== 'analog' },
-                    { key: 'jpegMidtone', label: 'JPEG Midtones', min: 0, max: 1, step: 0.01, realtime: true, visibleWhen: (values) => values.mode !== 'analog' },
-                    { key: 'jpegHighlight', label: 'JPEG Highlights', min: 0, max: 2, step: 0.01, realtime: true, visibleWhen: (values) => values.mode !== 'analog' },
+                    { key: 'lensSoftness', label: 'Lens Softness', min: 0, max: 1, step: 0.01, realtime: true, visibleWhen: isPowerShotDigitalMode },
+                    { key: 'ccdBloom', label: 'CCD Bloom', min: 0, max: 2, step: 0.01, realtime: true, visibleWhen: isPowerShotDigitalMode },
+                    { key: 'noiseScale', label: 'Noise', min: 0, max: 2, step: 0.01, realtime: true, visibleWhen: isPowerShotDigitalMode },
+                    { key: 'bayerNR', label: 'Bayer NR', min: 0, max: 1, step: 0.01, realtime: true, visibleWhen: isPowerShotDigitalMode },
+                    { key: 'chromaNR', label: 'Chroma NR', min: 0, max: 1, step: 0.01, realtime: true, visibleWhen: isPowerShotDigitalMode },
+                    { key: 'jpegStrength', label: 'JPEG', min: 0, max: 1, step: 0.01, realtime: true, affectsVisibility: true, visibleWhen: isPowerShotDigitalMode },
+                    { key: 'jpegQuality', label: 'JPEG Quality', min: 1, max: 100, step: 1, integer: true, realtime: true, visibleWhen: isPowerShotJpegActive },
+                    { key: 'jpegChroma420', label: 'JPEG Chroma', min: 0, max: 1, step: 0.01, realtime: true, visibleWhen: isPowerShotJpegActive },
+                    { key: 'jpegMidtone', label: 'JPEG Midtones', min: 0, max: 1, step: 0.01, realtime: true, visibleWhen: isPowerShotJpegActive },
+                    { key: 'jpegHighlight', label: 'JPEG Highlights', min: 0, max: 2, step: 0.01, realtime: true, visibleWhen: isPowerShotJpegActive },
                     { key: 'brightness', label: 'Brightness', min: -1, max: 1, step: 0.01, realtime: true },
                     { key: 'contrast', label: 'Contrast', min: -1, max: 1, step: 0.01, realtime: true },
-                    { key: 'analogStrength', label: 'VHS Strength', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: (values) => values.mode === 'analog' },
-                    { key: 'analogTracking', label: 'Tracking', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: (values) => values.mode === 'analog' },
-                    { key: 'analogChromaBleed', label: 'Chroma Bleed', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: (values) => values.mode === 'analog' },
-                    { key: 'analogRinging', label: 'Ringing', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: (values) => values.mode === 'analog' },
-                    { key: 'analogTapeNoise', label: 'Tape Noise', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: (values) => values.mode === 'analog' },
-                    { key: 'analogEdgeWave', label: 'Edge Wave', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: (values) => values.mode === 'analog' },
-                    { key: 'analogDropouts', label: 'Dropouts', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: (values) => values.mode === 'analog' },
-                    { key: 'analogScanlines', label: 'Scanlines', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: (values) => values.mode === 'analog' },
-                    { key: 'analogHeadSwitch', label: 'Head Switch', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: (values) => values.mode === 'analog' },
-                    { key: 'freezeNoise', label: 'Freeze Noise', type: 'checkbox' },
+                    { key: 'analogStrength', label: 'VHS Strength', min: 0, max: 3, step: 0.01, realtime: true, affectsVisibility: true, visibleWhen: isPowerShotAnalogMode },
+                    { key: 'analogTracking', label: 'Tracking', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotAnalogActive },
+                    { key: 'analogChromaBleed', label: 'Chroma Bleed', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotAnalogActive },
+                    { key: 'analogRinging', label: 'Ringing', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotAnalogActive },
+                    { key: 'analogTapeNoise', label: 'Tape Noise', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotAnalogActive },
+                    { key: 'analogEdgeWave', label: 'Edge Wave', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotAnalogActive },
+                    { key: 'analogDropouts', label: 'Dropouts', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotAnalogActive },
+                    { key: 'analogScanlines', label: 'Scanlines', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotAnalogActive },
+                    { key: 'analogHeadSwitch', label: 'Head Switch', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotAnalogActive },
+                    { key: 'freezeNoise', label: 'Freeze Noise', type: 'checkbox', visibleWhen: isPowerShotTemporalNoiseActive },
                 ],
             },
             {
@@ -12807,6 +12815,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                         input.addEventListener('input', () => {
                             previewPostFxControlLabel(control, input, valueEl, getSectionValues);
                             applyControlValueLive();
+                            if (control.affectsVisibility) syncPostFxPanel(false, { persist: false });
                         });
                         input.addEventListener('change', () => savePostFxState());
                     } else {
@@ -12952,7 +12961,10 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     const controlEl = section.controlEls[control.key];
                     if (!controlEl) continue;
                     const visible = isPostFxControlVisible(control, values);
-                    if (controlEl.wrapperEl) controlEl.wrapperEl.hidden = !visible;
+                    if (controlEl.wrapperEl) {
+                        controlEl.wrapperEl.hidden = !visible;
+                        controlEl.wrapperEl.classList.toggle('is-hidden', !visible);
+                    }
                     const editingControl = !force && document.activeElement === controlEl.input;
 
                     // Disable DOF sliders when "Auto from Camera" is on (Physical Camera drives them)

@@ -439,8 +439,17 @@ export function createMaxJSFxController({
     }
 
     function isPowerShotActive() {
+        const p = normalizePowerShotOptions();
+        if (p.mode === 'analog') {
+            return supportsScreenSpaceEffects
+                && !!p.enabled
+                && p.amount > 1.0e-6
+                && (p.analogStrength > 1.0e-6 || Math.abs(p.brightness) > 1.0e-6 || Math.abs(p.contrast) > 1.0e-6)
+                && !isShaderLabEnabled();
+        }
         return supportsScreenSpaceEffects
-            && !!state.powershot.enabled
+            && !!p.enabled
+            && p.amount > 1.0e-6
             && !isShaderLabEnabled();
     }
 
@@ -476,6 +485,29 @@ export function createMaxJSFxController({
         return Number.isFinite(value) ? value : fallback;
     }
 
+    function powerShotNonZero(value, epsilon = 1.0e-6) {
+        return Math.abs(Number(value) || 0) > epsilon;
+    }
+
+    function powerShotAnyNonZero(values, epsilon = 1.0e-6) {
+        return Array.isArray(values) && values.some((value) => powerShotNonZero(value, epsilon));
+    }
+
+    function powerShotAnyUniformNonZero(preset, keys) {
+        return keys.some((key) => powerShotNonZero(preset?.[key]));
+    }
+
+    function powerShotArrayDiffers(values, identity) {
+        return Array.isArray(values)
+            && values.some((value, index) => Math.abs((Number(value) || 0) - identity[index]) > 1.0e-6);
+    }
+
+    function powerShotCcmDiffers(ccm) {
+        const identity = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
+        return Array.isArray(ccm)
+            && ccm.some((row, rowIndex) => powerShotArrayDiffers(row, identity[rowIndex] || []));
+    }
+
     function normalizePowerShotOptions() {
         const p = state.powershot;
         p.mode = p.mode === 'analog' ? 'analog' : 'digital';
@@ -509,9 +541,10 @@ export function createMaxJSFxController({
         if (!powerShotPipeline) return;
         const p = normalizePowerShotOptions();
         const presetKey = normalizePowerShotPreset(p.preset);
+        const preset = POWERSHOT_PRESETS[presetKey];
         p.preset = presetKey;
         powerShotPipeline.setMode?.(p.mode);
-        applyPowerShotPreset(powerShotPipeline.ctx, POWERSHOT_PRESETS[presetKey]);
+        applyPowerShotPreset(powerShotPipeline.ctx, preset);
         powerShotPipeline.ctx.power.value = THREE.MathUtils.clamp(p.amount, 0, 1);
         powerShotPipeline.ctx.P.lensSoftness.value = p.lensSoftness;
         powerShotPipeline.ctx.P.ccdBloom.value = p.ccdBloom;
@@ -533,6 +566,33 @@ export function createMaxJSFxController({
         powerShotPipeline.ctx.P.analogScanlines.value = p.analogScanlines;
         powerShotPipeline.ctx.P.analogHeadSwitch.value = p.analogHeadSwitch;
         powerShotPipeline.setOutputColorGrading?.(p);
+
+        const digital = p.mode === 'digital';
+        if (!digital) return;
+
+        const setDigitalStage = (id, enabled) => powerShotPipeline.setEnabled?.(id, digital && !!enabled);
+        const hasNoise = p.noiseScale > 1.0e-6 && powerShotAnyUniformNonZero(preset, [
+            'noise_intensity', 'color_noise_intensity', 'column_fpn', 'row_fpn', 'prnu', 'dsnu',
+        ]);
+        setDigitalStage('barrel', powerShotNonZero(preset?.barrel_distortion));
+        setDigitalStage('ca', powerShotNonZero(preset?.chromatic_aberration));
+        setDigitalStage('lens', p.lensSoftness > 1.0e-6);
+        setDigitalStage('ccdbloom', p.ccdBloom > 1.0e-6);
+        setDigitalStage('mosaic', true);
+        setDigitalStage('dpc', powerShotNonZero(preset?.hot_pixel_rate));
+        setDigitalStage('blacklevel', powerShotAnyNonZero(preset?.black_level));
+        setDigitalStage('noise', hasNoise);
+        setDigitalStage('aaf', powerShotNonZero(preset?.aaf_strength));
+        setDigitalStage('bnr', p.bayerNR > 1.0e-6);
+        setDigitalStage('wb', powerShotArrayDiffers(preset?.wb_shift, [1, 1, 1]));
+        setDigitalStage('demosaic', true);
+        setDigitalStage('chromanr', p.chromaNR > 1.0e-6);
+        setDigitalStage('ccm', powerShotCcmDiffers(preset?.ccm));
+        setDigitalStage('tone', false);
+        setDigitalStage('saturation', Math.abs((Number(preset?.saturation_boost) || 1) - 1) > 1.0e-6);
+        setDigitalStage('vignette', powerShotNonZero(preset?.vignette_strength));
+        setDigitalStage('edge', powerShotNonZero(preset?.ee_gain));
+        setDigitalStage('jpeg', p.jpegStrength > 1.0e-6);
     }
 
     function ensurePowerShotPipeline() {

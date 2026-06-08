@@ -161,7 +161,10 @@ function stCcdBloom(tex, ctx) {
 // --- Bayer domain ---
 
 function stMosaic(tex, ctx) {
-  const c = texture(tex, screenUV).rgb;
+  return mosaicColor(texture(tex, screenUV).rgb, ctx);
+}
+
+function mosaicColor(c, ctx) {
   const ph = bayerPhase(screenUV, ctx);
   const bayer = c.r.mul(ph.isR)
     .add(c.g.mul(ph.isGr.add(ph.isGb)))
@@ -170,7 +173,11 @@ function stMosaic(tex, ctx) {
 }
 
 function stWhiteBalance(tex, ctx) {
-  const b = texture(tex, screenUV).r;
+  return whiteBalanceColor(texture(tex, screenUV).rgb, ctx);
+}
+
+function whiteBalanceColor(c, ctx) {
+  const b = c.r;
   const ph = bayerPhase(screenUV, ctx);
   const gain = ctx.P.wbR.mul(ph.isR)
     .add(ctx.P.wbG.mul(ph.isGr.add(ph.isGb)))
@@ -179,8 +186,11 @@ function stWhiteBalance(tex, ctx) {
 }
 
 function stBlackLevel(tex, ctx) {
-  const b = texture(tex, screenUV).r;
-  return vec3(blackLevelValue(b, ctx));
+  return blackLevelColor(texture(tex, screenUV).rgb, ctx);
+}
+
+function blackLevelColor(c, ctx) {
+  return vec3(blackLevelValue(c.r, ctx));
 }
 
 function blackLevelValue(b, ctx) {
@@ -208,8 +218,11 @@ function samePhase3x3(tex, ctx) {
 }
 
 function stBayerNoise(tex, ctx) {
-  const b = texture(tex, screenUV).r;
-  return vec3(bayerNoiseValue(b, ctx));
+  return bayerNoiseColor(texture(tex, screenUV).rgb, ctx);
+}
+
+function bayerNoiseColor(c, ctx) {
+  return vec3(bayerNoiseValue(c.r, ctx));
 }
 
 function bayerNoiseValue(b, ctx) {
@@ -235,11 +248,6 @@ function bayerNoiseValue(b, ctx) {
   sig = sig.add(read).add(shot);
 
   return sig.clamp(0.0, LEVELS);
-}
-
-function stBlackLevelNoise(tex, ctx) {
-  const b = blackLevelValue(texture(tex, screenUV).r, ctx);
-  return vec3(bayerNoiseValue(b, ctx));
 }
 
 // Remove isolated Bayer-domain hot/dead samples before they demosaic into
@@ -445,8 +453,21 @@ function vignetteColor(c, ctx) {
   return c.mul(falloff).clamp(0.0, LEVELS);
 }
 
-function stRgbPointStack(tex, ctx, ids) {
+function stDigitalPointStack(tex, ctx, ids) {
   let c = texture(tex, screenUV).rgb;
+  return digitalPointStackColor(c, ctx, ids);
+}
+
+function stInputDigitalPointStack(tex, ctx, ids) {
+  let c = texture(tex, screenUV).rgb.mul(LEVELS);
+  return digitalPointStackColor(c, ctx, ids);
+}
+
+function digitalPointStackColor(c, ctx, ids) {
+  if (ids.has("mosaic")) c = mosaicColor(c, ctx);
+  if (ids.has("blacklevel")) c = blackLevelColor(c, ctx);
+  if (ids.has("noise")) c = bayerNoiseColor(c, ctx);
+  if (ids.has("wb")) c = whiteBalanceColor(c, ctx);
   if (ids.has("ccm")) c = ccmColor(c, ctx);
   if (ids.has("tone")) c = toneColor(c, ctx);
   if (ids.has("saturation")) c = saturationColor(c, ctx);
@@ -818,7 +839,10 @@ export const ANALOG_STAGE_DEFS = [
   { id: "analog", label: "Analog VHS / NTSC", make: stAnalogVhs },
 ];
 
-const RGB_POINT_STAGE_IDS = new Set(["ccm", "tone", "saturation", "vignette"]);
+const DIGITAL_POINT_STAGE_IDS = new Set([
+  "mosaic", "blacklevel", "noise", "wb",
+  "ccm", "tone", "saturation", "vignette",
+]);
 
 // ---------------------------------------------------------------------------
 // uniforms built per preset (so we can hot-swap without rebuilding nodes)
@@ -986,6 +1010,8 @@ export class Pipeline {
   }
 
   setEnabled(id, on) {
+    const hasStage = this.enabled.has(id);
+    if (on === hasStage) return;
     if (on) this.enabled.add(id);
     else this.enabled.delete(id);
     this.dirty = true;
@@ -1011,8 +1037,29 @@ export class Pipeline {
     this.dirty = false;
     if (!this.source) { this.outputMat = null; return; }
 
-    // mandatory input + downsample pass: 0..1 source -> 0..255 in rtA.
-    this.steps.push({ material: this._mat(stInput(this.source, this.ctx)), target: this.rtA });
+    const active = this.mode === "analog"
+      ? ANALOG_STAGE_DEFS
+      : STAGE_DEFS.filter((s) => this.enabled.has(s.id));
+    let read = this.rtA;
+    let write = this.rtB;
+    let startIndex = 0;
+
+    // Mandatory input/downsample is point-only, so fold it into the first
+    // digital point-stage run when no earlier resampling stage is active.
+    if (this.mode === "digital" && active.length > 0 && DIGITAL_POINT_STAGE_IDS.has(active[0].id)) {
+      const ids = [];
+      while (startIndex < active.length && DIGITAL_POINT_STAGE_IDS.has(active[startIndex].id)) {
+        ids.push(active[startIndex].id);
+        startIndex += 1;
+      }
+      this.steps.push({
+        material: this._mat(stInputDigitalPointStack(this.source, this.ctx, new Set(ids))),
+        target: this.rtA,
+      });
+    } else {
+      // mandatory input + downsample pass: 0..1 source -> 0..255 in rtA.
+      this.steps.push({ material: this._mat(stInput(this.source, this.ctx)), target: this.rtA });
+    }
 
     const appendSingle = (make) => {
       this.steps.push({ material: this._mat(make(read.texture, this.ctx)), target: write });
@@ -1020,28 +1067,18 @@ export class Pipeline {
     };
 
     // ping-pong the active stages across rtA/rtB with baked input textures
-    let read = this.rtA;
-    let write = this.rtB;
-    const active = this.mode === "analog"
-      ? ANALOG_STAGE_DEFS
-      : STAGE_DEFS.filter((s) => this.enabled.has(s.id));
-    for (let i = 0; i < active.length; i += 1) {
+    for (let i = startIndex; i < active.length; i += 1) {
       const stage = active[i];
-      if (stage.id === "blacklevel" && active[i + 1]?.id === "noise") {
-        appendSingle(stBlackLevelNoise);
-        i += 1;
-        continue;
-      }
-      if (RGB_POINT_STAGE_IDS.has(stage.id)) {
+      if (DIGITAL_POINT_STAGE_IDS.has(stage.id)) {
         const ids = [];
         let j = i;
-        while (j < active.length && RGB_POINT_STAGE_IDS.has(active[j].id)) {
+        while (j < active.length && DIGITAL_POINT_STAGE_IDS.has(active[j].id)) {
           ids.push(active[j].id);
           j += 1;
         }
         if (ids.length > 1) {
           const idSet = new Set(ids);
-          appendSingle((tex, ctx) => stRgbPointStack(tex, ctx, idSet));
+          appendSingle((tex, ctx) => stDigitalPointStack(tex, ctx, idSet));
           i = j - 1;
           continue;
         }

@@ -665,6 +665,11 @@ body.light-mode .dock-drag-handle.dragging::after { background: rgba(0, 0, 0, 0.
     display: grid;
     gap: 2px;
 }
+.fx-control[hidden],
+.fx-check[hidden],
+[data-fx-control].is-hidden {
+    display: none !important;
+}
 .fx-control-head {
     display: flex;
     align-items: baseline;

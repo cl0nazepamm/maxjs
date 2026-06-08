@@ -591,6 +591,7 @@
         const PERFORMANCE_DEFAULTS = Object.freeze({
             fpsCap: 0,
             renderScale: 1.0,
+            postFxScale: 1.0,
             optimizeMaxInstances: true,
             maxInstanceBucketThreshold: 50,
             splatsEnabled: true,
@@ -625,6 +626,11 @@
             return Math.max(0.25, devicePixelRatio * scale);
         }
 
+        function getEffectivePostFxResolutionScale() {
+            const scale = Number.isFinite(performanceSettings.postFxScale) ? performanceSettings.postFxScale : 1.0;
+            return Math.max(0.25, Math.min(1.0, scale));
+        }
+
         function applyRendererPerformanceSettings({ resizePostFx = false } = {}) {
             if (renderer) {
                 renderer.setPixelRatio(getEffectivePixelRatio());
@@ -635,6 +641,8 @@
                 splatOverlay.renderer.setSize(innerWidth, innerHeight, false);
             }
             lastRenderTimestamp = 0;
+            maxjsFx.setResolutionScale?.(getEffectivePostFxResolutionScale());
+            webglBasicFx.setResolutionScale?.(getEffectivePostFxResolutionScale());
             if (resizePostFx) {
                 maxjsFx.resize();
                 webglBasicFx.resize?.();
@@ -4824,6 +4832,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 motionBlur: maxjsFx.isMotionBlurEnabled(), traa: maxjsFx.isTRAAEnabled(),
                 contactShadow: maxjsFx.isContactShadowEnabled(), retro: maxjsFx.isRetroEnabled(),
                 volumetric: maxjsFx.isVolumetricEnabled(), pixel: maxjsFx.isPixelEnabled(),
+                powershot: maxjsFx.isPowerShotEnabled(),
                 fog: maxjsFx.isFogEnabled(),
             };
             maxjsFx.setEnabled(false); maxjsFx.setSSREnabled(false); maxjsFx.setGTAOEnabled(false);
@@ -4831,6 +4840,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             maxjsFx.setMotionBlurEnabled(false); maxjsFx.setTRAAEnabled(false);
             maxjsFx.setContactShadowEnabled(false); maxjsFx.setRetroEnabled(false);
             maxjsFx.setVolumetricEnabled(false); maxjsFx.setPixelEnabled(false);
+            maxjsFx.setPowerShotEnabled(false);
             maxjsFx.setFogEnabled(false);
             rebuildAsciiEffect();
             asciiActive = true;
@@ -4852,7 +4862,8 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 maxjsFx.setToonOutlineEnabled(s.toonOutline); maxjsFx.setMotionBlurEnabled(s.motionBlur);
                 maxjsFx.setTRAAEnabled(s.traa); maxjsFx.setContactShadowEnabled(s.contactShadow);
                 maxjsFx.setRetroEnabled(s.retro); maxjsFx.setVolumetricEnabled(s.volumetric);
-                maxjsFx.setPixelEnabled(s.pixel);                 maxjsFx.setFogEnabled(s.fog);
+                maxjsFx.setPixelEnabled(s.pixel); maxjsFx.setPowerShotEnabled(s.powershot);
+                maxjsFx.setFogEnabled(s.fog);
                 asciiPreFxSnapshot = null;
             }
             syncPostFxPanel(true);
@@ -4889,6 +4900,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     retro: maxjsFx.isRetroEnabled(),
                     volumetric: maxjsFx.isVolumetricEnabled(),
                     pixel: maxjsFx.isPixelEnabled(),
+                    powershot: maxjsFx.isPowerShotEnabled(),
                     fog: maxjsFx.isFogEnabled(),
                     clone: maxjsFx.isCloneEnabled(),
                 };
@@ -4904,6 +4916,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 maxjsFx.setRetroEnabled(false);
                 maxjsFx.setVolumetricEnabled(false);
                 maxjsFx.setPixelEnabled(false);
+                maxjsFx.setPowerShotEnabled(false);
                 maxjsFx.setFogEnabled(false);
                 maxjsFx.setGTAOEnabled(false);
             }
@@ -4932,6 +4945,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 maxjsFx.setRetroEnabled(clayPreFxSnapshot.retro);
                 maxjsFx.setVolumetricEnabled(clayPreFxSnapshot.volumetric);
                 maxjsFx.setPixelEnabled(clayPreFxSnapshot.pixel);
+                maxjsFx.setPowerShotEnabled(clayPreFxSnapshot.powershot);
                 maxjsFx.setFogEnabled(clayPreFxSnapshot.fog);
                 maxjsFx.setCloneEnabled(clayPreFxSnapshot.clone);
                 clayPreFxSnapshot = null;
@@ -6986,13 +7000,79 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         const shadowCenter = new THREE.Vector3();
         const shadowSize = new THREE.Vector3();
         const shadowTarget = new THREE.Vector3();
+        const shadowOriginScale = new THREE.Vector3();
+        const shadowOriginDir = new THREE.Vector3();
+        const shadowOriginLightPos = new THREE.Vector3();
         const lightLocalPos = new THREE.Vector3();
         const lightWorldPos = new THREE.Vector3();
         const lightTargetLocal = new THREE.Vector3();
 
+        function isShadowMapOriginObject(object) {
+            const name = String(object?.name || '');
+            return /^(?:maxjs[\s_-]*)?(?:(?:shadow[\s_-]*map|shadowmap|shadow)[\s_-]*)origin(?:$|[\s_.:-])/i.test(name);
+        }
+
+        function getShadowMapOriginRadiusFromName(name) {
+            const match = String(name || '').match(/(?:^|[\s_:-])(?:r|radius|size)?[\s_:=:-]*(\d+(?:\.\d+)?)(?:$|[\s_:-])/i);
+            if (!match) return 0;
+            const radius = Number(match[1]);
+            return Number.isFinite(radius) && radius > 0 ? radius : 0;
+        }
+
+        function configureShadowMapOriginObject(object) {
+            if (!object) return;
+            object.userData ??= {};
+            object.userData.maxjsShadowMapOrigin = true;
+            object.userData.maxjsVisible = false;
+            object.castShadow = false;
+            object.receiveShadow = false;
+            setObjectSelfVisibleLayer(object, false);
+        }
+
+        function findShadowMapOriginObject() {
+            for (const object of nodeMap.values()) {
+                if (!isShadowMapOriginObject(object)) continue;
+                configureShadowMapOriginObject(object);
+                return object;
+            }
+            return null;
+        }
+
+        function getShadowMapOriginFocus(object) {
+            if (!object) return null;
+            object.updateWorldMatrix(true, false);
+            const nameRadius = getShadowMapOriginRadiusFromName(object.name);
+            shadowBounds.makeEmpty();
+            if (object.isMesh || object.isLine || object.isLineSegments) {
+                shadowBounds.setFromObject(object);
+            }
+            object.getWorldPosition(shadowCenter);
+
+            let radius = nameRadius;
+            if (!radius && !shadowBounds.isEmpty()) {
+                shadowBounds.getCenter(shadowCenter);
+                shadowBounds.getSize(shadowSize);
+                radius = Math.max(shadowSize.x, shadowSize.y, shadowSize.z) * 0.5;
+            }
+            if (!radius) {
+                object.getWorldScale(shadowOriginScale);
+                radius = Math.max(shadowOriginScale.x, shadowOriginScale.y, shadowOriginScale.z, 50);
+            }
+
+            return {
+                center: shadowCenter,
+                radius: Math.max(radius, 1),
+                explicit: true,
+            };
+        }
+
         function getShadowSceneFocus() {
+            const origin = findShadowMapOriginObject();
+            if (origin) return getShadowMapOriginFocus(origin);
+
             shadowBounds.makeEmpty();
             for (const [, mesh] of nodeMap) {
+                if (mesh?.userData?.maxjsShadowMapOrigin || isShadowMapOriginObject(mesh)) continue;
                 if (!mesh?.isMesh || !mesh.visible) continue;
                 shadowBounds.expandByObject(mesh);
             }
@@ -7005,16 +7085,46 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             shadowBounds.getCenter(shadowCenter);
             shadowBounds.getSize(shadowSize);
             const radius = Math.max(shadowSize.x, shadowSize.y, shadowSize.z, 50);
-            return { center: shadowCenter, radius };
+            return { center: shadowCenter, radius, explicit: false };
+        }
+
+        function setObjectWorldPosition(object, worldPosition) {
+            const parent = object?.parent;
+            if (!object || !worldPosition) return;
+            object.position.copy(worldPosition);
+            if (parent) {
+                parent.updateMatrixWorld(true);
+                parent.worldToLocal(object.position);
+            }
+            object.updateMatrixWorld(true);
+        }
+
+        function applyDirectionalShadowOrigin(light, focus) {
+            const target = light.userData?.maxjsTarget;
+            if (!focus?.explicit || !target) return;
+
+            light.getWorldPosition(lightWorldPos);
+            target.getWorldPosition(shadowTarget);
+            shadowOriginDir.subVectors(shadowTarget, lightWorldPos);
+            if (shadowOriginDir.lengthSq() < 1e-8) return;
+            shadowOriginDir.normalize();
+
+            const distance = Math.max(focus.radius * 4, lightWorldPos.distanceTo(shadowTarget), 200);
+            shadowOriginLightPos.copy(focus.center).addScaledVector(shadowOriginDir, -distance);
+            setObjectWorldPosition(light, shadowOriginLightPos);
+            setObjectWorldPosition(target, focus.center);
+            shadowTarget.copy(focus.center);
         }
 
         function updateLightShadowCamera(light, ld) {
             if (!light?.shadow || !light.castShadow) return;
 
-            const { center, radius } = getShadowSceneFocus();
+            const focus = getShadowSceneFocus();
+            const { radius } = focus;
             const shadowCamera = light.shadow.camera;
 
             if (ld.type === 0 && shadowCamera?.isOrthographicCamera) {
+                applyDirectionalShadowOrigin(light, focus);
                 shadowCamera.left = -radius;
                 shadowCamera.right = radius;
                 shadowCamera.top = radius;
@@ -7173,6 +7283,9 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             if (ld.name) light.name = ld.name;
             syncLightParent(light, ld);
 
+            const isRuntimeOverridden = (property) =>
+                ld.h != null && layerManager.hasObjectPropertyOverride?.(ld.h, property) === true;
+
             const visible = ld.v == null ? true : !!ld.v;
             light.userData.maxjsVisible = visible;
             light.visible = true;
@@ -7247,6 +7360,11 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     updateLightShadowCamera(light, ld);
                 }
             }
+            if (Object.prototype.hasOwnProperty.call(ld, 'map') && !isRuntimeOverridden('map')) {
+                light.map = ld.map ?? null;
+                light.needsUpdate = true;
+            }
+            if (ld.h != null) layerManager.applyObjectPropertyOverrides?.(ld.h, light);
         }
 
         function createLightFromData(ld) {
@@ -11635,6 +11753,94 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 ],
             },
             {
+                key: 'powershot',
+                title: 'PowerShot',
+                copy: 'Compact digital camera ISP: CCD smear, Bayer artifacts, denoise, sharpening, vignette, and JPEG blocks.',
+                note: 'Requires WebGPU or Force WebGL. Disabled while Shader Lab is active.',
+                keepVisibleWhenUnsupported: true,
+                disabledBy: () => (shaderLabFx?.isEnabled?.()
+                    ? 'Disabled while Shader Lab is active.'
+                    : null),
+                requiresWebGPU: true,
+                isEnabled: () => maxjsFx.isPowerShotEnabled(),
+                setEnabled: (enabled) => maxjsFx.setPowerShotEnabled(enabled),
+                getValues: (state) => ({
+                    mode: 'digital',
+                    preset: 'powershot',
+                    amount: 1.0,
+                    resolutionScale: 0.75,
+                    lensSoftness: 0.32,
+                    ccdBloom: 0.35,
+                    noiseScale: 1.06,
+                    bayerNR: 0.5,
+                    chromaNR: 1.0,
+                    jpegStrength: 0.2,
+                    jpegQuality: 60,
+                    jpegChroma420: 0.75,
+                    jpegMidtone: 0.45,
+                    jpegHighlight: 1.0,
+                    brightness: 0,
+                    contrast: 0,
+                    analogStrength: 0.72,
+                    analogTracking: 0.46,
+                    analogChromaBleed: 0.76,
+                    analogRinging: 0.62,
+                    analogTapeNoise: 0.70,
+                    analogEdgeWave: 0.34,
+                    analogDropouts: 0.32,
+                    analogScanlines: 0.54,
+                    analogHeadSwitch: 0.42,
+                    freezeNoise: false,
+                    ...(state.powershot || {}),
+                }),
+                setValues: (patch) => maxjsFx.setPowerShotOptions(patch),
+                controls: [
+                    {
+                        key: 'mode',
+                        label: 'Mode',
+                        type: 'select',
+                        options: [
+                            { value: 'digital', label: 'Digital CCD' },
+                            { value: 'analog', label: 'Analog VHS' },
+                        ],
+                    },
+                    {
+                        key: 'preset',
+                        label: 'Preset',
+                        type: 'select',
+                        visibleWhen: (values) => values.mode !== 'analog',
+                        options: maxjsFx.getPowerShotPresets().map((preset) => ({
+                            value: preset.key,
+                            label: `${preset.key} - ${preset.label}`,
+                        })),
+                    },
+                    { key: 'amount', label: 'Amount', min: 0, max: 1, step: 0.01, realtime: true },
+                    { key: 'resolutionScale', label: 'Resolution', min: 0.1, max: 1, step: 0.05 },
+                    { key: 'lensSoftness', label: 'Lens Softness', min: 0, max: 1, step: 0.01, realtime: true, visibleWhen: (values) => values.mode !== 'analog' },
+                    { key: 'ccdBloom', label: 'CCD Bloom', min: 0, max: 2, step: 0.01, realtime: true, visibleWhen: (values) => values.mode !== 'analog' },
+                    { key: 'noiseScale', label: 'Noise', min: 0, max: 2, step: 0.01, realtime: true, visibleWhen: (values) => values.mode !== 'analog' },
+                    { key: 'bayerNR', label: 'Bayer NR', min: 0, max: 1, step: 0.01, realtime: true, visibleWhen: (values) => values.mode !== 'analog' },
+                    { key: 'chromaNR', label: 'Chroma NR', min: 0, max: 1, step: 0.01, realtime: true, visibleWhen: (values) => values.mode !== 'analog' },
+                    { key: 'jpegStrength', label: 'JPEG', min: 0, max: 1, step: 0.01, realtime: true, visibleWhen: (values) => values.mode !== 'analog' },
+                    { key: 'jpegQuality', label: 'JPEG Quality', min: 1, max: 100, step: 1, integer: true, realtime: true, visibleWhen: (values) => values.mode !== 'analog' },
+                    { key: 'jpegChroma420', label: 'JPEG Chroma', min: 0, max: 1, step: 0.01, realtime: true, visibleWhen: (values) => values.mode !== 'analog' },
+                    { key: 'jpegMidtone', label: 'JPEG Midtones', min: 0, max: 1, step: 0.01, realtime: true, visibleWhen: (values) => values.mode !== 'analog' },
+                    { key: 'jpegHighlight', label: 'JPEG Highlights', min: 0, max: 2, step: 0.01, realtime: true, visibleWhen: (values) => values.mode !== 'analog' },
+                    { key: 'brightness', label: 'Brightness', min: -1, max: 1, step: 0.01, realtime: true },
+                    { key: 'contrast', label: 'Contrast', min: -1, max: 1, step: 0.01, realtime: true },
+                    { key: 'analogStrength', label: 'VHS Strength', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: (values) => values.mode === 'analog' },
+                    { key: 'analogTracking', label: 'Tracking', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: (values) => values.mode === 'analog' },
+                    { key: 'analogChromaBleed', label: 'Chroma Bleed', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: (values) => values.mode === 'analog' },
+                    { key: 'analogRinging', label: 'Ringing', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: (values) => values.mode === 'analog' },
+                    { key: 'analogTapeNoise', label: 'Tape Noise', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: (values) => values.mode === 'analog' },
+                    { key: 'analogEdgeWave', label: 'Edge Wave', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: (values) => values.mode === 'analog' },
+                    { key: 'analogDropouts', label: 'Dropouts', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: (values) => values.mode === 'analog' },
+                    { key: 'analogScanlines', label: 'Scanlines', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: (values) => values.mode === 'analog' },
+                    { key: 'analogHeadSwitch', label: 'Head Switch', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: (values) => values.mode === 'analog' },
+                    { key: 'freezeNoise', label: 'Freeze Noise', type: 'checkbox' },
+                ],
+            },
+            {
                 key: 'dof',
                 title: 'Depth of Field',
                 copy: 'Physical camera DOF with bokeh blur. Auto-syncs from Max Physical Camera when enabled.',
@@ -11723,6 +11929,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
 
         function readPostFxControlValue(control, input, getValues) {
             if (control.type === 'checkbox') return input.checked;
+            if (control.type === 'select') return input.value;
             if (control.dynamic === 'log') {
                 const values = getValues();
                 const min = logSliderMin(control);
@@ -11735,13 +11942,17 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
 
         /** Scrub preview only — no maxjsFx / pipeline work (keeps range inputs responsive). */
         function previewPostFxControlLabel(control, input, valueEl, getValues) {
-            if (!valueEl || control.type === 'checkbox') return;
+            if (!valueEl || control.type === 'checkbox' || control.type === 'select') return;
             const value = readPostFxControlValue(control, input, getValues);
             valueEl.textContent = formatControlValue(control, value);
         }
 
         function formatControlValue(control, value) {
             if (control.type === 'checkbox') return value ? 'On' : 'Off';
+            if (control.type === 'select') {
+                const option = (control.options || []).find((item) => item.value === value);
+                return option?.label || String(value ?? '');
+            }
             if (!Number.isFinite(value)) return '--';
             if (control.dynamic === 'log') {
                 if (value < 0.01) return value.toFixed(3);
@@ -11753,6 +11964,15 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             if (control.step >= 0.1) return value.toFixed(1);
             if (control.step >= 0.01) return value.toFixed(2);
             return value.toFixed(3);
+        }
+
+        function isPostFxControlVisible(control, values) {
+            if (typeof control.visibleWhen !== 'function') return true;
+            try {
+                return control.visibleWhen(values) !== false;
+            } catch (_) {
+                return true;
+            }
         }
 
         function setPostPanelVisible(visible) {
@@ -11768,12 +11988,8 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         }
 
         function buildPostFxPanel() {
-            const sectionsHtml = postFxSections.map(section => `
-                <section class="fx-section collapsed" data-fx-section="${section.key}">
-                    <div class="fx-section-header">
-                        <div class="fx-section-title">${section.title}</div>
-                        <button class="fx-toggle" type="button" id="fx-toggle-${section.key}">Off</button>
-                    </div>
+            const cloneSectionKeys = new Set(['powershot']);
+            const renderGeneratedPostFxControls = (section) => `
                     ${section.warn ? `<div class="fx-warn">${section.warn}</div>` : ''}
                     <div class="fx-grid">
                         ${section.controls.map(control => {
@@ -11782,9 +11998,26 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
 
                             if (control.type === 'checkbox') {
                                 return `
-                                    <label class="fx-check" for="${inputId}">
+                                    <label class="fx-check" for="${inputId}" data-fx-control="${control.key}">
                                         <span>${control.label}</span>
                                         <input id="${inputId}" type="checkbox">
+                                    </label>
+                                `;
+                            }
+
+                            if (control.type === 'select') {
+                                const options = (control.options || []).map((option) =>
+                                    `<option value="${option.value}">${option.label}</option>`
+                                ).join('');
+                                return `
+                                    <label class="fx-control" for="${inputId}" data-fx-control="${control.key}">
+                                        <div class="fx-control-head">
+                                            <span>${control.label}</span>
+                                        </div>
+                                        <select
+                                            id="${inputId}"
+                                            style="background:rgba(255,255,255,0.05);color:#aaa;border:1px solid rgba(255,255,255,0.08);border-radius:0;padding:3px 6px;font:10px 'Segoe UI',system-ui,sans-serif;width:100%;outline:none;cursor:pointer"
+                                        >${options}</select>
                                     </label>
                                 `;
                             }
@@ -11794,7 +12027,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                             const rangeMax = useLogSlider ? LOG_SLIDER_STEPS : control.max;
                             const rangeStep = useLogSlider ? 1 : control.step;
                             return `
-                                <label class="fx-control" for="${inputId}">
+                                <label class="fx-control" for="${inputId}" data-fx-control="${control.key}">
                                     <div class="fx-control-head">
                                         <span>${control.label}</span>
                                         <span class="fx-value" id="${valueId}"></span>
@@ -11812,8 +12045,33 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                         }).join('')}
                     </div>
                     <div class="fx-note" id="fx-note-${section.key}"></div>
+            `;
+            const renderGeneratedPostFxSection = (section) => `
+                <section class="fx-section collapsed" data-fx-section="${section.key}">
+                    <div class="fx-section-header">
+                        <div class="fx-section-title">${section.title}</div>
+                        <button class="fx-toggle" type="button" id="fx-toggle-${section.key}">Off</button>
+                    </div>
+                    ${renderGeneratedPostFxControls(section)}
                 </section>
-            `).join('');
+            `;
+            const renderClonePostFxSubsection = (section) => `
+                <div class="clone-subsection" data-fx-section="${section.key}" data-post-stack-only style="margin-top:8px;padding:6px 0 4px;border-top:1px solid rgba(255,255,255,0.08)">
+                    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">
+                        <span style="font-size:11px;color:#ccc;font-weight:600;letter-spacing:0.3px">${section.title}</span>
+                        <button class="fx-toggle" type="button" id="fx-toggle-${section.key}">Off</button>
+                    </div>
+                    ${renderGeneratedPostFxControls(section)}
+                </div>
+            `;
+            const sectionsHtml = postFxSections
+                .filter(section => !cloneSectionKeys.has(section.key))
+                .map(renderGeneratedPostFxSection)
+                .join('');
+            const cloneSectionsHtml = postFxSections
+                .filter(section => cloneSectionKeys.has(section.key))
+                .map(renderClonePostFxSubsection)
+                .join('');
 
             const tmOptions = Object.keys(toneMappingModes).map(name =>
                 `<option value="${name}" ${name === currentToneMapping ? 'selected' : ''}>${name}</option>`
@@ -11907,6 +12165,13 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                                 </div>
                                 <input class="fx-range" id="fx-performance-renderscale" type="range" min="0.25" max="1" step="0.05" value="${performanceSettings.renderScale}">
                             </label>
+                            <label class="fx-control" for="fx-performance-postfxscale">
+                                <div class="fx-control-head">
+                                    <span>Post FX Scale</span>
+                                    <span class="fx-value" id="fx-performance-postfxscale-val">${getEffectivePostFxResolutionScale().toFixed(2)}x</span>
+                                </div>
+                                <input class="fx-range" id="fx-performance-postfxscale" type="range" min="0.25" max="1" step="0.05" value="${getEffectivePostFxResolutionScale()}">
+                            </label>
                             <label class="fx-check" for="fx-performance-optimizeinstances">
                                 <span>Optimize Max Instances</span>
                                 <input id="fx-performance-optimizeinstances" type="checkbox" ${performanceSettings.optimizeMaxInstances ? 'checked' : ''}>
@@ -11923,7 +12188,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                                 <input class="fx-range" id="fx-performance-instancethreshold" type="range" min="2" max="500" step="1" value="${performanceSettings.maxInstanceBucketThreshold}">
                             </label>
                         </div>
-                        <div class="fx-note" id="fx-performance-note">Caps viewer frame rate (12 = stop-motion look, 24 = cinema) and scales device pixel ratio to reduce GPU load. Splats off skips Spark (no second WebGL pass). Headset sessions stay uncapped.</div>
+                        <div class="fx-note" id="fx-performance-note">Caps viewer frame rate and scales renderer/post-FX resolution to reduce GPU load. Splats off skips Spark. Headset sessions stay uncapped.</div>
                     </section>
                     <section class="fx-section collapsed" data-keep-on-shader-lab>
                         <div class="fx-section-header">
@@ -12038,6 +12303,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                             </div>
                             <div class="fx-note" style="margin-top:2px">Combine it with Pixel or Retro.</div>
                         </div>
+                        ${cloneSectionsHtml}
                     </section>
                     <section class="fx-section collapsed" data-fx-section="ascii">
                         <div class="fx-section-header">
@@ -12090,13 +12356,14 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     retro: { wiggle: false, affineDistortion: 5.0, resolutionScale: 0.25, filterTextures: false, dither: false, colorDepth: 32, scanlines: false, scanlineIntensity: 0.3, scanlineDensity: 1.0, crt: false, vignetteIntensity: 0.3, bleeding: 0.001, curvature: 0.02 },
                     volumetric: { intensity: 1.0, steps: 12, density: 0.5, denoise: 0.6, resolution: 0.25 },
                     pixel: { pixelate: false, pixelSize: 4, chromatic: false, chromaticIntensity: 0.005, sharpen: false, sharpenStrength: 0.5, grain: false, grainIntensity: 0.08, brightness: 0, contrast: 0, saturation: 0 },
+                    powershot: { mode: 'digital', preset: 'powershot', amount: 1.0, resolutionScale: 0.75, lensSoftness: 0.32, ccdBloom: 0.35, noiseScale: 1.06, bayerNR: 0.5, chromaNR: 1.0, jpegStrength: 0.2, jpegQuality: 60, jpegChroma420: 0.75, jpegMidtone: 0.45, jpegHighlight: 1.0, brightness: 0, contrast: 0, analogStrength: 0.72, analogTracking: 0.46, analogChromaBleed: 0.76, analogRinging: 0.62, analogTapeNoise: 0.70, analogEdgeWave: 0.34, analogDropouts: 0.32, analogScanlines: 0.54, analogHeadSwitch: 0.42, freezeNoise: false },
                     fog: { type: 0, opacity: 1.0, near: 10, far: 500, density: 0.01, noiseScale: 0.005, noiseSpeed: 0.2, height: 20 },
                 };
                 if (clayModeActive) {
                     // Clay owns the live FX state — reset the snapshot so exit restores to defaults
                     clayPreFxSnapshot = { ssgi: false, ssr: false, gtao: false, bloom: false,
                         toonOutline: false, motionBlur: false, traa: false, contactShadow: false,
-                        retro: false, volumetric: false, pixel: false, fog: false, clone: false };
+                        retro: false, volumetric: false, pixel: false, powershot: false, fog: false, clone: false };
                     // Still push default values so they're ready when clay exits
                     for (const section of postFxSections) {
                         if (defaults[section.key]) section.setValues(defaults[section.key]);
@@ -12189,15 +12456,24 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             const brightnessLabel = document.getElementById('fx-tonemapping-brightness-val');
             const contrastSlider = document.getElementById('fx-tonemapping-contrast');
             const contrastLabel = document.getElementById('fx-tonemapping-contrast-val');
+            const usePowerShotColorGrading = () => maxjsFx.isPowerShotEnabled?.() === true;
             brightnessSlider.oninput = (e) => {
                 const v = parseFloat(e.target.value);
-                maxjsFx.setColorGrading({ brightness: v });
+                if (usePowerShotColorGrading()) {
+                    maxjsFx.setPowerShotOptions({ brightness: v });
+                } else {
+                    maxjsFx.setColorGrading({ brightness: v });
+                }
                 brightnessLabel.textContent = v.toFixed(2);
             };
             brightnessSlider.onchange = () => savePostFxState();
             contrastSlider.oninput = (e) => {
                 const v = parseFloat(e.target.value);
-                maxjsFx.setColorGrading({ contrast: v });
+                if (usePowerShotColorGrading()) {
+                    maxjsFx.setPowerShotOptions({ contrast: v });
+                } else {
+                    maxjsFx.setColorGrading({ contrast: v });
+                }
                 contrastLabel.textContent = v.toFixed(2);
             };
             contrastSlider.onchange = () => savePostFxState();
@@ -12215,6 +12491,8 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             const fpsCapSelect = document.getElementById('fx-performance-fpscap');
             const renderScaleSlider = document.getElementById('fx-performance-renderscale');
             const renderScaleValue = document.getElementById('fx-performance-renderscale-val');
+            const postFxScaleSlider = document.getElementById('fx-performance-postfxscale');
+            const postFxScaleValue = document.getElementById('fx-performance-postfxscale-val');
             const optimizeInstancesCheck = document.getElementById('fx-performance-optimizeinstances');
             const splatsEnabledCheck = document.getElementById('fx-performance-splats');
             const instanceThresholdSlider = document.getElementById('fx-performance-instancethreshold');
@@ -12231,6 +12509,15 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             };
             renderScaleSlider.onchange = (e) => {
                 performanceSettings.renderScale = Math.max(0.25, Math.min(1.0, Number(e.target.value) || 1.0));
+                applyRendererPerformanceSettings({ resizePostFx: true });
+                savePostFxState();
+            };
+            postFxScaleSlider.oninput = (e) => {
+                const scale = Math.max(0.25, Math.min(1.0, Number(e.target.value) || 1.0));
+                postFxScaleValue.textContent = `${scale.toFixed(2)}x`;
+            };
+            postFxScaleSlider.onchange = (e) => {
+                performanceSettings.postFxScale = Math.max(0.25, Math.min(1.0, Number(e.target.value) || 1.0));
                 applyRendererPerformanceSettings({ resizePostFx: true });
                 savePostFxState();
             };
@@ -12479,7 +12766,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             }
 
             for (const section of postFxSections) {
-                section.sectionEl = document.querySelector(`.fx-section[data-fx-section="${section.key}"]`);
+                section.sectionEl = document.querySelector(`[data-fx-section="${section.key}"]`);
                 section.toggleEl = document.getElementById(`fx-toggle-${section.key}`);
                 section.noteEl = document.getElementById(`fx-note-${section.key}`);
                 section.controlEls = {};
@@ -12500,8 +12787,9 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     const valueEl = control.type === 'checkbox'
                         ? null
                         : document.getElementById(`fx-value-${section.key}-${control.key}`);
+                    const wrapperEl = input?.closest?.('[data-fx-control]');
 
-                    section.controlEls[control.key] = { input, valueEl };
+                    section.controlEls[control.key] = { input, valueEl, wrapperEl };
 
                     const getSectionValues = () => section.getValues(maxjsFx.getState());
                     const applyControlValueLive = () => {
@@ -12513,7 +12801,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                         syncPostFxPanel(true, { persist });
                     };
 
-                    if (control.type === 'checkbox') {
+                    if (control.type === 'checkbox' || control.type === 'select') {
                         input.addEventListener('change', () => commitControlValue(true));
                     } else if (control.realtime) {
                         input.addEventListener('input', () => {
@@ -12565,6 +12853,8 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             const fpsCapSelect = document.getElementById('fx-performance-fpscap');
             const renderScaleSlider = document.getElementById('fx-performance-renderscale');
             const renderScaleValue = document.getElementById('fx-performance-renderscale-val');
+            const postFxScaleSlider = document.getElementById('fx-performance-postfxscale');
+            const postFxScaleValue = document.getElementById('fx-performance-postfxscale-val');
             const optimizeInstancesCheck = document.getElementById('fx-performance-optimizeinstances');
             const splatsEnabledCheck = document.getElementById('fx-performance-splats');
             const instanceThresholdSlider = document.getElementById('fx-performance-instancethreshold');
@@ -12578,7 +12868,10 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 expSlider.value = String(exposureLinearToSliderInput(currentExposure));
             }
             if (expLabel) expLabel.textContent = formatExposureEvLabel(currentExposure);
-            const cg = maxjsFx.getColorGrading();
+            const colorGradingUsesPowerShot = maxjsFx.isPowerShotEnabled?.() === true;
+            const cg = colorGradingUsesPowerShot
+                ? maxjsFx.getState().powershot
+                : maxjsFx.getColorGrading();
             const brightnessSlider = document.getElementById('fx-tonemapping-brightness');
             const brightnessLabel = document.getElementById('fx-tonemapping-brightness-val');
             const contrastSlider = document.getElementById('fx-tonemapping-contrast');
@@ -12587,6 +12880,8 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             if (brightnessLabel) brightnessLabel.textContent = cg.brightness.toFixed(2);
             if (canSyncInput(contrastSlider)) contrastSlider.value = String(cg.contrast);
             if (contrastLabel) contrastLabel.textContent = cg.contrast.toFixed(2);
+            if (brightnessSlider) brightnessSlider.disabled = false;
+            if (contrastSlider) contrastSlider.disabled = false;
             const aaSelect = document.getElementById('fx-aa-mode');
             if (canSyncInput(aaSelect)) {
                 aaSelect.value = (!supportsScreenSpaceEffects && currentAAMode === 'traa')
@@ -12601,13 +12896,15 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             if (canSyncInput(fpsCapSelect)) fpsCapSelect.value = String(performanceSettings.fpsCap || 0);
             if (canSyncInput(renderScaleSlider)) renderScaleSlider.value = String(performanceSettings.renderScale);
             if (renderScaleValue) renderScaleValue.textContent = `${performanceSettings.renderScale.toFixed(2)}x`;
+            if (canSyncInput(postFxScaleSlider)) postFxScaleSlider.value = String(getEffectivePostFxResolutionScale());
+            if (postFxScaleValue) postFxScaleValue.textContent = `${getEffectivePostFxResolutionScale().toFixed(2)}x`;
             if (canSyncInput(optimizeInstancesCheck)) optimizeInstancesCheck.checked = !!performanceSettings.optimizeMaxInstances;
             if (canSyncInput(splatsEnabledCheck)) splatsEnabledCheck.checked = performanceSettings.splatsEnabled !== false;
             if (canSyncInput(instanceThresholdSlider)) instanceThresholdSlider.value = String(performanceSettings.maxInstanceBucketThreshold);
             if (instanceThresholdValue) instanceThresholdValue.textContent = String(performanceSettings.maxInstanceBucketThreshold);
             if (performanceNote) {
                 performanceNote.textContent =
-                    `Caps the viewer frame rate and scales device pixel ratio to reduce GPU load. Effective DPR ${getEffectivePixelRatio().toFixed(2)}. Splats off skips Spark. Large plain Max instance groups can collapse into InstancedMesh buckets. Headset sessions stay uncapped.`;
+                    `Caps the viewer frame rate and scales device pixel ratio/post-FX targets to reduce GPU load. Effective DPR ${getEffectivePixelRatio().toFixed(2)}. Post FX ${getEffectivePostFxResolutionScale().toFixed(2)}x. Splats off skips Spark. Large plain Max instance groups can collapse into InstancedMesh buckets. Headset sessions stay uncapped.`;
             }
 
             const cameraNearInput = document.getElementById('fx-camera-near');
@@ -12634,10 +12931,11 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 const values = section.getValues(state);
                 const enabled = section.isEnabled();
                 const disabledByOther = section.disabledBy ? section.disabledBy(state) : null;
-                const hiddenByBackend = section.requiresWebGPU && !supportsScreenSpaceEffects;
+                const unsupportedBackend = section.requiresWebGPU && !supportsScreenSpaceEffects;
+                const hiddenByBackend = unsupportedBackend && !section.keepVisibleWhenUnsupported;
                 const disabled =
                     !available ||
-                    hiddenByBackend ||
+                    unsupportedBackend ||
                     !!disabledByOther;
 
                 if (section.sectionEl) {
@@ -12653,15 +12951,19 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 for (const control of section.controls) {
                     const controlEl = section.controlEls[control.key];
                     if (!controlEl) continue;
+                    const visible = isPostFxControlVisible(control, values);
+                    if (controlEl.wrapperEl) controlEl.wrapperEl.hidden = !visible;
                     const editingControl = !force && document.activeElement === controlEl.input;
 
                     // Disable DOF sliders when "Auto from Camera" is on (Physical Camera drives them)
                     const dofAutoControls = ['focusDistance', 'focalLength', 'bokehScale'];
                     const autoLocked = section.key === 'dof' && dofAutoControls.includes(control.key) && values.autoFromCamera;
-                    controlEl.input.disabled = disabled || autoLocked;
+                    controlEl.input.disabled = disabled || autoLocked || !visible;
 
                     if (control.type === 'checkbox') {
                         if (!editingControl) controlEl.input.checked = !!values[control.key];
+                    } else if (control.type === 'select') {
+                        if (!editingControl) controlEl.input.value = values[control.key];
                     } else if (control.dynamic === 'log') {
                         const min = logSliderMin(control);
                         const max = logSliderMax(control, values[control.key]);
@@ -12684,7 +12986,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 if (!available && lastError) {
                     note = lastError;
                     isError = true;
-                } else if (section.requiresWebGPU && !supportsScreenSpaceEffects) {
+                } else if (unsupportedBackend) {
                     note = 'Requires WebGPU or Force WebGL.';
                     isError = true;
                 } else if (disabledByOther) {
@@ -12732,6 +13034,14 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             }
         }
 
+        function serializeSnapshotFxState() {
+            const fx = maxjsFx.getState();
+            if (!fx || typeof fx !== 'object') return fx;
+            const snapshotFx = { ...fx };
+            delete snapshotFx.powershot;
+            return snapshotFx;
+        }
+
         function serializeSnapshotUiState({ includeDebug = false } = {}) {
             const snapshotRendererBackend = isPathTracingMode ? 'WebGL2' : rendererBackendLabel;
             const authoredEnvironmentActive = !!(skyActive || currentEnvParams?.hdri);
@@ -12746,7 +13056,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 lightProbeEnabled,
                 lightMode,
                 background: hiddenBackgroundColor,
-                fx: maxjsFx.getState(),
+                fx: serializeSnapshotFxState(),
                 webglBasicFx: webglBasicFx.getState?.(),
                 camera: serializeCurrentCameraState(),
                 hdri: {
@@ -12761,6 +13071,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 performance: {
                     fpsCap: performanceSettings.fpsCap,
                     renderScale: performanceSettings.renderScale,
+                    postFxScale: getEffectivePostFxResolutionScale(),
                     optimizeMaxInstances: performanceSettings.optimizeMaxInstances,
                     maxInstanceBucketThreshold: performanceSettings.maxInstanceBucketThreshold,
                     splatsEnabled: performanceSettings.splatsEnabled !== false,
@@ -12790,6 +13101,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
 
         function serializePersistedPostFxState() {
             const payload = serializeSnapshotUiState();
+            payload.fx = maxjsFx.getState();
             delete payload.camera;
             delete payload.studio;
             delete payload.bake;
@@ -12901,6 +13213,9 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     }
                     if (Number.isFinite(saved.performance.renderScale)) {
                         performanceSettings.renderScale = Math.max(0.25, Math.min(1.0, saved.performance.renderScale));
+                    }
+                    if (Number.isFinite(saved.performance.postFxScale)) {
+                        performanceSettings.postFxScale = Math.max(0.25, Math.min(1.0, saved.performance.postFxScale));
                     }
                     if (typeof saved.performance.optimizeMaxInstances === 'boolean') {
                         performanceSettings.optimizeMaxInstances = saved.performance.optimizeMaxInstances;
@@ -13767,6 +14082,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 // Save and bypass all performance throttling
                 savedPerformanceSettings = { ...performanceSettings };
                 performanceSettings.renderScale = 1.0;
+                performanceSettings.postFxScale = 1.0;
                 performanceSettings.fpsCap = 0;
 
                 savedRenderToImageState = {

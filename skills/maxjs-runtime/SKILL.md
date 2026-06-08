@@ -85,6 +85,7 @@ Adapters represent synced Max objects.
 - Geometry sampling: `node.sampleSurface({ point, normal, rng })` returns `{ point, normal, barycentric, triangleIndex, mesh, meshHandle, meshName }`. Use `count` for multiple area-weighted samples.
 - Anchors: `node.createAnchor(options)`.
 - Runtime clone: `node.clone(options)` mirrors `ctx.js.cloneFromMax(node, options)` and returns a runtime-owned `Object3D`.
+- Path-scoped runtime property overrides: `node.overrides.setProperty(property, value, options)`, `node.overrides.clearProperty(property, options)`, and `node.overrides.hasProperty(property)`.
 - Reset: `node.resetTransform()` clears runtime transform overrides; `node.reset()` clears transform and visibility overrides.
 - Orientation helpers: `getPivotWorldPosition()`, `getVisualCenter()`, `getPivotToVisualCenter()`, `getLocalAxesWorld()`, `getOrientationSnapshot()`.
 
@@ -162,6 +163,38 @@ Modes:
 - `world`: target world space.
 
 Clear overrides in `dispose()` if the layer temporarily owns authored objects.
+
+## Runtime Property Overrides
+
+Use `node.overrides` when a runtime layer must own one exact Three.js property on a synced Max object while the rest of the object continues to sync from Max. Overrides are keyed by `(handle, property)`, so setting `node.overrides.setProperty('map', texture)` on a synced `SpotLight` only protects `light.map`; position, intensity, color, angle, shadow settings, parenting, and visibility still update from fastsync/playback.
+
+This is the preferred API for light cookies/gobos, runtime-only texture slots, and other layer-owned properties that native sync would otherwise overwrite.
+
+```js
+const spot = ctx.maxScene.findOne('TJS_Spot');
+const texture = ctx.js.own(new THREE.TextureLoader().load('./inlines/cookie.png'));
+texture.colorSpace = THREE.SRGBColorSpace;
+
+spot.overrides.setProperty('map', texture, {
+    needsUpdate: true,
+    shadowNeedsUpdate: true,
+    materialsNeedUpdate: true,
+});
+```
+
+Clear the exact path on teardown when the runtime layer no longer owns it:
+
+```js
+dispose() {
+    spot?.overrides.clearProperty('map', {
+        restoreValue: null,
+        needsUpdate: true,
+        shadowNeedsUpdate: true,
+    });
+}
+```
+
+Do not replace whole synced objects or bypass the adapter for this pattern. Raw writes like `spot.raw.map = texture` are acceptable only as compatibility fallback for older viewer builds, because the next sync or playback update can overwrite them.
 
 ## Other Important `ctx` APIs
 

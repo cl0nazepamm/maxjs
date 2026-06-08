@@ -922,7 +922,8 @@ function startRenderLoop({ renderer, scene, camera, controls, layerManager, anim
 
         layerManager?.beforeRender?.(elapsed);
         try {
-            // Default render path. MaxJS FX (when present) takes over.
+            // Snapshot boot keeps the conservative FX gate; advanced live-viewer
+            // post stacks are intentionally not replayed in deploy snapshots.
             if (maxjsFx?.isEnabled?.()) {
                 maxjsFx.render();
             } else {

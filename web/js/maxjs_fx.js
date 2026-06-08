@@ -65,6 +65,8 @@ import { dof } from 'three/addons/tsl/display/DepthOfFieldNode.js';
 import { traa } from 'three/addons/tsl/display/TRAANode.js';
 import { gaussianBlur } from 'three/addons/tsl/display/GaussianBlurNode.js';
 import { ImprovedNoise } from 'three/addons/math/ImprovedNoise.js';
+import { Pipeline as PowerShotPipeline, applyPreset as applyPowerShotPreset, STAGE_DEFS as POWERSHOT_STAGE_DEFS } from './powershot_pipeline.js';
+import { PRESETS as POWERSHOT_PRESETS, PRESET_KEYS as POWERSHOT_PRESET_KEYS } from './powershot_presets.js';
 
 function setTexturePrecision(scenePass) {
     const diffuseTexture = scenePass.getTexture('diffuseColor');
@@ -246,6 +248,35 @@ export function createMaxJSFxController({
             contrast: 0,
             saturation: 0,
         },
+        powershot: {
+            enabled: false,
+            mode: 'digital',
+            preset: 'powershot',
+            amount: 1.0,
+            resolutionScale: 0.75,
+            lensSoftness: 0.32,
+            ccdBloom: 0.35,
+            noiseScale: 1.06,
+            bayerNR: 0.5,
+            chromaNR: 1.0,
+            jpegStrength: 0.2,
+            jpegQuality: 60,
+            jpegChroma420: 0.75,
+            jpegMidtone: 0.45,
+            jpegHighlight: 1.0,
+            brightness: 0,
+            contrast: 0,
+            analogStrength: 0.72,
+            analogTracking: 0.46,
+            analogChromaBleed: 0.76,
+            analogRinging: 0.62,
+            analogTapeNoise: 0.70,
+            analogEdgeWave: 0.34,
+            analogDropouts: 0.32,
+            analogScanlines: 0.54,
+            analogHeadSwitch: 0.42,
+            freezeNoise: false,
+        },
         dof: {
             enabled: false,
             autoFromCamera: true,
@@ -292,6 +323,10 @@ export function createMaxJSFxController({
     let activeShaderLabFx = shaderLabFx;
     let shaderLabInputTarget = null;
     let lastShaderLabFrameTime = 0;
+    let powerShotInputTarget = null;
+    let powerShotPipeline = null;
+    let powerShotFrame = 0;
+    let postFxResolutionScale = 1.0;
     const dofFocusDistanceU = uniform(100);
     const dofFocalLengthU = uniform(50);
     const dofBokehScaleU = uniform(5);
@@ -401,6 +436,114 @@ export function createMaxJSFxController({
         return supportsScreenSpaceEffects
             && !!state.retro.wiggle
             && (state.retro.enabled || isShaderLabEnabled());
+    }
+
+    function isPowerShotActive() {
+        return supportsScreenSpaceEffects
+            && !!state.powershot.enabled
+            && !isShaderLabEnabled();
+    }
+
+    function normalizePowerShotPreset(value) {
+        const key = String(value || 'powershot');
+        return POWERSHOT_PRESETS[key] ? key : 'powershot';
+    }
+
+    function powerShotPresetUiDefaults(key) {
+        const preset = POWERSHOT_PRESETS[normalizePowerShotPreset(key)] || POWERSHOT_PRESETS.powershot;
+        return {
+            lensSoftness: preset.lens_softness ?? 0.25,
+            ccdBloom: preset.ccd_bloom_strength ?? 0,
+            bayerNR: preset.bnr_strength ?? 0,
+            jpegStrength: 0.2,
+            jpegQuality: preset.jpeg_quality ?? 60,
+            jpegChroma420: 0.75,
+            jpegMidtone: 0.45,
+            jpegHighlight: 1.0,
+            analogStrength: preset.analog_vhs_strength ?? 0.65,
+            analogTracking: preset.analog_tracking ?? 0.45,
+            analogChromaBleed: preset.analog_chroma_bleed ?? 0.75,
+            analogRinging: preset.analog_ringing ?? 0.65,
+            analogTapeNoise: preset.analog_tape_noise ?? 0.75,
+            analogEdgeWave: preset.analog_edge_wave ?? 0.35,
+            analogDropouts: preset.analog_dropouts ?? 0.35,
+            analogScanlines: preset.analog_scanlines ?? 0.55,
+            analogHeadSwitch: preset.analog_head_switch ?? 0.45,
+        };
+    }
+
+    function finiteOr(value, fallback) {
+        return Number.isFinite(value) ? value : fallback;
+    }
+
+    function normalizePowerShotOptions() {
+        const p = state.powershot;
+        p.mode = p.mode === 'analog' ? 'analog' : 'digital';
+        p.amount = THREE.MathUtils.clamp(finiteOr(p.amount, 1.0), 0, 1);
+        p.resolutionScale = THREE.MathUtils.clamp(finiteOr(p.resolutionScale, 0.75), 0.1, 1);
+        p.lensSoftness = THREE.MathUtils.clamp(finiteOr(p.lensSoftness, 0.32), 0, 1);
+        p.ccdBloom = THREE.MathUtils.clamp(finiteOr(p.ccdBloom, 0.35), 0, 2);
+        p.noiseScale = THREE.MathUtils.clamp(finiteOr(p.noiseScale, 1.06), 0, 2);
+        p.bayerNR = THREE.MathUtils.clamp(finiteOr(p.bayerNR, 0.5), 0, 1);
+        p.chromaNR = THREE.MathUtils.clamp(finiteOr(p.chromaNR, 1.0), 0, 1);
+        p.jpegStrength = THREE.MathUtils.clamp(finiteOr(p.jpegStrength, 0.2), 0, 1);
+        p.jpegQuality = THREE.MathUtils.clamp(finiteOr(p.jpegQuality, 60), 1, 100);
+        p.jpegChroma420 = THREE.MathUtils.clamp(finiteOr(p.jpegChroma420, 0.75), 0, 1);
+        p.jpegMidtone = THREE.MathUtils.clamp(finiteOr(p.jpegMidtone, 0.45), 0, 1);
+        p.jpegHighlight = THREE.MathUtils.clamp(finiteOr(p.jpegHighlight, 1.0), 0, 2);
+        p.brightness = THREE.MathUtils.clamp(finiteOr(p.brightness, 0), -1, 1);
+        p.contrast = THREE.MathUtils.clamp(finiteOr(p.contrast, 0), -1, 1);
+        p.analogStrength = THREE.MathUtils.clamp(finiteOr(p.analogStrength, 0.72), 0, 3);
+        p.analogTracking = THREE.MathUtils.clamp(finiteOr(p.analogTracking, 0.46), 0, 3);
+        p.analogChromaBleed = THREE.MathUtils.clamp(finiteOr(p.analogChromaBleed, 0.76), 0, 3);
+        p.analogRinging = THREE.MathUtils.clamp(finiteOr(p.analogRinging, 0.62), 0, 3);
+        p.analogTapeNoise = THREE.MathUtils.clamp(finiteOr(p.analogTapeNoise, 0.70), 0, 3);
+        p.analogEdgeWave = THREE.MathUtils.clamp(finiteOr(p.analogEdgeWave, 0.34), 0, 3);
+        p.analogDropouts = THREE.MathUtils.clamp(finiteOr(p.analogDropouts, 0.32), 0, 3);
+        p.analogScanlines = THREE.MathUtils.clamp(finiteOr(p.analogScanlines, 0.54), 0, 3);
+        p.analogHeadSwitch = THREE.MathUtils.clamp(finiteOr(p.analogHeadSwitch, 0.42), 0, 3);
+        return p;
+    }
+
+    function syncPowerShotPipeline() {
+        if (!powerShotPipeline) return;
+        const p = normalizePowerShotOptions();
+        const presetKey = normalizePowerShotPreset(p.preset);
+        p.preset = presetKey;
+        powerShotPipeline.setMode?.(p.mode);
+        applyPowerShotPreset(powerShotPipeline.ctx, POWERSHOT_PRESETS[presetKey]);
+        powerShotPipeline.ctx.power.value = THREE.MathUtils.clamp(p.amount, 0, 1);
+        powerShotPipeline.ctx.P.lensSoftness.value = p.lensSoftness;
+        powerShotPipeline.ctx.P.ccdBloom.value = p.ccdBloom;
+        powerShotPipeline.ctx.noiseScale.value = p.noiseScale;
+        powerShotPipeline.ctx.P.bayerNR.value = p.bayerNR;
+        powerShotPipeline.ctx.P.chromaNR.value = p.chromaNR;
+        powerShotPipeline.ctx.P.jpegStrength.value = p.jpegStrength;
+        powerShotPipeline.ctx.P.jpegQuality.value = p.jpegQuality;
+        powerShotPipeline.ctx.P.jpegChroma420.value = p.jpegChroma420;
+        powerShotPipeline.ctx.P.jpegMidtone.value = p.jpegMidtone;
+        powerShotPipeline.ctx.P.jpegHighlight.value = p.jpegHighlight;
+        powerShotPipeline.ctx.P.analogStrength.value = p.analogStrength;
+        powerShotPipeline.ctx.P.analogTracking.value = p.analogTracking;
+        powerShotPipeline.ctx.P.analogChromaBleed.value = p.analogChromaBleed;
+        powerShotPipeline.ctx.P.analogRinging.value = p.analogRinging;
+        powerShotPipeline.ctx.P.analogTapeNoise.value = p.analogTapeNoise;
+        powerShotPipeline.ctx.P.analogEdgeWave.value = p.analogEdgeWave;
+        powerShotPipeline.ctx.P.analogDropouts.value = p.analogDropouts;
+        powerShotPipeline.ctx.P.analogScanlines.value = p.analogScanlines;
+        powerShotPipeline.ctx.P.analogHeadSwitch.value = p.analogHeadSwitch;
+        powerShotPipeline.setOutputColorGrading?.(p);
+    }
+
+    function ensurePowerShotPipeline() {
+        if (!powerShotPipeline) {
+            powerShotPipeline = new PowerShotPipeline(renderer);
+            for (const stage of POWERSHOT_STAGE_DEFS) {
+                powerShotPipeline.setEnabled(stage.id, stage.id !== 'tone');
+            }
+        }
+        syncPowerShotPipeline();
+        return powerShotPipeline;
     }
 
     function matchAndSmooth(rawBlobs) {
@@ -780,6 +923,7 @@ export function createMaxJSFxController({
         state.traa.enabled = false;
         state.bloom.enabled = false;
         state.pixel.enabled = false;
+        state.powershot.enabled = false;
         state.volumetric.enabled = false;
         state.dof.enabled = false;
         pipelineReady = false;
@@ -803,6 +947,7 @@ export function createMaxJSFxController({
             || isContactShadowActive()
             || isRetroActive()
             || isScreenSpaceActive('pixel')
+            || isPowerShotActive()
             || isScreenSpaceActive('volumetric')
             || isScreenSpaceActive('dof')
             || isScreenSpaceActive('fog');
@@ -816,7 +961,7 @@ export function createMaxJSFxController({
         const canvas = renderer?.domElement;
         if (!canvas?.style) return;
 
-        if (!hasColorGradingEnabled()) {
+        if (!hasColorGradingEnabled() || isPowerShotActive()) {
             canvas.style.filter = '';
             return;
         }
@@ -877,6 +1022,7 @@ export function createMaxJSFxController({
             retro: { ...state.retro },
             fog: { ...state.fog },
             pixel: { ...state.pixel },
+            powershot: { ...state.powershot },
             volumetric: { ...state.volumetric },
             dof: { ...state.dof },
             clone: { ...state.clone, color: [...state.clone.color] },  // blob tracker (CPU-only, no GPU pipeline)
@@ -888,7 +1034,7 @@ export function createMaxJSFxController({
         const keys = [
             'ssgi', 'ssr', 'gtao', 'motionBlur', 'traa', 'bloom',
             'toonOutline', 'contactShadow', 'retro', 'fog', 'pixel',
-            'volumetric', 'dof', 'clone', 'colorGrading',
+            'powershot', 'volumetric', 'dof', 'clone', 'colorGrading',
         ];
         for (const key of keys) {
             const source = fx[key];
@@ -994,10 +1140,41 @@ export function createMaxJSFxController({
         snapshotRendererOutputState();
     }
 
+    function normalizePostFxResolutionScale(value) {
+        const numeric = Number(value);
+        if (!Number.isFinite(numeric)) return 1.0;
+        return THREE.MathUtils.clamp(numeric, 0.25, 1.0);
+    }
+
+    function getCombinedPostFxResolutionScale(extraScale = 1.0) {
+        const extra = Number(extraScale);
+        const safeExtra = Number.isFinite(extra) ? extra : 1.0;
+        return THREE.MathUtils.clamp(postFxResolutionScale * safeExtra, 0.1, 1.0);
+    }
+
+    function getScaledPostFxSize(width, height, extraScale = 1.0) {
+        const scale = getCombinedPostFxResolutionScale(extraScale);
+        return {
+            width: Math.max(2, Math.round(width * scale)),
+            height: Math.max(2, Math.round(height * scale)),
+        };
+    }
+
+    function applyNodeResolutionScale(node, extraScale = 1.0) {
+        if (!node) return;
+        const scale = getCombinedPostFxResolutionScale(extraScale);
+        if (typeof node.setResolutionScale === 'function') {
+            node.setResolutionScale(scale);
+        } else if ('resolutionScale' in node) {
+            node.resolutionScale = scale;
+        }
+    }
+
     function ensureShaderLabInputTarget() {
         readRendererDrawBufferSize(rendererDrawBufferSize);
-        const width = Math.max(1, Math.round(rendererDrawBufferSize.x || renderer.domElement?.width || 1));
-        const height = Math.max(1, Math.round(rendererDrawBufferSize.y || renderer.domElement?.height || 1));
+        const drawWidth = Math.max(1, Math.round(rendererDrawBufferSize.x || renderer.domElement?.width || 1));
+        const drawHeight = Math.max(1, Math.round(rendererDrawBufferSize.y || renderer.domElement?.height || 1));
+        const { width, height } = getScaledPostFxSize(drawWidth, drawHeight);
         activeShaderLabFx?.resize?.(width, height);
         if (shaderLabInputTarget && shaderLabInputTarget.width === width && shaderLabInputTarget.height === height) {
             return shaderLabInputTarget;
@@ -1010,6 +1187,28 @@ export function createMaxJSFxController({
             stencilBuffer: false,
         });
         return shaderLabInputTarget;
+    }
+
+    function ensurePowerShotInputTarget() {
+        readRendererDrawBufferSize(rendererDrawBufferSize);
+        const drawWidth = Math.max(1, Math.round(rendererDrawBufferSize.x || renderer.domElement?.width || 1));
+        const drawHeight = Math.max(1, Math.round(rendererDrawBufferSize.y || renderer.domElement?.height || 1));
+        const powerShotScale = THREE.MathUtils.clamp(Number(state.powershot.resolutionScale) || 1, 0.1, 1);
+        const { width: workWidth, height: workHeight } = getScaledPostFxSize(drawWidth, drawHeight, powerShotScale);
+        const targetMatches = powerShotInputTarget
+            && powerShotInputTarget.width === workWidth
+            && powerShotInputTarget.height === workHeight;
+        if (!targetMatches) {
+            try { powerShotInputTarget?.dispose?.(); } catch (_) {}
+            powerShotInputTarget = new THREE.RenderTarget(workWidth, workHeight, {
+                type: THREE.HalfFloatType,
+                colorSpace: THREE.LinearSRGBColorSpace,
+                depthBuffer: true,
+                stencilBuffer: false,
+            });
+        }
+        ensurePowerShotPipeline().setSize(workWidth, workHeight);
+        return powerShotInputTarget;
     }
 
     function renderShaderLabFinal(renderNativeToCurrentTarget) {
@@ -1049,6 +1248,56 @@ export function createMaxJSFxController({
             inputs: getShaderLabInputs(),
             outputTarget: previousTarget,
         }) === true;
+    }
+
+    function renderPowerShotFinal(renderNativeToCurrentTarget) {
+        if (!isPowerShotActive()) return false;
+        const target = ensurePowerShotInputTarget();
+        const previousTarget = renderer.getRenderTarget?.() || null;
+        const previousToneMapping = renderer.toneMapping;
+        const previousExposure = renderer.toneMappingExposure;
+        const previousOutputColorSpace = renderer.outputColorSpace;
+        const previousClearColor = new THREE.Color();
+        try { renderer.getClearColor?.(previousClearColor); } catch (_) {}
+        const previousClearAlpha = typeof renderer.getClearAlpha === 'function'
+            ? renderer.getClearAlpha()
+            : null;
+
+        try {
+            renderer.toneMapping = previousToneMapping;
+            renderer.toneMappingExposure = previousExposure;
+            renderer.outputColorSpace = THREE.LinearSRGBColorSpace;
+            renderer.setClearColor?.(0x000000, 0);
+            renderer.setRenderTarget(target);
+            renderNativeToCurrentTarget();
+        } finally {
+            renderer.setRenderTarget(previousTarget);
+            renderer.toneMapping = previousToneMapping;
+            renderer.toneMappingExposure = previousExposure;
+            renderer.outputColorSpace = previousOutputColorSpace;
+            if (previousClearAlpha != null) {
+                try { renderer.setClearColor?.(previousClearColor, previousClearAlpha); } catch (_) {}
+            }
+        }
+
+        if (!state.powershot.freezeNoise) powerShotFrame += 1;
+        const pipeline = ensurePowerShotPipeline();
+        try {
+            renderer.toneMapping = THREE.NoToneMapping;
+            renderer.toneMappingExposure = 1.0;
+            renderer.outputColorSpace = previousOutputColorSpace;
+            renderer.setClearColor?.(0x000000, 0);
+            return pipeline.renderTexture(target.texture, powerShotFrame, {
+                outputTarget: previousTarget,
+            }) === true;
+        } finally {
+            renderer.toneMapping = previousToneMapping;
+            renderer.toneMappingExposure = previousExposure;
+            renderer.outputColorSpace = previousOutputColorSpace;
+            if (previousClearAlpha != null) {
+                try { renderer.setClearColor?.(previousClearColor, previousClearAlpha); } catch (_) {}
+            }
+        }
     }
 
     function flushPendingPipelineUpdates() {
@@ -1459,6 +1708,7 @@ export function createMaxJSFxController({
                 const prePass = isScreenSpaceActive('traa')
                     ? pass(scene, camera, { samples: 1 })
                     : pass(scene, camera);
+                applyNodeResolutionScale(prePass);
                 activeNodes.push(prePass);
                 prePass.transparent = false;
                 prePass.setMRT(mrt({
@@ -1525,7 +1775,7 @@ export function createMaxJSFxController({
                     aoPass.radius.value = derived.effectiveGTAORadius;
                     aoPass.scale.value = state.gtao.scale;
                     aoPass.thickness.value = derived.effectiveGTAOThickness;
-                    aoPass.resolutionScale = state.gtao.resolutionScale;
+                    applyNodeResolutionScale(aoPass, state.gtao.resolutionScale);
                     aoPass.useTemporalFiltering = isScreenSpaceActive('traa');
                     activeNodes.push(aoPass);
                     activeAOPass = aoPass;
@@ -1543,6 +1793,7 @@ export function createMaxJSFxController({
                         toc.thickness,
                         toc.alpha)
                     : pass(scene, camera);
+                applyNodeResolutionScale(scenePass);
                 activeNodes.push(scenePass);
                 scenePassNode = scenePass;
                 activeScenePass = scenePass;
@@ -1599,6 +1850,7 @@ export function createMaxJSFxController({
                 ssgiPass.giIntensity.value = state.ssgi.giIntensity;
                 ssgiPass.expFactor.value = state.ssgi.expFactor;
                 ssgiPass.useTemporalFiltering = state.ssgi.temporal;
+                applyNodeResolutionScale(ssgiPass);
                 activeNodes.push(ssgiPass);
 
                 beauty = vec4(
@@ -1625,6 +1877,7 @@ export function createMaxJSFxController({
                 ssrPass.maxDistance.value = derived.effectiveSSRMaxDistance;
                 ssrPass.opacity.value = state.ssr.opacity;
                 ssrPass.thickness.value = derived.effectiveSSRThickness;
+                applyNodeResolutionScale(ssrPass);
                 activeNodes.push(ssrPass);
                 activeSSRPass = ssrPass;
                 // SSR has no proper environment fallback, so do not let it darken
@@ -1656,6 +1909,7 @@ export function createMaxJSFxController({
                     state.bloom.radius,
                     state.bloom.threshold
                 );
+                applyNodeResolutionScale(bloomPass);
                 activeNodes.push(bloomPass);
                 const bloomLuma = bloomPass.r.mul(0.2126).add(bloomPass.g.mul(0.7152)).add(bloomPass.b.mul(0.0722));
                 beauty = vec4(beauty.rgb.add(bloomPass.rgb), raiseBeautyAlpha(bloomLuma));
@@ -1666,6 +1920,7 @@ export function createMaxJSFxController({
                 dofFocalLengthU.value = state.dof.focalLength;
                 dofBokehScaleU.value = state.dof.bokehScale;
                 const dofPass = dof(beauty, scenePassNode.getViewZNode(), dofFocusDistanceU, dofFocalLengthU, dofBokehScaleU);
+                applyNodeResolutionScale(dofPass);
                 activeNodes.push(dofPass);
                 // DepthOfFieldNode composite forces a=1; keep scene alpha for transparent backdrop + fog
                 beauty = vec4(dofPass.rgb, beautyAlpha);
@@ -1684,7 +1939,7 @@ export function createMaxJSFxController({
 
                     const volPass = pass(scene, camera, { depthBuffer: false });
                     volPass.setLayers(volLayerMask);
-                    volPass.setResolutionScale(state.volumetric.resolution);
+                    applyNodeResolutionScale(volPass, state.volumetric.resolution);
                     activeNodes.push(volPass);
 
                     const blurredVol = gaussianBlur(volPass, volDenoiseU);
@@ -1708,6 +1963,7 @@ export function createMaxJSFxController({
                 traaPass.depthThreshold = state.traa.depthThreshold;
                 traaPass.edgeDepthDiff = state.traa.edgeDepthDiff;
                 traaPass.maxVelocityLength = state.traa.maxVelocityLength;
+                applyNodeResolutionScale(traaPass);
                 activeNodes.push(traaPass);
                 beauty = vec4(traaPass.rgb, beautyAlpha);
             }
@@ -1720,6 +1976,8 @@ export function createMaxJSFxController({
                     prePassVelocity.mul(uniform(state.motionBlur.amount)),
                     int(Math.max(2, Math.round(state.motionBlur.samples)))
                 );
+                applyNodeResolutionScale(motionBlurPass);
+                activeNodes.push(motionBlurPass);
                 beauty = vec4(motionBlurPass.rgb, beautyAlpha);
             }
 
@@ -1911,6 +2169,20 @@ export function createMaxJSFxController({
         },
         supportsScreenSpaceEffects() {
             return supportsScreenSpaceEffects;
+        },
+        getResolutionScale() {
+            return postFxResolutionScale;
+        },
+        setResolutionScale(scale) {
+            const nextScale = normalizePostFxResolutionScale(scale);
+            if (Math.abs(nextScale - postFxResolutionScale) <= 1.0e-6) {
+                return postFxResolutionScale;
+            }
+            postFxResolutionScale = nextScale;
+            if (pipelineReady || hasPipelineEffectEnabled()) {
+                rebuildPipeline();
+            }
+            return postFxResolutionScale;
         },
         setEnabled(enabled) {
             if (enabled && !supportsScreenSpaceEffects) {
@@ -2261,12 +2533,82 @@ export function createMaxJSFxController({
             return { ...state.pixel };
         },
 
+        // ── PowerShot ISP ──
+
+        isPowerShotEnabled() {
+            return state.powershot.enabled;
+        },
+        setPowerShotEnabled(enabled) {
+            if (enabled && isShaderLabEnabled()) {
+                lastError = 'PowerShot is unavailable while Shader Lab is active.';
+                onError(lastError);
+                return false;
+            }
+            if (enabled && !supportsScreenSpaceEffects) {
+                lastError = 'PowerShot requires WebGPU or TSL_GL';
+                onError(lastError);
+                state.powershot.enabled = true;
+                rebuildPipeline();
+                return false;
+            }
+            state.powershot.enabled = !!enabled && available;
+            rebuildPipeline();
+            return state.powershot.enabled;
+        },
+        setPowerShotOptions(options = {}) {
+            if (typeof options.mode === 'string') {
+                state.powershot.mode = options.mode === 'analog' ? 'analog' : 'digital';
+                state.powershot.freezeNoise = false;
+            }
+            if (typeof options.preset === 'string') {
+                state.powershot.preset = normalizePowerShotPreset(options.preset);
+                Object.assign(state.powershot, powerShotPresetUiDefaults(state.powershot.preset));
+            }
+            assignFinite(state.powershot, 'amount', options.amount);
+            assignFinite(state.powershot, 'resolutionScale', options.resolutionScale);
+            assignFinite(state.powershot, 'lensSoftness', options.lensSoftness);
+            assignFinite(state.powershot, 'ccdBloom', options.ccdBloom);
+            assignFinite(state.powershot, 'noiseScale', options.noiseScale);
+            assignFinite(state.powershot, 'bayerNR', options.bayerNR);
+            assignFinite(state.powershot, 'chromaNR', options.chromaNR);
+            assignFinite(state.powershot, 'jpegStrength', options.jpegStrength);
+            assignFinite(state.powershot, 'jpegQuality', options.jpegQuality);
+            assignFinite(state.powershot, 'jpegChroma420', options.jpegChroma420);
+            assignFinite(state.powershot, 'jpegMidtone', options.jpegMidtone);
+            assignFinite(state.powershot, 'jpegHighlight', options.jpegHighlight);
+            assignFinite(state.powershot, 'brightness', options.brightness);
+            assignFinite(state.powershot, 'contrast', options.contrast);
+            assignFinite(state.powershot, 'analogStrength', options.analogStrength);
+            assignFinite(state.powershot, 'analogTracking', options.analogTracking);
+            assignFinite(state.powershot, 'analogChromaBleed', options.analogChromaBleed);
+            assignFinite(state.powershot, 'analogRinging', options.analogRinging);
+            assignFinite(state.powershot, 'analogTapeNoise', options.analogTapeNoise);
+            assignFinite(state.powershot, 'analogEdgeWave', options.analogEdgeWave);
+            assignFinite(state.powershot, 'analogDropouts', options.analogDropouts);
+            assignFinite(state.powershot, 'analogScanlines', options.analogScanlines);
+            assignFinite(state.powershot, 'analogHeadSwitch', options.analogHeadSwitch);
+            if (typeof options.freezeNoise === 'boolean') state.powershot.freezeNoise = options.freezeNoise;
+            if (powerShotPipeline) syncPowerShotPipeline();
+            if (state.powershot.enabled) queuePipelineUpdate({ output: true });
+            return { ...state.powershot };
+        },
+        getPowerShotPresets() {
+            return POWERSHOT_PRESET_KEYS.map((key) => ({
+                key,
+                label: POWERSHOT_PRESETS[key]?.name || key,
+            }));
+        },
+
         // ── Global Color Grading ──
 
         getColorGrading() {
             return { ...state.colorGrading };
         },
         setColorGrading(options = {}) {
+            if (isPowerShotActive()) {
+                syncCanvasColorGrading();
+                return { ...state.colorGrading };
+            }
             assignFinite(state.colorGrading, 'brightness', options.brightness);
             assignFinite(state.colorGrading, 'contrast', options.contrast);
             colorGradingBrightnessU.value = state.colorGrading.brightness;
@@ -2529,6 +2871,9 @@ export function createMaxJSFxController({
                 if (shaderLabActive) {
                     const consumed = renderShaderLabFinal(() => renderer.render(scene, camera));
                     if (!consumed) renderer.render(scene, camera);
+                } else if (isPowerShotActive()) {
+                    const consumed = renderPowerShotFinal(() => renderer.render(scene, camera));
+                    if (!consumed) renderer.render(scene, camera);
                 } else {
                     renderer.render(scene, camera);
                 }
@@ -2548,6 +2893,9 @@ export function createMaxJSFxController({
                 }
                 if (shaderLabActive) {
                     const consumed = renderShaderLabFinal(() => postProcessing.render());
+                    if (!consumed) postProcessing.render();
+                } else if (isPowerShotActive()) {
+                    const consumed = renderPowerShotFinal(() => postProcessing.render());
                     if (!consumed) postProcessing.render();
                 } else {
                     postProcessing.render();

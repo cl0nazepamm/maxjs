@@ -779,6 +779,9 @@ function createMaxNodeAdapter({
     layerId,
     getTransformApi,
     setMaterialMap,
+    setPropertyOverride,
+    clearPropertyOverride,
+    hasPropertyOverride,
     getNodeAdapter,
     cloneFromMax,
     setVisibilityOverride,
@@ -1184,6 +1187,26 @@ function createMaxNodeAdapter({
             if (typeof slot !== 'string' || !slot) return;
             setMaterialMap?.(handle, slot, texture);
         },
+        overrides: freezePlainObject({
+            hasProperty(property) {
+                if (typeof property !== 'string' || !property) return false;
+                return hasPropertyOverride?.(handle, property) === true;
+            },
+            setProperty(property, value, options = {}) {
+                if (typeof property !== 'string' || !property) return false;
+                return setPropertyOverride?.(handle, property, value, {
+                    ...options,
+                    object: getObject(),
+                }) === true;
+            },
+            clearProperty(property, options = {}) {
+                if (typeof property !== 'string' || !property) return false;
+                return clearPropertyOverride?.(handle, property, {
+                    ...options,
+                    object: getObject(),
+                }) === true;
+            },
+        }),
         snapshot() {
             const obj = getObject();
             if (!obj) return null;

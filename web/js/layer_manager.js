@@ -185,6 +185,12 @@ export function createLayerManager({
         applyMaterialOverridesToMesh,
         setMaterialMapOverride,
         clearMaterialOverridesForLayer,
+        setObjectPropertyOverride,
+        clearObjectPropertyOverride,
+        clearObjectPropertyOverridesForLayer,
+        applyObjectPropertyOverrides,
+        applyAllObjectPropertyOverrides,
+        hasObjectPropertyOverride,
         applyAllRuntimeTransformOverrides,
         applyAllRuntimeVisibilityOverrides,
         markRuntimeTransformOverridesDirty,
@@ -195,7 +201,7 @@ export function createLayerManager({
         setRuntimeVisibilityOverride,
         clearRuntimeVisibilityOverride,
         clearRuntimeVisibilityOverridesForLayer,
-    } = createRuntimeOverrideController({ THREE, nodeMap });
+    } = createRuntimeOverrideController({ THREE, nodeMap, lightHandleMap });
 
     function emitChange(reason = 'state') {
         for (const listener of listeners) {
@@ -316,6 +322,9 @@ export function createLayerManager({
                 layerId: layer.id,
                 getTransformApi: createTransformApi,
                 setMaterialMap: (h, slot, tex) => setMaterialMapOverride(layer.id, h, slot, tex),
+                setPropertyOverride: (h, property, value, options) => setObjectPropertyOverride(layer.id, h, property, value, options),
+                clearPropertyOverride: (h, property, options) => clearObjectPropertyOverride(layer.id, h, property, options),
+                hasPropertyOverride: (h, property) => hasObjectPropertyOverride(h, property),
                 getNodeAdapter: (nextHandle) => getLayerNodeAdapter(layer, nextHandle),
                 cloneFromMax: (source, options) => layer.cloneFromMax?.(source, options) ?? null,
                 setVisibilityOverride: (h, visible, obj) => setRuntimeVisibilityOverride(layer.id, h, visible, obj),
@@ -978,6 +987,7 @@ export function createLayerManager({
         clearRuntimeTransformOverridesForLayer(id);
         clearRuntimeVisibilityOverridesForLayer(id);
         clearMaterialOverridesForLayer(id);
+        clearObjectPropertyOverridesForLayer(id);
 
         jsWorldRoot.remove(layer.group);
         overlayWorldRoot.remove(layer.overlayGroup);
@@ -1032,6 +1042,7 @@ export function createLayerManager({
 
         applyAllRuntimeTransformOverrides();
         applyAllRuntimeVisibilityOverrides();
+        applyAllObjectPropertyOverrides();
 
         for (const layer of layers.values()) {
             anchorCount += layer.anchors.length;
@@ -1117,7 +1128,11 @@ export function createLayerManager({
             }
         }
     }
-    function beforeRender(frameElapsed) { dispatchRenderHook('onBeforeRender', frameElapsed); }
+    function beforeRender(frameElapsed) {
+        applyAllObjectPropertyOverrides();
+        dispatchRenderHook('onBeforeRender', frameElapsed);
+        applyAllObjectPropertyOverrides();
+    }
     function afterRender(frameElapsed)  { dispatchRenderHook('onAfterRender',  frameElapsed); }
 
     function getLayerCode(id) {
@@ -1299,6 +1314,8 @@ export function createLayerManager({
         // Called from the scene message handler after each material assignment
         // so layer-registered map slot overrides survive fastsync rebuilds.
         applyMaterialOverrides: applyMaterialOverridesToMesh,
+        applyObjectPropertyOverrides,
+        hasObjectPropertyOverride,
         serialize,
         get isCameraOverridden() { return cameraControl.isScriptMode(); },
         get cameraMode() { return cameraControl.getMode(); },

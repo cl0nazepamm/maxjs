@@ -303,7 +303,11 @@ function createMaxSceneFacade({ scene, nodeMap, lightHandleMap, getAdapter, crea
         get environment() { return scene.environment ?? null; },
         get fog() { return scene.fog?.clone?.() ?? null; },
         has(handle) { return nodeMap.has(handle); },
-        getNode(handle) { return nodeMap.has(handle) ? getAdapter(handle) : null; },
+        getNode(handle) {
+            if (nodeMap.has(handle)) return getAdapter(handle);
+            if (lightHandleMap?.has(handle)) return getAdapter(handle, lightHandleMap.get(handle));
+            return null;
+        },
         getParent(handle) {
             const obj = nodeMap.get(handle) ?? lightHandleMap?.get(handle) ?? null;
             const parentHandle = parentHandleOf(obj);

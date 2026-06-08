@@ -30,6 +30,9 @@ const TARGET_DISTANCE = 1000;
 const shadowBounds = new THREE.Box3();
 const shadowCenter = new THREE.Vector3();
 const shadowSize = new THREE.Vector3();
+const shadowOriginScale = new THREE.Vector3();
+const shadowOriginDir = new THREE.Vector3();
+const shadowOriginLightPos = new THREE.Vector3();
 const lightLocalPos = new THREE.Vector3();
 const lightWorldPos = new THREE.Vector3();
 const lightTargetLocal = new THREE.Vector3();
@@ -103,9 +106,77 @@ function setLightTargetFromData(light, ld, rootParent) {
     target.updateMatrixWorld();
 }
 
+function isShadowMapOriginObject(object) {
+    const name = String(object?.name || '');
+    return /^(?:maxjs[\s_-]*)?(?:(?:shadow[\s_-]*map|shadowmap|shadow)[\s_-]*)origin(?:$|[\s_.:-])/i.test(name);
+}
+
+function getShadowMapOriginRadiusFromName(name) {
+    const match = String(name || '').match(/(?:^|[\s_:-])(?:r|radius|size)?[\s_:=:-]*(\d+(?:\.\d+)?)(?:$|[\s_:-])/i);
+    if (!match) return 0;
+    const radius = Number(match[1]);
+    return Number.isFinite(radius) && radius > 0 ? radius : 0;
+}
+
+function setObjectSelfVisibleLayer(object, visible) {
+    if (!object?.layers?.set) return;
+    object.layers.set(visible ? 0 : MAXJS_SELF_HIDDEN_LAYER);
+}
+
+function configureShadowMapOriginObject(object) {
+    if (!object) return;
+    object.userData ??= {};
+    object.userData.maxjsShadowMapOrigin = true;
+    object.userData.maxjsVisible = false;
+    object.castShadow = false;
+    object.receiveShadow = false;
+    setObjectSelfVisibleLayer(object, false);
+}
+
+function findShadowMapOriginObject(nodeMap) {
+    for (const object of nodeMap?.values?.() ?? []) {
+        if (!isShadowMapOriginObject(object)) continue;
+        configureShadowMapOriginObject(object);
+        return object;
+    }
+    return null;
+}
+
+function getShadowMapOriginFocus(object) {
+    if (!object) return null;
+    object.updateWorldMatrix(true, false);
+    const nameRadius = getShadowMapOriginRadiusFromName(object.name);
+    shadowBounds.makeEmpty();
+    if (object.isMesh || object.isLine || object.isLineSegments) {
+        shadowBounds.setFromObject(object);
+    }
+    object.getWorldPosition(shadowCenter);
+
+    let radius = nameRadius;
+    if (!radius && !shadowBounds.isEmpty()) {
+        shadowBounds.getCenter(shadowCenter);
+        shadowBounds.getSize(shadowSize);
+        radius = Math.max(shadowSize.x, shadowSize.y, shadowSize.z) * 0.5;
+    }
+    if (!radius) {
+        object.getWorldScale(shadowOriginScale);
+        radius = Math.max(shadowOriginScale.x, shadowOriginScale.y, shadowOriginScale.z, 50);
+    }
+
+    return {
+        center: shadowCenter,
+        radius: Math.max(radius, 1),
+        explicit: true,
+    };
+}
+
 function getShadowSceneFocus(nodeMap) {
+    const origin = findShadowMapOriginObject(nodeMap);
+    if (origin) return getShadowMapOriginFocus(origin);
+
     shadowBounds.makeEmpty();
     for (const mesh of nodeMap?.values?.() ?? []) {
+        if (mesh?.userData?.maxjsShadowMapOrigin || isShadowMapOriginObject(mesh)) continue;
         if (!mesh?.isMesh || !mesh.visible) continue;
         shadowBounds.expandByObject(mesh);
     }
@@ -120,7 +191,36 @@ function getShadowSceneFocus(nodeMap) {
     return {
         center: shadowCenter,
         radius: Math.max(shadowSize.x, shadowSize.y, shadowSize.z, 50),
+        explicit: false,
     };
+}
+
+function setObjectWorldPosition(object, worldPosition) {
+    const parent = object?.parent;
+    if (!object || !worldPosition) return;
+    object.position.copy(worldPosition);
+    if (parent) {
+        parent.updateMatrixWorld(true);
+        parent.worldToLocal(object.position);
+    }
+    object.updateMatrixWorld(true);
+}
+
+function applyDirectionalShadowOrigin(light, focus) {
+    const target = light.userData?.maxjsTarget;
+    if (!focus?.explicit || !target) return;
+
+    light.getWorldPosition(lightWorldPos);
+    target.getWorldPosition(lightTargetWorld);
+    shadowOriginDir.subVectors(lightTargetWorld, lightWorldPos);
+    if (shadowOriginDir.lengthSq() < 1e-8) return;
+    shadowOriginDir.normalize();
+
+    const distance = Math.max(focus.radius * 4, lightWorldPos.distanceTo(lightTargetWorld), 200);
+    shadowOriginLightPos.copy(focus.center).addScaledVector(shadowOriginDir, -distance);
+    setObjectWorldPosition(light, shadowOriginLightPos);
+    setObjectWorldPosition(target, focus.center);
+    lightTargetWorld.copy(focus.center);
 }
 
 function applyLightShadowDefaults(light, ld, nodeMap) {
@@ -133,9 +233,11 @@ function applyLightShadowDefaults(light, ld, nodeMap) {
     const mapSz = ld.shadowMapSize ?? 1024;
     light.shadow.mapSize.set(mapSz, mapSz);
 
-    const { radius } = getShadowSceneFocus(nodeMap);
+    const focus = getShadowSceneFocus(nodeMap);
+    const { radius } = focus;
     const cam = light.shadow.camera;
     if (ld.type === 0 && cam?.isOrthographicCamera) {
+        applyDirectionalShadowOrigin(light, focus);
         cam.left = -radius;
         cam.right = radius;
         cam.top = radius;

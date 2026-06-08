@@ -22,6 +22,7 @@ export function createWebGLBasicFx({
     let fullscreenMesh = null;
     let copyMaterial = null;
     let disposed = false;
+    let resolutionScale = 1.0;
     let state = {
         enabled: true,
         passes: [],
@@ -47,6 +48,20 @@ export function createWebGLBasicFx({
         return drawSize;
     }
 
+    function normalizeResolutionScale(value) {
+        const numeric = Number(value);
+        if (!Number.isFinite(numeric)) return 1.0;
+        return Math.max(0.25, Math.min(1.0, numeric));
+    }
+
+    function getTargetSize() {
+        const size = getDrawSize();
+        return {
+            width: Math.max(2, Math.round(size.x * resolutionScale)),
+            height: Math.max(2, Math.round(size.y * resolutionScale)),
+        };
+    }
+
     function makeTarget(width, height) {
         const TargetCtor = THREE.WebGLRenderTarget || THREE.RenderTarget;
         return new TargetCtor(width, height, {
@@ -56,13 +71,13 @@ export function createWebGLBasicFx({
     }
 
     function ensureTargets() {
-        const size = getDrawSize();
-        if (readTarget && writeTarget && readTarget.width === size.x && readTarget.height === size.y) {
+        const size = getTargetSize();
+        if (readTarget && writeTarget && readTarget.width === size.width && readTarget.height === size.height) {
             return;
         }
         disposeTargets();
-        readTarget = makeTarget(size.x, size.y);
-        writeTarget = makeTarget(size.x, size.y);
+        readTarget = makeTarget(size.width, size.height);
+        writeTarget = makeTarget(size.width, size.height);
     }
 
     function ensureFullscreen() {
@@ -268,6 +283,16 @@ export function createWebGLBasicFx({
         setEnabled: (enabled) => {
             state.enabled = !!enabled;
             return state.enabled;
+        },
+        getResolutionScale: () => resolutionScale,
+        setResolutionScale: (scale) => {
+            const nextScale = normalizeResolutionScale(scale);
+            if (Math.abs(nextScale - resolutionScale) <= 1.0e-6) {
+                return resolutionScale;
+            }
+            resolutionScale = nextScale;
+            if (readTarget || writeTarget) ensureTargets();
+            return resolutionScale;
         },
         hasEnabledEffects,
         registerPass,

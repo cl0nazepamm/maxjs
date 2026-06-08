@@ -2,7 +2,7 @@
 
 import { freezePlainObject, matrixElementsAlmostEqual } from './layer_utils.js';
 
-function createRuntimeOverrideController({ THREE, nodeMap }) {
+function createRuntimeOverrideController({ THREE, nodeMap, lightHandleMap = null }) {
     const runtimeTransformOverrides = new Map();
     let runtimeTransformReapplyNeeded = false;
     // Map<handle, Map<slotName, { texture, layerId }>> — survives sync
@@ -11,6 +11,7 @@ function createRuntimeOverrideController({ THREE, nodeMap }) {
     // (HTML, canvas, anything) reach displacement / color / etc. on the
     // synced mesh without cloning.
     const materialOverrides = new Map();
+    const objectPropertyOverrides = new Map();
     const runtimeVisibilityOverrides = new Map();
     let runtimeVisibilityReapplyNeeded = false;
     const transformScratch = {
@@ -206,6 +207,126 @@ function createRuntimeOverrideController({ THREE, nodeMap }) {
             // Trigger a fresh sync so the original material reasserts.
             // Cheaper than tracking the original map per slot — next
             // scene message rebuilds the material from Max state.
+        }
+    }
+
+    function getRuntimeObjectByHandle(handle, explicitObj = null) {
+        return explicitObj?.isObject3D
+            ? explicitObj
+            : (nodeMap.get(handle) ?? lightHandleMap?.get?.(handle) ?? null);
+    }
+
+    function markObjectMaterialsDirty(obj) {
+        if (!obj?.isObject3D) return false;
+        let changed = false;
+        obj.traverse?.((child) => {
+            const materials = Array.isArray(child?.material)
+                ? child.material
+                : (child?.material ? [child.material] : []);
+            for (const material of materials) {
+                if (!material) continue;
+                material.needsUpdate = true;
+                changed = true;
+            }
+        });
+        const materials = Array.isArray(obj.material)
+            ? obj.material
+            : (obj.material ? [obj.material] : []);
+        for (const material of materials) {
+            if (!material) continue;
+            material.needsUpdate = true;
+            changed = true;
+        }
+        return changed;
+    }
+
+    function applyObjectPropertyOverrideEntry(obj, property, entry) {
+        if (!obj || !property || !entry) return false;
+        const nextValue = entry.value;
+        const changed = obj[property] !== nextValue;
+        if (changed) obj[property] = nextValue;
+        const shouldSignal = changed || entry.options?.forceUpdate === true;
+        if (shouldSignal && entry.options?.needsUpdate === true && obj.needsUpdate !== true) {
+            obj.needsUpdate = true;
+        }
+        if (shouldSignal && entry.options?.shadowNeedsUpdate === true && obj.shadow) {
+            obj.shadow.needsUpdate = true;
+        }
+        if (shouldSignal && entry.options?.materialsNeedUpdate !== false) {
+            markObjectMaterialsDirty(obj.parent?.isObject3D ? obj.parent : obj);
+        }
+        if (typeof entry.options?.onApply === 'function') {
+            try { entry.options.onApply(obj, property, nextValue, changed); } catch (_) {}
+        }
+        return changed;
+    }
+
+    function applyObjectPropertyOverrides(handle, explicitObj = null) {
+        const properties = objectPropertyOverrides.get(handle);
+        if (!properties || properties.size === 0) return false;
+        const obj = getRuntimeObjectByHandle(handle, explicitObj);
+        if (!obj) return false;
+        let changed = false;
+        for (const [property, entry] of properties) {
+            changed = applyObjectPropertyOverrideEntry(obj, property, entry) || changed;
+        }
+        return changed;
+    }
+
+    function applyAllObjectPropertyOverrides() {
+        let changed = false;
+        for (const handle of objectPropertyOverrides.keys()) {
+            changed = applyObjectPropertyOverrides(handle) || changed;
+        }
+        return changed;
+    }
+
+    function hasObjectPropertyOverride(handle, property) {
+        if (!property || typeof property !== 'string') return false;
+        return objectPropertyOverrides.get(handle)?.has(property) === true;
+    }
+
+    function setObjectPropertyOverride(layerId, handle, property, value, options = {}) {
+        if (!property || typeof property !== 'string') return false;
+        let properties = objectPropertyOverrides.get(handle);
+        if (!properties) {
+            properties = new Map();
+            objectPropertyOverrides.set(handle, properties);
+        }
+        properties.set(property, {
+            value,
+            layerId,
+            options: { ...options },
+        });
+        applyObjectPropertyOverrides(handle, options.object ?? null);
+        return true;
+    }
+
+    function clearObjectPropertyOverride(layerId, handle, property, options = {}) {
+        const properties = objectPropertyOverrides.get(handle);
+        if (!properties) return false;
+        const entry = properties.get(property);
+        if (!entry || (layerId && entry.layerId !== layerId)) return false;
+        properties.delete(property);
+        if (properties.size === 0) objectPropertyOverrides.delete(handle);
+        if (Object.prototype.hasOwnProperty.call(options, 'restoreValue')) {
+            const obj = getRuntimeObjectByHandle(handle, options.object ?? null);
+            if (obj) {
+                obj[property] = options.restoreValue;
+                if (options.needsUpdate === true) obj.needsUpdate = true;
+                if (options.shadowNeedsUpdate === true && obj.shadow) obj.shadow.needsUpdate = true;
+            }
+        }
+        return true;
+    }
+
+    function clearObjectPropertyOverridesForLayer(layerId) {
+        if (!layerId) return;
+        for (const [handle, properties] of [...objectPropertyOverrides.entries()]) {
+            for (const [property, entry] of [...properties.entries()]) {
+                if (entry.layerId === layerId) properties.delete(property);
+            }
+            if (properties.size === 0) objectPropertyOverrides.delete(handle);
         }
     }
     
@@ -485,6 +606,12 @@ function createRuntimeOverrideController({ THREE, nodeMap }) {
         applyMaterialOverridesToMesh,
         setMaterialMapOverride,
         clearMaterialOverridesForLayer,
+        setObjectPropertyOverride,
+        clearObjectPropertyOverride,
+        clearObjectPropertyOverridesForLayer,
+        applyObjectPropertyOverrides,
+        applyAllObjectPropertyOverrides,
+        hasObjectPropertyOverride,
         applyAllRuntimeTransformOverrides,
         applyAllRuntimeVisibilityOverrides,
         markRuntimeTransformOverridesDirty,

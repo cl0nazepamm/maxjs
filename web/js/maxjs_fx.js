@@ -1,82 +1,25 @@
+// Editor post-FX facade. The public fxApi surface is unchanged; the TSL
+// frame graph itself now lives in fx/core.js + fx/effects/* (descriptor
+// registry shared 1:1 with the standalone snapshot viewer — see
+// docs/POST_FX_UNIFIED_PLAN.md). This file keeps the editor-only concerns:
+// state + setters, Shader Lab and PowerShot final-stylize passes, the clone
+// CPU blob tracker, CSS colorGrading, and renderer-output/resize tracking.
 import * as THREE from 'three';
-import {
-    add,
-    blendColor,
-    color,
-    convertToTexture,
-    colorToDirection,
-    densityFogFactor,
-    diffuseColor,
-    directionToColor,
-    float,
-    fog,
-    int,
-    max,
-    metalness,
-    mrt,
-    normalView,
-    normalWorld,
-    output,
-    pass,
-    positionWorld,
-    positionView,
-    rangeFogFactor,
-    roughness,
-    sample,
-    triNoise3D,
-    vec2,
-    vec3,
-    vec4,
-    screenUV,
-    screenSize,
-    builtinShadowContext,
-    builtinAOContext,
-    toonOutlinePass,
-    posterize,
-    uniform,
-    replaceDefaultUV,
-    velocity,
-    dot,
-    fract,
-    mix,
-    sin,
-    Fn,
-    time,
-    texture3D,
-    screenCoordinate,
-    cameraProjectionMatrix,
-    cameraViewMatrix,
-    positionLocal,
-    modelWorldMatrix,
-    varying,
-    uv,
-} from 'three/tsl';
-import { bloom } from 'three/addons/tsl/display/BloomNode.js';
-import { ssr } from 'three/addons/tsl/display/SSRNode.js';
-import { ssgi } from 'three/addons/tsl/display/SSGINode.js';
-// OutlineNode removed — using built-in toonOutlinePass from TSL instead
-import { sss } from 'three/addons/tsl/display/SSSNode.js';
-import { scanlines, vignette, colorBleeding, barrelUV } from 'three/addons/tsl/display/CRT.js';
-import { bayerDither, bayer16 } from 'three/addons/tsl/math/Bayer.js';
-// retroPass removed — replaced with lightweight PS1 vertex snap
-import { ao } from 'three/addons/tsl/display/GTAONode.js';
-import { motionBlur } from 'three/addons/tsl/display/MotionBlur.js';
-import { dof } from 'three/addons/tsl/display/DepthOfFieldNode.js';
-import { traa } from 'three/addons/tsl/display/TRAANode.js';
-import { gaussianBlur } from 'three/addons/tsl/display/GaussianBlurNode.js';
-import { ImprovedNoise } from 'three/addons/math/ImprovedNoise.js';
-import { Pipeline as PowerShotPipeline, applyPreset as applyPowerShotPreset, STAGE_DEFS as POWERSHOT_STAGE_DEFS } from './powershot_pipeline.js';
-import { PRESETS as POWERSHOT_PRESETS, PRESET_KEYS as POWERSHOT_PRESET_KEYS } from './powershot_presets.js';
+import { uniform, vec3 } from 'three/tsl';
+import { createPowerShotFinal, normalizePowerShotPreset, powerShotPresetUiDefaults, listPowerShotPresets } from './fx/final/powershot.js';
+import { createShaderLabFinal } from './fx/final/shaderlab.js';
+import { createFxCore } from './fx/core.js';
+import { ALL } from './fx/registry.js';
+import { syncRetroUniforms } from './fx/effects/retro.js';
+import { syncPixelUniforms } from './fx/effects/pixel.js';
+import { syncVolumetricUniforms, applyVolumetricSteps } from './fx/effects/volumetric.js';
 
-function setTexturePrecision(scenePass) {
-    const diffuseTexture = scenePass.getTexture('diffuseColor');
-    if (diffuseTexture) diffuseTexture.type = THREE.UnsignedByteType;
-
-    const normalTexture = scenePass.getTexture('normal');
-    if (normalTexture) normalTexture.type = THREE.UnsignedByteType;
-
-    const metalRoughTexture = scenePass.getTexture('metalrough');
-    if (metalRoughTexture) metalRoughTexture.type = THREE.UnsignedByteType;
+function cloneEffectDefaults(defaults = {}) {
+    const copy = {};
+    for (const [key, value] of Object.entries(defaults)) {
+        copy[key] = Array.isArray(value) ? [...value] : value;
+    }
+    return copy;
 }
 
 export function createMaxJSFxController({
@@ -89,12 +32,8 @@ export function createMaxJSFxController({
     environmentVisible = true,
     hiddenBackgroundColor = 0x1a1a2e,
 }) {
-    const PipelineCtor = THREE.RenderPipeline || THREE.PostProcessing;
-    const postProcessing = new PipelineCtor(renderer);
-    const emptyOutputNode = vec4(0, 0, 0, 0);
     const supportsScreenSpaceEffects = backendLabel === 'WebGPU' || backendLabel === 'TSL_GL';
     const supportsTslPostEffects = supportsScreenSpaceEffects;
-    const SSR_REFERENCE_SIZE = 6.0;
     const hiddenBackground = new THREE.Color(hiddenBackgroundColor);
     const hiddenBackgroundRU = uniform(hiddenBackground.r);
     const hiddenBackgroundGU = uniform(hiddenBackground.g);
@@ -104,206 +43,60 @@ export function createMaxJSFxController({
     const colorGradingBrightnessU = uniform(0);
     const colorGradingContrastU = uniform(0);
 
-    // Cached toon mesh detection — refreshed on pipeline rebuild, not every frame
-    let cachedHasToonMeshes = false;
-
-    function refreshToonMeshCache() {
-        cachedHasToonMeshes = false;
-        scene.traverse(obj => {
-            if (!obj.isMesh || !obj.visible) return;
-            const mats = Array.isArray(obj.material) ? obj.material : [obj.material];
-            for (const m of mats) {
-                if (m && m.isMeshToonMaterial) {
-                    cachedHasToonMeshes = true;
-                    return;
-                }
-            }
-        });
+    // Effect state — defaults are sourced from each descriptor (single source
+    // of truth shared with the snapshot viewer). powershot / clone /
+    // colorGrading are facade-resident: not TSL composite descriptors.
+    const state = {};
+    for (const descriptor of ALL) {
+        state[descriptor.id] = cloneEffectDefaults(descriptor.defaults);
     }
-
-    function getToonMeshes() {
-        // Only used during pipeline rebuild — returns fresh list
-        const result = [];
-        scene.traverse(obj => {
-            if (!obj.isMesh || !obj.visible) return;
-            const mats = Array.isArray(obj.material) ? obj.material : [obj.material];
-            for (const m of mats) {
-                if (m && m.isMeshToonMaterial) {
-                    result.push(obj);
-                    break;
-                }
-            }
-        });
-        return result;
-    }
-    const state = {
-        ssgi: {
-            enabled: false,
-            radius: 8,
-            thickness: 1.5,
-            aoIntensity: 1.0,
-            giIntensity: 1.5,
-            expFactor: 1.5,
-            sliceCount: 2,
-            stepCount: 8,
-            temporal: false,
-        },
-        ssr: {
-            enabled: false,
-            quality: 0.45,
-            blurQuality: 2,
-            maxDistance: 0.5,
-            opacity: 0.9,
-            thickness: 0.015,
-        },
-        gtao: {
-            enabled: false,
-            samples: 16,
-            distanceExponent: 1.0,
-            distanceFallOff: 1.0,
-            radius: 0.5,
-            scale: 2.0,
-            thickness: 1.0,
-            resolutionScale: 1.0,
-        },
-        motionBlur: {
-            enabled: false,
-            amount: 1.0,
-            samples: 16,
-        },
-        traa: {
-            enabled: false,
-            useSubpixelCorrection: true,
-            depthThreshold: 0.0005,
-            edgeDepthDiff: 0.001,
-            maxVelocityLength: 128,
-        },
-        bloom: {
-            enabled: false,
-            strength: 0.4,
-            radius: 0.2,
-            threshold: 0.75,
-        },
-        toonOutline: {
-            enabled: false,
-            color: [0, 0, 0],
-            thickness: 0.003,
-            alpha: 1.0,
-        },
-        contactShadow: {
-            enabled: false,
-            maxDistance: 0.1,
-            thickness: 0.006,
-            shadowIntensity: 0.85,
-            quality: 0.3,
-            temporal: false,
-        },
-        retro: {
-            enabled: false,
-            wiggle: false,
-            affineDistortion: 5.0,
-            resolutionScale: 0.25,
-            filterTextures: false,
-            dither: false,
-            colorDepth: 32,
-            scanlines: false,
-            scanlineIntensity: 0.3,
-            scanlineDensity: 1.0,
-            crt: false,
-            vignetteIntensity: 0.3,
-            bleeding: 0.001,
-            curvature: 0.02,
-        },
-        fog: {
-            enabled: false,
-            type: 0,          // 0=Range, 1=Density, 2=Custom (procedural)
-            color: [0.85, 0.85, 0.9],
-            opacity: 1.0,
-            near: 10.0,
-            far: 500.0,
-            density: 0.01,
-            noiseScale: 0.005,
-            noiseSpeed: 0.2,
-            height: 20.0,
-        },
-        volumetric: {
-            enabled: false,
-            intensity: 1.0,
-            steps: 12,
-            density: 0.5,
-            denoise: 0.6,
-            resolution: 0.25,
-        },
-        pixel: {
-            enabled: false,
-            pixelate: false,
-            pixelSize: 4,
-            chromatic: false,
-            chromaticIntensity: 0.005,
-            sharpen: false,
-            sharpenStrength: 0.5,
-            grain: false,
-            grainIntensity: 0.08,
-            brightness: 0,
-            contrast: 0,
-            saturation: 0,
-        },
-        powershot: {
-            enabled: false,
-            mode: 'digital',
-            preset: 'powershot',
-            amount: 1.0,
-            resolutionScale: 0.75,
-            lensSoftness: 0.32,
-            ccdBloom: 0.35,
-            noiseScale: 1.06,
-            bayerNR: 0.5,
-            chromaNR: 1.0,
-            jpegStrength: 0.2,
-            jpegQuality: 60,
-            jpegChroma420: 0.75,
-            jpegMidtone: 0.45,
-            jpegHighlight: 1.0,
-            brightness: 0,
-            contrast: 0,
-            analogStrength: 0.72,
-            analogTracking: 0.46,
-            analogChromaBleed: 0.76,
-            analogRinging: 0.62,
-            analogTapeNoise: 0.70,
-            analogBandMask: 0.35,
-            analogEdgeWave: 0.34,
-            analogDropouts: 0.32,
-            analogScanlines: 0.54,
-            analogHeadSwitch: 0.42,
-            freezeNoise: false,
-        },
-        dof: {
-            enabled: false,
-            autoFromCamera: true,
-            focusDistance: 100,
-            focalLength: 50,
-            bokehScale: 5,
-        },
-        clone: {
-            enabled: false,
-            source: 'luma',          // 'luma', 'depth'
-            threshold: 0.53,
-            blurRadius: 0,           // box blur radius on the 64x64 analysis grid
-            minBlobSize: 0,          // minimum blob area (0-1 of screen)
-            color: [0.0, 1.0, 0.6], // reserved for future use
-            opacity: 1.0,
-            gridDensity: 0,          // subdivision grid (0=off, 2-8=lines)
-            smoothing: 0.75,         // lerp factor (0=frozen, 1=instant snap)
-            invert: false,           // invert threshold (track dark regions)
-        },
-        colorGrading: {
-            brightness: 0,
-            contrast: 0,
-        },
+    state.powershot = {
+        enabled: false,
+        mode: 'digital',
+        preset: 'powershot',
+        amount: 1.0,
+        resolutionScale: 0.75,
+        lensSoftness: 0.32,
+        ccdBloom: 0.35,
+        noiseScale: 1.06,
+        bayerNR: 0.5,
+        chromaNR: 1.0,
+        jpegStrength: 0.2,
+        jpegQuality: 60,
+        jpegChroma420: 0.75,
+        jpegMidtone: 0.45,
+        jpegHighlight: 1.0,
+        brightness: 0,
+        contrast: 0,
+        analogStrength: 0.72,
+        analogTracking: 0.46,
+        analogChromaBleed: 0.76,
+        analogRinging: 0.62,
+        analogTapeNoise: 0.70,
+        analogBandMask: 0.35,
+        analogEdgeWave: 0.34,
+        analogDropouts: 0.32,
+        analogScanlines: 0.54,
+        analogHeadSwitch: 0.42,
+        freezeNoise: false,
+    };
+    state.clone = {
+        enabled: false,
+        source: 'luma',          // 'luma', 'depth'
+        threshold: 0.53,
+        blurRadius: 0,           // box blur radius on the 64x64 analysis grid
+        minBlobSize: 0,          // minimum blob area (0-1 of screen)
+        color: [0.0, 1.0, 0.6], // reserved for future use
+        opacity: 1.0,
+        gridDensity: 0,          // subdivision grid (0=off, 2-8=lines)
+        smoothing: 0.75,         // lerp factor (0=frozen, 1=instant snap)
+        invert: false,           // invert threshold (track dark regions)
+    };
+    state.colorGrading = {
+        brightness: 0,
+        contrast: 0,
     };
 
-    let selectedObjects = [];
     let mainLight = null;  // DirectionalLight for contact shadows
 
     let available = true;
@@ -316,36 +109,39 @@ export function createMaxJSFxController({
     // now-populated scene, then clears this flag. Prevents breakage without
     // rebuilding on every subsequent snapshot (which would murder scrub perf).
     let pipelineBuiltAgainstEmptyScene = false;
-    let activeNodes = [];
-    let activeSSRPass = null;
-    let activeAOPass = null;
-    let activeContactShadowPass = null;
-    let activeScenePass = null;
     let activeShaderLabFx = shaderLabFx;
-    let shaderLabInputTarget = null;
-    let lastShaderLabFrameTime = 0;
-    let powerShotInputTarget = null;
-    let powerShotPipeline = null;
-    let powerShotFrame = 0;
     let postFxResolutionScale = 1.0;
-    const dofFocusDistanceU = uniform(100);
-    const dofFocalLengthU = uniform(50);
-    const dofBokehScaleU = uniform(5);
-    const retroCurvatureU = uniform(0.02);
-    const retroBleedingU = uniform(0.001);
-    const retroColorDepthU = uniform(32);
-    const retroScanlineIntensityU = uniform(0.3);
-    const retroScanlineDensityU = uniform(1);
-    const retroVignetteIntensityU = uniform(0.3);
-    const pixelSizeU = uniform(4);
-    const pixelChromaticIntensityU = uniform(0.005);
-    const pixelSharpenStrengthU = uniform(0.5);
-    const pixelGrainIntensityU = uniform(0.08);
-    const pixelBrightnessU = uniform(0);
-    const pixelContrastU = uniform(0);
-    const pixelSaturationU = uniform(0);
-    let hiddenDuringPost = [];
     let forceEnvironmentBackground = false;
+
+    const core = createFxCore({
+        renderer,
+        scene,
+        descriptors: ALL,
+        state,
+        getCamera: () => camera,
+        getMainLight: () => mainLight,
+        supportsScreenSpaceEffects,
+        supportsTslPostEffects,
+        isShaderLabEnabled,
+        getEnvironmentVisible: () => environmentVisible,
+        getResolutionScale: () => postFxResolutionScale,
+    });
+    const postProcessing = core.postProcessing;
+
+    // Final-stylize stages — shared with the snapshot viewer (fx/final/*).
+    const shaderLabFinal = createShaderLabFinal({
+        renderer,
+        getShaderLabFx: () => activeShaderLabFx,
+        getScaledPostFxSize: core.getScaledPostFxSize,
+        supportsScreenSpaceEffects,
+    });
+    const powerShotFinal = createPowerShotFinal({
+        renderer,
+        getOptions: () => state.powershot,
+        getScaledPostFxSize: core.getScaledPostFxSize,
+        supportsScreenSpaceEffects,
+        isShaderLabEnabled,
+    });
 
     // Clone blob analysis (CPU side — tiny 64x64 readback + CCL)
     const BLOB_W = 64, BLOB_H = 64;
@@ -360,35 +156,11 @@ export function createMaxJSFxController({
     let stableBlobs = [];    // temporally smoothed blobs for rendering
     let nextStableId = 0;
     let blobSkip = 0;
-    const BLOB_SMOOTH_DEFAULT = 0.25;
     const BLOB_MATCH_DIST = 0.3;    // max centroid distance to match (normalized)
     const BLOB_FADE_FRAMES = 8;     // frames before an unmatched blob disappears
 
-    function cleanupUnsupportedRealtimeResources() {
-        if (supportsScreenSpaceEffects) return;
-        restoreForcedContactShadowLight();
-        removeVolumetricMesh();
-        activeContactShadowPass = null;
-    }
-
-    function isScreenSpaceActive(key) {
-        return supportsScreenSpaceEffects && !!state[key]?.enabled;
-    }
-
-    function isSSRActive() {
-        return supportsTslPostEffects && !!state.ssr.enabled;
-    }
-
-    function isContactShadowActive() {
-        return supportsScreenSpaceEffects && !!state.contactShadow.enabled && !!mainLight;
-    }
-
-    function isToonOutlineActive() {
-        return supportsScreenSpaceEffects && !!state.toonOutline.enabled;
-    }
-
-    function isBloomActive() {
-        return supportsTslPostEffects && !!state.bloom.enabled;
+    function isShaderLabEnabled() {
+        return supportsScreenSpaceEffects && !!activeShaderLabFx?.isEnabled?.();
     }
 
     function syncHiddenBackgroundUniforms() {
@@ -408,206 +180,6 @@ export function createMaxJSFxController({
         syncHiddenBackgroundUniforms();
         queuePipelineUpdate({ output: true });
         return hiddenBackground.getHex();
-    }
-
-    function getShaderLabInputs() {
-        return {
-            color: true,
-            depth: false,
-            normal: false,
-            motion: false,
-            slot: 'finalStylize',
-        };
-    }
-
-    function hasShaderLabPassEnabled() {
-        return isShaderLabEnabled()
-            && activeShaderLabFx.canRenderWithInputs?.(getShaderLabInputs()) !== false;
-    }
-
-    function isShaderLabEnabled() {
-        return supportsScreenSpaceEffects && !!activeShaderLabFx?.isEnabled?.();
-    }
-
-    function isRetroActive() {
-        return isScreenSpaceActive('retro') && !isShaderLabEnabled();
-    }
-
-    function isPS1WiggleActive() {
-        return supportsScreenSpaceEffects
-            && !!state.retro.wiggle
-            && (state.retro.enabled || isShaderLabEnabled());
-    }
-
-    function isPowerShotActive() {
-        const p = normalizePowerShotOptions();
-        if (p.mode === 'analog') {
-            return supportsScreenSpaceEffects
-                && !!p.enabled
-                && p.amount > 1.0e-6
-                && (p.analogStrength > 1.0e-6 || Math.abs(p.brightness) > 1.0e-6 || Math.abs(p.contrast) > 1.0e-6)
-                && !isShaderLabEnabled();
-        }
-        return supportsScreenSpaceEffects
-            && !!p.enabled
-            && p.amount > 1.0e-6
-            && !isShaderLabEnabled();
-    }
-
-    function normalizePowerShotPreset(value) {
-        const key = String(value || 'powershot');
-        return POWERSHOT_PRESETS[key] ? key : 'powershot';
-    }
-
-    function powerShotPresetUiDefaults(key) {
-        const preset = POWERSHOT_PRESETS[normalizePowerShotPreset(key)] || POWERSHOT_PRESETS.powershot;
-        return {
-            lensSoftness: preset.lens_softness ?? 0.25,
-            ccdBloom: preset.ccd_bloom_strength ?? 0,
-            bayerNR: preset.bnr_strength ?? 0,
-            jpegStrength: 0.2,
-            jpegQuality: preset.jpeg_quality ?? 60,
-            jpegChroma420: 0.75,
-            jpegMidtone: 0.45,
-            jpegHighlight: 1.0,
-            analogStrength: preset.analog_vhs_strength ?? 0.65,
-            analogTracking: preset.analog_tracking ?? 0.45,
-            analogChromaBleed: preset.analog_chroma_bleed ?? 0.75,
-            analogRinging: preset.analog_ringing ?? 0.65,
-            analogTapeNoise: preset.analog_tape_noise ?? 0.75,
-            analogBandMask: preset.analog_band_mask ?? 0.35,
-            analogEdgeWave: preset.analog_edge_wave ?? 0.35,
-            analogDropouts: preset.analog_dropouts ?? 0.35,
-            analogScanlines: preset.analog_scanlines ?? 0.55,
-            analogHeadSwitch: preset.analog_head_switch ?? 0.45,
-        };
-    }
-
-    function finiteOr(value, fallback) {
-        return Number.isFinite(value) ? value : fallback;
-    }
-
-    function powerShotNonZero(value, epsilon = 1.0e-6) {
-        return Math.abs(Number(value) || 0) > epsilon;
-    }
-
-    function powerShotAnyNonZero(values, epsilon = 1.0e-6) {
-        return Array.isArray(values) && values.some((value) => powerShotNonZero(value, epsilon));
-    }
-
-    function powerShotAnyUniformNonZero(preset, keys) {
-        return keys.some((key) => powerShotNonZero(preset?.[key]));
-    }
-
-    function powerShotArrayDiffers(values, identity) {
-        return Array.isArray(values)
-            && values.some((value, index) => Math.abs((Number(value) || 0) - identity[index]) > 1.0e-6);
-    }
-
-    function powerShotCcmDiffers(ccm) {
-        const identity = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
-        return Array.isArray(ccm)
-            && ccm.some((row, rowIndex) => powerShotArrayDiffers(row, identity[rowIndex] || []));
-    }
-
-    function normalizePowerShotOptions() {
-        const p = state.powershot;
-        p.mode = p.mode === 'analog' ? 'analog' : 'digital';
-        p.amount = THREE.MathUtils.clamp(finiteOr(p.amount, 1.0), 0, 1);
-        p.resolutionScale = THREE.MathUtils.clamp(finiteOr(p.resolutionScale, 0.75), 0.1, 1);
-        p.lensSoftness = THREE.MathUtils.clamp(finiteOr(p.lensSoftness, 0.32), 0, 1);
-        p.ccdBloom = THREE.MathUtils.clamp(finiteOr(p.ccdBloom, 0.35), 0, 2);
-        p.noiseScale = THREE.MathUtils.clamp(finiteOr(p.noiseScale, 1.06), 0, 2);
-        p.bayerNR = THREE.MathUtils.clamp(finiteOr(p.bayerNR, 0.5), 0, 1);
-        p.chromaNR = THREE.MathUtils.clamp(finiteOr(p.chromaNR, 1.0), 0, 1);
-        p.jpegStrength = THREE.MathUtils.clamp(finiteOr(p.jpegStrength, 0.2), 0, 1);
-        p.jpegQuality = THREE.MathUtils.clamp(finiteOr(p.jpegQuality, 60), 1, 100);
-        p.jpegChroma420 = THREE.MathUtils.clamp(finiteOr(p.jpegChroma420, 0.75), 0, 1);
-        p.jpegMidtone = THREE.MathUtils.clamp(finiteOr(p.jpegMidtone, 0.45), 0, 1);
-        p.jpegHighlight = THREE.MathUtils.clamp(finiteOr(p.jpegHighlight, 1.0), 0, 2);
-        p.brightness = THREE.MathUtils.clamp(finiteOr(p.brightness, 0), -1, 1);
-        p.contrast = THREE.MathUtils.clamp(finiteOr(p.contrast, 0), -1, 1);
-        p.analogStrength = THREE.MathUtils.clamp(finiteOr(p.analogStrength, 0.72), 0, 3);
-        p.analogTracking = THREE.MathUtils.clamp(finiteOr(p.analogTracking, 0.46), 0, 3);
-        p.analogChromaBleed = THREE.MathUtils.clamp(finiteOr(p.analogChromaBleed, 0.76), 0, 3);
-        p.analogRinging = THREE.MathUtils.clamp(finiteOr(p.analogRinging, 0.62), 0, 3);
-        p.analogTapeNoise = THREE.MathUtils.clamp(finiteOr(p.analogTapeNoise, 0.70), 0, 3);
-        p.analogBandMask = THREE.MathUtils.clamp(finiteOr(p.analogBandMask, 0.35), 0, 3);
-        p.analogEdgeWave = THREE.MathUtils.clamp(finiteOr(p.analogEdgeWave, 0.34), 0, 3);
-        p.analogDropouts = THREE.MathUtils.clamp(finiteOr(p.analogDropouts, 0.32), 0, 3);
-        p.analogScanlines = THREE.MathUtils.clamp(finiteOr(p.analogScanlines, 0.54), 0, 3);
-        p.analogHeadSwitch = THREE.MathUtils.clamp(finiteOr(p.analogHeadSwitch, 0.42), 0, 3);
-        return p;
-    }
-
-    function syncPowerShotPipeline() {
-        if (!powerShotPipeline) return;
-        const p = normalizePowerShotOptions();
-        const presetKey = normalizePowerShotPreset(p.preset);
-        const preset = POWERSHOT_PRESETS[presetKey];
-        p.preset = presetKey;
-        powerShotPipeline.setMode?.(p.mode);
-        applyPowerShotPreset(powerShotPipeline.ctx, preset);
-        powerShotPipeline.ctx.power.value = THREE.MathUtils.clamp(p.amount, 0, 1);
-        powerShotPipeline.ctx.P.lensSoftness.value = p.lensSoftness;
-        powerShotPipeline.ctx.P.ccdBloom.value = p.ccdBloom;
-        powerShotPipeline.ctx.noiseScale.value = p.noiseScale;
-        powerShotPipeline.ctx.P.bayerNR.value = p.bayerNR;
-        powerShotPipeline.ctx.P.chromaNR.value = p.chromaNR;
-        powerShotPipeline.ctx.P.jpegStrength.value = p.jpegStrength;
-        powerShotPipeline.ctx.P.jpegQuality.value = p.jpegQuality;
-        powerShotPipeline.ctx.P.jpegChroma420.value = p.jpegChroma420;
-        powerShotPipeline.ctx.P.jpegMidtone.value = p.jpegMidtone;
-        powerShotPipeline.ctx.P.jpegHighlight.value = p.jpegHighlight;
-        powerShotPipeline.ctx.P.analogStrength.value = p.analogStrength;
-        powerShotPipeline.ctx.P.analogTracking.value = p.analogTracking;
-        powerShotPipeline.ctx.P.analogChromaBleed.value = p.analogChromaBleed;
-        powerShotPipeline.ctx.P.analogRinging.value = p.analogRinging;
-        powerShotPipeline.ctx.P.analogTapeNoise.value = p.analogTapeNoise;
-        powerShotPipeline.ctx.P.analogBandMask.value = p.analogBandMask;
-        powerShotPipeline.ctx.P.analogEdgeWave.value = p.analogEdgeWave;
-        powerShotPipeline.ctx.P.analogDropouts.value = p.analogDropouts;
-        powerShotPipeline.ctx.P.analogScanlines.value = p.analogScanlines;
-        powerShotPipeline.ctx.P.analogHeadSwitch.value = p.analogHeadSwitch;
-        powerShotPipeline.setOutputColorGrading?.(p);
-
-        const digital = p.mode === 'digital';
-        if (!digital) return;
-
-        const setDigitalStage = (id, enabled) => powerShotPipeline.setEnabled?.(id, digital && !!enabled);
-        const hasNoise = p.noiseScale > 1.0e-6 && powerShotAnyUniformNonZero(preset, [
-            'noise_intensity', 'color_noise_intensity', 'column_fpn', 'row_fpn', 'prnu', 'dsnu',
-        ]);
-        setDigitalStage('barrel', powerShotNonZero(preset?.barrel_distortion));
-        setDigitalStage('ca', powerShotNonZero(preset?.chromatic_aberration));
-        setDigitalStage('lens', p.lensSoftness > 1.0e-6);
-        setDigitalStage('ccdbloom', p.ccdBloom > 1.0e-6);
-        setDigitalStage('mosaic', true);
-        setDigitalStage('dpc', powerShotNonZero(preset?.hot_pixel_rate));
-        setDigitalStage('blacklevel', powerShotAnyNonZero(preset?.black_level));
-        setDigitalStage('noise', hasNoise);
-        setDigitalStage('aaf', powerShotNonZero(preset?.aaf_strength));
-        setDigitalStage('bnr', p.bayerNR > 1.0e-6);
-        setDigitalStage('wb', powerShotArrayDiffers(preset?.wb_shift, [1, 1, 1]));
-        setDigitalStage('demosaic', true);
-        setDigitalStage('chromanr', p.chromaNR > 1.0e-6);
-        setDigitalStage('ccm', powerShotCcmDiffers(preset?.ccm));
-        setDigitalStage('tone', false);
-        setDigitalStage('saturation', Math.abs((Number(preset?.saturation_boost) || 1) - 1) > 1.0e-6);
-        setDigitalStage('vignette', powerShotNonZero(preset?.vignette_strength));
-        setDigitalStage('edge', powerShotNonZero(preset?.ee_gain));
-        setDigitalStage('jpeg', p.jpegStrength > 1.0e-6);
-    }
-
-    function ensurePowerShotPipeline() {
-        if (!powerShotPipeline) {
-            powerShotPipeline = new PowerShotPipeline(renderer);
-            for (const stage of POWERSHOT_STAGE_DEFS) {
-                powerShotPipeline.setEnabled(stage.id, stage.id !== 'tone');
-            }
-        }
-        syncPowerShotPipeline();
-        return powerShotPipeline;
     }
 
     function matchAndSmooth(rawBlobs) {
@@ -829,154 +401,6 @@ export function createMaxJSFxController({
         }
     }
 
-    let forcedContactShadowLightState = null;
-
-    // Cache objects that need hiding during post pass — rebuilt on pipeline rebuild only
-    let postPassHideList = [];
-    let normalsComputed = new WeakSet();
-
-    function refreshPostPassHideList() {
-        postPassHideList = [];
-        scene.traverse((object) => {
-            if (!object?.visible) return;
-            if (object.isLine || object.isLineSegments || object.isPoints || object.isSprite) {
-                postPassHideList.push(object);
-            }
-            // Pre-compute normals once, not every frame
-            if (object.isMesh && object.geometry && !normalsComputed.has(object.geometry)) {
-                if (!object.geometry.getAttribute?.('normal') && object.geometry.getAttribute?.('position')) {
-                    try { object.geometry.computeVertexNormals(); } catch {}
-                }
-                normalsComputed.add(object.geometry);
-            }
-        });
-    }
-
-    function prepareSceneForPostPass() {
-        hiddenDuringPost = postPassHideList.filter(o => o.visible);
-        for (const o of hiddenDuringPost) o.visible = false;
-    }
-
-    function restoreSceneAfterPostPass() {
-        for (const o of hiddenDuringPost) o.visible = true;
-        hiddenDuringPost = [];
-    }
-
-    function restoreForcedContactShadowLight() {
-        if (!forcedContactShadowLightState) return;
-
-        const { light, castShadow, shadowIntensity } = forcedContactShadowLightState;
-        forcedContactShadowLightState = null;
-
-        if (!light) return;
-
-        light.castShadow = castShadow;
-        if (light.shadow && shadowIntensity != null) {
-            light.shadow.intensity = shadowIntensity;
-            light.shadow.needsUpdate = true;
-        }
-    }
-
-    function ensureMainLightSupportsContactShadow() {
-        if (!state.contactShadow.enabled || !mainLight?.isDirectionalLight) {
-            restoreForcedContactShadowLight();
-            return;
-        }
-
-        if (forcedContactShadowLightState?.light && forcedContactShadowLightState.light !== mainLight) {
-            restoreForcedContactShadowLight();
-        }
-
-        if (mainLight.castShadow || forcedContactShadowLightState?.light === mainLight) return;
-
-        forcedContactShadowLightState = {
-            light: mainLight,
-            castShadow: mainLight.castShadow,
-            shadowIntensity: mainLight.shadow && Number.isFinite(mainLight.shadow.intensity)
-                ? mainLight.shadow.intensity
-                : null,
-        };
-
-        mainLight.castShadow = true;
-        if (mainLight.shadow) {
-            if (typeof mainLight.shadow.intensity === 'number') {
-                mainLight.shadow.intensity = 0;
-            }
-            mainLight.shadow.needsUpdate = true;
-        }
-    }
-
-    function disposeResource(resource, seen) {
-        if (!resource || seen.has(resource)) return;
-        seen.add(resource);
-        if (typeof resource.dispose === 'function') {
-            try { resource.dispose(); } catch (_) { /* best effort */ }
-        }
-    }
-
-    function disposeResourceMap(map, seen) {
-        if (!map) return;
-        const values = map instanceof Map ? map.values() : Object.values(map);
-        for (const value of values) {
-            disposeResource(value, seen);
-        }
-    }
-
-    function detachPostProcessingGraph() {
-        postProcessing.outputNode = emptyOutputNode;
-        postProcessing._context = null;
-        postProcessing.needsUpdate = true;
-
-        const quadMat = postProcessing?._quadMesh?.material;
-        if (!quadMat) return;
-
-        disposeResource(quadMat, new Set());
-        quadMat.fragmentNode = null;
-        quadMat.needsUpdate = true;
-    }
-
-    // Deep-dispose a post-FX node. PassNode owns render targets and temporal
-    // previous-frame texture clones; RTTNode from convertToTexture owns its
-    // render target plus a private quad material. Three's base Node.dispose()
-    // only dispatches an event, so walk the private ownership fields too.
-    function disposeNodeDeep(node, seen) {
-        if (!node) return;
-        try {
-            disposeResource(node.renderTarget, seen);
-            disposeResourceMap(node._previousTextures, seen);
-            disposeResourceMap(node._textures, seen);
-            disposeResource(node._quadMesh?.material, seen);
-            disposeResource(node, seen);
-
-            node.scene = null;
-            node.camera = null;
-            node.contextNode = null;
-            node.renderTarget = null;
-            node._previousTextures = {};
-            node._previousTextureNodes = {};
-            node._textures = {};
-            node._textureNodes = {};
-            node._linearDepthNodes = {};
-            node._viewZNodes = {};
-            node._contextNodeCache = null;
-        } catch (_) {
-            // Cleanup must never break a rebuild.
-        }
-    }
-
-    function clearNodes() {
-        detachPostProcessingGraph();
-        activeSSRPass = null;
-        activeAOPass = null;
-        activeContactShadowPass = null;
-        activeScenePass = null;
-        const seen = new Set();
-        for (const node of activeNodes) {
-            disposeNodeDeep(node, seen);
-        }
-        activeNodes = [];
-    }
-
     function disableWithError(prefix, error) {
         lastError = error?.message || String(error);
         available = false;
@@ -991,11 +415,7 @@ export function createMaxJSFxController({
         state.volumetric.enabled = false;
         state.dof.enabled = false;
         pipelineReady = false;
-        restoreForcedContactShadowLight();
-        removeVolumetricMesh();
-        clearNodes();
-        postProcessing.outputNode = null;
-        postProcessing.needsUpdate = true;
+        core.handleBuildFailure();
         onError(`${prefix}: ${lastError}`);
     }
 
@@ -1005,27 +425,18 @@ export function createMaxJSFxController({
     }
 
     function hasPipelineEffectEnabled() {
-        return isScreenSpaceActive('ssgi') || isSSRActive() || isScreenSpaceActive('gtao')
-            || isScreenSpaceActive('motionBlur') || isScreenSpaceActive('traa') || isBloomActive()
-            || (isToonOutlineActive() && cachedHasToonMeshes)
-            || isContactShadowActive()
-            || isRetroActive()
-            || isScreenSpaceActive('pixel')
-            || isPowerShotActive()
-            || isScreenSpaceActive('volumetric')
-            || isScreenSpaceActive('dof')
-            || isScreenSpaceActive('fog');
+        return core.anyEffectActive() || powerShotFinal.isActive();
     }
 
     function hasAnyEffectEnabled() {
-        return hasPipelineEffectEnabled() || hasShaderLabPassEnabled();
+        return hasPipelineEffectEnabled() || shaderLabFinal.hasPassEnabled();
     }
 
     function syncCanvasColorGrading() {
         const canvas = renderer?.domElement;
         if (!canvas?.style) return;
 
-        if (!hasColorGradingEnabled() || isPowerShotActive()) {
+        if (!hasColorGradingEnabled() || powerShotFinal.isActive()) {
             canvas.style.filter = '';
             return;
         }
@@ -1035,71 +446,20 @@ export function createMaxJSFxController({
         canvas.style.filter = `brightness(${brightness}) contrast(${contrast})`;
     }
 
-    function computeSceneReferenceSize() {
-        const box = new THREE.Box3();
-        let foundMesh = false;
-
-        scene.traverse((object) => {
-            if (!object?.visible || !object.isMesh || !object.geometry) return;
-            const position = object.geometry.getAttribute?.('position');
-            if (!position || position.count === 0) return;
-            box.expandByObject(object);
-            foundMesh = true;
-        });
-
-        if (!foundMesh || box.isEmpty()) return SSR_REFERENCE_SIZE;
-
-        const size = box.getSize(new THREE.Vector3());
-        const maxDimension = Math.max(size.x, size.y, size.z);
-        return Number.isFinite(maxDimension) && maxDimension > 1.0e-3
-            ? maxDimension
-            : SSR_REFERENCE_SIZE;
-    }
-
-    function computeDerivedState() {
-        const sceneReferenceSize = computeSceneReferenceSize();
-        const ssrUnitScale = Math.max(1, sceneReferenceSize / SSR_REFERENCE_SIZE);
-
-        return {
-            sceneReferenceSize,
-            ssrUnitScale,
-            effectiveSSRMaxDistance: state.ssr.maxDistance * ssrUnitScale,
-            effectiveSSRThickness: state.ssr.thickness * ssrUnitScale,
-            effectiveGTAORadius: state.gtao.radius * ssrUnitScale,
-            effectiveGTAOThickness: state.gtao.thickness * ssrUnitScale,
-            effectiveContactShadowMaxDistance: state.contactShadow.maxDistance * ssrUnitScale,
-            effectiveContactShadowThickness: state.contactShadow.thickness * ssrUnitScale,
-            ps1SnapActive: isPS1WiggleActive(),
-        };
-    }
-
     function snapshotState() {
-        return {
-            ssgi: { ...state.ssgi },
-            ssr: { ...state.ssr },
-            gtao: { ...state.gtao },
-            motionBlur: { ...state.motionBlur },
-            traa: { ...state.traa },
-            bloom: { ...state.bloom },
-            toonOutline: { ...state.toonOutline, toonCount: cachedHasToonMeshes ? 1 : 0 },
-            contactShadow: { ...state.contactShadow },
-            retro: { ...state.retro },
-            fog: { ...state.fog },
-            pixel: { ...state.pixel },
-            powershot: { ...state.powershot },
-            volumetric: { ...state.volumetric },
-            dof: { ...state.dof },
-            clone: { ...state.clone, color: [...state.clone.color] },  // blob tracker (CPU-only, no GPU pipeline)
-            colorGrading: { ...state.colorGrading },
-        };
+        const snap = {};
+        for (const descriptor of ALL) {
+            snap[descriptor.id] = cloneEffectDefaults(state[descriptor.id]);
+        }
+        snap.toonOutline.toonCount = core.hasToonMeshes() ? 1 : 0;
+        snap.powershot = { ...state.powershot };
+        snap.clone = { ...state.clone, color: [...state.clone.color] };  // blob tracker (CPU-only, no GPU pipeline)
+        snap.colorGrading = { ...state.colorGrading };
+        return snap;
     }
 
     function restoreStateSnapshot(fx = {}) {
-        const keys = [
-            'ssgi', 'ssr', 'gtao', 'motionBlur', 'traa', 'bloom',
-            'toonOutline', 'contactShadow', 'retro', 'fog', 'pixel',
-            'powershot', 'volumetric', 'dof', 'clone', 'colorGrading',
-        ];
+        const keys = [...ALL.map((d) => d.id), 'powershot', 'clone', 'colorGrading'];
         for (const key of keys) {
             const source = fx[key];
             if (!source || typeof source !== 'object') continue;
@@ -1117,16 +477,13 @@ export function createMaxJSFxController({
         syncHiddenBackgroundUniforms();
         colorGradingBrightnessU.value = state.colorGrading.brightness;
         colorGradingContrastU.value = state.colorGrading.contrast;
-        cleanupUnsupportedRealtimeResources();
+        core.cleanupUnsupportedRealtimeResources();
         rebuildPipeline();
         return snapshotState();
     }
 
-    // ── Fog — applied via scene.fogNode (independent of post-processing) ──
+    // ── Renderer output tracking + queued pipeline updates ──────────────
 
-    const fogTimer = uniform(0);
-    let fogAnimationActive = false;
-    const pixelTimer = uniform(0);
     const rendererDrawBufferSize = new THREE.Vector2();
     let pendingPipelineRebuild = false;
     let pendingSceneRefresh = false;
@@ -1210,160 +567,6 @@ export function createMaxJSFxController({
         return THREE.MathUtils.clamp(numeric, 0.25, 1.0);
     }
 
-    function getCombinedPostFxResolutionScale(extraScale = 1.0) {
-        const extra = Number(extraScale);
-        const safeExtra = Number.isFinite(extra) ? extra : 1.0;
-        return THREE.MathUtils.clamp(postFxResolutionScale * safeExtra, 0.1, 1.0);
-    }
-
-    function getScaledPostFxSize(width, height, extraScale = 1.0) {
-        const scale = getCombinedPostFxResolutionScale(extraScale);
-        return {
-            width: Math.max(2, Math.round(width * scale)),
-            height: Math.max(2, Math.round(height * scale)),
-        };
-    }
-
-    function applyNodeResolutionScale(node, extraScale = 1.0) {
-        if (!node) return;
-        const scale = getCombinedPostFxResolutionScale(extraScale);
-        if (typeof node.setResolutionScale === 'function') {
-            node.setResolutionScale(scale);
-        } else if ('resolutionScale' in node) {
-            node.resolutionScale = scale;
-        }
-    }
-
-    function ensureShaderLabInputTarget() {
-        readRendererDrawBufferSize(rendererDrawBufferSize);
-        const drawWidth = Math.max(1, Math.round(rendererDrawBufferSize.x || renderer.domElement?.width || 1));
-        const drawHeight = Math.max(1, Math.round(rendererDrawBufferSize.y || renderer.domElement?.height || 1));
-        const { width, height } = getScaledPostFxSize(drawWidth, drawHeight);
-        activeShaderLabFx?.resize?.(width, height);
-        if (shaderLabInputTarget && shaderLabInputTarget.width === width && shaderLabInputTarget.height === height) {
-            return shaderLabInputTarget;
-        }
-        try { shaderLabInputTarget?.dispose?.(); } catch (_) {}
-        shaderLabInputTarget = new THREE.RenderTarget(width, height, {
-            type: THREE.HalfFloatType,
-            colorSpace: THREE.LinearSRGBColorSpace,
-            depthBuffer: true,
-            stencilBuffer: false,
-        });
-        return shaderLabInputTarget;
-    }
-
-    function ensurePowerShotInputTarget() {
-        readRendererDrawBufferSize(rendererDrawBufferSize);
-        const drawWidth = Math.max(1, Math.round(rendererDrawBufferSize.x || renderer.domElement?.width || 1));
-        const drawHeight = Math.max(1, Math.round(rendererDrawBufferSize.y || renderer.domElement?.height || 1));
-        const powerShotScale = THREE.MathUtils.clamp(Number(state.powershot.resolutionScale) || 1, 0.1, 1);
-        const { width: workWidth, height: workHeight } = getScaledPostFxSize(drawWidth, drawHeight, powerShotScale);
-        const targetMatches = powerShotInputTarget
-            && powerShotInputTarget.width === workWidth
-            && powerShotInputTarget.height === workHeight;
-        if (!targetMatches) {
-            try { powerShotInputTarget?.dispose?.(); } catch (_) {}
-            powerShotInputTarget = new THREE.RenderTarget(workWidth, workHeight, {
-                type: THREE.HalfFloatType,
-                colorSpace: THREE.LinearSRGBColorSpace,
-                depthBuffer: true,
-                stencilBuffer: false,
-            });
-        }
-        ensurePowerShotPipeline().setSize(workWidth, workHeight);
-        return powerShotInputTarget;
-    }
-
-    function renderShaderLabFinal(renderNativeToCurrentTarget) {
-        if (!hasShaderLabPassEnabled()) return false;
-        const target = ensureShaderLabInputTarget();
-        const previousTarget = renderer.getRenderTarget?.() || null;
-        const previousToneMapping = renderer.toneMapping;
-        const previousExposure = renderer.toneMappingExposure;
-        const previousOutputColorSpace = renderer.outputColorSpace;
-        const previousClearColor = new THREE.Color();
-        try { renderer.getClearColor?.(previousClearColor); } catch (_) {}
-        const previousClearAlpha = typeof renderer.getClearAlpha === 'function'
-            ? renderer.getClearAlpha()
-            : null;
-        const now = performance.now() * 0.001;
-        const delta = lastShaderLabFrameTime > 0 ? now - lastShaderLabFrameTime : 0;
-        lastShaderLabFrameTime = now;
-
-        try {
-            renderer.toneMapping = THREE.NoToneMapping;
-            renderer.toneMappingExposure = 1.0;
-            renderer.outputColorSpace = THREE.LinearSRGBColorSpace;
-            renderer.setClearColor?.(0x000000, 0);
-            renderer.setRenderTarget(target);
-            renderNativeToCurrentTarget();
-        } finally {
-            renderer.setRenderTarget(previousTarget);
-            renderer.toneMapping = previousToneMapping;
-            renderer.toneMappingExposure = previousExposure;
-            renderer.outputColorSpace = previousOutputColorSpace;
-            if (previousClearAlpha != null) {
-                try { renderer.setClearColor?.(previousClearColor, previousClearAlpha); } catch (_) {}
-            }
-        }
-
-        return activeShaderLabFx.renderTexture?.(target.texture, now, delta, {
-            inputs: getShaderLabInputs(),
-            outputTarget: previousTarget,
-        }) === true;
-    }
-
-    function renderPowerShotFinal(renderNativeToCurrentTarget) {
-        if (!isPowerShotActive()) return false;
-        const target = ensurePowerShotInputTarget();
-        const previousTarget = renderer.getRenderTarget?.() || null;
-        const previousToneMapping = renderer.toneMapping;
-        const previousExposure = renderer.toneMappingExposure;
-        const previousOutputColorSpace = renderer.outputColorSpace;
-        const previousClearColor = new THREE.Color();
-        try { renderer.getClearColor?.(previousClearColor); } catch (_) {}
-        const previousClearAlpha = typeof renderer.getClearAlpha === 'function'
-            ? renderer.getClearAlpha()
-            : null;
-
-        try {
-            renderer.toneMapping = previousToneMapping;
-            renderer.toneMappingExposure = previousExposure;
-            renderer.outputColorSpace = THREE.LinearSRGBColorSpace;
-            renderer.setClearColor?.(0x000000, 0);
-            renderer.setRenderTarget(target);
-            renderNativeToCurrentTarget();
-        } finally {
-            renderer.setRenderTarget(previousTarget);
-            renderer.toneMapping = previousToneMapping;
-            renderer.toneMappingExposure = previousExposure;
-            renderer.outputColorSpace = previousOutputColorSpace;
-            if (previousClearAlpha != null) {
-                try { renderer.setClearColor?.(previousClearColor, previousClearAlpha); } catch (_) {}
-            }
-        }
-
-        if (!state.powershot.freezeNoise) powerShotFrame += 1;
-        const pipeline = ensurePowerShotPipeline();
-        try {
-            renderer.toneMapping = THREE.NoToneMapping;
-            renderer.toneMappingExposure = 1.0;
-            renderer.outputColorSpace = previousOutputColorSpace;
-            renderer.setClearColor?.(0x000000, 0);
-            return pipeline.renderTexture(target.texture, powerShotFrame, {
-                outputTarget: previousTarget,
-            }) === true;
-        } finally {
-            renderer.toneMapping = previousToneMapping;
-            renderer.toneMappingExposure = previousExposure;
-            renderer.outputColorSpace = previousOutputColorSpace;
-            if (previousClearAlpha != null) {
-                try { renderer.setClearColor?.(previousClearColor, previousClearAlpha); } catch (_) {}
-            }
-        }
-    }
-
     function flushPendingPipelineUpdates() {
         syncRendererOutputState();
         const needsRebuild = pendingPipelineRebuild;
@@ -1387,8 +590,7 @@ export function createMaxJSFxController({
             // Scene structure changed (mesh added/removed/material swap) but the
             // post-FX node graph is unchanged. Refresh the two scene-derived caches
             // without tearing down the pipeline.
-            refreshToonMeshCache();
-            refreshPostPassHideList();
+            core.refreshSceneCaches();
         }
 
         if (needsOutputRefresh && pipelineReady) {
@@ -1398,304 +600,34 @@ export function createMaxJSFxController({
 
     snapshotRendererOutputState();
 
-    // ── Volumetric lighting mesh management ──
+    function rebuildPipeline() {
+        core.prepareRebuild();
 
-    const LAYER_VOL = 10;
-    const volLayerMask = new THREE.Layers();
-    volLayerMask.disableAll();
-    volLayerMask.enable(LAYER_VOL);
-
-    let volumetricMesh = null;
-    let volNoiseTexture = null;
-    let volLightsEnabled = [];
-    const volDensityU = uniform(0.5);
-    const volIntensityU = uniform(1.0);
-    const volDenoiseU = uniform(0.6);
-    const volLightContribU = uniform(1.0);
-
-    function getOrCreateVolNoise() {
-        if (volNoiseTexture) return volNoiseTexture;
-        const size = 64;
-        const data = new Uint8Array(size * size * size);
-        const noise = new ImprovedNoise();
-        const scale = 5.0;
-        for (let k = 0; k < size; k++)
-            for (let j = 0; j < size; j++)
-                for (let i = 0; i < size; i++)
-                    data[i + j * size + k * size * size] =
-                        (noise.noise(i * scale / size, j * scale / size, k * scale / size) * 0.5 + 0.5) * 255;
-        const tex = new THREE.Data3DTexture(data, size, size, size);
-        tex.format = THREE.RedFormat;
-        tex.minFilter = THREE.LinearFilter;
-        tex.magFilter = THREE.LinearFilter;
-        tex.wrapS = tex.wrapT = tex.wrapR = THREE.RepeatWrapping;
-        tex.needsUpdate = true;
-        volNoiseTexture = tex;
-        return tex;
-    }
-
-    function ensureVolumetricMesh() {
-        const noiseTex = getOrCreateVolNoise();
-        volDensityU.value = state.volumetric.density;
-
-        if (!volumetricMesh) {
-            const volMat = new THREE.VolumeNodeMaterial();
-            volMat.steps = state.volumetric.steps;
-            // Volumetric light should respond only to explicit scene lights.
-            // Letting scene.environment drive this material makes HDRI/env slot
-            // changes wash out or override the intended volumetric contribution.
-            volMat.envNode = color(0x000000);
-            volMat.offsetNode = bayer16(screenCoordinate);
-            volMat.scatteringNode = Fn(({ positionRay }) => {
-                const t = vec3(time, float(0), time.mul(0.3));
-                const sampleAt = (scale, timeScale) =>
-                    texture3D(noiseTex, positionRay.add(t.mul(timeScale)).mul(scale).mod(1), 0).r.add(0.5);
-                let d = sampleAt(0.1, 1);
-                d = d.mul(sampleAt(0.05, 1));
-                d = d.mul(sampleAt(0.02, 2));
-                return volDensityU.mix(float(1), d);
-            });
-
-            volumetricMesh = new THREE.Mesh(
-                new THREE.BoxGeometry(1, 1, 1),
-                volMat
-            );
-            volumetricMesh.userData.isVolume = true;
-            volumetricMesh.layers.disableAll();
-            volumetricMesh.layers.enable(LAYER_VOL);
-            scene.add(volumetricMesh);
-        } else {
-            volumetricMesh.material.steps = state.volumetric.steps;
-        }
-
-        // Size to scene bounds
-        const box = new THREE.Box3();
-        scene.traverse(obj => {
-            if (
-                obj.isMesh
-                && obj !== volumetricMesh
-                && !obj.userData?.volumetricBoundsBypass
-                && obj.visible
-                && obj.geometry
-            ) {
-                const pos = obj.geometry.getAttribute?.('position');
-                if (pos && pos.count > 0) box.expandByObject(obj);
-            }
-        });
-        if (!box.isEmpty()) {
-            const center = box.getCenter(new THREE.Vector3());
-            const sz = box.getSize(new THREE.Vector3());
-            const pad = 2.0;
-            volumetricMesh.position.copy(center);
-            volumetricMesh.scale.set(
-                Math.max(sz.x * pad, 1),
-                Math.max(sz.y * pad, 1),
-                Math.max(sz.z * pad, 1)
-            );
-        } else {
-            volumetricMesh.position.set(0, 0, 0);
-            volumetricMesh.scale.set(500, 500, 500);
-        }
-        volumetricMesh.visible = true;
-
-        syncVolumetricLightLayers();
-    }
-
-    /** Max light volContrib edits do not rebuild the post pipeline; re-apply light.layers every frame. */
-    function syncVolumetricLightLayers() {
-        disableVolLights();
-        let contribSum = 0;
-        let contribCount = 0;
-        scene.traverse(obj => {
-            if (!obj.isLight) return;
-            if (obj.userData?.volumetricBypass) return;
-            const vc = obj.userData?.volContrib;
-            if (vc !== undefined && vc <= 0) return;
-            obj.layers.enable(LAYER_VOL);
-            volLightsEnabled.push(obj);
-            const val = (vc !== undefined && Number.isFinite(vc)) ? Math.max(0, vc) : 1.0;
-            contribSum += val;
-            contribCount++;
-        });
-        // Average per-light volContrib as linear output multiplier
-        volLightContribU.value = contribCount > 0 ? contribSum / contribCount : 1.0;
-    }
-
-    function disableVolLights() {
-        for (const light of volLightsEnabled) {
-            if (light.layers) light.layers.disable(LAYER_VOL);
-        }
-        volLightsEnabled = [];
-    }
-
-    // Per-light volContrib is applied as a linear output multiplier via volLightContribU
-    // (averaged across contributing lights in syncVolumetricLightLayers).
-    // This gives smooth 0-1 control instead of the near-binary response from
-    // scaling light intensity before Beer's law exponential.
-
-    function removeVolumetricMesh() {
-        if (volumetricMesh) volumetricMesh.visible = false;
-        disableVolLights();
-    }
-
-    function applyFog() {
-        const f = state.fog;
-        if (!supportsScreenSpaceEffects || !f.enabled) {
-            scene.fogNode = null;
-            fogAnimationActive = false;
+        if (!hasPipelineEffectEnabled() || !available) {
+            pipelineReady = false;
+            core.teardownPipeline();
+            forceEnvironmentBackground = false;
+            syncCanvasColorGrading();
             return;
         }
 
-        const fogColor = color(f.color[0], f.color[1], f.color[2]);
+        core.clearNodes();
+        syncCanvasColorGrading();
 
-        if (f.type === 0) {
-            // Range fog (linear near/far)
-            const factor = rangeFogFactor(f.near, f.far);
-            scene.fogNode = fog(fogColor, factor.mul(float(f.opacity)));
-        } else if (f.type === 1) {
-            // Density fog (exponential)
-            const factor = densityFogFactor(f.density);
-            scene.fogNode = fog(fogColor, factor.mul(float(f.opacity)));
-        } else if (f.type === 2) {
-            // Custom procedural fog with triNoise3D
-            const groundColor = fogColor;
-            const fogDistance = positionView.z.negate().smoothstep(0, camera.far.sub ? camera.far : float(1000));
-            const distance = fogDistance.mul(float(f.height)).max(float(4));
-            const groundFogArea = distance.sub(positionWorld.y).div(distance).pow(3).saturate().mul(float(f.opacity));
-
-            const noiseA = triNoise3D(positionWorld.mul(float(f.noiseScale)), float(0.2), fogTimer);
-            const noiseB = triNoise3D(positionWorld.mul(float(f.noiseScale * 2)), float(0.2), fogTimer.mul(float(1.2)));
-            const fogNoise = noiseA.add(noiseB).mul(groundColor);
-
-            scene.fogNode = fog(fogDistance.oneMinus().mix(groundColor, fogNoise), groundFogArea);
-            fogAnimationActive = true;
-        }
-    }
-
-    function updateActiveScreenSpaceParams() {
-        if (activeScenePass) {
-            activeScenePass.transparent = true;
-        }
-        const derived = computeDerivedState();
-        if (activeSSRPass) {
-            activeSSRPass.maxDistance.value = derived.effectiveSSRMaxDistance;
-            activeSSRPass.thickness.value = derived.effectiveSSRThickness;
-        }
-        if (activeAOPass) {
-            activeAOPass.radius.value = derived.effectiveGTAORadius;
-            activeAOPass.thickness.value = derived.effectiveGTAOThickness;
-        }
-        if (activeContactShadowPass) {
-            activeContactShadowPass.maxDistance.value = derived.effectiveContactShadowMaxDistance;
-            activeContactShadowPass.thickness.value = derived.effectiveContactShadowThickness;
+        const result = core.buildPipeline();
+        if (result.ok) {
+            pipelineReady = true;
+            lastError = '';
+            forceEnvironmentBackground = result.forceEnvironmentBackground;
+            pipelineBuiltAgainstEmptyScene = result.builtAgainstEmptyScene;
+        } else {
+            forceEnvironmentBackground = false;
+            disableWithError('SSGI setup failed', result.error);
         }
     }
 
     function assignFinite(target, key, value) {
         if (Number.isFinite(value)) target[key] = value;
-    }
-
-    // ── PS1 Vertex Snap ──────────────────────────────────
-    // Snaps vertices to screen-pixel grid in clip space. Modifies materials in-place —
-    // no material cloning, no CubeMapNode overhead, no separate render pass.
-    const ps1SnapStrength = uniform(5.0);
-    // PS1 vertex snap — outputs clip-space position via vertexNode (bypasses Three.js projection)
-    const ps1VertexSnap = Fn(() => {
-        const worldPos = modelWorldMatrix.mul(vec4(positionLocal, 1.0));
-        const clipPos = cameraProjectionMatrix.mul(cameraViewMatrix).mul(worldPos);
-        const w = clipPos.w;
-        const ndc = clipPos.xy.div(w);
-        const screenPx = ndc.add(1.0).mul(0.5).mul(screenSize);
-        const grid = ps1SnapStrength;
-        const snappedPx = screenPx.div(grid).floor().mul(grid);
-        const snappedNdc = snappedPx.div(screenSize).mul(2.0).sub(1.0);
-        return vec4(snappedNdc.mul(w), clipPos.z, w);
-    })();
-
-    let ps1WiggleActive = false;
-    let ps1SceneDirty = true;
-    const ps1SavedNodes = new Map();
-
-    function ps1SavedVertexNode(saved) {
-        return saved && typeof saved === 'object' && Object.prototype.hasOwnProperty.call(saved, 'vertexNode')
-            ? saved.vertexNode
-            : saved;
-    }
-
-    function restorePS1Material(mat) {
-        if (!ps1SavedNodes.has(mat)) return;
-        mat.vertexNode = ps1SavedVertexNode(ps1SavedNodes.get(mat));
-        ps1SavedNodes.delete(mat);
-    }
-
-    function hasPS1ExcludedToken(value) {
-        const text = String(value || '').toLowerCase();
-        return /(^|[_\-\s])(sky|skydome|skybox|background|backdrop|environment|env)([_\-\s]|$)/.test(text);
-    }
-
-    function shouldSkipPS1Object(obj) {
-        if (!obj || (!obj.isMesh && !obj.isSkinnedMesh && !obj.isInstancedMesh)) return true;
-        const data = obj.userData || {};
-        if (data.maxjsNoPS1Wiggle || data.maxjsSky || data.maxjsBackground || data.maxjsBackdrop) return true;
-        if (obj.isSky || obj.isSkyMesh || hasPS1ExcludedToken(obj.name) || hasPS1ExcludedToken(obj.type)) return true;
-        return false;
-    }
-
-    function shouldSkipPS1Material(mat) {
-        if (!mat) return true;
-        const data = mat.userData || {};
-        if (data.maxjsNoPS1Wiggle || data.maxjsSky || data.maxjsBackground || data.maxjsBackdrop) return true;
-        return hasPS1ExcludedToken(mat.name) || hasPS1ExcludedToken(mat.type);
-    }
-
-    function enablePS1Wiggle(strength = 5.0) {
-        ps1SnapStrength.value = Math.max(1.0, strength);
-        ps1WiggleActive = true;
-        scene.traverse(obj => {
-            const skipObject = shouldSkipPS1Object(obj);
-            const mats = obj.material
-                ? (Array.isArray(obj.material) ? obj.material : [obj.material])
-                : [];
-            for (const mat of mats) {
-                if (skipObject || shouldSkipPS1Material(mat)) {
-                    restorePS1Material(mat);
-                    continue;
-                }
-                if (ps1SavedNodes.has(mat)) continue;
-                ps1SavedNodes.set(mat, { vertexNode: mat.vertexNode || null, object: obj });
-                mat.vertexNode = ps1VertexSnap;
-            }
-        });
-    }
-
-    function disablePS1Wiggle() {
-        if (!ps1WiggleActive && ps1SavedNodes.size === 0) return;
-        ps1WiggleActive = false;
-        for (const [mat, saved] of ps1SavedNodes) {
-            mat.vertexNode = ps1SavedVertexNode(saved);
-        }
-        ps1SavedNodes.clear();
-    }
-
-    function syncRetroUniforms() {
-        const r = state.retro;
-        retroCurvatureU.value = r.curvature;
-        retroBleedingU.value = r.bleeding;
-        retroColorDepthU.value = r.colorDepth;
-        retroScanlineIntensityU.value = r.scanlineIntensity;
-        retroScanlineDensityU.value = r.scanlineDensity;
-        retroVignetteIntensityU.value = r.vignetteIntensity;
-    }
-
-    function syncPixelUniforms() {
-        const p = state.pixel;
-        pixelSizeU.value = p.pixelSize;
-        pixelChromaticIntensityU.value = p.chromaticIntensity;
-        pixelSharpenStrengthU.value = p.sharpenStrength;
-        pixelGrainIntensityU.value = p.grainIntensity;
-        pixelBrightnessU.value = p.brightness;
-        pixelContrastU.value = p.contrast;
-        pixelSaturationU.value = p.saturation;
     }
 
     function retroOptionsNeedRebuild(options = {}) {
@@ -1715,506 +647,12 @@ export function createMaxJSFxController({
         return false;
     }
 
-    function syncSharedSceneEffects(force = false) {
-        const shouldUsePS1Wiggle = isPS1WiggleActive();
-        if (shouldUsePS1Wiggle) {
-            if (force || ps1SceneDirty || !ps1WiggleActive) {
-                enablePS1Wiggle(state.retro.affineDistortion);
-            } else {
-                ps1SnapStrength.value = Math.max(1.0, state.retro.affineDistortion);
-            }
-        } else {
-            disablePS1Wiggle();
-        }
-        ps1SceneDirty = false;
-    }
-
-    function rebuildPipeline() {
-        disablePS1Wiggle();
-        ps1SceneDirty = true;
-        refreshToonMeshCache();
-        refreshPostPassHideList();
-        ensureMainLightSupportsContactShadow();
-        cleanupUnsupportedRealtimeResources();
-        if (!isScreenSpaceActive('volumetric')) removeVolumetricMesh();
-
-        if (!hasPipelineEffectEnabled() || !available) {
-            pipelineReady = false;
-            syncSharedSceneEffects(true);
-            restoreForcedContactShadowLight();
-            clearNodes();
-            postProcessing.outputNode = null;
-            postProcessing.needsUpdate = true;
-            forceEnvironmentBackground = false;
-            syncCanvasColorGrading();
-            return;
-        }
-
-        clearNodes();
-        syncCanvasColorGrading();
-
-        try {
-            // PS1 vertex snap — coexists with all post-FX, no takeover needed
-            syncSharedSceneEffects(true);
-
-            const useSharedPrePass =
-                isScreenSpaceActive('gtao') ||
-                isScreenSpaceActive('motionBlur') ||
-                isScreenSpaceActive('traa') ||
-                isContactShadowActive();
-
-            let prePassDepth = null;
-            let prePassNormal = null;
-            let prePassVelocity = null;
-
-            if (useSharedPrePass) {
-                // TRAA copies depth — MSAA sample count must be 1 to avoid mismatch
-                const prePass = isScreenSpaceActive('traa')
-                    ? pass(scene, camera, { samples: 1 })
-                    : pass(scene, camera);
-                applyNodeResolutionScale(prePass);
-                activeNodes.push(prePass);
-                prePass.transparent = false;
-                prePass.setMRT(mrt({
-                    output: directionToColor(normalView),
-                    velocity,
-                }));
-
-                prePassDepth = prePass.getTextureNode('depth');
-                const prePassNormalColor = prePass.getTextureNode('output');
-                prePassVelocity = prePass.getTextureNode('velocity');
-                prePassNormal = sample((uvNode) => colorToDirection(prePassNormalColor.sample(uvNode)));
-
-                const normalTexture = prePass.getTexture('output');
-                if (normalTexture) normalTexture.type = THREE.UnsignedByteType;
-            }
-
-            let sceneContext = null;
-            if (isContactShadowActive() && prePassDepth) {
-                const derived = computeDerivedState();
-                const contactShadowTemporal = state.contactShadow.temporal && isScreenSpaceActive('traa');
-                const sssPass = sss(prePassDepth, camera, mainLight);
-                sssPass.maxDistance.value = derived.effectiveContactShadowMaxDistance;
-                sssPass.thickness.value = derived.effectiveContactShadowThickness;
-                sssPass.shadowIntensity.value = state.contactShadow.shadowIntensity;
-                sssPass.quality.value = state.contactShadow.quality;
-                sssPass.useTemporalFiltering = contactShadowTemporal;
-                activeNodes.push(sssPass);
-                activeContactShadowPass = sssPass;
-
-                const sssSample = sssPass.getTextureNode().sample(screenUV).r;
-                sceneContext = builtinShadowContext(sssSample, mainLight, sceneContext);
-            }
-
-            // When HDRI is loaded but not shown as the viewport background, the scene pass still
-            // sees environment in reflections; far-depth pixels must be normalized to hidden fill + a=0
-            // so SSR and fog (isBg) behave. This was SSR-only before, which broke fog whenever SSR was off.
-            const hiddenEnvironmentBackdrop =
-                !!scene.environment && !environmentVisible;
-            const useEnvironmentBackdropCompensation =
-                hiddenEnvironmentBackdrop
-                && (isSSRActive() || isScreenSpaceActive('fog'));
-            // Hidden environment/background means transparent scene input.
-            // The CSS viewport backdrop may still be visible behind the canvas,
-            // but it must never enter Bloom/SSGI/SSR source pixels.
-            const backgroundFillNode = vec3(0, 0, 0);
-            const backgroundAlphaNode = float(0);
-
-            let beauty;
-            let scenePassNode = null;
-            let scenePassColor, scenePassDepth, scenePassDiffuse, scenePassNormalColor, scenePassMetalRough, sceneNormal, ssrReflectivity;
-
-            {
-                const derived = computeDerivedState();
-                const ssrReflectivityNode = max(
-                    metalness,
-                    roughness.oneMinus().mul(0.35).add(float(0.04))
-                ).mul(roughness.smoothstep(0.85, 0.75));
-
-                if (isScreenSpaceActive('gtao') && prePassDepth && prePassNormal) {
-                    const aoPass = ao(prePassDepth, prePassNormal, camera);
-                    aoPass.samples.value = state.gtao.samples;
-                    aoPass.distanceExponent.value = state.gtao.distanceExponent;
-                    aoPass.distanceFallOff.value = state.gtao.distanceFallOff;
-                    aoPass.radius.value = derived.effectiveGTAORadius;
-                    aoPass.scale.value = state.gtao.scale;
-                    aoPass.thickness.value = derived.effectiveGTAOThickness;
-                    applyNodeResolutionScale(aoPass, state.gtao.resolutionScale);
-                    aoPass.useTemporalFiltering = isScreenSpaceActive('traa');
-                    activeNodes.push(aoPass);
-                    activeAOPass = aoPass;
-
-                    const aoSample = aoPass.getTextureNode().sample(screenUV).r;
-                    sceneContext = builtinAOContext(aoSample, sceneContext);
-                }
-
-                // Use toonOutlinePass as scene pass when toon materials exist — outlines + MRT
-                const useToonPass = isToonOutlineActive() && getToonMeshes().length > 0;
-                const toc = state.toonOutline;
-                const scenePass = useToonPass
-                    ? toonOutlinePass(scene, camera,
-                        new THREE.Color(toc.color[0], toc.color[1], toc.color[2]),
-                        toc.thickness,
-                        toc.alpha)
-                    : pass(scene, camera);
-                applyNodeResolutionScale(scenePass);
-                activeNodes.push(scenePass);
-                scenePassNode = scenePass;
-                activeScenePass = scenePass;
-                // Keep the transparent render list enabled regardless of backdrop.
-                // PassNode.transparent controls whether transparent objects render,
-                // so tying it to the HDRI visibility toggle drops opacity maps.
-                scenePass.transparent = true;
-
-                if (sceneContext) scenePass.contextNode = sceneContext;
-
-                scenePass.setMRT(mrt({
-                    output,
-                    diffuseColor,
-                    normal: directionToColor(normalView),
-                    metalrough: vec2(ssrReflectivityNode, roughness),
-                }));
-
-                setTexturePrecision(scenePass);
-
-                scenePassColor = scenePass.getTextureNode('output');
-                beauty = scenePassColor;
-                scenePassDiffuse = scenePass.getTextureNode('diffuseColor');
-                scenePassDepth = scenePass.getTextureNode('depth');
-                scenePassNormalColor = scenePass.getTextureNode('normal');
-                scenePassMetalRough = scenePass.getTextureNode('metalrough');
-                sceneNormal = sample((uvNode) => colorToDirection(scenePassNormalColor.sample(uvNode)));
-                ssrReflectivity = scenePassMetalRough.r;
-            }
-
-            // The MRT scene-pass output alpha is unreliable for opaque geometry
-            // when there is no background fill (alpha render / transparent
-            // export): opaque pixels can read a=0, which then premultiplies the
-            // whole matte to transparent black on the canvas. Derive coverage
-            // from scene depth (already reliable, drives the env-backdrop
-            // compensation below) and keep the higher of the two so glow/bloom
-            // can still extend alpha past the geometry. This is a no-op for
-            // live/opaque renders, where the background fills depth=far with a=1
-            // — there scenePassColor.a is already 1 and dominates the max().
-            const geometryCoverageAlpha = scenePassDepth.r.lessThan(float(0.999999)).select(float(1), float(0));
-            let beautyAlpha = max(scenePassColor.a, geometryCoverageAlpha);
-            const withBeautyAlpha = (node) => vec4(node.rgb, beautyAlpha);
-            const raiseBeautyAlpha = (alphaNode) => {
-                beautyAlpha = max(beautyAlpha, alphaNode);
-                return beautyAlpha;
-            };
-
-            if (isScreenSpaceActive('ssgi')) {
-                const ssgiPass = ssgi(scenePassColor, scenePassDepth, sceneNormal, camera);
-                ssgiPass.sliceCount.value = state.ssgi.sliceCount;
-                ssgiPass.stepCount.value = state.ssgi.stepCount;
-                ssgiPass.radius.value = state.ssgi.radius;
-                ssgiPass.thickness.value = state.ssgi.thickness;
-                ssgiPass.aoIntensity.value = state.ssgi.aoIntensity;
-                ssgiPass.giIntensity.value = state.ssgi.giIntensity;
-                ssgiPass.expFactor.value = state.ssgi.expFactor;
-                ssgiPass.useTemporalFiltering = state.ssgi.temporal;
-                applyNodeResolutionScale(ssgiPass);
-                activeNodes.push(ssgiPass);
-
-                beauty = vec4(
-                    add(
-                        beauty.rgb.mul(ssgiPass.a),
-                        scenePassDiffuse.rgb.mul(ssgiPass.rgb)
-                    ),
-                    beautyAlpha
-                );
-            }
-
-            if (isSSRActive()) {
-                const derived = computeDerivedState();
-                const ssrPass = ssr(
-                    scenePassColor,
-                    scenePassDepth,
-                    sceneNormal,
-                    ssrReflectivity,
-                    scenePassMetalRough.g,
-                    camera
-                );
-                ssrPass.quality.value = state.ssr.quality;
-                ssrPass.blurQuality.value = state.ssr.blurQuality;
-                ssrPass.maxDistance.value = derived.effectiveSSRMaxDistance;
-                ssrPass.opacity.value = state.ssr.opacity;
-                ssrPass.thickness.value = derived.effectiveSSRThickness;
-                applyNodeResolutionScale(ssrPass);
-                activeNodes.push(ssrPass);
-                activeSSRPass = ssrPass;
-                // SSR has no proper environment fallback, so do not let it darken
-                // the existing beauty pass. Keep the brighter of the base lighting
-                // (including HDRI/IBL) and the SSR-composited result.
-                const ssrBlended = blendColor(beauty, ssrPass);
-                beauty = vec4(max(beauty.rgb, ssrBlended.rgb), beautyAlpha);
-            }
-
-            let environmentBackdropCompensated = false;
-            // SSR needs the HDRI temporarily visible as a background source when
-            // the user hides the environment, but downstream effects should see
-            // a transparent/hidden backdrop. Do this before bloom so glow can
-            // rebuild alpha around geometry instead of being wiped later.
-            if (useEnvironmentBackdropCompensation && scenePassDepth) {
-                const hasGeom = scenePassDepth.r.lessThan(float(0.999999));
-                beautyAlpha = hasGeom.select(beautyAlpha, backgroundAlphaNode);
-                beauty = vec4(
-                    hasGeom.select(beauty.rgb, backgroundFillNode),
-                    beautyAlpha
-                );
-                environmentBackdropCompensated = true;
-            }
-
-            if (isBloomActive()) {
-                const bloomPass = bloom(
-                    beauty,
-                    state.bloom.strength,
-                    state.bloom.radius,
-                    state.bloom.threshold
-                );
-                applyNodeResolutionScale(bloomPass);
-                activeNodes.push(bloomPass);
-                const bloomLuma = bloomPass.r.mul(0.2126).add(bloomPass.g.mul(0.7152)).add(bloomPass.b.mul(0.0722));
-                beauty = vec4(beauty.rgb.add(bloomPass.rgb), raiseBeautyAlpha(bloomLuma));
-            }
-
-            if (isScreenSpaceActive('dof') && scenePassNode) {
-                dofFocusDistanceU.value = state.dof.focusDistance;
-                dofFocalLengthU.value = state.dof.focalLength;
-                dofBokehScaleU.value = state.dof.bokehScale;
-                const dofPass = dof(beauty, scenePassNode.getViewZNode(), dofFocusDistanceU, dofFocalLengthU, dofBokehScaleU);
-                applyNodeResolutionScale(dofPass);
-                activeNodes.push(dofPass);
-                // DepthOfFieldNode composite forces a=1; keep scene alpha for transparent backdrop + fog
-                beauty = vec4(dofPass.rgb, beautyAlpha);
-            }
-
-            // Toon outline is handled at the scene pass level (line above) —
-            // toonOutlinePass replaces pass() so MRT + SSGI/SSR/Bloom all stack on top.
-
-            // ── Volumetric Lighting ──
-            if (isScreenSpaceActive('volumetric')) {
-                try {
-                    ensureVolumetricMesh();
-                    volDensityU.value = state.volumetric.density;
-                    volIntensityU.value = state.volumetric.intensity;
-                    volDenoiseU.value = state.volumetric.denoise;
-
-                    const volPass = pass(scene, camera, { depthBuffer: false });
-                    volPass.setLayers(volLayerMask);
-                    applyNodeResolutionScale(volPass, state.volumetric.resolution);
-                    activeNodes.push(volPass);
-
-                    const blurredVol = gaussianBlur(volPass, volDenoiseU);
-                    activeNodes.push(blurredVol);
-
-                    const volResult = blurredVol.mul(volIntensityU).mul(volLightContribU);
-                    const volLuma = volResult.r.mul(0.2126).add(volResult.g.mul(0.7152)).add(volResult.b.mul(0.0722));
-                    beauty = vec4(beauty.rgb.add(volResult.rgb), raiseBeautyAlpha(volLuma));
-                } catch (e) {
-                    console.warn('Volumetric pass failed:', e);
-                    removeVolumetricMesh();
-                }
-            }
-
-            if (isScreenSpaceActive('traa') && prePassDepth && prePassVelocity) {
-                const traaInput = convertToTexture(beauty);
-                activeNodes.push(traaInput);
-
-                const traaPass = traa(traaInput, prePassDepth, prePassVelocity, camera);
-                traaPass.useSubpixelCorrection = state.traa.useSubpixelCorrection;
-                traaPass.depthThreshold = state.traa.depthThreshold;
-                traaPass.edgeDepthDiff = state.traa.edgeDepthDiff;
-                traaPass.maxVelocityLength = state.traa.maxVelocityLength;
-                applyNodeResolutionScale(traaPass);
-                activeNodes.push(traaPass);
-                beauty = vec4(traaPass.rgb, beautyAlpha);
-            }
-
-            if (isScreenSpaceActive('motionBlur') && prePassVelocity) {
-                const motionBlurInput = convertToTexture(beauty);
-                activeNodes.push(motionBlurInput);
-                const motionBlurPass = motionBlur(
-                    motionBlurInput,
-                    prePassVelocity.mul(uniform(state.motionBlur.amount)),
-                    int(Math.max(2, Math.round(state.motionBlur.samples)))
-                );
-                applyNodeResolutionScale(motionBlurPass);
-                activeNodes.push(motionBlurPass);
-                beauty = vec4(motionBlurPass.rgb, beautyAlpha);
-            }
-
-            if (isRetroActive()) {
-                const r = state.retro;
-                syncRetroUniforms();
-
-                // CRT barrel distortion + color bleeding
-                if (r.crt) {
-                    const distortedUV = barrelUV(retroCurvatureU);
-                    beauty = replaceDefaultUV(distortedUV, beauty);
-                    beauty = colorBleeding(beauty, retroBleedingU);
-                }
-
-                // Dither + posterize
-                if (r.dither) {
-                    beauty = bayerDither(beauty, retroColorDepthU);
-                    beauty = posterize(beauty, retroColorDepthU);
-                }
-
-                // Vignette
-                if (r.vignetteIntensity > 0) {
-                    beauty = vignette(beauty, retroVignetteIntensityU, 0.6);
-                }
-
-                // Scanlines
-                if (r.scanlines) {
-                    beauty = scanlines(beauty, retroScanlineIntensityU, screenSize.y.mul(retroScanlineDensityU), 0.0);
-                }
-                beauty = withBeautyAlpha(beauty);
-            }
-
-            // ── Pixel FX ──
-            if (isScreenSpaceActive('pixel')) {
-                const p = state.pixel;
-                syncPixelUniforms();
-
-                // Pixelate — snap UVs to a coarse grid
-                if (p.pixelate && p.pixelSize > 1) {
-                    const px = vec2(
-                        max(screenSize.x.div(pixelSizeU), float(1.0)),
-                        max(screenSize.y.div(pixelSizeU), float(1.0))
-                    );
-                    beauty = replaceDefaultUV(() => screenUV.mul(px).floor().div(px), beauty);
-                }
-
-                // Effects requiring random-access texture sampling
-                const needsTex = (p.chromatic && p.chromaticIntensity > 0) ||
-                                  (p.sharpen && p.sharpenStrength > 0);
-
-                if (needsTex) {
-                    let bTex = convertToTexture(beauty);
-                    activeNodes.push(bTex);
-
-                    // Chromatic Aberration — radial RGB split
-                    if (p.chromatic && p.chromaticIntensity > 0) {
-                        const dir = screenUV.sub(vec2(0.5, 0.5));
-                        const uvR = screenUV.add(dir.mul(pixelChromaticIntensityU));
-                        const uvB = screenUV.sub(dir.mul(pixelChromaticIntensityU));
-                        beauty = vec4(
-                            bTex.sample(uvR).r,
-                            bTex.sample(screenUV).g,
-                            bTex.sample(uvB).b,
-                            bTex.sample(screenUV).a
-                        );
-
-                        if (p.sharpen && p.sharpenStrength > 0) {
-                            bTex = convertToTexture(beauty);
-                            activeNodes.push(bTex);
-                        }
-                    }
-
-                    // Sharpen — unsharp mask kernel
-                    if (p.sharpen && p.sharpenStrength > 0) {
-                        const txX = float(1).div(screenSize.x);
-                        const txY = float(1).div(screenSize.y);
-                        const ctr = bTex.sample(screenUV);
-                        const sl  = bTex.sample(screenUV.sub(vec2(txX, 0)));
-                        const sr  = bTex.sample(screenUV.add(vec2(txX, 0)));
-                        const st  = bTex.sample(screenUV.sub(vec2(0, txY)));
-                        const sb  = bTex.sample(screenUV.add(vec2(0, txY)));
-                        const avg = sl.add(sr).add(st).add(sb).mul(0.25);
-                        beauty = vec4(ctr.rgb.add(ctr.rgb.sub(avg.rgb).mul(pixelSharpenStrengthU)), ctr.a);
-                    }
-                }
-
-                // Color Grading — brightness / contrast / saturation
-                if (p.brightness !== 0 || p.contrast !== 0 || p.saturation !== 0) {
-                    let col = beauty.rgb;
-                    if (p.brightness !== 0) {
-                        col = col.add(pixelBrightnessU);
-                    }
-                    if (p.contrast !== 0) {
-                        col = col.sub(0.5).mul(pixelContrastU.add(1.0)).add(0.5);
-                    }
-                    if (p.saturation !== 0) {
-                        const luma = col.r.mul(0.2126).add(col.g.mul(0.7152)).add(col.b.mul(0.0722));
-                        col = mix(vec3(luma, luma, luma), col, pixelSaturationU.add(1.0));
-                    }
-                    beauty = vec4(col, beauty.a);
-                }
-
-                // Film Grain — animated hash noise
-                if (p.grain && p.grainIntensity > 0) {
-                    const seed = screenUV.add(vec2(pixelTimer.mul(0.17), pixelTimer.mul(0.31)));
-                    const noise = fract(sin(dot(seed, vec2(12.9898, 78.233))).mul(43758.5453));
-                    beauty = vec4(beauty.rgb.add(noise.sub(0.5).mul(pixelGrainIntensityU)), beauty.a);
-                }
-                beauty = withBeautyAlpha(beauty);
-            }
-
-            // Environment backdrop compensation: hide HDRI on background when not visible.
-            // Usually handled before bloom; this late fallback preserves older paths
-            // where the early compensation could not run.
-            if (useEnvironmentBackdropCompensation && scenePassDepth && !environmentBackdropCompensated) {
-                const hasGeom = scenePassDepth.r.lessThan(float(0.999999));
-                beautyAlpha = hasGeom.select(beautyAlpha, backgroundAlphaNode);
-                beauty = vec4(
-                    hasGeom.select(beauty.rgb, backgroundFillNode),
-                    beautyAlpha
-                );
-            }
-
-            // Fog: blend fog color based on depth, works over geometry AND background
-            if (isScreenSpaceActive('fog') && scenePassDepth) {
-                const f = state.fog;
-                const d = scenePassDepth.r;
-                const cn = float(camera.near);
-                const cf = float(camera.far);
-                const z = cn.mul(cf).div(cf.sub(d.mul(cf.sub(cn))));
-
-                let fogAlpha;
-                if (f.type === 0) {
-                    fogAlpha = z.sub(float(f.near)).div(float(Math.max(f.far - f.near, 0.001)))
-                        .saturate().mul(float(f.opacity));
-                } else {
-                    const dens = float(f.type === 1 ? f.density : (f.density || 0.01));
-                    fogAlpha = z.mul(dens).negate().exp().oneMinus().mul(float(f.opacity));
-                }
-
-                const fogCol = vec3(f.color[0], f.color[1], f.color[2]);
-                // Blend fog color over scene based on depth-computed alpha
-                const blended = beauty.rgb.mul(fogAlpha.oneMinus()).add(fogCol.mul(fogAlpha));
-                beauty = vec4(blended, raiseBeautyAlpha(fogAlpha));
-            }
-
-            postProcessing.outputNode = withBeautyAlpha(beauty);
-            postProcessing.needsUpdate = true;
-            pipelineReady = true;
-            lastError = '';
-            forceEnvironmentBackground = useEnvironmentBackdropCompensation;
-
-            // Track whether the scene had any renderables at build time. If
-            // zero (cold-start with saved post-FX before any scene sync),
-            // pass(scene, camera) cached an empty render list and the next
-            // markSceneChanged must escalate to a real rebuild.
-            let renderableCount = 0;
-            scene.traverse((obj) => {
-                if (obj?.isMesh || obj?.isSkinnedMesh) renderableCount++;
-            });
-            pipelineBuiltAgainstEmptyScene = renderableCount === 0;
-        } catch (error) {
-            forceEnvironmentBackground = false;
-            disableWithError('SSGI setup failed', error);
-        }
-    }
-
     const fxApi = {
         getState() {
             return snapshotState();
         },
         getDerivedState() {
-            return computeDerivedState();
+            return core.computeDerivedState();
         },
         hasEnabledEffects() {
             return pendingSceneRefresh || pendingPipelineRebuild || hasAnyEffectEnabled();
@@ -2226,7 +664,7 @@ export function createMaxJSFxController({
             return available;
         },
         applySharedSceneEffects() {
-            syncSharedSceneEffects();
+            core.syncSharedSceneEffects();
         },
         getLastError() {
             return lastError;
@@ -2389,7 +827,7 @@ export function createMaxJSFxController({
          * never needed from outside, since those have dedicated entry points.
          */
         markSceneChanged(options = {}) {
-            ps1SceneDirty = true;
+            core.markPS1SceneDirty();
             // Three reasons to escalate a scene-structure change to a full rebuild:
             //   1. Explicit {rebuild:true} from the caller (env/effect graph swap).
             //   2. Toon outline is on — it binds per-mesh refs into the node
@@ -2492,7 +930,7 @@ export function createMaxJSFxController({
             }
             state.contactShadow.enabled = !!enabled && available;
             if (!state.contactShadow.enabled) {
-                restoreForcedContactShadowLight();
+                core.restoreForcedContactShadowLight();
             }
             rebuildPipeline();
             return state.contactShadow.enabled;
@@ -2549,11 +987,11 @@ export function createMaxJSFxController({
             assignFinite(state.retro, 'vignetteIntensity', options.vignetteIntensity);
             assignFinite(state.retro, 'bleeding', options.bleeding);
             assignFinite(state.retro, 'curvature', options.curvature);
-            syncRetroUniforms();
+            syncRetroUniforms(core.ctx);
             if (needsRebuild) {
                 rebuildPipeline();
             } else {
-                syncSharedSceneEffects();
+                core.syncSharedSceneEffects();
                 if (state.retro.enabled) queuePipelineUpdate({ output: true });
             }
             return { ...state.retro };
@@ -2588,7 +1026,7 @@ export function createMaxJSFxController({
             assignFinite(state.pixel, 'brightness', options.brightness);
             assignFinite(state.pixel, 'contrast', options.contrast);
             assignFinite(state.pixel, 'saturation', options.saturation);
-            syncPixelUniforms();
+            syncPixelUniforms(core.ctx);
             if (needsRebuild) {
                 rebuildPipeline();
             } else if (state.pixel.enabled) {
@@ -2653,15 +1091,12 @@ export function createMaxJSFxController({
             assignFinite(state.powershot, 'analogScanlines', options.analogScanlines);
             assignFinite(state.powershot, 'analogHeadSwitch', options.analogHeadSwitch);
             if (typeof options.freezeNoise === 'boolean') state.powershot.freezeNoise = options.freezeNoise;
-            if (powerShotPipeline) syncPowerShotPipeline();
+            if (powerShotFinal.hasPipeline()) powerShotFinal.syncPipeline();
             if (state.powershot.enabled) queuePipelineUpdate({ output: true });
             return { ...state.powershot };
         },
         getPowerShotPresets() {
-            return POWERSHOT_PRESET_KEYS.map((key) => ({
-                key,
-                label: POWERSHOT_PRESETS[key]?.name || key,
-            }));
+            return listPowerShotPresets();
         },
 
         // ── Global Color Grading ──
@@ -2670,7 +1105,7 @@ export function createMaxJSFxController({
             return { ...state.colorGrading };
         },
         setColorGrading(options = {}) {
-            if (isPowerShotActive()) {
+            if (powerShotFinal.isActive()) {
                 syncCanvasColorGrading();
                 return { ...state.colorGrading };
             }
@@ -2705,9 +1140,9 @@ export function createMaxJSFxController({
             assignFinite(state.dof, 'bokehScale', options.bokehScale);
             if (typeof options.autoFromCamera === 'boolean') state.dof.autoFromCamera = options.autoFromCamera;
             if (state.dof.enabled) {
-                dofFocusDistanceU.value = state.dof.focusDistance;
-                dofFocalLengthU.value = state.dof.focalLength;
-                dofBokehScaleU.value = state.dof.bokehScale;
+                core.uniforms.dofFocusDistanceU.value = state.dof.focusDistance;
+                core.uniforms.dofFocalLengthU.value = state.dof.focalLength;
+                core.uniforms.dofBokehScaleU.value = state.dof.bokehScale;
             }
             return { ...state.dof };
         },
@@ -2715,7 +1150,7 @@ export function createMaxJSFxController({
             if (!state.dof.enabled || !state.dof.autoFromCamera) return;
             if (!Number.isFinite(targetDist) || targetDist <= 0) return;
             state.dof.focusDistance = targetDist;
-            dofFocusDistanceU.value = targetDist;
+            core.uniforms.dofFocusDistanceU.value = targetDist;
         },
         updateDofFromPhysicalCamera(cam, onUpdate = null) {
             // Called when Camera Lock is ON and Physical Camera has DOF
@@ -2725,17 +1160,17 @@ export function createMaxJSFxController({
             let changed = false;
             if (Number.isFinite(cam.dofFocusDistance) && cam.dofFocusDistance > 0) {
                 state.dof.focusDistance = cam.dofFocusDistance;
-                dofFocusDistanceU.value = cam.dofFocusDistance;
+                core.uniforms.dofFocusDistanceU.value = cam.dofFocusDistance;
                 changed = true;
             }
             if (Number.isFinite(cam.dofFocalLength) && cam.dofFocalLength > 0) {
                 state.dof.focalLength = cam.dofFocalLength;
-                dofFocalLengthU.value = cam.dofFocalLength;
+                core.uniforms.dofFocalLengthU.value = cam.dofFocalLength;
                 changed = true;
             }
             if (Number.isFinite(cam.dofBokehScale) && cam.dofBokehScale > 0) {
                 state.dof.bokehScale = cam.dofBokehScale;
-                dofBokehScaleU.value = cam.dofBokehScale;
+                core.uniforms.dofBokehScaleU.value = cam.dofBokehScale;
                 changed = true;
             }
             if (changed && onUpdate) onUpdate();
@@ -2770,13 +1205,9 @@ export function createMaxJSFxController({
             assignFinite(state.volumetric, 'resolution', options.resolution);
 
             // Live-update uniforms without pipeline rebuild
-            volDensityU.value = state.volumetric.density;
-            volIntensityU.value = state.volumetric.intensity;
-            volDenoiseU.value = state.volumetric.denoise;
-
-            if (volumetricMesh && Number.isFinite(options.steps)) {
-                volumetricMesh.material.steps = state.volumetric.steps;
-                volumetricMesh.material.needsUpdate = true;
+            syncVolumetricUniforms(core.ctx);
+            if (Number.isFinite(options.steps)) {
+                applyVolumetricSteps(core.ctx);
             }
 
             if (needsRebuild) rebuildPipeline();
@@ -2793,12 +1224,12 @@ export function createMaxJSFxController({
                 lastError = 'Fog requires WebGPU or TSL_GL';
                 onError(lastError);
                 state.fog.enabled = true;
-                applyFog();
+                core.applySceneFog();
                 rebuildPipeline();
                 return false;
             }
             state.fog.enabled = !!enabled;
-            applyFog();
+            core.applySceneFog();
             rebuildPipeline();
             return state.fog.enabled;
         },
@@ -2813,7 +1244,7 @@ export function createMaxJSFxController({
             assignFinite(state.fog, 'noiseScale', options.noiseScale);
             assignFinite(state.fog, 'noiseSpeed', options.noiseSpeed);
             assignFinite(state.fog, 'height', options.height);
-            applyFog();
+            core.applySceneFog();
             if (Number.isFinite(options.type) && options.type !== prevType) {
                 rebuildPipeline();
             }
@@ -2856,7 +1287,7 @@ export function createMaxJSFxController({
             f.noiseScale = nextNoiseScale;
             f.noiseSpeed = nextNoiseSpeed;
             f.height = nextHeight;
-            applyFog();
+            core.applySceneFog();
             rebuildPipeline();
         },
 
@@ -2887,7 +1318,7 @@ export function createMaxJSFxController({
             return { ...state.clone };
         },
         sanitizeForCurrentBackend() {
-            cleanupUnsupportedRealtimeResources();
+            core.cleanupUnsupportedRealtimeResources();
             rebuildPipeline();
             return snapshotState();
         },
@@ -2921,23 +1352,17 @@ export function createMaxJSFxController({
         render() {
             flushPendingPipelineUpdates();
             syncCanvasColorGrading();
-            // Update fog timer for procedural animation
-            if (fogAnimationActive) {
-                fogTimer.value = performance.now() * 0.001 * state.fog.noiseSpeed;
-            }
-            // Update pixel grain timer
-            if (isScreenSpaceActive('pixel') && state.pixel.grain) {
-                pixelTimer.value = performance.now() * 0.001;
-            }
+            // Fog + pixel-grain timers (procedural animation)
+            core.updateFrameTimers();
 
-            const shaderLabActive = hasShaderLabPassEnabled();
+            const shaderLabActive = shaderLabFinal.hasPassEnabled();
 
             if (!hasPipelineEffectEnabled() || !pipelineReady) {
                 if (shaderLabActive) {
-                    const consumed = renderShaderLabFinal(() => renderer.render(scene, camera));
+                    const consumed = shaderLabFinal.renderFinal(() => renderer.render(scene, camera));
                     if (!consumed) renderer.render(scene, camera);
-                } else if (isPowerShotActive()) {
-                    const consumed = renderPowerShotFinal(() => renderer.render(scene, camera));
+                } else if (powerShotFinal.isActive()) {
+                    const consumed = powerShotFinal.renderFinal(() => renderer.render(scene, camera));
                     if (!consumed) renderer.render(scene, camera);
                 } else {
                     renderer.render(scene, camera);
@@ -2952,21 +1377,18 @@ export function createMaxJSFxController({
                 if (forceEnvironmentBackground) {
                     scene.background = scene.environment;
                 }
-                updateActiveScreenSpaceParams();
-                if (isScreenSpaceActive('volumetric')) {
-                    syncVolumetricLightLayers();
-                }
+                core.updatePerFrame();
                 if (shaderLabActive) {
-                    const consumed = renderShaderLabFinal(() => postProcessing.render());
+                    const consumed = shaderLabFinal.renderFinal(() => postProcessing.render());
                     if (!consumed) postProcessing.render();
-                } else if (isPowerShotActive()) {
-                    const consumed = renderPowerShotFinal(() => postProcessing.render());
+                } else if (powerShotFinal.isActive()) {
+                    const consumed = powerShotFinal.renderFinal(() => postProcessing.render());
                     if (!consumed) postProcessing.render();
                 } else {
                     postProcessing.render();
                 }
             } catch (error) {
-                restoreSceneAfterPostPass();
+                core.restoreSceneAfterPostPass();
                 disableWithError('Post pipeline render failed', error);
                 renderer.render(scene, camera);
             } finally {
@@ -3057,7 +1479,7 @@ export function createMaxJSFxController({
 
     if (typeof window !== 'undefined') {
         window.addEventListener('maxjs-shader-lab-state', () => {
-            syncSharedSceneEffects(true);
+            core.syncSharedSceneEffects(true);
             if (supportsScreenSpaceEffects && state.retro.enabled) {
                 rebuildPipeline();
             }

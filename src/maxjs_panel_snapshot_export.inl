@@ -360,15 +360,70 @@
         return value;
     }
 
+    // True when the JSON object value for `key` has a TOP-LEVEL
+    // "enabled": true member. Brace-aware and string-safe: the old
+    // fixed-window scan false-negated when `enabled` sat past 768 chars
+    // (shaderLab serializes its composition config before the flag) and
+    // false-positived on nested objects with their own enabled flags
+    // (shaderLab config layers) or on neighbouring effects inside the
+    // window. Skips occurrences of `key` that are string values rather
+    // than object keys (e.g. "preset":"powershot").
     static bool JsonObjectHasEnabledTrue(const std::wstring& json, const wchar_t* key) {
         if (json.empty() || !key || !*key) return false;
         const std::wstring needle = L"\"" + std::wstring(key) + L"\"";
-        const size_t pos = json.find(needle);
-        if (pos == std::wstring::npos) return false;
-        const size_t len = std::min<size_t>(json.size() - pos, 768);
-        const std::wstring slice = json.substr(pos, len);
-        return slice.find(L"\"enabled\":true") != std::wstring::npos ||
-               slice.find(L"\"enabled\": true") != std::wstring::npos;
+        const auto isJsonSpace = [](wchar_t c) {
+            return c == L' ' || c == L'\t' || c == L'\n' || c == L'\r';
+        };
+
+        size_t searchPos = 0;
+        size_t pos = std::wstring::npos;
+        while ((pos = json.find(needle, searchPos)) != std::wstring::npos) {
+            searchPos = pos + 1;
+
+            // Must parse as `"key" : {` — otherwise it was a string value.
+            size_t i = pos + needle.size();
+            while (i < json.size() && isJsonSpace(json[i])) ++i;
+            if (i >= json.size() || json[i] != L':') continue;
+            ++i;
+            while (i < json.size() && isJsonSpace(json[i])) ++i;
+            if (i >= json.size() || json[i] != L'{') continue;
+
+            // Walk the object: track depth, skip string literals, look for
+            // a depth-1 "enabled" key.
+            static const std::wstring enabledKey = L"\"enabled\"";
+            int depth = 0;
+            bool inString = false;
+            bool escaped = false;
+            for (; i < json.size(); ++i) {
+                const wchar_t c = json[i];
+                if (inString) {
+                    if (escaped) escaped = false;
+                    else if (c == L'\\') escaped = true;
+                    else if (c == L'"') inString = false;
+                    continue;
+                }
+                if (c == L'"') {
+                    if (depth == 1 && json.compare(i, enabledKey.size(), enabledKey) == 0) {
+                        size_t after = i + enabledKey.size();
+                        while (after < json.size() && isJsonSpace(json[after])) ++after;
+                        if (after < json.size() && json[after] == L':') {
+                            ++after;
+                            while (after < json.size() && isJsonSpace(json[after])) ++after;
+                            return json.compare(after, 4, L"true") == 0;
+                        }
+                    }
+                    inString = true;
+                    continue;
+                }
+                if (c == L'{') {
+                    ++depth;
+                } else if (c == L'}') {
+                    if (--depth == 0) break;  // object closed, no enabled flag
+                }
+            }
+            return false;  // parsed the key's object; flag absent or false
+        }
+        return false;
     }
 
     static std::wstring DetectRendererPrefFromSnapshotUi(const std::wstring& snapshotUiJson) {
@@ -771,21 +826,29 @@
             }
         };
 
+        // Feature names are exact JS effect ids (camelCase) — they key the
+        // dynamic descriptor imports in web/js/fx/loader.js. The manifest
+        // post_fx array intentionally diverges from the snake_case boolean
+        // feature flags elsewhere in runtimeFeatures.
         addIfEnabled(L"ssgi", L"ssgi");
         addIfEnabled(L"ssr", L"ssr");
         addIfEnabled(L"gtao", L"gtao");
-        addIfEnabled(L"motionBlur", L"motion_blur");
+        addIfEnabled(L"motionBlur", L"motionBlur");
         addIfEnabled(L"traa", L"traa");
         addIfEnabled(L"bloom", L"bloom");
-        addIfEnabled(L"toonOutline", L"toon_outline");
-        addIfEnabled(L"contactShadow", L"contact_shadow");
+        addIfEnabled(L"toonOutline", L"toonOutline");
+        addIfEnabled(L"contactShadow", L"contactShadow");
         addIfEnabled(L"retro", L"retro");
-        addIfEnabled(L"fog", L"post_fog");
+        addIfEnabled(L"fog", L"fog");
         addIfEnabled(L"pixel", L"pixel");
         addIfEnabled(L"volumetric", L"volumetric");
         addIfEnabled(L"dof", L"dof");
-        addIfEnabled(L"clone", L"clone_overlay");
-        addIfEnabled(L"ascii", L"ascii");
+        addIfEnabled(L"clone", L"clone");  // CPU overlay — no fx module; loader skips it
+        // Final-stylize stages (fx/final/*). powershot state lives inside
+        // snapshotUi.fx; shaderLab is a top-level snapshotUi object whose
+        // composition replays through shader_lab_fx.js in the viewer.
+        addIfEnabled(L"powershot", L"powershot");
+        addIfEnabled(L"shaderLab", L"shaderLab");
     }
 
     static void AccumulateRuntimeFeatureTextHints(SnapshotRuntimeFeatures& features,

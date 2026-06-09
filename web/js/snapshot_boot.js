@@ -401,14 +401,15 @@ function buildLayerManager({
 
 // ─── Phase 5: conditional module registration ─────────────────────────
 // Lazy-imports each optional module only when runtimeFeatures asks for it.
-// Stage 2: skipped unconditionally with a deferred-extraction note. Empty
-// snapshots and pure-Three.js host pages (where the user wires their own
-// post-FX) work fine without this. Real wiring lands once each subsystem's
-// init/dispose lifecycle is documented and stubs in index.html are
-// replaced with the same lazy imports.
+// post_fx is wired: a WebGPU snapshot with enabled effects dynamic-imports
+// snapshot_fx.js, which in turn imports ONLY the enabled fx/effects/*
+// descriptors (raw ESM — the import graph is the bundle). WebGL snapshots
+// import zero post-FX code. The remaining subsystems are still skipped with
+// a deferred-extraction note until their init/dispose lifecycle is
+// documented and stubs in index.html are replaced with the same lazy
+// imports.
 async function registerOptionalModules(features, ctx) {
     const wanted = [];
-    if (features.post_fx?.length)  wanted.push('post_fx');
     if (features.splats)           wanted.push('splats');
     if (features.html_textures)    wanted.push('html_textures');
     if (features.volumes)          wanted.push('volumes');
@@ -422,6 +423,24 @@ async function registerOptionalModules(features, ctx) {
     }
 
     const modules = {};
+
+    // Post-FX replay needs the TSL node pipeline — WebGPU target only.
+    // (snapshot.html / WebGL stays post-FX free by design.)
+    if (features.renderer_pref === 'webgpu' && features.post_fx?.length) {
+        try {
+            const { createSnapshotFx } = await import('./snapshot_fx.js');
+            modules.maxjsFx = await createSnapshotFx({
+                renderer: ctx.renderer,
+                scene: ctx.scene,
+                camera: ctx.camera,
+                postFx: features.post_fx,
+                backendLabel: ctx.renderer?.userData?.maxjsBackendLabel || '',
+            });
+        } catch (error) {
+            console.warn('[snapshot_boot] post-FX module init failed', error);
+        }
+    }
+
     const hasAudioPayload = Array.isArray(ctx?.meta?.audios) && ctx.meta.audios.length > 0;
     if (features.audio || hasAudioPayload) {
         try {
@@ -659,6 +678,16 @@ function applySnapshotUi(snapshotUi, ctx) {
 
     applySnapshotCoreLook(snapshotUi, { renderer });
     applySnapshotSolidBackground(snapshotUi, scene);
+
+    // Post-FX state replay (WebGPU snapshots only — module registered in
+    // registerOptionalModules when runtimeFeatures.post_fx is non-empty).
+    // Final-stylize stages ride along: fx.powershot is part of fx, the
+    // Shader Lab composition lives at snapshotUi.shaderLab.
+    if (ctx.maxjsFx) {
+        ctx.maxjsFx.setEnvironmentVisible?.(snapshotUi.envVisible !== false);
+        ctx.maxjsFx.setResolutionScale?.(snapshotUi.performance?.postFxScale);
+        ctx.maxjsFx.restoreState?.(snapshotUi.fx ?? {}, { shaderLab: snapshotUi.shaderLab });
+    }
 
     // Camera state — minimal subset; full applyStandaloneCameraState is bigger.
     const cam = snapshotUi.camera;
@@ -1081,6 +1110,10 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
         // artist look and must win for exported pages.
         applySnapshotCoreLook(meta.snapshotUi, { renderer });
     }
+    // scene.environment lands after the snapshotUi post-FX replay above, so
+    // rebuild the FX graph once: env-backdrop compensation (hidden HDRI +
+    // ssr/fog) needs the final environment state.
+    (optionalModules.maxjsFx ?? optionalModules.ssgiFx)?.notifyEnvironmentChanged?.();
     syncDefaultLights();
 
     // Phase 7b: top-level camera state. Lives at meta.camera independently

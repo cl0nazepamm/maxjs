@@ -13049,11 +13049,10 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         }
 
         function serializeSnapshotFxState() {
-            const fx = maxjsFx.getState();
-            if (!fx || typeof fx !== 'object') return fx;
-            const snapshotFx = { ...fx };
-            delete snapshotFx.powershot;
-            return snapshotFx;
+            // Full state including powershot — the snapshot viewer replays it
+            // via fx/final/powershot.js when runtimeFeatures.post_fx lists
+            // 'powershot' (the exporter detects fx.powershot.enabled).
+            return maxjsFx.getState();
         }
 
         function serializeSnapshotUiState({ includeDebug = false } = {}) {

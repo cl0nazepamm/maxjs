@@ -98,6 +98,7 @@ export function createTSLCompiler({
     // Per-factory compat-namespace cache (was a module-level singleton inline).
     const tslCompatWarnings = new Set();
     let tslCompatNamespace = null;
+    let fallbackTexture = null;
 
     function coerceTSLFloat(value, fallback) {
         const n = Number(value);
@@ -169,6 +170,36 @@ export function createTSLCompiler({
         debugWarn(`[TSL] Legacy API shim: ${name} -> ${replacement}`);
     }
 
+    function getFallbackTexture() {
+        if (fallbackTexture) return fallbackTexture;
+        if (typeof THREE.DataTexture !== 'function') return null;
+        fallbackTexture = new THREE.DataTexture(
+            new Uint8Array([255, 255, 255, 255]),
+            1,
+            1,
+            THREE.RGBAFormat,
+            THREE.UnsignedByteType,
+        );
+        fallbackTexture.colorSpace = THREE.SRGBColorSpace ?? THREE.NoColorSpace;
+        fallbackTexture.wrapS = fallbackTexture.wrapT = THREE.RepeatWrapping;
+        fallbackTexture.name = 'maxjs-tsl-fallback';
+        fallbackTexture.needsUpdate = true;
+        return fallbackTexture;
+    }
+
+    function ensureTextureBindingSafe(texture) {
+        if (!texture?.isTexture) return getFallbackTexture();
+        const image = texture.source?.data ?? texture.image;
+        if (image == null) {
+            const fallback = getFallbackTexture();
+            if (fallback?.image) {
+                texture.image = fallback.image;
+                texture.needsUpdate = true;
+            }
+        }
+        return texture;
+    }
+
     function normalizeMaxVertexColorChannel(channel = 0) {
         if (typeof channel === 'string') {
             const token = channel.trim().toLowerCase();
@@ -204,6 +235,9 @@ export function createTSLCompiler({
         compat.maxVertexColor = (channel = 0) =>
             TSL.attribute(maxVertexColorAttributeName(channel), 'vec4');
         compat.vertexColorChannel = compat.maxVertexColor;
+        if (typeof TSL.texture === 'function') {
+            compat.texture = (texture, ...args) => TSL.texture(ensureTextureBindingSafe(texture), ...args);
+        }
         tslCompatNamespace = compat;
         return compat;
     }
@@ -217,11 +251,12 @@ export function createTSLCompiler({
         try {
             const params = buildTSLParams(code, tslParams || {});
             const fn = new Function('THREE', 'TSL', 'params', 'TEXTURES', code);
-            const result = fn(THREE, TSL, params, texturesNs);
+            const result = fn(THREE, getTSLCompatNamespace(), params, texturesNs);
             if (result && result.isTexture) {
-                result.needsUpdate = true;
-                textureCache.set(cacheKey, result);
-                return result;
+                const safeTexture = ensureTextureBindingSafe(result);
+                safeTexture.needsUpdate = true;
+                textureCache.set(cacheKey, safeTexture);
+                return safeTexture;
             }
             // Preset path: snippet returned a TSL color node — bake it to a texture.
             if (result && bakeFn) {
@@ -247,7 +282,7 @@ export function createTSLCompiler({
             const maps = {};
             for (let i = 1; i <= 16; i++) {
                 const url = md[`tslMap${i}`];
-                if (url) maps[`map${i}`] = loadTexture(url);
+                if (url) maps[`map${i}`] = ensureTextureBindingSafe(loadTexture(url));
             }
             // Build dynamic params from @param declarations + stored values
             const params = buildTSLParams(md.tslCode, md.tslParams || {});

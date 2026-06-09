@@ -21,6 +21,7 @@ class Color { constructor(r, g, b) { this.isColor = true; this.r = r ?? 0; this.
 const TSL = {
     uniform: (v) => ({ isUniform: true, value: v }),
     attribute: () => ({ isAttribute: true }),
+    texture: (tex, ...args) => ({ isTextureNode: true, tex, args }),
     vec2: (x, y) => ({ isVec2: true, x, y }),
     vec3: (x, y, z) => ({ isVec3: true, x, y, z }),
     time: { isTime: true },
@@ -31,6 +32,13 @@ const THREE_GPU = {
     UnsignedByteType: 'UnsignedByteType',
     RepeatWrapping: 'RepeatWrapping',
     SRGBColorSpace: 'SRGBColorSpace',
+    DataTexture: class {
+        constructor(data, width, height) {
+            this.isTexture = true;
+            this.isDataTexture = true;
+            this.image = { data, width, height };
+        }
+    },
     MeshPhysicalNodeMaterial: class { constructor() { this.userData = {}; this.isNodeMaterial = true; } },
     MeshStandardMaterial: class { constructor(o = {}) { Object.assign(this, o); this.userData = {}; } },
 };
@@ -164,6 +172,32 @@ console.log('[8] makeBakeNodeToTexture returns a bind-safe DataTexture placehold
     await new Promise((resolve) => setTimeout(resolve, 0));
     ok(rendered === true && disposed === true, 'offscreen render target was rendered and disposed asynchronously');
     ok(completed === true && tex.image.data[0] === 7, 'async readback updates placeholder pixels');
+}
+
+console.log('[9] TSL texture nodes are bind-safe with missing or pending images');
+{
+    const pendingTexture = { isTexture: true, image: null };
+    const c = createTSLCompiler({
+        THREE: THREE_GPU,
+        TSL,
+        loadTexture: () => pendingTexture,
+    });
+
+    const missing = c.createTSLMaterial({
+        tslCode: 'material.colorNode = TSL.texture(maps.map1);',
+    });
+    ok(missing.colorNode?.isTextureNode === true, 'missing map still creates a texture node');
+    ok(missing.colorNode.tex?.image?.width === 1, 'missing map uses a 1x1 fallback texture');
+
+    const pending = c.createTSLMaterial({
+        tslMap1: 'pending.png',
+        tslCode: 'material.colorNode = TSL.texture(maps.map1);',
+    });
+    ok(pending.colorNode.tex === pendingTexture, 'pending loader texture is preserved in the node graph');
+    ok(pendingTexture.image?.width === 1, 'pending loader texture receives a bind-safe fallback image');
+
+    const returned = c.evalTSLTexture('return new THREE.DataTexture(new Uint8Array([0, 0, 0, 0]), 1, 1);', {});
+    ok(returned?.image?.width === 1, 'direct texture return remains bind-safe');
 }
 
 console.log(failures === 0 ? '\nALL PASS' : `\n${failures} FAILURE(S)`);

@@ -37,6 +37,11 @@ const lightLocalPos = new THREE.Vector3();
 const lightWorldPos = new THREE.Vector3();
 const lightTargetLocal = new THREE.Vector3();
 const lightTargetWorld = new THREE.Vector3();
+const lightDirWorld = new THREE.Vector3();
+const lightParentQuat = new THREE.Quaternion();
+const lightWorldQuat = new THREE.Quaternion();
+// Exporter convention: beam = node TM −Y (WriteLightJson: dir = -row1).
+const LIGHT_BEAM_AXIS = new THREE.Vector3(0, -1, 0);
 const MAXJS_SELF_HIDDEN_LAYER = 31;
 
 function getLightParentObject(light, ld, parent, nodeMap) {
@@ -65,8 +70,39 @@ function syncLightParent(light, ld, parent, nodeMap) {
     const parentObject = getLightParentObject(light, ld, parent, nodeMap);
     if (light.parent !== parentObject) parentObject.add(light);
     const target = light.userData.maxjsTarget;
-    if (target && target.parent !== parentObject) parentObject.add(target);
+    if (target) {
+        // Lights parented in Max (flashlight on a camera, lamp on a vehicle)
+        // carry their aim point WITH them: the target rides as a child of the
+        // light so animated matrix tracks rotate the beam too — the light's
+        // own quaternion is otherwise ignored by Spot/Directional lights.
+        // Free lights keep the world-space sibling target (existing behavior,
+        // incl. the directional shadow-origin focus path).
+        const attachTargetToLight = (Number(light.userData.maxjsParentHandle) || 0) > 0;
+        const targetParent = attachTargetToLight ? light : parentObject;
+        if (target.parent !== targetParent) targetParent.add(target);
+    }
     return parentObject;
+}
+
+// For lights whose target rides as a child: the light's local rotation must
+// carry the beam direction so the child target (≈ local −Y offset) lands at
+// the exported aim point. Animated matrix16 tracks later overwrite this
+// rotation with the sampled Max node TM, whose −Y is the beam by the same
+// exporter convention — so static pose and animated frames stay consistent.
+function orientLightFromDir(light, ld, rootParent) {
+    if (!Array.isArray(ld?.dir)) return;
+    lightDirWorld.set(ld.dir[0], ld.dir[1], ld.dir[2]);
+    if (lightDirWorld.lengthSq() < 1e-12) return;
+    rootParent.updateMatrixWorld(true);
+    lightDirWorld.transformDirection(rootParent.matrixWorld);
+    lightWorldQuat.setFromUnitVectors(LIGHT_BEAM_AXIS, lightDirWorld);
+    if (light.parent) {
+        light.parent.updateMatrixWorld(true);
+        light.parent.getWorldQuaternion(lightParentQuat);
+        light.quaternion.copy(lightParentQuat.invert().multiply(lightWorldQuat));
+    } else {
+        light.quaternion.copy(lightWorldQuat);
+    }
 }
 
 function setPositionFromRootSpace(obj, pos, rootParent) {
@@ -285,6 +321,7 @@ function applyLightData(light, ld, nodeMap, parent) {
     switch (ld.type) {
     case 0: // Directional
         setPositionFromRootSpace(light, ld.pos, parent);
+        if (light.userData.maxjsTarget?.parent === light) orientLightFromDir(light, ld, parent);
         setLightTargetFromData(light, ld, parent);
         break;
     case 1: // Point
@@ -298,6 +335,7 @@ function applyLightData(light, ld, nodeMap, parent) {
         light.decay = ld.decay ?? 2;
         light.angle = ld.angle ?? Math.PI / 4;
         light.penumbra = ld.penumbra ?? 0.1;
+        if (light.userData.maxjsTarget?.parent === light) orientLightFromDir(light, ld, parent);
         setLightTargetFromData(light, ld, parent);
         break;
     case 3: // RectArea — orient toward dir

@@ -19,6 +19,7 @@
 #include <cmath>
 #include <cstdint>
 #include <immintrin.h>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -167,24 +168,46 @@ static void WriteVertexColorOffsetsJson(std::wostringstream& ss,
 
 static uint64_t HashFNV1a(const void* data, size_t bytes, uint64_t seed = 1469598103934665603ULL) {
     const unsigned char* p = static_cast<const unsigned char*>(data);
+    constexpr uint64_t kPrime = 1099511628211ULL;
     uint64_t h = seed;
-    // SSE: process 16 bytes at a time for large buffers
-    // Fold 128-bit chunks into the hash via XOR + multiply cascade
     size_t i = 0;
-    if (bytes >= 32) {
+    if (bytes >= 64) {
+        // Four independent FNV lanes over 32-byte blocks. A single FNV chain
+        // is latency-bound on the serial multiply (~1.5 GB/s); four chains
+        // run in the multiplier pipeline concurrently (~4x on bulk buffers,
+        // which is what the per-tick geometry dedupe hashes are).
+        uint64_t h0 = h;
+        uint64_t h1 = h ^ 0x9E3779B97F4A7C15ULL;
+        uint64_t h2 = h ^ 0xC2B2AE3D27D4EB4FULL;
+        uint64_t h3 = h ^ 0x165667B19E3779F9ULL;
+        for (; i + 31 < bytes; i += 32) {
+            uint64_t a, b, c, d;
+            memcpy(&a, p + i, 8);
+            memcpy(&b, p + i + 8, 8);
+            memcpy(&c, p + i + 16, 8);
+            memcpy(&d, p + i + 24, 8);
+            h0 = (h0 ^ a) * kPrime;
+            h1 = (h1 ^ b) * kPrime;
+            h2 = (h2 ^ c) * kPrime;
+            h3 = (h3 ^ d) * kPrime;
+        }
+        h = h0;
+        h = (h ^ h1) * kPrime;
+        h = (h ^ h2) * kPrime;
+        h = (h ^ h3) * kPrime;
+    }
+    if (bytes - i >= 16) {
+        // Fold remaining 128-bit chunks via XOR + multiply cascade
         for (; i + 15 < bytes; i += 16) {
             uint64_t lo, hi;
             memcpy(&lo, p + i, 8);
             memcpy(&hi, p + i + 8, 8);
-            h ^= lo;
-            h *= 1099511628211ULL;
-            h ^= hi;
-            h *= 1099511628211ULL;
+            h = (h ^ lo) * kPrime;
+            h = (h ^ hi) * kPrime;
         }
     }
     for (; i < bytes; i++) {
-        h ^= static_cast<uint64_t>(p[i]);
-        h *= 1099511628211ULL;
+        h = (h ^ static_cast<uint64_t>(p[i])) * kPrime;
     }
     return h;
 }
@@ -220,6 +243,17 @@ static uint64_t HashMeshData(const std::vector<float>& verts,
     return h;
 }
 
+// Block size for packing per-element fields into contiguous runs before
+// hashing. Per-field HashFNV1a calls cost more than the hashing itself on
+// large meshes; packing turns the state hash into a few bulk passes.
+static constexpr int kHashPackBlock = 256;
+
+struct PackedFaceHashState {
+    DWORD v[3];
+    DWORD smGroup;
+    DWORD matID;
+};
+
 static uint64_t HashMeshState(Mesh& mesh) {
     uint64_t h = 1469598103934665603ULL;
     const int numVerts = mesh.getNumVerts();
@@ -227,18 +261,23 @@ static uint64_t HashMeshState(Mesh& mesh) {
     h = HashFNV1a(&numVerts, sizeof(numVerts), h);
     h = HashFNV1a(&numFaces, sizeof(numFaces), h);
 
-    for (int i = 0; i < numVerts; ++i) {
-        Point3 p = mesh.getVert(i);
-        h = HashFNV1a(&p, sizeof(p), h);
+    // Vertex positions are a contiguous Point3 array — one bulk pass.
+    if (numVerts > 0 && mesh.verts) {
+        h = HashFNV1a(mesh.verts, static_cast<size_t>(numVerts) * sizeof(Point3), h);
     }
 
-    for (int i = 0; i < numFaces; ++i) {
-        Face& face = mesh.faces[i];
-        const DWORD smGroup = face.getSmGroup();
-        const MtlID matID = face.getMatID();
-        h = HashFNV1a(face.v, sizeof(face.v), h);
-        h = HashFNV1a(&smGroup, sizeof(smGroup), h);
-        h = HashFNV1a(&matID, sizeof(matID), h);
+    PackedFaceHashState block[kHashPackBlock];
+    for (int base = 0; base < numFaces; base += kHashPackBlock) {
+        const int n = std::min(kHashPackBlock, numFaces - base);
+        for (int k = 0; k < n; ++k) {
+            Face& face = mesh.faces[base + k];
+            block[k].v[0] = face.v[0];
+            block[k].v[1] = face.v[1];
+            block[k].v[2] = face.v[2];
+            block[k].smGroup = face.getSmGroup();
+            block[k].matID = face.getMatID();
+        }
+        h = HashFNV1a(block, sizeof(PackedFaceHashState) * static_cast<size_t>(n), h);
     }
 
     return h;
@@ -251,28 +290,33 @@ static uint64_t HashMNMeshState(MNMesh& mn) {
     h = HashFNV1a(&numVerts, sizeof(numVerts), h);
     h = HashFNV1a(&numFaces, sizeof(numFaces), h);
 
-    for (int i = 0; i < numVerts; ++i) {
-        const MNVert* vert = mn.V(i);
-        const DWORD dead = (vert && vert->GetFlag(MN_DEAD)) ? 1u : 0u;
-        const Point3 p = mn.P(i);
-        h = HashFNV1a(&dead, sizeof(dead), h);
-        h = HashFNV1a(&p, sizeof(p), h);
+    struct PackedMNVertState { float x, y, z; DWORD dead; };
+    PackedMNVertState vertBlock[kHashPackBlock];
+    for (int base = 0; base < numVerts; base += kHashPackBlock) {
+        const int n = std::min(kHashPackBlock, numVerts - base);
+        for (int k = 0; k < n; ++k) {
+            const int i = base + k;
+            const MNVert* vert = mn.V(i);
+            const Point3 p = mn.P(i);
+            vertBlock[k] = { p.x, p.y, p.z,
+                             (vert && vert->GetFlag(MN_DEAD)) ? 1u : 0u };
+        }
+        h = HashFNV1a(vertBlock, sizeof(PackedMNVertState) * static_cast<size_t>(n), h);
     }
 
     for (int i = 0; i < numFaces; ++i) {
         const MNFace* face = mn.F(i);
         if (!face) continue;
 
-        const DWORD dead = face->GetFlag(MN_DEAD) ? 1u : 0u;
-        const int deg = face->deg;
-        const DWORD smGroup = face->smGroup;
-        const MtlID matID = face->material;
-        h = HashFNV1a(&dead, sizeof(dead), h);
-        h = HashFNV1a(&deg, sizeof(deg), h);
-        h = HashFNV1a(&smGroup, sizeof(smGroup), h);
-        h = HashFNV1a(&matID, sizeof(matID), h);
-        if (deg > 0 && face->vtx) {
-            h = HashFNV1a(face->vtx, sizeof(int) * static_cast<size_t>(deg), h);
+        const DWORD scalars[4] = {
+            face->GetFlag(MN_DEAD) ? 1u : 0u,
+            static_cast<DWORD>(face->deg),
+            face->smGroup,
+            static_cast<DWORD>(face->material),
+        };
+        h = HashFNV1a(scalars, sizeof(scalars), h);
+        if (face->deg > 0 && face->vtx) {
+            h = HashFNV1a(face->vtx, sizeof(int) * static_cast<size_t>(face->deg), h);
         }
     }
 
@@ -376,9 +420,8 @@ static uint64_t HashMeshVertexColorChannels(Mesh& mesh,
             h = HashFNV1a(map.tv, static_cast<size_t>(numVerts) * sizeof(UVVert), h);
         }
         if (numFaces > 0 && map.tf) {
-            for (int i = 0; i < numFaces; ++i) {
-                h = HashFNV1a(map.tf[i].t, sizeof(map.tf[i].t), h);
-            }
+            // TVFace is just DWORD t[3] — the whole face array hashes in one pass.
+            h = HashFNV1a(map.tf, static_cast<size_t>(numFaces) * sizeof(TVFace), h);
         }
     }
     return h;
@@ -398,9 +441,8 @@ static uint64_t HashMNMeshVertexColorChannels(MNMesh& mn,
         h = HashFNV1a(&numVerts, sizeof(numVerts), h);
         h = HashFNV1a(&numFaces, sizeof(numFaces), h);
         if (!map) continue;
-        for (int i = 0; i < numVerts; ++i) {
-            const UVVert value = map->v[i];
-            h = HashFNV1a(&value, sizeof(value), h);
+        if (numVerts > 0 && map->v) {
+            h = HashFNV1a(map->v, static_cast<size_t>(numVerts) * sizeof(UVVert), h);
         }
         for (int i = 0; i < numFaces; ++i) {
             MNMapFace* mapFace = map->F(i);
@@ -428,10 +470,8 @@ static uint64_t HashMeshStateWithUVs(Mesh& mesh, bool allowMapChannel1 = false) 
     }
 
     if (numTVerts > 0 && mesh.tvFace) {
-        const int numFaces = mesh.getNumFaces();
-        for (int i = 0; i < numFaces; ++i) {
-            h = HashFNV1a(mesh.tvFace[i].t, sizeof(mesh.tvFace[i].t), h);
-        }
+        h = HashFNV1a(mesh.tvFace,
+                      static_cast<size_t>(mesh.getNumFaces()) * sizeof(TVFace), h);
     }
     const std::vector<int> vertexColorChannels = CollectMeshVertexColorChannels(mesh, allowMapChannel1);
     h = HashMeshVertexColorChannels(mesh, vertexColorChannels, h);
@@ -445,13 +485,18 @@ static uint64_t HashMeshChannelState(Mesh& mesh, bool allowMapChannel1 = false) 
     h = HashFNV1a(&numVerts, sizeof(numVerts), h);
     h = HashFNV1a(&numFaces, sizeof(numFaces), h);
 
-    for (int i = 0; i < numFaces; ++i) {
-        Face& face = mesh.faces[i];
-        const DWORD smGroup = face.getSmGroup();
-        const MtlID matID = face.getMatID();
-        h = HashFNV1a(face.v, sizeof(face.v), h);
-        h = HashFNV1a(&smGroup, sizeof(smGroup), h);
-        h = HashFNV1a(&matID, sizeof(matID), h);
+    PackedFaceHashState block[kHashPackBlock];
+    for (int base = 0; base < numFaces; base += kHashPackBlock) {
+        const int n = std::min(kHashPackBlock, numFaces - base);
+        for (int k = 0; k < n; ++k) {
+            Face& face = mesh.faces[base + k];
+            block[k].v[0] = face.v[0];
+            block[k].v[1] = face.v[1];
+            block[k].v[2] = face.v[2];
+            block[k].smGroup = face.getSmGroup();
+            block[k].matID = face.getMatID();
+        }
+        h = HashFNV1a(block, sizeof(PackedFaceHashState) * static_cast<size_t>(n), h);
     }
 
     const int numTVerts = mesh.getNumTVerts();
@@ -461,9 +506,7 @@ static uint64_t HashMeshChannelState(Mesh& mesh, bool allowMapChannel1 = false) 
     }
 
     if (numTVerts > 0 && mesh.tvFace) {
-        for (int i = 0; i < numFaces; ++i) {
-            h = HashFNV1a(mesh.tvFace[i].t, sizeof(mesh.tvFace[i].t), h);
-        }
+        h = HashFNV1a(mesh.tvFace, static_cast<size_t>(numFaces) * sizeof(TVFace), h);
     }
 
     const std::vector<int> vertexColorChannels = CollectMeshVertexColorChannels(mesh, allowMapChannel1);
@@ -482,9 +525,8 @@ static uint64_t HashMNMeshStateWithUVs(MNMesh& mn, bool allowMapChannel1 = false
     h = HashFNV1a(&numUVFaces, sizeof(numUVFaces), h);
     if (!hasUVs) return h;
 
-    for (int i = 0; i < numUVVerts; ++i) {
-        UVVert uv = uvMap->v[i];
-        h = HashFNV1a(&uv, sizeof(uv), h);
+    if (numUVVerts > 0 && uvMap->v) {
+        h = HashFNV1a(uvMap->v, static_cast<size_t>(numUVVerts) * sizeof(UVVert), h);
     }
 
     for (int i = 0; i < numUVFaces; ++i) {
@@ -518,16 +560,15 @@ static uint64_t HashMNMeshChannelState(MNMesh& mn, bool allowMapChannel1 = false
         const MNFace* face = mn.F(i);
         if (!face) continue;
 
-        const DWORD dead = face->GetFlag(MN_DEAD) ? 1u : 0u;
-        const int deg = face->deg;
-        const DWORD smGroup = face->smGroup;
-        const MtlID matID = face->material;
-        h = HashFNV1a(&dead, sizeof(dead), h);
-        h = HashFNV1a(&deg, sizeof(deg), h);
-        h = HashFNV1a(&smGroup, sizeof(smGroup), h);
-        h = HashFNV1a(&matID, sizeof(matID), h);
-        if (deg > 0 && face->vtx) {
-            h = HashFNV1a(face->vtx, sizeof(int) * static_cast<size_t>(deg), h);
+        const DWORD scalars[4] = {
+            face->GetFlag(MN_DEAD) ? 1u : 0u,
+            static_cast<DWORD>(face->deg),
+            face->smGroup,
+            static_cast<DWORD>(face->material),
+        };
+        h = HashFNV1a(scalars, sizeof(scalars), h);
+        if (face->deg > 0 && face->vtx) {
+            h = HashFNV1a(face->vtx, sizeof(int) * static_cast<size_t>(face->deg), h);
         }
     }
 
@@ -538,9 +579,8 @@ static uint64_t HashMNMeshChannelState(MNMesh& mn, bool allowMapChannel1 = false
     h = HashFNV1a(&numUVVerts, sizeof(numUVVerts), h);
     h = HashFNV1a(&numUVFaces, sizeof(numUVFaces), h);
     if (hasUVs) {
-        for (int i = 0; i < numUVVerts; ++i) {
-            UVVert uv = uvMap->v[i];
-            h = HashFNV1a(&uv, sizeof(uv), h);
+        if (numUVVerts > 0 && uvMap->v) {
+            h = HashFNV1a(uvMap->v, static_cast<size_t>(numUVVerts) * sizeof(UVVert), h);
         }
 
         for (int i = 0; i < numUVFaces; ++i) {
@@ -837,6 +877,45 @@ static void BatchNormalizeSSE(float* data, size_t count) {
     }
 }
 
+// Non-temporal copy for large one-shot writes into WebView2 shared buffers.
+// The CPU never reads those bytes back — the renderer process does — so a
+// regular memcpy evicts megabytes of useful cache per frame at playback
+// rates. Streaming stores bypass the cache hierarchy entirely.
+static void StreamCopyBytes(void* dstRaw, const void* srcRaw, size_t bytes) {
+    unsigned char* dst = static_cast<unsigned char*>(dstRaw);
+    const unsigned char* src = static_cast<const unsigned char*>(srcRaw);
+    if (bytes < 4096) {
+        memcpy(dst, src, bytes);
+        return;
+    }
+
+    const size_t head = (16 - (reinterpret_cast<uintptr_t>(dst) & 15)) & 15;
+    if (head) {
+        memcpy(dst, src, head);
+        dst += head;
+        src += head;
+        bytes -= head;
+    }
+
+    size_t blocks = bytes / 64;
+    while (blocks--) {
+        const __m128i a = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src));
+        const __m128i b = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + 16));
+        const __m128i c = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + 32));
+        const __m128i d = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + 48));
+        _mm_stream_si128(reinterpret_cast<__m128i*>(dst), a);
+        _mm_stream_si128(reinterpret_cast<__m128i*>(dst + 16), b);
+        _mm_stream_si128(reinterpret_cast<__m128i*>(dst + 32), c);
+        _mm_stream_si128(reinterpret_cast<__m128i*>(dst + 48), d);
+        src += 64;
+        dst += 64;
+    }
+    _mm_sfence();
+
+    const size_t tail = bytes & 63;
+    if (tail) memcpy(dst, src, tail);
+}
+
 static Point3 NormalizeNormalOrFallback(const Point3& value, const Point3& fallback = Point3(0.0f, 0.0f, 1.0f)) {
     if (!std::isfinite(value.x) || !std::isfinite(value.y) || !std::isfinite(value.z)) return fallback;
     return DotProd(value, value) > 1.0e-20f ? NormalizeSSE(value) : fallback;
@@ -917,6 +996,208 @@ struct FastVertexSource {
     int faceIdx = -1;
     int localIdx = -1;
 };
+
+// ══════════════════════════════════════════════════════════════
+//  Fast-deform topology epoch + precomputed normal gather plan
+// ══════════════════════════════════════════════════════════════
+
+// Captured when the fast-replay caches (controlIdx / FastVertexSource) are
+// built and re-validated on every fast tick before the caches are replayed.
+// Catches topology edits the per-index bounds checks cannot see — e.g. a
+// dynamic tessellation modifier changing connectivity mid-drag while the new
+// vertex count stays above every cached index — so stale mappings are dropped
+// instead of stamping scrambled positions onto old topology.
+struct FastDeformTopoEpoch {
+    bool valid = false;
+    bool fromLiveMN = false;   // which mesh source the caches were built from
+    bool topoVolatile = false; // stack can animate topology → also compare sampled hash
+    int nv = -1;
+    int nf = -1;
+    uint64_t faceSampleHash = 0;
+};
+
+// Incremental ("sparse") update state for sub-object editing of high-poly
+// meshes. While a vertex/edge/face drag is active, only a tiny region of the
+// mesh moves per tick — so instead of re-extracting everything, control
+// positions are diffed against a persistent snapshot and only the moved
+// region (positions + 1-ring normals via reverse adjacency) is recomputed
+// into persistent render buffers. The wire payload stays full-size and
+// byte-identical in layout to the deform fast path, so the viewer needs no
+// changes. Allocated lazily per edit session; freed on the next full
+// re-extract (plan reset) or cache prune.
+struct FastSparseState {
+    bool valid = false;                 // buffers primed against current topology
+    bool posAdjacencyBuilt = false;
+    bool normalsAdjacencyBuilt = false;
+    // Persistent mirrors (what the viewer currently has)
+    std::vector<float> controlPos;      // nv * 3 — last-seen control positions
+    std::vector<float> renderPos;       // sources * 3
+    std::vector<float> renderNorms;     // sources * 3 (empty when normals not streamed)
+    // Reverse adjacency (CSR), built once per topology epoch
+    std::vector<uint32_t> ctrlRenderOff, ctrlRenderIdx; // control vert → render verts
+    std::vector<uint32_t> ctrlFaceOff, ctrlFaceIdx;     // control vert → adjacent faces
+    std::vector<uint32_t> faceRenderOff, faceRenderIdx; // face → render verts gathering it
+    // Dirty tracking scratch (flags reset via the lists each tick)
+    std::vector<uint8_t> ctrlMoved, faceDirty, renderDirty;
+    std::vector<uint32_t> movedCtrl, dirtyFaceList, dirtyRenderList;
+};
+
+// Precomputed normal recipe for the fast-deform path. Topology is constant
+// while the epoch holds, so smoothing-group islands and explicit-normal IDs
+// are resolved once into a CSR gather table; the per-frame cost collapses to
+// face normals + indexed accumulation — no adjacency rebuild, no allocations.
+struct FastNormalPlan {
+    bool built = false;
+    bool hasSpec = false;
+    std::vector<int> specId;           // per render vertex: explicit normal id, -1 = gather
+    std::vector<uint32_t> gatherOff;   // CSR offsets, size = sources + 1
+    std::vector<uint32_t> gatherFaces; // CSR face indices (smoothing groups pre-resolved)
+    std::vector<Point3> faceNormalScratch; // persistent per-frame scratch
+    // Persisted partitioners keep the same index chunks on the same cores
+    // across the 30–60 Hz re-runs of the identical parallel_for ranges, so
+    // per-core caches stay warm. Per-instance state — never copied.
+    std::unique_ptr<concurrency::affinity_partitioner> facePartitioner;
+    std::unique_ptr<concurrency::affinity_partitioner> vertPartitioner;
+    // Sub-object sparse-edit session state. Per-instance — never copied.
+    std::unique_ptr<FastSparseState> sparse;
+
+    FastNormalPlan() = default;
+    FastNormalPlan(FastNormalPlan&&) = default;
+    FastNormalPlan& operator=(FastNormalPlan&&) = default;
+    FastNormalPlan(const FastNormalPlan& other)
+        : built(other.built),
+          hasSpec(other.hasSpec),
+          specId(other.specId),
+          gatherOff(other.gatherOff),
+          gatherFaces(other.gatherFaces) {}
+    FastNormalPlan& operator=(const FastNormalPlan& other) {
+        if (this == &other) return *this;
+        built = other.built;
+        hasSpec = other.hasSpec;
+        specId = other.specId;
+        gatherOff = other.gatherOff;
+        gatherFaces = other.gatherFaces;
+        faceNormalScratch.clear();
+        facePartitioner.reset();
+        vertPartitioner.reset();
+        sparse.reset();
+        return *this;
+    }
+};
+
+struct FastDeformGuard {
+    FastDeformTopoEpoch epoch;
+    FastNormalPlan plan;
+};
+
+// Sampled connectivity hash — only consulted for epoch-volatile nodes where
+// face/vertex counts alone could miss an equal-count connectivity swap.
+static uint64_t SampleFaceTopologyHash(Mesh& mesh) {
+    const int nf = mesh.getNumFaces();
+    uint64_t h = HashFNV1a(&nf, sizeof(nf));
+    if (nf <= 0 || !mesh.faces) return h;
+    const int sampleCount = (nf < kSkinnedHashSampleCount) ? nf : kSkinnedHashSampleCount;
+    const int stride = (nf <= sampleCount) ? 1 : std::max(1, nf / sampleCount);
+    for (int s = 0; s < sampleCount; ++s) {
+        int f = s * stride;
+        if (f >= nf) f = nf - 1;
+        h = HashFNV1a(&f, sizeof(f), h);
+        h = HashFNV1a(mesh.faces[f].v, sizeof(mesh.faces[f].v), h);
+    }
+    const int lastF = nf - 1;
+    h = HashFNV1a(&lastF, sizeof(lastF), h);
+    h = HashFNV1a(mesh.faces[lastF].v, sizeof(mesh.faces[lastF].v), h);
+    return h;
+}
+
+static uint64_t SampleFaceTopologyHash(MNMesh& mn) {
+    const int nf = mn.FNum();
+    uint64_t h = HashFNV1a(&nf, sizeof(nf));
+    if (nf <= 0) return h;
+    auto hashFace = [&mn](uint64_t seed, int f) {
+        const MNFace* face = mn.F(f);
+        const int deg = (face && !face->GetFlag(MN_DEAD)) ? face->deg : -1;
+        uint64_t hh = HashFNV1a(&f, sizeof(f), seed);
+        hh = HashFNV1a(&deg, sizeof(deg), hh);
+        if (deg > 0 && face->vtx) {
+            hh = HashFNV1a(face->vtx, sizeof(int) * static_cast<size_t>(deg), hh);
+        }
+        return hh;
+    };
+    const int sampleCount = (nf < kSkinnedHashSampleCount) ? nf : kSkinnedHashSampleCount;
+    const int stride = (nf <= sampleCount) ? 1 : std::max(1, nf / sampleCount);
+    for (int s = 0; s < sampleCount; ++s) {
+        int f = s * stride;
+        if (f >= nf) f = nf - 1;
+        h = hashFace(h, f);
+    }
+    h = hashFace(h, nf - 1);
+    return h;
+}
+
+// Stack scan at epoch-capture time: any enabled-in-viewport modifier that
+// declares TOPO_CHANNEL output (Tessellate, TurboSmooth with animated iters,
+// Optimize, etc.) can change connectivity without a node event mid-drag.
+static bool NodeHasTopologyAnimatingModifier(INode* node) {
+    if (!node) return false;
+    Object* cursor = node->GetObjectRef();
+    while (cursor &&
+           (cursor->ClassID() == derivObjClassID || cursor->ClassID() == WSMDerivObjClassID)) {
+        IDerivedObject* derived = static_cast<IDerivedObject*>(cursor);
+        const int modCount = derived->NumModifiers();
+        for (int i = 0; i < modCount; ++i) {
+            Modifier* mod = derived->GetModifier(i);
+            if (!mod || !mod->IsEnabled() || !mod->IsEnabledInViews()) continue;
+            if (mod->ChannelsChanged() & TOPO_CHANNEL) return true;
+        }
+        cursor = derived->GetObjRef();
+    }
+    return false;
+}
+
+static void CaptureFastDeformEpochFromMesh(Mesh& mesh, INode* node, TimeValue t,
+                                           Object* evalObj, bool fromLiveMN,
+                                           FastDeformTopoEpoch& epoch) {
+    epoch.valid = true;
+    epoch.fromLiveMN = fromLiveMN;
+    epoch.nv = mesh.getNumVerts();
+    epoch.nf = mesh.getNumFaces();
+    epoch.topoVolatile = NodeHasTopologyAnimatingModifier(node);
+    if (!epoch.topoVolatile && evalObj) {
+        // Conservative procedural objects report limited topology validity;
+        // treating them as volatile only adds a microsecond sampled hash.
+        const Interval iv = evalObj->ChannelValidity(t, TOPO_CHAN_NUM);
+        epoch.topoVolatile = iv.Start() != TIME_NegInfinity || iv.End() != TIME_PosInfinity;
+    }
+    epoch.faceSampleHash = SampleFaceTopologyHash(mesh);
+}
+
+static void CaptureFastDeformEpochFromMNMesh(MNMesh& mn, INode* node, TimeValue t,
+                                             Object* evalObj, bool fromLiveMN,
+                                             FastDeformTopoEpoch& epoch) {
+    epoch.valid = true;
+    epoch.fromLiveMN = fromLiveMN;
+    epoch.nv = mn.VNum();
+    epoch.nf = mn.FNum();
+    epoch.topoVolatile = NodeHasTopologyAnimatingModifier(node);
+    if (!epoch.topoVolatile && evalObj) {
+        const Interval iv = evalObj->ChannelValidity(t, TOPO_CHAN_NUM);
+        epoch.topoVolatile = iv.Start() != TIME_NegInfinity || iv.End() != TIME_PosInfinity;
+    }
+    epoch.faceSampleHash = SampleFaceTopologyHash(mn);
+}
+
+static bool FastDeformEpochMatches(Mesh& mesh, const FastDeformTopoEpoch& epoch) {
+    if (!epoch.valid) return false;
+    if (mesh.getNumVerts() != epoch.nv || mesh.getNumFaces() != epoch.nf) return false;
+    return !epoch.topoVolatile || SampleFaceTopologyHash(mesh) == epoch.faceSampleHash;
+}
+
+static bool FastDeformEpochMatches(MNMesh& mn, const FastDeformTopoEpoch& epoch) {
+    if (!epoch.valid) return false;
+    if (mn.VNum() != epoch.nv || mn.FNum() != epoch.nf) return false;
+    return !epoch.topoVolatile || SampleFaceTopologyHash(mn) == epoch.faceSampleHash;
+}
 
 // ── MNMesh (PolyObject) extraction — handles ngons correctly ──
 static bool ExtractMeshFromMNMesh(MNMesh& mn,
@@ -1795,7 +2076,8 @@ static bool ExtractMesh(INode* node, TimeValue t,
                         std::vector<VertexColorAttributeRecord>* outVertexColors = nullptr,
                         std::vector<FastVertexSource>* outFastVertexSources = nullptr,
                         std::vector<float>* outUV2s = nullptr,
-                        bool emitPrimaryUVs = true) {
+                        bool emitPrimaryUVs = true,
+                        FastDeformTopoEpoch* outEpoch = nullptr) {
     const bool allowMapChannel1 = ShouldAllowVertexColorMapChannel1(node);
     if (MNMesh* liveMN = TryGetLiveEditablePolyMesh(node)) {
         // When UV2 is requested, prefer the evaluated object if the live
@@ -1803,7 +2085,10 @@ static bool ExtractMesh(INode* node, TimeValue t,
         // Unwrap modifiers that author lightmap UVs above the base object
         // without putting UV2 into the hot geo_fast path.
         if (!outUV2s || MNMeshHasUsableMapChannel(*liveMN, 2)) {
-            return ExtractMeshFromMNMesh(*liveMN, verts, uvs, indices, groups, normals, controlIdx, outVertexColors, allowMapChannel1, outFastVertexSources, outUV2s, emitPrimaryUVs);
+            const bool ok = ExtractMeshFromMNMesh(*liveMN, verts, uvs, indices, groups, normals, controlIdx, outVertexColors, allowMapChannel1, outFastVertexSources, outUV2s, emitPrimaryUVs);
+            if (ok && outEpoch)
+                CaptureFastDeformEpochFromMNMesh(*liveMN, node, t, nullptr, true, *outEpoch);
+            return ok;
         }
     }
 
@@ -1819,7 +2104,10 @@ static bool ExtractMesh(INode* node, TimeValue t,
     if (os.obj->IsSubClassOf(polyObjectClassID)) {
         PolyObject* poly = static_cast<PolyObject*>(os.obj);
         MNMesh& mn = poly->GetMesh();
-        return ExtractMeshFromMNMesh(mn, verts, uvs, indices, groups, normals, controlIdx, outVertexColors, allowMapChannel1, outFastVertexSources, outUV2s, emitPrimaryUVs);
+        const bool ok = ExtractMeshFromMNMesh(mn, verts, uvs, indices, groups, normals, controlIdx, outVertexColors, allowMapChannel1, outFastVertexSources, outUV2s, emitPrimaryUVs);
+        if (ok && outEpoch)
+            CaptureFastDeformEpochFromMNMesh(mn, node, t, os.obj, false, *outEpoch);
+        return ok;
     }
 
     // Fallback: convert to TriObject for non-poly geometry (primitives, patches, etc.)
@@ -1827,7 +2115,14 @@ static bool ExtractMesh(INode* node, TimeValue t,
     TriObject* tri = static_cast<TriObject*>(
         os.obj->ConvertToType(t, Class_ID(TRIOBJ_CLASS_ID, 0)));
     if (!tri) return false;
-    return ExtractMeshFromTriObject(tri, os.obj, verts, uvs, indices, groups, normals, controlIdx, outVertexColors, allowMapChannel1, outFastVertexSources, outUV2s, emitPrimaryUVs);
+    // Capture before extraction — ExtractMeshFromTriObject deletes converted
+    // TriObjects on its way out.
+    FastDeformTopoEpoch triEpoch;
+    if (outEpoch)
+        CaptureFastDeformEpochFromMesh(tri->GetMesh(), node, t, os.obj, false, triEpoch);
+    const bool ok = ExtractMeshFromTriObject(tri, os.obj, verts, uvs, indices, groups, normals, controlIdx, outVertexColors, allowMapChannel1, outFastVertexSources, outUV2s, emitPrimaryUVs);
+    if (ok && outEpoch) *outEpoch = triEpoch;
+    return ok;
 }
 
 static bool TryHashExtractedRenderableGeometry(INode* node, TimeValue t, uint64_t& outHash) {
@@ -1992,23 +2287,29 @@ static bool NodeHasExtractableVertexColors(INode* node, TimeValue t) {
 static bool ExtractSkinnedFastPositions(INode* node,
                                         TimeValue t,
                                         const std::vector<int>& controlIdx,
+                                        const FastDeformTopoEpoch& epoch,
                                         std::vector<float>& outVerts) {
     outVerts.clear();
-    if (!node || controlIdx.empty()) return false;
+    if (!node || controlIdx.empty() || !epoch.valid) return false;
 
-    if (MNMesh* liveMN = TryGetLiveEditablePolyMesh(node)) {
+    auto copyFromMN = [&](MNMesh& mn) {
         outVerts.resize(controlIdx.size() * 3);
         for (size_t i = 0; i < controlIdx.size(); ++i) {
-            const int ci = controlIdx[i];
-            if (ci < 0 || ci >= liveMN->VNum()) {
-                outVerts.clear();
-                return false;
-            }
-            const Point3 p = liveMN->P(ci);
+            // Epoch match guarantees the cached index is valid for this topology.
+            const Point3 p = mn.P(controlIdx[i]);
             outVerts[i * 3 + 0] = p.x;
             outVerts[i * 3 + 1] = p.y;
             outVerts[i * 3 + 2] = p.z;
         }
+    };
+
+    // Replay must read the same mesh source the cache was built from —
+    // mixing the live Editable Poly mesh with an evaluated-stack mesh maps
+    // indices across different topologies even when counts happen to agree.
+    if (epoch.fromLiveMN) {
+        MNMesh* liveMN = TryGetLiveEditablePolyMesh(node);
+        if (!liveMN || !FastDeformEpochMatches(*liveMN, epoch)) return false;
+        copyFromMN(*liveMN);
         return true;
     }
 
@@ -2018,18 +2319,8 @@ static bool ExtractSkinnedFastPositions(INode* node,
 
     if (os.obj->IsSubClassOf(polyObjectClassID)) {
         MNMesh& mn = static_cast<PolyObject*>(os.obj)->GetMesh();
-        outVerts.resize(controlIdx.size() * 3);
-        for (size_t i = 0; i < controlIdx.size(); ++i) {
-            const int ci = controlIdx[i];
-            if (ci < 0 || ci >= mn.VNum()) {
-                outVerts.clear();
-                return false;
-            }
-            const Point3 p = mn.P(ci);
-            outVerts[i * 3 + 0] = p.x;
-            outVerts[i * 3 + 1] = p.y;
-            outVerts[i * 3 + 2] = p.z;
-        }
+        if (!FastDeformEpochMatches(mn, epoch)) return false;
+        copyFromMN(mn);
         return true;
     }
 
@@ -2038,63 +2329,37 @@ static bool ExtractSkinnedFastPositions(INode* node,
     if (!tri) return false;
 
     Mesh& mesh = tri->GetMesh();
-    outVerts.resize(controlIdx.size() * 3);
-    bool ok = true;
-    for (size_t i = 0; i < controlIdx.size(); ++i) {
-        const int ci = controlIdx[i];
-        if (ci < 0 || ci >= mesh.getNumVerts()) {
-            ok = false;
-            break;
+    const bool ok = FastDeformEpochMatches(mesh, epoch);
+    if (ok) {
+        outVerts.resize(controlIdx.size() * 3);
+        for (size_t i = 0; i < controlIdx.size(); ++i) {
+            const Point3 p = mesh.getVert(controlIdx[i]);
+            outVerts[i * 3 + 0] = p.x;
+            outVerts[i * 3 + 1] = p.y;
+            outVerts[i * 3 + 2] = p.z;
         }
-        const Point3 p = mesh.getVert(ci);
-        outVerts[i * 3 + 0] = p.x;
-        outVerts[i * 3 + 1] = p.y;
-        outVerts[i * 3 + 2] = p.z;
     }
-
-    if (!ok) outVerts.clear();
     if (tri != os.obj) tri->DeleteThis();
     return ok;
 }
 
-static bool ExtractMNMeshFastGeometry(MNMesh& mn,
-                                      const std::vector<FastVertexSource>& sources,
-                                      std::vector<float>& outVerts,
-                                      std::vector<float>* outNormals) {
+// ── Normal gather plan: build once per topology epoch ──
+static void BuildFastNormalPlanFromMNMesh(MNMesh& mn,
+                                          const std::vector<FastVertexSource>& sources,
+                                          FastNormalPlan& plan) {
     const int nv = mn.VNum();
     const int nf = mn.FNum();
-    outVerts.clear();
-    if (nv <= 0 || sources.empty()) return false;
-
-    outVerts.resize(sources.size() * 3);
-    for (size_t i = 0; i < sources.size(); ++i) {
-        const int ci = sources[i].controlIdx;
-        if (ci < 0 || ci >= nv) {
-            outVerts.clear();
-            if (outNormals) outNormals->clear();
-            return false;
-        }
-        const Point3 p = mn.P(ci);
-        outVerts[i * 3 + 0] = p.x;
-        outVerts[i * 3 + 1] = p.y;
-        outVerts[i * 3 + 2] = p.z;
-    }
-
-    if (!outNormals) return true;
-    outNormals->clear();
-    if (nf <= 0) return true;
+    plan.specId.clear();
+    plan.gatherOff.clear();
+    plan.gatherFaces.clear();
 
     MNNormalSpec* normalSpec = mn.GetSpecifiedNormals();
-    const bool hasNormalSpec = normalSpec &&
+    plan.hasSpec = normalSpec &&
         normalSpec->GetNumFaces() == nf &&
         normalSpec->GetNumNormals() > 0;
-    const int specNormalCount = hasNormalSpec ? normalSpec->GetNumNormals() : 0;
+    const int specNormalCount = plan.hasSpec ? normalSpec->GetNumNormals() : 0;
 
-    std::vector<Point3> faceNormals(nf, Point3(0, 0, 0));
-    concurrency::parallel_for(0, nf, [&](int f) {
-        faceNormals[f] = ComputeMNMeshFaceNormalSafe(mn, f);
-    });
-
+    // Build-time-only vertex → (face, smGroup) adjacency over live faces.
     std::vector<int> vertCornerOff(static_cast<size_t>(nv) + 1, 0);
     int totalCorners = 0;
     for (int f = 0; f < nf; ++f) {
@@ -2109,8 +2374,8 @@ static bool ExtractMNMeshFastGeometry(MNMesh& mn,
     }
     for (int i = 1; i <= nv; ++i) vertCornerOff[i] += vertCornerOff[i - 1];
 
-    struct FastMNCorner { int faceIdx; DWORD smGrp; };
-    std::vector<FastMNCorner> vertCornersFlat(static_cast<size_t>(totalCorners));
+    struct PlanCorner { int faceIdx; DWORD smGrp; };
+    std::vector<PlanCorner> corners(static_cast<size_t>(totalCorners));
     {
         std::vector<int> cursor(nv, 0);
         for (int f = 0; f < nf; ++f) {
@@ -2120,93 +2385,61 @@ static bool ExtractMNMeshFastGeometry(MNMesh& mn,
             for (int v = 0; v < face->deg; ++v) {
                 const int pIdx = face->vtx[v];
                 if (pIdx < 0 || pIdx >= nv) continue;
-                vertCornersFlat[vertCornerOff[pIdx] + cursor[pIdx]++] = { f, smGrp };
+                corners[vertCornerOff[pIdx] + cursor[pIdx]++] = { f, smGrp };
             }
         }
     }
 
-    outNormals->resize(sources.size() * 3);
-    const Point3 fallback(0.0f, 0.0f, 1.0f);
-    concurrency::parallel_for(size_t(0), sources.size(), [&](size_t i) {
+    plan.specId.assign(sources.size(), -1);
+    plan.gatherOff.resize(sources.size() + 1);
+    plan.gatherOff[0] = 0;
+    plan.gatherFaces.reserve(sources.size());
+    for (size_t i = 0; i < sources.size(); ++i) {
         const FastVertexSource& src = sources[i];
         const bool validFace = src.faceIdx >= 0 && src.faceIdx < nf;
-        if (hasNormalSpec && validFace) {
+        int specNid = -1;
+        if (plan.hasSpec && validFace && src.localIdx >= 0) {
             MNNormalFace& nfSpec = normalSpec->Face(src.faceIdx);
-            if (src.localIdx >= 0 &&
-                src.localIdx < nfSpec.GetDegree() &&
-                nfSpec.GetSpecified(src.localIdx)) {
+            if (src.localIdx < nfSpec.GetDegree() && nfSpec.GetSpecified(src.localIdx)) {
                 const int nid = nfSpec.GetNormalID(src.localIdx);
-                if (nid >= 0 && nid < specNormalCount) {
-                    const Point3 n = NormalizeNormalOrFallback(normalSpec->Normal(nid), faceNormals[src.faceIdx]);
-                    (*outNormals)[i * 3 + 0] = n.x;
-                    (*outNormals)[i * 3 + 1] = n.y;
-                    (*outNormals)[i * 3 + 2] = n.z;
-                    return;
-                }
+                if (nid >= 0 && nid < specNormalCount) specNid = nid;
             }
         }
-
-        Point3 accum(0, 0, 0);
-        if (src.smGroup == 0) {
-            accum = validFace ? faceNormals[src.faceIdx] : fallback;
-        } else {
-            const int beg = vertCornerOff[src.controlIdx];
-            const int end = vertCornerOff[src.controlIdx + 1];
-            for (int j = beg; j < end; ++j) {
-                const FastMNCorner& other = vertCornersFlat[j];
-                if ((other.smGrp & src.smGroup) != 0) {
-                    accum += faceNormals[other.faceIdx];
+        plan.specId[i] = specNid;
+        if (specNid < 0) {
+            const size_t rowStart = plan.gatherFaces.size();
+            if (src.smGroup == 0) {
+                if (validFace) plan.gatherFaces.push_back(static_cast<uint32_t>(src.faceIdx));
+            } else if (src.controlIdx >= 0 && src.controlIdx < nv) {
+                const int beg = vertCornerOff[src.controlIdx];
+                const int end = vertCornerOff[src.controlIdx + 1];
+                for (int j = beg; j < end; ++j) {
+                    if ((corners[j].smGrp & src.smGroup) != 0)
+                        plan.gatherFaces.push_back(static_cast<uint32_t>(corners[j].faceIdx));
                 }
             }
-            if (DotProd(accum, accum) <= 1.0e-20f && validFace) {
-                accum = faceNormals[src.faceIdx];
-            }
+            if (plan.gatherFaces.size() == rowStart && validFace)
+                plan.gatherFaces.push_back(static_cast<uint32_t>(src.faceIdx));
         }
-        const Point3 n = NormalizeNormalOrFallback(accum, fallback);
-        (*outNormals)[i * 3 + 0] = n.x;
-        (*outNormals)[i * 3 + 1] = n.y;
-        (*outNormals)[i * 3 + 2] = n.z;
-    });
-    return true;
+        plan.gatherOff[i + 1] = static_cast<uint32_t>(plan.gatherFaces.size());
+    }
+    plan.built = true;
 }
 
-static bool ExtractMeshFastGeometry(Mesh& mesh,
-                                    const std::vector<FastVertexSource>& sources,
-                                    std::vector<float>& outVerts,
-                                    std::vector<float>* outNormals) {
+static void BuildFastNormalPlanFromMesh(Mesh& mesh,
+                                        const std::vector<FastVertexSource>& sources,
+                                        FastNormalPlan& plan) {
     const int nv = mesh.getNumVerts();
     const int nf = mesh.getNumFaces();
-    outVerts.clear();
-    if (nv <= 0 || sources.empty()) return false;
-
-    outVerts.resize(sources.size() * 3);
-    for (size_t i = 0; i < sources.size(); ++i) {
-        const int ci = sources[i].controlIdx;
-        if (ci < 0 || ci >= nv) {
-            outVerts.clear();
-            if (outNormals) outNormals->clear();
-            return false;
-        }
-        const Point3 p = mesh.getVert(ci);
-        outVerts[i * 3 + 0] = p.x;
-        outVerts[i * 3 + 1] = p.y;
-        outVerts[i * 3 + 2] = p.z;
-    }
-
-    if (!outNormals) return true;
-    outNormals->clear();
-    if (nf <= 0) return true;
+    plan.specId.clear();
+    plan.gatherOff.clear();
+    plan.gatherFaces.clear();
 
     MeshNormalSpec* normalSpec = mesh.GetSpecifiedNormals();
-    const bool hasNormalSpec = normalSpec &&
+    plan.hasSpec = normalSpec &&
         normalSpec->GetNumFaces() == nf &&
         normalSpec->GetNumNormals() > 0;
-    const int specNormalCount = hasNormalSpec ? normalSpec->GetNumNormals() : 0;
-
-    std::vector<Point3> faceNormals(nf, Point3(0, 0, 0));
-    concurrency::parallel_for(0, nf, [&](int f) {
-        faceNormals[f] = ComputeMeshFaceNormalSafe(mesh, f);
-    });
+    const int specNormalCount = plan.hasSpec ? normalSpec->GetNumNormals() : 0;
 
     std::vector<int> vertCornerOff(static_cast<size_t>(nv) + 1, 0);
     for (int f = 0; f < nf; ++f) {
@@ -2214,73 +2447,553 @@ static bool ExtractMeshFastGeometry(Mesh& mesh,
     }
     for (int i = 1; i <= nv; ++i) vertCornerOff[i] += vertCornerOff[i - 1];
 
-    struct FastTriCorner { int faceIdx; DWORD smGrp; };
-    std::vector<FastTriCorner> vertCornersFlat(static_cast<size_t>(nf) * 3);
+    struct PlanCorner { int faceIdx; DWORD smGrp; };
+    std::vector<PlanCorner> corners(static_cast<size_t>(nf) * 3);
     {
         std::vector<int> cursor(nv, 0);
         for (int f = 0; f < nf; ++f) {
             const DWORD smGrp = mesh.faces[f].getSmGroup();
             for (int v = 0; v < 3; ++v) {
                 const int pIdx = mesh.faces[f].v[v];
-                vertCornersFlat[vertCornerOff[pIdx] + cursor[pIdx]++] = { f, smGrp };
+                corners[vertCornerOff[pIdx] + cursor[pIdx]++] = { f, smGrp };
             }
         }
     }
 
-    outNormals->resize(sources.size() * 3);
+    plan.specId.assign(sources.size(), -1);
+    plan.gatherOff.resize(sources.size() + 1);
+    plan.gatherOff[0] = 0;
+    plan.gatherFaces.reserve(sources.size());
+    for (size_t i = 0; i < sources.size(); ++i) {
+        const FastVertexSource& src = sources[i];
+        const bool validFace = src.faceIdx >= 0 && src.faceIdx < nf;
+        int specNid = -1;
+        if (plan.hasSpec && validFace && src.localIdx >= 0 && src.localIdx < 3) {
+            MeshNormalFace& nfSpec = normalSpec->Face(src.faceIdx);
+            if (nfSpec.GetSpecified(src.localIdx)) {
+                const int nid = nfSpec.GetNormalID(src.localIdx);
+                if (nid >= 0 && nid < specNormalCount) specNid = nid;
+            }
+        }
+        plan.specId[i] = specNid;
+        if (specNid < 0) {
+            const size_t rowStart = plan.gatherFaces.size();
+            if (src.smGroup == 0) {
+                if (validFace) plan.gatherFaces.push_back(static_cast<uint32_t>(src.faceIdx));
+            } else if (src.controlIdx >= 0 && src.controlIdx < nv) {
+                const int beg = vertCornerOff[src.controlIdx];
+                const int end = vertCornerOff[src.controlIdx + 1];
+                for (int j = beg; j < end; ++j) {
+                    if ((corners[j].smGrp & src.smGroup) != 0)
+                        plan.gatherFaces.push_back(static_cast<uint32_t>(corners[j].faceIdx));
+                }
+            }
+            if (plan.gatherFaces.size() == rowStart && validFace)
+                plan.gatherFaces.push_back(static_cast<uint32_t>(src.faceIdx));
+        }
+        plan.gatherOff[i + 1] = static_cast<uint32_t>(plan.gatherFaces.size());
+    }
+    plan.built = true;
+}
+
+// ── Per-frame normal pass: face normals + CSR gather, zero allocations
+//    beyond the persistent scratch. Replaces the per-frame adjacency
+//    rebuild + smoothing-group scan the old fast path paid on every tick. ──
+static void ApplyFastNormalPlan(MNMesh& mn,
+                                const std::vector<FastVertexSource>& sources,
+                                FastNormalPlan& plan,
+                                std::vector<float>& outNormals) {
+    const int nf = mn.FNum();
+    MNNormalSpec* normalSpec = mn.GetSpecifiedNormals();
+    const bool hasSpec = normalSpec &&
+        normalSpec->GetNumFaces() == nf &&
+        normalSpec->GetNumNormals() > 0;
+    if (!plan.built || plan.hasSpec != hasSpec ||
+        plan.gatherOff.size() != sources.size() + 1) {
+        BuildFastNormalPlanFromMNMesh(mn, sources, plan);
+    }
+    const int specNormalCount = (plan.hasSpec && normalSpec) ? normalSpec->GetNumNormals() : 0;
+
+    if (!plan.facePartitioner) plan.facePartitioner = std::make_unique<concurrency::affinity_partitioner>();
+    if (!plan.vertPartitioner) plan.vertPartitioner = std::make_unique<concurrency::affinity_partitioner>();
+
+    plan.faceNormalScratch.resize(static_cast<size_t>(nf));
+    Point3* faceNormals = plan.faceNormalScratch.data();
+    concurrency::parallel_for(0, nf, [&](int f) {
+        faceNormals[f] = ComputeMNMeshFaceNormalSafe(mn, f);
+    }, *plan.facePartitioner);
+
+    outNormals.resize(sources.size() * 3);
+    float* out = outNormals.data();
     const Point3 fallback(0.0f, 0.0f, 1.0f);
     concurrency::parallel_for(size_t(0), sources.size(), [&](size_t i) {
         const FastVertexSource& src = sources[i];
         const bool validFace = src.faceIdx >= 0 && src.faceIdx < nf;
-        if (hasNormalSpec && validFace) {
-            MeshNormalFace& nfSpec = normalSpec->Face(src.faceIdx);
-            if (src.localIdx >= 0 &&
-                src.localIdx < 3 &&
-                nfSpec.GetSpecified(src.localIdx)) {
-                const int nid = nfSpec.GetNormalID(src.localIdx);
-                if (nid >= 0 && nid < specNormalCount) {
-                    const Point3 n = NormalizeNormalOrFallback(normalSpec->Normal(nid), faceNormals[src.faceIdx]);
-                    (*outNormals)[i * 3 + 0] = n.x;
-                    (*outNormals)[i * 3 + 1] = n.y;
-                    (*outNormals)[i * 3 + 2] = n.z;
-                    return;
+        Point3 n;
+        const int specNid = plan.specId.empty() ? -1 : plan.specId[i];
+        if (specNid >= 0 && specNid < specNormalCount) {
+            n = NormalizeNormalOrFallback(normalSpec->Normal(specNid),
+                                          validFace ? faceNormals[src.faceIdx] : fallback);
+        } else {
+            Point3 accum(0.0f, 0.0f, 0.0f);
+            const uint32_t beg = plan.gatherOff[i];
+            const uint32_t end = plan.gatherOff[i + 1];
+            for (uint32_t j = beg; j < end; ++j) accum += faceNormals[plan.gatherFaces[j]];
+            if (DotProd(accum, accum) <= 1.0e-20f && validFace) accum = faceNormals[src.faceIdx];
+            n = NormalizeNormalOrFallback(accum, fallback);
+        }
+        out[i * 3 + 0] = n.x;
+        out[i * 3 + 1] = n.y;
+        out[i * 3 + 2] = n.z;
+    }, *plan.vertPartitioner);
+}
+
+static void ApplyFastNormalPlan(Mesh& mesh,
+                                const std::vector<FastVertexSource>& sources,
+                                FastNormalPlan& plan,
+                                std::vector<float>& outNormals) {
+    const int nf = mesh.getNumFaces();
+    MeshNormalSpec* normalSpec = mesh.GetSpecifiedNormals();
+    const bool hasSpec = normalSpec &&
+        normalSpec->GetNumFaces() == nf &&
+        normalSpec->GetNumNormals() > 0;
+    if (!plan.built || plan.hasSpec != hasSpec ||
+        plan.gatherOff.size() != sources.size() + 1) {
+        BuildFastNormalPlanFromMesh(mesh, sources, plan);
+    }
+    const int specNormalCount = (plan.hasSpec && normalSpec) ? normalSpec->GetNumNormals() : 0;
+
+    if (!plan.facePartitioner) plan.facePartitioner = std::make_unique<concurrency::affinity_partitioner>();
+    if (!plan.vertPartitioner) plan.vertPartitioner = std::make_unique<concurrency::affinity_partitioner>();
+
+    plan.faceNormalScratch.resize(static_cast<size_t>(nf));
+    Point3* faceNormals = plan.faceNormalScratch.data();
+    concurrency::parallel_for(0, nf, [&](int f) {
+        faceNormals[f] = ComputeMeshFaceNormalSafe(mesh, f);
+    }, *plan.facePartitioner);
+
+    outNormals.resize(sources.size() * 3);
+    float* out = outNormals.data();
+    const Point3 fallback(0.0f, 0.0f, 1.0f);
+    concurrency::parallel_for(size_t(0), sources.size(), [&](size_t i) {
+        const FastVertexSource& src = sources[i];
+        const bool validFace = src.faceIdx >= 0 && src.faceIdx < nf;
+        Point3 n;
+        const int specNid = plan.specId.empty() ? -1 : plan.specId[i];
+        if (specNid >= 0 && specNid < specNormalCount) {
+            n = NormalizeNormalOrFallback(normalSpec->Normal(specNid),
+                                          validFace ? faceNormals[src.faceIdx] : fallback);
+        } else {
+            Point3 accum(0.0f, 0.0f, 0.0f);
+            const uint32_t beg = plan.gatherOff[i];
+            const uint32_t end = plan.gatherOff[i + 1];
+            for (uint32_t j = beg; j < end; ++j) accum += faceNormals[plan.gatherFaces[j]];
+            if (DotProd(accum, accum) <= 1.0e-20f && validFace) accum = faceNormals[src.faceIdx];
+            n = NormalizeNormalOrFallback(accum, fallback);
+        }
+        out[i * 3 + 0] = n.x;
+        out[i * 3 + 1] = n.y;
+        out[i * 3 + 2] = n.z;
+    }, *plan.vertPartitioner);
+}
+
+// Blocked parallel gather for the position replay loops. Per-index
+// parallel_for overhead would swamp the 12-byte copies, so work is split
+// into blocks; below the threshold a serial loop wins outright.
+static constexpr size_t kParallelGatherMinVerts = 16384;
+static constexpr size_t kParallelGatherBlock = 8192;
+
+template <typename CopyBlockFn>
+static void ParallelGatherBlocks(size_t count, const CopyBlockFn& copyBlock) {
+    if (count < kParallelGatherMinVerts) {
+        copyBlock(size_t(0), count);
+        return;
+    }
+    const size_t blocks = (count + kParallelGatherBlock - 1) / kParallelGatherBlock;
+    concurrency::parallel_for(size_t(0), blocks, [&](size_t b) {
+        const size_t beg = b * kParallelGatherBlock;
+        const size_t end = std::min(count, beg + kParallelGatherBlock);
+        copyBlock(beg, end);
+    });
+}
+
+static bool ExtractMNMeshFastGeometry(MNMesh& mn,
+                                      const std::vector<FastVertexSource>& sources,
+                                      FastDeformGuard& guard,
+                                      std::vector<float>& outVerts,
+                                      std::vector<float>* outNormals) {
+    outVerts.clear();
+    if (outNormals) outNormals->clear();
+    if (sources.empty() || !FastDeformEpochMatches(mn, guard.epoch)) return false;
+
+    outVerts.resize(sources.size() * 3);
+    float* dst = outVerts.data();
+    const FastVertexSource* src = sources.data();
+    ParallelGatherBlocks(sources.size(), [&](size_t beg, size_t end) {
+        for (size_t i = beg; i < end; ++i) {
+            // Epoch match guarantees the cached index is valid for this topology.
+            const Point3 p = mn.P(src[i].controlIdx);
+            dst[i * 3 + 0] = p.x;
+            dst[i * 3 + 1] = p.y;
+            dst[i * 3 + 2] = p.z;
+        }
+    });
+
+    if (outNormals && mn.FNum() > 0)
+        ApplyFastNormalPlan(mn, sources, guard.plan, *outNormals);
+    return true;
+}
+
+static bool ExtractMeshFastGeometry(Mesh& mesh,
+                                    const std::vector<FastVertexSource>& sources,
+                                    FastDeformGuard& guard,
+                                    std::vector<float>& outVerts,
+                                    std::vector<float>* outNormals) {
+    outVerts.clear();
+    if (outNormals) outNormals->clear();
+    if (sources.empty() || !FastDeformEpochMatches(mesh, guard.epoch)) return false;
+
+    outVerts.resize(sources.size() * 3);
+    float* dst = outVerts.data();
+    const FastVertexSource* src = sources.data();
+    ParallelGatherBlocks(sources.size(), [&](size_t beg, size_t end) {
+        for (size_t i = beg; i < end; ++i) {
+            const Point3 p = mesh.getVert(src[i].controlIdx);
+            dst[i * 3 + 0] = p.x;
+            dst[i * 3 + 1] = p.y;
+            dst[i * 3 + 2] = p.z;
+        }
+    });
+
+    if (outNormals && mesh.getNumFaces() > 0)
+        ApplyFastNormalPlan(mesh, sources, guard.plan, *outNormals);
+    return true;
+}
+
+// ══════════════════════════════════════════════════════════════
+//  Sparse sub-object edit path
+// ══════════════════════════════════════════════════════════════
+// Above this moved-fraction the touched region is no longer "sparse" and a
+// full plan-path refresh of the persistent buffers is cheaper than the
+// per-vertex bookkeeping (soft selection / large-region drags).
+static constexpr float kSparseMaxMovedFraction = 0.30f;
+// Dirty lists below this size run serial — parallel_for overhead dominates.
+static constexpr size_t kSparseParallelMinItems = 512;
+
+// Result contract: 0 = cannot sparse-update (caller drops caches and takes
+// the full extract path), 1 = buffers updated, send them, 2 = positions are
+// byte-identical to what the viewer already has — skip the send entirely.
+template <typename GetPosFn, typename FaceNormalFn, typename CornerNormalFn, typename ApplyFullNormalsFn>
+static int FastSparseUpdateCore(int nv, int nf,
+                                const std::vector<FastVertexSource>& sources,
+                                FastNormalPlan& plan,
+                                bool wantNormals,
+                                const GetPosFn& getPos,
+                                const FaceNormalFn& faceNormal,
+                                const CornerNormalFn& cornerNormal,
+                                const ApplyFullNormalsFn& applyFullNormals) {
+    FastSparseState& sp = *plan.sparse;
+    const size_t n = sources.size();
+    if (nv <= 0 || n == 0) return 0;
+    const size_t ctrlFloats = static_cast<size_t>(nv) * 3;
+    const size_t renderFloats = n * 3;
+    const FastVertexSource* srcArr = sources.data();
+
+    const bool primed = sp.valid &&
+        sp.controlPos.size() == ctrlFloats &&
+        sp.renderPos.size() == renderFloats &&
+        (!wantNormals || sp.renderNorms.size() == renderFloats) &&
+        sp.ctrlMoved.size() == static_cast<size_t>(nv);
+    if (!primed) {
+        sp.controlPos.resize(ctrlFloats);
+        float* cp = sp.controlPos.data();
+        ParallelGatherBlocks(static_cast<size_t>(nv), [&](size_t beg, size_t end) {
+            for (size_t c = beg; c < end; ++c) {
+                const Point3 p = getPos(static_cast<int>(c));
+                cp[c * 3 + 0] = p.x;
+                cp[c * 3 + 1] = p.y;
+                cp[c * 3 + 2] = p.z;
+            }
+        });
+        sp.renderPos.resize(renderFloats);
+        float* rp = sp.renderPos.data();
+        ParallelGatherBlocks(n, [&](size_t beg, size_t end) {
+            for (size_t i = beg; i < end; ++i) {
+                const size_t c = static_cast<size_t>(srcArr[i].controlIdx);
+                rp[i * 3 + 0] = cp[c * 3 + 0];
+                rp[i * 3 + 1] = cp[c * 3 + 1];
+                rp[i * 3 + 2] = cp[c * 3 + 2];
+            }
+        });
+        if (wantNormals) applyFullNormals(sp.renderNorms);
+        else sp.renderNorms.clear();
+        sp.ctrlMoved.assign(static_cast<size_t>(nv), 0);
+        sp.faceDirty.assign(wantNormals ? static_cast<size_t>(nf) : 0, 0);
+        sp.renderDirty.assign(wantNormals ? n : 0, 0);
+        sp.valid = true;
+        return 1;
+    }
+
+    // Diff control positions against the persistent snapshot (exact float
+    // compare — both sides came from the same pipeline). Updates the
+    // snapshot in place and flags movers.
+    float* cp = sp.controlPos.data();
+    uint8_t* movedFlags = sp.ctrlMoved.data();
+    ParallelGatherBlocks(static_cast<size_t>(nv), [&](size_t beg, size_t end) {
+        for (size_t c = beg; c < end; ++c) {
+            const Point3 p = getPos(static_cast<int>(c));
+            float* dst = cp + c * 3;
+            if (p.x != dst[0] || p.y != dst[1] || p.z != dst[2]) {
+                dst[0] = p.x;
+                dst[1] = p.y;
+                dst[2] = p.z;
+                movedFlags[c] = 1;
+            }
+        }
+    });
+
+    sp.movedCtrl.clear();
+    const size_t maxMoved = static_cast<size_t>(nv * kSparseMaxMovedFraction) + 1;
+    bool tooMany = false;
+    for (int c = 0; c < nv; ++c) {
+        if (!movedFlags[c]) continue;
+        movedFlags[c] = 0;
+        if (sp.movedCtrl.size() >= maxMoved) tooMany = true;
+        else sp.movedCtrl.push_back(static_cast<uint32_t>(c));
+    }
+    if (!tooMany && sp.movedCtrl.empty()) return 2;
+
+    float* rp = sp.renderPos.data();
+    if (tooMany) {
+        // Large-region edit: refresh everything through the plan path. The
+        // control snapshot is already updated, so positions are a linear copy.
+        ParallelGatherBlocks(n, [&](size_t beg, size_t end) {
+            for (size_t i = beg; i < end; ++i) {
+                const size_t c = static_cast<size_t>(srcArr[i].controlIdx);
+                rp[i * 3 + 0] = cp[c * 3 + 0];
+                rp[i * 3 + 1] = cp[c * 3 + 1];
+                rp[i * 3 + 2] = cp[c * 3 + 2];
+            }
+        });
+        if (wantNormals) applyFullNormals(sp.renderNorms);
+        return 1;
+    }
+
+    // Sparse apply: scatter moved positions to their render verts and mark
+    // every adjacent face dirty.
+    sp.dirtyFaceList.clear();
+    for (uint32_t c : sp.movedCtrl) {
+        const float* P = cp + static_cast<size_t>(c) * 3;
+        for (uint32_t k = sp.ctrlRenderOff[c]; k < sp.ctrlRenderOff[c + 1]; ++k) {
+            const uint32_t r = sp.ctrlRenderIdx[k];
+            rp[r * 3 + 0] = P[0];
+            rp[r * 3 + 1] = P[1];
+            rp[r * 3 + 2] = P[2];
+        }
+        if (wantNormals) {
+            for (uint32_t k = sp.ctrlFaceOff[c]; k < sp.ctrlFaceOff[c + 1]; ++k) {
+                const uint32_t f = sp.ctrlFaceIdx[k];
+                if (!sp.faceDirty[f]) {
+                    sp.faceDirty[f] = 1;
+                    sp.dirtyFaceList.push_back(f);
+                }
+            }
+        }
+    }
+
+    if (wantNormals && !sp.dirtyFaceList.empty()) {
+        if (plan.faceNormalScratch.size() != static_cast<size_t>(nf)) return 0; // scratch lost — bail to full path
+        Point3* fn = plan.faceNormalScratch.data();
+        const std::vector<uint32_t>& dfl = sp.dirtyFaceList;
+        if (dfl.size() >= kSparseParallelMinItems) {
+            concurrency::parallel_for(size_t(0), dfl.size(), [&](size_t k) {
+                fn[dfl[k]] = faceNormal(static_cast<int>(dfl[k]));
+            });
+        } else {
+            for (uint32_t f : dfl) fn[f] = faceNormal(static_cast<int>(f));
+        }
+
+        sp.dirtyRenderList.clear();
+        for (uint32_t f : dfl) {
+            for (uint32_t k = sp.faceRenderOff[f]; k < sp.faceRenderOff[f + 1]; ++k) {
+                const uint32_t r = sp.faceRenderIdx[k];
+                if (!sp.renderDirty[r]) {
+                    sp.renderDirty[r] = 1;
+                    sp.dirtyRenderList.push_back(r);
+                }
+            }
+            sp.faceDirty[f] = 0;
+        }
+
+        float* rn = sp.renderNorms.data();
+        const std::vector<uint32_t>& drl = sp.dirtyRenderList;
+        if (drl.size() >= kSparseParallelMinItems) {
+            concurrency::parallel_for(size_t(0), drl.size(), [&](size_t k) {
+                const Point3 nrm = cornerNormal(static_cast<size_t>(drl[k]));
+                rn[drl[k] * 3 + 0] = nrm.x;
+                rn[drl[k] * 3 + 1] = nrm.y;
+                rn[drl[k] * 3 + 2] = nrm.z;
+            });
+        } else {
+            for (uint32_t r : drl) {
+                const Point3 nrm = cornerNormal(static_cast<size_t>(r));
+                rn[r * 3 + 0] = nrm.x;
+                rn[r * 3 + 1] = nrm.y;
+                rn[r * 3 + 2] = nrm.z;
+            }
+        }
+        for (uint32_t r : drl) sp.renderDirty[r] = 0;
+    }
+    return 1;
+}
+
+static int FastSparseUpdateFromMNMesh(MNMesh& mn,
+                                      const std::vector<FastVertexSource>& sources,
+                                      FastNormalPlan& plan,
+                                      bool wantNormals) {
+    const int nv = mn.VNum();
+    const int nf = mn.FNum();
+    const size_t n = sources.size();
+    if (nv <= 0 || n == 0) return 0;
+
+    MNNormalSpec* normalSpec = mn.GetSpecifiedNormals();
+    const bool hasSpec = normalSpec &&
+        normalSpec->GetNumFaces() == nf &&
+        normalSpec->GetNumNormals() > 0;
+    if (wantNormals && (!plan.built || plan.hasSpec != hasSpec ||
+                        plan.gatherOff.size() != n + 1)) {
+        BuildFastNormalPlanFromMNMesh(mn, sources, plan);
+        if (plan.sparse) {
+            // Gather table changed — the reverse face→render mapping is stale.
+            plan.sparse->valid = false;
+            plan.sparse->normalsAdjacencyBuilt = false;
+        }
+    }
+    if (!plan.sparse) plan.sparse = std::make_unique<FastSparseState>();
+    FastSparseState& sp = *plan.sparse;
+
+    if (!sp.posAdjacencyBuilt) {
+        sp.ctrlRenderOff.assign(static_cast<size_t>(nv) + 1, 0);
+        for (size_t i = 0; i < n; ++i) sp.ctrlRenderOff[sources[i].controlIdx + 1]++;
+        for (int c = 1; c <= nv; ++c) sp.ctrlRenderOff[c] += sp.ctrlRenderOff[c - 1];
+        sp.ctrlRenderIdx.resize(n);
+        {
+            std::vector<uint32_t> cursor(sp.ctrlRenderOff.begin(), sp.ctrlRenderOff.end() - 1);
+            for (size_t i = 0; i < n; ++i)
+                sp.ctrlRenderIdx[cursor[sources[i].controlIdx]++] = static_cast<uint32_t>(i);
+        }
+        sp.posAdjacencyBuilt = true;
+    }
+
+    if (wantNormals && !sp.normalsAdjacencyBuilt) {
+        // control vert → adjacent faces (all of them — any adjacent face
+        // normal changes when the vertex moves, regardless of smoothing).
+        sp.ctrlFaceOff.assign(static_cast<size_t>(nv) + 1, 0);
+        for (int f = 0; f < nf; ++f) {
+            MNFace* face = mn.F(f);
+            if (!face || face->GetFlag(MN_DEAD)) continue;
+            for (int v = 0; v < face->deg; ++v) {
+                const int c = face->vtx[v];
+                if (c >= 0 && c < nv) sp.ctrlFaceOff[c + 1]++;
+            }
+        }
+        for (int c = 1; c <= nv; ++c) sp.ctrlFaceOff[c] += sp.ctrlFaceOff[c - 1];
+        sp.ctrlFaceIdx.resize(sp.ctrlFaceOff[nv]);
+        {
+            std::vector<uint32_t> cursor(sp.ctrlFaceOff.begin(), sp.ctrlFaceOff.end() - 1);
+            for (int f = 0; f < nf; ++f) {
+                MNFace* face = mn.F(f);
+                if (!face || face->GetFlag(MN_DEAD)) continue;
+                for (int v = 0; v < face->deg; ++v) {
+                    const int c = face->vtx[v];
+                    if (c >= 0 && c < nv) sp.ctrlFaceIdx[cursor[c]++] = static_cast<uint32_t>(f);
                 }
             }
         }
 
-        Point3 accum(0, 0, 0);
-        if (src.smGroup == 0) {
-            accum = validFace ? faceNormals[src.faceIdx] : fallback;
-        } else {
-            const int beg = vertCornerOff[src.controlIdx];
-            const int end = vertCornerOff[src.controlIdx + 1];
-            for (int j = beg; j < end; ++j) {
-                const FastTriCorner& other = vertCornersFlat[j];
-                if ((other.smGrp & src.smGroup) != 0) {
-                    accum += faceNormals[other.faceIdx];
-                }
-            }
-            if (DotProd(accum, accum) <= 1.0e-20f && validFace) {
-                accum = faceNormals[src.faceIdx];
+        // face → render verts that gather it: invert the plan's CSR rows,
+        // plus each corner's own face (covers spec corners with empty rows).
+        sp.faceRenderOff.assign(static_cast<size_t>(nf) + 1, 0);
+        for (size_t i = 0; i < n; ++i) {
+            const int ownFace = sources[i].faceIdx;
+            if (ownFace >= 0 && ownFace < nf) sp.faceRenderOff[ownFace + 1]++;
+            for (uint32_t j = plan.gatherOff[i]; j < plan.gatherOff[i + 1]; ++j)
+                sp.faceRenderOff[plan.gatherFaces[j] + 1]++;
+        }
+        for (int f = 1; f <= nf; ++f) sp.faceRenderOff[f] += sp.faceRenderOff[f - 1];
+        sp.faceRenderIdx.resize(sp.faceRenderOff[nf]);
+        {
+            std::vector<uint32_t> cursor(sp.faceRenderOff.begin(), sp.faceRenderOff.end() - 1);
+            for (size_t i = 0; i < n; ++i) {
+                const int ownFace = sources[i].faceIdx;
+                if (ownFace >= 0 && ownFace < nf)
+                    sp.faceRenderIdx[cursor[ownFace]++] = static_cast<uint32_t>(i);
+                for (uint32_t j = plan.gatherOff[i]; j < plan.gatherOff[i + 1]; ++j)
+                    sp.faceRenderIdx[cursor[plan.gatherFaces[j]]++] = static_cast<uint32_t>(i);
             }
         }
-        const Point3 n = NormalizeNormalOrFallback(accum, fallback);
-        (*outNormals)[i * 3 + 0] = n.x;
-        (*outNormals)[i * 3 + 1] = n.y;
-        (*outNormals)[i * 3 + 2] = n.z;
-    });
-    return true;
+        sp.normalsAdjacencyBuilt = true;
+    }
+
+    const int specNormalCount = hasSpec ? normalSpec->GetNumNormals() : 0;
+    const Point3 fallback(0.0f, 0.0f, 1.0f);
+    const FastVertexSource* srcArr = sources.data();
+    auto getPos = [&mn](int c) { return mn.P(c); };
+    auto faceNormalFn = [&mn](int f) { return ComputeMNMeshFaceNormalSafe(mn, f); };
+    auto cornerNormalFn = [&](size_t i) -> Point3 {
+        const FastVertexSource& src = srcArr[i];
+        const bool validFace = src.faceIdx >= 0 && src.faceIdx < nf;
+        const Point3* fn = plan.faceNormalScratch.data();
+        const int specNid = plan.specId.empty() ? -1 : plan.specId[i];
+        if (specNid >= 0 && specNid < specNormalCount) {
+            return NormalizeNormalOrFallback(normalSpec->Normal(specNid),
+                                             validFace ? fn[src.faceIdx] : fallback);
+        }
+        Point3 accum(0.0f, 0.0f, 0.0f);
+        for (uint32_t j = plan.gatherOff[i]; j < plan.gatherOff[i + 1]; ++j)
+            accum += fn[plan.gatherFaces[j]];
+        if (DotProd(accum, accum) <= 1.0e-20f && validFace) accum = fn[src.faceIdx];
+        return NormalizeNormalOrFallback(accum, fallback);
+    };
+    auto applyFullNormals = [&](std::vector<float>& out) {
+        ApplyFastNormalPlan(mn, sources, plan, out);
+    };
+    return FastSparseUpdateCore(nv, nf, sources, plan, wantNormals,
+                                getPos, faceNormalFn, cornerNormalFn, applyFullNormals);
+}
+
+// Sub-object edit replay: same dispatch contract as ExtractSkinnedFastGeometry
+// but incremental. v1 covers the live Editable Poly / Edit Poly path —
+// exactly the meshes whose sub-object transforms are position-only, which is
+// what makes the sparse diff safe (UV/color edits go through other edit
+// objects and take the full path). Results live in guard.plan.sparse.
+static int ExtractSubobjectSparseGeometry(INode* node,
+                                          TimeValue t,
+                                          const std::vector<FastVertexSource>& sources,
+                                          FastDeformGuard& guard,
+                                          bool wantNormals) {
+    (void)t;
+    if (!node || sources.empty() || !guard.epoch.valid) return 0;
+    if (!guard.epoch.fromLiveMN) return 0;
+    MNMesh* liveMN = TryGetLiveEditablePolyMesh(node);
+    if (!liveMN || !FastDeformEpochMatches(*liveMN, guard.epoch)) return 0;
+    return FastSparseUpdateFromMNMesh(*liveMN, sources, guard.plan, wantNormals);
 }
 
 static bool ExtractSkinnedFastGeometry(INode* node,
                                        TimeValue t,
                                        const std::vector<FastVertexSource>& sources,
+                                       FastDeformGuard& guard,
                                        std::vector<float>& outVerts,
                                        std::vector<float>* outNormals) {
-    if (!node || sources.empty()) return false;
+    if (!node || sources.empty() || !guard.epoch.valid) return false;
 
-    if (MNMesh* liveMN = TryGetLiveEditablePolyMesh(node)) {
-        return ExtractMNMeshFastGeometry(*liveMN, sources, outVerts, outNormals);
+    // Replay the same mesh source the cache was built from (see
+    // ExtractSkinnedFastPositions for why mixing sources corrupts).
+    if (guard.epoch.fromLiveMN) {
+        MNMesh* liveMN = TryGetLiveEditablePolyMesh(node);
+        if (!liveMN) return false;
+        return ExtractMNMeshFastGeometry(*liveMN, sources, guard, outVerts, outNormals);
     }
 
     ObjectState os = node->EvalWorldState(t);
@@ -2289,14 +3002,14 @@ static bool ExtractSkinnedFastGeometry(INode* node,
 
     if (os.obj->IsSubClassOf(polyObjectClassID)) {
         MNMesh& mn = static_cast<PolyObject*>(os.obj)->GetMesh();
-        return ExtractMNMeshFastGeometry(mn, sources, outVerts, outNormals);
+        return ExtractMNMeshFastGeometry(mn, sources, guard, outVerts, outNormals);
     }
 
     if (!os.obj->CanConvertToType(Class_ID(TRIOBJ_CLASS_ID, 0))) return false;
     TriObject* tri = static_cast<TriObject*>(os.obj->ConvertToType(t, Class_ID(TRIOBJ_CLASS_ID, 0)));
     if (!tri) return false;
 
-    bool ok = ExtractMeshFastGeometry(tri->GetMesh(), sources, outVerts, outNormals);
+    bool ok = ExtractMeshFastGeometry(tri->GetMesh(), sources, guard, outVerts, outNormals);
     if (tri != os.obj) tri->DeleteThis();
     return ok;
 }

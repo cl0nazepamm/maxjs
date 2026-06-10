@@ -1025,8 +1025,7 @@
         mtlScalarHashMap_.clear();
         mtlFastScalarHashMap_.clear();
         ClearMaterialEditHandleCache();
-        skinnedControlIdxCache_.clear();
-        skinnedFastSourceCache_.clear();
+        ClearFastDeformState();
         lastSkinnedLivePollTick_ = 0;
         haveLastTimerTime_ = false;
         lastTimerTime_ = 0;

@@ -50,6 +50,16 @@
     std::unordered_set<ULONG> skinnedHandles_;             // geom handles with Skin modifier
     std::unordered_map<ULONG, std::vector<int>> skinnedControlIdxCache_; // render vertex -> control vertex
     std::unordered_map<ULONG, std::vector<FastVertexSource>> skinnedFastSourceCache_; // render vertex -> normal/position source
+    std::unordered_map<ULONG, FastDeformGuard> fastDeformGuardMap_; // topology epoch + normal gather plan guarding the two caches above
+    struct FastDeformSharedBufferSlot {
+        ComPtr<ICoreWebView2SharedBuffer> buf;
+        UINT64 capacity = 0;
+    };
+    struct FastDeformSharedBufferPool {
+        FastDeformSharedBufferSlot slots[2];
+        int next = 0;
+    };
+    std::unordered_map<ULONG, FastDeformSharedBufferPool> fastDeformSharedBuffers_; // persistent double-buffered geo_fast payload buffers
     ULONGLONG lastSkinnedLivePollTick_ = 0;
     ULONGLONG lastCameraLivePollTick_ = 0;
     ULONGLONG lastRedrawLivePollTick_ = 0;

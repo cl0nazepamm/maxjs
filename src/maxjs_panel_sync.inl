@@ -88,6 +88,70 @@
         haveLastSentCamera_ = true;
     }
 
+    // ── Fast-deform cache lifecycle. The replay caches, their topology
+    //    epoch/normal-plan guard, and the persistent shared buffers must be
+    //    invalidated together; these helpers are the only mutation points. ──
+    void EraseFastDeformReplayState(ULONG handle) {
+        skinnedControlIdxCache_.erase(handle);
+        skinnedFastSourceCache_.erase(handle);
+        fastDeformGuardMap_.erase(handle);
+    }
+
+    void CloseFastDeformSharedBuffers(ULONG handle) {
+        auto it = fastDeformSharedBuffers_.find(handle);
+        if (it == fastDeformSharedBuffers_.end()) return;
+        for (auto& slot : it->second.slots) {
+            if (slot.buf) slot.buf->Close();
+        }
+        fastDeformSharedBuffers_.erase(it);
+    }
+
+    void EraseFastDeformState(ULONG handle) {
+        EraseFastDeformReplayState(handle);
+        CloseFastDeformSharedBuffers(handle);
+    }
+
+    void ClearFastDeformState() {
+        skinnedControlIdxCache_.clear();
+        skinnedFastSourceCache_.clear();
+        fastDeformGuardMap_.clear();
+        for (auto& entry : fastDeformSharedBuffers_) {
+            for (auto& slot : entry.second.slots) {
+                if (slot.buf) slot.buf->Close();
+            }
+        }
+        fastDeformSharedBuffers_.clear();
+    }
+
+    void PruneFastDeformState() {
+        auto stale = [this](ULONG handle) {
+            return skinnedHandles_.find(handle) == skinnedHandles_.end() &&
+                   deformHandles_.find(handle) == deformHandles_.end();
+        };
+        for (auto it = skinnedControlIdxCache_.begin(); it != skinnedControlIdxCache_.end(); ) {
+            if (stale(it->first)) it = skinnedControlIdxCache_.erase(it);
+            else ++it;
+        }
+        for (auto it = skinnedFastSourceCache_.begin(); it != skinnedFastSourceCache_.end(); ) {
+            if (stale(it->first)) it = skinnedFastSourceCache_.erase(it);
+            else ++it;
+        }
+        for (auto it = fastDeformGuardMap_.begin(); it != fastDeformGuardMap_.end(); ) {
+            if (stale(it->first)) it = fastDeformGuardMap_.erase(it);
+            else ++it;
+        }
+        for (auto it = fastDeformSharedBuffers_.begin(); it != fastDeformSharedBuffers_.end(); ) {
+            if (stale(it->first)) {
+                for (auto& slot : it->second.slots) {
+                    if (slot.buf) slot.buf->Close();
+                }
+                it = fastDeformSharedBuffers_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
     bool ShouldOmitGeometryFastChannels(INode* node, TimeValue t) {
         if (!node) return false;
         const ULONG handle = node->GetHandle();
@@ -2193,8 +2257,7 @@
             audioHashMap_.clear();
             gltfHashMap_.clear();
             geoScanCursor_ = 0;
-            skinnedControlIdxCache_.clear();
-            skinnedFastSourceCache_.clear();
+            ClearFastDeformState();
             lastSkinnedLivePollTick_ = 0;
             lastCameraLivePollTick_ = 0;
             lastRedrawLivePollTick_ = 0;
@@ -2375,6 +2438,26 @@
                 isDeforming &&
                 NodeHasExtractableVertexColors(node, t);
 
+            // Sub-object sparse replay: while a vertex/edge/face drag is
+            // active on a live Editable Poly, geometry changes are
+            // position-only, the topology epoch holds, and the sparse state
+            // can diff + patch just the moved region instead of re-extracting
+            // the whole mesh every tick. (Unwrap / Edit Normals / paint edit
+            // contexts never produce a fromLiveMN epoch on this path, so they
+            // keep the full extract and their channel edits stream live.)
+            auto guardIt = fastDeformGuardMap_.find(handle);
+            const bool subobjectSparseEligible =
+                !isDeforming && !forceFullGeometry &&
+                node->Selected() &&
+                IsSubObjectEditingActive() &&
+                guardIt != fastDeformGuardMap_.end() &&
+                guardIt->second.epoch.valid &&
+                guardIt->second.epoch.fromLiveMN;
+            const bool sparsePrimed =
+                subobjectSparseEligible &&
+                guardIt->second.plan.sparse &&
+                guardIt->second.plan.sparse->valid;
+
             // Hash-dedupe before extracting. RailClone / Forest Pack / TyFlow
             // (and Max itself) fire spurious ControllerStructured events when
             // the viewport redraws, even if the generated mesh is byte-identical
@@ -2389,7 +2472,11 @@
             // hash would EvalWorldState once before SendGeometryFastUpdate
             // evaluates again to extract positions. That duplicate eval was a
             // direct source of choppy Max playback.
-            if (!preferPositionOnlyDeformSync) {
+            //
+            // Skip it for a primed sparse edit session too — the position
+            // diff inside the sparse path IS the change detector there, at a
+            // fraction of the full-state hash cost.
+            if (!preferPositionOnlyDeformSync && !sparsePrimed) {
                 uint64_t preHash = 0;
                 auto it = geoHashMap_.find(handle);
                 if (it != geoHashMap_.end() &&
@@ -2415,24 +2502,50 @@
             // need the full ExtractMesh path so UV/topology changes are not
             // silently dropped.
             bool usedSkinnedFastPositions = false;
-            if (wv17 && env12 && isDeforming && !forceFullGeometry &&
-                (!hasVertexColors || preferPositionOnlyDeformSync)) {
-                // Timeline/interactive deformation is latency-bound, not
-                // normal-bound. Normal extraction is exactly the expensive path
-                // on faceted Editable Mesh input: it walks smoothing islands
-                // and can multiply render vertices. Keep the current normal
-                // buffer while Max is playing or scrubbing; idle/full sync can
-                // refresh normals after the time slider settles.
-                const bool streamLiveNormals = !omitFastChannels && !preferPositionOnlyDeformSync;
-                auto sourceIt = skinnedFastSourceCache_.find(handle);
-                if (sourceIt != skinnedFastSourceCache_.end()) {
-                    usedSkinnedFastPositions = ExtractSkinnedFastGeometry(
-                        node, t, sourceIt->second, verts, streamLiveNormals ? &norms : nullptr);
-                }
-                if (!usedSkinnedFastPositions) {
-                    auto cacheIt = skinnedControlIdxCache_.find(handle);
-                    if (cacheIt != skinnedControlIdxCache_.end()) {
-                        usedSkinnedFastPositions = ExtractSkinnedFastPositions(node, t, cacheIt->second, verts);
+            const FastSparseState* sparsePayload = nullptr;
+            const bool streamLiveNormals = !omitFastChannels;
+            if (wv17 && env12 && !forceFullGeometry && guardIt != fastDeformGuardMap_.end()) {
+                if (isDeforming && (!hasVertexColors || preferPositionOnlyDeformSync)) {
+                    // The precomputed FastNormalPlan turns the per-frame normal
+                    // pass into face normals + a CSR gather with zero allocations,
+                    // so live normals stay on during timeline playback/scrubbing
+                    // too (they used to be frozen here for performance).
+                    auto sourceIt = skinnedFastSourceCache_.find(handle);
+                    if (sourceIt != skinnedFastSourceCache_.end()) {
+                        usedSkinnedFastPositions = ExtractSkinnedFastGeometry(
+                            node, t, sourceIt->second, guardIt->second,
+                            verts, streamLiveNormals ? &norms : nullptr);
+                    }
+                    if (!usedSkinnedFastPositions) {
+                        auto cacheIt = skinnedControlIdxCache_.find(handle);
+                        if (cacheIt != skinnedControlIdxCache_.end()) {
+                            usedSkinnedFastPositions = ExtractSkinnedFastPositions(
+                                node, t, cacheIt->second, guardIt->second.epoch, verts);
+                        }
+                    }
+                    if (!usedSkinnedFastPositions) {
+                        // Topology epoch tripped (dynamic tessellation while
+                        // dragging, modifier toggle, …). Drop the stale caches
+                        // so this tick re-extracts full geometry with real
+                        // indices and the viewer rebuilds, instead of stamping
+                        // re-mapped positions onto old topology.
+                        EraseFastDeformReplayState(handle);
+                    }
+                } else if (subobjectSparseEligible) {
+                    auto sourceIt = skinnedFastSourceCache_.find(handle);
+                    if (sourceIt != skinnedFastSourceCache_.end()) {
+                        const int sparseResult = ExtractSubobjectSparseGeometry(
+                            node, t, sourceIt->second, guardIt->second, streamLiveNormals);
+                        if (sparseResult == 2) continue;  // positions identical — nothing to send
+                        if (sparseResult == 1) {
+                            usedSkinnedFastPositions = true;
+                            sparsePayload = guardIt->second.plan.sparse.get();
+                        } else {
+                            // Epoch tripped mid-edit (Cut/Connect/tessellation
+                            // changed topology) — same recovery as the deform
+                            // path: full re-extract this tick.
+                            EraseFastDeformReplayState(handle);
+                        }
                     }
                 }
             }
@@ -2440,10 +2553,11 @@
             std::vector<VertexColorAttributeRecord> vertexColors;
             std::vector<int> controlIdx;
             std::vector<FastVertexSource> fastSources;
+            FastDeformTopoEpoch fastEpoch;
             std::vector<float>* extractNormals =
                 (omitFastChannels || preferPositionOnlyDeformSync) ? nullptr : &norms;
             if (!usedSkinnedFastPositions &&
-                !ExtractMesh(node, t, verts, uvs, indices, groups, extractNormals, &controlIdx, &vertexColors, &fastSources, nullptr, !omitFastChannels)) {
+                !ExtractMesh(node, t, verts, uvs, indices, groups, extractNormals, &controlIdx, &vertexColors, &fastSources, nullptr, !omitFastChannels, &fastEpoch)) {
                 ObjectState os = node->EvalWorldState(t);
                 if (!ShouldExtractRenderableShape(node, t, &os) ||
                     !ExtractSpline(node, t, verts, indices)) {
@@ -2467,15 +2581,17 @@
                     else
                         deformChannelHashMap_.erase(handle);
                 }
-                if (!isSpline && controlIdx.size() * 3 == verts.size()) {
+                if (!isSpline && controlIdx.size() * 3 == verts.size() && fastEpoch.valid) {
                     skinnedControlIdxCache_[handle] = std::move(controlIdx);
                     if (fastSources.size() * 3 == verts.size())
                         skinnedFastSourceCache_[handle] = std::move(fastSources);
                     else
                         skinnedFastSourceCache_.erase(handle);
+                    FastDeformGuard& guard = fastDeformGuardMap_[handle];
+                    guard.epoch = fastEpoch;
+                    guard.plan = FastNormalPlan{};  // topology may have changed — rebuild lazily
                 } else {
-                    skinnedControlIdxCache_.erase(handle);
-                    skinnedFastSourceCache_.erase(handle);
+                    EraseFastDeformReplayState(handle);
                 }
             }
 
@@ -2483,9 +2599,16 @@
             GetJsModData(node, t, jmFast);
 
             if (wv17 && env12) {
-                size_t totalBytes = verts.size() * 4;
+                // Sparse sub-object replay streams from the persistent session
+                // buffers; every other path streams the locally extracted data.
+                const std::vector<float>& vertsBin =
+                    sparsePayload ? sparsePayload->renderPos : verts;
+                const std::vector<float>& normsBin =
+                    (sparsePayload && !sparsePayload->renderNorms.empty())
+                        ? sparsePayload->renderNorms : norms;
+                size_t totalBytes = vertsBin.size() * 4;
                 if (usedSkinnedFastPositions) {
-                    totalBytes += norms.size() * 4;
+                    totalBytes += normsBin.size() * 4;
                 } else {
                     totalBytes += indices.size() * 4 + uvs.size() * 4 + norms.size() * 4;
                     for (const VertexColorAttributeRecord& attr : vertexColors) {
@@ -2495,28 +2618,47 @@
                 if (totalBytes < 4) totalBytes = 4;
 
                 ComPtr<ICoreWebView2SharedBuffer> buf;
-                if (FAILED(env12->CreateSharedBuffer(totalBytes, &buf)) || !buf) continue;
+                if (usedSkinnedFastPositions) {
+                    // Deform replay has a stable payload size per topology
+                    // epoch — reuse a persistent double-buffered SharedBuffer
+                    // instead of paying a new file mapping every frame. Two
+                    // slots alternate so the renderer can still be reading the
+                    // previous post while this one is filled.
+                    FastDeformSharedBufferPool& pool = fastDeformSharedBuffers_[handle];
+                    FastDeformSharedBufferSlot& slot = pool.slots[pool.next & 1];
+                    pool.next ^= 1;
+                    if (!slot.buf || slot.capacity < totalBytes) {
+                        if (slot.buf) slot.buf->Close();
+                        slot.buf.Reset();
+                        slot.capacity = 0;
+                        if (FAILED(env12->CreateSharedBuffer(totalBytes, &slot.buf)) || !slot.buf) continue;
+                        slot.capacity = totalBytes;
+                    }
+                    buf = slot.buf;
+                } else if (FAILED(env12->CreateSharedBuffer(totalBytes, &buf)) || !buf) {
+                    continue;
+                }
 
                 BYTE* ptr = nullptr;
                 buf->get_Buffer(&ptr);
                 size_t off = 0;
-                memcpy(ptr + off, verts.data(), verts.size() * 4); size_t vOff = off; off += verts.size() * 4;
+                StreamCopyBytes(ptr + off, vertsBin.data(), vertsBin.size() * 4); size_t vOff = off; off += vertsBin.size() * 4;
                 size_t iOff = 0;
                 size_t uvOff = 0;
                 size_t nOff = 0;
                 if (usedSkinnedFastPositions) {
                     nOff = off;
-                    if (!norms.empty()) { memcpy(ptr + off, norms.data(), norms.size() * 4); off += norms.size() * 4; }
+                    if (!normsBin.empty()) { StreamCopyBytes(ptr + off, normsBin.data(), normsBin.size() * 4); off += normsBin.size() * 4; }
                 } else {
-                    memcpy(ptr + off, indices.data(), indices.size() * 4); iOff = off; off += indices.size() * 4;
+                    StreamCopyBytes(ptr + off, indices.data(), indices.size() * 4); iOff = off; off += indices.size() * 4;
                     uvOff = off;
-                    if (!uvs.empty()) { memcpy(ptr + off, uvs.data(), uvs.size() * 4); off += uvs.size() * 4; }
+                    if (!uvs.empty()) { StreamCopyBytes(ptr + off, uvs.data(), uvs.size() * 4); off += uvs.size() * 4; }
                     nOff = off;
-                    if (!norms.empty()) { memcpy(ptr + off, norms.data(), norms.size() * 4); off += norms.size() * 4; }
+                    if (!norms.empty()) { StreamCopyBytes(ptr + off, norms.data(), norms.size() * 4); off += norms.size() * 4; }
                     for (VertexColorAttributeRecord& attr : vertexColors) {
                         attr.off = off;
                         if (!attr.values.empty()) {
-                            memcpy(ptr + off, attr.values.data(), attr.values.size() * sizeof(float));
+                            StreamCopyBytes(ptr + off, attr.values.data(), attr.values.size() * sizeof(float));
                             off += attr.values.size() * sizeof(float);
                         }
                     }
@@ -2528,9 +2670,9 @@
                 ss << L",\"jsmod\":" << (jmFast.found ? L"true" : L"false");
                 if (omitFastChannels) ss << L",\"compactChannels\":true";
                 if (isSpline) ss << L",\"spline\":true";
-                ss << L",\"vOff\":" << vOff << L",\"vN\":" << verts.size();
+                ss << L",\"vOff\":" << vOff << L",\"vN\":" << vertsBin.size();
                 if (usedSkinnedFastPositions) {
-                    if (!norms.empty()) ss << L",\"nOff\":" << nOff << L",\"nN\":" << norms.size();
+                    if (!normsBin.empty()) ss << L",\"nOff\":" << nOff << L",\"nN\":" << normsBin.size();
                     ss << L",\"skipBounds\":true";
                 } else {
                     ss << L",\"iOff\":" << iOff << L",\"iN\":" << indices.size();
@@ -2837,8 +2979,7 @@
                 gltfHashMap_.erase(handle);
                 geoHashMap_.erase(handle);
                 deformChannelHashMap_.erase(handle);
-                skinnedControlIdxCache_.erase(handle);
-                skinnedFastSourceCache_.erase(handle);
+                EraseFastDeformState(handle);
                 geomHandles_.erase(handle);
                 lightHandles_.erase(handle);
                 splatHandles_.erase(handle);
@@ -3065,8 +3206,7 @@
                 lightHashMap_.erase(handle);
                 geoHashMap_.erase(handle);
                 deformChannelHashMap_.erase(handle);
-                skinnedControlIdxCache_.erase(handle);
-                skinnedFastSourceCache_.erase(handle);
+                EraseFastDeformState(handle);
                 lastSentTransforms_.erase(handle);
                 if (isHelper) helperHandles_.erase(handle);
                 else geomHandles_.erase(handle);

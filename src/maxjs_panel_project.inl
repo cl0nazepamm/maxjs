@@ -164,8 +164,7 @@
         groupCache_.clear();
         lastBBoxHash_.clear();
         lastLiveGeomHash_.clear();
-        skinnedControlIdxCache_.clear();
-        skinnedFastSourceCache_.clear();
+        ClearFastDeformState();
         lastSkinnedLivePollTick_ = 0;
         haveLastTimerTime_ = false;
         lastTimerTime_ = 0;

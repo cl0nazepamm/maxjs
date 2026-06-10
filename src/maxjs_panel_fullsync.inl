@@ -28,16 +28,7 @@
         bool first = true;
         MaterialLibraryBuilder materialLibrary;
         WriteSceneNodes(root, t, ss, first, prevGeom, materialLibrary);
-        for (auto it = skinnedControlIdxCache_.begin(); it != skinnedControlIdxCache_.end(); ) {
-            if (skinnedHandles_.find(it->first) == skinnedHandles_.end() &&
-                deformHandles_.find(it->first) == deformHandles_.end()) it = skinnedControlIdxCache_.erase(it);
-            else ++it;
-        }
-        for (auto it = skinnedFastSourceCache_.begin(); it != skinnedFastSourceCache_.end(); ) {
-            if (skinnedHandles_.find(it->first) == skinnedHandles_.end() &&
-                deformHandles_.find(it->first) == deformHandles_.end()) it = skinnedFastSourceCache_.erase(it);
-            else ++it;
-        }
+        PruneFastDeformState();
         ss << L"],";
         WriteMaterialLibraryJson(ss, materialLibrary);
         ss << L",";
@@ -281,7 +272,8 @@
                 // stable deforming modifier (Skin, Path Deform, Bend, FFD, etc.)
                 // can then route through the fast-positions path instead of
                 // the full ExtractMesh (smaller payload, single EvalWorldState).
-                bool extracted = ExtractMesh(node, t, verts, uvs, indices, groups, &norms, &controlIdx, &vertexColors, &fastSources, &uv2s);
+                FastDeformTopoEpoch fastEpoch;
+                bool extracted = ExtractMesh(node, t, verts, uvs, indices, groups, &norms, &controlIdx, &vertexColors, &fastSources, &uv2s, true, &fastEpoch);
 
                 // Spline fallback — extract as line geometry
                 bool isSpline = false;
@@ -303,12 +295,15 @@
                     }
                     groupCache_[handle] = groups;
                     if (isSkinned) skinnedHandles_.insert(handle);
-                    if (!isSpline && controlIdx.size() * 3 == verts.size()) {
+                    if (!isSpline && controlIdx.size() * 3 == verts.size() && fastEpoch.valid) {
                         skinnedControlIdxCache_[handle] = std::move(controlIdx);
                         if (fastSources.size() * 3 == verts.size())
                             skinnedFastSourceCache_[handle] = std::move(fastSources);
                         else
                             skinnedFastSourceCache_.erase(handle);
+                        FastDeformGuard& guard = fastDeformGuardMap_[handle];
+                        guard.epoch = fastEpoch;
+                        guard.plan = FastNormalPlan{};
                         // If this mesh has a modifier stack it can deform without
                         // firing a node event (e.g. Path Deform driven by time).
                         // Mark it for per-frame polling so playback catches it
@@ -319,8 +314,7 @@
                             deformHandles_.erase(handle);
                         }
                     } else {
-                        skinnedControlIdxCache_.erase(handle);
-                        skinnedFastSourceCache_.erase(handle);
+                        EraseFastDeformReplayState(handle);
                         deformHandles_.erase(handle);
                     }
 
@@ -551,6 +545,11 @@
                             skinnedControlIdxCache_[ng.handle] = skinnedControlIdxCache_[ng.instOfHandle];
                         if (skinnedFastSourceCache_.count(ng.instOfHandle))
                             skinnedFastSourceCache_[ng.handle] = skinnedFastSourceCache_[ng.instOfHandle];
+                        if (fastDeformGuardMap_.count(ng.instOfHandle)) {
+                            // Instances share topology — the epoch and the
+                            // normal gather plan are both valid as-is.
+                            fastDeformGuardMap_[ng.handle] = fastDeformGuardMap_[ng.instOfHandle];
+                        }
                     }
                     geos.push_back(std::move(ng));
                     geomHandles_.insert(node->GetHandle());
@@ -561,8 +560,9 @@
                     const bool isSkinned = FindModifierOnNode(node, SKIN_CLASSID) != nullptr;
                     std::vector<int> controlIdx;
                     std::vector<FastVertexSource> fastSources;
+                    FastDeformTopoEpoch fastEpoch;
                     bool extracted = ExtractMesh(node, t, ng.verts, ng.uvs, ng.indices, ng.groups,
-                        &ng.norms, &controlIdx, &ng.vertexColors, &fastSources, &ng.uv2s);
+                        &ng.norms, &controlIdx, &ng.vertexColors, &fastSources, &ng.uv2s, true, &fastEpoch);
                     if (!extracted && ShouldExtractRenderableShape(node, t, &os)) {
                         extracted = ExtractSpline(node, t, ng.verts, ng.indices);
                         ng.spline = extracted;
@@ -598,20 +598,22 @@
                         lastBBoxHash_[ng.handle] = MakeGeomValidityKey(gv);
                     }
                     if (isSkinned) skinnedHandles_.insert(node->GetHandle());
-                    if (!ng.spline && controlIdx.size() * 3 == ng.verts.size()) {
+                    if (!ng.spline && controlIdx.size() * 3 == ng.verts.size() && fastEpoch.valid) {
                         skinnedControlIdxCache_[ng.handle] = std::move(controlIdx);
                         if (fastSources.size() * 3 == ng.verts.size())
                             skinnedFastSourceCache_[ng.handle] = std::move(fastSources);
                         else
                             skinnedFastSourceCache_.erase(ng.handle);
+                        FastDeformGuard& guard = fastDeformGuardMap_[ng.handle];
+                        guard.epoch = fastEpoch;
+                        guard.plan = FastNormalPlan{};
                         if (NodeHasModifierStack(node)) {
                             deformHandles_.insert(ng.handle);
                         } else {
                             deformHandles_.erase(ng.handle);
                         }
                     } else {
-                        skinnedControlIdxCache_.erase(ng.handle);
-                        skinnedFastSourceCache_.erase(ng.handle);
+                        EraseFastDeformReplayState(ng.handle);
                         deformHandles_.erase(ng.handle);
                     }
 
@@ -698,16 +700,7 @@
             if (geomHandles_.find(it->first) == geomHandles_.end()) it = deformChannelHashMap_.erase(it);
             else ++it;
         }
-        for (auto it = skinnedControlIdxCache_.begin(); it != skinnedControlIdxCache_.end(); ) {
-            if (skinnedHandles_.find(it->first) == skinnedHandles_.end() &&
-                deformHandles_.find(it->first) == deformHandles_.end()) it = skinnedControlIdxCache_.erase(it);
-            else ++it;
-        }
-        for (auto it = skinnedFastSourceCache_.begin(); it != skinnedFastSourceCache_.end(); ) {
-            if (skinnedHandles_.find(it->first) == skinnedHandles_.end() &&
-                deformHandles_.find(it->first) == deformHandles_.end()) it = skinnedFastSourceCache_.erase(it);
-            else ++it;
-        }
+        PruneFastDeformState();
 
         // Create shared buffer
         if (totalBytes == 0) totalBytes = 4;  // min size
@@ -755,17 +748,17 @@
 
             // Geometry: byte offsets into shared buffer (or -1 if unchanged)
             if (ng.changed) {
-                memcpy(bufPtr + ng.vOff, ng.verts.data(), ng.verts.size() * sizeof(float));
-                memcpy(bufPtr + ng.iOff, ng.indices.data(), ng.indices.size() * sizeof(int));
+                StreamCopyBytes(bufPtr + ng.vOff, ng.verts.data(), ng.verts.size() * sizeof(float));
+                StreamCopyBytes(bufPtr + ng.iOff, ng.indices.data(), ng.indices.size() * sizeof(int));
                 if (!ng.uvs.empty())
-                    memcpy(bufPtr + ng.uvOff, ng.uvs.data(), ng.uvs.size() * sizeof(float));
+                    StreamCopyBytes(bufPtr + ng.uvOff, ng.uvs.data(), ng.uvs.size() * sizeof(float));
                 if (!ng.uv2s.empty())
-                    memcpy(bufPtr + ng.uv2Off, ng.uv2s.data(), ng.uv2s.size() * sizeof(float));
+                    StreamCopyBytes(bufPtr + ng.uv2Off, ng.uv2s.data(), ng.uv2s.size() * sizeof(float));
                 if (!ng.norms.empty())
-                    memcpy(bufPtr + ng.nOff, ng.norms.data(), ng.norms.size() * sizeof(float));
+                    StreamCopyBytes(bufPtr + ng.nOff, ng.norms.data(), ng.norms.size() * sizeof(float));
                 for (const VertexColorAttributeRecord& attr : ng.vertexColors) {
                     if (!attr.values.empty()) {
-                        memcpy(bufPtr + attr.off, attr.values.data(), attr.values.size() * sizeof(float));
+                        StreamCopyBytes(bufPtr + attr.off, attr.values.data(), attr.values.size() * sizeof(float));
                     }
                 }
 
@@ -978,8 +971,7 @@
                 gltfHashMap_.erase(handle);
                 geoHashMap_.erase(handle);
                 deformChannelHashMap_.erase(handle);
-                skinnedControlIdxCache_.erase(handle);
-                skinnedFastSourceCache_.erase(handle);
+                EraseFastDeformState(handle);
                 selectionDirtyHandles_.erase(handle);
                 helperHandles_.erase(handle);
                 lastSentTransforms_.erase(handle);

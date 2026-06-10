@@ -342,8 +342,20 @@
                     return;
                 }
 
-                // Fast path: just mark dirty. SendGeometryFastUpdate will do
-                // the one EvalWorldState we actually need (for data extraction).
+                // Sampled-position gate: deformHandles_ holds EVERY node with
+                // a modifier stack, not just animated ones, and this lane used
+                // to mark all of them dirty unconditionally — so a heavy scene
+                // re-extracted and re-sent every static UVW-Map/Edit-Poly mesh
+                // on every playback tick. The ~256-probe hash costs microseconds
+                // (EvalWorldState is cached at an unchanged time) and lets the
+                // genuinely static majority skip extraction and send entirely.
+                uint64_t geomHash = 0;
+                if (TryHashAdaptiveDeformPositions(node, t, geomHash)) {
+                    auto it = lastLiveGeomHash_.find(handle);
+                    if (it != lastLiveGeomHash_.end() && it->second == geomHash) return;
+                    lastLiveGeomHash_[handle] = geomHash;
+                }
+
                 geoHashMap_.erase(handle);
                 geoFastDirtyHandles_.insert(handle);
                 changed = true;
@@ -362,20 +374,7 @@
             // when nothing changed. This path does EvalWorldState, but only
             // fires when the scene is truly idle — the cost is acceptable.
             uint64_t geomHash = 0;
-            ObjectState os = node->EvalWorldState(t);
-            if (!os.obj || os.obj->SuperClassID() != GEOMOBJECT_CLASS_ID) return;
-            if (os.obj->IsSubClassOf(polyObjectClassID)) {
-                PolyObject* poly = static_cast<PolyObject*>(os.obj);
-                MNMesh& mn = poly->GetMesh();
-                geomHash = HashAdaptiveSkinnedPositions(mn);
-            } else if (os.obj->CanConvertToType(Class_ID(TRIOBJ_CLASS_ID, 0))) {
-                TriObject* tri = static_cast<TriObject*>(
-                    os.obj->ConvertToType(t, Class_ID(TRIOBJ_CLASS_ID, 0)));
-                if (!tri) return;
-                Mesh& mesh = tri->GetMesh();
-                geomHash = HashAdaptiveSkinnedPositions(mesh);
-                if (tri != os.obj) tri->DeleteThis();
-            } else return;
+            if (!TryHashAdaptiveDeformPositions(node, t, geomHash)) return;
             auto it = lastLiveGeomHash_.find(handle);
             if (it != lastLiveGeomHash_.end() && it->second == geomHash) return;
             lastLiveGeomHash_[handle] = geomHash;

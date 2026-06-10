@@ -19,12 +19,31 @@
 #include <cmath>
 #include <cstdint>
 #include <immintrin.h>
+#include <intrin.h>
 #include <memory>
 #include <sstream>
 #include <string>
 #include <unordered_map>
 #include <vector>
 #include <ppl.h>
+
+// Runtime AVX2 dispatch — Max 2026's official baseline is SSE4.2, so the
+// AVX2 kernels are CPUID-gated instead of compiled with /arch:AVX2 (MSVC
+// emits VEX for _mm256 intrinsics without the flag, so mixing is safe as
+// long as the guarded paths never execute on older CPUs).
+static bool DetectAvx2Support() {
+    int info[4] = {};
+    __cpuid(info, 0);
+    if (info[0] < 7) return false;
+    __cpuid(info, 1);
+    const bool osxsave = (info[2] & (1 << 27)) != 0;
+    const bool avx = (info[2] & (1 << 28)) != 0;
+    if (!osxsave || !avx) return false;
+    if ((_xgetbv(0) & 0x6) != 0x6) return false; // OS saves ymm state
+    __cpuidex(info, 7, 0);
+    return (info[1] & (1 << 5)) != 0; // AVX2
+}
+inline const bool g_maxjsHasAvx2 = DetectAvx2Support();
 
 static float SafeJsonFloat(float value, float fallback = 0.0f) {
     if (!std::isfinite(value)) return fallback;
@@ -674,6 +693,28 @@ static uint64_t HashAdaptiveSkinnedPositions(MNMesh& mn) {
     return h;
 }
 
+// Sampled position hash for deform-handle change gating. Cheap enough
+// (≤ kSkinnedHashSampleCount probes) to run per node per playback tick —
+// static modifier-stack nodes (UVW Map, dormant Edit Poly, …) get skipped
+// outright instead of re-extracting and re-sending every frame.
+static bool TryHashAdaptiveDeformPositions(INode* node, TimeValue t, uint64_t& outHash) {
+    if (!node) return false;
+    ObjectState os = node->EvalWorldState(t);
+    if (!os.obj || os.obj->SuperClassID() != GEOMOBJECT_CLASS_ID) return false;
+    if (os.obj->IsSubClassOf(polyObjectClassID)) {
+        MNMesh& mn = static_cast<PolyObject*>(os.obj)->GetMesh();
+        outHash = HashAdaptiveSkinnedPositions(mn);
+        return true;
+    }
+    if (!os.obj->CanConvertToType(Class_ID(TRIOBJ_CLASS_ID, 0))) return false;
+    TriObject* tri = static_cast<TriObject*>(
+        os.obj->ConvertToType(t, Class_ID(TRIOBJ_CLASS_ID, 0)));
+    if (!tri) return false;
+    outHash = HashAdaptiveSkinnedPositions(tri->GetMesh());
+    if (tri != os.obj) tri->DeleteThis();
+    return true;
+}
+
 static MNMesh* TryGetLiveEditablePolyMesh(INode* node) {
     if (!node) return nullptr;
 
@@ -881,11 +922,42 @@ static void BatchNormalizeSSE(float* data, size_t count) {
 // The CPU never reads those bytes back — the renderer process does — so a
 // regular memcpy evicts megabytes of useful cache per frame at playback
 // rates. Streaming stores bypass the cache hierarchy entirely.
+static void StreamCopyBytesAvx2(unsigned char* dst, const unsigned char* src, size_t bytes) {
+    const size_t head = (32 - (reinterpret_cast<uintptr_t>(dst) & 31)) & 31;
+    if (head) {
+        memcpy(dst, src, head);
+        dst += head;
+        src += head;
+        bytes -= head;
+    }
+    size_t blocks = bytes / 128;
+    while (blocks--) {
+        const __m256i a = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src));
+        const __m256i b = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + 32));
+        const __m256i c = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + 64));
+        const __m256i d = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + 96));
+        _mm256_stream_si256(reinterpret_cast<__m256i*>(dst), a);
+        _mm256_stream_si256(reinterpret_cast<__m256i*>(dst + 32), b);
+        _mm256_stream_si256(reinterpret_cast<__m256i*>(dst + 64), c);
+        _mm256_stream_si256(reinterpret_cast<__m256i*>(dst + 96), d);
+        src += 128;
+        dst += 128;
+    }
+    _mm_sfence();
+    _mm256_zeroupper();
+    const size_t tail = bytes & 127;
+    if (tail) memcpy(dst, src, tail);
+}
+
 static void StreamCopyBytes(void* dstRaw, const void* srcRaw, size_t bytes) {
     unsigned char* dst = static_cast<unsigned char*>(dstRaw);
     const unsigned char* src = static_cast<const unsigned char*>(srcRaw);
     if (bytes < 4096) {
         memcpy(dst, src, bytes);
+        return;
+    }
+    if (g_maxjsHasAvx2) {
+        StreamCopyBytesAvx2(dst, src, bytes);
         return;
     }
 
@@ -919,6 +991,83 @@ static void StreamCopyBytes(void* dstRaw, const void* srcRaw, size_t bytes) {
 static Point3 NormalizeNormalOrFallback(const Point3& value, const Point3& fallback = Point3(0.0f, 0.0f, 1.0f)) {
     if (!std::isfinite(value.x) || !std::isfinite(value.y) || !std::isfinite(value.z)) return fallback;
     return DotProd(value, value) > 1.0e-20f ? NormalizeSSE(value) : fallback;
+}
+
+// Normalize an interleaved xyz array in place. Degenerate / non-finite
+// vectors become (0,0,1), matching NormalizeNormalOrFallback's default
+// fallback. AVX2 path computes 8 inverse lengths per iteration via strided
+// gathers + rsqrt with one Newton-Raphson refinement.
+static void BatchNormalizeNormalsInPlace(float* data, size_t count) {
+    size_t i = 0;
+    if (g_maxjsHasAvx2 && count >= 8) {
+        alignas(32) static const int kStride3[8] = { 0, 3, 6, 9, 12, 15, 18, 21 };
+        const __m256i idx = _mm256_load_si256(reinterpret_cast<const __m256i*>(kStride3));
+        const __m256 minLen2 = _mm256_set1_ps(1.0e-20f);
+        const __m256 maxLen2 = _mm256_set1_ps(3.0e38f);
+        const __m256 half = _mm256_set1_ps(0.5f);
+        const __m256 three = _mm256_set1_ps(3.0f);
+        for (; i + 8 <= count; i += 8) {
+            float* base = data + i * 3;
+            const __m256 x = _mm256_i32gather_ps(base + 0, idx, 4);
+            const __m256 y = _mm256_i32gather_ps(base + 1, idx, 4);
+            const __m256 z = _mm256_i32gather_ps(base + 2, idx, 4);
+            const __m256 len2 = _mm256_add_ps(
+                _mm256_add_ps(_mm256_mul_ps(x, x), _mm256_mul_ps(y, y)),
+                _mm256_mul_ps(z, z));
+            __m256 rsq = _mm256_rsqrt_ps(len2);
+            rsq = _mm256_mul_ps(_mm256_mul_ps(half, rsq),
+                                _mm256_sub_ps(three, _mm256_mul_ps(len2, _mm256_mul_ps(rsq, rsq))));
+            // Ordered compares reject NaN; the upper bound rejects +inf from
+            // overflowed accumulations.
+            const __m256 valid = _mm256_and_ps(
+                _mm256_cmp_ps(len2, minLen2, _CMP_GT_OQ),
+                _mm256_cmp_ps(len2, maxLen2, _CMP_LT_OQ));
+            rsq = _mm256_and_ps(rsq, valid);
+            alignas(32) float inv[8];
+            _mm256_store_ps(inv, rsq);
+            for (int k = 0; k < 8; ++k) {
+                float* v = base + k * 3;
+                const float s = inv[k];
+                if (s == 0.0f) {
+                    v[0] = 0.0f;
+                    v[1] = 0.0f;
+                    v[2] = 1.0f;
+                } else {
+                    v[0] *= s;
+                    v[1] *= s;
+                    v[2] *= s;
+                }
+            }
+        }
+        _mm256_zeroupper();
+    }
+    for (; i < count; ++i) {
+        float* v = data + i * 3;
+        const Point3 n = NormalizeNormalOrFallback(Point3(v[0], v[1], v[2]));
+        v[0] = n.x;
+        v[1] = n.y;
+        v[2] = n.z;
+    }
+}
+
+// Blocked parallel gather for the position replay loops. Per-index
+// parallel_for overhead would swamp the 12-byte copies, so work is split
+// into blocks; below the threshold a serial loop wins outright.
+static constexpr size_t kParallelGatherMinVerts = 16384;
+static constexpr size_t kParallelGatherBlock = 8192;
+
+template <typename CopyBlockFn>
+static void ParallelGatherBlocks(size_t count, const CopyBlockFn& copyBlock) {
+    if (count < kParallelGatherMinVerts) {
+        copyBlock(size_t(0), count);
+        return;
+    }
+    const size_t blocks = (count + kParallelGatherBlock - 1) / kParallelGatherBlock;
+    concurrency::parallel_for(size_t(0), blocks, [&](size_t b) {
+        const size_t beg = b * kParallelGatherBlock;
+        const size_t end = std::min(count, beg + kParallelGatherBlock);
+        copyBlock(beg, end);
+    });
 }
 
 static Point3 ComputeMNMeshFaceNormalSafe(MNMesh& mn, int faceIdx) {
@@ -2525,27 +2674,30 @@ static void ApplyFastNormalPlan(MNMesh& mn,
 
     outNormals.resize(sources.size() * 3);
     float* out = outNormals.data();
-    const Point3 fallback(0.0f, 0.0f, 1.0f);
     concurrency::parallel_for(size_t(0), sources.size(), [&](size_t i) {
         const FastVertexSource& src = sources[i];
         const bool validFace = src.faceIdx >= 0 && src.faceIdx < nf;
+        // Written unnormalized — the single batched (AVX2 8-wide when
+        // available) normalize pass below replaces the per-corner rsqrt.
         Point3 n;
         const int specNid = plan.specId.empty() ? -1 : plan.specId[i];
         if (specNid >= 0 && specNid < specNormalCount) {
-            n = NormalizeNormalOrFallback(normalSpec->Normal(specNid),
-                                          validFace ? faceNormals[src.faceIdx] : fallback);
+            n = normalSpec->Normal(specNid);
         } else {
             Point3 accum(0.0f, 0.0f, 0.0f);
             const uint32_t beg = plan.gatherOff[i];
             const uint32_t end = plan.gatherOff[i + 1];
             for (uint32_t j = beg; j < end; ++j) accum += faceNormals[plan.gatherFaces[j]];
             if (DotProd(accum, accum) <= 1.0e-20f && validFace) accum = faceNormals[src.faceIdx];
-            n = NormalizeNormalOrFallback(accum, fallback);
+            n = accum;
         }
         out[i * 3 + 0] = n.x;
         out[i * 3 + 1] = n.y;
         out[i * 3 + 2] = n.z;
     }, *plan.vertPartitioner);
+    ParallelGatherBlocks(sources.size(), [&](size_t beg, size_t end) {
+        BatchNormalizeNormalsInPlace(out + beg * 3, end - beg);
+    });
 }
 
 static void ApplyFastNormalPlan(Mesh& mesh,
@@ -2574,46 +2726,29 @@ static void ApplyFastNormalPlan(Mesh& mesh,
 
     outNormals.resize(sources.size() * 3);
     float* out = outNormals.data();
-    const Point3 fallback(0.0f, 0.0f, 1.0f);
     concurrency::parallel_for(size_t(0), sources.size(), [&](size_t i) {
         const FastVertexSource& src = sources[i];
         const bool validFace = src.faceIdx >= 0 && src.faceIdx < nf;
+        // Written unnormalized — the single batched (AVX2 8-wide when
+        // available) normalize pass below replaces the per-corner rsqrt.
         Point3 n;
         const int specNid = plan.specId.empty() ? -1 : plan.specId[i];
         if (specNid >= 0 && specNid < specNormalCount) {
-            n = NormalizeNormalOrFallback(normalSpec->Normal(specNid),
-                                          validFace ? faceNormals[src.faceIdx] : fallback);
+            n = normalSpec->Normal(specNid);
         } else {
             Point3 accum(0.0f, 0.0f, 0.0f);
             const uint32_t beg = plan.gatherOff[i];
             const uint32_t end = plan.gatherOff[i + 1];
             for (uint32_t j = beg; j < end; ++j) accum += faceNormals[plan.gatherFaces[j]];
             if (DotProd(accum, accum) <= 1.0e-20f && validFace) accum = faceNormals[src.faceIdx];
-            n = NormalizeNormalOrFallback(accum, fallback);
+            n = accum;
         }
         out[i * 3 + 0] = n.x;
         out[i * 3 + 1] = n.y;
         out[i * 3 + 2] = n.z;
     }, *plan.vertPartitioner);
-}
-
-// Blocked parallel gather for the position replay loops. Per-index
-// parallel_for overhead would swamp the 12-byte copies, so work is split
-// into blocks; below the threshold a serial loop wins outright.
-static constexpr size_t kParallelGatherMinVerts = 16384;
-static constexpr size_t kParallelGatherBlock = 8192;
-
-template <typename CopyBlockFn>
-static void ParallelGatherBlocks(size_t count, const CopyBlockFn& copyBlock) {
-    if (count < kParallelGatherMinVerts) {
-        copyBlock(size_t(0), count);
-        return;
-    }
-    const size_t blocks = (count + kParallelGatherBlock - 1) / kParallelGatherBlock;
-    concurrency::parallel_for(size_t(0), blocks, [&](size_t b) {
-        const size_t beg = b * kParallelGatherBlock;
-        const size_t end = std::min(count, beg + kParallelGatherBlock);
-        copyBlock(beg, end);
+    ParallelGatherBlocks(sources.size(), [&](size_t beg, size_t end) {
+        BatchNormalizeNormalsInPlace(out + beg * 3, end - beg);
     });
 }
 

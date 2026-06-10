@@ -439,6 +439,7 @@
             updateGeometryIndexAttribute,
         } from './js/scene_binary.js';
         import { maxTimeline } from './js/maxjs_timeline.js';
+        import { gpuRecomputeNormals, gpuNormalsInvalidate } from './js/gpu_normals.js';
         import { createPerfHud } from './js/perf_hud.js';
         import { createMaxJSFxController } from './js/maxjs_fx.js';
         import { createWebGLBasicFx } from './js/webgl_basicfx.js';
@@ -5043,6 +5044,10 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
 
                                 if (hasIncomingIndex && existingIdx) {
                                     updateGeometryIndexAttribute(mesh.geometry, buf, meta.iOff, meta.iN);
+                                    // Index contents changed in place — the GPU
+                                    // normal adjacency cache is keyed by geometry
+                                    // and must not survive a connectivity rewrite.
+                                    gpuNormalsInvalidate(mesh.geometry);
                                 }
 
                                 if (meta.uvOff != null && meta.uvN) {
@@ -5051,6 +5056,12 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
 
                                 if (meta.nOff != null && meta.nN) {
                                     updateFloatGeometryAttribute(mesh.geometry, 'normal', buf, meta.nOff, meta.nN, 3);
+                                } else if (skipBounds) {
+                                    // Position-only deform update (oversized mesh /
+                                    // compact channels): rebuild normals in a WebGPU
+                                    // compute pass instead of leaving them frozen.
+                                    // No-op on the WebGL fallback backend.
+                                    gpuRecomputeNormals(renderer, mesh);
                                 }
 
                                 setGeometryVertexColorAttributes(mesh.geometry, incomingVertexColors, buf);
@@ -5098,6 +5109,11 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                                 mesh.geometry.dispose();
                                 mesh.geometry = geom;
                                 applyIncomingGroups();
+                                if (meta.nOff == null && meta.compactChannels) {
+                                    // Rebuilt topology carried no normals (cloned
+                                    // stale ones above) — refresh them on the GPU.
+                                    gpuRecomputeNormals(renderer, mesh);
+                                }
                             }
                             applyIncomingMaterial();
                             // Geometry data on the same Object3D — no pipeline

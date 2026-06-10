@@ -1020,6 +1020,10 @@
                     collect(node);
                     continue;
                 }
+                if (os.obj && IsThreeJSWebAppClassID(os.obj->ClassID())) {
+                    collect(node);
+                    continue;
+                }
                 if (os.obj && IsThreeJSLightClassID(os.obj->ClassID()) &&
                     options.includeLights && !node->IsNodeHidden(TRUE)) {
                     runtimeFeatures.lights += 1;
@@ -1523,6 +1527,8 @@
             ss << L",";
             WriteGLTFsJson(ss, ip, t, true, false, false);
         }
+        ss << L",";
+        WriteWebAppsJson(ss, ip, t, true, false, false);
         if (options.includeAnimations) {
             runtimeFeatures.animations = WriteSnapshotAnimationsJson(
                 ss, nodes, ip, t, options, outAnimBinary, skinRigMeshHandles, lockedCameraHandle_);

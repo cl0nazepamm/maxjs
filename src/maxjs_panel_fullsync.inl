@@ -14,6 +14,7 @@
         splatHandles_.clear();
         audioHandles_.clear();
         gltfHandles_.clear();
+        webappHandles_.clear();
         hairHandles_.clear();
         helperHandles_.clear();
         deformHandles_.clear();
@@ -60,6 +61,8 @@
         WriteAudiosJson(ss, ip, t, true, false, true);
         ss << L",";
         WriteGLTFsJson(ss, ip, t, true, false, true);
+        ss << L",";
+        WriteWebAppsJson(ss, ip, t, true, false, true);
 
         // ForestPack + RailClone instance groups (GPU instancing)
         {
@@ -162,7 +165,7 @@
             INode* node = parent->GetChildNode(i);
             if (!node) continue;
             ObjectState os = node->EvalWorldState(t);
-            if (os.obj && (IsThreeJSSplatClassID(os.obj->ClassID()) || IsThreeJSAudioClassID(os.obj->ClassID()) || IsThreeJSGLTFClassID(os.obj->ClassID()))) {
+            if (os.obj && (IsThreeJSSplatClassID(os.obj->ClassID()) || IsThreeJSAudioClassID(os.obj->ClassID()) || IsThreeJSGLTFClassID(os.obj->ClassID()) || IsThreeJSWebAppClassID(os.obj->ClassID()))) {
                 WriteSceneNodes(node, t, ss, first, prevGeom, materialLibrary);
                 continue;
             }
@@ -402,6 +405,7 @@
         splatHandles_.clear();
         audioHandles_.clear();
         gltfHandles_.clear();
+        webappHandles_.clear();
         hairHandles_.clear();
         helperHandles_.clear();
         deformHandles_.clear();
@@ -473,7 +477,7 @@
                 INode* node = parent->GetChildNode(i);
                 if (!node) continue;
                 ObjectState os = node->EvalWorldState(t);
-                if (os.obj && (IsThreeJSSplatClassID(os.obj->ClassID()) || IsThreeJSAudioClassID(os.obj->ClassID()) || IsThreeJSGLTFClassID(os.obj->ClassID()))) {
+                if (os.obj && (IsThreeJSSplatClassID(os.obj->ClassID()) || IsThreeJSAudioClassID(os.obj->ClassID()) || IsThreeJSGLTFClassID(os.obj->ClassID()) || IsThreeJSWebAppClassID(os.obj->ClassID()))) {
                     collect(node);
                     continue;
                 }
@@ -684,6 +688,10 @@
             if (gltfHandles_.find(it->first) == gltfHandles_.end()) it = gltfHashMap_.erase(it);
             else ++it;
         }
+        for (auto it = webappHashMap_.begin(); it != webappHashMap_.end(); ) {
+            if (webappHandles_.find(it->first) == webappHandles_.end()) it = webappHashMap_.erase(it);
+            else ++it;
+        }
         for (auto it = groupCache_.begin(); it != groupCache_.end(); ) {
             if (geomHandles_.find(it->first) == geomHandles_.end()) it = groupCache_.erase(it);
             else ++it;
@@ -832,6 +840,8 @@
         WriteAudiosJson(ss, ip, t, true, false, true);
         ss << L",";
         WriteGLTFsJson(ss, ip, t, true, false, true);
+        ss << L",";
+        WriteWebAppsJson(ss, ip, t, true, false, true);
 
         // ForestPack + RailClone instance groups (GPU instancing)
         {
@@ -1033,6 +1043,8 @@
         WriteAudiosJson(ss, ip, t, true, true, true);
         ss << L",";
         WriteGLTFsJson(ss, ip, t, true, true, true);
+        ss << L",";
+        WriteWebAppsJson(ss, ip, t, true, true, true);
         ss << L'}';
         webview_->PostWebMessageAsJson(ss.str().c_str());
     }

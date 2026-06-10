@@ -34,6 +34,22 @@
         return resolvedPath.empty() ? std::wstring{} : MapAssetPath(resolvedPath, false);
     }
 
+    std::wstring MapWebAppUrl(const std::wstring& rawUrl) {
+        if (rawUrl.empty()) return {};
+        // Web URLs pass through untouched; absolute disk paths map onto the
+        // same-origin asset host. Anything else (project-relative path) is
+        // resolved by the viewer against the active project root.
+        if (rawUrl.rfind(L"http://", 0) == 0 || rawUrl.rfind(L"https://", 0) == 0 ||
+            rawUrl.rfind(L"data:", 0) == 0) {
+            return rawUrl;
+        }
+        if (rawUrl.size() >= 3 && rawUrl[1] == L':') {
+            std::wstring mapped = MapAssetPath(rawUrl, false);
+            return mapped.empty() ? rawUrl : mapped;
+        }
+        return rawUrl;
+    }
+
     // ── Callbacks & sync ─────────────────────────────────────
 
     bool IsTrackedHandle(ULONG handle) const {
@@ -42,13 +58,15 @@
             || splatHandles_.find(handle) != splatHandles_.end()
             || audioHandles_.find(handle) != audioHandles_.end()
             || gltfHandles_.find(handle) != gltfHandles_.end()
+            || webappHandles_.find(handle) != webappHandles_.end()
             || hairHandles_.find(handle) != hairHandles_.end()
             || helperHandles_.find(handle) != helperHandles_.end();
     }
 
     bool HasTrackedNodes() const {
         return !geomHandles_.empty() || !lightHandles_.empty() || !splatHandles_.empty()
-            || !audioHandles_.empty() || !gltfHandles_.empty() || !hairHandles_.empty()
+            || !audioHandles_.empty() || !gltfHandles_.empty() || !webappHandles_.empty()
+            || !hairHandles_.empty()
             || !helperHandles_.empty();
     }
 

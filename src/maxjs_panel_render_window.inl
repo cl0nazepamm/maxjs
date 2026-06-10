@@ -1006,6 +1006,7 @@
         splatHandles_.clear();
         audioHandles_.clear();
         gltfHandles_.clear();
+        webappHandles_.clear();
         hairHandles_.clear();
         helperHandles_.clear();
         deformHandles_.clear();
@@ -1015,6 +1016,7 @@
         splatHashMap_.clear();
         audioHashMap_.clear();
         gltfHashMap_.clear();
+        webappHashMap_.clear();
         propHashMap_.clear();
         geoHashMap_.clear();
         geoFastTriangleCountMap_.clear();

@@ -14,6 +14,7 @@ export const COMMAND_TYPES = Object.freeze({
     UpdateAudio: 10,
     UpdateTime: 11,
     UpdateGLTF: 12,
+    UpdateWebApp: 13,
 });
 
 function assertSize(type, actual, expected) {
@@ -207,6 +208,17 @@ export function applyDeltaFrame(buffer, handlers = {}) {
                 decodeMs += performance.now() - decodeStart;
                 const applyStart = performance.now();
                 handlers.onGLTF?.(handle, matrix, visible);
+                applyMs += performance.now() - applyStart;
+                break;
+            }
+            case COMMAND_TYPES.UpdateWebApp: {
+                assertSize('UpdateWebApp', commandSize, 76);
+                const handle = view.getUint32(payloadOffset, true);
+                const matrix = new Float32Array(buffer, payloadOffset + 4, 16);
+                const visible = view.getUint32(payloadOffset + 68, true) !== 0;
+                decodeMs += performance.now() - decodeStart;
+                const applyStart = performance.now();
+                handlers.onWebApp?.(handle, matrix, visible);
                 applyMs += performance.now() - applyStart;
                 break;
             }

@@ -450,6 +450,7 @@
         import { createMaxJSAnimationSystem } from './js/maxjs_animation.js';
         import { createMaxJSAudioSystem } from './js/maxjs_audio.js';
         import { createMaxJSGLTFSystem } from './js/maxjs_gltf.js';
+        import { createMaxJSWebAppSystem } from './js/maxjs_webapp.js';
         import { createProjectRuntime } from './js/project_runtime.js';
         import { getInstancedMeshBatchSize, instanceGroupKey, isWebGpuInstancingPath } from './js/instance_batching.js';
         import * as css3dOverlay from './js/css3d_overlay.js';
@@ -1069,6 +1070,7 @@
         let audioSystem = null;
         let audioMuted = readPersistedAudioMuted();
         let gltfSystem = null;
+        let webappSystem = null;
         const splatHandleMap = new Map();
         const splatMatrix = new THREE_STD.Matrix4();
         const splatPosition = new THREE_STD.Vector3();
@@ -6020,6 +6022,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             reconcileSplats(snapshot.splats ?? []);
             audioSystem?.applyAudios(snapshot.audios ?? []);
             gltfSystem?.applyGLTFs(snapshot.gltfs ?? []);
+            webappSystem?.applyWebApps(snapshot.webapps ?? []);
             applyHairInstances(snapshot.hairInstances ?? []);
             applyForestInstances(snapshot.forestInstances ?? [], options.binaryBuffer ?? null);
             applyVolumes(snapshot.volumes ?? []);
@@ -6400,6 +6403,12 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             if (Array.isArray(msg?.gltfs)) gltfSystem?.applyGLTFUpdates(msg.gltfs);
         });
 
+        // WebApp Animator param channels (curve-driven) + page/size edits.
+        // Binary UpdateWebApp carries transform + visibility only.
+        bridge.on('webapp_update', msg => {
+            if (Array.isArray(msg?.webapps)) webappSystem?.applyWebAppUpdates(msg.webapps);
+        });
+
         // ── Binary Scene Handler (SharedBuffer) ──────────────
         function handleBinaryScene(buffer, meta) {
             if (meta.type !== 'scene_bin') return;
@@ -6636,6 +6645,9 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 onGLTF(handle, matrix, visible) {
                     gltfSystem?.applyGLTFTransformBinary(handle, matrix, visible);
                     pathTraceSceneChanged = true;
+                },
+                onWebApp(handle, matrix, visible) {
+                    webappSystem?.applyWebAppTransformBinary(handle, matrix, visible);
                 },
                 onTime(td) {
                     maxTimeline.onTime(td);
@@ -14020,6 +14032,11 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         if (projectRuntime) {
             layerManager.bindProjectRuntime(projectRuntime);
         }
+        webappSystem = createMaxJSWebAppSystem({
+            THREE,
+            parent: maxBasisRoot,
+            getProjectBaseUrl: () => projectRuntime?.getState?.().projectRootUrl || '',
+        });
         window.maxJSProjectRuntime = projectRuntime;
         window.maxJS.layers = layerManager;
         window.maxJS.animation = animationSystem;

@@ -1022,7 +1022,8 @@
             lightHandles_.size() +
             splatHandles_.size() +
             audioHandles_.size() +
-            gltfHandles_.size();
+            gltfHandles_.size() +
+            webappHandles_.size();
         frame.ReserveBytes(32 + handleCount * 96 + 80);
         frame.BeginFrame();
 
@@ -1048,6 +1049,7 @@
         for (ULONG handle : splatHandles_) collectHandle(handle);
         for (ULONG handle : audioHandles_) collectHandle(handle);
         for (ULONG handle : gltfHandles_) collectHandle(handle);
+        for (ULONG handle : webappHandles_) collectHandle(handle);
         SortHandlesByHierarchyDepth(playbackHandles, ip);
 
         auto appendHandle = [&](ULONG handle) {
@@ -1081,6 +1083,10 @@
             }
             if (gltfHandles_.find(handle) != gltfHandles_.end()) {
                 frame.UpdateGLTF(static_cast<std::uint32_t>(handle), xform, visible);
+                return;
+            }
+            if (webappHandles_.find(handle) != webappHandles_.end()) {
+                frame.UpdateWebApp(static_cast<std::uint32_t>(handle), xform, visible);
                 return;
             }
 
@@ -1267,6 +1273,7 @@
         if (IsThreeJSSplatClassID(os.obj->ClassID())) return true;
         if (IsThreeJSAudioClassID(os.obj->ClassID())) return true;
         if (IsThreeJSGLTFClassID(os.obj->ClassID())) return true;
+        if (IsThreeJSWebAppClassID(os.obj->ClassID())) return true;
 
         const SClass_ID superClass = os.obj->SuperClassID();
         return superClass == GEOMOBJECT_CLASS_ID || superClass == LIGHT_CLASS_ID
@@ -1710,6 +1717,7 @@
         fastDirtyHandles_.insert(splatHandles_.begin(), splatHandles_.end());
         fastDirtyHandles_.insert(audioHandles_.begin(), audioHandles_.end());
         fastDirtyHandles_.insert(gltfHandles_.begin(), gltfHandles_.end());
+        fastDirtyHandles_.insert(webappHandles_.begin(), webappHandles_.end());
         fastDirtyHandles_.insert(hairHandles_.begin(), hairHandles_.end());
         fastDirtyHandles_.insert(helperHandles_.begin(), helperHandles_.end());
         QueueFastFlush();
@@ -1743,6 +1751,7 @@
         for (ULONG handle : splatHandles_) markIfTransformChanged(handle);
         for (ULONG handle : audioHandles_) markIfTransformChanged(handle);
         for (ULONG handle : gltfHandles_) markIfTransformChanged(handle);
+        for (ULONG handle : webappHandles_) markIfTransformChanged(handle);
         for (ULONG handle : hairHandles_) markIfTransformChanged(handle);
         for (ULONG handle : helperHandles_) markIfTransformChanged(handle);
 
@@ -2259,11 +2268,13 @@
             splatHandles_.clear();
             audioHandles_.clear();
             gltfHandles_.clear();
+            webappHandles_.clear();
             hairHandles_.clear();
             helperHandles_.clear();
             deformHandles_.clear();
             audioHashMap_.clear();
             gltfHashMap_.clear();
+            webappHashMap_.clear();
             geoScanCursor_ = 0;
             ClearFastDeformState();
             lastSkinnedLivePollTick_ = 0;
@@ -2386,6 +2397,10 @@
                 DetectAudioChanges();
                 DetectGLTFChanges();
             }
+            // WebApp animator params are driven by Max animation curves, so
+            // unlike audio/glTF (UI-edit-only params) they must keep sampling
+            // during playback. Cheap: few nodes, hash compare per tick.
+            DetectWebAppChanges();
             if (allowHeavyGeometryPolling && slowPhase == 6) DetectGeometryChanges();
             if (allowIdlePolling && slowPhase == 9) DetectJsModChanges();
             if (allowIdlePolling && slowPhase == 12) DetectPluginInstanceChanges();
@@ -2988,6 +3003,7 @@
                 splatHashMap_.erase(handle);
                 audioHashMap_.erase(handle);
                 gltfHashMap_.erase(handle);
+                webappHashMap_.erase(handle);
                 geoHashMap_.erase(handle);
                 deformChannelHashMap_.erase(handle);
                 EraseFastDeformState(handle);
@@ -2996,6 +3012,7 @@
                 splatHandles_.erase(handle);
                 audioHandles_.erase(handle);
                 gltfHandles_.erase(handle);
+                webappHandles_.erase(handle);
                 hairHandles_.erase(handle);
                 helperHandles_.erase(handle);
                 deformHandles_.erase(handle);
@@ -3038,6 +3055,10 @@
             }
             if (gltfHandles_.find(handle) != gltfHandles_.end()) {
                 frame.UpdateGLTF(static_cast<std::uint32_t>(handle), xform, visible);
+                continue;
+            }
+            if (webappHandles_.find(handle) != webappHandles_.end()) {
+                frame.UpdateWebApp(static_cast<std::uint32_t>(handle), xform, visible);
                 continue;
             }
 
@@ -3664,6 +3685,50 @@
         return HashFNV1a(payload.data(), payload.size() * sizeof(wchar_t));
     }
 
+    uint64_t ComputeWebAppStateHash(INode* node, TimeValue t) {
+        if (!node) return 0;
+
+        ObjectState os = node->EvalWorldState(t);
+        if (!os.obj || !IsThreeJSWebAppClassID(os.obj->ClassID())) {
+            const std::wstring payload = L"null";
+            return HashFNV1a(payload.data(), payload.size() * sizeof(wchar_t));
+        }
+
+        IParamBlock2* pb = os.obj->GetParamBlockByID(threejs_webapp_params);
+        if (!pb) {
+            const std::wstring payload = L"null";
+            return HashFNV1a(payload.data(), payload.size() * sizeof(wchar_t));
+        }
+
+        const MCHAR* rawUrl = pb->GetStr(pw_url);
+
+        std::wostringstream ss;
+        ss.imbue(std::locale::classic());
+        ss << L"{\"v\":" << (IsMaxJsSyncDrawVisible(node) ? L'1' : L'0');
+        ss << L",\"url\":\"" << EscapeJson(rawUrl ? rawUrl : L"") << L"\"";
+        ss << L",\"width\":" << pb->GetInt(pw_width);
+        ss << L",\"height\":" << pb->GetInt(pw_height);
+        ss << L",\"displaySize\":" << pb->GetFloat(pw_display_size, t);
+        ss << L",\"opacity\":" << pb->GetFloat(pw_opacity, t);
+        ss << L",\"interactive\":" << (pb->GetInt(pw_interactive) ? L'1' : L'0');
+        ss << L",\"presentation\":" << pb->GetInt(pw_presentation);
+        static const ParamID valueIds[kWebAppParamChannels] = {
+            pw_param1, pw_param2, pw_param3, pw_param4,
+            pw_param5, pw_param6, pw_param7, pw_param8,
+        };
+        static const ParamID nameIds[kWebAppParamChannels] = {
+            pw_param1_name, pw_param2_name, pw_param3_name, pw_param4_name,
+            pw_param5_name, pw_param6_name, pw_param7_name, pw_param8_name,
+        };
+        for (int i = 0; i < kWebAppParamChannels; ++i) {
+            const MCHAR* name = pb->GetStr(nameIds[i]);
+            ss << L",\"" << EscapeJson(name ? name : L"") << L"\":" << pb->GetFloat(valueIds[i], t);
+        }
+        ss << L"}";
+        const std::wstring payload = ss.str();
+        return HashFNV1a(payload.data(), payload.size() * sizeof(wchar_t));
+    }
+
     // Material graph/physical edits use full sync. Preview-safe scalar edits
     // stay on delta_bin so interactive material work does not rebuild the scene.
     void DetectMaterialChanges() {
@@ -3885,6 +3950,51 @@
             if (WriteGLTFJson(gltfJson, node, t, /*includeHandle*/ true, /*includeVisibility*/ true, /*trackHandle*/ false)) {
                 if (!first) ss << L',';
                 ss << gltfJson.str();
+                first = false;
+            }
+        }
+        ss << L"]}";
+        webview_->PostWebMessageAsJson(ss.str().c_str());
+    }
+
+    void DetectWebAppChanges() {
+        Interface* ip = GetCOREInterface();
+        if (!ip || webappHandles_.empty()) return;
+
+        TimeValue t = ip->GetTime();
+        std::vector<INode*> dirty;
+        dirty.reserve(webappHandles_.size());
+
+        for (ULONG handle : webappHandles_) {
+            INode* node = ip->GetINodeByHandle(handle);
+            if (!node) continue;
+
+            const uint64_t hash = ComputeWebAppStateHash(node, t);
+            auto it = webappHashMap_.find(handle);
+            if (it == webappHashMap_.end()) {
+                webappHashMap_[handle] = hash;
+                dirty.push_back(node);  // first observation — push so JS has initial state
+            } else if (it->second != hash) {
+                it->second = hash;
+                dirty.push_back(node);
+            }
+        }
+
+        if (dirty.empty() || !webview_) return;
+
+        // Param values ride a dedicated JSON message; the binary UpdateWebApp
+        // delta command only carries transform/visibility. Curve-animated
+        // params change every playback frame, but the payload is tiny.
+        std::wostringstream ss;
+        ss.imbue(std::locale::classic());
+        ss << L"{\"type\":\"webapp_update\",\"webapps\":[";
+        bool first = true;
+        for (INode* node : dirty) {
+            std::wostringstream webappJson;
+            webappJson.imbue(std::locale::classic());
+            if (WriteWebAppJson(webappJson, node, t, /*includeHandle*/ true, /*includeVisibility*/ true, /*trackHandle*/ false)) {
+                if (!first) ss << L',';
+                ss << webappJson.str();
                 first = false;
             }
         }
@@ -4876,6 +4986,101 @@
         return true;
     }
 
+    bool WriteWebAppJson(std::wostringstream& ss, INode* node, TimeValue t,
+                         bool includeHandle = false, bool includeVisibility = false,
+                         bool trackHandle = false) {
+        if (!node) return false;
+
+        ObjectState os = node->EvalWorldState(t);
+        if (!os.obj || !IsThreeJSWebAppClassID(os.obj->ClassID())) return false;
+
+        IParamBlock2* pb = os.obj->GetParamBlockByID(threejs_webapp_params);
+        if (!pb) return false;
+
+        const MCHAR* rawUrl = pb->GetStr(pw_url);
+        std::wstring url = rawUrl ? MapWebAppUrl(rawUrl) : std::wstring{};
+
+        const ULONG handle = node->GetHandle();
+        float xform[16];
+        GetTransform16(node, t, xform);
+        if (trackHandle) {
+            webappHandles_.insert(handle);
+            RememberSentTransform(handle, xform);
+        }
+
+        ss << L'{';
+        bool needsComma = false;
+        auto appendComma = [&]() {
+            if (needsComma) ss << L',';
+            needsComma = true;
+        };
+
+        if (includeHandle) {
+            appendComma();
+            ss << L"\"h\":" << handle;
+        }
+
+        appendComma();
+        ss << L"\"n\":\"" << EscapeJson(node->GetName()) << L'"';
+
+        if (includeVisibility) {
+            appendComma();
+            ss << L"\"v\":" << (IsMaxJsSyncDrawVisible(node) ? L'1' : L'0');
+        }
+
+        appendComma();
+        ss << L"\"t\":";
+        WriteFloats(ss, xform, 16);
+
+        appendComma();
+        ss << L"\"url\":\"" << EscapeJson(url.c_str()) << L"\"";
+
+        appendComma();
+        ss << L"\"width\":" << pb->GetInt(pw_width);
+
+        appendComma();
+        ss << L"\"height\":" << pb->GetInt(pw_height);
+
+        appendComma();
+        ss << L"\"displaySize\":";
+        WriteFloatValue(ss, pb->GetFloat(pw_display_size, t), 50.0f);
+
+        appendComma();
+        ss << L"\"opacity\":";
+        WriteFloatValue(ss, pb->GetFloat(pw_opacity, t), 1.0f);
+
+        appendComma();
+        ss << L"\"interactive\":" << (pb->GetInt(pw_interactive) ? L"true" : L"false");
+
+        appendComma();
+        ss << L"\"presentation\":\"" << (pb->GetInt(pw_presentation) == 1 ? L"texture" : L"css3d") << L"\"";
+
+        // Named animatable channels — evaluated at t, so Max curves drive them.
+        static const ParamID valueIds[kWebAppParamChannels] = {
+            pw_param1, pw_param2, pw_param3, pw_param4,
+            pw_param5, pw_param6, pw_param7, pw_param8,
+        };
+        static const ParamID nameIds[kWebAppParamChannels] = {
+            pw_param1_name, pw_param2_name, pw_param3_name, pw_param4_name,
+            pw_param5_name, pw_param6_name, pw_param7_name, pw_param8_name,
+        };
+        appendComma();
+        ss << L"\"params\":{";
+        bool firstParam = true;
+        for (int i = 0; i < kWebAppParamChannels; ++i) {
+            const MCHAR* name = pb->GetStr(nameIds[i]);
+            if (!name || !name[0]) continue;
+            if (!firstParam) ss << L',';
+            ss << L"\"" << EscapeJson(name) << L"\":";
+            WriteFloatValue(ss, pb->GetFloat(valueIds[i], t), 0.0f);
+            firstParam = false;
+        }
+        ss << L'}';
+
+        ss << L'}';
+        return true;
+    }
+
     void WriteLightsJson(std::wostringstream& ss, Interface* ip, TimeValue t,
                          bool includeHandle = false, bool includeVisibility = false,
                          bool trackHandles = false) {
@@ -5000,6 +5205,38 @@
                 }
             };
             collectGLTFs(root);
+        }
+        ss << L']';
+    }
+
+    void WriteWebAppsJson(std::wostringstream& ss, Interface* ip, TimeValue t,
+                          bool includeHandle = false, bool includeVisibility = false,
+                          bool trackHandles = false) {
+        ss << L"\"webapps\":[";
+        bool firstWebApp = true;
+        INode* root = ip ? ip->GetRootNode() : nullptr;
+        if (root) {
+            std::function<void(INode*)> collectWebApps = [&](INode* parent) {
+                for (int i = 0; i < parent->NumberOfChildren(); i++) {
+                    INode* node = parent->GetChildNode(i);
+                    if (!node) continue;
+                    if (node->IsNodeHidden(TRUE) && !includeVisibility) {
+                        collectWebApps(node);
+                        continue;
+                    }
+
+                    std::wostringstream webappJson;
+                    webappJson.imbue(std::locale::classic());
+                    if (WriteWebAppJson(webappJson, node, t, includeHandle, includeVisibility, trackHandles)) {
+                        if (!firstWebApp) ss << L',';
+                        ss << webappJson.str();
+                        firstWebApp = false;
+                    }
+
+                    collectWebApps(node);
+                }
+            };
+            collectWebApps(root);
         }
         ss << L']';
     }

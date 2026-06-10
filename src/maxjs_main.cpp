@@ -48,6 +48,7 @@
 #include "threejs_sky.h"
 #include "threejs_deform.h"
 #include "threejs_gltf.h"
+#include "threejs_webapp.h"
 #include <iskin.h>
 
 #include <wrl.h>
@@ -1490,7 +1491,7 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, ULONG fdwReason, LPVOID) {
 }
 
 __declspec(dllexport) const TCHAR* LibDescription()   { return MAXJS_NAME; }
-__declspec(dllexport) int LibNumberClasses()           { return 22; }
+__declspec(dllexport) int LibNumberClasses()           { return 23; }
 __declspec(dllexport) ClassDesc* LibClassDesc(int i) {
     switch (i) {
         case 0: return &maxJSDesc;
@@ -1515,6 +1516,7 @@ __declspec(dllexport) ClassDesc* LibClassDesc(int i) {
         case 19: return GetThreeJSTSLTexDesc();
         case 20: return GetThreeJSHTMLTexDesc();
         case 21: return GetThreeJSGLTFDesc();
+        case 22: return GetThreeJSWebAppDesc();
         default: return nullptr;
     }
 }

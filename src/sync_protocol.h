@@ -22,6 +22,7 @@ enum class CommandType : std::uint16_t {
     UpdateAudio = 10,
     UpdateTime = 11,
     UpdateGLTF = 12,
+    UpdateWebApp = 13,
 };
 
 // ── Wire layout descriptors ──────────────────────────────────────
@@ -76,6 +77,7 @@ using LightLayout          = Layout<Wire::U32, Wire::Mat16, Wire::BoolU32, Wire:
 using SplatLayout          = Layout<Wire::U32, Wire::Mat16, Wire::BoolU32>;
 using AudioLayout          = SplatLayout;
 using GLTFLayout           = SplatLayout;
+using WebAppLayout         = SplatLayout;
 using TimeLayout           = Layout<Wire::U32, Wire::U32, Wire::U8,
                                     Wire::PadU8, Wire::PadU8, Wire::PadU8>;
 using EndFrameLayout       = Layout<>;
@@ -131,6 +133,7 @@ public:
     void UpdateSplat(std::uint32_t handle, const float* matrix16, bool visible);
     void UpdateAudio(std::uint32_t handle, const float* matrix16, bool visible);
     void UpdateGLTF(std::uint32_t handle, const float* matrix16, bool visible);
+    void UpdateWebApp(std::uint32_t handle, const float* matrix16, bool visible);
     // Max → JS time oracle. ticks is Max TimeValue (1/4800s). tpf is ticks per
     // frame (GetTicksPerFrame()). stateFlags: bit 0 = playing, bits 1-7 reserved.
     void UpdateTime(std::int32_t ticks, std::int32_t tpf, std::uint8_t stateFlags);

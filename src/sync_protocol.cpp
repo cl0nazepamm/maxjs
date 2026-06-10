@@ -141,6 +141,15 @@ void DeltaFrameBuilder::UpdateGLTF(std::uint32_t handle, const float* matrix16, 
     AppendU32(visible ? 1u : 0u);
 }
 
+void DeltaFrameBuilder::UpdateWebApp(std::uint32_t handle, const float* matrix16, bool visible) {
+    BeginCommand(CommandType::UpdateWebApp, WebAppLayout::size);
+    AppendU32(handle);
+    for (int i = 0; i < 16; ++i) {
+        AppendF32(matrix16[i]);
+    }
+    AppendU32(visible ? 1u : 0u);
+}
+
 void DeltaFrameBuilder::UpdateTime(std::int32_t ticks, std::int32_t tpf, std::uint8_t stateFlags) {
     // 4 ticks + 4 tpf + 1 flags + 3 pad = 12 payload (see TimeLayout)
     BeginCommand(CommandType::UpdateTime, TimeLayout::size);

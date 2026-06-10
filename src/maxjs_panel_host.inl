@@ -22,6 +22,7 @@
     std::unordered_set<ULONG> splatHandles_;
     std::unordered_set<ULONG> audioHandles_;
     std::unordered_set<ULONG> gltfHandles_;
+    std::unordered_set<ULONG> webappHandles_;
     std::unordered_set<ULONG> hairHandles_;
     std::unordered_set<ULONG> helperHandles_;
     // Meshes with a modifier stack whose output can change between frames
@@ -42,6 +43,7 @@
     std::unordered_map<ULONG, uint64_t> splatHashMap_; // node handle → splat source state hash
     std::unordered_map<ULONG, uint64_t> audioHashMap_; // node handle → audio source state hash
     std::unordered_map<ULONG, uint64_t> gltfHashMap_;  // node handle → gltf source state hash
+    std::unordered_map<ULONG, uint64_t> webappHashMap_; // node handle → webapp animator state hash
     std::unordered_map<ULONG, uint64_t> geoHashMap_;   // node handle → geometry topology hash
     std::unordered_map<ULONG, int> geoFastTriangleCountMap_; // node handle -> capped triangle count for geo_fast eligibility
     std::unordered_map<ULONG, uint64_t> deformChannelHashMap_; // node handle -> UV/topology hash for deform fast path

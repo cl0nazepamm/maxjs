@@ -396,6 +396,15 @@ body.light-mode .dock-drag-handle.dragging::after { background: rgba(0, 0, 0, 0.
     opacity: 0.35;
     cursor: not-allowed;
 }
+/* Web Panels (WebApp Animator) presentation flipswitch */
+.webpanel-switch {
+    display: flex;
+    gap: 2px;
+}
+.webpanel-switch .fx-toggle.pending {
+    opacity: 0.45;
+    pointer-events: none;
+}
 .sidepanel-body {
     display: grid;
     gap: 5px;

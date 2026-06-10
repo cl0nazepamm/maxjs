@@ -1,18 +1,28 @@
-// css3d_overlay.js — lazy singleton wrapping a CSS3DRenderer that draws
-// CSS3DObjects from the main Three.js scene on a DOM div over the WebGL canvas.
-// webapp_layer.js acquires the overlay; index.html ticks it each frame.
+// css3d_overlay.js — lazy singletons wrapping CSS3DRenderers on DOM divs.
+// Two roots:
+//   - front (z-index 1, above the WebGL canvas): normal overlay panels.
+//   - behind (z-index -1, under the alpha:true canvas): depth-occluded
+//     panels — punch-through compositing makes scene geometry occlude the
+//     DOM per pixel. The behind layer renders a SEPARATE scene because one
+//     CSS3DRenderer writes element display state per render call, so two
+//     renderers cannot share one object set.
+// webapp_layer.js / maxjs_webapp.js acquire; index.html ticks each frame.
 
 let cssRenderer = null;
 let rootEl = null;
+let behindRenderer = null;
+let behindRootEl = null;
 let refCount = 0;
 let loaderPromise = null;
 let cachedCSS3DObject = null;
+let cachedCSS3DRendererCtor = null;
 
 async function loadRenderer() {
     if (loaderPromise) return loaderPromise;
     loaderPromise = import('three/addons/renderers/CSS3DRenderer.js')
         .then(mod => {
             cachedCSS3DObject = mod.CSS3DObject;
+            cachedCSS3DRendererCtor = mod.CSS3DRenderer;
             return mod;
         });
     return loaderPromise;
@@ -48,12 +58,42 @@ export function release() {
     // Keep renderer alive even at 0 — cheap and avoids churn if a layer remounts.
 }
 
+function ensureBehindRoot() {
+    if (behindRootEl) return behindRootEl;
+    const el = document.createElement('div');
+    el.id = 'maxjs-css3d-behind-root';
+    el.style.position = 'absolute';
+    el.style.inset = '0';
+    el.style.pointerEvents = 'none';
+    el.style.zIndex = '-1';
+    el.style.overflow = 'hidden';
+    document.body.appendChild(el);
+    behindRootEl = el;
+    return el;
+}
+
+export async function acquireBehind() {
+    await loadRenderer();
+    if (!behindRenderer) {
+        const el = ensureBehindRoot();
+        behindRenderer = new cachedCSS3DRendererCtor({ element: el });
+        behindRenderer.setSize(window.innerWidth, window.innerHeight);
+    }
+    refCount += 1;
+    return { CSS3DObject: cachedCSS3DObject, root: behindRootEl };
+}
+
 export function tick(scene, camera) {
     if (cssRenderer) cssRenderer.render(scene, camera);
 }
 
+export function tickBehind(scene, camera) {
+    if (behindRenderer && scene) behindRenderer.render(scene, camera);
+}
+
 export function setSize(width, height) {
     if (cssRenderer) cssRenderer.setSize(width, height);
+    if (behindRenderer) behindRenderer.setSize(width, height);
 }
 
 export function isActive() {

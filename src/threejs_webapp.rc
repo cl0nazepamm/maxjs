@@ -1,0 +1,106 @@
+#include "threejs_webapp_res.h"
+#include <windows.h>
+
+STRINGTABLE
+BEGIN
+    IDS_WEBAPP_PARAMS "WebApp Animator"
+    IDS_WEBAPP_DISPLAY_SIZE "Display Size"
+    IDS_WEBAPP_URL "URL"
+    IDS_WEBAPP_WIDTH "Width (px)"
+    IDS_WEBAPP_HEIGHT "Height (px)"
+    IDS_WEBAPP_OPACITY "Opacity"
+    IDS_WEBAPP_INTERACTIVE "Interactive"
+    IDS_WEBAPP_PRESENTATION "Presentation"
+    IDS_WEBAPP_PARAM1 "Param 1"
+    IDS_WEBAPP_PARAM2 "Param 2"
+    IDS_WEBAPP_PARAM3 "Param 3"
+    IDS_WEBAPP_PARAM4 "Param 4"
+    IDS_WEBAPP_PARAM5 "Param 5"
+    IDS_WEBAPP_PARAM6 "Param 6"
+    IDS_WEBAPP_PARAM7 "Param 7"
+    IDS_WEBAPP_PARAM8 "Param 8"
+    IDS_WEBAPP_DEPTH_OCCLUDE "Depth Occlude"
+    IDS_WEBAPP_LAYER_COUNT "Layers"
+    IDS_WEBAPP_LAYER_GAP "Layer Gap"
+    IDS_WEBAPP_PARAM1_NAME "Param 1 Name"
+    IDS_WEBAPP_PARAM2_NAME "Param 2 Name"
+    IDS_WEBAPP_PARAM3_NAME "Param 3 Name"
+    IDS_WEBAPP_PARAM4_NAME "Param 4 Name"
+    IDS_WEBAPP_PARAM5_NAME "Param 5 Name"
+    IDS_WEBAPP_PARAM6_NAME "Param 6 Name"
+    IDS_WEBAPP_PARAM7_NAME "Param 7 Name"
+    IDS_WEBAPP_PARAM8_NAME "Param 8 Name"
+END
+
+IDD_THREEJS_WEBAPP DIALOG 0, 0, 186, 260
+STYLE DS_SETFONT | WS_CHILD | WS_VISIBLE
+FONT 8, "Segoe UI"
+BEGIN
+    LTEXT           "URL", -1, 8, 6, 18, 8
+    EDITTEXT        IDC_WEBAPP_URL_EDIT, 28, 4, 114, 12, ES_AUTOHSCROLL
+    PUSHBUTTON      "...", IDC_WEBAPP_BROWSE, 146, 4, 32, 12
+
+    LTEXT           "Display", -1, 8, 22, 30, 8
+    CONTROL         "", IDC_WEBAPP_SIZE_EDIT, "CustEdit", WS_TABSTOP, 40, 20, 28, 10
+    CONTROL         "", IDC_WEBAPP_SIZE_SPIN, "SpinnerControl", 0, 68, 20, 11, 10
+
+    LTEXT           "Opacity", -1, 96, 22, 30, 8
+    CONTROL         "", IDC_WEBAPP_OPACITY_EDIT, "CustEdit", WS_TABSTOP, 128, 20, 26, 10
+    CONTROL         "", IDC_WEBAPP_OPACITY_SPIN, "SpinnerControl", 0, 154, 20, 11, 10
+
+    LTEXT           "W px", -1, 8, 38, 22, 8
+    CONTROL         "", IDC_WEBAPP_WIDTH_EDIT, "CustEdit", WS_TABSTOP, 32, 36, 30, 10
+    CONTROL         "", IDC_WEBAPP_WIDTH_SPIN, "SpinnerControl", 0, 62, 36, 11, 10
+
+    LTEXT           "H px", -1, 96, 38, 20, 8
+    CONTROL         "", IDC_WEBAPP_HEIGHT_EDIT, "CustEdit", WS_TABSTOP, 118, 36, 30, 10
+    CONTROL         "", IDC_WEBAPP_HEIGHT_SPIN, "SpinnerControl", 0, 148, 36, 11, 10
+
+    CONTROL         "Interactive", IDC_WEBAPP_INTERACTIVE, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 8, 52, 50, 10
+    CONTROL         "CSS3D", IDC_WEBAPP_PRES_CSS3D, "Button", BS_AUTORADIOBUTTON | WS_GROUP | WS_TABSTOP, 70, 52, 40, 10
+    CONTROL         "Texture", IDC_WEBAPP_PRES_TEXTURE, "Button", BS_AUTORADIOBUTTON, 114, 52, 44, 10
+
+    CONTROL         "Depth Occlude", IDC_WEBAPP_DEPTH_OCCLUDE, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 8, 66, 62, 10
+    LTEXT           "Layers", -1, 74, 67, 26, 8
+    CONTROL         "", IDC_WEBAPP_LAYERS_EDIT, "CustEdit", WS_TABSTOP, 100, 65, 18, 10
+    CONTROL         "", IDC_WEBAPP_LAYERS_SPIN, "SpinnerControl", 0, 118, 65, 11, 10
+    LTEXT           "Gap", -1, 134, 67, 16, 8
+    CONTROL         "", IDC_WEBAPP_GAP_EDIT, "CustEdit", WS_TABSTOP, 150, 65, 22, 10
+    CONTROL         "", IDC_WEBAPP_GAP_SPIN, "SpinnerControl", 0, 172, 65, 11, 10
+
+    GROUPBOX        "Animated Params", -1, 4, 82, 178, 174
+    LTEXT           "Name", -1, 12, 94, 60, 8
+    LTEXT           "Value", -1, 116, 94, 40, 8
+
+    EDITTEXT        IDC_WEBAPP_NAME1, 12, 106, 96, 12, ES_AUTOHSCROLL
+    CONTROL         "", IDC_WEBAPP_VAL1, "CustEdit", WS_TABSTOP, 116, 107, 40, 10
+    CONTROL         "", IDC_WEBAPP_VALSPIN1, "SpinnerControl", 0, 156, 107, 11, 10
+
+    EDITTEXT        IDC_WEBAPP_NAME2, 12, 124, 96, 12, ES_AUTOHSCROLL
+    CONTROL         "", IDC_WEBAPP_VAL2, "CustEdit", WS_TABSTOP, 116, 125, 40, 10
+    CONTROL         "", IDC_WEBAPP_VALSPIN2, "SpinnerControl", 0, 156, 125, 11, 10
+
+    EDITTEXT        IDC_WEBAPP_NAME3, 12, 142, 96, 12, ES_AUTOHSCROLL
+    CONTROL         "", IDC_WEBAPP_VAL3, "CustEdit", WS_TABSTOP, 116, 143, 40, 10
+    CONTROL         "", IDC_WEBAPP_VALSPIN3, "SpinnerControl", 0, 156, 143, 11, 10
+
+    EDITTEXT        IDC_WEBAPP_NAME4, 12, 160, 96, 12, ES_AUTOHSCROLL
+    CONTROL         "", IDC_WEBAPP_VAL4, "CustEdit", WS_TABSTOP, 116, 161, 40, 10
+    CONTROL         "", IDC_WEBAPP_VALSPIN4, "SpinnerControl", 0, 156, 161, 11, 10
+
+    EDITTEXT        IDC_WEBAPP_NAME5, 12, 178, 96, 12, ES_AUTOHSCROLL
+    CONTROL         "", IDC_WEBAPP_VAL5, "CustEdit", WS_TABSTOP, 116, 179, 40, 10
+    CONTROL         "", IDC_WEBAPP_VALSPIN5, "SpinnerControl", 0, 156, 179, 11, 10
+
+    EDITTEXT        IDC_WEBAPP_NAME6, 12, 196, 96, 12, ES_AUTOHSCROLL
+    CONTROL         "", IDC_WEBAPP_VAL6, "CustEdit", WS_TABSTOP, 116, 197, 40, 10
+    CONTROL         "", IDC_WEBAPP_VALSPIN6, "SpinnerControl", 0, 156, 197, 11, 10
+
+    EDITTEXT        IDC_WEBAPP_NAME7, 12, 214, 96, 12, ES_AUTOHSCROLL
+    CONTROL         "", IDC_WEBAPP_VAL7, "CustEdit", WS_TABSTOP, 116, 215, 40, 10
+    CONTROL         "", IDC_WEBAPP_VALSPIN7, "SpinnerControl", 0, 156, 215, 11, 10
+
+    EDITTEXT        IDC_WEBAPP_NAME8, 12, 232, 96, 12, ES_AUTOHSCROLL
+    CONTROL         "", IDC_WEBAPP_VAL8, "CustEdit", WS_TABSTOP, 116, 233, 40, 10
+    CONTROL         "", IDC_WEBAPP_VALSPIN8, "SpinnerControl", 0, 156, 233, 11, 10
+END

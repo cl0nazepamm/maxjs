@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  :root { --param-progress: 0; --param-hue: 0; }
+  html, body { margin: 0; height: 100%; background: transparent; font-family: system-ui, sans-serif; }
+  .card {
+    box-sizing: border-box; height: 100%; padding: 48px;
+    background: rgba(18, 18, 24, 0.92); color: #fff; border-radius: 24px;
+    display: flex; flex-direction: column; justify-content: center; gap: 24px;
+  }
+  h1 { margin: 0; font-size: 56px; }
+  .bar { height: 28px; background: #2a2a33; border-radius: 14px; overflow: hidden; }
+  .fill { height: 100%; width: 0%; background: hsl(200, 90%, 55%); border-radius: 14px; }
+  .readout { font-size: 36px; color: #9ad; font-variant-numeric: tabular-nums; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>max.js WebApp Animator</h1>
+    <div class="bar"><div class="fill" id="fill"></div></div>
+    <div class="readout" id="readout">progress 0.00 | hue 0</div>
+  </div>
+  <script>
+    const fill = document.getElementById('fill');
+    const readout = document.getElementById('readout');
+    let params = { progress: 0, hue: 0 };
+    function render() {
+      const p = Math.max(0, Math.min(1, Number(params.progress) || 0));
+      const hue = Number(params.hue) || 0;
+      fill.style.width = (p * 100).toFixed(1) + '%';
+      fill.style.background = `hsl(${hue}, 90%, 55%)`;
+      readout.textContent = `progress ${p.toFixed(2)} | hue ${hue.toFixed(0)}`;
+    }
+    window.addEventListener('message', (e) => {
+      if (e.data?.type !== 'maxjs:params') return;
+      params = { ...params, ...e.data.params };
+      render();
+    });
+    render();
+  </script>
+</body>
+</html>

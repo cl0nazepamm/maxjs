@@ -1928,6 +1928,39 @@
             QueueFastFlush();
             return;
         }
+        // Viewer-side Web Panels UI writes settings back onto the WebApp
+        // Animator node. The param block stays the single source of truth:
+        // no direct viewer-side mutation — DetectWebAppChanges hash-detects
+        // the edit and round-trips a webapp_update on the next tick.
+        if (type == L"webapp_set") {
+            std::wstring handleStr;
+            ExtractJsonString(msg, L"handle", handleStr);
+            ULONG h = 0;
+            if (!handleStr.empty()) {
+                try { h = static_cast<ULONG>(std::stoul(handleStr)); } catch (...) { h = 0; }
+            }
+            Interface* ip = GetCOREInterface();
+            INode* node = (ip && h != 0) ? ip->GetINodeByHandle(h) : nullptr;
+            if (!node) return;
+            ObjectState os = node->EvalWorldState(ip->GetTime());
+            if (!os.obj || !IsThreeJSWebAppClassID(os.obj->ClassID())) return;
+            IParamBlock2* pb = os.obj->GetParamBlockByID(threejs_webapp_params);
+            if (!pb) return;
+
+            int presentation = -1;
+            const bool hasPresentation =
+                ExtractJsonInt(msg, L"presentation", presentation) &&
+                presentation >= 0 && presentation <= 1;
+            bool depthOcclude = false;
+            const bool hasDepthOcclude = ExtractJsonBool(msg, L"depthOcclude", depthOcclude);
+            if (!hasPresentation && !hasDepthOcclude) return;
+
+            theHold.Begin();
+            if (hasPresentation) pb->SetValue(pw_presentation, 0, presentation);
+            if (hasDepthOcclude) pb->SetValue(pw_depth_occlude, 0, depthOcclude ? TRUE : FALSE);
+            theHold.Accept(_T("Web Panel Setting"));
+            return;
+        }
         if (type == L"pathtracing_settings") {
             int samplesPerFrame = pathTracingSamplesPerFrame_;
             float giClamp = pathTracingGIClamp_;
@@ -3712,6 +3745,9 @@
         ss << L",\"opacity\":" << pb->GetFloat(pw_opacity, t);
         ss << L",\"interactive\":" << (pb->GetInt(pw_interactive) ? L'1' : L'0');
         ss << L",\"presentation\":" << pb->GetInt(pw_presentation);
+        ss << L",\"depthOcclude\":" << (pb->GetInt(pw_depth_occlude) ? L'1' : L'0');
+        ss << L",\"layerCount\":" << pb->GetInt(pw_layer_count);
+        ss << L",\"layerGap\":" << pb->GetFloat(pw_layer_gap, t);
         static const ParamID valueIds[kWebAppParamChannels] = {
             pw_param1, pw_param2, pw_param3, pw_param4,
             pw_param5, pw_param6, pw_param7, pw_param8,
@@ -5054,6 +5090,16 @@
 
         appendComma();
         ss << L"\"presentation\":\"" << (pb->GetInt(pw_presentation) == 1 ? L"texture" : L"css3d") << L"\"";
+
+        appendComma();
+        ss << L"\"depthOcclude\":" << (pb->GetInt(pw_depth_occlude) ? L"true" : L"false");
+
+        appendComma();
+        ss << L"\"layerCount\":" << pb->GetInt(pw_layer_count);
+
+        appendComma();
+        ss << L"\"layerGap\":";
+        WriteFloatValue(ss, pb->GetFloat(pw_layer_gap, t), 5.0f);
 
         // Named animatable channels — evaluated at t, so Max curves drive them.
         static const ParamID valueIds[kWebAppParamChannels] = {

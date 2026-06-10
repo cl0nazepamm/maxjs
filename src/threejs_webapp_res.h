@@ -1,0 +1,76 @@
+#pragma once
+
+#define IDD_THREEJS_WEBAPP         540
+
+#define IDS_WEBAPP_PARAMS          560
+#define IDS_WEBAPP_DISPLAY_SIZE    561
+#define IDS_WEBAPP_URL             562
+#define IDS_WEBAPP_WIDTH           563
+#define IDS_WEBAPP_HEIGHT          564
+#define IDS_WEBAPP_OPACITY         565
+#define IDS_WEBAPP_INTERACTIVE     566
+#define IDS_WEBAPP_PRESENTATION    567
+#define IDS_WEBAPP_PARAM1          568
+#define IDS_WEBAPP_PARAM2          569
+#define IDS_WEBAPP_PARAM3          570
+#define IDS_WEBAPP_PARAM4          571
+#define IDS_WEBAPP_PARAM5          572
+#define IDS_WEBAPP_PARAM6          573
+#define IDS_WEBAPP_PARAM7          574
+#define IDS_WEBAPP_PARAM8          575
+#define IDS_WEBAPP_PARAM1_NAME     576
+#define IDS_WEBAPP_PARAM2_NAME     577
+#define IDS_WEBAPP_PARAM3_NAME     578
+#define IDS_WEBAPP_PARAM4_NAME     579
+#define IDS_WEBAPP_PARAM5_NAME     580
+#define IDS_WEBAPP_PARAM6_NAME     581
+#define IDS_WEBAPP_PARAM7_NAME     582
+#define IDS_WEBAPP_PARAM8_NAME     583
+#define IDS_WEBAPP_DEPTH_OCCLUDE   587
+#define IDS_WEBAPP_LAYER_COUNT     588
+#define IDS_WEBAPP_LAYER_GAP       589
+
+#define IDC_WEBAPP_URL_EDIT        5401
+#define IDC_WEBAPP_BROWSE          5402
+#define IDC_WEBAPP_SIZE_EDIT       5404
+#define IDC_WEBAPP_SIZE_SPIN       5405
+#define IDC_WEBAPP_WIDTH_EDIT      5406
+#define IDC_WEBAPP_WIDTH_SPIN      5407
+#define IDC_WEBAPP_HEIGHT_EDIT     5408
+#define IDC_WEBAPP_HEIGHT_SPIN     5409
+#define IDC_WEBAPP_OPACITY_EDIT    5410
+#define IDC_WEBAPP_OPACITY_SPIN    5411
+#define IDC_WEBAPP_INTERACTIVE     5412
+#define IDC_WEBAPP_PRES_CSS3D      5413
+#define IDC_WEBAPP_PRES_TEXTURE    5414
+#define IDC_WEBAPP_DEPTH_OCCLUDE   5415
+#define IDC_WEBAPP_LAYERS_EDIT     5416
+#define IDC_WEBAPP_LAYERS_SPIN     5417
+#define IDC_WEBAPP_GAP_EDIT        5418
+#define IDC_WEBAPP_GAP_SPIN        5419
+
+// Channel rows: name edit 5420+i, value edit 5430+i, value spin 5440+i (i = 0..7)
+#define IDC_WEBAPP_NAME1           5420
+#define IDC_WEBAPP_NAME2           5421
+#define IDC_WEBAPP_NAME3           5422
+#define IDC_WEBAPP_NAME4           5423
+#define IDC_WEBAPP_NAME5           5424
+#define IDC_WEBAPP_NAME6           5425
+#define IDC_WEBAPP_NAME7           5426
+#define IDC_WEBAPP_NAME8           5427
+#define IDC_WEBAPP_VAL1            5430
+#define IDC_WEBAPP_VAL2            5431
+#define IDC_WEBAPP_VAL3            5432
+#define IDC_WEBAPP_VAL4            5433
+#define IDC_WEBAPP_VAL5            5434
+#define IDC_WEBAPP_VAL6            5435
+#define IDC_WEBAPP_VAL7            5436
+#define IDC_WEBAPP_VAL8            5437
+#define IDC_WEBAPP_VALSPIN1        5440
+#define IDC_WEBAPP_VALSPIN2        5441
+#define IDC_WEBAPP_VALSPIN3        5442
+#define IDC_WEBAPP_VALSPIN4        5443
+#define IDC_WEBAPP_VALSPIN5        5444
+#define IDC_WEBAPP_VALSPIN6        5445
+#define IDC_WEBAPP_VALSPIN7        5446
+#define IDC_WEBAPP_VALSPIN8        5447

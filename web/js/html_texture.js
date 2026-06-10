@@ -80,11 +80,18 @@ function rewriteScopedSubtree(root, viewport) {
 // document, not the shadow tree. We wrap inline user scripts in an IIFE that
 // shadows `document` with a small proxy that delegates query methods to the
 // shadow root and forwards everything else to the real document.
-async function injectHtmlDocument(host, url, viewport = {}) {
+export async function injectHtmlDocument(host, url, viewport = {}, injectCss = '') {
     const response = await fetch(url, { cache: 'no-store' });
     if (!response.ok) throw new Error('HTTP ' + response.status + ' for ' + url);
     const text = await response.text();
     const parsed = new DOMParser().parseFromString(text, 'text/html');
+
+    if (injectCss) {
+        const injected = parsed.createElement('style');
+        injected.setAttribute('data-maxjs-inject', '');
+        injected.textContent = injectCss;
+        parsed.head.appendChild(injected);
+    }
 
     // Documents authored as real pages often put CSS variables on `:root`
     // and use viewport units. In shadow mode those need to be scoped to the
@@ -174,6 +181,7 @@ export function createHTMLTexture(THREE, url, options = {}) {
     const width  = Math.max(64, Math.min(4096, options.width  || 1024));
     const height = Math.max(64, Math.min(4096, options.height || 1024));
     const initialParams = options.params;
+    const injectCss = typeof options.injectCss === 'string' ? options.injectCss : '';
     const maxRedrawFps = Math.max(1, Math.min(60, Number(options.maxFps || options.fps || 30)));
     // 'shadow' (default) uses DOMParser + shadow root + script proxy.
     // Works for hand-authored HTML/CSS + vanilla JS with broad CSS feature
@@ -230,7 +238,8 @@ export function createHTMLTexture(THREE, url, options = {}) {
         }).then(text => {
             const baseHref = url.replace(/[^/]*$/, '');
             const baseTag = '<base href="' + baseHref + '">' +
-                '<style id="maxjs-html-texture-base">html,body{background:transparent;}</style>';
+                '<style id="maxjs-html-texture-base">html,body{background:transparent;}</style>' +
+                (injectCss ? '<style data-maxjs-inject>' + injectCss + '</style>' : '');
             const patched = /<head[^>]*>/i.test(text)
                 ? text.replace(/<head[^>]*>/i, m => m + baseTag)
                 : '<head>' + baseTag + '</head>' + text;
@@ -430,7 +439,7 @@ export function createHTMLTexture(THREE, url, options = {}) {
     if (mode === 'iframe') {
         host.addEventListener('load', onReady, { once: true });
     } else {
-        injectHtmlDocument(host, url, { width, height }).then(onReady).catch(err => {
+        injectHtmlDocument(host, url, { width, height }, injectCss).then(onReady).catch(err => {
             console.warn('[maxjs html_texture] failed to load', url, err);
         });
     }

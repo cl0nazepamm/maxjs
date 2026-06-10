@@ -600,8 +600,19 @@ export function createMaxJSFxController({
 
     snapshotRendererOutputState();
 
+    function syncWebPanelPunchEnabled() {
+        const rects = core.ctx.shared.webPanelPunch?.rects ?? [];
+        // Derive with the punch OFF so "others active" can't see itself — the
+        // punch must never force the pipeline path on its own (with FX off,
+        // depth-occluded panels punch via their occluder meshes instead).
+        state.webPanelPunch.enabled = false;
+        const othersActive = hasPipelineEffectEnabled();
+        state.webPanelPunch.enabled = othersActive && rects.length > 0;
+    }
+
     function rebuildPipeline() {
         core.prepareRebuild();
+        syncWebPanelPunchEnabled();
 
         if (!hasPipelineEffectEnabled() || !available) {
             pipelineReady = false;
@@ -674,6 +685,23 @@ export function createMaxJSFxController({
         },
         getResolutionScale() {
             return postFxResolutionScale;
+        },
+        isPipelineRenderActive() {
+            return pipelineReady && hasPipelineEffectEnabled();
+        },
+        // Depth-occluded web panel rects (maxjs_webapp.js). Rebuild only on
+        // count changes — transforms/opacity ride the descriptor's per-frame
+        // uniform update, so 30-60 Hz panel traffic never rebuilds the graph.
+        setWebPanelPunchRects(rects) {
+            const shared = core.ctx.shared;
+            const prevCount = shared.webPanelPunch?.rects?.length ?? 0;
+            const next = Array.isArray(rects) ? rects.slice(0) : [];
+            if (!shared.webPanelPunch) shared.webPanelPunch = { rects: next };
+            else shared.webPanelPunch.rects = next;
+            if (next.length !== prevCount) {
+                syncWebPanelPunchEnabled();
+                if (pipelineReady || hasPipelineEffectEnabled()) rebuildPipeline();
+            }
         },
         setResolutionScale(scale) {
             const nextScale = normalizePostFxResolutionScale(scale);

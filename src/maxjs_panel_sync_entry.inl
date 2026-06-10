@@ -44,8 +44,17 @@
             return rawUrl;
         }
         if (rawUrl.size() >= 3 && rawUrl[1] == L':') {
-            std::wstring mapped = MapAssetPath(rawUrl, false);
-            return mapped.empty() ? rawUrl : mapped;
+            // Disk paths may carry viewer flags (e.g. ?maxjs-host=div) —
+            // strip the query for file mapping, re-append afterwards.
+            std::wstring path = rawUrl;
+            std::wstring query;
+            const size_t queryPos = rawUrl.find(L'?');
+            if (queryPos != std::wstring::npos) {
+                path = rawUrl.substr(0, queryPos);
+                query = rawUrl.substr(queryPos);
+            }
+            std::wstring mapped = MapAssetPath(path, false);
+            return mapped.empty() ? rawUrl : mapped + query;
         }
         return rawUrl;
     }

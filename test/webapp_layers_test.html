@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  html, body { margin: 0; height: 100%; background: transparent; font-family: system-ui, sans-serif; color: #fff; }
+  .full { position: absolute; inset: 0; }
+  .bg {
+    background: linear-gradient(160deg, #101018 0%, #1a1a28 100%);
+    border-radius: 28px;
+    display: flex; align-items: flex-end; justify-content: center;
+    padding-bottom: 36px; box-sizing: border-box;
+    font-size: 22px; color: #556;
+  }
+  .cards {
+    display: flex; align-items: center; justify-content: center; gap: 32px;
+  }
+  .card {
+    width: 240px; height: 300px; border-radius: 20px;
+    background: rgba(40, 44, 60, 0.95);
+    border: 1px solid rgba(255,255,255,0.08);
+    box-shadow: 0 24px 60px -24px rgba(0,0,0,0.8);
+    display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px;
+  }
+  .card .num { font-size: 64px; font-weight: 700; }
+  .card .cap { font-size: 15px; color: #9ab; }
+  .fg {
+    display: flex; align-items: flex-start; justify-content: center; padding-top: 40px;
+  }
+  .badge {
+    padding: 14px 34px; border-radius: 999px;
+    background: hsl(150, 80%, 45%); color: #04140c;
+    font-size: 28px; font-weight: 800; letter-spacing: 0.02em;
+    box-shadow: 0 18px 50px -16px hsl(150, 80%, 35%);
+  }
+  button { cursor: pointer; font: inherit; }
+  .clickme {
+    margin-top: 10px; padding: 8px 18px; border-radius: 10px; border: 0;
+    background: #3b82f6; color: white; font-size: 15px;
+  }
+  .clickme.clicked { background: #f59e0b; }
+</style>
+</head>
+<body>
+  <div class="full bg" data-maxjs-layer="0">layer 0 — background</div>
+  <div class="full cards" data-maxjs-layer="1">
+    <div class="card">
+      <div class="num" id="n1">42</div><div class="cap">layer 1 — card A</div>
+      <button class="clickme" onclick="this.classList.toggle('clicked'); this.textContent = this.textContent === 'Click me' ? 'Clicked!' : 'Click me'">Click me</button>
+    </div>
+    <div class="card"><div class="num" id="n2">7</div><div class="cap">layer 1 — card B</div></div>
+  </div>
+  <div class="full fg" data-maxjs-layer="2">
+    <div class="badge">LAYER 2 — FLOATING</div>
+  </div>
+  <script>
+    // Per-instance identity (works cross-origin via URL query too).
+    const q = new URLSearchParams(location.search);
+    if (q.has('maxjs-layer')) {
+      document.title = 'layer ' + q.get('maxjs-layer') + '/' + q.get('maxjs-layers');
+    }
+    // Continuous channel demo: "progress" drives the card numbers.
+    window.addEventListener('message', (e) => {
+      const m = e.data;
+      if ((m?.type === 'maxjs:params' || m?.type === 'maxjs-params') && m.params) {
+        const p = Number(m.params.progress) || 0;
+        const n1 = document.getElementById('n1');
+        const n2 = document.getElementById('n2');
+        if (n1) n1.textContent = Math.round(p * 100);
+        if (n2) n2.textContent = (p * 9.9).toFixed(1);
+      }
+    });
+  </script>
+</body>
+</html>

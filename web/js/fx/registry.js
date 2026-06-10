@@ -15,6 +15,7 @@ import fog from './effects/fog.js';
 import pixel from './effects/pixel.js';
 import volumetric from './effects/volumetric.js';
 import dof from './effects/dof.js';
+import webPanelPunch from './effects/webPanelPunch.js';
 
 // Declaration order matches the historical maxjs_fx.js state-key order so
 // snapshotState() serialization stays stable. Composite order is governed by
@@ -33,4 +34,5 @@ export const ALL = [
     volumetric,
     pixel,
     dof,
+    webPanelPunch,
 ];

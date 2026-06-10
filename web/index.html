@@ -79,6 +79,12 @@
                     <span class="vpmenu-label">Canvas</span>
                 </div>
                 <div class="vpmenu-row maxonly devonly" data-vpmenu-close>
+                    <button id="btnWebPanels" class="rail-btn" title="WebApp Animator panels — flip presentation between CSS3D overlay and in-scene Canvas." aria-label="Web Panels">
+                        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="1.5" y="2.5" width="10" height="7" rx="1"/><path d="M4.5 12.5h10a1 1 0 0 0 1-1v-5"/><path d="M4 5.5h5M4 7.5h3"/></svg>
+                    </button>
+                    <span class="vpmenu-label">Web Panels</span>
+                </div>
+                <div class="vpmenu-row maxonly devonly" data-vpmenu-close>
                     <button id="btnSnapshotPanel" class="rail-btn" title="Snapshot" aria-label="Snapshot">
                         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2.5 13h11a1 1 0 0 0 1-1V6a1 1 0 0 0-1-1h-1.8l-.7-1.6a1 1 0 0 0-.9-.6H6a1 1 0 0 0-.9.6L4.3 5H2.5a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1Z"/><circle cx="8" cy="9" r="2.5"/></svg>
                     </button>
@@ -267,6 +273,7 @@
     <div id="rightDock">
         <aside id="snapshotPanel" class="sidepanel" aria-hidden="true" inert></aside>
         <aside id="layersPanel" class="sidepanel" aria-hidden="true" inert></aside>
+        <aside id="webPanelsPanel" class="sidepanel" aria-hidden="true" inert></aside>
         <aside id="canvasPanel" class="sidepanel" aria-hidden="true" inert></aside>
         <aside id="shaderLabPanel" class="sidepanel" aria-hidden="true" inert></aside>
         <aside id="lightLinkPanel" class="sidepanel" aria-hidden="true" inert></aside>
@@ -451,6 +458,7 @@
         import { createMaxJSAudioSystem } from './js/maxjs_audio.js';
         import { createMaxJSGLTFSystem } from './js/maxjs_gltf.js';
         import { createMaxJSWebAppSystem } from './js/maxjs_webapp.js';
+        import { attachDomPanelForwarding } from './js/dom_panel_forwarding.js';
         import { createProjectRuntime } from './js/project_runtime.js';
         import { getInstancedMeshBatchSize, instanceGroupKey, isWebGpuInstancingPath } from './js/instance_batching.js';
         import * as css3dOverlay from './js/css3d_overlay.js';
@@ -1241,6 +1249,15 @@
         // hit to host pixel coords → dispatch click to the matching DOM
         // element inside the texture's shadow tree.
         attachHTMLClickForwarding(THREE, renderer, () => ({ camera, scene }));
+
+        // Pointer input for depth-occluded web panels (behind-canvas CSS3D).
+        // Reads targets lazily — webappSystem is created later in startup.
+        attachDomPanelForwarding({
+            THREE,
+            renderer,
+            getCameraScene: () => ({ camera, scene }),
+            getTargets: () => webappSystem?.listForwardTargets?.() ?? [],
+        });
 
         // Shader Lab FX — optional custom pass consumed by the unified
         // Post FX controller. Toggled from the right rail. Loads React +
@@ -11532,6 +11549,97 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             });
         }
 
+        // ── Web Panels (WebApp Animator flipswitch) ──────────
+        // List-shaped, refresh-driven — same shape as the layers panel. The
+        // flipswitch never mutates viewer state directly: it sends webapp_set
+        // to Max (theHold-wrapped, undoable) and re-renders from the
+        // webapp_update round-trip, so the param block stays authoritative.
+        const btnWebPanels = document.getElementById('btnWebPanels');
+        const webPanelsPanel = document.getElementById('webPanelsPanel');
+        let webPanelsVisible = false;
+        let webPanelsRefreshQueued = false;
+
+        function escapeWebPanelText(value) {
+            return String(value ?? '')
+                .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+        }
+
+        function setWebPanelsVisible(visible) {
+            webPanelsVisible = !!visible;
+            if (!webPanelsVisible) {
+                const ae = document.activeElement;
+                if (ae instanceof HTMLElement && webPanelsPanel.contains(ae)) btnWebPanels?.focus();
+            }
+            webPanelsPanel.classList.toggle('visible', webPanelsVisible);
+            webPanelsPanel.toggleAttribute('inert', !webPanelsVisible);
+            webPanelsPanel.setAttribute('aria-hidden', String(!webPanelsVisible));
+            btnWebPanels?.classList.toggle('active', webPanelsVisible);
+            if (webPanelsVisible) queueWebPanelsRefresh();
+        }
+
+        function queueWebPanelsRefresh() {
+            if (!webPanelsVisible || webPanelsRefreshQueued) return;
+            webPanelsRefreshQueued = true;
+            requestAnimationFrame(() => {
+                webPanelsRefreshQueued = false;
+                if (webPanelsVisible) refreshWebPanelsPanel();
+            });
+        }
+
+        function refreshWebPanelsPanel() {
+            const panels = webappSystem?.listPanels?.() ?? [];
+            const renderRow = (p) => `
+                <div class="layer-item${p.visible ? '' : ' inactive'}">
+                    <div class="layer-main">
+                        <div class="layer-meta">
+                            <span class="layer-name" title="${escapeWebPanelText(p.name)}">${escapeWebPanelText(p.name)}</span>
+                            <span class="layer-source inline">#${p.handle}</span>
+                            ${p.layerCount > 1 ? `<span class="layer-priority" title="Layer stack">x${p.layerCount}</span>` : ''}
+                        </div>
+                        <div class="layer-detail" title="${escapeWebPanelText(p.url)}">${escapeWebPanelText(p.url || '(no url)')}</div>
+                    </div>
+                    <div class="layer-actions webpanel-switch" data-webpanel="${p.handle}">
+                        <button class="fx-toggle${p.presentation === 'css3d' ? ' active' : ''}" data-presentation="0" title="DOM overlay — crisp, interactive, outside the framebuffer">CSS3D</button>
+                        <button class="fx-toggle${p.presentation === 'texture' ? ' active' : ''}" data-presentation="1" title="In-scene pixels — post FX, depth, render output apply">Canvas</button>
+                        <button class="fx-toggle${p.depthOcclude ? ' active' : ''}" data-depth-occlude="${p.depthOcclude ? '0' : '1'}"
+                            ${p.presentation === 'texture' ? 'disabled' : ''}
+                            title="CSS3D behind the canvas with punch-through compositing — scene geometry occludes the panel per pixel">Depth</button>
+                    </div>
+                </div>`;
+            webPanelsPanel.innerHTML = `
+                <div class="sidepanel-header">
+                    <div>
+                        <div class="sidepanel-title">Web Panels</div>
+                        <div class="sidepanel-subtitle">${panels.length} WebApp Animator node${panels.length === 1 ? '' : 's'}</div>
+                    </div>
+                    <div style="display:flex;gap:4px">
+                        <button id="webPanelsHideBtn">Hide</button>
+                    </div>
+                </div>
+                <div class="sidepanel-body">${panels.length === 0
+                    ? '<div class="layers-empty">No WebApp Animator nodes in the scene. Create one from the <code>max.js</code> category in the Create panel.</div>'
+                    : panels.map(renderRow).join('')}</div>
+            `;
+            webPanelsPanel.querySelector('#webPanelsHideBtn')?.addEventListener('click', () => setWebPanelsVisible(false));
+            webPanelsPanel.querySelectorAll('.webpanel-switch button').forEach(btn => {
+                btn.addEventListener('click', () => {
+                    if (btn.classList.contains('pending') || btn.disabled) return;
+                    const handle = btn.closest('[data-webpanel]')?.dataset.webpanel;
+                    if (!handle) return;
+                    if (btn.dataset.depthOcclude !== undefined) {
+                        bridge.send('webapp_set', { handle: String(handle), depthOcclude: btn.dataset.depthOcclude === '1' });
+                    } else {
+                        if (btn.classList.contains('active')) return;
+                        bridge.send('webapp_set', { handle: String(handle), presentation: Number(btn.dataset.presentation) });
+                    }
+                    btn.classList.add('pending');  // cleared by the round-trip re-render
+                });
+            });
+        }
+
+        btnWebPanels?.addEventListener('click', () => setWebPanelsVisible(!webPanelsVisible));
+
         btnLayersPanel.addEventListener('click', () => setLayersPanelVisible(!layersPanelVisible));
         btnCanvasPanel?.addEventListener('click', () => setCanvasPanelVisible(!canvasPanelVisible));
         btnShaderLabPanel?.addEventListener('click', () => {
@@ -13843,6 +13951,12 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             // draw, restored after draw so authored state is what the rest of
             // the system sees between frames.
             layerManager.beforeRender?.(frameElapsed);
+            // Depth-occluded web panels: pick punch mode for this frame.
+            // Pipeline active → analytic mask (occluder meshes hidden);
+            // direct render → occluder meshes punch natively. Captures
+            // suppress punching entirely so output never ships alpha holes.
+            webappSystem?.setPunchSuppressed?.(renderToImageActive === true);
+            webappSystem?.setPunchPipelineActive?.(maxjsFx.isPipelineRenderActive?.() === true);
             try {
                 if (pathTracingFx.isEnabled?.() && (!renderToImageActive || pendingRenderToImage?.pathTracing)) {
                     // Pathtracing is a live-viewer-only renderer mode. It
@@ -13897,6 +14011,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 layerManager.afterRender?.(frameElapsed);
             }
             css3dOverlay.tick(scene, camera);
+            css3dOverlay.tickBehind(webappSystem?.getBehindScene?.(), camera);
             // Clone blob overlay — draw bounding rects on 2D canvas
             if (maxjsFx.isCloneEnabled() && !renderToImageActive) {
                 maxjsFx.drawBlobOverlay(blobOverlayCtx, blobOverlayCvs.width, blobOverlayCvs.height);
@@ -14036,7 +14151,10 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             THREE,
             parent: maxBasisRoot,
             getProjectBaseUrl: () => projectRuntime?.getState?.().projectRootUrl || '',
+            onPunchRectsChanged: (rects) => maxjsFx.setWebPanelPunchRects?.(rects),
         });
+        webappSystem.subscribe(() => queueWebPanelsRefresh());
+        window.maxJS.webapps = webappSystem;
         window.maxJSProjectRuntime = projectRuntime;
         window.maxJS.layers = layerManager;
         window.maxJS.animation = animationSystem;

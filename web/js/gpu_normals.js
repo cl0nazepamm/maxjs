@@ -17,6 +17,17 @@
 import * as THREE from 'three';
 import { Fn, If, Loop, Return, float, instanceIndex, storage, uint, vec3 } from 'three/tsl';
 
+// HARD-DISABLED: three r184's WebGPU backend MUTATES itemSize-3 attributes
+// used as storage buffers (pads the array vec3→vec4 and rewrites
+// attribute.itemSize/array in place — see createAttribute /
+// _force3to4BytesAlignment in three.webgpu.js). That fights
+// updateFloatGeometryAttribute's itemSize check every tick, causing
+// perpetual attribute replacement + pipeline churn = mesh corruption and
+// severe lag. Re-enabling requires geometries created with storage
+// attributes from birth and a padded-aware CPU update path — do NOT flip
+// this back without that redesign.
+const GPU_NORMALS_HARD_DISABLED = true;
+
 const states = new WeakMap();
 let disabledByError = false;
 
@@ -72,14 +83,25 @@ function buildState(geometry) {
     const idxStorage = new THREE.StorageBufferAttribute(indexU32, 1);
     const offStorage = new THREE.StorageBufferAttribute(offsets, 1);
     const adjStorage = new THREE.StorageBufferAttribute(adjTri.length ? adjTri : new Uint32Array(1), 1);
-    const faceStorage = new THREE.StorageBufferAttribute(new Float32Array(triCount * 3), 3);
+    const faceStorage = new THREE.StorageBufferAttribute(new Float32Array(triCount * 3), 1);
 
-    const positions = storage(posAttr, 'vec3', vertCount);
-    const normals = storage(nrmAttr, 'vec3', vertCount);
+    // LAYOUT-CRITICAL: every float buffer is bound as a scalar array.
+    // WGSL `array<vec3<f32>>` storage has a 16-byte stride, but these same
+    // buffers are consumed by the render pipeline as tightly packed 12-byte
+    // vertex attributes — binding them as 'vec3' makes three allocate the
+    // padded layout and silently shears the whole mesh. `array<f32>` is
+    // spec-guaranteed stride 4, identical to the vertex layout.
+    const positions = storage(posAttr, 'float', vertCount * 3);
+    const normals = storage(nrmAttr, 'float', vertCount * 3);
     const indices = storage(idxStorage, 'uint', indexU32.length);
     const adjOff = storage(offStorage, 'uint', offsets.length);
     const adjList = storage(adjStorage, 'uint', Math.max(adjTri.length, 1));
-    const faceNormals = storage(faceStorage, 'vec3', triCount);
+    const faceNormals = storage(faceStorage, 'float', triCount * 3);
+
+    const loadVec3 = (bufNode, base) => vec3(
+        bufNode.element(base),
+        bufNode.element(base.add(uint(1))),
+        bufNode.element(base.add(uint(2))));
 
     // Pass 1: per-triangle normals (normalized for parity with the CPU
     // plan's uniform smoothing-group weighting; degenerate → +Z).
@@ -89,16 +111,21 @@ function buildState(geometry) {
             Return();
         });
         const base = tri.mul(uint(3)).toVar();
-        const p0 = positions.element(indices.element(base)).toVar();
-        const p1 = positions.element(indices.element(base.add(uint(1)))).toVar();
-        const p2 = positions.element(indices.element(base.add(uint(2)))).toVar();
+        const i0 = indices.element(base).mul(uint(3)).toVar();
+        const i1 = indices.element(base.add(uint(1))).mul(uint(3)).toVar();
+        const i2 = indices.element(base.add(uint(2))).mul(uint(3)).toVar();
+        const p0 = loadVec3(positions, i0).toVar();
+        const p1 = loadVec3(positions, i1).toVar();
+        const p2 = loadVec3(positions, i2).toVar();
         const n = p1.sub(p0).cross(p2.sub(p0)).toVar();
         const lenSq = n.dot(n).toVar();
         const out = vec3(0.0, 0.0, 1.0).toVar();
         If(lenSq.greaterThan(float(1e-20)), () => {
             out.assign(n.mul(lenSq.inverseSqrt()));
         });
-        faceNormals.element(tri).assign(out);
+        faceNormals.element(base).assign(out.x);
+        faceNormals.element(base.add(uint(1))).assign(out.y);
+        faceNormals.element(base.add(uint(2))).assign(out.z);
     })().compute(triCount);
 
     // Pass 2: per-vertex gather over the CSR rows.
@@ -111,14 +138,18 @@ function buildState(geometry) {
         const rowEnd = adjOff.element(v.add(uint(1))).toVar();
         const accum = vec3(0.0).toVar();
         Loop({ start: rowStart, end: rowEnd, type: 'uint', condition: '<' }, ({ i }) => {
-            accum.addAssign(faceNormals.element(adjList.element(i)));
+            const f3 = adjList.element(i).mul(uint(3)).toVar();
+            accum.addAssign(loadVec3(faceNormals, f3));
         });
         const lenSq = accum.dot(accum).toVar();
         const out = vec3(0.0, 0.0, 1.0).toVar();
         If(lenSq.greaterThan(float(1e-20)), () => {
             out.assign(accum.mul(lenSq.inverseSqrt()));
         });
-        normals.element(v).assign(out);
+        const o = v.mul(uint(3)).toVar();
+        normals.element(o).assign(out.x);
+        normals.element(o.add(uint(1))).assign(out.y);
+        normals.element(o.add(uint(2))).assign(out.z);
     })().compute(vertCount);
 
     return {
@@ -157,11 +188,17 @@ export function gpuNormalsInvalidate(geometry) {
     if (geometry) states.delete(geometry);
 }
 
+// True once a runtime failure has latched the feature off — callers use this
+// to tell the plugin to fall back to CPU normal streaming.
+export function isGpuNormalsDisabled() {
+    return disabledByError;
+}
+
 // Recompute normals on the GPU after a position-only update. Returns true
 // when a compute was dispatched (or is queued behind one in flight); false
 // means the caller should keep its existing fallback behavior.
 export function gpuRecomputeNormals(renderer, mesh) {
-    if (disabledByError) return false;
+    if (GPU_NORMALS_HARD_DISABLED || disabledByError) return false;
     try {
         if (!renderer || !renderer.backend || renderer.backend.isWebGPUBackend !== true) return false;
         const geometry = mesh && mesh.geometry;

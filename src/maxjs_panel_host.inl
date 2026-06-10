@@ -4,6 +4,7 @@
     ComPtr<ICoreWebView2Environment> env_;
 
     bool jsReady_ = false;
+    bool gpuNormalsLive_ = false; // viewer recomputes deform normals on GPU; skip CPU normal extraction in the fast lane
     bool dirty_ = true;
     bool useBinary_ = false;
     std::uint32_t nextFrameId_ = 1;
@@ -558,6 +559,7 @@
         productionRenderContentActive_ = productionRender;
         texDirMap_.clear();
         jsReady_ = false;
+        gpuNormalsLive_ = false; // re-announced by the viewer after init
 
         if (!webDir.empty()) {
             ComPtr<ICoreWebView2_3> wv3;

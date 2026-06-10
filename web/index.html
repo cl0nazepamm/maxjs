@@ -439,7 +439,7 @@
             updateGeometryIndexAttribute,
         } from './js/scene_binary.js';
         import { maxTimeline } from './js/maxjs_timeline.js';
-        import { gpuRecomputeNormals, gpuNormalsInvalidate } from './js/gpu_normals.js';
+        import { gpuRecomputeNormals, gpuNormalsInvalidate, isGpuNormalsDisabled } from './js/gpu_normals.js';
         import { createPerfHud } from './js/perf_hud.js';
         import { createMaxJSFxController } from './js/maxjs_fx.js';
         import { createWebGLBasicFx } from './js/webgl_basicfx.js';
@@ -793,6 +793,16 @@
         if (THREE.RectAreaLightNode?.setLTC) {
             THREE.RectAreaLightNode.setLTC(RectAreaLightTexturesLib.init());
         }
+
+        // Tell the plugin whether deform normals can be rebuilt GPU-side; when
+        // true the C++ fast lane streams positions only (all mesh sizes) and
+        // gpu_normals.js recomputes normals per update in a compute pass.
+        // Announced false while the GPU path is hard-disabled (see
+        // gpu_normals.js — three r184 mutates itemSize-3 storage attributes,
+        // which corrupts live-streamed geometry). CPU normal streaming covers
+        // everything below the compact-channel threshold instead.
+        let gpuNormalsAnnounced = false;
+        window.chrome?.webview?.postMessage({ type: 'gpu_normals', enabled: false });
 
         // ── Render mode ───────────────────────────────────────
         // Studio  = MaxLightsNode (light linking + per-mesh HDRI intensity).
@@ -5057,11 +5067,16 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                                 if (meta.nOff != null && meta.nN) {
                                     updateFloatGeometryAttribute(mesh.geometry, 'normal', buf, meta.nOff, meta.nN, 3);
                                 } else if (skipBounds) {
-                                    // Position-only deform update (oversized mesh /
-                                    // compact channels): rebuild normals in a WebGPU
-                                    // compute pass instead of leaving them frozen.
-                                    // No-op on the WebGL fallback backend.
-                                    gpuRecomputeNormals(renderer, mesh);
+                                    // Position-only deform update: rebuild normals in
+                                    // a WebGPU compute pass instead of leaving them
+                                    // frozen. No-op on the WebGL fallback backend.
+                                    if (!gpuRecomputeNormals(renderer, mesh) &&
+                                        gpuNormalsAnnounced && isGpuNormalsDisabled()) {
+                                        // Compute path died at runtime — tell the
+                                        // plugin to resume CPU normal streaming.
+                                        gpuNormalsAnnounced = false;
+                                        window.chrome?.webview?.postMessage({ type: 'gpu_normals', enabled: false });
+                                    }
                                 }
 
                                 setGeometryVertexColorAttributes(mesh.geometry, incomingVertexColors, buf);

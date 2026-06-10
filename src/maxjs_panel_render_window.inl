@@ -991,6 +991,7 @@
         webview_ = nullptr;
         env_ = nullptr;
         jsReady_ = false;
+        gpuNormalsLive_ = false;
         useBinary_ = false;
         dirty_ = true;
         embeddedViewportHwnd_ = nullptr;

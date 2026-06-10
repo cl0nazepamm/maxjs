@@ -1897,6 +1897,15 @@
             ReloadWebContent();
             return;
         }
+        if (type == L"gpu_normals") {
+            // Viewer announces whether it rebuilds deform normals in a WebGPU
+            // compute pass. When live, the fast deform/sparse lane skips CPU
+            // normal extraction entirely and streams positions only.
+            bool enabled = false;
+            ExtractJsonBool(msg, L"enabled", enabled);
+            gpuNormalsLive_ = enabled;
+            return;
+        }
         if (type == L"lock_camera") {
             std::wstring handleStr;
             ExtractJsonString(msg, L"handle", handleStr);
@@ -2502,7 +2511,10 @@
             // silently dropped.
             bool usedSkinnedFastPositions = false;
             const FastSparseState* sparsePayload = nullptr;
-            const bool streamLiveNormals = !omitFastChannels;
+            // When the viewer's GPU normal recompute is live, every fast
+            // deform/sparse update goes positions-only regardless of size —
+            // normals are rebuilt in a WebGPU compute pass per update.
+            const bool streamLiveNormals = !omitFastChannels && !gpuNormalsLive_;
             if (wv17 && env12 && !forceFullGeometry && guardIt != fastDeformGuardMap_.end()) {
                 if (isDeforming && (!hasVertexColors || preferPositionOnlyDeformSync)) {
                     // The precomputed FastNormalPlan turns the per-frame normal

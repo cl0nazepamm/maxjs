@@ -132,6 +132,7 @@
 
     void PrepareForWebReload() {
         jsReady_ = false;
+        gpuNormalsLive_ = false;
         SetDirtyImmediate();
         tickCount_ = 0;
         geoScanCursor_ = 0;

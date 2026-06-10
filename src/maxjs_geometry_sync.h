@@ -629,7 +629,12 @@ static uint64_t MakeGeomValidityKey(const Interval& iv) {
 
 static constexpr int kSkinnedHashFullVertexThreshold = 16384;
 static constexpr int kSkinnedHashSampleCount = 256;
-static constexpr int kMaxBinaryDeltaTriangles = 600000;
+// Above this triangle count, fast deform updates go compact (positions only,
+// UVs/normals preserved viewer-side and refreshed at idle). Lowered from
+// 600k: with live normals now streaming on every fast update below the
+// threshold, the per-tick normal pass on very heavy meshes costs more than
+// frozen normals are worth during interaction.
+static constexpr int kMaxBinaryDeltaTriangles = 256000;
 static constexpr ULONGLONG kSkinnedLivePollIntervalMs = 16;
 static constexpr ULONGLONG kCameraLivePollIntervalMs = 16;
 

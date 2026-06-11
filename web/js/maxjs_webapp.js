@@ -300,15 +300,36 @@ export function createMaxJSWebAppSystem({ THREE, parent, getProjectBaseUrl, onPu
     }
 
     function postLayerIdentity(entry, inst, index) {
-        if (!inst.isIframe || !entry.data) return;
+        if (!entry.data) return;
         const count = entry.data.layerCount;
-        try { inst.host.contentWindow?.postMessage({ type: 'maxjs:layer', index, count }, '*'); } catch {}
+        if (inst.isIframe) {
+            try {
+                const docEl = inst.sameOrigin ? inst.host.contentDocument?.documentElement : null;
+                docEl?.style?.setProperty('--maxjs-layer-index', String(index));
+                docEl?.style?.setProperty('--maxjs-layer-count', String(count));
+                if (docEl?.dataset) {
+                    docEl.dataset.maxjsLayer = String(index);
+                    docEl.dataset.maxjsLayers = String(count);
+                }
+            } catch {}
+            try { inst.host.contentWindow?.postMessage({ type: 'maxjs:layer', index, count }, '*'); } catch {}
+        } else if (inst.divHost) {
+            try { window.postMessage({ type: 'maxjs:layer', index, count }, '*'); } catch {}
+        }
+    }
+
+    function applyLayerIdentity(entry) {
+        if (!entry.data || entry.data.layerCount <= 1) return;
+        for (let i = 0; i < entry.instances.length; i++) {
+            postLayerIdentity(entry, entry.instances[i], i);
+        }
     }
 
     function applyAll(entry) {
         composeTransform(entry);
         applyOpacity(entry, true);
         applyParams(entry, true);
+        applyLayerIdentity(entry);
         refreshPunchState();
     }
 
@@ -543,6 +564,7 @@ export function createMaxJSWebAppSystem({ THREE, parent, getProjectBaseUrl, onPu
         composeTransform(entry);
         applyOpacity(entry);
         applyParams(entry);
+        applyLayerIdentity(entry);
     }
 
     function destroyEntry(handle) {

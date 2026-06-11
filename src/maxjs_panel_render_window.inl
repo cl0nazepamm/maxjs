@@ -2,6 +2,7 @@
 
     HANDLE renderImageEvent_ = nullptr;  // signaled when JS confirms a Max-path frame rendered
     std::wstring renderToImageBase64_;   // canvas PNG (straight alpha) sent by JS for the Max path
+    std::wstring renderCss3dMaskBase64_;
     bool renderLocked_ = false;          // panel is locked to render resolution
     bool renderImageWarmed_ = false;     // first Max-path capture needs camera/sync settle time
     RECT preRenderRect_ = {};            // saved window rect before render
@@ -60,6 +61,8 @@
     // docs/WEBAPP_ANIMATOR.md).
     bool renderCompositedCapture_ = false;       // single-frame (VFB bitmap) path
     bool renderSequenceComposited_ = false;      // sequence path
+    bool renderSequenceWriteCss3dMask_ = false;
+    HANDLE renderCss3dMaskEvent_ = nullptr;
     double preCaptureRasterScale_ = 0.0;
     bool rasterScaleOverridden_ = false;
 
@@ -428,6 +431,75 @@
         return true;
     }
 
+    std::wstring RenderSequenceCss3dMaskPath() const {
+        const std::wstring framePath = RenderSequenceFramePath();
+        if (framePath.empty()) return {};
+        std::filesystem::path fsPath(framePath);
+        fsPath.replace_filename(fsPath.stem().wstring() + L"_css3d_mask.png");
+        return fsPath.wstring();
+    }
+
+    bool WriteRenderSequenceCss3dMaskBytes(const std::string& imageBytes, std::wstring& error) {
+        const std::wstring outputPath = RenderSequenceCss3dMaskPath();
+        if (outputPath.empty()) {
+            error = L"Missing CSS3D mask output path";
+            return false;
+        }
+
+        std::error_code ec;
+        const std::filesystem::path fsPath(outputPath);
+        const std::filesystem::path parent = fsPath.parent_path();
+        if (!parent.empty()) std::filesystem::create_directories(parent, ec);
+        if (ec) {
+            error = L"Failed to create CSS3D mask output directory";
+            return false;
+        }
+
+        if (!WriteBinaryFile(outputPath, imageBytes)) {
+            error = L"Failed to write CSS3D mask frame";
+            return false;
+        }
+        return true;
+    }
+
+    bool CaptureCss3dMaskImage(std::string& outBytes, DWORD timeoutMs = 15000) {
+        if (!webview_) return false;
+        if (!renderCss3dMaskEvent_) {
+            renderCss3dMaskEvent_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        }
+        if (!renderCss3dMaskEvent_) return false;
+        renderCss3dMaskBase64_.clear();
+        ResetEvent(renderCss3dMaskEvent_);
+
+        const int fps = GetFrameRate();
+        std::wstringstream msg;
+        msg << L"{\"type\":\"render_css3d_mask_begin\""
+            << L",\"width\":" << renderSequenceWidth_
+            << L",\"height\":" << renderSequenceHeight_
+            << L",\"frame\":" << renderSequenceCurrentFrame_
+            << L",\"fps\":" << fps << L"}";
+        webview_->PostWebMessageAsJson(msg.str().c_str());
+
+        const DWORD start = GetTickCount();
+        while (WaitForSingleObject(renderCss3dMaskEvent_, 0) != WAIT_OBJECT_0) {
+            if (GetTickCount() - start > timeoutMs) {
+                webview_->PostWebMessageAsJson(L"{\"type\":\"render_css3d_mask_end\"}");
+                return false;
+            }
+            MSG winMsg;
+            while (PeekMessage(&winMsg, nullptr, 0, 0, PM_REMOVE)) {
+                TranslateMessage(&winMsg);
+                DispatchMessage(&winMsg);
+            }
+            Sleep(1);
+        }
+
+        const bool ok = DecodeBase64Wide(renderCss3dMaskBase64_, outBytes);
+        renderCss3dMaskBase64_.clear();
+        webview_->PostWebMessageAsJson(L"{\"type\":\"render_css3d_mask_end\"}");
+        return ok && !outBytes.empty();
+    }
+
     void FinishRenderSequence(bool restoreTime = true) {
         if (webview_) {
             webview_->PostWebMessageAsJson(L"{\"type\":\"render_sequence_done\"}");
@@ -449,6 +521,7 @@
         renderSequenceFirstFrame_ = true;
         renderSequenceAlpha_ = false;
         renderSequenceComposited_ = false;
+        renderSequenceWriteCss3dMask_ = false;
         renderCameraOverrideActive_ = false;
         OverrideRasterizationScaleForCapture(false);
         UnlockRenderSize();
@@ -486,6 +559,19 @@
             renderSequenceLastError_ = error;
             FinishRenderSequence(false);
             return;
+        }
+        if (renderSequenceWriteCss3dMask_) {
+            std::string maskBytes;
+            if (!CaptureCss3dMaskImage(maskBytes) || maskBytes.empty()) {
+                renderSequenceLastError_ = L"CSS3D mask capture failed";
+                FinishRenderSequence(false);
+                return;
+            }
+            if (!WriteRenderSequenceCss3dMaskBytes(maskBytes, error)) {
+                renderSequenceLastError_ = error;
+                FinishRenderSequence(false);
+                return;
+            }
         }
         renderSequenceFrameInFlight_ = false;
         renderSequenceCurrentFrame_ += renderSequenceStep_;
@@ -554,6 +640,7 @@
                              int startFrame,
                              int endFrame,
                              int step,
+                             bool writeCss3dMask,
                              INode* renderViewNode,
                              const ViewParams* renderViewParams) {
         if (basePath.empty() || width <= 0 || height <= 0) return false;
@@ -574,6 +661,7 @@
         renderSequenceMime_ = mime.empty() ? L"image/png" : mime;
         // Composited capture is opaque by construction — no alpha matte.
         renderSequenceAlpha_ = !renderSequenceComposited_ && RenderMimeSupportsAlpha(renderSequenceMime_);
+        renderSequenceWriteCss3dMask_ = writeCss3dMask && renderSequenceComposited_;
         renderSequenceWidth_ = width;
         renderSequenceHeight_ = height;
         renderSequenceStartFrame_ = startFrame;

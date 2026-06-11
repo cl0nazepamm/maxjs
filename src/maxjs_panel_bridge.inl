@@ -138,12 +138,13 @@ bool StartMaxJSRenderSequence(const std::wstring& outputPath,
                               int startFrame,
                               int endFrame,
                               int step,
+                              bool writeCss3dMask,
                               INode* renderViewNode,
                               const ViewParams* renderViewParams) {
     EnsurePanel();
     if (!g_panel) return false;
     return g_panel->StartRenderSequence(outputPath, mime, width, height,
-        startFrame, endFrame, step, renderViewNode, renderViewParams);
+        startFrame, endFrame, step, writeCss3dMask, renderViewNode, renderViewParams);
 }
 
 static void RegisterMaxScript() {

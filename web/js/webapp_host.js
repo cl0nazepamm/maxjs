@@ -83,7 +83,57 @@ function isLocalAssetUrl(url) {
 // becomes same-origin with the viewer: synthetic event dispatch, direct CSS
 // variable writes, and injected per-layer stylesheets all work. A <base href>
 // keeps relative asset URLs resolving against the source directory.
-async function applySrcdocAdoption(iframe, url, injectCss) {
+function layerBridgeScript(layerIndex, layerCount) {
+    const index = Math.max(0, Math.floor(readNumber(layerIndex, 0)));
+    const count = Math.max(1, Math.floor(readNumber(layerCount, 1)));
+    return `
+<script data-maxjs-webapp-layer-bridge>
+(() => {
+  const index = ${JSON.stringify(index)};
+  const count = ${JSON.stringify(count)};
+  const transparentColors = new Set(['rgb(4, 4, 4)', 'rgb(5, 5, 5)', 'rgb(10, 10, 10)']);
+  function setIdentity() {
+    try {
+      document.documentElement.style.setProperty('--maxjs-layer-index', String(index));
+      document.documentElement.style.setProperty('--maxjs-layer-count', String(count));
+      document.documentElement.dataset.maxjsLayer = String(index);
+      document.documentElement.dataset.maxjsLayers = String(count);
+    } catch {}
+  }
+  function clearLayerBackdrops() {
+    if (count <= 1) return;
+    try {
+      document.documentElement.style.setProperty('background', 'transparent', 'important');
+      document.body?.style?.setProperty('background', 'transparent', 'important');
+      document.getElementById('root')?.style?.setProperty('background', 'transparent', 'important');
+      document.querySelectorAll('body, body *').forEach((el) => {
+        const bg = getComputedStyle(el).backgroundColor;
+        if (transparentColors.has(bg)) {
+          el.style.setProperty('background-color', 'transparent', 'important');
+          el.style.setProperty('background', 'transparent', 'important');
+        }
+      });
+    } catch {}
+  }
+  function publish() {
+    setIdentity();
+    clearLayerBackdrops();
+    try { window.postMessage({ type: 'maxjs:layer', index, count }, '*'); } catch {}
+  }
+  publish();
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', publish, { once: true });
+  }
+  requestAnimationFrame(publish);
+  setTimeout(publish, 50);
+  setTimeout(publish, 150);
+  setTimeout(publish, 500);
+  setTimeout(publish, 1000);
+})();
+</` + `script>`;
+}
+
+async function applySrcdocAdoption(iframe, url, injectCss, layerIdentity = null) {
     try {
         const response = await fetch(url, { cache: 'no-store' });
         if (!response.ok) throw new Error('HTTP ' + response.status);
@@ -91,7 +141,8 @@ async function applySrcdocAdoption(iframe, url, injectCss) {
         const baseHref = url.replace(/[^/]*$/, '');
         const injected = '<base href="' + baseHref + '">' +
             '<style data-maxjs-webapp-base>:root{color-scheme:light;}html,body{background:transparent;}</style>' +
-            (injectCss ? '<style data-maxjs-webapp-inject>' + injectCss + '</style>' : '');
+            (injectCss ? '<style data-maxjs-webapp-inject>' + injectCss + '</style>' : '') +
+            layerBridgeScript(layerIdentity?.index ?? 0, layerIdentity?.count ?? 1);
         iframe.srcdoc = /<head[^>]*>/i.test(text)
             ? text.replace(/<head[^>]*>/i, m => m + injected)
             : '<head>' + injected + '</head>' + text;
@@ -103,7 +154,7 @@ async function applySrcdocAdoption(iframe, url, injectCss) {
     }
 }
 
-async function createCSS3DHost({ url, width, height, interactive, behind = false, adoptLocal = false, injectCss = '' }) {
+async function createCSS3DHost({ url, width, height, interactive, behind = false, adoptLocal = false, injectCss = '', layerIndex = 0, layerCount = 1 }) {
     const { CSS3DObject } = await (behind ? overlay.acquireBehind() : overlay.acquire());
     const size = readWebappSize({ width, height });
     const iframe = document.createElement('iframe');
@@ -122,7 +173,7 @@ async function createCSS3DHost({ url, width, height, interactive, behind = false
     if (url) {
         if (adoptLocal && isLocalAssetUrl(url)) {
             sameOrigin = true;  // srcdoc lands async; load event still fires after adoption
-            applySrcdocAdoption(iframe, url, injectCss);
+            applySrcdocAdoption(iframe, url, injectCss, { index: layerIndex, count: layerCount });
         } else {
             iframe.src = url;
         }

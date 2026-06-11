@@ -51,7 +51,9 @@ function layerUrl(url, index, count) {
 // and the <html> element injected into texture-mode shadow roots.
 function layerCss(index, count) {
     if (count <= 1) return '';
-    const identity = `html{--maxjs-layer-index:${index};--maxjs-layer-count:${count};}`;
+    const identity = `html{--maxjs-layer-index:${index};--maxjs-layer-count:${count};}` +
+        'html,body{background:transparent !important;}' +
+        '#root{background:transparent !important;}';
     // Layer containers pass pointer hit-testing through (the forwarder walks
     // layers near→far and needs elementFromPoint to skip transparent regions);
     // interactive elements opt back in automatically, anything else via
@@ -61,8 +63,7 @@ function layerCss(index, count) {
     if (index === 0) {
         return `${identity}${hitTest}[data-maxjs-layer]:not([data-maxjs-layer="0"]){display:none !important;}`;
     }
-    return `${identity}${hitTest}body > :not([data-maxjs-layer="${index}"]):not(script):not(style){display:none !important;}` +
-        'html,body{background:transparent !important;}';
+    return `${identity}${hitTest}body > :not([data-maxjs-layer="${index}"]):not(script):not(style){display:none !important;}`;
 }
 
 export function createMaxJSWebAppSystem({ THREE, parent, getProjectBaseUrl, onPunchRectsChanged }) {
@@ -412,6 +413,8 @@ export function createMaxJSWebAppSystem({ THREE, parent, getProjectBaseUrl, onPu
             behind: d.depthOcclude,
             adoptLocal: d.depthOcclude,
             injectCss: layerCss(index, d.layerCount),
+            layerIndex: index,
+            layerCount: d.layerCount,
         };
         const built = useDivHost
             ? await createCSS3DDivHost(spec)

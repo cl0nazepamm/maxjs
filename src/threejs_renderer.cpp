@@ -35,6 +35,7 @@ extern bool StartMaxJSRenderSequence(const std::wstring& outputPath,
                                      int startFrame,
                                      int endFrame,
                                      int step,
+                                     bool writeCss3dMask,
                                      INode* renderViewNode,
                                      const ViewParams* renderViewParams);
 
@@ -45,6 +46,7 @@ static constexpr float kPathTracingDefaultGIClamp = 8.0f;
 static constexpr float kPathTracingMinGIClamp = 1.0f;
 static constexpr float kPathTracingMaxGIClamp = 1000.0f;
 static constexpr bool kDefaultUseMaxJSOrchestrator = true;
+static constexpr bool kDefaultWriteCss3dMask = false;
 static constexpr USHORT kThreeJSRendererSettingsChunk = 0x5100;
 
 static int ClampPathTracingSamplesPerFrame(int value) {
@@ -253,6 +255,7 @@ class ThreeJSRenderer : public Renderer {
     float pathTracingGIClamp_ = kPathTracingDefaultGIClamp;
     bool pathTracingFreezeSync_ = false;
     bool useMaxJSOrchestrator_ = kDefaultUseMaxJSOrchestrator;
+    bool writeCss3dMask_ = kDefaultWriteCss3dMask;
 
 public:
     ThreeJSRenderer() {}
@@ -279,6 +282,7 @@ public:
         r->pathTracingGIClamp_ = pathTracingGIClamp_;
         r->pathTracingFreezeSync_ = pathTracingFreezeSync_;
         r->useMaxJSOrchestrator_ = useMaxJSOrchestrator_;
+        r->writeCss3dMask_ = writeCss3dMask_;
         BaseClone(this, r, remap);
         return r;
     }
@@ -287,6 +291,7 @@ public:
     float GetPathTracingGIClamp() const { return pathTracingGIClamp_; }
     bool GetPathTracingFreezeSync() const { return pathTracingFreezeSync_; }
     bool GetUseMaxJSOrchestrator() const { return useMaxJSOrchestrator_; }
+    bool GetWriteCss3dMask() const { return writeCss3dMask_; }
 
     void BroadcastPathTracingSettings() const {
         SetMaxJSPathTracingSettings(pathTracingSamplesPerFrame_, pathTracingGIClamp_, pathTracingFreezeSync_);
@@ -301,6 +306,10 @@ public:
 
     void SetUseMaxJSOrchestrator(bool enabled) {
         useMaxJSOrchestrator_ = enabled;
+    }
+
+    void SetWriteCss3dMask(bool enabled) {
+        writeCss3dMask_ = enabled;
     }
 
     // ── Renderer core ────────────────────────────────────────
@@ -373,6 +382,7 @@ public:
             renderStartFrame_,
             renderEndFrame_,
             renderFrameStep_,
+            writeCss3dMask_,
             renderViewNode_,
             effectiveViewParams);
         return ok ? 1 : 0;
@@ -396,6 +406,7 @@ public:
             false
         );
         SetUseMaxJSOrchestrator(kDefaultUseMaxJSOrchestrator);
+        SetWriteCss3dMask(kDefaultWriteCss3dMask);
     }
 
     // ── Required overrides ───────────────────────────────────
@@ -433,11 +444,12 @@ public:
 
         std::ostringstream payload;
         payload.imbue(std::locale::classic());
-        payload << 2 << ' '
+        payload << 3 << ' '
                 << pathTracingSamplesPerFrame_ << ' '
                 << pathTracingGIClamp_ << ' '
                 << (pathTracingFreezeSync_ ? 1 : 0) << ' '
-                << (useMaxJSOrchestrator_ ? 1 : 0);
+                << (useMaxJSOrchestrator_ ? 1 : 0) << ' '
+                << (writeCss3dMask_ ? 1 : 0);
 
         isave->BeginChunk(kThreeJSRendererSettingsChunk);
         result = isave->WriteCString(payload.str().c_str());
@@ -463,12 +475,16 @@ public:
                     float giClamp = kPathTracingDefaultGIClamp;
                     int freezeSync = 0;
                     int useOrchestrator = kDefaultUseMaxJSOrchestrator ? 1 : 0;
+                    int writeCss3dMask = kDefaultWriteCss3dMask ? 1 : 0;
                     std::istringstream input(payload);
                     input.imbue(std::locale::classic());
                     if (input >> version >> samplesPerFrame >> giClamp >> freezeSync) {
                         SetPathTracingSettings(samplesPerFrame, giClamp, freezeSync != 0, false);
                         if (version >= 2 && (input >> useOrchestrator)) {
                             SetUseMaxJSOrchestrator(useOrchestrator != 0);
+                        }
+                        if (version >= 3 && (input >> writeCss3dMask)) {
+                            SetWriteCss3dMask(writeCss3dMask != 0);
                         }
                     }
                 }
@@ -492,6 +508,7 @@ class ThreeJSRendererParamDlg : public RendParamDlg {
     float giClamp_ = kPathTracingDefaultGIClamp;
     bool freezeSync_ = false;
     bool useMaxJSOrchestrator_ = kDefaultUseMaxJSOrchestrator;
+    bool writeCss3dMask_ = kDefaultWriteCss3dMask;
 
 public:
     ThreeJSRendererParamDlg(ThreeJSRenderer* renderer, IRendParams* rendParams, BOOL prog)
@@ -500,6 +517,7 @@ public:
         giClamp_ = renderer_ ? renderer_->GetPathTracingGIClamp() : kPathTracingDefaultGIClamp;
         freezeSync_ = renderer_ ? renderer_->GetPathTracingFreezeSync() : false;
         useMaxJSOrchestrator_ = renderer_ ? renderer_->GetUseMaxJSOrchestrator() : kDefaultUseMaxJSOrchestrator;
+        writeCss3dMask_ = renderer_ ? renderer_->GetWriteCss3dMask() : kDefaultWriteCss3dMask;
 
         panel_ = rendParams_->AddRollupPage(
             hInstance,
@@ -551,6 +569,7 @@ private:
 
         CheckDlgButton(hWnd, IDC_RENDERER_PT_FREEZE_SYNC, freezeSync_ ? BST_CHECKED : BST_UNCHECKED);
         CheckDlgButton(hWnd, IDC_RENDERER_USE_ORCHESTRATOR, useMaxJSOrchestrator_ ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(hWnd, IDC_RENDERER_WRITE_CSS3D_MASK, writeCss3dMask_ ? BST_CHECKED : BST_UNCHECKED);
         if (prog_) {
             EnableWindow(GetDlgItem(hWnd, IDC_RENDERER_PT_SPF_EDIT), FALSE);
             EnableWindow(GetDlgItem(hWnd, IDC_RENDERER_PT_SPF_SPIN), FALSE);
@@ -558,6 +577,7 @@ private:
             EnableWindow(GetDlgItem(hWnd, IDC_RENDERER_PT_GI_CLAMP_SPIN), FALSE);
             EnableWindow(GetDlgItem(hWnd, IDC_RENDERER_PT_FREEZE_SYNC), FALSE);
             EnableWindow(GetDlgItem(hWnd, IDC_RENDERER_USE_ORCHESTRATOR), FALSE);
+            EnableWindow(GetDlgItem(hWnd, IDC_RENDERER_WRITE_CSS3D_MASK), FALSE);
         }
         updating_ = false;
     }
@@ -582,6 +602,7 @@ private:
         }
         freezeSync_ = IsDlgButtonChecked(hWnd, IDC_RENDERER_PT_FREEZE_SYNC) == BST_CHECKED;
         useMaxJSOrchestrator_ = IsDlgButtonChecked(hWnd, IDC_RENDERER_USE_ORCHESTRATOR) == BST_CHECKED;
+        writeCss3dMask_ = IsDlgButtonChecked(hWnd, IDC_RENDERER_WRITE_CSS3D_MASK) == BST_CHECKED;
     }
 
     void CommitFromControls(HWND hWnd = nullptr) {
@@ -590,6 +611,7 @@ private:
         if (hWnd) ReadControls(hWnd);
         renderer_->SetPathTracingSettings(samplesPerFrame_, giClamp_, freezeSync_, true);
         renderer_->SetUseMaxJSOrchestrator(useMaxJSOrchestrator_);
+        renderer_->SetWriteCss3dMask(writeCss3dMask_);
     }
 
     INT_PTR WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -607,7 +629,8 @@ private:
             return FALSE;
         case WM_COMMAND:
             if (LOWORD(wParam) == IDC_RENDERER_PT_FREEZE_SYNC ||
-                LOWORD(wParam) == IDC_RENDERER_USE_ORCHESTRATOR) {
+                LOWORD(wParam) == IDC_RENDERER_USE_ORCHESTRATOR ||
+                LOWORD(wParam) == IDC_RENDERER_WRITE_CSS3D_MASK) {
                 CommitFromControls(hWnd);
                 return TRUE;
             }

@@ -2282,6 +2282,16 @@
             if (renderImageEvent_) SetEvent(renderImageEvent_);
             return;
         }
+        if (type == L"render_css3d_mask_ready") {
+            renderCss3dMaskBase64_.clear();
+            std::wstring jsError;
+            if (ExtractJsonString(msg, L"error", jsError) && !jsError.empty()) {
+                renderSequenceLastError_ = jsError;
+            }
+            ExtractJsonString(msg, L"imageBase64", renderCss3dMaskBase64_);
+            if (renderCss3dMaskEvent_) SetEvent(renderCss3dMaskEvent_);
+            return;
+        }
         if (type == L"sync_lightmap_uvs" || type == L"sync_uv2") {
             RequestFullGeometryResync();
             return;

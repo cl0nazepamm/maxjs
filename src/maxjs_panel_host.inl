@@ -87,6 +87,9 @@
     std::map<std::wstring, std::wstring> texDirMap_;    // dir → host
     int texDirCount_ = 0;
     bool lastClayMode_ = false;
+    int lastRenderOutputWidth_ = 0;
+    int lastRenderOutputHeight_ = 0;
+    float lastRenderOutputAspect_ = 0.0f;
     std::wstring activeWebDir_;
     std::uint64_t activeWebStamp_ = 0;
     bool productionRenderContentActive_ = false;

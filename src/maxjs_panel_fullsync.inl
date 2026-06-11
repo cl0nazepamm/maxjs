@@ -154,6 +154,7 @@
         ss << L'}';
 
         webview_->PostWebMessageAsJson(ss.str().c_str());
+        SendRenderOutputSettings(true);
         ResetFastPathState(true);
     }
 
@@ -939,6 +940,7 @@
         wv17->PostSharedBufferToScript(sharedBuf.Get(),
             COREWEBVIEW2_SHARED_BUFFER_ACCESS_READ_ONLY,
             ss.str().c_str());
+        SendRenderOutputSettings(true);
         ResetFastPathState(true);
     }
 

@@ -128,6 +128,12 @@
                     </button>
                     <span class="vpmenu-label">Camera Lock</span>
                 </div>
+                <div class="vpmenu-row devonly">
+                    <button id="btnSafeFrame" class="rail-btn" title="Crop viewport to render output" aria-label="Crop viewport to render output">
+                        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="4" width="12" height="8" rx="1"/><path d="M5 4v8M11 4v8"/></svg>
+                    </button>
+                    <span class="vpmenu-label" id="safeFrameLabel">Safe Frame</span>
+                </div>
             </div>
         </div>
         <!-- Standard: renderer menu -->
@@ -607,6 +613,120 @@
             splatsEnabled: true,
         });
         let performanceSettings = { ...PERFORMANCE_DEFAULTS };
+        const SAFE_FRAME_STORAGE_KEY = 'maxjs_safe_frame_enabled';
+        const renderOutputSettings = { width: 0, height: 0, aspect: 0 };
+        let safeFrameEnabled = false;
+        let blobOverlayCvs = null;
+        let blobOverlayCtx = null;
+
+        try {
+            safeFrameEnabled = localStorage.getItem(SAFE_FRAME_STORAGE_KEY) === 'true';
+        } catch {}
+
+        function getRenderOutputAspect() {
+            const width = Number(renderOutputSettings.width);
+            const height = Number(renderOutputSettings.height);
+            const aspect = Number(renderOutputSettings.aspect);
+            if (Number.isFinite(aspect) && aspect > 0) return aspect;
+            return Number.isFinite(width) && Number.isFinite(height) && width > 0 && height > 0
+                ? width / height
+                : null;
+        }
+
+        function getViewportFrameRect() {
+            const fullWidth = Math.max(1, innerWidth || 1);
+            const fullHeight = Math.max(1, innerHeight || 1);
+            const aspect = safeFrameEnabled ? getRenderOutputAspect() : null;
+            if (!aspect) return { x: 0, y: 0, width: fullWidth, height: fullHeight, aspect: fullWidth / fullHeight };
+
+            const viewportAspect = fullWidth / fullHeight;
+            let width = fullWidth;
+            let height = fullHeight;
+            if (viewportAspect > aspect) {
+                width = Math.max(1, Math.round(fullHeight * aspect));
+            } else {
+                height = Math.max(1, Math.round(fullWidth / aspect));
+            }
+            return {
+                x: Math.round((fullWidth - width) * 0.5),
+                y: Math.round((fullHeight - height) * 0.5),
+                width,
+                height,
+                aspect: width / height,
+            };
+        }
+
+        function applyFrameElementStyle(el, rect = getViewportFrameRect()) {
+            if (!el?.style) return;
+            el.style.position = 'absolute';
+            el.style.inset = 'auto';
+            el.style.left = `${rect.x}px`;
+            el.style.top = `${rect.y}px`;
+            el.style.width = `${rect.width}px`;
+            el.style.height = `${rect.height}px`;
+        }
+
+        function syncSafeFrameButtonUi() {
+            const button = document.getElementById('btnSafeFrame');
+            const label = document.getElementById('safeFrameLabel');
+            if (!button) return;
+            const aspect = getRenderOutputAspect();
+            const sizeLabel = aspect && renderOutputSettings.width > 0 && renderOutputSettings.height > 0
+                ? `${renderOutputSettings.width}x${renderOutputSettings.height}`
+                : 'render output';
+            button.classList.toggle('active', safeFrameEnabled);
+            button.setAttribute('aria-pressed', safeFrameEnabled ? 'true' : 'false');
+            button.title = safeFrameEnabled
+                ? `Safe Frame on - cropped to ${sizeLabel}`
+                : `Safe Frame off - click to crop viewport to ${sizeLabel}`;
+            button.setAttribute('aria-label', safeFrameEnabled ? 'Safe Frame on' : 'Safe Frame off');
+            if (label) label.textContent = aspect ? `Safe Frame ${sizeLabel}` : 'Safe Frame';
+        }
+
+        function updateCameraProjectionForViewportRect() {
+            const rect = getViewportFrameRect();
+            const aspect = rect.aspect || 1;
+            if (camera?.isPerspectiveCamera) {
+                camera.aspect = aspect;
+            } else if (camera?.isOrthographicCamera) {
+                const viewWidth = Math.max(0.001, camera.right - camera.left);
+                camera.left = -viewWidth / 2;
+                camera.right = viewWidth / 2;
+                camera.top = viewWidth / (2 * aspect);
+                camera.bottom = -viewWidth / (2 * aspect);
+            }
+            camera?.updateProjectionMatrix?.();
+            return rect;
+        }
+
+        function applyRenderViewportLayout({ resizeBuffers = false, resizePostFx = false } = {}) {
+            const rect = updateCameraProjectionForViewportRect();
+            if (renderer) {
+                if (resizeBuffers) renderer.setSize(rect.width, rect.height);
+                applyFrameElementStyle(renderer.domElement, rect);
+            }
+            if (splatOverlay?.renderer) {
+                if (resizeBuffers) splatOverlay.renderer.setSize(rect.width, rect.height, false);
+                applyFrameElementStyle(splatOverlay.renderer.domElement, rect);
+            }
+            if (asciiEffect?.domElement) {
+                asciiEffect.setSize(rect.width, rect.height);
+                applyFrameElementStyle(asciiEffect.domElement, rect);
+            }
+            if (blobOverlayCvs) {
+                if (blobOverlayCvs.width !== rect.width) blobOverlayCvs.width = rect.width;
+                if (blobOverlayCvs.height !== rect.height) blobOverlayCvs.height = rect.height;
+                applyFrameElementStyle(blobOverlayCvs, rect);
+            }
+            css3dOverlay.setSize(rect.width, rect.height);
+            css3dOverlay.setViewportRect(rect);
+            if (resizePostFx) {
+                maxjsFx.resize();
+                webglBasicFx.resize?.();
+            }
+            syncSafeFrameButtonUi();
+            return rect;
+        }
 
         // User-overridable camera clip planes. null means "use auto-fit value".
         // Raise `near` to reclaim depth precision on large scenes where distant geo z-fights.
@@ -642,17 +762,28 @@
         }
 
         function applyRendererPerformanceSettings({ resizePostFx = false } = {}) {
+            const rect = getViewportFrameRect();
             if (renderer) {
                 renderer.setPixelRatio(getEffectivePixelRatio());
-                renderer.setSize(innerWidth, innerHeight);
+                renderer.setSize(rect.width, rect.height);
+                applyFrameElementStyle(renderer.domElement, rect);
             }
             if (splatOverlay?.renderer) {
                 splatOverlay.renderer.setPixelRatio(getEffectivePixelRatio());
-                splatOverlay.renderer.setSize(innerWidth, innerHeight, false);
+                splatOverlay.renderer.setSize(rect.width, rect.height, false);
+                applyFrameElementStyle(splatOverlay.renderer.domElement, rect);
+            }
+            if (blobOverlayCvs) {
+                if (blobOverlayCvs.width !== rect.width) blobOverlayCvs.width = rect.width;
+                if (blobOverlayCvs.height !== rect.height) blobOverlayCvs.height = rect.height;
+                applyFrameElementStyle(blobOverlayCvs, rect);
             }
             lastRenderTimestamp = 0;
             maxjsFx.setResolutionScale?.(getEffectivePostFxResolutionScale());
             webglBasicFx.setResolutionScale?.(getEffectivePostFxResolutionScale());
+            updateCameraProjectionForViewportRect();
+            css3dOverlay.setSize(rect.width, rect.height);
+            css3dOverlay.setViewportRect(rect);
             if (resizePostFx) {
                 maxjsFx.resize();
                 webglBasicFx.resize?.();
@@ -660,14 +791,14 @@
         }
 
         function configureRenderer(nextRenderer) {
-            nextRenderer.setSize(innerWidth, innerHeight);
+            const rect = getViewportFrameRect();
+            nextRenderer.setSize(rect.width, rect.height);
             nextRenderer.setPixelRatio(getEffectivePixelRatio());
             nextRenderer.toneMapping = THREE.NeutralToneMapping;
             nextRenderer.toneMappingExposure = 1.0;
             nextRenderer.shadowMap.enabled = true;
             nextRenderer.setClearColor?.(0x000000, 0);
-            nextRenderer.domElement.style.position = 'absolute';
-            nextRenderer.domElement.style.inset = '0';
+            applyFrameElementStyle(nextRenderer.domElement, rect);
             nextRenderer.domElement.style.zIndex = '0';
             document.body.appendChild(nextRenderer.domElement);
         }
@@ -1398,16 +1529,23 @@
         }
 
         // Clone blob overlay — 2D canvas for bounding rectangles
-        const blobOverlayCvs = document.createElement('canvas');
+        blobOverlayCvs = document.createElement('canvas');
         blobOverlayCvs.style.cssText = 'position:absolute;inset:0;pointer-events:none;z-index:10';
-        blobOverlayCvs.width = innerWidth;
-        blobOverlayCvs.height = innerHeight;
+        const initialBlobFrameRect = getViewportFrameRect();
+        blobOverlayCvs.width = initialBlobFrameRect.width;
+        blobOverlayCvs.height = initialBlobFrameRect.height;
+        applyFrameElementStyle(blobOverlayCvs, initialBlobFrameRect);
         document.body.appendChild(blobOverlayCvs);
-        const blobOverlayCtx = blobOverlayCvs.getContext('2d');
+        blobOverlayCtx = blobOverlayCvs.getContext('2d');
         addEventListener('resize', () => {
-            blobOverlayCvs.width = innerWidth;
-            blobOverlayCvs.height = innerHeight;
-            if (asciiActive && asciiEffect) asciiEffect.setSize(innerWidth, innerHeight);
+            const rect = getViewportFrameRect();
+            blobOverlayCvs.width = rect.width;
+            blobOverlayCvs.height = rect.height;
+            applyFrameElementStyle(blobOverlayCvs, rect);
+            if (asciiActive && asciiEffect) {
+                asciiEffect.setSize(rect.width, rect.height);
+                applyFrameElementStyle(asciiEffect.domElement, rect);
+            }
         });
 
         function queueSplatMutation(work) {
@@ -1445,10 +1583,12 @@
             const overlayRenderer = new THREE_STD.WebGLRenderer({
                 antialias: true, alpha: true, premultipliedAlpha: true,
             });
+            const rect = getViewportFrameRect();
             overlayRenderer.setPixelRatio(getEffectivePixelRatio());
-            overlayRenderer.setSize(innerWidth, innerHeight, false);
+            overlayRenderer.setSize(rect.width, rect.height, false);
             overlayRenderer.setClearColor(0x000000, 0);
             overlayRenderer.domElement.style.cssText = 'position:absolute;inset:0;pointer-events:none;z-index:5';
+            applyFrameElementStyle(overlayRenderer.domElement, rect);
             overlayRenderer.outputColorSpace = THREE_STD.SRGBColorSpace;
             document.body.appendChild(overlayRenderer.domElement);
 
@@ -4674,6 +4814,28 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
 
         applyLiveSyncSettings({ disabled: slowJsonSyncMode }, { sendHost: true, persist: false });
 
+        bridge.on('render_output_settings', msg => {
+            const width = Math.max(1, Math.round(Number(msg.width) || 0));
+            const height = Math.max(1, Math.round(Number(msg.height) || 0));
+            const aspect = Math.max(0, Number(msg.aspect) || 0);
+            if (
+                renderOutputSettings.width === width &&
+                renderOutputSettings.height === height &&
+                Math.abs((renderOutputSettings.aspect || 0) - aspect) < 1.0e-4
+            ) {
+                syncSafeFrameButtonUi();
+                return;
+            }
+            renderOutputSettings.width = width;
+            renderOutputSettings.height = height;
+            renderOutputSettings.aspect = aspect;
+            if (safeFrameEnabled) {
+                applyRenderViewportLayout({ resizeBuffers: true, resizePostFx: true });
+            } else {
+                syncSafeFrameButtonUi();
+            }
+        });
+
         bridge.on('pathtracing_settings', msg => {
             applyPathTracingSettings({
                 samplesPerFrame: msg.samplesPerFrame,
@@ -4904,9 +5066,11 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             asciiEffect = new AsciiEffect(renderer, ASCII_CHARS, {
                 invert: asciiSettings.invert, resolution: asciiSettings.resolution,
             });
-            asciiEffect.setSize(innerWidth, innerHeight);
+            const rect = getViewportFrameRect();
+            asciiEffect.setSize(rect.width, rect.height);
             asciiEffect.domElement.style.cssText = 'position:absolute;inset:0;z-index:1;color:' +
                 (ASCII_COLORS[asciiSettings.color] || '#fff') + ';background:#000;overflow:hidden';
+            applyFrameElementStyle(asciiEffect.domElement, rect);
             document.body.appendChild(asciiEffect.domElement);
         }
         let clayPreFxSnapshot = null;
@@ -10069,6 +10233,9 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         let renderToImageActive = false;
         let pendingRenderToImage = null;
         let renderToImageForcePathTracing = false;
+        // Sticky across sequence frames (pendingRenderToImage clears between
+        // them) so punch state doesn't flicker mid-sequence.
+        let renderCaptureComposited = false;
 
         function readBlobAsDataUrl(blob) {
             return new Promise((resolve, reject) => {
@@ -10128,6 +10295,10 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         function getCameraProjectionAspect() {
             if (renderToImageActive && pendingRenderToImage?.width > 0 && pendingRenderToImage?.height > 0) {
                 return pendingRenderToImage.width / pendingRenderToImage.height;
+            }
+            if (safeFrameEnabled) {
+                const aspect = getRenderOutputAspect();
+                if (aspect) return aspect;
             }
             if (camera?.isPerspectiveCamera && Number.isFinite(camera.aspect) && camera.aspect > 0) {
                 return camera.aspect;
@@ -10331,6 +10502,18 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 location.reload();
             }
         };
+
+        document.getElementById('btnSafeFrame')?.addEventListener('click', () => {
+            safeFrameEnabled = !safeFrameEnabled;
+            try {
+                localStorage.setItem(SAFE_FRAME_STORAGE_KEY, safeFrameEnabled ? 'true' : 'false');
+            } catch {}
+            applyRenderViewportLayout({ resizeBuffers: true, resizePostFx: true });
+            perfHud.setStatus(safeFrameEnabled
+                ? 'max.js - safe frame crop on'
+                : 'max.js - safe frame crop off');
+        });
+        syncSafeFrameButtonUi();
 
         const SNAPSHOT_SETTINGS_KEY = 'maxjs_snapshot_settings';
         const SNAPSHOT_SETTINGS_DEFAULTS = Object.freeze({
@@ -13490,26 +13673,9 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         // One pipeline churn event per resize gesture instead of dozens.
         let resizeTimer = null;
         addEventListener('resize', () => {
-            if (camera.isPerspectiveCamera) {
-                camera.aspect = innerWidth / innerHeight;
-            } else {
-                const viewWidth = Math.max(0.001, camera.right - camera.left);
-                const aspect = innerWidth / innerHeight;
-                camera.top = viewWidth / (2 * aspect);
-                camera.bottom = -viewWidth / (2 * aspect);
-            }
-            camera.updateProjectionMatrix();
             // CSS-only update keeps the canvas visually filling the viewport
             // during drag. No drawing-buffer resize → no swap chain churn.
-            if (renderer?.domElement) {
-                renderer.domElement.style.width = innerWidth + 'px';
-                renderer.domElement.style.height = innerHeight + 'px';
-            }
-            if (splatOverlay?.renderer?.domElement) {
-                splatOverlay.renderer.domElement.style.width = innerWidth + 'px';
-                splatOverlay.renderer.domElement.style.height = innerHeight + 'px';
-            }
-            css3dOverlay.setSize(innerWidth, innerHeight);
+            applyRenderViewportLayout({ resizeBuffers: false, resizePostFx: false });
             clearTimeout(resizeTimer);
             resizeTimer = setTimeout(() => {
                 applyRendererPerformanceSettings({ resizePostFx: false });
@@ -13953,9 +14119,11 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             layerManager.beforeRender?.(frameElapsed);
             // Depth-occluded web panels: pick punch mode for this frame.
             // Pipeline active → analytic mask (occluder meshes hidden);
-            // direct render → occluder meshes punch natively. Captures
-            // suppress punching entirely so output never ships alpha holes.
-            webappSystem?.setPunchSuppressed?.(renderToImageActive === true);
+            // direct render → occluder meshes punch natively. Canvas-readback
+            // captures suppress punching (no alpha holes in output); composited
+            // captures keep it — the DOM behind the holes IS in the output.
+            webappSystem?.setPunchSuppressed?.(
+                renderToImageActive === true && !renderCaptureComposited);
             webappSystem?.setPunchPipelineActive?.(maxjsFx.isPipelineRenderActive?.() === true);
             try {
                 if (pathTracingFx.isEnabled?.() && (!renderToImageActive || pendingRenderToImage?.pathTracing)) {
@@ -14069,11 +14237,21 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                         } finally {
                             renderToImageForcePathTracing = false;
                         }
-                        // Both paths read the canvas back to C++. The Max-bitmap
-                        // path (render_to_image_ready) needs the pixels too — its
-                        // alpha channel only survives from the canvas, not from
-                        // WebView2 CapturePreview.
-                        void sendCurrentCanvasRenderFile(capture);
+                        if (capture.composited) {
+                            // C++ captures the WebView composite (CapturePreview)
+                            // on receipt — DOM panels + canvas as displayed. One
+                            // extra frame lets the compositor present the final
+                            // CSS3D state before the grab.
+                            requestAnimationFrame(() => {
+                                bridge.send(capture.responseType, { composited: true });
+                            });
+                        } else {
+                            // Both paths read the canvas back to C++. The Max-bitmap
+                            // path (render_to_image_ready) needs the pixels too — its
+                            // alpha channel only survives from the canvas, not from
+                            // WebView2 CapturePreview.
+                            void sendCurrentCanvasRenderFile(capture);
+                        }
                     });
                 }
             }
@@ -14216,7 +14394,12 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             const warmupMs = Number.isFinite(msg.warmupMs) ? Math.max(0, msg.warmupMs) : 250;
             const isSequenceFrame = responseType === 'render_sequence_frame_file';
             const captureMime = typeof msg.mime === 'string' && msg.mime ? msg.mime : 'image/png';
-            const wantsAlpha = msg.alpha === true && mimeSupportsAlpha(captureMime);
+            // Composited capture: C++ grabs the WebView composite (CapturePreview)
+            // so CSS3D web panels appear in the output. DOM panel roots stay
+            // visible, punch stays active, and JS skips the canvas readback.
+            const compositedCapture = msg.composited === true;
+            renderCaptureComposited = compositedCapture;
+            const wantsAlpha = !compositedCapture && msg.alpha === true && mimeSupportsAlpha(captureMime);
             const usePathTracing = pathTracingFx.isEnabled?.() === true;
             const ptMinSamples = Number.isFinite(msg.pathTracingSamples)
                 ? Math.max(1, Math.floor(msg.pathTracingSamples))
@@ -14232,6 +14415,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 responseType,
                 mime: captureMime,
                 alpha: wantsAlpha,
+                composited: compositedCapture,
                 pathTracing: usePathTracing,
                 pathTracingMinSamples: usePathTracing ? ptMinSamples : 1,
                 startedAtMs: performance.now(),
@@ -14245,18 +14429,22 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 ),
             };
 
-            // Hide all UI — keep only canvas elements visible
+            // Hide all UI — keep only canvas elements visible. Composited
+            // capture also keeps the CSS3D panel roots: those pixels ARE the
+            // content being rendered.
             if (!wasAlreadyActive) {
                 for (const el of document.body.children) {
-                    if (el.tagName !== 'CANVAS' && el.tagName !== 'SCRIPT') {
-                        el._rtiPrevDisplay = el.style.display;
-                        el.style.display = 'none';
-                    }
+                    if (el.tagName === 'CANVAS' || el.tagName === 'SCRIPT') continue;
+                    if (compositedCapture && (el.id === 'maxjs-css3d-root' || el.id === 'maxjs-css3d-behind-root')) continue;
+                    el._rtiPrevDisplay = el.style.display;
+                    el.style.display = 'none';
                 }
                 const captureBackdropColor = !wantsAlpha && envVisible && !getEnvironmentBackgroundMap()
                     ? `#${hiddenBackgroundColor.toString(16).padStart(6, '0')}`
                     : 'transparent';
-                document.body.style.background = captureBackdropColor;
+                // Composited capture is WYSIWYG — keep the live viewport
+                // background instead of the capture backdrop override.
+                if (!compositedCapture) document.body.style.background = captureBackdropColor;
 
                 // Save and bypass all performance throttling
                 savedPerformanceSettings = { ...performanceSettings };
@@ -14323,6 +14511,8 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             // Set renderer to exact requested resolution, pixel ratio 1:1
             renderer.setPixelRatio(1);
             renderer.setSize(w, h);
+            const captureRect = { x: 0, y: 0, width: w, height: h, aspect: w / h };
+            applyFrameElementStyle(renderer.domElement, captureRect);
             if (camera.isPerspectiveCamera) {
                 camera.aspect = w / h;
             } else {
@@ -14339,7 +14529,10 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             if (splatOverlay?.renderer) {
                 splatOverlay.renderer.setPixelRatio(1);
                 splatOverlay.renderer.setSize(w, h, false);
+                applyFrameElementStyle(splatOverlay.renderer.domElement, captureRect);
             }
+            css3dOverlay.setSize(w, h);
+            css3dOverlay.setViewportRect(captureRect);
 
             try {
                 // Wait for the fresh synced frame to land; renderFrame will perform the one-shot render.
@@ -14357,6 +14550,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             renderToImageActive = false;
             pendingRenderToImage = null;
             renderToImageForcePathTracing = false;
+            renderCaptureComposited = false;
             pathTracingFx.setCaptureMode?.(false);
 
             // Restore all UI elements
@@ -14396,8 +14590,6 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     syncEnvironmentDisplay();
                 }
             }
-            camera.aspect = innerWidth / innerHeight;
-            camera.updateProjectionMatrix();
             applyRendererPerformanceSettings({ resizePostFx: true });
         }
 

@@ -42,6 +42,34 @@ function ensureRoot() {
     return el;
 }
 
+function applyRootRect(el, rect) {
+    if (!el) return;
+    const x = Number(rect?.x);
+    const y = Number(rect?.y);
+    const width = Number(rect?.width);
+    const height = Number(rect?.height);
+    if (
+        Number.isFinite(x) &&
+        Number.isFinite(y) &&
+        Number.isFinite(width) &&
+        Number.isFinite(height) &&
+        width > 0 &&
+        height > 0
+    ) {
+        el.style.inset = 'auto';
+        el.style.left = `${x}px`;
+        el.style.top = `${y}px`;
+        el.style.width = `${width}px`;
+        el.style.height = `${height}px`;
+        return;
+    }
+    el.style.inset = '0';
+    el.style.left = '';
+    el.style.top = '';
+    el.style.width = '';
+    el.style.height = '';
+}
+
 export async function acquire() {
     const mod = await loadRenderer();
     if (!cssRenderer) {
@@ -94,6 +122,11 @@ export function tickBehind(scene, camera) {
 export function setSize(width, height) {
     if (cssRenderer) cssRenderer.setSize(width, height);
     if (behindRenderer) behindRenderer.setSize(width, height);
+}
+
+export function setViewportRect(rect) {
+    applyRootRect(rootEl, rect);
+    applyRootRect(behindRootEl, rect);
 }
 
 export function isActive() {

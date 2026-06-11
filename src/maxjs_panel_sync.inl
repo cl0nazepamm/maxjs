@@ -2253,6 +2253,13 @@
             if (ExtractJsonString(msg, L"error", jsError) && !jsError.empty()) {
                 renderSequenceLastError_ = jsError;
                 FinishRenderSequence(false);
+            } else if (renderSequenceComposited_) {
+                // CSS3D web panels in the scene: the frame only exists in the
+                // WebView composite. CapturePreview CANNOT run from inside
+                // this WebMessageReceived handler (its completion dispatches
+                // through the event queue this handler is blocking — pumping
+                // here deadlocks). Defer to a clean WndProc stack.
+                PostMessage(hwnd_, WM_RENDER_SEQUENCE_CAPTURE, 0, 0);
             } else if (!ExtractJsonString(msg, L"imageBase64", imageBase64) || imageBase64.empty()) {
                 renderSequenceLastError_ = L"Missing browser render payload";
                 FinishRenderSequence(false);
@@ -2453,6 +2460,40 @@
                 : L"{\"type\":\"clay_mode\",\"enabled\":false}";
             webview_->PostWebMessageAsJson(msg.c_str());
         }
+
+        SendRenderOutputSettings(force);
+    }
+
+    void SendRenderOutputSettings(bool force = false) {
+        if (!webview_) return;
+        Interface* ip = GetCOREInterface();
+        if (!ip) return;
+
+        const int width = std::max(1, ip->GetRendWidth());
+        const int height = std::max(1, ip->GetRendHeight());
+        float aspect = ip->GetRendImageAspect();
+        if (!std::isfinite(aspect) || aspect <= 0.0f) {
+            aspect = static_cast<float>(width) / static_cast<float>(height);
+        }
+        if (!force &&
+            width == lastRenderOutputWidth_ &&
+            height == lastRenderOutputHeight_ &&
+            std::fabs(aspect - lastRenderOutputAspect_) < 1.0e-4f) {
+            return;
+        }
+
+        lastRenderOutputWidth_ = width;
+        lastRenderOutputHeight_ = height;
+        lastRenderOutputAspect_ = aspect;
+
+        std::wostringstream ss;
+        ss.imbue(std::locale::classic());
+        ss << L"{\"type\":\"render_output_settings\",\"width\":" << width
+           << L",\"height\":" << height
+           << L",\"aspect\":";
+        WriteFloatValue(ss, aspect, static_cast<float>(width) / static_cast<float>(height));
+        ss << L"}";
+        webview_->PostWebMessageAsJson(ss.str().c_str());
     }
 
     // Surgical geometry update — sends ONLY changed mesh data, no metadata for other nodes
@@ -3751,10 +3792,22 @@
         static const ParamID valueIds[kWebAppParamChannels] = {
             pw_param1, pw_param2, pw_param3, pw_param4,
             pw_param5, pw_param6, pw_param7, pw_param8,
+            pw_param9, pw_param10, pw_param11, pw_param12,
+            pw_param13, pw_param14, pw_param15, pw_param16,
+            pw_param17, pw_param18, pw_param19, pw_param20,
+            pw_param21, pw_param22, pw_param23, pw_param24,
+            pw_param25, pw_param26, pw_param27, pw_param28,
+            pw_param29, pw_param30, pw_param31, pw_param32,
         };
         static const ParamID nameIds[kWebAppParamChannels] = {
             pw_param1_name, pw_param2_name, pw_param3_name, pw_param4_name,
             pw_param5_name, pw_param6_name, pw_param7_name, pw_param8_name,
+            pw_param9_name, pw_param10_name, pw_param11_name, pw_param12_name,
+            pw_param13_name, pw_param14_name, pw_param15_name, pw_param16_name,
+            pw_param17_name, pw_param18_name, pw_param19_name, pw_param20_name,
+            pw_param21_name, pw_param22_name, pw_param23_name, pw_param24_name,
+            pw_param25_name, pw_param26_name, pw_param27_name, pw_param28_name,
+            pw_param29_name, pw_param30_name, pw_param31_name, pw_param32_name,
         };
         for (int i = 0; i < kWebAppParamChannels; ++i) {
             const MCHAR* name = pb->GetStr(nameIds[i]);
@@ -5105,10 +5158,22 @@
         static const ParamID valueIds[kWebAppParamChannels] = {
             pw_param1, pw_param2, pw_param3, pw_param4,
             pw_param5, pw_param6, pw_param7, pw_param8,
+            pw_param9, pw_param10, pw_param11, pw_param12,
+            pw_param13, pw_param14, pw_param15, pw_param16,
+            pw_param17, pw_param18, pw_param19, pw_param20,
+            pw_param21, pw_param22, pw_param23, pw_param24,
+            pw_param25, pw_param26, pw_param27, pw_param28,
+            pw_param29, pw_param30, pw_param31, pw_param32,
         };
         static const ParamID nameIds[kWebAppParamChannels] = {
             pw_param1_name, pw_param2_name, pw_param3_name, pw_param4_name,
             pw_param5_name, pw_param6_name, pw_param7_name, pw_param8_name,
+            pw_param9_name, pw_param10_name, pw_param11_name, pw_param12_name,
+            pw_param13_name, pw_param14_name, pw_param15_name, pw_param16_name,
+            pw_param17_name, pw_param18_name, pw_param19_name, pw_param20_name,
+            pw_param21_name, pw_param22_name, pw_param23_name, pw_param24_name,
+            pw_param25_name, pw_param26_name, pw_param27_name, pw_param28_name,
+            pw_param29_name, pw_param30_name, pw_param31_name, pw_param32_name,
         };
         appendComma();
         ss << L"\"params\":{";

@@ -22,6 +22,7 @@ projects/
 projects/*/dist/node_modules/
 AGENTS.md
 docs/
+figma-webapp-*.md
 dev.bat
 dev2027.bat
 debug.bat

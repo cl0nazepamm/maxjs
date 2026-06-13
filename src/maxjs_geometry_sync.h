@@ -13,6 +13,7 @@
 #include <Scene/IHairModifier.h>
 
 #include "maxjs_core_utils.h"
+#include "threejs_deform.h"
 #include "threejs_splat.h"
 
 #include <algorithm>
@@ -149,6 +150,85 @@ static void TrimDefaultVertexColorAttributes(std::vector<VertexColorAttributeRec
                 return attr.values.empty() || IsDefaultVertexColorAttribute(attr);
             }),
         attrs.end());
+}
+
+// ── Deform weight channel (three.js Deform + sub-object selection) ──
+// A Poly Select / Vol. Select below the three.js Deform modifier (or an Edit
+// Poly soft selection above it) leaves the pipeline's vertex selection and
+// soft-selection falloff in the evaluated mesh. Captured per SOURCE vertex
+// here, expanded per render vertex through the controlIdx mapping, and
+// shipped as the "deformWeight" vc channel so the web runtime exposes it as
+// a geometry attribute. Packed (w,w,w,w) so an all-zero selection never
+// matches the default-channel trim patterns. Object-level selection emits
+// nothing — absence means "weight 1 everywhere" on the web side.
+static constexpr const char* kDeformWeightAttrName = "deformWeight";
+static constexpr int kDeformWeightChannel = -100;
+
+static bool NodeHasThreeJSDeformModifier(INode* node) {
+    if (!node) return false;
+    Object* obj = node->GetObjectRef();
+    while (obj && obj->SuperClassID() == GEN_DERIVOB_CLASS_ID) {
+        IDerivedObject* dobj = static_cast<IDerivedObject*>(obj);
+        for (int i = 0; i < dobj->NumModifiers(); i++) {
+            Modifier* mod = dobj->GetModifier(i);
+            if (mod && mod->IsEnabled() && IsThreeJSDeformClassID(mod->ClassID())) return true;
+        }
+        obj = dobj->GetObjRef();
+    }
+    return false;
+}
+
+// Canonical Max deformer weighting: hard-selected verts are 1, otherwise the
+// soft-selection falloff weight (0 when none). Mirrors how SimpleMod-style
+// modifiers consume the selection channel.
+static bool CaptureMeshDeformWeights(Mesh& mesh, std::vector<float>& out) {
+    if (mesh.selLevel == MESH_OBJECT) return false;
+    const int numVerts = mesh.getNumVerts();
+    if (numVerts <= 0) return false;
+    BitArray sel = mesh.VertexTempSel();
+    const float* vsw = mesh.getVSelectionWeights();
+    out.resize(static_cast<size_t>(numVerts));
+    for (int i = 0; i < numVerts; ++i) {
+        const bool hard = i < sel.GetSize() && sel[i];
+        const float w = hard ? 1.0f : (vsw ? vsw[i] : 0.0f);
+        out[static_cast<size_t>(i)] = std::clamp(w, 0.0f, 1.0f);
+    }
+    return true;
+}
+
+static bool CaptureMNMeshDeformWeights(MNMesh& mn, std::vector<float>& out) {
+    if (mn.selLevel == MNM_SL_OBJECT) return false;
+    const int numVerts = mn.numv;
+    if (numVerts <= 0) return false;
+    BitArray sel = mn.VertexTempSel();
+    const float* vsw = mn.getVSelectionWeights();
+    out.resize(static_cast<size_t>(numVerts));
+    for (int i = 0; i < numVerts; ++i) {
+        const bool hard = i < sel.GetSize() && sel[i];
+        const float w = hard ? 1.0f : (vsw ? vsw[i] : 0.0f);
+        out[static_cast<size_t>(i)] = std::clamp(w, 0.0f, 1.0f);
+    }
+    return true;
+}
+
+static void AppendDeformWeightChannel(const std::vector<float>& srcWeights,
+                                      const std::vector<int>& controlIdx,
+                                      std::vector<VertexColorAttributeRecord>* outVertexColors) {
+    if (!outVertexColors || srcWeights.empty() || controlIdx.empty()) return;
+    VertexColorAttributeRecord attr;
+    attr.channel = kDeformWeightChannel;
+    attr.attrName = kDeformWeightAttrName;
+    attr.values.reserve(controlIdx.size() * 4);
+    for (const int src : controlIdx) {
+        const float w = (src >= 0 && src < static_cast<int>(srcWeights.size()))
+            ? srcWeights[static_cast<size_t>(src)]
+            : 1.0f;
+        attr.values.push_back(w);
+        attr.values.push_back(w);
+        attr.values.push_back(w);
+        attr.values.push_back(w);
+    }
+    outVertexColors->push_back(std::move(attr));
 }
 
 static void WriteVertexColorAttributesJson(std::wostringstream& ss,
@@ -2233,13 +2313,24 @@ static bool ExtractMesh(INode* node, TimeValue t,
                         bool emitPrimaryUVs = true,
                         FastDeformTopoEpoch* outEpoch = nullptr) {
     const bool allowMapChannel1 = ShouldAllowVertexColorMapChannel1(node);
+    // three.js Deform weight channel — needs the render→source vertex mapping
+    // even when the caller didn't request controlIdx.
+    const bool wantsDeformWeights = outVertexColors && NodeHasThreeJSDeformModifier(node);
+    std::vector<int> deformWeightControlIdx;
+    std::vector<int>* weightedControlIdx = controlIdx;
+    if (wantsDeformWeights && !weightedControlIdx) weightedControlIdx = &deformWeightControlIdx;
+    std::vector<float> deformWeights;
+
     if (MNMesh* liveMN = TryGetLiveEditablePolyMesh(node)) {
         // When UV2 is requested, prefer the evaluated object if the live
         // Editable Poly mesh does not carry map channel 2. This catches UVW /
         // Unwrap modifiers that author lightmap UVs above the base object
         // without putting UV2 into the hot geo_fast path.
         if (!outUV2s || MNMeshHasUsableMapChannel(*liveMN, 2)) {
-            const bool ok = ExtractMeshFromMNMesh(*liveMN, verts, uvs, indices, groups, normals, controlIdx, outVertexColors, allowMapChannel1, outFastVertexSources, outUV2s, emitPrimaryUVs);
+            if (wantsDeformWeights) CaptureMNMeshDeformWeights(*liveMN, deformWeights);
+            const bool ok = ExtractMeshFromMNMesh(*liveMN, verts, uvs, indices, groups, normals, weightedControlIdx, outVertexColors, allowMapChannel1, outFastVertexSources, outUV2s, emitPrimaryUVs);
+            if (ok && wantsDeformWeights && !deformWeights.empty())
+                AppendDeformWeightChannel(deformWeights, *weightedControlIdx, outVertexColors);
             if (ok && outEpoch)
                 CaptureFastDeformEpochFromMNMesh(*liveMN, node, t, nullptr, true, *outEpoch);
             return ok;
@@ -2258,7 +2349,10 @@ static bool ExtractMesh(INode* node, TimeValue t,
     if (os.obj->IsSubClassOf(polyObjectClassID)) {
         PolyObject* poly = static_cast<PolyObject*>(os.obj);
         MNMesh& mn = poly->GetMesh();
-        const bool ok = ExtractMeshFromMNMesh(mn, verts, uvs, indices, groups, normals, controlIdx, outVertexColors, allowMapChannel1, outFastVertexSources, outUV2s, emitPrimaryUVs);
+        if (wantsDeformWeights) CaptureMNMeshDeformWeights(mn, deformWeights);
+        const bool ok = ExtractMeshFromMNMesh(mn, verts, uvs, indices, groups, normals, weightedControlIdx, outVertexColors, allowMapChannel1, outFastVertexSources, outUV2s, emitPrimaryUVs);
+        if (ok && wantsDeformWeights && !deformWeights.empty())
+            AppendDeformWeightChannel(deformWeights, *weightedControlIdx, outVertexColors);
         if (ok && outEpoch)
             CaptureFastDeformEpochFromMNMesh(mn, node, t, os.obj, false, *outEpoch);
         return ok;
@@ -2271,10 +2365,13 @@ static bool ExtractMesh(INode* node, TimeValue t,
     if (!tri) return false;
     // Capture before extraction — ExtractMeshFromTriObject deletes converted
     // TriObjects on its way out.
+    if (wantsDeformWeights) CaptureMeshDeformWeights(tri->GetMesh(), deformWeights);
     FastDeformTopoEpoch triEpoch;
     if (outEpoch)
         CaptureFastDeformEpochFromMesh(tri->GetMesh(), node, t, os.obj, false, triEpoch);
-    const bool ok = ExtractMeshFromTriObject(tri, os.obj, verts, uvs, indices, groups, normals, controlIdx, outVertexColors, allowMapChannel1, outFastVertexSources, outUV2s, emitPrimaryUVs);
+    const bool ok = ExtractMeshFromTriObject(tri, os.obj, verts, uvs, indices, groups, normals, weightedControlIdx, outVertexColors, allowMapChannel1, outFastVertexSources, outUV2s, emitPrimaryUVs);
+    if (ok && wantsDeformWeights && !deformWeights.empty())
+        AppendDeformWeightChannel(deformWeights, *weightedControlIdx, outVertexColors);
     if (ok && outEpoch) *outEpoch = triEpoch;
     return ok;
 }

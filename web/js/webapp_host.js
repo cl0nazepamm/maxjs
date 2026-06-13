@@ -91,29 +91,73 @@ function layerBridgeScript(layerIndex, layerCount) {
 (() => {
   const index = ${JSON.stringify(index)};
   const count = ${JSON.stringify(count)};
-  const transparentColors = new Set(['rgb(4, 4, 4)', 'rgb(5, 5, 5)', 'rgb(10, 10, 10)']);
+  // Every style/dataset write below is guarded (skip when the value is
+  // already applied). The MutationObserver watches 'style' attributes, so an
+  // unguarded write re-fires the observer on our own mutation and the
+  // cleanup becomes a permanent per-frame reflow loop.
+  function setImportant(el, prop, value) {
+    if (el.style.getPropertyValue(prop) === value &&
+        el.style.getPropertyPriority(prop) === 'important') return;
+    el.style.setProperty(prop, value, 'important');
+  }
+  function isOpaqueDarkBackdrop(color) {
+    const match = String(color || '').match(/rgba?\\(([^)]+)\\)/i);
+    if (!match) return false;
+    const parts = match[1].split(',').map((v) => Number(String(v).trim()));
+    if (parts.length < 3 || parts.some((v, i) => i < 3 && !Number.isFinite(v))) return false;
+    const alpha = parts.length >= 4 && Number.isFinite(parts[3]) ? parts[3] : 1;
+    return alpha > 0.95 && parts[0] <= 16 && parts[1] <= 16 && parts[2] <= 16;
+  }
+  function coversViewport(el) {
+    if (!el || el === document.documentElement || el === document.body) return true;
+    const rect = el.getBoundingClientRect();
+    const vw = Math.max(1, window.innerWidth || document.documentElement.clientWidth || 1);
+    const vh = Math.max(1, window.innerHeight || document.documentElement.clientHeight || 1);
+    return rect.width >= vw * 0.85 && rect.height >= vh * 0.85 &&
+      rect.left <= vw * 0.15 && rect.top <= vh * 0.15;
+  }
+  function clearBackdropElement(el) {
+    if (!el) return;
+    // Longhands only — clearing the 'background' shorthand reserializes the
+    // whole style attribute every pass, which defeats the write guards.
+    setImportant(el, 'background-color', 'transparent');
+    setImportant(el, 'background-image', 'none');
+  }
   function setIdentity() {
     try {
-      document.documentElement.style.setProperty('--maxjs-layer-index', String(index));
-      document.documentElement.style.setProperty('--maxjs-layer-count', String(count));
-      document.documentElement.dataset.maxjsLayer = String(index);
-      document.documentElement.dataset.maxjsLayers = String(count);
+      const docEl = document.documentElement;
+      if (docEl.style.getPropertyValue('--maxjs-layer-index') !== String(index)) {
+        docEl.style.setProperty('--maxjs-layer-index', String(index));
+      }
+      if (docEl.style.getPropertyValue('--maxjs-layer-count') !== String(count)) {
+        docEl.style.setProperty('--maxjs-layer-count', String(count));
+      }
+      if (docEl.dataset.maxjsLayer !== String(index)) docEl.dataset.maxjsLayer = String(index);
+      if (docEl.dataset.maxjsLayers !== String(count)) docEl.dataset.maxjsLayers = String(count);
     } catch {}
   }
   function clearLayerBackdrops() {
-    if (count <= 1) return;
     try {
-      document.documentElement.style.setProperty('background', 'transparent', 'important');
-      document.body?.style?.setProperty('background', 'transparent', 'important');
-      document.getElementById('root')?.style?.setProperty('background', 'transparent', 'important');
-      document.querySelectorAll('body, body *').forEach((el) => {
+      clearBackdropElement(document.documentElement);
+      clearBackdropElement(document.body);
+      const root = document.getElementById('root');
+      if (root && coversViewport(root)) clearBackdropElement(root);
+      document.querySelectorAll('body > *, #root > *').forEach((el) => {
+        if (!coversViewport(el)) return;
         const bg = getComputedStyle(el).backgroundColor;
-        if (transparentColors.has(bg)) {
-          el.style.setProperty('background-color', 'transparent', 'important');
-          el.style.setProperty('background', 'transparent', 'important');
-        }
+        if (isOpaqueDarkBackdrop(bg)) clearBackdropElement(el);
       });
     } catch {}
+  }
+  let backdropCleanupQueued = false;
+  function queueBackdropCleanup() {
+    if (backdropCleanupQueued) return;
+    backdropCleanupQueued = true;
+    requestAnimationFrame(() => {
+      backdropCleanupQueued = false;
+      setIdentity();
+      clearLayerBackdrops();
+    });
   }
   function publish() {
     setIdentity();
@@ -129,6 +173,18 @@ function layerBridgeScript(layerIndex, layerCount) {
   setTimeout(publish, 150);
   setTimeout(publish, 500);
   setTimeout(publish, 1000);
+  try {
+    // Backdrop cleanup only — no maxjs:layer postMessage from mutations.
+    // Pages that re-render on that message would otherwise self-sustain:
+    // message → render → mutation → message.
+    const observer = new MutationObserver(queueBackdropCleanup);
+    observer.observe(document.documentElement, {
+      subtree: true,
+      childList: true,
+      attributes: true,
+      attributeFilter: ['class', 'style'],
+    });
+  } catch {}
 })();
 </` + `script>`;
 }
@@ -278,6 +334,7 @@ export {
     createTextureHost,
     formatParamValue,
     isLocalAssetUrl,
+    layerBridgeScript,
     postParamsToIframe,
     resolveWebappUrl,
     sanitizeParamName,

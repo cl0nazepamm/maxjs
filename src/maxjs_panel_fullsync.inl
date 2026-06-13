@@ -232,6 +232,7 @@
                 WriteNodeParentJson(ss, node);
                 ss << L",\"props\":{"; WriteNodePropsJson(ss, node, t); ss << L'}';
                 { JsModData jm; GetJsModData(node, t, jm); if (jm.found) { ss << L","; WriteJsModJson(ss, jm); } }
+                WriteUserPropsJson(ss, node);
                 ss << L",\"t\":"; WriteFloats(ss, xform, 16);
                 RememberSentTransform(handle, xform);
 
@@ -329,6 +330,7 @@
                     WriteNodeParentJson(ss, node);
                     ss << L",\"props\":{"; WriteNodePropsJson(ss, node, t); ss << L'}';
                     { JsModData jm; GetJsModData(node, t, jm); if (jm.found) { ss << L","; WriteJsModJson(ss, jm); } }
+                    WriteUserPropsJson(ss, node);
                     ss << L",\"t\":"; WriteFloats(ss, xform, 16);
                     if (isSpline) ss << L",\"spline\":true";
                     RememberSentTransform(handle, xform);
@@ -749,6 +751,7 @@
             MaxJSPBR pbr; ExtractPBR(ng.node, t, pbr);
             ss << L",\"props\":{"; WriteNodePropsJson(ss, ng.node, t); ss << L'}';
             { JsModData jm; GetJsModData(ng.node, t, jm); if (jm.found) { ss << L","; WriteJsModJson(ss, jm); } }
+            WriteUserPropsJson(ss, ng.node);
             ss << L",\"vis\":" << (ng.visible ? L'1' : L'0');
             if (ng.objId != 0) ss << L",\"objId\":" << ng.objId;
             if (ng.instOfHandle != 0) ss << L",\"instOf\":" << ng.instOfHandle;

@@ -6,7 +6,7 @@
 // CPU blob tracker, CSS colorGrading, and renderer-output/resize tracking.
 import * as THREE from 'three';
 import { uniform, vec3 } from 'three/tsl';
-import { createPowerShotFinal, normalizePowerShotPreset, powerShotPresetUiDefaults, listPowerShotPresets } from './fx/final/powershot.js';
+import { createPowerShotFinal, normalizePowerShotPreset, powerShotPresetUiDefaults, listPowerShotPresets, normalizePowerShotFilmStock, powerShotFilmStockUiDefaults, listPowerShotFilmStocks } from './fx/final/powershot.js';
 import { createShaderLabFinal } from './fx/final/shaderlab.js';
 import { createFxCore } from './fx/core.js';
 import { ALL } from './fx/registry.js';
@@ -78,6 +78,20 @@ export function createMaxJSFxController({
         analogDropouts: 0.32,
         analogScanlines: 0.54,
         analogHeadSwitch: 0.42,
+        filmStock: 'kodak_500t',
+        filmExposure: 0,
+        filmInputGamma: 0.65,
+        filmGrain: 1.0,
+        filmGrainSize: 1.6,
+        filmGrainColour: 0.8,
+        filmHalation: 0.35,
+        filmHalationThreshold: 0.55,
+        filmHalationRadius: 1.5,
+        filmPrintExposure: 0,
+        filmPrintWarmth: 0,
+        filmWeave: 0.4,
+        filmFlicker: 0.12,
+        filmNegative: false,
         freezeNoise: false,
     };
     state.clone = {
@@ -1087,12 +1101,18 @@ export function createMaxJSFxController({
         },
         setPowerShotOptions(options = {}) {
             if (typeof options.mode === 'string') {
-                state.powershot.mode = options.mode === 'analog' ? 'analog' : 'digital';
+                state.powershot.mode = options.mode === 'analog' ? 'analog'
+                    : options.mode === 'film' ? 'film'
+                    : 'digital';
                 state.powershot.freezeNoise = false;
             }
             if (typeof options.preset === 'string') {
                 state.powershot.preset = normalizePowerShotPreset(options.preset);
                 Object.assign(state.powershot, powerShotPresetUiDefaults(state.powershot.preset));
+            }
+            if (typeof options.filmStock === 'string') {
+                state.powershot.filmStock = normalizePowerShotFilmStock(options.filmStock);
+                Object.assign(state.powershot, powerShotFilmStockUiDefaults(state.powershot.filmStock));
             }
             assignFinite(state.powershot, 'amount', options.amount);
             assignFinite(state.powershot, 'resolutionScale', options.resolutionScale);
@@ -1118,6 +1138,19 @@ export function createMaxJSFxController({
             assignFinite(state.powershot, 'analogDropouts', options.analogDropouts);
             assignFinite(state.powershot, 'analogScanlines', options.analogScanlines);
             assignFinite(state.powershot, 'analogHeadSwitch', options.analogHeadSwitch);
+            assignFinite(state.powershot, 'filmExposure', options.filmExposure);
+            assignFinite(state.powershot, 'filmInputGamma', options.filmInputGamma);
+            assignFinite(state.powershot, 'filmGrain', options.filmGrain);
+            assignFinite(state.powershot, 'filmGrainSize', options.filmGrainSize);
+            assignFinite(state.powershot, 'filmGrainColour', options.filmGrainColour);
+            assignFinite(state.powershot, 'filmHalation', options.filmHalation);
+            assignFinite(state.powershot, 'filmHalationThreshold', options.filmHalationThreshold);
+            assignFinite(state.powershot, 'filmHalationRadius', options.filmHalationRadius);
+            assignFinite(state.powershot, 'filmPrintExposure', options.filmPrintExposure);
+            assignFinite(state.powershot, 'filmPrintWarmth', options.filmPrintWarmth);
+            assignFinite(state.powershot, 'filmWeave', options.filmWeave);
+            assignFinite(state.powershot, 'filmFlicker', options.filmFlicker);
+            if (typeof options.filmNegative === 'boolean') state.powershot.filmNegative = options.filmNegative;
             if (typeof options.freezeNoise === 'boolean') state.powershot.freezeNoise = options.freezeNoise;
             if (powerShotFinal.hasPipeline()) powerShotFinal.syncPipeline();
             if (state.powershot.enabled) queuePipelineUpdate({ output: true });
@@ -1125,6 +1158,9 @@ export function createMaxJSFxController({
         },
         getPowerShotPresets() {
             return listPowerShotPresets();
+        },
+        getPowerShotFilmStocks() {
+            return listPowerShotFilmStocks();
         },
 
         // ── Global Color Grading ──

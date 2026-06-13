@@ -182,7 +182,20 @@ export function createHTMLTexture(THREE, url, options = {}) {
     const height = Math.max(64, Math.min(4096, options.height || 1024));
     const initialParams = options.params;
     const injectCss = typeof options.injectCss === 'string' ? options.injectCss : '';
+    const injectHeadHtml = typeof options.injectHeadHtml === 'string' ? options.injectHeadHtml : '';
     const maxRedrawFps = Math.max(1, Math.min(60, Number(options.maxFps || options.fps || 30)));
+    // When true, dirty signals (params, DOM mutations, canvas.onpaint) never
+    // force an immediate redraw — they wait for the maxFps clock. Used by
+    // punch-mask textures, where an animated page otherwise re-rasterizes and
+    // re-uploads every paint regardless of the cap.
+    const throttleRedraws = options.throttleRedraws === true;
+    // Idle floor: with no recent dirty signal the unconditional refresh clock
+    // drops to this rate. Any dirty signal restores the maxFps rate and holds
+    // it for a grace window, so page-timed transitions (button reveals whose
+    // trigger param flips once) are captured at the active rate even when
+    // only their first frame produces a signal. Defaults to maxFps (off).
+    const idleRedrawFps = Math.max(1, Math.min(60, Number(options.idleFps) || maxRedrawFps));
+    const DIRTY_BOOST_MS = 1200;
     // 'shadow' (default) uses DOMParser + shadow root + script proxy.
     // Works for hand-authored HTML/CSS + vanilla JS with broad CSS feature
     // support (gradients, backdrop-filter, background-clip text, borders).
@@ -239,7 +252,8 @@ export function createHTMLTexture(THREE, url, options = {}) {
             const baseHref = url.replace(/[^/]*$/, '');
             const baseTag = '<base href="' + baseHref + '">' +
                 '<style id="maxjs-html-texture-base">html,body{background:transparent;}</style>' +
-                (injectCss ? '<style data-maxjs-inject>' + injectCss + '</style>' : '');
+                (injectCss ? '<style data-maxjs-inject>' + injectCss + '</style>' : '') +
+                injectHeadHtml;
             const patched = /<head[^>]*>/i.test(text)
                 ? text.replace(/<head[^>]*>/i, m => m + baseTag)
                 : '<head>' + baseTag + '</head>' + text;
@@ -291,6 +305,7 @@ export function createHTMLTexture(THREE, url, options = {}) {
     let loaded = false;
     let dirty = true;
     let lastRedrawAt = 0;
+    let lastDirtyAt = -Infinity;
 
     function redrawIntervalMs() {
         let timelineFps = 0;
@@ -330,8 +345,21 @@ export function createHTMLTexture(THREE, url, options = {}) {
 
     function scheduleRedraw() {
         dirty = true;
+        lastDirtyAt = performance.now();
+        if (disposed) return;
+        if (throttleRedraws) {
+            const interval = redrawIntervalMs();
+            const elapsed = performance.now() - lastRedrawAt;
+            if (elapsed < interval) {
+                // A pending idle-clock timer may be far in the future —
+                // replace it so the dirty capture lands on the active clock.
+                if (loopTimer) { clearTimeout(loopTimer); loopTimer = 0; }
+                scheduleLoop(interval - elapsed);
+                return;
+            }
+        }
         if (loopTimer) { clearTimeout(loopTimer); loopTimer = 0; }
-        if (disposed || rafHandle) return;
+        if (rafHandle) return;
         rafHandle = requestAnimationFrame(() => {
             rafHandle = 0;
             lastRedrawAt = performance.now();
@@ -418,13 +446,19 @@ export function createHTMLTexture(THREE, url, options = {}) {
         loopHandle = 0;
         if (disposed) return;
         const interval = redrawIntervalMs();
+        // Recently-dirty content recaptures on the active clock; quiet content
+        // falls to the idle floor (the unconditional clock stays as a safety
+        // net for paints the dirty hooks miss). With idleFps unset both rates
+        // are the same and this reduces to the original fixed-interval loop.
+        const boosted = dirty || (now - lastDirtyAt) < DIRTY_BOOST_MS;
+        const due = boosted ? interval : Math.max(interval, 1000 / idleRedrawFps);
         const elapsed = now - lastRedrawAt;
-        if (dirty || elapsed >= interval) {
+        if (dirty || elapsed >= due) {
             dirty = false;
             lastRedrawAt = now;
             redraw();
         }
-        scheduleLoop(Math.max(0, interval - (performance.now() - lastRedrawAt)));
+        scheduleLoop(Math.max(0, due - (performance.now() - lastRedrawAt)));
     }
 
     function onReady() {

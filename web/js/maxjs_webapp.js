@@ -28,6 +28,7 @@ import {
     createCSS3DDivHost,
     createCSS3DHost,
     formatParamValue,
+    layerBridgeScript,
     postParamsToIframe,
     resolveWebappUrl,
     teardownWebappHost,
@@ -130,6 +131,7 @@ export function createMaxJSWebAppSystem({ THREE, parent, getProjectBaseUrl, onPu
                 if (!inst.occluder) continue;
                 rects.push({
                     object: inst.occluder,
+                    getMaskTexture: () => inst.punchMask?.texture ?? null,
                     getOpacity: () => entry.data?.opacity ?? 1,
                 });
                 if (rects.length >= MAX_PUNCH_RECTS) {
@@ -258,6 +260,9 @@ export function createMaxJSWebAppSystem({ THREE, parent, getProjectBaseUrl, onPu
         entry.lastOpacity = opacity;
         for (const inst of entry.instances) {
             if (!inst.host && !inst.obj) continue;
+            if (inst.occluder?.material) {
+                inst.occluder.material.opacity = opacity;
+            }
             if (entry.presentation === 'css3d') {
                 if (inst.host) inst.host.style.opacity = String(opacity);
             } else if (inst.obj?.material) {
@@ -289,6 +294,9 @@ export function createMaxJSWebAppSystem({ THREE, parent, getProjectBaseUrl, onPu
                 postParamsToIframe(inst.host, params);
             } else if (inst.divHost) {
                 anyTexture = true;  // div-host scripts live in the main window — window-level delivery
+            }
+            if (inst.punchMask) {
+                inst.punchMask.updateParams(params);
             }
         }
         if (anyTexture) {
@@ -342,6 +350,10 @@ export function createMaxJSWebAppSystem({ THREE, parent, getProjectBaseUrl, onPu
             try { inst.occluder.material?.dispose(); } catch {}
             inst.occluder = null;
         }
+        if (inst.punchMask) {
+            try { inst.punchMask.cleanup(); } catch {}
+            inst.punchMask = null;
+        }
         if (inst.htmlTex) {
             try { inst.obj?.parent?.remove(inst.obj); } catch {}
             try { inst.obj?.geometry?.dispose(); } catch {}
@@ -367,19 +379,33 @@ export function createMaxJSWebAppSystem({ THREE, parent, getProjectBaseUrl, onPu
         }
     }
 
-    function makeOccluder(entry) {
-        // Writes depth + RGBA(0,0,0,0): in the direct-render path this punches
-        // the alpha hole natively. Hidden whenever the FX pipeline is active —
-        // its depth write would pollute GTAO/DOF and re-seal coverage alpha;
-        // the webPanelPunch mask takes over there.
+    function makeOccluder(entry, inst) {
+        // Writes depth + RGBA(0,0,0,0) only where the hidden DOM mask has
+        // visible pixels. This keeps transparent/nonexistent webapp pixels
+        // from cutting holes through the Three.js canvas.
+        //
+        // NOT a GLSL ShaderMaterial: the live viewer renders with
+        // WebGPURenderer (native or forceWebGL), whose NodeLibrary has no
+        // ShaderMaterial mapping — fromMaterial() falls back to a default
+        // NodeMaterial that draws the rect as an opaque black plate. A plain
+        // MeshBasicMaterial expresses the same fragment program portably:
+        //   alphaTest      → discard where mask.a * opacity < threshold
+        //   Zero/Zero blend → surviving fragments write RGBA(0,0,0,0)
+        // and converts cleanly to MeshBasicNodeMaterial on the node renderer.
         const material = new THREE.MeshBasicMaterial({
             color: 0x000000,
-            opacity: 0,
-            transparent: false,
-            blending: THREE.NoBlending,
+            map: inst.punchMask?.texture ?? null,  // null → punch full rect (no mask)
+            alphaTest: 0.015,
+            transparent: false,  // opaque pass: depth-sorted with scene, depth written
             side: THREE.DoubleSide,
             depthWrite: true,
+            blending: THREE.CustomBlending,
+            blendEquation: THREE.AddEquation,
+            blendSrc: THREE.ZeroFactor,
+            blendDst: THREE.ZeroFactor,
         });
+        material.opacity = entry.data?.opacity ?? 1;
+        material.toneMapped = false;
         const mesh = new THREE.Mesh(occluderGeometry, material);
         mesh.name = `webapp_occluder_${entry.handle}`;
         mesh.userData.maxjsExcludeFromRuntimeSnapshot = true;
@@ -442,6 +468,27 @@ export function createMaxJSWebAppSystem({ THREE, parent, getProjectBaseUrl, onPu
             : await createCSS3DHost(spec);
         built.htmlTex = null;
         built.occluder = null;
+        // The punch mask is a second, hidden copy of the page rasterized via
+        // drawElementImage — a real app instance, so it is the expensive part
+        // of depth occlusion. Throttled adaptive capture: while dirty signals
+        // arrive (param updates during orchestrated playback, page paints) it
+        // recaptures at the timeline rate so reveals stay frame-accurate
+        // through the punched hole; a quiet page falls to the 8 fps idle
+        // floor. Uncapped it re-rasterized + re-uploaded width×height pixels
+        // on every paint of an animated page.
+        built.punchMask = d.depthOcclude
+            ? createHTMLTexture(THREE, layerUrl(url, index, d.layerCount), {
+                width: d.width,
+                height: d.height,
+                params: d.params,
+                mode: 'iframe',
+                maxFps: 30,
+                idleFps: 8,
+                throttleRedraws: true,
+                injectCss: layerCss(index, d.layerCount),
+                injectHeadHtml: layerBridgeScript(index, d.layerCount),
+            })
+            : null;
         return built;
     }
 
@@ -492,7 +539,7 @@ export function createMaxJSWebAppSystem({ THREE, parent, getProjectBaseUrl, onPu
             inst.obj.userData.maxjsExcludeFromRuntimeSnapshot = true;
             if (behind) {
                 entry.behindGroup.add(inst.obj);
-                inst.occluder = makeOccluder(entry);
+                inst.occluder = makeOccluder(entry, inst);
                 entry.group.add(inst.occluder);
             } else {
                 entry.group.add(inst.obj);

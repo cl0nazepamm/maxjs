@@ -358,6 +358,16 @@ function createMaxSceneFacade({ scene, nodeMap, lightHandleMap, getAdapter, crea
             }
             return out;
         },
+        /** Nodes currently selected in Max (bridge stamps userData.maxjsSelected).
+         *  Safe to poll; subscribe to bus event 'max:selection' for changes. */
+        listSelected() {
+            const out = [];
+            for (const handle of nodeMap.keys()) {
+                const adapter = getAdapter(handle);
+                if (adapter?.selected) out.push(adapter);
+            }
+            return out;
+        },
         findByName(name, options = {}) {
             return findByNameInternal(name, options);
         },

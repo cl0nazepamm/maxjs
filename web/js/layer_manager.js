@@ -5,6 +5,7 @@
 import { maxTimeline } from './maxjs_timeline.js';
 import { createCameraAdapter } from './layer_camera_adapter.js';
 import { createInputHelper, createInstancesFacade, createMaxSceneFacade, createNodeMapFacade, createRendererFacade } from './layer_facades.js';
+import { createDeformSystem } from './layer_deform.js';
 import { createMaxNodeAdapter } from './layer_node_adapter.js';
 import { createRuntimeOverrideController } from './layer_runtime_overrides.js';
 import {
@@ -41,6 +42,8 @@ export function createLayerManager({
     onCameraModeChange = null,
     getSceneCameras = () => [],
     getGLTFSystem = () => null,
+    getAnimationSystem = () => null,
+    getAudioSystem = () => null,
     debugLog = () => {},
     debugWarn = () => {},
 }) {
@@ -185,6 +188,9 @@ export function createLayerManager({
         applyMaterialOverridesToMesh,
         setMaterialMapOverride,
         clearMaterialOverridesForLayer,
+        setMaterialDecorator,
+        clearMaterialDecorator,
+        clearMaterialDecoratorsForLayer,
         setObjectPropertyOverride,
         clearObjectPropertyOverride,
         clearObjectPropertyOverridesForLayer,
@@ -201,7 +207,112 @@ export function createLayerManager({
         setRuntimeVisibilityOverride,
         clearRuntimeVisibilityOverride,
         clearRuntimeVisibilityOverridesForLayer,
+        hasRuntimeVisibilityOverride,
     } = createRuntimeOverrideController({ THREE, nodeMap, lightHandleMap });
+
+    // Max selection diff — re-emitted on the shared bus as 'max:selection'.
+    // Scanned only while at least one layer is subscribed; the two Sets are
+    // swapped each change so the steady state allocates nothing.
+    const selectionState = { current: new Set(), scratch: new Set() };
+    function diffSelection() {
+        const prev = selectionState.current;
+        const next = selectionState.scratch;
+        next.clear();
+        let grew = false;
+        for (const [handle, obj] of nodeMap) {
+            if (obj?.userData?.maxjsSelected === true) {
+                next.add(handle);
+                if (!prev.has(handle)) grew = true;
+            }
+        }
+        if (!grew && next.size === prev.size) return;
+        const added = [];
+        const removed = [];
+        for (const handle of next) if (!prev.has(handle)) added.push(handle);
+        for (const handle of prev) if (!next.has(handle)) removed.push(handle);
+        selectionState.current = next;
+        selectionState.scratch = prev;
+        busEmitInternal('max:selection', freezePlainObject({
+            selected: Object.freeze([...next]),
+            added: Object.freeze(added),
+            removed: Object.freeze(removed),
+        }));
+    }
+
+    // Max timeline transitions, re-emitted on the shared layer bus.
+    // 'change' fires continuously during playback (deferred to RAF) but a
+    // change while NOT playing is a scrub/jump — that's the seek signal.
+    maxTimeline.on('play', snap => busEmitInternal('max:time:play', snap));
+    maxTimeline.on('pause', snap => busEmitInternal('max:time:pause', snap));
+    maxTimeline.on('change', snap => {
+        if (!snap.playing) busEmitInternal('max:time:seek', snap);
+    });
+
+    // Max authored-animation playback control (ctx.anim). Thin facade over
+    // createMaxJSAnimationSystem — absent system (standalone without
+    // animations) degrades to empty list / no-op false.
+    const animFacade = freezePlainObject({
+        list() {
+            const sys = getAnimationSystem?.();
+            return sys ? sys.getState().clips : [];
+        },
+        play(id) { return getAnimationSystem?.()?.setClipPlaying(id, true) === true; },
+        pause(id) { return getAnimationSystem?.()?.setClipPlaying(id, false) === true; },
+        stop(id) {
+            const sys = getAnimationSystem?.();
+            if (!sys) return false;
+            const paused = sys.setClipPlaying(id, false);
+            return sys.setClipTime(id, 0) && paused;
+        },
+        setTime(id, seconds) { return getAnimationSystem?.()?.setClipTime(id, seconds) === true; },
+        setSpeed(id, speed) { return getAnimationSystem?.()?.setClipSpeed(id, speed) === true; },
+        setLoop(id, mode) { return getAnimationSystem?.()?.setClipLoop(id, mode) === true; },
+        seekAll(seconds) { return getAnimationSystem?.()?.seekAllClips(seconds) === true; },
+        isPlaying(id) {
+            const sys = getAnimationSystem?.();
+            return !!sys && sys.getState().clips.some(clip => clip.id === id && clip.playing);
+        },
+    });
+
+    // Max audio control + layer-fired one-shots (ctx.audio). One-shots are
+    // tracked per layer and silenced on that layer's dispose.
+    function createLayerAudioFacade(layer) {
+        const activeOneShots = new Set();
+        layer.disposers.push(() => {
+            for (const shot of [...activeOneShots]) {
+                try { shot.stop(); } catch (_) {}
+            }
+            activeOneShots.clear();
+        });
+        return freezePlainObject({
+            list() { return getAudioSystem?.()?.listEntries?.() ?? []; },
+            play(handle) { return getAudioSystem?.()?.playEntry?.(handle) === true; },
+            stop(handle) { return getAudioSystem?.()?.stopEntry?.(handle) === true; },
+            setVolume(handle, volume) { return getAudioSystem?.()?.setEntryVolume?.(handle, volume) === true; },
+            get muted() { return getAudioSystem?.()?.getMuted?.() === true; },
+            playOneShot(url, options = {}) {
+                const shot = getAudioSystem?.()?.playOneShot?.(url, options) ?? null;
+                if (!shot) return null;
+                for (const old of activeOneShots) {
+                    if (!old.active) activeOneShots.delete(old);
+                }
+                activeOneShots.add(shot);
+                return shot;
+            },
+        });
+    }
+
+    // GPU vertex-stage deformation (ctx.deform). Node-graph edits ride the
+    // material decorator reapply path so fastsync rebuilds keep them.
+    const deformSystem = createDeformSystem({
+        THREE,
+        renderer,
+        nodeMap,
+        getTimelineSeconds: () => maxTimeline.now(),
+        setMaterialDecorator,
+        clearMaterialDecorator,
+        debugWarn,
+    });
 
     function emitChange(reason = 'state') {
         for (const listener of listeners) {
@@ -785,6 +896,9 @@ export function createLayerManager({
             camera: cameraFacade,
             renderer: rendererFacade,
             instances: instancesFacade,
+            deform: deformSystem.createLayerFacade(layer.id, handle => getLayerNodeAdapter(layer, handle)),
+            anim: animFacade,
+            audio: createLayerAudioFacade(layer),
             get input() {
                 return getOrCreateLayerInput(layer);
             },
@@ -984,9 +1098,11 @@ export function createLayerManager({
         layer.anchors.length = 0;
         layer.nodeAdapters.clear();
         if (layer.input) { layer.input.dispose(); layer.input = null; }
+        deformSystem.disposeLayer(id);
         clearRuntimeTransformOverridesForLayer(id);
         clearRuntimeVisibilityOverridesForLayer(id);
         clearMaterialOverridesForLayer(id);
+        clearMaterialDecoratorsForLayer(id);
         clearObjectPropertyOverridesForLayer(id);
 
         jsWorldRoot.remove(layer.group);
@@ -1043,6 +1159,8 @@ export function createLayerManager({
         applyAllRuntimeTransformOverrides();
         applyAllRuntimeVisibilityOverrides();
         applyAllObjectPropertyOverrides();
+        deformSystem.update(dt, elapsed);
+        if (busHandlers.get('max:selection')?.size) diffSelection();
 
         for (const layer of layers.values()) {
             anchorCount += layer.anchors.length;
@@ -1162,7 +1280,8 @@ export function createLayerManager({
         return out;
     }
 
-    /** Meshes driven by three.js Deform (jsmod); snapshot embeds JS clones under jsRoot — always hide these Max copies when jsRoot is present. */
+    /** Meshes driven by three.js Deform (jsmod); snapshot embeds JS clones under jsRoot — hide those Max copies when jsRoot is present.
+     *  Meshes deformed in place by ctx.deform have no clone and must stay visible. */
     function collectJsmodMaxSyncHandles() {
         if (!maxRoot) return [];
         const out = [];
@@ -1171,7 +1290,7 @@ export function createLayerManager({
             if (!isDescendantOf(obj, maxRoot)) continue;
             const drawable = obj.isMesh || obj.isLine || obj.isLineSegments;
             if (!drawable) continue;
-            if (obj.userData?.jsmod) out.push(handle);
+            if (obj.userData?.jsmod && !deformSystem.drives(handle)) out.push(handle);
         }
         return out;
     }
@@ -1312,8 +1431,12 @@ export function createLayerManager({
         restoreTransformOverrides: restoreRuntimeTransformOverrides,
         markRuntimeTransformsDirty: markRuntimeTransformOverridesDirty,
         // Called from the scene message handler after each material assignment
-        // so layer-registered map slot overrides survive fastsync rebuilds.
+        // so layer-registered map slot overrides and node-graph decorators
+        // (ctx.deform) survive fastsync rebuilds.
         applyMaterialOverrides: applyMaterialOverridesToMesh,
+        // Bridge visibility consults this so Max hide/unhide flows to jsmod
+        // meshes unless a layer explicitly owns their visibility.
+        hasRuntimeVisibilityOverride,
         applyObjectPropertyOverrides,
         hasObjectPropertyOverride,
         serialize,

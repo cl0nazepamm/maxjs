@@ -18,11 +18,26 @@ import {
     float,
     getViewPosition,
     screenUV,
+    texture,
     uniform,
+    vec2,
     vec4,
 } from 'three/tsl';
 
 export const MAX_PUNCH_RECTS = 8;
+
+// texture(null) is illegal in TSL — TextureNode.getUniformHash() reads
+// value.uuid during build, so a null mask crashes the whole pipeline build.
+// 1×1 white (alpha 1) = "punch the full rect by opacity", the pre-mask
+// behavior, used until a panel's DOM mask texture exists.
+let _fallbackMask = null;
+function fallbackMask(THREE) {
+    if (!_fallbackMask) {
+        _fallbackMask = new THREE.DataTexture(new Uint8Array([255, 255, 255, 255]), 1, 1);
+        _fallbackMask.needsUpdate = true;
+    }
+    return _fallbackMask;
+}
 
 export default {
     id: 'webPanelPunch',
@@ -43,6 +58,7 @@ export default {
         reg.uniforms = rects.map(() => ({
             invWorld: uniform(new ctx.THREE.Matrix4()),
             opacity: uniform(1),
+            mask: texture(fallbackMask(ctx.THREE)),
         }));
 
         const d = ctx.sceneTex.depth.r;
@@ -67,7 +83,9 @@ export default {
                 .and(t.lessThan(float(0.9999)))  // panel strictly nearer than the scene sample
                 .and(hit.x.abs().lessThanEqual(float(0.5)))
                 .and(hit.y.abs().lessThanEqual(float(0.5)));
-            punch = punch.max(valid.select(u.opacity, float(0)));
+            const maskUv = hit.add(vec2(0.5, 0.5));
+            const maskAlpha = u.mask.sample(maskUv).a.mul(u.opacity);
+            punch = punch.max(valid.select(maskAlpha, float(0)));
         }
 
         ctx.beautyAlpha = ctx.beautyAlpha.mul(punch.oneMinus());
@@ -83,6 +101,7 @@ export default {
             if (!rect?.object || !u) continue;
             u.invWorld.value.copy(rect.object.matrixWorld).invert();
             u.opacity.value = rect.getOpacity ? rect.getOpacity() : 1;
+            u.mask.value = (rect.getMaskTexture && rect.getMaskTexture()) || fallbackMask(ctx.THREE);
         }
     },
 };

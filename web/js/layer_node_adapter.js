@@ -4,6 +4,61 @@ import { freezePlainObject } from './layer_utils.js';
 
 const surfaceTopologyCache = new WeakMap();
 
+// Read-only material summary for layer code. Only assigned texture slots are
+// reported; mutation stays with setMap / overrides / deform decorators.
+const MATERIAL_SNAPSHOT_MAP_SLOTS = [
+    'map', 'aoMap', 'roughnessMap', 'metalnessMap', 'normalMap', 'bumpMap',
+    'displacementMap', 'emissiveMap', 'alphaMap', 'lightMap', 'envMap', 'matcap',
+];
+
+// Max user-defined properties arrive as the raw "key = value" line buffer
+// (userData.maxjsUserProps). Parsed lazily, cached per object, invalidated
+// when the raw string changes. Numbers/booleans coerce; quoted strings strip.
+const userPropsParseCache = new WeakMap();
+
+function parseUserProps(raw) {
+    const out = {};
+    for (const line of String(raw).split(/\r\n|\r|\n/)) {
+        const idx = line.indexOf('=');
+        if (idx <= 0) continue;
+        const key = line.slice(0, idx).trim();
+        if (!key) continue;
+        let value = line.slice(idx + 1).trim();
+        if (value.length >= 2 && value.startsWith('"') && value.endsWith('"')) {
+            out[key] = value.slice(1, -1);
+        } else if (/^-?\d+(\.\d+)?$/.test(value)) {
+            out[key] = Number(value);
+        } else if (/^(true|false)$/i.test(value)) {
+            out[key] = value.toLowerCase() === 'true';
+        } else {
+            out[key] = value;
+        }
+    }
+    return out;
+}
+
+function summarizeMaterial(material) {
+    if (!material) return null;
+    const maps = {};
+    for (const slot of MATERIAL_SNAPSHOT_MAP_SLOTS) {
+        const texture = material[slot];
+        if (texture) maps[slot] = texture.name || texture.uuid || true;
+    }
+    return {
+        name: material.name || '',
+        type: material.type || '',
+        color: material.color?.isColor ? material.color.getHex() : null,
+        roughness: typeof material.roughness === 'number' ? material.roughness : null,
+        metalness: typeof material.metalness === 'number' ? material.metalness : null,
+        opacity: typeof material.opacity === 'number' ? material.opacity : null,
+        transparent: material.transparent === true,
+        side: Number.isFinite(material.side) ? material.side : null,
+        emissive: material.emissive?.isColor ? material.emissive.getHex() : null,
+        emissiveIntensity: typeof material.emissiveIntensity === 'number' ? material.emissiveIntensity : null,
+        maps,
+    };
+}
+
 function getSurfaceTopologyCache(geometry, THREE) {
     const position = geometry?.getAttribute?.('position') ?? geometry?.attributes?.position;
     if (!position || position.itemSize < 3 || position.count < 3) return null;
@@ -1032,6 +1087,38 @@ function createMaxNodeAdapter({
         hide() { setNodeVisible(false); return this; },
         resetVisibility() { return resetNodeVisibility(); },
         get jsmod() { return !!getObject()?.userData?.jsmod; },
+        /** Max selection state (bridge stamps userData.maxjsSelected).
+         *  Subscribe to bus event 'max:selection' for change notifications. */
+        get selected() { return getObject()?.userData?.maxjsSelected === true; },
+        /** Parsed Max user-defined properties (Object Properties → User
+         *  Defined tab): { key: number|boolean|string }. Frozen; empty
+         *  object when the node has none. */
+        get userProps() {
+            const obj = getObject();
+            const raw = obj?.userData?.maxjsUserProps;
+            if (!raw) return Object.freeze({});
+            let cached = userPropsParseCache.get(obj);
+            if (!cached || cached.raw !== raw) {
+                cached = { raw, parsed: Object.freeze(parseUserProps(raw)) };
+                userPropsParseCache.set(obj, cached);
+            }
+            return cached.parsed;
+        },
+        /** The raw user-properties buffer exactly as authored in Max. */
+        get userPropsRaw() { return getObject()?.userData?.maxjsUserProps ?? ''; },
+        /** Read-only view of the synced material(s). Mutation goes through
+         *  setMap / overrides.setProperty / ctx.deform decorators. */
+        get material() {
+            const raw = getObject()?.material ?? null;
+            if (!raw) return null;
+            const list = Array.isArray(raw) ? raw.filter(Boolean) : [raw];
+            return freezePlainObject({
+                raw,
+                list: Object.freeze([...list]),
+                count: list.length,
+                snapshot() { return list.map(summarizeMaterial); },
+            });
+        },
         get parentHandle() {
             const h = Number(getObject()?.userData?.maxjsParentHandle);
             return Number.isFinite(h) && h > 0 ? h : null;

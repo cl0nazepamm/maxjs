@@ -877,6 +877,8 @@ export function createMaxJSAnimationSystem({
             clips: [...clipGroups.values()].map(group => ({
                 id: group.id,
                 name: group.name,
+                duration: getGroupDuration(group),
+                time: getGroupPlaybackTime(group),
                 targets: group.entries.length + group.customEntries.length,
                 mixerTargets: group.entries.length,
                 customTargets: group.customEntries.length,

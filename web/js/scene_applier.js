@@ -743,6 +743,11 @@ export async function applySceneBin({ buffer, meta, ctx, hooks: userHooks = {}, 
         mesh.castShadow = nd.props?.cshadow !== false && nd.props?.cshadow !== 0;
         mesh.receiveShadow = nd.props?.rshadow !== false && nd.props?.rshadow !== 0;
 
+        // Max user-defined properties (adapter.userProps reads this stamp).
+        // Full payloads omit the field when the buffer is empty.
+        if (typeof nd.userProps === 'string' && nd.userProps) mesh.userData.maxjsUserProps = nd.userProps;
+        else delete mesh.userData.maxjsUserProps;
+
         // Transform + visibility (a tiny subset of finalizeSceneNode).
         syncParent(mesh, nd, nodeMap, maxRoot);
         const visChanged = hooks.applyVisibility(mesh, nd.vis);

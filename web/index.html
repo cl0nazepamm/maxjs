@@ -4014,6 +4014,14 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             else delete mesh.userData.jsmod;
         }
 
+        // Max user-defined properties (Object Properties → User Defined).
+        // Full payloads omit the field when empty, so callers on full-sync
+        // paths pass nd.userProps directly; partial paths guard on != null.
+        function applyUserPropsSyncState(mesh, userProps) {
+            if (typeof userProps === 'string' && userProps) mesh.userData.maxjsUserProps = userProps;
+            else delete mesh.userData.maxjsUserProps;
+        }
+
         const MAXJS_SELF_HIDDEN_LAYER = 31;
 
         function setObjectSelfVisibleLayer(object, visible) {
@@ -4055,8 +4063,18 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             return changed;
         }
 
+        // Assigned after layerManager init. Until then jsmod visibility keeps
+        // the legacy skip so nothing fights layers during boot.
+        let jsmodVisibilityOwnedByLayer = null;
+
         function applyBridgeVisibility(mesh, visibleFlag) {
-            if (!mesh || mesh.userData.jsmod) return false;
+            if (!mesh) return false;
+            // three.js Deform meshes follow Max visibility like any other node
+            // unless a layer explicitly owns their visibility (clone workflows
+            // hiding the Max copy via node.hide()). In-place ctx.deform needs
+            // no hide/unhide special-casing at all.
+            if (mesh.userData.jsmod
+                && (!jsmodVisibilityOwnedByLayer || jsmodVisibilityOwnedByLayer(mesh.userData.maxjsHandle))) return false;
             const visible = visibleFlag == null ? true : !!visibleFlag;
             return applyMaxObjectVisibility(mesh, visible);
         }
@@ -5831,6 +5849,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             }
             if (mesh && nd && nd.h != null) mesh.userData.maxjsHandle = nd.h;
             applyJsmodSyncState(mesh, !!nd.jsmod);
+            applyUserPropsSyncState(mesh, nd.userProps);
             applyInstanceSyncState(mesh, nd.instOf);
             const visibilityChanged = applyBridgeVisibility(mesh, nd.vis);
             mesh.frustumCulled = false;
@@ -5852,6 +5871,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             if (nd.helper === true) mesh.userData.maxjsHelper = true;
             if (Object.prototype.hasOwnProperty.call(nd, 'p')) syncNodeParent(mesh, nd);
             if (nd.jsmod != null) applyJsmodSyncState(mesh, nd.jsmod === true);
+            if (nd.userProps != null) applyUserPropsSyncState(mesh, nd.userProps);
             if (nd.vis != null) applyBridgeVisibility(mesh, nd.vis);
             if (isFiniteArray(nd.t, 16)) {
                 const hadHTMLAutoFit = !!mesh.userData?.maxjsHasHTMLAutoFit;
@@ -6283,6 +6303,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     if (updateMaxInstanceBucketNode(nd.h, nd)) transformsChanged = true;
                     if (mesh) {
                         applyJsmodSyncState(mesh, !!nd.jsmod);
+                        applyUserPropsSyncState(mesh, nd.userProps);
                         applyInstanceSyncState(mesh, nd.instOf);
                         if (nd.s != null) applySelection(mesh, nd.s);
                     }
@@ -6634,6 +6655,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     if (updateMaxInstanceBucketNode(nd.h, nd)) transformsChanged = true;
                     if (mesh) {
                         applyJsmodSyncState(mesh, !!nd.jsmod);
+                        applyUserPropsSyncState(mesh, nd.userProps);
                         applyInstanceSyncState(mesh, nd.instOf);
                         if (nd.s != null) applySelection(mesh, nd.s);
                     }
@@ -11882,13 +11904,15 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             if (markOutput) maxjsFx.markOutputChanged?.();
         }
 
-        const isPowerShotDigitalMode = (values) => values.mode !== 'analog';
+        const isPowerShotDigitalMode = (values) => values.mode !== 'analog' && values.mode !== 'film';
         const isPowerShotAnalogMode = (values) => values.mode === 'analog';
+        const isPowerShotFilmMode = (values) => values.mode === 'film';
         const isPowerShotJpegActive = (values) => isPowerShotDigitalMode(values) && Number(values.jpegStrength) > 1.0e-6;
         const isPowerShotAnalogActive = (values) => isPowerShotAnalogMode(values) && Number(values.analogStrength) > 1.0e-6;
         const isPowerShotTemporalNoiseActive = (values) =>
             (isPowerShotDigitalMode(values) && Number(values.noiseScale) > 1.0e-6)
-            || isPowerShotAnalogActive(values);
+            || isPowerShotAnalogActive(values)
+            || (isPowerShotFilmMode(values) && Number(values.filmGrain) > 1.0e-6);
 
         const postFxSections = [
             {
@@ -12097,7 +12121,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             {
                 key: 'powershot',
                 title: 'PowerShot',
-                copy: 'Compact digital camera ISP: CCD smear, Bayer artifacts, denoise, sharpening, vignette, and JPEG blocks.',
+                copy: 'Compact digital camera ISP, analog VHS, and motion-picture film: CCD smear, Bayer artifacts, JPEG blocks, tape damage, or a Vision3 negative printed to 2383 with grain and halation.',
                 note: 'Requires WebGPU or Force WebGL. Disabled while Shader Lab is active.',
                 keepVisibleWhenUnsupported: true,
                 disabledBy: () => (shaderLabFx?.isEnabled?.()
@@ -12133,6 +12157,20 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     analogDropouts: 0.32,
                     analogScanlines: 0.54,
                     analogHeadSwitch: 0.42,
+                    filmStock: 'kodak_500t',
+                    filmExposure: 0,
+                    filmInputGamma: 0.65,
+                    filmGrain: 1.0,
+                    filmGrainSize: 1.6,
+                    filmGrainColour: 0.8,
+                    filmHalation: 0.35,
+                    filmHalationThreshold: 0.55,
+                    filmHalationRadius: 1.5,
+                    filmPrintExposure: 0,
+                    filmPrintWarmth: 0,
+                    filmWeave: 0.4,
+                    filmFlicker: 0.12,
+                    filmNegative: false,
                     freezeNoise: false,
                     ...(state.powershot || {}),
                 }),
@@ -12145,7 +12183,18 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                         options: [
                             { value: 'digital', label: 'Digital CCD' },
                             { value: 'analog', label: 'Analog VHS' },
+                            { value: 'film', label: 'Film Print' },
                         ],
+                    },
+                    {
+                        key: 'filmStock',
+                        label: 'Film Stock',
+                        type: 'select',
+                        visibleWhen: isPowerShotFilmMode,
+                        options: maxjsFx.getPowerShotFilmStocks().map((stock) => ({
+                            value: stock.key,
+                            label: stock.label,
+                        })),
                     },
                     {
                         key: 'preset',
@@ -12169,8 +12218,21 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     { key: 'jpegChroma420', label: 'JPEG Chroma', min: 0, max: 1, step: 0.01, realtime: true, visibleWhen: isPowerShotJpegActive },
                     { key: 'jpegMidtone', label: 'JPEG Midtones', min: 0, max: 1, step: 0.01, realtime: true, visibleWhen: isPowerShotJpegActive },
                     { key: 'jpegHighlight', label: 'JPEG Highlights', min: 0, max: 2, step: 0.01, realtime: true, visibleWhen: isPowerShotJpegActive },
-                    { key: 'brightness', label: 'Brightness', min: -1, max: 1, step: 0.01, realtime: true },
-                    { key: 'contrast', label: 'Contrast', min: -1, max: 1, step: 0.01, realtime: true },
+                    { key: 'filmExposure', label: 'Exposure (stops)', min: -3, max: 3, step: 0.05, realtime: true, visibleWhen: isPowerShotFilmMode },
+                    { key: 'filmInputGamma', label: 'Input Gamma', min: 0.5, max: 1.5, step: 0.01, realtime: true, visibleWhen: isPowerShotFilmMode },
+                    { key: 'filmGrain', label: 'Grain', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotFilmMode },
+                    { key: 'filmGrainSize', label: 'Grain Size', min: 0.5, max: 4, step: 0.05, realtime: true, visibleWhen: isPowerShotFilmMode },
+                    { key: 'filmGrainColour', label: 'Grain Colour', min: 0, max: 1, step: 0.01, realtime: true, visibleWhen: isPowerShotFilmMode },
+                    { key: 'filmHalation', label: 'Halation', min: 0, max: 1, step: 0.01, realtime: true, visibleWhen: isPowerShotFilmMode },
+                    { key: 'filmHalationThreshold', label: 'Halation Threshold', min: 0, max: 1, step: 0.01, realtime: true, visibleWhen: isPowerShotFilmMode },
+                    { key: 'filmHalationRadius', label: 'Halation Radius', min: 0.5, max: 3, step: 0.05, realtime: true, visibleWhen: isPowerShotFilmMode },
+                    { key: 'filmPrintExposure', label: 'Print Exposure', min: -1, max: 1, step: 0.01, realtime: true, visibleWhen: isPowerShotFilmMode },
+                    { key: 'filmPrintWarmth', label: 'Print Warmth', min: -1, max: 1, step: 0.01, realtime: true, visibleWhen: isPowerShotFilmMode },
+                    { key: 'filmWeave', label: 'Gate Weave', min: 0, max: 2, step: 0.01, realtime: true, visibleWhen: isPowerShotFilmMode },
+                    { key: 'filmFlicker', label: 'Flicker', min: 0, max: 1, step: 0.01, realtime: true, visibleWhen: isPowerShotFilmMode },
+                    { key: 'filmNegative', label: 'Show Negative', type: 'checkbox', visibleWhen: isPowerShotFilmMode },
+                    { key: 'brightness', label: 'Brightness', min: -1, max: 1, step: 0.01, realtime: true, visibleWhen: (values) => !isPowerShotFilmMode(values) },
+                    { key: 'contrast', label: 'Contrast', min: -1, max: 1, step: 0.01, realtime: true, visibleWhen: (values) => !isPowerShotFilmMode(values) },
                     { key: 'analogStrength', label: 'VHS Strength', min: 0, max: 3, step: 0.01, realtime: true, affectsVisibility: true, visibleWhen: isPowerShotAnalogMode },
                     { key: 'analogTracking', label: 'Tracking', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotAnalogActive },
                     { key: 'analogChromaBleed', label: 'Chroma Bleed', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotAnalogActive },
@@ -14287,9 +14349,12 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             getSceneCameras: () => knownSceneCameras,
             onCameraModeChange: applyLayerCameraMode,
             getGLTFSystem: () => gltfSystem,
+            getAnimationSystem: () => animationSystem,
+            getAudioSystem: () => audioSystem,
             debugLog: maxjsDebugLog,
             debugWarn: maxjsDebugWarn,
         });
+        jsmodVisibilityOwnedByLayer = (handle) => layerManager.hasRuntimeVisibilityOverride(handle);
         animationSystem = createMaxJSAnimationSystem({
             THREE,
             nodeMap,

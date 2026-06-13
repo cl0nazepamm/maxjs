@@ -1504,6 +1504,17 @@ static void WriteJsModJson(std::wostringstream& ss, const JsModData&) {
     ss << L"\"jsmod\":true";
 }
 
+// ── User-defined properties (Object Properties → User Defined tab) ──
+// Raw buffer on the wire (leading comma included, nothing when empty);
+// the web runtime parses key=value lines into adapter.userProps.
+static void WriteUserPropsJson(std::wostringstream& ss, INode* node) {
+    if (!node) return;
+    MSTR buf;
+    node->GetUserPropBuffer(buf);
+    if (buf.Length() == 0) return;
+    ss << L",\"userProps\":\"" << EscapeJson(buf.data()) << L"\"";
+}
+
 static bool IsMaxJSHierarchyNode(INode* node, TimeValue t) {
     if (!node || node->IsRootNode()) return false;
     if (node->IsGroupHead()) return true;

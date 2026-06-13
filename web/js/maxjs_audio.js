@@ -8,6 +8,9 @@ export function createMaxJSAudioSystem({ THREE, parent, getActiveCamera }) {
 
     const entryMap = new Map();
     const bufferCache = new Map();
+    // Layer-fired one-shots (ctx.audio.playOneShot) — tracked so dispose can
+    // silence them; entries auto-remove when playback ends.
+    const oneShots = new Set();
 
     const listenerPosition = new THREE.Vector3();
     const listenerForward = new THREE.Vector3();
@@ -425,6 +428,128 @@ export function createMaxJSAudioSystem({ THREE, parent, getActiveCamera }) {
         for (const data of audioData) upsertEntry(data);
     }
 
+    // ── Layer-facing controls (ctx.audio) ─────────────────────────
+    // Max sync owns entry.data — volume set here holds until the next
+    // authored update for that origin arrives from Max.
+
+    function listEntries() {
+        return [...entryMap.values()].map(entry => ({
+            handle: entry.handle,
+            url: entry.data?.url ?? '',
+            volume: entry.data?.volume ?? 0,
+            loop: entry.data?.loop !== false,
+            visible: !!entry.visible,
+            playing: entry.activeSources.size > 0,
+        }));
+    }
+
+    function playEntry(handle) {
+        const entry = entryMap.get(handle);
+        if (!entry) return false;
+        syncEntryPlayback(entry, true);
+        return true;
+    }
+
+    function stopEntry(handle) {
+        const entry = entryMap.get(handle);
+        if (!entry) return false;
+        stopPlayback(entry, { clearOneShot: true });
+        return true;
+    }
+
+    function setEntryVolume(handle, volume) {
+        const entry = entryMap.get(handle);
+        if (!entry?.data) return false;
+        entry.data.volume = Math.max(0, Number(volume) || 0);
+        updateEntryGain(entry);
+        return true;
+    }
+
+    function playOneShot(url, options = {}) {
+        if (typeof url !== 'string' || !url) return null;
+        const ctx = ensureContext();
+        if (!ctx || !masterGain) return null;
+
+        const record = { stopped: false, source: null, nodes: [] };
+        const stop = () => {
+            if (record.stopped) return;
+            record.stopped = true;
+            oneShots.delete(record);
+            try {
+                if (record.source) {
+                    record.source.onended = null;
+                    record.source.stop(0);
+                }
+            } catch (_) {
+            }
+            try {
+                record.source?.disconnect?.();
+            } catch (_) {
+            }
+            for (const node of record.nodes) {
+                try {
+                    node.disconnect();
+                } catch (_) {
+                }
+            }
+        };
+        record.stop = stop;
+        oneShots.add(record);
+
+        const volume = Math.max(0, Number(options.volume ?? 1) || 0);
+        const loop = options.loop === true;
+
+        loadBuffer(url)
+            .then((buffer) => {
+                if (!buffer || record.stopped) return;
+                if (ctx.state !== 'running') {
+                    // Autoplay-locked — a one-shot fired before any user
+                    // gesture cannot be deferred meaningfully; drop it.
+                    armActivationHandlers();
+                    stop();
+                    return;
+                }
+                const source = ctx.createBufferSource();
+                source.buffer = buffer;
+                source.loop = loop;
+                const gain = ctx.createGain();
+                gain.gain.value = volume;
+                source.connect(gain);
+                record.source = source;
+                record.nodes.push(gain);
+
+                const pos = options.position;
+                const p = Array.isArray(pos)
+                    ? pos
+                    : (pos?.isVector3 ? [pos.x, pos.y, pos.z] : null);
+                if (p && p.length >= 3) {
+                    const panner = ctx.createPanner();
+                    panner.panningModel = 'HRTF';
+                    panner.distanceModel = 'inverse';
+                    panner.refDistance = Math.max(0.01, Number(options.refDistance) || 120);
+                    panner.maxDistance = Math.max(panner.refDistance, Number(options.maxDistance) || 5000);
+                    panner.rolloffFactor = Math.max(0, Number(options.rolloff) || 1);
+                    setAudioParam(panner, p[0], p[1], p[2]);
+                    gain.connect(panner);
+                    panner.connect(masterGain);
+                    record.nodes.push(panner);
+                } else {
+                    gain.connect(masterGain);
+                }
+                source.onended = () => stop();
+                source.start();
+            })
+            .catch((error) => {
+                console.warn('[max.js audio] one-shot load failed', error);
+                stop();
+            });
+
+        return {
+            stop,
+            get active() { return !record.stopped; },
+        };
+    }
+
     function setMuted(nextMuted) {
         muted = !!nextMuted;
         if (!context || !masterGain) return;
@@ -481,6 +606,7 @@ export function createMaxJSAudioSystem({ THREE, parent, getActiveCamera }) {
     }
 
     function dispose() {
+        for (const record of [...oneShots]) record.stop();
         for (const handle of [...entryMap.keys()]) destroyEntry(handle);
         bufferCache.clear();
         removeActivationHandlers();
@@ -506,6 +632,11 @@ export function createMaxJSAudioSystem({ THREE, parent, getActiveCamera }) {
         destroyEntry,
         getMuted,
         setMuted,
+        listEntries,
+        playEntry,
+        stopEntry,
+        setEntryVolume,
+        playOneShot,
         update,
         dispose,
     };

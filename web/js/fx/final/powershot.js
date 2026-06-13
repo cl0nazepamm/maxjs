@@ -8,6 +8,7 @@
 import * as THREE from 'three';
 import { Pipeline as PowerShotPipeline, applyPreset as applyPowerShotPreset, STAGE_DEFS as POWERSHOT_STAGE_DEFS } from '../../powershot_pipeline.js';
 import { PRESETS as POWERSHOT_PRESETS, PRESET_KEYS as POWERSHOT_PRESET_KEYS } from '../../powershot_presets.js';
+import { FilmPipeline as PowerShotFilmPipeline, applyFilmPreset as applyPowerShotFilmPreset, FILM_PRESETS as POWERSHOT_FILM_PRESETS, FILM_PRESET_KEYS as POWERSHOT_FILM_PRESET_KEYS } from '../../powershot_film.js';
 
 function finiteOr(value, fallback) {
     return Number.isFinite(value) ? value : fallback;
@@ -39,6 +40,33 @@ function powerShotCcmDiffers(ccm) {
 export function normalizePowerShotPreset(value) {
     const key = String(value || 'powershot');
     return POWERSHOT_PRESETS[key] ? key : 'powershot';
+}
+
+export function normalizePowerShotFilmStock(value) {
+    const key = String(value || POWERSHOT_FILM_PRESET_KEYS[0]);
+    return POWERSHOT_FILM_PRESETS[key] ? key : POWERSHOT_FILM_PRESET_KEYS[0];
+}
+
+export function powerShotFilmStockUiDefaults(key) {
+    const stock = POWERSHOT_FILM_PRESETS[normalizePowerShotFilmStock(key)];
+    return {
+        filmExposure: stock.exposure ?? 0,
+        filmGrain: stock.grain_strength ?? 1.0,
+        filmGrainSize: stock.grain_size ?? 1.6,
+        filmGrainColour: stock.grain_saturation ?? 0.8,
+        filmHalation: stock.halation_strength ?? 0.35,
+        filmHalationThreshold: stock.halation_threshold ?? 0.55,
+        filmHalationRadius: stock.halation_radius ?? 1.5,
+        filmWeave: stock.weave ?? 0.4,
+        filmFlicker: stock.flicker ?? 0.12,
+    };
+}
+
+export function listPowerShotFilmStocks() {
+    return POWERSHOT_FILM_PRESET_KEYS.map((key) => ({
+        key,
+        label: POWERSHOT_FILM_PRESETS[key]?.name || key,
+    }));
 }
 
 export function powerShotPresetUiDefaults(key) {
@@ -88,6 +116,7 @@ export function createPowerShotFinal({
 }) {
     let powerShotInputTarget = null;
     let powerShotPipeline = null;
+    let filmPipeline = null;
     let powerShotFrame = 0;
     const drawBufferSize = new THREE.Vector2();
 
@@ -100,7 +129,7 @@ export function createPowerShotFinal({
 
     function normalizeOptions() {
         const p = getOptions();
-        p.mode = p.mode === 'analog' ? 'analog' : 'digital';
+        p.mode = p.mode === 'analog' ? 'analog' : p.mode === 'film' ? 'film' : 'digital';
         p.amount = THREE.MathUtils.clamp(finiteOr(p.amount, 1.0), 0, 1);
         p.resolutionScale = THREE.MathUtils.clamp(finiteOr(p.resolutionScale, 0.75), 0.1, 1);
         p.lensSoftness = THREE.MathUtils.clamp(finiteOr(p.lensSoftness, 0.32), 0, 1);
@@ -125,6 +154,20 @@ export function createPowerShotFinal({
         p.analogDropouts = THREE.MathUtils.clamp(finiteOr(p.analogDropouts, 0.32), 0, 3);
         p.analogScanlines = THREE.MathUtils.clamp(finiteOr(p.analogScanlines, 0.54), 0, 3);
         p.analogHeadSwitch = THREE.MathUtils.clamp(finiteOr(p.analogHeadSwitch, 0.42), 0, 3);
+        p.filmStock = normalizePowerShotFilmStock(p.filmStock);
+        p.filmExposure = THREE.MathUtils.clamp(finiteOr(p.filmExposure, 0), -3, 3);
+        p.filmInputGamma = THREE.MathUtils.clamp(finiteOr(p.filmInputGamma, 0.65), 0.5, 1.5);
+        p.filmGrain = THREE.MathUtils.clamp(finiteOr(p.filmGrain, 1.0), 0, 3);
+        p.filmGrainSize = THREE.MathUtils.clamp(finiteOr(p.filmGrainSize, 1.6), 0.5, 4);
+        p.filmGrainColour = THREE.MathUtils.clamp(finiteOr(p.filmGrainColour, 0.8), 0, 1);
+        p.filmHalation = THREE.MathUtils.clamp(finiteOr(p.filmHalation, 0.35), 0, 1);
+        p.filmHalationThreshold = THREE.MathUtils.clamp(finiteOr(p.filmHalationThreshold, 0.55), 0, 1);
+        p.filmHalationRadius = THREE.MathUtils.clamp(finiteOr(p.filmHalationRadius, 1.5), 0.5, 3);
+        p.filmPrintExposure = THREE.MathUtils.clamp(finiteOr(p.filmPrintExposure, 0), -1, 1);
+        p.filmPrintWarmth = THREE.MathUtils.clamp(finiteOr(p.filmPrintWarmth, 0), -1, 1);
+        p.filmWeave = THREE.MathUtils.clamp(finiteOr(p.filmWeave, 0.4), 0, 2);
+        p.filmFlicker = THREE.MathUtils.clamp(finiteOr(p.filmFlicker, 0.12), 0, 1);
+        p.filmNegative = !!p.filmNegative;
         return p;
     }
 
@@ -143,7 +186,33 @@ export function createPowerShotFinal({
             && !isShaderLabEnabled();
     }
 
+    function syncFilmPipeline() {
+        if (!filmPipeline) return;
+        const p = normalizeOptions();
+        const stock = POWERSHOT_FILM_PRESETS[p.filmStock];
+        // stock preset first (curves, lights, grain character), then the
+        // user-facing trims from state on top
+        applyPowerShotFilmPreset(filmPipeline.ctx, stock);
+        filmPipeline.ctx.power.value = THREE.MathUtils.clamp(p.amount, 0, 1);
+        const F = filmPipeline.ctx.P;
+        F.exposure.value = p.filmExposure;
+        F.inputGamma.value = p.filmInputGamma;
+        F.grainStrength.value = p.filmGrain;
+        F.grainSize.value = p.filmGrainSize;
+        F.grainSaturation.value = p.filmGrainColour;
+        F.halStrength.value = p.filmHalation;
+        F.halThreshold.value = p.filmHalationThreshold;
+        F.halRadius.value = p.filmHalationRadius;
+        F.printExposure.value = p.filmPrintExposure * 0.301; // slider stops -> log10
+        F.printWarmth.value = p.filmPrintWarmth;
+        F.weave.value = p.filmWeave;
+        F.flicker.value = p.filmFlicker;
+        F.negativeView.value = p.filmNegative ? 1 : 0;
+        filmPipeline.setEnabled?.('halation', p.filmHalation > 1.0e-6);
+    }
+
     function syncPipeline() {
+        syncFilmPipeline();
         if (!powerShotPipeline) return;
         const p = normalizeOptions();
         const presetKey = normalizePowerShotPreset(p.preset);
@@ -213,6 +282,18 @@ export function createPowerShotFinal({
         return powerShotPipeline;
     }
 
+    function ensureFilmPipeline() {
+        if (!filmPipeline) filmPipeline = new PowerShotFilmPipeline(renderer);
+        syncFilmPipeline();
+        return filmPipeline;
+    }
+
+    // film mode runs its own negative->print pipeline; digital/analog share
+    // the classic ISP runner. Both expose renderTexture(tex, frame, opts).
+    function ensureActivePipeline() {
+        return normalizeOptions().mode === 'film' ? ensureFilmPipeline() : ensurePipeline();
+    }
+
     function ensureInputTarget() {
         readRendererDrawBufferSize();
         const drawWidth = Math.max(1, Math.round(drawBufferSize.x || renderer.domElement?.width || 1));
@@ -231,7 +312,7 @@ export function createPowerShotFinal({
                 stencilBuffer: false,
             });
         }
-        ensurePipeline().setSize(workWidth, workHeight);
+        ensureActivePipeline().setSize(workWidth, workHeight);
         return powerShotInputTarget;
     }
 
@@ -266,7 +347,7 @@ export function createPowerShotFinal({
         }
 
         if (!getOptions().freezeNoise) powerShotFrame += 1;
-        const pipeline = ensurePipeline();
+        const pipeline = ensureActivePipeline();
         try {
             renderer.toneMapping = THREE.NoToneMapping;
             renderer.toneMappingExposure = 1.0;
@@ -290,12 +371,14 @@ export function createPowerShotFinal({
         normalizeOptions,
         syncPipeline,
         renderFinal,
-        hasPipeline: () => !!powerShotPipeline,
+        hasPipeline: () => !!powerShotPipeline || !!filmPipeline,
         dispose() {
             try { powerShotInputTarget?.dispose?.(); } catch (_) {}
             powerShotInputTarget = null;
             try { powerShotPipeline?.dispose?.(); } catch (_) {}
             powerShotPipeline = null;
+            try { filmPipeline?.dispose?.(); } catch (_) {}
+            filmPipeline = null;
         },
     };
 }

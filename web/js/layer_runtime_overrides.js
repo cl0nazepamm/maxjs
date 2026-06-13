@@ -11,6 +11,12 @@ function createRuntimeOverrideController({ THREE, nodeMap, lightHandleMap = null
     // (HTML, canvas, anything) reach displacement / color / etc. on the
     // synced mesh without cloning.
     const materialOverrides = new Map();
+    // Map<handle, Map<key, { fn, layerId }>> — node-graph decorators
+    // (ctx.deform & friends). Same survival contract as map-slot overrides:
+    // reapplied after every fastsync material rebuild through
+    // applyMaterialOverridesToMesh(). fn(mesh, handle) must be idempotent —
+    // it runs again on every reapply for the same material instance.
+    const materialDecorators = new Map();
     const objectPropertyOverrides = new Map();
     const runtimeVisibilityOverrides = new Map();
     let runtimeVisibilityReapplyNeeded = false;
@@ -167,15 +173,27 @@ function createRuntimeOverrideController({ THREE, nodeMap, lightHandleMap = null
     // material rebuild that fastsync does on every scene message.
     
     function applyMaterialOverridesToMesh(handle, mesh) {
+        if (!mesh) return;
         const slots = materialOverrides.get(handle);
-        if (!slots || !mesh) return;
-        const mats = Array.isArray(mesh.material) ? mesh.material : (mesh.material ? [mesh.material] : []);
-        for (const m of mats) {
-            if (!m) continue;
-            for (const [slot, entry] of slots) {
-                m[slot] = entry.texture;
+        if (slots) {
+            const mats = Array.isArray(mesh.material) ? mesh.material : (mesh.material ? [mesh.material] : []);
+            for (const m of mats) {
+                if (!m) continue;
+                for (const [slot, entry] of slots) {
+                    m[slot] = entry.texture;
+                }
+                m.needsUpdate = true;
             }
-            m.needsUpdate = true;
+        }
+        const decorators = materialDecorators.get(handle);
+        if (decorators) {
+            for (const entry of decorators.values()) {
+                try {
+                    entry.fn(mesh, handle);
+                } catch (err) {
+                    console.error('[maxjs] material decorator error', err);
+                }
+            }
         }
     }
     
@@ -207,6 +225,48 @@ function createRuntimeOverrideController({ THREE, nodeMap, lightHandleMap = null
             // Trigger a fresh sync so the original material reasserts.
             // Cheaper than tracking the original map per slot — next
             // scene message rebuilds the material from Max state.
+        }
+    }
+
+    // ── Material decorators ───────────────────────────────────────
+    // Handle-keyed node-graph mutators (positionNode etc.) that ride the
+    // same reapply path as map-slot overrides. The owner restores material
+    // state itself on clear — the registry only tracks the functions.
+
+    function setMaterialDecorator(layerId, handle, key, fn) {
+        if (typeof fn !== 'function' || !key) return false;
+        let decorators = materialDecorators.get(handle);
+        if (!decorators) {
+            decorators = new Map();
+            materialDecorators.set(handle, decorators);
+        }
+        decorators.set(key, { fn, layerId });
+        // Apply immediately so the change is visible before the next sync.
+        const mesh = nodeMap.get(handle);
+        if (mesh) {
+            try {
+                fn(mesh, handle);
+            } catch (err) {
+                console.error('[maxjs] material decorator error', err);
+            }
+        }
+        return true;
+    }
+
+    function clearMaterialDecorator(handle, key) {
+        const decorators = materialDecorators.get(handle);
+        if (!decorators?.delete(key)) return false;
+        if (decorators.size === 0) materialDecorators.delete(handle);
+        return true;
+    }
+
+    function clearMaterialDecoratorsForLayer(layerId) {
+        if (!layerId) return;
+        for (const [handle, decorators] of [...materialDecorators.entries()]) {
+            for (const [key, entry] of [...decorators.entries()]) {
+                if (entry.layerId === layerId) decorators.delete(key);
+            }
+            if (decorators.size === 0) materialDecorators.delete(handle);
         }
     }
 
@@ -409,6 +469,13 @@ function createRuntimeOverrideController({ THREE, nodeMap, lightHandleMap = null
         }
     }
 
+    /** True when a layer currently owns this handle's visibility. The bridge
+     *  visibility path checks this so Max hide/unhide flows normally unless a
+     *  layer explicitly took over (clone workflows hiding the Max copy). */
+    function hasRuntimeVisibilityOverride(handle) {
+        return runtimeVisibilityOverrides.has(handle);
+    }
+
     function applyAllRuntimeVisibilityOverrides(force = false) {
         if (!force && !runtimeVisibilityReapplyNeeded) return false;
         runtimeVisibilityReapplyNeeded = false;
@@ -606,6 +673,9 @@ function createRuntimeOverrideController({ THREE, nodeMap, lightHandleMap = null
         applyMaterialOverridesToMesh,
         setMaterialMapOverride,
         clearMaterialOverridesForLayer,
+        setMaterialDecorator,
+        clearMaterialDecorator,
+        clearMaterialDecoratorsForLayer,
         setObjectPropertyOverride,
         clearObjectPropertyOverride,
         clearObjectPropertyOverridesForLayer,
@@ -622,6 +692,7 @@ function createRuntimeOverrideController({ THREE, nodeMap, lightHandleMap = null
         setRuntimeVisibilityOverride,
         clearRuntimeVisibilityOverride,
         clearRuntimeVisibilityOverridesForLayer,
+        hasRuntimeVisibilityOverride,
     };
 }
 

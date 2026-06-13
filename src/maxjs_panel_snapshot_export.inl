@@ -1354,6 +1354,7 @@
             if (node.parentHandle != 0) ss << L",\"p\":" << node.parentHandle;
             ss << L",\"props\":{"; WriteNodePropsJson(ss, node.node, t); ss << L'}';
             { JsModData jm; GetJsModData(node.node, t, jm); if (jm.found) { ss << L","; WriteJsModJson(ss, jm); } }
+            WriteUserPropsJson(ss, node.node);
             ss << L",\"vis\":" << (node.visible ? L'1' : L'0');
             ss << L",\"t\":"; WriteFloats(ss, xform, 16);
             if (node.spline) ss << L",\"spline\":true";

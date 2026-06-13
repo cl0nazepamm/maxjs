@@ -1904,3 +1904,42 @@ body.light-mode .vpmenu-sep { background: rgba(0, 0, 0, 0.1); }
 body.light-mode .vpmenu-label { color: rgba(20, 24, 28, 0.8); }
 body.light-mode .vpmenu-row:hover { background: rgba(0, 0, 0, 0.05); }
 body.light-mode .vpmenu-row-cam .rail-cam-native { color: rgba(20, 24, 28, 0.85); }
+
+/* ── Path-tracer pause toggle ──────────────────────────────────────────
+   Stops compute dispatch so the GPU goes idle and the maxjs UI panels stay
+   responsive; the accumulated frame holds on screen. Visible only in PT mode. */
+.pt-pause-toggle {
+    position: fixed;
+    right: 12px;
+    bottom: 12px;
+    z-index: 40;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    height: 26px;
+    padding: 0 12px;
+    font: 600 11px/1 'Segoe UI', system-ui, sans-serif;
+    color: #d8dde5;
+    background: rgba(21, 23, 26, 0.82);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 4px;
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.45);
+    cursor: pointer;
+    backdrop-filter: blur(4px);
+    transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease;
+}
+.pt-pause-toggle:hover {
+    background: rgba(34, 38, 44, 0.9);
+    border-color: rgba(255, 255, 255, 0.22);
+}
+.pt-pause-toggle.is-paused {
+    color: #ffd479;
+    border-color: rgba(224, 160, 0, 0.55);
+    background: rgba(60, 45, 12, 0.85);
+}
+body:not(.pathtracing-mode) .pt-pause-toggle { display: none; }
+body.light-mode .pt-pause-toggle {
+    color: #1a1d22;
+    background: rgba(245, 245, 247, 0.9);
+    border-color: rgba(0, 0, 0, 0.14);
+}

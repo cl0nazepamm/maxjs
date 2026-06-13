@@ -37,6 +37,7 @@ import {
     roughness,
     sample,
     screenSize,
+    texture,
     triNoise3D,
     uniform,
     vec2,
@@ -48,6 +49,12 @@ import {
     cameraViewMatrix,
     modelWorldMatrix,
 } from 'three/tsl';
+
+// Effects safe to run on a path-traced source: pure color-domain folds that
+// need no gbuffer. Everything else (SSGI/SSR/GTAO/DOF/fog/motionBlur/...)
+// reads depth/normal the PT has no gbuffer for — and PT already does GI/DOF —
+// so they are gated off whenever ctx.pathTracedColor is set.
+const PT_SAFE_EFFECTS = new Set(['bloom', 'pixel', 'retro']);
 
 function setTexturePrecision(scenePass) {
     const diffuseTexture = scenePass.getTexture('diffuseColor');
@@ -133,6 +140,7 @@ export function createFxCore({
         scenePass: null,
         sceneTex: null,
         sceneContext: null,
+        pathTracedColor: null, // when set, the linear-HDR PT texture replaces the scene pass
         isShaderLabEnabled,
         has: isEffectActive,
         pushNode(node) { activeNodes.push(node); },
@@ -150,6 +158,8 @@ export function createFxCore({
     function isEffectActive(id) {
         const descriptor = byId.get(id);
         if (!descriptor || !state[id]?.enabled) return false;
+        // Path-traced source → color-domain effects only (no gbuffer exists).
+        if (ctx.pathTracedColor && !PT_SAFE_EFFECTS.has(id)) return false;
         const supports = (id === 'ssr' || id === 'bloom')
             ? supportsTslPostEffects
             : supportsScreenSpaceEffects;
@@ -633,6 +643,28 @@ export function createFxCore({
             syncSharedSceneEffects(true);
 
             currentDerived = computeDerivedState();
+
+            // ── Path-traced source ──────────────────────────────────────────
+            // The spectral PT already produced linear-HDR beauty (with real GI +
+            // DOF), so there is no scene pass and no gbuffer. Feed that color in
+            // as the beauty and fold ONLY the color-domain effects (bloom/pixel/
+            // retro); the gbuffer passes are gated off via isEffectActive. Output
+            // (PowerShot film emulation + tone map) is shared with the raster
+            // path, so the linear workflow is identical from here down.
+            if (ctx.pathTracedColor) {
+                const ptColor = texture(ctx.pathTracedColor);
+                currentBeauty = vec4(ptColor.rgb, float(1));
+                currentBeautyAlpha = float(1);
+                for (const d of sorted) {
+                    if (d.stage !== 'beauty' || !isEffectActive(d.id)) continue;
+                    const next = d.build(ctx);
+                    if (next != null) currentBeauty = next;
+                }
+                postProcessing.outputNode = ctx.withBeautyAlpha(currentBeauty);
+                postProcessing.needsUpdate = true;
+                return { ok: true, forceEnvironmentBackground: false, builtAgainstEmptyScene: false };
+            }
+
             const active = sorted.filter((d) => isEffectActive(d.id));
 
             const useSharedPrePass = active.some((d) => Array.isArray(d.needs) && d.needs.length > 0);

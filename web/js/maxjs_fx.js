@@ -1413,6 +1413,21 @@ export function createMaxJSFxController({
             rebuildPipeline();
         },
 
+        // Path-traced source: hand the post stack a linear-HDR texture (the
+        // spectral PT output) to use as the beauty instead of a rasterized
+        // scene pass. buildPipeline gates the gbuffer effects and folds only
+        // the color-domain ones; PowerShot/tone map at output are shared.
+        // Pass null to return to the normal scene-pass pipeline.
+        setPathTracedSource(texture) {
+            const next = texture || null;
+            if (core.ctx.pathTracedColor === next) return;
+            core.ctx.pathTracedColor = next;
+            queuePipelineUpdate({ rebuild: true, output: true });
+        },
+        hasPathTracedSource() {
+            return !!core.ctx.pathTracedColor;
+        },
+
         render() {
             flushPendingPipelineUpdates();
             syncCanvasColorGrading();

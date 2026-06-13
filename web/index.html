@@ -326,10 +326,6 @@
             "./vendor/three-r184/examples/lighting/LightProbeGrid.js": {
                 "three": "./vendor/three-r184/build/three.module.js"
             },
-            "./node_modules/three-gpu-pathtracer/": {
-                "three": "./vendor/three-r184/build/three.module.js",
-                "three/examples/jsm/": "./vendor/three-r184/examples/"
-            },
             "./node_modules/three-mesh-bvh/": {
                 "three": "./vendor/three-r184/build/three.module.js"
             },
@@ -456,7 +452,7 @@
         import { createPerfHud } from './js/perf_hud.js';
         import { createMaxJSFxController } from './js/maxjs_fx.js';
         import { createWebGLBasicFx } from './js/webgl_basicfx.js';
-        import { createPathTracingController } from './js/pathtracing_controller.js';
+        import { createSpectralTracer } from './js/spectral_tracer.js';
         import { createLayerManager } from './js/layer_manager.js';
         import { MAXJS_LAYER_SSR_EXCLUDE } from './js/render_layers.js';
         import { createGeospatialSkyController } from './js/geospatial_sky.js';
@@ -834,7 +830,7 @@
 
         const maxjsRenderMode = readMaxjsRenderMode();
         const isStudioMode = maxjsRenderMode === 'studio';
-        const isPathTracingMode = isHostedWebView && maxjsRenderMode === 'pathtracing';
+        const isPathTracingMode = maxjsRenderMode === 'pathtracing';
         document.body.classList.toggle('pathtracing-mode', isPathTracingMode);
 
         function normalizeRendererBackend(value) {
@@ -874,17 +870,11 @@
             let nextRenderer;
             let backendLabel;
 
-            if (isPathTracingMode) {
-                nextRenderer = new THREE_STD.WebGLRenderer({
-                    antialias: true,
-                    alpha: true,
-                    preserveDrawingBuffer: shouldPreserveCanvasForCapture,
-                    powerPreference: 'high-performance',
-                });
-                backendLabel = 'WebGL (Pathtracing)';
-                configureRenderer(nextRenderer);
-                await initializeRenderer(nextRenderer);
-            } else if (requestedBackend === 'webgl2') {
+            // The WebGPU spectral path tracer requires the NATIVE WebGPU
+            // backend (backend.isWebGPUBackend). Ignore any forced-WebGL
+            // preference while in pathtracing mode so PT always lands on the
+            // native WebGPU renderer below.
+            if (requestedBackend === 'webgl2' && !isPathTracingMode) {
                 nextRenderer = new THREE_STD.WebGLRenderer({
                     antialias: true,
                     alpha: true,
@@ -894,7 +884,7 @@
                 backendLabel = 'WebGL Mode';
                 configureRenderer(nextRenderer);
                 await initializeRenderer(nextRenderer);
-            } else if (requestedBackend === 'webgl-fallback') {
+            } else if (requestedBackend === 'webgl-fallback' && !isPathTracingMode) {
                 // Normal viewer WebGL2 uses the modern renderer stack so TSL /
                 // Shader Lab can compile to the forced WebGL backend.
                 nextRenderer = new THREE.WebGPURenderer({ antialias: true, alpha: true, forceWebGL: true, preserveDrawingBuffer: shouldPreserveCanvasForCapture });
@@ -1399,7 +1389,10 @@
             samplesPerFrame: 64,
             giClamp: 8.0,
             freezeSync: false,
+            paused: false,
+            sampleLimit: 0, // 0 = unlimited; >0 converges then stops (frees GPU)
         };
+        let ptPauseUiSync = null; // set when the PT pause toggle is created
 
         function beginTextureLoad() {
             pendingTextureLoads += 1;
@@ -1408,13 +1401,12 @@
         function endTextureLoad() {
             pendingTextureLoads = Math.max(0, pendingTextureLoads - 1);
         }
-        const pathTracingFx = createPathTracingController({
+        const pathTracingFx = createSpectralTracer({
             renderer,
             scene,
             camera,
             enabled: isPathTracingMode,
             settings: pathTracingSettings,
-            loadWebGLPathTracer: async () => import('./node_modules/three-gpu-pathtracer/src/core/WebGLPathTracer.js'),
             onStatus(message) {
                 perfHud.setStatus(message);
             },
@@ -1434,6 +1426,58 @@
         let pathTracingLiveRebuildTimer = 0;
         let pathTracingLiveRebuildQueued = false;
 
+        // Linear-HDR target the path tracer blits into when its output is routed
+        // through the camera post stack (bloom/grade/grain + PowerShot). The
+        // post stack gates its own gbuffer effects (SSGI/SSR/...) once a PT
+        // source is set, so only the color-domain effects fold over PT's beauty.
+        let pathTracingPostTarget = null;
+        function ensurePathTracingPostTarget() {
+            if (typeof THREE.RenderTarget !== 'function') return null;
+            const v = new THREE.Vector2();
+            renderer.getDrawingBufferSize(v);
+            const w = Math.max(1, Math.floor(v.x));
+            const h = Math.max(1, Math.floor(v.y));
+            if (pathTracingPostTarget && (pathTracingPostTarget.width !== w || pathTracingPostTarget.height !== h)) {
+                pathTracingPostTarget.dispose();
+                pathTracingPostTarget = null;
+            }
+            if (!pathTracingPostTarget) {
+                pathTracingPostTarget = new THREE.RenderTarget(w, h, {
+                    type: THREE.HalfFloatType,
+                    colorSpace: THREE.LinearSRGBColorSpace,
+                    depthBuffer: false,
+                });
+            }
+            return pathTracingPostTarget;
+        }
+
+        // One PT live frame: route through the post stack when camera effects
+        // (or PowerShot) are on, else blit straight to the canvas.
+        function renderPathTracingLiveFrame() {
+            const wantPost = !renderToImageActive
+                && maxjsFx.isAvailable?.()
+                && (maxjsFx.hasEnabledEffects?.() || maxjsFx.hasPathTracedSource?.());
+            if (wantPost) {
+                const rt = ensurePathTracingPostTarget();
+                if (rt) {
+                    pathTracingFx.setToneMapInBlit?.(false); // emit linear HDR
+                    const prevTarget = renderer.getRenderTarget();
+                    renderer.setRenderTarget(rt);
+                    const ok = pathTracingFx.render?.();
+                    renderer.setRenderTarget(prevTarget);
+                    if (ok) {
+                        maxjsFx.setPathTracedSource?.(rt.texture);
+                        maxjsFx.render();
+                        return;
+                    }
+                }
+            }
+            // Direct path: the blit tone-maps straight to the canvas.
+            pathTracingFx.setToneMapInBlit?.(true);
+            maxjsFx.setPathTracedSource?.(null);
+            if (!pathTracingFx.render?.()) renderPathTracingFallbackFrame();
+        }
+
         function normalizePathTracingSamplesPerFrame(value) {
             const n = Math.round(Number(value));
             if (!Number.isFinite(n)) return 64;
@@ -1444,6 +1488,12 @@
             const n = Number(value);
             if (!Number.isFinite(n)) return 8.0;
             return Math.max(1.0, Math.min(1000.0, n));
+        }
+
+        function normalizePathTracingSampleLimit(value) {
+            const n = Math.round(Number(value));
+            if (!Number.isFinite(n) || n <= 0) return 0; // 0 = unlimited
+            return Math.min(100000, n);
         }
 
         function resetPathTracingStartupWarmup() {
@@ -1498,6 +1548,8 @@
                 samplesPerFrame: pathTracingSettings.samplesPerFrame,
                 giClamp: pathTracingSettings.giClamp,
                 freezeSync: pathTracingSettings.freezeSync,
+                paused: pathTracingSettings.paused,
+                sampleLimit: pathTracingSettings.sampleLimit,
                 active: isPathTracingMode,
             });
         }
@@ -1510,7 +1562,17 @@
             pathTracingSettings.giClamp = normalizePathTracingGIClamp(
                 next.giClamp ?? pathTracingSettings.giClamp,
             );
+            pathTracingSettings.sampleLimit = normalizePathTracingSampleLimit(
+                next.sampleLimit ?? pathTracingSettings.sampleLimit,
+            );
             if (next.freezeSync != null) pathTracingSettings.freezeSync = next.freezeSync === true;
+            if (next.paused != null) {
+                pathTracingSettings.paused = next.paused === true;
+                // Pause stops all compute dispatch → GPU idle → UI panels stay
+                // responsive while the last accumulated frame holds on screen.
+                pathTracingFx.setPaused?.(pathTracingSettings.paused);
+                ptPauseUiSync?.();
+            }
             pathTracingFx.setOptions?.(pathTracingSettings);
             if (wasFrozen && !pathTracingSettings.freezeSync && isPathTracingMode && hasInitialSync) {
                 // C++ still advanced its sent-state caches while JS was ignoring updates.
@@ -11240,7 +11302,9 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 || `Restart max.js with ${label} pipeline now?`;
             if (options.prompt === false || confirm(confirmMessage)) {
                 persistRendererBackendPreference(normalizedMode);
-                if (normalizedMode === 'webgl2' || maxjsRenderMode === 'pathtracing') {
+                // Pathtracing now runs on WebGPU; only the WebGL2 backend (which
+                // can't host the spectral tracer) drops back to standard mode.
+                if (normalizedMode === 'webgl2') {
                     try { localStorage.setItem(MAXJS_MODE_KEY, 'standard'); } catch {}
                 }
                 sessionStorage.setItem('maxjs_renderer_backend', normalizedMode);
@@ -11307,13 +11371,36 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     if (mode === maxjsRenderMode) return;
                     const label = modeLabels[mode] || mode;
                     if (!confirm(`Switch to ${label} mode? Reloads the page.`)) return;
-                    if (mode === 'pathtracing') persistRendererBackendPreference('webgl2');
+                    // Pathtracing runs on the same WebGPU backend now — no
+                    // backend switch, just re-init the render mode on reload.
                     try { localStorage.setItem(MAXJS_MODE_KEY, mode); } catch {}
                     location.reload();
                 });
             });
         }
         syncRendererButtonUi();
+
+        // Path-tracer pause toggle. Stops compute dispatch so the GPU goes idle
+        // and the maxjs UI panels stay responsive while the accumulated frame
+        // holds. Styled by .pt-pause-toggle (css/index.css); that rule hides it
+        // outside pathtracing mode, so it can be created unconditionally.
+        {
+            const ptPauseBtn = document.createElement('button');
+            ptPauseBtn.id = 'btnPathTracePause';
+            ptPauseBtn.type = 'button';
+            ptPauseBtn.className = 'pt-pause-toggle';
+            ptPauseUiSync = () => {
+                const p = pathTracingSettings.paused === true;
+                ptPauseBtn.textContent = p ? '▶ Resume' : '⏸ Pause';
+                ptPauseBtn.classList.toggle('is-paused', p);
+                ptPauseBtn.title = p ? 'Resume path tracing' : 'Pause path tracing — frees the GPU so the UI stays responsive';
+            };
+            ptPauseBtn.addEventListener('click', () => {
+                applyPathTracingSettings({ paused: !pathTracingSettings.paused }, { notify: true, sendHost: true });
+            });
+            document.body.appendChild(ptPauseBtn);
+            ptPauseUiSync();
+        }
 
         function setViewportMenuItemHidden(el, hidden) {
             if (!el) return;
@@ -11334,17 +11421,17 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             setViewportMenuItemHidden(renderModeRow, false);
             renderModeSwitch?.querySelectorAll('[data-render-mode]').forEach(button => {
                 const mode = button.dataset.renderMode;
-                const hideForPipeline = webGLPipeline
-                    ? mode === 'studio'
-                    : mode === 'pathtracing';
+                // Studio and the WebGPU spectral path tracer both require the
+                // native WebGPU stack; hide them on the WebGL pipeline.
+                const hideForPipeline = webGLPipeline && (mode === 'studio' || mode === 'pathtracing');
                 setViewportMenuItemHidden(button, hideForPipeline);
                 const gated = hideForPipeline;
                 button.disabled = gated;
                 button.classList.toggle('is-gated', gated);
                 button.setAttribute('aria-disabled', gated ? 'true' : 'false');
                 button.title = `${modeLabels[mode] || mode} mode${mode === maxjsRenderMode ? ' active' : ''}`;
-                if (tslGl && mode === 'pathtracing') {
-                    button.title = 'Pathtracing is available from the WebGL pipeline';
+                if (webGLPipeline && mode === 'pathtracing') {
+                    button.title = 'Pathtracing requires the native WebGPU pipeline';
                 }
             });
 
@@ -13452,7 +13539,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         }
 
         function serializeSnapshotUiState({ includeDebug = false } = {}) {
-            const snapshotRendererBackend = isPathTracingMode ? 'WebGL2' : rendererBackendLabel;
+            const snapshotRendererBackend = rendererBackendLabel;
             const authoredEnvironmentActive = !!(skyActive || currentEnvParams?.hdri);
             const payload = {
                 buildMode: includeDebug ? 'dev' : 'release',
@@ -14594,7 +14681,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
 
             try {
                 if (pathTracingFx.isEnabled?.() && (!renderToImageActive || renderToImageForcePathTracing)) {
-                    if (!pathTracingFx.render?.()) renderPathTracingFallbackFrame();
+                    renderPathTracingLiveFrame();
                 } else if (webglBasicFx.isAvailable?.() || maxjsFx.hasEnabledEffects()) {
                     renderViewerFrame();
                 } else {

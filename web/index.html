@@ -8112,6 +8112,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     notifyLightingParamChanged();
                 }
                 if (lightCameraConstraints.size === 0) return;
+                camera.updateMatrixWorld(true);
                 for (const [lh, c] of lightCameraConstraints) {
                     const light = getByHandle(lightHandleMap, lh);
                     if (!light) continue;

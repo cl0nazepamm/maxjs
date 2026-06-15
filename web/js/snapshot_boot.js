@@ -28,7 +28,7 @@
 //   4. Layer manager core
 //   5. Conditional module registration (driven by runtimeFeatures)
 //   6. Apply scene.bin
-//   7. Apply snapshotUi block (tone mapping, exposure, env, fog, postfx state)
+//   7. Apply snapshotUi block (tone mapping, exposure, env, fog, postfx/studio state)
 //   8. Apply runtimeScene block (baked Object3D JSON)
 //   9. Bind layer project (inlines/ + project.maxjs.json)
 //  10. Run (setAnimationLoop)
@@ -38,10 +38,11 @@
 // Real code:    1 (meta), 2 (renderer), 3 (scene/camera/controls),
 //               4 (layer manager), 6 (applier with simple-PBR materials
 //               via material_builder.js), 7 partial (tone-map/exposure/
-//               bg/camera + scene lights via scene_lights.js), 9 (layer
+//               bg/camera + scene lights + portable Studio state), 9 (layer
 //               project bind), 10 (render loop), animation + timeline.
 // Deferred:     5 (optional modules — warns and continues),
-//               7 fx/studio/bake (warns), 8 runtimeScene (warns),
+//               7 deeper live editor panels / bake UI (warns),
+//               8 runtimeScene (warns),
 //               TSL / MaterialX / VRay / OpenPBR / Toon material types
 //               (degrade to MeshStandardMaterial), instance buckets,
 //               vertex colors, fog, splats/gltf.
@@ -657,8 +658,8 @@ function applySnapshotCameraClip(camera, cameraClip) {
 //   - envVisible: show environment map on the viewport background (Environment btn)
 //   - basic camera position/target and user clip planes if present
 // Bake overrides are consumed by material_builder during scene.bin apply.
-// The deeper post stack and studio lighting are still intentionally out of
-// the lightweight snapshot boot path.
+// The deeper live editor panels are intentionally out of the lightweight
+// snapshot boot path; portable Studio state is replayed after camera/env apply.
 export function applySnapshotSolidBackground(snapshotUi, scene) {
     if (!snapshotUi || !scene) return;
     // Environment map on the background wins when envVisible is true.
@@ -712,14 +713,9 @@ function applySnapshotUi(snapshotUi, ctx) {
     }
     applySnapshotCameraClip(camera, snapshotUi.cameraClip);
 
-    // Defer the rest.
-    if (snapshotUi.studio) {
-        noteExtractionDeferred(
-            'applySnapshotUi (studio)',
-            'index.html applyStudioState',
-            '(core look and bake overrides applied; studio lighting skipped)',
-        );
-    }
+    // Studio state is applied from boot() after authored environment and the
+    // final camera state are both in place, so camera-relative constraints have
+    // the same basis they had in the live viewer.
 }
 
 // Helper: re-derive vertical fov from the stashed horizontal Max fov +
@@ -933,7 +929,7 @@ async function bindLayerProject(root, meta, layerManager) {
 }
 
 // ─── Phase 10: render loop ────────────────────────────────────────────
-function startRenderLoop({ renderer, scene, camera, controls, layerManager, animationSystem, maxjsFx, snapshotEnvironment, optionalModules }) {
+function startRenderLoop({ renderer, scene, camera, controls, layerManager, animationSystem, maxjsFx, snapshotEnvironment, optionalModules, studioLighting }) {
     let lastTimeMs = performance.now();
     let elapsed = 0;
     const loop = () => {
@@ -948,6 +944,7 @@ function startRenderLoop({ renderer, scene, camera, controls, layerManager, anim
             module?.update?.(dt, elapsed);
         }
         snapshotEnvironment?.update?.(dt, elapsed, camera);
+        studioLighting?.updateCameraConstraints?.();
 
         layerManager?.beforeRender?.(elapsed);
         try {
@@ -983,6 +980,15 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
 
     // Phase 2: renderer
     const renderer = await createRenderer(canvas, features);
+    let studioModule = null;
+    if (features.renderer_pref === 'webgpu' && meta.snapshotUi?.studio) {
+        try {
+            studioModule = await import('./studio_lighting.js');
+            studioModule.installStudioLightingRenderer?.(renderer);
+        } catch (error) {
+            console.warn('[snapshot_boot] studio lighting module init failed', error);
+        }
+    }
 
     // Phase 3: scene
     const sceneCtx = createScene({ meta, renderer, canvas });
@@ -1038,8 +1044,10 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
         allowGeospatialSky: !!features.geospatial_sky,
     });
     let authoredLightCount = 0;
+    let studioLighting = null;
     const syncDefaultLights = () => {
-        defaultLights.visible = authoredLightCount === 0 && !snapshotEnvironment.isLightingActive();
+        const studioLightingActive = studioLighting?.hasReflectionPaint?.() === true;
+        defaultLights.visible = authoredLightCount === 0 && !snapshotEnvironment.isLightingActive() && !studioLightingActive;
     };
 
     // Phase 4: layer manager
@@ -1143,6 +1151,24 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
         controls.enabled = !locked;
     }
 
+    if (meta.snapshotUi?.studio && studioModule?.createStudioLightingController) {
+        try {
+            studioLighting = studioModule.createStudioLightingController({
+                scene,
+                camera,
+                nodeMap,
+                lightHandleMap,
+                getRenderableMeshes: () => applierCtx.forestMeshes?.values?.() ?? [],
+                onSceneChanged: () => (optionalModules.maxjsFx ?? optionalModules.ssgiFx)?.markSceneChanged?.(),
+                onOutputChanged: () => (optionalModules.maxjsFx ?? optionalModules.ssgiFx)?.markOutputChanged?.(),
+            });
+            studioLighting.applyState(meta.snapshotUi.studio);
+            syncDefaultLights();
+        } catch (error) {
+            console.warn('[snapshot_boot] studio lighting apply failed', error);
+        }
+    }
+
     // Phase 8: runtimeScene
     if (meta.runtimeScene) {
         await applyRuntimeScene(meta.runtimeScene, {
@@ -1179,6 +1205,7 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
         maxjsFx: optionalModules.maxjsFx ?? optionalModules.ssgiFx,
         snapshotEnvironment,
         optionalModules,
+        studioLighting,
     });
 
     return {
@@ -1191,10 +1218,16 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
         audioSystem: optionalModules.audio ?? null,
         animationSystem, maxTimeline,
         resize,
-        applyDelta: (newBuffer) => applyDelta(newBuffer, applierCtx),
+        applyDelta: async (newBuffer) => {
+            const result = await applyDelta(newBuffer, applierCtx);
+            studioLighting?.refreshSceneBindings?.();
+            syncDefaultLights();
+            return result;
+        },
         applyLights: (lightsData) => {
             const r = sceneLights.apply(lightsData);
             authoredLightCount = countVisibleLightPayload(lightsData);
+            studioLighting?.refreshSceneBindings?.();
             syncDefaultLights();
             return r;
         },
@@ -1217,6 +1250,7 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
                 }
             } catch {}
             try { snapshotEnvironment.dispose(); } catch {}
+            try { studioLighting?.dispose?.(); } catch {}
             try { sceneLights.dispose(); } catch {}
             try {
                 const disposedGeometries = new Set();

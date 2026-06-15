@@ -436,6 +436,13 @@
             lower.find(L"\"snapshot_backend\": \"webgpu") != std::wstring::npos) {
             return L"webgpu";
         }
+        // Studio state replays through MaxLightsNode / reflection paint, which
+        // requires the WebGPU/TSL snapshot shell even if older UI payloads did
+        // not include an explicit rendererBackend field.
+        if (lower.find(L"\"studio\":{") != std::wstring::npos ||
+            lower.find(L"\"studio\": {") != std::wstring::npos) {
+            return L"webgpu";
+        }
         return L"webgl";
     }
 

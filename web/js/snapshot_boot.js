@@ -73,7 +73,7 @@ import { createSceneLights } from './scene_lights.js';
 import { createSnapshotEnvironment } from './snapshot_environment.js';
 import { createMaterialBuilder } from './material_builder.js';
 import { copyMaxArrayToWorld, copyMaxComponentsToWorld } from './max_basis.js';
-import { geometryFromNodeBinary } from './scene_binary.js';
+import { binInRange, geometryFromNodeBinary, typedArrayCanStore } from './scene_binary.js';
 import { sceneSpace } from './max_basis.js';
 // Optional modules — imported lazily inside Phase 5 once runtimeFeatures
 // declare them. Keep them out of the static import graph so Minimal mode
@@ -461,6 +461,107 @@ async function registerOptionalModules(features, ctx) {
     return modules;
 }
 
+function normalizeMaxVertexColorChannel(channel = 0) {
+    if (typeof channel === 'string') {
+        const token = channel.trim().toLowerCase();
+        if (token === 'color' || token === 'rgb') return 0;
+        if (token === 'shading' || token === 'illum' || token === 'illumination') return -1;
+        if (token === 'alpha') return -2;
+        const parsed = Number.parseInt(token, 10);
+        if (Number.isFinite(parsed)) return parsed;
+        return 0;
+    }
+    if (!Number.isFinite(channel)) return 0;
+    return Math.trunc(channel);
+}
+
+function maxVertexColorAttributeName(channel = 0) {
+    const normalized = normalizeMaxVertexColorChannel(channel);
+    if (normalized === 0) return 'color';
+    if (normalized === -1) return 'maxjs_vc_shading';
+    if (normalized === -2) return 'maxjs_vc_alpha';
+    return `maxjs_vc_${normalized}`;
+}
+
+function normalizeVertexColorDescriptors(vertexColors) {
+    if (!Array.isArray(vertexColors)) return [];
+    return vertexColors.map((entry) => {
+        const channel = normalizeMaxVertexColorChannel(entry?.ch ?? entry?.channel ?? 0);
+        const name = (typeof entry?.name === 'string' && entry.name.length)
+            ? entry.name
+            : maxVertexColorAttributeName(channel);
+        const itemSize = Number.isInteger(entry?.itemSize) && entry.itemSize > 0
+            ? entry.itemSize
+            : 4;
+        let valueCount = 0;
+        if (Number.isInteger(entry?.n) && entry.n >= 0) valueCount = entry.n;
+        else if (Array.isArray(entry?.v) || ArrayBuffer.isView(entry?.v)) valueCount = entry.v.length;
+        const count = itemSize > 0 ? Math.floor(valueCount / itemSize) : 0;
+        return { ...entry, channel, name, itemSize, count, valueCount };
+    }).filter((entry) => entry.count > 0);
+}
+
+function setGeometryVertexColorAttributes(geometry, vertexColors, buffer = null) {
+    if (!geometry) return;
+    geometry.userData ??= {};
+    const descriptors = normalizeVertexColorDescriptors(vertexColors);
+    const previous = Array.isArray(geometry.userData.maxjsVertexColors)
+        ? geometry.userData.maxjsVertexColors
+        : [];
+    const keepNames = new Set(descriptors.map((entry) => entry.name));
+
+    if (descriptors.length > 0) {
+        for (const entry of previous) {
+            if (!keepNames.has(entry.name)) geometry.deleteAttribute(entry.name);
+        }
+    }
+
+    for (const entry of descriptors) {
+        const current = geometry.getAttribute(entry.name);
+        const fastPath = current
+            && current.itemSize === entry.itemSize
+            && current.count === entry.count
+            && typedArrayCanStore(current.array, entry.n || 0);
+
+        if (fastPath) {
+            if (buffer) {
+                if (!binInRange(buffer, entry.off, entry.n || 0)) {
+                    console.warn('[snapshot_boot] Invalid vertex color range for', entry.name);
+                    continue;
+                }
+                current.array.set(new Float32Array(buffer, entry.off, entry.n));
+                current.needsUpdate = true;
+            } else if (Array.isArray(entry.v) || ArrayBuffer.isView(entry.v)) {
+                current.array.set(entry.v);
+                current.needsUpdate = true;
+            }
+            continue;
+        }
+
+        let values = null;
+        if (buffer) {
+            if (!binInRange(buffer, entry.off, entry.n || 0)) {
+                console.warn('[snapshot_boot] Invalid vertex color range for', entry.name);
+                continue;
+            }
+            values = new Float32Array(new Float32Array(buffer, entry.off, entry.n));
+        } else if (Array.isArray(entry.v) || ArrayBuffer.isView(entry.v)) {
+            values = new Float32Array(entry.v);
+        } else {
+            continue;
+        }
+
+        geometry.setAttribute(entry.name, new THREE.BufferAttribute(values, entry.itemSize));
+    }
+
+    geometry.userData.maxjsVertexColors = descriptors.map(({ channel, name, itemSize, count }) => ({
+        channel, name, itemSize, count,
+    }));
+    geometry.userData.maxjsVertexColorChannels = geometry.userData.maxjsVertexColors.map(({ channel, name }) => ({
+        channel, name,
+    }));
+}
+
 // ─── Phase 6: apply scene.bin ──────────────────────────────────────────
 // Stage 3: real applier landed. js/scene_applier.js does the geometry
 // build / mesh creation / transform / removal pass. Defaults give every
@@ -530,6 +631,9 @@ async function applyDelta(buffer, ctx) {
             },
             onMaterialApplied: (handle, mesh) => {
                 ctx.layerManager?.applyMaterialOverrides?.(handle, mesh);
+            },
+            setVertexColors: (geom, vc, sceneBuffer) => {
+                setGeometryVertexColorAttributes(geom, vc, sceneBuffer);
             },
             markRuntimeTransformsDirty: () => {
                 ctx.layerManager?.markRuntimeTransformsDirty?.();

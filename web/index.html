@@ -12691,14 +12691,39 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             return `${ev >= 0 ? '+' : ''}${ev.toFixed(2)} EV`;
         }
 
-        function logSliderMin(control) {
-            return Number.isFinite(control.min) ? control.min : 0.001;
+        function postFxControlSliderMode(control) {
+            if (!control || control.type === 'checkbox' || control.type === 'select' || control.integer) return 'linear';
+            if (control.dynamic === false || control.dynamic === 'linear') return 'linear';
+            if (control.dynamic === 'signed-log' || control.dynamic === 'log') return control.dynamic;
+            const min = Number(control.min);
+            const max = Number(control.max);
+            if (!Number.isFinite(min) || !Number.isFinite(max) || max <= min) return 'linear';
+            if (min < 0 && max > 0) return 'signed-log';
+            if (max > 0) return 'log';
+            return 'linear';
         }
 
-        function logSliderMax(control, currentValue) {
-            const cap = Number.isFinite(control.max) ? control.max : 5;
-            const cur = Number(currentValue);
-            return Number.isFinite(cur) && cur > cap ? cur : cap;
+        function postFxDynamicSliderFloor(control, maxAbs, currentAbs = NaN) {
+            const declaredMin = Number(control.min);
+            const step = Number(control.step);
+            const candidates = [];
+            if (Number.isFinite(declaredMin) && declaredMin > 0) candidates.push(declaredMin);
+            if (Number.isFinite(step) && step > 0) candidates.push(step);
+            if (Number.isFinite(currentAbs) && currentAbs > 0) candidates.push(currentAbs);
+            if (candidates.length === 0 && Number.isFinite(maxAbs) && maxAbs > 0) candidates.push(maxAbs / LOG_SLIDER_STEPS);
+            const floor = Math.min(...candidates.filter((v) => Number.isFinite(v) && v > 0));
+            return Number.isFinite(floor) && floor > 0 ? floor : 0.001;
+        }
+
+        function postFxDynamicPositiveBounds(control, currentValue) {
+            const declaredMax = Number(control.max);
+            const currentAbs = Math.abs(Number(currentValue));
+            const max = Math.max(
+                Number.isFinite(declaredMax) && declaredMax > 0 ? declaredMax : 1,
+                Number.isFinite(currentAbs) && currentAbs > 0 ? currentAbs : 0
+            );
+            const min = Math.min(postFxDynamicSliderFloor(control, max, currentAbs), max);
+            return { min, max: Math.max(max, min) };
         }
 
         function valueToLogSliderInput(value, min, max) {
@@ -12713,14 +12738,73 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             return min * Math.pow(max / min, t);
         }
 
+        function valueToPostFxDynamicSliderInput(control, value, currentValue = value) {
+            const mode = postFxControlSliderMode(control);
+            if (mode === 'linear') return Number(value);
+            const v = Number(value);
+            if (!Number.isFinite(v)) return 0;
+
+            if (mode === 'signed-log') {
+                const center = Math.floor(LOG_SLIDER_STEPS / 2);
+                if (Math.abs(v) <= 1.0e-12) return center;
+                const halfSteps = center - 1;
+                const maxAbs = v < 0 ? Math.abs(Number(control.min)) : Number(control.max);
+                const { min, max } = postFxDynamicPositiveBounds({ ...control, max: maxAbs }, currentValue);
+                if (max <= min) return center;
+                const t = Math.max(0, Math.min(1, Math.log(Math.abs(v) / min) / Math.log(max / min)));
+                const offset = 1 + Math.round(t * halfSteps);
+                return v < 0 ? center - offset : center + offset;
+            }
+
+            const declaredMin = Number(control.min);
+            if (declaredMin <= 0 && v <= 0) return 0;
+            const { min, max } = postFxDynamicPositiveBounds(control, currentValue);
+            if (max <= min) return declaredMin <= 0 ? 1 : 0;
+            const clamped = Math.max(min, Math.min(max, v));
+            const t = Math.max(0, Math.min(1, Math.log(clamped / min) / Math.log(max / min)));
+            const zeroSlot = declaredMin <= 0;
+            const steps = zeroSlot ? LOG_SLIDER_STEPS - 1 : LOG_SLIDER_STEPS;
+            return (zeroSlot ? 1 : 0) + Math.round(t * steps);
+        }
+
+        function postFxDynamicSliderInputToValue(control, input, currentValue) {
+            const mode = postFxControlSliderMode(control);
+            if (mode === 'linear') {
+                const raw = Number(input);
+                return control.integer ? Math.round(raw) : raw;
+            }
+
+            const rawInput = Math.max(0, Math.min(LOG_SLIDER_STEPS, Number(input)));
+            if (mode === 'signed-log') {
+                const center = Math.floor(LOG_SLIDER_STEPS / 2);
+                if (Math.abs(rawInput - center) < 0.5) return 0;
+                const sign = rawInput < center ? -1 : 1;
+                const maxAbs = sign < 0 ? Math.abs(Number(control.min)) : Number(control.max);
+                const { min, max } = postFxDynamicPositiveBounds({ ...control, max: maxAbs }, currentValue);
+                if (max <= min) return sign * min;
+                const halfSteps = center - 1;
+                const offset = Math.max(1, Math.abs(rawInput - center));
+                const t = Math.max(0, Math.min(1, (offset - 1) / halfSteps));
+                return sign * min * Math.pow(max / min, t);
+            }
+
+            const declaredMin = Number(control.min);
+            if (declaredMin <= 0 && rawInput <= 0) return 0;
+            const { min, max } = postFxDynamicPositiveBounds(control, currentValue);
+            if (max <= min) return min;
+            const zeroSlot = declaredMin <= 0;
+            const steps = zeroSlot ? LOG_SLIDER_STEPS - 1 : LOG_SLIDER_STEPS;
+            const adjusted = zeroSlot ? Math.max(1, rawInput) - 1 : rawInput;
+            const t = Math.max(0, Math.min(1, adjusted / steps));
+            return min * Math.pow(max / min, t);
+        }
+
         function readPostFxControlValue(control, input, getValues) {
             if (control.type === 'checkbox') return input.checked;
             if (control.type === 'select') return input.value;
-            if (control.dynamic === 'log') {
+            if (postFxControlSliderMode(control) !== 'linear') {
                 const values = getValues();
-                const min = logSliderMin(control);
-                const max = logSliderMax(control, values[control.key]);
-                return logSliderInputToValue(input.value, min, max);
+                return postFxDynamicSliderInputToValue(control, input.value, values[control.key]);
             }
             const raw = Number(input.value);
             return control.integer ? Math.round(raw) : raw;
@@ -12740,10 +12824,14 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 return option?.label || String(value ?? '');
             }
             if (!Number.isFinite(value)) return '--';
-            if (control.dynamic === 'log') {
-                if (value < 0.01) return value.toFixed(3);
-                if (value < 1) return value.toFixed(2);
-                return value.toFixed(2);
+            if (postFxControlSliderMode(control) !== 'linear') {
+                const abs = Math.abs(value);
+                if (abs === 0) return '0';
+                if (abs < 0.001) return value.toExponential(2);
+                if (abs < 0.01) return value.toFixed(4);
+                if (abs < 1) return value.toFixed(3);
+                if (abs < 10) return value.toFixed(2);
+                return value.toFixed(1);
             }
             if (control.integer) return String(Math.round(value));
             if (control.step >= 1) return value.toFixed(0);
@@ -12808,10 +12896,11 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                                 `;
                             }
 
-                            const useLogSlider = control.dynamic === 'log';
-                            const rangeMin = useLogSlider ? 0 : control.min;
-                            const rangeMax = useLogSlider ? LOG_SLIDER_STEPS : control.max;
-                            const rangeStep = useLogSlider ? 1 : control.step;
+                            const dynamicMode = postFxControlSliderMode(control);
+                            const useDynamicSlider = dynamicMode !== 'linear';
+                            const rangeMin = useDynamicSlider ? 0 : control.min;
+                            const rangeMax = useDynamicSlider ? LOG_SLIDER_STEPS : control.max;
+                            const rangeStep = useDynamicSlider ? 1 : control.step;
                             return `
                                 <label class="fx-control" for="${inputId}" data-fx-control="${control.key}">
                                     <div class="fx-control-head">
@@ -13745,8 +13834,9 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     }
                     const editingControl = !force && document.activeElement === controlEl.input;
 
-                    // Disable DOF sliders when "Auto from Camera" is on (Physical Camera drives them)
-                    const dofAutoControls = ['focusDistance', 'focalLength', 'bokehScale'];
+                    // Lock the camera-driven DOF sliders when "Auto from Camera" is on. DOF Range
+                    // (focalLength) stays manual — physical range is unusable at scene scale.
+                    const dofAutoControls = ['focusDistance', 'bokehScale'];
                     const autoLocked = section.key === 'dof' && dofAutoControls.includes(control.key) && values.autoFromCamera;
                     controlEl.input.disabled = disabled || autoLocked || !visible;
 
@@ -13754,11 +13844,9 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                         if (!editingControl) controlEl.input.checked = !!values[control.key];
                     } else if (control.type === 'select') {
                         if (!editingControl) controlEl.input.value = values[control.key];
-                    } else if (control.dynamic === 'log') {
-                        const min = logSliderMin(control);
-                        const max = logSliderMax(control, values[control.key]);
+                    } else if (postFxControlSliderMode(control) !== 'linear') {
                         if (!editingControl) {
-                            controlEl.input.value = valueToLogSliderInput(values[control.key], min, max);
+                            controlEl.input.value = valueToPostFxDynamicSliderInput(control, values[control.key], values[control.key]);
                         }
                         if (controlEl.valueEl) {
                             controlEl.valueEl.textContent = formatControlValue(control, values[control.key]);
@@ -14525,9 +14613,9 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             xrRuntime.update(frameDt);
             if (!xrRuntime.active) syncOrbitNavigationFeel();
             if (!xrRuntime.active && !(animationSystem?.isDrivingSceneCamera?.())) controls.update();
-            // Auto-update DOF focus distance from camera-to-target when enabled
-            // Skip when Physical Camera DOF is driving the values (Camera Lock ON + Physical Camera has DOF)
-            if (!xrRuntime.active && (!physicalCameraDofActive || !camLock)) {
+            // Auto-update DOF focus distance from camera-to-target when enabled.
+            // Physical Camera DOF owns focus/bokeh while the camera packet is active.
+            if (!xrRuntime.active && !physicalCameraDofActive) {
                 maxjsFx.updateDofFocusFromCamera(camera.position.distanceTo(controls.target));
             }
             syncPathTracingDofFromPostFx();
@@ -14964,7 +15052,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
 
         function renderCurrentFrameOnce(renderTimeSeconds = null) {
             if (!xrRuntime.active) controls.update();
-            if (!xrRuntime.active && (!physicalCameraDofActive || !camLock)) {
+            if (!xrRuntime.active && !physicalCameraDofActive) {
                 maxjsFx.updateDofFocusFromCamera(camera.position.distanceTo(controls.target));
             }
             syncPathTracingDofFromPostFx();

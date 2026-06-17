@@ -1230,27 +1230,45 @@ export function createMaxJSFxController({
             core.uniforms.dofFocusDistanceU.value = targetDist;
         },
         updateDofFromPhysicalCamera(cam, onUpdate = null) {
-            // Called when Camera Lock is ON and Physical Camera has DOF
-            if (!state.dof.enabled || !state.dof.autoFromCamera) return;
-            if (!cam.dofEnabled) return;
+            // Called when Camera Lock is ON and Physical Camera has DOF.
+            // Auto-track the camera's FOCUS DISTANCE (where it is focused) and bokeh size
+            // (driven by aperture). The "DOF Range" (focalLength) is intentionally NOT taken
+            // from the camera: physical depth-of-field scales with focusDistance^2, so beyond
+            // near focus it resolves to extremes (whole scene sharp, or a razor-thin plane)
+            // and is not artistically usable. Range stays a manual control.
+            if (!state.dof.autoFromCamera) return false;
+            if (!cam.dofEnabled) return false;
 
             let changed = false;
-            if (Number.isFinite(cam.dofFocusDistance) && cam.dofFocusDistance > 0) {
-                state.dof.focusDistance = cam.dofFocusDistance;
-                core.uniforms.dofFocusDistanceU.value = cam.dofFocusDistance;
+            if (!state.dof.enabled) {
+                if (!supportsScreenSpaceEffects) {
+                    lastError = 'DOF requires WebGPU or TSL_GL';
+                    onError(lastError);
+                    return false;
+                }
+                if (!available) return false;
+                state.dof.enabled = true;
+                rebuildPipeline();
                 changed = true;
             }
-            if (Number.isFinite(cam.dofFocalLength) && cam.dofFocalLength > 0) {
-                state.dof.focalLength = cam.dofFocalLength;
-                core.uniforms.dofFocalLengthU.value = cam.dofFocalLength;
-                changed = true;
+            if (Number.isFinite(cam.dofFocusDistance) && cam.dofFocusDistance > 0) {
+                const focusDistance = cam.dofFocusDistance;
+                if (state.dof.focusDistance !== focusDistance) {
+                    state.dof.focusDistance = focusDistance;
+                    changed = true;
+                }
+                core.uniforms.dofFocusDistanceU.value = focusDistance;
             }
             if (Number.isFinite(cam.dofBokehScale) && cam.dofBokehScale > 0) {
-                state.dof.bokehScale = cam.dofBokehScale;
-                core.uniforms.dofBokehScaleU.value = cam.dofBokehScale;
-                changed = true;
+                const bokehScale = cam.dofBokehScale;
+                if (state.dof.bokehScale !== bokehScale) {
+                    state.dof.bokehScale = bokehScale;
+                    changed = true;
+                }
+                core.uniforms.dofBokehScaleU.value = bokehScale;
             }
             if (changed && onUpdate) onUpdate();
+            return changed;
         },
 
         // ── Volumetric Lighting ──

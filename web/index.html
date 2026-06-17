@@ -134,6 +134,12 @@
                     </button>
                     <span class="vpmenu-label" id="safeFrameLabel">Safe Frame</span>
                 </div>
+                <div class="vpmenu-row" data-vpmenu-close>
+                    <button id="btnComposition" class="rail-btn" title="Composition guides — thirds, golden ratio, spiral, diagonals…" aria-label="Composition guides" aria-haspopup="dialog" aria-expanded="false">
+                        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="2.5" width="12" height="11" rx="1"/><path d="M6.67 2.5v11M9.33 2.5v11M2 6.17h12M2 9.83h12"/></svg>
+                    </button>
+                    <span class="vpmenu-label">Composition</span>
+                </div>
             </div>
         </div>
         <!-- Standard: renderer menu -->
@@ -274,6 +280,56 @@
             </div>
         </div>
     </nav>
+    <!-- Composition guides popover (opened by the Composition button under Safe Frame) -->
+    <div id="compositionPopover" class="comp-popover" role="dialog" aria-label="Composition guides" aria-hidden="true" hidden>
+        <div class="comp-popover-head">
+            <span class="comp-popover-title">Composition</span>
+            <button id="compClose" class="comp-popover-close" type="button" title="Close" aria-label="Close composition guides">
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 4 4 12M4 4l8 8"/></svg>
+            </button>
+        </div>
+        <div class="comp-section">Guides</div>
+        <div id="compGuideGrid" class="comp-chip-grid" role="group" aria-label="Composition guides"></div>
+        <div class="comp-row comp-suboption" data-comp-suboption="spiral">
+            <span class="comp-row-label">Spiral</span>
+            <div id="compSpiralOrient" class="rail-mode-switch comp-mini-switch" role="group" aria-label="Spiral orientation">
+                <button class="rail-mode-option" type="button" data-spiral-orient="0" title="Eye top-right">↗</button>
+                <button class="rail-mode-option" type="button" data-spiral-orient="1" title="Eye top-left">↖</button>
+                <button class="rail-mode-option" type="button" data-spiral-orient="2" title="Eye bottom-right">↘</button>
+                <button class="rail-mode-option" type="button" data-spiral-orient="3" title="Eye bottom-left">↙</button>
+            </div>
+        </div>
+        <div class="comp-row comp-suboption" data-comp-suboption="grid">
+            <span class="comp-row-label">Density</span>
+            <input id="compGridDiv" class="comp-range" type="range" min="2" max="16" step="1" value="8" aria-label="Grid density">
+            <span id="compGridDivVal" class="comp-range-val">8</span>
+        </div>
+        <div class="comp-section">Aspect Mask</div>
+        <div class="comp-row">
+            <select id="compAspect" class="comp-select" aria-label="Aspect mask"></select>
+        </div>
+        <div class="comp-section">Appearance</div>
+        <div class="comp-row">
+            <span class="comp-row-label">Color</span>
+            <label class="comp-color-slot" title="Guide color" aria-label="Guide color">
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" aria-hidden="true">
+                    <rect class="comp-color-fill" x="2.5" y="2.5" width="11" height="11" rx="2" stroke="currentColor"/>
+                </svg>
+                <input type="color" id="compColor" value="#ffffff" tabindex="-1" aria-label="Guide color">
+            </label>
+        </div>
+        <div class="comp-row">
+            <span class="comp-row-label">Opacity</span>
+            <input id="compOpacity" class="comp-range" type="range" min="0.1" max="1" step="0.05" value="0.5" aria-label="Guide opacity">
+        </div>
+        <div class="comp-row">
+            <span class="comp-row-label">Weight</span>
+            <input id="compThickness" class="comp-range" type="range" min="0.5" max="3" step="0.5" value="1" aria-label="Guide thickness">
+        </div>
+        <div class="comp-row comp-row-actions">
+            <button id="compClear" class="comp-btn" type="button" title="Hide all guides">Clear all</button>
+        </div>
+    </div>
     <script src="./js/startup_gate.js"></script>
     <script src="./js/viewport_menu.js"></script>
     <div id="rightDock">
@@ -428,12 +484,20 @@
         import * as TSL from 'three/tsl';
         import { createTSLCompiler, makeBakeNodeToTexture } from './js/tsl_materials.js';
 
-        // Patch materialEnvIntensity to always read material.envMapIntensity,
-        // even when no per-material envMap is set (default three.js falls back
-        // to scene.environmentIntensity which is global).  This makes the
-        // native EnvironmentNode respect per-material envMapIntensity with
-        // scene.environment. Planetary WebGPU sky owns environmentNode separately.
-        materialEnvIntensity.onObjectUpdate(({ material }) => material.envMapIntensity);
+        // Patch materialEnvIntensity so scene.environment still respects
+        // per-material envMapIntensity, while scene.environmentNode can carry
+        // a global node intensity for procedural WebGPU environments.
+        materialEnvIntensity.onObjectUpdate(({ material, scene }) => {
+            const materialIntensity = Number.isFinite(material?.envMapIntensity)
+                ? material.envMapIntensity
+                : 1.0;
+            const nodeIntensity = (
+                !material?.envMap &&
+                scene?.environmentNode &&
+                Number.isFinite(scene?.environmentIntensity)
+            ) ? scene.environmentIntensity : 1.0;
+            return materialIntensity * nodeIntensity;
+        });
         import { applyDeltaFrame } from './js/protocol.js';
         import {
             attachSkinAttributes,
@@ -467,6 +531,7 @@
         import { getOrCreateHTMLTexture, releaseHTMLTexture, disposeAllHTMLTextures, attachHTMLClickForwarding } from './js/html_texture.js';
         import { createCanvasPanel } from './js/canvas_panel.js';
         import { createShaderLabFx } from './js/shader_lab_fx.js';
+        import { createCompositionOverlay, COMPOSITION_GUIDES, COMPOSITION_ASPECTS } from './js/composition_overlay.js';
         import { installDockDragHide } from './js/dock_drag.js';
         import { analyzeSnapshotPayload, formatBytes, formatPercent } from './js/snapshot_diagnostics.js';
         import {
@@ -614,6 +679,7 @@
         let safeFrameEnabled = false;
         let blobOverlayCvs = null;
         let blobOverlayCtx = null;
+        let compositionOverlay = null;
 
         try {
             safeFrameEnabled = localStorage.getItem(SAFE_FRAME_STORAGE_KEY) === 'true';
@@ -714,6 +780,7 @@
                 if (blobOverlayCvs.height !== rect.height) blobOverlayCvs.height = rect.height;
                 applyFrameElementStyle(blobOverlayCvs, rect);
             }
+            compositionOverlay?.resize(rect);
             css3dOverlay.setSize(rect.width, rect.height);
             css3dOverlay.setViewportRect(rect);
             if (resizePostFx) {
@@ -1451,12 +1518,50 @@
             return pathTracingPostTarget;
         }
 
-        // One PT live frame: route through the post stack when camera effects
-        // (or PowerShot) are on, else blit straight to the canvas.
+        function hasPathTracingPostFxActive() {
+            return !!(
+                shaderLabFx?.isEnabled?.()
+                || maxjsFx.isBloomEnabled?.()
+                || maxjsFx.isPixelEnabled?.()
+                || maxjsFx.isRetroEnabled?.()
+                || maxjsFx.isPowerShotEnabled?.()
+            );
+        }
+
+        function computePathTracingApertureRadius(dof = {}) {
+            const focusDistance = Math.max(0.01, Number(dof.focusDistance) || 5);
+            const dofRange = Math.max(0.01, Number(dof.focalLength) || focusDistance);
+            const bokehScale = Math.max(0, Number(dof.bokehScale) || 0);
+            if (bokehScale <= 0) return 0;
+
+            // Post DOF's "focalLength" is a transition range, not optical focal
+            // length. Map a narrower range to a stronger PT lens radius, but
+            // ramp it gently so the focus plane stays usable.
+            const bokehFactor = Math.min(1, bokehScale / 30);
+            const rangeFactor = Math.sqrt(Math.min(16, Math.max(0.05, focusDistance / dofRange)));
+            const radius = focusDistance * bokehFactor * rangeFactor * 0.006;
+            return Math.max(0, Math.min(radius, focusDistance * 0.02));
+        }
+
+        function syncPathTracingDofFromPostFx() {
+            if (!pathTracingFx?.setDOF) return;
+            const dof = maxjsFx.getState?.().dof || {};
+            const enabled = maxjsFx.isDofEnabled?.() === true && camera?.isPerspectiveCamera === true;
+            const focusDistance = Math.max(0.01, Number(dof.focusDistance) || camera.position.distanceTo(controls.target) || 5);
+            pathTracingFx.setDOF({
+                enabled,
+                focusDistance,
+                apertureRadius: enabled ? computePathTracingApertureRadius({ ...dof, focusDistance }) : 0,
+            });
+        }
+
+        // One PT live frame: route through the post stack when beauty-only or
+        // final stylize effects are on, else blit straight to the canvas.
         function renderPathTracingLiveFrame() {
+            syncPathTracingDofFromPostFx();
             const wantPost = !renderToImageActive
                 && maxjsFx.isAvailable?.()
-                && (maxjsFx.hasEnabledEffects?.() || maxjsFx.hasPathTracedSource?.());
+                && hasPathTracingPostFxActive();
             if (wantPost) {
                 const rt = ensurePathTracingPostTarget();
                 if (rt) {
@@ -1599,11 +1704,21 @@
         applyFrameElementStyle(blobOverlayCvs, initialBlobFrameRect);
         document.body.appendChild(blobOverlayCvs);
         blobOverlayCtx = blobOverlayCvs.getContext('2d');
+
+        // Composition guide overlay — always-on-top framing helpers pinned to
+        // the viewport frame so they track Safe Frame cropping automatically.
+        compositionOverlay = createCompositionOverlay({
+            applyFrameStyle: applyFrameElementStyle,
+            getFrameRect: getViewportFrameRect,
+        });
+        compositionOverlay.resize(getViewportFrameRect());
+
         addEventListener('resize', () => {
             const rect = getViewportFrameRect();
             blobOverlayCvs.width = rect.width;
             blobOverlayCvs.height = rect.height;
             applyFrameElementStyle(blobOverlayCvs, rect);
+            compositionOverlay?.resize(rect);
             if (asciiActive && asciiEffect) {
                 asciiEffect.setSize(rect.width, rect.height);
                 applyFrameElementStyle(asciiEffect.domElement, rect);
@@ -3426,6 +3541,11 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     await updateLightProbeFromHDRI(hdrTex, probeSignature, loadGeneration);
                 }
                 maxjsFx.markEnvironmentChanged?.();
+                // The path tracer bakes the env texture into its kernel at
+                // build time, so an async HDRI load that lands after the scene
+                // was built needs an explicit rebuild — otherwise the tracer
+                // keeps its stale (null) env and shows the black/no-env state.
+                markPathTracingSceneDirtyNow();
                 syncHdriPanel();
             }, undefined, (error) => {
                 console.error('max.js HDRI load failed', { hdriUrl, error });
@@ -3438,6 +3558,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 syncMaterialEnvMaps();
                 syncEnvironmentDisplay();
                 resetEnvironmentLighting();
+                markPathTracingSceneDirtyNow(); // drop the now-cleared env binding
                 syncHdriPanel();
             });
         }
@@ -3523,6 +3644,9 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     await updateLightProbeFromHDRI(hdrTex, 'local-' + localHdriFileName, loadGen);
                 }
                 maxjsFx.markEnvironmentChanged?.();
+                // Async load: rebuild the tracer so it picks up the new env
+                // texture (baked into the kernel at build time). See loadHDRI.
+                markPathTracingSceneDirtyNow();
                 if (persist) savePostFxState();
                 syncHdriPanel();
             }, undefined, (error) => {
@@ -3577,6 +3701,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             localHdriEnabled = enabled;
             applyLocalHDRIToScene();
             maxjsFx.markEnvironmentChanged?.();
+            markPathTracingSceneDirtyNow(); // env texture binding toggled on/off
             savePostFxState();
             syncHdriPanel();
         }
@@ -3596,6 +3721,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             if (authoredEnvironmentActive) {
                 restoreAuthoredEnvironmentAfterLocalHDRIChange();
                 maxjsFx.markEnvironmentChanged?.();
+                markPathTracingSceneDirtyNow(); // env binding swapped back to authored
                 savePostFxState();
                 syncHdriPanel();
                 return;
@@ -3610,6 +3736,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             scene.backgroundBlurriness = 0;
             syncEnvironmentDisplay();
             resetEnvironmentLighting();
+            markPathTracingSceneDirtyNow(); // env binding cleared
             savePostFxState();
             syncHdriPanel();
         }
@@ -7919,10 +8046,12 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                                 writeBit(mesh, lid, link.objects.has(meshHandle));
                             });
                         } else {
-                            for (const oh of link.objects) {
-                                const mesh = getByHandle(nodeMap, oh);
-                                if (mesh) writeBit(mesh, lid, false);
-                            }
+                            // Walk every renderable mesh (instanced buckets included,
+                            // which never appear in nodeMap) and clear the bit on the
+                            // excluded ones, mirroring the include branch above.
+                            forEachRenderableMesh((meshHandle, mesh) => {
+                                if (link.objects.has(meshHandle)) writeBit(mesh, lid, false);
+                            });
                         }
                     }
                 }
@@ -10385,6 +10514,8 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 const aspect = getRenderOutputAspect();
                 if (aspect) return aspect;
             }
+            const rect = getViewportFrameRect();
+            if (Number.isFinite(rect?.aspect) && rect.aspect > 0) return rect.aspect;
             if (camera?.isPerspectiveCamera && Number.isFinite(camera.aspect) && camera.aspect > 0) {
                 return camera.aspect;
             }
@@ -10410,6 +10541,21 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             applyCameraClipOverrides(camera);
         }
 
+        function syncCameraConsumersAfterSwap() {
+            if (!renderToImageActive) {
+                applyRenderViewportLayout({ resizeBuffers: true, resizePostFx: false });
+            }
+            maxjsFx.setCamera?.(camera);
+            webglBasicFx.setCamera?.(camera);
+            shaderLabFx.setCamera?.(camera);
+            pathTracingFx.setCamera?.(camera);
+            if (!renderToImageActive) {
+                maxjsFx.resize();
+                webglBasicFx.resize?.();
+                shaderLabFx.resize?.();
+            }
+        }
+
         // ── Camera Sync (Max view → world camera) ───────────
         function applyCamera(cam) {
             const layerCameraMode = layerManager?.cameraMode ?? 'viewport';
@@ -10422,25 +10568,20 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
 
             const wantOrtho = cam.persp === false;
             const isOrtho = camera.isOrthographicCamera;
+            let cameraSwapped = false;
 
             if (wantOrtho && !isOrtho) {
                 scene.remove(camera);
                 camera = orthoCamera;
                 scene.add(camera);
                 controls.object = camera;
-                maxjsFx.setCamera?.(camera);
-                webglBasicFx.setCamera?.(camera);
-                shaderLabFx.setCamera?.(camera);
-                pathTracingFx.setCamera?.(camera);
+                cameraSwapped = true;
             } else if (!wantOrtho && isOrtho) {
                 scene.remove(camera);
                 camera = perspCamera;
                 scene.add(camera);
                 controls.object = camera;
-                maxjsFx.setCamera?.(camera);
-                webglBasicFx.setCamera?.(camera);
-                shaderLabFx.setCamera?.(camera);
-                pathTracingFx.setCamera?.(camera);
+                cameraSwapped = true;
             }
 
             copyMaxArrayToWorld(camera.position, cam.pos);
@@ -10449,6 +10590,9 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             camera.lookAt(cameraTargetWorld);
 
             applyCameraProjectionFromMax(cam);
+            if (cameraSwapped) {
+                syncCameraConsumersAfterSwap();
+            }
             controls.target.copy(cameraTargetWorld);
             syncOrbitNavigationFeel();
 
@@ -10457,6 +10601,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             if (physicalCameraDofActive && maxjsFx?.updateDofFromPhysicalCamera) {
                 maxjsFx.updateDofFromPhysicalCamera(cam, () => syncPostFxPanel(false, { persist: false }));
             }
+            syncPathTracingDofFromPostFx();
         }
 
         function computeVisibleSceneBounds(target = new THREE.Box3()) {
@@ -10492,24 +10637,19 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
 
             const wantOrtho = savedCamera.perspective === false;
             const isOrtho = camera.isOrthographicCamera;
+            let cameraSwapped = false;
             if (wantOrtho && !isOrtho) {
                 scene.remove(camera);
                 camera = orthoCamera;
                 scene.add(camera);
                 controls.object = camera;
-                maxjsFx.setCamera?.(camera);
-                webglBasicFx.setCamera?.(camera);
-                shaderLabFx.setCamera?.(camera);
-                pathTracingFx.setCamera?.(camera);
+                cameraSwapped = true;
             } else if (!wantOrtho && isOrtho) {
                 scene.remove(camera);
                 camera = perspCamera;
                 scene.add(camera);
                 controls.object = camera;
-                maxjsFx.setCamera?.(camera);
-                webglBasicFx.setCamera?.(camera);
-                shaderLabFx.setCamera?.(camera);
-                pathTracingFx.setCamera?.(camera);
+                cameraSwapped = true;
             }
 
             camera.position.fromArray(savedCamera.position);
@@ -10521,7 +10661,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 const viewWidth = Number.isFinite(savedCamera.viewWidth) && savedCamera.viewWidth > 0
                     ? savedCamera.viewWidth
                     : 500;
-                const aspect = innerWidth / innerHeight;
+                const aspect = getCameraProjectionAspect();
                 camera.left = -viewWidth / 2;
                 camera.right = viewWidth / 2;
                 camera.top = viewWidth / (2 * aspect);
@@ -10530,10 +10670,16 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 camera.far = 100000;
             } else if (Number.isFinite(savedCamera.fov) && savedCamera.fov > 0 && savedCamera.fov < 170) {
                 camera.fov = savedCamera.fov;
+                camera.aspect = getCameraProjectionAspect();
                 applySyncedCameraClip(camera, savedCamera);
             }
 
             applyCameraClipOverrides(camera);
+            if (cameraSwapped) {
+                syncCameraConsumersAfterSwap();
+            } else {
+                updateCameraProjectionForViewportRect();
+            }
             controls.target.fromArray(savedCamera.target);
             syncOrbitNavigationFeel();
             controls.update();
@@ -10599,6 +10745,144 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 : 'max.js - safe frame crop off');
         });
         syncSafeFrameButtonUi();
+
+        // ── Composition guide controls ──────────────────────────────────
+        (function wireCompositionOverlay() {
+            if (!compositionOverlay) return;
+            const st0 = compositionOverlay.getState();
+            const button = document.getElementById('btnComposition');
+            const popover = document.getElementById('compositionPopover');
+            const closeBtn = document.getElementById('compClose');
+            const chipGrid = document.getElementById('compGuideGrid');
+            const spiralSwitch = document.getElementById('compSpiralOrient');
+            const spiralRow = document.querySelector('[data-comp-suboption="spiral"]');
+            const gridRow = document.querySelector('[data-comp-suboption="grid"]');
+            const gridDiv = document.getElementById('compGridDiv');
+            const gridDivVal = document.getElementById('compGridDivVal');
+            const aspectSel = document.getElementById('compAspect');
+            const colorInput = document.getElementById('compColor');
+            const colorFill = document.querySelector('.comp-color-fill');
+            const opacity = document.getElementById('compOpacity');
+            const thickness = document.getElementById('compThickness');
+            const clearBtn = document.getElementById('compClear');
+
+            function refreshChrome() {
+                const st = compositionOverlay.getState();
+                button?.classList.toggle('active', compositionOverlay.isActive());
+                spiralRow?.classList.toggle('is-hidden', !st.guides.spiral);
+                gridRow?.classList.toggle('is-hidden', !st.guides.grid);
+            }
+
+            function setPopover(open) {
+                if (!popover) return;
+                popover.hidden = !open;
+                popover.setAttribute('aria-hidden', open ? 'false' : 'true');
+                popover.classList.toggle('open', open);
+                button?.setAttribute('aria-expanded', open ? 'true' : 'false');
+            }
+            if (button && popover) {
+                button.addEventListener('click', () => setPopover(popover.hidden));
+                closeBtn?.addEventListener('click', () => setPopover(false));
+                document.addEventListener('pointerdown', (e) => {
+                    if (popover.hidden) return;
+                    if (e.target.closest('#compositionPopover') || e.target.closest('#btnComposition')) return;
+                    setPopover(false);
+                });
+                document.addEventListener('keydown', (e) => {
+                    if (e.key === 'Escape' && !popover.hidden) setPopover(false);
+                });
+            }
+
+            if (chipGrid) {
+                for (const g of COMPOSITION_GUIDES) {
+                    const chip = document.createElement('button');
+                    chip.type = 'button';
+                    chip.className = 'comp-chip';
+                    chip.dataset.guide = g.id;
+                    chip.textContent = g.label;
+                    chip.title = g.title;
+                    const on = !!st0.guides[g.id];
+                    chip.classList.toggle('active', on);
+                    chip.setAttribute('aria-pressed', on ? 'true' : 'false');
+                    chip.addEventListener('click', () => {
+                        const next = compositionOverlay.toggleGuide(g.id);
+                        chip.classList.toggle('active', next);
+                        chip.setAttribute('aria-pressed', next ? 'true' : 'false');
+                        refreshChrome();
+                    });
+                    chipGrid.appendChild(chip);
+                }
+            }
+
+            if (spiralSwitch) {
+                const markActive = (v) => spiralSwitch.querySelectorAll('.rail-mode-option').forEach((b) => {
+                    b.classList.toggle('active', Number(b.dataset.spiralOrient) === v);
+                });
+                markActive(st0.spiralOrientation);
+                spiralSwitch.addEventListener('click', (e) => {
+                    const btn = e.target.closest('[data-spiral-orient]');
+                    if (!btn) return;
+                    const v = Number(btn.dataset.spiralOrient) & 3;
+                    compositionOverlay.setSpiralOrientation(v);
+                    markActive(v);
+                });
+            }
+
+            if (gridDiv) {
+                gridDiv.value = String(st0.gridDivisions);
+                if (gridDivVal) gridDivVal.textContent = String(st0.gridDivisions);
+                gridDiv.addEventListener('input', () => {
+                    compositionOverlay.setGridDivisions(gridDiv.value);
+                    if (gridDivVal) gridDivVal.textContent = String(Math.round(Number(gridDiv.value)));
+                });
+            }
+
+            if (aspectSel) {
+                for (const a of COMPOSITION_ASPECTS) {
+                    const opt = document.createElement('option');
+                    opt.value = a.id;
+                    opt.textContent = a.id === 'off' ? 'No mask' : a.label;
+                    aspectSel.appendChild(opt);
+                }
+                aspectSel.value = st0.aspect;
+                aspectSel.addEventListener('change', () => {
+                    compositionOverlay.setAspect(aspectSel.value);
+                    refreshChrome();
+                });
+            }
+
+            if (colorInput) {
+                colorInput.value = st0.color;
+                if (colorFill) colorFill.style.fill = st0.color;
+                colorInput.addEventListener('input', () => {
+                    compositionOverlay.setColor(colorInput.value);
+                    if (colorFill) colorFill.style.fill = colorInput.value;
+                });
+            }
+
+            if (opacity) {
+                opacity.value = String(st0.opacity);
+                opacity.addEventListener('input', () => compositionOverlay.setOpacity(opacity.value));
+            }
+            if (thickness) {
+                thickness.value = String(st0.thickness);
+                thickness.addEventListener('input', () => compositionOverlay.setThickness(thickness.value));
+            }
+
+            if (clearBtn) {
+                clearBtn.addEventListener('click', () => {
+                    compositionOverlay.clearGuides();
+                    chipGrid?.querySelectorAll('.comp-chip').forEach((c) => {
+                        c.classList.remove('active');
+                        c.setAttribute('aria-pressed', 'false');
+                    });
+                    if (aspectSel) aspectSel.value = 'off';
+                    refreshChrome();
+                });
+            }
+
+            refreshChrome();
+        })();
 
         const SNAPSHOT_SETTINGS_KEY = 'maxjs_snapshot_settings';
         const SNAPSHOT_SETTINGS_DEFAULTS = Object.freeze({
@@ -12342,9 +12626,17 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 note: 'Requires WebGPU or Force WebGL. Enable DOF on the Physical Camera in Max for auto mode.',
                 requiresWebGPU: true,
                 isEnabled: () => maxjsFx.isDofEnabled(),
-                setEnabled: (enabled) => maxjsFx.setDofEnabled(enabled),
+                setEnabled: (enabled) => {
+                    const result = maxjsFx.setDofEnabled(enabled);
+                    syncPathTracingDofFromPostFx();
+                    return result;
+                },
                 getValues: (state) => state.dof,
-                setValues: (patch) => maxjsFx.setDofOptions(patch),
+                setValues: (patch) => {
+                    const result = maxjsFx.setDofOptions(patch);
+                    syncPathTracingDofFromPostFx();
+                    return result;
+                },
                 controls: [
                     { key: 'autoFromCamera', label: 'Auto from Camera', type: 'checkbox' },
                     { key: 'focusDistance', label: 'Focus Distance', min: 0.1, max: 10000, step: 1, realtime: true },
@@ -13740,6 +14032,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 if (!fx) return;
 
                 maxjsFx.restoreState?.(fx);
+                syncPathTracingDofFromPostFx();
                 if (saved.webglBasicFx) {
                     webglBasicFx.restoreState?.(saved.webglBasicFx);
                 }
@@ -14237,6 +14530,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             if (!xrRuntime.active && (!physicalCameraDofActive || !camLock)) {
                 maxjsFx.updateDofFocusFromCamera(camera.position.distanceTo(controls.target));
             }
+            syncPathTracingDofFromPostFx();
             // Default key light follows camera
             if (defaultLights.visible) {
                 defaultKey.position.copy(getActiveCameraWorldPosition(cameraPositionWorld));
@@ -14277,8 +14571,10 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             webappSystem?.setPunchPipelineActive?.(maxjsFx.isPipelineRenderActive?.() === true);
             try {
                 if (pathTracingFx.isEnabled?.() && (!renderToImageActive || pendingRenderToImage?.pathTracing)) {
-                    // Pathtracing is a live-viewer-only renderer mode. It
-                    // bypasses post FX and never participates in snapshots.
+                    // Pathtracing is a live-viewer-only renderer mode. The live
+                    // frame routes through renderPathTracingLiveFrame() so the
+                    // color-domain / stylized post FX fold over the PT beauty; PT
+                    // still never participates in snapshots.
                     // Claim warmup frames with the PT controller instead of
                     // rasterizing the scene through legacy WebGL; synced
                     // scenes can contain TSL/Node materials that the legacy
@@ -14286,6 +14582,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     if (renderToImageActive && pendingRenderToImage?.pathTracing) {
                         if (pendingRenderToImage.pathTracingStarted) {
                             pathTracingFx.start?.();
+                            syncPathTracingDofFromPostFx();
                             if (!pathTracingFx.render?.()) renderPathTracingFallbackFrame();
                         } else {
                             renderPathTracingFallbackFrame();
@@ -14295,7 +14592,12 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                         if (hasInitialSync) pathTracingRasterWarmupFrames += 1;
                     } else {
                         pathTracingFx.start?.();
-                        if (!pathTracingFx.render?.()) renderPathTracingFallbackFrame();
+                        // Route the live PT frame through the post stack so the
+                        // color-domain / stylized post FX (bloom, pixel, retro,
+                        // PowerShot, Shader Lab) fold over the path-traced beauty.
+                        // With no post FX enabled it blits straight to the canvas,
+                        // and it owns its own fallback if the trace render fails.
+                        renderPathTracingLiveFrame();
                     }
                 } else if (asciiActive && asciiEffect) {
                     asciiEffect.render(scene, camera);
@@ -14451,7 +14753,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             getControls: () => controls,
             getJsRoot: () => jsRoot,
             getOverlayRoot: () => overlayRoot,
-            getViewportAspect: () => innerWidth / innerHeight,
+            getViewportAspect: () => getCameraProjectionAspect(),
             buildGeometry,
             applyMaterialScalar,
         });
@@ -14665,6 +14967,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             if (!xrRuntime.active && (!physicalCameraDofActive || !camLock)) {
                 maxjsFx.updateDofFocusFromCamera(camera.position.distanceTo(controls.target));
             }
+            syncPathTracingDofFromPostFx();
             if (defaultLights.visible) {
                 defaultKey.position.copy(getActiveCameraWorldPosition(cameraPositionWorld));
             }

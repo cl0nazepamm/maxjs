@@ -9,17 +9,18 @@
 // by the global sample count and maps XYZ→sRGB. "Fast not accurate" by design.
 //
 // Buffer strides come from spectral_scene.js: bvhNodes u32×8, triIndex u32×3,
-// vertexPos f32×3, triMaterial u32×1, materials f32×12, lights f32×16,
-// accum f32×4 (xyz + pad).
+// vertexData f32×8 (pos+normal+uv), triMaterial u32×1, materials f32×24,
+// lights f32×16, accum f32×4 (xyz + pad). PBR maps arrive as DataArrayTextures
+// (one per type) sampled at the hit UV.
 
 import * as TSL from 'three/tsl';
 
 const {
-    Fn, Loop, If, Break, Return, instanceIndex, uniform, storage, texture,
-    float, int, uint, vec3, vec4,
+    Fn, Loop, If, Break, Return, instanceIndex, uniform, storage, texture, texture3D,
+    float, int, uint, vec2, vec3, vec4,
     uintBitsToFloat, equirectUV,
-    select, max, min, abs, sqrt, sin, cos, exp, floor,
-    dot, cross, normalize, reflect, mix, clamp, length,
+    select, max, min, abs, sqrt, sin, cos, exp, pow, floor,
+    dot, cross, normalize, reflect, mix, clamp, length, smoothstep,
 } = TSL;
 
 const PI = 3.141592653589793;
@@ -65,12 +66,14 @@ function rgbToSpectral(rgbNode, lambda) {
 }
 
 export function buildKernels({
-    THREE, buffers, env, width, height,
+    THREE, buffers, env, lut = null, lutRes = 0, maps = {}, width, height,
 }) {
     // Storage nodes
     const bvhNodes = storage(buffers.bvhNodes, 'uint', buffers.bvhNodes.count);
     const triIndex = storage(buffers.triIndex, 'uint', buffers.triIndex.count);
-    const vertexPos = storage(buffers.vertexPos, 'float', buffers.vertexPos.count);
+    // Interleaved per-vertex: [px,py,pz, nx,ny,nz, u,v] (stride 8) — packed to
+    // stay within the 8 storage-buffer budget.
+    const vertexData = storage(buffers.vertexData, 'float', buffers.vertexData.count);
     const triMaterial = storage(buffers.triMaterial, 'uint', buffers.triMaterial.count);
     const materials = storage(buffers.materials, 'float', buffers.materials.count);
     const lights = storage(buffers.lights, 'float', buffers.lights.count);
@@ -105,12 +108,49 @@ export function buildKernels({
     const H = U.resolution.y;
 
     // ── helpers (graph emitters) ───────────────────────────────────
+    const VSTRIDE = uint(8);
     const fetchVert = (vid) => {
-        const b = vid.mul(uint(3));
-        return vec3(vertexPos.element(b), vertexPos.element(b.add(uint(1))), vertexPos.element(b.add(uint(2))));
+        const b = vid.mul(VSTRIDE);
+        return vec3(vertexData.element(b), vertexData.element(b.add(uint(1))), vertexData.element(b.add(uint(2))));
+    };
+    const fetchNorm = (vid) => {
+        const b = vid.mul(VSTRIDE).add(uint(3));
+        return vec3(vertexData.element(b), vertexData.element(b.add(uint(1))), vertexData.element(b.add(uint(2))));
+    };
+    const fetchUV = (vid) => {
+        const b = vid.mul(VSTRIDE).add(uint(6));
+        return vec2(vertexData.element(b), vertexData.element(b.add(uint(1))));
     };
     const triVert = (triId, k) => triIndex.element(triId.mul(uint(3)).add(uint(k)));
-    const matFloat = (matId, k) => materials.element(matId.mul(uint(12)).add(uint(k)));
+    const matFloat = (matId, k) => materials.element(matId.mul(uint(24)).add(uint(k)));
+
+    // ── PBR map array textures ─────────────────────────────────────
+    // One DataArrayTexture per map type; null when no material binds that type
+    // (we never reference an absent texture, so its GPU binding is never
+    // created). Layer index lives in the material record; −1 = unmapped.
+    const albedoTex = maps.albedo || null;
+    const normalTex = maps.normal || null;
+    const roughTex = maps.roughness || null;
+    const metalTex = maps.metalness || null;
+    const emissiveTex = maps.emissive || null;
+    const haveAlbedoMap = !!albedoTex;
+    const haveNormalMap = !!normalTex;
+    const haveRoughMap = !!roughTex;
+    const haveMetalMap = !!metalTex;
+    const haveEmissiveMap = !!emissiveTex;
+
+    // sRGB → linear (exact piecewise), component-wise. Colour maps (albedo,
+    // emissive) are stored as raw sRGB bytes; data maps are already linear.
+    const srgbToLinear = (c) => select(
+        c.lessThanEqual(vec3(0.04045)),
+        c.div(12.92),
+        pow(max(c.add(0.055).div(1.055), vec3(0)), vec3(2.4)),
+    );
+    // Sample a map-array layer at the transformed UV. layerF is the material's
+    // stored layer float (−1 = none); we clamp to 0 for the fetch and let the
+    // caller gate on `useLayer` so an unmapped material ignores the result.
+    const sampleLayer = (tex, uv, layerF) =>
+        texture(tex, uv).depth(int(max(layerF, float(0)))).xyz;
 
     // PCG integer finalizer (full avalanche) — used to derive a well-mixed
     // initial state from (pixel, frame). The OLD seed `(pix ^ frameSeed)*prime`
@@ -134,6 +174,43 @@ export function buildKernels({
         return float(res).mul(INV_U32);
     };
 
+    // ── Jakob–Hanika RGB → reflectance upsampling ──────────────────
+    // Fetch the (c0,c1,c2) triple from the precomputed LUT (3 argmax slabs,
+    // uniform grid → hardware trilinear), then s(λ)=0.5+0.5·x/√(1+x²) with x a
+    // quadratic in the wavelength remapped to [0,1] over the band. Reflectance
+    // is bounded [0,1]; emission upsamples the unit-chroma and scales by
+    // brightness so coloured lights/HDRI keep their hue but any intensity.
+    const haveLut = !!(lut && lut.length === 3 && lutRes > 1);
+    const LUTN = float(lutRes || 2);
+    const lutUV = (g) => clamp(g, 0.0, 1.0).mul(LUTN.sub(1)).add(0.5).div(LUTN);
+    const jhCoeffs = (rgb) => {
+        const r = rgb.x, g = rgb.y, b = rgb.z;
+        const fetch = (lt, zc, a, c) => {
+            const z = max(zc, float(1e-4));
+            return texture3D(lt, vec3(lutUV(a.div(z)), lutUV(c.div(z)), lutUV(clamp(zc, 0.0, 1.0)))).xyz;
+        };
+        const c0 = fetch(lut[0], r, g, b); // r is max: x=g/z, y=b/z
+        const c1 = fetch(lut[1], g, b, r); // g is max: x=b/z, y=r/z
+        const c2 = fetch(lut[2], b, r, g); // b is max: x=r/z, y=g/z
+        const isB = b.greaterThanEqual(g).and(b.greaterThanEqual(r));
+        const isG = g.greaterThanEqual(r);
+        return select(isB, c2, select(isG, c1, c0));
+    };
+    const jhEval = (c, lambda) => {
+        const Ln = clamp(lambda.sub(LAMBDA_MIN).div(LAMBDA_RANGE), 0.0, 1.0);
+        const x = c.x.mul(Ln).add(c.y).mul(Ln).add(c.z);
+        return float(0.5).add(x.mul(0.5).div(sqrt(x.mul(x).add(1.0))));
+    };
+    const jhReflectance = haveLut
+        ? (rgb, lambda) => jhEval(jhCoeffs(clamp(rgb, 0.0, 1.0)), lambda)
+        : (rgb, lambda) => rgbToSpectral(rgb, lambda);
+    const jhEmission = haveLut
+        ? (rgb, lambda) => {
+            const m = max(max(rgb.x, rgb.y), rgb.z);
+            return jhReflectance(rgb.div(max(m, float(1e-6))), lambda).mul(m);
+        }
+        : (rgb, lambda) => rgbToSpectral(rgb, lambda);
+
     // env radiance at λ for a world direction (or sky fallback)
     const envAtLambda = (dir, lambda) => {
         const out = float(0).toVar();
@@ -146,13 +223,19 @@ export function buildKernels({
                 dir.x.mul(sr).add(dir.z.mul(cr)),
             );
             const uv = equirectUV(normalize(rdir));
+            // texture() auto-converts from the texture's colorSpace to linear
+            // working space (HDR/EXR are already linear), so rgb is linear
+            // radiance — same value the rasterizer's IBL feeds on.
             const rgb = texture(env, uv).level(0).xyz.mul(U.envIntensity);
-            out.assign(rgbToSpectral(rgb, lambda));
+            out.assign(jhEmission(rgb, lambda));
         } else {
-            // neutral sky gradient fallback
-            const up = clamp(dir.y.mul(0.5).add(0.5), 0.0, 1.0);
-            const rgb = mix(vec3(0.12, 0.13, 0.16), vec3(0.5, 0.6, 0.8), up).mul(U.envIntensity);
-            out.assign(rgbToSpectral(rgb, lambda));
+            // No sampleable HDRI bound (sky/none/geospatial) — match the raster,
+            // which has NO image-based environment light in that state, by
+            // emitting black instead of a synthetic blue sky. The old gradient
+            // injected an env light the viewport never showed ("always-blue").
+            // Sky/geospatial drive scene.environmentNode (a TSL node, not an
+            // equirect texture) and are intentionally out of scope here.
+            out.assign(float(0));
         }
         return out;
     };
@@ -266,7 +349,16 @@ export function buildKernels({
                                 const vb = dot(rd, qv).mul(invDet);
                                 If(vb.greaterThanEqual(float(0)).and(u.add(vb).lessThanEqual(float(1))), () => {
                                     const tHit = dot(e2, qv).mul(invDet);
-                                    If(tHit.greaterThan(float(RAY_EPS)).and(tHit.lessThan(maxDist)), () => { blocked.assign(float(1)); });
+                                    If(tHit.greaterThan(float(RAY_EPS)).and(tHit.lessThan(maxDist)), () => {
+                                        // Glass is transparent to shadow rays: a transmissive
+                                        // occluder lets direct light pass instead of casting a
+                                        // solid shadow. Opaque hits behind it still block. (The
+                                        // ray doesn't refract here — true prism caustics come
+                                        // from BSDF path sampling against an emissive/env light,
+                                        // not from this straight-line NEE occlusion test.)
+                                        const occTrans = matFloat(triMaterial.element(triId), 5);
+                                        If(occTrans.lessThan(float(0.5)), () => { blocked.assign(float(1)); });
+                                    });
                                 });
                             });
                         });
@@ -342,44 +434,131 @@ export function buildKernels({
         const radiance = float(0).toVar();
 
         Loop({ start: uint(0), end: U.bounceCap, type: 'uint', condition: '<' }, ({ i }) => {
+            // GI/firefly clamp ("GI Clamp" control): cap each INDIRECT bounce's
+            // radiance contribution at radianceClamp. Direct contributions
+            // (i==0 — a directly visible emitter/HDRI, or first-hit NEE) stay
+            // exact, so only multi-bounce spikes (a bright emitter or HDRI sun
+            // reached through a low-probability bounce) get bounded. Clamping
+            // the throughput-weighted contribution is what actually suppresses
+            // fireflies — clamping throughput alone never fires, since for
+            // energy-conserving materials throughput ≤ 1 ≤ radianceClamp.
+            const clampGI = (contrib) => select(i.greaterThan(uint(0)), min(contrib, U.radianceClamp), contrib);
+
             const bestT = float(T_MAX).toVar();
             const bestTri = int(-1).toVar();
             traverseClosest(ro, rd, bestT, bestTri);
 
             If(bestTri.lessThan(int(0)), () => {
-                radiance.addAssign(throughput.mul(envAtLambda(rd, lambda)));
+                radiance.addAssign(clampGI(throughput.mul(envAtLambda(rd, lambda))));
                 Break();
             });
 
             const triId = uint(bestTri);
             const matId = triMaterial.element(triId);
-            const p0 = fetchVert(triVert(triId, 0));
-            const p1 = fetchVert(triVert(triId, 1));
-            const p2 = fetchVert(triVert(triId, 2));
+            const vi0 = triVert(triId, 0);
+            const vi1 = triVert(triId, 1);
+            const vi2 = triVert(triId, 2);
+            const p0 = fetchVert(vi0);
+            const p1 = fetchVert(vi1);
+            const p2 = fetchVert(vi2);
             const ngRaw = normalize(cross(p1.sub(p0), p2.sub(p0)));
             const entering = dot(ngRaw, rd).lessThan(float(0));         // front-face hit
-            const ng = ngRaw.mul(select(entering, float(1), float(-1))); // forward-facing
+            const ng = ngRaw.mul(select(entering, float(1), float(-1))); // geometric, faces ray
+
+            // Smooth shading normal: re-derive the hit barycentrics (Möller-
+            // Trumbore) and interpolate the per-vertex normals. Falls back to
+            // the geometric normal when no vertex normals were synced (length 0).
+            const e1n = p1.sub(p0);
+            const e2n = p2.sub(p0);
+            const pvn = cross(rd, e2n);
+            const invDetN = float(1).div(dot(e1n, pvn));
+            const tvn = ro.sub(p0);
+            const bU = dot(tvn, pvn).mul(invDetN);
+            const bV = dot(rd, cross(tvn, e1n)).mul(invDetN);
+            const bW = float(1).sub(bU).sub(bV);
+            const nInterp = bW.mul(fetchNorm(vi0)).add(bU.mul(fetchNorm(vi1))).add(bV.mul(fetchNorm(vi2)));
+            const nLen = length(nInterp);
+            const Ns = select(nLen.greaterThan(float(0.01)), nInterp.div(max(nLen, float(1e-6))), ng).toVar();
+
+            // Interpolated + transformed hit UV — shared by every map sample.
+            const uvHit = fetchUV(vi0).mul(bW).add(fetchUV(vi1).mul(bU)).add(fetchUV(vi2).mul(bV));
+            const uvRep = vec2(matFloat(matId, 18), matFloat(matId, 19));
+            const uvOff = vec2(matFloat(matId, 20), matFloat(matId, 21));
+            const uv = uvHit.mul(uvRep).add(uvOff).toVar();
+
+            // Normal map: perturb Ns in a UV-derived tangent frame (applied
+            // before the face-flip so back-faces are corrected post-perturbation).
+            if (haveNormalMap) {
+                const nmL = matFloat(matId, 13);
+                If(nmL.greaterThan(float(-0.5)), () => {
+                    const duv1 = fetchUV(vi1).sub(fetchUV(vi0));
+                    const duv2 = fetchUV(vi2).sub(fetchUV(vi0));
+                    const denom = duv1.x.mul(duv2.y).sub(duv2.x.mul(duv1.y));
+                    If(abs(denom).greaterThan(float(1e-10)), () => {
+                        const r = float(1).div(denom);
+                        const tRaw = e1n.mul(duv2.y).sub(e2n.mul(duv1.y)).mul(r);
+                        // Gram-Schmidt T against Ns; bitangent from the cross.
+                        const T = normalize(tRaw.sub(Ns.mul(dot(Ns, tRaw))));
+                        const B = cross(Ns, T);
+                        const ns = matFloat(matId, 17);
+                        const tn = sampleLayer(normalTex, uv, nmL).mul(2).sub(1); // [0,1]→[-1,1]
+                        const perturbed = T.mul(tn.x.mul(ns)).add(B.mul(tn.y.mul(ns))).add(Ns.mul(tn.z));
+                        Ns.assign(normalize(perturbed));
+                    });
+                });
+            }
+            // keep the shading normal on the geometric side that faces the ray
+            Ns.assign(Ns.mul(select(dot(Ns, ng).lessThan(float(0)), float(-1), float(1))));
 
             const hitPoint = ro.add(rd.mul(bestT));
             const hitPos = hitPoint.add(ng.mul(float(RAY_EPS)));        // +ng offset for NEE
 
-            // material fields
-            const baseColor = vec3(matFloat(matId, 0), matFloat(matId, 1), matFloat(matId, 2));
-            const roughness = matFloat(matId, 3);
-            const metalness = matFloat(matId, 4);
+            // material fields (scalar PBR × optional maps sampled at the hit UV)
+            const baseColor = vec3(matFloat(matId, 0), matFloat(matId, 1), matFloat(matId, 2)).toVar();
+            const roughness = matFloat(matId, 3).toVar();
+            const metalness = matFloat(matId, 4).toVar();
             const transmission = matFloat(matId, 5);
             const ior = matFloat(matId, 6);
-            const emissive = vec3(matFloat(matId, 7), matFloat(matId, 8), matFloat(matId, 9));
+            const emissive = vec3(matFloat(matId, 7), matFloat(matId, 8), matFloat(matId, 9)).toVar();
             const dispersionB = matFloat(matId, 11);
+
+            // map mul-semantics mirror three (diffuse*=map, rough*=g, metal*=b,
+            // emissive*=map); −1 layer → multiply by 1 (no-op).
+            if (haveAlbedoMap) {
+                const aL = matFloat(matId, 12);
+                const s = srgbToLinear(sampleLayer(albedoTex, uv, aL));
+                baseColor.assign(baseColor.mul(select(aL.greaterThan(float(-0.5)), s, vec3(1))));
+            }
+            if (haveRoughMap) {
+                const rL = matFloat(matId, 14);
+                const s = sampleLayer(roughTex, uv, rL).y; // green channel (glTF metallic-roughness)
+                roughness.assign(roughness.mul(select(rL.greaterThan(float(-0.5)), s, float(1))));
+            }
+            if (haveMetalMap) {
+                const mL = matFloat(matId, 15);
+                const s = sampleLayer(metalTex, uv, mL).z; // blue channel (glTF metallic-roughness)
+                metalness.assign(metalness.mul(select(mL.greaterThan(float(-0.5)), s, float(1))));
+            }
+            if (haveEmissiveMap) {
+                const eL = matFloat(matId, 16);
+                const s = srgbToLinear(sampleLayer(emissiveTex, uv, eL));
+                emissive.assign(emissive.mul(select(eL.greaterThan(float(-0.5)), s, vec3(1))));
+            }
+            roughness.assign(clamp(roughness, float(0.02), float(1)));
+            metalness.assign(clamp(metalness, float(0), float(1)));
+
             const isGlass = transmission.greaterThan(float(0.5));
             const notGlass = select(isGlass, float(0), float(1));
 
             // emissive contribution at λ
-            radiance.addAssign(throughput.mul(rgbToSpectral(emissive, lambda)));
+            radiance.addAssign(clampGI(throughput.mul(jhEmission(emissive, lambda))));
 
-            const albedoL = rgbToSpectral(baseColor, lambda);
+            const albedoL = jhReflectance(baseColor, lambda);
 
-            // NEE: one light sample (diffuse only — fast)
+            // NEE: one light sample (diffuse only — fast). Mirrors the raster
+            // punctual-light model (three getDistanceAttenuation +
+            // getSpotAttenuation) so spot cones, decay and range agree with the
+            // viewport. Reference: web/js/max_lights_node.js Masked*LightDataNode.
             If(U.lightCount.greaterThan(uint(0)), () => {
                 const li = uint(min(float(U.lightCount).sub(1), floor(nextRand().mul(float(U.lightCount)))));
                 const lb = li.mul(uint(16));
@@ -388,22 +567,41 @@ export function buildKernels({
                 const ldir = vec3(lights.element(lb.add(uint(4))), lights.element(lb.add(uint(5))), lights.element(lb.add(uint(6))));
                 const lcol = vec3(lights.element(lb.add(uint(7))), lights.element(lb.add(uint(8))), lights.element(lb.add(uint(9))));
                 const lrange = lights.element(lb.add(uint(10)));
+                const ldecay = lights.element(lb.add(uint(11)));
+                const lcosAngle = lights.element(lb.add(uint(12)));
+                const lcosPen = lights.element(lb.add(uint(13)));
 
-                // directional (type 0): toward -ldir, infinite distance
+                // type: 0 directional, 1 point, 2 spot. ldir is the beam forward
+                // (normalize(target-pos)); three's spotDirection is its negation.
                 const isDir = ltype.lessThan(float(0.5));
+                const isSpot = abs(ltype.sub(float(2))).lessThan(float(0.5));
                 const toLight = select(isDir, ldir.mul(-1), lpos.sub(hitPos));
                 const dist = select(isDir, float(1e4), max(length(toLight), float(1e-4)));
                 const wi = normalize(toLight);
-                const ndl = max(dot(ng, wi), float(0));
+                const ndl = max(dot(Ns, wi), float(0));
                 If(ndl.greaterThan(float(0)), () => {
                     const blocked = traverseAny(hitPos, wi, dist.sub(float(RAY_EPS)));
                     If(blocked.lessThan(float(0.5)), () => {
-                        // inverse-square for positional lights (clamped)
-                        const atten = select(isDir, float(1), float(1).div(max(dist.mul(dist), float(1e-2))));
-                        const lrad = rgbToSpectral(lcol, lambda).mul(atten);
+                        // distance attenuation — three getDistanceAttenuation:
+                        // 1/max(dist^decay, 0.01), windowed by (1-(dist/range)^4)^2
+                        // when range>0. Directional lights take no distance falloff.
+                        const falloff = float(1).div(max(pow(dist, ldecay), float(0.01)));
+                        const rr = dist.div(max(lrange, float(1e-4)));
+                        const rr2 = rr.mul(rr);
+                        const win = clamp(float(1).sub(rr2.mul(rr2)), float(0), float(1));
+                        const ranged = falloff.mul(win.mul(win));
+                        const posAtten = select(lrange.greaterThan(float(0)), ranged, falloff);
+                        const distAtten = select(isDir, float(1), posAtten);
+                        // spot cone — three getSpotAttenuation:
+                        // smoothstep(coneCos, penumbraCos, dot(lightDir, spotDir)).
+                        // angleCos = dot(wi, spotDir) = -dot(wi, ldir).
+                        const angleCos = dot(wi, ldir).mul(-1);
+                        const spotAtten = smoothstep(lcosAngle, lcosPen, angleCos);
+                        const atten = distAtten.mul(select(isSpot, spotAtten, float(1)));
+                        const lrad = jhEmission(lcol, lambda).mul(atten);
                         const diffuse = albedoL.mul(float(1).sub(metalness)).mul(1.0 / PI);
                         // glass is specular — skip the diffuse direct-light term for it
-                        radiance.addAssign(throughput.mul(diffuse).mul(ndl).mul(lrad).mul(float(U.lightCount)).mul(notGlass));
+                        radiance.addAssign(clampGI(throughput.mul(diffuse).mul(ndl).mul(lrad).mul(float(U.lightCount)).mul(notGlass)));
                     });
                 });
             });
@@ -417,9 +615,9 @@ export function buildKernels({
 
             // ── opaque BSDF: metal = rough mirror, else cosine diffuse ──
             const doMetal = nextRand().lessThan(metalness);
-            const diffuseDir = cosineSample(ng, nextRand(), nextRand());
-            const mirror = reflect(rd, ng);
-            const glossy = normalize(mirror.add(cosineSample(ng, nextRand(), nextRand()).sub(ng).mul(roughness)));
+            const diffuseDir = cosineSample(Ns, nextRand(), nextRand());
+            const mirror = reflect(rd, Ns);
+            const glossy = normalize(mirror.add(cosineSample(Ns, nextRand(), nextRand()).sub(Ns).mul(roughness)));
             const opaqueDir = select(doMetal, glossy, diffuseDir);
 
             // ── dielectric (glass) BSDF with WAVELENGTH-DEPENDENT IOR ──
@@ -427,8 +625,12 @@ export function buildKernels({
             // prism fans white light into a spectrum. This is the path's
             // wavelength driving GEOMETRY (Snell), not just the final color.
             const nLambda = ior.add(dispersionB.mul(float(550).sub(lambda)).div(float(170)));
+            // Reflect/refract against the smooth shading normal Ns (same as the
+            // opaque lobe) so curved glass bends light smoothly instead of per
+            // triangle facet. entering/eta stay on the geometric normal — which
+            // medium we're crossing into is topological, and Ns can lie about it.
             const eta = select(entering, float(1).div(nLambda), nLambda);   // n_in / n_out
-            const cosI = clamp(dot(rd, ng).mul(float(-1)), float(0), float(1));
+            const cosI = clamp(dot(rd, Ns).mul(float(-1)), float(0), float(1));
             const sin2T = eta.mul(eta).mul(float(1).sub(cosI.mul(cosI)));
             const tir = sin2T.greaterThan(float(1));                        // total internal reflection
             const cosT = sqrt(max(float(0), float(1).sub(sin2T)));
@@ -437,15 +639,17 @@ export function buildKernels({
             const fcos = select(entering, cosI, cosT);                     // cosine in the denser medium
             const om = float(1).sub(fcos);
             const fres = R0.add(float(1).sub(R0).mul(om.mul(om).mul(om).mul(om).mul(om)));
-            const refractDir = normalize(rd.mul(eta).add(ng.mul(eta.mul(cosI).sub(cosT))));
-            const reflectDir = reflect(rd, ng);
+            const refractDir = normalize(rd.mul(eta).add(Ns.mul(eta.mul(cosI).sub(cosT))));
+            const reflectDir = reflect(rd, Ns);
             const doReflect = tir.or(nextRand().lessThan(fres));           // Fresnel importance sample
             const glassDir = select(doReflect, reflectDir, refractDir);
 
             // pick lobe; glass is clear (weight 1, Fresnel already sampled)
             const newDir = select(isGlass, glassDir, opaqueDir);
             const throughputMul = select(isGlass, float(1), albedoL);
-            throughput.assign(min(throughput.mul(throughputMul), U.radianceClamp));
+            // GI Clamp now bounds radiance contributions (see clampGI above);
+            // throughput just carries the path weight (≤1 for physical BSDFs).
+            throughput.assign(throughput.mul(throughputMul));
 
             // offset the next ray's origin onto whichever side it actually leaves
             const sideN = ng.mul(select(dot(newDir, ng).greaterThan(float(0)), float(1), float(-1)));

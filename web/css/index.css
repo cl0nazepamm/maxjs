@@ -1905,6 +1905,239 @@ body.light-mode .vpmenu-label { color: rgba(20, 24, 28, 0.8); }
 body.light-mode .vpmenu-row:hover { background: rgba(0, 0, 0, 0.05); }
 body.light-mode .vpmenu-row-cam .rail-cam-native { color: rgba(20, 24, 28, 0.85); }
 
+/* ── Composition guides popover ───────────────────────────────────────── */
+.comp-popover {
+    position: fixed;
+    top: 48px;
+    left: 8px;
+    z-index: 41;
+    width: 234px;
+    max-height: calc(100vh - 64px);
+    overflow-y: auto;
+    padding: 8px;
+    background: rgba(20, 20, 22, 0.9);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 8px;
+    box-shadow: 0 16px 48px rgba(0, 0, 0, 0.55);
+    backdrop-filter: blur(32px) saturate(1.4);
+    -webkit-backdrop-filter: blur(32px) saturate(1.4);
+    color: #d0d4d8;
+    font: 11px/1.4 -apple-system, 'Segoe UI', system-ui, sans-serif;
+    transform-origin: top left;
+    animation: comp-pop-in 0.14s cubic-bezier(0.16, 1, 0.3, 1);
+}
+.comp-popover[hidden] { display: none; }
+@keyframes comp-pop-in {
+    from { opacity: 0; transform: translateY(-6px) scale(0.98); }
+    to   { opacity: 1; transform: translateY(0) scale(1); }
+}
+.comp-popover-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 4px;
+}
+.comp-popover-title {
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0.01em;
+    color: #eef1f4;
+}
+.comp-popover-close {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 22px;
+    height: 22px;
+    padding: 0;
+    border: 1px solid transparent;
+    border-radius: 4px;
+    background: transparent;
+    color: rgba(220, 225, 229, 0.7);
+    cursor: pointer;
+    transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
+}
+.comp-popover-close svg { width: 13px; height: 13px; }
+.comp-popover-close:hover {
+    background: rgba(255, 255, 255, 0.06);
+    color: #f2f5f4;
+    border-color: rgba(255, 255, 255, 0.12);
+}
+.comp-section {
+    padding: 6px 2px 4px;
+    font-size: 8px;
+    font-weight: 700;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: rgba(255, 255, 255, 0.34);
+}
+.comp-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 3px 2px;
+    min-height: 24px;
+}
+.comp-row-label {
+    flex: 0 0 auto;
+    min-width: 52px;
+    color: rgba(220, 225, 229, 0.85);
+}
+.comp-suboption.is-hidden { display: none; }
+
+/* Guide toggle chips */
+.comp-chip-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 4px;
+    padding: 2px 0 4px;
+}
+.comp-chip {
+    height: 26px;
+    padding: 0 4px;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 4px;
+    background: rgba(255, 255, 255, 0.025);
+    color: rgba(220, 225, 229, 0.62);
+    font: 600 10px/1 'Segoe UI', system-ui, sans-serif;
+    letter-spacing: 0.01em;
+    cursor: pointer;
+    transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease, box-shadow 0.12s ease;
+}
+.comp-chip:hover {
+    color: rgba(245, 248, 250, 0.92);
+    background: rgba(255, 255, 255, 0.05);
+    border-color: rgba(255, 255, 255, 0.14);
+}
+.comp-chip.active {
+    color: #0c0f12;
+    background: var(--rail-accent, rgba(240, 240, 240, 0.92));
+    border-color: transparent;
+    box-shadow: 0 1px 6px rgba(0, 0, 0, 0.3);
+}
+
+/* Spiral orientation mini switch (reuses .rail-mode-option visuals) */
+.comp-mini-switch {
+    display: flex;
+    gap: 2px;
+    width: auto;
+    margin: 0;
+    padding: 3px;
+}
+.comp-mini-switch .rail-mode-option {
+    width: 26px;
+    height: 20px;
+    flex: 0 0 auto;
+    min-width: 0;
+    font-size: 11px;
+    line-height: 1;
+}
+
+/* Range sliders + readouts */
+.comp-range {
+    flex: 1 1 auto;
+    min-width: 0;
+    height: 18px;
+    accent-color: var(--rail-accent, #e6e6e6);
+    cursor: pointer;
+}
+.comp-range-val {
+    flex: 0 0 auto;
+    min-width: 16px;
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+    color: rgba(220, 225, 229, 0.7);
+}
+
+/* Aspect select */
+.comp-select {
+    flex: 1 1 auto;
+    height: 26px;
+    padding: 0 8px;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 4px;
+    background: rgba(255, 255, 255, 0.03);
+    color: rgba(228, 230, 232, 0.92);
+    font: 11px/1 'Segoe UI', system-ui, sans-serif;
+    cursor: pointer;
+}
+.comp-select:focus-visible { outline: 1px solid var(--rail-accent, #cfd3d6); }
+.comp-select option { background: #1b1b1d; color: #e4e6e8; }
+
+/* Color swatch */
+.comp-color-slot {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 26px;
+    height: 26px;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 4px;
+    overflow: hidden;
+    cursor: pointer;
+}
+.comp-color-slot svg { width: 18px; height: 18px; pointer-events: none; }
+.comp-color-fill { fill: #ffffff; }
+.comp-color-slot input[type="color"] {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    margin: 0;
+    padding: 0;
+    border: 0;
+    opacity: 0;
+    cursor: pointer;
+}
+
+/* Clear-all button */
+.comp-row-actions { padding-top: 6px; }
+.comp-btn {
+    flex: 1 1 auto;
+    height: 28px;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 4px;
+    background: rgba(255, 255, 255, 0.03);
+    color: rgba(228, 230, 232, 0.9);
+    font: 600 11px/1 'Segoe UI', system-ui, sans-serif;
+    cursor: pointer;
+    transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease;
+}
+.comp-btn:hover {
+    background: rgba(255, 255, 255, 0.07);
+    border-color: rgba(255, 255, 255, 0.2);
+    color: #f2f5f4;
+}
+
+/* Light mode */
+body.light-mode .comp-popover {
+    background: rgba(238, 240, 243, 0.92);
+    border-color: rgba(0, 0, 0, 0.1);
+    color: #1a1d22;
+}
+body.light-mode .comp-popover-title { color: #14171b; }
+body.light-mode .comp-section { color: rgba(20, 24, 28, 0.45); }
+body.light-mode .comp-row-label { color: rgba(20, 24, 28, 0.8); }
+body.light-mode .comp-popover-close { color: rgba(20, 24, 28, 0.7); }
+body.light-mode .comp-popover-close:hover { background: rgba(0, 0, 0, 0.06); color: #111; }
+body.light-mode .comp-chip {
+    background: rgba(0, 0, 0, 0.03);
+    border-color: rgba(0, 0, 0, 0.12);
+    color: rgba(20, 24, 28, 0.62);
+}
+body.light-mode .comp-chip:hover { color: #111; background: rgba(0, 0, 0, 0.06); }
+body.light-mode .comp-chip.active { color: #f6f8fa; background: #2b2f36; border-color: transparent; }
+body.light-mode .comp-select,
+body.light-mode .comp-btn,
+body.light-mode .comp-color-slot {
+    background: rgba(0, 0, 0, 0.03);
+    border-color: rgba(0, 0, 0, 0.14);
+    color: #1a1d22;
+}
+body.light-mode .comp-select option { background: #f4f5f7; color: #111; }
+body.light-mode .comp-range-val { color: rgba(20, 24, 28, 0.7); }
+
 /* ── Path-tracer pause toggle ──────────────────────────────────────────
    Stops compute dispatch so the GPU goes idle and the maxjs UI panels stay
    responsive; the accumulated frame holds on screen. Visible only in PT mode. */

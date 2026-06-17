@@ -14,6 +14,37 @@
 import * as THREE from 'three';
 import { buildSpectralScene } from './spectral_scene.js';
 import { buildKernels } from './spectral_kernel.js';
+import { decodeSpectralLut, SPECTRAL_LUT_RES } from '../vendor/spectral/srgb_lut.js';
+
+// RGB→reflectance LUT as 3 Data3DTextures (one per argmax slab), built once and
+// shared across scene rebuilds. The packed module stores depth = slab*res+zi,
+// so slab s occupies a contiguous res³ RGBA-float slice.
+let spectralLutTextures = null;
+function getSpectralLutTextures() {
+    if (spectralLutTextures) return spectralLutTextures;
+    try {
+        const res = SPECTRAL_LUT_RES;
+        const all = decodeSpectralLut(); // Float32Array, RGBA, 3 slabs packed in depth
+        const sliceLen = res * res * res * 4;
+        const out = [];
+        for (let s = 0; s < 3; s++) {
+            const slice = all.slice(s * sliceLen, (s + 1) * sliceLen);
+            const tex = new THREE.Data3DTexture(slice, res, res, res);
+            tex.format = THREE.RGBAFormat;
+            tex.type = THREE.FloatType;
+            tex.minFilter = THREE.LinearFilter;
+            tex.magFilter = THREE.LinearFilter;
+            tex.wrapS = tex.wrapT = tex.wrapR = THREE.ClampToEdgeWrapping;
+            tex.colorSpace = THREE.NoColorSpace; // raw coefficients, not colour
+            tex.needsUpdate = true;
+            out.push(tex);
+        }
+        spectralLutTextures = out;
+    } catch (e) {
+        spectralLutTextures = null; // kernel falls back to the cheap 3-bin upsample
+    }
+    return spectralLutTextures;
+}
 
 const SCENE_REBUILD_COALESCE_MS = 25;
 const SCENE_REBUILD_MIN_INTERVAL_MS = 50;
@@ -22,6 +53,12 @@ const CAMERA_MATRIX_EPSILON = 1e-6;
 const DEFAULT_SAMPLES_PER_FRAME = 64;
 const MIN_SAMPLES_PER_FRAME = 1;
 const MAX_SAMPLES_PER_FRAME = 512;
+// Live IPR dispatches exactly ONE sample per presented frame so the viewport
+// stays maximally interactive and refines progressively; the full
+// samplesPerFrame batch is reserved for capture/render-to-image, where
+// wall-clock matters more than framerate. (samplesPerFrame is GPU-bound:
+// batching >1/frame live just stalls each present without converging faster.)
+const LIVE_SAMPLES_PER_FRAME = 1;
 const DEFAULT_GI_CLAMP = 8.0;
 const MIN_GI_CLAMP = 1.0;
 const MAX_GI_CLAMP = 1000.0;
@@ -92,6 +129,10 @@ export function createSpectralTracer({
 
     const lastCameraWorld = { initialized: false, values: new Float64Array(16) };
     const lastCameraProj = { initialized: false, values: new Float64Array(16) };
+    // Last env intensity/rotation pushed to the kernel — so a live HDRI
+    // intensity/rotation tweak (no scene rebuild) resets accumulation.
+    let lastEnvIntensity = NaN;
+    let lastEnvRotation = NaN;
 
     // GPU resources (rebuilt on scene change)
     let gpu = null; // { buffers, kernels, quad, width, height, env }
@@ -103,6 +144,11 @@ export function createSpectralTracer({
     function resetCameraKeys() {
         lastCameraWorld.initialized = false;
         lastCameraProj.initialized = false;
+    }
+
+    function almostEqualDof(a, b, absEpsilon = 1e-5, relEpsilon = 1e-5) {
+        const scale = Math.max(1, Math.abs(a), Math.abs(b));
+        return Math.abs(a - b) <= absEpsilon + relEpsilon * scale;
     }
 
     function requestSceneRebuild({ immediate = false } = {}) {
@@ -143,9 +189,12 @@ export function createSpectralTracer({
 
     function disposeGPU() {
         if (!gpu) return;
-        for (const key of ['bvhNodes', 'triIndex', 'vertexPos', 'triMaterial', 'materials', 'lights', 'accum']) {
+        for (const key of ['bvhNodes', 'triIndex', 'vertexData', 'triMaterial', 'materials', 'lights', 'accum']) {
             gpu.buffers[key]?.dispose?.();
         }
+        // Per-scene PBR map array textures (the shared spectral LUT is NOT
+        // disposed here — it persists across rebuilds).
+        if (gpu.maps) for (const t of Object.values(gpu.maps)) t?.dispose?.();
         gpu.quad?.material?.dispose?.();
         gpu.quad?.geometry?.dispose?.();
         gpu = null;
@@ -178,7 +227,7 @@ export function createSpectralTracer({
             const buffers = {
                 bvhNodes: makeStorage(built.bvhNodes),
                 triIndex: makeStorage(built.triIndex),
-                vertexPos: makeStorage(built.vertexPos),
+                vertexData: makeStorage(built.vertexData),
                 triMaterial: makeStorage(built.triMaterial),
                 materials: makeStorage(built.materials),
                 lights: makeStorage(built.lights),
@@ -186,12 +235,17 @@ export function createSpectralTracer({
                 lightCount: built.lightCount,
                 nodeCount: built.nodeCount,
             };
-            const kernels = buildKernels({ THREE, buffers, env: built.env, width, height });
+            const kernels = buildKernels({
+                THREE, buffers, env: built.env,
+                lut: getSpectralLutTextures(), lutRes: SPECTRAL_LUT_RES,
+                maps: built.maps, width, height,
+            });
             const quad = new THREE.QuadMesh(kernels.blitMaterial);
-            gpu = { buffers, kernels, quad, width, height, env: built.env };
+            gpu = { buffers, kernels, quad, width, height, env: built.env, maps: built.maps };
 
             applyUniformSettings();
             updateCameraUniforms(true);
+            updateEnvUniforms(true);
             renderedSamples = 0;
 
             sceneDirty = false;
@@ -218,6 +272,29 @@ export function createSpectralTracer({
         u.apertureRadius.value = dofEnabled ? Math.max(0, dofApertureRadius) : 0;
         u.focusDistance.value = Math.max(0.01, dofFocusDistance);
         u.toneMapEnabled.value = toneMapInBlit ? 1 : 0;
+    }
+
+    // Push the live scene environment intensity/rotation into the kernel so the
+    // path-traced env matches the rasterized HDRI 1:1. The env *texture* itself
+    // is baked at build time (a swap triggers a rebuild); intensity and rotation
+    // are uniforms and can change without one (sliders), so we sync them here.
+    function updateEnvUniforms(force = false) {
+        if (!gpu) return false;
+        const u = gpu.kernels.uniforms;
+        const intensity = Number.isFinite(scene?.environmentIntensity) ? scene.environmentIntensity : 1;
+        // three's WebGPU env node samples with sampleDir = Rᵀ(θ)·worldDir, where
+        // Rᵀ = transpose(makeRotationFromEuler(scene.environmentRotation)) and
+        // θ = environmentRotation.y (three.webgpu.js materialEnvRotation, applied
+        // as materialEnvRotation.mul(dir)). The kernel's envAtLambda rotation is
+        // exactly Rᵀ(t)·dir, so the uniform is +θ (un-negated) to rotate the
+        // path-traced env the same way as the rasterized HDRI.
+        const rotation = Number.isFinite(scene?.environmentRotation?.y) ? scene.environmentRotation.y : 0;
+        if (!force && intensity === lastEnvIntensity && rotation === lastEnvRotation) return false;
+        lastEnvIntensity = intensity;
+        lastEnvRotation = rotation;
+        u.envIntensity.value = intensity;
+        u.envRotation.value = rotation;
+        return true;
     }
 
     function updateCameraUniforms(force = false) {
@@ -281,6 +358,7 @@ export function createSpectralTracer({
         if (!gpu) return clearFrame();
 
         if (updateCameraUniforms()) resetAccumulation();
+        if (updateEnvUniforms()) resetAccumulation();
 
         // Sample limit (converge-and-stop): once the target is reached, dispatch
         // no more compute — just hold the converged frame. Frees the GPU exactly
@@ -297,7 +375,9 @@ export function createSpectralTracer({
 
         try {
             const u = gpu.kernels.uniforms;
-            const count = samplesPerFrame;
+            // Capture/render-to-image uses the full batch; live IPR caps to a
+            // small batch so the panel stays responsive (see LIVE_SAMPLES_PER_FRAME).
+            const count = captureMode ? samplesPerFrame : LIVE_SAMPLES_PER_FRAME;
             for (let i = 0; i < count; i++) {
                 frameSeed = (frameSeed + 1) >>> 0;
                 u.frameSeed.value = frameSeed;
@@ -373,8 +453,20 @@ export function createSpectralTracer({
     function setDOF(opts = {}) {
         let changed = false;
         if (typeof opts.enabled === 'boolean' && opts.enabled !== dofEnabled) { dofEnabled = opts.enabled; changed = true; }
-        if (Number.isFinite(opts.focusDistance) && opts.focusDistance !== dofFocusDistance) { dofFocusDistance = opts.focusDistance; changed = true; }
-        if (Number.isFinite(opts.apertureRadius) && opts.apertureRadius !== dofApertureRadius) { dofApertureRadius = opts.apertureRadius; changed = true; }
+        if (Number.isFinite(opts.focusDistance)) {
+            const nextFocusDistance = Math.max(0.01, opts.focusDistance);
+            if (!almostEqualDof(nextFocusDistance, dofFocusDistance, 1e-4, 1e-5)) {
+                dofFocusDistance = nextFocusDistance;
+                changed = true;
+            }
+        }
+        if (Number.isFinite(opts.apertureRadius)) {
+            const nextApertureRadius = Math.max(0, opts.apertureRadius);
+            if (!almostEqualDof(nextApertureRadius, dofApertureRadius, 1e-6, 1e-4)) {
+                dofApertureRadius = nextApertureRadius;
+                changed = true;
+            }
+        }
         if (changed) { applyUniformSettings(); resetAccumulation(); }
         return changed;
     }

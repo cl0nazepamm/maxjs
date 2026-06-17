@@ -656,10 +656,11 @@ function createDeformSystem({
     // ── Decoration ──────────────────────────────────────────────────
 
     function builderArgs(entry, material, mesh = null) {
+        // Existing chain (TSL snippet or an earlier deform entry) or rest
+        // position — builders displace this and return the result.
+        const position = material.positionNode ?? TSL.positionLocal;
         return {
-            // Existing chain (TSL snippet or an earlier deform entry) or rest
-            // position — builders displace this and return the result.
-            position: material.positionNode ?? TSL.positionLocal,
+            position,
             normal: material.normalNode ?? TSL.normalLocal,
             uv: TSL.uv(),
             color: TSL.vertexColor(),
@@ -671,6 +672,24 @@ function createDeformSystem({
                 : TSL.float(1),
             time: entry.timeMode === 'timeline' ? timelineUniform : clockUniform,
             params: entry.paramNodes,
+            // ── World space ──────────────────────────────────────────────
+            // positionNode output is LOCAL — the renderer applies the model matrix
+            // afterwards — so a world-space displacement must be expressed through
+            // that matrix. These nodes use the SAME model matrix the GPU renders
+            // with, so a world-space offset stays consistent across meshes that have
+            // different transforms/scales. A CPU-side worldToLocal cannot guarantee
+            // that: fastsync drives synced transforms with matrixAutoUpdate=false, so
+            // a layer's matrixWorld read can disagree with what the GPU uses.
+            //
+            // Move a whole object by a world-space offset W (e.g. drag a rig around):
+            //   position: ({ position, worldToLocalDir, params }) =>
+            //       position.add(worldToLocalDir(params.offsetWorld))
+            positionWorld: TSL.modelWorldMatrix.mul(TSL.vec4(position, 1.0)).xyz,
+            worldMatrix: TSL.modelWorldMatrix,
+            worldMatrixInverse: TSL.modelWorldMatrixInverse,
+            // A world-space vector (offset/direction — NOT a point) -> local delta
+            // to add to `position`. w=0 drops translation, so only rotation+scale apply.
+            worldToLocalDir: (worldVec) => TSL.modelWorldMatrixInverse.mul(TSL.vec4(worldVec, 0.0)).xyz,
             TSL,
             THREE,
         };

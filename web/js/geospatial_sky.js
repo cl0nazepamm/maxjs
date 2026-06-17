@@ -15,7 +15,6 @@ const ASSET_ROOT_URL = new URL('../node_modules/@takram/three-atmosphere/assets/
 const WEBGL_ATMOSPHERE_EXPOSURE_BOOST = 10.0;
 const WEBGL_ATMOSPHERE_ENV_INTENSITY_FLOOR = 1.0;
 const WEBGPU_ATMOSPHERE_EXPOSURE_BOOST = 3.5;
-const WEBGPU_ATMOSPHERE_ENV_INTENSITY_FLOOR = 2.0;
 
 // NeutralToneMapping + Linear→sRGB encoding, injected into takram's SkyMaterial
 // fragment shader. Three.js doesn't auto-inject tone-mapping or colorspace
@@ -734,10 +733,7 @@ function applyNodeState(state, params, camera) {
             state.scene.backgroundNode = null;
         }
         state.scene.environmentNode = state.nodeEnvironment;
-        state.scene.environmentIntensity = Math.max(
-            WEBGPU_ATMOSPHERE_ENV_INTENSITY_FLOOR,
-            state.skyExposure ?? numberOr(params?.exposure, 0.5),
-        );
+        state.scene.environmentIntensity = WEBGPU_ATMOSPHERE_EXPOSURE_BOOST;
     } else if (state.scene.backgroundNode === state.nodeBackground) {
         state.scene.backgroundNode = null;
         if (state.scene.environmentNode === state.nodeEnvironment) state.scene.environmentNode = null;

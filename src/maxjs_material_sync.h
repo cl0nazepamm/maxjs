@@ -2123,10 +2123,17 @@ static void ExtractOpenPBRMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
     readColor(_T("fuzz_color"), d.sheenColor);
     d.sheenRoughness = readFloat(_T("fuzz_roughness"), 0.5f);
 
-    // Emission
+    // Emission — OpenPBR drives emitted radiance from three inputs:
+    //   emission_weight (0..1 gate) * emission_color (chromaticity) * emission_luminance (nits).
+    // We only forwarded weight before, so the luminance slider was dead and emissive
+    // intensity could never exceed 1 (no bloom). Fold luminance into emissiveIntensity:
+    // emission_luminance defaults to 1000 nits, so 1000 -> 1.0 (neutral, matches old
+    // behaviour at default) and higher values push intensity > 1 so glow/bloom kicks in.
+    const float kOpenPBRReferenceLuminance = 1000.0f; // OpenPBR emission_luminance default (nits)
     float emWeight = readFloat(_T("emission_weight"), 0.0f);
+    float emLuminance = readFloat(_T("emission_luminance"), kOpenPBRReferenceLuminance);
     readColor(_T("emission_color"), d.emission);
-    d.emIntensity = emWeight;
+    d.emIntensity = emWeight * (emLuminance / kOpenPBRReferenceLuminance);
 
     // Thin film → Iridescence
     d.iridescence = readFloat(_T("thin_film_weight"), 0.0f);

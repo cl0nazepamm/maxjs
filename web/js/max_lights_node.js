@@ -9,10 +9,12 @@
 // in-shader via TSL's `userData()` reference node. The mask is per-mesh at
 // render time, not per-material.
 //
-// Masked types: Directional, Point, Spot, Hemisphere. Ambient is summed
-// into a single irradiance and cannot be per-mesh masked. Projected spots
-// and shadow-casters take LightsNode's per-light fallback path (unmasked,
-// same behaviour as stock DynamicLightsNode).
+// Batched masked types: Directional, Point, Spot, Hemisphere. Ambient is
+// summed into a single irradiance and cannot be per-mesh masked. Lights that
+// can't batch — shadow-casters, projected/textured spots, area lights — take
+// LightsNode's per-light fallback path; for those the same per-mesh mask is
+// applied in setupDirectLight()/setupDirectRectAreaLight() (see maskFactorForLight),
+// so linking works uniformly across every light type, not just the batched ones.
 
 import DynamicLightsNode from 'three/addons/tsl/lighting/DynamicLightsNode.js';
 import DirectionalLightDataNode from 'three/addons/tsl/lighting/data/DirectionalLightDataNode.js';
@@ -24,7 +26,7 @@ import { NodeUtils } from 'three/webgpu';
 import { getReflectionPaintNode } from './reflection_paint.js';
 import {
     If, Loop, getDistanceAttenuation, mix, normalWorld, positionView, renderGroup,
-    select, smoothstep, uniformArray, vec3, uint, int,
+    select, smoothstep, uniformArray, vec3, uint, int, float,
     bitAnd, shiftLeft, nodeObject, or, not, userData,
 } from 'three/tsl';
 
@@ -253,6 +255,21 @@ const isSpecialSpotLight = (light) =>
 
 const isLinkedLight = (light) => light?.userData?.maxjsLightLinked === true;
 
+// Per-mesh mask factor (1.0 = lit, 0.0 = masked out) for one linked light on the
+// FALLBACK path — shadow-casters, projected/textured spots and area lights, which
+// can't batch and so render through stock three.js LightNodes the Masked*DataNode
+// path never sees. The light's id is a compile-time constant for its dedicated
+// LightNode, so the bit shift bakes into the program; only the 32-bit mask word is
+// read per-mesh via userData(). Returns null for unlinked lights (no mask, no cost).
+function maskFactorForLight(light) {
+    const id = light?.userData?.maxjsLightId;
+    if (!isLinkedLight(light) || !Number.isInteger(id) || id < 0 || id >= 64) return null;
+    const word = userData(id < 32 ? LIGHT_MASK_LO_KEY : LIGHT_MASK_HI_KEY, 'uint');
+    const bit = shiftLeft(uint(1), uint(id & 31));
+    const contributes = bitAnd(word, bit).notEqual(uint(0));
+    return select(contributes, float(1.0), float(0.0));
+}
+
 // three.js r184 NodeMaterial.setupLights() spawns a fresh lightsNode via the factory
 // every time a material with an env LightingNode compiles (scene.environmentNode set).
 // Each instance owns its own _dataNodes → separate UBOs → per-frame setLights() from
@@ -307,6 +324,10 @@ export default class MaxLightsNode extends DynamicLightsNode {
             }
             HASH_DATA.push(light.id);
             HASH_DATA.push(light.castShadow ? 1 : 0);
+            // Linked state + id gate the fallback mask multiply (setupDirectLight).
+            // A linked↔unlinked flip or an id reassignment must rebuild the program
+            // since the bit shift is baked in at compile time. 0 = unlinked.
+            HASH_DATA.push(isLinkedLight(light) ? ((light.userData?.maxjsLightId ?? -1) + 1) : 0);
             if (light.isSpotLight === true) {
                 HASH_DATA.push(light.map !== null ? light.map.id : -1);
                 HASH_DATA.push(light.colorNode ? light.colorNode.getCacheKey() : -1);
@@ -403,6 +424,31 @@ export default class MaxLightsNode extends DynamicLightsNode {
         if (reflectionPaintNode.active) lightNodes.push(reflectionPaintNode);
 
         this._lightNodes = lightNodes;
+    }
+
+    // Fallback-path light linking. Batched lights are masked inside the
+    // Masked*DataNode subclasses; lights that can't batch (shadow-casters,
+    // projected/textured spots, area lights) build stock three.js LightNodes
+    // which route their contribution back through these two hooks on the active
+    // lightsNode (builder.lightsNode === this). For linked lights we multiply the
+    // already shadow-scaled color by the per-mesh mask so the same userData masks
+    // apply uniformly across every light type.
+    setupDirectLight(builder, lightNode, lightData) {
+        const factor = maskFactorForLight(lightNode?.light);
+        super.setupDirectLight(
+            builder,
+            lightNode,
+            factor === null ? lightData : { ...lightData, lightColor: lightData.lightColor.mul(factor) },
+        );
+    }
+
+    setupDirectRectAreaLight(builder, lightNode, lightData) {
+        const factor = maskFactorForLight(lightNode?.light);
+        super.setupDirectRectAreaLight(
+            builder,
+            lightNode,
+            factor === null ? lightData : { ...lightData, lightColor: lightData.lightColor.mul(factor) },
+        );
     }
 
     setLights(lights) {

@@ -9,18 +9,30 @@
 // Output is plain typed arrays + counts; spectral_kernel turns them into
 // StorageBufferAttributes. Nothing here touches the GPU.
 //
-// Accuracy is explicitly not a goal — see who-cares-man plan. Materials are
-// read as scalar PBR fields off the live material (works for every
-// Standard/Physical/Lambert/Phong/Basic node material; TSL/MaterialX graphs
-// fall back to their scalar values, same limitation as the old WebGL tracer).
+// Materials are read as scalar PBR fields off the live material (works for
+// every Standard/Physical/Lambert/Phong/Basic node material; TSL/MaterialX
+// graphs fall back to their scalar values, same limitation as the old WebGL
+// tracer). PBR *maps* (albedo/normal/roughness/metalness/emissive) are also
+// extracted to GPU array textures and sampled at the hit UV — see
+// buildMaterialTextures below.
 
 import { MeshBVH } from 'three-mesh-bvh';
 
 const NODE_STRIDE_U32 = 8;     // bvhNodes: 6 aabb floats + miss + payload
-const MAT_STRIDE = 12;         // materials: see layout below
-const LIGHT_STRIDE = 16;       // lights: see layout below
-const VERT_STRIDE = 3;         // vertexPos: tightly packed xyz (flat f32 storage, read by offset; also fed to MeshBVH which assumes stride 3)
-const BYTES_PER_BVH_NODE = 32; // three-mesh-bvh BYTES_PER_NODE (8 x u32)
+// materials stride (floats). Layout:
+//   [0..2] baseColor RGB (linear) · [3] roughness · [4] metalness
+//   [5] transmission · [6] ior · [7..9] emissive RGB (linear×intensity)
+//   [10] opacity · [11] dispersionB
+//   [12] albedo-map layer · [13] normal-map layer · [14] roughness-map layer
+//   [15] metalness-map layer · [16] emissive-map layer   (all −1 = none)
+//   [17] normalScale · [18..19] uv repeat xy · [20..21] uv offset xy
+//   [22] flags (reserved) · [23] pad
+const MAT_STRIDE = 24;
+const LIGHT_STRIDE = 16;        // lights: see layout below
+const VERT_STRIDE = 3;          // vertexPos: tightly packed xyz (flat f32 storage, read by offset; also fed to MeshBVH which assumes stride 3)
+const VERTEX_DATA_STRIDE = 8;   // GPU interleaved per-vertex: pos(3) + normal(3) + uv(2)
+const BYTES_PER_BVH_NODE = 32;  // three-mesh-bvh BYTES_PER_NODE (8 x u32)
+const TEXTURE_ATLAS_SIZE = 256; // every material map is resampled to this square size and stacked into a DataArrayTexture layer
 
 const SKY_NAMES = new Set(['__maxjs_sky__']);
 
@@ -83,6 +95,21 @@ function materialToUber(material) {
     // MeshPhysicalMaterial.dispersion drives it (0 = none).
     const dispersionB = Number.isFinite(material.dispersion) ? material.dispersion : 0;
 
+    // UV transform + normalScale: read from the primary present map (all maps in
+    // a material almost always share one transform). Fast-not-accurate: a single
+    // repeat/offset is applied to every map; per-map transforms and rotation are
+    // intentionally ignored.
+    const primary = material.map || material.normalMap || material.roughnessMap
+        || material.metalnessMap || material.emissiveMap || null;
+    const rep = primary?.repeat;
+    const off = primary?.offset;
+    const repX = rep && Number.isFinite(rep.x) ? rep.x : 1;
+    const repY = rep && Number.isFinite(rep.y) ? rep.y : 1;
+    const offX = off && Number.isFinite(off.x) ? off.x : 0;
+    const offY = off && Number.isFinite(off.y) ? off.y : 0;
+    const ns = material.normalScale;
+    const normalScale = ns && Number.isFinite(ns.x) ? ns.x : 1;
+
     return [r, g, b,
         Math.min(1, Math.max(0.02, roughness)),
         Math.min(1, Math.max(0, metalness)),
@@ -90,13 +117,129 @@ function materialToUber(material) {
         Math.max(1, ior),
         em[0], em[1], em[2],
         Math.min(1, Math.max(0, opacity)),
-        dispersionB];
+        dispersionB,
+        -1, -1, -1, -1, -1,   // [12..16] map layers, filled by buildMaterialTextures
+        normalScale,
+        repX, repY, offX, offY,
+        0, 0];                 // [22] flags (reserved) · [23] pad
 }
 
-function uberKey(rec) {
+const texUuid = (t) => (t && t.isTexture ? t.uuid : '-');
+
+// Materials sharing scalar params but differing in any bound map must NOT
+// collapse to one uber index, else they'd share a texture layer. Fold the map
+// identities into the dedup key.
+function uberKey(rec, material) {
     let k = '';
     for (let i = 0; i < MAT_STRIDE; i++) k += Math.round(rec[i] * 1000) + ':';
+    k += texUuid(material.map) + '|' + texUuid(material.normalMap) + '|'
+        + texUuid(material.roughnessMap) + '|' + texUuid(material.metalnessMap)
+        + '|' + texUuid(material.emissiveMap);
     return k;
+}
+
+// ── Material map extraction ────────────────────────────────────────
+// Resample every bound PBR map to a fixed square and stack same-typed maps
+// into one DataArrayTexture (one binding per map type, layer = material's
+// assigned slot). RGBA8, NoColorSpace — the kernel decodes sRGB for
+// colour maps itself. Textures are deduped by uuid within a type so a reused
+// map costs one layer. Unreadable sources (compressed, no decoded image)
+// leave the layer at −1 and the material keeps its scalar field.
+
+function toDrawable(image) {
+    if (!image) return null;
+    if (typeof HTMLImageElement !== 'undefined' && image instanceof HTMLImageElement) {
+        return (image.complete && image.naturalWidth > 0) ? image : null;
+    }
+    if (typeof HTMLCanvasElement !== 'undefined' && image instanceof HTMLCanvasElement) return image;
+    if (typeof ImageBitmap !== 'undefined' && image instanceof ImageBitmap) return image;
+    if (typeof OffscreenCanvas !== 'undefined' && image instanceof OffscreenCanvas) return image;
+    if (typeof HTMLVideoElement !== 'undefined' && image instanceof HTMLVideoElement) {
+        return image.readyState >= 2 ? image : null;
+    }
+    // DataTexture-style { data, width, height }: rebuild a canvas from raw RGBA8.
+    const { data, width, height } = image;
+    if (data && width > 0 && height > 0
+        && (data instanceof Uint8Array || data instanceof Uint8ClampedArray)
+        && data.length >= width * height * 4) {
+        const c = document.createElement('canvas');
+        c.width = width; c.height = height;
+        const ctx = c.getContext('2d');
+        const id = ctx.createImageData(width, height);
+        id.data.set(data.subarray(0, width * height * 4));
+        ctx.putImageData(id, 0, 0);
+        return c;
+    }
+    return null;
+}
+
+function extractTextureRGBA(tex, size) {
+    if (typeof document === 'undefined') return null;
+    if (!tex || tex.isCompressedTexture) return null;
+    const drawable = toDrawable(tex.image);
+    if (!drawable) return null;
+    const c = document.createElement('canvas');
+    c.width = size; c.height = size;
+    const ctx = c.getContext('2d', { willReadFrequently: true });
+    if (!ctx) return null;
+    // Bake the texture's flipY into the layer so a kernel sample at the mesh UV
+    // lands on the same texel three's rasterizer would read (default image
+    // textures use flipY = true). DataTextures default flipY = false.
+    if (tex.flipY) { ctx.translate(0, size); ctx.scale(1, -1); }
+    try { ctx.drawImage(drawable, 0, 0, size, size); }
+    catch { return null; }
+    let pixels;
+    try { pixels = ctx.getImageData(0, 0, size, size).data; }
+    catch { return null; } // tainted canvas (cross-origin without CORS)
+    return new Uint8Array(pixels);
+}
+
+// Walk every uber material, extract each map type, build the DataArrayTextures,
+// and write the assigned layer index back into each uber record. Returns
+// { albedo, normal, roughness, metalness, emissive } (DataArrayTexture | null).
+function buildMaterialTextures(THREE, uberList, uberMaterials, size) {
+    const TYPES = [
+        { field: 'map', recIdx: 12, out: 'albedo' },
+        { field: 'normalMap', recIdx: 13, out: 'normal' },
+        { field: 'roughnessMap', recIdx: 14, out: 'roughness' },
+        { field: 'metalnessMap', recIdx: 15, out: 'metalness' },
+        { field: 'emissiveMap', recIdx: 16, out: 'emissive' },
+    ];
+    const layerBytes = size * size * 4;
+    const result = { albedo: null, normal: null, roughness: null, metalness: null, emissive: null };
+
+    for (const ty of TYPES) {
+        const layers = [];
+        const byUuid = new Map();
+        for (let i = 0; i < uberList.length; i++) {
+            const tex = uberMaterials[i]?.[ty.field];
+            if (!tex || !tex.isTexture) continue;
+            let layer = byUuid.get(tex.uuid);
+            if (layer === undefined) {
+                const data = extractTextureRGBA(tex, size);
+                if (!data) continue; // unreadable → leave record layer at −1
+                layer = layers.length;
+                layers.push(data);
+                byUuid.set(tex.uuid, layer);
+            }
+            uberList[i][ty.recIdx] = layer;
+        }
+        if (layers.length === 0) continue;
+        const merged = new Uint8Array(layerBytes * layers.length);
+        for (let l = 0; l < layers.length; l++) merged.set(layers[l], l * layerBytes);
+        const arr = new THREE.DataArrayTexture(merged, size, size, layers.length);
+        arr.format = THREE.RGBAFormat;
+        arr.type = THREE.UnsignedByteType;
+        arr.minFilter = THREE.LinearFilter;
+        arr.magFilter = THREE.LinearFilter;
+        arr.wrapS = THREE.RepeatWrapping;   // honour uv repeat > 1
+        arr.wrapT = THREE.RepeatWrapping;
+        arr.colorSpace = THREE.NoColorSpace; // raw bytes; kernel decodes sRGB
+        arr.generateMipmaps = false;
+        arr.needsUpdate = true;
+        result[ty.out] = arr;
+    }
+    return result;
 }
 
 // ── Threaded (stackless) BVH re-flatten ────────────────────────────
@@ -229,12 +372,19 @@ export function buildSpectralScene({ THREE, scene, maxTriangles = 4_000_000 } = 
     // Pass 1: gather eligible (mesh, matrixWorld, materialUberIndex-per-group)
     // and count verts/tris so we can allocate once.
     const uberList = [];
+    const uberMaterials = []; // parallel to uberList: source THREE material (for map extraction)
     const uberMap = new Map();
     function internMaterial(material) {
-        const rec = materialToUber(material || {});
-        const key = uberKey(rec);
+        const mat = material || {};
+        const rec = materialToUber(mat);
+        const key = uberKey(rec, mat);
         let idx = uberMap.get(key);
-        if (idx === undefined) { idx = uberList.length; uberList.push(rec); uberMap.set(key, idx); }
+        if (idx === undefined) {
+            idx = uberList.length;
+            uberList.push(rec);
+            uberMaterials.push(mat);
+            uberMap.set(key, idx);
+        }
         return idx;
     }
 
@@ -283,7 +433,11 @@ export function buildSpectralScene({ THREE, scene, maxTriangles = 4_000_000 } = 
 
         totalVerts += pos.count * matrices.length;
         totalTris += triCount * matrices.length;
-        draws.push({ geom, pos, index, triCount, matrices, triMat });
+        draws.push({
+            geom, pos, index, triCount, matrices, triMat,
+            normal: geom.attributes.normal || null,
+            uv: geom.attributes.uv || null,
+        });
     });
 
     if (totalTris === 0 || totalVerts === 0) return null;
@@ -297,21 +451,35 @@ export function buildSpectralScene({ THREE, scene, maxTriangles = 4_000_000 } = 
     // material groups — acceptable under the no-accuracy goal) so the final
     // per-triangle material survives the BVH index permutation.
     const vertexPos = new Float32Array(totalVerts * VERT_STRIDE);
+    const vertexNormal = new Float32Array(totalVerts * 3); // world-space, 0 = none → flat
+    const vertexUV = new Float32Array(totalVerts * 2);
     const triIndex = new Uint32Array(totalTris * 3);
     const vertexMaterial = new Uint32Array(totalVerts);
     let vCursor = 0; // vertex count written
     let tCursor = 0; // triangle count written
 
     const v = new THREE.Vector3();
+    const nrm = new THREE.Vector3();
+    const normalMat = new THREE.Matrix3();
     for (const d of draws) {
-        const { pos, index, triCount, matrices, triMat } = d;
+        const { pos, index, triCount, matrices, triMat, normal, uv } = d;
         const vCount = pos.count;
         for (const m of matrices) {
             const vBase = vCursor;
+            normalMat.getNormalMatrix(m); // inverse-transpose of the model 3x3
             for (let i = 0; i < vCount; i++) {
                 v.fromBufferAttribute(pos, i).applyMatrix4(m);
                 const o = (vBase + i) * VERT_STRIDE;
                 vertexPos[o] = v.x; vertexPos[o + 1] = v.y; vertexPos[o + 2] = v.z;
+                if (normal) {
+                    nrm.fromBufferAttribute(normal, i).applyMatrix3(normalMat).normalize();
+                    const no = (vBase + i) * 3;
+                    vertexNormal[no] = nrm.x; vertexNormal[no + 1] = nrm.y; vertexNormal[no + 2] = nrm.z;
+                }
+                if (uv) {
+                    const uo = (vBase + i) * 2;
+                    vertexUV[uo] = uv.getX(i); vertexUV[uo + 1] = uv.getY(i);
+                }
             }
             for (let t = 0; t < triCount; t++) {
                 const a = vBase + (index ? index.getX(t * 3) : t * 3);
@@ -351,6 +519,11 @@ export function buildSpectralScene({ THREE, scene, maxTriangles = 4_000_000 } = 
         triMaterial[t] = vertexMaterial[triIndex[t * 3]] >>> 0;
     }
 
+    // Extract PBR maps into array textures FIRST — this writes each material's
+    // assigned layer index into its uber record ([12..16]) before we pack the
+    // materials buffer below.
+    const maps = buildMaterialTextures(THREE, uberList, uberMaterials, TEXTURE_ATLAS_SIZE);
+
     // Materials buffer
     const materials = new Float32Array(uberList.length * MAT_STRIDE);
     for (let i = 0; i < uberList.length; i++) {
@@ -369,17 +542,29 @@ export function buildSpectralScene({ THREE, scene, maxTriangles = 4_000_000 } = 
 
     geometry.dispose?.();
 
+    // Interleave pos+normal+uv into one GPU storage buffer (8 floats/vertex) so
+    // the kernel stays within the 8 storage-buffer budget. Layout per vertex:
+    // [px,py,pz, nx,ny,nz, u,v]. Original vertex order (BVH only permuted tris).
+    const vertexData = new Float32Array(totalVerts * VERTEX_DATA_STRIDE);
+    for (let i = 0; i < totalVerts; i++) {
+        const d = i * VERTEX_DATA_STRIDE, p = i * VERT_STRIDE, n = i * 3, u = i * 2;
+        vertexData[d] = vertexPos[p]; vertexData[d + 1] = vertexPos[p + 1]; vertexData[d + 2] = vertexPos[p + 2];
+        vertexData[d + 3] = vertexNormal[n]; vertexData[d + 4] = vertexNormal[n + 1]; vertexData[d + 5] = vertexNormal[n + 2];
+        vertexData[d + 6] = vertexUV[u]; vertexData[d + 7] = vertexUV[u + 1];
+    }
+
     return {
         error: null,
         bvhNodes, nodeCount,
         triIndex, triCount: totalTris,
-        vertexPos, vertexCount: totalVerts,
+        vertexData, vertexCount: totalVerts,
         triMaterial,
         materials, materialCount: uberList.length,
         lights, lightCount: lightRecords.length,
         env,
-        strides: { NODE_STRIDE_U32, MAT_STRIDE, LIGHT_STRIDE, VERT_STRIDE },
+        maps, // { albedo, normal, roughness, metalness, emissive } DataArrayTexture | null
+        strides: { NODE_STRIDE_U32, MAT_STRIDE, LIGHT_STRIDE, VERT_STRIDE, VERTEX_DATA_STRIDE },
     };
 }
 
-export { NODE_STRIDE_U32, MAT_STRIDE, LIGHT_STRIDE, VERT_STRIDE, BYTES_PER_BVH_NODE };
+export { NODE_STRIDE_U32, MAT_STRIDE, LIGHT_STRIDE, VERT_STRIDE, VERTEX_DATA_STRIDE, BYTES_PER_BVH_NODE };

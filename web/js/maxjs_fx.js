@@ -32,7 +32,10 @@ export function createMaxJSFxController({
     environmentVisible = true,
     hiddenBackgroundColor = 0x1a1a2e,
 }) {
-    const supportsScreenSpaceEffects = backendLabel === 'WebGPU' || backendLabel === 'TSL_GL';
+    const isNodeRenderer = renderer?.isWebGPURenderer === true
+        || renderer?.backend?.isWebGPUBackend === true
+        || renderer?.backend?.isWebGLBackend === true;
+    const supportsScreenSpaceEffects = backendLabel === 'WebGPU' || backendLabel === 'TSL_GL' || isNodeRenderer;
     const supportsTslPostEffects = supportsScreenSpaceEffects;
     const hiddenBackground = new THREE.Color(hiddenBackgroundColor);
     const hiddenBackgroundRU = uniform(hiddenBackground.r);
@@ -439,11 +442,21 @@ export function createMaxJSFxController({
     }
 
     function hasPipelineEffectEnabled() {
-        return core.anyEffectActive() || powerShotFinal.isActive();
+        return core.anyEffectActive()
+            || powerShotFinal.isActive()
+            || (!!core.ctx.pathTracedColor && shaderLabFinal.hasPassEnabled());
     }
 
     function hasAnyEffectEnabled() {
         return hasPipelineEffectEnabled() || shaderLabFinal.hasPassEnabled();
+    }
+
+    function renderPostInputToCurrentTarget() {
+        if (core.ctx.pathTracedColor && pipelineReady) {
+            postProcessing.render();
+            return;
+        }
+        renderer.render(scene, camera);
     }
 
     function syncCanvasColorGrading() {
@@ -1438,11 +1451,11 @@ export function createMaxJSFxController({
 
             if (!hasPipelineEffectEnabled() || !pipelineReady) {
                 if (shaderLabActive) {
-                    const consumed = shaderLabFinal.renderFinal(() => renderer.render(scene, camera));
-                    if (!consumed) renderer.render(scene, camera);
+                    const consumed = shaderLabFinal.renderFinal(renderPostInputToCurrentTarget);
+                    if (!consumed) renderPostInputToCurrentTarget();
                 } else if (powerShotFinal.isActive()) {
-                    const consumed = powerShotFinal.renderFinal(() => renderer.render(scene, camera));
-                    if (!consumed) renderer.render(scene, camera);
+                    const consumed = powerShotFinal.renderFinal(renderPostInputToCurrentTarget);
+                    if (!consumed) renderPostInputToCurrentTarget();
                 } else {
                     renderer.render(scene, camera);
                 }

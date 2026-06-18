@@ -13585,6 +13585,21 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                             </label>
                         </div>
                     </section>
+                    <section class="fx-section collapsed" data-fx-section="halogi" data-keep-on-shader-lab>
+                        <div class="fx-section-header">
+                            <div class="fx-section-title">Global Illumination</div>
+                            <button class="fx-toggle" id="fx-gi-toggle" type="button">Off</button>
+                        </div>
+                        <div class="fx-note" style="margin:0;padding:2px 0;color:#666;font-size:9px">BVH-traced indirect bounce (HALO-GI). WebGPU + Studio mode.</div>
+                        <div class="fx-grid">
+                            <label class="fx-control" for="fx-gi-intensity">
+                                <div class="fx-control-head"><span>Intensity</span><span class="fx-value" id="fx-gi-intensity-val">1.5</span></div>
+                                <input class="fx-range" id="fx-gi-intensity" type="range" min="0" max="6" step="0.1" value="1.5">
+                            </label>
+                            <label class="fx-check" for="fx-gi-leakfree" title="Depth-moment Chebyshev visibility — stops light leaking through walls."><span>Leak-free</span><input id="fx-gi-leakfree" type="checkbox" checked></label>
+                            <label class="fx-check" for="fx-gi-solid" title="Drop/relocate probes buried in SOLID geometry. Off is safer for thin 2-sided walls."><span>Solid scene</span><input id="fx-gi-solid" type="checkbox"></label>
+                        </div>
+                    </section>
                     ${sectionsHtml}
                     <section class="fx-section collapsed" data-fx-section="clone" data-keep-on-shader-lab>
                         <div class="fx-section-header">
@@ -13979,6 +13994,39 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             hdriBlurVal.textContent = localHdriBlur.toFixed(2);
             hdriFlipCheck.checked = localHdriFlip;
             syncHdriPanel();
+
+            // HALO-GI controls (window.maxjsHaloGI exists only in Studio + WebGPU)
+            {
+                const giToggle = document.getElementById('fx-gi-toggle');
+                const giInt = document.getElementById('fx-gi-intensity');
+                const giIntVal = document.getElementById('fx-gi-intensity-val');
+                const giLeak = document.getElementById('fx-gi-leakfree');
+                const giSolid = document.getElementById('fx-gi-solid');
+                const syncGiPanel = () => {
+                    const gi = window.maxjsHaloGI;
+                    const on = !!(gi && gi.isOn && gi.isOn());
+                    if (giToggle) {
+                        giToggle.textContent = gi ? (on ? 'On' : 'Off') : 'N/A';
+                        giToggle.classList.toggle('active', on);
+                        giToggle.disabled = !gi;
+                    }
+                };
+                if (giToggle) giToggle.onclick = () => {
+                    const gi = window.maxjsHaloGI;
+                    if (!gi) return;
+                    if (gi.isOn && gi.isOn()) gi.disable();
+                    else { gi.enable(); gi.setIntensity(parseFloat(giInt?.value) || 1.5); }
+                    syncGiPanel();
+                };
+                if (giInt) giInt.oninput = () => {
+                    const v = parseFloat(giInt.value);
+                    if (giIntVal) giIntVal.textContent = v.toFixed(1);
+                    window.maxjsHaloGI?.setIntensity?.(v);
+                };
+                if (giLeak) giLeak.onchange = () => window.maxjsHaloGI?.setCheby?.(giLeak.checked ? 1 : 0);
+                if (giSolid) giSolid.onchange = () => window.maxjsHaloGI?.setClassify?.(giSolid.checked ? 1 : 0);
+                syncGiPanel();
+            }
 
             // Clone blob tracker controls
             {

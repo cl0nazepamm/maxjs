@@ -167,7 +167,7 @@
                     <span class="vpmenu-label">Mode</span>
                     <div id="renderModeSwitch" class="rail-mode-switch" role="group" aria-label="Render mode">
                         <button class="rail-mode-option" type="button" data-render-mode="standard" title="Standard render mode">STD</button>
-                        <button class="rail-mode-option" type="button" data-render-mode="studio" title="Studio render mode">STU</button>
+                        <button class="rail-mode-option" type="button" data-render-mode="studio" title="Advanced render mode">ADV</button>
                         <button class="rail-mode-option" type="button" data-render-mode="pathtracing" title="Pathtracing render mode">PT</button>
                     </div>
                 </div>
@@ -468,6 +468,8 @@
             LIGHT_MASK_LO_KEY,
             LIGHT_MASK_HI_KEY,
         } from './js/max_lights_node.js';
+        import { createIrradianceVolume } from './js/gi_irradiance_volume.js';
+        import { createProbeField as createHaloProbeField } from './js/gi_probes.js';
         // Spark.js uses GLSL3/ShaderChunk — needs WebGL THREE build (scoped in importmap).
         // Lazy-import to avoid crashing on page load.
         let Spark = null;
@@ -1025,7 +1027,8 @@
             }
         }
 
-        if (isStudioMode && renderer.lighting?.createNode) {
+        const shouldInstallMaxLightsNode = isStudioMode;
+        if (shouldInstallMaxLightsNode && renderer.lighting?.createNode) {
             // Install MaxLightsNode as the renderer's LightsNode factory. The
             // renderer creates one LightsNode per scene via lighting.createNode()
             // and caches it; setting scene.lightsNode is a no-op in r184. Override
@@ -1036,6 +1039,89 @@
                 maxSpotLights: 32,
                 maxHemisphereLights: 4,
             }).setLights(lights);
+        }
+
+        // Advanced-only WebGPU local-bounce volume. Standard/Default keep their
+        // normal direct-light path; this is the low-frequency local color bleed
+        // term for the Advanced lighting stack.
+        let giVolume = null;
+        let haloGi = null; // HALO-GI BVH-traced DDGI probe field (opt-in; see init below)
+        let giVolumeSyncToken = '';
+        let giVolumeRefreshTimer = 0;
+        let giVolumeFadeFrame = 0;
+        let giVolumeFadeSerial = 0;
+        let giVolumeDebounceSerial = 0;
+        let giVolumeIdleToken = 0;
+        let giVolumeIdleSolving = false;
+        let giVolumeHiddenForDebounce = false;
+        let giVolumePendingRefresh = false;
+        let giVolumePendingLightRefresh = false;
+        let giVolumeLastCameraSignature = '';
+        let giVolumeNativeRequestToken = 0;
+        let giVolumeNativeWaitTimer = 0;
+        let giVolumeNativeAwaitSurface = false;
+        let giVolumeNativeAwaitLights = false;
+        const GI_VOLUME_BASE_INTENSITY = 0.38;
+        const GI_VOLUME_FADE_OUT_MS = 80;
+        const GI_VOLUME_FADE_IN_MS = 180;
+        const GI_VOLUME_CAMERA_DEBOUNCE_MS = 240;
+        const GI_VOLUME_LIGHT_DEBOUNCE_MS = 260;
+        const GI_VOLUME_SCENE_DEBOUNCE_MS = 480;
+        const GI_VOLUME_PLAYBACK_DEBOUNCE_MS = 520;
+        const GI_VOLUME_NATIVE_WAIT_MS = 160;
+        if (isStudioMode && renderer.backend?.isWebGPUBackend === true) {
+            try {
+                giVolume = createIrradianceVolume({ renderer, scene, intensity: GI_VOLUME_BASE_INTENSITY });
+                renderer.userData = renderer.userData || {};
+                renderer.userData.maxjsGI = giVolume;
+                window.maxjsGI = giVolume; // console handle: maxjsGI.setIntensity(2), .bakeAll(), .node.active
+            } catch (err) {
+                maxjsDebugWarn?.('max.js GI volume init failed:', err);
+                giVolume = null;
+            }
+            // HALO-GI: BVH-traced DDGI probe field (docs/GI_HALO_design.md). OPT-IN
+            // — default OFF so the shipped path is byte-identical. Enable live with
+            //   window.maxjsHaloGI.enable()   (disable() reverts to the surfel volume)
+            // When enabled it mutes the surfel giVolume to avoid double-counting and
+            // ticks on its own ~30 Hz throttle (decoupled from delta-sync). The probe
+            // node only injects into context.irradiance while active, so an unbuilt /
+            // disabled field changes nothing.
+            try {
+                const haloField = createHaloProbeField({ renderer, scene, intensity: 1.0 });
+                let haloOn = window.MAXJS_HALO_GI === true;
+                let haloLastTick = 0;
+                haloGi = {
+                    field: haloField,
+                    isOn: () => haloOn && haloField.isSupported(),
+                    enable() {
+                        if (!haloField.isSupported()) { console.warn('HALO-GI needs the WebGPU backend'); return false; }
+                        haloOn = true;
+                        if (giVolume) { giVolume.setEnabled(false); giVolume.setIntensity(0); }
+                        haloField.setEnabled(true);
+                        haloField.requestRebuild();
+                        return true;
+                    },
+                    disable() {
+                        haloOn = false;
+                        haloField.setEnabled(false);
+                    },
+                    setIntensity: (v) => haloField.setIntensity(v),
+                    setCheby: (v) => haloField.setChebyStrength(v), // 0 leaks, 1 leak-free
+                    setClassify: (v) => haloField.setClassifyStrength(v), // 0 off (default), 1 drop buried probes (solid scenes)
+                    getStats: () => haloField.getStats(),
+                    tick(nowMs) {
+                        if (!haloOn || isPathTracingMode || !haloField.isSupported()) return;
+                        if (nowMs - haloLastTick < 33) return; // ~30 Hz, own throttle
+                        haloLastTick = nowMs;
+                        void haloField.tick();
+                    },
+                };
+                window.maxjsHaloGI = haloGi; // console handle
+                if (haloOn) haloGi.enable();
+            } catch (err) {
+                maxjsDebugWarn?.('max.js HALO-GI init failed:', err);
+                haloGi = null;
+            }
         }
 
         const controls = new OrbitControls(camera, renderer.domElement);
@@ -2003,6 +2089,7 @@
                 lightProbeGrid.dispose?.();
                 lightProbeGrid = null;
             }
+            if (giVolume) { giVolume.setEnabled(false); syncGiVolumeActive(); }
             applyLightProbeState();
         }
 
@@ -2246,6 +2333,21 @@
 
         function markLightProbeSceneDirty() {
             lightProbeSceneRevision += 1;
+            scheduleGiVolumeFromCurrentScene({
+                delay: maxTimeline.playing() ? GI_VOLUME_PLAYBACK_DEBOUNCE_MS : GI_VOLUME_SCENE_DEBOUNCE_MS,
+                refresh: true,
+                reason: 'scene',
+            });
+        }
+
+        function markLightProbeLightsDirty() {
+            lightProbeSceneRevision += 1;
+            scheduleGiVolumeFromCurrentScene({
+                delay: maxTimeline.playing() ? GI_VOLUME_PLAYBACK_DEBOUNCE_MS : GI_VOLUME_LIGHT_DEBOUNCE_MS,
+                refresh: false,
+                lightRefresh: true,
+                reason: 'lights',
+            });
         }
 
         function markLightProbeMaterialsDirty() {
@@ -2362,9 +2464,314 @@
             }
         }
 
+        function giVolumeNowMs() {
+            return (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+        }
+
+        function giVolumeEase(t) {
+            const x = THREE.MathUtils.clamp(t, 0, 1);
+            return x * x * (3 - 2 * x);
+        }
+
+        function fadeGiVolumeTo(targetIntensity, durationMs, onComplete) {
+            if (!giVolume) return;
+            const startIntensity = Math.max(0, Number(giVolume.node?.intensity) || 0);
+            const endIntensity = Math.max(0, Number(targetIntensity) || 0);
+            giVolumeFadeSerial += 1;
+            const serial = giVolumeFadeSerial;
+            if (giVolumeFadeFrame) cancelAnimationFrame(giVolumeFadeFrame);
+            giVolumeFadeFrame = 0;
+
+            if (!(durationMs > 0) || Math.abs(startIntensity - endIntensity) < 1e-4) {
+                giVolume.setIntensity(endIntensity);
+                syncGiVolumeActive();
+                onComplete?.();
+                return;
+            }
+
+            const startedAt = giVolumeNowMs();
+            const step = () => {
+                if (serial !== giVolumeFadeSerial) return;
+                const t = giVolumeEase((giVolumeNowMs() - startedAt) / durationMs);
+                giVolume.setIntensity(THREE.MathUtils.lerp(startIntensity, endIntensity, t));
+                syncGiVolumeActive();
+                if (t < 1) {
+                    giVolumeFadeFrame = requestAnimationFrame(step);
+                } else {
+                    giVolumeFadeFrame = 0;
+                    onComplete?.();
+                }
+            };
+            step();
+        }
+
+        function hideGiVolumeForDebounce() {
+            if (!giVolume || !giVolume.isSupported?.()) return;
+            giVolumeHiddenForDebounce = true;
+            if (giVolume.hasData?.()) {
+                if (giVolumeFadeFrame) cancelAnimationFrame(giVolumeFadeFrame);
+                giVolumeFadeFrame = 0;
+                giVolumeFadeSerial += 1;
+                giVolume.setEnabled(true);
+                giVolume.setIntensity(GI_VOLUME_BASE_INTENSITY);
+                lightProbe.intensity = 0;
+                hasLightProbeData = true;
+                syncGiVolumeActive();
+            } else if ((Number(giVolume.node?.intensity) || 0) > 1e-4) {
+                fadeGiVolumeTo(0, GI_VOLUME_FADE_OUT_MS);
+            } else {
+                giVolume.setIntensity(0);
+                syncGiVolumeActive();
+            }
+        }
+
+        function revealGiVolumeAfterDebounce(token) {
+            if (!giVolume || !giVolume.isSupported?.() || isPathTracingMode) return;
+            if (token != null && token !== giVolumeDebounceSerial) return;
+            if (maxTimeline.playing()) {
+                scheduleGiVolumeFromCurrentScene({
+                    delay: GI_VOLUME_PLAYBACK_DEBOUNCE_MS,
+                    refresh: giVolumePendingRefresh,
+                    lightRefresh: true,
+                    reason: 'playback',
+                });
+                return;
+            }
+            if (!giVolume.hasData?.()) return;
+            giVolumeIdleSolving = false;
+            giVolumeHiddenForDebounce = false;
+            giVolume.setEnabled(true);
+            lightProbe.intensity = 0;
+            hasLightProbeData = true;
+            fadeGiVolumeTo(GI_VOLUME_BASE_INTENSITY, GI_VOLUME_FADE_IN_MS);
+        }
+
+        function startGiVolumeHiddenSolve(token, { refresh = false, lightRefresh = false } = {}) {
+            if (!giVolume || !giVolume.isSupported?.() || isPathTracingMode) return;
+            if (token !== giVolumeDebounceSerial) return;
+            if (maxTimeline.playing()) {
+                scheduleGiVolumeFromCurrentScene({
+                    delay: GI_VOLUME_PLAYBACK_DEBOUNCE_MS,
+                    refresh,
+                    lightRefresh: true,
+                    reason: 'playback',
+                });
+                return;
+            }
+
+            giVolumeIdleToken = token;
+            const hasHistory = giVolume.hasData?.() === true;
+            giVolume.setEnabled(true);
+            giVolume.setIntensity(hasHistory ? GI_VOLUME_BASE_INTENSITY : 0);
+            lightProbe.intensity = 0;
+            hasLightProbeData = true;
+            syncGiVolumeActive();
+
+            let queued = true;
+            if (refresh) {
+                queued = updateGiVolumeFromScene({ hidden: true });
+            } else if (lightRefresh) {
+                giVolume.requestLightRefresh?.();
+            }
+
+            if (!queued) return;
+            giVolumeIdleSolving = giVolume.hasPendingWork?.() === true;
+            if (!giVolumeIdleSolving) revealGiVolumeAfterDebounce(token);
+        }
+
+        function clearGiVolumeNativeWait() {
+            if (giVolumeNativeWaitTimer) clearTimeout(giVolumeNativeWaitTimer);
+            giVolumeNativeWaitTimer = 0;
+            giVolumeNativeRequestToken = 0;
+            giVolumeNativeAwaitSurface = false;
+            giVolumeNativeAwaitLights = false;
+        }
+
+        function maybeStartGiVolumeAfterNativePacket(token) {
+            if (token !== giVolumeDebounceSerial || token !== giVolumeNativeRequestToken) return;
+            if (giVolumeNativeAwaitSurface || giVolumeNativeAwaitLights) return;
+            clearGiVolumeNativeWait();
+            startGiVolumeHiddenSolve(token, { refresh: false, lightRefresh: false });
+        }
+
+        function requestNativeGiPackets(token, { refresh = false, lightRefresh = false } = {}) {
+            if (!window.chrome?.webview || !bridge?.send) return false;
+            const needSurface = refresh === true || !giVolume?.hasData?.();
+            const needLights = needSurface || lightRefresh === true;
+            if (!needSurface && !needLights) return false;
+
+            clearGiVolumeNativeWait();
+            giVolumeNativeRequestToken = token;
+            giVolumeNativeAwaitSurface = needSurface;
+            giVolumeNativeAwaitLights = needLights;
+            bridge.send('gi_probe_refresh', { surface: needSurface, lights: needLights });
+
+            giVolumeNativeWaitTimer = setTimeout(() => {
+                if (token !== giVolumeDebounceSerial || token !== giVolumeNativeRequestToken) return;
+                const fallbackRefresh = giVolumeNativeAwaitSurface;
+                const fallbackLightRefresh = giVolumeNativeAwaitLights;
+                clearGiVolumeNativeWait();
+                startGiVolumeHiddenSolve(token, {
+                    refresh: fallbackRefresh,
+                    lightRefresh: fallbackLightRefresh,
+                });
+            }, GI_VOLUME_NATIVE_WAIT_MS);
+            return true;
+        }
+
+        function runGiVolumeAfterDebounce(token) {
+            giVolumeRefreshTimer = 0;
+            if (!giVolume || !giVolume.isSupported?.() || isPathTracingMode) return;
+            if (token !== giVolumeDebounceSerial) return;
+            if (maxTimeline.playing()) {
+                scheduleGiVolumeFromCurrentScene({
+                    delay: GI_VOLUME_PLAYBACK_DEBOUNCE_MS,
+                    refresh: giVolumePendingRefresh,
+                    lightRefresh: true,
+                    reason: 'playback',
+                });
+                return;
+            }
+
+            const refresh = giVolumePendingRefresh || !giVolume.hasData?.();
+            const lightRefresh = giVolumePendingLightRefresh;
+            giVolumePendingRefresh = false;
+            giVolumePendingLightRefresh = false;
+            if (requestNativeGiPackets(token, { refresh, lightRefresh })) return;
+            startGiVolumeHiddenSolve(token, { refresh, lightRefresh });
+        }
+
+        // Recompile materials once when the GI volume's active state flips, so
+        // MaxLightsNode's customCacheKey picks up (or drops) the GiVolumeNode.
+        // Data-only surfel-buffer writes during compute do NOT pass through here.
+        function syncGiVolumeActive() {
+            // Recompile on active flip OR grid resize (cacheToken carries a
+            // generation that bumps when the GPU surfel/grid buffers are rebuilt).
+            const token = giVolume && giVolume.node.active
+                ? `on:${giVolume.node.cacheToken}`
+                : 'off';
+            if (token !== giVolumeSyncToken) {
+                giVolumeSyncToken = token;
+                markLightProbeMaterialsDirty();
+            }
+        }
+
+        // WebGPU compute local-bounce surfel path. Sizes the box from the scene
+        // bounds, enables the volume, mutes the single ambient lightProbe to
+        // avoid double counting, and schedules a GPU probe solve.
+        function updateGiVolumeFromScene({ hidden = false } = {}) {
+            if (!giVolume || !giVolume.isSupported() || isPathTracingMode) {
+                if (giVolume) { giVolume.setEnabled(false); syncGiVolumeActive(); }
+                return false;
+            }
+            if (maxTimeline.playing()) {
+                scheduleGiVolumeFromCurrentScene({
+                    delay: GI_VOLUME_PLAYBACK_DEBOUNCE_MS,
+                    refresh: true,
+                    reason: 'playback',
+                });
+                return true;
+            }
+            scene.updateMatrixWorld(true);
+            const bounds = computeLightProbeGridBounds(new THREE.Box3());
+            const hasHistory = giVolume.hasData?.() === true;
+            if (!giVolume.setBounds(bounds)) return false;
+            giVolume.setEnabled(true);
+            giVolume.setIntensity(hidden && !hasHistory ? 0 : GI_VOLUME_BASE_INTENSITY);
+            lightProbe.intensity = 0; // volume owns indirect diffuse — no double count
+            hasLightProbeData = true;
+            syncGiVolumeActive();
+            giVolume.scheduleBake();
+            return true;
+        }
+
+        function scheduleGiVolumeFromCurrentScene({
+            delay = GI_VOLUME_SCENE_DEBOUNCE_MS,
+            refresh = true,
+            lightRefresh = false,
+            reason = 'scene',
+        } = {}) {
+            if (!giVolume || !giVolume.isSupported() || isPathTracingMode) return;
+            giVolumePendingRefresh = giVolumePendingRefresh || refresh === true;
+            giVolumePendingLightRefresh = giVolumePendingLightRefresh || lightRefresh === true;
+            giVolumeDebounceSerial += 1;
+            const token = giVolumeDebounceSerial;
+            giVolumeIdleSolving = false;
+            hideGiVolumeForDebounce();
+            if (giVolumeRefreshTimer) clearTimeout(giVolumeRefreshTimer);
+            giVolumeRefreshTimer = setTimeout(() => {
+                runGiVolumeAfterDebounce(token);
+            }, delay);
+        }
+
+        function updateGiVolumeIdleWork() {
+            if (!giVolume || !giVolume.isSupported?.() || isPathTracingMode || renderToImageActive) return;
+            if (maxTimeline.playing()) {
+                if (giVolume.node?.active || giVolumeIdleSolving || giVolume.hasPendingWork?.()) {
+                    scheduleGiVolumeFromCurrentScene({
+                        delay: GI_VOLUME_PLAYBACK_DEBOUNCE_MS,
+                        refresh: false,
+                        lightRefresh: true,
+                        reason: 'playback',
+                    });
+                }
+                return;
+            }
+            if (giVolumeRefreshTimer) return;
+            if (!giVolumeIdleSolving && !giVolume.hasPendingWork?.()) return;
+            const token = giVolumeIdleToken || giVolumeDebounceSerial;
+            const compute = giVolume.tick({ playback: false });
+            if (compute && typeof compute.finally === 'function') {
+                compute.finally(() => {
+                    if (giVolumeIdleSolving
+                        && token === giVolumeDebounceSerial
+                        && !giVolume.hasPendingWork?.()
+                        && !maxTimeline.playing()) {
+                        revealGiVolumeAfterDebounce(token);
+                    }
+                });
+            } else if (!giVolume.hasPendingWork?.()) {
+                revealGiVolumeAfterDebounce(token);
+            }
+        }
+
+        function giVolumeCameraSignature(cam) {
+            const q = (v) => Math.round((Number(v) || 0) * 1000);
+            const a = Array.isArray(cam?.pos) ? cam.pos : [];
+            const b = Array.isArray(cam?.tgt) ? cam.tgt : [];
+            const u = Array.isArray(cam?.up) ? cam.up : [];
+            return [
+                cam?.persp === false ? 0 : 1,
+                q(cam?.fov),
+                q(cam?.viewWidth),
+                q(a[0]), q(a[1]), q(a[2]),
+                q(b[0]), q(b[1]), q(b[2]),
+                q(u[0]), q(u[1]), q(u[2]),
+            ].join(':');
+        }
+
+        function noteGiVolumeCameraSync(cam) {
+            if (!giVolume || !giVolume.isSupported?.() || !giVolume.hasData?.()) return;
+            const signature = giVolumeCameraSignature(cam);
+            if (!signature || signature === giVolumeLastCameraSignature) return;
+            giVolumeLastCameraSignature = signature;
+            scheduleGiVolumeFromCurrentScene({
+                delay: GI_VOLUME_CAMERA_DEBOUNCE_MS,
+                refresh: false,
+                reason: 'camera',
+            });
+        }
+
         async function updateLightProbeFromCurrentScene({ force = false } = {}) {
-            if (!lightProbeEnabled && !force) return;
+            if (!lightProbeEnabled && !force) {
+                if (giVolume) { giVolume.setEnabled(false); syncGiVolumeActive(); }
+                return;
+            }
             if (!supportsWebGLLightProbeGrid()) {
+                if (giVolume?.isSupported?.() && !isPathTracingMode) {
+                    scheduleGiVolumeFromCurrentScene({ delay: 0, refresh: true, reason: 'probe' });
+                    return;
+                }
                 if (refreshSkyAmbientLightProbeFromCurrentSky()) return;
                 if (!currentHdriUrl) clearLightProbe();
                 return;
@@ -2381,6 +2788,10 @@
 
         function scheduleLightProbeFromCurrentScene({ force = false, delay = 180 } = {}) {
             if (!lightProbeEnabled && !force) return;
+            if (giVolume?.isSupported?.() && !supportsWebGLLightProbeGrid() && !isPathTracingMode) {
+                scheduleGiVolumeFromCurrentScene({ delay, refresh: true, reason: 'light-probe' });
+                return;
+            }
             if (lightProbeRefreshTimer) clearTimeout(lightProbeRefreshTimer);
             lightProbeRefreshTimer = setTimeout(() => {
                 lightProbeRefreshTimer = 0;
@@ -5390,7 +5801,50 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     buf = e.getBuffer();
                     const meta = typeof e.additionalData === 'string'
                         ? JSON.parse(e.additionalData) : e.additionalData;
-                    if (meta?.type === 'delta_bin') {
+                    if (meta?.type === 'gi_surface_bin') {
+                        const floatCount = Math.max(0, Math.min(Number(meta.floatCount) || 0, buf.byteLength / 4));
+                        const array = new Float32Array(new Float32Array(buf, 0, floatCount));
+                        const expectedNativeSurface = giVolumeNativeRequestToken === giVolumeDebounceSerial
+                            && giVolumeNativeAwaitSurface === true;
+                        if (giVolume?.setNativeSurface?.({
+                            array,
+                            count: meta.sampleCount,
+                            boundsMin: meta.boundsMin,
+                            boundsSize: meta.boundsSize,
+                        })) {
+                            if (expectedNativeSurface) {
+                                giVolumeNativeAwaitSurface = false;
+                                maybeStartGiVolumeAfterNativePacket(giVolumeNativeRequestToken);
+                            } else {
+                                scheduleGiVolumeFromCurrentScene({
+                                    delay: GI_VOLUME_SCENE_DEBOUNCE_MS,
+                                    refresh: false,
+                                    reason: 'native-surface',
+                                });
+                            }
+                        }
+                    } else if (meta?.type === 'gi_light_bin') {
+                        const floatCount = Math.max(0, Math.min(Number(meta.floatCount) || 0, buf.byteLength / 4));
+                        const array = new Float32Array(new Float32Array(buf, 0, floatCount));
+                        const expectedNativeLights = giVolumeNativeRequestToken === giVolumeDebounceSerial
+                            && giVolumeNativeAwaitLights === true;
+                        if (giVolume?.setNativeLights?.({
+                            array,
+                            count: meta.lightCount,
+                        })) {
+                            if (expectedNativeLights) {
+                                giVolumeNativeAwaitLights = false;
+                                maybeStartGiVolumeAfterNativePacket(giVolumeNativeRequestToken);
+                            } else {
+                                scheduleGiVolumeFromCurrentScene({
+                                    delay: GI_VOLUME_LIGHT_DEBOUNCE_MS,
+                                    refresh: false,
+                                    lightRefresh: true,
+                                    reason: 'native-lights',
+                                });
+                            }
+                        }
+                    } else if (meta?.type === 'delta_bin') {
                         handleBinaryDelta(buf, meta);
                     } else if (meta?.type === 'geo_fast') {
                         // Real-time vertex update — in-place when topology matches
@@ -6426,10 +6880,10 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 lightLinking.refreshSceneBindings?.();
                 markLightProbeSceneDirty();
             } else if (lightsChanged) {
+                markLightProbeLightsDirty();
                 maxjsFx.markOutputChanged?.();
             }
             if (sceneChanged || lightsChanged) {
-                if (lightsChanged) markLightProbeSceneDirty();
                 scheduleLightProbeFromCurrentScene();
             }
             if (pathTracingFx.isEnabled?.()) {
@@ -6734,13 +7188,17 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         bridge.on('xform', msg => {
             const applyStart = performance.now();
             let visibilityChanged = false;
+            let giSurfaceChanged = false;
             let pathTraceSceneChanged = false;
             for (const nd of msg.nodes) {
                 const mesh = nodeMap.get(nd.h);
                 if (nd.vis != null) visibilityChanged = true;
                 if (mesh) {
                     applyIncrementalNodeUpdate(mesh, nd);
-                    if (nd.t || nd.mat || nd.vis != null) pathTraceSceneChanged = true;
+                    if (nd.t || nd.mat || nd.vis != null) {
+                        pathTraceSceneChanged = true;
+                        giSurfaceChanged = true;
+                    }
                 }
                 if (nd.t) {
                     applyHairTransform(nd.h, nd.t);
@@ -6768,6 +7226,8 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             if (visibilityChanged) {
                 // Visibility flip changes the post-pass hide list — cheap refresh.
                 maxjsFx.markSceneChanged?.();
+            }
+            if (giSurfaceChanged) {
                 markLightProbeSceneDirty();
                 scheduleLightProbeFromCurrentScene({ delay: 350 });
             }
@@ -6965,6 +7425,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
 
         function handleBinaryDelta(buffer, meta) {
             let runtimeTransformsChanged = false;
+            let giSurfaceChanged = false;
             let pathTraceSceneChanged = false;
             const result = applyDeltaFrame(buffer, {
                 onTransform(nodeHandle, matrix) {
@@ -6972,6 +7433,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     if (mesh) applyIncrementalNodeUpdate(mesh, { t: matrix });
                     if (mesh) {
                         runtimeTransformsChanged = true;
+                        giSurfaceChanged = true;
                         pathTraceSceneChanged = true;
                     }
                     applyHairTransform(nodeHandle, matrix);
@@ -6980,6 +7442,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     const mesh = nodeMap.get(nodeHandle);
                     if (mesh) {
                         applyIncrementalNodeUpdate(mesh, { mat: material });
+                        giSurfaceChanged = true;
                         pathTraceSceneChanged = true;
                     }
                 },
@@ -6991,6 +7454,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     const mesh = nodeMap.get(nodeHandle);
                     if (mesh) {
                         applyIncrementalNodeUpdate(mesh, { vis: visible });
+                        giSurfaceChanged = true;
                         pathTraceSceneChanged = true;
                     }
                     applyHairVisibility(nodeHandle, visible);
@@ -7021,7 +7485,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                         volContrib: ld.volContrib,
                     });
                     if (ld.type === 0) refreshSkyFromLinkedSun();
-                    markLightProbeSceneDirty();
+                    markLightProbeLightsDirty();
                     scheduleLightProbeFromCurrentScene({ delay: 350 });
                     pathTraceSceneChanged = true;
                 },
@@ -7046,6 +7510,10 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 },
             });
             if (runtimeTransformsChanged) layerManager.markRuntimeTransformsDirty?.();
+            if (giSurfaceChanged) {
+                markLightProbeSceneDirty();
+                scheduleLightProbeFromCurrentScene({ delay: 350 });
+            }
             if (pathTraceSceneChanged) schedulePathTracingLiveRebuild();
             markInitialSync();
             setTransportMode('binary-delta');
@@ -7889,7 +8357,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             if (maxjsFx.setMainLight) {
                 maxjsFx.setMainLight(mainDirectionalLight || (defaultLights.visible ? defaultKey : null));
             }
-            markLightProbeSceneDirty();
+            markLightProbeLightsDirty();
             scheduleLightProbeFromCurrentScene({ delay: 350 });
         }
 
@@ -8715,7 +9183,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 return;
             }
             if (!isStudioMode) {
-                perfHud.setStatus('max.js - Light Linking is available in Studio mode only');
+                perfHud.setStatus('max.js - Light Linking is available in Advanced mode only');
                 return;
             }
             setLightLinkPanelVisible(!lightLinkPanelVisible);
@@ -8931,7 +9399,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 return;
             }
             if (!isStudioMode) {
-                perfHud.setStatus('max.js - Reflection Paint is available in Studio mode only');
+                perfHud.setStatus('max.js - Reflection Paint is available in Advanced mode only');
                 return;
             }
             setReflPaintPanelVisible(!reflPaintPanelVisible);
@@ -10370,10 +10838,9 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             if (maxjsFx.setMainLight) {
                 maxjsFx.setMainLight(mainDirectionalLight || (defaultLights.visible ? defaultKey : null));
             }
-            if (refreshSkyFromLinkedSun()) {
-                markLightProbeSceneDirty();
-                scheduleLightProbeFromCurrentScene({ delay: 350 });
-            }
+            refreshSkyFromLinkedSun();
+            markLightProbeLightsDirty();
+            scheduleLightProbeFromCurrentScene({ delay: 350 });
         }
 
         // ── Scene Camera Lock ────────────────────────────────
@@ -10565,6 +11032,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             if (!isFiniteArray(cam?.pos, 3) || !isFiniteArray(cam?.tgt, 3) || !isFiniteArray(cam?.up, 3)) {
                 return;
             }
+            noteGiVolumeCameraSync(cam);
 
             const wantOrtho = cam.persp === false;
             const isOrtho = camera.isOrthographicCamera;
@@ -11641,11 +12109,11 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         const renderModeSwitch = document.getElementById('renderModeSwitch');
         const modeLabels = {
             standard: 'Standard',
-            studio: 'Studio',
+            studio: 'Advanced',
             pathtracing: 'Pathtracing',
         };
         if (renderModeSwitch) {
-            renderModeSwitch.title = 'Render mode: Standard, Studio, or live-only Pathtracing';
+            renderModeSwitch.title = 'Render mode: Standard, Advanced, or live-only Pathtracing';
             renderModeSwitch.querySelectorAll('[data-render-mode]').forEach(button => {
                 const mode = button.dataset.renderMode;
                 const active = mode === maxjsRenderMode;
@@ -11706,7 +12174,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             setViewportMenuItemHidden(renderModeRow, false);
             renderModeSwitch?.querySelectorAll('[data-render-mode]').forEach(button => {
                 const mode = button.dataset.renderMode;
-                // Studio and the WebGPU spectral path tracer both require the
+                // Advanced and the WebGPU spectral path tracer both require the
                 // native WebGPU stack; hide them on the WebGL pipeline.
                 const hideForPipeline = webGLPipeline && (mode === 'studio' || mode === 'pathtracing');
                 setViewportMenuItemHidden(button, hideForPipeline);
@@ -11768,7 +12236,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 button.classList.toggle('is-gated', gated);
                 button.setAttribute('aria-disabled', gated ? 'true' : 'false');
                 button.title = gated
-                    ? `${button.dataset.baseTitle} (Studio mode only)`
+                    ? `${button.dataset.baseTitle} (Advanced mode only)`
                     : button.dataset.baseTitle;
             }
             if (gated) {
@@ -14612,7 +15080,17 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             updateSkyTime(frameElapsed);
             xrRuntime.update(frameDt);
             if (!xrRuntime.active) syncOrbitNavigationFeel();
-            if (!xrRuntime.active && !(animationSystem?.isDrivingSceneCamera?.())) controls.update();
+            let controlsChanged = false;
+            if (!xrRuntime.active && !(animationSystem?.isDrivingSceneCamera?.())) {
+                controlsChanged = controls.update() === true;
+            }
+            if (controlsChanged) {
+                scheduleGiVolumeFromCurrentScene({
+                    delay: GI_VOLUME_CAMERA_DEBOUNCE_MS,
+                    refresh: false,
+                    reason: 'controls',
+                });
+            }
             // Auto-update DOF focus distance from camera-to-target when enabled.
             // Physical Camera DOF owns focus/bokeh while the camera packet is active.
             if (!xrRuntime.active && !physicalCameraDofActive) {
@@ -14717,6 +15195,16 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 reportBridgeError('runtime error', error);
             } finally {
                 layerManager.afterRender?.(frameElapsed);
+            }
+            // Idle GI: keep probe rebuilds out of camera/playback/sync churn.
+            // Existing probes stay visible as history; after idle, the GPU solve
+            // blends new C++/viewer data into the same volume.
+            if (!renderToImageActive) {
+                updateGiVolumeIdleWork();
+                syncGiVolumeActive();
+                // HALO-GI probe field tick — own ~30 Hz throttle, no-op unless
+                // opted in (window.maxjsHaloGI.enable()); never recompiles materials.
+                haloGi?.tick(performance.now());
             }
             css3dOverlay.tick(scene, camera);
             css3dOverlay.tickBehind(webappSystem?.getBehindScene?.(), camera);

@@ -74,6 +74,7 @@
 #include <cmath>
 #include <cwctype>
 #include <cstdint>
+#include <cfloat>
 #include <locale>
 #include <immintrin.h>
 #include <ppl.h>

@@ -12,6 +12,9 @@
 // vertexData f32×8 (pos+normal+uv), triMaterial u32×1, materials f32×24,
 // lights f32×16, accum f32×4 (xyz + pad). PBR maps arrive as DataArrayTextures
 // (one per type) sampled at the hit UV.
+//
+// The BVH traversal + JH-spectral/env/PBR shading emitters live in
+// spectral_traverse.js (shared byte-identically with the HALO-GI probe kernel).
 
 import * as TSL from 'three/tsl';
 
@@ -23,17 +26,16 @@ const {
     dot, cross, normalize, reflect, mix, clamp, length, smoothstep,
 } = TSL;
 
-const PI = 3.141592653589793;
-const LAMBDA_MIN = 380.0;
-const LAMBDA_MAX = 720.0;
-const LAMBDA_RANGE = LAMBDA_MAX - LAMBDA_MIN;
+import {
+    buildTraversal,
+    PI, LAMBDA_MIN, LAMBDA_MAX, LAMBDA_RANGE, T_MAX, RAY_EPS,
+} from './spectral_traverse.js';
+
 // ∫ȳ(λ)dλ over [380,720] for the Wyman fits below. Dividing the XYZ Monte
 // Carlo estimate by this maps a unit flat spectrum to Y=1 (neutral white);
 // without it a fully-lit white surface lands at Y≈107 and blows out to white.
 const CIE_Y_INTEGRAL = 106.936;
 const INV_U32 = 1.0 / 4294967296.0;
-const T_MAX = 1e30;
-const RAY_EPS = 1e-3;
 
 // ── Wyman 2013 single-lobe CIE 1931 fits ───────────────────────────
 function wymanG(x, mu, s1, s2) {
@@ -54,15 +56,6 @@ function cieY(l) {
 function cieZ(l) {
     return wymanG(l, 437.0, 0.0845, 0.0278).mul(1.217)
         .add(wymanG(l, 459.0, 0.0385, 0.0725).mul(0.681));
-}
-
-// Linear RGB → scalar reflectance at λ via a smooth 3-bin spectrum
-// (blue→green→red). Cheap and good enough for averaged color.
-function rgbToSpectral(rgbNode, lambda) {
-    const t = clamp(lambda.sub(LAMBDA_MIN).div(LAMBDA_RANGE), 0.0, 1.0);
-    const lo = mix(rgbNode.z, rgbNode.y, clamp(t.mul(2.0), 0.0, 1.0));
-    const hi = mix(rgbNode.y, rgbNode.x, clamp(t.sub(0.5).mul(2.0), 0.0, 1.0));
-    return select(t.lessThan(0.5), lo, hi);
 }
 
 export function buildKernels({
@@ -107,50 +100,22 @@ export function buildKernels({
     const W = U.resolution.x;
     const H = U.resolution.y;
 
-    // ── helpers (graph emitters) ───────────────────────────────────
-    const VSTRIDE = uint(8);
-    const fetchVert = (vid) => {
-        const b = vid.mul(VSTRIDE);
-        return vec3(vertexData.element(b), vertexData.element(b.add(uint(1))), vertexData.element(b.add(uint(2))));
-    };
-    const fetchNorm = (vid) => {
-        const b = vid.mul(VSTRIDE).add(uint(3));
-        return vec3(vertexData.element(b), vertexData.element(b.add(uint(1))), vertexData.element(b.add(uint(2))));
-    };
-    const fetchUV = (vid) => {
-        const b = vid.mul(VSTRIDE).add(uint(6));
-        return vec2(vertexData.element(b), vertexData.element(b.add(uint(1))));
-    };
-    const triVert = (triId, k) => triIndex.element(triId.mul(uint(3)).add(uint(k)));
-    const matFloat = (matId, k) => materials.element(matId.mul(uint(24)).add(uint(k)));
-
-    // ── PBR map array textures ─────────────────────────────────────
-    // One DataArrayTexture per map type; null when no material binds that type
-    // (we never reference an absent texture, so its GPU binding is never
-    // created). Layer index lives in the material record; −1 = unmapped.
-    const albedoTex = maps.albedo || null;
-    const normalTex = maps.normal || null;
-    const roughTex = maps.roughness || null;
-    const metalTex = maps.metalness || null;
-    const emissiveTex = maps.emissive || null;
-    const haveAlbedoMap = !!albedoTex;
-    const haveNormalMap = !!normalTex;
-    const haveRoughMap = !!roughTex;
-    const haveMetalMap = !!metalTex;
-    const haveEmissiveMap = !!emissiveTex;
-
-    // sRGB → linear (exact piecewise), component-wise. Colour maps (albedo,
-    // emissive) are stored as raw sRGB bytes; data maps are already linear.
-    const srgbToLinear = (c) => select(
-        c.lessThanEqual(vec3(0.04045)),
-        c.div(12.92),
-        pow(max(c.add(0.055).div(1.055), vec3(0)), vec3(2.4)),
-    );
-    // Sample a map-array layer at the transformed UV. layerF is the material's
-    // stored layer float (−1 = none); we clamp to 0 for the fetch and let the
-    // caller gate on `useLayer` so an unmapped material ignores the result.
-    const sampleLayer = (tex, uv, layerF) =>
-        texture(tex, uv).depth(int(max(layerF, float(0)))).xyz;
+    // ── shared traversal + shading emitters (BVH closest/any-hit, JH spectral,
+    // env, PBR map sampling) bound to this kernel's storage + uniforms. Extracted
+    // to spectral_traverse.js so the HALO-GI probe kernel reuses identical logic
+    // against the same resident BVH (no second acceleration structure).
+    const trav = buildTraversal({
+        storages: { bvhNodes, triIndex, vertexData, triMaterial, materials },
+        U, env, lut, lutRes, maps,
+    });
+    const {
+        fetchVert, fetchNorm, fetchUV, triVert, matFloat,
+        srgbToLinear, sampleLayer,
+        jhReflectance, jhEmission, envAtLambda, cosineSample,
+        traverseClosest, traverseAny,
+        haveAlbedoMap, haveNormalMap, haveRoughMap, haveMetalMap, haveEmissiveMap,
+        albedoTex, normalTex, roughTex, metalTex, emissiveTex,
+    } = trav;
 
     // PCG integer finalizer (full avalanche) — used to derive a well-mixed
     // initial state from (pixel, frame). The OLD seed `(pix ^ frameSeed)*prime`
@@ -172,217 +137,6 @@ export function buildKernels({
         const word = ns.shiftRight(ns.shiftRight(uint(28)).add(uint(4))).bitXor(ns).mul(uint(277803737));
         const res = word.shiftRight(uint(22)).bitXor(word);
         return float(res).mul(INV_U32);
-    };
-
-    // ── Jakob–Hanika RGB → reflectance upsampling ──────────────────
-    // Fetch the (c0,c1,c2) triple from the precomputed LUT (3 argmax slabs,
-    // uniform grid → hardware trilinear), then s(λ)=0.5+0.5·x/√(1+x²) with x a
-    // quadratic in the wavelength remapped to [0,1] over the band. Reflectance
-    // is bounded [0,1]; emission upsamples the unit-chroma and scales by
-    // brightness so coloured lights/HDRI keep their hue but any intensity.
-    const haveLut = !!(lut && lut.length === 3 && lutRes > 1);
-    const LUTN = float(lutRes || 2);
-    const lutUV = (g) => clamp(g, 0.0, 1.0).mul(LUTN.sub(1)).add(0.5).div(LUTN);
-    const jhCoeffs = (rgb) => {
-        const r = rgb.x, g = rgb.y, b = rgb.z;
-        const fetch = (lt, zc, a, c) => {
-            const z = max(zc, float(1e-4));
-            return texture3D(lt, vec3(lutUV(a.div(z)), lutUV(c.div(z)), lutUV(clamp(zc, 0.0, 1.0)))).xyz;
-        };
-        const c0 = fetch(lut[0], r, g, b); // r is max: x=g/z, y=b/z
-        const c1 = fetch(lut[1], g, b, r); // g is max: x=b/z, y=r/z
-        const c2 = fetch(lut[2], b, r, g); // b is max: x=r/z, y=g/z
-        const isB = b.greaterThanEqual(g).and(b.greaterThanEqual(r));
-        const isG = g.greaterThanEqual(r);
-        return select(isB, c2, select(isG, c1, c0));
-    };
-    const jhEval = (c, lambda) => {
-        const Ln = clamp(lambda.sub(LAMBDA_MIN).div(LAMBDA_RANGE), 0.0, 1.0);
-        const x = c.x.mul(Ln).add(c.y).mul(Ln).add(c.z);
-        return float(0.5).add(x.mul(0.5).div(sqrt(x.mul(x).add(1.0))));
-    };
-    const jhReflectance = haveLut
-        ? (rgb, lambda) => jhEval(jhCoeffs(clamp(rgb, 0.0, 1.0)), lambda)
-        : (rgb, lambda) => rgbToSpectral(rgb, lambda);
-    const jhEmission = haveLut
-        ? (rgb, lambda) => {
-            const m = max(max(rgb.x, rgb.y), rgb.z);
-            return jhReflectance(rgb.div(max(m, float(1e-6))), lambda).mul(m);
-        }
-        : (rgb, lambda) => rgbToSpectral(rgb, lambda);
-
-    // env radiance at λ for a world direction (or sky fallback)
-    const envAtLambda = (dir, lambda) => {
-        const out = float(0).toVar();
-        if (env) {
-            // rotate dir around Y by envRotation
-            const cr = cos(U.envRotation), sr = sin(U.envRotation);
-            const rdir = vec3(
-                dir.x.mul(cr).sub(dir.z.mul(sr)),
-                dir.y,
-                dir.x.mul(sr).add(dir.z.mul(cr)),
-            );
-            const uv = equirectUV(normalize(rdir));
-            // texture() auto-converts from the texture's colorSpace to linear
-            // working space (HDR/EXR are already linear), so rgb is linear
-            // radiance — same value the rasterizer's IBL feeds on.
-            const rgb = texture(env, uv).level(0).xyz.mul(U.envIntensity);
-            out.assign(jhEmission(rgb, lambda));
-        } else {
-            // No sampleable HDRI bound (sky/none/geospatial) — match the raster,
-            // which has NO image-based environment light in that state, by
-            // emitting black instead of a synthetic blue sky. The old gradient
-            // injected an env light the viewport never showed ("always-blue").
-            // Sky/geospatial drive scene.environmentNode (a TSL node, not an
-            // equirect texture) and are intentionally out of scope here.
-            out.assign(float(0));
-        }
-        return out;
-    };
-
-    // ── BVH closest-hit: returns {t, tri, normal} via out-vars ──────
-    // Stackless threaded traversal. cursor walks node indices; miss link is
-    // the escape. Returns bestT and best triangle id; caller computes normal.
-    const traverseClosest = (ro, rd, bestTVar, bestTriVar) => {
-        const invD = vec3(float(1).div(rd.x), float(1).div(rd.y), float(1).div(rd.z));
-        const cursor = uint(0).toVar();
-        Loop({ start: uint(0), end: U.nodeCount, type: 'uint', condition: '<' }, () => {
-            If(cursor.greaterThanEqual(U.nodeCount), () => { Break(); });
-            const base = cursor.mul(uint(8));
-            const bmin = vec3(
-                uintBitsToFloat(bvhNodes.element(base)),
-                uintBitsToFloat(bvhNodes.element(base.add(uint(1)))),
-                uintBitsToFloat(bvhNodes.element(base.add(uint(2)))));
-            const bmax = vec3(
-                uintBitsToFloat(bvhNodes.element(base.add(uint(3)))),
-                uintBitsToFloat(bvhNodes.element(base.add(uint(4)))),
-                uintBitsToFloat(bvhNodes.element(base.add(uint(5)))));
-            const miss = bvhNodes.element(base.add(uint(6)));
-            const payload = bvhNodes.element(base.add(uint(7)));
-
-            // slab test against [0, bestT]
-            const t0 = bmin.sub(ro).mul(invD);
-            const t1 = bmax.sub(ro).mul(invD);
-            const tsmall = min(t0, t1);
-            const tbig = max(t0, t1);
-            const tNear = max(max(tsmall.x, tsmall.y), tsmall.z);
-            const tFar = min(min(tbig.x, tbig.y), tbig.z);
-
-            If(tFar.greaterThanEqual(max(tNear, float(0))).and(tNear.lessThan(bestTVar)), () => {
-                If(payload.equal(uint(0xFFFFFFFF)), () => {
-                    cursor.assign(cursor.add(uint(1))); // internal → left child (contiguous)
-                }).Else(() => {
-                    const triOffset = payload.bitAnd(uint(0x00FFFFFF));
-                    const triCount = payload.shiftRight(uint(24));
-                    Loop({ start: uint(0), end: triCount, type: 'uint', condition: '<' }, ({ i }) => {
-                        const triId = triOffset.add(i);
-                        const i0 = triVert(triId, 0);
-                        const i1 = triVert(triId, 1);
-                        const i2 = triVert(triId, 2);
-                        const p0 = fetchVert(i0);
-                        const p1 = fetchVert(i1);
-                        const p2 = fetchVert(i2);
-                        const e1 = p1.sub(p0);
-                        const e2 = p2.sub(p0);
-                        const pv = cross(rd, e2);
-                        const det = dot(e1, pv);
-                        If(abs(det).greaterThan(float(1e-12)), () => {
-                            const invDet = float(1).div(det);
-                            const tv = ro.sub(p0);
-                            const u = dot(tv, pv).mul(invDet);
-                            If(u.greaterThanEqual(float(0)).and(u.lessThanEqual(float(1))), () => {
-                                const qv = cross(tv, e1);
-                                const vbar = dot(rd, qv).mul(invDet);
-                                If(vbar.greaterThanEqual(float(0)).and(u.add(vbar).lessThanEqual(float(1))), () => {
-                                    const tHit = dot(e2, qv).mul(invDet);
-                                    If(tHit.greaterThan(float(RAY_EPS)).and(tHit.lessThan(bestTVar)), () => {
-                                        bestTVar.assign(tHit);
-                                        bestTriVar.assign(int(triId));
-                                    });
-                                });
-                            });
-                        });
-                    });
-                    cursor.assign(miss);
-                });
-            }).Else(() => {
-                cursor.assign(miss);
-            });
-        });
-    };
-
-    // any-hit (shadow) traversal: returns 1.0 if blocked within maxDist
-    const traverseAny = (ro, rd, maxDist) => {
-        const invD = vec3(float(1).div(rd.x), float(1).div(rd.y), float(1).div(rd.z));
-        const cursor = uint(0).toVar();
-        const blocked = float(0).toVar();
-        Loop({ start: uint(0), end: U.nodeCount, type: 'uint', condition: '<' }, () => {
-            If(cursor.greaterThanEqual(U.nodeCount).or(blocked.greaterThan(float(0.5))), () => { Break(); });
-            const base = cursor.mul(uint(8));
-            const bmin = vec3(uintBitsToFloat(bvhNodes.element(base)), uintBitsToFloat(bvhNodes.element(base.add(uint(1)))), uintBitsToFloat(bvhNodes.element(base.add(uint(2)))));
-            const bmax = vec3(uintBitsToFloat(bvhNodes.element(base.add(uint(3)))), uintBitsToFloat(bvhNodes.element(base.add(uint(4)))), uintBitsToFloat(bvhNodes.element(base.add(uint(5)))));
-            const miss = bvhNodes.element(base.add(uint(6)));
-            const payload = bvhNodes.element(base.add(uint(7)));
-            const t0 = bmin.sub(ro).mul(invD);
-            const t1 = bmax.sub(ro).mul(invD);
-            const tNear = max(max(min(t0.x, t1.x), min(t0.y, t1.y)), min(t0.z, t1.z));
-            const tFar = min(min(max(t0.x, t1.x), max(t0.y, t1.y)), max(t0.z, t1.z));
-            If(tFar.greaterThanEqual(max(tNear, float(0))).and(tNear.lessThan(maxDist)), () => {
-                If(payload.equal(uint(0xFFFFFFFF)), () => {
-                    cursor.assign(cursor.add(uint(1)));
-                }).Else(() => {
-                    const triOffset = payload.bitAnd(uint(0x00FFFFFF));
-                    const triCount = payload.shiftRight(uint(24));
-                    Loop({ start: uint(0), end: triCount, type: 'uint', condition: '<' }, ({ i }) => {
-                        const triId = triOffset.add(i);
-                        const p0 = fetchVert(triVert(triId, 0));
-                        const p1 = fetchVert(triVert(triId, 1));
-                        const p2 = fetchVert(triVert(triId, 2));
-                        const e1 = p1.sub(p0); const e2 = p2.sub(p0);
-                        const pv = cross(rd, e2); const det = dot(e1, pv);
-                        If(abs(det).greaterThan(float(1e-12)), () => {
-                            const invDet = float(1).div(det);
-                            const tv = ro.sub(p0);
-                            const u = dot(tv, pv).mul(invDet);
-                            If(u.greaterThanEqual(float(0)).and(u.lessThanEqual(float(1))), () => {
-                                const qv = cross(tv, e1);
-                                const vb = dot(rd, qv).mul(invDet);
-                                If(vb.greaterThanEqual(float(0)).and(u.add(vb).lessThanEqual(float(1))), () => {
-                                    const tHit = dot(e2, qv).mul(invDet);
-                                    If(tHit.greaterThan(float(RAY_EPS)).and(tHit.lessThan(maxDist)), () => {
-                                        // Glass is transparent to shadow rays: a transmissive
-                                        // occluder lets direct light pass instead of casting a
-                                        // solid shadow. Opaque hits behind it still block. (The
-                                        // ray doesn't refract here — true prism caustics come
-                                        // from BSDF path sampling against an emissive/env light,
-                                        // not from this straight-line NEE occlusion test.)
-                                        const occTrans = matFloat(triMaterial.element(triId), 5);
-                                        If(occTrans.lessThan(float(0.5)), () => { blocked.assign(float(1)); });
-                                    });
-                                });
-                            });
-                        });
-                    });
-                    cursor.assign(miss);
-                });
-            }).Else(() => { cursor.assign(miss); });
-        });
-        return blocked;
-    };
-
-    // cosine-weighted hemisphere sample around n
-    const cosineSample = (n, r1, r2) => {
-        const phi = r1.mul(2 * PI);
-        const cosT = sqrt(float(1).sub(r2));
-        const sinT = sqrt(r2);
-        // build tangent frame
-        const a = select(abs(n.y).lessThan(float(0.999)), vec3(0, 1, 0), vec3(1, 0, 0));
-        const t = normalize(cross(a, n));
-        const b = cross(n, t);
-        return normalize(
-            t.mul(cos(phi).mul(sinT))
-                .add(b.mul(sin(phi).mul(sinT)))
-                .add(n.mul(cosT)));
     };
 
     // ── main trace kernel ──────────────────────────────────────────

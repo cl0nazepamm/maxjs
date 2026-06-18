@@ -145,6 +145,7 @@
     bool pathTracingFreezeSync_ = false;
     bool pathTracingViewerActive_ = false;
     bool pathTracingHasSceneSync_ = false;
+    bool nativeGiSurfaceDirty_ = true;
     bool pendingSnapshotExportRequest_ = false;
     std::wstring lastSnapshotExportPath_;
     std::wstring snapshotServePath_;

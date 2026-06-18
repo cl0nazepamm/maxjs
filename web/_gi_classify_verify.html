@@ -1,0 +1,81 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>HALO-GI classification verify</title>
+<style>html,body{margin:0;height:100%;background:#111;color:#cde;font:12px/1.5 monospace}#c{width:45vw;height:100vh;float:left}#o{padding:10px;overflow:auto;height:100vh}</style>
+<script type="importmap">{ "imports": {
+  "three":"./vendor/three-r184/build/three.webgpu.js",
+  "three/webgpu":"./vendor/three-r184/build/three.webgpu.js",
+  "three/tsl":"./vendor/three-r184/build/three.tsl.js",
+  "three-mesh-bvh":"./node_modules/three-mesh-bvh/src/index.js" },
+  "scopes":{"./node_modules/three-mesh-bvh/":{"three":"./vendor/three-r184/build/three.module.js"}}}</script>
+</head><body><canvas id="c"></canvas><pre id="o">running…</pre><script type="module">
+// Phase-2: classification marks probes buried in SOLID geometry INACTIVE (most
+// fixed rays hit backfaces). A solid box occluder over a floor: probes inside
+// the box → inactive; open-air probes → active. (Backface rule is correct for
+// solid meshes — a room with solid walls shows the inner FRONTfaces.)
+const log=[]; const out=document.getElementById('o');
+window.addEventListener('error',e=>log.push(''+(e.error?e.error.stack:e.message)));
+window.addEventListener('unhandledrejection',e=>log.push('rej:'+(e.reason&&e.reason.stack||e.reason)));
+const report=(o)=>{ window.__DONE=o; out.textContent=JSON.stringify(o,null,2); };
+
+(async()=>{
+ const THREE=await import('three'); const TSL=await import('three/tsl');
+ const { createProbeField }=await import('./js/gi_probes.js');
+ const canvas=document.getElementById('c'); const renderer=new THREE.WebGPURenderer({canvas});
+ renderer.setPixelRatio(1); renderer.setSize(Math.floor(innerWidth*0.45),innerHeight,false); await renderer.init();
+ if(renderer.backend?.isWebGPUBackend!==true){ report({pass:false,reason:'not webgpu',log}); return; }
+
+ const scene=new THREE.Scene();
+ // SOLID box at origin (default FrontSide → outward normals), large vs the grid
+ // cell so interior probes are DEEPLY buried; pad region gives open-air probes.
+ const BC=[0,0,0], BS=3, BH=BS/2;
+ const box=new THREE.Mesh(new THREE.BoxGeometry(BS,BS,BS), new THREE.MeshStandardMaterial({color:0xaa5533,roughness:1}));
+ box.position.set(...BC); scene.add(box);
+ scene.updateMatrixWorld(true);
+
+ const field=createProbeField({ renderer, scene, intensity:1.0, hysteresis:0.9 });
+ if(!field.isSupported()){ report({pass:false,reason:'unsupported',log}); return; }
+ field.setEnabled(true);
+ let n=0; const TICKS=12; // classification is one-shot; a few ticks suffice
+ await new Promise((res)=>{ (async function loop(){ try{ await field.tick(); }catch(e){ log.push('tick:'+(e&&e.stack||e)); } n++; if(n<TICKS) requestAnimationFrame(loop); else res(); })(); });
+
+ // read the per-probe state BUFFER directly (reliable; the atlas blit path has
+ // a Y-flip that confounds a pixel readback — the node samples the atlas with
+ // the SAME uv convention the upload writes, so it reads correctly in-shader).
+ const stateBuf=field._debugStateBuffer();
+ if(!stateBuf){ report({pass:false,reason:'no state buffer',log}); return; }
+ const res=field.getResolution();
+ const st=new Float32Array(await renderer.getArrayBufferAsync(stateBuf));
+
+ // grid bounds (mirror gi_probes rebuild: scene bbox + 6% pad)
+ const bb=new THREE.Box3().setFromObject(scene); const gsz=bb.getSize(new THREE.Vector3()); const gmin=bb.min.clone();
+ const pad=gsz.clone().multiplyScalar(0.06); gmin.sub(pad); gsz.add(pad.clone().multiplyScalar(2));
+ // meta buffer is 4 floats/probe: [state, offset.xyz]
+ const mi=(px,py,pz)=>(px + py*res.x + pz*res.x*res.y)*4;
+ const stateAt=(px,py,pz)=> st[mi(px,py,pz)] > 0.5 ? 1 : 0;
+ const offMag=(px,py,pz)=>{ const b=mi(px,py,pz); return Math.hypot(st[b+1],st[b+2],st[b+3]); };
+ // deeply inside the box (≥1 unit from any wall) vs clearly outside it (in the pad)
+ const inBox=(p)=>Math.abs(p[0]-BC[0])<BH-1.0 && Math.abs(p[1]-BC[1])<BH-1.0 && Math.abs(p[2]-BC[2])<BH-1.0;
+ const openAir=(p)=>Math.abs(p[0]-BC[0])>BH+0.05 || Math.abs(p[1]-BC[1])>BH+0.05 || Math.abs(p[2]-BC[2])>BH+0.05;
+ // a probe just INSIDE a box face (within relocClamp of escape) should get a
+ // nonzero relocation offset; deep-open probes get ~0.
+ const nearFace=(p)=>{ const dx=BH-Math.abs(p[0]-BC[0]), dy=BH-Math.abs(p[1]-BC[1]), dz=BH-Math.abs(p[2]-BC[2]);
+   return Math.min(dx,dy,dz)>0 && Math.min(dx,dy,dz)<0.4 && Math.max(Math.abs(p[0]-BC[0]),Math.abs(p[1]-BC[1]),Math.abs(p[2]-BC[2]))<BH; };
+ let inTot=0,inInactive=0, airTot=0,airActive=0, faceTot=0,faceReloc=0, airOffSum=0;
+ for(let pz=0;pz<res.z;pz++)for(let py=0;py<res.y;py++)for(let px=0;px<res.x;px++){
+   const wp=[gmin.x+px/(res.x-1)*gsz.x, gmin.y+py/(res.y-1)*gsz.y, gmin.z+pz/(res.z-1)*gsz.z];
+   const active = stateAt(px,py,pz) > 0.5;
+   const om = offMag(px,py,pz);
+   if(inBox(wp)){ inTot++; if(!active) inInactive++; }
+   else if(openAir(wp)){ airTot++; if(active) airActive++; airOffSum+=om; }
+   if(nearFace(wp)){ faceTot++; if(om>1e-3) faceReloc++; }
+ }
+ const airOffMean=airOffSum/Math.max(1,airTot);
+ const checks=[
+   {name:'probes INSIDE solid box are INACTIVE', value:{inactive:inInactive,total:inTot}, pass: inTot>=1 && inInactive >= inTot*0.7},
+   {name:'open-air probes stay ACTIVE', value:{active:airActive,total:airTot}, pass: airTot>=1 && airActive >= airTot*0.9},
+   {name:'open-air probes get ~ZERO relocation offset', value:{meanOffset:+airOffMean.toFixed(4)}, pass: airOffMean < 0.02},
+   {name:'near-surface probes get RELOCATED (offset>0)', value:{relocated:faceReloc,total:faceTot}, pass: faceTot>=1 && faceReloc >= faceTot*0.6},
+ ];
+ const pass=checks.every(c=>c.pass);
+ report({pass, res, boxBounds:{c:BC,half:BH}, checks, log});
+})();
+</script></body></html>

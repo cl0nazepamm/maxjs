@@ -1,0 +1,92 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>HALO-GI leak (Chebyshev) verify</title>
+<style>html,body{margin:0;height:100%;background:#111;color:#cde;font:12px/1.5 monospace}#c{width:50vw;height:100vh;float:left}#o{padding:10px;overflow:auto;height:100vh}</style>
+<script type="importmap">{ "imports": {
+  "three":"./vendor/three-r184/build/three.webgpu.js",
+  "three/webgpu":"./vendor/three-r184/build/three.webgpu.js",
+  "three/tsl":"./vendor/three-r184/build/three.tsl.js",
+  "three-mesh-bvh":"./node_modules/three-mesh-bvh/src/index.js" },
+  "scopes":{"./node_modules/three-mesh-bvh/":{"three":"./vendor/three-r184/build/three.module.js"}}}</script>
+</head><body><canvas id="c"></canvas><pre id="o">running…</pre><script type="module">
+// Phase-2 validation: depth-moment Chebyshev kills light-leak through a thin
+// wall. Two enclosed rooms split by a solid divider; light ONLY in the left
+// room. Sample the field (through the node's Chebyshev sampler) at a point in
+// the DARK room facing the wall, with cheby ON vs OFF — leak must drop.
+const log=[]; const out=document.getElementById('o');
+window.addEventListener('error',e=>log.push(''+(e.error?e.error.stack:e.message)));
+window.addEventListener('unhandledrejection',e=>log.push('rej:'+(e.reason&&e.reason.stack||e.reason)));
+const report=(o)=>{ window.__DONE=o; out.textContent=JSON.stringify(o,null,2); };
+
+(async()=>{
+ const THREE=await import('three'); const TSL=await import('three/tsl');
+ const { createProbeField }=await import('./js/gi_probes.js');
+ const canvas=document.getElementById('c'); const renderer=new THREE.WebGPURenderer({canvas});
+ renderer.setPixelRatio(1); renderer.setSize(Math.floor(innerWidth*0.5),innerHeight,false); await renderer.init();
+ if(renderer.backend?.isWebGPUBackend!==true){ report({pass:false,reason:'not webgpu',log}); return; }
+
+ const scene=new THREE.Scene();
+ const mat=(c)=>new THREE.MeshStandardMaterial({color:c,roughness:1,metalness:0});
+ const add=(geo,m,pos,rot)=>{ const o=new THREE.Mesh(geo,m); o.position.set(...pos); if(rot)o.rotation.set(...rot); scene.add(o); return o; };
+ // outer box x[-3,3] y[0,4] z[-2,2]
+ const PX=new THREE.PlaneGeometry(6,4), PZ=new THREE.PlaneGeometry(4,4), PY=new THREE.PlaneGeometry(6,4);
+ add(new THREE.PlaneGeometry(6,4),mat(0xcccccc),[0,0,0],[-Math.PI/2,0,0]);   // floor
+ add(new THREE.PlaneGeometry(6,4),mat(0xcccccc),[0,4,0],[Math.PI/2,0,0]);    // ceiling
+ add(new THREE.PlaneGeometry(6,4),mat(0xcccccc),[0,2,-2],[0,0,0]);           // back  +Z
+ add(new THREE.PlaneGeometry(6,4),mat(0xcccccc),[0,2,2],[0,Math.PI,0]);      // front −Z
+ add(new THREE.PlaneGeometry(4,4),mat(0xcccccc),[-3,2,0],[0,Math.PI/2,0]);   // left  +X
+ add(new THREE.PlaneGeometry(4,4),mat(0xcccccc),[3,2,0],[0,-Math.PI/2,0]);   // right −X
+ // SOLID divider wall at x=0.27 (OFF the probe grid, between probes at x≈0 and
+ // x≈0.53) so the wall sits BETWEEN a lit probe and dark points → the case
+ // Chebyshev fixes (an on-grid wall would need relocation instead).
+ const WALLX=0.27;
+ add(new THREE.PlaneGeometry(4,4),mat(0xbbbbbb),[WALLX,2,0],[0,Math.PI/2,0]);
+ add(new THREE.PlaneGeometry(4,4),mat(0xbbbbbb),[WALLX,2,0],[0,-Math.PI/2,0]);
+ // light only in the LEFT (lit) room
+ const lamp=new THREE.PointLight(0xffffff,30,0,2); lamp.position.set(-1.5,3.5,0); scene.add(lamp);
+ scene.updateMatrixWorld(true);
+
+ const field=createProbeField({ renderer, scene, intensity:1.0, hysteresis:0.9 });
+ if(!field.isSupported()){ report({pass:false,reason:'unsupported',log}); return; }
+ field.setEnabled(true);
+ let n=0; const TICKS=160;
+ window.__dbg=()=>({n, hasField:!!field, hasData:field.hasData?.(), stats:field.getStats?.(), log});
+ await new Promise((res)=>{ (async function loop(){ try{ await field.tick(); }catch(e){ log.push('tick:'+(e&&e.stack||e)); } n++; if(n<TICKS) requestAnimationFrame(loop); else res(); })(); });
+
+ // sampler material: colorNode = node.sampleIrradiance(P,N) — applies Chebyshev.
+ let A_cheby,B_cheby,B_leak,C_cheby;
+ try {
+   const Pn=TSL.uniform(new THREE.Vector3()), Nn=TSL.uniform(new THREE.Vector3());
+   const sm=new THREE.MeshBasicNodeMaterial(); sm.toneMapped=false; sm.depthTest=false; sm.depthWrite=false;
+   sm.colorNode=field.node.sampleIrradiance(Pn, Nn).mul(0.1);
+   const q=new THREE.QuadMesh(sm); const rt=new THREE.RenderTarget(1,1);
+   async function sampleAt(P,N,cheby){
+     Pn.value.set(...P); Nn.value.set(...N); field.setChebyStrength(cheby);
+     renderer.setRenderTarget(rt); q.render(renderer); renderer.setRenderTarget(null);
+     const b=await renderer.readRenderTargetPixelsAsync(rt,0,0,1,1);
+     return [b[0],b[1],b[2]];
+   }
+   A_cheby=await sampleAt([-1.5,2,0],[0,1,0],1);
+   C_cheby=await sampleAt([2.5,2,0],[1,0,0],1);
+   // scan x just inside the dark room (facing the wall) to find where the cage
+   // straddles the wall → max leak with cheby OFF; record cheby ON at same spot.
+   var scan=[];
+   for(const x of [0.35,0.4,0.45,0.5,0.6,0.7]){
+     const off=await sampleAt([x,2,0],[-1,0,0],0);
+     const on =await sampleAt([x,2,0],[-1,0,0],1);
+     scan.push({x, off:+(off[0]+off[1]+off[2]).toFixed(1), on:+(on[0]+on[1]+on[2]).toFixed(1)});
+   }
+   rt.dispose();
+   var worst=scan.reduce((a,b)=>b.off>a.off?b:a, scan[0]);
+   B_leak=[worst.off,0,0]; B_cheby=[worst.on,0,0];
+ } catch(e){ report({pass:false,reason:'sampler:'+(e&&e.stack||e),log}); return; }
+ const sum=(p)=>p[0]+p[1]+p[2];
+
+ const Bl=B_leak[0], Bc=B_cheby[0];
+ const checks=[
+   {name:'lit room has GI (sanity)', value:{A:sum(A_cheby)}, pass: sum(A_cheby) > 15},
+   {name:'leak exists WITHOUT Chebyshev (control)', value:{worstLeak:Bl}, pass: Bl > 6},
+   {name:'Chebyshev cuts the through-wall leak >50%', value:{B_cheby:Bc, B_leak:Bl, ratio:+(Bc/Math.max(1,Bl)).toFixed(2)}, pass: Bc < Bl*0.5},
+ ];
+ const pass=checks.every(c=>c.pass);
+ report({pass, A_cheby, scan, worst:{leak:Bl,cheby:Bc}, C_cheby, checks, log});
+})();
+</script></body></html>

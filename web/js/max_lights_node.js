@@ -24,6 +24,8 @@ import HemisphereLightDataNode from 'three/addons/tsl/lighting/data/HemisphereLi
 import AmbientLightDataNode from 'three/addons/tsl/lighting/data/AmbientLightDataNode.js';
 import { NodeUtils } from 'three/webgpu';
 import { getReflectionPaintNode } from './reflection_paint.js';
+import { getGiVolumeNode } from './gi_irradiance_volume.js';
+import { getGiProbeNode } from './gi_probes.js';
 import {
     If, Loop, getDistanceAttenuation, mix, normalWorld, positionView, renderGroup,
     select, smoothstep, uniformArray, vec3, uint, int, float,
@@ -334,6 +336,14 @@ export default class MaxLightsNode extends DynamicLightsNode {
             }
         }
         if (getReflectionPaintNode().active) typeSet.add('reflection-paint-global');
+        // GI irradiance volume: token carries a generation so enable/disable and
+        // grid-resize recompile, but data-only surfel-buffer writes share the same
+        // program.
+        if (getGiVolumeNode().active) typeSet.add(getGiVolumeNode().cacheToken);
+        // HALO-GI probe field: token bumps ONLY on grid resize / enable, never on
+        // per-tick atlas writes (the atlas is a stable sampled binding) — so probe
+        // updates never recompile materials. This is the churn-free contract.
+        if (getGiProbeNode().active) typeSet.add(getGiProbeNode().cacheToken);
         for (const token of [...typeSet].sort()) HASH_DATA.push(NodeUtils.hashString(token));
         const key = NodeUtils.hashArray(HASH_DATA);
         HASH_DATA.length = 0;
@@ -422,6 +432,19 @@ export default class MaxLightsNode extends DynamicLightsNode {
 
         const reflectionPaintNode = getReflectionPaintNode();
         if (reflectionPaintNode.active) lightNodes.push(reflectionPaintNode);
+
+        // GI irradiance volume — adds position-dependent local diffuse bounce into
+        // builder.context.irradiance for every synced material (global; not
+        // per-mesh light-link masked — indirect bounce is unmasked by design).
+        const giVolumeNode = getGiVolumeNode();
+        if (giVolumeNode.active) lightNodes.push(giVolumeNode);
+
+        // HALO-GI BVH-traced DDGI probe field — leak-free room-scale bounce into
+        // context.irradiance (global, unmasked, same as the surfel volume). The
+        // two are mutually exclusive at runtime (index.html mutes the surfel
+        // volume when the probe field is active) to avoid double-counting bounce.
+        const giProbeNode = getGiProbeNode();
+        if (giProbeNode.active) lightNodes.push(giProbeNode);
 
         this._lightNodes = lightNodes;
     }

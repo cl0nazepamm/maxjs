@@ -318,7 +318,7 @@ function flattenBVHRoot(rootBuffer) {
 // [1..3] worldPos, [4..6] worldDir (toward target), [7..9] color*intensity,
 // [10] range, [11] decay, [12] cosAngle, [13] cosPenumbra, [14] w, [15] h.
 
-function collectLights(THREE, scene) {
+export function collectLights(THREE, scene) {
     const out = [];
     const pos = new THREE.Vector3();
     const dir = new THREE.Vector3();

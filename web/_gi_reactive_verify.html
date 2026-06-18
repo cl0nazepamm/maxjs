@@ -1,0 +1,76 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>HALO-GI reactivity verify</title>
+<style>html,body{margin:0;height:100%;background:#111;color:#cde;font:12px/1.5 monospace}#c{width:45vw;height:100vh;float:left}#o{padding:10px;overflow:auto;height:100vh}</style>
+<script type="importmap">{ "imports": {
+  "three":"./vendor/three-r184/build/three.webgpu.js",
+  "three/webgpu":"./vendor/three-r184/build/three.webgpu.js",
+  "three/tsl":"./vendor/three-r184/build/three.tsl.js",
+  "three-mesh-bvh":"./node_modules/three-mesh-bvh/src/index.js" },
+  "scopes":{"./node_modules/three-mesh-bvh/":{"three":"./vendor/three-r184/build/three.module.js"}}}</script>
+</head><body><canvas id="c"></canvas><pre id="o">running…</pre><script type="module">
+// Reactivity: the field must respond to LIVE light + geometry edits without a
+// manual rebuild. (1) recolor a light white→red → floor bounce shifts red.
+// (2) move the light far → bounce dims. (3) move a mesh → geoSig triggers a rebuild.
+const log=[]; const out=document.getElementById('o');
+window.addEventListener('error',e=>log.push(''+(e.error?e.error.stack:e.message)));
+window.addEventListener('unhandledrejection',e=>log.push('rej:'+(e.reason&&e.reason.stack||e.reason)));
+const report=(o)=>{ window.__DONE=o; out.textContent=JSON.stringify(o,null,2); };
+
+(async()=>{
+ const THREE=await import('three'); const TSL=await import('three/tsl');
+ const { createProbeField }=await import('./js/gi_probes.js');
+ const canvas=document.getElementById('c'); const renderer=new THREE.WebGPURenderer({canvas});
+ renderer.setPixelRatio(1); renderer.setSize(Math.floor(innerWidth*0.45),innerHeight,false); await renderer.init();
+ if(renderer.backend?.isWebGPUBackend!==true){ report({pass:false,reason:'not webgpu',log}); return; }
+
+ const scene=new THREE.Scene();
+ const floor=new THREE.Mesh(new THREE.PlaneGeometry(8,8), new THREE.MeshStandardMaterial({color:0xffffff,roughness:1}));
+ floor.rotation.x=-Math.PI/2; scene.add(floor);
+ const block=new THREE.Mesh(new THREE.BoxGeometry(1.4,1.4,1.4), new THREE.MeshStandardMaterial({color:0xffffff,roughness:1}));
+ block.position.set(0,0.7,0); scene.add(block);
+ const lamp=new THREE.PointLight(0xffffff,26,0,2); lamp.position.set(0,3.4,0); scene.add(lamp);
+ scene.updateMatrixWorld(true);
+
+ const field=createProbeField({ renderer, scene, intensity:1.0, hysteresis:0.85 });
+ if(!field.isSupported()){ report({pass:false,reason:'unsupported',log}); return; }
+ field.setEnabled(true);
+ const Pn=TSL.uniform(new THREE.Vector3(0,0.4,1.6)), Nn=TSL.uniform(new THREE.Vector3(0,1,0));
+ const rt=new THREE.RenderTarget(1,1,{type:THREE.HalfFloatType});
+ const ticks=async(n)=>{ for(let i=0;i<n;i++){ await field.tick(); await new Promise(r=>requestAnimationFrame(r)); } };
+
+ await ticks(120);
+ // build the sampler AFTER convergence so it captures the live atlas (not null).
+ // Light edits do an in-place refresh (same atlas object) → this sampler stays valid.
+ const sm=new THREE.MeshBasicNodeMaterial(); sm.toneMapped=false; sm.colorNode=field.node.sampleIrradiance(Pn,Nn);
+ const q=new THREE.QuadMesh(sm);
+ const sample=async()=>{ renderer.setRenderTarget(rt); q.render(renderer); renderer.setRenderTarget(null);
+   const b=await renderer.readRenderTargetPixelsAsync(rt,0,0,1,1); return [+b[0].toFixed(2),+b[1].toFixed(2),+b[2].toFixed(2)]; };
+ const baseRGB = await sample();                 // white light → neutral bounce
+ const baseProbes = field.getStats().probes;
+
+ // (1) recolor the light to RED (live edit, no rebuild call)
+ lamp.color.setHex(0xff2020); scene.updateMatrixWorld(true);
+ await ticks(70);
+ const redRGB = await sample();                  // expect R-biased now
+
+ // (2) move the light far away (dim) — back to white first
+ lamp.color.setHex(0xffffff); lamp.position.set(0,18,0); scene.updateMatrixWorld(true);
+ await ticks(70);
+ const dimRGB = await sample();                  // expect dimmer than base
+
+ // (3) geometry edit: scale the block up a lot → geoSig change → rebuild
+ lamp.position.set(0,3.4,0); scene.updateMatrixWorld(true);
+ block.scale.set(2.4,2.4,2.4); block.position.set(2.2,1.7,0); scene.updateMatrixWorld(true);
+ await ticks(60);
+ const afterGeoProbes = field.getStats().probes;
+
+ const sum=(p)=>p[0]+p[1]+p[2];
+ const checks=[
+   {name:'baseline GI present', value:{baseRGB}, pass: sum(baseRGB)>2},
+   {name:'recolor light white→RED shifts bounce red (live, no rebuild)', value:{baseRGB,redRGB}, pass: (redRGB[0]-redRGB[1]) > (baseRGB[0]-baseRGB[1]) + 1.5},
+   {name:'moving light far DIMS the bounce', value:{baseSum:+sum(baseRGB).toFixed(1), dimSum:+sum(dimRGB).toFixed(1)}, pass: sum(dimRGB) < sum(baseRGB)*0.6},
+   {name:'geometry edit triggers a rebuild (probes recomputed)', value:{baseProbes, afterGeoProbes}, pass: afterGeoProbes>0},
+ ];
+ const pass=checks.every(c=>c.pass);
+ report({pass, baseRGB, redRGB, dimRGB, checks, log});
+})();
+</script></body></html>

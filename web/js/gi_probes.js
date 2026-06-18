@@ -30,6 +30,8 @@ import {
 // importing this module for the GiProbeNode (e.g. from max_lights_node.js) does
 // NOT drag the CPU BVH builder into that module graph.
 let _buildSpectralScene = null;
+let _collectLights = null;       // cheap light re-collect for reactivity (no BVH rebuild)
+let _LIGHT_STRIDE = 16;
 import { buildTraversal, T_MAX, RAY_EPS, PI } from './spectral_traverse.js';
 import { octEncodeNode, octDecodeNode } from './gi_oct.js';
 
@@ -47,6 +49,11 @@ const TARGET_PROBES_LONG_AXIS = 12;
 const MAX_PROBES_PER_AXIS = 24;
 const MAX_TRIANGLES = 4_000_000;
 const MAX_LIGHTS = 64;             // matches spectral_scene LIGHT_STRIDE table
+// ── reactivity: respond to live light/geometry edits ──
+const REACTIVE_TICKS = 40;         // ticks of fast (low-hysteresis) convergence after a change
+const REACTIVE_HYSTERESIS = 0.4;   // hysteresis during a reactivity burst (vs steady-state)
+const LIGHT_CHECK_INTERVAL = 6;    // ticks between light-change checks
+const GEO_CHECK_INTERVAL = 24;     // ticks between geometry-change checks (full rebuild = expensive)
 
 let _node = null;
 
@@ -223,6 +230,14 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
     let probeCursor = 0;
     let frameCounter = 0;
     let updatedPerTick = 1;
+    // reactivity: self-detect live light/geometry edits and re-converge fast.
+    const baseHysteresis = THREE.MathUtils.clamp(hysteresis, 0, 0.99);
+    let lastLightSig = null;
+    let lastGeoSig = null;
+    let geoChanged = false;   // debounce: rebuild only after geometry edits SETTLE
+    let checkCounter = 0;
+    let reactiveTicks = 0;
+    const _sigVec = new THREE.Vector3();
 
     const U = {
         gridMin: uniform(new THREE.Vector3()),
@@ -644,7 +659,10 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
 
     async function ensureSceneBuilder() {
         if (!_buildSpectralScene) {
-            ({ buildSpectralScene: _buildSpectralScene } = await import('./spectral_scene.js'));
+            const mod = await import('./spectral_scene.js');
+            _buildSpectralScene = mod.buildSpectralScene;
+            _collectLights = mod.collectLights || null;
+            if (Number.isFinite(mod.LIGHT_STRIDE)) _LIGHT_STRIDE = mod.LIGHT_STRIDE;
         }
         return _buildSpectralScene;
     }
@@ -695,6 +713,26 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
         if (dirty || !gpu) { inFlight = true; let ok = false; try { ok = await rebuild(); } finally { inFlight = false; } if (!ok) return; }
         if (!gpu) return;
 
+        // reactivity: detect live light/geometry edits (throttled). Light change →
+        // cheap in-place buffer refresh; geometry change → full BVH rebuild next tick.
+        checkCounter++;
+        if (checkCounter % LIGHT_CHECK_INTERVAL === 0) {
+            const ls = lightSignature();
+            if (lastLightSig !== null && ls !== lastLightSig) refreshLights();
+            lastLightSig = ls;
+        }
+        if (checkCounter % GEO_CHECK_INTERVAL === 0) {
+            const gs = geoSignature();
+            // debounce: only rebuild once the geometry has SETTLED (stable for one
+            // interval), so a continuous drag doesn't trigger a rebuild every check.
+            if (lastGeoSig !== null && gs !== lastGeoSig) geoChanged = true;
+            else if (geoChanged) { geoChanged = false; reactiveTicks = REACTIVE_TICKS; requestRebuild(); }
+            lastGeoSig = gs;
+        }
+        // drop hysteresis during a reactivity burst so the field re-converges fast.
+        U.hysteresis.value = reactiveTicks > 0 ? REACTIVE_HYSTERESIS : baseHysteresis;
+        if (reactiveTicks > 0) reactiveTicks--;
+
         const updated = Math.min(updatedCap(), probeTotal);
         U.probeOffset.value = probeCursor >>> 0;
         U.updatedCount.value = updated >>> 0;
@@ -722,6 +760,48 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
 
     function setEnabled(on) { node.setEnabled(on === true); if (on) dirty = true; }
     function requestRebuild() { dirty = true; }
+
+    // ── reactivity helpers ──
+    // Cheap scene signatures: a change flags a light refresh (in-place) or a full
+    // BVH rebuild. Both kick a low-hysteresis burst so the field re-converges fast.
+    function lightSignature() {
+        let s = '', n = 0;
+        scene.traverseVisible((o) => {
+            if (!o.isLight || o.isAmbientLight || o.isHemisphereLight) return;
+            o.getWorldPosition(_sigVec);
+            const c = o.color;
+            s += `${Math.round(_sigVec.x)},${Math.round(_sigVec.y)},${Math.round(_sigVec.z)}|`
+               + `${c ? Math.round((c.r * 7 + c.g * 11 + c.b * 13) * 32) : 0}|`
+               + `${Math.round((o.intensity || 0) * 10)}|${Math.round((o.angle || 0) * 100)};`;
+            n++;
+        });
+        return n + ':' + s;
+    }
+    function geoSignature() {
+        let meshes = 0, prims = 0, hash = 0;
+        scene.traverseVisible((o) => {
+            if (!o.isMesh && !o.isInstancedMesh) return;
+            const p = o.geometry?.attributes?.position; if (!p) return;
+            meshes++;
+            prims += o.geometry.index ? o.geometry.index.count : p.count;
+            const e = o.matrixWorld?.elements;
+            if (e) hash += e[12] + e[13] * 1.7 + e[14] * 2.3 + p.count + (o.count || 1);
+        });
+        return `${meshes}:${prims}:${Math.round(hash)}`;
+    }
+    // re-collect lights into the existing buffer (no BVH rebuild). Count change → full rebuild.
+    function refreshLights() {
+        if (!gpu || !_collectLights) return;
+        let records;
+        try { records = _collectLights(THREE, scene); } catch { return; }
+        if (records.length !== gpu.lightCount) { requestRebuild(); return; }
+        const arr = gpu.buffers.lights.array;
+        arr.fill(0);
+        for (let i = 0; i < records.length; i++) arr.set(records[i], i * _LIGHT_STRIDE);
+        gpu.buffers.lights.needsUpdate = true;
+        reactiveTicks = REACTIVE_TICKS;
+    }
+
     function dispose() { disposed = true; disposeGPU(); node.setEnabled(false); }
 
     return {

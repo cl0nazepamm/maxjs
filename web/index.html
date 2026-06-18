@@ -1108,6 +1108,8 @@
                     setIntensity: (v) => haloField.setIntensity(v),
                     setCheby: (v) => haloField.setChebyStrength(v), // 0 leaks, 1 leak-free
                     setClassify: (v) => haloField.setClassifyStrength(v), // 0 off (default), 1 drop buried probes (solid scenes)
+                    setBounds: (box) => haloField.setBounds(box),     // single Probe Origin box; null = auto-fit
+                    setVolumes: (boxes) => haloField.setVolumes(boxes), // multiple Probe Origin boxes (unioned for now)
                     getStats: () => haloField.getStats(),
                     tick(nowMs) {
                         if (!haloOn || isPathTracingMode || !haloField.isSupported()) return;

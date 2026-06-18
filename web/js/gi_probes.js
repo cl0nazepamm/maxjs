@@ -224,6 +224,7 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
 
     let gpu = null;           // { buffers, kernels, atlases, buffers... }
     let dirty = true;
+    let manualVolumes = null; // explicit probe volumes (Probe Origin boxes); null = auto-fit scene
     let needsClassify = true; // one-shot probe classification after a rebuild
     let inFlight = false;
     let disposed = false;
@@ -674,13 +675,22 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
 
         const box = new THREE.Box3();
         scene.updateMatrixWorld(true);
-        box.setFromObject(scene);
+        // Explicit "Probe Origin" volumes override the whole-scene auto-fit: fewer
+        // probes, denser where it matters, faster. Multiple boxes are unioned into
+        // one grid for now (perf win = tighter than the whole scene); far-apart
+        // boxes will later get separate grids. Auto-fit only when no volume is set.
+        const hasVolumes = Array.isArray(manualVolumes) && manualVolumes.length > 0;
+        if (hasVolumes) { box.makeEmpty(); for (const b of manualVolumes) if (b && !b.isEmpty()) box.union(b); }
+        else box.setFromObject(scene);
         if (box.isEmpty()) { disposeGPU(); return false; }
         box.getSize(gridSize);
         gridMin.copy(box.min);
-        // pad the grid slightly so surfaces sit inside the cage.
-        const pad = gridSize.clone().multiplyScalar(0.06);
-        gridMin.sub(pad); gridSize.add(pad.clone().multiplyScalar(2));
+        if (!hasVolumes) {
+            // pad the AUTO-FIT grid so surfaces sit inside the cage. Explicit boxes
+            // are used as drawn (the author owns their extent).
+            const pad = gridSize.clone().multiplyScalar(0.06);
+            gridMin.sub(pad); gridSize.add(pad.clone().multiplyScalar(2));
+        }
         res.copy(computeGridResolution(gridSize));
         probeTotal = res.x * res.y * res.z;
         atlasW = res.x * TILE;
@@ -760,6 +770,16 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
 
     function setEnabled(on) { node.setEnabled(on === true); if (on) dirty = true; }
     function requestRebuild() { dirty = true; }
+    // Set explicit probe volume(s) (world-space THREE.Box3) — e.g. synced "Probe
+    // Origin" boxes. Pass null/empty to revert to whole-scene auto-fit.
+    function setVolumes(boxes) {
+        const list = (Array.isArray(boxes) ? boxes : [boxes])
+            .filter((b) => b && b.isBox3 && !b.isEmpty())
+            .map((b) => b.clone());
+        manualVolumes = list.length ? list : null;
+        dirty = true;
+    }
+    const setBounds = (box) => setVolumes(box ? [box] : null); // single-box convenience
 
     // ── reactivity helpers ──
     // Cheap scene signatures: a change flags a light refresh (in-place) or a full
@@ -815,10 +835,13 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
             if (Number.isFinite(v)) U.classifyStrength.value = THREE.MathUtils.clamp(v, 0, 1); // trace-side relocation apply
         },
         requestRebuild,
+        setBounds,
+        setVolumes,
         isSupported,
         hasData: () => node._hasData === true,
         getStats: () => ({ probes: probeTotal, res: res.clone(), atlas: [atlasW, atlasH], rays: RAYS_PER_PROBE, active: node.active }),
         getResolution: () => res.clone(),
+        getBounds: () => new THREE.Box3(gridMin.clone(), gridMin.clone().add(gridSize)),
         _debugAtlas: () => gpu?.atlas || null,
         _debugDepthAtlas: () => gpu?.depthAtlas || null,
         _debugStateAtlas: () => gpu?.stateAtlas || null,

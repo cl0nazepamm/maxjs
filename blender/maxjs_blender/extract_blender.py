@@ -285,4 +285,7 @@ def extract_scene(context, backend="WebGL"):
         "toneMapping": tone,
         "exposure": exposure,
         "fps": int(round(scene.render.fps / fps_base)),
+        # Same name→handle map the snapshot used; the live pump reuses it so the
+        # browser's nodeMap resolves every delta command.
+        "handle_map": dict(handle),
     }

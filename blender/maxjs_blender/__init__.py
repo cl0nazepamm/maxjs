@@ -22,11 +22,12 @@ import webbrowser
 import bpy
 
 try:
-    from . import extract_blender, serialize, server
+    from . import extract_blender, serialize, server, pump
 except ImportError:  # running the modules outside the package
     import extract_blender
     import serialize
     import server
+    import pump
 
 
 def _repo_web_root():
@@ -50,7 +51,44 @@ def _export(context):
     ir = extract_blender.extract_scene(context, backend=scene.maxjs_backend)
     stats = serialize.write_snapshot(out_dir, ir)
     stats["out_dir"] = out_dir
+    stats["handle_map"] = ir["handle_map"]
     return stats
+
+
+# ── live IPR: a depsgraph-paced delta pump streaming MXJB frames ──
+_IPR = {"running": False, "pump": None, "scene": None, "interval": 0.05}
+
+
+class _Ctx:
+    """Minimal context shim for the pump inside a timer (it only needs .scene)."""
+    def __init__(self, scene):
+        self.scene = scene
+
+    def evaluated_depsgraph_get(self):
+        return bpy.context.evaluated_depsgraph_get()
+
+
+def _ipr_tick():
+    st = _IPR
+    if not st["running"]:
+        return None  # unregister
+    try:
+        scene = bpy.data.scenes.get(st["scene"])
+        if scene is not None:
+            frame = st["pump"].build_frame(_Ctx(scene))
+            if frame:
+                server.push_delta(frame)
+    except Exception as ex:
+        print("[max.js IPR] tick error:", repr(ex))
+    return st["interval"]
+
+
+def _ipr_stop():
+    _IPR["running"] = False
+    if bpy.app.timers.is_registered(_ipr_tick):
+        bpy.app.timers.unregister(_ipr_tick)
+    server.set_ipr(False)
+    server.clear_delta()
 
 
 class MAXJS_OT_export_only(bpy.types.Operator):
@@ -98,6 +136,52 @@ class MAXJS_OT_export_preview(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class MAXJS_OT_ipr_start(bpy.types.Operator):
+    bl_idname = "maxjs.ipr_start"
+    bl_label = "Start Live IPR (max.js)"
+    bl_description = "Stream scene edits to the browser as MXJB delta frames"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        scene = context.scene
+        web_root = _resolve_web_root(scene)
+        if not os.path.isdir(web_root):
+            self.report({"ERROR"}, "max.js web/ runtime not found: %s" % web_root)
+            return {"CANCELLED"}
+        try:
+            stats = _export(context)
+            pmp = pump.DeltaPump(stats["handle_map"])
+            pmp.seed(context)  # prime caches from current state; emits nothing
+        except Exception as ex:
+            self.report({"ERROR"}, "max.js IPR export failed: %r" % ex)
+            return {"CANCELLED"}
+
+        server.clear_delta()
+        _httpd, port = server.serve(web_root, stats["out_dir"], port=scene.maxjs_port, ipr=True)
+        _IPR.update(running=True, pump=pmp, scene=scene.name,
+                    interval=max(0.016, float(scene.maxjs_ipr_interval)))
+        if not bpy.app.timers.is_registered(_ipr_tick):
+            bpy.app.timers.register(_ipr_tick)
+
+        page = "snapshot_webgpu.html" if scene.maxjs_backend == "WebGPU" else "snapshot.html"
+        url = "http://127.0.0.1:%d/%s" % (port, page)
+        webbrowser.open(url)
+        self.report({"INFO"}, "max.js IPR live (%.0f Hz) → %s" % (1.0 / _IPR["interval"], url))
+        return {"FINISHED"}
+
+
+class MAXJS_OT_ipr_stop(bpy.types.Operator):
+    bl_idname = "maxjs.ipr_stop"
+    bl_label = "Stop Live IPR (max.js)"
+    bl_description = "Stop streaming delta frames"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        _ipr_stop()
+        self.report({"INFO"}, "max.js IPR stopped")
+        return {"FINISHED"}
+
+
 class MAXJS_PT_panel(bpy.types.Panel):
     bl_label = "max.js"
     bl_space_type = "VIEW_3D"
@@ -116,8 +200,19 @@ class MAXJS_PT_panel(bpy.types.Panel):
         layout.operator("maxjs.export_preview", icon="PLAY")
         layout.operator("maxjs.export_only", icon="EXPORT")
 
+        layout.separator()
+        box = layout.box()
+        box.label(text="Live IPR", icon="RENDER_ANIMATION")
+        box.prop(scene, "maxjs_ipr_interval", text="Interval (s)")
+        if _IPR["running"]:
+            box.operator("maxjs.ipr_stop", icon="PAUSE")
+            box.label(text="● streaming", icon="REC")
+        else:
+            box.operator("maxjs.ipr_start", icon="PLAY")
 
-_CLASSES = (MAXJS_OT_export_only, MAXJS_OT_export_preview, MAXJS_PT_panel)
+
+_CLASSES = (MAXJS_OT_export_only, MAXJS_OT_export_preview,
+            MAXJS_OT_ipr_start, MAXJS_OT_ipr_stop, MAXJS_PT_panel)
 
 
 def register():
@@ -134,18 +229,25 @@ def register():
     bpy.types.Scene.maxjs_port = bpy.props.IntProperty(
         name="Port", default=0, min=0, max=65535,
         description="0 = pick a free port")
+    bpy.types.Scene.maxjs_ipr_interval = bpy.props.FloatProperty(
+        name="IPR interval", default=0.05, min=0.016, max=1.0,
+        description="Seconds between delta pumps (0.05 = 20 Hz)")
     for cls in _CLASSES:
         bpy.utils.register_class(cls)
 
 
 def unregister():
     try:
+        _ipr_stop()
+    except Exception:
+        pass
+    try:
         server.stop()
     except Exception:
         pass
     for cls in reversed(_CLASSES):
         bpy.utils.unregister_class(cls)
-    for prop in ("maxjs_backend", "maxjs_out_dir", "maxjs_web_root", "maxjs_port"):
+    for prop in ("maxjs_backend", "maxjs_out_dir", "maxjs_web_root", "maxjs_port", "maxjs_ipr_interval"):
         if hasattr(bpy.types.Scene, prop):
             delattr(bpy.types.Scene, prop)
 

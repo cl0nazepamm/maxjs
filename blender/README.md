@@ -34,10 +34,12 @@ Two deliberate design choices keep this a *translation layer* and not a fork:
 
 ```
 blender/maxjs_blender/
-  contract.py         spec + adaptive binary packers + conformance asserts   (pure)
+  contract.py         spec + adaptive binary packers + DeltaFrameBuilder (MXJB) + conformance asserts   (pure)
   serialize.py        neutral IR → snapshot.json + scene.bin                  (pure, DCC-agnostic)
   extract_blender.py  Blender depsgraph → neutral IR    ← the ONLY bpy-coupled file
-  server.py           overlay HTTP server (serves shared web/ + the export)
+  pump.py             change-detecting live delta pump (emits MXJB frames)
+  ipr_client.js       injected browser client: decodes via shared protocol.js, applies via maxjsPlayer
+  server.py           overlay HTTP server (serves shared web/ + the export + /maxjs/delta)
   __init__.py         add-on: operators + N-panel
 ```
 
@@ -68,8 +70,20 @@ DCC, reimplement only that file.
 2. Open the **N** sidebar in the 3D Viewport → **max.js** tab.
 3. (Optional) set **web/** to your max.js `web/` directory. Empty = auto-detect
    from the repo layout (`blender/../../web`).
-4. Click **Export & Preview**. The scene is written to a temp dir and opened in
-   the browser against the shared runtime.
+4. Click **Export & Preview** for a static snapshot, or **Start Live IPR** to
+   stream edits. Both open the browser against the shared runtime.
+
+### Live IPR (interactive preview render)
+
+**Start Live IPR** exports the initial snapshot, then runs a ~20 Hz pump
+(`bpy.app.timers`) that diffs the scene and streams only what changed as **MXJB
+delta frames — the exact wire format the 3ds Max plugin emits**. The browser
+client (injected by the overlay server) decodes them with the *same*
+`web/js/protocol.js` Max uses and applies them through `maxjsPlayer`. Transport
+is a plain HTTP poll of `/maxjs/delta` (no websockets). Move/rotate objects or
+tweak a Principled BSDF in Blender and the viewer updates live; the camera is
+left under the viewer's own orbit controls. Snapshots fall out for free — IPR
+starts from one and shares the same contract + extractors.
 
 Headless / scripted:
 
@@ -82,15 +96,16 @@ sz.write_snapshot(r"C:\path\to\out", ir)   # → out/snapshot.json + out/scene.b
 
 ## Scope
 
-**Now (v0.1 — snapshot parity):** meshes (vertices, split normals, the active UV,
+**Now (v0.2):** snapshot parity — meshes (vertices, split normals, the active UV,
 triangulated, corner-deduped), object hierarchy via parent handles, Principled
 BSDF materials, point/spot/sun/area lights with the right photometric units, the
-active camera. Static scene rendered in the shared runtime.
+active camera — **plus live IPR** streaming MXJB transform / visibility /
+material-scalar / light / camera deltas at ~20 Hz.
 
 **Next:** multi-material (`groups` + `matRefs`), texture maps, second UV /
-lightmap channel, and **live IPR** — streaming the MXJB delta protocol
-(`contract.LAYOUT`, already mirrored) over a browser transport so edits update
-in real time, the way the Max WebView2 path does.
+lightmap channel, live *geometry* topology updates (re-stream scene.bin on mesh
+edits), and add/remove of objects mid-session (handles are currently fixed at
+IPR start).
 
 **Out of scope (matches max.js):** WebXR; effects that depend on CPU project
 layers unless their sidecars are exported.

@@ -246,3 +246,121 @@ assert LAYOUT["Light"] == 148, LAYOUT
 assert LAYOUT["Splat"] == 72, LAYOUT
 assert LAYOUT["Time"] == 12, LAYOUT
 assert LAYOUT["EndFrame"] == 0, LAYOUT
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# DeltaFrameBuilder — byte-identical Python port of src/sync_protocol.cpp.
+# This is the live-IPR encoder: the Blender delta pump emits the SAME MXJB
+# frames the 3ds Max plugin emits, decoded by the SAME web/js/protocol.js.
+# Payload sizes come from LAYOUT above (single source of truth).
+# ─────────────────────────────────────────────────────────────────────────
+_CMD_HEADER = 4  # u16 type + u16 size
+
+
+class DeltaFrameBuilder:
+    def __init__(self, frame_id):
+        self._b = bytearray()
+        self._count = 0
+        self._frame_id = int(frame_id) & 0xFFFFFFFF
+        # Frame header: magic, version, reserved, frameId, commandCount(placeholder)
+        self._u32(DELTA_FRAME_MAGIC)
+        self._u16(DELTA_FRAME_VERSION)
+        self._u16(0)
+        self._u32(self._frame_id)
+        self._count_off = len(self._b)
+        self._u32(0)
+
+    # ── low-level appenders (little-endian, matches x86 memcpy) ──
+    def _u16(self, v):
+        self._b += struct.pack("<H", int(v) & 0xFFFF)
+
+    def _u32(self, v):
+        self._b += struct.pack("<I", int(v) & 0xFFFFFFFF)
+
+    def _i32(self, v):
+        self._b += struct.pack("<i", int(v))
+
+    def _f32(self, v):
+        self._b += struct.pack("<f", float(v))
+
+    def _begin(self, cmd_name, payload_bytes):
+        self._u16(COMMAND[cmd_name])
+        self._u16(_CMD_HEADER + payload_bytes)
+        self._count += 1
+
+    # ── commands (field order mirrors sync_protocol.cpp exactly) ──
+    def begin_frame(self):
+        self._begin("BeginFrame", LAYOUT["BeginFrame"])
+        self._u32(self._frame_id)
+
+    def update_transform(self, handle, matrix16):
+        self._begin("UpdateTransform", LAYOUT["Transform"])
+        self._u32(handle)
+        for i in range(16):
+            self._f32(matrix16[i])
+
+    def update_material_scalar(self, handle, color3, rough, metal, opacity):
+        self._begin("UpdateMaterialScalar", LAYOUT["MaterialScalar"])
+        self._u32(handle)
+        self._f32(color3[0]); self._f32(color3[1]); self._f32(color3[2])
+        self._f32(rough); self._f32(metal); self._f32(opacity)
+
+    def update_selection(self, handle, selected):
+        self._begin("UpdateSelection", LAYOUT["Selection"])
+        self._u32(handle); self._u32(1 if selected else 0)
+
+    def update_visibility(self, handle, visible):
+        self._begin("UpdateVisibility", LAYOUT["Visibility"])
+        self._u32(handle); self._u32(1 if visible else 0)
+
+    def update_camera(self, pos3, tgt3, up3, fov, persp, view_width=0.0,
+                      dof_enabled=False, dof_focus=0.0, dof_focal=0.0, dof_bokeh=0.0):
+        self._begin("UpdateCamera", LAYOUT["Camera"])
+        for v in pos3: self._f32(v)
+        for v in tgt3: self._f32(v)
+        for v in up3: self._f32(v)
+        self._f32(fov); self._u32(1 if persp else 0); self._f32(view_width)
+        self._u32(1 if dof_enabled else 0)
+        self._f32(dof_focus); self._f32(dof_focal); self._f32(dof_bokeh)
+
+    def update_light(self, handle, d):
+        """d: dict with matrix16, visible, type, color[3], intensity, distance,
+        decay, angle, penumbra, width, height, groundColor[3], castShadow,
+        shadowBias, shadowRadius, shadowMapSize, volContrib."""
+        self._begin("UpdateLight", LAYOUT["Light"])
+        self._u32(handle)
+        m = d["matrix16"]
+        for i in range(16):
+            self._f32(m[i])
+        self._u32(1 if d.get("visible", True) else 0)
+        self._u32(int(d.get("type", 0)))
+        c = d.get("color", (1, 1, 1)); self._f32(c[0]); self._f32(c[1]); self._f32(c[2])
+        self._f32(d.get("intensity", 1.0))
+        self._f32(d.get("distance", 0.0))
+        self._f32(d.get("decay", 2.0))
+        self._f32(d.get("angle", 0.0))
+        self._f32(d.get("penumbra", 0.0))
+        self._f32(d.get("width", 0.0))
+        self._f32(d.get("height", 0.0))
+        g = d.get("groundColor", (0, 0, 0)); self._f32(g[0]); self._f32(g[1]); self._f32(g[2])
+        self._u32(1 if d.get("castShadow", False) else 0)
+        self._f32(d.get("shadowBias", 0.0))
+        self._f32(d.get("shadowRadius", 0.0))
+        self._u32(int(d.get("shadowMapSize", 1024)))
+        self._f32(d.get("volContrib", 0.0))
+
+    def update_time(self, ticks, tpf, state_flags):
+        self._begin("UpdateTime", LAYOUT["Time"])
+        self._u32(ticks); self._u32(tpf)
+        self._b += struct.pack("<B", int(state_flags) & 0xFF)
+        self._b += b"\x00\x00\x00"
+
+    def end_frame(self):
+        self._begin("EndFrame", LAYOUT["EndFrame"])
+        struct.pack_into("<I", self._b, self._count_off, self._count)
+
+    def command_count(self):
+        return self._count
+
+    def bytes(self):
+        return bytes(self._b)

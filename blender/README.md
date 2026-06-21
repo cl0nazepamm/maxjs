@@ -38,8 +38,9 @@ blender/maxjs_blender/
   serialize.py        neutral IR → snapshot.json + scene.bin                  (pure, DCC-agnostic)
   extract_blender.py  Blender depsgraph → neutral IR    ← the ONLY bpy-coupled file
   pump.py             change-detecting live delta pump (emits MXJB frames)
-  ipr_client.js       injected browser client: decodes via shared protocol.js, applies via maxjsPlayer
-  server.py           overlay HTTP server (serves shared web/ + the export + /maxjs/delta)
+  webview2_shim.js    fakes the 3ds Max WebView2 host so the REAL editor (index.html) runs in a browser
+  ipr_client.js       (legacy) client for the snapshot-viewer IPR path
+  server.py           overlay HTTP server (serves shared web/ + the export + SSE + shim injection)
   __init__.py         add-on: operators + N-panel
 ```
 
@@ -75,19 +76,30 @@ DCC, reimplement only that file.
 
 ### Live IPR (interactive preview render)
 
-**Start Live IPR** exports the initial snapshot, then drives an **event-driven**
-pump: a `depsgraph_update_post` handler fires the moment you edit and diffs only
-the objects Blender flagged dirty, emitting **MXJB delta frames — the exact wire
-format the 3ds Max plugin streams**. Frames are **pushed** to the browser over
-Server-Sent Events (`EventSource`, auto-reconnecting) — no polling, no
-websockets. The injected client decodes them with the *same* `web/js/protocol.js`
-Max uses and applies them through `maxjsPlayer`. Move/rotate objects or tweak a
-Principled BSDF and the viewer updates live; the camera is left under the
-viewer's own orbit controls. Snapshots fall out for free — IPR starts from one
-and shares the same contract + extractors.
+**Start Live IPR** opens the **actual max.js editor** (`web/index.html`, full
+WebGPU post-FX pipeline) in the browser — not the stripped snapshot viewer. The
+trick: the editor only ever talks to one thing, the 3ds Max WebView2 host, which
+it reaches through `window.chrome.webview`. The add-on injects
+`webview2_shim.js` (inline, right after `<head>`, before the editor's standalone
+check) that **impersonates that host**:
 
-(A cursor-based `/maxjs/delta` poll endpoint remains as a fallback; the live path
-is `/maxjs/stream`.)
+- on the editor's `{type:'ready'}` handshake, it pushes `snapshot.json` +
+  `scene.bin` as a `scene_bin` shared buffer → the editor's own
+  `handleBinaryScene` builds the scene;
+- it streams **MXJB delta frames** (SSE `/maxjs/stream`) as `delta_bin` shared
+  buffers → the editor's own `handleBinaryDelta` (the same `protocol.js` +
+  `applyDeltaFrame` the C++ host drives) applies transform / material / visibility
+  / camera / light updates.
+
+So **web/ is never touched** — the editor runs unmodified and does all the work;
+the add-on just plays the part of Max. The pump is event-driven: a
+`depsgraph_update_post` handler fires the instant you edit and diffs only the
+dirty objects. Push transport is SSE (`EventSource`, auto-reconnecting) — no
+polling, no websockets.
+
+Exposure / post-FX use the editor's own defaults and FX panel (the snapshot's
+`exposure` is a snapshot-viewer concept; the editor owns its post-FX state). A
+cursor-based `/maxjs/delta` poll endpoint remains as a fallback.
 
 Headless / scripted:
 
@@ -103,13 +115,16 @@ sz.write_snapshot(r"C:\path\to\out", ir)   # → out/snapshot.json + out/scene.b
 **Now (v0.2):** snapshot parity — meshes (vertices, split normals, the active UV,
 triangulated, corner-deduped), object hierarchy via parent handles, Principled
 BSDF materials, point/spot/sun/area lights with the right photometric units, the
-active camera — **plus live IPR**: event-driven (depsgraph) MXJB transform /
-visibility / material-scalar / light deltas, pushed over SSE.
+active camera — **plus live IPR in the real max.js editor** (WebGPU, full post-FX):
+event-driven (depsgraph) MXJB transform / visibility / material-scalar / light
+deltas pushed over SSE and applied by the editor's native handlers.
 
-**Next:** multi-material (`groups` + `matRefs`), texture maps, second UV /
-lightmap channel, live *geometry* topology updates (re-stream scene.bin on mesh
-edits), and add/remove of objects mid-session (handles are currently fixed at
-IPR start).
+**Next:** forward post-FX / exposure state into the editor from the shim (match
+the look automatically); drive the editor camera from the Blender *viewport*
+(region_3d) so navigating in Blender moves the preview; multi-material (`groups`
++ `matRefs`); texture maps; live *geometry* topology updates (re-stream
+`scene.bin` / `geo_fast` on mesh edits); add/remove of objects mid-session
+(handles are currently fixed at IPR start).
 
 **Out of scope (matches max.js):** WebXR; effects that depend on CPU project
 layers unless their sidecars are exported.

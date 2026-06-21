@@ -188,10 +188,11 @@ class MAXJS_OT_ipr_start(bpy.types.Operator):
         if _on_depsgraph not in bpy.app.handlers.depsgraph_update_post:
             bpy.app.handlers.depsgraph_update_post.append(_on_depsgraph)
 
-        page = "snapshot_webgpu.html" if scene.maxjs_backend == "WebGPU" else "snapshot.html"
-        url = "http://127.0.0.1:%d/%s" % (port, page)
+        # The real max.js editor viewport (full post-FX), driven via the
+        # injected WebView2 host shim — not the stripped snapshot viewer.
+        url = "http://127.0.0.1:%d/index.html" % port
         webbrowser.open(url)
-        self.report({"INFO"}, "max.js IPR live (event-driven) → %s" % url)
+        self.report({"INFO"}, "max.js IPR live (full viewer) → %s" % url)
         return {"FINISHED"}
 
 

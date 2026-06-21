@@ -171,8 +171,23 @@ class _OverlayHandler(http.server.SimpleHTTPRequestHandler):
     def _serve_html_injected(self, fs):
         with open(fs, "rb") as f:
             data = f.read()
-        idx = data.lower().rfind(b"</body>")
-        data = (data[:idx] + _CLIENT_TAG + data[idx:]) if idx != -1 else (data + _CLIENT_TAG)
+        if os.path.basename(fs).lower() == "index.html":
+            # Real max.js editor: inline the WebView2 host shim immediately after
+            # <head>, BEFORE index.html's standalone check, so it boots hosted.
+            shim_path = os.path.join(os.path.dirname(__file__), "webview2_shim.js")
+            shim = b""
+            try:
+                with open(shim_path, "rb") as sf:
+                    shim = sf.read()
+            except OSError:
+                pass
+            tag = b"<script>\n" + shim + b"\n</script>"
+            low = data.lower()
+            idx = low.find(b"<head>")
+            data = (data[:idx + 6] + tag + data[idx + 6:]) if idx != -1 else (tag + data)
+        else:
+            idx = data.lower().rfind(b"</body>")
+            data = (data[:idx] + _CLIENT_TAG + data[idx:]) if idx != -1 else (data + _CLIENT_TAG)
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))

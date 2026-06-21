@@ -10,9 +10,11 @@
 # the injected client at /maxjs/ipr_client.js, and (4) appends that client to
 # served .html when IPR is active. No websockets — plain stdlib http.server poll.
 
+import base64
 import http.server
 import os
 import posixpath
+import queue
 import struct
 import threading
 import urllib.parse
@@ -20,14 +22,28 @@ import urllib.parse
 _CONF = {"web_root": None, "export_dir": None, "ipr": False}
 _SERVER = {"httpd": None, "thread": None, "port": None}
 
-# Cursor-based delta ring. `base` = number of frames dropped; frames[0] has
-# absolute index `base`. Clients poll with the absolute cursor they've consumed.
+# Cursor-based delta ring — fallback for the poll endpoint. `base` = number of
+# frames dropped; frames[0] has absolute index `base`.
 _DELTA = {"frames": [], "base": 0, "cap": 8192, "lock": threading.Lock()}
+
+# Live SSE clients: one bounded Queue per open /maxjs/stream connection. The
+# pump pushes a frame and it fans out to every connection immediately (push,
+# not poll) — this is what makes the preview feel like the Max IPR.
+_CLIENTS = set()
+_CLIENTS_LOCK = threading.Lock()
 
 _CLIENT_TAG = b'<script type="module" src="/maxjs/ipr_client.js"></script>'
 
 
 def push_delta(frame_bytes):
+    # Fan out to live SSE connections (the fast path)…
+    with _CLIENTS_LOCK:
+        for q in _CLIENTS:
+            try:
+                q.put_nowait(frame_bytes)
+            except queue.Full:
+                pass
+    # …and keep the ring so the poll endpoint still works as a fallback.
     with _DELTA["lock"]:
         _DELTA["frames"].append(frame_bytes)
         overflow = len(_DELTA["frames"]) - _DELTA["cap"]
@@ -75,6 +91,8 @@ class _OverlayHandler(http.server.SimpleHTTPRequestHandler):
 
     def do_GET(self):
         path = self.path.split("?", 1)[0]
+        if path == "/maxjs/stream":
+            return self._serve_stream()
         if path == "/maxjs/delta":
             return self._serve_delta()
         if path == "/maxjs/ipr_client.js":
@@ -85,6 +103,36 @@ class _OverlayHandler(http.server.SimpleHTTPRequestHandler):
             if fs.lower().endswith(".html") and os.path.isfile(fs):
                 return self._serve_html_injected(fs)
         return super().do_GET()
+
+    def _serve_stream(self):
+        # Server-Sent Events: one long-lived HTTP/1.0 response we keep writing
+        # to. Each MXJB frame is base64'd into a `data:` line. EventSource on the
+        # client reconnects automatically if the socket drops. No websockets.
+        q = queue.Queue(maxsize=4096)
+        with _CLIENTS_LOCK:
+            _CLIENTS.add(q)
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Connection", "close")
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+            self.wfile.write(b": maxjs ipr stream\n\n")
+            self.wfile.flush()
+            while True:
+                try:
+                    frame = q.get(timeout=15.0)
+                except queue.Empty:
+                    self.wfile.write(b": ping\n\n")  # heartbeat / dead-peer probe
+                    self.wfile.flush()
+                    continue
+                self.wfile.write(b"data:" + base64.b64encode(frame) + b"\n\n")
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+            pass
+        finally:
+            with _CLIENTS_LOCK:
+                _CLIENTS.discard(q)
 
     def _serve_delta(self):
         qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)

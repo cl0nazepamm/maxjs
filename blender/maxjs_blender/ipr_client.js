@@ -9,8 +9,6 @@
 import * as THREE from 'three';
 import { applyDeltaFrame } from '/js/protocol.js';
 
-const POLL_MS = 60;
-
 // Re-localization identical to scene_applier.js applyTransform (not exported,
 // so mirrored here): MXJB transforms are WORLD matrices in Max/Z-up space; for
 // parented nodes we express them relative to the parent within the basis root.
@@ -73,18 +71,11 @@ function makeHandlers(player) {
     };
 }
 
-function applyBlob(buffer, handlers) {
-    const dv = new DataView(buffer);
-    let o = 0;
-    const nextCursor = dv.getUint32(o, true); o += 4;
-    const count = dv.getUint32(o, true); o += 4;
-    for (let i = 0; i < count; i++) {
-        const len = dv.getUint32(o, true); o += 4;
-        const frame = buffer.slice(o, o + len); o += len;
-        try { applyDeltaFrame(frame, handlers); }
-        catch (e) { console.warn("[max.js IPR] frame decode failed", e); }
-    }
-    return { nextCursor, count };
+function b64ToArrayBuffer(b64) {
+    const bin = atob(b64);
+    const u8 = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+    return u8.buffer; // fresh buffer, offset 0 → frame payloads stay 4-aligned
 }
 
 function badge(text, ok) {
@@ -113,24 +104,23 @@ async function main() {
     const player = await waitForPlayer();
     if (!player) { badge("max.js IPR: no player", false); return; }
     const handlers = makeHandlers(player);
-    let since = 0;
     let frames = 0;
     badge("max.js IPR ● live", true);
 
-    async function poll() {
+    // Push transport: the server streams each frame the instant the pump emits
+    // it. EventSource reconnects on its own if the socket drops.
+    const es = new EventSource("/maxjs/stream");
+    es.onmessage = (ev) => {
         try {
-            const res = await fetch(`/maxjs/delta?since=${since}`, { cache: "no-store" });
-            if (res.status === 200) {
-                const { nextCursor, count } = applyBlob(await res.arrayBuffer(), handlers);
-                since = nextCursor;
-                if (count) { frames += count; badge(`max.js IPR ● live · ${frames} frames`, true); }
-            }
+            applyDeltaFrame(b64ToArrayBuffer(ev.data), handlers);
+            frames++;
+            badge(`max.js IPR ● live · ${frames} frames`, true);
         } catch (e) {
-            badge("max.js IPR ○ disconnected", false);
+            console.warn("[max.js IPR] frame decode failed", e);
         }
-        setTimeout(poll, POLL_MS);
-    }
-    poll();
+    };
+    es.onopen = () => badge(`max.js IPR ● live · ${frames} frames`, true);
+    es.onerror = () => badge("max.js IPR ○ reconnecting…", false);
 }
 
 main();

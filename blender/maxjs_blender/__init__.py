@@ -55,12 +55,15 @@ def _export(context):
     return stats
 
 
-# ── live IPR: a depsgraph-paced delta pump streaming MXJB frames ──
-_IPR = {"running": False, "pump": None, "scene": None, "interval": 0.05}
+# ── live IPR: an event-driven delta pump streaming MXJB frames ──
+# Driven by depsgraph_update_post, so frames fire the instant the user edits
+# (not on a fixed clock) and each frame diffs only the objects Blender flagged
+# dirty. Pushed to the browser over SSE — this is what makes it feel like Max.
+_IPR = {"running": False, "pump": None, "scene": None}
 
 
 class _Ctx:
-    """Minimal context shim for the pump inside a timer (it only needs .scene)."""
+    """Minimal context shim for the pump (it only needs .scene)."""
     def __init__(self, scene):
         self.scene = scene
 
@@ -68,25 +71,48 @@ class _Ctx:
         return bpy.context.evaluated_depsgraph_get()
 
 
-def _ipr_tick():
+def _dirty_object_names(scene, depsgraph):
+    """Object names touched by this depsgraph update (transform/shading), mapping
+    Material/Light datablock edits back to the objects that use them."""
+    names = set()
+    for upd in depsgraph.updates:
+        idd = getattr(upd, "id", None)
+        if idd is None:
+            continue
+        idd = getattr(idd, "original", idd)
+        if isinstance(idd, bpy.types.Object):
+            names.add(idd.name)
+        elif isinstance(idd, bpy.types.Material):
+            for o in scene.objects:
+                if any(ms.material == idd for ms in o.material_slots):
+                    names.add(o.name)
+        elif isinstance(idd, bpy.types.Light):
+            for o in scene.objects:
+                if o.data == idd:
+                    names.add(o.name)
+    return names
+
+
+def _on_depsgraph(scene, depsgraph):
     st = _IPR
-    if not st["running"]:
-        return None  # unregister
+    if not st["running"] or scene.name != st["scene"]:
+        return
     try:
-        scene = bpy.data.scenes.get(st["scene"])
-        if scene is not None:
-            frame = st["pump"].build_frame(_Ctx(scene))
-            if frame:
-                server.push_delta(frame)
+        names = _dirty_object_names(scene, depsgraph)
+        if not names:
+            return
+        frame = st["pump"].build_frame(_Ctx(scene), only_names=names)
+        if frame:
+            server.push_delta(frame)
     except Exception as ex:
-        print("[max.js IPR] tick error:", repr(ex))
-    return st["interval"]
+        print("[max.js IPR] depsgraph error:", repr(ex))
 
 
 def _ipr_stop():
     _IPR["running"] = False
-    if bpy.app.timers.is_registered(_ipr_tick):
-        bpy.app.timers.unregister(_ipr_tick)
+    handlers = bpy.app.handlers.depsgraph_update_post
+    if _on_depsgraph in handlers:
+        handlers.remove(_on_depsgraph)
     server.set_ipr(False)
     server.clear_delta()
 
@@ -158,15 +184,14 @@ class MAXJS_OT_ipr_start(bpy.types.Operator):
 
         server.clear_delta()
         _httpd, port = server.serve(web_root, stats["out_dir"], port=scene.maxjs_port, ipr=True)
-        _IPR.update(running=True, pump=pmp, scene=scene.name,
-                    interval=max(0.016, float(scene.maxjs_ipr_interval)))
-        if not bpy.app.timers.is_registered(_ipr_tick):
-            bpy.app.timers.register(_ipr_tick)
+        _IPR.update(running=True, pump=pmp, scene=scene.name)
+        if _on_depsgraph not in bpy.app.handlers.depsgraph_update_post:
+            bpy.app.handlers.depsgraph_update_post.append(_on_depsgraph)
 
         page = "snapshot_webgpu.html" if scene.maxjs_backend == "WebGPU" else "snapshot.html"
         url = "http://127.0.0.1:%d/%s" % (port, page)
         webbrowser.open(url)
-        self.report({"INFO"}, "max.js IPR live (%.0f Hz) → %s" % (1.0 / _IPR["interval"], url))
+        self.report({"INFO"}, "max.js IPR live (event-driven) → %s" % url)
         return {"FINISHED"}
 
 
@@ -203,10 +228,9 @@ class MAXJS_PT_panel(bpy.types.Panel):
         layout.separator()
         box = layout.box()
         box.label(text="Live IPR", icon="RENDER_ANIMATION")
-        box.prop(scene, "maxjs_ipr_interval", text="Interval (s)")
         if _IPR["running"]:
             box.operator("maxjs.ipr_stop", icon="PAUSE")
-            box.label(text="● streaming", icon="REC")
+            box.label(text="● streaming (event-driven)", icon="REC")
         else:
             box.operator("maxjs.ipr_start", icon="PLAY")
 
@@ -229,9 +253,6 @@ def register():
     bpy.types.Scene.maxjs_port = bpy.props.IntProperty(
         name="Port", default=0, min=0, max=65535,
         description="0 = pick a free port")
-    bpy.types.Scene.maxjs_ipr_interval = bpy.props.FloatProperty(
-        name="IPR interval", default=0.05, min=0.016, max=1.0,
-        description="Seconds between delta pumps (0.05 = 20 Hz)")
     for cls in _CLASSES:
         bpy.utils.register_class(cls)
 
@@ -247,7 +268,7 @@ def unregister():
         pass
     for cls in reversed(_CLASSES):
         bpy.utils.unregister_class(cls)
-    for prop in ("maxjs_backend", "maxjs_out_dir", "maxjs_web_root", "maxjs_port", "maxjs_ipr_interval"):
+    for prop in ("maxjs_backend", "maxjs_out_dir", "maxjs_web_root", "maxjs_port"):
         if hasattr(bpy.types.Scene, prop):
             delattr(bpy.types.Scene, prop)
 

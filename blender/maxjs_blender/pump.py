@@ -51,17 +51,23 @@ class DeltaPump:
         already has this state from the initial snapshot)."""
         self._build(context, seed=True)
 
-    def build_frame(self, context):
-        """Return MXJB frame bytes for what changed since last call, or None."""
-        return self._build(context, seed=False)
+    def build_frame(self, context, only_names=None):
+        """Return MXJB frame bytes for what changed since last call, or None.
 
-    def _build(self, context, seed):
+        `only_names` (a set of object names) restricts the diff to objects the
+        depsgraph flagged dirty — so an interactive edit costs O(changed), not
+        O(scene)."""
+        return self._build(context, seed=False, only_names=only_names)
+
+    def _build(self, context, seed, only_names=None):
         scene = context.scene
         b = contract.DeltaFrameBuilder(self._frame)
         b.begin_frame()
         emitted = 0
 
         for o in scene.objects:
+            if only_names is not None and o.name not in only_names:
+                continue
             h = self.handle_map.get(o.name)
             if not h:
                 continue
@@ -104,7 +110,8 @@ class DeltaPump:
                     if not seed:
                         b.update_light(h, rec); emitted += 1
 
-        cam = extract_blender._camera_to_ir(scene)
+        cam_dirty = only_names is None or (scene.camera and scene.camera.name in only_names)
+        cam = extract_blender._camera_to_ir(scene) if cam_dirty else None
         if cam is not None:
             ckey = (_round_seq(cam["pos"], 5), _round_seq(cam["tgt"], 5), _round_seq(cam["up"], 5),
                     round(cam["fov"], 4), bool(cam["persp"]))

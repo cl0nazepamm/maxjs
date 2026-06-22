@@ -6,7 +6,7 @@
 // CPU blob tracker, CSS colorGrading, and renderer-output/resize tracking.
 import * as THREE from 'three';
 import { uniform, vec3 } from 'three/tsl';
-import { createPowerShotFinal, normalizePowerShotPreset, powerShotPresetUiDefaults, listPowerShotPresets, normalizePowerShotFilmStock, powerShotFilmStockUiDefaults, listPowerShotFilmStocks } from './fx/final/powershot.js';
+import { createPowerShotFinal, normalizePowerShotPreset, powerShotPresetUiDefaults, listPowerShotPresets, normalizePowerShotFilmStock, powerShotFilmStockUiDefaults, listPowerShotFilmStocks, normalizePowerShotInfraredPreset, powerShotInfraredPresetUiDefaults, listPowerShotInfraredPresets } from './fx/final/powershot.js';
 import { createShaderLabFinal } from './fx/final/shaderlab.js';
 import { createFxCore } from './fx/core.js';
 import { ALL } from './fx/registry.js';
@@ -95,6 +95,16 @@ export function createMaxJSFxController({
         filmWeave: 0.4,
         filmFlicker: 0.12,
         filmNegative: false,
+        infraredPreset: 'ethereal_green',
+        irExposure: 1.25,
+        irResponse: 0.0,
+        irLocalGain: 0.48,
+        irGlow: 0.92,
+        irGlowThreshold: 0.43,
+        irEyes: 1.15,
+        irNoise: 1.0,
+        irVignette: 0.52,
+        irHotspot: 0.12,
         freezeNoise: false,
     };
     state.clone = {
@@ -1116,6 +1126,7 @@ export function createMaxJSFxController({
             if (typeof options.mode === 'string') {
                 state.powershot.mode = options.mode === 'analog' ? 'analog'
                     : options.mode === 'film' ? 'film'
+                    : options.mode === 'infrared' ? 'infrared'
                     : 'digital';
                 state.powershot.freezeNoise = false;
             }
@@ -1126,6 +1137,10 @@ export function createMaxJSFxController({
             if (typeof options.filmStock === 'string') {
                 state.powershot.filmStock = normalizePowerShotFilmStock(options.filmStock);
                 Object.assign(state.powershot, powerShotFilmStockUiDefaults(state.powershot.filmStock));
+            }
+            if (typeof options.infraredPreset === 'string') {
+                state.powershot.infraredPreset = normalizePowerShotInfraredPreset(options.infraredPreset);
+                Object.assign(state.powershot, powerShotInfraredPresetUiDefaults(state.powershot.infraredPreset));
             }
             assignFinite(state.powershot, 'amount', options.amount);
             assignFinite(state.powershot, 'resolutionScale', options.resolutionScale);
@@ -1164,6 +1179,15 @@ export function createMaxJSFxController({
             assignFinite(state.powershot, 'filmWeave', options.filmWeave);
             assignFinite(state.powershot, 'filmFlicker', options.filmFlicker);
             if (typeof options.filmNegative === 'boolean') state.powershot.filmNegative = options.filmNegative;
+            assignFinite(state.powershot, 'irExposure', options.irExposure);
+            assignFinite(state.powershot, 'irResponse', options.irResponse);
+            assignFinite(state.powershot, 'irLocalGain', options.irLocalGain);
+            assignFinite(state.powershot, 'irGlow', options.irGlow);
+            assignFinite(state.powershot, 'irGlowThreshold', options.irGlowThreshold);
+            assignFinite(state.powershot, 'irEyes', options.irEyes);
+            assignFinite(state.powershot, 'irNoise', options.irNoise);
+            assignFinite(state.powershot, 'irVignette', options.irVignette);
+            assignFinite(state.powershot, 'irHotspot', options.irHotspot);
             if (typeof options.freezeNoise === 'boolean') state.powershot.freezeNoise = options.freezeNoise;
             if (powerShotFinal.hasPipeline()) powerShotFinal.syncPipeline();
             if (state.powershot.enabled) queuePipelineUpdate({ output: true });
@@ -1174,6 +1198,9 @@ export function createMaxJSFxController({
         },
         getPowerShotFilmStocks() {
             return listPowerShotFilmStocks();
+        },
+        getPowerShotInfraredPresets() {
+            return listPowerShotInfraredPresets();
         },
 
         // ── Global Color Grading ──

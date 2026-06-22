@@ -155,6 +155,13 @@ function densityGrain(density, ctx) {
   return density.add(grain.mul(amp));
 }
 
+function filmOutputAlpha(sourceSample, effectColor) {
+  const sourceAlpha = sourceSample.a.clamp(0.0, 1.0);
+  const effectDelta = dot(abs(effectColor.sub(sourceSample.rgb)), LUM709);
+  const effectAlpha = effectDelta.sub(0.002).mul(6.0).clamp(0.0, 0.65);
+  return sourceAlpha.add(effectAlpha.mul(sourceAlpha.oneMinus())).clamp(0.0, 1.0);
+}
+
 // ---------------------------------------------------------------------------
 // passes
 // ---------------------------------------------------------------------------
@@ -225,8 +232,9 @@ function stDevelop(srcTex, ctx, haloTex) {
   const negView = linearToSrgb(tNeg);
 
   const film = mix(printView, negView, ctx.P.negativeView);
-  const source = texture(srcTex, screenUV).rgb;
-  return vec4(mix(source, film, ctx.power).clamp(0.0, 1.0), 1.0);
+  const sourceSample = texture(srcTex, screenUV);
+  const effectColor = mix(sourceSample.rgb, film, ctx.power).clamp(0.0, 1.0);
+  return vec4(effectColor, filmOutputAlpha(sourceSample, effectColor));
 }
 
 // ---------------------------------------------------------------------------

@@ -5867,31 +5867,15 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                                 && pos.count === vertCount
                                 && (!hasIncomingIndex || (existingIdx && existingIdx.count === idxCount));
                             const incomingVertexColors = normalizeVertexColorDescriptors(meta.vc);
+                            const oldGroups = cloneGeometryGroups(mesh.geometry);
                             const applyIncomingGroups = () => {
-                                if (!Array.isArray(meta.groups)) return;
-                                mesh.geometry.clearGroups();
-                                for (const [start, count, idx] of meta.groups) {
-                                    mesh.geometry.addGroup(start, count, idx);
+                                if (applyGeometryGroups(mesh.geometry, meta.groups)) return;
+                                if (oldGroups.length && (!Array.isArray(mesh.geometry.groups) || mesh.geometry.groups.length === 0)) {
+                                    applyGeometryGroups(mesh.geometry, oldGroups);
                                 }
                             };
                             const applyIncomingMaterial = () => {
-                                if (!Array.isArray(meta.groups) || !Array.isArray(meta.mats)) return;
-                                const ndForMaterial = {
-                                    ...(mesh.userData?.maxjsLastNodePayload || {}),
-                                    h: meta.h,
-                                    n: mesh.name,
-                                    t: mesh.matrix?.elements,
-                                    groups: meta.groups,
-                                    mats: meta.mats,
-                                };
-                                delete ndForMaterial.mat;
-                                delete ndForMaterial.matRef;
-                                delete ndForMaterial.matRefs;
-                                const oldMaterial = mesh.material;
-                                mesh.material = createSceneRenderableMaterial(ndForMaterial, wantsLine, mesh.geometry, mesh);
-                                stampSceneMaterial(mesh, ndForMaterial, wantsLine);
-                                disposeSceneMaterial(oldMaterial);
-                                layerManager.applyMaterialOverrides?.(meta.h, mesh);
+                                applyFastMaterialPayload(mesh, meta, wantsLine);
                             };
 
                             if (sameTopology) {
@@ -6467,6 +6451,68 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             return lineMat;
         }
 
+        function cloneGeometryGroups(geometry) {
+            return Array.isArray(geometry?.groups)
+                ? geometry.groups.map(group => [group.start, group.count, group.materialIndex])
+                : [];
+        }
+
+        function applyGeometryGroups(geometry, groups) {
+            if (!geometry || !Array.isArray(groups)) return false;
+            geometry.clearGroups();
+            for (const group of groups) {
+                if (!Array.isArray(group) || group.length < 3) continue;
+                geometry.addGroup(group[0], group[1], group[2]);
+            }
+            return true;
+        }
+
+        function geometryGroupsMatch(geometry, groups) {
+            if (!geometry || !Array.isArray(groups)) return false;
+            const current = Array.isArray(geometry.groups) ? geometry.groups : [];
+            if (current.length !== groups.length) return false;
+            for (let i = 0; i < groups.length; i++) {
+                const group = groups[i];
+                if (!Array.isArray(group) || group.length < 3) return false;
+                const currentGroup = current[i];
+                if (!currentGroup
+                    || currentGroup.start !== group[0]
+                    || currentGroup.count !== group[1]
+                    || currentGroup.materialIndex !== group[2]) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        function resolveInstancedNodeGeometry(nd, sourceGeometry, { cloneForJsmod = false } = {}) {
+            if (!sourceGeometry) return null;
+            if (!Array.isArray(nd?.groups)) return cloneForJsmod ? sourceGeometry.clone() : sourceGeometry;
+            if (!cloneForJsmod && geometryGroupsMatch(sourceGeometry, nd.groups)) return sourceGeometry;
+            const geometry = sourceGeometry.clone();
+            applyGeometryGroups(geometry, nd.groups);
+            return geometry;
+        }
+
+        function applyFastMaterialPayload(mesh, payload, wantsLine) {
+            if (!mesh || !Array.isArray(payload?.groups) || !Array.isArray(payload?.mats)) return false;
+            const ndForMaterial = {
+                ...(mesh.userData?.maxjsLastNodePayload || {}),
+                h: payload.h,
+                n: mesh.name,
+                t: mesh.matrix?.elements,
+                groups: payload.groups,
+                mats: payload.mats,
+            };
+            delete ndForMaterial.mat;
+            delete ndForMaterial.matRef;
+            delete ndForMaterial.matRefs;
+            const changed = ensureSceneRenderableMaterial(mesh, ndForMaterial, wantsLine);
+            if (!changed) stampSceneMaterial(mesh, ndForMaterial, wantsLine);
+            if (changed) layerManager.applyMaterialOverrides?.(payload.h, mesh);
+            return changed;
+        }
+
         function stampSceneMaterial(mesh, nd, wantsLine) {
             mesh.userData ??= {};
             mesh.userData.maxjsMaterialSignature = sceneMaterialSignature(nd, wantsLine);
@@ -6476,6 +6522,22 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
 
         function ensureSceneRenderableMaterial(mesh, nd, wantsLine) {
             if (!mesh) return false;
+            // Guard: a single-material payload must not collapse a mesh that is
+            // still multi/sub-object. On an incremental re-sync (e.g. after undo)
+            // the Max side can skip geometry extraction for a node whose geometry
+            // is unchanged/instanced — and with it drop the multi-sub groups+mats
+            // payload, sending only a single `mat`. The geometry still carries its
+            // (>1) material groups, so a lone `mat` can't be the real assignment;
+            // rebuilding from it dumps every face onto slot 0 (the "instances lose
+            // their material IDs" bug). Keep the existing array. A genuine
+            // multi→single change re-extracts geometry with a single group, which
+            // releases this guard on its own.
+            if (!wantsLine
+                && Array.isArray(mesh.material) && mesh.material.length > 1
+                && Array.isArray(mesh.geometry?.groups) && mesh.geometry.groups.length > 1
+                && !(Array.isArray(nd?.mats) && nd.mats.length)) {
+                return false;
+            }
             const signature = sceneMaterialSignature(nd, wantsLine);
             if (mesh.material && mesh.userData?.maxjsMaterialSignature === signature) return false;
             const oldMaterial = mesh.material;
@@ -6567,12 +6629,10 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         function disposeMaxInstanceBuckets() {
             for (const [, bucket] of maxInstanceBuckets) {
                 if (bucket.mesh?.parent) bucket.mesh.parent.remove(bucket.mesh);
-                // Don't dispose geometry OR material — both are shared with the
-                // source mesh (see buildMaxInstanceBuckets: `new InstancedMesh
-                // (sourceMesh.geometry, sourceMaterial, ...)`). Disposing the
-                // material here would kill the source mesh's pipeline too,
-                // forcing a full WebGPU recompile of that material on the
-                // next render pass.
+                // Geometry is shared with the source mesh. Materials are owned
+                // per bucket so sibling buckets cannot overwrite each other's
+                // assignments through a shared source material.
+                if (bucket.ownsMaterial) disposeSceneMaterial(bucket.mesh?.material);
             }
             maxInstanceBuckets.clear();
             maxInstanceHandleToBucket.clear();
@@ -6655,10 +6715,16 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 if (bucket.lastMaterialScalarSignature !== materialSignature) {
                     applyMaterialScalar(bucket.mesh, nd.mat);
                     bucket.lastMaterialScalarSignature = materialSignature;
+                    bucket.materialKey = materialSignature;
                     changed = true;
                 }
             }
             return changed;
+        }
+
+        function createMaxInstanceBucketMaterial(group, sourceMesh) {
+            const materialPayload = group?.nodes?.[0] ?? null;
+            return createSceneRenderableMaterial(materialPayload, false, sourceMesh?.geometry ?? null, null);
         }
 
         function computeMaxInstanceBucketGroups(nodes) {
@@ -6727,8 +6793,8 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             for (const group of bucketGroups.values()) {
                 const sourceMesh = nodeMap.get(group.sourceHandle);
                 if (!sourceMesh?.geometry || sourceMesh.isLine || sourceMesh.isLineSegments || sourceMesh.isSkinnedMesh) continue;
-                const sourceMaterial = sourceMesh.material;
-                const mesh = new THREE.InstancedMesh(sourceMesh.geometry, sourceMaterial, group.nodes.length);
+                const bucketMaterial = createMaxInstanceBucketMaterial(group, sourceMesh);
+                const mesh = new THREE.InstancedMesh(sourceMesh.geometry, bucketMaterial, group.nodes.length);
                 mesh.matrixAutoUpdate = false;
                 mesh.frustumCulled = false;
                 mesh.castShadow = !!sourceMesh.castShadow;
@@ -6743,7 +6809,8 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     handleToIndex: new Map(),
                     transforms: new Map(),
                     visible: new Map(),
-                    lastMaterialScalarSignature: '',
+                    lastMaterialScalarSignature: group.nodes[0]?.mat ? materialIdentityKey(group.nodes[0].mat) : '',
+                    ownsMaterial: true,
                 };
 
                 group.nodes.forEach((nd, index) => {
@@ -6761,10 +6828,6 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 });
 
                 updateMaxInstanceBucketVisibility(bucket);
-                if (group.nodes[0]?.mat) {
-                    applyMaterialScalar(mesh, group.nodes[0].mat);
-                    bucket.lastMaterialScalarSignature = materialIdentityKey(group.nodes[0].mat);
-                }
                 maxRoot.add(mesh);
                 maxInstanceBuckets.set(group.key, bucket);
             }
@@ -6958,25 +7021,22 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 const jsmodFlag = !!nd.jsmod;
                 // jsmod flag: layers own vertices — skip geo rebuild for existing meshes
                 const jsmodSkipGeo = jsmodFlag && mesh;
+                const instSrcMesh = nd.instOf ? nodeMap.get(nd.instOf) : null;
 
                 // Geometry: only rebuild if vertex data is present (skip for cached nodes)
                 let geom = mesh?.geometry;
-                if (nd.v && nd.i && !jsmodSkipGeo) {
+                if (nd.instOf && !nd.v) {
+                    const srcGeom = instSrcMesh?.geometry;
+                    if (srcGeom) geom = resolveInstancedNodeGeometry(nd, srcGeom, { cloneForJsmod: jsmodFlag });
+                } else if (nd.v && nd.i && !jsmodSkipGeo) {
                     geom = buildGeometry(nd.v, nd.i, nd.uv, nd.norm, {
                         isLine: !!nd.spline,
                         vertexColors: nd.vc,
                         uv2s: nd.uv2,
                     });
-                    if (nd.groups) {
-                        for (const [start, count, idx] of nd.groups) {
-                            geom.addGroup(start, count, idx);
-                        }
-                    }
+                    applyGeometryGroups(geom, nd.groups);
                 } else if (geom && nd.groups) {
-                    geom.clearGroups();
-                    for (const [start, count, idx] of nd.groups) {
-                        geom.addGroup(start, count, idx);
-                    }
+                    applyGeometryGroups(geom, nd.groups);
                 }
 
                 const wantsLine = !!nd.spline;
@@ -7077,34 +7137,57 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             if (mesh.userData.jsmod) return;  // layers own vertices
             const wantsLine = !!msg.spline;
             const hasLine = !!(mesh.isLine || mesh.isLineSegments);
+            const oldGroups = cloneGeometryGroups(mesh.geometry);
 
             // Type changed (spline ↔ mesh) — need full rebuild, can't just swap geometry
             if (wantsLine !== hasLine) {
+                const oldMaterial = mesh.material;
+                const previousPayload = mesh.userData?.maxjsLastNodePayload || {};
+                const previousName = mesh.name;
+                const previousMatrix = mesh.matrix?.clone?.();
+                const previousMatrixWorld = mesh.matrixWorld?.clone?.();
                 removeMaxNodeObject(mesh);
                 mesh.geometry?.dispose?.();
-                if (Array.isArray(mesh.material)) {
-                    for (const m of mesh.material) m?.dispose?.();
-                } else {
-                    mesh.material?.dispose?.();
-                }
                 const geom = buildGeometry(msg.v, msg.i, msg.uv, msg.norm, {
                     isLine: wantsLine,
                     vertexColors: msg.vc,
                 });
+                if (!applyGeometryGroups(geom, msg.groups) && oldGroups.length) {
+                    applyGeometryGroups(geom, oldGroups);
+                }
                 let newMesh;
+                let material = null;
+                let materialPayload = null;
+                if (Array.isArray(msg.groups) && Array.isArray(msg.mats)) {
+                    materialPayload = {
+                        ...previousPayload,
+                        h: msg.h,
+                        n: previousName,
+                        t: previousMatrix?.elements,
+                        groups: msg.groups,
+                        mats: msg.mats,
+                    };
+                    delete materialPayload.mat;
+                    delete materialPayload.matRef;
+                    delete materialPayload.matRefs;
+                    material = createSceneRenderableMaterial(materialPayload, wantsLine, geom, mesh);
+                }
                 if (wantsLine) {
-                    newMesh = new THREE.LineSegments(geom, new THREE.LineBasicMaterial({ color: 0xffffff }));
+                    newMesh = new THREE.LineSegments(geom, material || new THREE.LineBasicMaterial({ color: 0xffffff }));
                 } else {
-                    newMesh = new THREE.Mesh(geom, new THREE.MeshStandardMaterial());
+                    newMesh = new THREE.Mesh(geom, material || new THREE.MeshStandardMaterial());
                 }
                 newMesh.matrixAutoUpdate = false;
-                newMesh.name = mesh.name;
+                newMesh.name = previousName;
                 newMesh.frustumCulled = false;
                 newMesh.userData.maxjsHandle = msg.h;
-                newMesh.matrix.copy(mesh.matrix);
-                newMesh.matrixWorld.copy(mesh.matrixWorld);
+                newMesh.userData.maxjsLastNodePayload = previousPayload;
+                if (previousMatrix) newMesh.matrix.copy(previousMatrix);
+                if (previousMatrixWorld) newMesh.matrixWorld.copy(previousMatrixWorld);
                 maxRoot.add(newMesh);
                 nodeMap.set(msg.h, newMesh);
+                if (materialPayload) stampSceneMaterial(newMesh, materialPayload, wantsLine);
+                disposeSceneMaterial(oldMaterial);
                 // Renderable-type swap (mesh ↔ line) — scene structure changed,
                 // refresh the post-pass hide list / toon cache. Cheap.
                 maxjsFx.markSceneChanged?.();
@@ -7124,6 +7207,9 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 skipNormalCompute: !!msg.compactChannels,
                 skipBoundsCompute: !!msg.compactChannels,
             });
+            if (!applyGeometryGroups(geom, msg.groups) && oldGroups.length) {
+                applyGeometryGroups(geom, oldGroups);
+            }
             if (msg.compactChannels) {
                 const vertCount = Math.floor((msg.v?.length || 0) / 3);
                 if (!msg.uv && oldUv && oldUv.count === vertCount) {
@@ -7137,6 +7223,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             }
             mesh.geometry.dispose();
             mesh.geometry = geom;
+            applyFastMaterialPayload(mesh, msg, wantsLine);
             // Vertex / topology data on the same Object3D — no scene-structure
             // refresh, no pipeline rebuild. pass(scene, camera) picks up the new
             // BufferGeometry attributes on the next frame automatically.
@@ -7323,24 +7410,17 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 let geom = mesh?.geometry;
                 if (nd.instOf && !nd.geo) {
                     const srcGeom = geoByHandle.get(nd.instOf) || instSrcMesh?.geometry;
-                    if (srcGeom) geom = jsmodFlag ? srcGeom.clone() : srcGeom;
+                    if (srcGeom) geom = resolveInstancedNodeGeometry(nd, srcGeom, { cloneForJsmod: jsmodFlag });
                 } else if (nd.geo && !jsmodSkipGeo) {
                     geom = geometryFromNodeBinary(nd, buffer);
                     if (!geom) continue;
                     setGeometryVertexColorAttributes(geom, nd.geo.vc, buffer);
                     // Add material groups for Multi/Sub
-                    if (nd.groups) {
-                        for (const [start, count, idx] of nd.groups) {
-                            geom.addGroup(start, count, idx);
-                        }
-                    }
+                    applyGeometryGroups(geom, nd.groups);
                     attachSkinAttributes(geom, nd, buffer);
                 } else if (geom && nd.groups) {
                     // Geometry unchanged, but keep groups/material indexing synced.
-                    geom.clearGroups();
-                    for (const [start, count, idx] of nd.groups) {
-                        geom.addGroup(start, count, idx);
-                    }
+                    applyGeometryGroups(geom, nd.groups);
                 }
 
                 // Cache geometry for instance sharing (always, not just when new geo arrives)
@@ -7432,7 +7512,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             const result = applyDeltaFrame(buffer, {
                 onTransform(nodeHandle, matrix) {
                     const mesh = nodeMap.get(nodeHandle);
-                    if (mesh) applyIncrementalNodeUpdate(mesh, { t: matrix });
+                    if (mesh) applyIncrementalNodeUpdate(mesh, { t: matrix }, nodeHandle);
                     if (mesh) {
                         runtimeTransformsChanged = true;
                         giSurfaceChanged = true;
@@ -7443,19 +7523,19 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 onMaterialScalar(nodeHandle, material) {
                     const mesh = nodeMap.get(nodeHandle);
                     if (mesh) {
-                        applyIncrementalNodeUpdate(mesh, { mat: material });
+                        applyIncrementalNodeUpdate(mesh, { mat: material }, nodeHandle);
                         giSurfaceChanged = true;
                         pathTraceSceneChanged = true;
                     }
                 },
                 onSelection(nodeHandle, selected) {
                     const mesh = nodeMap.get(nodeHandle);
-                    if (mesh) applyIncrementalNodeUpdate(mesh, { s: selected });
+                    if (mesh) applyIncrementalNodeUpdate(mesh, { s: selected }, nodeHandle);
                 },
                 onVisibility(nodeHandle, visible) {
                     const mesh = nodeMap.get(nodeHandle);
                     if (mesh) {
-                        applyIncrementalNodeUpdate(mesh, { vis: visible });
+                        applyIncrementalNodeUpdate(mesh, { vis: visible }, nodeHandle);
                         giSurfaceChanged = true;
                         pathTraceSceneChanged = true;
                     }
@@ -12746,7 +12826,8 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             if (markOutput) maxjsFx.markOutputChanged?.();
         }
 
-        const isPowerShotDigitalMode = (values) => values.mode !== 'analog' && values.mode !== 'film';
+        const isPowerShotInfraredMode = (values) => values.mode === 'infrared';
+        const isPowerShotDigitalMode = (values) => values.mode !== 'analog' && values.mode !== 'film' && values.mode !== 'infrared';
         const isPowerShotAnalogMode = (values) => values.mode === 'analog';
         const isPowerShotFilmMode = (values) => values.mode === 'film';
         const isPowerShotJpegActive = (values) => isPowerShotDigitalMode(values) && Number(values.jpegStrength) > 1.0e-6;
@@ -12754,7 +12835,8 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         const isPowerShotTemporalNoiseActive = (values) =>
             (isPowerShotDigitalMode(values) && Number(values.noiseScale) > 1.0e-6)
             || isPowerShotAnalogActive(values)
-            || (isPowerShotFilmMode(values) && Number(values.filmGrain) > 1.0e-6);
+            || (isPowerShotFilmMode(values) && Number(values.filmGrain) > 1.0e-6)
+            || (isPowerShotInfraredMode(values) && Number(values.irNoise) > 1.0e-6);
 
         const postFxSections = [
             {
@@ -13013,6 +13095,16 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     filmWeave: 0.4,
                     filmFlicker: 0.12,
                     filmNegative: false,
+                    infraredPreset: 'ethereal_green',
+                    irExposure: 1.25,
+                    irResponse: 0.0,
+                    irLocalGain: 0.48,
+                    irGlow: 0.92,
+                    irGlowThreshold: 0.43,
+                    irEyes: 1.15,
+                    irNoise: 1.0,
+                    irVignette: 0.52,
+                    irHotspot: 0.12,
                     freezeNoise: false,
                     ...(state.powershot || {}),
                 }),
@@ -13026,6 +13118,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                             { value: 'digital', label: 'Digital CCD' },
                             { value: 'analog', label: 'Analog VHS' },
                             { value: 'film', label: 'Film Print' },
+                            { value: 'infrared', label: 'Night Vision' },
                         ],
                     },
                     {
@@ -13046,6 +13139,16 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                         options: maxjsFx.getPowerShotPresets().map((preset) => ({
                             value: preset.key,
                             label: `${preset.key} - ${preset.label}`,
+                        })),
+                    },
+                    {
+                        key: 'infraredPreset',
+                        label: 'Tube',
+                        type: 'select',
+                        visibleWhen: isPowerShotInfraredMode,
+                        options: maxjsFx.getPowerShotInfraredPresets().map((preset) => ({
+                            value: preset.key,
+                            label: preset.label,
                         })),
                     },
                     { key: 'amount', label: 'Amount', min: 0, max: 1, step: 0.01, realtime: true },
@@ -13073,8 +13176,8 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     { key: 'filmWeave', label: 'Gate Weave', min: 0, max: 2, step: 0.01, realtime: true, visibleWhen: isPowerShotFilmMode },
                     { key: 'filmFlicker', label: 'Flicker', min: 0, max: 1, step: 0.01, realtime: true, visibleWhen: isPowerShotFilmMode },
                     { key: 'filmNegative', label: 'Show Negative', type: 'checkbox', visibleWhen: isPowerShotFilmMode },
-                    { key: 'brightness', label: 'Brightness', min: -1, max: 1, step: 0.01, realtime: true, visibleWhen: (values) => !isPowerShotFilmMode(values) },
-                    { key: 'contrast', label: 'Contrast', min: -1, max: 1, step: 0.01, realtime: true, visibleWhen: (values) => !isPowerShotFilmMode(values) },
+                    { key: 'brightness', label: 'Brightness', min: -1, max: 1, step: 0.01, realtime: true, visibleWhen: (values) => !isPowerShotFilmMode(values) && !isPowerShotInfraredMode(values) },
+                    { key: 'contrast', label: 'Contrast', min: -1, max: 1, step: 0.01, realtime: true, visibleWhen: (values) => !isPowerShotFilmMode(values) && !isPowerShotInfraredMode(values) },
                     { key: 'analogStrength', label: 'VHS Strength', min: 0, max: 3, step: 0.01, realtime: true, affectsVisibility: true, visibleWhen: isPowerShotAnalogMode },
                     { key: 'analogTracking', label: 'Tracking', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotAnalogActive },
                     { key: 'analogChromaBleed', label: 'Chroma Bleed', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotAnalogActive },
@@ -13085,6 +13188,15 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     { key: 'analogDropouts', label: 'Dropouts', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotAnalogActive },
                     { key: 'analogScanlines', label: 'Scanlines', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotAnalogActive },
                     { key: 'analogHeadSwitch', label: 'Head Switch', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotAnalogActive },
+                    { key: 'irExposure', label: 'Exposure (stops)', min: -3, max: 4, step: 0.05, realtime: true, visibleWhen: isPowerShotInfraredMode },
+                    { key: 'irResponse', label: 'IR Response', min: 0, max: 1, step: 0.01, realtime: true, visibleWhen: isPowerShotInfraredMode },
+                    { key: 'irLocalGain', label: 'Local Gain', min: 0, max: 1.5, step: 0.01, realtime: true, visibleWhen: isPowerShotInfraredMode },
+                    { key: 'irGlow', label: 'Green Bloom', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotInfraredMode },
+                    { key: 'irGlowThreshold', label: 'Bloom Threshold', min: 0, max: 1, step: 0.01, realtime: true, visibleWhen: isPowerShotInfraredMode },
+                    { key: 'irEyes', label: 'Eye Flare', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotInfraredMode },
+                    { key: 'irNoise', label: 'Sensor Noise', min: 0, max: 3, step: 0.01, realtime: true, affectsVisibility: true, visibleWhen: isPowerShotInfraredMode },
+                    { key: 'irVignette', label: 'Tube Vignette', min: 0, max: 1, step: 0.01, realtime: true, visibleWhen: isPowerShotInfraredMode },
+                    { key: 'irHotspot', label: 'Hotspot', min: 0, max: 1, step: 0.01, realtime: true, visibleWhen: isPowerShotInfraredMode },
                     { key: 'freezeNoise', label: 'Freeze Noise', type: 'checkbox', visibleWhen: isPowerShotTemporalNoiseActive },
                 ],
             },

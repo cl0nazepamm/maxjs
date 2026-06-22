@@ -307,9 +307,41 @@ function buildInstanceGeometry(grp, buffer) {
     return geom;
 }
 
-function addInstanceGeometryGroups(geom, groups) {
-    if (!geom || !Array.isArray(groups)) return;
-    for (const [start, count, idx] of groups) geom.addGroup(start, count, idx);
+function applyInstanceGeometryGroups(geom, groups) {
+    if (!geom || !Array.isArray(groups)) return false;
+    geom.clearGroups();
+    for (const group of groups) {
+        if (!Array.isArray(group) || group.length < 3) continue;
+        geom.addGroup(group[0], group[1], group[2]);
+    }
+    return true;
+}
+
+function instanceGeometryGroupsMatch(geom, groups) {
+    if (!geom || !Array.isArray(groups)) return false;
+    const current = Array.isArray(geom.groups) ? geom.groups : [];
+    if (current.length !== groups.length) return false;
+    for (let i = 0; i < groups.length; i++) {
+        const group = groups[i];
+        if (!Array.isArray(group) || group.length < 3) return false;
+        const currentGroup = current[i];
+        if (!currentGroup ||
+            currentGroup.start !== group[0] ||
+            currentGroup.count !== group[1] ||
+            currentGroup.materialIndex !== group[2]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+function resolveInstancedNodeGeometry(nd, sourceGeometry, { cloneForJsmod = false } = {}) {
+    if (!sourceGeometry) return null;
+    if (!Array.isArray(nd?.groups)) return cloneForJsmod ? sourceGeometry.clone() : sourceGeometry;
+    if (!cloneForJsmod && instanceGeometryGroupsMatch(sourceGeometry, nd.groups)) return sourceGeometry;
+    const geom = sourceGeometry.clone();
+    applyInstanceGeometryGroups(geom, nd.groups);
+    return geom;
 }
 
 function getInstanceTransformPayload(grp, buffer) {
@@ -476,7 +508,7 @@ function buildInstanceMaterial(grp, geom, ctx, hooks) {
     }
 
     if (Array.isArray(grp?.mats) && Array.isArray(grp?.groups)) {
-        addInstanceGeometryGroups(geom, grp.groups);
+        applyInstanceGeometryGroups(geom, grp.groups);
         return grp.mats.map((materialDescriptor, materialIndex) =>
             hooks.instanceMaterialBuilder({
                 grp,
@@ -650,20 +682,17 @@ export async function applySceneBin({ buffer, meta, ctx, hooks: userHooks = {}, 
         let geom = mesh?.geometry;
         if (nd.instOf && !nd.geo) {
             const srcGeom = geoByHandle.get(nd.instOf) || instSrcMesh?.geometry;
-            if (srcGeom) geom = jsmodFlag ? srcGeom.clone() : srcGeom;
+            if (srcGeom) geom = resolveInstancedNodeGeometry(nd, srcGeom, { cloneForJsmod: jsmodFlag });
         } else if (nd.geo && !jsmodSkipGeo) {
             const built = geometryFromNodeBinary(nd, buffer);
             if (!built) continue;
             geom = built;
             hooks.setVertexColors(geom, nd.geo.vc, buffer);
-            if (nd.groups) {
-                for (const [start, count, idx] of nd.groups) geom.addGroup(start, count, idx);
-            }
+            applyInstanceGeometryGroups(geom, nd.groups);
             if (nd.skin && !nd.spline) attachSkinAttributes(geom, nd, buffer);
             if (!nd.spline) attachMorphAttributes(geom, nd, buffer);
         } else if (geom && nd.groups) {
-            geom.clearGroups();
-            for (const [start, count, idx] of nd.groups) geom.addGroup(start, count, idx);
+            applyInstanceGeometryGroups(geom, nd.groups);
         }
 
         if (geom) geoByHandle.set(nd.h, geom);

@@ -9,6 +9,7 @@ import * as THREE from 'three';
 import { Pipeline as PowerShotPipeline, applyPreset as applyPowerShotPreset, STAGE_DEFS as POWERSHOT_STAGE_DEFS } from '../../powershot_pipeline.js';
 import { PRESETS as POWERSHOT_PRESETS, PRESET_KEYS as POWERSHOT_PRESET_KEYS } from '../../powershot_presets.js';
 import { FilmPipeline as PowerShotFilmPipeline, applyFilmPreset as applyPowerShotFilmPreset, FILM_PRESETS as POWERSHOT_FILM_PRESETS, FILM_PRESET_KEYS as POWERSHOT_FILM_PRESET_KEYS } from '../../powershot_film.js';
+import { InfraredPipeline as PowerShotInfraredPipeline, applyInfraredPreset as applyPowerShotInfraredPreset, INFRARED_PRESETS as POWERSHOT_INFRARED_PRESETS, INFRARED_PRESET_KEYS as POWERSHOT_INFRARED_PRESET_KEYS } from '../../powershot_infrared.js';
 
 function finiteOr(value, fallback) {
     return Number.isFinite(value) ? value : fallback;
@@ -69,6 +70,36 @@ export function listPowerShotFilmStocks() {
     }));
 }
 
+export function normalizePowerShotInfraredPreset(value) {
+    const key = String(value || POWERSHOT_INFRARED_PRESET_KEYS[0]);
+    return POWERSHOT_INFRARED_PRESETS[key] ? key : POWERSHOT_INFRARED_PRESET_KEYS[0];
+}
+
+// Flat UI trims pulled from a preset; the full preset (phosphor colours, curves,
+// gain limits, etc.) is applied wholesale in syncInfraredPipeline, then these
+// user-facing knobs are layered on top.
+export function powerShotInfraredPresetUiDefaults(key) {
+    const preset = POWERSHOT_INFRARED_PRESETS[normalizePowerShotInfraredPreset(key)];
+    return {
+        irExposure: preset.exposure ?? 1.25,
+        irResponse: preset.nir_input ?? 0,
+        irLocalGain: preset.local_gain ?? 0.48,
+        irGlow: preset.glow_strength ?? 0.92,
+        irGlowThreshold: preset.glow_threshold ?? 0.43,
+        irEyes: preset.eye_strength ?? 1.15,
+        irNoise: preset.noise_amount ?? 1.0,
+        irVignette: preset.vignette ?? 0.52,
+        irHotspot: preset.hotspot ?? 0.12,
+    };
+}
+
+export function listPowerShotInfraredPresets() {
+    return POWERSHOT_INFRARED_PRESET_KEYS.map((key) => ({
+        key,
+        label: POWERSHOT_INFRARED_PRESETS[key]?.name || key,
+    }));
+}
+
 export function powerShotPresetUiDefaults(key) {
     const preset = POWERSHOT_PRESETS[normalizePowerShotPreset(key)] || POWERSHOT_PRESETS.powershot;
     return {
@@ -117,6 +148,7 @@ export function createPowerShotFinal({
     let powerShotInputTarget = null;
     let powerShotPipeline = null;
     let filmPipeline = null;
+    let infraredPipeline = null;
     let powerShotFrame = 0;
     const drawBufferSize = new THREE.Vector2();
 
@@ -129,7 +161,10 @@ export function createPowerShotFinal({
 
     function normalizeOptions() {
         const p = getOptions();
-        p.mode = p.mode === 'analog' ? 'analog' : p.mode === 'film' ? 'film' : 'digital';
+        p.mode = p.mode === 'analog' ? 'analog'
+            : p.mode === 'film' ? 'film'
+            : p.mode === 'infrared' ? 'infrared'
+            : 'digital';
         p.amount = THREE.MathUtils.clamp(finiteOr(p.amount, 1.0), 0, 1);
         p.resolutionScale = THREE.MathUtils.clamp(finiteOr(p.resolutionScale, 0.75), 0.1, 1);
         p.lensSoftness = THREE.MathUtils.clamp(finiteOr(p.lensSoftness, 0.32), 0, 1);
@@ -168,6 +203,16 @@ export function createPowerShotFinal({
         p.filmWeave = THREE.MathUtils.clamp(finiteOr(p.filmWeave, 0.4), 0, 2);
         p.filmFlicker = THREE.MathUtils.clamp(finiteOr(p.filmFlicker, 0.12), 0, 1);
         p.filmNegative = !!p.filmNegative;
+        p.infraredPreset = normalizePowerShotInfraredPreset(p.infraredPreset);
+        p.irExposure = THREE.MathUtils.clamp(finiteOr(p.irExposure, 1.25), -3, 4);
+        p.irResponse = THREE.MathUtils.clamp(finiteOr(p.irResponse, 0), 0, 1);
+        p.irLocalGain = THREE.MathUtils.clamp(finiteOr(p.irLocalGain, 0.48), 0, 1.5);
+        p.irGlow = THREE.MathUtils.clamp(finiteOr(p.irGlow, 0.92), 0, 3);
+        p.irGlowThreshold = THREE.MathUtils.clamp(finiteOr(p.irGlowThreshold, 0.43), 0, 1);
+        p.irEyes = THREE.MathUtils.clamp(finiteOr(p.irEyes, 1.15), 0, 3);
+        p.irNoise = THREE.MathUtils.clamp(finiteOr(p.irNoise, 1.0), 0, 3);
+        p.irVignette = THREE.MathUtils.clamp(finiteOr(p.irVignette, 0.52), 0, 1);
+        p.irHotspot = THREE.MathUtils.clamp(finiteOr(p.irHotspot, 0.12), 0, 1);
         return p;
     }
 
@@ -211,8 +256,31 @@ export function createPowerShotFinal({
         filmPipeline.setEnabled?.('halation', p.filmHalation > 1.0e-6);
     }
 
+    function syncInfraredPipeline() {
+        if (!infraredPipeline) return;
+        const p = normalizeOptions();
+        const presetKey = normalizePowerShotInfraredPreset(p.infraredPreset);
+        const preset = POWERSHOT_INFRARED_PRESETS[presetKey];
+        p.infraredPreset = presetKey;
+        // full preset first (phosphor colours, gain curve, noise character),
+        // then the user-facing trims from state on top
+        applyPowerShotInfraredPreset(infraredPipeline.ctx, preset);
+        infraredPipeline.ctx.power.value = THREE.MathUtils.clamp(p.amount, 0, 1);
+        const I = infraredPipeline.ctx.P;
+        I.exposure.value = p.irExposure;
+        I.nirInput.value = p.irResponse;
+        I.localGain.value = p.irLocalGain;
+        I.glowStrength.value = p.irGlow;
+        I.glowThreshold.value = p.irGlowThreshold;
+        I.eyeStrength.value = p.irEyes;
+        I.noiseAmount.value = p.irNoise;
+        I.vignette.value = p.irVignette;
+        I.hotspot.value = p.irHotspot;
+    }
+
     function syncPipeline() {
         syncFilmPipeline();
+        syncInfraredPipeline();
         if (!powerShotPipeline) return;
         const p = normalizeOptions();
         const presetKey = normalizePowerShotPreset(p.preset);
@@ -288,10 +356,20 @@ export function createPowerShotFinal({
         return filmPipeline;
     }
 
-    // film mode runs its own negative->print pipeline; digital/analog share
-    // the classic ISP runner. Both expose renderTexture(tex, frame, opts).
+    function ensureInfraredPipeline() {
+        if (!infraredPipeline) infraredPipeline = new PowerShotInfraredPipeline(renderer);
+        syncInfraredPipeline();
+        return infraredPipeline;
+    }
+
+    // film mode runs its own negative->print pipeline and infrared runs the
+    // pseudo-NIR night-vision pipeline; digital/analog share the classic ISP
+    // runner. All expose renderTexture(tex, frame, opts) / setSize(w, h).
     function ensureActivePipeline() {
-        return normalizeOptions().mode === 'film' ? ensureFilmPipeline() : ensurePipeline();
+        const mode = normalizeOptions().mode;
+        if (mode === 'film') return ensureFilmPipeline();
+        if (mode === 'infrared') return ensureInfraredPipeline();
+        return ensurePipeline();
     }
 
     function ensureInputTarget() {
@@ -371,7 +449,7 @@ export function createPowerShotFinal({
         normalizeOptions,
         syncPipeline,
         renderFinal,
-        hasPipeline: () => !!powerShotPipeline || !!filmPipeline,
+        hasPipeline: () => !!powerShotPipeline || !!filmPipeline || !!infraredPipeline,
         dispose() {
             try { powerShotInputTarget?.dispose?.(); } catch (_) {}
             powerShotInputTarget = null;
@@ -379,6 +457,8 @@ export function createPowerShotFinal({
             powerShotPipeline = null;
             try { filmPipeline?.dispose?.(); } catch (_) {}
             filmPipeline = null;
+            try { infraredPipeline?.dispose?.(); } catch (_) {}
+            infraredPipeline = null;
         },
     };
 }

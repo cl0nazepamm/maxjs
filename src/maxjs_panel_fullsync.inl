@@ -220,6 +220,19 @@
                 }
             }
 
+            // A multi/sub-object node with no cached face groups would fall through
+            // to the single-material emit in the skip-extract branch below and
+            // collapse every face onto slot 0 ("instanced objects lose their
+            // material IDs"). A material-structure delta can drop groupCache_ while
+            // the geometry still hashes as unchanged (geoHashMap_/bbox repopulated
+            // by a later geometry tick before this full sync runs), so the test
+            // above can't see the gap. Force a re-extract for that case so the face
+            // groups are recomputed instead of silently downgrading to one material.
+            if (skipExtract && !groupCache_.count(handle)) {
+                Mtl* multiMtl = FindMultiSubMtl(node->GetMtl());
+                if (multiMtl && multiMtl->NumSubMtls() > 0) skipExtract = false;
+            }
+
             if (skipExtract) {
                 // Geometry unchanged — send node with transform + material, no geometry data.
                 // JS side keeps existing BufferGeometry when v/i fields are absent.

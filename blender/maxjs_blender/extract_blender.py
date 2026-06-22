@@ -281,8 +281,23 @@ def _light_to_ir(obj, handle):
 
 
 # ─────────────────────────── camera ──────────────────────────────────────
-def _camera_to_ir(scene):
-    cam = scene.camera
+def _scene_camera_object(scene):
+    cam = getattr(scene, "camera", None)
+    if cam is not None:
+        return cam
+    try:
+        named = scene.objects.get("Camera")
+    except Exception:
+        named = None
+    if named is not None and getattr(named, "type", None) == "CAMERA":
+        return named
+    for obj in scene.objects:
+        if getattr(obj, "type", None) == "CAMERA":
+            return obj
+    return None
+
+
+def _camera_object_to_ir(cam):
     if cam is None:
         return None
     m = cam.matrix_world
@@ -302,6 +317,99 @@ def _camera_to_ir(scene):
         "fov": math.degrees(cam.data.angle_x),
         "persp": cam.data.type == "PERSP",
         "viewWidth": float(cam.data.ortho_scale) if cam.data.type == "ORTHO" else 0.0,
+    }
+
+
+def _camera_to_ir(scene):
+    return _camera_object_to_ir(_scene_camera_object(scene))
+
+
+def _scene_cameras_to_ir(scene, handle_map):
+    cameras = []
+    for obj in scene.objects:
+        if getattr(obj, "type", None) != "CAMERA":
+            continue
+        handle = handle_map.get(obj.name)
+        if not handle:
+            continue
+        cameras.append({"h": int(handle), "n": obj.name})
+    return cameras
+
+
+def _viewport_space_from_context(context=None, preferred_space=None):
+    if preferred_space is not None:
+        try:
+            if preferred_space.type == "VIEW_3D" and preferred_space.region_3d is not None:
+                return preferred_space
+        except ReferenceError:
+            pass
+        except Exception:
+            pass
+
+    if context is not None:
+        space = getattr(context, "space_data", None)
+        if getattr(space, "type", None) == "VIEW_3D" and getattr(space, "region_3d", None) is not None:
+            return space
+
+    wm = getattr(bpy.context, "window_manager", None)
+    for window in getattr(wm, "windows", []) or []:
+        screen = getattr(window, "screen", None)
+        for area in getattr(screen, "areas", []) or []:
+            if getattr(area, "type", None) != "VIEW_3D":
+                continue
+            for space in area.spaces:
+                if getattr(space, "type", None) == "VIEW_3D" and getattr(space, "region_3d", None) is not None:
+                    return space
+    return None
+
+
+def _viewport_camera_to_ir(context=None, preferred_space=None, scene=None):
+    space = _viewport_space_from_context(context, preferred_space)
+    if space is None:
+        return None
+    rv3d = getattr(space, "region_3d", None)
+    if rv3d is None:
+        return None
+
+    active_scene = scene or getattr(context, "scene", None) or getattr(bpy.context, "scene", None)
+    if getattr(rv3d, "view_perspective", "") == "CAMERA" and active_scene is not None:
+        cam = _camera_to_ir(active_scene)
+        if cam is not None:
+            return cam
+
+    rot = rv3d.view_rotation
+    loc = rv3d.view_location
+    dist = max(0.01, float(getattr(rv3d, "view_distance", 10.0) or 10.0))
+    forward = (rot @ mathutils.Vector((0, 0, -1))).normalized()
+    up = (rot @ mathutils.Vector((0, 1, 0))).normalized()
+    pos = loc + (rot @ mathutils.Vector((0, 0, dist)))
+    tgt = loc
+    if (tgt - pos).length < 1.0e-6:
+        tgt = pos + forward * max(1.0, dist)
+
+    lens = max(1.0e-3, float(getattr(space, "lens", 50.0) or 50.0))
+    sensor_width = 36.0
+    fov = math.degrees(2.0 * math.atan(sensor_width / (2.0 * lens)))
+    persp = bool(getattr(rv3d, "is_perspective", True)) and getattr(rv3d, "view_perspective", "") != "ORTHO"
+
+    view_width = 0.0
+    if not persp:
+        try:
+            proj_x = float(rv3d.window_matrix[0][0])
+            if abs(proj_x) > 1.0e-8:
+                view_width = abs(2.0 / proj_x)
+        except Exception:
+            view_width = 0.0
+        if view_width <= 0.0:
+            view_width = max(0.001, dist * 2.0)
+
+    return {
+        "pos": [pos.x, pos.y, pos.z],
+        "tgt": [tgt.x, tgt.y, tgt.z],
+        "up": [up.x, up.y, up.z],
+        "fov": fov,
+        "persp": persp,
+        "viewWidth": view_width,
     }
 
 
@@ -366,6 +474,8 @@ def extract_scene(context, backend="WebGL"):
         "toneMapping": tone,
         "exposure": exposure,
         "fps": int(round(scene.render.fps / fps_base)),
+        "sceneCameras": _scene_cameras_to_ir(scene, handle),
+        "lockedCamera": 0,
         # Same name→handle map the snapshot used; the live pump reuses it so the
         # browser's nodeMap resolves every delta command.
         "handle_map": dict(handle),

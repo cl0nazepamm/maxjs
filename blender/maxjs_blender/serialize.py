@@ -76,11 +76,12 @@ def _minmax(seq):
     return float(min(seq)), float(max(seq))
 
 
-def _append_geo(buf, mesh):
+def _append_geo(buf, mesh, *, adaptive=True):
     """Append a node's geometry to the shared buffer; return its `geo` descriptor.
 
-    Block order v→i→uv→uv2→n and adaptive element types exactly mirror
-    src/maxjs_panel_snapshot_export.inl / src/maxjs_main.cpp.
+    Block order v→i→uv→uv2→n mirrors the native producers. Static snapshot
+    export uses the adaptive scene.bin contract; live IPR fullsync keeps the
+    Max viewer's float32/int32 channel layout so geo_fast can patch it in place.
     """
     pos = mesh["positions"]
     idx = mesh["indices"]
@@ -95,9 +96,9 @@ def _append_geo(buf, mesh):
     geo["vN"] = _len(pos)
     buf += contract.pack_f32(pos)
 
-    # indices — u16 if every index fits, else int32
+    # indices — snapshot export may pack to u16; live IPR fullsync stays int32.
     imin, imax = _minmax(idx)
-    itype = contract.index_type(int(imin), int(imax), _len(idx))
+    itype = contract.index_type(int(imin), int(imax), _len(idx)) if adaptive else ""
     _align(buf, contract.ALIGN["u16"] if itype == "u16" else contract.ALIGN["i32"])
     geo["iOff"] = len(buf)
     geo["iN"] = _len(idx)
@@ -107,10 +108,10 @@ def _append_geo(buf, mesh):
     else:
         buf += contract.pack_i32(idx)
 
-    # uvs — u16n if all in [0,1], else f32
+    # uvs — snapshot export may pack to u16n; live IPR fullsync stays f32.
     if uv is not None and _len(uv):
         umin, umax = _minmax(uv)
-        utype = contract.uv_type(umin, umax, _len(uv))
+        utype = contract.uv_type(umin, umax, _len(uv)) if adaptive else ""
         _align(buf, contract.ALIGN["u16n"] if utype == "u16n" else contract.ALIGN["f32"])
         geo["uvOff"] = len(buf)
         geo["uvN"] = _len(uv)
@@ -120,10 +121,10 @@ def _append_geo(buf, mesh):
         else:
             buf += contract.pack_f32(uv)
 
-    # uv2 — same adaptive packing as the first UV channel.
+    # uv2 — same packing choice as the first UV channel.
     if uv2 is not None and _len(uv2):
         umin, umax = _minmax(uv2)
-        utype = contract.uv_type(umin, umax, _len(uv2))
+        utype = contract.uv_type(umin, umax, _len(uv2)) if adaptive else ""
         _align(buf, contract.ALIGN["u16n"] if utype == "u16n" else contract.ALIGN["f32"])
         geo["uv2Off"] = len(buf)
         geo["uv2N"] = _len(uv2)
@@ -133,10 +134,10 @@ def _append_geo(buf, mesh):
         else:
             buf += contract.pack_f32(uv2)
 
-    # normals — i16n if all in [-1,1], else f32
+    # normals — snapshot export may pack to i16n; live IPR fullsync stays f32.
     if nrm is not None and _len(nrm):
         nmin, nmax = _minmax(nrm)
-        ntype = contract.normal_type(nmin, nmax, _len(nrm))
+        ntype = contract.normal_type(nmin, nmax, _len(nrm)) if adaptive else ""
         _align(buf, contract.ALIGN["i16n"] if ntype == "i16n" else contract.ALIGN["f32"])
         geo["nOff"] = len(buf)
         geo["nN"] = _len(nrm)
@@ -147,6 +148,55 @@ def _append_geo(buf, mesh):
             buf += contract.pack_f32(nrm)
 
     return geo
+
+
+def build_geo_fast_update(handle, mesh, *, materials=None, jsmod=False, spline=False):
+    """Build the Max live `geo_fast` shared-buffer packet for one changed mesh.
+
+    This is the binary path from src/maxjs_panel_sync.inl: float32 vertices,
+    int32 indices, float32 UVs, float32 normals, plus optional material groups.
+    """
+    buf = bytearray()
+    meta = {"type": "geo_fast", "h": int(handle), "jsmod": bool(jsmod)}
+    if spline:
+        meta["spline"] = True
+
+    pos = mesh["positions"]
+    idx = mesh["indices"]
+    uv = mesh.get("uvs")
+    nrm = mesh.get("normals")
+
+    _align(buf, 4)
+    meta["vOff"] = len(buf)
+    meta["vN"] = _len(pos)
+    buf += contract.pack_f32(pos)
+
+    _align(buf, 4)
+    meta["iOff"] = len(buf)
+    meta["iN"] = _len(idx)
+    buf += contract.pack_i32(idx)
+
+    if uv is not None and _len(uv):
+        _align(buf, 4)
+        meta["uvOff"] = len(buf)
+        meta["uvN"] = _len(uv)
+        buf += contract.pack_f32(uv)
+
+    if nrm is not None and _len(nrm):
+        _align(buf, 4)
+        meta["nOff"] = len(buf)
+        meta["nN"] = _len(nrm)
+        buf += contract.pack_f32(nrm)
+
+    groups = mesh.get("groups") or []
+    if groups:
+        meta["groups"] = [[int(a), int(b), int(c)] for a, b, c in groups]
+        if materials:
+            meta["mats"] = [mat or DEFAULT_MATERIAL for mat in materials]
+
+    if len(buf) == 0:
+        buf = bytearray(4)
+    return meta, bytes(buf)
 
 
 class _MaterialLibrary:
@@ -243,7 +293,7 @@ def _runtime_features(scene, snapshot):
     }
 
 
-def build_snapshot(scene):
+def build_snapshot(scene, *, adaptive_geometry=True):
     """Return (snapshot_dict, scene_bin_bytes) from a neutral scene IR."""
     buf = bytearray()
     lib = _MaterialLibrary()
@@ -267,7 +317,7 @@ def build_snapshot(scene):
         j["props"] = dict(DEFAULT_PROPS)
         j["vis"] = 1 if nd.get("visible", True) else 0
         j["t"] = [float(x) for x in nd["matrix"]]
-        j["geo"] = _append_geo(buf, mesh)
+        j["geo"] = _append_geo(buf, mesh, adaptive=adaptive_geometry)
         groups = mesh.get("groups") or []
         materials = nd.get("materials") or []
         if groups and materials:
@@ -296,6 +346,8 @@ def build_snapshot(scene):
         },
         "env": {"enabled": False, "type": "none"},
         "fog": {"active": False, "type": "none"},
+        "sceneCameras": scene.get("sceneCameras", []),
+        "lockedCamera": int(scene.get("lockedCamera", 0) or 0),
         "lights": scene.get("lights", []),
         "splats": [], "audios": [], "gltfs": [], "webapps": [],
         "snapshotUi": _snapshot_ui(scene, camera),
@@ -304,11 +356,11 @@ def build_snapshot(scene):
     return snap, bytes(buf)
 
 
-def write_snapshot(out_dir, scene):
+def write_snapshot(out_dir, scene, *, adaptive_geometry=True):
     """Build and write snapshot.json + scene.bin into out_dir. Returns a stats dict."""
     import os
     os.makedirs(out_dir, exist_ok=True)
-    snap, binary = build_snapshot(scene)
+    snap, binary = build_snapshot(scene, adaptive_geometry=adaptive_geometry)
     with open(os.path.join(out_dir, contract.BIN_NAME), "wb") as f:
         f.write(binary)
     with open(os.path.join(out_dir, "snapshot.json"), "w", encoding="utf-8") as f:

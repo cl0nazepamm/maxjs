@@ -110,6 +110,70 @@ class TranslationContractTests(unittest.TestCase):
         self.assertEqual(snap["runtimeFeatures"]["stats"]["materials"], 2)
         self.assertEqual(snap["runtimeFeatures"]["stats"]["lights"], 1)
 
+    def test_live_ipr_scene_bin_uses_max_fullsync_channel_layout(self):
+        scene = {
+            "nodes": [
+                {
+                    "handle": 10,
+                    "name": "LiveMesh",
+                    "matrix": IDENTITY,
+                    "visible": True,
+                    "mesh": {
+                        "positions": [0, 0, 0, 1, 0, 0, 0, 1, 0],
+                        "indices": [0, 1, 2],
+                        "uvs": [0, 0, 0.5, 0, 0, 0.5],
+                        "normals": [0, 0, 1, 0, 0, 1, 0, 0, 1],
+                    },
+                    "material": material("Mat"),
+                }
+            ],
+        }
+        snap, _binary = serialize.build_snapshot(scene, adaptive_geometry=False)
+        geo = snap["nodes"][0]["geo"]
+
+        self.assertNotIn("iType", geo)
+        self.assertNotIn("uvType", geo)
+        self.assertNotIn("nType", geo)
+
+    def test_geo_fast_packet_matches_live_binary_contract(self):
+        mesh = {
+            "positions": [0, 0, 0, 1, 0, 0, 0, 1, 0],
+            "indices": [0, 1, 2],
+            "uvs": [0, 0, 1, 0, 0, 1],
+            "normals": [0, 0, 1, 0, 0, 1, 0, 0, 1],
+            "groups": [[0, 3, 0]],
+        }
+        meta, blob = serialize.build_geo_fast_update(
+            42,
+            mesh,
+            materials=[material("Slot")],
+        )
+
+        self.assertEqual(meta["type"], "geo_fast")
+        self.assertEqual(meta["h"], 42)
+        self.assertEqual(meta["vOff"], 0)
+        self.assertEqual(meta["vN"], 9)
+        self.assertEqual(meta["iOff"], 36)
+        self.assertEqual(meta["iN"], 3)
+        self.assertEqual(meta["uvOff"], 48)
+        self.assertEqual(meta["uvN"], 6)
+        self.assertEqual(meta["nOff"], 72)
+        self.assertEqual(meta["nN"], 9)
+        self.assertEqual(meta["groups"], [[0, 3, 0]])
+        self.assertEqual(len(meta["mats"]), 1)
+        self.assertEqual(len(blob), 108)
+
+    def test_scene_camera_list_matches_max_metadata_shape(self):
+        scene = {
+            "nodes": [],
+            "sceneCameras": [{"h": 7, "n": "Camera"}],
+            "lockedCamera": 0,
+        }
+        snap, _binary = serialize.build_snapshot(scene)
+
+        self.assertEqual(snap["sceneCameras"], [{"h": 7, "n": "Camera"}])
+        self.assertEqual(snap["lockedCamera"], 0)
+
     def test_write_snapshot_outputs_valid_shared_runtime_files(self):
         scene = {
             "nodes": [],

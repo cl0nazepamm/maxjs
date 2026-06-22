@@ -71,6 +71,17 @@
                 console.error("[maxjs shim] delta apply failed", e);
             }
         };
+        es.addEventListener("sharedbuffer", (ev) => {
+            try {
+                const payload = JSON.parse(ev.data);
+                dispatchShared(b64ToArrayBuffer(payload.data), payload.meta);
+                frames++;
+                const kind = payload?.meta?.type || "buffer";
+                badge("max.js IPR ● live · " + frames + " frames · " + kind, true);
+            } catch (e) {
+                console.error("[maxjs shim] shared buffer apply failed", e);
+            }
+        });
         es.onopen = () => badge("max.js IPR ● live", true);
         es.onerror = () => badge("max.js IPR ○ reconnecting…", false);
     }
@@ -86,9 +97,18 @@
         },
         postMessage(msg) {
             // index.html → host. The only one we must honor is the readiness
-            // handshake; every other host call (gpu_normals, path-tracing state,
-            // snapshot export, file dialogs…) is safe to ignore in the browser.
+            // handshake and camera lock. Other host calls (gpu_normals,
+            // path-tracing state, snapshot export, file dialogs…) are safe to
+            // ignore in the browser.
             if (msg && msg.type === "ready") bootScene();
+            if (msg && msg.type === "lock_camera") {
+                fetch("/maxjs/host", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify(msg),
+                    cache: "no-store",
+                }).catch((e) => console.warn("[maxjs shim] lock_camera failed", e));
+            }
         },
         postMessageWithAdditionalObjects() {},
         releaseBuffer() {},

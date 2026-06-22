@@ -143,13 +143,12 @@ triangulated, corner-deduped), object hierarchy via parent handles, Principled
 BSDF materials, point/spot/sun/area lights with the right photometric units, the
 active camera — **plus live IPR in the real max.js editor** (WebGPU, full post-FX):
 event-driven (depsgraph) MXJB transform / visibility / material-scalar / light
-deltas pushed over SSE and applied by the editor's native handlers.
+deltas, Max-style `geo_fast` mesh updates, and camera mode driven by the max.js
+IPR camera dropdown (`Viewport` = Blender 3D View, camera entries = Blender
+camera objects).
 
 **Next:** forward post-FX / exposure state into the editor from the shim (match
-the look automatically); drive the editor camera from the Blender *viewport*
-(region_3d) so navigating in Blender moves the preview; multi-material (`groups`
-+ `matRefs`); texture maps; live *geometry* topology updates (re-stream
-`scene.bin` / `geo_fast` on mesh edits); add/remove of objects mid-session
+the look automatically); texture maps; add/remove of objects mid-session
 (handles are currently fixed at IPR start).
 
 **Out of scope (matches max.js):** WebXR; effects that depend on CPU project

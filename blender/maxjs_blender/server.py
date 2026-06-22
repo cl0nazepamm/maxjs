@@ -12,6 +12,7 @@
 
 import base64
 import http.server
+import json
 import os
 import posixpath
 import queue
@@ -21,6 +22,7 @@ import urllib.parse
 
 _CONF = {"web_root": None, "export_dir": None, "ipr": False}
 _SERVER = {"httpd": None, "thread": None, "port": None}
+_STATE = {"locked_camera": 0, "lock": threading.Lock()}
 
 # Cursor-based delta ring — fallback for the poll endpoint. `base` = number of
 # frames dropped; frames[0] has absolute index `base`.
@@ -52,6 +54,22 @@ def push_delta(frame_bytes):
             _DELTA["base"] += overflow
 
 
+def push_shared_buffer(meta, buffer_bytes):
+    """Fan out a WebView2-style sharedbufferreceived payload over SSE.
+
+    Delta frames stay on the default message event for legacy clients; generic
+    shared-buffer packets use a named event that the editor shim turns back into
+    chrome.webview.sharedbufferreceived.
+    """
+    item = ("sharedbuffer", dict(meta), bytes(buffer_bytes))
+    with _CLIENTS_LOCK:
+        for q in _CLIENTS:
+            try:
+                q.put_nowait(item)
+            except queue.Full:
+                pass
+
+
 def _take_delta(since):
     with _DELTA["lock"]:
         base = _DELTA["base"]
@@ -69,6 +87,20 @@ def clear_delta():
 
 def set_ipr(enabled):
     _CONF["ipr"] = bool(enabled)
+
+
+def set_locked_camera(handle):
+    try:
+        handle = int(handle)
+    except Exception:
+        handle = 0
+    with _STATE["lock"]:
+        _STATE["locked_camera"] = max(0, handle)
+
+
+def get_locked_camera():
+    with _STATE["lock"]:
+        return int(_STATE["locked_camera"])
 
 
 def _safe_relpath(path):
@@ -110,6 +142,31 @@ class _OverlayHandler(http.server.SimpleHTTPRequestHandler):
                 return self._serve_html_injected(fs)
         return super().do_GET()
 
+    def do_POST(self):
+        path = self.path.split("?", 1)[0]
+        if path == "/maxjs/host":
+            return self._serve_host_message()
+        self.send_error(404)
+
+    def _serve_host_message(self):
+        try:
+            length = int(self.headers.get("Content-Length", "0") or "0")
+        except ValueError:
+            length = 0
+        try:
+            raw = self.rfile.read(max(0, min(length, 1024 * 1024)))
+            msg = json.loads(raw.decode("utf-8") or "{}")
+        except Exception:
+            msg = {}
+        if msg.get("type") == "lock_camera":
+            set_locked_camera(msg.get("handle", 0))
+        data = b'{"ok":true}'
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
     def _serve_stream(self):
         # Server-Sent Events: one long-lived HTTP/1.0 response we keep writing
         # to. Each MXJB frame is base64'd into a `data:` line. EventSource on the
@@ -132,7 +189,16 @@ class _OverlayHandler(http.server.SimpleHTTPRequestHandler):
                     self.wfile.write(b": ping\n\n")  # heartbeat / dead-peer probe
                     self.wfile.flush()
                     continue
-                self.wfile.write(b"data:" + base64.b64encode(frame) + b"\n\n")
+                if isinstance(frame, tuple) and len(frame) == 3 and frame[0] == "sharedbuffer":
+                    _event, meta, blob = frame
+                    payload = json.dumps({
+                        "meta": meta,
+                        "data": base64.b64encode(blob).decode("ascii"),
+                    }, separators=(",", ":")).encode("utf-8")
+                    self.wfile.write(b"event: sharedbuffer\n")
+                    self.wfile.write(b"data:" + payload + b"\n\n")
+                else:
+                    self.wfile.write(b"data:" + base64.b64encode(frame) + b"\n\n")
                 self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
             pass
@@ -225,3 +291,4 @@ def stop():
         finally:
             _SERVER.update(httpd=None, thread=None, port=None)
     clear_delta()
+    set_locked_camera(0)

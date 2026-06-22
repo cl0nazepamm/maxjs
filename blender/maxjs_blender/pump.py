@@ -10,10 +10,13 @@
 # so the browser's nodeMap resolves each command to the right object.
 
 try:
-    from . import contract, extract_blender
+    from . import contract, extract_blender, serialize
 except ImportError:
     import contract
     import extract_blender
+    import serialize
+
+import json
 
 
 def _round_seq(seq, ndigits):
@@ -28,6 +31,7 @@ class DeltaPump:
         self._vis = {}
         self._mat = {}
         self._light = {}
+        self._geo = {}
         self._cam = None
 
     # ── material scalar (base color / rough / metal / opacity) ──
@@ -50,6 +54,7 @@ class DeltaPump:
         """Prime caches from the current scene without emitting (the browser
         already has this state from the initial snapshot)."""
         self._build(context, seed=True)
+        self._build_geometry(context, seed=True)
 
     def build_frame(self, context, only_names=None):
         """Return MXJB frame bytes for what changed since last call, or None.
@@ -58,6 +63,88 @@ class DeltaPump:
         depsgraph flagged dirty — so an interactive edit costs O(changed), not
         O(scene)."""
         return self._build(context, seed=False, only_names=only_names)
+
+    def seed_camera(self, camera):
+        self._remember_camera(camera)
+
+    def build_camera_frame(self, camera):
+        if not self._remember_camera(camera):
+            return None
+        b = contract.DeltaFrameBuilder(self._frame)
+        b.begin_frame()
+        b.update_camera(camera["pos"], camera["tgt"], camera["up"], camera["fov"],
+                        camera["persp"], camera.get("viewWidth", 0.0))
+        b.end_frame()
+        self._frame += 1
+        return b.bytes()
+
+    def build_geometry_updates(self, context, only_names=None):
+        """Return [(meta, bytes), ...] geo_fast packets for changed meshes."""
+        return self._build_geometry(context, seed=False, only_names=only_names)
+
+    def _mesh_geo_packet(self, obj, depsgraph, handle):
+        mesh = extract_blender._extract_mesh(obj, depsgraph)
+        if mesh is None:
+            return None
+
+        material_slots = mesh.pop("material_slots", [0])
+        materials = None
+        if mesh.get("groups"):
+            materials = [
+                extract_blender._slot_material_to_pbr(obj, slot)
+                for slot in material_slots
+            ]
+
+        meta, blob = serialize.build_geo_fast_update(handle, mesh, materials=materials)
+        sig_meta = {
+            key: value for key, value in meta.items()
+            if key not in ("vOff", "iOff", "uvOff", "nOff")
+        }
+        sig = (
+            len(blob),
+            contract.hash_fnv1a(blob),
+            json.dumps(sig_meta, sort_keys=True, separators=(",", ":"), ensure_ascii=False),
+        )
+        return meta, blob, sig
+
+    def _build_geometry(self, context, seed, only_names=None):
+        depsgraph = context.evaluated_depsgraph_get()
+        updates = []
+
+        for o in context.scene.objects:
+            if only_names is not None and o.name not in only_names:
+                continue
+            if o.type not in extract_blender._MESHABLE:
+                continue
+            h = self.handle_map.get(o.name)
+            if not h:
+                continue
+
+            packet = self._mesh_geo_packet(o, depsgraph, h)
+            if packet is None:
+                continue
+            meta, blob, sig = packet
+            if self._geo.get(h) == sig:
+                continue
+            self._geo[h] = sig
+            if not seed:
+                updates.append((meta, blob))
+
+        return updates
+
+    def _camera_key(self, cam):
+        return (_round_seq(cam["pos"], 5), _round_seq(cam["tgt"], 5), _round_seq(cam["up"], 5),
+                round(cam["fov"], 4), bool(cam["persp"]),
+                round(float(cam.get("viewWidth", 0.0) or 0.0), 4))
+
+    def _remember_camera(self, cam):
+        if cam is None:
+            return False
+        ckey = self._camera_key(cam)
+        if self._cam == ckey:
+            return False
+        self._cam = ckey
+        return True
 
     def _build(self, context, seed, only_names=None):
         scene = context.scene
@@ -110,13 +197,11 @@ class DeltaPump:
                     if not seed:
                         b.update_light(h, rec); emitted += 1
 
-        cam_dirty = only_names is None or (scene.camera and scene.camera.name in only_names)
+        scene_camera = extract_blender._scene_camera_object(scene)
+        cam_dirty = only_names is None or (scene_camera and scene_camera.name in only_names)
         cam = extract_blender._camera_to_ir(scene) if cam_dirty else None
         if cam is not None:
-            ckey = (_round_seq(cam["pos"], 5), _round_seq(cam["tgt"], 5), _round_seq(cam["up"], 5),
-                    round(cam["fov"], 4), bool(cam["persp"]))
-            if self._cam != ckey:
-                self._cam = ckey
+            if self._remember_camera(cam):
                 if not seed:
                     b.update_camera(cam["pos"], cam["tgt"], cam["up"], cam["fov"],
                                     cam["persp"], cam.get("viewWidth", 0.0)); emitted += 1

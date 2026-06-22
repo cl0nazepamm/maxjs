@@ -22,12 +22,13 @@ import webbrowser
 import bpy
 
 try:
-    from . import extract_blender, serialize, server, pump
+    from . import camera_sync, extract_blender, live_ipr, serialize, server
 except ImportError:  # running the modules outside the package
+    import camera_sync
     import extract_blender
+    import live_ipr
     import serialize
     import server
-    import pump
 
 
 def _repo_web_root():
@@ -68,144 +69,6 @@ def _export(context, *, adaptive_geometry=True, camera_override=None):
     stats["out_dir"] = out_dir
     stats["handle_map"] = ir["handle_map"]
     return stats
-
-
-# ── live IPR: an event-driven delta pump streaming MXJB frames ──
-# Driven by depsgraph_update_post, so frames fire the instant the user edits
-# (not on a fixed clock) and each frame diffs only the objects Blender flagged
-# dirty. Pushed to the browser over SSE — this is what makes it feel like Max.
-_IPR = {"running": False, "pump": None, "scene": None,
-        "viewport_space": None, "handle_map": {}, "camera_modal_running": False}
-
-
-class _Ctx:
-    """Minimal context shim for the pump (it only needs .scene)."""
-    def __init__(self, scene):
-        self.scene = scene
-
-    def evaluated_depsgraph_get(self):
-        return bpy.context.evaluated_depsgraph_get()
-
-
-def _dirty_update_sets(scene, depsgraph):
-    """Return (delta_names, geometry_names) for this depsgraph update.
-
-    Geometry datablock and object-geometry updates feed geo_fast. Transform,
-    visibility, material scalar, light, and camera changes still feed MXJB
-    delta_bin, matching the native Max split.
-    """
-    names = set()
-    geometry = set()
-
-    def add_data_users(data_block):
-        for o in scene.objects:
-            if o.data == data_block:
-                names.add(o.name)
-                if o.type in extract_blender._MESHABLE:
-                    geometry.add(o.name)
-
-    for upd in depsgraph.updates:
-        idd = getattr(upd, "id", None)
-        if idd is None:
-            continue
-        idd = getattr(idd, "original", idd)
-        is_geometry = bool(getattr(upd, "is_updated_geometry", False))
-        if isinstance(idd, bpy.types.Object):
-            names.add(idd.name)
-            if is_geometry and idd.type in extract_blender._MESHABLE:
-                geometry.add(idd.name)
-        else:
-            data_types = [bpy.types.Mesh, bpy.types.Curve]
-            for type_name in ("SurfaceCurve", "MetaBall", "TextCurve"):
-                typ = getattr(bpy.types, type_name, None)
-                if typ is not None:
-                    data_types.append(typ)
-            if isinstance(idd, tuple(data_types)):
-                add_data_users(idd)
-                continue
-            if isinstance(idd, bpy.types.Material):
-                for o in scene.objects:
-                    if any(ms.material == idd for ms in o.material_slots):
-                        names.add(o.name)
-                continue
-            if isinstance(idd, bpy.types.Light):
-                for o in scene.objects:
-                    if o.data == idd:
-                        names.add(o.name)
-                continue
-            if isinstance(idd, bpy.types.Camera):
-                for o in scene.objects:
-                    if o.data == idd:
-                        names.add(o.name)
-                continue
-    return names, geometry
-
-
-def _on_depsgraph(scene, depsgraph):
-    st = _IPR
-    if not st["running"] or scene.name != st["scene"]:
-        return
-    try:
-        names, geometry_names = _dirty_update_sets(scene, depsgraph)
-        camera_names = {o.name for o in scene.objects if getattr(o, "type", None) == "CAMERA"}
-        names.difference_update(camera_names)
-        if names:
-            frame = st["pump"].build_frame(_Ctx(scene), only_names=names)
-            if frame:
-                server.push_delta(frame)
-        if geometry_names:
-            for meta, blob in st["pump"].build_geometry_updates(_Ctx(scene), only_names=geometry_names):
-                server.push_shared_buffer(meta, blob)
-    except Exception as ex:
-        print("[max.js IPR] depsgraph error:", repr(ex))
-
-
-def _capture_viewport_space(context):
-    space = getattr(context, "space_data", None)
-    if getattr(space, "type", None) == "VIEW_3D" and getattr(space, "region_3d", None) is not None:
-        return space
-    return extract_blender._viewport_space_from_context(context)
-
-
-def _viewport_camera_ir(scene):
-    return extract_blender._viewport_camera_to_ir(
-        bpy.context,
-        preferred_space=_IPR.get("viewport_space"),
-        scene=scene,
-    )
-
-
-def _camera_for_locked_handle(scene, handle):
-    if not handle:
-        return _viewport_camera_ir(scene)
-    handle_map = _IPR.get("handle_map") or {}
-    for obj in scene.objects:
-        if handle_map.get(obj.name) == handle and getattr(obj, "type", None) == "CAMERA":
-            return extract_blender._camera_object_to_ir(obj)
-    server.set_locked_camera(0)
-    return _viewport_camera_ir(scene)
-
-
-def _push_ipr_camera_update(scene):
-    st = _IPR
-    cam = _camera_for_locked_handle(scene, server.get_locked_camera())
-    if cam is not None and st["pump"] is not None:
-        frame = st["pump"].build_camera_frame(cam)
-        if frame:
-            server.push_delta(frame)
-
-
-def _ipr_stop():
-    _IPR["running"] = False
-    handlers = bpy.app.handlers.depsgraph_update_post
-    if _on_depsgraph in handlers:
-        handlers.remove(_on_depsgraph)
-    server.set_ipr(False)
-    server.clear_delta()
-    server.set_locked_camera(0)
-    _IPR["viewport_space"] = None
-    _IPR["handle_map"] = {}
-    _IPR["camera_modal_running"] = False
 
 
 class MAXJS_OT_export_only(bpy.types.Operator):
@@ -253,42 +116,6 @@ class MAXJS_OT_export_preview(bpy.types.Operator):
         return {"FINISHED"}
 
 
-class MAXJS_OT_ipr_camera_pump(bpy.types.Operator):
-    bl_idname = "maxjs.ipr_camera_pump"
-    bl_label = "max.js IPR camera pump"
-
-    _timer = None
-
-    def _remove_timer(self, context):
-        if self._timer is not None:
-            try:
-                context.window_manager.event_timer_remove(self._timer)
-            except Exception:
-                pass
-            self._timer = None
-        _IPR["camera_modal_running"] = False
-
-    def invoke(self, context, event):
-        if _IPR.get("camera_modal_running"):
-            return {"CANCELLED"}
-        self._timer = context.window_manager.event_timer_add(1.0 / 60.0, window=context.window)
-        context.window_manager.modal_handler_add(self)
-        _IPR["camera_modal_running"] = True
-        return {"RUNNING_MODAL"}
-
-    def modal(self, context, event):
-        if not _IPR.get("running"):
-            self._remove_timer(context)
-            return {"CANCELLED"}
-        if event.type == "TIMER":
-            scene = bpy.data.scenes.get(_IPR.get("scene") or "") or context.scene
-            try:
-                _push_ipr_camera_update(scene)
-            except Exception as ex:
-                print("[max.js IPR] camera pump error:", repr(ex))
-        return {"PASS_THROUGH"}
-
-
 class MAXJS_OT_ipr_start(bpy.types.Operator):
     bl_idname = "maxjs.ipr_start"
     bl_label = "Start Live IPR (max.js)"
@@ -302,41 +129,11 @@ class MAXJS_OT_ipr_start(bpy.types.Operator):
             self.report({"ERROR"}, "max.js web/ runtime not found: %s" % web_root)
             return {"CANCELLED"}
         try:
-            viewport_space = _capture_viewport_space(context)
-            viewport_camera = extract_blender._viewport_camera_to_ir(
-                context,
-                preferred_space=viewport_space,
-                scene=scene,
-            )
-            # Native Max live fullsync uses float32/int32 geometry channels;
-            # keep Blender IPR on that layout so later geo_fast packets patch
-            # the same buffers exactly like the Max path.
-            stats = _export(context, adaptive_geometry=False, camera_override=viewport_camera)
-            pmp = pump.DeltaPump(stats["handle_map"])
-            pmp.seed(context)  # prime caches from current state; emits nothing
-            if viewport_camera is not None:
-                pmp.seed_camera(viewport_camera)
+            stats = live_ipr.start(context, web_root, _export)
         except Exception as ex:
             self.report({"ERROR"}, "max.js IPR export failed: %r" % ex)
             return {"CANCELLED"}
-
-        server.clear_delta()
-        server.set_locked_camera(0)
-        _httpd, port = server.serve(web_root, stats["out_dir"], port=scene.maxjs_port, ipr=True)
-        _IPR.update(running=True, pump=pmp, scene=scene.name,
-                    viewport_space=viewport_space, handle_map=stats["handle_map"])
-        if _on_depsgraph not in bpy.app.handlers.depsgraph_update_post:
-            bpy.app.handlers.depsgraph_update_post.append(_on_depsgraph)
-        try:
-            bpy.ops.maxjs.ipr_camera_pump("INVOKE_DEFAULT")
-        except Exception as ex:
-            print("[max.js IPR] camera pump start failed:", repr(ex))
-
-        # The real max.js editor viewport (full post-FX), driven via the
-        # injected WebView2 host shim — not the stripped snapshot viewer.
-        url = "http://127.0.0.1:%d/index.html" % port
-        webbrowser.open(url)
-        self.report({"INFO"}, "max.js IPR live (full viewer) → %s" % url)
+        self.report({"INFO"}, "max.js IPR live (full viewer) → %s" % stats["url"])
         return {"FINISHED"}
 
 
@@ -347,7 +144,7 @@ class MAXJS_OT_ipr_stop(bpy.types.Operator):
     bl_options = {"REGISTER"}
 
     def execute(self, context):
-        _ipr_stop()
+        live_ipr.stop()
         self.report({"INFO"}, "max.js IPR stopped")
         return {"FINISHED"}
 
@@ -373,7 +170,7 @@ class MAXJS_PT_panel(bpy.types.Panel):
         layout.separator()
         box = layout.box()
         box.label(text="Live IPR", icon="RENDER_ANIMATION")
-        if _IPR["running"]:
+        if live_ipr.is_running():
             box.operator("maxjs.ipr_stop", icon="PAUSE")
             box.label(text="● streaming (event-driven)", icon="REC")
         else:
@@ -381,7 +178,7 @@ class MAXJS_PT_panel(bpy.types.Panel):
 
 
 _CLASSES = (MAXJS_OT_export_only, MAXJS_OT_export_preview,
-            MAXJS_OT_ipr_camera_pump,
+            camera_sync.MAXJS_OT_ipr_camera_pump,
             MAXJS_OT_ipr_start, MAXJS_OT_ipr_stop, MAXJS_PT_panel)
 
 
@@ -405,7 +202,7 @@ def register():
 
 def unregister():
     try:
-        _ipr_stop()
+        live_ipr.stop()
     except Exception:
         pass
     try:

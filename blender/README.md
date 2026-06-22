@@ -74,6 +74,32 @@ DCC, reimplement only that file.
 4. Click **Export & Preview** for a static snapshot, or **Start Live IPR** to
    stream edits. Both open the browser against the shared runtime.
 
+### Dev workflow — run the add-on straight from the repo (like `dev.bat`)
+
+The root `dev.bat` launches Max with `MAXJS_WEB_DIR` pointed at the repo so the
+plugin serves live `web/` from source — no copy step. The Blender side mirrors
+that: **don't install the add-on, launch Blender pointed at the repo.**
+
+```bash
+./blender/dev.sh                 # macOS / Linux   (BLENDER=/path/to/blender to override)
+blender\dev.bat                  # Windows
+```
+
+These set `MAXJS_WEB_DIR=<repo>/web` and run Blender with
+`--python blender/dev_register.py`, which puts the repo on `sys.path`, imports
+`maxjs_blender` **from the working copy**, and registers it. So:
+
+- `git pull` (or any edit), then **relaunch `dev.sh`** → newest code + `web/`,
+  no install/copy, nothing written into Blender's addons folder.
+- To re-apply edits *without* restarting Blender: **Text Editor ▸ open
+  `dev_register.py` ▸ Run** (it reloads every `maxjs_blender.*` submodule and
+  re-registers).
+- Don't *also* enable an installed copy in Preferences — pick one or the other,
+  or they double-register.
+
+(One-time install via zip/symlink still works for non-dev use; see git history /
+the operators. The launcher is the day-to-day dev loop.)
+
 ### Live IPR (interactive preview render)
 
 **Start Live IPR** opens the **actual max.js editor** (`web/index.html`, full

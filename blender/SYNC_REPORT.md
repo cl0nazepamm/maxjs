@@ -24,6 +24,7 @@ by reference and not forked.
 | --- | --- | --- | --- |
 | Mesh geometry | Yes | Yes | Evaluated Blender mesh, triangulated, corner-deduped. Live mesh edits stream as Max-style `geo_fast`. |
 | Topology changes | Yes | Yes | Live `geo_fast` can rebuild geometry when vertex/index counts change. |
+| Add/remove/rename objects | Yes | Yes | Live object-table changes trigger a Max-style full `scene_bin` resync without restarting IPR. Existing Blender object identities keep their handles across rename, and the served snapshot files are refreshed for reconnects. |
 | Object transforms | Yes | Yes | World matrices are emitted in the same Z-up basis expected by max.js. |
 | Visibility | Yes | Yes | Object visibility maps to node visibility and `UpdateVisibility`. |
 | Parent hierarchy | Yes | Yes | Meshes and empties carry parent handles. |
@@ -37,7 +38,8 @@ by reference and not forked.
 | Lights | Yes | Yes | Sun, point, spot, and area lights map to max.js light records and live `UpdateLight`. |
 | Camera object | Yes | Yes | Blender camera objects appear in the max.js camera dropdown and can be locked from the IPR panel. |
 | Viewport camera | N/A | Yes | `Viewport` in the max.js camera dropdown maps to Blender's active 3D View `RegionView3D`. |
-| Camera list | Yes | Yes at IPR start | Blender cameras are emitted as `sceneCameras` with `lockedCamera: 0`. New cameras after IPR start require restart. |
+| Camera list | Yes | Yes | Blender cameras are emitted as `sceneCameras`; camera add/remove/rename refreshes through the structural `scene_bin` resync path. |
+| Camera clip planes | Yes | Initial only | Blender camera and viewport `near`/`far` values are written into `snapshot.json`/`snapshotUi`; live clip edits need a future camera protocol field. |
 | Tone/exposure hints | Yes | No live forward | Static snapshot stores Blender view exposure/tone hints. Live editor still owns its own post-FX state. |
 | Transport | Yes | Yes | Initial scene uses `scene_bin`; live uses MXJB `delta_bin` and binary `geo_fast`, all over SSE. |
 
@@ -59,24 +61,25 @@ by reference and not forked.
 - [x] UV0 export and live update
 - [x] Static UV2 export
 - [x] Static material library dedupe
+- [x] Static and initial-IPR camera clip planes
+- [x] Add/remove/rename object sync through full `scene_bin` resync
+- [x] Camera list refresh through full `scene_bin` resync
 
 ### Partial
 
 - [ ] Live selection delta
 - [ ] Live UV2 `geo_fast` updates
 - [ ] Live material structure updates
-- [ ] Camera list refresh without IPR restart
+- [ ] Live camera clip plane updates
 - [ ] Snapshot UI parity beyond the basic generated payload
 - [ ] Tone/exposure forwarding into the live editor
 
 ### Missing
 
-- [ ] Add/remove objects during IPR
 - [ ] Texture map extraction
 - [ ] Vertex color extraction
 - [ ] Full Blender material graph translation
 - [ ] Camera DOF forwarding
-- [ ] Camera clip plane forwarding
 - [ ] Environment, HDRI, and sky translation
 - [ ] Fog and volume translation
 - [ ] Animation export and timeline sync
@@ -91,14 +94,13 @@ by reference and not forked.
 
 | Area | Status | Notes |
 | --- | --- | --- |
-| Add/remove objects during IPR | Missing | Handles are seeded at IPR start. New or deleted objects need a fresh IPR session. |
 | Texture maps | Missing | Blender node textures are not translated into max.js material texture slots yet. |
 | Vertex colors | Missing | Mesh color attributes are not extracted into max.js vertex color descriptors. |
 | UV2 live updates | Partial | Static export supports UV2; live `geo_fast` does not currently send `uv2Off`/`uv2N`. |
 | Full material graph | Missing | Only a Principled BSDF scalar subset is mapped. No procedural nodes or image texture graph traversal. |
 | Live material structure changes | Partial | Scalar edits stream live. Slot count, material assignment, texture, or material model changes may require full IPR restart or a future material-structure update path. |
 | Camera DOF | Missing | Camera focus distance is used to pick a target point, but physical DOF fields are not forwarded. |
-| Camera clip planes | Missing | Near/far clipping is not read from Blender cameras. |
+| Camera clip planes | Partial | Blender camera and viewport clip planes are serialized for static export and initial IPR; live clip edits are not streamed because `UpdateCamera` has no near/far fields. |
 | Scene environment/HDRI/sky | Missing | Export currently writes `env: none`; no world shader/HDRI/sky translation. |
 | Fog/volumes | Missing | Blender fog/world volume data is not translated. |
 | Animations | Missing | No timeline sampling, keyframes, skeletal animation, morph targets, or `scene_anim.bin`. |
@@ -110,7 +112,6 @@ by reference and not forked.
 | Layer Manager parity | Runtime only | The editor's Layer Manager exists because the shared runtime is used, but Blender does not author max.js runtime layers. |
 | Snapshot UI parity | Partial | Basic `snapshotUi` is written; portable Studio/post-FX/HDRI/editor state from Max is not authored by Blender. |
 | Render output / safe frame | Missing | Blender render resolution/aspect is not forwarded as live render-output settings. |
-| Scene camera list live refresh | Missing | Camera dropdown is correct at IPR start; camera add/remove/rename needs IPR restart. |
 
 ## Mapping Details
 
@@ -127,6 +128,13 @@ by reference and not forked.
   - normals: `i16n` when possible, otherwise `float32`
 - Live IPR initial `scene_bin` uses float32/int32 channel layout so later
   `geo_fast` packets can patch the same buffers exactly like the Max live path.
+- Live object-table changes preserve existing object-identity handles across
+  rename, allocate new handles monotonically, and push a fresh `scene_bin` so
+  the shared runtime prunes deleted handles and creates new nodes like the Max
+  fullsync path.
+- Structural resyncs also rewrite the served `snapshot.json` and `scene.bin`,
+  so browser refresh/reconnect loads the latest Blender scene instead of the
+  startup snapshot.
 
 ### Materials
 
@@ -164,8 +172,6 @@ by reference and not forked.
 
 - [ ] Texture maps: image texture extraction for base color, normal, roughness,
    metallic, opacity, emission, and transmission where possible.
-- [ ] Add/remove object support during IPR: handle table refresh or full-scene
-   resync path without restarting IPR.
 - [ ] Vertex colors and UV2 live `geo_fast` support.
 - [ ] Live material structure updates for material assignment, slot count, and
    texture changes.
@@ -178,4 +184,16 @@ by reference and not forked.
 
 - `python blender\test_translation_contract.py`
 - `python blender\tests\test_serialize_smoke.py`
-- `python -m py_compile blender\maxjs_blender\__init__.py blender\maxjs_blender\extract_blender.py blender\maxjs_blender\pump.py blender\maxjs_blender\serialize.py blender\maxjs_blender\server.py`
+- `python -m py_compile blender\maxjs_blender\__init__.py blender\maxjs_blender\live_ipr.py blender\maxjs_blender\camera_sync.py blender\maxjs_blender\pump.py blender\maxjs_blender\server.py blender\maxjs_blender\extract_blender.py blender\maxjs_blender\serialize.py blender\maxjs_blender\handles.py`
+- Headless Blender 5.1 sanity: stable handle allocation through rename, add,
+  delete, and name reuse.
+- Headless Blender 5.1 sanity: live full `scene_bin` resync helper preserves
+  object-identity handles.
+- Headless Blender 5.1 sanity: live full `scene_bin` resync rewrites the served
+  snapshot files for browser refresh/reconnect.
+- Headless Blender 5.1 sanity: `_on_depsgraph` detects an object-table change
+  and pushes structural `scene_bin` with stable existing handles and new
+  monotonic handles.
+- Browser-level editor sanity: real `web/index.html` served through the Blender
+  overlay applied repeated full `scene_bin` packets as `nodes 1 -> nodes 2 ->
+  nodes 1`, then refreshed into the latest two-node served snapshot.

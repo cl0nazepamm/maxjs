@@ -68,6 +68,8 @@ def _export(context, *, adaptive_geometry=True, camera_override=None):
     stats = serialize.write_snapshot(out_dir, ir, adaptive_geometry=adaptive_geometry)
     stats["out_dir"] = out_dir
     stats["handle_map"] = ir["handle_map"]
+    stats["handle_id_map"] = ir.get("handle_id_map", {})
+    stats["next_handle"] = ir.get("next_handle")
     return stats
 
 

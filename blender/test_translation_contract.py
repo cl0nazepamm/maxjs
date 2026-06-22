@@ -11,6 +11,7 @@ if PKG not in sys.path:
     sys.path.insert(0, PKG)
 
 import contract
+import handles
 import serialize
 
 
@@ -33,6 +34,90 @@ def material(name):
 
 
 class TranslationContractTests(unittest.TestCase):
+    def test_live_handles_preserve_existing_and_allocate_monotonically(self):
+        initial, next_handle = handles.assign_stable_handles(["Cube", "Camera"])
+        self.assertEqual(initial, {"Cube": 1, "Camera": 2})
+        self.assertEqual(next_handle, 3)
+
+        changed, next_handle = handles.assign_stable_handles(
+            ["Camera", "Sphere"],
+            existing_handle_map=initial,
+            next_handle=next_handle,
+        )
+
+        self.assertEqual(changed["Camera"], 2)
+        self.assertEqual(changed["Sphere"], 3)
+        self.assertNotIn("Cube", changed)
+        self.assertEqual(next_handle, 4)
+
+    def test_live_handles_do_not_reuse_deleted_name_later_in_session(self):
+        initial, next_handle = handles.assign_stable_handles(["Cube"])
+        deleted, next_handle = handles.assign_stable_handles(
+            [],
+            existing_handle_map=initial,
+            next_handle=next_handle,
+        )
+        recreated, next_handle = handles.assign_stable_handles(
+            ["Cube"],
+            existing_handle_map=deleted,
+            next_handle=next_handle,
+        )
+
+        self.assertEqual(initial["Cube"], 1)
+        self.assertEqual(recreated["Cube"], 2)
+        self.assertEqual(next_handle, 3)
+
+    def test_live_object_handles_survive_rename_by_object_identity(self):
+        names, ids, next_handle = handles.assign_stable_object_handles(
+            [("Cube", 101)],
+        )
+        renamed, renamed_ids, next_handle = handles.assign_stable_object_handles(
+            [("HeroCube", 101)],
+            existing_name_map=names,
+            existing_id_map=ids,
+            next_handle=next_handle,
+        )
+
+        self.assertEqual(names["Cube"], 1)
+        self.assertEqual(renamed["HeroCube"], 1)
+        self.assertEqual(renamed_ids[101], 1)
+        self.assertNotIn("Cube", renamed)
+        self.assertEqual(next_handle, 2)
+
+    def test_live_object_handles_prefer_identity_over_reused_name(self):
+        names, ids, next_handle = handles.assign_stable_object_handles(
+            [("Cube", 101)],
+        )
+        renamed, renamed_ids, next_handle = handles.assign_stable_object_handles(
+            [("HeroCube", 101), ("Cube", 202)],
+            existing_name_map=names,
+            existing_id_map=ids,
+            next_handle=next_handle,
+        )
+
+        self.assertEqual(renamed["HeroCube"], 1)
+        self.assertEqual(renamed["Cube"], 2)
+        self.assertEqual(renamed_ids[101], 1)
+        self.assertEqual(renamed_ids[202], 2)
+        self.assertEqual(next_handle, 3)
+
+    def test_live_object_handles_do_not_reuse_deleted_identity_with_same_name(self):
+        names, ids, next_handle = handles.assign_stable_object_handles(
+            [("Cube", 101)],
+        )
+        replaced, replaced_ids, next_handle = handles.assign_stable_object_handles(
+            [("Cube", 202)],
+            existing_name_map=names,
+            existing_id_map=ids,
+            next_handle=next_handle,
+        )
+
+        self.assertEqual(names["Cube"], 1)
+        self.assertEqual(replaced["Cube"], 2)
+        self.assertEqual(replaced_ids[202], 2)
+        self.assertNotIn(101, replaced_ids)
+        self.assertEqual(next_handle, 3)
+
     def test_material_hash_is_stable_and_name_independent(self):
         scene = {
             "nodes": [
@@ -173,6 +258,27 @@ class TranslationContractTests(unittest.TestCase):
 
         self.assertEqual(snap["sceneCameras"], [{"h": 7, "n": "Camera"}])
         self.assertEqual(snap["lockedCamera"], 0)
+
+    def test_camera_clip_planes_are_serialized_for_snapshot_and_ui(self):
+        scene = {
+            "nodes": [],
+            "camera": {
+                "pos": [1, 2, 3],
+                "tgt": [0, 0, 0],
+                "up": [0, 0, 1],
+                "fov": 45.0,
+                "persp": True,
+                "near": 0.25,
+                "far": 2500.0,
+            },
+        }
+        snap, _binary = serialize.build_snapshot(scene)
+
+        self.assertEqual(snap["camera"]["near"], 0.25)
+        self.assertEqual(snap["camera"]["far"], 2500.0)
+        self.assertEqual(snap["snapshotUi"]["camera"]["near"], 0.25)
+        self.assertEqual(snap["snapshotUi"]["camera"]["far"], 2500.0)
+        self.assertEqual(snap["snapshotUi"]["cameraClip"], {"near": 0.25, "far": 2500.0})
 
     def test_write_snapshot_outputs_valid_shared_runtime_files(self):
         scene = {

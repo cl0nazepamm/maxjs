@@ -226,10 +226,19 @@ class _MaterialLibrary:
 
 def _default_camera():
     return {"pos": [12.0, -16.0, 9.0], "tgt": [0.0, 0.0, 1.0], "up": [0.0, 0.0, 1.0],
-            "fov": 45.0, "persp": True}
+            "fov": 45.0, "persp": True, "near": 0.1, "far": 100000.0}
+
+
+def _camera_clip(camera):
+    near = float(camera.get("near", 0.1) or 0.1)
+    far = float(camera.get("far", 100000.0) or 100000.0)
+    near = near if near > 0.0 else 0.1
+    far = far if far > near else max(near + 1.0e-6, 100000.0)
+    return near, far
 
 
 def _snapshot_ui(scene, camera):
+    near, far = _camera_clip(camera)
     return {
         "rendererBackend": scene.get("rendererBackend", "WebGL"),
         "toneMapping": scene.get("toneMapping", "AgX"),
@@ -243,9 +252,9 @@ def _snapshot_ui(scene, camera):
         "camera": {
             "position": camera["pos"], "target": camera["tgt"], "up": camera["up"],
             "fov": camera["fov"], "perspective": bool(camera.get("persp", True)),
-            "near": 0.1, "far": 100000.0, "viewWidth": float(camera.get("viewWidth", 0.0)),
+            "near": near, "far": far, "viewWidth": float(camera.get("viewWidth", 0.0)),
         },
-        "cameraClip": {"near": 0.1, "far": 100000.0},
+        "cameraClip": {"near": near, "far": far},
         "hdri": {"enabled": False},
         "fx": {},
         "bake": {"enabled": False},
@@ -331,6 +340,7 @@ def build_snapshot(scene, *, adaptive_geometry=True):
         buf = bytearray(4)  # matches C++ minimum (totalBytes = 4)
 
     camera = scene.get("camera") or _default_camera()
+    camera_near, camera_far = _camera_clip(camera)
     snap = {
         "type": contract.SNAPSHOT_TYPE,
         "frame": contract.SNAPSHOT_FRAME,
@@ -341,6 +351,7 @@ def build_snapshot(scene, *, adaptive_geometry=True):
         "camera": {
             "pos": camera["pos"], "tgt": camera["tgt"], "up": camera["up"],
             "fov": camera["fov"], "persp": bool(camera.get("persp", True)),
+            "near": camera_near, "far": camera_far,
             "dofEnabled": False, "dofFocusDistance": 0.0,
             "dofFocalLength": 0.0, "dofBokehScale": 0.0,
         },

@@ -19,9 +19,10 @@ import bpy
 import mathutils
 
 try:
-    from . import contract
+    from . import contract, handles
 except ImportError:
     import contract
+    import handles
 
 _MESHABLE = {"MESH", "CURVE", "SURFACE", "META", "FONT"}
 
@@ -37,6 +38,15 @@ def _visible(obj):
         return bool(obj.visible_get())
     except Exception:
         return not obj.hide_render
+
+
+def _object_session_id(obj):
+    try:
+        return int(obj.as_pointer())
+    except ReferenceError:
+        return None
+    except Exception:
+        return None
 
 
 def _uv_layer_arrays(me, loop_count):
@@ -310,6 +320,8 @@ def _camera_object_to_ir(cam):
     if dof and getattr(dof, "focus_distance", 0.0) > 0.0:
         dist = dof.focus_distance
     tgt = pos + fwd * max(1.0, dist)
+    near = max(1.0e-6, float(getattr(cam.data, "clip_start", 0.1) or 0.1))
+    far = max(near + 1.0e-6, float(getattr(cam.data, "clip_end", 100000.0) or 100000.0))
     return {
         "pos": [pos.x, pos.y, pos.z],
         "tgt": [tgt.x, tgt.y, tgt.z],
@@ -317,6 +329,8 @@ def _camera_object_to_ir(cam):
         "fov": math.degrees(cam.data.angle_x),
         "persp": cam.data.type == "PERSP",
         "viewWidth": float(cam.data.ortho_scale) if cam.data.type == "ORTHO" else 0.0,
+        "near": near,
+        "far": far,
     }
 
 
@@ -403,6 +417,8 @@ def _viewport_camera_to_ir(context=None, preferred_space=None, scene=None):
         if view_width <= 0.0:
             view_width = max(0.001, dist * 2.0)
 
+    near = max(1.0e-6, float(getattr(space, "clip_start", 0.1) or 0.1))
+    far = max(near + 1.0e-6, float(getattr(space, "clip_end", 100000.0) or 100000.0))
     return {
         "pos": [pos.x, pos.y, pos.z],
         "tgt": [tgt.x, tgt.y, tgt.z],
@@ -410,17 +426,28 @@ def _viewport_camera_to_ir(context=None, preferred_space=None, scene=None):
         "fov": fov,
         "persp": persp,
         "viewWidth": view_width,
+        "near": near,
+        "far": far,
     }
 
 
 # ─────────────────────────── scene walk ──────────────────────────────────
-def extract_scene(context, backend="WebGL"):
+def extract_scene(context, backend="WebGL", handle_map=None, next_handle=None,
+                  handle_id_map=None):
     scene = context.scene
     depsgraph = context.evaluated_depsgraph_get()
     objs = list(scene.objects)
 
-    # Stable per-export handles (also resolves parent references).
-    handle = {o.name: i + 1 for i, o in enumerate(objs)}
+    # Stable producer handles (also resolves parent references). Static exports
+    # still start at 1; Live IPR passes session maps so structure resyncs
+    # preserve existing object handles, including rename, and allocate new ones
+    # monotonically.
+    handle, handle_ids, next_handle_out = handles.assign_stable_object_handles(
+        [(o.name, _object_session_id(o)) for o in objs],
+        existing_name_map=handle_map,
+        existing_id_map=handle_id_map,
+        next_handle=next_handle,
+    )
 
     nodes, lights = [], []
     for o in objs:
@@ -479,4 +506,6 @@ def extract_scene(context, backend="WebGL"):
         # Same name→handle map the snapshot used; the live pump reuses it so the
         # browser's nodeMap resolves every delta command.
         "handle_map": dict(handle),
+        "handle_id_map": dict(handle_ids),
+        "next_handle": int(next_handle_out),
     }

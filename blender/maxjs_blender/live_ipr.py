@@ -4,17 +4,19 @@
 # in pump.py, camera-source policy stays in camera_sync.py, and transport stays
 # in server.py.
 
+import json
 import os
 import webbrowser
 
 import bpy
 
 try:
-    from . import camera_sync, extract_blender, pump, server
+    from . import camera_sync, extract_blender, pump, serialize, server
 except ImportError:
     import camera_sync
     import extract_blender
     import pump
+    import serialize
     import server
 
 
@@ -22,8 +24,13 @@ _STATE = {
     "running": False,
     "pump": None,
     "scene": None,
+    "out_dir": None,
     "viewport_space": None,
     "handle_map": {},
+    "handle_id_map": {},
+    "next_handle": 1,
+    "structure_sig": None,
+    "syncing_full": False,
     "camera_modal_running": False,
 }
 
@@ -95,11 +102,124 @@ def _dirty_update_sets(scene, depsgraph):
     return names, geometry
 
 
+def _next_handle_from_stats(stats):
+    next_handle = stats.get("next_handle")
+    if next_handle is not None:
+        return int(next_handle)
+    handles = [int(v) for v in (stats.get("handle_map") or {}).values()]
+    handles.extend(int(v) for v in (stats.get("handle_id_map") or {}).values())
+    return (max(handles) + 1) if handles else 1
+
+
+def _pointer_id(value):
+    try:
+        return int(value.as_pointer())
+    except ReferenceError:
+        return 0
+    except Exception:
+        return 0
+
+
+def _structure_signature(scene):
+    """Object-table signature that maps to Max's full-sync dirty condition."""
+    rows = []
+    for obj in scene.objects:
+        parent = getattr(obj, "parent", None)
+        data = getattr(obj, "data", None)
+        rows.append((
+            obj.name,
+            getattr(obj, "type", ""),
+            parent.name if parent else "",
+            _pointer_id(obj),
+            _pointer_id(data) if data is not None else 0,
+        ))
+    return tuple(rows)
+
+
+def _current_camera_ir(scene):
+    return camera_sync.camera_for_locked_handle(
+        scene,
+        _STATE,
+        server.get_locked_camera(),
+    )
+
+
+def _build_full_scene_packet(scene):
+    context = _Ctx(scene)
+    ir = extract_blender.extract_scene(
+        context,
+        backend=getattr(scene, "maxjs_backend", "WebGL"),
+        handle_map=_STATE.get("handle_map") or {},
+        handle_id_map=_STATE.get("handle_id_map") or {},
+        next_handle=_STATE.get("next_handle") or 1,
+    )
+    camera = _current_camera_ir(scene)
+    if camera is not None:
+        ir["camera"] = camera
+    ir["lockedCamera"] = int(server.get_locked_camera() or 0)
+    snap, binary = serialize.build_snapshot(ir, adaptive_geometry=False)
+    return context, ir, snap, binary, camera
+
+
+def _write_current_scene_files(snap, binary):
+    out_dir = _STATE.get("out_dir")
+    if not out_dir:
+        return
+    os.makedirs(out_dir, exist_ok=True)
+    bin_name = snap.get("bin") or "scene.bin"
+    with open(os.path.join(out_dir, bin_name), "wb") as f:
+        f.write(binary)
+    with open(os.path.join(out_dir, "snapshot.json"), "w", encoding="utf-8") as f:
+        json.dump(snap, f, separators=(",", ":"))
+
+
+def _send_full_scene_resync(scene, reason):
+    if _STATE.get("syncing_full"):
+        return False
+    _STATE["syncing_full"] = True
+    try:
+        context, ir, snap, binary, camera = _build_full_scene_packet(scene)
+        new_pump = pump.DeltaPump(ir["handle_map"])
+        new_pump.seed(context)
+        if camera is not None:
+            new_pump.seed_camera(camera)
+
+        _write_current_scene_files(snap, binary)
+        server.clear_delta()
+        server.push_shared_buffer(snap, binary)
+        _STATE.update(
+            pump=new_pump,
+            handle_map=ir["handle_map"],
+            handle_id_map=ir.get("handle_id_map", {}),
+            next_handle=ir.get("next_handle") or _next_handle_from_stats(ir),
+            structure_sig=_structure_signature(scene),
+        )
+        print("[max.js IPR] scene_bin resync (%s): %d nodes, %d bytes" %
+              (reason, len(snap.get("nodes", [])), len(binary)))
+        return True
+    finally:
+        _STATE["syncing_full"] = False
+
+
 def _on_depsgraph(scene, depsgraph):
     if not _STATE["running"] or scene.name != _STATE["scene"]:
         return
     try:
+        structure_sig = _structure_signature(scene)
+        if _STATE.get("structure_sig") is not None and structure_sig != _STATE["structure_sig"]:
+            _send_full_scene_resync(scene, "structure")
+            return
+
         names, geometry_names = _dirty_update_sets(scene, depsgraph)
+        known_handles = _STATE.get("handle_map") or {}
+        unknown_names = {
+            name for name in (names | geometry_names)
+            if name not in known_handles and scene.objects.get(name) is not None
+        }
+        if unknown_names:
+            _send_full_scene_resync(scene, "new handles")
+            return
+
         camera_names = {obj.name for obj in scene.objects if getattr(obj, "type", None) == "CAMERA"}
         names.difference_update(camera_names)
         if names:
@@ -140,8 +260,13 @@ def start(context, web_root, export_snapshot):
         running=True,
         pump=pmp,
         scene=scene.name,
+        out_dir=stats["out_dir"],
         viewport_space=viewport_space,
         handle_map=stats["handle_map"],
+        handle_id_map=stats.get("handle_id_map", {}),
+        next_handle=_next_handle_from_stats(stats),
+        structure_sig=_structure_signature(scene),
+        syncing_full=False,
     )
     if _on_depsgraph not in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.append(_on_depsgraph)
@@ -165,7 +290,12 @@ def stop():
     _STATE.update(
         pump=None,
         scene=None,
+        out_dir=None,
         viewport_space=None,
         handle_map={},
+        handle_id_map={},
+        next_handle=1,
+        structure_sig=None,
+        syncing_full=False,
         camera_modal_running=False,
     )

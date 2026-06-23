@@ -1,5 +1,0 @@
-# Generated preview artifacts (snapshot.json + scene.bin written by the add-on)
-_preview/
-# Python bytecode
-__pycache__/
-*.pyc

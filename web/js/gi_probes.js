@@ -23,7 +23,7 @@ import {
     Fn, If, Loop, Return, instanceIndex, storage, uniform, texture,
     float, int, uint, vec2, vec3, vec4, uvec2,
     max as tslMax, min as tslMin, mix, clamp, floor, normalize, dot, cross, length,
-    abs as tslAbs, sqrt, cos, sin, pow, textureStore, positionWorld, normalWorld, select,
+    abs as tslAbs, sqrt, cos, sin, pow, exp, textureStore, positionWorld, normalWorld, select,
 } from 'three/tsl';
 
 // buildSpectralScene (pulls three-mesh-bvh) is lazy-loaded in rebuild() so
@@ -54,6 +54,15 @@ const REACTIVE_TICKS = 40;         // ticks of fast (low-hysteresis) convergence
 const REACTIVE_HYSTERESIS = 0.4;   // hysteresis during a reactivity burst (vs steady-state)
 const LIGHT_CHECK_INTERVAL = 6;    // ticks between light-change checks
 const GEO_CHECK_INTERVAL = 24;     // ticks between geometry-change checks (full rebuild = expensive)
+// ── denoise uplift (CORE, docs/GI_HALO_design.md §11) tunables ──
+const GI_ANTILAG_K = 4.0;          // SVGF antilag: temporal-variance bandwidth (×σ²)
+const GI_ANTILAG_EPS = 0.0016;     // antilag luma² floor (~0.04²): steady per-tick ray noise can't lower hysteresis
+const GI_FILTER_K = 8.0;           // spatial filter: variance→edge-stop bandwidth
+const GI_FILTER_EPS = 0.001;       // spatial filter luma² absolute floor (avoids /0 on black)
+const GI_FILTER_REL = 0.0225;      // spatial filter RELATIVE floor (~15% luma)²: even a temporally
+                                   // converged texel gets a mild edge-PRESERVING bilateral smooth of
+                                   // sub-threshold (noise-scale) neighbours, while strong directional
+                                   // edges (red↔green) stay sharp. Steady-state splotch reduction.
 
 let _node = null;
 
@@ -212,7 +221,7 @@ function computeGridResolution(size) {
     return new THREE.Vector3(axis(size.x), axis(size.y), axis(size.z));
 }
 
-export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis = 0.95 } = {}) {
+export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis = 0.95, onRebuilt = null } = {}) {
     const node = getGiProbeNode();
     node.setIntensity(intensity);
 
@@ -257,6 +266,7 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
         cellMin: uniform(0.1),          // min grid cell spacing (relocation margin)
         relocClamp: uniform(0.045),     // max relocation offset (< 0.45·cell → probe stays in cell)
         classifyStrength: uniform(0.0), // gates relocation APPLY (mirrors node.classifyStrengthNode)
+        filterStrength: uniform(1.0),   // CORE denoise: 0 = filter off (harness baseline), 1 = full intra-tile spatial filter
     };
 
     function isSupported() {
@@ -284,10 +294,16 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
     // spherical-Fibonacci ray k of N, with a per-frame jitter to decorrelate
     // frames. MUST be reproduced identically in the blend gather.
     function rayDir(kNode, jitterNode) {
-        const fk = float(kNode).add(jitterNode);
-        const z = float(1.0).sub(fk.add(0.5).div(float(RAYS_PER_PROBE)).mul(2.0));
+        // Cranley-Patterson rotation: stratify the cosine-z by index k, then
+        // toroidally shift BOTH z and azimuth by the per-frame jitter. Same 64
+        // rays, materially lower variance than the old raw index-shift; keeps the
+        // (k, jitter) signature so the blend gather reproduces each ray identically.
+        const sk = float(kNode).add(0.5).div(float(RAYS_PER_PROBE));
+        const u = sk.add(jitterNode);
+        const uw = u.sub(floor(u));                           // wrap to [0,1) (fract is not imported)
+        const z = float(1.0).sub(uw.mul(2.0));
         const r = sqrt(tslMax(float(0.0), float(1.0).sub(z.mul(z))));
-        const phi = fk.mul(float(GOLDEN_ANGLE));
+        const phi = float(kNode).mul(float(GOLDEN_ANGLE)).add(jitterNode.mul(float(2.0 * Math.PI)));
         return vec3(r.mul(cos(phi)), r.mul(sin(phi)), z);
     }
 
@@ -448,6 +464,13 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
                 const emissive = vec3(matFloat(matId, 7), matFloat(matId, 8), matFloat(matId, 9));
                 const radiance = emissive.toVar();
 
+                // energy-weighted diffuse albedo: metals (slot 4) and glass (slot 5)
+                // don't bounce Lambert diffuse. Cap ≤0.95 so the temporal multibounce
+                // series E = direct/(1−kd) is provably convergent (no runaway).
+                const metal = matFloat(matId, 4);
+                const transm = matFloat(matId, 5);
+                const kd = clamp(baseColor.mul(float(1.0).sub(metal)).mul(float(1.0).sub(transm)), vec3(0.0), vec3(0.95)).toVar();
+
                 // NEE over ALL lights (count small; loop avoids sampling noise).
                 Loop({ start: uint(0), end: U.lightCount, type: 'uint', condition: '<' }, ({ i: li }) => {
                     const lb = li.mul(uint(16)).toVar();
@@ -478,7 +501,7 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
                             const angleCos = dot(wi, ldir).mul(-1.0);
                             const spotAtten = clamp(angleCos.sub(lcosAngle).div(tslMax(lcosPen.sub(lcosAngle), float(1e-4))), float(0.0), float(1.0));
                             const atten = distAtten.mul(select(isSpot, spotAtten, float(1.0)));
-                            const diffuse = baseColor.mul(float(1.0).div(float(PI)));
+                            const diffuse = kd.mul(float(1.0).div(float(PI)));
                             radiance.addAssign(diffuse.mul(ndl).mul(lcol).mul(atten));
                         });
                     });
@@ -487,8 +510,12 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
                 // multibounce: add last frame's irradiance × albedo (the atlas is
                 // re-uploaded every tick, so this reads a valid prior field; on
                 // tick 1 it reads zero, which is correct). Lambert: E·albedo/π.
-                const bounce = sampleAtlas(hitPos, ng).mul(baseColor).mul(float(1.0).div(float(PI)));
-                radiance.addAssign(tslMin(bounce, vec3(U.radianceClamp))); // clamp feedback spikes
+                const bounce = sampleAtlas(hitPos, ng).mul(kd).mul(float(1.0).div(float(PI)));
+                // hue-stable firefly rolloff (vs the old per-channel hard clamp that
+                // clipped saturated bounce hues): scale by luminance, preserving chroma.
+                const bl = dot(bounce, vec3(0.2126, 0.7152, 0.0722));
+                const roll = U.radianceClamp.div(tslMax(U.radianceClamp, bl));
+                radiance.addAssign(bounce.mul(roll));
                 outRgb.assign(radiance);
             });
             // miss → outRgb stays BLACK (CRITICAL: never sample sky here — IBL
@@ -547,11 +574,27 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
             const ib = probeIndex.mul(uint(TILE * TILE)).add(local).mul(uint(4)).toVar();
             const prev = vec3(irr.element(ib), irr.element(ib.add(uint(1))), irr.element(ib.add(uint(2))));
             const wasBlack = dot(prev, vec3(1.0)).lessThan(float(1e-6));
-            const h = select(wasBlack, float(0.0), U.hysteresis);
+            // disocclusion-safe adaptive hysteresis (SVGF antilag) from the stored
+            // luminance 2nd moment: a big disagreement vs the temporal std-dev →
+            // trust→0 → snap to the new sample (no ghost); steady per-tick ray noise
+            // stays under the EPS floor so it can NOT lower hysteresis (no re-splotch).
+            const LUMA = vec3(0.2126, 0.7152, 0.0722);
+            const curL = dot(meanRad, LUMA);
+            const prevL = dot(prev, LUMA);
+            const prevM2 = irr.element(ib.add(uint(3)));
+            const varL = tslMax(prevM2.sub(prevL.mul(prevL)), float(0.0));
+            const dLum = tslAbs(curL.sub(prevL));
+            const trust = exp(dLum.mul(dLum).div(varL.mul(float(GI_ANTILAG_K)).add(float(GI_ANTILAG_EPS))).mul(-1.0));
+            const h = select(wasBlack, float(0.0), U.hysteresis.mul(trust));
             const blended = mix(meanRad, prev, h);
             irr.element(ib).assign(blended.x);
             irr.element(ib.add(uint(1))).assign(blended.y);
             irr.element(ib.add(uint(2))).assign(blended.z);
+            // luminance 2nd moment E[L²] in the FREE 4th slot (buffer-only; the upload
+            // keeps atlas.w=1.0 so the fragment sampler never sees it). luma is linear
+            // → E[luma]=luma(E[rgb]), so variance = max(0, M2 − luma(rgb)²) anywhere.
+            const m2 = mix(curL.mul(curL), prevM2, h);
+            irr.element(ib.add(uint(3))).assign(m2);
 
             // depth moments: same hysteresis; fill instantly when unseeded.
             const db = probeIndex.mul(uint(TILE * TILE)).add(local).mul(uint(2)).toVar();
@@ -577,9 +620,41 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
             const row = probeIndex.div(U.resX.mul(U.resY)).mul(U.resY).add(probeIndex.div(U.resX).mod(U.resY));
             const tx = col.mul(uint(TILE)).add(lx);
             const ty = row.mul(uint(TILE)).add(ly);
+            // ── intra-tile variance/edge-stopped spatial filter (CORE splotch killer).
+            // Reads the read-only irrBuffer and writes the write-only atlas, so the
+            // denoised result never feeds back into history (no over-blur, no RAW
+            // hazard). Interior texels only; the 1px octahedral gutter is copied raw.
+            // Taps stay inside THIS probe's tile → cannot mix radiance across a wall.
+            const LUMA = vec3(0.2126, 0.7152, 0.0722);
             const ib = gid.mul(uint(4));
-            const e = vec3(irrRead.element(ib), irrRead.element(ib.add(uint(1))), irrRead.element(ib.add(uint(2))));
-            textureStore(atlas, uvec2(tx, ty), vec4(e, float(1.0))).toWriteOnly();
+            const eC = vec3(irrRead.element(ib), irrRead.element(ib.add(uint(1))), irrRead.element(ib.add(uint(2)))).toVar();
+            const lumaC = dot(eC, LUMA);
+            const varC = tslMax(irrRead.element(ib.add(uint(3))).sub(lumaC.mul(lumaC)), float(0.0));
+            const probeBase = probeIndex.mul(uint(TILE * TILE)).toVar();
+            const lxI = int(lx); const lyI = int(ly);
+            const facc = vec3(0.0).toVar();
+            const fwsum = float(0.0).toVar();
+            for (let jy = -1; jy <= 1; jy++) {
+                for (let jx = -1; jx <= 1; jx++) {
+                    const gw = Math.exp(-(jx * jx + jy * jy) * 0.5); // separable 3×3 gaussian (JS const)
+                    const nx = lxI.add(int(jx)).clamp(int(BORDER), int(BORDER + OCT_RES - 1)).toUint();
+                    const ny = lyI.add(int(jy)).clamp(int(BORDER), int(BORDER + OCT_RES - 1)).toUint();
+                    const nIb = probeBase.add(ny.mul(uint(TILE))).add(nx).mul(uint(4));
+                    const en = vec3(irrRead.element(nIb), irrRead.element(nIb.add(uint(1))), irrRead.element(nIb.add(uint(2))));
+                    const dLum = dot(en, LUMA).sub(lumaC);
+                    // variance-adaptive edge stop: noisy texel (high var) → wide trust →
+                    // blur; converged texel (var→0) → narrow → preserve directional detail.
+                    const es = exp(dLum.mul(dLum).div(varC.mul(float(GI_FILTER_K)).add(tslMax(float(GI_FILTER_EPS), lumaC.mul(lumaC).mul(float(GI_FILTER_REL))))).mul(-1.0));
+                    const w = float(gw).mul(es);
+                    facc.addAssign(en.mul(w));
+                    fwsum.addAssign(w);
+                }
+            }
+            const filtered = facc.div(fwsum.max(float(1e-4)));
+            const isInterior = lx.greaterThanEqual(uint(BORDER)).and(lx.lessThanEqual(uint(BORDER + OCT_RES - 1)))
+                .and(ly.greaterThanEqual(uint(BORDER))).and(ly.lessThanEqual(uint(BORDER + OCT_RES - 1)));
+            const outE = select(isInterior, mix(eC, filtered, U.filterStrength), eC);
+            textureStore(atlas, uvec2(tx, ty), vec4(outE, float(1.0))).toWriteOnly();
             const db = gid.mul(uint(2));
             const dd = vec2(depthRead.element(db), depthRead.element(db.add(uint(1))));
             textureStore(depthAtlas, uvec2(tx, ty), vec4(dd.x, dd.y, float(0.0), float(1.0))).toWriteOnly();
@@ -715,6 +790,13 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
         probeCursor = 0;
         dirty = false;
         needsClassify = true;
+        // The setGrid/setAtlases calls above bumped _structGen → the lights-node
+        // cacheToken changed. Force the one-shot material recompile NOW, the frame
+        // the probe data first exists, so the field folds into the lights graph
+        // immediately on enable / after a settled geometry rebuild — not a rebuild
+        // late. Fires only here (once per rebuild, already debounced), never per
+        // tick → cannot reintroduce recompile churn.
+        if (typeof onRebuilt === 'function') { try { onRebuilt(); } catch (e) { /* non-fatal */ } }
         return true;
     }
 
@@ -834,14 +916,16 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
             node.setClassifyStrength(v); // node-side: classification gate + relocation apply
             if (Number.isFinite(v)) U.classifyStrength.value = THREE.MathUtils.clamp(v, 0, 1); // trace-side relocation apply
         },
+        setFilterStrength: (v) => { if (Number.isFinite(v)) U.filterStrength.value = THREE.MathUtils.clamp(v, 0, 1); }, // CORE denoise: 0 = off (harness baseline), 1 = full
         requestRebuild,
         setBounds,
         setVolumes,
         isSupported,
         hasData: () => node._hasData === true,
-        getStats: () => ({ probes: probeTotal, res: res.clone(), atlas: [atlasW, atlasH], rays: RAYS_PER_PROBE, active: node.active }),
+        getStats: () => ({ probes: probeTotal, res: res.clone(), atlas: [atlasW, atlasH], rays: RAYS_PER_PROBE, oct: OCT_RES, tile: TILE, active: node.active }),
         getResolution: () => res.clone(),
         getBounds: () => new THREE.Box3(gridMin.clone(), gridMin.clone().add(gridSize)),
+        _debugUpload: async () => { if (gpu && !disposed) { try { await renderer.computeAsync(gpu.uploadKernel); } catch (e) { /* harness-only */ } } },
         _debugAtlas: () => gpu?.atlas || null,
         _debugDepthAtlas: () => gpu?.depthAtlas || null,
         _debugStateAtlas: () => gpu?.stateAtlas || null,

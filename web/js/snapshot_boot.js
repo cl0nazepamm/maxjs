@@ -948,6 +948,11 @@ function resolveSnapshotLayerFactory(moduleNamespace) {
     throw new Error('Snapshot layer module must export default/createLayer/mount or layer hooks');
 }
 
+function resolveSnapshotStaticParameters(moduleNamespace) {
+    const params = moduleNamespace?.parameters ?? moduleNamespace?.params;
+    return params && typeof params === 'object' ? params : null;
+}
+
 function buildSnapshotManifestLayers(manifest) {
     const rawLayers = Array.isArray(manifest?.layers) ? manifest.layers : [];
     return rawLayers
@@ -958,6 +963,7 @@ function buildSnapshotManifestLayers(manifest) {
             entryPath: entry?.entry || entry?.path || 'main.js',
             source: 'project',
             enabled: true,
+            paramValues: entry?.paramValues ?? entry?.parameters ?? entry?.params,
         }));
 }
 
@@ -971,6 +977,8 @@ function buildSnapshotRuntimeLayers(runtimeScene) {
             entryPath: entry.entry,
             source: entry.source || 'inline',
             enabled: true,
+            parameters: entry.parameters ?? [],
+            paramValues: entry.paramValues ?? entry.parameters ?? entry.params,
         }));
 }
 
@@ -1011,12 +1019,17 @@ async function bindLayerProject(root, meta, layerManager) {
             const factory = resolveSnapshotLayerFactory(moduleNamespace);
             const result = await layerManager.mount(
                 entry.id,
-                async (ctx, THREE_arg) => factory(ctx, THREE_arg, { manifest, layer: entry }),
+                async (ctx, THREE_arg) => {
+                    const staticParams = resolveSnapshotStaticParameters(moduleNamespace);
+                    if (staticParams) ctx.params.define(staticParams);
+                    return factory(ctx, THREE_arg, { manifest, layer: entry });
+                },
                 {
                     name: entry.name || entry.id,
                     code: moduleUrl.toString(),
                     source: entry.source || 'project',
                     entry: entry.entryPath,
+                    paramValues: entry.paramValues ?? entry.parameters ?? entry.params,
                 },
             );
             if (result?.error) throw new Error(result.error);

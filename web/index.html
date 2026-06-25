@@ -1087,7 +1087,7 @@
             // node only injects into context.irradiance while active, so an unbuilt /
             // disabled field changes nothing.
             try {
-                const haloField = createHaloProbeField({ renderer, scene, intensity: 1.0 });
+                const haloField = createHaloProbeField({ renderer, scene, intensity: 1.0, onRebuilt: markLightProbeMaterialsDirty });
                 let haloOn = window.MAXJS_HALO_GI === true;
                 let haloLastTick = 0;
                 haloGi = {
@@ -1099,15 +1099,21 @@
                         if (giVolume) { giVolume.setEnabled(false); giVolume.setIntensity(0); }
                         haloField.setEnabled(true);
                         haloField.requestRebuild();
+                        // The fold-in recompile is forced by the field's onRebuilt hook
+                        // (markLightProbeMaterialsDirty) the moment the first rebuild
+                        // produces probe data — same frame the data exists, not a rebuild
+                        // late. Fires once per rebuild (debounced), never per tick.
                         return true;
                     },
                     disable() {
                         haloOn = false;
                         haloField.setEnabled(false);
+                        markLightProbeMaterialsDirty(); // one-shot: drop the probe node from the lights graph this frame
                     },
                     setIntensity: (v) => haloField.setIntensity(v),
                     setCheby: (v) => haloField.setChebyStrength(v), // 0 leaks, 1 leak-free
                     setClassify: (v) => haloField.setClassifyStrength(v), // 0 off (default), 1 drop buried probes (solid scenes)
+                    setFilter: (v) => haloField.setFilterStrength(v),     // CORE denoise: 0 off (baseline), 1 full intra-tile spatial filter
                     setBounds: (box) => haloField.setBounds(box),     // single Probe Origin box; null = auto-fit
                     setVolumes: (boxes) => haloField.setVolumes(boxes), // multiple Probe Origin boxes (unioned for now)
                     getStats: () => haloField.getStats(),
@@ -7488,6 +7494,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
 
             if (transformsChanged || sceneChanged) layerManager.markRuntimeTransformsDirty?.();
             finalizeSceneSnapshot(meta, 'binary-scene', applyStart, meta.stats?.producerBytes ?? buffer.byteLength, {
+                binaryBuffer: buffer,
                 bucketPlan,
                 sceneChanged,
                 afterWorldUpdate() {
@@ -7708,7 +7715,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             const isLine = !!options.isLine;
             const geom = new THREE.BufferGeometry();
             geom.setAttribute('position', new THREE.Float32BufferAttribute(vertices, 3));
-            if (indices?.length) geom.setIndex(indices);
+            if (indices?.length) geom.setIndex(new THREE.BufferAttribute(indices, 1));
             if (uvs?.length) geom.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
             if (options.uv2s?.length) {
                 const uv2Attr = new THREE.Float32BufferAttribute(options.uv2s, 2);
@@ -10612,7 +10619,10 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
 
         function applyForestInstances(groups, binaryBuffer = null) {
             const buildSerial = ++forestBuildSerial;
+            const buildStart = performance.now();
+            let addedMeshes = 0;
             // Remove old forest meshes
+            const removedMeshes = forestMeshes.size;
             const disposedGeometries = new Set();
             const disposedMaterials = new Set();
             for (const [key, mesh] of forestMeshes) {
@@ -10626,7 +10636,28 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             }
             forestMeshes.clear();
 
-            if (!Array.isArray(groups) || groups.length === 0) return;
+            const markForestInstancesReady = () => {
+                if (buildSerial !== forestBuildSerial) return;
+                scene.updateMatrixWorld(true);
+                layerManager.markRuntimeTransformsDirty?.();
+                maxjsFx.markSceneChanged?.();
+                markLightProbeSceneDirty();
+                scheduleLightProbeFromCurrentScene({ delay: 350 });
+                schedulePathTracingLiveRebuild();
+                updateSyncHud({
+                    countAsAppliedSync: false,
+                    transport: transportMode,
+                    frameId: 0,
+                    producerBytes: 0,
+                    decodeMs: 0,
+                    applyMs: performance.now() - buildStart,
+                });
+            };
+
+            if (!Array.isArray(groups) || groups.length === 0) {
+                if (removedMeshes > 0) markForestInstancesReady();
+                return;
+            }
             maxjsDebugLog('[ForestPack]', groups.length, 'groups, total instances:', groups.reduce((s, g) => s + (g.count || 0), 0));
 
             const buildForestInstances = async () => {
@@ -10711,8 +10742,10 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     }
                     maxRoot.add(instMesh);
                     forestMeshes.set(batchCount > 1 ? `${groupKey}:${batchIndex}` : groupKey, instMesh);
+                    addedMeshes++;
                 }
             }
+            if (addedMeshes > 0 || removedMeshes > 0) markForestInstancesReady();
             };
             buildForestInstances().catch(err => console.error('[ForestPack] async build failed', err));
         }
@@ -12575,6 +12608,102 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             }
         }
 
+        function formatLayerParamValue(param) {
+            if (param?.type === 'color') return String(param.value || '#ffffff').toLowerCase();
+            if (param?.type === 'bool') return param.value ? 'On' : 'Off';
+            const n = Number(param?.value);
+            if (!Number.isFinite(n)) return String(param?.value ?? '');
+            if (Math.abs(n) >= 100) return n.toFixed(1).replace(/\.0$/, '');
+            if (Math.abs(n) >= 10) return n.toFixed(2).replace(/\.?0+$/, '');
+            return n.toFixed(3).replace(/\.?0+$/, '');
+        }
+
+        function layerParamNumberAttrs(param) {
+            const attrs = [];
+            if (Number.isFinite(Number(param.min))) attrs.push(`min="${Number(param.min)}"`);
+            if (Number.isFinite(Number(param.max))) attrs.push(`max="${Number(param.max)}"`);
+            if (param.step != null) attrs.push(`step="${escapeWebPanelText(param.step)}"`);
+            return attrs.join(' ');
+        }
+
+        function renderLayerParamControl(layer, param) {
+            const name = String(param?.name || '');
+            if (!name) return '';
+            const idAttr = escapeWebPanelText(layer.id);
+            const nameAttr = escapeWebPanelText(name);
+            const label = escapeWebPanelText(param.label || name);
+            const title = escapeWebPanelText(param.description || param.label || name);
+            const value = param.type === 'color'
+                ? escapeWebPanelText(String(param.value || '#ffffff'))
+                : escapeWebPanelText(String(param.value ?? ''));
+            const common = `data-layer-param-layer="${idAttr}" data-layer-param="${nameAttr}" data-layer-param-type="${escapeWebPanelText(param.type || '')}"`;
+            const valueHtml = `<span class="layer-param-value" data-layer-param-value>${escapeWebPanelText(formatLayerParamValue(param))}</span>`;
+
+            if (param.type === 'slider') {
+                return `<label class="layer-param layer-param-slider" title="${title}">
+                    <span class="layer-param-head"><span>${label}</span>${valueHtml}</span>
+                    <input class="layer-param-input layer-param-range fx-range" type="range" ${common} ${layerParamNumberAttrs(param)} value="${value}">
+                </label>`;
+            }
+            if (param.type === 'float') {
+                return `<label class="layer-param layer-param-float" title="${title}">
+                    <span class="layer-param-head"><span>${label}</span>${valueHtml}</span>
+                    <input class="layer-param-input layer-param-number" type="number" ${common} ${layerParamNumberAttrs(param)} value="${value}">
+                </label>`;
+            }
+            if (param.type === 'color') {
+                return `<label class="layer-param layer-param-color" title="${title}">
+                    <span class="layer-param-head"><span>${label}</span>${valueHtml}</span>
+                    <input class="layer-param-input layer-param-swatch" type="color" ${common} value="${value}">
+                </label>`;
+            }
+            if (param.type === 'bool') {
+                return `<label class="layer-param layer-param-bool" title="${title}">
+                    <span class="layer-param-head"><span>${label}</span>${valueHtml}</span>
+                    <input class="layer-param-input layer-param-check" type="checkbox" ${common} ${param.value ? 'checked' : ''}>
+                </label>`;
+            }
+            return '';
+        }
+
+        function renderLayerParams(layer) {
+            const params = Array.isArray(layer.parameters) ? layer.parameters : [];
+            if (params.length === 0) return '';
+            const controls = params.map(param => renderLayerParamControl(layer, param)).filter(Boolean).join('');
+            return controls ? `<div class="layer-params">${controls}</div>` : '';
+        }
+
+        function readLayerParamInput(input) {
+            if (input.type === 'checkbox') return input.checked;
+            return input.value;
+        }
+
+        function syncLayerParamControl(control, param) {
+            if (!control || !param) return;
+            const valueEl = control.querySelector('[data-layer-param-value]');
+            if (valueEl) valueEl.textContent = formatLayerParamValue(param);
+            control.querySelectorAll('input[data-layer-param]').forEach(input => {
+                if (input.type === 'checkbox') {
+                    input.checked = !!param.value;
+                } else if (document.activeElement !== input || input.type === 'range' || input.type === 'color') {
+                    input.value = String(param.value ?? '');
+                }
+            });
+        }
+
+        function handleLayerParamInput(input, commit = false) {
+            if (!input) return;
+            if ((input.type === 'number' || input.type === 'range') && !Number.isFinite(Number(input.value))) return;
+            const layerId = input.dataset.layerParamLayer;
+            const name = input.dataset.layerParam;
+            if (!layerId || !name) return;
+            const param = _layerManagerRef?.setParameter?.(layerId, name, readLayerParamInput(input), {
+                source: 'ui',
+                silent: !commit,
+            });
+            if (param) syncLayerParamControl(input.closest('.layer-param'), param);
+        }
+
         function refreshLayersPanel() {
             if (!layersPanelVisible || !_layerManagerRef) return;
             const projectState = getProjectRuntimeState();
@@ -12591,19 +12720,20 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 <div class="layer-item${l.error ? ' error' : ''}${!l.active ? ' inactive' : ''}">
                     <div class="layer-main">
                         <div class="layer-meta">
-                            <span class="layer-name" title="${l.name}">${l.name}</span>
+                            <span class="layer-name" title="${escapeWebPanelText(l.name)}">${escapeWebPanelText(l.name)}</span>
                             ${Number.isFinite(l.priority) && l.priority !== 100 ? `<span class="layer-priority" title="Load priority (lower = earlier)">${l.priority}</span>` : ''}
                             <span class="layer-source ${l.source === 'project' ? 'project' : 'inline'}">${l.source}</span>
                             <span class="layer-status ${getLayerStatus(l).className}">${getLayerStatus(l).label}</span>
                         </div>
-                        <div class="layer-detail" title="${getLayerDetails(l)}">${getLayerDetails(l)}</div>
+                        <div class="layer-detail" title="${escapeWebPanelText(getLayerDetails(l))}">${escapeWebPanelText(getLayerDetails(l))}</div>
                     </div>
                     <div class="layer-actions">
                         ${l.source === 'project' || l.persisted !== false
-                            ? `<button class="layer-action layer-toggle" data-layer-toggle="${l.id}">${l.enabled === false ? 'Enable' : 'Disable'}</button>`
+                            ? `<button class="layer-action layer-toggle" data-layer-toggle="${escapeWebPanelText(l.id)}">${l.enabled === false ? 'Enable' : 'Disable'}</button>`
                             : ''
                         }
                     </div>
+                    ${renderLayerParams(l)}
                 </div>`;
 
             // Group by folder. Root ('') renders flat at top; named folders render as
@@ -12664,6 +12794,10 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     const layer = layers.find(item => item.id === btn.dataset.layerRemove);
                     if (layer) void handleLayerRemove(layer);
                 });
+            });
+            layersPanel.querySelectorAll('input[data-layer-param]').forEach(input => {
+                input.addEventListener('input', () => handleLayerParamInput(input, false));
+                input.addEventListener('change', () => handleLayerParamInput(input, true));
             });
             layersPanel.querySelectorAll('details[data-folder]').forEach(el => {
                 el.addEventListener('toggle', () => {
@@ -13095,16 +13229,16 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     filmWeave: 0.4,
                     filmFlicker: 0.12,
                     filmNegative: false,
-                    infraredPreset: 'ethereal_green',
-                    irExposure: 1.25,
+                    infraredPreset: 'white_phosphor',
+                    irExposure: 0.85,
                     irResponse: 0.0,
-                    irLocalGain: 0.48,
-                    irGlow: 0.92,
-                    irGlowThreshold: 0.43,
-                    irEyes: 1.15,
-                    irNoise: 1.0,
-                    irVignette: 0.52,
-                    irHotspot: 0.12,
+                    irLocalGain: 0.46,
+                    irGlow: 0.34,
+                    irGlowThreshold: 0.44,
+                    irEyes: 0.78,
+                    irNoise: 0.48,
+                    irVignette: 0.26,
+                    irHotspot: 0.055,
                     freezeNoise: false,
                     ...(state.powershot || {}),
                 }),
@@ -13118,7 +13252,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                             { value: 'digital', label: 'Digital CCD' },
                             { value: 'analog', label: 'Analog VHS' },
                             { value: 'film', label: 'Film Print' },
-                            { value: 'infrared', label: 'Night Vision' },
+                            { value: 'infrared', label: 'White Phosphor' },
                         ],
                     },
                     {
@@ -13139,16 +13273,6 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                         options: maxjsFx.getPowerShotPresets().map((preset) => ({
                             value: preset.key,
                             label: `${preset.key} - ${preset.label}`,
-                        })),
-                    },
-                    {
-                        key: 'infraredPreset',
-                        label: 'Tube',
-                        type: 'select',
-                        visibleWhen: isPowerShotInfraredMode,
-                        options: maxjsFx.getPowerShotInfraredPresets().map((preset) => ({
-                            value: preset.key,
-                            label: preset.label,
                         })),
                     },
                     { key: 'amount', label: 'Amount', min: 0, max: 1, step: 0.01, realtime: true },
@@ -13191,10 +13315,10 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     { key: 'irExposure', label: 'Exposure (stops)', min: -3, max: 4, step: 0.05, realtime: true, visibleWhen: isPowerShotInfraredMode },
                     { key: 'irResponse', label: 'IR Response', min: 0, max: 1, step: 0.01, realtime: true, visibleWhen: isPowerShotInfraredMode },
                     { key: 'irLocalGain', label: 'Local Gain', min: 0, max: 1.5, step: 0.01, realtime: true, visibleWhen: isPowerShotInfraredMode },
-                    { key: 'irGlow', label: 'Green Bloom', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotInfraredMode },
+                    { key: 'irGlow', label: 'Halo Bloom', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotInfraredMode },
                     { key: 'irGlowThreshold', label: 'Bloom Threshold', min: 0, max: 1, step: 0.01, realtime: true, visibleWhen: isPowerShotInfraredMode },
                     { key: 'irEyes', label: 'Eye Flare', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotInfraredMode },
-                    { key: 'irNoise', label: 'Sensor Noise', min: 0, max: 3, step: 0.01, realtime: true, affectsVisibility: true, visibleWhen: isPowerShotInfraredMode },
+                    { key: 'irNoise', label: 'Tube Scintillation', min: 0, max: 3, step: 0.01, realtime: true, affectsVisibility: true, visibleWhen: isPowerShotInfraredMode },
                     { key: 'irVignette', label: 'Tube Vignette', min: 0, max: 1, step: 0.01, realtime: true, visibleWhen: isPowerShotInfraredMode },
                     { key: 'irHotspot', label: 'Hotspot', min: 0, max: 1, step: 0.01, realtime: true, visibleWhen: isPowerShotInfraredMode },
                     { key: 'freezeNoise', label: 'Freeze Noise', type: 'checkbox', visibleWhen: isPowerShotTemporalNoiseActive },

@@ -6,6 +6,7 @@ import { maxTimeline } from './maxjs_timeline.js';
 import { createCameraAdapter } from './layer_camera_adapter.js';
 import { createInputHelper, createInstancesFacade, createMaxSceneFacade, createNodeMapFacade, createRendererFacade } from './layer_facades.js';
 import { createDeformSystem } from './layer_deform.js';
+import { createLayerParamController } from './layer_params.js';
 import { createMaxNodeAdapter } from './layer_node_adapter.js';
 import { createRuntimeOverrideController } from './layer_runtime_overrides.js';
 import {
@@ -329,6 +330,12 @@ export function createLayerManager({
         return () => listeners.delete(listener);
     }
 
+    const paramController = createLayerParamController({
+        THREE,
+        emitChange,
+        debugWarn,
+    });
+
     function snapshotLayer(layer) {
         return {
             id: layer.id,
@@ -341,6 +348,7 @@ export function createLayerManager({
             active: layer.active,
             loading: layer.loading,
             error: layer.error,
+            parameters: paramController.list(layer),
             anchors: layer.anchors.length,
             tracked: layer.tracked.size,
             profile: freezePlainObject({
@@ -896,6 +904,7 @@ export function createLayerManager({
             camera: cameraFacade,
             renderer: rendererFacade,
             instances: instancesFacade,
+            params: paramController.createFacade(layer),
             deform: deformSystem.createLayerFacade(layer.id, handle => getLayerNodeAdapter(layer, handle)),
             anim: animFacade,
             audio: createLayerAudioFacade(layer),
@@ -1027,6 +1036,7 @@ export function createLayerManager({
             },
             ctx: null,
         };
+        paramController.initLayer(layer, options);
 
         jsWorldRoot.add(group);
         overlayWorldRoot.add(overlayGroup);
@@ -1048,6 +1058,10 @@ export function createLayerManager({
                 return { id, error: 'Layer replaced during load' };
             }
             layer.hooks = hooks || {};
+            const hookParams = layer.hooks.parameters ?? layer.hooks.params;
+            if (hookParams && typeof hookParams === 'object') {
+                paramController.define(layer, hookParams, undefined, { source: 'hooks', silent: true });
+            }
             if (typeof layer.hooks.init === 'function') {
                 await layer.hooks.init(layer.ctx);
             }
@@ -1067,6 +1081,7 @@ export function createLayerManager({
     function remove(id, options = {}) {
         const layer = layers.get(id);
         if (!layer) return false;
+        paramController.remember(layer);
 
         if (layer.hooks && typeof layer.hooks.dispose === 'function') {
             try {
@@ -1348,6 +1363,7 @@ export function createLayerManager({
                 priority: Number.isFinite(layer.priority) ? layer.priority : 100,
                 active: layer.active,
                 error: layer.error,
+                parameters: paramController.list(layer),
             })),
             jsRoot,
             overlayRoot,
@@ -1372,6 +1388,7 @@ export function createLayerManager({
             folder: layer.folder || '',
             priority: Number.isFinite(layer.priority) ? layer.priority : 100,
             enabled: layer.active,
+            parameters: paramController.list(layer),
         }));
     }
 
@@ -1413,6 +1430,12 @@ export function createLayerManager({
             }
             if (changed) emitChange('meta');
             return changed;
+        },
+        setParameter(id, name, value, options = {}) {
+            return paramController.setLayerParameter(layers, id, name, value, options);
+        },
+        setParam(id, name, value, options = {}) {
+            return paramController.setLayerParameter(layers, id, name, value, options);
         },
         getBus() {
             return {

@@ -81,15 +81,15 @@ export function normalizePowerShotInfraredPreset(value) {
 export function powerShotInfraredPresetUiDefaults(key) {
     const preset = POWERSHOT_INFRARED_PRESETS[normalizePowerShotInfraredPreset(key)];
     return {
-        irExposure: preset.exposure ?? 1.25,
+        irExposure: preset.exposure ?? 0.85,
         irResponse: preset.nir_input ?? 0,
-        irLocalGain: preset.local_gain ?? 0.48,
-        irGlow: preset.glow_strength ?? 0.92,
-        irGlowThreshold: preset.glow_threshold ?? 0.43,
-        irEyes: preset.eye_strength ?? 1.15,
-        irNoise: preset.noise_amount ?? 1.0,
-        irVignette: preset.vignette ?? 0.52,
-        irHotspot: preset.hotspot ?? 0.12,
+        irLocalGain: preset.local_gain ?? 0.46,
+        irGlow: preset.glow_strength ?? 0.34,
+        irGlowThreshold: preset.glow_threshold ?? 0.44,
+        irEyes: preset.eye_strength ?? 0.78,
+        irNoise: preset.noise_amount ?? 0.48,
+        irVignette: preset.vignette ?? 0.26,
+        irHotspot: preset.hotspot ?? 0.055,
     };
 }
 
@@ -204,15 +204,15 @@ export function createPowerShotFinal({
         p.filmFlicker = THREE.MathUtils.clamp(finiteOr(p.filmFlicker, 0.12), 0, 1);
         p.filmNegative = !!p.filmNegative;
         p.infraredPreset = normalizePowerShotInfraredPreset(p.infraredPreset);
-        p.irExposure = THREE.MathUtils.clamp(finiteOr(p.irExposure, 1.25), -3, 4);
+        p.irExposure = THREE.MathUtils.clamp(finiteOr(p.irExposure, 0.85), -3, 4);
         p.irResponse = THREE.MathUtils.clamp(finiteOr(p.irResponse, 0), 0, 1);
-        p.irLocalGain = THREE.MathUtils.clamp(finiteOr(p.irLocalGain, 0.48), 0, 1.5);
-        p.irGlow = THREE.MathUtils.clamp(finiteOr(p.irGlow, 0.92), 0, 3);
-        p.irGlowThreshold = THREE.MathUtils.clamp(finiteOr(p.irGlowThreshold, 0.43), 0, 1);
-        p.irEyes = THREE.MathUtils.clamp(finiteOr(p.irEyes, 1.15), 0, 3);
-        p.irNoise = THREE.MathUtils.clamp(finiteOr(p.irNoise, 1.0), 0, 3);
-        p.irVignette = THREE.MathUtils.clamp(finiteOr(p.irVignette, 0.52), 0, 1);
-        p.irHotspot = THREE.MathUtils.clamp(finiteOr(p.irHotspot, 0.12), 0, 1);
+        p.irLocalGain = THREE.MathUtils.clamp(finiteOr(p.irLocalGain, 0.46), 0, 1.5);
+        p.irGlow = THREE.MathUtils.clamp(finiteOr(p.irGlow, 0.34), 0, 3);
+        p.irGlowThreshold = THREE.MathUtils.clamp(finiteOr(p.irGlowThreshold, 0.44), 0, 1);
+        p.irEyes = THREE.MathUtils.clamp(finiteOr(p.irEyes, 0.78), 0, 3);
+        p.irNoise = THREE.MathUtils.clamp(finiteOr(p.irNoise, 0.48), 0, 3);
+        p.irVignette = THREE.MathUtils.clamp(finiteOr(p.irVignette, 0.26), 0, 1);
+        p.irHotspot = THREE.MathUtils.clamp(finiteOr(p.irHotspot, 0.055), 0, 1);
         return p;
     }
 

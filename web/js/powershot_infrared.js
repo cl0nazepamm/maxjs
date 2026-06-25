@@ -1,9 +1,14 @@
-// PowerSHOT infrared mode - pseudo-NIR night-vision / phosphor imaging.
+// PowerSHOT infrared mode - image-intensifier night-vision emulation.
 //
-// This is a separate imaging path from the visible-light digital ISP. It works
-// in scene-linear 0..1+ values, packs adaptation / bloom / eye-glow sources
-// into one quarter-resolution analysis target, then develops the final green
-// phosphor image in one full-resolution pass.
+// This is a separate imaging path from the visible-light digital ISP. It models
+// a modern Gen-3 image-intensifier tube: a GaAs photocathode (red/NIR-weighted
+// spectral response), an MCP gain stage with a constant-output transfer curve,
+// resolution-limited optics, sparse photon scintillation, and a phosphor screen.
+//
+// It works in a single scalar "electron-flux" channel L in scene-linear 0..1+,
+// packs adaptation / halo / eye-glow sources into one quarter-resolution
+// analysis target, then develops the final phosphor image in one full-resolution
+// pass. The shipped look is a high-end white-phosphor tube.
 
 import * as THREE from "three/webgpu";
 import {
@@ -13,6 +18,7 @@ import {
 } from "three/tsl";
 
 const LUM709 = vec3(0.2126, 0.7152, 0.0722);
+const TAU = 6.2831853;
 
 function exp2u(x) {
   return exp(x.mul(Math.LN2));
@@ -31,13 +37,6 @@ function linearToSrgb(c) {
   return mix(lo, hi, step(0.0031308, v));
 }
 
-function hash12(p) {
-  const a = fract(vec3(p.x, p.y, p.x).mul(0.1031));
-  const d = dot(a, vec3(a.y, a.z, a.x).add(33.33));
-  const b = a.add(d);
-  return fract(b.x.add(b.y).mul(b.z));
-}
-
 function hash13(p) {
   const a = fract(p.mul(0.1031));
   const d = dot(a, vec3(a.z, a.y, a.x).add(31.32));
@@ -45,47 +44,146 @@ function hash13(p) {
   return fract(b.x.add(b.y).mul(b.z));
 }
 
-function gaussFixed(p, salt) {
-  const q = p.add(salt);
-  const u1 = hash12(q).max(1e-6);
-  const u2 = hash12(q.add(vec2(19.19, 7.41))).max(1e-6);
-  return sqrt(log(u1).mul(-2.0)).mul(cos(u2.mul(6.2831853)));
-}
-
+// Box-Muller gaussian keyed to a grain cell and a temporal phase. Used for the
+// continuous shot-noise "fizz" on lit surfaces (Poisson sqrt(N) behaviour).
 function gaussTemporal(p, t, salt) {
   const u1 = hash13(vec3(p.x, p.y, t.add(salt))).max(1e-6);
   const u2 = hash13(vec3(p.x.add(11.0), p.y.add(3.0), t.add(salt).add(1.7))).max(1e-6);
   return sqrt(log(u1).mul(-2.0)).mul(cos(u2.mul(6.2831853)));
 }
 
-function pseudoNirValue(srcTex, ctx, uv) {
-  const lin = srgbToLinear(texture(srcTex, uv).rgb);
-  const broad = dot(lin, ctx.P.spectralMix);
+// --- Stage 1: GaAs photocathode spectral response -------------------------
+// Fake the NIR-weighted response of a Gen-3 photocathode from an sRGB frame
+// (which carries no real NIR): rising red>green>blue quantum efficiency, a
+// chlorophyll "Wood effect" foliage glow, a waxy skin lift, and suppression of
+// blue sky / open water toward black. Returns the scalar electron flux.
+function nirFromLinear(lin, ctx) {
+  const P = ctx.P;
+  const broad = dot(lin, P.spectralMix);
   const redExcess = max(lin.r.sub(lin.g.add(lin.b).mul(0.5)), 0.0);
-  const greenExcess = max(lin.g.sub(max(lin.r, lin.b)), 0.0);
-  const simulated = broad
-    .add(redExcess.mul(ctx.P.redReflectance))
-    .add(greenExcess.mul(ctx.P.greenReflectance))
-    .sub(lin.b.mul(ctx.P.blueSuppression));
-  const monoInput = dot(lin, LUM709);
+  const greenDominance = max(lin.g.sub(lin.r.mul(0.58).add(lin.b.mul(0.42))), 0.0);
+  const vegExcess = greenDominance.mul(smoothstep(0.035, 0.55, lin.g));
+  const skin = max(min(lin.r.mul(0.95), lin.g).sub(lin.b.mul(0.72)), 0.0);
+  const skyMask = smoothstep(0.02, 0.38, lin.b.sub(max(lin.r, lin.g).mul(0.86)));
+  const waterMask = smoothstep(0.02, 0.34, min(lin.g, lin.b).sub(lin.r.mul(1.12)));
 
-  return mix(simulated, monoInput, ctx.P.nirInput)
-    .max(0.0)
-    .mul(exp2u(ctx.P.exposure));
+  let sim = broad
+    .add(redExcess.mul(P.redReflectance))
+    .add(vegExcess.mul(P.greenReflectance))
+    .add(skin.mul(P.skinBoost));
+  sim = sim
+    .mul(float(1.0).sub(P.skySuppress.mul(skyMask)))
+    .mul(float(1.0).sub(P.waterSuppress.mul(waterMask)))
+    .sub(lin.b.mul(P.blueSuppression));
+
+  const mono = dot(lin, LUM709);
+  sim = sim.max(0.0).pow(P.photocathodeGamma);
+  return mix(sim, mono, P.nirInput).max(0.0).mul(exp2u(P.exposure));
 }
 
-function phosphorMap(x, ctx) {
-  let color = mix(
-    ctx.P.shadowColor,
-    ctx.P.midColor,
-    smoothstep(0.0, ctx.P.midPoint, x),
+function pseudoNirValue(srcTex, ctx, uv) {
+  return nirFromLinear(srgbToLinear(texture(srcTex, uv).rgb), ctx);
+}
+
+// --- Stage 7 (folded into read): resolution-limited PSF -------------------
+// A real tube is never razor-sharp (cascaded photocathode gap + MCP pore
+// sampling + phosphor grain + fibre-optic window). A small separable-ish
+// gaussian of the SOURCE keeps the signal soft so scintillation later sits as
+// crisp sparkle on a soft base - the cure for "generic grain".
+function softNir(srcTex, ctx, uv) {
+  const s = ctx.P.psfSigma;
+  const ox = vec2(ctx.texel.x.mul(s), 0.0);
+  const oy = vec2(0.0, ctx.texel.y.mul(s));
+  const wC = 0.4;
+  const wN = 0.15;
+  return pseudoNirValue(srcTex, ctx, uv).mul(wC)
+    .add(pseudoNirValue(srcTex, ctx, uv.add(ox)).mul(wN))
+    .add(pseudoNirValue(srcTex, ctx, uv.sub(ox)).mul(wN))
+    .add(pseudoNirValue(srcTex, ctx, uv.add(oy)).mul(wN))
+    .add(pseudoNirValue(srcTex, ctx, uv.sub(oy)).mul(wN));
+}
+
+// --- Stage 11: phosphor screen --------------------------------------------
+// One intensity-invariant chroma multiply; only the brightest blooming cores
+// desaturate toward white (eye/sensor clip). White phosphor is a cool
+// near-neutral, NOT pure (1,1,1).
+function phosphorMap(L, ctx) {
+  const P = ctx.P;
+  let screen = L.sub(P.screenBlack).max(0.0);
+  screen = screen.mul(P.screenGain);
+  screen = screen.div(screen.add(P.screenShoulder)).mul(P.screenShoulder.add(1.0));
+  screen = screen.max(0.0).pow(P.phosphorGamma);
+
+  const base = P.phosphorChroma.mul(screen);
+  const white = P.highlightWhite.mul(min(screen, float(1.0)));
+  const s = smoothstep(P.bloomStart, P.bloomStart.add(P.bloomRange), screen)
+    .mul(P.highlightDesat);
+  return mix(base, white, s);
+}
+
+// --- Stage 8: chicken-wire fixed pattern ----------------------------------
+// Faint hexagonal MCP multifibre-boundary gain modulation, visible only in
+// bright uniform fields, near-invisible on a high-end white-phosphor tube. A
+// smooth 3-plane-wave honeycomb (no hard SDF) avoids moire against the pixel
+// grid. Replaces the old CCD-style row/column gaussian streaks.
+function hexGain(ctx, uv, L) {
+  const P = ctx.P;
+  const aspect = ctx.resolution.x.div(ctx.resolution.y);
+  const p = vec2(uv.x.sub(0.5).mul(aspect), uv.y.sub(0.5)).mul(P.chickenFreq);
+  const a = p.x;
+  const b = p.x.mul(0.5).add(p.y.mul(0.8660254));
+  const c = p.x.mul(-0.5).add(p.y.mul(0.8660254));
+  const h = cos(a.mul(TAU)).add(cos(b.mul(TAU))).add(cos(c.mul(TAU)));
+  const hn = h.add(1.5).mul(1.0 / 4.5).clamp(0.0, 1.0); // 0 at cell borders, 1 at centres
+  const line = float(1.0).sub(smoothstep(0.0, P.chickenLine.add(1e-3), hn));
+  const gate = smoothstep(P.chickenGateLo, P.chickenGateHi, L);
+  return float(1.0).sub(P.chickenAmp.mul(line).mul(gate));
+}
+
+// --- Stage 9: scintillation -----------------------------------------------
+// The headline fix. Real intensifier noise is NOT symmetric gaussian grain - it
+// is a SPARSE field of brief BRIGHT flashes (single amplified photo-electrons),
+// each ~one resolution element, whose density RISES as the signal falls (dark
+// areas boil, bright areas are clean), riding on the EBI self-glow floor, plus a
+// continuous sqrt(signal) shot fizz on lit surfaces.
+//
+// One frame's sparse sparkle field, a pure function of (cell, frame phase).
+function sparkleAt(cell, fphase, L, ctx) {
+  const P = ctx.P;
+  const u = hash13(vec3(cell.x, cell.y, fphase.add(11.0)));
+  const darkness = float(1.0).sub(smoothstep(0.025, 0.58, L));
+  const dens = P.scintDensity.mul(
+    float(1.0).add(P.scintDarkBoost.mul(darkness)),
   );
-  color = mix(
-    color,
-    ctx.P.highlightColor,
-    smoothstep(ctx.P.highlightStart, 1.0, x),
-  );
-  return color;
+  const fire = step(float(1.0).sub(dens), u); // only the top `dens` fraction fire
+  const v = hash13(vec3(cell.x.add(7.0), cell.y.add(3.0), fphase.add(23.0)));
+  const amp = v.pow(P.scintSharp).mul(P.scintGain); // pow -> rare bright pops, not uniform
+  const ride = P.ebi.mul(P.scintFloor).add(sqrt(L.add(1e-4)).mul(0.5));
+  return fire.mul(amp).mul(ride);
+}
+
+function scintillation(L, ctx) {
+  const P = ctx.P;
+  const grain = max(P.scintGrain, float(0.5));
+  const cell = floor(screenUV.mul(ctx.resolution).div(grain));
+  const f = ctx.frame;
+
+  // Continuous shot fizz: absolute noise ~ sqrt(signal), so relative noise falls
+  // as the surface brightens (correct Poisson / high-SNR behaviour).
+  const shot = gaussTemporal(cell, f, 37.0).mul(sqrt(L.add(P.ebi)).mul(P.shotStrength));
+
+  // Sparse sparkle with a STATELESS phosphor "boil": because each frame's field
+  // is a pure function of (cell, frame), we recompute the two previous frames and
+  // combine with a decaying max() - each flash turns on sharply then fades over a
+  // couple of frames (P45 ~1 ms afterglow), so the field boils rather than
+  // blinks like TV snow. Needs no history buffer, and freezes correctly when the
+  // frame uniform is held constant.
+  const s0 = sparkleAt(cell, f, L, ctx);
+  const s1 = sparkleAt(cell, f.sub(1.0), L, ctx).mul(P.persistence);
+  const s2 = sparkleAt(cell, f.sub(2.0), L, ctx).mul(P.persistence.mul(P.persistence));
+  const sparkle = max(s0, max(s1, s2));
+
+  return shot.add(sparkle).mul(P.noiseAmount);
 }
 
 function infraredOutputAlpha(sourceSample, effectColor) {
@@ -121,83 +219,81 @@ function stAnalysisBlur(tex, ctx, dx, dy) {
 }
 
 function stDevelop(srcTex, ctx, analysisTex, eyeMaskTex, stages) {
+  const P = ctx.P;
   const sourceSample = texture(srcTex, screenUV);
-  const nir = pseudoNirValue(srcTex, ctx, screenUV);
-  const analysis = analysisTex ? texture(analysisTex, screenUV).rgb : vec3(nir, 0.0, 0.0);
-  let signal = nir;
+  const nirSharp = pseudoNirValue(srcTex, ctx, screenUV); // sharp, for eye local contrast
+  const analysis = analysisTex ? texture(analysisTex, screenUV).rgb : vec3(nirSharp, 0.0, 0.0);
 
+  // 1+7: photocathode signal, resolution-limited (soft).
+  let signal = softNir(srcTex, ctx, screenUV);
+
+  // 2: EBI self-glow floor - lifts blacks into a faint glowing grey so noise has
+  // something to ride on (what you see with the lens cap on).
+  signal = signal.add(P.ebi);
+
+  // 3: local adaptation / ABC - huge gain that auto-dims bright regions and lifts
+  // shadows toward a constant output, from the quarter-res blurred local mean.
   if (stages.adaptation) {
     const local = max(analysis.r, float(1e-4));
-    const adaptiveGain = ctx.P.middleGrey
+    const adaptiveGain = P.middleGrey
       .div(local)
-      .pow(ctx.P.localGain)
-      .clamp(ctx.P.minGain, ctx.P.maxGain);
+      .pow(P.localGain)
+      .clamp(P.minGain, P.maxGain);
     signal = signal.mul(adaptiveGain);
   }
 
-  signal = signal.sub(ctx.P.blackPoint).max(0.0);
-  const amplified = signal.mul(ctx.P.gain);
-  signal = amplified.div(amplified.add(1.0)).pow(ctx.P.gamma);
+  // 4: MCP gain + Naka-Rushton transfer - constant-gain region, saturation knee,
+  // and a hard ABC ceiling (maxOutput). The phosphor is linear, so no extra gamma.
+  const x = signal.mul(P.gain);
+  signal = x.div(x.div(P.maxOutput).add(1.0));
 
+  // 5: halo / bloom - bright sources bloom into a fixed angular disc (charge
+  // spreading across the photocathode-MCP gap), constant in screen space.
   if (stages.glow) {
-    signal = signal.add(analysis.g.mul(ctx.P.glowStrength));
+    signal = signal.add(analysis.g.mul(P.glowStrength));
   }
 
+  // 6: eyeshine / retroreflection (animal eyes, retroreflectors under the IR
+  // illuminator), with the optional eye-mask input.
   if (stages.eyes) {
-    const localContrast = nir.sub(analysis.r.mul(ctx.P.eyeLocalRatio)).max(0.0);
+    const localContrast = nirSharp.sub(analysis.r.mul(P.eyeLocalRatio)).max(0.0);
     const eyeCore = smoothstep(
-      ctx.P.eyeThreshold,
-      ctx.P.eyeThreshold.add(ctx.P.eyeSoftness),
+      P.eyeThreshold,
+      P.eyeThreshold.add(P.eyeSoftness),
       localContrast,
-    ).mul(ctx.P.eyeStrength);
+    ).mul(P.eyeStrength);
     signal = signal
-      .add(eyeCore.mul(ctx.P.eyeCoreStrength))
-      .add(eyeCore.mul(analysis.g).mul(ctx.P.eyeHaloStrength));
+      .add(eyeCore.mul(P.eyeCoreStrength))
+      .add(eyeCore.mul(analysis.g).mul(P.eyeHaloStrength));
 
     if (eyeMaskTex) {
       const mask = texture(eyeMaskTex, screenUV).r.clamp(0.0, 1.0);
       signal = signal
-        .add(analysis.b.mul(ctx.P.maskedEyeHalo).mul(ctx.P.eyeStrength))
-        .add(eyeCore.mul(mask).mul(ctx.P.maskedEyeCore));
+        .add(analysis.b.mul(P.maskedEyeHalo).mul(P.eyeStrength))
+        .add(eyeCore.mul(mask).mul(P.maskedEyeCore));
     }
   }
 
+  // 8+9: device-locked chicken-wire, then sparse scintillation on top.
   if (stages.noise) {
-    const px = screenUV.mul(ctx.resolution).div(max(ctx.P.noiseSize, float(0.5)));
-    const cell = floor(px);
-    const amount = ctx.P.noiseAmount;
-    const read = gaussTemporal(cell, ctx.frame, 11.0)
-      .mul(ctx.P.readNoise.mul(signal.oneMinus()).mul(amount));
-    const shot = gaussTemporal(cell, ctx.frame, 37.0)
-      .mul(sqrt(signal.add(1e-4)).mul(ctx.P.shotNoise).mul(amount));
-    const column = gaussFixed(vec2(cell.x, 0.0), vec2(5.3, 0.0));
-    const row = gaussFixed(vec2(0.0, cell.y), vec2(0.0, 9.7));
-    const fixed = column.add(row).mul(0.5).mul(ctx.P.fixedPattern.mul(amount));
-    const phosphor = gaussTemporal(cell, ctx.frame, 71.0)
-      .mul(ctx.P.phosphorNoise.mul(amount));
-    signal = signal.add(read).add(shot).add(fixed).add(phosphor).max(0.0);
+    signal = signal.mul(hexGain(ctx, screenUV, signal));
+    signal = signal.add(scintillation(signal, ctx)).max(P.ebi.mul(0.5));
   }
 
+  // 10: eyepiece shading - circular field-stop vignette + centre hotspot only.
+  // No CRT scanlines and no whole-frame flicker: an intensifier is not a raster
+  // display and autogating runs at kHz, imperceptibly.
   if (stages.display) {
     const p = screenUV.sub(0.5);
     const aspect = ctx.resolution.x.div(ctx.resolution.y);
     const q = vec2(p.x.mul(aspect), p.y);
     const radius = sqrt(dot(q, q));
-    const vignette = float(1.0).sub(
-      smoothstep(0.25, 0.78, radius).mul(ctx.P.vignette),
-    );
-    const hotspot = exp(radius.mul(radius).mul(-8.0)).mul(ctx.P.hotspot);
-    const scan = sin(screenUV.y.mul(ctx.resolution.y).mul(3.14159265))
-      .mul(ctx.P.scanModulation);
-    const flutter = hash13(vec3(floor(ctx.frame), 3.1, 8.7))
-      .sub(0.5)
-      .mul(ctx.P.flicker);
-    signal = signal
-      .mul(vignette)
-      .add(hotspot)
-      .mul(float(1.0).add(scan).add(flutter));
+    const vignette = float(1.0).sub(smoothstep(0.25, 0.78, radius).mul(P.vignette));
+    const hotspot = exp(radius.mul(radius).mul(-8.0)).mul(P.hotspot);
+    signal = signal.mul(vignette).add(hotspot);
   }
 
+  // 11: phosphor colour map.
   const phosphor = phosphorMap(signal.clamp(0.0, 1.35), ctx);
   const effectColor = linearToSrgb(phosphor).clamp(0.0, 1.0);
   const finalColor = mix(sourceSample.rgb, effectColor, ctx.power).clamp(0.0, 1.0);
@@ -212,194 +308,147 @@ export function makeInfraredUniforms() {
     frame: uniform(0),
     power: uniform(1),
     P: {
+      // photocathode spectral response
       exposure: uniform(1.0),
       nirInput: uniform(0.0),
-      spectralMix: uniform(new THREE.Vector3(0.50, 0.42, 0.08)),
-      redReflectance: uniform(0.22),
-      greenReflectance: uniform(0.12),
-      blueSuppression: uniform(0.08),
+      spectralMix: uniform(new THREE.Vector3(0.50, 0.40, 0.10)),
+      redReflectance: uniform(0.25),
+      greenReflectance: uniform(0.65),
+      blueSuppression: uniform(0.10),
+      skySuppress: uniform(0.45),
+      waterSuppress: uniform(0.35),
+      skinBoost: uniform(0.12),
+      photocathodeGamma: uniform(0.88),
 
+      // tube self-glow floor
+      ebi: uniform(0.0045),
+
+      // local adaptation / ABC
       middleGrey: uniform(0.18),
-      localGain: uniform(0.35),
-      minGain: uniform(0.65),
-      maxGain: uniform(3.5),
-      gain: uniform(2.2),
-      blackPoint: uniform(0.008),
-      gamma: uniform(0.68),
+      localGain: uniform(0.32),
+      minGain: uniform(0.70),
+      maxGain: uniform(3.0),
 
-      glowThreshold: uniform(0.58),
-      glowSoftness: uniform(0.20),
-      glowStrength: uniform(0.55),
-      glowRadius: uniform(1.4),
+      // MCP gain + Naka-Rushton transfer
+      gain: uniform(3.4),
+      maxOutput: uniform(1.05),
 
-      eyeStrength: uniform(1.0),
-      eyeThreshold: uniform(0.32),
+      // halo / bloom
+      glowThreshold: uniform(0.60),
+      glowSoftness: uniform(0.22),
+      glowStrength: uniform(0.45),
+      glowRadius: uniform(1.45),
+
+      // eyeshine
+      eyeStrength: uniform(0.90),
+      eyeThreshold: uniform(0.30),
       eyeSoftness: uniform(0.12),
       eyeLocalRatio: uniform(1.15),
-      eyeCoreStrength: uniform(0.55),
-      eyeHaloStrength: uniform(0.60),
+      eyeCoreStrength: uniform(0.56),
+      eyeHaloStrength: uniform(0.50),
       maskedEyeCore: uniform(0.90),
-      maskedEyeHalo: uniform(0.85),
+      maskedEyeHalo: uniform(0.80),
 
-      noiseAmount: uniform(1.0),
-      readNoise: uniform(0.022),
-      shotNoise: uniform(0.035),
-      fixedPattern: uniform(0.008),
-      phosphorNoise: uniform(0.018),
-      noiseSize: uniform(1.0),
+      // resolution-limited optics
+      psfSigma: uniform(0.75),
 
-      shadowColor: uniform(new THREE.Vector3(0.000, 0.008, 0.002)),
-      midColor: uniform(new THREE.Vector3(0.025, 0.560, 0.080)),
-      highlightColor: uniform(new THREE.Vector3(0.720, 1.000, 0.780)),
-      midPoint: uniform(0.60),
-      highlightStart: uniform(0.68),
+      // chicken-wire fixed pattern
+      chickenAmp: uniform(0.02),
+      chickenFreq: uniform(38.0),
+      chickenLine: uniform(0.06),
+      chickenGateLo: uniform(0.45),
+      chickenGateHi: uniform(0.85),
 
-      vignette: uniform(0.42),
-      hotspot: uniform(0.12),
-      scanModulation: uniform(0.015),
-      flicker: uniform(0.012),
+      // scintillation noise
+      noiseAmount: uniform(0.70),
+      scintGrain: uniform(1.15),
+      scintDensity: uniform(0.055),
+      scintGain: uniform(0.55),
+      scintSharp: uniform(3.2),
+      scintDarkBoost: uniform(1.8),
+      shotStrength: uniform(0.035),
+      scintFloor: uniform(0.5),
 
-      persistence: uniform(0.0),
-      persistenceRejection: uniform(8.0),
+      // phosphor screen
+      phosphorChroma: uniform(new THREE.Vector3(0.92, 0.96, 1.00)),
+      highlightWhite: uniform(new THREE.Vector3(1.00, 1.00, 1.00)),
+      screenBlack: uniform(0.004),
+      screenGain: uniform(1.08),
+      screenShoulder: uniform(0.92),
+      phosphorGamma: uniform(0.94),
+      highlightDesat: uniform(0.55),
+      bloomStart: uniform(0.75),
+      bloomRange: uniform(0.55),
+
+      // eyepiece shading
+      vignette: uniform(0.30),
+      hotspot: uniform(0.10),
+
+      // phosphor persistence (scintillation boil tail)
+      persistence: uniform(0.32),
     },
   };
 }
 
 export const INFRARED_PRESETS = {
-  ethereal_green: {
-    name: "Ethereal Green NIR",
-    sensor_resolution: [1280, 960],
-    exposure: 1.25,
-    nir_input: 0.0,
-    spectral_mix: [0.50, 0.42, 0.08],
-    red_reflectance: 0.28,
-    green_reflectance: 0.16,
-    blue_suppression: 0.10,
-    middle_grey: 0.18,
-    local_gain: 0.48,
-    min_gain: 0.75,
-    max_gain: 4.8,
-    gain: 2.75,
-    black_point: 0.010,
-    gamma: 0.62,
-    glow_threshold: 0.43,
-    glow_softness: 0.28,
-    glow_strength: 0.92,
-    glow_radius: 1.75,
-    eye_strength: 1.15,
-    eye_threshold: 0.24,
-    eye_softness: 0.15,
-    eye_local_ratio: 1.10,
-    eye_core_strength: 0.66,
-    eye_halo_strength: 0.72,
-    masked_eye_core: 0.98,
-    masked_eye_halo: 0.95,
-    noise_amount: 1.0,
-    read_noise: 0.026,
-    shot_noise: 0.038,
-    fixed_pattern: 0.010,
-    phosphor_noise: 0.022,
-    noise_size: 1.0,
-    shadow_color: [0.000, 0.008, 0.002],
-    mid_color: [0.022, 0.520, 0.070],
-    highlight_color: [0.760, 1.000, 0.800],
-    mid_point: 0.58,
-    highlight_start: 0.62,
-    vignette: 0.52,
-    hotspot: 0.12,
-    scan_modulation: 0.018,
-    flicker: 0.016,
-    persistence: 0.0,
-  },
-  digital_850nm: {
-    name: "850 nm Digital NoIR",
-    sensor_resolution: [1920, 1080],
-    exposure: 0.75,
-    nir_input: 0.0,
-    spectral_mix: [0.58, 0.36, 0.06],
-    red_reflectance: 0.18,
-    green_reflectance: 0.08,
-    blue_suppression: 0.08,
-    middle_grey: 0.18,
-    local_gain: 0.28,
-    min_gain: 0.70,
-    max_gain: 2.8,
-    gain: 2.15,
-    black_point: 0.006,
-    gamma: 0.72,
-    glow_threshold: 0.66,
-    glow_softness: 0.18,
-    glow_strength: 0.32,
-    glow_radius: 1.1,
-    eye_strength: 0.72,
-    eye_threshold: 0.36,
-    eye_softness: 0.10,
-    eye_local_ratio: 1.20,
-    eye_core_strength: 0.46,
-    eye_halo_strength: 0.32,
-    masked_eye_core: 0.82,
-    masked_eye_halo: 0.55,
-    noise_amount: 0.55,
-    read_noise: 0.015,
-    shot_noise: 0.020,
-    fixed_pattern: 0.004,
-    phosphor_noise: 0.006,
-    noise_size: 0.8,
-    shadow_color: [0.000, 0.006, 0.002],
-    mid_color: [0.030, 0.470, 0.065],
-    highlight_color: [0.820, 1.000, 0.840],
-    mid_point: 0.65,
-    highlight_start: 0.74,
-    vignette: 0.22,
-    hotspot: 0.24,
-    scan_modulation: 0.006,
-    flicker: 0.004,
-    persistence: 0.0,
-  },
   white_phosphor: {
-    name: "White Phosphor",
+    name: "P45 White Phosphor",
     sensor_resolution: [1280, 960],
-    exposure: 1.0,
+    exposure: 0.85,
     nir_input: 0.0,
-    spectral_mix: [0.52, 0.40, 0.08],
-    red_reflectance: 0.22,
-    green_reflectance: 0.10,
-    blue_suppression: 0.08,
+    spectral_mix: [0.58, 0.34, 0.08],
+    red_reflectance: 0.24,
+    green_reflectance: 0.92,
+    blue_suppression: 0.16,
+    sky_suppress: 0.66,
+    water_suppress: 0.52,
+    skin_boost: 0.17,
+    photocathode_gamma: 0.86,
+    ebi: 0.0065,
     middle_grey: 0.18,
-    local_gain: 0.38,
-    min_gain: 0.70,
-    max_gain: 3.6,
-    gain: 2.35,
-    black_point: 0.008,
-    gamma: 0.66,
-    glow_threshold: 0.55,
+    local_gain: 0.46,
+    min_gain: 0.58,
+    max_gain: 4.2,
+    gain: 3.9,
+    max_output: 0.98,
+    glow_threshold: 0.44,
     glow_softness: 0.24,
-    glow_strength: 0.54,
-    glow_radius: 1.45,
-    eye_strength: 0.90,
-    eye_threshold: 0.30,
-    eye_softness: 0.12,
+    glow_strength: 0.34,
+    glow_radius: 1.90,
+    eye_strength: 0.78,
+    eye_threshold: 0.28,
+    eye_softness: 0.14,
     eye_local_ratio: 1.15,
-    eye_core_strength: 0.56,
-    eye_halo_strength: 0.50,
-    masked_eye_core: 0.90,
-    masked_eye_halo: 0.80,
-    noise_amount: 0.72,
-    read_noise: 0.020,
-    shot_noise: 0.030,
-    fixed_pattern: 0.006,
-    phosphor_noise: 0.012,
-    noise_size: 1.0,
-    shadow_color: [0.003, 0.006, 0.010],
-    mid_color: [0.360, 0.470, 0.520],
-    highlight_color: [0.940, 0.980, 1.000],
-    mid_point: 0.62,
-    highlight_start: 0.70,
-    vignette: 0.36,
-    hotspot: 0.12,
-    scan_modulation: 0.010,
-    flicker: 0.008,
-    persistence: 0.0,
+    eye_core_strength: 0.50,
+    eye_halo_strength: 0.44,
+    masked_eye_core: 0.82,
+    masked_eye_halo: 0.68,
+    psf_sigma: 0.92,
+    chicken_amp: 0.012,
+    chicken_freq: 44.0,
+    chicken_line: 0.045,
+    chicken_gate_lo: 0.54,
+    chicken_gate_hi: 0.92,
+    noise_amount: 0.48,
+    scint_grain: 1.05,
+    scint_density: 0.018,
+    scint_gain: 0.74,
+    scint_sharp: 4.2,
+    scint_dark_boost: 4.0,
+    shot_strength: 0.026,
+    scint_floor: 0.72,
+    phosphor_chroma: [0.78, 0.86, 0.96],
+    highlight_white: [0.96, 0.98, 1.00],
+    screen_black: 0.006,
+    screen_gain: 1.12,
+    screen_shoulder: 0.86,
+    phosphor_gamma: 0.94,
+    highlight_desat: 0.46,
+    bloom_start: 0.64,
+    bloom_range: 0.58,
+    vignette: 0.26,
+    hotspot: 0.055,
+    persistence: 0.42,
   },
 };
 
@@ -413,13 +462,17 @@ export function applyInfraredPreset(ctx, preset) {
   P.redReflectance.value = preset.red_reflectance;
   P.greenReflectance.value = preset.green_reflectance;
   P.blueSuppression.value = preset.blue_suppression;
+  P.skySuppress.value = preset.sky_suppress;
+  P.waterSuppress.value = preset.water_suppress ?? 0.35;
+  P.skinBoost.value = preset.skin_boost;
+  P.photocathodeGamma.value = preset.photocathode_gamma ?? 0.88;
+  P.ebi.value = preset.ebi;
   P.middleGrey.value = preset.middle_grey;
   P.localGain.value = preset.local_gain;
   P.minGain.value = preset.min_gain;
   P.maxGain.value = preset.max_gain;
   P.gain.value = preset.gain;
-  P.blackPoint.value = preset.black_point;
-  P.gamma.value = preset.gamma;
+  P.maxOutput.value = preset.max_output;
   P.glowThreshold.value = preset.glow_threshold;
   P.glowSoftness.value = preset.glow_softness;
   P.glowStrength.value = preset.glow_strength;
@@ -432,31 +485,40 @@ export function applyInfraredPreset(ctx, preset) {
   P.eyeHaloStrength.value = preset.eye_halo_strength;
   P.maskedEyeCore.value = preset.masked_eye_core;
   P.maskedEyeHalo.value = preset.masked_eye_halo;
+  P.psfSigma.value = preset.psf_sigma;
+  P.chickenAmp.value = preset.chicken_amp;
+  P.chickenFreq.value = preset.chicken_freq;
+  P.chickenLine.value = preset.chicken_line;
+  P.chickenGateLo.value = preset.chicken_gate_lo;
+  P.chickenGateHi.value = preset.chicken_gate_hi;
   P.noiseAmount.value = preset.noise_amount;
-  P.readNoise.value = preset.read_noise;
-  P.shotNoise.value = preset.shot_noise;
-  P.fixedPattern.value = preset.fixed_pattern;
-  P.phosphorNoise.value = preset.phosphor_noise;
-  P.noiseSize.value = preset.noise_size;
-  P.shadowColor.value.set(...preset.shadow_color);
-  P.midColor.value.set(...preset.mid_color);
-  P.highlightColor.value.set(...preset.highlight_color);
-  P.midPoint.value = preset.mid_point;
-  P.highlightStart.value = preset.highlight_start;
+  P.scintGrain.value = preset.scint_grain;
+  P.scintDensity.value = preset.scint_density;
+  P.scintGain.value = preset.scint_gain;
+  P.scintSharp.value = preset.scint_sharp;
+  P.scintDarkBoost.value = preset.scint_dark_boost;
+  P.shotStrength.value = preset.shot_strength;
+  P.scintFloor.value = preset.scint_floor;
+  P.phosphorChroma.value.set(...preset.phosphor_chroma);
+  P.highlightWhite.value.set(...preset.highlight_white);
+  P.screenBlack.value = preset.screen_black ?? 0.004;
+  P.screenGain.value = preset.screen_gain ?? 1.08;
+  P.screenShoulder.value = preset.screen_shoulder ?? 0.92;
+  P.phosphorGamma.value = preset.phosphor_gamma ?? 0.94;
+  P.highlightDesat.value = preset.highlight_desat ?? 0.55;
+  P.bloomStart.value = preset.bloom_start;
+  P.bloomRange.value = preset.bloom_range;
   P.vignette.value = preset.vignette;
   P.hotspot.value = preset.hotspot;
-  P.scanModulation.value = preset.scan_modulation;
-  P.flicker.value = preset.flicker;
-  P.persistence.value = preset.persistence ?? 0;
+  P.persistence.value = preset.persistence ?? 0.3;
 }
 
 export const INFRARED_STAGE_DEFS = [
   { id: "adaptation", label: "Local gain adaptation" },
-  { id: "glow", label: "Infrared bloom" },
+  { id: "glow", label: "Intensifier halo" },
   { id: "eyes", label: "Retinal flare" },
-  { id: "noise", label: "Sensor and phosphor noise" },
-  { id: "display", label: "Phosphor display response" },
-  { id: "persistence", label: "Phosphor persistence" },
+  { id: "noise", label: "Tube scintillation" },
+  { id: "display", label: "Phosphor display" },
 ];
 
 export class InfraredPipeline {
@@ -541,7 +603,8 @@ export class InfraredPipeline {
   }
 
   clearHistory() {
-    // Reserved for the persistence pass. Static infrared has no history state.
+    // The phosphor "boil" is stateless (it recomputes prior frames analytically),
+    // so the intensifier path keeps no history target.
   }
 
   setEnabled(id, on) {

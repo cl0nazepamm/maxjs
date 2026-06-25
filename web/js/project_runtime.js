@@ -45,6 +45,11 @@ function resolveFactory(moduleNamespace) {
     throw new Error('Project module must export default/createLayer/mount or layer hooks');
 }
 
+function resolveStaticParameters(moduleNamespace) {
+    const params = moduleNamespace?.parameters ?? moduleNamespace?.params;
+    return params && typeof params === 'object' ? params : null;
+}
+
 async function fetchText(url) {
     const response = await fetch(url, { cache: 'no-store' });
     if (!response.ok) {
@@ -445,12 +450,17 @@ function stripSettingsFromPostFx(payload) {
 
         const result = await layerManager.mount(
             layerId,
-            async (ctx, THREE) => factory(ctx, THREE, { manifest, layer: entry }),
+            async (ctx, THREE) => {
+                const staticParams = resolveStaticParameters(moduleNamespace);
+                if (staticParams) ctx.params.define(staticParams);
+                return factory(ctx, THREE, { manifest, layer: entry });
+            },
             {
                 name: entry.name || layerId,
                 code: moduleUrl,
                 source: LAYER_SOURCE_PROJECT,
                 entry: entryPath,
+                paramValues: entry.raw?.paramValues ?? entry.raw?.parameters ?? entry.raw?.params,
             },
         );
 
@@ -879,6 +889,7 @@ function stripSettingsFromPostFx(payload) {
                 active: !!runtime?.active,
                 loading: !!runtime?.loading,
                 error: runtime?.error ?? null,
+                parameters: runtime?.parameters ?? [],
                 anchors: runtime?.anchors ?? 0,
                 tracked: runtime?.tracked ?? 0,
                 profile: runtime?.profile ?? null,
@@ -913,6 +924,7 @@ function stripSettingsFromPostFx(payload) {
                 active: runtime?.active ?? false,
                 loading: runtime?.loading ?? false,
                 error: runtime?.error ?? null,
+                parameters: runtime?.parameters ?? [],
                 anchors: runtime?.anchors ?? 0,
                 tracked: runtime?.tracked ?? 0,
                 profile: runtime?.profile ?? null,
@@ -933,6 +945,7 @@ function stripSettingsFromPostFx(payload) {
                 active: runtime.active ?? true,
                 loading: runtime.loading ?? false,
                 error: runtime.error ?? null,
+                parameters: runtime.parameters ?? [],
                 anchors: runtime.anchors ?? 0,
                 tracked: runtime.tracked ?? 0,
                 profile: runtime.profile ?? null,
@@ -1046,15 +1059,19 @@ function stripSettingsFromPostFx(payload) {
 
         const result = await layerManager.mount(
             key,
-            async (ctx, THREE) => factory(ctx, THREE, {
-                layer: {
-                    id: key,
-                    baseId: rawId,
-                    name,
-                    folder,
-                    priority,
-                },
-            }),
+            async (ctx, THREE) => {
+                const staticParams = resolveStaticParameters(moduleNamespace);
+                if (staticParams) ctx.params.define(staticParams);
+                return factory(ctx, THREE, {
+                    layer: {
+                        id: key,
+                        baseId: rawId,
+                        name,
+                        folder,
+                        priority,
+                    },
+                });
+            },
             {
                 name: name || rawId,
                 code: moduleUrl,

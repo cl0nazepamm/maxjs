@@ -17,7 +17,7 @@
 import * as THREE from 'three';
 import { Fn, If, Loop, Return, float, instanceIndex, storage, uint, vec3 } from 'three/tsl';
 
-// HARD-DISABLED: three r184's WebGPU backend MUTATES itemSize-3 attributes
+// HARD-DISABLED: three r185's WebGPU backend MUTATES itemSize-3 attributes
 // used as storage buffers (pads the array vec3→vec4 and rewrites
 // attribute.itemSize/array in place — see createAttribute /
 // _force3to4BytesAlignment in three.webgpu.js). That fights

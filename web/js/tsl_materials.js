@@ -17,7 +17,7 @@
 
 // Render a TSL color node into a sampleable THREE.DataTexture using an offscreen
 // QuadMesh + RenderTarget + async readback. Do not return RenderTarget.texture:
-// r184 WebGPU can leave that texture without a sampled bind resource and crash
+// r185 WebGPU can leave that texture without a sampled bind resource and crash
 // later in createBindGroup() when a classic material samples it.
 export function makeBakeNodeToTexture(renderer, THREE, { onComplete = () => {} } = {}) {
     if (!renderer

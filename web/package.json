@@ -4,7 +4,7 @@
     "@takram/three-atmosphere": "^0.19.1",
     "@takram/three-geospatial": "^0.9.1",
     "postprocessing": "^6.39.1",
-    "three": "^0.184.0",
+    "three": "^0.185.0",
     "three-mesh-bvh": "0.8.3",
     "xatlas-web": "^0.1.0"
   }

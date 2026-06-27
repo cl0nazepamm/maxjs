@@ -103,7 +103,7 @@ export function createPerfHud(infoEl) {
         updateRender(renderMs, renderInfo, memoryInfo) {
             if (!debugEnabled) return;
             state.renderMs = renderMs;
-            // r184 backends disagree on `info.render` shape:
+            // Three backends disagree on `info.render` shape:
             //   WebGLInfo:  `calls` is per-frame (auto-reset inside render()).
             //   WebGPU Info: `calls` is monotonic since app start; `drawCalls`
             //                is the per-frame count (reset each RAF tick).

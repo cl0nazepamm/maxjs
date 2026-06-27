@@ -1,11 +1,11 @@
 <!DOCTYPE html><html><head><meta charset="utf-8"><title>HALO-GI reactivity verify</title>
 <style>html,body{margin:0;height:100%;background:#111;color:#cde;font:12px/1.5 monospace}#c{width:45vw;height:100vh;float:left}#o{padding:10px;overflow:auto;height:100vh}</style>
 <script type="importmap">{ "imports": {
-  "three":"./vendor/three-r184/build/three.webgpu.js",
-  "three/webgpu":"./vendor/three-r184/build/three.webgpu.js",
-  "three/tsl":"./vendor/three-r184/build/three.tsl.js",
+  "three":"./vendor/three-r185/build/three.webgpu.js",
+  "three/webgpu":"./vendor/three-r185/build/three.webgpu.js",
+  "three/tsl":"./vendor/three-r185/build/three.tsl.js",
   "three-mesh-bvh":"./node_modules/three-mesh-bvh/src/index.js" },
-  "scopes":{"./node_modules/three-mesh-bvh/":{"three":"./vendor/three-r184/build/three.module.js"}}}</script>
+  "scopes":{"./node_modules/three-mesh-bvh/":{"three":"./vendor/three-r185/build/three.module.js"}}}</script>
 </head><body><canvas id="c"></canvas><pre id="o">running…</pre><script type="module">
 // Reactivity: the field must respond to LIVE light + geometry edits without a
 // manual rebuild. (1) recolor a light white→red → floor bounce shifts red.

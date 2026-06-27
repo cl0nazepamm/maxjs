@@ -272,7 +272,7 @@ function maskFactorForLight(light) {
     return select(contributes, float(1.0), float(0.0));
 }
 
-// three.js r184 NodeMaterial.setupLights() spawns a fresh lightsNode via the factory
+// three.js NodeMaterial.setupLights() spawns a fresh lightsNode via the factory
 // every time a material with an env LightingNode compiles (scene.environmentNode set).
 // Each instance owns its own _dataNodes → separate UBOs → per-frame setLights() from
 // renderList.finish() only reaches the scene-cached instance, leaving material-owned
@@ -447,6 +447,7 @@ export default class MaxLightsNode extends DynamicLightsNode {
         if (giProbeNode.active) lightNodes.push(giProbeNode);
 
         this._lightNodes = lightNodes;
+        return lightNodes;
     }
 
     // Fallback-path light linking. Batched lights are masked inside the

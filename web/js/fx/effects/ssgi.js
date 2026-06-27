@@ -33,10 +33,13 @@ export default {
         ctx.applyNodeResolutionScale(ssgiPass);
         ctx.pushNode(ssgiPass);
 
+        const ssgiAO = ssgiPass.getAONode().r;
+        const ssgiGI = ssgiPass.getGINode().rgb;
+
         return vec4(
             add(
-                ctx.beauty.rgb.mul(ssgiPass.a),
-                sceneTex.diffuse.rgb.mul(ssgiPass.rgb)
+                ctx.beauty.rgb.mul(ssgiAO),
+                sceneTex.diffuse.rgb.mul(ssgiGI)
             ),
             ctx.beautyAlpha
         );

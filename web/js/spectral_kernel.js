@@ -1,6 +1,6 @@
 // spectral_kernel.js — TSL compute kernel + blit material for the spectral
 // path tracer. Pure-TSL (no raw WGSL); mirrors the compute idioms proven in
-// web/js/layer_deform.js and web/js/gpu_normals.js on this r184 build.
+// web/js/layer_deform.js and web/js/gpu_normals.js on this r185 build.
 //
 // One invocation = one pixel = one full path (1 spp/frame, accumulated). The
 // path carries a single hero wavelength λ; material reflectance is a 3-bin

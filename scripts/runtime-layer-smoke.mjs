@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
-const THREE = require('../web/vendor/three-r184/build/three.cjs');
+const THREE = require('../web/vendor/three-r185/build/three.cjs');
 const { createLayerManager } = await import(new URL('../web/js/layer_manager.js', import.meta.url).href);
 
 function disposableMesh(name, flags) {

@@ -228,7 +228,7 @@ export function geometryFromNodeBinary(nd, buffer) {
     }
     if (geo.uv2Off != null && geo.uv2N) {
         const uv2Attr = uvAttributeFromBinary(buffer, geo.uv2Off, geo.uv2N, geo.uv2Type, `${nd.n || 'node'} uv2`);
-        // three r184 lightMap samples geometry attribute "uv1".
+        // three r185 lightMap samples geometry attribute "uv1".
         // Keep "uv2" as a compatibility/debug alias for Max map channel 2.
         if (uv2Attr) {
             out.setAttribute('uv1', uv2Attr);

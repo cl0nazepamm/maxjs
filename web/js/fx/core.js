@@ -18,10 +18,8 @@
 import * as THREE from 'three';
 import {
     color,
-    colorToDirection,
     densityFogFactor,
     diffuseColor,
-    directionToColor,
     float,
     fog,
     max,
@@ -29,6 +27,7 @@ import {
     mrt,
     normalView,
     output,
+    packNormalToRGB,
     pass,
     positionLocal,
     positionView,
@@ -40,6 +39,7 @@ import {
     texture,
     triNoise3D,
     uniform,
+    unpackRGBToNormal,
     vec2,
     vec3,
     vec4,
@@ -679,14 +679,14 @@ export function createFxCore({
                 activeNodes.push(prePass);
                 prePass.transparent = false;
                 prePass.setMRT(mrt({
-                    output: directionToColor(normalView),
+                    output: packNormalToRGB(normalView),
                     velocity,
                 }));
 
                 const prePassDepth = prePass.getTextureNode('depth');
                 const prePassNormalColor = prePass.getTextureNode('output');
                 const prePassVelocity = prePass.getTextureNode('velocity');
-                const prePassNormal = sample((uvNode) => colorToDirection(prePassNormalColor.sample(uvNode)));
+                const prePassNormal = sample((uvNode) => unpackRGBToNormal(prePassNormalColor.sample(uvNode)));
 
                 const normalTexture = prePass.getTexture('output');
                 if (normalTexture) normalTexture.type = THREE.UnsignedByteType;
@@ -742,7 +742,7 @@ export function createFxCore({
             scenePass.setMRT(mrt({
                 output,
                 diffuseColor,
-                normal: directionToColor(normalView),
+                normal: packNormalToRGB(normalView),
                 metalrough: vec2(ssrReflectivityNode, roughness),
             }));
 
@@ -753,7 +753,7 @@ export function createFxCore({
             const scenePassDepth = scenePass.getTextureNode('depth');
             const scenePassNormalColor = scenePass.getTextureNode('normal');
             const scenePassMetalRough = scenePass.getTextureNode('metalrough');
-            const sceneNormal = sample((uvNode) => colorToDirection(scenePassNormalColor.sample(uvNode)));
+            const sceneNormal = sample((uvNode) => unpackRGBToNormal(scenePassNormalColor.sample(uvNode)));
 
             ctx.sceneTex = {
                 color: scenePassColor,

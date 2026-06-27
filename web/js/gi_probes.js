@@ -47,6 +47,9 @@ const BACKFACE_FRACTION = 0.25;    // > this fraction backface hits → probe is
 const GOLDEN_ANGLE = Math.PI * (3 - Math.sqrt(5));
 const TARGET_PROBES_LONG_AXIS = 12;
 const MAX_PROBES_PER_AXIS = 24;
+const MAX_PROBES_PER_TICK = 128;    // cap compute bursts on room-scale grids
+const SURFACE_NORMAL_BIAS_CELL = 0.03; // sample 3% of a cell off the shaded wall, not half a cell
+const TRACE_SURFACE_BIAS_CELL = 0.005; // shadow/NEE ray origin bias, scaled to scene units
 const MAX_TRIANGLES = 4_000_000;
 const MAX_LIGHTS = 64;             // matches spectral_scene LIGHT_STRIDE table
 // ── reactivity: respond to live light/geometry edits ──
@@ -55,8 +58,6 @@ const REACTIVE_HYSTERESIS = 0.4;   // hysteresis during a reactivity burst (vs s
 const LIGHT_CHECK_INTERVAL = 6;    // ticks between light-change checks
 const GEO_CHECK_INTERVAL = 24;     // ticks between geometry-change checks (full rebuild = expensive)
 // ── denoise uplift (CORE, docs/GI_HALO_design.md §11) tunables ──
-const GI_ANTILAG_K = 4.0;          // SVGF antilag: temporal-variance bandwidth (×σ²)
-const GI_ANTILAG_EPS = 0.0016;     // antilag luma² floor (~0.04²): steady per-tick ray noise can't lower hysteresis
 const GI_FILTER_K = 8.0;           // spatial filter: variance→edge-stop bandwidth
 const GI_FILTER_EPS = 0.001;       // spatial filter luma² absolute floor (avoids /0 on black)
 const GI_FILTER_REL = 0.0225;      // spatial filter RELATIVE floor (~15% luma)²: even a temporally
@@ -458,7 +459,8 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
                 const faceFwd = dot(ngRaw, rd).lessThan(float(0.0));
                 const ng = ngRaw.mul(select(faceFwd, float(1.0), float(-1.0))).toVar();
                 const hitPoint = ro.add(rd.mul(bestT));
-                const hitPos = hitPoint.add(ng.mul(float(RAY_EPS))).toVar();
+                const traceBias = tslMax(U.cellMin.mul(float(TRACE_SURFACE_BIAS_CELL)), float(RAY_EPS));
+                const hitPos = hitPoint.add(ng.mul(traceBias)).toVar();
 
                 const baseColor = vec3(matFloat(matId, 0), matFloat(matId, 1), matFloat(matId, 2)).toVar();
                 const emissive = vec3(matFloat(matId, 7), matFloat(matId, 8), matFloat(matId, 9));
@@ -489,7 +491,7 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
                     const wi = normalize(toLight);
                     const ndl = tslMax(dot(ng, wi), float(0.0));
                     If(ndl.greaterThan(float(0.0)), () => {
-                        const blocked = traverseAny(hitPos, wi, dist.sub(float(RAY_EPS)));
+                        const blocked = traverseAny(hitPos, wi, dist.sub(traceBias));
                         If(blocked.lessThan(float(0.5)), () => {
                             const falloff = float(1.0).div(tslMax(pow(dist, ldecay), float(0.01)));
                             const rr = dist.div(tslMax(lrange, float(1e-4)));
@@ -574,18 +576,15 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
             const ib = probeIndex.mul(uint(TILE * TILE)).add(local).mul(uint(4)).toVar();
             const prev = vec3(irr.element(ib), irr.element(ib.add(uint(1))), irr.element(ib.add(uint(2))));
             const wasBlack = dot(prev, vec3(1.0)).lessThan(float(1e-6));
-            // disocclusion-safe adaptive hysteresis (SVGF antilag) from the stored
-            // luminance 2nd moment: a big disagreement vs the temporal std-dev →
-            // trust→0 → snap to the new sample (no ghost); steady per-tick ray noise
-            // stays under the EPS floor so it can NOT lower hysteresis (no re-splotch).
+            // Stable temporal accumulation: HALO intentionally jitters rays every
+            // tick, so luminance disagreement is expected on steady walls. Treating
+            // that as disocclusion collapses history and causes visible flicker.
+            // Real light/geometry edits are handled by temporarily lowering
+            // U.hysteresis from tick(), not by per-texel history rejection here.
             const LUMA = vec3(0.2126, 0.7152, 0.0722);
             const curL = dot(meanRad, LUMA);
-            const prevL = dot(prev, LUMA);
             const prevM2 = irr.element(ib.add(uint(3)));
-            const varL = tslMax(prevM2.sub(prevL.mul(prevL)), float(0.0));
-            const dLum = tslAbs(curL.sub(prevL));
-            const trust = exp(dLum.mul(dLum).div(varL.mul(float(GI_ANTILAG_K)).add(float(GI_ANTILAG_EPS))).mul(-1.0));
-            const h = select(wasBlack, float(0.0), U.hysteresis.mul(trust));
+            const h = select(wasBlack, float(0.0), U.hysteresis);
             const blended = mix(meanRad, prev, h);
             irr.element(ib).assign(blended.x);
             irr.element(ib.add(uint(1))).assign(blended.y);
@@ -606,13 +605,32 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
             depthS.element(db.add(uint(1))).assign(dblended.y);
         })().compute(updatedCap() * TILE * TILE);
 
-        // ── UPLOAD: copy irrBuffer → atlas StorageTexture (full field each tick;
-        // cheap, keeps the sampled atlas authoritative without read-after-write). ──
-        const uploadKernel = Fn(() => {
+        // ── CLEAR: new StorageTextures are not assumed zeroed. Do this once per
+        // rebuild before the round-robin batch uploads start populating live probes.
+        const clearAtlasKernel = Fn(() => {
             const gid = instanceIndex.toVar();
             const total = uint(probeTotal * TILE * TILE);
             If(gid.greaterThanEqual(total), () => { Return(); });
             const probeIndex = gid.div(uint(TILE * TILE)).toVar();
+            const local = gid.mod(uint(TILE * TILE)).toVar();
+            const lx = local.mod(uint(TILE)).toVar();
+            const ly = local.div(uint(TILE)).toVar();
+            const col = probeIndex.mod(U.resX);
+            const row = probeIndex.div(U.resX.mul(U.resY)).mul(U.resY).add(probeIndex.div(U.resX).mod(U.resY));
+            const tx = col.mul(uint(TILE)).add(lx);
+            const ty = row.mul(uint(TILE)).add(ly);
+            textureStore(atlas, uvec2(tx, ty), vec4(0.0, 0.0, 0.0, 1.0)).toWriteOnly();
+            textureStore(depthAtlas, uvec2(tx, ty), vec4(0.0, 0.0, 0.0, 1.0)).toWriteOnly();
+        })().compute(probeTotal * TILE * TILE);
+
+        // ── UPLOAD: copy the updated probes into the atlas StorageTexture. Unchanged
+        // probes keep their previous atlas texels; uploading the full field every tick
+        // caused avoidable WebGPU stalls on larger rooms.
+        const uploadKernel = Fn(() => {
+            const gid = instanceIndex.toVar();
+            const slot = gid.div(uint(TILE * TILE)).toVar();
+            If(slot.greaterThanEqual(U.updatedCount), () => { Return(); });
+            const probeIndex = U.probeOffset.add(slot).mod(U.probeTotal).toVar();
             const local = gid.mod(uint(TILE * TILE)).toVar();
             const lx = local.mod(uint(TILE)).toVar();
             const ly = local.div(uint(TILE)).toVar();
@@ -626,11 +644,12 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
             // hazard). Interior texels only; the 1px octahedral gutter is copied raw.
             // Taps stay inside THIS probe's tile → cannot mix radiance across a wall.
             const LUMA = vec3(0.2126, 0.7152, 0.0722);
-            const ib = gid.mul(uint(4));
+            const probeBase = probeIndex.mul(uint(TILE * TILE)).toVar();
+            const probeTexel = probeBase.add(local).toVar();
+            const ib = probeTexel.mul(uint(4));
             const eC = vec3(irrRead.element(ib), irrRead.element(ib.add(uint(1))), irrRead.element(ib.add(uint(2)))).toVar();
             const lumaC = dot(eC, LUMA);
             const varC = tslMax(irrRead.element(ib.add(uint(3))).sub(lumaC.mul(lumaC)), float(0.0));
-            const probeBase = probeIndex.mul(uint(TILE * TILE)).toVar();
             const lxI = int(lx); const lyI = int(ly);
             const facc = vec3(0.0).toVar();
             const fwsum = float(0.0).toVar();
@@ -655,10 +674,10 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
                 .and(ly.greaterThanEqual(uint(BORDER))).and(ly.lessThanEqual(uint(BORDER + OCT_RES - 1)));
             const outE = select(isInterior, mix(eC, filtered, U.filterStrength), eC);
             textureStore(atlas, uvec2(tx, ty), vec4(outE, float(1.0))).toWriteOnly();
-            const db = gid.mul(uint(2));
+            const db = probeTexel.mul(uint(2));
             const dd = vec2(depthRead.element(db), depthRead.element(db.add(uint(1))));
             textureStore(depthAtlas, uvec2(tx, ty), vec4(dd.x, dd.y, float(0.0), float(1.0))).toWriteOnly();
-        })().compute(probeTotal * TILE * TILE);
+        })().compute(updatedCap() * TILE * TILE);
 
         // ── CLASSIFY: one thread per probe. Fixed full-sphere rays; if too many
         // hit BACKFACES the probe is buried in geometry → mark INACTIVE. ──
@@ -725,12 +744,13 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
             )).toWriteOnly();
         })().compute(probeTotal);
 
-        return { buffers, traceKernel, blendKernel, uploadKernel, classifyKernel, uploadStateKernel, atlas, depthAtlas, stateAtlas, irrBuffer, depthBuffer, stateBuffer, rayBuffer, maps: built.maps, lightCount: built.lightCount };
+        return { buffers, traceKernel, blendKernel, uploadKernel, clearAtlasKernel, classifyKernel, uploadStateKernel, atlas, depthAtlas, stateAtlas, irrBuffer, depthBuffer, stateBuffer, rayBuffer, maps: built.maps, lightCount: built.lightCount };
     }
 
     function updatedCap() {
-        // round-robin: update ~1/4 of probes per tick (≥1).
-        return Math.max(1, Math.ceil(Math.max(1, probeTotal) / 4));
+        // Round-robin: update ~1/4 of small fields, but cap the batch so large
+        // rooms do not hitch the viewport with a huge compute burst.
+        return Math.max(1, Math.min(MAX_PROBES_PER_TICK, Math.ceil(Math.max(1, probeTotal) / 4)));
     }
 
     async function ensureSceneBuilder() {
@@ -786,7 +806,7 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
         U.cellMin.value = Math.max(1e-4, minCell);
         U.relocClamp.value = 0.45 * minCell;
         node.setAtlases(gpu.atlas, gpu.depthAtlas, gpu.stateAtlas);
-        node.setGrid(gridMin, gridSize, res, atlasW, atlasH, minCell * 0.5);
+        node.setGrid(gridMin, gridSize, res, atlasW, atlasH, minCell * SURFACE_NORMAL_BIAS_CELL);
         probeCursor = 0;
         dirty = false;
         needsClassify = true;
@@ -835,6 +855,7 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
         inFlight = true;
         try {
             if (needsClassify) {
+                await renderer.computeAsync(gpu.clearAtlasKernel);
                 await renderer.computeAsync(gpu.classifyKernel);
                 await renderer.computeAsync(gpu.uploadStateKernel);
                 needsClassify = false;

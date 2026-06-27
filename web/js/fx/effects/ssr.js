@@ -22,14 +22,17 @@ export default {
             sceneTex.color,
             sceneTex.depth,
             sceneTex.normal,
-            sceneTex.reflectivity,
-            sceneTex.metalrough.g,
-            ctx.camera
+            {
+                metalnessNode: sceneTex.reflectivity,
+                roughnessNode: sceneTex.metalrough.g,
+                diffuseNode: sceneTex.diffuse,
+                camera: ctx.camera,
+            }
         );
         ssrPass.quality.value = state.ssr.quality;
-        ssrPass.blurQuality.value = state.ssr.blurQuality;
+        ssrPass.blurQuality = Math.max(1, Math.min(3, Math.round(state.ssr.blurQuality)));
         ssrPass.maxDistance.value = derived.effectiveSSRMaxDistance;
-        ssrPass.opacity.value = state.ssr.opacity;
+        ssrPass.intensity.value = state.ssr.opacity;
         ssrPass.thickness.value = derived.effectiveSSRThickness;
         ctx.applyNodeResolutionScale(ssrPass);
         ctx.pushNode(ssrPass);

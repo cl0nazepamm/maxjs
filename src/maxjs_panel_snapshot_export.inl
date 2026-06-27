@@ -139,12 +139,12 @@
             return false;
         }
 
-        const std::wstring threeVendor = webDir + L"\\vendor\\three-r184";
+        const std::wstring threeVendor = webDir + L"\\vendor\\three-r185";
         if (!DirectoryExists(threeVendor + L"\\build")) {
-            error = L"Snapshot runtime dependency missing: web/vendor/three-r184/build";
+            error = L"Snapshot runtime dependency missing: web/vendor/three-r185/build";
             return false;
         }
-        if (!CopyDirectoryRecursive(threeVendor + L"\\build", outDir + L"\\vendor\\three-r184\\build")) {
+        if (!CopyDirectoryRecursive(threeVendor + L"\\build", outDir + L"\\vendor\\three-r185\\build")) {
             error = L"Failed to copy snapshot runtime three.js build vendor";
             return false;
         }
@@ -154,16 +154,16 @@
         for (const std::wstring& fileName : threeRootFiles) {
             const std::wstring src = threeVendor + L"\\" + fileName;
             if (FileExists(src)) {
-                CopyFileEnsuringDirectories(src, outDir + L"\\vendor\\three-r184\\" + fileName);
+                CopyFileEnsuringDirectories(src, outDir + L"\\vendor\\three-r185\\" + fileName);
             }
         }
 
         const std::wstring threeExamples = threeVendor + L"\\examples";
         if (!DirectoryExists(threeExamples)) {
-            error = L"Snapshot runtime dependency missing: web/vendor/three-r184/examples";
+            error = L"Snapshot runtime dependency missing: web/vendor/three-r185/examples";
             return false;
         }
-        if (!CopyDirectoryRecursive(threeExamples, outDir + L"\\vendor\\three-r184\\examples")) {
+        if (!CopyDirectoryRecursive(threeExamples, outDir + L"\\vendor\\three-r185\\examples")) {
             error = L"Failed to copy snapshot runtime three.js examples vendor";
             return false;
         }

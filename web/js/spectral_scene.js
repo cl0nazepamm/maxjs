@@ -26,13 +26,15 @@ const NODE_STRIDE_U32 = 8;     // bvhNodes: 6 aabb floats + miss + payload
 //   [12] albedo-map layer · [13] normal-map layer · [14] roughness-map layer
 //   [15] metalness-map layer · [16] emissive-map layer   (all −1 = none)
 //   [17] normalScale · [18..19] uv repeat xy · [20..21] uv offset xy
-//   [22] flags (reserved) · [23] pad
-const MAT_STRIDE = 24;
+//   [22] side (0 front, 1 back, 2 double) · [23] alphaTest
+//   [24] alpha-map layer · [25..27] pad
+const MAT_STRIDE = 28;
 const LIGHT_STRIDE = 16;        // lights: see layout below
 const VERT_STRIDE = 3;          // vertexPos: tightly packed xyz (flat f32 storage, read by offset; also fed to MeshBVH which assumes stride 3)
 const VERTEX_DATA_STRIDE = 8;   // GPU interleaved per-vertex: pos(3) + normal(3) + uv(2)
 const BYTES_PER_BVH_NODE = 32;  // three-mesh-bvh BYTES_PER_NODE (8 x u32)
 const TEXTURE_ATLAS_SIZE = 256; // every material map is resampled to this square size and stacked into a DataArrayTexture layer
+const SKIP_TRIANGLE_MATERIAL = 0xFFFFFFFF;
 
 const SKY_NAMES = new Set(['__maxjs_sky__']);
 
@@ -41,18 +43,80 @@ function meshMaterials(mesh) {
     return Array.isArray(mesh.material) ? mesh.material : [mesh.material];
 }
 
+function materialIsRenderable(material) {
+    return !!material
+        && material.visible !== false
+        && (!Number.isFinite(material.opacity) || material.opacity > 1.0e-4);
+}
+
+function objectLayersMatchCamera(object, camera) {
+    if (!camera?.layers?.test || !object?.layers) return true;
+    return object.layers.test(camera.layers);
+}
+
+function objectIsRenderable(object, camera) {
+    return object?.visible !== false
+        && object.userData?.maxjsVisible !== false
+        && objectLayersMatchCamera(object, camera);
+}
+
 function isTraceableGeometry(geometry) {
     const pos = geometry?.attributes?.position;
     return !!(pos && pos.count >= 3 && pos.itemSize >= 3 && pos.array);
 }
 
-function isTraceableMesh(object) {
+function isTraceableMesh(object, camera) {
     if (!object?.isMesh && !object?.isInstancedMesh) return false;
     if (object.isSkinnedMesh) return false; // bind-pose only; skip for now
     if (SKY_NAMES.has(object.name)) return false;
-    if (!object.visible) return false;
+    if (!objectIsRenderable(object, camera)) return false;
     if (!isTraceableGeometry(object.geometry)) return false;
-    return meshMaterials(object).length > 0;
+    return meshMaterials(object).some(materialIsRenderable);
+}
+
+function buildTriangleMaterialMap(geometry, materials, triCount, internMaterial, materialIsArray = false) {
+    const triMat = new Uint32Array(triCount);
+    triMat.fill(SKIP_TRIANGLE_MATERIAL);
+
+    const groups = Array.isArray(geometry?.groups) ? geometry.groups : [];
+    if (materialIsArray) {
+        for (const grp of groups) {
+            const slot = grp.materialIndex == null ? 0 : Math.trunc(Number(grp.materialIndex));
+            if (!Number.isFinite(slot) || slot < 0 || slot >= materials.length) continue;
+            const material = materials[slot] || null;
+            const uber = materialIsRenderable(material)
+                ? internMaterial(material)
+                : SKIP_TRIANGLE_MATERIAL;
+            const start = Math.max(0, Math.trunc(Number(grp.start) || 0));
+            const count = Math.max(0, Math.trunc(Number(grp.count) || 0));
+            const t0 = Math.floor(start / 3);
+            const t1 = Math.min(triCount, t0 + Math.floor(count / 3));
+            for (let t = t0; t < t1; t++) triMat[t] = uber;
+        }
+    } else {
+        const baseMaterial = materials[0] || null;
+        const baseUber = materialIsRenderable(baseMaterial)
+            ? internMaterial(baseMaterial)
+            : SKIP_TRIANGLE_MATERIAL;
+        triMat.fill(baseUber);
+    }
+
+    let visibleTriCount = 0;
+    for (let t = 0; t < triCount; t++) {
+        if (triMat[t] !== SKIP_TRIANGLE_MATERIAL) visibleTriCount++;
+    }
+    if (visibleTriCount === triCount) {
+        return { triMat, visibleTriCount, visibleTriIndices: null };
+    }
+    if (visibleTriCount === 0) {
+        return { triMat, visibleTriCount, visibleTriIndices: new Uint32Array(0) };
+    }
+    const visibleTriIndices = new Uint32Array(visibleTriCount);
+    let cursor = 0;
+    for (let t = 0; t < triCount; t++) {
+        if (triMat[t] !== SKIP_TRIANGLE_MATERIAL) visibleTriIndices[cursor++] = t;
+    }
+    return { triMat, visibleTriCount, visibleTriIndices };
 }
 
 // ── Uber material mapping ──────────────────────────────────────────
@@ -89,6 +153,7 @@ function materialToUber(material) {
     const transmission = Number.isFinite(material.transmission) ? material.transmission : 0;
     const ior = Number.isFinite(material.ior) ? material.ior : 1.5;
     const opacity = Number.isFinite(material.opacity) ? material.opacity : 1;
+    const alphaTest = Number.isFinite(material.alphaTest) ? material.alphaTest : 0;
     const em = emissiveScaled(material, [0, 0, 0]);
     // Dispersion strength: the kernel reads this as the per-wavelength IOR
     // spread n(λ) = ior ± dispersionB across the visible band. three's
@@ -100,7 +165,7 @@ function materialToUber(material) {
     // repeat/offset is applied to every map; per-map transforms and rotation are
     // intentionally ignored.
     const primary = material.map || material.normalMap || material.roughnessMap
-        || material.metalnessMap || material.emissiveMap || null;
+        || material.metalnessMap || material.emissiveMap || material.alphaMap || null;
     const rep = primary?.repeat;
     const off = primary?.offset;
     const repX = rep && Number.isFinite(rep.x) ? rep.x : 1;
@@ -109,6 +174,10 @@ function materialToUber(material) {
     const offY = off && Number.isFinite(off.y) ? off.y : 0;
     const ns = material.normalScale;
     const normalScale = ns && Number.isFinite(ns.x) ? ns.x : 1;
+
+    const side = Number.isFinite(material.side)
+        ? Math.min(2, Math.max(0, material.side | 0))
+        : 0;
 
     return [r, g, b,
         Math.min(1, Math.max(0.02, roughness)),
@@ -121,7 +190,10 @@ function materialToUber(material) {
         -1, -1, -1, -1, -1,   // [12..16] map layers, filled by buildMaterialTextures
         normalScale,
         repX, repY, offX, offY,
-        0, 0];                 // [22] flags (reserved) · [23] pad
+        side,
+        Math.min(1, Math.max(0, alphaTest)),
+        -1,                     // [24] alpha-map layer, filled by buildMaterialTextures
+        0, 0, 0];               // [25..27] pad
 }
 
 const texUuid = (t) => (t && t.isTexture ? t.uuid : '-');
@@ -134,7 +206,7 @@ function uberKey(rec, material) {
     for (let i = 0; i < MAT_STRIDE; i++) k += Math.round(rec[i] * 1000) + ':';
     k += texUuid(material.map) + '|' + texUuid(material.normalMap) + '|'
         + texUuid(material.roughnessMap) + '|' + texUuid(material.metalnessMap)
-        + '|' + texUuid(material.emissiveMap);
+        + '|' + texUuid(material.emissiveMap) + '|' + texUuid(material.alphaMap);
     return k;
 }
 
@@ -196,7 +268,7 @@ function extractTextureRGBA(tex, size) {
 
 // Walk every uber material, extract each map type, build the DataArrayTextures,
 // and write the assigned layer index back into each uber record. Returns
-// { albedo, normal, roughness, metalness, emissive } (DataArrayTexture | null).
+// { albedo, normal, roughness, metalness, emissive, alpha } (DataArrayTexture | null).
 function buildMaterialTextures(THREE, uberList, uberMaterials, size) {
     const TYPES = [
         { field: 'map', recIdx: 12, out: 'albedo' },
@@ -204,9 +276,10 @@ function buildMaterialTextures(THREE, uberList, uberMaterials, size) {
         { field: 'roughnessMap', recIdx: 14, out: 'roughness' },
         { field: 'metalnessMap', recIdx: 15, out: 'metalness' },
         { field: 'emissiveMap', recIdx: 16, out: 'emissive' },
+        { field: 'alphaMap', recIdx: 24, out: 'alpha' },
     ];
     const layerBytes = size * size * 4;
-    const result = { albedo: null, normal: null, roughness: null, metalness: null, emissive: null };
+    const result = { albedo: null, normal: null, roughness: null, metalness: null, emissive: null, alpha: null };
 
     for (const ty of TYPES) {
         const layers = [];
@@ -318,20 +391,23 @@ function flattenBVHRoot(rootBuffer) {
 // [1..3] worldPos, [4..6] worldDir (toward target), [7..9] color*intensity,
 // [10] range, [11] decay, [12] cosAngle, [13] cosPenumbra, [14] w, [15] h.
 
-export function collectLights(THREE, scene) {
+export function collectLights(THREE, scene, camera = null) {
     const out = [];
     const pos = new THREE.Vector3();
     const dir = new THREE.Vector3();
     const tgt = new THREE.Vector3();
     scene.traverseVisible((obj) => {
         if (!obj.isLight) return;
+        if (!objectIsRenderable(obj, camera)) return;
         if (obj.isAmbientLight || obj.isHemisphereLight) return; // folded into env
         obj.updateWorldMatrix(true, false);
         obj.getWorldPosition(pos);
         const c = obj.color, k = Number.isFinite(obj.intensity) ? obj.intensity : 1;
+        if (k <= 0) return;
         const cr = (c?.isColor ? c.r : 1) * k;
         const cg = (c?.isColor ? c.g : 1) * k;
         const cb = (c?.isColor ? c.b : 1) * k;
+        if (cr <= 0 && cg <= 0 && cb <= 0) return;
         let type = 1, range = 0, decay = 2, cosAngle = -1, cosPen = -1, w = 0, h = 0;
         dir.set(0, 0, -1);
         if (obj.isDirectionalLight || obj.isSpotLight) {
@@ -365,7 +441,7 @@ export function collectLights(THREE, scene) {
 
 // ── Main build ─────────────────────────────────────────────────────
 
-export function buildSpectralScene({ THREE, scene, maxTriangles = 4_000_000 } = {}) {
+export function buildSpectralScene({ THREE, scene, camera = null, maxTriangles = 4_000_000 } = {}) {
     if (!scene) return null;
     scene.updateMatrixWorld(true);
 
@@ -388,13 +464,13 @@ export function buildSpectralScene({ THREE, scene, maxTriangles = 4_000_000 } = 
         return idx;
     }
 
-    const draws = []; // { geometry, matrices: Mat4[], groupMats: Uint32 per-source-tri material }
+    const draws = []; // { geometry, matrices: Mat4[], triMat: Uint32 per-source-tri material }
     let totalVerts = 0;
     let totalTris = 0;
 
     const mat4Scratch = new THREE.Matrix4();
     scene.traverseVisible((obj) => {
-        if (!isTraceableMesh(obj)) return;
+        if (!isTraceableMesh(obj, camera)) return;
         const geom = obj.geometry;
         const pos = geom.attributes.position;
         const index = geom.index;
@@ -402,24 +478,14 @@ export function buildSpectralScene({ THREE, scene, maxTriangles = 4_000_000 } = 
         if (triCount <= 0) return;
 
         const mats = meshMaterials(obj);
-        // Per-source-triangle uber index (handles Multi/Sub via geometry groups).
-        const triMat = new Uint32Array(triCount);
-        const baseUber = internMaterial(mats[0]);
-        triMat.fill(baseUber);
-        const groups = Array.isArray(geom.groups) ? geom.groups : [];
-        if (groups.length > 0 && mats.length > 1) {
-            for (const grp of groups) {
-                const slot = Math.min(mats.length - 1, Math.max(0, grp.materialIndex | 0));
-                const uber = internMaterial(mats[slot]);
-                const t0 = Math.floor((grp.start | 0) / 3);
-                const t1 = Math.min(triCount, t0 + Math.floor((grp.count | 0) / 3));
-                for (let t = t0; t < t1; t++) triMat[t] = uber;
-            }
-        }
+        const { triMat, visibleTriCount, visibleTriIndices } =
+            buildTriangleMaterialMap(geom, mats, triCount, internMaterial, Array.isArray(obj.material));
+        if (visibleTriCount <= 0) return;
 
         const matrices = [];
         if (obj.isInstancedMesh) {
-            const count = obj.count | 0;
+            const capacity = Number.isFinite(obj.instanceMatrix?.count) ? obj.instanceMatrix.count : obj.count;
+            const count = Math.max(0, Math.min(obj.count | 0, capacity | 0));
             for (let i = 0; i < count; i++) {
                 const m = new THREE.Matrix4();
                 obj.getMatrixAt(i, m);
@@ -431,10 +497,11 @@ export function buildSpectralScene({ THREE, scene, maxTriangles = 4_000_000 } = 
         }
         if (matrices.length === 0) return;
 
-        totalVerts += pos.count * matrices.length;
-        totalTris += triCount * matrices.length;
+        const uniqueTriMaterial = Array.isArray(obj.material);
+        totalVerts += (pos.count + (uniqueTriMaterial ? visibleTriCount : 0)) * matrices.length;
+        totalTris += visibleTriCount * matrices.length;
         draws.push({
-            geom, pos, index, triCount, matrices, triMat,
+            geom, pos, index, triCount, visibleTriCount, visibleTriIndices, matrices, triMat, uniqueTriMaterial,
             normal: geom.attributes.normal || null,
             uv: geom.attributes.uv || null,
         });
@@ -447,9 +514,10 @@ export function buildSpectralScene({ THREE, scene, maxTriangles = 4_000_000 } = 
     }
 
     // Pass 2: allocate and fill the world-space indexed soup. vertexMaterial
-    // is stamped per triangle (last writer wins for verts shared across
-    // material groups — acceptable under the no-accuracy goal) so the final
-    // per-triangle material survives the BVH index permutation.
+    // is stamped so the final per-triangle material survives the BVH index
+    // permutation. Material-array draws get a unique first vertex per visible
+    // triangle, which preserves exact Multi/Sub group material assignment even
+    // when source triangles share vertices.
     const vertexPos = new Float32Array(totalVerts * VERT_STRIDE);
     const vertexNormal = new Float32Array(totalVerts * 3); // world-space, 0 = none → flat
     const vertexUV = new Float32Array(totalVerts * 2);
@@ -462,10 +530,11 @@ export function buildSpectralScene({ THREE, scene, maxTriangles = 4_000_000 } = 
     const nrm = new THREE.Vector3();
     const normalMat = new THREE.Matrix3();
     for (const d of draws) {
-        const { pos, index, triCount, matrices, triMat, normal, uv } = d;
+        const { pos, index, triCount, visibleTriCount, visibleTriIndices, matrices, triMat, uniqueTriMaterial, normal, uv } = d;
         const vCount = pos.count;
         for (const m of matrices) {
             const vBase = vCursor;
+            const tagBase = vBase + vCount;
             normalMat.getNormalMatrix(m); // inverse-transpose of the model 3x3
             for (let i = 0; i < vCount; i++) {
                 v.fromBufferAttribute(pos, i).applyMatrix4(m);
@@ -481,21 +550,42 @@ export function buildSpectralScene({ THREE, scene, maxTriangles = 4_000_000 } = 
                     vertexUV[uo] = uv.getX(i); vertexUV[uo + 1] = uv.getY(i);
                 }
             }
-            for (let t = 0; t < triCount; t++) {
-                const a = vBase + (index ? index.getX(t * 3) : t * 3);
-                const b = vBase + (index ? index.getX(t * 3 + 1) : t * 3 + 1);
-                const c = vBase + (index ? index.getX(t * 3 + 2) : t * 3 + 2);
+            for (let t = 0; t < visibleTriCount; t++) {
+                const sourceTri = visibleTriIndices ? visibleTriIndices[t] : t;
+                if (sourceTri < 0 || sourceTri >= triCount) continue;
+                const sourceA = vBase + (index ? index.getX(sourceTri * 3) : sourceTri * 3);
+                const a = uniqueTriMaterial ? tagBase + t : sourceA;
+                const b = vBase + (index ? index.getX(sourceTri * 3 + 1) : sourceTri * 3 + 1);
+                const c = vBase + (index ? index.getX(sourceTri * 3 + 2) : sourceTri * 3 + 2);
+                if (uniqueTriMaterial) {
+                    const po = a * VERT_STRIDE;
+                    const ps = sourceA * VERT_STRIDE;
+                    vertexPos[po] = vertexPos[ps];
+                    vertexPos[po + 1] = vertexPos[ps + 1];
+                    vertexPos[po + 2] = vertexPos[ps + 2];
+                    const no = a * 3;
+                    const ns = sourceA * 3;
+                    vertexNormal[no] = vertexNormal[ns];
+                    vertexNormal[no + 1] = vertexNormal[ns + 1];
+                    vertexNormal[no + 2] = vertexNormal[ns + 2];
+                    const uo = a * 2;
+                    const us = sourceA * 2;
+                    vertexUV[uo] = vertexUV[us];
+                    vertexUV[uo + 1] = vertexUV[us + 1];
+                }
                 const to = (tCursor + t) * 3;
                 triIndex[to] = a;
                 triIndex[to + 1] = b;
                 triIndex[to + 2] = c;
-                const um = triMat[t];
+                const um = triMat[sourceTri];
                 vertexMaterial[a] = um;
-                vertexMaterial[b] = um;
-                vertexMaterial[c] = um;
+                if (!uniqueTriMaterial) {
+                    vertexMaterial[b] = um;
+                    vertexMaterial[c] = um;
+                }
             }
-            vCursor += vCount;
-            tCursor += triCount;
+            vCursor += vCount + (uniqueTriMaterial ? visibleTriCount : 0);
+            tCursor += visibleTriCount;
         }
     }
 
@@ -531,7 +621,7 @@ export function buildSpectralScene({ THREE, scene, maxTriangles = 4_000_000 } = 
     }
 
     // Lights
-    const lightRecords = collectLights(THREE, scene);
+    const lightRecords = collectLights(THREE, scene, camera);
     const lights = new Float32Array(Math.max(1, lightRecords.length) * LIGHT_STRIDE);
     for (let i = 0; i < lightRecords.length; i++) lights.set(lightRecords[i], i * LIGHT_STRIDE);
 
@@ -562,7 +652,7 @@ export function buildSpectralScene({ THREE, scene, maxTriangles = 4_000_000 } = 
         materials, materialCount: uberList.length,
         lights, lightCount: lightRecords.length,
         env,
-        maps, // { albedo, normal, roughness, metalness, emissive } DataArrayTexture | null
+        maps, // { albedo, normal, roughness, metalness, emissive, alpha } DataArrayTexture | null
         strides: { NODE_STRIDE_U32, MAT_STRIDE, LIGHT_STRIDE, VERT_STRIDE, VERTEX_DATA_STRIDE },
     };
 }

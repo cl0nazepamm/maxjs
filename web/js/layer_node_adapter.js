@@ -1271,8 +1271,8 @@ function createMaxNodeAdapter({
         // on every scene message after the material is rebuilt. Pass
         // texture=null to clear an override.
         setMap(slot, texture) {
-            if (typeof slot !== 'string' || !slot) return;
-            setMaterialMap?.(handle, slot, texture);
+            if (typeof slot !== 'string' || !slot) return false;
+            return setMaterialMap?.(handle, slot, texture) === true;
         },
         overrides: freezePlainObject({
             hasProperty(property) {

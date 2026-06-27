@@ -47,6 +47,8 @@ export function createLayerManager({
     getAudioSystem = () => null,
     debugLog = () => {},
     debugWarn = () => {},
+    onRuntimeVisibilityChanged = null,
+    onRuntimeSceneChanged = null,
 }) {
     const layers = new Map();
     const listeners = new Set();
@@ -209,7 +211,12 @@ export function createLayerManager({
         clearRuntimeVisibilityOverride,
         clearRuntimeVisibilityOverridesForLayer,
         hasRuntimeVisibilityOverride,
-    } = createRuntimeOverrideController({ THREE, nodeMap, lightHandleMap });
+    } = createRuntimeOverrideController({
+        THREE,
+        nodeMap,
+        lightHandleMap,
+        onRuntimeSceneChanged: (event) => notifyRuntimeSceneChanged(event),
+    });
 
     // Max selection diff — re-emitted on the shared bus as 'max:selection'.
     // Scanned only while at least one layer is subscribed; the two Sets are
@@ -322,6 +329,23 @@ export function createLayerManager({
             } catch (error) {
                 console.error('[LayerManager] listener error', error);
             }
+        }
+    }
+
+    function notifyRuntimeSceneChanged(event) {
+        const payload = event && typeof event === 'object' ? event : { type: 'runtime' };
+        if (payload.type === 'visibility' && typeof onRuntimeVisibilityChanged === 'function') {
+            try {
+                onRuntimeVisibilityChanged(payload);
+            } catch (error) {
+                console.error('[LayerManager] runtime visibility listener error', error);
+            }
+        }
+        if (typeof onRuntimeSceneChanged !== 'function') return;
+        try {
+            onRuntimeSceneChanged(payload);
+        } catch (error) {
+            console.error('[LayerManager] runtime scene listener error', error);
         }
     }
 
@@ -446,8 +470,16 @@ export function createLayerManager({
                 hasPropertyOverride: (h, property) => hasObjectPropertyOverride(h, property),
                 getNodeAdapter: (nextHandle) => getLayerNodeAdapter(layer, nextHandle),
                 cloneFromMax: (source, options) => layer.cloneFromMax?.(source, options) ?? null,
-                setVisibilityOverride: (h, visible, obj) => setRuntimeVisibilityOverride(layer.id, h, visible, obj),
-                clearVisibilityOverride: (h, obj) => clearRuntimeVisibilityOverride(h, obj),
+                setVisibilityOverride: (h, visible, obj) => {
+                    const changed = setRuntimeVisibilityOverride(layer.id, h, visible, obj);
+                    if (changed) notifyRuntimeSceneChanged({ type: 'visibility', layerId: layer.id, handle: h, visible: visible !== false });
+                    return changed;
+                },
+                clearVisibilityOverride: (h, obj) => {
+                    const changed = clearRuntimeVisibilityOverride(h, obj);
+                    if (changed) notifyRuntimeSceneChanged({ type: 'visibility', layerId: layer.id, handle: h, reset: true });
+                    return changed;
+                },
             });
             layer.nodeAdapters.set(handle, adapter);
         }
@@ -816,6 +848,7 @@ export function createLayerManager({
             const targetParent = options.parent?.isObject3D ? options.parent : parent;
             placeRuntimeClone(clone, adapter, targetParent, options);
             if (clone.userData?.maxjsFollowSourceMaterial) layer.liveMaterialClones.add(clone);
+            notifyRuntimeSceneChanged({ type: 'jsScene', layerId: layer.id, action: 'cloneFromMax' });
             return clone;
         };
         layer.cloneFromMax = cloneFromMaxForLayer;
@@ -833,12 +866,14 @@ export function createLayerManager({
                 markOwned(resource, owner);
                 if (options.snapshotId) setSnapshotTargetId(resource, `runtime:${layer.id}:${options.snapshotId}`);
                 parent.add(resource);
+                notifyRuntimeSceneChanged({ type: 'jsScene', layerId: layer.id, action: 'add' });
                 return resource;
             },
             remove(resource) {
                 if (!resource?.isObject3D || !isOwnedByJs(resource)) return false;
                 resource.parent?.remove(resource);
                 disposeOwnedResource(resource);
+                notifyRuntimeSceneChanged({ type: 'jsScene', layerId: layer.id, action: 'remove' });
                 return true;
             },
             createGroup(name = '', options = {}) {
@@ -848,6 +883,7 @@ export function createLayerManager({
                 if (options.snapshotId) setSnapshotTargetId(group, `runtime:${layer.id}:${options.snapshotId}`);
                 const parent = owner === OWNER_OVERLAY ? layer.overlayGroup : layer.group;
                 parent.add(group);
+                notifyRuntimeSceneChanged({ type: 'jsScene', layerId: layer.id, action: 'createGroup' });
                 return group;
             },
             createAnchor(handle, options = {}) {
@@ -882,8 +918,10 @@ export function createLayerManager({
                 // Without this, dispose() frees geometry/material but leaves the object
                 // parented — it lingers as a dead, un-rendered-but-present husk (and any
                 // layer still toggling its ancestor's visibility brings it back "stuck").
-                if (resource?.isObject3D) resource.parent?.remove(resource);
+                const wasObject3D = resource?.isObject3D === true;
+                if (wasObject3D) resource.parent?.remove(resource);
                 disposeOwnedResource(resource);
+                if (wasObject3D) notifyRuntimeSceneChanged({ type: 'jsScene', layerId: layer.id, action: 'dispose' });
             },
             traverse(cb) {
                 if (typeof cb === 'function') layer.group.traverse(cb);

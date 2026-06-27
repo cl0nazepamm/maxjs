@@ -2,7 +2,7 @@
 
 import { freezePlainObject, matrixElementsAlmostEqual } from './layer_utils.js';
 
-function createRuntimeOverrideController({ THREE, nodeMap, lightHandleMap = null }) {
+function createRuntimeOverrideController({ THREE, nodeMap, lightHandleMap = null, onRuntimeSceneChanged = null }) {
     const runtimeTransformOverrides = new Map();
     let runtimeTransformReapplyNeeded = false;
     // Map<handle, Map<slotName, { texture, layerId }>> — survives sync
@@ -35,6 +35,15 @@ function createRuntimeOverrideController({ THREE, nodeMap, lightHandleMap = null
         deltaScale: new THREE.Vector3(),
         euler: new THREE.Euler(),
     };
+
+    function notifyRuntimeSceneChanged(event) {
+        if (typeof onRuntimeSceneChanged !== 'function') return;
+        try {
+            onRuntimeSceneChanged(event);
+        } catch (error) {
+            console.error('[maxjs] runtime scene listener error', error);
+        }
+    }
     
     function applyObjectLocalMatrix(obj, matrix) {
         if (!obj?.isObject3D) return false;
@@ -156,6 +165,7 @@ function createRuntimeOverrideController({ THREE, nodeMap, lightHandleMap = null
         if (obj?.isObject3D) applyObjectLocalMatrix(obj, state.baseMatrix);
         runtimeTransformOverrides.delete(handle);
         if (runtimeTransformOverrides.size === 0) runtimeTransformReapplyNeeded = false;
+        notifyRuntimeSceneChanged({ type: 'transform', layerId: state.ownerLayer, handle, reset: true });
         return true;
     }
     
@@ -199,6 +209,10 @@ function createRuntimeOverrideController({ THREE, nodeMap, lightHandleMap = null
     
     function setMaterialMapOverride(layerId, handle, slot, texture) {
         let slots = materialOverrides.get(handle);
+        const previous = slots?.get(slot)?.texture;
+        if (!slots && texture == null) return false;
+        if (texture == null && previous === undefined) return false;
+        if (texture != null && previous === texture) return false;
         if (!slots) {
             slots = new Map();
             materialOverrides.set(handle, slots);
@@ -213,6 +227,8 @@ function createRuntimeOverrideController({ THREE, nodeMap, lightHandleMap = null
         // before the next scene sync.
         const mesh = nodeMap.get(handle);
         if (mesh) applyMaterialOverridesToMesh(handle, mesh);
+        notifyRuntimeSceneChanged({ type: 'materialMap', layerId, handle, slot });
+        return true;
     }
     
     function clearMaterialOverridesForLayer(layerId) {
@@ -358,7 +374,10 @@ function createRuntimeOverrideController({ THREE, nodeMap, lightHandleMap = null
             layerId,
             options: { ...options },
         });
-        applyObjectPropertyOverrides(handle, options.object ?? null);
+        const changed = applyObjectPropertyOverrides(handle, options.object ?? null);
+        if (changed || options.forceUpdate === true) {
+            notifyRuntimeSceneChanged({ type: 'property', layerId, handle, property });
+        }
         return true;
     }
 
@@ -377,6 +396,7 @@ function createRuntimeOverrideController({ THREE, nodeMap, lightHandleMap = null
                 if (options.shadowNeedsUpdate === true && obj.shadow) obj.shadow.needsUpdate = true;
             }
         }
+        notifyRuntimeSceneChanged({ type: 'property', layerId: entry.layerId, handle, property, reset: true });
         return true;
     }
 
@@ -419,7 +439,7 @@ function createRuntimeOverrideController({ THREE, nodeMap, lightHandleMap = null
         }
         if (obj.layers?.set) {
             const layer = next ? 0 : 31;
-            const mask = 1 << layer;
+            const mask = 2 ** layer;
             if (obj.layers.mask !== mask) {
                 obj.layers.set(layer);
                 changed = true;
@@ -566,7 +586,9 @@ function createRuntimeOverrideController({ THREE, nodeMap, lightHandleMap = null
             if (!payload) return false;
             const { state, obj } = payload;
             mutator(state.position, state.quaternion, state.scale, state, obj);
-            applyRuntimeTransformState(state, obj);
+            if (applyRuntimeTransformState(state, obj)) {
+                notifyRuntimeSceneChanged({ type: 'transform', layerId: state.ownerLayer, handle, mode: state.mode });
+            }
             return true;
         }
     

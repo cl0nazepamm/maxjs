@@ -1046,6 +1046,11 @@
         // term for the Advanced lighting stack.
         let giVolume = null;
         let haloGi = null; // HALO-GI BVH-traced DDGI probe field (opt-in; see init below)
+        // HALO-GI idle tracking: the probe field holds its synchronous BVH rebuild + GPU
+        // solve until the view rests (camera quiet, not playing, delta-sync settled), so
+        // a freeze can never land during interaction. Updated in the render loop.
+        let haloGiLastInteractionMs = 0;
+        let haloGiLastSyncSerial = -1;
         let giVolumeSyncToken = '';
         let giVolumeRefreshTimer = 0;
         let giVolumeFadeFrame = 0;
@@ -1185,7 +1190,13 @@
                         if (!haloOn || isPathTracingMode || !haloField.isSupported()) return;
                         if (nowMs - haloLastTick < 33) return; // ~30 Hz, own throttle
                         haloLastTick = nowMs;
-                        void haloField.tick();
+                        // The field self-gates on viewport idle: rebuild + solve are held
+                        // while orbiting / playing / mid delta-sync (GI is world-space, so
+                        // holding it static during motion is lossless and freeze-proof).
+                        void haloField.tick({
+                            idleMs: nowMs - haloGiLastInteractionMs,
+                            playing: !!maxTimeline?.playing?.(),
+                        });
                     },
                 };
                 window.maxjsHaloGI = haloGi; // console handle
@@ -4699,7 +4710,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         function setObjectSelfVisibleLayer(object, visible) {
             if (!object?.layers?.set) return false;
             const layer = visible ? 0 : MAXJS_SELF_HIDDEN_LAYER;
-            const mask = 1 << layer;
+            const mask = 2 ** layer;
             if (object.layers.mask === mask) return false;
             object.layers.set(layer);
             return true;
@@ -6735,10 +6746,12 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             // Compact: rebuild instance matrices with only visible entries
             let slot = 0;
             for (const handle of bucket.handles) {
+                bucket.handleToIndex.set(handle, -1);
                 if (bucket.visible.get(handle) === false) continue;
                 const xf = bucket.transforms.get(handle);
                 if (xf) maxInstanceMatrixScratch.fromArray(xf);
                 else maxInstanceMatrixScratch.identity();
+                bucket.handleToIndex.set(handle, slot);
                 bucket.mesh.setMatrixAt(slot, maxInstanceMatrixScratch);
                 slot++;
             }
@@ -6759,6 +6772,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             } else {
                 bucket.transforms.set(handle, Array.from(matrixArray));
             }
+            if (bucket.visible.get(handle) === false || idx < 0) return false;
             maxInstanceMatrixScratch.fromArray(matrixArray);
             bucket.mesh.setMatrixAt(idx, maxInstanceMatrixScratch);
             bucket.mesh.instanceMatrix.needsUpdate = true;
@@ -15561,7 +15575,14 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 syncGiVolumeActive();
                 // HALO-GI probe field tick — own ~30 Hz throttle, no-op unless
                 // opted in (window.maxjsHaloGI.enable()); never recompiles materials.
-                haloGi?.tick(performance.now());
+                // Track viewport interaction so the field can hold its synchronous
+                // rebuild + GPU solve until the camera/sync settle (freeze-proof).
+                const haloNowMs = performance.now();
+                if (controlsChanged || latestAppliedSyncSerial !== haloGiLastSyncSerial) {
+                    haloGiLastSyncSerial = latestAppliedSyncSerial;
+                    haloGiLastInteractionMs = haloNowMs;
+                }
+                haloGi?.tick(haloNowMs);
             }
             css3dOverlay.tick(scene, camera);
             css3dOverlay.tickBehind(webappSystem?.getBehindScene?.(), camera);
@@ -15676,6 +15697,12 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             getAudioSystem: () => audioSystem,
             debugLog: maxjsDebugLog,
             debugWarn: maxjsDebugWarn,
+            onRuntimeSceneChanged: () => {
+                maxjsFx.markSceneChanged?.();
+                markLightProbeSceneDirty();
+                scheduleLightProbeFromCurrentScene({ delay: 350 });
+                schedulePathTracingLiveRebuild();
+            },
         });
         jsmodVisibilityOwnedByLayer = (handle) => layerManager.hasRuntimeVisibilityOverride(handle);
         animationSystem = createMaxJSAnimationSystem({
@@ -15706,6 +15733,9 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             animationSystem.invalidateTargets();
             // Layer mutations can add/remove meshes — cheap scene refresh.
             maxjsFx.markSceneChanged?.();
+            markLightProbeSceneDirty();
+            scheduleLightProbeFromCurrentScene({ delay: 350 });
+            schedulePathTracingLiveRebuild();
         });
         const projectRuntime = window.chrome?.webview
             ? createProjectRuntime({ layerManager, bridge, perfHud, debugLog: maxjsDebugLog, debugWarn: maxjsDebugWarn })

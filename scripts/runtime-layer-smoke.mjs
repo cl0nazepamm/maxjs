@@ -22,13 +22,28 @@ const renderer = {
     info: {},
     domElement: { width: 800, height: 600 },
 };
+const maxNodeFlags = {};
+const maxNode = disposableMesh('max-node', maxNodeFlags);
+const nodeMap = new Map([[101, maxNode]]);
+let visibilityEvents = 0;
+let lastVisibilityEvent = null;
+let runtimeSceneEvents = 0;
+let lastRuntimeSceneEvent = null;
 
 const manager = createLayerManager({
     scene,
     camera,
     renderer,
     THREE,
-    nodeMap: new Map(),
+    nodeMap,
+    onRuntimeVisibilityChanged(event) {
+        visibilityEvents++;
+        lastVisibilityEvent = event;
+    },
+    onRuntimeSceneChanged(event) {
+        runtimeSceneEvents++;
+        lastRuntimeSceneEvent = event;
+    },
 });
 
 const removedFlags = {};
@@ -68,6 +83,50 @@ const mountResult = await manager.mount('runtime-smoke', (ctx) => {
     tracked = ctx.js.add(disposableMesh('tracked-me', trackedFlags));
     ctx.js.track(tracked);
     assert.equal(tracked.parent, ctx.group, 'tracked Object3D starts parented for teardown test');
+
+    const sceneEventBaseline = runtimeSceneEvents;
+    assert.ok(sceneEventBaseline >= 5, 'ctx.js graph mutations notify host scene changes');
+
+    const maxNodeAdapter = ctx.maxScene.getNode(101);
+    assert.ok(maxNodeAdapter, 'ctx.maxScene exposes Max node adapters');
+    maxNodeAdapter.hide();
+    assert.equal(visibilityEvents, 1, 'runtime node hide notifies host visibility changes');
+    assert.equal(lastVisibilityEvent?.handle, 101, 'visibility event includes node handle');
+    assert.equal(lastVisibilityEvent?.visible, false, 'visibility event includes hidden state');
+    assert.equal(maxNode.layers.mask, 0x80000000, 'runtime hide moves Max node to hidden layer');
+    maxNodeAdapter.hide();
+    assert.equal(visibilityEvents, 1, 'repeated runtime hide does not notify unchanged visibility');
+    maxNodeAdapter.show();
+    assert.equal(visibilityEvents, 2, 'runtime node show notifies host visibility changes');
+    assert.equal(lastVisibilityEvent?.visible, true, 'visibility event includes visible state');
+    assert.equal(maxNode.layers.mask, 1, 'runtime show restores visible layer');
+    assert.equal(maxNodeAdapter.resetVisibility(), true, 'runtime visibility reset clears override');
+    assert.equal(visibilityEvents, 3, 'runtime visibility reset notifies host visibility changes');
+    assert.equal(lastVisibilityEvent?.reset, true, 'visibility reset event is flagged');
+    assert.equal(runtimeSceneEvents, sceneEventBaseline + 3, 'visibility changes also notify runtime scene changes');
+
+    assert.equal(maxNodeAdapter.transform.setPosition(2, 0, 0), true, 'runtime transform override applies');
+    assert.equal(runtimeSceneEvents, sceneEventBaseline + 4, 'runtime transform override notifies host scene changes');
+    assert.equal(lastRuntimeSceneEvent?.type, 'transform', 'runtime transform event is typed');
+    assert.equal(maxNodeAdapter.resetTransform(), true, 'runtime transform reset clears override');
+    assert.equal(runtimeSceneEvents, sceneEventBaseline + 5, 'runtime transform reset notifies host scene changes');
+
+    const overrideTexture = new THREE.Texture();
+    assert.equal(maxNodeAdapter.setMap('map', overrideTexture), true, 'runtime material map override applies');
+    assert.equal(runtimeSceneEvents, sceneEventBaseline + 6, 'runtime material map override notifies host scene changes');
+    assert.equal(lastRuntimeSceneEvent?.type, 'materialMap', 'runtime material map event is typed');
+    assert.equal(maxNodeAdapter.setMap('map', overrideTexture), false, 'unchanged runtime material map override is ignored');
+    assert.equal(runtimeSceneEvents, sceneEventBaseline + 6, 'unchanged runtime material map override does not notify');
+    assert.equal(maxNodeAdapter.setMap('map', null), true, 'runtime material map override clears');
+    assert.equal(runtimeSceneEvents, sceneEventBaseline + 7, 'runtime material map clear notifies host scene changes');
+
+    assert.equal(maxNodeAdapter.overrides.setProperty('castShadow', true), true, 'runtime property override applies');
+    assert.equal(runtimeSceneEvents, sceneEventBaseline + 8, 'runtime property override notifies host scene changes');
+    assert.equal(lastRuntimeSceneEvent?.type, 'property', 'runtime property event is typed');
+    assert.equal(maxNodeAdapter.overrides.setProperty('castShadow', true), true, 'unchanged runtime property override remains a valid override');
+    assert.equal(runtimeSceneEvents, sceneEventBaseline + 8, 'unchanged runtime property override does not notify');
+    assert.equal(maxNodeAdapter.overrides.clearProperty('castShadow', { restoreValue: false }), true, 'runtime property override clears');
+    assert.equal(runtimeSceneEvents, sceneEventBaseline + 9, 'runtime property clear notifies host scene changes');
 
     return {};
 });

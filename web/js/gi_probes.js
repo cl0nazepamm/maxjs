@@ -57,6 +57,14 @@ const REACTIVE_TICKS = 40;         // ticks of fast (low-hysteresis) convergence
 const REACTIVE_HYSTERESIS = 0.4;   // hysteresis during a reactivity burst (vs steady-state)
 const LIGHT_CHECK_INTERVAL = 6;    // ticks between light-change checks
 const GEO_CHECK_INTERVAL = 24;     // ticks between geometry-change checks (full rebuild = expensive)
+const GEO_SETTLE_INTERVALS = 2;    // geo must be stable this many checks before a rebuild fires (debounce)
+// ── freeze-proofing: gate the synchronous BVH rebuild + GPU solve on viewport idle ──
+// The CPU MeshBVH build in rebuild() blocks the render thread, so it (and the GPU
+// solve) must NEVER land while the user is orbiting, the timeline is playing, or a
+// delta-sync burst is in flight. GI is world-space, so holding the field static
+// during motion is visually lossless; it resumes and converges once the view rests.
+const GI_IDLE_MS = 200;            // ms of camera/sync quiet before GI work resumes
+const REBUILD_BACKOFF_TICKS = 45;  // ticks to wait after a failed/empty rebuild before retrying
 // ── denoise uplift (CORE, docs/GI_HALO_design.md §11) tunables ──
 const GI_FILTER_K = 8.0;           // spatial filter: variance→edge-stop bandwidth
 const GI_FILTER_EPS = 0.001;       // spatial filter luma² absolute floor (avoids /0 on black)
@@ -116,13 +124,19 @@ export class GiProbeNode extends LightingNode {
         this._hasData = !!atlas;
         this._structGen++;
     }
-    setGrid(gridMin, gridSize, res, atlasW, atlasH, normalBias) {
+    // Update the grid placement uniforms only. Uniform .value writes do NOT change
+    // a material cache key, so this is churn-free — the same-dim rebuild path uses
+    // it to re-place probes after a geometry edit WITHOUT a TSL recompile.
+    updateGridUniforms(gridMin, gridSize, res, atlasW, atlasH, normalBias) {
         this.gridMinNode.value.copy(gridMin);
         this.gridSizeNode.value.copy(gridSize);
         this.resNode.value.copy(res);
         this.atlasDimNode.value.set(atlasW, atlasH);
         if (Number.isFinite(normalBias)) this.normalBiasNode.value = Math.max(1e-4, normalBias);
-        this._structGen++;
+    }
+    setGrid(gridMin, gridSize, res, atlasW, atlasH, normalBias) {
+        this.updateGridUniforms(gridMin, gridSize, res, atlasW, atlasH, normalBias);
+        this._structGen++;   // resize/first-enable ONLY → cacheToken moves → one recompile
     }
 
     // world position of grid probe (px,py,pz).
@@ -236,16 +250,26 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
     let dirty = true;
     let manualVolumes = null; // explicit probe volumes (Probe Origin boxes); null = auto-fit scene
     let needsClassify = true; // one-shot probe classification after a rebuild
+    let needsClear = true;    // zero the atlas+depthAtlas ONCE on a FULL rebuild (fresh textures
+                              //   aren't guaranteed zeroed); the same-dim path reuses live history,
+                              //   so it must NOT clear (clearing would black-flash the field).
+    let rebuildBackoff = 0;   // ticks remaining before retrying after a failed/empty rebuild (A7)
     let inFlight = false;
     let disposed = false;
     let probeCursor = 0;
     let frameCounter = 0;
     let updatedPerTick = 1;
+    let refreshStarted = false; // B1: false until the first full-field pass begins; gates ray-rotation advance
+    // same-dim detection: a geometry edit that doesn't resize the grid reuses the
+    // existing atlases/buffers and skips the recompile (A4).
+    let prevAtlasW = 0, prevAtlasH = 0, prevProbeTotal = 0;
+    let quantStep = 1;        // translation deadband (~quarter cell) for the geo signature (A1)
+    let lightQuant = 1;       // scene-relative position deadband for the light signature (B4)
     // reactivity: self-detect live light/geometry edits and re-converge fast.
     const baseHysteresis = THREE.MathUtils.clamp(hysteresis, 0, 0.99);
     let lastLightSig = null;
     let lastGeoSig = null;
-    let geoChanged = false;   // debounce: rebuild only after geometry edits SETTLE
+    let geoStable = -1;       // -1 = no pending geo change; >=0 = stable-check count since a change (debounce, A1)
     let checkCounter = 0;
     let reactiveTicks = 0;
     const _sigVec = new THREE.Vector3();
@@ -277,6 +301,17 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
             && typeof THREE.StorageBufferAttribute === 'function';
     }
 
+    // Same-dim rebuild: free ONLY the previous build's BVH storages, ray scratch, and
+    // texture maps — the atlases + irr/depth/state buffers are handed to the new kernels
+    // via `reuse`, so they must NOT be disposed (preserves live history, keeps the
+    // material binding stable → no recompile).
+    function disposeBVHOnly(g) {
+        if (!g) return;
+        for (const k of ['bvhNodes', 'triIndex', 'vertexData', 'triMaterial', 'materials', 'lights']) g.buffers?.[k]?.dispose?.();
+        g.rayBuffer?.dispose?.();
+        if (g.maps) for (const t of Object.values(g.maps)) t?.dispose?.();
+    }
+
     function disposeGPU() {
         if (!gpu) return;
         for (const k of ['bvhNodes', 'triIndex', 'vertexData', 'triMaterial', 'materials', 'lights']) gpu.buffers[k]?.dispose?.();
@@ -289,6 +324,7 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
         gpu.stateAtlas?.dispose?.();
         if (gpu.maps) for (const t of Object.values(gpu.maps)) t?.dispose?.();
         gpu = null;
+        prevAtlasW = prevAtlasH = prevProbeTotal = 0; // next rebuild takes the full (resize) path
         node.setAtlases(null, null, null);
     }
 
@@ -330,7 +366,7 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
         );
     }
 
-    function buildKernels(built) {
+    function buildKernels(built, reuse = null) {
         const buffers = {
             bvhNodes: new THREE.StorageBufferAttribute(built.bvhNodes, 1),
             triIndex: new THREE.StorageBufferAttribute(built.triIndex, 1),
@@ -359,39 +395,51 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
         const rayBuffer = new THREE.StorageBufferAttribute(new Float32Array(Math.max(4, updatedCap() * RAYS_PER_PROBE * 4)), 1);
         const rayData = storage(rayBuffer, 'float', rayBuffer.count);
 
-        // irradiance STATE buffer (read_write): 4 floats per probe texel.
-        const irrBuffer = new THREE.StorageBufferAttribute(new Float32Array(Math.max(4, probeTotal * TILE * TILE * 4)), 1);
+        // irradiance STATE buffer (read_write): 4 floats per probe texel. Reused on a
+        // same-dim rebuild so the field keeps converging from its live history (no black flash).
+        const irrBuffer = reuse?.irrBuffer || new THREE.StorageBufferAttribute(new Float32Array(Math.max(4, probeTotal * TILE * TILE * 4)), 1);
         const irr = storage(irrBuffer, 'float', irrBuffer.count);
         const irrRead = storage(irrBuffer, 'float', irrBuffer.count).toReadOnly();
 
-        // write-only sampled atlas (HW bilinear) — uploaded from irrBuffer.
-        const atlas = new THREE.StorageTexture(atlasW, atlasH);
-        atlas.type = THREE.HalfFloatType; atlas.format = THREE.RGBAFormat;
-        atlas.minFilter = THREE.LinearFilter; atlas.magFilter = THREE.LinearFilter;
-        atlas.wrapS = THREE.ClampToEdgeWrapping; atlas.wrapT = THREE.ClampToEdgeWrapping;
-        atlas.generateMipmaps = false; atlas.mipmapsAutoUpdate = false;
+        // write-only sampled atlas (HW bilinear) — uploaded from irrBuffer. Reused
+        // verbatim on a same-dim rebuild so the material's binding stays stable
+        // (churn-free) and the live irradiance history survives the geometry edit.
+        const atlas = reuse?.atlas || (() => {
+            const t = new THREE.StorageTexture(atlasW, atlasH);
+            t.type = THREE.HalfFloatType; t.format = THREE.RGBAFormat;
+            t.minFilter = THREE.LinearFilter; t.magFilter = THREE.LinearFilter;
+            t.wrapS = THREE.ClampToEdgeWrapping; t.wrapT = THREE.ClampToEdgeWrapping;
+            t.generateMipmaps = false; t.mipmapsAutoUpdate = false;
+            return t;
+        })();
 
         // depth-moment STATE (read_write): 2 floats per probe texel (meanR, meanR²),
         // + a sampled depth atlas for the Chebyshev visibility test (leak-free).
-        const depthBuffer = new THREE.StorageBufferAttribute(new Float32Array(Math.max(2, probeTotal * TILE * TILE * 2)), 1);
+        const depthBuffer = reuse?.depthBuffer || new THREE.StorageBufferAttribute(new Float32Array(Math.max(2, probeTotal * TILE * TILE * 2)), 1);
         const depthS = storage(depthBuffer, 'float', depthBuffer.count);
         const depthRead = storage(depthBuffer, 'float', depthBuffer.count).toReadOnly();
-        const depthAtlas = new THREE.StorageTexture(atlasW, atlasH);
-        depthAtlas.type = THREE.HalfFloatType; depthAtlas.format = THREE.RGBAFormat;
-        depthAtlas.minFilter = THREE.LinearFilter; depthAtlas.magFilter = THREE.LinearFilter;
-        depthAtlas.wrapS = THREE.ClampToEdgeWrapping; depthAtlas.wrapT = THREE.ClampToEdgeWrapping;
-        depthAtlas.generateMipmaps = false; depthAtlas.mipmapsAutoUpdate = false;
+        const depthAtlas = reuse?.depthAtlas || (() => {
+            const t = new THREE.StorageTexture(atlasW, atlasH);
+            t.type = THREE.HalfFloatType; t.format = THREE.RGBAFormat;
+            t.minFilter = THREE.LinearFilter; t.magFilter = THREE.LinearFilter;
+            t.wrapS = THREE.ClampToEdgeWrapping; t.wrapT = THREE.ClampToEdgeWrapping;
+            t.generateMipmaps = false; t.mipmapsAutoUpdate = false;
+            return t;
+        })();
 
         // probe META: 4 floats/probe = [state(1=active/0=buried), offset.xyz(relocation)].
         // Sampled (NEAREST, per-probe) by the node; atlas packs R=state, GBA=offset.
-        const stateBuffer = new THREE.StorageBufferAttribute(new Float32Array(Math.max(4, probeTotal * 4)), 1);
+        const stateBuffer = reuse?.stateBuffer || new THREE.StorageBufferAttribute(new Float32Array(Math.max(4, probeTotal * 4)), 1);
         const stateS = storage(stateBuffer, 'float', stateBuffer.count);
         const stateRead = storage(stateBuffer, 'float', stateBuffer.count).toReadOnly();
-        const stateAtlas = new THREE.StorageTexture(Math.max(1, res.x), Math.max(1, res.y * res.z));
-        stateAtlas.type = THREE.HalfFloatType; stateAtlas.format = THREE.RGBAFormat;
-        stateAtlas.minFilter = THREE.NearestFilter; stateAtlas.magFilter = THREE.NearestFilter;
-        stateAtlas.wrapS = stateAtlas.wrapT = THREE.ClampToEdgeWrapping;
-        stateAtlas.generateMipmaps = false; stateAtlas.mipmapsAutoUpdate = false;
+        const stateAtlas = reuse?.stateAtlas || (() => {
+            const t = new THREE.StorageTexture(Math.max(1, res.x), Math.max(1, res.y * res.z));
+            t.type = THREE.HalfFloatType; t.format = THREE.RGBAFormat;
+            t.minFilter = THREE.NearestFilter; t.magFilter = THREE.NearestFilter;
+            t.wrapS = t.wrapT = THREE.ClampToEdgeWrapping;
+            t.generateMipmaps = false; t.mipmapsAutoUpdate = false;
+            return t;
+        })();
 
         const loadLightVec3 = (base, off) => vec3(lights.element(base.add(uint(off))), lights.element(base.add(uint(off + 1))), lights.element(base.add(uint(off + 2))));
 
@@ -766,7 +814,10 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
     async function rebuild() {
         const buildSpectralScene = await ensureSceneBuilder();
         const built = buildSpectralScene({ THREE, scene, maxTriangles: MAX_TRIANGLES });
-        if (!built || built.error) { disposeGPU(); return false; }
+        // On a failed/empty build, keep the EXISTING field as history (don't tear it
+        // down) — tick() arms a backoff so we don't re-enter the synchronous build
+        // every frame. (A7)
+        if (!built || built.error) return false;
 
         const box = new THREE.Box3();
         scene.updateMatrixWorld(true);
@@ -777,7 +828,7 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
         const hasVolumes = Array.isArray(manualVolumes) && manualVolumes.length > 0;
         if (hasVolumes) { box.makeEmpty(); for (const b of manualVolumes) if (b && !b.isEmpty()) box.union(b); }
         else box.setFromObject(scene);
-        if (box.isEmpty()) { disposeGPU(); return false; }
+        if (box.isEmpty()) return false;
         box.getSize(gridSize);
         gridMin.copy(box.min);
         if (!hasVolumes) {
@@ -791,6 +842,43 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
         atlasW = res.x * TILE;
         atlasH = res.y * res.z * TILE;
 
+        const minCell = Math.min(gridSize.x / Math.max(1, res.x - 1), gridSize.y / Math.max(1, res.y - 1), gridSize.z / Math.max(1, res.z - 1));
+        quantStep = Math.max(1e-4, minCell * 0.25);             // A1: geo-signature translation deadband (~¼ cell)
+        lightQuant = Math.max(1e-3, gridSize.length() * 0.003); // B4: light-signature position deadband (~0.3% of scene)
+
+        // (A4) Same-dim path: a geometry/light edit that does NOT resize the grid reuses
+        // the live atlases + irr/depth/state buffers, rebuilds ONLY the BVH-bound kernels,
+        // and updates grid uniforms WITHOUT bumping the cache token → NO full-scene TSL
+        // recompile (the per-rebuild half of the freeze) and NO black flash. The reused
+        // history re-converges to the new geometry over a reactivity burst.
+        const sameDim = !!gpu && atlasW === prevAtlasW && atlasH === prevAtlasH && probeTotal === prevProbeTotal;
+        if (sameDim) {
+            const prev = gpu;
+            const reuse = {
+                atlas: prev.atlas, depthAtlas: prev.depthAtlas, stateAtlas: prev.stateAtlas,
+                irrBuffer: prev.irrBuffer, depthBuffer: prev.depthBuffer, stateBuffer: prev.stateBuffer,
+            };
+            gpu = buildKernels(built, reuse);
+            disposeBVHOnly(prev);   // free ONLY the old BVH storages + ray scratch + maps
+            U.gridMin.value.copy(gridMin);
+            U.gridSize.value.copy(gridSize);
+            U.lightCount.value = Math.min(MAX_LIGHTS, gpu.lightCount) >>> 0;
+            U.maxDist.value = gridSize.length();
+            U.cellMin.value = Math.max(1e-4, minCell);
+            U.relocClamp.value = 0.45 * minCell;
+            // res / probeTotal / atlasDim are unchanged by definition → leave those uniforms.
+            // Churn-free: update the NODE's placement uniforms WITHOUT bumping _structGen.
+            node.updateGridUniforms(gridMin, gridSize, res, atlasW, atlasH, minCell * SURFACE_NORMAL_BIAS_CELL);
+            probeCursor = 0;
+            refreshStarted = false;
+            needsClear = false;             // reuse the live atlas history (no black flash)
+            needsClassify = true;           // refresh per-probe state for the new geometry
+            reactiveTicks = REACTIVE_TICKS; // re-converge the reused history to the edit
+            dirty = false;
+            return true;
+        }
+
+        // Resize / first-enable path: full teardown + fresh resources + exactly ONE recompile.
         disposeGPU();
         gpu = buildKernels(built);
 
@@ -801,32 +889,52 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
         U.atlasDim.value.set(atlasW, atlasH);
         U.lightCount.value = Math.min(MAX_LIGHTS, gpu.lightCount) >>> 0;
         U.maxDist.value = gridSize.length();
-
-        const minCell = Math.min(gridSize.x / Math.max(1, res.x - 1), gridSize.y / Math.max(1, res.y - 1), gridSize.z / Math.max(1, res.z - 1));
         U.cellMin.value = Math.max(1e-4, minCell);
         U.relocClamp.value = 0.45 * minCell;
         node.setAtlases(gpu.atlas, gpu.depthAtlas, gpu.stateAtlas);
         node.setGrid(gridMin, gridSize, res, atlasW, atlasH, minCell * SURFACE_NORMAL_BIAS_CELL);
+        prevAtlasW = atlasW; prevAtlasH = atlasH; prevProbeTotal = probeTotal;
         probeCursor = 0;
+        refreshStarted = false;
         dirty = false;
+        needsClear = true;      // fresh StorageTextures aren't guaranteed zeroed
         needsClassify = true;
         // The setGrid/setAtlases calls above bumped _structGen → the lights-node
         // cacheToken changed. Force the one-shot material recompile NOW, the frame
         // the probe data first exists, so the field folds into the lights graph
-        // immediately on enable / after a settled geometry rebuild — not a rebuild
-        // late. Fires only here (once per rebuild, already debounced), never per
-        // tick → cannot reintroduce recompile churn.
+        // immediately on enable / after a resize — not a rebuild late. Fires only on
+        // this (resize/first-enable) path, never on the same-dim path or per tick →
+        // cannot reintroduce recompile churn.
         if (typeof onRebuilt === 'function') { try { onRebuilt(); } catch (e) { /* non-fatal */ } }
         return true;
     }
 
-    async function tick() {
+    async function tick(opts = {}) {
         if (disposed || inFlight || !node._enabled || !isSupported()) return;
-        if (dirty || !gpu) { inFlight = true; let ok = false; try { ok = await rebuild(); } finally { inFlight = false; } if (!ok) return; }
+
+        // (A2) Idle gate — the ONE hard rule. The synchronous CPU BVH rebuild AND the
+        // GPU solve are held while the user orbits, the timeline plays, or a delta-sync
+        // burst is in flight. GI is world-space, so the field staying static during
+        // motion is visually lossless; work resumes the moment the view rests, so a
+        // freeze can never land during interaction.
+        const idleMs = Number.isFinite(opts.idleMs) ? opts.idleMs : Infinity;
+        const playing = opts.playing === true;
+        if (idleMs < GI_IDLE_MS || playing) return;
+
+        // (A7) Back off after a failed/empty rebuild instead of re-entering the
+        // synchronous build every tick.
+        if (rebuildBackoff > 0) rebuildBackoff--;
+
+        if (dirty || !gpu) {
+            if (rebuildBackoff > 0) return;
+            inFlight = true; let ok = false;
+            try { ok = await rebuild(); } finally { inFlight = false; }
+            if (!ok) { dirty = false; rebuildBackoff = REBUILD_BACKOFF_TICKS; return; }
+        }
         if (!gpu) return;
 
         // reactivity: detect live light/geometry edits (throttled). Light change →
-        // cheap in-place buffer refresh; geometry change → full BVH rebuild next tick.
+        // cheap in-place buffer refresh; geometry change → debounced rebuild.
         checkCounter++;
         if (checkCounter % LIGHT_CHECK_INTERVAL === 0) {
             const ls = lightSignature();
@@ -835,11 +943,15 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
         }
         if (checkCounter % GEO_CHECK_INTERVAL === 0) {
             const gs = geoSignature();
-            // debounce: only rebuild once the geometry has SETTLED (stable for one
-            // interval), so a continuous drag doesn't trigger a rebuild every check.
-            if (lastGeoSig !== null && gs !== lastGeoSig) geoChanged = true;
-            else if (geoChanged) { geoChanged = false; reactiveTicks = REACTIVE_TICKS; requestRebuild(); }
-            lastGeoSig = gs;
+            // (A1) Debounce: rebuild only after the geometry has been STABLE for
+            // GEO_SETTLE_INTERVALS consecutive checks, so a continuous drag never
+            // thrashes. geoStable: -1 = no pending change; >=0 = stable-checks counted.
+            if (lastGeoSig === null) lastGeoSig = gs;
+            else if (gs !== lastGeoSig) { lastGeoSig = gs; geoStable = 0; }
+            else if (geoStable >= 0) {
+                geoStable++;
+                if (geoStable >= GEO_SETTLE_INTERVALS) { geoStable = -1; reactiveTicks = REACTIVE_TICKS; requestRebuild(); }
+            }
         }
         // drop hysteresis during a reactivity burst so the field re-converges fast.
         U.hysteresis.value = reactiveTicks > 0 ? REACTIVE_HYSTERESIS : baseHysteresis;
@@ -848,21 +960,45 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
         const updated = Math.min(updatedCap(), probeTotal);
         U.probeOffset.value = probeCursor >>> 0;
         U.updatedCount.value = updated >>> 0;
-        frameCounter = (frameCounter + 1) >>> 0;
-        U.frameJitter.value = (frameCounter * 0.61803398875) % 1;
+        // (B1) Advance the ray-set rotation ONLY at the start of a new full-field pass,
+        // never per tick. Within a pass every probe is solved with the SAME rotation,
+        // so re-solving a static probe yields an identical estimate → the temporal blend
+        // is a no-op → ZERO per-tick boil (the flicker). The slow per-pass rotation
+        // still averages the 64-ray structured error over seconds (SH-volume smoothness
+        // without giving up multi-rotation averaging).
+        if (probeCursor === 0) {
+            if (refreshStarted) { frameCounter = (frameCounter + 1) >>> 0; U.frameJitter.value = (frameCounter * 0.61803398875) % 1; }
+            refreshStarted = true;
+        }
         probeCursor = probeTotal > 0 ? (probeCursor + updated) % probeTotal : 0;
 
         inFlight = true;
         try {
-            if (needsClassify) {
-                await renderer.computeAsync(gpu.clearAtlasKernel);
-                await renderer.computeAsync(gpu.classifyKernel);
-                await renderer.computeAsync(gpu.uploadStateKernel);
-                needsClassify = false;
+            // (A5) One-time-per-rebuild prep. clear (full rebuild only) + the cheap
+            // uploadState (ALWAYS — it's the sole writer of stateAtlas; a zero-init
+            // stateBuffer yields a neutral state, and skipping it would leave the
+            // relocation sample reading uninitialised texels → NaN). classify (the
+            // 32-ray BVH walk) runs ONLY when Solid-scene mode is on. These WRITE
+            // buffers the trace then READS, so let them finish before tracing.
+            if (needsClear || needsClassify) {
+                const prep = [];
+                if (needsClear) { prep.push(renderer.computeAsync(gpu.clearAtlasKernel)); needsClear = false; }
+                if (needsClassify) {
+                    if (U.classifyStrength.value > 0) prep.push(renderer.computeAsync(gpu.classifyKernel));
+                    prep.push(renderer.computeAsync(gpu.uploadStateKernel));
+                    needsClassify = false;
+                }
+                await Promise.all(prep);
             }
-            await renderer.computeAsync(gpu.traceKernel);
-            await renderer.computeAsync(gpu.blendKernel);
-            await renderer.computeAsync(gpu.uploadKernel);
+            // (A6) Submit trace→blend→upload in order WITHOUT awaiting between them:
+            // same-queue submission order preserves the data dependency, so a single
+            // trailing await suffices. This removes the per-kernel CPU↔GPU round-trip
+            // that serialized GI against the frame (the steady-state "slow").
+            await Promise.all([
+                renderer.computeAsync(gpu.traceKernel),
+                renderer.computeAsync(gpu.blendKernel),
+                renderer.computeAsync(gpu.uploadKernel),
+            ]);
         } catch (e) {
             console.warn('max.js HALO-GI probe tick failed:', e);
             dirty = true;
@@ -871,8 +1007,8 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
         }
     }
 
-    function setEnabled(on) { node.setEnabled(on === true); if (on) dirty = true; }
-    function requestRebuild() { dirty = true; }
+    function setEnabled(on) { node.setEnabled(on === true); if (on) requestRebuild(); }
+    function requestRebuild() { dirty = true; rebuildBackoff = 0; } // a genuine request clears any failure backoff
     // Set explicit probe volume(s) (world-space THREE.Box3) — e.g. synced "Probe
     // Origin" boxes. Pass null/empty to revert to whole-scene auto-fit.
     function setVolumes(boxes) {
@@ -880,7 +1016,7 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
             .filter((b) => b && b.isBox3 && !b.isEmpty())
             .map((b) => b.clone());
         manualVolumes = list.length ? list : null;
-        dirty = true;
+        requestRebuild();
     }
     const setBounds = (box) => setVolumes(box ? [box] : null); // single-box convenience
 
@@ -889,26 +1025,33 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
     // BVH rebuild. Both kick a low-hysteresis burst so the field re-converges fast.
     function lightSignature() {
         let s = '', n = 0;
+        // (B4) Scene-relative deadbands so sub-perceptual delta-sync jitter does NOT
+        // arm a reactive burst every check; a genuine edit still changes the signature.
+        const q = lightQuant > 1e-6 ? lightQuant : 1;
         scene.traverseVisible((o) => {
             if (!o.isLight || o.isAmbientLight || o.isHemisphereLight) return;
             o.getWorldPosition(_sigVec);
             const c = o.color;
-            s += `${Math.round(_sigVec.x)},${Math.round(_sigVec.y)},${Math.round(_sigVec.z)}|`
-               + `${c ? Math.round((c.r * 7 + c.g * 11 + c.b * 13) * 32) : 0}|`
-               + `${Math.round((o.intensity || 0) * 10)}|${Math.round((o.angle || 0) * 100)};`;
+            s += `${Math.round(_sigVec.x / q)},${Math.round(_sigVec.y / q)},${Math.round(_sigVec.z / q)}|`
+               + `${c ? Math.round((c.r * 7 + c.g * 11 + c.b * 13) * 16) : 0}|`
+               + `${Math.round((o.intensity || 0) * 4)}|${Math.round((o.angle || 0) * 50)};`;
             n++;
         });
         return n + ':' + s;
     }
     function geoSignature() {
         let meshes = 0, prims = 0, hash = 0;
+        // (A1) Quantize world translation to ~¼ cell: sub-perceptual sync jitter does
+        // NOT re-arm a rebuild, while a genuine move DOES (the BVH bakes world-space
+        // verts, so real moves MUST rebuild or the field traces stale geometry).
+        const q = quantStep > 1e-6 ? quantStep : 1;
         scene.traverseVisible((o) => {
             if (!o.isMesh && !o.isInstancedMesh) return;
             const p = o.geometry?.attributes?.position; if (!p) return;
             meshes++;
             prims += o.geometry.index ? o.geometry.index.count : p.count;
             const e = o.matrixWorld?.elements;
-            if (e) hash += e[12] + e[13] * 1.7 + e[14] * 2.3 + p.count + (o.count || 1);
+            if (e) hash += Math.round(e[12] / q) + Math.round(e[13] / q) * 1.7 + Math.round(e[14] / q) * 2.3 + p.count + (o.count || 1);
         });
         return `${meshes}:${prims}:${Math.round(hash)}`;
     }

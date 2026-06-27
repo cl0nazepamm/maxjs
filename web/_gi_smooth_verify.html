@@ -1,0 +1,115 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>HALO-GI smooth/freeze-proof verify</title>
+<style>html,body{margin:0;height:100%;background:#111;color:#cde;font:12px/1.5 monospace}#c{width:45vw;height:100vh;float:left}#o{padding:10px;overflow:auto;height:100vh}</style>
+<script type="importmap">{ "imports": {
+  "three":"./vendor/three-r185/build/three.webgpu.js",
+  "three/webgpu":"./vendor/three-r185/build/three.webgpu.js",
+  "three/tsl":"./vendor/three-r185/build/three.tsl.js",
+  "three-mesh-bvh":"./node_modules/three-mesh-bvh/src/index.js" },
+  "scopes":{"./node_modules/three-mesh-bvh/":{"three":"./vendor/three-r185/build/three.module.js"}}}</script>
+</head><body><canvas id="c"></canvas><pre id="o">running…</pre><script type="module">
+// Session-1 validation of the freeze/flicker fixes (does NOT re-test the GI math —
+// _gi_probe_verify / _gi_leak_verify cover that). Proves:
+//  (1) IDLE GATE: tick({idleMs:0}) holds the (synchronous) rebuild; tick({idleMs:big}) runs it.
+//  (2) NO CHURN: a SAME-DIM rebuild does NOT change node.cacheToken (no material recompile).
+//  (3) RESIZE: a grid-resize rebuild DOES change cacheToken (one recompile, as designed).
+//  (4) SMOOTH: after convergence on a static scene the atlas is temporally stable
+//      (per-texel drift near the 8-bit quantization floor → no per-tick boil/flicker).
+const log=[]; const out=document.getElementById('o');
+window.addEventListener('error',e=>log.push(''+(e.error?e.error.stack:e.message)));
+window.addEventListener('unhandledrejection',e=>log.push('rej:'+(e.reason&&e.reason.stack||e.reason)));
+const report=(o)=>{ window.__DONE=o; out.textContent=JSON.stringify(o,null,2); };
+
+(async()=>{
+ const THREE=await import('three'); const TSL=await import('three/tsl');
+ const { createProbeField }=await import('./js/gi_probes.js');
+ const canvas=document.getElementById('c'); const renderer=new THREE.WebGPURenderer({canvas});
+ renderer.setPixelRatio(1); renderer.setSize(Math.floor(innerWidth*0.45),innerHeight,false); await renderer.init();
+ if(renderer.backend?.isWebGPUBackend!==true){ report({pass:false,reason:'not webgpu',log}); return; }
+
+ const scene=new THREE.Scene();
+ const floor=new THREE.Mesh(new THREE.PlaneGeometry(6,6), new THREE.MeshStandardMaterial({color:0xffffff,roughness:1}));
+ floor.rotation.x=-Math.PI/2; scene.add(floor);
+ const block=new THREE.Mesh(new THREE.BoxGeometry(1,1,1), new THREE.MeshStandardMaterial({color:0xffffff,roughness:1}));
+ block.position.set(0,0.5,0); scene.add(block);
+ const lamp=new THREE.PointLight(0xffffff,30,0,2); lamp.position.set(0,3,0); scene.add(lamp);
+ scene.updateMatrixWorld(true);
+
+ const field=createProbeField({ renderer, scene, intensity:1.0, hysteresis:0.92 });
+ if(!field.isSupported()){ report({pass:false,reason:'unsupported',log}); return; }
+ field.setEnabled(true);
+
+ const idleTick=(idleMs)=>field.tick({ idleMs });
+ const run=async(n,idleMs)=>{ for(let i=0;i<n;i++){ await idleTick(idleMs); await new Promise(r=>requestAnimationFrame(r)); } };
+
+ // readback the irradiance atlas (RGBA8, scaled) → interior-texel stats
+ const TILE=8, OCT=6, BORDER=1;
+ async function grabAtlas(){
+   const atlas=field._debugAtlas(); if(!atlas) return null;
+   const aw=atlas.image.width, ah=atlas.image.height;
+   const m=new THREE.MeshBasicNodeMaterial(); m.depthTest=false; m.depthWrite=false; m.toneMapped=false;
+   m.colorNode=TSL.texture(atlas, TSL.screenUV).mul(0.25);
+   const q=new THREE.QuadMesh(m); const rt=new THREE.RenderTarget(aw,ah);
+   rt.texture.minFilter=THREE.NearestFilter; rt.texture.magFilter=THREE.NearestFilter;
+   renderer.setRenderTarget(rt); q.render(renderer); renderer.setRenderTarget(null);
+   const buf=await renderer.readRenderTargetPixelsAsync(rt,0,0,aw,ah); rt.dispose();
+   return { aw, ah, buf };
+ }
+ // mean |Δ| over INTERIOR texels of every probe tile, and mean signal
+ function atlasDelta(A,B){
+   const res=field.getResolution(); let dsum=0, ssum=0, n=0;
+   const at=(g,x,y)=>{ const i=((g.ah-1-y)*g.aw+x)*4; return [g.buf[i],g.buf[i+1],g.buf[i+2]]; };
+   for(let pz=0;pz<res.z;pz++) for(let py=0;py<res.y;py++) for(let pxi=0;pxi<res.x;pxi++){
+     const col=pxi, row=pz*res.y+py;
+     for(let iy=0;iy<OCT;iy++) for(let ix=0;ix<OCT;ix++){
+       const x=col*TILE+BORDER+ix, y=row*TILE+BORDER+iy;
+       const a=at(A,x,y), b=at(B,x,y);
+       dsum+=Math.abs(a[0]-b[0])+Math.abs(a[1]-b[1])+Math.abs(a[2]-b[2]);
+       ssum+=a[0]+a[1]+a[2]; n+=3;
+     }
+   }
+   return { meanAbsDelta:+(dsum/Math.max(1,n)).toFixed(3), meanSignal:+(ssum/Math.max(1,n)).toFixed(3) };
+ }
+
+ // ---- converge on the static scene ----
+ await run(160, Infinity);
+ const token0 = field.node.cacheToken;
+ const probes0 = field.getStats().probes;
+
+ // (4) SMOOTH: temporal stability across ~2 full round-robin passes
+ const A = await grabAtlas();
+ await run(8, Infinity);
+ const B = await grabAtlas();
+ const drift = (A&&B) ? atlasDelta(A,B) : {meanAbsDelta:-1,meanSignal:0};
+ // ratio of per-texel drift to signal; near 8-bit quantization floor (~1/255 of the
+ // 0.25-scaled value) means visually static = no flicker.
+ const driftRatio = drift.meanSignal>0 ? +(drift.meanAbsDelta/drift.meanSignal).toFixed(4) : 1;
+
+ // (2) NO CHURN — same-dim rebuild: nudge the block (box stays floor-dominated → grid
+ // res unchanged) and force a rebuild; cacheToken must NOT move.
+ block.position.set(0.6,0.5,0.3); scene.updateMatrixWorld(true);
+ field.requestRebuild();
+ await idleTick(Infinity);              // idle → rebuild runs; same-dim path
+ const token1 = field.node.cacheToken;
+ const probes1 = field.getStats().probes;
+
+ // (1) IDLE GATE — force a RESIZE rebuild (scale the floor 3x → grid res changes), then
+ // prove tick({idleMs:0}) HOLDS it (no rebuild) and tick({idleMs:big}) RUNS it.
+ floor.scale.set(3,3,3); scene.updateMatrixWorld(true);
+ field.requestRebuild();
+ const probesBeforeGate = field.getStats().probes;
+ await run(6, 0);                        // "viewport moving" → rebuild must be held
+ const probesWhileMoving = field.getStats().probes;
+ await idleTick(500);                    // idle → rebuild runs (resize)
+ const token2 = field.node.cacheToken;
+ const probesAfterIdle = field.getStats().probes;
+
+ const checks=[
+   {name:'(4) smooth: atlas temporally stable after convergence', value:{drift, driftRatio}, pass: driftRatio>=0 && driftRatio < 0.04},
+   {name:'(2) no churn: SAME-DIM rebuild keeps cacheToken stable', value:{token0,token1,probes0,probes1}, pass: token1===token0 && probes1===probes0},
+   {name:'(1) idle gate HOLDS rebuild while moving (idleMs:0)', value:{probesBeforeGate,probesWhileMoving}, pass: probesWhileMoving===probesBeforeGate},
+   {name:'(1/3) idle release RUNS the resize rebuild (probes change, cacheToken bumps)', value:{probesBeforeGate,probesAfterIdle,token1,token2}, pass: probesAfterIdle!==probesBeforeGate && token2!==token1},
+ ];
+ const pass=checks.every(c=>c.pass);
+ report({pass, token0, token1, token2, drift, driftRatio, checks, log});
+})();
+</script></body></html>

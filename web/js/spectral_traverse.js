@@ -45,6 +45,7 @@ export function rgbToSpectral(rgbNode, lambda) {
 // and `maps` (PBR DataArrayTextures | {}) mirror buildKernels' inputs.
 export function buildTraversal({ storages, U, env = null, lut = null, lutRes = 0, maps = {} }) {
     const { bvhNodes, triIndex, vertexData, triMaterial, materials } = storages;
+    const MSTRIDE = uint(28);
 
     // ── helpers (graph emitters) ───────────────────────────────────
     const VSTRIDE = uint(8);
@@ -61,7 +62,7 @@ export function buildTraversal({ storages, U, env = null, lut = null, lutRes = 0
         return vec2(vertexData.element(b), vertexData.element(b.add(uint(1))));
     };
     const triVert = (triId, k) => triIndex.element(triId.mul(uint(3)).add(uint(k)));
-    const matFloat = (matId, k) => materials.element(matId.mul(uint(24)).add(uint(k)));
+    const matFloat = (matId, k) => materials.element(matId.mul(MSTRIDE).add(uint(k)));
 
     // ── PBR map array textures ─────────────────────────────────────
     const albedoTex = maps.albedo || null;
@@ -69,11 +70,13 @@ export function buildTraversal({ storages, U, env = null, lut = null, lutRes = 0
     const roughTex = maps.roughness || null;
     const metalTex = maps.metalness || null;
     const emissiveTex = maps.emissive || null;
+    const alphaTex = maps.alpha || null;
     const haveAlbedoMap = !!albedoTex;
     const haveNormalMap = !!normalTex;
     const haveRoughMap = !!roughTex;
     const haveMetalMap = !!metalTex;
     const haveEmissiveMap = !!emissiveTex;
+    const haveAlphaMap = !!alphaTex;
 
     // sRGB → linear (exact piecewise), component-wise.
     const srgbToLinear = (c) => select(
@@ -84,6 +87,44 @@ export function buildTraversal({ storages, U, env = null, lut = null, lutRes = 0
     // Sample a map-array layer at the transformed UV.
     const sampleLayer = (tex, uv, layerF) =>
         texture(tex, uv).depth(int(max(layerF, float(0)))).xyz;
+    const sampleLayerRGBA = (tex, uv, layerF) =>
+        texture(tex, uv).depth(int(max(layerF, float(0))));
+
+    const materialSideAccepts = (matId, det) => {
+        const side = matFloat(matId, 22);
+        const frontFace = det.greaterThan(float(0));
+        const frontSide = side.lessThan(float(0.5));
+        const backSide = side.greaterThanEqual(float(0.5)).and(side.lessThan(float(1.5)));
+        const doubleSide = side.greaterThanEqual(float(1.5));
+        return doubleSide
+            .or(frontSide.and(frontFace))
+            .or(backSide.and(det.lessThan(float(0))));
+    };
+
+    const materialAlphaAccepts = (matId, uv) => {
+        const alpha = matFloat(matId, 10).toVar();
+        if (haveAlbedoMap) {
+            const aL = matFloat(matId, 12);
+            const rgba = sampleLayerRGBA(albedoTex, uv, aL);
+            alpha.assign(alpha.mul(select(aL.greaterThan(float(-0.5)), rgba.w, float(1))));
+        }
+        if (haveAlphaMap) {
+            const aL = matFloat(matId, 24);
+            const rgba = sampleLayerRGBA(alphaTex, uv, aL);
+            // three.js alphaMap samples the green channel.
+            alpha.assign(alpha.mul(select(aL.greaterThan(float(-0.5)), rgba.y, float(1))));
+        }
+        const alphaTest = matFloat(matId, 23);
+        return alpha.greaterThan(float(1.0e-4))
+            .and(alphaTest.lessThanEqual(float(0)).or(alpha.greaterThanEqual(alphaTest)));
+    };
+
+    const hitUV = (triId, u, vbar) => {
+        const w = float(1).sub(u).sub(vbar);
+        return fetchUV(triVert(triId, 0)).mul(w)
+            .add(fetchUV(triVert(triId, 1)).mul(u))
+            .add(fetchUV(triVert(triId, 2)).mul(vbar));
+    };
 
     // ── Jakob–Hanika RGB → reflectance upsampling ──────────────────
     const haveLut = !!(lut && lut.length === 3 && lutRes > 1);
@@ -189,8 +230,13 @@ export function buildTraversal({ storages, U, env = null, lut = null, lutRes = 0
                                 If(vbar.greaterThanEqual(float(0)).and(u.add(vbar).lessThanEqual(float(1))), () => {
                                     const tHit = dot(e2, qv).mul(invDet);
                                     If(tHit.greaterThan(float(RAY_EPS)).and(tHit.lessThan(bestTVar)), () => {
-                                        bestTVar.assign(tHit);
-                                        bestTriVar.assign(int(triId));
+                                        const matId = triMaterial.element(triId);
+                                        const acceptsSide = materialSideAccepts(matId, det);
+                                        const acceptsAlpha = materialAlphaAccepts(matId, hitUV(triId, u, vbar));
+                                        If(acceptsSide.and(acceptsAlpha), () => {
+                                            bestTVar.assign(tHit);
+                                            bestTriVar.assign(int(triId));
+                                        });
                                     });
                                 });
                             });
@@ -243,8 +289,11 @@ export function buildTraversal({ storages, U, env = null, lut = null, lutRes = 0
                                 If(vb.greaterThanEqual(float(0)).and(u.add(vb).lessThanEqual(float(1))), () => {
                                     const tHit = dot(e2, qv).mul(invDet);
                                     If(tHit.greaterThan(float(RAY_EPS)).and(tHit.lessThan(maxDist)), () => {
-                                        const occTrans = matFloat(triMaterial.element(triId), 5);
-                                        If(occTrans.lessThan(float(0.5)), () => { blocked.assign(float(1)); });
+                                        const matId = triMaterial.element(triId);
+                                        const acceptsSide = materialSideAccepts(matId, det);
+                                        const acceptsAlpha = materialAlphaAccepts(matId, hitUV(triId, u, vb));
+                                        const occTrans = matFloat(matId, 5);
+                                        If(acceptsSide.and(acceptsAlpha).and(occTrans.lessThan(float(0.5))), () => { blocked.assign(float(1)); });
                                     });
                                 });
                             });
@@ -276,7 +325,7 @@ export function buildTraversal({ storages, U, env = null, lut = null, lutRes = 0
         srgbToLinear, sampleLayer,
         jhReflectance, jhEmission, envAtLambda, cosineSample,
         traverseClosest, traverseAny,
-        haveAlbedoMap, haveNormalMap, haveRoughMap, haveMetalMap, haveEmissiveMap,
-        albedoTex, normalTex, roughTex, metalTex, emissiveTex,
+        haveAlbedoMap, haveNormalMap, haveRoughMap, haveMetalMap, haveEmissiveMap, haveAlphaMap,
+        albedoTex, normalTex, roughTex, metalTex, emissiveTex, alphaTex,
     };
 }

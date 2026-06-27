@@ -128,7 +128,7 @@ const DEFAULT_HOOKS = Object.freeze({
         }
         if (mesh.layers?.set) {
             const layer = next ? 0 : MAXJS_SELF_HIDDEN_LAYER;
-            const mask = 1 << layer;
+            const mask = 2 ** layer;
             if (mesh.layers.mask !== mask) {
                 mesh.layers.set(layer);
                 changed = true;

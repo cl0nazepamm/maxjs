@@ -90,6 +90,9 @@ function matrixChanged(matrix, cache, epsilon = CAMERA_MATRIX_EPSILON) {
     }
     return false;
 }
+function cameraLayersMask(camera) {
+    return Number.isFinite(camera?.layers?.mask) ? camera.layers.mask : 0;
+}
 
 export function createSpectralTracer({
     renderer,
@@ -133,6 +136,7 @@ export function createSpectralTracer({
     // intensity/rotation tweak (no scene rebuild) resets accumulation.
     let lastEnvIntensity = NaN;
     let lastEnvRotation = NaN;
+    let lastCameraLayersMask = NaN;
 
     // GPU resources (rebuilt on scene change)
     let gpu = null; // { buffers, kernels, quad, width, height, env }
@@ -206,13 +210,14 @@ export function createSpectralTracer({
 
     function rebuildScene() {
         try {
-            const built = buildSpectralScene({ THREE, scene, maxTriangles: MAX_TRIANGLES });
+            const built = buildSpectralScene({ THREE, scene, camera: activeCamera, maxTriangles: MAX_TRIANGLES });
             if (!built) {
                 // Empty scene — nothing to trace. Treat as built so we just clear.
                 disposeGPU();
                 hasSceneBuilt = false;
                 sceneDirty = false;
                 sceneDirtyAt = 0;
+                lastCameraLayersMask = cameraLayersMask(activeCamera);
                 return true;
             }
             if (built.error) {
@@ -251,6 +256,7 @@ export function createSpectralTracer({
             sceneDirty = false;
             hasSceneBuilt = true;
             sceneDirtyAt = 0;
+            lastCameraLayersMask = cameraLayersMask(activeCamera);
             lastSceneRebuildAt = performance.now();
             nextRebuildRetryAt = 0;
             lastRebuildErrorKey = '';
@@ -343,6 +349,11 @@ export function createSpectralTracer({
             if (!gpu) return clearFrame();
             try { gpu.quad.render(renderer); } catch (error) { onError(error); }
             return true;
+        }
+
+        const currentCameraLayersMask = cameraLayersMask(activeCamera);
+        if (hasSceneBuilt && currentCameraLayersMask !== lastCameraLayersMask) {
+            requestSceneRebuild({ immediate: true });
         }
 
         if (sceneDirty) {
@@ -480,8 +491,10 @@ export function createSpectralTracer({
     function isSyncFrozen() { return freezeSync === true; }
     function setCamera(nextCamera) {
         if (!nextCamera) return;
+        const previousCameraLayersMask = cameraLayersMask(activeCamera);
         activeCamera = nextCamera;
         resetCameraKeys();
+        if (cameraLayersMask(activeCamera) !== previousCameraLayersMask) requestSceneRebuild({ immediate: true });
         if (updateCameraUniforms(true)) resetAccumulation();
     }
     function dispose() {

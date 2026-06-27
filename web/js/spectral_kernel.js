@@ -9,7 +9,7 @@
 // by the global sample count and maps XYZ→sRGB. "Fast not accurate" by design.
 //
 // Buffer strides come from spectral_scene.js: bvhNodes u32×8, triIndex u32×3,
-// vertexData f32×8 (pos+normal+uv), triMaterial u32×1, materials f32×24,
+// vertexData f32×8 (pos+normal+uv), triMaterial u32×1, materials f32×28,
 // lights f32×16, accum f32×4 (xyz + pad). PBR maps arrive as DataArrayTextures
 // (one per type) sampled at the hit UV.
 //

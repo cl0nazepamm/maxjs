@@ -791,11 +791,17 @@ export function createMaxJSFxController({
             return state.ssr.enabled;
         },
         setSSROptions(options = {}) {
+            if (typeof options.denoise === 'boolean') state.ssr.denoise = options.denoise;
+            if (typeof options.stochastic === 'boolean') state.ssr.stochastic = options.stochastic;
             assignFinite(state.ssr, 'quality', options.quality);
             assignFinite(state.ssr, 'blurQuality', options.blurQuality);
             assignFinite(state.ssr, 'maxDistance', options.maxDistance);
             assignFinite(state.ssr, 'opacity', options.opacity);
             assignFinite(state.ssr, 'thickness', options.thickness);
+            assignFinite(state.ssr, 'denoiseRadius', options.denoiseRadius);
+            assignFinite(state.ssr, 'denoiseStrength', options.denoiseStrength);
+            assignFinite(state.ssr, 'denoiseFrames', options.denoiseFrames);
+            assignFinite(state.ssr, 'denoiseAdaptiveTrust', options.denoiseAdaptiveTrust);
             rebuildPipeline();
             return { ...state.ssr };
         },

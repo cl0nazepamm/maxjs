@@ -667,11 +667,26 @@ export function createFxCore({
 
             const active = sorted.filter((d) => isEffectActive(d.id));
 
-            const useSharedPrePass = active.some((d) => Array.isArray(d.needs) && d.needs.length > 0);
+            const descriptorNeeds = (descriptor) => (
+                typeof descriptor.needs === 'function'
+                    ? descriptor.needs(ctx)
+                    : descriptor.needs
+            );
+            const descriptorFlag = (descriptor, key) => (
+                typeof descriptor[key] === 'function'
+                    ? descriptor[key](ctx)
+                    : descriptor[key]
+            );
+
+            const useSharedPrePass = active.some((d) => {
+                const needs = descriptorNeeds(d);
+                return Array.isArray(needs) && needs.length > 0;
+            });
 
             if (useSharedPrePass) {
                 // TRAA copies depth — MSAA sample count must be 1 to avoid mismatch
-                const forceSamplesOne = active.some((d) => d.forcePrePassSamplesOne);
+                const forceSamplesOne = active.some((d) => descriptorFlag(d, 'forcePrePassSamplesOne'));
+                const keepNormalCopyCompatible = active.some((d) => descriptorFlag(d, 'needsCopyCompatiblePrePassNormal'));
                 const prePass = forceSamplesOne
                     ? pass(scene, getCamera(), { samples: 1 })
                     : pass(scene, getCamera());
@@ -689,12 +704,14 @@ export function createFxCore({
                 const prePassNormal = sample((uvNode) => unpackRGBToNormal(prePassNormalColor.sample(uvNode)));
 
                 const normalTexture = prePass.getTexture('output');
-                if (normalTexture) normalTexture.type = THREE.UnsignedByteType;
+                // SSR denoise copies normal history; source/destination GPU formats must match.
+                if (normalTexture && !keepNormalCopyCompatible) normalTexture.type = THREE.UnsignedByteType;
 
                 ctx.prePass = {
                     node: prePass,
                     depth: prePassDepth,
                     normal: prePassNormal,
+                    normalColor: prePassNormalColor,
                     velocity: prePassVelocity,
                 };
             }

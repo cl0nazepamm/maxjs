@@ -13074,6 +13074,12 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     { key: 'maxDistance', label: 'Max Distance', min: 0.05, max: 2, step: 0.01 },
                     { key: 'opacity', label: 'Opacity', min: 0, max: 1, step: 0.01 },
                     { key: 'thickness', label: 'Thickness', min: 0.001, max: 0.05, step: 0.001 },
+                    { key: 'denoise', label: 'Denoiser', type: 'checkbox' },
+                    { key: 'stochastic', label: 'Stochastic Rays', type: 'checkbox', visibleWhen: (values) => !values.denoise },
+                    { key: 'denoiseRadius', label: 'Denoise Radius', min: 0.25, max: 24, step: 0.25, visibleWhen: (values) => values.denoise },
+                    { key: 'denoiseStrength', label: 'Temporal Strength', min: 0.01, max: 1, step: 0.01, visibleWhen: (values) => values.denoise },
+                    { key: 'denoiseFrames', label: 'History Frames', min: 1, max: 64, step: 1, integer: true, visibleWhen: (values) => values.denoise },
+                    { key: 'denoiseAdaptiveTrust', label: 'Firefly Guard', min: 0, max: 1, step: 0.01, visibleWhen: (values) => values.denoise },
                 ],
             },
             {
@@ -14690,6 +14696,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     isError = true;
                 } else if (section.key === 'ssr' && derived) {
                     note = `World distance ${derived.effectiveSSRMaxDistance.toFixed(2)} • thickness ${derived.effectiveSSRThickness.toFixed(3)}`;
+                    if (values.denoise) note += ' • recurrent denoise';
                 } else if (section.key === 'gtao' && derived) {
                     note = `World radius ${derived.effectiveGTAORadius.toFixed(2)} • thickness ${derived.effectiveGTAOThickness.toFixed(2)}`;
                 } else if (section.key === 'contactShadow' && derived) {

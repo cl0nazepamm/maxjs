@@ -1285,12 +1285,14 @@
                         // (markLightProbeMaterialsDirty) the moment the first rebuild
                         // produces probe data — same frame the data exists, not a rebuild
                         // late. Fires once per rebuild (debounced), never per tick.
+                        window.__maxjsSyncGiPanel?.(); // mirror On state in the FX panel (incl. auto-enable on reload)
                         return true;
                     },
                     disable() {
                         haloOn = false;
                         haloField.setEnabled(false);
                         markLightProbeMaterialsDirty(); // one-shot: drop the probe node from the lights graph this frame
+                        window.__maxjsSyncGiPanel?.();
                     },
                     setIntensity: (v) => haloField.setIntensity(v),
                     setCheby: (v) => haloField.setChebyStrength(v), // 0 leaks, 1 leak-free
@@ -14188,8 +14190,6 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                                 <div class="fx-control-head"><span>Intensity</span><span class="fx-value" id="fx-gi-intensity-val">1.5</span></div>
                                 <input class="fx-range" id="fx-gi-intensity" type="range" min="0" max="6" step="0.1" value="1.5">
                             </label>
-                            <label class="fx-check" for="fx-gi-leakfree" title="Depth-moment Chebyshev visibility — stops light leaking through walls."><span>Leak-free</span><input id="fx-gi-leakfree" type="checkbox" checked></label>
-                            <label class="fx-check" for="fx-gi-solid" title="Drop/relocate probes buried in SOLID geometry. Off is safer for thin 2-sided walls."><span>Solid scene</span><input id="fx-gi-solid" type="checkbox"></label>
                             <label class="fx-check" for="fx-gi-show-probes" title="Diagnostics: show the probe field as a grid of spheres in the viewport."><span>Show probes</span><input id="fx-gi-show-probes" type="checkbox"></label>
                         </div>
                     </section>
@@ -14601,8 +14601,6 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 const giToggle = document.getElementById('fx-gi-toggle');
                 const giInt = document.getElementById('fx-gi-intensity');
                 const giIntVal = document.getElementById('fx-gi-intensity-val');
-                const giLeak = document.getElementById('fx-gi-leakfree');
-                const giSolid = document.getElementById('fx-gi-solid');
                 const syncGiPanel = () => {
                     const gi = window.maxjsHaloGI;
                     const on = !!(gi && gi.isOn && gi.isOn());
@@ -14611,7 +14609,17 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                         giToggle.classList.toggle('active', on);
                         giToggle.disabled = !gi;
                     }
+                    // Mirror the live field state into the controls so a GI that was restored /
+                    // auto-enabled after reload (e.g. a persisted Probe Grid re-syncing) shows the
+                    // real toggle + intensity instead of the static HTML defaults — the "checkbox
+                    // says off while settings persisted" bug.
+                    const node = gi?.field?.node;
+                    if (giInt && Number.isFinite(node?.intensityNode?.value)) {
+                        giInt.value = String(node.intensityNode.value);
+                        if (giIntVal) giIntVal.textContent = Number(node.intensityNode.value).toFixed(1);
+                    }
                 };
+                window.__maxjsSyncGiPanel = syncGiPanel;
                 if (giToggle) giToggle.onclick = () => {
                     const gi = window.maxjsHaloGI;
                     if (!gi) return;
@@ -14624,8 +14632,6 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     if (giIntVal) giIntVal.textContent = v.toFixed(1);
                     window.maxjsHaloGI?.setIntensity?.(v);
                 };
-                if (giLeak) giLeak.onchange = () => window.maxjsHaloGI?.setCheby?.(giLeak.checked ? 1 : 0);
-                if (giSolid) giSolid.onchange = () => window.maxjsHaloGI?.setClassify?.(giSolid.checked ? 1 : 0);
                 const giShowProbes = document.getElementById('fx-gi-show-probes');
                 if (giShowProbes) giShowProbes.onchange = () => setProbeHelpersVisible(giShowProbes.checked);
                 syncGiPanel();

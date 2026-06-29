@@ -323,6 +323,7 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
         relocClamp: uniform(0.045),     // max relocation offset (< 0.45·cell → probe stays in cell)
         classifyStrength: uniform(0.0), // gates relocation APPLY (mirrors node.classifyStrengthNode)
         filterStrength: uniform(1.0),   // CORE denoise: 0 = filter off (harness baseline), 1 = full intra-tile spatial filter
+        filterSmooth: uniform(0.5),     // UI "Smoothness": widens the bilateral edge-stop (0 = baseline detail, 1 = very smooth)
     };
 
     function isSupported() {
@@ -732,6 +733,12 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
             const lxI = int(lx); const lyI = int(ly);
             const facc = vec3(0.0).toVar();
             const fwsum = float(0.0).toVar();
+            // UI "Smoothness" (U.filterSmooth) widens the variance-adaptive edge stop so more
+            // neighbours are trusted → stronger blur that kills GI splotch. 0 = baseline
+            // bandwidth (original directional detail), 1 = ~7× wider (very smooth).
+            const smW = float(1.0).add(U.filterSmooth.mul(float(6.0)));
+            const kEff = float(GI_FILTER_K).mul(smW);
+            const relEff = float(GI_FILTER_REL).mul(smW);
             for (let jy = -1; jy <= 1; jy++) {
                 for (let jx = -1; jx <= 1; jx++) {
                     const gw = Math.exp(-(jx * jx + jy * jy) * 0.5); // separable 3×3 gaussian (JS const)
@@ -742,7 +749,7 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
                     const dLum = dot(en, LUMA).sub(lumaC);
                     // variance-adaptive edge stop: noisy texel (high var) → wide trust →
                     // blur; converged texel (var→0) → narrow → preserve directional detail.
-                    const es = exp(dLum.mul(dLum).div(varC.mul(float(GI_FILTER_K)).add(tslMax(float(GI_FILTER_EPS), lumaC.mul(lumaC).mul(float(GI_FILTER_REL))))).mul(-1.0));
+                    const es = exp(dLum.mul(dLum).div(varC.mul(kEff).add(tslMax(float(GI_FILTER_EPS), lumaC.mul(lumaC).mul(relEff))).max(float(1e-8))).mul(-1.0));
                     const w = float(gw).mul(es);
                     facc.addAssign(en.mul(w));
                     fwsum.addAssign(w);
@@ -1143,6 +1150,7 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
             if (Number.isFinite(v)) U.classifyStrength.value = THREE.MathUtils.clamp(v, 0, 1); // trace-side relocation apply
         },
         setFilterStrength: (v) => { if (Number.isFinite(v)) U.filterStrength.value = THREE.MathUtils.clamp(v, 0, 1); }, // CORE denoise: 0 = off (harness baseline), 1 = full
+        setSmoothness: (v) => { if (Number.isFinite(v)) U.filterSmooth.value = THREE.MathUtils.clamp(v, 0, 1); }, // UI "Smoothness": widen the denoise edge-stop
         requestRebuild,
         setBounds,
         setVolumes,

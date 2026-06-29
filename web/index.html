@@ -1298,6 +1298,7 @@
                     setCheby: (v) => haloField.setChebyStrength(v), // 0 leaks, 1 leak-free
                     setClassify: (v) => haloField.setClassifyStrength(v), // 0 off (default), 1 drop buried probes (solid scenes)
                     setFilter: (v) => haloField.setFilterStrength(v),     // CORE denoise: 0 off (baseline), 1 full intra-tile spatial filter
+                    setSmoothness: (v) => haloField.setSmoothness(v),     // UI "Smoothness": widen the denoise edge-stop (kills GI splotch)
                     setBounds: (box) => haloField.setBounds(box),     // single Probe Origin box; null = auto-fit
                     setVolumes: (boxes) => haloField.setVolumes(boxes), // multiple Probe Origin boxes (unioned for now)
                     getStats: () => haloField.getStats(),
@@ -14184,11 +14185,15 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                             <div class="fx-section-title">Global Illumination</div>
                             <button class="fx-toggle" id="fx-gi-toggle" type="button">Off</button>
                         </div>
-                        <div class="fx-note" style="margin:0;padding:2px 0;color:#666;font-size:9px">BVH-traced indirect bounce (HALO-GI). WebGPU + Studio mode.</div>
+                        <div class="fx-note" style="margin:0;padding:2px 0;color:#666;font-size:9px">BVH-traced indirect bounce (HALO-GI). WebGPU, any render mode.</div>
                         <div class="fx-grid">
                             <label class="fx-control" for="fx-gi-intensity">
                                 <div class="fx-control-head"><span>Intensity</span><span class="fx-value" id="fx-gi-intensity-val">1.5</span></div>
                                 <input class="fx-range" id="fx-gi-intensity" type="range" min="0" max="6" step="0.1" value="1.5">
+                            </label>
+                            <label class="fx-control" for="fx-gi-smoothness">
+                                <div class="fx-control-head"><span>Smoothness</span><span class="fx-value" id="fx-gi-smoothness-val">0.50</span></div>
+                                <input class="fx-range" id="fx-gi-smoothness" type="range" min="0" max="1" step="0.05" value="0.5">
                             </label>
                             <label class="fx-check" for="fx-gi-show-probes" title="Diagnostics: show the probe field as a grid of spheres in the viewport."><span>Show probes</span><input id="fx-gi-show-probes" type="checkbox"></label>
                         </div>
@@ -14601,6 +14606,8 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 const giToggle = document.getElementById('fx-gi-toggle');
                 const giInt = document.getElementById('fx-gi-intensity');
                 const giIntVal = document.getElementById('fx-gi-intensity-val');
+                const giSmooth = document.getElementById('fx-gi-smoothness');
+                const giSmoothVal = document.getElementById('fx-gi-smoothness-val');
                 const syncGiPanel = () => {
                     const gi = window.maxjsHaloGI;
                     const on = !!(gi && gi.isOn && gi.isOn());
@@ -14624,13 +14631,18 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     const gi = window.maxjsHaloGI;
                     if (!gi) return;
                     if (gi.isOn && gi.isOn()) gi.disable();
-                    else { gi.enable(); gi.setIntensity(parseFloat(giInt?.value) || 1.5); }
+                    else { gi.enable(); gi.setIntensity(parseFloat(giInt?.value) || 1.5); gi.setSmoothness?.(parseFloat(giSmooth?.value)); }
                     syncGiPanel();
                 };
                 if (giInt) giInt.oninput = () => {
                     const v = parseFloat(giInt.value);
                     if (giIntVal) giIntVal.textContent = v.toFixed(1);
                     window.maxjsHaloGI?.setIntensity?.(v);
+                };
+                if (giSmooth) giSmooth.oninput = () => {
+                    const v = parseFloat(giSmooth.value);
+                    if (giSmoothVal) giSmoothVal.textContent = v.toFixed(2);
+                    window.maxjsHaloGI?.setSmoothness?.(v);
                 };
                 const giShowProbes = document.getElementById('fx-gi-show-probes');
                 if (giShowProbes) giShowProbes.onchange = () => setProbeHelpersVisible(giShowProbes.checked);

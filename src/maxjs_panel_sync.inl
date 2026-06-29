@@ -3555,6 +3555,47 @@
         webview_->PostWebMessageAsJson(ss.str().c_str());
     }
 
+    // HALO-GI Probe Grid out-of-band sync: a tiny JSON side-channel carrying each
+    // probe grid's box size + manual divisions + enabled flag, keyed by node handle.
+    // The grid's TRANSFORM rides the normal helper-node sync (both JSON and binary
+    // paths); the viewer fits the GI volume from (synced transform x this size).
+    // Called from EVERY scene-send path (full JSON, full binary, transform, delta) so
+    // fast-sync never misses it. Change-gated by the serialized payload.
+    std::wstring lastProbeGridSig_;
+    void SendProbeGridSync() {
+        if (!webview_) return;
+        Interface* ip = GetCOREInterface();
+        if (!ip) return;
+        const TimeValue t = ip->GetTime();
+        std::wostringstream grids;
+        grids.imbue(std::locale::classic());
+        int count = 0;
+        std::vector<INode*> stack;
+        INode* root = ip->GetRootNode();
+        if (root) for (int i = 0; i < root->NumberOfChildren(); i++) stack.push_back(root->GetChildNode(i));
+        while (!stack.empty()) {
+            INode* node = stack.back(); stack.pop_back();
+            if (!node) continue;
+            for (int i = 0; i < node->NumberOfChildren(); i++) stack.push_back(node->GetChildNode(i));
+            ObjectState os = node->EvalWorldState(t);
+            if (!os.obj || !IsThreeJSProbeGridClassID(os.obj->ClassID())) continue;
+            float dims[3] = { 100.0f, 100.0f, 100.0f }; int div[3] = { 12, 6, 12 }; bool en = true;
+            GetThreeJSProbeGridInfo(os.obj, dims, div, en);
+            if (count++) grids << L',';
+            grids << L"{\"h\":" << node->GetHandle()
+                  << L",\"enabled\":" << (en ? 1 : 0)
+                  << L",\"size\":[" << dims[0] << L',' << dims[1] << L',' << dims[2] << L"]"
+                  << L",\"div\":[" << div[0] << L',' << div[1] << L',' << div[2] << L"]}";
+        }
+        const std::wstring payload = grids.str();
+        if (payload == lastProbeGridSig_) return; // unchanged -> don't resend
+        lastProbeGridSig_ = payload;
+        std::wostringstream ss;
+        ss.imbue(std::locale::classic());
+        ss << L"{\"type\":\"probeGrids\",\"grids\":[" << payload << L"]}";
+        webview_->PostWebMessageAsJson(ss.str().c_str());
+    }
+
     void SendBinaryDeltaSync(bool includeMaterialScalars) {
         if (!webview_ || !env_) return;
 
@@ -3663,6 +3704,7 @@
         wv17->PostSharedBufferToScript(sharedBuf.Get(),
             COREWEBVIEW2_SHARED_BUFFER_ACCESS_READ_ONLY,
             meta.str().c_str());
+        SendProbeGridSync();
     }
 
     uint64_t HashMaterialPBRState(const MaxJSPBR& pbr) {

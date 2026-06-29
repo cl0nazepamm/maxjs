@@ -826,8 +826,8 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
         // one grid for now (perf win = tighter than the whole scene); far-apart
         // boxes will later get separate grids. Auto-fit only when no volume is set.
         const hasVolumes = Array.isArray(manualVolumes) && manualVolumes.length > 0;
-        if (hasVolumes) { box.makeEmpty(); for (const b of manualVolumes) if (b && !b.isEmpty()) box.union(b); }
-        else box.setFromObject(scene);
+        if (hasVolumes) { box.makeEmpty(); for (const v of manualVolumes) if (v.box && !v.box.isEmpty()) box.union(v.box); }
+        else box.setFromObject(scene);  // auto-fit ONLY when no probe-grid volume is set
         if (box.isEmpty()) return false;
         box.getSize(gridSize);
         gridMin.copy(box.min);
@@ -837,7 +837,10 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
             const pad = gridSize.clone().multiplyScalar(0.06);
             gridMin.sub(pad); gridSize.add(pad.clone().multiplyScalar(2));
         }
-        res.copy(computeGridResolution(gridSize));
+        // Manual divisions: a single explicit volume with a res override sets grid
+        // resolution directly; otherwise derive from box size.
+        const resOverride = (hasVolumes && manualVolumes.length === 1 && manualVolumes[0].res) ? manualVolumes[0].res : null;
+        res.copy(resOverride ? resOverride : computeGridResolution(gridSize));
         probeTotal = res.x * res.y * res.z;
         atlasW = res.x * TILE;
         atlasH = res.y * res.z * TILE;
@@ -1009,12 +1012,28 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
 
     function setEnabled(on) { node.setEnabled(on === true); if (on) requestRebuild(); }
     function requestRebuild() { dirty = true; rebuildBackoff = 0; } // a genuine request clears any failure backoff
-    // Set explicit probe volume(s) (world-space THREE.Box3) — e.g. synced "Probe
-    // Origin" boxes. Pass null/empty to revert to whole-scene auto-fit.
+    // Set explicit probe volume(s) — e.g. synced "HALO-GI Probe Grid" helpers. Each
+    // entry is a world-space THREE.Box3 (auto resolution) OR { box, res } where res is
+    // a Vector3/[x,y,z] of MANUAL per-axis divisions. Pass null/empty to revert to
+    // whole-scene auto-fit. When set, auto-fit is OFF (the box bounds the field).
+    function normalizeRes(r) {
+        if (!r) return null;
+        const rx = Number.isFinite(r.x) ? r.x : (Array.isArray(r) ? r[0] : NaN);
+        const ry = Number.isFinite(r.y) ? r.y : (Array.isArray(r) ? r[1] : NaN);
+        const rz = Number.isFinite(r.z) ? r.z : (Array.isArray(r) ? r[2] : NaN);
+        if (!Number.isFinite(rx) || !Number.isFinite(ry) || !Number.isFinite(rz)) return null;
+        const c = (v) => THREE.MathUtils.clamp(Math.round(v), 2, MAX_PROBES_PER_AXIS);
+        return new THREE.Vector3(c(rx), c(ry), c(rz));
+    }
     function setVolumes(boxes) {
-        const list = (Array.isArray(boxes) ? boxes : [boxes])
-            .filter((b) => b && b.isBox3 && !b.isEmpty())
-            .map((b) => b.clone());
+        const arr = Array.isArray(boxes) ? boxes : [boxes];
+        const list = [];
+        for (const entry of arr) {
+            if (!entry) continue;
+            const box = entry.isBox3 ? entry : entry.box;
+            if (!box || !box.isBox3 || box.isEmpty()) continue;
+            list.push({ box: box.clone(), res: entry.isBox3 ? null : normalizeRes(entry.res) });
+        }
         manualVolumes = list.length ? list : null;
         requestRebuild();
     }

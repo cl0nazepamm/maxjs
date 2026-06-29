@@ -22,6 +22,7 @@
         pluginInstHash_.clear();
         ClearMaterialEditHandleCache();
         lastSentTransforms_.clear();
+        lastProbeGridSig_.clear(); // resend probe grids on every full sync (covers viewer reload)
 
         std::wostringstream ss;
         ss.imbue(std::locale::classic());
@@ -154,6 +155,7 @@
         ss << L'}';
 
         webview_->PostWebMessageAsJson(ss.str().c_str());
+        SendProbeGridSync();
         SendRenderOutputSettings(true);
         ResetFastPathState(true);
     }
@@ -428,6 +430,7 @@
         pluginInstHandles_.clear();
         pluginInstHash_.clear();
         lastSentTransforms_.clear();
+        lastProbeGridSig_.clear(); // resend probe grids on every (binary) full sync
 
         // Collect all geometry nodes
         struct NodeGeo {
@@ -956,6 +959,7 @@
         wv17->PostSharedBufferToScript(sharedBuf.Get(),
             COREWEBVIEW2_SHARED_BUFFER_ACCESS_READ_ONLY,
             ss.str().c_str());
+        SendProbeGridSync();
         SendRenderOutputSettings(true);
         ResetFastPathState(true);
     }
@@ -1065,4 +1069,5 @@
         WriteWebAppsJson(ss, ip, t, true, true, true);
         ss << L'}';
         webview_->PostWebMessageAsJson(ss.str().c_str());
+        SendProbeGridSync();
     }

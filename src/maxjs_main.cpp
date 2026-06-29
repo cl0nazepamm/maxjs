@@ -49,6 +49,7 @@
 #include "threejs_deform.h"
 #include "threejs_gltf.h"
 #include "threejs_webapp.h"
+#include "threejs_probegrid.h"
 #include <iskin.h>
 
 #include <wrl.h>
@@ -1493,7 +1494,7 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, ULONG fdwReason, LPVOID) {
 }
 
 __declspec(dllexport) const TCHAR* LibDescription()   { return MAXJS_NAME; }
-__declspec(dllexport) int LibNumberClasses()           { return 23; }
+__declspec(dllexport) int LibNumberClasses()           { return 24; }
 __declspec(dllexport) ClassDesc* LibClassDesc(int i) {
     switch (i) {
         case 0: return &maxJSDesc;
@@ -1519,6 +1520,7 @@ __declspec(dllexport) ClassDesc* LibClassDesc(int i) {
         case 20: return GetThreeJSHTMLTexDesc();
         case 21: return GetThreeJSGLTFDesc();
         case 22: return GetThreeJSWebAppDesc();
+        case 23: return GetThreeJSProbeGridDesc();
         default: return nullptr;
     }
 }

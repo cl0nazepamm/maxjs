@@ -486,20 +486,110 @@
         import * as TSL from 'three/tsl';
         import { createTSLCompiler, makeBakeNodeToTexture } from './js/tsl_materials.js';
 
+        const maxjsHdriDiffuseIntensity = THREE.TSL.uniform(1.0);
+
         // Patch materialEnvIntensity so scene.environment still respects
-        // per-material envMapIntensity, while scene.environmentNode can carry
-        // a global node intensity for procedural WebGPU environments.
+        // per-material envMapIntensity, while scene.environmentIntensity remains
+        // the global HDRI/node intensity control.
         materialEnvIntensity.onObjectUpdate(({ material, scene }) => {
             const materialIntensity = Number.isFinite(material?.envMapIntensity)
                 ? material.envMapIntensity
                 : 1.0;
-            const nodeIntensity = (
-                !material?.envMap &&
-                scene?.environmentNode &&
-                Number.isFinite(scene?.environmentIntensity)
-            ) ? scene.environmentIntensity : 1.0;
-            return materialIntensity * nodeIntensity;
+            const sceneIntensity = Number.isFinite(scene?.environmentIntensity)
+                ? scene.environmentIntensity
+                : 1.0;
+            return materialIntensity * sceneIntensity;
         });
+
+        function patchEnvironmentNodeDiffuseSplit() {
+            const EnvironmentNode = THREE.EnvironmentNode;
+            const tsl = THREE.TSL || {};
+            if (!EnvironmentNode?.prototype || EnvironmentNode.prototype.maxjsHdriDiffuseSplitPatched) return;
+
+            const {
+                isolate,
+                roughness,
+                clearcoatRoughness,
+                cameraWorldMatrix,
+                normalView,
+                clearcoatNormalView,
+                normalWorld,
+                positionViewDirection,
+                float,
+                pow4,
+                bentNormalView,
+                pmremTexture,
+            } = tsl;
+            if (!isolate || !roughness || !cameraWorldMatrix || !normalView || !normalWorld || !positionViewDirection || !float || !pow4 || !pmremTexture) {
+                return;
+            }
+
+            const originalSetup = EnvironmentNode.prototype.setup;
+            const createRadianceContext = (roughnessNode, normalViewNode) => {
+                let reflectVec = null;
+                return {
+                    getUV: () => {
+                        if (reflectVec === null) {
+                            reflectVec = positionViewDirection.negate().reflect(normalViewNode);
+                            reflectVec = pow4(roughnessNode).mix(reflectVec, normalViewNode).normalize();
+                            reflectVec = reflectVec.transformDirection(cameraWorldMatrix);
+                        }
+                        return reflectVec;
+                    },
+                    getTextureLevel: () => roughnessNode,
+                };
+            };
+            const createIrradianceContext = (normalWorldNode) => ({
+                getUV: () => normalWorldNode,
+                getTextureLevel: () => float(1.0),
+            });
+
+            EnvironmentNode.prototype.setup = function setupMaxjsEnvironmentNode(builder) {
+                try {
+                    const { material } = builder;
+                    let envNode = this.envNode;
+
+                    if (envNode.isTextureNode || envNode.isMaterialReferenceNode) {
+                        const value = envNode.isTextureNode ? envNode.value : material[envNode.property];
+                        const cache = this._getPMREMNodeCache(builder.renderer);
+                        let cacheEnvNode = cache.get(value);
+                        if (cacheEnvNode === undefined) {
+                            cacheEnvNode = pmremTexture(value);
+                            cache.set(value, cacheEnvNode);
+                        }
+                        envNode = cacheEnvNode;
+                    }
+
+                    const useAnisotropy = material.useAnisotropy === true || material.anisotropy > 0;
+                    const radianceNormalView = useAnisotropy ? bentNormalView : normalView;
+
+                    const radiance = envNode.context(createRadianceContext(roughness, radianceNormalView)).mul(materialEnvIntensity);
+                    const irradiance = envNode.context(createIrradianceContext(normalWorld)).mul(Math.PI).mul(materialEnvIntensity);
+
+                    builder.context.radiance.addAssign(isolate(radiance));
+
+                    const isNativeWebGPU = builder.renderer?.backend?.isWebGPUBackend === true;
+                    const isolatedIrradiance = isolate(irradiance);
+                    builder.context.iblIrradiance.addAssign(
+                        isNativeWebGPU ? isolatedIrradiance.mul(maxjsHdriDiffuseIntensity) : isolatedIrradiance
+                    );
+
+                    const clearcoatRadiance = builder.context.lightingModel.clearcoatRadiance;
+                    if (clearcoatRadiance && clearcoatRoughness && clearcoatNormalView) {
+                        const clearcoatRadianceContext = envNode
+                            .context(createRadianceContext(clearcoatRoughness, clearcoatNormalView))
+                            .mul(materialEnvIntensity);
+                        clearcoatRadiance.addAssign(isolate(clearcoatRadianceContext));
+                    }
+                } catch (error) {
+                    return originalSetup.call(this, builder);
+                }
+            };
+
+            Object.defineProperty(EnvironmentNode.prototype, 'maxjsHdriDiffuseSplitPatched', { value: true });
+        }
+
+        patchEnvironmentNodeDiffuseSplit();
         import { applyDeltaFrame } from './js/protocol.js';
         import {
             attachSkinAttributes,
@@ -1051,6 +1141,11 @@
         // a freeze can never land during interaction. Updated in the render loop.
         let haloGiLastInteractionMs = 0;
         let haloGiLastSyncSerial = -1;
+        // HALO-GI Probe Grid side-channel: handle -> { size:[l,w,h], div:[x,y,z], enabled }.
+        // Transform rides the normal helper-node sync; this carries size + manual divisions.
+        const probeGridData = new Map();
+        let probeVolumeSig = '';
+        let probeGridAutoEnabled = false; // auto-turn-on GI once when an enabled grid first appears
         let giVolumeSyncToken = '';
         let giVolumeRefreshTimer = 0;
         let giVolumeFadeFrame = 0;
@@ -2129,9 +2224,27 @@
         let localHdriShowBg = false;
         let localHdriBlur = 0;
         let localHdriFlip = false;
+        let localHdriReflectionOnly = false;
 
         function isLocalHdriLoaded() { return localHdriObjectUrl != null; }
         function isLocalHdriActive() { return isLocalHdriLoaded() && localHdriEnabled; }
+        function isNativeWebGPUBackend() {
+            return rendererBackendLabel === 'WebGPU' && renderer?.backend?.isWebGPUBackend === true;
+        }
+        function isHdriReflectionOnlyEffective() {
+            return !!(localHdriReflectionOnly && isNativeWebGPUBackend() && isLocalHdriActive() && !hasAuthoredEnvironmentActive());
+        }
+        function applyHdriReflectionOnlyState({ markOutput = false } = {}) {
+            const active = isHdriReflectionOnlyEffective();
+            scene.userData.maxjsHdriReflectionOnly = active;
+            maxjsHdriDiffuseIntensity.value = active ? 0.0 : 1.0;
+            applyLightProbeState();
+            if (markOutput) {
+                markLightProbeMaterialsDirty();
+                maxjsFx.markEnvironmentChanged?.();
+                maxjsFx.markOutputChanged?.();
+            }
+        }
 
         function clearCurrentHdriEnvMap() {
             if (currentHdriEnvMap) {
@@ -2154,8 +2267,9 @@
         }
 
         function applyLightProbeState() {
-            const useGrid = lightProbeEnabled && hasLightProbeGridData && !!lightProbeGrid;
-            lightProbe.intensity = lightProbeEnabled && !useGrid ? lightProbeIntensity : 0.0;
+            const hdriDiffuseMuted = isHdriReflectionOnlyEffective();
+            const useGrid = !hdriDiffuseMuted && lightProbeEnabled && hasLightProbeGridData && !!lightProbeGrid;
+            lightProbe.intensity = !hdriDiffuseMuted && lightProbeEnabled && !useGrid ? lightProbeIntensity : 0.0;
             if (lightProbeGrid) lightProbeGrid.visible = useGrid;
             if (lightProbeGridActive !== useGrid) {
                 lightProbeGridActive = useGrid;
@@ -4027,6 +4141,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     : retainPMREMTexture(pmremGenerator.fromEquirectangular(hdrTex));
                 currentHdriEnvMap = envMap;
                 scene.environment = envMap;
+                applyHdriReflectionOnlyState();
                 syncMaterialEnvMaps();
                 syncEnvironmentDisplay();
                 if (previousEnvMap && previousEnvMap !== envMap) previousEnvMap.dispose?.();
@@ -4049,6 +4164,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 scene.environment = null;
                 scene.userData.maxjsPathTraceEnvironment = null;
                 scene.userData.maxjsPathTraceBackground = null;
+                applyHdriReflectionOnlyState();
                 syncMaterialEnvMaps();
                 syncEnvironmentDisplay();
                 resetEnvironmentLighting();
@@ -4160,6 +4276,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 scene.userData.maxjsPathTraceEnvironment = localHdriRawTexture || null;
                 syncMaterialEnvMaps();
                 scene.environmentIntensity = localHdriIntensity;
+                applyHdriReflectionOnlyState();
                 const rot = localHdriRotation * Math.PI / 180;
                 scene.environmentRotation.set(0, -rot, 0);
                 scene.backgroundRotation.set(0, -rot, 0);
@@ -4174,6 +4291,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 scene.environment = null;
                 scene.userData.maxjsPathTraceEnvironment = currentHdriRawTexture || null;
                 scene.userData.maxjsPathTraceBackground = null;
+                applyHdriReflectionOnlyState();
                 syncMaterialEnvMaps();
                 setBackgroundColor(hiddenBackgroundColor);
                 maxjsFx.setEnvironmentVisible(false);
@@ -4223,6 +4341,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             scene.environment = null;
             scene.userData.maxjsPathTraceEnvironment = null;
             scene.userData.maxjsPathTraceBackground = null;
+            applyHdriReflectionOnlyState();
             syncMaterialEnvMaps();
             scene.environmentIntensity = 1.0;
             scene.environmentRotation.set(0, 0, 0);
@@ -4250,7 +4369,9 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 toggleEl.textContent = localHdriEnabled ? 'On' : 'Off';
                 toggleEl.classList.toggle('active', !authoredEnvironmentActive && localHdriEnabled && isLocalHdriLoaded());
             }
-            for (const id of ['fx-hdri-toggle', 'fx-hdri-load', 'fx-hdri-clear', 'fx-hdri-rotation', 'fx-hdri-intensity', 'fx-hdri-blur', 'fx-hdri-flip']) {
+            const reflectionOnlyEl = document.getElementById('fx-hdri-reflection-only');
+            if (reflectionOnlyEl) reflectionOnlyEl.checked = localHdriReflectionOnly;
+            for (const id of ['fx-hdri-toggle', 'fx-hdri-load', 'fx-hdri-clear', 'fx-hdri-rotation', 'fx-hdri-intensity', 'fx-hdri-blur', 'fx-hdri-flip', 'fx-hdri-reflection-only']) {
                 const el = document.getElementById(id);
                 if (el) el.disabled = authoredEnvironmentActive;
             }
@@ -4413,6 +4534,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 disposeSkyReflectionEnvironment();
                 if (skyEnvMap && scene.environment === skyEnvMap) scene.environment = null;
                 scene.environmentIntensity = 1.0;
+                applyHdriReflectionOnlyState();
                 currentHdriProbeSignature = JSON.stringify([
                     'geospatial-probe',
                     params.model,
@@ -4483,6 +4605,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     hasLightProbeData = true;
                     skyActive = true;
                     skyPlanetaryActive = true;
+                    applyHdriReflectionOnlyState();
                     currentHdriUrl = null;
                     currentHdriProbeSignature = '';
                     maxjsFx.markEnvironmentChanged?.();
@@ -4563,6 +4686,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 syncDefaultLightsVisibility();
                 updateSkyAmbientLightProbe(params, sunDir);
                 skyActive = true;
+                applyHdriReflectionOnlyState();
 
                 // Clear HDRI state
                 currentHdriUrl = null;
@@ -4625,6 +4749,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             scene.environment = null;
             syncMaterialEnvMaps();
             scene.environmentIntensity = 1.0;
+            applyHdriReflectionOnlyState();
             scene.environmentRotation.set(0, 0, 0);
             scene.backgroundRotation.set(0, 0, 0);
             scene.backgroundBlurriness = 0;
@@ -7044,6 +7169,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             // entry points, so a full pipeline rebuild is unnecessary here.
             if (sceneChanged) maxjsFx.markSceneChanged?.();
             options.afterWorldUpdate?.();
+            syncHaloProbeVolumes();
 
             if (firstSync && snapshot.nodes.length > 0) {
                 firstSync = false;
@@ -7189,6 +7315,128 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         });
 
         // ── Environment/Fog live update (standalone, change-only) ──
+        // ── HALO-GI Probe Grid: size + manual divisions per node handle ──
+        bridge.on('probeGrids', msg => {
+            probeGridData.clear();
+            if (Array.isArray(msg.grids)) {
+                for (const g of msg.grids) {
+                    if (!g || !Number.isFinite(g.h)) continue;
+                    probeGridData.set(g.h, {
+                        size: Array.isArray(g.size) ? g.size : null,  // [l,w,h] world units
+                        div: Array.isArray(g.div) ? g.div : null,     // [x,y,z] manual divisions
+                        enabled: g.enabled !== 0,
+                    });
+                }
+            }
+            // Auto-enable HALO-GI the first time an enabled grid appears so adding a
+            // probe grid "just works" (and survives viewer reloads).
+            if (!probeGridAutoEnabled && window.maxjsHaloGI && window.maxjsHaloGI.isOn?.() !== true) {
+                for (const d of probeGridData.values()) {
+                    if (d.enabled && Array.isArray(d.size)) { probeGridAutoEnabled = true; try { window.maxjsHaloGI.enable(); } catch (e) {} break; }
+                }
+            }
+            syncHaloProbeVolumes();
+        });
+
+        // Fit the HALO-GI probe volume(s) to the synced probe-grid helper(s): each box's
+        // world AABB (from the helper node's transform x its size) + manual divisions.
+        // No enabled grids -> whole-scene auto-fit. Change-gated.
+        const _pgBox = new THREE.Box3();
+        const _pgVec = new THREE.Vector3();
+        function syncHaloProbeVolumes() {
+            const gi = window.maxjsHaloGI;
+            if (!gi || typeof gi.setVolumes !== 'function') return;
+            const volumes = [];
+            let sig = '';
+            for (const [h, data] of probeGridData) {
+                if (!data || data.enabled === false || !Array.isArray(data.size)) continue;
+                const obj = nodeMap.get(h);           // transform from the synced helper node
+                if (!obj) continue;                   // node not synced yet -> a later sync applies it
+                obj.updateWorldMatrix(true, false);
+                const size = data.size;
+                const hx = size[0] * 0.5, hy = size[1] * 0.5, hz = size[2] * 0.5;
+                _pgBox.makeEmpty();
+                for (let cx = -1; cx <= 1; cx += 2) for (let cy = -1; cy <= 1; cy += 2) for (let cz = -1; cz <= 1; cz += 2) {
+                    _pgVec.set(cx * hx, cy * hy, cz * hz).applyMatrix4(obj.matrixWorld);
+                    _pgBox.expandByPoint(_pgVec);
+                }
+                const div = data.div;
+                const res = (Array.isArray(div) && div.length === 3) ? { x: div[0], y: div[1], z: div[2] } : null;
+                volumes.push(res ? { box: _pgBox.clone(), res } : _pgBox.clone());
+                const e = obj.matrixWorld.elements;
+                sig += `${h}|${size.join(',')}|${div ? div.join(',') : 'a'}|`
+                    + `${Math.round(e[12])},${Math.round(e[13])},${Math.round(e[14])},`
+                    + `${e[0].toFixed(2)},${e[5].toFixed(2)},${e[10].toFixed(2)},${e[1].toFixed(2)},${e[2].toFixed(2)};`;
+            }
+            if (sig === probeVolumeSig) return;
+            probeVolumeSig = sig;
+            if (volumes.length === 0) gi.setBounds?.(null); // no grids -> whole-scene auto-fit
+            else gi.setVolumes(volumes);
+        }
+
+        // ── Diagnostics: draw the HALO-GI probe field as a grid of small spheres. ──
+        let probeHelperMesh = null;
+        let probeHelpersVisible = false;
+        let probeHelperSig = '';
+        const _probeHelperMat = new THREE.Matrix4();
+        function disposeProbeHelpers() {
+            if (probeHelperMesh) {
+                probeHelperMesh.parent?.remove(probeHelperMesh);
+                probeHelperMesh.geometry?.dispose?.();
+                probeHelperMesh.material?.dispose?.();
+                probeHelperMesh = null;
+            }
+            probeHelperSig = '';
+        }
+        function updateProbeHelpers() {
+            if (!probeHelpersVisible) return;
+            const gi = window.maxjsHaloGI;
+            const field = gi?.field;
+            if (!field || typeof field.getResolution !== 'function' || gi.hasData?.() === false) {
+                if (probeHelperMesh) probeHelperMesh.visible = false;
+                return;
+            }
+            const res = field.getResolution();
+            const bounds = field.getBounds?.();
+            if (!res || !bounds) { if (probeHelperMesh) probeHelperMesh.visible = false; return; }
+            const rx = Math.max(1, Math.round(res.x)), ry = Math.max(1, Math.round(res.y)), rz = Math.max(1, Math.round(res.z));
+            const total = rx * ry * rz;
+            const min = bounds.min;
+            const size = _pgVec.subVectors(bounds.max, bounds.min);
+            const sx = size.x, sy = size.y, sz = size.z;
+            const sig = `${rx},${ry},${rz}|${min.x.toFixed(2)},${min.y.toFixed(2)},${min.z.toFixed(2)}|${sx.toFixed(2)},${sy.toFixed(2)},${sz.toFixed(2)}`;
+            if (sig === probeHelperSig && probeHelperMesh) { probeHelperMesh.visible = true; return; }
+            probeHelperSig = sig;
+            if (!probeHelperMesh || probeHelperMesh.count !== total) {
+                disposeProbeHelpers();
+                probeHelperSig = sig;
+                const r = Math.max(sx / Math.max(1, rx - 1), sy / Math.max(1, ry - 1), sz / Math.max(1, rz - 1)) * 0.08 + 1e-3;
+                const geo = new THREE.SphereGeometry(r, 8, 6);
+                const mat = new THREE.MeshBasicMaterial({ color: 0x33ddff, depthWrite: false, transparent: true, opacity: 0.85, toneMapped: false });
+                probeHelperMesh = new THREE.InstancedMesh(geo, mat, total);
+                probeHelperMesh.frustumCulled = false;
+                probeHelperMesh.renderOrder = 9999;
+                probeHelperMesh.userData.maxjsExcludeFromRuntimeSnapshot = true;
+                scene.add(probeHelperMesh);
+            }
+            let idx = 0;
+            for (let k = 0; k < rz; k++) for (let j = 0; j < ry; j++) for (let i = 0; i < rx; i++) {
+                const fx = rx > 1 ? i / (rx - 1) : 0, fy = ry > 1 ? j / (ry - 1) : 0, fz = rz > 1 ? k / (rz - 1) : 0;
+                _probeHelperMat.makeTranslation(min.x + fx * sx, min.y + fy * sy, min.z + fz * sz);
+                probeHelperMesh.setMatrixAt(idx++, _probeHelperMat);
+            }
+            probeHelperMesh.instanceMatrix.needsUpdate = true;
+            probeHelperMesh.visible = true;
+        }
+        function setProbeHelpersVisible(v) {
+            probeHelpersVisible = !!v;
+            if (!probeHelpersVisible) { if (probeHelperMesh) probeHelperMesh.visible = false; }
+            else updateProbeHelpers();
+            const cb = document.getElementById('fx-gi-show-probes');
+            if (cb && cb.checked !== probeHelpersVisible) cb.checked = probeHelpersVisible;
+        }
+        window.maxjsHaloGIShowProbes = setProbeHelpersVisible;
+
         bridge.on('env_update', msg => {
             let pathTraceSceneChanged = false;
             if (msg.env) {
@@ -13905,6 +14153,10 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                                 <span>Flip</span>
                                 <input id="fx-hdri-flip" type="checkbox">
                             </label>
+                            <label class="fx-check" for="fx-hdri-reflection-only" title="Native WebGPU only: keep HDRI reflections, mute HDRI diffuse lighting.">
+                                <span>Reflection only (WebGPU)</span>
+                                <input id="fx-hdri-reflection-only" type="checkbox">
+                            </label>
                         </div>
                     </section>
                     <section class="fx-section collapsed" data-fx-section="halogi" data-keep-on-shader-lab>
@@ -13920,6 +14172,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                             </label>
                             <label class="fx-check" for="fx-gi-leakfree" title="Depth-moment Chebyshev visibility — stops light leaking through walls."><span>Leak-free</span><input id="fx-gi-leakfree" type="checkbox" checked></label>
                             <label class="fx-check" for="fx-gi-solid" title="Drop/relocate probes buried in SOLID geometry. Off is safer for thin 2-sided walls."><span>Solid scene</span><input id="fx-gi-solid" type="checkbox"></label>
+                            <label class="fx-check" for="fx-gi-show-probes" title="Diagnostics: show the probe field as a grid of spheres in the viewport."><span>Show probes</span><input id="fx-gi-show-probes" type="checkbox"></label>
                         </div>
                     </section>
                     ${sectionsHtml}
@@ -14307,6 +14560,13 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 applyLocalHDRISettings();
                 savePostFxState();
             };
+            const hdriReflectionOnlyCheck = document.getElementById('fx-hdri-reflection-only');
+            hdriReflectionOnlyCheck.onchange = () => {
+                localHdriReflectionOnly = hdriReflectionOnlyCheck.checked;
+                applyHdriReflectionOnlyState({ markOutput: true });
+                savePostFxState();
+                syncHdriPanel();
+            };
             // Sync initial state
             hdriRotSlider.value = localHdriRotation;
             hdriRotVal.textContent = Math.round(localHdriRotation);
@@ -14315,6 +14575,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             hdriBlurSlider.value = localHdriBlur;
             hdriBlurVal.textContent = localHdriBlur.toFixed(2);
             hdriFlipCheck.checked = localHdriFlip;
+            hdriReflectionOnlyCheck.checked = localHdriReflectionOnly;
             syncHdriPanel();
 
             // HALO-GI controls (window.maxjsHaloGI exists only in Studio + WebGPU)
@@ -14347,6 +14608,8 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 };
                 if (giLeak) giLeak.onchange = () => window.maxjsHaloGI?.setCheby?.(giLeak.checked ? 1 : 0);
                 if (giSolid) giSolid.onchange = () => window.maxjsHaloGI?.setClassify?.(giSolid.checked ? 1 : 0);
+                const giShowProbes = document.getElementById('fx-gi-show-probes');
+                if (giShowProbes) giShowProbes.onchange = () => setProbeHelpersVisible(giShowProbes.checked);
                 syncGiPanel();
             }
 
@@ -14781,6 +15044,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     showBg: envVisible,
                     blur: localHdriBlur,
                     flip: localHdriFlip,
+                    reflectionOnly: localHdriReflectionOnly,
                     enabled: authoredEnvironmentActive ? false : localHdriEnabled,
                     fileName: !authoredEnvironmentActive && isLocalHdriLoaded() ? localHdriFileName : '',
                 },
@@ -14914,6 +15178,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     if (Number.isFinite(saved.hdri.blur)) localHdriBlur = saved.hdri.blur;
                     if (typeof saved.hdri.showBg === 'boolean') localHdriShowBg = saved.hdri.showBg;
                     if (typeof saved.hdri.flip === 'boolean') localHdriFlip = saved.hdri.flip;
+                    if (typeof saved.hdri.reflectionOnly === 'boolean') localHdriReflectionOnly = saved.hdri.reflectionOnly;
                     if (typeof saved.hdri.enabled === 'boolean') localHdriEnabled = saved.hdri.enabled;
                     // Apply blur to scene even without HDRI loaded (will be used when HDRI loads)
                     scene.backgroundBlurriness = localHdriBlur;
@@ -15583,6 +15848,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     haloGiLastInteractionMs = haloNowMs;
                 }
                 haloGi?.tick(haloNowMs);
+                updateProbeHelpers();
             }
             css3dOverlay.tick(scene, camera);
             css3dOverlay.tickBehind(webappSystem?.getBehindScene?.(), camera);

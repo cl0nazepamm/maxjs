@@ -53,8 +53,16 @@ const TRACE_SURFACE_BIAS_CELL = 0.005; // shadow/NEE ray origin bias, scaled to 
 const MAX_TRIANGLES = 4_000_000;
 const MAX_LIGHTS = 64;             // matches spectral_scene LIGHT_STRIDE table
 // ── reactivity: respond to live light/geometry edits ──
-const REACTIVE_TICKS = 40;         // ticks of fast (low-hysteresis) convergence after a change
-const REACTIVE_HYSTERESIS = 0.4;   // hysteresis during a reactivity burst (vs steady-state)
+const REACTIVE_TICKS = 75;         // ticks of EASED re-convergence after a light/geo edit
+const REACTIVE_HYSTERESIS = 0.8;   // STARTING hysteresis of the reactive fade; it ramps UP to
+                                   // the steady-state value across the burst so an edit fades in
+                                   // smoothly. (Was a flat 0.4 → passed 60% of a freshly-rotated
+                                   // 64-ray estimate each tick → the "flickers left/right" boil.)
+const ROT_MIN_TICKS = 6;           // min ticks between ray-set rotations. Small grids (≤
+                                   // MAX_PROBES_PER_TICK probes = a 1-tick full pass) otherwise
+                                   // rotate the ray set EVERY tick, injecting fresh per-tick noise
+                                   // the temporal blend has to absorb. Large grids (multi-tick
+                                   // passes ≥ this) are unaffected — they already rotate per pass.
 const LIGHT_CHECK_INTERVAL = 6;    // ticks between light-change checks
 const GEO_CHECK_INTERVAL = 24;     // ticks between geometry-change checks (full rebuild = expensive)
 const GEO_SETTLE_INTERVALS = 2;    // geo must be stable this many checks before a rebuild fires (debounce)
@@ -260,6 +268,7 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
     let frameCounter = 0;
     let updatedPerTick = 1;
     let refreshStarted = false; // B1: false until the first full-field pass begins; gates ray-rotation advance
+    let ticksSinceRot = 0;      // B1: ticks since the last ray-set rotation (throttles small-grid rotation)
     // same-dim detection: a geometry edit that doesn't resize the grid reuses the
     // existing atlases/buffers and skips the recompile (A4).
     let prevAtlasW = 0, prevAtlasH = 0, prevProbeTotal = 0;
@@ -956,22 +965,34 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
                 if (geoStable >= GEO_SETTLE_INTERVALS) { geoStable = -1; reactiveTicks = REACTIVE_TICKS; requestRebuild(); }
             }
         }
-        // drop hysteresis during a reactivity burst so the field re-converges fast.
-        U.hysteresis.value = reactiveTicks > 0 ? REACTIVE_HYSTERESIS : baseHysteresis;
-        if (reactiveTicks > 0) reactiveTicks--;
+        // Reactive re-converge: EASE the temporal blend from a faster (lower-hysteresis) start
+        // UP to the steady-state hysteresis across the burst, so a light/geometry edit FADES
+        // smoothly into its new solution over a couple seconds — instead of snapping or boiling.
+        // (Was a flat REACTIVE_HYSTERESIS for the whole burst → big per-tick jumps = the
+        // "calculating buncha shit, flickers left/right" pop the user reported.)
+        if (reactiveTicks > 0) {
+            const t = 1 - (reactiveTicks / REACTIVE_TICKS); // 0 at burst start → 1 at burst end
+            U.hysteresis.value = REACTIVE_HYSTERESIS + (baseHysteresis - REACTIVE_HYSTERESIS) * t;
+            reactiveTicks--;
+        } else {
+            U.hysteresis.value = baseHysteresis;
+        }
 
         const updated = Math.min(updatedCap(), probeTotal);
         U.probeOffset.value = probeCursor >>> 0;
         U.updatedCount.value = updated >>> 0;
-        // (B1) Advance the ray-set rotation ONLY at the start of a new full-field pass,
-        // never per tick. Within a pass every probe is solved with the SAME rotation,
-        // so re-solving a static probe yields an identical estimate → the temporal blend
-        // is a no-op → ZERO per-tick boil (the flicker). The slow per-pass rotation
-        // still averages the 64-ray structured error over seconds (SH-volume smoothness
-        // without giving up multi-rotation averaging).
-        if (probeCursor === 0) {
+        // (B1) Advance the ray-set rotation only at a full-field pass boundary AND no more
+        // often than ROT_MIN_TICKS apart. Within a held rotation every probe is solved with the
+        // SAME rays, so re-solving a static probe yields an identical estimate → the temporal
+        // blend is a no-op → ZERO per-tick boil (the flicker). The original pass-only gate held
+        // for LARGE grids (multi-tick passes) but small grids finish a full pass EVERY tick, so
+        // they rotated every tick → fresh 64-ray noise each tick. The tick floor keeps slow
+        // multi-rotation averaging (SH-volume smoothness) at any grid size.
+        ticksSinceRot++;
+        if (probeCursor === 0 && ticksSinceRot >= ROT_MIN_TICKS) {
             if (refreshStarted) { frameCounter = (frameCounter + 1) >>> 0; U.frameJitter.value = (frameCounter * 0.61803398875) % 1; }
             refreshStarted = true;
+            ticksSinceRot = 0;
         }
         probeCursor = probeTotal > 0 ? (probeCursor + updated) % probeTotal : 0;
 

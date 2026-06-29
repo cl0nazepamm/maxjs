@@ -50,6 +50,13 @@ const MAX_PROBES_PER_AXIS = 24;
 const MAX_PROBES_PER_TICK = 128;    // cap compute bursts on room-scale grids
 const SURFACE_NORMAL_BIAS_CELL = 0.03; // sample 3% of a cell off the shaded wall, not half a cell
 const TRACE_SURFACE_BIAS_CELL = 0.005; // shadow/NEE ray origin bias, scaled to scene units
+const GI_CHEBY_BIAS_CELL = 0.08;       // Chebyshev SELF-OCCLUSION tolerance as a fraction of the
+                                       // min cell. A lit surface must not shadow itself against its
+                                       // own low-res depth moments (that's the "leak-free errors on
+                                       // triangles" — per-triangle self-occlusion). Big enough to
+                                       // absorb the normal-bias offset + oct-depth averaging error,
+                                       // small enough to stay UNDER wall thickness so leak-free
+                                       // visibility through real walls is preserved.
 const MAX_TRIANGLES = 4_000_000;
 const MAX_LIGHTS = 64;             // matches spectral_scene LIGHT_STRIDE table
 // ── reactivity: respond to live light/geometry edits ──
@@ -106,8 +113,15 @@ export class GiProbeNode extends LightingNode {
         this.atlasDimNode = uniform(new THREE.Vector2(1, 1));
         this.intensityNode = uniform(1.0);
         this.normalBiasNode = uniform(0.04);
-        // 0 → no visibility test (pure trilinear, leaks); 1 → full Chebyshev.
-        this.chebyStrengthNode = uniform(1.0);
+        // 0 → no visibility test = pure trilinear "radiosity" look (THE DEFAULT, by user pref:
+        // smoother, no per-triangle self-occlusion); 1 → full Chebyshev leak-free visibility.
+        // The Chebyshev term self-occludes on dense/thick geometry and hurt the look more than
+        // leaks helped, so it's off by default and has no UI toggle. Reachable via setCheby(1).
+        this.chebyStrengthNode = uniform(0.0);
+        // Chebyshev self-occlusion tolerance (WORLD units). Surface stays "visible" to its
+        // own probes within this depth → stops the leak-free term erroring on triangles.
+        // Set per rebuild to minCell * GI_CHEBY_BIAS_CELL; tweak live via this uniform.
+        this.chebyBiasNode = uniform(0.0);
         // 0 → classification IGNORED (default — safe for thin 2-sided walls, which
         // a backface test misreads); 1 → drop probes buried in SOLID geometry.
         this.classifyStrengthNode = uniform(0.0);
@@ -135,15 +149,16 @@ export class GiProbeNode extends LightingNode {
     // Update the grid placement uniforms only. Uniform .value writes do NOT change
     // a material cache key, so this is churn-free — the same-dim rebuild path uses
     // it to re-place probes after a geometry edit WITHOUT a TSL recompile.
-    updateGridUniforms(gridMin, gridSize, res, atlasW, atlasH, normalBias) {
+    updateGridUniforms(gridMin, gridSize, res, atlasW, atlasH, normalBias, chebyBias) {
         this.gridMinNode.value.copy(gridMin);
         this.gridSizeNode.value.copy(gridSize);
         this.resNode.value.copy(res);
         this.atlasDimNode.value.set(atlasW, atlasH);
         if (Number.isFinite(normalBias)) this.normalBiasNode.value = Math.max(1e-4, normalBias);
+        if (Number.isFinite(chebyBias)) this.chebyBiasNode.value = Math.max(0, chebyBias);
     }
-    setGrid(gridMin, gridSize, res, atlasW, atlasH, normalBias) {
-        this.updateGridUniforms(gridMin, gridSize, res, atlasW, atlasH, normalBias);
+    setGrid(gridMin, gridSize, res, atlasW, atlasH, normalBias, chebyBias) {
+        this.updateGridUniforms(gridMin, gridSize, res, atlasW, atlasH, normalBias, chebyBias);
         this._structGen++;   // resize/first-enable ONLY → cacheToken moves → one recompile
     }
 
@@ -209,9 +224,16 @@ export class GiProbeNode extends LightingNode {
             const m = texture(depthAtlas, this._tileUV(col, row, octD));
             const m1 = m.x; const m2 = m.y;
             const variance = m2.sub(m1.mul(m1)).abs();
-            const dm = dist.sub(m1);
+            // Self-occlusion tolerance: a lit surface must not shadow ITSELF against its own
+            // low-res depth moments. dist (probe→fragment) carries the normal-bias offset and
+            // is compared to oct-averaged depth, so on dense/thick geometry it slips just past
+            // m1 per triangle → the leak-free term "errors on triangles". A depth bias (db, <
+            // wall thickness) treats the surface as visible within tolerance, so real walls
+            // still occlude (no leak) but a surface stops fighting its own shadow.
+            const db = this.chebyBiasNode;
+            const dm = dist.sub(m1).sub(db).max(float(0.0));
             const chebyRaw = variance.div(variance.add(dm.mul(dm)).max(float(1e-6)));
-            const cheby = select(dist.lessThanEqual(m1), float(1.0), chebyRaw);
+            const cheby = select(dist.lessThanEqual(m1.add(db)), float(1.0), chebyRaw);
             const visW = mix(float(1.0), tslMax(cheby.mul(cheby).mul(cheby), float(0.05)), this.chebyStrengthNode);
 
             const stateEff = mix(float(1.0), stateV, this.classifyStrengthNode);
@@ -880,7 +902,7 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
             U.relocClamp.value = 0.45 * minCell;
             // res / probeTotal / atlasDim are unchanged by definition → leave those uniforms.
             // Churn-free: update the NODE's placement uniforms WITHOUT bumping _structGen.
-            node.updateGridUniforms(gridMin, gridSize, res, atlasW, atlasH, minCell * SURFACE_NORMAL_BIAS_CELL);
+            node.updateGridUniforms(gridMin, gridSize, res, atlasW, atlasH, minCell * SURFACE_NORMAL_BIAS_CELL, minCell * GI_CHEBY_BIAS_CELL);
             probeCursor = 0;
             refreshStarted = false;
             needsClear = false;             // reuse the live atlas history (no black flash)
@@ -904,7 +926,7 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
         U.cellMin.value = Math.max(1e-4, minCell);
         U.relocClamp.value = 0.45 * minCell;
         node.setAtlases(gpu.atlas, gpu.depthAtlas, gpu.stateAtlas);
-        node.setGrid(gridMin, gridSize, res, atlasW, atlasH, minCell * SURFACE_NORMAL_BIAS_CELL);
+        node.setGrid(gridMin, gridSize, res, atlasW, atlasH, minCell * SURFACE_NORMAL_BIAS_CELL, minCell * GI_CHEBY_BIAS_CELL);
         prevAtlasW = atlasW; prevAtlasH = atlasH; prevProbeTotal = probeTotal;
         probeCursor = 0;
         refreshStarted = false;

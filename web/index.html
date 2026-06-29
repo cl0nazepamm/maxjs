@@ -470,6 +470,7 @@
         } from './js/max_lights_node.js';
         import { createIrradianceVolume } from './js/gi_irradiance_volume.js';
         import { createProbeField as createHaloProbeField } from './js/gi_probes.js';
+        import { giLights } from './js/gi_lights_node.js';
         // Spark.js uses GLSL3/ShaderChunk — needs WebGL THREE build (scoped in importmap).
         // Lazy-import to avoid crashing on page load.
         let Spark = null;
@@ -1117,6 +1118,7 @@
             }
         }
 
+        const isWebGpuBackend = renderer.backend?.isWebGPUBackend === true;
         const shouldInstallMaxLightsNode = isStudioMode;
         if (shouldInstallMaxLightsNode && renderer.lighting?.createNode) {
             // Install MaxLightsNode as the renderer's LightsNode factory. The
@@ -1124,6 +1126,17 @@
             // and caches it; setting scene.lightsNode is a no-op here. Override
             // must land before the first frame so the cached node is ours.
             renderer.lighting.createNode = (lights = []) => maxLights({
+                maxDirectionalLights: 16,
+                maxPointLights: 32,
+                maxSpotLights: 32,
+                maxHemisphereLights: 4,
+            }).setLights(lights);
+        } else if (isWebGpuBackend && renderer.lighting?.createNode) {
+            // Non-Studio WebGPU: stock batched lights (DynamicLightsNode) PLUS the
+            // opt-in HALO-GI / surfel injection (GiLightsNode). Byte-identical to
+            // stock three.js when GI is off, so HALO-GI works in EVERY WebGPU mode
+            // without the Studio light-linking overhead. Studio keeps MaxLightsNode.
+            renderer.lighting.createNode = (lights = []) => giLights({
                 maxDirectionalLights: 16,
                 maxPointLights: 32,
                 maxSpotLights: 32,
@@ -1243,13 +1256,18 @@
             if (shouldAutoStartStudioGiVolume()) {
                 window.maxjsGI.enable();
             }
-            // HALO-GI: BVH-traced DDGI probe field (docs/GI_HALO_design.md). OPT-IN
-            // — default OFF so the shipped path is byte-identical. Enable live with
-            //   window.maxjsHaloGI.enable()   (disable() drops the probe node)
-            // When enabled it mutes the surfel giVolume to avoid double-counting and
-            // ticks on its own ~30 Hz throttle (decoupled from delta-sync). The probe
-            // node only injects into context.irradiance while active, so an unbuilt /
-            // disabled field changes nothing.
+        }
+
+        // HALO-GI: BVH-traced DDGI probe field (docs/GI_HALO_design.md). Works in
+        // EVERY WebGPU mode (not just Studio) — the GiLightsNode installed for
+        // non-Studio injects the same probe term Studio's MaxLightsNode does. OPT-IN
+        // — default OFF so the shipped path is byte-identical. Enable live with
+        //   window.maxjsHaloGI.enable()   (disable() drops the probe node)
+        // When enabled it mutes the surfel giVolume (Studio-only) to avoid double-
+        // counting and ticks on its own ~30 Hz throttle (decoupled from delta-sync).
+        // The probe node only injects into context.irradiance while active, so an
+        // unbuilt / disabled field changes nothing.
+        if (isWebGpuBackend) {
             try {
                 const haloField = createHaloProbeField({ renderer, scene, intensity: 1.0, onRebuilt: markLightProbeMaterialsDirty });
                 let haloOn = window.MAXJS_HALO_GI === true;
@@ -1548,7 +1566,7 @@
         const isStandalone = !(window.chrome?.webview?.postMessage);
         const urlMode = new URLSearchParams(location.search).get('mode');
         let buildMode = urlMode || (isStandalone ? 'release' : 'dev');
-        let debugMode = false;
+        var debugMode = false;
         let slowJsonSyncMode = false;
 
         function syncAudioMuteButtonUi() {

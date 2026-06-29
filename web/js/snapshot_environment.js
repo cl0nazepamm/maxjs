@@ -140,6 +140,7 @@ function normalizeEnv(env, snapshotUi) {
                 flip: uiHdri.flip ? 1 : 0,
                 blur: Number(uiHdri.blur) || 0,
                 intensity: Number.isFinite(Number(uiHdri.intensity)) ? Number(uiHdri.intensity) : 1,
+                reflectionOnly: uiHdri.reflectionOnly === true,
                 fileName: uiHdri.fileName || '',
                 maxjsLocal: true,
             },
@@ -208,6 +209,7 @@ export function createSnapshotEnvironment({ scene, renderer, camera = null, root
 
     function resetSceneEnvironment() {
         scene.environment = null;
+        scene.userData.maxjsHdriReflectionOnly = false;
         if (scene.environmentRotation?.set) scene.environmentRotation.set(0, 0, 0);
         if (scene.backgroundRotation?.set) scene.backgroundRotation.set(0, 0, 0);
         if ('environmentIntensity' in scene) scene.environmentIntensity = 1;
@@ -240,6 +242,7 @@ export function createSnapshotEnvironment({ scene, renderer, camera = null, root
             scene.environment = envMap;
             const intensity = Number.isFinite(Number(lastHdriRaw?.intensity)) ? Number(lastHdriRaw.intensity) : 1;
             if ('environmentIntensity' in scene) scene.environmentIntensity = intensity;
+            scene.userData.maxjsHdriReflectionOnly = lastHdriRaw?.reflectionOnly === true;
             setRotations(Number(lastHdriRaw?.rot) || 0, !!lastHdriRaw?.flip);
             if (!lastHdriRaw?.maxjsLocal) {
                 renderer.toneMappingExposure =

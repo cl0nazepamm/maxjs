@@ -40,7 +40,6 @@ import {
     triNoise3D,
     uniform,
     unpackRGBToNormal,
-    vec2,
     vec3,
     vec4,
     velocity,
@@ -735,9 +734,10 @@ export function createFxCore({
             const backgroundFillNode = vec3(0, 0, 0);
             const backgroundAlphaNode = float(0);
 
+            const ssrDielectricReflectivityNode = roughness.oneMinus().mul(0.08).add(float(0.02));
             const ssrReflectivityNode = max(
                 metalness,
-                roughness.oneMinus().mul(0.35).add(float(0.04))
+                ssrDielectricReflectivityNode
             ).mul(roughness.smoothstep(0.85, 0.75));
 
             // Scene pass: a scenePass-stage descriptor (toonOutline) may replace
@@ -760,7 +760,7 @@ export function createFxCore({
                 output,
                 diffuseColor,
                 normal: packNormalToRGB(normalView),
-                metalrough: vec2(ssrReflectivityNode, roughness),
+                metalrough: vec4(metalness, roughness, ssrReflectivityNode, 1),
             }));
 
             setTexturePrecision(scenePass);
@@ -779,7 +779,7 @@ export function createFxCore({
                 normalColor: scenePassNormalColor,
                 metalrough: scenePassMetalRough,
                 normal: sceneNormal,
-                reflectivity: scenePassMetalRough.r,
+                reflectivity: scenePassMetalRough.b,
             };
 
             currentBeauty = scenePassColor;

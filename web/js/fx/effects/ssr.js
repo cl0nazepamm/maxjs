@@ -1,6 +1,6 @@
 // Screen-space reflections. Verbatim move of the SSR block from
 // maxjs_fx.js rebuildPipeline().
-import { blendColor, max, vec4 } from 'three/tsl';
+import { vec4 } from 'three/tsl';
 import { ssr } from 'three/addons/tsl/display/SSRNode.js';
 import { temporalReproject } from 'three/addons/tsl/display/TemporalReprojectNode.js';
 import { recurrentDenoise } from 'three/addons/tsl/display/RecurrentDenoiseNode.js';
@@ -11,10 +11,6 @@ function clampFinite(value, min, max, fallback) {
     const numeric = Number(value);
     if (!Number.isFinite(numeric)) return fallback;
     return Math.max(min, Math.min(max, numeric));
-}
-
-function hasCpuTextureData(texture) {
-    return !!texture?.isTexture && !!texture.image?.data;
 }
 
 function getFallbackEnvironment(THREE) {
@@ -36,8 +32,9 @@ function getFallbackEnvironment(THREE) {
 }
 
 function getSSREnvironmentTexture(ctx) {
-    const rawEnvironment = ctx.scene?.userData?.maxjsPathTraceEnvironment;
-    if (hasCpuTextureData(rawEnvironment)) return rawEnvironment;
+    // max.js already applies authored HDRI/IBL in the beauty pass. SSR misses
+    // must not inject that HDRI a second time or the result becomes tinted and
+    // over-bright; a black equirect keeps r185 stochastic SSR's env sampler valid.
     return getFallbackEnvironment(ctx.THREE);
 }
 
@@ -68,16 +65,20 @@ export default {
             && !!ctx.prePass?.depth
             && !!ctx.prePass?.normalColor
             && !!ctx.prePass?.velocity;
+        const useStochastic = useDenoiser || !!state.ssr.stochastic;
+        const metalnessNode = useStochastic
+            ? sceneTex.metalrough.r
+            : sceneTex.reflectivity;
         const ssrPass = ssr(
             sceneTex.color,
             sceneTex.depth,
             sceneTex.normal,
             {
-                stochastic: useDenoiser || !!state.ssr.stochastic,
-                metalnessNode: sceneTex.reflectivity,
+                stochastic: useStochastic,
+                metalnessNode,
                 roughnessNode: sceneTex.metalrough.g,
                 diffuseNode: sceneTex.diffuse,
-                environmentNode: (useDenoiser || !!state.ssr.stochastic)
+                environmentNode: useStochastic
                     ? getSSREnvironmentTexture(ctx)
                     : null,
                 camera: ctx.camera,
@@ -88,6 +89,8 @@ export default {
         ssrPass.maxDistance.value = derived.effectiveSSRMaxDistance;
         ssrPass.intensity.value = state.ssr.opacity;
         ssrPass.thickness.value = derived.effectiveSSRThickness;
+        ssrPass.screenEdgeFadeBlack = true;
+        ssrPass.environmentIntensity.value = 0;
         ctx.applyNodeResolutionScale(ssrPass);
         ctx.pushNode(ssrPass);
         ctx.setActivePass('ssr', ssrPass);
@@ -96,11 +99,9 @@ export default {
             ? buildDenoisedSSR(ctx, ssrPass)
             : ssrPass;
 
-        // SSR has no proper environment fallback, so do not let it darken
-        // the existing beauty pass. Keep the brighter of the base lighting
-        // (including HDRI/IBL) and the SSR-composited result.
-        const ssrBlended = blendColor(ctx.beauty, reflectionNode);
-        return vec4(max(ctx.beauty.rgb, ssrBlended.rgb), ctx.beautyAlpha);
+        // SSRNode.a is ray length / temporal history, not opacity. Alpha-over
+        // compositing treats long hits as full replacement and shifts color.
+        return vec4(ctx.beauty.rgb.add(reflectionNode.rgb), ctx.beautyAlpha);
     },
     update(ctx) {
         const ssrPass = ctx.getActivePass('ssr');

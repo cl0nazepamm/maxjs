@@ -246,6 +246,10 @@ export function createSpectralTracer({
                 accum: makeStorage(new Float32Array(width * height * 4)),
                 lightCount: built.lightCount,
                 nodeCount: built.nodeCount,
+                // two-level BVH: instance table + TLAS live in the materials tail
+                tlasNodeCount: built.tlasNodeCount,
+                instBase: built.instBase,
+                tlasBase: built.tlasBase,
             };
             const kernels = buildKernels({
                 THREE, buffers, env: built.env,

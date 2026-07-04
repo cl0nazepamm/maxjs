@@ -1111,6 +1111,9 @@ export function createMaxJSFxController({
 
         // ── PowerShot ISP ──
 
+        getPowerShotOptions() {
+            return state.powershot;
+        },
         isPowerShotEnabled() {
             return state.powershot.enabled;
         },

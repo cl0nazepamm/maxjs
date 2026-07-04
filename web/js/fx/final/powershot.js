@@ -208,7 +208,7 @@ export function createPowerShotFinal({
         p.filmFlicker = THREE.MathUtils.clamp(finiteOr(p.filmFlicker, 0.12), 0, 1);
         p.filmNegative = !!p.filmNegative;
         p.infraredPreset = normalizePowerShotInfraredPreset(p.infraredPreset);
-        p.irExposure = THREE.MathUtils.clamp(finiteOr(p.irExposure, 0.85), -3, 4);
+        p.irExposure = THREE.MathUtils.clamp(finiteOr(p.irExposure, 0.85), -8, 8);
         p.irResponse = THREE.MathUtils.clamp(finiteOr(p.irResponse, 0), 0, 1);
         p.irLocalGain = THREE.MathUtils.clamp(finiteOr(p.irLocalGain, 0.46), 0, 1.5);
         p.irGlow = THREE.MathUtils.clamp(finiteOr(p.irGlow, 0.34), 0, 3);

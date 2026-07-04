@@ -8886,12 +8886,43 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             target.updateMatrixWorld();
         }
 
+        // NIR emitter tagging for the spectral tracer (collectLights reads
+        // userData.emitterClass / userData.colorTemp). Two Max-side channels:
+        //   1. userProps string, if the sync carries it for lights:
+        //      "emitterClass=ir" / "=led" / "=sodium" / "=incandescent",
+        //      optional "colorTemp=2856".
+        //   2. NAME tagging — works with the sync as-is: a light whose name
+        //      contains "_ir"/"ir_", "_led", "_sodium"/"_lps", "_inc"/"_halogen"
+        //      (case-insensitive) gets the class. Rename in Max → tagged.
+        function applyLightEmitterClass(light, ld) {
+            let cls;
+            let temp;
+            const props = typeof ld.userProps === 'string' ? ld.userProps : '';
+            if (props) {
+                const mc = /emitterClass\s*=\s*([a-z_]+)/i.exec(props);
+                if (mc) cls = mc[1].toLowerCase();
+                const mt = /colorTemp\s*=\s*([0-9.]+)/i.exec(props);
+                if (mt) temp = Number(mt[1]);
+            }
+            if (!cls && light.name) {
+                const n = `_${light.name.toLowerCase().replace(/[\s\-.]+/g, '_')}_`;
+                if (/_ir_|_nir_|_illuminator_/.test(n)) cls = 'ir';
+                else if (/_led_/.test(n)) cls = 'led';
+                else if (/_sodium_|_lps_/.test(n)) cls = 'sodium';
+                else if (/_inc_|_incandescent_|_halogen_|_tungsten_/.test(n)) cls = 'incandescent';
+            }
+            if (cls) light.userData.emitterClass = cls;
+            else delete light.userData.emitterClass;
+            if (Number.isFinite(temp)) light.userData.colorTemp = temp;
+        }
+
         function applyLightData(light, ld) {
             light.userData ??= {};
             light.userData.maxjsTypeId = ld.type;
             if (ld.h != null) light.userData.maxjsHandle = ld.h;
             if (ld.name) light.name = ld.name;
             syncLightParent(light, ld);
+            applyLightEmitterClass(light, ld);
 
             const isRuntimeOverridden = (property) =>
                 ld.h != null && layerManager.hasObjectPropertyOverride?.(ld.h, property) === true;
@@ -13964,7 +13995,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     { key: 'analogDropouts', label: 'Dropouts', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotAnalogActive },
                     { key: 'analogScanlines', label: 'Scanlines', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotAnalogActive },
                     { key: 'analogHeadSwitch', label: 'Head Switch', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotAnalogActive },
-                    { key: 'irExposure', label: 'Exposure (stops)', min: -3, max: 4, step: 0.05, realtime: true, visibleWhen: isPowerShotInfraredMode },
+                    { key: 'irExposure', label: 'Exposure (stops)', min: -8, max: 8, step: 0.05, realtime: true, visibleWhen: isPowerShotInfraredMode },
                     { key: 'irResponse', label: 'IR Response', min: 0, max: 1, step: 0.01, realtime: true, visibleWhen: isPowerShotInfraredMode },
                     { key: 'irLocalGain', label: 'Local Gain', min: 0, max: 1.5, step: 0.01, realtime: true, visibleWhen: isPowerShotInfraredMode },
                     { key: 'irGlow', label: 'Halo Bloom', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotInfraredMode },
@@ -14026,8 +14057,8 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         ];
 
         const LOG_SLIDER_STEPS = 1000;
-        const EXPOSURE_EV_MIN = -6;
-        const EXPOSURE_EV_MAX = 4;
+        const EXPOSURE_EV_MIN = -10;
+        const EXPOSURE_EV_MAX = 8;
         const EXPOSURE_LINEAR_MIN = Math.pow(2, EXPOSURE_EV_MIN);
         const EXPOSURE_LINEAR_MAX = Math.pow(2, EXPOSURE_EV_MAX);
 
@@ -16223,6 +16254,15 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 const haloNowMs = performance.now();
                 if (controlsChanged) haloGiLastInteractionMs = haloNowMs;
                 haloGi?.tick(haloNowMs);
+                // White Phosphor × trace view = TRUE-NIR: flip the tracer's λ
+                // domain to photocathode flux automatically. setRenderMode
+                // no-ops when unchanged, so the per-frame call is free — and
+                // it catches every state path (panel, restore, console).
+                pathTracingFx?.setRenderMode?.(
+                    isPathTracingMode
+                        && maxjsFx.isPowerShotEnabled?.()
+                        && maxjsFx.getPowerShotOptions?.()?.mode === 'infrared'
+                        ? 'nv' : 'visible');
                 updateProbeHelpers();
             }
             css3dOverlay.tick(scene, camera);

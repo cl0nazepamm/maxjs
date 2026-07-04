@@ -129,6 +129,13 @@ export function createSpectralTracer({
     let dofFocusDistance = 5;
     let dofApertureRadius = 0;
     let toneMapInBlit = true; // false → emit linear HDR for an external post stack
+    // 'visible' (XYZ→sRGB, default) or 'nv' (true photocathode flux, linear).
+    // NV mode is meant to feed the image-intensifier model: point nvTarget at
+    // a HalfFloat RenderTarget and hand its .texture to
+    // powershotInfrared.setInputMode('nir') + renderTexture(...). With no
+    // nvTarget the raw flux is blitted straight to the canvas (debug view).
+    let renderMode = 'visible';
+    let nvTarget = null;
 
     const lastCameraWorld = { initialized: false, values: new Float64Array(16) };
     const lastCameraProj = { initialized: false, values: new Float64Array(16) };
@@ -244,6 +251,7 @@ export function createSpectralTracer({
                 THREE, buffers, env: built.env,
                 lut: getSpectralLutTextures(), lutRes: SPECTRAL_LUT_RES,
                 maps: built.maps, width, height,
+                mode: renderMode,
             });
             const quad = new THREE.QuadMesh(kernels.blitMaterial);
             gpu = { buffers, kernels, quad, width, height, env: built.env, maps: built.maps };
@@ -328,6 +336,22 @@ export function createSpectralTracer({
         return true;
     }
 
+    // Present the accumulated image: to the canvas, or — NV mode with a flux
+    // target bound — into that RenderTarget for the intensifier stage.
+    function presentQuad() {
+        if (renderMode === 'nv' && nvTarget) {
+            const prev = renderer.getRenderTarget?.() ?? null;
+            try {
+                renderer.setRenderTarget(nvTarget);
+                gpu.quad.render(renderer);
+            } finally {
+                renderer.setRenderTarget(prev);
+            }
+        } else {
+            gpu.quad.render(renderer);
+        }
+    }
+
     function ensureSize() {
         if (!gpu) return;
         const { width, height } = rendererSize();
@@ -347,7 +371,7 @@ export function createSpectralTracer({
         // last render stays frozen on screen. Resume picks up where it left off.
         if (paused) {
             if (!gpu) return clearFrame();
-            try { gpu.quad.render(renderer); } catch (error) { onError(error); }
+            try { presentQuad(); } catch (error) { onError(error); }
             return true;
         }
 
@@ -380,7 +404,7 @@ export function createSpectralTracer({
                 convergedNotified = true;
                 onStatus(`max.js - Path tracer converged (${renderedSamples}/${sampleLimit} samples)`);
             }
-            try { gpu.quad.render(renderer); } catch (error) { onError(error); }
+            try { presentQuad(); } catch (error) { onError(error); }
             return true;
         }
 
@@ -399,7 +423,7 @@ export function createSpectralTracer({
             // Exposure follows the viewer's tone-mapping exposure (display-time
             // multiply in the blit — no accumulation reset needed).
             u.exposure.value = Number.isFinite(renderer.toneMappingExposure) ? renderer.toneMappingExposure : 1;
-            gpu.quad.render(renderer);
+            presentQuad();
             return true;
         } catch (error) {
             onError(error);
@@ -489,6 +513,22 @@ export function createSpectralTracer({
         return true;
     }
     function isSyncFrozen() { return freezeSync === true; }
+    // 'visible' | 'nv'. The λ domain, sampling scheme and accumulation channel
+    // are baked into the kernels, so a mode change rebuilds them (and restarts
+    // accumulation) — cheap next to the BVH build it rides on.
+    function setRenderMode(next) {
+        const v = next === 'nv' ? 'nv' : 'visible';
+        if (renderMode === v) return false;
+        renderMode = v;
+        requestSceneRebuild({ immediate: true });
+        onStatus(`max.js - Path tracer mode: ${v === 'nv' ? 'night-vision (photocathode flux)' : 'visible'}`);
+        return true;
+    }
+    function getRenderMode() { return renderMode; }
+    // RenderTarget the NV flux is presented into (null → canvas debug view).
+    function setNvTarget(target) {
+        nvTarget = target || null;
+    }
     function setCamera(nextCamera) {
         if (!nextCamera) return;
         const previousCameraLayersMask = cameraLayersMask(activeCamera);
@@ -527,6 +567,9 @@ export function createSpectralTracer({
         getSettings,
         setDOF,
         setToneMapInBlit,
+        setRenderMode,
+        getRenderMode,
+        setNvTarget,
         isSyncFrozen,
         setCamera,
         dispose,

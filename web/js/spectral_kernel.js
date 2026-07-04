@@ -10,8 +10,17 @@
 //
 // Buffer strides come from spectral_scene.js: bvhNodes u32×8, triIndex u32×3,
 // vertexData f32×8 (pos+normal+uv), triMaterial u32×1, materials f32×28,
-// lights f32×16, accum f32×4 (xyz + pad). PBR maps arrive as DataArrayTextures
-// (one per type) sampled at the hit UV.
+// lights f32×17, accum f32×4 (XYZ + NIR photocathode flux). PBR maps arrive
+// as DataArrayTextures (one per type) sampled at the hit UV.
+//
+// Render modes (buildKernels `mode`):
+//   'visible' — λ ∈ [380,720] uniform, Wyman XYZ accumulation (unchanged).
+//   'nv'      — λ ∈ [550,900] importance-sampled against the Gen-3 GaAs
+//               photocathode response; the path's radiance × S(λ)/pdf(λ),
+//               normalized by ∫S dλ, accumulates in the 4th channel as true
+//               electron flux. The blit then emits LINEAR flux (no tone map,
+//               no sRGB) for the image-intensifier stage
+//               (powershot_infrared.js, setInputMode("nir")).
 //
 // The BVH traversal + JH-spectral/env/PBR shading emitters live in
 // spectral_traverse.js (shared byte-identically with the HALO-GI probe kernel).
@@ -19,16 +28,18 @@
 import * as TSL from 'three/tsl';
 
 const {
-    Fn, Loop, If, Break, Return, instanceIndex, uniform, storage, texture, texture3D,
+    Fn, Loop, If, Break, Return, instanceIndex, uniform, uniformArray, storage, texture, texture3D,
     float, int, uint, vec2, vec3, vec4,
     uintBitsToFloat, equirectUV,
-    select, max, min, abs, sqrt, sin, cos, exp, pow, floor,
+    select, max, min, abs, sqrt, sin, cos, exp, pow, floor, fract,
     dot, cross, normalize, reflect, mix, clamp, length, smoothstep,
 } = TSL;
 
 import {
     buildTraversal,
-    PI, LAMBDA_MIN, LAMBDA_MAX, LAMBDA_RANGE, T_MAX, RAY_EPS,
+    photocathodeS, buildPhotocathodeSampler,
+    PI, LAMBDA_MIN, LAMBDA_MAX, LAMBDA_RANGE,
+    NV_LAMBDA_MIN, NV_LAMBDA_MAX, T_MAX, RAY_EPS,
 } from './spectral_traverse.js';
 
 // ∫ȳ(λ)dλ over [380,720] for the Wyman fits below. Dividing the XYZ Monte
@@ -60,7 +71,21 @@ function cieZ(l) {
 
 export function buildKernels({
     THREE, buffers, env, lut = null, lutRes = 0, maps = {}, width, height,
+    // 'visible' | 'nv'. nvSampling 'uniform' exists only for A/B-validating
+    // the importance estimator (means must agree within Monte Carlo noise).
+    mode = 'visible', nvSampling = 'importance',
 }) {
+    const isNV = mode === 'nv';
+    const nvImportance = isNV && nvSampling !== 'uniform';
+    // Per-mode λ domain. Visible keeps [380,720] — byte-identical behaviour.
+    const lambdaMin = isNV ? NV_LAMBDA_MIN : LAMBDA_MIN;
+    const lambdaRange = (isNV ? NV_LAMBDA_MAX : LAMBDA_MAX) - lambdaMin;
+    // NV λ sampler: 64-entry inverse-CDF LUT + ∫S dλ (flux normalization —
+    // the analogue of CIE_Y_INTEGRAL: a unit-radiance flat-spectrum scene
+    // lands near flux 1.0).
+    const pcSampler = isNV ? buildPhotocathodeSampler() : null;
+    const pcLutNode = nvImportance ? uniformArray(Array.from(pcSampler.lut), 'float') : null;
+    const pcLutN = pcSampler ? pcSampler.lut.length : 0;
     // Storage nodes
     const bvhNodes = storage(buffers.bvhNodes, 'uint', buffers.bvhNodes.count);
     const triIndex = storage(buffers.triIndex, 'uint', buffers.triIndex.count);
@@ -111,7 +136,7 @@ export function buildKernels({
     const {
         fetchVert, fetchNorm, fetchUV, triVert, matFloat,
         srgbToLinear, sampleLayer,
-        jhReflectance, jhEmission, envAtLambda, cosineSample,
+        jhReflectance, jhEmission, emitterAtLambda, envAtLambda, cosineSample,
         traverseClosest, traverseAny,
         haveAlbedoMap, haveNormalMap, haveRoughMap, haveMetalMap, haveEmissiveMap,
         albedoTex, normalTex, roughTex, metalTex, emissiveTex,
@@ -183,7 +208,17 @@ export function buildKernels({
             rd.assign(normalize(focusPoint.sub(ro)));
         });
 
-        const lambda = float(LAMBDA_MIN).add(nextRand().mul(LAMBDA_RANGE)).toVar();
+        // Hero wavelength. Visible: uniform over the domain. NV: drawn from
+        // the photocathode inverse-CDF LUT, so λ lands where the tube actually
+        // responds (pdf ∝ S(λ)); the pdf then cancels against S(λ) in the
+        // accumulation weight below.
+        const lambda = float(lambdaMin).add(nextRand().mul(lambdaRange)).toVar();
+        if (nvImportance) {
+            const u = nextRand().mul(pcLutN - 1);
+            const i0 = uint(floor(u));
+            const i1 = min(i0.add(uint(1)), uint(pcLutN - 1));
+            lambda.assign(mix(pcLutNode.element(i0), pcLutNode.element(i1), fract(u)));
+        }
         const throughput = float(1).toVar();
         const radiance = float(0).toVar();
 
@@ -307,7 +342,11 @@ export function buildKernels({
             // emissive contribution at λ
             radiance.addAssign(clampGI(throughput.mul(jhEmission(emissive, lambda))));
 
-            const albedoL = jhReflectance(baseColor, lambda);
+            // material slot [25]: authored NIR albedo (−1 = untagged → JH
+            // extrapolation prior). Blended in above 700 nm; visible-mode
+            // output is effectively untouched.
+            const nirAlbedo = matFloat(matId, 25);
+            const albedoL = jhReflectance(baseColor, lambda, nirAlbedo);
 
             // NEE: one light sample (diffuse only — fast). Mirrors the raster
             // punctual-light model (three getDistanceAttenuation +
@@ -315,7 +354,7 @@ export function buildKernels({
             // viewport. Reference: web/js/max_lights_node.js Masked*LightDataNode.
             If(U.lightCount.greaterThan(uint(0)), () => {
                 const li = uint(min(float(U.lightCount).sub(1), floor(nextRand().mul(float(U.lightCount)))));
-                const lb = li.mul(uint(16));
+                const lb = li.mul(uint(17));
                 const ltype = lights.element(lb);
                 const lpos = vec3(lights.element(lb.add(uint(1))), lights.element(lb.add(uint(2))), lights.element(lb.add(uint(3))));
                 const ldir = vec3(lights.element(lb.add(uint(4))), lights.element(lb.add(uint(5))), lights.element(lb.add(uint(6))));
@@ -324,6 +363,8 @@ export function buildKernels({
                 const ldecay = lights.element(lb.add(uint(11)));
                 const lcosAngle = lights.element(lb.add(uint(12)));
                 const lcosPen = lights.element(lb.add(uint(13)));
+                // [16] emitter class (packed; ≥500 = incandescent colour temp)
+                const leclass = lights.element(lb.add(uint(16)));
 
                 // type: 0 directional, 1 point, 2 spot. ldir is the beam forward
                 // (normalize(target-pos)); three's spotDirection is its negation.
@@ -352,7 +393,7 @@ export function buildKernels({
                         const angleCos = dot(wi, ldir).mul(-1);
                         const spotAtten = smoothstep(lcosAngle, lcosPen, angleCos);
                         const atten = distAtten.mul(select(isSpot, spotAtten, float(1)));
-                        const lrad = jhEmission(lcol, lambda).mul(atten);
+                        const lrad = emitterAtLambda(lcol, lambda, leclass).mul(atten);
                         const diffuse = albedoL.mul(float(1).sub(metalness)).mul(1.0 / PI);
                         // glass is specular — skip the diffuse direct-light term for it
                         radiance.addAssign(clampGI(throughput.mul(diffuse).mul(ndl).mul(lrad).mul(float(U.lightCount)).mul(notGlass)));
@@ -378,6 +419,9 @@ export function buildKernels({
             // n(λ): shorter wavelengths refract more (normal dispersion), so a
             // prism fans white light into a spectrum. This is the path's
             // wavelength driving GEOMETRY (Snell), not just the final color.
+            // The linear fit extrapolates fine to 900 nm (NV mode) — real
+            // dispersion flattens out in NIR, so linear slightly overshoots,
+            // imperceptibly through an intensifier. No change needed.
             const nLambda = ior.add(dispersionB.mul(float(550).sub(lambda)).div(float(170)));
             // Reflect/refract against the smooth shading normal Ns (same as the
             // opaque lobe) so curved glass bends light smoothly instead of per
@@ -411,17 +455,27 @@ export function buildKernels({
             rd.assign(normalize(newDir));
         });
 
-        // hero λ radiance → XYZ. ×LAMBDA_RANGE undoes the uniform pdf (1/range);
-        // ÷CIE_Y_INTEGRAL normalizes luminance so unit radiance → Y≈1.
-        const w = LAMBDA_RANGE / CIE_Y_INTEGRAL;
-        const X = cieX(lambda).mul(radiance).mul(w);
-        const Y = cieY(lambda).mul(radiance).mul(w);
-        const Z = cieZ(lambda).mul(radiance).mul(w);
-
         const o = pix.mul(uint(4));
-        accum.element(o).addAssign(X);
-        accum.element(o.add(uint(1))).addAssign(Y);
-        accum.element(o.add(uint(2))).addAssign(Z);
+        if (isNV) {
+            // NV mode: true photocathode electron flux in the 4th channel.
+            // Estimator: radiance · S(λ) / (pdf(λ) · ∫S dλ). With importance
+            // sampling pdf(λ) = S(λ)/∫S, so the weight collapses to exactly 1
+            // — treating the inverse-CDF draw as exact, standard practice.
+            // With uniform sampling (A/B validation) pdf = 1/range instead.
+            // XYZ is skipped entirely: photocathode-weighted λ barely lands
+            // below 720 where x̄ȳz̄ are meaningful, and the ALU is wasted.
+            const fluxW = nvImportance
+                ? float(1.0)
+                : photocathodeS(lambda).mul(lambdaRange / pcSampler.integral);
+            accum.element(o.add(uint(3))).addAssign(radiance.mul(fluxW));
+        } else {
+            // hero λ radiance → XYZ. ×LAMBDA_RANGE undoes the uniform pdf (1/range);
+            // ÷CIE_Y_INTEGRAL normalizes luminance so unit radiance → Y≈1.
+            const w = LAMBDA_RANGE / CIE_Y_INTEGRAL;
+            accum.element(o).addAssign(cieX(lambda).mul(radiance).mul(w));
+            accum.element(o.add(uint(1))).addAssign(cieY(lambda).mul(radiance).mul(w));
+            accum.element(o.add(uint(2))).addAssign(cieZ(lambda).mul(radiance).mul(w));
+        }
     })().compute(width * height);
 
     // clear kernel (reset accumulation)
@@ -451,8 +505,16 @@ export function buildKernels({
         const iy = uint(sc.y);
         const idx = iy.mul(uint(width)).add(ix);
         const o = idx.mul(uint(4));
-        const xyz = vec3(accum.element(o), accum.element(o.add(uint(1))), accum.element(o.add(uint(2))));
         const inv = float(1).div(max(U.sampleCount, float(1)));
+        if (isNV) {
+            // LINEAR electron flux for the intensifier stage: sample-count
+            // divide + exposure only. NO tone map, NO sRGB — the tube model
+            // (powershot_infrared.js, inputMode "nir") owns the transfer
+            // curve, and it reads the red channel raw.
+            const flux = accum.element(o.add(uint(3))).mul(inv).mul(U.exposure).max(0.0);
+            return vec4(flux, flux, flux, 1);
+        }
+        const xyz = vec3(accum.element(o), accum.element(o.add(uint(1))), accum.element(o.add(uint(2))));
         const c = xyz.mul(inv);
         // XYZ (D65) → linear sRGB
         const rgb = vec3(

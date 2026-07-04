@@ -3,6 +3,14 @@
 import { add, vec4 } from 'three/tsl';
 import { ssgi } from 'three/addons/tsl/display/SSGINode.js';
 
+let warnedUnsupported = false;
+
+function supportsSsgi(ctx) {
+    const renderer = ctx?.renderer;
+    if (renderer?.backend?.isWebGPUBackend !== true || typeof renderer.hasFeature !== 'function') return true;
+    return renderer.hasFeature('rg11b10ufloat-renderable') !== false;
+}
+
 export default {
     id: 'ssgi',
     stage: 'beauty',
@@ -20,6 +28,14 @@ export default {
         temporal: false,
     },
     build(ctx) {
+        if (!supportsSsgi(ctx)) {
+            if (!warnedUnsupported) {
+                warnedUnsupported = true;
+                console.warn('[max.js] SSGI disabled: WebGPU device lacks rg11b10ufloat-renderable support required by three r185 SSGINode.');
+            }
+            return ctx.beauty;
+        }
+
         const { state, sceneTex } = ctx;
         const ssgiPass = ssgi(sceneTex.color, sceneTex.depth, sceneTex.normal, ctx.camera);
         ssgiPass.sliceCount.value = state.ssgi.sliceCount;

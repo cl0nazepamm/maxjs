@@ -461,6 +461,201 @@ async function registerOptionalModules(features, ctx) {
     return modules;
 }
 
+const SNAPSHOT_HALO_GI_DEFAULTS = Object.freeze({
+    enabled: false,
+    intensity: 10,
+    divisions: 16,
+    rays: 64,
+    cascades: 1,
+    continuous: true,
+    hysteresis: 0.9,
+    hysteresisNormalize: true,
+    normalBias: 1.75,
+    radianceClamp: 8,
+    depthSharpness: 40,
+    cheby: 0.5,
+    classify: 0,
+    filter: 1,
+    smoothness: 1,
+    detail: 1,
+    changeThreshold: 2.5,
+    snapAmount: 0.30,
+    fireflyClamp: 6.0,
+    volumes: [],
+});
+
+function numOrFallback(value, fallback, min = -Infinity, max = Infinity) {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return fallback;
+    return Math.max(min, Math.min(max, n));
+}
+
+function normalizeSnapshotHaloGiState(snapshotUi) {
+    const source = snapshotUi?.haloGi;
+    if (!source || typeof source !== 'object') return null;
+    return {
+        enabled: source.enabled === true,
+        intensity: numOrFallback(source.intensity, SNAPSHOT_HALO_GI_DEFAULTS.intensity, 0, 32),
+        divisions: Math.round(numOrFallback(source.divisions, SNAPSHOT_HALO_GI_DEFAULTS.divisions, 2, 32)),
+        rays: Math.round(numOrFallback(source.rays, SNAPSHOT_HALO_GI_DEFAULTS.rays, 32, 256) / 16) * 16,
+        cascades: Math.round(Number(source.cascades)) === 2 ? 2 : 1,
+        continuous: source.continuous !== false,
+        hysteresis: numOrFallback(source.hysteresis, SNAPSHOT_HALO_GI_DEFAULTS.hysteresis, 0, 0.99),
+        // Absent in pre-normalization exports — default ON to match the field.
+        hysteresisNormalize: source.hysteresisNormalize !== false,
+        normalBias: numOrFallback(source.normalBias, SNAPSHOT_HALO_GI_DEFAULTS.normalBias, 0, 8),
+        radianceClamp: numOrFallback(source.radianceClamp, SNAPSHOT_HALO_GI_DEFAULTS.radianceClamp, 0, 64),
+        depthSharpness: numOrFallback(source.depthSharpness, SNAPSHOT_HALO_GI_DEFAULTS.depthSharpness, 1, 200),
+        cheby: numOrFallback(source.cheby, SNAPSHOT_HALO_GI_DEFAULTS.cheby, 0, 1),
+        classify: numOrFallback(source.classify, SNAPSHOT_HALO_GI_DEFAULTS.classify, 0, 1),
+        filter: numOrFallback(source.filter, SNAPSHOT_HALO_GI_DEFAULTS.filter, 0, 1),
+        smoothness: numOrFallback(source.smoothness, SNAPSHOT_HALO_GI_DEFAULTS.smoothness, 0, 1),
+        detail: numOrFallback(source.detail, SNAPSHOT_HALO_GI_DEFAULTS.detail, 0, 1),
+        changeThreshold: numOrFallback(source.changeThreshold, SNAPSHOT_HALO_GI_DEFAULTS.changeThreshold, 0.5, 8),
+        snapAmount: numOrFallback(source.snapAmount, SNAPSHOT_HALO_GI_DEFAULTS.snapAmount, 0, 0.9),
+        fireflyClamp: numOrFallback(source.fireflyClamp, SNAPSHOT_HALO_GI_DEFAULTS.fireflyClamp, 1, 20),
+        volumes: Array.isArray(source.volumes) ? source.volumes : [],
+    };
+}
+
+function snapshotHaloVolumeBoxes(volumes) {
+    const out = [];
+    for (const entry of Array.isArray(volumes) ? volumes : []) {
+        if (!entry || !Array.isArray(entry.min) || !Array.isArray(entry.max)) continue;
+        const min = new THREE.Vector3(
+            Number(entry.min[0]), Number(entry.min[1]), Number(entry.min[2]),
+        );
+        const max = new THREE.Vector3(
+            Number(entry.max[0]), Number(entry.max[1]), Number(entry.max[2]),
+        );
+        if (!Number.isFinite(min.x) || !Number.isFinite(min.y) || !Number.isFinite(min.z)
+            || !Number.isFinite(max.x) || !Number.isFinite(max.y) || !Number.isFinite(max.z)) {
+            continue;
+        }
+        const box = new THREE.Box3(min, max);
+        if (box.isEmpty()) continue;
+        if (Array.isArray(entry.res) && entry.res.length >= 3) {
+            const res = new THREE.Vector3(
+                Math.round(Number(entry.res[0])),
+                Math.round(Number(entry.res[1])),
+                Math.round(Number(entry.res[2])),
+            );
+            if (Number.isFinite(res.x) && Number.isFinite(res.y) && Number.isFinite(res.z)) {
+                out.push({ box, res });
+                continue;
+            }
+        }
+        out.push(box);
+    }
+    return out;
+}
+
+function markSnapshotHaloGiMaterialsDirty(scene) {
+    const seen = new WeakSet();
+    const mark = (material) => {
+        if (!material || seen.has(material)) return;
+        seen.add(material);
+        if (material.isMeshBasicMaterial || material.isLineBasicMaterial || material.isLineDashedMaterial) return;
+        if (material.visible === false) return;
+        material.dispose?.();
+        material.needsUpdate = true;
+    };
+    scene.traverse((object) => {
+        const material = object?.material;
+        if (!material) return;
+        if (Array.isArray(material)) material.forEach(mark);
+        else mark(material);
+    });
+}
+
+function applySnapshotHaloGiSettings(field, settings) {
+    field.setIntensity?.(settings.intensity);
+    field.setDivisions?.(settings.divisions);
+    field.setRays?.(settings.rays);
+    field.setCascades?.(settings.cascades);
+    field.setContinuous?.(settings.continuous);
+    field.setHysteresis?.(settings.hysteresis);
+    field.setHysteresisNormalization?.(settings.hysteresisNormalize);
+    field.setNormalBias?.(settings.normalBias);
+    field.setRadianceClamp?.(settings.radianceClamp);
+    field.setDepthSharpness?.(settings.depthSharpness);
+    field.setChebyStrength?.(settings.cheby);
+    field.setClassifyStrength?.(settings.classify);
+    field.setFilterStrength?.(settings.filter);
+    field.setSmoothness?.(settings.smoothness);
+    field.setDetailStrength?.(settings.detail);
+    field.setChangeThreshold?.(settings.changeThreshold);
+    field.setSnapAmount?.(settings.snapAmount);
+    field.setFireflyClamp?.(settings.fireflyClamp);
+}
+
+async function createSnapshotHaloGi({ renderer, scene, snapshotUi } = {}) {
+    const settings = normalizeSnapshotHaloGiState(snapshotUi);
+    if (!settings?.enabled) return null;
+    if (renderer?.backend?.isWebGPUBackend !== true || !renderer?.lighting?.createNode) return null;
+    // Studio (spectral) snapshots already run MaxLightsNode, which injects the
+    // probe term via getGiProbeNode() — the field just has to exist. Only
+    // plain snapshots swap in GiLightsNode to reach the same term. The path
+    // tracer never rides snapshots; probes ARE the spectral replay.
+    const swapLightingNode = !snapshotUi?.studio;
+
+    let previousCreateNode = null;
+    let installedCreateNode = null;
+    try {
+        const { createProbeField } = await import('./gi_probes.js');
+        if (swapLightingNode) {
+            const { giLights } = await import('./gi_lights_node.js');
+            previousCreateNode = renderer.lighting.createNode;
+            const lightOptions = {
+                maxDirectionalLights: 16,
+                maxPointLights: 32,
+                maxSpotLights: 32,
+                maxHemisphereLights: 4,
+            };
+            installedCreateNode = (lights = []) => giLights(lightOptions).setLights(lights);
+            renderer.lighting.createNode = installedCreateNode;
+        }
+
+        const field = createProbeField({
+            renderer,
+            scene,
+            intensity: settings.intensity,
+            hysteresis: settings.hysteresis,
+            divisions: settings.divisions,
+            onRebuilt: () => markSnapshotHaloGiMaterialsDirty(scene),
+        });
+        applySnapshotHaloGiSettings(field, settings);
+        const volumes = snapshotHaloVolumeBoxes(settings.volumes);
+        if (volumes.length) field.setVolumes(volumes);
+        field.setEnabled(true);
+        field.requestRebuild?.();
+
+        return {
+            field,
+            settings,
+            update() {
+                if (!field.isSupported?.()) return;
+                void field.tick({ idleMs: Number.POSITIVE_INFINITY, playing: false });
+            },
+            requestRebuild() {
+                field.requestRebuild?.();
+            },
+            dispose() {
+                try { field.dispose?.(); } catch {}
+                if (renderer.lighting?.createNode === installedCreateNode) {
+                    renderer.lighting.createNode = previousCreateNode;
+                }
+            },
+        };
+    } catch (error) {
+        if (installedCreateNode && renderer.lighting?.createNode === installedCreateNode) {
+            renderer.lighting.createNode = previousCreateNode;
+        }
+        console.warn('[snapshot_boot] HALO-GI snapshot replay failed', error);
+        return null;
+    }
+}
+
 function normalizeMaxVertexColorChannel(channel = 0) {
     if (typeof channel === 'string') {
         const token = channel.trim().toLowerCase();
@@ -1241,6 +1436,13 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
     (optionalModules.maxjsFx ?? optionalModules.ssgiFx)?.notifyEnvironmentChanged?.();
     syncDefaultLights();
 
+    const snapshotHaloGi = await createSnapshotHaloGi({
+        renderer,
+        scene,
+        snapshotUi: meta.snapshotUi,
+    });
+    if (snapshotHaloGi) optionalModules.haloGi = snapshotHaloGi;
+
     // Phase 7b: top-level camera state. Lives at meta.camera independently
     // of snapshotUi (which is gated by the "Viewer UI State" export toggle
     // and may be absent). meta.camera shape:
@@ -1339,6 +1541,7 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
             const result = await applyDelta(newBuffer, applierCtx);
             studioLighting?.refreshSceneBindings?.();
             syncDefaultLights();
+            optionalModules.haloGi?.requestRebuild?.();
             return result;
         },
         applyLights: (lightsData) => {
@@ -1346,17 +1549,25 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
             authoredLightCount = countVisibleLightPayload(lightsData);
             studioLighting?.refreshSceneBindings?.();
             syncDefaultLights();
+            optionalModules.haloGi?.requestRebuild?.();
             return r;
         },
         setEnvironmentEnabled: (enabled) => {
             const state = snapshotEnvironment.setEnabled(enabled);
             syncDefaultLights();
+            optionalModules.haloGi?.requestRebuild?.();
             return state;
         },
-        setEnvironmentVisible: (visible) =>
-            snapshotEnvironment.setBackgroundVisible(visible),
-        setEnvironmentBackgroundVisible: (visible) =>
-            snapshotEnvironment.setBackgroundVisible(visible),
+        setEnvironmentVisible: (visible) => {
+            const state = snapshotEnvironment.setBackgroundVisible(visible);
+            optionalModules.haloGi?.requestRebuild?.();
+            return state;
+        },
+        setEnvironmentBackgroundVisible: (visible) => {
+            const state = snapshotEnvironment.setBackgroundVisible(visible);
+            optionalModules.haloGi?.requestRebuild?.();
+            return state;
+        },
         dispose() {
             try { stopLoop(); } catch {}
             try { removeEventListener('resize', onResize); } catch {}

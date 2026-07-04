@@ -344,6 +344,21 @@ function resolveInstancedNodeGeometry(nd, sourceGeometry, { cloneForJsmod = fals
     return geom;
 }
 
+// Group tables live on the geometry, but instanced nodes share one
+// BufferGeometry — rewriting groups in place would scramble every sibling's
+// material-ID mapping (last node processed wins). Clone for this node instead.
+function syncNodeGeometryGroups(mesh, geom, groups, nodeMap) {
+    if (!geom || !Array.isArray(groups)) return geom;
+    if (instanceGeometryGroupsMatch(geom, groups)) return geom;
+    let shared = false;
+    for (const other of nodeMap.values()) {
+        if (other !== mesh && other.geometry === geom) { shared = true; break; }
+    }
+    const target = shared ? geom.clone() : geom;
+    applyInstanceGeometryGroups(target, groups);
+    return target;
+}
+
 function getInstanceTransformPayload(grp, buffer) {
     if (Number.isInteger(grp?.xformOff) && Number.isInteger(grp?.xformN)) {
         const values = binaryFloatView(buffer, grp.xformOff, grp.xformN, 'instance transform');
@@ -692,7 +707,7 @@ export async function applySceneBin({ buffer, meta, ctx, hooks: userHooks = {}, 
             if (nd.skin && !nd.spline) attachSkinAttributes(geom, nd, buffer);
             if (!nd.spline) attachMorphAttributes(geom, nd, buffer);
         } else if (geom && nd.groups) {
-            applyInstanceGeometryGroups(geom, nd.groups);
+            geom = syncNodeGeometryGroups(mesh, geom, nd.groups, nodeMap);
         }
 
         if (geom) geoByHandle.set(nd.h, geom);

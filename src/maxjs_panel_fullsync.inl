@@ -547,6 +547,18 @@
                     }
                 }
 
+                // A multi/sub-object node with no cached face groups must not skip
+                // extraction: the skip branch would emit a single matRef and collapse
+                // every face onto slot 0 ("instanced objects lose their material
+                // IDs"). A material-structure delta can drop groupCache_ while a
+                // later geometry tick repopulates geoHashMap_/lastBBoxHash_ before
+                // this full sync runs, so the bbox test alone can't see the gap.
+                // Mirror of the guard in WriteSceneNodes (the JSON writer).
+                if (skipExtract && !groupCache_.count(ng.handle)) {
+                    Mtl* multiMtl = FindMultiSubMtl(node->GetMtl());
+                    if (multiMtl && multiMtl->NumSubMtls() > 0) skipExtract = false;
+                }
+
                 // Instance dedup: if another node in this group already extracted, skip
                 if (!skipExtract && srcHandle != 0 && srcHandle != ng.handle) {
                     if (extractedSources.count(srcHandle)) {

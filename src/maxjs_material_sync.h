@@ -2498,12 +2498,47 @@ static Mtl* GetSubMtlFromMatID(Mtl* multiMtl, int matID) {
     }
 
     // No usable ID table (legacy / non-standard multi material): fall back to
-    // the sequential mapping, wrapping out-of-range IDs the way the renderer
-    // does for the common contiguous case.
-    int idx = (matID > 0 && matID <= subCount)
-                  ? (matID - 1)
-                  : (((matID % subCount) + subCount) % subCount);
+    // the sequential mapping. matID arrives 0-based (face getMatID / MNMesh
+    // face->material), so slot == matID for the contiguous case; out-of-range
+    // IDs wrap cyclically the way the Max renderer does. (The UI and MAXScript
+    // display these values 1-based — do not "fix" this back to matID - 1.)
+    const int idx = ((matID % subCount) + subCount) % subCount;
     return multiMtl->GetSubMtl(idx);
+}
+
+// Writes the Multi/Sub slot -> material-ID table (the ID column) as a JSON
+// array. Consumed by the material state hash: remapping which face ID feeds
+// which sub-material slot changes GetSubMtlFromMatID's output without touching
+// any sub-material, so the mapping itself must participate in change
+// detection or ID-column edits never trigger a resync.
+static void WriteMultiSubMaterialIdListJson(Mtl* multiMtl, std::wostringstream& ss) {
+    ss << L'[';
+    bool first = true;
+    if (multiMtl) {
+        for (int b = 0; b < multiMtl->NumParamBlocks(); b++) {
+            IParamBlock2* pb = multiMtl->GetParamBlock(b);
+            if (!pb) continue;
+            ParamID idListId = -1;
+            for (int i = 0; i < pb->NumParams(); i++) {
+                const ParamID pid = pb->IndextoID(i);
+                const ParamDef& pd = pb->GetParamDef(pid);
+                if (!pd.int_name) continue;
+                if (pd.type == TYPE_INT_TAB && PBNameEquals(pd.int_name, _T("materialIDList"))) {
+                    idListId = pid;
+                    break;
+                }
+            }
+            if (idListId < 0) continue;
+            const int idCount = pb->Count(idListId);
+            for (int s = 0; s < idCount; s++) {
+                if (!first) ss << L',';
+                ss << pb->GetInt(idListId, 0, s);
+                first = false;
+            }
+            break;
+        }
+    }
+    ss << L']';
 }
 
 template <typename TGroupList>

@@ -3724,7 +3724,13 @@
         Mtl* rawMtl = node->GetMtl();
         Mtl* multiMtl = FindMultiSubMtl(rawMtl);
         if (multiMtl && multiMtl->NumSubMtls() > 0) {
-            ss << L"{\"multi\":true,\"count\":" << multiMtl->NumSubMtls() << L",\"mats\":[";
+            ss << L"{\"multi\":true,\"count\":" << multiMtl->NumSubMtls();
+            // ID-column mapping must be part of the hash: remapping face IDs to
+            // different slots changes what GetSubMtlFromMatID emits on the next
+            // full sync without any sub-material (slot order) change.
+            ss << L",\"ids\":";
+            WriteMultiSubMaterialIdListJson(multiMtl, ss);
+            ss << L",\"mats\":[";
             for (int i = 0; i < multiMtl->NumSubMtls(); ++i) {
                 if (i) ss << L',';
                 MaxJSPBR subPBR;

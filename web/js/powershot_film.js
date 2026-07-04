@@ -205,6 +205,26 @@ function stDevelop(srcTex, ctx, haloTex, inputEncoding) {
     E = E.add(halo.mul(ctx.P.halColor).mul(ctx.P.halStrength));
   }
 
+  // film burn (scene-linear path to white): a bright enough light overwhelms
+  // all three dye layers at once, so the highlight travels toward white BEFORE
+  // the H&D response — then the print shoulder rolls it off and halation blooms
+  // the glow around it. Doing this in the exposure domain (not as a post clamp
+  // on the developed image) is what reads as a film burn rather than a filter,
+  // and it fixes the "notorious six": a saturated highlight desaturates to white
+  // instead of clipping to a pure primary. Triggered in stops over 18% grey so
+  // the rolloff is perceptually even; only genuine highlights are touched, and
+  // it pulls toward the brightest channel (keeps value high) not luminance
+  // (which would gray a bright blue to mud). highlightBurn 0 = raw film.
+  const burnPeak = max(max(E.x, E.y), E.z);
+  const burnStops = log(burnPeak.div(0.18).max(1e-6)).mul(1.0 / Math.LN2);
+  const burnW = smoothstep(2.0, 6.5, burnStops).mul(ctx.P.highlightBurn);
+  E = mix(E, vec3(burnPeak), burnW.clamp(0.0, 1.0));
+
+  // post-burn scene colour, kept as the hue reference for the hue-restoration
+  // step after development (see below). Captured here so blown highlights —
+  // already pulled to white by the burn — carry no hue to restore.
+  const hueRef = E;
+
   // spectral sensitivity cross-talk (rows sum to 1: neutrals stay neutral)
   E = filmMatrix(E, ctx.P.d2fR, ctx.P.d2fG, ctx.P.d2fB).max(1e-6);
 
@@ -229,6 +249,38 @@ function stDevelop(srcTex, ctx, haloTex, inputEncoding) {
   const tPrint = pow10(ctx.P.prtDmin.sub(dPrint));
   let out = tPrint.mul(ctx.P.displayGain);
   out = filmMatrix(out, ctx.P.p2dR, ctx.P.p2dG, ctx.P.p2dB);
+
+  // hue restoration (the notorious-six edge fix), done as a TRUE hue ROTATION:
+  // the per-channel H&D curves rotate hue as they climb (orange->yellow,
+  // azure->cyan). For midtones that skew IS the stock's character, so we keep
+  // it — we only rein in the EXAGGERATED skew on near-primary colours, gated by
+  // purity. The fix: keep the developed colour's luminance AND chroma magnitude
+  // (its saturation and rolloff — the film character) and turn ONLY the hue
+  // angle back toward the post-burn scene hue. A lerp toward the scene *colour*
+  // (the earlier version) also drags saturation, so it either did nothing or
+  // desaturated; rotating the chroma vector moves hue without touching purity.
+  // Blown highlights are already ~white in hueRef (no hue), so the burn stands.
+  const hrLt = dot(out, LUM709);
+  // purity: 0 = achromatic, ->1 on a gamut edge (channel spread over intensity)
+  const hrChroma = max(max(out.x, out.y), out.z).sub(min(min(out.x, out.y), out.z));
+  const hrPurity = hrChroma.div(hrLt.add(hrChroma).max(1e-5)).clamp(0.0, 1.0);
+  const hrW = ctx.P.hueRestore.mul(smoothstep(0.5, 1.0, hrPurity)).clamp(0.0, 1.0);
+  // split each colour into achromatic mean + chroma vector (in the plane
+  // perpendicular to grey); the chroma vector's DIRECTION is the hue, its
+  // LENGTH is the chroma. Rotate the developed direction toward the scene
+  // direction by hrW (nlerp — skews are small, so it tracks a true rotation),
+  // then rebuild with the developed mean + developed magnitude preserved.
+  const outMean = out.x.add(out.y).add(out.z).div(3.0);
+  const refMean = hueRef.x.add(hueRef.y).add(hueRef.z).div(3.0);
+  const outChroma = out.sub(outMean);
+  const refChroma = hueRef.sub(refMean);
+  const outMag = sqrt(dot(outChroma, outChroma)).max(1e-6);
+  const dirOut = outChroma.div(outMag);
+  const dirRef = refChroma.div(sqrt(dot(refChroma, refChroma)).max(1e-6));
+  const dirMix = mix(dirOut, dirRef, hrW);
+  const dirN = dirMix.div(sqrt(dot(dirMix, dirMix)).max(1e-6));
+  out = vec3(outMean).add(dirN.mul(outMag));
+
   const printView = linearToSrgb(out);
 
   // negative inspection view: the orange-masked negative itself
@@ -259,6 +311,20 @@ export function makeFilmUniforms() {
       // JPEG/video input, whose baked tone curve would otherwise stack with
       // the print's ~1.75x system gamma; set 1.0 for scene-linear sources.
       inputGamma: uniform(0.65),
+      // film-burn strength (not preset data — a global highlight behaviour).
+      // 0 = raw per-channel film response (highlights clip to a pure primary,
+      // full notorious-six); 1 = bright highlights burn to white in the
+      // exposure domain before the H&D curves. See stDevelop. Default 0.7:
+      // real film burns highlights to white — clip-to-primary is the artifact.
+      highlightBurn: uniform(0.7),
+      // hue-restoration strength (not preset data — a global gamut behaviour).
+      // 0 = raw per-channel curve hue skew (full film character); 1 = pull the
+      // hue of near-primary (high-purity) colours back to the scene while keeping
+      // film luminance. Purity-weighted, so midtones/neutrals are untouched — it
+      // only reins in the exaggerated skew on Notorious-Six edges. See stDevelop.
+      // Default 0.2: the datasheet-fit curves' hue shift IS the real stock, so
+      // keep it — this just trims the pure-primary edge cases.
+      hueRestore: uniform(0.2),
 
       d2fR: uniform(new THREE.Vector3(1, 0, 0)),
       d2fG: uniform(new THREE.Vector3(0, 1, 0)),

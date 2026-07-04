@@ -1,5 +1,5 @@
 // spectral_traverse.js — shared TSL traversal + shading helpers for the
-// spectral path tracer AND the HALO-GI probe kernel (docs/GI_HALO_design.md §3.4).
+// spectral path tracer AND the SPEEDBALL GI probe kernel (docs/GI_SPEEDBALL_design.md §3.4).
 //
 // EXTRACTED VERBATIM from spectral_kernel.js buildKernels() so both kernels
 // trace the SAME resident stackless BVH with byte-identical logic — there is no
@@ -151,9 +151,9 @@ export function buildTraversal({ storages, U, env = null, lut = null, lutRes = 0
     );
     // Sample a map-array layer at the transformed UV.
     const sampleLayer = (tex, uv, layerF) =>
-        texture(tex, uv).depth(int(max(layerF, float(0)))).xyz;
+        texture(tex, uv).depth(int(max(layerF, float(0)))).level(0).xyz;
     const sampleLayerRGBA = (tex, uv, layerF) =>
-        texture(tex, uv).depth(int(max(layerF, float(0))));
+        texture(tex, uv).depth(int(max(layerF, float(0)))).level(0);
 
     const materialSideAccepts = (matId, det) => {
         const side = matFloat(matId, 22);
@@ -440,7 +440,7 @@ export function buildTraversal({ storages, U, env = null, lut = null, lutRes = 0
     };
 
     return {
-        fetchVert, fetchNorm, fetchUV, triVert, matFloat,
+        fetchVert, fetchNorm, fetchUV, hitUV, triVert, matFloat,
         srgbToLinear, sampleLayer,
         jhReflectance, jhEmission, emitterAtLambda, envAtLambda, cosineSample,
         traverseClosest, traverseAny,

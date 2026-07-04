@@ -658,7 +658,8 @@ function createDeformSystem({
     function builderArgs(entry, material, mesh = null) {
         // Existing chain (TSL snippet or an earlier deform entry) or rest
         // position — builders displace this and return the result.
-        const position = material.positionNode ?? TSL.positionLocal;
+        const restPosition = TSL.positionGeometry ?? TSL.positionLocal;
+        const position = material.positionNode ?? restPosition;
         return {
             position,
             normal: material.normalNode ?? TSL.normalLocal,

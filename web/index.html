@@ -1173,12 +1173,133 @@
         // solve until the view rests (camera quiet, not playing, delta-sync settled), so
         // a freeze can never land during interaction. Updated in the render loop.
         let haloGiLastInteractionMs = 0;
-        let haloGiLastSyncSerial = -1;
         // HALO-GI Probe Grid side-channel: handle -> { size:[l,w,h], div:[x,y,z], enabled }.
         // Transform rides the normal helper-node sync; this carries size + manual divisions.
         const probeGridData = new Map();
         let probeVolumeSig = '';
         let probeGridAutoEnabled = false; // auto-turn-on GI once when an enabled grid first appears
+        const HALO_GI_DEFAULTS = Object.freeze({
+            // Speedball probes exist only in spectral, where they default ON
+            // (the DDGI field IS the live view). window.MAXJS_HALO_GI = false
+            // force-disables; standard mode never runs them.
+            enabled: isStudioMode && window.MAXJS_HALO_GI !== false,
+            intensity: 10,
+            divisions: 16,
+            rays: 64,
+            cascades: 1,
+            continuous: true,
+            hysteresis: 0.9,
+            hysteresisNormalize: true,
+            normalBias: 1.75,
+            radianceClamp: 8,
+            depthSharpness: 40,
+            cheby: 0.5,
+            classify: 0,
+            filter: 1,
+            smoothness: 1,
+            detail: 1,
+            changeThreshold: 2.5,
+            snapAmount: 0.30,
+            fireflyClamp: 6.0,
+            showProbes: false,
+        });
+        const HALO_GI_NUMERIC_CONTROLS = Object.freeze([
+            { key: 'intensity', label: 'Intensity', min: 0, max: 32, step: 0.05, digits: 1 },
+            { key: 'divisions', label: 'Divisions', min: 2, max: 32, step: 1, digits: 0 },
+            { key: 'rays', label: 'Rays / Probe', min: 32, max: 256, step: 16, digits: 0 },
+            { key: 'hysteresis', label: 'Hysteresis', min: 0.5, max: 0.99, step: 0.01, digits: 2 },
+            { key: 'normalBias', label: 'Normal Bias', min: 0, max: 4, step: 0.05, digits: 2 },
+            { key: 'radianceClamp', label: 'Radiance Clamp', min: 0, max: 32, step: 0.5, digits: 1 },
+            { key: 'depthSharpness', label: 'Depth Sharpness', min: 1, max: 200, step: 1, digits: 0 },
+            { key: 'cheby', label: 'Chebyshev', min: 0, max: 1, step: 0.05, digits: 2 },
+            { key: 'classify', label: 'Solid Classify', min: 0, max: 1, step: 0.05, digits: 2 },
+            { key: 'filter', label: 'Filter', min: 0, max: 1, step: 0.05, digits: 2 },
+            { key: 'smoothness', label: 'Smoothness', min: 0, max: 1, step: 0.05, digits: 2 },
+            { key: 'detail', label: 'Detail', min: 0, max: 1, step: 0.05, digits: 2 },
+            { key: 'changeThreshold', label: 'Change Threshold', min: 0.5, max: 8, step: 0.05, digits: 2 },
+            { key: 'snapAmount', label: 'Snap Amount', min: 0, max: 0.9, step: 0.01, digits: 2 },
+            { key: 'fireflyClamp', label: 'Firefly Clamp', min: 1, max: 20, step: 0.5, digits: 1 },
+        ]);
+        let haloGiSettings = { ...HALO_GI_DEFAULTS };
+        function clampHaloGiNumber(key, value) {
+            const control = HALO_GI_NUMERIC_CONTROLS.find(c => c.key === key);
+            if (!control) return Number.isFinite(value) ? value : HALO_GI_DEFAULTS[key];
+            const n = Number(value);
+            const fallback = HALO_GI_DEFAULTS[key];
+            if (!Number.isFinite(n)) return fallback;
+            const stepped = control.step >= 1 ? Math.round(n / control.step) * control.step : n;
+            return THREE.MathUtils.clamp(stepped, control.min, control.max);
+        }
+        function formatHaloGiValue(key, value = haloGiSettings[key]) {
+            const control = HALO_GI_NUMERIC_CONTROLS.find(c => c.key === key);
+            if (!control) return String(value);
+            const n = Number(value);
+            if (!Number.isFinite(n)) return String(HALO_GI_DEFAULTS[key]);
+            return control.digits === 0 ? String(Math.round(n)) : n.toFixed(control.digits);
+        }
+        function normalizeHaloGiSettings(input = {}, base = HALO_GI_DEFAULTS) {
+            const out = { ...base };
+            for (const control of HALO_GI_NUMERIC_CONTROLS) {
+                if (control.key in input) out[control.key] = clampHaloGiNumber(control.key, input[control.key]);
+            }
+            if ('enabled' in input) out.enabled = input.enabled === true;
+            if ('continuous' in input) out.continuous = input.continuous === true;
+            if ('hysteresisNormalize' in input) out.hysteresisNormalize = input.hysteresisNormalize === true;
+            if ('showProbes' in input) out.showProbes = input.showProbes === true;
+            if ('cascades' in input) out.cascades = Math.round(Number(input.cascades)) === 2 ? 2 : 1;
+            return out;
+        }
+        function applyHaloGiTuning(field = haloGi?.field) {
+            if (!field) return;
+            field.setIntensity?.(haloGiSettings.intensity);
+            field.setDivisions?.(haloGiSettings.divisions);
+            field.setRays?.(haloGiSettings.rays);
+            field.setCascades?.(haloGiSettings.cascades);
+            field.setContinuous?.(haloGiSettings.continuous);
+            field.setHysteresis?.(haloGiSettings.hysteresis);
+            field.setHysteresisNormalization?.(haloGiSettings.hysteresisNormalize);
+            field.setNormalBias?.(haloGiSettings.normalBias);
+            field.setRadianceClamp?.(haloGiSettings.radianceClamp);
+            field.setDepthSharpness?.(haloGiSettings.depthSharpness);
+            field.setChebyStrength?.(haloGiSettings.cheby);
+            field.setClassifyStrength?.(haloGiSettings.classify);
+            field.setFilterStrength?.(haloGiSettings.filter);
+            field.setSmoothness?.(haloGiSettings.smoothness);
+            field.setDetailStrength?.(haloGiSettings.detail);
+            field.setChangeThreshold?.(haloGiSettings.changeThreshold);
+            field.setSnapAmount?.(haloGiSettings.snapAmount);
+            field.setFireflyClamp?.(haloGiSettings.fireflyClamp);
+        }
+        function serializeHaloGiState() {
+            return {
+                ...haloGiSettings,
+                volumes: serializeHaloGiProbeVolumes(),
+            };
+        }
+        function applyHaloGiState(input = {}, { persist = false } = {}) {
+            const togglesEnabled = Object.prototype.hasOwnProperty.call(input, 'enabled');
+            const togglesProbes = Object.prototype.hasOwnProperty.call(input, 'showProbes');
+            haloGiSettings = normalizeHaloGiSettings(input, haloGiSettings);
+            applyHaloGiTuning();
+            if (togglesProbes && haloGiSettings.showProbes !== probeHelpersVisible) setProbeHelpersVisible(haloGiSettings.showProbes);
+            const gi = window.maxjsHaloGI;
+            if (gi && togglesEnabled) {
+                if (haloGiSettings.enabled) gi.enable({ applySettings: false });
+                else gi.disable({ applySettings: false });
+            }
+            window.__maxjsSyncGiPanel?.();
+            if (persist) savePostFxState();
+        }
+        function setHaloGiSetting(key, value, { persist = false } = {}) {
+            applyHaloGiState({ [key]: value }, { persist });
+        }
+        function resetHaloGiToDefaults({ persist = false } = {}) {
+            applyHaloGiState({
+                ...HALO_GI_DEFAULTS,
+                enabled: haloGiSettings.enabled,
+                showProbes: haloGiSettings.showProbes,
+            }, { persist });
+        }
         let giVolumeSyncToken = '';
         let giVolumeRefreshTimer = 0;
         let giVolumeFadeFrame = 0;
@@ -1278,30 +1399,38 @@
             }
         }
 
-        // HALO-GI: BVH-traced DDGI probe field (docs/GI_HALO_design.md). Works in
-        // EVERY WebGPU mode (not just Studio) — the GiLightsNode installed for
-        // non-Studio injects the same probe term Studio's MaxLightsNode does. OPT-IN
-        // — default OFF so the shipped path is byte-identical. Enable live with
-        //   window.maxjsHaloGI.enable()   (disable() drops the probe node)
-        // When enabled it mutes the surfel giVolume (Studio-only) to avoid double-
-        // counting and ticks on its own ~30 Hz throttle (decoupled from delta-sync).
-        // The probe node only injects into context.irradiance while active, so an
-        // unbuilt / disabled field changes nothing.
-        if (isWebGpuBackend) {
+        // HALO-GI: BVH-traced DDGI probe field (docs/GI_HALO_design.md) — the
+        // speedball probes. SPECTRAL-ONLY: standard mode is vanilla three.js
+        // (native LightProbe / LightProbeGrid GI) and must never run speedball.
+        // In spectral the field is constructed up front and ON by default — it
+        // IS the live view, and because it shares the BVH/traversal core with
+        // the path tracer (spectral_traverse.js) the PT ⇄ DDGI switch is
+        // instant. window.MAXJS_HALO_GI = false force-disables. When enabled it
+        // mutes the surfel giVolume to avoid double-counting and ticks every
+        // frame — the field self-gates on idle and auto-throttles its own ray
+        // budget. The probe node only injects into context.irradiance while
+        // active, so a disabled field changes nothing.
+        if (isWebGpuBackend && isStudioMode) {
             try {
-                const haloField = createHaloProbeField({ renderer, scene, intensity: 1.0, onRebuilt: markLightProbeMaterialsDirty });
-                // Spectral mode turns the probe field ON by default — it IS
-                // the live view; window.MAXJS_HALO_GI = false force-disables.
-                let haloOn = window.MAXJS_HALO_GI === true
-                    || (isStudioMode && window.MAXJS_HALO_GI !== false);
-                let haloLastTick = 0;
+                const haloField = createHaloProbeField({
+                    renderer,
+                    scene,
+                    intensity: haloGiSettings.intensity,
+                    hysteresis: haloGiSettings.hysteresis,
+                    divisions: haloGiSettings.divisions,
+                    onRebuilt: markLightProbeMaterialsDirty,
+                });
+                applyHaloGiTuning(haloField);
+                let haloOn = haloGiSettings.enabled === true;
                 haloGi = {
                     field: haloField,
                     isOn: () => haloOn && haloField.isSupported(),
-                    enable() {
+                    enable({ applySettings = true } = {}) {
                         if (!haloField.isSupported()) { console.warn('HALO-GI needs the WebGPU backend'); return false; }
                         haloOn = true;
+                        haloGiSettings.enabled = true;
                         if (giVolume) { giVolume.setEnabled(false); giVolume.setIntensity(0); }
+                        if (applySettings) applyHaloGiTuning(haloField);
                         haloField.setEnabled(true);
                         haloField.requestRebuild();
                         // The fold-in recompile is forced by the field's onRebuilt hook
@@ -1311,27 +1440,47 @@
                         window.__maxjsSyncGiPanel?.(); // mirror On state in the FX panel (incl. auto-enable on reload)
                         return true;
                     },
-                    disable() {
+                    disable({ applySettings = true } = {}) {
                         haloOn = false;
+                        haloGiSettings.enabled = false;
+                        if (applySettings) applyHaloGiTuning(haloField);
                         haloField.setEnabled(false);
                         markLightProbeMaterialsDirty(); // one-shot: drop the probe node from the lights graph this frame
                         window.__maxjsSyncGiPanel?.();
                     },
-                    setIntensity: (v) => haloField.setIntensity(v),
-                    setCheby: (v) => haloField.setChebyStrength(v), // 0 leaks, 1 leak-free
-                    setClassify: (v) => haloField.setClassifyStrength(v), // 0 off (default), 1 drop buried probes (solid scenes)
-                    setFilter: (v) => haloField.setFilterStrength(v),     // CORE denoise: 0 off (baseline), 1 full intra-tile spatial filter
-                    setSmoothness: (v) => haloField.setSmoothness(v),     // UI "Smoothness": widen the denoise edge-stop (kills GI splotch)
+                    setIntensity: (v) => setHaloGiSetting('intensity', v),
+                    setDivisions: (v) => setHaloGiSetting('divisions', v),
+                    setRays: (v) => setHaloGiSetting('rays', v),
+                    setCascades: (v) => setHaloGiSetting('cascades', v),
+                    setContinuous: (v) => setHaloGiSetting('continuous', v),
+                    setHysteresis: (v) => setHaloGiSetting('hysteresis', v),
+                    setHysteresisNormalize: (v) => setHaloGiSetting('hysteresisNormalize', v),
+                    setNormalBias: (v) => setHaloGiSetting('normalBias', v),
+                    setRadianceClamp: (v) => setHaloGiSetting('radianceClamp', v),
+                    setDepthSharpness: (v) => setHaloGiSetting('depthSharpness', v),
+                    setCheby: (v) => setHaloGiSetting('cheby', v), // 0 leaks, 1 leak-free
+                    setChebyStrength: (v) => setHaloGiSetting('cheby', v),
+                    setClassify: (v) => setHaloGiSetting('classify', v), // 0 off (default), 1 drop buried probes (solid scenes)
+                    setClassifyStrength: (v) => setHaloGiSetting('classify', v),
+                    setFilter: (v) => setHaloGiSetting('filter', v),     // CORE denoise: 0 off (baseline), 1 full intra-tile spatial filter
+                    setFilterStrength: (v) => setHaloGiSetting('filter', v),
+                    setSmoothness: (v) => setHaloGiSetting('smoothness', v),     // UI "Smoothness": widen the denoise edge-stop (kills GI splotch)
+                    setChangeThreshold: (v) => setHaloGiSetting('changeThreshold', v),
+                    setSnapAmount: (v) => setHaloGiSetting('snapAmount', v),
+                    setFireflyClamp: (v) => setHaloGiSetting('fireflyClamp', v),
+                    resetDefaults: () => resetHaloGiToDefaults({ persist: true }),
+                    getSettings: () => serializeHaloGiState(),
                     setBounds: (box) => haloField.setBounds(box),     // single Probe Origin box; null = auto-fit
                     setVolumes: (boxes) => haloField.setVolumes(boxes), // multiple Probe Origin boxes (unioned for now)
                     getStats: () => haloField.getStats(),
                     tick(nowMs) {
                         if (!haloOn || isPathTracingMode || !haloField.isSupported()) return;
-                        if (nowMs - haloLastTick < 33) return; // ~30 Hz, own throttle
-                        haloLastTick = nowMs;
-                        // The field self-gates on viewport idle: rebuild + solve are held
-                        // while orbiting / playing / mid delta-sync (GI is world-space, so
-                        // holding it static during motion is lossless and freeze-proof).
+                        // Tick EVERY frame, exactly like the speedball standalone — the
+                        // field self-gates on viewport idle and auto-throttles its ray
+                        // budget from measured tick-to-tick dt. An external cadence cap
+                        // (the old ~30 Hz throttle) reads as GPU pressure to that
+                        // auto-throttle and pins the budget at the floor: 12× less
+                        // solve throughput than the standalone = laggy convergence.
                         void haloField.tick({
                             idleMs: nowMs - haloGiLastInteractionMs,
                             playing: !!maxTimeline?.playing?.(),
@@ -1339,7 +1488,7 @@
                     },
                 };
                 window.maxjsHaloGI = haloGi; // console handle
-                if (haloOn) haloGi.enable();
+                if (haloOn) haloGi.enable({ applySettings: false });
             } catch (err) {
                 maxjsDebugWarn?.('max.js HALO-GI init failed:', err);
                 haloGi = null;
@@ -2331,9 +2480,12 @@
         }
 
         function applyLightProbeState() {
+            // Native three.js probes are standard-mode GI only — the spectral
+            // stack sources ALL probe GI from speedball (HALO-GI DDGI).
+            const probesAllowed = !isStudioMode;
             const hdriDiffuseMuted = isHdriReflectionOnlyEffective();
-            const useGrid = !hdriDiffuseMuted && lightProbeEnabled && hasLightProbeGridData && !!lightProbeGrid;
-            lightProbe.intensity = !hdriDiffuseMuted && lightProbeEnabled && !useGrid ? lightProbeIntensity : 0.0;
+            const useGrid = probesAllowed && !hdriDiffuseMuted && lightProbeEnabled && hasLightProbeGridData && !!lightProbeGrid;
+            lightProbe.intensity = probesAllowed && !hdriDiffuseMuted && lightProbeEnabled && !useGrid ? lightProbeIntensity : 0.0;
             if (lightProbeGrid) lightProbeGrid.visible = useGrid;
             if (lightProbeGridActive !== useGrid) {
                 lightProbeGridActive = useGrid;
@@ -6764,6 +6916,30 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             return geometry;
         }
 
+        function isGeometrySharedByAnotherMesh(geometry, selfMesh) {
+            if (!geometry) return false;
+            for (const other of nodeMap.values()) {
+                if (other !== selfMesh && other.geometry === geometry) return true;
+            }
+            for (const [, bucket] of maxInstanceBuckets) {
+                if (bucket.mesh && bucket.mesh.geometry === geometry) return true;
+            }
+            return false;
+        }
+
+        function syncGeometryGroupsForNode(mesh, geometry, groups) {
+            if (!geometry || !Array.isArray(groups)) return geometry;
+            if (geometryGroupsMatch(geometry, groups)) return geometry;
+            // Groups live on the geometry, but instances share one BufferGeometry.
+            // Rewriting them in place would scramble every sibling's material-ID
+            // mapping (last node processed wins) — clone for this node instead.
+            const target = isGeometrySharedByAnotherMesh(geometry, mesh)
+                ? geometry.clone()
+                : geometry;
+            applyGeometryGroups(target, groups);
+            return target;
+        }
+
         function applyFastMaterialPayload(mesh, payload, wantsLine) {
             if (!mesh || !Array.isArray(payload?.groups) || !Array.isArray(payload?.mats)) return false;
             const ndForMaterial = {
@@ -6790,7 +6966,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             mesh.userData.maxjsHasHTMLAutoFit = nodePayloadHasHTMLAutoFit(nd);
         }
 
-        function ensureSceneRenderableMaterial(mesh, nd, wantsLine) {
+        function ensureSceneRenderableMaterial(mesh, nd, wantsLine, { authoritativeMaterial = false } = {}) {
             if (!mesh) return false;
             // Guard: a single-material payload must not collapse a mesh that is
             // still multi/sub-object. On an incremental re-sync (e.g. after undo)
@@ -6799,13 +6975,20 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             // payload, sending only a single `mat`. The geometry still carries its
             // (>1) material groups, so a lone `mat` can't be the real assignment;
             // rebuilding from it dumps every face onto slot 0 (the "instances lose
-            // their material IDs" bug). Keep the existing array. A genuine
-            // multi→single change re-extracts geometry with a single group, which
-            // releases this guard on its own.
+            // their material IDs" bug). Keep the existing array.
+            //
+            // Full scene syncs pass authoritativeMaterial: there the Max side has
+            // just re-read GetMtl() for this node, so a single `mat` IS the real
+            // assignment (a genuine multi→single reassignment) and must apply —
+            // material assignment never re-extracts geometry, so waiting for a
+            // single-group geometry payload deadlocked these nodes until a viewer
+            // reload. With a single material three.js ignores the group material
+            // indices, so the (possibly shared) geometry groups can stay.
             if (!wantsLine
                 && Array.isArray(mesh.material) && mesh.material.length > 1
                 && Array.isArray(mesh.geometry?.groups) && mesh.geometry.groups.length > 1
-                && !(Array.isArray(nd?.mats) && nd.mats.length)) {
+                && !(Array.isArray(nd?.mats) && nd.mats.length)
+                && !(authoritativeMaterial && nd?.mat)) {
                 return false;
             }
             const signature = sceneMaterialSignature(nd, wantsLine);
@@ -6867,7 +7050,14 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 }
             }
             if (nd.s != null) applySelection(mesh, nd.s);
-            if (nd.mat && mesh.material) applyMaterialScalar(mesh, nd.mat);
+            // Max never intends scalar pushes for Multi/Sub nodes (a single
+            // color/rough/metal set would smear across every sub-material).
+            // Guard here too: a delta can land while the mesh is still
+            // multi-material mid-reassignment, before the full sync applies.
+            if (nd.mat && mesh.material
+                && !(Array.isArray(mesh.material) && mesh.material.length > 1)) {
+                applyMaterialScalar(mesh, nd.mat);
+            }
         }
 
         function buildNodeGeometryRefCounts() {
@@ -7310,7 +7500,8 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     });
                     applyGeometryGroups(geom, nd.groups);
                 } else if (geom && nd.groups) {
-                    applyGeometryGroups(geom, nd.groups);
+                    // Never rewrites groups on a geometry other meshes share.
+                    geom = syncGeometryGroupsForNode(mesh, geom, nd.groups);
                 }
 
                 const wantsLine = !!nd.spline;
@@ -7326,11 +7517,15 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 }
 
                 if (mesh) {
-                    if (nd.v && nd.i && !jsmodSkipGeo && geom !== mesh.geometry) {
-                        mesh.geometry.dispose();
+                    if (!jsmodSkipGeo && geom && geom !== mesh.geometry) {
+                        // Old geometry may be shared with instance siblings —
+                        // only dispose it once no other mesh references it.
+                        if (!isGeometrySharedByAnotherMesh(mesh.geometry, mesh)) {
+                            mesh.geometry.dispose();
+                        }
                         mesh.geometry = geom;
                     }
-                    if (ensureSceneRenderableMaterial(mesh, nd, wantsLine)) {
+                    if (ensureSceneRenderableMaterial(mesh, nd, wantsLine, { authoritativeMaterial: true })) {
                         sceneChanged = true;
                         layerManager.applyMaterialOverrides?.(nd.h, mesh);
                     }
@@ -7407,30 +7602,52 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         // No enabled grids -> whole-scene auto-fit. Change-gated.
         const _pgBox = new THREE.Box3();
         const _pgVec = new THREE.Vector3();
-        function syncHaloProbeVolumes() {
-            const gi = window.maxjsHaloGI;
-            if (!gi || typeof gi.setVolumes !== 'function') return;
+        function buildHaloProbeVolumes() {
             const volumes = [];
-            let sig = '';
             for (const [h, data] of probeGridData) {
                 if (!data || data.enabled === false || !Array.isArray(data.size)) continue;
-                const obj = nodeMap.get(h);           // transform from the synced helper node
-                if (!obj) continue;                   // node not synced yet -> a later sync applies it
+                const obj = nodeMap.get(h);
+                if (!obj) continue;
                 obj.updateWorldMatrix(true, false);
                 const size = data.size;
                 const hx = size[0] * 0.5, hy = size[1] * 0.5, hz = size[2] * 0.5;
-                _pgBox.makeEmpty();
+                const box = new THREE.Box3();
                 for (let cx = -1; cx <= 1; cx += 2) for (let cy = -1; cy <= 1; cy += 2) for (let cz = -1; cz <= 1; cz += 2) {
                     _pgVec.set(cx * hx, cy * hy, cz * hz).applyMatrix4(obj.matrixWorld);
-                    _pgBox.expandByPoint(_pgVec);
+                    box.expandByPoint(_pgVec);
                 }
                 const div = data.div;
                 const res = (Array.isArray(div) && div.length === 3) ? { x: div[0], y: div[1], z: div[2] } : null;
-                volumes.push(res ? { box: _pgBox.clone(), res } : _pgBox.clone());
-                const e = obj.matrixWorld.elements;
-                sig += `${h}|${size.join(',')}|${div ? div.join(',') : 'a'}|`
-                    + `${Math.round(e[12])},${Math.round(e[13])},${Math.round(e[14])},`
-                    + `${e[0].toFixed(2)},${e[5].toFixed(2)},${e[10].toFixed(2)},${e[1].toFixed(2)},${e[2].toFixed(2)};`;
+                volumes.push(res ? { box, res } : box);
+            }
+            return volumes;
+        }
+        function serializeHaloGiProbeVolumes() {
+            return buildHaloProbeVolumes().map((entry) => {
+                const box = entry.isBox3 ? entry : entry.box;
+                const res = entry.isBox3 ? null : entry.res;
+                if (!box || !box.isBox3 || box.isEmpty()) return null;
+                const out = {
+                    min: [box.min.x, box.min.y, box.min.z],
+                    max: [box.max.x, box.max.y, box.max.z],
+                };
+                if (res) out.res = [res.x, res.y, res.z];
+                return out;
+            }).filter(Boolean);
+        }
+        function syncHaloProbeVolumes() {
+            const gi = window.maxjsHaloGI;
+            if (!gi || typeof gi.setVolumes !== 'function') return;
+            const volumes = buildHaloProbeVolumes();
+            let sig = '';
+            for (const entry of volumes) {
+                const box = entry.isBox3 ? entry : entry.box;
+                const res = entry.isBox3 ? null : entry.res;
+                if (!box || box.isEmpty()) continue;
+                const size = _pgVec.subVectors(box.max, box.min);
+                sig += `${box.min.x.toFixed(3)},${box.min.y.toFixed(3)},${box.min.z.toFixed(3)}|`
+                    + `${size.x.toFixed(3)},${size.y.toFixed(3)},${size.z.toFixed(3)}|`
+                    + `${res ? `${res.x},${res.y},${res.z}` : 'a'};`;
             }
             if (sig === probeVolumeSig) return;
             probeVolumeSig = sig;
@@ -7494,10 +7711,12 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         }
         function setProbeHelpersVisible(v) {
             probeHelpersVisible = !!v;
+            haloGiSettings.showProbes = probeHelpersVisible;
             if (!probeHelpersVisible) { if (probeHelperMesh) probeHelperMesh.visible = false; }
             else updateProbeHelpers();
             const cb = document.getElementById('fx-gi-show-probes');
             if (cb && cb.checked !== probeHelpersVisible) cb.checked = probeHelpersVisible;
+            window.__maxjsSyncGiPanel?.();
         }
         window.maxjsHaloGIShowProbes = setProbeHelpersVisible;
 
@@ -7816,7 +8035,8 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     attachSkinAttributes(geom, nd, buffer);
                 } else if (geom && nd.groups) {
                     // Geometry unchanged, but keep groups/material indexing synced.
-                    applyGeometryGroups(geom, nd.groups);
+                    // Never rewrites groups on a geometry other meshes share.
+                    geom = syncGeometryGroupsForNode(mesh, geom, nd.groups);
                 }
 
                 // Cache geometry for instance sharing (always, not just when new geo arrives)
@@ -7851,7 +8071,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                             mesh.userData.maxjsMaterialSignature = null;
                         }
                     }
-                    if (ensureSceneRenderableMaterial(mesh, nd, wantsLine)) {
+                    if (ensureSceneRenderableMaterial(mesh, nd, wantsLine, { authoritativeMaterial: true })) {
                         sceneChanged = true;
                         layerManager.applyMaterialOverrides?.(nd.h, mesh);
                     }
@@ -8261,7 +8481,10 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 if (!isCachedMaterialTemplate(oldMaterial)) disposeSceneMaterial(oldMaterial);
                 return true;
             };
-            if (rebuildForBlackSpecularRoute()) return;
+            if (rebuildForBlackSpecularRoute()) {
+                if (mesh.userData) mesh.userData.maxjsMaterialSignature = null;
+                return;
+            }
 
             const c = material?.color;
             const emissive = material?.emissive;
@@ -8367,6 +8590,11 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 }
                 if (materialNeedsUpdate) m.needsUpdate = true;
             }
+            // The in-place mutation desyncs the live material from the signature
+            // stamped at build time. Drop the stamp so the next full sync always
+            // rebuilds — a stale signature could match a reverted/reassigned
+            // material payload and leave the mutated look stuck until reload.
+            if (mesh.userData) mesh.userData.maxjsMaterialSignature = null;
         }
 
         // ── Lights Sync ──────────────────────────────────────
@@ -13641,6 +13869,8 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     filmHalationRadius: 1.5,
                     filmPrintExposure: 0,
                     filmPrintWarmth: 0,
+                    filmHighlightBurn: 0.7,
+                    filmHueRestore: 0.2,
                     filmWeave: 0.4,
                     filmFlicker: 0.12,
                     filmNegative: false,
@@ -13656,8 +13886,12 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     irHotspot: 0.055,
                     freezeNoise: false,
                     ...(state.powershot || {}),
+                    // A save written in spectral can carry mode:'infrared';
+                    // standard mode must never surface white phosphor.
+                    ...(!isStudioMode && state.powershot?.mode === 'infrared' ? { mode: 'digital' } : {}),
                 }),
-                setValues: (patch) => maxjsFx.setPowerShotOptions(patch),
+                setValues: (patch) => maxjsFx.setPowerShotOptions(
+                    !isStudioMode && patch?.mode === 'infrared' ? { ...patch, mode: 'digital' } : patch),
                 controls: [
                     {
                         key: 'mode',
@@ -13667,7 +13901,8 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                             { value: 'digital', label: 'Digital CCD' },
                             { value: 'analog', label: 'Analog VHS' },
                             { value: 'film', label: 'Film Print' },
-                            { value: 'infrared', label: 'White Phosphor' },
+                            // NIR white phosphor reads spectral flux — spectral-only.
+                            ...(isStudioMode ? [{ value: 'infrared', label: 'White Phosphor' }] : []),
                         ],
                     },
                     {
@@ -13712,6 +13947,8 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     { key: 'filmHalationRadius', label: 'Halation Radius', min: 0.5, max: 3, step: 0.05, realtime: true, visibleWhen: isPowerShotFilmMode },
                     { key: 'filmPrintExposure', label: 'Print Exposure', min: -1, max: 1, step: 0.01, realtime: true, visibleWhen: isPowerShotFilmMode },
                     { key: 'filmPrintWarmth', label: 'Print Warmth', min: -1, max: 1, step: 0.01, realtime: true, visibleWhen: isPowerShotFilmMode },
+                    { key: 'filmHighlightBurn', label: 'Highlight Burn', min: 0, max: 1, step: 0.01, realtime: true, visibleWhen: isPowerShotFilmMode },
+                    { key: 'filmHueRestore', label: 'Hue Restore', min: 0, max: 1, step: 0.01, realtime: true, visibleWhen: isPowerShotFilmMode },
                     { key: 'filmWeave', label: 'Gate Weave', min: 0, max: 2, step: 0.01, realtime: true, visibleWhen: isPowerShotFilmMode },
                     { key: 'filmFlicker', label: 'Flicker', min: 0, max: 1, step: 0.01, realtime: true, visibleWhen: isPowerShotFilmMode },
                     { key: 'filmNegative', label: 'Show Negative', type: 'checkbox', visibleWhen: isPowerShotFilmMode },
@@ -14245,19 +14482,28 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     <section class="fx-section collapsed" data-fx-section="halogi" data-keep-on-shader-lab>
                         <div class="fx-section-header">
                             <div class="fx-section-title">Global Illumination</div>
-                            <button class="fx-toggle" id="fx-gi-toggle" type="button">Off</button>
+                            <div style="display:flex;align-items:center;gap:6px">
+                                <button class="fx-toggle" id="fx-gi-reset" type="button">Reset</button>
+                                <button class="fx-toggle" id="fx-gi-toggle" type="button">Off</button>
+                            </div>
                         </div>
                         <div class="fx-note" style="margin:0;padding:2px 0;color:#666;font-size:9px">BVH-traced indirect bounce (HALO-GI). WebGPU, any render mode.</div>
                         <div class="fx-grid">
-                            <label class="fx-control" for="fx-gi-intensity">
-                                <div class="fx-control-head"><span>Intensity</span><span class="fx-value" id="fx-gi-intensity-val">1.5</span></div>
-                                <input class="fx-range" id="fx-gi-intensity" type="range" min="0" max="6" step="0.1" value="1.5">
+                            ${HALO_GI_NUMERIC_CONTROLS.map(control => `
+                            <label class="fx-control" for="fx-gi-${control.key}">
+                                <div class="fx-control-head"><span>${control.label}</span><span class="fx-value" id="fx-gi-${control.key}-val">${formatHaloGiValue(control.key)}</span></div>
+                                <input class="fx-range" id="fx-gi-${control.key}" type="range" min="${control.min}" max="${control.max}" step="${control.step}" value="${haloGiSettings[control.key]}">
+                            </label>`).join('')}
+                            <label class="fx-control" for="fx-gi-cascades">
+                                <div class="fx-control-head"><span>Cascades</span></div>
+                                <select id="fx-gi-cascades" style="background:rgba(255,255,255,0.05);color:#aaa;border:1px solid rgba(255,255,255,0.08);border-radius:0;padding:3px 6px;font:10px 'Segoe UI',system-ui,sans-serif;width:100%;outline:none;cursor:pointer">
+                                    <option value="1" ${haloGiSettings.cascades === 1 ? 'selected' : ''}>Single grid</option>
+                                    <option value="2" ${haloGiSettings.cascades === 2 ? 'selected' : ''}>Cascaded (2)</option>
+                                </select>
                             </label>
-                            <label class="fx-control" for="fx-gi-smoothness">
-                                <div class="fx-control-head"><span>Smoothness</span><span class="fx-value" id="fx-gi-smoothness-val">0.50</span></div>
-                                <input class="fx-range" id="fx-gi-smoothness" type="range" min="0" max="1" step="0.05" value="0.5">
-                            </label>
-                            <label class="fx-check" for="fx-gi-show-probes" title="Diagnostics: show the probe field as a grid of spheres in the viewport."><span>Show probes</span><input id="fx-gi-show-probes" type="checkbox"></label>
+                            <label class="fx-check" for="fx-gi-continuous"><span>Continuous solve</span><input id="fx-gi-continuous" type="checkbox" ${haloGiSettings.continuous ? 'checked' : ''}></label>
+                            <label class="fx-check" for="fx-gi-hyst-norm"><span>Normalize hysteresis</span><input id="fx-gi-hyst-norm" type="checkbox" ${haloGiSettings.hysteresisNormalize ? 'checked' : ''}></label>
+                            <label class="fx-check" for="fx-gi-show-probes" title="Diagnostics: show the probe field as a grid of spheres in the viewport."><span>Show probes</span><input id="fx-gi-show-probes" type="checkbox" ${haloGiSettings.showProbes ? 'checked' : ''}></label>
                         </div>
                     </section>
                     ${sectionsHtml}
@@ -14666,10 +14912,12 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             // HALO-GI controls (window.maxjsHaloGI exists only in Studio + WebGPU)
             {
                 const giToggle = document.getElementById('fx-gi-toggle');
-                const giInt = document.getElementById('fx-gi-intensity');
-                const giIntVal = document.getElementById('fx-gi-intensity-val');
-                const giSmooth = document.getElementById('fx-gi-smoothness');
-                const giSmoothVal = document.getElementById('fx-gi-smoothness-val');
+                const giReset = document.getElementById('fx-gi-reset');
+                const giCascades = document.getElementById('fx-gi-cascades');
+                const giContinuous = document.getElementById('fx-gi-continuous');
+                const giHystNorm = document.getElementById('fx-gi-hyst-norm');
+                const giShowProbes = document.getElementById('fx-gi-show-probes');
+                const canSyncGiInput = (input) => !!input && document.activeElement !== input;
                 const syncGiPanel = () => {
                     const gi = window.maxjsHaloGI;
                     const on = !!(gi && gi.isOn && gi.isOn());
@@ -14678,36 +14926,59 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                         giToggle.classList.toggle('active', on);
                         giToggle.disabled = !gi;
                     }
-                    // Mirror the live field state into the controls so a GI that was restored /
-                    // auto-enabled after reload (e.g. a persisted Probe Grid re-syncing) shows the
-                    // real toggle + intensity instead of the static HTML defaults — the "checkbox
-                    // says off while settings persisted" bug.
-                    const node = gi?.field?.node;
-                    if (giInt && Number.isFinite(node?.intensityNode?.value)) {
-                        giInt.value = String(node.intensityNode.value);
-                        if (giIntVal) giIntVal.textContent = Number(node.intensityNode.value).toFixed(1);
+                    if (giReset) giReset.disabled = !gi;
+                    for (const control of HALO_GI_NUMERIC_CONTROLS) {
+                        const input = document.getElementById(`fx-gi-${control.key}`);
+                        const val = document.getElementById(`fx-gi-${control.key}-val`);
+                        const value = haloGiSettings[control.key];
+                        if (input) {
+                            input.disabled = !gi;
+                            if (canSyncGiInput(input)) input.value = String(value);
+                        }
+                        if (val) val.textContent = formatHaloGiValue(control.key, value);
+                    }
+                    if (giCascades) {
+                        giCascades.disabled = !gi;
+                        if (canSyncGiInput(giCascades)) giCascades.value = String(haloGiSettings.cascades);
+                    }
+                    if (giContinuous) {
+                        giContinuous.disabled = !gi;
+                        if (canSyncGiInput(giContinuous)) giContinuous.checked = !!haloGiSettings.continuous;
+                    }
+                    if (giHystNorm) {
+                        giHystNorm.disabled = !gi;
+                        if (canSyncGiInput(giHystNorm)) giHystNorm.checked = !!haloGiSettings.hysteresisNormalize;
+                    }
+                    if (giShowProbes) {
+                        giShowProbes.disabled = !gi;
+                        if (canSyncGiInput(giShowProbes)) giShowProbes.checked = !!haloGiSettings.showProbes;
                     }
                 };
                 window.__maxjsSyncGiPanel = syncGiPanel;
+                if (giReset) giReset.onclick = () => resetHaloGiToDefaults({ persist: true });
                 if (giToggle) giToggle.onclick = () => {
                     const gi = window.maxjsHaloGI;
                     if (!gi) return;
-                    if (gi.isOn && gi.isOn()) gi.disable();
-                    else { gi.enable(); gi.setIntensity(parseFloat(giInt?.value) || 1.5); gi.setSmoothness?.(parseFloat(giSmooth?.value)); }
+                    setHaloGiSetting('enabled', !(gi.isOn && gi.isOn()), { persist: true });
                     syncGiPanel();
                 };
-                if (giInt) giInt.oninput = () => {
-                    const v = parseFloat(giInt.value);
-                    if (giIntVal) giIntVal.textContent = v.toFixed(1);
-                    window.maxjsHaloGI?.setIntensity?.(v);
-                };
-                if (giSmooth) giSmooth.oninput = () => {
-                    const v = parseFloat(giSmooth.value);
-                    if (giSmoothVal) giSmoothVal.textContent = v.toFixed(2);
-                    window.maxjsHaloGI?.setSmoothness?.(v);
-                };
-                const giShowProbes = document.getElementById('fx-gi-show-probes');
-                if (giShowProbes) giShowProbes.onchange = () => setProbeHelpersVisible(giShowProbes.checked);
+                for (const control of HALO_GI_NUMERIC_CONTROLS) {
+                    const input = document.getElementById(`fx-gi-${control.key}`);
+                    const val = document.getElementById(`fx-gi-${control.key}-val`);
+                    if (!input) continue;
+                    const apply = (persist = false) => {
+                        const v = clampHaloGiNumber(control.key, input.value);
+                        input.value = String(v);
+                        if (val) val.textContent = formatHaloGiValue(control.key, v);
+                        setHaloGiSetting(control.key, v, { persist });
+                    };
+                    input.oninput = () => apply(false);
+                    input.onchange = () => apply(true);
+                }
+                if (giCascades) giCascades.onchange = () => setHaloGiSetting('cascades', giCascades.value, { persist: true });
+                if (giContinuous) giContinuous.onchange = () => setHaloGiSetting('continuous', giContinuous.checked, { persist: true });
+                if (giHystNorm) giHystNorm.onchange = () => setHaloGiSetting('hysteresisNormalize', giHystNorm.checked, { persist: true });
+                if (giShowProbes) giShowProbes.onchange = () => setHaloGiSetting('showProbes', giShowProbes.checked, { persist: true });
                 syncGiPanel();
             }
 
@@ -15146,6 +15417,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     enabled: authoredEnvironmentActive ? false : localHdriEnabled,
                     fileName: !authoredEnvironmentActive && isLocalHdriLoaded() ? localHdriFileName : '',
                 },
+                haloGi: serializeHaloGiState(),
                 performance: {
                     fpsCap: performanceSettings.fpsCap,
                     renderScale: performanceSettings.renderScale,
@@ -15285,6 +15557,9 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     cameraClip.near = Number.isFinite(saved.cameraClip.near) && saved.cameraClip.near > 0 ? saved.cameraClip.near : null;
                     cameraClip.far = Number.isFinite(saved.cameraClip.far) && saved.cameraClip.far > 0 ? saved.cameraClip.far : null;
                     applyCameraClipOverrides(camera);
+                }
+                if (saved.haloGi && typeof saved.haloGi === 'object') {
+                    applyHaloGiState(saved.haloGi);
                 }
                 if (saved.performance) {
                     if (Number.isFinite(saved.performance.fpsCap)) {
@@ -15936,15 +16211,17 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             if (!renderToImageActive) {
                 updateGiVolumeIdleWork();
                 syncGiVolumeActive();
-                // HALO-GI probe field tick — own ~30 Hz throttle, no-op unless
-                // opted in (window.maxjsHaloGI.enable()); never recompiles materials.
-                // Track viewport interaction so the field can hold its synchronous
-                // rebuild + GPU solve until the camera/sync settle (freeze-proof).
+                // HALO-GI probe field tick — every frame (the field idle-gates and
+                // budget-throttles itself); no-op unless enabled; never recompiles
+                // materials. ONLY camera movement marks interaction — matching the
+                // speedball standalone. Delta-sync must NOT mark it: Max edits
+                // stream serials at 30-60 Hz, which starved the 200 ms idle gate
+                // and deferred every light/geo pickup until the drag ended
+                // ("delayed" GI). The field handles live edits itself — cheap
+                // in-place light refresh + settle-debounced geometry rebuild
+                // (24-tick checks × 2 stable) that can never land mid-drag.
                 const haloNowMs = performance.now();
-                if (controlsChanged || latestAppliedSyncSerial !== haloGiLastSyncSerial) {
-                    haloGiLastSyncSerial = latestAppliedSyncSerial;
-                    haloGiLastInteractionMs = haloNowMs;
-                }
+                if (controlsChanged) haloGiLastInteractionMs = haloNowMs;
                 haloGi?.tick(haloNowMs);
                 updateProbeHelpers();
             }

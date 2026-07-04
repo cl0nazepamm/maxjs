@@ -92,6 +92,8 @@ export function createMaxJSFxController({
         filmHalationRadius: 1.5,
         filmPrintExposure: 0,
         filmPrintWarmth: 0,
+        filmHighlightBurn: 0.7,
+        filmHueRestore: 0.2,
         filmWeave: 0.4,
         filmFlicker: 0.12,
         filmNegative: false,

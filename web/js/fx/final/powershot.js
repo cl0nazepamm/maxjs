@@ -202,6 +202,8 @@ export function createPowerShotFinal({
         p.filmHalationRadius = THREE.MathUtils.clamp(finiteOr(p.filmHalationRadius, 1.5), 0.5, 3);
         p.filmPrintExposure = THREE.MathUtils.clamp(finiteOr(p.filmPrintExposure, 0), -1, 1);
         p.filmPrintWarmth = THREE.MathUtils.clamp(finiteOr(p.filmPrintWarmth, 0), -1, 1);
+        p.filmHighlightBurn = THREE.MathUtils.clamp(finiteOr(p.filmHighlightBurn, 0.7), 0, 1);
+        p.filmHueRestore = THREE.MathUtils.clamp(finiteOr(p.filmHueRestore, 0.2), 0, 1);
         p.filmWeave = THREE.MathUtils.clamp(finiteOr(p.filmWeave, 0.4), 0, 2);
         p.filmFlicker = THREE.MathUtils.clamp(finiteOr(p.filmFlicker, 0.12), 0, 1);
         p.filmNegative = !!p.filmNegative;
@@ -252,6 +254,8 @@ export function createPowerShotFinal({
         F.halRadius.value = p.filmHalationRadius;
         F.printExposure.value = p.filmPrintExposure * 0.301; // slider stops -> log10
         F.printWarmth.value = p.filmPrintWarmth;
+        F.highlightBurn.value = p.filmHighlightBurn;
+        F.hueRestore.value = p.filmHueRestore;
         F.weave.value = p.filmWeave;
         F.flicker.value = p.filmFlicker;
         F.negativeView.value = p.filmNegative ? 1 : 0;

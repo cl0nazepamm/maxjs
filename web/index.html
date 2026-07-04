@@ -167,8 +167,8 @@
                     <span class="vpmenu-label">Mode</span>
                     <div id="renderModeSwitch" class="rail-mode-switch" role="group" aria-label="Render mode">
                         <button class="rail-mode-option" type="button" data-render-mode="standard" title="Standard render mode">STD</button>
-                        <button class="rail-mode-option" type="button" data-render-mode="studio" title="Advanced render mode">ADV</button>
-                        <button class="rail-mode-option" type="button" data-render-mode="pathtracing" title="Pathtracing render mode">PT</button>
+                        <button class="rail-mode-option" type="button" data-render-mode="spectral" title="Spectral render mode">SPC</button>
+                        <button class="rail-mode-option" type="button" id="btnSpectralTrace" title="Path-traced view (spectral mode)">PT</button>
                     </div>
                 </div>
                 <div class="vpmenu-row devonly" data-vpmenu-close>
@@ -178,13 +178,13 @@
                     <span class="vpmenu-label">Enter VR</span>
                 </div>
                 <div class="vpmenu-sep devonly"></div>
-                <div class="vpmenu-row devonly">
+                <div class="vpmenu-row devonly" style="display:none"><!-- parked: re-enable via STUDIO_ONLY_RAIL_IDS -->
                     <button id="btnLightLink" class="rail-btn" title="Light Linking" aria-label="Light Linking">
                         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6.5 8.5a2.5 2.5 0 0 0 3.5 0l2.5-2.5a2.5 2.5 0 0 0-3.5-3.5L8 3.5"/><path d="M9.5 7.5a2.5 2.5 0 0 0-3.5 0L3.5 10a2.5 2.5 0 0 0 3.5 3.5L8 12.5"/></svg>
                     </button>
                     <span class="vpmenu-label">Light Linking</span>
                 </div>
-                <div class="vpmenu-row devonly">
+                <div class="vpmenu-row devonly" style="display:none"><!-- parked: re-enable via STUDIO_ONLY_RAIL_IDS -->
                     <button id="btnReflPaint" class="rail-btn" title="Reflection Paint" aria-label="Reflection Paint">
                         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 7-5 5a2 2 0 0 1-3-3l5-5"/><path d="m14 2-5 5M12 4l2 2"/></svg>
                     </button>
@@ -972,7 +972,10 @@
 
         const RENDERER_BACKEND_STORAGE_KEY = 'maxjs_renderer_backend_preference';
         const MAXJS_MODE_KEY = 'maxjs-render-mode';
-        const MAXJS_RENDER_MODES = ['standard', 'studio', 'pathtracing'];
+        // 'spectral' replaces the old 'studio' (Advanced) mode and absorbs the
+        // old top-level 'pathtracing' mode: the path tracer is now a live VIEW
+        // inside spectral mode (same spectral scene core as the probe GI).
+        const MAXJS_RENDER_MODES = ['standard', 'spectral'];
         const isHostedWebView = !!window.chrome?.webview?.postMessage;
         const pageParams = new URLSearchParams(window.location.search);
         const isProductionRenderPage = pageParams.has('productionRender');
@@ -981,7 +984,13 @@
         function readMaxjsRenderMode() {
             if (isProductionRenderPage) return 'standard';
             try {
-                const value = localStorage.getItem(MAXJS_MODE_KEY);
+                let value = localStorage.getItem(MAXJS_MODE_KEY);
+                // migrate legacy tokens: Advanced ('studio') and the old
+                // top-level 'pathtracing' mode both fold into 'spectral'.
+                if (value === 'studio' || value === 'pathtracing') {
+                    value = 'spectral';
+                    try { localStorage.setItem(MAXJS_MODE_KEY, value); } catch {}
+                }
                 return MAXJS_RENDER_MODES.includes(value) ? value : 'standard';
             } catch {
                 return 'standard';
@@ -989,8 +998,16 @@
         }
 
         const maxjsRenderMode = readMaxjsRenderMode();
-        const isStudioMode = maxjsRenderMode === 'studio';
-        const isPathTracingMode = maxjsRenderMode === 'pathtracing';
+        // internal flag name kept ('studio') — it gates every advanced feature
+        // and renaming hundreds of references buys nothing. UI label: Spectral.
+        const isStudioMode = maxjsRenderMode === 'spectral';
+        // Spectral view: 'probes' = live DDGI probe GI (default), 'trace' =
+        // the spectral path tracer. Live-switchable WITHOUT reload — both run
+        // on the same spectral scene core. setSpectralView() flips it.
+        const MAXJS_SPECTRAL_VIEW_KEY = 'maxjs-spectral-view';
+        let spectralView = 'probes';
+        try { if (localStorage.getItem(MAXJS_SPECTRAL_VIEW_KEY) === 'trace') spectralView = 'trace'; } catch {}
+        let isPathTracingMode = isStudioMode && spectralView === 'trace';
         document.body.classList.toggle('pathtracing-mode', isPathTracingMode);
 
         function normalizeRendererBackend(value) {
@@ -1104,7 +1121,10 @@
         //               This is live-viewer only and is not exported to snapshots.
         //
         // Mode is frozen before renderer init; switching requires reload.
-        const STUDIO_ONLY_RAIL_IDS = ['btnLightLink', 'btnReflPaint'];
+        // Light Linking + Reflection Paint are parked for now (disabled, not
+        // deleted): their rail rows are display:none in the HTML and no sync
+        // path re-shows them. Restore = re-add ids + drop the inline style.
+        const STUDIO_ONLY_RAIL_IDS = [];
 
         function setRailButtonMeta(button, { label, badge } = {}) {
             if (!button) return;
@@ -1270,7 +1290,10 @@
         if (isWebGpuBackend) {
             try {
                 const haloField = createHaloProbeField({ renderer, scene, intensity: 1.0, onRebuilt: markLightProbeMaterialsDirty });
-                let haloOn = window.MAXJS_HALO_GI === true;
+                // Spectral mode turns the probe field ON by default — it IS
+                // the live view; window.MAXJS_HALO_GI = false force-disables.
+                let haloOn = window.MAXJS_HALO_GI === true
+                    || (isStudioMode && window.MAXJS_HALO_GI !== false);
                 let haloLastTick = 0;
                 haloGi = {
                     field: haloField,
@@ -1757,7 +1780,7 @@
             renderer,
             scene,
             camera,
-            enabled: isPathTracingMode,
+            enabled: isStudioMode, // spectral mode: view toggles live via setSpectralView()
             settings: pathTracingSettings,
             onStatus(message) {
                 perfHud.setStatus(message);
@@ -1766,13 +1789,33 @@
                 reportBridgeError('pathtracing', error);
             },
         });
-        if (isPathTracingMode || String(rendererBackendLabel || '') === 'WebGL Mode') {
+        if (isStudioMode || String(rendererBackendLabel || '') === 'WebGL Mode') {
             pathTracingFx.preload?.();
         }
         const PATH_TRACING_RASTER_WARMUP_FRAMES = 2;
         const PATH_TRACING_TEXTURE_WAIT_MS = 3000;
         const PATH_TRACING_CAPTURE_DEFAULT_SAMPLES = 64;
         const PATH_TRACING_LIVE_REBUILD_DELAY_MS = 180;
+
+        // Live spectral-view switch: probe GI <-> path tracer, no reload.
+        // The probe ticker checks isPathTracingMode per tick and the render
+        // loop gates the PT branch on it, so flipping the flag is enough;
+        // entering trace view (re)starts the tracer and re-bakes the scene.
+        function setSpectralView(view) {
+            const next = view === 'trace' ? 'trace' : 'probes';
+            if (!isStudioMode || spectralView === next) return spectralView;
+            spectralView = next;
+            isPathTracingMode = next === 'trace';
+            document.body.classList.toggle('pathtracing-mode', isPathTracingMode);
+            try { localStorage.setItem(MAXJS_SPECTRAL_VIEW_KEY, next); } catch {}
+            if (isPathTracingMode) {
+                pathTracingFx.start?.();
+                pathTracingFx.markSceneDirty?.();
+            }
+            window.__maxjsSyncSpectralViewUi?.();
+            return spectralView;
+        }
+        window.maxjsSpectral = { getView: () => spectralView, setView: setSpectralView };
         let pathTracingRasterWarmupFrames = 0;
         let pathTracingWarmupStartedAt = 0;
         let pathTracingLiveRebuildTimer = 0;
@@ -12571,11 +12614,10 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
         const renderModeSwitch = document.getElementById('renderModeSwitch');
         const modeLabels = {
             standard: 'Standard',
-            studio: 'Advanced',
-            pathtracing: 'Pathtracing',
+            spectral: 'Spectral',
         };
         if (renderModeSwitch) {
-            renderModeSwitch.title = 'Render mode: Standard, Advanced, or live-only Pathtracing';
+            renderModeSwitch.title = 'Render mode: Standard, or Spectral (probe GI + live path tracer)';
             renderModeSwitch.querySelectorAll('[data-render-mode]').forEach(button => {
                 const mode = button.dataset.renderMode;
                 const active = mode === maxjsRenderMode;
@@ -12593,6 +12635,25 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 });
             });
         }
+
+        // Spectral sub-view toggle: probes <-> path tracer, live (no reload).
+        const spectralTraceButton = document.getElementById('btnSpectralTrace');
+        window.__maxjsSyncSpectralViewUi = () => {
+            if (!spectralTraceButton) return;
+            const webGL = typeof isWebGLPipelineActive === 'function' && isWebGLPipelineActive();
+            spectralTraceButton.style.display = (isStudioMode && !webGL) ? '' : 'none';
+            const active = isStudioMode && spectralView === 'trace';
+            spectralTraceButton.classList.toggle('active', active);
+            spectralTraceButton.setAttribute('aria-pressed', active ? 'true' : 'false');
+            spectralTraceButton.title = active
+                ? 'Path-traced view active — click for probe GI'
+                : 'Path-traced view (spectral mode)';
+        };
+        spectralTraceButton?.addEventListener('click', () => {
+            if (!isStudioMode) return;
+            setSpectralView(spectralView === 'trace' ? 'probes' : 'trace');
+        });
+        window.__maxjsSyncSpectralViewUi();
         syncRendererButtonUi();
 
         // Path-tracer pause toggle. Stops compute dispatch so the GPU goes idle
@@ -12636,17 +12697,17 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             setViewportMenuItemHidden(renderModeRow, false);
             renderModeSwitch?.querySelectorAll('[data-render-mode]').forEach(button => {
                 const mode = button.dataset.renderMode;
-                // Advanced and the WebGPU spectral path tracer both require the
-                // native WebGPU stack; hide them on the WebGL pipeline.
-                const hideForPipeline = webGLPipeline && (mode === 'studio' || mode === 'pathtracing');
+                // Spectral mode (probe GI + path tracer) requires the native
+                // WebGPU stack; hide it on the WebGL pipeline.
+                const hideForPipeline = webGLPipeline && mode === 'spectral';
                 setViewportMenuItemHidden(button, hideForPipeline);
                 const gated = hideForPipeline;
                 button.disabled = gated;
                 button.classList.toggle('is-gated', gated);
                 button.setAttribute('aria-disabled', gated ? 'true' : 'false');
                 button.title = `${modeLabels[mode] || mode} mode${mode === maxjsRenderMode ? ' active' : ''}`;
-                if (webGLPipeline && mode === 'pathtracing') {
-                    button.title = 'Pathtracing requires the native WebGPU pipeline';
+                if (webGLPipeline && mode === 'spectral') {
+                    button.title = 'Spectral mode requires the native WebGPU pipeline';
                 }
             });
 
@@ -12680,6 +12741,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 setLightLinkPanelVisible(false);
                 setReflPaintPanelVisible(false);
             }
+            window.__maxjsSyncSpectralViewUi?.();
         }
 
         function syncStudioOnlyUi() {
@@ -15808,7 +15870,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 renderToImageActive === true && !renderCaptureComposited);
             webappSystem?.setPunchPipelineActive?.(maxjsFx.isPipelineRenderActive?.() === true);
             try {
-                if (pathTracingFx.isEnabled?.() && (!renderToImageActive || pendingRenderToImage?.pathTracing)) {
+                if (isPathTracingMode && pathTracingFx.isEnabled?.() && (!renderToImageActive || pendingRenderToImage?.pathTracing)) {
                     // Pathtracing is a live-viewer-only renderer mode. The live
                     // frame routes through renderPathTracingLiveFrame() so the
                     // color-domain / stylized post FX fold over the PT beauty; PT

@@ -621,7 +621,7 @@ export function createFxCore({
      *  2. context-stage descriptors (slot order) build ctx.sceneContext
      *  3. scene pass (scenePass-stage descriptor or default pass) + MRT
      *  4. beauty fold in slot order, env-backdrop compensation spliced
-     *     between slots 50 and 60 (early) / before 130 (late fallback)
+     *     between slots 50 and 60 (early — before fog at 65) / >=130 fallback
      *  5. output node with coverage-derived beauty alpha
      *
      * The caller decides teardown-vs-build and owns error escalation; an
@@ -819,7 +819,8 @@ export function createFxCore({
                     if (useEnvironmentBackdropCompensation) applyBackdropCompensation();
                 }
                 // Late fallback preserves older paths where the early
-                // compensation could not run — must land before fog (slot 130).
+                // compensation could not run (fog now sits at slot 65, inside
+                // the early splice; only slot>=130 descriptors reach this).
                 if ((d.slot ?? 0) >= 130
                     && useEnvironmentBackdropCompensation
                     && !environmentBackdropCompensated) {

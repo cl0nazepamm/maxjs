@@ -5,7 +5,7 @@ import { bloom } from 'three/addons/tsl/display/BloomNode.js';
 export default {
     id: 'bloom',
     stage: 'beauty',
-    slot: 60,
+    slot: 95, // lens: bloom light that already traversed fog (65) / volumetrics (80)
     needs: [],
     defaults: {
         enabled: false,

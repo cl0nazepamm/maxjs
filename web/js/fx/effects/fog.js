@@ -6,7 +6,7 @@ import { float, vec3, vec4 } from 'three/tsl';
 export default {
     id: 'fog',
     stage: 'beauty',
-    slot: 130,
+    slot: 65, // atmosphere: after env compensation (>=60), before the lens (DOF/bloom)
     needs: [],
     defaults: {
         enabled: false,

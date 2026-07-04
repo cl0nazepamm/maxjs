@@ -165,6 +165,7 @@ export function createMaxJSFxController({
     const powerShotFinal = createPowerShotFinal({
         renderer,
         getOptions: () => state.powershot,
+        getColorGrading: () => state.colorGrading,
         getScaledPostFxSize: core.getScaledPostFxSize,
         supportsScreenSpaceEffects,
         isShaderLabEnabled,

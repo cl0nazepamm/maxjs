@@ -134,6 +134,7 @@ export function listPowerShotPresets() {
 /**
  * @param renderer                  WebGPURenderer
  * @param getOptions                () => state.powershot (live object; normalize mutates it in place, as before)
+ * @param getColorGrading          () => state.colorGrading | null — brightness rides the linear input as exposure, contrast lands in the ISP output grade
  * @param getScaledPostFxSize       core.getScaledPostFxSize
  * @param supportsScreenSpaceEffects backend capability flag
  * @param isShaderLabEnabled        Shader Lab wins the final-stylize slot
@@ -141,6 +142,7 @@ export function listPowerShotPresets() {
 export function createPowerShotFinal({
     renderer,
     getOptions,
+    getColorGrading = null,
     getScaledPostFxSize,
     supportsScreenSpaceEffects = false,
     isShaderLabEnabled = () => false,
@@ -408,8 +410,13 @@ export function createPowerShotFinal({
             : null;
 
         try {
-            renderer.toneMapping = previousToneMapping;
-            renderer.toneMappingExposure = previousExposure;
+            // The ISP is the IMAGER: it receives scene-linear radiance and
+            // owns the entire transfer curve (setInputEncoding('linear')
+            // below). Running the display tone map first would stack two
+            // response curves — a camera doesn't photograph a tone-mapped
+            // JPEG of the world.
+            renderer.toneMapping = THREE.NoToneMapping;
+            renderer.toneMappingExposure = 1.0;
             renderer.outputColorSpace = THREE.LinearSRGBColorSpace;
             renderer.setClearColor?.(0x000000, 0);
             renderer.setRenderTarget(target);
@@ -426,6 +433,16 @@ export function createPowerShotFinal({
 
         if (!getOptions().freezeNoise) powerShotFrame += 1;
         const pipeline = ensureActivePipeline();
+        pipeline.setInputEncoding?.('linear');
+        const grading = getColorGrading?.() || null;
+        if (grading && pipeline.ctx?.sceneExposure) {
+            // brightness rides the LINEAR input as photographic exposure
+            // (+/-3 stops); contrast lands in the ISP output grade. Both live
+            // in the GPU chain so captures match the screen — the old CSS
+            // canvas filter did neither.
+            pipeline.ctx.sceneExposure.value = 3 * (Number(grading.brightness) || 0);
+            pipeline.setOutputColorGrading?.({ contrast: Number(grading.contrast) || 0 });
+        }
         try {
             renderer.toneMapping = THREE.NoToneMapping;
             renderer.toneMappingExposure = 1.0;

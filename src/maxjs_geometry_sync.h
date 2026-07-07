@@ -715,8 +715,24 @@ static constexpr int kSkinnedHashSampleCount = 256;
 // threshold, the per-tick normal pass on very heavy meshes costs more than
 // frozen normals are worth during interaction.
 static constexpr int kMaxBinaryDeltaTriangles = 256000;
-static constexpr ULONGLONG kSkinnedLivePollIntervalMs = 16;
+// 11 ms ≈ 90 Hz for the geometry interaction lanes only (selected vertex
+// edits + skinned/deform polling). Camera stays at 16 ms — it was not part of
+// the 90 Hz ask. GetTickCount64 advances in ~15.6 ms clock-interrupt steps and
+// cannot gate sub-16 ms intervals — the gates that use these constants must
+// read MaxJSLivePollNowMs() below, never GetTickCount64().
+static constexpr ULONGLONG kSkinnedLivePollIntervalMs = 11;
 static constexpr ULONGLONG kCameraLivePollIntervalMs = 16;
+
+static inline ULONGLONG MaxJSLivePollNowMs() {
+    static const ULONGLONG freq = [] {
+        LARGE_INTEGER f{};
+        QueryPerformanceFrequency(&f);
+        return static_cast<ULONGLONG>(f.QuadPart ? f.QuadPart : 1);
+    }();
+    LARGE_INTEGER c{};
+    QueryPerformanceCounter(&c);
+    return static_cast<ULONGLONG>(c.QuadPart) * 1000ull / freq;
+}
 
 static uint64_t HashSampledPoint3Array(const Point3* points,
                                        int count,

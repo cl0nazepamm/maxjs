@@ -287,7 +287,7 @@
             lastDeformLivePollTime_ == t) {
             return;
         }
-        const ULONGLONG now = GetTickCount64();
+        const ULONGLONG now = MaxJSLivePollNowMs();
         if (!forceForCurrentTime &&
             lastSkinnedLivePollTick_ != 0 &&
             (now - lastSkinnedLivePollTick_) < kSkinnedLivePollIntervalMs) {
@@ -1421,7 +1421,7 @@
     }
 
     bool ConsumeRedrawLivePollSlot() {
-        const ULONGLONG now = GetTickCount64();
+        const ULONGLONG now = MaxJSLivePollNowMs();
         if (lastRedrawLivePollTick_ != 0 &&
             (now - lastRedrawLivePollTick_) < kSkinnedLivePollIntervalMs) {
             return false;
@@ -2016,7 +2016,7 @@
 
     void MarkCameraDirtyIfChanged(bool respectThrottle = true) {
         if (fastCameraDirty_ && fastFlushPosted_) return;
-        const ULONGLONG now = GetTickCount64();
+        const ULONGLONG now = MaxJSLivePollNowMs();
         if (respectThrottle &&
             lastCameraLivePollTick_ != 0 &&
             (now - lastCameraLivePollTick_) < kCameraLivePollIntervalMs) {

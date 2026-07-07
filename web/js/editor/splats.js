@@ -188,13 +188,31 @@ function createSplatsSystem(deps = {}) {
             });
         }
 
+    // Binary xform fast path (delta sync): apply a transform to a tracked
+    // splat. Returns true when a splat with that handle exists and was updated.
+    function applyTrackedSplatTransform(handle, matrix, visible) {
+        const entry = splatHandleMap.get(handle);
+        if (!entry?.mesh) return false;
+        applySplatTransform(entry.mesh, { t: matrix, v: visible ? 1 : 0 });
+        return true;
+    }
+
+    // Abandon queued mutations so a shutdown doesn't wait behind pending loads
+    // (splats-disabled toggle / restored settings path).
+    function resetMutationQueue() {
+        splatMutationQueue = Promise.resolve();
+    }
+
     return {
         splatsViewerEnabled,
         shutdownSplatViewer,
         updateSplatCamera,
         reconcileSplats,
         applySplatUpdates,
+        applyTrackedSplatTransform,
+        resetMutationQueue,
         get overlay() { return splatOverlay; },
+        get count() { return splatHandleMap.size; },
     };
 }
 

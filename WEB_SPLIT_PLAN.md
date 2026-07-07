@@ -29,6 +29,14 @@ Extraction lessons so far (apply to every future wave):
 - Mutable boot bindings passed to factories MUST be getter properties on the
   deps object (`get camera()`), TDZ-late ones (reportBridgeError) closures.
   Stable-after-init bindings (renderer, rendererBackendLabel) pass by value.
+- After each extraction, grep boot for EVERY identifier the new module
+  declares. A moved-symbol leak is a dormant ReferenceError the smoke can't
+  reach (guarded branches: splat xform / queue reset / loop guards leaked in
+  Wave 2a, fixed same day by widening the splats API).
+- The browser smoke MUST run in an isolated browser. The playwright/devtools
+  MCPs attach to the LIVE Max panel's WebView2 when Max runs with
+  MAXJS_DEBUG_PORT — navigating it hijacks the user's viewer. Real-host
+  detection: chrome.webview.postMessage is [native code] + hostObjects exists.
 
 Line numbers below refer to the pre-split tree (~17,000 lines); they have
 drifted — anchor on function names, not line numbers.

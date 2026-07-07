@@ -7499,9 +7499,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     pathTraceSceneChanged = true;
                 },
                 onSplat(handle, matrix, visible) {
-                    const entry = splatHandleMap.get(handle);
-                    if (!entry?.mesh) return;
-                    applySplatTransform(entry.mesh, { t: matrix, v: visible ? 1 : 0 });
+                    if (!splatsSystem.applyTrackedSplatTransform(handle, matrix, visible)) return;
                     pathTraceSceneChanged = true;
                 },
                 onAudio(handle, matrix, visible) {
@@ -14130,7 +14128,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 splatsEnabledCheck.onchange = () => {
                     performanceSettings.splatsEnabled = splatsEnabledCheck.checked;
                     if (!performanceSettings.splatsEnabled) {
-                        splatMutationQueue = Promise.resolve();
+                        splatsSystem.resetMutationQueue();
                         void shutdownSplatViewer().then(() => {
                             savePostFxState();
                             syncPostFxPanel(true);
@@ -14915,7 +14913,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                     if (typeof saved.performance.splatsEnabled === 'boolean') {
                         performanceSettings.splatsEnabled = saved.performance.splatsEnabled;
                         if (!performanceSettings.splatsEnabled) {
-                            splatMutationQueue = Promise.resolve();
+                            splatsSystem.resetMutationQueue();
                             void shutdownSplatViewer();
                         }
                     }
@@ -15283,7 +15281,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             } else if (blobOverlayCtx) {
                 blobOverlayCtx.clearRect(0, 0, blobOverlayCvs.width, blobOverlayCvs.height);
             }
-            if (splatsSystem.overlay && splatHandleMap.size > 0) {
+            if (splatsSystem.overlay && splatsSystem.count > 0) {
                 updateSplatCamera();
                 splatsSystem.overlay.renderer.render(splatsSystem.overlay.scene, splatsSystem.overlay.camera);
             }
@@ -15648,7 +15646,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             } catch (error) {
                 reportBridgeError('runtime error', error);
             }
-            if (splatsSystem.overlay && splatHandleMap.size > 0) {
+            if (splatsSystem.overlay && splatsSystem.count > 0) {
                 updateSplatCamera();
                 splatsSystem.overlay.renderer.render(splatsSystem.overlay.scene, splatsSystem.overlay.camera);
             }

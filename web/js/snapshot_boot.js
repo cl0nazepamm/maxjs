@@ -602,9 +602,9 @@ async function createSnapshotHaloGi({ renderer, scene, snapshotUi } = {}) {
     let previousCreateNode = null;
     let installedCreateNode = null;
     try {
-        const { createProbeField } = await import('./gi_probes.js');
+        const { createProbeField } = await import('speedball-gi');
         if (swapLightingNode) {
-            const { giLights } = await import('./gi_lights_node.js');
+            const { giLights } = await import('speedball-gi');
             previousCreateNode = renderer.lighting.createNode;
             const lightOptions = {
                 maxDirectionalLights: 16,

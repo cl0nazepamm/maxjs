@@ -6,10 +6,10 @@
 // the final pass. Snapshots dynamic-import this module only when
 // runtimeFeatures.post_fx lists 'powershot'.
 import * as THREE from 'three';
-import { Pipeline as PowerShotPipeline, applyPreset as applyPowerShotPreset, STAGE_DEFS as POWERSHOT_STAGE_DEFS } from '../../powershot_pipeline.js';
-import { PRESETS as POWERSHOT_PRESETS, PRESET_KEYS as POWERSHOT_PRESET_KEYS } from '../../powershot_presets.js';
-import { FilmPipeline as PowerShotFilmPipeline, applyFilmPreset as applyPowerShotFilmPreset, FILM_PRESETS as POWERSHOT_FILM_PRESETS, FILM_PRESET_KEYS as POWERSHOT_FILM_PRESET_KEYS } from '../../powershot_film.js';
-import { InfraredPipeline as PowerShotInfraredPipeline, applyInfraredPreset as applyPowerShotInfraredPreset, INFRARED_PRESETS as POWERSHOT_INFRARED_PRESETS, INFRARED_PRESET_KEYS as POWERSHOT_INFRARED_PRESET_KEYS } from '../../powershot_infrared.js';
+import { Pipeline as PowerShotPipeline, applyPreset as applyPowerShotPreset, STAGE_DEFS as POWERSHOT_STAGE_DEFS } from 'powershot-threejs/pipeline';
+import { PRESETS as POWERSHOT_PRESETS, PRESET_KEYS as POWERSHOT_PRESET_KEYS } from 'powershot-threejs/presets';
+import { FilmPipeline as PowerShotFilmPipeline, applyFilmPreset as applyPowerShotFilmPreset, FILM_PRESETS as POWERSHOT_FILM_PRESETS, FILM_PRESET_KEYS as POWERSHOT_FILM_PRESET_KEYS } from 'powershot-threejs/film';
+import { InfraredPipeline as PowerShotInfraredPipeline, applyInfraredPreset as applyPowerShotInfraredPreset, INFRARED_PRESETS as POWERSHOT_INFRARED_PRESETS, INFRARED_PRESET_KEYS as POWERSHOT_INFRARED_PRESET_KEYS } from 'powershot-threejs/infrared';
 
 function finiteOr(value, fallback) {
     return Number.isFinite(value) ? value : fallback;

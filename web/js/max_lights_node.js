@@ -24,8 +24,7 @@ import HemisphereLightDataNode from 'three/addons/tsl/lighting/data/HemisphereLi
 import AmbientLightDataNode from 'three/addons/tsl/lighting/data/AmbientLightDataNode.js';
 import { NodeUtils } from 'three/webgpu';
 import { getReflectionPaintNode } from './reflection_paint.js';
-import { getGiVolumeNode } from './gi_irradiance_volume.js';
-import { getGiProbeNode } from './gi_probes.js';
+import { getGiVolumeNode, getGiProbeNode } from 'speedball-gi';
 import {
     If, Loop, getDistanceAttenuation, mix, normalWorld, positionView, renderGroup,
     select, smoothstep, uniformArray, vec3, uint, int, float,

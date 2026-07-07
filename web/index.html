@@ -356,6 +356,13 @@
             "three/addons/": "./vendor/three-r185/examples/",
             "three/examples/jsm/": "./vendor/three-r185/examples/",
             "three-mesh-bvh": "./node_modules/three-mesh-bvh/src/index.js",
+            "speedball-gi": "https://cdn.jsdelivr.net/npm/speedball-gi@0.5.0/js/index.js",
+            "speedball-gi/spectral-tracer": "https://cdn.jsdelivr.net/npm/speedball-gi@0.5.0/js/spectral_tracer.js",
+            "speedball-gi/caustics": "https://cdn.jsdelivr.net/npm/speedball-gi@0.5.0/js/caustic_engine.js",
+            "powershot-threejs/pipeline": "https://cdn.jsdelivr.net/npm/powershot-threejs@0.5.1/src/pipeline.js",
+            "powershot-threejs/presets": "https://cdn.jsdelivr.net/npm/powershot-threejs@0.5.1/src/presets.js",
+            "powershot-threejs/film": "https://cdn.jsdelivr.net/npm/powershot-threejs@0.5.1/src/film.js",
+            "powershot-threejs/infrared": "https://cdn.jsdelivr.net/npm/powershot-threejs@0.5.1/src/infrared.js",
             "xatlas-web": "./node_modules/xatlas-web/dist/xatlas-web.js",
             "@sparkjsdev/spark": "./node_modules/@sparkjsdev/spark/dist/spark.module.js",
             "@takram/three-atmosphere": "./node_modules/@takram/three-atmosphere/build/index.js",
@@ -468,9 +475,7 @@
             LIGHT_MASK_LO_KEY,
             LIGHT_MASK_HI_KEY,
         } from './js/max_lights_node.js';
-        import { createIrradianceVolume } from './js/gi_irradiance_volume.js';
-        import { createProbeField as createHaloProbeField } from './js/gi_probes.js';
-        import { giLights } from './js/gi_lights_node.js';
+        import { createIrradianceVolume, createProbeField as createHaloProbeField, giLights } from 'speedball-gi';
         // Spark.js uses GLSL3/ShaderChunk — needs WebGL THREE build (scoped in importmap).
         // Lazy-import to avoid crashing on page load.
         let Spark = null;
@@ -609,7 +614,7 @@
         import { createPerfHud } from './js/perf_hud.js';
         import { createMaxJSFxController } from './js/maxjs_fx.js';
         import { createWebGLBasicFx } from './js/webgl_basicfx.js';
-        import { createSpectralTracer } from './js/spectral_tracer.js';
+        import { createSpectralTracer } from 'speedball-gi/spectral-tracer';
         import { createLayerManager } from './js/layer_manager.js';
         import { MAXJS_LAYER_SSR_EXCLUDE } from './js/render_layers.js';
         import { createGeospatialSkyController } from './js/geospatial_sky.js';
@@ -1946,10 +1951,21 @@
         const PATH_TRACING_CAPTURE_DEFAULT_SAMPLES = 64;
         const PATH_TRACING_LIVE_REBUILD_DELAY_MS = 180;
 
+        function isPathTracingViewActive() {
+            return isPathTracingMode && pathTracingFx.isEnabled?.() === true;
+        }
+
+        function leavePathTracingView() {
+            clearScheduledPathTracingLiveRebuild();
+            pathTracingFx.setToneMapInBlit?.(true);
+            maxjsFx.setPathTracedSource?.(null);
+        }
+
         // Live spectral-view switch: probe GI <-> path tracer, no reload.
         // The probe ticker checks isPathTracingMode per tick and the render
-        // loop gates the PT branch on it, so flipping the flag is enough;
-        // entering trace view (re)starts the tracer and re-bakes the scene.
+        // loop gates the PT branch on it. Leaving trace view must also clear
+        // the post stack's PT source, otherwise regular spectral/probe frames
+        // keep presenting the last path-traced texture.
         function setSpectralView(view) {
             const next = view === 'trace' ? 'trace' : 'probes';
             if (!isStudioMode || spectralView === next) return spectralView;
@@ -1959,9 +1975,12 @@
             try { localStorage.setItem(MAXJS_SPECTRAL_VIEW_KEY, next); } catch {}
             if (isPathTracingMode) {
                 pathTracingFx.start?.();
-                pathTracingFx.markSceneDirty?.();
+                resetPathTracingStartupWarmup();
+            } else {
+                leavePathTracingView();
             }
             window.__maxjsSyncSpectralViewUi?.();
+            if (window.chrome?.webview) sendPathTracingRuntimeState();
             return spectralView;
         }
         window.maxjsSpectral = { getView: () => spectralView, setView: setSpectralView };
@@ -16176,7 +16195,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
                 renderToImageActive === true && !renderCaptureComposited);
             webappSystem?.setPunchPipelineActive?.(maxjsFx.isPipelineRenderActive?.() === true);
             try {
-                if (isPathTracingMode && pathTracingFx.isEnabled?.() && (!renderToImageActive || pendingRenderToImage?.pathTracing)) {
+                if (isPathTracingViewActive() && (!renderToImageActive || pendingRenderToImage?.pathTracing)) {
                     // Pathtracing is a live-viewer-only renderer mode. The live
                     // frame routes through renderPathTracingLiveFrame() so the
                     // color-domain / stylized post FX fold over the PT beauty; PT
@@ -16628,7 +16647,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             }
 
             try {
-                if (pathTracingFx.isEnabled?.() && (!renderToImageActive || renderToImageForcePathTracing)) {
+                if ((isPathTracingViewActive() || renderToImageForcePathTracing) && (!renderToImageActive || renderToImageForcePathTracing)) {
                     renderPathTracingLiveFrame();
                 } else if (webglBasicFx.isAvailable?.() || maxjsFx.hasEnabledEffects()) {
                     renderViewerFrame();
@@ -16658,7 +16677,7 @@ vec4 maxjsHTMLColor = vec4( 0.0 );
             const compositedCapture = msg.composited === true;
             renderCaptureComposited = compositedCapture;
             const wantsAlpha = !compositedCapture && msg.alpha === true && mimeSupportsAlpha(captureMime);
-            const usePathTracing = pathTracingFx.isEnabled?.() === true;
+            const usePathTracing = isPathTracingViewActive();
             const ptMinSamples = Number.isFinite(msg.pathTracingSamples)
                 ? Math.max(1, Math.floor(msg.pathTracingSamples))
                 : Math.max(PATH_TRACING_CAPTURE_DEFAULT_SAMPLES, pathTracingSettings.samplesPerFrame);

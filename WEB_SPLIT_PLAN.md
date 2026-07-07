@@ -1,7 +1,21 @@
 # web/index.html Split Plan
 
-Status: PLANNED (2026-07-07). Line numbers refer to the working tree on this date
-(~17,000 lines); they will drift — anchor on function names, not line numbers.
+Status: IN PROGRESS (2026-07-07). Waves 0 and 1 are DONE:
+- Wave 0: `tools/check_esm_graph.mjs` (import/export graph tripwire) +
+  `tools/split_smoke_server.mjs` / `split_smoke_shim.js` (boot smoke gate:
+  serve web/ shimmed, assert ready handshake + zero page errors). Baseline was
+  fully clean — 0 console errors/warnings; keep it that way.
+- Wave 1: inline module script moved verbatim to `web/js/editor/boot.js`
+  (index.html 17,002 → 456 lines; only import specifiers rewritten);
+  `host_bridge.js` extracted (bridge core, handshake, requestHostAction,
+  typed shared-buffer routing via onSharedBuffer/onSharedBufferFallback);
+  minimal `context.js`; `web/HOST_CONTRACT.md` written (web root — `docs/` is
+  gitignored at any depth, and the contract should travel with the web/
+  submodule anyway); ready handshake stamps `contractVersion: 1`.
+Next: Wave 2 (webxr, splats, render_capture, pathtracing_glue).
+
+Line numbers below refer to the pre-split tree (~17,000 lines); they have
+drifted — anchor on function names, not line numbers.
 
 Goal (per AGENTS.md "Multi-platform: Python route"): reduce `web/index.html` to
 markup + importmap + a thin boot module, with all editor logic in ES modules
@@ -68,7 +82,7 @@ WebView2/sharedbuffer event wiring, standalone fallback text, and
 here — they stay with their subsystems (scene sync registers `scene`/`xform`,
 snapshot module registers `snapshot_export_request`, etc.).
 
-Add `docs/HOST_CONTRACT.md` describing the above, and stamp
+Add `web/HOST_CONTRACT.md` describing the above, and stamp
 `contractVersion` into the ready handshake so hosts can assert compatibility.
 The head bootstrap (standalone redirect) stays inline in index.html but is
 documented as part of the contract (the shim must be injected before it).

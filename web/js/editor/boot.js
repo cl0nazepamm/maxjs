@@ -1,0 +1,16449 @@
+        import * as THREE from 'three';
+        import * as THREE_STD from 'three-std';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { HDRLoader } from 'three/addons/loaders/HDRLoader.js';
+        import { EXRLoader } from 'three/addons/loaders/EXRLoader.js';
+        import { MaterialXLoader } from 'three/addons/loaders/MaterialXLoader.js';
+        import { LightProbeGenerator } from 'three/addons/lights/LightProbeGenerator.js';
+        import { LightProbeGrid } from 'three/addons/lighting/LightProbeGrid.js';
+        import { RectAreaLightTexturesLib } from 'three/addons/lights/RectAreaLightTexturesLib.js';
+        import { hashBlur } from 'three/addons/tsl/display/hashBlur.js';
+        import { XRButton } from 'three/addons/webxr/XRButton.js';
+        import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
+        import { SkyMesh } from 'three/addons/objects/SkyMesh.js';
+        import { Sky } from 'three/addons/objects/Sky.js';
+        import { AsciiEffect } from 'three/addons/effects/AsciiEffect.js';
+        import { Inspector } from 'three/addons/inspector/Inspector.js';
+        import {
+            maxLights,
+            ensureMeshMaskDefaults,
+            getReflectionPaintNode,
+            LIGHT_MASK_LO_KEY,
+            LIGHT_MASK_HI_KEY,
+        } from '../max_lights_node.js';
+        import { createIrradianceVolume, createProbeField as createHaloProbeField, giLights } from 'speedball-gi';
+        // Spark.js uses GLSL3/ShaderChunk — needs WebGL THREE build (scoped in importmap).
+        // Lazy-import to avoid crashing on page load.
+        let Spark = null;
+        import {
+            color as tslColor,
+            float as tslFloat,
+            linearDepth,
+            materialEnvIntensity,
+            screenUV,
+            texture as tslTexture,
+            viewportLinearDepth,
+            viewportSharedTexture,
+        } from 'three/tsl';
+        import * as TSL from 'three/tsl';
+        import { createTSLCompiler, makeBakeNodeToTexture } from '../tsl_materials.js';
+
+        const maxjsHdriDiffuseIntensity = THREE.TSL.uniform(1.0);
+
+        // Patch materialEnvIntensity so scene.environment still respects
+        // per-material envMapIntensity, while scene.environmentIntensity remains
+        // the global HDRI/node intensity control.
+        materialEnvIntensity.onObjectUpdate(({ material, scene }) => {
+            const materialIntensity = Number.isFinite(material?.envMapIntensity)
+                ? material.envMapIntensity
+                : 1.0;
+            const sceneIntensity = Number.isFinite(scene?.environmentIntensity)
+                ? scene.environmentIntensity
+                : 1.0;
+            return materialIntensity * sceneIntensity;
+        });
+
+        function patchEnvironmentNodeDiffuseSplit() {
+            const EnvironmentNode = THREE.EnvironmentNode;
+            const tsl = THREE.TSL || {};
+            if (!EnvironmentNode?.prototype || EnvironmentNode.prototype.maxjsHdriDiffuseSplitPatched) return;
+
+            const {
+                isolate,
+                roughness,
+                clearcoatRoughness,
+                cameraWorldMatrix,
+                normalView,
+                clearcoatNormalView,
+                normalWorld,
+                positionViewDirection,
+                float,
+                pow4,
+                bentNormalView,
+                pmremTexture,
+            } = tsl;
+            if (!isolate || !roughness || !cameraWorldMatrix || !normalView || !normalWorld || !positionViewDirection || !float || !pow4 || !pmremTexture) {
+                return;
+            }
+
+            const originalSetup = EnvironmentNode.prototype.setup;
+            const createRadianceContext = (roughnessNode, normalViewNode) => {
+                let reflectVec = null;
+                return {
+                    getUV: () => {
+                        if (reflectVec === null) {
+                            reflectVec = positionViewDirection.negate().reflect(normalViewNode);
+                            reflectVec = pow4(roughnessNode).mix(reflectVec, normalViewNode).normalize();
+                            reflectVec = reflectVec.transformDirection(cameraWorldMatrix);
+                        }
+                        return reflectVec;
+                    },
+                    getTextureLevel: () => roughnessNode,
+                };
+            };
+            const createIrradianceContext = (normalWorldNode) => ({
+                getUV: () => normalWorldNode,
+                getTextureLevel: () => float(1.0),
+            });
+
+            EnvironmentNode.prototype.setup = function setupMaxjsEnvironmentNode(builder) {
+                try {
+                    const { material } = builder;
+                    let envNode = this.envNode;
+
+                    if (envNode.isTextureNode || envNode.isMaterialReferenceNode) {
+                        const value = envNode.isTextureNode ? envNode.value : material[envNode.property];
+                        const cache = this._getPMREMNodeCache(builder.renderer);
+                        let cacheEnvNode = cache.get(value);
+                        if (cacheEnvNode === undefined) {
+                            cacheEnvNode = pmremTexture(value);
+                            cache.set(value, cacheEnvNode);
+                        }
+                        envNode = cacheEnvNode;
+                    }
+
+                    const useAnisotropy = material.useAnisotropy === true || material.anisotropy > 0;
+                    const radianceNormalView = useAnisotropy ? bentNormalView : normalView;
+
+                    const radiance = envNode.context(createRadianceContext(roughness, radianceNormalView)).mul(materialEnvIntensity);
+                    const irradiance = envNode.context(createIrradianceContext(normalWorld)).mul(Math.PI).mul(materialEnvIntensity);
+
+                    builder.context.radiance.addAssign(isolate(radiance));
+
+                    const isNativeWebGPU = builder.renderer?.backend?.isWebGPUBackend === true;
+                    const isolatedIrradiance = isolate(irradiance);
+                    builder.context.iblIrradiance.addAssign(
+                        isNativeWebGPU ? isolatedIrradiance.mul(maxjsHdriDiffuseIntensity) : isolatedIrradiance
+                    );
+
+                    const clearcoatRadiance = builder.context.lightingModel.clearcoatRadiance;
+                    if (clearcoatRadiance && clearcoatRoughness && clearcoatNormalView) {
+                        const clearcoatRadianceContext = envNode
+                            .context(createRadianceContext(clearcoatRoughness, clearcoatNormalView))
+                            .mul(materialEnvIntensity);
+                        clearcoatRadiance.addAssign(isolate(clearcoatRadianceContext));
+                    }
+                } catch (error) {
+                    return originalSetup.call(this, builder);
+                }
+            };
+
+            Object.defineProperty(EnvironmentNode.prototype, 'maxjsHdriDiffuseSplitPatched', { value: true });
+        }
+
+        patchEnvironmentNodeDiffuseSplit();
+        import { applyDeltaFrame } from '../protocol.js';
+        import {
+            attachSkinAttributes,
+            binInRange,
+            buildSkinnedMeshFromNd as buildSkinnedMeshFromBinary,
+            geometryFromNodeBinary,
+            indexArrayFromBinary,
+            normalAttributeFromBinary,
+            uvAttributeFromBinary,
+            typedArrayCanStore,
+            updateFloatGeometryAttribute,
+            updateGeometryIndexAttribute,
+        } from '../scene_binary.js';
+        import { maxTimeline } from '../maxjs_timeline.js';
+        import { createHostBridge } from './host_bridge.js';
+        import { createEditorContext } from './context.js';
+        import { gpuRecomputeNormals, gpuNormalsInvalidate, isGpuNormalsDisabled } from '../gpu_normals.js';
+        import { createPerfHud } from '../perf_hud.js';
+        import { createMaxJSFxController } from '../maxjs_fx.js';
+        import { createWebGLBasicFx } from '../webgl_basicfx.js';
+        import { createSpectralTracer } from 'speedball-gi/spectral-tracer';
+        import { createLayerManager } from '../layer_manager.js';
+        import { MAXJS_LAYER_SSR_EXCLUDE } from '../render_layers.js';
+        import { createGeospatialSkyController } from '../geospatial_sky.js';
+        import { createMaxJSAnimationSystem } from '../maxjs_animation.js';
+        import { createMaxJSAudioSystem } from '../maxjs_audio.js';
+        import { createMaxJSGLTFSystem } from '../maxjs_gltf.js';
+        import { createMaxJSWebAppSystem } from '../maxjs_webapp.js';
+        import { attachDomPanelForwarding } from '../dom_panel_forwarding.js';
+        import { createProjectRuntime } from '../project_runtime.js';
+        import { getInstancedMeshBatchSize, instanceGroupKey, isWebGpuInstancingPath } from '../instance_batching.js';
+        import * as css3dOverlay from '../css3d_overlay.js';
+        import { getOrCreateHTMLTexture, releaseHTMLTexture, disposeAllHTMLTextures, attachHTMLClickForwarding } from '../html_texture.js';
+        import { createCanvasPanel } from '../canvas_panel.js';
+        import { createShaderLabFx } from '../shader_lab_fx.js';
+        import { createCompositionOverlay, COMPOSITION_GUIDES, COMPOSITION_ASPECTS } from '../composition_overlay.js';
+        import { installDockDragHide } from '../dock_drag.js';
+        import { analyzeSnapshotPayload, formatBytes, formatPercent } from '../snapshot_diagnostics.js';
+        import {
+            copyMaxArrayToWorld,
+            copyMaxComponentsToWorld,
+            copyMaxMatrixArrayToWorldStd,
+            sceneSpace,
+        } from '../scene_space.js';
+        import {
+            createShaderLabPanel,
+            getShaderLabSnapshot,
+            setShaderLabSnapshot,
+            onShaderLabSnapshotChange,
+            updateShaderLabEnabled,
+        } from '../shader_lab_panel.js';
+        import {
+            applyTextureChannelSelection as applyTextureChannelSelectionShared,
+            applyTextureTransform as applyTextureTransformShared,
+            applyTextureUvChannel as applyTextureUvChannelShared,
+            maxMapChannelFromMapName as maxMapChannelFromMapNameShared,
+            maxMapChannelToTextureChannel as maxMapChannelToTextureChannelShared,
+            normalizeTextureTransform as normalizeTextureTransformShared,
+            optimizedTextureTransformForSlot as optimizedTextureTransformForSlotShared,
+            resolveTextureColorSpace as resolveTextureColorSpaceShared,
+            shouldRouteBlackSpecularToLambert as shouldRouteBlackSpecularToLambertShared,
+        } from '../material_contract.js';
+
+        const THEME_STORAGE_KEY = 'maxjs-theme';
+        const AUDIO_MUTED_STORAGE_KEY = 'maxjs-audio-muted';
+        const BACKGROUND_COLOR_STORAGE_KEY = 'maxjs-background-color';
+        const DEFAULT_BACKGROUND_COLOR = 0x353535;
+        function hexColorInputValue(hex) {
+            return `#${(hex >>> 0).toString(16).padStart(6, '0')}`;
+        }
+        function parseHexColorInput(value) {
+            if (typeof value !== 'string' || !/^#[0-9a-fA-F]{6}$/.test(value)) return null;
+            return parseInt(value.slice(1), 16);
+        }
+        function readPersistedBackgroundColor() {
+            try {
+                const raw = localStorage.getItem(BACKGROUND_COLOR_STORAGE_KEY);
+                if (raw) {
+                    const value = Number(raw);
+                    if (Number.isFinite(value) && value >= 0 && value <= 0xffffff) {
+                        return value >>> 0;
+                    }
+                }
+                const legacy = localStorage.getItem('maxjs-bg-colors');
+                if (legacy) {
+                    const parsed = JSON.parse(legacy);
+                    const migrated = parsed?.custom ?? parsed?.dark ?? parsed?.light;
+                    if (Number.isFinite(migrated) && migrated >= 0 && migrated <= 0xffffff) {
+                        return migrated >>> 0;
+                    }
+                }
+            } catch { /* private mode / corrupt */ }
+            return DEFAULT_BACKGROUND_COLOR;
+        }
+        function saveBackgroundColor() {
+            try {
+                localStorage.setItem(BACKGROUND_COLOR_STORAGE_KEY, String(hiddenBackgroundColor));
+            } catch { /* private mode */ }
+        }
+        function applyViewportBackdropColor(hex = null) {
+            if (hex == null) {
+                document.documentElement.style.setProperty('--maxjs-viewport-bg', 'transparent');
+                return;
+            }
+            const value = Number.isFinite(hex) ? (hex >>> 0) : DEFAULT_BACKGROUND_COLOR;
+            document.documentElement.style.setProperty(
+                '--maxjs-viewport-bg',
+                `#${value.toString(16).padStart(6, '0')}`
+            );
+        }
+        function readPersistedLightMode() {
+            try {
+                return localStorage.getItem(THEME_STORAGE_KEY) === 'light';
+            } catch {
+                return false;
+            }
+        }
+        function readPersistedAudioMuted() {
+            try {
+                return localStorage.getItem(AUDIO_MUTED_STORAGE_KEY) === 'true';
+            } catch {
+                return false;
+            }
+        }
+        let lightMode = readPersistedLightMode();
+        document.body.classList.toggle('light-mode', lightMode);
+
+        // ── Scene Setup (Y-up world + Max basis boundary) ───
+        let hiddenBackgroundColor = readPersistedBackgroundColor();
+        applyViewportBackdropColor(null);
+        const viewportBackgroundColor = new THREE.Color(hiddenBackgroundColor);
+        const scene = new THREE.Scene();
+        scene.background = null;
+        const maxBasisRoot = new THREE.Group();
+        maxBasisRoot.name = '__maxjs_max_basis_root__';
+        maxBasisRoot.rotation.x = -Math.PI / 2;
+        scene.add(maxBasisRoot);
+        const maxRoot = new THREE.Group();
+        maxRoot.name = '__maxjs_max_root__';
+        maxBasisRoot.add(maxRoot);
+        const jsRoot = new THREE.Group();
+        jsRoot.name = '__maxjs_js_root__';
+        scene.add(jsRoot);
+        const overlayRoot = new THREE.Group();
+        overlayRoot.name = '__maxjs_overlay_root__';
+        maxBasisRoot.add(overlayRoot);
+
+        const cameraTargetWorld = new THREE.Vector3();
+        const cameraPositionWorld = new THREE.Vector3();
+        const lightTargetWorld = new THREE.Vector3();
+
+        const cameraDefaultPosition = copyMaxComponentsToWorld(new THREE.Vector3(), 200, -200, 150);
+        const cameraDefaultDirection = cameraDefaultPosition.clone().normalize();
+        function getActiveCameraWorldPosition(target = new THREE.Vector3()) {
+            const activeCamera = renderer.xr?.isPresenting ? renderer.xr.getCamera(camera) : camera;
+            return activeCamera.getWorldPosition(target);
+        }
+
+        const DEFAULT_CAMERA_NEAR = 1.0;
+        const DEFAULT_CAMERA_FAR = 100000;
+        const perspCamera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, DEFAULT_CAMERA_NEAR, DEFAULT_CAMERA_FAR);
+        const orthoCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, DEFAULT_CAMERA_NEAR, DEFAULT_CAMERA_FAR);
+        perspCamera.up.set(0, 1, 0);
+        orthoCamera.up.set(0, 1, 0);
+        perspCamera.position.copy(cameraDefaultPosition);
+        perspCamera.layers.enable(MAXJS_LAYER_SSR_EXCLUDE);
+        orthoCamera.layers.enable(MAXJS_LAYER_SSR_EXCLUDE);
+        let camera = perspCamera;
+
+        const PERFORMANCE_DEFAULTS = Object.freeze({
+            fpsCap: 0,
+            renderScale: 1.0,
+            postFxScale: 1.0,
+            optimizeMaxInstances: true,
+            maxInstanceBucketThreshold: 50,
+            splatsEnabled: true,
+        });
+        let performanceSettings = { ...PERFORMANCE_DEFAULTS };
+        const SAFE_FRAME_STORAGE_KEY = 'maxjs_safe_frame_enabled';
+        const renderOutputSettings = { width: 0, height: 0, aspect: 0 };
+        let safeFrameEnabled = false;
+        let blobOverlayCvs = null;
+        let blobOverlayCtx = null;
+        let compositionOverlay = null;
+
+        try {
+            safeFrameEnabled = localStorage.getItem(SAFE_FRAME_STORAGE_KEY) === 'true';
+        } catch {}
+
+        function getRenderOutputAspect() {
+            const width = Number(renderOutputSettings.width);
+            const height = Number(renderOutputSettings.height);
+            const aspect = Number(renderOutputSettings.aspect);
+            if (Number.isFinite(aspect) && aspect > 0) return aspect;
+            return Number.isFinite(width) && Number.isFinite(height) && width > 0 && height > 0
+                ? width / height
+                : null;
+        }
+
+        function getViewportFrameRect() {
+            const fullWidth = Math.max(1, innerWidth || 1);
+            const fullHeight = Math.max(1, innerHeight || 1);
+            const aspect = safeFrameEnabled ? getRenderOutputAspect() : null;
+            if (!aspect) return { x: 0, y: 0, width: fullWidth, height: fullHeight, aspect: fullWidth / fullHeight };
+
+            const viewportAspect = fullWidth / fullHeight;
+            let width = fullWidth;
+            let height = fullHeight;
+            if (viewportAspect > aspect) {
+                width = Math.max(1, Math.round(fullHeight * aspect));
+            } else {
+                height = Math.max(1, Math.round(fullWidth / aspect));
+            }
+            return {
+                x: Math.round((fullWidth - width) * 0.5),
+                y: Math.round((fullHeight - height) * 0.5),
+                width,
+                height,
+                aspect: width / height,
+            };
+        }
+
+        function applyFrameElementStyle(el, rect = getViewportFrameRect()) {
+            if (!el?.style) return;
+            el.style.position = 'absolute';
+            el.style.inset = 'auto';
+            el.style.left = `${rect.x}px`;
+            el.style.top = `${rect.y}px`;
+            el.style.width = `${rect.width}px`;
+            el.style.height = `${rect.height}px`;
+        }
+
+        function syncSafeFrameButtonUi() {
+            const button = document.getElementById('btnSafeFrame');
+            const label = document.getElementById('safeFrameLabel');
+            if (!button) return;
+            const aspect = getRenderOutputAspect();
+            const sizeLabel = aspect && renderOutputSettings.width > 0 && renderOutputSettings.height > 0
+                ? `${renderOutputSettings.width}x${renderOutputSettings.height}`
+                : 'render output';
+            button.classList.toggle('active', safeFrameEnabled);
+            button.setAttribute('aria-pressed', safeFrameEnabled ? 'true' : 'false');
+            button.title = safeFrameEnabled
+                ? `Safe Frame on - cropped to ${sizeLabel}`
+                : `Safe Frame off - click to crop viewport to ${sizeLabel}`;
+            button.setAttribute('aria-label', safeFrameEnabled ? 'Safe Frame on' : 'Safe Frame off');
+            if (label) label.textContent = aspect ? `Safe Frame ${sizeLabel}` : 'Safe Frame';
+        }
+
+        function updateCameraProjectionForViewportRect() {
+            const rect = getViewportFrameRect();
+            const aspect = rect.aspect || 1;
+            if (camera?.isPerspectiveCamera) {
+                camera.aspect = aspect;
+            } else if (camera?.isOrthographicCamera) {
+                const viewWidth = Math.max(0.001, camera.right - camera.left);
+                camera.left = -viewWidth / 2;
+                camera.right = viewWidth / 2;
+                camera.top = viewWidth / (2 * aspect);
+                camera.bottom = -viewWidth / (2 * aspect);
+            }
+            camera?.updateProjectionMatrix?.();
+            return rect;
+        }
+
+        function applyRenderViewportLayout({ resizeBuffers = false, resizePostFx = false } = {}) {
+            const rect = updateCameraProjectionForViewportRect();
+            if (renderer) {
+                if (resizeBuffers) renderer.setSize(rect.width, rect.height);
+                applyFrameElementStyle(renderer.domElement, rect);
+            }
+            if (splatOverlay?.renderer) {
+                if (resizeBuffers) splatOverlay.renderer.setSize(rect.width, rect.height, false);
+                applyFrameElementStyle(splatOverlay.renderer.domElement, rect);
+            }
+            if (asciiEffect?.domElement) {
+                asciiEffect.setSize(rect.width, rect.height);
+                applyFrameElementStyle(asciiEffect.domElement, rect);
+            }
+            if (blobOverlayCvs) {
+                if (blobOverlayCvs.width !== rect.width) blobOverlayCvs.width = rect.width;
+                if (blobOverlayCvs.height !== rect.height) blobOverlayCvs.height = rect.height;
+                applyFrameElementStyle(blobOverlayCvs, rect);
+            }
+            compositionOverlay?.resize(rect);
+            css3dOverlay.setSize(rect.width, rect.height);
+            css3dOverlay.setViewportRect(rect);
+            if (resizePostFx) {
+                maxjsFx.resize();
+                webglBasicFx.resize?.();
+            }
+            syncSafeFrameButtonUi();
+            return rect;
+        }
+
+        // User-overridable camera clip planes. null means "use auto-fit value".
+        // Raise `near` to reclaim depth precision on large scenes where distant geo z-fights.
+        const cameraClip = { near: null, far: null };
+        function applyCameraClipOverrides(cam) {
+            if (!cam) return;
+            if (Number.isFinite(cameraClip.near) && cameraClip.near > 0) cam.near = cameraClip.near;
+            if (Number.isFinite(cameraClip.far) && cameraClip.far > cam.near) cam.far = cameraClip.far;
+            cam.updateProjectionMatrix();
+        }
+        function applySyncedCameraClip(cam, source = null) {
+            if (!cam || cam.isOrthographicCamera) return;
+            const near = Number(source?.near);
+            const far = Number(source?.far);
+            if (Number.isFinite(near) && near > 0 && Number.isFinite(far) && far > near) {
+                cam.near = near;
+                cam.far = far;
+                return;
+            }
+            if (!Number.isFinite(cam.near) || cam.near < DEFAULT_CAMERA_NEAR) cam.near = DEFAULT_CAMERA_NEAR;
+            if (!Number.isFinite(cam.far) || cam.far <= cam.near) cam.far = DEFAULT_CAMERA_FAR;
+        }
+        let lastRenderTimestamp = 0;
+
+        function getEffectivePixelRatio() {
+            const scale = Number.isFinite(performanceSettings.renderScale) ? performanceSettings.renderScale : 1.0;
+            return Math.max(0.25, devicePixelRatio * scale);
+        }
+
+        function getEffectivePostFxResolutionScale() {
+            const scale = Number.isFinite(performanceSettings.postFxScale) ? performanceSettings.postFxScale : 1.0;
+            return Math.max(0.25, Math.min(1.0, scale));
+        }
+
+        function applyRendererPerformanceSettings({ resizePostFx = false } = {}) {
+            const rect = getViewportFrameRect();
+            if (renderer) {
+                renderer.setPixelRatio(getEffectivePixelRatio());
+                renderer.setSize(rect.width, rect.height);
+                applyFrameElementStyle(renderer.domElement, rect);
+            }
+            if (splatOverlay?.renderer) {
+                splatOverlay.renderer.setPixelRatio(getEffectivePixelRatio());
+                splatOverlay.renderer.setSize(rect.width, rect.height, false);
+                applyFrameElementStyle(splatOverlay.renderer.domElement, rect);
+            }
+            if (blobOverlayCvs) {
+                if (blobOverlayCvs.width !== rect.width) blobOverlayCvs.width = rect.width;
+                if (blobOverlayCvs.height !== rect.height) blobOverlayCvs.height = rect.height;
+                applyFrameElementStyle(blobOverlayCvs, rect);
+            }
+            lastRenderTimestamp = 0;
+            maxjsFx.setResolutionScale?.(getEffectivePostFxResolutionScale());
+            webglBasicFx.setResolutionScale?.(getEffectivePostFxResolutionScale());
+            updateCameraProjectionForViewportRect();
+            css3dOverlay.setSize(rect.width, rect.height);
+            css3dOverlay.setViewportRect(rect);
+            if (resizePostFx) {
+                maxjsFx.resize();
+                webglBasicFx.resize?.();
+            }
+        }
+
+        function configureRenderer(nextRenderer) {
+            const rect = getViewportFrameRect();
+            nextRenderer.setSize(rect.width, rect.height);
+            nextRenderer.setPixelRatio(getEffectivePixelRatio());
+            nextRenderer.toneMapping = THREE.NeutralToneMapping;
+            nextRenderer.toneMappingExposure = 1.0;
+            nextRenderer.shadowMap.enabled = true;
+            nextRenderer.setClearColor?.(0x000000, 0);
+            applyFrameElementStyle(nextRenderer.domElement, rect);
+            nextRenderer.domElement.style.zIndex = '0';
+            document.body.appendChild(nextRenderer.domElement);
+        }
+
+        async function initializeRenderer(nextRenderer) {
+            if (typeof nextRenderer.init === 'function') {
+                await nextRenderer.init();
+            }
+        }
+
+        function disposeRenderer(nextRenderer) {
+            nextRenderer?.domElement?.remove?.();
+            nextRenderer?.dispose?.();
+        }
+
+        const RENDERER_BACKEND_STORAGE_KEY = 'maxjs_renderer_backend_preference';
+        const MAXJS_MODE_KEY = 'maxjs-render-mode';
+        // 'spectral' replaces the old 'studio' (Advanced) mode and absorbs the
+        // old top-level 'pathtracing' mode: the path tracer is now a live VIEW
+        // inside spectral mode (same spectral scene core as the probe GI).
+        const MAXJS_RENDER_MODES = ['standard', 'spectral'];
+        const isHostedWebView = !!window.chrome?.webview?.postMessage;
+        const pageParams = new URLSearchParams(window.location.search);
+        const isProductionRenderPage = pageParams.has('productionRender');
+        const shouldPreserveCanvasForCapture = isHostedWebView || isProductionRenderPage;
+
+        function readMaxjsRenderMode() {
+            if (isProductionRenderPage) return 'standard';
+            try {
+                let value = localStorage.getItem(MAXJS_MODE_KEY);
+                // migrate legacy tokens: Advanced ('studio') and the old
+                // top-level 'pathtracing' mode both fold into 'spectral'.
+                if (value === 'studio' || value === 'pathtracing') {
+                    value = 'spectral';
+                    try { localStorage.setItem(MAXJS_MODE_KEY, value); } catch {}
+                }
+                return MAXJS_RENDER_MODES.includes(value) ? value : 'standard';
+            } catch {
+                return 'standard';
+            }
+        }
+
+        const maxjsRenderMode = readMaxjsRenderMode();
+        // internal flag name kept ('studio') — it gates every advanced feature
+        // and renaming hundreds of references buys nothing. UI label: Spectral.
+        const isStudioMode = maxjsRenderMode === 'spectral';
+        // Spectral view: 'probes' = live DDGI probe GI (default), 'trace' =
+        // the spectral path tracer. Live-switchable WITHOUT reload — both run
+        // on the same spectral scene core. setSpectralView() flips it.
+        const MAXJS_SPECTRAL_VIEW_KEY = 'maxjs-spectral-view';
+        let spectralView = 'probes';
+        try { if (localStorage.getItem(MAXJS_SPECTRAL_VIEW_KEY) === 'trace') spectralView = 'trace'; } catch {}
+        let isPathTracingMode = isStudioMode && spectralView === 'trace';
+        document.body.classList.toggle('pathtracing-mode', isPathTracingMode);
+
+        function normalizeRendererBackend(value) {
+            if (value === 'webgl-vr' || value === 'webgl-xr' || value === 'webgl-headset') return 'webgl2';
+            if (value === 'webgl') return 'webgl2';
+            return value === 'webgl2' || value === 'webgpu' || value === 'webgl-fallback' ? value : '';
+        }
+
+        function persistRendererBackendPreference(mode) {
+            const normalized = normalizeRendererBackend(mode);
+            if (normalized === 'webgl2' || normalized === 'webgl-fallback' || normalized === 'webgpu') {
+                try { localStorage.setItem(RENDERER_BACKEND_STORAGE_KEY, normalized); } catch {}
+            }
+        }
+
+        function consumeRequestedRendererBackend() {
+            if (isProductionRenderPage) return 'webgl-fallback';
+            const explicit = sessionStorage.getItem('maxjs_renderer_backend');
+            if (explicit) {
+                sessionStorage.removeItem('maxjs_renderer_backend');
+                return normalizeRendererBackend(explicit);
+            }
+            const forceFallback = sessionStorage.getItem('maxjs_force_webgl') === '1';
+            if (forceFallback) {
+                sessionStorage.removeItem('maxjs_force_webgl');
+                return 'webgl-fallback';
+            }
+            try {
+                return normalizeRendererBackend(localStorage.getItem(RENDERER_BACKEND_STORAGE_KEY));
+            } catch {}
+            return '';
+        }
+
+        async function createRenderer() {
+            const requestedBackend = consumeRequestedRendererBackend();
+
+            let nextRenderer;
+            let backendLabel;
+
+            // The WebGPU spectral path tracer requires the NATIVE WebGPU
+            // backend (backend.isWebGPUBackend). Ignore any forced-WebGL
+            // preference while in pathtracing mode so PT always lands on the
+            // native WebGPU renderer below.
+            if (requestedBackend === 'webgl2' && !isPathTracingMode) {
+                nextRenderer = new THREE_STD.WebGLRenderer({
+                    antialias: true,
+                    alpha: true,
+                    preserveDrawingBuffer: shouldPreserveCanvasForCapture,
+                    powerPreference: 'high-performance',
+                });
+                backendLabel = 'WebGL Mode';
+                configureRenderer(nextRenderer);
+                await initializeRenderer(nextRenderer);
+            } else if (requestedBackend === 'webgl-fallback' && !isPathTracingMode) {
+                // Normal viewer WebGL2 uses the modern renderer stack so TSL /
+                // Shader Lab can compile to the forced WebGL backend.
+                nextRenderer = new THREE.WebGPURenderer({ antialias: true, alpha: true, forceWebGL: true, preserveDrawingBuffer: shouldPreserveCanvasForCapture });
+                backendLabel = 'TSL_GL';
+                configureRenderer(nextRenderer);
+                await initializeRenderer(nextRenderer);
+            } else {
+                nextRenderer = new THREE.WebGPURenderer({ antialias: true, alpha: true, preserveDrawingBuffer: shouldPreserveCanvasForCapture });
+                backendLabel = 'WebGPU';
+                try {
+                    configureRenderer(nextRenderer);
+                    await initializeRenderer(nextRenderer);
+                } catch (error) {
+                    console.warn('max.js WebGPU init failed, retrying with forced WebGL2 backend.', error);
+                    disposeRenderer(nextRenderer);
+                    nextRenderer = new THREE.WebGPURenderer({ antialias: true, alpha: true, forceWebGL: true, preserveDrawingBuffer: shouldPreserveCanvasForCapture });
+                    backendLabel = 'TSL_GL';
+                    configureRenderer(nextRenderer);
+                    await initializeRenderer(nextRenderer);
+                }
+            }
+
+            return { renderer: nextRenderer, backendLabel };
+        }
+
+        let renderer = null;
+        let rendererBackendLabel = 'WebGPU';
+        try {
+            ({ renderer, backendLabel: rendererBackendLabel } = await createRenderer());
+        } catch (error) {
+            const message = error?.message || String(error);
+            document.getElementById('info').textContent = `max.js - renderer init failed: ${message}`;
+            throw error;
+        }
+
+        if (THREE.RectAreaLightNode?.setLTC) {
+            THREE.RectAreaLightNode.setLTC(RectAreaLightTexturesLib.init());
+        }
+
+        // Tell the plugin whether deform normals can be rebuilt GPU-side; when
+        // true the C++ fast lane streams positions only (all mesh sizes) and
+        // gpu_normals.js recomputes normals per update in a compute pass.
+        // Announced false while the GPU path is hard-disabled (see
+        // gpu_normals.js — three r185 mutates itemSize-3 storage attributes,
+        // which corrupts live-streamed geometry). CPU normal streaming covers
+        // everything below the compact-channel threshold instead.
+        let gpuNormalsAnnounced = false;
+        window.chrome?.webview?.postMessage({ type: 'gpu_normals', enabled: false });
+
+        // ── Render mode ───────────────────────────────────────
+        // Studio  = MaxLightsNode (light linking + per-mesh HDRI intensity).
+        //           Unlinked lights stay on stock batched three.js light nodes.
+        // Standard = stock three.js pipeline. No per-mesh tricks, but fits
+        //            within baseline WebGPU uniform-buffer limits — use on
+        //            heavier scenes that exceed 12 uniform buffers/stage.
+        // Pathtracing = isolated legacy WebGL2 progressive path tracer.
+        //               This is live-viewer only and is not exported to snapshots.
+        //
+        // Mode is frozen before renderer init; switching requires reload.
+        // Light Linking + Reflection Paint are parked for now (disabled, not
+        // deleted): their rail rows are display:none in the HTML and no sync
+        // path re-shows them. Restore = re-add ids + drop the inline style.
+        const STUDIO_ONLY_RAIL_IDS = [];
+
+        function setRailButtonMeta(button, { label, badge } = {}) {
+            if (!button) return;
+            if (typeof label === 'string') {
+                const labelEl = button.querySelector('.rail-btn-label');
+                if (labelEl) labelEl.textContent = label;
+            }
+            if (typeof badge === 'string') {
+                const badgeEl = button.querySelector('.rail-btn-badge');
+                if (badgeEl) badgeEl.textContent = badge;
+            }
+        }
+
+        const isWebGpuBackend = renderer.backend?.isWebGPUBackend === true;
+        const shouldInstallMaxLightsNode = isStudioMode;
+        if (shouldInstallMaxLightsNode && renderer.lighting?.createNode) {
+            // Install MaxLightsNode as the renderer's LightsNode factory. The
+            // renderer creates one LightsNode per scene via lighting.createNode()
+            // and caches it; setting scene.lightsNode is a no-op here. Override
+            // must land before the first frame so the cached node is ours.
+            renderer.lighting.createNode = (lights = []) => maxLights({
+                maxDirectionalLights: 16,
+                maxPointLights: 32,
+                maxSpotLights: 32,
+                maxHemisphereLights: 4,
+            }).setLights(lights);
+        } else if (isWebGpuBackend && renderer.lighting?.createNode) {
+            // Non-Studio WebGPU: stock batched lights (DynamicLightsNode) PLUS the
+            // opt-in HALO-GI / surfel injection (GiLightsNode). Byte-identical to
+            // stock three.js when GI is off, so HALO-GI works in EVERY WebGPU mode
+            // without the Studio light-linking overhead. Studio keeps MaxLightsNode.
+            renderer.lighting.createNode = (lights = []) => giLights({
+                maxDirectionalLights: 16,
+                maxPointLights: 32,
+                maxSpotLights: 32,
+                maxHemisphereLights: 4,
+            }).setLights(lights);
+        }
+
+        // Advanced-only WebGPU local-bounce volume. Standard/Default keep their
+        // normal direct-light path; this is the low-frequency local color bleed
+        // term for the Advanced lighting stack.
+        let giVolume = null;
+        let haloGi = null; // HALO-GI BVH-traced DDGI probe field (opt-in; see init below)
+        // HALO-GI idle tracking: the probe field holds its synchronous BVH rebuild + GPU
+        // solve until the view rests (camera quiet, not playing, delta-sync settled), so
+        // a freeze can never land during interaction. Updated in the render loop.
+        let haloGiLastInteractionMs = 0;
+        // HALO-GI Probe Grid side-channel: handle -> { size:[l,w,h], div:[x,y,z], enabled }.
+        // Transform rides the normal helper-node sync; this carries size + manual divisions.
+        const probeGridData = new Map();
+        let probeVolumeSig = '';
+        let probeGridAutoEnabled = false; // auto-turn-on GI once when an enabled grid first appears
+        const HALO_GI_DEFAULTS = Object.freeze({
+            // Speedball probes exist only in spectral, where they default ON
+            // (the DDGI field IS the live view). window.MAXJS_HALO_GI = false
+            // force-disables; standard mode never runs them.
+            enabled: isStudioMode && window.MAXJS_HALO_GI !== false,
+            intensity: 10,
+            divisions: 16,
+            rays: 64,
+            cascades: 1,
+            continuous: true,
+            hysteresis: 0.9,
+            hysteresisNormalize: true,
+            normalBias: 1.75,
+            radianceClamp: 8,
+            depthSharpness: 40,
+            cheby: 0.5,
+            classify: 0,
+            filter: 1,
+            smoothness: 1,
+            detail: 1,
+            changeThreshold: 2.5,
+            snapAmount: 0.30,
+            fireflyClamp: 6.0,
+            showProbes: false,
+        });
+        const HALO_GI_NUMERIC_CONTROLS = Object.freeze([
+            { key: 'intensity', label: 'Intensity', min: 0, max: 32, step: 0.05, digits: 1 },
+            { key: 'divisions', label: 'Divisions', min: 2, max: 32, step: 1, digits: 0 },
+            { key: 'rays', label: 'Rays / Probe', min: 32, max: 256, step: 16, digits: 0 },
+            { key: 'hysteresis', label: 'Hysteresis', min: 0.5, max: 0.99, step: 0.01, digits: 2 },
+            { key: 'normalBias', label: 'Normal Bias', min: 0, max: 4, step: 0.05, digits: 2 },
+            { key: 'radianceClamp', label: 'Radiance Clamp', min: 0, max: 32, step: 0.5, digits: 1 },
+            { key: 'depthSharpness', label: 'Depth Sharpness', min: 1, max: 200, step: 1, digits: 0 },
+            { key: 'cheby', label: 'Chebyshev', min: 0, max: 1, step: 0.05, digits: 2 },
+            { key: 'classify', label: 'Solid Classify', min: 0, max: 1, step: 0.05, digits: 2 },
+            { key: 'filter', label: 'Filter', min: 0, max: 1, step: 0.05, digits: 2 },
+            { key: 'smoothness', label: 'Smoothness', min: 0, max: 1, step: 0.05, digits: 2 },
+            { key: 'detail', label: 'Detail', min: 0, max: 1, step: 0.05, digits: 2 },
+            { key: 'changeThreshold', label: 'Change Threshold', min: 0.5, max: 8, step: 0.05, digits: 2 },
+            { key: 'snapAmount', label: 'Snap Amount', min: 0, max: 0.9, step: 0.01, digits: 2 },
+            { key: 'fireflyClamp', label: 'Firefly Clamp', min: 1, max: 20, step: 0.5, digits: 1 },
+        ]);
+        let haloGiSettings = { ...HALO_GI_DEFAULTS };
+        function clampHaloGiNumber(key, value) {
+            const control = HALO_GI_NUMERIC_CONTROLS.find(c => c.key === key);
+            if (!control) return Number.isFinite(value) ? value : HALO_GI_DEFAULTS[key];
+            const n = Number(value);
+            const fallback = HALO_GI_DEFAULTS[key];
+            if (!Number.isFinite(n)) return fallback;
+            const stepped = control.step >= 1 ? Math.round(n / control.step) * control.step : n;
+            return THREE.MathUtils.clamp(stepped, control.min, control.max);
+        }
+        function formatHaloGiValue(key, value = haloGiSettings[key]) {
+            const control = HALO_GI_NUMERIC_CONTROLS.find(c => c.key === key);
+            if (!control) return String(value);
+            const n = Number(value);
+            if (!Number.isFinite(n)) return String(HALO_GI_DEFAULTS[key]);
+            return control.digits === 0 ? String(Math.round(n)) : n.toFixed(control.digits);
+        }
+        function normalizeHaloGiSettings(input = {}, base = HALO_GI_DEFAULTS) {
+            const out = { ...base };
+            for (const control of HALO_GI_NUMERIC_CONTROLS) {
+                if (control.key in input) out[control.key] = clampHaloGiNumber(control.key, input[control.key]);
+            }
+            if ('enabled' in input) out.enabled = input.enabled === true;
+            if ('continuous' in input) out.continuous = input.continuous === true;
+            if ('hysteresisNormalize' in input) out.hysteresisNormalize = input.hysteresisNormalize === true;
+            if ('showProbes' in input) out.showProbes = input.showProbes === true;
+            if ('cascades' in input) out.cascades = Math.round(Number(input.cascades)) === 2 ? 2 : 1;
+            return out;
+        }
+        function applyHaloGiTuning(field = haloGi?.field) {
+            if (!field) return;
+            field.setIntensity?.(haloGiSettings.intensity);
+            field.setDivisions?.(haloGiSettings.divisions);
+            field.setRays?.(haloGiSettings.rays);
+            field.setCascades?.(haloGiSettings.cascades);
+            field.setContinuous?.(haloGiSettings.continuous);
+            field.setHysteresis?.(haloGiSettings.hysteresis);
+            field.setHysteresisNormalization?.(haloGiSettings.hysteresisNormalize);
+            field.setNormalBias?.(haloGiSettings.normalBias);
+            field.setRadianceClamp?.(haloGiSettings.radianceClamp);
+            field.setDepthSharpness?.(haloGiSettings.depthSharpness);
+            field.setChebyStrength?.(haloGiSettings.cheby);
+            field.setClassifyStrength?.(haloGiSettings.classify);
+            field.setFilterStrength?.(haloGiSettings.filter);
+            field.setSmoothness?.(haloGiSettings.smoothness);
+            field.setDetailStrength?.(haloGiSettings.detail);
+            field.setChangeThreshold?.(haloGiSettings.changeThreshold);
+            field.setSnapAmount?.(haloGiSettings.snapAmount);
+            field.setFireflyClamp?.(haloGiSettings.fireflyClamp);
+        }
+        function serializeHaloGiState() {
+            return {
+                ...haloGiSettings,
+                volumes: serializeHaloGiProbeVolumes(),
+            };
+        }
+        function applyHaloGiState(input = {}, { persist = false } = {}) {
+            const togglesEnabled = Object.prototype.hasOwnProperty.call(input, 'enabled');
+            const togglesProbes = Object.prototype.hasOwnProperty.call(input, 'showProbes');
+            haloGiSettings = normalizeHaloGiSettings(input, haloGiSettings);
+            applyHaloGiTuning();
+            if (togglesProbes && haloGiSettings.showProbes !== probeHelpersVisible) setProbeHelpersVisible(haloGiSettings.showProbes);
+            const gi = window.maxjsHaloGI;
+            if (gi && togglesEnabled) {
+                if (haloGiSettings.enabled) gi.enable({ applySettings: false });
+                else gi.disable({ applySettings: false });
+            }
+            window.__maxjsSyncGiPanel?.();
+            if (persist) savePostFxState();
+        }
+        function setHaloGiSetting(key, value, { persist = false } = {}) {
+            applyHaloGiState({ [key]: value }, { persist });
+        }
+        function resetHaloGiToDefaults({ persist = false } = {}) {
+            applyHaloGiState({
+                ...HALO_GI_DEFAULTS,
+                enabled: haloGiSettings.enabled,
+                showProbes: haloGiSettings.showProbes,
+            }, { persist });
+        }
+        let giVolumeSyncToken = '';
+        let giVolumeRefreshTimer = 0;
+        let giVolumeFadeFrame = 0;
+        let giVolumeFadeSerial = 0;
+        let giVolumeDebounceSerial = 0;
+        let giVolumeIdleToken = 0;
+        let giVolumeIdleSolving = false;
+        let giVolumeHiddenForDebounce = false;
+        let giVolumePendingRefresh = false;
+        let giVolumePendingLightRefresh = false;
+        let giVolumeLastCameraSignature = '';
+        let giVolumeNativeRequestToken = 0;
+        let giVolumeNativeWaitTimer = 0;
+        let giVolumeNativeAwaitSurface = false;
+        let giVolumeNativeAwaitLights = false;
+        const GI_VOLUME_BASE_INTENSITY = 0.38;
+        const GI_VOLUME_FADE_OUT_MS = 80;
+        const GI_VOLUME_FADE_IN_MS = 180;
+        const GI_VOLUME_CAMERA_DEBOUNCE_MS = 240;
+        const GI_VOLUME_LIGHT_DEBOUNCE_MS = 260;
+        const GI_VOLUME_SCENE_DEBOUNCE_MS = 480;
+        const GI_VOLUME_PLAYBACK_DEBOUNCE_MS = 520;
+        const GI_VOLUME_NATIVE_WAIT_MS = 160;
+
+        const isAdvancedWebGpuLighting = isStudioMode && renderer.backend?.isWebGPUBackend === true;
+        function shouldAutoStartStudioGiVolume() {
+            if (window.MAXJS_STUDIO_GI === true) return true;
+            if (pageParams.get('studioGi') === '1' || pageParams.get('studioGI') === '1') return true;
+            try {
+                return localStorage.getItem('maxjs-studio-gi') === '1'
+                    || localStorage.getItem('maxjs-studio-surfel-gi') === '1';
+            } catch {
+                return false;
+            }
+        }
+        function ensureStudioGiVolume() {
+            if (giVolume || !isAdvancedWebGpuLighting) return giVolume;
+            try {
+                giVolume = createIrradianceVolume({ renderer, scene, intensity: GI_VOLUME_BASE_INTENSITY });
+                renderer.userData = renderer.userData || {};
+                renderer.userData.maxjsGI = giVolume;
+            } catch (err) {
+                maxjsDebugWarn?.('max.js GI volume init failed:', err);
+                giVolume = null;
+            }
+            return giVolume;
+        }
+        function installStudioGiConsoleHandle() {
+            window.maxjsGI = {
+                get volume() { return giVolume; },
+                get node() { return giVolume?.node ?? null; },
+                isSupported: () => ensureStudioGiVolume()?.isSupported?.() === true,
+                isEnabled: () => giVolume?.node?._enabled === true,
+                enable() {
+                    const volume = ensureStudioGiVolume();
+                    if (!volume?.isSupported?.()) return false;
+                    volume.setEnabled(true);
+                    volume.setIntensity(GI_VOLUME_BASE_INTENSITY);
+                    scheduleGiVolumeFromCurrentScene({ delay: 0, refresh: true, reason: 'manual-enable' });
+                    return true;
+                },
+                disable() {
+                    if (!giVolume) return true;
+                    giVolume.setEnabled(false);
+                    giVolume.setIntensity(0);
+                    syncGiVolumeActive();
+                    return true;
+                },
+                setEnabled(on) { return on ? this.enable() : this.disable(); },
+                setIntensity(value) {
+                    const volume = ensureStudioGiVolume();
+                    volume?.setIntensity?.(value);
+                    syncGiVolumeActive();
+                },
+                bakeAll() {
+                    const volume = ensureStudioGiVolume();
+                    if (!volume?.isSupported?.()) return false;
+                    volume.bakeAll?.();
+                    scheduleGiVolumeFromCurrentScene({ delay: 0, refresh: true, reason: 'manual-bake' });
+                    return true;
+                },
+                scheduleBake() {
+                    const volume = ensureStudioGiVolume();
+                    if (!volume?.isSupported?.()) return false;
+                    volume.scheduleBake?.();
+                    scheduleGiVolumeFromCurrentScene({ delay: 0, refresh: false, lightRefresh: true, reason: 'manual-light-bake' });
+                    return true;
+                },
+                getStats: () => giVolume?.getStats?.() ?? { active: false, available: false, lazy: true },
+            };
+        }
+
+        if (isAdvancedWebGpuLighting) {
+            installStudioGiConsoleHandle();
+            if (shouldAutoStartStudioGiVolume()) {
+                window.maxjsGI.enable();
+            }
+        }
+
+        // HALO-GI: BVH-traced DDGI probe field (docs/GI_HALO_design.md) — the
+        // speedball probes. SPECTRAL-ONLY: standard mode is vanilla three.js
+        // (native LightProbe / LightProbeGrid GI) and must never run speedball.
+        // In spectral the field is constructed up front and ON by default — it
+        // IS the live view, and because it shares the BVH/traversal core with
+        // the path tracer (spectral_traverse.js) the PT ⇄ DDGI switch is
+        // instant. window.MAXJS_HALO_GI = false force-disables. When enabled it
+        // mutes the surfel giVolume to avoid double-counting and ticks every
+        // frame — the field self-gates on idle and auto-throttles its own ray
+        // budget. The probe node only injects into context.irradiance while
+        // active, so a disabled field changes nothing.
+        if (isWebGpuBackend && isStudioMode) {
+            try {
+                const haloField = createHaloProbeField({
+                    renderer,
+                    scene,
+                    intensity: haloGiSettings.intensity,
+                    hysteresis: haloGiSettings.hysteresis,
+                    divisions: haloGiSettings.divisions,
+                    onRebuilt: markLightProbeMaterialsDirty,
+                });
+                applyHaloGiTuning(haloField);
+                let haloOn = haloGiSettings.enabled === true;
+                haloGi = {
+                    field: haloField,
+                    isOn: () => haloOn && haloField.isSupported(),
+                    enable({ applySettings = true } = {}) {
+                        if (!haloField.isSupported()) { console.warn('HALO-GI needs the WebGPU backend'); return false; }
+                        haloOn = true;
+                        haloGiSettings.enabled = true;
+                        if (giVolume) { giVolume.setEnabled(false); giVolume.setIntensity(0); }
+                        if (applySettings) applyHaloGiTuning(haloField);
+                        haloField.setEnabled(true);
+                        haloField.requestRebuild();
+                        // The fold-in recompile is forced by the field's onRebuilt hook
+                        // (markLightProbeMaterialsDirty) the moment the first rebuild
+                        // produces probe data — same frame the data exists, not a rebuild
+                        // late. Fires once per rebuild (debounced), never per tick.
+                        window.__maxjsSyncGiPanel?.(); // mirror On state in the FX panel (incl. auto-enable on reload)
+                        return true;
+                    },
+                    disable({ applySettings = true } = {}) {
+                        haloOn = false;
+                        haloGiSettings.enabled = false;
+                        if (applySettings) applyHaloGiTuning(haloField);
+                        haloField.setEnabled(false);
+                        markLightProbeMaterialsDirty(); // one-shot: drop the probe node from the lights graph this frame
+                        window.__maxjsSyncGiPanel?.();
+                    },
+                    setIntensity: (v) => setHaloGiSetting('intensity', v),
+                    setDivisions: (v) => setHaloGiSetting('divisions', v),
+                    setRays: (v) => setHaloGiSetting('rays', v),
+                    setCascades: (v) => setHaloGiSetting('cascades', v),
+                    setContinuous: (v) => setHaloGiSetting('continuous', v),
+                    setHysteresis: (v) => setHaloGiSetting('hysteresis', v),
+                    setHysteresisNormalize: (v) => setHaloGiSetting('hysteresisNormalize', v),
+                    setNormalBias: (v) => setHaloGiSetting('normalBias', v),
+                    setRadianceClamp: (v) => setHaloGiSetting('radianceClamp', v),
+                    setDepthSharpness: (v) => setHaloGiSetting('depthSharpness', v),
+                    setCheby: (v) => setHaloGiSetting('cheby', v), // 0 leaks, 1 leak-free
+                    setChebyStrength: (v) => setHaloGiSetting('cheby', v),
+                    setClassify: (v) => setHaloGiSetting('classify', v), // 0 off (default), 1 drop buried probes (solid scenes)
+                    setClassifyStrength: (v) => setHaloGiSetting('classify', v),
+                    setFilter: (v) => setHaloGiSetting('filter', v),     // CORE denoise: 0 off (baseline), 1 full intra-tile spatial filter
+                    setFilterStrength: (v) => setHaloGiSetting('filter', v),
+                    setSmoothness: (v) => setHaloGiSetting('smoothness', v),     // UI "Smoothness": widen the denoise edge-stop (kills GI splotch)
+                    setChangeThreshold: (v) => setHaloGiSetting('changeThreshold', v),
+                    setSnapAmount: (v) => setHaloGiSetting('snapAmount', v),
+                    setFireflyClamp: (v) => setHaloGiSetting('fireflyClamp', v),
+                    resetDefaults: () => resetHaloGiToDefaults({ persist: true }),
+                    getSettings: () => serializeHaloGiState(),
+                    setBounds: (box) => haloField.setBounds(box),     // single Probe Origin box; null = auto-fit
+                    setVolumes: (boxes) => haloField.setVolumes(boxes), // multiple Probe Origin boxes (unioned for now)
+                    getStats: () => haloField.getStats(),
+                    tick(nowMs) {
+                        if (!haloOn || isPathTracingMode || !haloField.isSupported()) return;
+                        // Tick EVERY frame, exactly like the speedball standalone — the
+                        // field self-gates on viewport idle and auto-throttles its ray
+                        // budget from measured tick-to-tick dt. An external cadence cap
+                        // (the old ~30 Hz throttle) reads as GPU pressure to that
+                        // auto-throttle and pins the budget at the floor: 12× less
+                        // solve throughput than the standalone = laggy convergence.
+                        void haloField.tick({
+                            idleMs: nowMs - haloGiLastInteractionMs,
+                            playing: !!maxTimeline?.playing?.(),
+                        });
+                    },
+                };
+                window.maxjsHaloGI = haloGi; // console handle
+                if (haloOn) haloGi.enable({ applySettings: false });
+            } catch (err) {
+                maxjsDebugWarn?.('max.js HALO-GI init failed:', err);
+                haloGi = null;
+            }
+        }
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.08;
+        controls.zoomToCursor = true;
+        controls.screenSpacePanning = false;
+        controls.mouseButtons = {
+            LEFT: null,               // reserved for selection
+            MIDDLE: THREE.MOUSE.PAN,  // middle = pan
+            RIGHT: null               // reserved
+        };
+        controls.zoomSpeed = 2.0;
+        controls.rotateSpeed = 0.5;
+        controls.panSpeed = 1.0;
+        // Alt+MMB = orbit (3ds Max style) — capture phase to beat OrbitControls
+        renderer.domElement.addEventListener('pointerdown', e => {
+            if (e.button === 1 && controls.enabled) {
+                controls.mouseButtons.MIDDLE = e.altKey ? THREE.MOUSE.ROTATE : THREE.MOUSE.PAN;
+            }
+        }, true);
+        renderer.domElement.addEventListener('pointerup', e => {
+            if (e.button === 1) {
+                controls.mouseButtons.MIDDLE = THREE.MOUSE.PAN;
+            }
+        }, true);
+        controls.enabled = false;  // cam lock ON by default
+
+        // Grid lives in Max space under the basis root, so the default helper plane
+        // lands on Max's XY ground plane without extra rotations.
+        const grid = new THREE.GridHelper(200, 20, 0x555555, 0x444444);
+        grid.visible = false;
+        grid.userData.maxjsExcludeFromRuntimeSnapshot = true;
+        overlayRoot.add(grid);
+
+        // Live viewer fallback lighting — camera-following headlight rig used
+        // when the Max scene has no authored lights or environment.
+        const defaultLights = new THREE.Group();
+        const defaultAmbient = new THREE.AmbientLight(0xffffff, 0.4);
+        defaultAmbient.userData.volumetricBypass = true;
+        defaultLights.add(defaultAmbient);
+        const defaultKey = new THREE.DirectionalLight(0xffffff, 2.5);
+        defaultKey.userData.volumetricBypass = true;
+        defaultKey.castShadow = false;
+        defaultKey.shadow.mapSize.set(2048, 2048);
+        defaultKey.shadow.camera.near = 0.1;
+        defaultKey.shadow.camera.far = 2000;
+        defaultKey.shadow.camera.left = -500;
+        defaultKey.shadow.camera.right = 500;
+        defaultKey.shadow.camera.top = 500;
+        defaultKey.shadow.camera.bottom = -500;
+        defaultKey.shadow.bias = -0.001;
+        defaultKey.shadow.normalBias = 0.02;
+        const defaultFill = new THREE.DirectionalLight(0xe8e8e8, 0.8);
+        defaultFill.userData.volumetricBypass = true;
+        defaultFill.position.set(-1, 1, 0.5);
+        defaultLights.add(defaultKey);
+        defaultLights.add(defaultFill);
+        scene.add(defaultLights);
+        function setDefaultLightsVisible(visible) {
+            const enabled = !isPathTracingMode && !!visible;
+            defaultLights.visible = enabled;
+            defaultAmbient.visible = enabled;
+            defaultKey.visible = enabled;
+            defaultFill.visible = enabled;
+        }
+        setDefaultLightsVisible(true);
+        const lightProbe = new THREE.LightProbe();
+        scene.add(lightProbe);
+        const skyProbeSH = new THREE.SphericalHarmonics3();
+        const skyProbeBasis = new Array(9).fill(0);
+        const skyProbeColor = new THREE.Vector3();
+        const skyProbeSunColor = new THREE.Vector3();
+        const skyReflectionDir = new THREE.Vector3();
+        const skyReflectionColor = new THREE.Vector3();
+        const skyProbeDirections = [
+            new THREE.Vector3(0, 1, 0),
+            new THREE.Vector3(0, -1, 0),
+            new THREE.Vector3(1, 0, 0),
+            new THREE.Vector3(-1, 0, 0),
+            new THREE.Vector3(0, 0, 1),
+            new THREE.Vector3(0, 0, -1),
+            new THREE.Vector3(0.58, 0.58, 0.58).normalize(),
+            new THREE.Vector3(-0.58, 0.58, 0.58).normalize(),
+            new THREE.Vector3(0.58, 0.58, -0.58).normalize(),
+            new THREE.Vector3(-0.58, 0.58, -0.58).normalize(),
+            new THREE.Vector3(0.58, -0.58, 0.58).normalize(),
+            new THREE.Vector3(-0.58, -0.58, 0.58).normalize(),
+            new THREE.Vector3(0.58, -0.58, -0.58).normalize(),
+            new THREE.Vector3(-0.58, -0.58, -0.58).normalize(),
+        ];
+
+        // ── Loaders & Caches ────────────────────────────────
+        const textureLoader = new THREE.TextureLoader();
+        const webglTextureLoader = new THREE_STD.TextureLoader();
+        const rgbeLoader = new HDRLoader();
+        const exrLoader = new EXRLoader();
+        suppressKnownExrMetadataWarnings(exrLoader);
+        textureLoader.setCrossOrigin?.('anonymous');
+        webglTextureLoader.setCrossOrigin?.('anonymous');
+        rgbeLoader.setCrossOrigin?.('anonymous');
+        exrLoader.setCrossOrigin?.('anonymous');
+        const PMREMGeneratorCtor = renderer?.isWebGLRenderer === true
+            ? THREE_STD.PMREMGenerator
+            : THREE.PMREMGenerator;
+        const pmremGenerator = new PMREMGeneratorCtor(renderer);
+        pmremGenerator.compileEquirectangularShader();
+
+        function retainPMREMTexture(renderTarget) {
+            const texture = renderTarget?.texture ?? null;
+            if (!texture) {
+                renderTarget?.dispose?.();
+                return null;
+            }
+            texture.userData ??= {};
+            if (!texture.userData.maxjsPMREMDisposeWrapped) {
+                let disposed = false;
+                const originalDispose = texture.dispose?.bind(texture);
+                texture.dispose = () => {
+                    if (disposed) return;
+                    disposed = true;
+                    const target = texture.userData?.maxjsPMREMRenderTarget;
+                    if (target) target.dispose?.();
+                    else originalDispose?.();
+                    if (texture.userData) {
+                        delete texture.userData.maxjsPMREMRenderTarget;
+                        delete texture.userData.maxjsPMREMDisposeWrapped;
+                    }
+                };
+                texture.userData.maxjsPMREMDisposeWrapped = true;
+            }
+            texture.userData.maxjsPMREMRenderTarget = renderTarget;
+            return texture;
+        }
+
+        function getTextureExtension(source) {
+            try {
+                const url = new URL(String(source || ''), window.location.href);
+                return (url.pathname.split('.').pop() || '').toLowerCase();
+            } catch {
+                const clean = String(source || '').split(/[?#]/, 1)[0];
+                return (clean.split('.').pop() || '').toLowerCase();
+            }
+        }
+
+        const hdrTextureExtensions = new Set(['hdr', 'exr']);
+
+        function colorSpaceForTextureExtension(ext, requestedColorSpace) {
+            return hdrTextureExtensions.has(ext) && requestedColorSpace === THREE.SRGBColorSpace
+                ? THREE.LinearSRGBColorSpace
+                : requestedColorSpace;
+        }
+
+        function suppressKnownExrMetadataWarnings(loader) {
+            if (!loader || loader.userData?.maxjsQuietM44fHeader) return loader;
+            const originalParse = typeof loader.parse === 'function' ? loader.parse.bind(loader) : null;
+            if (!originalParse) return loader;
+            loader.parse = (...args) => {
+                const previousWarn = console.warn;
+                console.warn = (...warnArgs) => {
+                    const msg = String(warnArgs?.[0] ?? '');
+                    if (msg.includes('THREE.EXRLoader: Skipped unknown header attribute type') &&
+                        msg.includes('m44f')) {
+                        return;
+                    }
+                    previousWarn.apply(console, warnArgs);
+                };
+                try {
+                    return originalParse(...args);
+                } finally {
+                    console.warn = previousWarn;
+                }
+            };
+            loader.userData = { ...(loader.userData || {}), maxjsQuietM44fHeader: true };
+            return loader;
+        }
+
+        const browserTextureExtensions = new Set([
+            'png', 'jpg', 'jpeg', 'webp', 'bmp', 'gif', 'avif', 'svg',
+            'exr', 'hdr',
+        ]);
+
+        function canBrowserLoadTextureExtension(ext) {
+            return !ext || browserTextureExtensions.has(ext);
+        }
+
+        const videoTextureExtensions = new Set(['mp4', 'm4v', 'webm', 'mov', 'ogv']);
+
+        function isVideoTextureExtension(ext) {
+            return !!ext && videoTextureExtensions.has(ext);
+        }
+
+        function loadEnvironmentTexture(url, sourceName, onLoad, onProgress, onError) {
+            const ext = getTextureExtension(sourceName || url);
+            const loader = ext === 'exr'
+                ? exrLoader
+                : (ext === 'hdr' ? rgbeLoader : textureLoader);
+
+            loader.load(url, (texture) => {
+                texture.colorSpace = colorSpaceForTextureExtension(ext, THREE.SRGBColorSpace);
+                texture.mapping = THREE.EquirectangularReflectionMapping;
+                onLoad(texture);
+            }, onProgress, onError);
+        }
+
+        const textureCache = new Map();
+        const failedTextureCache = new Set();
+        let pendingTextureLoads = 0;
+        const materialCache = new Map();
+        const materialXTemplateCache = new Map();
+        const materialXLoadCache = new Map();
+        const materialRegistry = new Map();
+        let nextMaterialRegistryId = 1;
+        let materialRegistryFrame = 0;
+        let materialRegistryStats = {
+            uniqueMaterials: 0,
+            materialTemplates: 0,
+            materialRefs: 0,
+            bucketedRefs: 0,
+            instanceBuckets: 0,
+            maxRefsPerMaterial: 0,
+        };
+        const nodeMap = new Map();
+        const maxInstanceBuckets = new Map(); // bucketKey -> { mesh, materialKey, sourceHandle, handles:Set, handleToIndex:Map, transforms:Map, visible:Map }
+        const maxInstanceHandleToBucket = new Map(); // handle -> bucketKey
+        let lastMaxInstanceBucketSignature = '';
+        let animationSystem = null;
+        let audioSystem = null;
+        let audioMuted = readPersistedAudioMuted();
+        let gltfSystem = null;
+        let webappSystem = null;
+        const splatHandleMap = new Map();
+        const splatMatrix = new THREE_STD.Matrix4();
+        const splatPosition = new THREE_STD.Vector3();
+        const splatQuaternion = new THREE_STD.Quaternion();
+        const splatScale = new THREE_STD.Vector3();
+        let splatMutationQueue = Promise.resolve();
+        let splatOverlay = null;
+        const perfHud = createPerfHud(document.getElementById('info'));
+        perfHud.setStatus(`max.js - ${rendererBackendLabel} renderer ready`);
+
+        const DEBUG_STORAGE_KEY = 'maxjs_debug';
+        const PROFILE_SCENE_STORAGE_KEY = 'maxjs_profile_scene';
+        const SLOW_JSON_SYNC_STORAGE_KEY = 'maxjs_slow_json_sync';
+        const LEGACY_LIVE_SYNC_DISABLED_STORAGE_KEY = 'maxjs_live_sync_disabled';
+        const isStandalone = !(window.chrome?.webview?.postMessage);
+        const urlMode = new URLSearchParams(location.search).get('mode');
+        let buildMode = urlMode || (isStandalone ? 'release' : 'dev');
+        var debugMode = false;
+        let slowJsonSyncMode = false;
+
+        function syncAudioMuteButtonUi() {
+            const button = document.getElementById('btnMuteAudio');
+            if (!button) return;
+            const label = audioMuted ? 'Unmute audio' : 'Mute audio';
+            button.classList.toggle('active', audioMuted);
+            button.title = label;
+            button.setAttribute('aria-label', label);
+        }
+
+        function setAudioMuted(nextMuted, { persist = true } = {}) {
+            audioMuted = !!nextMuted;
+            audioSystem?.setMuted?.(audioMuted);
+            if (persist) {
+                try { localStorage.setItem(AUDIO_MUTED_STORAGE_KEY, audioMuted ? 'true' : 'false'); } catch {}
+            }
+            syncAudioMuteButtonUi();
+        }
+
+        try {
+            const raw = localStorage.getItem(DEBUG_STORAGE_KEY);
+            if (raw === 'true') debugMode = true;
+            else if (raw === 'false') debugMode = false;
+            else {
+                // Unset: loud inside Max; quiet for hosted snapshots (release). ?mode=dev defaults verbose.
+                debugMode = !isStandalone || buildMode !== 'release';
+            }
+        } catch (_) {
+            debugMode = !isStandalone;
+        }
+        try {
+            slowJsonSyncMode =
+                localStorage.getItem(SLOW_JSON_SYNC_STORAGE_KEY) === 'true' ||
+                localStorage.getItem(LEGACY_LIVE_SYNC_DISABLED_STORAGE_KEY) === 'true';
+        } catch (_) {
+            slowJsonSyncMode = false;
+        }
+        function maxjsDebugLog(...args) {
+            if (debugMode) console.log(...args);
+        }
+        function maxjsDebugWarn(...args) {
+            if (debugMode) console.warn(...args);
+        }
+        function isSceneProfilingEnabled() {
+            try {
+                return localStorage.getItem(PROFILE_SCENE_STORAGE_KEY) === 'true';
+            } catch (_) {
+                return false;
+            }
+        }
+
+        const maxjsFx = createMaxJSFxController({
+            renderer,
+            scene,
+            camera,
+            backendLabel: rendererBackendLabel,
+            environmentVisible: false,
+            hiddenBackgroundColor,
+            onError(message) {
+                perfHud.setStatus(`max.js - ${message}`);
+            },
+        });
+        // Default camera light available for contact shadows from the start
+        if (maxjsFx.setMainLight) maxjsFx.setMainLight(defaultKey);
+
+        function setBackgroundColor(hex = hiddenBackgroundColor) {
+            hiddenBackgroundColor = hex >>> 0;
+            viewportBackgroundColor.setHex(hiddenBackgroundColor);
+            syncViewportBackdrop();
+            maxjsFx.setHiddenBackgroundColor(hiddenBackgroundColor);
+            geospatialSky?.setFallbackBackground?.(hiddenBackgroundColor);
+            saveBackgroundColor();
+            syncBackgroundColorSlot();
+            savePostFxState();
+        }
+
+        function getEnvironmentBackgroundMap() {
+            if (isLocalHdriActive() && localHdriEnvMap) return localHdriEnvMap;
+            if (currentHdriEnvMap) return currentHdriEnvMap;
+            const bg = scene.environment;
+            return bg && !bg.isColor ? bg : null;
+        }
+
+        function syncViewportBackdrop(envMap = getEnvironmentBackgroundMap()) {
+            applyViewportBackdropColor(envVisible && !envMap ? hiddenBackgroundColor : null);
+        }
+
+        function syncEnvironmentDisplay() {
+            const envMap = getEnvironmentBackgroundMap();
+            localHdriShowBg = envVisible && !!envMap;
+            syncViewportBackdrop(envMap);
+            if (envVisible && envMap) {
+                scene.background = envMap;
+                if (isLocalHdriActive()) {
+                    scene.backgroundIntensity = localHdriIntensity;
+                    scene.userData.maxjsPathTraceBackground = localHdriRawTexture || null;
+                } else {
+                    scene.userData.maxjsPathTraceBackground = currentHdriRawTexture || null;
+                    if (localHdriBlur) scene.backgroundBlurriness = localHdriBlur;
+                }
+                maxjsFx.setEnvironmentVisible(true);
+            } else {
+                scene.background = null;
+                if (!envVisible) scene.userData.maxjsPathTraceBackground = null;
+                maxjsFx.setEnvironmentVisible(false);
+            }
+            maxjsFx.markEnvironmentChanged?.();
+        }
+
+        function syncDefaultLightsVisibility() {
+            const environmentLightingActive = !!(
+                currentHdriUrl
+                || (isLocalHdriLoaded() && localHdriEnabled)
+                || skyActive
+            );
+            setDefaultLightsVisible(lightHandleMap.size === 0 && !environmentLightingActive);
+        }
+
+        function resetEnvironmentLighting({ restoreDefaultLights = true } = {}) {
+            if (lightProbeRefreshTimer) {
+                clearTimeout(lightProbeRefreshTimer);
+                lightProbeRefreshTimer = 0;
+            }
+            currentHdriProbeSignature = '';
+            hdriLoadGeneration += 1;
+            clearLightProbe();
+            markLightProbeSceneDirty();
+            markLightProbeMaterialsDirty();
+            if (restoreDefaultLights) {
+                syncDefaultLightsVisibility();
+            }
+            maxjsFx.markEnvironmentChanged?.();
+        }
+
+        const webglBasicFx = createWebGLBasicFx({
+            THREE: THREE_STD,
+            renderer,
+            scene,
+            camera,
+            backendLabel: rendererBackendLabel,
+            onError(message, error) {
+                console.warn(message, error);
+            },
+        });
+        window.maxjsWebGLBasicFx = webglBasicFx;
+
+        // Forward viewport clicks to HTML texmap content. Raycast hits a
+        // mesh whose material has any HTML-texture map slot → convert UV
+        // hit to host pixel coords → dispatch click to the matching DOM
+        // element inside the texture's shadow tree.
+        attachHTMLClickForwarding(THREE, renderer, () => ({ camera, scene }));
+
+        // Pointer input for depth-occluded web panels (behind-canvas CSS3D).
+        // Reads targets lazily — webappSystem is created later in startup.
+        attachDomPanelForwarding({
+            THREE,
+            renderer,
+            getCameraScene: () => ({ camera, scene }),
+            getTargets: () => webappSystem?.listForwardTargets?.() ?? [],
+        });
+
+        // Shader Lab FX — optional custom pass consumed by the unified
+        // Post FX controller. Toggled from the right rail. Loads React +
+        // @basementstudio/shader-lab from esm.sh on first enable.
+        const shaderLabFx = createShaderLabFx({ THREE, renderer, scene, camera });
+        maxjsFx.setShaderLabFx?.(shaderLabFx);
+        const pathTracingSettings = {
+            samplesPerFrame: 64,
+            giClamp: 8.0,
+            freezeSync: false,
+            paused: false,
+            sampleLimit: 0, // 0 = unlimited; >0 converges then stops (frees GPU)
+        };
+        let ptPauseUiSync = null; // set when the PT pause toggle is created
+
+        function beginTextureLoad() {
+            pendingTextureLoads += 1;
+        }
+
+        function endTextureLoad() {
+            pendingTextureLoads = Math.max(0, pendingTextureLoads - 1);
+        }
+        const pathTracingFx = createSpectralTracer({
+            renderer,
+            scene,
+            camera,
+            enabled: isStudioMode, // spectral mode: view toggles live via setSpectralView()
+            settings: pathTracingSettings,
+            onStatus(message) {
+                perfHud.setStatus(message);
+            },
+            onError(error) {
+                reportBridgeError('pathtracing', error);
+            },
+        });
+        if (isStudioMode || String(rendererBackendLabel || '') === 'WebGL Mode') {
+            pathTracingFx.preload?.();
+        }
+        const PATH_TRACING_RASTER_WARMUP_FRAMES = 2;
+        const PATH_TRACING_TEXTURE_WAIT_MS = 3000;
+        const PATH_TRACING_CAPTURE_DEFAULT_SAMPLES = 64;
+        const PATH_TRACING_LIVE_REBUILD_DELAY_MS = 180;
+
+        function isPathTracingViewActive() {
+            return isPathTracingMode && pathTracingFx.isEnabled?.() === true;
+        }
+
+        function leavePathTracingView() {
+            clearScheduledPathTracingLiveRebuild();
+            pathTracingFx.setToneMapInBlit?.(true);
+            maxjsFx.setPathTracedSource?.(null);
+        }
+
+        // Live spectral-view switch: probe GI <-> path tracer, no reload.
+        // The probe ticker checks isPathTracingMode per tick and the render
+        // loop gates the PT branch on it. Leaving trace view must also clear
+        // the post stack's PT source, otherwise regular spectral/probe frames
+        // keep presenting the last path-traced texture.
+        function setSpectralView(view) {
+            const next = view === 'trace' ? 'trace' : 'probes';
+            if (!isStudioMode || spectralView === next) return spectralView;
+            spectralView = next;
+            isPathTracingMode = next === 'trace';
+            document.body.classList.toggle('pathtracing-mode', isPathTracingMode);
+            try { localStorage.setItem(MAXJS_SPECTRAL_VIEW_KEY, next); } catch {}
+            if (isPathTracingMode) {
+                pathTracingFx.start?.();
+                resetPathTracingStartupWarmup();
+            } else {
+                leavePathTracingView();
+            }
+            window.__maxjsSyncSpectralViewUi?.();
+            if (window.chrome?.webview) sendPathTracingRuntimeState();
+            return spectralView;
+        }
+        window.maxjsSpectral = { getView: () => spectralView, setView: setSpectralView };
+        let pathTracingRasterWarmupFrames = 0;
+        let pathTracingWarmupStartedAt = 0;
+        let pathTracingLiveRebuildTimer = 0;
+        let pathTracingLiveRebuildQueued = false;
+
+        // Linear-HDR target the path tracer blits into when its output is routed
+        // through the camera post stack (bloom/grade/grain + PowerShot). The
+        // post stack gates its own gbuffer effects (SSGI/SSR/...) once a PT
+        // source is set, so only the color-domain effects fold over PT's beauty.
+        let pathTracingPostTarget = null;
+        function ensurePathTracingPostTarget() {
+            if (typeof THREE.RenderTarget !== 'function') return null;
+            const v = new THREE.Vector2();
+            renderer.getDrawingBufferSize(v);
+            const w = Math.max(1, Math.floor(v.x));
+            const h = Math.max(1, Math.floor(v.y));
+            if (pathTracingPostTarget && (pathTracingPostTarget.width !== w || pathTracingPostTarget.height !== h)) {
+                pathTracingPostTarget.dispose();
+                pathTracingPostTarget = null;
+            }
+            if (!pathTracingPostTarget) {
+                pathTracingPostTarget = new THREE.RenderTarget(w, h, {
+                    type: THREE.HalfFloatType,
+                    colorSpace: THREE.LinearSRGBColorSpace,
+                    depthBuffer: false,
+                });
+            }
+            return pathTracingPostTarget;
+        }
+
+        function hasPathTracingPostFxActive() {
+            return !!(
+                shaderLabFx?.isEnabled?.()
+                || maxjsFx.isBloomEnabled?.()
+                || maxjsFx.isPixelEnabled?.()
+                || maxjsFx.isRetroEnabled?.()
+                || maxjsFx.isPowerShotEnabled?.()
+            );
+        }
+
+        function computePathTracingApertureRadius(dof = {}) {
+            const focusDistance = Math.max(0.01, Number(dof.focusDistance) || 5);
+            const dofRange = Math.max(0.01, Number(dof.focalLength) || focusDistance);
+            const bokehScale = Math.max(0, Number(dof.bokehScale) || 0);
+            if (bokehScale <= 0) return 0;
+
+            // Post DOF's "focalLength" is a transition range, not optical focal
+            // length. Map a narrower range to a stronger PT lens radius, but
+            // ramp it gently so the focus plane stays usable.
+            const bokehFactor = Math.min(1, bokehScale / 30);
+            const rangeFactor = Math.sqrt(Math.min(16, Math.max(0.05, focusDistance / dofRange)));
+            const radius = focusDistance * bokehFactor * rangeFactor * 0.006;
+            return Math.max(0, Math.min(radius, focusDistance * 0.02));
+        }
+
+        function syncPathTracingDofFromPostFx() {
+            if (!pathTracingFx?.setDOF) return;
+            const dof = maxjsFx.getState?.().dof || {};
+            const enabled = maxjsFx.isDofEnabled?.() === true && camera?.isPerspectiveCamera === true;
+            const focusDistance = Math.max(0.01, Number(dof.focusDistance) || camera.position.distanceTo(controls.target) || 5);
+            pathTracingFx.setDOF({
+                enabled,
+                focusDistance,
+                apertureRadius: enabled ? computePathTracingApertureRadius({ ...dof, focusDistance }) : 0,
+            });
+        }
+
+        // One PT live frame: route through the post stack when beauty-only or
+        // final stylize effects are on, else blit straight to the canvas.
+        function renderPathTracingLiveFrame() {
+            syncPathTracingDofFromPostFx();
+            const wantPost = !renderToImageActive
+                && maxjsFx.isAvailable?.()
+                && hasPathTracingPostFxActive();
+            if (wantPost) {
+                const rt = ensurePathTracingPostTarget();
+                if (rt) {
+                    pathTracingFx.setToneMapInBlit?.(false); // emit linear HDR
+                    const prevTarget = renderer.getRenderTarget();
+                    renderer.setRenderTarget(rt);
+                    const ok = pathTracingFx.render?.();
+                    renderer.setRenderTarget(prevTarget);
+                    if (ok) {
+                        maxjsFx.setPathTracedSource?.(rt.texture);
+                        maxjsFx.render();
+                        return;
+                    }
+                }
+            }
+            // Direct path: the blit tone-maps straight to the canvas.
+            pathTracingFx.setToneMapInBlit?.(true);
+            maxjsFx.setPathTracedSource?.(null);
+            if (!pathTracingFx.render?.()) renderPathTracingFallbackFrame();
+        }
+
+        function normalizePathTracingSamplesPerFrame(value) {
+            const n = Math.round(Number(value));
+            if (!Number.isFinite(n)) return 64;
+            return Math.max(1, Math.min(512, n));
+        }
+
+        function normalizePathTracingGIClamp(value) {
+            const n = Number(value);
+            if (!Number.isFinite(n)) return 8.0;
+            return Math.max(1.0, Math.min(1000.0, n));
+        }
+
+        function normalizePathTracingSampleLimit(value) {
+            const n = Math.round(Number(value));
+            if (!Number.isFinite(n) || n <= 0) return 0; // 0 = unlimited
+            return Math.min(100000, n);
+        }
+
+        function resetPathTracingStartupWarmup() {
+            pathTracingRasterWarmupFrames = 0;
+            pathTracingWarmupStartedAt = 0;
+        }
+
+        function canStartPathTracingNow() {
+            if (!isPathTracingMode || !bridgeHasInitialSync()) return false;
+            if (pathTracingWarmupStartedAt <= 0) pathTracingWarmupStartedAt = performance.now();
+            if (pathTracingRasterWarmupFrames < PATH_TRACING_RASTER_WARMUP_FRAMES) return false;
+            const waitedMs = performance.now() - pathTracingWarmupStartedAt;
+            if (pendingTextureLoads > 0 && waitedMs < PATH_TRACING_TEXTURE_WAIT_MS) return false;
+            return true;
+        }
+
+        function renderPathTracingFallbackFrame() {
+            return pathTracingFx.clearFrame?.() === true;
+        }
+
+        function clearScheduledPathTracingLiveRebuild() {
+            if (pathTracingLiveRebuildTimer) {
+                clearTimeout(pathTracingLiveRebuildTimer);
+                pathTracingLiveRebuildTimer = 0;
+            }
+            pathTracingLiveRebuildQueued = false;
+        }
+
+        function markPathTracingSceneDirtyNow() {
+            clearScheduledPathTracingLiveRebuild();
+            if (pathTracingFx.isEnabled?.()) {
+                pathTracingFx.markSceneDirty?.();
+            }
+        }
+
+        function schedulePathTracingLiveRebuild() {
+            if (!isPathTracingMode || !pathTracingFx.isStarted?.()) return;
+            if (pathTracingSettings.freezeSync) return;
+            if (pathTracingLiveRebuildQueued) return;
+            pathTracingLiveRebuildQueued = true;
+            pathTracingLiveRebuildTimer = setTimeout(() => {
+                pathTracingLiveRebuildTimer = 0;
+                pathTracingLiveRebuildQueued = false;
+                if (isPathTracingMode && !pathTracingSettings.freezeSync) {
+                    pathTracingFx.markSceneDirty?.();
+                }
+            }, PATH_TRACING_LIVE_REBUILD_DELAY_MS);
+        }
+
+        function sendPathTracingRuntimeState() {
+            bridge.send('pathtracing_settings', {
+                samplesPerFrame: pathTracingSettings.samplesPerFrame,
+                giClamp: pathTracingSettings.giClamp,
+                freezeSync: pathTracingSettings.freezeSync,
+                paused: pathTracingSettings.paused,
+                sampleLimit: pathTracingSettings.sampleLimit,
+                active: isPathTracingMode,
+            });
+        }
+
+        function applyPathTracingSettings(next = {}, { notify = false, sendHost = false } = {}) {
+            const wasFrozen = pathTracingSettings.freezeSync === true;
+            pathTracingSettings.samplesPerFrame = normalizePathTracingSamplesPerFrame(
+                next.samplesPerFrame ?? pathTracingSettings.samplesPerFrame,
+            );
+            pathTracingSettings.giClamp = normalizePathTracingGIClamp(
+                next.giClamp ?? pathTracingSettings.giClamp,
+            );
+            pathTracingSettings.sampleLimit = normalizePathTracingSampleLimit(
+                next.sampleLimit ?? pathTracingSettings.sampleLimit,
+            );
+            if (next.freezeSync != null) pathTracingSettings.freezeSync = next.freezeSync === true;
+            if (next.paused != null) {
+                pathTracingSettings.paused = next.paused === true;
+                // Pause stops all compute dispatch → GPU idle → UI panels stay
+                // responsive while the last accumulated frame holds on screen.
+                pathTracingFx.setPaused?.(pathTracingSettings.paused);
+                ptPauseUiSync?.();
+            }
+            pathTracingFx.setOptions?.(pathTracingSettings);
+            if (wasFrozen && !pathTracingSettings.freezeSync && isPathTracingMode && bridgeHasInitialSync()) {
+                // C++ still advanced its sent-state caches while JS was ignoring updates.
+                // Ask for one authoritative resync when accumulation is unfrozen.
+                bridge.send('scene_dirty', { reason: 'pathtracing_unfreeze' });
+                markPathTracingSceneDirtyNow();
+            }
+            if (sendHost && window.chrome?.webview) {
+                sendPathTracingRuntimeState();
+            }
+            if (notify && isPathTracingMode) {
+                perfHud.setStatus(
+                    `max.js - PT samples/frame ${pathTracingSettings.samplesPerFrame}, GI clamp ${pathTracingSettings.giClamp.toFixed(1)}, sync ${pathTracingSettings.freezeSync ? 'frozen' : 'live'}`,
+                );
+            }
+        }
+
+        // Clone blob overlay — 2D canvas for bounding rectangles
+        blobOverlayCvs = document.createElement('canvas');
+        blobOverlayCvs.style.cssText = 'position:absolute;inset:0;pointer-events:none;z-index:10';
+        const initialBlobFrameRect = getViewportFrameRect();
+        blobOverlayCvs.width = initialBlobFrameRect.width;
+        blobOverlayCvs.height = initialBlobFrameRect.height;
+        applyFrameElementStyle(blobOverlayCvs, initialBlobFrameRect);
+        document.body.appendChild(blobOverlayCvs);
+        blobOverlayCtx = blobOverlayCvs.getContext('2d');
+
+        // Composition guide overlay — always-on-top framing helpers pinned to
+        // the viewport frame so they track Safe Frame cropping automatically.
+        compositionOverlay = createCompositionOverlay({
+            applyFrameStyle: applyFrameElementStyle,
+            getFrameRect: getViewportFrameRect,
+        });
+        compositionOverlay.resize(getViewportFrameRect());
+
+        addEventListener('resize', () => {
+            const rect = getViewportFrameRect();
+            blobOverlayCvs.width = rect.width;
+            blobOverlayCvs.height = rect.height;
+            applyFrameElementStyle(blobOverlayCvs, rect);
+            compositionOverlay?.resize(rect);
+            if (asciiActive && asciiEffect) {
+                asciiEffect.setSize(rect.width, rect.height);
+                applyFrameElementStyle(asciiEffect.domElement, rect);
+            }
+        });
+
+        function queueSplatMutation(work) {
+            splatMutationQueue = splatMutationQueue
+                .then(() => work())
+                .catch(error => {
+                    reportBridgeError('splat sync error', error);
+                });
+            return splatMutationQueue;
+        }
+
+        function splatsViewerEnabled() {
+            return performanceSettings.splatsEnabled !== false;
+        }
+
+        async function shutdownSplatViewer() {
+            const handles = [...splatHandleMap.keys()];
+            for (const h of handles) await removeTrackedSplat(h);
+            if (splatOverlay) {
+                try {
+                    splatOverlay.renderer?.dispose?.();
+                    splatOverlay.renderer?.domElement?.remove?.();
+                } catch (e) { /* ignore */ }
+                splatOverlay = null;
+            }
+            Spark = null;
+        }
+
+        async function ensureSplatOverlay() {
+            if (!splatsViewerEnabled()) return null;
+            if (splatOverlay) return splatOverlay;
+
+            if (!Spark) Spark = await import('@sparkjsdev/spark');
+
+            const overlayRenderer = new THREE_STD.WebGLRenderer({
+                antialias: true, alpha: true, premultipliedAlpha: true,
+            });
+            const rect = getViewportFrameRect();
+            overlayRenderer.setPixelRatio(getEffectivePixelRatio());
+            overlayRenderer.setSize(rect.width, rect.height, false);
+            overlayRenderer.setClearColor(0x000000, 0);
+            overlayRenderer.domElement.style.cssText = 'position:absolute;inset:0;pointer-events:none;z-index:5';
+            applyFrameElementStyle(overlayRenderer.domElement, rect);
+            overlayRenderer.outputColorSpace = THREE_STD.SRGBColorSpace;
+            document.body.appendChild(overlayRenderer.domElement);
+
+            const overlayScene = new THREE_STD.Scene();
+            const overlayCamera = new THREE_STD.PerspectiveCamera(camera.fov, camera.aspect, camera.near, camera.far);
+            const spark = new Spark.SparkRenderer({ renderer: overlayRenderer });
+            spark.frustumCulled = false;
+            overlayScene.add(spark);
+
+            splatOverlay = { renderer: overlayRenderer, scene: overlayScene, camera: overlayCamera, spark };
+            return splatOverlay;
+        }
+
+        function updateSplatCamera() {
+            if (!splatOverlay) return;
+            const oc = splatOverlay.camera;
+            oc.position.set(camera.position.x, camera.position.y, camera.position.z);
+            oc.quaternion.set(camera.quaternion.x, camera.quaternion.y, camera.quaternion.z, camera.quaternion.w);
+            oc.up.set(camera.up.x, camera.up.y, camera.up.z);
+            oc.near = Math.max(camera.near, 0.01);
+            oc.far = Math.max(camera.far, oc.near + 1.0);
+            oc.aspect = camera.aspect;
+            oc.fov = camera.fov;
+            oc.updateProjectionMatrix();
+            oc.updateMatrixWorld(true);
+        }
+
+        function applySplatTransform(mesh, splat) {
+            if (!mesh) return;
+
+            if (isFiniteArray(splat?.t, 16)) {
+                copyMaxMatrixArrayToWorldStd(splatMatrix, splat.t);
+                splatMatrix.decompose(splatPosition, splatQuaternion, splatScale);
+                mesh.position.copy(splatPosition);
+                mesh.quaternion.copy(splatQuaternion);
+                mesh.scale.copy(splatScale);
+            } else {
+                mesh.position.set(0, 0, 0);
+                mesh.quaternion.identity();
+                mesh.scale.set(1, 1, 1);
+            }
+
+            mesh.visible = splat?.v == null ? true : !!splat.v;
+        }
+
+        async function removeTrackedSplat(handle) {
+            const entry = splatHandleMap.get(handle);
+            if (!entry) return;
+            splatHandleMap.delete(handle);
+            if (entry.mesh.parent) entry.mesh.parent.remove(entry.mesh);
+            entry.mesh.dispose?.();
+        }
+
+        async function upsertTrackedSplat(splat) {
+            const handle = splat?.h;
+            if (handle == null) return;
+
+            if (!splatsViewerEnabled()) {
+                await removeTrackedSplat(handle);
+                return;
+            }
+
+            const url = typeof splat.url === 'string' ? splat.url : '';
+            if (!url) {
+                await removeTrackedSplat(handle);
+                return;
+            }
+
+            const existing = splatHandleMap.get(handle);
+
+            if (existing && existing.url === url) {
+                applySplatTransform(existing.mesh, splat);
+                return;
+            }
+
+            if (existing) {
+                await removeTrackedSplat(handle);
+            }
+
+            const overlay = await ensureSplatOverlay();
+            if (!overlay) return;
+            perfHud.setStatus(`max.js - Loading splat...`);
+            const mesh = new Spark.SplatMesh({ url });
+            mesh.name = splat.n || `Splat ${handle}`;
+            overlay.scene.add(mesh);
+            splatHandleMap.set(handle, { url, mesh });
+            applySplatTransform(mesh, splat);
+            perfHud.setStatus(`max.js - Splat ready: ${mesh.name}`);
+        }
+
+        function reconcileSplats(splats = []) {
+            return queueSplatMutation(async () => {
+                if (!splatsViewerEnabled()) {
+                    await shutdownSplatViewer();
+                    return;
+                }
+                const incomingHandles = new Set(splats.map(splat => splat.h));
+                const staleHandles = [];
+
+                for (const handle of splatHandleMap.keys()) {
+                    if (!incomingHandles.has(handle)) staleHandles.push(handle);
+                }
+
+                for (const handle of staleHandles) {
+                    await removeTrackedSplat(handle);
+                }
+
+                for (const splat of splats) {
+                    await upsertTrackedSplat(splat);
+                }
+            });
+        }
+
+        function applySplatUpdates(splats = []) {
+            if (!splats.length) return;
+            if (!splatsViewerEnabled()) return;
+
+            return queueSplatMutation(async () => {
+                for (const splat of splats) {
+                    await upsertTrackedSplat(splat);
+                }
+            });
+        }
+        function createSolidTexture(r, g, b, a = 255) {
+            const tex = new THREE.DataTexture(new Uint8Array([r, g, b, a]), 1, 1);
+            tex.colorSpace = THREE.NoColorSpace;
+            tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+            tex.minFilter = tex.magFilter = THREE.LinearFilter;
+            tex.needsUpdate = true;
+            tex.updateMatrix();
+            return tex;
+        }
+
+        function createSteppedGradientTexture(values) {
+            const data = new Uint8Array(values.length * 4);
+            for (let i = 0; i < values.length; i++) {
+                const value = values[i];
+                const offset = i * 4;
+                data[offset + 0] = value;
+                data[offset + 1] = value;
+                data[offset + 2] = value;
+                data[offset + 3] = 255;
+            }
+            const tex = new THREE.DataTexture(data, values.length, 1);
+            tex.colorSpace = THREE.NoColorSpace;
+            tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping;
+            tex.minFilter = tex.magFilter = THREE.NearestFilter;
+            tex.generateMipmaps = false;
+            tex.needsUpdate = true;
+            tex.updateMatrix();
+            return tex;
+        }
+
+        const fallbackWhiteTexture = createSolidTexture(255, 255, 255, 255);
+        const fallbackFlatNormalTexture = createSolidTexture(128, 128, 255, 255);
+        const fallbackHeightTexture = createSolidTexture(255, 255, 255, 255);
+        const fallbackToonGradientTexture = createSteppedGradientTexture([32, 96, 160, 255]);
+
+        let firstSync = true;
+        let camLock = true;
+        let physicalCameraDofActive = false;
+        let envVisible = false;
+        let lightProbeEnabled = true;
+        const lightProbeIntensity = 1.0;
+        let currentHdriUrl = null;
+        let currentHdriProbeSignature = '';
+        let currentEnvParams = null;
+        let currentHdriEnvMap = null;
+        let currentHdriRawTexture = null;
+        let hasLightProbeData = false;
+        let lightProbeGrid = null;
+        let hasLightProbeGridData = false;
+        let hdriLoadGeneration = 0;
+        let lightProbeSceneRevision = 0;
+        let lightProbeRefreshTimer = 0;
+        let lightProbeGridActive = null;
+
+        // Local HDRI override (independent of Max environment)
+        let localHdriObjectUrl = null;   // file loaded in memory
+        let localHdriEnvMap = null;      // cached PMREM texture
+        let localHdriRawTexture = null;  // equirect source for pathtracing
+        let localHdriFile = null;        // original picked/restored file for snapshot export
+
+        // No-op — env intensity is now controlled per-material via
+        // material.envMapIntensity using the patched materialEnvIntensity
+        // node (see import section). No need to stamp envMap on materials.
+        function syncMaterialEnvMaps() {}
+        let localHdriEnabled = true;     // on/off toggle (file stays loaded)
+        let localHdriFileName = '';
+        let localHdriRotation = 0;
+        let localHdriIntensity = 1.0;
+        let localHdriShowBg = false;
+        let localHdriBlur = 0;
+        let localHdriFlip = false;
+        let localHdriReflectionOnly = false;
+
+        function isLocalHdriLoaded() { return localHdriObjectUrl != null; }
+        function isLocalHdriActive() { return isLocalHdriLoaded() && localHdriEnabled; }
+        function isNativeWebGPUBackend() {
+            return rendererBackendLabel === 'WebGPU' && renderer?.backend?.isWebGPUBackend === true;
+        }
+        function isHdriReflectionOnlyEffective() {
+            return !!(localHdriReflectionOnly && isNativeWebGPUBackend() && isLocalHdriActive() && !hasAuthoredEnvironmentActive());
+        }
+        function applyHdriReflectionOnlyState({ markOutput = false } = {}) {
+            const active = isHdriReflectionOnlyEffective();
+            scene.userData.maxjsHdriReflectionOnly = active;
+            maxjsHdriDiffuseIntensity.value = active ? 0.0 : 1.0;
+            applyLightProbeState();
+            if (markOutput) {
+                markLightProbeMaterialsDirty();
+                maxjsFx.markEnvironmentChanged?.();
+                maxjsFx.markOutputChanged?.();
+            }
+        }
+
+        function clearCurrentHdriEnvMap() {
+            if (currentHdriEnvMap) {
+                const oldEnvMap = currentHdriEnvMap;
+                currentHdriEnvMap = null;
+                if (scene.environment === oldEnvMap) scene.environment = null;
+                if (scene.background === oldEnvMap) scene.background = null;
+                oldEnvMap.dispose?.();
+            }
+            if (currentHdriRawTexture) {
+                if (scene.userData.maxjsPathTraceEnvironment === currentHdriRawTexture) {
+                    scene.userData.maxjsPathTraceEnvironment = null;
+                }
+                if (scene.userData.maxjsPathTraceBackground === currentHdriRawTexture) {
+                    scene.userData.maxjsPathTraceBackground = null;
+                }
+                currentHdriRawTexture.dispose?.();
+                currentHdriRawTexture = null;
+            }
+        }
+
+        function applyLightProbeState() {
+            // Native three.js probes are standard-mode GI only — the spectral
+            // stack sources ALL probe GI from speedball (HALO-GI DDGI).
+            const probesAllowed = !isStudioMode;
+            const hdriDiffuseMuted = isHdriReflectionOnlyEffective();
+            const useGrid = probesAllowed && !hdriDiffuseMuted && lightProbeEnabled && hasLightProbeGridData && !!lightProbeGrid;
+            lightProbe.intensity = probesAllowed && !hdriDiffuseMuted && lightProbeEnabled && !useGrid ? lightProbeIntensity : 0.0;
+            if (lightProbeGrid) lightProbeGrid.visible = useGrid;
+            if (lightProbeGridActive !== useGrid) {
+                lightProbeGridActive = useGrid;
+                markLightProbeMaterialsDirty();
+            }
+        }
+
+        function clearLightProbe() {
+            lightProbe.copy(new THREE.LightProbe());
+            hasLightProbeData = false;
+            hasLightProbeGridData = false;
+            if (lightProbeGrid) {
+                if (lightProbeGrid.parent) lightProbeGrid.parent.remove(lightProbeGrid);
+                lightProbeGrid.dispose?.();
+                lightProbeGrid = null;
+            }
+            if (giVolume) { giVolume.setEnabled(false); syncGiVolumeActive(); }
+            applyLightProbeState();
+        }
+
+        function addSkyProbeSample(direction, radiance, weight) {
+            THREE.SphericalHarmonics3.getBasisAt(direction, skyProbeBasis);
+            for (let i = 0; i < 9; i++) {
+                skyProbeSH.coefficients[i].addScaledVector(radiance, skyProbeBasis[i] * weight);
+            }
+        }
+
+        function sampleSkyProbeRadiance(direction, params, sunDir, target) {
+            const up = THREE.MathUtils.clamp(direction.y * 0.5 + 0.5, 0, 1);
+            const horizon = 1.0 - Math.abs(direction.y);
+            const sunAmount = Math.pow(Math.max(direction.dot(sunDir), 0), 48);
+            const exposure = Math.max(0.25, skyNumber(params?.exposure, 0.5));
+            const sunStrength = Math.max(0.1, THREE.MathUtils.clamp(sunDir.y, -1, 1));
+
+            target.set(0.06, 0.065, 0.07);
+            target.lerp(new THREE.Vector3(0.22, 0.34, 0.58), Math.pow(up, 0.75));
+            target.addScaledVector(new THREE.Vector3(0.55, 0.62, 0.72), horizon * 0.12);
+            if (direction.y < 0) {
+                target.lerp(new THREE.Vector3(0.055, 0.05, 0.04), Math.min(1, -direction.y * 0.9));
+            }
+
+            skyProbeSunColor.set(1.0, 0.82, 0.56).multiplyScalar(sunAmount * (0.25 + sunStrength * 0.35));
+            target.add(skyProbeSunColor);
+            return target.multiplyScalar(0.55 + exposure * 0.35);
+        }
+
+        function sampleSkyReflectionRadiance(direction, params, sunDir, target) {
+            const up = THREE.MathUtils.clamp(direction.y * 0.5 + 0.5, 0, 1);
+            const horizon = Math.pow(1.0 - Math.abs(direction.y), 1.6);
+            const below = direction.y < 0 ? Math.min(1, -direction.y * 1.35) : 0;
+            const sunDot = Math.max(direction.dot(sunDir), 0);
+            const sunDisc = Math.pow(sunDot, 360);
+            const sunGlow = Math.pow(sunDot, 18);
+            const exposure = Math.max(0.25, skyNumber(params?.exposure, 0.5));
+            const rayleigh = THREE.MathUtils.clamp(skyNumber(params?.rayleigh, 3), 0, 8) / 8;
+            const turbidity = THREE.MathUtils.clamp(skyNumber(params?.turbidity, 10), 0, 20) / 20;
+
+            const zenithR = THREE.MathUtils.lerp(0.08, 0.18, turbidity);
+            const zenithG = THREE.MathUtils.lerp(0.22, 0.34, rayleigh);
+            const zenithB = THREE.MathUtils.lerp(0.72, 1.15, rayleigh);
+            const horizonR = THREE.MathUtils.lerp(0.55, 0.92, turbidity);
+            const horizonG = THREE.MathUtils.lerp(0.72, 0.78, turbidity);
+            const horizonB = THREE.MathUtils.lerp(0.98, 0.58, turbidity);
+
+            target.set(zenithR, zenithG, zenithB);
+            target.lerp(skyProbeColor.set(horizonR, horizonG, horizonB), horizon);
+            if (below > 0) {
+                target.lerp(skyProbeColor.set(0.028, 0.03, 0.034), below);
+            }
+            target.addScaledVector(skyProbeSunColor.set(1.0, 0.78, 0.42), sunGlow * 0.9 + sunDisc * 8.0);
+            return target.multiplyScalar(0.85 + exposure * 0.45);
+        }
+
+        function disposeSkyReflectionEnvironment() {
+            if (!skyEnvMap) return;
+            const oldSkyEnvMap = skyEnvMap;
+            skyEnvMap = null;
+            if (scene.environment === oldSkyEnvMap) scene.environment = null;
+            if (scene.background === oldSkyEnvMap) scene.background = null;
+            oldSkyEnvMap.dispose?.();
+        }
+
+        function disposeSkyPathTraceEnvironment() {
+            if (!skyPathTraceTexture) return;
+            const oldSkyPathTraceTexture = skyPathTraceTexture;
+            skyPathTraceTexture = null;
+            if (scene.userData.maxjsPathTraceEnvironment === oldSkyPathTraceTexture) {
+                scene.userData.maxjsPathTraceEnvironment = null;
+            }
+            if (scene.userData.maxjsPathTraceBackground === oldSkyPathTraceTexture) {
+                scene.userData.maxjsPathTraceBackground = null;
+            }
+            oldSkyPathTraceTexture.dispose?.();
+        }
+
+        function updateSkyPathTraceEnvironment(params, sunDir) {
+            if (!isPathTracingMode) return;
+            const canvas = document.createElement('canvas');
+            canvas.width = 384;
+            canvas.height = 192;
+            const ctx2d = canvas.getContext('2d', { willReadFrequently: false });
+            if (!ctx2d) return;
+            const image = ctx2d.createImageData(canvas.width, canvas.height);
+            const data = image.data;
+            let ptr = 0;
+            for (let y = 0; y < canvas.height; y++) {
+                const v = (y + 0.5) / canvas.height;
+                const phi = v * Math.PI;
+                const sinPhi = Math.sin(phi);
+                skyReflectionDir.y = Math.cos(phi);
+                for (let x = 0; x < canvas.width; x++) {
+                    const u = (x + 0.5) / canvas.width;
+                    const theta = u * Math.PI * 2 - Math.PI;
+                    skyReflectionDir.x = sinPhi * Math.sin(theta);
+                    skyReflectionDir.z = sinPhi * Math.cos(theta);
+                    sampleSkyReflectionRadiance(skyReflectionDir, params, sunDir, skyReflectionColor);
+                    data[ptr++] = Math.round(255 * Math.pow(THREE.MathUtils.clamp(skyReflectionColor.x, 0, 1), 1 / 2.2));
+                    data[ptr++] = Math.round(255 * Math.pow(THREE.MathUtils.clamp(skyReflectionColor.y, 0, 1), 1 / 2.2));
+                    data[ptr++] = Math.round(255 * Math.pow(THREE.MathUtils.clamp(skyReflectionColor.z, 0, 1), 1 / 2.2));
+                    data[ptr++] = 255;
+                }
+            }
+            ctx2d.putImageData(image, 0, 0);
+
+            const SkyTextureTHREE = renderer?.isWebGLRenderer === true ? THREE_STD : THREE;
+            const textureData = new Uint8Array(data);
+            const texture = new SkyTextureTHREE.DataTexture(
+                textureData,
+                canvas.width,
+                canvas.height,
+                SkyTextureTHREE.RGBAFormat || THREE.RGBAFormat,
+                SkyTextureTHREE.UnsignedByteType || THREE.UnsignedByteType,
+            );
+            texture.name = 'MaxJSSkyPathTraceEquirect';
+            texture.colorSpace = SkyTextureTHREE.SRGBColorSpace || THREE.SRGBColorSpace;
+            texture.mapping = SkyTextureTHREE.EquirectangularReflectionMapping || THREE.EquirectangularReflectionMapping;
+            texture.flipY = false;
+            texture.needsUpdate = true;
+
+            disposeSkyPathTraceEnvironment();
+            skyPathTraceTexture = texture;
+            scene.userData.maxjsPathTraceEnvironment = texture;
+            scene.userData.maxjsPathTraceBackground = texture;
+        }
+
+        function buildProceduralSkyReflectionEnvironment(params, sunDir) {
+            const SkyTextureTHREE = renderer?.isWebGLRenderer === true ? THREE_STD : THREE;
+            const canvas = document.createElement('canvas');
+            canvas.width = 256;
+            canvas.height = 128;
+            const ctx2d = canvas.getContext('2d', { willReadFrequently: false });
+            if (!ctx2d) return null;
+            const image = ctx2d.createImageData(canvas.width, canvas.height);
+            const data = image.data;
+            let ptr = 0;
+            for (let y = 0; y < canvas.height; y++) {
+                const v = (y + 0.5) / canvas.height;
+                const phi = v * Math.PI;
+                const sinPhi = Math.sin(phi);
+                skyReflectionDir.y = Math.cos(phi);
+                for (let x = 0; x < canvas.width; x++) {
+                    const u = (x + 0.5) / canvas.width;
+                    const theta = u * Math.PI * 2 - Math.PI;
+                    skyReflectionDir.x = sinPhi * Math.sin(theta);
+                    skyReflectionDir.z = sinPhi * Math.cos(theta);
+                    sampleSkyReflectionRadiance(skyReflectionDir, params, sunDir, skyReflectionColor);
+                    data[ptr++] = Math.round(255 * Math.pow(THREE.MathUtils.clamp(skyReflectionColor.x, 0, 1), 1 / 2.2));
+                    data[ptr++] = Math.round(255 * Math.pow(THREE.MathUtils.clamp(skyReflectionColor.y, 0, 1), 1 / 2.2));
+                    data[ptr++] = Math.round(255 * Math.pow(THREE.MathUtils.clamp(skyReflectionColor.z, 0, 1), 1 / 2.2));
+                    data[ptr++] = 255;
+                }
+            }
+            ctx2d.putImageData(image, 0, 0);
+
+            const texture = new SkyTextureTHREE.CanvasTexture(canvas);
+            texture.colorSpace = SkyTextureTHREE.SRGBColorSpace || THREE.SRGBColorSpace;
+            texture.mapping = SkyTextureTHREE.EquirectangularReflectionMapping || THREE.EquirectangularReflectionMapping;
+            const envMap = retainPMREMTexture(pmremGenerator.fromEquirectangular(texture));
+            texture.dispose?.();
+            if (envMap) envMap.name = 'MaxJSSkyReflectionProceduralPMREM';
+            return envMap;
+        }
+
+        function updateSkyReflectionEnvironment(params, sunDir) {
+            const usesGeospatialSky = params?.model === SKY_MODEL_PLANETARY
+                && allowGeospatialSky;
+            if (isPathTracingMode || usesGeospatialSky) {
+                disposeSkyReflectionEnvironment();
+                return;
+            }
+            const nextEnvMap = buildProceduralSkyReflectionEnvironment(params, sunDir);
+            if (!nextEnvMap) return;
+
+            disposeSkyReflectionEnvironment();
+            skyEnvMap = nextEnvMap;
+            scene.environment = skyEnvMap;
+            scene.environmentIntensity = 1.0;
+            syncMaterialEnvMaps();
+        }
+
+        function updateSkyAmbientLightProbe(params, sunDir) {
+            if (isPathTracingMode) {
+                clearLightProbe();
+                return;
+            }
+            if (lightProbeGrid) {
+                if (lightProbeGrid.parent) lightProbeGrid.parent.remove(lightProbeGrid);
+                lightProbeGrid.dispose?.();
+                lightProbeGrid = null;
+            }
+            skyProbeSH.zero();
+            const weight = (Math.PI * 4) / skyProbeDirections.length;
+            for (const direction of skyProbeDirections) {
+                addSkyProbeSample(direction, sampleSkyProbeRadiance(direction, params, sunDir, skyProbeColor), weight);
+            }
+            lightProbe.sh.copy(skyProbeSH);
+            hasLightProbeData = true;
+            hasLightProbeGridData = false;
+            applyLightProbeState();
+        }
+
+        function supportsWebGLLightProbeGrid() {
+            return !isPathTracingMode
+                && typeof LightProbeGrid === 'function'
+                && renderer?.isWebGLRenderer === true;
+        }
+
+        function computeLightProbeGridBounds(target = new THREE.Box3()) {
+            target.makeEmpty();
+            for (const mesh of nodeMap.values()) {
+                if (!mesh?.visible || !mesh.isMesh || !mesh.geometry) continue;
+                const position = mesh.geometry.getAttribute?.('position');
+                if (!position || position.count <= 0) continue;
+                target.expandByObject(mesh);
+            }
+            if (target.isEmpty()) {
+                target.setFromCenterAndSize(
+                    new THREE.Vector3(0, 0, 0),
+                    new THREE.Vector3(200, 120, 200)
+                );
+            } else {
+                const size = target.getSize(new THREE.Vector3());
+                const pad = Math.max(10, Math.max(size.x, size.y, size.z) * 0.08);
+                target.expandByScalar(pad);
+            }
+            return target;
+        }
+
+        function chooseLightProbeGridResolution(size) {
+            const maxDim = Math.max(size.x, size.y, size.z, 1);
+            const axisCount = (axisSize) => THREE.MathUtils.clamp(Math.round(2 + 3 * axisSize / maxDim), 2, 5);
+            return new THREE.Vector3(
+                axisCount(size.x),
+                axisCount(size.y),
+                axisCount(size.z)
+            );
+        }
+
+        function markLightProbeSceneDirty() {
+            lightProbeSceneRevision += 1;
+            scheduleGiVolumeFromCurrentScene({
+                delay: maxTimeline.playing() ? GI_VOLUME_PLAYBACK_DEBOUNCE_MS : GI_VOLUME_SCENE_DEBOUNCE_MS,
+                refresh: true,
+                reason: 'scene',
+            });
+        }
+
+        function markLightProbeLightsDirty() {
+            lightProbeSceneRevision += 1;
+            scheduleGiVolumeFromCurrentScene({
+                delay: maxTimeline.playing() ? GI_VOLUME_PLAYBACK_DEBOUNCE_MS : GI_VOLUME_LIGHT_DEBOUNCE_MS,
+                refresh: false,
+                lightRefresh: true,
+                reason: 'lights',
+            });
+        }
+
+        function markLightProbeMaterialsDirty() {
+            const seen = new WeakSet();
+            const markMaterial = (material) => {
+                if (!material || seen.has(material)) return;
+                seen.add(material);
+                if (material.isMeshBasicMaterial || material.isLineBasicMaterial || material.isLineDashedMaterial) return;
+                if (material.visible === false) return;
+                material.needsUpdate = true;
+            };
+            scene.traverse((object) => {
+                if (!object?.material) return;
+                if (Array.isArray(object.material)) {
+                    for (const material of object.material) markMaterial(material);
+                } else {
+                    markMaterial(object.material);
+                }
+            });
+        }
+
+        function currentLightProbeSceneSignature() {
+            const bounds = computeLightProbeGridBounds(new THREE.Box3());
+            const center = bounds.getCenter(new THREE.Vector3());
+            const size = bounds.getSize(new THREE.Vector3());
+            const quantize = (value) => Math.round(Number(value || 0) * 1000) / 1000;
+            let bakeSignature = '';
+            try {
+                bakeSignature = bakeStateSignature();
+            } catch {}
+            return JSON.stringify([
+                'scene-grid',
+                currentHdriUrl || null,
+                isLocalHdriActive(),
+                !!scene.environment,
+                defaultLights.visible,
+                lastLightsSignature,
+                bakeSignature,
+                nodeMap.size,
+                lightProbeSceneRevision,
+                center.toArray().map(quantize),
+                size.toArray().map(quantize),
+            ]);
+        }
+
+        async function updateLightProbeGridFromScene(hdrTex, probeSignature, loadGeneration) {
+            if (!supportsWebGLLightProbeGrid()) return false;
+
+            const bounds = computeLightProbeGridBounds(new THREE.Box3());
+            const center = bounds.getCenter(new THREE.Vector3());
+            const size = bounds.getSize(new THREE.Vector3());
+            const resolution = chooseLightProbeGridResolution(size);
+            const nextGrid = new LightProbeGrid(
+                Math.max(size.x, 1),
+                Math.max(size.y, 1),
+                Math.max(size.z, 1),
+                resolution.x,
+                resolution.y,
+                resolution.z
+            );
+            nextGrid.name = '__maxjs_light_probe_grid__';
+            nextGrid.position.copy(center);
+            nextGrid.userData.maxjsExcludeFromRuntimeSnapshot = true;
+            nextGrid.userData.volumetricBoundsBypass = true;
+
+            const previousGrid = lightProbeGrid;
+            if (previousGrid?.parent) previousGrid.parent.remove(previousGrid);
+
+            const savedProbeIntensity = lightProbe.intensity;
+            const savedBackground = scene.background;
+            const savedBackgroundRotation = scene.backgroundRotation.clone();
+            lightProbe.intensity = 0.0;
+            if (hdrTex) scene.background = hdrTex;
+
+            try {
+                scene.updateMatrixWorld(true);
+                const maxDim = Math.max(size.x, size.y, size.z, 1);
+                nextGrid.bake(renderer, scene, {
+                    cubemapSize: 16,
+                    near: 0.1,
+                    far: Math.max(1000, maxDim * 4),
+                });
+
+                if (loadGeneration !== hdriLoadGeneration || probeSignature !== currentHdriProbeSignature) {
+                    nextGrid.dispose?.();
+                    if (previousGrid) scene.add(previousGrid);
+                    return true;
+                }
+
+                if (previousGrid) previousGrid.dispose?.();
+                lightProbeGrid = nextGrid;
+                hasLightProbeGridData = true;
+                hasLightProbeData = true;
+                scene.add(lightProbeGrid);
+                applyLightProbeState();
+                return true;
+            } catch (error) {
+                nextGrid.dispose?.();
+                if (previousGrid) {
+                    scene.add(previousGrid);
+                    lightProbeGrid = previousGrid;
+                    hasLightProbeGridData = true;
+                    applyLightProbeState();
+                    maxjsDebugWarn('max.js WebGL light probe grid bake failed; keeping previous grid:', error);
+                    return true;
+                }
+                hasLightProbeGridData = false;
+                maxjsDebugWarn('max.js WebGL light probe grid bake failed:', error);
+                return false;
+            } finally {
+                scene.background = savedBackground;
+                scene.backgroundRotation.copy(savedBackgroundRotation);
+                if (!hasLightProbeGridData) lightProbe.intensity = savedProbeIntensity;
+            }
+        }
+
+        function giVolumeNowMs() {
+            return (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+        }
+
+        function giVolumeEase(t) {
+            const x = THREE.MathUtils.clamp(t, 0, 1);
+            return x * x * (3 - 2 * x);
+        }
+
+        function fadeGiVolumeTo(targetIntensity, durationMs, onComplete) {
+            if (!giVolume) return;
+            const startIntensity = Math.max(0, Number(giVolume.node?.intensity) || 0);
+            const endIntensity = Math.max(0, Number(targetIntensity) || 0);
+            giVolumeFadeSerial += 1;
+            const serial = giVolumeFadeSerial;
+            if (giVolumeFadeFrame) cancelAnimationFrame(giVolumeFadeFrame);
+            giVolumeFadeFrame = 0;
+
+            if (!(durationMs > 0) || Math.abs(startIntensity - endIntensity) < 1e-4) {
+                giVolume.setIntensity(endIntensity);
+                syncGiVolumeActive();
+                onComplete?.();
+                return;
+            }
+
+            const startedAt = giVolumeNowMs();
+            const step = () => {
+                if (serial !== giVolumeFadeSerial) return;
+                const t = giVolumeEase((giVolumeNowMs() - startedAt) / durationMs);
+                giVolume.setIntensity(THREE.MathUtils.lerp(startIntensity, endIntensity, t));
+                syncGiVolumeActive();
+                if (t < 1) {
+                    giVolumeFadeFrame = requestAnimationFrame(step);
+                } else {
+                    giVolumeFadeFrame = 0;
+                    onComplete?.();
+                }
+            };
+            step();
+        }
+
+        function hideGiVolumeForDebounce() {
+            if (!giVolume || !giVolume.isSupported?.()) return;
+            giVolumeHiddenForDebounce = true;
+            if (giVolume.hasData?.()) {
+                if (giVolumeFadeFrame) cancelAnimationFrame(giVolumeFadeFrame);
+                giVolumeFadeFrame = 0;
+                giVolumeFadeSerial += 1;
+                giVolume.setEnabled(true);
+                giVolume.setIntensity(GI_VOLUME_BASE_INTENSITY);
+                lightProbe.intensity = 0;
+                hasLightProbeData = true;
+                syncGiVolumeActive();
+            } else if ((Number(giVolume.node?.intensity) || 0) > 1e-4) {
+                fadeGiVolumeTo(0, GI_VOLUME_FADE_OUT_MS);
+            } else {
+                giVolume.setIntensity(0);
+                syncGiVolumeActive();
+            }
+        }
+
+        function revealGiVolumeAfterDebounce(token) {
+            if (!giVolume || !giVolume.isSupported?.() || isPathTracingMode) return;
+            if (token != null && token !== giVolumeDebounceSerial) return;
+            if (maxTimeline.playing()) {
+                scheduleGiVolumeFromCurrentScene({
+                    delay: GI_VOLUME_PLAYBACK_DEBOUNCE_MS,
+                    refresh: giVolumePendingRefresh,
+                    lightRefresh: true,
+                    reason: 'playback',
+                });
+                return;
+            }
+            if (!giVolume.hasData?.()) return;
+            giVolumeIdleSolving = false;
+            giVolumeHiddenForDebounce = false;
+            giVolume.setEnabled(true);
+            lightProbe.intensity = 0;
+            hasLightProbeData = true;
+            fadeGiVolumeTo(GI_VOLUME_BASE_INTENSITY, GI_VOLUME_FADE_IN_MS);
+        }
+
+        function startGiVolumeHiddenSolve(token, { refresh = false, lightRefresh = false } = {}) {
+            if (!giVolume || !giVolume.isSupported?.() || isPathTracingMode) return;
+            if (token !== giVolumeDebounceSerial) return;
+            if (maxTimeline.playing()) {
+                scheduleGiVolumeFromCurrentScene({
+                    delay: GI_VOLUME_PLAYBACK_DEBOUNCE_MS,
+                    refresh,
+                    lightRefresh: true,
+                    reason: 'playback',
+                });
+                return;
+            }
+
+            giVolumeIdleToken = token;
+            const hasHistory = giVolume.hasData?.() === true;
+            giVolume.setEnabled(true);
+            giVolume.setIntensity(hasHistory ? GI_VOLUME_BASE_INTENSITY : 0);
+            lightProbe.intensity = 0;
+            hasLightProbeData = true;
+            syncGiVolumeActive();
+
+            let queued = true;
+            if (refresh) {
+                queued = updateGiVolumeFromScene({ hidden: true });
+            } else if (lightRefresh) {
+                giVolume.requestLightRefresh?.();
+            }
+
+            if (!queued) return;
+            giVolumeIdleSolving = giVolume.hasPendingWork?.() === true;
+            if (!giVolumeIdleSolving) revealGiVolumeAfterDebounce(token);
+        }
+
+        function clearGiVolumeNativeWait() {
+            if (giVolumeNativeWaitTimer) clearTimeout(giVolumeNativeWaitTimer);
+            giVolumeNativeWaitTimer = 0;
+            giVolumeNativeRequestToken = 0;
+            giVolumeNativeAwaitSurface = false;
+            giVolumeNativeAwaitLights = false;
+        }
+
+        function maybeStartGiVolumeAfterNativePacket(token) {
+            if (token !== giVolumeDebounceSerial || token !== giVolumeNativeRequestToken) return;
+            if (giVolumeNativeAwaitSurface || giVolumeNativeAwaitLights) return;
+            clearGiVolumeNativeWait();
+            startGiVolumeHiddenSolve(token, { refresh: false, lightRefresh: false });
+        }
+
+        function requestNativeGiPackets(token, { refresh = false, lightRefresh = false } = {}) {
+            if (!window.chrome?.webview || !bridge?.send) return false;
+            const needSurface = refresh === true || !giVolume?.hasData?.();
+            const needLights = needSurface || lightRefresh === true;
+            if (!needSurface && !needLights) return false;
+
+            clearGiVolumeNativeWait();
+            giVolumeNativeRequestToken = token;
+            giVolumeNativeAwaitSurface = needSurface;
+            giVolumeNativeAwaitLights = needLights;
+            bridge.send('gi_probe_refresh', { surface: needSurface, lights: needLights });
+
+            giVolumeNativeWaitTimer = setTimeout(() => {
+                if (token !== giVolumeDebounceSerial || token !== giVolumeNativeRequestToken) return;
+                const fallbackRefresh = giVolumeNativeAwaitSurface;
+                const fallbackLightRefresh = giVolumeNativeAwaitLights;
+                clearGiVolumeNativeWait();
+                startGiVolumeHiddenSolve(token, {
+                    refresh: fallbackRefresh,
+                    lightRefresh: fallbackLightRefresh,
+                });
+            }, GI_VOLUME_NATIVE_WAIT_MS);
+            return true;
+        }
+
+        function runGiVolumeAfterDebounce(token) {
+            giVolumeRefreshTimer = 0;
+            if (!giVolume || !giVolume.isSupported?.() || isPathTracingMode) return;
+            if (token !== giVolumeDebounceSerial) return;
+            if (maxTimeline.playing()) {
+                scheduleGiVolumeFromCurrentScene({
+                    delay: GI_VOLUME_PLAYBACK_DEBOUNCE_MS,
+                    refresh: giVolumePendingRefresh,
+                    lightRefresh: true,
+                    reason: 'playback',
+                });
+                return;
+            }
+
+            const refresh = giVolumePendingRefresh || !giVolume.hasData?.();
+            const lightRefresh = giVolumePendingLightRefresh;
+            giVolumePendingRefresh = false;
+            giVolumePendingLightRefresh = false;
+            if (requestNativeGiPackets(token, { refresh, lightRefresh })) return;
+            startGiVolumeHiddenSolve(token, { refresh, lightRefresh });
+        }
+
+        // Recompile materials once when the GI volume's active state flips, so
+        // MaxLightsNode's customCacheKey picks up (or drops) the GiVolumeNode.
+        // Data-only surfel-buffer writes during compute do NOT pass through here.
+        function syncGiVolumeActive() {
+            // Recompile on active flip OR grid resize (cacheToken carries a
+            // generation that bumps when the GPU surfel/grid buffers are rebuilt).
+            const token = giVolume && giVolume.node.active
+                ? `on:${giVolume.node.cacheToken}`
+                : 'off';
+            if (token !== giVolumeSyncToken) {
+                giVolumeSyncToken = token;
+                markLightProbeMaterialsDirty();
+            }
+        }
+
+        // WebGPU compute local-bounce surfel path. Sizes the box from the scene
+        // bounds, enables the volume, mutes the single ambient lightProbe to
+        // avoid double counting, and schedules a GPU probe solve.
+        function updateGiVolumeFromScene({ hidden = false } = {}) {
+            if (!giVolume || !giVolume.isSupported() || isPathTracingMode) {
+                if (giVolume) { giVolume.setEnabled(false); syncGiVolumeActive(); }
+                return false;
+            }
+            if (maxTimeline.playing()) {
+                scheduleGiVolumeFromCurrentScene({
+                    delay: GI_VOLUME_PLAYBACK_DEBOUNCE_MS,
+                    refresh: true,
+                    reason: 'playback',
+                });
+                return true;
+            }
+            scene.updateMatrixWorld(true);
+            const bounds = computeLightProbeGridBounds(new THREE.Box3());
+            const hasHistory = giVolume.hasData?.() === true;
+            if (!giVolume.setBounds(bounds)) return false;
+            giVolume.setEnabled(true);
+            giVolume.setIntensity(hidden && !hasHistory ? 0 : GI_VOLUME_BASE_INTENSITY);
+            lightProbe.intensity = 0; // volume owns indirect diffuse — no double count
+            hasLightProbeData = true;
+            syncGiVolumeActive();
+            giVolume.scheduleBake();
+            return true;
+        }
+
+        function scheduleGiVolumeFromCurrentScene({
+            delay = GI_VOLUME_SCENE_DEBOUNCE_MS,
+            refresh = true,
+            lightRefresh = false,
+            reason = 'scene',
+        } = {}) {
+            if (!giVolume || !giVolume.isSupported() || isPathTracingMode) return;
+            giVolumePendingRefresh = giVolumePendingRefresh || refresh === true;
+            giVolumePendingLightRefresh = giVolumePendingLightRefresh || lightRefresh === true;
+            giVolumeDebounceSerial += 1;
+            const token = giVolumeDebounceSerial;
+            giVolumeIdleSolving = false;
+            hideGiVolumeForDebounce();
+            if (giVolumeRefreshTimer) clearTimeout(giVolumeRefreshTimer);
+            giVolumeRefreshTimer = setTimeout(() => {
+                runGiVolumeAfterDebounce(token);
+            }, delay);
+        }
+
+        function updateGiVolumeIdleWork() {
+            if (!giVolume || !giVolume.isSupported?.() || isPathTracingMode || renderToImageActive) return;
+            if (maxTimeline.playing()) {
+                if (giVolume.node?.active || giVolumeIdleSolving || giVolume.hasPendingWork?.()) {
+                    scheduleGiVolumeFromCurrentScene({
+                        delay: GI_VOLUME_PLAYBACK_DEBOUNCE_MS,
+                        refresh: false,
+                        lightRefresh: true,
+                        reason: 'playback',
+                    });
+                }
+                return;
+            }
+            if (giVolumeRefreshTimer) return;
+            if (!giVolumeIdleSolving && !giVolume.hasPendingWork?.()) return;
+            const token = giVolumeIdleToken || giVolumeDebounceSerial;
+            const compute = giVolume.tick({ playback: false });
+            if (compute && typeof compute.finally === 'function') {
+                compute.finally(() => {
+                    if (giVolumeIdleSolving
+                        && token === giVolumeDebounceSerial
+                        && !giVolume.hasPendingWork?.()
+                        && !maxTimeline.playing()) {
+                        revealGiVolumeAfterDebounce(token);
+                    }
+                });
+            } else if (!giVolume.hasPendingWork?.()) {
+                revealGiVolumeAfterDebounce(token);
+            }
+        }
+
+        function giVolumeCameraSignature(cam) {
+            const q = (v) => Math.round((Number(v) || 0) * 1000);
+            const a = Array.isArray(cam?.pos) ? cam.pos : [];
+            const b = Array.isArray(cam?.tgt) ? cam.tgt : [];
+            const u = Array.isArray(cam?.up) ? cam.up : [];
+            return [
+                cam?.persp === false ? 0 : 1,
+                q(cam?.fov),
+                q(cam?.viewWidth),
+                q(a[0]), q(a[1]), q(a[2]),
+                q(b[0]), q(b[1]), q(b[2]),
+                q(u[0]), q(u[1]), q(u[2]),
+            ].join(':');
+        }
+
+        function noteGiVolumeCameraSync(cam) {
+            if (!giVolume || !giVolume.isSupported?.() || !giVolume.hasData?.()) return;
+            const signature = giVolumeCameraSignature(cam);
+            if (!signature || signature === giVolumeLastCameraSignature) return;
+            giVolumeLastCameraSignature = signature;
+            scheduleGiVolumeFromCurrentScene({
+                delay: GI_VOLUME_CAMERA_DEBOUNCE_MS,
+                refresh: false,
+                reason: 'camera',
+            });
+        }
+
+        async function updateLightProbeFromCurrentScene({ force = false } = {}) {
+            if (!lightProbeEnabled && !force) {
+                if (giVolume) { giVolume.setEnabled(false); syncGiVolumeActive(); }
+                return;
+            }
+            if (!supportsWebGLLightProbeGrid()) {
+                if (giVolume?.isSupported?.() && !isPathTracingMode) {
+                    scheduleGiVolumeFromCurrentScene({ delay: 0, refresh: true, reason: 'probe' });
+                    return;
+                }
+                if (refreshSkyAmbientLightProbeFromCurrentSky()) return;
+                if (!currentHdriUrl) clearLightProbe();
+                return;
+            }
+
+            scene.updateMatrixWorld(true);
+            const probeSignature = currentLightProbeSceneSignature();
+            if (!force && hasLightProbeGridData && probeSignature === currentHdriProbeSignature) return;
+
+            currentHdriProbeSignature = probeSignature;
+            hdriLoadGeneration += 1;
+            await updateLightProbeGridFromScene(null, probeSignature, hdriLoadGeneration);
+        }
+
+        function scheduleLightProbeFromCurrentScene({ force = false, delay = 180 } = {}) {
+            if (!lightProbeEnabled && !force) return;
+            if (giVolume?.isSupported?.() && !supportsWebGLLightProbeGrid() && !isPathTracingMode) {
+                scheduleGiVolumeFromCurrentScene({ delay, refresh: true, reason: 'light-probe' });
+                return;
+            }
+            if (lightProbeRefreshTimer) clearTimeout(lightProbeRefreshTimer);
+            lightProbeRefreshTimer = setTimeout(() => {
+                lightProbeRefreshTimer = 0;
+                void updateLightProbeFromCurrentScene({ force });
+            }, delay);
+        }
+
+        async function updateLightProbeFromHDRI(hdrTex, probeSignature, loadGeneration) {
+            if (isPathTracingMode) {
+                clearLightProbe();
+                return;
+            }
+
+            if (await updateLightProbeGridFromScene(hdrTex, probeSignature, loadGeneration)) {
+                return;
+            }
+
+            const captureScene = new THREE.Scene();
+            captureScene.background = hdrTex;
+            captureScene.backgroundRotation.copy(scene.environmentRotation);
+
+            const CubeRenderTargetCtor =
+                typeof THREE.WebGLCubeRenderTarget === 'function'
+                    ? THREE.WebGLCubeRenderTarget
+                    : THREE_STD.WebGLCubeRenderTarget;
+            const CubeCameraCtor =
+                typeof THREE.CubeCamera === 'function'
+                    ? THREE.CubeCamera
+                    : THREE_STD.CubeCamera;
+
+            if (typeof CubeRenderTargetCtor !== 'function' || typeof CubeCameraCtor !== 'function') {
+                hasLightProbeData = false;
+                maxjsDebugWarn('max.js light probe generation unavailable: missing cube capture constructors');
+                return;
+            }
+
+            const cubeRenderTarget = new CubeRenderTargetCtor(128, {
+                type: hdrTex.type ?? THREE.HalfFloatType,
+                colorSpace: hdrTex.colorSpace ?? THREE.LinearSRGBColorSpace,
+            });
+            const cubeCamera = new CubeCameraCtor(0.1, 10, cubeRenderTarget);
+
+            try {
+                cubeCamera.update(renderer, captureScene);
+                const nextProbe = await LightProbeGenerator.fromCubeRenderTarget(renderer, cubeRenderTarget);
+
+                if (loadGeneration !== hdriLoadGeneration || probeSignature !== currentHdriProbeSignature) {
+                    return;
+                }
+
+                lightProbe.copy(nextProbe);
+                hasLightProbeData = true;
+                hasLightProbeGridData = false;
+                applyLightProbeState();
+            } catch (error) {
+                hasLightProbeData = false;
+                maxjsDebugWarn('max.js light probe generation failed:', error);
+            } finally {
+                cubeRenderTarget.dispose();
+            }
+        }
+
+        function normalizeTextureTransform(xf) {
+            return normalizeTextureTransformShared(xf);
+        }
+
+        function applyTextureTransform(tex, xf) {
+            return applyTextureTransformShared(tex, xf);
+        }
+
+        function applyFallbackImage(tex, fallbackTex, colorSpace, xf, url) {
+            tex.image = fallbackTex.image;
+            tex.colorSpace = colorSpace;
+            applyTextureTransform(tex, xf);
+            tex.needsUpdate = true;
+            console.warn('max.js missing texture, using fallback:', url);
+        }
+
+        function configureGradientTexture(tex) {
+            if (!tex) return null;
+            tex.colorSpace = THREE.NoColorSpace;
+            tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping;
+            tex.minFilter = tex.magFilter = THREE.NearestFilter;
+            tex.generateMipmaps = false;
+            tex.needsUpdate = true;
+            return tex;
+        }
+
+        function applyTextureChannelSelection(tex, xf) {
+            return applyTextureChannelSelectionShared(tex, xf);
+        }
+
+        function maxMapChannelToTextureChannel(maxMapChannel, fallbackMaxChannel = 1) {
+            return maxMapChannelToTextureChannelShared(maxMapChannel, fallbackMaxChannel);
+        }
+
+        function maxMapChannelFromMapName(value, fallbackMaxChannel = 2) {
+            return maxMapChannelFromMapNameShared(value, fallbackMaxChannel);
+        }
+
+        function applyTextureUvChannel(tex, maxMapChannel, fallbackMaxChannel = 1) {
+            return applyTextureUvChannelShared(tex, maxMapChannel, fallbackMaxChannel);
+        }
+
+        function explicitMaxMapChannelFromName(value) {
+            let filename = String(value ?? '');
+            try {
+                const parsed = new URL(filename, location.href);
+                filename = parsed.pathname || filename;
+            } catch {}
+            filename = filename.replace(/\\/g, '/').split('/').pop() || filename;
+            const baseName = filename.replace(/\.[^./\\]+$/, '');
+            const match = baseName.match(/(?:^|[_.\-\s])UV([12])(?:$|[_.\-\s])/i);
+            return match ? Number(match[1]) : null;
+        }
+
+        const textureUvChannelViews = new WeakMap();
+
+        function textureWithUvChannel(tex, maxMapChannel, fallbackMaxChannel = 1) {
+            if (!tex?.isTexture) return tex;
+            const channel = maxMapChannelToTextureChannel(maxMapChannel, fallbackMaxChannel);
+            if (tex.channel === channel) return tex;
+
+            let byChannel = textureUvChannelViews.get(tex);
+            if (!byChannel) {
+                byChannel = new Map();
+                textureUvChannelViews.set(tex, byChannel);
+            }
+            let view = byChannel.get(channel);
+            if (!view) {
+                view = tex.clone();
+                view.userData = { ...(tex.userData || {}), maxjsUvChannelViewOf: tex.uuid };
+                byChannel.set(channel, view);
+            }
+            view.channel = channel;
+            view.needsUpdate = true;
+            return view;
+        }
+
+        function resolveLightMapMaxMapChannel(md) {
+            const explicit = explicitMaxMapChannelFromName(md?.lmMap ?? md?.lightMap ?? '');
+            if (explicit === 1 || explicit === 2) return explicit;
+            if (Number.isFinite(Number(md?.lmCh))) return Math.max(1, Math.round(Number(md.lmCh)));
+            const xf = normalizeTextureTransform(md?.lmMapXf ?? md?.lightMapXf);
+            if (Number.isFinite(Number(xf?.uvChannel))) return Math.max(1, Math.round(Number(xf.uvChannel)));
+            return 2;
+        }
+
+        function withMaxMapChannelOverride(xf, maxMapChannel) {
+            if (!Number.isFinite(Number(maxMapChannel))) return xf;
+            const uvChannel = Math.max(1, Math.round(Number(maxMapChannel)));
+            return { ...((xf && typeof xf === 'object') ? xf : {}), uvChannel };
+        }
+
+        function optimizedTextureTransformForSlot(key, xf) {
+            return optimizedTextureTransformForSlotShared(key, xf);
+        }
+
+        function resolveColorSpace(slotColorSpace, xf) {
+            return resolveTextureColorSpaceShared(slotColorSpace, xf);
+        }
+
+        function isAbsoluteWindowsPath(path) {
+            return /^[a-zA-Z]:[\\/]/.test(path) || /^\\\\/.test(path);
+        }
+
+        function toAssetUrl(filePath) {
+            const normalized = String(filePath ?? '').replace(/\\/g, '/');
+            const segments = normalized.split('/').filter((segment, index) => segment.length > 0 || index === 0);
+            const encoded = segments.map(segment => encodeURIComponent(segment)).join('/');
+            return `https://maxjs-assets.local/${encoded}`;
+        }
+
+        function normalizeMaterialXResourceUrl(url) {
+            const value = String(url ?? '').trim();
+            if (!value) return value;
+            if (/^(?:data:|blob:|https?:)/i.test(value)) return value;
+            if (isAbsoluteWindowsPath(value)) return toAssetUrl(value);
+            return value.replace(/\\/g, '/');
+        }
+
+        function pickMaterialXMaterial(materials, md) {
+            const entries = Object.entries(materials ?? {});
+            if (!entries.length) return null;
+
+            const requestedName = String(md.materialXName ?? '').trim();
+            if (requestedName) {
+                const namedEntry = entries.find(([name]) => name === requestedName);
+                if (namedEntry) return namedEntry[1];
+            }
+
+            const requestedIndex = Number.isFinite(md.materialXIndex)
+                ? Math.max(1, Math.round(md.materialXIndex))
+                : 1;
+            return entries[Math.min(entries.length - 1, requestedIndex - 1)][1];
+        }
+
+        function createPendingMaterialXMaterial(md) {
+            const material = new THREE.MeshPhysicalNodeMaterial({
+                color: new THREE.Color(md.color[0], md.color[1], md.color[2]),
+                roughness: md.rough ?? 0.5,
+                metalness: md.metal ?? 0.0,
+                side: md.side === 0 ? THREE.FrontSide : THREE.DoubleSide,
+            });
+
+            if (md.opacity != null && md.opacity < 0.999) {
+                material.transparent = true;
+                material.opacity = md.opacity;
+            }
+
+            material.userData ??= {};
+            material.userData.maxjsMaterialXPending = true;
+            material.needsUpdate = true;
+            return material;
+        }
+
+        function normalizeMaterialXDocument(text) {
+            const source = String(text ?? '');
+            if (!source.trim()) return source;
+
+            const parser = new DOMParser();
+            const doc = parser.parseFromString(source, 'application/xml');
+            if (doc.querySelector('parsererror')) return source;
+
+            const hasNamedChild = (node, name) => Array.from(node.children).some(child => child.getAttribute('name') === name);
+            const appendElement = (node, tagName, attrs) => {
+                const child = doc.createElement(tagName);
+                for (const [key, value] of Object.entries(attrs)) child.setAttribute(key, value);
+                node.appendChild(child);
+            };
+
+            const ensureNamedChild = (selector, name, tagName, attrs) => {
+                for (const node of doc.querySelectorAll(selector)) {
+                    if (!hasNamedChild(node, name)) appendElement(node, tagName, { name, ...attrs });
+                }
+            };
+
+            // Max's MaterialX export can omit the procedural coordinate input,
+            // while Three's MaterialXLoader only wires what is explicitly present.
+            ensureNamedChild('noise2d, cellnoise2d, worleynoise2d, unifiednoise2d', 'texcoord', 'texcoord', { type: 'vector2' });
+            ensureNamedChild('noise3d, cellnoise3d, worleynoise3d, unifiednoise3d', 'texcoord', 'position', { type: 'vector3' });
+            ensureNamedChild('fractal3d', 'position', 'position', { type: 'vector3' });
+            // image: loader does texture(file, texcoord) — missing texcoord => broken sampling.
+            ensureNamedChild('image', 'texcoord', 'texcoord', { type: 'vector2' });
+            // tiledimage: mx_transform_uv(uvtiling, uvoffset); both must exist or the spread is empty.
+            ensureNamedChild('tiledimage', 'uvtiling', 'input', { type: 'vector2', value: '1, 1' });
+            ensureNamedChild('tiledimage', 'uvoffset', 'input', { type: 'vector2', value: '0, 0' });
+
+            // Max exports emission=1.0 even when emission_color is black — force emission to 0
+            for (const ss of doc.querySelectorAll('standard_surface')) {
+                const emissionInput = Array.from(ss.children).find(c => c.getAttribute('name') === 'emission');
+                const emColorInput = Array.from(ss.children).find(c => c.getAttribute('name') === 'emission_color');
+                if (emissionInput && !emColorInput) {
+                    // No emission color means it defaults to black — zero out emission weight
+                    emissionInput.setAttribute('value', '0');
+                } else if (emissionInput && emColorInput && !emColorInput.getAttribute('nodename')) {
+                    const val = emColorInput.getAttribute('value') || '0, 0, 0';
+                    const parts = val.split(',').map(v => parseFloat(v.trim()));
+                    if (parts.every(v => v < 0.001)) {
+                        emissionInput.setAttribute('value', '0');
+                    }
+                }
+            }
+
+            // If Max exports a standard_surface or gltf_pbr without a <surfacematerial> wrapper,
+            // inject one so the loader creates MeshPhysicalNodeMaterial instead of unlit MeshBasicNodeMaterial.
+            const root = doc.documentElement;
+            if (!root.querySelector('surfacematerial')) {
+                const shaderNode = root.querySelector('standard_surface, gltf_pbr');
+                if (shaderNode) {
+                    const shaderName = shaderNode.getAttribute('name') || 'SR_default';
+                    const smName = shaderName + '_material';
+                    // Only wrap if not already inside a surfacematerial
+                    if (!shaderNode.closest('surfacematerial')) {
+                        const sm = doc.createElement('surfacematerial');
+                        sm.setAttribute('name', smName);
+                        sm.setAttribute('type', 'material');
+                        const inp = doc.createElement('input');
+                        inp.setAttribute('name', 'surfaceshader');
+                        inp.setAttribute('type', 'surfaceshader');
+                        inp.setAttribute('nodename', shaderName);
+                        sm.appendChild(inp);
+                        root.appendChild(sm);
+                    }
+                }
+            }
+
+            // Fix unconnected <output> nodes with default values — Three.js loader can't handle them.
+            // Convert: <output name="X" type="T" value="V"/> → <constant name="X_const" type="T" value="V"/>
+            // and rewire the output to point at the constant node.
+            for (const output of doc.querySelectorAll('output[value]')) {
+                if (output.getAttribute('nodename')) continue; // already connected
+                const name = output.getAttribute('name');
+                const type = output.getAttribute('type');
+                const value = output.getAttribute('value');
+                if (!name || !type || !value) continue;
+                const constName = `${name}_const`;
+                const parent = output.parentNode;
+                const constant = doc.createElement('constant');
+                constant.setAttribute('name', constName);
+                constant.setAttribute('type', type);
+                const valInput = doc.createElement('input');
+                valInput.setAttribute('name', 'value');
+                valInput.setAttribute('type', type);
+                valInput.setAttribute('value', value);
+                constant.appendChild(valInput);
+                parent.insertBefore(constant, output);
+                output.removeAttribute('value');
+                output.setAttribute('nodename', constName);
+            }
+
+            return new XMLSerializer().serializeToString(doc);
+        }
+
+        function applyLoadedMaterialXTemplate(target, source, md) {
+            target.copy(source);
+            for (const key of Object.keys(source)) {
+                if (key.endsWith('Node')) target[key] = source[key];
+            }
+            target.name = source.name || target.name;
+            target.side = md.side === 0 ? THREE.FrontSide : THREE.DoubleSide;
+            target.userData ??= {};
+            target.userData.maxjsMaterialXPending = false;
+            target.userData.maxjsMaterialXSourceName = source.name || '';
+            rememberMaterialEmissiveBase(target);
+            target.needsUpdate = true;
+        }
+
+        function applyLoadedTSLTemplate(target, source, md) {
+            target.copy(source);
+            for (const key of Object.keys(source)) {
+                if (key.endsWith('Node')) target[key] = source[key];
+            }
+            target.name = source.name || target.name;
+            target.side = md.side === 0 ? THREE.FrontSide : THREE.DoubleSide;
+            target.userData ??= {};
+            target.userData.maxjsMaterialXPending = false;
+            target.userData.maxjsMaterialXFallback = true;
+            rememberMaterialEmissiveBase(target);
+            target.needsUpdate = true;
+        }
+
+        async function ensureMaterialXTemplateLoaded(cacheKey, template, md) {
+            if (!md.materialXFile && !md.materialXInline) return template;
+
+            let pending = materialXLoadCache.get(cacheKey);
+            if (pending) return pending;
+
+            const materialXBase = md.materialXBase || '';
+            const isDataTextureUrl = (url) => {
+                const lower = String(url || '').toLowerCase();
+                return (
+                    lower.includes('normal') ||
+                    lower.includes('rough') ||
+                    lower.includes('metal') ||
+                    lower.includes('orm') ||
+                    lower.includes('ao') ||
+                    lower.includes('occlusion') ||
+                    lower.includes('height') ||
+                    lower.includes('displace') ||
+                    lower.includes('displacement') ||
+                    lower.includes('bump') ||
+                    lower.includes('mask')
+                );
+            };
+            const manager = new THREE.LoadingManager();
+            manager.setURLModifier(url => {
+                const normalized = normalizeMaterialXResourceUrl(url);
+                if (materialXBase && !/^(?:data:|blob:|https?:)/i.test(normalized)) {
+                    return materialXBase + (materialXBase.endsWith('/') ? '' : '/') + normalized;
+                }
+                return normalized;
+            });
+            manager.onError = url => console.error('[MaterialX] Failed to load:', url);
+
+            // ImageBitmapLoader can produce blank textures in WebView2 virtual hosts.
+            // Use a handler that loads via HTMLImageElement instead.
+            const imgLoader = {
+                load(url, onLoad, onProgress, onError) {
+                    const resolvedUrl = manager.resolveURL(url);
+                    const img = new Image();
+                    img.crossOrigin = 'anonymous';
+                    img.onload = () => { manager.itemEnd(resolvedUrl); if (onLoad) onLoad(img); };
+                    img.onerror = (e) => { manager.itemEnd(resolvedUrl); manager.itemError(resolvedUrl); if (onError) onError(e); };
+                    manager.itemStart(resolvedUrl);
+                    img.src = resolvedUrl;
+                }
+            };
+            // EXRLoader returns DataTexture; mark likely utility maps as raw data.
+            const exrHandler = {
+                load(url, onLoad, onProgress, onError) {
+                    const resolvedUrl = manager.resolveURL(url);
+                    manager.itemStart(resolvedUrl);
+                    exrLoader.load(resolvedUrl,
+                        (texture) => {
+                            texture.colorSpace = isDataTextureUrl(resolvedUrl)
+                                ? THREE.NoColorSpace
+                                : THREE.LinearSRGBColorSpace;
+                            manager.itemEnd(resolvedUrl);
+                            if (onLoad) onLoad(texture);
+                        },
+                        onProgress,
+                        (e) => { manager.itemEnd(resolvedUrl); manager.itemError(resolvedUrl); if (onError) onError(e); }
+                    );
+                }
+            };
+            manager.addHandler(/\.exr$/i, exrHandler);
+            manager.addHandler(/\./, imgLoader);
+
+            const loader = new MaterialXLoader(manager);
+            // Don't call loader.setPath() — URLModifier already handles materialXBase
+
+            // Get MaterialX XML — either from inline string or file fetch
+            const getXml = md.materialXInline
+                ? Promise.resolve(md.materialXInline)
+                : fetch(md.materialXFile, { cache: 'no-store' })
+                    .then(response => {
+                        if (!response.ok) {
+                            throw new Error(`MaterialX fetch failed: ${response.status} ${response.statusText}`);
+                        }
+                        return response.text();
+                    });
+
+            pending = getXml
+                .then(text => loader.parse(normalizeMaterialXDocument(text)))
+                .then(({ materials }) => {
+                    const loadedMaterial = pickMaterialXMaterial(materials, md);
+                    if (!loadedMaterial) {
+                        throw new Error(`No MaterialX material resolved for ${md.materialXFile || 'inline'}`);
+                    }
+
+                    applyLoadedMaterialXTemplate(template, loadedMaterial, md);
+                    return template;
+                })
+                .catch(error => {
+                    console.error('[MaterialX] Load failed:', error);
+                    if (md.model === 'MeshTSLNodeMaterial' && md.tslCode) {
+                        try {
+                            const fallback = tslCompiler.createTSLMaterial({
+                                ...md,
+                                materialXFile: '',
+                                materialXInline: '',
+                                materialXBase: '',
+                                materialXName: '',
+                                materialXIndex: 1,
+                            });
+                            applyLoadedTSLTemplate(template, fallback, md);
+                            maxjsDebugWarn('[MaterialX] Falling back to TSL code for MeshTSLNodeMaterial');
+                            return template;
+                        } catch (fallbackError) {
+                            console.error('[MaterialX] TSL fallback failed:', fallbackError);
+                        }
+                    }
+                    template.color?.set?.(0xff00ff);
+                    template.wireframe = true;
+                    template.userData ??= {};
+                    template.userData.maxjsMaterialXPending = false;
+                    template.needsUpdate = true;
+                    return template;
+                })
+                .finally(() => {
+                    materialXLoadCache.delete(cacheKey);
+                });
+
+            materialXLoadCache.set(cacheKey, pending);
+            return pending;
+        }
+
+        function canUploadVideoFrame(video) {
+            return !!video &&
+                !video.error &&
+                !video.seeking &&
+                video.readyState >= video.HAVE_CURRENT_DATA &&
+                video.videoWidth > 0 &&
+                video.videoHeight > 0;
+        }
+
+        function installSafeVideoTexturePump(tex, video) {
+            if (!tex || !video) return;
+            let disposed = false;
+            let frameCallbackId = 0;
+            if (tex.source) tex.source.dataReady = false;
+
+            if (tex._requestVideoFrameCallbackId &&
+                typeof video.cancelVideoFrameCallback === 'function') {
+                try { video.cancelVideoFrameCallback(tex._requestVideoFrameCallbackId); } catch {}
+                tex._requestVideoFrameCallbackId = 0;
+            }
+
+            const markReadyFrame = () => {
+                if (!canUploadVideoFrame(video)) return;
+                if (tex.source) tex.source.dataReady = true;
+                tex.needsUpdate = true;
+            };
+
+            tex.update = markReadyFrame;
+
+            const scheduleFrameCallback = () => {
+                if (disposed || typeof video.requestVideoFrameCallback !== 'function') return;
+                frameCallbackId = video.requestVideoFrameCallback(() => {
+                    frameCallbackId = 0;
+                    markReadyFrame();
+                    scheduleFrameCallback();
+                });
+                tex._requestVideoFrameCallbackId = frameCallbackId;
+            };
+
+            const onReady = () => {
+                markReadyFrame();
+                if (!frameCallbackId) scheduleFrameCallback();
+            };
+            const onNotReady = () => {
+                if (tex.source) tex.source.dataReady = false;
+            };
+
+            video.addEventListener('loadeddata', onReady);
+            video.addEventListener('canplay', onReady);
+            video.addEventListener('playing', onReady);
+            video.addEventListener('seeked', onReady);
+            video.addEventListener('seeking', onNotReady);
+            video.addEventListener('waiting', onNotReady);
+            video.addEventListener('stalled', onNotReady);
+
+            const disposeBase = tex.dispose.bind(tex);
+            tex.dispose = () => {
+                disposed = true;
+                video.removeEventListener('loadeddata', onReady);
+                video.removeEventListener('canplay', onReady);
+                video.removeEventListener('playing', onReady);
+                video.removeEventListener('seeked', onReady);
+                video.removeEventListener('seeking', onNotReady);
+                video.removeEventListener('waiting', onNotReady);
+                video.removeEventListener('stalled', onNotReady);
+                if (frameCallbackId && typeof video.cancelVideoFrameCallback === 'function') {
+                    try { video.cancelVideoFrameCallback(frameCallbackId); } catch {}
+                }
+                frameCallbackId = 0;
+                tex._requestVideoFrameCallbackId = 0;
+                disposeBase();
+            };
+
+            onReady();
+        }
+
+        function loadVideoTexture(url, xf) {
+            const normalizedXf = normalizeTextureTransform(xf);
+            const playbackKey = JSON.stringify({
+                loop: xf?.loop !== false,
+                muted: xf?.muted !== false,
+                rate: xf?.rate ?? 1.0,
+            });
+            // Distinct UV transforms must not clobber a shared cached texture.
+            const cacheKey = `video:${url}:${playbackKey}:${JSON.stringify(normalizedXf)}`;
+            if (textureCache.has(cacheKey)) return textureCache.get(cacheKey);
+            const video = document.createElement('video');
+            video.crossOrigin = 'anonymous';
+            video.loop = xf?.loop !== false;
+            video.muted = xf?.muted !== false;
+            video.playbackRate = xf?.rate ?? 1.0;
+            video.playsInline = true;
+            video.autoplay = true;
+            video.preload = 'auto';
+            video.src = url;
+            video.load?.();
+            video.play().catch(() => {});
+            const tex = new THREE.VideoTexture(video);
+            tex.colorSpace = THREE.SRGBColorSpace;
+            tex.minFilter = THREE.LinearFilter;
+            tex.magFilter = THREE.LinearFilter;
+            installSafeVideoTexturePump(tex, video);
+            // Honor Max UV tiling/offset/rotation/wrap + channel select, the
+            // same as still-image textures (loadTexture) — video previously
+            // ignored all of these.
+            applyTextureChannelSelection(tex, normalizedXf);
+            applyTextureTransform(tex, normalizedXf);
+            textureCache.set(cacheKey, tex);
+            return tex;
+        }
+
+        function loadTexture(url, colorSpace = THREE.LinearSRGBColorSpace, xf = null, fallbackTex = fallbackWhiteTexture) {
+            if (!url) return null;
+            if (xf?.video) return loadVideoTexture(url, xf);
+            colorSpace = resolveColorSpace(colorSpace, xf);
+            const ext = getTextureExtension(url);
+            // A plain Max Bitmap can point straight at a video file (no custom
+            // Video Texture map). Route those to the video loader instead of
+            // rejecting them as an unsupported still-image format.
+            if (isVideoTextureExtension(ext)) return loadVideoTexture(url, xf);
+            const textureColorSpace = colorSpaceForTextureExtension(ext, colorSpace);
+            const normalizedXf = normalizeTextureTransform(xf);
+            const cacheKey = JSON.stringify([url, String(textureColorSpace), normalizedXf]);
+            if (textureCache.has(cacheKey)) return textureCache.get(cacheKey);
+            if (!canBrowserLoadTextureExtension(ext)) {
+                const placeholder = fallbackTex || fallbackWhiteTexture;
+                textureCache.set(cacheKey, placeholder);
+                console.warn('max.js skipped unsupported browser texture format:', url);
+                return placeholder;
+            }
+            if (ext === 'exr' || ext === 'hdr') {
+                const loader = ext === 'exr' ? exrLoader : rgbeLoader;
+                const placeholder = fallbackTex || fallbackWhiteTexture;
+                textureCache.set(cacheKey, placeholder);
+                beginTextureLoad();
+                loader.load(url, loadedTex => {
+                    endTextureLoad();
+                    applyTextureChannelSelection(loadedTex, normalizedXf);
+                    loadedTex.colorSpace = textureColorSpace;
+                    applyTextureTransform(loadedTex, normalizedXf);
+                    loadedTex.needsUpdate = true;
+                    textureCache.set(cacheKey, loadedTex);
+                    if (bakeOverrides.enabled) reapplyBakeOverridesToScene();
+                    maxjsFx.markOutputChanged?.();
+                }, undefined, () => {
+                    endTextureLoad();
+                });
+                return placeholder;
+            }
+            beginTextureLoad();
+            const tex = textureLoader.load(
+                url,
+                loadedTex => {
+                    endTextureLoad();
+                    applyTextureChannelSelection(loadedTex, normalizedXf);
+                    loadedTex.colorSpace = textureColorSpace;
+                    applyTextureTransform(loadedTex, normalizedXf);
+                    loadedTex.needsUpdate = true;
+                },
+                undefined,
+                () => {
+                    endTextureLoad();
+                    applyFallbackImage(tex, fallbackTex, textureColorSpace, normalizedXf, url);
+                }
+            );
+            tex.colorSpace = textureColorSpace;
+            applyTextureTransform(tex, normalizedXf);
+            textureCache.set(cacheKey, tex);
+            return tex;
+        }
+
+        // Shared TSL material/texture compiler (extracted to js/tsl_materials.js so the
+        // standalone snapshot path can run the exact same code). The vendored tsl-textures
+        // namespace and the node->texture bake helper are wired in lazily below.
+        const tslCompiler = createTSLCompiler({
+            THREE,
+            TSL,
+            loadTexture,
+            textureCache,
+            debugWarn: maxjsDebugWarn,
+            // Bake TSL color nodes (bitmap presets) into textures; redraw when ready.
+            bakeNodeToTexture: makeBakeNodeToTexture(renderer, THREE, {
+                onComplete: () => maxjsFx.markOutputChanged?.(),
+            }),
+        });
+        // Load the procedural-texture preset library before materials can compile
+        // so first-use preset snippets resolve the injected TEXTURES namespace.
+        await import('tsl-textures')
+            .then((ns) => tslCompiler.setTextures(ns))
+            .catch(() => { /* only present when tsl-textures presets are used */ });
+
+        function isWebGLTexturePathActive() {
+            const label = String(rendererBackendLabel || '');
+            return !!renderer?.isWebGLRenderer || label.startsWith('WebGL') || label === 'TSL_GL';
+        }
+
+        function prepareLoadedBakeTexture(loadedTex, colorSpace, maxMapChannel) {
+            if (!loadedTex?.isTexture) return null;
+            let tex = loadedTex;
+            if (isWebGLTexturePathActive() && loadedTex.isDataTexture && loadedTex.image?.data) {
+                const image = loadedTex.image;
+                tex = new THREE_STD.DataTexture(image.data, image.width, image.height);
+                tex.format = loadedTex.format;
+                tex.type = loadedTex.type;
+                tex.mapping = loadedTex.mapping;
+                tex.wrapS = loadedTex.wrapS;
+                tex.wrapT = loadedTex.wrapT;
+                tex.magFilter = loadedTex.magFilter;
+                tex.minFilter = loadedTex.minFilter;
+                tex.generateMipmaps = loadedTex.generateMipmaps;
+                tex.flipY = loadedTex.flipY;
+                tex.unpackAlignment = loadedTex.unpackAlignment;
+            }
+            tex.colorSpace = colorSpace;
+            applyTextureUvChannel(tex, maxMapChannel, 2);
+            tex.needsUpdate = true;
+            return tex;
+        }
+
+        function loadBakeTexture(url, colorSpace = THREE.LinearSRGBColorSpace, maxMapChannel = 2) {
+            if (!url) return null;
+            colorSpace = resolveColorSpace(colorSpace, null);
+            const ext = getTextureExtension(url);
+            const textureColorSpace = colorSpaceForTextureExtension(ext, colorSpace);
+            const channel = maxMapChannelToTextureChannel(maxMapChannel, 2);
+            const cacheKey = JSON.stringify(['bake', url, String(textureColorSpace), channel]);
+            const cached = textureCache.get(cacheKey);
+            if (cached?.isTexture) return cached;
+            if (cached?.pending) return null;
+            if (failedTextureCache.has(cacheKey)) return null;
+
+            if (!canBrowserLoadTextureExtension(ext)) {
+                failedTextureCache.add(cacheKey);
+                console.warn('max.js skipped unsupported bake texture format:', url);
+                return null;
+            }
+
+            const loader = ext === 'exr'
+                ? exrLoader
+                : (ext === 'hdr' ? rgbeLoader : (isWebGLTexturePathActive() ? webglTextureLoader : textureLoader));
+            textureCache.set(cacheKey, { pending: true });
+            loader.load(
+                url,
+                loadedTex => {
+                    const bakeTex = prepareLoadedBakeTexture(loadedTex, textureColorSpace, maxMapChannel);
+                    if (!bakeTex) {
+                        failedTextureCache.add(cacheKey);
+                        textureCache.delete(cacheKey);
+                        return;
+                    }
+                    failedTextureCache.delete(cacheKey);
+                    textureCache.set(cacheKey, bakeTex);
+                    if (bakeOverrides.enabled) reapplyBakeOverridesToScene();
+                    maxjsFx.markOutputChanged?.();
+                },
+                undefined,
+                () => {
+                    failedTextureCache.add(cacheKey);
+                    textureCache.delete(cacheKey);
+                    if (bakeOverrides.enabled) reapplyBakeOverridesToScene();
+                    maxjsFx.markOutputChanged?.();
+                }
+            );
+            return null;
+        }
+
+        function loadBakeTextureFromCandidates(candidates, colorSpace = THREE.LinearSRGBColorSpace) {
+            let selected = null;
+            for (const candidate of candidates || []) {
+                const tex = loadBakeTexture(candidate.url, colorSpace, candidate.maxMapChannel);
+                if (tex && !selected) selected = { ...candidate, texture: tex };
+            }
+            return selected;
+        }
+
+        function bakeExposureScale() {
+            const scale = bakeOverrides.intensity * Math.pow(2, bakeOverrides.bakeExposure);
+            return Number.isFinite(scale) ? Math.max(0, scale) : 1;
+        }
+
+        function isDisplayBakedBeautyProxy(url = '') {
+            if (bakeOverrides.proxyDisplay !== true || bakeOverrides.mode !== 'beauty') return false;
+            const ext = getTextureExtension(url);
+            return ext !== 'exr' && ext !== 'hdr';
+        }
+
+        function clearBakeTextureLoadFailures() {
+            for (const key of [...failedTextureCache]) {
+                if (String(key).startsWith('["bake",')) failedTextureCache.delete(key);
+            }
+            for (const [key, value] of [...textureCache]) {
+                if (String(key).startsWith('["bake",') && value?.pending) textureCache.delete(key);
+            }
+        }
+
+        // TSL texture/material compile moved to js/tsl_materials.js (tslCompiler.evalTSLTexture).
+
+        const HTML_TEXTURE_AUTO_FIT_KEYS = [
+            'map', 'opMap', 'emMap', 'roughMap', 'metalMap', 'normMap',
+            'bumpMap', 'dispMap', 'parallaxMap', 'aoMap', 'lmMap',
+            'gradMap', 'sssMap', 'matcapMap',
+            'specMap', 'specIntMap', 'specColMap', 'transMap',
+            'ccMap', 'ccRoughMap', 'ccNormMap',
+        ];
+        const HTML_TEXTURE_AUTO_FIT_MAX_TRIANGLES = 20000;
+
+        function materialFlagEnabled(value) {
+            return value === true || value === 1 || value === '1' || value === 'true';
+        }
+
+        function clampHTMLTextureDimension(value, fallback = 1024) {
+            const n = Math.round(Number(value));
+            if (!Number.isFinite(n)) return fallback;
+            return Math.max(64, Math.min(4096, n));
+        }
+
+        function manualHTMLTextureSize(md, key) {
+            return {
+                width: clampHTMLTextureDimension(md?.[key + 'HTMLW'], 1024),
+                height: clampHTMLTextureDimension(md?.[key + 'HTMLH'], 1024),
+            };
+        }
+
+        function htmlTextureAutoFitEnabled(md, key) {
+            return !!md?.[key + 'HTML'] && materialFlagEnabled(md?.[key + 'HTMLAutoFit']);
+        }
+
+        function fitHTMLTextureSizeToAspect(maxSize, aspect) {
+            if (!Number.isFinite(aspect) || aspect <= 0) return maxSize;
+            const maxW = clampHTMLTextureDimension(maxSize.width, 1024);
+            const maxH = clampHTMLTextureDimension(maxSize.height, 1024);
+            const maxAspect = maxW / Math.max(1, maxH);
+            let width = maxW;
+            let height = maxH;
+            if (aspect >= maxAspect) {
+                width = maxW;
+                height = maxW / aspect;
+            } else {
+                height = maxH;
+                width = maxH * aspect;
+            }
+            return {
+                width: clampHTMLTextureDimension(width, maxW),
+                height: clampHTMLTextureDimension(height, maxH),
+            };
+        }
+
+        function matrixScaleSignature(matrixArray) {
+            if (!isFiniteArray(matrixArray, 16)) return '1,1,1';
+            const sx = Math.hypot(matrixArray[0], matrixArray[1], matrixArray[2]);
+            const sy = Math.hypot(matrixArray[4], matrixArray[5], matrixArray[6]);
+            const sz = Math.hypot(matrixArray[8], matrixArray[9], matrixArray[10]);
+            const round = (value) => Number.isFinite(value) ? Math.round(value * 1000) / 1000 : 1;
+            return `${round(sx)},${round(sy)},${round(sz)}`;
+        }
+
+        function estimateGeometryUvAspect(geometry, materialIndex = null, matrixArray = null) {
+            const position = geometry?.getAttribute?.('position');
+            const uv = geometry?.getAttribute?.('uv');
+            if (!position || !uv || position.count < 3 || uv.count < 3) return 1;
+
+            const index = geometry.index;
+            const indexCount = index ? index.count : position.count;
+            const ranges = [];
+            if (materialIndex != null && Array.isArray(geometry.groups) && geometry.groups.length) {
+                for (const group of geometry.groups) {
+                    if (group?.materialIndex === materialIndex && group.count >= 3) {
+                        ranges.push({
+                            start: Math.max(0, group.start || 0),
+                            count: Math.max(0, Math.min(group.count || 0, indexCount - (group.start || 0))),
+                        });
+                    }
+                }
+            }
+            if (ranges.length === 0) ranges.push({ start: 0, count: indexCount });
+
+            let totalTriangles = 0;
+            for (const range of ranges) totalTriangles += Math.floor(range.count / 3);
+            if (totalTriangles <= 0) return 1;
+
+            const sampleStep = Math.max(1, Math.ceil(totalTriangles / HTML_TEXTURE_AUTO_FIT_MAX_TRIANGLES));
+            const p0 = new THREE.Vector3();
+            const p1 = new THREE.Vector3();
+            const p2 = new THREE.Vector3();
+            const dp1 = new THREE.Vector3();
+            const dp2 = new THREE.Vector3();
+            const tangent = new THREE.Vector3();
+            const bitangent = new THREE.Vector3();
+            const cross = new THREE.Vector3();
+            const matrix = isFiniteArray(matrixArray, 16) ? new THREE.Matrix4().fromArray(matrixArray) : null;
+            let tangentSum = 0;
+            let bitangentSum = 0;
+            let weightSum = 0;
+            let triangleOrdinal = 0;
+
+            const vertexIndexAt = (drawIndex) => index ? index.getX(drawIndex) : drawIndex;
+
+            for (const range of ranges) {
+                const end = range.start + range.count - 2;
+                for (let draw = range.start; draw < end; draw += 3) {
+                    if ((triangleOrdinal++ % sampleStep) !== 0) continue;
+                    const i0 = vertexIndexAt(draw);
+                    const i1 = vertexIndexAt(draw + 1);
+                    const i2 = vertexIndexAt(draw + 2);
+                    if (
+                        i0 < 0 || i1 < 0 || i2 < 0 ||
+                        i0 >= position.count || i1 >= position.count || i2 >= position.count ||
+                        i0 >= uv.count || i1 >= uv.count || i2 >= uv.count
+                    ) {
+                        continue;
+                    }
+
+                    p0.fromBufferAttribute(position, i0);
+                    p1.fromBufferAttribute(position, i1);
+                    p2.fromBufferAttribute(position, i2);
+                    if (matrix) {
+                        p0.applyMatrix4(matrix);
+                        p1.applyMatrix4(matrix);
+                        p2.applyMatrix4(matrix);
+                    }
+                    const u0 = uv.getX(i0), v0 = uv.getY(i0);
+                    const u1 = uv.getX(i1), v1 = uv.getY(i1);
+                    const u2 = uv.getX(i2), v2 = uv.getY(i2);
+                    const du1 = u1 - u0, dv1 = v1 - v0;
+                    const du2 = u2 - u0, dv2 = v2 - v0;
+                    const det = du1 * dv2 - du2 * dv1;
+                    if (Math.abs(det) < 1.0e-8) continue;
+
+                    dp1.subVectors(p1, p0);
+                    dp2.subVectors(p2, p0);
+                    const weight = cross.crossVectors(dp1, dp2).length();
+                    if (!Number.isFinite(weight) || weight <= 1.0e-8) continue;
+
+                    const invDet = 1 / det;
+                    tangent.copy(dp1).multiplyScalar(dv2).addScaledVector(dp2, -dv1).multiplyScalar(invDet);
+                    bitangent.copy(dp2).multiplyScalar(du1).addScaledVector(dp1, -du2).multiplyScalar(invDet);
+                    const tLen = tangent.length();
+                    const bLen = bitangent.length();
+                    if (!Number.isFinite(tLen) || !Number.isFinite(bLen) || tLen <= 1.0e-8 || bLen <= 1.0e-8) {
+                        continue;
+                    }
+
+                    tangentSum += tLen * weight;
+                    bitangentSum += bLen * weight;
+                    weightSum += weight;
+                }
+            }
+
+            if (weightSum <= 0 || bitangentSum <= 0) return 1;
+            const aspect = tangentSum / bitangentSum;
+            if (!Number.isFinite(aspect) || aspect <= 0) return 1;
+            return Math.max(0.05, Math.min(20, aspect));
+        }
+
+        function getMaterialContextUvAspect(materialContext) {
+            if (!materialContext?.geometry) return 1;
+            const materialIndex = materialContext.materialIndex ?? null;
+            const key = (materialIndex == null ? '__all__' : String(materialIndex)) + ':' +
+                matrixScaleSignature(materialContext.matrixArray);
+            materialContext.htmlTextureAutoFitAspectCache ??= new Map();
+            if (!materialContext.htmlTextureAutoFitAspectCache.has(key)) {
+                materialContext.htmlTextureAutoFitAspectCache.set(
+                    key,
+                    estimateGeometryUvAspect(materialContext.geometry, materialIndex, materialContext.matrixArray)
+                );
+            }
+            return materialContext.htmlTextureAutoFitAspectCache.get(key);
+        }
+
+        function resolveHTMLTextureSize(md, key, materialContext = null) {
+            const manualSize = manualHTMLTextureSize(md, key);
+            if (!htmlTextureAutoFitEnabled(md, key)) return manualSize;
+            const aspect = getMaterialContextUvAspect(materialContext);
+            return fitHTMLTextureSizeToAspect(manualSize, aspect);
+        }
+
+        function withHTMLAutoFitIdentity(md, materialContext = null) {
+            if (!md || typeof md !== 'object') return md;
+            let sizes = null;
+            for (const key of HTML_TEXTURE_AUTO_FIT_KEYS) {
+                if (!htmlTextureAutoFitEnabled(md, key)) continue;
+                const size = resolveHTMLTextureSize(md, key, materialContext);
+                sizes ??= {};
+                sizes[key] = size.width + 'x' + size.height;
+            }
+            return sizes ? { ...md, __maxjsHTMLAutoFitSizes: sizes } : md;
+        }
+
+        // Load a map slot — priority: HTML texmap → TSL procedural → URL bitmap.
+        function loadMapSlot(md, key, colorSpace, xfKey, fallback, materialContext = null, maxMapChannelOverride = null) {
+            const xfSource = withMaxMapChannelOverride(xfKey ? md[xfKey] : null, maxMapChannelOverride);
+            const htmlUrl = md[key + 'HTML'];
+            if (htmlUrl) {
+                const normalizedXf = normalizeTextureTransform(xfSource);
+                const baseUrl = md[key + 'HTMLBase'] || '';
+                const filename = md[key + 'HTMLName'] || '';
+                // Prefer baseUrl + filename so snapshot-mode relative URLs
+                // resolve inside the copied directory (and sibling images
+                // in the HTML file keep working).
+                const resolved = (baseUrl && filename)
+                    ? (baseUrl + encodeURIComponent(filename))
+                    : htmlUrl;
+                const htmlSize = resolveHTMLTextureSize(md, key, materialContext);
+                const handle = getOrCreateHTMLTexture(THREE, resolved, {
+                    width: htmlSize.width,
+                    height: htmlSize.height,
+                    params: md[key + 'HTMLParams'],
+                    cacheKey: resolved,
+                });
+                applyTextureTransform(handle.texture, normalizedXf);
+                applyTextureUvChannel(handle.texture, normalizedXf?.uvChannel, 1);
+                return handle.texture;
+            }
+            const tslCode = md[key + 'TSL'];
+            if (tslCode) return tslCompiler.evalTSLTexture(tslCode, md[key + 'TSLParams']);
+            const url = md[key];
+            if (url) return loadTexture(url, colorSpace, optimizedTextureTransformForSlot(key, xfSource), fallback);
+            return null;
+        }
+
+        function isHTMLTexture(tex) {
+            return !!tex?.userData?.maxjsHTMLHost;
+        }
+
+        function applyOpacityTextureSlot(material, tex) {
+            if (!tex || !material) return false;
+            if (!(Number.isFinite(material.alphaTest) && material.alphaTest > 0)) {
+                material.transparent = true;
+            }
+            if (isHTMLTexture(tex) && !material.map) {
+                // HTML texmaps commonly carry both color and alpha. Treating
+                // them as alphaMap-only discards the color and renders the
+                // material's white diffuse through the mask.
+                material.map = tex;
+                if ('alphaMap' in material) material.alphaMap = null;
+                return true;
+            }
+            if ('alphaMap' in material) material.alphaMap = tex;
+            return true;
+        }
+
+        const MAXJS_HTML_COLOR_MAP_FRAGMENT = `
+vec4 maxjsHTMLColor = vec4( 0.0 );
+#ifdef USE_MAP
+    vec4 sampledDiffuseColor = texture2D( map, vMapUv );
+    #ifdef DECODE_VIDEO_TEXTURE
+        sampledDiffuseColor = sRGBTransferEOTF( sampledDiffuseColor );
+    #endif
+    maxjsHTMLColor = sampledDiffuseColor;
+#endif
+`;
+
+        const MAXJS_HTML_COLOR_OVERLAY_FRAGMENT = `
+#ifdef USE_MAP
+    outgoingLight = mix( outgoingLight, maxjsHTMLColor.rgb, maxjsHTMLColor.a );
+#endif
+#include <opaque_fragment>
+`;
+
+        function preserveOpacityForHTMLColorMap(material, tex) {
+            if (!material || !isHTMLTexture(tex)) return false;
+            material.userData ??= {};
+            material.userData.maxjsHTMLColorMapPreserveOpacity = true;
+
+            if (!material.onBeforeCompile?.maxjsHTMLColorMapPreserveOpacity) {
+                const previousOnBeforeCompile = material.onBeforeCompile;
+                const patchedOnBeforeCompile = function(shader, renderer) {
+                    previousOnBeforeCompile?.call(this, shader, renderer);
+                    shader.fragmentShader = shader.fragmentShader.replace(
+                        '#include <map_fragment>',
+                        MAXJS_HTML_COLOR_MAP_FRAGMENT
+                    );
+                    shader.fragmentShader = shader.fragmentShader.replace(
+                        '#include <opaque_fragment>',
+                        MAXJS_HTML_COLOR_OVERLAY_FRAGMENT
+                    );
+                };
+                patchedOnBeforeCompile.maxjsHTMLColorMapPreserveOpacity = true;
+                material.onBeforeCompile = patchedOnBeforeCompile;
+                material.customProgramCacheKey = () => 'maxjs-html-color-map-preserve-opacity-v1';
+            }
+
+            material.needsUpdate = true;
+            return true;
+        }
+
+        function wantsHTMLTextureOverrideMaterial(md) {
+            return !!md?.mapHTML && (md.mapHTMLOverride === true || md.mapHTMLOverride === 1);
+        }
+
+        function htmlTextureOverrideIdentity(md, materialContext = null) {
+            const size = resolveHTMLTextureSize(md, 'map', materialContext);
+            return {
+                name: md?.name || '',
+                side: md?.side ?? 1,
+                mapHTML: md?.mapHTML || '',
+                mapHTMLBase: md?.mapHTMLBase || '',
+                mapHTMLName: md?.mapHTMLName || '',
+                mapHTMLW: size.width,
+                mapHTMLH: size.height,
+                mapHTMLParams: md?.mapHTMLParams || null,
+                mapXf: md?.mapXf || null,
+                mapHTMLOverride: true,
+                mapHTMLAutoFit: !!md?.mapHTMLAutoFit,
+            };
+        }
+
+        function createHTMLTextureOverrideMaterial(md, materialContext = null) {
+            const tex = loadMapSlot(md, 'map', THREE.SRGBColorSpace, 'mapXf', fallbackWhiteTexture, materialContext);
+            if (!isHTMLTexture(tex)) return null;
+            const material = new THREE.MeshBasicMaterial({
+                color: 0xffffff,
+                map: tex,
+                side: md.side === 0 ? THREE.FrontSide : THREE.DoubleSide,
+                transparent: true,
+                opacity: 1.0,
+                depthWrite: false,
+                fog: false,
+                toneMapped: false,
+            });
+            material.alphaTest = 0.0;
+            material.premultipliedAlpha = false;
+            material.userData ??= {};
+            material.userData.maxjsHTMLTextureOverride = true;
+            material.needsUpdate = true;
+            return material;
+        }
+
+        function refreshLightProbeFromCurrentHDRI() {
+            if (!currentEnvParams?.hdri) {
+                markLightProbeSceneDirty();
+                scheduleLightProbeFromCurrentScene({ force: true, delay: 0 });
+                return;
+            }
+            loadHDRI(currentEnvParams, { forceProbeRefresh: true });
+        }
+
+        function loadHDRI(envParams, options = {}) {
+            if (!envParams?.hdri) return;
+            currentEnvParams = envParams;
+
+            let hdriUrl = envParams.hdri;
+            try {
+                hdriUrl = new URL(envParams.hdri, window.location.href).href;
+            } catch {
+                hdriUrl = envParams.hdri;
+            }
+
+            // Exposure
+            renderer.toneMappingExposure = Math.pow(2, envParams.exp || 0) * (envParams.gamma || 1.0);
+            // Post FX owns the final view transform; Max HDRI exposure is
+            // environment metadata and must not stomp a restored custom look.
+            applyCoreToneMappingState({ markOutput: false });
+
+            const rot = (envParams.rot || 0) * Math.PI / 180;
+            scene.environmentRotation.set(0, -rot, 0);
+            scene.backgroundRotation.set(0, -rot, 0);
+            const probeSignature = JSON.stringify([hdriUrl, envParams.rot || 0, envParams.flip || 0, envParams.zup || 0]);
+            const shouldRefreshTexture = hdriUrl !== currentHdriUrl;
+            const shouldRefreshProbe = !!options.forceProbeRefresh
+                || probeSignature !== currentHdriProbeSignature
+                || !hasLightProbeData;
+
+            if (!shouldRefreshTexture && !shouldRefreshProbe) return;
+
+            currentHdriUrl = hdriUrl;
+            currentHdriProbeSignature = probeSignature;
+            hdriLoadGeneration += 1;
+            const loadGeneration = hdriLoadGeneration;
+
+            loadEnvironmentTexture(hdriUrl, hdriUrl, async (hdrTex) => {
+                if (loadGeneration !== hdriLoadGeneration) {
+                    hdrTex.dispose();
+                    return;
+                }
+                if (currentHdriRawTexture && currentHdriRawTexture !== hdrTex) currentHdriRawTexture.dispose?.();
+                currentHdriRawTexture = hdrTex;
+                scene.userData.maxjsPathTraceEnvironment = hdrTex;
+                const previousEnvMap = currentHdriEnvMap;
+                const envMap = isPathTracingMode
+                    ? null
+                    : retainPMREMTexture(pmremGenerator.fromEquirectangular(hdrTex));
+                currentHdriEnvMap = envMap;
+                scene.environment = envMap;
+                applyHdriReflectionOnlyState();
+                syncMaterialEnvMaps();
+                syncEnvironmentDisplay();
+                if (previousEnvMap && previousEnvMap !== envMap) previousEnvMap.dispose?.();
+                syncDefaultLightsVisibility();
+                if (lightProbeEnabled || shouldRefreshProbe) {
+                    await updateLightProbeFromHDRI(hdrTex, probeSignature, loadGeneration);
+                }
+                maxjsFx.markEnvironmentChanged?.();
+                // The path tracer bakes the env texture into its kernel at
+                // build time, so an async HDRI load that lands after the scene
+                // was built needs an explicit rebuild — otherwise the tracer
+                // keeps its stale (null) env and shows the black/no-env state.
+                markPathTracingSceneDirtyNow();
+                syncHdriPanel();
+            }, undefined, (error) => {
+                console.error('max.js HDRI load failed', { hdriUrl, error });
+                currentHdriUrl = null;
+                currentEnvParams = null;
+                clearCurrentHdriEnvMap();
+                scene.environment = null;
+                scene.userData.maxjsPathTraceEnvironment = null;
+                scene.userData.maxjsPathTraceBackground = null;
+                applyHdriReflectionOnlyState();
+                syncMaterialEnvMaps();
+                syncEnvironmentDisplay();
+                resetEnvironmentLighting();
+                markPathTracingSceneDirtyNow(); // drop the now-cleared env binding
+                syncHdriPanel();
+            });
+        }
+
+        // ── Local HDRI (independent of Max) ─────────────────
+        // Persist HDRI across page reloads (Force WebGL pipeline switch) via IndexedDB
+        const HDRI_DB_NAME = 'maxjs_hdri_cache';
+        const HDRI_DB_STORE = 'files';
+
+        function openHdriDB() {
+            return new Promise((resolve, reject) => {
+                const req = indexedDB.open(HDRI_DB_NAME, 1);
+                req.onupgradeneeded = () => req.result.createObjectStore(HDRI_DB_STORE);
+                req.onsuccess = () => resolve(req.result);
+                req.onerror = () => reject(req.error);
+            });
+        }
+
+        async function stashHdriFile(file) {
+            try {
+                const db = await openHdriDB();
+                const buf = await file.arrayBuffer();
+                const tx = db.transaction(HDRI_DB_STORE, 'readwrite');
+                tx.objectStore(HDRI_DB_STORE).put({ name: file.name, buffer: buf }, 'current');
+                db.close();
+            } catch (e) { maxjsDebugWarn('[max.js] HDRI stash failed:', e); }
+        }
+
+        async function restoreStashedHdri() {
+            try {
+                const db = await openHdriDB();
+                const tx = db.transaction(HDRI_DB_STORE, 'readonly');
+                const req = tx.objectStore(HDRI_DB_STORE).get('current');
+                return new Promise((resolve) => {
+                    req.onsuccess = () => {
+                        db.close();
+                        const data = req.result;
+                        if (data?.buffer && data?.name) {
+                            resolve(new File([data.buffer], data.name));
+                        } else {
+                            resolve(null);
+                        }
+                    };
+                    req.onerror = () => { db.close(); resolve(null); };
+                });
+            } catch { return null; }
+        }
+
+        async function clearStashedHdri() {
+            try {
+                const db = await openHdriDB();
+                const tx = db.transaction(HDRI_DB_STORE, 'readwrite');
+                tx.objectStore(HDRI_DB_STORE).delete('current');
+                db.close();
+            } catch {}
+        }
+
+        function loadLocalHDRIFile(file, { preserveEnabled = false, persist = true } = {}) {
+            if (localHdriObjectUrl) URL.revokeObjectURL(localHdriObjectUrl);
+            if (localHdriEnvMap) { localHdriEnvMap.dispose(); localHdriEnvMap = null; }
+            if (localHdriRawTexture) { localHdriRawTexture.dispose?.(); localHdriRawTexture = null; }
+            if (!hasAuthoredEnvironmentActive()) {
+                clearCurrentHdriEnvMap();
+            }
+            localHdriFile = file;
+            localHdriObjectUrl = URL.createObjectURL(file);
+            localHdriFileName = file.name;
+            if (!preserveEnabled) localHdriEnabled = true;
+            void stashHdriFile(file);
+
+            hdriLoadGeneration += 1;
+            const loadGen = hdriLoadGeneration;
+
+            loadEnvironmentTexture(localHdriObjectUrl, file.name, async (hdrTex) => {
+                if (loadGen !== hdriLoadGeneration) { hdrTex.dispose(); return; }
+                localHdriRawTexture = hdrTex;
+                localHdriEnvMap = isPathTracingMode
+                    ? null
+                    : retainPMREMTexture(pmremGenerator.fromEquirectangular(hdrTex));
+                applyLocalHDRIToScene();
+                currentHdriUrl = localHdriObjectUrl;
+                if (!hasAuthoredEnvironmentActive() && lightProbeEnabled) {
+                    await updateLightProbeFromHDRI(hdrTex, 'local-' + localHdriFileName, loadGen);
+                }
+                maxjsFx.markEnvironmentChanged?.();
+                // Async load: rebuild the tracer so it picks up the new env
+                // texture (baked into the kernel at build time). See loadHDRI.
+                markPathTracingSceneDirtyNow();
+                if (persist) savePostFxState();
+                syncHdriPanel();
+            }, undefined, (error) => {
+                console.error('max.js local HDRI load failed', error);
+                clearLocalHDRI();
+            });
+        }
+
+        function applyLocalHDRIToScene() {
+            if (hasAuthoredEnvironmentActive()) {
+                restoreAuthoredEnvironmentAfterLocalHDRIChange();
+                return;
+            }
+            if (!localHdriEnvMap && !localHdriRawTexture) return;
+            if (localHdriEnabled) {
+                scene.environment = localHdriEnvMap;
+                scene.userData.maxjsPathTraceEnvironment = localHdriRawTexture || null;
+                syncMaterialEnvMaps();
+                scene.environmentIntensity = localHdriIntensity;
+                applyHdriReflectionOnlyState();
+                const rot = localHdriRotation * Math.PI / 180;
+                scene.environmentRotation.set(0, -rot, 0);
+                scene.backgroundRotation.set(0, -rot, 0);
+                if (localHdriFlip) {
+                    scene.environmentRotation.y += Math.PI;
+                    scene.backgroundRotation.y += Math.PI;
+                }
+                scene.backgroundBlurriness = localHdriBlur;
+                syncEnvironmentDisplay();
+                syncDefaultLightsVisibility();
+            } else {
+                scene.environment = null;
+                scene.userData.maxjsPathTraceEnvironment = currentHdriRawTexture || null;
+                scene.userData.maxjsPathTraceBackground = null;
+                applyHdriReflectionOnlyState();
+                syncMaterialEnvMaps();
+                setBackgroundColor(hiddenBackgroundColor);
+                maxjsFx.setEnvironmentVisible(false);
+                resetEnvironmentLighting();
+            }
+        }
+
+        function applyLocalHDRISettings() {
+            if (hasAuthoredEnvironmentActive()) {
+                restoreAuthoredEnvironmentAfterLocalHDRIChange();
+                return;
+            }
+            if (!isLocalHdriActive()) return;
+            applyLocalHDRIToScene();
+            maxjsFx.markOutputChanged?.();
+        }
+
+        function toggleLocalHDRI(enabled) {
+            localHdriEnabled = enabled;
+            applyLocalHDRIToScene();
+            maxjsFx.markEnvironmentChanged?.();
+            markPathTracingSceneDirtyNow(); // env texture binding toggled on/off
+            savePostFxState();
+            syncHdriPanel();
+        }
+
+        function clearLocalHDRI() {
+            const authoredEnvironmentActive = hasAuthoredEnvironmentActive();
+            localHdriFileName = '';
+            localHdriFile = null;
+            localHdriEnabled = true;
+            if (localHdriEnvMap) { localHdriEnvMap.dispose(); localHdriEnvMap = null; }
+            if (localHdriRawTexture) { localHdriRawTexture.dispose?.(); localHdriRawTexture = null; }
+            clearCurrentHdriEnvMap();
+            if (localHdriObjectUrl) { URL.revokeObjectURL(localHdriObjectUrl); localHdriObjectUrl = null; }
+            void clearStashedHdri();
+            currentHdriUrl = null;
+            currentHdriProbeSignature = '';
+            if (authoredEnvironmentActive) {
+                restoreAuthoredEnvironmentAfterLocalHDRIChange();
+                maxjsFx.markEnvironmentChanged?.();
+                markPathTracingSceneDirtyNow(); // env binding swapped back to authored
+                savePostFxState();
+                syncHdriPanel();
+                return;
+            }
+            scene.environment = null;
+            scene.userData.maxjsPathTraceEnvironment = null;
+            scene.userData.maxjsPathTraceBackground = null;
+            applyHdriReflectionOnlyState();
+            syncMaterialEnvMaps();
+            scene.environmentIntensity = 1.0;
+            scene.environmentRotation.set(0, 0, 0);
+            scene.backgroundRotation.set(0, 0, 0);
+            scene.backgroundBlurriness = 0;
+            syncEnvironmentDisplay();
+            resetEnvironmentLighting();
+            markPathTracingSceneDirtyNow(); // env binding cleared
+            savePostFxState();
+            syncHdriPanel();
+        }
+
+        function syncHdriPanel() {
+            const nameEl = document.getElementById('fx-hdri-name');
+            const toggleEl = document.getElementById('fx-hdri-toggle');
+            const authoredEnvironmentActive = hasAuthoredEnvironmentActive();
+            if (nameEl) {
+                nameEl.textContent = authoredEnvironmentActive
+                    ? 'Max environment active'
+                    : isLocalHdriLoaded()
+                    ? localHdriFileName + (localHdriEnabled ? '' : ' (off)')
+                    : 'No HDRI loaded';
+            }
+            if (toggleEl) {
+                toggleEl.textContent = localHdriEnabled ? 'On' : 'Off';
+                toggleEl.classList.toggle('active', !authoredEnvironmentActive && localHdriEnabled && isLocalHdriLoaded());
+            }
+            const reflectionOnlyEl = document.getElementById('fx-hdri-reflection-only');
+            if (reflectionOnlyEl) reflectionOnlyEl.checked = localHdriReflectionOnly;
+            for (const id of ['fx-hdri-toggle', 'fx-hdri-load', 'fx-hdri-clear', 'fx-hdri-rotation', 'fx-hdri-intensity', 'fx-hdri-blur', 'fx-hdri-flip', 'fx-hdri-reflection-only']) {
+                const el = document.getElementById(id);
+                if (el) el.disabled = authoredEnvironmentActive;
+            }
+        }
+
+        // ── Sky Environment ──────────────────────────────────
+        // SkyMesh (TSL/NodeMaterial) for WebGPU + WebGL2-fallback backends.
+        // Legacy Sky (ShaderMaterial) for pure WebGLRenderer — NodeMaterial can't compile there.
+        let skyMesh = null;
+        let skySunLight = null;
+        let skyFillLight = null;
+        let skyEnvMap = null;
+        let skyPathTraceTexture = null;
+        let lastSkySig = '';
+        let lastSkySourceParams = null;
+        let skyActive = false;
+        let skyPlanetaryActive = false;
+        let geospatialSky = null;
+        const skyLinkedSunDirection = new THREE.Vector3();
+        const skyLinkedSunPosition = new THREE.Vector3();
+        const skyLinkedSunTarget = new THREE.Vector3();
+        const skySunDirectionScratch = new THREE.Vector3();
+        const SKY_MODEL_PLANETARY = 1;
+        const SKY_DEFAULTS = Object.freeze({
+            turbidity: 10,
+            rayleigh: 3,
+            mieCoefficient: 0.005,
+            mieDirectionalG: 0.7,
+            elevation: 2,
+            azimuth: 180,
+            exposure: 0.5,
+            model: 0,
+            showSunDisc: true,
+            cameraAltitude: 1200,
+        });
+        // Geospatial sky is supported by WebGPU and plain WebGL. Keep it out of
+        // Force WebGL because that TSL path conflicts with post effects.
+        const useLegacySky = !(renderer instanceof THREE.WebGPURenderer);
+        const allowGeospatialSky = rendererBackendLabel === 'WebGPU'
+            || String(rendererBackendLabel || '').startsWith('WebGL');
+
+        function skyNumber(value, fallback) {
+            const n = Number(value);
+            return Number.isFinite(n) ? n : fallback;
+        }
+
+        function hasAuthoredEnvironmentActive() {
+            return !!(skyActive || currentEnvParams?.hdri);
+        }
+
+        function restoreAuthoredEnvironmentAfterLocalHDRIChange() {
+            if (skyActive && lastSkySourceParams) {
+                lastSkySig = '';
+                applySky(lastSkySourceParams);
+                return true;
+            }
+            if (currentEnvParams?.hdri) {
+                loadHDRI(currentEnvParams, { forceProbeRefresh: true });
+                return true;
+            }
+            return false;
+        }
+
+        function normalizeSkyParams(rawParams) {
+            const params = { ...SKY_DEFAULTS, ...(rawParams || {}) };
+            params.turbidity = skyNumber(params.turbidity, SKY_DEFAULTS.turbidity);
+            params.rayleigh = skyNumber(params.rayleigh, SKY_DEFAULTS.rayleigh);
+            params.mieCoefficient = skyNumber(params.mieCoefficient, SKY_DEFAULTS.mieCoefficient);
+            params.mieDirectionalG = skyNumber(params.mieDirectionalG, SKY_DEFAULTS.mieDirectionalG);
+            params.elevation = skyNumber(params.elevation, SKY_DEFAULTS.elevation);
+            params.azimuth = skyNumber(params.azimuth, SKY_DEFAULTS.azimuth);
+            params.exposure = skyNumber(params.exposure, SKY_DEFAULTS.exposure);
+            params.model = Math.trunc(skyNumber(params.model, SKY_DEFAULTS.model));
+            params.showSunDisc = params.showSunDisc !== false && params.showSunDisc !== 0;
+            params.cameraAltitude = Math.max(0, skyNumber(params.cameraAltitude, SKY_DEFAULTS.cameraAltitude));
+            return params;
+        }
+
+        function getSkySunDirectionWorld(params, target = skySunDirectionScratch) {
+            if (Array.isArray(params?.sunDirectionWorld)) {
+                target.set(
+                    Number(params.sunDirectionWorld[0]),
+                    Number(params.sunDirectionWorld[1]),
+                    Number(params.sunDirectionWorld[2])
+                );
+                if (target.lengthSq() > 1e-8) return target.normalize();
+            }
+            const elevRad = THREE.MathUtils.degToRad(skyNumber(params?.elevation, SKY_DEFAULTS.elevation));
+            const azimRad = THREE.MathUtils.degToRad(skyNumber(params?.azimuth, SKY_DEFAULTS.azimuth));
+            return copyMaxComponentsToWorld(target,
+                Math.cos(elevRad) * Math.sin(azimRad),
+                Math.cos(elevRad) * Math.cos(azimRad),
+                Math.sin(elevRad)
+            ).normalize();
+        }
+
+        function isSkyLinkCandidateLight(light) {
+            if (!light?.isDirectionalLight || light.userData?.maxjsVisible === false) return false;
+            if (light.name === '__maxjs_sky_sun__' || light.name === '__maxjs_geospatial_sky_sun__') return false;
+            return light.userData?.maxjsHandle != null;
+        }
+
+        function getDirectionalLightSunVector(light, target = new THREE.Vector3()) {
+            if (!light) return null;
+            light.updateMatrixWorld?.();
+            light.target?.updateMatrixWorld?.();
+            skyLinkedSunPosition.setFromMatrixPosition(light.matrixWorld);
+            if (light.target?.matrixWorld) skyLinkedSunTarget.setFromMatrixPosition(light.target.matrixWorld);
+            else skyLinkedSunTarget.set(0, 0, 0);
+            target.copy(skyLinkedSunPosition).sub(skyLinkedSunTarget);
+            return target.lengthSq() > 1.0e-8 ? target.normalize() : null;
+        }
+
+        function findSkyLinkedSunDirection(target = skyLinkedSunDirection) {
+            const directional = [];
+            for (const light of lightHandleMap.values()) {
+                if (isSkyLinkCandidateLight(light)) directional.push(light);
+            }
+            if (!directional.length) return null;
+            const named = directional.find((light) => {
+                const name = String(light.name || '').toLowerCase();
+                return /\b(sun|sunlight|solar|daylight)\b/.test(name)
+                    || name.includes('sun')
+                    || name.includes('solar')
+                    || name.includes('daylight');
+            });
+            return getDirectionalLightSunVector(named || (directional.length === 1 ? directional[0] : null), target);
+        }
+
+        function withLinkedSkySun(rawParams) {
+            const linkedDir = findSkyLinkedSunDirection();
+            if (!linkedDir) return rawParams;
+            const snap = (value) => Math.round(value * 10000) / 10000;
+            return {
+                ...(rawParams || {}),
+                sunDirectionWorld: [snap(linkedDir.x), snap(linkedDir.y), snap(linkedDir.z)],
+                sunLinkedLight: true,
+            };
+        }
+
+        function updateSkyTime(elapsedSeconds) {
+            if (!skyActive || !skyPlanetaryActive) return;
+            geospatialSky?.update({ camera, elapsedSeconds });
+        }
+
+        function refreshSkyFromLinkedSun() {
+            if (!skyActive || !lastSkySourceParams) return false;
+            const beforeSig = lastSkySig;
+            applySky(lastSkySourceParams);
+            return beforeSig !== lastSkySig;
+        }
+
+        function refreshSkyAmbientLightProbeFromCurrentSky() {
+            if (!skyActive || !lastSkySourceParams) return false;
+            const params = normalizeSkyParams(withLinkedSkySun(lastSkySourceParams));
+            const sunDir = getSkySunDirectionWorld(params, skySunDirectionScratch);
+            if (params.model === SKY_MODEL_PLANETARY && allowGeospatialSky) {
+                clearLightProbe();
+                hasLightProbeData = true;
+                disposeSkyReflectionEnvironment();
+                if (skyEnvMap && scene.environment === skyEnvMap) scene.environment = null;
+                scene.environmentIntensity = 1.0;
+                applyHdriReflectionOnlyState();
+                currentHdriProbeSignature = JSON.stringify([
+                    'geospatial-probe',
+                    params.model,
+                    params.exposure,
+                    params.elevation,
+                    params.azimuth,
+                    params.sunDirectionWorld || null,
+                ]);
+                return true;
+            }
+            updateSkyAmbientLightProbe(params, sunDir);
+            if (!skyEnvMap || scene.environment !== skyEnvMap) {
+                updateSkyReflectionEnvironment(params, sunDir);
+            }
+            currentHdriProbeSignature = JSON.stringify([
+                'sky-probe',
+                params.model,
+                params.exposure,
+                params.elevation,
+                params.azimuth,
+                params.sunDirectionWorld || null,
+            ]);
+            return true;
+        }
+
+        function removeClassicSkyObjects() {
+            if (skyMesh?.parent) skyMesh.parent.remove(skyMesh);
+            if (skySunLight?.parent) skySunLight.parent.remove(skySunLight);
+            if (skyFillLight?.parent) skyFillLight.parent.remove(skyFillLight);
+        }
+
+        function applySky(skyParams) {
+            if (!skyParams) return;
+            lastSkySourceParams = skyParams;
+
+            const params = normalizeSkyParams(withLinkedSkySun(skyParams));
+            const sig = JSON.stringify(params);
+            if (sig === lastSkySig) {
+                if (!hasLightProbeData) refreshSkyAmbientLightProbeFromCurrentSky();
+                return;
+            }
+            lastSkySig = sig;
+
+            try {
+                const planetary = params.model === SKY_MODEL_PLANETARY && allowGeospatialSky;
+                if (planetary) {
+                    removeClassicSkyObjects();
+                    geospatialSky ??= createGeospatialSkyController({
+                        scene,
+                        renderer,
+                        backendLabel: rendererBackendLabel,
+                        fallbackBackground: hiddenBackgroundColor,
+                    });
+
+                    clearCurrentHdriEnvMap();
+                    disposeSkyReflectionEnvironment();
+                    disposeSkyPathTraceEnvironment();
+                    scene.environment = null;
+                    scene.environmentIntensity = 1.0;
+                    syncMaterialEnvMaps();
+                    scene.environmentRotation.set(0, 0, 0);
+                    scene.backgroundRotation.set(0, 0, 0);
+
+                    geospatialSky.apply(params, { camera });
+                    applyCoreToneMappingState({ markOutput: false });
+                    syncDefaultLightsVisibility();
+                    clearLightProbe();
+                    hasLightProbeData = true;
+                    skyActive = true;
+                    skyPlanetaryActive = true;
+                    applyHdriReflectionOnlyState();
+                    currentHdriUrl = null;
+                    currentHdriProbeSignature = '';
+                    maxjsFx.markEnvironmentChanged?.();
+                    syncHdriPanel();
+                    return;
+                }
+
+                geospatialSky?.dispose();
+                geospatialSky = null;
+                skyPlanetaryActive = false;
+
+                if (!skyMesh) {
+                    skyMesh = useLegacySky ? new Sky() : new SkyMesh();
+                    skyMesh.scale.setScalar(450000);
+                    skyMesh.name = '__maxjs_sky__';
+                    skyMesh.frustumCulled = false;
+                    skyMesh.userData.volumetricBoundsBypass = true;
+                }
+
+                const sunDir = getSkySunDirectionWorld(params, skySunDirectionScratch);
+
+                if (useLegacySky) {
+                    const u = skyMesh.material.uniforms;
+                    u.turbidity.value = params.turbidity;
+                    u.rayleigh.value = params.rayleigh;
+                    u.mieCoefficient.value = params.mieCoefficient;
+                    u.mieDirectionalG.value = params.mieDirectionalG;
+                    u.up.value.set(0, 1, 0);
+                    u.sunPosition.value.copy(sunDir);
+                } else {
+                    skyMesh.turbidity.value = params.turbidity;
+                    skyMesh.rayleigh.value = params.rayleigh;
+                    skyMesh.mieCoefficient.value = params.mieCoefficient;
+                    skyMesh.mieDirectionalG.value = params.mieDirectionalG;
+                    skyMesh.upUniform.value.set(0, 1, 0);
+                    skyMesh.sunPosition.value.copy(sunDir);
+                }
+
+                renderer.toneMappingExposure = params.exposure;
+                // Keep the user-selected Post FX tonemapper/exposure authoritative.
+                applyCoreToneMappingState({ markOutput: false });
+
+                if (skyMesh.parent !== scene) scene.add(skyMesh);
+
+                clearCurrentHdriEnvMap();
+
+                // The sky mesh is the environment surface. Keep the scene
+                // background transparent so it never enters Bloom/SSGI as a
+                // matte when the environment backdrop is hidden.
+                scene.background = null;
+                updateSkyReflectionEnvironment(params, sunDir);
+                updateSkyPathTraceEnvironment(params, sunDir);
+                scene.environmentRotation.set(0, 0, 0);
+                scene.backgroundRotation.set(0, 0, 0);
+
+                // Sun DirectionalLight along sun direction
+                if (!skySunLight) {
+                    skySunLight = new THREE.DirectionalLight(0xffffff, 2.0);
+                    skySunLight.name = '__maxjs_sky_sun__';
+                    skySunLight.userData.volumetricBypass = true;
+                }
+                if (skySunLight.parent !== scene) scene.add(skySunLight);
+                const sunStrength = Math.max(0.1, THREE.MathUtils.clamp(sunDir.y, -1, 1));
+                const warmth = 1.0 - sunStrength * 0.2;
+                skySunLight.color.setRGB(1.0, warmth, warmth * 0.85);
+                skySunLight.intensity = 1.0 + sunStrength * 3.0;
+                skySunLight.position.copy(sunDir).multiplyScalar(200);
+
+                // Sky fill HemisphereLight
+                if (!skyFillLight) {
+                    skyFillLight = new THREE.HemisphereLight(0x87CEEB, 0x362D1B, 1.0);
+                    skyFillLight.name = '__maxjs_sky_fill__';
+                    skyFillLight.userData.volumetricBypass = true;
+                }
+                if (skyFillLight.parent !== scene) scene.add(skyFillLight);
+                skyFillLight.intensity = 0.5 + sunStrength * 0.5;
+
+                syncDefaultLightsVisibility();
+                updateSkyAmbientLightProbe(params, sunDir);
+                skyActive = true;
+                applyHdriReflectionOnlyState();
+
+                // Clear HDRI state
+                currentHdriUrl = null;
+                currentHdriProbeSignature = '';
+
+                maxjsFx.markEnvironmentChanged?.();
+                syncHdriPanel();
+
+            } catch (err) {
+                console.error('[max.js] applySky error:', err);
+            }
+        }
+
+        function removeSky() {
+            lastSkySig = '';
+            skyActive = false;
+            skyPlanetaryActive = false;
+            geospatialSky?.dispose();
+            geospatialSky = null;
+            if (skyMesh?.parent) skyMesh.parent.remove(skyMesh);
+            if (skySunLight?.parent) skySunLight.parent.remove(skySunLight);
+            if (skyFillLight?.parent) skyFillLight.parent.remove(skyFillLight);
+            disposeSkyReflectionEnvironment();
+            disposeSkyPathTraceEnvironment();
+        }
+
+        function materialListHasRawShader(material) {
+            if (Array.isArray(material)) return material.some((entry) => entry?.isRawShaderMaterial);
+            return !!material?.isRawShaderMaterial;
+        }
+
+        function removeWebGPUIncompatibleSceneMaterials() {
+            if (rendererBackendLabel !== 'WebGPU') return;
+            const removals = [];
+            scene.traverse((object) => {
+                if (!object?.parent) return;
+                if (
+                    materialListHasRawShader(object.material)
+                    || materialListHasRawShader(object.customDepthMaterial)
+                    || materialListHasRawShader(object.customDistanceMaterial)
+                ) {
+                    removals.push(object);
+                }
+            });
+            for (const object of removals) {
+                object.parent?.remove(object);
+                if (!object.userData?.maxjsRawShaderPurgeLogged) {
+                    object.userData.maxjsRawShaderPurgeLogged = true;
+                    console.warn('[max.js] removed WebGPU-incompatible RawShaderMaterial object:', object.name || object.type || '(unnamed)');
+                }
+            }
+        }
+
+        function removeAuthoredEnvironment() {
+            removeSky();
+            currentHdriUrl = null;
+            currentHdriProbeSignature = '';
+            currentEnvParams = null;
+            clearCurrentHdriEnvMap();
+            scene.environment = null;
+            syncMaterialEnvMaps();
+            scene.environmentIntensity = 1.0;
+            applyHdriReflectionOnlyState();
+            scene.environmentRotation.set(0, 0, 0);
+            scene.backgroundRotation.set(0, 0, 0);
+            scene.backgroundBlurriness = 0;
+            syncEnvironmentDisplay();
+            resetEnvironmentLighting();
+            if (isLocalHdriLoaded()) {
+                applyLocalHDRIToScene();
+            }
+            syncHdriPanel();
+        }
+
+        // ── Material Creation ───────────────────────────────
+        function rememberMaterialEmissiveBase(material) {
+            if (!material?.emissive) return;
+            material.userData ??= {};
+            material.userData.maxjsBaseEmissive = [
+                material.emissive.r,
+                material.emissive.g,
+                material.emissive.b,
+            ];
+            material.userData.maxjsBaseEmissiveIntensity = Number.isFinite(material.emissiveIntensity)
+                ? material.emissiveIntensity
+                : 1.0;
+        }
+
+        function applyMaterialSelectionState(material, selected) {
+            // Selection is now handled by outline post-processing pass
+            // Just restore base emissive
+            if (!material?.emissive) return;
+            const base = material.userData?.maxjsBaseEmissive || [0, 0, 0];
+            const baseIntensity = Number.isFinite(material.userData?.maxjsBaseEmissiveIntensity)
+                ? material.userData.maxjsBaseEmissiveIntensity
+                : 1.0;
+            material.emissive.setRGB(base[0], base[1], base[2]);
+            material.emissiveIntensity = baseIntensity;
+        }
+
+        function applyMeshShadowState(mesh) {
+            if (!mesh?.isMesh) return;
+            mesh.castShadow = true;
+            mesh.receiveShadow = true;
+        }
+
+        function applyNodeProps(mesh, props) {
+            if (!props) return;
+            // Renderable toggle — works for both meshes and splines
+            if (props.rend === 0) applyMaxObjectVisibility(mesh, false);
+            if (!mesh?.isMesh) return;
+            mesh.castShadow = props.cshadow !== 0;
+            mesh.receiveShadow = props.rshadow !== 0;
+            const side = props.bcull ? THREE.FrontSide : THREE.DoubleSide;
+            const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+            for (const m of mats) {
+                if (m && m.side !== side) m.side = side;
+                if (!m) continue;
+                if (props.opacity != null && props.opacity < 0.999) {
+                    m.transparent = true;
+                    m.opacity = props.opacity;
+                } else if (m.userData?._propsOpacity) {
+                    m.transparent = false;
+                    m.opacity = 1.0;
+                }
+                if (!m.userData) m.userData = {};
+                m.userData._propsOpacity = props.opacity != null && props.opacity < 0.999;
+            }
+        }
+
+        function applyJsmodSyncState(mesh, enabled) {
+            if (enabled) mesh.userData.jsmod = true;
+            else delete mesh.userData.jsmod;
+        }
+
+        // Max user-defined properties (Object Properties → User Defined).
+        // Full payloads omit the field when empty, so callers on full-sync
+        // paths pass nd.userProps directly; partial paths guard on != null.
+        function applyUserPropsSyncState(mesh, userProps) {
+            if (typeof userProps === 'string' && userProps) mesh.userData.maxjsUserProps = userProps;
+            else delete mesh.userData.maxjsUserProps;
+        }
+
+        const MAXJS_SELF_HIDDEN_LAYER = 31;
+
+        function setObjectSelfVisibleLayer(object, visible) {
+            if (!object?.layers?.set) return false;
+            const layer = visible ? 0 : MAXJS_SELF_HIDDEN_LAYER;
+            const mask = 2 ** layer;
+            if (object.layers.mask === mask) return false;
+            object.layers.set(layer);
+            return true;
+        }
+
+        function restoreRenderableMaterialVisibility(object) {
+            const materials = Array.isArray(object?.material)
+                ? object.material
+                : (object?.material ? [object.material] : []);
+            let changed = false;
+            for (const material of materials) {
+                if (!material) continue;
+                if (material.visible !== true) {
+                    material.visible = true;
+                    changed = true;
+                }
+            }
+            return changed;
+        }
+
+        function applyMaxObjectVisibility(object, visible) {
+            if (!object) return false;
+            object.userData ??= {};
+            const next = visible !== false;
+            let changed = object.userData.maxjsVisible !== next;
+            object.userData.maxjsVisible = next;
+            if (object.visible !== true) {
+                object.visible = true;
+                changed = true;
+            }
+            changed = setObjectSelfVisibleLayer(object, next) || changed;
+            changed = restoreRenderableMaterialVisibility(object) || changed;
+            return changed;
+        }
+
+        // Assigned after layerManager init. Until then jsmod visibility keeps
+        // the legacy skip so nothing fights layers during boot.
+        let jsmodVisibilityOwnedByLayer = null;
+
+        function applyBridgeVisibility(mesh, visibleFlag) {
+            if (!mesh) return false;
+            // three.js Deform meshes follow Max visibility like any other node
+            // unless a layer explicitly owns their visibility (clone workflows
+            // hiding the Max copy via node.hide()). In-place ctx.deform needs
+            // no hide/unhide special-casing at all.
+            if (mesh.userData.jsmod
+                && (!jsmodVisibilityOwnedByLayer || jsmodVisibilityOwnedByLayer(mesh.userData.maxjsHandle))) return false;
+            const visible = visibleFlag == null ? true : !!visibleFlag;
+            return applyMaxObjectVisibility(mesh, visible);
+        }
+
+        function applyInstanceSyncState(mesh, instOfHandle) {
+            if (!mesh) return;
+            if (Number.isFinite(instOfHandle) && instOfHandle > 0) mesh.userData.maxjsInstOf = instOfHandle;
+            else delete mesh.userData.maxjsInstOf;
+        }
+
+        function getSSSRoughnessInfluence(roughness) {
+            const r = THREE.MathUtils.clamp(Number.isFinite(roughness) ? roughness : 0.5, 0, 1);
+            return {
+                attenuationScale: THREE.MathUtils.lerp(0.35, 1.0, r),
+                powerScale: THREE.MathUtils.lerp(1.6, 0.55, r),
+            };
+        }
+
+        function applySSSRoughnessInfluence(material, roughness) {
+            if (!material || material.type !== 'MeshSSSNodeMaterial') return;
+            const base = material.userData?.maxjsSSSBase || {};
+            const baseAttenuation = Number.isFinite(base.attenuation) ? base.attenuation : 0.1;
+            const basePower = Number.isFinite(base.power) ? base.power : 2.0;
+            const influence = getSSSRoughnessInfluence(roughness);
+            material.thicknessAttenuationNode = tslFloat(baseAttenuation * influence.attenuationScale);
+            material.thicknessPowerNode = tslFloat(Math.max(0.01, basePower * influence.powerScale));
+            material.needsUpdate = true;
+        }
+
+        function applySSSMaterialNodes(material, md) {
+            if (!material || typeof material !== 'object') return;
+
+            const sssColor = Array.isArray(md.sssColor) && md.sssColor.length === 3
+                ? new THREE.Color(md.sssColor[0], md.sssColor[1], md.sssColor[2])
+                : new THREE.Color(1, 1, 1);
+            let thicknessColorNode = tslColor(sssColor);
+
+            if (md.sssMap) {
+                const sssMap = loadTexture(md.sssMap, THREE.SRGBColorSpace, md.sssMapXf, fallbackWhiteTexture);
+                thicknessColorNode = tslTexture(sssMap).rgb.mul(thicknessColorNode);
+            }
+
+            material.thicknessColorNode = thicknessColorNode;
+            material.thicknessDistortionNode = tslFloat(md.sssDistortion ?? 0.1);
+            material.thicknessAmbientNode = tslFloat(md.sssAmbient ?? 0.0);
+            material.thicknessScaleNode = tslFloat(md.sssScale ?? 10.0);
+            material.userData ??= {};
+            material.userData.maxjsSSSBase = {
+                attenuation: md.sssAttenuation ?? 0.1,
+                power: md.sssPower ?? 2.0,
+            };
+            applySSSRoughnessInfluence(material, md.rough ?? material.roughness ?? 0.5);
+        }
+
+        const utilityMaterialModels = new Set([
+
+            'MeshDepthMaterial',
+            'MeshBackdropNodeMaterial',
+            'MeshLambertMaterial',
+            'MeshMatcapMaterial',
+            'MeshNormalMaterial',
+            'MeshPhongMaterial',
+        ]);
+
+        function createBackdropUtilityMaterial(md) {
+            const material = new THREE.MeshBasicNodeMaterial();
+            const opacity = Math.min(1.0, Math.max(0.0, md.opacity ?? 1.0));
+            const tintStrength = Math.max(0.0, md.mapS ?? 1.0);
+            const blurStrength = Math.max(0.0, md.rough ?? 0.5);
+            const pixelGrid = Math.max(8.0, (1.0 - Math.min(1.0, blurStrength)) * 128.0);
+            const backdropMode = md.backdropMode ?? 0;
+            const depthDistance = viewportLinearDepth.distance(linearDepth());
+            const depthAlphaNode = depthDistance.oneMinus().smoothstep(0.90, 2.0).mul(10.0).saturate();
+            const blurAmountNode = depthDistance.smoothstep(0.0, 0.6).mul(blurStrength * 40.0).clamp().mul(0.1);
+
+            let tintNode = tslColor(new THREE.Color(md.color[0], md.color[1], md.color[2])).mul(tslFloat(tintStrength));
+            let colorMapNode = null;
+
+            if (md.map) {
+                const tintMap = loadTexture(md.map, THREE.SRGBColorSpace, md.mapXf, fallbackWhiteTexture);
+                colorMapNode = tslTexture(tintMap);
+                tintNode = colorMapNode.rgb.mul(tintNode);
+            }
+
+            let flatOpacityNode = tslFloat(opacity);
+            if (md.opMap) {
+                const alphaMap = loadTexture(md.opMap, THREE.LinearSRGBColorSpace, md.opMapXf, fallbackWhiteTexture);
+                flatOpacityNode = flatOpacityNode.mul(tslTexture(alphaMap).r.mul(tslFloat(md.opMapS ?? 1.0)));
+            }
+            const depthOpacityNode = depthAlphaNode.mul(flatOpacityNode);
+
+            switch (backdropMode) {
+            case 1:
+                material.backdropNode = depthAlphaNode;
+                material.opacityNode = depthOpacityNode;
+                break;
+            case 2:
+                material.backdropNode = colorMapNode ? colorMapNode.rgb.mul(tslFloat(tintStrength)) : hashBlur(viewportSharedTexture(), tslFloat(0.05));
+                material.opacityNode = colorMapNode ? flatOpacityNode.mul(colorMapNode.a) : flatOpacityNode;
+                break;
+            case 3:
+                material.backdropNode = viewportSharedTexture(screenUV.mul(pixelGrid).floor().div(pixelGrid));
+                material.opacityNode = flatOpacityNode;
+                break;
+            case 0:
+            default:
+                // Frosted glass: depth-based blur + tint (matches webgpu_backdrop_area example)
+                material.backdropNode = hashBlur(viewportSharedTexture(), blurAmountNode)
+                    .add(depthAlphaNode.mix(tintNode.mul(0.3), 0));
+                // No opacityNode — let backdropNode handle the compositing
+                break;
+            }
+            material.side = md.side === 0 ? THREE.FrontSide : THREE.DoubleSide;
+            material.transparent = true;
+            material.depthWrite = false;
+            return material;
+        }
+
+        // TSL coerce/buildTSLParams/compat-warn helpers moved to js/tsl_materials.js.
+
+        function normalizeMaxVertexColorChannel(channel = 0) {
+            if (typeof channel === 'string') {
+                const token = channel.trim().toLowerCase();
+                if (token === 'color' || token === 'rgb') return 0;
+                if (token === 'shading' || token === 'illum' || token === 'illumination') return -1;
+                if (token === 'alpha') return -2;
+                const parsed = Number.parseInt(token, 10);
+                if (Number.isFinite(parsed)) return parsed;
+                return 0;
+            }
+            if (!Number.isFinite(channel)) return 0;
+            return Math.trunc(channel);
+        }
+
+        function maxVertexColorAttributeName(channel = 0) {
+            const normalized = normalizeMaxVertexColorChannel(channel);
+            if (normalized === 0) return 'color';
+            if (normalized === -1) return 'maxjs_vc_shading';
+            if (normalized === -2) return 'maxjs_vc_alpha';
+            return `maxjs_vc_${normalized}`;
+        }
+
+        // TSL compat-namespace + material builders moved to js/tsl_materials.js
+        // (tslCompiler.createTSLMaterial / createMissingTSLMaterial).
+
+        function createUtilityMaterial(runtimeModelName, md, materialContext = null) {
+            if (runtimeModelName === 'MeshBackdropNodeMaterial') {
+                return createBackdropUtilityMaterial(md);
+            }
+
+            let material;
+            switch (runtimeModelName) {
+            case 'MeshDepthMaterial':
+                material = new THREE.MeshDepthMaterial();
+                break;
+            case 'MeshMatcapMaterial':
+                material = new THREE.MeshMatcapMaterial();
+                break;
+            case 'MeshNormalMaterial':
+                material = new THREE.MeshNormalMaterial();
+                break;
+            case 'MeshPhongMaterial':
+                material = new THREE.MeshPhongMaterial();
+                break;
+            case 'MeshLambertMaterial':
+            default:
+                material = new THREE.MeshLambertMaterial();
+                break;
+            }
+
+            material.side = md.side === 0 ? THREE.FrontSide : THREE.DoubleSide;
+            material.opacity = md.opacity ?? 1.0;
+            material.transparent = !!md.transparent || material.opacity < 0.999;
+            if ('depthWrite' in material && md.depthWrite != null) material.depthWrite = !!md.depthWrite;
+            if ('depthTest' in material && md.depthTest != null) material.depthTest = !!md.depthTest;
+            if ('alphaTest' in material && Number.isFinite(md.alphaTest)) material.alphaTest = md.alphaTest;
+
+            if ('color' in material && Array.isArray(md.color)) {
+                material.color.setRGB(md.color[0], md.color[1], md.color[2]);
+            }
+            if ('emissive' in material) {
+                if (Array.isArray(md.em)) {
+                    material.emissive.setRGB(md.em[0], md.em[1], md.em[2]);
+                }
+                material.emissiveIntensity = md.emI ?? material.emissiveIntensity ?? 1.0;
+            }
+            if ('envMapIntensity' in material && md.envI != null) material.envMapIntensity = md.envI;
+            if ('reflectivity' in material && md.reflectivity != null) material.reflectivity = md.reflectivity;
+            if ('refractionRatio' in material && md.refractionRatio != null) material.refractionRatio = md.refractionRatio;
+            if ('flatShading' in material) material.flatShading = !!md.flat;
+            if ('wireframe' in material) material.wireframe = !!md.wireframe;
+            if ('fog' in material && md.fog != null) material.fog = !!md.fog;
+            if ('shininess' in material && md.shininess != null) material.shininess = md.shininess;
+            if ('specular' in material && Array.isArray(md.spec)) {
+                material.specular.setRGB(md.spec[0], md.spec[1], md.spec[2]);
+            }
+            if ('combine' in material && md.combine != null) {
+                const combineModes = [THREE.MultiplyOperation, THREE.MixOperation, THREE.AddOperation];
+                material.combine = combineModes[md.combine] ?? THREE.MultiplyOperation;
+            }
+            if ('normalMapType' in material && md.normalMapType != null) {
+                material.normalMapType = md.normalMapType === 1 ? THREE.ObjectSpaceNormalMap : THREE.TangentSpaceNormalMap;
+            }
+            if ('depthPacking' in material && md.depthPacking != null) {
+                const depthPackingModes = [
+                    THREE.BasicDepthPacking,
+                    THREE.RGBADepthPacking,
+                    THREE.RGBDepthPacking,
+                    THREE.RGDepthPacking,
+                ];
+                material.depthPacking = depthPackingModes[md.depthPacking] ?? THREE.BasicDepthPacking;
+            }
+            if (md.normScl != null && 'normalScale' in material) {
+                material.normalScale = new THREE.Vector2(md.normScl, md.normScl);
+            }
+            if (md.bumpS != null && 'bumpScale' in material) material.bumpScale = md.bumpS;
+            if (md.dispS != null && 'displacementScale' in material) material.displacementScale = md.dispS;
+            if (md.dispB != null && 'displacementBias' in material) material.displacementBias = md.dispB;
+            if (md.aoI != null && 'aoMapIntensity' in material) material.aoMapIntensity = md.aoI;
+            if (md.lmI != null && 'lightMapIntensity' in material) material.lightMapIntensity = md.lmI;
+
+            // Apply texture maps (all slots support TSL Texture)
+            const applyMap = (key, prop, cs, xf, fb) => {
+                const tex = loadMapSlot(md, key, cs, xf, fb, materialContext);
+                if (tex && prop in material) material[prop] = tex;
+                return tex;
+            };
+            const W = fallbackWhiteTexture, N = fallbackFlatNormalTexture, H = fallbackHeightTexture;
+            preserveOpacityForHTMLColorMap(material, applyMap('map', 'map', THREE.SRGBColorSpace, 'mapXf', W));
+            applyMap('normMap',    'normalMap',              THREE.LinearSRGBColorSpace,   'normMapXf',    N);
+            applyMap('bumpMap',    'bumpMap',                THREE.NoColorSpace,           'bumpMapXf',    H);
+            applyMap('ccMap',      'clearcoatMap',           THREE.LinearSRGBColorSpace,   'ccMapXf',      W);
+            applyMap('ccRoughMap', 'clearcoatRoughnessMap',  THREE.LinearSRGBColorSpace,   'ccRoughMapXf', W);
+            applyMap('ccNormMap',  'clearcoatNormalMap',     THREE.LinearSRGBColorSpace,   'ccNormMapXf',  N);
+            applyMap('dispMap',    'displacementMap',        THREE.NoColorSpace,           'dispMapXf',    H);
+            applyMap('aoMap',      'aoMap',                  THREE.LinearSRGBColorSpace,   'aoMapXf',      W);
+            applyMap('emMap',      'emissiveMap',            THREE.SRGBColorSpace,         'emMapXf',      W);
+            applyMap('transMap',   'transmissionMap',        THREE.LinearSRGBColorSpace,   'transMapXf',   W);
+            const lightMapChannel = resolveLightMapMaxMapChannel(md);
+            const lmTex = loadMapSlot(md, 'lmMap', THREE.LinearSRGBColorSpace, 'lmMapXf', W, materialContext, lightMapChannel);
+            if (lmTex && 'lightMap' in material) material.lightMap = lmTex;
+            if (lmTex) {
+                material.lightMap = textureWithUvChannel(lmTex, lightMapChannel, 2);
+                applyWebGpuLightMapUvContext(material, lightMapChannel);
+                material.lightMapIntensity = md.lmI ?? material.lightMapIntensity ?? 1.0;
+            }
+            applyMap('matcapMap',  'matcap',                 THREE.SRGBColorSpace,         'matcapMapXf',  W);
+            applyMap('specMap',    'specularMap',            THREE.LinearSRGBColorSpace,   'specMapXf',    W);
+            applyOpacityTextureSlot(material, loadMapSlot(md, 'opMap', THREE.LinearSRGBColorSpace, 'opMapXf', W, materialContext));
+
+            rememberMaterialEmissiveBase(material);
+            material.needsUpdate = true;
+            return material;
+        }
+
+        function shouldRouteBlackSpecularToLambert(requestedModelName, md) {
+            return shouldRouteBlackSpecularToLambertShared(requestedModelName, md);
+        }
+
+        function materialIdentityValue(value) {
+            if (Array.isArray(value)) return value.map(materialIdentityValue);
+            if (!value || typeof value !== 'object') return value;
+            const normalized = {};
+            for (const key of Object.keys(value).sort()) {
+                if (key === 'name') continue;
+                const child = value[key];
+                if (child === undefined) continue;
+                normalized[key] = materialIdentityValue(child);
+            }
+            return normalized;
+        }
+
+        function materialIdentityKey(md) {
+            return JSON.stringify(materialIdentityValue(md ?? null));
+        }
+
+        function materialTemplateCacheKey(requestedModelName, runtimeModelName, md) {
+            return JSON.stringify([requestedModelName, runtimeModelName, materialIdentityValue(md ?? null)]);
+        }
+
+        function getMaterialPayloads(nd) {
+            if (nd?.mats && nd?.groups) return nd.mats.filter(Boolean);
+            if (nd?.mat) return [nd.mat];
+            return [null];
+        }
+
+        function countMaterialTextureSlots(md) {
+            if (!md || typeof md !== 'object') return 0;
+            let count = 0;
+            for (const [key, value] of Object.entries(md)) {
+                if (typeof value !== 'string' || value.length === 0) continue;
+                if (key === 'model' || key === 'name' || key === 'materialXFile' || key === 'materialXInline') continue;
+                if (key.endsWith('Map') || key.endsWith('Tex') || key.endsWith('Path') || key.endsWith('File')) count++;
+            }
+            return count;
+        }
+
+        function getOrCreateMaterialRegistryEntry(md) {
+            const key = md ? materialIdentityKey(md) : '__maxjs_default_material__';
+            let entry = materialRegistry.get(key);
+            if (!entry) {
+                entry = {
+                    id: nextMaterialRegistryId++,
+                    key,
+                    model: md?.model || 'MeshStandardMaterial',
+                    displayName: md?.name || 'default',
+                    names: new Set(),
+                    textureSlots: countMaterialTextureSlots(md),
+                    refCount: 0,
+                    bucketedRefCount: 0,
+                    lastSeenFrame: 0,
+                };
+                materialRegistry.set(key, entry);
+            }
+            if (md?.name) {
+                entry.displayName = md.name;
+                entry.names.add(md.name);
+            }
+            entry.model = md?.model || entry.model || 'MeshStandardMaterial';
+            entry.textureSlots = countMaterialTextureSlots(md);
+            return entry;
+        }
+
+        function refreshMaterialRegistry(nodes, bucketPlan = null) {
+            materialRegistryFrame++;
+            let materialRefs = 0;
+            let bucketedRefs = 0;
+            let maxRefsPerMaterial = 0;
+            for (const entry of materialRegistry.values()) {
+                entry.refCount = 0;
+                entry.bucketedRefCount = 0;
+            }
+            for (const nd of nodes || []) {
+                for (const md of getMaterialPayloads(nd)) {
+                    const entry = getOrCreateMaterialRegistryEntry(md);
+                    entry.refCount++;
+                    entry.lastSeenFrame = materialRegistryFrame;
+                    materialRefs++;
+                }
+            }
+            for (const group of bucketPlan?.groups?.values?.() || []) {
+                const entry = materialRegistry.get(group.materialKey);
+                if (!entry) continue;
+                entry.bucketedRefCount += group.nodes.length;
+                bucketedRefs += group.nodes.length;
+            }
+            for (const [key, entry] of [...materialRegistry.entries()]) {
+                if (entry.lastSeenFrame !== materialRegistryFrame) {
+                    materialRegistry.delete(key);
+                    continue;
+                }
+                maxRefsPerMaterial = Math.max(maxRefsPerMaterial, entry.refCount);
+            }
+            materialRegistryStats = {
+                uniqueMaterials: materialRegistry.size,
+                materialTemplates: materialCache.size + materialXTemplateCache.size,
+                materialRefs,
+                bucketedRefs,
+                instanceBuckets: bucketPlan?.groups?.size ?? maxInstanceBuckets.size,
+                maxRefsPerMaterial,
+            };
+            return materialRegistryStats;
+        }
+
+        function materialRegistryHudStats() {
+            return {
+                materialCount: materialRegistryStats.uniqueMaterials,
+                materialTemplateCount: materialRegistryStats.materialTemplates,
+                instanceBucketCount: materialRegistryStats.instanceBuckets,
+            };
+        }
+
+        function resolveSnapshotMaterialRefs(snapshot) {
+            if (!snapshot || !Array.isArray(snapshot.nodes) || !Array.isArray(snapshot.materials)) return snapshot;
+            const materialById = new Map();
+            for (const entry of snapshot.materials) {
+                const id = Number(entry?.id ?? entry?.i);
+                const material = entry?.mat ?? entry?.material;
+                if (Number.isFinite(id) && material && typeof material === 'object') {
+                    materialById.set(id, material);
+                }
+            }
+            if (materialById.size === 0) return snapshot;
+            for (const nd of snapshot.nodes) {
+                if (!nd || typeof nd !== 'object') continue;
+                if (nd.mat == null && nd.matRef != null) {
+                    const mat = materialById.get(Number(nd.matRef));
+                    if (mat) nd.mat = mat;
+                }
+                if (!Array.isArray(nd.mats) && Array.isArray(nd.matRefs)) {
+                    const mats = [];
+                    for (const ref of nd.matRefs) {
+                        const mat = materialById.get(Number(ref));
+                        if (mat) mats.push(mat);
+                    }
+                    if (mats.length > 0) nd.mats = mats;
+                }
+            }
+            return snapshot;
+        }
+
+        function createMaterial(md, materialContext = null) {
+            const requestedModelName = md.model || 'MeshStandardMaterial';
+            const registryEntry = getOrCreateMaterialRegistryEntry(md);
+            if (wantsHTMLTextureOverrideMaterial(md)) {
+                const runtimeModelName = 'HTMLTextureOverrideMaterial';
+                const key = materialTemplateCacheKey(requestedModelName, runtimeModelName, htmlTextureOverrideIdentity(md, materialContext));
+                let template = materialCache.get(key);
+                if (!template) {
+                    template = createHTMLTextureOverrideMaterial(md, materialContext);
+                    if (!template) {
+                        template = new THREE.MeshBasicMaterial({
+                            color: 0xff00ff,
+                            side: md.side === 0 ? THREE.FrontSide : THREE.DoubleSide,
+                            toneMapped: false,
+                        });
+                    }
+                    template.userData ??= {};
+                    template.userData.maxjsMaterialRegistryId = registryEntry.id;
+                    template.userData.maxjsMaterialIdentityKey = registryEntry.key;
+                    template.userData.maxjsRequestedMaterialModel = requestedModelName;
+                    template.userData.maxjsMaterialModel = runtimeModelName;
+                    template.userData.maxjsSourceMaterialName = md.name || template.name || 'default';
+                    if (md.name) template.name = md.name;
+                    materialCache.set(key, template);
+                }
+                const material = template.clone();
+                material.userData = { ...(template.userData || {}) };
+                material.userData.maxjsMaterialRegistryId = registryEntry.id;
+                material.userData.maxjsMaterialIdentityKey = registryEntry.key;
+                material.userData.maxjsSourceMaterialName = md.name || material.name || 'default';
+                if (md.name) material.name = md.name;
+                return material;
+            }
+            const forceLambertForBlackSpecular = shouldRouteBlackSpecularToLambert(requestedModelName, md);
+            const wantsMaterialXMaterial = requestedModelName === 'MaterialXMaterial';
+            const wantsUtilityMaterial = forceLambertForBlackSpecular || utilityMaterialModels.has(requestedModelName);
+            const wantsToonMaterial = requestedModelName === 'MeshToonMaterial';
+            const wantsSSSMaterial = requestedModelName === 'MeshSSSNodeMaterial';
+            const wantsTSLMaterial = requestedModelName === 'MeshTSLNodeMaterial';
+            const hasMaterialXSource = Boolean(md.materialXInline || md.materialXFile);
+            if (wantsTSLMaterial && md.materialXBridgeConnected && !hasMaterialXSource) {
+                const sourceName = md.materialXBridgeSourceName || 'connected source material';
+                const reason = md.materialXBridgeError || 'auto-compile produced no MaterialX payload';
+                console.error(`[MaterialX] Auto-compile bridge failed for ${sourceName}: ${reason}`);
+            }
+            const wantsAdvancedMaterial =
+                requestedModelName === 'MeshPhysicalMaterial' ||
+                requestedModelName === 'MeshStandardNodeMaterial';
+            const canUseBackdropUtility =
+                requestedModelName === 'MeshBackdropNodeMaterial' &&
+                rendererBackendLabel === 'WebGPU' &&
+                typeof THREE.MeshBasicNodeMaterial === 'function' &&
+                typeof hashBlur === 'function';
+            const hasUtilityCtor =
+                wantsUtilityMaterial &&
+                requestedModelName !== 'MeshBackdropNodeMaterial' &&
+                typeof THREE[requestedModelName] === 'function';
+            const canUseToonMaterial = wantsToonMaterial && typeof THREE.MeshToonMaterial === 'function';
+            const isPlainWebGLMaterialBackend = String(rendererBackendLabel || '').startsWith('WebGL');
+            const canUseNodeMaterialBackend = !isPlainWebGLMaterialBackend;
+            const canUseSSSMaterial =
+                wantsSSSMaterial &&
+                canUseNodeMaterialBackend &&
+                typeof THREE.MeshSSSNodeMaterial === 'function' &&
+                typeof tslColor === 'function' &&
+                typeof tslFloat === 'function' &&
+                typeof tslTexture === 'function';
+            const runtimeModelName = (wantsMaterialXMaterial && canUseNodeMaterialBackend)
+                ? 'MaterialXMaterial'
+                : forceLambertForBlackSpecular
+                ? 'MeshLambertMaterial'
+                : wantsUtilityMaterial
+                ? ((hasUtilityCtor || canUseBackdropUtility) ? requestedModelName : 'MeshLambertMaterial')
+                : (canUseToonMaterial
+                ? 'MeshToonMaterial'
+                : (canUseSSSMaterial
+                    ? 'MeshSSSNodeMaterial'
+                    : ((wantsAdvancedMaterial || wantsSSSMaterial || wantsTSLMaterial || wantsMaterialXMaterial)
+                        ? 'MeshPhysicalMaterial'
+                        : 'MeshStandardMaterial')));
+            // Exclude tslParams from cache key — param changes should update
+            // existing uniforms, not trigger a full material rebuild.
+            const cacheableBaseMd = (wantsTSLMaterial && md.tslParams)
+                ? Object.assign({}, md, { tslParams: undefined })
+                : md;
+            const cacheableMd = withHTMLAutoFitIdentity(cacheableBaseMd, materialContext);
+            const key = materialTemplateCacheKey(requestedModelName, runtimeModelName, cacheableMd);
+            let template = materialCache.get(key);
+            if (!template && wantsMaterialXMaterial) {
+                template = materialXTemplateCache.get(key);
+            }
+
+            if (!template) {
+                if (wantsMaterialXMaterial && canUseNodeMaterialBackend) {
+                    template = createPendingMaterialXMaterial(md);
+                    materialXTemplateCache.set(key, template);
+                    ensureMaterialXTemplateLoaded(key, template, md);
+                } else if (wantsTSLMaterial && canUseNodeMaterialBackend && hasMaterialXSource) {
+                    // TSL material with MaterialX source — use MaterialXLoader
+                    template = createPendingMaterialXMaterial(md);
+                    materialXTemplateCache.set(key, template);
+                    ensureMaterialXTemplateLoaded(key, template, md);
+                } else if (wantsTSLMaterial && canUseNodeMaterialBackend && md.tslCode) {
+                    template = tslCompiler.createTSLMaterial(md);
+                } else if (wantsTSLMaterial && canUseNodeMaterialBackend) {
+                    template = tslCompiler.createMissingTSLMaterial(md);
+                } else if (wantsUtilityMaterial) {
+                    template = createUtilityMaterial(runtimeModelName, md, materialContext);
+                } else {
+                    const params = {
+                        color: new THREE.Color(md.color[0], md.color[1], md.color[2]),
+                        side: md.side === 0 ? THREE.FrontSide : THREE.DoubleSide,
+                    };
+
+                    if (!wantsToonMaterial) {
+                        params.roughness = md.rough ?? 0.5;
+                        params.metalness = md.metal ?? 0.0;
+                        params.envMapIntensity = md.envI ?? 1.0;
+                    }
+
+                    if (md.opacity != null && md.opacity < 0.999) {
+                        params.transparent = true;
+                        params.opacity = md.opacity;
+                    }
+                    if (Number.isFinite(md.alphaTest) && md.alphaTest > 0) {
+                        params.alphaTest = md.alphaTest;
+                    }
+                    if (md.transparent === true) params.transparent = true;
+                    if (md.depthWrite != null) params.depthWrite = !!md.depthWrite;
+                    if (md.depthTest != null) params.depthTest = !!md.depthTest;
+
+                    if (wantsAdvancedMaterial || wantsSSSMaterial || wantsTSLMaterial || wantsMaterialXMaterial) {
+                        if (Array.isArray(md.specularColor)) {
+                            params.specularColor = new THREE.Color(md.specularColor[0], md.specularColor[1], md.specularColor[2]);
+                        }
+                        if (md.specularIntensity != null) {
+                            params.specularIntensity = md.specularIntensity;
+                            // specularIntensity 0 = no reflections at all; also kill env reflections + set IOR 1.0
+                            if (md.specularIntensity < 0.001) {
+                                params.envMapIntensity = 0;
+                                params.ior = 1.0;
+                            }
+                        }
+                        if (md.specIntMap) params.specularIntensityMap = loadTexture(md.specIntMap, THREE.LinearSRGBColorSpace, md.specIntMapXf, fallbackWhiteTexture);
+                        if (md.specColMap) params.specularColorMap = loadTexture(md.specColMap, THREE.SRGBColorSpace, md.specColMapXf, fallbackWhiteTexture);
+                        if (md.clearcoat != null) params.clearcoat = md.clearcoat;
+                        if (md.clearcoatRoughness != null) params.clearcoatRoughness = md.clearcoatRoughness;
+                        if (md.ccMap) params.clearcoatMap = loadTexture(md.ccMap, THREE.LinearSRGBColorSpace, md.ccMapXf, fallbackWhiteTexture);
+                        if (md.ccRoughMap) params.clearcoatRoughnessMap = loadTexture(md.ccRoughMap, THREE.LinearSRGBColorSpace, md.ccRoughMapXf, fallbackWhiteTexture);
+                        if (md.ccNormMap) params.clearcoatNormalMap = loadTexture(md.ccNormMap, THREE.LinearSRGBColorSpace, md.ccNormMapXf, fallbackFlatNormalTexture);
+                        if (md.sheen != null) params.sheen = md.sheen;
+                        if (md.sheenRoughness != null) params.sheenRoughness = md.sheenRoughness;
+                        if (Array.isArray(md.sheenColor)) {
+                            params.sheenColor = new THREE.Color(md.sheenColor[0], md.sheenColor[1], md.sheenColor[2]);
+                        }
+                        if (md.iridescence != null) params.iridescence = md.iridescence;
+                        if (md.iridescenceIOR != null) params.iridescenceIOR = md.iridescenceIOR;
+                        if (md.transmission != null) params.transmission = md.transmission;
+                        if (md.transMap) params.transmissionMap = loadTexture(md.transMap, THREE.LinearSRGBColorSpace, md.transMapXf, fallbackWhiteTexture);
+                        if (md.ior != null && !(md.specularIntensity != null && md.specularIntensity < 0.001)) params.ior = md.ior;
+                        if (md.reflectivity != null) params.reflectivity = md.reflectivity;
+                        if (md.thickness != null) params.thickness = md.thickness;
+                        if (md.dispersion != null) params.dispersion = md.dispersion;
+                        if (Array.isArray(md.attenuationColor)) {
+                            params.attenuationColor = new THREE.Color(md.attenuationColor[0], md.attenuationColor[1], md.attenuationColor[2]);
+                        }
+                        if (md.attenuationDistance != null && md.attenuationDistance > 0) {
+                            params.attenuationDistance = md.attenuationDistance;
+                        }
+                        if (md.anisotropy != null) params.anisotropy = md.anisotropy;
+                        if ((md.transmission ?? 0) > 0) params.transparent = true;
+                    }
+
+                    const hasEmissiveColor = Array.isArray(md.em) && md.em.length === 3 &&
+                        md.em.some(value => Math.abs(value) > 1.0e-5);
+
+                    if (md.em && md.emI > 0) {
+                        params.emissive = new THREE.Color(md.em[0], md.em[1], md.em[2]);
+                        params.emissiveIntensity = md.emI;
+                    }
+
+                    if (md.emMap) {
+                        if (!params.emissive) {
+                            params.emissive = hasEmissiveColor
+                                ? new THREE.Color(md.em[0], md.em[1], md.em[2])
+                                : new THREE.Color(1, 1, 1);
+                        }
+                        if (params.emissiveIntensity == null || params.emissiveIntensity <= 0) {
+                            params.emissiveIntensity = md.emMapS ?? 1.0;
+                        }
+                    }
+
+                    if (md.normScl != null) params.normalScale = new THREE.Vector2(md.normScl, md.normScl);
+                    if (md.bumpS != null) params.bumpScale = md.bumpS;
+                    if (md.dispS != null) params.displacementScale = md.dispS;
+                    if (md.dispB != null) params.displacementBias = md.dispB;
+                    if (md.aoI != null) params.aoMapIntensity = md.aoI;
+
+                    if (canUseToonMaterial) {
+                        template = new THREE.MeshToonMaterial(params);
+                    } else if (canUseSSSMaterial) {
+                        template = new THREE.MeshSSSNodeMaterial(params);
+                    } else if (wantsAdvancedMaterial || wantsSSSMaterial || wantsTSLMaterial || wantsMaterialXMaterial) {
+                        template = new THREE.MeshPhysicalMaterial(params);
+                    } else {
+                        template = new THREE.MeshStandardMaterial(params);
+                    }
+
+                    // Textures (all slots support TSL Texture)
+                    {
+                        const apply = (key, prop, cs, xf, fb) => {
+                            const tex = loadMapSlot(md, key, cs, xf, fb, materialContext);
+                            if (tex) template[prop] = tex;
+                            return tex;
+                        };
+                        const W = fallbackWhiteTexture, N = fallbackFlatNormalTexture, H = fallbackHeightTexture;
+                        preserveOpacityForHTMLColorMap(template, apply('map', 'map', THREE.SRGBColorSpace, 'mapXf', W));
+                        if (!wantsToonMaterial) {
+                            apply('roughMap', 'roughnessMap',  THREE.LinearSRGBColorSpace, 'roughMapXf', W);
+                            apply('metalMap', 'metalnessMap',  THREE.LinearSRGBColorSpace, 'metalMapXf', W);
+                        }
+                        apply('normMap',  'normalMap',         THREE.LinearSRGBColorSpace, 'normMapXf',  N);
+                        apply('bumpMap',  'bumpMap',           THREE.NoColorSpace,         'bumpMapXf',  H);
+                        apply('dispMap',  'displacementMap',   THREE.NoColorSpace,         'dispMapXf',  H);
+                        apply('aoMap',    'aoMap',             THREE.LinearSRGBColorSpace, 'aoMapXf',    W);
+                        apply('emMap',    'emissiveMap',       THREE.SRGBColorSpace,       'emMapXf',    W);
+                        applyOpacityTextureSlot(template, loadMapSlot(md, 'opMap', THREE.LinearSRGBColorSpace, 'opMapXf', W, materialContext));
+                        if ('transmissionMap' in template)
+                            apply('transMap', 'transmissionMap', THREE.LinearSRGBColorSpace, 'transMapXf', W);
+                    }
+                    if (canUseToonMaterial) {
+                        const gradTex = loadMapSlot(md, 'gradMap', THREE.NoColorSpace, null, fallbackToonGradientTexture, materialContext);
+                        template.gradientMap = gradTex
+                            ? configureGradientTexture(gradTex)
+                            : fallbackToonGradientTexture;
+                    }
+
+                    // Lightmap
+                    {
+                        const lightMapChannel = resolveLightMapMaxMapChannel(md);
+                        const lmTex = loadMapSlot(md, 'lmMap', THREE.LinearSRGBColorSpace, 'lmMapXf', fallbackWhiteTexture, materialContext, lightMapChannel);
+                        if (lmTex) {
+                            template.lightMap = textureWithUvChannel(lmTex, lightMapChannel, 2);
+                            applyWebGpuLightMapUvContext(template, lightMapChannel);
+                            template.lightMapIntensity = md.lmI ?? 1.0;
+                        }
+                    }
+
+                    if (canUseSSSMaterial) {
+                        applySSSMaterialNodes(template, md);
+                    }
+                }
+                template.userData ??= {};
+                template.userData.maxjsMaterialRegistryId = registryEntry.id;
+                template.userData.maxjsMaterialIdentityKey = registryEntry.key;
+                template.userData.maxjsRequestedMaterialModel = requestedModelName;
+                template.userData.maxjsMaterialModel = runtimeModelName;
+                template.userData.maxjsUtilityMaterialFallback =
+                    wantsUtilityMaterial && !(hasUtilityCtor || canUseBackdropUtility);
+                template.userData.maxjsLambertFromBlackSpecular = forceLambertForBlackSpecular;
+                template.userData.maxjsToonMaterialFallback =
+                    wantsToonMaterial && !canUseToonMaterial;
+                template.userData.maxjsSSSMaterialFallback =
+                    wantsSSSMaterial && !canUseSSSMaterial;
+                template.userData.maxjsSourceMaterialName = md.name || template.name || 'default';
+                if (md.name) template.name = md.name;
+
+                rememberMaterialEmissiveBase(template);
+                template.needsUpdate = true;
+                materialCache.set(key, template);
+
+            } else if (wantsMaterialXMaterial) {
+                materialCache.set(key, template);
+            }
+
+            if ((wantsMaterialXMaterial || (wantsTSLMaterial && hasMaterialXSource)) && canUseNodeMaterialBackend) {
+                return template;
+            }
+
+            // TSL material reuse: update uniforms from latest params without rebuild
+            if (wantsTSLMaterial && template.userData?.tslParams && md.tslParams) {
+                const stored = template.userData.tslParams;
+                for (const [k, v] of Object.entries(md.tslParams)) {
+                    const u = stored[k];
+                    if (!u) continue;
+                    if (typeof v === 'number') u.value = v;
+                    else if (Array.isArray(v) && u.value?.isColor) u.value.setRGB(v[0]??0, v[1]??0, v[2]??0);
+                    else if (typeof v === 'boolean') u.value = v ? 1.0 : 0.0;
+                }
+                return template;
+            }
+
+            const material = template.clone();
+            material.userData = { ...(template.userData || {}) };
+            material.userData.maxjsMaterialRegistryId = registryEntry.id;
+            material.userData.maxjsMaterialIdentityKey = registryEntry.key;
+            material.userData.maxjsSourceMaterialName = md.name || material.name || 'default';
+            if (md.name) material.name = md.name;
+            if (material.userData.maxjsHTMLColorMapPreserveOpacity) {
+                preserveOpacityForHTMLColorMap(material, material.map);
+            }
+            rememberMaterialEmissiveBase(material);
+            return material;
+        }
+
+
+        // ── Max Bridge ────────────────────────────────────── (core in ./host_bridge.js — the host seam)
+        const ctx = createEditorContext();
+        const hostBridge = createHostBridge({
+            setInfoText: text => setInfoText(text),
+            // Restore Studio manifest state now that lights + meshes are populated.
+            onFirstSync: () => { restoreStudioState(); restoreBakeState(); },
+            onBeforeReady: () => sendPathTracingRuntimeState(),
+        });
+        const bridge = hostBridge.bridge;
+        const { requestHostAction, toBase64Utf8, bytesToBase64, reportBridgeError,
+                startBridgeHandshake, markInitialSync } = hostBridge;
+        const bridgeHasInitialSync = hostBridge.hasInitialSync;
+        ctx.hostBridge = hostBridge;
+        ctx.bridge = bridge;
+
+        function syncLiveSyncButtonUi() {
+            const button = document.getElementById('btnLiveSync');
+            if (!button) return;
+            button.textContent = slowJsonSyncMode ? 'SLOW' : 'LIVE';
+            button.classList.toggle('active', !slowJsonSyncMode);
+            button.classList.toggle('is-gated', slowJsonSyncMode);
+            button.setAttribute('aria-pressed', slowJsonSyncMode ? 'false' : 'true');
+            button.title = slowJsonSyncMode
+                ? 'Slow JSON sync: fastsync callbacks disabled'
+                : 'Live fast sync enabled';
+            button.setAttribute('aria-label', slowJsonSyncMode ? 'Switch to live fast sync' : 'Switch to slow JSON sync');
+        }
+
+        function applyLiveSyncSettings(next = {}, { notify = false, sendHost = false, persist = true } = {}) {
+            if (next.disabled != null) slowJsonSyncMode = next.disabled === true;
+            if (persist) {
+                try {
+                    localStorage.setItem(SLOW_JSON_SYNC_STORAGE_KEY, slowJsonSyncMode ? 'true' : 'false');
+                    localStorage.removeItem(LEGACY_LIVE_SYNC_DISABLED_STORAGE_KEY);
+                } catch {}
+            }
+            syncLiveSyncButtonUi();
+            if (sendHost && window.chrome?.webview) {
+                bridge.send('live_sync_settings', { disabled: slowJsonSyncMode });
+            }
+            if (notify) {
+                perfHud.setStatus(`max.js - ${slowJsonSyncMode ? 'slow JSON sync' : 'live fast sync'}`);
+            }
+        }
+
+        document.getElementById('btnLiveSync')?.addEventListener('click', () => {
+            applyLiveSyncSettings({ disabled: !slowJsonSyncMode }, { notify: true, sendHost: true });
+        });
+
+        bridge.on('live_sync_settings', msg => {
+            applyLiveSyncSettings({ disabled: msg.disabled === true }, { notify: true, sendHost: false });
+        });
+
+        applyLiveSyncSettings({ disabled: slowJsonSyncMode }, { sendHost: true, persist: false });
+
+        bridge.on('render_output_settings', msg => {
+            const width = Math.max(1, Math.round(Number(msg.width) || 0));
+            const height = Math.max(1, Math.round(Number(msg.height) || 0));
+            const aspect = Math.max(0, Number(msg.aspect) || 0);
+            if (
+                renderOutputSettings.width === width &&
+                renderOutputSettings.height === height &&
+                Math.abs((renderOutputSettings.aspect || 0) - aspect) < 1.0e-4
+            ) {
+                syncSafeFrameButtonUi();
+                return;
+            }
+            renderOutputSettings.width = width;
+            renderOutputSettings.height = height;
+            renderOutputSettings.aspect = aspect;
+            if (safeFrameEnabled) {
+                applyRenderViewportLayout({ resizeBuffers: true, resizePostFx: true });
+            } else {
+                syncSafeFrameButtonUi();
+            }
+        });
+
+        bridge.on('pathtracing_settings', msg => {
+            applyPathTracingSettings({
+                samplesPerFrame: msg.samplesPerFrame,
+                giClamp: msg.giClamp,
+                freezeSync: msg.freezeSync,
+            }, { notify: true });
+        });
+
+        let transportMode = 'waiting';
+        let latestAppliedSyncFrame = 0;
+        let latestAppliedSyncSerial = 0;
+
+        function setInfoText(text) {
+            perfHud.setStatus(text);
+        }
+
+        function setTransportMode(mode) {
+            transportMode = mode;
+        }
+
+        function countInstances() {
+            const sharedGeoms = new Set();
+            let count = 0;
+            for (const [handle, mesh] of nodeMap) {
+                if (!mesh?.geometry) continue;
+                if (maxInstanceHandleToBucket.has(handle)) continue; // counted via bucket below
+                // Explicit Max instance (instOf from C++)
+                if (Number.isFinite(mesh.userData?.maxjsInstOf) && mesh.userData.maxjsInstOf > 0) {
+                    count++;
+                    continue;
+                }
+                // Implicit: multiple meshes sharing same BufferGeometry
+                if (sharedGeoms.has(mesh.geometry)) count++;
+                else sharedGeoms.add(mesh.geometry);
+            }
+            // Max instance GPU buckets
+            for (const [, bucket] of maxInstanceBuckets) {
+                count += bucket.handles.size;
+            }
+            for (const [, entry] of hairMeshes) {
+                count += entry?.mesh?.count ?? 0;
+            }
+            // Forest Pack GPU instances
+            for (const [, im] of forestMeshes) {
+                count += im.count;
+            }
+            return count;
+        }
+
+        function updateSyncHud(partial = {}) {
+            if (partial.countAsAppliedSync !== false) {
+                latestAppliedSyncSerial += 1;
+            }
+            if (Number.isFinite(partial.frameId) && partial.frameId > 0) {
+                latestAppliedSyncFrame = Math.max(latestAppliedSyncFrame, partial.frameId);
+            }
+            // Release / static snapshot: no HUD churn (perfHud.updateSync repaints + countInstances).
+            if (!debugMode || buildMode === 'release') return;
+            perfHud.updateSync({
+                transport: partial.transport ?? transportMode,
+                frameId: partial.frameId ?? 0,
+                producerBytes: partial.producerBytes ?? 0,
+                decodeMs: partial.decodeMs ?? 0,
+                applyMs: partial.applyMs ?? 0,
+                nodeCount: nodeMap.size,
+                instanceCount: countInstances(),
+                ...materialRegistryHudStats(),
+                textureCount: textureCache.size,
+            });
+        }
+
+        bridge.on('debug', msg => {
+            if (!bridgeHasInitialSync()) {
+                setInfoText('max.js - ' + (msg.msg || 'debug'));
+            } else {
+                maxjsDebugLog('[max.js debug]', msg.msg || 'debug');
+            }
+        });
+
+        // ── Clay Mode ───────────────────────────────────
+        let clayModeActive = false;
+        const defaultShadingLabel = 'Default Shading';
+        const shadingMenuLabel = document.querySelector('[data-shading-label]');
+
+        function updateShadingMenuLabel(isClay) {
+            if (!shadingMenuLabel) return;
+            const label = isClay ? 'Clay' : defaultShadingLabel;
+            if (shadingMenuLabel.textContent !== label) shadingMenuLabel.textContent = label;
+        }
+
+        // ── ASCII Effect (full takeover) ──
+        let asciiActive = false;
+        let asciiEffect = null;
+        let asciiPreFxSnapshot = null;
+        let asciiSettings = { resolution: 0.15, color: 'white', invert: false };
+        const ASCII_COLORS = { white: '#fff', green: '#0f0', amber: '#ffb000' };
+        const ASCII_CHARS = ' .:-=+*#%@';
+
+        function enterAsciiMode() {
+            if (asciiActive) return true;
+            if (shaderLabFx?.isEnabled?.()) {
+                perfHud?.setStatus?.('max.js - ASCII unavailable while Shader Lab is active');
+                syncPostFxPanel(true);
+                return false;
+            }
+            asciiPreFxSnapshot = {
+                ssgi: maxjsFx.isEnabled(), ssr: maxjsFx.isSSREnabled(), gtao: maxjsFx.isGTAOEnabled(),
+                bloom: maxjsFx.isBloomEnabled(), toonOutline: maxjsFx.isToonOutlineEnabled(),
+                motionBlur: maxjsFx.isMotionBlurEnabled(), traa: maxjsFx.isTRAAEnabled(),
+                contactShadow: maxjsFx.isContactShadowEnabled(), retro: maxjsFx.isRetroEnabled(),
+                volumetric: maxjsFx.isVolumetricEnabled(), pixel: maxjsFx.isPixelEnabled(),
+                powershot: maxjsFx.isPowerShotEnabled(),
+                fog: maxjsFx.isFogEnabled(),
+            };
+            maxjsFx.setEnabled(false); maxjsFx.setSSREnabled(false); maxjsFx.setGTAOEnabled(false);
+            maxjsFx.setBloomEnabled(false); maxjsFx.setToonOutlineEnabled(false);
+            maxjsFx.setMotionBlurEnabled(false); maxjsFx.setTRAAEnabled(false);
+            maxjsFx.setContactShadowEnabled(false); maxjsFx.setRetroEnabled(false);
+            maxjsFx.setVolumetricEnabled(false); maxjsFx.setPixelEnabled(false);
+            maxjsFx.setPowerShotEnabled(false);
+            maxjsFx.setFogEnabled(false);
+            rebuildAsciiEffect();
+            asciiActive = true;
+            renderer.domElement.style.display = 'none';
+            document.querySelector('.sidepanel-body')?.classList.add('ascii-takeover');
+            return true;
+        }
+
+        function exitAsciiMode() {
+            if (!asciiActive) return;
+            asciiActive = false;
+            if (asciiEffect) { asciiEffect.domElement.remove(); asciiEffect = null; }
+            renderer.domElement.style.display = '';
+            document.querySelector('.sidepanel-body')?.classList.remove('ascii-takeover');
+            if (asciiPreFxSnapshot) {
+                const s = asciiPreFxSnapshot;
+                maxjsFx.setGTAOEnabled(s.gtao); maxjsFx.setEnabled(s.ssgi);
+                maxjsFx.setSSREnabled(s.ssr); maxjsFx.setBloomEnabled(s.bloom);
+                maxjsFx.setToonOutlineEnabled(s.toonOutline); maxjsFx.setMotionBlurEnabled(s.motionBlur);
+                maxjsFx.setTRAAEnabled(s.traa); maxjsFx.setContactShadowEnabled(s.contactShadow);
+                maxjsFx.setRetroEnabled(s.retro); maxjsFx.setVolumetricEnabled(s.volumetric);
+                maxjsFx.setPixelEnabled(s.pixel); maxjsFx.setPowerShotEnabled(s.powershot);
+                maxjsFx.setFogEnabled(s.fog);
+                asciiPreFxSnapshot = null;
+            }
+            syncPostFxPanel(true);
+        }
+
+        function rebuildAsciiEffect() {
+            if (asciiEffect) asciiEffect.domElement.remove();
+            asciiEffect = new AsciiEffect(renderer, ASCII_CHARS, {
+                invert: asciiSettings.invert, resolution: asciiSettings.resolution,
+            });
+            const rect = getViewportFrameRect();
+            asciiEffect.setSize(rect.width, rect.height);
+            asciiEffect.domElement.style.cssText = 'position:absolute;inset:0;z-index:1;color:' +
+                (ASCII_COLORS[asciiSettings.color] || '#fff') + ';background:#000;overflow:hidden';
+            applyFrameElementStyle(asciiEffect.domElement, rect);
+            document.body.appendChild(asciiEffect.domElement);
+        }
+        let clayPreFxSnapshot = null;
+        const clayMat = new THREE.MeshStandardMaterial({
+            color: 0x9d3d31, roughness: 0.6, metalness: 0.05, side: THREE.DoubleSide,
+        });
+
+        function enterClayMode() {
+            if (!clayPreFxSnapshot) {
+                // Snapshot current FX state once. Forced native resends must not
+                // overwrite the user's restore target with the already-muted clay state.
+                clayPreFxSnapshot = {
+                    ssgi: maxjsFx.isEnabled(),
+                    ssr: maxjsFx.isSSREnabled(),
+                    gtao: maxjsFx.isGTAOEnabled(),
+                    bloom: maxjsFx.isBloomEnabled(),
+                    toonOutline: maxjsFx.isToonOutlineEnabled(),
+                    motionBlur: maxjsFx.isMotionBlurEnabled(),
+                    traa: maxjsFx.isTRAAEnabled(),
+                    contactShadow: maxjsFx.isContactShadowEnabled(),
+                    retro: maxjsFx.isRetroEnabled(),
+                    volumetric: maxjsFx.isVolumetricEnabled(),
+                    pixel: maxjsFx.isPixelEnabled(),
+                    powershot: maxjsFx.isPowerShotEnabled(),
+                    fog: maxjsFx.isFogEnabled(),
+                    clone: maxjsFx.isCloneEnabled(),
+                };
+                // Disable everything
+                maxjsFx.setCloneEnabled(false);
+                maxjsFx.setEnabled(false);
+                maxjsFx.setSSREnabled(false);
+                maxjsFx.setBloomEnabled(false);
+                maxjsFx.setToonOutlineEnabled(false);
+                maxjsFx.setMotionBlurEnabled(false);
+                maxjsFx.setTRAAEnabled(false);
+                maxjsFx.setContactShadowEnabled(false);
+                maxjsFx.setRetroEnabled(false);
+                maxjsFx.setVolumetricEnabled(false);
+                maxjsFx.setPixelEnabled(false);
+                maxjsFx.setPowerShotEnabled(false);
+                maxjsFx.setFogEnabled(false);
+                maxjsFx.setGTAOEnabled(false);
+            }
+            if (maxjsFx.setClayOverride) maxjsFx.setClayOverride(true);
+
+            // Use scene.overrideMaterial — renderer + shadow system use it natively,
+            // no per-mesh swap needed, no stale WebGPU TextureNode references.
+            scene.overrideMaterial = clayMat;
+            maxjsFx.markOutputChanged?.();
+        }
+
+        function exitClayMode() {
+            scene.overrideMaterial = null;
+
+            // Restore FX state
+            if (clayPreFxSnapshot) {
+                if (maxjsFx.setClayOverride) maxjsFx.setClayOverride(false);
+                maxjsFx.setGTAOEnabled(clayPreFxSnapshot.gtao);
+                maxjsFx.setEnabled(clayPreFxSnapshot.ssgi);
+                maxjsFx.setSSREnabled(clayPreFxSnapshot.ssr);
+                maxjsFx.setBloomEnabled(clayPreFxSnapshot.bloom);
+                maxjsFx.setToonOutlineEnabled(clayPreFxSnapshot.toonOutline);
+                maxjsFx.setMotionBlurEnabled(clayPreFxSnapshot.motionBlur);
+                maxjsFx.setTRAAEnabled(clayPreFxSnapshot.traa);
+                maxjsFx.setContactShadowEnabled(clayPreFxSnapshot.contactShadow);
+                maxjsFx.setRetroEnabled(clayPreFxSnapshot.retro);
+                maxjsFx.setVolumetricEnabled(clayPreFxSnapshot.volumetric);
+                maxjsFx.setPixelEnabled(clayPreFxSnapshot.pixel);
+                maxjsFx.setPowerShotEnabled(clayPreFxSnapshot.powershot);
+                maxjsFx.setFogEnabled(clayPreFxSnapshot.fog);
+                maxjsFx.setCloneEnabled(clayPreFxSnapshot.clone);
+                clayPreFxSnapshot = null;
+            }
+            maxjsFx.markOutputChanged?.();
+        }
+
+        bridge.on('clay_mode', msg => {
+            if (renderToImageActive) return;  // suppress during production render
+            const enabled = !!msg.enabled;
+            const needsApply = enabled
+                ? (!clayModeActive || scene.overrideMaterial !== clayMat)
+                : (clayModeActive || scene.overrideMaterial === clayMat || !!clayPreFxSnapshot);
+            if (!needsApply) {
+                updateShadingMenuLabel(enabled);
+                return;
+            }
+            clayModeActive = enabled;
+            updateShadingMenuLabel(enabled);
+            if (enabled) enterClayMode(); else exitClayMode();
+            syncPostFxPanel(true, { persist: false });
+        });
+
+        // Host wiring: binary shared-buffer routes (zero-copy geometry) are
+        // registered per payload type here; the window/webview event listeners
+        // live in host_bridge.installHostWiring().
+        hostBridge.onSharedBuffer('gi_surface_bin', (buf, meta) => {
+                        const floatCount = Math.max(0, Math.min(Number(meta.floatCount) || 0, buf.byteLength / 4));
+                        const array = new Float32Array(new Float32Array(buf, 0, floatCount));
+                        const expectedNativeSurface = giVolumeNativeRequestToken === giVolumeDebounceSerial
+                            && giVolumeNativeAwaitSurface === true;
+                        if (giVolume?.setNativeSurface?.({
+                            array,
+                            count: meta.sampleCount,
+                            boundsMin: meta.boundsMin,
+                            boundsSize: meta.boundsSize,
+                        })) {
+                            if (expectedNativeSurface) {
+                                giVolumeNativeAwaitSurface = false;
+                                maybeStartGiVolumeAfterNativePacket(giVolumeNativeRequestToken);
+                            } else {
+                                scheduleGiVolumeFromCurrentScene({
+                                    delay: GI_VOLUME_SCENE_DEBOUNCE_MS,
+                                    refresh: false,
+                                    reason: 'native-surface',
+                                });
+                            }
+                        }
+        });
+        hostBridge.onSharedBuffer('gi_light_bin', (buf, meta) => {
+                        const floatCount = Math.max(0, Math.min(Number(meta.floatCount) || 0, buf.byteLength / 4));
+                        const array = new Float32Array(new Float32Array(buf, 0, floatCount));
+                        const expectedNativeLights = giVolumeNativeRequestToken === giVolumeDebounceSerial
+                            && giVolumeNativeAwaitLights === true;
+                        if (giVolume?.setNativeLights?.({
+                            array,
+                            count: meta.lightCount,
+                        })) {
+                            if (expectedNativeLights) {
+                                giVolumeNativeAwaitLights = false;
+                                maybeStartGiVolumeAfterNativePacket(giVolumeNativeRequestToken);
+                            } else {
+                                scheduleGiVolumeFromCurrentScene({
+                                    delay: GI_VOLUME_LIGHT_DEBOUNCE_MS,
+                                    refresh: false,
+                                    lightRefresh: true,
+                                    reason: 'native-lights',
+                                });
+                            }
+                        }
+        });
+        hostBridge.onSharedBuffer('delta_bin', (buf, meta) => {
+                        handleBinaryDelta(buf, meta);
+        });
+        hostBridge.onSharedBuffer('geo_fast', (buf, meta) => {
+                        // Real-time vertex update — in-place when topology matches
+                        const mesh = nodeMap.get(meta.h);
+                        if (mesh) {
+                            if (meta.jsmod != null) applyJsmodSyncState(mesh, meta.jsmod === true);
+                            if (!mesh.userData.jsmod) {
+                            const pos = mesh.geometry.getAttribute('position');
+                            const wantsLine = !!meta.spline;
+                            const hasLine = !!(mesh.isLine || mesh.isLineSegments);
+                            const vertCount = meta.vN / 3;
+                            const hasIncomingIndex = meta.iOff != null && meta.iN != null;
+                            const idxCount = hasIncomingIndex ? meta.iN : 0;
+                            const existingIdx = mesh.geometry.getIndex();
+                            const skipBounds = !!(meta.skipBounds || meta.compactChannels);
+                            const sameTopology = wantsLine === hasLine
+                                && pos
+                                && pos.count === vertCount
+                                && (!hasIncomingIndex || (existingIdx && existingIdx.count === idxCount));
+                            const incomingVertexColors = normalizeVertexColorDescriptors(meta.vc);
+                            const oldGroups = cloneGeometryGroups(mesh.geometry);
+                            const applyIncomingGroups = () => {
+                                if (applyGeometryGroups(mesh.geometry, meta.groups)) return;
+                                if (oldGroups.length && (!Array.isArray(mesh.geometry.groups) || mesh.geometry.groups.length === 0)) {
+                                    applyGeometryGroups(mesh.geometry, oldGroups);
+                                }
+                            };
+                            const applyIncomingMaterial = () => {
+                                applyFastMaterialPayload(mesh, meta, wantsLine);
+                            };
+
+                            if (sameTopology) {
+                                // Hot path: copy positions into existing GPU buffer
+                                updateFloatGeometryAttribute(mesh.geometry, 'position', buf, meta.vOff, meta.vN, 3);
+
+                                if (hasIncomingIndex && existingIdx) {
+                                    updateGeometryIndexAttribute(mesh.geometry, buf, meta.iOff, meta.iN);
+                                    // Index contents changed in place — the GPU
+                                    // normal adjacency cache is keyed by geometry
+                                    // and must not survive a connectivity rewrite.
+                                    gpuNormalsInvalidate(mesh.geometry);
+                                }
+
+                                if (meta.uvOff != null && meta.uvN) {
+                                    updateFloatGeometryAttribute(mesh.geometry, 'uv', buf, meta.uvOff, meta.uvN, 2);
+                                }
+
+                                if (meta.nOff != null && meta.nN) {
+                                    updateFloatGeometryAttribute(mesh.geometry, 'normal', buf, meta.nOff, meta.nN, 3);
+                                } else if (skipBounds) {
+                                    // Position-only deform update: rebuild normals in
+                                    // a WebGPU compute pass instead of leaving them
+                                    // frozen. No-op on the WebGL fallback backend.
+                                    if (!gpuRecomputeNormals(renderer, mesh) &&
+                                        gpuNormalsAnnounced && isGpuNormalsDisabled()) {
+                                        // Compute path died at runtime — tell the
+                                        // plugin to resume CPU normal streaming.
+                                        gpuNormalsAnnounced = false;
+                                        window.chrome?.webview?.postMessage({ type: 'gpu_normals', enabled: false });
+                                    }
+                                }
+
+                                setGeometryVertexColorAttributes(mesh.geometry, incomingVertexColors, buf);
+
+                                // skipBounds signals a deformation-only fast update:
+                                // bounding volumes are the hot path cost for skinned
+                                // meshes at 60fps and drive nothing visible here
+                                // (frustum culling is off).
+                                if (!skipBounds) {
+                                    mesh.geometry.computeBoundingBox();
+                                    mesh.geometry.computeBoundingSphere();
+                                }
+                                applyIncomingGroups();
+                            } else {
+                                if (!hasIncomingIndex) return;
+                                // Topology changed — full rebuild
+                                const oldUv = mesh.geometry.getAttribute('uv');
+                                const oldNormal = mesh.geometry.getAttribute('normal');
+                                const verts = new Float32Array(new Float32Array(buf, meta.vOff, meta.vN));
+                                const idx = new Uint32Array(new Int32Array(buf, meta.iOff, meta.iN));
+                                const geom = new THREE.BufferGeometry();
+                                geom.setAttribute('position', new THREE.BufferAttribute(verts, 3));
+                                geom.setIndex(new THREE.BufferAttribute(idx, 1));
+                                if (meta.uvOff != null && meta.uvN) {
+                                    const uvs = new Float32Array(new Float32Array(buf, meta.uvOff, meta.uvN));
+                                    geom.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
+                                } else if (meta.compactChannels && oldUv && oldUv.count === vertCount) {
+                                    geom.setAttribute('uv', oldUv.clone());
+                                }
+                                if (meta.nOff != null && meta.nN) {
+                                    const norms = new Float32Array(new Float32Array(buf, meta.nOff, meta.nN));
+                                    geom.setAttribute('normal', new THREE.BufferAttribute(norms, 3));
+                                } else if (meta.compactChannels && oldNormal && oldNormal.count === vertCount) {
+                                    geom.setAttribute('normal', oldNormal.clone());
+                                } else if (!meta.compactChannels) {
+                                    geom.computeVertexNormals();
+                                }
+                                setGeometryVertexColorAttributes(geom, incomingVertexColors, buf);
+                                if (meta.compactChannels) {
+                                    if (mesh.geometry.boundingBox) geom.boundingBox = mesh.geometry.boundingBox.clone();
+                                    if (mesh.geometry.boundingSphere) geom.boundingSphere = mesh.geometry.boundingSphere.clone();
+                                } else {
+                                    geom.computeBoundingSphere();
+                                }
+                                mesh.geometry.dispose();
+                                mesh.geometry = geom;
+                                applyIncomingGroups();
+                                if (meta.nOff == null && meta.compactChannels) {
+                                    // Rebuilt topology carried no normals (cloned
+                                    // stale ones above) — refresh them on the GPU.
+                                    gpuRecomputeNormals(renderer, mesh);
+                                }
+                            }
+                            applyIncomingMaterial();
+                            // Geometry data on the same Object3D — no pipeline
+                            // rebuild needed regardless of which branch ran.
+                            maxjsFx?.markGeometryDataDirty?.();
+                            markLightProbeSceneDirty();
+                            scheduleLightProbeFromCurrentScene({ delay: 350 });
+                            schedulePathTracingLiveRebuild();
+                            }
+                        }
+        });
+        hostBridge.onSharedBufferFallback((buf, meta) => {
+                        handleBinaryScene(buf, meta);
+        });
+        hostBridge.installHostWiring();
+        window.maxJS = bridge;
+        bridge.materials = {
+            getStats() {
+                return { ...materialRegistryStats };
+            },
+            getEntries() {
+                return [...materialRegistry.values()].map((entry) => ({
+                    id: entry.id,
+                    model: entry.model,
+                    displayName: entry.displayName,
+                    names: [...entry.names],
+                    textureSlots: entry.textureSlots,
+                    refCount: entry.refCount,
+                    bucketedRefCount: entry.bucketedRefCount,
+                    key: entry.key,
+                }));
+            },
+        };
+
+        const DEFAULT_BAKE_STATE = Object.freeze({
+            version: 1,
+            enabled: false,
+            mode: 'lightmap',
+            match: 'scene',
+            folder: '',
+            sceneName: 'scene',
+            lightSuffix: '_lightmap',
+            beautySuffix: '_beauty',
+            extension: 'png',
+            intensity: 1.0,
+            bakeExposure: 0,
+            proxyDisplay: false,
+        });
+        let bakeOverrides = { ...DEFAULT_BAKE_STATE };
+        let lastBakeUv2RequestKey = '';
+        let bakeUv2RequestTimer = 0;
+
+        function normalizeBakeState(payload) {
+            const raw = payload && typeof payload === 'object' ? payload : {};
+            const next = { ...DEFAULT_BAKE_STATE, ...raw };
+            next.enabled = raw.enabled === true;
+            next.mode = next.mode === 'beauty' ? 'beauty' : 'lightmap';
+            next.match = ['scene', 'object', 'material'].includes(next.match) ? next.match : 'scene';
+            next.folder = stripWrappingQuotes(next.folder);
+            next.sceneName = String(next.sceneName || DEFAULT_BAKE_STATE.sceneName).trim() || DEFAULT_BAKE_STATE.sceneName;
+            next.lightSuffix = String(next.lightSuffix ?? DEFAULT_BAKE_STATE.lightSuffix);
+            next.beautySuffix = String(next.beautySuffix ?? DEFAULT_BAKE_STATE.beautySuffix);
+            next.extension = String(next.extension || DEFAULT_BAKE_STATE.extension).replace(/^\./, '') || DEFAULT_BAKE_STATE.extension;
+            next.intensity = Number.isFinite(Number(next.intensity)) ? Math.max(0, Number(next.intensity)) : 1.0;
+            next.bakeExposure = Number.isFinite(Number(next.bakeExposure)) ? Number(next.bakeExposure) : 0;
+            next.proxyDisplay = raw.proxyDisplay === true;
+            return next;
+        }
+
+        function serializeBakeState() {
+            return { ...bakeOverrides };
+        }
+
+        function serializeSnapshotBakeState() {
+            const state = serializeBakeState();
+            if (state.enabled && state.folder) {
+                state.folder = normalizeBakeFolderUrl(state.folder);
+            }
+            return state;
+        }
+
+        function bakeStateSignature() {
+            return JSON.stringify(bakeOverrides);
+        }
+
+        function stripWrappingQuotes(value) {
+            let text = String(value ?? '').trim();
+            while (text.length >= 2) {
+                const first = text[0];
+                const last = text[text.length - 1];
+                if ((first === '"' && last === '"') || (first === "'" && last === "'")) {
+                    text = text.slice(1, -1).trim();
+                    continue;
+                }
+                break;
+            }
+            return text;
+        }
+
+        function encodeAssetPath(path) {
+            const normalized = String(path ?? '').replace(/\\/g, '/');
+            const segments = normalized.split('/').filter((segment, index) => segment.length > 0 || index === 0);
+            return segments.map(segment => encodeURIComponent(segment)).join('/');
+        }
+
+        function normalizeBakeFolderUrl(folder) {
+            const raw = String(folder ?? '').trim();
+            if (!raw) return '';
+            if (/^https?:\/\//i.test(raw) || raw.startsWith('./') || raw.startsWith('../') || raw.startsWith('/')) {
+                return raw.endsWith('/') ? raw : `${raw}/`;
+            }
+            if (/^[a-zA-Z]:[\\/]/.test(raw) || /^\\\\/.test(raw)) {
+                return `https://maxjs-assets.local/${encodeAssetPath(raw).replace(/\/?$/, '/')}`;
+            }
+            return raw.endsWith('/') ? raw : `${raw}/`;
+        }
+
+        function sanitizeBakeFileStem(value) {
+            return String(value ?? '')
+                .trim()
+                .replace(/[\\/:*?"<>|]+/g, '_')
+                .replace(/\s+/g, '_')
+                .replace(/^_+|_+$/g, '') || 'scene';
+        }
+
+        function getMaterialBakeName(material) {
+            return String(
+                material?.userData?.maxjsSourceMaterialName ??
+                material?.name ??
+                'material'
+            ).trim() || 'material';
+        }
+
+        function getBakeTargetName(nd, material, mesh = null) {
+            if (bakeOverrides.match === 'object') return mesh?.name || nd?.n || nd?.name || `node_${nd?.h ?? '0'}`;
+            if (bakeOverrides.match === 'material') return getMaterialBakeName(material);
+            return bakeOverrides.sceneName;
+        }
+
+        function getBakeTextureUrl(nd, material, kind, mesh = null, extensionOverride = null) {
+            return getBakeTextureCandidates(nd, material, kind, mesh, extensionOverride)[0]?.url || '';
+        }
+
+        function bakeFilenameHasExplicitUvChannel(filename) {
+            const baseName = String(filename ?? '').replace(/\.[^./\\]+$/, '');
+            return /(?:^|[_.\-\s])UV[12](?:$|[_.\-\s])/i.test(baseName);
+        }
+
+        function getBakeFilenameCandidates(stem, suffix, extension) {
+            const exact = `${stem}${suffix}.${extension}`;
+            const names = bakeFilenameHasExplicitUvChannel(exact)
+                ? [exact]
+                : [
+                    `${stem}_UV2.${extension}`,
+                    `${stem}_UV1.${extension}`,
+                    exact,
+                    ...(suffix ? [`${stem}.${extension}`] : []),
+                ];
+            return [...new Set(names)];
+        }
+
+        function getBakeTextureCandidates(nd, material, kind, mesh = null, extensionOverride = null) {
+            if (!bakeOverrides.enabled || !bakeOverrides.folder) return [];
+            const folder = normalizeBakeFolderUrl(bakeOverrides.folder);
+            if (!folder) return [];
+            const suffix = kind === 'beauty' ? bakeOverrides.beautySuffix : bakeOverrides.lightSuffix;
+            const stem = sanitizeBakeFileStem(getBakeTargetName(nd, material, mesh));
+            const extension = String(extensionOverride || bakeOverrides.extension || DEFAULT_BAKE_STATE.extension).replace(/^\./, '');
+            return getBakeFilenameCandidates(stem, suffix, extension).map(filename => ({
+                filename,
+                url: `${folder}${encodeURIComponent(filename)}`,
+                maxMapChannel: getBakeMaxMapChannel(filename),
+            }));
+        }
+
+        function hasGeometryUV2(geom) {
+            return !!(geom?.getAttribute?.('uv1') || geom?.getAttribute?.('uv2'));
+        }
+
+        function getBakeMaxMapChannel(url = '') {
+            return maxMapChannelFromMapName(url, 2);
+        }
+
+        function hasGeometryMaxMapChannel(geom, maxMapChannel = 2) {
+            const channel = Number.isFinite(Number(maxMapChannel))
+                ? Math.max(1, Math.round(Number(maxMapChannel)))
+                : 2;
+            if (channel === 1) return !!geom?.getAttribute?.('uv');
+            if (channel === 2) return hasGeometryUV2(geom);
+            return false;
+        }
+
+        const webGpuLightMapUvContexts = new WeakMap();
+
+        function restoreWebGpuLightMapUvContext(material) {
+            const state = material ? webGpuLightMapUvContexts.get(material) : null;
+            if (!state) return false;
+            const ownsContext = material.contextNode === state.contextNode;
+            webGpuLightMapUvContexts.delete(material);
+            if (!ownsContext) return false;
+            material.contextNode = state.previousContext ?? null;
+            material.needsUpdate = true;
+            return true;
+        }
+
+        function applyWebGpuLightMapUvContext(material, maxMapChannel = 2) {
+            if (!material) return false;
+            if (String(rendererBackendLabel || '') !== 'WebGPU') return restoreWebGpuLightMapUvContext(material);
+            const channel = Number.isFinite(Number(maxMapChannel))
+                ? Math.max(1, Math.round(Number(maxMapChannel)))
+                : 2;
+            if (channel !== 1) return restoreWebGpuLightMapUvContext(material);
+            const lightMap = material.lightMap;
+            if (!lightMap?.isTexture || typeof TSL?.replaceDefaultUV !== 'function' || typeof TSL?.uv !== 'function') {
+                return restoreWebGpuLightMapUvContext(material);
+            }
+
+            const lightMapUuid = lightMap.uuid;
+            const previousState = webGpuLightMapUvContexts.get(material);
+            if (previousState?.textureUuid === lightMapUuid &&
+                previousState?.maxMapChannel === channel &&
+                material.contextNode === previousState.contextNode) {
+                return false;
+            }
+            const previousContext = previousState?.previousContext ?? material.contextNode ?? null;
+            const contextNode = TSL.replaceDefaultUV((textureNode) => {
+                const tex = textureNode?.value;
+                if (tex === lightMap || tex?.uuid === lightMapUuid) return TSL.uv(0);
+                if (textureNode?.uvNode) return textureNode.uvNode;
+                const fallbackChannel = Number.isFinite(Number(tex?.channel))
+                    ? Math.max(0, Math.round(Number(tex.channel)))
+                    : 0;
+                return TSL.uv(fallbackChannel);
+            });
+            material.contextNode = contextNode;
+            webGpuLightMapUvContexts.set(material, { previousContext, contextNode, textureUuid: lightMapUuid, maxMapChannel: channel });
+            material.needsUpdate = true;
+            return true;
+        }
+
+        function markBakeMissingUv(material, maxMapChannel = 2) {
+            material.userData ??= {};
+            material.userData.maxjsBakeMissingUV = maxMapChannel;
+            if (maxMapChannel === 2) material.userData.maxjsBakeMissingUV2 = true;
+            else delete material.userData.maxjsBakeMissingUV2;
+        }
+
+        function clearBakeMissingUv(material) {
+            if (!material?.userData) return;
+            delete material.userData.maxjsBakeMissingUV;
+            delete material.userData.maxjsBakeMissingUV2;
+        }
+
+        function maybeRequestBakeUv2Resync(reason = 'auto') {
+            const state = normalizeBakeState(bakeOverrides);
+            if (!state.enabled || (state.mode !== 'lightmap' && state.mode !== 'beauty')) return;
+            if (!window.chrome?.webview) return;
+
+            const stats = getBakeUv2RequirementStats(state.mode);
+            if (stats.required <= 0 || stats.ready >= stats.required) return;
+
+            const key = `${bakeStateSignature()}|${stats.required}|${stats.ready}`;
+            if (key === lastBakeUv2RequestKey) return;
+            lastBakeUv2RequestKey = key;
+
+            clearTimeout(bakeUv2RequestTimer);
+            bakeUv2RequestTimer = setTimeout(() => {
+                bridge.send('sync_lightmap_uvs', { reason });
+                perfHud.setStatus('max.js - requesting native UV2 bake geometry resync');
+            }, 50);
+        }
+
+        function createBeautyBakeMaterial(source, texture, url = '', maxMapChannel = 2) {
+            const BakeTHREE = isWebGLTexturePathActive() ? THREE_STD : THREE;
+            const displayProxy = isDisplayBakedBeautyProxy(url);
+            const exposureScale = displayProxy ? 1 : bakeExposureScale();
+            const mat = new BakeTHREE.MeshBasicMaterial({
+                color: new BakeTHREE.Color(exposureScale, exposureScale, exposureScale),
+                map: textureWithUvChannel(texture, maxMapChannel, 2),
+                side: source?.side ?? BakeTHREE.FrontSide,
+                transparent: !!source?.transparent || (Number.isFinite(source?.opacity) && source.opacity < 1),
+                opacity: Number.isFinite(source?.opacity) ? source.opacity : 1,
+                alphaMap: source?.alphaMap ?? null,
+                depthWrite: source?.depthWrite ?? true,
+                depthTest: source?.depthTest ?? true,
+                toneMapped: !displayProxy,
+            });
+            mat.name = source?.name ? `${source.name} bake beauty` : 'bake beauty';
+            mat.userData = { ...(source?.userData || {}), maxjsBakeOverride: 'beauty', maxjsBakeUvChannel: maxMapChannel };
+            return mat;
+        }
+
+        function bakeOverrideOwnerKey(nd, mesh = null) {
+            const handle = nd?.h ?? mesh?.userData?.maxjsHandle;
+            if (handle != null) return `h:${handle}`;
+            return `n:${mesh?.name || nd?.n || nd?.name || ''}`;
+        }
+
+        function stampBakeOverrideOwner(material, nd, mesh = null) {
+            if (!material) return;
+            material.userData ??= {};
+            material.userData.maxjsBakeOwnerKey = bakeOverrideOwnerKey(nd, mesh);
+            material.userData.maxjsBakeOwnerName = mesh?.name || nd?.n || nd?.name || '';
+        }
+
+        function ensureBakeOverrideMaterialInstance(material, nd, mesh = null) {
+            if (!material) return material;
+            const ownerKey = bakeOverrideOwnerKey(nd, mesh);
+            const existingOwnerKey = material.userData?.maxjsBakeOwnerKey;
+            const needsClone = isCachedMaterialTemplate(material) ||
+                (existingOwnerKey && existingOwnerKey !== ownerKey);
+            if (!needsClone) {
+                stampBakeOverrideOwner(material, nd, mesh);
+                return material;
+            }
+            const clone = material.clone();
+            clone.userData = { ...(material.userData || {}) };
+            stampBakeOverrideOwner(clone, nd, mesh);
+            rememberMaterialEmissiveBase(clone);
+            clone.needsUpdate = true;
+            return clone;
+        }
+
+        function applyBakeOverrideToMaterial(material, nd, geom, mesh = null) {
+            if (!material || !bakeOverrides.enabled) return material;
+            if (material.isLineBasicMaterial || material.isLineDashedMaterial) return material;
+            const kind = bakeOverrides.mode === 'beauty' ? 'beauty' : 'lightmap';
+            if (kind === 'lightmap') material = ensureBakeOverrideMaterialInstance(material, nd, mesh);
+            const candidates = getBakeTextureCandidates(nd, material, kind, mesh);
+            if (!candidates.length) return material;
+            const usableCandidates = candidates.filter(candidate => hasGeometryMaxMapChannel(geom, candidate.maxMapChannel));
+            if (!usableCandidates.length) {
+                markBakeMissingUv(material, candidates[0]?.maxMapChannel ?? 2);
+                return material;
+            }
+
+            if (kind === 'beauty') {
+                const bake = loadBakeTextureFromCandidates(usableCandidates, THREE.SRGBColorSpace);
+                if (!bake) return material;
+                material.userData ??= {};
+                clearBakeMissingUv(material);
+                material.userData.maxjsBakeSourceUrl = bake.url;
+                material.userData.maxjsBakeUvChannel = bake.maxMapChannel;
+                material.toneMapped = !isDisplayBakedBeautyProxy(bake.url);
+                return createBeautyBakeMaterial(material, bake.texture, bake.url, bake.maxMapChannel);
+            }
+
+            const bake = loadBakeTextureFromCandidates(usableCandidates, THREE.LinearSRGBColorSpace);
+            if (!bake) return material;
+            material.lightMap = textureWithUvChannel(bake.texture, bake.maxMapChannel, 2);
+            applyWebGpuLightMapUvContext(material, bake.maxMapChannel);
+            material.lightMapIntensity = bakeExposureScale();
+            material.userData ??= {};
+            stampBakeOverrideOwner(material, nd, mesh);
+            clearBakeMissingUv(material);
+            material.userData.maxjsBakeOverride = 'lightmap';
+            material.userData.maxjsBakeSourceUrl = bake.url;
+            material.userData.maxjsBakeUvChannel = bake.maxMapChannel;
+            material.userData.maxjsBakeTextureChannel = material.lightMap?.channel ?? null;
+            material.needsUpdate = true;
+            return material;
+        }
+
+        function applyBakeOverridesToSceneMaterial(material, nd, geom, mesh = null) {
+            if (Array.isArray(material)) {
+                return material.map(item => applyBakeOverrideToMaterial(item, nd, geom, mesh));
+            }
+            return applyBakeOverrideToMaterial(material, nd, geom, mesh);
+        }
+
+        function createSceneMaterial(nd, geom = null, mesh = null) {
+            let material = null;
+            if (nd?.mats && nd?.groups) {
+                material = nd.mats.map((m, materialIndex) => createMaterial(m, {
+                    geometry: geom,
+                    materialIndex,
+                    matrixArray: nd?.t,
+                }));
+            } else if (nd?.mat) {
+                material = createMaterial(nd.mat, {
+                    geometry: geom,
+                    materialIndex: null,
+                    matrixArray: nd?.t,
+                });
+            }
+            else {
+                const entry = getOrCreateMaterialRegistryEntry(null);
+                material = new THREE.MeshStandardMaterial({ color: 0x888888, side: THREE.DoubleSide });
+                material.userData ??= {};
+                material.userData.maxjsMaterialRegistryId = entry.id;
+                material.userData.maxjsMaterialIdentityKey = entry.key;
+                material.userData.maxjsSourceMaterialName = 'default';
+            }
+            return applyBakeOverridesToSceneMaterial(material, nd, geom, mesh);
+        }
+
+        function createDefaultSceneMaterial() {
+            const entry = getOrCreateMaterialRegistryEntry(null);
+            const material = new THREE.MeshStandardMaterial({ color: 0x888888, side: THREE.DoubleSide });
+            material.userData ??= {};
+            material.userData.maxjsMaterialRegistryId = entry.id;
+            material.userData.maxjsMaterialIdentityKey = entry.key;
+            material.userData.maxjsSourceMaterialName = 'default';
+            return material;
+        }
+
+        function materialPayloadHasHTMLAutoFit(md) {
+            if (!md || typeof md !== 'object') return false;
+            return HTML_TEXTURE_AUTO_FIT_KEYS.some(key => htmlTextureAutoFitEnabled(md, key));
+        }
+
+        function nodePayloadHasHTMLAutoFit(nd) {
+            if (!nd || typeof nd !== 'object') return false;
+            if (materialPayloadHasHTMLAutoFit(nd.mat)) return true;
+            return Array.isArray(nd.mats) && nd.mats.some(materialPayloadHasHTMLAutoFit);
+        }
+
+        const pendingMaterialDisposals = [];
+        function disposeSceneMaterial(material) {
+            // Defer disposal to next frame — WebGPU node cache may still reference textures
+            if (Array.isArray(material)) {
+                for (const item of material) { if (item) pendingMaterialDisposals.push(item); }
+            } else if (material) {
+                pendingMaterialDisposals.push(material);
+            }
+        }
+        function collectMaterialRefs(material, refs) {
+            if (Array.isArray(material)) {
+                for (const item of material) if (item) refs.add(item);
+            } else if (material) {
+                refs.add(material);
+            }
+        }
+        function collectLiveSceneMaterials() {
+            const live = new Set();
+            for (const mesh of nodeMap.values()) collectMaterialRefs(mesh?.material, live);
+            for (const [, bucket] of maxInstanceBuckets) collectMaterialRefs(bucket?.mesh?.material, live);
+            for (const [, entry] of hairMeshes) collectMaterialRefs(entry?.mesh?.material, live);
+            for (const [, mesh] of forestMeshes) collectMaterialRefs(mesh?.material, live);
+            return live;
+        }
+        function flushMaterialDisposals() {
+            if (pendingMaterialDisposals.length === 0) return;
+            const live = collectLiveSceneMaterials();
+            const disposed = new Set();
+            for (const mat of pendingMaterialDisposals) {
+                if (!mat || live.has(mat) || disposed.has(mat)) continue;
+                mat.dispose?.();
+                disposed.add(mat);
+            }
+            pendingMaterialDisposals.length = 0;
+        }
+
+        function createSceneLineMaterial(mat) {
+            return new THREE.LineBasicMaterial({
+                color: mat?.color ?? new THREE.Color(0xffffff),
+            });
+        }
+
+        function sceneMaterialSignature(nd, wantsLine) {
+            const payload = nd?.mats && nd?.groups
+                ? ['multi', nd.mats.map(materialIdentityValue)]
+                : (nd?.mat ? ['single', materialIdentityValue(nd.mat)] : ['default']);
+            // Bake mode (beauty) is the only state that swaps material *type*; track it
+            // so material-type changes still trigger rebuild. Other bake fields (folder,
+            // intensity, suffixes) mutate the existing material in place.
+            const bakeKey = bakeOverrides.enabled && bakeOverrides.mode === 'beauty' ? 'beauty' : 'live';
+            const htmlFitKey = nodePayloadHasHTMLAutoFit(nd) ? `:htmlfit:${matrixScaleSignature(nd?.t)}` : '';
+            return `${wantsLine ? 'line' : 'mesh'}:${bakeKey}:${JSON.stringify(payload)}${htmlFitKey}`;
+        }
+
+        function isCachedMaterialTemplate(material) {
+            if (!material) return false;
+            for (const cached of materialCache.values()) if (cached === material) return true;
+            for (const cached of materialXTemplateCache.values()) if (cached === material) return true;
+            return false;
+        }
+
+        function createSceneRenderableMaterial(nd, wantsLine, geom = null, mesh = null) {
+            const mat = createSceneMaterial(nd, geom, mesh);
+            if (!wantsLine) return mat;
+            const lineMat = createSceneLineMaterial(mat);
+            if (!isCachedMaterialTemplate(mat)) disposeSceneMaterial(mat);
+            return lineMat;
+        }
+
+        function cloneGeometryGroups(geometry) {
+            return Array.isArray(geometry?.groups)
+                ? geometry.groups.map(group => [group.start, group.count, group.materialIndex])
+                : [];
+        }
+
+        function applyGeometryGroups(geometry, groups) {
+            if (!geometry || !Array.isArray(groups)) return false;
+            geometry.clearGroups();
+            for (const group of groups) {
+                if (!Array.isArray(group) || group.length < 3) continue;
+                geometry.addGroup(group[0], group[1], group[2]);
+            }
+            return true;
+        }
+
+        function geometryGroupsMatch(geometry, groups) {
+            if (!geometry || !Array.isArray(groups)) return false;
+            const current = Array.isArray(geometry.groups) ? geometry.groups : [];
+            if (current.length !== groups.length) return false;
+            for (let i = 0; i < groups.length; i++) {
+                const group = groups[i];
+                if (!Array.isArray(group) || group.length < 3) return false;
+                const currentGroup = current[i];
+                if (!currentGroup
+                    || currentGroup.start !== group[0]
+                    || currentGroup.count !== group[1]
+                    || currentGroup.materialIndex !== group[2]) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        function resolveInstancedNodeGeometry(nd, sourceGeometry, { cloneForJsmod = false } = {}) {
+            if (!sourceGeometry) return null;
+            if (!Array.isArray(nd?.groups)) return cloneForJsmod ? sourceGeometry.clone() : sourceGeometry;
+            if (!cloneForJsmod && geometryGroupsMatch(sourceGeometry, nd.groups)) return sourceGeometry;
+            const geometry = sourceGeometry.clone();
+            applyGeometryGroups(geometry, nd.groups);
+            return geometry;
+        }
+
+        function isGeometrySharedByAnotherMesh(geometry, selfMesh) {
+            if (!geometry) return false;
+            for (const other of nodeMap.values()) {
+                if (other !== selfMesh && other.geometry === geometry) return true;
+            }
+            for (const [, bucket] of maxInstanceBuckets) {
+                if (bucket.mesh && bucket.mesh.geometry === geometry) return true;
+            }
+            return false;
+        }
+
+        function syncGeometryGroupsForNode(mesh, geometry, groups) {
+            if (!geometry || !Array.isArray(groups)) return geometry;
+            if (geometryGroupsMatch(geometry, groups)) return geometry;
+            // Groups live on the geometry, but instances share one BufferGeometry.
+            // Rewriting them in place would scramble every sibling's material-ID
+            // mapping (last node processed wins) — clone for this node instead.
+            const target = isGeometrySharedByAnotherMesh(geometry, mesh)
+                ? geometry.clone()
+                : geometry;
+            applyGeometryGroups(target, groups);
+            return target;
+        }
+
+        function applyFastMaterialPayload(mesh, payload, wantsLine) {
+            if (!mesh || !Array.isArray(payload?.groups) || !Array.isArray(payload?.mats)) return false;
+            const ndForMaterial = {
+                ...(mesh.userData?.maxjsLastNodePayload || {}),
+                h: payload.h,
+                n: mesh.name,
+                t: mesh.matrix?.elements,
+                groups: payload.groups,
+                mats: payload.mats,
+            };
+            delete ndForMaterial.mat;
+            delete ndForMaterial.matRef;
+            delete ndForMaterial.matRefs;
+            const changed = ensureSceneRenderableMaterial(mesh, ndForMaterial, wantsLine);
+            if (!changed) stampSceneMaterial(mesh, ndForMaterial, wantsLine);
+            if (changed) layerManager.applyMaterialOverrides?.(payload.h, mesh);
+            return changed;
+        }
+
+        function stampSceneMaterial(mesh, nd, wantsLine) {
+            mesh.userData ??= {};
+            mesh.userData.maxjsMaterialSignature = sceneMaterialSignature(nd, wantsLine);
+            mesh.userData.maxjsLastNodePayload = nd;
+            mesh.userData.maxjsHasHTMLAutoFit = nodePayloadHasHTMLAutoFit(nd);
+        }
+
+        function ensureSceneRenderableMaterial(mesh, nd, wantsLine, { authoritativeMaterial = false } = {}) {
+            if (!mesh) return false;
+            // Guard: a single-material payload must not collapse a mesh that is
+            // still multi/sub-object. On an incremental re-sync (e.g. after undo)
+            // the Max side can skip geometry extraction for a node whose geometry
+            // is unchanged/instanced — and with it drop the multi-sub groups+mats
+            // payload, sending only a single `mat`. The geometry still carries its
+            // (>1) material groups, so a lone `mat` can't be the real assignment;
+            // rebuilding from it dumps every face onto slot 0 (the "instances lose
+            // their material IDs" bug). Keep the existing array.
+            //
+            // Full scene syncs pass authoritativeMaterial: there the Max side has
+            // just re-read GetMtl() for this node, so a single `mat` IS the real
+            // assignment (a genuine multi→single reassignment) and must apply —
+            // material assignment never re-extracts geometry, so waiting for a
+            // single-group geometry payload deadlocked these nodes until a viewer
+            // reload. With a single material three.js ignores the group material
+            // indices, so the (possibly shared) geometry groups can stay.
+            if (!wantsLine
+                && Array.isArray(mesh.material) && mesh.material.length > 1
+                && Array.isArray(mesh.geometry?.groups) && mesh.geometry.groups.length > 1
+                && !(Array.isArray(nd?.mats) && nd.mats.length)
+                && !(authoritativeMaterial && nd?.mat)) {
+                return false;
+            }
+            const signature = sceneMaterialSignature(nd, wantsLine);
+            if (mesh.material && mesh.userData?.maxjsMaterialSignature === signature) return false;
+            const oldMaterial = mesh.material;
+            mesh.material = createSceneRenderableMaterial(nd, wantsLine, mesh.geometry, mesh);
+            mesh.userData ??= {};
+            mesh.userData.maxjsMaterialSignature = signature;
+            mesh.userData.maxjsLastNodePayload = nd;
+            mesh.userData.maxjsHasHTMLAutoFit = nodePayloadHasHTMLAutoFit(nd);
+            disposeSceneMaterial(oldMaterial);
+            return true;
+        }
+
+        function finalizeSceneNode(mesh, nd) {
+            if (nd?.h != null && getMaxInstanceBucketForHandle(nd.h)) {
+                return updateMaxInstanceBucketNode(nd.h, nd);
+            }
+            if (mesh && nd && nd.h != null) mesh.userData.maxjsHandle = nd.h;
+            applyJsmodSyncState(mesh, !!nd.jsmod);
+            applyUserPropsSyncState(mesh, nd.userProps);
+            applyInstanceSyncState(mesh, nd.instOf);
+            const visibilityChanged = applyBridgeVisibility(mesh, nd.vis);
+            mesh.frustumCulled = false;
+            if (!nd.spline) applyMeshShadowState(mesh);
+            applyNodeProps(mesh, nd.props);
+            const transformChanged = applyTransform(mesh, nd.t);
+            applySelection(mesh, nd.s);
+            return !!(visibilityChanged || transformChanged);
+        }
+
+        function applyIncrementalNodeUpdate(mesh, nd, handleOverride = null) {
+            if (!mesh || !nd) return;
+            const handle = handleOverride ?? nd.h ?? null;
+            if (handle != null && getMaxInstanceBucketForHandle(handle)) {
+                updateMaxInstanceBucketNode(handle, nd);
+                return;
+            }
+            if (handle != null) mesh.userData.maxjsHandle = handle;
+            if (nd.helper === true) mesh.userData.maxjsHelper = true;
+            if (Object.prototype.hasOwnProperty.call(nd, 'p')) syncNodeParent(mesh, nd);
+            if (nd.jsmod != null) applyJsmodSyncState(mesh, nd.jsmod === true);
+            if (nd.userProps != null) applyUserPropsSyncState(mesh, nd.userProps);
+            if (nd.vis != null) applyBridgeVisibility(mesh, nd.vis);
+            if (isFiniteArray(nd.t, 16)) {
+                const hadHTMLAutoFit = !!mesh.userData?.maxjsHasHTMLAutoFit;
+                const oldScaleSignature = hadHTMLAutoFit
+                    ? matrixScaleSignature(mesh.userData?.maxjsLastNodePayload?.t)
+                    : '';
+                applyTransform(mesh, nd.t);
+                if (hadHTMLAutoFit) {
+                    const lastPayload = mesh.userData?.maxjsLastNodePayload;
+                    if (lastPayload) {
+                        lastPayload.t = nd.t;
+                        if (matrixScaleSignature(nd.t) !== oldScaleSignature) {
+                            ensureSceneRenderableMaterial(mesh, lastPayload, !!lastPayload.spline);
+                        }
+                    }
+                }
+            }
+            if (nd.s != null) applySelection(mesh, nd.s);
+            // Max never intends scalar pushes for Multi/Sub nodes (a single
+            // color/rough/metal set would smear across every sub-material).
+            // Guard here too: a delta can land while the mesh is still
+            // multi-material mid-reassignment, before the full sync applies.
+            if (nd.mat && mesh.material
+                && !(Array.isArray(mesh.material) && mesh.material.length > 1)) {
+                applyMaterialScalar(mesh, nd.mat);
+            }
+        }
+
+        function buildNodeGeometryRefCounts() {
+            const counts = new Map();
+            for (const mesh of nodeMap.values()) {
+                const geom = mesh?.geometry;
+                if (!geom) continue;
+                counts.set(geom, (counts.get(geom) || 0) + 1);
+            }
+            return counts;
+        }
+
+        function retainGeometryRef(refCounts, geom) {
+            if (!refCounts || !geom) return;
+            refCounts.set(geom, (refCounts.get(geom) || 0) + 1);
+        }
+
+        function releaseGeometryRef(refCounts, geom) {
+            if (!refCounts || !geom) return;
+            const next = (refCounts.get(geom) || 0) - 1;
+            if (next <= 0) {
+                refCounts.delete(geom);
+                geom.dispose?.();
+            } else {
+                refCounts.set(geom, next);
+            }
+        }
+
+        function disposeMaxInstanceBuckets() {
+            for (const [, bucket] of maxInstanceBuckets) {
+                if (bucket.mesh?.parent) bucket.mesh.parent.remove(bucket.mesh);
+                // Geometry is shared with the source mesh. Materials are owned
+                // per bucket so sibling buckets cannot overwrite each other's
+                // assignments through a shared source material.
+                if (bucket.ownsMaterial) disposeSceneMaterial(bucket.mesh?.material);
+            }
+            maxInstanceBuckets.clear();
+            maxInstanceHandleToBucket.clear();
+            lastMaxInstanceBucketSignature = '';
+            // Restore visibility on nodes that were hidden by bucket merge
+            for (const [, mesh] of nodeMap) {
+                if (mesh && !mesh.visible && mesh.userData?.maxjsInstOf) {
+                    mesh.visible = true;
+                }
+            }
+        }
+
+        function getMaxInstanceBucketForHandle(handle) {
+            const bucketKey = maxInstanceHandleToBucket.get(handle);
+            return bucketKey ? maxInstanceBuckets.get(bucketKey) ?? null : null;
+        }
+
+        const maxInstanceMatrixScratch = new THREE.Matrix4();
+
+        function matrixArraysAlmostEqual(a, b, eps = 1.0e-7) {
+            if (!a || !b || a.length < 16 || b.length < 16) return false;
+            for (let i = 0; i < 16; i++) {
+                if (Math.abs((a[i] ?? 0) - (b[i] ?? 0)) > eps) return false;
+            }
+            return true;
+        }
+
+        function updateMaxInstanceBucketVisibility(bucket) {
+            if (!bucket?.mesh) return;
+            // Compact: rebuild instance matrices with only visible entries
+            let slot = 0;
+            for (const handle of bucket.handles) {
+                bucket.handleToIndex.set(handle, -1);
+                if (bucket.visible.get(handle) === false) continue;
+                const xf = bucket.transforms.get(handle);
+                if (xf) maxInstanceMatrixScratch.fromArray(xf);
+                else maxInstanceMatrixScratch.identity();
+                bucket.handleToIndex.set(handle, slot);
+                bucket.mesh.setMatrixAt(slot, maxInstanceMatrixScratch);
+                slot++;
+            }
+            bucket.mesh.count = slot;
+            bucket.mesh.visible = slot > 0;
+            bucket.mesh.instanceMatrix.needsUpdate = true;
+        }
+
+        function updateMaxInstanceBucketTransform(handle, matrixArray) {
+            const bucket = getMaxInstanceBucketForHandle(handle);
+            if (!bucket || !isFiniteArray(matrixArray, 16)) return false;
+            const idx = bucket.handleToIndex.get(handle);
+            if (idx == null) return false;
+            const previous = bucket.transforms.get(handle);
+            if (matrixArraysAlmostEqual(previous, matrixArray)) return false;
+            if (previous) {
+                for (let i = 0; i < 16; i++) previous[i] = matrixArray[i];
+            } else {
+                bucket.transforms.set(handle, Array.from(matrixArray));
+            }
+            if (bucket.visible.get(handle) === false || idx < 0) return false;
+            maxInstanceMatrixScratch.fromArray(matrixArray);
+            bucket.mesh.setMatrixAt(idx, maxInstanceMatrixScratch);
+            bucket.mesh.instanceMatrix.needsUpdate = true;
+            return true;
+        }
+
+        function updateMaxInstanceBucketNode(handle, nd) {
+            const bucket = getMaxInstanceBucketForHandle(handle);
+            if (!bucket) return false;
+            let changed = false;
+            if (nd.vis != null) {
+                const nextVisible = !!nd.vis;
+                if (bucket.visible.get(handle) !== nextVisible) {
+                    bucket.visible.set(handle, nextVisible);
+                    updateMaxInstanceBucketVisibility(bucket);
+                    changed = true;
+                }
+            }
+            if (isFiniteArray(nd.t, 16)) {
+                if (updateMaxInstanceBucketTransform(handle, nd.t)) changed = true;
+            }
+            if (nd.mat) {
+                const materialSignature = materialIdentityKey(nd.mat);
+                if (bucket.lastMaterialScalarSignature !== materialSignature) {
+                    applyMaterialScalar(bucket.mesh, nd.mat);
+                    bucket.lastMaterialScalarSignature = materialSignature;
+                    bucket.materialKey = materialSignature;
+                    changed = true;
+                }
+            }
+            return changed;
+        }
+
+        function createMaxInstanceBucketMaterial(group, sourceMesh) {
+            const materialPayload = group?.nodes?.[0] ?? null;
+            return createSceneRenderableMaterial(materialPayload, false, sourceMesh?.geometry ?? null, null);
+        }
+
+        function computeMaxInstanceBucketGroups(nodes) {
+            const groups = new Map();
+            if (!performanceSettings.optimizeMaxInstances) return groups;
+            for (const nd of nodes) {
+                if (!Number.isFinite(nd?.instOf) || nd.instOf <= 0) continue;
+                if (nd.jsmod || nd.spline || nd.skin || nd.groups || nd.mats) continue;
+                const sourceHandle = nd.instOf;
+                const materialKey = nd.mat ? materialIdentityKey(nd.mat) : '__default__';
+                const bucketKey = `${sourceHandle}|${materialKey}`;
+                if (!groups.has(bucketKey)) {
+                    groups.set(bucketKey, {
+                        key: bucketKey,
+                        sourceHandle,
+                        materialKey,
+                        nodes: [],
+                    });
+                }
+                groups.get(bucketKey).nodes.push(nd);
+            }
+            for (const [key, group] of [...groups.entries()]) {
+                if (group.nodes.length < Math.max(1, performanceSettings.maxInstanceBucketThreshold)) {
+                    groups.delete(key);
+                }
+            }
+            return groups;
+        }
+
+        function planMaxInstanceBuckets(snapshotNodes) {
+            const bucketGroups = computeMaxInstanceBucketGroups(snapshotNodes);
+            const nodeByHandle = new Map();
+            for (const nd of snapshotNodes) nodeByHandle.set(nd.h, nd);
+            let signature = '';
+            const bucketHandles = new Set();
+            if (bucketGroups.size > 0) {
+                const parts = [];
+                for (const group of bucketGroups.values()) {
+                    const handles = group.nodes.map((nd) => nd.h).sort((a, b) => a - b);
+                    for (const handle of handles) bucketHandles.add(handle);
+                    const sourceMaterialSig = sceneMaterialSignature(nodeByHandle.get(group.sourceHandle), false);
+                    parts.push(`${group.key}@${sourceMaterialSig}#${group.nodes.length}:${handles.join(',')}`);
+                }
+                parts.sort();
+                signature = parts.join('||');
+            }
+            return { groups: bucketGroups, signature, handles: bucketHandles };
+        }
+
+        function buildMaxInstanceBuckets(snapshotNodes, bucketPlan = null) {
+            const plan = bucketPlan ?? planMaxInstanceBuckets(snapshotNodes);
+            const bucketGroups = plan.groups;
+            const signature = plan.signature;
+
+            if (signature === lastMaxInstanceBucketSignature) {
+                // Composition unchanged — keep existing buckets, let per-handle
+                // transform / visibility / material updates flow through
+                // updateMaxInstanceBucketNode without reallocating meshes.
+                return false;
+            }
+
+            disposeMaxInstanceBuckets();
+            lastMaxInstanceBucketSignature = signature;
+            if (bucketGroups.size === 0) return true;
+
+            for (const group of bucketGroups.values()) {
+                const sourceMesh = nodeMap.get(group.sourceHandle);
+                if (!sourceMesh?.geometry || sourceMesh.isLine || sourceMesh.isLineSegments || sourceMesh.isSkinnedMesh) continue;
+                const bucketMaterial = createMaxInstanceBucketMaterial(group, sourceMesh);
+                const mesh = new THREE.InstancedMesh(sourceMesh.geometry, bucketMaterial, group.nodes.length);
+                mesh.matrixAutoUpdate = false;
+                mesh.frustumCulled = false;
+                mesh.castShadow = !!sourceMesh.castShadow;
+                mesh.receiveShadow = !!sourceMesh.receiveShadow;
+                mesh.name = `max_instances_${group.sourceHandle}_x${group.nodes.length}`;
+
+                const bucket = {
+                    mesh,
+                    materialKey: group.materialKey,
+                    sourceHandle: group.sourceHandle,
+                    handles: new Set(),
+                    handleToIndex: new Map(),
+                    transforms: new Map(),
+                    visible: new Map(),
+                    lastMaterialScalarSignature: group.nodes[0]?.mat ? materialIdentityKey(group.nodes[0].mat) : '',
+                    ownsMaterial: true,
+                };
+
+                group.nodes.forEach((nd, index) => {
+                    bucket.handles.add(nd.h);
+                    bucket.handleToIndex.set(nd.h, index);
+                    bucket.transforms.set(nd.h, isFiniteArray(nd.t, 16) ? Array.from(nd.t) : null);
+                    bucket.visible.set(nd.h, nd.vis == null ? true : !!nd.vis);
+                    const matrix = new THREE.Matrix4();
+                    if (isFiniteArray(nd.t, 16)) matrix.fromArray(nd.t);
+                    else matrix.identity();
+                    mesh.setMatrixAt(index, matrix);
+                    maxInstanceHandleToBucket.set(nd.h, group.key);
+                    const original = nodeMap.get(nd.h);
+                    if (original && original !== sourceMesh) original.visible = false;
+                });
+
+                updateMaxInstanceBucketVisibility(bucket);
+                maxRoot.add(mesh);
+                maxInstanceBuckets.set(group.key, bucket);
+            }
+            return true;
+        }
+
+        function profileSceneNodes(nodes) {
+            if (!debugMode || buildMode === 'release' || !isSceneProfilingEnabled()) return;
+            const stats = [];
+            for (const nd of nodes) {
+                const mesh = nodeMap.get(nd.h);
+                if (!mesh) continue;
+                const verts = nd.geo?.vN || nd.v?.length || 0;
+                const matCount = Array.isArray(mesh.material) ? mesh.material.length : 1;
+                const geom = mesh.geometry;
+                const triCount = geom?.index
+                    ? Math.floor(geom.index.count / 3)
+                    : Math.floor((geom?.attributes?.position?.count || 0) / 3);
+                stats.push({
+                    name: nd.n || `h:${nd.h}`,
+                    handle: nd.h,
+                    verts: Math.floor(verts / 3),
+                    tris: triCount,
+                    materials: matCount,
+                    instOf: nd.instOf || 0,
+                    skinned: !!nd.skin,
+                    spline: !!nd.spline,
+                });
+            }
+            if (stats.length === 0) return;
+            stats.sort((a, b) => b.tris - a.tris);
+            const top = stats.slice(0, 10);
+            console.groupCollapsed(`[max.js Profile] ${stats.length} nodes, top 10 by tri count`);
+            console.table(top);
+            const totalTris = stats.reduce((s, n) => s + n.tris, 0);
+            const totalVerts = stats.reduce((s, n) => s + n.verts, 0);
+            console.log(`Total: ${totalVerts} verts, ${totalTris} tris, ${stats.length} nodes`);
+            console.log('[max.js Profile] material registry', {
+                uniqueMaterials: materialRegistryStats.uniqueMaterials,
+                materialTemplates: materialRegistryStats.materialTemplates,
+                materialRefs: materialRegistryStats.materialRefs,
+                bucketedRefs: materialRegistryStats.bucketedRefs,
+                instanceBuckets: materialRegistryStats.instanceBuckets,
+                maxRefsPerMaterial: materialRegistryStats.maxRefsPerMaterial,
+            });
+            console.groupEnd();
+        }
+
+        function findSnapshotSkySunDirection(lightsData) {
+            const directional = (Array.isArray(lightsData) ? lightsData : [])
+                .filter(light => light?.type === 0 && light.v !== false && light.v !== 0 && Array.isArray(light.dir));
+            if (!directional.length) return null;
+            const named = directional.find((light) => {
+                const name = String(light.name || '').toLowerCase();
+                return /\b(sun|sunlight|solar|daylight)\b/.test(name)
+                    || name.includes('sun')
+                    || name.includes('solar')
+                    || name.includes('daylight');
+            });
+            const light = named || (directional.length === 1 ? directional[0] : null);
+            if (!light) return null;
+            const dir = light.dir;
+            const world = copyMaxComponentsToWorld(
+                new THREE.Vector3(),
+                -Number(dir[0]),
+                -Number(dir[1]),
+                -Number(dir[2]),
+            );
+            return world.lengthSq() > 1.0e-8 ? world.normalize().toArray() : null;
+        }
+
+        function withSnapshotLinkedSkySun(env, lightsData) {
+            if (!env?.sky) return env;
+            const sunDirectionWorld = findSnapshotSkySunDirection(lightsData);
+            if (!sunDirectionWorld) return env;
+            return {
+                ...env,
+                sky: {
+                    ...env.sky,
+                    sunDirectionWorld,
+                    sunLinkedLight: true,
+                },
+            };
+        }
+
+        function finalizeSceneSnapshot(snapshot, transport, applyStart, producerBytes, options = {}) {
+            resolveSnapshotMaterialRefs(snapshot);
+            if (snapshot.camera) applyCamera(snapshot.camera);
+            const snapshotEnv = withSnapshotLinkedSkySun(snapshot.env, snapshot.lights);
+            if (snapshotEnv?.sky) {
+                applySky(snapshotEnv.sky);
+            } else if (snapshotEnv?.hdri) {
+                removeSky();
+                loadHDRI(snapshotEnv);
+            } else if (snapshotEnv?.enabled === false || snapshotEnv?.type === 'none') {
+                removeAuthoredEnvironment();
+            }
+            if (snapshot.fog) maxjsFx.setFogFromScene(snapshot.fog);
+            const lightsChanged = snapshot.lights ? applyLights(snapshot.lights) : false;
+            if (snapshot.sceneCameras) updateSceneCameraList(snapshot.sceneCameras, snapshot.lockedCamera);
+            reconcileSplats(snapshot.splats ?? []);
+            audioSystem?.applyAudios(snapshot.audios ?? []);
+            gltfSystem?.applyGLTFs(snapshot.gltfs ?? []);
+            webappSystem?.applyWebApps(snapshot.webapps ?? []);
+            applyHairInstances(snapshot.hairInstances ?? []);
+            applyForestInstances(snapshot.forestInstances ?? [], options.binaryBuffer ?? null);
+            applyVolumes(snapshot.volumes ?? []);
+            const bucketPlan = options.bucketPlan ?? planMaxInstanceBuckets(snapshot.nodes);
+            refreshMaterialRegistry(snapshot.nodes, bucketPlan);
+            const bucketChanged = buildMaxInstanceBuckets(snapshot.nodes, bucketPlan);
+            profileSceneNodes(snapshot.nodes);
+            scene.updateMatrixWorld(options.forceWorldUpdate === true);
+            const sceneChanged = !!(options.sceneChanged || bucketChanged);
+            if (sceneChanged) {
+                lightLinking.refreshSceneBindings?.();
+                markLightProbeSceneDirty();
+            } else if (lightsChanged) {
+                markLightProbeLightsDirty();
+                maxjsFx.markOutputChanged?.();
+            }
+            if (sceneChanged || lightsChanged) {
+                scheduleLightProbeFromCurrentScene();
+            }
+            if (pathTracingFx.isEnabled?.()) {
+                resetPathTracingStartupWarmup();
+                markPathTracingSceneDirtyNow();
+            }
+            // Full snapshot can add/remove many meshes — cheap scene refresh.
+            // Effect toggles, env, and renderer size have their own dedicated
+            // entry points, so a full pipeline rebuild is unnecessary here.
+            if (sceneChanged) maxjsFx.markSceneChanged?.();
+            options.afterWorldUpdate?.();
+            syncHaloProbeVolumes();
+
+            if (firstSync && snapshot.nodes.length > 0) {
+                firstSync = false;
+                if (!camLock) fitCamera();
+            }
+            const applyMs = performance.now() - applyStart;
+            markInitialSync();
+            updateSyncHud({
+                transport,
+                frameId: snapshot.frame ?? 0,
+                producerBytes,
+                decodeMs: 0,
+                applyMs,
+            });
+        }
+
+        // ── Scene Sync ──────────────────────────────────────
+        bridge.on('scene', msg => {
+            resolveSnapshotMaterialRefs(msg);
+            setTransportMode('json');
+            const applyStart = performance.now();
+            const incoming = new Set(msg.nodes.map(n => n.h));
+            const bucketPlan = planMaxInstanceBuckets(msg.nodes);
+            const stableBucketHandles = bucketPlan.signature === lastMaxInstanceBucketSignature
+                ? bucketPlan.handles
+                : null;
+            let sceneChanged = false;
+            let transformsChanged = false;
+
+            for (const [handle, mesh] of nodeMap) {
+                if (!incoming.has(handle)) {
+                    removeMaxNodeObject(mesh);
+                    mesh.geometry?.dispose?.();
+                    disposeSceneMaterial(mesh.material);
+                    nodeMap.delete(handle);
+                    sceneChanged = true;
+                }
+            }
+
+            for (const nd of msg.nodes) {
+                let mesh = nodeMap.get(nd.h);
+                if (nd.helper === true) {
+                    ensureTransformOnlyNode(nd, mesh);
+                    transformsChanged = true;
+                    continue;
+                }
+
+                if (stableBucketHandles?.has(nd.h) && getMaxInstanceBucketForHandle(nd.h)) {
+                    if (updateMaxInstanceBucketNode(nd.h, nd)) transformsChanged = true;
+                    if (mesh) {
+                        applyJsmodSyncState(mesh, !!nd.jsmod);
+                        applyUserPropsSyncState(mesh, nd.userProps);
+                        applyInstanceSyncState(mesh, nd.instOf);
+                        if (nd.s != null) applySelection(mesh, nd.s);
+                    }
+                    continue;
+                }
+
+                const jsmodFlag = !!nd.jsmod;
+                // jsmod flag: layers own vertices — skip geo rebuild for existing meshes
+                const jsmodSkipGeo = jsmodFlag && mesh;
+                const instSrcMesh = nd.instOf ? nodeMap.get(nd.instOf) : null;
+
+                // Geometry: only rebuild if vertex data is present (skip for cached nodes)
+                let geom = mesh?.geometry;
+                if (nd.instOf && !nd.v) {
+                    const srcGeom = instSrcMesh?.geometry;
+                    if (srcGeom) geom = resolveInstancedNodeGeometry(nd, srcGeom, { cloneForJsmod: jsmodFlag });
+                } else if (nd.v && nd.i && !jsmodSkipGeo) {
+                    geom = buildGeometry(nd.v, nd.i, nd.uv, nd.norm, {
+                        isLine: !!nd.spline,
+                        vertexColors: nd.vc,
+                        uv2s: nd.uv2,
+                    });
+                    applyGeometryGroups(geom, nd.groups);
+                } else if (geom && nd.groups) {
+                    // Never rewrites groups on a geometry other meshes share.
+                    geom = syncGeometryGroupsForNode(mesh, geom, nd.groups);
+                }
+
+                const wantsLine = !!nd.spline;
+                const hasLineRenderable = !!(mesh?.isLine || mesh?.isLineSegments);
+                const renderableTypeMismatch = !!mesh && wantsLine !== hasLineRenderable;
+                if (renderableTypeMismatch) {
+                    removeMaxNodeObject(mesh);
+                    mesh.geometry?.dispose?.();
+                    disposeSceneMaterial(mesh.material);
+                    nodeMap.delete(nd.h);
+                    mesh = null;
+                    sceneChanged = true;
+                }
+
+                if (mesh) {
+                    if (!jsmodSkipGeo && geom && geom !== mesh.geometry) {
+                        // Old geometry may be shared with instance siblings —
+                        // only dispose it once no other mesh references it.
+                        if (!isGeometrySharedByAnotherMesh(mesh.geometry, mesh)) {
+                            mesh.geometry.dispose();
+                        }
+                        mesh.geometry = geom;
+                    }
+                    if (ensureSceneRenderableMaterial(mesh, nd, wantsLine, { authoritativeMaterial: true })) {
+                        sceneChanged = true;
+                        layerManager.applyMaterialOverrides?.(nd.h, mesh);
+                    }
+                } else {
+                    if (!geom) continue;
+                    const material = createSceneRenderableMaterial(nd, wantsLine, geom);
+                    if (wantsLine) {
+                        mesh = new THREE.LineSegments(geom, material);
+                    } else {
+                        mesh = new THREE.Mesh(geom, material);
+                    }
+                    mesh.matrixAutoUpdate = false;
+                    mesh.name = nd.n;
+                    mesh.frustumCulled = false;
+                    mesh.userData.maxjsHandle = nd.h;
+                    stampSceneMaterial(mesh, nd, wantsLine);
+                    syncNodeParent(mesh, nd);
+                    nodeMap.set(nd.h, mesh);
+                    sceneChanged = true;
+                    layerManager.applyMaterialOverrides?.(nd.h, mesh);
+                }
+
+                syncNodeParent(mesh, nd);
+                if (finalizeSceneNode(mesh, nd)) transformsChanged = true;
+            }
+
+            if (transformsChanged || sceneChanged) layerManager.markRuntimeTransformsDirty?.();
+            finalizeSceneSnapshot(msg, 'json', applyStart, msg.stats?.producerBytes ?? 0, {
+                bucketPlan,
+                sceneChanged,
+            });
+        });
+
+        // ── Camera-only sync (30fps) ─────────────────────────
+        bridge.on('cam', msg => {
+            if (msg.camera) applyCamera(msg.camera);
+            if (msg.frame || msg.stats) {
+                updateSyncHud({
+                    transport: 'json',
+                    frameId: msg.frame ?? 0,
+                    producerBytes: msg.stats?.producerBytes ?? 0,
+                    decodeMs: 0,
+                    applyMs: 0,
+                });
+            }
+        });
+
+        // ── Environment/Fog live update (standalone, change-only) ──
+        // ── HALO-GI Probe Grid: size + manual divisions per node handle ──
+        bridge.on('probeGrids', msg => {
+            probeGridData.clear();
+            if (Array.isArray(msg.grids)) {
+                for (const g of msg.grids) {
+                    if (!g || !Number.isFinite(g.h)) continue;
+                    probeGridData.set(g.h, {
+                        size: Array.isArray(g.size) ? g.size : null,  // [l,w,h] world units
+                        div: Array.isArray(g.div) ? g.div : null,     // [x,y,z] manual divisions
+                        enabled: g.enabled !== 0,
+                    });
+                }
+            }
+            // Auto-enable HALO-GI the first time an enabled grid appears so adding a
+            // probe grid "just works" (and survives viewer reloads).
+            if (!probeGridAutoEnabled && window.maxjsHaloGI && window.maxjsHaloGI.isOn?.() !== true) {
+                for (const d of probeGridData.values()) {
+                    if (d.enabled && Array.isArray(d.size)) { probeGridAutoEnabled = true; try { window.maxjsHaloGI.enable(); } catch (e) {} break; }
+                }
+            }
+            syncHaloProbeVolumes();
+        });
+
+        // Fit the HALO-GI probe volume(s) to the synced probe-grid helper(s): each box's
+        // world AABB (from the helper node's transform x its size) + manual divisions.
+        // No enabled grids -> whole-scene auto-fit. Change-gated.
+        const _pgBox = new THREE.Box3();
+        const _pgVec = new THREE.Vector3();
+        function buildHaloProbeVolumes() {
+            const volumes = [];
+            for (const [h, data] of probeGridData) {
+                if (!data || data.enabled === false || !Array.isArray(data.size)) continue;
+                const obj = nodeMap.get(h);
+                if (!obj) continue;
+                obj.updateWorldMatrix(true, false);
+                const size = data.size;
+                const hx = size[0] * 0.5, hy = size[1] * 0.5, hz = size[2] * 0.5;
+                const box = new THREE.Box3();
+                for (let cx = -1; cx <= 1; cx += 2) for (let cy = -1; cy <= 1; cy += 2) for (let cz = -1; cz <= 1; cz += 2) {
+                    _pgVec.set(cx * hx, cy * hy, cz * hz).applyMatrix4(obj.matrixWorld);
+                    box.expandByPoint(_pgVec);
+                }
+                const div = data.div;
+                const res = (Array.isArray(div) && div.length === 3) ? { x: div[0], y: div[1], z: div[2] } : null;
+                volumes.push(res ? { box, res } : box);
+            }
+            return volumes;
+        }
+        function serializeHaloGiProbeVolumes() {
+            return buildHaloProbeVolumes().map((entry) => {
+                const box = entry.isBox3 ? entry : entry.box;
+                const res = entry.isBox3 ? null : entry.res;
+                if (!box || !box.isBox3 || box.isEmpty()) return null;
+                const out = {
+                    min: [box.min.x, box.min.y, box.min.z],
+                    max: [box.max.x, box.max.y, box.max.z],
+                };
+                if (res) out.res = [res.x, res.y, res.z];
+                return out;
+            }).filter(Boolean);
+        }
+        function syncHaloProbeVolumes() {
+            const gi = window.maxjsHaloGI;
+            if (!gi || typeof gi.setVolumes !== 'function') return;
+            const volumes = buildHaloProbeVolumes();
+            let sig = '';
+            for (const entry of volumes) {
+                const box = entry.isBox3 ? entry : entry.box;
+                const res = entry.isBox3 ? null : entry.res;
+                if (!box || box.isEmpty()) continue;
+                const size = _pgVec.subVectors(box.max, box.min);
+                sig += `${box.min.x.toFixed(3)},${box.min.y.toFixed(3)},${box.min.z.toFixed(3)}|`
+                    + `${size.x.toFixed(3)},${size.y.toFixed(3)},${size.z.toFixed(3)}|`
+                    + `${res ? `${res.x},${res.y},${res.z}` : 'a'};`;
+            }
+            if (sig === probeVolumeSig) return;
+            probeVolumeSig = sig;
+            if (volumes.length === 0) gi.setBounds?.(null); // no grids -> whole-scene auto-fit
+            else gi.setVolumes(volumes);
+        }
+
+        // ── Diagnostics: draw the HALO-GI probe field as a grid of small spheres. ──
+        let probeHelperMesh = null;
+        let probeHelpersVisible = false;
+        let probeHelperSig = '';
+        const _probeHelperMat = new THREE.Matrix4();
+        function disposeProbeHelpers() {
+            if (probeHelperMesh) {
+                probeHelperMesh.parent?.remove(probeHelperMesh);
+                probeHelperMesh.geometry?.dispose?.();
+                probeHelperMesh.material?.dispose?.();
+                probeHelperMesh = null;
+            }
+            probeHelperSig = '';
+        }
+        function updateProbeHelpers() {
+            if (!probeHelpersVisible) return;
+            const gi = window.maxjsHaloGI;
+            const field = gi?.field;
+            if (!field || typeof field.getResolution !== 'function' || gi.hasData?.() === false) {
+                if (probeHelperMesh) probeHelperMesh.visible = false;
+                return;
+            }
+            const res = field.getResolution();
+            const bounds = field.getBounds?.();
+            if (!res || !bounds) { if (probeHelperMesh) probeHelperMesh.visible = false; return; }
+            const rx = Math.max(1, Math.round(res.x)), ry = Math.max(1, Math.round(res.y)), rz = Math.max(1, Math.round(res.z));
+            const total = rx * ry * rz;
+            const min = bounds.min;
+            const size = _pgVec.subVectors(bounds.max, bounds.min);
+            const sx = size.x, sy = size.y, sz = size.z;
+            const sig = `${rx},${ry},${rz}|${min.x.toFixed(2)},${min.y.toFixed(2)},${min.z.toFixed(2)}|${sx.toFixed(2)},${sy.toFixed(2)},${sz.toFixed(2)}`;
+            if (sig === probeHelperSig && probeHelperMesh) { probeHelperMesh.visible = true; return; }
+            probeHelperSig = sig;
+            if (!probeHelperMesh || probeHelperMesh.count !== total) {
+                disposeProbeHelpers();
+                probeHelperSig = sig;
+                const r = Math.max(sx / Math.max(1, rx - 1), sy / Math.max(1, ry - 1), sz / Math.max(1, rz - 1)) * 0.08 + 1e-3;
+                const geo = new THREE.SphereGeometry(r, 8, 6);
+                const mat = new THREE.MeshBasicMaterial({ color: 0x33ddff, depthWrite: false, transparent: true, opacity: 0.85, toneMapped: false });
+                probeHelperMesh = new THREE.InstancedMesh(geo, mat, total);
+                probeHelperMesh.frustumCulled = false;
+                probeHelperMesh.renderOrder = 9999;
+                probeHelperMesh.userData.maxjsExcludeFromRuntimeSnapshot = true;
+                scene.add(probeHelperMesh);
+            }
+            let idx = 0;
+            for (let k = 0; k < rz; k++) for (let j = 0; j < ry; j++) for (let i = 0; i < rx; i++) {
+                const fx = rx > 1 ? i / (rx - 1) : 0, fy = ry > 1 ? j / (ry - 1) : 0, fz = rz > 1 ? k / (rz - 1) : 0;
+                _probeHelperMat.makeTranslation(min.x + fx * sx, min.y + fy * sy, min.z + fz * sz);
+                probeHelperMesh.setMatrixAt(idx++, _probeHelperMat);
+            }
+            probeHelperMesh.instanceMatrix.needsUpdate = true;
+            probeHelperMesh.visible = true;
+        }
+        function setProbeHelpersVisible(v) {
+            probeHelpersVisible = !!v;
+            haloGiSettings.showProbes = probeHelpersVisible;
+            if (!probeHelpersVisible) { if (probeHelperMesh) probeHelperMesh.visible = false; }
+            else updateProbeHelpers();
+            const cb = document.getElementById('fx-gi-show-probes');
+            if (cb && cb.checked !== probeHelpersVisible) cb.checked = probeHelpersVisible;
+            window.__maxjsSyncGiPanel?.();
+        }
+        window.maxjsHaloGIShowProbes = setProbeHelpersVisible;
+
+        bridge.on('env_update', msg => {
+            let pathTraceSceneChanged = false;
+            if (msg.env) {
+                if (msg.env.sky) {
+                    applySky(msg.env.sky);
+                    markLightProbeSceneDirty();
+                    scheduleLightProbeFromCurrentScene();
+                    pathTraceSceneChanged = true;
+                } else if (msg.env.hdri) {
+                    removeSky();
+                    loadHDRI(msg.env);
+                    pathTraceSceneChanged = true;
+                } else if (msg.env.enabled === false || msg.env.type === 'none') {
+                    removeAuthoredEnvironment();
+                    pathTraceSceneChanged = true;
+                }
+                maxjsFx.markEnvironmentChanged?.();
+            }
+            if (msg.fog) {
+                maxjsFx.setFogFromScene(msg.fog);
+                pathTraceSceneChanged = true;
+            }
+            if (pathTraceSceneChanged) schedulePathTracingLiveRebuild();
+        });
+
+        bridge.on('geo_fast', msg => {
+            const mesh = nodeMap.get(msg.h);
+            if (!mesh) return;
+            if (msg.jsmod != null) applyJsmodSyncState(mesh, msg.jsmod === true);
+            if (mesh.userData.jsmod) return;  // layers own vertices
+            const wantsLine = !!msg.spline;
+            const hasLine = !!(mesh.isLine || mesh.isLineSegments);
+            const oldGroups = cloneGeometryGroups(mesh.geometry);
+
+            // Type changed (spline ↔ mesh) — need full rebuild, can't just swap geometry
+            if (wantsLine !== hasLine) {
+                const oldMaterial = mesh.material;
+                const previousPayload = mesh.userData?.maxjsLastNodePayload || {};
+                const previousName = mesh.name;
+                const previousMatrix = mesh.matrix?.clone?.();
+                const previousMatrixWorld = mesh.matrixWorld?.clone?.();
+                removeMaxNodeObject(mesh);
+                mesh.geometry?.dispose?.();
+                const geom = buildGeometry(msg.v, msg.i, msg.uv, msg.norm, {
+                    isLine: wantsLine,
+                    vertexColors: msg.vc,
+                });
+                if (!applyGeometryGroups(geom, msg.groups) && oldGroups.length) {
+                    applyGeometryGroups(geom, oldGroups);
+                }
+                let newMesh;
+                let material = null;
+                let materialPayload = null;
+                if (Array.isArray(msg.groups) && Array.isArray(msg.mats)) {
+                    materialPayload = {
+                        ...previousPayload,
+                        h: msg.h,
+                        n: previousName,
+                        t: previousMatrix?.elements,
+                        groups: msg.groups,
+                        mats: msg.mats,
+                    };
+                    delete materialPayload.mat;
+                    delete materialPayload.matRef;
+                    delete materialPayload.matRefs;
+                    material = createSceneRenderableMaterial(materialPayload, wantsLine, geom, mesh);
+                }
+                if (wantsLine) {
+                    newMesh = new THREE.LineSegments(geom, material || new THREE.LineBasicMaterial({ color: 0xffffff }));
+                } else {
+                    newMesh = new THREE.Mesh(geom, material || new THREE.MeshStandardMaterial());
+                }
+                newMesh.matrixAutoUpdate = false;
+                newMesh.name = previousName;
+                newMesh.frustumCulled = false;
+                newMesh.userData.maxjsHandle = msg.h;
+                newMesh.userData.maxjsLastNodePayload = previousPayload;
+                if (previousMatrix) newMesh.matrix.copy(previousMatrix);
+                if (previousMatrixWorld) newMesh.matrixWorld.copy(previousMatrixWorld);
+                maxRoot.add(newMesh);
+                nodeMap.set(msg.h, newMesh);
+                if (materialPayload) stampSceneMaterial(newMesh, materialPayload, wantsLine);
+                disposeSceneMaterial(oldMaterial);
+                // Renderable-type swap (mesh ↔ line) — scene structure changed,
+                // refresh the post-pass hide list / toon cache. Cheap.
+                maxjsFx.markSceneChanged?.();
+                markLightProbeSceneDirty();
+                scheduleLightProbeFromCurrentScene();
+                schedulePathTracingLiveRebuild();
+                return;
+            }
+
+            const oldUv = mesh.geometry?.getAttribute?.('uv');
+            const oldNormal = mesh.geometry?.getAttribute?.('normal');
+            const oldBoundingBox = mesh.geometry?.boundingBox?.clone?.();
+            const oldBoundingSphere = mesh.geometry?.boundingSphere?.clone?.();
+            const geom = buildGeometry(msg.v, msg.i, msg.uv, msg.norm, {
+                isLine: wantsLine,
+                vertexColors: msg.vc,
+                skipNormalCompute: !!msg.compactChannels,
+                skipBoundsCompute: !!msg.compactChannels,
+            });
+            if (!applyGeometryGroups(geom, msg.groups) && oldGroups.length) {
+                applyGeometryGroups(geom, oldGroups);
+            }
+            if (msg.compactChannels) {
+                const vertCount = Math.floor((msg.v?.length || 0) / 3);
+                if (!msg.uv && oldUv && oldUv.count === vertCount) {
+                    geom.setAttribute('uv', oldUv.clone());
+                }
+                if (!msg.norm && oldNormal && oldNormal.count === vertCount) {
+                    geom.setAttribute('normal', oldNormal.clone());
+                }
+                if (oldBoundingBox) geom.boundingBox = oldBoundingBox;
+                if (oldBoundingSphere) geom.boundingSphere = oldBoundingSphere;
+            }
+            mesh.geometry.dispose();
+            mesh.geometry = geom;
+            applyFastMaterialPayload(mesh, msg, wantsLine);
+            // Vertex / topology data on the same Object3D — no scene-structure
+            // refresh, no pipeline rebuild. pass(scene, camera) picks up the new
+            // BufferGeometry attributes on the next frame automatically.
+            maxjsFx.markGeometryDataDirty?.();
+            markLightProbeSceneDirty();
+            scheduleLightProbeFromCurrentScene({ delay: 350 });
+            schedulePathTracingLiveRebuild();
+        });
+
+        // ── Hair Fast Sync — re-extracted world-space instances ──
+        bridge.on('hair_fast', msg => {
+            if (!Array.isArray(msg.groups)) return;
+            let pathTraceSceneChanged = false;
+            const m = new THREE.Matrix4();
+            const c = new THREE.Color();
+            for (const grp of msg.groups) {
+                const count = grp.count || Math.floor((grp.xforms?.length || 0) / 16);
+                if (!count || !Array.isArray(grp.xforms) || grp.xforms.length < count * 16) continue;
+                const entry = hairMeshes.get(grp.h);
+                if (!entry?.mesh || entry.mesh.count !== count) {
+                    // No entry yet, or strand count changed — rebuild just this
+                    // handle. Never touch other hair groups (msg.groups is only
+                    // the dirty subset from SendHairFastUpdate).
+                    disposeHairEntry(grp.h);
+                    buildHairEntry(grp);
+                    pathTraceSceneChanged = true;
+                    continue;
+                }
+                const instMesh = entry.mesh;
+                for (let i = 0; i < count; i++) {
+                    m.fromArray(grp.xforms, i * 16);
+                    instMesh.setMatrixAt(i, m);
+                    if (grp.colors) {
+                        c.setRGB(
+                            grp.colors[i * 3] ?? 1,
+                            grp.colors[i * 3 + 1] ?? 1,
+                            grp.colors[i * 3 + 2] ?? 1
+                        );
+                        instMesh.setColorAt(i, c);
+                    }
+                }
+                instMesh.instanceMatrix.needsUpdate = true;
+                if (instMesh.instanceColor) instMesh.instanceColor.needsUpdate = true;
+                if (grp.vis != null) entry.root.visible = !!grp.vis;
+                pathTraceSceneChanged = true;
+            }
+            if (pathTraceSceneChanged) schedulePathTracingLiveRebuild();
+        });
+
+        // ── Transform Sync (+ material scalars, ~6fps) ──────
+        bridge.on('xform', msg => {
+            const applyStart = performance.now();
+            let visibilityChanged = false;
+            let giSurfaceChanged = false;
+            let pathTraceSceneChanged = false;
+            for (const nd of msg.nodes) {
+                const mesh = nodeMap.get(nd.h);
+                if (nd.vis != null) visibilityChanged = true;
+                if (mesh) {
+                    applyIncrementalNodeUpdate(mesh, nd);
+                    if (nd.t || nd.mat || nd.vis != null) {
+                        pathTraceSceneChanged = true;
+                        giSurfaceChanged = true;
+                    }
+                }
+                if (nd.t) {
+                    applyHairTransform(nd.h, nd.t);
+                    pathTraceSceneChanged = true;
+                }
+                if (nd.vis != null) {
+                    applyHairVisibility(nd.h, nd.vis);
+                    pathTraceSceneChanged = true;
+                }
+            }
+            if (msg.lights) {
+                applyLightUpdates(msg.lights);
+                pathTraceSceneChanged = true;
+            }
+            if (msg.splats) {
+                applySplatUpdates(msg.splats);
+                pathTraceSceneChanged = true;
+            }
+            if (msg.audios) audioSystem?.applyAudioUpdates(msg.audios);
+            if (msg.gltfs) {
+                gltfSystem?.applyGLTFUpdates(msg.gltfs);
+                pathTraceSceneChanged = true;
+            }
+            if (msg.camera) applyCamera(msg.camera);
+            if (visibilityChanged) {
+                // Visibility flip changes the post-pass hide list — cheap refresh.
+                maxjsFx.markSceneChanged?.();
+            }
+            if (giSurfaceChanged) {
+                markLightProbeSceneDirty();
+                scheduleLightProbeFromCurrentScene({ delay: 350 });
+            }
+            if (pathTraceSceneChanged) schedulePathTracingLiveRebuild();
+            const applyMs = performance.now() - applyStart;
+            updateSyncHud({
+                transport: 'json',
+                frameId: msg.frame ?? 0,
+                producerBytes: msg.stats?.producerBytes ?? 0,
+                decodeMs: 0,
+                applyMs,
+            });
+        });
+
+        // Audio param edits ride a standalone JSON message because the binary
+        // delta's UpdateAudio command only carries transform + visibility.
+        bridge.on('audio_update', msg => {
+            if (Array.isArray(msg?.audios)) audioSystem?.applyAudioUpdates(msg.audios);
+        });
+
+        // Same pattern for glTF param edits (file path, rootScale, autoplay, displayName).
+        // Binary UpdateGLTF carries transform + visibility only.
+        bridge.on('gltf_update', msg => {
+            if (Array.isArray(msg?.gltfs)) gltfSystem?.applyGLTFUpdates(msg.gltfs);
+        });
+
+        // WebApp Animator param channels (curve-driven) + page/size edits.
+        // Binary UpdateWebApp carries transform + visibility only.
+        bridge.on('webapp_update', msg => {
+            if (Array.isArray(msg?.webapps)) webappSystem?.applyWebAppUpdates(msg.webapps);
+        });
+
+        // ── Binary Scene Handler (SharedBuffer) ──────────────
+        function handleBinaryScene(buffer, meta) {
+            if (meta.type !== 'scene_bin') return;
+            resolveSnapshotMaterialRefs(meta);
+            setTransportMode('binary-scene');
+            const applyStart = performance.now();
+            const incoming = new Set(meta.nodes.map(n => n.h));
+            const bucketPlan = planMaxInstanceBuckets(meta.nodes);
+            const stableBucketHandles = bucketPlan.signature === lastMaxInstanceBucketSignature
+                ? bucketPlan.handles
+                : null;
+            let sceneChanged = false;
+            let transformsChanged = false;
+            const geometryRefCounts = buildNodeGeometryRefCounts();
+
+            // Remove deleted — collect first, then dispose non-shared geometries
+            const toRemove = [];
+            for (const [handle, mesh] of nodeMap) {
+                if (!incoming.has(handle)) toRemove.push(handle);
+            }
+            for (const handle of toRemove) {
+                const mesh = nodeMap.get(handle);
+                removeMaxNodeObject(mesh);
+                releaseGeometryRef(geometryRefCounts, mesh?.geometry);
+                disposeSceneMaterial(mesh?.material);
+                nodeMap.delete(handle);
+                sceneChanged = true;
+            }
+
+            // Geometry cache for instance sharing within this sync
+            const geoByHandle = new Map();
+
+            for (const nd of meta.nodes) {
+                let mesh = nodeMap.get(nd.h);
+                if (nd.helper === true) {
+                    ensureTransformOnlyNode(nd, mesh);
+                    transformsChanged = true;
+                    continue;
+                }
+
+                if (stableBucketHandles?.has(nd.h) && getMaxInstanceBucketForHandle(nd.h)) {
+                    if (updateMaxInstanceBucketNode(nd.h, nd)) transformsChanged = true;
+                    if (mesh) {
+                        applyJsmodSyncState(mesh, !!nd.jsmod);
+                        applyUserPropsSyncState(mesh, nd.userProps);
+                        applyInstanceSyncState(mesh, nd.instOf);
+                        if (nd.s != null) applySelection(mesh, nd.s);
+                    }
+                    continue;
+                }
+
+                const jsmodFlag = !!nd.jsmod;
+                const instSrcMesh = nd.instOf ? nodeMap.get(nd.instOf) : null;
+                const sharesInstGeom = !!(mesh && instSrcMesh && mesh.geometry === instSrcMesh.geometry);
+                // jsmod: skip host geo swap unless instanced mesh still shares master geometry (layers need a unique buffer)
+                const jsmodSkipGeo = jsmodFlag && mesh && !sharesInstGeom;
+
+                // Instance: share geometry from the source node (no new BufferGeometry)
+                let geom = mesh?.geometry;
+                if (nd.instOf && !nd.geo) {
+                    const srcGeom = geoByHandle.get(nd.instOf) || instSrcMesh?.geometry;
+                    if (srcGeom) geom = resolveInstancedNodeGeometry(nd, srcGeom, { cloneForJsmod: jsmodFlag });
+                } else if (nd.geo && !jsmodSkipGeo) {
+                    geom = geometryFromNodeBinary(nd, buffer);
+                    if (!geom) continue;
+                    setGeometryVertexColorAttributes(geom, nd.geo.vc, buffer);
+                    // Add material groups for Multi/Sub
+                    applyGeometryGroups(geom, nd.groups);
+                    attachSkinAttributes(geom, nd, buffer);
+                } else if (geom && nd.groups) {
+                    // Geometry unchanged, but keep groups/material indexing synced.
+                    // Never rewrites groups on a geometry other meshes share.
+                    geom = syncGeometryGroupsForNode(mesh, geom, nd.groups);
+                }
+
+                // Cache geometry for instance sharing (always, not just when new geo arrives)
+                if (geom) geoByHandle.set(nd.h, geom);
+
+                const wantsLine = !!nd.spline;
+                if (mesh && nd.skin && !mesh.isSkinnedMesh && !wantsLine) {
+                    removeMaxNodeObject(mesh);
+                    releaseGeometryRef(geometryRefCounts, mesh?.geometry);
+                    disposeSceneMaterial(mesh.material);
+                    nodeMap.delete(nd.h);
+                    mesh = null;
+                    sceneChanged = true;
+                }
+                const hasLineRenderable = !!(mesh?.isLine || mesh?.isLineSegments);
+                const renderableTypeMismatch = !!mesh && wantsLine !== hasLineRenderable;
+                if (renderableTypeMismatch) {
+                    removeMaxNodeObject(mesh);
+                    releaseGeometryRef(geometryRefCounts, mesh?.geometry);
+                    disposeSceneMaterial(mesh.material);
+                    nodeMap.delete(nd.h);
+                    mesh = null;
+                    sceneChanged = true;
+                }
+
+                if (mesh) {
+                    if (!jsmodSkipGeo && geom && geom !== mesh.geometry) {
+                        releaseGeometryRef(geometryRefCounts, mesh.geometry);
+                        retainGeometryRef(geometryRefCounts, geom);
+                        mesh.geometry = geom;
+                        if (nodePayloadHasHTMLAutoFit(nd)) {
+                            mesh.userData.maxjsMaterialSignature = null;
+                        }
+                    }
+                    if (ensureSceneRenderableMaterial(mesh, nd, wantsLine, { authoritativeMaterial: true })) {
+                        sceneChanged = true;
+                        layerManager.applyMaterialOverrides?.(nd.h, mesh);
+                    }
+                } else {
+                    if (!geom) continue;
+                    const material = createSceneRenderableMaterial(nd, wantsLine, geom);
+                    if (wantsLine) {
+                        mesh = new THREE.LineSegments(geom, material);
+                    } else if (nd.skin) {
+                        mesh = buildSkinnedMeshFromBinary({ nd, geom, material, buffer, nodeMap });
+                        if (!mesh) mesh = new THREE.Mesh(geom, material);
+                    } else {
+                        mesh = new THREE.Mesh(geom, material);
+                    }
+                    mesh.matrixAutoUpdate = false;
+                    mesh.name = nd.n;
+                    mesh.frustumCulled = false;
+                    mesh.userData.maxjsHandle = nd.h;
+                    stampSceneMaterial(mesh, nd, wantsLine);
+                    syncNodeParent(mesh, nd);
+                    nodeMap.set(nd.h, mesh);
+                    retainGeometryRef(geometryRefCounts, mesh.geometry);
+                    sceneChanged = true;
+                    layerManager.applyMaterialOverrides?.(nd.h, mesh);
+                }
+
+                syncNodeParent(mesh, nd);
+                if (finalizeSceneNode(mesh, nd)) transformsChanged = true;
+            }
+
+            if (transformsChanged || sceneChanged) layerManager.markRuntimeTransformsDirty?.();
+            finalizeSceneSnapshot(meta, 'binary-scene', applyStart, meta.stats?.producerBytes ?? buffer.byteLength, {
+                binaryBuffer: buffer,
+                bucketPlan,
+                sceneChanged,
+                afterWorldUpdate() {
+                    // Recalculate skeleton boneInverses for NEWLY created skinned meshes
+                    // (only needed once — after the mesh is in the scene hierarchy under maxBasisRoot).
+                    for (const mesh of nodeMap.values()) {
+                        if (mesh?.isSkinnedMesh && mesh.skeleton && !mesh.userData._skelBound) {
+                            mesh.skeleton.calculateInverses();
+                            mesh.bind(mesh.skeleton, mesh.matrixWorld);
+                            mesh.userData._skelBound = true;
+                        }
+                    }
+                    animationSystem?.invalidateTargets();
+                },
+            });
+        }
+
+        function handleBinaryDelta(buffer, meta) {
+            let runtimeTransformsChanged = false;
+            let giSurfaceChanged = false;
+            let pathTraceSceneChanged = false;
+            const result = applyDeltaFrame(buffer, {
+                onTransform(nodeHandle, matrix) {
+                    const mesh = nodeMap.get(nodeHandle);
+                    if (mesh) applyIncrementalNodeUpdate(mesh, { t: matrix }, nodeHandle);
+                    if (mesh) {
+                        runtimeTransformsChanged = true;
+                        giSurfaceChanged = true;
+                        pathTraceSceneChanged = true;
+                    }
+                    applyHairTransform(nodeHandle, matrix);
+                },
+                onMaterialScalar(nodeHandle, material) {
+                    const mesh = nodeMap.get(nodeHandle);
+                    if (mesh) {
+                        applyIncrementalNodeUpdate(mesh, { mat: material }, nodeHandle);
+                        giSurfaceChanged = true;
+                        pathTraceSceneChanged = true;
+                    }
+                },
+                onSelection(nodeHandle, selected) {
+                    const mesh = nodeMap.get(nodeHandle);
+                    if (mesh) applyIncrementalNodeUpdate(mesh, { s: selected }, nodeHandle);
+                },
+                onVisibility(nodeHandle, visible) {
+                    const mesh = nodeMap.get(nodeHandle);
+                    if (mesh) {
+                        applyIncrementalNodeUpdate(mesh, { vis: visible }, nodeHandle);
+                        giSurfaceChanged = true;
+                        pathTraceSceneChanged = true;
+                    }
+                    applyHairVisibility(nodeHandle, visible);
+                },
+                onCamera(cameraState) {
+                    applyCamera(cameraState);
+                },
+                onLight(handle, ld) {
+                    const light = lightHandleMap.get(handle);
+                    if (!light) return;
+                    const m = ld.matrix;
+                    // Reconstruct the JSON-style light data for applyLightData
+                    const pos = [m[12], m[13], m[14]];
+                    const len = Math.sqrt(m[4]*m[4] + m[5]*m[5] + m[6]*m[6]) || 1;
+                    const dir = [-m[4]/len, -m[5]/len, -m[6]/len];
+                    applyLightData(light, {
+                        h: handle, type: ld.type,
+                        v: ld.visible ? 1 : 0,
+                        pos, dir,
+                        color: ld.color, intensity: ld.intensity,
+                        distance: ld.distance, decay: ld.decay,
+                        angle: ld.angle, penumbra: ld.penumbra,
+                        width: ld.width, height: ld.height,
+                        groundColor: ld.groundColor,
+                        castShadow: ld.castShadow,
+                        shadowBias: ld.shadowBias, shadowRadius: ld.shadowRadius,
+                        shadowMapSize: ld.shadowMapSize,
+                        volContrib: ld.volContrib,
+                    });
+                    if (ld.type === 0) refreshSkyFromLinkedSun();
+                    markLightProbeLightsDirty();
+                    scheduleLightProbeFromCurrentScene({ delay: 350 });
+                    pathTraceSceneChanged = true;
+                },
+                onSplat(handle, matrix, visible) {
+                    const entry = splatHandleMap.get(handle);
+                    if (!entry?.mesh) return;
+                    applySplatTransform(entry.mesh, { t: matrix, v: visible ? 1 : 0 });
+                    pathTraceSceneChanged = true;
+                },
+                onAudio(handle, matrix, visible) {
+                    audioSystem?.applyAudioTransformBinary(handle, matrix, visible);
+                },
+                onGLTF(handle, matrix, visible) {
+                    gltfSystem?.applyGLTFTransformBinary(handle, matrix, visible);
+                    pathTraceSceneChanged = true;
+                },
+                onWebApp(handle, matrix, visible) {
+                    webappSystem?.applyWebAppTransformBinary(handle, matrix, visible);
+                },
+                onTime(td) {
+                    maxTimeline.onTime(td);
+                },
+            });
+            if (runtimeTransformsChanged) layerManager.markRuntimeTransformsDirty?.();
+            if (giSurfaceChanged) {
+                markLightProbeSceneDirty();
+                scheduleLightProbeFromCurrentScene({ delay: 350 });
+            }
+            if (pathTraceSceneChanged) schedulePathTracingLiveRebuild();
+            markInitialSync();
+            setTransportMode('binary-delta');
+            updateSyncHud({
+                transport: 'binary-delta',
+                frameId: meta.frame ?? result.frameId,
+                producerBytes: meta.stats?.producerBytes ?? result.bytes,
+                decodeMs: result.decodeMs,
+                applyMs: result.applyMs,
+            });
+        }
+
+        function normalizeVertexColorDescriptors(vertexColors) {
+            if (!Array.isArray(vertexColors)) return [];
+            return vertexColors.map((entry) => {
+                const channel = normalizeMaxVertexColorChannel(entry?.ch ?? entry?.channel ?? 0);
+                const name = (typeof entry?.name === 'string' && entry.name.length)
+                    ? entry.name
+                    : maxVertexColorAttributeName(channel);
+                const itemSize = Number.isInteger(entry?.itemSize) && entry.itemSize > 0
+                    ? entry.itemSize
+                    : 4;
+                let valueCount = 0;
+                if (Number.isInteger(entry?.n) && entry.n >= 0) valueCount = entry.n;
+                else if (Array.isArray(entry?.v) || ArrayBuffer.isView(entry?.v)) valueCount = entry.v.length;
+                const count = itemSize > 0 ? Math.floor(valueCount / itemSize) : 0;
+                return { ...entry, channel, name, itemSize, count, valueCount };
+            }).filter((entry) => entry.count > 0);
+        }
+
+        function setGeometryVertexColorAttributes(geometry, vertexColors, buffer = null) {
+            if (!geometry) return;
+            geometry.userData ??= {};
+            const descriptors = normalizeVertexColorDescriptors(vertexColors);
+            const previous = Array.isArray(geometry.userData.maxjsVertexColors)
+                ? geometry.userData.maxjsVertexColors
+                : [];
+            const keepNames = new Set(descriptors.map((entry) => entry.name));
+
+            // Only reap missing channels when the incoming payload actually has
+            // data. A transient empty VC update (partial tick, slow sync) would
+            // otherwise delete every attribute and re-add it next tick —
+            // deleteAttribute + setAttribute each invalidate the WebGPU vertex
+            // buffer layout and force every material sampling the attribute to
+            // rebuild its render pipeline. That pipeline churn is the root of
+            // the Inspector's "(not in use)" cascade across SSGI / Bloom / AO.
+            if (descriptors.length > 0) {
+                for (const entry of previous) {
+                    if (!keepNames.has(entry.name)) geometry.deleteAttribute(entry.name);
+                }
+            }
+
+            for (const entry of descriptors) {
+                const current = geometry.getAttribute(entry.name);
+                const fastPath = current
+                    && current.itemSize === entry.itemSize
+                    && current.count === entry.count
+                    && typedArrayCanStore(current.array, entry.n || 0);
+
+                if (fastPath) {
+                    // In-place update — zero allocation. Copy from the shared
+                    // binary buffer view directly into the existing typed array
+                    // rather than round-tripping through a standalone copy.
+                    if (buffer) {
+                        if (!binInRange(buffer, entry.off, entry.n || 0)) {
+                            console.warn('[max.js binary] Invalid vertex color range for', entry.name);
+                            continue;
+                        }
+                        current.array.set(new Float32Array(buffer, entry.off, entry.n));
+                        current.needsUpdate = true;
+                    } else if (Array.isArray(entry.v) || ArrayBuffer.isView(entry.v)) {
+                        current.array.set(entry.v);
+                        current.needsUpdate = true;
+                    }
+                    continue;
+                }
+
+                // Slow path: itemSize or count mismatch — must create a new
+                // BufferAttribute. Pipeline invalidation is unavoidable here,
+                // but it only fires on genuine topology changes (new channel,
+                // remesh, first-time attach).
+                let values = null;
+                if (buffer) {
+                    if (!binInRange(buffer, entry.off, entry.n || 0)) {
+                        console.warn('[max.js binary] Invalid vertex color range for', entry.name);
+                        continue;
+                    }
+                    // Standalone copy — the shared buffer may be released after
+                    // this handler returns.
+                    values = new Float32Array(new Float32Array(buffer, entry.off, entry.n));
+                } else if (Array.isArray(entry.v) || ArrayBuffer.isView(entry.v)) {
+                    values = new Float32Array(entry.v);
+                } else {
+                    continue;
+                }
+
+                geometry.setAttribute(entry.name, new THREE.BufferAttribute(values, entry.itemSize));
+            }
+
+            geometry.userData.maxjsVertexColors = descriptors.map(({ channel, name, itemSize, count }) => ({
+                channel, name, itemSize, count,
+            }));
+            geometry.userData.maxjsVertexColorChannels = geometry.userData.maxjsVertexColors.map(({ channel, name }) => ({
+                channel, name,
+            }));
+        }
+
+        // ── Geometry Builder ────────────────────────────────
+        function buildGeometry(vertices, indices, uvs, normals, options = {}) {
+            const isLine = !!options.isLine;
+            const geom = new THREE.BufferGeometry();
+            geom.setAttribute('position', new THREE.Float32BufferAttribute(vertices, 3));
+            if (indices?.length) geom.setIndex(new THREE.BufferAttribute(indices, 1));
+            if (uvs?.length) geom.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
+            if (options.uv2s?.length) {
+                const uv2Attr = new THREE.Float32BufferAttribute(options.uv2s, 2);
+                geom.setAttribute('uv1', uv2Attr);
+                geom.setAttribute('uv2', uv2Attr);
+            }
+            if (normals?.length) geom.setAttribute('normal', new THREE.Float32BufferAttribute(normals, 3));
+            else if (!isLine && !options.skipNormalCompute) geom.computeVertexNormals();
+            setGeometryVertexColorAttributes(geom, options.vertexColors);
+            if (!options.skipBoundsCompute) {
+                geom.computeBoundingBox();
+                geom.computeBoundingSphere();
+            }
+            return geom;
+        }
+
+        function isFiniteArray(values, expectedLength) {
+            const isArrayLike = Array.isArray(values) || ArrayBuffer.isView(values);
+            if (!isArrayLike || values.length !== expectedLength) return false;
+            for (let i = 0; i < values.length; i++) {
+                if (!Number.isFinite(values[i])) return false;
+            }
+            return true;
+        }
+
+        const maxNodeParentScratch = {
+            raw: new THREE.Matrix4(),
+            parentInRoot: new THREE.Matrix4(),
+            parentInv: new THREE.Matrix4(),
+            rootInv: new THREE.Matrix4(),
+        };
+
+        function removeMaxNodeObject(obj) {
+            if (!obj) return;
+            obj.parent?.remove(obj);
+        }
+
+        function getNodeParentObject(nd, obj = null) {
+            const parentHandle = Number(nd?.p);
+            const parent = Number.isFinite(parentHandle) && parentHandle > 0
+                ? nodeMap.get(parentHandle)
+                : null;
+            if (!parent || parent === obj) return maxRoot;
+            for (let cursor = parent; cursor; cursor = cursor.parent) {
+                if (cursor === obj) return maxRoot;
+            }
+            return parent;
+        }
+
+        function syncNodeParent(obj, nd) {
+            if (!obj) return maxRoot;
+            const parent = getNodeParentObject(nd, obj);
+            const parentHandle = parent === maxRoot ? 0 : (Number(nd?.p) || 0);
+            obj.userData ??= {};
+            obj.userData.maxjsParentHandle = parentHandle;
+            if (obj.parent !== parent) parent.add(obj);
+            return parent;
+        }
+
+        function ensureTransformOnlyNode(nd, existing = null) {
+            let obj = existing;
+            if (obj && obj.userData?.maxjsHelper !== true) {
+                removeMaxNodeObject(obj);
+                obj.geometry?.dispose?.();
+                disposeSceneMaterial(obj.material);
+                obj = null;
+            }
+            if (!obj) {
+                obj = new THREE.Object3D();
+                obj.matrixAutoUpdate = false;
+                obj.frustumCulled = false;
+            }
+            obj.name = nd.n ?? obj.name ?? '';
+            obj.userData ??= {};
+            obj.userData.maxjsHandle = nd.h;
+            obj.userData.maxjsHelper = true;
+            syncNodeParent(obj, nd);
+            finalizeSceneNode(obj, nd);
+            nodeMap.set(nd.h, obj);
+            return obj;
+        }
+
+        function applyTransform(mesh, t) {
+            if (!isFiniteArray(t, 16)) {
+                const alreadyIdentity = matrixArraysAlmostEqual(mesh.matrix.elements, [
+                    1, 0, 0, 0,
+                    0, 1, 0, 0,
+                    0, 0, 1, 0,
+                    0, 0, 0, 1,
+                ]);
+                if (alreadyIdentity) return false;
+                mesh.matrix.identity();
+                mesh.position.set(0, 0, 0);
+                mesh.quaternion.identity();
+                mesh.scale.set(1, 1, 1);
+                mesh.matrixWorldNeedsUpdate = true;
+                return true;
+            }
+            maxNodeParentScratch.raw.fromArray(t);
+            if (mesh.parent && mesh.parent !== maxRoot) {
+                maxRoot.updateMatrixWorld(true);
+                mesh.parent.updateMatrixWorld(true);
+                maxNodeParentScratch.rootInv.copy(maxRoot.matrixWorld).invert();
+                maxNodeParentScratch.parentInRoot
+                    .copy(maxNodeParentScratch.rootInv)
+                    .multiply(mesh.parent.matrixWorld);
+                maxNodeParentScratch.parentInv.copy(maxNodeParentScratch.parentInRoot).invert();
+                maxNodeParentScratch.raw.premultiply(maxNodeParentScratch.parentInv);
+            }
+            if (matrixArraysAlmostEqual(mesh.matrix.elements, maxNodeParentScratch.raw.elements)) {
+                return false;
+            }
+            mesh.matrix.copy(maxNodeParentScratch.raw);
+            mesh.matrixWorldNeedsUpdate = true;
+            return true;
+        }
+
+        function applySelection(mesh, selected) {
+            mesh.userData.maxjsSelected = !!selected;
+            // Toon outline is auto-detected from material type — no manual selection needed
+        }
+
+        function applyMaterialScalar(mesh, material, materialIndex = null) {
+            const rebuildForBlackSpecularRoute = () => {
+                if (!mesh || !material) return false;
+                if (materialIndex != null) {
+                    if (!Array.isArray(mesh.material)) return false;
+                    const oldMaterial = mesh.material[materialIndex] ?? null;
+                    if (!oldMaterial) return false;
+                    const wantsRoute = shouldRouteBlackSpecularToLambert(material.model || 'MeshStandardMaterial', material);
+                    const isRouted = !!oldMaterial.userData?.maxjsLambertFromBlackSpecular;
+                    if (wantsRoute === isRouted) return false;
+                    const nextMaterials = mesh.material.slice();
+                    nextMaterials[materialIndex] = createMaterial(material, {
+                        geometry: mesh.geometry,
+                        materialIndex,
+                        matrixArray: mesh.matrix?.elements,
+                    });
+                    mesh.material = nextMaterials;
+                    if (!isCachedMaterialTemplate(oldMaterial)) disposeSceneMaterial(oldMaterial);
+                    return true;
+                }
+                if (Array.isArray(mesh.material)) return false;
+                const oldMaterial = mesh.material;
+                const wantsRoute = shouldRouteBlackSpecularToLambert(material.model || 'MeshStandardMaterial', material);
+                const isRouted = !!oldMaterial?.userData?.maxjsLambertFromBlackSpecular;
+                if (wantsRoute === isRouted) return false;
+                mesh.material = createMaterial(material, {
+                    geometry: mesh.geometry,
+                    materialIndex: null,
+                    matrixArray: mesh.matrix?.elements,
+                });
+                if (!isCachedMaterialTemplate(oldMaterial)) disposeSceneMaterial(oldMaterial);
+                return true;
+            };
+            if (rebuildForBlackSpecularRoute()) {
+                if (mesh.userData) mesh.userData.maxjsMaterialSignature = null;
+                return;
+            }
+
+            const c = material?.color;
+            const emissive = material?.emissive;
+            const specularColor = material?.specularColor;
+            const sheenColor = material?.sheenColor;
+            const attenuationColor = material?.attenuationColor;
+            let mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+            if (materialIndex != null) {
+                const selected = Array.isArray(mesh.material)
+                    ? mesh.material[materialIndex] ?? null
+                    : (materialIndex === 0 ? mesh.material : null);
+                mats = selected ? [selected] : [];
+            }
+            for (const m of mats) {
+                if (!m) continue;
+                if (m.userData?.maxjsHTMLTextureOverride) continue;
+                let materialNeedsUpdate = false;
+                let nextTransparent = m.transparent;
+                if (c && m.color) m.color.setRGB(c[0], c[1], c[2]);
+                if (emissive && m.emissive) m.emissive.setRGB(emissive[0], emissive[1], emissive[2]);
+                if (specularColor && 'specularColor' in m && m.specularColor) {
+                    m.specularColor.setRGB(specularColor[0], specularColor[1], specularColor[2]);
+                }
+                if (sheenColor && 'sheenColor' in m && m.sheenColor) {
+                    m.sheenColor.setRGB(sheenColor[0], sheenColor[1], sheenColor[2]);
+                }
+                if (attenuationColor && 'attenuationColor' in m && m.attenuationColor) {
+                    m.attenuationColor.setRGB(attenuationColor[0], attenuationColor[1], attenuationColor[2]);
+                }
+                const roughness = material?.roughness ?? material?.rough;
+                const metalness = material?.metalness ?? material?.metal;
+                if (roughness != null && 'roughness' in m) {
+                    m.roughness = roughness;
+                    applySSSRoughnessInfluence(m, roughness);
+                }
+                if (metalness != null && 'metalness' in m) m.metalness = metalness;
+                if (material?.opacity != null) {
+                    m.opacity = material.opacity;
+                    nextTransparent = !!material.transparent || material.opacity < 0.999;
+                }
+                if (material?.transparent === true) nextTransparent = true;
+                if (material?.depthWrite != null && 'depthWrite' in m) m.depthWrite = !!material.depthWrite;
+                if (material?.depthTest != null && 'depthTest' in m) m.depthTest = !!material.depthTest;
+                if (Number.isFinite(material?.alphaTest) && 'alphaTest' in m) m.alphaTest = material.alphaTest;
+                if (material?.emissiveIntensity != null || material?.emI != null) {
+                    if ('emissiveIntensity' in m) m.emissiveIntensity = material?.emissiveIntensity ?? material?.emI;
+                }
+                if (material?.envMapIntensity != null || material?.envI != null) {
+                    if ('envMapIntensity' in m) m.envMapIntensity = material?.envMapIntensity ?? material?.envI;
+                }
+                if (material?.aoMapIntensity != null || material?.aoI != null) {
+                    if ('aoMapIntensity' in m) m.aoMapIntensity = material?.aoMapIntensity ?? material?.aoI;
+                }
+                if (material?.clearcoat != null && 'clearcoat' in m) m.clearcoat = material.clearcoat;
+                if (material?.clearcoatRoughness != null && 'clearcoatRoughness' in m) {
+                    m.clearcoatRoughness = material.clearcoatRoughness;
+                }
+                if (material?.sheen != null && 'sheen' in m) m.sheen = material.sheen;
+                if (material?.sheenRoughness != null && 'sheenRoughness' in m) {
+                    m.sheenRoughness = material.sheenRoughness;
+                }
+                if (material?.iridescence != null && 'iridescence' in m) {
+                    m.iridescence = material.iridescence;
+                }
+                if (material?.iridescenceIOR != null && 'iridescenceIOR' in m) {
+                    m.iridescenceIOR = material.iridescenceIOR;
+                }
+                if (material?.transmission != null && 'transmission' in m) {
+                    const hadTransmission = (m.transmission ?? 0) > 0;
+                    m.transmission = material.transmission;
+                    const hasTransmission = material.transmission > 0;
+                    if (hadTransmission !== hasTransmission) materialNeedsUpdate = true;
+                    if (hasTransmission) nextTransparent = true;
+                }
+                if (material?.thickness != null && 'thickness' in m) m.thickness = material.thickness;
+                if (material?.specularIntensity != null && 'specularIntensity' in m) {
+                    m.specularIntensity = material.specularIntensity;
+                    if (material.specularIntensity < 0.001) {
+                        m.envMapIntensity = 0;
+                    }
+                }
+                // IOR must be set AFTER specularIntensity — Three.js derives F0 from both
+                if (material?.ior != null && 'ior' in m) {
+                    m.ior = (material.specularIntensity != null && material.specularIntensity < 0.001) ? 1.0 : material.ior;
+                }
+                if (material?.reflectivity != null && 'reflectivity' in m) {
+                    m.reflectivity = material.reflectivity;
+                }
+                if (material?.dispersion != null && 'dispersion' in m) {
+                    m.dispersion = material.dispersion;
+                }
+                if (material?.attenuationDistance != null && 'attenuationDistance' in m) {
+                    m.attenuationDistance = material.attenuationDistance;
+                }
+                if (material?.anisotropy != null && 'anisotropy' in m) {
+                    m.anisotropy = material.anisotropy;
+                }
+                rememberMaterialEmissiveBase(m);
+                applyMaterialSelectionState(m, !!mesh.userData.maxjsSelected);
+                if (m.transparent !== nextTransparent) {
+                    m.transparent = nextTransparent;
+                    materialNeedsUpdate = true;
+                }
+                if (materialNeedsUpdate) m.needsUpdate = true;
+            }
+            // The in-place mutation desyncs the live material from the signature
+            // stamped at build time. Drop the stamp so the next full sync always
+            // rebuilds — a stale signature could match a reverted/reassigned
+            // material payload and leave the mutated look stuck until reload.
+            if (mesh.userData) mesh.userData.maxjsMaterialSignature = null;
+        }
+
+        // ── Lights Sync ──────────────────────────────────────
+        const lightGroup = new THREE.Group();
+        lightGroup.name = '__maxjs_lights';
+        maxRoot.add(lightGroup);
+        const LIGHT_TYPES = ['DirectionalLight', 'PointLight', 'SpotLight', 'RectAreaLight', 'HemisphereLight', 'AmbientLight'];
+        const lightHandleMap = new Map();
+        const lightHelperMap = new Map();
+        let lightHelpersVisible = false;
+        let lastLightsSignature = '';
+        const shadowBounds = new THREE.Box3();
+        const shadowCenter = new THREE.Vector3();
+        const shadowSize = new THREE.Vector3();
+        const shadowTarget = new THREE.Vector3();
+        const shadowOriginScale = new THREE.Vector3();
+        const shadowOriginDir = new THREE.Vector3();
+        const shadowOriginLightPos = new THREE.Vector3();
+        const lightLocalPos = new THREE.Vector3();
+        const lightWorldPos = new THREE.Vector3();
+        const lightTargetLocal = new THREE.Vector3();
+
+        function isShadowMapOriginObject(object) {
+            const name = String(object?.name || '');
+            return /^(?:maxjs[\s_-]*)?(?:(?:shadow[\s_-]*map|shadowmap|shadow)[\s_-]*)origin(?:$|[\s_.:-])/i.test(name);
+        }
+
+        function getShadowMapOriginRadiusFromName(name) {
+            const match = String(name || '').match(/(?:^|[\s_:-])(?:r|radius|size)?[\s_:=:-]*(\d+(?:\.\d+)?)(?:$|[\s_:-])/i);
+            if (!match) return 0;
+            const radius = Number(match[1]);
+            return Number.isFinite(radius) && radius > 0 ? radius : 0;
+        }
+
+        function configureShadowMapOriginObject(object) {
+            if (!object) return;
+            object.userData ??= {};
+            object.userData.maxjsShadowMapOrigin = true;
+            object.userData.maxjsVisible = false;
+            object.castShadow = false;
+            object.receiveShadow = false;
+            setObjectSelfVisibleLayer(object, false);
+        }
+
+        function findShadowMapOriginObject() {
+            for (const object of nodeMap.values()) {
+                if (!isShadowMapOriginObject(object)) continue;
+                configureShadowMapOriginObject(object);
+                return object;
+            }
+            return null;
+        }
+
+        function getShadowMapOriginFocus(object) {
+            if (!object) return null;
+            object.updateWorldMatrix(true, false);
+            const nameRadius = getShadowMapOriginRadiusFromName(object.name);
+            shadowBounds.makeEmpty();
+            if (object.isMesh || object.isLine || object.isLineSegments) {
+                shadowBounds.setFromObject(object);
+            }
+            object.getWorldPosition(shadowCenter);
+
+            let radius = nameRadius;
+            if (!radius && !shadowBounds.isEmpty()) {
+                shadowBounds.getCenter(shadowCenter);
+                shadowBounds.getSize(shadowSize);
+                radius = Math.max(shadowSize.x, shadowSize.y, shadowSize.z) * 0.5;
+            }
+            if (!radius) {
+                object.getWorldScale(shadowOriginScale);
+                radius = Math.max(shadowOriginScale.x, shadowOriginScale.y, shadowOriginScale.z, 50);
+            }
+
+            return {
+                center: shadowCenter,
+                radius: Math.max(radius, 1),
+                explicit: true,
+            };
+        }
+
+        function getShadowSceneFocus() {
+            const origin = findShadowMapOriginObject();
+            if (origin) return getShadowMapOriginFocus(origin);
+
+            shadowBounds.makeEmpty();
+            for (const [, mesh] of nodeMap) {
+                if (mesh?.userData?.maxjsShadowMapOrigin || isShadowMapOriginObject(mesh)) continue;
+                if (!mesh?.isMesh || !mesh.visible) continue;
+                shadowBounds.expandByObject(mesh);
+            }
+
+            if (shadowBounds.isEmpty()) {
+                shadowBounds.min.set(-100, -100, -100);
+                shadowBounds.max.set(100, 100, 100);
+            }
+
+            shadowBounds.getCenter(shadowCenter);
+            shadowBounds.getSize(shadowSize);
+            const radius = Math.max(shadowSize.x, shadowSize.y, shadowSize.z, 50);
+            return { center: shadowCenter, radius, explicit: false };
+        }
+
+        function setObjectWorldPosition(object, worldPosition) {
+            const parent = object?.parent;
+            if (!object || !worldPosition) return;
+            object.position.copy(worldPosition);
+            if (parent) {
+                parent.updateMatrixWorld(true);
+                parent.worldToLocal(object.position);
+            }
+            object.updateMatrixWorld(true);
+        }
+
+        function applyDirectionalShadowOrigin(light, focus) {
+            const target = light.userData?.maxjsTarget;
+            if (!focus?.explicit || !target) return;
+
+            light.getWorldPosition(lightWorldPos);
+            target.getWorldPosition(shadowTarget);
+            shadowOriginDir.subVectors(shadowTarget, lightWorldPos);
+            if (shadowOriginDir.lengthSq() < 1e-8) return;
+            shadowOriginDir.normalize();
+
+            const distance = Math.max(focus.radius * 4, lightWorldPos.distanceTo(shadowTarget), 200);
+            shadowOriginLightPos.copy(focus.center).addScaledVector(shadowOriginDir, -distance);
+            setObjectWorldPosition(light, shadowOriginLightPos);
+            setObjectWorldPosition(target, focus.center);
+            shadowTarget.copy(focus.center);
+        }
+
+        function updateLightShadowCamera(light, ld) {
+            if (!light?.shadow || !light.castShadow) return;
+
+            const focus = getShadowSceneFocus();
+            const { radius } = focus;
+            const shadowCamera = light.shadow.camera;
+
+            if (ld.type === 0 && shadowCamera?.isOrthographicCamera) {
+                applyDirectionalShadowOrigin(light, focus);
+                shadowCamera.left = -radius;
+                shadowCamera.right = radius;
+                shadowCamera.top = radius;
+                shadowCamera.bottom = -radius;
+                shadowCamera.near = 0.1;
+                light.getWorldPosition(lightWorldPos);
+                shadowCamera.far = Math.max(radius * 8, lightWorldPos.distanceTo(shadowTarget), 200);
+                shadowCamera.updateProjectionMatrix();
+            } else if (ld.type === 1 && shadowCamera?.isPerspectiveCamera) {
+                shadowCamera.near = Math.max(radius * 0.01, 0.1);
+                shadowCamera.far = ld.distance > 0 ? ld.distance : Math.max(radius * 6, 200);
+                shadowCamera.updateProjectionMatrix();
+            } else if (ld.type === 2 && shadowCamera?.isPerspectiveCamera) {
+                shadowCamera.near = Math.max(radius * 0.01, 0.1);
+                shadowCamera.far = ld.distance > 0 ? ld.distance : Math.max(radius * 6, 200);
+                shadowCamera.fov = THREE.MathUtils.radToDeg((ld.angle ?? Math.PI / 4) * 2);
+                shadowCamera.updateProjectionMatrix();
+            }
+
+            light.shadow.needsUpdate = true;
+        }
+
+        function createLightHelper(light, type) {
+            let helper = null;
+            const sz = 2;
+            switch (type) {
+            case 0: helper = new THREE.DirectionalLightHelper(light, sz); break;
+            case 1: helper = new THREE.PointLightHelper(light, sz); break;
+            case 2: helper = new THREE.SpotLightHelper(light); break;
+            case 4: helper = new THREE.HemisphereLightHelper(light, sz); break;
+            }
+            if (helper) {
+                helper.userData.maxjsExcludeFromRuntimeSnapshot = true;
+                helper.visible = lightHelpersVisible;
+                lightGroup.add(helper);
+            }
+            return helper;
+        }
+
+        function clearLightHelpers() {
+            for (const [, helper] of lightHelperMap) {
+                if (helper.parent) helper.parent.remove(helper);
+                helper.dispose?.();
+            }
+            lightHelperMap.clear();
+        }
+
+        function updateLightHelpers() {
+            for (const [, helper] of lightHelperMap) {
+                helper.update?.();
+            }
+        }
+
+        function setLightHelpersVisible(v) {
+            lightHelpersVisible = !!v;
+            for (const [, helper] of lightHelperMap) {
+                helper.visible = lightHelpersVisible;
+            }
+            const btn = document.getElementById('btnLightHelpers');
+            if (btn) btn.classList.toggle('active', lightHelpersVisible);
+        }
+
+        function clearLights() {
+            clearLightHelpers();
+            for (const [, light] of lightHandleMap) {
+                const target = light.userData?.maxjsTarget;
+                if (target?.parent) target.parent.remove(target);
+                if (light.parent) light.parent.remove(light);
+                if (light.dispose) light.dispose();
+            }
+            lightHandleMap.clear();
+            while (lightGroup.children.length) {
+                const c = lightGroup.children[0];
+                lightGroup.remove(c);
+                if (c.dispose) c.dispose();
+            }
+        }
+
+        function getLightParentObject(light) {
+            const parentHandle = Number(light?.userData?.maxjsParentHandle);
+            const parent = Number.isFinite(parentHandle) && parentHandle > 0
+                ? nodeMap.get(parentHandle)
+                : null;
+            if (!parent || parent === light) return lightGroup;
+            for (let cursor = parent; cursor; cursor = cursor.parent) {
+                if (cursor === light) return lightGroup;
+            }
+            return parent;
+        }
+
+        function syncLightParent(light, ld) {
+            if (!light) return lightGroup;
+            light.userData ??= {};
+            if (Object.prototype.hasOwnProperty.call(ld, 'p')) {
+                const parentHandle = Number(ld.p);
+                light.userData.maxjsParentHandle =
+                    Number.isFinite(parentHandle) && parentHandle > 0 ? parentHandle : 0;
+            } else {
+                light.userData.maxjsParentHandle = Number(light.userData.maxjsParentHandle) || 0;
+            }
+            const parent = getLightParentObject(light);
+            if (light.parent !== parent) parent.add(light);
+            const target = light.userData.maxjsTarget;
+            if (target && target.parent !== parent) parent.add(target);
+            return parent;
+        }
+
+        function setLightPositionFromMaxRoot(light, pos) {
+            if (!light || !Array.isArray(pos)) return;
+            lightLocalPos.set(pos[0], pos[1], pos[2]);
+            const parent = light.parent || lightGroup;
+            if (parent !== lightGroup) {
+                maxRoot.updateMatrixWorld(true);
+                parent.updateMatrixWorld(true);
+                lightWorldPos.copy(lightLocalPos);
+                maxRoot.localToWorld(lightWorldPos);
+                lightLocalPos.copy(lightWorldPos);
+                parent.worldToLocal(lightLocalPos);
+            }
+            light.position.copy(lightLocalPos);
+        }
+
+        function setLightTargetFromData(light, ld) {
+            const target = light.userData?.maxjsTarget;
+            if (!target) return;
+            // Fixed distance — three.js normalizes (target - position) internally,
+            // only the direction matters here. Previously recomputed scene bounds
+            // per call via getShadowSceneFocus(), which iterated every mesh and
+            // hitched animation playback with parented lights.
+            const targetDistance = 1000;
+            lightTargetLocal.set(
+                ld.pos[0] + ld.dir[0] * targetDistance,
+                ld.pos[1] + ld.dir[1] * targetDistance,
+                ld.pos[2] + ld.dir[2] * targetDistance
+            );
+            lightTargetWorld.copy(lightTargetLocal);
+            maxRoot.updateMatrixWorld(true);
+            maxRoot.localToWorld(lightTargetWorld);
+            shadowTarget.copy(lightTargetWorld);
+
+            const parent = target.parent || lightGroup;
+            if (parent !== lightGroup) {
+                parent.updateMatrixWorld(true);
+                target.position.copy(lightTargetWorld);
+                parent.worldToLocal(target.position);
+            } else {
+                target.position.copy(lightTargetLocal);
+            }
+            target.updateMatrixWorld();
+        }
+
+        // NIR emitter tagging for the spectral tracer (collectLights reads
+        // userData.emitterClass / userData.colorTemp). Two Max-side channels:
+        //   1. userProps string, if the sync carries it for lights:
+        //      "emitterClass=ir" / "=led" / "=sodium" / "=incandescent",
+        //      optional "colorTemp=2856".
+        //   2. NAME tagging — works with the sync as-is: a light whose name
+        //      contains "_ir"/"ir_", "_led", "_sodium"/"_lps", "_inc"/"_halogen"
+        //      (case-insensitive) gets the class. Rename in Max → tagged.
+        function applyLightEmitterClass(light, ld) {
+            let cls;
+            let temp;
+            const props = typeof ld.userProps === 'string' ? ld.userProps : '';
+            if (props) {
+                const mc = /emitterClass\s*=\s*([a-z_]+)/i.exec(props);
+                if (mc) cls = mc[1].toLowerCase();
+                const mt = /colorTemp\s*=\s*([0-9.]+)/i.exec(props);
+                if (mt) temp = Number(mt[1]);
+            }
+            if (!cls && light.name) {
+                const n = `_${light.name.toLowerCase().replace(/[\s\-.]+/g, '_')}_`;
+                if (/_ir_|_nir_|_illuminator_/.test(n)) cls = 'ir';
+                else if (/_led_/.test(n)) cls = 'led';
+                else if (/_sodium_|_lps_/.test(n)) cls = 'sodium';
+                else if (/_inc_|_incandescent_|_halogen_|_tungsten_/.test(n)) cls = 'incandescent';
+            }
+            if (cls) light.userData.emitterClass = cls;
+            else delete light.userData.emitterClass;
+            if (Number.isFinite(temp)) light.userData.colorTemp = temp;
+        }
+
+        function applyLightData(light, ld) {
+            light.userData ??= {};
+            light.userData.maxjsTypeId = ld.type;
+            if (ld.h != null) light.userData.maxjsHandle = ld.h;
+            if (ld.name) light.name = ld.name;
+            syncLightParent(light, ld);
+            applyLightEmitterClass(light, ld);
+
+            const isRuntimeOverridden = (property) =>
+                ld.h != null && layerManager.hasObjectPropertyOverride?.(ld.h, property) === true;
+
+            const visible = ld.v == null ? true : !!ld.v;
+            light.userData.maxjsVisible = visible;
+            light.visible = true;
+            light.layers?.set?.(visible ? 0 : MAXJS_SELF_HIDDEN_LAYER);
+            if (light.userData.maxjsTarget) light.userData.maxjsTarget.visible = true;
+
+            if (light.color && Array.isArray(ld.color)) {
+                light.color.setRGB(ld.color[0], ld.color[1], ld.color[2]);
+            }
+            if ('intensity' in light && Number.isFinite(ld.intensity)) {
+                light.userData.maxjsAuthoredIntensity = ld.intensity;
+                light.intensity = visible ? ld.intensity : 0;
+            }
+            if (Number.isFinite(ld.volContrib)) {
+                light.userData.volContrib = ld.volContrib;
+            } else {
+                delete light.userData.volContrib;
+            }
+
+            switch (ld.type) {
+            case 0:
+                setLightPositionFromMaxRoot(light, ld.pos);
+                setLightTargetFromData(light, ld);
+                break;
+            case 1:
+                setLightPositionFromMaxRoot(light, ld.pos);
+                light.distance = ld.distance || 0;
+                light.decay = ld.decay ?? 2;
+                break;
+            case 2:
+                setLightPositionFromMaxRoot(light, ld.pos);
+                light.distance = ld.distance || 0;
+                light.decay = ld.decay ?? 2;
+                light.angle = ld.angle ?? Math.PI / 4;
+                light.penumbra = ld.penumbra ?? 0.1;
+                setLightTargetFromData(light, ld);
+                break;
+            case 3:
+                setLightPositionFromMaxRoot(light, ld.pos);
+                light.width = ld.width || 20;
+                light.height = ld.height || 20;
+                lightTargetLocal.set(
+                    ld.pos[0] + ld.dir[0],
+                    ld.pos[1] + ld.dir[1],
+                    ld.pos[2] + ld.dir[2]
+                );
+                lightTargetWorld.copy(lightTargetLocal);
+                maxRoot.updateMatrixWorld(true);
+                maxRoot.localToWorld(lightTargetWorld);
+                light.updateMatrixWorld(true);
+                light.lookAt(lightTargetWorld);
+                break;
+            case 4:
+                setLightPositionFromMaxRoot(light, ld.pos);
+                light.groundColor.setRGB(
+                    ld.groundColor?.[0] ?? 0.2666666667,
+                    ld.groundColor?.[1] ?? 0.2666666667,
+                    ld.groundColor?.[2] ?? 0.2666666667
+                );
+                break;
+            case 5:
+                break;
+            }
+
+            if (light.shadow) {
+                light.castShadow = visible && !!ld.castShadow;
+                if (light.castShadow) {
+                    light.shadow.bias = ld.shadowBias ?? -0.0001;
+                    light.shadow.radius = ld.shadowRadius ?? 1;
+                    const mapSz = ld.shadowMapSize ?? 1024;
+                    light.shadow.mapSize.set(mapSz, mapSz);
+                    updateLightShadowCamera(light, ld);
+                }
+            }
+            if (Object.prototype.hasOwnProperty.call(ld, 'map') && !isRuntimeOverridden('map')) {
+                light.map = ld.map ?? null;
+                light.needsUpdate = true;
+            }
+            if (ld.h != null) layerManager.applyObjectPropertyOverrides?.(ld.h, light);
+        }
+
+        function createLightFromData(ld) {
+            let light;
+            switch (ld.type) {
+            case 0:
+                light = new THREE.DirectionalLight(0xffffff, 1);
+                light.userData.maxjsTarget = light.target;
+                lightGroup.add(light.target);
+                break;
+            case 1:
+                light = new THREE.PointLight(0xffffff, 1, 0, 2);
+                break;
+            case 2:
+                light = new THREE.SpotLight(0xffffff, 1, 0, Math.PI / 4, 0.1, 2);
+                light.userData.maxjsTarget = light.target;
+                lightGroup.add(light.target);
+                break;
+            case 3:
+                light = new THREE.RectAreaLight(0xffffff, 1, ld.width || 20, ld.height || 20);
+                break;
+            case 4:
+                light = new THREE.HemisphereLight(0xffffff, 0x444444, 1);
+                break;
+            case 5:
+                light = new THREE.AmbientLight(0xffffff, 1);
+                break;
+            default:
+                return null;
+            }
+
+            applyLightData(light, ld);
+            return light;
+        }
+
+        // ── Light ID allocator for per-material mask uniforms ──
+        // Stable across re-syncs by name so UI state (stored by name) still
+        // applies. 64-slot cap (two uint32 per material). Slot 0..63 used for
+        // linked lights; any extras fall back to "unlinked" = always on.
+        const MAXJS_MAX_LIGHT_IDS = 64;
+        const lightIdByName = new Map();        // name -> id
+        const lightIdSlots = new Uint8Array(MAXJS_MAX_LIGHT_IDS); // 1 = taken
+        function lightStableKey(light, ld) {
+            return light?.name || ld?.name || ('_h' + ld?.h);
+        }
+        function allocLightId(key) {
+            if (lightIdByName.has(key)) {
+                const id = lightIdByName.get(key);
+                lightIdSlots[id] = 1;
+                return id;
+            }
+            for (let i = 0; i < MAXJS_MAX_LIGHT_IDS; i++) {
+                if (!lightIdSlots[i]) {
+                    lightIdSlots[i] = 1;
+                    lightIdByName.set(key, i);
+                    return i;
+                }
+            }
+            return -1; // all slots taken — light becomes "unlinked"
+        }
+
+        function finalizeLightState(lightsData) {
+            let appliedLightCount = 0;
+            let mainDirectionalLight = null;
+            lightIdSlots.fill(0);
+
+            for (const ld of lightsData) {
+                const light = createLightFromData(ld);
+                if (!light) continue;
+                if (!light.parent) lightGroup.add(light);
+                if (ld.h != null) {
+                    lightHandleMap.set(ld.h, light);
+                    const helper = createLightHelper(light, ld.type);
+                    if (helper) lightHelperMap.set(ld.h, helper);
+                    const id = allocLightId(lightStableKey(light, ld));
+                    light.userData ??= {};
+                    light.userData.maxjsLightId = id;
+                    light.userData.maxjsLightLinked = false;
+                }
+                if (light.userData?.maxjsVisible !== false) {
+                    appliedLightCount++;
+                    if (!mainDirectionalLight && ld.type === 0) mainDirectionalLight = light;
+                }
+            }
+
+            syncDefaultLightsVisibility();
+            if (maxjsFx.setMainLight) {
+                maxjsFx.setMainLight(mainDirectionalLight || (defaultLights.visible ? defaultKey : null));
+            }
+            markLightProbeLightsDirty();
+            scheduleLightProbeFromCurrentScene({ delay: 350 });
+        }
+
+        function sceneLightsSignature(lightsData) {
+            return JSON.stringify(Array.isArray(lightsData) ? lightsData : []);
+        }
+
+        function applyLights(lightsData) {
+            const signature = sceneLightsSignature(lightsData);
+            if (signature === lastLightsSignature) return false;
+            clearLights();
+            finalizeLightState(lightsData);
+            lightLinking.reapply();
+            refreshSkyFromLinkedSun();
+            lastLightsSignature = signature;
+            return true;
+        }
+
+        // ── Light Linking ────────────────────────────────────
+        // Per-mesh 64-bit light masks plus per-material HDRI intensity state.
+        // Persisted by stable names so it survives re-sync.
+        const LIGHT_LINK_STORAGE_KEY = 'maxjs-light-linking';
+
+        const lightLinking = (() => {
+            // lightHandle -> { mode: 'include'|'exclude', objects: Set<nodeHandle> }
+            const links = new Map();
+            // materialName -> float (0..1+) HDRI intensity. Keyed by Max material
+            // name so it survives handle churn and scene rebuilds.
+            const envIntensityByName = new Map();
+
+            function handleToken(handle) {
+                return handle == null ? '' : String(handle);
+            }
+
+            function resolveHandle(map, handle) {
+                if (handle == null) return null;
+                if (map.has(handle)) return handle;
+                const token = handleToken(handle);
+                if (map.has(token)) return token;
+                if (/^-?\d+$/.test(token)) {
+                    const numeric = Number(token);
+                    if (Number.isSafeInteger(numeric) && map.has(numeric)) return numeric;
+                }
+                return null;
+            }
+
+            function getByHandle(map, handle) {
+                const resolved = resolveHandle(map, handle);
+                return resolved == null ? undefined : map.get(resolved);
+            }
+
+            function forEachRenderableMesh(fn) {
+                for (const [h, mesh] of nodeMap) {
+                    if (!mesh?.isMesh) continue;
+                    fn(handleToken(h), mesh);
+                }
+                for (const [, bucket] of maxInstanceBuckets) {
+                    if (!bucket?.mesh?.isMesh) continue;
+                    fn(handleToken(bucket.sourceHandle ?? ''), bucket.mesh);
+                }
+            }
+
+            function materialNameOf(material) {
+                const value = String(
+                    material?.userData?.maxjsSourceMaterialName ??
+                    material?.name ??
+                    ''
+                ).trim();
+                return value || 'default';
+            }
+
+            let lightingParamRefreshQueued = false;
+            function notifyLightingParamChanged() {
+                if (lightingParamRefreshQueued) return;
+                lightingParamRefreshQueued = true;
+                requestAnimationFrame(() => {
+                    lightingParamRefreshQueued = false;
+                    maxjsFx.markOutputChanged?.();
+                });
+            }
+
+            function lightHandleByName(name) {
+                for (const [h, light] of lightHandleMap) {
+                    if (light.name === name) return handleToken(h);
+                }
+                return null;
+            }
+            function meshHandleByName(name) {
+                for (const [h, mesh] of nodeMap) {
+                    if (mesh.name === name) return handleToken(h);
+                }
+                return null;
+            }
+
+            function resetMask(mesh) {
+                ensureMeshMaskDefaults(mesh);
+                mesh.userData[LIGHT_MASK_LO_KEY] = 0xFFFFFFFF;
+                mesh.userData[LIGHT_MASK_HI_KEY] = 0xFFFFFFFF;
+            }
+
+            function writeBit(mesh, lightId, enabled) {
+                ensureMeshMaskDefaults(mesh);
+                const key = lightId < 32 ? LIGHT_MASK_LO_KEY : LIGHT_MASK_HI_KEY;
+                const bit = (1 << (lightId & 31)) >>> 0;
+                const cur = mesh.userData[key] >>> 0;
+                mesh.userData[key] = enabled ? ((cur | bit) >>> 0) : ((cur & ~bit) >>> 0);
+            }
+
+            function forEachMaterialByName(materialName, fn) {
+                const seen = new Set();
+                forEachRenderableMesh((_h, mesh) => {
+                    const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+                    for (const mat of materials) {
+                        if (!mat || seen.has(mat)) continue;
+                        seen.add(mat);
+                        if (materialNameOf(mat) === materialName) fn(mat, mesh);
+                    }
+                });
+            }
+
+            function applyEnvIntensities() {
+                const seen = new Set();
+                forEachRenderableMesh((_h, mesh) => {
+                    const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+                    for (const mat of materials) {
+                        if (!mat || seen.has(mat)) continue;
+                        seen.add(mat);
+                        const matName = materialNameOf(mat);
+                        const ev = envIntensityByName.get(matName);
+                        mat.envMapIntensity = (typeof ev === 'number') ? ev : 1.0;
+                    }
+                });
+            }
+
+            function reapply() {
+                for (const [, light] of lightHandleMap) {
+                    if (!light?.userData) continue;
+                    light.userData.maxjsLightLinked = false;
+                }
+                // Apply each link as a bit-clear pattern.
+                if (links.size > 0) {
+                    // Only linked lights need per-mesh masks. This avoids
+                    // walking every mesh on normal Studio scenes.
+                    forEachRenderableMesh((_meshHandle, mesh) => {
+                        resetMask(mesh);
+                    });
+                    for (const [lh, link] of links) {
+                        const light = getByHandle(lightHandleMap, lh);
+                        const lid = light?.userData?.maxjsLightId;
+                        if (!Number.isInteger(lid) || lid < 0 || lid >= 64) continue;
+                        light.userData.maxjsLightLinked = true;
+                        if (link.mode === 'include') {
+                            forEachRenderableMesh((meshHandle, mesh) => {
+                                writeBit(mesh, lid, link.objects.has(meshHandle));
+                            });
+                        } else {
+                            // Walk every renderable mesh (instanced buckets included,
+                            // which never appear in nodeMap) and clear the bit on the
+                            // excluded ones, mirroring the include branch above.
+                            forEachRenderableMesh((meshHandle, mesh) => {
+                                if (link.objects.has(meshHandle)) writeBit(mesh, lid, false);
+                            });
+                        }
+                    }
+                }
+                applyEnvIntensities();
+            }
+
+            function notifyLightLinkTopologyChanged() {
+                maxjsFx.markSceneChanged?.();
+                notifyLightingParamChanged();
+            }
+
+            function setLink(lightHandle, mode, objectHandles) {
+                const lightKey = handleToken(lightHandle);
+                if (!objectHandles || objectHandles.size === 0) {
+                    links.delete(lightKey);
+                } else {
+                    links.set(lightKey, {
+                        mode,
+                        objects: new Set(Array.from(objectHandles, handleToken)),
+                    });
+                }
+                reapply();
+                notifyLightLinkTopologyChanged();
+                save();
+            }
+
+            function removeLink(lightHandle) {
+                links.delete(handleToken(lightHandle));
+                reapply();
+                notifyLightLinkTopologyChanged();
+                save();
+            }
+
+            function getLink(lightHandle) {
+                return links.get(handleToken(lightHandle)) || null;
+            }
+
+            function getAllLinks() { return links; }
+
+            // Constrain-to-camera: HDRI rotation tracks camera yaw
+            let hdriConstrainToCamera = false;
+            let hdriBaseRotationY = 0;
+            function getCameraYaw() {
+                camera.updateMatrixWorld(true);
+                return Math.atan2(
+                    camera.matrixWorld.elements[8],
+                    camera.matrixWorld.elements[10]
+                );
+            }
+            function getCameraWorldQuaternion(target = new THREE.Quaternion()) {
+                camera.updateMatrixWorld(true);
+                return camera.getWorldQuaternion(target);
+            }
+            function setHdriConstrainToCamera(v) {
+                hdriConstrainToCamera = !!v;
+                if (v) hdriBaseRotationY = scene.environmentRotation.y + getCameraYaw();
+                save();
+            }
+            function getHdriConstrainToCamera() { return hdriConstrainToCamera; }
+
+            let reflectionPaintConstrainToCamera = false;
+            const reflectionPaintCameraDirections = new Map();
+            const constraintCameraQuat = new THREE.Quaternion();
+            const constraintInverseQuat = new THREE.Quaternion();
+            function vectorFromPlain(value) {
+                if (value?.isVector3) return value.clone();
+                if (Array.isArray(value) && value.length >= 3) {
+                    return new THREE.Vector3(value[0] || 0, value[1] || 0, value[2] || 0);
+                }
+                if (value && typeof value === 'object') {
+                    return new THREE.Vector3(value.x || 0, value.y || 0, value.z || 0);
+                }
+                return null;
+            }
+            function captureReflectionPaintCameraDirections(saved = null) {
+                reflectionPaintCameraDirections.clear();
+                const savedById = new Map();
+                for (const item of (Array.isArray(saved) ? saved : [])) {
+                    const id = Number(item?.id);
+                    const direction = vectorFromPlain(item?.cameraDirection ?? item?.direction);
+                    if (Number.isFinite(id) && direction) savedById.set(id, direction.normalize());
+                }
+                getCameraWorldQuaternion(constraintCameraQuat);
+                constraintInverseQuat.copy(constraintCameraQuat).invert();
+                for (const l of getReflectionPaintNode().getLights()) {
+                    const savedDir = savedById.get(Number(l.id));
+                    if (savedDir) {
+                        reflectionPaintCameraDirections.set(Number(l.id), savedDir);
+                        continue;
+                    }
+                    const worldDir = vectorFromPlain(l.direction);
+                    if (!worldDir) continue;
+                    reflectionPaintCameraDirections.set(
+                        Number(l.id),
+                        worldDir.normalize().applyQuaternion(constraintInverseQuat).normalize()
+                    );
+                }
+            }
+            function setReflectionPaintConstrainToCamera(v) {
+                reflectionPaintConstrainToCamera = !!v;
+                if (reflectionPaintConstrainToCamera) captureReflectionPaintCameraDirections();
+                save({ flush: true });
+            }
+            function getReflectionPaintConstrainToCamera() { return reflectionPaintConstrainToCamera; }
+
+            // Constrain-to-camera: per-light camera-relative offset
+            // lightHandle -> { posOffset: Vector3, targetOffset: Vector3 }
+            const lightCameraConstraints = new Map();
+            const constraintWorldPos = new THREE.Vector3();
+            function vectorFromArray(value) {
+                return Array.isArray(value) && value.length >= 3
+                    ? new THREE.Vector3(value[0] || 0, value[1] || 0, value[2] || 0)
+                    : null;
+            }
+            function toCameraLocalOffset(worldPosition) {
+                camera.updateMatrixWorld(true);
+                return camera.worldToLocal(worldPosition.clone());
+            }
+            function applyWorldPosition(object, worldPosition) {
+                if (!object) return;
+                if (object.parent) {
+                    object.parent.updateMatrixWorld(true);
+                    object.position.copy(object.parent.worldToLocal(worldPosition.clone()));
+                } else {
+                    object.position.copy(worldPosition);
+                }
+                object.updateMatrixWorld(true);
+            }
+            function buildCameraConstraintForLight(lightHandle, saved = null) {
+                const light = getByHandle(lightHandleMap, lightHandle);
+                if (!light) return null;
+                light.updateMatrixWorld(true);
+                const posOffset = vectorFromArray(saved?.posOffset)
+                    || toCameraLocalOffset(light.getWorldPosition(new THREE.Vector3()));
+                let targetOffset = vectorFromArray(saved?.targetOffset ?? saved?.dirOffset);
+                const target = light.userData?.maxjsTarget || light.target;
+                if (!targetOffset && target) {
+                    target.updateMatrixWorld(true);
+                    targetOffset = toCameraLocalOffset(target.getWorldPosition(new THREE.Vector3()));
+                }
+                return { posOffset, targetOffset };
+            }
+            function setLightConstrainToCamera(lightHandle, enabled) {
+                const lightKey = handleToken(lightHandle);
+                if (enabled) {
+                    const constraint = buildCameraConstraintForLight(lightHandle);
+                    if (!constraint) return;
+                    lightCameraConstraints.set(lightKey, constraint);
+                } else {
+                    lightCameraConstraints.delete(lightKey);
+                }
+                save();
+            }
+            function getLightConstrainToCamera(lightHandle) {
+                return lightCameraConstraints.has(handleToken(lightHandle));
+            }
+
+            // Called each frame from renderFrame — updates constrained transforms.
+            function updateCameraConstraints() {
+                if (hdriConstrainToCamera) {
+                    const camYaw = getCameraYaw();
+                    scene.environmentRotation.y = hdriBaseRotationY - camYaw;
+                    scene.backgroundRotation.y = hdriBaseRotationY - camYaw;
+                }
+                if (reflectionPaintConstrainToCamera) {
+                    getCameraWorldQuaternion(constraintCameraQuat);
+                    const paint = getReflectionPaintNode();
+                    const liveIds = new Set();
+                    for (const l of paint.getLights()) {
+                        const id = Number(l.id);
+                        liveIds.add(id);
+                        let localDir = reflectionPaintCameraDirections.get(id);
+                        if (!localDir) {
+                            const worldDir = vectorFromPlain(l.direction);
+                            if (!worldDir) continue;
+                            constraintInverseQuat.copy(constraintCameraQuat).invert();
+                            localDir = worldDir.normalize().applyQuaternion(constraintInverseQuat).normalize();
+                            reflectionPaintCameraDirections.set(id, localDir);
+                        }
+                        paint.updateLight(id, {
+                            direction: localDir.clone().applyQuaternion(constraintCameraQuat).normalize(),
+                        });
+                    }
+                    for (const id of reflectionPaintCameraDirections.keys()) {
+                        if (!liveIds.has(id)) reflectionPaintCameraDirections.delete(id);
+                    }
+                    notifyLightingParamChanged();
+                }
+                if (lightCameraConstraints.size === 0) return;
+                camera.updateMatrixWorld(true);
+                for (const [lh, c] of lightCameraConstraints) {
+                    const light = getByHandle(lightHandleMap, lh);
+                    if (!light) continue;
+                    applyWorldPosition(light, camera.localToWorld(constraintWorldPos.copy(c.posOffset)));
+                    if (c.targetOffset) {
+                        const target = light.userData?.maxjsTarget || light.target;
+                        if (target) {
+                            applyWorldPosition(target, camera.localToWorld(constraintWorldPos.copy(c.targetOffset)));
+                        }
+                    }
+                }
+            }
+
+            function setEnvIntensity(materialName, value) {
+                if (!materialName) return;
+                const v = Number.isFinite(value) ? value : 1.0;
+                if (v !== 1.0) envIntensityByName.set(materialName, v);
+                else envIntensityByName.delete(materialName);
+                let touched = false;
+                forEachMaterialByName(materialName, (mat) => {
+                    mat.envMapIntensity = v;
+                    touched = true;
+                });
+                if (touched) notifyLightingParamChanged();
+                save();
+            }
+
+            function getEnvIntensity(materialName) {
+                const v = envIntensityByName.get(materialName);
+                return (typeof v === 'number') ? v : 1.0;
+            }
+
+            function setReflectionPaintIntensity(value) {
+                const paint = getReflectionPaintNode();
+                const wasActive = paint.active;
+                const v = Number.isFinite(value) ? Math.max(0, value) : 1.0;
+                paint.setGlobalIntensity(v);
+                if (wasActive !== paint.active) notifyLightLinkTopologyChanged();
+                else notifyLightingParamChanged();
+                save();
+            }
+
+            function getReflectionPaintIntensity() {
+                return getReflectionPaintNode().getGlobalIntensity();
+            }
+
+            function serialize() {
+                const data = { links: {}, env: {}, constrain: {} };
+                data.reflectionPaintIntensity = getReflectionPaintIntensity();
+                data.constrain.hdri = hdriConstrainToCamera;
+                data.constrain.reflectionPaint = reflectionPaintConstrainToCamera;
+                if (reflectionPaintCameraDirections.size > 0) {
+                    data.constrain.reflectionPaintDirections = [...reflectionPaintCameraDirections].map(([id, direction]) => ({
+                        id,
+                        cameraDirection: direction.toArray(),
+                    }));
+                }
+                const constrainedLightNames = [];
+                const constrainedLights = [];
+                for (const [lh, constraint] of lightCameraConstraints) {
+                    const n = getByHandle(lightHandleMap, lh)?.name;
+                    if (!n) continue;
+                    constrainedLightNames.push(n);
+                    constrainedLights.push({
+                        name: n,
+                        posOffset: constraint.posOffset.toArray(),
+                        targetOffset: constraint.targetOffset ? constraint.targetOffset.toArray() : null,
+                    });
+                }
+                if (constrainedLightNames.length) {
+                    data.constrain.lights = constrainedLightNames;
+                    data.constrain.lightOffsets = constrainedLights;
+                }
+                for (const [lh, link] of links) {
+                    const lName = getByHandle(lightHandleMap, lh)?.name;
+                    if (!lName) continue;
+                    const objNames = [];
+                    for (const oh of link.objects) {
+                        const n = getByHandle(nodeMap, oh)?.name;
+                        if (n) objNames.push(n);
+                    }
+                    data.links[lName] = { mode: link.mode, objects: objNames };
+                }
+                for (const [materialName, v] of envIntensityByName) {
+                    data.env[materialName] = v;
+                }
+                return data;
+            }
+
+            function save(options = {}) {
+                saveStudioState(options);
+            }
+
+            function readLegacyStorage() {
+                try {
+                    const raw = localStorage.getItem(LIGHT_LINK_STORAGE_KEY);
+                    return raw ? JSON.parse(raw) : null;
+                } catch {
+                    return null;
+                }
+            }
+
+            function applyPayload(data, options = {}) {
+                try {
+                    links.clear();
+                    envIntensityByName.clear();
+                    lightCameraConstraints.clear();
+                    if (!data || typeof data !== 'object') {
+                        reapply();
+                        return;
+                    }
+                    // Back-compat: old format was flat { lightName: {mode, objects} }.
+                    const rawLinks = data.links || (data.env === undefined ? data : {});
+                    const rawEnv = data.env || {};
+                    for (const [lName, entry] of Object.entries(rawLinks)) {
+                        if (!entry || typeof entry !== 'object' || !entry.mode) continue;
+                        const lh = lightHandleByName(lName);
+                        if (lh == null) continue;
+                        const objHandles = new Set();
+                        for (const oName of (entry.objects || [])) {
+                            const oh = meshHandleByName(oName);
+                            if (oh != null) objHandles.add(oh);
+                        }
+                        if (objHandles.size > 0) {
+                            links.set(lh, {
+                                mode: entry.mode === 'include' ? 'include' : 'exclude',
+                                objects: objHandles,
+                            });
+                        }
+                    }
+                    for (const [materialName, v] of Object.entries(rawEnv)) {
+                        if (Number.isFinite(v)) envIntensityByName.set(materialName, v);
+                    }
+                    const rawConstrain = data.constrain || {};
+                    hdriConstrainToCamera = !!rawConstrain.hdri;
+                    if (hdriConstrainToCamera) hdriBaseRotationY = scene.environmentRotation.y + getCameraYaw();
+                    reflectionPaintConstrainToCamera = !!rawConstrain.reflectionPaint;
+                    if (reflectionPaintConstrainToCamera) {
+                        captureReflectionPaintCameraDirections(rawConstrain.reflectionPaintDirections);
+                    }
+                    const lightConstraints = Array.isArray(rawConstrain.lightOffsets)
+                        ? rawConstrain.lightOffsets
+                        : (rawConstrain.lights || []).map(name => ({ name }));
+                    for (const item of lightConstraints) {
+                        const lName = typeof item === 'string' ? item : item?.name;
+                        const lh = lightHandleByName(lName);
+                        if (lh == null) continue;
+                        const constraint = buildCameraConstraintForLight(lh, item);
+                        if (constraint) lightCameraConstraints.set(handleToken(lh), constraint);
+                    }
+                    if (options.applyReflectionPaintIntensity !== false && Number.isFinite(data.reflectionPaintIntensity)) {
+                        getReflectionPaintNode().setGlobalIntensity(data.reflectionPaintIntensity);
+                    }
+                    reapply();
+                } catch {}
+            }
+
+            function restoreFromStorage() {
+                applyPayload(readLegacyStorage());
+            }
+
+            return {
+                reapply, serialize, applyPayload, restoreFromStorage,
+                refreshSceneBindings: () => {
+                    reapply();
+                    notifyLightingParamChanged();
+                },
+                setLink, removeLink, getLink, getAllLinks,
+                setEnvIntensity, getEnvIntensity,
+                setReflectionPaintIntensity, getReflectionPaintIntensity,
+                setHdriConstrainToCamera, getHdriConstrainToCamera,
+                setReflectionPaintConstrainToCamera, getReflectionPaintConstrainToCamera,
+                captureReflectionPaintCameraDirections,
+                setLightConstrainToCamera, getLightConstrainToCamera,
+                updateCameraConstraints,
+            };
+        })();
+
+        // ── Light Linking Panel UI ───────────────────────────
+        const lightLinkPanel = document.getElementById('lightLinkPanel');
+        let lightLinkPanelVisible = false;
+        let lightLinkPanelSelectedTarget = '';
+
+        function setLightLinkPanelVisible(v) {
+            if (v && !isStudioMode) return;
+            lightLinkPanelVisible = !!v;
+            lightLinkPanel.classList.toggle('visible', lightLinkPanelVisible);
+            lightLinkPanel.toggleAttribute('inert', !lightLinkPanelVisible);
+            lightLinkPanel.setAttribute('aria-hidden', String(!lightLinkPanelVisible));
+            document.getElementById('btnLightLink').classList.toggle('active', lightLinkPanelVisible);
+            if (lightLinkPanelVisible) rebuildLightLinkPanel();
+        }
+
+        function rebuildLightLinkPanel(preferredTarget = '') {
+            const previousTarget = preferredTarget
+                || lightLinkPanelSelectedTarget
+                || document.getElementById('ll-light-sel')?.value
+                || '';
+            const collectSliderMaterials = () => {
+                const names = new Set();
+                const items = [];
+                for (const [, mesh] of nodeMap) {
+                    if (!mesh?.isMesh) continue;
+                    const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+                    for (const material of materials) {
+                        if (!material) continue;
+                        const key = String(
+                            material.userData?.maxjsSourceMaterialName ??
+                            material.name ??
+                            'default'
+                        ).trim() || 'default';
+                        if (names.has(key)) continue;
+                        names.add(key);
+                        items.push({ key, name: key });
+                    }
+                }
+                items.sort((a, b) => a.name.localeCompare(b.name));
+                return items;
+            };
+            const lights = [];
+            for (const [h, light] of lightHandleMap) {
+                lights.push({ h, name: light.name || `Light ${h}`, type: light.type });
+            }
+            const nodes = [];
+            for (const [h, mesh] of nodeMap) {
+                if (!mesh?.isMesh) continue;
+                nodes.push({ h: String(h), name: mesh.name || `Object ${h}` });
+            }
+            nodes.sort((a, b) => a.name.localeCompare(b.name));
+
+            let html = `<div class="sidepanel-header">` +
+                `<div><div class="sidepanel-title">Light Linking</div>` +
+                `<div class="sidepanel-subtitle">Mesh links, material intensity</div></div>` +
+                `</div>` +
+                `<div class="sidepanel-body" style="gap:6px;">`;
+
+            const hdriAvailable = !!scene.environment;
+            const reflectionPaintAvailable = getReflectionPaintNode().count > 0;
+            if (lights.length === 0 && !hdriAvailable && !reflectionPaintAvailable) {
+                html += `<div style="color:#666;padding:8px 0;">No lights or HDRI in scene</div>`;
+            } else {
+                // Target selector: HDRI first, then individual lights.
+                html += `<label style="font-size:10px;color:#888;">Target</label>`;
+                html += `<select id="ll-light-sel" style="width:100%;background:#222;color:#ccc;border:1px solid #444;padding:3px;font-size:11px;">`;
+                if (hdriAvailable) {
+                    html += `<option value="__hdri__">HDRI (per-material intensity)</option>`;
+                }
+                for (const l of lights) {
+                    html += `<option value="${l.h}">${l.name}</option>`;
+                }
+                if (reflectionPaintAvailable) {
+                    html += `<option value="__rp__">Reflection Paint (global intensity)</option>`;
+                }
+                html += `</select>`;
+
+                // Mode selector (hidden in HDRI mode)
+                html += `<div id="ll-mode-row" style="display:flex;gap:4px;margin:4px 0;">`;
+                html += `<button id="ll-mode-none" class="ll-mode active" style="flex:1;font-size:10px;padding:3px;">None</button>`;
+                html += `<button id="ll-mode-include" class="ll-mode" style="flex:1;font-size:10px;padding:3px;">Include</button>`;
+                html += `<button id="ll-mode-exclude" class="ll-mode" style="flex:1;font-size:10px;padding:3px;">Exclude</button>`;
+                html += `</div>`;
+                html += `<div id="ll-hdri-hint" style="display:none;font-size:10px;color:#888;margin:4px 0;">Drag sliders per material — 0 removes HDRI contribution, 1 = default.</div>`;
+                html += `<label id="ll-constrain-row" style="display:none;font-size:10px;color:#aaa;margin:2px 0;cursor:pointer;gap:4px;align-items:center;">`;
+                html += `<input type="checkbox" id="ll-constrain-cam" style="margin:0;accent-color:#e8e8e8;"> Constrain to Camera`;
+                html += `</label>`;
+
+                // Object list header
+                html += `<div style="display:flex;justify-content:space-between;align-items:center;margin-top:4px;">`;
+                html += `<label id="ll-list-label" style="font-size:10px;color:#888;">Objects</label>`;
+                html += `<div id="ll-bulk-btns" style="display:flex;gap:3px;">`;
+                html += `<button id="ll-sel-all" style="font-size:9px;padding:1px 5px;">All</button>`;
+                html += `<button id="ll-sel-none" style="font-size:9px;padding:1px 5px;">None</button>`;
+                html += `</div></div>`;
+
+                // Object list body — rendered fresh per-selection since items differ
+                html += `<div id="ll-obj-list" style="max-height:300px;overflow-y:auto;border:1px solid #333;padding:2px;"></div>`;
+            }
+            html += `</div>`;
+            lightLinkPanel.innerHTML = html;
+
+            if (lights.length === 0 && !hdriAvailable && !reflectionPaintAvailable) return;
+
+            const lightSel = document.getElementById('ll-light-sel');
+            const modeRow = document.getElementById('ll-mode-row');
+            const hdriHint = document.getElementById('ll-hdri-hint');
+            const bulkBtns = document.getElementById('ll-bulk-btns');
+            const modeNone = document.getElementById('ll-mode-none');
+            const modeInclude = document.getElementById('ll-mode-include');
+            const modeExclude = document.getElementById('ll-mode-exclude');
+            const objList = document.getElementById('ll-obj-list');
+            const listLabel = document.getElementById('ll-list-label');
+            let sliderTargets = [];
+            const availableTargetValues = new Set();
+            if (hdriAvailable) availableTargetValues.add('__hdri__');
+            for (const l of lights) availableTargetValues.add(String(l.h));
+            if (reflectionPaintAvailable) availableTargetValues.add('__rp__');
+            if (availableTargetValues.has(previousTarget)) {
+                lightSel.value = previousTarget;
+                lightLinkPanelSelectedTarget = previousTarget;
+            } else {
+                lightLinkPanelSelectedTarget = lightSel.value || '';
+            }
+
+            function isHdriMode() { return lightSel.value === '__hdri__'; }
+            function isRpMode() { return lightSel.value === '__rp__'; }
+            function isSliderMode() { return isHdriMode() || isRpMode(); }
+            function getSelectedLight() {
+                const v = lightSel.value;
+                if (v === '__hdri__' || v === '__rp__') return v;
+                return v;
+            }
+
+            function getMode() {
+                if (modeInclude.classList.contains('active')) return 'include';
+                if (modeExclude.classList.contains('active')) return 'exclude';
+                return 'none';
+            }
+
+            function setActiveMode(mode) {
+                modeNone.classList.toggle('active', mode === 'none');
+                modeInclude.classList.toggle('active', mode === 'include');
+                modeExclude.classList.toggle('active', mode === 'exclude');
+                objList.style.opacity = mode === 'none' ? '0.3' : '1';
+                objList.style.pointerEvents = mode === 'none' ? 'none' : 'auto';
+            }
+
+            function renderObjectList() {
+                let inner = '';
+                if (isRpMode()) {
+                    const v = lightLinking.getReflectionPaintIntensity();
+                    sliderTargets = [{ key: '__reflection_paint_global__', name: 'Global Intensity' }];
+                    inner += `<div style="display:flex;align-items:center;gap:6px;padding:1px 2px;font-size:10px;">`;
+                    inner += `<span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">Global Intensity</span>`;
+                    inner += `<input type="range" data-index="0" min="0" max="2" step="0.01" value="${v}" style="width:90px;accent-color:#e8e8e8;">`;
+                    inner += `<span data-index="0" style="width:30px;text-align:right;color:#aaa;font-variant-numeric:tabular-nums;">${v.toFixed(2)}</span>`;
+                    inner += `</div>`;
+                } else if (isHdriMode()) {
+                    sliderTargets = collectSliderMaterials();
+                    const getV = (key) => lightLinking.getEnvIntensity(key);
+                    for (let i = 0; i < sliderTargets.length; i++) {
+                        const target = sliderTargets[i];
+                        const v = getV(target.key);
+                        inner += `<div style="display:flex;align-items:center;gap:6px;padding:1px 2px;font-size:10px;">`;
+                        inner += `<span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${target.name}</span>`;
+                        inner += `<input type="range" data-index="${i}" min="0" max="1" step="0.01" value="${v}" style="width:90px;accent-color:#e8e8e8;">`;
+                        inner += `<span data-index="${i}" style="width:30px;text-align:right;color:#aaa;font-variant-numeric:tabular-nums;">${v.toFixed(2)}</span>`;
+                        inner += `</div>`;
+                    }
+                } else {
+                    sliderTargets = [];
+                    for (const n of nodes) {
+                        inner += `<label style="display:flex;align-items:center;gap:4px;padding:1px 2px;font-size:10px;cursor:pointer;">`;
+                        inner += `<input type="checkbox" data-h="${n.h}" style="margin:0;accent-color:#e8e8e8;"> ${n.name}`;
+                        inner += `</label>`;
+                    }
+                }
+                objList.innerHTML = inner;
+            }
+
+            const constrainRow = document.getElementById('ll-constrain-row');
+            const constrainCam = document.getElementById('ll-constrain-cam');
+
+            function loadLightState() {
+                const sel = getSelectedLight();
+                if (isSliderMode()) {
+                    modeRow.style.display = 'none';
+                    hdriHint.style.display = '';
+                    listLabel.textContent = isRpMode() ? 'Reflection Paint' : 'Materials';
+                    hdriHint.textContent = isRpMode()
+                        ? 'Global multiplier for the painted environment overlay.'
+                        : 'Drag sliders per material \u2014 0 removes HDRI contribution, 1 = default.';
+                    bulkBtns.style.display = 'none';
+                    objList.style.opacity = '1';
+                    objList.style.pointerEvents = 'auto';
+                    constrainRow.style.display = 'flex';
+                    constrainCam.checked = isRpMode()
+                        ? lightLinking.getReflectionPaintConstrainToCamera()
+                        : lightLinking.getHdriConstrainToCamera();
+                    renderObjectList();
+                    return;
+                }
+                modeRow.style.display = '';
+                hdriHint.style.display = 'none';
+                listLabel.textContent = 'Objects';
+                bulkBtns.style.display = '';
+                constrainRow.style.display = 'flex';
+                constrainCam.checked = lightLinking.getLightConstrainToCamera(sel);
+                renderObjectList();
+                const lh = getSelectedLight();
+                const link = lightLinking.getLink(lh);
+                if (!link) {
+                    setActiveMode('none');
+                } else {
+                    setActiveMode(link.mode);
+                    for (const cb of objList.querySelectorAll('input[type=checkbox]')) {
+                        cb.checked = link.objects.has(String(cb.dataset.h));
+                    }
+                }
+            }
+
+            function applyFromUI() {
+                if (isSliderMode()) return; // sliders fire their own path
+                const lh = getSelectedLight();
+                const mode = getMode();
+                if (mode === 'none') {
+                    lightLinking.removeLink(lh);
+                    return;
+                }
+                const objs = new Set();
+                for (const cb of objList.querySelectorAll('input[type=checkbox]')) {
+                    if (cb.checked) objs.add(String(cb.dataset.h));
+                }
+                lightLinking.setLink(lh, mode, objs);
+            }
+
+            lightSel.addEventListener('change', () => {
+                lightLinkPanelSelectedTarget = lightSel.value;
+                loadLightState();
+            });
+
+            modeNone.addEventListener('click', () => { setActiveMode('none'); applyFromUI(); });
+            modeInclude.addEventListener('click', () => { setActiveMode('include'); applyFromUI(); });
+            modeExclude.addEventListener('click', () => { setActiveMode('exclude'); applyFromUI(); });
+
+            objList.addEventListener('input', (ev) => {
+                if (!isSliderMode()) return;
+                const tgt = ev.target;
+                if (tgt?.type !== 'range') return;
+                const index = Number.parseInt(tgt.dataset.index, 10);
+                const target = sliderTargets[index];
+                if (!target) return;
+                const v = parseFloat(tgt.value);
+                const lbl = tgt.parentElement?.querySelector('span[data-index]');
+                if (lbl) lbl.textContent = v.toFixed(2);
+                if (isRpMode()) lightLinking.setReflectionPaintIntensity(v);
+                else lightLinking.setEnvIntensity(target.key, v);
+            });
+            objList.addEventListener('change', (ev) => {
+                if (isSliderMode()) return;
+                applyFromUI();
+            });
+
+            document.getElementById('ll-sel-all').addEventListener('click', () => {
+                if (isSliderMode()) return;
+                for (const cb of objList.querySelectorAll('input[type=checkbox]')) cb.checked = true;
+                applyFromUI();
+            });
+            document.getElementById('ll-sel-none').addEventListener('click', () => {
+                if (isSliderMode()) return;
+                for (const cb of objList.querySelectorAll('input[type=checkbox]')) cb.checked = false;
+                applyFromUI();
+            });
+
+            constrainCam.addEventListener('change', () => {
+                const sel = getSelectedLight();
+                if (isRpMode()) {
+                    lightLinking.setReflectionPaintConstrainToCamera(constrainCam.checked);
+                } else if (isHdriMode()) {
+                    lightLinking.setHdriConstrainToCamera(constrainCam.checked);
+                } else {
+                    lightLinking.setLightConstrainToCamera(sel, constrainCam.checked);
+                }
+            });
+
+            loadLightState();
+        }
+
+        document.getElementById('btnLightLink')?.addEventListener('click', () => {
+            if (isSimpleWebGLPipelineActive()) {
+                perfHud.setStatus('max.js - Light Linking is unavailable in the simple WebGL pipeline');
+                return;
+            }
+            if (!isStudioMode) {
+                perfHud.setStatus('max.js - Light Linking is available in Advanced mode only');
+                return;
+            }
+            setLightLinkPanelVisible(!lightLinkPanelVisible);
+        });
+
+        // ── Reflection Paint Panel ──────────────────────────
+        const reflPaintPanel = document.getElementById('reflPaintPanel');
+        const reflPaint = getReflectionPaintNode();
+        let reflPaintPanelVisible = false;
+        const REFL_PAINT_STORAGE_KEY = 'maxjs-reflection-paint';
+
+        function notifyReflectionPaintChanged(wasActive, options = {}) {
+            if (wasActive !== reflPaint.active) maxjsFx.markSceneChanged?.();
+            maxjsFx.markOutputChanged?.();
+            if (lightLinkPanelVisible && (options.rebuildLightPanel || wasActive !== reflPaint.active)) {
+                rebuildLightLinkPanel();
+            }
+        }
+
+        function setReflPaintPanelVisible(v) {
+            if (v && !isStudioMode) return;
+            reflPaintPanelVisible = !!v;
+            reflPaintPanel.classList.toggle('visible', reflPaintPanelVisible);
+            reflPaintPanel.toggleAttribute('inert', !reflPaintPanelVisible);
+            reflPaintPanel.setAttribute('aria-hidden', String(!reflPaintPanelVisible));
+            document.getElementById('btnReflPaint')?.classList.toggle('active', reflPaintPanelVisible);
+            if (reflPaintPanelVisible) rebuildReflPaintPanel();
+        }
+
+        function saveReflPaint(options = {}) {
+            saveStudioState(options);
+        }
+
+        function serializeReflectionPaintState() {
+            return {
+                intensity: reflPaint.getGlobalIntensity?.() ?? 1.0,
+                lights: reflPaint.getLights(),
+            };
+        }
+
+        function applyReflectionPaintState(payload) {
+            try {
+                const lights = Array.isArray(payload) ? payload : payload?.lights;
+                const wasActive = reflPaint.active;
+                if (Number.isFinite(payload?.intensity)) {
+                    reflPaint.setGlobalIntensity(payload.intensity);
+                } else if (payload && !Array.isArray(payload)) {
+                    reflPaint.setGlobalIntensity(1.0);
+                }
+                reflPaint.clearLights();
+                for (const l of (Array.isArray(lights) ? lights : [])) {
+                    reflPaint.addLight({
+                        id: l.id,
+                        lat: l.lat, lon: l.lon,
+                        color: l.color,
+                        colorOuter: l.colorOuter,
+                        intensity: l.intensity,
+                        radiusX: l.radiusX ?? l.radius ?? 0.15,
+                        radiusY: l.radiusY ?? l.radius ?? 0.15,
+                        edge: l.edge ?? 0.3,
+                        shape: l.shape ?? 'circle',
+                        rotation: l.rotation ?? 0,
+                    });
+                }
+                notifyReflectionPaintChanged(wasActive);
+            } catch {}
+        }
+
+        function readLegacyReflectionPaintState() {
+            try {
+                const raw = localStorage.getItem(REFL_PAINT_STORAGE_KEY);
+                return raw ? { lights: JSON.parse(raw) } : null;
+            } catch {
+                return null;
+            }
+        }
+
+        function rpRow(cls, id, label, type, min, max, step, value, displayVal) {
+            return `<label class="fx-check"><span>${label}</span><div style="display:flex;align-items:center;gap:4px;flex:1;min-width:0;">` +
+                `<input type="${type}" class="fx-range ${cls}" data-id="${id}" min="${min}" max="${max}" step="${step}" value="${value}">` +
+                `<span class="${cls}-val" data-id="${id}" style="width:32px;font-size:9px;text-align:right;color:#999;font-variant-numeric:tabular-nums;flex-shrink:0;">${displayVal}</span></div></label>`;
+        }
+
+        function handleReflPaintInput(ev) {
+            const el = ev.target;
+            const sec = el.closest('[data-id]');
+            const id = Number(sec?.dataset.id || el.dataset.id);
+            if (!id) return;
+            const wasActive = reflPaint.active;
+            const props = {};
+            if (el.classList.contains('rp-lat') || el.classList.contains('rp-lon')) {
+                const latEl = reflPaintPanel.querySelector(`.rp-lat[data-id="${id}"]`);
+                const lonEl = reflPaintPanel.querySelector(`.rp-lon[data-id="${id}"]`);
+                props.lat = parseFloat(latEl.value);
+                props.lon = parseFloat(lonEl.value);
+                const latV = reflPaintPanel.querySelector(`.rp-lat-val[data-id="${id}"]`);
+                const lonV = reflPaintPanel.querySelector(`.rp-lon-val[data-id="${id}"]`);
+                if (latV) latV.textContent = Math.round(props.lat);
+                if (lonV) lonV.textContent = Math.round(props.lon);
+            } else if (el.classList.contains('rp-color')) {
+                props.color = el.value;
+            } else if (el.classList.contains('rp-color-outer')) {
+                props.colorOuter = el.value;
+            } else if (el.classList.contains('rp-int')) {
+                props.intensity = parseFloat(el.value);
+                const v = reflPaintPanel.querySelector(`.rp-int-val[data-id="${id}"]`);
+                if (v) v.textContent = props.intensity.toFixed(1);
+            } else if (el.classList.contains('rp-sx')) {
+                props.radiusX = parseFloat(el.value);
+                const v = reflPaintPanel.querySelector(`.rp-sx-val[data-id="${id}"]`);
+                if (v) v.textContent = props.radiusX.toFixed(2);
+            } else if (el.classList.contains('rp-sy')) {
+                props.radiusY = parseFloat(el.value);
+                const v = reflPaintPanel.querySelector(`.rp-sy-val[data-id="${id}"]`);
+                if (v) v.textContent = props.radiusY.toFixed(2);
+            } else if (el.classList.contains('rp-shape')) {
+                props.shape = el.value;
+            } else if (el.classList.contains('rp-rot')) {
+                props.rotation = parseFloat(el.value) * Math.PI / 180;
+                const v = reflPaintPanel.querySelector(`.rp-rot-val[data-id="${id}"]`);
+                if (v) v.textContent = Math.round(parseFloat(el.value));
+            } else if (el.classList.contains('rp-edge')) {
+                props.edge = parseFloat(el.value);
+                const v = reflPaintPanel.querySelector(`.rp-edge-val[data-id="${id}"]`);
+                if (v) v.textContent = props.edge.toFixed(3);
+            } else {
+                return;
+            }
+            reflPaint.updateLight(id, props);
+            if (lightLinking.getReflectionPaintConstrainToCamera()) {
+                lightLinking.captureReflectionPaintCameraDirections();
+            }
+            saveReflPaint();
+            notifyReflectionPaintChanged(wasActive);
+        }
+
+        reflPaintPanel.addEventListener('input', handleReflPaintInput);
+        reflPaintPanel.addEventListener('change', () => saveReflPaint({ flush: true }));
+
+        function rebuildReflPaintPanel() {
+            const lights = reflPaint.getLights();
+            let html = `<div class="sidepanel-header"><div><div class="sidepanel-title">Reflection Paint</div>` +
+                `<div class="sidepanel-subtitle">Global painted HDRI overlay</div></div>` +
+                `<div style="display:flex;gap:4px"><button id="rp-add" type="button">+ Add</button>` +
+                `<button id="rp-hide" type="button">Hide</button></div></div>`;
+            html += `<div class="sidepanel-body">`;
+
+            if (lights.length === 0) {
+                html += `<div style="color:#555;font-size:10px;padding:4px 0;">No paint lights. Click + Add to paint one on the environment sphere.</div>`;
+            }
+
+            for (const l of lights) {
+                const rotDeg = Math.round((l.rotation || 0) * 180 / Math.PI);
+                html += `<section class="fx-section" data-id="${l.id}">`;
+                html += `<div class="fx-section-title" style="margin-bottom:8px;">`;
+                html += `<span style="flex:1;">Paint ${l.id}</span>`;
+                html += `<button class="rp-del" data-id="${l.id}" type="button" style="color:#c66;">Delete</button>`;
+                html += `</div>`;
+                html += `<div class="fx-grid">`;
+                html += rpRow('rp-lat', l.id, 'Latitude', 'range', -90, 90, 1, Math.round(l.lat), Math.round(l.lat));
+                html += rpRow('rp-lon', l.id, 'Longitude', 'range', 0, 360, 1, Math.round(l.lon), Math.round(l.lon));
+                html += `<label class="fx-check"><span>Color</span><div style="display:flex;align-items:center;gap:6px;">` +
+                    `<input type="color" class="rp-color" data-id="${l.id}" value="${l.color}" style="width:24px;height:16px;border:1px solid rgba(255,255,255,0.1);padding:0;background:none;cursor:pointer;" title="Center">` +
+                    `<span style="font-size:9px;color:#666;">Edge</span>` +
+                    `<input type="color" class="rp-color-outer" data-id="${l.id}" value="${l.colorOuter}" style="width:24px;height:16px;border:1px solid rgba(255,255,255,0.1);padding:0;background:none;cursor:pointer;" title="Edge gradient">` +
+                    `</div></label>`;
+                html += rpRow('rp-int', l.id, 'Intensity', 'range', 0, 10, 0.1, l.intensity, l.intensity.toFixed(1));
+                html += rpRow('rp-sx', l.id, 'Size X', 'range', 0.01, 1.5, 0.01, l.radiusX, l.radiusX.toFixed(2));
+                html += rpRow('rp-sy', l.id, 'Size Y', 'range', 0.01, 1.5, 0.01, l.radiusY, l.radiusY.toFixed(2));
+                html += `<label class="fx-check"><span>Shape</span>` +
+                    `<select class="rp-shape" data-id="${l.id}" style="background:rgba(255,255,255,0.05);color:#bbb;border:1px solid rgba(255,255,255,0.08);padding:3px 6px;font:9px/1 -apple-system,'Segoe UI',system-ui,sans-serif;">` +
+                    `<option value="circle"${l.shape === 'circle' ? ' selected' : ''}>Circle</option>` +
+                    `<option value="rect"${l.shape === 'rect' ? ' selected' : ''}>Rectangle</option></select></label>`;
+                html += rpRow('rp-rot', l.id, 'Rotation', 'range', 0, 360, 1, rotDeg, rotDeg);
+                html += rpRow('rp-edge', l.id, 'Edge', 'range', 0.001, 1, 0.001, l.edge, l.edge.toFixed(3));
+                html += `</div></section>`;
+            }
+
+            html += `</div>`;
+            reflPaintPanel.innerHTML = html;
+
+            document.getElementById('rp-add')?.addEventListener('click', () => {
+                const wasActive = reflPaint.active;
+                reflPaint.addLight({ lat: 45, lon: 90, intensity: 2.0, radiusX: 0.15, radiusY: 0.15, edge: 0.3, shape: 'circle', rotation: 0 });
+                if (lightLinking.getReflectionPaintConstrainToCamera()) {
+                    lightLinking.captureReflectionPaintCameraDirections();
+                }
+                saveReflPaint({ flush: true });
+                notifyReflectionPaintChanged(wasActive, { rebuildLightPanel: true });
+                rebuildReflPaintPanel();
+            });
+            document.getElementById('rp-hide')?.addEventListener('click', () => {
+                setReflPaintPanelVisible(false);
+            });
+
+            for (const btn of reflPaintPanel.querySelectorAll('.rp-del')) {
+                btn.addEventListener('click', () => {
+                    const wasActive = reflPaint.active;
+                    reflPaint.removeLight(Number(btn.dataset.id));
+                    if (lightLinking.getReflectionPaintConstrainToCamera()) {
+                        lightLinking.captureReflectionPaintCameraDirections();
+                    }
+                    saveReflPaint({ flush: true });
+                    notifyReflectionPaintChanged(wasActive);
+                    rebuildReflPaintPanel();
+                });
+            }
+        }
+
+        document.getElementById('btnReflPaint')?.addEventListener('click', () => {
+            if (isSimpleWebGLPipelineActive()) {
+                perfHud.setStatus('max.js - Reflection Paint is unavailable in the simple WebGL pipeline');
+                return;
+            }
+            if (!isStudioMode) {
+                perfHud.setStatus('max.js - Reflection Paint is available in Advanced mode only');
+                return;
+            }
+            setReflPaintPanelVisible(!reflPaintPanelVisible);
+        });
+
+        // ── Studio State Persistence ────────────────────────
+        let studioPersistTimer = 0;
+        let lastProjectStudioSignature = '';
+        let queuedProjectStudioSignature = '';
+        let queuedProjectStudioPayload = null;
+        let studioPersistInFlight = false;
+        let newestLocalStudioSignature = '';
+        let suppressStudioPersistenceDepth = 0;
+        const STUDIO_PERSIST_IDLE_MS = 550;
+
+        function withStudioPersistenceSuppressed(fn) {
+            suppressStudioPersistenceDepth += 1;
+            try {
+                return fn();
+            } finally {
+                suppressStudioPersistenceDepth = Math.max(0, suppressStudioPersistenceDepth - 1);
+            }
+        }
+
+        function serializeStudioState() {
+            return {
+                version: 1,
+                lightLinking: lightLinking.serialize(),
+                reflectionPaint: serializeReflectionPaintState(),
+            };
+        }
+
+        function applyStudioState(payload) {
+            if (!isStudioMode) return;
+            if (!payload || typeof payload !== 'object') return;
+            withStudioPersistenceSuppressed(() => {
+                applyReflectionPaintState(payload.reflectionPaint ?? { lights: [], intensity: 1.0 });
+                lightLinking.applyPayload(payload.lightLinking);
+                if (lightLinkPanelVisible) rebuildLightLinkPanel();
+                if (reflPaintPanelVisible) rebuildReflPaintPanel();
+            });
+        }
+
+        function saveLegacyStudioStateFallback(payload) {
+            if (window.chrome?.webview) return;
+            try {
+                localStorage.setItem(LIGHT_LINK_STORAGE_KEY, JSON.stringify(payload.lightLinking ?? {}));
+                localStorage.setItem(REFL_PAINT_STORAGE_KEY, JSON.stringify(payload.reflectionPaint?.lights ?? []));
+            } catch {}
+        }
+
+        function restoreLegacyStudioStateFallback() {
+            if (window.chrome?.webview) return false;
+            withStudioPersistenceSuppressed(() => {
+                lightLinking.restoreFromStorage();
+                applyReflectionPaintState(readLegacyReflectionPaintState());
+            });
+            return true;
+        }
+
+        function scheduleProjectStudioSave(delayMs = STUDIO_PERSIST_IDLE_MS) {
+            clearTimeout(studioPersistTimer);
+            studioPersistTimer = setTimeout(() => {
+                studioPersistTimer = 0;
+                void flushProjectStudioSave();
+            }, delayMs);
+        }
+
+        async function flushProjectStudioSave() {
+            const projectRuntime = _projectRuntimeRef;
+            if (!projectRuntime?.setStudioState || studioPersistInFlight) return;
+            const payload = queuedProjectStudioPayload;
+            const signature = queuedProjectStudioSignature;
+            if (!payload || !signature) return;
+
+            queuedProjectStudioPayload = null;
+            queuedProjectStudioSignature = '';
+            studioPersistInFlight = true;
+            try {
+                await projectRuntime.setStudioState(payload);
+                lastProjectStudioSignature = signature;
+                if (newestLocalStudioSignature === signature && !queuedProjectStudioPayload) {
+                    newestLocalStudioSignature = '';
+                }
+            } catch (error) {
+                reportBridgeError('studio state save', error);
+            } finally {
+                studioPersistInFlight = false;
+                if (queuedProjectStudioPayload) scheduleProjectStudioSave();
+            }
+        }
+
+        function saveStudioState(options = {}) {
+            if (!isStudioMode) return;
+            if (suppressStudioPersistenceDepth > 0) return;
+            const payload = serializeStudioState();
+            const signature = JSON.stringify(payload);
+            const projectRuntime = _projectRuntimeRef;
+            if (projectRuntime?.setStudioState) {
+                if (signature === lastProjectStudioSignature && !queuedProjectStudioPayload) return;
+                if (signature === queuedProjectStudioSignature) return;
+                newestLocalStudioSignature = signature;
+                lastProjectStudioSignature = signature;
+                queuedProjectStudioPayload = payload;
+                queuedProjectStudioSignature = signature;
+                scheduleProjectStudioSave(options.flush ? 0 : STUDIO_PERSIST_IDLE_MS);
+                return;
+            }
+            saveLegacyStudioStateFallback(payload);
+        }
+
+        function restoreStudioState() {
+            const projectRuntime = _projectRuntimeRef;
+            const projectPayload = projectRuntime?.getStudioState?.();
+            if (projectPayload) {
+                lastProjectStudioSignature = JSON.stringify(projectPayload);
+                newestLocalStudioSignature = '';
+                queuedProjectStudioSignature = '';
+                queuedProjectStudioPayload = null;
+                applyStudioState(projectPayload);
+                return;
+            }
+            if (projectRuntime) return;
+            restoreLegacyStudioStateFallback();
+        }
+
+        function syncProjectStudioState() {
+            const payload = _projectRuntimeRef?.getStudioState?.();
+            if (!payload) return;
+            const signature = JSON.stringify(payload);
+            if (!signature || signature === lastProjectStudioSignature) return;
+            if (newestLocalStudioSignature && signature !== newestLocalStudioSignature) return;
+            lastProjectStudioSignature = signature;
+            applyStudioState(payload);
+        }
+
+        // ── Bake Overrides Panel ───────────────────────────
+        const bakePanel = document.getElementById('bakePanel');
+        let bakePanelVisible = false;
+        let bakePersistTimer = 0;
+        let lastProjectBakeSignature = '';
+        let suppressBakePersistenceDepth = 0;
+        const BAKE_STORAGE_KEY = 'maxjs_bake_state';
+
+        function withBakePersistenceSuppressed(fn) {
+            suppressBakePersistenceDepth += 1;
+            try {
+                return fn();
+            } finally {
+                suppressBakePersistenceDepth = Math.max(0, suppressBakePersistenceDepth - 1);
+            }
+        }
+
+        function escapeBakeHtml(value) {
+            return String(value ?? '').replace(/[&<>"']/g, ch => ({
+                '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+            }[ch]));
+        }
+
+        function getBakeSceneStats() {
+            let meshes = 0;
+            let uv1 = 0;
+            let uv2 = 0;
+            for (const mesh of nodeMap.values()) {
+                if (!mesh?.isMesh) continue;
+                meshes++;
+                if (hasGeometryMaxMapChannel(mesh.geometry, 1)) uv1++;
+                if (hasGeometryUV2(mesh.geometry)) uv2++;
+            }
+            return { meshes, uv1, uv2 };
+        }
+
+        function getBakeUv2RequirementStats(kind = bakeOverrides.mode === 'beauty' ? 'beauty' : 'lightmap') {
+            let required = 0;
+            let ready = 0;
+            for (const mesh of nodeMap.values()) {
+                const nd = mesh?.userData?.maxjsLastNodePayload;
+                if (!mesh?.isMesh || !nd) continue;
+                const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+                for (const material of materials) {
+                    const needsUv2 = getBakeTextureCandidates(nd, material, kind, mesh)
+                        .some(candidate => candidate.maxMapChannel === 2);
+                    if (!needsUv2) continue;
+                    required++;
+                    if (hasGeometryUV2(mesh.geometry)) ready++;
+                }
+            }
+            return { required, ready };
+        }
+
+        function mutateLightmapBakeOnMaterial(material, nd, geom, mesh = null) {
+            if (!material) return false;
+            if (material.isLineBasicMaterial || material.isLineDashedMaterial) return false;
+            const wasOverride = material.userData?.maxjsBakeOverride;
+            const shouldApply = bakeOverrides.enabled && bakeOverrides.mode === 'lightmap';
+
+            if (!shouldApply) {
+                if (wasOverride === 'lightmap') {
+                    material.lightMap = null;
+                    material.lightMapIntensity = 1.0;
+                    restoreWebGpuLightMapUvContext(material);
+                    if (material.userData) delete material.userData.maxjsBakeOverride;
+                    material.needsUpdate = true;
+                    return true;
+                }
+                return false;
+            }
+
+            const candidates = getBakeTextureCandidates(nd, material, 'lightmap', mesh);
+            const usableCandidates = candidates.filter(candidate => hasGeometryMaxMapChannel(geom, candidate.maxMapChannel));
+            if (!candidates.length || !usableCandidates.length) {
+                material.userData ??= {};
+                if (!candidates.length) {
+                    if (wasOverride === 'lightmap') {
+                        material.lightMap = null;
+                        material.lightMapIntensity = 1.0;
+                        restoreWebGpuLightMapUvContext(material);
+                        delete material.userData.maxjsBakeOverride;
+                        material.needsUpdate = true;
+                        return true;
+                    }
+                    return false;
+                }
+                markBakeMissingUv(material, candidates[0]?.maxMapChannel ?? 2);
+                return false;
+            }
+
+            const bake = loadBakeTextureFromCandidates(usableCandidates, THREE.LinearSRGBColorSpace);
+            if (!bake) return false;
+            const nextLightMap = textureWithUvChannel(bake.texture, bake.maxMapChannel, 2);
+            const intensity = bakeExposureScale();
+            const lightMapChanged = material.lightMap !== nextLightMap;
+            const intensityChanged = material.lightMapIntensity !== intensity;
+            const uvChannelChanged = material.userData?.maxjsBakeUvChannel !== bake.maxMapChannel ||
+                material.userData?.maxjsBakeTextureChannel !== (nextLightMap?.channel ?? null);
+            material.lightMap = nextLightMap;
+            const uvContextChanged = applyWebGpuLightMapUvContext(material, bake.maxMapChannel);
+            if (!lightMapChanged && !intensityChanged && !uvChannelChanged && !uvContextChanged && wasOverride === 'lightmap') return false;
+            material.lightMapIntensity = intensity;
+            material.userData ??= {};
+            stampBakeOverrideOwner(material, nd, mesh);
+            clearBakeMissingUv(material);
+            material.userData.maxjsBakeOverride = 'lightmap';
+            material.userData.maxjsBakeSourceUrl = bake.url;
+            material.userData.maxjsBakeUvChannel = bake.maxMapChannel;
+            material.userData.maxjsBakeTextureChannel = nextLightMap?.channel ?? null;
+            if (lightMapChanged || uvChannelChanged || uvContextChanged) material.needsUpdate = true;
+            return true;
+        }
+
+        function reapplyBakeOverridesToScene() {
+            let changed = false;
+            const wantsBeauty = bakeOverrides.enabled && bakeOverrides.mode === 'beauty';
+            const seenMats = new WeakSet();
+
+            for (const mesh of nodeMap.values()) {
+                const nd = mesh?.userData?.maxjsLastNodePayload;
+                if (!mesh || !nd) continue;
+                const mats = Array.isArray(mesh.material) ? mesh.material : (mesh.material ? [mesh.material] : []);
+                const hasBeautyOverride = mats.some(m => m?.userData?.maxjsBakeOverride === 'beauty');
+
+                if (wantsBeauty || hasBeautyOverride) {
+                    const wantsLine = mesh.isLine || mesh.isLineSegments;
+                    mesh.userData ??= {};
+                    mesh.userData.maxjsMaterialSignature = '';
+                    if (ensureSceneRenderableMaterial(mesh, nd, wantsLine)) {
+                        changed = true;
+                        if (nd.h != null) layerManager.applyMaterialOverrides?.(nd.h, mesh);
+                    }
+                    continue;
+                }
+
+                for (let materialIndex = 0; materialIndex < mats.length; materialIndex++) {
+                    let m = mats[materialIndex];
+                    if (!m) continue;
+                    const unique = ensureBakeOverrideMaterialInstance(m, nd, mesh);
+                    if (unique !== m) {
+                        if (Array.isArray(mesh.material)) mesh.material[materialIndex] = unique;
+                        else mesh.material = unique;
+                        disposeSceneMaterial(m);
+                        m = unique;
+                        changed = true;
+                    }
+                    if (seenMats.has(m)) continue;
+                    seenMats.add(m);
+                    if (mutateLightmapBakeOnMaterial(m, nd, mesh.geometry, mesh)) changed = true;
+                }
+            }
+            if (changed) {
+                maxjsFx.markSceneChanged?.();
+                maxjsFx.markOutputChanged?.();
+                markLightProbeSceneDirty();
+                scheduleLightProbeFromCurrentScene({ delay: 250 });
+            }
+            return changed;
+        }
+
+        function applyBakeState(payload, { persist = false, rebuild = true, refreshPanel = true, force = false } = {}) {
+            const next = normalizeBakeState(payload);
+            const prevSignature = bakeStateSignature();
+            const nextSignature = JSON.stringify(next);
+            const activeEl = document.activeElement;
+            const bakePanelEditing = !!(bakePanelVisible && activeEl && bakePanel.contains(activeEl) && activeEl.matches?.('input,select,textarea'));
+            if (!force && prevSignature === nextSignature) {
+                if (refreshPanel && bakePanelVisible && !bakePanelEditing) rebuildBakePanel();
+                return;
+            }
+            bakeOverrides = next;
+            maybeRequestBakeUv2Resync('bake-overrides');
+            if (rebuild) reapplyBakeOverridesToScene();
+            if (refreshPanel && bakePanelVisible && !bakePanelEditing) rebuildBakePanel();
+            if (persist) saveBakeState();
+        }
+
+        function saveBakeState() {
+            if (suppressBakePersistenceDepth > 0) return;
+            const payload = serializeBakeState();
+            const signature = JSON.stringify(payload);
+            const projectRuntime = _projectRuntimeRef;
+            if (projectRuntime?.setBakeState) {
+                if (signature === lastProjectBakeSignature) return;
+                lastProjectBakeSignature = signature;
+                clearTimeout(bakePersistTimer);
+                bakePersistTimer = setTimeout(() => {
+                    bakePersistTimer = 0;
+                    void projectRuntime.setBakeState(payload).catch(error => {
+                        reportBridgeError('bake state save', error);
+                    });
+                }, 550);
+                return;
+            }
+            try {
+                localStorage.setItem(BAKE_STORAGE_KEY, signature);
+            } catch {}
+        }
+
+        function restoreBakeState() {
+            const projectPayload = _projectRuntimeRef?.getBakeState?.();
+            if (projectPayload) {
+                lastProjectBakeSignature = JSON.stringify(projectPayload);
+                withBakePersistenceSuppressed(() => {
+                    applyBakeState(projectPayload, { rebuild: true });
+                });
+                return;
+            }
+            if (_projectRuntimeRef) return;
+            try {
+                const raw = localStorage.getItem(BAKE_STORAGE_KEY);
+                if (raw) {
+                    withBakePersistenceSuppressed(() => {
+                        applyBakeState(JSON.parse(raw), { rebuild: true });
+                    });
+                }
+            } catch {}
+        }
+
+        function syncProjectBakeState() {
+            const payload = _projectRuntimeRef?.getBakeState?.();
+            if (!payload) return;
+            const signature = JSON.stringify(payload);
+            if (!signature || signature === lastProjectBakeSignature) return;
+            lastProjectBakeSignature = signature;
+            withBakePersistenceSuppressed(() => {
+                applyBakeState(payload, { rebuild: true });
+            });
+        }
+
+        function setBakePanelVisible(v) {
+            bakePanelVisible = !!v;
+            bakePanel.classList.toggle('visible', bakePanelVisible);
+            bakePanel.toggleAttribute('inert', !bakePanelVisible);
+            bakePanel.setAttribute('aria-hidden', String(!bakePanelVisible));
+            document.getElementById('btnBakeOverrides')?.classList.toggle('active', bakePanelVisible);
+            if (bakePanelVisible) rebuildBakePanel();
+        }
+
+        function readBakeStateFromPanel() {
+            return normalizeBakeState({
+                enabled: bakePanel.querySelector('#bake-enabled')?.checked === true,
+                mode: bakePanel.querySelector('#bake-mode')?.value,
+                match: bakePanel.querySelector('#bake-match')?.value,
+                folder: bakePanel.querySelector('#bake-folder')?.value,
+                sceneName: bakePanel.querySelector('#bake-scene')?.value,
+                lightSuffix: bakePanel.querySelector('#bake-light-suffix')?.value,
+                beautySuffix: bakePanel.querySelector('#bake-beauty-suffix')?.value,
+                extension: bakePanel.querySelector('#bake-ext')?.value,
+                intensity: parseFloat(bakePanel.querySelector('#bake-intensity')?.value),
+                bakeExposure: parseFloat(bakePanel.querySelector('#bake-exposure')?.value),
+            });
+        }
+
+        function updateBakePanelPreview(next) {
+            const intensityLabel = bakePanel.querySelector('#bake-intensity')?.nextElementSibling;
+            if (intensityLabel) intensityLabel.textContent = next.intensity.toFixed(2);
+            const exposureLabel = bakePanel.querySelector('#bake-exposure')?.nextElementSibling;
+            if (exposureLabel) exposureLabel.textContent = `${next.bakeExposure >= 0 ? '+' : ''}${next.bakeExposure.toFixed(1)} EV`;
+            const previous = bakeOverrides;
+            bakeOverrides = next;
+            const sampleLight = getBakeTextureUrl({ n: 'ObjectName', h: 0 }, null, 'lightmap') || 'Set a folder to preview path';
+            const sampleBeauty = getBakeTextureUrl({ n: 'ObjectName', h: 0 }, null, 'beauty') || 'Set a folder to preview path';
+            bakeOverrides = previous;
+            const lightPreview = bakePanel.querySelector('#bake-light-preview');
+            const beautyPreview = bakePanel.querySelector('#bake-beauty-preview');
+            if (lightPreview) lightPreview.innerHTML = `<span class="bake-path-label">Light</span>${escapeBakeHtml(sampleLight)}`;
+            if (beautyPreview) beautyPreview.innerHTML = `<span class="bake-path-label">Beauty</span>${escapeBakeHtml(sampleBeauty)}`;
+        }
+
+        function getBakeTargetPreviewRows(limit = 8) {
+            const kind = bakeOverrides.mode === 'beauty' ? 'beauty' : 'lightmap';
+            const rows = [];
+            const seen = new Set();
+            for (const mesh of nodeMap.values()) {
+                const nd = mesh?.userData?.maxjsLastNodePayload;
+                if (!mesh?.isMesh || !nd) continue;
+                const material = Array.isArray(mesh.material) ? mesh.material[0] : mesh.material;
+                const stem = sanitizeBakeFileStem(getBakeTargetName(nd, material, mesh));
+                const key = `${stem}|${kind}`;
+                if (seen.has(key)) continue;
+                seen.add(key);
+                rows.push({
+                    stem,
+                    url: getBakeTextureUrl(nd, material, kind, mesh) || '',
+                });
+                if (rows.length >= limit) break;
+            }
+            return rows;
+        }
+
+        function renderBakeTargetPreview(rows) {
+            if (!rows.length) return '';
+            const html = rows.map(row => `
+                <div class="bake-target-row">
+                    <span class="bake-target-name">${escapeBakeHtml(row.stem)}</span>
+                    <span class="bake-target-url">${escapeBakeHtml(row.url)}</span>
+                </div>
+            `).join('');
+            return `<div class="bake-path-preview bake-target-list"><span class="bake-path-label">Targets</span>${html}</div>`;
+        }
+
+        function getAllBakeProxyTargets() {
+            const rows = [];
+            const seen = new Set();
+            for (const mesh of nodeMap.values()) {
+                const nd = mesh?.userData?.maxjsLastNodePayload;
+                if (!mesh?.isMesh || !nd) continue;
+                const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+                for (const material of materials) {
+                    const stem = sanitizeBakeFileStem(getBakeTargetName(nd, material, mesh));
+                    const candidates = getBakeTextureCandidates(nd, material, 'beauty', mesh, 'exr')
+                        .filter(candidate => hasGeometryMaxMapChannel(mesh.geometry, candidate.maxMapChannel));
+                    for (const candidate of candidates) {
+                        const filename = candidate.filename.replace(/\.[^./\\]+$/, '.png');
+                        if (seen.has(filename)) continue;
+                        seen.add(filename);
+                        rows.push({
+                            stem,
+                            filename,
+                            sourceUrl: candidate.url,
+                        });
+                    }
+                }
+            }
+            rows.sort((a, b) => {
+                const knownA = /^(containers?_main|containers?_bg|ground_main|ground_bg|character|bg)$/i.test(a.stem);
+                const knownB = /^(containers?_main|containers?_bg|ground_main|ground_bg|character|bg)$/i.test(b.stem);
+                if (knownA !== knownB) return knownA ? -1 : 1;
+                return a.stem.localeCompare(b.stem, undefined, { sensitivity: 'base' });
+            });
+            return rows;
+        }
+
+        function loadProxySourceTexture(url) {
+            return new Promise((resolve, reject) => {
+                const ext = getTextureExtension(url);
+                const loader = ext === 'exr'
+                    ? exrLoader
+                    : (ext === 'hdr' ? rgbeLoader : textureLoader);
+                loader.load(
+                    url,
+                    texture => {
+                        texture.colorSpace = colorSpaceForTextureExtension(ext, THREE.SRGBColorSpace);
+                        texture.needsUpdate = true;
+                        resolve(texture);
+                    },
+                    undefined,
+                    error => reject(error || new Error(`Failed to load ${url}`)),
+                );
+            });
+        }
+
+        function cloneProxyTextureForWebGL(texture) {
+            if (!texture?.isTexture) return null;
+            let result = null;
+            if (texture.isDataTexture && texture.image?.data) {
+                const image = texture.image;
+                result = new THREE_STD.DataTexture(
+                    image.data,
+                    image.width,
+                    image.height,
+                    texture.format,
+                    texture.type,
+                );
+                result.unpackAlignment = texture.unpackAlignment;
+            } else if (texture.image) {
+                result = new THREE_STD.Texture(texture.image);
+            }
+            if (!result) return null;
+            result.colorSpace = texture.colorSpace;
+            result.flipY = texture.flipY;
+            result.wrapS = result.wrapT = THREE_STD.ClampToEdgeWrapping;
+            result.minFilter = THREE_STD.LinearFilter;
+            result.magFilter = THREE_STD.LinearFilter;
+            result.generateMipmaps = false;
+            result.channel = 0;
+            result.needsUpdate = true;
+            return result;
+        }
+
+        let bakeProxyRenderer = null;
+        const BAKE_PROXY_MAX_SOURCE_DIMENSION = 8192;
+        function getBakeProxyRenderer() {
+            if (bakeProxyRenderer) return bakeProxyRenderer;
+            bakeProxyRenderer = new THREE_STD.WebGLRenderer({
+                antialias: false,
+                alpha: false,
+                premultipliedAlpha: false,
+                preserveDrawingBuffer: false,
+            });
+            bakeProxyRenderer.outputColorSpace = THREE_STD.SRGBColorSpace;
+            bakeProxyRenderer.setPixelRatio(1);
+            return bakeProxyRenderer;
+        }
+
+        function stdToneMappingForCurrentMode() {
+            return {
+                None: THREE_STD.NoToneMapping,
+                Linear: THREE_STD.LinearToneMapping,
+                Reinhard: THREE_STD.ReinhardToneMapping,
+                Cineon: THREE_STD.CineonToneMapping,
+                AgX: THREE_STD.AgXToneMapping,
+                Neutral: THREE_STD.NeutralToneMapping,
+            }[currentToneMapping] ?? THREE_STD.NeutralToneMapping;
+        }
+
+        async function renderBakeTextureProxy(target) {
+            const source = await loadProxySourceTexture(target.sourceUrl);
+            const image = source.image || {};
+            const sourceWidth = Math.max(1, Number(image.width) || 1);
+            const sourceHeight = Math.max(1, Number(image.height) || 1);
+            const width = Math.round(sourceWidth);
+            const height = Math.round(sourceHeight);
+            if (width > BAKE_PROXY_MAX_SOURCE_DIMENSION || height > BAKE_PROXY_MAX_SOURCE_DIMENSION) {
+                throw new Error(`Bake proxy source is ${width}x${height}; PNG proxy export preserves source size and supports up to ${BAKE_PROXY_MAX_SOURCE_DIMENSION}px per side`);
+            }
+
+            const proxyTexture = cloneProxyTextureForWebGL(source);
+            if (!proxyTexture) throw new Error(`Unsupported proxy source texture: ${target.sourceUrl}`);
+
+            const rendererProxy = getBakeProxyRenderer();
+            const previousTarget = rendererProxy.getRenderTarget();
+            const previousToneMapping = rendererProxy.toneMapping;
+            const previousExposure = rendererProxy.toneMappingExposure;
+            const previousOutputColorSpace = rendererProxy.outputColorSpace;
+            rendererProxy.setSize(width, height, false);
+            rendererProxy.outputColorSpace = THREE_STD.SRGBColorSpace;
+            rendererProxy.toneMapping = stdToneMappingForCurrentMode();
+            rendererProxy.toneMappingExposure = currentExposure;
+
+            const sceneProxy = new THREE_STD.Scene();
+            const cameraProxy = new THREE_STD.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+            const exposureScale = bakeExposureScale();
+            const materialProxy = new THREE_STD.MeshBasicMaterial({
+                color: new THREE_STD.Color(exposureScale, exposureScale, exposureScale),
+                map: proxyTexture,
+                toneMapped: true,
+            });
+            const meshProxy = new THREE_STD.Mesh(new THREE_STD.PlaneGeometry(2, 2), materialProxy);
+            sceneProxy.add(meshProxy);
+
+            const renderTarget = new THREE_STD.WebGLRenderTarget(width, height, {
+                format: THREE_STD.RGBAFormat,
+                type: THREE_STD.UnsignedByteType,
+                depthBuffer: false,
+                stencilBuffer: false,
+            });
+            renderTarget.texture.colorSpace = THREE_STD.SRGBColorSpace;
+
+            try {
+                rendererProxy.setRenderTarget(renderTarget);
+                rendererProxy.clear(true, true, true);
+                rendererProxy.render(sceneProxy, cameraProxy);
+                const rgba = new Uint8Array(width * height * 4);
+                rendererProxy.readRenderTargetPixels(renderTarget, 0, 0, width, height, rgba);
+                const rgb = new Uint8Array(width * height * 3);
+                for (let y = 0; y < height; y++) {
+                    const srcRow = height - 1 - y;
+                    for (let x = 0; x < width; x++) {
+                        const src = (srcRow * width + x) * 4;
+                        const dst = (y * width + x) * 3;
+                        rgb[dst + 0] = rgba[src + 0];
+                        rgb[dst + 1] = rgba[src + 1];
+                        rgb[dst + 2] = rgba[src + 2];
+                    }
+                }
+                return { width, height, rgb };
+            } finally {
+                rendererProxy.setRenderTarget(previousTarget);
+                rendererProxy.toneMapping = previousToneMapping;
+                rendererProxy.toneMappingExposure = previousExposure;
+                rendererProxy.outputColorSpace = previousOutputColorSpace;
+                renderTarget.dispose();
+                materialProxy.dispose();
+                meshProxy.geometry.dispose();
+                proxyTexture.dispose?.();
+                source.dispose?.();
+            }
+        }
+
+        let bakeProxyExportActive = false;
+        async function encodeBeautyBakeProxyMaps() {
+            if (bakeProxyExportActive) return;
+            if (!window.chrome?.webview) {
+                reportBridgeError('bake proxy encode', 'Available only inside max.js');
+                return;
+            }
+            const current = bakePanelVisible ? readBakeStateFromPanel() : bakeOverrides;
+            if (current.mode !== 'beauty') {
+                reportBridgeError('bake proxy encode', 'Switch Bake Overrides mode to Beauty first');
+                return;
+            }
+            if (!current.folder) {
+                reportBridgeError('bake proxy encode', 'Set a bake folder first');
+                return;
+            }
+
+            applyBakeState(current, { persist: true, rebuild: true, refreshPanel: false, force: true });
+            const targets = getAllBakeProxyTargets();
+            if (targets.length === 0) {
+                reportBridgeError('bake proxy encode', 'No UV1/UV2 beauty bake targets found');
+                return;
+            }
+
+            bakeProxyExportActive = true;
+            if (bakePanelVisible) rebuildBakePanel();
+            try {
+                let written = 0;
+                let skipped = 0;
+                for (let i = 0; i < targets.length; i++) {
+                    const target = targets[i];
+                    perfHud.setStatus(`max.js - encoding beauty proxy ${i + 1}/${targets.length}: ${target.filename}`);
+                    try {
+                        const rendered = await renderBakeTextureProxy(target);
+                        await requestHostAction('bake_proxy_image_write', {
+                            folder: current.folder,
+                            filename: target.filename,
+                            width: rendered.width,
+                            height: rendered.height,
+                            rgbBase64: bytesToBase64(rendered.rgb),
+                        }, 120000);
+                        written++;
+                    } catch (error) {
+                        skipped++;
+                        maxjsDebugWarn(
+                            `[max.js bake proxy] skipped ${target.filename} from ${target.sourceUrl}:`,
+                            error,
+                        );
+                    }
+                }
+                if (written <= 0) {
+                    throw new Error(`No beauty proxy maps were written (${skipped} skipped)`);
+                }
+
+                applyBakeState({ ...bakeOverrides, extension: 'png', proxyDisplay: true }, {
+                    persist: true,
+                    rebuild: true,
+                    refreshPanel: true,
+                    force: true,
+                });
+                perfHud.setStatus(`max.js - encoded ${written} display-baked PNG beauty proxies${skipped ? ` (${skipped} skipped)` : ''}`);
+            } catch (error) {
+                reportBridgeError('bake proxy encode', error);
+            } finally {
+                bakeProxyExportActive = false;
+                if (bakePanelVisible) rebuildBakePanel();
+            }
+        }
+
+        function isBakeTextInput(el) {
+            return el?.tagName === 'INPUT' && String(el.type || '').toLowerCase() === 'text';
+        }
+
+        function updateBakeStateFromPanel(event) {
+            const next = readBakeStateFromPanel();
+            updateBakePanelPreview(next);
+            if (event?.type === 'input' && isBakeTextInput(event.target)) return;
+            applyBakeState(next, { persist: true, rebuild: true, refreshPanel: false });
+        }
+
+        function rebuildBakePanel() {
+            const b = normalizeBakeState(bakeOverrides);
+            const stats = getBakeSceneStats();
+            const sampleLight = getBakeTextureUrl({ n: 'ObjectName', h: 0 }, null, 'lightmap') || 'Set a folder to preview path';
+            const sampleBeauty = getBakeTextureUrl({ n: 'ObjectName', h: 0 }, null, 'beauty') || 'Set a folder to preview path';
+            const targetRows = getBakeTargetPreviewRows();
+            const targetPreview = renderBakeTargetPreview(targetRows);
+            bakePanel.innerHTML = `
+                <div class="sidepanel-header">
+                    <div><div class="sidepanel-title">Bake Overrides</div>
+                    <div class="sidepanel-subtitle">UV1/UV2 bake maps</div></div>
+                    <button id="bake-hide" type="button">Hide</button>
+                </div>
+                <div class="sidepanel-body">
+                    <section class="fx-section">
+                        <div class="fx-section-title"><span>Runtime Bake Source</span></div>
+                        <div class="bake-grid">
+                            <label class="fx-check"><span>Enabled</span><input id="bake-enabled" type="checkbox" ${b.enabled ? 'checked' : ''}></label>
+                            <label class="bake-field"><span>Mode</span><select id="bake-mode"><option value="lightmap"${b.mode === 'lightmap' ? ' selected' : ''}>Lightmap</option><option value="beauty"${b.mode === 'beauty' ? ' selected' : ''}>Beauty</option></select></label>
+                            <label class="bake-field"><span>Match</span><select id="bake-match"><option value="scene"${b.match === 'scene' ? ' selected' : ''}>Scene atlas</option><option value="object"${b.match === 'object' ? ' selected' : ''}>Object name</option><option value="material"${b.match === 'material' ? ' selected' : ''}>Material name</option></select></label>
+                            <label class="bake-field"><span>Folder</span><input id="bake-folder" type="text" value="${escapeBakeHtml(b.folder)}" placeholder="F:\\bakes\\ or ./bakes/"></label>
+                        </div>
+                    </section>
+                    <section class="fx-section">
+                        <div class="fx-section-title"><span>Naming</span></div>
+                        <div class="bake-grid">
+                            <label class="bake-field"><span>Scene Stem</span><input id="bake-scene" type="text" value="${escapeBakeHtml(b.sceneName)}"></label>
+                            <label class="bake-field"><span>Light Suffix</span><input id="bake-light-suffix" type="text" value="${escapeBakeHtml(b.lightSuffix)}"></label>
+                            <label class="bake-field"><span>Beauty Suffix</span><input id="bake-beauty-suffix" type="text" value="${escapeBakeHtml(b.beautySuffix)}"></label>
+                            <label class="bake-field"><span>Ext</span><input id="bake-ext" type="text" value="${escapeBakeHtml(b.extension)}"></label>
+                            <label class="bake-field"><span>Intensity</span><span class="bake-range"><input id="bake-intensity" class="fx-range" type="range" min="0" max="4" step="0.05" value="${b.intensity}"><span class="bake-value">${b.intensity.toFixed(2)}</span></span></label>
+                            <label class="bake-field"><span>Exposure</span><span class="bake-range"><input id="bake-exposure" class="fx-range" type="range" min="-6" max="6" step="0.1" value="${b.bakeExposure}"><span class="bake-value">${b.bakeExposure >= 0 ? '+' : ''}${b.bakeExposure.toFixed(1)} EV</span></span></label>
+                            <button id="bake-reset-look" class="bake-reset-look" type="button">Reset Look</button>
+                        </div>
+                    </section>
+                    <section class="fx-section">
+                        <div class="fx-section-title"><span>Status</span></div>
+                        <div class="bake-status-row">
+                            <div class="bake-stat"><span>Meshes</span><strong>${stats.meshes}</strong></div>
+                            <div class="bake-stat"><span>UV1 Ready</span><strong>${stats.uv1}</strong></div>
+                            <div class="bake-stat"><span>UV2 Ready</span><strong>${stats.uv2}</strong></div>
+                        </div>
+                        <div id="bake-light-preview" class="bake-path-preview"><span class="bake-path-label">Light</span>${escapeBakeHtml(sampleLight)}</div>
+                        <div id="bake-beauty-preview" class="bake-path-preview"><span class="bake-path-label">Beauty</span>${escapeBakeHtml(sampleBeauty)}</div>
+                        ${targetPreview}
+                        <div class="bake-actions">
+                            <button id="bake-reapply" type="button">Reapply</button>
+                            <button id="bake-sync" type="button">Sync UV2</button>
+                            <button id="bake-proxy" type="button" ${bakeProxyExportActive ? 'disabled' : ''}>Encode PNG Proxy</button>
+                        </div>
+                    </section>
+                </div>`;
+            bakePanel.querySelector('#bake-hide')?.addEventListener('click', () => setBakePanelVisible(false));
+            bakePanel.querySelector('#bake-reset-look')?.addEventListener('click', () => {
+                const intensity = bakePanel.querySelector('#bake-intensity');
+                const exposure = bakePanel.querySelector('#bake-exposure');
+                if (intensity) intensity.value = DEFAULT_BAKE_STATE.intensity;
+                if (exposure) exposure.value = DEFAULT_BAKE_STATE.bakeExposure;
+                const next = readBakeStateFromPanel();
+                updateBakePanelPreview(next);
+                applyBakeState(next, { persist: true, rebuild: true, refreshPanel: false, force: true });
+            });
+            bakePanel.querySelector('#bake-reapply')?.addEventListener('click', () => {
+                clearBakeTextureLoadFailures();
+                applyBakeState(readBakeStateFromPanel(), { persist: true, rebuild: true, refreshPanel: false, force: true });
+                perfHud.setStatus('max.js - bake overrides reapplied');
+            });
+            bakePanel.querySelector('#bake-sync')?.addEventListener('click', () => {
+                lastBakeUv2RequestKey = '';
+                bridge.send('sync_lightmap_uvs', { reason: 'manual' });
+                perfHud.setStatus('max.js - requested full scene sync for UV2/lightmaps');
+            });
+            bakePanel.querySelector('#bake-proxy')?.addEventListener('click', () => {
+                void encodeBeautyBakeProxyMaps();
+            });
+            for (const el of bakePanel.querySelectorAll('input,select')) {
+                if (isBakeTextInput(el) || el.id === 'bake-intensity' || el.id === 'bake-exposure') {
+                    el.addEventListener('input', updateBakeStateFromPanel);
+                }
+                el.addEventListener('change', updateBakeStateFromPanel);
+            }
+        }
+
+        document.getElementById('btnBakeOverrides')?.addEventListener('click', () => {
+            setBakePanelVisible(!bakePanelVisible);
+        });
+
+        // ── Hair And Fur GPU Instancing ─────────────────────
+        const hairMeshes = new Map(); // handle -> { root, mesh }
+
+        function createHairBladeGeometry() {
+            const rows = 5;
+            const positions = [];
+            const normals = [];
+            const uvs = [];
+            const indices = [];
+
+            function appendPlane(angle) {
+                const c = Math.cos(angle);
+                const s = Math.sin(angle);
+                const baseVertex = positions.length / 3;
+                const nx = s;
+                const ny = 0;
+                const nz = c;
+
+                for (let row = 0; row <= rows; row++) {
+                    const v = row / rows;
+                    const taper = Math.max(0.02, Math.pow(1.0 - v, 0.7));
+                    const halfWidth = 0.5 * taper;
+
+                    const lx0 = -halfWidth;
+                    const lx1 = halfWidth;
+                    const x0 = lx0 * c;
+                    const z0 = -lx0 * s;
+                    const x1 = lx1 * c;
+                    const z1 = -lx1 * s;
+
+                    positions.push(x0, v, z0, x1, v, z1);
+                    normals.push(nx, ny, nz, nx, ny, nz);
+                    uvs.push(0, v, 1, v);
+
+                    if (row < rows) {
+                        const base = baseVertex + row * 2;
+                        indices.push(base, base + 1, base + 2);
+                        indices.push(base + 1, base + 3, base + 2);
+                    }
+                }
+            }
+
+            appendPlane(0);
+            appendPlane(Math.PI * 0.5);
+
+            const geom = new THREE.BufferGeometry();
+            geom.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+            geom.setAttribute('normal', new THREE.Float32BufferAttribute(normals, 3));
+            geom.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
+            geom.setIndex(indices);
+            geom.computeBoundingBox();
+            geom.computeBoundingSphere();
+            return geom;
+        }
+
+        const hairBladeGeometry = createHairBladeGeometry();
+
+        function disposeHairEntry(handle) {
+            const entry = hairMeshes.get(handle);
+            if (!entry) return;
+            if (entry.root?.parent) entry.root.parent.remove(entry.root);
+            disposeSceneMaterial(entry.mesh?.material);
+            hairMeshes.delete(handle);
+        }
+
+        function disposeHairInstances() {
+            for (const handle of Array.from(hairMeshes.keys())) disposeHairEntry(handle);
+        }
+
+        function applyHairTransform(handle, matrixArray) {
+            // Hair instance matrices are world-space — transform updates are
+            // handled via hair_fast re-extraction, not root group transforms.
+            return false;
+        }
+
+        function applyHairVisibility(handle, visible) {
+            const entry = hairMeshes.get(handle);
+            if (!entry?.root) return false;
+            entry.root.visible = !!visible;
+            return true;
+        }
+
+        function buildHairEntry(grp) {
+            const count = grp.count || Math.floor((grp.xforms?.length || 0) / 16);
+            if (!count || !Array.isArray(grp.xforms) || grp.xforms.length < count * 16) return null;
+
+            let mat = grp.mat ? createMaterial(grp.mat, {
+                geometry: hairBladeGeometry,
+                materialIndex: null,
+            }) : new THREE.MeshPhysicalMaterial({
+                color: 0xffffff,
+                roughness: 0.8,
+                metalness: 0.0,
+                side: THREE.DoubleSide,
+            });
+            if (Array.isArray(mat)) {
+                mat = mat[0] ?? new THREE.MeshPhysicalMaterial({ color: 0xffffff, side: THREE.DoubleSide });
+            }
+            mat.side = THREE.DoubleSide;
+            mat.vertexColors = true;
+            if ((grp.mat?.opacity ?? 1) < 0.999) mat.transparent = true;
+            mat.needsUpdate = true;
+
+            const instMesh = new THREE.InstancedMesh(hairBladeGeometry, mat, count);
+            instMesh.matrixAutoUpdate = false;
+            instMesh.frustumCulled = false;
+            instMesh.castShadow = true;
+            instMesh.receiveShadow = true;
+            instMesh.name = `hair_${grp.h}_x${count}`;
+
+            const m = new THREE.Matrix4();
+            const c = new THREE.Color();
+            for (let i = 0; i < count; i++) {
+                m.fromArray(grp.xforms, i * 16);
+                instMesh.setMatrixAt(i, m);
+
+                const colorOff = i * 3;
+                const r = grp.colors?.[colorOff + 0] ?? 1.0;
+                const g = grp.colors?.[colorOff + 1] ?? 1.0;
+                const b = grp.colors?.[colorOff + 2] ?? 1.0;
+                c.setRGB(r, g, b);
+                instMesh.setColorAt(i, c);
+            }
+            instMesh.instanceMatrix.needsUpdate = true;
+            if (instMesh.instanceColor) instMesh.instanceColor.needsUpdate = true;
+
+            const root = new THREE.Group();
+            root.matrixAutoUpdate = false;
+            root.name = `hair_root_${grp.h}`;
+            root.userData.maxjsHair = true;
+            root.visible = grp.vis == null ? true : !!grp.vis;
+            root.add(instMesh);
+            maxRoot.add(root);
+
+            const entry = { root, mesh: instMesh };
+            hairMeshes.set(grp.h, entry);
+            return entry;
+        }
+
+        function applyHairInstances(groups) {
+            disposeHairInstances();
+            if (!Array.isArray(groups) || groups.length === 0) return;
+            for (const grp of groups) buildHairEntry(grp);
+        }
+
+        // ── ForestPack GPU Instancing ───────────────────────
+        const forestMeshes = new Map(); // key → InstancedMesh
+        let forestBuildSerial = 0;
+        const FOREST_INSTANCE_UPLOAD_CHUNK = 4096;
+
+        function getForestBinaryFloatView(buffer, off, n, label) {
+            if (!(buffer instanceof ArrayBuffer) || !binInRange(buffer, off, n)) {
+                console.warn(`[max.js binary] Invalid ${label} range`);
+                return null;
+            }
+            return new Float32Array(buffer, off, n);
+        }
+
+        function getForestGeometryPayload(grp, binaryBuffer) {
+            const geo = grp?.geo;
+            if (geo && binaryBuffer instanceof ArrayBuffer) {
+                const v = getForestBinaryFloatView(binaryBuffer, geo.vOff, geo.vN, 'forest position');
+                const i = indexArrayFromBinary(binaryBuffer, geo.iOff, geo.iN, geo.iType, {
+                    copy: true,
+                    label: 'forest index',
+                });
+                if (!v || !i) return null;
+                const uvAttr = geo.uvOff != null && geo.uvN
+                    ? uvAttributeFromBinary(binaryBuffer, geo.uvOff, geo.uvN, geo.uvType, 'forest uv')
+                    : null;
+                const normalAttr = geo.nOff != null && geo.nN
+                    ? normalAttributeFromBinary(binaryBuffer, geo.nOff, geo.nN, geo.nType, 'forest normal')
+                    : null;
+                return {
+                    v: new Float32Array(v),
+                    i,
+                    uv: null,
+                    uvAttr,
+                    norm: null,
+                    normalAttr,
+                };
+            }
+            if (!grp?.v?.length || !grp?.i?.length) return null;
+            return { v: grp.v, i: grp.i, uv: grp.uv, uvAttr: null, norm: grp.norm, normalAttr: null };
+        }
+
+        function getForestTransformPayload(grp, binaryBuffer) {
+            if (Number.isInteger(grp?.xformOff) && Number.isInteger(grp?.xformN) && binaryBuffer instanceof ArrayBuffer) {
+                const values = getForestBinaryFloatView(binaryBuffer, grp.xformOff, grp.xformN, 'forest transform');
+                if (!values) return null;
+                const type = String(grp.xformType ?? 'f32m16').trim().toLowerCase();
+                return { values, type, stride: type === 'affine12' ? 12 : 16 };
+            }
+            if (Array.isArray(grp?.xforms) || ArrayBuffer.isView(grp?.xforms)) {
+                return { values: grp.xforms, type: 'f32m16', stride: 16 };
+            }
+            return null;
+        }
+
+        function setForestInstanceMatrix(matrix, payload, index) {
+            const values = payload.values;
+            const off = index * payload.stride;
+            if (payload.type === 'affine12') {
+                matrix.set(
+                    values[off+0], values[off+3], values[off+6],  values[off+9],
+                    values[off+1], values[off+4], values[off+7],  values[off+10],
+                    values[off+2], values[off+5], values[off+8],  values[off+11],
+                    0,             0,             0,              1
+                );
+                return;
+            }
+            matrix.set(
+                values[off+0], values[off+4], values[off+8],  values[off+12],
+                values[off+1], values[off+5], values[off+9],  values[off+13],
+                values[off+2], values[off+6], values[off+10], values[off+14],
+                values[off+3], values[off+7], values[off+11], values[off+15]
+            );
+        }
+
+        function writeForestInstanceMatrixAt(target, targetOff, payload, index) {
+            const values = payload.values;
+            const off = index * payload.stride;
+            if (payload.type === 'affine12') {
+                target[targetOff + 0] = values[off + 0];
+                target[targetOff + 1] = values[off + 1];
+                target[targetOff + 2] = values[off + 2];
+                target[targetOff + 3] = 0;
+                target[targetOff + 4] = values[off + 3];
+                target[targetOff + 5] = values[off + 4];
+                target[targetOff + 6] = values[off + 5];
+                target[targetOff + 7] = 0;
+                target[targetOff + 8] = values[off + 6];
+                target[targetOff + 9] = values[off + 7];
+                target[targetOff + 10] = values[off + 8];
+                target[targetOff + 11] = 0;
+                target[targetOff + 12] = values[off + 9];
+                target[targetOff + 13] = values[off + 10];
+                target[targetOff + 14] = values[off + 11];
+                target[targetOff + 15] = 1;
+                return;
+            }
+            if (typeof values.subarray === 'function') {
+                target.set(values.subarray(off, off + 16), targetOff);
+                return;
+            }
+            for (let i = 0; i < 16; i++) {
+                target[targetOff + i] = values[off + i];
+            }
+        }
+
+        function nextForestBuildFrame() {
+            return new Promise(resolve => requestAnimationFrame(resolve));
+        }
+
+        function disposeForestBuildMaterial(material, disposedMaterials) {
+            const materials = Array.isArray(material) ? material : [material];
+            for (const item of materials) {
+                if (!item || disposedMaterials.has(item)) continue;
+                disposedMaterials.add(item);
+                disposeSceneMaterial(item);
+            }
+        }
+
+        function disposeForestBuildResources(geometry, material) {
+            geometry?.dispose?.();
+            disposeForestBuildMaterial(material, new Set());
+        }
+
+        function usingWebGpuInstanceMaterials() {
+            return isWebGpuInstancingPath({ renderer, backendLabel: rendererBackendLabel });
+        }
+
+        function copyInstanceTextureSlot(source, target, fromKey, toKey = fromKey) {
+            const url = source?.[fromKey];
+            if (typeof url === 'string' && url.length > 0) target[toKey] = url;
+            const xf = source?.[`${fromKey}Xf`];
+            if (xf != null) target[`${toKey}Xf`] = xf;
+        }
+
+        function webGpuSafeInstanceMaterialDescriptor(md) {
+            if (!usingWebGpuInstanceMaterials() || !md || typeof md !== 'object') return md;
+
+            const safe = {
+                model: 'MeshStandardMaterial',
+                name: md.name,
+                color: Array.isArray(md.color) ? md.color.slice(0, 3) : [0.8, 0.8, 0.8],
+                side: md.side,
+                rough: Number.isFinite(md.rough) ? md.rough : 0.65,
+                metal: Number.isFinite(md.metal) ? md.metal : 0.0,
+                envI: Number.isFinite(md.envI) ? md.envI : 1.0,
+            };
+
+            if (md.opacity != null) safe.opacity = md.opacity;
+            if (md.transparent === true) safe.transparent = true;
+            if (md.depthWrite != null) safe.depthWrite = md.depthWrite;
+            if (md.depthTest != null) safe.depthTest = md.depthTest;
+            if (Number.isFinite(md.alphaTest) && md.alphaTest > 0) safe.alphaTest = md.alphaTest;
+            if (Array.isArray(md.em) && md.emI > 0) {
+                safe.em = md.em.slice(0, 3);
+                safe.emI = md.emI;
+            }
+
+            copyInstanceTextureSlot(md, safe, 'map');
+            if (!safe.map) copyInstanceTextureSlot(md, safe, 'diffMap', 'map');
+            copyInstanceTextureSlot(md, safe, 'opMap');
+            if (!safe.opMap) copyInstanceTextureSlot(md, safe, 'alphaMap', 'opMap');
+            if (!safe.opMap) copyInstanceTextureSlot(md, safe, 'opacityMap', 'opMap');
+
+            if (safe.opMap && !(Number.isFinite(safe.alphaTest) && safe.alphaTest > 0)) {
+                safe.alphaTest = 0.35;
+                safe.transparent = false;
+            }
+
+            return safe;
+        }
+
+        function dominantForestMaterialIndex(grp) {
+            if (!Array.isArray(grp?.groups) || grp.groups.length === 0) return 0;
+            let bestIndex = 0;
+            let bestCount = -1;
+            for (const group of grp.groups) {
+                const materialIndex = Number(group?.[2]);
+                const indexCount = Number(group?.[1]);
+                if (Number.isFinite(materialIndex) && Number.isFinite(indexCount) && indexCount > bestCount) {
+                    bestIndex = materialIndex;
+                    bestCount = indexCount;
+                }
+            }
+            return bestIndex;
+        }
+
+        function shouldCollapseForestMaterialsForWebGpu(grp) {
+            if (!usingWebGpuInstanceMaterials()) return false;
+            if (String(grp?.kind || '').toLowerCase() === 'railclone') return false;
+            if (!Array.isArray(grp?.mats) || !Array.isArray(grp?.groups)) return false;
+            const textureSlots = grp.mats.reduce((sum, material) => sum + countMaterialTextureSlots(material), 0);
+            return grp.groups.length > 8 || textureSlots > 4;
+        }
+
+        function createForestInstanceMaterial(md, materialContext = null) {
+            return createMaterial(webGpuSafeInstanceMaterialDescriptor(md), materialContext);
+        }
+
+        function applyForestInstances(groups, binaryBuffer = null) {
+            const buildSerial = ++forestBuildSerial;
+            const buildStart = performance.now();
+            let addedMeshes = 0;
+            // Remove old forest meshes
+            const removedMeshes = forestMeshes.size;
+            const disposedGeometries = new Set();
+            const disposedMaterials = new Set();
+            for (const [key, mesh] of forestMeshes) {
+                maxRoot.remove(mesh);
+                if (mesh.geometry && !disposedGeometries.has(mesh.geometry)) {
+                    disposedGeometries.add(mesh.geometry);
+                    mesh.geometry.dispose();
+                }
+                disposeForestBuildMaterial(mesh.material, disposedMaterials);
+                mesh.dispose?.();
+            }
+            forestMeshes.clear();
+
+            const markForestInstancesReady = () => {
+                if (buildSerial !== forestBuildSerial) return;
+                scene.updateMatrixWorld(true);
+                layerManager.markRuntimeTransformsDirty?.();
+                maxjsFx.markSceneChanged?.();
+                markLightProbeSceneDirty();
+                scheduleLightProbeFromCurrentScene({ delay: 350 });
+                schedulePathTracingLiveRebuild();
+                updateSyncHud({
+                    countAsAppliedSync: false,
+                    transport: transportMode,
+                    frameId: 0,
+                    producerBytes: 0,
+                    decodeMs: 0,
+                    applyMs: performance.now() - buildStart,
+                });
+            };
+
+            if (!Array.isArray(groups) || groups.length === 0) {
+                if (removedMeshes > 0) markForestInstancesReady();
+                return;
+            }
+            maxjsDebugLog('[ForestPack]', groups.length, 'groups, total instances:', groups.reduce((s, g) => s + (g.count || 0), 0));
+
+            const buildForestInstances = async () => {
+                for (const grp of groups) {
+                    if (buildSerial !== forestBuildSerial) return;
+                const geoPayload = getForestGeometryPayload(grp, binaryBuffer);
+                const xformPayload = getForestTransformPayload(grp, binaryBuffer);
+                const count = grp.count || Math.floor((xformPayload?.values?.length || 0) / (xformPayload?.stride || 16));
+                if (!geoPayload || !xformPayload?.values || !count ||
+                    xformPayload.values.length < count * xformPayload.stride) {
+                    continue;
+                }
+
+                const geom = buildGeometry(geoPayload.v, geoPayload.i, geoPayload.uv, geoPayload.norm, {
+                    skipNormalCompute: !!geoPayload.normalAttr,
+                });
+                if (geoPayload.uvAttr) geom.setAttribute('uv', geoPayload.uvAttr);
+                if (geoPayload.normalAttr) geom.setAttribute('normal', geoPayload.normalAttr);
+
+                // Material: use data from C++ (single or multi-sub), fallback to gray
+                let mat;
+                if (shouldCollapseForestMaterialsForWebGpu(grp)) {
+                    const materialIndex = dominantForestMaterialIndex(grp);
+                    const sourceMaterial = grp.mats?.[materialIndex] ?? grp.mats?.[0] ?? grp.mat;
+                    mat = sourceMaterial
+                        ? createForestInstanceMaterial(sourceMaterial, { geometry: geom, materialIndex: null })
+                        : new THREE.MeshStandardMaterial({ color: 0x888888, roughness: 0.7, side: THREE.DoubleSide });
+                } else if (grp.mats && grp.groups) {
+                    // Multi/Sub material — create material array + geometry groups
+                    for (const [start, count, idx] of grp.groups) {
+                        geom.addGroup(start, count, idx);
+                    }
+                    mat = grp.mats.map((m, materialIndex) => createForestInstanceMaterial(m, { geometry: geom, materialIndex }));
+                } else if (grp.mat) {
+                    mat = createForestInstanceMaterial(grp.mat, { geometry: geom, materialIndex: null });
+                } else {
+                    mat = new THREE.MeshStandardMaterial({ color: 0x888888, roughness: 0.7, side: THREE.DoubleSide });
+                }
+
+                const groupKey = instanceGroupKey(grp);
+                const batchSize = Math.max(1, getInstancedMeshBatchSize({
+                    renderer,
+                    backendLabel: rendererBackendLabel,
+                    count,
+                }));
+                const batchCount = Math.ceil(count / batchSize);
+                for (let batchIndex = 0, start = 0; start < count; batchIndex++, start += batchSize) {
+                    if (buildSerial !== forestBuildSerial) {
+                        disposeForestBuildResources(geom, mat);
+                        return;
+                    }
+                    const sliceCount = Math.min(batchSize, count - start);
+                    const instMesh = new THREE.InstancedMesh(geom, mat, sliceCount);
+                    instMesh.matrixAutoUpdate = false;
+                    instMesh.frustumCulled = false;
+                    instMesh.castShadow = true;
+                    instMesh.receiveShadow = true;
+                    instMesh.name = batchCount > 1
+                        ? `forest_${groupKey}_part${batchIndex + 1}_x${sliceCount}`
+                        : `forest_${groupKey}_x${sliceCount}`;
+                    instMesh.userData.maxjsInstanceGroup = true;
+                    instMesh.userData.maxjsSource = groupKey;
+                    instMesh.userData.maxjsInstanceStart = start;
+                    instMesh.userData.maxjsInstanceTotal = count;
+                    const matrixArray = instMesh.instanceMatrix.array;
+
+                    for (let i = 0; i < sliceCount; i++) {
+                        if ((i > 0) && (i % FOREST_INSTANCE_UPLOAD_CHUNK) === 0) {
+                            await nextForestBuildFrame();
+                            if (buildSerial !== forestBuildSerial) {
+                                disposeForestBuildResources(instMesh.geometry, instMesh.material);
+                                return;
+                            }
+                        }
+                        writeForestInstanceMatrixAt(matrixArray, i * 16, xformPayload, start + i);
+                    }
+                    instMesh.instanceMatrix.needsUpdate = true;
+
+                    if (buildSerial !== forestBuildSerial) {
+                        disposeForestBuildResources(instMesh.geometry, instMesh.material);
+                        return;
+                    }
+                    maxRoot.add(instMesh);
+                    forestMeshes.set(batchCount > 1 ? `${groupKey}:${batchIndex}` : groupKey, instMesh);
+                    addedMeshes++;
+                }
+            }
+            if (addedMeshes > 0 || removedMeshes > 0) markForestInstancesReady();
+            };
+            buildForestInstances().catch(err => console.error('[ForestPack] async build failed', err));
+        }
+
+        // ── tyFlow Volume Rendering (smoke/fire) ─────────────
+        const volumeMeshes = new Map(); // key → THREE.Mesh with volume shader
+
+        function createSmokePalette() {
+            const canvas = document.createElement('canvas');
+            canvas.width = 256; canvas.height = 1;
+            const ctx = canvas.getContext('2d');
+            const grad = ctx.createLinearGradient(0, 0, 256, 0);
+            grad.addColorStop(0.0, 'rgba(0,0,0,0)');
+            grad.addColorStop(0.1, 'rgba(40,40,40,0.3)');
+            grad.addColorStop(0.4, 'rgba(120,120,120,0.6)');
+            grad.addColorStop(0.7, 'rgba(180,180,180,0.8)');
+            grad.addColorStop(1.0, 'rgba(220,220,220,1.0)');
+            ctx.fillStyle = grad;
+            ctx.fillRect(0, 0, 256, 1);
+            const tex = new THREE.CanvasTexture(canvas);
+            tex.minFilter = THREE.LinearFilter;
+            tex.magFilter = THREE.LinearFilter;
+            return tex;
+        }
+        const smokePalette = createSmokePalette();
+
+        // Simplified box-based volume shader (integrates with scene depth)
+        function createVolumeMesh(vol) {
+            const dim = vol.dim;
+            const voxSize = vol.voxSize;
+            const sizeX = dim[0] * voxSize[0];
+            const sizeY = dim[1] * voxSize[1];
+            const sizeZ = dim[2] * voxSize[2];
+
+            // Create 3D texture from density data
+            const data = new Float32Array(vol.density);
+            const tex3d = new THREE.Data3DTexture(data, dim[0], dim[1], dim[2]);
+            tex3d.format = THREE.RedFormat;
+            tex3d.type = THREE.FloatType;
+            tex3d.minFilter = THREE.LinearFilter;
+            tex3d.magFilter = THREE.LinearFilter;
+            tex3d.wrapS = THREE.ClampToEdgeWrapping;
+            tex3d.wrapT = THREE.ClampToEdgeWrapping;
+            tex3d.wrapR = THREE.ClampToEdgeWrapping;
+            tex3d.needsUpdate = true;
+
+            const stepNorm = (vol.step || Math.min(voxSize[0], voxSize[1], voxSize[2]))
+                             / Math.max(sizeX, sizeY, sizeZ);
+
+            const mat = new THREE.ShaderMaterial({
+                uniforms: {
+                    volumeTex: { value: tex3d },
+                    stepSize: { value: stepNorm },
+                    densityMult: { value: 15.0 },
+                    cameraPos: { value: new THREE.Vector3() },
+                },
+                vertexShader: `
+                    varying vec3 vLocalPos;
+                    void main() {
+                        // position is [-0.5, 0.5], map to [0,1]
+                        vLocalPos = position + 0.5;
+                        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+                    }
+                `,
+                fragmentShader: `
+                    precision highp sampler3D;
+                    uniform sampler3D volumeTex;
+                    uniform float stepSize;
+                    uniform float densityMult;
+                    uniform vec3 cameraPos;
+                    varying vec3 vLocalPos;
+
+                    void main() {
+                        // Camera position in local [0,1] space
+                        vec3 camLocal = (inverse(modelMatrix) * vec4(cameraPos, 1.0)).xyz + 0.5;
+                        vec3 rayDir = normalize(vLocalPos - camLocal);
+
+                        // Ray-box intersection in [0,1] space
+                        vec3 invDir = 1.0 / rayDir;
+                        vec3 t0 = -camLocal * invDir;
+                        vec3 t1 = (vec3(1.0) - camLocal) * invDir;
+                        vec3 tmin = min(t0, t1);
+                        vec3 tmax = max(t0, t1);
+                        float tNear = max(max(tmin.x, tmin.y), tmin.z);
+                        float tFar = min(min(tmax.x, tmax.y), tmax.z);
+                        if (tNear > tFar) discard;
+                        tNear = max(tNear, 0.0);
+
+                        float dt = stepSize;
+                        vec4 acc = vec4(0.0);
+                        float t = tNear;
+
+                        for (int i = 0; i < 256; i++) {
+                            if (t > tFar || acc.a > 0.95) break;
+                            vec3 pos = camLocal + rayDir * t;
+                            float d = texture(volumeTex, pos).r;
+                            if (d > 0.001) {
+                                float a = 1.0 - exp(-d * densityMult * dt);
+                                // Smoke: light gray, denser = slightly darker
+                                vec3 col = mix(vec3(0.85), vec3(0.3), clamp(d, 0.0, 1.0));
+                                acc.rgb += col * a * (1.0 - acc.a);
+                                acc.a += a * (1.0 - acc.a);
+                            }
+                            t += dt;
+                        }
+                        if (acc.a < 0.005) discard;
+                        gl_FragColor = acc;
+                    }
+                `,
+                transparent: true,
+                depthWrite: false,
+                side: THREE.BackSide,
+            });
+
+            // Unit box centered at origin — scaled to volume size
+            const geom = new THREE.BoxGeometry(1, 1, 1);
+            const mesh = new THREE.Mesh(geom, mat);
+            mesh.scale.set(sizeX, sizeY, sizeZ);
+            mesh.frustumCulled = false;
+            mesh.renderOrder = 100;
+            mesh.userData._volumeTex = tex3d;
+            return mesh;
+        }
+
+        function applyVolumes(volumes) {
+            // Remove old volume meshes
+            for (const [key, mesh] of volumeMeshes) {
+                maxRoot.remove(mesh);
+                if (mesh.userData._volumeTex) mesh.userData._volumeTex.dispose();
+                mesh.material.dispose();
+                mesh.geometry.dispose();
+            }
+            volumeMeshes.clear();
+
+            if (!Array.isArray(volumes) || volumes.length === 0) return;
+
+            let totalVoxels = 0, rendered = 0;
+            for (let vi = 0; vi < volumes.length; vi++) {
+                const vol = volumes[vi];
+                if (!vol.density?.length || !vol.dim) continue;
+                totalVoxels += vol.dim[0] * vol.dim[1] * vol.dim[2];
+
+                // Skip empty volumes (no significant density)
+                let maxD = 0;
+                for (let i = 0; i < vol.density.length; i++) {
+                    if (vol.density[i] > maxD) maxD = vol.density[i];
+                }
+                if (maxD < 0.001) continue;
+
+                const mesh = createVolumeMesh(vol);
+
+                // Position: origin is voxel [0,0,0] center in world space
+                // Box spans from origin to origin + dim*voxelSize
+                const sX = vol.dim[0] * vol.voxSize[0];
+                const sY = vol.dim[1] * vol.voxSize[1];
+                const sZ = vol.dim[2] * vol.voxSize[2];
+                // Center the box at the middle of the volume
+                mesh.position.set(
+                    vol.origin[0] + sX * 0.5,
+                    vol.origin[1] + sY * 0.5,
+                    vol.origin[2] + sZ * 0.5
+                );
+
+                mesh.name = `volume_${vol.h}_${vi}`;
+                maxRoot.add(mesh);
+                volumeMeshes.set(`${vol.h}_${vi}`, mesh);
+                rendered++;
+            }
+            if (rendered > 0) {
+                maxjsDebugLog('[Volume]', rendered, '/', volumes.length, 'blocks,', totalVoxels, 'voxels');
+            }
+        }
+
+        // Update camera position uniform for volume shaders
+        function updateVolumeUniforms() {
+            for (const [, mesh] of volumeMeshes) {
+                if (mesh.material?.uniforms?.cameraPos) {
+                    mesh.material.uniforms.cameraPos.value.copy(getActiveCameraWorldPosition(cameraPositionWorld));
+                }
+            }
+        }
+
+        function applyLightUpdates(lightsData) {
+            if (!Array.isArray(lightsData)) return;
+            lastLightsSignature = '';
+
+            let appliedLightCount = 0;
+            let mainDirectionalLight = null;
+
+            for (const ld of lightsData) {
+                const light = lightHandleMap.get(ld.h);
+                if (!light || light.userData?.maxjsTypeId !== ld.type || light.type !== LIGHT_TYPES[ld.type]) {
+                    applyLights(lightsData);
+                    return;
+                }
+
+                applyLightData(light, ld);
+                if (light.userData?.maxjsVisible !== false) {
+                    appliedLightCount++;
+                    if (!mainDirectionalLight && ld.type === 0) mainDirectionalLight = light;
+                }
+            }
+
+            syncDefaultLightsVisibility();
+            if (maxjsFx.setMainLight) {
+                maxjsFx.setMainLight(mainDirectionalLight || (defaultLights.visible ? defaultKey : null));
+            }
+            refreshSkyFromLinkedSun();
+            markLightProbeLightsDirty();
+            scheduleLightProbeFromCurrentScene({ delay: 350 });
+        }
+
+        // ── Scene Camera Lock ────────────────────────────────
+        const selSceneCamera = document.getElementById('selSceneCamera');
+        let knownSceneCameras = [];
+
+        function updateSceneCameraList(cameras, lockedHandle) {
+            knownSceneCameras = cameras || [];
+            const current = selSceneCamera.value;
+            selSceneCamera.innerHTML = '<option value="0">Viewport</option>';
+            for (const c of knownSceneCameras) {
+                const opt = document.createElement('option');
+                opt.value = String(c.h);
+                opt.textContent = c.n || `Camera ${c.h}`;
+                selSceneCamera.appendChild(opt);
+            }
+            // Restore selection
+            const target = lockedHandle != null ? String(lockedHandle) : current;
+            if ([...selSceneCamera.options].some(o => o.value === target)) {
+                selSceneCamera.value = target;
+            } else {
+                selSceneCamera.value = '0';
+            }
+        }
+
+        selSceneCamera.addEventListener('change', () => {
+            const handle = parseInt(selSceneCamera.value, 10) || 0;
+            bridge.send('lock_camera', { handle: String(handle) });
+        });
+
+        function syncCameraLockButtonUi() {
+            const el = document.getElementById('btnCamLock');
+            if (!el) return;
+            el.classList.toggle('active', camLock);
+            el.title = camLock ? 'Camera lock on — orbit disabled' : 'Camera lock off — orbit enabled';
+            el.setAttribute('aria-pressed', camLock ? 'true' : 'false');
+            el.setAttribute('aria-label', camLock ? 'Camera lock on' : 'Camera lock off');
+        }
+
+        function syncEnvButtonUi() {
+            const el = document.getElementById('btnEnv');
+            if (!el) return;
+            el.classList.toggle('active', envVisible);
+            el.title = envVisible ? 'Environment backdrop visible' : 'Environment backdrop hidden';
+            el.setAttribute('aria-pressed', envVisible ? 'true' : 'false');
+            el.setAttribute('aria-label', envVisible ? 'Environment backdrop visible' : 'Environment backdrop hidden');
+        }
+
+        function applyLayerCameraMode(mode, options = {}) {
+            if (mode === 'physical') {
+                const handle = parseInt(options.handle, 10) || 0;
+                if (!handle) return;
+                camLock = true;
+                syncCameraLockButtonUi();
+                controls.enabled = false;
+                if ([...selSceneCamera.options].some(o => o.value === String(handle))) {
+                    selSceneCamera.value = String(handle);
+                }
+                bridge.send('lock_camera', { handle: String(handle) });
+                return;
+            }
+
+            if (mode === 'viewport') {
+                selSceneCamera.value = '0';
+                bridge.send('lock_camera', { handle: '0' });
+                controls.enabled = !camLock;
+                return;
+            }
+        }
+
+        let renderToImageActive = false;
+        let pendingRenderToImage = null;
+        let renderToImageForcePathTracing = false;
+        // Sticky across sequence frames (pendingRenderToImage clears between
+        // them) so punch state doesn't flicker mid-sequence.
+        let renderCaptureComposited = false;
+
+        function readBlobAsDataUrl(blob) {
+            return new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onload = () => resolve(String(reader.result || ''));
+                reader.onerror = () => reject(reader.error || new Error('FileReader failed'));
+                reader.readAsDataURL(blob);
+            });
+        }
+
+        function canvasToBlob(canvas, mime, quality) {
+            return new Promise(resolve => {
+                try {
+                    canvas.toBlob(blob => resolve(blob), mime, quality);
+                } catch {
+                    resolve(null);
+                }
+            });
+        }
+
+        function mimeSupportsAlpha(mime) {
+            const normalized = String(mime || '').toLowerCase();
+            return normalized === 'image/png' || normalized === 'image/webp';
+        }
+
+        async function sendCurrentCanvasRenderFile(capture) {
+            const responseType = capture?.responseType || 'render_sequence_frame_file';
+            try {
+                const requestedMime = typeof capture?.mime === 'string' && capture.mime
+                    ? capture.mime
+                    : 'image/png';
+                const quality = requestedMime === 'image/jpeg' || requestedMime === 'image/webp'
+                    ? 0.95
+                    : undefined;
+                let blob = await canvasToBlob(renderer.domElement, requestedMime, quality);
+                if (!blob && requestedMime !== 'image/png') {
+                    blob = await canvasToBlob(renderer.domElement, 'image/png');
+                }
+                if (!blob) throw new Error('Canvas image export failed');
+
+                const dataUrl = await readBlobAsDataUrl(blob);
+                const comma = dataUrl.indexOf(',');
+                if (comma < 0) throw new Error('Canvas image payload missing data URL header');
+                bridge.send(responseType, {
+                    imageBase64: dataUrl.slice(comma + 1),
+                    mime: blob.type || requestedMime,
+                    width: capture?.width || renderer.domElement.width || 0,
+                    height: capture?.height || renderer.domElement.height || 0,
+                });
+            } catch (error) {
+                bridge.send(responseType, {
+                    error: error?.message || String(error),
+                });
+            }
+        }
+
+        function getCameraProjectionAspect() {
+            if (renderToImageActive && pendingRenderToImage?.width > 0 && pendingRenderToImage?.height > 0) {
+                return pendingRenderToImage.width / pendingRenderToImage.height;
+            }
+            if (safeFrameEnabled) {
+                const aspect = getRenderOutputAspect();
+                if (aspect) return aspect;
+            }
+            const rect = getViewportFrameRect();
+            if (Number.isFinite(rect?.aspect) && rect.aspect > 0) return rect.aspect;
+            if (camera?.isPerspectiveCamera && Number.isFinite(camera.aspect) && camera.aspect > 0) {
+                return camera.aspect;
+            }
+            return innerHeight > 0 ? innerWidth / innerHeight : 1;
+        }
+
+        function applyCameraProjectionFromMax(cam) {
+            const aspect = getCameraProjectionAspect();
+            if (camera.isOrthographicCamera) {
+                const vw = Number.isFinite(cam.viewWidth) && cam.viewWidth > 0 ? cam.viewWidth : 500;
+                camera.left = -vw / 2;
+                camera.right = vw / 2;
+                camera.top = vw / (2 * aspect);
+                camera.bottom = -vw / (2 * aspect);
+                camera.near = -100000;
+                camera.far = 100000;
+            } else if (Number.isFinite(cam.fov) && cam.fov > 0 && cam.fov < 170) {
+                const hRad = cam.fov * Math.PI / 180;
+                camera.aspect = aspect;
+                camera.fov = 2 * Math.atan(Math.tan(hRad / 2) / aspect) * 180 / Math.PI;
+                applySyncedCameraClip(camera, cam);
+            }
+            applyCameraClipOverrides(camera);
+        }
+
+        function syncCameraConsumersAfterSwap() {
+            if (!renderToImageActive) {
+                applyRenderViewportLayout({ resizeBuffers: true, resizePostFx: false });
+            }
+            maxjsFx.setCamera?.(camera);
+            webglBasicFx.setCamera?.(camera);
+            shaderLabFx.setCamera?.(camera);
+            pathTracingFx.setCamera?.(camera);
+            if (!renderToImageActive) {
+                maxjsFx.resize();
+                webglBasicFx.resize?.();
+                shaderLabFx.resize?.();
+            }
+        }
+
+        // ── Camera Sync (Max view → world camera) ───────────
+        function applyCamera(cam) {
+            const layerCameraMode = layerManager?.cameraMode ?? 'viewport';
+            if (xrRuntime?.active) return;
+            if (layerCameraMode === 'script') return;
+            if (!renderToImageActive && !camLock && layerCameraMode !== 'physical') return;
+            if (!isFiniteArray(cam?.pos, 3) || !isFiniteArray(cam?.tgt, 3) || !isFiniteArray(cam?.up, 3)) {
+                return;
+            }
+            noteGiVolumeCameraSync(cam);
+
+            const wantOrtho = cam.persp === false;
+            const isOrtho = camera.isOrthographicCamera;
+            let cameraSwapped = false;
+
+            if (wantOrtho && !isOrtho) {
+                scene.remove(camera);
+                camera = orthoCamera;
+                scene.add(camera);
+                controls.object = camera;
+                cameraSwapped = true;
+            } else if (!wantOrtho && isOrtho) {
+                scene.remove(camera);
+                camera = perspCamera;
+                scene.add(camera);
+                controls.object = camera;
+                cameraSwapped = true;
+            }
+
+            copyMaxArrayToWorld(camera.position, cam.pos);
+            copyMaxArrayToWorld(camera.up, cam.up);
+            copyMaxArrayToWorld(cameraTargetWorld, cam.tgt);
+            camera.lookAt(cameraTargetWorld);
+
+            applyCameraProjectionFromMax(cam);
+            if (cameraSwapped) {
+                syncCameraConsumersAfterSwap();
+            }
+            controls.target.copy(cameraTargetWorld);
+            syncOrbitNavigationFeel();
+
+            // Forward Physical Camera DOF to post-fx when available
+            physicalCameraDofActive = !!cam.dofEnabled;
+            if (physicalCameraDofActive && maxjsFx?.updateDofFromPhysicalCamera) {
+                maxjsFx.updateDofFromPhysicalCamera(cam, () => syncPostFxPanel(false, { persist: false }));
+            }
+            syncPathTracingDofFromPostFx();
+        }
+
+        function computeVisibleSceneBounds(target = new THREE.Box3()) {
+            target.makeEmpty();
+            for (const [, mesh] of nodeMap) {
+                if (mesh?.visible) target.expandByObject(mesh);
+            }
+            return target;
+        }
+
+        function serializeCurrentCameraState() {
+            return {
+                perspective: !camera.isOrthographicCamera,
+                position: camera.position.toArray(),
+                up: camera.up.toArray(),
+                target: controls.target.toArray(),
+                fov: camera.isPerspectiveCamera ? camera.fov : null,
+                viewWidth: camera.isOrthographicCamera ? (camera.right - camera.left) : null,
+                near: Number.isFinite(camera.near) ? camera.near : null,
+                far: Number.isFinite(camera.far) ? camera.far : null,
+            };
+        }
+
+        function applyStandaloneCameraState(savedCamera) {
+            if (!savedCamera) { maxjsDebugLog('[max.js] applyStandaloneCameraState: no savedCamera'); return; }
+            if (!isFiniteArray(savedCamera.position, 3) ||
+                !isFiniteArray(savedCamera.up, 3) ||
+                !isFiniteArray(savedCamera.target, 3)) {
+                maxjsDebugLog('[max.js] applyStandaloneCameraState: invalid arrays', savedCamera);
+                return;
+            }
+            maxjsDebugLog('[max.js] applyStandaloneCameraState: applying', savedCamera.position, savedCamera.target);
+
+            const wantOrtho = savedCamera.perspective === false;
+            const isOrtho = camera.isOrthographicCamera;
+            let cameraSwapped = false;
+            if (wantOrtho && !isOrtho) {
+                scene.remove(camera);
+                camera = orthoCamera;
+                scene.add(camera);
+                controls.object = camera;
+                cameraSwapped = true;
+            } else if (!wantOrtho && isOrtho) {
+                scene.remove(camera);
+                camera = perspCamera;
+                scene.add(camera);
+                controls.object = camera;
+                cameraSwapped = true;
+            }
+
+            camera.position.fromArray(savedCamera.position);
+            camera.up.fromArray(savedCamera.up);
+            cameraTargetWorld.fromArray(savedCamera.target);
+            camera.lookAt(cameraTargetWorld);
+
+            if (wantOrtho) {
+                const viewWidth = Number.isFinite(savedCamera.viewWidth) && savedCamera.viewWidth > 0
+                    ? savedCamera.viewWidth
+                    : 500;
+                const aspect = getCameraProjectionAspect();
+                camera.left = -viewWidth / 2;
+                camera.right = viewWidth / 2;
+                camera.top = viewWidth / (2 * aspect);
+                camera.bottom = -viewWidth / (2 * aspect);
+                camera.near = -100000;
+                camera.far = 100000;
+            } else if (Number.isFinite(savedCamera.fov) && savedCamera.fov > 0 && savedCamera.fov < 170) {
+                camera.fov = savedCamera.fov;
+                camera.aspect = getCameraProjectionAspect();
+                applySyncedCameraClip(camera, savedCamera);
+            }
+
+            applyCameraClipOverrides(camera);
+            if (cameraSwapped) {
+                syncCameraConsumersAfterSwap();
+            } else {
+                updateCameraProjectionForViewportRect();
+            }
+            controls.target.fromArray(savedCamera.target);
+            syncOrbitNavigationFeel();
+            controls.update();
+        }
+
+        function fitCamera() {
+            scene.updateMatrixWorld(true);
+            const box = computeVisibleSceneBounds(new THREE.Box3());
+            if (box.isEmpty()) return;
+            const center = box.getCenter(new THREE.Vector3());
+            const size = box.getSize(new THREE.Vector3());
+            const maxDim = Math.max(size.x, size.y, size.z);
+            controls.target.copy(center);
+            if (camera.isPerspectiveCamera) {
+                const verticalFov = THREE.MathUtils.degToRad(camera.fov || 60);
+                const fitDistance = maxDim / Math.max(0.2, 2 * Math.tan(verticalFov * 0.5));
+                camera.position.copy(center).addScaledVector(cameraDefaultDirection, fitDistance * 1.15);
+            } else {
+                camera.position.copy(center).addScaledVector(cameraDefaultDirection, Math.max(maxDim, 1) * 1.15);
+            }
+            camera.near = Math.max(DEFAULT_CAMERA_NEAR, maxDim * 0.001);
+            camera.far = Math.max(1000, maxDim * 100);
+            applyCameraClipOverrides(camera);
+            syncOrbitNavigationFeel();
+            controls.update();
+        }
+
+        function syncOrbitNavigationFeel() {
+            const distance = Math.max(0.01, camera.position.distanceTo(controls.target));
+            const box = computeVisibleSceneBounds(new THREE.Box3());
+            const size = box.isEmpty() ? new THREE.Vector3(1, 1, 1) : box.getSize(new THREE.Vector3());
+            const maxDim = Math.max(1, size.x, size.y, size.z);
+            const scale = THREE.MathUtils.clamp(distance / maxDim, 0.15, 6.0);
+
+            controls.panSpeed = THREE.MathUtils.clamp(scale * 1.1, 0.15, 3.5);
+            controls.zoomSpeed = THREE.MathUtils.clamp(1.35 + Math.log2(scale + 1.0), 0.8, 3.0);
+            controls.rotateSpeed = THREE.MathUtils.clamp(0.42 + scale * 0.08, 0.35, 0.95);
+            controls.minDistance = Math.max(0.01, maxDim * 0.0025);
+            controls.maxDistance = Math.max(1000, maxDim * 25);
+        }
+
+        // ── UI Controls ─────────────────────────────────────
+        document.getElementById('btnKill').onclick = () => {
+            bridge.send('kill');
+        };
+
+        document.getElementById('btnRefresh').onclick = () => {
+            if (window.chrome?.webview) {
+                bridge.send('refresh');
+            } else {
+                location.reload();
+            }
+        };
+
+        document.getElementById('btnSafeFrame')?.addEventListener('click', () => {
+            safeFrameEnabled = !safeFrameEnabled;
+            try {
+                localStorage.setItem(SAFE_FRAME_STORAGE_KEY, safeFrameEnabled ? 'true' : 'false');
+            } catch {}
+            applyRenderViewportLayout({ resizeBuffers: true, resizePostFx: true });
+            perfHud.setStatus(safeFrameEnabled
+                ? 'max.js - safe frame crop on'
+                : 'max.js - safe frame crop off');
+        });
+        syncSafeFrameButtonUi();
+
+        // ── Composition guide controls ──────────────────────────────────
+        (function wireCompositionOverlay() {
+            if (!compositionOverlay) return;
+            const st0 = compositionOverlay.getState();
+            const button = document.getElementById('btnComposition');
+            const popover = document.getElementById('compositionPopover');
+            const closeBtn = document.getElementById('compClose');
+            const chipGrid = document.getElementById('compGuideGrid');
+            const spiralSwitch = document.getElementById('compSpiralOrient');
+            const spiralRow = document.querySelector('[data-comp-suboption="spiral"]');
+            const gridRow = document.querySelector('[data-comp-suboption="grid"]');
+            const gridDiv = document.getElementById('compGridDiv');
+            const gridDivVal = document.getElementById('compGridDivVal');
+            const aspectSel = document.getElementById('compAspect');
+            const colorInput = document.getElementById('compColor');
+            const colorFill = document.querySelector('.comp-color-fill');
+            const opacity = document.getElementById('compOpacity');
+            const thickness = document.getElementById('compThickness');
+            const clearBtn = document.getElementById('compClear');
+
+            function refreshChrome() {
+                const st = compositionOverlay.getState();
+                button?.classList.toggle('active', compositionOverlay.isActive());
+                spiralRow?.classList.toggle('is-hidden', !st.guides.spiral);
+                gridRow?.classList.toggle('is-hidden', !st.guides.grid);
+            }
+
+            function setPopover(open) {
+                if (!popover) return;
+                popover.hidden = !open;
+                popover.setAttribute('aria-hidden', open ? 'false' : 'true');
+                popover.classList.toggle('open', open);
+                button?.setAttribute('aria-expanded', open ? 'true' : 'false');
+            }
+            if (button && popover) {
+                button.addEventListener('click', () => setPopover(popover.hidden));
+                closeBtn?.addEventListener('click', () => setPopover(false));
+                document.addEventListener('pointerdown', (e) => {
+                    if (popover.hidden) return;
+                    if (e.target.closest('#compositionPopover') || e.target.closest('#btnComposition')) return;
+                    setPopover(false);
+                });
+                document.addEventListener('keydown', (e) => {
+                    if (e.key === 'Escape' && !popover.hidden) setPopover(false);
+                });
+            }
+
+            if (chipGrid) {
+                for (const g of COMPOSITION_GUIDES) {
+                    const chip = document.createElement('button');
+                    chip.type = 'button';
+                    chip.className = 'comp-chip';
+                    chip.dataset.guide = g.id;
+                    chip.textContent = g.label;
+                    chip.title = g.title;
+                    const on = !!st0.guides[g.id];
+                    chip.classList.toggle('active', on);
+                    chip.setAttribute('aria-pressed', on ? 'true' : 'false');
+                    chip.addEventListener('click', () => {
+                        const next = compositionOverlay.toggleGuide(g.id);
+                        chip.classList.toggle('active', next);
+                        chip.setAttribute('aria-pressed', next ? 'true' : 'false');
+                        refreshChrome();
+                    });
+                    chipGrid.appendChild(chip);
+                }
+            }
+
+            if (spiralSwitch) {
+                const markActive = (v) => spiralSwitch.querySelectorAll('.rail-mode-option').forEach((b) => {
+                    b.classList.toggle('active', Number(b.dataset.spiralOrient) === v);
+                });
+                markActive(st0.spiralOrientation);
+                spiralSwitch.addEventListener('click', (e) => {
+                    const btn = e.target.closest('[data-spiral-orient]');
+                    if (!btn) return;
+                    const v = Number(btn.dataset.spiralOrient) & 3;
+                    compositionOverlay.setSpiralOrientation(v);
+                    markActive(v);
+                });
+            }
+
+            if (gridDiv) {
+                gridDiv.value = String(st0.gridDivisions);
+                if (gridDivVal) gridDivVal.textContent = String(st0.gridDivisions);
+                gridDiv.addEventListener('input', () => {
+                    compositionOverlay.setGridDivisions(gridDiv.value);
+                    if (gridDivVal) gridDivVal.textContent = String(Math.round(Number(gridDiv.value)));
+                });
+            }
+
+            if (aspectSel) {
+                for (const a of COMPOSITION_ASPECTS) {
+                    const opt = document.createElement('option');
+                    opt.value = a.id;
+                    opt.textContent = a.id === 'off' ? 'No mask' : a.label;
+                    aspectSel.appendChild(opt);
+                }
+                aspectSel.value = st0.aspect;
+                aspectSel.addEventListener('change', () => {
+                    compositionOverlay.setAspect(aspectSel.value);
+                    refreshChrome();
+                });
+            }
+
+            if (colorInput) {
+                colorInput.value = st0.color;
+                if (colorFill) colorFill.style.fill = st0.color;
+                colorInput.addEventListener('input', () => {
+                    compositionOverlay.setColor(colorInput.value);
+                    if (colorFill) colorFill.style.fill = colorInput.value;
+                });
+            }
+
+            if (opacity) {
+                opacity.value = String(st0.opacity);
+                opacity.addEventListener('input', () => compositionOverlay.setOpacity(opacity.value));
+            }
+            if (thickness) {
+                thickness.value = String(st0.thickness);
+                thickness.addEventListener('input', () => compositionOverlay.setThickness(thickness.value));
+            }
+
+            if (clearBtn) {
+                clearBtn.addEventListener('click', () => {
+                    compositionOverlay.clearGuides();
+                    chipGrid?.querySelectorAll('.comp-chip').forEach((c) => {
+                        c.classList.remove('active');
+                        c.setAttribute('aria-pressed', 'false');
+                    });
+                    if (aspectSel) aspectSel.value = 'off';
+                    refreshChrome();
+                });
+            }
+
+            refreshChrome();
+        })();
+
+        const SNAPSHOT_SETTINGS_KEY = 'maxjs_snapshot_settings';
+        const SNAPSHOT_SETTINGS_DEFAULTS = Object.freeze({
+            includeSceneNodes: true,
+            includeEnvironment: true,
+            includeFog: true,
+            includeLights: true,
+            includeSplats: true,
+            includeAudios: true,
+            includeInstances: true,
+            includeUnusedChannels: false,
+            includeAllMorphTargets: false,
+            includeDebugPayload: false,
+            includeSnapshotUi: true,
+            includeRuntimeScene: true,
+            includeDisabledLayers: false,
+            copyAssets: true,
+            includeRapierVendor: false,
+            includeGeospatialSky: false,
+            includeAnimations: true,
+            includeTransformAnimation: true,
+            includeGeometryAnimation: true,
+            includeMaterialAnimation: true,
+            includeCameraAnimation: true,
+            animationSampleStepFrames: 1,
+        });
+
+        function sanitizeSnapshotSettings(value) {
+            const raw = value && typeof value === 'object' ? value : {};
+            const sanitized = { ...SNAPSHOT_SETTINGS_DEFAULTS };
+            for (const key of Object.keys(SNAPSHOT_SETTINGS_DEFAULTS)) {
+                if (!(key in raw)) continue;
+                if (key === 'animationSampleStepFrames') {
+                    const step = Math.round(Number(raw[key]));
+                    sanitized[key] = Number.isFinite(step) ? Math.min(120, Math.max(1, step)) : 1;
+                } else {
+                    sanitized[key] = !!raw[key];
+                }
+            }
+            return sanitized;
+        }
+
+        function getSnapshotExportSettings() {
+            const settings = sanitizeSnapshotSettings(snapshotSettings);
+            // NOTE: snapshotUi (post-fx, camera) and runtimeScene (layers) are essential
+            // for working snapshots - don't gate them behind includeDebugPayload
+            settings.includeSnapshotUi = true;
+            settings.includeRuntimeScene = true;
+            if (!settings.includeAnimations) {
+                settings.includeTransformAnimation = false;
+                settings.includeGeometryAnimation = false;
+                settings.includeMaterialAnimation = false;
+                settings.includeCameraAnimation = false;
+            }
+            return settings;
+        }
+
+        function loadSnapshotSettings() {
+            try {
+                const raw = localStorage.getItem(SNAPSHOT_SETTINGS_KEY);
+                if (!raw) return { ...SNAPSHOT_SETTINGS_DEFAULTS };
+                return sanitizeSnapshotSettings(JSON.parse(raw));
+            } catch {
+                return { ...SNAPSHOT_SETTINGS_DEFAULTS };
+            }
+        }
+
+        function saveSnapshotSettings() {
+            try {
+                localStorage.setItem(SNAPSHOT_SETTINGS_KEY, JSON.stringify(snapshotSettings));
+            } catch {}
+        }
+
+        let snapshotSettings = loadSnapshotSettings();
+        const btnSnapshotPanel = document.getElementById('btnSnapshotPanel');
+        const snapshotPanel = document.getElementById('snapshotPanel');
+        let snapshotPanelVisible = false;
+        let pendingSnapshotRequestId = null;
+        let pendingSnapshotServeRequestId = null;
+        let pendingSnapshotServeAfterExport = false;
+        let pendingSnapshotAnalyze = false;
+        let lastSnapshotExportPath = '';
+        let lastSnapshotServeUrl = '';
+
+        function setSnapshotPanelVisible(visible) {
+            snapshotPanelVisible = !!visible;
+            if (!snapshotPanelVisible) {
+                const activeElement = document.activeElement;
+                if (activeElement instanceof HTMLElement && snapshotPanel.contains(activeElement)) {
+                    btnSnapshotPanel.focus();
+                }
+            }
+            snapshotPanel.classList.toggle('visible', snapshotPanelVisible);
+            snapshotPanel.toggleAttribute('inert', !snapshotPanelVisible);
+            snapshotPanel.setAttribute('aria-hidden', String(!snapshotPanelVisible));
+            btnSnapshotPanel.classList.toggle('active', snapshotPanelVisible);
+            if (snapshotPanelVisible) {
+                buildSnapshotPanel();
+                syncSnapshotPanel();
+            }
+        }
+
+        function updateSnapshotSetting(key, value) {
+            snapshotSettings = sanitizeSnapshotSettings({
+                ...snapshotSettings,
+                [key]: key === 'animationSampleStepFrames' ? Number(value) : !!value,
+            });
+            saveSnapshotSettings();
+            syncSnapshotPanel();
+        }
+
+        function resetSnapshotSettings() {
+            snapshotSettings = { ...SNAPSHOT_SETTINGS_DEFAULTS };
+            saveSnapshotSettings();
+            syncSnapshotPanel();
+        }
+
+        function buildSnapshotPanel() {
+            snapshotPanel.innerHTML = `
+                <div class="sidepanel-header">
+                    <div>
+                        <div class="sidepanel-title">Snapshot</div>
+                        <div class="sidepanel-subtitle" id="snapshotPanelStatus">Saved export profile</div>
+                    </div>
+                    <div style="display:flex;gap:4px">
+                        <button id="snapshotResetBtn" type="button">Reset</button>
+                        <button id="snapshotHideBtn" type="button">Hide</button>
+                    </div>
+                </div>
+                <div class="sidepanel-body">
+                    <section class="fx-section">
+                        <div class="fx-section-header">
+                            <div class="fx-section-title">Content</div>
+                        </div>
+                        <div class="snapshot-grid">
+                            <label class="fx-check" for="snapshot-includeSceneNodes"><span>Scene Nodes</span><input id="snapshot-includeSceneNodes" type="checkbox"></label>
+                            <label class="fx-check" for="snapshot-includeEnvironment"><span>Environment</span><input id="snapshot-includeEnvironment" type="checkbox"></label>
+                            <label class="fx-check" for="snapshot-includeFog"><span>Fog</span><input id="snapshot-includeFog" type="checkbox"></label>
+                            <label class="fx-check" for="snapshot-includeLights"><span>Lights</span><input id="snapshot-includeLights" type="checkbox"></label>
+                            <label class="fx-check" for="snapshot-includeSplats"><span>Splats</span><input id="snapshot-includeSplats" type="checkbox"></label>
+                            <label class="fx-check" for="snapshot-includeAudios"><span>Audio</span><input id="snapshot-includeAudios" type="checkbox"></label>
+                            <label class="fx-check" for="snapshot-includeInstances"><span>Instances</span><input id="snapshot-includeInstances" type="checkbox"></label>
+                            <label class="fx-check" for="snapshot-includeUnusedChannels" title="Export stray vertex-color map channels (≥3, e.g. extra UVW sets). Off = lean export; tick only if a material reads maxjs_vc_N."><span>Unused VC Channels</span><input id="snapshot-includeUnusedChannels" type="checkbox"></label>
+                            <label class="fx-check" for="snapshot-includeAllMorphTargets" title="Keep zero unkeyed Morpher channels in the snapshot. Off prunes channels that sit at 0 and have no keys."><span>All Morph Channels</span><input id="snapshot-includeAllMorphTargets" type="checkbox"></label>
+                            <label class="fx-check" for="snapshot-includeDebugPayload"><span>Debug Payload</span><input id="snapshot-includeDebugPayload" type="checkbox"></label>
+                            <label class="fx-check" for="snapshot-includeSnapshotUi"><span>Viewer UI State</span><input id="snapshot-includeSnapshotUi" type="checkbox"></label>
+                            <label class="fx-check" for="snapshot-includeRuntimeScene"><span>JS Runtime Scene</span><input id="snapshot-includeRuntimeScene" type="checkbox"></label>
+                            <label class="fx-check" for="snapshot-includeDisabledLayers" title="Archive disabled scene-script sources and runtime data into the snapshot. Off keeps deploy exports lean and prevents disabled layers from being replayed."><span>Disabled Layers</span><input id="snapshot-includeDisabledLayers" type="checkbox"></label>
+                            <label class="fx-check" for="snapshot-copyAssets"><span>Copy Assets</span><input id="snapshot-copyAssets" type="checkbox"></label>
+                        </div>
+                        <div class="snapshot-note">Copy Assets should stay on for deployable snapshots. Debug Payload controls viewer UI, runtime scene, and debug-side snapshot extras.</div>
+                    </section>
+                    <section class="fx-section">
+                        <div class="fx-section-header">
+                            <div class="fx-section-title">Vendor</div>
+                        </div>
+                        <div class="snapshot-grid">
+                            <label class="fx-check" for="snapshot-includeRapierVendor"><span>Rapier Physics</span><input id="snapshot-includeRapierVendor" type="checkbox"></label>
+                            <label class="fx-check" for="snapshot-includeGeospatialSky" title="Bundle the @takram atmosphere packages + three/src node sources (~6 MB) needed by the planetary/geospatial sky. Off keeps exports lean; tick only for scenes using the planetary sky model."><span>Geospatial Sky</span><input id="snapshot-includeGeospatialSky" type="checkbox"></label>
+                        </div>
+                        <div class="snapshot-note">Only needed for physics runtime layers (Rapier) or the planetary/geospatial sky model.</div>
+                    </section>
+                    <section class="fx-section">
+                        <div class="fx-section-header">
+                            <div class="fx-section-title">Animation</div>
+                        </div>
+                        <div class="snapshot-grid">
+                            <label class="fx-check" for="snapshot-includeAnimations"><span>Export Animation</span><input id="snapshot-includeAnimations" type="checkbox"></label>
+                            <label class="fx-check" for="snapshot-includeTransformAnimation"><span>Transform + Visibility</span><input id="snapshot-includeTransformAnimation" type="checkbox"></label>
+                            <label class="fx-check" for="snapshot-includeGeometryAnimation"><span>Geometry / Vertex</span><input id="snapshot-includeGeometryAnimation" type="checkbox"></label>
+                            <label class="fx-check" for="snapshot-includeMaterialAnimation"><span>Material Params</span><input id="snapshot-includeMaterialAnimation" type="checkbox"></label>
+                            <label class="fx-check" for="snapshot-includeCameraAnimation"><span>Active Camera</span><input id="snapshot-includeCameraAnimation" type="checkbox"></label>
+                            <label class="snapshot-inline" for="snapshot-animationSampleStepFrames">
+                                <span>Sample Every N Frames</span>
+                                <input id="snapshot-animationSampleStepFrames" type="number" min="1" max="120" step="1">
+                            </label>
+                        </div>
+                        <div class="snapshot-note">Material and geometry export are baked from the Max scene. Higher sample steps reduce export cost but also reduce fidelity.</div>
+                    </section>
+                    <section class="fx-section">
+                        <div class="fx-section-header">
+                            <div class="fx-section-title">Actions</div>
+                        </div>
+                        <div class="snapshot-actions">
+                            <button id="snapshotExportBtn" type="button">Export Snapshot</button>
+                            <button id="snapshotServeBtn" type="button">Serve Snapshot</button>
+                            <button id="snapshotAnalyzeBtn" type="button">Analyze Snapshot</button>
+                        </div>
+                        <div id="snapshotExportLocation" class="snapshot-location" hidden></div>
+                        <div class="snapshot-note">Settings persist across sessions.</div>
+                    </section>
+                </div>
+            `;
+
+            snapshotPanel.querySelector('#snapshotHideBtn')?.addEventListener('click', () => setSnapshotPanelVisible(false));
+            snapshotPanel.querySelector('#snapshotResetBtn')?.addEventListener('click', () => resetSnapshotSettings());
+            snapshotPanel.querySelector('#snapshotExportBtn')?.addEventListener('click', () => {
+                void exportSnapshotWithSettings();
+            });
+            snapshotPanel.querySelector('#snapshotServeBtn')?.addEventListener('click', () => {
+                void serveSnapshotWithSettings();
+            });
+            snapshotPanel.querySelector('#snapshotAnalyzeBtn')?.addEventListener('click', () => {
+                void analyzeSnapshotFromHost();
+            });
+
+            for (const key of Object.keys(SNAPSHOT_SETTINGS_DEFAULTS)) {
+                const input = snapshotPanel.querySelector(`#snapshot-${key}`);
+                if (!input) continue;
+                const eventName = input.type === 'number' ? 'input' : 'change';
+                input.addEventListener(eventName, () => {
+                    updateSnapshotSetting(key, input.type === 'number' ? input.value : input.checked);
+                });
+            }
+        }
+
+        function syncSnapshotPanel() {
+            if (!snapshotPanelVisible) return;
+
+            const effective = getSnapshotExportSettings();
+            const exportButton = snapshotPanel.querySelector('#snapshotExportBtn');
+            const serveButton = snapshotPanel.querySelector('#snapshotServeBtn');
+            const analyzeButton = snapshotPanel.querySelector('#snapshotAnalyzeBtn');
+            const status = snapshotPanel.querySelector('#snapshotPanelStatus');
+            const location = snapshotPanel.querySelector('#snapshotExportLocation');
+            if (status) {
+                if (!window.chrome?.webview) status.textContent = 'Available only inside max.js';
+                else if (pendingSnapshotAnalyze) status.textContent = 'Analyzing snapshot...';
+                else if (pendingSnapshotServeRequestId) status.textContent = 'Serving snapshot...';
+                else if (pendingSnapshotRequestId) status.textContent = 'Writing snapshot...';
+                else if (lastSnapshotServeUrl) status.textContent = 'Snapshot served';
+                else if (lastSnapshotExportPath) status.textContent = 'Snapshot saved';
+                else status.textContent = `dist export • step ${effective.animationSampleStepFrames}f`;
+            }
+            if (location) {
+                if (lastSnapshotServeUrl) {
+                    location.hidden = false;
+                    location.textContent = `Snapshot served at ${lastSnapshotServeUrl}`;
+                    location.title = lastSnapshotServeUrl;
+                } else if (lastSnapshotExportPath) {
+                    location.hidden = false;
+                    location.textContent = `Snapshot saved to ${lastSnapshotExportPath}`;
+                    location.title = lastSnapshotExportPath;
+                } else {
+                    location.hidden = true;
+                    location.textContent = '';
+                    location.removeAttribute('title');
+                }
+            }
+            if (exportButton) {
+                exportButton.disabled = !window.chrome?.webview || !!pendingSnapshotRequestId || !!pendingSnapshotServeRequestId || pendingSnapshotAnalyze;
+                exportButton.textContent = pendingSnapshotRequestId ? 'Writing...' : 'Export Snapshot';
+            }
+            if (serveButton) {
+                serveButton.disabled = !window.chrome?.webview || !!pendingSnapshotRequestId || !!pendingSnapshotServeRequestId || pendingSnapshotAnalyze;
+                serveButton.textContent = pendingSnapshotServeRequestId ? 'Serving...' : 'Serve Snapshot';
+            }
+            if (analyzeButton) {
+                analyzeButton.disabled = !window.chrome?.webview || !!pendingSnapshotRequestId || !!pendingSnapshotServeRequestId || pendingSnapshotAnalyze;
+                analyzeButton.textContent = pendingSnapshotAnalyze ? 'Analyzing...' : 'Analyze Snapshot';
+            }
+
+            for (const [key, defaultValue] of Object.entries(SNAPSHOT_SETTINGS_DEFAULTS)) {
+                const input = snapshotPanel.querySelector(`#snapshot-${key}`);
+                if (!input) continue;
+                if (typeof defaultValue === 'number') input.value = snapshotSettings[key];
+                else input.checked = !!snapshotSettings[key];
+            }
+
+            const animationsEnabled = !!snapshotSettings.includeAnimations;
+            const sceneNodesEnabled = !!snapshotSettings.includeSceneNodes;
+            const animationKeys = ['includeTransformAnimation', 'includeGeometryAnimation', 'includeMaterialAnimation'];
+            for (const key of animationKeys) {
+                const input = snapshotPanel.querySelector(`#snapshot-${key}`);
+                if (input) input.disabled = !animationsEnabled || !sceneNodesEnabled;
+            }
+            // NOTE: snapshotUi and runtimeScene are NOT gated by debugPayload - they're essential
+            const snapshotUiInput = snapshotPanel.querySelector('#snapshot-includeSnapshotUi');
+            if (snapshotUiInput) {
+                snapshotUiInput.checked = true;
+                snapshotUiInput.disabled = true;
+            }
+            const runtimeSceneInput = snapshotPanel.querySelector('#snapshot-includeRuntimeScene');
+            if (runtimeSceneInput) {
+                runtimeSceneInput.checked = true;
+                runtimeSceneInput.disabled = true;
+            }
+            const cameraInput = snapshotPanel.querySelector('#snapshot-includeCameraAnimation');
+            if (cameraInput) cameraInput.disabled = !animationsEnabled;
+            const stepInput = snapshotPanel.querySelector('#snapshot-animationSampleStepFrames');
+            if (stepInput) stepInput.disabled = !animationsEnabled;
+        }
+
+        function escapeSnapshotDiagnosticHtml(value) {
+            return String(value ?? '').replace(/[&<>"']/g, ch => ({
+                '&': '&amp;',
+                '<': '&lt;',
+                '>': '&gt;',
+                '"': '&quot;',
+                "'": '&#39;',
+            }[ch]));
+        }
+
+        function snapshotDiagnosticRow(label, value) {
+            return `
+                <div class="snapshot-diagnostics-row">
+                    <span>${escapeSnapshotDiagnosticHtml(label)}</span>
+                    <strong>${escapeSnapshotDiagnosticHtml(value)}</strong>
+                </div>
+            `;
+        }
+
+        function renderSnapshotDiagnosticsOverlay(report, path) {
+            const sceneBinBytes = report.files.sceneBin || 0;
+            const channelRows = Object.entries(report.sceneBinChannels || {})
+                .filter(([, bytes]) => bytes > 0)
+                .sort((a, b) => b[1] - a[1])
+                .map(([name, bytes]) => `
+                    <tr>
+                        <td>${escapeSnapshotDiagnosticHtml(name)}</td>
+                        <td>${escapeSnapshotDiagnosticHtml(formatBytes(bytes))}</td>
+                        <td>${escapeSnapshotDiagnosticHtml(formatPercent(bytes, sceneBinBytes))}</td>
+                    </tr>
+                `).join('');
+            const morphRows = (report.morphNodes || []).slice(0, 18).map(node => `
+                <tr>
+                    <td>${escapeSnapshotDiagnosticHtml(node.name)}</td>
+                    <td>${escapeSnapshotDiagnosticHtml(node.channels)}</td>
+                    <td>${escapeSnapshotDiagnosticHtml(node.nonzero)}</td>
+                    <td>${escapeSnapshotDiagnosticHtml(formatBytes(node.bytes))}</td>
+                    <td>${escapeSnapshotDiagnosticHtml((node.names || []).join(', '))}</td>
+                </tr>
+            `).join('');
+            const topRows = (report.topNodes || []).map(node => {
+                const rigData = [
+                    node.skin ? 'Skin' : '',
+                    node.morphChannels ? `Morph ${node.morphChannels}` : '',
+                ].filter(Boolean).join(' + ');
+                return `
+                    <tr>
+                        <td>${escapeSnapshotDiagnosticHtml(node.name)}</td>
+                        <td>${escapeSnapshotDiagnosticHtml(formatBytes(node.bytes))}</td>
+                        <td>${escapeSnapshotDiagnosticHtml(Math.round(node.verts || 0).toLocaleString())}</td>
+                        <td>${escapeSnapshotDiagnosticHtml(rigData)}</td>
+                    </tr>
+                `;
+            }).join('');
+            const vertexColor = report.vertexColor || {};
+            const warnings = [];
+            if (report.overlap > 0) warnings.push(`${formatBytes(report.overlap)} overlapping scene.bin ranges`);
+            if (report.gap > 0) warnings.push(`${formatBytes(report.gap)} unaccounted scene.bin gaps`);
+            if ((report.unknownTypes || []).length) warnings.push(`Unknown buffer types: ${report.unknownTypes.join(', ')}`);
+            if (vertexColor.bytesStoredAsF32 > 0) warnings.push(`${formatBytes(vertexColor.bytesStoredAsF32)} vertex colors stored as f32`);
+
+            return `
+                <div class="snapshot-diagnostics-window" role="dialog" aria-modal="true" aria-labelledby="snapshotDiagnosticsTitle">
+                    <div class="snapshot-diagnostics-header">
+                        <div>
+                            <div id="snapshotDiagnosticsTitle" class="snapshot-diagnostics-title">Snapshot Diagnostics</div>
+                            <div class="snapshot-diagnostics-path">${escapeSnapshotDiagnosticHtml(path || 'Last exported snapshot')}</div>
+                        </div>
+                        <button id="snapshotDiagnosticsClose" type="button" aria-label="Close snapshot diagnostics">Close</button>
+                    </div>
+                    <div class="snapshot-diagnostics-body">
+                        ${warnings.length ? `<section class="snapshot-diagnostics-alert">${warnings.map(escapeSnapshotDiagnosticHtml).join('<br>')}</section>` : ''}
+                        <section class="snapshot-diagnostics-grid">
+                            <div class="snapshot-diagnostics-card">
+                                <h3>Files</h3>
+                                ${snapshotDiagnosticRow('snapshot.json', formatBytes(report.files.snapshotJson))}
+                                ${snapshotDiagnosticRow('scene.bin', formatBytes(report.files.sceneBin))}
+                                ${snapshotDiagnosticRow('scene_anim.bin', report.files.sceneAnimBin ? formatBytes(report.files.sceneAnimBin) : 'none')}
+                            </div>
+                            <div class="snapshot-diagnostics-card">
+                                <h3>Scene</h3>
+                                ${snapshotDiagnosticRow('Nodes', report.totals.nodes.toLocaleString())}
+                                ${snapshotDiagnosticRow('Materials', report.totals.materials.toLocaleString())}
+                                ${snapshotDiagnosticRow('Vertices', report.totals.verts.toLocaleString())}
+                                ${snapshotDiagnosticRow('Triangles', report.totals.tris.toLocaleString())}
+                                ${snapshotDiagnosticRow('Animation clips', report.totals.animationClips.toLocaleString())}
+                                ${snapshotDiagnosticRow('Morph tracks', report.totals.morphTracks.toLocaleString())}
+                            </div>
+                            <div class="snapshot-diagnostics-card">
+                                <h3>Layout</h3>
+                                ${snapshotDiagnosticRow('Accounted bytes', `${formatBytes(report.accounted)} (${formatPercent(report.accounted, sceneBinBytes)})`)}
+                                ${snapshotDiagnosticRow('High water', `${formatBytes(report.highWater)} (${formatPercent(report.highWater, sceneBinBytes)})`)}
+                                ${snapshotDiagnosticRow('Gaps', formatBytes(report.gap))}
+                                ${snapshotDiagnosticRow('Overlaps', formatBytes(report.overlap))}
+                            </div>
+                            <div class="snapshot-diagnostics-card">
+                                <h3>Vertex Colors</h3>
+                                ${snapshotDiagnosticRow('Total', formatBytes(vertexColor.total))}
+                                ${snapshotDiagnosticRow('Channels', (vertexColor.channels || 0).toLocaleString())}
+                                ${snapshotDiagnosticRow('UV2 duplicates', formatBytes(vertexColor.bytesOnUv2Duplicates))}
+                                ${snapshotDiagnosticRow('Channels >= 3', formatBytes(vertexColor.bytesOnChannelsGE3))}
+                            </div>
+                        </section>
+                        <section class="snapshot-diagnostics-table">
+                            <h3>scene.bin Channels</h3>
+                            <table><thead><tr><th>Channel</th><th>Bytes</th><th>Share</th></tr></thead><tbody>${channelRows || '<tr><td colspan="3">No binary channels found</td></tr>'}</tbody></table>
+                        </section>
+                        <section class="snapshot-diagnostics-table">
+                            <h3>Morph Targets</h3>
+                            <table><thead><tr><th>Node</th><th>Channels</th><th>Nonzero</th><th>Bytes</th><th>Registered Names</th></tr></thead><tbody>${morphRows || '<tr><td colspan="5">No morph targets registered in snapshot</td></tr>'}</tbody></table>
+                        </section>
+                        <section class="snapshot-diagnostics-table">
+                            <h3>Top Nodes By Bytes</h3>
+                            <table><thead><tr><th>Node</th><th>Bytes</th><th>Verts</th><th>Rig Data</th></tr></thead><tbody>${topRows || '<tr><td colspan="4">No node byte data</td></tr>'}</tbody></table>
+                        </section>
+                    </div>
+                </div>
+            `;
+        }
+
+        function closeSnapshotDiagnosticsOverlay() {
+            const overlay = document.getElementById('snapshotDiagnosticsOverlay');
+            if (overlay) overlay.remove();
+            document.removeEventListener('keydown', handleSnapshotDiagnosticsKeydown);
+        }
+
+        function handleSnapshotDiagnosticsKeydown(event) {
+            if (event.key === 'Escape') closeSnapshotDiagnosticsOverlay();
+        }
+
+        function showSnapshotDiagnosticsOverlay(report, path) {
+            closeSnapshotDiagnosticsOverlay();
+            const overlay = document.createElement('div');
+            overlay.id = 'snapshotDiagnosticsOverlay';
+            overlay.className = 'snapshot-diagnostics';
+            overlay.innerHTML = renderSnapshotDiagnosticsOverlay(report, path);
+            overlay.addEventListener('click', event => {
+                if (event.target === overlay) closeSnapshotDiagnosticsOverlay();
+            });
+            document.body.appendChild(overlay);
+            document.getElementById('snapshotDiagnosticsClose')?.addEventListener('click', closeSnapshotDiagnosticsOverlay);
+            document.addEventListener('keydown', handleSnapshotDiagnosticsKeydown);
+        }
+
+        async function analyzeSnapshotFromHost() {
+            if (!window.chrome?.webview || pendingSnapshotRequestId || pendingSnapshotServeRequestId || pendingSnapshotAnalyze) return;
+            pendingSnapshotAnalyze = true;
+            syncSnapshotPanel();
+            setInfoText('max.js - analyzing snapshot...');
+            try {
+                const msg = await requestHostAction('snapshot_analyze', { path: lastSnapshotExportPath || '' }, 120000);
+                const report = analyzeSnapshotPayload({
+                    snapshotJson: msg.snapshotJson,
+                    files: {
+                        snapshotJsonBytes: msg.snapshotJsonBytes,
+                        sceneBinBytes: msg.sceneBinBytes,
+                        sceneAnimBytes: msg.sceneAnimBytes,
+                    },
+                    options: { top: 18, morphNameLimit: 24 },
+                });
+                const analyzedPath = msg.path || lastSnapshotExportPath || '';
+                lastSnapshotExportPath = analyzedPath || lastSnapshotExportPath;
+                showSnapshotDiagnosticsOverlay(report, analyzedPath);
+                setInfoText('max.js - snapshot diagnostics ready');
+            } catch (error) {
+                reportBridgeError('snapshot analyze', error);
+            } finally {
+                pendingSnapshotAnalyze = false;
+                syncSnapshotPanel();
+            }
+        }
+
+        async function exportSnapshotWithSettings(options = {}) {
+            if (!window.chrome?.webview || pendingSnapshotRequestId) return;
+
+            const settings = getSnapshotExportSettings();
+            let snapshotBase64 = '';
+            let runtimeSnapshotBase64 = '';
+            let localHdriBase64 = '';
+            let localHdriFileNameForExport = '';
+            const authoredEnvironmentActive = !!(skyActive || currentEnvParams?.hdri);
+
+            if (settings.includeSnapshotUi) {
+                const uiState = serializeSnapshotUiState({ includeDebug: settings.includeDebugPayload });
+                uiState.bake = serializeSnapshotBakeState();
+                if (!settings.includeSplats && uiState.performance) {
+                    uiState.performance = { ...uiState.performance, splatsEnabled: false };
+                }
+                if (!authoredEnvironmentActive && settings.copyAssets && isLocalHdriLoaded() && localHdriFile instanceof Blob) {
+                    try {
+                        localHdriBase64 = bytesToBase64(new Uint8Array(await localHdriFile.arrayBuffer()));
+                        localHdriFileNameForExport = localHdriFile.name || localHdriFileName || 'local_hdri.hdr';
+                    } catch (error) {
+                        reportBridgeError('snapshot HDRI export', error);
+                        return;
+                    }
+                }
+                snapshotBase64 = toBase64Utf8(JSON.stringify(uiState));
+            }
+
+            if (settings.includeRuntimeScene) {
+                try {
+                    const runtimeSnapshot = layerManager.serializeSnapshot?.({
+                        includeDisabledLayers: settings.includeDisabledLayers,
+                    }) ?? null;
+                    if (runtimeSnapshot) {
+                        runtimeSnapshotBase64 = toBase64Utf8(JSON.stringify(runtimeSnapshot));
+                        const layerRows = runtimeSnapshot.layers?.length ?? 0;
+                        const hasTransformOverrides = Array.isArray(runtimeSnapshot.transformOverrides)
+                            && runtimeSnapshot.transformOverrides.length > 0;
+                        if (layerRows > 0 && !runtimeSnapshot.jsRoot && !runtimeSnapshot.overlayRoot && !hasTransformOverrides) {
+                            maxjsDebugWarn(
+                                '[max.js snapshot] Runtime scene has layer metadata but no serialized 3D (empty roots and no tracked orphans). '
+                                + 'Parent effects with ctx.js.add(...) / overlay:true, or ctx.track() if you attach elsewhere.',
+                            );
+                        }
+                    }
+                } catch (error) {
+                    reportBridgeError('snapshot serialize', error);
+                    return;
+                }
+            }
+
+            pendingSnapshotRequestId = `snapshot_${Date.now()}`;
+            pendingSnapshotServeAfterExport = !!options.serveAfter;
+            syncSnapshotPanel();
+            setInfoText('max.js - writing snapshot...');
+            bridge.send('snapshot_export', {
+                requestId: pendingSnapshotRequestId,
+                snapshotBase64,
+                runtimeBase64: runtimeSnapshotBase64,
+                localHdriBase64,
+                localHdriFileName: localHdriFileNameForExport,
+                ...settings,
+            });
+        }
+
+        async function serveSnapshotWithSettings() {
+            if (!window.chrome?.webview || pendingSnapshotRequestId || pendingSnapshotServeRequestId) return;
+            if (!lastSnapshotExportPath) {
+                await exportSnapshotWithSettings({ serveAfter: true });
+                return;
+            }
+
+            pendingSnapshotServeRequestId = `snapshot_serve_${Date.now()}`;
+            lastSnapshotServeUrl = '';
+            syncSnapshotPanel();
+            setInfoText('max.js - serving snapshot...');
+            bridge.send('snapshot_serve', {
+                requestId: pendingSnapshotServeRequestId,
+                path: lastSnapshotExportPath,
+            });
+        }
+
+        bridge.on('snapshot_export_request', () => {
+            void exportSnapshotWithSettings();
+        });
+
+        btnSnapshotPanel.onclick = () => {
+            setSnapshotPanelVisible(!snapshotPanelVisible);
+        };
+
+        // requestHostAction resolution lives in host_bridge.js; this handler only
+        // owns the snapshot-export UI consequences.
+        bridge.on('host_action_result', msg => {
+            if (msg.action === 'snapshot_export') {
+                if (pendingSnapshotRequestId && msg.requestId && msg.requestId !== pendingSnapshotRequestId) return;
+                pendingSnapshotRequestId = null;
+                if (msg.ok) {
+                    lastSnapshotExportPath = msg.path || 'dist';
+                    lastSnapshotServeUrl = '';
+                    setInfoText(`max.js - Snapshot saved to ${lastSnapshotExportPath}`);
+                    syncSnapshotPanel();
+                    if (pendingSnapshotServeAfterExport) {
+                        pendingSnapshotServeAfterExport = false;
+                        void serveSnapshotWithSettings();
+                    }
+                } else {
+                    pendingSnapshotServeAfterExport = false;
+                    syncSnapshotPanel();
+                    reportBridgeError('snapshot export', msg.error || 'snapshot export failed');
+                }
+                return;
+            }
+
+            if (msg.action === 'snapshot_serve') {
+                if (pendingSnapshotServeRequestId && msg.requestId && msg.requestId !== pendingSnapshotServeRequestId) return;
+                pendingSnapshotServeRequestId = null;
+                if (msg.ok) {
+                    lastSnapshotServeUrl = msg.path || '';
+                    setInfoText(`max.js - Snapshot served at ${lastSnapshotServeUrl || 'localhost'}`);
+                } else {
+                    reportBridgeError('snapshot serve', msg.error || 'snapshot serve failed');
+                }
+                syncSnapshotPanel();
+            }
+        });
+
+        const btnCam = document.getElementById('btnCamLock');
+        btnCam.onclick = () => {
+            camLock = !camLock;
+            syncCameraLockButtonUi();
+            controls.enabled = !camLock;
+            savePostFxState();
+        };
+
+        const btnEnv = document.getElementById('btnEnv');
+        btnEnv.onclick = () => {
+            envVisible = !envVisible;
+            syncEnvButtonUi();
+            if (isLocalHdriActive()) {
+                applyLocalHDRIToScene();
+            } else {
+                syncEnvironmentDisplay();
+            }
+            savePostFxState();
+        };
+
+        syncCameraLockButtonUi();
+        syncEnvButtonUi();
+
+        const btnLightProbe = document.getElementById('btnLightProbe');
+        btnLightProbe.onclick = () => {
+            lightProbeEnabled = !lightProbeEnabled;
+            btnLightProbe.classList.toggle('active', lightProbeEnabled);
+            applyLightProbeState();
+            if (lightProbeEnabled) refreshLightProbeFromCurrentHDRI();
+            savePostFxState();
+        };
+
+        const btnRenderer = document.getElementById('btnRenderer');
+        const rendererPipelineSwitch = document.getElementById('rendererPipelineSwitch');
+        const btnForceWebGL = document.getElementById('btnForceWebGL');
+        const forceWebGLRow = document.getElementById('forceWebGLRow');
+        const RENDERER_PIPELINE_LABELS = {
+            webgl2: 'WebGL Mode',
+            webgpu: 'WebGPU Mode',
+            'webgl-fallback': 'WebGPU Mode (Force WebGL)',
+        };
+        const RENDERER_PIPELINE_BADGES = {
+            webgl2: 'WebGL',
+            webgpu: 'WGPU',
+            'webgl-fallback': 'WGPU',
+        };
+        const WEBGL_PIPELINE_CONFIRM_MESSAGE =
+            'This is the simple WebGL pipeline. It is snapshot friendly, supported by every browser and has superior light probing. But you will lose rendering modes, TSL materials and the max.js post processing stack.';
+        function isWgl2FallbackBackendActive() {
+            const label = String(rendererBackendLabel || '');
+            return label === 'TSL_GL' || label === 'WGL2 Fallback';
+        }
+        function isWgl2BackendActive() {
+            const label = String(rendererBackendLabel || '');
+            return renderer?.isWebGLRenderer === true
+                && (label === 'WebGL Mode' || label === 'WebGL (Pathtracing)');
+        }
+        function isSimpleWebGLPipelineActive() {
+            return isWgl2BackendActive() && !isPathTracingMode;
+        }
+        function isWebGLPipelineActive() {
+            return isWgl2BackendActive();
+        }
+        function getRendererPipelineMode() {
+            if (isWgl2BackendActive()) return 'webgl2';
+            if (isWgl2FallbackBackendActive()) return 'webgl-fallback';
+            if (String(rendererBackendLabel || '') === 'WebGPU') return 'webgpu';
+            return 'webgl-fallback';
+        }
+        function syncRendererButtonUi() {
+            const pipelineMode = getRendererPipelineMode();
+            const pipelineLabel = RENDERER_PIPELINE_LABELS[pipelineMode] || pipelineMode;
+            if (btnRenderer) {
+                setRailButtonMeta(btnRenderer, { badge: RENDERER_PIPELINE_BADGES[pipelineMode] || 'WGPU' });
+                btnRenderer.classList.toggle('active', pipelineMode !== 'webgpu');
+                btnRenderer.title = `Renderer pipeline: ${pipelineLabel}`;
+            }
+            if (rendererPipelineSwitch) {
+                rendererPipelineSwitch.querySelectorAll('[data-renderer-pipeline]').forEach(button => {
+                    const mode = normalizeRendererBackend(button.dataset.rendererPipeline);
+                    const active = mode === pipelineMode
+                        || (mode === 'webgpu' && pipelineMode === 'webgl-fallback');
+                    button.classList.toggle('active', active);
+                    button.setAttribute('aria-pressed', active ? 'true' : 'false');
+                    button.title = mode === 'webgpu' && pipelineMode === 'webgl-fallback'
+                        ? 'WebGPU pipeline active with Force WebGL enabled'
+                        : `${RENDERER_PIPELINE_LABELS[mode] || mode} pipeline${active ? ' active' : ''}`;
+                });
+            }
+            const forceWebGLActive = pipelineMode === 'webgl-fallback';
+            setViewportMenuItemHidden(forceWebGLRow, pipelineMode === 'webgl2');
+            if (btnForceWebGL) {
+                btnForceWebGL.classList.toggle('active', forceWebGLActive);
+                btnForceWebGL.setAttribute('aria-pressed', forceWebGLActive ? 'true' : 'false');
+                btnForceWebGL.title = forceWebGLActive
+                    ? 'Force WebGL is active. Click to restart in native WebGPU.'
+                    : 'Restart WebGPU mode using the forced WebGL backend.';
+            }
+        }
+        function restartWithRendererBackend(mode, options = {}) {
+            const normalizedMode = normalizeRendererBackend(mode) || 'webgpu';
+            const reason = options.reason || 'manual';
+            const label = RENDERER_PIPELINE_LABELS[normalizedMode] || normalizedMode;
+            const confirmMessage = options.confirmMessage
+                || `Restart max.js with ${label} pipeline now?`;
+            if (options.prompt === false || confirm(confirmMessage)) {
+                persistRendererBackendPreference(normalizedMode);
+                // Pathtracing now runs on WebGPU; only the WebGL2 backend (which
+                // can't host the spectral tracer) drops back to standard mode.
+                if (normalizedMode === 'webgl2') {
+                    try { localStorage.setItem(MAXJS_MODE_KEY, 'standard'); } catch {}
+                }
+                sessionStorage.setItem('maxjs_renderer_backend', normalizedMode);
+                location.reload();
+                return;
+            }
+        }
+        function getNextRendererPipelineMode() {
+            const order = ['webgl2', 'webgpu', 'webgl-fallback'];
+            const current = getRendererPipelineMode();
+            const index = order.indexOf(current);
+            return order[(index + 1) % order.length] || 'webgl-fallback';
+        }
+        btnRenderer?.addEventListener('click', () => {
+            const nextMode = getNextRendererPipelineMode();
+            restartWithRendererBackend(nextMode, {
+                reason: 'manual',
+                confirmMessage: nextMode === 'webgl2'
+                    ? WEBGL_PIPELINE_CONFIRM_MESSAGE
+                    : `Restart max.js with ${RENDERER_PIPELINE_LABELS[nextMode]} pipeline now?`,
+            });
+        });
+        if (rendererPipelineSwitch) {
+            rendererPipelineSwitch.querySelectorAll('[data-renderer-pipeline]').forEach(button => {
+                const mode = normalizeRendererBackend(button.dataset.rendererPipeline);
+                button.addEventListener('click', () => {
+                    if (!mode || mode === getRendererPipelineMode()) return;
+                    restartWithRendererBackend(mode, {
+                        reason: mode === 'webgl-fallback' ? 'fallback' : 'manual',
+                        confirmMessage: mode === 'webgl2'
+                            ? WEBGL_PIPELINE_CONFIRM_MESSAGE
+                            : mode === 'webgl-fallback'
+                            ? 'Force WebGL runs the WebGPU renderer stack through WebGL and reloads the panel.\n\nUse this when native WebGPU is not usable.\n\nEnable Force WebGL now?'
+                            : `Restart max.js with ${RENDERER_PIPELINE_LABELS[mode]} pipeline now?`,
+                    });
+                });
+            });
+        }
+        btnForceWebGL?.addEventListener('click', () => {
+            const forceWebGLActive = getRendererPipelineMode() === 'webgl-fallback';
+            restartWithRendererBackend(forceWebGLActive ? 'webgpu' : 'webgl-fallback', {
+                reason: forceWebGLActive ? 'manual' : 'fallback',
+                confirmMessage: forceWebGLActive
+                    ? 'Disable Force WebGL and restart with native WebGPU now?'
+                    : 'Force WebGL runs the WebGPU renderer stack through WebGL and reloads the panel.\n\nUse this when native WebGPU is not usable.\n\nEnable Force WebGL now?',
+            });
+        });
+
+        const renderModeSwitch = document.getElementById('renderModeSwitch');
+        const modeLabels = {
+            standard: 'Standard',
+            spectral: 'Spectral',
+        };
+        if (renderModeSwitch) {
+            renderModeSwitch.title = 'Render mode: Standard, or Spectral (probe GI + live path tracer)';
+            renderModeSwitch.querySelectorAll('[data-render-mode]').forEach(button => {
+                const mode = button.dataset.renderMode;
+                const active = mode === maxjsRenderMode;
+                button.classList.toggle('active', active);
+                button.setAttribute('aria-pressed', active ? 'true' : 'false');
+                button.title = `${modeLabels[mode] || mode} mode${active ? ' active' : ''}`;
+                button.addEventListener('click', () => {
+                    if (mode === maxjsRenderMode) return;
+                    const label = modeLabels[mode] || mode;
+                    if (!confirm(`Switch to ${label} mode? Reloads the page.`)) return;
+                    // Pathtracing runs on the same WebGPU backend now — no
+                    // backend switch, just re-init the render mode on reload.
+                    try { localStorage.setItem(MAXJS_MODE_KEY, mode); } catch {}
+                    location.reload();
+                });
+            });
+        }
+
+        // Spectral sub-view toggle: probes <-> path tracer, live (no reload).
+        const spectralTraceButton = document.getElementById('btnSpectralTrace');
+        window.__maxjsSyncSpectralViewUi = () => {
+            if (!spectralTraceButton) return;
+            const webGL = typeof isWebGLPipelineActive === 'function' && isWebGLPipelineActive();
+            spectralTraceButton.style.display = (isStudioMode && !webGL) ? '' : 'none';
+            const active = isStudioMode && spectralView === 'trace';
+            spectralTraceButton.classList.toggle('active', active);
+            spectralTraceButton.setAttribute('aria-pressed', active ? 'true' : 'false');
+            spectralTraceButton.title = active
+                ? 'Path-traced view active — click for probe GI'
+                : 'Path-traced view (spectral mode)';
+        };
+        spectralTraceButton?.addEventListener('click', () => {
+            if (!isStudioMode) return;
+            setSpectralView(spectralView === 'trace' ? 'probes' : 'trace');
+        });
+        window.__maxjsSyncSpectralViewUi();
+        syncRendererButtonUi();
+
+        // Path-tracer pause toggle. Stops compute dispatch so the GPU goes idle
+        // and the maxjs UI panels stay responsive while the accumulated frame
+        // holds. Styled by .pt-pause-toggle (css/index.css); that rule hides it
+        // outside pathtracing mode, so it can be created unconditionally.
+        {
+            const ptPauseBtn = document.createElement('button');
+            ptPauseBtn.id = 'btnPathTracePause';
+            ptPauseBtn.type = 'button';
+            ptPauseBtn.className = 'pt-pause-toggle';
+            ptPauseUiSync = () => {
+                const p = pathTracingSettings.paused === true;
+                ptPauseBtn.textContent = p ? '▶ Resume' : '⏸ Pause';
+                ptPauseBtn.classList.toggle('is-paused', p);
+                ptPauseBtn.title = p ? 'Resume path tracing' : 'Pause path tracing — frees the GPU so the UI stays responsive';
+            };
+            ptPauseBtn.addEventListener('click', () => {
+                applyPathTracingSettings({ paused: !pathTracingSettings.paused }, { notify: true, sendHost: true });
+            });
+            document.body.appendChild(ptPauseBtn);
+            ptPauseUiSync();
+        }
+
+        function setViewportMenuItemHidden(el, hidden) {
+            if (!el) return;
+            el.hidden = !!hidden;
+            el.classList.toggle('is-hidden', !!hidden);
+            if (hidden) {
+                el.style.setProperty('display', 'none', 'important');
+            } else {
+                el.style.removeProperty('display');
+            }
+        }
+
+        function syncSimpleWebGLPipelineUi() {
+            const simpleWebGL = isSimpleWebGLPipelineActive();
+            const webGLPipeline = isWebGLPipelineActive();
+            const tslGl = isWgl2FallbackBackendActive();
+            const renderModeRow = renderModeSwitch?.closest('.vpmenu-row');
+            setViewportMenuItemHidden(renderModeRow, false);
+            renderModeSwitch?.querySelectorAll('[data-render-mode]').forEach(button => {
+                const mode = button.dataset.renderMode;
+                // Spectral mode (probe GI + path tracer) requires the native
+                // WebGPU stack; hide it on the WebGL pipeline.
+                const hideForPipeline = webGLPipeline && mode === 'spectral';
+                setViewportMenuItemHidden(button, hideForPipeline);
+                const gated = hideForPipeline;
+                button.disabled = gated;
+                button.classList.toggle('is-gated', gated);
+                button.setAttribute('aria-disabled', gated ? 'true' : 'false');
+                button.title = `${modeLabels[mode] || mode} mode${mode === maxjsRenderMode ? ' active' : ''}`;
+                if (webGLPipeline && mode === 'spectral') {
+                    button.title = 'Spectral mode requires the native WebGPU pipeline';
+                }
+            });
+
+            const vrButton = document.getElementById('btnEnterVR');
+            const vrRow = vrButton?.closest('.vpmenu-row');
+            setViewportMenuItemHidden(vrRow, webGLPipeline);
+            if (vrButton) {
+                vrButton.disabled = webGLPipeline || vrButton.disabled;
+                vrButton.classList.toggle('is-gated', webGLPipeline || vrButton.disabled);
+                if (webGLPipeline) vrButton.title = 'VR is unavailable in the WebGL/pathtracing pipeline';
+            }
+
+            for (const id of STUDIO_ONLY_RAIL_IDS) {
+                const button = document.getElementById(id);
+                const row = button?.closest('.vpmenu-row');
+                setViewportMenuItemHidden(row, simpleWebGL);
+                if (button && simpleWebGL) {
+                    button.disabled = true;
+                    button.classList.add('is-gated');
+                    button.setAttribute('aria-disabled', 'true');
+                }
+            }
+            const renderMenuSep = document.querySelector('[data-menu="render"] .vpmenu-sep');
+            setViewportMenuItemHidden(renderMenuSep, simpleWebGL || !isStudioMode);
+
+            const shaderLabButton = document.getElementById('btnShaderLabPanel');
+            const shaderLabRow = shaderLabButton?.closest('.vpmenu-row');
+            setViewportMenuItemHidden(shaderLabRow, simpleWebGL || !isShaderLabBackendAvailable());
+
+            if (simpleWebGL) {
+                setLightLinkPanelVisible(false);
+                setReflPaintPanelVisible(false);
+            }
+            window.__maxjsSyncSpectralViewUi?.();
+        }
+
+        function syncStudioOnlyUi() {
+            const gated = !isStudioMode;
+            for (const id of STUDIO_ONLY_RAIL_IDS) {
+                const button = document.getElementById(id);
+                if (!button) continue;
+                const row = button.closest('.vpmenu-row');
+                if (isSimpleWebGLPipelineActive()) {
+                    setViewportMenuItemHidden(row, true);
+                    continue;
+                }
+                setViewportMenuItemHidden(row, gated);
+                if (!button.dataset.baseTitle) button.dataset.baseTitle = button.title || '';
+                button.disabled = gated;
+                button.classList.toggle('is-gated', gated);
+                button.setAttribute('aria-disabled', gated ? 'true' : 'false');
+                button.title = gated
+                    ? `${button.dataset.baseTitle} (Advanced mode only)`
+                    : button.dataset.baseTitle;
+            }
+            if (gated) {
+                setLightLinkPanelVisible(false);
+                setReflPaintPanelVisible(false);
+            }
+            syncSimpleWebGLPipelineUi();
+        }
+        syncStudioOnlyUi();
+
+        function syncBackgroundColorSlot() {
+            const input = document.getElementById('bgColorSlot');
+            const slot = document.querySelector('.vpmenu-bg-slot');
+            const hex = hexColorInputValue(hiddenBackgroundColor);
+            if (input) input.value = hex;
+            if (slot) slot.style.setProperty('--vpmenu-bg-fill', hex);
+        }
+
+        // ── Theme Toggle ─────────────────────────────────
+        // Icon swap is CSS-driven (body.light-mode toggles .icon-moon / .icon-sun)
+        const btnMuteAudio = document.getElementById('btnMuteAudio');
+        btnMuteAudio?.addEventListener('click', () => {
+            setAudioMuted(!audioMuted);
+        });
+        syncAudioMuteButtonUi();
+
+        const btnTheme = document.getElementById('btnTheme');
+        btnTheme.onclick = () => {
+            lightMode = !lightMode;
+            document.body.classList.toggle('light-mode', lightMode);
+            try {
+                localStorage.setItem(THEME_STORAGE_KEY, lightMode ? 'light' : 'dark');
+            } catch (e) { /* private mode */ }
+        };
+
+        const bgColorSlotInput = document.getElementById('bgColorSlot');
+        bgColorSlotInput?.addEventListener('input', () => {
+            const next = parseHexColorInput(bgColorSlotInput.value);
+            if (next == null) return;
+            setBackgroundColor(next);
+        });
+        syncBackgroundColorSlot();
+
+        // Toon outline is automatic — no UI button needed
+
+        // ── Runtime Layers Panel ─────────────────────────
+        const btnLayersPanel = document.getElementById('btnLayersPanel');
+        const layersPanel = document.getElementById('layersPanel');
+        let layersPanelVisible = false;
+        let layersPanelDirty = true;
+        let layersPanelRefreshQueued = false;
+
+        function setLayersPanelVisible(visible) {
+            layersPanelVisible = !!visible;
+            if (!layersPanelVisible) {
+                const ae = document.activeElement;
+                if (ae instanceof HTMLElement && layersPanel.contains(ae)) btnLayersPanel.focus();
+            }
+            layersPanel.classList.toggle('visible', layersPanelVisible);
+            layersPanel.toggleAttribute('inert', !layersPanelVisible);
+            layersPanel.setAttribute('aria-hidden', String(!layersPanelVisible));
+            btnLayersPanel?.classList.toggle('active', layersPanelVisible);
+            if (layersPanelVisible) queueLayersPanelRefresh();
+        }
+
+        // ── Shader Lab Panel ────────────────────────────────
+        const btnShaderLabPanel = document.getElementById('btnShaderLabPanel');
+        const shaderLabPanel = document.getElementById('shaderLabPanel');
+        let shaderLabPanelVisible = false;
+        let shaderLabPanelApp = null;
+
+        function isShaderLabBackendAvailable() {
+            return !!maxjsFx.supportsScreenSpaceEffects?.();
+        }
+
+        function syncShaderLabAvailability() {
+            const available = isShaderLabBackendAvailable();
+            if (btnShaderLabPanel) {
+                const row = btnShaderLabPanel.closest('.vpmenu-row');
+                setViewportMenuItemHidden(row, !available || isSimpleWebGLPipelineActive());
+                btnShaderLabPanel.disabled = !available;
+                btnShaderLabPanel.classList.toggle('disabled', !available);
+                btnShaderLabPanel.title = available
+                    ? 'Shader Lab by basement.studio'
+                    : 'Shader Lab requires WebGPU or Force WebGL';
+            }
+            if (!available && shaderLabPanelVisible) {
+                setShaderLabPanelVisible(false);
+            }
+            return available;
+        }
+
+        function setShaderLabPanelVisible(visible) {
+            shaderLabPanelVisible = !!visible && isShaderLabBackendAvailable();
+            if (!shaderLabPanelVisible) {
+                const ae = document.activeElement;
+                if (ae instanceof HTMLElement && shaderLabPanel.contains(ae)) btnShaderLabPanel?.focus();
+            }
+            shaderLabPanel.classList.toggle('visible', shaderLabPanelVisible);
+            shaderLabPanel.toggleAttribute('inert', !shaderLabPanelVisible);
+            shaderLabPanel.setAttribute('aria-hidden', String(!shaderLabPanelVisible));
+            btnShaderLabPanel?.classList.toggle('active', shaderLabPanelVisible);
+            if (shaderLabPanelVisible && !shaderLabPanelApp) {
+                createShaderLabPanel({
+                    panelEl: shaderLabPanel,
+                    shaderLabFx,
+                    onHide: () => setShaderLabPanelVisible(false),
+                }).then(app => { shaderLabPanelApp = app; }).catch(err => {
+                    shaderLabPanel.innerHTML =
+                        '<div class="sidepanel-header"><div>' +
+                        '<div class="sidepanel-title">Shader Lab</div>' +
+                        '<div class="sidepanel-subtitle" style="color:#f66">' +
+                        'Failed to load: ' + String(err.message || err) +
+                        '</div></div></div>';
+                    console.error('[ShaderLabPanel] React load failed:', err);
+                });
+            }
+            syncShaderLabAvailability();
+        }
+
+        // ── Canvas Panel ────────────────────────────────────
+        const btnCanvasPanel = document.getElementById('btnCanvasPanel');
+        const canvasPanel = document.getElementById('canvasPanel');
+        let canvasPanelVisible = false;
+        let canvasPanelApp = null;
+
+        function setCanvasPanelVisible(visible) {
+            canvasPanelVisible = !!visible;
+            if (!canvasPanelVisible) {
+                const ae = document.activeElement;
+                if (ae instanceof HTMLElement && canvasPanel.contains(ae)) btnCanvasPanel?.focus();
+            }
+            canvasPanel.classList.toggle('visible', canvasPanelVisible);
+            canvasPanel.toggleAttribute('inert', !canvasPanelVisible);
+            canvasPanel.setAttribute('aria-hidden', String(!canvasPanelVisible));
+            btnCanvasPanel?.classList.toggle('active', canvasPanelVisible);
+            if (canvasPanelVisible && !canvasPanelApp) {
+                // Lazy-mount on first open so React isn't fetched on load.
+                createCanvasPanel({
+                    panelEl: canvasPanel,
+                    getProjectBaseUrl: () => projectRuntime?.getState?.().projectRootUrl || '',
+                    onHide: () => setCanvasPanelVisible(false),
+                }).then(app => { canvasPanelApp = app; }).catch(err => {
+                    canvasPanel.innerHTML =
+                        '<div class="sidepanel-header"><div>' +
+                        '<div class="sidepanel-title">Canvas</div>' +
+                        '<div class="sidepanel-subtitle" style="color:#f66">' +
+                        'Failed to load React: ' + String(err.message || err) +
+                        '</div></div></div>';
+                    console.error('[CanvasPanel] React load failed:', err);
+                });
+            } else if (canvasPanelVisible && canvasPanelApp) {
+                canvasPanelApp.render();
+            }
+        }
+
+        let _layerManagerRef = null;
+        let _projectRuntimeRef = null;
+        let _layerManagerUnsub = null;
+        let _projectRuntimeUnsub = null;
+
+        function queueLayersPanelRefresh() {
+            layersPanelDirty = true;
+            if (!layersPanelVisible || layersPanelRefreshQueued) return;
+            layersPanelRefreshQueued = true;
+            requestAnimationFrame(() => {
+                layersPanelRefreshQueued = false;
+                if (!layersPanelVisible || !layersPanelDirty) return;
+                layersPanelDirty = false;
+                refreshLayersPanel();
+            });
+        }
+
+        function attachLayerPanelSubscriptions() {
+            _layerManagerUnsub?.();
+            _projectRuntimeUnsub?.();
+            _layerManagerUnsub = _layerManagerRef?.subscribe?.(() => queueLayersPanelRefresh()) ?? null;
+            _projectRuntimeUnsub = _projectRuntimeRef?.subscribe?.(() => {
+                queueLayersPanelRefresh();
+                syncProjectStudioState();
+                syncProjectBakeState();
+                syncProjectPostFxState();
+            }) ?? null;
+        }
+
+        function getPanelLayers() {
+            // listEntries() is the single source of truth — driven by the
+            // C++ inlines/ folder scan via inline_layers_state.
+            return _projectRuntimeRef?.listEntries?.() ?? [];
+        }
+
+        function getProjectRuntimeState() {
+            return _projectRuntimeRef?.getState?.() ?? {};
+        }
+
+        function getLayerStatus(layer) {
+            if (layer.error) return { label: 'ERR', className: 'err' };
+            if (layer.loading) return { label: 'LOAD', className: 'off' };
+            if (layer.enabled === false) return { label: 'OFF', className: 'off' };
+            return layer.active ? { label: 'LIVE', className: 'live' } : { label: 'OFF', className: 'off' };
+        }
+
+        function getLayerDetails(layer) {
+            const details = [];
+            if (layer.entry) {
+                details.push(layer.source === 'inline' && layer.enabled === false
+                    ? `${layer.entry}.disabled`
+                    : layer.entry);
+            } else if (layer.source === 'inline') {
+                details.push(`inlines/${layer.id}.js${layer.enabled === false ? '.disabled' : ''}`);
+            }
+            if (Number.isFinite(layer.profile?.avgUpdateMs) && layer.profile.updateCount > 0) {
+                details.push(`avg ${layer.profile.avgUpdateMs.toFixed(2)}ms`);
+            }
+            details.push(`anc ${layer.anchors ?? 0}`);
+            details.push(`trk ${layer.tracked ?? 0}`);
+            return details.join(' | ');
+        }
+
+        function handleLayerToggle(layer) {
+            const nextEnabled = !(layer.enabled !== false);
+            // Pure runtime flag flip. No await, no dispose, no remount,
+            // no manifest write. File rename is fire-and-forget and never
+            // blocks the UI or affects the visual state.
+            try { _layerManagerRef?.setActive?.(layer.id, nextEnabled); }
+            catch (err) { maxjsDebugWarn('[max.js layer toggle] setActive failed', layer.id, err); }
+            queueLayersPanelRefresh();
+            _projectRuntimeRef?.setInlineLayerEnabled?.(layer.id, nextEnabled)
+                ?.catch?.(err => {
+                    maxjsDebugWarn('[max.js layer toggle] persist failed', layer.id, err);
+                });
+        }
+
+        async function handleLayerRemove(layer) {
+            try {
+                if (layer.source === 'inline' && _projectRuntimeRef?.removeInlineLayer) {
+                    await _projectRuntimeRef.removeInlineLayer(layer.id);
+                    _layerManagerRef?.remove(layer.id);
+                } else if (layer.source === 'project') {
+                    await _projectRuntimeRef?.removeLayer(layer.id);
+                } else {
+                    _layerManagerRef?.remove(layer.id);
+                }
+            } catch (error) {
+                reportBridgeError('layer remove', error);
+            }
+        }
+
+        async function handleReleaseProjectManifest() {
+            try {
+                await _projectRuntimeRef?.releaseManifest?.();
+            } catch (error) {
+                reportBridgeError('release project manifest', error);
+            }
+        }
+
+        function formatLayerParamValue(param) {
+            if (param?.type === 'color') return String(param.value || '#ffffff').toLowerCase();
+            if (param?.type === 'bool') return param.value ? 'On' : 'Off';
+            const n = Number(param?.value);
+            if (!Number.isFinite(n)) return String(param?.value ?? '');
+            if (Math.abs(n) >= 100) return n.toFixed(1).replace(/\.0$/, '');
+            if (Math.abs(n) >= 10) return n.toFixed(2).replace(/\.?0+$/, '');
+            return n.toFixed(3).replace(/\.?0+$/, '');
+        }
+
+        function layerParamNumberAttrs(param) {
+            const attrs = [];
+            if (Number.isFinite(Number(param.min))) attrs.push(`min="${Number(param.min)}"`);
+            if (Number.isFinite(Number(param.max))) attrs.push(`max="${Number(param.max)}"`);
+            if (param.step != null) attrs.push(`step="${escapeWebPanelText(param.step)}"`);
+            return attrs.join(' ');
+        }
+
+        function renderLayerParamControl(layer, param) {
+            const name = String(param?.name || '');
+            if (!name) return '';
+            const idAttr = escapeWebPanelText(layer.id);
+            const nameAttr = escapeWebPanelText(name);
+            const label = escapeWebPanelText(param.label || name);
+            const title = escapeWebPanelText(param.description || param.label || name);
+            const value = param.type === 'color'
+                ? escapeWebPanelText(String(param.value || '#ffffff'))
+                : escapeWebPanelText(String(param.value ?? ''));
+            const common = `data-layer-param-layer="${idAttr}" data-layer-param="${nameAttr}" data-layer-param-type="${escapeWebPanelText(param.type || '')}"`;
+            const valueHtml = `<span class="layer-param-value" data-layer-param-value>${escapeWebPanelText(formatLayerParamValue(param))}</span>`;
+
+            if (param.type === 'slider') {
+                return `<label class="layer-param layer-param-slider" title="${title}">
+                    <span class="layer-param-head"><span>${label}</span>${valueHtml}</span>
+                    <input class="layer-param-input layer-param-range fx-range" type="range" ${common} ${layerParamNumberAttrs(param)} value="${value}">
+                </label>`;
+            }
+            if (param.type === 'float') {
+                return `<label class="layer-param layer-param-float" title="${title}">
+                    <span class="layer-param-head"><span>${label}</span>${valueHtml}</span>
+                    <input class="layer-param-input layer-param-number" type="number" ${common} ${layerParamNumberAttrs(param)} value="${value}">
+                </label>`;
+            }
+            if (param.type === 'color') {
+                return `<label class="layer-param layer-param-color" title="${title}">
+                    <span class="layer-param-head"><span>${label}</span>${valueHtml}</span>
+                    <input class="layer-param-input layer-param-swatch" type="color" ${common} value="${value}">
+                </label>`;
+            }
+            if (param.type === 'bool') {
+                return `<label class="layer-param layer-param-bool" title="${title}">
+                    <span class="layer-param-head"><span>${label}</span>${valueHtml}</span>
+                    <input class="layer-param-input layer-param-check" type="checkbox" ${common} ${param.value ? 'checked' : ''}>
+                </label>`;
+            }
+            return '';
+        }
+
+        function renderLayerParams(layer) {
+            const params = Array.isArray(layer.parameters) ? layer.parameters : [];
+            if (params.length === 0) return '';
+            const controls = params.map(param => renderLayerParamControl(layer, param)).filter(Boolean).join('');
+            return controls ? `<div class="layer-params">${controls}</div>` : '';
+        }
+
+        function readLayerParamInput(input) {
+            if (input.type === 'checkbox') return input.checked;
+            return input.value;
+        }
+
+        function syncLayerParamControl(control, param) {
+            if (!control || !param) return;
+            const valueEl = control.querySelector('[data-layer-param-value]');
+            if (valueEl) valueEl.textContent = formatLayerParamValue(param);
+            control.querySelectorAll('input[data-layer-param]').forEach(input => {
+                if (input.type === 'checkbox') {
+                    input.checked = !!param.value;
+                } else if (document.activeElement !== input || input.type === 'range' || input.type === 'color') {
+                    input.value = String(param.value ?? '');
+                }
+            });
+        }
+
+        function handleLayerParamInput(input, commit = false) {
+            if (!input) return;
+            if ((input.type === 'number' || input.type === 'range') && !Number.isFinite(Number(input.value))) return;
+            const layerId = input.dataset.layerParamLayer;
+            const name = input.dataset.layerParam;
+            if (!layerId || !name) return;
+            const param = _layerManagerRef?.setParameter?.(layerId, name, readLayerParamInput(input), {
+                source: 'ui',
+                silent: !commit,
+            });
+            if (param) syncLayerParamControl(input.closest('.layer-param'), param);
+        }
+
+        function refreshLayersPanel() {
+            if (!layersPanelVisible || !_layerManagerRef) return;
+            const projectState = getProjectRuntimeState();
+            const layers = getPanelLayers();
+            const projectReady = projectState.manifestExists === true;
+            const canReleaseProject = projectState.sceneSaved === true && !projectReady;
+            const emptyHtml = !projectState.sceneSaved
+                ? '<div class="layers-empty">Save the scene first. max.js creates <code>project.maxjs.json</code> and <code>inlines/</code> next to the <code>.max</code> file.</div>'
+                : !projectReady
+                    ? `<div class="layers-empty">This scene has no max.js project yet. Create scene-local runtime files next to the <code>.max</code> file.<div style="margin-top:10px"><button id="layersReleaseBtn">Release Project Manifest</button></div></div>`
+                    : '<div class="layers-empty">No layers yet. Scene-local project files live in <code>project.maxjs.json</code> and <code>inlines/</code>.</div>';
+
+            const renderLayerItem = (l) => `
+                <div class="layer-item${l.error ? ' error' : ''}${!l.active ? ' inactive' : ''}">
+                    <div class="layer-main">
+                        <div class="layer-meta">
+                            <span class="layer-name" title="${escapeWebPanelText(l.name)}">${escapeWebPanelText(l.name)}</span>
+                            ${Number.isFinite(l.priority) && l.priority !== 100 ? `<span class="layer-priority" title="Load priority (lower = earlier)">${l.priority}</span>` : ''}
+                            <span class="layer-source ${l.source === 'project' ? 'project' : 'inline'}">${l.source}</span>
+                            <span class="layer-status ${getLayerStatus(l).className}">${getLayerStatus(l).label}</span>
+                        </div>
+                        <div class="layer-detail" title="${escapeWebPanelText(getLayerDetails(l))}">${escapeWebPanelText(getLayerDetails(l))}</div>
+                    </div>
+                    <div class="layer-actions">
+                        ${l.source === 'project' || l.persisted !== false
+                            ? `<button class="layer-action layer-toggle" data-layer-toggle="${escapeWebPanelText(l.id)}">${l.enabled === false ? 'Enable' : 'Disable'}</button>`
+                            : ''
+                        }
+                    </div>
+                    ${renderLayerParams(l)}
+                </div>`;
+
+            // Group by folder. Root ('') renders flat at top; named folders render as
+            // <details> collapsibles below. Collapse state persists in localStorage.
+            const collapseKey = 'maxjs.layers.folderCollapse';
+            let collapseState = {};
+            try { collapseState = JSON.parse(localStorage.getItem(collapseKey) || '{}') || {}; } catch {}
+
+            const rootLayers = [];
+            const byFolder = new Map();
+            for (const l of layers) {
+                const f = typeof l.folder === 'string' ? l.folder : '';
+                if (!f) { rootLayers.push(l); continue; }
+                let set = byFolder.get(f);
+                if (!set) { set = []; byFolder.set(f, set); }
+                set.push(l);
+            }
+            const folders = [...byFolder.keys()].sort();
+
+            const itemsHtml = layers.length === 0
+                ? emptyHtml
+                : [
+                    ...rootLayers.map(renderLayerItem),
+                    ...folders.map(folder => {
+                        const items = byFolder.get(folder).map(renderLayerItem).join('');
+                        const isOpen = collapseState[folder] !== false;
+                        return `<details class="layer-folder"${isOpen ? ' open' : ''} data-folder="${folder}">
+                            <summary class="layer-folder-header"><span class="layer-folder-name">${folder}</span><span class="layer-folder-count">${byFolder.get(folder).length}</span></summary>
+                            <div class="layer-folder-body">${items}</div>
+                        </details>`;
+                    }),
+                ].join('');
+
+            layersPanel.innerHTML = `
+                <div class="sidepanel-header">
+                    <div>
+                        <div class="sidepanel-title">Runtime Layers (inlines)</div>
+                        <div class="sidepanel-subtitle">${layers.length} tracked</div>
+                    </div>
+                    <div style="display:flex;gap:4px">
+                        ${canReleaseProject && layers.length > 0 ? '<button id="layersReleaseBtn">Release Project Manifest</button>' : ''}
+                        <button id="layersHideBtn">Hide</button>
+                    </div>
+                </div>
+                <div class="sidepanel-body">${itemsHtml}</div>
+            `;
+
+            layersPanel.querySelector('#layersHideBtn')?.addEventListener('click', () => setLayersPanelVisible(false));
+            layersPanel.querySelector('#layersReleaseBtn')?.addEventListener('click', () => { void handleReleaseProjectManifest(); });
+            layersPanel.querySelectorAll('[data-layer-toggle]').forEach(btn => {
+                btn.addEventListener('click', () => {
+                    const layer = layers.find(item => item.id === btn.dataset.layerToggle);
+                    if (layer) void handleLayerToggle(layer);
+                });
+            });
+            layersPanel.querySelectorAll('[data-layer-remove]').forEach(btn => {
+                btn.addEventListener('click', () => {
+                    const layer = layers.find(item => item.id === btn.dataset.layerRemove);
+                    if (layer) void handleLayerRemove(layer);
+                });
+            });
+            layersPanel.querySelectorAll('input[data-layer-param]').forEach(input => {
+                input.addEventListener('input', () => handleLayerParamInput(input, false));
+                input.addEventListener('change', () => handleLayerParamInput(input, true));
+            });
+            layersPanel.querySelectorAll('details[data-folder]').forEach(el => {
+                el.addEventListener('toggle', () => {
+                    const folder = el.dataset.folder;
+                    let state = {};
+                    try { state = JSON.parse(localStorage.getItem(collapseKey) || '{}') || {}; } catch {}
+                    state[folder] = el.open;
+                    try { localStorage.setItem(collapseKey, JSON.stringify(state)); } catch {}
+                });
+            });
+        }
+
+        // ── Web Panels (WebApp Animator flipswitch) ──────────
+        // List-shaped, refresh-driven — same shape as the layers panel. The
+        // flipswitch never mutates viewer state directly: it sends webapp_set
+        // to Max (theHold-wrapped, undoable) and re-renders from the
+        // webapp_update round-trip, so the param block stays authoritative.
+        const btnWebPanels = document.getElementById('btnWebPanels');
+        const webPanelsPanel = document.getElementById('webPanelsPanel');
+        let webPanelsVisible = false;
+        let webPanelsRefreshQueued = false;
+
+        function escapeWebPanelText(value) {
+            return String(value ?? '')
+                .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+        }
+
+        function setWebPanelsVisible(visible) {
+            webPanelsVisible = !!visible;
+            if (!webPanelsVisible) {
+                const ae = document.activeElement;
+                if (ae instanceof HTMLElement && webPanelsPanel.contains(ae)) btnWebPanels?.focus();
+            }
+            webPanelsPanel.classList.toggle('visible', webPanelsVisible);
+            webPanelsPanel.toggleAttribute('inert', !webPanelsVisible);
+            webPanelsPanel.setAttribute('aria-hidden', String(!webPanelsVisible));
+            btnWebPanels?.classList.toggle('active', webPanelsVisible);
+            if (webPanelsVisible) queueWebPanelsRefresh();
+        }
+
+        function queueWebPanelsRefresh() {
+            if (!webPanelsVisible || webPanelsRefreshQueued) return;
+            webPanelsRefreshQueued = true;
+            requestAnimationFrame(() => {
+                webPanelsRefreshQueued = false;
+                if (webPanelsVisible) refreshWebPanelsPanel();
+            });
+        }
+
+        function refreshWebPanelsPanel() {
+            const panels = webappSystem?.listPanels?.() ?? [];
+            const renderRow = (p) => `
+                <div class="layer-item${p.visible ? '' : ' inactive'}">
+                    <div class="layer-main">
+                        <div class="layer-meta">
+                            <span class="layer-name" title="${escapeWebPanelText(p.name)}">${escapeWebPanelText(p.name)}</span>
+                            <span class="layer-source inline">#${p.handle}</span>
+                            ${p.layerCount > 1 ? `<span class="layer-priority" title="Layer stack">x${p.layerCount}</span>` : ''}
+                        </div>
+                        <div class="layer-detail" title="${escapeWebPanelText(p.url)}">${escapeWebPanelText(p.url || '(no url)')}</div>
+                    </div>
+                    <div class="layer-actions webpanel-switch" data-webpanel="${p.handle}">
+                        <button class="fx-toggle${p.presentation === 'css3d' ? ' active' : ''}" data-presentation="0" title="DOM overlay — crisp, interactive, outside the framebuffer">CSS3D</button>
+                        <button class="fx-toggle${p.presentation === 'texture' ? ' active' : ''}" data-presentation="1" title="In-scene pixels — post FX, depth, render output apply">Canvas</button>
+                        <button class="fx-toggle${p.depthOcclude ? ' active' : ''}" data-depth-occlude="${p.depthOcclude ? '0' : '1'}"
+                            ${p.presentation === 'texture' ? 'disabled' : ''}
+                            title="CSS3D behind the canvas with punch-through compositing — scene geometry occludes the panel per pixel">Depth</button>
+                    </div>
+                </div>`;
+            webPanelsPanel.innerHTML = `
+                <div class="sidepanel-header">
+                    <div>
+                        <div class="sidepanel-title">Web Panels</div>
+                        <div class="sidepanel-subtitle">${panels.length} WebApp Animator node${panels.length === 1 ? '' : 's'}</div>
+                    </div>
+                    <div style="display:flex;gap:4px">
+                        <button id="webPanelsHideBtn">Hide</button>
+                    </div>
+                </div>
+                <div class="sidepanel-body">${panels.length === 0
+                    ? '<div class="layers-empty">No WebApp Animator nodes in the scene. Create one from the <code>max.js</code> category in the Create panel.</div>'
+                    : panels.map(renderRow).join('')}</div>
+            `;
+            webPanelsPanel.querySelector('#webPanelsHideBtn')?.addEventListener('click', () => setWebPanelsVisible(false));
+            webPanelsPanel.querySelectorAll('.webpanel-switch button').forEach(btn => {
+                btn.addEventListener('click', () => {
+                    if (btn.classList.contains('pending') || btn.disabled) return;
+                    const handle = btn.closest('[data-webpanel]')?.dataset.webpanel;
+                    if (!handle) return;
+                    if (btn.dataset.depthOcclude !== undefined) {
+                        bridge.send('webapp_set', { handle: String(handle), depthOcclude: btn.dataset.depthOcclude === '1' });
+                    } else {
+                        if (btn.classList.contains('active')) return;
+                        bridge.send('webapp_set', { handle: String(handle), presentation: Number(btn.dataset.presentation) });
+                    }
+                    btn.classList.add('pending');  // cleared by the round-trip re-render
+                });
+            });
+        }
+
+        btnWebPanels?.addEventListener('click', () => setWebPanelsVisible(!webPanelsVisible));
+
+        btnLayersPanel.addEventListener('click', () => setLayersPanelVisible(!layersPanelVisible));
+        btnCanvasPanel?.addEventListener('click', () => setCanvasPanelVisible(!canvasPanelVisible));
+        btnShaderLabPanel?.addEventListener('click', () => {
+            if (!isShaderLabBackendAvailable()) {
+                perfHud.setStatus('max.js - Shader Lab requires WebGPU or Force WebGL');
+                syncShaderLabAvailability();
+                return;
+            }
+            setShaderLabPanelVisible(!shaderLabPanelVisible);
+        });
+        syncShaderLabAvailability();
+
+        document.getElementById('btnLightHelpers')?.addEventListener('click', () => {
+            setLightHelpersVisible(!lightHelpersVisible);
+        });
+
+        const btnPostFxPanel = document.getElementById('btnPostFxPanel');
+        const rightDock = document.getElementById('rightDock');
+        const postPanel = document.getElementById('postPanel');
+        let postPanelVisible = false;
+        let syncClonePanelFn = null;
+        let lastPostFxSignature = '';
+
+        function clampDockWidth(width) {
+            const numeric = Number.parseFloat(width);
+            const maxWidth = Math.max(200, window.innerWidth - 16);
+            return Math.max(200, Math.min(Number.isFinite(numeric) ? numeric : 240, maxWidth));
+        }
+
+        function setRightDockWidth(width) {
+            const clamped = clampDockWidth(width);
+            document.documentElement.style.setProperty('--dock-width', `${clamped}px`);
+            if (rightDock) rightDock.style.width = '';
+            return clamped;
+        }
+
+        // Tone mapping modes
+        const DEFAULT_TONE_MAPPING = 'Neutral';
+        const toneMappingModes = {
+            'None': THREE.NoToneMapping,
+            'Linear': THREE.LinearToneMapping,
+            'Reinhard': THREE.ReinhardToneMapping,
+            'Cineon': THREE.CineonToneMapping,
+            'AgX': THREE.AgXToneMapping,
+            'Neutral': THREE.NeutralToneMapping,
+        };
+        let currentToneMapping = DEFAULT_TONE_MAPPING;
+        let currentExposure = 1.0;
+        let currentAAMode = 'off'; // 'traa' | 'off' (MSAA option removed — was a no-op with the deferred MRT pipeline)
+
+        function applyCoreToneMappingState({ markOutput = true } = {}) {
+            renderer.toneMapping = toneMappingModes[currentToneMapping] ?? toneMappingModes[DEFAULT_TONE_MAPPING];
+            renderer.toneMappingExposure = currentExposure;
+            renderer.userData ??= {};
+            renderer.userData.maxjsToneMappingMode = currentToneMapping;
+            renderer.userData.maxjsToneMappingExposure = currentExposure;
+            if (markOutput) maxjsFx.markOutputChanged?.();
+        }
+
+        const isPowerShotInfraredMode = (values) => values.mode === 'infrared';
+        const isPowerShotDigitalMode = (values) => values.mode !== 'analog' && values.mode !== 'film' && values.mode !== 'infrared';
+        const isPowerShotAnalogMode = (values) => values.mode === 'analog';
+        const isPowerShotFilmMode = (values) => values.mode === 'film';
+        const isPowerShotJpegActive = (values) => isPowerShotDigitalMode(values) && Number(values.jpegStrength) > 1.0e-6;
+        const isPowerShotAnalogActive = (values) => isPowerShotAnalogMode(values) && Number(values.analogStrength) > 1.0e-6;
+        const isPowerShotTemporalNoiseActive = (values) =>
+            (isPowerShotDigitalMode(values) && Number(values.noiseScale) > 1.0e-6)
+            || isPowerShotAnalogActive(values)
+            || (isPowerShotFilmMode(values) && Number(values.filmGrain) > 1.0e-6)
+            || (isPowerShotInfraredMode(values) && Number(values.irNoise) > 1.0e-6);
+
+        const postFxSections = [
+            {
+                key: 'ssgi',
+                title: 'SSGI',
+                copy: 'Diffuse bounce lighting and ambient occlusion from the current frame.',
+                note: 'Requires WebGPU or Force WebGL.',
+                requiresWebGPU: true,
+                isEnabled: () => maxjsFx.isEnabled(),
+                setEnabled: (enabled) => maxjsFx.setEnabled(enabled),
+                getValues: (state) => state.ssgi,
+                setValues: (patch) => maxjsFx.setSSGIOptions(patch),
+                controls: [
+                    { key: 'radius', label: 'Radius', min: 1, max: 24, step: 0.5 },
+                    { key: 'thickness', label: 'Thickness', min: 0.01, max: 10, step: 0.01 },
+                    { key: 'aoIntensity', label: 'AO Intensity', min: 0, max: 4, step: 0.05 },
+                    { key: 'giIntensity', label: 'GI Intensity', min: 0, max: 32, step: 0.1 },
+                    { key: 'expFactor', label: 'Falloff', min: 1, max: 3, step: 0.05 },
+                    { key: 'sliceCount', label: 'Slices', min: 1, max: 4, step: 1, integer: true },
+                    { key: 'stepCount', label: 'Steps', min: 1, max: 24, step: 1, integer: true },
+                    { key: 'temporal', label: 'Temporal Filter', type: 'checkbox' },
+                ],
+            },
+            {
+                key: 'ssr',
+                title: 'SSR',
+                copy: 'Screen-space reflections for glossy and mirror-like surfaces.',
+                note: 'Requires WebGPU or Force WebGL.',
+                requiresWebGPU: true,
+                isEnabled: () => maxjsFx.isSSREnabled(),
+                setEnabled: (enabled) => maxjsFx.setSSREnabled(enabled),
+                getValues: (state) => state.ssr,
+                setValues: (patch) => maxjsFx.setSSROptions(patch),
+                controls: [
+                    { key: 'quality', label: 'Quality', min: 0, max: 1, step: 0.01 },
+                    { key: 'blurQuality', label: 'Blur Quality', min: 1, max: 3, step: 1, integer: true },
+                    { key: 'maxDistance', label: 'Max Distance', min: 0.05, max: 2, step: 0.01 },
+                    { key: 'opacity', label: 'Opacity', min: 0, max: 1, step: 0.01 },
+                    { key: 'thickness', label: 'Thickness', min: 0.001, max: 0.05, step: 0.001 },
+                    { key: 'denoise', label: 'Denoiser', type: 'checkbox' },
+                    { key: 'stochastic', label: 'Stochastic Rays', type: 'checkbox', visibleWhen: (values) => !values.denoise },
+                    { key: 'denoiseRadius', label: 'Denoise Radius', min: 0.25, max: 24, step: 0.25, visibleWhen: (values) => values.denoise },
+                    { key: 'denoiseStrength', label: 'Temporal Strength', min: 0.01, max: 1, step: 0.01, visibleWhen: (values) => values.denoise },
+                    { key: 'denoiseFrames', label: 'History Frames', min: 1, max: 64, step: 1, integer: true, visibleWhen: (values) => values.denoise },
+                    { key: 'denoiseAdaptiveTrust', label: 'Firefly Guard', min: 0, max: 1, step: 0.01, visibleWhen: (values) => values.denoise },
+                ],
+            },
+            {
+                key: 'gtao',
+                title: 'GTAO',
+                copy: 'Ground-truth ambient occlusion from a dedicated depth and normal pre-pass.',
+                note: 'Requires WebGPU or Force WebGL.',
+                requiresWebGPU: true,
+                isEnabled: () => maxjsFx.isGTAOEnabled(),
+                setEnabled: (enabled) => maxjsFx.setGTAOEnabled(enabled),
+                getValues: (state) => state.gtao,
+                setValues: (patch) => maxjsFx.setGTAOOptions(patch),
+                controls: [
+                    { key: 'radius', label: 'Radius', min: 0.05, max: 2, step: 0.01 },
+                    { key: 'thickness', label: 'Thickness', min: 0.01, max: 2, step: 0.01 },
+                    { key: 'scale', label: 'Intensity', min: 0, max: 4, step: 0.05 },
+                    { key: 'distanceExponent', label: 'Dist Exp', min: 1, max: 2, step: 0.01 },
+                    { key: 'distanceFallOff', label: 'Falloff', min: 0.01, max: 1, step: 0.01 },
+                    { key: 'samples', label: 'Samples', min: 4, max: 32, step: 1, integer: true },
+                    { key: 'resolutionScale', label: 'Resolution', min: 0.25, max: 1, step: 0.05 },
+                ],
+            },
+            {
+                key: 'bloom',
+                title: 'Bloom',
+                copy: 'Highlights bleed for emissive and high-energy surfaces.',
+                note: 'Requires WebGPU or Force WebGL.',
+                requiresWebGPU: true,
+                isEnabled: () => maxjsFx.isBloomEnabled(),
+                setEnabled: (enabled) => maxjsFx.setBloomEnabled(enabled),
+                getValues: (state) => state.bloom,
+                setValues: (patch) => maxjsFx.setBloomOptions(patch),
+                controls: [
+                    { key: 'strength', label: 'Strength', min: 0, max: 3, step: 0.01 },
+                    { key: 'radius', label: 'Radius', min: 0, max: 1, step: 0.01 },
+                    { key: 'threshold', label: 'Threshold', min: 0, max: 2, step: 0.01 },
+                ],
+            },
+            {
+                key: 'toonOutline',
+                title: 'Toon Outline',
+                copy: 'Black ink outline on objects with ThreeJS Toon material. Auto-detected.',
+                note: 'Only visible on MeshToonMaterial objects.',
+                requiresWebGPU: true,
+                isEnabled: () => maxjsFx.isToonOutlineEnabled(),
+                setEnabled: (enabled) => maxjsFx.setToonOutlineEnabled(enabled),
+                getValues: (state) => state.toonOutline,
+                setValues: (patch) => maxjsFx.setToonOutlineOptions(patch),
+                controls: [
+                    { key: 'thickness', label: 'Thickness', min: 0.001, max: 0.02, step: 0.001 },
+                    { key: 'alpha', label: 'Opacity', min: 0, max: 1, step: 0.01 },
+                ],
+            },
+            {
+                key: 'motionBlur',
+                title: 'Motion Blur',
+                copy: 'Velocity-based blur from camera and object motion in the current frame.',
+                note: 'Requires WebGPU or Force WebGL.',
+                requiresWebGPU: true,
+                // Pixel FX takes the post-pass output; motion blur on top is meaningless
+                // (it would smear the pixelated image). Mutually exclusive.
+                disabledBy: (state) => state.pixel.enabled
+                    ? 'Disabled while Pixel FX is on.'
+                    : null,
+                isEnabled: () => maxjsFx.isMotionBlurEnabled(),
+                setEnabled: (enabled) => maxjsFx.setMotionBlurEnabled(enabled),
+                getValues: (state) => state.motionBlur,
+                setValues: (patch) => maxjsFx.setMotionBlurOptions(patch),
+                controls: [
+                    { key: 'amount', label: 'Amount', min: 0, max: 3, step: 0.01 },
+                    { key: 'samples', label: 'Samples', min: 4, max: 32, step: 1, integer: true },
+                ],
+            },
+            // TRAA is now managed via the Anti-Aliasing selector above the FX sections
+            {
+                key: 'contactShadow',
+                title: 'Contact Shadows',
+                copy: 'Screen-space shadows for detailed close-range shadowing.',
+                note: 'Requires WebGPU or Force WebGL and a DirectionalLight.',
+                requiresWebGPU: true,
+                isEnabled: () => maxjsFx.isContactShadowEnabled(),
+                setEnabled: (enabled) => maxjsFx.setContactShadowEnabled(enabled),
+                getValues: (state) => state.contactShadow,
+                setValues: (patch) => maxjsFx.setContactShadowOptions(patch),
+                controls: [
+                    { key: 'maxDistance', label: 'Max Distance', min: 0.01, max: 1, step: 0.01 },
+                    { key: 'thickness', label: 'Thickness', min: 0.001, max: 0.1, step: 0.001 },
+                    { key: 'shadowIntensity', label: 'Intensity', min: 0, max: 1, step: 0.01 },
+                    { key: 'quality', label: 'Quality', min: 0, max: 1, step: 0.01 },
+                    { key: 'temporal', label: 'Temporal', type: 'checkbox' },
+                ],
+            },
+            {
+                key: 'retro',
+                title: 'Retro',
+                copy: 'PS1-style posterization, scanlines, barrel distortion, and CRT effects.',
+                note: 'Requires WebGPU or Force WebGL.',
+                disabledBy: () => (shaderLabFx?.isEnabled?.()
+                    ? 'Disabled while Shader Lab is active.'
+                    : null),
+                requiresWebGPU: true,
+                isEnabled: () => maxjsFx.isRetroEnabled(),
+                setEnabled: (enabled) => maxjsFx.setRetroEnabled(enabled),
+                getValues: (state) => state.retro,
+                setValues: (patch) => maxjsFx.setRetroOptions(patch),
+                controls: [
+                    { key: 'dither', label: 'Dither', type: 'checkbox' },
+                    { key: 'colorDepth', label: 'Color Depth', min: 2, max: 64, step: 1, integer: true, realtime: true },
+                    { key: 'scanlines', label: 'Scanlines', type: 'checkbox' },
+                    { key: 'scanlineIntensity', label: 'Scan Intensity', min: 0, max: 1, step: 0.01, realtime: true },
+                    { key: 'scanlineDensity', label: 'Scan Density', min: 0.02, max: 1, step: 0.01, realtime: true },
+                    { key: 'crt', label: 'CRT Distortion', type: 'checkbox' },
+                    { key: 'curvature', label: 'Curvature', min: 0, max: 0.2, step: 0.01, realtime: true },
+                    { key: 'bleeding', label: 'Color Bleed', min: 0, max: 0.01, step: 0.001, realtime: true },
+                    { key: 'vignetteIntensity', label: 'Vignette', min: 0, max: 1, step: 0.01, realtime: true },
+                ],
+            },
+            {
+                key: 'volumetric',
+                title: 'Volumetric Light',
+                copy: 'Ray-marched light scattering through fog volume. Reacts to scene lights.',
+                note: 'Requires WebGPU or Force WebGL.',
+                requiresWebGPU: true,
+                isEnabled: () => maxjsFx.isVolumetricEnabled(),
+                setEnabled: (enabled) => maxjsFx.setVolumetricEnabled(enabled),
+                getValues: (state) => state.volumetric,
+                setValues: (patch) => maxjsFx.setVolumetricOptions(patch),
+                controls: [
+                    { key: 'intensity', label: 'Intensity', min: 0.001, max: 5, dynamic: 'log', realtime: true },
+                    { key: 'density', label: 'Density', min: 0, max: 1, step: 0.01, realtime: true },
+                    { key: 'steps', label: 'Steps', min: 2, max: 32, step: 1, integer: true },
+                    { key: 'denoise', label: 'Denoise', min: 0, max: 2, step: 0.05, realtime: true },
+                    { key: 'resolution', label: 'Resolution', min: 0.1, max: 1, step: 0.05 },
+                ],
+            },
+            {
+                key: 'pixel',
+                title: 'Pixel FX',
+                copy: 'Pixelation, chromatic aberration, sharpen, color grading, and film grain.',
+                note: 'Requires WebGPU or Force WebGL. Mutually exclusive with Motion Blur.',
+                requiresWebGPU: true,
+                isEnabled: () => maxjsFx.isPixelEnabled(),
+                setEnabled: (enabled) => {
+                    // Pixel FX and Motion Blur are mutually exclusive — turning on
+                    // Pixel forces Motion Blur off so the disabled-by gate is honored.
+                    if (enabled && maxjsFx.isMotionBlurEnabled()) {
+                        maxjsFx.setMotionBlurEnabled(false);
+                    }
+                    return maxjsFx.setPixelEnabled(enabled);
+                },
+                getValues: (state) => state.pixel,
+                setValues: (patch) => maxjsFx.setPixelOptions(patch),
+                controls: [
+                    { key: 'pixelate', label: 'Pixelate', type: 'checkbox' },
+                    { key: 'pixelSize', label: 'Pixel Size', min: 1, max: 32, step: 1, integer: true, realtime: true },
+                    { key: 'chromatic', label: 'Chromatic Aberr', type: 'checkbox' },
+                    { key: 'chromaticIntensity', label: 'CA Intensity', min: 0, max: 0.05, step: 0.001, realtime: true },
+                    { key: 'sharpen', label: 'Sharpen', type: 'checkbox' },
+                    { key: 'sharpenStrength', label: 'Sharp Strength', min: 0, max: 3, step: 0.05, realtime: true },
+                    { key: 'grain', label: 'Film Grain', type: 'checkbox' },
+                    { key: 'grainIntensity', label: 'Grain Amount', min: 0, max: 0.5, step: 0.01, realtime: true },
+                    { key: 'brightness', label: 'Brightness', min: -1, max: 1, step: 0.01, realtime: true },
+                    { key: 'contrast', label: 'Contrast', min: -1, max: 1, step: 0.01, realtime: true },
+                    { key: 'saturation', label: 'Saturation', min: -1, max: 1, step: 0.01, realtime: true },
+                ],
+            },
+            {
+                key: 'powershot',
+                title: 'PowerShot',
+                copy: 'Compact digital camera ISP, analog VHS, and motion-picture film: CCD smear, Bayer artifacts, JPEG blocks, tape damage, or a Vision3 negative printed to 2383 with grain and halation.',
+                note: 'Requires WebGPU or Force WebGL. Disabled while Shader Lab is active.',
+                keepVisibleWhenUnsupported: true,
+                disabledBy: () => (shaderLabFx?.isEnabled?.()
+                    ? 'Disabled while Shader Lab is active.'
+                    : null),
+                requiresWebGPU: true,
+                isEnabled: () => maxjsFx.isPowerShotEnabled(),
+                setEnabled: (enabled) => maxjsFx.setPowerShotEnabled(enabled),
+                getValues: (state) => ({
+                    mode: 'digital',
+                    preset: 'powershot',
+                    amount: 1.0,
+                    resolutionScale: 0.75,
+                    lensSoftness: 0.32,
+                    ccdBloom: 0.35,
+                    noiseScale: 1.06,
+                    bayerNR: 0.5,
+                    chromaNR: 1.0,
+                    jpegStrength: 0.2,
+                    jpegQuality: 60,
+                    jpegChroma420: 0.75,
+                    jpegMidtone: 0.45,
+                    jpegHighlight: 1.0,
+                    brightness: 0,
+                    contrast: 0,
+                    analogStrength: 0.72,
+                    analogTracking: 0.46,
+                    analogChromaBleed: 0.76,
+                    analogRinging: 0.62,
+                    analogTapeNoise: 0.70,
+                    analogBandMask: 0.35,
+                    analogEdgeWave: 0.34,
+                    analogDropouts: 0.32,
+                    analogScanlines: 0.54,
+                    analogHeadSwitch: 0.42,
+                    filmStock: 'kodak_500t',
+                    filmExposure: 0,
+                    filmInputGamma: 0.65,
+                    filmGrain: 1.0,
+                    filmGrainSize: 1.6,
+                    filmGrainColour: 0.8,
+                    filmHalation: 0.35,
+                    filmHalationThreshold: 0.55,
+                    filmHalationRadius: 1.5,
+                    filmPrintExposure: 0,
+                    filmPrintWarmth: 0,
+                    filmHighlightBurn: 0.7,
+                    filmHueRestore: 0.2,
+                    filmWeave: 0.4,
+                    filmFlicker: 0.12,
+                    filmNegative: false,
+                    infraredPreset: 'white_phosphor',
+                    irExposure: 0.85,
+                    irResponse: 0.0,
+                    irLocalGain: 0.46,
+                    irGlow: 0.34,
+                    irGlowThreshold: 0.44,
+                    irEyes: 0.78,
+                    irNoise: 0.48,
+                    irVignette: 0.26,
+                    irHotspot: 0.055,
+                    freezeNoise: false,
+                    ...(state.powershot || {}),
+                    // A save written in spectral can carry mode:'infrared';
+                    // standard mode must never surface white phosphor.
+                    ...(!isStudioMode && state.powershot?.mode === 'infrared' ? { mode: 'digital' } : {}),
+                }),
+                setValues: (patch) => maxjsFx.setPowerShotOptions(
+                    !isStudioMode && patch?.mode === 'infrared' ? { ...patch, mode: 'digital' } : patch),
+                controls: [
+                    {
+                        key: 'mode',
+                        label: 'Mode',
+                        type: 'select',
+                        options: [
+                            { value: 'digital', label: 'Digital CCD' },
+                            { value: 'analog', label: 'Analog VHS' },
+                            { value: 'film', label: 'Film Print' },
+                            // NIR white phosphor reads spectral flux — spectral-only.
+                            ...(isStudioMode ? [{ value: 'infrared', label: 'White Phosphor' }] : []),
+                        ],
+                    },
+                    {
+                        key: 'filmStock',
+                        label: 'Film Stock',
+                        type: 'select',
+                        visibleWhen: isPowerShotFilmMode,
+                        options: maxjsFx.getPowerShotFilmStocks().map((stock) => ({
+                            value: stock.key,
+                            label: stock.label,
+                        })),
+                    },
+                    {
+                        key: 'preset',
+                        label: 'Preset',
+                        type: 'select',
+                        visibleWhen: isPowerShotDigitalMode,
+                        options: maxjsFx.getPowerShotPresets().map((preset) => ({
+                            value: preset.key,
+                            label: `${preset.key} - ${preset.label}`,
+                        })),
+                    },
+                    { key: 'amount', label: 'Amount', min: 0, max: 1, step: 0.01, realtime: true },
+                    { key: 'resolutionScale', label: 'Resolution', min: 0.1, max: 1, step: 0.05 },
+                    { key: 'lensSoftness', label: 'Lens Softness', min: 0, max: 1, step: 0.01, realtime: true, visibleWhen: isPowerShotDigitalMode },
+                    { key: 'ccdBloom', label: 'CCD Bloom', min: 0, max: 2, step: 0.01, realtime: true, visibleWhen: isPowerShotDigitalMode },
+                    { key: 'noiseScale', label: 'Noise', min: 0, max: 2, step: 0.01, realtime: true, visibleWhen: isPowerShotDigitalMode },
+                    { key: 'bayerNR', label: 'Bayer NR', min: 0, max: 1, step: 0.01, realtime: true, visibleWhen: isPowerShotDigitalMode },
+                    { key: 'chromaNR', label: 'Chroma NR', min: 0, max: 1, step: 0.01, realtime: true, visibleWhen: isPowerShotDigitalMode },
+                    { key: 'jpegStrength', label: 'JPEG', min: 0, max: 1, step: 0.01, realtime: true, affectsVisibility: true, visibleWhen: isPowerShotDigitalMode },
+                    { key: 'jpegQuality', label: 'JPEG Quality', min: 1, max: 100, step: 1, integer: true, realtime: true, visibleWhen: isPowerShotJpegActive },
+                    { key: 'jpegChroma420', label: 'JPEG Chroma', min: 0, max: 1, step: 0.01, realtime: true, visibleWhen: isPowerShotJpegActive },
+                    { key: 'jpegMidtone', label: 'JPEG Midtones', min: 0, max: 1, step: 0.01, realtime: true, visibleWhen: isPowerShotJpegActive },
+                    { key: 'jpegHighlight', label: 'JPEG Highlights', min: 0, max: 2, step: 0.01, realtime: true, visibleWhen: isPowerShotJpegActive },
+                    { key: 'filmExposure', label: 'Exposure (stops)', min: -3, max: 3, step: 0.05, realtime: true, visibleWhen: isPowerShotFilmMode },
+                    { key: 'filmInputGamma', label: 'Input Gamma', min: 0.5, max: 1.5, step: 0.01, realtime: true, visibleWhen: isPowerShotFilmMode },
+                    { key: 'filmGrain', label: 'Grain', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotFilmMode },
+                    { key: 'filmGrainSize', label: 'Grain Size', min: 0.5, max: 4, step: 0.05, realtime: true, visibleWhen: isPowerShotFilmMode },
+                    { key: 'filmGrainColour', label: 'Grain Colour', min: 0, max: 1, step: 0.01, realtime: true, visibleWhen: isPowerShotFilmMode },
+                    { key: 'filmHalation', label: 'Halation', min: 0, max: 1, step: 0.01, realtime: true, visibleWhen: isPowerShotFilmMode },
+                    { key: 'filmHalationThreshold', label: 'Halation Threshold', min: 0, max: 1, step: 0.01, realtime: true, visibleWhen: isPowerShotFilmMode },
+                    { key: 'filmHalationRadius', label: 'Halation Radius', min: 0.5, max: 3, step: 0.05, realtime: true, visibleWhen: isPowerShotFilmMode },
+                    { key: 'filmPrintExposure', label: 'Print Exposure', min: -1, max: 1, step: 0.01, realtime: true, visibleWhen: isPowerShotFilmMode },
+                    { key: 'filmPrintWarmth', label: 'Print Warmth', min: -1, max: 1, step: 0.01, realtime: true, visibleWhen: isPowerShotFilmMode },
+                    { key: 'filmHighlightBurn', label: 'Highlight Burn', min: 0, max: 1, step: 0.01, realtime: true, visibleWhen: isPowerShotFilmMode },
+                    { key: 'filmHueRestore', label: 'Hue Restore', min: 0, max: 1, step: 0.01, realtime: true, visibleWhen: isPowerShotFilmMode },
+                    { key: 'filmWeave', label: 'Gate Weave', min: 0, max: 2, step: 0.01, realtime: true, visibleWhen: isPowerShotFilmMode },
+                    { key: 'filmFlicker', label: 'Flicker', min: 0, max: 1, step: 0.01, realtime: true, visibleWhen: isPowerShotFilmMode },
+                    { key: 'filmNegative', label: 'Show Negative', type: 'checkbox', visibleWhen: isPowerShotFilmMode },
+                    { key: 'brightness', label: 'Brightness', min: -1, max: 1, step: 0.01, realtime: true, visibleWhen: (values) => !isPowerShotFilmMode(values) && !isPowerShotInfraredMode(values) },
+                    { key: 'contrast', label: 'Contrast', min: -1, max: 1, step: 0.01, realtime: true, visibleWhen: (values) => !isPowerShotFilmMode(values) && !isPowerShotInfraredMode(values) },
+                    { key: 'analogStrength', label: 'VHS Strength', min: 0, max: 3, step: 0.01, realtime: true, affectsVisibility: true, visibleWhen: isPowerShotAnalogMode },
+                    { key: 'analogTracking', label: 'Tracking', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotAnalogActive },
+                    { key: 'analogChromaBleed', label: 'Chroma Bleed', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotAnalogActive },
+                    { key: 'analogRinging', label: 'Ringing', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotAnalogActive },
+                    { key: 'analogTapeNoise', label: 'Tape Noise', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotAnalogActive },
+                    { key: 'analogBandMask', label: 'Band Mask', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotAnalogActive },
+                    { key: 'analogEdgeWave', label: 'Edge Wave', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotAnalogActive },
+                    { key: 'analogDropouts', label: 'Dropouts', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotAnalogActive },
+                    { key: 'analogScanlines', label: 'Scanlines', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotAnalogActive },
+                    { key: 'analogHeadSwitch', label: 'Head Switch', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotAnalogActive },
+                    { key: 'irExposure', label: 'Exposure (stops)', min: -8, max: 8, step: 0.05, realtime: true, visibleWhen: isPowerShotInfraredMode },
+                    { key: 'irResponse', label: 'IR Response', min: 0, max: 1, step: 0.01, realtime: true, visibleWhen: isPowerShotInfraredMode },
+                    { key: 'irLocalGain', label: 'Local Gain', min: 0, max: 1.5, step: 0.01, realtime: true, visibleWhen: isPowerShotInfraredMode },
+                    { key: 'irGlow', label: 'Halo Bloom', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotInfraredMode },
+                    { key: 'irGlowThreshold', label: 'Bloom Threshold', min: 0, max: 1, step: 0.01, realtime: true, visibleWhen: isPowerShotInfraredMode },
+                    { key: 'irEyes', label: 'Eye Flare', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotInfraredMode },
+                    { key: 'irNoise', label: 'Tube Scintillation', min: 0, max: 3, step: 0.01, realtime: true, affectsVisibility: true, visibleWhen: isPowerShotInfraredMode },
+                    { key: 'irVignette', label: 'Tube Vignette', min: 0, max: 1, step: 0.01, realtime: true, visibleWhen: isPowerShotInfraredMode },
+                    { key: 'irHotspot', label: 'Hotspot', min: 0, max: 1, step: 0.01, realtime: true, visibleWhen: isPowerShotInfraredMode },
+                    { key: 'freezeNoise', label: 'Freeze Noise', type: 'checkbox', visibleWhen: isPowerShotTemporalNoiseActive },
+                ],
+            },
+            {
+                key: 'dof',
+                title: 'Depth of Field',
+                copy: 'Physical camera DOF with bokeh blur. Auto-syncs from Max Physical Camera when enabled.',
+                warn: 'NOTICE: Changing parameters while active can cause temporary flickering.',
+                note: 'Requires WebGPU or Force WebGL. Enable DOF on the Physical Camera in Max for auto mode.',
+                requiresWebGPU: true,
+                isEnabled: () => maxjsFx.isDofEnabled(),
+                setEnabled: (enabled) => {
+                    const result = maxjsFx.setDofEnabled(enabled);
+                    syncPathTracingDofFromPostFx();
+                    return result;
+                },
+                getValues: (state) => state.dof,
+                setValues: (patch) => {
+                    const result = maxjsFx.setDofOptions(patch);
+                    syncPathTracingDofFromPostFx();
+                    return result;
+                },
+                controls: [
+                    { key: 'autoFromCamera', label: 'Auto from Camera', type: 'checkbox' },
+                    { key: 'focusDistance', label: 'Focus Distance', min: 0.1, max: 10000, step: 1, realtime: true },
+                    { key: 'focalLength', label: 'DOF Range', min: 0.1, max: 5000, step: 1, realtime: true },
+                    { key: 'bokehScale', label: 'Bokeh Scale', min: 0.5, max: 30, step: 0.5, realtime: true },
+                ],
+            },
+            {
+                key: 'fog',
+                title: 'Fog',
+                copy: 'Distance fog, density fog, or animated procedural ground fog.',
+                note: 'Requires WebGPU or Force WebGL. Also controllable via Rendering > Environment > Atmosphere in Max.',
+                requiresWebGPU: true,
+                isEnabled: () => maxjsFx.isFogEnabled(),
+                setEnabled: (enabled) => maxjsFx.setFogEnabled(enabled),
+                getValues: (state) => state.fog,
+                setValues: (patch) => maxjsFx.setFogOptions(patch),
+                controls: [
+                    { key: 'type', label: 'Type', min: 0, max: 2, step: 1, integer: true },
+                    { key: 'opacity', label: 'Opacity', min: 0, max: 1, step: 0.01, realtime: true },
+                    { key: 'near', label: 'Near', min: 0, max: 9999, step: 1, realtime: true },
+                    { key: 'far', label: 'Far', min: 1, max: 9999, step: 5, realtime: true },
+                    { key: 'density', label: 'Density', min: 0.0001, max: 0.5, step: 0.001, realtime: true },
+                    { key: 'noiseScale', label: 'Noise Scale', min: 0.0001, max: 0.1, step: 0.001, realtime: true },
+                    { key: 'noiseSpeed', label: 'Noise Speed', min: 0, max: 5, step: 0.05, realtime: true },
+                    { key: 'height', label: 'Height', min: 0, max: 9999, step: 1, realtime: true },
+                ],
+            },
+        ];
+
+        const LOG_SLIDER_STEPS = 1000;
+        const EXPOSURE_EV_MIN = -10;
+        const EXPOSURE_EV_MAX = 8;
+        const EXPOSURE_LINEAR_MIN = Math.pow(2, EXPOSURE_EV_MIN);
+        const EXPOSURE_LINEAR_MAX = Math.pow(2, EXPOSURE_EV_MAX);
+
+        function exposureLinearToEv(linear) {
+            const safe = Math.max(EXPOSURE_LINEAR_MIN, Math.min(EXPOSURE_LINEAR_MAX, Number(linear) || 1));
+            return Math.log2(safe);
+        }
+
+        function exposureLinearToSliderInput(linear) {
+            return valueToLogSliderInput(linear, EXPOSURE_LINEAR_MIN, EXPOSURE_LINEAR_MAX);
+        }
+
+        function exposureSliderInputToLinear(input) {
+            return logSliderInputToValue(input, EXPOSURE_LINEAR_MIN, EXPOSURE_LINEAR_MAX);
+        }
+
+        function formatExposureEvLabel(linear) {
+            const ev = exposureLinearToEv(linear);
+            return `${ev >= 0 ? '+' : ''}${ev.toFixed(2)} EV`;
+        }
+
+        function postFxControlSliderMode(control) {
+            if (!control || control.type === 'checkbox' || control.type === 'select' || control.integer) return 'linear';
+            if (control.dynamic === false || control.dynamic === 'linear') return 'linear';
+            if (control.dynamic === 'signed-log' || control.dynamic === 'log') return control.dynamic;
+            const min = Number(control.min);
+            const max = Number(control.max);
+            if (!Number.isFinite(min) || !Number.isFinite(max) || max <= min) return 'linear';
+            if (min < 0 && max > 0) return 'signed-log';
+            if (max > 0) return 'log';
+            return 'linear';
+        }
+
+        function postFxDynamicSliderFloor(control, maxAbs, currentAbs = NaN) {
+            const declaredMin = Number(control.min);
+            const step = Number(control.step);
+            const candidates = [];
+            if (Number.isFinite(declaredMin) && declaredMin > 0) candidates.push(declaredMin);
+            if (Number.isFinite(step) && step > 0) candidates.push(step);
+            if (Number.isFinite(currentAbs) && currentAbs > 0) candidates.push(currentAbs);
+            if (candidates.length === 0 && Number.isFinite(maxAbs) && maxAbs > 0) candidates.push(maxAbs / LOG_SLIDER_STEPS);
+            const floor = Math.min(...candidates.filter((v) => Number.isFinite(v) && v > 0));
+            return Number.isFinite(floor) && floor > 0 ? floor : 0.001;
+        }
+
+        function postFxDynamicPositiveBounds(control, currentValue) {
+            const declaredMax = Number(control.max);
+            const currentAbs = Math.abs(Number(currentValue));
+            const max = Math.max(
+                Number.isFinite(declaredMax) && declaredMax > 0 ? declaredMax : 1,
+                Number.isFinite(currentAbs) && currentAbs > 0 ? currentAbs : 0
+            );
+            const min = Math.min(postFxDynamicSliderFloor(control, max, currentAbs), max);
+            return { min, max: Math.max(max, min) };
+        }
+
+        function valueToLogSliderInput(value, min, max) {
+            const v = Math.max(min, Math.min(max, Number(value) || min));
+            if (max <= min) return 0;
+            const t = Math.log(v / min) / Math.log(max / min);
+            return Math.round(Math.max(0, Math.min(1, t)) * LOG_SLIDER_STEPS);
+        }
+
+        function logSliderInputToValue(input, min, max) {
+            const t = Math.max(0, Math.min(1, Number(input) / LOG_SLIDER_STEPS));
+            return min * Math.pow(max / min, t);
+        }
+
+        function valueToPostFxDynamicSliderInput(control, value, currentValue = value) {
+            const mode = postFxControlSliderMode(control);
+            if (mode === 'linear') return Number(value);
+            const v = Number(value);
+            if (!Number.isFinite(v)) return 0;
+
+            if (mode === 'signed-log') {
+                const center = Math.floor(LOG_SLIDER_STEPS / 2);
+                if (Math.abs(v) <= 1.0e-12) return center;
+                const halfSteps = center - 1;
+                const maxAbs = v < 0 ? Math.abs(Number(control.min)) : Number(control.max);
+                const { min, max } = postFxDynamicPositiveBounds({ ...control, max: maxAbs }, currentValue);
+                if (max <= min) return center;
+                const t = Math.max(0, Math.min(1, Math.log(Math.abs(v) / min) / Math.log(max / min)));
+                const offset = 1 + Math.round(t * halfSteps);
+                return v < 0 ? center - offset : center + offset;
+            }
+
+            const declaredMin = Number(control.min);
+            if (declaredMin <= 0 && v <= 0) return 0;
+            const { min, max } = postFxDynamicPositiveBounds(control, currentValue);
+            if (max <= min) return declaredMin <= 0 ? 1 : 0;
+            const clamped = Math.max(min, Math.min(max, v));
+            const t = Math.max(0, Math.min(1, Math.log(clamped / min) / Math.log(max / min)));
+            const zeroSlot = declaredMin <= 0;
+            const steps = zeroSlot ? LOG_SLIDER_STEPS - 1 : LOG_SLIDER_STEPS;
+            return (zeroSlot ? 1 : 0) + Math.round(t * steps);
+        }
+
+        function postFxDynamicSliderInputToValue(control, input, currentValue) {
+            const mode = postFxControlSliderMode(control);
+            if (mode === 'linear') {
+                const raw = Number(input);
+                return control.integer ? Math.round(raw) : raw;
+            }
+
+            const rawInput = Math.max(0, Math.min(LOG_SLIDER_STEPS, Number(input)));
+            if (mode === 'signed-log') {
+                const center = Math.floor(LOG_SLIDER_STEPS / 2);
+                if (Math.abs(rawInput - center) < 0.5) return 0;
+                const sign = rawInput < center ? -1 : 1;
+                const maxAbs = sign < 0 ? Math.abs(Number(control.min)) : Number(control.max);
+                const { min, max } = postFxDynamicPositiveBounds({ ...control, max: maxAbs }, currentValue);
+                if (max <= min) return sign * min;
+                const halfSteps = center - 1;
+                const offset = Math.max(1, Math.abs(rawInput - center));
+                const t = Math.max(0, Math.min(1, (offset - 1) / halfSteps));
+                return sign * min * Math.pow(max / min, t);
+            }
+
+            const declaredMin = Number(control.min);
+            if (declaredMin <= 0 && rawInput <= 0) return 0;
+            const { min, max } = postFxDynamicPositiveBounds(control, currentValue);
+            if (max <= min) return min;
+            const zeroSlot = declaredMin <= 0;
+            const steps = zeroSlot ? LOG_SLIDER_STEPS - 1 : LOG_SLIDER_STEPS;
+            const adjusted = zeroSlot ? Math.max(1, rawInput) - 1 : rawInput;
+            const t = Math.max(0, Math.min(1, adjusted / steps));
+            return min * Math.pow(max / min, t);
+        }
+
+        function readPostFxControlValue(control, input, getValues) {
+            if (control.type === 'checkbox') return input.checked;
+            if (control.type === 'select') return input.value;
+            if (postFxControlSliderMode(control) !== 'linear') {
+                const values = getValues();
+                return postFxDynamicSliderInputToValue(control, input.value, values[control.key]);
+            }
+            const raw = Number(input.value);
+            return control.integer ? Math.round(raw) : raw;
+        }
+
+        /** Scrub preview only — no maxjsFx / pipeline work (keeps range inputs responsive). */
+        function previewPostFxControlLabel(control, input, valueEl, getValues) {
+            if (!valueEl || control.type === 'checkbox' || control.type === 'select') return;
+            const value = readPostFxControlValue(control, input, getValues);
+            valueEl.textContent = formatControlValue(control, value);
+        }
+
+        function formatControlValue(control, value) {
+            if (control.type === 'checkbox') return value ? 'On' : 'Off';
+            if (control.type === 'select') {
+                const option = (control.options || []).find((item) => item.value === value);
+                return option?.label || String(value ?? '');
+            }
+            if (!Number.isFinite(value)) return '--';
+            if (postFxControlSliderMode(control) !== 'linear') {
+                const abs = Math.abs(value);
+                if (abs === 0) return '0';
+                if (abs < 0.001) return value.toExponential(2);
+                if (abs < 0.01) return value.toFixed(4);
+                if (abs < 1) return value.toFixed(3);
+                if (abs < 10) return value.toFixed(2);
+                return value.toFixed(1);
+            }
+            if (control.integer) return String(Math.round(value));
+            if (control.step >= 1) return value.toFixed(0);
+            if (control.step >= 0.1) return value.toFixed(1);
+            if (control.step >= 0.01) return value.toFixed(2);
+            return value.toFixed(3);
+        }
+
+        function isPostFxControlVisible(control, values) {
+            if (typeof control.visibleWhen !== 'function') return true;
+            try {
+                return control.visibleWhen(values) !== false;
+            } catch (_) {
+                return true;
+            }
+        }
+
+        function setPostPanelVisible(visible) {
+            postPanelVisible = !!visible;
+            const activeElement = document.activeElement;
+            if (!postPanelVisible && activeElement instanceof HTMLElement && postPanel.contains(activeElement)) {
+                btnPostFxPanel.focus();
+            }
+            postPanel.classList.toggle('visible', postPanelVisible);
+            postPanel.toggleAttribute('inert', !postPanelVisible);
+            postPanel.setAttribute('aria-hidden', String(!postPanelVisible));
+            syncPostFxPanel(true, { persist: false });
+        }
+
+        function buildPostFxPanel() {
+            const cloneSectionKeys = new Set(['powershot']);
+            const renderGeneratedPostFxControls = (section) => `
+                    ${section.warn ? `<div class="fx-warn">${section.warn}</div>` : ''}
+                    <div class="fx-grid">
+                        ${section.controls.map(control => {
+                            const inputId = `fx-${section.key}-${control.key}`;
+                            const valueId = `fx-value-${section.key}-${control.key}`;
+
+                            if (control.type === 'checkbox') {
+                                return `
+                                    <label class="fx-check" for="${inputId}" data-fx-control="${control.key}">
+                                        <span>${control.label}</span>
+                                        <input id="${inputId}" type="checkbox">
+                                    </label>
+                                `;
+                            }
+
+                            if (control.type === 'select') {
+                                const options = (control.options || []).map((option) =>
+                                    `<option value="${option.value}">${option.label}</option>`
+                                ).join('');
+                                return `
+                                    <label class="fx-control" for="${inputId}" data-fx-control="${control.key}">
+                                        <div class="fx-control-head">
+                                            <span>${control.label}</span>
+                                        </div>
+                                        <select
+                                            id="${inputId}"
+                                            style="background:rgba(255,255,255,0.05);color:#aaa;border:1px solid rgba(255,255,255,0.08);border-radius:0;padding:3px 6px;font:10px 'Segoe UI',system-ui,sans-serif;width:100%;outline:none;cursor:pointer"
+                                        >${options}</select>
+                                    </label>
+                                `;
+                            }
+
+                            const dynamicMode = postFxControlSliderMode(control);
+                            const useDynamicSlider = dynamicMode !== 'linear';
+                            const rangeMin = useDynamicSlider ? 0 : control.min;
+                            const rangeMax = useDynamicSlider ? LOG_SLIDER_STEPS : control.max;
+                            const rangeStep = useDynamicSlider ? 1 : control.step;
+                            return `
+                                <label class="fx-control" for="${inputId}" data-fx-control="${control.key}">
+                                    <div class="fx-control-head">
+                                        <span>${control.label}</span>
+                                        <span class="fx-value" id="${valueId}"></span>
+                                    </div>
+                                    <input
+                                        class="fx-range"
+                                        id="${inputId}"
+                                        type="range"
+                                        min="${rangeMin}"
+                                        max="${rangeMax}"
+                                        step="${rangeStep}"
+                                    >
+                                </label>
+                            `;
+                        }).join('')}
+                    </div>
+                    <div class="fx-note" id="fx-note-${section.key}"></div>
+            `;
+            const renderGeneratedPostFxSection = (section) => `
+                <section class="fx-section collapsed" data-fx-section="${section.key}">
+                    <div class="fx-section-header">
+                        <div class="fx-section-title">${section.title}</div>
+                        <button class="fx-toggle" type="button" id="fx-toggle-${section.key}">Off</button>
+                    </div>
+                    ${renderGeneratedPostFxControls(section)}
+                </section>
+            `;
+            const renderClonePostFxSubsection = (section) => `
+                <div class="clone-subsection" data-fx-section="${section.key}" data-post-stack-only style="margin-top:8px;padding:6px 0 4px;border-top:1px solid rgba(255,255,255,0.08)">
+                    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">
+                        <span style="font-size:11px;color:#ccc;font-weight:600;letter-spacing:0.3px">${section.title}</span>
+                        <button class="fx-toggle" type="button" id="fx-toggle-${section.key}">Off</button>
+                    </div>
+                    ${renderGeneratedPostFxControls(section)}
+                </div>
+            `;
+            const sectionsHtml = postFxSections
+                .filter(section => !cloneSectionKeys.has(section.key))
+                .map(renderGeneratedPostFxSection)
+                .join('');
+            const cloneSectionsHtml = postFxSections
+                .filter(section => cloneSectionKeys.has(section.key))
+                .map(renderClonePostFxSubsection)
+                .join('');
+
+            const tmOptions = Object.keys(toneMappingModes).map(name =>
+                `<option value="${name}" ${name === currentToneMapping ? 'selected' : ''}>${name}</option>`
+            ).join('');
+            const fpsCapOptions = [
+                { value: 0, label: 'Uncapped' },
+                { value: 12, label: '12 FPS (stop-motion)' },
+                { value: 24, label: '24 FPS (cinema)' },
+                { value: 30, label: '30 FPS' },
+                { value: 60, label: '60 FPS' },
+                { value: 90, label: '90 FPS' },
+                { value: 120, label: '120 FPS' },
+                { value: 144, label: '144 FPS' },
+                { value: 240, label: '240 FPS' },
+            ].map(option =>
+                `<option value="${option.value}" ${option.value === performanceSettings.fpsCap ? 'selected' : ''}>${option.label}</option>`
+            ).join('');
+
+            postPanel.innerHTML = `
+                <div class="sidepanel-resize" id="panelResizeHandle"></div>
+                <div class="sidepanel-header">
+                    <div>
+                        <div class="sidepanel-title">Post FX</div>
+                        <div class="sidepanel-subtitle" id="postPanelStatus">${rendererBackendLabel}</div>
+                    </div>
+                    <button id="btnPostPanelReset" type="button" style="border-color:rgba(200,80,80,0.3)">Reset</button>
+                    <button id="btnPostPanelClose" type="button">Hide</button>
+                </div>
+                <div class="sidepanel-body">
+                    <section class="fx-section collapsed" data-keep-on-shader-lab>
+                        <div class="fx-section-header">
+                            <div class="fx-section-title">Tone Mapping</div>
+                        </div>
+                        <div class="fx-grid">
+                            <select id="fx-tonemapping-mode" style="background:rgba(255,255,255,0.05);color:#aaa;border:1px solid rgba(255,255,255,0.08);border-radius:0;padding:3px 6px;font:10px 'Segoe UI',system-ui,sans-serif;width:100%;outline:none;cursor:pointer">
+                                ${tmOptions}
+                            </select>
+                            <label class="fx-control" for="fx-tonemapping-exp">
+                                <div class="fx-control-head">
+                                    <span>Exposure</span>
+                                    <span class="fx-value" id="fx-tonemapping-exp-val">${formatExposureEvLabel(currentExposure)}</span>
+                                </div>
+                                <input class="fx-range" id="fx-tonemapping-exp" type="range" min="0" max="${LOG_SLIDER_STEPS}" step="1" value="${exposureLinearToSliderInput(currentExposure)}">
+                            </label>
+                            <label class="fx-control" for="fx-tonemapping-brightness">
+                                <div class="fx-control-head">
+                                    <span>Brightness</span>
+                                    <span class="fx-value" id="fx-tonemapping-brightness-val">0.00</span>
+                                </div>
+                                <input class="fx-range" id="fx-tonemapping-brightness" type="range" min="-1" max="1" step="0.01" value="0">
+                            </label>
+                            <label class="fx-control" for="fx-tonemapping-contrast">
+                                <div class="fx-control-head">
+                                    <span>Contrast</span>
+                                    <span class="fx-value" id="fx-tonemapping-contrast-val">0.00</span>
+                                </div>
+                                <input class="fx-range" id="fx-tonemapping-contrast" type="range" min="-1" max="1" step="0.01" value="0">
+                            </label>
+                        </div>
+                    </section>
+                    <section class="fx-section collapsed">
+                        <div class="fx-section-header">
+                            <div class="fx-section-title">Anti-Aliasing</div>
+                        </div>
+                        <div class="fx-warn">NOTICE: Changing parameters while active can cause temporary flickering.</div>
+                        <div class="fx-grid">
+                            <select id="fx-aa-mode" style="background:rgba(255,255,255,0.05);color:#aaa;border:1px solid rgba(255,255,255,0.08);border-radius:0;padding:3px 6px;font:10px 'Segoe UI',system-ui,sans-serif;width:100%;outline:none;cursor:pointer">
+                                <option value="traa"${maxjsFx.isTRAAEnabled() ? ' selected' : ''}>TRAA</option>
+                                <option value="off"${!maxjsFx.isTRAAEnabled() ? ' selected' : ''}>Off</option>
+                            </select>
+                        </div>
+                        <div class="fx-note">TRAA: temporal reprojection (WebGPU only). Off: no anti-aliasing.</div>
+                    </section>
+                    <section class="fx-section collapsed" data-keep-on-shader-lab>
+                        <div class="fx-section-header">
+                            <div class="fx-section-title">Performance</div>
+                        </div>
+                        <div class="fx-grid">
+                            <label class="fx-control" for="fx-performance-fpscap">
+                                <div class="fx-control-head">
+                                    <span>FPS Cap</span>
+                                </div>
+                                <select id="fx-performance-fpscap" style="background:rgba(255,255,255,0.05);color:#aaa;border:1px solid rgba(255,255,255,0.08);border-radius:0;padding:3px 6px;font:10px 'Segoe UI',system-ui,sans-serif;width:100%;outline:none;cursor:pointer">
+                                    ${fpsCapOptions}
+                                </select>
+                            </label>
+                            <label class="fx-control" for="fx-performance-renderscale">
+                                <div class="fx-control-head">
+                                    <span>Render Scale</span>
+                                    <span class="fx-value" id="fx-performance-renderscale-val">${performanceSettings.renderScale.toFixed(2)}x</span>
+                                </div>
+                                <input class="fx-range" id="fx-performance-renderscale" type="range" min="0.25" max="1" step="0.05" value="${performanceSettings.renderScale}">
+                            </label>
+                            <label class="fx-control" for="fx-performance-postfxscale">
+                                <div class="fx-control-head">
+                                    <span>Post FX Scale</span>
+                                    <span class="fx-value" id="fx-performance-postfxscale-val">${getEffectivePostFxResolutionScale().toFixed(2)}x</span>
+                                </div>
+                                <input class="fx-range" id="fx-performance-postfxscale" type="range" min="0.25" max="1" step="0.05" value="${getEffectivePostFxResolutionScale()}">
+                            </label>
+                            <label class="fx-check" for="fx-performance-optimizeinstances">
+                                <span>Optimize Max Instances</span>
+                                <input id="fx-performance-optimizeinstances" type="checkbox" ${performanceSettings.optimizeMaxInstances ? 'checked' : ''}>
+                            </label>
+                            <label class="fx-check" for="fx-performance-splats">
+                                <span>Gaussian splats (Spark)</span>
+                                <input id="fx-performance-splats" type="checkbox" ${performanceSettings.splatsEnabled !== false ? 'checked' : ''}>
+                            </label>
+                            <label class="fx-control" for="fx-performance-instancethreshold">
+                                <div class="fx-control-head">
+                                    <span>Instance Bucket Threshold</span>
+                                    <span class="fx-value" id="fx-performance-instancethreshold-val">${performanceSettings.maxInstanceBucketThreshold}</span>
+                                </div>
+                                <input class="fx-range" id="fx-performance-instancethreshold" type="range" min="2" max="500" step="1" value="${performanceSettings.maxInstanceBucketThreshold}">
+                            </label>
+                        </div>
+                        <div class="fx-note" id="fx-performance-note">Caps viewer frame rate and scales renderer/post-FX resolution to reduce GPU load. Splats off skips Spark. Headset sessions stay uncapped.</div>
+                    </section>
+                    <section class="fx-section collapsed" data-keep-on-shader-lab>
+                        <div class="fx-section-header">
+                            <div class="fx-section-title">Camera Clipping</div>
+                        </div>
+                        <div class="fx-grid">
+                            <label class="fx-control" for="fx-camera-near">
+                                <div class="fx-control-head">
+                                    <span>Near plane</span>
+                                    <span class="fx-value" id="fx-camera-near-val">auto (${camera.near.toFixed(3)})</span>
+                                </div>
+                                <input class="fx-number" id="fx-camera-near" type="number" min="0" step="0.01" placeholder="auto" value="${cameraClip.near ?? ''}">
+                            </label>
+                            <label class="fx-control" for="fx-camera-far">
+                                <div class="fx-control-head">
+                                    <span>Far plane</span>
+                                    <span class="fx-value" id="fx-camera-far-val">auto (${camera.far.toFixed(0)})</span>
+                                </div>
+                                <input class="fx-number" id="fx-camera-far" type="number" min="0" step="1" placeholder="auto" value="${cameraClip.far ?? ''}">
+                            </label>
+                        </div>
+                        <div class="fx-note">Leave empty for auto-fit. Raise Near (e.g. 1–10) on large scenes to eliminate distant-geometry z-fighting by reclaiming depth buffer precision.</div>
+                    </section>
+                    <section class="fx-section collapsed" data-fx-section="hdri" data-keep-on-shader-lab>
+                        <div class="fx-section-header">
+                            <div class="fx-section-title">HDRI</div>
+                            <div style="display:flex;gap:3px">
+                                <button class="fx-toggle" id="fx-hdri-toggle" type="button">Off</button>
+                                <button id="fx-hdri-load" type="button">Load</button>
+                                <button id="fx-hdri-clear" type="button" style="border-color:#663030">Clear</button>
+                            </div>
+                            <input type="file" id="fx-hdri-file" style="display:none">
+                        </div>
+                        <div id="fx-hdri-name" style="font-size:9px;color:#777;padding:2px 0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">No HDRI loaded</div>
+                        <div class="fx-grid">
+                            <label class="fx-control" for="fx-hdri-intensity">
+                                <div class="fx-control-head"><span>Intensity</span><span class="fx-value" id="fx-hdri-intensity-val">1.0</span></div>
+                                <input class="fx-range" id="fx-hdri-intensity" type="range" min="0" max="5" step="0.05" value="1">
+                            </label>
+                            <label class="fx-control" for="fx-hdri-rotation">
+                                <div class="fx-control-head"><span>Rotation</span><span class="fx-value" id="fx-hdri-rotation-val">0</span></div>
+                                <input class="fx-range" id="fx-hdri-rotation" type="range" min="0" max="360" step="1" value="0">
+                            </label>
+                            <label class="fx-control" for="fx-hdri-blur">
+                                <div class="fx-control-head"><span>BG Blur</span><span class="fx-value" id="fx-hdri-blur-val">0.0</span></div>
+                                <input class="fx-range" id="fx-hdri-blur" type="range" min="0" max="1" step="0.01" value="0">
+                            </label>
+                            <label class="fx-check" for="fx-hdri-flip">
+                                <span>Flip</span>
+                                <input id="fx-hdri-flip" type="checkbox">
+                            </label>
+                            <label class="fx-check" for="fx-hdri-reflection-only" title="Native WebGPU only: keep HDRI reflections, mute HDRI diffuse lighting.">
+                                <span>Reflection only (WebGPU)</span>
+                                <input id="fx-hdri-reflection-only" type="checkbox">
+                            </label>
+                        </div>
+                    </section>
+                    <section class="fx-section collapsed" data-fx-section="halogi" data-keep-on-shader-lab>
+                        <div class="fx-section-header">
+                            <div class="fx-section-title">Global Illumination</div>
+                            <div style="display:flex;align-items:center;gap:6px">
+                                <button class="fx-toggle" id="fx-gi-reset" type="button">Reset</button>
+                                <button class="fx-toggle" id="fx-gi-toggle" type="button">Off</button>
+                            </div>
+                        </div>
+                        <div class="fx-note" style="margin:0;padding:2px 0;color:#666;font-size:9px">BVH-traced indirect bounce (HALO-GI). WebGPU, any render mode.</div>
+                        <div class="fx-grid">
+                            ${HALO_GI_NUMERIC_CONTROLS.map(control => `
+                            <label class="fx-control" for="fx-gi-${control.key}">
+                                <div class="fx-control-head"><span>${control.label}</span><span class="fx-value" id="fx-gi-${control.key}-val">${formatHaloGiValue(control.key)}</span></div>
+                                <input class="fx-range" id="fx-gi-${control.key}" type="range" min="${control.min}" max="${control.max}" step="${control.step}" value="${haloGiSettings[control.key]}">
+                            </label>`).join('')}
+                            <label class="fx-control" for="fx-gi-cascades">
+                                <div class="fx-control-head"><span>Cascades</span></div>
+                                <select id="fx-gi-cascades" style="background:rgba(255,255,255,0.05);color:#aaa;border:1px solid rgba(255,255,255,0.08);border-radius:0;padding:3px 6px;font:10px 'Segoe UI',system-ui,sans-serif;width:100%;outline:none;cursor:pointer">
+                                    <option value="1" ${haloGiSettings.cascades === 1 ? 'selected' : ''}>Single grid</option>
+                                    <option value="2" ${haloGiSettings.cascades === 2 ? 'selected' : ''}>Cascaded (2)</option>
+                                </select>
+                            </label>
+                            <label class="fx-check" for="fx-gi-continuous"><span>Continuous solve</span><input id="fx-gi-continuous" type="checkbox" ${haloGiSettings.continuous ? 'checked' : ''}></label>
+                            <label class="fx-check" for="fx-gi-hyst-norm"><span>Normalize hysteresis</span><input id="fx-gi-hyst-norm" type="checkbox" ${haloGiSettings.hysteresisNormalize ? 'checked' : ''}></label>
+                            <label class="fx-check" for="fx-gi-show-probes" title="Diagnostics: show the probe field as a grid of spheres in the viewport."><span>Show probes</span><input id="fx-gi-show-probes" type="checkbox" ${haloGiSettings.showProbes ? 'checked' : ''}></label>
+                        </div>
+                    </section>
+                    ${sectionsHtml}
+                    <section class="fx-section collapsed" data-fx-section="clone" data-keep-on-shader-lab>
+                        <div class="fx-section-header">
+                            <div class="fx-section-title">Clone</div>
+                        </div>
+                        <div class="fx-note" style="margin:0;padding:2px 0;color:#666;font-size:9px">Custom fun effects that are designed by me.</div>
+
+                        <div class="clone-subsection" data-requires-threejs-backend style="margin-top:8px;padding:6px 0 4px;border-top:1px solid rgba(255,255,255,0.08)">
+                            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">
+                                <span style="font-size:11px;color:#ccc;font-weight:600;letter-spacing:0.3px">Blob Tracker</span>
+                                <button class="fx-toggle" type="button" id="fx-toggle-clone">Off</button>
+                            </div>
+                            <div class="fx-grid">
+                                <label class="fx-control" for="fx-clone-source">
+                                    <div class="fx-control-head"><span>Source</span></div>
+                                    <select id="fx-clone-source" style="background:rgba(255,255,255,0.05);color:#aaa;border:1px solid rgba(255,255,255,0.08);border-radius:0;padding:3px 6px;font:10px 'Segoe UI',system-ui,sans-serif;width:100%;outline:none;cursor:pointer">
+                                        <option value="luma" selected>Luminance</option>
+                                        <option value="depth">Depth</option>
+                                    </select>
+                                </label>
+                                <label class="fx-control" for="fx-clone-threshold">
+                                    <div class="fx-control-head"><span>Threshold</span><span class="fx-value" id="fx-clone-threshold-val">0.53</span></div>
+                                    <input class="fx-range" id="fx-clone-threshold" type="range" min="0" max="1" step="0.005" value="0.53">
+                                </label>
+                                <label class="fx-control" for="fx-clone-blurRadius">
+                                    <div class="fx-control-head"><span>Merge Radius</span><span class="fx-value" id="fx-clone-blurRadius-val">0.0</span></div>
+                                    <input class="fx-range" id="fx-clone-blurRadius" type="range" min="0" max="16" step="0.1" value="0">
+                                </label>
+                                <label class="fx-control" for="fx-clone-minBlobSize">
+                                    <div class="fx-control-head"><span>Min Blob Size</span><span class="fx-value" id="fx-clone-minBlobSize-val">0.00</span></div>
+                                    <input class="fx-range" id="fx-clone-minBlobSize" type="range" min="0" max="0.5" step="0.001" value="0">
+                                </label>
+                                <label class="fx-control" for="fx-clone-gridDensity">
+                                    <div class="fx-control-head"><span>Grid Density</span><span class="fx-value" id="fx-clone-gridDensity-val">0</span></div>
+                                    <input class="fx-range" id="fx-clone-gridDensity" type="range" min="0" max="8" step="1" value="0">
+                                </label>
+                                <label class="fx-control" for="fx-clone-smoothing">
+                                    <div class="fx-control-head"><span>Smoothing</span><span class="fx-value" id="fx-clone-smoothing-val">0.75</span></div>
+                                    <input class="fx-range" id="fx-clone-smoothing" type="range" min="0.01" max="1" step="0.01" value="0.75">
+                                </label>
+                                <label class="fx-control" for="fx-clone-opacity">
+                                    <div class="fx-control-head"><span>Opacity</span><span class="fx-value" id="fx-clone-opacity-val">1.00</span></div>
+                                    <input class="fx-range" id="fx-clone-opacity" type="range" min="0" max="1" step="0.005" value="1">
+                                </label>
+                                <label class="fx-check" for="fx-clone-invert"><span>Invert</span><input id="fx-clone-invert" type="checkbox"></label>
+                            </div>
+                        </div>
+
+                        <div class="clone-subsection" data-post-stack-only style="margin-top:8px;padding:6px 0 4px;border-top:1px solid rgba(255,255,255,0.08)">
+                            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">
+                                <span style="font-size:11px;color:#ccc;font-weight:600;letter-spacing:0.3px">Playstation Wobble</span>
+                                <button class="fx-toggle" type="button" id="fx-toggle-wobble">Off</button>
+                            </div>
+                            <div class="fx-grid" style="margin-top:6px">
+                                <label class="fx-control" for="fx-clone-snapGrid">
+                                    <div class="fx-control-head"><span>Snap Grid</span><span class="fx-value" id="fx-clone-snapGrid-val">5.0</span></div>
+                                    <input class="fx-range" id="fx-clone-snapGrid" type="range" min="1" max="20" step="0.5" value="5">
+                                </label>
+                            </div>
+                            <div class="fx-note" style="margin-top:2px">Combine it with Pixel or Retro.</div>
+                        </div>
+                        ${cloneSectionsHtml}
+                    </section>
+                    <section class="fx-section collapsed" data-fx-section="ascii">
+                        <div class="fx-section-header">
+                            <div class="fx-section-title">ASCII</div>
+                            <button class="fx-toggle" type="button" id="fx-toggle-ascii">Off</button>
+                        </div>
+                        <div class="fx-grid">
+                            <label class="fx-control" for="fx-clone-ascii-resolution">
+                                <div class="fx-control-head"><span>Resolution</span><span class="fx-value" id="fx-clone-ascii-resolution-val">0.15</span></div>
+                                <input class="fx-range" id="fx-clone-ascii-resolution" type="range" min="0.05" max="0.5" step="0.01" value="0.15">
+                            </label>
+                            <label class="fx-control" for="fx-clone-ascii-color">
+                                <div class="fx-control-head"><span>Color</span></div>
+                                <select id="fx-clone-ascii-color" style="background:rgba(255,255,255,0.05);color:#aaa;border:1px solid rgba(255,255,255,0.08);border-radius:0;padding:3px 6px;font:10px 'Segoe UI',system-ui,sans-serif;width:100%;outline:none;cursor:pointer">
+                                    <option value="white" selected>White</option>
+                                    <option value="green">Green</option>
+                                    <option value="amber">Amber</option>
+                                </select>
+                            </label>
+                            <label class="fx-check" for="fx-clone-ascii-invert"><span>Invert</span><input id="fx-clone-ascii-invert" type="checkbox"></label>
+                        </div>
+                        <div class="fx-note">Full takeover — disables all other post-FX.</div>
+                    </section>
+                </div>
+            `;
+
+            document.getElementById('btnPostPanelClose').onclick = () => setPostPanelVisible(false);
+
+            // Collapsible sections — click header to toggle
+            for (const header of postPanel.querySelectorAll('.fx-section-header')) {
+                header.addEventListener('click', (e) => {
+                    // Don't collapse when clicking buttons/inputs inside the header
+                    if (e.target.closest('button, input, select')) return;
+                    header.closest('.fx-section')?.classList.toggle('collapsed');
+                });
+            }
+
+            document.getElementById('btnPostPanelReset').onclick = () => {
+                // Reset all FX values to defaults then disable
+                // Does NOT touch HDRI or clay mode
+                const defaults = {
+                    ssgi: { radius: 8, thickness: 1.5, aoIntensity: 1.0, giIntensity: 1.5, expFactor: 1.5, sliceCount: 2, stepCount: 8, temporal: false },
+                    ssr: { quality: 0.45, blurQuality: 2, maxDistance: 0.5, opacity: 0.9, thickness: 0.015 },
+                    gtao: { samples: 16, distanceExponent: 1.0, distanceFallOff: 1.0, radius: 0.5, scale: 2.0, thickness: 1.0, resolutionScale: 1.0 },
+                    bloom: { strength: 0.4, radius: 0.2, threshold: 0.75 },
+                    toonOutline: { thickness: 0.003, alpha: 1.0 },
+                    motionBlur: { amount: 1.0, samples: 16 },
+                    traa: { useSubpixelCorrection: true, depthThreshold: 0.0005, edgeDepthDiff: 0.001, maxVelocityLength: 128 },
+                    contactShadow: { maxDistance: 0.1, thickness: 0.006, shadowIntensity: 0.85, quality: 0.3, temporal: false },
+                    retro: { wiggle: false, affineDistortion: 5.0, resolutionScale: 0.25, filterTextures: false, dither: false, colorDepth: 32, scanlines: false, scanlineIntensity: 0.3, scanlineDensity: 1.0, crt: false, vignetteIntensity: 0.3, bleeding: 0.001, curvature: 0.02 },
+                    volumetric: { intensity: 1.0, steps: 12, density: 0.5, denoise: 0.6, resolution: 0.25 },
+                    pixel: { pixelate: false, pixelSize: 4, chromatic: false, chromaticIntensity: 0.005, sharpen: false, sharpenStrength: 0.5, grain: false, grainIntensity: 0.08, brightness: 0, contrast: 0, saturation: 0 },
+                    powershot: { mode: 'digital', preset: 'powershot', amount: 1.0, resolutionScale: 0.75, lensSoftness: 0.32, ccdBloom: 0.35, noiseScale: 1.06, bayerNR: 0.5, chromaNR: 1.0, jpegStrength: 0.2, jpegQuality: 60, jpegChroma420: 0.75, jpegMidtone: 0.45, jpegHighlight: 1.0, brightness: 0, contrast: 0, analogStrength: 0.72, analogTracking: 0.46, analogChromaBleed: 0.76, analogRinging: 0.62, analogTapeNoise: 0.70, analogBandMask: 0.35, analogEdgeWave: 0.34, analogDropouts: 0.32, analogScanlines: 0.54, analogHeadSwitch: 0.42, freezeNoise: false },
+                    fog: { type: 0, opacity: 1.0, near: 10, far: 500, density: 0.01, noiseScale: 0.005, noiseSpeed: 0.2, height: 20 },
+                };
+                if (clayModeActive) {
+                    // Clay owns the live FX state — reset the snapshot so exit restores to defaults
+                    clayPreFxSnapshot = { ssgi: false, ssr: false, gtao: false, bloom: false,
+                        toonOutline: false, motionBlur: false, traa: false, contactShadow: false,
+                        retro: false, volumetric: false, pixel: false, powershot: false, fog: false, clone: false };
+                    // Still push default values so they're ready when clay exits
+                    for (const section of postFxSections) {
+                        if (defaults[section.key]) section.setValues(defaults[section.key]);
+                    }
+                } else {
+                    for (const section of postFxSections) {
+                        section.setEnabled(false);
+                        if (defaults[section.key]) section.setValues(defaults[section.key]);
+                    }
+                }
+                currentToneMapping = DEFAULT_TONE_MAPPING;
+                currentExposure = 1.0;
+                currentAAMode = 'off';
+                maxjsFx.setTRAAEnabled(false);
+                maxjsFx.setCloneEnabled(false);
+                maxjsFx.setCloneOptions({ threshold: 0.53, blurRadius: 0, minBlobSize: 0, opacity: 1.0, gridDensity: 0, smoothing: 0.75, invert: false, source: 'luma' });
+                maxjsFx.setColorGrading({ brightness: 0, contrast: 0 });
+                if (asciiActive) exitAsciiMode();
+                asciiSettings = { resolution: 0.15, color: 'white', invert: false };
+                performanceSettings = { ...PERFORMANCE_DEFAULTS };
+                cameraClip.near = null;
+                cameraClip.far = null;
+                {
+                    const bounds = computeVisibleSceneBounds(new THREE.Box3());
+                    if (!bounds.isEmpty()) {
+                        const size = bounds.getSize(new THREE.Vector3());
+                        const maxDim = Math.max(size.x, size.y, size.z);
+                        camera.near = Math.max(DEFAULT_CAMERA_NEAR, maxDim * 0.001);
+                        camera.far = Math.max(1000, maxDim * 100);
+                        applyCameraClipOverrides(camera);
+                    }
+                }
+                applyRendererPerformanceSettings({ resizePostFx: true });
+                applyCoreToneMappingState();
+                try { localStorage.removeItem(POSTFX_STORAGE_KEY); localStorage.removeItem('maxjs_panel_width'); } catch {}
+                postPanel.style.width = '';
+                setRightDockWidth(240);
+                buildPostFxPanel();
+                syncPostFxPanel(true);
+            };
+
+            // Panel horizontal resize
+            const resizeHandle = document.getElementById('panelResizeHandle');
+            let resizing = false;
+            resizeHandle.addEventListener('mousedown', (e) => {
+                e.preventDefault();
+                resizing = true;
+                resizeHandle.classList.add('active');
+                const startX = e.clientX;
+                const startW = rightDock?.offsetWidth || postPanel.offsetWidth;
+                const onMove = (ev) => {
+                    const dx = startX - ev.clientX;
+                    setRightDockWidth(startW + dx);
+                    postPanel.style.width = '';
+                };
+                const onUp = () => {
+                    resizing = false;
+                    resizeHandle.classList.remove('active');
+                    document.removeEventListener('mousemove', onMove);
+                    document.removeEventListener('mouseup', onUp);
+                    const dockWidth = rightDock?.offsetWidth || postPanel.offsetWidth;
+                    try { localStorage.setItem('maxjs_panel_width', `${clampDockWidth(dockWidth)}px`); } catch {}
+                };
+                document.addEventListener('mousemove', onMove);
+                document.addEventListener('mouseup', onUp);
+            });
+            try {
+                const savedW = localStorage.getItem('maxjs_panel_width');
+                if (savedW) setRightDockWidth(savedW);
+                postPanel.style.width = '';
+            } catch {}
+
+            // Tone mapping controls
+            document.getElementById('fx-tonemapping-mode').onchange = (e) => {
+                currentToneMapping = e.target.value;
+                applyCoreToneMappingState();
+                savePostFxState();
+            };
+            const expSlider = document.getElementById('fx-tonemapping-exp');
+            const expLabel = document.getElementById('fx-tonemapping-exp-val');
+            expSlider.oninput = () => {
+                currentExposure = exposureSliderInputToLinear(expSlider.value);
+                applyCoreToneMappingState();
+                expLabel.textContent = formatExposureEvLabel(currentExposure);
+            };
+            expSlider.onchange = () => savePostFxState();
+
+            // Brightness / Contrast (global color grading, runs independently of Pixel FX)
+            const brightnessSlider = document.getElementById('fx-tonemapping-brightness');
+            const brightnessLabel = document.getElementById('fx-tonemapping-brightness-val');
+            const contrastSlider = document.getElementById('fx-tonemapping-contrast');
+            const contrastLabel = document.getElementById('fx-tonemapping-contrast-val');
+            const usePowerShotColorGrading = () => maxjsFx.isPowerShotEnabled?.() === true;
+            brightnessSlider.oninput = (e) => {
+                const v = parseFloat(e.target.value);
+                if (usePowerShotColorGrading()) {
+                    maxjsFx.setPowerShotOptions({ brightness: v });
+                } else {
+                    maxjsFx.setColorGrading({ brightness: v });
+                }
+                brightnessLabel.textContent = v.toFixed(2);
+            };
+            brightnessSlider.onchange = () => savePostFxState();
+            contrastSlider.oninput = (e) => {
+                const v = parseFloat(e.target.value);
+                if (usePowerShotColorGrading()) {
+                    maxjsFx.setPowerShotOptions({ contrast: v });
+                } else {
+                    maxjsFx.setColorGrading({ contrast: v });
+                }
+                contrastLabel.textContent = v.toFixed(2);
+            };
+            contrastSlider.onchange = () => savePostFxState();
+
+            // Anti-Aliasing mode
+            const aaSelect = document.getElementById('fx-aa-mode');
+            aaSelect.onchange = (e) => {
+                const mode = e.target.value;
+                maxjsFx.setTRAAEnabled(mode === 'traa');
+                currentAAMode = mode;
+                savePostFxState();
+                syncPostFxPanel(true);
+            };
+
+            const fpsCapSelect = document.getElementById('fx-performance-fpscap');
+            const renderScaleSlider = document.getElementById('fx-performance-renderscale');
+            const renderScaleValue = document.getElementById('fx-performance-renderscale-val');
+            const postFxScaleSlider = document.getElementById('fx-performance-postfxscale');
+            const postFxScaleValue = document.getElementById('fx-performance-postfxscale-val');
+            const optimizeInstancesCheck = document.getElementById('fx-performance-optimizeinstances');
+            const splatsEnabledCheck = document.getElementById('fx-performance-splats');
+            const instanceThresholdSlider = document.getElementById('fx-performance-instancethreshold');
+            const instanceThresholdValue = document.getElementById('fx-performance-instancethreshold-val');
+            fpsCapSelect.onchange = (e) => {
+                performanceSettings.fpsCap = Number(e.target.value) || 0;
+                lastRenderTimestamp = 0;
+                savePostFxState();
+                syncPostFxPanel(true);
+            };
+            renderScaleSlider.oninput = (e) => {
+                const scale = Math.max(0.25, Math.min(1.0, Number(e.target.value) || 1.0));
+                renderScaleValue.textContent = `${scale.toFixed(2)}x`;
+            };
+            renderScaleSlider.onchange = (e) => {
+                performanceSettings.renderScale = Math.max(0.25, Math.min(1.0, Number(e.target.value) || 1.0));
+                applyRendererPerformanceSettings({ resizePostFx: true });
+                savePostFxState();
+            };
+            postFxScaleSlider.oninput = (e) => {
+                const scale = Math.max(0.25, Math.min(1.0, Number(e.target.value) || 1.0));
+                postFxScaleValue.textContent = `${scale.toFixed(2)}x`;
+            };
+            postFxScaleSlider.onchange = (e) => {
+                performanceSettings.postFxScale = Math.max(0.25, Math.min(1.0, Number(e.target.value) || 1.0));
+                applyRendererPerformanceSettings({ resizePostFx: true });
+                savePostFxState();
+            };
+            optimizeInstancesCheck.onchange = () => {
+                performanceSettings.optimizeMaxInstances = optimizeInstancesCheck.checked;
+                disposeMaxInstanceBuckets();
+                savePostFxState();
+                syncPostFxPanel(true);
+            };
+            if (splatsEnabledCheck) {
+                splatsEnabledCheck.onchange = () => {
+                    performanceSettings.splatsEnabled = splatsEnabledCheck.checked;
+                    if (!performanceSettings.splatsEnabled) {
+                        splatMutationQueue = Promise.resolve();
+                        void shutdownSplatViewer().then(() => {
+                            savePostFxState();
+                            syncPostFxPanel(true);
+                        });
+                    } else {
+                        savePostFxState();
+                        syncPostFxPanel(true);
+                        bridge.send('scene_dirty');
+                    }
+                };
+            }
+            instanceThresholdSlider.oninput = (e) => {
+                instanceThresholdValue.textContent = String(Math.max(2, Math.round(Number(e.target.value) || 50)));
+            };
+            instanceThresholdSlider.onchange = (e) => {
+                performanceSettings.maxInstanceBucketThreshold = Math.max(2, Math.round(Number(e.target.value) || 50));
+                disposeMaxInstanceBuckets();
+                savePostFxState();
+            };
+
+            // Camera clipping controls
+            const cameraNearInput = document.getElementById('fx-camera-near');
+            const cameraNearValue = document.getElementById('fx-camera-near-val');
+            const cameraFarInput = document.getElementById('fx-camera-far');
+            const cameraFarValue = document.getElementById('fx-camera-far-val');
+            function commitCameraClip() {
+                const nearRaw = parseFloat(cameraNearInput.value);
+                const farRaw = parseFloat(cameraFarInput.value);
+                cameraClip.near = Number.isFinite(nearRaw) && nearRaw > 0 ? nearRaw : null;
+                cameraClip.far = Number.isFinite(farRaw) && farRaw > 0 ? farRaw : null;
+                applyCameraClipOverrides(camera);
+                cameraNearValue.textContent = cameraClip.near != null
+                    ? `${camera.near.toFixed(3)}`
+                    : `auto (${camera.near.toFixed(3)})`;
+                cameraFarValue.textContent = cameraClip.far != null
+                    ? `${camera.far.toFixed(0)}`
+                    : `auto (${camera.far.toFixed(0)})`;
+                maxjsFx.markSceneChanged?.();
+                savePostFxState();
+            }
+            function previewCameraClip() {
+                const nearRaw = parseFloat(cameraNearInput.value);
+                const farRaw = parseFloat(cameraFarInput.value);
+                cameraNearValue.textContent = Number.isFinite(nearRaw) && nearRaw > 0
+                    ? nearRaw.toFixed(3)
+                    : `auto (${camera.near.toFixed(3)})`;
+                cameraFarValue.textContent = Number.isFinite(farRaw) && farRaw > 0
+                    ? farRaw.toFixed(0)
+                    : `auto (${camera.far.toFixed(0)})`;
+            }
+            cameraNearInput.oninput = previewCameraClip;
+            cameraFarInput.oninput = previewCameraClip;
+            cameraNearInput.onchange = () => { commitCameraClip(); savePostFxState(); };
+            cameraFarInput.onchange = () => { commitCameraClip(); savePostFxState(); };
+
+            // HDRI Environment controls
+            const hdriFileInput = document.getElementById('fx-hdri-file');
+            document.getElementById('fx-hdri-toggle').onclick = () => toggleLocalHDRI(!localHdriEnabled);
+            document.getElementById('fx-hdri-load').onclick = () => hdriFileInput.click();
+            document.getElementById('fx-hdri-clear').onclick = () => clearLocalHDRI();
+            hdriFileInput.onchange = (e) => {
+                const file = e.target.files?.[0];
+                if (file) loadLocalHDRIFile(file);
+                hdriFileInput.value = '';
+            };
+            const hdriRotSlider = document.getElementById('fx-hdri-rotation');
+            const hdriRotVal = document.getElementById('fx-hdri-rotation-val');
+            hdriRotSlider.oninput = (e) => {
+                localHdriRotation = parseFloat(e.target.value);
+                hdriRotVal.textContent = String(Math.round(localHdriRotation));
+                applyLocalHDRISettings();
+            };
+            hdriRotSlider.onchange = () => savePostFxState();
+            const hdriIntSlider = document.getElementById('fx-hdri-intensity');
+            const hdriIntVal = document.getElementById('fx-hdri-intensity-val');
+            hdriIntSlider.oninput = (e) => {
+                localHdriIntensity = parseFloat(e.target.value);
+                hdriIntVal.textContent = localHdriIntensity.toFixed(2);
+                applyLocalHDRISettings();
+            };
+            hdriIntSlider.onchange = () => savePostFxState();
+            const hdriBlurSlider = document.getElementById('fx-hdri-blur');
+            const hdriBlurVal = document.getElementById('fx-hdri-blur-val');
+            hdriBlurSlider.oninput = (e) => {
+                localHdriBlur = parseFloat(e.target.value);
+                hdriBlurVal.textContent = localHdriBlur.toFixed(2);
+                applyLocalHDRISettings();
+            };
+            hdriBlurSlider.onchange = () => savePostFxState();
+            const hdriFlipCheck = document.getElementById('fx-hdri-flip');
+            hdriFlipCheck.onchange = () => {
+                localHdriFlip = hdriFlipCheck.checked;
+                applyLocalHDRISettings();
+                savePostFxState();
+            };
+            const hdriReflectionOnlyCheck = document.getElementById('fx-hdri-reflection-only');
+            hdriReflectionOnlyCheck.onchange = () => {
+                localHdriReflectionOnly = hdriReflectionOnlyCheck.checked;
+                applyHdriReflectionOnlyState({ markOutput: true });
+                savePostFxState();
+                syncHdriPanel();
+            };
+            // Sync initial state
+            hdriRotSlider.value = localHdriRotation;
+            hdriRotVal.textContent = Math.round(localHdriRotation);
+            hdriIntSlider.value = localHdriIntensity;
+            hdriIntVal.textContent = localHdriIntensity.toFixed(2);
+            hdriBlurSlider.value = localHdriBlur;
+            hdriBlurVal.textContent = localHdriBlur.toFixed(2);
+            hdriFlipCheck.checked = localHdriFlip;
+            hdriReflectionOnlyCheck.checked = localHdriReflectionOnly;
+            syncHdriPanel();
+
+            // HALO-GI controls (window.maxjsHaloGI exists only in Studio + WebGPU)
+            {
+                const giToggle = document.getElementById('fx-gi-toggle');
+                const giReset = document.getElementById('fx-gi-reset');
+                const giCascades = document.getElementById('fx-gi-cascades');
+                const giContinuous = document.getElementById('fx-gi-continuous');
+                const giHystNorm = document.getElementById('fx-gi-hyst-norm');
+                const giShowProbes = document.getElementById('fx-gi-show-probes');
+                const canSyncGiInput = (input) => !!input && document.activeElement !== input;
+                const syncGiPanel = () => {
+                    const gi = window.maxjsHaloGI;
+                    const on = !!(gi && gi.isOn && gi.isOn());
+                    if (giToggle) {
+                        giToggle.textContent = gi ? (on ? 'On' : 'Off') : 'N/A';
+                        giToggle.classList.toggle('active', on);
+                        giToggle.disabled = !gi;
+                    }
+                    if (giReset) giReset.disabled = !gi;
+                    for (const control of HALO_GI_NUMERIC_CONTROLS) {
+                        const input = document.getElementById(`fx-gi-${control.key}`);
+                        const val = document.getElementById(`fx-gi-${control.key}-val`);
+                        const value = haloGiSettings[control.key];
+                        if (input) {
+                            input.disabled = !gi;
+                            if (canSyncGiInput(input)) input.value = String(value);
+                        }
+                        if (val) val.textContent = formatHaloGiValue(control.key, value);
+                    }
+                    if (giCascades) {
+                        giCascades.disabled = !gi;
+                        if (canSyncGiInput(giCascades)) giCascades.value = String(haloGiSettings.cascades);
+                    }
+                    if (giContinuous) {
+                        giContinuous.disabled = !gi;
+                        if (canSyncGiInput(giContinuous)) giContinuous.checked = !!haloGiSettings.continuous;
+                    }
+                    if (giHystNorm) {
+                        giHystNorm.disabled = !gi;
+                        if (canSyncGiInput(giHystNorm)) giHystNorm.checked = !!haloGiSettings.hysteresisNormalize;
+                    }
+                    if (giShowProbes) {
+                        giShowProbes.disabled = !gi;
+                        if (canSyncGiInput(giShowProbes)) giShowProbes.checked = !!haloGiSettings.showProbes;
+                    }
+                };
+                window.__maxjsSyncGiPanel = syncGiPanel;
+                if (giReset) giReset.onclick = () => resetHaloGiToDefaults({ persist: true });
+                if (giToggle) giToggle.onclick = () => {
+                    const gi = window.maxjsHaloGI;
+                    if (!gi) return;
+                    setHaloGiSetting('enabled', !(gi.isOn && gi.isOn()), { persist: true });
+                    syncGiPanel();
+                };
+                for (const control of HALO_GI_NUMERIC_CONTROLS) {
+                    const input = document.getElementById(`fx-gi-${control.key}`);
+                    const val = document.getElementById(`fx-gi-${control.key}-val`);
+                    if (!input) continue;
+                    const apply = (persist = false) => {
+                        const v = clampHaloGiNumber(control.key, input.value);
+                        input.value = String(v);
+                        if (val) val.textContent = formatHaloGiValue(control.key, v);
+                        setHaloGiSetting(control.key, v, { persist });
+                    };
+                    input.oninput = () => apply(false);
+                    input.onchange = () => apply(true);
+                }
+                if (giCascades) giCascades.onchange = () => setHaloGiSetting('cascades', giCascades.value, { persist: true });
+                if (giContinuous) giContinuous.onchange = () => setHaloGiSetting('continuous', giContinuous.checked, { persist: true });
+                if (giHystNorm) giHystNorm.onchange = () => setHaloGiSetting('hysteresisNormalize', giHystNorm.checked, { persist: true });
+                if (giShowProbes) giShowProbes.onchange = () => setHaloGiSetting('showProbes', giShowProbes.checked, { persist: true });
+                syncGiPanel();
+            }
+
+            // Clone blob tracker controls
+            {
+                const cloneToggle = document.getElementById('fx-toggle-clone');
+                const cloneSource = document.getElementById('fx-clone-source');
+                const cloneSliders = ['threshold', 'blurRadius', 'minBlobSize', 'gridDensity', 'smoothing', 'opacity'];
+
+                cloneToggle.onclick = () => {
+                    const enabled = maxjsFx.setCloneEnabled(!maxjsFx.isCloneEnabled());
+                    cloneToggle.textContent = enabled ? 'On' : 'Off';
+                    cloneToggle.classList.toggle('active', enabled);
+                    syncPostFxPanel(true);
+                };
+                cloneSource.onchange = () => {
+                    maxjsFx.setCloneOptions({ source: cloneSource.value });
+                    savePostFxState();
+                };
+                for (const key of cloneSliders) {
+                    const input = document.getElementById(`fx-clone-${key}`);
+                    const valEl = document.getElementById(`fx-clone-${key}-val`);
+                    const applyCloneSlider = () => {
+                        const v = Number(input.value);
+                        if (valEl) valEl.textContent = v >= 1 ? String(Math.round(v)) : v.toFixed(2);
+                        maxjsFx.setCloneOptions({ [key]: v });
+                    };
+                    input.oninput = applyCloneSlider;
+                    input.onchange = () => savePostFxState();
+                }
+                const invertCheck = document.getElementById('fx-clone-invert');
+                invertCheck.onchange = () => {
+                    maxjsFx.setCloneOptions({ invert: invertCheck.checked });
+                    savePostFxState();
+                };
+
+                // Playstation Wobble controls (drives retro.wiggle / retro.affineDistortion)
+                const wobbleToggle = document.getElementById('fx-toggle-wobble');
+                const wobbleSection = wobbleToggle?.closest('[data-post-stack-only]');
+                const snapGridSlider = document.getElementById('fx-clone-snapGrid');
+                const snapGridVal = document.getElementById('fx-clone-snapGrid-val');
+                wobbleToggle.onclick = () => {
+                    if (!maxjsFx.supportsScreenSpaceEffects()) {
+                        perfHud.setStatus('max.js - Playstation Wobble requires WebGPU or Force WebGL');
+                        syncPostFxPanel(true);
+                        return;
+                    }
+                    const retro = maxjsFx.getState().retro;
+                    const shaderLabActive = !!shaderLabFx?.isEnabled?.();
+                    const next = !retro.wiggle;
+                    maxjsFx.setRetroOptions({ wiggle: next });
+                    if (next && !shaderLabActive && !maxjsFx.isRetroEnabled()) maxjsFx.setRetroEnabled(true);
+                    wobbleToggle.textContent = next ? 'On' : 'Off';
+                    wobbleToggle.classList.toggle('active', next);
+                    savePostFxState();
+                    syncPostFxPanel(true);
+                };
+                snapGridSlider.oninput = () => {
+                    if (!maxjsFx.supportsScreenSpaceEffects()) return;
+                    const v = Number(snapGridSlider.value);
+                    snapGridVal.textContent = v.toFixed(1);
+                    maxjsFx.setRetroOptions({ affineDistortion: v });
+                };
+                snapGridSlider.onchange = () => savePostFxState();
+
+                // ASCII controls
+                const asciiToggle = document.getElementById('fx-toggle-ascii');
+                const asciiResSlider = document.getElementById('fx-clone-ascii-resolution');
+                const asciiResVal = document.getElementById('fx-clone-ascii-resolution-val');
+                const asciiColorSelect = document.getElementById('fx-clone-ascii-color');
+                const asciiInvertCheck = document.getElementById('fx-clone-ascii-invert');
+                asciiToggle.onclick = () => {
+                    if (asciiActive) exitAsciiMode(); else if (!enterAsciiMode()) return;
+                    asciiToggle.textContent = asciiActive ? 'On' : 'Off';
+                    asciiToggle.classList.toggle('active', asciiActive);
+                    syncPostFxPanel(true);
+                };
+                asciiResSlider.oninput = () => {
+                    asciiSettings.resolution = Number(asciiResSlider.value);
+                    asciiResVal.textContent = asciiSettings.resolution.toFixed(2);
+                    if (asciiActive) rebuildAsciiEffect();
+                };
+                asciiResSlider.onchange = () => savePostFxState();
+                asciiColorSelect.onchange = () => {
+                    asciiSettings.color = asciiColorSelect.value;
+                    if (asciiActive) rebuildAsciiEffect();
+                    savePostFxState();
+                };
+                asciiInvertCheck.onchange = () => {
+                    asciiSettings.invert = asciiInvertCheck.checked;
+                    if (asciiActive) rebuildAsciiEffect();
+                    savePostFxState();
+                };
+
+                syncClonePanelFn = () => {
+                    const canSyncInput = (input) => !!input && document.activeElement !== input;
+                    const s = maxjsFx.getState().clone;
+                    cloneToggle.textContent = s.enabled ? 'On' : 'Off';
+                    cloneToggle.classList.toggle('active', s.enabled);
+                    if (canSyncInput(cloneSource)) cloneSource.value = s.source;
+                    for (const key of cloneSliders) {
+                        const input = document.getElementById(`fx-clone-${key}`);
+                        const valEl = document.getElementById(`fx-clone-${key}-val`);
+                        if (canSyncInput(input)) input.value = s[key];
+                        if (valEl) valEl.textContent = s[key] >= 1 ? String(Math.round(s[key])) : s[key].toFixed(2);
+                    }
+                    if (canSyncInput(invertCheck)) invertCheck.checked = !!s.invert;
+                    const retro = maxjsFx.getState().retro;
+                    const supportsPostStack = maxjsFx.supportsScreenSpaceEffects();
+                    const asciiBlockedByShaderLab = !!shaderLabFx?.isEnabled?.();
+                    if (wobbleSection) wobbleSection.hidden = !supportsPostStack;
+                    wobbleToggle.textContent = retro.wiggle ? 'On' : 'Off';
+                    wobbleToggle.classList.toggle('active', retro.wiggle);
+                    wobbleToggle.disabled = !supportsPostStack;
+                    snapGridSlider.disabled = !supportsPostStack;
+                    if (canSyncInput(snapGridSlider)) snapGridSlider.value = retro.affineDistortion;
+                    snapGridVal.textContent = retro.affineDistortion.toFixed(1);
+                    asciiToggle.textContent = asciiActive ? 'On' : 'Off';
+                    asciiToggle.classList.toggle('active', asciiActive);
+                    asciiToggle.disabled = asciiBlockedByShaderLab;
+                    asciiResSlider.disabled = asciiBlockedByShaderLab;
+                    asciiColorSelect.disabled = asciiBlockedByShaderLab;
+                    asciiInvertCheck.disabled = asciiBlockedByShaderLab;
+                    if (canSyncInput(asciiResSlider)) asciiResSlider.value = asciiSettings.resolution;
+                    asciiResVal.textContent = asciiSettings.resolution.toFixed(2);
+                    if (canSyncInput(asciiColorSelect)) asciiColorSelect.value = asciiSettings.color;
+                    if (canSyncInput(asciiInvertCheck)) asciiInvertCheck.checked = asciiSettings.invert;
+                };
+                syncClonePanelFn();
+            }
+
+            for (const section of postFxSections) {
+                section.sectionEl = document.querySelector(`[data-fx-section="${section.key}"]`);
+                section.toggleEl = document.getElementById(`fx-toggle-${section.key}`);
+                section.noteEl = document.getElementById(`fx-note-${section.key}`);
+                section.controlEls = {};
+
+                section.toggleEl.onclick = () => {
+                    const enabled = section.setEnabled(!section.isEnabled());
+                    syncPostFxPanel(true);
+                    if (!enabled) {
+                        const message = maxjsFx.getLastError();
+                        if (message && (!maxjsFx.isAvailable() || section.requiresWebGPU)) {
+                            perfHud.setStatus(`max.js - ${section.title} unavailable: ${message}`);
+                        }
+                    }
+                };
+
+                for (const control of section.controls) {
+                    const input = document.getElementById(`fx-${section.key}-${control.key}`);
+                    const valueEl = control.type === 'checkbox'
+                        ? null
+                        : document.getElementById(`fx-value-${section.key}-${control.key}`);
+                    const wrapperEl = input?.closest?.('[data-fx-control]');
+
+                    section.controlEls[control.key] = { input, valueEl, wrapperEl };
+
+                    const getSectionValues = () => section.getValues(maxjsFx.getState());
+                    const applyControlValueLive = () => {
+                        const value = readPostFxControlValue(control, input, getSectionValues);
+                        section.setValues({ [control.key]: value });
+                    };
+                    const commitControlValue = (persist) => {
+                        applyControlValueLive();
+                        syncPostFxPanel(true, { persist });
+                    };
+
+                    if (control.type === 'checkbox' || control.type === 'select') {
+                        input.addEventListener('change', () => commitControlValue(true));
+                    } else if (control.realtime) {
+                        input.addEventListener('input', () => {
+                            previewPostFxControlLabel(control, input, valueEl, getSectionValues);
+                            applyControlValueLive();
+                            if (control.affectsVisibility) syncPostFxPanel(false, { persist: false });
+                        });
+                        input.addEventListener('change', () => savePostFxState());
+                    } else {
+                        input.addEventListener('input', () => {
+                            previewPostFxControlLabel(control, input, valueEl, getSectionValues);
+                        });
+                        input.addEventListener('change', () => commitControlValue(true));
+                    }
+                }
+            }
+        }
+
+        function syncPostFxPanel(force = false, { persist = true } = {}) {
+            const state = maxjsFx.getState();
+            const derived = postPanelVisible ? maxjsFx.getDerivedState() : null;
+            const available = maxjsFx.isAvailable();
+            const supportsScreenSpaceEffects = maxjsFx.supportsScreenSpaceEffects();
+            const lastError = maxjsFx.getLastError();
+            const signature = JSON.stringify({
+                panel: postPanelVisible,
+                available,
+                supportsScreenSpaceEffects,
+                lastError,
+                performanceSettings,
+                cameraClip,
+                state,
+                derived,
+            });
+
+            if (!force && signature === lastPostFxSignature) return;
+            lastPostFxSignature = signature;
+            syncShaderLabAvailability();
+            const canSyncInput = (input) => !!input && (force || document.activeElement !== input);
+
+            const panelStatus = document.getElementById('postPanelStatus');
+            if (panelStatus) {
+                panelStatus.textContent = available
+                    ? (supportsScreenSpaceEffects
+                        ? `${rendererBackendLabel} backend`
+                        : `${rendererBackendLabel} backend • utility controls`)
+                    : `${rendererBackendLabel} backend • ${lastError || 'unavailable'}`;
+            }
+
+            const fpsCapSelect = document.getElementById('fx-performance-fpscap');
+            const renderScaleSlider = document.getElementById('fx-performance-renderscale');
+            const renderScaleValue = document.getElementById('fx-performance-renderscale-val');
+            const postFxScaleSlider = document.getElementById('fx-performance-postfxscale');
+            const postFxScaleValue = document.getElementById('fx-performance-postfxscale-val');
+            const optimizeInstancesCheck = document.getElementById('fx-performance-optimizeinstances');
+            const splatsEnabledCheck = document.getElementById('fx-performance-splats');
+            const instanceThresholdSlider = document.getElementById('fx-performance-instancethreshold');
+            const instanceThresholdValue = document.getElementById('fx-performance-instancethreshold-val');
+            const performanceNote = document.getElementById('fx-performance-note');
+            const tmSelect = document.getElementById('fx-tonemapping-mode');
+            if (canSyncInput(tmSelect)) tmSelect.value = currentToneMapping;
+            const expSlider = document.getElementById('fx-tonemapping-exp');
+            const expLabel = document.getElementById('fx-tonemapping-exp-val');
+            if (canSyncInput(expSlider)) {
+                expSlider.value = String(exposureLinearToSliderInput(currentExposure));
+            }
+            if (expLabel) expLabel.textContent = formatExposureEvLabel(currentExposure);
+            const colorGradingUsesPowerShot = maxjsFx.isPowerShotEnabled?.() === true;
+            const cg = colorGradingUsesPowerShot
+                ? maxjsFx.getState().powershot
+                : maxjsFx.getColorGrading();
+            const brightnessSlider = document.getElementById('fx-tonemapping-brightness');
+            const brightnessLabel = document.getElementById('fx-tonemapping-brightness-val');
+            const contrastSlider = document.getElementById('fx-tonemapping-contrast');
+            const contrastLabel = document.getElementById('fx-tonemapping-contrast-val');
+            if (canSyncInput(brightnessSlider)) brightnessSlider.value = String(cg.brightness);
+            if (brightnessLabel) brightnessLabel.textContent = cg.brightness.toFixed(2);
+            if (canSyncInput(contrastSlider)) contrastSlider.value = String(cg.contrast);
+            if (contrastLabel) contrastLabel.textContent = cg.contrast.toFixed(2);
+            if (brightnessSlider) brightnessSlider.disabled = false;
+            if (contrastSlider) contrastSlider.disabled = false;
+            const aaSelect = document.getElementById('fx-aa-mode');
+            if (canSyncInput(aaSelect)) {
+                aaSelect.value = (!supportsScreenSpaceEffects && currentAAMode === 'traa')
+                    ? 'off'
+                    : currentAAMode;
+            }
+            const aaTraaOption = document.querySelector('#fx-aa-mode option[value="traa"]');
+            if (aaTraaOption) {
+                aaTraaOption.disabled = !supportsScreenSpaceEffects;
+                aaTraaOption.hidden = !supportsScreenSpaceEffects;
+            }
+            if (canSyncInput(fpsCapSelect)) fpsCapSelect.value = String(performanceSettings.fpsCap || 0);
+            if (canSyncInput(renderScaleSlider)) renderScaleSlider.value = String(performanceSettings.renderScale);
+            if (renderScaleValue) renderScaleValue.textContent = `${performanceSettings.renderScale.toFixed(2)}x`;
+            if (canSyncInput(postFxScaleSlider)) postFxScaleSlider.value = String(getEffectivePostFxResolutionScale());
+            if (postFxScaleValue) postFxScaleValue.textContent = `${getEffectivePostFxResolutionScale().toFixed(2)}x`;
+            if (canSyncInput(optimizeInstancesCheck)) optimizeInstancesCheck.checked = !!performanceSettings.optimizeMaxInstances;
+            if (canSyncInput(splatsEnabledCheck)) splatsEnabledCheck.checked = performanceSettings.splatsEnabled !== false;
+            if (canSyncInput(instanceThresholdSlider)) instanceThresholdSlider.value = String(performanceSettings.maxInstanceBucketThreshold);
+            if (instanceThresholdValue) instanceThresholdValue.textContent = String(performanceSettings.maxInstanceBucketThreshold);
+            if (performanceNote) {
+                performanceNote.textContent =
+                    `Caps the viewer frame rate and scales device pixel ratio/post-FX targets to reduce GPU load. Effective DPR ${getEffectivePixelRatio().toFixed(2)}. Post FX ${getEffectivePostFxResolutionScale().toFixed(2)}x. Splats off skips Spark. Large plain Max instance groups can collapse into InstancedMesh buckets. Headset sessions stay uncapped.`;
+            }
+
+            const cameraNearInput = document.getElementById('fx-camera-near');
+            const cameraNearValue = document.getElementById('fx-camera-near-val');
+            const cameraFarInput = document.getElementById('fx-camera-far');
+            const cameraFarValue = document.getElementById('fx-camera-far-val');
+            if (canSyncInput(cameraNearInput)) cameraNearInput.value = cameraClip.near != null ? String(cameraClip.near) : '';
+            if (canSyncInput(cameraFarInput)) cameraFarInput.value = cameraClip.far != null ? String(cameraClip.far) : '';
+            if (cameraNearValue) {
+                cameraNearValue.textContent = cameraClip.near != null
+                    ? `${camera.near.toFixed(3)}`
+                    : `auto (${camera.near.toFixed(3)})`;
+            }
+            if (cameraFarValue) {
+                cameraFarValue.textContent = cameraClip.far != null
+                    ? `${camera.far.toFixed(0)}`
+                    : `auto (${camera.far.toFixed(0)})`;
+            }
+
+            const hasEnabledEffects = maxjsFx.hasEnabledEffects();
+            btnPostFxPanel.classList.toggle('active', postPanelVisible || hasEnabledEffects);
+
+            for (const section of postFxSections) {
+                const values = section.getValues(state);
+                const enabled = section.isEnabled();
+                const disabledByOther = section.disabledBy ? section.disabledBy(state) : null;
+                const unsupportedBackend = section.requiresWebGPU && !supportsScreenSpaceEffects;
+                const hiddenByBackend = unsupportedBackend && !section.keepVisibleWhenUnsupported;
+                const disabled =
+                    !available ||
+                    unsupportedBackend ||
+                    !!disabledByOther;
+
+                if (section.sectionEl) {
+                    section.sectionEl.hidden = hiddenByBackend;
+                    section.sectionEl.classList.toggle('disabled-by-other', !!disabledByOther);
+                }
+                if (hiddenByBackend) continue;
+
+                section.toggleEl.textContent = enabled ? 'On' : 'Off';
+                section.toggleEl.classList.toggle('active', enabled);
+                section.toggleEl.disabled = disabled;
+
+                for (const control of section.controls) {
+                    const controlEl = section.controlEls[control.key];
+                    if (!controlEl) continue;
+                    const visible = isPostFxControlVisible(control, values);
+                    if (controlEl.wrapperEl) {
+                        controlEl.wrapperEl.hidden = !visible;
+                        controlEl.wrapperEl.classList.toggle('is-hidden', !visible);
+                    }
+                    const editingControl = !force && document.activeElement === controlEl.input;
+
+                    // Lock the camera-driven DOF sliders when "Auto from Camera" is on. DOF Range
+                    // (focalLength) stays manual — physical range is unusable at scene scale.
+                    const dofAutoControls = ['focusDistance', 'bokehScale'];
+                    const autoLocked = section.key === 'dof' && dofAutoControls.includes(control.key) && values.autoFromCamera;
+                    controlEl.input.disabled = disabled || autoLocked || !visible;
+
+                    if (control.type === 'checkbox') {
+                        if (!editingControl) controlEl.input.checked = !!values[control.key];
+                    } else if (control.type === 'select') {
+                        if (!editingControl) controlEl.input.value = values[control.key];
+                    } else if (postFxControlSliderMode(control) !== 'linear') {
+                        if (!editingControl) {
+                            controlEl.input.value = valueToPostFxDynamicSliderInput(control, values[control.key], values[control.key]);
+                        }
+                        if (controlEl.valueEl) {
+                            controlEl.valueEl.textContent = formatControlValue(control, values[control.key]);
+                        }
+                    } else {
+                        if (!editingControl) controlEl.input.value = values[control.key];
+                        if (controlEl.valueEl) {
+                            controlEl.valueEl.textContent = formatControlValue(control, values[control.key]);
+                        }
+                    }
+                }
+
+                let note = section.note;
+                let isError = false;
+                if (!available && lastError) {
+                    note = lastError;
+                    isError = true;
+                } else if (unsupportedBackend) {
+                    note = 'Requires WebGPU or Force WebGL.';
+                    isError = true;
+                } else if (disabledByOther) {
+                    note = disabledByOther;
+                    isError = true;
+                } else if (section.key === 'ssr' && derived) {
+                    note = `World distance ${derived.effectiveSSRMaxDistance.toFixed(2)} • thickness ${derived.effectiveSSRThickness.toFixed(3)}`;
+                    if (values.denoise) note += ' • recurrent denoise';
+                } else if (section.key === 'gtao' && derived) {
+                    note = `World radius ${derived.effectiveGTAORadius.toFixed(2)} • thickness ${derived.effectiveGTAOThickness.toFixed(2)}`;
+                } else if (section.key === 'contactShadow' && derived) {
+                    note = `World distance ${derived.effectiveContactShadowMaxDistance.toFixed(2)} • thickness ${derived.effectiveContactShadowThickness.toFixed(3)}`;
+                    if (values.temporal && !state.traa.enabled) {
+                        note += ' • Temporal needs TRAA';
+                    }
+                } else if (section.key === 'traa') {
+                    note = values.useSubpixelCorrection
+                        ? 'Temporal AA with subpixel correction enabled.'
+                        : 'Temporal AA with the cleaner, less corrective resolve.';
+                }
+
+                section.noteEl.textContent = note;
+                section.noteEl.classList.toggle('error', isError);
+            }
+
+            if (syncClonePanelFn) syncClonePanelFn();
+            if (persist) savePostFxState();
+        }
+
+        btnPostFxPanel.onclick = () => {
+            setPostPanelVisible(!postPanelVisible);
+        };
+
+        // ── Post FX persistence ──
+        const POSTFX_STORAGE_KEY = 'maxjs_postfx_state';
+        let postFxPersistTimer = 0;
+        let lastProjectPostFxSignature = '';
+        let suppressPostFxPersistenceDepth = 0;
+
+        function withPostFxPersistenceSuppressed(fn) {
+            suppressPostFxPersistenceDepth += 1;
+            try {
+                return fn();
+            } finally {
+                suppressPostFxPersistenceDepth = Math.max(0, suppressPostFxPersistenceDepth - 1);
+            }
+        }
+
+        function serializeSnapshotFxState() {
+            // Full state including powershot — the snapshot viewer replays it
+            // via fx/final/powershot.js when runtimeFeatures.post_fx lists
+            // 'powershot' (the exporter detects fx.powershot.enabled).
+            return maxjsFx.getState();
+        }
+
+        function serializeSnapshotUiState({ includeDebug = false } = {}) {
+            const snapshotRendererBackend = rendererBackendLabel;
+            const authoredEnvironmentActive = !!(skyActive || currentEnvParams?.hdri);
+            const payload = {
+                buildMode: includeDebug ? 'dev' : 'release',
+                rendererBackend: snapshotRendererBackend,
+                toneMapping: currentToneMapping,
+                exposure: currentExposure,
+                aaMode: currentAAMode,
+                envVisible,
+                camLock,
+                lightProbeEnabled,
+                lightMode,
+                background: hiddenBackgroundColor,
+                fx: serializeSnapshotFxState(),
+                webglBasicFx: webglBasicFx.getState?.(),
+                camera: serializeCurrentCameraState(),
+                hdri: {
+                    rotation: localHdriRotation,
+                    intensity: localHdriIntensity,
+                    showBg: envVisible,
+                    blur: localHdriBlur,
+                    flip: localHdriFlip,
+                    reflectionOnly: localHdriReflectionOnly,
+                    enabled: authoredEnvironmentActive ? false : localHdriEnabled,
+                    fileName: !authoredEnvironmentActive && isLocalHdriLoaded() ? localHdriFileName : '',
+                },
+                haloGi: serializeHaloGiState(),
+                performance: {
+                    fpsCap: performanceSettings.fpsCap,
+                    renderScale: performanceSettings.renderScale,
+                    postFxScale: getEffectivePostFxResolutionScale(),
+                    optimizeMaxInstances: performanceSettings.optimizeMaxInstances,
+                    maxInstanceBucketThreshold: performanceSettings.maxInstanceBucketThreshold,
+                    splatsEnabled: performanceSettings.splatsEnabled !== false,
+                },
+                cameraClip: { near: cameraClip.near, far: cameraClip.far },
+                ascii: { enabled: asciiActive, ...asciiSettings },
+                shaderLab: getShaderLabSnapshot(),
+                studio: isStudioMode ? serializeStudioState() : null,
+                bake: serializeBakeState(),
+                timeline: {
+                    fps: maxTimeline.fps(),
+                    startFrame: 0,
+                    endFrame: 0,
+                    defaultPlaying: true,
+                },
+            };
+            if (includeDebug) {
+                payload.debug = {
+                    buildMode, debugMode, standalone: isStandalone,
+                    backend: snapshotRendererBackend,
+                    nodeMapSize: nodeMap.size,
+                    memory: renderer?.info?.memory ?? null,
+                };
+            }
+            return payload;
+        }
+
+        function serializePersistedPostFxState() {
+            const payload = serializeSnapshotUiState();
+            payload.fx = maxjsFx.getState();
+            delete payload.camera;
+            delete payload.studio;
+            delete payload.bake;
+            return payload;
+        }
+
+        function savePostFxState() {
+            if (suppressPostFxPersistenceDepth > 0) return;
+            const projectRuntime = _projectRuntimeRef;
+            if (projectRuntime?.setPostFxState) {
+                const payload = serializePersistedPostFxState();
+                const signature = JSON.stringify(payload);
+                if (signature === lastProjectPostFxSignature) return;
+                lastProjectPostFxSignature = signature;
+                clearTimeout(postFxPersistTimer);
+                postFxPersistTimer = setTimeout(() => {
+                    void projectRuntime.setPostFxState(payload).catch(error => {
+                        reportBridgeError('post fx state save', error);
+                    });
+                }, 180);
+                return;
+            }
+            try {
+                const payload = serializePersistedPostFxState();
+                localStorage.setItem(POSTFX_STORAGE_KEY, JSON.stringify(payload));
+            } catch {}
+        }
+
+        // Any user edit in the Shader Lab panel (config layer add/edit/delete,
+        // autoApply toggle, activate/deactivate) routes through this handler
+        // to persist alongside the rest of the Post FX state — next to the
+        // .max file when the project runtime is available, otherwise
+        // localStorage.
+        onShaderLabSnapshotChange(() => savePostFxState());
+
+        // Track the Activate state in the store whenever it flips so a refresh
+        // brings the effect back (same UX as ssgi effects being sticky).
+        window.addEventListener('maxjs-shader-lab-state', () => {
+            const shaderLabEnabled = shaderLabFx.isEnabled();
+            if (shaderLabEnabled && asciiActive) exitAsciiMode();
+            updateShaderLabEnabled(shaderLabEnabled);
+            syncPostFxPanel(true, { persist: false });
+        });
+
+        function applySavedPostFxPayload(saved) {
+            try {
+                let toneMappingChanged = false;
+                if (saved.toneMapping && toneMappingModes[saved.toneMapping] != null) {
+                    currentToneMapping = saved.toneMapping;
+                    toneMappingChanged = true;
+                }
+                if (Number.isFinite(saved.exposure)) {
+                    currentExposure = saved.exposure;
+                    toneMappingChanged = true;
+                }
+                if (toneMappingChanged) applyCoreToneMappingState();
+                if (saved.aaMode && ['msaa', 'traa', 'off'].includes(saved.aaMode)) {
+                    // Legacy saved value: 'msaa' was a no-op alias for 'off' — normalize.
+                    const loaded = saved.aaMode === 'msaa' ? 'off' : saved.aaMode;
+                    currentAAMode = loaded;
+                    if (maxjsFx.supportsScreenSpaceEffects()) {
+                        maxjsFx.setTRAAEnabled(currentAAMode === 'traa');
+                    }
+                }
+                if (typeof saved.envVisible === 'boolean') {
+                    envVisible = saved.envVisible;
+                }
+                if (typeof saved.camLock === 'boolean') {
+                    camLock = saved.camLock;
+                    controls.enabled = !camLock;
+                    syncCameraLockButtonUi();
+                }
+                if (typeof saved.lightProbeEnabled === 'boolean') {
+                    lightProbeEnabled = saved.lightProbeEnabled;
+                    btnLightProbe.classList.toggle('active', lightProbeEnabled);
+                    applyLightProbeState();
+                    if (lightProbeEnabled) refreshLightProbeFromCurrentHDRI();
+                }
+                if (typeof saved.lightMode === 'boolean') {
+                    lightMode = saved.lightMode;
+                    document.body.classList.toggle('light-mode', lightMode);
+                }
+                if (Number.isFinite(saved.background)) {
+                    setBackgroundColor(saved.background >>> 0);
+                } else if (saved.backgroundPresets && typeof saved.backgroundPresets === 'object') {
+                    const legacy = saved.backgroundPresets.custom ?? saved.backgroundPresets.dark ?? saved.backgroundPresets.light;
+                    if (Number.isFinite(legacy)) setBackgroundColor(legacy >>> 0);
+                }
+
+                // Restore HDRI settings (file must be re-picked, but sliders persist)
+                if (saved.hdri) {
+                    if (Number.isFinite(saved.hdri.rotation)) localHdriRotation = saved.hdri.rotation;
+                    if (Number.isFinite(saved.hdri.intensity)) localHdriIntensity = saved.hdri.intensity;
+                    if (Number.isFinite(saved.hdri.blur)) localHdriBlur = saved.hdri.blur;
+                    if (typeof saved.hdri.showBg === 'boolean') localHdriShowBg = saved.hdri.showBg;
+                    if (typeof saved.hdri.flip === 'boolean') localHdriFlip = saved.hdri.flip;
+                    if (typeof saved.hdri.reflectionOnly === 'boolean') localHdriReflectionOnly = saved.hdri.reflectionOnly;
+                    if (typeof saved.hdri.enabled === 'boolean') localHdriEnabled = saved.hdri.enabled;
+                    // Apply blur to scene even without HDRI loaded (will be used when HDRI loads)
+                    scene.backgroundBlurriness = localHdriBlur;
+                }
+                if (saved.cameraClip) {
+                    cameraClip.near = Number.isFinite(saved.cameraClip.near) && saved.cameraClip.near > 0 ? saved.cameraClip.near : null;
+                    cameraClip.far = Number.isFinite(saved.cameraClip.far) && saved.cameraClip.far > 0 ? saved.cameraClip.far : null;
+                    applyCameraClipOverrides(camera);
+                }
+                if (saved.haloGi && typeof saved.haloGi === 'object') {
+                    applyHaloGiState(saved.haloGi);
+                }
+                if (saved.performance) {
+                    if (Number.isFinite(saved.performance.fpsCap)) {
+                        performanceSettings.fpsCap = Math.max(0, Math.round(saved.performance.fpsCap));
+                    }
+                    if (Number.isFinite(saved.performance.renderScale)) {
+                        performanceSettings.renderScale = Math.max(0.25, Math.min(1.0, saved.performance.renderScale));
+                    }
+                    if (Number.isFinite(saved.performance.postFxScale)) {
+                        performanceSettings.postFxScale = Math.max(0.25, Math.min(1.0, saved.performance.postFxScale));
+                    }
+                    if (typeof saved.performance.optimizeMaxInstances === 'boolean') {
+                        performanceSettings.optimizeMaxInstances = saved.performance.optimizeMaxInstances;
+                    }
+                    if (Number.isFinite(saved.performance.maxInstanceBucketThreshold)) {
+                        performanceSettings.maxInstanceBucketThreshold = Math.max(2, Math.round(saved.performance.maxInstanceBucketThreshold));
+                    }
+                    if (typeof saved.performance.splatsEnabled === 'boolean') {
+                        performanceSettings.splatsEnabled = saved.performance.splatsEnabled;
+                        if (!performanceSettings.splatsEnabled) {
+                            splatMutationQueue = Promise.resolve();
+                            void shutdownSplatViewer();
+                        }
+                    }
+                    applyRendererPerformanceSettings({ resizePostFx: true });
+                }
+                syncEnvButtonUi();
+                if (isLocalHdriActive()) {
+                    applyLocalHDRIToScene();
+                } else {
+                    syncEnvironmentDisplay();
+                }
+
+                const fx = saved.fx;
+                if (!fx) return;
+
+                maxjsFx.restoreState?.(fx);
+                syncPathTracingDofFromPostFx();
+                if (saved.webglBasicFx) {
+                    webglBasicFx.restoreState?.(saved.webglBasicFx);
+                }
+
+                // ASCII restore
+                if (saved.ascii) {
+                    if (Number.isFinite(saved.ascii.resolution)) asciiSettings.resolution = saved.ascii.resolution;
+                    if (saved.ascii.color) asciiSettings.color = saved.ascii.color;
+                    if (typeof saved.ascii.invert === 'boolean') asciiSettings.invert = saved.ascii.invert;
+                    if (saved.ascii.enabled && !saved.shaderLab?.enabled) enterAsciiMode();
+                }
+
+                // Shader Lab restore (config + autoApply + enabled) —
+                // next-to-.max persistence flows through the same Post FX
+                // state pipe. If the scene had Shader Lab active, reactivate
+                // it so the refresh keeps the effect on screen.
+                if (saved.shaderLab) {
+                    setShaderLabSnapshot(saved.shaderLab);
+                    shaderLabFx.setState?.(saved.shaderLab);
+                    if (!maxjsFx.supportsScreenSpaceEffects()) {
+                        shaderLabFx.disable?.();
+                        syncShaderLabAvailability();
+                    } else if (saved.shaderLab.enabled && !shaderLabFx.isEnabled()) {
+                        shaderLabFx.enable(saved.shaderLab).catch(err => {
+                            console.error('[ShaderLab] restore enable failed:', err);
+                        });
+                    }
+                }
+            } catch (e) {
+                maxjsDebugWarn('max.js: failed to apply post-FX state', e);
+            }
+        }
+
+        function restorePostFxState() {
+            withPostFxPersistenceSuppressed(() => {
+                try {
+                    const projectPayload = _projectRuntimeRef?.getPostFxState?.();
+                    if (projectPayload) {
+                        lastProjectPostFxSignature = JSON.stringify(projectPayload);
+                        applySavedPostFxPayload(projectPayload);
+                        return;
+                    }
+                    if (_projectRuntimeRef) return;
+                    const raw = localStorage.getItem(POSTFX_STORAGE_KEY);
+                    if (!raw) return;
+                    applySavedPostFxPayload(JSON.parse(raw));
+                } catch (e) {
+                    maxjsDebugWarn('max.js: failed to restore post-FX state', e);
+                }
+            });
+        }
+
+        function syncProjectPostFxState() {
+            const payload = _projectRuntimeRef?.getPostFxState?.();
+            if (!payload) return;
+            const signature = JSON.stringify(payload);
+            if (!signature || signature === lastProjectPostFxSignature) return;
+            lastProjectPostFxSignature = signature;
+            withPostFxPersistenceSuppressed(() => {
+                applySavedPostFxPayload(payload);
+                syncPostFxPanel(true, { persist: false });
+            });
+        }
+
+        buildPostFxPanel();
+        // NOTE: Do NOT call syncPostFxPanel here — it would save defaults and overwrite stored settings.
+        // restoreInteractiveBrowserState() handles restore then sync.
+
+        // ── Resize + Render ─────────────────────────────────
+        // WebGPU pipelines bound to the canvas swap chain get duplicated every
+        // time canvas.width / canvas.height change (forces context reconfigure
+        // and orphans the old swap-chain textures the pipelines reference).
+        // `renderer.setSize` touches canvas.width — so dragging a panel resize
+        // handle at 60fps used to fire 60 full pipeline rebuilds across every
+        // post-FX pass. The Inspector's "(not in use)" cascade on every pass
+        // was that churn being observed in-flight.
+        //
+        // Strategy: update camera + CSS immediately so the canvas visually
+        // tracks the drag (browser scales stale pixels smoothly), but defer
+        // the drawing-buffer resize + post-FX rebuild until dragging settles.
+        // One pipeline churn event per resize gesture instead of dozens.
+        let resizeTimer = null;
+        addEventListener('resize', () => {
+            // CSS-only update keeps the canvas visually filling the viewport
+            // during drag. No drawing-buffer resize → no swap chain churn.
+            applyRenderViewportLayout({ resizeBuffers: false, resizePostFx: false });
+            clearTimeout(resizeTimer);
+            resizeTimer = setTimeout(() => {
+                applyRendererPerformanceSettings({ resizePostFx: false });
+                maxjsFx.resize();
+                webglBasicFx.resize?.();
+            }, 150);
+        });
+
+        // ── Headset runtime ──────────────────────────────────
+        // Fragile integration: this path is intentionally isolated from snapshots/export
+        // and has only been tested on Quest 3 via Virtual Desktop (VDXR).
+        function createWebXRRuntime() {
+            const runtime = {
+                active: false,
+                supportsXR: false,
+                shouldBypassPostFx: false,
+                update() {},
+            };
+
+            if (renderer?.isWebGLRenderer !== true && !isWgl2FallbackBackendActive()) {
+                return runtime;
+            }
+            if (!('xr' in navigator)) {
+                return runtime;
+            }
+
+            try {
+                renderer.xr.enabled = true;
+                renderer.xr.setReferenceSpaceType?.('local-floor');
+                runtime.supportsXR = true;
+
+                const xrButton = XRButton.createButton(renderer, {
+                    optionalFeatures: ['local-floor', 'bounded-floor', 'hand-tracking'],
+                });
+                xrButton.style.zIndex = '100';
+                const suppressUnsupportedButton = () => {
+                    const text = String(xrButton.textContent || xrButton.innerText || '').trim().toUpperCase();
+                    if (/XR NOT SUPPORTED|XR NOT ALLOWED|WEBXR NOT AVAILABLE|WEBXR NEEDS HTTPS/.test(text)) {
+                        xrButtonObserver.disconnect();
+                        xrButton.remove();
+                        runtime.supportsXR = false;
+                    }
+                };
+                const xrButtonObserver = new MutationObserver(suppressUnsupportedButton);
+                xrButtonObserver.observe(xrButton, { childList: true, characterData: true, subtree: true });
+                setTimeout(suppressUnsupportedButton, 500);
+                setTimeout(suppressUnsupportedButton, 2000);
+                // Keep three.js's button (it owns support detection + session
+                // request) but hide it — the viewport menu's "Enter VR" button
+                // proxies clicks to it and mirrors its state.
+                xrButton.style.display = 'none';
+                document.body.appendChild(xrButton);
+                runtime.xrButton = xrButton;
+
+                const xrOrigin = new THREE.Group();
+                xrOrigin.name = '__maxjs_xr_origin__';
+                xrOrigin.visible = false;
+                scene.add(xrOrigin);
+
+                const controllerModelFactory = new XRControllerModelFactory();
+                const pointerGeometry = new THREE.BufferGeometry();
+                pointerGeometry.setAttribute('position', new THREE.Float32BufferAttribute([0, 0, 0, 0, 0, -1], 3));
+                const controllerStates = [];
+                const savedCameraState = {
+                    position: new THREE.Vector3(),
+                    quaternion: new THREE.Quaternion(),
+                    up: new THREE.Vector3(),
+                    target: new THREE.Vector3(),
+                    hasValue: false,
+                };
+                const moveForward = new THREE.Vector3();
+                const moveRight = new THREE.Vector3();
+                const moveDelta = new THREE.Vector3();
+                const worldUp = new THREE.Vector3(0, 1, 0);
+                const focusBounds = new THREE.Box3();
+                const focusCenter = new THREE.Vector3();
+
+                const inputDeadzone = 0.16;
+                const moveSpeed = 180;
+                const verticalSpeed = 120;
+                const snapTurnAngle = THREE.MathUtils.degToRad(30);
+                const snapTurnThreshold = 0.72;
+                const snapTurnReset = 0.28;
+
+                function applyDeadzone(value, deadzone = inputDeadzone) {
+                    if (!Number.isFinite(value) || Math.abs(value) <= deadzone) return 0;
+                    return ((Math.abs(value) - deadzone) / (1 - deadzone)) * Math.sign(value);
+                }
+
+                function readPrimaryStick(inputSource) {
+                    const axes = inputSource?.gamepad?.axes;
+                    if (!axes?.length) return { x: 0, y: 0 };
+
+                    let bestX = 0;
+                    let bestY = 0;
+                    let bestStrength = 0;
+                    const pairCount = Math.floor(axes.length / 2);
+                    for (let i = 0; i < pairCount; i++) {
+                        const x = applyDeadzone(axes[i * 2] ?? 0);
+                        const y = applyDeadzone(axes[i * 2 + 1] ?? 0);
+                        const strength = x * x + y * y;
+                        if (strength > bestStrength) {
+                            bestStrength = strength;
+                            bestX = x;
+                            bestY = y;
+                        }
+                    }
+                    return { x: bestX, y: bestY };
+                }
+
+                function isButtonPressed(inputSource, index) {
+                    return !!inputSource?.gamepad?.buttons?.[index]?.pressed;
+                }
+
+                function setControllerInputSource(state, inputSource) {
+                    if (state.inputSource === inputSource) return;
+                    state.inputSource = inputSource ?? null;
+                    const visible = !!state.inputSource;
+                    state.controller.visible = visible;
+                    state.grip.visible = visible;
+                    if (!visible) state.turnReady = true;
+                }
+
+                function syncControllerInputSources() {
+                    const session = renderer.xr?.getSession?.();
+                    const inputSources = Array.from(session?.inputSources ?? [])
+                        .filter(source => !!source && (!!source.gamepad || source.targetRayMode === 'tracked-pointer'))
+                        .sort((a, b) => {
+                            const rank = (source) => {
+                                switch (source?.handedness) {
+                                    case 'left': return 0;
+                                    case 'right': return 1;
+                                    default: return 2;
+                                }
+                            };
+                            return rank(a) - rank(b);
+                        });
+
+                    for (let i = 0; i < controllerStates.length; i++) {
+                        setControllerInputSource(controllerStates[i], inputSources[i] ?? null);
+                    }
+                }
+
+                function getControllerState(handedness, fallbackIndex = -1) {
+                    for (const state of controllerStates) {
+                        if (state.inputSource?.handedness === handedness) return state;
+                    }
+                    if (fallbackIndex >= 0 && controllerStates[fallbackIndex]?.inputSource) {
+                        return controllerStates[fallbackIndex];
+                    }
+                    return controllerStates.find(state => !!state.inputSource) ?? null;
+                }
+
+                function recenterOrigin() {
+                    const box = computeVisibleSceneBounds(focusBounds);
+                    if (box.isEmpty()) {
+                        xrOrigin.position.set(0, 0, 0);
+                        xrOrigin.rotation.set(0, 0, 0);
+                        return;
+                    }
+
+                    box.getCenter(focusCenter);
+                    xrOrigin.position.copy(focusCenter);
+                    xrOrigin.position.y = 0;
+                    xrOrigin.rotation.set(0, 0, 0);
+                }
+
+                function captureCameraState() {
+                    savedCameraState.position.copy(camera.position);
+                    savedCameraState.quaternion.copy(camera.quaternion);
+                    savedCameraState.up.copy(camera.up);
+                    savedCameraState.target.copy(controls.target);
+                    savedCameraState.hasValue = true;
+                }
+
+                function restoreCameraState() {
+                    if (!savedCameraState.hasValue) {
+                        camera.up.set(0, 1, 0);
+                        camera.position.copy(cameraDefaultPosition);
+                        camera.lookAt(controls.target);
+                        return;
+                    }
+                    camera.position.copy(savedCameraState.position);
+                    camera.quaternion.copy(savedCameraState.quaternion);
+                    camera.up.copy(savedCameraState.up);
+                    controls.target.copy(savedCameraState.target);
+                }
+
+                function handleSessionStart() {
+                    runtime.active = true;
+                    runtime.shouldBypassPostFx = true;
+                    captureCameraState();
+                    controls.enabled = false;
+                    xrOrigin.visible = true;
+                    // Scale up for cm units (Max) vs meters (headset session)
+                    xrOrigin.scale.setScalar(100);
+                    xrOrigin.add(camera);
+                    syncControllerInputSources();
+                    recenterOrigin();
+                    perfHud.setStatus('max.js - headset session active');
+                }
+
+                function handleSessionEnd() {
+                    runtime.active = false;
+                    runtime.shouldBypassPostFx = false;
+                    scene.add(camera);
+                    xrOrigin.visible = false;
+                    xrOrigin.position.set(0, 0, 0);
+                    xrOrigin.rotation.set(0, 0, 0);
+                    xrOrigin.scale.setScalar(1);
+                    restoreCameraState();
+                    camera.updateProjectionMatrix();
+                    controls.enabled = !camLock;
+                    controls.update();
+                    perfHud.setStatus(`max.js - ${rendererBackendLabel} renderer ready`);
+                }
+
+                function updateLocomotion(dt) {
+                    if (!runtime.active) return;
+
+                    syncControllerInputSources();
+
+                    const leftState = getControllerState('left', 0);
+                    const rightState = getControllerState('right', 1);
+                    const moveState = leftState ?? rightState;
+                    const turnState = rightState && rightState !== moveState ? rightState : null;
+
+                    if (moveState?.inputSource) {
+                        const { x, y } = readPrimaryStick(moveState.inputSource);
+                        moveForward.set(0, 0, -1).applyQuaternion(xrOrigin.quaternion);
+                        moveForward.y = 0;
+                        if (moveForward.lengthSq() < 1e-6) moveForward.set(0, 0, -1);
+                        moveForward.normalize();
+                        moveRight.crossVectors(moveForward, worldUp).normalize();
+
+                        moveDelta.set(0, 0, 0);
+                        if (x) moveDelta.addScaledVector(moveRight, x * moveSpeed * dt);
+                        if (y) moveDelta.addScaledVector(moveForward, -y * moveSpeed * dt);
+                        if (moveDelta.lengthSq() > 0) xrOrigin.position.add(moveDelta);
+
+                        if (isButtonPressed(moveState.inputSource, 1)) {
+                            xrOrigin.position.y += verticalSpeed * dt;
+                        }
+                    }
+
+                    if (rightState?.inputSource && isButtonPressed(rightState.inputSource, 1)) {
+                        xrOrigin.position.y -= verticalSpeed * dt;
+                    }
+
+                    if (turnState?.inputSource) {
+                        const { x } = readPrimaryStick(turnState.inputSource);
+                        if (turnState.turnReady && Math.abs(x) >= snapTurnThreshold) {
+                            xrOrigin.rotateY(-Math.sign(x) * snapTurnAngle);
+                            turnState.turnReady = false;
+                        } else if (!turnState.turnReady && Math.abs(x) <= snapTurnReset) {
+                            turnState.turnReady = true;
+                        }
+                    }
+                }
+
+                for (let i = 0; i < 2; i++) {
+                    const controller = renderer.xr.getController(i);
+                    const grip = renderer.xr.getControllerGrip(i);
+                    const ray = new THREE.Line(pointerGeometry, new THREE.LineBasicMaterial({
+                        color: i === 0 ? 0x66d9ef : 0xffc857,
+                        transparent: true,
+                        opacity: 0.85,
+                    }));
+                    ray.name = `__maxjs_xr_ray_${i}`;
+                    ray.scale.z = 0.75;
+                    controller.visible = false;
+                    grip.visible = false;
+                    controller.add(ray);
+                    grip.add(controllerModelFactory.createControllerModel(grip));
+                    xrOrigin.add(controller);
+                    xrOrigin.add(grip);
+
+                    const state = {
+                        index: i,
+                        controller,
+                        grip,
+                        ray,
+                        inputSource: null,
+                        turnReady: true,
+                    };
+
+                    controller.addEventListener('connected', event => {
+                        state.inputSource = event.data ?? null;
+                        controller.visible = true;
+                        grip.visible = true;
+                    });
+                    controller.addEventListener('disconnected', () => {
+                        state.inputSource = null;
+                        state.turnReady = true;
+                        controller.visible = false;
+                        grip.visible = false;
+                    });
+
+                    controllerStates.push(state);
+                }
+
+                renderer.xr.addEventListener('sessionstart', handleSessionStart);
+                renderer.xr.addEventListener('sessionend', handleSessionEnd);
+                runtime.update = updateLocomotion;
+            } catch (error) {
+                console.warn('[max.js] WebXR init failed:', error);
+            }
+
+            return runtime;
+        }
+
+        const xrRuntime = !window.chrome?.webview
+            ? { active: false, shouldBypassPostFx: false, update() {} }
+            : createWebXRRuntime();
+
+        // "Enter VR" menu button: proxies the (hidden) three.js XRButton and
+        // mirrors its state. VR is hidden in the simple WebGL pipeline and only
+        // surfaced for renderer modes where we intentionally support it.
+        (function wireEnterVrButton() {
+            const vrBtn = document.getElementById('btnEnterVR');
+            if (!vrBtn) return;
+            const vrRow = vrBtn.closest('.vpmenu-row');
+            const vrLabel = vrBtn.closest('.vpmenu-row')?.querySelector('.vpmenu-label');
+            const setLabel = (text) => { if (vrLabel) vrLabel.textContent = text; };
+            function syncVrState() {
+                if (isWebGLPipelineActive()) {
+                    setViewportMenuItemHidden(vrRow, true);
+                    vrBtn.disabled = true;
+                    vrBtn.classList.add('is-gated');
+                    vrBtn.classList.remove('active');
+                    vrBtn.title = 'VR is unavailable in the WebGL/pathtracing pipeline';
+                    setLabel('VR Unavailable');
+                    return;
+                }
+                setViewportMenuItemHidden(vrRow, false);
+                const xrButton = xrRuntime?.xrButton;
+                const ready = !!xrRuntime?.supportsXR && !!xrButton && xrButton.isConnected;
+                if (!ready) {
+                    setViewportMenuItemHidden(vrRow, !isWgl2FallbackBackendActive());
+                    vrBtn.disabled = true;
+                    vrBtn.classList.add('is-gated');
+                    vrBtn.classList.remove('active');
+                    vrBtn.title = 'VR unavailable — needs a supported WebGL pipeline and a headset';
+                    setLabel('VR Unavailable');
+                    return;
+                }
+                setViewportMenuItemHidden(vrRow, false);
+                vrBtn.disabled = false;
+                vrBtn.classList.remove('is-gated');
+                const presenting = !!renderer.xr?.isPresenting
+                    || String(xrButton.textContent || '').trim().toUpperCase().includes('EXIT');
+                vrBtn.classList.toggle('active', presenting);
+                vrBtn.title = presenting ? 'Exit VR' : 'Enter VR';
+                setLabel(presenting ? 'Exit VR' : 'Enter VR');
+            }
+            vrBtn.addEventListener('click', () => {
+                const xrButton = xrRuntime?.xrButton;
+                if (xrButton && !vrBtn.disabled) xrButton.click();
+            });
+            if (xrRuntime?.xrButton && typeof MutationObserver === 'function') {
+                new MutationObserver(syncVrState).observe(xrRuntime.xrButton, {
+                    childList: true, characterData: true, subtree: true,
+                });
+            }
+            renderer.xr?.addEventListener?.('sessionstart', syncVrState);
+            renderer.xr?.addEventListener?.('sessionend', syncVrState);
+            // Initial + after three.js resolves async support detection.
+            syncVrState();
+            setTimeout(syncVrState, 600);
+            setTimeout(syncVrState, 2100);
+        })();
+
+        let lastPostFxPanelSyncMs = 0;
+
+        function renderViewerFrame() {
+            if (webglBasicFx.isAvailable?.()) {
+                webglBasicFx.render(() => renderer.render(scene, camera));
+                maxjsFx.afterExternalRender?.();
+                return;
+            }
+            maxjsFx.render();
+        }
+
+        function renderFrame(frameTimeMs = performance.now()) {
+            flushMaterialDisposals();
+            if (renderToImageActive && !pendingRenderToImage) return;
+            const manualFpsCap = Number.isFinite(performanceSettings.fpsCap) ? performanceSettings.fpsCap : 0;
+            if (!renderer.xr?.isPresenting && manualFpsCap > 0) {
+                const minFrameMs = 1000 / manualFpsCap;
+                if (lastRenderTimestamp !== 0 && (frameTimeMs - lastRenderTimestamp) < minFrameMs) return;
+            }
+            lastRenderTimestamp = frameTimeMs;
+            inlineTimer.update(frameTimeMs);
+            const liveFrameDt = inlineClock.getDelta();
+            const liveFrameElapsed = inlineClock.getElapsed();
+            const captureFrameTime = renderToImageActive
+                && pendingRenderToImage
+                && Number.isFinite(pendingRenderToImage.renderTimeSeconds)
+                ? pendingRenderToImage.renderTimeSeconds
+                : null;
+            const frameDt = captureFrameTime == null ? liveFrameDt : 0;
+            const frameElapsed = captureFrameTime ?? liveFrameElapsed;
+            updateSkyTime(frameElapsed);
+            xrRuntime.update(frameDt);
+            if (!xrRuntime.active) syncOrbitNavigationFeel();
+            let controlsChanged = false;
+            if (!xrRuntime.active && !(animationSystem?.isDrivingSceneCamera?.())) {
+                controlsChanged = controls.update() === true;
+            }
+            if (controlsChanged) {
+                scheduleGiVolumeFromCurrentScene({
+                    delay: GI_VOLUME_CAMERA_DEBOUNCE_MS,
+                    refresh: false,
+                    reason: 'controls',
+                });
+            }
+            // Auto-update DOF focus distance from camera-to-target when enabled.
+            // Physical Camera DOF owns focus/bokeh while the camera packet is active.
+            if (!xrRuntime.active && !physicalCameraDofActive) {
+                maxjsFx.updateDofFocusFromCamera(camera.position.distanceTo(controls.target));
+            }
+            syncPathTracingDofFromPostFx();
+            // Default key light follows camera
+            if (defaultLights.visible) {
+                defaultKey.position.copy(getActiveCameraWorldPosition(cameraPositionWorld));
+            }
+            updateVolumeUniforms();
+            lightLinking.updateCameraConstraints();
+            if (lightHelpersVisible) updateLightHelpers();
+            layerManager.update(frameDt, frameElapsed);
+            if (captureFrameTime == null) {
+                animationSystem?.update(frameDt);
+            } else {
+                animationSystem?.seekAllClips?.(captureFrameTime);
+            }
+            audioSystem?.update();
+            if (captureFrameTime == null) {
+                gltfSystem?.update?.(frameDt);
+            } else {
+                gltfSystem?.setTime?.(captureFrameTime);
+            }
+
+            const perfHudActive = perfHud.isDebugEnabled?.() ?? false;
+            if (perfHudActive) perfHud.updateLayers(layerManager.getStats());
+            maxjsFx.applySharedSceneEffects?.();
+            removeWebGPUIncompatibleSceneMaterials();
+            const renderStart = performance.now();
+            // Last-mile render-only camera offsets (handheld shake, etc.).
+            // Applied after layer.update + camera sync so they survive until
+            // draw, restored after draw so authored state is what the rest of
+            // the system sees between frames.
+            layerManager.beforeRender?.(frameElapsed);
+            // Depth-occluded web panels: pick punch mode for this frame.
+            // Pipeline active → analytic mask (occluder meshes hidden);
+            // direct render → occluder meshes punch natively. Canvas-readback
+            // captures suppress punching (no alpha holes in output); composited
+            // captures keep it — the DOM behind the holes IS in the output.
+            webappSystem?.setPunchSuppressed?.(
+                renderToImageActive === true && !renderCaptureComposited);
+            webappSystem?.setPunchPipelineActive?.(maxjsFx.isPipelineRenderActive?.() === true);
+            try {
+                if (isPathTracingViewActive() && (!renderToImageActive || pendingRenderToImage?.pathTracing)) {
+                    // Pathtracing is a live-viewer-only renderer mode. The live
+                    // frame routes through renderPathTracingLiveFrame() so the
+                    // color-domain / stylized post FX fold over the PT beauty; PT
+                    // still never participates in snapshots.
+                    // Claim warmup frames with the PT controller instead of
+                    // rasterizing the scene through legacy WebGL; synced
+                    // scenes can contain TSL/Node materials that the legacy
+                    // renderer cannot draw.
+                    if (renderToImageActive && pendingRenderToImage?.pathTracing) {
+                        if (pendingRenderToImage.pathTracingStarted) {
+                            pathTracingFx.start?.();
+                            syncPathTracingDofFromPostFx();
+                            if (!pathTracingFx.render?.()) renderPathTracingFallbackFrame();
+                        } else {
+                            renderPathTracingFallbackFrame();
+                        }
+                    } else if (!canStartPathTracingNow()) {
+                        renderPathTracingFallbackFrame();
+                        if (bridgeHasInitialSync()) pathTracingRasterWarmupFrames += 1;
+                    } else {
+                        pathTracingFx.start?.();
+                        // Route the live PT frame through the post stack so the
+                        // color-domain / stylized post FX (bloom, pixel, retro,
+                        // PowerShot, Shader Lab) fold over the path-traced beauty.
+                        // With no post FX enabled it blits straight to the canvas,
+                        // and it owns its own fallback if the trace render fails.
+                        renderPathTracingLiveFrame();
+                    }
+                } else if (asciiActive && asciiEffect) {
+                    asciiEffect.render(scene, camera);
+                } else if (xrRuntime.shouldBypassPostFx) {
+                    // Reduce brightness for headset sessions (no post-fx tone mapping)
+                    const savedExposure = renderer.toneMappingExposure;
+                    const xrLightScale = 0.1;
+                    renderer.toneMappingExposure = savedExposure * 0.15;
+                    // Scale down lights temporarily
+                    scene.traverse(obj => {
+                        if (obj.isLight && obj.intensity !== undefined) {
+                            obj.userData._xrSavedIntensity = obj.intensity;
+                            obj.intensity *= xrLightScale;
+                        }
+                    });
+                    renderer.render(scene, camera);
+                    // Restore
+                    renderer.toneMappingExposure = savedExposure;
+                    scene.traverse(obj => {
+                        if (obj.isLight && obj.userData._xrSavedIntensity !== undefined) {
+                            obj.intensity = obj.userData._xrSavedIntensity;
+                            delete obj.userData._xrSavedIntensity;
+                        }
+                    });
+                } else {
+                    renderViewerFrame();
+                }
+            } catch (error) {
+                reportBridgeError('runtime error', error);
+            } finally {
+                layerManager.afterRender?.(frameElapsed);
+            }
+            // Idle GI: keep probe rebuilds out of camera/playback/sync churn.
+            // Existing probes stay visible as history; after idle, the GPU solve
+            // blends new C++/viewer data into the same volume.
+            if (!renderToImageActive) {
+                updateGiVolumeIdleWork();
+                syncGiVolumeActive();
+                // HALO-GI probe field tick — every frame (the field idle-gates and
+                // budget-throttles itself); no-op unless enabled; never recompiles
+                // materials. ONLY camera movement marks interaction — matching the
+                // speedball standalone. Delta-sync must NOT mark it: Max edits
+                // stream serials at 30-60 Hz, which starved the 200 ms idle gate
+                // and deferred every light/geo pickup until the drag ended
+                // ("delayed" GI). The field handles live edits itself — cheap
+                // in-place light refresh + settle-debounced geometry rebuild
+                // (24-tick checks × 2 stable) that can never land mid-drag.
+                const haloNowMs = performance.now();
+                if (controlsChanged) haloGiLastInteractionMs = haloNowMs;
+                haloGi?.tick(haloNowMs);
+                // White Phosphor × trace view = TRUE-NIR: flip the tracer's λ
+                // domain to photocathode flux automatically. setRenderMode
+                // no-ops when unchanged, so the per-frame call is free — and
+                // it catches every state path (panel, restore, console).
+                pathTracingFx?.setRenderMode?.(
+                    isPathTracingMode
+                        && maxjsFx.isPowerShotEnabled?.()
+                        && maxjsFx.getPowerShotOptions?.()?.mode === 'infrared'
+                        ? 'nv' : 'visible');
+                updateProbeHelpers();
+            }
+            css3dOverlay.tick(scene, camera);
+            css3dOverlay.tickBehind(webappSystem?.getBehindScene?.(), camera);
+            // Clone blob overlay — draw bounding rects on 2D canvas
+            if (maxjsFx.isCloneEnabled() && !renderToImageActive) {
+                maxjsFx.drawBlobOverlay(blobOverlayCtx, blobOverlayCvs.width, blobOverlayCvs.height);
+            } else if (blobOverlayCtx) {
+                blobOverlayCtx.clearRect(0, 0, blobOverlayCvs.width, blobOverlayCvs.height);
+            }
+            if (splatOverlay && splatHandleMap.size > 0) {
+                updateSplatCamera();
+                splatOverlay.renderer.render(splatOverlay.scene, splatOverlay.camera);
+            }
+            if (renderToImageActive && pendingRenderToImage) {
+                const nowMs = performance.now();
+                const syncReady = latestAppliedSyncSerial > pendingRenderToImage.observedSyncSerial;
+                const settledEnough = nowMs >= (pendingRenderToImage.startedAtMs + pendingRenderToImage.warmupMs);
+                if (
+                    pendingRenderToImage.pathTracing
+                    && !pendingRenderToImage.pathTracingStarted
+                    && syncReady
+                    && settledEnough
+                ) {
+                    if (pendingRenderToImage.textureWaitStartedAt <= 0) {
+                        pendingRenderToImage.textureWaitStartedAt = nowMs;
+                    }
+                    const texturesReady = pendingTextureLoads <= 0;
+                    const textureWaitExpired = nowMs >= (
+                        pendingRenderToImage.textureWaitStartedAt + pendingRenderToImage.textureWaitMs
+                    );
+                    if (texturesReady || textureWaitExpired) {
+                        pendingRenderToImage.pathTracingStarted = true;
+                        pathTracingFx.start?.();
+                        pathTracingFx.markSceneDirty?.();
+                    }
+                }
+                const pathTracingReady = !pendingRenderToImage.pathTracing
+                    || (
+                        pendingRenderToImage.pathTracingStarted
+                        && pathTracingFx.isCaptureReady?.(pendingRenderToImage.pathTracingMinSamples) === true
+                    );
+                const timedOut = nowMs >= pendingRenderToImage.syncDeadlineMs;
+                if (timedOut && pendingRenderToImage.pathTracing && !pathTracingReady) {
+                    const sampleCount = Math.floor(pathTracingFx.getSampleCount?.() ?? 0);
+                    perfHud.setStatus(
+                        `max.js - PT accumulating ${sampleCount}/${pendingRenderToImage.pathTracingMinSamples}`,
+                    );
+                    pendingRenderToImage.syncDeadlineMs = nowMs + 30000;
+                }
+                if ((syncReady && settledEnough && pathTracingReady) || (!pendingRenderToImage.pathTracing && timedOut)) {
+                    const capture = pendingRenderToImage;
+                    const renderTimeSeconds = capture.renderTimeSeconds;
+                    pendingRenderToImage = null;
+                    requestAnimationFrame(() => {
+                        renderToImageForcePathTracing = capture.pathTracing === true;
+                        try {
+                            renderCurrentFrameOnce(renderTimeSeconds);
+                        } finally {
+                            renderToImageForcePathTracing = false;
+                        }
+                        if (capture.composited) {
+                            // C++ captures the WebView composite (CapturePreview)
+                            // on receipt — DOM panels + canvas as displayed. One
+                            // extra frame lets the compositor present the final
+                            // CSS3D state before the grab.
+                            requestAnimationFrame(() => {
+                                bridge.send(capture.responseType, { composited: true });
+                            });
+                        } else {
+                            // Both paths read the canvas back to C++. The Max-bitmap
+                            // path (render_to_image_ready) needs the pixels too — its
+                            // alpha channel only survives from the canvas, not from
+                            // WebView2 CapturePreview.
+                            void sendCurrentCanvasRenderFile(capture);
+                        }
+                    });
+                }
+            }
+            if (postPanelVisible || (debugMode && buildMode !== 'release')) {
+                if ((frameTimeMs - lastPostFxPanelSyncMs) >= 250) {
+                    lastPostFxPanelSyncMs = frameTimeMs;
+                    syncPostFxPanel(false, { persist: false });
+                }
+            }
+            if (perfHudActive) {
+                perfHud.updateRender(performance.now() - renderStart, renderer.info?.render, renderer.info?.memory);
+            }
+        }
+
+        // ── JS_Inline Layer Manager ──────────────────────────
+        const inlineTimer = new THREE.Timer();
+        inlineTimer.connect?.(document);
+        const inlineClock = inlineTimer;
+        const layerManager = createLayerManager({
+            scene,
+            camera,
+            renderer,
+            THREE,
+            nodeMap,
+            lightHandleMap,
+            maxRoot,
+            jsRoot,
+            overlayRoot,
+            space: sceneSpace,
+            controls,
+            getCamera: () => camera,
+            getCameraTarget: (target) => target?.copy(cameraTargetWorld) ?? cameraTargetWorld.clone(),
+            getSceneCameras: () => knownSceneCameras,
+            onCameraModeChange: applyLayerCameraMode,
+            getGLTFSystem: () => gltfSystem,
+            getAnimationSystem: () => animationSystem,
+            getAudioSystem: () => audioSystem,
+            debugLog: maxjsDebugLog,
+            debugWarn: maxjsDebugWarn,
+            onRuntimeSceneChanged: () => {
+                maxjsFx.markSceneChanged?.();
+                markLightProbeSceneDirty();
+                scheduleLightProbeFromCurrentScene({ delay: 350 });
+                schedulePathTracingLiveRebuild();
+            },
+        });
+        jsmodVisibilityOwnedByLayer = (handle) => layerManager.hasRuntimeVisibilityOverride(handle);
+        animationSystem = createMaxJSAnimationSystem({
+            THREE,
+            nodeMap,
+            lightHandleMap,
+            getCamera: () => camera,
+            getControls: () => controls,
+            getJsRoot: () => jsRoot,
+            getOverlayRoot: () => overlayRoot,
+            getViewportAspect: () => getCameraProjectionAspect(),
+            buildGeometry,
+            applyMaterialScalar,
+        });
+        audioSystem = createMaxJSAudioSystem({
+            THREE,
+            parent: maxBasisRoot,
+            getActiveCamera: () => renderer.xr?.isPresenting ? renderer.xr.getCamera(camera) : camera,
+        });
+        setAudioMuted(audioMuted, { persist: false });
+        gltfSystem = createMaxJSGLTFSystem({
+            THREE,
+            parent: maxBasisRoot,
+            getBus: () => layerManager?.getBus?.(),
+            debugWarn: maxjsDebugWarn,
+        });
+        layerManager.subscribe?.(() => {
+            animationSystem.invalidateTargets();
+            // Layer mutations can add/remove meshes — cheap scene refresh.
+            maxjsFx.markSceneChanged?.();
+            markLightProbeSceneDirty();
+            scheduleLightProbeFromCurrentScene({ delay: 350 });
+            schedulePathTracingLiveRebuild();
+        });
+        const projectRuntime = window.chrome?.webview
+            ? createProjectRuntime({ layerManager, bridge, perfHud, debugLog: maxjsDebugLog, debugWarn: maxjsDebugWarn })
+            : null;
+        if (projectRuntime) {
+            layerManager.bindProjectRuntime(projectRuntime);
+        }
+        webappSystem = createMaxJSWebAppSystem({
+            THREE,
+            parent: maxBasisRoot,
+            getProjectBaseUrl: () => projectRuntime?.getState?.().projectRootUrl || '',
+            onPunchRectsChanged: (rects) => maxjsFx.setWebPanelPunchRects?.(rects),
+        });
+        webappSystem.subscribe(() => queueWebPanelsRefresh());
+        window.maxJS.webapps = webappSystem;
+        window.maxJSProjectRuntime = projectRuntime;
+        window.maxJS.layers = layerManager;
+        window.maxJS.animation = animationSystem;
+        window.maxJS.time = maxTimeline;
+        window.maxJS.audio = audioSystem;
+        window.maxJS.gltf = gltfSystem;
+        _layerManagerRef = layerManager;
+        _projectRuntimeRef = projectRuntime;
+        attachLayerPanelSubscriptions();
+        queueLayersPanelRefresh();
+
+
+        // ── Render to Image (production render) ──────────────
+        let savedPerformanceSettings = null;
+        let savedRenderToImageState = null;
+
+        function getCss3dMaskRoots() {
+            return [
+                document.getElementById('maxjs-css3d-root'),
+                document.getElementById('maxjs-css3d-behind-root'),
+            ].filter(Boolean);
+        }
+
+        function getCss3dMaskHosts() {
+            return getCss3dMaskRoots().flatMap(root => (
+                Array.from(root.querySelectorAll('iframe, .maxjs-webapp-div-host'))
+            ));
+        }
+
+        function cleanupCss3dMaskDomLeaks() {
+            const leaked = Array.from(document.querySelectorAll('.maxjs-css3d-mask-overlay'));
+            if (leaked.length > 0) {
+                for (const el of leaked) {
+                    const prev = el.previousElementSibling;
+                    if (prev?.matches?.('iframe, .maxjs-webapp-div-host') && prev.style.visibility === 'hidden') {
+                        prev.style.visibility = '';
+                    }
+                    try { el.remove(); } catch {}
+                }
+            }
+            try { document.getElementById('maxjs-css3d-mask-style')?.remove(); } catch {}
+        }
+
+        function css3dMaskOutputSize(msg = null) {
+            const width = Math.max(1, Math.floor(
+                Number(msg?.width) || renderer.domElement?.width || innerWidth || 1
+            ));
+            const height = Math.max(1, Math.floor(
+                Number(msg?.height) || renderer.domElement?.height || innerHeight || 1
+            ));
+            return { width, height };
+        }
+
+        function isCss3dMaskHostVisible(host) {
+            if (!host?.isConnected) return false;
+            const style = getComputedStyle(host);
+            if (style.display === 'none' || style.visibility === 'hidden') return false;
+            if ((Number(style.opacity) || 0) <= 0) return false;
+            const rect = host.getBoundingClientRect();
+            return rect.width > 0.5 && rect.height > 0.5;
+        }
+
+        function getCss3dMaskHostQuad(host, width, height) {
+            const scaleX = width / Math.max(1, innerWidth || width);
+            const scaleY = height / Math.max(1, innerHeight || height);
+            try {
+                const quad = host.getBoxQuads?.()[0];
+                if (quad) {
+                    return [quad.p1, quad.p2, quad.p3, quad.p4].map(p => ({
+                        x: p.x * scaleX,
+                        y: p.y * scaleY,
+                    }));
+                }
+            } catch {}
+            const r = host.getBoundingClientRect();
+            return [
+                { x: r.left * scaleX, y: r.top * scaleY },
+                { x: r.right * scaleX, y: r.top * scaleY },
+                { x: r.right * scaleX, y: r.bottom * scaleY },
+                { x: r.left * scaleX, y: r.bottom * scaleY },
+            ];
+        }
+
+        function drawCss3dMaskQuad(ctx, points) {
+            if (!points || points.length < 3) return;
+            ctx.beginPath();
+            ctx.moveTo(points[0].x, points[0].y);
+            for (let i = 1; i < points.length; i++) ctx.lineTo(points[i].x, points[i].y);
+            ctx.closePath();
+            ctx.fill();
+        }
+
+        function collectCss3dMaskQuads(width, height) {
+            const quads = [];
+            for (const host of getCss3dMaskHosts()) {
+                if (!isCss3dMaskHostVisible(host)) continue;
+                quads.push({
+                    behind: !!host.closest('#maxjs-css3d-behind-root'),
+                    points: getCss3dMaskHostQuad(host, width, height),
+                });
+            }
+            return quads;
+        }
+
+        function renderCss3dMaskFrame(msg = null) {
+            const frameNumber = Number.isFinite(msg?.frame) ? msg.frame : 0;
+            const fps = Number.isFinite(msg?.fps) && msg.fps > 0 ? msg.fps : 30;
+            const renderTimeSeconds = frameNumber / fps;
+            cleanupCss3dMaskDomLeaks();
+            renderCaptureComposited = true;
+            webappSystem?.setPunchSuppressed?.(false);
+            webappSystem?.setPunchPipelineActive?.(maxjsFx.isPipelineRenderActive?.() === true);
+            renderCurrentFrameOnce(renderTimeSeconds);
+            css3dOverlay.tick(scene, camera);
+            css3dOverlay.tickBehind(webappSystem?.getBehindScene?.(), camera);
+        }
+
+        async function sendCss3dMaskPng(msg = null) {
+            const { width, height } = css3dMaskOutputSize(msg);
+            const quads = collectCss3dMaskQuads(width, height);
+            const out = document.createElement('canvas');
+            out.width = width;
+            out.height = height;
+            const outCtx = out.getContext('2d', { willReadFrequently: true });
+            outCtx.fillStyle = '#000';
+            outCtx.fillRect(0, 0, width, height);
+
+            const behind = quads.filter(q => q.behind);
+            const front = quads.filter(q => !q.behind);
+            if (behind.length > 0) {
+                const behindCanvas = document.createElement('canvas');
+                behindCanvas.width = width;
+                behindCanvas.height = height;
+                const behindCtx = behindCanvas.getContext('2d', { willReadFrequently: true });
+                behindCtx.fillStyle = '#fff';
+                for (const q of behind) drawCss3dMaskQuad(behindCtx, q.points);
+
+                const sceneAlphaCanvas = document.createElement('canvas');
+                sceneAlphaCanvas.width = width;
+                sceneAlphaCanvas.height = height;
+                const sceneAlphaCtx = sceneAlphaCanvas.getContext('2d', { willReadFrequently: true });
+                sceneAlphaCtx.drawImage(renderer.domElement, 0, 0, width, height);
+
+                const behindData = behindCtx.getImageData(0, 0, width, height);
+                const alphaData = sceneAlphaCtx.getImageData(0, 0, width, height);
+                const outData = outCtx.getImageData(0, 0, width, height);
+                for (let i = 0; i < outData.data.length; i += 4) {
+                    if (behindData.data[i + 3] === 0) continue;
+                    const visible = 255 - alphaData.data[i + 3];
+                    if (visible <= 0) continue;
+                    outData.data[i + 0] = visible;
+                    outData.data[i + 1] = visible;
+                    outData.data[i + 2] = visible;
+                    outData.data[i + 3] = 255;
+                }
+                outCtx.putImageData(outData, 0, 0);
+            }
+
+            outCtx.fillStyle = '#fff';
+            for (const q of front) drawCss3dMaskQuad(outCtx, q.points);
+
+            const blob = await canvasToBlob(out, 'image/png');
+            if (!blob) throw new Error('CSS3D mask export failed');
+            const dataUrl = await readBlobAsDataUrl(blob);
+            const comma = dataUrl.indexOf(',');
+            if (comma < 0) throw new Error('CSS3D mask payload missing data URL header');
+            bridge.send('render_css3d_mask_ready', {
+                imageBase64: dataUrl.slice(comma + 1),
+                mime: 'image/png',
+                width,
+                height,
+            });
+        }
+
+        function renderCurrentFrameOnce(renderTimeSeconds = null) {
+            if (!xrRuntime.active) controls.update();
+            if (!xrRuntime.active && !physicalCameraDofActive) {
+                maxjsFx.updateDofFocusFromCamera(camera.position.distanceTo(controls.target));
+            }
+            syncPathTracingDofFromPostFx();
+            if (defaultLights.visible) {
+                defaultKey.position.copy(getActiveCameraWorldPosition(cameraPositionWorld));
+            }
+            updateVolumeUniforms();
+            const effectiveElapsed = Number.isFinite(renderTimeSeconds)
+                ? renderTimeSeconds
+                : inlineClock.getElapsed();
+            layerManager.update(0, effectiveElapsed);
+            if (Number.isFinite(renderTimeSeconds)) {
+                animationSystem?.seekAllClips?.(renderTimeSeconds);
+                gltfSystem?.setTime?.(renderTimeSeconds);
+            } else {
+                animationSystem?.update(0);
+            }
+
+            try {
+                if ((isPathTracingViewActive() || renderToImageForcePathTracing) && (!renderToImageActive || renderToImageForcePathTracing)) {
+                    renderPathTracingLiveFrame();
+                } else if (webglBasicFx.isAvailable?.() || maxjsFx.hasEnabledEffects()) {
+                    renderViewerFrame();
+                } else {
+                    renderer.render(scene, camera);
+                }
+            } catch (error) {
+                reportBridgeError('runtime error', error);
+            }
+            if (splatOverlay && splatHandleMap.size > 0) {
+                updateSplatCamera();
+                splatOverlay.renderer.render(splatOverlay.scene, splatOverlay.camera);
+            }
+        }
+
+        function beginRenderImageFrame(msg, responseType) {
+            const w = msg.width || innerWidth;
+            const h = msg.height || innerHeight;
+            const frameNumber = Number.isFinite(msg.frame) ? msg.frame : 0;
+            const fps = Number.isFinite(msg.fps) && msg.fps > 0 ? msg.fps : 30;
+            const warmupMs = Number.isFinite(msg.warmupMs) ? Math.max(0, msg.warmupMs) : 250;
+            const isSequenceFrame = responseType === 'render_sequence_frame_file';
+            const captureMime = typeof msg.mime === 'string' && msg.mime ? msg.mime : 'image/png';
+            // Composited capture: C++ grabs the WebView composite (CapturePreview)
+            // so CSS3D web panels appear in the output. DOM panel roots stay
+            // visible, punch stays active, and JS skips the canvas readback.
+            const compositedCapture = msg.composited === true;
+            renderCaptureComposited = compositedCapture;
+            const wantsAlpha = !compositedCapture && msg.alpha === true && mimeSupportsAlpha(captureMime);
+            const usePathTracing = isPathTracingViewActive();
+            const ptMinSamples = Number.isFinite(msg.pathTracingSamples)
+                ? Math.max(1, Math.floor(msg.pathTracingSamples))
+                : Math.max(PATH_TRACING_CAPTURE_DEFAULT_SAMPLES, pathTracingSettings.samplesPerFrame);
+            const wasAlreadyActive = renderToImageActive === true;
+            renderToImageActive = true;
+            pendingRenderToImage = {
+                observedSyncSerial: latestAppliedSyncSerial,
+                renderTimeSeconds: frameNumber / fps,
+                width: w,
+                height: h,
+                warmupMs,
+                responseType,
+                mime: captureMime,
+                alpha: wantsAlpha,
+                composited: compositedCapture,
+                pathTracing: usePathTracing,
+                pathTracingMinSamples: usePathTracing ? ptMinSamples : 1,
+                startedAtMs: performance.now(),
+                textureWaitStartedAt: 0,
+                textureWaitMs: usePathTracing ? PATH_TRACING_TEXTURE_WAIT_MS : 0,
+                pathTracingStarted: false,
+                syncDeadlineMs: performance.now() + (
+                    usePathTracing
+                        ? Math.max(30000, Math.min(600000, ptMinSamples * 1000))
+                        : 10000
+                ),
+            };
+
+            // Hide all UI — keep only canvas elements visible. Composited
+            // capture also keeps the CSS3D panel roots: those pixels ARE the
+            // content being rendered.
+            if (!wasAlreadyActive) {
+                for (const el of document.body.children) {
+                    if (el.tagName === 'CANVAS' || el.tagName === 'SCRIPT') continue;
+                    if (compositedCapture && (el.id === 'maxjs-css3d-root' || el.id === 'maxjs-css3d-behind-root')) continue;
+                    el._rtiPrevDisplay = el.style.display;
+                    el.style.display = 'none';
+                }
+                const captureBackdropColor = !wantsAlpha && envVisible && !getEnvironmentBackgroundMap()
+                    ? `#${hiddenBackgroundColor.toString(16).padStart(6, '0')}`
+                    : 'transparent';
+                // Composited capture is WYSIWYG — keep the live viewport
+                // background instead of the capture backdrop override.
+                if (!compositedCapture) document.body.style.background = captureBackdropColor;
+
+                // Save and bypass all performance throttling
+                savedPerformanceSettings = { ...performanceSettings };
+                performanceSettings.renderScale = 1.0;
+                performanceSettings.postFxScale = 1.0;
+                performanceSettings.fpsCap = 0;
+
+                savedRenderToImageState = {
+                    envVisible,
+                    localHdriShowBg,
+                    playbackState: animationSystem?.capturePlaybackState?.() ?? null,
+                    rendererClearColor: (() => {
+                        const color = new THREE.Color();
+                        try { renderer.getClearColor?.(color); } catch {}
+                        return color;
+                    })(),
+                    rendererClearAlpha: typeof renderer.getClearAlpha === 'function'
+                        ? renderer.getClearAlpha()
+                        : null,
+                };
+            }
+
+            try {
+                renderer.setClearColor?.(
+                    wantsAlpha ? 0x000000 : hiddenBackgroundColor,
+                    0
+                );
+            } catch {}
+
+            // Single background decision shared by both paths (legacy + orchestrator):
+            // gated only on wantsAlpha, never on which path triggered the render.
+            if (wantsAlpha) {
+                // Transparent matte — no background fill.
+                envVisible = false;
+                localHdriShowBg = false;
+                maxjsFx.setEnvironmentVisible(false);
+                scene.background = null;
+            } else {
+                // Opaque output still renders the scene against alpha. File
+                // formats without alpha may matte later, but Bloom never sees
+                // the viewport background as source pixels.
+                maxjsFx.setEnvironmentVisible(envVisible);
+                if (isLocalHdriActive()) {
+                    localHdriShowBg = envVisible;
+                    applyLocalHDRIToScene();
+                } else {
+                    scene.background = envVisible && scene.environment
+                        ? scene.environment
+                        : null;
+                }
+            }
+            if (pendingRenderToImage.pathTracing) {
+                resetPathTracingStartupWarmup();
+                pathTracingFx.setCaptureMode?.(true);
+                pathTracingFx.markSceneDirty?.();
+            } else {
+                pathTracingFx.setCaptureMode?.(false);
+            }
+
+            if (frameNumber >= 0) {
+                animationSystem?.seekAllClips?.(frameNumber / fps);
+            }
+
+            // Set renderer to exact requested resolution, pixel ratio 1:1
+            renderer.setPixelRatio(1);
+            renderer.setSize(w, h);
+            const captureRect = { x: 0, y: 0, width: w, height: h, aspect: w / h };
+            applyFrameElementStyle(renderer.domElement, captureRect);
+            if (camera.isPerspectiveCamera) {
+                camera.aspect = w / h;
+            } else {
+                const viewWidth = Math.max(0.001, camera.right - camera.left);
+                const aspect = w / h;
+                camera.left = -viewWidth / 2;
+                camera.right = viewWidth / 2;
+                camera.top = viewWidth / (2 * aspect);
+                camera.bottom = -viewWidth / (2 * aspect);
+            }
+            camera.updateProjectionMatrix();
+            maxjsFx.resize();
+            webglBasicFx.resize?.();
+            if (splatOverlay?.renderer) {
+                splatOverlay.renderer.setPixelRatio(1);
+                splatOverlay.renderer.setSize(w, h, false);
+                applyFrameElementStyle(splatOverlay.renderer.domElement, captureRect);
+            }
+            css3dOverlay.setSize(w, h);
+            css3dOverlay.setViewportRect(captureRect);
+
+            try {
+                // Wait for the fresh synced frame to land; renderFrame will perform the one-shot render.
+            } catch (error) {
+                console.warn(`[max.js ${isSequenceFrame ? 'render_sequence_frame' : 'render_to_image'}] render failed`, error);
+                if (responseType === 'render_to_image_ready') {
+                    bridge.send('render_to_image_ready');
+                } else {
+                    bridge.send(responseType, { error: error?.message || String(error) });
+                }
+            }
+        }
+
+        function finishRenderImageFrame() {
+            renderToImageActive = false;
+            pendingRenderToImage = null;
+            renderToImageForcePathTracing = false;
+            renderCaptureComposited = false;
+            pathTracingFx.setCaptureMode?.(false);
+
+            // Restore all UI elements
+            for (const el of document.body.children) {
+                if ('_rtiPrevDisplay' in el) {
+                    el.style.display = el._rtiPrevDisplay;
+                    delete el._rtiPrevDisplay;
+                }
+            }
+            document.body.style.background = '';
+
+            // Restore performance settings and viewport size
+            if (savedPerformanceSettings) {
+                Object.assign(performanceSettings, savedPerformanceSettings);
+                savedPerformanceSettings = null;
+            }
+            if (savedRenderToImageState) {
+                envVisible = savedRenderToImageState.envVisible;
+                localHdriShowBg = savedRenderToImageState.localHdriShowBg;
+                animationSystem?.restorePlaybackState?.(savedRenderToImageState.playbackState);
+                try {
+                    if (savedRenderToImageState.rendererClearColor) {
+                        renderer.setClearColor?.(
+                            savedRenderToImageState.rendererClearColor,
+                            savedRenderToImageState.rendererClearAlpha ?? 1
+                        );
+                    } else if (typeof renderer.setClearAlpha === 'function' &&
+                               Number.isFinite(savedRenderToImageState.rendererClearAlpha)) {
+                        renderer.setClearAlpha(savedRenderToImageState.rendererClearAlpha);
+                    }
+                } catch {}
+                savedRenderToImageState = null;
+                syncEnvButtonUi();
+                if (isLocalHdriActive()) {
+                    applyLocalHDRIToScene();
+                } else {
+                    syncEnvironmentDisplay();
+                }
+            }
+            applyRendererPerformanceSettings({ resizePostFx: true });
+        }
+
+        bridge.on('render_to_image', msg => beginRenderImageFrame(msg, 'render_to_image_ready'));
+        bridge.on('render_to_image_done', finishRenderImageFrame);
+        bridge.on('render_sequence_frame', msg => beginRenderImageFrame(msg, 'render_sequence_frame_file'));
+        bridge.on('render_sequence_done', finishRenderImageFrame);
+        bridge.on('render_css3d_mask_begin', msg => {
+            cleanupCss3dMaskDomLeaks();
+            renderCss3dMaskFrame(msg);
+            requestAnimationFrame(() => {
+                renderCss3dMaskFrame(msg);
+                requestAnimationFrame(() => {
+                    renderCss3dMaskFrame(msg);
+                    sendCss3dMaskPng(msg).catch(error => {
+                        bridge.send('render_css3d_mask_ready', {
+                            error: error?.message || String(error),
+                        });
+                    });
+                });
+            });
+        });
+        bridge.on('render_css3d_mask_end', cleanupCss3dMaskDomLeaks);
+
+        // ── Build mode / Standalone / Debug ──
+        // buildMode / isStandalone / urlMode are initialized near perfHud (early).
+        // three.js r185 Inspector — lazily created, gated by debug mode.
+        let threeInspector = null;
+        function placeThreeInspectorToggle() {
+            const shell = threeInspector?.domElement;
+            const toggle = shell?.querySelector?.('#profiler-toggle');
+            const miniPanel = shell?.querySelector?.('#profiler-mini-panel');
+            if (toggle) {
+                toggle.style.top = 'auto';
+                toggle.style.right = 'auto';
+                toggle.style.bottom = '15px';
+                toggle.style.left = '15px';
+            }
+            if (miniPanel) {
+                miniPanel.style.top = 'auto';
+                miniPanel.style.right = 'auto';
+                miniPanel.style.bottom = '60px';
+                miniPanel.style.left = '15px';
+            }
+        }
+        function syncInspector() {
+            if (debugMode && buildMode !== 'release') {
+                if (!threeInspector) {
+                    threeInspector = new Inspector();
+                    renderer.inspector = threeInspector;
+                    const parent = renderer.domElement.parentElement;
+                    if (parent && !threeInspector.domElement.parentElement) {
+                        parent.appendChild(threeInspector.domElement);
+                    }
+                    placeThreeInspectorToggle();
+                }
+                threeInspector.domElement.style.display = '';
+                placeThreeInspectorToggle();
+            } else if (threeInspector) {
+                threeInspector.domElement.style.display = 'none';
+            }
+        }
+
+        async function restoreInteractiveBrowserState() {
+            restorePostFxState();
+            syncPostFxPanel(true, { persist: false });
+
+            const file = await restoreStashedHdri();
+            if (file && !isLocalHdriLoaded()) loadLocalHDRIFile(file, { preserveEnabled: true, persist: false });
+        }
+
+        function applyBuildMode() {
+            const hud = document.getElementById('hud');
+            const rail = document.getElementById('viewportMenu');
+            const railHandle = document.querySelector('.rail-drag-handle');
+            const dockHandle = document.querySelector('.dock-drag-handle');
+            const info = document.getElementById('info');
+            const debugBtn = document.getElementById('btnDebug');
+            // Perf HUD + sync stats: only when not in static release mode (localStorage debug alone must not cost frames).
+            perfHud.setDebugEnabled(debugMode && buildMode !== 'release');
+            if (buildMode === 'release') {
+                hud.style.display = 'none';
+                if (rail) rail.style.display = 'none';
+                if (railHandle) railHandle.style.display = 'none';
+                if (dockHandle) dockHandle.style.display = 'none';
+                return;
+            }
+            hud.style.display = '';
+            if (rail) rail.style.display = '';
+            if (railHandle) railHandle.style.display = '';
+            if (dockHandle) dockHandle.style.display = '';
+            info.style.display = debugMode ? '' : 'none';
+            debugBtn.classList.toggle('active', debugMode);
+            syncInspector();
+        }
+
+        function setDebugMode(enabled) {
+            debugMode = enabled;
+            try { localStorage.setItem(DEBUG_STORAGE_KEY, String(debugMode)); } catch {}
+            applyBuildMode();
+        }
+
+        void restoreInteractiveBrowserState();
+
+        addEventListener('focus', () => {
+            lastRenderTimestamp = 0;
+            syncPostFxPanel(true, { persist: false });
+        });
+        addEventListener('blur', () => {
+            lastRenderTimestamp = 0;
+            syncPostFxPanel(true, { persist: false });
+        });
+        document.addEventListener('visibilitychange', () => {
+            lastRenderTimestamp = 0;
+            syncPostFxPanel(true, { persist: false });
+        });
+
+        if (buildMode !== 'release') {
+            const debugBtn = document.getElementById('btnDebug');
+            debugBtn.style.display = '';
+            debugBtn.onclick = () => setDebugMode(!debugMode);
+        }
+
+        installDockDragHide();
+
+        applyBuildMode();
+
+        renderer.setAnimationLoop(renderFrame);
+
+        startBridgeHandshake();

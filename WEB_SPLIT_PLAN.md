@@ -12,7 +12,23 @@ Status: IN PROGRESS (2026-07-07). Waves 0 and 1 are DONE:
   minimal `context.js`; `web/HOST_CONTRACT.md` written (web root — `docs/` is
   gitignored at any depth, and the contract should travel with the web/
   submodule anyway); ready handshake stamps `contractVersion: 1`.
-Next: Wave 2 (webxr, splats, render_capture, pathtracing_glue).
+Wave 2 status: `webxr.js` and `splats.js` extracted and verified (2026-07-07).
+RE-SCOPED after reading the code: `render_capture` is NOT self-contained — begin/
+finishRenderImageFrame write env state (envVisible, localHdriShowBg), swap
+performanceSettings, and the render loop itself drains `pendingRenderToImage`;
+it moves to Wave 6 with the render loop. `pathtracing_glue` similarly shares
+warmup counters with the loop; it moves to the renderer/PT wave. Next: Wave 3
+(environment stack).
+Extraction lessons so far (apply to every future wave):
+- Node 22 `node --check` on ESM files LAZY-PARSES inner function bodies — it
+  passes real syntax errors. check_esm_graph.mjs now does an eager vm.Script
+  compile per module; trust it + the browser smoke, never bare node --check.
+- sed-style identifier rewrites (`camera` -> `deps.camera`) corrupt object
+  literal KEYS (`{ camera: x }` -> `{ deps.camera: x }`). Grep for `deps.\w+\s*:`
+  after any mechanical rewrite.
+- Mutable boot bindings passed to factories MUST be getter properties on the
+  deps object (`get camera()`), TDZ-late ones (reportBridgeError) closures.
+  Stable-after-init bindings (renderer, rendererBackendLabel) pass by value.
 
 Line numbers below refer to the pre-split tree (~17,000 lines); they have
 drifted — anchor on function names, not line numbers.

@@ -17,6 +17,23 @@
 import { readFileSync, readdirSync, statSync, existsSync } from 'node:fs';
 import { dirname, join, resolve, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import vm from 'node:vm';
+
+// `node --check` on an ESM file lazily parses inner function bodies (verified
+// on Node 22: a syntax error inside a function passes --check when the file
+// has import/export, but fails as CJS). vm.Script compiles eagerly, so strip
+// the module syntax and compile the rest to get real whole-file checking.
+function eagerSyntaxError(source) {
+    const stripped = source
+        .replace(/^([ \t]*)import\b(?!\s*[(.])[^;]*?;/gms, '$1;')
+        .replace(/^([ \t]*)export\s*\{[^}]*\}\s*(from\s*['"][^'"]+['"])?\s*;/gm, '$1;')
+        .replace(/^([ \t]*)export\s+default\b/gm, '$1void')
+        .replace(/^([ \t]*)export\s+/gm, '$1')
+        .replace(/\bimport\.meta\b/g, '__import_meta__')
+        .replace(/\bawait\b/g, '/*await*/');   // top-level await outside async fn in script mode
+    try { new vm.Script(stripped); return null; }
+    catch (e) { return e.message; }
+}
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const WEB = join(ROOT, 'web');
@@ -138,6 +155,10 @@ for (const file of walkJs(join(WEB, 'js'))) {
 }
 
 let importCount = 0;
+for (const { label, source } of sources) {
+    const syntaxErr = eagerSyntaxError(source);
+    if (syntaxErr) failures.push(`${label}: syntax error — ${syntaxErr}`);
+}
 for (const { label, baseDir, source } of sources) {
     for (const imp of parseImports(source)) {
         if (!isLocal(imp.spec)) continue;

@@ -24,7 +24,7 @@ import HemisphereLightDataNode from 'three/addons/tsl/lighting/data/HemisphereLi
 import AmbientLightDataNode from 'three/addons/tsl/lighting/data/AmbientLightDataNode.js';
 import { NodeUtils } from 'three/webgpu';
 import { getReflectionPaintNode } from './reflection_paint.js';
-import { getGiVolumeNode, getGiProbeNode } from 'speedball-gi';
+import { getGiVolumeNode, getGiProbeNode, isIrEmitter, getOrCreateIrLightNode } from 'speedball-gi';
 import {
     If, Loop, getDistanceAttenuation, mix, normalWorld, positionView, renderGroup,
     select, smoothstep, uniformArray, vec3, uint, int, float,
@@ -309,9 +309,13 @@ export default class MaxLightsNode extends DynamicLightsNode {
     }
 
     _canBatch(light) {
+        // IR emitters (emitterClass 'ir') never batch: the batched data nodes read
+        // light.color CPU-side (black for a true IR illuminator) — they take the
+        // sensed-band per-light path in setupLightsNode instead.
         return light.isNode !== true
             && light.castShadow !== true
             && !isSpecialSpotLight(light)
+            && !isIrEmitter(light)
             && STOCK_DATA_CLASSES[light.constructor.name] !== undefined;
     }
 
@@ -403,7 +407,12 @@ export default class MaxLightsNode extends DynamicLightsNode {
                 if (list) list.push(light); else target.set(typeName, [light]);
                 continue;
             }
-            const lightNode = getOrCreateFallbackLightNode(light, nodeLibrary);
+            // IR emitters ride speedball's sensed-band light node (colorNode =
+            // white × intensity × nirGate; light.color stays black) so the direct
+            // term appears only under NV — same switch as the probes' NEE gate.
+            const lightNode = isIrEmitter(light)
+                ? getOrCreateIrLightNode(light, nodeLibrary)
+                : getOrCreateFallbackLightNode(light, nodeLibrary);
             if (lightNode) lightNodes.push(lightNode);
         }
 

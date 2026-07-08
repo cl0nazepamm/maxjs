@@ -1,5 +1,7 @@
 // render_loop.js - editor frame driver and visible-frame render path.
 
+import { setNirDirectSensing } from 'speedball-gi';
+
 function createRenderLoop(deps = {}) {
         let lastPostFxPanelSyncMs = 0;
 
@@ -168,15 +170,20 @@ function createRenderLoop(deps = {}) {
                 const haloNowMs = performance.now();
                 if (controlsChanged) deps.haloGiLastInteractionMs = haloNowMs;
                 deps.haloGi?.tick(haloNowMs);
-                // White Phosphor × trace view = TRUE-NIR: flip the tracer's λ
-                // domain to photocathode flux automatically. setRenderMode
-                // no-ops when unchanged, so the per-frame call is free — and
-                // it catches every state path (panel, restore, console).
+                // White Phosphor = the imager senses NIR. One state, three
+                // consumers, each a no-op when unchanged so the per-frame calls
+                // are free — and they catch every state path (panel, restore,
+                // console):
+                //   • trace view: flip the tracer's λ domain to photocathode flux,
+                //   • probes NEE: un-gate class-4 IR lights (gi_probes nirGate),
+                //   • direct raster term: un-gate the lifted IR light nodes
+                //     (gi_lights_node nirGate, shared with MaxLightsNode).
+                const nirSensing = deps.maxjsFx.isPowerShotEnabled?.() === true
+                    && deps.maxjsFx.getPowerShotOptions?.()?.mode === 'infrared';
                 deps.pathTracingFx?.setRenderMode?.(
-                    deps.isPathTracingMode
-                        && deps.maxjsFx.isPowerShotEnabled?.()
-                        && deps.maxjsFx.getPowerShotOptions?.()?.mode === 'infrared'
-                        ? 'nv' : 'visible');
+                    deps.isPathTracingMode && nirSensing ? 'nv' : 'visible');
+                deps.haloGi?.field?.setNirSensing?.(nirSensing);
+                setNirDirectSensing(nirSensing);
                 deps.updateProbeHelpers();
             }
             deps.css3dOverlay.tick(deps.scene, deps.camera);

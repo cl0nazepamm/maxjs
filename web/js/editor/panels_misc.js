@@ -1440,7 +1440,7 @@ function createPanelsMisc(deps = {}) {
 
         const btnPostFxPanel = document.getElementById('btnPostFxPanel');
         const rightDock = document.getElementById('rightDock');
-        const postPanel = document.getElementById('postPanel');
+        const postPanel = document.getElementById('postPanel');
         function clampDockWidth(width) {
             const numeric = Number.parseFloat(width);
             const maxWidth = Math.max(200, window.innerWidth - 16);
@@ -1492,6 +1492,7 @@ function createPanelsMisc(deps = {}) {
             queueWebPanelsRefresh,
             escapeWebPanelText,
             setRightDockWidth,
+            clampDockWidth,
             btnLightProbe,
             btnPostFxPanel,
             rightDock,

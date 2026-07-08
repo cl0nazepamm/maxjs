@@ -1135,7 +1135,7 @@ function createPostFxGlue(deps = {}) {
                     document.removeEventListener('mousemove', onMove);
                     document.removeEventListener('mouseup', onUp);
                     const dockWidth = deps.rightDock?.offsetWidth || deps.postPanel.offsetWidth;
-                    try { localStorage.setItem('maxjs_panel_width', `${clampDockWidth(dockWidth)}px`); } catch {}
+                    try { localStorage.setItem('maxjs_panel_width', `${deps.clampDockWidth(dockWidth)}px`); } catch {}
                 };
                 document.addEventListener('mousemove', onMove);
                 document.addEventListener('mouseup', onUp);

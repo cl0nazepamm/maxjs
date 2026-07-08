@@ -837,7 +837,7 @@ function createSceneSync(deps = {}) {
                 }
             }
             if (msg.lights) {
-                applyLightUpdates(msg.lights);
+                deps.applyLightUpdates(msg.lights);
                 pathTraceSceneChanged = true;
             }
             if (msg.splats) {

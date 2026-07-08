@@ -347,6 +347,27 @@ material.colorNode = params.tint.mul(params.strength);
 
 Parameter comments create uniforms available through `params.name`. Keep parameter names stable because Max files may save them.
 
+### Unit scale (cm)
+
+max.js scenes sync from 3ds Max in **centimeters** (`ctx.space.units` is `'cm'`; world transforms, camera clips, and raycasts all assume cm). **TSL materials and textures must be authored to match this scale** — do not tune parallax, displacement, noise tiling, or effect strength as if the scene were meters.
+
+- Prefer **cm-native `@param` names** when a value is physical (`openingWidthCm`, `virtualDepthCm`, `displacementCm`) rather than abstract UV magic numbers.
+- When UV size maps to a real opening, expose the mesh width/height in cm and **normalize** procedural density, parallax reach, and glitter pitch against it (e.g. reference width **80 cm** for a typical porthole/panel).
+- **Parallax / fake-depth** materials: derive UV offset from `depthCm / openingWidthCm`, not a standalone `0.0–1.0` scale copied from meter-based Three.js examples.
+- **Vertex `positionNode` / deform offsets**: express displacements in cm (small sway ≈ 1–8 cm; wind on foliage ≈ 5–30 cm), not unitless 0.01-style meter defaults.
+- **World-space TSL** (`positionWorld`, `cameraPosition`): distances between samples are in cm — divide or multiply consciously when porting shaders from meter-based demos.
+
+```js
+// Example: cm-normalized parallax reach for an ~80 cm reference opening
+// @param float virtualDepthCm 280.0 80.0 1200.0
+// @param float openingWidthCm 80.0 20.0 300.0
+// @param float parallaxStrength 1.0 0.4 2.0
+const cmNorm = TSL.float(80.0).div(params.openingWidthCm);
+const parallaxReach = params.virtualDepthCm
+    .div(params.openingWidthCm.mul(TSL.float(35.0)))
+    .mul(params.parallaxStrength);
+```
+
 Common node assignments:
 
 ```js
@@ -400,6 +421,8 @@ return tex;
 
 No `ctx` is injected into TSL snippets. For timeline-driven shader values, use a runtime layer to update a uniform from `ctx.maxTime`, or build the material from an imported layer module instead of a raw Max material snippet.
 
+TSL texture snippets inherit the same **cm** scene scale when baked onto scene geometry — tile noise and feature size against expected physical UV footprint (cm), not generic 0–1 UV assumptions.
+
 ## Quick Checklist
 
 Before shipping runtime code:
@@ -409,3 +432,4 @@ Before shipping runtime code:
 - Are all runtime objects tracked/owned for cleanup and snapshot export?
 - Are TSL parameters declared with stable `// @param` names?
 - Are TSL nodes valid for Three.js `0.184`?
+- Do TSL defaults and physical params match **max.js cm unit scale** (not meter-based Three.js example values)?

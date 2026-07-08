@@ -1131,10 +1131,10 @@ function createSceneSync(deps = {}) {
         function normalizeVertexColorDescriptors(vertexColors) {
             if (!Array.isArray(vertexColors)) return [];
             return vertexColors.map((entry) => {
-                const channel = normalizeMaxVertexColorChannel(entry?.ch ?? entry?.channel ?? 0);
+                const channel = deps.normalizeMaxVertexColorChannel(entry?.ch ?? entry?.channel ?? 0);
                 const name = (typeof entry?.name === 'string' && entry.name.length)
                     ? entry.name
-                    : maxVertexColorAttributeName(channel);
+                    : deps.maxVertexColorAttributeName(channel);
                 const itemSize = Number.isInteger(entry?.itemSize) && entry.itemSize > 0
                     ? entry.itemSize
                     : 4;

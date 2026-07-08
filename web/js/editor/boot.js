@@ -1558,6 +1558,8 @@
             applySSSRoughnessInfluence,
             rememberMaterialEmissiveBase,
             applyMaterialSelectionState,
+            normalizeMaxVertexColorChannel,
+            maxVertexColorAttributeName,
             reconcileSplats,
             applySplatUpdates,
             resetPathTracingStartupWarmup: (...args) => resetPathTracingStartupWarmup(...args),

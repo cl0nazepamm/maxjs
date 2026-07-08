@@ -17,8 +17,51 @@ RE-SCOPED after reading the code: `render_capture` is NOT self-contained — beg
 finishRenderImageFrame write env state (envVisible, localHdriShowBg), swap
 performanceSettings, and the render loop itself drains `pendingRenderToImage`;
 it moves to Wave 6 with the render loop. `pathtracing_glue` similarly shares
-warmup counters with the loop; it moves to the renderer/PT wave. Next: Wave 3
-(environment stack).
+warmup counters with the loop; it moves to the renderer/PT wave.
+Wave 3 status: DONE 2026-07-07 — `texture_pipeline.js` (1095), `environment.js`
+(476), `sky.js` (594), `gi_volume_glue.js` (1172) extracted; boot.js 13,143
+lines. Per-step gates all green (check_esm_graph + boot smoke + moved-identifier
+grep). Wave-boundary gates (live Max + Blender shim contract smoke) NOT yet run.
+Wave 3 notes for later waves:
+- `materialXTemplateCache` deliberately stayed in boot (its consumers are
+  createMaterial + disposal guards) — move it with `materials.js` in Wave 4.
+- NEW LESSON: factories that eagerly register bridge/sharedbuffer handlers in
+  their body (gi_volume_glue does) MUST be wired AFTER `createHostBridge()` in
+  boot — passing `hostBridge`/`bridge` into a deps object above that line is a
+  TDZ ReferenceError the graph check can't see; only the boot smoke catches it.
+- Environment/sky deps that point at functions owned by a LATER-wired module
+  use closure wrappers `(...a) => fn(...a)`, not shorthand refs.
+Wave 4 status: DONE 2026-07-07 — `materials.js` (1197), `bake_system.js` (1062),
+`lights.js` (1412), `scene_sync.js` (1540), `scene_extras.js` (735),
+`camera_system.js` (315) extracted; boot.js 7,709 lines. All six per-step gates
+green (check_esm_graph + boot smoke + moved-identifier reconciliation). The
+3M-poly hot-path perf baseline has NOT been re-run (needs live Max) — required
+before trusting Wave 4 in production. Shared bindings kept boot-owned with
+accessors by design: bakeOverrides, nodeMap, maxInstanceBuckets,
+maxInstanceHandleToBucket, hairMeshes, forestMeshes, lightHandleMap,
+defaultLights, camera, controls, camLock. TDZ sweeps converted earlier-wiring
+shorthands (setDefaultLightsVisible, isFiniteArray x2) to closure wrappers.
+Wave 5 status: DONE 2026-07-07 — `renderer_core.js` (399), `snapshot_export.js`
+(618), `postfx_glue.js` (2069), `panels_misc.js` (1502) extracted and gated
+green; boot.js 3,572 lines. serializeSnapshotUiState/serializeSnapshotFxState
+deliberately stayed in boot (cross-subsystem serializers, revisit at Wave 6).
+NEW LESSON: function deps must be closure properties, NEVER invoke-in-getter
+(`get f() { return f(); }` hands the module a boolean where it expects a
+callable — deps.f() then throws "not a function"; caught by smoke on
+panels_misc, three occurrences fixed in the wiring block).
+Wave 6 status: DONE 2026-07-08 — `pathtracing_glue.js` (229),
+`render_capture.js` (502), `render_loop.js` (277) extracted and gated green.
+THE SPLIT IS CODE-COMPLETE: boot.js is 2,800 lines (imports, env patches, ctx
+creation, 15+ factory wiring blocks, residual bridge glue, window.maxJS
+handles, debug tail — above the plan's ~600 target; residue is candidate for a
+later cleanup pass, NOT part of the verbatim-move waves). 21 modules under
+web/js/editor/, check_esm_graph 148 imports / 96 modules, boot smoke green at
+every step. ALL EXTRACTIONS UNCOMMITTED — per-step verified patches archived in
+the session scratchpad wave3/4/5/6_backups.
+STILL OWED (wave-boundary/human gates): live Max session + 3M-poly hot-path
+baseline (Wave 4), postfx + studio persistence round-trip in Max, snapshot
+export + standalone replay, WGL2/WebGPU/TSL_GL backend switching,
+render-to-image, Blender shim IPR contract smoke.
 Extraction lessons so far (apply to every future wave):
 - Node 22 `node --check` on ESM files LAZY-PARSES inner function bodies — it
   passes real syntax errors. check_esm_graph.mjs now does an eager vm.Script

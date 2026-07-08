@@ -1,5 +1,6 @@
 // postfx_glue.js - editor post-FX panel, tone mapping, and persistence glue.
 import * as THREE from 'three';
+import { powerShotInfraredPresetUiDefaults } from '../fx/final/powershot.js';
 
 function createPostFxGlue(deps = {}) {
         let syncClonePanelFn = null;
@@ -44,16 +45,24 @@ function createPostFxGlue(deps = {}) {
         }
 
         const isPowerShotInfraredMode = (values) => values.mode === 'infrared';
-        const isPowerShotDigitalMode = (values) => values.mode !== 'analog' && values.mode !== 'film' && values.mode !== 'infrared';
+        const isPowerShotNightshotMode = (values) => values.mode === 'nightshot';
+        // Both read NIR flux — spectral-only, and both drive the NIR sensing gates.
+        const isPowerShotNirMode = (values) => isPowerShotInfraredMode(values) || isPowerShotNightshotMode(values);
+        const isPowerShotDigitalMode = (values) => values.mode !== 'analog' && values.mode !== 'film' && !isPowerShotNirMode(values);
         const isPowerShotAnalogMode = (values) => values.mode === 'analog';
         const isPowerShotFilmMode = (values) => values.mode === 'film';
         const isPowerShotJpegActive = (values) => isPowerShotDigitalMode(values) && Number(values.jpegStrength) > 1.0e-6;
         const isPowerShotAnalogActive = (values) => isPowerShotAnalogMode(values) && Number(values.analogStrength) > 1.0e-6;
+        // modes whose output rides the analog tape path (VHS sliders apply):
+        // Analog VHS itself, and NightShot's camcorder back end.
+        const isPowerShotTapePathMode = (values) => isPowerShotAnalogMode(values) || isPowerShotNightshotMode(values);
+        const isPowerShotTapeActive = (values) => isPowerShotTapePathMode(values) && Number(values.analogStrength) > 1.0e-6;
         const isPowerShotTemporalNoiseActive = (values) =>
             (isPowerShotDigitalMode(values) && Number(values.noiseScale) > 1.0e-6)
             || isPowerShotAnalogActive(values)
             || (isPowerShotFilmMode(values) && Number(values.filmGrain) > 1.0e-6)
-            || (isPowerShotInfraredMode(values) && Number(values.irNoise) > 1.0e-6);
+            || (isPowerShotInfraredMode(values) && Number(values.irNoise) > 1.0e-6)
+            || isPowerShotNightshotMode(values); // CCD shot noise + tape noise are always temporal
 
         const postFxSections = [
             {
@@ -320,24 +329,17 @@ function createPostFxGlue(deps = {}) {
                     filmWeave: 0.4,
                     filmFlicker: 0.12,
                     filmNegative: false,
-                    infraredPreset: 'white_phosphor',
-                    irExposure: 0.85,
-                    irResponse: 0.0,
-                    irLocalGain: 0.46,
-                    irGlow: 0.34,
-                    irGlowThreshold: 0.44,
-                    irEyes: 0.78,
-                    irNoise: 0.48,
-                    irVignette: 0.26,
-                    irHotspot: 0.055,
+                    infraredPreset: 'white_phosphor_nir',
+                    ...powerShotInfraredPresetUiDefaults('white_phosphor_nir'),
+                    nsSmear: 0.9,
                     freezeNoise: false,
                     ...(state.powershot || {}),
-                    // A save written in spectral can carry mode:'infrared';
-                    // standard mode must never surface white phosphor.
-                    ...(!deps.isStudioMode && state.powershot?.mode === 'infrared' ? { mode: 'digital' } : {}),
+                    // A save written in spectral can carry a NIR mode;
+                    // standard mode must never surface white phosphor/NightShot.
+                    ...(!deps.isStudioMode && ['infrared', 'nightshot'].includes(state.powershot?.mode) ? { mode: 'digital' } : {}),
                 }),
                 setValues: (patch) => deps.maxjsFx.setPowerShotOptions(
-                    !deps.isStudioMode && patch?.mode === 'infrared' ? { ...patch, mode: 'digital' } : patch),
+                    !deps.isStudioMode && ['infrared', 'nightshot'].includes(patch?.mode) ? { ...patch, mode: 'digital' } : patch),
                 controls: [
                     {
                         key: 'mode',
@@ -347,8 +349,11 @@ function createPostFxGlue(deps = {}) {
                             { value: 'digital', label: 'Digital CCD' },
                             { value: 'analog', label: 'Analog VHS' },
                             { value: 'film', label: 'Film Print' },
-                            // NIR white phosphor reads spectral flux — spectral-only.
-                            ...(deps.isStudioMode ? [{ value: 'infrared', label: 'White Phosphor' }] : []),
+                            // NIR modes read spectral flux — spectral-only.
+                            ...(deps.isStudioMode ? [
+                                { value: 'infrared', label: 'White Phosphor' },
+                                { value: 'nightshot', label: 'NightShot' },
+                            ] : []),
                         ],
                     },
                     {
@@ -398,20 +403,20 @@ function createPostFxGlue(deps = {}) {
                     { key: 'filmWeave', label: 'Gate Weave', min: 0, max: 2, step: 0.01, realtime: true, visibleWhen: isPowerShotFilmMode },
                     { key: 'filmFlicker', label: 'Flicker', min: 0, max: 1, step: 0.01, realtime: true, visibleWhen: isPowerShotFilmMode },
                     { key: 'filmNegative', label: 'Show Negative', type: 'checkbox', visibleWhen: isPowerShotFilmMode },
-                    { key: 'brightness', label: 'Brightness', min: -1, max: 1, step: 0.01, realtime: true, visibleWhen: (values) => !isPowerShotFilmMode(values) && !isPowerShotInfraredMode(values) },
-                    { key: 'contrast', label: 'Contrast', min: -1, max: 1, step: 0.01, realtime: true, visibleWhen: (values) => !isPowerShotFilmMode(values) && !isPowerShotInfraredMode(values) },
-                    { key: 'analogStrength', label: 'VHS Strength', min: 0, max: 3, step: 0.01, realtime: true, affectsVisibility: true, visibleWhen: isPowerShotAnalogMode },
-                    { key: 'analogTracking', label: 'Tracking', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotAnalogActive },
-                    { key: 'analogChromaBleed', label: 'Chroma Bleed', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotAnalogActive },
-                    { key: 'analogRinging', label: 'Ringing', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotAnalogActive },
-                    { key: 'analogTapeNoise', label: 'Tape Noise', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotAnalogActive },
-                    { key: 'analogBandMask', label: 'Band Mask', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotAnalogActive },
-                    { key: 'analogEdgeWave', label: 'Edge Wave', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotAnalogActive },
-                    { key: 'analogDropouts', label: 'Dropouts', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotAnalogActive },
-                    { key: 'analogScanlines', label: 'Scanlines', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotAnalogActive },
-                    { key: 'analogHeadSwitch', label: 'Head Switch', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotAnalogActive },
-                    { key: 'irExposure', label: 'Exposure (stops)', min: -8, max: 8, step: 0.05, realtime: true, visibleWhen: isPowerShotInfraredMode },
-                    { key: 'irResponse', label: 'IR Response', min: 0, max: 1, step: 0.01, realtime: true, visibleWhen: isPowerShotInfraredMode },
+                    { key: 'brightness', label: 'Brightness', min: -1, max: 1, step: 0.01, realtime: true, visibleWhen: (values) => !isPowerShotFilmMode(values) && !isPowerShotNirMode(values) },
+                    { key: 'contrast', label: 'Contrast', min: -1, max: 1, step: 0.01, realtime: true, visibleWhen: (values) => !isPowerShotFilmMode(values) && !isPowerShotNirMode(values) },
+                    { key: 'analogStrength', label: 'VHS Strength', min: 0, max: 3, step: 0.01, realtime: true, affectsVisibility: true, visibleWhen: isPowerShotTapePathMode },
+                    { key: 'analogTracking', label: 'Tracking', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotTapeActive },
+                    { key: 'analogChromaBleed', label: 'Chroma Bleed', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotTapeActive },
+                    { key: 'analogRinging', label: 'Ringing', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotTapeActive },
+                    { key: 'analogTapeNoise', label: 'Tape Noise', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotTapeActive },
+                    { key: 'analogBandMask', label: 'Band Mask', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotTapeActive },
+                    { key: 'analogEdgeWave', label: 'Edge Wave', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotTapeActive },
+                    { key: 'analogDropouts', label: 'Dropouts', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotTapeActive },
+                    { key: 'analogScanlines', label: 'Scanlines', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotTapeActive },
+                    { key: 'analogHeadSwitch', label: 'Head Switch', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotTapeActive },
+                    { key: 'irExposure', label: 'Exposure (stops)', min: -8, max: 8, step: 0.05, realtime: true, visibleWhen: isPowerShotNirMode },
+                    { key: 'irResponse', label: 'IR Response', min: 0, max: 1, step: 0.01, realtime: true, visibleWhen: isPowerShotNirMode },
                     { key: 'irLocalGain', label: 'Local Gain', min: 0, max: 1.5, step: 0.01, realtime: true, visibleWhen: isPowerShotInfraredMode },
                     { key: 'irGlow', label: 'Halo Bloom', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotInfraredMode },
                     { key: 'irGlowThreshold', label: 'Bloom Threshold', min: 0, max: 1, step: 0.01, realtime: true, visibleWhen: isPowerShotInfraredMode },
@@ -419,6 +424,7 @@ function createPostFxGlue(deps = {}) {
                     { key: 'irNoise', label: 'Tube Scintillation', min: 0, max: 3, step: 0.01, realtime: true, affectsVisibility: true, visibleWhen: isPowerShotInfraredMode },
                     { key: 'irVignette', label: 'Tube Vignette', min: 0, max: 1, step: 0.01, realtime: true, visibleWhen: isPowerShotInfraredMode },
                     { key: 'irHotspot', label: 'Hotspot', min: 0, max: 1, step: 0.01, realtime: true, visibleWhen: isPowerShotInfraredMode },
+                    { key: 'nsSmear', label: 'CCD Smear', min: 0, max: 2, step: 0.01, realtime: true, visibleWhen: isPowerShotNightshotMode },
                     { key: 'freezeNoise', label: 'Freeze Noise', type: 'checkbox', visibleWhen: isPowerShotTemporalNoiseActive },
                 ],
             },

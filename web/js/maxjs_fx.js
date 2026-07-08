@@ -6,7 +6,7 @@
 // CPU blob tracker, CSS colorGrading, and renderer-output/resize tracking.
 import * as THREE from 'three';
 import { uniform, vec3 } from 'three/tsl';
-import { createPowerShotFinal, normalizePowerShotPreset, powerShotPresetUiDefaults, listPowerShotPresets, normalizePowerShotFilmStock, powerShotFilmStockUiDefaults, listPowerShotFilmStocks, normalizePowerShotInfraredPreset, powerShotInfraredPresetUiDefaults, listPowerShotInfraredPresets } from './fx/final/powershot.js';
+import { createPowerShotFinal, normalizePowerShotPreset, powerShotPresetUiDefaults, listPowerShotPresets, normalizePowerShotFilmStock, powerShotFilmStockUiDefaults, listPowerShotFilmStocks, normalizePowerShotInfraredPreset, powerShotInfraredPresetUiDefaults, listPowerShotInfraredPresets, powerShotNightshotUiDefaults } from './fx/final/powershot.js';
 import { createShaderLabFinal } from './fx/final/shaderlab.js';
 import { createFxCore } from './fx/core.js';
 import { ALL } from './fx/registry.js';
@@ -97,16 +97,11 @@ export function createMaxJSFxController({
         filmWeave: 0.4,
         filmFlicker: 0.12,
         filmNegative: false,
-        infraredPreset: 'white_phosphor',
-        irExposure: 0.85,
-        irResponse: 0.0,
-        irLocalGain: 0.46,
-        irGlow: 0.34,
-        irGlowThreshold: 0.44,
-        irEyes: 0.78,
-        irNoise: 0.48,
-        irVignette: 0.26,
-        irHotspot: 0.055,
+        // True-NIR white phosphor by default — the P45 (true NIR) preset carries
+        // the hot tube gain / ABC swing that gives the real close-range AGC feel.
+        infraredPreset: 'white_phosphor_nir',
+        ...powerShotInfraredPresetUiDefaults('white_phosphor_nir'),
+        nsSmear: 0.9, // NightShot CCD interline vertical smear
         freezeNoise: false,
     };
     state.clone = {
@@ -513,6 +508,14 @@ export function createMaxJSFxController({
         }
         if (Array.isArray(fx.clone?.color)) {
             state.clone.color = [...fx.clone.color];
+        }
+        // Legacy saves carry the pseudo-NIR 'white_phosphor' preset — the old
+        // default, never a deliberate choice (there is no preset selector in the
+        // UI). Fold them into the true-NIR default, trims included, so the tube
+        // gain / ABC behaviour matches current builds.
+        if (fx.powershot && state.powershot.infraredPreset === 'white_phosphor') {
+            state.powershot.infraredPreset = 'white_phosphor_nir';
+            Object.assign(state.powershot, powerShotInfraredPresetUiDefaults('white_phosphor_nir'));
         }
         syncHiddenBackgroundUniforms();
         colorGradingBrightnessU.value = state.colorGrading.brightness;
@@ -1136,10 +1139,18 @@ export function createMaxJSFxController({
         },
         setPowerShotOptions(options = {}) {
             if (typeof options.mode === 'string') {
+                const previousMode = state.powershot.mode;
                 state.powershot.mode = options.mode === 'analog' ? 'analog'
                     : options.mode === 'film' ? 'film'
                     : options.mode === 'infrared' ? 'infrared'
+                    : options.mode === 'nightshot' ? 'nightshot'
                     : 'digital';
+                // Entering NightShot seeds the shared analog trims (+ smear)
+                // with the preset's dialed tape character — otherwise the
+                // classic-analog slider state would stomp the NightShot look.
+                if (state.powershot.mode === 'nightshot' && previousMode !== 'nightshot') {
+                    Object.assign(state.powershot, powerShotNightshotUiDefaults());
+                }
                 state.powershot.freezeNoise = false;
             }
             if (typeof options.preset === 'string') {
@@ -1200,6 +1211,7 @@ export function createMaxJSFxController({
             assignFinite(state.powershot, 'irNoise', options.irNoise);
             assignFinite(state.powershot, 'irVignette', options.irVignette);
             assignFinite(state.powershot, 'irHotspot', options.irHotspot);
+            assignFinite(state.powershot, 'nsSmear', options.nsSmear);
             if (typeof options.freezeNoise === 'boolean') state.powershot.freezeNoise = options.freezeNoise;
             if (powerShotFinal.hasPipeline()) powerShotFinal.syncPipeline();
             if (state.powershot.enabled) queuePipelineUpdate({ output: true });

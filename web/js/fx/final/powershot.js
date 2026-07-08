@@ -10,6 +10,7 @@ import { Pipeline as PowerShotPipeline, applyPreset as applyPowerShotPreset, STA
 import { PRESETS as POWERSHOT_PRESETS, PRESET_KEYS as POWERSHOT_PRESET_KEYS } from 'powershot-threejs/presets';
 import { FilmPipeline as PowerShotFilmPipeline, applyFilmPreset as applyPowerShotFilmPreset, FILM_PRESETS as POWERSHOT_FILM_PRESETS, FILM_PRESET_KEYS as POWERSHOT_FILM_PRESET_KEYS } from 'powershot-threejs/film';
 import { InfraredPipeline as PowerShotInfraredPipeline, applyInfraredPreset as applyPowerShotInfraredPreset, INFRARED_PRESETS as POWERSHOT_INFRARED_PRESETS, INFRARED_PRESET_KEYS as POWERSHOT_INFRARED_PRESET_KEYS } from 'powershot-threejs/infrared';
+import { NightshotPipeline as PowerShotNightshotPipeline, applyNightshotPreset as applyPowerShotNightshotPreset, NIGHTSHOT_PRESETS as POWERSHOT_NIGHTSHOT_PRESETS } from 'powershot-threejs/nightshot';
 
 function finiteOr(value, fallback) {
     return Number.isFinite(value) ? value : fallback;
@@ -124,6 +125,27 @@ export function powerShotPresetUiDefaults(key) {
     };
 }
 
+// UI trims seeded when the user enters NightShot mode: the shared analog
+// sliders drive nightshot.cam, so entering the mode loads the preset's dialed
+// tape character instead of the classic-analog defaults.
+export function powerShotNightshotUiDefaults() {
+    const ns = POWERSHOT_NIGHTSHOT_PRESETS.nightshot_plus;
+    const cam = ns.cam;
+    return {
+        analogStrength: cam.analog_vhs_strength ?? 1.15,
+        analogTracking: cam.analog_tracking ?? 0.45,
+        analogChromaBleed: cam.analog_chroma_bleed ?? 0.15,
+        analogRinging: cam.analog_ringing ?? 0.95,
+        analogTapeNoise: cam.analog_tape_noise ?? 0.85,
+        analogBandMask: cam.analog_band_mask ?? 0.3,
+        analogEdgeWave: cam.analog_edge_wave ?? 0.3,
+        analogDropouts: cam.analog_dropouts ?? 0.35,
+        analogScanlines: cam.analog_scanlines ?? 0.75,
+        analogHeadSwitch: cam.analog_head_switch ?? 0.5,
+        nsSmear: ns.smear ?? 0.9,
+    };
+}
+
 export function listPowerShotPresets() {
     return POWERSHOT_PRESET_KEYS.map((key) => ({
         key,
@@ -151,6 +173,7 @@ export function createPowerShotFinal({
     let powerShotPipeline = null;
     let filmPipeline = null;
     let infraredPipeline = null;
+    let nightshotPipeline = null;
     let powerShotFrame = 0;
     const drawBufferSize = new THREE.Vector2();
 
@@ -166,6 +189,7 @@ export function createPowerShotFinal({
         p.mode = p.mode === 'analog' ? 'analog'
             : p.mode === 'film' ? 'film'
             : p.mode === 'infrared' ? 'infrared'
+            : p.mode === 'nightshot' ? 'nightshot'
             : 'digital';
         p.amount = THREE.MathUtils.clamp(finiteOr(p.amount, 1.0), 0, 1);
         p.resolutionScale = THREE.MathUtils.clamp(finiteOr(p.resolutionScale, 0.75), 0.1, 1);
@@ -217,6 +241,7 @@ export function createPowerShotFinal({
         p.irNoise = THREE.MathUtils.clamp(finiteOr(p.irNoise, 0.48), 0, 3);
         p.irVignette = THREE.MathUtils.clamp(finiteOr(p.irVignette, 0.26), 0, 1);
         p.irHotspot = THREE.MathUtils.clamp(finiteOr(p.irHotspot, 0.055), 0, 1);
+        p.nsSmear = THREE.MathUtils.clamp(finiteOr(p.nsSmear, 0.9), 0, 2);
         return p;
     }
 
@@ -284,9 +309,37 @@ export function createPowerShotFinal({
         I.hotspot.value = p.irHotspot;
     }
 
+    function syncNightshotPipeline() {
+        if (!nightshotPipeline) return;
+        const p = normalizeOptions();
+        // full preset first (CCD sensor character, camcorder tape path), then
+        // the user-facing trims on top. The shared ir* trims drive the sensor
+        // half; the smear knob is NightShot-only.
+        applyPowerShotNightshotPreset(nightshotPipeline, POWERSHOT_NIGHTSHOT_PRESETS.nightshot_plus);
+        nightshotPipeline.ctx.power.value = THREE.MathUtils.clamp(p.amount, 0, 1);
+        const I = nightshotPipeline.ir.ctx.P;
+        I.exposure.value = p.irExposure;
+        I.nirInput.value = p.irResponse;
+        nightshotPipeline.ctx.P.smear.value = p.nsSmear;
+        // shared analog trims drive the camcorder tape path (state is seeded
+        // from the NightShot preset on mode entry — powerShotNightshotUiDefaults)
+        const A = nightshotPipeline.cam.ctx.P;
+        A.analogStrength.value = p.analogStrength;
+        A.analogTracking.value = p.analogTracking;
+        A.analogChromaBleed.value = p.analogChromaBleed;
+        A.analogRinging.value = p.analogRinging;
+        A.analogTapeNoise.value = p.analogTapeNoise;
+        A.analogBandMask.value = p.analogBandMask;
+        A.analogEdgeWave.value = p.analogEdgeWave;
+        A.analogDropouts.value = p.analogDropouts;
+        A.analogScanlines.value = p.analogScanlines;
+        A.analogHeadSwitch.value = p.analogHeadSwitch;
+    }
+
     function syncPipeline() {
         syncFilmPipeline();
         syncInfraredPipeline();
+        syncNightshotPipeline();
         if (!powerShotPipeline) return;
         const p = normalizeOptions();
         const presetKey = normalizePowerShotPreset(p.preset);
@@ -368,13 +421,21 @@ export function createPowerShotFinal({
         return infraredPipeline;
     }
 
-    // film mode runs its own negative->print pipeline and infrared runs the
-    // pseudo-NIR night-vision pipeline; digital/analog share the classic ISP
+    function ensureNightshotPipeline() {
+        if (!nightshotPipeline) nightshotPipeline = new PowerShotNightshotPipeline(renderer);
+        syncNightshotPipeline();
+        return nightshotPipeline;
+    }
+
+    // film mode runs its own negative->print pipeline, infrared runs the
+    // pseudo-NIR night-vision pipeline, nightshot runs the CCD camcorder
+    // composition (sensor + tape path); digital/analog share the classic ISP
     // runner. All expose renderTexture(tex, frame, opts) / setSize(w, h).
     function ensureActivePipeline() {
         const mode = normalizeOptions().mode;
         if (mode === 'film') return ensureFilmPipeline();
         if (mode === 'infrared') return ensureInfraredPipeline();
+        if (mode === 'nightshot') return ensureNightshotPipeline();
         return ensurePipeline();
     }
 
@@ -470,7 +531,7 @@ export function createPowerShotFinal({
         normalizeOptions,
         syncPipeline,
         renderFinal,
-        hasPipeline: () => !!powerShotPipeline || !!filmPipeline || !!infraredPipeline,
+        hasPipeline: () => !!powerShotPipeline || !!filmPipeline || !!infraredPipeline || !!nightshotPipeline,
         dispose() {
             try { powerShotInputTarget?.dispose?.(); } catch (_) {}
             powerShotInputTarget = null;
@@ -480,6 +541,8 @@ export function createPowerShotFinal({
             filmPipeline = null;
             try { infraredPipeline?.dispose?.(); } catch (_) {}
             infraredPipeline = null;
+            try { nightshotPipeline?.dispose?.(); } catch (_) {}
+            nightshotPipeline = null;
         },
     };
 }

@@ -178,8 +178,9 @@ function createRenderLoop(deps = {}) {
                 //   • probes NEE: un-gate class-4 IR lights (gi_probes nirGate),
                 //   • direct raster term: un-gate the lifted IR light nodes
                 //     (gi_lights_node nirGate, shared with MaxLightsNode).
+                const psMode = deps.maxjsFx.getPowerShotOptions?.()?.mode;
                 const nirSensing = deps.maxjsFx.isPowerShotEnabled?.() === true
-                    && deps.maxjsFx.getPowerShotOptions?.()?.mode === 'infrared';
+                    && (psMode === 'infrared' || psMode === 'nightshot');
                 deps.pathTracingFx?.setRenderMode?.(
                     deps.isPathTracingMode && nirSensing ? 'nv' : 'visible');
                 deps.haloGi?.field?.setNirSensing?.(nirSensing);

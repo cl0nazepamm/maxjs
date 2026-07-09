@@ -83,6 +83,7 @@ export function powerShotInfraredPresetUiDefaults(key) {
     const preset = POWERSHOT_INFRARED_PRESETS[normalizePowerShotInfraredPreset(key)];
     return {
         irExposure: preset.exposure ?? 0.85,
+        irInputGamma: preset.input_gamma ?? 1.0,
         irResponse: preset.nir_input ?? 0,
         irLocalGain: preset.local_gain ?? 0.46,
         irGlow: preset.glow_strength ?? 0.34,
@@ -156,15 +157,17 @@ export function listPowerShotPresets() {
 /**
  * @param renderer                  WebGPURenderer
  * @param getOptions                () => state.powershot (live object; normalize mutates it in place, as before)
- * @param getColorGrading          () => state.colorGrading | null — brightness rides the linear input as exposure, contrast lands in the ISP output grade
  * @param getScaledPostFxSize       core.getScaledPostFxSize
  * @param supportsScreenSpaceEffects backend capability flag
  * @param isShaderLabEnabled        Shader Lab wins the final-stylize slot
+ *
+ * Exposure lives inside each PowerShot mode (filmExposure / irExposure / ISP).
+ * brightness + contrast are post-effect corrective grades via setOutputColorGrading
+ * (powershotLinearGrade on the linear print/phosphor/ISP output) — not input exposure.
  */
 export function createPowerShotFinal({
     renderer,
     getOptions,
-    getColorGrading = null,
     getScaledPostFxSize,
     supportsScreenSpaceEffects = false,
     isShaderLabEnabled = () => false,
@@ -233,6 +236,7 @@ export function createPowerShotFinal({
         p.filmNegative = !!p.filmNegative;
         p.infraredPreset = normalizePowerShotInfraredPreset(p.infraredPreset);
         p.irExposure = THREE.MathUtils.clamp(finiteOr(p.irExposure, 0.85), -8, 8);
+        p.irInputGamma = THREE.MathUtils.clamp(finiteOr(p.irInputGamma, 1.0), 0.35, 2);
         p.irResponse = THREE.MathUtils.clamp(finiteOr(p.irResponse, 0), 0, 1);
         p.irLocalGain = THREE.MathUtils.clamp(finiteOr(p.irLocalGain, 0.46), 0, 1.5);
         p.irGlow = THREE.MathUtils.clamp(finiteOr(p.irGlow, 0.34), 0, 3);
@@ -285,6 +289,8 @@ export function createPowerShotFinal({
         F.flicker.value = p.filmFlicker;
         F.negativeView.value = p.filmNegative ? 1 : 0;
         filmPipeline.setEnabled?.('halation', p.filmHalation > 1.0e-6);
+        // post-print corrective grade (not film exposure)
+        filmPipeline.setOutputColorGrading?.({ brightness: p.brightness, contrast: p.contrast });
     }
 
     function syncInfraredPipeline() {
@@ -299,6 +305,7 @@ export function createPowerShotFinal({
         infraredPipeline.ctx.power.value = THREE.MathUtils.clamp(p.amount, 0, 1);
         const I = infraredPipeline.ctx.P;
         I.exposure.value = p.irExposure;
+        I.inputGamma.value = p.irInputGamma;
         I.nirInput.value = p.irResponse;
         I.localGain.value = p.irLocalGain;
         I.glowStrength.value = p.irGlow;
@@ -307,6 +314,8 @@ export function createPowerShotFinal({
         I.noiseAmount.value = p.irNoise;
         I.vignette.value = p.irVignette;
         I.hotspot.value = p.irHotspot;
+        // post-phosphor corrective grade (not tube exposure)
+        infraredPipeline.setOutputColorGrading?.({ brightness: p.brightness, contrast: p.contrast });
     }
 
     function syncNightshotPipeline() {
@@ -319,6 +328,7 @@ export function createPowerShotFinal({
         nightshotPipeline.ctx.power.value = THREE.MathUtils.clamp(p.amount, 0, 1);
         const I = nightshotPipeline.ir.ctx.P;
         I.exposure.value = p.irExposure;
+        I.inputGamma.value = p.irInputGamma;
         I.nirInput.value = p.irResponse;
         nightshotPipeline.ctx.P.smear.value = p.nsSmear;
         // shared analog trims drive the camcorder tape path (state is seeded
@@ -334,6 +344,8 @@ export function createPowerShotFinal({
         A.analogDropouts.value = p.analogDropouts;
         A.analogScanlines.value = p.analogScanlines;
         A.analogHeadSwitch.value = p.analogHeadSwitch;
+        // post-camcorder corrective grade (forwards to internal camera ISP)
+        nightshotPipeline.setOutputColorGrading?.({ brightness: p.brightness, contrast: p.contrast });
     }
 
     function syncPipeline() {
@@ -368,7 +380,8 @@ export function createPowerShotFinal({
         powerShotPipeline.ctx.P.analogDropouts.value = p.analogDropouts;
         powerShotPipeline.ctx.P.analogScanlines.value = p.analogScanlines;
         powerShotPipeline.ctx.P.analogHeadSwitch.value = p.analogHeadSwitch;
-        powerShotPipeline.setOutputColorGrading?.(p);
+        // post-ISP corrective grade — not sceneExposure / input gain
+        powerShotPipeline.setOutputColorGrading?.({ brightness: p.brightness, contrast: p.contrast });
 
         const digital = p.mode === 'digital';
         if (!digital) return;
@@ -497,17 +510,11 @@ export function createPowerShotFinal({
         }
 
         if (!getOptions().freezeNoise) powerShotFrame += 1;
+        // sync* already pushed brightness/contrast into setOutputColorGrading on
+        // the active pipeline. Do not remap them onto sceneExposure — PowerShot
+        // owns exposure; these sliders are post-effect corrective grades only.
         const pipeline = ensureActivePipeline();
         pipeline.setInputEncoding?.('linear');
-        const grading = getColorGrading?.() || null;
-        if (grading && pipeline.ctx?.sceneExposure) {
-            // brightness rides the LINEAR input as photographic exposure
-            // (+/-3 stops); contrast lands in the ISP output grade. Both live
-            // in the GPU chain so captures match the screen — the old CSS
-            // canvas filter did neither.
-            pipeline.ctx.sceneExposure.value = 3 * (Number(grading.brightness) || 0);
-            pipeline.setOutputColorGrading?.({ contrast: Number(grading.contrast) || 0 });
-        }
         try {
             renderer.toneMapping = THREE.NoToneMapping;
             renderer.toneMappingExposure = 1.0;

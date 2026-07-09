@@ -1497,6 +1497,8 @@ function createPanelsMisc(deps = {}) {
             btnPostFxPanel,
             rightDock,
             postPanel,
+            isClayModeActive: () => clayModeActive,
+            setClayPreFxSnapshot: (snapshot) => { clayPreFxSnapshot = snapshot; },
         };
 }
 

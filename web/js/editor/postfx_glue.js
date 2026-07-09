@@ -403,8 +403,10 @@ function createPostFxGlue(deps = {}) {
                     { key: 'filmWeave', label: 'Gate Weave', min: 0, max: 2, step: 0.01, realtime: true, visibleWhen: isPowerShotFilmMode },
                     { key: 'filmFlicker', label: 'Flicker', min: 0, max: 1, step: 0.01, realtime: true, visibleWhen: isPowerShotFilmMode },
                     { key: 'filmNegative', label: 'Show Negative', type: 'checkbox', visibleWhen: isPowerShotFilmMode },
-                    { key: 'brightness', label: 'Brightness', min: -1, max: 1, step: 0.01, realtime: true, visibleWhen: (values) => !isPowerShotFilmMode(values) && !isPowerShotNirMode(values) },
-                    { key: 'contrast', label: 'Contrast', min: -1, max: 1, step: 0.01, realtime: true, visibleWhen: (values) => !isPowerShotFilmMode(values) && !isPowerShotNirMode(values) },
+                    // Post-effect corrective grade (powershotLinearGrade) — works
+                    // after every mode; mode-specific Exposure knobs stay separate.
+                    { key: 'brightness', label: 'Brightness', min: -1, max: 1, step: 0.01, realtime: true },
+                    { key: 'contrast', label: 'Contrast', min: -1, max: 1, step: 0.01, realtime: true },
                     { key: 'analogStrength', label: 'VHS Strength', min: 0, max: 3, step: 0.01, realtime: true, affectsVisibility: true, visibleWhen: isPowerShotTapePathMode },
                     { key: 'analogTracking', label: 'Tracking', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotTapeActive },
                     { key: 'analogChromaBleed', label: 'Chroma Bleed', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotTapeActive },
@@ -416,6 +418,7 @@ function createPostFxGlue(deps = {}) {
                     { key: 'analogScanlines', label: 'Scanlines', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotTapeActive },
                     { key: 'analogHeadSwitch', label: 'Head Switch', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotTapeActive },
                     { key: 'irExposure', label: 'Exposure (stops)', min: -8, max: 8, step: 0.05, realtime: true, visibleWhen: isPowerShotNirMode },
+                    { key: 'irInputGamma', label: 'Input Gamma', min: 0.35, max: 2, step: 0.01, realtime: true, visibleWhen: isPowerShotNirMode },
                     { key: 'irResponse', label: 'IR Response', min: 0, max: 1, step: 0.01, realtime: true, visibleWhen: isPowerShotNirMode },
                     { key: 'irLocalGain', label: 'Local Gain', min: 0, max: 1.5, step: 0.01, realtime: true, visibleWhen: isPowerShotInfraredMode },
                     { key: 'irGlow', label: 'Halo Bloom', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotInfraredMode },
@@ -625,6 +628,70 @@ function createPostFxGlue(deps = {}) {
             if (!valueEl || control.type === 'checkbox' || control.type === 'select') return;
             const value = readPostFxControlValue(control, input, getValues);
             valueEl.textContent = formatControlValue(control, value);
+        }
+
+        const POSTFX_SECTION_DEFAULTS = Object.freeze({
+            ssgi: { radius: 8, thickness: 1.5, aoIntensity: 1.0, giIntensity: 1.5, expFactor: 1.5, sliceCount: 2, stepCount: 8, temporal: false },
+            ssr: { quality: 0.45, blurQuality: 2, maxDistance: 0.5, opacity: 0.9, thickness: 0.015 },
+            gtao: { samples: 16, distanceExponent: 1.0, distanceFallOff: 1.0, radius: 0.5, scale: 2.0, thickness: 1.0, resolutionScale: 1.0 },
+            bloom: { strength: 0.4, radius: 0.2, threshold: 0.75 },
+            toonOutline: { thickness: 0.003, alpha: 1.0 },
+            motionBlur: { amount: 1.0, samples: 16 },
+            traa: { useSubpixelCorrection: true, depthThreshold: 0.0005, edgeDepthDiff: 0.001, maxVelocityLength: 128 },
+            contactShadow: { maxDistance: 0.1, thickness: 0.006, shadowIntensity: 0.85, quality: 0.3, temporal: false },
+            retro: { wiggle: false, affineDistortion: 5.0, resolutionScale: 0.25, filterTextures: false, dither: false, colorDepth: 32, scanlines: false, scanlineIntensity: 0.3, scanlineDensity: 1.0, crt: false, vignetteIntensity: 0.3, bleeding: 0.001, curvature: 0.02 },
+            volumetric: { intensity: 1.0, steps: 12, density: 0.5, denoise: 0.6, resolution: 0.25 },
+            pixel: { pixelate: false, pixelSize: 4, chromatic: false, chromaticIntensity: 0.005, sharpen: false, sharpenStrength: 0.5, grain: false, grainIntensity: 0.08, brightness: 0, contrast: 0, saturation: 0 },
+            dof: { autoFromCamera: true, focusDistance: 100, focalLength: 50, bokehScale: 5 },
+            fog: { type: 0, opacity: 1.0, near: 10, far: 500, density: 0.01, noiseScale: 0.005, noiseSpeed: 0.2, height: 20 },
+        });
+
+        function getPostFxSectionDefaultValues(section) {
+            if (!section) return null;
+            // PowerShot defaults live in getValues({}) (film / IR / NightShot fields included).
+            if (section.key === 'powershot') return section.getValues({});
+            return POSTFX_SECTION_DEFAULTS[section.key] || null;
+        }
+
+        // Right-click a range slider to snap it back to its default.
+        // Hand-authored: { getDefault/defaultValue, apply }.
+        // Generated section controls: { control, getDefault, setValue, valueEl }.
+        function bindRangeReset(input, {
+            defaultValue = null,
+            getDefault = null,
+            apply = null,
+            control = null,
+            setValue = null,
+            valueEl = null,
+            persist = true,
+        } = {}) {
+            if (!input || input.dataset.maxjsRangeResetBound === '1') return;
+            input.dataset.maxjsRangeResetBound = '1';
+            input.title = input.title
+                ? `${input.title} · Right-click to reset`
+                : 'Right-click to reset';
+            input.addEventListener('contextmenu', (e) => {
+                e.preventDefault();
+                if (input.disabled) return;
+                const next = typeof getDefault === 'function' ? getDefault() : defaultValue;
+                if (next == null || next === undefined) return;
+
+                if (typeof apply === 'function') {
+                    apply(next);
+                    return;
+                }
+                if (!control || typeof setValue !== 'function') return;
+                if (control.type === 'checkbox' || control.type === 'select') return;
+                if (postFxControlSliderMode(control) !== 'linear') {
+                    input.value = String(valueToPostFxDynamicSliderInput(control, next, next));
+                } else {
+                    input.value = String(next);
+                }
+                setValue(next);
+                if (valueEl) valueEl.textContent = formatControlValue(control, next);
+                if (persist) syncPostFxPanel(true, { persist: true });
+                else if (control.affectsVisibility) syncPostFxPanel(false, { persist: false });
+            });
         }
 
         function formatControlValue(control, value) {
@@ -1062,36 +1129,25 @@ function createPostFxGlue(deps = {}) {
             }
 
             document.getElementById('btnPostPanelReset').onclick = () => {
-                // Reset all FX values to defaults then disable
-                // Does NOT touch HDRI or clay mode
-                const defaults = {
-                    ssgi: { radius: 8, thickness: 1.5, aoIntensity: 1.0, giIntensity: 1.5, expFactor: 1.5, sliceCount: 2, stepCount: 8, temporal: false },
-                    ssr: { quality: 0.45, blurQuality: 2, maxDistance: 0.5, opacity: 0.9, thickness: 0.015 },
-                    gtao: { samples: 16, distanceExponent: 1.0, distanceFallOff: 1.0, radius: 0.5, scale: 2.0, thickness: 1.0, resolutionScale: 1.0 },
-                    bloom: { strength: 0.4, radius: 0.2, threshold: 0.75 },
-                    toonOutline: { thickness: 0.003, alpha: 1.0 },
-                    motionBlur: { amount: 1.0, samples: 16 },
-                    traa: { useSubpixelCorrection: true, depthThreshold: 0.0005, edgeDepthDiff: 0.001, maxVelocityLength: 128 },
-                    contactShadow: { maxDistance: 0.1, thickness: 0.006, shadowIntensity: 0.85, quality: 0.3, temporal: false },
-                    retro: { wiggle: false, affineDistortion: 5.0, resolutionScale: 0.25, filterTextures: false, dither: false, colorDepth: 32, scanlines: false, scanlineIntensity: 0.3, scanlineDensity: 1.0, crt: false, vignetteIntensity: 0.3, bleeding: 0.001, curvature: 0.02 },
-                    volumetric: { intensity: 1.0, steps: 12, density: 0.5, denoise: 0.6, resolution: 0.25 },
-                    pixel: { pixelate: false, pixelSize: 4, chromatic: false, chromaticIntensity: 0.005, sharpen: false, sharpenStrength: 0.5, grain: false, grainIntensity: 0.08, brightness: 0, contrast: 0, saturation: 0 },
-                    powershot: { mode: 'digital', preset: 'powershot', amount: 1.0, resolutionScale: 0.75, lensSoftness: 0.32, ccdBloom: 0.35, noiseScale: 1.06, bayerNR: 0.5, chromaNR: 1.0, jpegStrength: 0.2, jpegQuality: 60, jpegChroma420: 0.75, jpegMidtone: 0.45, jpegHighlight: 1.0, brightness: 0, contrast: 0, analogStrength: 0.72, analogTracking: 0.46, analogChromaBleed: 0.76, analogRinging: 0.62, analogTapeNoise: 0.70, analogBandMask: 0.35, analogEdgeWave: 0.34, analogDropouts: 0.32, analogScanlines: 0.54, analogHeadSwitch: 0.42, freezeNoise: false },
-                    fog: { type: 0, opacity: 1.0, near: 10, far: 500, density: 0.01, noiseScale: 0.005, noiseSpeed: 0.2, height: 20 },
-                };
-                if (clayModeActive) {
+                // Reset all FX values to defaults then disable.
+                // Does NOT touch HDRI or clay mode (only the clay restore snapshot).
+                if (deps.isClayModeActive?.()) {
                     // Clay owns the live FX state — reset the snapshot so exit restores to defaults
-                    clayPreFxSnapshot = { ssgi: false, ssr: false, gtao: false, bloom: false,
+                    deps.setClayPreFxSnapshot?.({
+                        ssgi: false, ssr: false, gtao: false, bloom: false,
                         toonOutline: false, motionBlur: false, traa: false, contactShadow: false,
-                        retro: false, volumetric: false, pixel: false, powershot: false, fog: false, clone: false };
+                        retro: false, volumetric: false, pixel: false, powershot: false, fog: false, clone: false,
+                    });
                     // Still push default values so they're ready when clay exits
                     for (const section of postFxSections) {
-                        if (defaults[section.key]) section.setValues(defaults[section.key]);
+                        const values = getPostFxSectionDefaultValues(section);
+                        if (values) section.setValues(values);
                     }
                 } else {
                     for (const section of postFxSections) {
                         section.setEnabled(false);
-                        if (defaults[section.key]) section.setValues(defaults[section.key]);
+                        const values = getPostFxSectionDefaultValues(section);
+                        if (values) section.setValues(values);
                     }
                 }
                 deps.currentToneMapping = deps.DEFAULT_TONE_MAPPING;
@@ -1101,6 +1157,7 @@ function createPostFxGlue(deps = {}) {
                 deps.maxjsFx.setCloneEnabled(false);
                 deps.maxjsFx.setCloneOptions({ threshold: 0.53, blurRadius: 0, minBlobSize: 0, opacity: 1.0, gridDensity: 0, smoothing: 0.75, invert: false, source: 'luma' });
                 deps.maxjsFx.setColorGrading({ brightness: 0, contrast: 0 });
+                syncPathTracingDofFromPostFx();
                 if (deps.asciiActive) deps.exitAsciiMode();
                 deps.asciiSettings = { resolution: 0.15, color: 'white', invert: false };
                 deps.performanceSettings = { ...deps.PERFORMANCE_DEFAULTS };
@@ -1170,33 +1227,59 @@ function createPostFxGlue(deps = {}) {
                 expLabel.textContent = formatExposureEvLabel(deps.currentExposure);
             };
             expSlider.onchange = () => savePostFxState();
+            bindRangeReset(expSlider, {
+                defaultValue: 1.0,
+                apply: (v) => {
+                    deps.currentExposure = v;
+                    expSlider.value = String(exposureLinearToSliderInput(v));
+                    applyCoreToneMappingState();
+                    expLabel.textContent = formatExposureEvLabel(v);
+                    savePostFxState();
+                },
+            });
 
-            // Brightness / Contrast (global color grading, runs independently of Pixel FX)
+            // Brightness / Contrast: CSS canvas filter when PowerShot is off;
+            // post-ISP powershotLinearGrade when PowerShot is on (corrective,
+            // after the imager — exposure stays on the mode-specific knobs).
             const brightnessSlider = document.getElementById('fx-tonemapping-brightness');
             const brightnessLabel = document.getElementById('fx-tonemapping-brightness-val');
             const contrastSlider = document.getElementById('fx-tonemapping-contrast');
             const contrastLabel = document.getElementById('fx-tonemapping-contrast-val');
             const usePowerShotColorGrading = () => deps.maxjsFx.isPowerShotEnabled?.() === true;
+            const applyToneGrade = (key, v) => {
+                if (usePowerShotColorGrading()) deps.maxjsFx.setPowerShotOptions({ [key]: v });
+                else deps.maxjsFx.setColorGrading({ [key]: v });
+            };
             brightnessSlider.oninput = (e) => {
                 const v = parseFloat(e.target.value);
-                if (usePowerShotColorGrading()) {
-                    deps.maxjsFx.setPowerShotOptions({ brightness: v });
-                } else {
-                    deps.maxjsFx.setColorGrading({ brightness: v });
-                }
+                applyToneGrade('brightness', v);
                 brightnessLabel.textContent = v.toFixed(2);
             };
             brightnessSlider.onchange = () => savePostFxState();
             contrastSlider.oninput = (e) => {
                 const v = parseFloat(e.target.value);
-                if (usePowerShotColorGrading()) {
-                    deps.maxjsFx.setPowerShotOptions({ contrast: v });
-                } else {
-                    deps.maxjsFx.setColorGrading({ contrast: v });
-                }
+                applyToneGrade('contrast', v);
                 contrastLabel.textContent = v.toFixed(2);
             };
             contrastSlider.onchange = () => savePostFxState();
+            bindRangeReset(brightnessSlider, {
+                defaultValue: 0,
+                apply: (v) => {
+                    brightnessSlider.value = String(v);
+                    applyToneGrade('brightness', v);
+                    brightnessLabel.textContent = v.toFixed(2);
+                    savePostFxState();
+                },
+            });
+            bindRangeReset(contrastSlider, {
+                defaultValue: 0,
+                apply: (v) => {
+                    contrastSlider.value = String(v);
+                    applyToneGrade('contrast', v);
+                    contrastLabel.textContent = v.toFixed(2);
+                    savePostFxState();
+                },
+            });
 
             // Anti-Aliasing mode
             const aaSelect = document.getElementById('fx-aa-mode');
@@ -1233,6 +1316,17 @@ function createPostFxGlue(deps = {}) {
                 deps.applyRendererPerformanceSettings({ resizePostFx: true });
                 savePostFxState();
             };
+            bindRangeReset(renderScaleSlider, {
+                defaultValue: deps.PERFORMANCE_DEFAULTS.renderScale,
+                apply: (v) => {
+                    const scale = Math.max(0.25, Math.min(1.0, Number(v) || 1.0));
+                    renderScaleSlider.value = String(scale);
+                    renderScaleValue.textContent = `${scale.toFixed(2)}x`;
+                    deps.performanceSettings.renderScale = scale;
+                    deps.applyRendererPerformanceSettings({ resizePostFx: true });
+                    savePostFxState();
+                },
+            });
             postFxScaleSlider.oninput = (e) => {
                 const scale = Math.max(0.25, Math.min(1.0, Number(e.target.value) || 1.0));
                 postFxScaleValue.textContent = `${scale.toFixed(2)}x`;
@@ -1242,6 +1336,17 @@ function createPostFxGlue(deps = {}) {
                 deps.applyRendererPerformanceSettings({ resizePostFx: true });
                 savePostFxState();
             };
+            bindRangeReset(postFxScaleSlider, {
+                defaultValue: deps.PERFORMANCE_DEFAULTS.postFxScale,
+                apply: (v) => {
+                    const scale = Math.max(0.25, Math.min(1.0, Number(v) || 1.0));
+                    postFxScaleSlider.value = String(scale);
+                    postFxScaleValue.textContent = `${scale.toFixed(2)}x`;
+                    deps.performanceSettings.postFxScale = scale;
+                    deps.applyRendererPerformanceSettings({ resizePostFx: true });
+                    savePostFxState();
+                },
+            });
             optimizeInstancesCheck.onchange = () => {
                 deps.performanceSettings.optimizeMaxInstances = optimizeInstancesCheck.checked;
                 deps.disposeMaxInstanceBuckets();
@@ -1282,6 +1387,17 @@ function createPostFxGlue(deps = {}) {
                 deps.disposeMaxInstanceBuckets();
                 savePostFxState();
             };
+            bindRangeReset(instanceThresholdSlider, {
+                defaultValue: deps.PERFORMANCE_DEFAULTS.maxInstanceBucketThreshold,
+                apply: (v) => {
+                    const n = Math.max(2, Math.round(Number(v) || 50));
+                    instanceThresholdSlider.value = String(n);
+                    instanceThresholdValue.textContent = String(n);
+                    deps.performanceSettings.maxInstanceBucketThreshold = n;
+                    deps.disposeMaxInstanceBuckets();
+                    savePostFxState();
+                },
+            });
 
             // Camera clipping controls
             const cameraNearInput = document.getElementById('fx-camera-near');
@@ -1317,6 +1433,20 @@ function createPostFxGlue(deps = {}) {
             cameraFarInput.oninput = previewCameraClip;
             cameraNearInput.onchange = () => { commitCameraClip(); savePostFxState(); };
             cameraFarInput.onchange = () => { commitCameraClip(); savePostFxState(); };
+            bindRangeReset(cameraNearInput, {
+                defaultValue: '',
+                apply: () => {
+                    cameraNearInput.value = '';
+                    commitCameraClip();
+                },
+            });
+            bindRangeReset(cameraFarInput, {
+                defaultValue: '',
+                apply: () => {
+                    cameraFarInput.value = '';
+                    commitCameraClip();
+                },
+            });
 
             // HDRI Environment controls
             const hdriFileInput = document.getElementById('fx-hdri-file');
@@ -1336,6 +1466,16 @@ function createPostFxGlue(deps = {}) {
                 deps.applyLocalHDRISettings();
             };
             hdriRotSlider.onchange = () => savePostFxState();
+            bindRangeReset(hdriRotSlider, {
+                defaultValue: 0,
+                apply: (v) => {
+                    deps.localHdriRotation = v;
+                    hdriRotSlider.value = String(v);
+                    hdriRotVal.textContent = String(Math.round(v));
+                    deps.applyLocalHDRISettings();
+                    savePostFxState();
+                },
+            });
             const hdriIntSlider = document.getElementById('fx-hdri-intensity');
             const hdriIntVal = document.getElementById('fx-hdri-intensity-val');
             hdriIntSlider.oninput = (e) => {
@@ -1344,6 +1484,16 @@ function createPostFxGlue(deps = {}) {
                 deps.applyLocalHDRISettings();
             };
             hdriIntSlider.onchange = () => savePostFxState();
+            bindRangeReset(hdriIntSlider, {
+                defaultValue: 1,
+                apply: (v) => {
+                    deps.localHdriIntensity = v;
+                    hdriIntSlider.value = String(v);
+                    hdriIntVal.textContent = v.toFixed(2);
+                    deps.applyLocalHDRISettings();
+                    savePostFxState();
+                },
+            });
             const hdriBlurSlider = document.getElementById('fx-hdri-blur');
             const hdriBlurVal = document.getElementById('fx-hdri-blur-val');
             hdriBlurSlider.oninput = (e) => {
@@ -1352,6 +1502,16 @@ function createPostFxGlue(deps = {}) {
                 deps.applyLocalHDRISettings();
             };
             hdriBlurSlider.onchange = () => savePostFxState();
+            bindRangeReset(hdriBlurSlider, {
+                defaultValue: 0,
+                apply: (v) => {
+                    deps.localHdriBlur = v;
+                    hdriBlurSlider.value = String(v);
+                    hdriBlurVal.textContent = v.toFixed(2);
+                    deps.applyLocalHDRISettings();
+                    savePostFxState();
+                },
+            });
             const hdriFlipCheck = document.getElementById('fx-hdri-flip');
             hdriFlipCheck.onchange = () => {
                 deps.localHdriFlip = hdriFlipCheck.checked;
@@ -1430,6 +1590,12 @@ function createPostFxGlue(deps = {}) {
                     deps.setHaloGiSetting('enabled', !(gi.isOn && gi.isOn()), { persist: true });
                     syncGiPanel();
                 };
+                const HALO_GI_RANGE_DEFAULTS = Object.freeze({
+                    intensity: 10, divisions: 16, rays: 64, hysteresis: 0.9,
+                    normalBias: 1.75, radianceClamp: 8, depthSharpness: 40,
+                    cheby: 0.5, classify: 0, filter: 1, smoothness: 1, detail: 1,
+                    changeThreshold: 2.5, snapAmount: 0.30, fireflyClamp: 6.0,
+                });
                 for (const control of deps.HALO_GI_NUMERIC_CONTROLS) {
                     const input = document.getElementById(`fx-gi-${control.key}`);
                     const val = document.getElementById(`fx-gi-${control.key}-val`);
@@ -1442,6 +1608,15 @@ function createPostFxGlue(deps = {}) {
                     };
                     input.oninput = () => apply(false);
                     input.onchange = () => apply(true);
+                    bindRangeReset(input, {
+                        defaultValue: HALO_GI_RANGE_DEFAULTS[control.key] ?? control.min,
+                        apply: (raw) => {
+                            const next = deps.clampHaloGiNumber(control.key, raw);
+                            input.value = String(next);
+                            if (val) val.textContent = deps.formatHaloGiValue(control.key, next);
+                            deps.setHaloGiSetting(control.key, next, { persist: true });
+                        },
+                    });
                 }
                 if (giCascades) giCascades.onchange = () => deps.setHaloGiSetting('cascades', giCascades.value, { persist: true });
                 if (giContinuous) giContinuous.onchange = () => deps.setHaloGiSetting('continuous', giContinuous.checked, { persist: true });
@@ -1466,6 +1641,14 @@ function createPostFxGlue(deps = {}) {
                     deps.maxjsFx.setCloneOptions({ source: cloneSource.value });
                     savePostFxState();
                 };
+                const cloneDefaults = Object.freeze({
+                    threshold: 0.53,
+                    blurRadius: 0,
+                    minBlobSize: 0,
+                    gridDensity: 0,
+                    smoothing: 0.75,
+                    opacity: 1.0,
+                });
                 for (const key of cloneSliders) {
                     const input = document.getElementById(`fx-clone-${key}`);
                     const valEl = document.getElementById(`fx-clone-${key}-val`);
@@ -1476,6 +1659,15 @@ function createPostFxGlue(deps = {}) {
                     };
                     input.oninput = applyCloneSlider;
                     input.onchange = () => savePostFxState();
+                    bindRangeReset(input, {
+                        defaultValue: cloneDefaults[key],
+                        apply: (v) => {
+                            input.value = String(v);
+                            if (valEl) valEl.textContent = v >= 1 ? String(Math.round(v)) : v.toFixed(2);
+                            deps.maxjsFx.setCloneOptions({ [key]: v });
+                            savePostFxState();
+                        },
+                    });
                 }
                 const invertCheck = document.getElementById('fx-clone-invert');
                 invertCheck.onchange = () => {
@@ -1511,6 +1703,16 @@ function createPostFxGlue(deps = {}) {
                     deps.maxjsFx.setRetroOptions({ affineDistortion: v });
                 };
                 snapGridSlider.onchange = () => savePostFxState();
+                bindRangeReset(snapGridSlider, {
+                    defaultValue: 5.0,
+                    apply: (v) => {
+                        if (!deps.maxjsFx.supportsScreenSpaceEffects()) return;
+                        snapGridSlider.value = String(v);
+                        snapGridVal.textContent = v.toFixed(1);
+                        deps.maxjsFx.setRetroOptions({ affineDistortion: v });
+                        savePostFxState();
+                    },
+                });
 
                 // ASCII controls
                 const asciiToggle = document.getElementById('fx-toggle-ascii');
@@ -1530,6 +1732,16 @@ function createPostFxGlue(deps = {}) {
                     if (deps.asciiActive) deps.rebuildAsciiEffect();
                 };
                 asciiResSlider.onchange = () => savePostFxState();
+                bindRangeReset(asciiResSlider, {
+                    defaultValue: 0.15,
+                    apply: (v) => {
+                        deps.asciiSettings.resolution = v;
+                        asciiResSlider.value = String(v);
+                        asciiResVal.textContent = v.toFixed(2);
+                        if (deps.asciiActive) deps.rebuildAsciiEffect();
+                        savePostFxState();
+                    },
+                });
                 asciiColorSelect.onchange = () => {
                     deps.asciiSettings.color = asciiColorSelect.value;
                     if (deps.asciiActive) deps.rebuildAsciiEffect();
@@ -1629,6 +1841,15 @@ function createPostFxGlue(deps = {}) {
                         });
                         input.addEventListener('change', () => commitControlValue(true));
                     }
+
+                    if (control.type !== 'checkbox' && control.type !== 'select') {
+                        bindRangeReset(input, {
+                            control,
+                            valueEl,
+                            getDefault: () => getPostFxSectionDefaultValues(section)?.[control.key],
+                            setValue: (value) => section.setValues({ [control.key]: value }),
+                        });
+                    }
                 }
             }
         }
@@ -1675,26 +1896,30 @@ function createPostFxGlue(deps = {}) {
             const instanceThresholdSlider = document.getElementById('fx-performance-instancethreshold');
             const instanceThresholdValue = document.getElementById('fx-performance-instancethreshold-val');
             const performanceNote = document.getElementById('fx-performance-note');
+            const powerShotOwnsToneMap = deps.maxjsFx.isPowerShotEnabled?.() === true;
             const tmSelect = document.getElementById('fx-tonemapping-mode');
             if (canSyncInput(tmSelect)) tmSelect.value = deps.currentToneMapping;
+            if (tmSelect) tmSelect.disabled = powerShotOwnsToneMap;
             const expSlider = document.getElementById('fx-tonemapping-exp');
             const expLabel = document.getElementById('fx-tonemapping-exp-val');
             if (canSyncInput(expSlider)) {
                 expSlider.value = String(exposureLinearToSliderInput(deps.currentExposure));
             }
             if (expLabel) expLabel.textContent = formatExposureEvLabel(deps.currentExposure);
-            const colorGradingUsesPowerShot = deps.maxjsFx.isPowerShotEnabled?.() === true;
-            const cg = colorGradingUsesPowerShot
+            if (expSlider) expSlider.disabled = powerShotOwnsToneMap;
+            // PowerShot replaces the tone map; brightness/contrast ride its
+            // post-effect grade. Without PowerShot they use the CSS filter.
+            const cg = powerShotOwnsToneMap
                 ? deps.maxjsFx.getState().powershot
                 : deps.maxjsFx.getColorGrading();
             const brightnessSlider = document.getElementById('fx-tonemapping-brightness');
             const brightnessLabel = document.getElementById('fx-tonemapping-brightness-val');
             const contrastSlider = document.getElementById('fx-tonemapping-contrast');
             const contrastLabel = document.getElementById('fx-tonemapping-contrast-val');
-            if (canSyncInput(brightnessSlider)) brightnessSlider.value = String(cg.brightness);
-            if (brightnessLabel) brightnessLabel.textContent = cg.brightness.toFixed(2);
-            if (canSyncInput(contrastSlider)) contrastSlider.value = String(cg.contrast);
-            if (contrastLabel) contrastLabel.textContent = cg.contrast.toFixed(2);
+            if (canSyncInput(brightnessSlider)) brightnessSlider.value = String(cg.brightness ?? 0);
+            if (brightnessLabel) brightnessLabel.textContent = (cg.brightness ?? 0).toFixed(2);
+            if (canSyncInput(contrastSlider)) contrastSlider.value = String(cg.contrast ?? 0);
+            if (contrastLabel) contrastLabel.textContent = (cg.contrast ?? 0).toFixed(2);
             if (brightnessSlider) brightnessSlider.disabled = false;
             if (contrastSlider) contrastSlider.disabled = false;
             const aaSelect = document.getElementById('fx-aa-mode');

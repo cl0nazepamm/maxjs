@@ -162,7 +162,6 @@ export function createMaxJSFxController({
     const powerShotFinal = createPowerShotFinal({
         renderer,
         getOptions: () => state.powershot,
-        getColorGrading: () => state.colorGrading,
         getScaledPostFxSize: core.getScaledPostFxSize,
         supportsScreenSpaceEffects,
         isShaderLabEnabled,
@@ -1203,6 +1202,7 @@ export function createMaxJSFxController({
             assignFinite(state.powershot, 'filmFlicker', options.filmFlicker);
             if (typeof options.filmNegative === 'boolean') state.powershot.filmNegative = options.filmNegative;
             assignFinite(state.powershot, 'irExposure', options.irExposure);
+            assignFinite(state.powershot, 'irInputGamma', options.irInputGamma);
             assignFinite(state.powershot, 'irResponse', options.irResponse);
             assignFinite(state.powershot, 'irLocalGain', options.irLocalGain);
             assignFinite(state.powershot, 'irGlow', options.irGlow);

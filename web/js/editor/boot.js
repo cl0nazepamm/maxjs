@@ -2094,6 +2094,8 @@
             btnPostFxPanel,
             rightDock,
             postPanel,
+            isClayModeActive,
+            setClayPreFxSnapshot,
         } = panelsMisc;
         syncRendererButtonUi();
 
@@ -2239,6 +2241,8 @@
             btnPostFxPanel,
             postPanel,
             rightDock,
+            isClayModeActive,
+            setClayPreFxSnapshot,
             get _projectRuntimeRef() { return _projectRuntimeRef; },
             get asciiActive() { return asciiActive; },
             get asciiSettings() { return asciiSettings; },

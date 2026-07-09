@@ -2,6 +2,9 @@
     void SendFullSync() {
         Interface* ip = GetCOREInterface();
         if (!ip) return;
+        // Serialization touches every material/texmap — keep the watcher from
+        // re-queuing our own evaluation echoes as user edits.
+        SuppressMaterialEditCaptureScope suppressEcho(*this);
         TimeValue t = ip->GetTime();
         INode* root = ip->GetRootNode();
         if (!root) return;
@@ -187,6 +190,9 @@
                 ss << L"{\"h\":" << handle;
                 ss << L",\"n\":\"" << EscapeJson(node->GetName()) << L'"';
                 ss << L",\"helper\":true";
+                // Group heads are flagged so the viewer's Flatten Groups pass
+                // can target actual Max groups and not generic helper parents.
+                if (node->IsGroupHead()) ss << L",\"grp\":1";
                 ss << L",\"s\":" << (node->Selected() ? L'1' : L'0');
                 ss << L",\"vis\":" << (IsMaxJsSyncDrawVisible(node) ? L'1' : L'0');
                 WriteNodeParentJson(ss, node);
@@ -403,6 +409,8 @@
     void SendFullSyncBinary() {
         Interface* ip = GetCOREInterface();
         if (!ip) return;
+        // Same echo suppression as SendFullSync.
+        SuppressMaterialEditCaptureScope suppressEcho(*this);
         TimeValue t = ip->GetTime();
         INode* root = ip->GetRootNode();
         if (!root) return;
@@ -445,6 +453,7 @@
             bool visible = true;
             bool spline = false;
             bool helper = false;
+            bool groupHead = false;
             size_t vOff, iOff, uvOff, uv2Off, nOff;
             uint64_t objId = 0;      // evaluated Object* — instances share this
             ULONG instOfHandle = 0;  // 0 = owns geometry, else = shares from this handle
@@ -513,6 +522,7 @@
                     helper.parentHandle = GetMaxJSParentHandle(node);
                     helper.visible = IsMaxJsSyncDrawVisible(node);
                     helper.helper = true;
+                    helper.groupHead = node->IsGroupHead();
                     geos.push_back(std::move(helper));
                     helperHandles_.insert(node->GetHandle());
                     collect(node);
@@ -770,6 +780,7 @@
             if (ng.parentHandle != 0) ss << L",\"p\":" << ng.parentHandle;
             if (ng.helper) {
                 ss << L",\"helper\":true";
+                if (ng.groupHead) ss << L",\"grp\":1";
                 ss << L",\"vis\":" << (ng.visible ? L'1' : L'0');
                 ss << L",\"t\":"; WriteFloats(ss, xform, 16);
                 ss << L'}';

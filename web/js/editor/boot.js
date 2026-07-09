@@ -279,6 +279,10 @@
             postFxScale: 1.0,
             optimizeMaxInstances: true,
             maxInstanceBucketThreshold: 50,
+            // Merge static Max group members into one mesh per material.
+            // Off by default: merged members lose per-node picking until the
+            // cluster dissolves.
+            flattenGroups: false,
             splatsEnabled: true,
         });
         let performanceSettings = { ...PERFORMANCE_DEFAULTS };
@@ -1613,6 +1617,7 @@
             retainGeometryRef,
             releaseGeometryRef,
             disposeMaxInstanceBuckets,
+            disposeFlattenedGroups,
             getMaxInstanceBucketForHandle,
             matrixArraysAlmostEqual,
             updateMaxInstanceBucketVisibility,
@@ -2199,6 +2204,7 @@
             clearLocalHDRI,
             computeVisibleSceneBounds,
             disposeMaxInstanceBuckets,
+            disposeFlattenedGroups,
             enterAsciiMode,
             exitAsciiMode,
             formatHaloGiValue,
@@ -2337,6 +2343,7 @@
                     postFxScale: getEffectivePostFxResolutionScale(),
                     optimizeMaxInstances: performanceSettings.optimizeMaxInstances,
                     maxInstanceBucketThreshold: performanceSettings.maxInstanceBucketThreshold,
+                    flattenGroups: performanceSettings.flattenGroups === true,
                     splatsEnabled: performanceSettings.splatsEnabled !== false,
                 },
                 cameraClip: { near: cameraClip.near, far: cameraClip.far },

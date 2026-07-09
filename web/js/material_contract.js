@@ -153,9 +153,17 @@ export function resolveTextureColorSpace(slotColorSpace, xf, url = '') {
     return slotColorSpace;
 }
 
+function normalizeOutputLut(value) {
+    if (!Array.isArray(value) || value.length < 2) return null;
+    return value.map(entry => {
+        const n = Number(entry);
+        return Number.isFinite(n) ? n : 0;
+    });
+}
+
 export function normalizeTextureTransform(xf) {
     if (!xf || typeof xf !== 'object') return null;
-    return {
+    const normalized = {
         scale: Number.isFinite(xf.scale) && Math.abs(xf.scale) > 1e-6 ? xf.scale : 1.0,
         tiling: [
             Number.isFinite(xf.tiling?.[0]) ? xf.tiling[0] : 1.0,
@@ -180,6 +188,18 @@ export function normalizeTextureTransform(xf) {
         colorSpace: typeof xf.colorSpace === 'string' ? xf.colorSpace : '',
         manualGamma: Number.isFinite(xf.manualGamma) ? xf.manualGamma : 1.0,
     };
+    // Max Output rollout data is attached only when present so cache keys and
+    // material hashes stay byte-identical for the common no-output case.
+    const outLut = normalizeOutputLut(xf.outLut);
+    const outLutR = normalizeOutputLut(xf.outLutR);
+    if (outLut) normalized.outLut = outLut;
+    if (outLutR) {
+        normalized.outLutR = outLutR;
+        normalized.outLutG = normalizeOutputLut(xf.outLutG) ?? outLutR;
+        normalized.outLutB = normalizeOutputLut(xf.outLutB) ?? outLutR;
+    }
+    if (xf.alphaFromRGB) normalized.alphaFromRGB = true;
+    return normalized;
 }
 
 export function wrapModeToThree(mode) {
@@ -298,7 +318,84 @@ function textureComponentToByte(data, index, tex) {
     return Math.round(THREE.MathUtils.clamp(raw, 0, 1) * 255);
 }
 
-function writeSelectedChannelBytes(r, g, b, a, channel, invert, out, outIndex) {
+// ── Max Output rollout (Invert/Clamp/RGB Level/Offset/Color Map) ──
+// The C++ side bakes the whole StdTexoutGen transfer into 256-entry float LUTs
+// (mono `outLut` or per-channel `outLutR/G/B`) sampled in Max's linear domain.
+// Here they collapse into byte→byte tables: for sRGB-encoded textures the
+// stored byte is decoded to linear, pushed through the LUT, and re-encoded so
+// the GPU's sRGB decode lands on Max's filtered linear value.
+
+function srgbByteToLinearUnit(x) {
+    return x <= 0.04045 ? x / 12.92 : Math.pow((x + 0.055) / 1.055, 2.4);
+}
+
+function linearUnitToSrgb(x) {
+    return x <= 0.0031308 ? x * 12.92 : 1.055 * Math.pow(x, 1 / 2.4) - 0.055;
+}
+
+function sampleOutputLut(lut, x) {
+    const pos = x * (lut.length - 1);
+    const i0 = Math.floor(pos);
+    const i1 = Math.min(lut.length - 1, i0 + 1);
+    return lut[i0] + (lut[i1] - lut[i0]) * (pos - i0);
+}
+
+function outputFilterFingerprint(luts, alphaFromRGB, srgbEncoded) {
+    const payload = `${JSON.stringify(luts)}:${alphaFromRGB ? 1 : 0}:${srgbEncoded ? 1 : 0}`;
+    let hash = 0x811c9dc5;
+    for (let i = 0; i < payload.length; i++) {
+        hash ^= payload.charCodeAt(i);
+        hash = Math.imul(hash, 0x01000193) >>> 0;
+    }
+    return hash.toString(16);
+}
+
+export function buildOutputFilter(xf, srgbEncoded) {
+    const mono = Array.isArray(xf?.outLut) && xf.outLut.length >= 2 ? xf.outLut : null;
+    const lutR = Array.isArray(xf?.outLutR) && xf.outLutR.length >= 2 ? xf.outLutR : mono;
+    const alphaFromRGB = !!xf?.alphaFromRGB;
+    if (!lutR && !alphaFromRGB) return null;
+    const lutG = Array.isArray(xf?.outLutG) && xf.outLutG.length >= 2 ? xf.outLutG : lutR;
+    const lutB = Array.isArray(xf?.outLutB) && xf.outLutB.length >= 2 ? xf.outLutB : lutR;
+
+    // tables: filtered bytes in the texture's stored encoding (written back to
+    // the image). linTables: filtered bytes in linear, used for alpha-from-RGB
+    // intensity, which the GPU never sRGB-decodes.
+    const tables = new Uint8Array(768);
+    const linTables = srgbEncoded && alphaFromRGB ? new Uint8Array(768) : null;
+    const luts = [lutR, lutG, lutB];
+    for (let i = 0; i < 256; i++) {
+        const stored = i / 255;
+        const x = srgbEncoded ? srgbByteToLinearUnit(stored) : stored;
+        for (let ch = 0; ch < 3; ch++) {
+            const lut = luts[ch];
+            let y = lut ? sampleOutputLut(lut, x) : x;
+            y = Math.min(1, Math.max(0, y));
+            if (linTables) linTables[ch * 256 + i] = Math.round(y * 255);
+            if (srgbEncoded) y = linearUnitToSrgb(y);
+            tables[ch * 256 + i] = Math.round(y * 255);
+        }
+    }
+    return {
+        tables,
+        linTables,
+        alphaFromRGB,
+        key: outputFilterFingerprint([lutR, lutG, lutB], alphaFromRGB, srgbEncoded),
+    };
+}
+
+function writeSelectedChannelBytes(r, g, b, a, channel, invert, out, outIndex, output) {
+    if (output) {
+        const tables = output.tables;
+        if (output.alphaFromRGB) {
+            const lin = output.linTables || tables;
+            a = Math.round((lin[r] + lin[256 + g] + lin[512 + b]) / 3);
+        }
+        const fr = tables[r];
+        const fg = tables[256 + g];
+        const fb = tables[512 + b];
+        r = fr; g = fg; b = fb;
+    }
     if (channel <= 1) {
         out[outIndex] = invert ? 255 - r : r;
         out[outIndex + 1] = invert ? 255 - g : g;
@@ -324,13 +421,13 @@ function writeSelectedChannelBytes(r, g, b, a, channel, invert, out, outIndex) {
     out[outIndex + 3] = channel === 5 ? value : a;
 }
 
-function writeSelectedTypedTextureChannel(data, pixelIndex, componentCount, tex, channel, invert, out, outIndex) {
+function writeSelectedTypedTextureChannel(data, pixelIndex, componentCount, tex, channel, invert, out, outIndex, output) {
     const base = pixelIndex * componentCount;
     const r = textureComponentToByte(data, base, tex);
     const g = componentCount > 1 ? textureComponentToByte(data, base + 1, tex) : r;
     const b = componentCount > 2 ? textureComponentToByte(data, base + 2, tex) : r;
     const a = componentCount > 3 ? textureComponentToByte(data, base + 3, tex) : 255;
-    writeSelectedChannelBytes(r, g, b, a, channel, invert, out, outIndex);
+    writeSelectedChannelBytes(r, g, b, a, channel, invert, out, outIndex, output);
 }
 
 function applyChannelTexture(tex, image, out, signature) {
@@ -345,7 +442,7 @@ function applyChannelTexture(tex, image, out, signature) {
     pendingChannelSelections.delete(tex);
 }
 
-function applyTypedTextureChannelSelection(tex, image, channel, invert, signature) {
+function applyTypedTextureChannelSelection(tex, image, channel, invert, signature, output) {
     const width = image.width;
     const height = image.height;
     const pixelCount = width * height;
@@ -355,7 +452,7 @@ function applyTypedTextureChannelSelection(tex, image, channel, invert, signatur
 
     const out = new Uint8Array(pixelCount * 4);
     for (let pixel = 0, outIndex = 0; pixel < pixelCount; pixel += 1, outIndex += 4) {
-        writeSelectedTypedTextureChannel(source, pixel, componentCount, tex, channel, invert, out, outIndex);
+        writeSelectedTypedTextureChannel(source, pixel, componentCount, tex, channel, invert, out, outIndex, output);
     }
     applyChannelTexture(tex, image, out, signature);
     return true;
@@ -404,7 +501,17 @@ function componentToByte(data, index, sourceType, isHalfFloat) {
   return Math.round(clamp01(raw) * 255);
 }
 
-function writeBytes(r, g, b, a, channel, invert, out, outIndex) {
+function writeBytes(r, g, b, a, channel, invert, out, outIndex, tables, linTables, alphaFromRGB) {
+  if (tables) {
+    if (alphaFromRGB) {
+      const lin = linTables || tables;
+      a = Math.round((lin[r] + lin[256 + g] + lin[512 + b]) / 3);
+    }
+    const fr = tables[r];
+    const fg = tables[256 + g];
+    const fb = tables[512 + b];
+    r = fr; g = fg; b = fb;
+  }
   if (channel <= 1) {
     out[outIndex] = invert ? 255 - r : r;
     out[outIndex + 1] = invert ? 255 - g : g;
@@ -444,7 +551,7 @@ self.onmessage = event => {
       const g = componentCount > 1 ? componentToByte(source, base + 1, job.sourceType, job.isHalfFloat) : r;
       const b = componentCount > 2 ? componentToByte(source, base + 2, job.sourceType, job.isHalfFloat) : r;
       const a = componentCount > 3 ? componentToByte(source, base + 3, job.sourceType, job.isHalfFloat) : 255;
-      writeBytes(r, g, b, a, job.channel, job.invert, out, outIndex);
+      writeBytes(r, g, b, a, job.channel, job.invert, out, outIndex, job.tables, job.linTables, job.alphaFromRGB);
     }
     self.postMessage({ id: job.id, width: job.width, height: job.height, buffer: out.buffer }, [out.buffer]);
   } catch (error) {
@@ -493,8 +600,8 @@ self.onmessage = event => {
     return channelExtractionWorker;
 }
 
-function channelSelectionKey(image, channel, invert) {
-    return `${image?.width || 0}x${image?.height || 0}:${image?.data?.length || 0}:${channel}:${invert ? 1 : 0}`;
+function channelSelectionKey(image, channel, invert, output) {
+    return `${image?.width || 0}x${image?.height || 0}:${image?.data?.length || 0}:${channel}:${invert ? 1 : 0}:${output?.key || ''}`;
 }
 
 function hasCompletedChannelSelection(tex, image, signature) {
@@ -502,20 +609,20 @@ function hasCompletedChannelSelection(tex, image, signature) {
     return completed?.image === image && completed?.signature === signature;
 }
 
-function scheduleTypedTextureChannelSelection(tex, image, channel, invert) {
+function scheduleTypedTextureChannelSelection(tex, image, channel, invert, output) {
     const width = image.width;
     const height = image.height;
     const pixelCount = width * height;
     const source = image.data;
     if (!pixelCount || !source?.length) return false;
 
-    const signature = `typed:${channelSelectionKey(image, channel, invert)}`;
+    const signature = `typed:${channelSelectionKey(image, channel, invert, output)}`;
     if (hasCompletedChannelSelection(tex, image, signature)) return true;
     if (pendingChannelSelections.has(tex)) return true;
     pendingChannelSelections.set(tex, signature);
 
     const worker = createChannelExtractionWorker();
-    if (!worker) return applyTypedTextureChannelSelection(tex, image, channel, invert, signature);
+    if (!worker) return applyTypedTextureChannelSelection(tex, image, channel, invert, signature, output);
 
     const id = nextChannelWorkerJobId++;
     const pendingImage = { data: new Uint8Array([255, 255, 255, 255]), width: 1, height: 1 };
@@ -533,13 +640,16 @@ function scheduleTypedTextureChannelSelection(tex, image, channel, invert) {
             isHalfFloat: tex?.type === THREE.HalfFloatType,
             channel,
             invert,
+            tables: output?.tables || null,
+            linTables: output?.linTables || null,
+            alphaFromRGB: !!output?.alphaFromRGB,
         }, [sourceBuffer]);
         installPendingChannelTexture(tex, pendingImage);
     } catch (error) {
         pendingChannelWorkerJobs.delete(id);
         console.warn('[material_contract] channel extraction worker transfer failed:', error);
         pendingChannelSelections.set(tex, signature);
-        return applyTypedTextureChannelSelection(tex, image, channel, invert, signature);
+        return applyTypedTextureChannelSelection(tex, image, channel, invert, signature, output);
     }
     return true;
 }
@@ -559,7 +669,7 @@ function isDrawableImageSource(image) {
         (typeof VideoFrame !== 'undefined' && image instanceof VideoFrame);
 }
 
-function applyCanvasChannelSelection(tex, image, width, height, channel, invert, signature) {
+function applyCanvasChannelSelection(tex, image, width, height, channel, invert, signature, output) {
     const canvas = document.createElement('canvas');
     canvas.width = width;
     canvas.height = height;
@@ -573,7 +683,7 @@ function applyCanvasChannelSelection(tex, image, width, height, channel, invert,
         const g = data[i + 1];
         const b = data[i + 2];
         const a = data[i + 3];
-        writeSelectedChannelBytes(r, g, b, a, channel, invert, data, i);
+        writeSelectedChannelBytes(r, g, b, a, channel, invert, data, i, output);
     }
     ctx.putImageData(imageData, 0, 0);
     tex.image = canvas;
@@ -582,15 +692,19 @@ function applyCanvasChannelSelection(tex, image, width, height, channel, invert,
     return true;
 }
 
-function scheduleCanvasChannelSelection(tex, image, width, height, channel, invert) {
-    const signature = `canvas:${width}x${height}:${channel}:${invert ? 1 : 0}`;
+function canvasChannelSelectionKey(width, height, channel, invert, output) {
+    return `canvas:${width}x${height}:${channel}:${invert ? 1 : 0}:${output?.key || ''}`;
+}
+
+function scheduleCanvasChannelSelection(tex, image, width, height, channel, invert, output) {
+    const signature = canvasChannelSelectionKey(width, height, channel, invert, output);
     if (hasCompletedChannelSelection(tex, image, signature)) return true;
     if (pendingChannelSelections.has(tex)) return true;
     pendingChannelSelections.set(tex, signature);
     scheduleDeferredTask(() => {
         if (pendingChannelSelections.get(tex) !== signature) return;
         try {
-            if (tex.image === image) applyCanvasChannelSelection(tex, image, width, height, channel, invert, signature);
+            if (tex.image === image) applyCanvasChannelSelection(tex, image, width, height, channel, invert, signature, output);
         } catch (error) {
             console.warn('[material_contract] channel extraction failed:', error);
         } finally {
@@ -603,7 +717,10 @@ function scheduleCanvasChannelSelection(tex, image, width, height, channel, inve
 export function applyTextureChannelSelection(tex, xf) {
     const channel = xf?.channel ?? 1;
     const invert = !!xf?.invert;
-    if (channel <= 1 && !invert) return tex;
+    // Output-rollout LUTs operate in Max's linear domain; sRGB-stored textures
+    // are decoded/re-encoded around the LUT so the GPU sees matching values.
+    const output = buildOutputFilter(xf, tex?.colorSpace === THREE.SRGBColorSpace);
+    if (channel <= 1 && !invert && !output) return tex;
 
     const image = tex?.image;
     if (isVideoTextureImage(image)) return tex;
@@ -612,21 +729,21 @@ export function applyTextureChannelSelection(tex, xf) {
     if (!width || !height) return tex;
 
     if (isTypedTextureImage(image)) {
-        scheduleTypedTextureChannelSelection(tex, image, channel, invert);
+        scheduleTypedTextureChannelSelection(tex, image, channel, invert, output);
         return tex;
     }
 
     const pixelCount = width * height;
     if (typeof document === 'undefined' || !isDrawableImageSource(image)) return tex;
-    const signature = `canvas:${width}x${height}:${channel}:${invert ? 1 : 0}`;
+    const signature = canvasChannelSelectionKey(width, height, channel, invert, output);
     if (hasCompletedChannelSelection(tex, image, signature)) return tex;
     if (pixelCount > MAX_SYNC_DRAWABLE_CHANNEL_EXTRACTION_PIXELS) {
-        scheduleCanvasChannelSelection(tex, image, width, height, channel, invert);
+        scheduleCanvasChannelSelection(tex, image, width, height, channel, invert, output);
         return tex;
     }
 
     try {
-        applyCanvasChannelSelection(tex, image, width, height, channel, invert, signature);
+        applyCanvasChannelSelection(tex, image, width, height, channel, invert, signature, output);
     } catch (error) {
         console.warn('[material_contract] channel extraction failed:', error);
     }

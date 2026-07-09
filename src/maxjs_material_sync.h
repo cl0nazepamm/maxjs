@@ -202,6 +202,15 @@ struct MaxJSPBR {
         std::wstring wrapMode = L"periodic";
         std::wstring colorSpace;   // "sRGB", "Linear", "auto", etc.
         float manualGamma = 1.0f;
+        // BitmapTex Output rollout (StdTexoutGen). Invert/Clamp/RGB Level/RGB
+        // Offset/Output Amount/Color Map are baked into per-channel LUTs by
+        // sampling TextureOutput::Filter so viewer math matches Max exactly.
+        // outLutG/outLutB stay empty when the transfer is monochrome.
+        bool  alphaFromRGB = false;
+        float outBumpAmount = 1.0f;
+        std::vector<float> outLutR;
+        std::vector<float> outLutG;
+        std::vector<float> outLutB;
         bool  isVideo = false;
         bool  videoLoop = true;
         bool  videoMuted = true;
@@ -700,6 +709,92 @@ static bool ExtractStdUVTransform(Texmap* map, MaxJSPBR::TexTransform& xf) {
     return true;
 }
 
+// ── BitmapTex Output rollout (StdTexoutGen) ────────────────
+// The whole Output pipeline (Invert, Clamp, RGB Level, RGB Offset, Color Map
+// curves) is baked by pushing a gray ramp through TextureOutput::Filter — the
+// same call BitmapTex::EvalColor uses — so ordering and curve semantics can
+// never drift from Max. Each output channel depends only on its own input
+// channel, so one ramp pass captures all three transfer functions at once.
+
+// Whether Filter() already folds Output Amount into the filtered color differs
+// by implementation detail, so probe once with a scratch default instance.
+static bool TexoutFilterAppliesOutAmt() {
+    static int cached = -1;
+    if (cached >= 0) return cached != 0;
+    cached = 1; // assume folded in: never double-apply on probe failure
+    if (TextureOutput* probe = GetNewDefaultTextureOutput()) {
+        auto* stdOut = static_cast<StdTexoutGen*>(probe);
+        if (stdOut->IsStdTexoutGen()) {
+            HoldSuspend hs;
+            stdOut->SetOutAmt(2.0f, 0);
+            Interval valid = FOREVER;
+            probe->Update(0, valid);
+            cached = probe->Filter(0.5f) > 0.75f ? 1 : 0;
+        }
+        probe->MaybeAutoDelete();
+    }
+    return cached != 0;
+}
+
+static constexpr int kTexoutLutSize = 256;
+
+static bool TexoutLutIsIdentity(const std::vector<float>& lut) {
+    for (int i = 0; i < kTexoutLutSize; ++i) {
+        if (std::fabs(lut[i] - i / 255.0f) > 0.5f / 255.0f) return false;
+    }
+    return true;
+}
+
+static void ExtractBitmapTexOutput(Texmap* map, MaxJSPBR::TexTransform& xf) {
+    if (!map || map->ClassID() != Class_ID(BMTEX_CLASS_ID, 0)) return;
+    TextureOutput* texout = static_cast<BitmapTex*>(map)->GetTexout();
+    if (!texout) return;
+    auto* stdOut = static_cast<StdTexoutGen*>(texout);
+    if (!stdOut->IsStdTexoutGen()) return;
+
+    const TimeValue t = GetCOREInterface() ? GetCOREInterface()->GetTime() : 0;
+    Interval valid = FOREVER;
+    texout->Update(t, valid);
+
+    xf.alphaFromRGB = stdOut->GetAlphaFromRGB() != FALSE;
+    xf.outBumpAmount = stdOut->GetBumpAmt(t);
+
+    const float outAmt = stdOut->GetOutAmt(t);
+    const bool defaultFilter =
+        !stdOut->GetInvert() &&
+        !stdOut->GetClamp() &&
+        !stdOut->GetFlag(TEXOUT_COLOR_MAP) &&
+        std::fabs(stdOut->GetRGBAmt(t) - 1.0f) <= 1.0e-6f &&
+        std::fabs(stdOut->GetRGBOff(t)) <= 1.0e-6f &&
+        std::fabs(outAmt - 1.0f) <= 1.0e-6f;
+    if (defaultFilter) return;
+
+    const float outScale = TexoutFilterAppliesOutAmt() ? 1.0f : outAmt;
+    std::vector<float> lutR(kTexoutLutSize), lutG(kTexoutLutSize), lutB(kTexoutLutSize);
+    bool mono = true;
+    for (int i = 0; i < kTexoutLutSize; ++i) {
+        const float v = i / 255.0f;
+        const AColor c = texout->Filter(AColor(v, v, v, 1.0f));
+        lutR[i] = c.r * outScale;
+        lutG[i] = c.g * outScale;
+        lutB[i] = c.b * outScale;
+        if (mono && (std::fabs(lutG[i] - lutR[i]) > 1.0e-4f ||
+                     std::fabs(lutB[i] - lutR[i]) > 1.0e-4f)) {
+            mono = false;
+        }
+    }
+    // Enable Color Map with an untouched linear curve (and friends) still
+    // filters to a straight ramp — drop it so the payload and material hash
+    // stay identical to the no-output case.
+    if (mono && TexoutLutIsIdentity(lutR)) return;
+
+    xf.outLutR = std::move(lutR);
+    if (!mono) {
+        xf.outLutG = std::move(lutG);
+        xf.outLutB = std::move(lutB);
+    }
+}
+
 // ── Procedural Map Baking ──────────────────────────────────
 // TODO(maxjs): Revisit generic 3ds Max procedural texmap baking after release.
 // The current experimental fallback is intentionally disabled at the call site in
@@ -982,6 +1077,7 @@ static bool ExtractMaterialTexture(Texmap* map, std::wstring& filePath, MaxJSPBR
         filePath = filename;
         xf = {};
         ExtractStdUVTransform(resolved, xf);
+        ExtractBitmapTexOutput(resolved, xf);
         if (resolved != map) {
             if (IsAutodeskUberBitmap(map)) {
                 ExtractUberBitmapTransform(map, xf, outputChannelIndex);

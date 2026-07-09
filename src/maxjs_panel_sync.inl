@@ -740,6 +740,140 @@
         SetDirty(false);
     }
 
+    // ── Material edit watcher ────────────────────────────────
+    // Standard 3ds Max materials (Physical/Standard/VRay...) have no plugin
+    // edit hook — only maxjs's own material classes call
+    // MaxJSNotifyMaterialEdited from their PBAccessors. Everything else used
+    // to depend on the budgeted idle crawler, whose two-visit confirm can
+    // never complete inside one 4s audit window on large scenes (871 nodes ≈
+    // 11s per rotation at 16 handles/tick), so edits were silently dropped
+    // until a viewer restart. The watcher holds weak references to every root
+    // scene material and forwards REFMSG_CHANGE — which propagates up from
+    // any nested texmap, texture output, or curve — into the same targeted
+    // path the PBAccessors use. Material edits become event-driven regardless
+    // of scene size or material class; the crawler stays as a safety net.
+    class MaterialEditWatcher : public ReferenceMaker {
+    public:
+        MaxJSPanel* panel = nullptr;
+        std::vector<RefTargetHandle> targets;
+
+        int NumRefs() override { return static_cast<int>(targets.size()); }
+        RefTargetHandle GetReference(int i) override {
+            return (i >= 0 && i < static_cast<int>(targets.size())) ? targets[i] : nullptr;
+        }
+        // Weak observer: never counts as a real dependent (not saved, no
+        // dependency-loop participation), but still receives change messages.
+        BOOL IsRealDependency(ReferenceTarget*) override { return FALSE; }
+        RefResult NotifyRefChanged(const Interval&, RefTargetHandle hTarget,
+                                   PartID&, RefMessage message, BOOL) override {
+            if (!panel) return REF_SUCCEED;
+            if (message == REFMSG_CHANGE) {
+                panel->QueueMaterialEditTarget(hTarget);
+            } else if (message == REFMSG_TARGET_DELETED) {
+                panel->ForgetMaterialEditTarget(hTarget);
+                for (auto& t : targets) { if (t == hTarget) t = nullptr; }
+            }
+            return REF_SUCCEED;
+        }
+
+    protected:
+        void SetReference(int i, RefTargetHandle rtarg) override {
+            if (i >= 0 && i < static_cast<int>(targets.size())) targets[i] = rtarg;
+        }
+    };
+
+    // RAII: our own extraction/serialization can tickle texmaps (Update,
+    // bitmap loads) and echo REFMSG_CHANGE back at the watcher. Suppress
+    // capture while WE are the ones touching materials.
+    struct SuppressMaterialEditCaptureScope {
+        MaxJSPanel& p;
+        bool prev;
+        explicit SuppressMaterialEditCaptureScope(MaxJSPanel& panel)
+            : p(panel), prev(panel.suppressMaterialEditCapture_) {
+            p.suppressMaterialEditCapture_ = true;
+        }
+        ~SuppressMaterialEditCaptureScope() { p.suppressMaterialEditCapture_ = prev; }
+    };
+
+    MaterialEditWatcher* materialEditWatcher_ = nullptr;
+    std::unordered_set<ReferenceTarget*> pendingMaterialEditTargets_;
+    std::unordered_set<ReferenceTarget*> watchedMaterialSet_;
+    bool suppressMaterialEditCapture_ = false;
+    bool pendingMaterialEditOverflow_ = false;
+    static constexpr size_t kMaxPendingMaterialEditTargets = 256;
+
+    void QueueMaterialEditTarget(ReferenceTarget* target) {
+        if (!target || suppressMaterialEditCapture_) return;
+        if (pendingMaterialEditTargets_.size() >= kMaxPendingMaterialEditTargets) {
+            // Mass edit (script sweep) — fall back to one full sync instead
+            // of dropping targets.
+            pendingMaterialEditOverflow_ = true;
+            return;
+        }
+        pendingMaterialEditTargets_.insert(target);
+    }
+
+    void ForgetMaterialEditTarget(ReferenceTarget* target) {
+        pendingMaterialEditTargets_.erase(target);
+        watchedMaterialSet_.erase(target);
+    }
+
+    void DrainPendingMaterialEdits() {
+        if (pendingMaterialEditOverflow_) {
+            pendingMaterialEditOverflow_ = false;
+            pendingMaterialEditTargets_.clear();
+            ClearMaterialEditHandleCache();
+            SetDirtyImmediate();
+            return;
+        }
+        if (pendingMaterialEditTargets_.empty()) return;
+        std::vector<ReferenceTarget*> targets(
+            pendingMaterialEditTargets_.begin(), pendingMaterialEditTargets_.end());
+        pendingMaterialEditTargets_.clear();
+        SuppressMaterialEditCaptureScope guard(*this);
+        for (ReferenceTarget* target : targets) NotifyMaterialEditedTarget(target);
+    }
+
+    void RebuildMaterialEditWatcher() {
+        Interface* ip = GetCOREInterface();
+        if (!ip) return;
+        std::unordered_set<ReferenceTarget*> current;
+        current.reserve(64);
+        for (ULONG handle : geomHandles_) {
+            INode* node = ip->GetINodeByHandle(handle);
+            if (!node) continue;
+            if (Mtl* mtl = node->GetMtl()) current.insert(mtl);
+        }
+        if (current == watchedMaterialSet_) return;
+        if (!materialEditWatcher_) {
+            materialEditWatcher_ = new MaterialEditWatcher();
+            materialEditWatcher_->panel = this;
+        }
+        HoldSuspend hs; // keep watcher ref churn out of the undo stack
+        materialEditWatcher_->DeleteAllRefsFromMe();
+        materialEditWatcher_->targets.clear();
+        materialEditWatcher_->targets.resize(current.size(), nullptr);
+        int slot = 0;
+        for (ReferenceTarget* mtl : current) {
+            materialEditWatcher_->ReplaceReference(slot++, mtl);
+        }
+        watchedMaterialSet_ = std::move(current);
+    }
+
+    void DestroyMaterialEditWatcher() {
+        pendingMaterialEditTargets_.clear();
+        watchedMaterialSet_.clear();
+        pendingMaterialEditOverflow_ = false;
+        if (materialEditWatcher_) {
+            materialEditWatcher_->panel = nullptr;
+            HoldSuspend hs;
+            materialEditWatcher_->DeleteAllRefsFromMe();
+            materialEditWatcher_->targets.clear();
+            delete materialEditWatcher_;
+            materialEditWatcher_ = nullptr;
+        }
+    }
+
     std::vector<ULONG> FindMaterialEditHandles(ReferenceTarget* target) {
         if (!target) return {};
         auto cached = materialEditHandleCache_.find(target);
@@ -755,7 +889,11 @@
             for (ULONG handle : geomHandles_) {
                 INode* node = ip->GetINodeByHandle(handle);
                 if (!node) continue;
-                if (FindSupportedMaterial(node->GetMtl()) == targetMtl) {
+                // Match the raw root too: the watcher references node
+                // materials as assigned, so multi-sub/shell roots arrive here
+                // directly and FindSupportedMaterial would only return a leaf.
+                Mtl* rawMtl = node->GetMtl();
+                if (rawMtl == targetMtl || FindSupportedMaterial(rawMtl) == targetMtl) {
                     handles.push_back(handle);
                 }
             }
@@ -770,8 +908,11 @@
         for (ULONG handle : geomHandles_) {
             INode* node = ip->GetINodeByHandle(handle);
             if (!node) continue;
-            Mtl* supportedMtl = FindSupportedMaterial(node->GetMtl());
-            if (supportedMtl && ReferenceTreeContains(supportedMtl, target)) {
+            // Search from the raw assigned material: it is a superset of the
+            // supported subtree, so nested texmaps under multi-sub slots that
+            // are not the "first supported" leaf still resolve to this node.
+            Mtl* rawMtl = node->GetMtl();
+            if (rawMtl && ReferenceTreeContains(rawMtl, target)) {
                 handles.push_back(handle);
             }
         }
@@ -787,6 +928,8 @@
         }
 
         if (geomHandles_.empty()) return;
+        // Extraction below may echo REFMSG_CHANGE into the watcher.
+        SuppressMaterialEditCaptureScope suppressEcho(*this);
 
         Interface* ip = GetCOREInterface();
         if (!ip) return;
@@ -811,7 +954,8 @@
             Mtl* rawMtl = node->GetMtl();
             Mtl* supportedMtl = FindSupportedMaterial(rawMtl);
             const bool stillMatches = supportedMtl &&
-                ((targetMtl && supportedMtl == targetMtl) || ReferenceTreeContains(supportedMtl, target));
+                ((targetMtl && (supportedMtl == targetMtl || rawMtl == targetMtl)) ||
+                 ReferenceTreeContains(rawMtl, target));
             if (!stillMatches) {
                 cacheStale = true;
                 continue;
@@ -2699,6 +2843,11 @@
             // These are cheap timestamp checks, unlike the heavier scene/material scans below.
             if (slowPhase == 0) CheckWebContentChanges();
             if (slowPhase == 3) CheckProjectContentChanges();
+            // Event-driven material edits: drained every tick, NOT gated on
+            // the idle-poll audit window — watcher notifications are the
+            // primary material path; the budgeted crawler below is a net.
+            if (allowHeavyPolling) DrainPendingMaterialEdits();
+            if (slowPhase == 7) RebuildMaterialEditWatcher();
             if (allowMaterialPolling && tickCount_ % MATERIAL_DETECT_TICKS == 2) DetectMaterialChanges();
             if (allowHeavyPolling && allowIdlePolling && lightPhase == 0) DetectPropertyChanges();
             if (allowTimelineAuxPolling && allowRealtimeAuxPolling && lightPhase == 1) {
@@ -3871,11 +4020,30 @@
         return state;
     }
 
+    // Cheap state for nodes without a material: the viewer renders them from
+    // wire color, so that is the only live-editable input worth tracking.
+    // Wire color rides the fast-scalar hash so drags keep using the delta
+    // path (as they did via the full extraction); structure/scalar stay
+    // constant so assigning a material later flips structureHash → full sync.
+    MaterialSyncState ComputeNullMaterialSyncState(INode* node) {
+        MaterialSyncState state;
+        const uint64_t base = HashFNV1a("maxjs-null-mtl", 14);
+        DWORD wire = node ? node->GetWireColor() : 0;
+        state.structureHash = base;
+        state.scalarHash = base;
+        state.fastScalarHash = HashFNV1a(&wire, sizeof(wire), base);
+        state.canFastSync = true;
+        return state;
+    }
+
     MaterialSyncState ComputeMaterialSyncState(INode* node, TimeValue t) {
         MaterialSyncState state;
         if (!node) return state;
 
         Mtl* rawMtl = node->GetMtl();
+        if (!rawMtl) {
+            return ComputeNullMaterialSyncState(node);
+        }
         Mtl* multiMtl = FindMultiSubMtl(rawMtl);
         if (multiMtl && multiMtl->NumSubMtls() > 1) {
             state.structureHash = ComputeMaterialStateHash(node, t);
@@ -3895,6 +4063,13 @@
         if (!node) return MaterialSyncState{};
 
         Mtl* rawMtl = node->GetMtl();
+        // Material-less nodes (ungrouped archviz members, helpers-with-mesh)
+        // used to pay a full ExtractPBR + serialize + hash per crawl visit
+        // just to describe "wire color". Hash the wire color directly so they
+        // cost ~nothing; null->assigned transitions still flip the hash.
+        if (!rawMtl) {
+            return ComputeNullMaterialSyncState(node);
+        }
         Mtl* multiMtl = FindMultiSubMtl(rawMtl);
         if (multiMtl && multiMtl->NumSubMtls() > 1) {
             return ComputeMaterialSyncState(node, t);
@@ -4145,6 +4320,7 @@
     void DetectMaterialChanges() {
         Interface* ip = GetCOREInterface();
         if (!ip) return;
+        SuppressMaterialEditCaptureScope suppressEcho(*this);
         TimeValue t = ip->GetTime();
         bool changed = false;
         bool requestedFullSync = false;
@@ -4220,6 +4396,12 @@
             fastDirtyHandles_.insert(handle);
             changed = true;
         });
+
+        // A pending candidate means a change was seen but not yet confirmed
+        // by its second visit. Keep the audit window alive until it resolves:
+        // expiry wipes the candidate map, which on large scenes (one cursor
+        // rotation > window) silently dropped edits until viewer restart.
+        if (!idleMaterialFullSyncCandidateHash_.empty()) ArmIdlePollAuditWindow();
 
         if (changed) QueueFastFlush();
     }
@@ -4595,6 +4777,10 @@
                 idlePropertyFullSyncCandidateHash_.erase(handle);
             }
         });
+
+        // Same keep-alive as DetectMaterialChanges: don't let the audit
+        // window expire (and wipe candidates) while a confirm is pending.
+        if (!idlePropertyFullSyncCandidateHash_.empty()) ArmIdlePollAuditWindow();
     }
 
     // ── Camera JSON fragment ─────────────────────────────────
@@ -4617,7 +4803,9 @@
                    xf.realWorld ||
                    _wcsicmp(xf.wrapMode.c_str(), L"periodic") != 0 ||
                    !xf.colorSpace.empty() ||
-                   std::fabs(xf.manualGamma - 1.0f) > 1.0e-6f;
+                   std::fabs(xf.manualGamma - 1.0f) > 1.0e-6f ||
+                   !xf.outLutR.empty() ||
+                   xf.alphaFromRGB;
         };
         auto writeXf = [&](const wchar_t* key, const MaxJSPBR::TexTransform& xf) {
             if (!hasTransformData(xf)) return;
@@ -4652,6 +4840,28 @@
                 ss << L",\"manualGamma\":";
                 WriteFloatValue(ss, xf.manualGamma, 1.0f);
             }
+            // BitmapTex Output rollout: baked transfer LUT(s) + alpha mode.
+            // Bump Amount is folded into the bumpS scalar, not emitted here.
+            auto writeLut = [&](const wchar_t* lutKey, const std::vector<float>& lut) {
+                ss << L",\"" << lutKey << L"\":[";
+                for (size_t i = 0; i < lut.size(); ++i) {
+                    if (i) ss << L',';
+                    // 8-bit output: 3 decimals keeps the payload compact
+                    WriteFloatValue(ss, std::round(lut[i] * 1000.0f) / 1000.0f, 0.0f);
+                }
+                ss << L']';
+            };
+            if (!xf.outLutR.empty()) {
+                if (xf.outLutG.empty()) {
+                    writeLut(L"outLut", xf.outLutR);
+                } else {
+                    writeLut(L"outLutR", xf.outLutR);
+                    writeLut(L"outLutG", xf.outLutG);
+                    writeLut(L"outLutB", xf.outLutB);
+                }
+            }
+            if (xf.alphaFromRGB)
+                ss << L",\"alphaFromRGB\":true";
             wroteField = true;
             if (xf.hasChannelSelect) {
                 if (wroteField) ss << L',';
@@ -4764,9 +4974,12 @@
         }
         ss << L",\"normScl\":";
         WriteFloatValue(ss, pbr.normalScale, 1.0f);
-        if (!pbr.bumpMap.empty() || std::fabs(pbr.bumpScale - 1.0f) > 1.0e-6f) {
+        // Output rollout Bump Amount of the bump-slot bitmap scales the bump
+        // strength in Max, so fold it into the emitted scalar.
+        const float bumpScaleOut = pbr.bumpScale * pbr.bumpMapTransform.outBumpAmount;
+        if (!pbr.bumpMap.empty() || std::fabs(bumpScaleOut - 1.0f) > 1.0e-6f) {
             ss << L",\"bumpS\":";
-            WriteFloatValue(ss, pbr.bumpScale, 1.0f);
+            WriteFloatValue(ss, bumpScaleOut, 1.0f);
         }
         if (!pbr.displacementMap.empty() || std::fabs(pbr.displacementScale) > 1.0e-6f || std::fabs(pbr.displacementBias) > 1.0e-6f) {
             ss << L",\"dispS\":";

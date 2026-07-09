@@ -1303,6 +1303,7 @@
                 ss << L"{\"h\":" << node.handle;
                 ss << L",\"n\":\"" << EscapeJson(node.node->GetName()) << L'"';
                 ss << L",\"helper\":true";
+                if (node.node->IsGroupHead()) ss << L",\"grp\":1";
                 ss << L",\"s\":" << (node.node->Selected() ? L'1' : L'0');
                 if (node.parentHandle != 0) ss << L",\"p\":" << node.parentHandle;
                 ss << L",\"vis\":" << (node.visible ? L'1' : L'0');

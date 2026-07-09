@@ -1252,6 +1252,7 @@
         deformHandles_.clear();
         mtlHashMap_.clear();
         ClearMaterialEditHandleCache();
+        DestroyMaterialEditWatcher();
         lightHashMap_.clear();
         splatHashMap_.clear();
         audioHashMap_.clear();

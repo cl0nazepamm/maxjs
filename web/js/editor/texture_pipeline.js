@@ -570,8 +570,10 @@ async function createTexturePipeline(deps = {}) {
                 deps.beginTextureLoad();
                 loader.load(url, loadedTex => {
                     deps.endTextureLoad();
-                    applyTextureChannelSelection(loadedTex, normalizedXf);
+                    // colorSpace first: channel selection needs it to decide
+                    // whether Output LUTs run through sRGB decode/encode.
                     loadedTex.colorSpace = textureColorSpace;
+                    applyTextureChannelSelection(loadedTex, normalizedXf);
                     applyTextureTransform(loadedTex, normalizedXf);
                     loadedTex.needsUpdate = true;
                     textureCache.set(cacheKey, loadedTex);
@@ -587,8 +589,8 @@ async function createTexturePipeline(deps = {}) {
                 url,
                 loadedTex => {
                     deps.endTextureLoad();
-                    applyTextureChannelSelection(loadedTex, normalizedXf);
                     loadedTex.colorSpace = textureColorSpace;
+                    applyTextureChannelSelection(loadedTex, normalizedXf);
                     applyTextureTransform(loadedTex, normalizedXf);
                     loadedTex.needsUpdate = true;
                 },

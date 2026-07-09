@@ -1,5 +1,6 @@
 // scene_sync.js - editor scene sync, geometry updates, binary deltas, and instance buckets.
 import * as THREE from 'three';
+import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 import { applyDeltaFrame } from '../protocol.js';
 import {
     attachSkinAttributes,
@@ -18,6 +19,11 @@ function createSceneSync(deps = {}) {
         let gpuNormalsAnnounced = false;
         let firstSync = true;
         let lastMaxInstanceBucketSignature = '';
+        // Flatten Groups: Max group members merged into one mesh per material
+        // under the group head. Keyed by head handle.
+        const flattenedGroups = new Map();
+        const flattenedGroupHandleToKey = new Map();
+        let lastFlattenSignature = '';
         // Host wiring: binary shared-buffer routes (zero-copy geometry) are
         // registered per payload type here; the window/webview event listeners
         // live in host_bridge.installHostWiring().
@@ -28,6 +34,9 @@ function createSceneSync(deps = {}) {
                         // Real-time vertex update — in-place when topology matches
                         const mesh = deps.nodeMap.get(meta.h);
                         if (mesh) {
+                            // In-place geometry edits invalidate any merged
+                            // group copy of this node.
+                            dissolveFlattenedGroupForHandle(meta.h);
                             if (meta.jsmod != null) deps.applyJsmodSyncState(mesh, meta.jsmod === true);
                             if (!mesh.userData.jsmod) {
                             const pos = mesh.geometry.getAttribute('position');
@@ -173,6 +182,14 @@ function createSceneSync(deps = {}) {
             if (handle != null && getMaxInstanceBucketForHandle(handle)) {
                 updateMaxInstanceBucketNode(handle, nd);
                 return;
+            }
+            // A delta touching a flattened group member invalidates its merged
+            // mesh — dissolve back to individuals; the next full sync
+            // re-merges. Selection-only deltas don't affect the merge.
+            if (handle != null && flattenedGroupHandleToKey.has(handle)) {
+                const touchesFlatten = isFiniteArray(nd.t, 16) || nd.vis != null || nd.mat ||
+                    nd.jsmod != null || Object.prototype.hasOwnProperty.call(nd, 'p');
+                if (touchesFlatten) dissolveFlattenedGroupForHandle(handle);
             }
             if (handle != null) mesh.userData.maxjsHandle = handle;
             if (nd.helper === true) mesh.userData.maxjsHelper = true;
@@ -444,6 +461,244 @@ function createSceneSync(deps = {}) {
             return true;
         }
 
+        // ── Flatten Groups ───────────────────────────────────────
+        // Mirrors the instance-bucket pattern: a web-side pass over the synced
+        // node payloads that merges the static mesh members of each Max group
+        // (nd.grp heads) into one mesh per material, parented under the group
+        // head object. Member geometry is baked in head-relative space from
+        // the wire matrices, so moving the whole group in Max stays a cheap
+        // head-transform update with no re-merge. Any delta that touches an
+        // individual member dissolves its cluster back to per-node meshes;
+        // the next full sync re-merges via the signature check.
+
+        function flattenTransformDigest(t) {
+            if (!isFiniteArray(t, 16)) return 'I';
+            let out = '';
+            for (let i = 0; i < 16; i++) out += `${Math.round(t[i] * 1000)},`;
+            return out;
+        }
+
+        function planGroupFlatten(nodes, bucketHandles = null) {
+            const clusters = new Map();
+            if (!deps.performanceSettings.flattenGroups) {
+                return { clusters, signature: '', handles: new Set() };
+            }
+            const byHandle = new Map();
+            for (const nd of nodes) byHandle.set(nd.h, nd);
+
+            const outermostGroupHead = (nd) => {
+                let head = null;
+                let cursor = nd;
+                for (let hops = 0; hops < 64 && cursor; hops++) {
+                    const parent = Number.isFinite(cursor.p) ? byHandle.get(cursor.p) : null;
+                    if (!parent) break;
+                    if (parent.helper === true && parent.grp) head = parent;
+                    cursor = parent;
+                }
+                return head;
+            };
+
+            for (const nd of nodes) {
+                if (nd.helper === true) continue;
+                if (nd.skin || nd.jsmod || nd.spline || nd.mats || nd.groups) continue;
+                if (nd.vis === false || nd.vis === 0) continue;
+                if (bucketHandles?.has(nd.h)) continue;
+                const head = outermostGroupHead(nd);
+                if (!head) continue;
+                if (!clusters.has(head.h)) clusters.set(head.h, { head, members: [] });
+                clusters.get(head.h).members.push(nd);
+            }
+
+            for (const [key, cluster] of [...clusters.entries()]) {
+                if (cluster.members.length < 2) clusters.delete(key);
+            }
+
+            const handles = new Set();
+            const parts = [];
+            for (const cluster of clusters.values()) {
+                const memberParts = cluster.members
+                    .map((nd) => {
+                        handles.add(nd.h);
+                        const matKey = nd.mat ? deps.materialIdentityKey(nd.mat) : '__default__';
+                        const geoKey = nd.geo?.vN ?? nd.v?.length ?? 0;
+                        return `${nd.h}~${flattenTransformDigest(nd.t)}~${matKey}~${geoKey}`;
+                    })
+                    .sort();
+                parts.push(`${cluster.head.h}@${flattenTransformDigest(cluster.head.t)}#${memberParts.join('|')}`);
+            }
+            parts.sort();
+            return { clusters, signature: parts.join('||'), handles };
+        }
+
+        function disposeFlattenedGroups() {
+            for (const [, cluster] of flattenedGroups) {
+                for (const mesh of cluster.meshes) {
+                    if (mesh.parent) mesh.parent.remove(mesh);
+                    mesh.geometry?.dispose?.();
+                    deps.disposeSceneMaterial(mesh.material);
+                }
+                for (const handle of cluster.handles) {
+                    const original = deps.nodeMap.get(handle);
+                    if (original?.userData?.maxjsFlattenHidden) {
+                        original.visible = true;
+                        delete original.userData.maxjsFlattenHidden;
+                    }
+                }
+            }
+            flattenedGroups.clear();
+            flattenedGroupHandleToKey.clear();
+            lastFlattenSignature = '';
+        }
+
+        function dissolveFlattenedGroupForHandle(handle) {
+            const key = flattenedGroupHandleToKey.get(handle);
+            if (key == null) return false;
+            const cluster = flattenedGroups.get(key);
+            if (!cluster) {
+                flattenedGroupHandleToKey.delete(handle);
+                return false;
+            }
+            for (const mesh of cluster.meshes) {
+                if (mesh.parent) mesh.parent.remove(mesh);
+                mesh.geometry?.dispose?.();
+                deps.disposeSceneMaterial(mesh.material);
+            }
+            for (const memberHandle of cluster.handles) {
+                const original = deps.nodeMap.get(memberHandle);
+                if (original?.userData?.maxjsFlattenHidden) {
+                    original.visible = true;
+                    delete original.userData.maxjsFlattenHidden;
+                }
+                flattenedGroupHandleToKey.delete(memberHandle);
+            }
+            flattenedGroups.delete(key);
+            // Force the next full sync to re-plan instead of matching the
+            // stale signature that still contains this cluster.
+            lastFlattenSignature = '';
+            deps.maxjsFx.markSceneChanged?.();
+            return true;
+        }
+
+        const flattenMatrixScratchA = new THREE.Matrix4();
+        const flattenMatrixScratchB = new THREE.Matrix4();
+
+        function flattenMemberGeometry(memberMesh, nd, headInverse) {
+            const src = memberMesh.geometry;
+            if (!src?.getAttribute?.('position')) return null;
+            let cloned = src.clone();
+            if (isFiniteArray(nd.t, 16)) {
+                flattenMatrixScratchB.fromArray(nd.t).premultiply(headInverse);
+            } else {
+                flattenMatrixScratchB.copy(headInverse);
+            }
+            cloned.applyMatrix4(flattenMatrixScratchB);
+            return cloned;
+        }
+
+        function normalizeGeometriesForMerge(list) {
+            // mergeGeometries needs identical attribute sets + index parity.
+            const common = new Set(Object.keys(list[0].attributes));
+            for (const geom of list) {
+                for (const name of common) {
+                    if (!geom.attributes[name]) common.delete(name);
+                }
+            }
+            if (!common.has('position')) return null;
+            const anyNonIndexed = list.some((geom) => !geom.index);
+            return list.map((geom) => {
+                let out = geom;
+                if (anyNonIndexed && out.index) out = out.toNonIndexed();
+                for (const name of Object.keys(out.attributes)) {
+                    if (!common.has(name)) out.deleteAttribute(name);
+                }
+                out.morphAttributes = {};
+                return out;
+            });
+        }
+
+        function reassertFlattenedVisibility() {
+            // Full syncs re-apply nd.vis to member meshes (and may recreate
+            // them), which would un-hide originals under a live merge and
+            // double-draw. Re-hide whatever the merge owns.
+            for (const [handle] of flattenedGroupHandleToKey) {
+                const original = deps.nodeMap.get(handle);
+                if (original && original.visible) {
+                    original.visible = false;
+                    original.userData.maxjsFlattenHidden = true;
+                }
+            }
+        }
+
+        function buildFlattenedGroups(nodes, flattenPlan) {
+            const plan = flattenPlan ?? planGroupFlatten(nodes);
+            if (plan.signature === lastFlattenSignature) {
+                if (plan.signature) reassertFlattenedVisibility();
+                return false;
+            }
+
+            disposeFlattenedGroups();
+            lastFlattenSignature = plan.signature;
+            if (plan.clusters.size === 0) return true;
+
+            for (const [headHandle, cluster] of plan.clusters) {
+                const headObject = deps.nodeMap.get(headHandle);
+                if (!headObject) continue;
+                if (isFiniteArray(cluster.head.t, 16)) {
+                    flattenMatrixScratchA.fromArray(cluster.head.t).invert();
+                } else {
+                    flattenMatrixScratchA.identity();
+                }
+
+                // One merged mesh per material identity within the group.
+                const byMaterial = new Map();
+                for (const nd of cluster.members) {
+                    const memberMesh = deps.nodeMap.get(nd.h);
+                    if (!memberMesh?.geometry || memberMesh.isLine || memberMesh.isLineSegments || memberMesh.isSkinnedMesh) continue;
+                    const matKey = nd.mat ? deps.materialIdentityKey(nd.mat) : '__default__';
+                    if (!byMaterial.has(matKey)) byMaterial.set(matKey, { nodes: [], geometries: [], meshes: [] });
+                    const slot = byMaterial.get(matKey);
+                    const baked = flattenMemberGeometry(memberMesh, nd, flattenMatrixScratchA);
+                    if (!baked) continue;
+                    slot.nodes.push(nd);
+                    slot.geometries.push(baked);
+                    slot.meshes.push(memberMesh);
+                }
+
+                const clusterMeshes = [];
+                const clusterHandles = new Set();
+                for (const [matKey, slot] of byMaterial) {
+                    if (slot.geometries.length < 2) {
+                        for (const geom of slot.geometries) geom.dispose();
+                        continue;
+                    }
+                    const normalized = normalizeGeometriesForMerge(slot.geometries);
+                    const merged = normalized ? mergeGeometries(normalized, false) : null;
+                    for (const geom of slot.geometries) geom.dispose();
+                    if (!merged) continue;
+                    const material = deps.createSceneRenderableMaterial(slot.nodes[0], false, merged, null);
+                    const mesh = new THREE.Mesh(merged, material);
+                    mesh.matrixAutoUpdate = false;
+                    mesh.matrix.identity();
+                    mesh.frustumCulled = false;
+                    mesh.castShadow = slot.meshes.some((m) => m.castShadow);
+                    mesh.receiveShadow = slot.meshes.some((m) => m.receiveShadow);
+                    mesh.name = `max_group_${headHandle}_${matKey.slice(0, 8)}_x${slot.nodes.length}`;
+                    headObject.add(mesh);
+                    clusterMeshes.push(mesh);
+                    for (let i = 0; i < slot.nodes.length; i++) {
+                        clusterHandles.add(slot.nodes[i].h);
+                        slot.meshes[i].visible = false;
+                        slot.meshes[i].userData.maxjsFlattenHidden = true;
+                    }
+                }
+
+                if (clusterMeshes.length === 0) continue;
+                flattenedGroups.set(headHandle, { meshes: clusterMeshes, handles: clusterHandles });
+                for (const handle of clusterHandles) flattenedGroupHandleToKey.set(handle, headHandle);
+            }
+            return true;
+        }
+
         function profileSceneNodes(nodes) {
             if (!deps.debugMode || deps.buildMode === 'release' || !deps.isSceneProfilingEnabled()) return;
             const stats = [];
@@ -549,9 +804,12 @@ function createSceneSync(deps = {}) {
             const bucketPlan = options.bucketPlan ?? planMaxInstanceBuckets(snapshot.nodes);
             deps.refreshMaterialRegistry(snapshot.nodes, bucketPlan);
             const bucketChanged = buildMaxInstanceBuckets(snapshot.nodes, bucketPlan);
+            const flattenChanged = buildFlattenedGroups(
+                snapshot.nodes,
+                planGroupFlatten(snapshot.nodes, bucketPlan.handles));
             profileSceneNodes(snapshot.nodes);
             deps.scene.updateMatrixWorld(options.forceWorldUpdate === true);
-            const sceneChanged = !!(options.sceneChanged || bucketChanged);
+            const sceneChanged = !!(options.sceneChanged || bucketChanged || flattenChanged);
             if (sceneChanged) {
                 deps.lightLinking.refreshSceneBindings?.();
                 deps.markLightProbeSceneDirty();
@@ -711,6 +969,7 @@ function createSceneSync(deps = {}) {
         deps.bridge.on('geo_fast', msg => {
             const mesh = deps.nodeMap.get(msg.h);
             if (!mesh) return;
+            dissolveFlattenedGroupForHandle(msg.h);
             if (msg.jsmod != null) deps.applyJsmodSyncState(mesh, msg.jsmod === true);
             if (mesh.userData.jsmod) return;  // layers own vertices
             const wantsLine = !!msg.spline;
@@ -1508,6 +1767,7 @@ function createSceneSync(deps = {}) {
             retainGeometryRef,
             releaseGeometryRef,
             disposeMaxInstanceBuckets,
+            disposeFlattenedGroups,
             getMaxInstanceBucketForHandle,
             matrixArraysAlmostEqual,
             updateMaxInstanceBucketVisibility,

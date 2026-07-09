@@ -861,6 +861,10 @@ function createPostFxGlue(deps = {}) {
                                 <span>Optimize Max Instances</span>
                                 <input id="fx-performance-optimizeinstances" type="checkbox" ${deps.performanceSettings.optimizeMaxInstances ? 'checked' : ''}>
                             </label>
+                            <label class="fx-check" for="fx-performance-flattengroups">
+                                <span>Flatten Groups</span>
+                                <input id="fx-performance-flattengroups" type="checkbox" ${deps.performanceSettings.flattenGroups ? 'checked' : ''}>
+                            </label>
                             <label class="fx-check" for="fx-performance-splats">
                                 <span>Gaussian splats (Spark)</span>
                                 <input id="fx-performance-splats" type="checkbox" ${deps.performanceSettings.splatsEnabled !== false ? 'checked' : ''}>
@@ -1210,6 +1214,7 @@ function createPostFxGlue(deps = {}) {
             const postFxScaleSlider = document.getElementById('fx-performance-postfxscale');
             const postFxScaleValue = document.getElementById('fx-performance-postfxscale-val');
             const optimizeInstancesCheck = document.getElementById('fx-performance-optimizeinstances');
+            const flattenGroupsCheck = document.getElementById('fx-performance-flattengroups');
             const splatsEnabledCheck = document.getElementById('fx-performance-splats');
             const instanceThresholdSlider = document.getElementById('fx-performance-instancethreshold');
             const instanceThresholdValue = document.getElementById('fx-performance-instancethreshold-val');
@@ -1243,6 +1248,16 @@ function createPostFxGlue(deps = {}) {
                 savePostFxState();
                 syncPostFxPanel(true);
             };
+            if (flattenGroupsCheck) {
+                flattenGroupsCheck.onchange = () => {
+                    deps.performanceSettings.flattenGroups = flattenGroupsCheck.checked;
+                    deps.disposeFlattenedGroups();
+                    savePostFxState();
+                    syncPostFxPanel(true);
+                    // Merging needs a fresh full snapshot to (re)plan clusters.
+                    if (deps.performanceSettings.flattenGroups) deps.bridge.send('scene_dirty');
+                };
+            }
             if (splatsEnabledCheck) {
                 splatsEnabledCheck.onchange = () => {
                     deps.performanceSettings.splatsEnabled = splatsEnabledCheck.checked;
@@ -1655,6 +1670,7 @@ function createPostFxGlue(deps = {}) {
             const postFxScaleSlider = document.getElementById('fx-performance-postfxscale');
             const postFxScaleValue = document.getElementById('fx-performance-postfxscale-val');
             const optimizeInstancesCheck = document.getElementById('fx-performance-optimizeinstances');
+            const flattenGroupsCheck = document.getElementById('fx-performance-flattengroups');
             const splatsEnabledCheck = document.getElementById('fx-performance-splats');
             const instanceThresholdSlider = document.getElementById('fx-performance-instancethreshold');
             const instanceThresholdValue = document.getElementById('fx-performance-instancethreshold-val');
@@ -1698,6 +1714,7 @@ function createPostFxGlue(deps = {}) {
             if (canSyncInput(postFxScaleSlider)) postFxScaleSlider.value = String(deps.getEffectivePostFxResolutionScale());
             if (postFxScaleValue) postFxScaleValue.textContent = `${deps.getEffectivePostFxResolutionScale().toFixed(2)}x`;
             if (canSyncInput(optimizeInstancesCheck)) optimizeInstancesCheck.checked = !!deps.performanceSettings.optimizeMaxInstances;
+            if (canSyncInput(flattenGroupsCheck)) flattenGroupsCheck.checked = !!deps.performanceSettings.flattenGroups;
             if (canSyncInput(splatsEnabledCheck)) splatsEnabledCheck.checked = deps.performanceSettings.splatsEnabled !== false;
             if (canSyncInput(instanceThresholdSlider)) instanceThresholdSlider.value = String(deps.performanceSettings.maxInstanceBucketThreshold);
             if (instanceThresholdValue) instanceThresholdValue.textContent = String(deps.performanceSettings.maxInstanceBucketThreshold);
@@ -1960,6 +1977,9 @@ function createPostFxGlue(deps = {}) {
                     }
                     if (typeof saved.performance.optimizeMaxInstances === 'boolean') {
                         deps.performanceSettings.optimizeMaxInstances = saved.performance.optimizeMaxInstances;
+                    }
+                    if (typeof saved.performance.flattenGroups === 'boolean') {
+                        deps.performanceSettings.flattenGroups = saved.performance.flattenGroups;
                     }
                     if (Number.isFinite(saved.performance.maxInstanceBucketThreshold)) {
                         deps.performanceSettings.maxInstanceBucketThreshold = Math.max(2, Math.round(saved.performance.maxInstanceBucketThreshold));

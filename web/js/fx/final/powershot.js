@@ -39,6 +39,28 @@ function powerShotCcmDiffers(ccm) {
         && ccm.some((row, rowIndex) => powerShotArrayDiffers(row, identity[rowIndex] || []));
 }
 
+function exposureLinearToStops(linear) {
+    return Math.log2(Math.max(1e-8, Number(linear) || 1));
+}
+
+function setPowerShotInputExposure(pipeline, mode, linearExposure, options) {
+    if (!pipeline || mode === 'film') return;
+    const stops = exposureLinearToStops(linearExposure);
+    if (typeof pipeline.setInputExposure === 'function') {
+        pipeline.setInputExposure(stops);
+        return;
+    }
+
+    // Compatibility with published PowerShot versions before setInputExposure.
+    if (mode === 'infrared' && pipeline.ctx?.P?.exposure) {
+        pipeline.ctx.P.exposure.value = options.irExposure + stops;
+    } else if (mode === 'nightshot' && pipeline.ir?.ctx?.P?.exposure) {
+        pipeline.ir.ctx.P.exposure.value = options.irExposure + stops;
+    } else if (pipeline.ctx?.sceneExposure) {
+        pipeline.ctx.sceneExposure.value = stops;
+    }
+}
+
 export function normalizePowerShotPreset(value) {
     const key = String(value || 'powershot');
     return POWERSHOT_PRESETS[key] ? key : 'powershot';
@@ -161,7 +183,8 @@ export function listPowerShotPresets() {
  * @param supportsScreenSpaceEffects backend capability flag
  * @param isShaderLabEnabled        Shader Lab wins the final-stylize slot
  *
- * Exposure lives inside each PowerShot mode (filmExposure / irExposure / ISP).
+ * Viewer Exposure is scene-linear plate gain before every non-film mode.
+ * Film ignores it and keeps filmExposure as the authoritative stock exposure.
  * brightness + contrast are post-effect corrective grades via setOutputColorGrading
  * (powershotLinearGrade on the linear print/phosphor/ISP output) — not input exposure.
  */
@@ -330,6 +353,10 @@ export function createPowerShotFinal({
         I.exposure.value = p.irExposure;
         I.inputGamma.value = p.irInputGamma;
         I.nirInput.value = p.irResponse;
+        // PowerShot <=0.6.1 added the NightShot hotspot as constant green
+        // emission, lifting black across most of the frame. Newer pipelines
+        // expose setInputExposure and use a black-preserving gain hotspot.
+        if (typeof nightshotPipeline.setInputExposure !== 'function') I.hotspot.value = 0;
         nightshotPipeline.ctx.P.smear.value = p.nsSmear;
         // shared analog trims drive the camcorder tape path (state is seeded
         // from the NightShot preset on mode entry — powerShotNightshotUiDefaults)
@@ -510,11 +537,12 @@ export function createPowerShotFinal({
         }
 
         if (!getOptions().freezeNoise) powerShotFrame += 1;
-        // sync* already pushed brightness/contrast into setOutputColorGrading on
-        // the active pipeline. Do not remap them onto sceneExposure — PowerShot
-        // owns exposure; these sliders are post-effect corrective grades only.
+        // Brightness/contrast already live in the pipeline's post-effect output
+        // grade. Viewer Exposure is a separate pre-effect plate gain.
+        const options = normalizeOptions();
         const pipeline = ensureActivePipeline();
         pipeline.setInputEncoding?.('linear');
+        setPowerShotInputExposure(pipeline, options.mode, previousExposure, options);
         try {
             renderer.toneMapping = THREE.NoToneMapping;
             renderer.toneMappingExposure = 1.0;

@@ -2213,6 +2213,7 @@
             getEffectivePixelRatio,
             getEffectivePostFxResolutionScale,
             getHaloGiSettings,
+            isLocalHdriActive,
             loadLocalHDRIFile,
             maxjsDebugWarn,
             rebuildAsciiEffect,

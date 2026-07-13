@@ -139,6 +139,16 @@
             return false;
         }
 
+        const std::wstring powerShotVendor = webDir + L"\\vendor\\powershot-threejs";
+        if (!DirectoryExists(powerShotVendor)) {
+            error = L"Snapshot runtime dependency missing: web/vendor/powershot-threejs";
+            return false;
+        }
+        if (!CopyDirectoryRecursive(powerShotVendor, outDir + L"\\vendor\\powershot-threejs")) {
+            error = L"Failed to copy snapshot runtime PowerShot vendor";
+            return false;
+        }
+
         const std::wstring threeVendor = webDir + L"\\vendor\\three-r185";
         if (!DirectoryExists(threeVendor + L"\\build")) {
             error = L"Snapshot runtime dependency missing: web/vendor/three-r185/build";

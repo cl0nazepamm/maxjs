@@ -46,11 +46,13 @@ function createPostFxGlue(deps = {}) {
 
         const isPowerShotInfraredMode = (values) => values.mode === 'infrared';
         const isPowerShotNightshotMode = (values) => values.mode === 'nightshot';
-        // Both read NIR flux — spectral-only, and both drive the NIR sensing gates.
+        // Both drive the NIR sensing controls; spectral mode can additionally supply NIR flux.
         const isPowerShotNirMode = (values) => isPowerShotInfraredMode(values) || isPowerShotNightshotMode(values);
         const isPowerShotDigitalMode = (values) => values.mode !== 'analog' && values.mode !== 'film' && !isPowerShotNirMode(values);
         const isPowerShotAnalogMode = (values) => values.mode === 'analog';
         const isPowerShotFilmMode = (values) => values.mode === 'film';
+        const isPowerShotElectronModelActive = (values) =>
+            isPowerShotInfraredMode(values) && values.irElectronModel === true;
         const isPowerShotJpegActive = (values) => isPowerShotDigitalMode(values) && Number(values.jpegStrength) > 1.0e-6;
         const isPowerShotAnalogActive = (values) => isPowerShotAnalogMode(values) && Number(values.analogStrength) > 1.0e-6;
         // modes whose output rides the analog tape path (VHS sliders apply):
@@ -331,15 +333,13 @@ function createPostFxGlue(deps = {}) {
                     filmNegative: false,
                     infraredPreset: 'white_phosphor_nir',
                     ...powerShotInfraredPresetUiDefaults('white_phosphor_nir'),
+                    irElectronModel: false,
+                    irElectronsPerUnit: 1024,
                     nsSmear: 0.9,
                     freezeNoise: false,
                     ...(state.powershot || {}),
-                    // A save written in spectral can carry a NIR mode;
-                    // standard mode must never surface white phosphor/NightShot.
-                    ...(!deps.isStudioMode && ['infrared', 'nightshot'].includes(state.powershot?.mode) ? { mode: 'digital' } : {}),
                 }),
-                setValues: (patch) => deps.maxjsFx.setPowerShotOptions(
-                    !deps.isStudioMode && ['infrared', 'nightshot'].includes(patch?.mode) ? { ...patch, mode: 'digital' } : patch),
+                setValues: (patch) => deps.maxjsFx.setPowerShotOptions(patch),
                 controls: [
                     {
                         key: 'mode',
@@ -349,11 +349,8 @@ function createPostFxGlue(deps = {}) {
                             { value: 'digital', label: 'Digital CCD' },
                             { value: 'analog', label: 'Analog VHS' },
                             { value: 'film', label: 'Film Print' },
-                            // NIR modes read spectral flux — spectral-only.
-                            ...(deps.isStudioMode ? [
-                                { value: 'infrared', label: 'White Phosphor' },
-                                { value: 'nightshot', label: 'NightShot' },
-                            ] : []),
+                            { value: 'infrared', label: 'White Phosphor' },
+                            { value: 'nightshot', label: 'NightShot' },
                         ],
                     },
                     {
@@ -424,7 +421,9 @@ function createPostFxGlue(deps = {}) {
                     { key: 'irGlow', label: 'Halo Bloom', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotInfraredMode },
                     { key: 'irGlowThreshold', label: 'Bloom Threshold', min: 0, max: 1, step: 0.01, realtime: true, visibleWhen: isPowerShotInfraredMode },
                     { key: 'irEyes', label: 'Eye Flare', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotInfraredMode },
-                    { key: 'irNoise', label: 'Tube Scintillation', min: 0, max: 3, step: 0.01, realtime: true, affectsVisibility: true, visibleWhen: isPowerShotInfraredMode },
+                    { key: 'irElectronModel', label: 'Photoelectron Model', type: 'checkbox', affectsVisibility: true, visibleWhen: isPowerShotInfraredMode },
+                    { key: 'irElectronsPerUnit', label: 'Electrons / Unit', min: 16, max: 4096, step: 16, integer: true, realtime: true, visibleWhen: isPowerShotElectronModelActive },
+                    { key: 'irNoise', label: 'Sensor Noise', min: 0, max: 3, step: 0.01, realtime: true, affectsVisibility: true, visibleWhen: isPowerShotNirMode },
                     { key: 'irVignette', label: 'Tube Vignette', min: 0, max: 1, step: 0.01, realtime: true, visibleWhen: isPowerShotInfraredMode },
                     { key: 'irHotspot', label: 'Hotspot', min: 0, max: 1, step: 0.01, realtime: true, visibleWhen: isPowerShotInfraredMode },
                     { key: 'nsSmear', label: 'CCD Smear', min: 0, max: 2, step: 0.01, realtime: true, visibleWhen: isPowerShotNightshotMode },

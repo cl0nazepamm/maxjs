@@ -43,7 +43,9 @@ function createPanelsMisc(deps = {}) {
             if (shadingMenuLabel.textContent !== label) shadingMenuLabel.textContent = label;
         }
 
-        // ── ASCII Effect (full takeover) ──        let asciiPreFxSnapshot = null;        const ASCII_COLORS = { white: '#fff', green: '#0f0', amber: '#ffb000' };
+        // ── ASCII Effect (full takeover) ──
+        let asciiPreFxSnapshot = null;
+        const ASCII_COLORS = { white: '#fff', green: '#0f0', amber: '#ffb000' };
         const ASCII_CHARS = ' .:-=+*#%@';
 
         function enterAsciiMode() {
@@ -1030,7 +1032,8 @@ function createPanelsMisc(deps = {}) {
             } else if (canvasPanelVisible && canvasPanelApp) {
                 canvasPanelApp.render();
             }
-        }        let _layerManagerUnsub = null;
+        }
+        let _layerManagerUnsub = null;
         let _projectRuntimeUnsub = null;
 
         function queueLayersPanelRefresh() {

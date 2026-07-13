@@ -101,6 +101,8 @@ export function createMaxJSFxController({
         // the hot tube gain / ABC swing that gives the real close-range AGC feel.
         infraredPreset: 'white_phosphor_nir',
         ...powerShotInfraredPresetUiDefaults('white_phosphor_nir'),
+        irElectronModel: false,
+        irElectronsPerUnit: 1024,
         nsSmear: 0.9, // NightShot CCD interline vertical smear
         freezeNoise: false,
     };
@@ -1209,6 +1211,8 @@ export function createMaxJSFxController({
             assignFinite(state.powershot, 'irGlowThreshold', options.irGlowThreshold);
             assignFinite(state.powershot, 'irEyes', options.irEyes);
             assignFinite(state.powershot, 'irNoise', options.irNoise);
+            if (typeof options.irElectronModel === 'boolean') state.powershot.irElectronModel = options.irElectronModel;
+            assignFinite(state.powershot, 'irElectronsPerUnit', options.irElectronsPerUnit);
             assignFinite(state.powershot, 'irVignette', options.irVignette);
             assignFinite(state.powershot, 'irHotspot', options.irHotspot);
             assignFinite(state.powershot, 'nsSmear', options.nsSmear);

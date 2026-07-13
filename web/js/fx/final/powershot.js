@@ -155,6 +155,7 @@ export function powerShotNightshotUiDefaults() {
     const ns = POWERSHOT_NIGHTSHOT_PRESETS.nightshot_plus;
     const cam = ns.cam;
     return {
+        irNoise: ns.ir.noise_amount ?? 0.5,
         analogStrength: cam.analog_vhs_strength ?? 1.15,
         analogTracking: cam.analog_tracking ?? 0.45,
         analogChromaBleed: cam.analog_chroma_bleed ?? 0.15,
@@ -266,6 +267,8 @@ export function createPowerShotFinal({
         p.irGlowThreshold = THREE.MathUtils.clamp(finiteOr(p.irGlowThreshold, 0.44), 0, 1);
         p.irEyes = THREE.MathUtils.clamp(finiteOr(p.irEyes, 0.78), 0, 3);
         p.irNoise = THREE.MathUtils.clamp(finiteOr(p.irNoise, 0.48), 0, 3);
+        p.irElectronModel = p.irElectronModel === true;
+        p.irElectronsPerUnit = THREE.MathUtils.clamp(finiteOr(p.irElectronsPerUnit, 1024), 1, 1.0e6);
         p.irVignette = THREE.MathUtils.clamp(finiteOr(p.irVignette, 0.26), 0, 1);
         p.irHotspot = THREE.MathUtils.clamp(finiteOr(p.irHotspot, 0.055), 0, 1);
         p.nsSmear = THREE.MathUtils.clamp(finiteOr(p.nsSmear, 0.9), 0, 2);
@@ -335,6 +338,9 @@ export function createPowerShotFinal({
         I.glowThreshold.value = p.irGlowThreshold;
         I.eyeStrength.value = p.irEyes;
         I.noiseAmount.value = p.irNoise;
+        infraredPipeline.setElectronModel?.(p.irElectronModel
+            ? { electronsPerUnit: p.irElectronsPerUnit }
+            : false);
         I.vignette.value = p.irVignette;
         I.hotspot.value = p.irHotspot;
         // post-phosphor corrective grade (not tube exposure)
@@ -353,6 +359,7 @@ export function createPowerShotFinal({
         I.exposure.value = p.irExposure;
         I.inputGamma.value = p.irInputGamma;
         I.nirInput.value = p.irResponse;
+        I.noiseAmount.value = p.irNoise;
         // PowerShot <=0.6.1 added the NightShot hotspot as constant green
         // emission, lifting black across most of the frame. Newer pipelines
         // expose setInputExposure and use a black-preserving gain hotspot.

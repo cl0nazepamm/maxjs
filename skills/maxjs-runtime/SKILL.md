@@ -215,7 +215,50 @@ Do not replace whole synced objects or bypass the adapter for this pattern. Raw 
 - `ctx.webapp.create(spec)`: mounts a WebApp Animator HTML overlay layer owned by this layer.
 - `ctx.services`: shared service registry between layers.
 - `ctx.runtime`: runtime metadata and helpers; includes `ctx.runtime.gltf`.
+- `ctx.spectral`: authored spectral material overrides. `setNirAlbedo(selector, value)` assigns scalar NIR reflectance without requiring a TSL material and returns a disposable live handle.
 - `ctx.THREE`: same Three.js namespace passed as the second factory arg.
+
+## Spectral Material Tags
+
+Use `ctx.spectral.setNirAlbedo(selector, value)` to author the scalar NIR
+reflectance consumed by the spectral tracer. Values clamp to `[0, 1]`. The
+assignment follows late-synced nodes, survives material rebuilds, replays in
+snapshots, and restores the previous material value when disposed. Cleanup is
+also automatic when the owning layer unloads.
+
+```js
+export default function layer(ctx) {
+    const foliage = ctx.spectral.setNirAlbedo({
+        under: 'Vegetation',
+        materials: ['Leaf*', 'Grass*'],
+    }, 0.55);
+
+    const road = ctx.spectral.setNirAlbedo({ objects: 'Road*' }, 0.06);
+
+    return {
+        dispose() {
+            foliage.dispose();
+            road.dispose();
+        },
+    };
+}
+```
+
+Selectors support:
+
+- Direct node adapter, handle, exact object name, `'Prefix*'`, `RegExp`, predicate, or an array.
+- `{ under, objects, materials, includeSelf }`; each node/material selector accepts exact names, prefix wildcards, regexes, predicates, or arrays.
+- Convenience keys: `objectName`, `objectPrefix`, `materialName`, and `materialPrefix`.
+
+The returned handle exposes `value`, `matched`, `materials`, `set(value)`,
+`refresh()`, and `dispose()`. A material shared outside the selected subtree is
+still one Three.js material, so its NIR value changes everywhere it is used.
+Material name selectors check both the current Three material name and the
+original Max material name retained by baked/runtime replacements.
+
+`nirAlbedo` is currently consumed by the spectral path tracer. The SPC/probe
+raster path continues using visible material albedo while only its IR-light
+band gate changes.
 
 `ctx.camera` can lock to Max scene cameras and expose the live render camera:
 

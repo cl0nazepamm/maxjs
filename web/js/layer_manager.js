@@ -9,6 +9,7 @@ import { createDeformSystem } from './layer_deform.js';
 import { createLayerParamController } from './layer_params.js';
 import { createMaxNodeAdapter } from './layer_node_adapter.js';
 import { createRuntimeOverrideController } from './layer_runtime_overrides.js';
+import { createSpectralMaterialSystem } from './layer_spectral.js';
 import {
     MATERIAL_MAP_KEYS,
     OWNER_MAX,
@@ -319,6 +320,13 @@ export function createLayerManager({
         getTimelineSeconds: () => maxTimeline.now(),
         setMaterialDecorator,
         clearMaterialDecorator,
+        debugWarn,
+    });
+    const spectralMaterialSystem = createSpectralMaterialSystem({
+        nodeMap,
+        setMaterialDecorator,
+        clearMaterialDecorator,
+        onChange: event => notifyRuntimeSceneChanged(event),
         debugWarn,
     });
 
@@ -944,6 +952,7 @@ export function createLayerManager({
             instances: instancesFacade,
             params: paramController.createFacade(layer),
             deform: deformSystem.createLayerFacade(layer.id, handle => getLayerNodeAdapter(layer, handle)),
+            spectral: spectralMaterialSystem.createLayerFacade(layer.id, handle => getLayerNodeAdapter(layer, handle)),
             anim: animFacade,
             audio: createLayerAudioFacade(layer),
             get input() {
@@ -1152,6 +1161,7 @@ export function createLayerManager({
         layer.nodeAdapters.clear();
         if (layer.input) { layer.input.dispose(); layer.input = null; }
         deformSystem.disposeLayer(id);
+        spectralMaterialSystem.disposeLayer(id);
         clearRuntimeTransformOverridesForLayer(id);
         clearRuntimeVisibilityOverridesForLayer(id);
         clearMaterialOverridesForLayer(id);
@@ -1213,6 +1223,7 @@ export function createLayerManager({
         applyAllRuntimeVisibilityOverrides();
         applyAllObjectPropertyOverrides();
         deformSystem.update(dt, elapsed);
+        spectralMaterialSystem.update(dt, elapsed);
         if (busHandlers.get('max:selection')?.size) diffSelection();
 
         for (const layer of layers.values()) {

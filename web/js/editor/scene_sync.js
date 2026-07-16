@@ -14,6 +14,7 @@ import {
 import { gpuRecomputeNormals, gpuNormalsInvalidate, isGpuNormalsDisabled } from '../gpu_normals.js';
 import { maxTimeline } from '../maxjs_timeline.js';
 import { copyMaxComponentsToWorld } from '../scene_space.js';
+import { ensureGeometryUv0ForMaterial, markUv0AttributeAuthored } from '../material_contract.js';
 
 function createSceneSync(deps = {}) {
         let gpuNormalsAnnounced = false;
@@ -23,6 +24,10 @@ function createSceneSync(deps = {}) {
         // under the group head. Keyed by head handle.
         const flattenedGroups = new Map();
         const flattenedGroupHandleToKey = new Map();
+        // Objects targeted by active light links must remain individually
+        // renderable. Instance buckets / flattened groups may still optimize
+        // every other object in the scene.
+        const lightLinkTargetHandles = new Set();
         let lastFlattenSignature = '';
         // Host wiring: binary shared-buffer routes (zero-copy geometry) are
         // registered per payload type here; the window/webview event listeners
@@ -60,7 +65,7 @@ function createSceneSync(deps = {}) {
                                 }
                             };
                             const applyIncomingMaterial = () => {
-                                deps.applyFastMaterialPayload(mesh, meta, wantsLine);
+                                return deps.applyFastMaterialPayload(mesh, meta, wantsLine);
                             };
 
                             if (sameTopology) {
@@ -77,6 +82,7 @@ function createSceneSync(deps = {}) {
 
                                 if (meta.uvOff != null && meta.uvN) {
                                     updateFloatGeometryAttribute(mesh.geometry, 'uv', buf, meta.uvOff, meta.uvN, 2);
+                                    markUv0AttributeAuthored(mesh.geometry.getAttribute('uv'));
                                 }
 
                                 if (meta.nOff != null && meta.nN) {
@@ -145,7 +151,12 @@ function createSceneSync(deps = {}) {
                                     gpuRecomputeNormals(deps.renderer, mesh);
                                 }
                             }
-                            applyIncomingMaterial();
+                            const previousMaterial = mesh.material;
+                            const materialChanged = applyIncomingMaterial();
+                            if (!wantsLine) ensureGeometryUv0ForMaterial(mesh.geometry, mesh.material);
+                            if (materialChanged) {
+                                deps.lightLinking.replaceRenderableMaterial?.(previousMaterial, mesh.material);
+                            }
                             // Geometry data on the same Object3D — no pipeline
                             // rebuild needed regardless of which branch ran.
                             deps.maxjsFx?.markGeometryDataDirty?.();
@@ -208,7 +219,10 @@ function createSceneSync(deps = {}) {
                     if (lastPayload) {
                         lastPayload.t = nd.t;
                         if (deps.matrixScaleSignature(nd.t) !== oldScaleSignature) {
-                            deps.ensureSceneRenderableMaterial(mesh, lastPayload, !!lastPayload.spline);
+                            const previousMaterial = mesh.material;
+                            if (deps.ensureSceneRenderableMaterial(mesh, lastPayload, !!lastPayload.spline)) {
+                                deps.lightLinking.replaceRenderableMaterial?.(previousMaterial, mesh.material);
+                            }
                         }
                     }
                 }
@@ -250,23 +264,58 @@ function createSceneSync(deps = {}) {
             }
         }
 
+        function dissolveMaxInstanceBucket(bucketKey) {
+            const bucket = deps.maxInstanceBuckets.get(bucketKey);
+            if (!bucket) return false;
+            if (bucket.mesh?.parent) bucket.mesh.parent.remove(bucket.mesh);
+            // Geometry is shared with the source mesh. Materials are owned
+            // per bucket so sibling buckets cannot overwrite each other's
+            // assignments through a shared source material.
+            if (bucket.ownsMaterial) deps.disposeSceneMaterial(bucket.mesh?.material);
+            for (const handle of bucket.handles ?? []) {
+                deps.maxInstanceHandleToBucket.delete(handle);
+                const original = deps.nodeMap.get(handle);
+                if (original) original.visible = bucket.visible?.get(handle) !== false;
+            }
+            deps.maxInstanceBuckets.delete(bucketKey);
+            lastMaxInstanceBucketSignature = '';
+            return true;
+        }
+
         function disposeMaxInstanceBuckets() {
-            for (const [, bucket] of deps.maxInstanceBuckets) {
-                if (bucket.mesh?.parent) bucket.mesh.parent.remove(bucket.mesh);
-                // Geometry is shared with the source mesh. Materials are owned
-                // per bucket so sibling buckets cannot overwrite each other's
-                // assignments through a shared source material.
-                if (bucket.ownsMaterial) deps.disposeSceneMaterial(bucket.mesh?.material);
+            for (const bucketKey of [...deps.maxInstanceBuckets.keys()]) {
+                dissolveMaxInstanceBucket(bucketKey);
             }
             deps.maxInstanceBuckets.clear();
             deps.maxInstanceHandleToBucket.clear();
             lastMaxInstanceBucketSignature = '';
-            // Restore visibility on nodes that were hidden by bucket merge
-            for (const [, mesh] of deps.nodeMap) {
-                if (mesh && !mesh.visible && mesh.userData?.maxjsInstOf) {
-                    mesh.visible = true;
-                }
+        }
+
+        function setLightLinkTargetHandles(handles) {
+            const next = new Set(Array.from(handles ?? [], (handle) => String(handle)));
+            if (
+                next.size === lightLinkTargetHandles.size
+                && [...next].every((handle) => lightLinkTargetHandles.has(handle))
+            ) return false;
+
+            const added = [...next].filter((handle) => !lightLinkTargetHandles.has(handle));
+            lightLinkTargetHandles.clear();
+            for (const handle of next) lightLinkTargetHandles.add(handle);
+
+            const touchedBuckets = new Set();
+            for (const handle of next) {
+                const numeric = /^-?\d+$/.test(handle) ? Number(handle) : handle;
+                const bucketKey = deps.maxInstanceHandleToBucket.get(handle)
+                    ?? deps.maxInstanceHandleToBucket.get(numeric);
+                if (bucketKey != null) touchedBuckets.add(bucketKey);
             }
+            for (const bucketKey of touchedBuckets) dissolveMaxInstanceBucket(bucketKey);
+            let topologyChanged = touchedBuckets.size > 0;
+            for (const handle of added) {
+                const numeric = /^-?\d+$/.test(handle) ? Number(handle) : handle;
+                topologyChanged = dissolveFlattenedGroupForHandle(numeric) || topologyChanged;
+            }
+            return topologyChanged;
         }
 
         function getMaxInstanceBucketForHandle(handle) {
@@ -359,6 +408,7 @@ function createSceneSync(deps = {}) {
             if (!deps.performanceSettings.optimizeMaxInstances) return groups;
             for (const nd of nodes) {
                 if (!Number.isFinite(nd?.instOf) || nd.instOf <= 0) continue;
+                if (lightLinkTargetHandles.has(String(nd.h))) continue;
                 if (nd.jsmod || nd.spline || nd.skin || nd.groups || nd.mats) continue;
                 const sourceHandle = nd.instOf;
                 const materialKey = nd.mat ? deps.materialIdentityKey(nd.mat) : '__default__';
@@ -500,6 +550,7 @@ function createSceneSync(deps = {}) {
 
             for (const nd of nodes) {
                 if (nd.helper === true) continue;
+                if (lightLinkTargetHandles.has(String(nd.h))) continue;
                 if (nd.skin || nd.jsmod || nd.spline || nd.mats || nd.groups) continue;
                 if (nd.vis === false || nd.vis === 0) continue;
                 if (bucketHandles?.has(nd.h)) continue;
@@ -932,8 +983,10 @@ function createSceneSync(deps = {}) {
                         }
                         mesh.geometry = geom;
                     }
+                    const previousMaterial = mesh.material;
                     if (deps.ensureSceneRenderableMaterial(mesh, nd, wantsLine, { authoritativeMaterial: true })) {
                         sceneChanged = true;
+                        deps.lightLinking.replaceRenderableMaterial?.(previousMaterial, mesh.material);
                         deps.layerManager.applyMaterialOverrides?.(nd.h, mesh);
                     }
                 } else {
@@ -1031,6 +1084,7 @@ function createSceneSync(deps = {}) {
                 deps.markLightProbeSceneDirty();
                 deps.scheduleLightProbeFromCurrentScene();
                 deps.schedulePathTracingLiveRebuild();
+                deps.lightLinking.refreshSceneBindings?.();
                 return;
             }
 
@@ -1060,7 +1114,12 @@ function createSceneSync(deps = {}) {
             }
             mesh.geometry.dispose();
             mesh.geometry = geom;
-            deps.applyFastMaterialPayload(mesh, msg, wantsLine);
+            const previousMaterial = mesh.material;
+            const materialChanged = deps.applyFastMaterialPayload(mesh, msg, wantsLine);
+            if (!wantsLine) ensureGeometryUv0ForMaterial(mesh.geometry, mesh.material);
+            if (materialChanged) {
+                deps.lightLinking.replaceRenderableMaterial?.(previousMaterial, mesh.material);
+            }
             // Vertex / topology data on the same Object3D — no scene-structure
             // refresh, no pipeline rebuild. pass(scene, camera) picks up the new
             // BufferGeometry attributes on the next frame automatically.
@@ -1235,8 +1294,10 @@ function createSceneSync(deps = {}) {
                             mesh.userData.maxjsMaterialSignature = null;
                         }
                     }
+                    const previousMaterial = mesh.material;
                     if (deps.ensureSceneRenderableMaterial(mesh, nd, wantsLine, { authoritativeMaterial: true })) {
                         sceneChanged = true;
+                        deps.lightLinking.replaceRenderableMaterial?.(previousMaterial, mesh.material);
                         deps.layerManager.applyMaterialOverrides?.(nd.h, mesh);
                     }
                 } else {
@@ -1615,6 +1676,7 @@ function createSceneSync(deps = {}) {
                 if (!mesh || !material) return false;
                 if (materialIndex != null) {
                     if (!Array.isArray(mesh.material)) return false;
+                    const previousMaterials = mesh.material;
                     const oldMaterial = mesh.material[materialIndex] ?? null;
                     if (!oldMaterial) return false;
                     const wantsRoute = deps.shouldRouteBlackSpecularToLambert(material.model || 'MeshStandardMaterial', material);
@@ -1627,6 +1689,7 @@ function createSceneSync(deps = {}) {
                         matrixArray: mesh.matrix?.elements,
                     });
                     mesh.material = nextMaterials;
+                    deps.lightLinking.replaceRenderableMaterial?.(previousMaterials, nextMaterials);
                     if (!deps.isCachedMaterialTemplate(oldMaterial)) deps.disposeSceneMaterial(oldMaterial);
                     return true;
                 }
@@ -1640,10 +1703,12 @@ function createSceneSync(deps = {}) {
                     materialIndex: null,
                     matrixArray: mesh.matrix?.elements,
                 });
+                deps.lightLinking.replaceRenderableMaterial?.(oldMaterial, mesh.material);
                 if (!deps.isCachedMaterialTemplate(oldMaterial)) deps.disposeSceneMaterial(oldMaterial);
                 return true;
             };
             if (rebuildForBlackSpecularRoute()) {
+                ensureGeometryUv0ForMaterial(mesh.geometry, mesh.material);
                 if (mesh.userData) mesh.userData.maxjsMaterialSignature = null;
                 return;
             }
@@ -1767,6 +1832,7 @@ function createSceneSync(deps = {}) {
             retainGeometryRef,
             releaseGeometryRef,
             disposeMaxInstanceBuckets,
+            setLightLinkTargetHandles,
             disposeFlattenedGroups,
             getMaxInstanceBucketForHandle,
             matrixArraysAlmostEqual,

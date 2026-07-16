@@ -9,8 +9,8 @@ Best for medium scale scenes. It is prone to leaking but it is continuous and ca
 ## Hysteresis
 Hysteresis is the main slider for radiosity fade in/out.
 
-It is normalized by default over the real interval between updates of a probe (frame rate × how many ticks the round-robin scan needs to revisit it), so the temporal blend feels similar across machines, browsers, and grid sizes.
-With slow machines or very large grids it converges as fast as it can without dissolving into per-update noise.
+It is normalized by default over each cascade's accepted solve cadence and fractional round-robin revisit interval. Adaptive diffuse/depth history is normalized only after its final reference-rate retention is formed. Rough and glossy reflection caches use one dedicated steady/noisy retention for their complete stored state (including glossy numerator and support), so their wall-time decay remains identical across refresh rates. A valid zero-coverage rough texel stays initialized instead of accepting the next sparse hit without history.
+The same reference-rate decay is preserved when a large grid revisits each probe only every several solve ticks; the Hysteresis slider remains the explicit stability/convergence tradeoff.
 
 The live demo exposes a **normalize hysteresis** switch so you can turn the normalization off and compare against the raw per-update value.
 
@@ -34,7 +34,11 @@ npm install speedball-gi three three-mesh-bvh
 import { installSpeedballGI } from 'speedball-gi';
 
 // At SETUP before the first render / renderer.setAnimationLoop():
-const gi = installSpeedballGI({ renderer, scene, camera });
+const gi = installSpeedballGI({
+  renderer, scene, camera,
+  roughReflections: true, // optional glossy + rough local reflections; reuses DDGI rays
+  // reflectionSkyFallback: true, // only when setSky() should replace a missing environment map
+});
 
 // In your render loop, once per frame:
 gi.update();
@@ -54,6 +58,42 @@ has already run, three has cached a non-GI lights node and GI will fail.
   all-metal import reads as black GI. Opt-in; mutates materials in place. You can
   also pass `prepareMaterials: true` to `installSpeedballGI`.
 
+## Local DDGI reflections
+
+Pass **`roughReflections: true`** at creation time to build rough and glossy
+local-radiance lobes from the rays Speedball already traces. It adds no reflection
+rays or BVH traversal. Diffuse, depth, and the stable power-8 rough lobe keep the
+compact 6x6 octahedral cache; smooth materials use a separate 16x16, power-64
+glossy cache with support-aware temporal history. That high-resolution resolve is
+one additional dispatch per steady probe solve while the opt-in feature is enabled;
+new atlas allocations also receive a one-time clear.
+
+The physical receiver reuses the diffuse gather's probe visibility, applies
+depth-moment parallax correction to each reflection lookup, and samples only the
+lobe(s) required by material roughness. The result stays in Three's native
+`context.radiance` path, so Standard/Physical BRDF, metallic F0, Fresnel, and DFG
+remain Three's responsibility.
+
+Reflection layers stay explicit and composable:
+
+1. `scene.environment` / `material.envMap` supplies distant radiance through
+   Three's EnvironmentNode.
+2. Speedball composites local DDGI coverage over that radiance.
+3. An SSR pass can overlay its screen-space hits afterward using its own confidence.
+
+By default, true probe-ray misses leave the prior radiance unchanged, so PMREM stays
+visible there and a later SSR pass can independently overlay its own hits. For a
+scene that calls `setSky()` but deliberately has no environment map, pass
+**`reflectionSkyFallback: true`** (or call
+`gi.setReflectionSkyFallback(true)`) to fill those misses from the same SH-9 sky.
+Keep it off when PMREM or another reflection layer owns the distant environment.
+Changing this ownership at runtime reconverges through the normal temporal history;
+set it at creation when the layer boundary must be established before first solve.
+
+The whole feature is opt-in, so existing integrations keep their allocation,
+shader, and image path. Its live contribution is
+`gi.setReflectionIntensity(0..1)`.
+
 ## Limitations
 
 - **WebGPU-only**
@@ -62,6 +102,12 @@ has already run, three has cached a non-GI lights node and GI will fail.
   representation. Standard PBR-ish materials are the target; exotic node graphs,
   alpha/transmission edge cases, and tiny normal-map detail won't all bounce
   exactly like final shading.
+- **Probe reflections are approximate** — the glossy lobe is parallax-corrected and
+  stable off-screen, but its angular/probe resolution is not a pixel-accurate mirror
+  or transmission path. Non-emissive pure metal/glass *hits inside the traced
+  scene* cannot be shaded by the Lambert DDGI ray, so they leave PMREM visible
+  instead of becoming black local occluders; use SSR/PT when exact mirror detail
+  is required.
 - **Best for small to medium scale scenes** — very large worlds or many separated islands
   can waste probes unless bounds and cascades are curated.
 - **Cascades:** — Don't even bother with cascades if you are not using Chromium. Additionally cascaded grid will require higher ray count to look as smooth as single grid probes.

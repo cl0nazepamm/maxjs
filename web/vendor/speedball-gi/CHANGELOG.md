@@ -3,6 +3,43 @@
 All notable changes to Speedball GI are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+- Fixed hysteresis normalization across render rates. Adaptive diffuse and depth
+  policies are formed in the 60 Hz reference domain before their final retention
+  is time-normalized. Rough and glossy reflections now share a dedicated steady /
+  noisy reference retention that remains a true elapsed-time semigroup instead of
+  inheriting diffuse's nonlinear change detector. Glossy numerator/support use the
+  same coefficient, and zero-coverage rough texels no longer re-arm as uninitialized
+  and bypass history on the next sparse hit. Each cascade uses its own accepted
+  solve cadence and fractional probe revisit rate, removing the near-full-batch
+  discontinuity that made high-throughput machines flicker more. The reactive fade
+  is elapsed-time based, and normalization no longer clamps either high-refresh or
+  sparse-revisit exponents.
+- Added opt-in local DDGI reflections without adding reflection rays or BVH
+  traversal. The power-8 rough lobe stays in the existing 6x6 probe blend, while
+  smooth materials use a separately packed 16x16 power-64 glossy cache. Its
+  support-aware numerator/denominator history resolves in one additional compute
+  dispatch and converges sparse sharp samples without giving weak ray sets equal
+  authority.
+- Standard/Physical receivers reuse the diffuse visibility gather,
+  depth-moment-parallax-correct each probe lookup, blend the two lobes by material
+  roughness, and composite coverage through Three's native `context.radiance`
+  path. Three still owns PMREM, metallic F0, Fresnel, and DFG shading, while a
+  later SSR pass remains free to overlay its own confident hits.
+- Added explicit `reflectionSkyFallback` creation and runtime controls. It defaults
+  off so true probe misses leave Three's prior radiance unchanged; scenes with only
+  a `setSky()` SH sky can opt in to use that already-traced radiance as the distant
+  reflection layer. Runtime ownership changes reconverge temporally.
+  Unsupported non-emissive pure-metal/glass hits remain transparent to the prior
+  reflection layer instead of becoming black occluders.
+- Reflection grids now respect both the device's 2D texture limit and its storage
+  buffer binding limit, and glossy history is normalized per ray so changing the
+  live ray count cannot skew temporal authority.
+- Updated the Sponza diagnostic ball to a receiver-only `metalness: 1`,
+  `roughness: 0` target and enabled SH reflection fallback for its procedural-sky,
+  no-environment configuration.
+
 ## [0.6.4] — 2026-07-13
 
 - Fixed unbounded WebGPU storage growth after settled animated-scene rebuilds.

@@ -118,7 +118,14 @@
         }
         const root = params.get('root') ?? ((await hasSnapshotAt('.')) ? '.' : 'snapshots/current');
         const reloadEnabled = !params.has('noreload');
-        const rendererBackend = 'webgpu';
+        const autoRendererBackend = params.get('maxjsAutoRenderer') === '1';
+        const requestedBackend = String(
+            params.get('renderer')
+            ?? params.get('backend')
+            ?? params.get('rendererBackend')
+            ?? 'webgpu',
+        ).toLowerCase();
+        const rendererBackend = requestedBackend.includes('tsl') ? 'tsl_gl' : 'webgpu';
 
         async function pollForUpdates(initialKey) {
             const url = `${root}/snapshot.json`;
@@ -130,8 +137,16 @@
                     if (!head.ok) continue;
                     const key = head.headers.get('last-modified') ?? head.headers.get('etag') ?? '';
                     if (key && lastKey && key !== lastKey) {
-                        console.log('[snapshot_webgpu.html] new export detected, reloading');
-                        location.reload();
+                        if (autoRendererBackend) {
+                            console.log('[snapshot_webgpu.html] new export detected, re-evaluating renderer');
+                            const target = new URL('snapshot.html', location.href);
+                            target.searchParams.delete('renderer');
+                            target.searchParams.delete('maxjsAutoRenderer');
+                            location.replace(target.href);
+                        } else {
+                            console.log('[snapshot_webgpu.html] new export detected, reloading');
+                            location.reload();
+                        }
                         return;
                     }
                     if (!lastKey) lastKey = key;
@@ -175,12 +190,14 @@
 
             if (reloadEnabled) pollForUpdates(initialKey);
         } catch (err) {
-            console.error('[max.js snapshot WebGPU] boot failed', err);
+            console.error(`[max.js snapshot ${rendererBackend}] boot failed`, err);
             status.classList.add('error');
             status.innerHTML =
-                '<div>snapshot WebGPU boot failed</div>' +
+                `<div>snapshot ${rendererBackend === 'tsl_gl' ? 'TSL_GL' : 'WebGPU'} boot failed</div>` +
                 '<pre>' + (err?.stack ?? err?.message ?? String(err)) + '</pre>' +
-                '<pre style="opacity:0.7">WebGPU deploys require native browser WebGPU. Use snapshot.html for WebGL.</pre>';
+                (rendererBackend === 'webgpu'
+                    ? '<pre style="opacity:0.7">WebGPU deploys require native browser WebGPU. Use ?renderer=tsl_gl for the TSL WebGL backend.</pre>'
+                    : '<pre style="opacity:0.7">TSL_GL requires WebGL2 support.</pre>');
             if (reloadEnabled) pollForUpdates(await snapshotKey());
         }
     </script>

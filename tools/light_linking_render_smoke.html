@@ -1,0 +1,270 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>max.js light-linking render smoke</title>
+    <style>
+        html, body { margin: 0; background: #111; color: #ddd; font: 13px monospace; }
+        canvas { display: block; width: 256px; height: 128px; image-rendering: pixelated; }
+        pre { white-space: pre-wrap; }
+    </style>
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "../web/vendor/three-r185/build/three.webgpu.js",
+            "three/webgpu": "../web/vendor/three-r185/build/three.webgpu.js",
+            "three/tsl": "../web/vendor/three-r185/build/three.tsl.js",
+            "three/addons/": "../web/vendor/three-r185/examples/",
+            "speedball-gi": "../web/vendor/speedball-gi/js/index.js"
+        }
+    }
+    </script>
+</head>
+<body>
+    <canvas id="canvas" width="256" height="128"></canvas>
+    <pre id="result">running...</pre>
+    <script type="module">
+        import * as THREE from 'three';
+        import {
+            installMaxLightsRenderer,
+            setLightLinkMaterialObserver,
+            setLightLinkMaskDefaults,
+        } from '../web/js/max_lights_node.js';
+        import {
+            LIGHT_MASK_HI_KEY,
+            LIGHT_MASK_LO_KEY,
+            LIGHT_MASK_READY_KEY,
+            createLightLinkMaskApplier,
+        } from '../web/js/light_linking_core.js';
+        import { createStudioLightingController } from '../web/js/studio_lighting.js';
+        import { createRenderer as createSnapshotRenderer } from '../web/js/scene_init.js';
+
+        const resultElement = document.getElementById('result');
+        const result = window.__LIGHT_LINK_RENDER_SMOKE = {
+            ready: false,
+            pass: false,
+            webgpu: !!navigator.gpu,
+            cases: [],
+            errors: [],
+        };
+
+        window.addEventListener('error', (event) => {
+            result.errors.push(String(event.error?.stack || event.message || event.error));
+        });
+        window.addEventListener('unhandledrejection', (event) => {
+            result.errors.push(String(event.reason?.stack || event.reason));
+        });
+
+        function rgbEnergy(pixels, width, x, y) {
+            const offset = ((y * width) + x) * 4;
+            return Math.round((pixels[offset] + pixels[offset + 1] + pixels[offset + 2]) / 3);
+        }
+
+        function maskSnapshot(mesh) {
+            return {
+                ready: mesh.userData[LIGHT_MASK_READY_KEY],
+                lo: mesh.userData[LIGHT_MASK_LO_KEY] >>> 0,
+                hi: mesh.userData[LIGHT_MASK_HI_KEY] >>> 0,
+            };
+        }
+
+        try {
+            const width = 256;
+            const height = 128;
+            const forceWebGL = new URLSearchParams(location.search).get('forceWebGL') === '1';
+            const { renderer } = await createSnapshotRenderer(document.getElementById('canvas'), {
+                backend: forceWebGL ? 'tsl_gl' : 'webgpu',
+            });
+            renderer.setPixelRatio(1);
+            renderer.setSize(width, height, false);
+            renderer.toneMapping = THREE.NoToneMapping;
+            renderer.outputColorSpace = THREE.SRGBColorSpace;
+            if (!installMaxLightsRenderer(renderer, { maxDirectionalLights: 1, maxHemisphereLights: 0 })) {
+                throw new Error('adaptive lighting factory was not installed');
+            }
+            result.backend = renderer.backend?.isWebGPUBackend === true ? 'WebGPU' : 'TSL_GL';
+
+            const scene = new THREE.Scene();
+            scene.background = new THREE.Color(0x000000);
+            const camera = new THREE.OrthographicCamera(-2, 2, 1, -1, 0.1, 10);
+            camera.position.z = 3;
+            camera.updateProjectionMatrix();
+
+            const geometry = new THREE.PlaneGeometry(1.35, 1.35);
+            const material = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 1, metalness: 0 });
+            const left = new THREE.Mesh(geometry, material);
+            const right = new THREE.Mesh(geometry, material);
+            left.position.x = -0.8;
+            right.position.x = 0.8;
+            left.name = 'Left';
+            right.name = 'Right';
+            scene.add(left, right);
+
+            const meshes = new Map([['10', left], ['11', right]]);
+            const lightHandleMap = new Map();
+            let specializedLightingActive = false;
+            const maskApplier = createLightLinkMaskApplier({
+                lightHandleMap,
+                forEachRenderableMesh(fn) {
+                    for (const [handle, mesh] of meshes) fn(handle, mesh);
+                },
+                onPrepareMesh(mesh) {
+                    setLightLinkMaterialObserver(mesh.material, true);
+                },
+            });
+            const renderTarget = new THREE.RenderTarget(width, height, {
+                minFilter: THREE.NearestFilter,
+                magFilter: THREE.NearestFilter,
+                type: THREE.UnsignedByteType,
+            });
+
+            function applyLinks(links) {
+                const state = maskApplier.apply(links);
+                if (state.activeCount === 0 && specializedLightingActive) {
+                    for (const mesh of meshes.values()) {
+                        setLightLinkMaterialObserver(mesh.material, false);
+                    }
+                }
+                specializedLightingActive = state.activeCount > 0;
+                setLightLinkMaskDefaults(renderer, state.defaultLo, state.defaultHi, state.generation);
+            }
+
+            function apply(mode, selected = []) {
+                applyLinks(mode
+                    ? new Map([['1', { mode, objects: new Set(selected) }]])
+                    : new Map());
+            }
+
+            async function capture(name, expectLeft, expectRight) {
+                renderer.setRenderTarget(renderTarget);
+                await renderer.renderAsync(scene, camera);
+                const pixels = await renderer.readRenderTargetPixelsAsync(renderTarget, 0, 0, width, height);
+                renderer.setRenderTarget(null);
+                const leftValue = rgbEnergy(pixels, width, 77, 64);
+                const rightValue = rgbEnergy(pixels, width, 179, 64);
+                const leftPass = expectLeft ? leftValue > 40 : leftValue < 8;
+                const rightPass = expectRight ? rightValue > 40 : rightValue < 8;
+                result.cases.push({
+                    name,
+                    left: leftValue,
+                    right: rightValue,
+                    expected: [expectLeft ? 'lit' : 'black', expectRight ? 'lit' : 'black'],
+                    masks: { left: maskSnapshot(left), right: maskSnapshot(right) },
+                    pass: leftPass && rightPass,
+                });
+            }
+
+            async function runLight(light, label) {
+                lightHandleMap.clear();
+                lightHandleMap.set('1', light);
+                scene.add(light);
+                if (light.target && !light.target.parent) scene.add(light.target);
+
+                apply(null);
+                await capture(`${label}: None`, true, true);
+                apply('include');
+                await capture(`${label}: Include empty`, false, false);
+                apply('include', ['10']);
+                await capture(`${label}: Include Left`, true, false);
+                apply('exclude', ['10']);
+                await capture(`${label}: Exclude Left`, false, true);
+                apply(null);
+                await capture(`${label}: None restored`, true, true);
+
+                scene.remove(light);
+                if (light.target?.parent === scene) scene.remove(light.target);
+            }
+
+            await runLight(new THREE.AmbientLight(0xffffff, 2), 'Ambient');
+
+            const directional = new THREE.DirectionalLight(0xffffff, 2);
+            directional.position.set(0, 0, 3);
+            directional.target.position.set(0, 0, 0);
+            await runLight(directional, 'Directional');
+
+            const point = new THREE.PointLight(0xffffff, 100, 0, 2);
+            point.position.set(0, 0, 3);
+            await runLight(point, 'Point');
+
+            const spot = new THREE.SpotLight(0xffffff, 100, 0, Math.PI / 3, 0, 2);
+            spot.position.set(0, 0, 3);
+            spot.target.position.set(0, 0, 0);
+            await runLight(spot, 'Spot');
+
+            const hemisphere = new THREE.HemisphereLight(0xffffff, 0x000000, 2);
+            hemisphere.position.set(0, 0, 1);
+            await runLight(hemisphere, 'Hemisphere fallback');
+
+            const cappedA = new THREE.DirectionalLight(0xffffff, 2);
+            const cappedB = new THREE.DirectionalLight(0xffffff, 2);
+            cappedA.position.set(0, 0, 3);
+            cappedB.position.set(0, 0, 3);
+            lightHandleMap.clear();
+            lightHandleMap.set('1', cappedA);
+            lightHandleMap.set('2', cappedB);
+            scene.add(cappedA, cappedA.target, cappedB, cappedB.target);
+            applyLinks(new Map([
+                ['1', { mode: 'include', objects: new Set() }],
+                ['2', { mode: 'include', objects: new Set(['10']) }],
+            ]));
+            await capture('Directional per-type overflow fallback', true, false);
+            applyLinks(new Map());
+            await capture('Directional per-type overflow None', true, true);
+            scene.remove(cappedA, cappedA.target, cappedB, cappedB.target);
+
+            const snapshotAmbient = new THREE.AmbientLight(0xffffff, 2);
+            lightHandleMap.clear();
+            lightHandleMap.set('7', snapshotAmbient);
+            scene.add(snapshotAmbient);
+            const snapshotController = createStudioLightingController({
+                renderer,
+                scene,
+                camera,
+                nodeMap: meshes,
+                lightHandleMap,
+            });
+            snapshotController.applyState({
+                version: 2,
+                lightLinking: {
+                    linkEntries: [{
+                        lightHandle: '7',
+                        lightName: '',
+                        mode: 'include',
+                        objectHandles: [],
+                        objectNames: [],
+                    }],
+                },
+            });
+            await capture('Snapshot replay Include empty', false, false);
+            snapshotController.applyState({
+                version: 2,
+                lightLinking: {
+                    linkEntries: [{
+                        lightHandle: '7',
+                        lightName: '',
+                        mode: 'exclude',
+                        objectHandles: ['10'],
+                        objectNames: ['Left'],
+                    }],
+                },
+            });
+            await capture('Snapshot replay Exclude Left', false, true);
+            snapshotController.dispose();
+            await capture('Snapshot replay None restored', true, true);
+            scene.remove(snapshotAmbient);
+
+            result.pass = result.cases.every((item) => item.pass) && result.errors.length === 0;
+            result.ready = true;
+            resultElement.textContent = JSON.stringify(result, null, 2);
+            renderer.dispose();
+            renderTarget.dispose();
+            geometry.dispose();
+            material.dispose();
+        } catch (error) {
+            result.errors.push(String(error?.stack || error));
+            result.ready = true;
+            resultElement.textContent = JSON.stringify(result, null, 2);
+        }
+    </script>
+</body>
+</html>

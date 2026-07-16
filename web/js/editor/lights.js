@@ -1,11 +1,19 @@
 // lights.js - editor scene lights, light linking, helpers, and shadow-origin glue.
 import * as THREE from 'three';
 import {
-    ensureMeshMaskDefaults,
+    clearUnownedLightLinkMaterialObserver,
     getReflectionPaintNode,
-    LIGHT_MASK_LO_KEY,
-    LIGHT_MASK_HI_KEY,
+    setLightLinkMaterialObserver,
+    setLightLinkMaskDefaults,
 } from '../max_lights_node.js';
+import {
+    createLightLinkMaskApplier,
+    deserializeLightLinks,
+    getByHandle,
+    handleToken,
+    normalizeLightLinkMode,
+    serializeLightLinks,
+} from '../light_linking_core.js';
 
 function createLights(deps = {}) {
         const lightHelperMap = new Map();
@@ -460,36 +468,9 @@ function createLights(deps = {}) {
             return light;
         }
 
-        // ── Light ID allocator for per-material mask uniforms ──
-        // Stable across re-syncs by name so UI state (stored by name) still
-        // applies. 64-slot cap (two uint32 per material). Slot 0..63 used for
-        // linked lights; any extras fall back to "unlinked" = always on.
-        const MAXJS_MAX_LIGHT_IDS = 64;
-        const lightIdByName = new Map();        // name -> id
-        const lightIdSlots = new Uint8Array(MAXJS_MAX_LIGHT_IDS); // 1 = taken
-        function lightStableKey(light, ld) {
-            return light?.name || ld?.name || ('_h' + ld?.h);
-        }
-        function allocLightId(key) {
-            if (lightIdByName.has(key)) {
-                const id = lightIdByName.get(key);
-                lightIdSlots[id] = 1;
-                return id;
-            }
-            for (let i = 0; i < MAXJS_MAX_LIGHT_IDS; i++) {
-                if (!lightIdSlots[i]) {
-                    lightIdSlots[i] = 1;
-                    lightIdByName.set(key, i);
-                    return i;
-                }
-            }
-            return -1; // all slots taken — light becomes "unlinked"
-        }
-
         function finalizeLightState(lightsData) {
             let appliedLightCount = 0;
             let mainDirectionalLight = null;
-            lightIdSlots.fill(0);
 
             for (const ld of lightsData) {
                 const light = createLightFromData(ld);
@@ -499,9 +480,8 @@ function createLights(deps = {}) {
                     deps.lightHandleMap.set(ld.h, light);
                     const helper = createLightHelper(light, ld.type);
                     if (helper) lightHelperMap.set(ld.h, helper);
-                    const id = allocLightId(lightStableKey(light, ld));
                     light.userData ??= {};
-                    light.userData.maxjsLightId = id;
+                    light.userData.maxjsLightId = -1;
                     light.userData.maxjsLightLinked = false;
                 }
                 if (light.userData?.maxjsVisible !== false) {
@@ -534,47 +514,99 @@ function createLights(deps = {}) {
         }
 
         // ── Light Linking ────────────────────────────────────
-        // Per-mesh 64-bit light masks plus per-material HDRI intensity state.
-        // Persisted by stable names so it survives re-sync.
+        // Per-mesh 64-bit fast masks plus overflow links and per-material HDRI
+        // intensity. Portable state is handle-first with legacy name fallback.
 
         const lightLinking = (() => {
             // lightHandle -> { mode: 'include'|'exclude', objects: Set<nodeHandle> }
             const links = new Map();
+            const materialObserverOwner = {};
+            const observedMaterials = new Set();
+            let observerSweepSet = null;
+            let observerSweepQueued = false;
             // materialName -> float (0..1+) HDRI intensity. Keyed by Max material
             // name so it survives handle churn and scene rebuilds.
             const envIntensityByName = new Map();
-
-            function handleToken(handle) {
-                return handle == null ? '' : String(handle);
-            }
-
-            function resolveHandle(map, handle) {
-                if (handle == null) return null;
-                if (map.has(handle)) return handle;
-                const token = handleToken(handle);
-                if (map.has(token)) return token;
-                if (/^-?\d+$/.test(token)) {
-                    const numeric = Number(token);
-                    if (Number.isSafeInteger(numeric) && map.has(numeric)) return numeric;
-                }
-                return null;
-            }
-
-            function getByHandle(map, handle) {
-                const resolved = resolveHandle(map, handle);
-                return resolved == null ? undefined : map.get(resolved);
-            }
+            const envBaseIntensityByMaterial = new WeakMap();
 
             function forEachRenderableMesh(fn) {
+                const seen = new WeakSet();
                 for (const [h, mesh] of deps.nodeMap) {
                     if (!mesh?.isMesh) continue;
+                    seen.add(mesh);
                     fn(handleToken(h), mesh);
                 }
-                for (const [, bucket] of deps.maxInstanceBuckets) {
-                    if (!bucket?.mesh?.isMesh) continue;
-                    fn(handleToken(bucket.sourceHandle ?? ''), bucket.mesh);
+                deps.scene?.traverse?.((mesh) => {
+                    if (!mesh?.isMesh || seen.has(mesh)) return;
+                    seen.add(mesh);
+                    const handle = mesh.userData?.maxjsHandle
+                        ?? mesh.userData?.maxjsSourceHandle
+                        ?? mesh.userData?.maxjsSource
+                        ?? '';
+                    fn(handleToken(handle), mesh);
+                });
+            }
+
+            function prepareMaterialObserver(material) {
+                const materials = Array.isArray(material) ? material : [material];
+                for (const entry of materials) {
+                    if (!entry) continue;
+                    observerSweepSet?.add(entry);
+                    if (observedMaterials.has(entry)) continue;
+                    observedMaterials.add(entry);
+                    setLightLinkMaterialObserver(entry, true, materialObserverOwner);
                 }
             }
+
+            function releaseMaterialObservers() {
+                for (const material of observedMaterials) {
+                    setLightLinkMaterialObserver(material, false, materialObserverOwner);
+                }
+                observedMaterials.clear();
+            }
+
+            function queueMaterialObserverSweep() {
+                if (observerSweepQueued) return;
+                observerSweepQueued = true;
+                queueMicrotask(() => {
+                    observerSweepQueued = false;
+                    if (!specializedLightingActive) return;
+                    const currentMaterials = new Set();
+                    observerSweepSet = currentMaterials;
+                    forEachRenderableMesh((_handle, mesh) => prepareMaterialObserver(mesh.material));
+                    observerSweepSet = null;
+                    sweepMaterialObservers(currentMaterials);
+                });
+            }
+
+            function replaceRenderableMaterial(_previous, next) {
+                if (!specializedLightingActive) return;
+                // A material can be shared by many renderables. Prepare the new
+                // material immediately, then release only after a scene-wide
+                // sweep proves the old material is no longer referenced.
+                prepareMaterialObserver(next);
+                queueMaterialObserverSweep();
+            }
+
+            function sweepMaterialObservers(currentMaterials) {
+                for (const material of [...observedMaterials]) {
+                    if (currentMaterials.has(material)) continue;
+                    setLightLinkMaterialObserver(material, false, materialObserverOwner);
+                    observedMaterials.delete(material);
+                }
+            }
+
+            const maskApplier = createLightLinkMaskApplier({
+                lightHandleMap: deps.lightHandleMap,
+                forEachRenderableMesh,
+                onPrepareMesh: (mesh) => prepareMaterialObserver(mesh.material),
+                onOverflow: (overflowCount, activeCount) => {
+                    console.warn(
+                        `[max.js] ${activeCount} linked lights active; ${overflowCount} use the per-light fallback beyond the 64-light batched mask.`,
+                    );
+                },
+            });
+            let specializedLightingActive = false;
 
             function materialNameOf(material) {
                 const value = String(
@@ -601,27 +633,6 @@ function createLights(deps = {}) {
                 }
                 return null;
             }
-            function meshHandleByName(name) {
-                for (const [h, mesh] of deps.nodeMap) {
-                    if (mesh.name === name) return handleToken(h);
-                }
-                return null;
-            }
-
-            function resetMask(mesh) {
-                ensureMeshMaskDefaults(mesh);
-                mesh.userData[LIGHT_MASK_LO_KEY] = 0xFFFFFFFF;
-                mesh.userData[LIGHT_MASK_HI_KEY] = 0xFFFFFFFF;
-            }
-
-            function writeBit(mesh, lightId, enabled) {
-                ensureMeshMaskDefaults(mesh);
-                const key = lightId < 32 ? LIGHT_MASK_LO_KEY : LIGHT_MASK_HI_KEY;
-                const bit = (1 << (lightId & 31)) >>> 0;
-                const cur = mesh.userData[key] >>> 0;
-                mesh.userData[key] = enabled ? ((cur | bit) >>> 0) : ((cur & ~bit) >>> 0);
-            }
-
             function forEachMaterialByName(materialName, fn) {
                 const seen = new Set();
                 forEachRenderableMesh((_h, mesh) => {
@@ -635,51 +646,68 @@ function createLights(deps = {}) {
             }
 
             function applyEnvIntensities() {
-                const seen = new Set();
-                forEachRenderableMesh((_h, mesh) => {
-                    const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
-                    for (const mat of materials) {
-                        if (!mat || seen.has(mat)) continue;
-                        seen.add(mat);
-                        const matName = materialNameOf(mat);
-                        const ev = envIntensityByName.get(matName);
-                        mat.envMapIntensity = (typeof ev === 'number') ? ev : 1.0;
-                    }
-                });
+                if (envIntensityByName.size === 0) return;
+                for (const [materialName, value] of envIntensityByName) {
+                    forEachMaterialByName(materialName, (mat) => {
+                        if (!envBaseIntensityByMaterial.has(mat)) {
+                            envBaseIntensityByMaterial.set(
+                                mat,
+                                Number.isFinite(mat.envMapIntensity) ? mat.envMapIntensity : 1.0,
+                            );
+                        }
+                        mat.envMapIntensity = value;
+                    });
+                }
+            }
+
+            function clearEnvIntensityOverrides() {
+                for (const [materialName] of envIntensityByName) {
+                    forEachMaterialByName(materialName, (mat) => {
+                        const base = envBaseIntensityByMaterial.get(mat);
+                        if (Number.isFinite(base)) mat.envMapIntensity = base;
+                        envBaseIntensityByMaterial.delete(mat);
+                    });
+                }
+                envIntensityByName.clear();
             }
 
             function reapply() {
-                for (const [, light] of deps.lightHandleMap) {
-                    if (!light?.userData) continue;
-                    light.userData.maxjsLightLinked = false;
+                const linkedObjectHandles = new Set();
+                for (const link of links.values()) {
+                    for (const handle of link.objects) linkedObjectHandles.add(handleToken(handle));
                 }
-                // Apply each link as a bit-clear pattern.
-                if (links.size > 0) {
-                    // Only linked lights need per-mesh masks. This avoids
-                    // walking every mesh on normal Studio scenes.
-                    forEachRenderableMesh((_meshHandle, mesh) => {
-                        resetMask(mesh);
+                const sceneTopologyChanged = deps.setLightLinkTargetHandles?.(linkedObjectHandles) === true;
+                observerSweepSet = new Set();
+                const maskState = maskApplier.apply(links);
+                const currentObserverMaterials = observerSweepSet;
+                observerSweepSet = null;
+                if (maskState.activeCount === 0 && specializedLightingActive) {
+                    releaseMaterialObservers();
+                    forEachRenderableMesh((_handle, mesh) => {
+                        clearUnownedLightLinkMaterialObserver(mesh.material);
                     });
-                    for (const [lh, link] of links) {
-                        const light = getByHandle(deps.lightHandleMap, lh);
-                        const lid = light?.userData?.maxjsLightId;
-                        if (!Number.isInteger(lid) || lid < 0 || lid >= 64) continue;
-                        light.userData.maxjsLightLinked = true;
-                        if (link.mode === 'include') {
-                            forEachRenderableMesh((meshHandle, mesh) => {
-                                writeBit(mesh, lid, link.objects.has(meshHandle));
-                            });
-                        } else {
-                            // Walk every renderable mesh (instanced buckets included,
-                            // which never appear in nodeMap) and clear the bit on the
-                            // excluded ones, mirroring the include branch above.
-                            forEachRenderableMesh((meshHandle, mesh) => {
-                                if (link.objects.has(meshHandle)) writeBit(mesh, lid, false);
-                            });
-                        }
-                    }
+                } else if (maskState.activeCount > 0) {
+                    sweepMaterialObservers(currentObserverMaterials);
                 }
+                specializedLightingActive = maskState.activeCount > 0;
+                if (specializedLightingActive && deps.isSimpleWebGLPipelineActive()) {
+                    deps.restartWithRendererBackend?.('webgl-fallback', {
+                        reason: 'light-linking-restore',
+                        prompt: false,
+                    });
+                }
+                if (specializedLightingActive && deps.isPathTracingMode) {
+                    deps.setSpectralView?.('probes');
+                }
+                setLightLinkMaskDefaults(
+                    deps.renderer,
+                    maskState.defaultLo,
+                    maskState.defaultHi,
+                    maskState.generation,
+                );
                 applyEnvIntensities();
+                window.__maxjsSyncSpectralViewUi?.();
+                return { ...maskState, sceneTopologyChanged };
             }
 
             function notifyLightLinkTopologyChanged() {
@@ -689,23 +717,29 @@ function createLights(deps = {}) {
 
             function setLink(lightHandle, mode, objectHandles) {
                 const lightKey = handleToken(lightHandle);
-                if (!objectHandles || objectHandles.size === 0) {
-                    links.delete(lightKey);
-                } else {
-                    links.set(lightKey, {
-                        mode,
-                        objects: new Set(Array.from(objectHandles, handleToken)),
-                    });
+                const normalizedMode = normalizeLightLinkMode(mode);
+                if (!normalizedMode) {
+                    removeLink(lightHandle);
+                    return;
                 }
-                reapply();
-                notifyLightLinkTopologyChanged();
+                const previous = links.get(lightKey);
+                links.set(lightKey, {
+                    mode: normalizedMode,
+                    objects: new Set(Array.from(objectHandles ?? [], handleToken)),
+                });
+                const state = reapply();
+                if (!previous || previous.mode !== normalizedMode || state.sceneTopologyChanged) {
+                    notifyLightLinkTopologyChanged();
+                }
+                else notifyLightingParamChanged();
                 save();
             }
 
             function removeLink(lightHandle) {
-                links.delete(handleToken(lightHandle));
+                const removed = links.delete(handleToken(lightHandle));
                 reapply();
-                notifyLightLinkTopologyChanged();
+                if (removed) notifyLightLinkTopologyChanged();
+                else notifyLightingParamChanged();
                 save();
             }
 
@@ -886,7 +920,19 @@ function createLights(deps = {}) {
                 else envIntensityByName.delete(materialName);
                 let touched = false;
                 forEachMaterialByName(materialName, (mat) => {
-                    mat.envMapIntensity = v;
+                    if (!envBaseIntensityByMaterial.has(mat)) {
+                        envBaseIntensityByMaterial.set(
+                            mat,
+                            Number.isFinite(mat.envMapIntensity) ? mat.envMapIntensity : 1.0,
+                        );
+                    }
+                    if (v !== 1.0) {
+                        mat.envMapIntensity = v;
+                    } else {
+                        const base = envBaseIntensityByMaterial.get(mat);
+                        if (Number.isFinite(base)) mat.envMapIntensity = base;
+                        envBaseIntensityByMaterial.delete(mat);
+                    }
                     touched = true;
                 });
                 if (touched) notifyLightingParamChanged();
@@ -913,7 +959,14 @@ function createLights(deps = {}) {
             }
 
             function serialize() {
-                const data = { links: {}, env: {}, constrain: {} };
+                const data = {
+                    ...serializeLightLinks(links, {
+                        lightHandleMap: deps.lightHandleMap,
+                        nodeMap: deps.nodeMap,
+                    }),
+                    env: {},
+                    constrain: {},
+                };
                 data.reflectionPaintIntensity = getReflectionPaintIntensity();
                 data.constrain.hdri = hdriConstrainToCamera;
                 data.constrain.reflectionPaint = reflectionPaintConstrainToCamera;
@@ -939,16 +992,6 @@ function createLights(deps = {}) {
                     data.constrain.lights = constrainedLightNames;
                     data.constrain.lightOffsets = constrainedLights;
                 }
-                for (const [lh, link] of links) {
-                    const lName = getByHandle(deps.lightHandleMap, lh)?.name;
-                    if (!lName) continue;
-                    const objNames = [];
-                    for (const oh of link.objects) {
-                        const n = getByHandle(deps.nodeMap, oh)?.name;
-                        if (n) objNames.push(n);
-                    }
-                    data.links[lName] = { mode: link.mode, objects: objNames };
-                }
                 for (const [materialName, v] of envIntensityByName) {
                     data.env[materialName] = v;
                 }
@@ -970,31 +1013,24 @@ function createLights(deps = {}) {
 
             function applyPayload(data, options = {}) {
                 try {
+                    const hadSpecializedLighting = specializedLightingActive;
                     links.clear();
-                    envIntensityByName.clear();
+                    clearEnvIntensityOverrides();
                     lightCameraConstraints.clear();
                     if (!data || typeof data !== 'object') {
-                        reapply();
+                        const state = reapply();
+                        if (hadSpecializedLighting || state.sceneTopologyChanged) {
+                            notifyLightLinkTopologyChanged();
+                        }
                         return;
                     }
-                    // Back-compat: old format was flat { lightName: {mode, objects} }.
-                    const rawLinks = data.links || (data.env === undefined ? data : {});
                     const rawEnv = data.env || {};
-                    for (const [lName, entry] of Object.entries(rawLinks)) {
-                        if (!entry || typeof entry !== 'object' || !entry.mode) continue;
-                        const lh = lightHandleByName(lName);
-                        if (lh == null) continue;
-                        const objHandles = new Set();
-                        for (const oName of (entry.objects || [])) {
-                            const oh = meshHandleByName(oName);
-                            if (oh != null) objHandles.add(oh);
-                        }
-                        if (objHandles.size > 0) {
-                            links.set(lh, {
-                                mode: entry.mode === 'include' ? 'include' : 'exclude',
-                                objects: objHandles,
-                            });
-                        }
+                    const restoredLinks = deserializeLightLinks(data, {
+                        lightHandleMap: deps.lightHandleMap,
+                        nodeMap: deps.nodeMap,
+                    });
+                    for (const [lightHandle, link] of restoredLinks) {
+                        links.set(lightHandle, link);
                     }
                     for (const [materialName, v] of Object.entries(rawEnv)) {
                         if (Number.isFinite(v)) envIntensityByName.set(materialName, v);
@@ -1019,7 +1055,10 @@ function createLights(deps = {}) {
                     if (options.applyReflectionPaintIntensity !== false && Number.isFinite(data.reflectionPaintIntensity)) {
                         getReflectionPaintNode().setGlobalIntensity(data.reflectionPaintIntensity);
                     }
-                    reapply();
+                    const state = reapply();
+                    if (hadSpecializedLighting || state.activeCount > 0 || state.sceneTopologyChanged) {
+                        notifyLightLinkTopologyChanged();
+                    }
                 } catch {}
             }
 
@@ -1029,11 +1068,23 @@ function createLights(deps = {}) {
 
             return {
                 reapply, serialize, applyPayload, restoreFromStorage,
+                prepareRenderableMaterial: (material) => {
+                    if (specializedLightingActive) prepareMaterialObserver(material);
+                },
+                replaceRenderableMaterial,
                 refreshSceneBindings: () => {
-                    reapply();
-                    notifyLightingParamChanged();
+                    const state = reapply();
+                    if (state.sceneTopologyChanged) notifyLightLinkTopologyChanged();
+                    else notifyLightingParamChanged();
                 },
                 setLink, removeLink, getLink, getAllLinks,
+                hasLinks: () => links.size > 0,
+                hasActiveLinks: () => specializedLightingActive,
+                hasPortableState: () => links.size > 0
+                    || envIntensityByName.size > 0
+                    || lightCameraConstraints.size > 0
+                    || hdriConstrainToCamera
+                    || reflectionPaintConstrainToCamera,
                 setEnvIntensity, getEnvIntensity,
                 setReflectionPaintIntensity, getReflectionPaintIntensity,
                 setHdriConstrainToCamera, getHdriConstrainToCamera,
@@ -1049,7 +1100,6 @@ function createLights(deps = {}) {
         let lightLinkPanelSelectedTarget = '';
 
         function setLightLinkPanelVisible(v) {
-            if (v && !deps.isStudioMode) return;
             deps.lightLinkPanelVisible = !!v;
             lightLinkPanel.classList.toggle('visible', deps.lightLinkPanelVisible);
             lightLinkPanel.toggleAttribute('inert', !deps.lightLinkPanelVisible);
@@ -1334,12 +1384,15 @@ function createLights(deps = {}) {
 
         document.getElementById('btnLightLink')?.addEventListener('click', () => {
             if (deps.isSimpleWebGLPipelineActive()) {
-                deps.perfHud.setStatus('max.js - Light Linking is unavailable in the simple WebGL pipeline');
+                deps.restartWithRendererBackend?.('webgl-fallback', {
+                    reason: 'light-linking',
+                    confirmMessage: 'Light Linking uses the max.js TSL lighting path. Restart in TSL_GL now?',
+                });
                 return;
             }
-            if (!deps.isStudioMode) {
-                deps.perfHud.setStatus('max.js - Light Linking is available in Advanced mode only');
-                return;
+            if (deps.isPathTracingMode) {
+                deps.setSpectralView?.('probes');
+                deps.perfHud.setStatus('max.js - switched to the raster view for Light Linking');
             }
             setLightLinkPanelVisible(!deps.lightLinkPanelVisible);
         });
@@ -1397,8 +1450,6 @@ function createLights(deps = {}) {
             applyLightEmitterClass,
             applyLightData,
             createLightFromData,
-            lightStableKey,
-            allocLightId,
             finalizeLightState,
             sceneLightsSignature,
             applyLights,

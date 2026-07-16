@@ -11,6 +11,7 @@ import {
     viewportSharedTexture,
 } from 'three/tsl';
 import {
+    ensureGeometryUv0ForMaterial,
     shouldRouteBlackSpecularToLambert as shouldRouteBlackSpecularToLambertShared,
 } from '../material_contract.js';
 
@@ -984,7 +985,10 @@ function createMaterials(deps = {}) {
 
         function createSceneRenderableMaterial(nd, wantsLine, geom = null, mesh = null) {
             const mat = createSceneMaterial(nd, geom, mesh);
-            if (!wantsLine) return mat;
+            if (!wantsLine) {
+                ensureGeometryUv0ForMaterial(geom, mat);
+                return mat;
+            }
             const lineMat = createSceneLineMaterial(mat);
             if (!isCachedMaterialTemplate(mat)) disposeSceneMaterial(mat);
             return lineMat;
@@ -1085,6 +1089,7 @@ function createMaterials(deps = {}) {
 
         function ensureSceneRenderableMaterial(mesh, nd, wantsLine, { authoritativeMaterial = false } = {}) {
             if (!mesh) return false;
+            if (!wantsLine) ensureGeometryUv0ForMaterial(mesh.geometry, mesh.material);
             // Guard: a single-material payload must not collapse a mesh that is
             // still multi/sub-object. On an incremental re-sync (e.g. after undo)
             // the Max side can skip geometry extraction for a node whose geometry

@@ -438,6 +438,16 @@
 
     static std::wstring DetectRendererPrefFromSnapshotUi(const std::wstring& snapshotUiJson) {
         const std::wstring lower = LowerAsciiCopy(snapshotUiJson);
+        if (lower.find(L"\"rendererbackend\":\"tsl") != std::wstring::npos ||
+            lower.find(L"\"rendererbackend\": \"tsl") != std::wstring::npos ||
+            lower.find(L"\"rendererbackend\":\"wgl2 fallback") != std::wstring::npos ||
+            lower.find(L"\"rendererbackend\": \"wgl2 fallback") != std::wstring::npos ||
+            lower.find(L"\"snapshotrendererbackend\":\"tsl") != std::wstring::npos ||
+            lower.find(L"\"snapshotrendererbackend\": \"tsl") != std::wstring::npos ||
+            lower.find(L"\"snapshot_backend\":\"tsl") != std::wstring::npos ||
+            lower.find(L"\"snapshot_backend\": \"tsl") != std::wstring::npos) {
+            return L"tsl_gl";
+        }
         if (lower.find(L"\"rendererbackend\":\"webgpu") != std::wstring::npos ||
             lower.find(L"\"rendererbackend\": \"webgpu") != std::wstring::npos ||
             lower.find(L"\"snapshotrendererbackend\":\"webgpu") != std::wstring::npos ||
@@ -825,11 +835,13 @@
             features.htmlTextures = true;
         }
         if (pbr.materialModel == L"MaterialXMaterial") {
-            features.rendererPref = L"webgpu";
+            // TSL_GL is already a node-material renderer. Preserve an explicit
+            // authored fallback instead of forcing native WebGPU on export.
+            if (features.rendererPref != L"tsl_gl") features.rendererPref = L"webgpu";
             AddUniqueRuntimeFeature(features.threeAddons, L"MaterialXLoader");
         } else if (pbr.materialModel == L"MeshTSLNodeMaterial" ||
                    pbr.materialModel == L"MeshSSSNodeMaterial") {
-            features.rendererPref = L"webgpu";
+            if (features.rendererPref != L"tsl_gl") features.rendererPref = L"webgpu";
         }
     }
 

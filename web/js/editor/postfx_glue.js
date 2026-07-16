@@ -307,6 +307,7 @@ function createPostFxGlue(deps = {}) {
                     contrast: 0,
                     analogStrength: 0.72,
                     analogTracking: 0.46,
+                    analogTrackingChoppiness: 1.0,
                     analogChromaBleed: 0.76,
                     analogRinging: 0.62,
                     analogTapeNoise: 0.70,
@@ -406,6 +407,7 @@ function createPostFxGlue(deps = {}) {
                     { key: 'contrast', label: 'Contrast', min: -1, max: 1, step: 0.01, realtime: true },
                     { key: 'analogStrength', label: 'VHS Strength', min: 0, max: 3, step: 0.01, realtime: true, affectsVisibility: true, visibleWhen: isPowerShotTapePathMode },
                     { key: 'analogTracking', label: 'Tracking', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotTapeActive },
+                    { key: 'analogTrackingChoppiness', label: 'Tracking Choppiness', min: 0, max: 1, step: 0.01, realtime: true, visibleWhen: isPowerShotTapeActive },
                     { key: 'analogChromaBleed', label: 'Chroma Bleed', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotTapeActive },
                     { key: 'analogRinging', label: 'Ringing', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotTapeActive },
                     { key: 'analogTapeNoise', label: 'Tape Noise', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotTapeActive },
@@ -1024,6 +1026,7 @@ function createPostFxGlue(deps = {}) {
                                 </select>
                             </label>
                             <label class="fx-check" for="fx-gi-continuous"><span>Continuous solve</span><input id="fx-gi-continuous" type="checkbox" ${deps.getHaloGiSettings().continuous ? 'checked' : ''}></label>
+                            <label class="fx-check" for="fx-gi-reflections" title="Structural Speedball path: enabling allocates and runs the rough/glossy DDGI reflection caches; disabling removes that GPU cost."><span>Rough reflections (GPU cost)</span><input id="fx-gi-reflections" type="checkbox" ${deps.getHaloGiSettings().roughReflections ? 'checked' : ''}></label>
                             <label class="fx-check" for="fx-gi-hyst-norm"><span>Normalize hysteresis</span><input id="fx-gi-hyst-norm" type="checkbox" ${deps.getHaloGiSettings().hysteresisNormalize ? 'checked' : ''}></label>
                             <label class="fx-check" for="fx-gi-show-probes" title="Diagnostics: show the probe field as a grid of spheres in the viewport."><span>Show probes</span><input id="fx-gi-show-probes" type="checkbox" ${deps.getHaloGiSettings().showProbes ? 'checked' : ''}></label>
                         </div>
@@ -1541,6 +1544,7 @@ function createPostFxGlue(deps = {}) {
                 const giReset = document.getElementById('fx-gi-reset');
                 const giCascades = document.getElementById('fx-gi-cascades');
                 const giContinuous = document.getElementById('fx-gi-continuous');
+                const giReflections = document.getElementById('fx-gi-reflections');
                 const giHystNorm = document.getElementById('fx-gi-hyst-norm');
                 const giShowProbes = document.getElementById('fx-gi-show-probes');
                 const canSyncGiInput = (input) => !!input && document.activeElement !== input;
@@ -1559,7 +1563,7 @@ function createPostFxGlue(deps = {}) {
                         const val = document.getElementById(`fx-gi-${control.key}-val`);
                         const value = giSettings[control.key];
                         if (input) {
-                            input.disabled = !gi;
+                            input.disabled = !gi || (control.key === 'reflectionIntensity' && !giSettings.roughReflections);
                             if (canSyncGiInput(input)) input.value = String(value);
                         }
                         if (val) val.textContent = deps.formatHaloGiValue(control.key, value);
@@ -1571,6 +1575,10 @@ function createPostFxGlue(deps = {}) {
                     if (giContinuous) {
                         giContinuous.disabled = !gi;
                         if (canSyncGiInput(giContinuous)) giContinuous.checked = !!giSettings.continuous;
+                    }
+                    if (giReflections) {
+                        giReflections.disabled = !gi;
+                        if (canSyncGiInput(giReflections)) giReflections.checked = !!giSettings.roughReflections;
                     }
                     if (giHystNorm) {
                         giHystNorm.disabled = !gi;
@@ -1593,6 +1601,7 @@ function createPostFxGlue(deps = {}) {
                     intensity: 10, divisions: 16, rays: 64, hysteresis: 0.9,
                     normalBias: 1.75, radianceClamp: 8, depthSharpness: 40,
                     cheby: 0.5, classify: 0, filter: 1, smoothness: 1, detail: 1,
+                    reflectionIntensity: 1.0,
                     changeThreshold: 2.5, snapAmount: 0.30, fireflyClamp: 6.0,
                 });
                 for (const control of deps.HALO_GI_NUMERIC_CONTROLS) {
@@ -1619,6 +1628,7 @@ function createPostFxGlue(deps = {}) {
                 }
                 if (giCascades) giCascades.onchange = () => deps.setHaloGiSetting('cascades', giCascades.value, { persist: true });
                 if (giContinuous) giContinuous.onchange = () => deps.setHaloGiSetting('continuous', giContinuous.checked, { persist: true });
+                if (giReflections) giReflections.onchange = () => deps.setHaloGiSetting('roughReflections', giReflections.checked, { persist: true });
                 if (giHystNorm) giHystNorm.onchange = () => deps.setHaloGiSetting('hysteresisNormalize', giHystNorm.checked, { persist: true });
                 if (giShowProbes) giShowProbes.onchange = () => deps.setHaloGiSetting('showProbes', giShowProbes.checked, { persist: true });
                 syncGiPanel();

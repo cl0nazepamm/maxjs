@@ -22,6 +22,76 @@ export const UTILITY_MATERIAL_MODELS = new Set([
     'MeshBackdropNodeMaterial',
 ]);
 
+// Material texture properties whose default sampling path reads geometry UV0.
+// Directional textures such as envMap/matcap and generated lookup textures are
+// intentionally absent. Texture.channel is honored so light/ao maps routed to
+// uv1 do not allocate an unnecessary uv attribute.
+const UV0_TEXTURE_PROPERTIES = Object.freeze([
+    'map',
+    'alphaMap',
+    'aoMap',
+    'bumpMap',
+    'normalMap',
+    'displacementMap',
+    'emissiveMap',
+    'metalnessMap',
+    'roughnessMap',
+    'lightMap',
+    'specularMap',
+    'specularIntensityMap',
+    'specularColorMap',
+    'clearcoatMap',
+    'clearcoatRoughnessMap',
+    'clearcoatNormalMap',
+    'iridescenceMap',
+    'iridescenceThicknessMap',
+    'sheenColorMap',
+    'sheenRoughnessMap',
+    'transmissionMap',
+    'thicknessMap',
+    'anisotropyMap',
+]);
+const SYNTHETIC_UV0_ATTRIBUTE_NAME = 'maxjs.syntheticUv0';
+
+export function isSyntheticUv0Attribute(attribute) {
+    return attribute?.maxjsSyntheticUv0 === true || attribute?.name === SYNTHETIC_UV0_ATTRIBUTE_NAME;
+}
+
+export function markUv0AttributeAuthored(attribute) {
+    if (!attribute) return;
+    if (attribute.name === SYNTHETIC_UV0_ATTRIBUTE_NAME) attribute.name = '';
+    delete attribute.maxjsSyntheticUv0;
+}
+
+export function materialUsesUv0(material) {
+    if (Array.isArray(material)) return material.some(materialUsesUv0);
+    if (!material) return false;
+    return UV0_TEXTURE_PROPERTIES.some((property) => {
+        const texture = material[property];
+        if (!texture?.isTexture) return false;
+        const channel = Number(texture.channel);
+        return !Number.isFinite(channel) || channel === 0;
+    });
+}
+
+// Three's AttributeNode substitutes a constant zero when a requested vertex
+// attribute is absent, but emits one warning for every compiled material. Make
+// that fallback explicit only for materials that actually sample UV0. The
+// rendered result stays identical while untextured UV-less meshes remain free
+// of the additional per-vertex allocation.
+export function ensureGeometryUv0ForMaterial(geometry, material) {
+    if (!geometry || !materialUsesUv0(material)) return false;
+    const position = geometry.getAttribute?.('position');
+    if (!position || !Number.isInteger(position.count) || position.count <= 0) return false;
+    const currentUv = geometry.getAttribute?.('uv');
+    if (currentUv && (!isSyntheticUv0Attribute(currentUv) || currentUv.count === position.count)) return false;
+    const fallbackUv = new THREE.BufferAttribute(new Float32Array(position.count * 2), 2);
+    fallbackUv.name = SYNTHETIC_UV0_ATTRIBUTE_NAME;
+    fallbackUv.maxjsSyntheticUv0 = true;
+    geometry.setAttribute('uv', fallbackUv);
+    return true;
+}
+
 export function finiteNumberOr(value, fallback) {
     const n = Number(value);
     return Number.isFinite(n) ? n : fallback;

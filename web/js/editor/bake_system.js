@@ -2,6 +2,7 @@
 import * as THREE from 'three';
 import * as THREE_STD from 'three-std';
 import * as TSL from 'three/tsl';
+import { isSyntheticUv0Attribute } from '../material_contract.js';
 
 function createBakeSystem(deps = {}) {
         const {
@@ -169,7 +170,10 @@ function createBakeSystem(deps = {}) {
             const channel = Number.isFinite(Number(maxMapChannel))
                 ? Math.max(1, Math.round(Number(maxMapChannel)))
                 : 2;
-            if (channel === 1) return !!geom?.getAttribute?.('uv');
+            if (channel === 1) {
+                const uv = geom?.getAttribute?.('uv');
+                return !!uv && !isSyntheticUv0Attribute(uv);
+            }
             if (channel === 2) return hasGeometryUV2(geom);
             return false;
         }
@@ -481,8 +485,10 @@ function createBakeSystem(deps = {}) {
                     const wantsLine = mesh.isLine || mesh.isLineSegments;
                     mesh.userData ??= {};
                     mesh.userData.maxjsMaterialSignature = '';
+                    const previousMaterial = mesh.material;
                     if (ensureSceneRenderableMaterial(mesh, nd, wantsLine)) {
                         changed = true;
+                        deps.lightLinking?.replaceRenderableMaterial?.(previousMaterial, mesh.material);
                         if (nd.h != null) deps.layerManager.applyMaterialOverrides?.(nd.h, mesh);
                     }
                     continue;
@@ -495,6 +501,7 @@ function createBakeSystem(deps = {}) {
                     if (unique !== m) {
                         if (Array.isArray(mesh.material)) mesh.material[materialIndex] = unique;
                         else mesh.material = unique;
+                        deps.lightLinking?.replaceRenderableMaterial?.(m, mesh.material);
                         disposeSceneMaterial(m);
                         m = unique;
                         changed = true;

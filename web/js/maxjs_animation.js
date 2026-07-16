@@ -1,3 +1,5 @@
+import { ensureGeometryUv0ForMaterial, markUv0AttributeAuthored } from './material_contract.js';
+
 function normalizeBindingPath(path) {
     const raw = String(path ?? '').trim();
     if (!raw) return null;
@@ -532,12 +534,14 @@ export function createMaxJSAnimationSystem({
             ) {
                 currentUv.copyArray(uvAttr.array);
                 currentUv.needsUpdate = true;
+                markUv0AttributeAuthored(currentUv);
             } else {
                 geometry.setAttribute('uv', uvAttr);
             }
         } else if (geometry.getAttribute('uv')) {
             geometry.deleteAttribute('uv');
         }
+        if (!frame.spline) ensureGeometryUv0ForMaterial(geometry, target.material);
 
         if (normalAttr && !frame.spline) {
             const currentNormal = geometry.getAttribute('normal');

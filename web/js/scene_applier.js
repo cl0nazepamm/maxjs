@@ -53,6 +53,7 @@ import {
     uvAttributeFromBinary,
 } from './scene_binary.js';
 import { getInstancedMeshBatchSize, instanceGroupKey, isWebGpuInstancingPath } from './instance_batching.js';
+import { ensureGeometryUv0ForMaterial } from './material_contract.js';
 
 // ─── Default hooks ─────────────────────────────────────────────────────
 //
@@ -568,6 +569,7 @@ function applyForestInstances(groups, buffer, ctx, hooks) {
 
         const groupKey = instanceGroupKey(grp, added);
         const material = buildInstanceMaterial(grp, geom, ctx, hooks);
+        ensureGeometryUv0ForMaterial(geom, material);
         const batchSize = Math.max(1, getInstancedMeshBatchSize({
             renderer: ctx.renderer,
             backendLabel: ctx.rendererBackendLabel,
@@ -746,9 +748,11 @@ export async function applySceneBin({ buffer, meta, ctx, hooks: userHooks = {}, 
                 sceneChanged = true;
                 hooks.onMaterialApplied(nd.h, mesh);
             }
+            if (!wantsLine) ensureGeometryUv0ForMaterial(mesh.geometry, mesh.material);
         } else {
             if (!geom) continue;
             const material = hooks.materialBuilder({ nd, geom, wantsLine });
+            if (!wantsLine) ensureGeometryUv0ForMaterial(geom, material);
             if (wantsLine) {
                 mesh = new THREE.LineSegments(geom, material);
             } else if (nd.skin) {

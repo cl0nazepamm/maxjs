@@ -1,49 +1,112 @@
 // MaxLightsNode — DynamicLightsNode + per-mesh 64-bit light-link masks.
 //
 // Only lights with userData.maxjsLightLinked === true use the masked path.
-// Unlinked lights stay on stock DynamicLightsNode data nodes, which keeps
-// Studio mode close to Standard mode unless light links are actually active.
+// Unlinked lights stay on Three's own DynamicLights data nodes, with native
+// per-light fallback beyond configured batch sizes. They never consume max.js
+// mask slots: None means ordinary Three light behavior with no contribution lost.
 //
 // Linked lights use a stable lightId (0..63) in userData. Each mesh carries
 // two uint32 userData values (maxjsLightMaskLo / maxjsLightMaskHi) read
 // in-shader via TSL's `userData()` reference node. The mask is per-mesh at
 // render time, not per-material.
 //
-// Batched masked types: Directional, Point, Spot, Hemisphere. Ambient is
-// summed into a single irradiance and cannot be per-mesh masked. Lights that
-// can't batch — shadow-casters, projected/textured spots, area lights — take
-// LightsNode's per-light fallback path; for those the same per-mesh mask is
-// applied in setupDirectLight()/setupDirectRectAreaLight() (see maskFactorForLight),
-// so linking works uniformly across every light type, not just the batched ones.
+// Batched masked types: Directional, Point, Spot, Hemisphere. Linked Ambient
+// lights take a dedicated per-light node because Three's stock ambient batch
+// irreversibly sums them. Other lights that can't batch — shadow-casters,
+// projected/textured spots, area lights, and links beyond the fast 64-light
+// mask — take the per-light fallback path with the same per-mesh contract.
 
 import DynamicLightsNode from 'three/addons/tsl/lighting/DynamicLightsNode.js';
+import AmbientLightDataNode from 'three/addons/tsl/lighting/data/AmbientLightDataNode.js';
 import DirectionalLightDataNode from 'three/addons/tsl/lighting/data/DirectionalLightDataNode.js';
 import PointLightDataNode from 'three/addons/tsl/lighting/data/PointLightDataNode.js';
 import SpotLightDataNode from 'three/addons/tsl/lighting/data/SpotLightDataNode.js';
 import HemisphereLightDataNode from 'three/addons/tsl/lighting/data/HemisphereLightDataNode.js';
-import AmbientLightDataNode from 'three/addons/tsl/lighting/data/AmbientLightDataNode.js';
-import { NodeUtils } from 'three/webgpu';
+import { AmbientLightNode, HemisphereLightNode, NodeUtils } from 'three/webgpu';
 import { getReflectionPaintNode } from './reflection_paint.js';
 import { getGiVolumeNode, getGiProbeNode, isIrEmitter, getOrCreateIrLightNode } from 'speedball-gi';
 import {
-    If, Loop, getDistanceAttenuation, mix, normalWorld, positionView, renderGroup,
-    select, smoothstep, uniformArray, vec3, uint, int, float,
+    LIGHT_MASK_HI_KEY,
+    LIGHT_LINK_REFRESH_NODE_KEY,
+    LIGHT_MASK_LO_KEY,
+    LIGHT_MASK_READY_KEY,
+    ensureMeshMaskDefaults,
+} from './light_linking_core.js';
+import {
+    If, Loop, getDistanceAttenuation, mix, normalWorld, objectGroup, positionView, renderGroup,
+    select, smoothstep, uniform, uniformArray, vec3, uint, int, float,
     bitAnd, shiftLeft, nodeObject, or, not, userData,
 } from 'three/tsl';
 
-export const LIGHT_MASK_LO_KEY = 'maxjsLightMaskLo';
-export const LIGHT_MASK_HI_KEY = 'maxjsLightMaskHi';
 const UNLINKED_ID = -1;
+const lightLinkRefreshNode = uint(0);
+const materialObserverOwners = new WeakMap();
+const defaultObserverOwner = {};
 
-export function ensureMeshMaskDefaults(mesh) {
-    if (!mesh) return;
-    mesh.userData ??= {};
-    if (typeof mesh.userData[LIGHT_MASK_LO_KEY] !== 'number') {
-        mesh.userData[LIGHT_MASK_LO_KEY] = 0xFFFFFFFF;
+export { LIGHT_MASK_HI_KEY, LIGHT_MASK_LO_KEY, ensureMeshMaskDefaults } from './light_linking_core.js';
+
+function createMaskDefaults() {
+    return {
+        loNode: uniform(0xFFFFFFFF, 'uint').setGroup(renderGroup),
+        hiNode: uniform(0xFFFFFFFF, 'uint').setGroup(renderGroup),
+        generationNode: uniform(0xFFFFFFFF, 'uint').setGroup(renderGroup),
+    };
+}
+
+export function setLightLinkMaskDefaults(renderer, lo = 0xFFFFFFFF, hi = 0xFFFFFFFF, generation = 0xFFFFFFFF) {
+    const defaults = renderer?.lighting?.createNode?.maxjsMaskDefaults;
+    if (!defaults) return false;
+    defaults.loNode.value = lo >>> 0;
+    defaults.hiNode.value = hi >>> 0;
+    defaults.generationNode.value = generation >>> 0;
+    return true;
+}
+
+// Three r185's NodeMaterialObserver only scans direct material node fields. It
+// cannot see userData() nodes nested inside a custom LightsNode, so without a
+// marker it may skip per-object mask uniform refreshes after the first linked
+// frame. This no-op node keeps object refreshes enabled only while specialized
+// lighting is active; ordinary-light mode removes it again.
+export function setLightLinkMaterialObserver(material, enabled, owner = defaultObserverOwner) {
+    if (Array.isArray(material)) {
+        let changed = false;
+        for (const entry of material) changed = setLightLinkMaterialObserver(entry, enabled, owner) || changed;
+        return changed;
     }
-    if (typeof mesh.userData[LIGHT_MASK_HI_KEY] !== 'number') {
-        mesh.userData[LIGHT_MASK_HI_KEY] = 0xFFFFFFFF;
+    if (!material) return false;
+    let owners = materialObserverOwners.get(material);
+    if (enabled) {
+        if (!owners) {
+            owners = new Set();
+            materialObserverOwners.set(material, owners);
+        }
+        if (owners.has(owner)) return false;
+        const installMarker = owners.size === 0 && material[LIGHT_LINK_REFRESH_NODE_KEY]?.isNode !== true;
+        owners.add(owner);
+        if (!installMarker) return false;
+        material[LIGHT_LINK_REFRESH_NODE_KEY] = lightLinkRefreshNode;
+    } else {
+        if (!owners?.delete(owner)) return false;
+        if (owners.size > 0) return false;
+        materialObserverOwners.delete(material);
+        if (material[LIGHT_LINK_REFRESH_NODE_KEY]?.isNode !== true) return false;
+        delete material[LIGHT_LINK_REFRESH_NODE_KEY];
     }
+    material.needsUpdate = true;
+    return true;
+}
+
+export function clearUnownedLightLinkMaterialObserver(material) {
+    if (Array.isArray(material)) {
+        let changed = false;
+        for (const entry of material) changed = clearUnownedLightLinkMaterialObserver(entry) || changed;
+        return changed;
+    }
+    if (!material || materialObserverOwners.get(material)?.size > 0) return false;
+    if (material[LIGHT_LINK_REFRESH_NODE_KEY]?.isNode !== true) return false;
+    delete material[LIGHT_LINK_REFRESH_NODE_KEY];
+    material.needsUpdate = true;
+    return true;
 }
 
 // TSL: true if the light contributes. Unlinked lights (id === -1) always
@@ -61,10 +124,13 @@ function maskContributes(lightIdNode, maskLoNode, maskHiNode) {
     return or(not(isLinked), maskHit);
 }
 
-function createMaskNodes() {
+function createMaskNodes(maskDefaults) {
+    const ready = userData(LIGHT_MASK_READY_KEY, 'uint')
+        .setGroup(objectGroup)
+        .equal(maskDefaults.generationNode);
     return {
-        loNode: userData(LIGHT_MASK_LO_KEY, 'uint'),
-        hiNode: userData(LIGHT_MASK_HI_KEY, 'uint'),
+        loNode: select(ready, userData(LIGHT_MASK_LO_KEY, 'uint').setGroup(objectGroup), maskDefaults.loNode),
+        hiNode: select(ready, userData(LIGHT_MASK_HI_KEY, 'uint').setGroup(objectGroup), maskDefaults.hiNode),
     };
 }
 
@@ -78,8 +144,9 @@ function writeIds(target, lights, maxCount) {
 
 // ── Directional ─────────────────────────────────────────
 class MaskedDirectionalLightDataNode extends DirectionalLightDataNode {
-    constructor(maxCount = 16) {
+    constructor(maxCount = 16, maskDefaults) {
         super(maxCount);
+        this.maskDefaults = maskDefaults;
         this._ids = new Array(maxCount).fill(UNLINKED_ID);
         this.idsNode = uniformArray(this._ids, 'int').setGroup(renderGroup);
     }
@@ -88,7 +155,7 @@ class MaskedDirectionalLightDataNode extends DirectionalLightDataNode {
         writeIds(this._ids, this._lights, this.maxCount);
     }
     setup(builder) {
-        const { loNode, hiNode } = createMaskNodes();
+        const { loNode, hiNode } = createMaskNodes(this.maskDefaults);
         const { lightingModel, reflectedLight } = builder.context;
         const dynDiffuse = vec3(0).toVar('maxjsDirDiffuse');
         const dynSpecular = vec3(0).toVar('maxjsDirSpecular');
@@ -112,8 +179,9 @@ class MaskedDirectionalLightDataNode extends DirectionalLightDataNode {
 
 // ── Point ───────────────────────────────────────────────
 class MaskedPointLightDataNode extends PointLightDataNode {
-    constructor(maxCount = 32) {
+    constructor(maxCount = 32, maskDefaults) {
         super(maxCount);
+        this.maskDefaults = maskDefaults;
         this._ids = new Array(maxCount).fill(UNLINKED_ID);
         this.idsNode = uniformArray(this._ids, 'int').setGroup(renderGroup);
     }
@@ -122,7 +190,7 @@ class MaskedPointLightDataNode extends PointLightDataNode {
         writeIds(this._ids, this._lights, this.maxCount);
     }
     setup(builder) {
-        const { loNode, hiNode } = createMaskNodes();
+        const { loNode, hiNode } = createMaskNodes(this.maskDefaults);
         const surfacePosition = builder.context.positionView || positionView;
         const { lightingModel, reflectedLight } = builder.context;
         const dynDiffuse = vec3(0).toVar('maxjsPointDiffuse');
@@ -154,8 +222,9 @@ class MaskedPointLightDataNode extends PointLightDataNode {
 
 // ── Spot ────────────────────────────────────────────────
 class MaskedSpotLightDataNode extends SpotLightDataNode {
-    constructor(maxCount = 32) {
+    constructor(maxCount = 32, maskDefaults) {
         super(maxCount);
+        this.maskDefaults = maskDefaults;
         this._ids = new Array(maxCount).fill(UNLINKED_ID);
         this.idsNode = uniformArray(this._ids, 'int').setGroup(renderGroup);
     }
@@ -164,7 +233,7 @@ class MaskedSpotLightDataNode extends SpotLightDataNode {
         writeIds(this._ids, this._lights, this.maxCount);
     }
     setup(builder) {
-        const { loNode, hiNode } = createMaskNodes();
+        const { loNode, hiNode } = createMaskNodes(this.maskDefaults);
         const surfacePosition = builder.context.positionView || positionView;
         const { lightingModel, reflectedLight } = builder.context;
         const dynDiffuse = vec3(0).toVar('maxjsSpotDiffuse');
@@ -203,8 +272,9 @@ class MaskedSpotLightDataNode extends SpotLightDataNode {
 
 // ── Hemisphere ──────────────────────────────────────────
 class MaskedHemisphereLightDataNode extends HemisphereLightDataNode {
-    constructor(maxCount = 4) {
+    constructor(maxCount = 4, maskDefaults) {
         super(maxCount);
+        this.maskDefaults = maskDefaults;
         this._ids = new Array(maxCount).fill(UNLINKED_ID);
         this.idsNode = uniformArray(this._ids, 'int').setGroup(renderGroup);
     }
@@ -213,7 +283,7 @@ class MaskedHemisphereLightDataNode extends HemisphereLightDataNode {
         writeIds(this._ids, this._lights, this.maxCount);
     }
     setup(builder) {
-        const { loNode, hiNode } = createMaskNodes();
+        const { loNode, hiNode } = createMaskNodes(this.maskDefaults);
         Loop(this.countNode, ({ i }) => {
             const lightId = this.idsNode.element(i);
             If(maskContributes(lightId, loNode, hiNode), () => {
@@ -236,19 +306,19 @@ const MAX_TO_PROP = {
     HemisphereLight: 'maxHemisphereLights',
 };
 
+const MASKED_DATA_CLASSES = {
+    DirectionalLight: MaskedDirectionalLightDataNode,
+    PointLight: MaskedPointLightDataNode,
+    SpotLight: MaskedSpotLightDataNode,
+    HemisphereLight: MaskedHemisphereLightDataNode,
+};
+
 const STOCK_DATA_CLASSES = {
     AmbientLight: AmbientLightDataNode,
     DirectionalLight: DirectionalLightDataNode,
     PointLight: PointLightDataNode,
     SpotLight: SpotLightDataNode,
     HemisphereLight: HemisphereLightDataNode,
-};
-
-const MASKED_DATA_CLASSES = {
-    DirectionalLight: MaskedDirectionalLightDataNode,
-    PointLight: MaskedPointLightDataNode,
-    SpotLight: MaskedSpotLightDataNode,
-    HemisphereLight: MaskedHemisphereLightDataNode,
 };
 
 const isSpecialSpotLight = (light) =>
@@ -262,13 +332,29 @@ const isLinkedLight = (light) => light?.userData?.maxjsLightLinked === true;
 // path never sees. The light's id is a compile-time constant for its dedicated
 // LightNode, so the bit shift bakes into the program; only the 32-bit mask word is
 // read per-mesh via userData(). Returns null for unlinked lights (no mask, no cost).
-function maskFactorForLight(light) {
+function maskFactorForLight(light, maskDefaults) {
     const id = light?.userData?.maxjsLightId;
-    if (!isLinkedLight(light) || !Number.isInteger(id) || id < 0 || id >= 64) return null;
-    const word = userData(id < 32 ? LIGHT_MASK_LO_KEY : LIGHT_MASK_HI_KEY, 'uint');
-    const bit = shiftLeft(uint(1), uint(id & 31));
-    const contributes = bitAnd(word, bit).notEqual(uint(0));
-    return select(contributes, float(1.0), float(0.0));
+    if (!isLinkedLight(light)) return null;
+    if (Number.isInteger(id) && id >= 0 && id < 64) {
+        const { loNode, hiNode } = createMaskNodes(maskDefaults);
+        const word = id < 32 ? loNode : hiNode;
+        const bit = shiftLeft(uint(1), uint(id & 31));
+        const contributes = bitAnd(word, bit).notEqual(uint(0));
+        return select(contributes, float(1.0), float(0.0));
+    }
+
+    const overflowKey = light?.userData?.maxjsLightMaskKey;
+    if (typeof overflowKey === 'string' && overflowKey) {
+        const ready = userData(LIGHT_MASK_READY_KEY, 'uint')
+            .setGroup(objectGroup)
+            .equal(maskDefaults.generationNode);
+        const objectFactor = userData(overflowKey, 'float').setGroup(objectGroup);
+        const fallback = float(light?.userData?.maxjsLightMaskDefault === 0 ? 0 : 1);
+        return select(ready, objectFactor, fallback);
+    }
+
+    // A linked light must never silently fall back to illuminating everything.
+    return float(0);
 }
 
 // three.js NodeMaterial.setupLights() spawns a fresh lightsNode via the factory
@@ -276,18 +362,58 @@ function maskFactorForLight(light) {
 // Each instance owns its own _dataNodes → separate UBOs → per-frame setLights() from
 // renderList.finish() only reaches the scene-cached instance, leaving material-owned
 // ones frozen. Sharing _dataNodes gives every material the same UBO per light type.
-const SHARED_STOCK_DATA_NODES = new Map();
-const SHARED_MASKED_DATA_NODES = new Map();
-const FALLBACK_LIGHT_NODE_REF = new WeakMap();
 const HASH_DATA = [];
 
-function getOrCreateFallbackLightNode(light, nodeLibrary) {
+class MaskedAmbientLightNode extends AmbientLightNode {
+    constructor(light, maskDefaults) {
+        super(light);
+        this.maskDefaults = maskDefaults;
+    }
+    setup({ context }) {
+        const factor = maskFactorForLight(this.light, this.maskDefaults);
+        context.irradiance.addAssign(factor === null ? this.colorNode : this.colorNode.mul(factor));
+    }
+}
+
+function getOrCreateMaskedAmbientLightNode(light, cache, maskDefaults) {
+    let lightNode = cache.get(light);
+    if (!lightNode) {
+        lightNode = new MaskedAmbientLightNode(light, maskDefaults);
+        cache.set(light, lightNode);
+    }
+    return lightNode;
+}
+
+class MaskedHemisphereLightNode extends HemisphereLightNode {
+    constructor(light, maskDefaults) {
+        super(light);
+        this.maskDefaults = maskDefaults;
+    }
+    setup(builder) {
+        const dotNL = normalWorld.dot(this.lightDirectionNode);
+        const hemiDiffuseWeight = dotNL.mul(0.5).add(0.5);
+        const irradiance = mix(this.groundColorNode, this.colorNode, hemiDiffuseWeight);
+        const factor = maskFactorForLight(this.light, this.maskDefaults);
+        builder.context.irradiance.addAssign(factor === null ? irradiance : irradiance.mul(factor));
+    }
+}
+
+function getOrCreateMaskedHemisphereLightNode(light, cache, maskDefaults) {
+    let lightNode = cache.get(light);
+    if (!lightNode) {
+        lightNode = new MaskedHemisphereLightNode(light, maskDefaults);
+        cache.set(light, lightNode);
+    }
+    return lightNode;
+}
+
+function getOrCreateFallbackLightNode(light, nodeLibrary, cache) {
     const LightNodeClass = nodeLibrary.getLightNodeClass(light.constructor);
     if (!LightNodeClass) return null;
-    let lightNode = FALLBACK_LIGHT_NODE_REF.get(light);
+    let lightNode = cache.get(light);
     if (!lightNode) {
         lightNode = new LightNodeClass(light);
-        FALLBACK_LIGHT_NODE_REF.set(light, lightNode);
+        cache.set(light, lightNode);
     }
     return lightNode;
 }
@@ -297,42 +423,96 @@ export default class MaxLightsNode extends DynamicLightsNode {
 
     constructor(options = {}) {
         super(options);
-        // Keep DynamicLightsNode's own map empty and drive the shared maps
-        // ourselves; parent grouping cannot distinguish linked vs unlinked.
+        // Keep the parent map empty because each renderer owns shared data nodes
+        // that are reused by every material-owned LightsNode instance.
         this._dataNodes = new Map();
-        this._stockDataNodes = SHARED_STOCK_DATA_NODES;
-        this._maskedDataNodes = SHARED_MASKED_DATA_NODES;
+        this._stockDataNodes = options.sharedStockDataNodes ?? new Map();
+        this._maskedDataNodes = options.sharedMaskedDataNodes ?? new Map();
+        this._maskDefaults = options.maskDefaults ?? createMaskDefaults();
+        this._fallbackLightNodeRef = options.fallbackLightNodeRef ?? new WeakMap();
+        this._maskedAmbientNodeRef = options.maskedAmbientNodeRef ?? new WeakMap();
+        this._maskedHemisphereNodeRef = options.maskedHemisphereNodeRef ?? new WeakMap();
     }
 
-    get _typeMap() {
-        return STOCK_DATA_CLASSES;
-    }
-
-    _canBatch(light) {
-        // IR emitters (emitterClass 'ir') never batch: the batched data nodes read
-        // light.color CPU-side (black for a true IR illuminator) — they take the
-        // sensed-band per-light path in setupLightsNode instead.
-        return light.isNode !== true
+    _canBatchStockBase(light) {
+        return !isLinkedLight(light)
+            && light.isNode !== true
             && light.castShadow !== true
             && !isSpecialSpotLight(light)
             && !isIrEmitter(light)
             && STOCK_DATA_CLASSES[light.constructor.name] !== undefined;
     }
 
+    _canBatchMaskedBase(light) {
+        // IR emitters (emitterClass 'ir') never batch: the batched data nodes read
+        // light.color CPU-side (black for a true IR illuminator) — they take the
+        // sensed-band per-light path in setupLightsNode instead.
+        const linkedId = light?.userData?.maxjsLightId;
+        return isLinkedLight(light)
+            && Number.isInteger(linkedId)
+            && linkedId >= 0
+            && linkedId < 64
+            && light.isNode !== true
+            && light.castShadow !== true
+            && !isSpecialSpotLight(light)
+            && !isIrEmitter(light)
+            && MASKED_DATA_CLASSES[light.constructor.name] !== undefined;
+    }
+
+    _computeBatchableSets(lights = this._lights) {
+        const stock = new WeakSet();
+        const masked = new WeakSet();
+        const stockCounts = new Map();
+        const maskedCounts = new Map();
+        for (const light of [...lights].sort((a, b) => a.id - b.id)) {
+            const target = this._canBatchStockBase(light)
+                ? stock
+                : (this._canBatchMaskedBase(light) ? masked : null);
+            if (!target) continue;
+            const typeName = light.constructor.name;
+            const maxProp = MAX_TO_PROP[typeName];
+            if (!maxProp) {
+                target.add(light);
+                continue;
+            }
+            const counts = target === stock ? stockCounts : maskedCounts;
+            const maxCount = Math.max(0, Number(this[maxProp]) || 0);
+            const count = counts.get(typeName) ?? 0;
+            if (count >= maxCount) continue;
+            counts.set(typeName, count + 1);
+            target.add(light);
+        }
+        return { stock, masked };
+    }
+
     customCacheKey() {
         const typeSet = new Set();
+        const batchable = this._computeBatchableSets();
         for (const light of this._lights) {
-            if (this._canBatch(light)) {
-                const canMask = MASKED_DATA_CLASSES[light.constructor.name] !== undefined;
-                typeSet.add(`${isLinkedLight(light) && canMask ? 'masked' : 'stock'}:${light.constructor.name}`);
+            if (batchable.stock.has(light)) {
+                typeSet.add(`stock:${light.constructor.name}`);
+                continue;
+            }
+            if (batchable.masked.has(light)) {
+                typeSet.add(`masked:${light.constructor.name}`);
                 continue;
             }
             HASH_DATA.push(light.id);
             HASH_DATA.push(light.castShadow ? 1 : 0);
+            HASH_DATA.push(isIrEmitter(light) ? 1 : 0);
             // Linked state + id gate the fallback mask multiply (setupDirectLight).
             // A linked↔unlinked flip or an id reassignment must rebuild the program
             // since the bit shift is baked in at compile time. 0 = unlinked.
-            HASH_DATA.push(isLinkedLight(light) ? ((light.userData?.maxjsLightId ?? -1) + 1) : 0);
+            if (isLinkedLight(light)) {
+                const linkedId = light.userData?.maxjsLightId;
+                const overflowKey = String(light.userData?.maxjsLightMaskKey ?? '');
+                HASH_DATA.push(Number.isInteger(linkedId) && linkedId >= 0
+                    ? linkedId + 1
+                    : NodeUtils.hashString(`overflow:${overflowKey}`));
+                HASH_DATA.push(light.userData?.maxjsLightMaskDefault === 0 ? 0 : 1);
+            } else {
+                HASH_DATA.push(0);
+            }
             if (light.isSpotLight === true) {
                 HASH_DATA.push(light.map !== null ? light.map.id : -1);
                 HASH_DATA.push(light.colorNode ? light.colorNode.getCacheKey() : -1);
@@ -353,32 +533,34 @@ export default class MaxLightsNode extends DynamicLightsNode {
         return key;
     }
 
-    _groupBatchableLights(lights) {
-        const stock = new Map();
-        const masked = new Map();
+    _groupBatchableLights(lights, batchable) {
+        const grouped = new Map();
         for (const light of lights) {
-            if (!this._canBatch(light)) continue;
+            if (!batchable.has(light)) continue;
             const typeName = light.constructor.name;
-            const target = isLinkedLight(light) && MASKED_DATA_CLASSES[typeName] !== undefined ? masked : stock;
-            const list = target.get(typeName);
-            if (list) list.push(light); else target.set(typeName, [light]);
+            const list = grouped.get(typeName);
+            if (list) list.push(light); else grouped.set(typeName, [light]);
         }
-        return { stock, masked };
+        return grouped;
     }
 
-    _getOrCreateDataNode(map, typeName, DataNodeClass) {
+    _getOrCreateDataNode(map, typeName, DataNodeClass, masked = false) {
         let dataNode = map.get(typeName);
         if (dataNode === undefined) {
             const maxProp = MAX_TO_PROP[typeName];
             const maxCount = maxProp ? this[maxProp] : undefined;
-            dataNode = maxCount !== undefined ? new DataNodeClass(maxCount) : new DataNodeClass();
+            dataNode = maxCount !== undefined
+                ? new DataNodeClass(maxCount, masked ? this._maskDefaults : undefined)
+                : new DataNodeClass();
             map.set(typeName, dataNode);
         }
         return dataNode;
     }
 
     _updateSharedDataNodes(lights) {
-        const { stock, masked } = this._groupBatchableLights(lights);
+        const batchable = this._computeBatchableSets(lights);
+        const stock = this._groupBatchableLights(lights, batchable.stock);
+        const masked = this._groupBatchableLights(lights, batchable.masked);
         for (const [typeName, dataNode] of this._stockDataNodes) {
             dataNode.setLights(stock.get(typeName) || []);
         }
@@ -391,7 +573,10 @@ export default class MaxLightsNode extends DynamicLightsNode {
         const lightNodes = [];
         const stockLightsByType = new Map();
         const maskedLightsByType = new Map();
-        const lights = [...this._lights].sort((a, b) => a.id - b.id);
+        const materialLightings = builder.context.materialLightings ?? [];
+        const lights = [...materialLightings, ...this._lights]
+            .sort((a, b) => (a.id ?? 0) - (b.id ?? 0));
+        const batchable = this._computeBatchableSets(lights);
         const nodeLibrary = builder.renderer.library;
 
         for (const light of lights) {
@@ -399,38 +584,59 @@ export default class MaxLightsNode extends DynamicLightsNode {
                 lightNodes.push(nodeObject(light));
                 continue;
             }
-            if (this._canBatch(light)) {
+            if (batchable.stock.has(light)) {
                 const typeName = light.constructor.name;
-                const canMask = MASKED_DATA_CLASSES[typeName] !== undefined;
-                const target = isLinkedLight(light) && canMask ? maskedLightsByType : stockLightsByType;
-                const list = target.get(typeName);
-                if (list) list.push(light); else target.set(typeName, [light]);
+                const list = stockLightsByType.get(typeName);
+                if (list) list.push(light); else stockLightsByType.set(typeName, [light]);
+                continue;
+            }
+            if (batchable.masked.has(light)) {
+                const typeName = light.constructor.name;
+                const list = maskedLightsByType.get(typeName);
+                if (list) list.push(light); else maskedLightsByType.set(typeName, [light]);
                 continue;
             }
             // IR emitters ride speedball's sensed-band light node (colorNode =
             // white × intensity × nirGate; light.color stays black) so the direct
             // term appears only under NV — same switch as the probes' NEE gate.
-            const lightNode = isIrEmitter(light)
-                ? getOrCreateIrLightNode(light, nodeLibrary)
-                : getOrCreateFallbackLightNode(light, nodeLibrary);
+            const lightNode = isLinkedLight(light) && light.isAmbientLight === true
+                ? getOrCreateMaskedAmbientLightNode(light, this._maskedAmbientNodeRef, this._maskDefaults)
+                : (isLinkedLight(light) && light.isHemisphereLight === true
+                    ? getOrCreateMaskedHemisphereLightNode(light, this._maskedHemisphereNodeRef, this._maskDefaults)
+                    : (isIrEmitter(light)
+                        ? getOrCreateIrLightNode(light, nodeLibrary)
+                        : getOrCreateFallbackLightNode(light, nodeLibrary, this._fallbackLightNodeRef)));
             if (lightNode) lightNodes.push(lightNode);
         }
 
-        // SHARED_DATA_NODES: each dataNode's _lights is driven ONLY by the scene
-        // MaxLightsNode's per-frame setLights → _updateDataNodeLights. Material
-        // compiles must not call dataNode.setLights — a material's _lights is a
-        // stale compile-time snapshot, and stomping the shared list truncates
-        // the light-link IDs writeIds() reads for other shaders.
+        // Shared stock data nodes keep ordinary analytic lights on Three's own
+        // DynamicLights fast path. Caps are admission limits only; excess lights
+        // already took the native per-light fallback above and are never dropped.
         for (const [typeName, typeLights] of stockLightsByType) {
-            const dataNode = this._getOrCreateDataNode(this._stockDataNodes, typeName, STOCK_DATA_CLASSES[typeName]);
+            const dataNode = this._getOrCreateDataNode(
+                this._stockDataNodes,
+                typeName,
+                STOCK_DATA_CLASSES[typeName],
+            );
             if (!dataNode._maxjsSeeded) {
                 dataNode.setLights(typeLights);
                 dataNode._maxjsSeeded = true;
             }
             lightNodes.push(dataNode);
         }
+
+        // SHARED MASKED DATA NODES: each dataNode's _lights is driven ONLY by the scene
+        // MaxLightsNode's per-frame setLights → _updateDataNodeLights. Material
+        // compiles must not call dataNode.setLights — a material's _lights is a
+        // stale compile-time snapshot, and stomping the shared list truncates
+        // the light-link IDs writeIds() reads for other shaders.
         for (const [typeName, typeLights] of maskedLightsByType) {
-            const dataNode = this._getOrCreateDataNode(this._maskedDataNodes, typeName, MASKED_DATA_CLASSES[typeName]);
+            const dataNode = this._getOrCreateDataNode(
+                this._maskedDataNodes,
+                typeName,
+                MASKED_DATA_CLASSES[typeName],
+                true,
+            );
             if (!dataNode._maxjsSeeded) {
                 dataNode.setLights(typeLights);
                 dataNode._maxjsSeeded = true;
@@ -452,6 +658,9 @@ export default class MaxLightsNode extends DynamicLightsNode {
         // two are mutually exclusive at runtime (index.html mutes the surfel
         // volume when the probe field is active) to avoid double-counting bounce.
         const giProbeNode = getGiProbeNode();
+        // materialLightings were already folded into lightNodes above, so the
+        // EnvironmentNode needed by Speedball's reflection composite is ordered
+        // before this probe without a second insertion or a separate graph path.
         if (giProbeNode.active) lightNodes.push(giProbeNode);
 
         this._lightNodes = lightNodes;
@@ -466,7 +675,7 @@ export default class MaxLightsNode extends DynamicLightsNode {
     // already shadow-scaled color by the per-mesh mask so the same userData masks
     // apply uniformly across every light type.
     setupDirectLight(builder, lightNode, lightData) {
-        const factor = maskFactorForLight(lightNode?.light);
+        const factor = maskFactorForLight(lightNode?.light, this._maskDefaults);
         super.setupDirectLight(
             builder,
             lightNode,
@@ -475,7 +684,7 @@ export default class MaxLightsNode extends DynamicLightsNode {
     }
 
     setupDirectRectAreaLight(builder, lightNode, lightData) {
-        const factor = maskFactorForLight(lightNode?.light);
+        const factor = maskFactorForLight(lightNode?.light, this._maskDefaults);
         super.setupDirectRectAreaLight(
             builder,
             lightNode,
@@ -491,4 +700,33 @@ export default class MaxLightsNode extends DynamicLightsNode {
 }
 
 export const maxLights = (options = {}) => new MaxLightsNode(options);
+
+export function installMaxLightsRenderer(renderer, options = {}) {
+    if (!renderer?.lighting?.createNode) return false;
+    if (renderer.lighting.createNode?.maxjsAdaptiveLighting === true) return true;
+    const sharedStockDataNodes = new Map();
+    const sharedMaskedDataNodes = new Map();
+    const maskDefaults = createMaskDefaults();
+    const fallbackLightNodeRef = new WeakMap();
+    const maskedAmbientNodeRef = new WeakMap();
+    const maskedHemisphereNodeRef = new WeakMap();
+    const factory = (lights = []) => maxLights({
+        maxDirectionalLights: options.maxDirectionalLights ?? 16,
+        maxPointLights: options.maxPointLights ?? 32,
+        maxSpotLights: options.maxSpotLights ?? 32,
+        maxHemisphereLights: options.maxHemisphereLights ?? 4,
+        sharedStockDataNodes,
+        sharedMaskedDataNodes,
+        maskDefaults,
+        fallbackLightNodeRef,
+        maskedAmbientNodeRef,
+        maskedHemisphereNodeRef,
+    }).setLights(lights);
+    factory.maxjsAdaptiveLighting = true;
+    factory.maxjsStudioLighting = true; // compatibility with older snapshot checks
+    factory.maxjsMaskDefaults = maskDefaults;
+    renderer.lighting.createNode = factory;
+    return true;
+}
+
 export { getReflectionPaintNode } from './reflection_paint.js';

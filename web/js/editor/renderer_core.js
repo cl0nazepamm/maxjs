@@ -312,6 +312,10 @@ function createRendererCore(deps = {}) {
         }
         function restartWithRendererBackend(mode, options = {}) {
             const normalizedMode = normalizeRendererBackend(mode) || 'webgpu';
+            if (normalizedMode === 'webgl2' && deps.hasActiveLightLinks?.()) {
+                alert('Light Linking is active. Set every linked light to None before switching to the simple WebGL pipeline.');
+                return false;
+            }
             const reason = options.reason || 'manual';
             const label = RENDERER_PIPELINE_LABELS[normalizedMode] || normalizedMode;
             const confirmMessage = options.confirmMessage
@@ -325,8 +329,9 @@ function createRendererCore(deps = {}) {
                 }
                 sessionStorage.setItem('maxjs_renderer_backend', normalizedMode);
                 location.reload();
-                return;
+                return true;
             }
+            return false;
         }
         function getNextRendererPipelineMode() {
             const order = ['webgl2', 'webgpu', 'webgl-fallback'];

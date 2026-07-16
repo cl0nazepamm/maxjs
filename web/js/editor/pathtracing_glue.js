@@ -21,6 +21,10 @@ function createPathTracingGlue(deps = {}) {
         // keep presenting the last path-traced texture.
         function setSpectralView(view) {
             const next = view === 'trace' ? 'trace' : 'probes';
+            if (next === 'trace' && deps.hasActiveLightLinks?.()) {
+                deps.perfHud?.setStatus?.('max.js - set linked lights to None before using Trace');
+                return deps.spectralView;
+            }
             if (!deps.isStudioMode || deps.spectralView === next) return deps.spectralView;
             deps.spectralView = next;
             deps.isPathTracingMode = next === 'trace';

@@ -7,48 +7,34 @@
 
 import * as THREE from 'three';
 
-import { getReflectionPaintNode, maxLights, ensureMeshMaskDefaults, LIGHT_MASK_LO_KEY, LIGHT_MASK_HI_KEY } from './max_lights_node.js';
-
-const MAXJS_MAX_LIGHT_IDS = 64;
+import {
+    clearUnownedLightLinkMaterialObserver,
+    getReflectionPaintNode,
+    installMaxLightsRenderer,
+    setLightLinkMaterialObserver,
+    setLightLinkMaskDefaults,
+} from './max_lights_node.js';
+import {
+    createLightLinkMaskApplier,
+    deserializeLightLinks,
+    getByHandle,
+    handleToken,
+    hasActiveLightLinksPayload,
+} from './light_linking_core.js';
 
 const constraintCameraQuat = new THREE.Quaternion();
 const constraintInverseQuat = new THREE.Quaternion();
 const constraintWorldPos = new THREE.Vector3();
 
 export function installStudioLightingRenderer(renderer, options = {}) {
-    if (!renderer?.lighting?.createNode) return false;
-    if (renderer.lighting.createNode?.maxjsStudioLighting === true) return true;
-
-    const factory = (lights = []) => maxLights({
-        maxDirectionalLights: options.maxDirectionalLights ?? 16,
-        maxPointLights: options.maxPointLights ?? 32,
-        maxSpotLights: options.maxSpotLights ?? 32,
-        maxHemisphereLights: options.maxHemisphereLights ?? 4,
-    }).setLights(lights);
-    factory.maxjsStudioLighting = true;
-    renderer.lighting.createNode = factory;
-    return true;
+    return installMaxLightsRenderer(renderer, options);
 }
 
-function handleToken(handle) {
-    return handle == null ? '' : String(handle);
-}
-
-function resolveHandle(map, handle) {
-    if (!map || handle == null) return null;
-    if (map.has(handle)) return handle;
-    const token = handleToken(handle);
-    if (map.has(token)) return token;
-    if (/^-?\d+$/.test(token)) {
-        const numeric = Number(token);
-        if (Number.isSafeInteger(numeric) && map.has(numeric)) return numeric;
-    }
-    return null;
-}
-
-function getByHandle(map, handle) {
-    const resolved = resolveHandle(map, handle);
-    return resolved == null ? undefined : map.get(resolved);
+export function studioStateNeedsMaxLightsNode(studioState) {
+    if (!studioState || typeof studioState !== 'object') return false;
+    if (hasActiveLightLinksPayload(studioState.lightLinking)) return true;
+    return Array.isArray(studioState.reflectionPaint?.lights)
+        && studioState.reflectionPaint.lights.length > 0;
 }
 
 function vectorFromPlain(value) {
@@ -75,11 +61,8 @@ function materialNameOf(material) {
     return value || 'default';
 }
 
-function lightStableKey(light, handle) {
-    return String(light?.name || (handle != null ? `_h${handle}` : `_light_${light?.id ?? 0}`));
-}
-
 export function createStudioLightingController({
+    renderer,
     scene,
     camera,
     nodeMap,
@@ -88,6 +71,7 @@ export function createStudioLightingController({
     onSceneChanged = null,
     onOutputChanged = null,
 } = {}) {
+    if (!renderer) throw new Error('createStudioLightingController: renderer required');
     if (!scene) throw new Error('createStudioLightingController: scene required');
     if (!camera) throw new Error('createStudioLightingController: camera required');
     if (!nodeMap) throw new Error('createStudioLightingController: nodeMap required');
@@ -95,80 +79,85 @@ export function createStudioLightingController({
 
     const links = new Map();
     const envIntensityByName = new Map();
+    const envBaseIntensityByMaterial = new WeakMap();
     const reflectionPaintCameraDirections = new Map();
     const lightCameraConstraints = new Map();
-    const lightIdByName = new Map();
-    const lightIdSlots = new Uint8Array(MAXJS_MAX_LIGHT_IDS);
+    const materialObserverOwner = {};
+    const observedMaterials = new Set();
+    let observerSweepSet = null;
 
     let hdriConstrainToCamera = false;
     let hdriBaseRotationY = 0;
     let reflectionPaintConstrainToCamera = false;
 
-    function allocLightId(key) {
-        if (lightIdByName.has(key)) {
-            const id = lightIdByName.get(key);
-            lightIdSlots[id] = 1;
-            return id;
-        }
-        for (let i = 0; i < MAXJS_MAX_LIGHT_IDS; i++) {
-            if (!lightIdSlots[i]) {
-                lightIdSlots[i] = 1;
-                lightIdByName.set(key, i);
-                return i;
-            }
-        }
-        return -1;
-    }
-
-    function ensureLightIds() {
-        lightIdSlots.fill(0);
-        for (const [handle, light] of lightHandleMap) {
-            if (!light) continue;
-            light.userData ??= {};
-            light.userData.maxjsLightId = allocLightId(lightStableKey(light, handle));
-            light.userData.maxjsLightLinked = false;
-        }
-    }
-
     function forEachRenderableMesh(fn) {
+        const seen = new WeakSet();
         for (const [h, mesh] of nodeMap) {
             if (!mesh?.isMesh) continue;
+            seen.add(mesh);
             fn(handleToken(h), mesh);
         }
+        scene.traverse?.((mesh) => {
+            if (!mesh?.isMesh || seen.has(mesh)) return;
+            seen.add(mesh);
+            const handle = mesh.userData?.maxjsHandle
+                ?? mesh.userData?.maxjsSourceHandle
+                ?? mesh.userData?.maxjsSource
+                ?? '';
+            fn(handleToken(handle), mesh);
+        });
         if (typeof getRenderableMeshes === 'function') {
             for (const entry of getRenderableMeshes() ?? []) {
                 const mesh = entry?.mesh?.isMesh ? entry.mesh : (entry?.isMesh ? entry : null);
-                if (!mesh) continue;
+                if (!mesh || seen.has(mesh)) continue;
+                seen.add(mesh);
                 const handle = entry?.handle ?? entry?.sourceHandle ?? mesh.userData?.maxjsHandle ?? mesh.userData?.maxjsSource ?? '';
                 fn(handleToken(handle), mesh);
             }
         }
     }
 
-    function resetMask(mesh) {
-        ensureMeshMaskDefaults(mesh);
-        mesh.userData[LIGHT_MASK_LO_KEY] = 0xFFFFFFFF;
-        mesh.userData[LIGHT_MASK_HI_KEY] = 0xFFFFFFFF;
+    function prepareMaterialObserver(material) {
+        const materials = Array.isArray(material) ? material : [material];
+        for (const entry of materials) {
+            if (!entry) continue;
+            observerSweepSet?.add(entry);
+            if (observedMaterials.has(entry)) continue;
+            observedMaterials.add(entry);
+            setLightLinkMaterialObserver(entry, true, materialObserverOwner);
+        }
     }
 
-    function writeBit(mesh, lightId, enabled) {
-        ensureMeshMaskDefaults(mesh);
-        const key = lightId < 32 ? LIGHT_MASK_LO_KEY : LIGHT_MASK_HI_KEY;
-        const bit = (1 << (lightId & 31)) >>> 0;
-        const cur = mesh.userData[key] >>> 0;
-        mesh.userData[key] = enabled ? ((cur | bit) >>> 0) : ((cur & ~bit) >>> 0);
+    function releaseMaterialObservers() {
+        for (const material of observedMaterials) {
+            setLightLinkMaterialObserver(material, false, materialObserverOwner);
+        }
+        observedMaterials.clear();
     }
+
+    function sweepMaterialObservers(currentMaterials) {
+        for (const material of [...observedMaterials]) {
+            if (currentMaterials.has(material)) continue;
+            setLightLinkMaterialObserver(material, false, materialObserverOwner);
+            observedMaterials.delete(material);
+        }
+    }
+
+    const maskApplier = createLightLinkMaskApplier({
+        lightHandleMap,
+        forEachRenderableMesh,
+        onPrepareMesh: (mesh) => prepareMaterialObserver(mesh.material),
+        onOverflow: (overflowCount, activeCount) => {
+            console.warn(
+                `[max.js snapshot] ${activeCount} linked lights active; ${overflowCount} use the per-light fallback beyond the 64-light batched mask.`,
+            );
+        },
+    });
+    let specializedLightingActive = false;
 
     function lightHandleByName(name) {
         for (const [h, light] of lightHandleMap) {
             if (light?.name === name) return handleToken(h);
-        }
-        return null;
-    }
-
-    function meshHandleByName(name) {
-        for (const [h, mesh] of nodeMap) {
-            if (mesh?.name === name) return handleToken(h);
         }
         return null;
     }
@@ -186,40 +175,53 @@ export function createStudioLightingController({
     }
 
     function applyEnvIntensities() {
-        const seen = new Set();
-        forEachRenderableMesh((_h, mesh) => {
-            const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
-            for (const mat of materials) {
-                if (!mat || seen.has(mat)) continue;
-                seen.add(mat);
-                const matName = materialNameOf(mat);
-                const ev = envIntensityByName.get(matName);
-                mat.envMapIntensity = (typeof ev === 'number') ? ev : 1.0;
-            }
-        });
+        if (envIntensityByName.size === 0) return;
+        for (const [materialName, value] of envIntensityByName) {
+            forEachMaterialByName(materialName, (mat) => {
+                if (!envBaseIntensityByMaterial.has(mat)) {
+                    envBaseIntensityByMaterial.set(
+                        mat,
+                        Number.isFinite(mat.envMapIntensity) ? mat.envMapIntensity : 1.0,
+                    );
+                }
+                mat.envMapIntensity = value;
+            });
+        }
+    }
+
+    function clearEnvIntensityOverrides() {
+        for (const [materialName] of envIntensityByName) {
+            forEachMaterialByName(materialName, (mat) => {
+                const base = envBaseIntensityByMaterial.get(mat);
+                if (Number.isFinite(base)) mat.envMapIntensity = base;
+                envBaseIntensityByMaterial.delete(mat);
+            });
+        }
+        envIntensityByName.clear();
     }
 
     function reapply() {
-        ensureLightIds();
-        if (links.size > 0) {
-            forEachRenderableMesh((_meshHandle, mesh) => resetMask(mesh));
-            for (const [lh, link] of links) {
-                const light = getByHandle(lightHandleMap, lh);
-                const lid = light?.userData?.maxjsLightId;
-                if (!Number.isInteger(lid) || lid < 0 || lid >= MAXJS_MAX_LIGHT_IDS) continue;
-                light.userData.maxjsLightLinked = true;
-                if (link.mode === 'include') {
-                    forEachRenderableMesh((meshHandle, mesh) => {
-                        writeBit(mesh, lid, link.objects.has(meshHandle));
-                    });
-                } else {
-                    forEachRenderableMesh((meshHandle, mesh) => {
-                        if (link.objects.has(meshHandle)) writeBit(mesh, lid, false);
-                    });
-                }
-            }
+        observerSweepSet = new Set();
+        const maskState = maskApplier.apply(links);
+        const currentObserverMaterials = observerSweepSet;
+        observerSweepSet = null;
+        if (maskState.activeCount === 0 && specializedLightingActive) {
+            releaseMaterialObservers();
+            forEachRenderableMesh((_handle, mesh) => {
+                clearUnownedLightLinkMaterialObserver(mesh.material);
+            });
+        } else if (maskState.activeCount > 0) {
+            sweepMaterialObservers(currentObserverMaterials);
         }
+        specializedLightingActive = maskState.activeCount > 0;
+        setLightLinkMaskDefaults(
+            renderer,
+            maskState.defaultLo,
+            maskState.defaultHi,
+            maskState.generation,
+        );
         applyEnvIntensities();
+        return maskState;
     }
 
     function getCameraYaw() {
@@ -316,7 +318,7 @@ export function createStudioLightingController({
 
     function applyLightLinkingPayload(data = {}, options = {}) {
         links.clear();
-        envIntensityByName.clear();
+        clearEnvIntensityOverrides();
         lightCameraConstraints.clear();
         reflectionPaintCameraDirections.clear();
         hdriConstrainToCamera = false;
@@ -327,23 +329,10 @@ export function createStudioLightingController({
             return;
         }
 
-        const rawLinks = data.links || (data.env === undefined ? data : {});
         const rawEnv = data.env || {};
-        for (const [lName, entry] of Object.entries(rawLinks)) {
-            if (!entry || typeof entry !== 'object' || !entry.mode) continue;
-            const lh = lightHandleByName(lName);
-            if (lh == null) continue;
-            const objHandles = new Set();
-            for (const oName of (entry.objects || [])) {
-                const oh = meshHandleByName(oName);
-                if (oh != null) objHandles.add(oh);
-            }
-            if (objHandles.size > 0) {
-                links.set(lh, {
-                    mode: entry.mode === 'include' ? 'include' : 'exclude',
-                    objects: objHandles,
-                });
-            }
+        const restoredLinks = deserializeLightLinks(data, { lightHandleMap, nodeMap });
+        for (const [lightHandle, link] of restoredLinks) {
+            links.set(lightHandle, link);
         }
 
         for (const [materialName, raw] of Object.entries(rawEnv)) {
@@ -443,14 +432,26 @@ export function createStudioLightingController({
         if (v !== 1.0) envIntensityByName.set(materialName, v);
         else envIntensityByName.delete(materialName);
         forEachMaterialByName(materialName, (mat) => {
-            mat.envMapIntensity = v;
+            if (!envBaseIntensityByMaterial.has(mat)) {
+                envBaseIntensityByMaterial.set(
+                    mat,
+                    Number.isFinite(mat.envMapIntensity) ? mat.envMapIntensity : 1.0,
+                );
+            }
+            if (v !== 1.0) {
+                mat.envMapIntensity = v;
+            } else {
+                const base = envBaseIntensityByMaterial.get(mat);
+                if (Number.isFinite(base)) mat.envMapIntensity = base;
+                envBaseIntensityByMaterial.delete(mat);
+            }
         });
         onOutputChanged?.();
     }
 
     function dispose() {
         links.clear();
-        envIntensityByName.clear();
+        clearEnvIntensityOverrides();
         reflectionPaintCameraDirections.clear();
         lightCameraConstraints.clear();
         hdriConstrainToCamera = false;

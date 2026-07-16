@@ -137,6 +137,7 @@ export function powerShotPresetUiDefaults(key) {
         jpegHighlight: 1.0,
         analogStrength: preset.analog_vhs_strength ?? 0.65,
         analogTracking: preset.analog_tracking ?? 0.45,
+        analogTrackingChoppiness: preset.analog_tracking_choppiness ?? 1.0,
         analogChromaBleed: preset.analog_chroma_bleed ?? 0.75,
         analogRinging: preset.analog_ringing ?? 0.65,
         analogTapeNoise: preset.analog_tape_noise ?? 0.75,
@@ -158,6 +159,7 @@ export function powerShotNightshotUiDefaults() {
         irNoise: ns.ir.noise_amount ?? 0.5,
         analogStrength: cam.analog_vhs_strength ?? 1.15,
         analogTracking: cam.analog_tracking ?? 0.45,
+        analogTrackingChoppiness: cam.analog_tracking_choppiness ?? 1.0,
         analogChromaBleed: cam.analog_chroma_bleed ?? 0.15,
         analogRinging: cam.analog_ringing ?? 0.95,
         analogTapeNoise: cam.analog_tape_noise ?? 0.85,
@@ -234,6 +236,7 @@ export function createPowerShotFinal({
         p.contrast = THREE.MathUtils.clamp(finiteOr(p.contrast, 0), -1, 1);
         p.analogStrength = THREE.MathUtils.clamp(finiteOr(p.analogStrength, 0.72), 0, 3);
         p.analogTracking = THREE.MathUtils.clamp(finiteOr(p.analogTracking, 0.46), 0, 3);
+        p.analogTrackingChoppiness = THREE.MathUtils.clamp(finiteOr(p.analogTrackingChoppiness, 1.0), 0, 1);
         p.analogChromaBleed = THREE.MathUtils.clamp(finiteOr(p.analogChromaBleed, 0.76), 0, 3);
         p.analogRinging = THREE.MathUtils.clamp(finiteOr(p.analogRinging, 0.62), 0, 3);
         p.analogTapeNoise = THREE.MathUtils.clamp(finiteOr(p.analogTapeNoise, 0.70), 0, 3);
@@ -370,6 +373,7 @@ export function createPowerShotFinal({
         const A = nightshotPipeline.cam.ctx.P;
         A.analogStrength.value = p.analogStrength;
         A.analogTracking.value = p.analogTracking;
+        A.analogTrackingChoppiness.value = p.analogTrackingChoppiness;
         A.analogChromaBleed.value = p.analogChromaBleed;
         A.analogRinging.value = p.analogRinging;
         A.analogTapeNoise.value = p.analogTapeNoise;
@@ -406,6 +410,7 @@ export function createPowerShotFinal({
         powerShotPipeline.ctx.P.jpegHighlight.value = p.jpegHighlight;
         powerShotPipeline.ctx.P.analogStrength.value = p.analogStrength;
         powerShotPipeline.ctx.P.analogTracking.value = p.analogTracking;
+        powerShotPipeline.ctx.P.analogTrackingChoppiness.value = p.analogTrackingChoppiness;
         powerShotPipeline.ctx.P.analogChromaBleed.value = p.analogChromaBleed;
         powerShotPipeline.ctx.P.analogRinging.value = p.analogRinging;
         powerShotPipeline.ctx.P.analogTapeNoise.value = p.analogTapeNoise;

@@ -13,7 +13,7 @@
 //
 //   root      string  — folder containing snapshot.json + scene.bin (e.g. '.')
 //   canvas    HTMLCanvasElement — render target
-//   options   object  — { rendererBackend?: 'webgpu' | 'webgl', debug?: boolean }
+//   options   object  — { rendererBackend?: 'webgpu' | 'tsl_gl' | 'webgl', debug?: boolean }
 //
 //   Returns: {
 //     renderer, scene, camera, controls, layerManager,
@@ -165,6 +165,7 @@ function normalizeRuntimeFeatures(meta) {
 function normalizeRendererBackend(value) {
     const raw = String(value || '').toLowerCase();
     if (raw.includes('webgpu')) return 'webgpu';
+    if (raw.includes('tsl')) return 'tsl_gl';
     return 'webgl';
 }
 
@@ -376,6 +377,7 @@ function buildLayerManager({
     overlayRoot,
     controls,
     sceneCameras = [],
+    onRuntimeSceneChanged = null,
 }) {
     return createLayerManager({
         scene,
@@ -397,6 +399,7 @@ function buildLayerManager({
         getSceneCameras: () => sceneCameras,
         debugLog: (...args) => console.debug('[snapshot_boot]', ...args),
         debugWarn: (...args) => console.warn('[snapshot_boot]', ...args),
+        onRuntimeSceneChanged,
     });
 }
 
@@ -425,9 +428,9 @@ async function registerOptionalModules(features, ctx) {
 
     const modules = {};
 
-    // Post-FX replay needs the TSL node pipeline — WebGPU target only.
-    // (snapshot.html / WebGL stays post-FX free by design.)
-    if (features.renderer_pref === 'webgpu' && features.post_fx?.length) {
+    // Post-FX replay needs the TSL node pipeline. Native WebGPU and TSL_GL
+    // share it; snapshot.html / simple WebGL stays post-FX free by design.
+    if (features.renderer_pref !== 'webgl' && features.post_fx?.length) {
         try {
             const { createSnapshotFx } = await import('./snapshot_fx.js');
             modules.maxjsFx = await createSnapshotFx({
@@ -478,6 +481,8 @@ const SNAPSHOT_HALO_GI_DEFAULTS = Object.freeze({
     filter: 1,
     smoothness: 1,
     detail: 1,
+    roughReflections: false,
+    reflectionIntensity: 1.0,
     changeThreshold: 2.5,
     snapAmount: 0.30,
     fireflyClamp: 6.0,
@@ -511,6 +516,8 @@ function normalizeSnapshotHaloGiState(snapshotUi) {
         filter: numOrFallback(source.filter, SNAPSHOT_HALO_GI_DEFAULTS.filter, 0, 1),
         smoothness: numOrFallback(source.smoothness, SNAPSHOT_HALO_GI_DEFAULTS.smoothness, 0, 1),
         detail: numOrFallback(source.detail, SNAPSHOT_HALO_GI_DEFAULTS.detail, 0, 1),
+        roughReflections: source.roughReflections === true,
+        reflectionIntensity: numOrFallback(source.reflectionIntensity, SNAPSHOT_HALO_GI_DEFAULTS.reflectionIntensity, 0, 1),
         changeThreshold: numOrFallback(source.changeThreshold, SNAPSHOT_HALO_GI_DEFAULTS.changeThreshold, 0.5, 8),
         snapAmount: numOrFallback(source.snapAmount, SNAPSHOT_HALO_GI_DEFAULTS.snapAmount, 0, 0.9),
         fireflyClamp: numOrFallback(source.fireflyClamp, SNAPSHOT_HALO_GI_DEFAULTS.fireflyClamp, 1, 20),
@@ -584,6 +591,7 @@ function applySnapshotHaloGiSettings(field, settings) {
     field.setFilterStrength?.(settings.filter);
     field.setSmoothness?.(settings.smoothness);
     field.setDetailStrength?.(settings.detail);
+    field.setReflectionIntensity?.(settings.reflectionIntensity);
     field.setChangeThreshold?.(settings.changeThreshold);
     field.setSnapAmount?.(settings.snapAmount);
     field.setFireflyClamp?.(settings.fireflyClamp);
@@ -593,11 +601,11 @@ async function createSnapshotHaloGi({ renderer, scene, snapshotUi } = {}) {
     const settings = normalizeSnapshotHaloGiState(snapshotUi);
     if (!settings?.enabled) return null;
     if (renderer?.backend?.isWebGPUBackend !== true || !renderer?.lighting?.createNode) return null;
-    // Studio (spectral) snapshots already run MaxLightsNode, which injects the
-    // probe term via getGiProbeNode() — the field just has to exist. Only
-    // plain snapshots swap in GiLightsNode to reach the same term. The path
-    // tracer never rides snapshots; probes ARE the spectral replay.
-    const swapLightingNode = !snapshotUi?.studio;
+    // An adaptive MaxLightsNode factory already injects the probe term when
+    // light links or Reflection Paint required it. Otherwise install GiLights.
+    // Check the actual factory marker instead of assuming every `studio` block
+    // needed specialized lighting.
+    const swapLightingNode = renderer.lighting.createNode?.maxjsAdaptiveLighting !== true;
 
     let previousCreateNode = null;
     let installedCreateNode = null;
@@ -622,6 +630,8 @@ async function createSnapshotHaloGi({ renderer, scene, snapshotUi } = {}) {
             intensity: settings.intensity,
             hysteresis: settings.hysteresis,
             divisions: settings.divisions,
+            roughReflections: settings.roughReflections,
+            reflectionIntensity: settings.reflectionIntensity,
             onRebuilt: () => markSnapshotHaloGiMaterialsDirty(scene),
         });
         applySnapshotHaloGiSettings(field, settings);
@@ -1293,10 +1303,15 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
     // Phase 2: renderer
     const renderer = await createRenderer(canvas, features);
     let studioModule = null;
-    if (features.renderer_pref === 'webgpu' && meta.snapshotUi?.studio) {
+    if (meta.snapshotUi?.studio) {
         try {
             studioModule = await import('./studio_lighting.js');
-            studioModule.installStudioLightingRenderer?.(renderer);
+            if (studioModule.studioStateNeedsMaxLightsNode?.(meta.snapshotUi.studio)) {
+                const installed = studioModule.installStudioLightingRenderer?.(renderer);
+                if (!installed) {
+                    console.warn('[snapshot_boot] light linking requires the WebGPU/TSL renderer');
+                }
+            }
         } catch (error) {
             console.warn('[snapshot_boot] studio lighting module init failed', error);
         }
@@ -1357,6 +1372,15 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
     });
     let authoredLightCount = 0;
     let studioLighting = null;
+    let studioLightingRefreshQueued = false;
+    const queueStudioLightingRefresh = () => {
+        if (studioLightingRefreshQueued) return;
+        studioLightingRefreshQueued = true;
+        queueMicrotask(() => {
+            studioLightingRefreshQueued = false;
+            studioLighting?.refreshSceneBindings?.();
+        });
+    };
     const syncDefaultLights = () => {
         const studioLightingActive = studioLighting?.hasReflectionPaint?.() === true;
         defaultLights.visible = authoredLightCount === 0 && !snapshotEnvironment.isLightingActive() && !studioLightingActive;
@@ -1367,6 +1391,7 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
         scene, camera, renderer, THREE,
         nodeMap, lightHandleMap, maxRoot, jsRoot, overlayRoot, controls,
         sceneCameras: Array.isArray(meta.sceneCameras) ? meta.sceneCameras : [],
+        onRuntimeSceneChanged: queueStudioLightingRefresh,
     });
 
     const animationSystem = createMaxJSAnimationSystem({
@@ -1473,6 +1498,7 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
     if (meta.snapshotUi?.studio && studioModule?.createStudioLightingController) {
         try {
             studioLighting = studioModule.createStudioLightingController({
+                renderer,
                 scene,
                 camera,
                 nodeMap,
@@ -1493,12 +1519,14 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
         await applyRuntimeScene(meta.runtimeScene, {
             scene, jsRoot, overlayRoot, layerManager, meta, nodeMap,
         });
+        studioLighting?.refreshSceneBindings?.();
     }
 
     // Phase 9: layer project. Project sidecars are independent of the baked
     // runtimeScene payload: a snapshot may ship project.maxjs.json + inlines/
     // even when runtimeScene was omitted or empty.
     await bindLayerProject(root, meta, layerManager);
+    studioLighting?.refreshSceneBindings?.();
 
     // Animation tracks
     if (meta.animations) {

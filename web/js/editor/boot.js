@@ -7,9 +7,8 @@
         import { createWebXRRuntime } from './webxr.js';
         import { Inspector } from 'three/addons/inspector/Inspector.js';
         import {
-            maxLights,
+            installMaxLightsRenderer,
         } from '../max_lights_node.js';
-        import { giLights } from 'speedball-gi';
         import { createSplatsSystem } from './splats.js';
         import { createRendererCore } from './renderer_core.js';
         import { createTexturePipeline } from './texture_pipeline.js';
@@ -371,6 +370,7 @@
 
         let renderer = null;
         let rendererBackendLabel = 'WebGPU';
+        let lightLinkingRef = null;
         const rendererCore = createRendererCore({
             MAXJS_MODE_KEY,
             getRenderOutputAspect,
@@ -396,6 +396,7 @@
             get isProductionRenderPage() { return isProductionRenderPage; },
             get shouldPreserveCanvasForCapture() { return shouldPreserveCanvasForCapture; },
             get isPathTracingMode() { return isPathTracingMode; },
+            hasActiveLightLinks: () => lightLinkingRef?.hasActiveLinks?.() === true,
         });
         const {
             getViewportFrameRect,
@@ -444,43 +445,20 @@
         window.chrome?.webview?.postMessage({ type: 'gpu_normals', enabled: false });
 
         // ── Render mode ───────────────────────────────────────
-        // Studio  = MaxLightsNode (light linking + per-mesh HDRI intensity).
-        //           Unlinked lights stay on stock batched three.js light nodes.
-        // Standard = stock three.js pipeline. No per-mesh tricks, but fits
-        //            within baseline WebGPU uniform-buffer limits — use on
-        //            heavier scenes that exceed 12 uniform buffers/stage.
+        // MaxLightsNode is the adaptive factory in every node-renderer mode.
+        // Unlinked lights stay on Three's own dynamic/native light nodes; only
+        // a light with an explicit include/exclude mode enters the masked path.
+        // The same factory also carries the opt-in HALO-GI nodes, replacing the
+        // old Standard=GiLights / Spectral=MaxLights split.
         // Pathtracing = isolated legacy WebGL2 progressive path tracer.
         //               This is live-viewer only and is not exported to snapshots.
         //
         // Mode is frozen before renderer init; switching requires reload.
-        // Light Linking + Reflection Paint are parked for now (disabled, not
-        // deleted): their rail rows are display:none in the HTML and no sync
-        // path re-shows them. Restore = re-add ids + drop the inline style.
-        const isWebGpuBackend = renderer.backend?.isWebGPUBackend === true;
-        const shouldInstallMaxLightsNode = isStudioMode;
-        if (shouldInstallMaxLightsNode && renderer.lighting?.createNode) {
-            // Install MaxLightsNode as the renderer's LightsNode factory. The
-            // renderer creates one LightsNode per scene via lighting.createNode()
-            // and caches it; setting scene.lightsNode is a no-op here. Override
-            // must land before the first frame so the cached node is ours.
-            renderer.lighting.createNode = (lights = []) => maxLights({
-                maxDirectionalLights: 16,
-                maxPointLights: 32,
-                maxSpotLights: 32,
-                maxHemisphereLights: 4,
-            }).setLights(lights);
-        } else if (isWebGpuBackend && renderer.lighting?.createNode) {
-            // Non-Studio WebGPU: stock batched lights (DynamicLightsNode) PLUS the
-            // opt-in HALO-GI / surfel injection (GiLightsNode). Byte-identical to
-            // stock three.js when GI is off, so HALO-GI works in EVERY WebGPU mode
-            // without the Studio light-linking overhead. Studio keeps MaxLightsNode.
-            renderer.lighting.createNode = (lights = []) => giLights({
-                maxDirectionalLights: 16,
-                maxPointLights: 32,
-                maxSpotLights: 32,
-                maxHemisphereLights: 4,
-            }).setLights(lights);
-        }
+        // Three caches lighting.createNode() per scene, so the adaptive factory
+        // must be installed before frame one; switching it when a checkbox is
+        // clicked is too late. Simple WGL2 has no node-lighting factory and is
+        // intentionally left on stock WebGLRenderer behavior.
+        installMaxLightsRenderer(renderer);
 
         let giVolume = null;
         let haloGi = null; // HALO-GI BVH-traced DDGI probe field (opt-in; see init below)
@@ -793,6 +771,7 @@
             PATH_TRACING_LIVE_REBUILD_DELAY_MS,
             syncPathTracingDofFromPostFx: (...args) => syncPathTracingDofFromPostFx(...args),
             bridgeHasInitialSync: (...args) => bridgeHasInitialSync(...args),
+            hasActiveLightLinks: () => lightLinkingRef?.hasActiveLinks?.() === true,
             get isStudioMode() { return isStudioMode; },
             get spectralView() { return spectralView; },
             set spectralView(value) { spectralView = value; },
@@ -1617,6 +1596,7 @@
             retainGeometryRef,
             releaseGeometryRef,
             disposeMaxInstanceBuckets,
+            setLightLinkTargetHandles,
             disposeFlattenedGroups,
             getMaxInstanceBucketForHandle,
             matrixArraysAlmostEqual,
@@ -1814,6 +1794,7 @@
             get nodeMap() { return nodeMap; },
             get layerManager() { return layerManager; },
             get maxjsFx() { return maxjsFx; },
+            get lightLinking() { return lightLinkingRef; },
             get bridge() { return bridge; },
             get perfHud() { return perfHud; },
             get projectRuntime() { return _projectRuntimeRef; },
@@ -1933,7 +1914,10 @@
             refreshSkyFromLinkedSun,
             saveStudioState: (...args) => saveStudioState(...args),
             isSimpleWebGLPipelineActive: (...args) => isSimpleWebGLPipelineActive(...args),
+            restartWithRendererBackend: (...args) => restartWithRendererBackend(...args),
+            setSpectralView: (...args) => setSpectralView(...args),
             get isPathTracingMode() { return isPathTracingMode; },
+            hasActiveLightLinks: () => lightLinkingRef?.hasActiveLinks?.() === true,
             get defaultLights() { return defaultLights; },
             get defaultAmbient() { return defaultAmbient; },
             get defaultKey() { return defaultKey; },
@@ -1947,6 +1931,7 @@
             set lightLinkPanelVisible(value) { lightLinkPanelVisible = value; },
             get nodeMap() { return nodeMap; },
             get maxInstanceBuckets() { return maxInstanceBuckets; },
+            setLightLinkTargetHandles,
             get maxRoot() { return maxRoot; },
             get scene() { return scene; },
             get camera() { return camera; },
@@ -1978,8 +1963,6 @@
             applyLightEmitterClass,
             applyLightData,
             createLightFromData,
-            lightStableKey,
-            allocLightId,
             finalizeLightState,
             sceneLightsSignature,
             applyLights,
@@ -1988,6 +1971,7 @@
             rebuildLightLinkPanel,
             applyLightUpdates,
         } = lightsSystem;
+        lightLinkingRef = lightLinking;
         setDefaultLightsVisible(true);
 
         let asciiActive = false;
@@ -2354,7 +2338,9 @@
                 cameraClip: { near: cameraClip.near, far: cameraClip.far },
                 ascii: { enabled: asciiActive, ...asciiSettings },
                 shaderLab: getShaderLabSnapshot(),
-                studio: isStudioMode ? serializeStudioState() : null,
+                studio: (isStudioMode || lightLinking.hasPortableState())
+                    ? serializeStudioState()
+                    : null,
                 bake: serializeBakeState(),
                 timeline: {
                     fps: maxTimeline.fps(),
@@ -2555,6 +2541,15 @@
         const inlineTimer = new THREE.Timer();
         inlineTimer.connect?.(document);
         const inlineClock = inlineTimer;
+        let lightLinkSceneRefreshQueued = false;
+        const queueLightLinkSceneRefresh = () => {
+            if (lightLinkSceneRefreshQueued) return;
+            lightLinkSceneRefreshQueued = true;
+            queueMicrotask(() => {
+                lightLinkSceneRefreshQueued = false;
+                lightLinking.refreshSceneBindings?.();
+            });
+        };
         const layerManager = createLayerManager({
             scene,
             camera,
@@ -2577,6 +2572,7 @@
             debugLog: maxjsDebugLog,
             debugWarn: maxjsDebugWarn,
             onRuntimeSceneChanged: () => {
+                queueLightLinkSceneRefresh();
                 maxjsFx.markSceneChanged?.();
                 markLightProbeSceneDirty();
                 scheduleLightProbeFromCurrentScene({ delay: 350 });
@@ -2610,6 +2606,7 @@
         });
         layerManager.subscribe?.(() => {
             animationSystem.invalidateTargets();
+            queueLightLinkSceneRefresh();
             // Layer mutations can add/remove meshes — cheap scene refresh.
             maxjsFx.markSceneChanged?.();
             markLightProbeSceneDirty();

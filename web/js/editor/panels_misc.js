@@ -425,6 +425,7 @@ function createPanelsMisc(deps = {}) {
         let studioPersistInFlight = false;
         let newestLocalStudioSignature = '';
         let suppressStudioPersistenceDepth = 0;
+        let retainedReflectionPaintState = null;
         const STUDIO_PERSIST_IDLE_MS = 550;
 
         function withStudioPersistenceSuppressed(fn) {
@@ -437,18 +438,28 @@ function createPanelsMisc(deps = {}) {
         }
 
         function serializeStudioState() {
+            const reflectionPaint = deps.isStudioMode
+                ? serializeReflectionPaintState()
+                : (retainedReflectionPaintState ?? serializeReflectionPaintState());
+            if (deps.isStudioMode) retainedReflectionPaintState = reflectionPaint;
             return {
-                version: 1,
+                version: 2,
                 lightLinking: deps.lightLinking.serialize(),
-                reflectionPaint: serializeReflectionPaintState(),
+                reflectionPaint,
             };
         }
 
         function applyStudioState(payload) {
-            if (!deps.isStudioMode) return;
             if (!payload || typeof payload !== 'object') return;
             withStudioPersistenceSuppressed(() => {
-                applyReflectionPaintState(payload.reflectionPaint ?? { lights: [], intensity: 1.0 });
+                retainedReflectionPaintState = payload.reflectionPaint
+                    ?? retainedReflectionPaintState
+                    ?? { lights: [], intensity: 1.0 };
+                // Reflection Paint remains a Spectral-only feature. Light links
+                // are renderer-agnostic across every node-renderer raster mode.
+                if (deps.isStudioMode) {
+                    applyReflectionPaintState(retainedReflectionPaintState);
+                }
                 deps.lightLinking.applyPayload(payload.lightLinking);
                 if (deps.lightLinkPanelVisible) deps.rebuildLightLinkPanel();
                 if (reflPaintPanelVisible) rebuildReflPaintPanel();
@@ -467,7 +478,10 @@ function createPanelsMisc(deps = {}) {
             if (window.chrome?.webview) return false;
             withStudioPersistenceSuppressed(() => {
                 deps.lightLinking.restoreFromStorage();
-                applyReflectionPaintState(readLegacyReflectionPaintState());
+                retainedReflectionPaintState = readLegacyReflectionPaintState()
+                    ?? retainedReflectionPaintState
+                    ?? { lights: [], intensity: 1.0 };
+                if (deps.isStudioMode) applyReflectionPaintState(retainedReflectionPaintState);
             });
             return true;
         }
@@ -505,7 +519,6 @@ function createPanelsMisc(deps = {}) {
         }
 
         function saveStudioState(options = {}) {
-            if (!deps.isStudioMode) return;
             if (suppressStudioPersistenceDepth > 0) return;
             const payload = serializeStudioState();
             const signature = JSON.stringify(payload);
@@ -760,16 +773,24 @@ function createPanelsMisc(deps = {}) {
         window.__maxjsSyncSpectralViewUi = () => {
             if (!spectralTraceButton) return;
             const webGL = typeof deps.isWebGLPipelineActive === 'function' && deps.isWebGLPipelineActive();
+            const lightLinksActive = deps.lightLinking?.hasActiveLinks?.() === true;
             spectralTraceButton.style.display = (deps.isStudioMode && !webGL) ? '' : 'none';
+            spectralTraceButton.disabled = lightLinksActive;
             const active = deps.isStudioMode && deps.spectralView === 'trace';
             spectralTraceButton.classList.toggle('active', active);
             spectralTraceButton.setAttribute('aria-pressed', active ? 'true' : 'false');
-            spectralTraceButton.title = active
-                ? 'Path-traced view active — click for probe GI'
-                : 'Path-traced view (spectral mode)';
+            spectralTraceButton.title = lightLinksActive
+                ? 'Path tracing is unavailable while Light Linking is active'
+                : (active
+                    ? 'Path-traced view active — click for probe GI'
+                    : 'Path-traced view (spectral mode)');
         };
         spectralTraceButton?.addEventListener('click', () => {
             if (!deps.isStudioMode) return;
+            if (deps.lightLinking?.hasActiveLinks?.()) {
+                deps.perfHud?.setStatus?.('max.js - set linked lights to None before using Trace');
+                return;
+            }
             deps.setSpectralView(deps.spectralView === 'trace' ? 'probes' : 'trace');
         });
         window.__maxjsSyncSpectralViewUi();

@@ -73,6 +73,7 @@ export function createMaxJSFxController({
         contrast: 0,
         analogStrength: 0.72,
         analogTracking: 0.46,
+        analogTrackingChoppiness: 1.0,
         analogChromaBleed: 0.76,
         analogRinging: 0.62,
         analogTapeNoise: 0.70,
@@ -1182,6 +1183,7 @@ export function createMaxJSFxController({
             assignFinite(state.powershot, 'contrast', options.contrast);
             assignFinite(state.powershot, 'analogStrength', options.analogStrength);
             assignFinite(state.powershot, 'analogTracking', options.analogTracking);
+            assignFinite(state.powershot, 'analogTrackingChoppiness', options.analogTrackingChoppiness);
             assignFinite(state.powershot, 'analogChromaBleed', options.analogChromaBleed);
             assignFinite(state.powershot, 'analogRinging', options.analogRinging);
             assignFinite(state.powershot, 'analogTapeNoise', options.analogTapeNoise);

@@ -3,7 +3,7 @@
 // lines ~1565-1875.
 //
 // Snapshot-mode scope (intentional differences from live):
-//   - No TSL_GL backend or headset runtime. Snapshots stay renderer-only.
+//   - No headset runtime. Snapshots support WebGL2, WebGPU, and TSL_GL.
 //   - No backend persistence (the snapshot wrapper declares the target).
 //   - No editor performance panel coupling — uses devicePixelRatio at 1×scale.
 //   - No grid helper, no postfx panel.
@@ -51,6 +51,7 @@ async function initializeRenderer(renderer) {
  * Picks the renderer backend.
  *   backend === 'webgl'  → WebGLRenderer
  *   backend === 'webgpu' → WebGPURenderer, native WebGPU required
+ *   backend === 'tsl_gl' → WebGPURenderer with the WebGL backend
  *   default              → 'webgl'
  *
  * Always renders into the supplied canvas (no implicit DOM injection).
@@ -58,12 +59,15 @@ async function initializeRenderer(renderer) {
 export async function createRenderer(canvas, { backend = 'webgl' } = {}) {
     if (!canvas) throw new Error('createRenderer: canvas is required');
 
-    const normalizedBackend = String(backend || 'webgl').toLowerCase().includes('webgpu')
+    const rawBackend = String(backend || 'webgl').toLowerCase();
+    const normalizedBackend = rawBackend.includes('webgpu')
         ? 'webgpu'
-        : 'webgl';
+        : (rawBackend.includes('tsl') ? 'tsl_gl' : 'webgl');
     const renderer = normalizedBackend === 'webgpu'
         ? await createWebGpuRenderer(canvas)
-        : createWebGlRenderer(canvas);
+        : (normalizedBackend === 'tsl_gl'
+            ? createTslGlRenderer(canvas)
+            : createWebGlRenderer(canvas));
     configureRenderer(renderer, canvas);
     await initializeRenderer(renderer);
 
@@ -77,7 +81,9 @@ export async function createRenderer(canvas, { backend = 'webgl' } = {}) {
 
     return {
         renderer,
-        backendLabel: normalizedBackend === 'webgpu' ? 'WebGPU' : 'WebGL2',
+        backendLabel: normalizedBackend === 'webgpu'
+            ? 'WebGPU'
+            : (normalizedBackend === 'tsl_gl' ? 'TSL_GL' : 'WebGL2'),
     };
 }
 
@@ -87,6 +93,19 @@ function createWebGlRenderer(canvas) {
     }
     return new THREE.WebGLRenderer({
         canvas, antialias: true, alpha: true, powerPreference: 'high-performance',
+    });
+}
+
+function createTslGlRenderer(canvas) {
+    if (typeof THREE.WebGPURenderer !== 'function') {
+        throw new Error('[scene_init] WebGPURenderer is required for the TSL_GL snapshot target.');
+    }
+    return new THREE.WebGPURenderer({
+        canvas,
+        antialias: true,
+        alpha: true,
+        powerPreference: 'high-performance',
+        forceWebGL: true,
     });
 }
 

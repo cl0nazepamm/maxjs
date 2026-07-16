@@ -16,7 +16,7 @@
 //
 //   OUT (deferred to follow-up sessions):
 //     - Light helpers (debug visualization)
-//     - Light linking (per-mesh masks — live-mode editor feature)
+//     - Light-link state editing (portable replay is applied by studio_lighting.js)
 //     - Light probe scheduling
 //     - SSGI main-light wiring
 //     - Shadow camera scene-bounds focus (snapshot uses fixed defaults)
@@ -43,7 +43,6 @@ const lightWorldQuat = new THREE.Quaternion();
 // Exporter convention: beam = node TM -Y (WriteLightJson: dir = -row1).
 const LIGHT_BEAM_AXIS = new THREE.Vector3(0, -1, 0);
 const MAXJS_SELF_HIDDEN_LAYER = 31;
-const MAXJS_MAX_LIGHT_IDS = 64;
 
 function getLightParentObject(light, ld, parent, nodeMap) {
     const explicitParent = Object.prototype.hasOwnProperty.call(ld ?? {}, 'p')
@@ -424,29 +423,6 @@ export function createSceneLights({ scene, parent = scene, lightHandleMap = new 
     parent.add(lightGroup);
 
     let lastSignature = '';
-    const lightIdByName = new Map();
-    const lightIdSlots = new Uint8Array(MAXJS_MAX_LIGHT_IDS);
-
-    function lightStableKey(light, ld) {
-        return String(light?.name || ld?.name || (ld?.h != null ? `_h${ld.h}` : `_light_${light?.id ?? 0}`));
-    }
-
-    function allocLightId(key) {
-        if (lightIdByName.has(key)) {
-            const id = lightIdByName.get(key);
-            lightIdSlots[id] = 1;
-            return id;
-        }
-        for (let i = 0; i < MAXJS_MAX_LIGHT_IDS; i++) {
-            if (!lightIdSlots[i]) {
-                lightIdSlots[i] = 1;
-                lightIdByName.set(key, i);
-                return i;
-            }
-        }
-        return -1;
-    }
-
     function clear() {
         for (const [, light] of lightHandleMap) {
             const target = light.userData?.maxjsTarget;
@@ -472,8 +448,6 @@ export function createSceneLights({ scene, parent = scene, lightHandleMap = new 
             return { count: 0, mainDirectional: null, signature: sig, changed: false };
         }
         clear();
-        lightIdSlots.fill(0);
-
         let count = 0;
         let mainDirectional = null;
         for (const ld of (lightsData ?? [])) {
@@ -481,7 +455,9 @@ export function createSceneLights({ scene, parent = scene, lightHandleMap = new 
             if (!light) continue;
             if (!light.parent) lightGroup.add(light);
             light.userData ??= {};
-            light.userData.maxjsLightId = allocLightId(lightStableKey(light, ld));
+            // IDs belong only to active include/exclude links. The portable
+            // controller assigns them after both lights and meshes exist.
+            light.userData.maxjsLightId = -1;
             light.userData.maxjsLightLinked = false;
             if (ld.h != null) lightHandleMap.set(ld.h, light);
             if (light.userData?.maxjsVisible !== false) {

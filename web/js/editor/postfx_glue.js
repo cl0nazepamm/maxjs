@@ -386,7 +386,7 @@ function createPostFxGlue(deps = {}) {
                     { key: 'jpegChroma420', label: 'JPEG Chroma', min: 0, max: 1, step: 0.01, realtime: true, visibleWhen: isPowerShotJpegActive },
                     { key: 'jpegMidtone', label: 'JPEG Midtones', min: 0, max: 1, step: 0.01, realtime: true, visibleWhen: isPowerShotJpegActive },
                     { key: 'jpegHighlight', label: 'JPEG Highlights', min: 0, max: 2, step: 0.01, realtime: true, visibleWhen: isPowerShotJpegActive },
-                    { key: 'filmExposure', label: 'Exposure (stops)', min: -3, max: 3, step: 0.05, realtime: true, visibleWhen: isPowerShotFilmMode },
+                    { key: 'filmExposure', label: 'Exposure (stops)', min: -12, max: 12, step: 0.05, realtime: true, visibleWhen: isPowerShotFilmMode },
                     { key: 'filmInputGamma', label: 'Input Gamma', min: 0.5, max: 1.5, step: 0.01, realtime: true, visibleWhen: isPowerShotFilmMode },
                     { key: 'filmGrain', label: 'Grain', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotFilmMode },
                     { key: 'filmGrainSize', label: 'Grain Size', min: 0.5, max: 4, step: 0.05, realtime: true, visibleWhen: isPowerShotFilmMode },
@@ -416,7 +416,7 @@ function createPostFxGlue(deps = {}) {
                     { key: 'analogDropouts', label: 'Dropouts', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotTapeActive },
                     { key: 'analogScanlines', label: 'Scanlines', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotTapeActive },
                     { key: 'analogHeadSwitch', label: 'Head Switch', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotTapeActive },
-                    { key: 'irExposure', label: 'Exposure (stops)', min: -8, max: 8, step: 0.05, realtime: true, visibleWhen: isPowerShotNirMode },
+                    { key: 'irExposure', label: 'Exposure (stops)', min: -12, max: 12, step: 0.05, realtime: true, visibleWhen: isPowerShotNirMode },
                     { key: 'irInputGamma', label: 'Input Gamma', min: 0.35, max: 2, step: 0.01, realtime: true, visibleWhen: isPowerShotNirMode },
                     { key: 'irResponse', label: 'IR Response', min: 0, max: 1, step: 0.01, realtime: true, visibleWhen: isPowerShotNirMode },
                     { key: 'irLocalGain', label: 'Local Gain', min: 0, max: 1.5, step: 0.01, realtime: true, visibleWhen: isPowerShotInfraredMode },
@@ -482,8 +482,8 @@ function createPostFxGlue(deps = {}) {
         ];
 
         const LOG_SLIDER_STEPS = 1000;
-        const EXPOSURE_EV_MIN = -10;
-        const EXPOSURE_EV_MAX = 8;
+        const EXPOSURE_EV_MIN = -12;
+        const EXPOSURE_EV_MAX = 12;
         const EXPOSURE_LINEAR_MIN = Math.pow(2, EXPOSURE_EV_MIN);
         const EXPOSURE_LINEAR_MAX = Math.pow(2, EXPOSURE_EV_MAX);
 

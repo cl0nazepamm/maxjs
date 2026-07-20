@@ -764,6 +764,8 @@
 
         let pathTracingRasterWarmupFrames = 0;
         let pathTracingWarmupStartedAt = 0;
+        let pathTracingBridge = null;
+        let refreshSkyForSpectralViewNow = () => false;
         const pathTracingGlue = createPathTracingGlue({
             MAXJS_SPECTRAL_VIEW_KEY,
             PATH_TRACING_RASTER_WARMUP_FRAMES,
@@ -788,9 +790,10 @@
             get pathTracingWarmupStartedAt() { return pathTracingWarmupStartedAt; },
             set pathTracingWarmupStartedAt(value) { pathTracingWarmupStartedAt = value; },
             get pendingTextureLoads() { return pendingTextureLoads; },
-            get bridge() { return bridge; },
+            get bridge() { return pathTracingBridge; },
             get perfHud() { return perfHud; },
             get ptPauseUiSync() { return ptPauseUiSync; },
+            refreshSkyForSpectralView: () => refreshSkyForSpectralViewNow(),
         });
         const {
             isPathTracingViewActive,
@@ -1154,6 +1157,7 @@
             syncDefaultLightsVisibility,
             syncHdriPanel,
             loadHDRI,
+            get isStudioMode() { return isStudioMode; },
             get renderer() { return renderer; },
             get rendererBackendLabel() { return rendererBackendLabel; },
             get scene() { return scene; },
@@ -1164,6 +1168,7 @@
             get lightProbe() { return lightProbe; },
             get lightHandleMap() { return lightHandleMap; },
             get isPathTracingMode() { return isPathTracingMode; },
+            get haloGi() { return haloGi; },
             get currentEnvParams() { return currentEnvParams; },
             get skyActive() { return skyActive; },
             set skyActive(value) { skyActive = value; },
@@ -1205,7 +1210,9 @@
             removeClassicSkyObjects,
             applySky,
             removeSky,
+            refreshSkyForSpectralView,
         } = sky;
+        refreshSkyForSpectralViewNow = refreshSkyForSpectralView;
 
         function materialListHasRawShader(material) {
             if (Array.isArray(material)) return material.some((entry) => entry?.isRawShaderMaterial);
@@ -1264,6 +1271,7 @@
             onBeforeReady: () => sendPathTracingRuntimeState(),
         });
         const bridge = hostBridge.bridge;
+        pathTracingBridge = bridge;
         const { requestHostAction, toBase64Utf8, bytesToBase64, reportBridgeError,
                 startBridgeHandshake, markInitialSync } = hostBridge;
         const bridgeHasInitialSync = hostBridge.hasInitialSync;
@@ -1281,6 +1289,12 @@
             isLocalHdriActive: () => isLocalHdriActive(),
             isHdriReflectionOnlyEffective: () => isHdriReflectionOnlyEffective(),
             refreshSkyAmbientLightProbeFromCurrentSky: () => refreshSkyAmbientLightProbeFromCurrentSky(),
+            setSpectralSkyDiffuseOwnership(active) {
+                const next = active === true;
+                if ((scene.userData.maxjsSpectralSkyDdgiOwnsDiffuse === true) === next) return;
+                scene.userData.maxjsSpectralSkyDdgiOwnsDiffuse = next;
+                applyHdriReflectionOnlyState({ markOutput: true });
+            },
             get renderer() { return renderer; },
             get scene() { return scene; },
             get nodeMap() { return nodeMap; },
@@ -1363,6 +1377,7 @@
             updateProbeHelpers,
             setProbeHelpersVisible,
         } = giVolumeGlue;
+        if (skyActive) refreshSkyForSpectralView();
 
         function syncLiveSyncButtonUi() {
             const button = document.getElementById('btnLiveSync');

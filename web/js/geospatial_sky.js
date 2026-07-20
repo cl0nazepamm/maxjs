@@ -269,10 +269,17 @@ function rendererUsesLegacyWebGL(renderer) {
 function rendererUsesForcedWebGL(state) {
     const label = String(state.backendLabel || state.renderer?.userData?.maxjsBackendLabel || '');
     return !rendererUsesLegacyWebGL(state.renderer)
-        && (label === 'WGL2 Fallback' || label.includes('Fallback'));
+        && (state.nodeSkyFallback === true
+            || label === 'TSL_GL'
+            || label === 'WGL2 Fallback'
+            || label.includes('Fallback'));
 }
 
 function ensureSkyLightProbe(state, atmosphere, textures = null) {
+    // SkyLightProbe belongs to the classic Three.js build used by Takram's
+    // WebGL package. Keep it out of WebGPURenderer scenes; those use max.js's
+    // own lights/GI while the classic atmosphere renders in the backdrop.
+    if (rendererUsesForcedWebGL(state)) return;
     if (!atmosphere?.SkyLightProbe) return;
     if (!state.skyLightProbe) {
         state.skyLightProbe = new atmosphere.SkyLightProbe({
@@ -505,11 +512,16 @@ async function loadNodeModules(state) {
     return state.nodeModulesPromise;
 }
 
-async function ensureWebGLSky(state) {
+function isGeospatialApplyCurrent(state, generation) {
+    return state.disposed !== true && state.applyGeneration === generation;
+}
+
+async function ensureWebGLSky(state, generation) {
     const [atmosphere, geospatial] = await Promise.all([
         loadAtmosphereModule(state),
         loadGeospatialModule(state),
     ]);
+    if (!isGeospatialApplyCurrent(state, generation)) return null;
     if (!state.webglMesh) {
         if (rendererUsesLegacyWebGL(state.renderer) || rendererUsesForcedWebGL(state)) {
             if (rendererUsesForcedWebGL(state)) ensureBackdropSkyRenderer(state);
@@ -561,6 +573,10 @@ async function ensureWebGLSky(state) {
             const textureRenderer = state.backdropRenderer || state.renderer;
             try { loader.setType(textureRenderer); } catch {}
             const textures = loader.load(ASSET_ROOT_URL, (loaded) => {
+                if (state.disposed) {
+                    resolve(null);
+                    return;
+                }
                 assignWebGLAtmosphereTextures(state, loaded);
                 state.skyEnvironmentSignature = '';
                 ensureSkyLightProbe(state, atmosphere, loaded);
@@ -569,8 +585,8 @@ async function ensureWebGLSky(state) {
             assignWebGLAtmosphereTextures(state, textures);
             ensureSkyLightProbe(state, atmosphere, textures);
         }).catch((error) => {
-            console.error('[max.js] geospatial sky texture load failed:', error);
-            throw error;
+            if (!state.disposed) console.error('[max.js] geospatial sky texture load failed:', error);
+            return null;
         });
     } else if ((rendererUsesLegacyWebGL(state.renderer) || rendererUsesForcedWebGL(state)) && state.webglTextures) {
         ensureSkyEnvironmentCapture(state, atmosphere, geospatial);
@@ -581,22 +597,46 @@ async function ensureWebGLSky(state) {
     return { atmosphere, geospatial };
 }
 
-async function ensureNodeSky(state) {
-    // WebGPU path: pull ONLY the geodesy math (no WebGL atmosphere/postprocessing).
-    const geospatial = await loadGeospatialModule(state);
-    const { atmosphereWebGPU, tsl } = await loadNodeModules(state);
+function clearNodeSky(state) {
+    if (state.scene.backgroundNode === state.nodeBackground) state.scene.backgroundNode = null;
+    if (state.scene.environmentNode === state.nodeEnvironment) state.scene.environmentNode = null;
+    if (state.renderer?.contextNode === state.nodeRendererContextNode) {
+        state.renderer.contextNode = state.previousRendererContextNode;
+    }
+    try { state.nodeContext?.dispose?.(); } catch {}
+    try { state.nodeBackground?.dispose?.(); } catch {}
+    if (state.nodeBackgroundBase !== state.nodeBackground) {
+        try { state.nodeBackgroundBase?.dispose?.(); } catch {}
+    }
+    try { state.nodeEnvironment?.dispose?.(); } catch {}
+    state.nodeContext = null;
+    state.nodeBackgroundBase = null;
+    state.nodeBackground = null;
+    state.nodeEnvironment = null;
+    state.nodeGeospatial = null;
+    state.nodeRendererContextNode = null;
+    state.previousRendererContextNode = null;
+}
 
-    removeWebGPUIncompatibleObjects(state);
+async function ensureNodeSky(state, generation) {
+    // WebGPU path: pull ONLY the geodesy math (no WebGL atmosphere/postprocessing).
+    const [geospatial, { atmosphereWebGPU, tsl }] = await Promise.all([
+        loadGeospatialModule(state),
+        loadNodeModules(state),
+    ]);
+    if (!isGeospatialApplyCurrent(state, generation)) return null;
 
     if (!state.nodeContext) {
         state.nodeContext = new atmosphereWebGPU.AtmosphereContext();
         state.nodeContext.camera = state.camera || undefined;
 
-        const previousContextValue = state.renderer.contextNode?.value || {};
-        state.renderer.contextNode = tsl.context({
+        state.previousRendererContextNode = state.renderer.contextNode ?? null;
+        const previousContextValue = state.previousRendererContextNode?.value || {};
+        state.nodeRendererContextNode = tsl.context({
             ...previousContextValue,
             getAtmosphere: () => state.nodeContext,
         });
+        state.renderer.contextNode = state.nodeRendererContextNode;
     }
 
     if (!state.nodeBackground) {
@@ -607,6 +647,7 @@ async function ensureNodeSky(state) {
         state.nodeEnvironment = atmosphereWebGPU.skyEnvironment(64);
     }
 
+    removeWebGPUIncompatibleObjects(state);
     if (state.scene.backgroundNode !== state.nodeBackground) {
         state.scene.backgroundNode = state.nodeBackground;
     }
@@ -619,17 +660,14 @@ async function ensureNodeSky(state) {
 }
 
 function isNodeRenderer(state) {
+    if (state.nodeSkyFallback) return false;
     const label = String(state.backendLabel || state.renderer?.userData?.maxjsBackendLabel || '');
     if (label) return label === 'WebGPU';
     return state.renderer?.backend?.isWebGPUBackend === true;
 }
 
-function applyCommonState(state, params, camera) {
-    state.params = params || {};
-    state.camera = camera || state.camera || null;
-    state.active = true;
-    state.visible = true;
-    const exposure = numberOr(state.params.exposure, 0.5);
+function applySkyExposureState(state, params) {
+    const exposure = numberOr(params?.exposure, 0.5);
     // Node (TSL) sky needs its own luminance boost; changing renderer exposure
     // would brighten the authored scene too. WebGL2 uses the SkyMaterial patch.
     if (isNodeRenderer(state)) {
@@ -639,6 +677,14 @@ function applyCommonState(state, params, camera) {
         state.skyExposure = exposure * WEBGL_ATMOSPHERE_EXPOSURE_BOOST;
         state.renderer.toneMappingExposure = exposure;
     }
+}
+
+function applyCommonState(state, params, camera) {
+    state.params = params || {};
+    state.camera = camera || state.camera || null;
+    state.active = true;
+    state.visible = true;
+    applySkyExposureState(state, state.params);
 }
 
 function applyWebGLState(state, params, camera) {
@@ -751,6 +797,8 @@ export function createGeospatialSkyController({ scene, renderer, backendLabel = 
         renderer,
         backendLabel,
         fallbackBackground,
+        disposed: false,
+        applyGeneration: 0,
         active: false,
         visible: true,
         backgroundVisible: true,
@@ -780,20 +828,31 @@ export function createGeospatialSkyController({ scene, renderer, backendLabel = 
         backdropCamera: null,
         backdropMesh: null,
         backdropTexture: null,
+        nodeSkyFallback: false,
+        nodeSkyFallbackWarned: false,
         nodeContext: null,
         nodeBackgroundBase: null,
         nodeBackground: null,
         nodeEnvironment: null,
         nodeGeospatial: null,
+        nodeRendererContextNode: null,
+        previousRendererContextNode: null,
         sunLight: null,
         fillLight: null,
         skyExposure: 1,
     };
 
     function apply(params, { camera, throwOnError = false } = {}) {
+        if (state.disposed) {
+            const error = new Error('geospatial sky controller is disposed');
+            if (throwOnError) return Promise.reject(error);
+            return Promise.resolve(null);
+        }
+        const generation = ++state.applyGeneration;
         applyCommonState(state, params, camera);
         const finish = (promise, label) => {
             const handled = promise.catch((error) => {
+                if (!isGeospatialApplyCurrent(state, generation)) return null;
                 state.active = false;
                 console.error(`[max.js] ${label} failed:`, error);
                 if (throwOnError) throw error;
@@ -803,13 +862,39 @@ export function createGeospatialSkyController({ scene, renderer, backendLabel = 
             return handled;
         };
         if (isNodeRenderer(state)) {
+            const nodeAttempt = ensureNodeSky(state, generation)
+                .then((result) => {
+                    if (!result || !isGeospatialApplyCurrent(state, generation)) return null;
+                    applyNodeState(state, state.params, state.camera);
+                    return result;
+                })
+                .catch(async (error) => {
+                    if (!isGeospatialApplyCurrent(state, generation)) return null;
+                    if (!state.nodeSkyFallbackWarned) {
+                        state.nodeSkyFallbackWarned = true;
+                        console.warn('[max.js] Takram node sky is incompatible with this Three.js build; using the physical WebGL atmosphere backdrop.', error);
+                    }
+                    state.nodeSkyFallback = true;
+                    clearNodeSky(state);
+                    // The first apply entered with the node exposure scale. Once
+                    // fallback owns the render, recompute the WebGL backdrop scale.
+                    applySkyExposureState(state, state.params);
+                    const result = await ensureWebGLSky(state, generation);
+                    if (!result || !isGeospatialApplyCurrent(state, generation)) return null;
+                    applyWebGLState(state, state.params, state.camera);
+                    return result;
+                });
             return finish(
-                ensureNodeSky(state).then(() => applyNodeState(state, state.params, state.camera)),
-                'geospatial node sky',
+                nodeAttempt,
+                'geospatial compatibility sky',
             );
         }
         return finish(
-            ensureWebGLSky(state).then(() => applyWebGLState(state, state.params, state.camera)),
+            ensureWebGLSky(state, generation).then((result) => {
+                if (!result || !isGeospatialApplyCurrent(state, generation)) return null;
+                applyWebGLState(state, state.params, state.camera);
+                return result;
+            }),
             'geospatial WebGL sky',
         );
     }
@@ -858,30 +943,23 @@ export function createGeospatialSkyController({ scene, renderer, backendLabel = 
     }
 
     function dispose() {
+        state.disposed = true;
+        state.applyGeneration += 1;
         state.active = false;
         if (state.webglMesh?.parent) state.webglMesh.parent.remove(state.webglMesh);
         if (state.skyLightProbe?.parent) state.skyLightProbe.parent.remove(state.skyLightProbe);
         disposeSkyEnvironmentCapture(state);
-        if (state.scene.backgroundNode === state.nodeBackground) state.scene.backgroundNode = null;
-        if (state.scene.environmentNode === state.nodeEnvironment) state.scene.environmentNode = null;
+        clearNodeSky(state);
         if (state.sunLight?.parent) state.sunLight.parent.remove(state.sunLight);
         if (state.sunLight?.target?.parent) state.sunLight.target.parent.remove(state.sunLight.target);
         if (state.fillLight?.parent) state.fillLight.parent.remove(state.fillLight);
         try { state.webglMesh?.geometry?.dispose?.(); } catch {}
         try { state.webglMaterial?.dispose?.(); } catch {}
-        try { state.nodeContext?.dispose?.(); } catch {}
-        try { state.nodeBackgroundBase?.dispose?.(); } catch {}
-        try { state.nodeEnvironment?.dispose?.(); } catch {}
         disposeBackdropSky(state);
         state.webglMesh = null;
         state.webglMaterial = null;
         state.skyLightProbe = null;
         state.webglTextures = null;
-        state.nodeContext = null;
-        state.nodeBackgroundBase = null;
-        state.nodeBackground = null;
-        state.nodeEnvironment = null;
-        state.nodeGeospatial = null;
         state.backdropTexture = null;
         state.sunLight = null;
         state.fillLight = null;

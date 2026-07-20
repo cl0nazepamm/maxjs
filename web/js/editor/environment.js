@@ -117,9 +117,13 @@ function createEnvironment(deps = {}) {
             return !!(deps.localHdriReflectionOnly && isNativeWebGPUBackend() && isLocalHdriActive() && !deps.hasAuthoredEnvironmentActive());
         }
         function applyHdriReflectionOnlyState({ markOutput = false } = {}) {
-            const active = isHdriReflectionOnlyEffective();
-            deps.scene.userData.maxjsHdriReflectionOnly = active;
-            deps.maxjsHdriDiffuseIntensity.value = active ? 0.0 : 1.0;
+            const hdriReflectionOnly = isHdriReflectionOnlyEffective();
+            const spectralSkyDdgiOwnsDiffuse = isNativeWebGPUBackend()
+                && deps.scene.userData.maxjsSpectralSkyDdgiOwnsDiffuse === true;
+            deps.scene.userData.maxjsHdriReflectionOnly = hdriReflectionOnly;
+            // HALO's sky is occlusion-aware diffuse lighting. Keep the PMREM for
+            // glossy reflections, but do not also inject its flat diffuse IBL.
+            deps.maxjsHdriDiffuseIntensity.value = hdriReflectionOnly || spectralSkyDdgiOwnsDiffuse ? 0.0 : 1.0;
             deps.applyLightProbeState();
             if (markOutput) {
                 deps.markLightProbeMaterialsDirty();

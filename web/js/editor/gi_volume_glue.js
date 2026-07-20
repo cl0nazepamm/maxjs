@@ -973,6 +973,18 @@ function createGiVolumeGlue(deps = {}) {
             try {
                 let haloOn = haloGiSettings.enabled === true;
                 let haloField = null;
+                let haloSkyInput = null;
+                let haloSkyIntensity = 2.0;
+                const syncHaloSkyState = () => {
+                    haloField?.setSky?.(haloSkyInput);
+                    haloField?.setSkyIntensity?.(haloSkyIntensity);
+                    const ownsDiffuse = haloOn
+                        && haloSkyInput != null
+                        && haloField?.isSupported?.() === true
+                        && !deps.isPathTracingMode;
+                    deps.setSpectralSkyDiffuseOwnership?.(ownsDiffuse);
+                    return ownsDiffuse;
+                };
                 const createConfiguredHaloField = () => createHaloProbeField({
                     renderer: deps.renderer,
                     scene: deps.scene,
@@ -998,6 +1010,7 @@ function createGiVolumeGlue(deps = {}) {
                         haloField.setEnabled(true);
                         haloField.requestRebuild();
                     }
+                    syncHaloSkyState();
                     markLightProbeMaterialsDirty();
                     updateProbeHelpers();
                     return haloField;
@@ -1015,6 +1028,7 @@ function createGiVolumeGlue(deps = {}) {
                         if (applySettings) applyHaloGiTuning(haloField);
                         haloField.setEnabled(true);
                         haloField.requestRebuild();
+                        syncHaloSkyState();
                         // The fold-in recompile is forced by the field's onRebuilt hook
                         // (markLightProbeMaterialsDirty) the moment the first rebuild
                         // produces probe data — same frame the data exists, not a rebuild
@@ -1027,6 +1041,7 @@ function createGiVolumeGlue(deps = {}) {
                         haloGiSettings.enabled = false;
                         if (applySettings) applyHaloGiTuning(haloField);
                         haloField.setEnabled(false);
+                        syncHaloSkyState();
                         markLightProbeMaterialsDirty(); // one-shot: drop the probe node from the lights graph this frame
                         window.__maxjsSyncGiPanel?.();
                     },
@@ -1040,6 +1055,14 @@ function createGiVolumeGlue(deps = {}) {
                         return true;
                     },
                     hasRoughReflections: () => haloField?.hasRoughReflections?.() === true,
+                    setSky(input, { intensity = haloSkyIntensity } = {}) {
+                        haloSkyInput = input ?? null;
+                        if (Number.isFinite(Number(intensity))) haloSkyIntensity = Math.max(0, Number(intensity));
+                        return syncHaloSkyState();
+                    },
+                    getSky: () => haloSkyInput,
+                    getSkyIntensity: () => haloSkyIntensity,
+                    syncSkyState: syncHaloSkyState,
                     setReflectionIntensity: (v) => setHaloGiSetting('reflectionIntensity', v),
                     setIntensity: (v) => setHaloGiSetting('intensity', v),
                     setDivisions: (v) => setHaloGiSetting('divisions', v),
@@ -1084,6 +1107,7 @@ function createGiVolumeGlue(deps = {}) {
                 if (haloOn) deps.haloGi.enable({ applySettings: false });
             } catch (err) {
                 deps.maxjsDebugWarn?.('max.js HALO-GI init failed:', err);
+                deps.setSpectralSkyDiffuseOwnership?.(false);
                 deps.haloGi = null;
             }
         }

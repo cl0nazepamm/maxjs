@@ -43,7 +43,9 @@ function createSky(deps = {}) {
         const skyLinkedSunPosition = new THREE.Vector3();
         const skyLinkedSunTarget = new THREE.Vector3();
         const skySunDirectionScratch = new THREE.Vector3();
+        const skyGiSunDirectionScratch = new THREE.Vector3();
         const SKY_MODEL_PLANETARY = 1;
+        const SPECTRAL_GI_SKY_INTENSITY = 2.0;
         const SKY_DEFAULTS = Object.freeze({
             turbidity: 10,
             rayleigh: 3,
@@ -56,10 +58,11 @@ function createSky(deps = {}) {
             showSunDisc: true,
             cameraAltitude: 1200,
         });
-        // Geospatial sky is supported by WebGPU and plain WebGL. Keep it out of
-        // Force WebGL because that TSL path conflicts with post effects.
+        // Geospatial sky supports native WebGPU, plain WebGL, and TSL_GL. The
+        // controller selects its compatible physical-atmosphere path per backend.
         const useLegacySky = !(deps.renderer instanceof THREE.WebGPURenderer);
         const allowGeospatialSky = deps.rendererBackendLabel === 'WebGPU'
+            || deps.rendererBackendLabel === 'TSL_GL'
             || String(deps.rendererBackendLabel || '').startsWith('WebGL');
 
         function addSkyProbeSample(direction, radiance, weight) {
@@ -138,7 +141,10 @@ function createSky(deps = {}) {
         }
 
         function updateSkyPathTraceEnvironment(params, sunDir) {
-            if (!deps.isPathTracingMode) return;
+            if (!deps.isPathTracingMode) {
+                disposeSkyPathTraceEnvironment();
+                return;
+            }
             const canvas = document.createElement('canvas');
             canvas.width = 384;
             canvas.height = 192;
@@ -300,6 +306,46 @@ function createSky(deps = {}) {
             return params;
         }
 
+        // Match Speedball's DDGI sky: a low-frequency, sun-free dome that only
+        // enters probe miss rays. The directional light owns the sun itself.
+        function buildSpectralGiSky(params) {
+            const sunDirection = getSkySunDirectionWorld(params, skyGiSunDirectionScratch);
+            const elevation = THREE.MathUtils.clamp(
+                THREE.MathUtils.radToDeg(Math.asin(THREE.MathUtils.clamp(sunDirection.y, -1, 1))),
+                0,
+                88,
+            );
+            const sunUp = THREE.MathUtils.clamp(Math.sin(THREE.MathUtils.degToRad(elevation)), 0, 1);
+            const daylight = Math.sqrt(sunUp);
+            const rayleigh = THREE.MathUtils.clamp(skyNumber(params?.rayleigh, 3) / 8, 0, 1);
+            const turbidity = THREE.MathUtils.clamp(skyNumber(params?.turbidity, 10) / 20, 0, 1);
+            const haze = THREE.MathUtils.clamp((1 - daylight) * 0.65 + turbidity * 0.35, 0, 1);
+
+            return {
+                zenith: new THREE.Color(
+                    0.10 + 0.12 * rayleigh,
+                    0.20 + 0.20 * rayleigh,
+                    0.42 + 0.34 * rayleigh,
+                ).multiplyScalar(0.18 + 0.62 * daylight),
+                horizon: new THREE.Color(
+                    0.34 + 0.34 * haze,
+                    0.39 + 0.18 * daylight,
+                    0.48 + 0.24 * daylight,
+                ).multiplyScalar(0.16 + 0.50 * daylight),
+                ground: new THREE.Color(0.10, 0.085, 0.065).multiplyScalar(0.06 + 0.16 * daylight),
+            };
+        }
+
+        function syncSpectralGiSky(params) {
+            if (!deps.isStudioMode || !deps.haloGi?.setSky) return false;
+            if (!params || params.model === SKY_MODEL_PLANETARY) {
+                deps.haloGi.setSky(null);
+                return false;
+            }
+            deps.haloGi.setSky(buildSpectralGiSky(params), { intensity: SPECTRAL_GI_SKY_INTENSITY });
+            return true;
+        }
+
         function getSkySunDirectionWorld(params, target = skySunDirectionScratch) {
             if (Array.isArray(params?.sunDirectionWorld)) {
                 target.set(
@@ -421,6 +467,7 @@ function createSky(deps = {}) {
             lastSkySourceParams = skyParams;
 
             const params = normalizeSkyParams(withLinkedSkySun(skyParams));
+            syncSpectralGiSky(params);
             const sig = JSON.stringify(params);
             if (sig === lastSkySig) {
                 if (!deps.hasLightProbeData) refreshSkyAmbientLightProbeFromCurrentSky();
@@ -441,7 +488,7 @@ function createSky(deps = {}) {
 
                     deps.clearCurrentHdriEnvMap();
                     disposeSkyReflectionEnvironment();
-                    disposeSkyPathTraceEnvironment();
+                    updateSkyPathTraceEnvironment(params, getSkySunDirectionWorld(params, skySunDirectionScratch));
                     deps.scene.environment = null;
                     deps.scene.environmentIntensity = 1.0;
                     deps.syncMaterialEnvMaps();
@@ -531,7 +578,7 @@ function createSky(deps = {}) {
                     skyFillLight.userData.volumetricBypass = true;
                 }
                 if (skyFillLight.parent !== deps.scene) deps.scene.add(skyFillLight);
-                skyFillLight.intensity = 0.5 + sunStrength * 0.5;
+                skyFillLight.intensity = deps.isStudioMode ? 0.05 : 0.5 + sunStrength * 0.5;
 
                 deps.syncDefaultLightsVisibility();
                 updateSkyAmbientLightProbe(params, sunDir);
@@ -561,6 +608,20 @@ function createSky(deps = {}) {
             if (skyFillLight?.parent) skyFillLight.parent.remove(skyFillLight);
             disposeSkyReflectionEnvironment();
             disposeSkyPathTraceEnvironment();
+            syncSpectralGiSky(null);
+        }
+
+        function refreshSkyForSpectralView() {
+            if (!deps.isStudioMode) return false;
+            if (!deps.skyActive || !lastSkySourceParams) {
+                syncSpectralGiSky(null);
+                return false;
+            }
+            // Probe view needs the PMREM for reflections; Trace needs the raw
+            // equirectangular texture. Re-run even when sky params are unchanged.
+            lastSkySig = '';
+            applySky(lastSkySourceParams);
+            return true;
         }
 
         return {
@@ -577,6 +638,8 @@ function createSky(deps = {}) {
             hasAuthoredEnvironmentActive,
             restoreAuthoredEnvironmentAfterLocalHDRIChange,
             normalizeSkyParams,
+            buildSpectralGiSky,
+            syncSpectralGiSky,
             getSkySunDirectionWorld,
             isSkyLinkCandidateLight,
             getDirectionalLightSunVector,
@@ -588,6 +651,7 @@ function createSky(deps = {}) {
             removeClassicSkyObjects,
             applySky,
             removeSky,
+            refreshSkyForSpectralView,
         };
 }
 

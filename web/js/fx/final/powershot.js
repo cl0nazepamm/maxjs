@@ -246,7 +246,7 @@ export function createPowerShotFinal({
         p.analogScanlines = THREE.MathUtils.clamp(finiteOr(p.analogScanlines, 0.54), 0, 3);
         p.analogHeadSwitch = THREE.MathUtils.clamp(finiteOr(p.analogHeadSwitch, 0.42), 0, 3);
         p.filmStock = normalizePowerShotFilmStock(p.filmStock);
-        p.filmExposure = THREE.MathUtils.clamp(finiteOr(p.filmExposure, 0), -3, 3);
+        p.filmExposure = THREE.MathUtils.clamp(finiteOr(p.filmExposure, 0), -12, 12);
         p.filmInputGamma = THREE.MathUtils.clamp(finiteOr(p.filmInputGamma, 0.65), 0.5, 1.5);
         p.filmGrain = THREE.MathUtils.clamp(finiteOr(p.filmGrain, 1.0), 0, 3);
         p.filmGrainSize = THREE.MathUtils.clamp(finiteOr(p.filmGrainSize, 1.6), 0.5, 4);
@@ -262,7 +262,7 @@ export function createPowerShotFinal({
         p.filmFlicker = THREE.MathUtils.clamp(finiteOr(p.filmFlicker, 0.12), 0, 1);
         p.filmNegative = !!p.filmNegative;
         p.infraredPreset = normalizePowerShotInfraredPreset(p.infraredPreset);
-        p.irExposure = THREE.MathUtils.clamp(finiteOr(p.irExposure, 0.85), -8, 8);
+        p.irExposure = THREE.MathUtils.clamp(finiteOr(p.irExposure, 0.85), -12, 12);
         p.irInputGamma = THREE.MathUtils.clamp(finiteOr(p.irInputGamma, 1.0), 0.35, 2);
         p.irResponse = THREE.MathUtils.clamp(finiteOr(p.irResponse, 0), 0, 1);
         p.irLocalGain = THREE.MathUtils.clamp(finiteOr(p.irLocalGain, 0.46), 0, 1.5);

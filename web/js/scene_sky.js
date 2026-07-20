@@ -70,7 +70,7 @@ export function createSky({ scene, renderer, allowGeospatialSky = true } = {}) {
     const rendererBackendLabel = String(renderer?.userData?.maxjsBackendLabel || '');
     const useLegacySky = !isWebGpuRenderer;
     const allowGeospatialSkyRuntime = allowGeospatialSky && (rendererBackendLabel
-        ? rendererBackendLabel === 'WebGPU' || rendererBackendLabel.startsWith('WebGL')
+        ? rendererBackendLabel === 'WebGPU' || rendererBackendLabel === 'TSL_GL' || rendererBackendLabel.startsWith('WebGL')
         : isWebGpuRenderer);
     const linkedSunDirection = new THREE.Vector3();
     const linkedSunPosition = new THREE.Vector3();

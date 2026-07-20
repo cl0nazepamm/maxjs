@@ -36,6 +36,8 @@ function createPathTracingGlue(deps = {}) {
             } else {
                 leavePathTracingView();
             }
+            const skyChanged = deps.refreshSkyForSpectralView?.() === true;
+            if (deps.isPathTracingMode && skyChanged) markPathTracingSceneDirtyNow();
             window.__maxjsSyncSpectralViewUi?.();
             if (window.chrome?.webview) sendPathTracingRuntimeState();
             return deps.spectralView;
@@ -168,7 +170,7 @@ function createPathTracingGlue(deps = {}) {
         }
 
         function sendPathTracingRuntimeState() {
-            deps.bridge.send('pathtracing_settings', {
+            deps.bridge?.send?.('pathtracing_settings', {
                 samplesPerFrame: deps.pathTracingSettings.samplesPerFrame,
                 giClamp: deps.pathTracingSettings.giClamp,
                 freezeSync: deps.pathTracingSettings.freezeSync,

@@ -5,6 +5,53 @@ All notable changes to Speedball GI are documented here. This project follows
 
 ## [Unreleased]
 
+- Added a deform fast path so same-topology vertex animation (streamed vertex
+  buffers, CPU skinning, morph bakes) never triggers the ~200 ms synchronous
+  MeshBVH rebuild. `built.updateDeforms()` re-gathers the deformed BLAS's
+  slice of the pooled vertex data from the live attributes and refits the
+  flattened node bounds in place (`gi_refit.js` — reverse pre-order walk over
+  the threaded layout; the tree structure stays build-time), then rewrites the
+  instance/TLAS tail via the existing `updateTransforms` path. The probe field
+  now splits its reactivity signatures: STRUCTURE (counts + index identity →
+  debounced full rebuild) no longer hashes `position.version`; a new DEFORM
+  signature (`position`/`normal` versions, checked every 12 idle ticks) routes
+  vertex motion to the in-place refit and re-uploads only the touched buffer
+  ranges (`updateRanges` when the three build supports them). Previously any
+  pause in a vertex stream (scrub stop, frame step, held pose, animation end)
+  armed the settle debounce and landed a full-scene MeshBVH rebuild on the
+  render thread — a repeating ~200 ms hitch during skinned-mesh workflows. GI
+  also tracks the deforming pose continuously now instead of only after the
+  stream settles. SkinnedMesh objects are excluded from all geometry
+  signatures, mirroring their exclusion from the BVH build, so GPU-skinned
+  meshes can never schedule pointless rebuilds. Temporal policy is untouched:
+  deform refreshes re-converge through the bounded per-texel change detector,
+  no reactive burst.
+
+## [0.6.6] — 2026-07-20
+
+- Made hysteresis normalization variance-bounded: the time-normalization exponent
+  now clamps at 1, so one update can never blend in more fresh Monte-Carlo noise
+  than the slider admits at 60 Hz — for every policy branch (diffuse noise/change,
+  depth, rough, glossy) and every service cadence. 0.6.5 removed this bound to
+  keep per-second decay exactly rate-invariant; the cost was sparse service (low
+  frame rates, throttled ray budgets, large-grid round-robin revisits, alternating
+  cascades) blending most of a fresh noisy ray set per revisit — the field
+  dissolved into flicker exactly when the machine was struggling. Sparse service
+  now converges slower in wall-clock instead of noisier; at and above 60 Hz the
+  per-second decay remains rate-invariant and high-refresh exponents stay
+  unclamped.
+- Removed the global reactive/low-hysteresis burst. Light, sky, transform, and
+  trace-side-knob edits no longer drop history authority for ~1.25 s — that read
+  as "flicker for a second, then settle" (a visible fade-out/in on every slider
+  touch). The temporal policy is constant at all times; edits re-converge through
+  the bounded per-texel change detector, so a change transitions smoothly at the
+  steady rate instead of pumping. `advanceReactiveTicks` (a debug/test helper
+  export, never part of the package entry point) is gone.
+- `setDepthSharpness` now accepts 0 (uniform-ish depth weighting; internally
+  floored at 0.01 because `pow(0,0)` is indeterminate in WGSL and would poison
+  the depth history with NaN). Demo defaults retuned: depth sharpness 0,
+  Chebyshev strength 0.8.
+
 ## [0.6.5] — 2026-07-20
 
 - Fixed hysteresis normalization across render rates. Adaptive diffuse and depth

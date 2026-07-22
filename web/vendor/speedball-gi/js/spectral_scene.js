@@ -6,7 +6,11 @@
 // world-AABBs packed into the tail of the materials buffer. Materials are
 // deduped into a flat uber table. Moving objects ride
 // built.updateTransforms() — an in-place instance/TLAS rewrite that needs no
-// soup rewrite, no MeshBVH rebuild, and no shader recompile.
+// soup rewrite, no MeshBVH rebuild, and no shader recompile. DEFORMING
+// objects (streamed vertex buffers, morphs, CPU skinning — same topology)
+// ride built.updateDeforms() — re-gather the deformed BLAS's pooled vertex
+// slice + in-place bounds refit (gi_refit.js) + the same TLAS rewrite, so a
+// vertex-animated mesh never forces the synchronous MeshBVH rebuild.
 //
 // Output is plain typed arrays + counts; spectral_kernel turns them into
 // StorageBufferAttributes. Nothing here touches the GPU.
@@ -19,6 +23,7 @@
 // buildMaterialTextures below.
 
 import { MeshBVH } from 'three-mesh-bvh';
+import { refitFlatBlasRange } from './gi_refit.js';
 
 const NODE_STRIDE_U32 = 8;     // bvhNodes: 6 aabb floats + miss + payload
 // materials stride (floats). Layout:
@@ -593,6 +598,10 @@ function buildLocalBlas(THREE, d) {
     const vertexUV = new Float32Array(totalV * 2);
     const vertexMaterial = new Uint32Array(totalV);
     const triIndex = new Uint32Array(d.visibleTriCount * 3);
+    // tag vertex t duplicates SOURCE vertex tagSrc[t] (the triangle's first
+    // index) — kept so updateDeforms can re-copy the duplicates after a
+    // deform gather. 0xFFFFFFFF = skipped triangle (never referenced).
+    const tagSrc = d.uniqueTriMaterial ? new Uint32Array(d.visibleTriCount).fill(0xFFFFFFFF) : null;
     for (let i = 0; i < vCount; i++) {
         const o = i * VERT_STRIDE;
         vertexPos[o] = pos.getX(i); vertexPos[o + 1] = pos.getY(i); vertexPos[o + 2] = pos.getZ(i);
@@ -610,6 +619,7 @@ function buildLocalBlas(THREE, d) {
         const sourceTri = d.visibleTriIndices ? d.visibleTriIndices[t] : t;
         if (sourceTri < 0 || sourceTri >= d.triCount) continue;
         const sourceA = index ? index.getX(sourceTri * 3) : sourceTri * 3;
+        if (tagSrc) tagSrc[t] = sourceA;
         const a = d.uniqueTriMaterial ? tagBase + t : sourceA;
         const b = index ? index.getX(sourceTri * 3 + 1) : sourceTri * 3 + 1;
         const c = index ? index.getX(sourceTri * 3 + 2) : sourceTri * 3 + 2;
@@ -642,7 +652,7 @@ function buildLocalBlas(THREE, d) {
     // the material rides the triangle's first vertex through the permutation).
     const triMaterial = new Uint32Array(d.visibleTriCount);
     for (let t = 0; t < d.visibleTriCount; t++) triMaterial[t] = vertexMaterial[triIndex[t * 3]] >>> 0;
-    return { vertexPos, vertexNormal, vertexUV, triIndex, triMaterial, records, localBounds, vertCount: totalV, triCount: d.visibleTriCount };
+    return { vertexPos, vertexNormal, vertexUV, triIndex, triMaterial, records, localBounds, vertCount: totalV, triCount: d.visibleTriCount, srcVertCount: vCount, tagSrc };
 }
 
 // Threaded TLAS over instance world-AABBs. Median split by index midpoint on
@@ -739,6 +749,12 @@ export async function buildSpectralScene({ THREE, scene, camera = null, maxTrian
                 uv: geom.attributes.uv || null,
             });
             if (!blas) return;
+            // Deform tracking: soup vertices [0, srcVertCount) map 1:1 onto the
+            // source geometry's vertices, so updateDeforms can re-gather this
+            // BLAS's pooled slice straight from the live attributes.
+            blas.srcGeom = geom;
+            blas.srcPosVersion = pos.version | 0;
+            blas.srcNormVersion = geom.attributes.normal ? (geom.attributes.normal.version | 0) : -1;
             blasIdx = blasList.length;
             blasList.push(blas);
             blasByKey.set(key, blasIdx);
@@ -912,6 +928,78 @@ export async function buildSpectralScene({ THREE, scene, camera = null, maxTrian
         return { bounds: dyn.worldBounds.clone() };
     }
 
+    // Deform fast path: SAME topology, moved vertices (streamed vertex
+    // buffers, morphs, CPU skinning). For each BLAS whose source position/
+    // normal attribute version moved: re-gather its slice of the pooled
+    // vertexData from the live attributes, refit its flat node bounds in
+    // place (gi_refit.js — the tree structure stays build-time), then rewrite
+    // the instance/TLAS tail from the new local bounds. No MeshBVH build, no
+    // allocation, no recompile — this is what keeps a 60 Hz vertex stream
+    // from ever needing the ~200 ms synchronous rebuild.
+    // Returns null when a source geometry's vertex count/layout changed under
+    // us (the soup is invalid → caller must full-rebuild), else
+    // { refitted, bounds, vertRanges, nodeRanges } where the ranges are
+    // [start, count] in ELEMENT units of vertexData / bvhNodes — pass them as
+    // updateRanges to bound the GPU re-upload to the deformed slices.
+    function updateDeforms() {
+        let refitted = 0;
+        const vertRanges = [], nodeRanges = [];
+        for (const b of blasList) {
+            const geom = b.srcGeom;
+            const posA = geom?.attributes?.position;
+            if (!posA) return null;
+            const normA = geom.attributes.normal || null;
+            const pv = posA.version | 0;
+            const nv = normA ? (normA.version | 0) : -1;
+            if (pv === b.srcPosVersion && nv === b.srcNormVersion) continue;
+            if (posA.count !== b.srcVertCount || (normA && normA.count !== b.srcVertCount)) return null;
+            for (let i = 0; i < b.srcVertCount; i++) {
+                const dd = (b.vertBase + i) * VERTEX_DATA_STRIDE;
+                vertexData[dd] = posA.getX(i);
+                vertexData[dd + 1] = posA.getY(i);
+                vertexData[dd + 2] = posA.getZ(i);
+                if (normA) {
+                    vertexData[dd + 3] = normA.getX(i);
+                    vertexData[dd + 4] = normA.getY(i);
+                    vertexData[dd + 5] = normA.getZ(i);
+                }
+                // normal attribute gone since build → keep the build-time
+                // normals (stale beats zero/flat for a low-frequency field)
+            }
+            if (b.tagSrc) {
+                const tagBase = b.vertBase + b.srcVertCount;
+                for (let t = 0; t < b.tagSrc.length; t++) {
+                    const s = b.tagSrc[t];
+                    if (s === 0xFFFFFFFF) continue;
+                    const dd = (tagBase + t) * VERTEX_DATA_STRIDE, ds = (b.vertBase + s) * VERTEX_DATA_STRIDE;
+                    vertexData[dd] = vertexData[ds];
+                    vertexData[dd + 1] = vertexData[ds + 1];
+                    vertexData[dd + 2] = vertexData[ds + 2];
+                    vertexData[dd + 3] = vertexData[ds + 3];
+                    vertexData[dd + 4] = vertexData[ds + 4];
+                    vertexData[dd + 5] = vertexData[ds + 5];
+                }
+            }
+            if (!refitFlatBlasRange({
+                nodesF, nodesU, triIndex, vertexData,
+                root: b.blasRoot, end: b.blasEnd,
+                nodeStrideU32: NODE_STRIDE_U32, vertexDataStride: VERTEX_DATA_STRIDE,
+            })) return null;
+            b.srcPosVersion = pv;
+            b.srcNormVersion = nv;
+            const rb = b.blasRoot * NODE_STRIDE_U32;
+            b.localBounds.min.set(nodesF[rb], nodesF[rb + 1], nodesF[rb + 2]);
+            b.localBounds.max.set(nodesF[rb + 3], nodesF[rb + 4], nodesF[rb + 5]);
+            vertRanges.push([b.vertBase * VERTEX_DATA_STRIDE, b.vertCount * VERTEX_DATA_STRIDE]);
+            nodeRanges.push([b.blasRoot * NODE_STRIDE_U32, (b.blasEnd - b.blasRoot) * NODE_STRIDE_U32]);
+            refitted++;
+        }
+        if (refitted === 0) return { refitted: 0, bounds: null, vertRanges, nodeRanges };
+        const res = updateTransforms(); // instance rows + TLAS from the refit local bounds
+        if (!res) return null;
+        return { refitted, bounds: res.bounds, vertRanges, nodeRanges };
+    }
+
     // Lights
     const lightRecords = collectLights(THREE, scene, camera);
     const lights = new Float32Array(Math.max(1, lightRecords.length) * LIGHT_STRIDE);
@@ -932,6 +1020,7 @@ export async function buildSpectralScene({ THREE, scene, camera = null, maxTrian
         materials, materialCount: uberList.length,
         instBase, instCount, tlasBase, tlasNodeCount,
         updateTransforms,
+        updateDeforms,
         lights, lightCount: lightRecords.length,
         env,
         maps, // { albedo, normal, roughness, metalness, emissive, alpha } DataArrayTexture | null

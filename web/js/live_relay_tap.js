@@ -21,9 +21,17 @@
 //   binary POST body: [u32 metaLen LE][metaLen bytes of meta JSON][payload]
 //   JSON POST body:   {"kind":"msg","data":{...}}
 //
+// Headless mode: while the relay reports at least one connected game
+// consumer, the viewer's requestAnimationFrame is throttled to ~4 fps so the
+// scene is not rendered twice — sync ingestion is event-driven and stays at
+// full rate. Focusing the viewer restores full speed instantly (so editing
+// in the max.js viewport is never sluggish); closing the game tab restores
+// it within one heartbeat.
+//
 // Config (localStorage):
 //   maxjs.liveRelay      'off' disables the tap entirely
 //   maxjs.liveRelayUrl   override, default http://127.0.0.1:5173/maxjs-relay-in
+//   maxjs.headlessAuto   'off' disables render throttling while a game runs
 (() => {
     'use strict';
     const wv = window.chrome?.webview;
@@ -31,12 +39,66 @@
 
     let disabled = false;
     let ingestUrl = '';
+    let headlessAuto = true;
     try {
         disabled = localStorage.getItem('maxjs.liveRelay') === 'off';
         ingestUrl = localStorage.getItem('maxjs.liveRelayUrl') || '';
+        headlessAuto = localStorage.getItem('maxjs.headlessAuto') !== 'off';
     } catch { /* storage unavailable — keep defaults */ }
     if (disabled) return;
     if (!ingestUrl) ingestUrl = 'http://127.0.0.1:5173/maxjs-relay-in';
+
+    // ── Headless render throttle ───────────────────────────────────────
+    // Must be installed before any viewer module captures rAF, which is why
+    // this file stays a classic <head> script. Shim ids are private to the
+    // map so cancelAnimationFrame keeps working for throttled callbacks.
+    const HEADLESS_FRAME_MS = 250;
+    let gameConsumers = 0;
+    let headlessAnnounced = false;
+    const nativeRaf = window.requestAnimationFrame.bind(window);
+    const nativeCancelRaf = window.cancelAnimationFrame.bind(window);
+    const rafHandles = new Map(); // shimId -> { t?: timeoutId, r?: nativeRafId }
+    let nextRafId = 1;
+
+    function headlessActive() {
+        return headlessAuto && gameConsumers > 0 && !document.hasFocus();
+    }
+
+    window.requestAnimationFrame = (callback) => {
+        const id = nextRafId++;
+        const fire = () => {
+            const r = nativeRaf((timestamp) => {
+                rafHandles.delete(id);
+                callback(timestamp);
+            });
+            rafHandles.set(id, { r });
+        };
+        if (headlessActive()) {
+            const t = setTimeout(fire, HEADLESS_FRAME_MS);
+            rafHandles.set(id, { t });
+        } else {
+            fire();
+        }
+        return id;
+    };
+    window.cancelAnimationFrame = (id) => {
+        const handle = rafHandles.get(id);
+        if (!handle) return;
+        rafHandles.delete(id);
+        if (handle.t !== undefined) clearTimeout(handle.t);
+        if (handle.r !== undefined) nativeCancelRaf(handle.r);
+    };
+
+    function setGameConsumers(count) {
+        gameConsumers = count;
+        const active = headlessAuto && gameConsumers > 0;
+        if (active !== headlessAnnounced) {
+            headlessAnnounced = active;
+            console.info(active
+                ? '[live_relay_tap] game connected — viewer rendering throttled (focus viewer for full speed)'
+                : '[live_relay_tap] game disconnected — viewer rendering resumed');
+        }
+    }
 
     const JSON_FORWARD_TYPES = new Set(['env_update']);
     const SKIP_BUFFER_TYPES = new Set(['gi_surface_bin', 'gi_light_bin']);
@@ -137,7 +199,7 @@
     // a game tab open before/after a dev-server restart get the map without
     // restarting the max.js panel.
     setInterval(async () => {
-        if (!lastSceneFrame || pumping || queue.length) return;
+        if (pumping || queue.length) return;
         try {
             const response = await fetch(ingestUrl, {
                 method: 'POST',
@@ -147,7 +209,14 @@
             });
             if (!response.ok) return;
             const status = await response.json();
-            if (status?.needScene) enqueue('scene', lastSceneFrame, 'application/octet-stream');
-        } catch { /* relay down — the next ping retries */ }
+            setGameConsumers(Number(status?.consumers) || 0);
+            if (status?.needScene && lastSceneFrame) {
+                enqueue('scene', lastSceneFrame, 'application/octet-stream');
+            }
+        } catch {
+            // Relay down: no game is consuming — never leave the viewer stuck
+            // in headless against a dead relay.
+            setGameConsumers(0);
+        }
     }, PING_MS);
 })();

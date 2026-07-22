@@ -40,6 +40,7 @@
 
     const JSON_FORWARD_TYPES = new Set(['env_update']);
     const SKIP_BUFFER_TYPES = new Set(['gi_surface_bin', 'gi_light_bin']);
+    const PING_MS = 4000;
     const encoder = new TextEncoder();
 
     const queue = [];          // { key, body, contentType }
@@ -128,4 +129,25 @@
             enqueue(`msg:${data.type}`, JSON.stringify({ kind: 'msg', data }), 'application/json');
         } catch { /* ignore */ }
     });
+
+    // Heartbeat: a relay that restarted while this tap was idle has an empty
+    // scene cache but never sees a failed POST here, so edits after that
+    // would stream deltas for nodes the consumers don't have. Ping and
+    // re-upload the scene when the relay says it lost it — this is what lets
+    // a game tab open before/after a dev-server restart get the map without
+    // restarting the max.js panel.
+    setInterval(async () => {
+        if (!lastSceneFrame || pumping || queue.length) return;
+        try {
+            const response = await fetch(ingestUrl, {
+                method: 'POST',
+                body: JSON.stringify({ kind: 'ping' }),
+                headers: { 'content-type': 'application/json' },
+                cache: 'no-store',
+            });
+            if (!response.ok) return;
+            const status = await response.json();
+            if (status?.needScene) enqueue('scene', lastSceneFrame, 'application/octet-stream');
+        } catch { /* relay down — the next ping retries */ }
+    }, PING_MS);
 })();

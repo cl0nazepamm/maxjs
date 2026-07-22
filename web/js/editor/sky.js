@@ -1,6 +1,7 @@
 // sky.js - procedural sky environment and sky-derived probe state.
 import * as THREE from 'three';
 import * as THREE_STD from 'three-std';
+import { uniform, vec4 } from 'three/tsl';
 import { SkyMesh } from 'three/addons/objects/SkyMesh.js';
 import { Sky } from 'three/addons/objects/Sky.js';
 import { createGeospatialSkyController } from '../geospatial_sky.js';
@@ -32,6 +33,9 @@ function createSky(deps = {}) {
         // SkyMesh (TSL/NodeMaterial) for WebGPU + WebGL2-fallback backends.
         // Legacy Sky (ShaderMaterial) for pure WebGLRenderer — NodeMaterial can't compile there.
         let skyMesh = null;
+        // PostFX owns renderer.toneMappingExposure, so the classic dome carries
+        // its own exposure multiplier (the planetary sky already does the same).
+        const skyDomeExposureUniform = uniform(1.0);
         let skySunLight = null;
         let skyFillLight = null;
         let skyEnvMap = null;
@@ -274,6 +278,13 @@ function createSky(deps = {}) {
             return Number.isFinite(n) ? n : fallback;
         }
 
+        // Linear brightness scale for the dome and the DDGI sky, normalized so
+        // the default spinner value (0.5) keeps the shipped look.
+        function skyExposureScale(params) {
+            const exposure = Math.max(0, skyNumber(params?.exposure, SKY_DEFAULTS.exposure));
+            return exposure / SKY_DEFAULTS.exposure;
+        }
+
         function hasAuthoredEnvironmentActive() {
             return !!(deps.skyActive || deps.currentEnvParams?.hdri);
         }
@@ -320,19 +331,20 @@ function createSky(deps = {}) {
             const rayleigh = THREE.MathUtils.clamp(skyNumber(params?.rayleigh, 3) / 8, 0, 1);
             const turbidity = THREE.MathUtils.clamp(skyNumber(params?.turbidity, 10) / 20, 0, 1);
             const haze = THREE.MathUtils.clamp((1 - daylight) * 0.65 + turbidity * 0.35, 0, 1);
+            const exposureScale = skyExposureScale(params);
 
             return {
                 zenith: new THREE.Color(
                     0.10 + 0.12 * rayleigh,
                     0.20 + 0.20 * rayleigh,
                     0.42 + 0.34 * rayleigh,
-                ).multiplyScalar(0.18 + 0.62 * daylight),
+                ).multiplyScalar((0.18 + 0.62 * daylight) * exposureScale),
                 horizon: new THREE.Color(
                     0.34 + 0.34 * haze,
                     0.39 + 0.18 * daylight,
                     0.48 + 0.24 * daylight,
-                ).multiplyScalar(0.16 + 0.50 * daylight),
-                ground: new THREE.Color(0.10, 0.085, 0.065).multiplyScalar(0.06 + 0.16 * daylight),
+                ).multiplyScalar((0.16 + 0.50 * daylight) * exposureScale),
+                ground: new THREE.Color(0.10, 0.085, 0.065).multiplyScalar((0.06 + 0.16 * daylight) * exposureScale),
             };
         }
 
@@ -520,6 +532,13 @@ function createSky(deps = {}) {
                     skyMesh.name = '__maxjs_sky__';
                     skyMesh.frustumCulled = false;
                     skyMesh.userData.volumetricBoundsBypass = true;
+                    if (!useLegacySky) {
+                        const baseColorNode = skyMesh.material.colorNode;
+                        skyMesh.material.colorNode = vec4(
+                            baseColorNode.rgb.mul(skyDomeExposureUniform),
+                            baseColorNode.a,
+                        );
+                    }
                 }
 
                 const sunDir = getSkySunDirectionWorld(params, skySunDirectionScratch);
@@ -541,8 +560,9 @@ function createSky(deps = {}) {
                     skyMesh.sunPosition.value.copy(sunDir);
                 }
 
-                deps.renderer.toneMappingExposure = params.exposure;
-                // Keep the user-selected Post FX tonemapper/exposure authoritative.
+                // The Post FX tonemapper/exposure stays authoritative for the
+                // frame; sky exposure scales only the dome + probe sky inputs.
+                skyDomeExposureUniform.value = skyExposureScale(params);
                 deps.applyCoreToneMappingState({ markOutput: false });
 
                 if (skyMesh.parent !== deps.scene) deps.scene.add(skyMesh);

@@ -50,7 +50,9 @@ export default {
         if (r.crt) {
             const distortedUV = barrelUV(u.retroCurvatureU);
             beauty = replaceDefaultUV(distortedUV, beauty);
-            beauty = colorBleeding(beauty, u.retroBleedingU);
+            // ownedTexture: colorBleeding() convertToTexture's its input; an
+            // RTT minted inside the factory leaks per rebuild (see fx/core).
+            beauty = colorBleeding(ctx.ownedTexture(beauty), u.retroBleedingU);
         }
 
         // Dither + posterize

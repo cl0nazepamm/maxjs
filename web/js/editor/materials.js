@@ -14,6 +14,7 @@ import {
     ensureGeometryUv0ForMaterial,
     shouldRouteBlackSpecularToLambert as shouldRouteBlackSpecularToLambertShared,
 } from '../material_contract.js';
+import { registerViewportNode } from '../fx/viewport_registry.js';
 
 function createMaterials(deps = {}) {
         const {
@@ -265,17 +266,17 @@ function createMaterials(deps = {}) {
                 material.opacityNode = depthOpacityNode;
                 break;
             case 2:
-                material.backdropNode = colorMapNode ? colorMapNode.rgb.mul(tslFloat(tintStrength)) : hashBlur(viewportSharedTexture(), tslFloat(0.05));
+                material.backdropNode = colorMapNode ? colorMapNode.rgb.mul(tslFloat(tintStrength)) : hashBlur(registerViewportNode(viewportSharedTexture()), tslFloat(0.05));
                 material.opacityNode = colorMapNode ? flatOpacityNode.mul(colorMapNode.a) : flatOpacityNode;
                 break;
             case 3:
-                material.backdropNode = viewportSharedTexture(screenUV.mul(pixelGrid).floor().div(pixelGrid));
+                material.backdropNode = registerViewportNode(viewportSharedTexture(screenUV.mul(pixelGrid).floor().div(pixelGrid)));
                 material.opacityNode = flatOpacityNode;
                 break;
             case 0:
             default:
                 // Frosted glass: depth-based blur + tint (matches webgpu_backdrop_area example)
-                material.backdropNode = hashBlur(viewportSharedTexture(), blurAmountNode)
+                material.backdropNode = hashBlur(registerViewportNode(viewportSharedTexture()), blurAmountNode)
                     .add(depthAlphaNode.mix(tintNode.mul(0.3), 0));
                 // No opacityNode — let backdropNode handle the compositing
                 break;

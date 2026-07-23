@@ -115,8 +115,11 @@ function buildDenoisedSSR(ctx, ssrPass) {
     const { state, sceneTex } = ctx;
     const maxFrames = Math.round(clampFinite(state.ssr.denoiseFrames, 1, 64, 32));
 
+    // ownedTexture: temporalReproject() convertToTexture's its input without
+    // the getTextureNode dance recurrentDenoise does — the RTT it mints over
+    // the raw SSRNode leaks its render target per rebuild (see fx/core).
     const temporalPass = temporalReproject(
-        ssrPass,
+        ctx.ownedTexture(ssrPass),
         ctx.prePass.depth,
         ctx.prePass.normalColor,
         ctx.prePass.velocity,

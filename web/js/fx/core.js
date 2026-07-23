@@ -18,6 +18,7 @@
 import * as THREE from 'three';
 import {
     color,
+    convertToTexture,
     densityFogFactor,
     diffuseColor,
     float,
@@ -48,6 +49,7 @@ import {
     cameraViewMatrix,
     modelWorldMatrix,
 } from 'three/tsl';
+import { purgeViewportCachesForTarget } from './viewport_registry.js';
 
 // Effects safe to run on a path-traced source: pure color-domain folds that
 // need no gbuffer. Everything else (SSGI/SSR/GTAO/DOF/fog/motionBlur/...)
@@ -80,7 +82,9 @@ export function createFxCore({
     getResolutionScale = () => 1.0,
 }) {
     const PipelineCtor = THREE.RenderPipeline || THREE.PostProcessing;
-    const postProcessing = new PipelineCtor(renderer);
+    // Recreated on every clearNodes() — see recreatePostPipeline(). Consumers
+    // must read it through the exported getter, never cache the instance.
+    let postProcessing = new PipelineCtor(renderer);
     const emptyOutputNode = vec4(0, 0, 0, 0);
     const SSR_REFERENCE_SIZE = 6.0;
 
@@ -143,6 +147,21 @@ export function createFxCore({
         isShaderLabEnabled,
         has: isEffectActive,
         pushNode(node) { activeNodes.push(node); },
+        // Wrap a computed node as a texture input AND take ownership of the
+        // RTTNode this mints, so clearNodes() disposes its render target on
+        // the next rebuild. Vendored effect factories (dof, CRT colorBleeding,
+        // recurrentDenoise, …) call convertToTexture internally on whatever
+        // they are handed — an RTT minted INSIDE the factory is reachable by
+        // nothing here and leaks a screen-sized HalfFloat target on every
+        // rebuildPipeline() (2026-07-23: DOF on + slider drags leaked VRAM
+        // until the WebGPU device died). Pre-wrapping makes the factory's
+        // internal wrap a no-op (convertToTexture is identity on texture
+        // nodes) and puts the RTT in activeNodes where disposal can see it.
+        ownedTexture(node) {
+            const wrapped = convertToTexture(node);
+            if (wrapped !== node) activeNodes.push(wrapped);
+            return wrapped;
+        },
         setActivePass(key, passNode) { activePasses.set(key, passNode); },
         getActivePass(key) { return activePasses.get(key) ?? null; },
         applyNodeResolutionScale,
@@ -336,6 +355,10 @@ export function createFxCore({
     function disposeResource(resource, seen) {
         if (!resource || seen.has(resource)) return;
         seen.add(resource);
+        // A dying render target may be a key in ViewportTextureNode clone
+        // caches (glass backdrops, transmission, viewportLinearDepth) — reap
+        // those framebuffer copies or they outlive every rebuild.
+        if (resource.isRenderTarget) purgeViewportCachesForTarget(resource);
         if (typeof resource.dispose === 'function') {
             try { resource.dispose(); } catch (_) { /* best effort */ }
         }
@@ -349,17 +372,31 @@ export function createFxCore({
         }
     }
 
-    function detachPostProcessingGraph() {
+    function recreatePostPipeline() {
+        // Retire the ENTIRE pipeline object, not just its node graph. Swapping
+        // outputNode on a reused quad is not enough on the WebGPU backend
+        // (r185): the old quad's compiled builder state (updateBeforeNodes)
+        // survives via closure retention, so the old graph's PassNodes keep
+        // updateBefore-running every frame and lazily RESURRECT their disposed
+        // render targets — VRAM grows by one zombie graph per rebuild
+        // (2026-07-23: heap snapshot showed 49 live PassNodes / 15 DOF nodes /
+        // 408 RenderTargets after a DOF slider session; the session died by
+        // GPU device loss). A fresh RenderPipeline instance makes the old quad
+        // unreachable, so its render-object caches, builder state, and node
+        // graph all become collectable together.
+        const previous = postProcessing;
+        try { previous.dispose?.(); } catch {}
+        try {
+            const quadMat = previous?._quadMesh?.material;
+            if (quadMat) {
+                disposeResource(quadMat, new Set());
+                quadMat.fragmentNode = null;
+            }
+        } catch {}
+        previous.outputNode = emptyOutputNode;
+        postProcessing = new PipelineCtor(renderer);
         postProcessing.outputNode = emptyOutputNode;
-        postProcessing._context = null;
         postProcessing.needsUpdate = true;
-
-        const quadMat = postProcessing?._quadMesh?.material;
-        if (!quadMat) return;
-
-        disposeResource(quadMat, new Set());
-        quadMat.fragmentNode = null;
-        quadMat.needsUpdate = true;
     }
 
     // Deep-dispose a post-FX node. PassNode owns render targets and temporal
@@ -392,7 +429,7 @@ export function createFxCore({
     }
 
     function clearNodes() {
-        detachPostProcessingGraph();
+        recreatePostPipeline();
         activePasses.clear();
         activeScenePass = null;
         const seen = new Set();
@@ -882,7 +919,9 @@ export function createFxCore({
     }
 
     return {
-        postProcessing,
+        // Live accessor: the instance is REPLACED on every clearNodes(); a
+        // cached reference would render (and resurrect) the old zombie graph.
+        get postProcessing() { return postProcessing; },
         ctx,
         uniforms,
         descriptors: sorted,

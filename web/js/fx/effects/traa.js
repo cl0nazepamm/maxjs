@@ -1,7 +1,7 @@
 // Temporal reprojection anti-aliasing. Verbatim move of the TRAA block from
 // maxjs_fx.js rebuildPipeline(). forcePrePassSamplesOne: TRAA copies depth —
 // the shared pre-pass MSAA sample count must be 1 to avoid mismatch.
-import { convertToTexture, vec4 } from 'three/tsl';
+import { vec4 } from 'three/tsl';
 import { traa } from 'three/addons/tsl/display/TRAANode.js';
 
 export default {
@@ -20,8 +20,7 @@ export default {
     build(ctx) {
         if (!ctx.prePass?.depth || !ctx.prePass?.velocity) return;
         const { state } = ctx;
-        const traaInput = convertToTexture(ctx.beauty);
-        ctx.pushNode(traaInput);
+        const traaInput = ctx.ownedTexture(ctx.beauty);
 
         const traaPass = traa(traaInput, ctx.prePass.depth, ctx.prePass.velocity, ctx.camera);
         traaPass.useSubpixelCorrection = state.traa.useSubpixelCorrection;

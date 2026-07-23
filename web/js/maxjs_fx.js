@@ -156,7 +156,9 @@ export function createMaxJSFxController({
         getEnvironmentVisible: () => environmentVisible,
         getResolutionScale: () => postFxResolutionScale,
     });
-    const postProcessing = core.postProcessing;
+    // NEVER cache core.postProcessing: the instance is replaced on every
+    // pipeline rebuild (see fx/core recreatePostPipeline) — a cached copy
+    // keeps rendering the old zombie graph and leaks its render targets.
 
     // Final-stylize stages — shared with the snapshot viewer (fx/final/*).
     const shaderLabFinal = createShaderLabFinal({
@@ -466,7 +468,7 @@ export function createMaxJSFxController({
 
     function renderPostInputToCurrentTarget() {
         if (core.ctx.pathTracedColor && pipelineReady) {
-            postProcessing.render();
+            core.postProcessing.render();
             return;
         }
         renderer.render(scene, camera);
@@ -563,7 +565,7 @@ export function createMaxJSFxController({
         if (scene) pendingSceneRefresh = true;
         if (output) pendingOutputRefresh = true;
         if (output && pipelineReady) {
-            postProcessing.needsUpdate = true;
+            core.postProcessing.needsUpdate = true;
         }
     }
 
@@ -642,7 +644,7 @@ export function createMaxJSFxController({
         }
 
         if (needsOutputRefresh && pipelineReady) {
-            postProcessing.needsUpdate = true;
+            core.postProcessing.needsUpdate = true;
         }
     }
 
@@ -1551,13 +1553,13 @@ export function createMaxJSFxController({
                 }
                 core.updatePerFrame();
                 if (shaderLabActive) {
-                    const consumed = shaderLabFinal.renderFinal(() => postProcessing.render());
-                    if (!consumed) postProcessing.render();
+                    const consumed = shaderLabFinal.renderFinal(() => core.postProcessing.render());
+                    if (!consumed) core.postProcessing.render();
                 } else if (powerShotFinal.isActive()) {
-                    const consumed = powerShotFinal.renderFinal(() => postProcessing.render());
-                    if (!consumed) postProcessing.render();
+                    const consumed = powerShotFinal.renderFinal(() => core.postProcessing.render());
+                    if (!consumed) core.postProcessing.render();
                 } else {
-                    postProcessing.render();
+                    core.postProcessing.render();
                 }
             } catch (error) {
                 core.restoreSceneAfterPostPass();

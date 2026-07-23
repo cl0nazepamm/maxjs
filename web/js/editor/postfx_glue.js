@@ -335,6 +335,7 @@ function createPostFxGlue(deps = {}) {
                     filmNegative: false,
                     infraredPreset: 'white_phosphor_nir',
                     ...powerShotInfraredPresetUiDefaults('white_phosphor_nir'),
+                    irIlluminator: 1,
                     irElectronModel: false,
                     irElectronsPerUnit: 1024,
                     nsSmear: 0.9,
@@ -417,6 +418,9 @@ function createPostFxGlue(deps = {}) {
                     { key: 'analogDropouts', label: 'Dropouts', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotTapeActive },
                     { key: 'analogScanlines', label: 'Scanlines', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotTapeActive },
                     { key: 'analogHeadSwitch', label: 'Head Switch', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotTapeActive },
+                    // Scene-side illuminator power in the sensed band (class-4 IR
+                    // lights: raster direct + probe NEE + PT) — not a tube stage.
+                    { key: 'irIlluminator', label: 'IR Illuminator', min: 0, max: 4, step: 0.05, realtime: true, visibleWhen: isPowerShotNirMode },
                     { key: 'irExposure', label: 'Exposure (stops)', min: -12, max: 12, step: 0.05, realtime: true, visibleWhen: isPowerShotNirMode },
                     { key: 'irInputGamma', label: 'Input Gamma', min: 0.35, max: 2, step: 0.01, realtime: true, visibleWhen: isPowerShotNirMode },
                     { key: 'irResponse', label: 'IR Response', min: 0, max: 1, step: 0.01, realtime: true, visibleWhen: isPowerShotNirMode },

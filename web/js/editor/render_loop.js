@@ -1,6 +1,6 @@
 // render_loop.js - editor frame driver and visible-frame render path.
 
-import { setNirDirectSensing } from 'speedball-gi';
+import { setNirDirectSensing, setNirIlluminatorGain } from 'speedball-gi';
 
 function createRenderLoop(deps = {}) {
         let lastPostFxPanelSyncMs = 0;
@@ -185,6 +185,19 @@ function createRenderLoop(deps = {}) {
                     deps.isPathTracingMode && nirSensing ? 'nv' : 'visible');
                 deps.haloGi?.field?.setNirSensing?.(nirSensing);
                 setNirDirectSensing(nirSensing);
+                // Raster band swap for ctx.spectral material tags: tagged
+                // diffuse scalars flip to their authored NIR level under NV
+                // (uniform writes only; giColor keeps PT/probe packing on the
+                // true visible albedo).
+                deps.layerManager?.setSpectralRasterSensing?.(nirSensing);
+                // IR Illuminator gain (PowerShot panel): one knob, all three
+                // consumers — direct raster term, probes' NEE, PT 850 nm band.
+                // Every setter no-ops when unchanged, so per-frame is free.
+                const psIrGain = Number(deps.maxjsFx.getPowerShotOptions?.()?.irIlluminator);
+                const irGain = Number.isFinite(psIrGain) ? psIrGain : 1;
+                setNirIlluminatorGain(irGain);
+                deps.haloGi?.field?.setNirGain?.(irGain);
+                deps.pathTracingFx?.setNirGain?.(irGain);
                 deps.updateProbeHelpers();
             }
             deps.css3dOverlay.tick(deps.scene, deps.camera);

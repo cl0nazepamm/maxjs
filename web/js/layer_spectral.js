@@ -98,6 +98,38 @@ export function createSpectralMaterialSystem({
     let nextEntryId = 1;
     let nextOrder = 1;
     let nextScanAt = 0;
+    // Raster NV band swap: while the imager senses NIR, a TAGGED material's
+    // diffuse scalar becomes grey at its authored NIR level (uniform write —
+    // zero recompiles; the diffuse map keeps supplying per-texel variation,
+    // mirroring the PT's level×texel behavior). The true visible color is
+    // parked in userData.giColor, which the spectral/probe packer honors
+    // FIRST, so PT and probe-bounce albedo stay band-correct throughout.
+    let rasterSensing = false;
+
+    function applyRasterSwap(material, state, value) {
+        if (!material?.color?.isColor) return;
+        if (!state.rasterSaved) {
+            state.rasterSaved = true;
+            state.savedColor = material.color.clone();
+            state.hadGiColor = hasOwn(material.userData ?? {}, 'giColor');
+            state.savedGiColor = material.userData?.giColor;
+            material.userData ??= {};
+            material.userData.giColor = state.savedColor;
+        }
+        material.color.setScalar(Math.min(1, Math.max(0, value)));
+    }
+
+    function clearRasterSwap(material, state) {
+        if (!state?.rasterSaved) return;
+        state.rasterSaved = false;
+        if (material?.color?.isColor && state.savedColor) material.color.copy(state.savedColor);
+        if (material?.userData) {
+            if (state.hadGiColor) material.userData.giColor = state.savedGiColor;
+            else delete material.userData.giColor;
+        }
+        state.savedColor = null;
+        state.savedGiColor = undefined;
+    }
 
     function nodeSpecMatches(spec, handle, object, getAdapter) {
         if (!spec) return true;
@@ -167,10 +199,12 @@ export function createSpectralMaterialSystem({
         }
         material.userData ??= {};
         if (winner) {
+            if (rasterSensing) applyRasterSwap(material, state, winner.value);
             if (material.userData.nirAlbedo === winner.value) return false;
             material.userData.nirAlbedo = winner.value;
             return true;
         }
+        clearRasterSwap(material, state);
         let changed = false;
         if (state.hadOwn) {
             changed = material.userData.nirAlbedo !== state.baseline;
@@ -358,6 +392,36 @@ export function createSpectralMaterialSystem({
         }
     }
 
+    // Flip the raster band swap for every currently-tagged material. Driven
+    // per-frame by the render loop from the NV sensing state — cheap no-op
+    // when unchanged. Winner resolution matches applyMaterialState (highest
+    // order wins), so overlapping entries swap to the same value they tag.
+    function setRasterSensing(on) {
+        const next = on === true;
+        if (next === rasterSensing) return false;
+        rasterSensing = next;
+        const seen = new Set();
+        for (const entry of entries.values()) {
+            if (entry.disposed) continue;
+            for (const material of entry.materialCounts.keys()) {
+                if (seen.has(material)) continue;
+                seen.add(material);
+                const state = materialStates.get(material);
+                if (!state) continue;
+                if (next) {
+                    let winner = null;
+                    for (const a of state.assignments.values()) {
+                        if (!winner || a.order > winner.order) winner = a;
+                    }
+                    if (winner) applyRasterSwap(material, state, winner.value);
+                } else {
+                    clearRasterSwap(material, state);
+                }
+            }
+        }
+        return true;
+    }
+
     function createLayerFacade(layerId, getAdapter) {
         return freezePlainObject({
             setNirAlbedo(selector, value, options = {}) {
@@ -380,5 +444,5 @@ export function createSpectralMaterialSystem({
         });
     }
 
-    return { createLayerFacade, update, disposeLayer };
+    return { createLayerFacade, update, disposeLayer, setRasterSensing };
 }

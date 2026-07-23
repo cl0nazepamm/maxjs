@@ -71,6 +71,9 @@ export function createMaxJSFxController({
         jpegHighlight: 1.0,
         brightness: 0,
         contrast: 0,
+        // Scene-side IR illuminator gain for the sensed band (NOT a tube stage
+        // param): scales class-4 IR lights in raster direct + probe NEE + PT.
+        irIlluminator: 1.0,
         analogStrength: 0.72,
         analogTracking: 0.46,
         analogTrackingChoppiness: 1.0,
@@ -1169,6 +1172,7 @@ export function createMaxJSFxController({
                 Object.assign(state.powershot, powerShotInfraredPresetUiDefaults(state.powershot.infraredPreset));
             }
             assignFinite(state.powershot, 'amount', options.amount);
+            assignFinite(state.powershot, 'irIlluminator', options.irIlluminator);
             assignFinite(state.powershot, 'resolutionScale', options.resolutionScale);
             assignFinite(state.powershot, 'lensSoftness', options.lensSoftness);
             assignFinite(state.powershot, 'ccdBloom', options.ccdBloom);

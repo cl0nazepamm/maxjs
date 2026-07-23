@@ -92,6 +92,13 @@ function createEnvironment(deps = {}) {
             deps.setDefaultLightsVisible(deps.lightHandleMap.size === 0 && !environmentLightingActive);
         }
 
+        // Tears down env lighting AND dirties every material (full pipeline
+        // recompile on the next frame — see markLightProbeMaterialsDirty).
+        // Callers must prove an environment is actually active before
+        // invoking this; boot.removeAuthoredEnvironment early-outs for
+        // exactly that reason. 2026-07-23: every settle full-sync re-sent
+        // "no environment", this ran on each scrub release, and the whole
+        // scene recompiled per seek.
         function resetEnvironmentLighting({ restoreDefaultLights = true } = {}) {
             if (deps.lightProbeRefreshTimer) {
                 clearTimeout(deps.lightProbeRefreshTimer);

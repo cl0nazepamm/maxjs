@@ -3030,6 +3030,19 @@
             gpuNormalsLive_ = enabled;
             return;
         }
+        if (type == L"client_log") {
+            // Web-side forensics (WebGPU device loss, etc.) share the
+            // process-failure log so one file tells the whole restart story.
+            std::wstring kind, reason, message, backend, when;
+            ExtractJsonString(msg, L"kind", kind);
+            ExtractJsonString(msg, L"reason", reason);
+            ExtractJsonString(msg, L"message", message);
+            ExtractJsonString(msg, L"backend", backend);
+            ExtractJsonString(msg, L"when", when);
+            AppendWebViewFailureLog(L"client_log kind=" + kind + L" backend=" + backend
+                + L" reason=" + reason + L" when=" + when + L" message=" + message);
+            return;
+        }
         if (type == L"lock_camera") {
             std::wstring handleStr;
             ExtractJsonString(msg, L"handle", handleStr);

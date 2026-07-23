@@ -918,6 +918,23 @@ function createSceneSync(deps = {}) {
             };
         }
 
+        // ── SETTLE-PATH CONTRACT (2026-07-23 scrub-release freeze) ────────
+        // This runs on EVERY authoritative full sync — including the settle
+        // that follows each timeline scrub release. Nothing called from here
+        // may "re-apply" state by replacing live objects without proving a
+        // change first:
+        //   • replaced geometry/index/material IDENTITY (or a version bump
+        //     on byte-identical data) reads as STRUCTURAL change to the
+        //     speedball/PT signatures → full MeshBVH rebuild + probe-kernel
+        //     recompile (~550 ms on the render thread);
+        //   • recreated lights or a torn-down environment flip pipeline
+        //     cache keys / dirty every material → full TSL recompile of the
+        //     whole scene (~140 ms single-frame stall).
+        // The four regressions that stacked into the per-scrub freeze:
+        // index resend (scene_binary.updateGeometryIndexAttribute), flatten
+        // re-merge (buildFlattenedGroups), light recreate (lights.applyLights),
+        // env teardown (boot.removeAuthoredEnvironment). Each now
+        // change-gates; hold every new sub-apply added here to that bar.
         function finalizeSceneSnapshot(snapshot, transport, applyStart, producerBytes, options = {}) {
             // The authoritative snapshot supersedes any deferred structural
             // rebuild owed by an earlier position-only packet.

@@ -325,6 +325,14 @@ function createGiVolumeGlue(deps = {}) {
             });
         }
 
+        // THE global recompile hammer: needsUpdate on every scene material
+        // rebuilds every pipeline's node graph inside the next render() — one
+        // synchronous ~140 ms+ frame with the HALO probe fold-in enlarging
+        // each graph. Call it ONLY on a real lighting-topology flip (GI
+        // active state, probe grid resize, environment identity) — NEVER
+        // from a per-settle/per-sync path. Routing it through the scrub
+        // settle (boot.removeAuthoredEnvironment → resetEnvironmentLighting)
+        // was cause #4 of the 2026-07-23 scrub-release freeze.
         function markLightProbeMaterialsDirty() {
             const seen = new WeakSet();
             const markMaterial = (material) => {

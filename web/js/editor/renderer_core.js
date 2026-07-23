@@ -200,6 +200,42 @@ function createRendererCore(deps = {}) {
 
             let nextRenderer;
             let backendLabel;
+            // GPU device loss was invisible before 2026-07-23: no handler
+            // existed, so a TDR / driver reset / OOM device kill left a black
+            // canvas or a silently restarted panel with nothing to attribute.
+            // Record every non-intentional loss where it survives the page:
+            // localStorage (read back on next boot) + the host failure log.
+            const DEVICE_LOSS_LOG_KEY = 'maxjs_device_loss_log';
+            const watchGpuDeviceLoss = (renderer, label) => {
+                const device = renderer?.backend?.device;
+                if (!device?.lost?.then) return;
+                device.lost.then((info) => {
+                    if (info?.reason === 'destroyed') return; // intentional dispose
+                    const entry = {
+                        when: new Date().toISOString(),
+                        backend: label,
+                        reason: info?.reason ?? 'unknown',
+                        message: String(info?.message || ''),
+                    };
+                    console.error('[max.js] WebGPU device LOST:', entry);
+                    try {
+                        const prior = JSON.parse(localStorage.getItem(DEVICE_LOSS_LOG_KEY) || '[]');
+                        const entries = Array.isArray(prior) ? prior : [];
+                        entries.push(entry);
+                        localStorage.setItem(DEVICE_LOSS_LOG_KEY, JSON.stringify(entries.slice(-10)));
+                    } catch {}
+                    try {
+                        window.chrome?.webview?.postMessage({ type: 'client_log', kind: 'gpu_device_lost', ...entry });
+                    } catch {}
+                }).catch(() => {});
+            };
+            try {
+                const prior = JSON.parse(localStorage.getItem(DEVICE_LOSS_LOG_KEY) || '[]');
+                if (Array.isArray(prior) && prior.length) {
+                    console.warn('[max.js] GPU device losses recorded by earlier sessions '
+                        + '(localStorage maxjs_device_loss_log):', prior);
+                }
+            } catch {}
 
             // The WebGPU spectral path tracer requires the NATIVE WebGPU
             // backend (backend.isWebGPUBackend). Ignore any forced-WebGL
@@ -240,6 +276,7 @@ function createRendererCore(deps = {}) {
 
             deps.renderer = nextRenderer;
             deps.rendererBackendLabel = backendLabel;
+            watchGpuDeviceLoss(nextRenderer, backendLabel);
             return { renderer: nextRenderer, backendLabel };
         }
 

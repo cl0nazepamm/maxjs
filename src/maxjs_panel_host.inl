@@ -457,6 +457,42 @@
                 }).Get());
     }
 
+    // ── WebView2 failure forensics ─────────────────────────────────────
+    // Renderer/GPU process deaths are otherwise SILENT: WebView2 recovers by
+    // renavigating and the viewer just "randomly restarts" with no dump, no
+    // event-log entry (2026-07-23: aggressive scrubbing + speedball GI drove
+    // renderer OOM via the since-fixed full-rebuild treadmill — took a live
+    // debugging session to even name the killer). Every failure appends one
+    // line to %LOCALAPPDATA%\MaxJS\webview_failures.log so a restart can be
+    // attributed after the fact. Web-side client_log messages (GPU device
+    // loss) land in the same file — one place tells the whole story.
+    static void AppendWebViewFailureLog(const std::wstring& line) {
+        wchar_t* localAppData = nullptr;
+        if (FAILED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &localAppData)) || !localAppData) return;
+        std::wstring path = std::wstring(localAppData) + L"\\MaxJS";
+        CoTaskMemFree(localAppData);
+        CreateDirectoryW(path.c_str(), nullptr);
+        path += L"\\webview_failures.log";
+        HANDLE file = CreateFileW(path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ, nullptr,
+            OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file == INVALID_HANDLE_VALUE) return;
+        SYSTEMTIME st; GetLocalTime(&st);
+        wchar_t stamp[64];
+        swprintf_s(stamp, L"[%04u-%02u-%02u %02u:%02u:%02u] ",
+            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+        const std::wstring full = stamp + line + L"\r\n";
+        const int bytes = WideCharToMultiByte(CP_UTF8, 0, full.c_str(),
+            static_cast<int>(full.size()), nullptr, 0, nullptr, nullptr);
+        if (bytes > 0) {
+            std::string utf8(static_cast<size_t>(bytes), '\0');
+            WideCharToMultiByte(CP_UTF8, 0, full.c_str(), static_cast<int>(full.size()),
+                utf8.data(), bytes, nullptr, nullptr);
+            DWORD written = 0;
+            WriteFile(file, utf8.data(), static_cast<DWORD>(utf8.size()), &written, nullptr);
+        }
+        CloseHandle(file);
+    }
+
     void OnWebViewReady(ICoreWebView2Controller* ctrl) {
         controller_ = ctrl;
         controller_->get_CoreWebView2(&webview_);
@@ -484,6 +520,57 @@
                     LPWSTR json = nullptr;
                     args->get_WebMessageAsJson(&json);
                     if (json) { OnWebMessage(json); CoTaskMemFree(json); }
+                    return S_OK;
+                }).Get(), nullptr);
+
+        // Attribute otherwise-silent viewer restarts (renderer OOM, GPU
+        // reset, hangs) and recover deliberately instead of magically.
+        // See AppendWebViewFailureLog above.
+        webview_->add_ProcessFailed(
+            Callback<ICoreWebView2ProcessFailedEventHandler>(
+                [this](ICoreWebView2*, ICoreWebView2ProcessFailedEventArgs* args) -> HRESULT {
+                    COREWEBVIEW2_PROCESS_FAILED_KIND kind =
+                        COREWEBVIEW2_PROCESS_FAILED_KIND_UNKNOWN_PROCESS_EXITED;
+                    if (args) args->get_ProcessFailedKind(&kind);
+                    std::wstring detail;
+                    ComPtr<ICoreWebView2ProcessFailedEventArgs2> args2;
+                    if (args && SUCCEEDED(args->QueryInterface(IID_PPV_ARGS(&args2))) && args2) {
+                        COREWEBVIEW2_PROCESS_FAILED_REASON reason =
+                            COREWEBVIEW2_PROCESS_FAILED_REASON_UNEXPECTED;
+                        args2->get_Reason(&reason);
+                        const wchar_t* reasonName =
+                            reason == COREWEBVIEW2_PROCESS_FAILED_REASON_UNRESPONSIVE ? L"UNRESPONSIVE" :
+                            reason == COREWEBVIEW2_PROCESS_FAILED_REASON_TERMINATED ? L"TERMINATED" :
+                            reason == COREWEBVIEW2_PROCESS_FAILED_REASON_CRASHED ? L"CRASHED" :
+                            reason == COREWEBVIEW2_PROCESS_FAILED_REASON_LAUNCH_FAILED ? L"LAUNCH_FAILED" :
+                            reason == COREWEBVIEW2_PROCESS_FAILED_REASON_OUT_OF_MEMORY ? L"OUT_OF_MEMORY" :
+                            L"UNEXPECTED";
+                        INT32 exitCode = 0;
+                        args2->get_ExitCode(&exitCode);
+                        wchar_t exitBuf[16];
+                        swprintf_s(exitBuf, L"0x%08X", static_cast<unsigned>(exitCode));
+                        detail = std::wstring(L" reason=") + reasonName + L" exitCode=" + exitBuf;
+                        LPWSTR description = nullptr;
+                        if (SUCCEEDED(args2->get_ProcessDescription(&description)) && description) {
+                            detail += L" process=";
+                            detail += description;
+                            CoTaskMemFree(description);
+                        }
+                    }
+                    const wchar_t* kindName =
+                        kind == COREWEBVIEW2_PROCESS_FAILED_KIND_BROWSER_PROCESS_EXITED ? L"BROWSER_PROCESS_EXITED" :
+                        kind == COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_EXITED ? L"RENDER_PROCESS_EXITED" :
+                        kind == COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_UNRESPONSIVE ? L"RENDER_PROCESS_UNRESPONSIVE" :
+                        kind == COREWEBVIEW2_PROCESS_FAILED_KIND_FRAME_RENDER_PROCESS_EXITED ? L"FRAME_RENDER_PROCESS_EXITED" :
+                        kind == COREWEBVIEW2_PROCESS_FAILED_KIND_UTILITY_PROCESS_EXITED ? L"UTILITY_PROCESS_EXITED" :
+                        kind == COREWEBVIEW2_PROCESS_FAILED_KIND_SANDBOX_HELPER_PROCESS_EXITED ? L"SANDBOX_HELPER_PROCESS_EXITED" :
+                        kind == COREWEBVIEW2_PROCESS_FAILED_KIND_GPU_PROCESS_EXITED ? L"GPU_PROCESS_EXITED" :
+                        L"UNKNOWN_PROCESS_EXITED";
+                    AppendWebViewFailureLog(std::wstring(L"ProcessFailed kind=") + kindName + detail);
+                    if (kind == COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_EXITED
+                        || kind == COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_UNRESPONSIVE) {
+                        if (webview_) webview_->Reload();
+                    }
                     return S_OK;
                 }).Get(), nullptr);
 

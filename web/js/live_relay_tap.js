@@ -109,6 +109,15 @@
     let pumping = false;
     let needSceneResync = true; // relay may have (re)started with an empty cache
     let lastSceneFrame = null;  // framed copy of the latest full scene payload
+    // Relay-absent gate. Anything can squat on the relay port (5173 is also
+    // Vite's default): a non-relay server accepts the full POST body and only
+    // then 404s, so a playback-rate delta stream turns into a full-scene
+    // upload + drop loop every few hundred ms — a main-thread hitch machine
+    // (2026-07-24). One failed POST flips this false, which silences ALL
+    // mirroring (not even buffer copies) until the heartbeat gets a
+    // well-formed relay answer back. scene_bin stays exempt so the resync
+    // cache tracks the newest map while the relay is away.
+    let relayAlive = null;     // null = unprobed, first contact is optimistic
 
     function frame(meta, buffer) {
         const metaBytes = encoder.encode(JSON.stringify(meta ?? {}));
@@ -137,6 +146,7 @@
             cache: 'no-store',
         });
         if (!response.ok) throw new Error(`relay ingest ${response.status}`);
+        relayAlive = true;
     }
 
     async function pump() {
@@ -154,10 +164,12 @@
                 queue.shift();
             }
         } catch {
-            // Relay down or restarting: drop the backlog (a fresh scene frame
-            // is replayed on the next successful contact) and stay quiet.
+            // Relay down, restarting, or not a relay at all: drop the backlog
+            // (a fresh scene frame is replayed on the next successful contact)
+            // and go silent until the heartbeat proves the relay is back.
             queue.length = 0;
             needSceneResync = true;
+            relayAlive = false;
         } finally {
             pumping = false;
         }
@@ -170,13 +182,18 @@
                 : (e.additionalData ?? {});
             const type = meta?.type;
             if (SKIP_BUFFER_TYPES.has(type)) return;
+            const isScene = !type || type === 'scene_bin';
+            // No relay: streams at playback rate must cost nothing — skip
+            // before the copy. Scene frames are rare and keep resync working.
+            if (relayAlive === false && !isScene) return;
             // Copy out of the shared buffer NOW — the editor's own handler
             // releases it after this dispatch.
             const framed = frame(meta, e.getBuffer());
             let key = null;
-            if (!type || type === 'scene_bin') {
+            if (isScene) {
                 lastSceneFrame = framed;
                 key = 'scene';
+                if (relayAlive === false) return; // cached for the heartbeat resync
             } else if (type === 'geo_fast' && meta.h != null) {
                 key = `geo:${meta.h}`;
             }
@@ -186,6 +203,7 @@
 
     wv.addEventListener('message', (e) => {
         try {
+            if (relayAlive === false) return;
             const data = e?.data;
             if (!data || !JSON_FORWARD_TYPES.has(data.type)) return;
             enqueue(`msg:${data.type}`, JSON.stringify({ kind: 'msg', data }), 'application/json');
@@ -207,8 +225,16 @@
                 headers: { 'content-type': 'application/json' },
                 cache: 'no-store',
             });
-            if (!response.ok) return;
+            if (!response.ok) { relayAlive = false; setGameConsumers(0); return; }
             const status = await response.json();
+            // A well-formed relay answer is the ONLY thing that revives
+            // mirroring after a failure — a squatter on the port never will.
+            if (!status || typeof status !== 'object' || !('consumers' in status)) {
+                relayAlive = false;
+                setGameConsumers(0);
+                return;
+            }
+            relayAlive = true;
             setGameConsumers(Number(status?.consumers) || 0);
             if (status?.needScene && lastSceneFrame) {
                 enqueue('scene', lastSceneFrame, 'application/octet-stream');
@@ -216,6 +242,7 @@
         } catch {
             // Relay down: no game is consuming — never leave the viewer stuck
             // in headless against a dead relay.
+            relayAlive = false;
             setGameConsumers(0);
         }
     }, PING_MS);

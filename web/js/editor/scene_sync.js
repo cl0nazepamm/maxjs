@@ -24,6 +24,18 @@ function createSceneSync(deps = {}) {
         // under the group head. Keyed by head handle.
         const flattenedGroups = new Map();
         const flattenedGroupHandleToKey = new Map();
+        // Per-cluster signatures of what is currently merged. Rebuilds are
+        // cluster-granular: one dissolved or edited group must never re-merge
+        // (and re-create materials for) every other group in the scene.
+        const flattenedClusterSignatures = new Map();
+        // Handles that stream geometry (deforming characters, live edits).
+        // Re-flattening them just re-arms the dissolve on the next packet —
+        // a per-scrub merge/dissolve oscillation that churns materials and
+        // every structural change-detector (HALO-GI/PT BVH rebuilds).
+        const flattenDeformExcludedHandles = new Set();
+        // If a position-only packet dissolves a flattened group, PT owes a
+        // structural rebuild—but it must wait for that handle's exact normals.
+        const pathTraceFullAfterNormalHandles = new Set();
         // Objects targeted by active light links must remain individually
         // renderable. Instance buckets / flattened groups may still optimize
         // every other object in the scene.
@@ -36,12 +48,17 @@ function createSceneSync(deps = {}) {
                         handleBinaryDelta(buf, meta);
         });
         deps.hostBridge.onSharedBuffer('geo_fast', (buf, meta) => {
+                        maxTimeline.noteSceneSync?.();
                         // Real-time vertex update — in-place when topology matches
                         const mesh = deps.nodeMap.get(meta.h);
                         if (mesh) {
+                            // Streaming geometry disqualifies this node from
+                            // future re-flattening for the session — see
+                            // flattenDeformExcludedHandles.
+                            flattenDeformExcludedHandles.add(meta.h);
                             // In-place geometry edits invalidate any merged
                             // group copy of this node.
-                            dissolveFlattenedGroupForHandle(meta.h);
+                            const flattenedGroupDissolved = dissolveFlattenedGroupForHandle(meta.h);
                             if (meta.jsmod != null) deps.applyJsmodSyncState(mesh, meta.jsmod === true);
                             if (!mesh.userData.jsmod) {
                             const pos = mesh.geometry.getAttribute('position');
@@ -56,6 +73,22 @@ function createSceneSync(deps = {}) {
                                 && pos
                                 && pos.count === vertCount
                                 && (!hasIncomingIndex || (existingIdx && existingIdx.count === idxCount));
+                            // Only the native guarded skipBounds lane proves
+                            // that connectivity/layout stayed unchanged. Count
+                            // equality alone is not a topology proof.
+                            const guardedDeform = sameTopology && meta.skipBounds === true;
+                            const hasExactIncomingNormals =
+                                Number(meta.nN) > 0 && Number(meta.nN) === Number(meta.vN);
+                            if (flattenedGroupDissolved && guardedDeform && !hasExactIncomingNormals) {
+                                pathTraceFullAfterNormalHandles.add(meta.h);
+                            }
+                            const deferredFullReady = hasExactIncomingNormals &&
+                                pathTraceFullAfterNormalHandles.delete(meta.h);
+                            const pathTraceChangeKind = !flattenedGroupDissolved &&
+                                !deferredFullReady && guardedDeform
+                                ? 'deform'
+                                : 'full';
+                            const pathTraceUpdateReady = !guardedDeform || hasExactIncomingNormals;
                             const incomingVertexColors = normalizeVertexColorDescriptors(meta.vc);
                             const oldGroups = deps.cloneGeometryGroups(mesh.geometry);
                             const applyIncomingGroups = () => {
@@ -73,11 +106,14 @@ function createSceneSync(deps = {}) {
                                 updateFloatGeometryAttribute(mesh.geometry, 'position', buf, meta.vOff, meta.vN, 3);
 
                                 if (hasIncomingIndex && existingIdx) {
-                                    updateGeometryIndexAttribute(mesh.geometry, buf, meta.iOff, meta.iN);
+                                    const indexApplied = updateGeometryIndexAttribute(mesh.geometry, buf, meta.iOff, meta.iN);
                                     // Index contents changed in place — the GPU
                                     // normal adjacency cache is keyed by geometry
                                     // and must not survive a connectivity rewrite.
-                                    gpuNormalsInvalidate(mesh.geometry);
+                                    // A byte-identical resend ('unchanged') keeps
+                                    // the cache and the attribute version, so
+                                    // structural change-detectors stay quiet.
+                                    if (indexApplied === true) gpuNormalsInvalidate(mesh.geometry);
                                 }
 
                                 if (meta.uvOff != null && meta.uvN) {
@@ -162,7 +198,13 @@ function createSceneSync(deps = {}) {
                             deps.maxjsFx?.markGeometryDataDirty?.();
                             deps.markLightProbeSceneDirty();
                             deps.scheduleLightProbeFromCurrentScene({ delay: 350 });
-                            deps.schedulePathTracingLiveRebuild();
+                            // Native interactive deformation is positions-only.
+                            // Wait for its exact settle-normal packet so PT does
+                            // one refit, not one with stale normals and another
+                            // 250 ms later. Structural packets still schedule now.
+                            if (pathTraceUpdateReady) {
+                                deps.schedulePathTracingLiveRebuild(pathTraceChangeKind);
+                            }
                             }
                         }
         });
@@ -188,11 +230,14 @@ function createSceneSync(deps = {}) {
         }
 
         function applyIncrementalNodeUpdate(mesh, nd, handleOverride = null) {
-            if (!mesh || !nd) return;
+            const result = { transformChanged: false, structuralChanged: false };
+            if (!mesh || !nd) return result;
             const handle = handleOverride ?? nd.h ?? null;
             if (handle != null && getMaxInstanceBucketForHandle(handle)) {
-                updateMaxInstanceBucketNode(handle, nd);
-                return;
+                const changed = updateMaxInstanceBucketNode(handle, nd);
+                result.transformChanged = changed && isFiniteArray(nd.t, 16);
+                result.structuralChanged = changed && (nd.vis != null || !!nd.mat);
+                return result;
             }
             // A delta touching a flattened group member invalidates its merged
             // mesh — dissolve back to individuals; the next full sync
@@ -200,20 +245,20 @@ function createSceneSync(deps = {}) {
             if (handle != null && flattenedGroupHandleToKey.has(handle)) {
                 const touchesFlatten = isFiniteArray(nd.t, 16) || nd.vis != null || nd.mat ||
                     nd.jsmod != null || Object.prototype.hasOwnProperty.call(nd, 'p');
-                if (touchesFlatten) dissolveFlattenedGroupForHandle(handle);
+                if (touchesFlatten && dissolveFlattenedGroupForHandle(handle)) result.structuralChanged = true;
             }
             if (handle != null) mesh.userData.maxjsHandle = handle;
             if (nd.helper === true) mesh.userData.maxjsHelper = true;
             if (Object.prototype.hasOwnProperty.call(nd, 'p')) syncNodeParent(mesh, nd);
             if (nd.jsmod != null) deps.applyJsmodSyncState(mesh, nd.jsmod === true);
             if (nd.userProps != null) deps.applyUserPropsSyncState(mesh, nd.userProps);
-            if (nd.vis != null) deps.applyBridgeVisibility(mesh, nd.vis);
+            if (nd.vis != null && deps.applyBridgeVisibility(mesh, nd.vis)) result.structuralChanged = true;
             if (isFiniteArray(nd.t, 16)) {
                 const hadHTMLAutoFit = !!mesh.userData?.maxjsHasHTMLAutoFit;
                 const oldScaleSignature = hadHTMLAutoFit
                     ? deps.matrixScaleSignature(mesh.userData?.maxjsLastNodePayload?.t)
                     : '';
-                applyTransform(mesh, nd.t);
+                result.transformChanged = applyTransform(mesh, nd.t);
                 if (hadHTMLAutoFit) {
                     const lastPayload = mesh.userData?.maxjsLastNodePayload;
                     if (lastPayload) {
@@ -222,6 +267,7 @@ function createSceneSync(deps = {}) {
                             const previousMaterial = mesh.material;
                             if (deps.ensureSceneRenderableMaterial(mesh, lastPayload, !!lastPayload.spline)) {
                                 deps.lightLinking.replaceRenderableMaterial?.(previousMaterial, mesh.material);
+                                result.structuralChanged = true;
                             }
                         }
                     }
@@ -235,7 +281,9 @@ function createSceneSync(deps = {}) {
             if (nd.mat && mesh.material
                 && !(Array.isArray(mesh.material) && mesh.material.length > 1)) {
                 applyMaterialScalar(mesh, nd.mat);
+                result.structuralChanged = true;
             }
+            return result;
         }
 
         function buildNodeGeometryRefCounts() {
@@ -521,10 +569,10 @@ function createSceneSync(deps = {}) {
         // individual member dissolves its cluster back to per-node meshes;
         // the next full sync re-merges via the signature check.
 
-        function flattenTransformDigest(t) {
-            if (!isFiniteArray(t, 16)) return 'I';
+        function flattenMatrixDigest(m) {
+            const e = m.elements;
             let out = '';
-            for (let i = 0; i < 16; i++) out += `${Math.round(t[i] * 1000)},`;
+            for (let i = 0; i < 16; i++) out += `${Math.round(e[i] * 1000)},`;
             return out;
         }
 
@@ -554,6 +602,7 @@ function createSceneSync(deps = {}) {
                 if (nd.skin || nd.jsmod || nd.spline || nd.mats || nd.groups) continue;
                 if (nd.vis === false || nd.vis === 0) continue;
                 if (bucketHandles?.has(nd.h)) continue;
+                if (flattenDeformExcludedHandles.has(nd.h)) continue;
                 const head = outermostGroupHead(nd);
                 if (!head) continue;
                 if (!clusters.has(head.h)) clusters.set(head.h, { head, members: [] });
@@ -566,19 +615,31 @@ function createSceneSync(deps = {}) {
 
             const handles = new Set();
             const parts = [];
-            for (const cluster of clusters.values()) {
+            const clusterSignatures = new Map();
+            const headInverse = new THREE.Matrix4();
+            const relative = new THREE.Matrix4();
+            for (const [headHandle, cluster] of clusters) {
+                if (isFiniteArray(cluster.head.t, 16)) headInverse.fromArray(cluster.head.t).invert();
+                else headInverse.identity();
                 const memberParts = cluster.members
                     .map((nd) => {
                         handles.add(nd.h);
                         const matKey = nd.mat ? deps.materialIdentityKey(nd.mat) : '__default__';
                         const geoKey = nd.geo?.vN ?? nd.v?.length ?? 0;
-                        return `${nd.h}~${flattenTransformDigest(nd.t)}~${matKey}~${geoKey}`;
+                        // HEAD-RELATIVE digest, matching how the merge bakes
+                        // member geometry: moving the whole group animates the
+                        // head object and must never read as a re-merge.
+                        if (isFiniteArray(nd.t, 16)) relative.fromArray(nd.t).premultiply(headInverse);
+                        else relative.copy(headInverse);
+                        return `${nd.h}~${flattenMatrixDigest(relative)}~${matKey}~${geoKey}`;
                     })
                     .sort();
-                parts.push(`${cluster.head.h}@${flattenTransformDigest(cluster.head.t)}#${memberParts.join('|')}`);
+                const clusterSig = `${cluster.head.h}#${memberParts.join('|')}`;
+                clusterSignatures.set(headHandle, clusterSig);
+                parts.push(clusterSig);
             }
             parts.sort();
-            return { clusters, signature: parts.join('||'), handles };
+            return { clusters, clusterSignatures, signature: parts.join('||'), handles };
         }
 
         function disposeFlattenedGroups() {
@@ -598,17 +659,13 @@ function createSceneSync(deps = {}) {
             }
             flattenedGroups.clear();
             flattenedGroupHandleToKey.clear();
+            flattenedClusterSignatures.clear();
             lastFlattenSignature = '';
         }
 
-        function dissolveFlattenedGroupForHandle(handle) {
-            const key = flattenedGroupHandleToKey.get(handle);
-            if (key == null) return false;
-            const cluster = flattenedGroups.get(key);
-            if (!cluster) {
-                flattenedGroupHandleToKey.delete(handle);
-                return false;
-            }
+        function dissolveFlattenedClusterByHead(headHandle) {
+            const cluster = flattenedGroups.get(headHandle);
+            if (!cluster) return false;
             for (const mesh of cluster.meshes) {
                 if (mesh.parent) mesh.parent.remove(mesh);
                 mesh.geometry?.dispose?.();
@@ -622,7 +679,19 @@ function createSceneSync(deps = {}) {
                 }
                 flattenedGroupHandleToKey.delete(memberHandle);
             }
-            flattenedGroups.delete(key);
+            flattenedGroups.delete(headHandle);
+            flattenedClusterSignatures.delete(headHandle);
+            return true;
+        }
+
+        function dissolveFlattenedGroupForHandle(handle) {
+            const key = flattenedGroupHandleToKey.get(handle);
+            if (key == null) return false;
+            if (!flattenedGroups.has(key)) {
+                flattenedGroupHandleToKey.delete(handle);
+                return false;
+            }
+            dissolveFlattenedClusterByHead(key);
             // Force the next full sync to re-plan instead of matching the
             // stale signature that still contains this cluster.
             lastFlattenSignature = '';
@@ -686,12 +755,24 @@ function createSceneSync(deps = {}) {
                 if (plan.signature) reassertFlattenedVisibility();
                 return false;
             }
-
-            disposeFlattenedGroups();
             lastFlattenSignature = plan.signature;
-            if (plan.clusters.size === 0) return true;
+
+            // Cluster-granular reconcile: dissolve only vanished or edited
+            // clusters, merge only new or edited ones. Untouched merges keep
+            // their meshes AND their already-compiled materials — a full
+            // dispose-and-remerge here recompiles pipelines and reads as a
+            // structural scene change to HALO-GI/PT on every group edit.
+            let changed = false;
+            for (const headHandle of [...flattenedClusterSignatures.keys()]) {
+                if (plan.clusterSignatures.get(headHandle) !== flattenedClusterSignatures.get(headHandle)) {
+                    flattenedClusterSignatures.delete(headHandle);
+                    if (dissolveFlattenedClusterByHead(headHandle)) changed = true;
+                }
+            }
 
             for (const [headHandle, cluster] of plan.clusters) {
+                const clusterSig = plan.clusterSignatures.get(headHandle);
+                if (flattenedClusterSignatures.get(headHandle) === clusterSig) continue;
                 const headObject = deps.nodeMap.get(headHandle);
                 if (!headObject) continue;
                 if (isFiniteArray(cluster.head.t, 16)) {
@@ -743,11 +824,18 @@ function createSceneSync(deps = {}) {
                     }
                 }
 
+                // Record degenerate results too, so an unchanged plan does
+                // not re-attempt this cluster's merge on every snapshot.
+                flattenedClusterSignatures.set(headHandle, clusterSig);
                 if (clusterMeshes.length === 0) continue;
                 flattenedGroups.set(headHandle, { meshes: clusterMeshes, handles: clusterHandles });
                 for (const handle of clusterHandles) flattenedGroupHandleToKey.set(handle, headHandle);
+                changed = true;
             }
-            return true;
+            // Unchanged clusters skipped the merge above, but a full snapshot
+            // may have re-applied nd.vis to their hidden originals.
+            if (flattenedGroups.size) reassertFlattenedVisibility();
+            return changed;
         }
 
         function profileSceneNodes(nodes) {
@@ -831,6 +919,9 @@ function createSceneSync(deps = {}) {
         }
 
         function finalizeSceneSnapshot(snapshot, transport, applyStart, producerBytes, options = {}) {
+            // The authoritative snapshot supersedes any deferred structural
+            // rebuild owed by an earlier position-only packet.
+            pathTraceFullAfterNormalHandles.clear();
             deps.resolveSnapshotMaterialRefs(snapshot);
             if (snapshot.camera) deps.applyCamera(snapshot.camera);
             const snapshotEnv = withSnapshotLinkedSkySun(snapshot.env, snapshot.lights);
@@ -1020,6 +1111,7 @@ function createSceneSync(deps = {}) {
         });
 
         deps.bridge.on('geo_fast', msg => {
+            maxTimeline.noteSceneSync?.();
             const mesh = deps.nodeMap.get(msg.h);
             if (!mesh) return;
             dissolveFlattenedGroupForHandle(msg.h);
@@ -1134,38 +1226,36 @@ function createSceneSync(deps = {}) {
             const applyStart = performance.now();
             let visibilityChanged = false;
             let giSurfaceChanged = false;
-            let pathTraceSceneChanged = false;
+            let pathTraceTransformsChanged = false;
+            let pathTraceStructuralChanged = false;
+            let pathTraceLightsChanged = false;
             for (const nd of msg.nodes) {
                 const mesh = deps.nodeMap.get(nd.h);
-                if (nd.vis != null) visibilityChanged = true;
                 if (mesh) {
-                    applyIncrementalNodeUpdate(mesh, nd);
-                    if (nd.t || nd.mat || nd.vis != null) {
-                        pathTraceSceneChanged = true;
-                        giSurfaceChanged = true;
-                    }
+                    const change = applyIncrementalNodeUpdate(mesh, nd);
+                    pathTraceTransformsChanged ||= change.transformChanged;
+                    pathTraceStructuralChanged ||= change.structuralChanged;
+                    giSurfaceChanged ||= change.transformChanged || change.structuralChanged;
+                    visibilityChanged ||= change.structuralChanged && nd.vis != null;
                 }
                 if (nd.t) {
                     deps.applyHairTransform(nd.h, nd.t);
-                    pathTraceSceneChanged = true;
                 }
                 if (nd.vis != null) {
                     deps.applyHairVisibility(nd.h, nd.vis);
-                    pathTraceSceneChanged = true;
                 }
             }
             if (msg.lights) {
-                deps.applyLightUpdates(msg.lights);
-                pathTraceSceneChanged = true;
+                pathTraceLightsChanged = deps.applyLightUpdates(msg.lights) === true;
             }
             if (msg.splats) {
                 deps.applySplatUpdates(msg.splats);
-                pathTraceSceneChanged = true;
+                pathTraceStructuralChanged = true;
             }
             if (msg.audios) deps.audioSystem?.applyAudioUpdates(msg.audios);
             if (msg.gltfs) {
                 deps.gltfSystem?.applyGLTFUpdates(msg.gltfs);
-                pathTraceSceneChanged = true;
+                pathTraceStructuralChanged = true;
             }
             if (msg.camera) deps.applyCamera(msg.camera);
             if (visibilityChanged) {
@@ -1176,7 +1266,11 @@ function createSceneSync(deps = {}) {
                 deps.markLightProbeSceneDirty();
                 deps.scheduleLightProbeFromCurrentScene({ delay: 350 });
             }
-            if (pathTraceSceneChanged) deps.schedulePathTracingLiveRebuild();
+            if (pathTraceStructuralChanged) deps.schedulePathTracingLiveRebuild();
+            else {
+                if (pathTraceTransformsChanged) deps.schedulePathTracingLiveRebuild('transform');
+                if (pathTraceLightsChanged) deps.schedulePathTracingLiveRebuild('light');
+            }
             const applyMs = performance.now() - applyStart;
             deps.updateSyncHud({
                 transport: 'json',
@@ -1350,24 +1444,27 @@ function createSceneSync(deps = {}) {
         function handleBinaryDelta(buffer, meta) {
             let runtimeTransformsChanged = false;
             let giSurfaceChanged = false;
-            let pathTraceSceneChanged = false;
+            let pathTraceTransformsChanged = false;
+            let pathTraceStructuralChanged = false;
+            let pathTraceLightsChanged = false;
             const result = applyDeltaFrame(buffer, {
                 onTransform(nodeHandle, matrix) {
                     const mesh = deps.nodeMap.get(nodeHandle);
-                    if (mesh) applyIncrementalNodeUpdate(mesh, { t: matrix }, nodeHandle);
                     if (mesh) {
-                        runtimeTransformsChanged = true;
-                        giSurfaceChanged = true;
-                        pathTraceSceneChanged = true;
+                        const change = applyIncrementalNodeUpdate(mesh, { t: matrix }, nodeHandle);
+                        runtimeTransformsChanged ||= change.transformChanged;
+                        giSurfaceChanged ||= change.transformChanged || change.structuralChanged;
+                        pathTraceTransformsChanged ||= change.transformChanged;
+                        pathTraceStructuralChanged ||= change.structuralChanged;
                     }
                     deps.applyHairTransform(nodeHandle, matrix);
                 },
                 onMaterialScalar(nodeHandle, material) {
                     const mesh = deps.nodeMap.get(nodeHandle);
                     if (mesh) {
-                        applyIncrementalNodeUpdate(mesh, { mat: material }, nodeHandle);
-                        giSurfaceChanged = true;
-                        pathTraceSceneChanged = true;
+                        const change = applyIncrementalNodeUpdate(mesh, { mat: material }, nodeHandle);
+                        giSurfaceChanged ||= change.structuralChanged;
+                        pathTraceStructuralChanged ||= change.structuralChanged;
                     }
                 },
                 onSelection(nodeHandle, selected) {
@@ -1377,9 +1474,9 @@ function createSceneSync(deps = {}) {
                 onVisibility(nodeHandle, visible) {
                     const mesh = deps.nodeMap.get(nodeHandle);
                     if (mesh) {
-                        applyIncrementalNodeUpdate(mesh, { vis: visible }, nodeHandle);
-                        giSurfaceChanged = true;
-                        pathTraceSceneChanged = true;
+                        const change = applyIncrementalNodeUpdate(mesh, { vis: visible }, nodeHandle);
+                        giSurfaceChanged ||= change.structuralChanged;
+                        pathTraceStructuralChanged ||= change.structuralChanged;
                     }
                     deps.applyHairVisibility(nodeHandle, visible);
                 },
@@ -1394,7 +1491,7 @@ function createSceneSync(deps = {}) {
                     const pos = [m[12], m[13], m[14]];
                     const len = Math.sqrt(m[4]*m[4] + m[5]*m[5] + m[6]*m[6]) || 1;
                     const dir = [-m[4]/len, -m[5]/len, -m[6]/len];
-                    deps.applyLightData(light, {
+                    const lightChanged = deps.applyLightData(light, {
                         h: handle, type: ld.type,
                         v: ld.visible ? 1 : 0,
                         pos, dir,
@@ -1408,21 +1505,23 @@ function createSceneSync(deps = {}) {
                         shadowMapSize: ld.shadowMapSize,
                         volContrib: ld.volContrib,
                     });
-                    if (ld.type === 0) deps.refreshSkyFromLinkedSun();
-                    deps.markLightProbeLightsDirty();
-                    deps.scheduleLightProbeFromCurrentScene({ delay: 350 });
-                    pathTraceSceneChanged = true;
+                    if (lightChanged) {
+                        if (ld.type === 0) deps.refreshSkyFromLinkedSun();
+                        deps.markLightProbeLightsDirty();
+                        deps.scheduleLightProbeFromCurrentScene({ delay: 350 });
+                        pathTraceLightsChanged = true;
+                    }
                 },
                 onSplat(handle, matrix, visible) {
                     if (!deps.splatsSystem.applyTrackedSplatTransform(handle, matrix, visible)) return;
-                    pathTraceSceneChanged = true;
+                    pathTraceStructuralChanged = true;
                 },
                 onAudio(handle, matrix, visible) {
                     deps.audioSystem?.applyAudioTransformBinary(handle, matrix, visible);
                 },
                 onGLTF(handle, matrix, visible) {
                     deps.gltfSystem?.applyGLTFTransformBinary(handle, matrix, visible);
-                    pathTraceSceneChanged = true;
+                    pathTraceStructuralChanged = true;
                 },
                 onWebApp(handle, matrix, visible) {
                     deps.webappSystem?.applyWebAppTransformBinary(handle, matrix, visible);
@@ -1436,7 +1535,11 @@ function createSceneSync(deps = {}) {
                 deps.markLightProbeSceneDirty();
                 deps.scheduleLightProbeFromCurrentScene({ delay: 350 });
             }
-            if (pathTraceSceneChanged) deps.schedulePathTracingLiveRebuild();
+            if (pathTraceStructuralChanged) deps.schedulePathTracingLiveRebuild();
+            else {
+                if (pathTraceTransformsChanged) deps.schedulePathTracingLiveRebuild('transform');
+                if (pathTraceLightsChanged) deps.schedulePathTracingLiveRebuild('light');
+            }
             deps.markInitialSync();
             deps.setTransportMode('binary-delta');
             deps.updateSyncHud({

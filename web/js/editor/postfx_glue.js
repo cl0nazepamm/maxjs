@@ -146,6 +146,7 @@ function createPostFxGlue(deps = {}) {
                     { key: 'strength', label: 'Strength', min: 0, max: 3, step: 0.01 },
                     { key: 'radius', label: 'Radius', min: 0, max: 1, step: 0.01 },
                     { key: 'threshold', label: 'Threshold', min: 0, max: 2, step: 0.01 },
+                    { key: 'resolutionScale', label: 'Resolution', min: 0.25, max: 1, step: 0.05 },
                 ],
             },
             {
@@ -635,7 +636,7 @@ function createPostFxGlue(deps = {}) {
             ssgi: { radius: 8, thickness: 1.5, aoIntensity: 1.0, giIntensity: 1.5, expFactor: 1.5, sliceCount: 2, stepCount: 8, temporal: false },
             ssr: { quality: 0.45, blurQuality: 2, maxDistance: 0.5, opacity: 0.9, thickness: 0.015 },
             gtao: { samples: 16, distanceExponent: 1.0, distanceFallOff: 1.0, radius: 0.5, scale: 2.0, thickness: 1.0, resolutionScale: 1.0 },
-            bloom: { strength: 0.4, radius: 0.2, threshold: 0.75 },
+            bloom: { strength: 0.4, radius: 0.2, threshold: 0.75, resolutionScale: 0.5 },
             toonOutline: { thickness: 0.003, alpha: 1.0 },
             motionBlur: { amount: 1.0, samples: 16 },
             traa: { useSubpixelCorrection: true, depthThreshold: 0.0005, edgeDepthDiff: 0.001, maxVelocityLength: 128 },

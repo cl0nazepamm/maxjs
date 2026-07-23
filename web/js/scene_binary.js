@@ -175,6 +175,17 @@ export function updateGeometryIndexAttribute(geometry, buffer, off, n, type = ''
         typedArrayCanStore(current.array, n) &&
         current.array.BYTES_PER_ELEMENT >= source.BYTES_PER_ELEMENT
     ) {
+        // Deform settle packets re-send an unchanged index. Bumping the
+        // attribute version there re-uploads the buffer AND reads as a
+        // connectivity change to every structural change-detector downstream
+        // (HALO-GI/PT geoSignature → full MeshBVH rebuild + kernel recompile
+        // on scrub release). Byte-identical indices must be a no-op.
+        const dst = current.array;
+        let changed = false;
+        for (let i = 0; i < n; i++) {
+            if (dst[i] !== source[i]) { changed = true; break; }
+        }
+        if (!changed) return 'unchanged';
         current.array.set(source);
         current.needsUpdate = true;
         return true;

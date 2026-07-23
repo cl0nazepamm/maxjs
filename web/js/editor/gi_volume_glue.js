@@ -1097,8 +1097,15 @@ function createGiVolumeGlue(deps = {}) {
                         // (the old ~30 Hz throttle) reads as GPU pressure to that
                         // auto-throttle and pins the budget at the floor: 12× less
                         // solve throughput than the standalone = laggy convergence.
+                        const timelineUpdateMs = deps.maxTimeline?.lastUpdateMs?.();
+                        const timelineIdleMs = Number.isFinite(timelineUpdateMs) && timelineUpdateMs > 0
+                            ? nowMs - timelineUpdateMs
+                            : Infinity;
                         void haloField.tick({
-                            idleMs: nowMs - deps.haloGiLastInteractionMs,
+                            // Scrub/step/stop are interactions too. Using the
+                            // newest camera OR timeline activity keeps scene
+                            // scans/refits out of the input callback tail.
+                            idleMs: Math.min(nowMs - deps.haloGiLastInteractionMs, timelineIdleMs),
                             playing: !!deps.maxTimeline?.playing?.(),
                         });
                     },

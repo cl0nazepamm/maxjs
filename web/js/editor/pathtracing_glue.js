@@ -2,13 +2,25 @@
 import * as THREE from 'three';
 
 function createPathTracingGlue(deps = {}) {
+        const PATH_TRACE_UPDATE_TRANSFORM = 1;
+        const PATH_TRACE_UPDATE_DEFORM = 2;
+        const PATH_TRACE_UPDATE_FULL = 4;
+        const PATH_TRACE_UPDATE_LIGHT = 8;
         let pathTracingLiveRebuildTimer = 0;
-        let pathTracingLiveRebuildQueued = false;
+        let pathTracingLiveUpdateMask = 0;
+        let pathTracingInactiveUpdateMask = 0;
         function isPathTracingViewActive() {
             return deps.isPathTracingMode && deps.pathTracingFx.isEnabled?.() === true;
         }
 
         function leavePathTracingView() {
+            // A scheduled update must survive switching to Probe view. The
+            // retained tracer scene is intentionally kept alive, so dropping
+            // this mask would show stale geometry/lights on the next Trace entry.
+            pathTracingInactiveUpdateMask = mergePathTracingUpdateMasks(
+                pathTracingInactiveUpdateMask,
+                pathTracingLiveUpdateMask,
+            );
             clearScheduledPathTracingLiveRebuild();
             deps.pathTracingFx.setToneMapInBlit?.(true);
             deps.maxjsFx.setPathTracedSource?.(null);
@@ -33,6 +45,14 @@ function createPathTracingGlue(deps = {}) {
             if (deps.isPathTracingMode) {
                 deps.pathTracingFx.start?.();
                 resetPathTracingStartupWarmup();
+                if (pathTracingInactiveUpdateMask) {
+                    pathTracingLiveUpdateMask = mergePathTracingUpdateMasks(
+                        pathTracingLiveUpdateMask,
+                        pathTracingInactiveUpdateMask,
+                    );
+                    pathTracingInactiveUpdateMask = 0;
+                    armPathTracingLiveUpdateTimer();
+                }
             } else {
                 leavePathTracingView();
             }
@@ -145,28 +165,92 @@ function createPathTracingGlue(deps = {}) {
                 clearTimeout(pathTracingLiveRebuildTimer);
                 pathTracingLiveRebuildTimer = 0;
             }
-            pathTracingLiveRebuildQueued = false;
+            pathTracingLiveUpdateMask = 0;
         }
 
         function markPathTracingSceneDirtyNow() {
             clearScheduledPathTracingLiveRebuild();
+            pathTracingInactiveUpdateMask = 0;
             if (deps.pathTracingFx.isEnabled?.()) {
                 deps.pathTracingFx.markSceneDirty?.();
             }
         }
 
-        function schedulePathTracingLiveRebuild() {
-            if (!deps.isPathTracingMode || !deps.pathTracingFx.isStarted?.()) return;
-            if (deps.pathTracingSettings.freezeSync) return;
-            if (pathTracingLiveRebuildQueued) return;
-            pathTracingLiveRebuildQueued = true;
-            pathTracingLiveRebuildTimer = setTimeout(() => {
-                pathTracingLiveRebuildTimer = 0;
-                pathTracingLiveRebuildQueued = false;
-                if (deps.isPathTracingMode && !deps.pathTracingSettings.freezeSync) {
+        function armPathTracingLiveUpdateTimer() {
+            if (pathTracingLiveRebuildTimer) clearTimeout(pathTracingLiveRebuildTimer);
+            pathTracingLiveRebuildTimer = setTimeout(flushPathTracingLiveUpdate, deps.PATH_TRACING_LIVE_REBUILD_DELAY_MS);
+        }
+
+        function flushPathTracingLiveUpdate() {
+            pathTracingLiveRebuildTimer = 0;
+            if (!deps.isPathTracingMode || deps.pathTracingSettings.freezeSync) {
+                pathTracingLiveUpdateMask = 0;
+                return;
+            }
+            // Playback can stop without another geometry packet. Poll the
+            // authoritative timeline state, but never land CPU scene work in
+            // the middle of playback. Paused slider packets keep resetting the
+            // trailing edge naturally.
+            if (deps.maxTimeline?.playing?.() === true) {
+                armPathTracingLiveUpdateTimer();
+                return;
+            }
+            const mask = pathTracingLiveUpdateMask;
+            pathTracingLiveUpdateMask = 0;
+            if ((mask & PATH_TRACE_UPDATE_FULL) !== 0) {
+                deps.pathTracingFx.markSceneDirty?.();
+            } else if ((mask & PATH_TRACE_UPDATE_DEFORM) !== 0) {
+                if (typeof deps.pathTracingFx.markDeformsDirty === 'function') {
+                    deps.pathTracingFx.markDeformsDirty({ transforms: (mask & PATH_TRACE_UPDATE_TRANSFORM) !== 0 });
+                } else {
                     deps.pathTracingFx.markSceneDirty?.();
                 }
-            }, deps.PATH_TRACING_LIVE_REBUILD_DELAY_MS);
+            } else if ((mask & PATH_TRACE_UPDATE_TRANSFORM) !== 0) {
+                if (typeof deps.pathTracingFx.markTransformsDirty === 'function') {
+                    deps.pathTracingFx.markTransformsDirty();
+                } else {
+                    deps.pathTracingFx.markSceneDirty?.();
+                }
+            }
+            if ((mask & PATH_TRACE_UPDATE_LIGHT) !== 0) {
+                if (typeof deps.pathTracingFx.markLightsDirty === 'function') {
+                    deps.pathTracingFx.markLightsDirty();
+                } else {
+                    deps.pathTracingFx.markSceneDirty?.();
+                }
+            }
+        }
+
+        function mergePathTracingUpdateMasks(currentMask, nextMask) {
+            if ((currentMask & PATH_TRACE_UPDATE_FULL) !== 0) return currentMask;
+            if ((nextMask & PATH_TRACE_UPDATE_FULL) !== 0) return PATH_TRACE_UPDATE_FULL;
+            return currentMask | nextMask;
+        }
+
+        function schedulePathTracingLiveRebuild(changeKind = 'full') {
+            if (deps.pathTracingSettings.freezeSync) return;
+            let nextMask = PATH_TRACE_UPDATE_FULL;
+            if (changeKind === 'transform') nextMask = PATH_TRACE_UPDATE_TRANSFORM;
+            else if (changeKind === 'deform') nextMask = PATH_TRACE_UPDATE_DEFORM;
+            else if (changeKind === 'light') nextMask = PATH_TRACE_UPDATE_LIGHT;
+            if (!deps.pathTracingFx.isStarted?.()) {
+                // The first start always builds from the current scene.
+                return;
+            }
+            if (!deps.isPathTracingMode) {
+                pathTracingInactiveUpdateMask = mergePathTracingUpdateMasks(
+                    pathTracingInactiveUpdateMask,
+                    nextMask,
+                );
+                return;
+            }
+            pathTracingLiveUpdateMask = mergePathTracingUpdateMasks(
+                pathTracingLiveUpdateMask,
+                nextMask,
+            );
+            // True trailing edge: every packet moves the flush point. This
+            // coalesces a play/scrub burst into one latest-pose update.
+            armPathTracingLiveUpdateTimer();
         }
 
         function sendPathTracingRuntimeState() {
@@ -200,11 +284,18 @@ function createPathTracingGlue(deps = {}) {
                 deps.ptPauseUiSync?.();
             }
             deps.pathTracingFx.setOptions?.(deps.pathTracingSettings);
-            if (wasFrozen && !deps.pathTracingSettings.freezeSync && deps.isPathTracingMode && deps.bridgeHasInitialSync()) {
-                // C++ still advanced its sent-state caches while JS was ignoring updates.
-                // Ask for one authoritative resync when accumulation is unfrozen.
-                deps.bridge.send('scene_dirty', { reason: 'pathtracing_unfreeze' });
-                markPathTracingSceneDirtyNow();
+            if (wasFrozen && !deps.pathTracingSettings.freezeSync) {
+                if (deps.isPathTracingMode && deps.bridgeHasInitialSync()) {
+                    // C++ still advanced its sent-state caches while JS was ignoring updates.
+                    // Ask for one authoritative resync when accumulation is unfrozen.
+                    deps.bridge.send('scene_dirty', { reason: 'pathtracing_unfreeze' });
+                    markPathTracingSceneDirtyNow();
+                } else if (deps.pathTracingFx.isStarted?.()) {
+                    pathTracingInactiveUpdateMask = mergePathTracingUpdateMasks(
+                        pathTracingInactiveUpdateMask,
+                        PATH_TRACE_UPDATE_FULL,
+                    );
+                }
             }
             if (sendHost && window.chrome?.webview) {
                 sendPathTracingRuntimeState();

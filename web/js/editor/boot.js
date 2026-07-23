@@ -771,6 +771,7 @@
             PATH_TRACING_RASTER_WARMUP_FRAMES,
             PATH_TRACING_TEXTURE_WAIT_MS,
             PATH_TRACING_LIVE_REBUILD_DELAY_MS,
+            maxTimeline,
             syncPathTracingDofFromPostFx: (...args) => syncPathTracingDofFromPostFx(...args),
             bridgeHasInitialSync: (...args) => bridgeHasInitialSync(...args),
             hasActiveLightLinks: () => lightLinkingRef?.hasActiveLinks?.() === true,
@@ -1242,6 +1243,11 @@
         }
 
         function removeAuthoredEnvironment() {
+            // Idempotent: every settle full-sync re-sends "no environment".
+            // Tearing down an environment that is not there resets env
+            // lighting, which dirties EVERY material — a one-frame full
+            // pipeline recompile on each timeline scrub release.
+            if (!skyActive && !currentHdriUrl && !currentEnvParams && !scene.environment) return;
             removeSky();
             currentHdriUrl = null;
             currentHdriProbeSignature = '';

@@ -343,8 +343,36 @@ function createLights(deps = {}) {
             if (Number.isFinite(temp)) light.userData.colorTemp = temp;
         }
 
+        function lightTracePayloadSignature(ld) {
+            const q = (value) => Number.isFinite(Number(value))
+                ? Math.round(Number(value) * 100000)
+                : 0;
+            const vec = (value, count = 3) => {
+                const out = [];
+                for (let i = 0; i < count; i++) out.push(q(Array.isArray(value) ? value[i] : 0));
+                return out.join(',');
+            };
+            const type = Number(ld?.type) | 0;
+            const parts = [
+                type,
+                ld?.v == null || ld.v ? 1 : 0,
+                vec(ld?.pos),
+                vec(ld?.dir),
+                vec(ld?.color),
+                q(ld?.intensity),
+                q(ld?.volContrib == null ? 1 : ld.volContrib),
+            ];
+            if (type === 1 || type === 2) parts.push(q(ld?.distance), q(ld?.decay == null ? 2 : ld.decay));
+            if (type === 2) parts.push(q(ld?.angle), q(ld?.penumbra));
+            if (type === 3) parts.push(q(ld?.width), q(ld?.height));
+            if (type === 4) parts.push(vec(ld?.groundColor));
+            return parts.join('|');
+        }
+
         function applyLightData(light, ld) {
             light.userData ??= {};
+            const traceSignature = lightTracePayloadSignature(ld);
+            const traceChanged = light.userData.maxjsTracePayloadSignature !== traceSignature;
             light.userData.maxjsTypeId = ld.type;
             if (ld.h != null) light.userData.maxjsHandle = ld.h;
             if (ld.name) light.name = ld.name;
@@ -433,6 +461,8 @@ function createLights(deps = {}) {
                 light.needsUpdate = true;
             }
             if (ld.h != null) deps.layerManager.applyObjectPropertyOverrides?.(ld.h, light);
+            light.userData.maxjsTracePayloadSignature = traceSignature;
+            return traceChanged;
         }
 
         function createLightFromData(ld) {
@@ -464,6 +494,8 @@ function createLights(deps = {}) {
                 return null;
             }
 
+            light.userData ??= {};
+            light.userData.maxjsLightType = ld.type;
             applyLightData(light, ld);
             return light;
         }
@@ -502,12 +534,49 @@ function createLights(deps = {}) {
             return JSON.stringify(Array.isArray(lightsData) ? lightsData : []);
         }
 
+        // Same light SET (handles + types) → update the existing light objects
+        // in place, exactly like the delta lane. Recreating lights replaces
+        // their identities, which flips the renderer's lighting cache key and
+        // recompiles every scene pipeline — a one-frame hitch on every scrub
+        // settle when any light value animates or jitters.
+        function canUpdateLightsInPlace(list) {
+            if (list.length === 0 || deps.lightHandleMap.size !== list.length) return false;
+            for (const ld of list) {
+                if (ld?.h == null) return false;
+                const existing = deps.lightHandleMap.get(ld.h);
+                if (!existing || existing.userData?.maxjsLightType !== ld.type) return false;
+            }
+            return true;
+        }
+
+        function updateLightsInPlace(list) {
+            let mainDirectionalLight = null;
+            for (const ld of list) {
+                const light = deps.lightHandleMap.get(ld.h);
+                applyLightData(light, ld);
+                if (light.userData?.maxjsVisible !== false && !mainDirectionalLight && ld.type === 0) {
+                    mainDirectionalLight = light;
+                }
+            }
+            deps.syncDefaultLightsVisibility();
+            if (deps.maxjsFx.setMainLight) {
+                deps.maxjsFx.setMainLight(mainDirectionalLight || (deps.defaultLights.visible ? deps.defaultKey : null));
+            }
+            deps.markLightProbeLightsDirty();
+            deps.scheduleLightProbeFromCurrentScene({ delay: 350 });
+        }
+
         function applyLights(lightsData) {
             const signature = sceneLightsSignature(lightsData);
             if (signature === deps.lastLightsSignature) return false;
-            clearLights();
-            finalizeLightState(lightsData);
-            lightLinking.reapply();
+            const list = Array.isArray(lightsData) ? lightsData : [];
+            if (canUpdateLightsInPlace(list)) {
+                updateLightsInPlace(list);
+            } else {
+                clearLights();
+                finalizeLightState(lightsData);
+                lightLinking.reapply();
+            }
             deps.refreshSkyFromLinkedSun();
             deps.lastLightsSignature = signature;
             return true;
@@ -1398,25 +1467,28 @@ function createLights(deps = {}) {
         });
 
         function applyLightUpdates(lightsData) {
-            if (!Array.isArray(lightsData)) return;
-            deps.lastLightsSignature = '';
+            if (!Array.isArray(lightsData)) return false;
 
             let appliedLightCount = 0;
             let mainDirectionalLight = null;
+            let changed = false;
 
             for (const ld of lightsData) {
                 const light = deps.lightHandleMap.get(ld.h);
                 if (!light || light.userData?.maxjsTypeId !== ld.type || light.type !== LIGHT_TYPES[ld.type]) {
                     applyLights(lightsData);
-                    return;
+                    return true;
                 }
 
-                applyLightData(light, ld);
+                changed = applyLightData(light, ld) || changed;
                 if (light.userData?.maxjsVisible !== false) {
                     appliedLightCount++;
                     if (!mainDirectionalLight && ld.type === 0) mainDirectionalLight = light;
                 }
             }
+
+            if (!changed) return false;
+            deps.lastLightsSignature = '';
 
             deps.syncDefaultLightsVisibility();
             if (deps.maxjsFx.setMainLight) {
@@ -1425,6 +1497,7 @@ function createLights(deps = {}) {
             deps.refreshSkyFromLinkedSun();
             deps.markLightProbeLightsDirty();
             deps.scheduleLightProbeFromCurrentScene({ delay: 350 });
+            return true;
         }
 
         return {

@@ -27,6 +27,10 @@ const state = {
     // Extrapolation anchors
     _lastPushSeconds: 0,
     _lastPushMono: 0,
+    // Geometry packets can trail the authored time packet while native
+    // deformation drains in bounded batches. GI uses the newer of the two so
+    // it cannot wake before the exact settle-normal packet arrives.
+    _lastSceneSyncMono: 0,
     // Standalone mode bookkeeping
     _standaloneRaf: 0,
     _standaloneStartMono: 0,
@@ -39,30 +43,37 @@ const listeners = {
     pause: new Set(),
 };
 let liveChangeRaf = 0;
+const liveTransitionQueue = [];
 
-function emit(event) {
+function emit(event, eventSnapshot = snapshot()) {
     const set = listeners[event];
     if (!set) return;
     for (const fn of set) {
-        try { fn(snapshot()); } catch (err) { console.warn('[maxTimeline] listener threw:', err); }
+        try { fn(eventSnapshot); } catch (err) { console.warn('[maxTimeline] listener threw:', err); }
     }
+}
+
+function flushLiveMailbox() {
+    liveChangeRaf = 0;
+    const transitions = liveTransitionQueue.splice(0);
+    for (const transition of transitions) {
+        emit(transition.event, transition.snapshot);
+    }
+    emit('change');
 }
 
 function emitChange(options = {}) {
     const defer = options.defer === true;
     if (defer && typeof requestAnimationFrame === 'function') {
         if (liveChangeRaf) return;
-        liveChangeRaf = requestAnimationFrame(() => {
-            liveChangeRaf = 0;
-            emit('change');
-        });
+        liveChangeRaf = requestAnimationFrame(flushLiveMailbox);
         return;
     }
     if (liveChangeRaf && typeof cancelAnimationFrame === 'function') {
         cancelAnimationFrame(liveChangeRaf);
         liveChangeRaf = 0;
     }
-    emit('change');
+    flushLiveMailbox();
 }
 
 function snapshot() {
@@ -123,9 +134,17 @@ function onTime({ ticks, tpf, stateFlags }) {
     state.frame = frame;
     state.playing = nextPlaying;
 
-    emitChange({ defer: nextPlaying });
-    if (!wasPlaying && nextPlaying) emit('play');
-    else if (wasPlaying && !nextPlaying) emit('pause');
+    if (!wasPlaying && nextPlaying) {
+        liveTransitionQueue.push({ event: 'play', snapshot: snapshot() });
+    } else if (wasPlaying && !nextPlaying) {
+        liveTransitionQueue.push({ event: 'pause', snapshot: snapshot() });
+    }
+
+    // Keep the authoritative state synchronous, but bound arbitrary layer/UI
+    // subscribers to one notification mailbox per animation frame for
+    // playback, paused scrub, frame-step, and stop alike. Transition snapshots
+    // retain play/pause ordering even when both arrive within the same frame.
+    emitChange({ defer: true });
 }
 
 // Current seconds with sub-frame extrapolation during playback.
@@ -145,6 +164,8 @@ function currentFrame() {
 function fps() { return state.fps; }
 function playing() { return state.playing; }
 function getSource() { return state.source; }
+function noteSceneSync() { state._lastSceneSyncMono = performance.now(); }
+function lastUpdateMs() { return Math.max(state._lastPushMono, state._lastSceneSyncMono); }
 
 function on(event, fn) {
     const set = listeners[event];
@@ -226,6 +247,8 @@ export const maxTimeline = {
     frame: currentFrame,
     fps,
     playing,
+    noteSceneSync,
+    lastUpdateMs,
     source: getSource,
     on,
     initStandalone,

@@ -960,6 +960,7 @@ export function createMaxJSFxController({
             assignFinite(state.bloom, 'strength', options.strength);
             assignFinite(state.bloom, 'radius', options.radius);
             assignFinite(state.bloom, 'threshold', options.threshold);
+            assignFinite(state.bloom, 'resolutionScale', options.resolutionScale);
             rebuildPipeline();
             return { ...state.bloom };
         },

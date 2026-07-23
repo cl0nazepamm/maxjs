@@ -106,20 +106,25 @@
         deformChannelHashMap_.clear();
         lastBBoxHash_.clear();
         lastLiveGeomHash_.clear();
-        geoFastDirtyHandles_.clear();
-        geoFullFastDirtyHandles_.clear();
+        ClearGeometryFastFlushQueue();
         geoScanCursor_ = 0;
         SetDirtyImmediate();
     }
 
     void QueueFastFlush() {
         if (slowJsonSyncMode_) return;
-        if (!hwnd_ || fastFlushPosted_) return;
+        if (!hwnd_ || !IsWindow(hwnd_) || !IsWindowVisible(hwnd_) || fastFlushPosted_) return;
+        const ULONGLONG now = GetTickCount64();
+        if (fastFlushRetryNotBeforeTick_ != 0 &&
+            now < fastFlushRetryNotBeforeTick_) {
+            return;
+        }
         if (dirty_ && !CanFlushFastPathDuringPendingFullSync()) return;
         if (suppressFastFlushPost_) return;
         fastFlushPosted_ = true;
         if (!PostMessage(hwnd_, WM_FAST_FLUSH, 0, 0)) {
             fastFlushPosted_ = false;
+            fastFlushRetryNotBeforeTick_ = now + kTransportRetryBackoffMs;
         }
     }
 

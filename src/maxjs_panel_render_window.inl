@@ -1240,6 +1240,7 @@
         selectionDirtyHandles_.clear();
         selectionRescanDirty_ = false;
         lastSentTransforms_.clear();
+        lastSentPlaybackAux_.clear();
         geomHandles_.clear();
         skinnedHandles_.clear();
         lightHandles_.clear();

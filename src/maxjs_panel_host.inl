@@ -35,6 +35,14 @@
     bool selectionRescanDirty_ = false;
     std::unordered_set<ULONG> visibilityDirtyHandles_;
     std::unordered_map<ULONG, std::array<float, 16>> lastSentTransforms_;
+    struct PlaybackAuxDeliveryState {
+        bool visible = true;
+        bool selected = false;
+        bool hasSelection = false;
+        std::uint64_t lightStateHash = 0;
+        bool hasLightStateHash = false;
+    };
+    std::unordered_map<ULONG, PlaybackAuxDeliveryState> lastSentPlaybackAux_;
     std::unordered_map<ULONG, uint64_t> mtlHashMap_;   // node handle → material structure hash
     std::unordered_map<ULONG, uint64_t> mtlScalarHashMap_; // node handle -> non-fast material scalar hash
     std::unordered_map<ULONG, uint64_t> mtlFastScalarHashMap_; // node handle -> delta material scalar hash
@@ -63,6 +71,9 @@
         int next = 0;
     };
     std::unordered_map<ULONG, FastDeformSharedBufferPool> fastDeformSharedBuffers_; // persistent double-buffered geo_fast payload buffers
+    std::unordered_set<ULONG> deformNormalRefreshPendingHandles_; // position-only deform posts awaiting one exact idle normal refresh
+    ULONGLONG deformNormalRefreshDueTick_ = 0;
+    ULONG deformNormalRefreshQueuedHandle_ = 0;
     ULONGLONG lastSkinnedLivePollTick_ = 0;
     ULONGLONG lastCameraLivePollTick_ = 0;
     ULONGLONG lastRedrawLivePollTick_ = 0;
@@ -105,7 +116,66 @@
     bool pendingTimelineDeformScan_ = false;
     bool pendingTimelineCameraCheck_ = false;
     bool playbackFlushPending_ = false;
-    TimeValue playbackFlushTime_ = 0;
+    bool playbackFlushPosted_ = false;
+    enum class PlaybackSyncResult : std::uint8_t {
+        Complete,
+        NeedsSlice,
+        RetryLater,
+    };
+    struct PlaybackSharedBufferSlot {
+        ComPtr<ICoreWebView2SharedBuffer> buf;
+        UINT64 capacity = 0;
+    };
+    // Playback snapshots are sampled incrementally on the Max UI thread, then
+    // delivered as one atomic MXJB frame.  The handle order is rebuilt after a
+    // full-sync epoch, so play/scrub never has to rediscover or hierarchy-sort
+    // the whole tracked scene.
+    std::vector<ULONG> playbackSnapshotHandles_;
+    std::vector<ULONG> timelineDeformHandles_;
+    TimeValue playbackRequestedTime_ = 0;
+    bool playbackRequestedPlaying_ = false;
+    bool playbackRequestedStateKnown_ = false;
+    std::uint64_t playbackRequestSerial_ = 0;
+    std::uint64_t playbackStateSentSerial_ = 0;
+    bool playbackSnapshotActive_ = false;
+    bool playbackSnapshotFinalized_ = false;
+    bool playbackSnapshotPosted_ = false;
+    bool playbackSnapshotTransformStageReady_ = false;
+    TimeValue playbackSnapshotTime_ = 0;
+    bool playbackSnapshotPlaying_ = false;
+    std::uint64_t playbackSnapshotSerial_ = 0;
+    size_t playbackSnapshotCursor_ = 0;
+    maxjs::sync::DeltaFrameBuilder playbackStateFrame_{0};
+    maxjs::sync::DeltaFrameBuilder playbackSnapshotFrame_{0};
+    // Both time/state and pose transport use buffers allocated during the
+    // full-sync epoch.  The pose bytes are copied into the selected slot over
+    // bounded posted turns, then the completed slot is retained verbatim if
+    // WebView asks us to retry the post.
+    PlaybackSharedBufferSlot playbackStateSharedBuffers_[2];
+    PlaybackSharedBufferSlot playbackSnapshotSharedBuffers_[2];
+    int playbackStateSharedBufferNext_ = 0;
+    int playbackSnapshotSharedBufferNext_ = 0;
+    int playbackSnapshotCopySlot_ = -1;
+    size_t playbackSnapshotCopyOffset_ = 0;
+    // Double-buffered transform cache: sampling writes the inactive map and a
+    // successful WebView post swaps it into service in O(1).  A failed post
+    // therefore cannot make an unsent transform look acknowledged.
+    std::unordered_map<ULONG, std::array<float, 16>> playbackSnapshotTransforms_;
+    std::unordered_map<ULONG, PlaybackAuxDeliveryState> playbackSnapshotAux_;
+    CameraData playbackSnapshotCamera_ = {};
+    bool playbackSnapshotHasCamera_ = false;
+    bool timelineTransformScanActive_ = false;
+    TimeValue timelineTransformScanTime_ = 0;
+    bool timelineTransformScanPlaying_ = false;
+    size_t timelineTransformScanCursor_ = 0;
+    bool timelineDeformScanActive_ = false;
+    TimeValue timelineDeformScanTime_ = 0;
+    bool timelineDeformScanPlaying_ = false;
+    size_t timelineDeformScanCursor_ = 0;
+    ULONGLONG playbackFlushRetryNotBeforeTick_ = 0;
+    ULONGLONG fastFlushRetryNotBeforeTick_ = 0;
+    ULONGLONG fullSyncRetryNotBeforeTick_ = 0;
+    ULONGLONG geometryFastFlushNotBeforeTick_ = 0;
     ULONGLONG idlePollAuditUntilTick_ = 0;
     bool idlePollFullSyncPending_ = false;
     ULONGLONG nextIdlePollFullSyncTick_ = 0;

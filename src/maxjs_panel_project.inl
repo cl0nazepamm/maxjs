@@ -150,6 +150,7 @@
         selectionDirtyHandles_.clear();
         selectionRescanDirty_ = false;
         lastSentTransforms_.clear();
+        lastSentPlaybackAux_.clear();
         mtlHashMap_.clear();
         mtlScalarHashMap_.clear();
         mtlFastScalarHashMap_.clear();

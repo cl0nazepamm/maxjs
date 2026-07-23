@@ -1,13 +1,19 @@
     // ── Full scene sync ──────────────────────────────────────
-    void SendFullSync() {
+    bool SendFullSync() {
         Interface* ip = GetCOREInterface();
-        if (!ip) return;
+        if (!ip || !webview_) {
+            HandleFullSyncDeliveryFailure();
+            return false;
+        }
         // Serialization touches every material/texmap — keep the watcher from
         // re-queuing our own evaluation echoes as user edits.
         SuppressMaterialEditCaptureScope suppressEcho(*this);
         TimeValue t = ip->GetTime();
         INode* root = ip->GetRootNode();
-        if (!root) return;
+        if (!root) {
+            HandleFullSyncDeliveryFailure();
+            return false;
+        }
         const std::uint32_t frameId = AllocateFrameId();
 
         std::unordered_set<ULONG> prevGeom = std::move(geomHandles_);
@@ -157,10 +163,19 @@
 
         ss << L'}';
 
-        webview_->PostWebMessageAsJson(ss.str().c_str());
+        const HRESULT scenePostResult = webview_->PostWebMessageAsJson(ss.str().c_str());
+        if (FAILED(scenePostResult)) {
+            HandleFullSyncDeliveryFailure();
+            return false;
+        }
+        ClearPendingDeformNormalRefresh();
+        ClearGeometryFastFlushQueue();
+        fullSyncRetryNotBeforeTick_ = 0;
         SendProbeGridSync();
         SendRenderOutputSettings(true);
         ResetFastPathState(true);
+        CapturePlaybackDeliveredStateAtTime(t);
+        return true;
     }
 
     void WriteSceneNodes(INode* parent, TimeValue t,
@@ -292,6 +307,7 @@
                 std::vector<int> indices;
                 std::vector<MatGroup> groups;
                 const bool isSkinned = FindModifierOnNode(node, SKIN_CLASSID) != nullptr;
+                const bool hasModifierStack = NodeHasModifierStack(node);
                 std::vector<int> controlIdx;
                 std::vector<FastVertexSource> fastSources;
                 // Always capture the control-vertex mapping — any topology-
@@ -299,7 +315,12 @@
                 // can then route through the fast-positions path instead of
                 // the full ExtractMesh (smaller payload, single EvalWorldState).
                 FastDeformTopoEpoch fastEpoch;
-                bool extracted = ExtractMesh(node, t, verts, uvs, indices, groups, &norms, &controlIdx, &vertexColors, &fastSources, &uv2s, true, &fastEpoch);
+                FastNormalPlan fastNormalPlan;
+                bool extracted = ExtractMesh(
+                    node, t, verts, uvs, indices, groups,
+                    &norms, &controlIdx, &vertexColors, &fastSources, &uv2s,
+                    true, &fastEpoch,
+                    (isSkinned || hasModifierStack) ? &fastNormalPlan : nullptr);
 
                 // Spline fallback — extract as line geometry
                 bool isSpline = false;
@@ -323,18 +344,23 @@
                     if (isSkinned) skinnedHandles_.insert(handle);
                     if (!isSpline && controlIdx.size() * 3 == verts.size() && fastEpoch.valid) {
                         skinnedControlIdxCache_[handle] = std::move(controlIdx);
-                        if (fastSources.size() * 3 == verts.size())
+                        const bool haveFastSources = fastSources.size() * 3 == verts.size();
+                        if (haveFastSources)
                             skinnedFastSourceCache_[handle] = std::move(fastSources);
                         else
                             skinnedFastSourceCache_.erase(handle);
                         FastDeformGuard& guard = fastDeformGuardMap_[handle];
                         guard.epoch = fastEpoch;
-                        guard.plan = FastNormalPlan{};
+                        const bool haveBuiltFastNormalPlan =
+                            haveFastSources && fastNormalPlan.built;
+                        guard.plan = haveBuiltFastNormalPlan
+                            ? std::move(fastNormalPlan)
+                            : FastNormalPlan{};
                         // If this mesh has a modifier stack it can deform without
                         // firing a node event (e.g. Path Deform driven by time).
                         // Mark it for per-frame polling so playback catches it
                         // without waiting for the idle geometry detector.
-                        if (NodeHasModifierStack(node)) {
+                        if (hasModifierStack) {
                             deformHandles_.insert(handle);
                         } else {
                             deformHandles_.erase(handle);
@@ -406,21 +432,27 @@
 
     // ── Binary scene sync via SharedBuffer ─────────────────
 
-    void SendFullSyncBinary() {
+    bool SendFullSyncBinary() {
         Interface* ip = GetCOREInterface();
-        if (!ip) return;
+        if (!ip || !webview_ || !env_) {
+            HandleFullSyncDeliveryFailure();
+            return false;
+        }
         // Same echo suppression as SendFullSync.
         SuppressMaterialEditCaptureScope suppressEcho(*this);
         TimeValue t = ip->GetTime();
         INode* root = ip->GetRootNode();
-        if (!root) return;
+        if (!root) {
+            HandleFullSyncDeliveryFailure();
+            return false;
+        }
         const std::uint32_t frameId = AllocateFrameId();
 
         ComPtr<ICoreWebView2_17> wv17;
         ComPtr<ICoreWebView2Environment12> env12;
         webview_->QueryInterface(IID_PPV_ARGS(&wv17));
         env_->QueryInterface(IID_PPV_ARGS(&env12));
-        if (!wv17 || !env12) { SendFullSync(); return; }
+        if (!wv17 || !env12) return SendFullSync();
 
         // Save previous tracking so we can skip extraction for unchanged nodes
         std::unordered_set<ULONG> prevGeom = std::move(geomHandles_);
@@ -603,11 +635,15 @@
                     else deformHandles_.erase(node->GetHandle());
                 } else {
                     const bool isSkinned = FindModifierOnNode(node, SKIN_CLASSID) != nullptr;
+                    const bool hasModifierStack = NodeHasModifierStack(node);
                     std::vector<int> controlIdx;
                     std::vector<FastVertexSource> fastSources;
                     FastDeformTopoEpoch fastEpoch;
+                    FastNormalPlan fastNormalPlan;
                     bool extracted = ExtractMesh(node, t, ng.verts, ng.uvs, ng.indices, ng.groups,
-                        &ng.norms, &controlIdx, &ng.vertexColors, &fastSources, &ng.uv2s, true, &fastEpoch);
+                        &ng.norms, &controlIdx, &ng.vertexColors, &fastSources, &ng.uv2s,
+                        true, &fastEpoch,
+                        (isSkinned || hasModifierStack) ? &fastNormalPlan : nullptr);
                     if (!extracted && ShouldExtractRenderableShape(node, t, &os)) {
                         extracted = ExtractSpline(node, t, ng.verts, ng.indices);
                         ng.spline = extracted;
@@ -645,14 +681,19 @@
                     if (isSkinned) skinnedHandles_.insert(node->GetHandle());
                     if (!ng.spline && controlIdx.size() * 3 == ng.verts.size() && fastEpoch.valid) {
                         skinnedControlIdxCache_[ng.handle] = std::move(controlIdx);
-                        if (fastSources.size() * 3 == ng.verts.size())
+                        const bool haveFastSources = fastSources.size() * 3 == ng.verts.size();
+                        if (haveFastSources)
                             skinnedFastSourceCache_[ng.handle] = std::move(fastSources);
                         else
                             skinnedFastSourceCache_.erase(ng.handle);
                         FastDeformGuard& guard = fastDeformGuardMap_[ng.handle];
                         guard.epoch = fastEpoch;
-                        guard.plan = FastNormalPlan{};
-                        if (NodeHasModifierStack(node)) {
+                        const bool haveBuiltFastNormalPlan =
+                            haveFastSources && fastNormalPlan.built;
+                        guard.plan = haveBuiltFastNormalPlan
+                            ? std::move(fastNormalPlan)
+                            : FastNormalPlan{};
+                        if (hasModifierStack) {
                             deformHandles_.insert(ng.handle);
                         } else {
                             deformHandles_.erase(ng.handle);
@@ -755,10 +796,21 @@
         if (totalBytes == 0) totalBytes = 4;  // min size
         ComPtr<ICoreWebView2SharedBuffer> sharedBuf;
         HRESULT hr = env12->CreateSharedBuffer(totalBytes, &sharedBuf);
-        if (FAILED(hr)) { SendFullSync(); return; }
+        if (FAILED(hr) || !sharedBuf) {
+            // Collection above has already advanced producer caches. A JSON
+            // fallback at this point could treat those unsent values as the
+            // viewer baseline and omit geometry, so retry from an invalidated
+            // full-sync epoch instead.
+            HandleFullSyncDeliveryFailure();
+            return false;
+        }
 
         BYTE* bufPtr = nullptr;
-        sharedBuf->get_Buffer(&bufPtr);
+        const HRESULT bufferResult = sharedBuf->get_Buffer(&bufPtr);
+        if (FAILED(bufferResult) || !bufPtr) {
+            HandleFullSyncDeliveryFailure();
+            return false;
+        }
 
         // Build metadata JSON + copy geometry into buffer
         std::wostringstream ss;
@@ -979,12 +1031,21 @@
         WriteSceneCamerasJson(ss);
         ss << L'}';
 
-        wv17->PostSharedBufferToScript(sharedBuf.Get(),
+        const HRESULT scenePostResult = wv17->PostSharedBufferToScript(sharedBuf.Get(),
             COREWEBVIEW2_SHARED_BUFFER_ACCESS_READ_ONLY,
             ss.str().c_str());
+        if (FAILED(scenePostResult)) {
+            HandleFullSyncDeliveryFailure();
+            return false;
+        }
+        ClearPendingDeformNormalRefresh();
+        ClearGeometryFastFlushQueue();
+        fullSyncRetryNotBeforeTick_ = 0;
         SendProbeGridSync();
         SendRenderOutputSettings(true);
         ResetFastPathState(true);
+        CapturePlaybackDeliveredStateAtTime(t);
+        return true;
     }
 
     // ── Transform-only sync ──────────────────────────────────

@@ -22,6 +22,17 @@ DeltaFrameBuilder::DeltaFrameBuilder(std::uint32_t frameId)
     : frameId_(frameId) {
     bytes_.reserve(512);
 
+    Reset(frameId);
+}
+
+void DeltaFrameBuilder::Reset(std::uint32_t frameId) {
+    frameId_ = frameId;
+    commandCount_ = 0;
+    commandCountOffset_ = 0;
+    bytes_.clear();
+    expectedCommandEnd_ = 0;
+    hasOpenCommand_ = false;
+
     AppendU32(kDeltaFrameMagic);
     AppendU16(kDeltaFrameVersion);
     AppendU16(0);

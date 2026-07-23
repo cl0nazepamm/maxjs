@@ -100,6 +100,10 @@ class DeltaFrameBuilder {
 public:
     explicit DeltaFrameBuilder(std::uint32_t frameId);
 
+    // Reinitialize the wire header while retaining vector capacity.  This is
+    // used by the sliced playback sampler so first-use allocation can happen
+    // during full sync instead of on Max's Play/Stop interaction path.
+    void Reset(std::uint32_t frameId);
     void BeginFrame();
     void UpdateTransform(std::uint32_t nodeHandle, const float* matrix16);
     void UpdateMaterialScalar(std::uint32_t nodeHandle, const float* color3,

@@ -1340,6 +1340,18 @@ struct FastDeformGuard {
     FastNormalPlan plan;
 };
 
+// Defined below ExtractMesh. Full geometry extraction uses these forward
+// declarations to retain a topology-matched normal plan while the evaluated
+// mesh is already available, avoiding a cold plan build on first playback.
+static void BuildFastNormalPlanFromMNMesh(
+    MNMesh& mn,
+    const std::vector<FastVertexSource>& sources,
+    FastNormalPlan& plan);
+static void BuildFastNormalPlanFromMesh(
+    Mesh& mesh,
+    const std::vector<FastVertexSource>& sources,
+    FastNormalPlan& plan);
+
 // Sampled connectivity hash — only consulted for epoch-volatile nodes where
 // face/vertex counts alone could miss an equal-count connectivity swap.
 static uint64_t SampleFaceTopologyHash(Mesh& mesh) {
@@ -2327,7 +2339,19 @@ static bool ExtractMesh(INode* node, TimeValue t,
                         std::vector<FastVertexSource>* outFastVertexSources = nullptr,
                         std::vector<float>* outUV2s = nullptr,
                         bool emitPrimaryUVs = true,
-                        FastDeformTopoEpoch* outEpoch = nullptr) {
+                        FastDeformTopoEpoch* outEpoch = nullptr,
+                        FastNormalPlan* outFastNormalPlan = nullptr) {
+    if (outEpoch) *outEpoch = FastDeformTopoEpoch{};
+    if (outFastNormalPlan) *outFastNormalPlan = FastNormalPlan{};
+
+    auto canRetainFastNormalPlan = [&]() {
+        return outFastNormalPlan &&
+               outEpoch && outEpoch->valid &&
+               normals && !normals->empty() && normals->size() == verts.size() &&
+               outFastVertexSources &&
+               outFastVertexSources->size() * 3 == verts.size();
+    };
+
     const bool allowMapChannel1 = ShouldAllowVertexColorMapChannel1(node);
     // three.js Deform weight channel — needs the render→source vertex mapping
     // even when the caller didn't request controlIdx.
@@ -2349,6 +2373,8 @@ static bool ExtractMesh(INode* node, TimeValue t,
                 AppendDeformWeightChannel(deformWeights, *weightedControlIdx, outVertexColors);
             if (ok && outEpoch)
                 CaptureFastDeformEpochFromMNMesh(*liveMN, node, t, nullptr, true, *outEpoch);
+            if (ok && canRetainFastNormalPlan())
+                BuildFastNormalPlanFromMNMesh(*liveMN, *outFastVertexSources, *outFastNormalPlan);
             return ok;
         }
     }
@@ -2371,6 +2397,8 @@ static bool ExtractMesh(INode* node, TimeValue t,
             AppendDeformWeightChannel(deformWeights, *weightedControlIdx, outVertexColors);
         if (ok && outEpoch)
             CaptureFastDeformEpochFromMNMesh(mn, node, t, os.obj, false, *outEpoch);
+        if (ok && canRetainFastNormalPlan())
+            BuildFastNormalPlanFromMNMesh(mn, *outFastVertexSources, *outFastNormalPlan);
         return ok;
     }
 
@@ -2379,16 +2407,19 @@ static bool ExtractMesh(INode* node, TimeValue t,
     TriObject* tri = static_cast<TriObject*>(
         os.obj->ConvertToType(t, Class_ID(TRIOBJ_CLASS_ID, 0)));
     if (!tri) return false;
-    // Capture before extraction — ExtractMeshFromTriObject deletes converted
-    // TriObjects on its way out.
+    // Capture before extraction, then retain this converted object until the
+    // topology-matched fast-normal plan has been built from the same Mesh.
     if (wantsDeformWeights) CaptureMeshDeformWeights(tri->GetMesh(), deformWeights);
     FastDeformTopoEpoch triEpoch;
     if (outEpoch)
         CaptureFastDeformEpochFromMesh(tri->GetMesh(), node, t, os.obj, false, triEpoch);
-    const bool ok = ExtractMeshFromTriObject(tri, os.obj, verts, uvs, indices, groups, normals, weightedControlIdx, outVertexColors, allowMapChannel1, outFastVertexSources, outUV2s, emitPrimaryUVs);
+    const bool ok = ExtractMeshFromTriObject(tri, tri, verts, uvs, indices, groups, normals, weightedControlIdx, outVertexColors, allowMapChannel1, outFastVertexSources, outUV2s, emitPrimaryUVs);
     if (ok && wantsDeformWeights && !deformWeights.empty())
         AppendDeformWeightChannel(deformWeights, *weightedControlIdx, outVertexColors);
     if (ok && outEpoch) *outEpoch = triEpoch;
+    if (ok && canRetainFastNormalPlan())
+        BuildFastNormalPlanFromMesh(tri->GetMesh(), *outFastVertexSources, *outFastNormalPlan);
+    if (tri != os.obj) tri->DeleteThis();
     return ok;
 }
 

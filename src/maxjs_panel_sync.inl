@@ -66,7 +66,7 @@
         InterlockedExchange(&activeShadeTickPosted_, 0);
     }
 
-    void GetActiveCamera(CameraData& cam) {
+    void GetActiveCameraAtTime(CameraData& cam, TimeValue t) {
         if (renderCameraOverrideActive_) {
             cam = renderCameraOverride_;
             return;
@@ -74,13 +74,18 @@
         if (lockedCameraHandle_ != 0) {
             Interface* ip = GetCOREInterface();
             INode* camNode = ip ? ip->GetINodeByHandle(lockedCameraHandle_) : nullptr;
-            if (camNode && GetSceneCameraData(camNode, ip->GetTime(), cam)) {
+            if (camNode && GetSceneCameraData(camNode, t, cam)) {
                 return;
             }
             // Camera deleted or invalid — fall back to viewport
             lockedCameraHandle_ = 0;
         }
         GetViewportCamera(cam);
+    }
+
+    void GetActiveCamera(CameraData& cam) {
+        Interface* ip = GetCOREInterface();
+        GetActiveCameraAtTime(cam, ip ? ip->GetTime() : 0);
     }
 
     void CaptureCurrentCameraState() {
@@ -106,9 +111,41 @@
         fastDeformSharedBuffers_.erase(it);
     }
 
+    void ClosePlaybackSharedBuffers() {
+        for (auto& slot : playbackStateSharedBuffers_) {
+            if (slot.buf) slot.buf->Close();
+            slot.buf.Reset();
+            slot.capacity = 0;
+        }
+        for (auto& slot : playbackSnapshotSharedBuffers_) {
+            if (slot.buf) slot.buf->Close();
+            slot.buf.Reset();
+            slot.capacity = 0;
+        }
+        playbackStateSharedBufferNext_ = 0;
+        playbackSnapshotSharedBufferNext_ = 0;
+        playbackSnapshotCopySlot_ = -1;
+        playbackSnapshotCopyOffset_ = 0;
+    }
+
+    void ClearPendingDeformNormalRefresh() {
+        deformNormalRefreshPendingHandles_.clear();
+        deformNormalRefreshDueTick_ = 0;
+        deformNormalRefreshQueuedHandle_ = 0;
+    }
+
+    void ClearGeometryFastFlushQueue() {
+        geoFastDirtyHandles_.clear();
+        geoFullFastDirtyHandles_.clear();
+        geometryFastFlushNotBeforeTick_ = 0;
+    }
+
     void EraseFastDeformState(ULONG handle) {
         EraseFastDeformReplayState(handle);
         CloseFastDeformSharedBuffers(handle);
+        deformNormalRefreshPendingHandles_.erase(handle);
+        if (deformNormalRefreshQueuedHandle_ == handle) deformNormalRefreshQueuedHandle_ = 0;
+        if (deformNormalRefreshPendingHandles_.empty()) deformNormalRefreshDueTick_ = 0;
     }
 
     void ClearFastDeformState() {
@@ -121,6 +158,10 @@
             }
         }
         fastDeformSharedBuffers_.clear();
+        // These buffers share the WebView/environment lifetime even though
+        // their payload is transform data rather than deform geometry.
+        ClosePlaybackSharedBuffers();
+        ClearPendingDeformNormalRefresh();
     }
 
     void PruneFastDeformState() {
@@ -149,6 +190,43 @@
             } else {
                 ++it;
             }
+        }
+        for (auto it = deformNormalRefreshPendingHandles_.begin();
+             it != deformNormalRefreshPendingHandles_.end(); ) {
+            if (stale(*it)) it = deformNormalRefreshPendingHandles_.erase(it);
+            else ++it;
+        }
+        if (deformNormalRefreshQueuedHandle_ != 0 &&
+            deformNormalRefreshPendingHandles_.find(deformNormalRefreshQueuedHandle_) ==
+                deformNormalRefreshPendingHandles_.end()) {
+            deformNormalRefreshQueuedHandle_ = 0;
+        }
+        if (deformNormalRefreshPendingHandles_.empty()) deformNormalRefreshDueTick_ = 0;
+    }
+
+    void RecordDeformNormalPost(ULONG handle,
+                                bool requiresCpuNormalRefresh,
+                                bool liveNormalsPosted,
+                                HRESULT postResult) {
+        if (!requiresCpuNormalRefresh) return;
+        if (liveNormalsPosted && SUCCEEDED(postResult)) {
+            // Keep the settle request until the WebView has accepted an exact
+            // live-normal payload. Extraction alone is not delivery.
+            deformNormalRefreshPendingHandles_.erase(handle);
+            if (deformNormalRefreshQueuedHandle_ == handle) deformNormalRefreshQueuedHandle_ = 0;
+            if (deformNormalRefreshPendingHandles_.empty()) deformNormalRefreshDueTick_ = 0;
+        } else {
+            // Arm before transport too: buffer creation or Post* can fail after
+            // the sampled-position hash was advanced, so this settle lane is
+            // also the guaranteed retry for the geometry payload itself.
+            deformNormalRefreshPendingHandles_.insert(handle);
+            const ULONGLONG now = GetTickCount64();
+            // Base the quiet/retry period on the actual transport attempt, not
+            // just the Max time event that scheduled it. This also prevents a
+            // failed exact post from rebuilding normals every timer tick.
+            deformNormalRefreshDueTick_ = std::max(
+                deformNormalRefreshDueTick_,
+                now + kInteractiveCooldownMs);
         }
     }
 
@@ -278,15 +356,11 @@
     }
 
     void CheckSkinnedGeometryLive(bool forceForCurrentTime = false) {
-        if (skinnedHandles_.empty() && deformHandles_.empty()) return;
+        if (timelineDeformHandles_.empty()) return;
         Interface* ip = GetCOREInterface();
         if (!ip) return;
-        TimeValue t = ip->GetTime();
-        if (forceForCurrentTime &&
-            haveLastDeformLivePollTime_ &&
-            lastDeformLivePollTime_ == t) {
-            return;
-        }
+        const TimeValue t = ip->GetTime();
+        const bool playing = ip->IsAnimPlaying() != 0;
         const ULONGLONG now = MaxJSLivePollNowMs();
         if (!forceForCurrentTime &&
             lastSkinnedLivePollTick_ != 0 &&
@@ -294,8 +368,33 @@
             return;
         }
         lastSkinnedLivePollTick_ = now;
-        haveLastDeformLivePollTime_ = true;
-        lastDeformLivePollTime_ = t;
+
+        if (forceForCurrentTime) {
+            if (!timelineDeformScanActive_ &&
+                haveLastDeformLivePollTime_ &&
+                lastDeformLivePollTime_ == t &&
+                timelineDeformScanPlaying_ == playing) {
+                return;
+            }
+
+            if (!timelineDeformScanActive_) {
+                timelineDeformScanActive_ = true;
+                timelineDeformScanCursor_ = 0;
+                timelineDeformScanTime_ = t;
+                timelineDeformScanPlaying_ = playing;
+            } else if (timelineDeformScanTime_ != t ||
+                       timelineDeformScanPlaying_ != playing) {
+                // Continuous playback must remain fair: keep walking the
+                // current round-robin cycle as time advances.  A stopped
+                // target is authoritative, so restart at handle zero and
+                // cover every deformer at that exact final time.
+                if (!playing || !timelineDeformScanPlaying_) {
+                    timelineDeformScanCursor_ = 0;
+                }
+                timelineDeformScanTime_ = t;
+                timelineDeformScanPlaying_ = playing;
+            }
+        }
 
         // Any of these means "something is actively changing this frame" and
         // the hash check is wasted work — extraction will happen anyway:
@@ -309,22 +408,12 @@
                      || ShouldFavorInteractivePerformance();
 
         bool changed = false;
-        std::vector<ULONG> deformingHandles;
-        deformingHandles.reserve(skinnedHandles_.size() + deformHandles_.size());
-        deformingHandles.insert(deformingHandles.end(), skinnedHandles_.begin(), skinnedHandles_.end());
-        for (ULONG handle : deformHandles_) {
-            // Skip handles already represented via skinnedHandles_ — most
-            // skinned meshes also have a derived-object wrapper, but one eval
-            // per handle per tick is the contract here.
-            if (skinnedHandles_.count(handle)) continue;
-            deformingHandles.push_back(handle);
-        }
 
         auto pollHandle = [&](ULONG handle) {
             if (geoFastDirtyHandles_.count(handle)) return;
             INode* node = ip->GetINodeByHandle(handle);
             if (!node) return;
-            if (forceForCurrentTime && IsAnimationPlaying() && !IsMaxJsSyncDrawVisible(node)) {
+            if (forceForCurrentTime && playing && !IsMaxJsSyncDrawVisible(node)) {
                 return;
             }
             const bool omitFastChannels = ShouldOmitGeometryFastChannels(node, t);
@@ -332,7 +421,7 @@
             if (skipHash) {
                 if (!omitFastChannels &&
                     !timelineFastLane &&
-                    !IsAnimationPlaying() &&
+                    !playing &&
                     node->Selected() &&
                     HasDeformingChannelChange(handle, node, t, true)) {
                     geoHashMap_.erase(handle);
@@ -384,19 +473,41 @@
             changed = true;
         };
 
-        // Same rule as transform sync: playback and active manipulation must
-        // be complete per tick or the viewer appears to stutter/lag behind
-        // Max. Idle polling can stay budgeted because it is only a safety net
-        // for background validity churn.
-        if (skipHash) {
-            deformLiveScanCursor_ = 0;
-            for (ULONG handle : deformingHandles) pollHandle(handle);
+        const ULONGLONG passStart = GetTickCount64();
+        if (forceForCurrentTime) {
+            size_t visited = 0;
+            while (timelineDeformScanCursor_ < timelineDeformHandles_.size() &&
+                   visited < kMaxDeformingGeometryHandlesPerTick) {
+                pollHandle(timelineDeformHandles_[timelineDeformScanCursor_++]);
+                ++visited;
+                if (visited > 0 &&
+                    (GetTickCount64() - passStart) >= kTimelineSampleBudgetMs) {
+                    break;
+                }
+            }
+
+            if (timelineDeformScanCursor_ < timelineDeformHandles_.size()) {
+                // DrainTimelineScanRequests clears the flag before calling us;
+                // explicitly retain ownership until the complete fair sweep is
+                // sampled.  The caller posts the next bounded turn.
+                pendingTimelineDeformScan_ = true;
+            } else {
+                timelineDeformScanActive_ = false;
+                timelineDeformScanCursor_ = 0;
+                haveLastDeformLivePollTime_ = true;
+                lastDeformLivePollTime_ = t;
+            }
         } else {
-            VisitBudgetedHandles(
-                deformingHandles,
-                deformLiveScanCursor_,
-                kMaxDeformingGeometryHandlesPerTick,
-                pollHandle);
+            const size_t count = timelineDeformHandles_.size();
+            const size_t maxVisit = std::min(kMaxDeformingGeometryHandlesPerTick, count);
+            size_t visited = 0;
+            while (visited < maxVisit) {
+                const size_t index = deformLiveScanCursor_ % count;
+                deformLiveScanCursor_ = (index + 1) % count;
+                pollHandle(timelineDeformHandles_[index]);
+                ++visited;
+                if ((GetTickCount64() - passStart) >= kTimelineSampleBudgetMs) break;
+            }
         }
         if (changed) QueueFastFlush();
     }
@@ -591,12 +702,12 @@
                                     float currentWorldOut[16] = nullptr) const {
         if (!node) return false;
 
-        auto worldIt = lastSentTransforms_.find(handle);
-        if (worldIt == lastSentTransforms_.end()) return true;
-
         float world[16];
         GetTransform16(node, t, world);
         if (currentWorldOut) std::copy(world, world + 16, currentWorldOut);
+
+        auto worldIt = lastSentTransforms_.find(handle);
+        if (worldIt == lastSentTransforms_.end()) return true;
 
         float local[16];
         float previousLocal[16];
@@ -636,6 +747,113 @@
         });
     }
 
+    bool EnsurePlaybackSharedBuffers(size_t snapshotCapacity) {
+        if (!webview_ || !env_ || !useBinary_) return false;
+
+        ComPtr<ICoreWebView2Environment12> env12;
+        env_->QueryInterface(IID_PPV_ARGS(&env12));
+        if (!env12) return false;
+
+        auto ensureSlot = [&](PlaybackSharedBufferSlot& slot, size_t requested) {
+            const UINT64 required = static_cast<UINT64>(std::max<size_t>(4, requested));
+            if (slot.buf && slot.capacity >= required) return true;
+
+            if (slot.buf) slot.buf->Close();
+            slot.buf.Reset();
+            slot.capacity = 0;
+
+            ComPtr<ICoreWebView2SharedBuffer> replacement;
+            const HRESULT hr = env12->CreateSharedBuffer(required, &replacement);
+            if (FAILED(hr) || !replacement) return false;
+            slot.buf = std::move(replacement);
+            slot.capacity = required;
+            return true;
+        };
+
+        bool ready = true;
+        for (auto& slot : playbackStateSharedBuffers_) {
+            ready = ensureSlot(slot, 64) && ready;
+        }
+        for (auto& slot : playbackSnapshotSharedBuffers_) {
+            ready = ensureSlot(slot, snapshotCapacity) && ready;
+        }
+        return ready;
+    }
+
+    void RebuildTimelineHandleCaches() {
+        playbackSnapshotHandles_.clear();
+        timelineDeformHandles_.clear();
+
+        std::unordered_set<ULONG> seen;
+        seen.reserve(
+            geomHandles_.size() + lightHandles_.size() + splatHandles_.size() +
+            audioHandles_.size() + gltfHandles_.size() + webappHandles_.size() +
+            hairHandles_.size() + helperHandles_.size());
+        auto appendUnique = [&](const std::unordered_set<ULONG>& source) {
+            for (ULONG handle : source) {
+                if (seen.insert(handle).second) playbackSnapshotHandles_.push_back(handle);
+            }
+        };
+        appendUnique(helperHandles_);
+        appendUnique(geomHandles_);
+        appendUnique(lightHandles_);
+        appendUnique(splatHandles_);
+        appendUnique(audioHandles_);
+        appendUnique(gltfHandles_);
+        appendUnique(webappHandles_);
+        appendUnique(hairHandles_);
+
+        Interface* ip = GetCOREInterface();
+        SortHandlesByHierarchyDepth(playbackSnapshotHandles_, ip);
+        playbackSnapshotTransforms_.reserve(playbackSnapshotHandles_.size());
+        playbackSnapshotAux_.reserve(playbackSnapshotHandles_.size());
+        playbackStateFrame_.ReserveBytes(64);
+        const size_t playbackSnapshotCapacity =
+            96 + playbackSnapshotHandles_.size() * 176;
+        playbackSnapshotFrame_.ReserveBytes(playbackSnapshotCapacity);
+        // Shared-buffer allocation is deliberately paid at the full-sync
+        // boundary, never on Play, Stop, or a timeline-scrub WndProc turn.
+        EnsurePlaybackSharedBuffers(playbackSnapshotCapacity);
+
+        timelineDeformHandles_.reserve(skinnedHandles_.size() + deformHandles_.size());
+        timelineDeformHandles_.insert(
+            timelineDeformHandles_.end(), skinnedHandles_.begin(), skinnedHandles_.end());
+        for (ULONG handle : deformHandles_) {
+            if (skinnedHandles_.find(handle) == skinnedHandles_.end()) {
+                timelineDeformHandles_.push_back(handle);
+            }
+        }
+        std::sort(timelineDeformHandles_.begin(), timelineDeformHandles_.end());
+
+        timelineTransformScanActive_ = false;
+        timelineTransformScanCursor_ = 0;
+        timelineDeformScanActive_ = false;
+        timelineDeformScanCursor_ = 0;
+        deformLiveScanCursor_ = 0;
+    }
+
+    void CapturePlaybackDeliveredStateAtTime(TimeValue t) {
+        lastSentPlaybackAux_.clear();
+        lastSentPlaybackAux_.reserve(playbackSnapshotHandles_.size());
+
+        Interface* ip = GetCOREInterface();
+        if (!ip) return;
+        for (ULONG handle : playbackSnapshotHandles_) {
+            INode* node = ip->GetINodeByHandle(handle);
+            if (!node) continue;
+            PlaybackAuxDeliveryState& state = lastSentPlaybackAux_[handle];
+            state.visible = IsMaxJsSyncDrawVisible(node);
+            if (helperHandles_.find(handle) != helperHandles_.end()) {
+                state.selected = node->Selected() != 0;
+                state.hasSelection = true;
+            }
+            if (lightHandles_.find(handle) != lightHandles_.end()) {
+                state.lightStateHash = ComputeLightStateHash(node, t);
+                state.hasLightStateHash = true;
+            }
+        }
+    }
+
     static constexpr ULONGLONG kInteractiveCooldownMs = 250;
     static constexpr ULONGLONG kFullSyncInteractiveDeferMs = 650;
     static constexpr ULONGLONG kMaterialInteractiveCooldownMs = 400;
@@ -643,7 +861,14 @@
     static constexpr ULONGLONG kIdlePollFullSyncMinIntervalMs = 1500;
     static constexpr ULONGLONG kIdlePollAuditWindowMs = 4000;
     static constexpr size_t kMaxFastFlushHandlesPerPass = 128;
-    static constexpr size_t kMaxDeformingGeometryHandlesPerTick = 64;
+    static constexpr size_t kMaxGeometryFastFlushHandlesPerPass = 8;
+    static constexpr size_t kMaxTimelineSnapshotHandlesPerPass = 8;
+    static constexpr size_t kMaxDeformingGeometryHandlesPerTick = 8;
+    static constexpr ULONGLONG kTimelineSampleBudgetMs = 4;
+    static constexpr size_t kTimelineTransportCopyBytesPerPass = 256 * 1024;
+    static constexpr size_t kTimelineTransportCopyQuantumBytes = 16 * 1024;
+    static constexpr ULONGLONG kTransportRetryBackoffMs = 100;
+    static constexpr ULONGLONG kFullSyncTransportRetryBackoffMs = 500;
     static constexpr size_t kMaxIdleMaterialHandlesPerTick = 16;
     static constexpr size_t kMaxIdleLightHandlesPerTick = 64;
     static constexpr size_t kMaxIdleSplatHandlesPerTick = 64;
@@ -1016,6 +1241,25 @@
         return ip && ip->IsAnimPlaying() != 0;
     }
 
+    void QueuePostedTimelineSync() {
+        playbackFlushPending_ = true;
+        if (playbackFlushPosted_) return;
+        const ULONGLONG now = GetTickCount64();
+        if (playbackFlushRetryNotBeforeTick_ != 0 &&
+            now < playbackFlushRetryNotBeforeTick_) {
+            return;
+        }
+        if (!hwnd_ || !IsWindow(hwnd_) || !IsWindowVisible(hwnd_)) {
+            playbackFlushRetryNotBeforeTick_ = now + kTransportRetryBackoffMs;
+            return;
+        }
+        if (PostMessage(hwnd_, WM_PLAYBACK_FLUSH, 0, 0)) {
+            playbackFlushPosted_ = true;
+        } else {
+            playbackFlushRetryNotBeforeTick_ = now + kTransportRetryBackoffMs;
+        }
+    }
+
     void PumpTimelineSyncFromTimer() {
         Interface* ip = GetCOREInterface();
         if (!ip) return;
@@ -1034,116 +1278,160 @@
     void PumpPlaybackSyncFromTimer() {
         Interface* ip = GetCOREInterface();
         if (!ip) return;
+        // A stopped final-pose transport retry may have no further TimeChanged
+        // event. Keep its mailbox timer-driven until the backoff expires.
+        if (playbackFlushPending_) {
+            QueuePostedTimelineSync();
+            return;
+        }
         if (!IsAnimationPlaying()) {
             haveLastPlaybackPollTime_ = false;
             return;
         }
-        if (playbackFlushPending_) return;
 
         const TimeValue t = ip->GetTime();
-        if (haveLastPlaybackPollTime_ && t == lastPlaybackPollTime_) return;
-        haveLastPlaybackPollTime_ = true;
-        lastPlaybackPollTime_ = t;
-
-        // Brute-force playback lane: sample the current evaluated Max time
-        // from our own pump and send the whole tracked transform/time state.
-        // This keeps viewer playback deterministic without blocking the
-        // timeline callback that advances Max itself.
-        SendPlaybackDeltaAtTime(t);
-
-        if (!skinnedHandles_.empty() || !deformHandles_.empty()) {
-            pendingTimelineDeformScan_ = true;
-            QueueFastFlush();
+        if (!playbackRequestedStateKnown_ ||
+            playbackRequestedTime_ != t ||
+            !playbackRequestedPlaying_) {
+            OnTimelineTimeChanged(t);
         }
     }
 
     void FlushPostedPlaybackSync() {
+        playbackFlushPosted_ = false;
         if (!playbackFlushPending_) return;
-        playbackFlushPending_ = false;
 
-        const TimeValue t = playbackFlushTime_;
-        haveLastPlaybackPollTime_ = true;
-        lastPlaybackPollTime_ = t;
-
-        SendPlaybackDeltaAtTime(t);
-
-        if (!skinnedHandles_.empty() || !deformHandles_.empty()) {
-            pendingTimelineDeformScan_ = true;
-            QueueFastFlush();
+        const ULONGLONG now = GetTickCount64();
+        if (playbackFlushRetryNotBeforeTick_ != 0 &&
+            now < playbackFlushRetryNotBeforeTick_) {
+            return;
         }
+
+        // TimeChanged only schedules this work. Sample Max again here so a
+        // queued playback tick can never publish stale time or revive the
+        // playing flag after the user has already pressed Stop.
+        Interface* ip = GetCOREInterface();
+        if (!ip) {
+            playbackFlushRetryNotBeforeTick_ = now + kTransportRetryBackoffMs;
+            return;
+        }
+        const TimeValue t = ip->GetTime();
+        const bool playing = ip->IsAnimPlaying() != 0;
+
+        haveLastTimerTime_ = true;
+        lastTimerTime_ = t;
+        if (!playbackRequestedStateKnown_) {
+            playbackRequestedTime_ = t;
+            playbackRequestedPlaying_ = playing;
+            playbackRequestedStateKnown_ = true;
+        } else if (playbackRequestedTime_ != t ||
+                   playbackRequestedPlaying_ != playing) {
+            // Timer observation is a second latest-state mailbox.  It covers
+            // play/stop transitions for which Max does not emit TimeChanged.
+            playbackRequestedTime_ = t;
+            playbackRequestedPlaying_ = playing;
+            ++playbackRequestSerial_;
+        }
+        if (playbackRequestSerial_ == 0) ++playbackRequestSerial_;
+        haveLastPlaybackPollTime_ = playing;
+        if (playing) lastPlaybackPollTime_ = t;
+
+        const PlaybackSyncResult result = SendPlaybackDeltaAtTime(t, playing);
+        if (result == PlaybackSyncResult::NeedsSlice) {
+            playbackFlushRetryNotBeforeTick_ = 0;
+            // Only bounded work continuation reposts immediately. Transport
+            // failures and hidden/unavailable hosts wait for the timer below.
+            QueuePostedTimelineSync();
+            return;
+        }
+        if (result == PlaybackSyncResult::RetryLater) {
+            playbackFlushRetryNotBeforeTick_ = now + kTransportRetryBackoffMs;
+            return;
+        }
+
+        playbackFlushRetryNotBeforeTick_ = 0;
+        playbackFlushPending_ = false;
     }
 
     void OnTimelineTimeChanged(TimeValue t) {
         haveLastTimerTime_ = true;
         lastTimerTime_ = t;
 
-        if (IsAnimationPlaying()) {
-            // Playback: do not produce sync from Max's timeline callback.
-            // This callback is on the path that advances Max's own time
-            // slider; any packing/eval/send work here directly harms Max
-            // playback cadence. Store the authored time and post a lightweight
-            // message so the real data read/send happens after the callback.
-            const bool alreadyPending = playbackFlushPending_;
-            playbackFlushTime_ = t;
-            playbackFlushPending_ = true;
-            if (!alreadyPending && hwnd_) PostMessage(hwnd_, WM_PLAYBACK_FLUSH, 0, 0);
-            return;
+        // This callback sits directly on Max's play/stop/scrub path. Keep it a
+        // latest-state mailbox only: no scene evaluation, geometry extraction,
+        // packing, or WebView calls are allowed before the callback returns.
+        const ULONGLONG now = GetTickCount64();
+        lastTimelineInteractionTick_ = now;
+        lastInteractionTick_ = now;
+
+        playbackRequestedTime_ = t;
+        playbackRequestedStateKnown_ = false; // posted turn samples authoritative play/stop state
+        ++playbackRequestSerial_;
+
+        QueuePostedTimelineSync();
+    }
+
+    bool PostPreparedSharedDeltaBuffer(ICoreWebView2SharedBuffer* sharedBuf,
+                                       std::uint32_t frameId,
+                                       std::uint32_t commandCount,
+                                       size_t producerBytes) {
+        if (!webview_ || !useBinary_ || !sharedBuf) return false;
+        ComPtr<ICoreWebView2_17> wv17;
+        webview_->QueryInterface(IID_PPV_ARGS(&wv17));
+        if (!wv17) return false;
+
+        if (commandCount == 0) return true;
+
+        std::wostringstream meta;
+        meta.imbue(std::locale::classic());
+        meta << L"{\"type\":\"delta_bin\",\"frame\":" << frameId;
+        meta << L",\"stats\":{\"producerBytes\":" << producerBytes;
+        meta << L",\"commandCount\":" << commandCount << L"}}";
+
+        const HRESULT postResult = wv17->PostSharedBufferToScript(
+            sharedBuf,
+            COREWEBVIEW2_SHARED_BUFFER_ACCESS_READ_ONLY,
+            meta.str().c_str());
+        return SUCCEEDED(postResult);
+    }
+
+    bool PostSharedDeltaBytes(const std::vector<std::uint8_t>& frameBytes,
+                              std::uint32_t frameId,
+                              std::uint32_t commandCount,
+                              size_t producerBytesFallback = 0) {
+        if (!webview_ || !env_ || !useBinary_) return false;
+
+        ComPtr<ICoreWebView2Environment12> env12;
+        env_->QueryInterface(IID_PPV_ARGS(&env12));
+        if (!env12) return false;
+
+        if (commandCount == 0) return true;
+        const size_t totalBytes = frameBytes.empty() ? 4 : frameBytes.size();
+
+        ComPtr<ICoreWebView2SharedBuffer> sharedBuf;
+        const HRESULT hr = env12->CreateSharedBuffer(totalBytes, &sharedBuf);
+        if (FAILED(hr) || !sharedBuf) return false;
+
+        BYTE* bufPtr = nullptr;
+        const HRESULT bufferResult = sharedBuf->get_Buffer(&bufPtr);
+        if (FAILED(bufferResult) || !bufPtr) return false;
+        if (!frameBytes.empty()) {
+            memcpy(bufPtr, frameBytes.data(), frameBytes.size());
         }
 
-        fastTimeDirty_ = true;
-        lastTimelineInteractionTick_ = GetTickCount64();
-
-        // Scrub: direct flush for lowest latency.
-        const bool wasSuppressingPost = suppressFastFlushPost_;
-        suppressFastFlushPost_ = true;
-        MarkAnimatedTransformsDirty();
-        CheckSkinnedGeometryLive(true);
-        MarkCameraDirtyIfChanged(false);
-        suppressFastFlushPost_ = wasSuppressingPost;
-
-        FlushFastPathNow();
-        MarkInteractiveActivity();
+        return PostPreparedSharedDeltaBuffer(
+            sharedBuf.Get(),
+            frameId,
+            commandCount,
+            frameBytes.empty() ? producerBytesFallback : frameBytes.size());
     }
 
     bool SendSharedDeltaFrame(maxjs::sync::DeltaFrameBuilder& frame,
                               std::uint32_t frameId,
                               size_t producerBytesFallback = 0) {
-        if (!webview_ || !env_ || !useBinary_) return false;
-
-        ComPtr<ICoreWebView2_17> wv17;
-        ComPtr<ICoreWebView2Environment12> env12;
-        webview_->QueryInterface(IID_PPV_ARGS(&wv17));
-        env_->QueryInterface(IID_PPV_ARGS(&env12));
-        if (!wv17 || !env12) return false;
-
         frame.EndFrame();
-        if (frame.command_count() == 0) return true;
-
-        const auto& frameBytes = frame.bytes();
-        const size_t totalBytes = frameBytes.empty() ? 4 : frameBytes.size();
-
-        ComPtr<ICoreWebView2SharedBuffer> sharedBuf;
-        HRESULT hr = env12->CreateSharedBuffer(totalBytes, &sharedBuf);
-        if (FAILED(hr) || !sharedBuf) return false;
-
-        BYTE* bufPtr = nullptr;
-        sharedBuf->get_Buffer(&bufPtr);
-        if (bufPtr && !frameBytes.empty()) {
-            memcpy(bufPtr, frameBytes.data(), frameBytes.size());
-        }
-
-        std::wostringstream meta;
-        meta.imbue(std::locale::classic());
-        meta << L"{\"type\":\"delta_bin\",\"frame\":" << frameId;
-        meta << L",\"stats\":{\"producerBytes\":"
-             << (frameBytes.empty() ? producerBytesFallback : frameBytes.size());
-        meta << L",\"commandCount\":" << frame.command_count() << L"}}";
-
-        wv17->PostSharedBufferToScript(
-            sharedBuf.Get(),
-            COREWEBVIEW2_SHARED_BUFFER_ACCESS_READ_ONLY,
-            meta.str().c_str());
-        return true;
+        return PostSharedDeltaBytes(
+            frame.bytes(), frameId, frame.command_count(), producerBytesFallback);
     }
 
     bool PostSharedFloatPacket(const wchar_t* type, const std::vector<float>& floats, const std::wstring& extraMeta = L"") {
@@ -1394,121 +1682,405 @@
         return PostSharedFloatPacket(L"gi_light_bin", out, extra.str());
     }
 
-    void SendPlaybackDeltaAtTime(TimeValue t) {
-        if (!jsReady_ || !webview_ || !hwnd_ || !IsWindowVisible(hwnd_)) return;
+    void ResetInProgressPlaybackSnapshot() {
+        playbackSnapshotActive_ = false;
+        playbackSnapshotFinalized_ = false;
+        playbackSnapshotPosted_ = false;
+        playbackSnapshotTransformStageReady_ = false;
+        playbackSnapshotCursor_ = 0;
+        playbackSnapshotHasCamera_ = false;
+        playbackSnapshotCopySlot_ = -1;
+        playbackSnapshotCopyOffset_ = 0;
+    }
+
+    bool SendTimelineStateOnly(TimeValue t, bool playing) {
         if (!useBinary_ || !env_) {
-            pendingTimelineTransformScan_ = true;
-            pendingTimelineCameraCheck_ = true;
+            fastTimeDirty_ = true;
             QueueFastFlush();
-            return;
+            return fastFlushPosted_ || fastFlushInProgress_;
         }
 
-        Interface* ip = GetCOREInterface();
-        if (!ip) return;
+        const std::uint32_t frameId = AllocateFrameId();
+        playbackStateFrame_.Reset(frameId);
+        playbackStateFrame_.BeginFrame();
+        playbackStateFrame_.UpdateTime(
+            static_cast<std::int32_t>(t), GetTicksPerFrame(), playing ? 0x01 : 0x00);
+        // maxTimeline dispatches this state on requestAnimationFrame; no scene
+        // listener runs synchronously against the old pose while the bounded
+        // native snapshot is still being sampled.
+        playbackStateFrame_.EndFrame();
+
+        const auto& frameBytes = playbackStateFrame_.bytes();
+        int stateSlotIndex = playbackStateSharedBufferNext_ & 1;
+        auto stateSlotReady = [&](int index) {
+            const PlaybackSharedBufferSlot& candidate = playbackStateSharedBuffers_[index];
+            return candidate.buf && candidate.capacity >= frameBytes.size();
+        };
+        if (!stateSlotReady(stateSlotIndex) && stateSlotReady(stateSlotIndex ^ 1)) {
+            stateSlotIndex ^= 1;
+        }
+        PlaybackSharedBufferSlot& slot = playbackStateSharedBuffers_[stateSlotIndex];
+        if (!stateSlotReady(stateSlotIndex)) {
+            // Capacity is provisioned only at a full-sync boundary. Re-arm one
+            // rather than allocating on the user's timeline interaction path.
+            SetDirtyImmediate(false);
+            return false;
+        }
+
+        BYTE* bufPtr = nullptr;
+        const HRESULT bufferResult = slot.buf->get_Buffer(&bufPtr);
+        if (FAILED(bufferResult) || !bufPtr) return false;
+        memcpy(bufPtr, frameBytes.data(), frameBytes.size());
+        if (!PostPreparedSharedDeltaBuffer(
+                slot.buf.Get(), frameId, playbackStateFrame_.command_count(), frameBytes.size())) {
+            return false;
+        }
+        playbackStateSharedBufferNext_ = (stateSlotIndex + 1) & 1;
+        return true;
+    }
+
+    void StartPlaybackSnapshot(TimeValue t, bool playing, std::uint64_t requestSerial) {
+        playbackSnapshotActive_ = true;
+        playbackSnapshotFinalized_ = false;
+        playbackSnapshotPosted_ = false;
+        playbackSnapshotTransformStageReady_ = false;
+        playbackSnapshotTime_ = t;
+        playbackSnapshotPlaying_ = playing;
+        playbackSnapshotSerial_ = requestSerial;
+        playbackSnapshotCursor_ = 0;
+        playbackSnapshotHasCamera_ = false;
 
         const std::uint32_t frameId = AllocateFrameId();
-        maxjs::sync::DeltaFrameBuilder frame(frameId);
-        const size_t handleCount =
-            helperHandles_.size() +
-            geomHandles_.size() +
-            lightHandles_.size() +
-            splatHandles_.size() +
-            audioHandles_.size() +
-            gltfHandles_.size() +
-            webappHandles_.size();
-        frame.ReserveBytes(32 + handleCount * 96 + 80);
-        frame.BeginFrame();
+        playbackSnapshotFrame_.Reset(frameId);
+        playbackSnapshotFrame_.BeginFrame();
+    }
 
-        auto shouldSendPlaybackHandle = [&](ULONG handle) -> bool {
-            INode* node = ip->GetINodeByHandle(handle);
-            if (!node) return true;
-            if (!SupportsParentedDeltaHandle(handle)) return true;
-            if (!GetDirectTrackedParentNode(node)) return true;
-            float currentWorld[16];
-            if (HasTransformChangedForSync(handle, node, t, currentWorld)) return true;
-            RememberSkippedParentedTransform(handle, node, currentWorld);
-            return false;
+    PlaybackSyncResult CopyAndPostFinalizedPlaybackSnapshot() {
+        const auto& frameBytes = playbackSnapshotFrame_.bytes();
+        if (playbackSnapshotPosted_) return PlaybackSyncResult::Complete;
+        if (playbackSnapshotFrame_.command_count() == 0) {
+            return PlaybackSyncResult::Complete;
+        }
+
+        if (playbackSnapshotCopySlot_ < 0) {
+            int candidate = playbackSnapshotSharedBufferNext_ & 1;
+            auto snapshotSlotReady = [&](int index) {
+                const PlaybackSharedBufferSlot& slot =
+                    playbackSnapshotSharedBuffers_[index];
+                return slot.buf && slot.capacity >= frameBytes.size();
+            };
+            if (!snapshotSlotReady(candidate) && snapshotSlotReady(candidate ^ 1)) {
+                candidate ^= 1;
+            }
+            if (!snapshotSlotReady(candidate)) {
+                // The scene grew beyond its full-sync epoch or preallocation
+                // failed. Never allocate here; a fresh full sync reprovisions.
+                SetDirtyImmediate(false);
+                return PlaybackSyncResult::RetryLater;
+            }
+            playbackSnapshotCopySlot_ = candidate;
+            playbackSnapshotCopyOffset_ = 0;
+            playbackSnapshotSharedBufferNext_ = (candidate + 1) & 1;
+        }
+
+        PlaybackSharedBufferSlot& slot =
+            playbackSnapshotSharedBuffers_[playbackSnapshotCopySlot_];
+        BYTE* bufPtr = nullptr;
+        const HRESULT bufferResult = slot.buf->get_Buffer(&bufPtr);
+        if (FAILED(bufferResult) || !bufPtr) {
+            return PlaybackSyncResult::RetryLater;
+        }
+
+        // Copy the already-finalized frame in small quanta. This combines a
+        // fixed byte ceiling with the same <=4ms UI-thread wall-clock budget
+        // used by scene sampling. A failed WebView post retains this completed
+        // slot and offset, so retry does not copy or evaluate the scene again.
+        const ULONGLONG passStart = GetTickCount64();
+        LARGE_INTEGER performanceFrequency = {};
+        LARGE_INTEGER performanceStart = {};
+        const bool havePerformanceClock =
+            QueryPerformanceFrequency(&performanceFrequency) != FALSE &&
+            QueryPerformanceCounter(&performanceStart) != FALSE &&
+            performanceFrequency.QuadPart > 0;
+        auto copyTimeBudgetExpired = [&]() {
+            if (havePerformanceClock) {
+                LARGE_INTEGER performanceNow = {};
+                QueryPerformanceCounter(&performanceNow);
+                return (performanceNow.QuadPart - performanceStart.QuadPart) * 1000 >=
+                       performanceFrequency.QuadPart *
+                           static_cast<LONGLONG>(kTimelineSampleBudgetMs);
+            }
+            return (GetTickCount64() - passStart) >= kTimelineSampleBudgetMs;
         };
+        size_t copiedThisPass = 0;
+        while (playbackSnapshotCopyOffset_ < frameBytes.size() &&
+               copiedThisPass < kTimelineTransportCopyBytesPerPass) {
+            const size_t remaining = frameBytes.size() - playbackSnapshotCopyOffset_;
+            const size_t passRemaining =
+                kTimelineTransportCopyBytesPerPass - copiedThisPass;
+            const size_t copyBytes = std::min(
+                remaining,
+                std::min(passRemaining, kTimelineTransportCopyQuantumBytes));
+            memcpy(
+                bufPtr + playbackSnapshotCopyOffset_,
+                frameBytes.data() + playbackSnapshotCopyOffset_,
+                copyBytes);
+            playbackSnapshotCopyOffset_ += copyBytes;
+            copiedThisPass += copyBytes;
+            if (copyTimeBudgetExpired()) break;
+        }
 
-        std::vector<ULONG> playbackHandles;
-        playbackHandles.reserve(handleCount);
-        auto collectHandle = [&](ULONG handle) {
-            if (shouldSendPlaybackHandle(handle)) playbackHandles.push_back(handle);
-        };
-        for (ULONG handle : helperHandles_) collectHandle(handle);
-        for (ULONG handle : geomHandles_) collectHandle(handle);
-        for (ULONG handle : lightHandles_) collectHandle(handle);
-        for (ULONG handle : splatHandles_) collectHandle(handle);
-        for (ULONG handle : audioHandles_) collectHandle(handle);
-        for (ULONG handle : gltfHandles_) collectHandle(handle);
-        for (ULONG handle : webappHandles_) collectHandle(handle);
-        SortHandlesByHierarchyDepth(playbackHandles, ip);
-
-        auto appendHandle = [&](ULONG handle) {
-            INode* node = ip->GetINodeByHandle(handle);
-            if (!node) {
-                SetDirty();
-                return;
-            }
-
-            float xform[16];
-            GetTransform16(node, t, xform);
-            RememberSentTransform(handle, xform);
-            const bool visible = IsMaxJsSyncDrawVisible(node);
-
-            if (lightHandles_.find(handle) != lightHandles_.end()) {
-                maxjs::sync::DeltaFrameBuilder::LightData ld = {};
-                ld.matrix16 = xform;
-                ld.visible = visible;
-                if (ExtractLightBinaryData(node, t, ld)) {
-                    frame.UpdateLight(static_cast<std::uint32_t>(handle), ld);
-                }
-                return;
-            }
-            if (splatHandles_.find(handle) != splatHandles_.end()) {
-                frame.UpdateSplat(static_cast<std::uint32_t>(handle), xform, visible);
-                return;
-            }
-            if (audioHandles_.find(handle) != audioHandles_.end()) {
-                frame.UpdateAudio(static_cast<std::uint32_t>(handle), xform, visible);
-                return;
-            }
-            if (gltfHandles_.find(handle) != gltfHandles_.end()) {
-                frame.UpdateGLTF(static_cast<std::uint32_t>(handle), xform, visible);
-                return;
-            }
-            if (webappHandles_.find(handle) != webappHandles_.end()) {
-                frame.UpdateWebApp(static_cast<std::uint32_t>(handle), xform, visible);
-                return;
-            }
-
-            frame.UpdateTransform(static_cast<std::uint32_t>(handle), xform);
-            if (helperHandles_.find(handle) != helperHandles_.end()) {
-                frame.UpdateSelection(static_cast<std::uint32_t>(handle), node->Selected() != 0);
-            }
-            frame.UpdateVisibility(static_cast<std::uint32_t>(handle), visible);
-        };
-
-        for (ULONG handle : playbackHandles) appendHandle(handle);
-
-        CameraData cam = {};
-        GetActiveCamera(cam);
-        if (!haveLastSentCamera_ || !CameraEquals(lastSentCamera_, cam)) {
-            frame.UpdateCamera(cam.pos, cam.target, cam.up, cam.fov, cam.perspective, cam.viewWidth,
-                               cam.dofEnabled, cam.dofFocusDistance, cam.dofFocalLength, cam.dofBokehScale);
-            lastSentCamera_ = cam;
+        if (playbackSnapshotCopyOffset_ < frameBytes.size()) {
+            return PlaybackSyncResult::NeedsSlice;
+        }
+        if (!PostPreparedSharedDeltaBuffer(
+                slot.buf.Get(),
+                playbackSnapshotFrame_.frame_id(),
+                playbackSnapshotFrame_.command_count(),
+                frameBytes.size())) {
+            return PlaybackSyncResult::RetryLater;
+        }
+        // Delivery is the atomic cache commit point. Both inactive maps contain
+        // the complete sampled state, so transforms and auxiliary visibility /
+        // selection / light hashes advance together in O(1). A newer stopped
+        // target can now safely supersede this snapshot without comparing
+        // against state older than what the viewer actually received.
+        lastSentTransforms_.swap(playbackSnapshotTransforms_);
+        lastSentPlaybackAux_.swap(playbackSnapshotAux_);
+        if (playbackSnapshotHasCamera_) {
+            lastSentCamera_ = playbackSnapshotCamera_;
             haveLastSentCamera_ = true;
             fastCameraDirty_ = false;
         }
+        playbackSnapshotPosted_ = true;
+        return PlaybackSyncResult::Complete;
+    }
 
-        const std::int32_t tpf = GetTicksPerFrame();
-        frame.UpdateTime(static_cast<std::int32_t>(t), tpf, 0x01);
-
-        if (!SendSharedDeltaFrame(frame, frameId)) {
+    PlaybackSyncResult SendPlaybackDeltaAtTime(TimeValue t, bool playing) {
+        if (!jsReady_ || !webview_ || !hwnd_ || !IsWindow(hwnd_) ||
+            !IsWindowVisible(hwnd_)) {
+            return PlaybackSyncResult::RetryLater;
+        }
+        if (!useBinary_ || !env_) {
+            // Debug JSON mode retains its bounded dirty-scan fallback.  The
+            // normal LIVE path below is the atomic binary snapshot lane.
             pendingTimelineTransformScan_ = true;
             pendingTimelineCameraCheck_ = true;
+            fastTimeDirty_ = true;
+            QueueFastFlush();
+            return (fastFlushPosted_ || fastFlushInProgress_)
+                ? PlaybackSyncResult::Complete
+                : PlaybackSyncResult::RetryLater;
+        }
+
+        Interface* ip = GetCOREInterface();
+        if (!ip) return PlaybackSyncResult::RetryLater;
+
+        if (playbackStateSentSerial_ != playbackRequestSerial_) {
+            if (!SendTimelineStateOnly(t, playing)) {
+                return PlaybackSyncResult::RetryLater;
+            }
+            playbackStateSentSerial_ = playbackRequestSerial_;
+        }
+
+        const bool targetSupersedesActive =
+            playbackSnapshotActive_ &&
+            (playbackSnapshotSerial_ != playbackRequestSerial_ ||
+             playbackSnapshotTime_ != t ||
+             playbackSnapshotPlaying_ != playing);
+        if (targetSupersedesActive &&
+            (!playbackSnapshotPlaying_ || !playing)) {
+            // Scrub/seek and especially Stop are final-pose requests: discard
+            // an older in-progress sample immediately.  During continuous
+            // playing we instead finish one atomic sample so a large scene can
+            // never starve under a stream of newer ticks; the latest tick stays
+            // coalesced in playbackRequested* and starts next.
+            ResetInProgressPlaybackSnapshot();
+        }
+
+        if (!playbackSnapshotActive_) {
+            StartPlaybackSnapshot(t, playing, playbackRequestSerial_);
+        }
+
+        if (!playbackSnapshotFinalized_) {
+            const ULONGLONG passStart = GetTickCount64();
+            size_t visited = 0;
+            if (!playbackSnapshotTransformStageReady_) {
+                // A prior successful swap leaves the old acknowledged cache in
+                // this inactive map.  Drain it under the same UI-thread budget
+                // instead of calling unordered_map::clear() in one stop/play
+                // turn; once empty, its buckets are retained for this sample.
+                while ((!playbackSnapshotTransforms_.empty() ||
+                        !playbackSnapshotAux_.empty()) &&
+                       visited < kMaxTimelineSnapshotHandlesPerPass) {
+                    if (!playbackSnapshotTransforms_.empty()) {
+                        playbackSnapshotTransforms_.erase(
+                            playbackSnapshotTransforms_.begin());
+                    } else {
+                        playbackSnapshotAux_.erase(playbackSnapshotAux_.begin());
+                    }
+                    ++visited;
+                    if ((GetTickCount64() - passStart) >= kTimelineSampleBudgetMs) break;
+                }
+                if (!playbackSnapshotTransforms_.empty() ||
+                    !playbackSnapshotAux_.empty()) {
+                    return PlaybackSyncResult::NeedsSlice;
+                }
+                playbackSnapshotTransformStageReady_ = true;
+                if ((GetTickCount64() - passStart) >= kTimelineSampleBudgetMs) {
+                    return PlaybackSyncResult::NeedsSlice;
+                }
+                visited = 0;
+            }
+
+            while (playbackSnapshotCursor_ < playbackSnapshotHandles_.size() &&
+                   visited < kMaxTimelineSnapshotHandlesPerPass) {
+                const ULONG handle = playbackSnapshotHandles_[playbackSnapshotCursor_++];
+                ++visited;
+
+                INode* node = ip->GetINodeByHandle(handle);
+                if (!node) {
+                    playbackSnapshotTransforms_.erase(handle);
+                    SetDirty();
+                } else {
+                    float xform[16];
+                    const bool transformChanged = HasTransformChangedForSync(
+                        handle, node, playbackSnapshotTime_, xform);
+                    std::array<float, 16>& staged = playbackSnapshotTransforms_[handle];
+                    std::copy(xform, xform + 16, staged.begin());
+                    const bool visible = IsMaxJsSyncDrawVisible(node);
+                    const auto previousAuxIt = lastSentPlaybackAux_.find(handle);
+                    const bool hasPreviousAux =
+                        previousAuxIt != lastSentPlaybackAux_.end();
+                    PlaybackAuxDeliveryState currentAux = hasPreviousAux
+                        ? previousAuxIt->second
+                        : PlaybackAuxDeliveryState{};
+                    const bool visibilityChanged =
+                        !hasPreviousAux || currentAux.visible != visible;
+                    currentAux.visible = visible;
+
+                    if (lightHandles_.find(handle) != lightHandles_.end()) {
+                        const std::uint64_t lightStateHash =
+                            ComputeLightStateHash(node, playbackSnapshotTime_);
+                        const bool lightStateChanged =
+                            !hasPreviousAux || !currentAux.hasLightStateHash ||
+                            currentAux.lightStateHash != lightStateHash;
+                        if (transformChanged || lightStateChanged) {
+                            maxjs::sync::DeltaFrameBuilder::LightData ld = {};
+                            ld.matrix16 = xform;
+                            ld.visible = visible;
+                            if (ExtractLightBinaryData(node, playbackSnapshotTime_, ld)) {
+                                playbackSnapshotFrame_.UpdateLight(
+                                    static_cast<std::uint32_t>(handle), ld);
+                                currentAux.lightStateHash = lightStateHash;
+                                currentAux.hasLightStateHash = true;
+                            } else {
+                                if (transformChanged) {
+                                    playbackSnapshotFrame_.UpdateTransform(
+                                        static_cast<std::uint32_t>(handle), xform);
+                                }
+                                if (visibilityChanged) {
+                                    playbackSnapshotFrame_.UpdateVisibility(
+                                        static_cast<std::uint32_t>(handle), visible);
+                                }
+                                SetDirty();
+                            }
+                        }
+                    } else if (splatHandles_.find(handle) != splatHandles_.end()) {
+                        if (transformChanged || visibilityChanged) {
+                            playbackSnapshotFrame_.UpdateSplat(
+                                static_cast<std::uint32_t>(handle), xform, visible);
+                        }
+                    } else if (audioHandles_.find(handle) != audioHandles_.end()) {
+                        if (transformChanged || visibilityChanged) {
+                            playbackSnapshotFrame_.UpdateAudio(
+                                static_cast<std::uint32_t>(handle), xform, visible);
+                        }
+                    } else if (gltfHandles_.find(handle) != gltfHandles_.end()) {
+                        if (transformChanged || visibilityChanged) {
+                            playbackSnapshotFrame_.UpdateGLTF(
+                                static_cast<std::uint32_t>(handle), xform, visible);
+                        }
+                    } else if (webappHandles_.find(handle) != webappHandles_.end()) {
+                        if (transformChanged || visibilityChanged) {
+                            playbackSnapshotFrame_.UpdateWebApp(
+                                static_cast<std::uint32_t>(handle), xform, visible);
+                        }
+                    } else {
+                        if (transformChanged) {
+                            playbackSnapshotFrame_.UpdateTransform(
+                                static_cast<std::uint32_t>(handle), xform);
+                        }
+                        if (helperHandles_.find(handle) != helperHandles_.end()) {
+                            const bool selected = node->Selected() != 0;
+                            if (!currentAux.hasSelection ||
+                                currentAux.selected != selected) {
+                                playbackSnapshotFrame_.UpdateSelection(
+                                    static_cast<std::uint32_t>(handle), selected);
+                            }
+                            currentAux.selected = selected;
+                            currentAux.hasSelection = true;
+                        }
+                        if (visibilityChanged) {
+                            playbackSnapshotFrame_.UpdateVisibility(
+                                static_cast<std::uint32_t>(handle), visible);
+                        }
+                    }
+                    playbackSnapshotAux_[handle] = currentAux;
+                }
+
+                if ((GetTickCount64() - passStart) >= kTimelineSampleBudgetMs) break;
+            }
+
+            if (playbackSnapshotCursor_ < playbackSnapshotHandles_.size()) {
+                return PlaybackSyncResult::NeedsSlice;
+            }
+
+            GetActiveCameraAtTime(playbackSnapshotCamera_, playbackSnapshotTime_);
+            playbackSnapshotHasCamera_ =
+                !haveLastSentCamera_ ||
+                !CameraEquals(lastSentCamera_, playbackSnapshotCamera_);
+            if (playbackSnapshotHasCamera_) {
+                playbackSnapshotFrame_.UpdateCamera(
+                    playbackSnapshotCamera_.pos,
+                    playbackSnapshotCamera_.target,
+                    playbackSnapshotCamera_.up,
+                    playbackSnapshotCamera_.fov,
+                    playbackSnapshotCamera_.perspective,
+                    playbackSnapshotCamera_.viewWidth,
+                    playbackSnapshotCamera_.dofEnabled,
+                    playbackSnapshotCamera_.dofFocusDistance,
+                    playbackSnapshotCamera_.dofFocalLength,
+                    playbackSnapshotCamera_.dofBokehScale);
+            }
+            playbackSnapshotFrame_.EndFrame();
+            playbackSnapshotFinalized_ = true;
+            // Do not stack transport copying on the same WndProc turn that
+            // just finished scene evaluation and camera sampling.
+            return PlaybackSyncResult::NeedsSlice;
+        }
+
+        const PlaybackSyncResult transportResult =
+            CopyAndPostFinalizedPlaybackSnapshot();
+        if (transportResult != PlaybackSyncResult::Complete) {
+            return transportResult;
+        }
+
+        const std::uint64_t deliveredSerial = playbackSnapshotSerial_;
+        const TimeValue deliveredTime = playbackSnapshotTime_;
+        const bool deliveredPlaying = playbackSnapshotPlaying_;
+        ResetInProgressPlaybackSnapshot();
+
+        if (!timelineDeformHandles_.empty()) {
+            pendingTimelineDeformScan_ = true;
             QueueFastFlush();
         }
+
+        return deliveredSerial == playbackRequestSerial_ &&
+                       deliveredTime == t &&
+                       deliveredPlaying == playing
+            ? PlaybackSyncResult::Complete
+            : PlaybackSyncResult::NeedsSlice;
     }
 
     bool IsModifyTaskActive() const {
@@ -1544,6 +2116,72 @@
         return IsAnimationPlaying() || ShouldSuppressSelectedGeometryDuringTimeline();
     }
 
+    bool QueuePendingDeformNormalRefresh() {
+        if (deformNormalRefreshPendingHandles_.empty()) return false;
+        if (ShouldUseTimelineGeometryFastLane() || ShouldFavorInteractivePerformance()) return false;
+        if (deformNormalRefreshDueTick_ != 0 &&
+            GetTickCount64() < deformNormalRefreshDueTick_) return false;
+
+        Interface* ip = GetCOREInterface();
+        if (!ip) return false;
+
+        auto isLiveDeformer = [this, ip](ULONG handle) {
+            const bool stillDeforming =
+                skinnedHandles_.find(handle) != skinnedHandles_.end() ||
+                deformHandles_.find(handle) != deformHandles_.end();
+            return stillDeforming && ip->GetINodeByHandle(handle) != nullptr;
+        };
+
+        if (deformNormalRefreshQueuedHandle_ != 0) {
+            const ULONG queuedHandle = deformNormalRefreshQueuedHandle_;
+            if (deformNormalRefreshPendingHandles_.find(queuedHandle) !=
+                    deformNormalRefreshPendingHandles_.end() &&
+                isLiveDeformer(queuedHandle)) {
+                geoFastDirtyHandles_.insert(queuedHandle);
+                QueueFastFlush();
+                return true;
+            }
+            deformNormalRefreshPendingHandles_.erase(queuedHandle);
+            deformNormalRefreshQueuedHandle_ = 0;
+        }
+
+        ULONG refreshHandle = 0;
+        bool haveRefreshHandle = false;
+        size_t inspected = 0;
+        for (auto it = deformNormalRefreshPendingHandles_.begin();
+             it != deformNormalRefreshPendingHandles_.end() &&
+                 inspected < kMaxGeometryFastFlushHandlesPerPass; ) {
+            const ULONG handle = *it;
+            ++inspected;
+            if (!isLiveDeformer(handle)) {
+                it = deformNormalRefreshPendingHandles_.erase(it);
+                continue;
+            }
+            refreshHandle = handle;
+            haveRefreshHandle = true;
+            break;
+        }
+
+        if (!haveRefreshHandle) {
+            if (deformNormalRefreshPendingHandles_.empty()) {
+                deformNormalRefreshDueTick_ = 0;
+                return false;
+            }
+            // Stale-debt cleanup is bounded too. Leave the remaining set for
+            // the next 33 ms timer turn instead of scanning it all on Stop.
+            return true;
+        }
+
+        // Deliberately bypass lastLiveGeomHash_: a position-only update already
+        // recorded the final position hash, but its CPU normals still need one
+        // exact delivery after the interaction cools down. Queue one handle per
+        // pass so several rigs cannot aggregate into a new stop-time stall.
+        deformNormalRefreshQueuedHandle_ = refreshHandle;
+        geoFastDirtyHandles_.insert(refreshHandle);
+        QueueFastFlush();
+        return true;
+    }
+
     bool ShouldPollSelectedGeometryLive() const {
         return IsSubObjectEditingActive() || ShouldFavorInteractivePerformance();
     }
@@ -1555,6 +2193,11 @@
 
     bool CanFlushFastPathDuringPendingFullSync() const {
         if (!dirty_) return true;
+        // After a failed full-scene post there is no trustworthy viewer
+        // baseline. Geo-fast delivery could repopulate producer hashes against
+        // meshes the viewer never received, causing the full retry to omit
+        // geometry. Keep every delta owner queued until one scene is accepted.
+        if (fullSyncRetryNotBeforeTick_ != 0) return false;
         return ShouldDeferFullSyncForInteraction(GetTickCount64());
     }
 
@@ -1625,6 +2268,14 @@
         if (scanDeform) CheckSkinnedGeometryLive(true);
         if (checkCamera) MarkCameraDirtyIfChanged(false);
         suppressFastFlushPost_ = wasSuppressingPost;
+
+        // Bounded transform/deform scans re-arm their own flag until the
+        // cached handle cycle is complete.  Post the next slice only after the
+        // current WndProc turn returns.
+        if (pendingTimelineTransformScan_ || pendingTimelineDeformScan_ ||
+            pendingTimelineCameraCheck_) {
+            QueueFastFlush();
+        }
     }
 
     void ResetFastPathState(bool refreshCameraState = false) {
@@ -1641,6 +2292,16 @@
         pendingTimelineDeformScan_ = false;
         pendingTimelineCameraCheck_ = false;
         playbackFlushPending_ = false;
+        playbackFlushPosted_ = false;
+        playbackFlushRetryNotBeforeTick_ = 0;
+        fastFlushRetryNotBeforeTick_ = 0;
+        playbackRequestedStateKnown_ = false;
+        playbackRequestedTime_ = 0;
+        playbackRequestedPlaying_ = false;
+        playbackRequestSerial_ = 0;
+        playbackStateSentSerial_ = 0;
+        ResetInProgressPlaybackSnapshot();
+        playbackSnapshotTransforms_.clear();
         haveLastPlaybackPollTime_ = false;
         haveLastDeformLivePollTime_ = false;
         lastTimelineInteractionTick_ = 0;
@@ -1648,8 +2309,52 @@
         lastCameraLivePollTick_ = 0;
         lastRedrawLivePollTick_ = 0;
         deformLiveScanCursor_ = 0;
+        RebuildTimelineHandleCaches();
         if (refreshCameraState) CaptureCurrentCameraState();
         else haveLastSentCamera_ = false;
+    }
+
+    void HandleFullSyncDeliveryFailure() {
+        // A failed scene post did not advance viewer state. Invalidate every
+        // producer-side cache whose value could otherwise make the retry omit
+        // data as "already sent", most importantly geometry and transforms.
+        lastSentTransforms_.clear();
+        lastSentPlaybackAux_.clear();
+        haveLastSentCamera_ = false;
+        fastCameraDirty_ = true;
+        geoHashMap_.clear();
+        geoFastTriangleCountMap_.clear();
+        deformChannelHashMap_.clear();
+        groupCache_.clear();
+        lastBBoxHash_.clear();
+        lastLiveGeomHash_.clear();
+        mtlHashMap_.clear();
+        mtlScalarHashMap_.clear();
+        mtlFastScalarHashMap_.clear();
+        lightHashMap_.clear();
+        splatHashMap_.clear();
+        audioHashMap_.clear();
+        gltfHashMap_.clear();
+        webappHashMap_.clear();
+        propHashMap_.clear();
+        jsmodStateMap_.clear();
+        pluginInstHash_.clear();
+        ClearMaterialEditHandleCache();
+
+        playbackStateSentSerial_ = 0;
+        ResetInProgressPlaybackSnapshot();
+        playbackSnapshotTransforms_.clear();
+        RebuildTimelineHandleCaches();
+
+        pathTracingHasSceneSync_ = false;
+        SetDirtyImmediate(false);
+        // SetDirtyImmediate is intentionally disabled in slow-json mode; a
+        // failed explicit full-scene delivery must still retain ownership.
+        dirty_ = true;
+        dirtyStamp_ = 0;
+        idlePollFullSyncPending_ = false;
+        fullSyncRetryNotBeforeTick_ =
+            GetTickCount64() + kFullSyncTransportRetryBackoffMs;
     }
 
     bool ShouldBootstrapVisibleNode(INode* node, TimeValue t) const {
@@ -2116,11 +2821,26 @@
     }
 
     void MarkAnimatedTransformsDirty() {
-        if (!HasTrackedNodes()) return;
+        if (playbackSnapshotHandles_.empty()) return;
         Interface* ip = GetCOREInterface();
         if (!ip) return;
 
         const TimeValue t = ip->GetTime();
+        const bool playing = ip->IsAnimPlaying() != 0;
+        if (!timelineTransformScanActive_) {
+            timelineTransformScanActive_ = true;
+            timelineTransformScanCursor_ = 0;
+            timelineTransformScanTime_ = t;
+            timelineTransformScanPlaying_ = playing;
+        } else if (timelineTransformScanTime_ != t ||
+                   timelineTransformScanPlaying_ != playing) {
+            if (!playing || !timelineTransformScanPlaying_) {
+                timelineTransformScanCursor_ = 0;
+            }
+            timelineTransformScanTime_ = t;
+            timelineTransformScanPlaying_ = playing;
+        }
+
         bool changed = false;
         auto markIfTransformChanged = [this, t, &changed](ULONG handle) {
             INode* node = GetCOREInterface() ? GetCOREInterface()->GetINodeByHandle(handle) : nullptr;
@@ -2129,23 +2849,26 @@
             float currentWorld[16];
             if (HasTransformChangedForSync(handle, node, t, currentWorld)) {
                 if (fastDirtyHandles_.insert(handle).second) changed = true;
-            } else {
-                RememberSkippedParentedTransform(handle, node, currentWorld);
             }
         };
 
-        // Timeline playback/scrubbing must be complete every Max time tick.
-        // Budgeting this loop makes low-poly scenes look like the time slider
-        // is skipping because only part of the scene reaches the web side on a
-        // given tick. Keep quality here; reduce cost in heavier hashing paths.
-        for (ULONG handle : geomHandles_) markIfTransformChanged(handle);
-        for (ULONG handle : lightHandles_) markIfTransformChanged(handle);
-        for (ULONG handle : splatHandles_) markIfTransformChanged(handle);
-        for (ULONG handle : audioHandles_) markIfTransformChanged(handle);
-        for (ULONG handle : gltfHandles_) markIfTransformChanged(handle);
-        for (ULONG handle : webappHandles_) markIfTransformChanged(handle);
-        for (ULONG handle : hairHandles_) markIfTransformChanged(handle);
-        for (ULONG handle : helperHandles_) markIfTransformChanged(handle);
+        // JSON/debug fallback only.  Keep even this compatibility lane bounded
+        // so a timer/posted turn can never evaluate the complete scene.
+        const ULONGLONG passStart = GetTickCount64();
+        size_t visited = 0;
+        while (timelineTransformScanCursor_ < playbackSnapshotHandles_.size() &&
+               visited < kMaxTimelineSnapshotHandlesPerPass) {
+            markIfTransformChanged(playbackSnapshotHandles_[timelineTransformScanCursor_++]);
+            ++visited;
+            if ((GetTickCount64() - passStart) >= kTimelineSampleBudgetMs) break;
+        }
+
+        if (timelineTransformScanCursor_ < playbackSnapshotHandles_.size()) {
+            pendingTimelineTransformScan_ = true;
+        } else {
+            timelineTransformScanActive_ = false;
+            timelineTransformScanCursor_ = 0;
+        }
 
         if (changed) {
             QueueFastFlush();
@@ -2722,6 +3445,7 @@
             jsmodStateMap_.clear();
             inlineLayersStateSignature_.clear();  // re-scan inline layers on reconnect
             lastSentTransforms_.clear();
+            lastSentPlaybackAux_.clear();
             lightHandles_.clear();
             splatHandles_.clear();
             audioHandles_.clear();
@@ -2763,6 +3487,16 @@
 
         const ULONGLONG now = GetTickCount64();
         if (slowJsonSyncMode_) {
+            if (dirty_) {
+                const bool fullSyncRetryReady =
+                    fullSyncRetryNotBeforeTick_ == 0 ||
+                    now >= fullSyncRetryNotBeforeTick_;
+                if (fullSyncRetryReady) {
+                    dirty_ = false;
+                    pathTracingHasSceneSync_ = SendFullSync();
+                }
+                return;
+            }
             if (lastSlowJsonSyncTick_ == 0 ||
                 (now - lastSlowJsonSyncTick_) >= SLOW_JSON_SYNC_INTERVAL_MS) {
                 lastSlowJsonSyncTick_ = now;
@@ -2783,14 +3517,50 @@
 
         PumpDeferredIdlePollFullSync(now);
 
+        const bool animPlaying = IsAnimationPlaying();
+        if (!animPlaying && haveLastPlaybackPollTime_) {
+            haveLastPlaybackPollTime_ = false;
+            // Max can stop without changing the current tick, so the
+            // TimeChange callback is not guaranteed to fire. Queue the same
+            // latest-state mailbox before either dirty-state branch can clear
+            // playback bookkeeping during a full sync.
+            Interface* timelineIp = GetCOREInterface();
+            if (timelineIp) {
+                OnTimelineTimeChanged(timelineIp->GetTime());
+                return;
+            }
+        }
+        if (playbackFlushPending_) {
+            QueuePostedTimelineSync();
+            // A stopped full-scene sync is itself an authoritative final pose
+            // and also provisions missing playback buffers. Let it supersede
+            // this mailbox; otherwise an initial allocation failure could keep
+            // both the mailbox and dirty full sync waiting on each other.
+            if (!animPlaying && !dirty_) return;
+        }
+
+        if (fastFlushRetryNotBeforeTick_ != 0 &&
+            now >= fastFlushRetryNotBeforeTick_) {
+            QueueFastFlush();
+        }
+
+        if (!geoFastDirtyHandles_.empty() &&
+            (geometryFastFlushNotBeforeTick_ == 0 ||
+             now >= geometryFastFlushNotBeforeTick_)) {
+            QueueFastFlush();
+        }
+
         if (dirty_) {
-            if (IsAnimationPlaying()) {
+            if (animPlaying) {
                 PumpPlaybackSyncFromTimer();
                 return;
             }
 
             const bool debounceReady =
                 dirtyStamp_ == 0 || (now - dirtyStamp_) >= DIRTY_DEBOUNCE_MS;
+            const bool fullSyncRetryReady =
+                fullSyncRetryNotBeforeTick_ == 0 ||
+                now >= fullSyncRetryNotBeforeTick_;
             const bool deferForInteraction = ShouldDeferFullSyncForInteraction(now);
 
             if (deferForInteraction) {
@@ -2798,29 +3568,28 @@
             }
 
             // Debounce: wait for notifications and interactive drags to settle before expensive full sync.
-            if (debounceReady && !deferForInteraction) {
+            if (debounceReady && fullSyncRetryReady && !deferForInteraction) {
                 dirty_ = false;
                 idlePollFullSyncPending_ = false;
                 ClearIdlePollFullSyncCandidates();
-                if (useBinary_) SendFullSyncBinary(); else SendFullSync();
-                pathTracingHasSceneSync_ = true;
+                const bool fullSyncDelivered = useBinary_
+                    ? SendFullSyncBinary()
+                    : SendFullSync();
+                pathTracingHasSceneSync_ = fullSyncDelivered;
             }
         } else {
-            const bool animPlaying = IsAnimationPlaying();
             if (animPlaying) {
                 PumpPlaybackSyncFromTimer();
             } else {
-                if (haveLastPlaybackPollTime_) {
-                    haveLastPlaybackPollTime_ = false;
-                    fastTimeDirty_ = true;
-                    FlushFastPathNow();
-                }
-                haveLastPlaybackPollTime_ = false;
                 MarkCameraDirtyIfChanged(false);
                 PollSelectedTransformGizmoLive();
                 if (ShouldPollSelectedGeometryLive()) CheckSelectedGeometryLive();
                 PumpTimelineSyncFromTimer();
-                CheckSkinnedGeometryLive();
+                // A due settle refresh is already an exact geometry eval. Do
+                // not precede it with the idle sampled-position hash/eval.
+                if (!QueuePendingDeformNormalRefresh()) {
+                    CheckSkinnedGeometryLive();
+                }
             }
             // Poll deforming meshes every tick regardless of interactive state.
             // Max's RedrawViewsCallback only fires on full scene redraws
@@ -2937,7 +3706,10 @@
 
         for (ULONG handle : handles) {
             INode* node = ip->GetINodeByHandle(handle);
-            if (!node) continue;
+            if (!node) {
+                EraseFastDeformState(handle);
+                continue;
+            }
             const bool omitFastChannels = ShouldOmitGeometryFastChannels(node, t);
 
             // Fast-deform path: positions are re-sent without
@@ -2950,11 +3722,28 @@
             const bool forceFullGeometry =
                 forceFullHandles && forceFullHandles->find(handle) != forceFullHandles->end();
             const bool timelineFastLane = ShouldUseTimelineGeometryFastLane();
+            const bool favorInteractivePerformance = ShouldFavorInteractivePerformance();
             const bool preferPositionOnlyDeformSync =
                 isDeforming && !forceFullGeometry &&
-                (timelineFastLane || ShouldFavorInteractivePerformance());
+                (timelineFastLane || favorInteractivePerformance);
+            const ULONGLONG normalRefreshNow = GetTickCount64();
+            const bool normalRefreshDue =
+                deformNormalRefreshDueTick_ == 0 ||
+                normalRefreshNow >= deformNormalRefreshDueTick_;
+            const bool normalRefreshPending =
+                deformNormalRefreshPendingHandles_.find(handle) !=
+                deformNormalRefreshPendingHandles_.end();
+            const bool forceLiveNormalRefresh =
+                isDeforming && !gpuNormalsLive_ &&
+                deformNormalRefreshQueuedHandle_ == handle &&
+                normalRefreshDue &&
+                !timelineFastLane && !favorInteractivePerformance;
+            const bool deferPendingNormalRefresh =
+                isDeforming && !forceFullGeometry &&
+                normalRefreshPending && !forceLiveNormalRefresh;
             const bool hasVertexColors =
                 !preferPositionOnlyDeformSync &&
+                !deferPendingNormalRefresh &&
                 isDeforming &&
                 NodeHasExtractableVertexColors(node, t);
 
@@ -2996,7 +3785,9 @@
             // Skip it for a primed sparse edit session too — the position
             // diff inside the sparse path IS the change detector there, at a
             // fraction of the full-state hash cost.
-            if (!preferPositionOnlyDeformSync && !sparsePrimed) {
+            if (!preferPositionOnlyDeformSync &&
+                !sparsePrimed &&
+                !forceLiveNormalRefresh) {
                 uint64_t preHash = 0;
                 auto it = geoHashMap_.find(handle);
                 if (it != geoHashMap_.end() &&
@@ -3010,9 +3801,11 @@
             std::vector<int> indices;
             std::vector<MatGroup> groups;
             bool isSpline = false;
-            // Fast-deform path: positions and normals are re-sent without
-            // indices/UVs/material groups. Valid for meshes whose topology and
-            // non-position channels are stable between full syncs — i.e.,
+            // Fast-deform path: positions are re-sent without indices/UVs or
+            // material groups. During timeline/interactive work CPU normals
+            // are deliberately omitted; one exact live-normal payload follows
+            // after the interaction cooldown. Valid for meshes whose topology
+            // and non-position channels are stable between full syncs — i.e.,
             // meshes where the current
             // frame's change is driven by a modifier's deformation, not by
             // a direct edit that could also change UVs or topology.
@@ -3023,23 +3816,40 @@
             // silently dropped.
             bool usedSkinnedFastPositions = false;
             const FastSparseState* sparsePayload = nullptr;
-            // When the viewer's GPU normal recompute is live, every fast
-            // deform/sparse update goes positions-only regardless of size —
-            // normals are rebuilt in a WebGPU compute pass per update.
-            const bool streamLiveNormals = !omitFastChannels && !gpuNormalsLive_;
+            // Never build/apply the CPU normal plan in the interactive
+            // position-only lane. Oversized compact meshes may still stream
+            // normals for the one forced settle refresh.
+            const bool streamLiveNormals =
+                !preferPositionOnlyDeformSync &&
+                !deferPendingNormalRefresh &&
+                !gpuNormalsLive_ &&
+                (!omitFastChannels || forceLiveNormalRefresh);
             if (wv17 && env12 && !forceFullGeometry && guardIt != fastDeformGuardMap_.end()) {
-                if (isDeforming && (!hasVertexColors || preferPositionOnlyDeformSync)) {
-                    // The precomputed FastNormalPlan turns the per-frame normal
-                    // pass into face normals + a CSR gather with zero allocations,
-                    // so live normals stay on during timeline playback/scrubbing
-                    // too (they used to be frozen here for performance).
+                if (isDeforming &&
+                    (!hasVertexColors ||
+                     preferPositionOnlyDeformSync ||
+                     deferPendingNormalRefresh ||
+                     forceLiveNormalRefresh)) {
+                    // FastNormalPlan remains lazy: interactive ticks gather only
+                    // positions; the first exact normal gather happens after the
+                    // settle cooldown instead of on Play/Scrub's critical path.
                     auto sourceIt = skinnedFastSourceCache_.find(handle);
                     if (sourceIt != skinnedFastSourceCache_.end()) {
                         usedSkinnedFastPositions = ExtractSkinnedFastGeometry(
                             node, t, sourceIt->second, guardIt->second,
                             verts, streamLiveNormals ? &norms : nullptr);
+                        if (usedSkinnedFastPositions &&
+                            forceLiveNormalRefresh &&
+                            (norms.empty() || norms.size() != verts.size())) {
+                            // A successful position gather is not a successful
+                            // normal refresh. Fall through to exact extraction
+                            // rather than silently rearming forever.
+                            usedSkinnedFastPositions = false;
+                            verts.clear();
+                            norms.clear();
+                        }
                     }
-                    if (!usedSkinnedFastPositions) {
+                    if (!usedSkinnedFastPositions && !forceLiveNormalRefresh) {
                         auto cacheIt = skinnedControlIdxCache_.find(handle);
                         if (cacheIt != skinnedControlIdxCache_.end()) {
                             usedSkinnedFastPositions = ExtractSkinnedFastPositions(
@@ -3077,10 +3887,16 @@
             std::vector<int> controlIdx;
             std::vector<FastVertexSource> fastSources;
             FastDeformTopoEpoch fastEpoch;
+            FastNormalPlan extractedNormalPlan;
             std::vector<float>* extractNormals =
-                (omitFastChannels || preferPositionOnlyDeformSync) ? nullptr : &norms;
+                (preferPositionOnlyDeformSync || deferPendingNormalRefresh ||
+                 (omitFastChannels && !forceLiveNormalRefresh)) ? nullptr : &norms;
             if (!usedSkinnedFastPositions &&
-                !ExtractMesh(node, t, verts, uvs, indices, groups, extractNormals, &controlIdx, &vertexColors, &fastSources, nullptr, !omitFastChannels, &fastEpoch)) {
+                !ExtractMesh(
+                    node, t, verts, uvs, indices, groups,
+                    extractNormals, &controlIdx, &vertexColors, &fastSources,
+                    nullptr, !omitFastChannels, &fastEpoch,
+                    (isDeforming && extractNormals) ? &extractedNormalPlan : nullptr)) {
                 ObjectState os = node->EvalWorldState(t);
                 if (!ShouldExtractRenderableShape(node, t, &os) ||
                     !ExtractSpline(node, t, verts, indices)) {
@@ -3106,13 +3922,21 @@
                 }
                 if (!isSpline && controlIdx.size() * 3 == verts.size() && fastEpoch.valid) {
                     skinnedControlIdxCache_[handle] = std::move(controlIdx);
-                    if (fastSources.size() * 3 == verts.size())
+                    const bool haveFastSources = fastSources.size() * 3 == verts.size();
+                    if (haveFastSources)
                         skinnedFastSourceCache_[handle] = std::move(fastSources);
                     else
                         skinnedFastSourceCache_.erase(handle);
                     FastDeformGuard& guard = fastDeformGuardMap_[handle];
                     guard.epoch = fastEpoch;
-                    guard.plan = FastNormalPlan{};  // topology may have changed — rebuild lazily
+                    // Exact full extraction prebuilds the matching plan while
+                    // the evaluated mesh is already live. Interactive
+                    // position-only extraction intentionally leaves it empty.
+                    const bool haveBuiltFastNormalPlan =
+                        haveFastSources && extractedNormalPlan.built;
+                    guard.plan = haveBuiltFastNormalPlan
+                        ? std::move(extractedNormalPlan)
+                        : FastNormalPlan{};
                 } else {
                     EraseFastDeformReplayState(handle);
                 }
@@ -3121,14 +3945,30 @@
             JsModData jmFast;
             GetJsModData(node, t, jmFast);
 
+            const std::vector<float>& payloadVerts =
+                sparsePayload ? sparsePayload->renderPos : verts;
+            const std::vector<float>& payloadNormals =
+                (sparsePayload && !sparsePayload->renderNorms.empty())
+                    ? sparsePayload->renderNorms : norms;
+            const bool requiresCpuNormalRefresh =
+                isDeforming && !isSpline && !gpuNormalsLive_;
+            const bool liveNormalsExtracted =
+                !payloadNormals.empty() &&
+                payloadNormals.size() == payloadVerts.size();
+
+            // Arm before shared-buffer allocation/post. A transport failure
+            // must not strand geometry after lastLiveGeomHash_ has advanced.
+            RecordDeformNormalPost(
+                handle,
+                requiresCpuNormalRefresh,
+                liveNormalsExtracted,
+                E_FAIL);
+
             if (wv17 && env12) {
                 // Sparse sub-object replay streams from the persistent session
                 // buffers; every other path streams the locally extracted data.
-                const std::vector<float>& vertsBin =
-                    sparsePayload ? sparsePayload->renderPos : verts;
-                const std::vector<float>& normsBin =
-                    (sparsePayload && !sparsePayload->renderNorms.empty())
-                        ? sparsePayload->renderNorms : norms;
+                const std::vector<float>& vertsBin = payloadVerts;
+                const std::vector<float>& normsBin = payloadNormals;
                 size_t totalBytes = vertsBin.size() * 4;
                 if (usedSkinnedFastPositions) {
                     totalBytes += normsBin.size() * 4;
@@ -3224,9 +4064,14 @@
                 }
                 ss << L'}';
 
-                wv17->PostSharedBufferToScript(buf.Get(),
+                const HRESULT postResult = wv17->PostSharedBufferToScript(buf.Get(),
                     COREWEBVIEW2_SHARED_BUFFER_ACCESS_READ_ONLY,
                     ss.str().c_str());
+                RecordDeformNormalPost(
+                    handle,
+                    requiresCpuNormalRefresh,
+                    liveNormalsExtracted,
+                    postResult);
             } else {
                 std::wostringstream ss;
                 ss.imbue(std::locale::classic());
@@ -3259,22 +4104,27 @@
                     }
                 }
                 ss << L'}';
-                webview_->PostWebMessageAsJson(ss.str().c_str());
+                const HRESULT postResult = webview_->PostWebMessageAsJson(ss.str().c_str());
+                RecordDeformNormalPost(
+                    handle,
+                    requiresCpuNormalRefresh,
+                    liveNormalsExtracted,
+                    postResult);
             }
         }
     }
 
-    void SendHairFastUpdate(const std::vector<ULONG>& dirtyHandles) {
-        if (!webview_) return;
+    bool SendHairFastUpdate(const std::vector<ULONG>& dirtyHandles) {
+        if (!webview_) return false;
         Interface* ip = GetCOREInterface();
-        if (!ip) return;
+        if (!ip) return false;
         TimeValue t = ip->GetTime();
 
         std::vector<ULONG> hairDirty;
         for (ULONG h : dirtyHandles) {
             if (hairHandles_.find(h) != hairHandles_.end()) hairDirty.push_back(h);
         }
-        if (hairDirty.empty()) return;
+        if (hairDirty.empty()) return true;
 
         std::vector<HairInstanceGroup> groups;
         for (ULONG h : hairDirty) {
@@ -3282,7 +4132,7 @@
             if (!node) continue;
             ExtractHairInstances(node, t, groups);
         }
-        if (groups.empty()) return;
+        if (groups.empty()) return true;
 
         std::wostringstream ss;
         ss.imbue(std::locale::classic());
@@ -3304,7 +4154,8 @@
             ss << L'}';
         }
         ss << L"]}";
-        webview_->PostWebMessageAsJson(ss.str().c_str());
+        const HRESULT postResult = webview_->PostWebMessageAsJson(ss.str().c_str());
+        return SUCCEEDED(postResult);
     }
 
     void SendSelectionSync(const std::vector<ULONG>& handles) {
@@ -3331,35 +4182,72 @@
         if (!first) webview_->PostWebMessageAsJson(ss.str().c_str());
     }
 
+    void TakeGeometryFastFlushBatch(std::unordered_set<ULONG>& batch,
+                                    std::unordered_set<ULONG>& fullBatch) {
+        batch.clear();
+        fullBatch.clear();
+        if (geoFastDirtyHandles_.empty()) {
+            geoFullFastDirtyHandles_.clear();
+            geometryFastFlushNotBeforeTick_ = 0;
+            return;
+        }
+
+        const ULONGLONG now = GetTickCount64();
+        if (geometryFastFlushNotBeforeTick_ != 0 &&
+            now < geometryFastFlushNotBeforeTick_) {
+            return;
+        }
+
+        auto takeHandle = [&](ULONG handle) {
+            batch.insert(handle);
+            geoFastDirtyHandles_.erase(handle);
+            if (geoFullFastDirtyHandles_.erase(handle) != 0) {
+                fullBatch.insert(handle);
+            }
+        };
+
+        // The one exact settle-normal update wins the next bounded batch.
+        // Then consume directly from the owning set: copying and sorting every
+        // remaining dirty handle here recreated an O(scene) UI-thread hitch
+        // before the eight-handle extraction cap could help.
+        if (deformNormalRefreshQueuedHandle_ != 0 &&
+            geoFastDirtyHandles_.find(deformNormalRefreshQueuedHandle_) !=
+                geoFastDirtyHandles_.end()) {
+            takeHandle(deformNormalRefreshQueuedHandle_);
+        }
+        while (batch.size() < kMaxGeometryFastFlushHandlesPerPass &&
+               !geoFastDirtyHandles_.empty()) {
+            takeHandle(*geoFastDirtyHandles_.begin());
+        }
+
+        if (geoFastDirtyHandles_.empty()) {
+            // Any unmatched full marker is stale; geometry markers are the
+            // owning queue and were all consumed above.
+            geoFullFastDirtyHandles_.clear();
+            geometryFastFlushNotBeforeTick_ = 0;
+        } else {
+            // Leave the remaining handles coalesced in the owning set. The
+            // 33ms sync timer posts the next batch so chained window messages
+            // cannot drain a large deform scene in one UI-thread burst.
+            geometryFastFlushNotBeforeTick_ = now + SYNC_INTERVAL_MS;
+        }
+    }
+
     void FlushFastPath() {
         fastFlushPosted_ = false;
+
+        const ULONGLONG flushNow = GetTickCount64();
+        if (fastFlushRetryNotBeforeTick_ != 0 &&
+            flushNow < fastFlushRetryNotBeforeTick_) {
+            return;
+        }
+        fastFlushRetryNotBeforeTick_ = 0;
 
         if (!jsReady_ || !webview_) return;
         if (dirty_ && !CanFlushFastPathDuringPendingFullSync()) return;
         if (!hwnd_ || !IsWindowVisible(hwnd_)) return;
 
         ConsumePendingTimelineFastSyncWork();
-
-        // Check for lights/splats/audios BEFORE batching to ensure consistent protocol
-        // selection even when handles are deferred across frames.
-        bool hasDirtyLights = false;
-        bool hasDirtySplats = false;
-        bool hasDirtyAudios = false;
-        bool hasDirtyGLTFs = false;
-        for (ULONG handle : fastDirtyHandles_) {
-            if (!hasDirtyLights && lightHandles_.find(handle) != lightHandles_.end()) {
-                hasDirtyLights = true;
-            }
-            if (!hasDirtySplats && splatHandles_.find(handle) != splatHandles_.end()) {
-                hasDirtySplats = true;
-            }
-            if (!hasDirtyAudios && audioHandles_.find(handle) != audioHandles_.end()) {
-                hasDirtyAudios = true;
-            }
-            if (!hasDirtyGLTFs && gltfHandles_.find(handle) != gltfHandles_.end()) {
-                hasDirtyGLTFs = true;
-            }
-        }
 
         std::vector<ULONG> dirtyHandles;
         dirtyHandles.reserve(fastDirtyHandles_.size());
@@ -3374,10 +4262,6 @@
             dirtyHandles.resize(kMaxFastFlushHandlesPerPass);
             fastDirtyHandles_.clear();
             fastDirtyHandles_.insert(deferredHandles.begin(), deferredHandles.end());
-            fastFlushPosted_ = true;
-            if (!PostMessage(hwnd_, WM_FAST_FLUSH, 0, 0)) {
-                fastFlushPosted_ = false;
-            }
         } else {
             fastDirtyHandles_.clear();
         }
@@ -3387,9 +4271,8 @@
 
         // Collect geometry-dirty handles before clearing
         std::unordered_set<ULONG> geoDirty;
-        geoDirty.swap(geoFastDirtyHandles_);
         std::unordered_set<ULONG> geoFullDirty;
-        geoFullDirty.swap(geoFullFastDirtyHandles_);
+        TakeGeometryFastFlushBatch(geoDirty, geoFullDirty);
         std::unordered_set<ULONG> materialDirty;
         materialDirty.swap(materialFastDirtyHandles_);
         for (ULONG handle : deferredHandles) {
@@ -3414,9 +4297,42 @@
             selectionDirty.insert(hairHandles_.begin(), hairHandles_.end());
         }
 
-        for (ULONG handle : dirtyHandles) visibilityDirty.erase(handle);
+        std::vector<ULONG> deduplicatedVisibilityOwners;
+        deduplicatedVisibilityOwners.reserve(dirtyHandles.size());
+        for (ULONG handle : dirtyHandles) {
+            if (visibilityDirty.erase(handle) != 0) {
+                deduplicatedVisibilityOwners.push_back(handle);
+            }
+        }
         fastCameraDirty_ = false;
         fastTimeDirty_ = false;
+
+        auto restoreConsumedFastWork = [&]() {
+            fastDirtyHandles_.insert(dirtyHandles.begin(), dirtyHandles.end());
+            materialFastDirtyHandles_.insert(materialDirty.begin(), materialDirty.end());
+            visibilityDirtyHandles_.insert(visibilityDirty.begin(), visibilityDirty.end());
+            visibilityDirtyHandles_.insert(
+                deduplicatedVisibilityOwners.begin(),
+                deduplicatedVisibilityOwners.end());
+            selectionDirtyHandles_.insert(selectionDirty.begin(), selectionDirty.end());
+            selectionRescanDirty_ = selectionRescanDirty_ || selectionRescanDirty;
+            fastCameraDirty_ = fastCameraDirty_ || hasDirtyCamera;
+            fastTimeDirty_ = fastTimeDirty_ || hasDirtyTime;
+            fastFlushRetryNotBeforeTick_ =
+                GetTickCount64() + kTransportRetryBackoffMs;
+        };
+
+        auto queueRemainingFastWork = [&]() {
+            if (!fastDirtyHandles_.empty() ||
+                !materialFastDirtyHandles_.empty() ||
+                !visibilityDirtyHandles_.empty() ||
+                !selectionDirtyHandles_.empty() ||
+                selectionRescanDirty_ || fastCameraDirty_ || fastTimeDirty_ ||
+                pendingTimelineTransformScan_ || pendingTimelineDeformScan_ ||
+                pendingTimelineCameraCheck_) {
+                QueueFastFlush();
+            }
+        };
 
         std::vector<ULONG> combinedNodeHandles = dirtyHandles;
         combinedNodeHandles.reserve(dirtyHandles.size() + visibilityDirty.size());
@@ -3431,28 +4347,24 @@
 
         const bool hasAnyNodeUpdates = !combinedNodeHandles.empty();
         const bool hasSelectionUpdates = !selectionDirty.empty();
-        if (!hasAnyNodeUpdates && !hasSelectionUpdates && !hasDirtyCamera && !hasDirtyTime) return;
-
-        // Also check visibility dirty handles for lights/splats/audios
-        for (ULONG handle : visibilityDirty) {
-            if (!hasDirtyLights && lightHandles_.find(handle) != lightHandles_.end()) {
-                hasDirtyLights = true;
-            }
-            if (!hasDirtySplats && splatHandles_.find(handle) != splatHandles_.end()) {
-                hasDirtySplats = true;
-            }
-            if (!hasDirtyAudios && audioHandles_.find(handle) != audioHandles_.end()) {
-                hasDirtyAudios = true;
-            }
-            if (!hasDirtyGLTFs && gltfHandles_.find(handle) != gltfHandles_.end()) {
-                hasDirtyGLTFs = true;
-            }
+        if (!hasAnyNodeUpdates && !hasSelectionUpdates && !hasDirtyCamera && !hasDirtyTime) {
+            queueRemainingFastWork();
+            return;
         }
 
         // Hair fast path: re-extract world-space hair instances for any dirty
         // hair handles. Covers transforms, deformation, frizz, dynamics — any
         // change that alters GetHairDefinition output.
-        SendHairFastUpdate(dirtyHandles);
+        const bool hairTransportFailed = !SendHairFastUpdate(dirtyHandles);
+        if (hairTransportFailed) {
+            for (ULONG handle : dirtyHandles) {
+                if (hairHandles_.find(handle) != hairHandles_.end()) {
+                    fastDirtyHandles_.insert(handle);
+                }
+            }
+            fastFlushRetryNotBeforeTick_ =
+                GetTickCount64() + kTransportRetryBackoffMs;
+        }
 
         if (!useBinary_) {
             if (hasAnyNodeUpdates) SendTransformSync(&combinedNodeHandles);
@@ -3462,26 +4374,15 @@
             }
             if (!hasAnyNodeUpdates && !hasSelectionUpdates) SendCameraSync();
             CaptureCurrentCameraState();
-            return;
-        }
-
-        ComPtr<ICoreWebView2_17> wv17;
-        ComPtr<ICoreWebView2Environment12> env12;
-        webview_->QueryInterface(IID_PPV_ARGS(&wv17));
-        env_->QueryInterface(IID_PPV_ARGS(&env12));
-        if (!wv17 || !env12) {
-            if (hasAnyNodeUpdates) SendTransformSync(&combinedNodeHandles);
-            if (hasSelectionUpdates) {
-                std::vector<ULONG> selectionHandles(selectionDirty.begin(), selectionDirty.end());
-                SendSelectionSync(selectionHandles);
-            }
-            if (!hasAnyNodeUpdates && !hasSelectionUpdates) SendCameraSync();
-            CaptureCurrentCameraState();
+            queueRemainingFastWork();
             return;
         }
 
         Interface* ip = GetCOREInterface();
-        if (!ip) return;
+        if (!ip) {
+            restoreConsumedFastWork();
+            return;
+        }
 
         TimeValue t = ip->GetTime();
         const std::uint32_t frameId = AllocateFrameId();
@@ -3489,6 +4390,22 @@
         frame.ReserveBytes(32 + dirtyHandles.size() * 160 + visibilityDirty.size() * 12 +
             selectionDirty.size() * 12 + (hasDirtyCamera ? 64 : 0) + 16);
         frame.BeginFrame();
+
+        std::vector<std::pair<ULONG, std::array<float, 16>>> stagedTransforms;
+        std::vector<std::pair<ULONG, bool>> stagedVisibility;
+        std::vector<std::pair<ULONG, bool>> stagedSelection;
+        std::vector<std::pair<ULONG, std::uint64_t>> stagedLightStateHashes;
+        stagedTransforms.reserve(dirtyHandles.size());
+        stagedVisibility.reserve(combinedNodeHandles.size());
+        stagedSelection.reserve(selectionDirty.size() + dirtyHandles.size());
+        stagedLightStateHashes.reserve(std::min(dirtyHandles.size(), lightHandles_.size()));
+        CameraData stagedCamera = {};
+        bool hasStagedCamera = false;
+        auto stageTransform = [&](ULONG handle, const float* xform) {
+            std::array<float, 16> staged = {};
+            std::copy(xform, xform + 16, staged.begin());
+            stagedTransforms.emplace_back(handle, staged);
+        };
 
         for (ULONG handle : dirtyHandles) {
             INode* node = ip->GetINodeByHandle(handle);
@@ -3514,6 +4431,7 @@
                 helperHandles_.erase(handle);
                 deformHandles_.erase(handle);
                 lastSentTransforms_.erase(handle);
+                lastSentPlaybackAux_.erase(handle);
                 materialFastDirtyHandles_.erase(handle);
                 selectionDirtyHandles_.erase(handle);
                 SetDirty();
@@ -3529,7 +4447,6 @@
 
             float xform[16];
             GetTransform16(node, t, xform);
-            RememberSentTransform(handle, xform);
             const bool visible = IsMaxJsSyncDrawVisible(node);
 
             // Use specialized commands for lights/splats/audios
@@ -3539,30 +4456,48 @@
                 ld.visible = visible;
                 if (ExtractLightBinaryData(node, t, ld)) {
                     frame.UpdateLight(static_cast<std::uint32_t>(handle), ld);
+                    stageTransform(handle, xform);
+                    stagedVisibility.emplace_back(handle, visible);
+                    stagedLightStateHashes.emplace_back(
+                        handle, ComputeLightStateHash(node, t));
+                } else {
+                    SetDirty();
                 }
                 continue;
             }
             if (splatHandles_.find(handle) != splatHandles_.end()) {
                 frame.UpdateSplat(static_cast<std::uint32_t>(handle), xform, visible);
+                stageTransform(handle, xform);
+                stagedVisibility.emplace_back(handle, visible);
                 continue;
             }
             if (audioHandles_.find(handle) != audioHandles_.end()) {
                 frame.UpdateAudio(static_cast<std::uint32_t>(handle), xform, visible);
+                stageTransform(handle, xform);
+                stagedVisibility.emplace_back(handle, visible);
                 continue;
             }
             if (gltfHandles_.find(handle) != gltfHandles_.end()) {
                 frame.UpdateGLTF(static_cast<std::uint32_t>(handle), xform, visible);
+                stageTransform(handle, xform);
+                stagedVisibility.emplace_back(handle, visible);
                 continue;
             }
             if (webappHandles_.find(handle) != webappHandles_.end()) {
                 frame.UpdateWebApp(static_cast<std::uint32_t>(handle), xform, visible);
+                stageTransform(handle, xform);
+                stagedVisibility.emplace_back(handle, visible);
                 continue;
             }
 
             // Regular geometry node
             frame.UpdateTransform(static_cast<std::uint32_t>(handle), xform);
-            frame.UpdateSelection(static_cast<std::uint32_t>(handle), node->Selected() != 0);
+            const bool selected = node->Selected() != 0;
+            frame.UpdateSelection(static_cast<std::uint32_t>(handle), selected);
             frame.UpdateVisibility(static_cast<std::uint32_t>(handle), visible);
+            stageTransform(handle, xform);
+            stagedSelection.emplace_back(handle, selected);
+            stagedVisibility.emplace_back(handle, visible);
 
             if (materialDirty.find(handle) != materialDirty.end()) {
                 float col[3] = {0.8f, 0.8f, 0.8f};
@@ -3582,22 +4517,26 @@
         for (ULONG handle : visibilityDirty) {
             INode* node = ip->GetINodeByHandle(handle);
             if (!node) continue;
-            frame.UpdateVisibility(static_cast<std::uint32_t>(handle), IsMaxJsSyncDrawVisible(node));
+            const bool visible = IsMaxJsSyncDrawVisible(node);
+            frame.UpdateVisibility(static_cast<std::uint32_t>(handle), visible);
+            stagedVisibility.emplace_back(handle, visible);
         }
 
         for (ULONG handle : selectionDirty) {
             INode* node = ip->GetINodeByHandle(handle);
             if (!node || !IsTrackedHandle(handle)) continue;
-            frame.UpdateSelection(static_cast<std::uint32_t>(handle), node->Selected() != 0);
+            const bool selected = node->Selected() != 0;
+            frame.UpdateSelection(static_cast<std::uint32_t>(handle), selected);
+            stagedSelection.emplace_back(handle, selected);
         }
 
         if (hasDirtyCamera) {
-            CameraData cam = {};
-            GetActiveCamera(cam);
-            frame.UpdateCamera(cam.pos, cam.target, cam.up, cam.fov, cam.perspective, cam.viewWidth,
-                               cam.dofEnabled, cam.dofFocusDistance, cam.dofFocalLength, cam.dofBokehScale);
-            lastSentCamera_ = cam;
-            haveLastSentCamera_ = true;
+            GetActiveCamera(stagedCamera);
+            frame.UpdateCamera(stagedCamera.pos, stagedCamera.target, stagedCamera.up,
+                               stagedCamera.fov, stagedCamera.perspective, stagedCamera.viewWidth,
+                               stagedCamera.dofEnabled, stagedCamera.dofFocusDistance,
+                               stagedCamera.dofFocalLength, stagedCamera.dofBokehScale);
+            hasStagedCamera = true;
         }
 
         // Time oracle — JS timeline / ctx.maxTime reads this.
@@ -3607,40 +4546,44 @@
             frame.UpdateTime(static_cast<std::int32_t>(t), tpf, stateFlags);
         }
         frame.EndFrame();
-        if (frame.command_count() == 0) return;
-
-        const auto& frameBytes = frame.bytes();
-        const size_t totalBytes = frameBytes.empty() ? 4 : frameBytes.size();
-
-        ComPtr<ICoreWebView2SharedBuffer> sharedBuf;
-        HRESULT hr = env12->CreateSharedBuffer(totalBytes, &sharedBuf);
-        if (FAILED(hr) || !sharedBuf) {
-            if (hasAnyNodeUpdates) SendTransformSync(&combinedNodeHandles);
-            if (hasSelectionUpdates) {
-                std::vector<ULONG> selectionHandles(selectionDirty.begin(), selectionDirty.end());
-                SendSelectionSync(selectionHandles);
-            }
-            if (!hasAnyNodeUpdates && !hasSelectionUpdates) SendCameraSync();
-            CaptureCurrentCameraState();
+        if (frame.command_count() == 0) {
+            restoreConsumedFastWork();
             return;
         }
 
-        BYTE* bufPtr = nullptr;
-        sharedBuf->get_Buffer(&bufPtr);
-        if (bufPtr && !frameBytes.empty()) {
-            memcpy(bufPtr, frameBytes.data(), frameBytes.size());
+        if (!PostSharedDeltaBytes(
+                frame.bytes(), frameId, frame.command_count())) {
+            // The dirty sets remain the ownership record until WebView accepts
+            // the binary frame. No JSON fallback is allowed to make one failed
+            // transport look delivered, and the timer enforces retry backoff.
+            restoreConsumedFastWork();
+            return;
         }
 
-        std::wostringstream meta;
-        meta.imbue(std::locale::classic());
-        meta << L"{\"type\":\"delta_bin\",\"frame\":" << frameId;
-        meta << L",\"stats\":{\"producerBytes\":" << frameBytes.size();
-        meta << L",\"commandCount\":" << frame.command_count() << L"}}";
-
-        wv17->PostSharedBufferToScript(
-            sharedBuf.Get(),
-            COREWEBVIEW2_SHARED_BUFFER_ACCESS_READ_ONLY,
-            meta.str().c_str());
+        // Delivery is the only cache-commit point. Failed CreateSharedBuffer,
+        // get_Buffer, and PostSharedBuffer calls leave all of these untouched.
+        for (const auto& [handle, transform] : stagedTransforms) {
+            lastSentTransforms_[handle] = transform;
+        }
+        for (const auto& [handle, visible] : stagedVisibility) {
+            lastSentPlaybackAux_[handle].visible = visible;
+        }
+        for (const auto& [handle, selected] : stagedSelection) {
+            PlaybackAuxDeliveryState& state = lastSentPlaybackAux_[handle];
+            state.selected = selected;
+            state.hasSelection = true;
+        }
+        for (const auto& [handle, stateHash] : stagedLightStateHashes) {
+            PlaybackAuxDeliveryState& state = lastSentPlaybackAux_[handle];
+            state.lightStateHash = stateHash;
+            state.hasLightStateHash = true;
+        }
+        if (hasStagedCamera) {
+            lastSentCamera_ = stagedCamera;
+            haveLastSentCamera_ = true;
+        }
+        if (!hairTransportFailed) fastFlushRetryNotBeforeTick_ = 0;
+        queueRemainingFastWork();
     }
 
     EnvData cachedEnv_;

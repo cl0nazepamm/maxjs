@@ -27,6 +27,13 @@ const state = {
     // Extrapolation anchors
     _lastPushSeconds: 0,
     _lastPushMono: 0,
+    // Timeline ACTIVITY stamp — decoupled from the extrapolation anchor
+    // above. Max re-pushes unchanged time with every sync burst (object and
+    // light edits, viewport redraws); _lastPushMono must keep moving for
+    // drift-snap, but only genuine motion (time change, play/pause flip,
+    // playback) may count as interaction, or every light drag pins the GI
+    // at its slashed post-interaction ray budget with light refresh held.
+    _lastActivityMono: 0,
     // Geometry packets can trail the authored time packet while native
     // deformation drains in bounded batches. GI uses the newer of the two so
     // it cannot wake before the exact settle-normal packet arrives.
@@ -127,6 +134,10 @@ function onTime({ ticks, tpf, stateFlags }) {
         state._lastPushMono = performance.now();
     }
 
+    if (nextPlaying || nextPlaying !== wasPlaying || ticks !== state.ticks) {
+        state._lastActivityMono = performance.now();
+    }
+
     state.ticks = ticks;
     state.tpf = safeTpf;
     state.fps = fps;
@@ -165,7 +176,7 @@ function fps() { return state.fps; }
 function playing() { return state.playing; }
 function getSource() { return state.source; }
 function noteSceneSync() { state._lastSceneSyncMono = performance.now(); }
-function lastUpdateMs() { return Math.max(state._lastPushMono, state._lastSceneSyncMono); }
+function lastUpdateMs() { return Math.max(state._lastActivityMono, state._lastSceneSyncMono); }
 
 function on(event, fn) {
     const set = listeners[event];
@@ -202,6 +213,7 @@ function initStandalone(options = {}) {
             state.ticks = Math.round(state.seconds * TICKS_PER_SECOND);
             state._lastPushSeconds = state.seconds;
             state._lastPushMono = performance.now();
+            state._lastActivityMono = state._lastPushMono;
             emitChange();
         }
         state._standaloneRaf = requestAnimationFrame(tick);
@@ -217,6 +229,7 @@ function standalonePlay() {
     state._standaloneStartMono = performance.now();
     state._standaloneStartSeconds = state.seconds;
     state.playing = true;
+    state._lastActivityMono = state._standaloneStartMono;
     emit('play');
     emitChange();
 }
@@ -225,6 +238,7 @@ function standalonePause() {
     if (state.source !== 'standalone') return;
     if (!state.playing) return;
     state.playing = false;
+    state._lastActivityMono = performance.now();
     emit('pause');
     emitChange();
 }
@@ -238,6 +252,7 @@ function standaloneSeek(seconds) {
     state._standaloneStartSeconds = state.seconds;
     state._lastPushSeconds = state.seconds;
     state._lastPushMono = state._standaloneStartMono;
+    state._lastActivityMono = state._standaloneStartMono;
     emitChange();
 }
 

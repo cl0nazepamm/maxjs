@@ -972,15 +972,18 @@ function createDeformSystem({
         }
     }
 
-    function createLayerFacade(layerId, getAdapter) {
+    function createLayerFacade(layerId, getAdapter, isActive = () => true) {
         return freezePlainObject({
             attach(target, options = {}) {
+                if (!isActive()) return null;
                 return attach(layerId, getAdapter, target, options);
             },
             simulate(target, options = {}) {
+                if (!isActive()) return null;
                 return simulate(layerId, getAdapter, target, options);
             },
             list() {
+                if (!isActive()) return [];
                 const out = [];
                 for (const entry of entries.values()) {
                     if (entry.layerId !== layerId || entry.disposed) continue;

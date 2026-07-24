@@ -1155,6 +1155,7 @@ function createPanelsMisc(deps = {}) {
         function formatLayerParamValue(param) {
             if (param?.type === 'color') return String(param.value || '#ffffff').toLowerCase();
             if (param?.type === 'bool') return param.value ? 'On' : 'Off';
+            if (param?.type === 'string') return String(param.value ?? '');
             const n = Number(param?.value);
             if (!Number.isFinite(n)) return String(param?.value ?? '');
             if (Math.abs(n) >= 100) return n.toFixed(1).replace(/\.0$/, '');
@@ -1205,6 +1206,12 @@ function createPanelsMisc(deps = {}) {
                 return `<label class="layer-param layer-param-bool" title="${title}">
                     <span class="layer-param-head"><span>${label}</span>${valueHtml}</span>
                     <input class="layer-param-input layer-param-check" type="checkbox" ${common} ${param.value ? 'checked' : ''}>
+                </label>`;
+            }
+            if (param.type === 'string') {
+                return `<label class="layer-param layer-param-string" title="${title}">
+                    <span class="layer-param-head"><span>${label}</span>${valueHtml}</span>
+                    <input class="layer-param-input layer-param-text" type="text" ${common} value="${value}">
                 </label>`;
             }
             return '';

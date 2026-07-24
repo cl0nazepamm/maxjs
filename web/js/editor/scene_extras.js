@@ -7,6 +7,7 @@ import {
     uvAttributeFromBinary,
 } from '../scene_binary.js';
 import { getInstancedMeshBatchSize, instanceGroupKey, isWebGpuInstancingPath } from '../instance_batching.js';
+import { markOwned, OWNER_MAX } from '../layer_ownership.js';
 
 function createSceneExtras(deps = {}) {
         // ── Hair Fast Sync — re-extracted world-space instances ──
@@ -178,6 +179,7 @@ function createSceneExtras(deps = {}) {
             root.userData.maxjsHair = true;
             root.visible = grp.vis == null ? true : !!grp.vis;
             root.add(instMesh);
+            markOwned(root, OWNER_MAX);
             deps.maxRoot.add(root);
 
             const entry = { root, mesh: instMesh };
@@ -511,6 +513,7 @@ function createSceneExtras(deps = {}) {
                         disposeForestBuildResources(instMesh.geometry, instMesh.material);
                         return;
                     }
+                    markOwned(instMesh, OWNER_MAX);
                     deps.maxRoot.add(instMesh);
                     deps.forestMeshes.set(batchCount > 1 ? `${groupKey}:${batchIndex}` : groupKey, instMesh);
                     addedMeshes++;
@@ -639,6 +642,8 @@ function createSceneExtras(deps = {}) {
             mesh.frustumCulled = false;
             mesh.renderOrder = 100;
             mesh.userData._volumeTex = tex3d;
+            markOwned(tex3d, OWNER_MAX);
+            markOwned(mesh, OWNER_MAX);
             return mesh;
         }
 

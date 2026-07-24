@@ -369,7 +369,8 @@ body.light-mode .dock-drag-handle.dragging::after { background: rgba(0, 0, 0, 0.
 .layer-param-input {
     min-width: 0;
 }
-.layer-param-number {
+.layer-param-number,
+.layer-param-text {
     width: 100%;
     min-height: 22px;
     padding: 3px 6px;
@@ -1297,7 +1298,8 @@ body.light-mode .layer-param-head {
 body.light-mode .layer-param-value {
     color: #222;
 }
-body.light-mode .layer-param-number {
+body.light-mode .layer-param-number,
+body.light-mode .layer-param-text {
     background: rgba(255, 255, 255, 0.5);
     color: #222;
     border-color: rgba(0, 0, 0, 0.16);
@@ -1374,7 +1376,8 @@ body:not(.light-mode) .sidepanel-left .sidepanel-resize { border-radius: 0 10px 
 body:not(.light-mode) .layer-item { border-radius: 5px; }
 body:not(.light-mode) .layer-source { border-radius: 999px; }
 body:not(.light-mode) .layer-action { border-radius: 3px; }
-body:not(.light-mode) .layer-param-number { border-radius: 5px; }
+body:not(.light-mode) .layer-param-number,
+body:not(.light-mode) .layer-param-text { border-radius: 5px; }
 body:not(.light-mode) .layer-param-swatch { border-radius: 4px; }
 body:not(.light-mode) .sidepanel button,
 body:not(.light-mode) .fx-toggle { border-radius: 5px; }

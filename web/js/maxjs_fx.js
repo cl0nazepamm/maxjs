@@ -688,7 +688,27 @@ export function createMaxJSFxController({
     }
 
     function assignFinite(target, key, value) {
-        if (Number.isFinite(value)) target[key] = value;
+        if (!Number.isFinite(value) || Object.is(target[key], value)) return false;
+        target[key] = value;
+        return true;
+    }
+
+    function assignBoolean(target, key, value) {
+        if (typeof value !== 'boolean' || target[key] === value) return false;
+        target[key] = value;
+        return true;
+    }
+
+    function assignArray(target, key, value) {
+        if (!Array.isArray(value)) return false;
+        const current = target[key];
+        if (Array.isArray(current)
+            && current.length === value.length
+            && current.every((entry, index) => Object.is(entry, value[index]))) {
+            return false;
+        }
+        target[key] = value;
+        return true;
     }
 
     function retroOptionsNeedRebuild(options = {}) {
@@ -768,24 +788,29 @@ export function createMaxJSFxController({
             if (enabled && !supportsScreenSpaceEffects) {
                 lastError = 'SSGI requires WebGPU or TSL_GL';
                 onError(lastError);
-                state.ssgi.enabled = true;
-                rebuildPipeline();
+                if (state.ssgi.enabled !== true) {
+                    state.ssgi.enabled = true;
+                    rebuildPipeline();
+                }
                 return false;
             }
-            state.ssgi.enabled = !!enabled && available;
+            const next = !!enabled && available;
+            if (state.ssgi.enabled === next) return state.ssgi.enabled;
+            state.ssgi.enabled = next;
             rebuildPipeline();
             return state.ssgi.enabled;
         },
         setSSGIOptions(options = {}) {
-            assignFinite(state.ssgi, 'radius', options.radius);
-            assignFinite(state.ssgi, 'thickness', options.thickness);
-            assignFinite(state.ssgi, 'aoIntensity', options.aoIntensity);
-            assignFinite(state.ssgi, 'giIntensity', options.giIntensity);
-            assignFinite(state.ssgi, 'expFactor', options.expFactor);
-            assignFinite(state.ssgi, 'sliceCount', options.sliceCount);
-            assignFinite(state.ssgi, 'stepCount', options.stepCount);
-            if (typeof options.temporal === 'boolean') state.ssgi.temporal = options.temporal;
-            rebuildPipeline();
+            let changed = false;
+            changed = assignFinite(state.ssgi, 'radius', options.radius) || changed;
+            changed = assignFinite(state.ssgi, 'thickness', options.thickness) || changed;
+            changed = assignFinite(state.ssgi, 'aoIntensity', options.aoIntensity) || changed;
+            changed = assignFinite(state.ssgi, 'giIntensity', options.giIntensity) || changed;
+            changed = assignFinite(state.ssgi, 'expFactor', options.expFactor) || changed;
+            changed = assignFinite(state.ssgi, 'sliceCount', options.sliceCount) || changed;
+            changed = assignFinite(state.ssgi, 'stepCount', options.stepCount) || changed;
+            changed = assignBoolean(state.ssgi, 'temporal', options.temporal) || changed;
+            if (changed) rebuildPipeline();
             return { ...state.ssgi };
         },
         isSSREnabled() {
@@ -795,27 +820,34 @@ export function createMaxJSFxController({
             if (enabled && !supportsTslPostEffects) {
                 lastError = 'SSR requires WebGPU or TSL_GL';
                 onError(lastError);
-                state.ssr.enabled = true;
-                rebuildPipeline();
+                if (state.ssr.enabled !== true) {
+                    state.ssr.enabled = true;
+                    rebuildPipeline();
+                }
                 return false;
             }
-            state.ssr.enabled = !!enabled && available;
+            const next = !!enabled && available;
+            if (state.ssr.enabled === next) return state.ssr.enabled;
+            state.ssr.enabled = next;
             rebuildPipeline();
             return state.ssr.enabled;
         },
         setSSROptions(options = {}) {
-            if (typeof options.denoise === 'boolean') state.ssr.denoise = options.denoise;
-            if (typeof options.stochastic === 'boolean') state.ssr.stochastic = options.stochastic;
-            assignFinite(state.ssr, 'quality', options.quality);
-            assignFinite(state.ssr, 'blurQuality', options.blurQuality);
-            assignFinite(state.ssr, 'maxDistance', options.maxDistance);
-            assignFinite(state.ssr, 'opacity', options.opacity);
-            assignFinite(state.ssr, 'thickness', options.thickness);
-            assignFinite(state.ssr, 'denoiseRadius', options.denoiseRadius);
-            assignFinite(state.ssr, 'denoiseStrength', options.denoiseStrength);
-            assignFinite(state.ssr, 'denoiseFrames', options.denoiseFrames);
-            assignFinite(state.ssr, 'denoiseAdaptiveTrust', options.denoiseAdaptiveTrust);
-            rebuildPipeline();
+            let rebuild = false;
+            let live = false;
+            rebuild = assignBoolean(state.ssr, 'denoise', options.denoise) || rebuild;
+            rebuild = assignBoolean(state.ssr, 'stochastic', options.stochastic) || rebuild;
+            rebuild = assignFinite(state.ssr, 'quality', options.quality) || rebuild;
+            rebuild = assignFinite(state.ssr, 'blurQuality', options.blurQuality) || rebuild;
+            live = assignFinite(state.ssr, 'maxDistance', options.maxDistance) || live;
+            rebuild = assignFinite(state.ssr, 'opacity', options.opacity) || rebuild;
+            live = assignFinite(state.ssr, 'thickness', options.thickness) || live;
+            rebuild = assignFinite(state.ssr, 'denoiseRadius', options.denoiseRadius) || rebuild;
+            rebuild = assignFinite(state.ssr, 'denoiseStrength', options.denoiseStrength) || rebuild;
+            rebuild = assignFinite(state.ssr, 'denoiseFrames', options.denoiseFrames) || rebuild;
+            rebuild = assignFinite(state.ssr, 'denoiseAdaptiveTrust', options.denoiseAdaptiveTrust) || rebuild;
+            if (rebuild) rebuildPipeline();
+            else if (live && state.ssr.enabled) queuePipelineUpdate({ output: true });
             return { ...state.ssr };
         },
         isGTAOEnabled() {
@@ -825,23 +857,30 @@ export function createMaxJSFxController({
             if (enabled && !supportsScreenSpaceEffects) {
                 lastError = 'GTAO requires WebGPU or TSL_GL';
                 onError(lastError);
-                state.gtao.enabled = true;
-                rebuildPipeline();
+                if (state.gtao.enabled !== true) {
+                    state.gtao.enabled = true;
+                    rebuildPipeline();
+                }
                 return false;
             }
-            state.gtao.enabled = !!enabled && available;
+            const next = !!enabled && available;
+            if (state.gtao.enabled === next) return state.gtao.enabled;
+            state.gtao.enabled = next;
             rebuildPipeline();
             return state.gtao.enabled;
         },
         setGTAOOptions(options = {}) {
-            assignFinite(state.gtao, 'samples', options.samples);
-            assignFinite(state.gtao, 'distanceExponent', options.distanceExponent);
-            assignFinite(state.gtao, 'distanceFallOff', options.distanceFallOff);
-            assignFinite(state.gtao, 'radius', options.radius);
-            assignFinite(state.gtao, 'scale', options.scale);
-            assignFinite(state.gtao, 'thickness', options.thickness);
-            assignFinite(state.gtao, 'resolutionScale', options.resolutionScale);
-            rebuildPipeline();
+            let rebuild = false;
+            let live = false;
+            rebuild = assignFinite(state.gtao, 'samples', options.samples) || rebuild;
+            rebuild = assignFinite(state.gtao, 'distanceExponent', options.distanceExponent) || rebuild;
+            rebuild = assignFinite(state.gtao, 'distanceFallOff', options.distanceFallOff) || rebuild;
+            live = assignFinite(state.gtao, 'radius', options.radius) || live;
+            rebuild = assignFinite(state.gtao, 'scale', options.scale) || rebuild;
+            live = assignFinite(state.gtao, 'thickness', options.thickness) || live;
+            rebuild = assignFinite(state.gtao, 'resolutionScale', options.resolutionScale) || rebuild;
+            if (rebuild) rebuildPipeline();
+            else if (live && state.gtao.enabled) queuePipelineUpdate({ output: true });
             return { ...state.gtao };
         },
         isMotionBlurEnabled() {
@@ -851,18 +890,23 @@ export function createMaxJSFxController({
             if (enabled && !supportsScreenSpaceEffects) {
                 lastError = 'Motion blur requires WebGPU or TSL_GL';
                 onError(lastError);
-                state.motionBlur.enabled = true;
-                rebuildPipeline();
+                if (state.motionBlur.enabled !== true) {
+                    state.motionBlur.enabled = true;
+                    rebuildPipeline();
+                }
                 return false;
             }
-            state.motionBlur.enabled = !!enabled && available;
+            const next = !!enabled && available;
+            if (state.motionBlur.enabled === next) return state.motionBlur.enabled;
+            state.motionBlur.enabled = next;
             rebuildPipeline();
             return state.motionBlur.enabled;
         },
         setMotionBlurOptions(options = {}) {
-            assignFinite(state.motionBlur, 'amount', options.amount);
-            assignFinite(state.motionBlur, 'samples', options.samples);
-            rebuildPipeline();
+            let changed = false;
+            changed = assignFinite(state.motionBlur, 'amount', options.amount) || changed;
+            changed = assignFinite(state.motionBlur, 'samples', options.samples) || changed;
+            if (changed) rebuildPipeline();
             return { ...state.motionBlur };
         },
         isTRAAEnabled() {
@@ -872,20 +916,25 @@ export function createMaxJSFxController({
             if (enabled && !supportsScreenSpaceEffects) {
                 lastError = 'TRAA requires WebGPU or TSL_GL';
                 onError(lastError);
-                state.traa.enabled = true;
-                rebuildPipeline();
+                if (state.traa.enabled !== true) {
+                    state.traa.enabled = true;
+                    rebuildPipeline();
+                }
                 return false;
             }
-            state.traa.enabled = !!enabled && available;
+            const next = !!enabled && available;
+            if (state.traa.enabled === next) return state.traa.enabled;
+            state.traa.enabled = next;
             rebuildPipeline();
             return state.traa.enabled;
         },
         setTRAAOptions(options = {}) {
-            if (typeof options.useSubpixelCorrection === 'boolean') state.traa.useSubpixelCorrection = options.useSubpixelCorrection;
-            assignFinite(state.traa, 'depthThreshold', options.depthThreshold);
-            assignFinite(state.traa, 'edgeDepthDiff', options.edgeDepthDiff);
-            assignFinite(state.traa, 'maxVelocityLength', options.maxVelocityLength);
-            rebuildPipeline();
+            let changed = false;
+            changed = assignBoolean(state.traa, 'useSubpixelCorrection', options.useSubpixelCorrection) || changed;
+            changed = assignFinite(state.traa, 'depthThreshold', options.depthThreshold) || changed;
+            changed = assignFinite(state.traa, 'edgeDepthDiff', options.edgeDepthDiff) || changed;
+            changed = assignFinite(state.traa, 'maxVelocityLength', options.maxVelocityLength) || changed;
+            if (changed) rebuildPipeline();
             return { ...state.traa };
         },
         setEnvironmentVisible(visible) {
@@ -953,20 +1002,25 @@ export function createMaxJSFxController({
             if (enabled && !supportsTslPostEffects) {
                 lastError = 'Bloom requires WebGPU or TSL_GL';
                 onError(lastError);
-                state.bloom.enabled = true;
-                rebuildPipeline();
+                if (state.bloom.enabled !== true) {
+                    state.bloom.enabled = true;
+                    rebuildPipeline();
+                }
                 return false;
             }
-            state.bloom.enabled = !!enabled && available;
+            const next = !!enabled && available;
+            if (state.bloom.enabled === next) return state.bloom.enabled;
+            state.bloom.enabled = next;
             rebuildPipeline();
             return state.bloom.enabled;
         },
         setBloomOptions(options = {}) {
-            assignFinite(state.bloom, 'strength', options.strength);
-            assignFinite(state.bloom, 'radius', options.radius);
-            assignFinite(state.bloom, 'threshold', options.threshold);
-            assignFinite(state.bloom, 'resolutionScale', options.resolutionScale);
-            rebuildPipeline();
+            let changed = false;
+            changed = assignFinite(state.bloom, 'strength', options.strength) || changed;
+            changed = assignFinite(state.bloom, 'radius', options.radius) || changed;
+            changed = assignFinite(state.bloom, 'threshold', options.threshold) || changed;
+            changed = assignFinite(state.bloom, 'resolutionScale', options.resolutionScale) || changed;
+            if (changed) rebuildPipeline();
             return { ...state.bloom };
         },
         isToonOutlineEnabled() {
@@ -976,19 +1030,24 @@ export function createMaxJSFxController({
             if (enabled && !supportsScreenSpaceEffects) {
                 lastError = 'Toon outline requires WebGPU or TSL_GL';
                 onError(lastError);
-                state.toonOutline.enabled = true;
-                rebuildPipeline();
+                if (state.toonOutline.enabled !== true) {
+                    state.toonOutline.enabled = true;
+                    rebuildPipeline();
+                }
                 return false;
             }
-            state.toonOutline.enabled = !!enabled;
+            const next = !!enabled;
+            if (state.toonOutline.enabled === next) return state.toonOutline.enabled;
+            state.toonOutline.enabled = next;
             rebuildPipeline();
             return state.toonOutline.enabled;
         },
         setToonOutlineOptions(options = {}) {
-            assignFinite(state.toonOutline, 'thickness', options.thickness);
-            assignFinite(state.toonOutline, 'alpha', options.alpha);
-            if (Array.isArray(options.color)) state.toonOutline.color = options.color;
-            rebuildPipeline();
+            let changed = false;
+            changed = assignFinite(state.toonOutline, 'thickness', options.thickness) || changed;
+            changed = assignFinite(state.toonOutline, 'alpha', options.alpha) || changed;
+            changed = assignArray(state.toonOutline, 'color', options.color) || changed;
+            if (changed) rebuildPipeline();
             return { ...state.toonOutline };
         },
         isContactShadowEnabled() {
@@ -998,8 +1057,10 @@ export function createMaxJSFxController({
             if (enabled && !supportsScreenSpaceEffects) {
                 lastError = 'Contact shadows require WebGPU or TSL_GL';
                 onError(lastError);
-                state.contactShadow.enabled = true;
-                rebuildPipeline();
+                if (state.contactShadow.enabled !== true) {
+                    state.contactShadow.enabled = true;
+                    rebuildPipeline();
+                }
                 return false;
             }
             if (enabled && !mainLight) {
@@ -1013,7 +1074,9 @@ export function createMaxJSFxController({
                 onError(lastError);
                 return false;
             }
-            state.contactShadow.enabled = !!enabled && available;
+            const next = !!enabled && available;
+            if (state.contactShadow.enabled === next) return state.contactShadow.enabled;
+            state.contactShadow.enabled = next;
             if (!state.contactShadow.enabled) {
                 core.restoreForcedContactShadowLight();
             }
@@ -1021,12 +1084,15 @@ export function createMaxJSFxController({
             return state.contactShadow.enabled;
         },
         setContactShadowOptions(options = {}) {
-            assignFinite(state.contactShadow, 'maxDistance', options.maxDistance);
-            assignFinite(state.contactShadow, 'thickness', options.thickness);
-            assignFinite(state.contactShadow, 'shadowIntensity', options.shadowIntensity);
-            assignFinite(state.contactShadow, 'quality', options.quality);
-            if (typeof options.temporal === 'boolean') state.contactShadow.temporal = options.temporal;
-            rebuildPipeline();
+            let rebuild = false;
+            let live = false;
+            live = assignFinite(state.contactShadow, 'maxDistance', options.maxDistance) || live;
+            live = assignFinite(state.contactShadow, 'thickness', options.thickness) || live;
+            rebuild = assignFinite(state.contactShadow, 'shadowIntensity', options.shadowIntensity) || rebuild;
+            rebuild = assignFinite(state.contactShadow, 'quality', options.quality) || rebuild;
+            rebuild = assignBoolean(state.contactShadow, 'temporal', options.temporal) || rebuild;
+            if (rebuild) rebuildPipeline();
+            else if (live && state.contactShadow.enabled) queuePipelineUpdate({ output: true });
             return { ...state.contactShadow };
         },
         setMainLight(light) {
@@ -1046,11 +1112,15 @@ export function createMaxJSFxController({
             if (enabled && !supportsScreenSpaceEffects) {
                 lastError = 'Retro requires WebGPU or TSL_GL';
                 onError(lastError);
-                state.retro.enabled = true;
-                rebuildPipeline();
+                if (state.retro.enabled !== true) {
+                    state.retro.enabled = true;
+                    rebuildPipeline();
+                }
                 return false;
             }
-            state.retro.enabled = !!enabled;
+            const next = !!enabled;
+            if (state.retro.enabled === next) return state.retro.enabled;
+            state.retro.enabled = next;
             rebuildPipeline();
             return state.retro.enabled;
         },
@@ -1090,11 +1160,15 @@ export function createMaxJSFxController({
             if (enabled && !supportsScreenSpaceEffects) {
                 lastError = 'Pixel FX requires WebGPU or TSL_GL';
                 onError(lastError);
-                state.pixel.enabled = true;
-                rebuildPipeline();
+                if (state.pixel.enabled !== true) {
+                    state.pixel.enabled = true;
+                    rebuildPipeline();
+                }
                 return false;
             }
-            state.pixel.enabled = !!enabled;
+            const next = !!enabled;
+            if (state.pixel.enabled === next) return state.pixel.enabled;
+            state.pixel.enabled = next;
             rebuildPipeline();
             return state.pixel.enabled;
         },
@@ -1137,11 +1211,15 @@ export function createMaxJSFxController({
             if (enabled && !supportsScreenSpaceEffects) {
                 lastError = 'PowerShot requires WebGPU or TSL_GL';
                 onError(lastError);
-                state.powershot.enabled = true;
-                rebuildPipeline();
+                if (state.powershot.enabled !== true) {
+                    state.powershot.enabled = true;
+                    rebuildPipeline();
+                }
                 return false;
             }
-            state.powershot.enabled = !!enabled && available;
+            const next = !!enabled && available;
+            if (state.powershot.enabled === next) return state.powershot.enabled;
+            state.powershot.enabled = next;
             rebuildPipeline();
             return state.powershot.enabled;
         },
@@ -1269,11 +1347,15 @@ export function createMaxJSFxController({
             if (enabled && !supportsScreenSpaceEffects) {
                 lastError = 'DOF requires WebGPU or TSL_GL';
                 onError(lastError);
-                state.dof.enabled = true;
-                rebuildPipeline();
+                if (state.dof.enabled !== true) {
+                    state.dof.enabled = true;
+                    rebuildPipeline();
+                }
                 return false;
             }
-            state.dof.enabled = !!enabled && available;
+            const next = !!enabled && available;
+            if (state.dof.enabled === next) return state.dof.enabled;
+            state.dof.enabled = next;
             rebuildPipeline();
             return state.dof.enabled;
         },
@@ -1346,11 +1428,15 @@ export function createMaxJSFxController({
             if (enabled && !supportsScreenSpaceEffects) {
                 lastError = 'Volumetric lighting requires WebGPU or TSL_GL';
                 onError(lastError);
-                state.volumetric.enabled = true;
-                rebuildPipeline();
+                if (state.volumetric.enabled !== true) {
+                    state.volumetric.enabled = true;
+                    rebuildPipeline();
+                }
                 return false;
             }
-            state.volumetric.enabled = !!enabled && available;
+            const next = !!enabled && available;
+            if (state.volumetric.enabled === next) return state.volumetric.enabled;
+            state.volumetric.enabled = next;
             rebuildPipeline();
             return state.volumetric.enabled;
         },
@@ -1384,12 +1470,16 @@ export function createMaxJSFxController({
             if (enabled && !supportsScreenSpaceEffects) {
                 lastError = 'Fog requires WebGPU or TSL_GL';
                 onError(lastError);
-                state.fog.enabled = true;
-                core.applySceneFog();
-                rebuildPipeline();
+                if (state.fog.enabled !== true) {
+                    state.fog.enabled = true;
+                    core.applySceneFog();
+                    rebuildPipeline();
+                }
                 return false;
             }
-            state.fog.enabled = !!enabled;
+            const next = !!enabled;
+            if (state.fog.enabled === next) return state.fog.enabled;
+            state.fog.enabled = next;
             core.applySceneFog();
             rebuildPipeline();
             return state.fog.enabled;

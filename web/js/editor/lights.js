@@ -14,6 +14,7 @@ import {
     normalizeLightLinkMode,
     serializeLightLinks,
 } from '../light_linking_core.js';
+import { markOwned, OWNER_MAX } from '../layer_ownership.js';
 
 function createLights(deps = {}) {
         const lightHelperMap = new Map();
@@ -31,6 +32,7 @@ function createLights(deps = {}) {
         // ── Lights Sync ──────────────────────────────────────
         const lightGroup = new THREE.Group();
         lightGroup.name = '__maxjs_lights';
+        markOwned(lightGroup, OWNER_MAX);
         deps.maxRoot.add(lightGroup);
         const LIGHT_TYPES = ['DirectionalLight', 'PointLight', 'SpotLight', 'RectAreaLight', 'HemisphereLight', 'AmbientLight'];
         const shadowBounds = new THREE.Box3();
@@ -196,6 +198,7 @@ function createLights(deps = {}) {
             if (helper) {
                 helper.userData.maxjsExcludeFromRuntimeSnapshot = true;
                 helper.visible = deps.lightHelpersVisible;
+                markOwned(helper, OWNER_MAX);
                 lightGroup.add(helper);
             }
             return helper;
@@ -321,10 +324,22 @@ function createLights(deps = {}) {
         //   2. NAME tagging — works with the sync as-is: a light whose name
         //      contains "_ir"/"ir_", "_led", "_sodium"/"_lps", "_inc"/"_halogen"
         //      (case-insensitive) gets the class. Rename in Max → tagged.
-        function applyLightEmitterClass(light, ld) {
+        function syncLightUserProps(light, ld, { partial = false } = {}) {
+            light.userData ??= {};
+            const hasUserProps = Object.prototype.hasOwnProperty.call(ld ?? {}, 'userProps');
+            if (!hasUserProps && partial) return;
+            const next = hasUserProps && typeof ld.userProps === 'string' ? ld.userProps : '';
+            if (next) light.userData.maxjsUserProps = next;
+            else delete light.userData.maxjsUserProps;
+        }
+
+        function applyLightEmitterClass(light, ld, options = {}) {
+            syncLightUserProps(light, ld, options);
             let cls;
             let temp;
-            const props = typeof ld.userProps === 'string' ? ld.userProps : '';
+            const props = typeof light.userData?.maxjsUserProps === 'string'
+                ? light.userData.maxjsUserProps
+                : '';
             if (props) {
                 const mc = /emitterClass\s*=\s*([a-z_]+)/i.exec(props);
                 if (mc) cls = mc[1].toLowerCase();
@@ -341,9 +356,10 @@ function createLights(deps = {}) {
             if (cls) light.userData.emitterClass = cls;
             else delete light.userData.emitterClass;
             if (Number.isFinite(temp)) light.userData.colorTemp = temp;
+            else delete light.userData.colorTemp;
         }
 
-        function lightTracePayloadSignature(ld) {
+        function lightTracePayloadSignature(ld, userProps = '', effectiveName = '') {
             const q = (value) => Number.isFinite(Number(value))
                 ? Math.round(Number(value) * 100000)
                 : 0;
@@ -361,6 +377,8 @@ function createLights(deps = {}) {
                 vec(ld?.color),
                 q(ld?.intensity),
                 q(ld?.volContrib == null ? 1 : ld.volContrib),
+                String(userProps || ''),
+                String(effectiveName || ''),
             ];
             if (type === 1 || type === 2) parts.push(q(ld?.distance), q(ld?.decay == null ? 2 : ld.decay));
             if (type === 2) parts.push(q(ld?.angle), q(ld?.penumbra));
@@ -369,31 +387,40 @@ function createLights(deps = {}) {
             return parts.join('|');
         }
 
-        function applyLightData(light, ld) {
+        function applyLightData(light, ld, options = {}) {
             light.userData ??= {};
-            const traceSignature = lightTracePayloadSignature(ld);
-            const traceChanged = light.userData.maxjsTracePayloadSignature !== traceSignature;
             light.userData.maxjsTypeId = ld.type;
             if (ld.h != null) light.userData.maxjsHandle = ld.h;
-            if (ld.name) light.name = ld.name;
-            syncLightParent(light, ld);
-            applyLightEmitterClass(light, ld);
 
             const isRuntimeOverridden = (property) =>
                 ld.h != null && deps.layerManager.hasObjectPropertyOverride?.(ld.h, property) === true;
 
+            if (ld.name && !isRuntimeOverridden('name')) light.name = ld.name;
+            syncLightParent(light, ld);
+            applyLightEmitterClass(light, ld, options);
+            const traceSignature = lightTracePayloadSignature(
+                ld,
+                light.userData.maxjsUserProps,
+                light.name
+            );
+            const traceChanged = light.userData.maxjsTracePayloadSignature !== traceSignature;
+
             const visible = ld.v == null ? true : !!ld.v;
             light.userData.maxjsVisible = visible;
-            light.visible = true;
-            light.layers?.set?.(visible ? 0 : deps.MAXJS_SELF_HIDDEN_LAYER);
+            if (!isRuntimeOverridden('visible')) light.visible = true;
+            if (!isRuntimeOverridden('layers')) {
+                light.layers?.set?.(visible ? 0 : deps.MAXJS_SELF_HIDDEN_LAYER);
+            }
             if (light.userData.maxjsTarget) light.userData.maxjsTarget.visible = true;
 
-            if (light.color && Array.isArray(ld.color)) {
+            if (!isRuntimeOverridden('color') && light.color && Array.isArray(ld.color)) {
                 light.color.setRGB(ld.color[0], ld.color[1], ld.color[2]);
             }
             if ('intensity' in light && Number.isFinite(ld.intensity)) {
                 light.userData.maxjsAuthoredIntensity = ld.intensity;
-                light.intensity = visible ? ld.intensity : 0;
+                if (!isRuntimeOverridden('intensity')) {
+                    light.intensity = visible ? ld.intensity : 0;
+                }
             }
             if (Number.isFinite(ld.volContrib)) {
                 light.userData.volContrib = ld.volContrib;
@@ -403,52 +430,58 @@ function createLights(deps = {}) {
 
             switch (ld.type) {
             case 0:
-                setLightPositionFromMaxRoot(light, ld.pos);
-                setLightTargetFromData(light, ld);
+                if (!isRuntimeOverridden('position')) setLightPositionFromMaxRoot(light, ld.pos);
+                if (!isRuntimeOverridden('target')) setLightTargetFromData(light, ld);
                 break;
             case 1:
-                setLightPositionFromMaxRoot(light, ld.pos);
-                light.distance = ld.distance || 0;
-                light.decay = ld.decay ?? 2;
+                if (!isRuntimeOverridden('position')) setLightPositionFromMaxRoot(light, ld.pos);
+                if (!isRuntimeOverridden('distance')) light.distance = ld.distance || 0;
+                if (!isRuntimeOverridden('decay')) light.decay = ld.decay ?? 2;
                 break;
             case 2:
-                setLightPositionFromMaxRoot(light, ld.pos);
-                light.distance = ld.distance || 0;
-                light.decay = ld.decay ?? 2;
-                light.angle = ld.angle ?? Math.PI / 4;
-                light.penumbra = ld.penumbra ?? 0.1;
-                setLightTargetFromData(light, ld);
+                if (!isRuntimeOverridden('position')) setLightPositionFromMaxRoot(light, ld.pos);
+                if (!isRuntimeOverridden('distance')) light.distance = ld.distance || 0;
+                if (!isRuntimeOverridden('decay')) light.decay = ld.decay ?? 2;
+                if (!isRuntimeOverridden('angle')) light.angle = ld.angle ?? Math.PI / 4;
+                if (!isRuntimeOverridden('penumbra')) light.penumbra = ld.penumbra ?? 0.1;
+                if (!isRuntimeOverridden('target')) setLightTargetFromData(light, ld);
                 break;
             case 3:
-                setLightPositionFromMaxRoot(light, ld.pos);
-                light.width = ld.width || 20;
-                light.height = ld.height || 20;
-                lightTargetLocal.set(
-                    ld.pos[0] + ld.dir[0],
-                    ld.pos[1] + ld.dir[1],
-                    ld.pos[2] + ld.dir[2]
-                );
-                lightTargetWorld.copy(lightTargetLocal);
-                deps.maxRoot.updateMatrixWorld(true);
-                deps.maxRoot.localToWorld(lightTargetWorld);
-                light.updateMatrixWorld(true);
-                light.lookAt(lightTargetWorld);
+                if (!isRuntimeOverridden('position')) setLightPositionFromMaxRoot(light, ld.pos);
+                if (!isRuntimeOverridden('width')) light.width = ld.width || 20;
+                if (!isRuntimeOverridden('height')) light.height = ld.height || 20;
+                if (!isRuntimeOverridden('quaternion') && !isRuntimeOverridden('rotation')) {
+                    lightTargetLocal.set(
+                        ld.pos[0] + ld.dir[0],
+                        ld.pos[1] + ld.dir[1],
+                        ld.pos[2] + ld.dir[2]
+                    );
+                    lightTargetWorld.copy(lightTargetLocal);
+                    deps.maxRoot.updateMatrixWorld(true);
+                    deps.maxRoot.localToWorld(lightTargetWorld);
+                    light.updateMatrixWorld(true);
+                    light.lookAt(lightTargetWorld);
+                }
                 break;
             case 4:
-                setLightPositionFromMaxRoot(light, ld.pos);
-                light.groundColor.setRGB(
-                    ld.groundColor?.[0] ?? 0.2666666667,
-                    ld.groundColor?.[1] ?? 0.2666666667,
-                    ld.groundColor?.[2] ?? 0.2666666667
-                );
+                if (!isRuntimeOverridden('position')) setLightPositionFromMaxRoot(light, ld.pos);
+                if (!isRuntimeOverridden('groundColor')) {
+                    light.groundColor.setRGB(
+                        ld.groundColor?.[0] ?? 0.2666666667,
+                        ld.groundColor?.[1] ?? 0.2666666667,
+                        ld.groundColor?.[2] ?? 0.2666666667
+                    );
+                }
                 break;
             case 5:
                 break;
             }
 
             if (light.shadow) {
-                light.castShadow = visible && !!ld.castShadow;
-                if (light.castShadow) {
+                if (!isRuntimeOverridden('castShadow')) {
+                    light.castShadow = visible && !!ld.castShadow;
+                }
+                if (light.castShadow && !isRuntimeOverridden('shadow')) {
                     light.shadow.bias = ld.shadowBias ?? -0.0001;
                     light.shadow.radius = ld.shadowRadius ?? 1;
                     const mapSz = ld.shadowMapSize ?? 1024;
@@ -497,6 +530,8 @@ function createLights(deps = {}) {
             light.userData ??= {};
             light.userData.maxjsLightType = ld.type;
             applyLightData(light, ld);
+            markOwned(light, OWNER_MAX);
+            if (light.userData.maxjsTarget) markOwned(light.userData.maxjsTarget, OWNER_MAX);
             return light;
         }
 
@@ -1480,7 +1515,7 @@ function createLights(deps = {}) {
                     return true;
                 }
 
-                changed = applyLightData(light, ld) || changed;
+                changed = applyLightData(light, ld, { partial: true }) || changed;
                 if (light.userData?.maxjsVisible !== false) {
                     appliedLightCount++;
                     if (!mainDirectionalLight && ld.type === 0) mainDirectionalLight = light;

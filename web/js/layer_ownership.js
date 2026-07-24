@@ -14,12 +14,34 @@ const MATERIAL_MAP_KEYS = [
 function setOwner(resource, owner) {
     if (!resource || typeof resource !== 'object') return resource;
     resource.userData ??= {};
+    const currentOwner = resource.userData[OWNER_KEY];
+    if (
+        owner === OWNER_MAX
+        && currentOwner != null
+        && currentOwner !== OWNER_MAX
+        && resource.userData.maxjsHandle == null
+    ) {
+        return resource;
+    }
+    if (
+        owner !== OWNER_MAX
+        && (
+            currentOwner === OWNER_MAX
+            || resource.userData.maxjsHandle != null
+        )
+    ) {
+        return resource;
+    }
     resource.userData[OWNER_KEY] = owner;
     return resource;
 }
 
 function getOwner(resource) {
     return resource?.userData?.[OWNER_KEY] ?? null;
+}
+
+function isOwnedByMax(resource) {
+    return getOwner(resource) === OWNER_MAX || resource?.userData?.maxjsHandle != null;
 }
 
 function isDisposable(resource) {
@@ -33,9 +55,13 @@ function isOwnedByJs(resource) {
 
 function markMaterialOwned(material, owner) {
     if (!material) return material;
+    if (owner !== OWNER_MAX && isOwnedByMax(material)) return material;
     setOwner(material, owner);
+    if (getOwner(material) !== owner) return material;
     for (const key of MATERIAL_MAP_KEYS) {
-        if (material[key]) setOwner(material[key], owner);
+        const map = material[key];
+        if (!map || (owner !== OWNER_MAX && isOwnedByMax(map))) continue;
+        setOwner(map, owner);
     }
     return material;
 }
@@ -50,8 +76,11 @@ function markOwned(resource, owner = OWNER_JS) {
 
     if (resource.isObject3D) {
         resource.traverse(obj => {
+            if (owner !== OWNER_MAX && isOwnedByMax(obj)) return;
             setOwner(obj, owner);
-            if (obj.geometry) setOwner(obj.geometry, owner);
+            if (obj.geometry && (owner === OWNER_MAX || !isOwnedByMax(obj.geometry))) {
+                setOwner(obj.geometry, owner);
+            }
             if (Array.isArray(obj.material)) obj.material.forEach(mat => markMaterialOwned(mat, owner));
             else if (obj.material) markMaterialOwned(obj.material, owner);
         });
@@ -59,8 +88,18 @@ function markOwned(resource, owner = OWNER_JS) {
     }
 
     if (resource.isMaterial) return markMaterialOwned(resource, owner);
+    if (owner !== OWNER_MAX && isOwnedByMax(resource)) return resource;
     if (resource.isBufferGeometry || resource.isTexture || resource.isRenderTarget) return setOwner(resource, owner);
     return setOwner(resource, owner);
+}
+
+function clearOwner(resource) {
+    if (!resource || typeof resource !== 'object') return resource;
+    if (resource.userData) {
+        resource.userData = { ...resource.userData };
+        delete resource.userData[OWNER_KEY];
+    }
+    return resource;
 }
 
 function setSnapshotTargetId(resource, snapshotId) {
@@ -70,44 +109,57 @@ function setSnapshotTargetId(resource, snapshotId) {
     return resource;
 }
 
-function disposeOwnedMaterial(material) {
+function disposeOwnedMaterial(material, options = {}) {
     if (!material) return;
+    const seen = options.seen ?? new Set();
+    const force = options.force === true;
     if (Array.isArray(material)) {
-        for (const item of material) disposeOwnedMaterial(item);
+        for (const item of material) disposeOwnedMaterial(item, { seen, force });
         return;
     }
+    if (seen.has(material) || isOwnedByMax(material)) return;
+    seen.add(material);
     for (const key of MATERIAL_MAP_KEYS) {
         const map = material[key];
-        if (isOwnedByJs(map) && isDisposable(map)) map.dispose();
+        if (!map || seen.has(map) || isOwnedByMax(map)) continue;
+        if (force || isOwnedByJs(map)) {
+            seen.add(map);
+            if (isDisposable(map)) map.dispose();
+        }
     }
-    if (isOwnedByJs(material) && isDisposable(material)) material.dispose();
+    if ((force || isOwnedByJs(material)) && isDisposable(material)) material.dispose();
 }
 
-function disposeOwnedResource(resource) {
+function disposeOwnedResource(resource, options = {}) {
     if (!resource) return;
 
+    const seen = options.seen ?? new Set();
+    const force = options.force === true;
     if (Array.isArray(resource)) {
-        for (const item of resource) disposeOwnedResource(item);
+        for (const item of resource) disposeOwnedResource(item, { seen, force });
         return;
     }
+
+    if (resource.isMaterial) {
+        disposeOwnedMaterial(resource, { seen, force });
+        return;
+    }
+
+    if (seen.has(resource) || isOwnedByMax(resource)) return;
+    seen.add(resource);
 
     if (resource.isObject3D) {
         while (resource.children.length > 0) {
             const child = resource.children[0];
             resource.remove(child);
-            disposeOwnedResource(child);
+            disposeOwnedResource(child, { seen, force });
         }
-        if (isOwnedByJs(resource.geometry) && isDisposable(resource.geometry)) resource.geometry.dispose();
-        disposeOwnedMaterial(resource.material);
+        disposeOwnedResource(resource.geometry, { seen, force });
+        disposeOwnedMaterial(resource.material, { seen, force });
         return;
     }
 
-    if (resource.isMaterial) {
-        disposeOwnedMaterial(resource);
-        return;
-    }
-
-    if (isOwnedByJs(resource) && isDisposable(resource)) resource.dispose();
+    if ((force || isOwnedByJs(resource)) && isDisposable(resource)) resource.dispose();
 }
 
 export {
@@ -116,7 +168,9 @@ export {
     OWNER_JS,
     OWNER_OVERLAY,
     setOwner,
+    clearOwner,
     isOwnedByJs,
+    isOwnedByMax,
     getOwner,
     markOwned,
     setSnapshotTargetId,

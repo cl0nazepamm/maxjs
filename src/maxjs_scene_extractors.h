@@ -2403,6 +2403,8 @@ public:
     void ControllerStructured(NodeKeyTab& nodes) override;
     void ControllerOtherEvent(NodeKeyTab& nodes) override;
     void LinkChanged(NodeKeyTab& nodes) override;
+    void NameChanged(NodeKeyTab& nodes) override;
+    void UserPropertiesChanged(NodeKeyTab& nodes) override;
     void SelectionChanged(NodeKeyTab& nodes) override;
     void HideChanged(NodeKeyTab& nodes) override;
     void GeometryChanged(NodeKeyTab& nodes) override;

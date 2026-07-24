@@ -25,6 +25,7 @@
 //   0 Directional, 1 Point, 2 Spot, 3 RectArea, 4 Hemisphere, 5 Ambient
 
 import * as THREE from 'three';
+import { markOwned, OWNER_MAX } from './layer_ownership.js';
 
 const TARGET_DISTANCE = 1000;
 const shadowBounds = new THREE.Box3();
@@ -292,11 +293,40 @@ function applyLightShadowDefaults(light, ld, nodeMap) {
     light.shadow.needsUpdate = true;
 }
 
+function applyLightMetadata(light, ld) {
+    const props = typeof ld.userProps === 'string' ? ld.userProps : '';
+    if (props) light.userData.maxjsUserProps = props;
+    else delete light.userData.maxjsUserProps;
+
+    let emitterClass;
+    let colorTemp;
+    if (props) {
+        const emitterMatch = /emitterClass\s*=\s*([a-z_]+)/i.exec(props);
+        if (emitterMatch) emitterClass = emitterMatch[1].toLowerCase();
+        const tempMatch = /colorTemp\s*=\s*([0-9.]+)/i.exec(props);
+        if (tempMatch) colorTemp = Number(tempMatch[1]);
+    }
+    if (!emitterClass && light.name) {
+        const normalizedName = `_${light.name.toLowerCase().replace(/[\s\-.]+/g, '_')}_`;
+        if (/_ir_|_nir_|_illuminator_/.test(normalizedName)) emitterClass = 'ir';
+        else if (/_led_/.test(normalizedName)) emitterClass = 'led';
+        else if (/_sodium_|_lps_/.test(normalizedName)) emitterClass = 'sodium';
+        else if (/_inc_|_incandescent_|_halogen_|_tungsten_/.test(normalizedName)) {
+            emitterClass = 'incandescent';
+        }
+    }
+    if (emitterClass) light.userData.emitterClass = emitterClass;
+    else delete light.userData.emitterClass;
+    if (Number.isFinite(colorTemp)) light.userData.colorTemp = colorTemp;
+    else delete light.userData.colorTemp;
+}
+
 function applyLightData(light, ld, nodeMap, parent) {
     light.userData ??= {};
     light.userData.maxjsTypeId = ld.type;
     if (ld.h != null) light.userData.maxjsHandle = ld.h;
     if (ld.name) light.name = ld.name;
+    applyLightMetadata(light, ld);
     syncLightParent(light, ld, parent, nodeMap);
 
     const visible = ld.v == null ? true : !!ld.v;
@@ -401,6 +431,8 @@ function createLightFromData(ld, lightGroup, nodeMap) {
         return null;
     }
     applyLightData(light, ld, nodeMap, lightGroup);
+    markOwned(light, OWNER_MAX);
+    if (light.userData.maxjsTarget) markOwned(light.userData.maxjsTarget, OWNER_MAX);
     return light;
 }
 
@@ -420,6 +452,7 @@ export function createSceneLights({ scene, parent = scene, lightHandleMap = new 
 
     const lightGroup = new THREE.Group();
     lightGroup.name = '__maxjs_lights__';
+    markOwned(lightGroup, OWNER_MAX);
     parent.add(lightGroup);
 
     let lastSignature = '';

@@ -422,12 +422,14 @@ export function createSpectralMaterialSystem({
         return true;
     }
 
-    function createLayerFacade(layerId, getAdapter) {
+    function createLayerFacade(layerId, getAdapter, isActive = () => true) {
         return freezePlainObject({
             setNirAlbedo(selector, value, options = {}) {
+                if (!isActive()) return null;
                 return createEntry(layerId, getAdapter, selector, value, options);
             },
             list() {
+                if (!isActive()) return [];
                 return [...entries.values()]
                     .filter(entry => entry.layerId === layerId && !entry.disposed)
                     .map(entry => freezePlainObject({
@@ -437,6 +439,7 @@ export function createSpectralMaterialSystem({
                     }));
             },
             clear() {
+                if (!isActive()) return 0;
                 const owned = [...entries.values()].filter(entry => entry.layerId === layerId);
                 for (const entry of owned) disposeEntry(entry);
                 return owned.length;

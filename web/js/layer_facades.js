@@ -42,7 +42,7 @@ function createNodeMapFacade(nodeMap, getAdapter) {
 // per-instance accessors then go straight to the mesh with no traversal.
 //   const bricks = ctx.instances.get('...');
 //   bricks.setPositionAt(3, x, y, z);   // moves instance 3, flags an upload
-function createInstancesFacade({ THREE, getRoot }) {
+function createInstancesFacade({ THREE, getRoot, isActive = () => true }) {
     const scratch = new THREE.Matrix4();      // used by the mutation helpers
     const iterScratch = new THREE.Matrix4();  // separate, so a mutating forEach
                                               // callback can't clobber iteration
@@ -92,7 +92,7 @@ function createInstancesFacade({ THREE, getRoot }) {
                 return out;
             },
             setMatrixAt(i, matrix) {
-                if (!inRange(i) || !matrix || !matrix.isMatrix4) return false;
+                if (!isActive() || !inRange(i) || !matrix || !matrix.isMatrix4) return false;
                 mesh.setMatrixAt(i, matrix);
                 mesh.instanceMatrix.needsUpdate = true;
                 return true;
@@ -105,7 +105,7 @@ function createInstancesFacade({ THREE, getRoot }) {
             // Move instance i, preserving its rotation/scale. Accepts (x,y,z) or a
             // Vector3 / array-like as the first argument.
             setPositionAt(i, x, y, z) {
-                if (!inRange(i)) return false;
+                if (!isActive() || !inRange(i)) return false;
                 mesh.getMatrixAt(i, scratch);
                 if (x && typeof x === 'object') {
                     scratch.setPosition(x.x ?? x[0] ?? 0, x.y ?? x[1] ?? 0, x.z ?? x[2] ?? 0);
@@ -124,7 +124,11 @@ function createInstancesFacade({ THREE, getRoot }) {
                 }
             },
             // Call after a batch of setMatrixAt() if you bypassed the helpers.
-            flush() { mesh.instanceMatrix.needsUpdate = true; return true; },
+            flush() {
+                if (!isActive()) return false;
+                mesh.instanceMatrix.needsUpdate = true;
+                return true;
+            },
         });
         handleCache.set(mesh, handle);
         return handle;
@@ -166,7 +170,7 @@ function createInstancesFacade({ THREE, getRoot }) {
             },
             setMatrixAt(i, matrix) {
                 const hit = locate(i);
-                if (!hit || !matrix || !matrix.isMatrix4) return false;
+                if (!isActive() || !hit || !matrix || !matrix.isMatrix4) return false;
                 hit.mesh.setMatrixAt(hit.localIndex, matrix);
                 hit.mesh.instanceMatrix.needsUpdate = true;
                 return true;
@@ -179,7 +183,7 @@ function createInstancesFacade({ THREE, getRoot }) {
             },
             setPositionAt(i, x, y, z) {
                 const hit = locate(i);
-                if (!hit) return false;
+                if (!isActive() || !hit) return false;
                 hit.mesh.getMatrixAt(hit.localIndex, scratch);
                 if (x && typeof x === 'object') {
                     scratch.setPosition(x.x ?? x[0] ?? 0, x.y ?? x[1] ?? 0, x.z ?? x[2] ?? 0);
@@ -204,6 +208,7 @@ function createInstancesFacade({ THREE, getRoot }) {
                 }
             },
             flush() {
+                if (!isActive()) return false;
                 for (const mesh of meshes) mesh.instanceMatrix.needsUpdate = true;
                 return true;
             },
@@ -403,7 +408,7 @@ function createMaxSceneFacade({ scene, nodeMap, lightHandleMap, getAdapter, crea
     });
 }
 
-function createRendererFacade(renderer, THREE, scene) {
+function createRendererFacade(renderer, THREE, scene, isActive = () => true) {
     let pmremGenerator = null;
 
     function getPMREMGenerator() {
@@ -443,6 +448,7 @@ function createRendererFacade(renderer, THREE, scene) {
     }
 
     function pmremFromScene(sceneOrObj, sigma = 0, near = 0.1, far = 1_000_000) {
+        if (!isActive()) return null;
         const pmrem = getPMREMGenerator();
         const target = sceneOrObj?.isScene
             ? sceneOrObj
@@ -455,6 +461,7 @@ function createRendererFacade(renderer, THREE, scene) {
         return retainPMREMTexture(rt);
     }
     function pmremFromEquirectangular(texture) {
+        if (!isActive()) return null;
         const pmrem = getPMREMGenerator();
         const rt = pmrem.fromEquirectangular(texture);
         return retainPMREMTexture(rt);

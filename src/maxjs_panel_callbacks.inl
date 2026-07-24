@@ -28,6 +28,14 @@ void MaxJSFastNodeEventCallback::LinkChanged(NodeKeyTab& nodes) {
     owner_->MarkTrackedNodesDirty(nodes);
 }
 
+void MaxJSFastNodeEventCallback::NameChanged(NodeKeyTab&) {
+    if (owner_) owner_->SetDirty(false);
+}
+
+void MaxJSFastNodeEventCallback::UserPropertiesChanged(NodeKeyTab&) {
+    if (owner_) owner_->SetDirty(false);
+}
+
 void MaxJSFastNodeEventCallback::SelectionChanged(NodeKeyTab& nodes) {
     if (owner_) owner_->MarkSelectionNodesDirty(nodes);
 }

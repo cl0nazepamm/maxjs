@@ -25,6 +25,10 @@ function createHostBridge({ setInfoText, onFirstSync, onBeforeReady } = {}) {
     const pendingHostActions = new Map();
     let nextHostActionId = 1;
     let hasInitialSync = false;
+    let resolveInitialSync = null;
+    const initialSyncPromise = new Promise(resolve => {
+        resolveInitialSync = resolve;
+    });
     let readyRetryTimer = 0;
     const sharedBufferHandlers = new Map(); // meta.type -> (buf, meta) => void
     let sharedBufferFallback = null;        // scene_bin & anything untyped
@@ -97,7 +101,13 @@ function createHostBridge({ setInfoText, onFirstSync, onBeforeReady } = {}) {
         if (hasInitialSync) return;
         hasInitialSync = true;
         stopReadyRetry();
+        resolveInitialSync?.();
+        resolveInitialSync = null;
         onFirstSync?.();
+    }
+
+    function whenInitialSync() {
+        return hasInitialSync ? Promise.resolve() : initialSyncPromise;
     }
 
     function startBridgeHandshake() {
@@ -175,6 +185,7 @@ function createHostBridge({ setInfoText, onFirstSync, onBeforeReady } = {}) {
         onSharedBufferFallback,
         installHostWiring,
         hasInitialSync: () => hasInitialSync,
+        whenInitialSync,
     };
 }
 

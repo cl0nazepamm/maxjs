@@ -3,7 +3,15 @@
 import { OWNER_JS, OWNER_OVERLAY } from './layer_ownership.js';
 import { freezePlainObject } from './layer_utils.js';
 
-function createCameraAdapter(camera, THREE, ownForJs, cameraControl, layerId, debugWarn = () => {}) {
+function createCameraAdapter(
+    camera,
+    THREE,
+    ownForJs,
+    cameraControl,
+    layerId,
+    debugWarn = () => {},
+    isActive = () => true,
+) {
     const scratch = {
         position: new THREE.Vector3(),
         target: new THREE.Vector3(),
@@ -19,6 +27,10 @@ function createCameraAdapter(camera, THREE, ownForJs, cameraControl, layerId, de
     }
 
     function ensureOwnership() {
+        if (!isActive()) {
+            debugWarn(`[Camera] Layer ${layerId} is no longer active`);
+            return false;
+        }
         const owner = cameraControl.getOwner();
         if (owner && owner !== layerId) {
             debugWarn(`[Camera] Layer ${layerId} cannot control camera owned by ${owner}`);
@@ -63,6 +75,7 @@ function createCameraAdapter(camera, THREE, ownForJs, cameraControl, layerId, de
     }
 
     function usePhysicalCamera(handle) {
+        if (!isActive()) return false;
         const resolvedHandle = Number(handle?.handle ?? handle?.h ?? handle);
         return cameraControl.setMode('physical', { handle: resolvedHandle, layerId });
     }
@@ -139,6 +152,7 @@ function createCameraAdapter(camera, THREE, ownForJs, cameraControl, layerId, de
         },
 
         clone(options = {}) {
+            if (!isActive()) return null;
             const cam = getActiveCamera();
             const clone = cam.clone();
             clone.matrix.copy(cam.matrix);
@@ -157,6 +171,7 @@ function createCameraAdapter(camera, THREE, ownForJs, cameraControl, layerId, de
 
         // Switch to viewport mode (synced from Max viewport)
         useViewport() {
+            if (!isActive()) return false;
             return cameraControl.setMode('viewport');
         },
 
@@ -172,6 +187,7 @@ function createCameraAdapter(camera, THREE, ownForJs, cameraControl, layerId, de
 
         // Switch to script/game mode (full JS control)
         useScriptMode(options = {}) {
+            if (!isActive()) return false;
             return cameraControl.setMode('script', {
                 layerId,
                 enableControls: options.enableOrbitControls ?? false,
@@ -179,10 +195,12 @@ function createCameraAdapter(camera, THREE, ownForJs, cameraControl, layerId, de
         },
 
         // Legacy ownership API (maps to script mode)
-        takeOver() { return cameraControl.claim(layerId); },
-        release() { cameraControl.release(layerId); },
+        takeOver() { return isActive() && cameraControl.claim(layerId); },
+        release() {
+            if (isActive()) cameraControl.release(layerId);
+        },
         get isOverridden() { return cameraControl.isClaimed(); },
-        get isOwnedByMe() { return cameraControl.getOwner() === layerId; },
+        get isOwnedByMe() { return isActive() && cameraControl.getOwner() === layerId; },
 
         // Position control
         setPosition(x, y, z) {
@@ -401,14 +419,17 @@ function createCameraAdapter(camera, THREE, ownForJs, cameraControl, layerId, de
 
         // Access to underlying controls (when claimed)
         get controls() {
+            if (!isActive()) return null;
             if (cameraControl.getOwner() !== layerId) return null;
             return cameraControl.getControls?.() ?? null;
         },
 
         // Enable/disable controls temporarily
         setControlsEnabled(enabled) {
+            if (!isActive()) return false;
             const ctrl = cameraControl.getControls?.();
             if (ctrl) ctrl.enabled = enabled;
+            return !!ctrl;
         },
     });
 }

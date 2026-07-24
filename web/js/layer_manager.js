@@ -15,11 +15,12 @@ import {
     OWNER_MAX,
     OWNER_JS,
     OWNER_OVERLAY,
+    clearOwner,
     disposeOwnedResource,
     getOwner,
     isOwnedByJs,
+    isOwnedByMax,
     markOwned,
-    setOwner,
     setSnapshotTargetId,
 } from './layer_ownership.js';
 import { freezePlainObject, normalizeFolder, normalizePriority } from './layer_utils.js';
@@ -50,6 +51,8 @@ export function createLayerManager({
     debugWarn = () => {},
     onRuntimeVisibilityChanged = null,
     onRuntimeSceneChanged = null,
+    whenSceneReady = null,
+    isSnapshot = false,
 }) {
     const layers = new Map();
     const listeners = new Set();
@@ -72,7 +75,7 @@ export function createLayerManager({
     overlayWorldRoot.name ||= '__maxjs_overlay_root__';
     if (!overlayWorldRoot.parent) scene.add(overlayWorldRoot);
 
-    if (maxRoot) setOwner(maxRoot, OWNER_MAX);
+    if (maxRoot) markOwned(maxRoot, OWNER_MAX);
 
     // Camera modes:
     // - 'viewport': synced from Max viewport (default, controlled by Max navigation)
@@ -283,6 +286,27 @@ export function createLayerManager({
         },
     });
 
+    function createLayerAnimFacade(layer) {
+        const mutate = callback => {
+            if (!isLayerCurrent(layer)) {
+                warnStaleLayerMutation(layer);
+                return false;
+            }
+            return callback();
+        };
+        return freezePlainObject({
+            list: () => animFacade.list(),
+            play: id => mutate(() => animFacade.play(id)),
+            pause: id => mutate(() => animFacade.pause(id)),
+            stop: id => mutate(() => animFacade.stop(id)),
+            setTime: (id, seconds) => mutate(() => animFacade.setTime(id, seconds)),
+            setSpeed: (id, speed) => mutate(() => animFacade.setSpeed(id, speed)),
+            setLoop: (id, mode) => mutate(() => animFacade.setLoop(id, mode)),
+            seekAll: seconds => mutate(() => animFacade.seekAll(seconds)),
+            isPlaying: id => animFacade.isPlaying(id),
+        });
+    }
+
     // Max audio control + layer-fired one-shots (ctx.audio). One-shots are
     // tracked per layer and silenced on that layer's dispose.
     function createLayerAudioFacade(layer) {
@@ -295,11 +319,24 @@ export function createLayerManager({
         });
         return freezePlainObject({
             list() { return getAudioSystem?.()?.listEntries?.() ?? []; },
-            play(handle) { return getAudioSystem?.()?.playEntry?.(handle) === true; },
-            stop(handle) { return getAudioSystem?.()?.stopEntry?.(handle) === true; },
-            setVolume(handle, volume) { return getAudioSystem?.()?.setEntryVolume?.(handle, volume) === true; },
+            play(handle) {
+                if (!isLayerCurrent(layer)) return false;
+                return getAudioSystem?.()?.playEntry?.(handle) === true;
+            },
+            stop(handle) {
+                if (!isLayerCurrent(layer)) return false;
+                return getAudioSystem?.()?.stopEntry?.(handle) === true;
+            },
+            setVolume(handle, volume) {
+                if (!isLayerCurrent(layer)) return false;
+                return getAudioSystem?.()?.setEntryVolume?.(handle, volume) === true;
+            },
             get muted() { return getAudioSystem?.()?.getMuted?.() === true; },
             playOneShot(url, options = {}) {
+                if (!isLayerCurrent(layer)) {
+                    warnStaleLayerMutation(layer);
+                    return null;
+                }
                 const shot = getAudioSystem?.()?.playOneShot?.(url, options) ?? null;
                 if (!shot) return null;
                 for (const old of activeOneShots) {
@@ -393,11 +430,43 @@ export function createLayerManager({
         };
     }
 
-    function ownForLayer(resource, owner = OWNER_JS) {
-        return markOwned(resource, owner);
+    function isLayerCurrent(layer) {
+        return !!layer && layers.get(layer.id) === layer;
+    }
+
+    function warnStaleLayerMutation(layer) {
+        if (!layer || layer.staleWarningEmitted) return;
+        layer.staleWarningEmitted = true;
+        debugWarn(`[LayerManager] Ignoring work resumed by inactive layer "${layer.id}"`);
+    }
+
+    function disposeLateUnownedResource(layer, resource, owner = OWNER_JS) {
+        warnStaleLayerMutation(layer);
+        if (!resource || isOwnedByMax(resource) || getOwner(resource) != null) return resource;
+        markOwned(resource, owner);
+        disposeOwnedResource(resource, { force: true });
+        return resource;
+    }
+
+    function ownForLayer(layer, resource, owner = OWNER_JS) {
+        if (!resource) return resource;
+        if (!isLayerCurrent(layer)) {
+            return disposeLateUnownedResource(layer, resource, owner);
+        }
+        if (isOwnedByMax(resource)) {
+            debugWarn(`[LayerManager] Layer "${layer.id}" cannot own a Max-managed resource`);
+            return resource;
+        }
+        markOwned(resource, owner);
+        layer.tracked.add(resource);
+        return resource;
     }
 
     function getOrCreateLayerInput(layer) {
+        if (!isLayerCurrent(layer)) {
+            warnStaleLayerMutation(layer);
+            throw new Error(`Layer "${layer.id}" is no longer active`);
+        }
         if (!layer.input) layer.input = createInputHelper(renderer);
         return layer.input;
     }
@@ -405,9 +474,11 @@ export function createLayerManager({
     function cloneMaterialForLayer(material, owner) {
         if (!material) return material;
         if (Array.isArray(material)) return material.map(item => cloneMaterialForLayer(item, owner));
-        const clone = material.clone();
+        const clone = clearOwner(material.clone());
         for (const key of MATERIAL_MAP_KEYS) {
-            if (material[key]?.clone) clone[key] = markOwned(material[key].clone(), owner);
+            if (material[key]?.clone) {
+                clone[key] = markOwned(clearOwner(material[key].clone()), owner);
+            }
         }
         return markOwned(clone, owner);
     }
@@ -416,7 +487,11 @@ export function createLayerManager({
         const source = nodeMap.get(handle);
         if (!source?.isObject3D) return null;
         const owner = options.overlay ? OWNER_OVERLAY : OWNER_JS;
-        const clone = source.clone(false);
+        if (source.geometry) markOwned(source.geometry, OWNER_MAX);
+        if (source.material) markOwned(source.material, OWNER_MAX);
+        const clone = clearOwner(source.clone(false));
+        clone.userData ??= {};
+        delete clone.userData.maxjsHandle;
         clone.name = options.name || `${source.name || 'node'}_clone`;
         clone.matrixAutoUpdate = true;
         source.updateWorldMatrix?.(true, false);
@@ -425,10 +500,11 @@ export function createLayerManager({
         clone.matrixWorld.copy(source.matrixWorld);
         clone.matrixWorldNeedsUpdate = true;
         clone.visible = true;
-        clone.userData ??= {};
         clone.userData.maxjsRuntimeClone = true;
         clone.userData.maxjsSourceHandle = handle;
-        if (source.geometry?.clone) clone.geometry = markOwned(source.geometry.clone(), owner);
+        if (source.geometry?.clone) {
+            clone.geometry = markOwned(clearOwner(source.geometry.clone()), owner);
+        }
         if (source.material) {
             if (source.userData?.jsmod) {
                 // three.js Deform layers own geometry, but material edits from Max
@@ -443,6 +519,10 @@ export function createLayerManager({
     }
 
     function createAnchorForLayer(layer, handle, options = {}) {
+        if (!isLayerCurrent(layer)) {
+            warnStaleLayerMutation(layer);
+            return null;
+        }
         const owner = options.overlay ? OWNER_OVERLAY : OWNER_JS;
         const parent = owner === OWNER_OVERLAY ? layer.overlayGroup : layer.group;
         const anchor = markOwned(new THREE.Group(), owner);
@@ -458,6 +538,10 @@ export function createLayerManager({
     }
 
     function getLayerNodeAdapter(layer, handle, explicitObj = null) {
+        if (!isLayerCurrent(layer)) {
+            warnStaleLayerMutation(layer);
+            return layer.nodeAdapters.get(handle) ?? null;
+        }
         // Check if handle exists in nodeMap or lightHandleMap
         const fromNodeMap = nodeMap.has(handle);
         const fromLightMap = lightHandleMap?.has(handle);
@@ -471,19 +555,39 @@ export function createLayerManager({
                 THREE,
                 createAnchor: (nextHandle, options) => createAnchorForLayer(layer, nextHandle, options),
                 layerId: layer.id,
-                getTransformApi: createTransformApi,
-                setMaterialMap: (h, slot, tex) => setMaterialMapOverride(layer.id, h, slot, tex),
-                setPropertyOverride: (h, property, value, options) => setObjectPropertyOverride(layer.id, h, property, value, options),
-                clearPropertyOverride: (h, property, options) => clearObjectPropertyOverride(layer.id, h, property, options),
-                hasPropertyOverride: (h, property) => hasObjectPropertyOverride(h, property),
+                isActive: () => isLayerCurrent(layer),
+                getTransformApi: (nextHandle, getObject, layerId) => createTransformApi(
+                    nextHandle,
+                    getObject,
+                    layerId,
+                    () => isLayerCurrent(layer),
+                ),
+                setMaterialMap: (h, slot, tex) => (
+                    isLayerCurrent(layer)
+                    && setMaterialMapOverride(layer.id, h, slot, tex)
+                ),
+                setPropertyOverride: (h, property, value, options) => (
+                    isLayerCurrent(layer)
+                    && setObjectPropertyOverride(layer.id, h, property, value, options)
+                ),
+                clearPropertyOverride: (h, property, options) => (
+                    isLayerCurrent(layer)
+                    && clearObjectPropertyOverride(layer.id, h, property, options)
+                ),
+                hasPropertyOverride: (h, property) => (
+                    isLayerCurrent(layer)
+                    && hasObjectPropertyOverride(h, property)
+                ),
                 getNodeAdapter: (nextHandle) => getLayerNodeAdapter(layer, nextHandle),
                 cloneFromMax: (source, options) => layer.cloneFromMax?.(source, options) ?? null,
                 setVisibilityOverride: (h, visible, obj) => {
+                    if (!isLayerCurrent(layer)) return false;
                     const changed = setRuntimeVisibilityOverride(layer.id, h, visible, obj);
                     if (changed) notifyRuntimeSceneChanged({ type: 'visibility', layerId: layer.id, handle: h, visible: visible !== false });
                     return changed;
                 },
                 clearVisibilityOverride: (h, obj) => {
+                    if (!isLayerCurrent(layer)) return false;
                     const changed = clearRuntimeVisibilityOverride(h, obj);
                     if (changed) notifyRuntimeSceneChanged({ type: 'visibility', layerId: layer.id, handle: h, reset: true });
                     return changed;
@@ -495,9 +599,26 @@ export function createLayerManager({
     }
 
     function buildContext(layer) {
-        const rendererFacade = createRendererFacade(renderer, THREE, scene);
-        const instancesFacade = createInstancesFacade({ THREE, getRoot: () => maxRoot ?? scene });
-        const cameraFacade = createCameraAdapter(camera, THREE, ownForLayer, cameraControl, layer.id, debugWarn);
+        const rendererFacade = createRendererFacade(
+            renderer,
+            THREE,
+            scene,
+            () => isLayerCurrent(layer),
+        );
+        const instancesFacade = createInstancesFacade({
+            THREE,
+            getRoot: () => maxRoot ?? scene,
+            isActive: () => isLayerCurrent(layer),
+        });
+        const cameraFacade = createCameraAdapter(
+            camera,
+            THREE,
+            (resource, owner) => ownForLayer(layer, resource, owner),
+            cameraControl,
+            layer.id,
+            debugWarn,
+            () => isLayerCurrent(layer),
+        );
         const nodeMapFacade = createNodeMapFacade(nodeMap, handle => getLayerNodeAdapter(layer, handle));
         const maxSceneFacade = createMaxSceneFacade({
             scene,
@@ -519,6 +640,10 @@ export function createLayerManager({
                 return Object.freeze([...(getGLTFSystem()?.list?.() ?? [])]);
             },
             onReady(handle, cb) {
+                if (!isLayerCurrent(layer)) {
+                    warnStaleLayerMutation(layer);
+                    return () => {};
+                }
                 const sys = getGLTFSystem();
                 if (!sys?.onReady) return () => {};
                 const dispose = sys.onReady(handle, cb);
@@ -718,6 +843,7 @@ export function createLayerManager({
             get id() { return layer.id; },
             get name() { return layer.name; },
             get isWebGPU() { return isWebGPU; },
+            isSnapshot: isSnapshot === true,
             get dt() { return dt; },
             get elapsed() { return elapsed; },
             // Scene coordinate info — world is Y-up (Three.js default), Max Z-up converted on input
@@ -733,12 +859,20 @@ export function createLayerManager({
 
         const projectFacade = freezePlainObject({
             setDirectory(dir, options = {}) {
+                if (!isLayerCurrent(layer)) {
+                    warnStaleLayerMutation(layer);
+                    return false;
+                }
                 if (!projectControl?.setProjectDirectory) {
                     throw new Error('Project runtime is not bound');
                 }
                 return projectControl.setProjectDirectory(dir, options);
             },
             reload(force = true) {
+                if (!isLayerCurrent(layer)) {
+                    warnStaleLayerMutation(layer);
+                    return false;
+                }
                 if (!projectControl?.reload) {
                     throw new Error('Project runtime is not bound');
                 }
@@ -752,6 +886,10 @@ export function createLayerManager({
         const ctxRef = { current: null };
         const webappFacade = freezePlainObject({
             create(spec) {
+                if (!isLayerCurrent(layer)) {
+                    warnStaleLayerMutation(layer);
+                    return null;
+                }
                 return createWebappLayer(ctxRef.current, THREE, spec);
             },
         });
@@ -760,6 +898,10 @@ export function createLayerManager({
             on(event, handler) {
                 if (typeof event !== 'string' || !event) throw new TypeError('bus.on: event must be a non-empty string');
                 if (typeof handler !== 'function') throw new TypeError('bus.on: handler must be a function');
+                if (!isLayerCurrent(layer)) {
+                    warnStaleLayerMutation(layer);
+                    return () => {};
+                }
                 let set = busHandlers.get(event);
                 if (!set) { set = new Set(); busHandlers.set(event, set); }
                 const rec = { handler, layerId: layer.id };
@@ -781,6 +923,10 @@ export function createLayerManager({
                 return dispose;
             },
             off(event, handler) {
+                if (!isLayerCurrent(layer)) {
+                    warnStaleLayerMutation(layer);
+                    return false;
+                }
                 const set = busHandlers.get(event);
                 if (!set) return false;
                 for (const rec of set) {
@@ -792,21 +938,32 @@ export function createLayerManager({
                 }
                 return false;
             },
-            emit: busEmitInternal,
+            emit(event, payload) {
+                if (!isLayerCurrent(layer)) {
+                    warnStaleLayerMutation(layer);
+                    return;
+                }
+                busEmitInternal(event, payload);
+            },
         });
 
         const servicesFacade = freezePlainObject({
             provide(name, value) {
                 if (typeof name !== 'string' || !name) throw new TypeError('services.provide: name must be a non-empty string');
+                if (!isLayerCurrent(layer)) {
+                    warnStaleLayerMutation(layer);
+                    return null;
+                }
                 const existing = serviceRegistry.get(name);
                 if (existing) {
                     throw new Error(`Service "${name}" already provided by layer "${existing.layerId}" (layer "${layer.id}" conflict)`);
                 }
-                serviceRegistry.set(name, { value, layerId: layer.id });
+                const record = { value, layerId: layer.id };
+                serviceRegistry.set(name, record);
                 serviceFireWaiters(name, value);
                 const dispose = () => {
                     const cur = serviceRegistry.get(name);
-                    if (cur && cur.layerId === layer.id) serviceRegistry.delete(name);
+                    if (cur === record) serviceRegistry.delete(name);
                 };
                 layer.disposers.push(dispose);
                 return value;
@@ -822,6 +979,10 @@ export function createLayerManager({
             },
             onProvide(name, cb) {
                 if (typeof cb !== 'function') throw new TypeError('services.onProvide: cb must be a function');
+                if (!isLayerCurrent(layer)) {
+                    warnStaleLayerMutation(layer);
+                    return () => {};
+                }
                 const existing = serviceRegistry.get(name);
                 if (existing) {
                     try { cb(existing.value); } catch (err) { console.error(`[LayerManager services.onProvide:${name}]`, err); }
@@ -847,6 +1008,10 @@ export function createLayerManager({
         });
 
         const cloneFromMaxForLayer = (source, options = {}) => {
+            if (!isLayerCurrent(layer)) {
+                warnStaleLayerMutation(layer);
+                return null;
+            }
             const adapter = resolveNodeAdapter(source, options);
             if (!adapter?.isMesh) return null;
             const clone = cloneMaxNode(adapter.handle, options);
@@ -855,7 +1020,9 @@ export function createLayerManager({
             const parent = options.overlay ? layer.overlayGroup : layer.group;
             const targetParent = options.parent?.isObject3D ? options.parent : parent;
             placeRuntimeClone(clone, adapter, targetParent, options);
-            if (clone.userData?.maxjsFollowSourceMaterial) layer.liveMaterialClones.add(clone);
+            if (clone.userData?.maxjsFollowSourceMaterial) {
+                layer.liveMaterialClones.set(clone, clone.material);
+            }
             notifyRuntimeSceneChanged({ type: 'jsScene', layerId: layer.id, action: 'cloneFromMax' });
             return clone;
         };
@@ -865,10 +1032,22 @@ export function createLayerManager({
             root: layer.group,
             overlayRoot: layer.overlayGroup,
             own(resource, options = {}) {
-                return ownForLayer(resource, options.overlay ? OWNER_OVERLAY : OWNER_JS);
+                return ownForLayer(layer, resource, options.overlay ? OWNER_OVERLAY : OWNER_JS);
             },
             add(resource, options = {}) {
                 if (!resource?.isObject3D) return null;
+                if (!isLayerCurrent(layer)) {
+                    disposeLateUnownedResource(
+                        layer,
+                        resource,
+                        options.overlay ? OWNER_OVERLAY : OWNER_JS,
+                    );
+                    return null;
+                }
+                if (isOwnedByMax(resource)) {
+                    debugWarn(`[LayerManager] Layer "${layer.id}" cannot add a Max-managed object`);
+                    return null;
+                }
                 const owner = options.overlay ? OWNER_OVERLAY : OWNER_JS;
                 const parent = owner === OWNER_OVERLAY ? layer.overlayGroup : layer.group;
                 markOwned(resource, owner);
@@ -878,14 +1057,38 @@ export function createLayerManager({
                 return resource;
             },
             remove(resource) {
-                if (!resource?.isObject3D || !isOwnedByJs(resource)) return false;
+                if (!resource?.isObject3D) return false;
+                if (!isLayerCurrent(layer)) {
+                    disposeLateUnownedResource(layer, resource);
+                    return false;
+                }
+                if (isOwnedByMax(resource)) {
+                    layer.tracked.delete(resource);
+                    debugWarn(`[LayerManager] Layer "${layer.id}" cannot remove a Max-managed object`);
+                    return false;
+                }
+                const owned = isOwnedByJs(resource)
+                    || layer.tracked.has(resource)
+                    || isDescendantOf(resource, layer.group)
+                    || isDescendantOf(resource, layer.overlayGroup);
+                layer.tracked.delete(resource);
                 resource.parent?.remove(resource);
-                disposeOwnedResource(resource);
+                if (owned) {
+                    disposeOwnedResource(resource, { force: true });
+                } else {
+                    debugWarn(`[LayerManager] Layer "${layer.id}" detached a foreign object without disposing it`);
+                }
                 notifyRuntimeSceneChanged({ type: 'jsScene', layerId: layer.id, action: 'remove' });
                 return true;
             },
             createGroup(name = '', options = {}) {
                 const owner = options.overlay ? OWNER_OVERLAY : OWNER_JS;
+                if (!isLayerCurrent(layer)) {
+                    const staleGroup = markOwned(new THREE.Group(), owner);
+                    disposeOwnedResource(staleGroup, { force: true });
+                    warnStaleLayerMutation(layer);
+                    return null;
+                }
                 const group = markOwned(new THREE.Group(), owner);
                 if (name) group.name = name;
                 if (options.snapshotId) setSnapshotTargetId(group, `runtime:${layer.id}:${options.snapshotId}`);
@@ -912,6 +1115,17 @@ export function createLayerManager({
             },
             track(resource, options = {}) {
                 if (!resource) return resource;
+                if (!isLayerCurrent(layer)) {
+                    return disposeLateUnownedResource(
+                        layer,
+                        resource,
+                        options.overlay ? OWNER_OVERLAY : OWNER_JS,
+                    );
+                }
+                if (isOwnedByMax(resource)) {
+                    debugWarn(`[LayerManager] Layer "${layer.id}" cannot track a Max-managed resource`);
+                    return resource;
+                }
                 markOwned(resource, options.overlay ? OWNER_OVERLAY : OWNER_JS);
                 if (options.snapshotId) setSnapshotTargetId(resource, `runtime:${layer.id}:${options.snapshotId}`);
                 layer.tracked.add(resource);
@@ -919,17 +1133,43 @@ export function createLayerManager({
             },
             setSnapshotId(resource, id) {
                 if (!resource?.isObject3D || !id) return resource;
+                if (!isLayerCurrent(layer)) {
+                    warnStaleLayerMutation(layer);
+                    return resource;
+                }
                 return setSnapshotTargetId(resource, `runtime:${layer.id}:${id}`);
             },
             dispose(resource) {
+                if (!resource) return false;
+                if (!isLayerCurrent(layer)) {
+                    disposeLateUnownedResource(layer, resource);
+                    return false;
+                }
+                if (isOwnedByMax(resource)) {
+                    layer.tracked.delete(resource);
+                    debugWarn(`[LayerManager] Layer "${layer.id}" cannot dispose a Max-managed resource`);
+                    return false;
+                }
                 // Detach Object3D resources from the scene graph before freeing them.
                 // Without this, dispose() frees geometry/material but leaves the object
                 // parented — it lingers as a dead, un-rendered-but-present husk (and any
                 // layer still toggling its ancestor's visibility brings it back "stuck").
                 const wasObject3D = resource?.isObject3D === true;
+                const owned = isOwnedByJs(resource)
+                    || layer.tracked.has(resource)
+                    || (wasObject3D && (
+                        isDescendantOf(resource, layer.group)
+                        || isDescendantOf(resource, layer.overlayGroup)
+                    ));
+                layer.tracked.delete(resource);
                 if (wasObject3D) resource.parent?.remove(resource);
-                disposeOwnedResource(resource);
+                if (owned) {
+                    disposeOwnedResource(resource, { force: true });
+                } else {
+                    debugWarn(`[LayerManager] Layer "${layer.id}" detached a foreign resource without disposing it`);
+                }
                 if (wasObject3D) notifyRuntimeSceneChanged({ type: 'jsScene', layerId: layer.id, action: 'dispose' });
+                return owned;
             },
             traverse(cb) {
                 if (typeof cb === 'function') layer.group.traverse(cb);
@@ -951,9 +1191,17 @@ export function createLayerManager({
             renderer: rendererFacade,
             instances: instancesFacade,
             params: paramController.createFacade(layer),
-            deform: deformSystem.createLayerFacade(layer.id, handle => getLayerNodeAdapter(layer, handle)),
-            spectral: spectralMaterialSystem.createLayerFacade(layer.id, handle => getLayerNodeAdapter(layer, handle)),
-            anim: animFacade,
+            deform: deformSystem.createLayerFacade(
+                layer.id,
+                handle => getLayerNodeAdapter(layer, handle),
+                () => isLayerCurrent(layer),
+            ),
+            spectral: spectralMaterialSystem.createLayerFacade(
+                layer.id,
+                handle => getLayerNodeAdapter(layer, handle),
+                () => isLayerCurrent(layer),
+            ),
+            anim: createLayerAnimFacade(layer),
             audio: createLayerAudioFacade(layer),
             get input() {
                 return getOrCreateLayerInput(layer);
@@ -994,7 +1242,7 @@ export function createLayerManager({
                 } else {
                     source.updateWorldMatrix(true, false);
                     sourceState = {
-                        visible: !!source.visible,
+                        visible: source.userData?.maxjsVisible !== false && source.visible !== false,
                         matrixWorld: source.matrixWorld,
                     };
                 }
@@ -1002,10 +1250,10 @@ export function createLayerManager({
             }
 
             if (!sourceState) {
-                anchor.visible = false;
+                if (anchor.userData.maxjsFollowVisibility) anchor.visible = false;
                 continue;
             }
-            anchor.visible = anchor.userData.maxjsFollowVisibility ? sourceState.visible : true;
+            if (anchor.userData.maxjsFollowVisibility) anchor.visible = sourceState.visible;
             if (anchor.userData.maxjsCopyWorldMatrix) {
                 anchor.matrix.copy(sourceState.matrixWorld);
                 anchor.matrixWorldNeedsUpdate = true;
@@ -1014,12 +1262,18 @@ export function createLayerManager({
     }
 
     function syncLiveMaterialClones(layer) {
-        for (const clone of [...layer.liveMaterialClones]) {
+        for (const [clone, lastFollowedMaterial] of [...layer.liveMaterialClones]) {
             if (!clone?.isObject3D || !clone.parent) {
                 layer.liveMaterialClones.delete(clone);
                 continue;
             }
             if (!clone.userData?.maxjsFollowSourceMaterial) {
+                layer.liveMaterialClones.delete(clone);
+                continue;
+            }
+
+            if (clone.material !== lastFollowedMaterial) {
+                delete clone.userData.maxjsFollowSourceMaterial;
                 layer.liveMaterialClones.delete(clone);
                 continue;
             }
@@ -1031,7 +1285,11 @@ export function createLayerManager({
                 continue;
             }
 
-            if (clone.material !== source.material) clone.material = source.material;
+            if (lastFollowedMaterial !== source.material) {
+                markOwned(source.material, OWNER_MAX);
+                clone.material = source.material;
+                layer.liveMaterialClones.set(clone, source.material);
+            }
         }
     }
 
@@ -1063,13 +1321,14 @@ export function createLayerManager({
             folder: normalizeFolder(options.folder),
             priority: normalizePriority(options.priority),
             hooks: null,
+            hooksDisposed: false,
             active: true,
             loading: false,
             error: null,
             errorCount: 0,
             tracked: new Set(),
             anchors: [],
-            liveMaterialClones: new Set(),
+            liveMaterialClones: new Map(),
             nodeAdapters: new Map(),
             disposers: [],
             input: null,
@@ -1083,6 +1342,7 @@ export function createLayerManager({
             },
             ctx: null,
         };
+        layer.paramIsActive = () => isLayerCurrent(layer);
         paramController.initLayer(layer, options);
 
         jsWorldRoot.add(group);
@@ -1100,11 +1360,25 @@ export function createLayerManager({
         layer.loading = true;
         layer.mountToken = mountToken;
         try {
-            const hooks = await createHooks(layer.ctx, THREE);
+            const sceneReady = typeof whenSceneReady === 'function'
+                ? whenSceneReady()
+                : whenSceneReady;
+            if (sceneReady) await sceneReady;
             if (layers.get(id) !== layer || layer.mountToken !== mountToken) {
+                disposeLayerState(layer, { cleanupGlobals: false });
                 return { id, error: 'Layer replaced during load' };
             }
+            // Initial scene sync may populate maxRoot after the manager itself
+            // was constructed. Stamp the authoritative tree immediately before
+            // user hooks receive raw objects/materials through the adapters.
+            if (maxRoot) markOwned(maxRoot, OWNER_MAX);
+            const hooks = await createHooks(layer.ctx, THREE);
             layer.hooks = hooks || {};
+            layer.hooksDisposed = false;
+            if (layers.get(id) !== layer || layer.mountToken !== mountToken) {
+                disposeLayerState(layer, { cleanupGlobals: false });
+                return { id, error: 'Layer replaced during load' };
+            }
             const hookParams = layer.hooks.parameters ?? layer.hooks.params;
             if (hookParams && typeof hookParams === 'object') {
                 paramController.define(layer, hookParams, undefined, { source: 'hooks', silent: true });
@@ -1113,11 +1387,17 @@ export function createLayerManager({
                 await layer.hooks.init(layer.ctx);
             }
         } catch (err) {
-            layer.error = err?.message || String(err);
-            layer.active = false;
-            console.error(`[LayerManager] Layer "${id}" init error:`, err);
+            if (layers.get(id) === layer && layer.mountToken === mountToken) {
+                layer.error = err?.message || String(err);
+                layer.active = false;
+                console.error(`[LayerManager] Layer "${id}" init error:`, err);
+            }
         } finally {
             if (layers.get(id) === layer) layer.loading = false;
+        }
+        if (layers.get(id) !== layer || layer.mountToken !== mountToken) {
+            disposeLayerState(layer, { cleanupGlobals: false });
+            return { id, error: 'Layer replaced during load' };
         }
         layer.profile.mountMs = performance.now() - mountStart;
         lastMountMs = layer.profile.mountMs;
@@ -1125,61 +1405,84 @@ export function createLayerManager({
         return { id, error: layer.error };
     }
 
-    function remove(id, options = {}) {
-        const layer = layers.get(id);
-        if (!layer) return false;
-        paramController.remember(layer);
-
-        if (layer.hooks && typeof layer.hooks.dispose === 'function') {
+    function disposeLayerState(layer, { cleanupGlobals = true } = {}) {
+        if (!layer) return;
+        layer.mountToken = null;
+        if (!layer.hooksDisposed && layer.hooks && typeof layer.hooks.dispose === 'function') {
             try {
                 layer.hooks.dispose(layer.ctx);
             } catch (err) {
-                debugWarn(`[LayerManager] Layer "${id}" dispose error:`, err);
+                debugWarn(`[LayerManager] Layer "${layer.id}" dispose error:`, err);
             }
         }
+        layer.hooksDisposed = true;
 
         // Auto-unsubscribe bus handlers, service provisions, and onProvide waiters
         // registered through ctx.bus / ctx.services. Runs after hooks.dispose so layer
         // code sees a live bus during its own teardown, then we sweep ghost handlers.
         if (layer.disposers?.length) {
             for (const fn of layer.disposers) {
-                try { fn(); } catch (err) { debugWarn(`[LayerManager] Layer "${id}" disposer error:`, err); }
+                try { fn(); } catch (err) { debugWarn(`[LayerManager] Layer "${layer.id}" disposer error:`, err); }
             }
             layer.disposers.length = 0;
         }
 
+        if (cleanupGlobals) {
+            // Restore live Max state before freeing layer-owned resources.
+            clearMaterialOverridesForLayer(layer.id);
+            clearObjectPropertyOverridesForLayer(layer.id);
+        }
+
+        const disposedResources = new Set();
         for (const resource of layer.tracked) {
             try {
+                if (isOwnedByMax(resource)) continue;
                 if (resource?.isObject3D) resource.parent?.remove(resource);
-                disposeOwnedResource(resource);
+                disposeOwnedResource(resource, { seen: disposedResources, force: true });
             } catch (err) {
-                debugWarn(`[LayerManager] Layer "${id}" tracked dispose error:`, err);
+                debugWarn(`[LayerManager] Layer "${layer.id}" tracked dispose error:`, err);
             }
         }
         layer.tracked.clear();
+        layer.liveMaterialClones.clear();
         layer.anchors.length = 0;
         layer.nodeAdapters.clear();
         if (layer.input) { layer.input.dispose(); layer.input = null; }
-        deformSystem.disposeLayer(id);
-        spectralMaterialSystem.disposeLayer(id);
-        clearRuntimeTransformOverridesForLayer(id);
-        clearRuntimeVisibilityOverridesForLayer(id);
-        clearMaterialOverridesForLayer(id);
-        clearMaterialDecoratorsForLayer(id);
-        clearObjectPropertyOverridesForLayer(id);
+        if (cleanupGlobals) {
+            deformSystem.disposeLayer(layer.id);
+            spectralMaterialSystem.disposeLayer(layer.id);
+            clearRuntimeTransformOverridesForLayer(layer.id);
+            clearRuntimeVisibilityOverridesForLayer(layer.id);
+            clearMaterialDecoratorsForLayer(layer.id);
+        }
 
         jsWorldRoot.remove(layer.group);
         overlayWorldRoot.remove(layer.overlayGroup);
-        disposeOwnedResource(layer.group);
-        disposeOwnedResource(layer.overlayGroup);
+        disposeOwnedResource(layer.group, { seen: disposedResources, force: true });
+        disposeOwnedResource(layer.overlayGroup, { seen: disposedResources, force: true });
 
         // Safety: release camera if this layer had claimed it. Older layers could
         // also leave physical camera mode ownerless, so clear that on removal too.
-        if (cameraControl.getOwner() === id || (cameraControl.isPhysicalMode() && cameraControl.getOwner() == null)) {
-            cameraControl.release(id);
+        if (
+            cleanupGlobals
+            && (
+                cameraControl.getOwner() === layer.id
+                || (cameraControl.isPhysicalMode() && cameraControl.getOwner() == null)
+            )
+        ) {
+            cameraControl.release(layer.id);
         }
+        layer.active = false;
+        layer.loading = false;
+    }
 
-        layers.delete(id);
+    function remove(id, options = {}) {
+        const layer = layers.get(id);
+        if (!layer) return false;
+        paramController.remember(layer);
+        disposeLayerState(layer);
+
+        if (layers.get(id) === layer) layers.delete(id);
         if (!options.silent) emitChange('removed');
         return true;
     }

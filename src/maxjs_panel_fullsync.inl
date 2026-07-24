@@ -208,6 +208,7 @@
                 ss << L",\"s\":" << (node->Selected() ? L'1' : L'0');
                 ss << L",\"vis\":" << (IsMaxJsSyncDrawVisible(node) ? L'1' : L'0');
                 WriteNodeParentJson(ss, node);
+                WriteUserPropsJson(ss, node);
                 ss << L",\"t\":"; WriteFloats(ss, xform, 16);
                 ss << L'}';
                 first = false;
@@ -391,29 +392,28 @@
                     }
                     WriteVertexColorAttributesJson(ss, vertexColors);
 
-                    if (!isSpline) {
-                        // Multi/Sub material support (meshes only)
-                        Mtl* multiMtl = FindMultiSubMtl(node->GetMtl());
-                        if (ShouldEmitMultiSubMaterialGroups(multiMtl, groups)) {
-                            ss << L",\"groups\":[";
-                            for (size_t g = 0; g < groups.size(); g++) {
-                                if (g) ss << L',';
-                                ss << L'[' << groups[g].start << L',' << groups[g].count << L',' << g << L']';
-                            }
-                            ss << L"],\"matRefs\":[";
-                            for (size_t g = 0; g < groups.size(); g++) {
-                                if (g) ss << L',';
-                                Mtl* subMtl = GetSubMtlFromMatID(multiMtl, groups[g].matID);
-                                MaxJSPBR subPBR;
-                                ExtractPBRFromMtl(subMtl, node, t, subPBR);
-                                ss << InternMaterial(materialLibrary, subPBR);
-                            }
-                            ss << L"]";
-                        } else {
-                            MaxJSPBR pbr;
-                            ExtractPBR(node, t, pbr);
-                            ss << L",\"matRef\":" << InternMaterial(materialLibrary, pbr);
+                    // Multi/Sub material support. Spline extraction has no
+                    // face groups, so it naturally takes the single matRef path.
+                    Mtl* multiMtl = FindMultiSubMtl(node->GetMtl());
+                    if (ShouldEmitMultiSubMaterialGroups(multiMtl, groups)) {
+                        ss << L",\"groups\":[";
+                        for (size_t g = 0; g < groups.size(); g++) {
+                            if (g) ss << L',';
+                            ss << L'[' << groups[g].start << L',' << groups[g].count << L',' << g << L']';
                         }
+                        ss << L"],\"matRefs\":[";
+                        for (size_t g = 0; g < groups.size(); g++) {
+                            if (g) ss << L',';
+                            Mtl* subMtl = GetSubMtlFromMatID(multiMtl, groups[g].matID);
+                            MaxJSPBR subPBR;
+                            ExtractPBRFromMtl(subMtl, node, t, subPBR);
+                            ss << InternMaterial(materialLibrary, subPBR);
+                        }
+                        ss << L"]";
+                    } else {
+                        MaxJSPBR pbr;
+                        ExtractPBR(node, t, pbr);
+                        ss << L",\"matRef\":" << InternMaterial(materialLibrary, pbr);
                     }
 
                     ss << L'}';
@@ -825,6 +825,7 @@
             if (ng.helper) {
                 ss << L",\"helper\":true";
                 if (ng.groupHead) ss << L",\"grp\":1";
+                WriteUserPropsJson(ss, ng.node);
                 ss << L",\"vis\":" << (ng.visible ? L'1' : L'0');
                 ss << L",\"t\":"; WriteFloats(ss, xform, 16);
                 ss << L'}';

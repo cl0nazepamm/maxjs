@@ -54,6 +54,7 @@ import {
 } from './scene_binary.js';
 import { getInstancedMeshBatchSize, instanceGroupKey, isWebGpuInstancingPath } from './instance_batching.js';
 import { ensureGeometryUv0ForMaterial } from './material_contract.js';
+import { markOwned, OWNER_MAX } from './layer_ownership.js';
 
 // ─── Default hooks ─────────────────────────────────────────────────────
 //
@@ -598,6 +599,7 @@ function applyForestInstances(groups, buffer, ctx, hooks) {
             }
             instMesh.instanceMatrix.needsUpdate = true;
 
+            markOwned(instMesh, OWNER_MAX);
             ctx.maxRoot.add(instMesh);
             ctx.forestMeshes.set(batchCount > 1 ? `${groupKey}:${batchIndex}` : groupKey, instMesh);
             added++;
@@ -671,10 +673,16 @@ export async function applySceneBin({ buffer, meta, ctx, hooks: userHooks = {}, 
             mesh.userData ??= {};
             mesh.userData.maxjsHandle = nd.h;
             mesh.userData.maxjsHelper = true;
+            if (typeof nd.userProps === 'string' && nd.userProps) {
+                mesh.userData.maxjsUserProps = nd.userProps;
+            } else {
+                delete mesh.userData.maxjsUserProps;
+            }
             syncParent(mesh, nd, nodeMap, maxRoot);
             const visChanged = hooks.applyVisibility(mesh, nd.vis);
             const xformChanged = applyTransform(mesh, nd.t, maxRoot);
             if (nd.s != null) hooks.applySelection(mesh, nd.s);
+            markOwned(mesh, OWNER_MAX);
             if (visChanged || xformChanged) transformsChanged = true;
             continue;
         }
@@ -801,6 +809,7 @@ export async function applySceneBin({ buffer, meta, ctx, hooks: userHooks = {}, 
         const visChanged = hooks.applyVisibility(mesh, nd.vis);
         const xformChanged = applyTransform(mesh, nd.t, maxRoot);
         if (nd.s != null) hooks.applySelection(mesh, nd.s);
+        markOwned(mesh, OWNER_MAX);
         if (visChanged || xformChanged) transformsChanged = true;
     }
 

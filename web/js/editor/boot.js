@@ -2555,6 +2555,7 @@
             getGLTFSystem: () => gltfSystem,
             getAnimationSystem: () => animationSystem,
             getAudioSystem: () => audioSystem,
+            whenSceneReady: () => hostBridge.whenInitialSync(),
             debugLog: maxjsDebugLog,
             debugWarn: maxjsDebugWarn,
             onRuntimeSceneChanged: () => {

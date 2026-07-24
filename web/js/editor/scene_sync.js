@@ -15,6 +15,7 @@ import { gpuRecomputeNormals, gpuNormalsInvalidate, isGpuNormalsDisabled } from 
 import { maxTimeline } from '../maxjs_timeline.js';
 import { copyMaxComponentsToWorld } from '../scene_space.js';
 import { ensureGeometryUv0ForMaterial, markUv0AttributeAuthored } from '../material_contract.js';
+import { markOwned, OWNER_MAX } from '../layer_ownership.js';
 
 function createSceneSync(deps = {}) {
         let gpuNormalsAnnounced = false;
@@ -189,6 +190,8 @@ function createSceneSync(deps = {}) {
                             }
                             const previousMaterial = mesh.material;
                             const materialChanged = applyIncomingMaterial();
+                            if (!sameTopology) markOwned(mesh.geometry, OWNER_MAX);
+                            if (materialChanged) markOwned(mesh.material, OWNER_MAX);
                             if (!wantsLine) ensureGeometryUv0ForMaterial(mesh.geometry, mesh.material);
                             if (materialChanged) {
                                 deps.lightLinking.replaceRenderableMaterial?.(previousMaterial, mesh.material);
@@ -217,6 +220,14 @@ function createSceneSync(deps = {}) {
                 return updateMaxInstanceBucketNode(nd.h, nd);
             }
             if (mesh && nd && nd.h != null) mesh.userData.maxjsHandle = nd.h;
+            if (mesh && nd && Object.prototype.hasOwnProperty.call(nd, 'n')) {
+                mesh.userData ??= {};
+                const nextName = typeof nd.n === 'string' ? nd.n : String(nd.n ?? '');
+                if (mesh.userData.maxjsNamePayload !== nextName) {
+                    mesh.userData.maxjsNamePayload = nextName;
+                    mesh.name = nextName;
+                }
+            }
             deps.applyJsmodSyncState(mesh, !!nd.jsmod);
             deps.applyUserPropsSyncState(mesh, nd.userProps);
             deps.applyInstanceSyncState(mesh, nd.instOf);
@@ -226,6 +237,7 @@ function createSceneSync(deps = {}) {
             deps.applyNodeProps(mesh, nd.props);
             const transformChanged = applyTransform(mesh, nd.t);
             applySelection(mesh, nd.s);
+            markOwned(mesh, OWNER_MAX);
             return !!(visibilityChanged || transformChanged);
         }
 
@@ -553,6 +565,7 @@ function createSceneSync(deps = {}) {
                 });
 
                 updateMaxInstanceBucketVisibility(bucket);
+                markOwned(mesh, OWNER_MAX);
                 deps.maxRoot.add(mesh);
                 deps.maxInstanceBuckets.set(group.key, bucket);
             }
@@ -815,6 +828,7 @@ function createSceneSync(deps = {}) {
                     mesh.castShadow = slot.meshes.some((m) => m.castShadow);
                     mesh.receiveShadow = slot.meshes.some((m) => m.receiveShadow);
                     mesh.name = `max_group_${headHandle}_${matKey.slice(0, 8)}_x${slot.nodes.length}`;
+                    markOwned(mesh, OWNER_MAX);
                     headObject.add(mesh);
                     clusterMeshes.push(mesh);
                     for (let i = 0; i < slot.nodes.length; i++) {
@@ -1185,6 +1199,7 @@ function createSceneSync(deps = {}) {
                 deps.maxRoot.add(newMesh);
                 deps.nodeMap.set(msg.h, newMesh);
                 if (materialPayload) deps.stampSceneMaterial(newMesh, materialPayload, wantsLine);
+                markOwned(newMesh, OWNER_MAX);
                 deps.disposeSceneMaterial(oldMaterial);
                 // Renderable-type swap (mesh ↔ line) — scene structure changed,
                 // refresh the post-pass hide list / toon cache. Cheap.
@@ -1224,6 +1239,8 @@ function createSceneSync(deps = {}) {
             mesh.geometry = geom;
             const previousMaterial = mesh.material;
             const materialChanged = deps.applyFastMaterialPayload(mesh, msg, wantsLine);
+            markOwned(mesh.geometry, OWNER_MAX);
+            if (materialChanged) markOwned(mesh.material, OWNER_MAX);
             if (!wantsLine) ensureGeometryUv0ForMaterial(mesh.geometry, mesh.material);
             if (materialChanged) {
                 deps.lightLinking.replaceRenderableMaterial?.(previousMaterial, mesh.material);
@@ -1240,6 +1257,7 @@ function createSceneSync(deps = {}) {
         // ── Transform Sync (+ material scalars, ~6fps) ──────
         deps.bridge.on('xform', msg => {
             const applyStart = performance.now();
+            let runtimeOverridesChanged = false;
             let visibilityChanged = false;
             let giSurfaceChanged = false;
             let pathTraceTransformsChanged = false;
@@ -1249,6 +1267,8 @@ function createSceneSync(deps = {}) {
                 const mesh = deps.nodeMap.get(nd.h);
                 if (mesh) {
                     const change = applyIncrementalNodeUpdate(mesh, nd);
+                    runtimeOverridesChanged ||= change.transformChanged
+                        || (nd.vis != null && change.structuralChanged);
                     pathTraceTransformsChanged ||= change.transformChanged;
                     pathTraceStructuralChanged ||= change.structuralChanged;
                     giSurfaceChanged ||= change.transformChanged || change.structuralChanged;
@@ -1263,6 +1283,7 @@ function createSceneSync(deps = {}) {
             }
             if (msg.lights) {
                 pathTraceLightsChanged = deps.applyLightUpdates(msg.lights) === true;
+                runtimeOverridesChanged ||= msg.lights.length > 0;
             }
             if (msg.audios) deps.audioSystem?.applyAudioUpdates(msg.audios);
             if (msg.gltfs) {
@@ -1270,6 +1291,7 @@ function createSceneSync(deps = {}) {
                 pathTraceStructuralChanged = true;
             }
             if (msg.camera) deps.applyCamera(msg.camera);
+            if (runtimeOverridesChanged) deps.layerManager.markRuntimeTransformsDirty?.();
             if (visibilityChanged) {
                 // Visibility flip changes the post-pass hide list — cheap refresh.
                 deps.maxjsFx.markSceneChanged?.();
@@ -1454,7 +1476,7 @@ function createSceneSync(deps = {}) {
         }
 
         function handleBinaryDelta(buffer, meta) {
-            let runtimeTransformsChanged = false;
+            let runtimeOverridesChanged = false;
             let giSurfaceChanged = false;
             let pathTraceTransformsChanged = false;
             let pathTraceStructuralChanged = false;
@@ -1464,7 +1486,7 @@ function createSceneSync(deps = {}) {
                     const mesh = deps.nodeMap.get(nodeHandle);
                     if (mesh) {
                         const change = applyIncrementalNodeUpdate(mesh, { t: matrix }, nodeHandle);
-                        runtimeTransformsChanged ||= change.transformChanged;
+                        runtimeOverridesChanged ||= change.transformChanged;
                         giSurfaceChanged ||= change.transformChanged || change.structuralChanged;
                         pathTraceTransformsChanged ||= change.transformChanged;
                         pathTraceStructuralChanged ||= change.structuralChanged;
@@ -1487,6 +1509,7 @@ function createSceneSync(deps = {}) {
                     const mesh = deps.nodeMap.get(nodeHandle);
                     if (mesh) {
                         const change = applyIncrementalNodeUpdate(mesh, { vis: visible }, nodeHandle);
+                        runtimeOverridesChanged ||= change.structuralChanged;
                         giSurfaceChanged ||= change.structuralChanged;
                         pathTraceStructuralChanged ||= change.structuralChanged;
                     }
@@ -1516,7 +1539,8 @@ function createSceneSync(deps = {}) {
                         shadowBias: ld.shadowBias, shadowRadius: ld.shadowRadius,
                         shadowMapSize: ld.shadowMapSize,
                         volContrib: ld.volContrib,
-                    });
+                    }, { partial: true });
+                    runtimeOverridesChanged = true;
                     if (lightChanged) {
                         if (ld.type === 0) deps.refreshSkyFromLinkedSun();
                         deps.markLightProbeLightsDirty();
@@ -1538,7 +1562,7 @@ function createSceneSync(deps = {}) {
                     maxTimeline.onTime(td);
                 },
             });
-            if (runtimeTransformsChanged) deps.layerManager.markRuntimeTransformsDirty?.();
+            if (runtimeOverridesChanged) deps.layerManager.markRuntimeTransformsDirty?.();
             if (giSurfaceChanged) {
                 deps.markLightProbeSceneDirty();
                 deps.scheduleLightProbeFromCurrentScene({ delay: 350 });
@@ -1732,7 +1756,6 @@ function createSceneSync(deps = {}) {
                 obj.matrixAutoUpdate = false;
                 obj.frustumCulled = false;
             }
-            obj.name = nd.n ?? obj.name ?? '';
             obj.userData ??= {};
             obj.userData.maxjsHandle = nd.h;
             obj.userData.maxjsHelper = true;
@@ -1819,6 +1842,7 @@ function createSceneSync(deps = {}) {
                 return true;
             };
             if (rebuildForBlackSpecularRoute()) {
+                markOwned(mesh.material, OWNER_MAX);
                 ensureGeometryUv0ForMaterial(mesh.geometry, mesh.material);
                 if (mesh.userData) mesh.userData.maxjsMaterialSignature = null;
                 return;

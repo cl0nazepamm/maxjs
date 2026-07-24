@@ -1300,6 +1300,7 @@
                 if (node.node->IsGroupHead()) ss << L",\"grp\":1";
                 ss << L",\"s\":" << (node.node->Selected() ? L'1' : L'0');
                 if (node.parentHandle != 0) ss << L",\"p\":" << node.parentHandle;
+                WriteUserPropsJson(ss, node.node);
                 ss << L",\"vis\":" << (node.visible ? L'1' : L'0');
                 ss << L",\"t\":"; WriteFloats(ss, xform, 16);
                 ss << L'}';

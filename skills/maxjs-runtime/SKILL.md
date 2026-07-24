@@ -35,7 +35,15 @@ export default function layer(ctx, THREE) {
 }
 ```
 
-Layers can mount before the scene is populated. Defer important lookups until `update()` if needed.
+The editor and snapshot player wait for their initial scene-ready signal before
+running a layer factory. Nodes can still appear, disappear, or rebuild later, so
+resolve dynamic scene references again when an adapter reports that its object
+is gone.
+
+An async `init()` context belongs to one exact mount. If hot reload or removal
+happens while it is awaiting, managed writes from the stale context are ignored
+and late unowned resources are cleaned up. Still cancel external async work in
+`dispose()` and do not retain raw scene/camera references past the layer lifetime.
 
 ```js
 let bee = null;
@@ -113,7 +121,7 @@ Use orientation helpers before gameplay/rig work. max.js runtime is Three.js Y-u
 After changing runtime object ownership, cleanup, clone placement, or layer teardown, run:
 
 ```powershell
-node scripts/runtime-layer-smoke.mjs
+node tools/runtime-layer-lifecycle-smoke.mjs
 ```
 
 Clone placement options are intentionally direct:
@@ -208,7 +216,7 @@ Do not replace whole synced objects or bypass the adapter for this pattern. Raw 
 - `ctx.input`: event helper with auto-cleanup.
 - `ctx.clock`: JS runtime time, `{ dt, elapsed }`.
 - `ctx.maxTime`: Max timeline, `{ seconds, frame, fps, playing, source }`.
-- `ctx.params`: layer-owned tweakable parameters shown in the Runtime Layers panel. Use `ctx.params.define({ speed: { type: 'slider', value: 1, min: 0, max: 4, step: 0.05 }, tint: { type: 'color', value: '#ff8844' } })`, then read the returned live values object or `ctx.params.values`. Supported UI types are `slider`, `float`, `color`, and `bool`; values are JSON-safe and exported in `runtimeScene` so snapshots replay tuned values before the layer factory runs.
+- `ctx.params`: layer-owned tweakable parameters shown in the Runtime Layers panel. Use `ctx.params.define({ speed: { type: 'slider', value: 1, min: 0, max: 4, step: 0.05 }, tint: { type: 'color', value: '#ff8844' }, mode: { type: 'string', value: 'orbit' } })`, then read the returned live values object or `ctx.params.values`. Supported UI types are `slider`, `float`, `color`, `bool`, and `string` (`text` is an alias); values are JSON-safe and exported in `runtimeScene` so snapshots replay tuned values before the layer factory runs.
 - `ctx.bus`: shared event bus, auto-unsubscribed on dispose. Max-driven events: `max:selection` `{ selected, added, removed }` (handle arrays), and `max:time:play` / `max:time:pause` / `max:time:seek` (timeline snapshot `{ seconds, frame, fps, playing }`).
 - `ctx.anim`: Max authored-animation playback — `list()` (`{ id, name, duration, time, playing, speed, loop }`), `play(id)`, `pause(id)`, `stop(id)`, `setTime(id, seconds)`, `setSpeed(id, factor)`, `setLoop(id, mode)`, `seekAll(seconds)`, `isPlaying(id)`. Empty list / no-op false when no animations are loaded.
 - `ctx.audio`: Max audio origins + layer SFX — `list()`, `play(handle)`, `stop(handle)`, `setVolume(handle, v)` (holds until Max re-syncs that origin), `muted`, and `playOneShot(url, { volume, position, refDistance, loop })` → `{ stop(), active }`. Positional when `position` (Vector3 or `[x,y,z]` world) is given; one-shots are silenced automatically on layer dispose. Audio requires a prior user gesture (browser autoplay policy) — one-shots fired before that are dropped.

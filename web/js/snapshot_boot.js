@@ -38,14 +38,12 @@
 // Real code:    1 (meta), 2 (renderer), 3 (scene/camera/controls),
 //               4 (layer manager), 6 (applier with simple-PBR materials
 //               via material_builder.js), 7 partial (tone-map/exposure/
-//               bg/camera + scene lights + portable Studio state), 9 (layer
-//               project bind), 10 (render loop), animation + timeline.
-// Deferred:     5 (optional modules — warns and continues),
+//               bg/camera + scene lights + portable Studio state), 8 (baked
+//               runtime scene fallback), 9 (layer project bind + dedupe),
+//               10 (render loop), animation + timeline.
+// Deferred:     5 (HTML textures / volumes / physics warn and continue),
 //               7 deeper live editor panels / bake UI (warns),
-//               8 runtimeScene (warns),
-//               TSL / MaterialX / VRay / OpenPBR / Toon material types
-//               (degrade to MeshStandardMaterial), instance buckets,
-//               vertex colors, fog, gltf.
+//               and standalone fog replay.
 //
 // What WORKS today: snapshots with Max-authored meshes render with PBR
 // materials — color, roughness, metalness, opacity, emissive, plus the
@@ -54,9 +52,9 @@
 // snapshot.json drive shading; shadows render for shadow-casters.
 // Skinned meshes assemble (Skeleton + bind pose). Animations tick.
 //
-// What's MISSING (visible regressions vs. live mode): TSL / MaterialX /
-// VRay / OpenPBR materials (degrade to MeshStandardMaterial), post-FX,
-// instance bucket merging, vertex colors.
+// Remaining gaps are live-host-only editor/event surfaces and the explicitly
+// deferred optional modules above. Backend-incompatible material models still
+// degrade to portable Three.js materials by design.
 
 import * as THREE from 'three';
 
@@ -180,6 +178,17 @@ function resolveSnapshotAssetUrl(root, url) {
 function resolveSnapshotAudioUrls(audioData, root) {
     if (!Array.isArray(audioData) || audioData.length === 0) return [];
     return audioData.map((entry) => {
+        if (!entry || typeof entry !== 'object') return entry;
+        return {
+            ...entry,
+            url: resolveSnapshotAssetUrl(root, entry.url),
+        };
+    });
+}
+
+function resolveSnapshotGltfUrls(gltfData, root) {
+    if (!Array.isArray(gltfData) || gltfData.length === 0) return [];
+    return gltfData.map((entry) => {
         if (!entry || typeof entry !== 'object') return entry;
         return {
             ...entry,
@@ -375,6 +384,9 @@ function buildLayerManager({
     overlayRoot,
     controls,
     sceneCameras = [],
+    getAnimationSystem = () => null,
+    getAudioSystem = () => null,
+    getGLTFSystem = () => null,
     onRuntimeSceneChanged = null,
 }) {
     return createLayerManager({
@@ -395,6 +407,10 @@ function buildLayerManager({
             return null;
         },
         getSceneCameras: () => sceneCameras,
+        getAnimationSystem,
+        getAudioSystem,
+        getGLTFSystem,
+        isSnapshot: true,
         debugLog: (...args) => console.debug('[snapshot_boot]', ...args),
         debugWarn: (...args) => console.warn('[snapshot_boot]', ...args),
         onRuntimeSceneChanged,
@@ -455,6 +471,21 @@ async function registerOptionalModules(features, ctx) {
             });
         } catch (error) {
             console.warn('[snapshot_boot] audio module init failed', error);
+        }
+    }
+
+    const hasGltfPayload = Array.isArray(ctx?.meta?.gltfs) && ctx.meta.gltfs.length > 0;
+    if (features.gltf || hasGltfPayload) {
+        try {
+            const { createMaxJSGLTFSystem } = await import('./maxjs_gltf.js');
+            modules.gltf = createMaxJSGLTFSystem({
+                THREE,
+                parent: ctx.maxBasisRoot ?? ctx.scene,
+                getBus: () => ctx.layerManager?.getBus?.(),
+                debugWarn: (...args) => console.warn('[snapshot_boot]', ...args),
+            });
+        } catch (error) {
+            console.warn('[snapshot_boot] glTF module init failed', error);
         }
     }
 
@@ -1117,16 +1148,291 @@ function applyTopLevelCamera(cam, { camera, controls, scratch, getAspect }) {
 }
 
 // ─── Phase 8: runtimeScene ────────────────────────────────────────────
-// Stage 2: deferred. Full implementation reuses index.html's ObjectLoader
-// path (with NodeMaterial → standard-material rewrite) and the TSL re-bind
-// pass. None of that is useful without phase 6 anyway, so noting and
-// continuing is correct here.
-async function applyRuntimeScene(runtimeScene, ctx) {
-    noteExtractionDeferred(
-        'applyRuntimeScene',
-        'index.html:12174-12365',
-        '(jsRoot/overlayRoot baked Object3D JSON + TSL re-bind + transform overrides)',
-    );
+// Baked trees are the durable fallback for layers that cannot be replayed from
+// their shipped ESM sidecars. They load first; phase 9 removes only the baked
+// layer roots whose sidecars mounted successfully.
+const RUNTIME_NODE_MATERIAL_TYPES = Object.freeze({
+    MeshPhysicalNodeMaterial: 'MeshPhysicalMaterial',
+    MeshSSSNodeMaterial: 'MeshPhysicalMaterial',
+    MeshStandardNodeMaterial: 'MeshStandardMaterial',
+    MeshBasicNodeMaterial: 'MeshBasicMaterial',
+    MeshLambertNodeMaterial: 'MeshLambertMaterial',
+    MeshPhongNodeMaterial: 'MeshPhongMaterial',
+    MeshToonNodeMaterial: 'MeshToonMaterial',
+    MeshNormalNodeMaterial: 'MeshNormalMaterial',
+    LineBasicNodeMaterial: 'LineBasicMaterial',
+    LineDashedNodeMaterial: 'LineDashedMaterial',
+    PointsNodeMaterial: 'PointsMaterial',
+    SpriteNodeMaterial: 'SpriteMaterial',
+});
+
+function cloneRuntimeObjectJson(value) {
+    return value && typeof value === 'object'
+        ? JSON.parse(JSON.stringify(value))
+        : null;
+}
+
+function patchRuntimeMaterialTypes(json) {
+    for (const material of Array.isArray(json?.materials) ? json.materials : []) {
+        const type = String(material?.type || '');
+        if (!type) continue;
+        if (RUNTIME_NODE_MATERIAL_TYPES[type]) {
+            material.type = RUNTIME_NODE_MATERIAL_TYPES[type];
+        } else if (type.includes('NodeMaterial')) {
+            material.type = 'MeshStandardMaterial';
+        }
+    }
+    return json;
+}
+
+async function parseRuntimeSubtree(json, root) {
+    const payload = patchRuntimeMaterialTypes(cloneRuntimeObjectJson(json));
+    if (!payload) return null;
+    const LoaderCtor = THREE.ObjectLoader ?? THREE.NodeObjectLoader;
+    if (!LoaderCtor) throw new Error('Three.js ObjectLoader is unavailable');
+    const loader = new LoaderCtor();
+    const resourceRoot = new URL(
+        String(root || '.').replace(/\/?$/, '/'),
+        window.location.href,
+    ).href;
+    loader.setResourcePath?.(resourceRoot);
+    return typeof loader.parseAsync === 'function'
+        ? loader.parseAsync(payload)
+        : loader.parse(payload);
+}
+
+function normalizeRuntimeHiddenSourceHandles(handles) {
+    const out = new Set();
+    for (const rawHandle of Array.isArray(handles) ? handles : []) {
+        const numericHandle = Number(rawHandle);
+        out.add(Number.isFinite(numericHandle) ? numericHandle : rawHandle);
+    }
+    return out;
+}
+
+function enforceRuntimeHiddenSources(handles, nodeMap) {
+    let hidden = 0;
+    for (const handle of handles ?? []) {
+        const object = nodeMap?.get?.(handle);
+        if (!object?.isObject3D) continue;
+        object.visible = false;
+        object.userData ??= {};
+        object.userData.maxjsVisible = false;
+        object.layers?.set?.(31);
+        hidden += 1;
+    }
+    return hidden;
+}
+
+function collectRuntimeResources(roots) {
+    const geometries = new Set();
+    const materials = new Set();
+    const textures = new Set();
+    const skeletons = new Set();
+    const collectMaterial = (material) => {
+        if (!material || materials.has(material)) return;
+        materials.add(material);
+        for (const value of Object.values(material)) {
+            if (value?.isTexture) textures.add(value);
+        }
+        for (const uniform of Object.values(material.uniforms ?? {})) {
+            if (uniform?.value?.isTexture) textures.add(uniform.value);
+        }
+    };
+    for (const root of Array.isArray(roots) ? roots : [roots]) {
+        root?.traverse?.((object) => {
+            if (object.geometry) geometries.add(object.geometry);
+            if (object.skeleton) skeletons.add(object.skeleton);
+            const objectMaterials = Array.isArray(object.material)
+                ? object.material
+                : [object.material];
+            objectMaterials.forEach(collectMaterial);
+        });
+    }
+    return { geometries, materials, textures, skeletons };
+}
+
+function disposeRuntimeObjects(roots, preserve = null) {
+    const resources = collectRuntimeResources(roots);
+    for (const geometry of resources.geometries) {
+        if (!preserve?.geometries?.has(geometry)) geometry.dispose?.();
+    }
+    for (const material of resources.materials) {
+        if (!preserve?.materials?.has(material)) material.dispose?.();
+    }
+    for (const texture of resources.textures) {
+        if (!preserve?.textures?.has(texture)) texture.dispose?.();
+    }
+    for (const skeleton of resources.skeletons) {
+        if (!preserve?.skeletons?.has(skeleton)) skeleton.dispose?.();
+    }
+}
+
+async function applyRuntimeScene(runtimeScene, { root, jsRoot, overlayRoot, nodeMap }) {
+    const hiddenSourceHandles = normalizeRuntimeHiddenSourceHandles(runtimeScene?.hideMaxSyncHandles);
+    const state = {
+        roots: [],
+        transformOverrides: Array.isArray(runtimeScene?.transformOverrides)
+            ? runtimeScene.transformOverrides
+            : [],
+        hiddenSourceHandles,
+        hiddenSourceCount: enforceRuntimeHiddenSources(hiddenSourceHandles, nodeMap),
+    };
+
+    const entries = [
+        ['jsRoot', runtimeScene?.jsRoot, jsRoot],
+        ['overlayRoot', runtimeScene?.overlayRoot, overlayRoot],
+    ];
+    for (const [kind, json, parent] of entries) {
+        if (!json || !parent?.add) continue;
+        try {
+            const parsed = await parseRuntimeSubtree(json, root);
+            if (!parsed?.isObject3D) continue;
+            parsed.visible = true;
+            parsed.userData ??= {};
+            parsed.userData.maxjsBakedRuntimeScene = true;
+            parsed.userData.maxjsBakedRuntimeKind = kind;
+            parent.add(parsed);
+            parsed.updateMatrixWorld(true);
+            state.roots.push(parsed);
+        } catch (error) {
+            console.warn(`[snapshot_boot] runtimeScene.${kind} parse failed`, error);
+        }
+    }
+    return state;
+}
+
+function pruneEmptyRuntimeRoots(runtimeState) {
+    if (!runtimeState?.roots?.length) return;
+    for (const bakedRoot of [...runtimeState.roots]) {
+        if (bakedRoot.children.length > 0) continue;
+        bakedRoot.parent?.remove(bakedRoot);
+        runtimeState.roots.splice(runtimeState.roots.indexOf(bakedRoot), 1);
+    }
+}
+
+function detachBakedLayer(runtimeState, layerId) {
+    const wanted = String(layerId ?? '');
+    if (!wanted || !runtimeState?.roots?.length) return [];
+    const matches = [];
+    for (const bakedRoot of runtimeState.roots) {
+        bakedRoot.traverse((object) => {
+            if (object === bakedRoot) return;
+            if (String(object.userData?.maxjsLayerId ?? '') === wanted) matches.push(object);
+        });
+    }
+
+    const selected = new Set(matches);
+    const records = [];
+    for (const object of matches) {
+        let ancestor = object.parent;
+        let nested = false;
+        while (ancestor) {
+            if (selected.has(ancestor)) {
+                nested = true;
+                break;
+            }
+            ancestor = ancestor.parent;
+        }
+        if (nested || !object.parent) continue;
+        const parent = object.parent;
+        records.push({
+            object,
+            parent,
+            index: parent.children.indexOf(object),
+        });
+    }
+    for (const record of records) record.parent.remove(record.object);
+    return records;
+}
+
+function restoreDetachedBakedLayer(records) {
+    const ordered = [...(records ?? [])].sort((a, b) => a.index - b.index);
+    for (const record of ordered) {
+        const { object, parent, index } = record;
+        if (!object?.isObject3D || !parent?.isObject3D) continue;
+        parent.add(object);
+        const currentIndex = parent.children.indexOf(object);
+        const targetIndex = Math.max(0, Math.min(index, parent.children.length - 1));
+        if (currentIndex !== targetIndex) {
+            parent.children.splice(currentIndex, 1);
+            parent.children.splice(targetIndex, 0, object);
+        }
+    }
+}
+
+function commitDetachedBakedLayer(runtimeState, records) {
+    const objects = (records ?? []).map(record => record.object).filter(Boolean);
+    if (objects.length === 0) return 0;
+    const preserved = collectRuntimeResources(runtimeState.roots);
+    disposeRuntimeObjects(objects, preserved);
+    pruneEmptyRuntimeRoots(runtimeState);
+    return objects.length;
+}
+
+function restoreSnapshotTransformOverrides(runtimeState, mountedIds, layerManager) {
+    const mounted = new Set(Array.isArray(mountedIds) ? mountedIds.map(String) : []);
+    const restore = runtimeState?.transformOverrides?.filter((entry) => {
+        if (!entry || typeof entry !== 'object') return false;
+        if (mounted.size === 0) return true;
+        const ownerLayer = entry.ownerLayer;
+        // Legacy snapshots cannot prove whether the mounted sidecar already
+        // re-applied a relative transform, so skip ownerless records here.
+        if (ownerLayer == null || ownerLayer === '') return false;
+        return !mounted.has(String(ownerLayer));
+    }) ?? [];
+    if (restore.length === 0) return 0;
+    layerManager?.restoreTransformOverrides?.(restore);
+    return restore.length;
+}
+
+function applySnapshotMaterialScalar(mesh, payload, materialIndex = null) {
+    if (!mesh || !payload || typeof payload !== 'object') return;
+    const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+    const targets = materialIndex == null
+        ? materials
+        : [materials[Number(materialIndex)]];
+    const colorKeys = ['color', 'emissive', 'specularColor', 'sheenColor', 'attenuationColor'];
+    const scalarKeys = [
+        'roughness', 'metalness', 'opacity', 'emissiveIntensity', 'envMapIntensity',
+        'aoMapIntensity', 'clearcoat', 'clearcoatRoughness', 'sheen',
+        'sheenRoughness', 'iridescence', 'iridescenceIOR', 'transmission',
+        'thickness', 'specularIntensity', 'ior', 'reflectivity', 'dispersion',
+        'attenuationDistance', 'anisotropy', 'alphaTest',
+    ];
+    const booleanKeys = ['depthWrite', 'depthTest'];
+
+    for (const material of targets) {
+        if (!material || material.userData?.maxjsHTMLTextureOverride) continue;
+        for (const key of colorKeys) {
+            const value = payload[key];
+            if ((Array.isArray(value) || ArrayBuffer.isView(value)) && material[key]?.setRGB) {
+                material[key].setRGB(Number(value[0]) || 0, Number(value[1]) || 0, Number(value[2]) || 0);
+            }
+        }
+        const roughness = payload.roughness ?? payload.rough;
+        const metalness = payload.metalness ?? payload.metal;
+        if (roughness != null && 'roughness' in material) material.roughness = Number(roughness);
+        if (metalness != null && 'metalness' in material) material.metalness = Number(metalness);
+        for (const key of scalarKeys) {
+            if (key === 'roughness' || key === 'metalness') continue;
+            if (payload[key] != null && key in material) material[key] = Number(payload[key]);
+        }
+        for (const key of booleanKeys) {
+            if (payload[key] != null && key in material) material[key] = !!payload[key];
+        }
+
+        let nextTransparent = material.transparent;
+        if (payload.opacity != null) {
+            nextTransparent = payload.transparent === true || Number(payload.opacity) < 0.999;
+        } else if (payload.transparent != null) {
+            nextTransparent = payload.transparent === true;
+        }
+        if (material.transparent !== nextTransparent) {
+            material.transparent = nextTransparent;
+            material.needsUpdate = true;
+        }
+    }
 }
 
 // ─── Phase 9: layer project bind ──────────────────────────────────────
@@ -1184,7 +1490,37 @@ function buildSnapshotRuntimeLayers(runtimeScene) {
         }));
 }
 
-async function bindLayerProject(root, meta, layerManager) {
+function bindSnapshotProjectRuntime(layerManager, root) {
+    let warned = false;
+    const warnReadOnly = () => {
+        if (warned) return;
+        warned = true;
+        console.warn('[snapshot_boot] ctx.project is read-only in a deployed snapshot');
+    };
+    const state = Object.freeze({
+        mode: 'snapshot',
+        readOnly: true,
+        root: new URL(
+            String(root || '.').replace(/\/?$/, '/'),
+            window.location.href,
+        ).href,
+    });
+    layerManager?.bindProjectRuntime?.({
+        setProjectDirectory() {
+            warnReadOnly();
+            return false;
+        },
+        reload() {
+            warnReadOnly();
+            return false;
+        },
+        getState() {
+            return state;
+        },
+    });
+}
+
+async function bindLayerProject(root, meta, layerManager, runtimeState) {
     let manifest = null;
     let baseUrl = new URL('./', new URL(`${root}/`, location.href));
     let allLayers = [];
@@ -1207,27 +1543,45 @@ async function bindLayerProject(root, meta, layerManager) {
     if (allLayers.length === 0) {
         allLayers = buildSnapshotManifestLayers(manifest);
     }
-    if (allLayers.length === 0) return { mounted: 0, manifest };
+    if (allLayers.length === 0) return { mounted: 0, mountedIds: [], manifest };
 
     const mountedIds = [];
-    try {
-        for (const entry of allLayers) {
-            if (entry?.enabled === false) continue;
+    const errors = [];
+    const seenIds = new Set();
+    for (const entry of allLayers) {
+        if (entry?.enabled === false) continue;
+        const id = String(entry.id ?? '');
+        if (!id || seenIds.has(id)) {
+            const error = new Error(id
+                ? `Duplicate snapshot layer id: ${id}`
+                : 'Snapshot layer is missing an id');
+            errors.push({ id, error });
+            console.warn('[snapshot_boot] layer module replay failed', error);
+            continue;
+        }
+        seenIds.add(id);
+
+        let detachedBaked = [];
+        try {
             const entryPath = String(entry.entryPath || entry.entry || entry.path || '').replace(/\\/g, '/');
-            if (!entryPath) throw new Error(`Missing layer entry path for ${entry.id}`);
+            if (!entryPath) throw new Error(`Missing layer entry path for ${id}`);
             const moduleUrl = new URL(entryPath, baseUrl);
-            moduleUrl.searchParams.set('v', `${Date.now()}_${entry.id}`);
+            moduleUrl.searchParams.set('v', `${Date.now()}_${id}`);
             const moduleNamespace = await import(moduleUrl.toString());
             const factory = resolveSnapshotLayerFactory(moduleNamespace);
+            // Remove only this layer's baked twin before its factory/init runs,
+            // so scene traversal cannot capture an object that will be disposed
+            // immediately after a successful live mount.
+            detachedBaked = detachBakedLayer(runtimeState, id);
             const result = await layerManager.mount(
-                entry.id,
+                id,
                 async (ctx, THREE_arg) => {
                     const staticParams = resolveSnapshotStaticParameters(moduleNamespace);
                     if (staticParams) ctx.params.define(staticParams);
                     return factory(ctx, THREE_arg, { manifest, layer: entry });
                 },
                 {
-                    name: entry.name || entry.id,
+                    name: entry.name || id,
                     code: moduleUrl.toString(),
                     source: entry.source || 'project',
                     entry: entry.entryPath,
@@ -1235,20 +1589,38 @@ async function bindLayerProject(root, meta, layerManager) {
                 },
             );
             if (result?.error) throw new Error(result.error);
-            mountedIds.push(entry.id);
-        }
-        return { mounted: mountedIds.length, manifest };
-    } catch (error) {
-        console.warn('[snapshot_boot] layer module replay failed', error);
-        for (const id of mountedIds) {
+            mountedIds.push(id);
+            commitDetachedBakedLayer(runtimeState, detachedBaked);
+        } catch (error) {
             try { layerManager.remove(id); } catch {}
+            restoreDetachedBakedLayer(detachedBaked);
+            errors.push({ id, error });
+            console.warn(`[snapshot_boot] layer "${id}" replay failed; keeping baked fallback`, error);
         }
-        return { mounted: 0, manifest, error };
     }
+    return {
+        mounted: mountedIds.length,
+        mountedIds: [...mountedIds],
+        manifest,
+        errors,
+        error: errors[0]?.error ?? null,
+    };
 }
 
 // ─── Phase 10: render loop ────────────────────────────────────────────
-function startRenderLoop({ renderer, scene, camera, controls, layerManager, animationSystem, maxjsFx, snapshotEnvironment, optionalModules, studioLighting }) {
+function startRenderLoop({
+    renderer,
+    scene,
+    camera,
+    controls,
+    layerManager,
+    animationSystem,
+    maxjsFx,
+    snapshotEnvironment,
+    optionalModules,
+    studioLighting,
+    enforceHiddenSources,
+}) {
     let lastTimeMs = performance.now();
     let elapsed = 0;
     const loop = () => {
@@ -1259,6 +1631,7 @@ function startRenderLoop({ renderer, scene, camera, controls, layerManager, anim
         if (controls) controls.update();
         layerManager?.update?.(dt, elapsed);
         animationSystem?.update?.(dt);
+        enforceHiddenSources?.();
         for (const module of Object.values(optionalModules ?? {})) {
             module?.update?.(dt, elapsed);
         }
@@ -1383,14 +1756,6 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
         defaultLights.visible = authoredLightCount === 0 && !snapshotEnvironment.isLightingActive() && !studioLightingActive;
     };
 
-    // Phase 4: layer manager
-    const layerManager = buildLayerManager({
-        scene, camera, renderer, THREE,
-        nodeMap, lightHandleMap, maxRoot, jsRoot, overlayRoot, controls,
-        sceneCameras: Array.isArray(meta.sceneCameras) ? meta.sceneCameras : [],
-        onRuntimeSceneChanged: queueStudioLightingRefresh,
-    });
-
     const animationSystem = createMaxJSAnimationSystem({
         THREE,
         nodeMap, lightHandleMap,
@@ -1400,10 +1765,25 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
         getOverlayRoot: () => overlayRoot,
         getViewportAspect,
         buildGeometry: (nd, buffer) => geometryFromNodeBinary(nd, buffer),
+        applyMaterialScalar: applySnapshotMaterialScalar,
     });
 
+    // Phase 4: layer manager. Getter closures keep the layer surface stable
+    // while optional modules are loaded immediately after the manager exists.
+    let optionalModules = {};
+    const layerManager = buildLayerManager({
+        scene, camera, renderer, THREE,
+        nodeMap, lightHandleMap, maxRoot, jsRoot, overlayRoot, controls,
+        sceneCameras: Array.isArray(meta.sceneCameras) ? meta.sceneCameras : [],
+        getAnimationSystem: () => animationSystem,
+        getAudioSystem: () => optionalModules.audio ?? null,
+        getGLTFSystem: () => optionalModules.gltf ?? null,
+        onRuntimeSceneChanged: queueStudioLightingRefresh,
+    });
+    bindSnapshotProjectRuntime(layerManager, root);
+
     // Phase 5: optional modules
-    const optionalModules = await registerOptionalModules(features, {
+    optionalModules = await registerOptionalModules(features, {
         scene, camera, renderer, layerManager, nodeMap, lightHandleMap,
         maxBasisRoot, jsRoot, overlayRoot, meta,
     });
@@ -1429,6 +1809,7 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
     // A project site can host the player from a shell page above that root,
     // so rebase them before the audio system fetches buffers.
     optionalModules.audio?.applyAudios(resolveSnapshotAudioUrls(meta.audios ?? [], root));
+    optionalModules.gltf?.applyGLTFs(resolveSnapshotGltfUrls(meta.gltfs ?? [], root));
 
     // Phase 7a: snapshotUi (postfx state, tone-map, exposure, bg)
     if (meta.snapshotUi) {
@@ -1511,21 +1892,23 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
         }
     }
 
-    // Phase 8: runtimeScene
+    // Phase 8: baked runtime fallback. Load it before sidecars so an absent or
+    // broken layer module still leaves the exported scene visible.
+    let runtimeSceneState = {
+        roots: [],
+        transformOverrides: [],
+        hiddenSourceHandles: new Set(),
+        hiddenSourceCount: 0,
+    };
     if (meta.runtimeScene) {
-        await applyRuntimeScene(meta.runtimeScene, {
-            scene, jsRoot, overlayRoot, layerManager, meta, nodeMap,
+        runtimeSceneState = await applyRuntimeScene(meta.runtimeScene, {
+            root, jsRoot, overlayRoot, nodeMap,
         });
         studioLighting?.refreshSceneBindings?.();
     }
 
-    // Phase 9: layer project. Project sidecars are independent of the baked
-    // runtimeScene payload: a snapshot may ship project.maxjs.json + inlines/
-    // even when runtimeScene was omitted or empty.
-    await bindLayerProject(root, meta, layerManager);
-    studioLighting?.refreshSceneBindings?.();
-
-    // Animation tracks
+    // Animation and timeline state must exist before layer init so ctx.anim
+    // and ctx.maxTime reflect the exported snapshot from the first hook.
     if (meta.animations) {
         let animationBuffer = null;
         if (meta.animations.bin) {
@@ -1534,13 +1917,19 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
         }
         animationSystem.loadSnapshotAnimations(meta.animations, animationBuffer);
     }
-
-    // Standalone timeline — no Max bridge, drive locally.
     if (meta.snapshotUi?.timeline) {
         maxTimeline.initStandalone(meta.snapshotUi.timeline);
     } else {
         maxTimeline.initStandalone({ fps: 30, defaultPlaying: true });
     }
+
+    // Phase 9: layer project. Project sidecars are independent of the baked
+    // runtimeScene payload: a snapshot may ship project.maxjs.json + inlines/
+    // even when runtimeScene was omitted or empty.
+    const layerReplay = await bindLayerProject(root, meta, layerManager, runtimeSceneState);
+    restoreSnapshotTransformOverrides(runtimeSceneState, layerReplay.mountedIds, layerManager);
+    animationSystem.invalidateTargets();
+    studioLighting?.refreshSceneBindings?.();
 
     // Phase 10: run
     const stopLoop = startRenderLoop({
@@ -1550,6 +1939,9 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
         snapshotEnvironment,
         optionalModules,
         studioLighting,
+        enforceHiddenSources: () => {
+            enforceRuntimeHiddenSources(runtimeSceneState.hiddenSourceHandles, nodeMap);
+        },
     });
 
     return {
@@ -1560,10 +1952,12 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
         sceneLights,
         environment: snapshotEnvironment,
         audioSystem: optionalModules.audio ?? null,
+        gltfSystem: optionalModules.gltf ?? null,
         animationSystem, maxTimeline,
         resize,
         applyDelta: async (newBuffer) => {
             const result = await applyDelta(newBuffer, applierCtx);
+            enforceRuntimeHiddenSources(runtimeSceneState.hiddenSourceHandles, nodeMap);
             studioLighting?.refreshSceneBindings?.();
             syncDefaultLights();
             optionalModules.haloGi?.requestRebuild?.();
@@ -1597,11 +1991,16 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
             try { stopLoop(); } catch {}
             try { removeEventListener('resize', onResize); } catch {}
             try { resizeObserver?.disconnect?.(); } catch {}
+            try { layerManager?.clear?.(); } catch {}
+            try { animationSystem?.clear?.(); } catch {}
             try {
-                for (const module of Object.values(optionalModules ?? {})) {
-                    module?.dispose?.();
-                }
+                disposeRuntimeObjects(runtimeSceneState.roots);
+                for (const bakedRoot of runtimeSceneState.roots) bakedRoot.parent?.remove(bakedRoot);
+                runtimeSceneState.roots.length = 0;
             } catch {}
+            for (const module of Object.values(optionalModules ?? {})) {
+                try { module?.dispose?.(); } catch {}
+            }
             try { snapshotEnvironment.dispose(); } catch {}
             try { studioLighting?.dispose?.(); } catch {}
             try { sceneLights.dispose(); } catch {}

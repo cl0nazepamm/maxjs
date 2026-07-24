@@ -37,14 +37,18 @@ function normalizeType(rawType, value, decl) {
     if (raw === 'float' || raw === 'number' || raw === 'int' || raw === 'integer') return 'float';
     if (raw === 'color' || raw === 'colour') return 'color';
     if (raw === 'bool' || raw === 'boolean' || raw === 'checkbox' || raw === 'toggle') return 'bool';
+    if (raw === 'string' || raw === 'text') return 'string';
 
-    if (isColorLike(value)) return 'color';
     if (typeof value === 'boolean') return 'bool';
+    if (typeof value === 'string') {
+        return isColorLike(value) ? 'color' : 'string';
+    }
     if (Number.isFinite(Number(value))) {
         return Number.isFinite(Number(decl?.min)) && Number.isFinite(Number(decl?.max))
             ? 'slider'
             : 'float';
     }
+    if (isColorLike(value)) return 'color';
     if (Number.isFinite(Number(decl?.min)) || Number.isFinite(Number(decl?.max))) return 'slider';
     return '';
 }
@@ -198,6 +202,10 @@ export function createLayerParamController({
 } = {}) {
     const valueStore = new Map(); // layer id -> { name: value }
 
+    function canMutate(layer) {
+        return typeof layer?.paramIsActive !== 'function' || layer.paramIsActive();
+    }
+
     function storedValuesFor(layer) {
         return valueStore.get(layer.id) ?? {};
     }
@@ -245,6 +253,12 @@ export function createLayerParamController({
             step = null;
             min = null;
             max = null;
+        } else if (type === 'string') {
+            defaultValue = rawDefault == null ? '' : String(rawDefault);
+            value = value == null ? defaultValue : String(value);
+            step = null;
+            min = null;
+            max = null;
         } else if (type === 'slider') {
             min = Number.isFinite(min) ? min : 0;
             max = Number.isFinite(max) ? max : 1;
@@ -282,6 +296,7 @@ export function createLayerParamController({
                 return layer.paramDefs.get(name)?.value;
             },
             set(value) {
+                if (!canMutate(layer)) return;
                 setValue(layer, name, value, { source: 'script' });
             },
         });
@@ -306,6 +321,7 @@ export function createLayerParamController({
     }
 
     function define(layer, specOrName, maybeDecl, options = {}) {
+        if (!canMutate(layer)) return layer.paramProxy;
         const spec = typeof specOrName === 'string'
             ? { [specOrName]: maybeDecl }
             : specOrName;
@@ -345,10 +361,12 @@ export function createLayerParamController({
     function coerceValue(entry, value) {
         if (entry.type === 'color') return colorToHex(THREE, value, entry.value);
         if (entry.type === 'bool') return !!value;
+        if (entry.type === 'string') return value == null ? '' : String(value);
         return clampNumber(finiteNumber(value, entry.value), entry.min, entry.max);
     }
 
     function setValue(layer, nameRaw, value, options = {}) {
+        if (!canMutate(layer)) return null;
         const name = normalizeName(nameRaw);
         if (!name) return null;
         let entry = layer.paramDefs.get(name);
@@ -422,6 +440,7 @@ export function createLayerParamController({
             },
             onChange(handler) {
                 if (typeof handler !== 'function') throw new TypeError('ctx.params.onChange: handler must be a function');
+                if (!canMutate(layer)) return () => {};
                 layer.paramWatchers.add(handler);
                 const dispose = () => layer.paramWatchers.delete(handler);
                 layer.disposers.push(dispose);

@@ -4186,6 +4186,7 @@
         selectionRescanDirty_ = false;
         if (selectionRescanDirty) {
             selectionDirty.insert(geomHandles_.begin(), geomHandles_.end());
+            selectionDirty.insert(helperHandles_.begin(), helperHandles_.end());
             selectionDirty.insert(lightHandles_.begin(), lightHandles_.end());
             selectionDirty.insert(audioHandles_.begin(), audioHandles_.end());
             selectionDirty.insert(gltfHandles_.begin(), gltfHandles_.end());
@@ -6137,6 +6138,7 @@
         const float volContrib = HasParam(pb, pl_vol_contrib) ? pb->GetFloat(pl_vol_contrib, t) : 1.0f;
         // Always emit so the web side never keeps a stale multiplier when the user returns to 1.0.
         ss << L",\"volContrib\":" << volContrib;
+        WriteUserPropsJson(ss, node);
 
         ss << L'}';
         return true;

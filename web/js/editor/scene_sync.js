@@ -15,7 +15,7 @@ import { gpuRecomputeNormals, gpuNormalsInvalidate, isGpuNormalsDisabled } from 
 import { maxTimeline } from '../maxjs_timeline.js';
 import { copyMaxComponentsToWorld } from '../scene_space.js';
 import { ensureGeometryUv0ForMaterial, markUv0AttributeAuthored } from '../material_contract.js';
-import { markOwned, OWNER_MAX } from '../layer_ownership.js';
+import { ensureMaxOwned, markOwned, OWNER_MAX } from '../layer_ownership.js';
 
 function createSceneSync(deps = {}) {
         let gpuNormalsAnnounced = false;
@@ -237,7 +237,10 @@ function createSceneSync(deps = {}) {
             deps.applyNodeProps(mesh, nd.props);
             const transformChanged = applyTransform(mesh, nd.t);
             applySelection(mesh, nd.s);
-            markOwned(mesh, OWNER_MAX);
+            // Idempotent: the callers above stamp swapped geometry/material at
+            // the swap site, so re-walking an already-Max-owned subtree here
+            // every settle would be pure tax on scene-sized node counts.
+            ensureMaxOwned(mesh);
             return !!(visibilityChanged || transformChanged);
         }
 
@@ -1103,9 +1106,11 @@ function createSceneSync(deps = {}) {
                             mesh.geometry.dispose();
                         }
                         mesh.geometry = geom;
+                        markOwned(mesh.geometry, OWNER_MAX);
                     }
                     const previousMaterial = mesh.material;
                     if (deps.ensureSceneRenderableMaterial(mesh, nd, wantsLine, { authoritativeMaterial: true })) {
+                        markOwned(mesh.material, OWNER_MAX);
                         sceneChanged = true;
                         deps.lightLinking.replaceRenderableMaterial?.(previousMaterial, mesh.material);
                         deps.layerManager.applyMaterialOverrides?.(nd.h, mesh);
@@ -1283,6 +1288,11 @@ function createSceneSync(deps = {}) {
             }
             if (msg.lights) {
                 pathTraceLightsChanged = deps.applyLightUpdates(msg.lights) === true;
+                // Deliberately broad: applyLightData's return value is the PATH
+                // TRACE payload signature, which excludes castShadow, the shadow
+                // params, map and visibility — all of which it writes anyway.
+                // Narrowing this to the returned flag would stop re-asserting
+                // overrides on exactly the light slots layers override most.
                 runtimeOverridesChanged ||= msg.lights.length > 0;
             }
             if (msg.audios) deps.audioSystem?.applyAudioUpdates(msg.audios);
@@ -1418,12 +1428,14 @@ function createSceneSync(deps = {}) {
                         releaseGeometryRef(geometryRefCounts, mesh.geometry);
                         retainGeometryRef(geometryRefCounts, geom);
                         mesh.geometry = geom;
+                        markOwned(mesh.geometry, OWNER_MAX);
                         if (deps.nodePayloadHasHTMLAutoFit(nd)) {
                             mesh.userData.maxjsMaterialSignature = null;
                         }
                     }
                     const previousMaterial = mesh.material;
                     if (deps.ensureSceneRenderableMaterial(mesh, nd, wantsLine, { authoritativeMaterial: true })) {
+                        markOwned(mesh.material, OWNER_MAX);
                         sceneChanged = true;
                         deps.lightLinking.replaceRenderableMaterial?.(previousMaterial, mesh.material);
                         deps.layerManager.applyMaterialOverrides?.(nd.h, mesh);
@@ -1540,6 +1552,8 @@ function createSceneSync(deps = {}) {
                         shadowMapSize: ld.shadowMapSize,
                         volContrib: ld.volContrib,
                     }, { partial: true });
+                    // Not gated on lightChanged — see the JSON lane above:
+                    // that flag is the PT signature, not "wrote something".
                     runtimeOverridesChanged = true;
                     if (lightChanged) {
                         if (ld.type === 0) deps.refreshSkyFromLinkedSun();

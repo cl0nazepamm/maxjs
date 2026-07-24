@@ -834,20 +834,27 @@ export function createMaxJSFxController({
         },
         setSSROptions(options = {}) {
             let rebuild = false;
-            let live = false;
+            // Scene-scaled uniforms (maxDistance/thickness here, and the
+            // equivalents in GTAO / contact shadows) need NO pipeline signal:
+            // core.updatePerFrame() recomputes ctx.derived and each effect's
+            // update() rewrites the .value every frame, so a new value lands
+            // on the next one. Flagging output would set
+            // postProcessing.needsUpdate, and r185's RenderPipeline._update()
+            // reassigns fragmentNode + material.needsUpdate — a NodeMaterial
+            // recompile of the output quad per call. A layer animating these
+            // would recompile per frame: D5 wearing a smaller hat.
+            assignFinite(state.ssr, 'maxDistance', options.maxDistance);
+            assignFinite(state.ssr, 'thickness', options.thickness);
             rebuild = assignBoolean(state.ssr, 'denoise', options.denoise) || rebuild;
             rebuild = assignBoolean(state.ssr, 'stochastic', options.stochastic) || rebuild;
             rebuild = assignFinite(state.ssr, 'quality', options.quality) || rebuild;
             rebuild = assignFinite(state.ssr, 'blurQuality', options.blurQuality) || rebuild;
-            live = assignFinite(state.ssr, 'maxDistance', options.maxDistance) || live;
             rebuild = assignFinite(state.ssr, 'opacity', options.opacity) || rebuild;
-            live = assignFinite(state.ssr, 'thickness', options.thickness) || live;
             rebuild = assignFinite(state.ssr, 'denoiseRadius', options.denoiseRadius) || rebuild;
             rebuild = assignFinite(state.ssr, 'denoiseStrength', options.denoiseStrength) || rebuild;
             rebuild = assignFinite(state.ssr, 'denoiseFrames', options.denoiseFrames) || rebuild;
             rebuild = assignFinite(state.ssr, 'denoiseAdaptiveTrust', options.denoiseAdaptiveTrust) || rebuild;
             if (rebuild) rebuildPipeline();
-            else if (live && state.ssr.enabled) queuePipelineUpdate({ output: true });
             return { ...state.ssr };
         },
         isGTAOEnabled() {
@@ -871,16 +878,15 @@ export function createMaxJSFxController({
         },
         setGTAOOptions(options = {}) {
             let rebuild = false;
-            let live = false;
+            // Per-frame scene-scaled uniforms — see setSSROptions.
+            assignFinite(state.gtao, 'radius', options.radius);
+            assignFinite(state.gtao, 'thickness', options.thickness);
             rebuild = assignFinite(state.gtao, 'samples', options.samples) || rebuild;
             rebuild = assignFinite(state.gtao, 'distanceExponent', options.distanceExponent) || rebuild;
             rebuild = assignFinite(state.gtao, 'distanceFallOff', options.distanceFallOff) || rebuild;
-            live = assignFinite(state.gtao, 'radius', options.radius) || live;
             rebuild = assignFinite(state.gtao, 'scale', options.scale) || rebuild;
-            live = assignFinite(state.gtao, 'thickness', options.thickness) || live;
             rebuild = assignFinite(state.gtao, 'resolutionScale', options.resolutionScale) || rebuild;
             if (rebuild) rebuildPipeline();
-            else if (live && state.gtao.enabled) queuePipelineUpdate({ output: true });
             return { ...state.gtao };
         },
         isMotionBlurEnabled() {
@@ -1085,14 +1091,13 @@ export function createMaxJSFxController({
         },
         setContactShadowOptions(options = {}) {
             let rebuild = false;
-            let live = false;
-            live = assignFinite(state.contactShadow, 'maxDistance', options.maxDistance) || live;
-            live = assignFinite(state.contactShadow, 'thickness', options.thickness) || live;
+            // Per-frame scene-scaled uniforms — see setSSROptions.
+            assignFinite(state.contactShadow, 'maxDistance', options.maxDistance);
+            assignFinite(state.contactShadow, 'thickness', options.thickness);
             rebuild = assignFinite(state.contactShadow, 'shadowIntensity', options.shadowIntensity) || rebuild;
             rebuild = assignFinite(state.contactShadow, 'quality', options.quality) || rebuild;
             rebuild = assignBoolean(state.contactShadow, 'temporal', options.temporal) || rebuild;
             if (rebuild) rebuildPipeline();
-            else if (live && state.contactShadow.enabled) queuePipelineUpdate({ output: true });
             return { ...state.contactShadow };
         },
         setMainLight(light) {

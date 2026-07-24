@@ -407,11 +407,16 @@ export function createLayerParamController({
         return THREE?.Color ? new THREE.Color(hex) : hex;
     }
 
-    function initLayer(layer, options = {}) {
+    // `binding` is the manager's contract, kept separate from `options` because
+    // `options` is the caller's mount payload and must not be written into.
+    function initLayer(layer, options = {}, binding = {}) {
         layer.paramDefs = new Map();
         layer.paramProxy = {};
         layer.paramWatchers = new Set();
         layer.paramNextOrder = 0;
+        layer.paramIsActive = typeof binding.isActive === 'function'
+            ? binding.isActive
+            : null;
         layer.initialParamValues = cloneInitialValues(
             options.paramValues ?? options.parameters ?? options.params,
         );

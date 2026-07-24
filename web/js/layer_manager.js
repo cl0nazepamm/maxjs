@@ -28,6 +28,17 @@ import { createWebappLayer } from './webapp_layer.js';
 
 const MAX_CONSECUTIVE_ERRORS = 60;
 
+// Handed to a layer that is no longer mounted. Allocating a real input helper
+// there would attach DOM listeners nobody owns, but throwing is worse: a stale
+// hooks.dispose() reading ctx.input would abort mid-teardown and skip the rest
+// of its own cleanup.
+const INERT_LAYER_INPUT = freezePlainObject({
+    get element() { return null; },
+    get document() { return null; },
+    on() {},
+    dispose() {},
+});
+
 export function createLayerManager({
     scene,
     camera,
@@ -465,7 +476,9 @@ export function createLayerManager({
     function getOrCreateLayerInput(layer) {
         if (!isLayerCurrent(layer)) {
             warnStaleLayerMutation(layer);
-            throw new Error(`Layer "${layer.id}" is no longer active`);
+            // Keep an already-built helper: disposeLayerState disposes it right
+            // after hooks.dispose, so late unbinds still get swept.
+            return layer.input ?? INERT_LAYER_INPUT;
         }
         if (!layer.input) layer.input = createInputHelper(renderer);
         return layer.input;
@@ -1079,13 +1092,15 @@ export function createLayerManager({
                     debugWarn(`[LayerManager] Layer "${layer.id}" detached a foreign object without disposing it`);
                 }
                 notifyRuntimeSceneChanged({ type: 'jsScene', layerId: layer.id, action: 'remove' });
+                // remove() reports DETACHMENT, dispose() reports FREEING — the
+                // differing return contracts are intentional, not an oversight.
+                // A foreign object is genuinely detached here (and warned about),
+                // so true is honest; only its resources are left alone.
                 return true;
             },
             createGroup(name = '', options = {}) {
                 const owner = options.overlay ? OWNER_OVERLAY : OWNER_JS;
                 if (!isLayerCurrent(layer)) {
-                    const staleGroup = markOwned(new THREE.Group(), owner);
-                    disposeOwnedResource(staleGroup, { force: true });
                     warnStaleLayerMutation(layer);
                     return null;
                 }
@@ -1342,8 +1357,9 @@ export function createLayerManager({
             },
             ctx: null,
         };
-        layer.paramIsActive = () => isLayerCurrent(layer);
-        paramController.initLayer(layer, options);
+        paramController.initLayer(layer, options, {
+            isActive: () => isLayerCurrent(layer),
+        });
 
         jsWorldRoot.add(group);
         overlayWorldRoot.add(overlayGroup);
@@ -1405,6 +1421,15 @@ export function createLayerManager({
         return { id, error: layer.error };
     }
 
+    // cleanupGlobals:false is for the replaced-during-load path ONLY, and it is
+    // load-bearing — do not "fix" it. The deform/spectral/override registries
+    // are keyed by layer ID STRING, not by layer object. A stale layer whose
+    // mount lost the race shares its id with the live replacement, so clearing
+    // those registries here would wipe the NEW layer's state. The cost is
+    // accepted: global registrations made by a layer that was replaced mid-init
+    // survive until the live layer with that id is itself removed. Everything
+    // owned per-object (tracked resources, groups, disposers, hooks) is always
+    // swept, whichever path we are on.
     function disposeLayerState(layer, { cleanupGlobals = true } = {}) {
         if (!layer) return;
         layer.mountToken = null;

@@ -93,6 +93,20 @@ function markOwned(resource, owner = OWNER_JS) {
     return setOwner(resource, owner);
 }
 
+// Idempotent Max stamp for the fastsync settle path. markOwned() walks the
+// whole subtree and re-tests 14 material map slots per object every call —
+// on a full sync that is pure redundant work once a node is already stamped.
+// CONTRACT: anything that gives an already-stamped node a new geometry,
+// material, or CHILD must stamp that resource at the site it introduces it —
+// the sync lanes do (geometry/material swaps, flatten clusters, instance
+// buckets, line<->mesh rebuilds). This only short-circuits re-walking a tree
+// that is already Max-owned; it cannot discover resources added since.
+function ensureMaxOwned(resource) {
+    if (!resource || typeof resource !== 'object') return resource;
+    if (getOwner(resource) === OWNER_MAX) return resource;
+    return markOwned(resource, OWNER_MAX);
+}
+
 function clearOwner(resource) {
     if (!resource || typeof resource !== 'object') return resource;
     if (resource.userData) {
@@ -173,6 +187,7 @@ export {
     isOwnedByMax,
     getOwner,
     markOwned,
+    ensureMaxOwned,
     setSnapshotTargetId,
     disposeOwnedMaterial,
     disposeOwnedResource,

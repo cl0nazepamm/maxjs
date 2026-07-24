@@ -28,6 +28,14 @@ void MaxJSFastNodeEventCallback::LinkChanged(NodeKeyTab& nodes) {
     owner_->MarkTrackedNodesDirty(nodes);
 }
 
+// These two deliberately break the pattern of their neighbours: they discard
+// the NodeKeyTab and ask for a debounced FULL sync instead of marking the
+// listed nodes dirty. There is no delta channel for names or user properties —
+// both ride the full-sync node payload only — so a targeted mark would have
+// nothing to carry them. SetDirty's 150ms debounce coalesces the burst, and
+// false skips the idle-poll audit: a rename is not interactive motion, so it
+// must not arm the geometry-audit window or stamp interactive activity.
+// If a name/userProps delta lane is ever added, move these to MarkTrackedNodesDirty.
 void MaxJSFastNodeEventCallback::NameChanged(NodeKeyTab&) {
     if (owner_) owner_->SetDirty(false);
 }

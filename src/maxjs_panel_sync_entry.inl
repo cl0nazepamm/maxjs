@@ -64,7 +64,6 @@
     bool IsTrackedHandle(ULONG handle) const {
         return geomHandles_.find(handle) != geomHandles_.end()
             || lightHandles_.find(handle) != lightHandles_.end()
-            || splatHandles_.find(handle) != splatHandles_.end()
             || audioHandles_.find(handle) != audioHandles_.end()
             || gltfHandles_.find(handle) != gltfHandles_.end()
             || webappHandles_.find(handle) != webappHandles_.end()
@@ -73,7 +72,7 @@
     }
 
     bool HasTrackedNodes() const {
-        return !geomHandles_.empty() || !lightHandles_.empty() || !splatHandles_.empty()
+        return !geomHandles_.empty() || !lightHandles_.empty()
             || !audioHandles_.empty() || !gltfHandles_.empty() || !webappHandles_.empty()
             || !hairHandles_.empty()
             || !helperHandles_.empty();

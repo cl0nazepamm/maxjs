@@ -813,9 +813,6 @@ static const wchar_t* GetMimeTypeForPath(const std::wstring& path) {
     if (_wcsicmp(ext, L".mov") == 0) return L"video/quicktime";
     if (_wcsicmp(ext, L".ogv") == 0) return L"video/ogg";
     if (_wcsicmp(ext, L".ply") == 0) return L"application/octet-stream";
-    if (_wcsicmp(ext, L".splat") == 0) return L"application/octet-stream";
-    if (_wcsicmp(ext, L".ksplat") == 0) return L"application/octet-stream";
-    if (_wcsicmp(ext, L".spz") == 0) return L"application/octet-stream";
     if (_wcsicmp(ext, L".mp3") == 0) return L"audio/mpeg";
     if (_wcsicmp(ext, L".wav") == 0) return L"audio/wav";
     if (_wcsicmp(ext, L".ogg") == 0) return L"audio/ogg";

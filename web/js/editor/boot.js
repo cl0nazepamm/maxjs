@@ -9,7 +9,6 @@
         import {
             installMaxLightsRenderer,
         } from '../max_lights_node.js';
-        import { createSplatsSystem } from './splats.js';
         import { createRendererCore } from './renderer_core.js';
         import { createTexturePipeline } from './texture_pipeline.js';
         import { createMaterials } from './materials.js';
@@ -282,7 +281,6 @@
             // Off by default: merged members lose per-node picking until the
             // cluster dissolves.
             flattenGroups: false,
-            splatsEnabled: true,
         });
         let performanceSettings = { ...PERFORMANCE_DEFAULTS };
         const SAFE_FRAME_STORAGE_KEY = 'maxjs_safe_frame_enabled';
@@ -362,10 +360,10 @@
         // Spectral view: 'probes' = live DDGI probe GI (default), 'trace' =
         // the spectral path tracer. Live-switchable WITHOUT reload — both run
         // on the same spectral scene core. setSpectralView() flips it.
-        const MAXJS_SPECTRAL_VIEW_KEY = 'maxjs-spectral-view';
+        // Session-only by design: every viewer start begins in 'probes' (PT off)
+        // so a restart never boots straight into the tracer.
         let spectralView = 'probes';
-        try { if (localStorage.getItem(MAXJS_SPECTRAL_VIEW_KEY) === 'trace') spectralView = 'trace'; } catch {}
-        let isPathTracingMode = isStudioMode && spectralView === 'trace';
+        let isPathTracingMode = false;
         document.body.classList.toggle('pathtracing-mode', isPathTracingMode);
 
         let renderer = null;
@@ -384,7 +382,6 @@
             get renderOutputSettings() { return renderOutputSettings; },
             get safeFrameEnabled() { return safeFrameEnabled; },
             get camera() { return camera; },
-            get splatsSystem() { return splatsSystem; },
             get asciiEffect() { return asciiEffect; },
             get blobOverlayCvs() { return blobOverlayCvs; },
             get compositionOverlay() { return compositionOverlay; },
@@ -619,12 +616,12 @@
 
         const DEBUG_STORAGE_KEY = 'maxjs_debug';
         const PROFILE_SCENE_STORAGE_KEY = 'maxjs_profile_scene';
-        const SLOW_JSON_SYNC_STORAGE_KEY = 'maxjs_slow_json_sync';
-        const LEGACY_LIVE_SYNC_DISABLED_STORAGE_KEY = 'maxjs_live_sync_disabled';
         const isStandalone = !(window.chrome?.webview?.postMessage);
         const urlMode = new URLSearchParams(location.search).get('mode');
         let buildMode = urlMode || (isStandalone ? 'release' : 'dev');
         var debugMode = false;
+        // Session-only by design: sync always boots LIVE; SLOW is a per-session
+        // debugging escape hatch, never a restored state.
         let slowJsonSyncMode = false;
 
         function setAudioMuted(nextMuted, { persist = true } = {}) {
@@ -646,13 +643,6 @@
             }
         } catch (_) {
             debugMode = !isStandalone;
-        }
-        try {
-            slowJsonSyncMode =
-                localStorage.getItem(SLOW_JSON_SYNC_STORAGE_KEY) === 'true' ||
-                localStorage.getItem(LEGACY_LIVE_SYNC_DISABLED_STORAGE_KEY) === 'true';
-        } catch (_) {
-            slowJsonSyncMode = false;
         }
         function maxjsDebugLog(...args) {
             if (debugMode) console.log(...args);
@@ -767,7 +757,6 @@
         let pathTracingBridge = null;
         let refreshSkyForSpectralViewNow = () => false;
         const pathTracingGlue = createPathTracingGlue({
-            MAXJS_SPECTRAL_VIEW_KEY,
             PATH_TRACING_RASTER_WARMUP_FRAMES,
             PATH_TRACING_TEXTURE_WAIT_MS,
             PATH_TRACING_LIVE_REBUILD_DELAY_MS,
@@ -840,16 +829,6 @@
             }
         });
 
-        const splatsSystem = createSplatsSystem({
-            perfHud,
-            isFiniteArray: (...args) => isFiniteArray(...args),
-            getViewportFrameRect, getEffectivePixelRatio, applyFrameElementStyle,
-            reportBridgeError: (prefix, err) => reportBridgeError(prefix, err),
-            get camera() { return camera; },
-            get performanceSettings() { return performanceSettings; },
-        });
-        const { splatsViewerEnabled, shutdownSplatViewer, updateSplatCamera,
-                reconcileSplats, applySplatUpdates } = splatsSystem;
         function createSolidTexture(r, g, b, a = 255) {
             const tex = new THREE.DataTexture(new Uint8Array([r, g, b, a]), 1, 1);
             tex.colorSpace = THREE.NoColorSpace;
@@ -1398,14 +1377,8 @@
             button.setAttribute('aria-label', slowJsonSyncMode ? 'Switch to live fast sync' : 'Switch to slow JSON sync');
         }
 
-        function applyLiveSyncSettings(next = {}, { notify = false, sendHost = false, persist = true } = {}) {
+        function applyLiveSyncSettings(next = {}, { notify = false, sendHost = false } = {}) {
             if (next.disabled != null) slowJsonSyncMode = next.disabled === true;
-            if (persist) {
-                try {
-                    localStorage.setItem(SLOW_JSON_SYNC_STORAGE_KEY, slowJsonSyncMode ? 'true' : 'false');
-                    localStorage.removeItem(LEGACY_LIVE_SYNC_DISABLED_STORAGE_KEY);
-                } catch {}
-            }
             syncLiveSyncButtonUi();
             if (sendHost && window.chrome?.webview) {
                 bridge.send('live_sync_settings', { disabled: slowJsonSyncMode });
@@ -1423,7 +1396,7 @@
             applyLiveSyncSettings({ disabled: msg.disabled === true }, { notify: true, sendHost: false });
         });
 
-        applyLiveSyncSettings({ disabled: slowJsonSyncMode }, { sendHost: true, persist: false });
+        applyLiveSyncSettings({ disabled: slowJsonSyncMode }, { sendHost: true });
 
         bridge.on('render_output_settings', msg => {
             const width = Math.max(1, Math.round(Number(msg.width) || 0));
@@ -1564,8 +1537,6 @@
             applyMaterialSelectionState,
             normalizeMaxVertexColorChannel,
             maxVertexColorAttributeName,
-            reconcileSplats,
-            applySplatUpdates,
             resetPathTracingStartupWarmup: (...args) => resetPathTracingStartupWarmup(...args),
             markPathTracingSceneDirtyNow: (...args) => markPathTracingSceneDirtyNow(...args),
             markLightProbeSceneDirty,
@@ -1604,7 +1575,6 @@
             get camLock() { return camLock; },
             get renderer() { return renderer; },
             get lightHandleMap() { return lightHandleMap; },
-            get splatsSystem() { return splatsSystem; },
             get audioSystem() { return audioSystem; },
             get gltfSystem() { return gltfSystem; },
             get webappSystem() { return webappSystem; },
@@ -2229,7 +2199,6 @@
             setHaloGiSetting,
             setRightDockWidth,
             setShaderLabSnapshot,
-            shutdownSplatViewer,
             syncCameraLockButtonUi,
             syncEnvButtonUi,
             syncEnvironmentDisplay,
@@ -2298,7 +2267,6 @@
             get rendererBackendLabel() { return rendererBackendLabel; },
             get scene() { return scene; },
             get shaderLabFx() { return shaderLabFx; },
-            get splatsSystem() { return splatsSystem; },
             get webglBasicFx() { return webglBasicFx; },
         });
         const {
@@ -2354,7 +2322,6 @@
                     optimizeMaxInstances: performanceSettings.optimizeMaxInstances,
                     maxInstanceBucketThreshold: performanceSettings.maxInstanceBucketThreshold,
                     flattenGroups: performanceSettings.flattenGroups === true,
-                    splatsEnabled: performanceSettings.splatsEnabled !== false,
                 },
                 cameraClip: { near: cameraClip.near, far: cameraClip.far },
                 ascii: { enabled: asciiActive, ...asciiSettings },
@@ -2502,7 +2469,6 @@
             updateGiVolumeIdleWork: (...args) => updateGiVolumeIdleWork(...args),
             syncGiVolumeActive: (...args) => syncGiVolumeActive(...args),
             updateProbeHelpers: (...args) => updateProbeHelpers(...args),
-            updateSplatCamera: (...args) => updateSplatCamera(...args),
             renderCurrentFrameOnce: (...args) => renderCurrentFrameOnce(...args),
             sendCurrentCanvasRenderFile: (...args) => sendCurrentCanvasRenderFile(...args),
             syncPostFxPanel: (...args) => syncPostFxPanel(...args),
@@ -2546,7 +2512,6 @@
             get css3dOverlay() { return css3dOverlay; },
             get blobOverlayCtx() { return blobOverlayCtx; },
             get blobOverlayCvs() { return blobOverlayCvs; },
-            get splatsSystem() { return splatsSystem; },
             get latestAppliedSyncSerial() { return latestAppliedSyncSerial; },
             get pendingTextureLoads() { return pendingTextureLoads; },
             get renderToImageForcePathTracing() { return renderToImageForcePathTracing; },
@@ -2669,7 +2634,6 @@
             renderPathTracingLiveFrame: (...args) => renderPathTracingLiveFrame(...args),
             renderViewerFrame: (...args) => renderViewerFrame(...args),
             reportBridgeError: (...args) => reportBridgeError(...args),
-            updateSplatCamera: (...args) => updateSplatCamera(...args),
             getEnvironmentBackgroundMap: (...args) => getEnvironmentBackgroundMap(...args),
             isLocalHdriActive: (...args) => isLocalHdriActive(...args),
             applyLocalHDRIToScene: (...args) => applyLocalHDRIToScene(...args),
@@ -2700,7 +2664,6 @@
             get renderToImageActive() { return renderToImageActive; },
             set renderToImageActive(value) { renderToImageActive = value; },
             get webglBasicFx() { return webglBasicFx; },
-            get splatsSystem() { return splatsSystem; },
             get pathTracingSettings() { return pathTracingSettings; },
             get pendingRenderToImage() { return pendingRenderToImage; },
             set pendingRenderToImage(value) { pendingRenderToImage = value; },

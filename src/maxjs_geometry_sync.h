@@ -14,7 +14,6 @@
 
 #include "maxjs_core_utils.h"
 #include "threejs_deform.h"
-#include "threejs_splat.h"
 
 #include <algorithm>
 #include <cmath>
@@ -870,7 +869,6 @@ static int EstimateRenderableTriangleCountCapped(INode* node, TimeValue t, int c
 
     ObjectState os = node->EvalWorldState(t);
     if (!os.obj || os.obj->SuperClassID() != GEOMOBJECT_CLASS_ID) return 0;
-    if (IsThreeJSSplatClassID(os.obj->ClassID())) return 0;
 
     if (os.obj->IsSubClassOf(polyObjectClassID)) {
         MNMesh& mn = static_cast<PolyObject*>(os.obj)->GetMesh();
@@ -903,7 +901,7 @@ static bool ShouldExtractRenderableShape(INode* node, TimeValue t, const ObjectS
         && !IsShapeConsumedByOtherRuntimeNode(node, t);
 }
 
-// Fast-path visibility (delta / xform / splat-audio hashes) must match layer hidden + renderable.
+// Fast-path visibility (delta / xform / audio hashes) must match layer hidden + renderable.
 // Sending only IsNodeHidden caused non-renderable meshes to receive vis=1 every frame and fight
 // props.rend on the JS side (flicker).
 static bool IsMaxJsSyncDrawVisible(INode* node) {
@@ -927,7 +925,6 @@ static uint64_t HashNodeGeometryState(INode* node, TimeValue t) {
         return HashMeshData(verts, indices, uvs);
     }
     if (os.obj->SuperClassID() != GEOMOBJECT_CLASS_ID) return 0;
-    if (IsThreeJSSplatClassID(os.obj->ClassID())) return 0;
 
     if (os.obj->IsSubClassOf(polyObjectClassID)) {
         PolyObject* poly = static_cast<PolyObject*>(os.obj);
@@ -2381,7 +2378,6 @@ static bool ExtractMesh(INode* node, TimeValue t,
 
     ObjectState os = node->EvalWorldState(t);
     if (!os.obj || os.obj->SuperClassID() != GEOMOBJECT_CLASS_ID) return false;
-    if (IsThreeJSSplatClassID(os.obj->ClassID())) return false;
 
     if (ShouldUseHairRenderMeshFallback(node)) {
         return ExtractRenderMeshGeometry(node, t, verts, uvs, indices, groups);
@@ -2456,7 +2452,6 @@ static bool TryHashRenderableGeometryState(INode* node, TimeValue t, uint64_t& o
     }
 
     if (os.obj->SuperClassID() != GEOMOBJECT_CLASS_ID) return false;
-    if (IsThreeJSSplatClassID(os.obj->ClassID())) return false;
 
     if (ShouldUseHairRenderMeshFallback(node)) {
         return TryHashExtractedRenderableGeometry(node, t, outHash);
@@ -2495,7 +2490,6 @@ static bool TryHashRenderableGeometryStateWithoutUVs(INode* node, TimeValue t, u
     }
 
     if (os.obj->SuperClassID() != GEOMOBJECT_CLASS_ID) return false;
-    if (IsThreeJSSplatClassID(os.obj->ClassID())) return false;
 
     if (ShouldUseHairRenderMeshFallback(node)) {
         outHash = HashNodeGeometryState(node, t);
@@ -2540,7 +2534,6 @@ static bool TryHashRenderableGeometryChannels(INode* node, TimeValue t, uint64_t
 
     ObjectState os = node->EvalWorldState(t);
     if (!os.obj || os.obj->SuperClassID() != GEOMOBJECT_CLASS_ID) return false;
-    if (IsThreeJSSplatClassID(os.obj->ClassID())) return false;
     if (ShouldUseHairRenderMeshFallback(node)) return false;
 
     if (os.obj->IsSubClassOf(polyObjectClassID)) {
@@ -2567,7 +2560,6 @@ static bool NodeHasExtractableVertexColors(INode* node, TimeValue t) {
 
     ObjectState os = node->EvalWorldState(t);
     if (!os.obj || os.obj->SuperClassID() != GEOMOBJECT_CLASS_ID) return false;
-    if (IsThreeJSSplatClassID(os.obj->ClassID())) return false;
 
     if (os.obj->IsSubClassOf(polyObjectClassID)) {
         PolyObject* poly = static_cast<PolyObject*>(os.obj);
@@ -2613,7 +2605,6 @@ static bool ExtractSkinnedFastPositions(INode* node,
 
     ObjectState os = node->EvalWorldState(t);
     if (!os.obj || os.obj->SuperClassID() != GEOMOBJECT_CLASS_ID) return false;
-    if (IsThreeJSSplatClassID(os.obj->ClassID())) return false;
 
     if (os.obj->IsSubClassOf(polyObjectClassID)) {
         MNMesh& mn = static_cast<PolyObject*>(os.obj)->GetMesh();
@@ -3282,7 +3273,6 @@ static bool ExtractSkinnedFastGeometry(INode* node,
 
     ObjectState os = node->EvalWorldState(t);
     if (!os.obj || os.obj->SuperClassID() != GEOMOBJECT_CLASS_ID) return false;
-    if (IsThreeJSSplatClassID(os.obj->ClassID())) return false;
 
     if (os.obj->IsSubClassOf(polyObjectClassID)) {
         MNMesh& mn = static_cast<PolyObject*>(os.obj)->GetMesh();

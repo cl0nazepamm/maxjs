@@ -36,7 +36,6 @@
 #include "maxjs_morpher_compat.h"
 #include "threejs_material.h"
 #include "threejs_lights.h"
-#include "threejs_splat.h"
 #include "maxjs_geometry_sync.h"
 #include "maxjs_material_sync.h"
 #include "maxjs_material_slots.h"
@@ -760,7 +759,6 @@ public:
         bool includeEnvironment = true;
         bool includeFog = true;
         bool includeLights = true;
-        bool includeSplats = true;
         bool includeAudios = true;
         bool includeGLTFs = true;
         bool includeInstances = true;
@@ -1494,7 +1492,7 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, ULONG fdwReason, LPVOID) {
 }
 
 __declspec(dllexport) const TCHAR* LibDescription()   { return MAXJS_NAME; }
-__declspec(dllexport) int LibNumberClasses()           { return 24; }
+__declspec(dllexport) int LibNumberClasses()           { return 23; }
 __declspec(dllexport) ClassDesc* LibClassDesc(int i) {
     switch (i) {
         case 0: return &maxJSDesc;
@@ -1511,16 +1509,15 @@ __declspec(dllexport) ClassDesc* LibClassDesc(int i) {
         case 11: return GetThreeJSHemisphereLightDesc();
         case 12: return GetThreeJSAmbientLightDesc();
         case 13: return GetThreeJSToonDesc();
-        case 14: return GetThreeJSSplatDesc();
-        case 15: return GetThreeJSAudioDesc();
-        case 16: return GetThreeJSFogDesc();
-        case 17: return GetThreeJSSkyDesc();
-        case 18: return GetThreeJSDeformDesc();
-        case 19: return GetThreeJSTSLTexDesc();
-        case 20: return GetThreeJSHTMLTexDesc();
-        case 21: return GetThreeJSGLTFDesc();
-        case 22: return GetThreeJSWebAppDesc();
-        case 23: return GetThreeJSProbeGridDesc();
+        case 14: return GetThreeJSAudioDesc();
+        case 15: return GetThreeJSFogDesc();
+        case 16: return GetThreeJSSkyDesc();
+        case 17: return GetThreeJSDeformDesc();
+        case 18: return GetThreeJSTSLTexDesc();
+        case 19: return GetThreeJSHTMLTexDesc();
+        case 20: return GetThreeJSGLTFDesc();
+        case 21: return GetThreeJSWebAppDesc();
+        case 22: return GetThreeJSProbeGridDesc();
         default: return nullptr;
     }
 }

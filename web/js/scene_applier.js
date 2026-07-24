@@ -29,7 +29,7 @@
 //   - HTML auto-fit, selection state stamping.
 //   - Light linking / light probes / scene profiling.
 //   - `finalizeSceneSnapshot` side effects (camera fit, HDRI load, fog,
-//     splats, audio, gltf, hairInstances, volumes).
+//     audio, gltf, hairInstances, volumes).
 //
 // All of the above are wired through the `hooks` parameter so caller code
 // can opt in incrementally. The default hooks are no-ops.

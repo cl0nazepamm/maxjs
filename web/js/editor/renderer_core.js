@@ -75,10 +75,6 @@ function createRendererCore(deps = {}) {
                 if (resizeBuffers) deps.renderer.setSize(rect.width, rect.height);
                 applyFrameElementStyle(deps.renderer.domElement, rect);
             }
-            if (deps.splatsSystem.overlay?.renderer) {
-                if (resizeBuffers) deps.splatsSystem.overlay.renderer.setSize(rect.width, rect.height, false);
-                applyFrameElementStyle(deps.splatsSystem.overlay.renderer.domElement, rect);
-            }
             if (deps.asciiEffect?.domElement) {
                 deps.asciiEffect.setSize(rect.width, rect.height);
                 applyFrameElementStyle(deps.asciiEffect.domElement, rect);
@@ -115,11 +111,6 @@ function createRendererCore(deps = {}) {
                 deps.renderer.setPixelRatio(getEffectivePixelRatio());
                 deps.renderer.setSize(rect.width, rect.height);
                 applyFrameElementStyle(deps.renderer.domElement, rect);
-            }
-            if (deps.splatsSystem.overlay?.renderer) {
-                deps.splatsSystem.overlay.renderer.setPixelRatio(getEffectivePixelRatio());
-                deps.splatsSystem.overlay.renderer.setSize(rect.width, rect.height, false);
-                applyFrameElementStyle(deps.splatsSystem.overlay.renderer.domElement, rect);
             }
             if (deps.blobOverlayCvs) {
                 if (deps.blobOverlayCvs.width !== rect.width) deps.blobOverlayCvs.width = rect.width;
@@ -237,6 +228,46 @@ function createRendererCore(deps = {}) {
                 }
             } catch {}
 
+            // WebGPU devices come up at spec-MINIMUM limits unless asked
+            // otherwise — 16 sampled textures per shader stage is one
+            // shadow-casting light away from overflowing a scene material's
+            // bind group once shadow maps and the HALO-GI probe atlases fold
+            // in (2026-07-24: "add one light and the floor vanishes" —
+            // BindGroupLayout creation failed, every mesh on that material
+            // stopped rendering). Mirror the adapter's real limits into the
+            // device request so the hardware ceiling, not the spec floor, is
+            // the budget. Probe with the SAME adapter options three's
+            // WebGPUBackend uses (featureLevel 'compatibility') so the
+            // mirrored values are valid for the adapter it will pick.
+            async function resolveWebGPULimits() {
+                try {
+                    const adapter = await navigator.gpu?.requestAdapter?.({ featureLevel: 'compatibility' });
+                    if (!adapter?.limits) return undefined;
+                    const MIRROR = [
+                        'maxTextureDimension1D', 'maxTextureDimension2D', 'maxTextureDimension3D',
+                        'maxTextureArrayLayers', 'maxBindGroups', 'maxBindingsPerBindGroup',
+                        'maxDynamicUniformBuffersPerPipelineLayout', 'maxDynamicStorageBuffersPerPipelineLayout',
+                        'maxSampledTexturesPerShaderStage', 'maxSamplersPerShaderStage',
+                        'maxStorageBuffersPerShaderStage', 'maxStorageTexturesPerShaderStage',
+                        'maxUniformBuffersPerShaderStage', 'maxUniformBufferBindingSize',
+                        'maxStorageBufferBindingSize', 'maxVertexBuffers', 'maxBufferSize',
+                        'maxVertexAttributes', 'maxVertexBufferArrayStride', 'maxInterStageShaderVariables',
+                        'maxColorAttachments', 'maxColorAttachmentBytesPerSample',
+                        'maxComputeWorkgroupStorageSize', 'maxComputeInvocationsPerWorkgroup',
+                        'maxComputeWorkgroupSizeX', 'maxComputeWorkgroupSizeY', 'maxComputeWorkgroupSizeZ',
+                        'maxComputeWorkgroupsPerDimension',
+                    ];
+                    const requiredLimits = {};
+                    for (const key of MIRROR) {
+                        const value = adapter.limits[key];
+                        if (typeof value === 'number' && Number.isFinite(value)) requiredLimits[key] = value;
+                    }
+                    return Object.keys(requiredLimits).length ? requiredLimits : undefined;
+                } catch (_) {
+                    return undefined;
+                }
+            }
+
             // The WebGPU spectral path tracer requires the NATIVE WebGPU
             // backend (backend.isWebGPUBackend). Ignore any forced-WebGL
             // preference while in pathtracing mode so PT always lands on the
@@ -259,18 +290,30 @@ function createRendererCore(deps = {}) {
                 configureRenderer(nextRenderer);
                 await initializeRenderer(nextRenderer);
             } else {
-                nextRenderer = new THREE.WebGPURenderer({ antialias: true, alpha: true, preserveDrawingBuffer: deps.shouldPreserveCanvasForCapture });
+                const requiredLimits = await resolveWebGPULimits();
+                nextRenderer = new THREE.WebGPURenderer({ antialias: true, alpha: true, preserveDrawingBuffer: deps.shouldPreserveCanvasForCapture, requiredLimits });
                 backendLabel = 'WebGPU';
                 try {
                     configureRenderer(nextRenderer);
                     await initializeRenderer(nextRenderer);
                 } catch (error) {
-                    console.warn('max.js WebGPU init failed, retrying with forced WebGL2 backend.', error);
+                    // Adapter-limit mirroring can theoretically over-ask (e.g.
+                    // adapter races between probe and init) — retry the stock
+                    // native device before surrendering to WebGL.
+                    console.warn('max.js WebGPU init failed, retrying with default limits.', error);
                     disposeRenderer(nextRenderer);
-                    nextRenderer = new THREE.WebGPURenderer({ antialias: true, alpha: true, forceWebGL: true, preserveDrawingBuffer: deps.shouldPreserveCanvasForCapture });
-                    backendLabel = 'TSL_GL';
-                    configureRenderer(nextRenderer);
-                    await initializeRenderer(nextRenderer);
+                    try {
+                        nextRenderer = new THREE.WebGPURenderer({ antialias: true, alpha: true, preserveDrawingBuffer: deps.shouldPreserveCanvasForCapture });
+                        configureRenderer(nextRenderer);
+                        await initializeRenderer(nextRenderer);
+                    } catch (error2) {
+                        console.warn('max.js WebGPU init failed, retrying with forced WebGL2 backend.', error2);
+                        disposeRenderer(nextRenderer);
+                        nextRenderer = new THREE.WebGPURenderer({ antialias: true, alpha: true, forceWebGL: true, preserveDrawingBuffer: deps.shouldPreserveCanvasForCapture });
+                        backendLabel = 'TSL_GL';
+                        configureRenderer(nextRenderer);
+                        await initializeRenderer(nextRenderer);
+                    }
                 }
             }
 

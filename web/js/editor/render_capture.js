@@ -253,10 +253,6 @@ function createRenderCapture(deps = {}) {
             } catch (error) {
                 deps.reportBridgeError('runtime error', error);
             }
-            if (deps.splatsSystem.overlay && deps.splatsSystem.count > 0) {
-                deps.updateSplatCamera();
-                deps.splatsSystem.overlay.renderer.render(deps.splatsSystem.overlay.scene, deps.splatsSystem.overlay.camera);
-            }
         }
 
         function beginRenderImageFrame(msg, responseType) {
@@ -399,11 +395,6 @@ function createRenderCapture(deps = {}) {
             deps.camera.updateProjectionMatrix();
             deps.maxjsFx.resize();
             deps.webglBasicFx.resize?.();
-            if (deps.splatsSystem.overlay?.renderer) {
-                deps.splatsSystem.overlay.renderer.setPixelRatio(1);
-                deps.splatsSystem.overlay.renderer.setSize(w, h, false);
-                deps.applyFrameElementStyle(deps.splatsSystem.overlay.renderer.domElement, captureRect);
-            }
             css3dOverlay.setSize(w, h);
             css3dOverlay.setViewportRect(captureRect);
 

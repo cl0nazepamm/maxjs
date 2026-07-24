@@ -105,7 +105,6 @@
 
     bool CopySnapshotRuntimeSeed(const std::wstring& webDir,
                                  const std::wstring& outDir,
-                                 bool copySparkDist,
                                  bool copyRapierVendor,
                                  bool copyGeospatialVendor,
                                  std::wstring& error) {
@@ -260,21 +259,6 @@
             }
         }
 
-        if (copySparkDist) {
-            const std::wstring sparkDist = webDir + L"\\node_modules\\@sparkjsdev\\spark\\dist";
-            if (!DirectoryExists(sparkDist)) {
-                error = L"Snapshot runtime dependency missing: @sparkjsdev/spark/dist";
-                return false;
-            }
-
-            if (!CopyDirectoryRecursive(
-                    sparkDist,
-                    outDir + L"\\node_modules\\@sparkjsdev\\spark\\dist")) {
-                error = L"Failed to copy snapshot runtime spark dist";
-                return false;
-            }
-        }
-
         return true;
     }
 
@@ -292,7 +276,6 @@
 
     struct SnapshotRuntimeFeatures {
         bool audio = false;
-        bool splats = false;
         bool htmlTextures = false;
         bool volumes = false;
         bool physics = false;
@@ -895,9 +878,6 @@
         if (lower.find(L"audio") != std::wstring::npos) {
             features.audio = true;
         }
-        if (lower.find(L"splat") != std::wstring::npos) {
-            features.splats = true;
-        }
         if (lower.find(L"htmltexture") != std::wstring::npos ||
             lower.find(L"html_texture") != std::wstring::npos ||
             lower.find(L"maxjshtml") != std::wstring::npos) {
@@ -940,7 +920,6 @@
         ss << L"\"runtimeFeatures\":{\"version\":1";
         ss << L",\"renderer_pref\":\"" << EscapeJson(features.rendererPref.c_str()) << L"\"";
         ss << L",\"audio\":" << (features.audio ? L"true" : L"false");
-        ss << L",\"splats\":" << (features.splats ? L"true" : L"false");
         ss << L",\"html_textures\":" << (features.htmlTextures ? L"true" : L"false");
         ss << L",\"volumes\":" << (features.volumes ? L"true" : L"false");
         ss << L",\"physics\":" << (features.physics ? L"true" : L"false");
@@ -1028,13 +1007,6 @@
                 // Always recurse into children — a hidden group node
                 // (e.g. PointHelper on a hidden layer) may have visible children.
                 ObjectState os = node->EvalWorldState(t);
-                if (os.obj && IsThreeJSSplatClassID(os.obj->ClassID())) {
-                    if (options.includeSplats && !node->IsNodeHidden(TRUE)) {
-                        runtimeFeatures.splats = true;
-                    }
-                    collect(node);
-                    continue;
-                }
                 if (os.obj && IsThreeJSAudioClassID(os.obj->ClassID())) {
                     if (options.includeAudios && !node->IsNodeHidden(TRUE)) {
                         runtimeFeatures.audio = true;
@@ -1546,10 +1518,6 @@
             ss << L",";
             WriteLightsJson(ss, ip, t, true, false, false);
         }
-        if (options.includeSplats) {
-            ss << L",";
-            WriteSplatsJson(ss, ip, t, true, false, false);
-        }
         if (options.includeAudios) {
             ss << L",";
             WriteAudiosJson(ss, ip, t, true, false, false);
@@ -1692,7 +1660,6 @@
         if (!CopySnapshotRuntimeSeed(
                 webDir,
                 outDir,
-                options.includeSplats,
                 options.includeRapierVendor,
                 options.includeGeospatialSky,
                 error)) {

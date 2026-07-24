@@ -124,7 +124,7 @@ const chute = ctx.maxScene.findOne('Emission_Guide');
 const clone = ctx.js.cloneFromMax(product, {
     at: chute.getWorldPosition(),
     align: 'visualCenter',
-    snapshotId: `vend-${product.handle}-${Date.now()}`
+    snapshotId: `vend-${product.handle}` // stable per mount — NEVER Date.now(): export-time ids must match re-run ids
 });
 ```
 

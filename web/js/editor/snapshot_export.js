@@ -8,7 +8,6 @@ function createSnapshotExport(deps = {}) {
             includeEnvironment: true,
             includeFog: true,
             includeLights: true,
-            includeSplats: true,
             includeAudios: true,
             includeInstances: true,
             includeUnusedChannels: false,
@@ -140,7 +139,6 @@ function createSnapshotExport(deps = {}) {
                             <label class="fx-check" for="snapshot-includeEnvironment"><span>Environment</span><input id="snapshot-includeEnvironment" type="checkbox"></label>
                             <label class="fx-check" for="snapshot-includeFog"><span>Fog</span><input id="snapshot-includeFog" type="checkbox"></label>
                             <label class="fx-check" for="snapshot-includeLights"><span>Lights</span><input id="snapshot-includeLights" type="checkbox"></label>
-                            <label class="fx-check" for="snapshot-includeSplats"><span>Splats</span><input id="snapshot-includeSplats" type="checkbox"></label>
                             <label class="fx-check" for="snapshot-includeAudios"><span>Audio</span><input id="snapshot-includeAudios" type="checkbox"></label>
                             <label class="fx-check" for="snapshot-includeInstances"><span>Instances</span><input id="snapshot-includeInstances" type="checkbox"></label>
                             <label class="fx-check" for="snapshot-includeUnusedChannels" title="Export stray vertex-color map channels (≥3, e.g. extra UVW sets). Off = lean export; tick only if a material reads maxjs_vc_N."><span>Unused VC Channels</span><input id="snapshot-includeUnusedChannels" type="checkbox"></label>
@@ -479,9 +477,6 @@ function createSnapshotExport(deps = {}) {
             if (settings.includeSnapshotUi) {
                 const uiState = deps.serializeSnapshotUiState({ includeDebug: settings.includeDebugPayload });
                 uiState.bake = deps.serializeSnapshotBakeState();
-                if (!settings.includeSplats && uiState.performance) {
-                    uiState.performance = { ...uiState.performance, splatsEnabled: false };
-                }
                 if (!authoredEnvironmentActive && settings.copyAssets && deps.isLocalHdriLoaded() && deps.localHdriFile instanceof Blob) {
                     try {
                         localHdriBase64 = deps.bytesToBase64(new Uint8Array(await deps.localHdriFile.arrayBuffer()));

@@ -953,7 +953,6 @@ function createSceneSync(deps = {}) {
             if (snapshot.fog) deps.maxjsFx.setFogFromScene(snapshot.fog);
             const lightsChanged = snapshot.lights ? deps.applyLights(snapshot.lights) : false;
             if (snapshot.sceneCameras) deps.updateSceneCameraList(snapshot.sceneCameras, snapshot.lockedCamera);
-            deps.reconcileSplats(snapshot.splats ?? []);
             deps.audioSystem?.applyAudios(snapshot.audios ?? []);
             deps.gltfSystem?.applyGLTFs(snapshot.gltfs ?? []);
             deps.webappSystem?.applyWebApps(snapshot.webapps ?? []);
@@ -1265,10 +1264,6 @@ function createSceneSync(deps = {}) {
             if (msg.lights) {
                 pathTraceLightsChanged = deps.applyLightUpdates(msg.lights) === true;
             }
-            if (msg.splats) {
-                deps.applySplatUpdates(msg.splats);
-                pathTraceStructuralChanged = true;
-            }
             if (msg.audios) deps.audioSystem?.applyAudioUpdates(msg.audios);
             if (msg.gltfs) {
                 deps.gltfSystem?.applyGLTFUpdates(msg.gltfs);
@@ -1528,10 +1523,6 @@ function createSceneSync(deps = {}) {
                         deps.scheduleLightProbeFromCurrentScene({ delay: 350 });
                         pathTraceLightsChanged = true;
                     }
-                },
-                onSplat(handle, matrix, visible) {
-                    if (!deps.splatsSystem.applyTrackedSplatTransform(handle, matrix, visible)) return;
-                    pathTraceStructuralChanged = true;
                 },
                 onAudio(handle, matrix, visible) {
                     deps.audioSystem?.applyAudioTransformBinary(handle, matrix, visible);

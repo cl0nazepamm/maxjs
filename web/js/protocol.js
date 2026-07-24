@@ -10,7 +10,7 @@ export const COMMAND_TYPES = Object.freeze({
     UpdateCamera: 6,
     EndFrame: 7,
     UpdateLight: 8,
-    UpdateSplat: 9,
+    // 9 retired (was UpdateSplat) — do not reuse
     UpdateAudio: 10,
     UpdateTime: 11,
     UpdateGLTF: 12,
@@ -163,17 +163,6 @@ export function applyDeltaFrame(buffer, handlers = {}) {
                     width, height, groundColor,
                     castShadow, shadowBias, shadowRadius, shadowMapSize, volContrib,
                 });
-                applyMs += performance.now() - applyStart;
-                break;
-            }
-            case COMMAND_TYPES.UpdateSplat: {
-                assertSize('UpdateSplat', commandSize, 76);
-                const handle = view.getUint32(payloadOffset, true);
-                const matrix = new Float32Array(buffer, payloadOffset + 4, 16);
-                const visible = view.getUint32(payloadOffset + 68, true) !== 0;
-                decodeMs += performance.now() - decodeStart;
-                const applyStart = performance.now();
-                handlers.onSplat?.(handle, matrix, visible);
                 applyMs += performance.now() - applyStart;
                 break;
             }

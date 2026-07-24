@@ -12,14 +12,12 @@
     size_t geoScanCursor_ = 0;
     size_t materialScanCursor_ = 0;
     size_t lightScanCursor_ = 0;
-    size_t splatScanCursor_ = 0;
     size_t jsmodScanCursor_ = 0;
     size_t pluginInstScanCursor_ = 0;
     size_t propertyScanCursor_ = 0;
     size_t deformLiveScanCursor_ = 0;
     std::unordered_set<ULONG> geomHandles_;
     std::unordered_set<ULONG> lightHandles_;
-    std::unordered_set<ULONG> splatHandles_;
     std::unordered_set<ULONG> audioHandles_;
     std::unordered_set<ULONG> gltfHandles_;
     std::unordered_set<ULONG> webappHandles_;
@@ -48,7 +46,6 @@
     std::unordered_map<ULONG, uint64_t> mtlFastScalarHashMap_; // node handle -> delta material scalar hash
     std::unordered_map<ReferenceTarget*, std::vector<ULONG>> materialEditHandleCache_; // edited material/map -> dependent node handles
     std::unordered_map<ULONG, uint64_t> lightHashMap_; // node handle → light state hash
-    std::unordered_map<ULONG, uint64_t> splatHashMap_; // node handle → splat source state hash
     std::unordered_map<ULONG, uint64_t> audioHashMap_; // node handle → audio source state hash
     std::unordered_map<ULONG, uint64_t> gltfHashMap_;  // node handle → gltf source state hash
     std::unordered_map<ULONG, uint64_t> webappHashMap_; // node handle → webapp animator state hash

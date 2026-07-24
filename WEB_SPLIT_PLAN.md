@@ -13,6 +13,8 @@ Status: IN PROGRESS (2026-07-07). Waves 0 and 1 are DONE:
   gitignored at any depth, and the contract should travel with the web/
   submodule anyway); ready handshake stamps `contractVersion: 1`.
 Wave 2 status: `webxr.js` and `splats.js` extracted and verified (2026-07-07).
+(2026-07-23: `splats.js` and the Spark/Gaussian-splat feature were removed from
+the project entirely — splat mentions below are historical.)
 RE-SCOPED after reading the code: `render_capture` is NOT self-contained — begin/
 finishRenderImageFrame write env state (envVisible, localHdriShowBg), swap
 performanceSettings, and the render loop itself drains `pendingRenderToImage`;

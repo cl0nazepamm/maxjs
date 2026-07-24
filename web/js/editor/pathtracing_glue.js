@@ -41,7 +41,6 @@ function createPathTracingGlue(deps = {}) {
             deps.spectralView = next;
             deps.isPathTracingMode = next === 'trace';
             document.body.classList.toggle('pathtracing-mode', deps.isPathTracingMode);
-            try { localStorage.setItem(deps.MAXJS_SPECTRAL_VIEW_KEY, next); } catch {}
             if (deps.isPathTracingMode) {
                 deps.pathTracingFx.start?.();
                 resetPathTracingStartupWarmup();

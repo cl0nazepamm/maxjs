@@ -938,10 +938,6 @@ function createPostFxGlue(deps = {}) {
                                 <span>Flatten Groups</span>
                                 <input id="fx-performance-flattengroups" type="checkbox" ${deps.performanceSettings.flattenGroups ? 'checked' : ''}>
                             </label>
-                            <label class="fx-check" for="fx-performance-splats">
-                                <span>Gaussian splats (Spark)</span>
-                                <input id="fx-performance-splats" type="checkbox" ${deps.performanceSettings.splatsEnabled !== false ? 'checked' : ''}>
-                            </label>
                             <label class="fx-control" for="fx-performance-instancethreshold">
                                 <div class="fx-control-head">
                                     <span>Instance Bucket Threshold</span>
@@ -950,7 +946,7 @@ function createPostFxGlue(deps = {}) {
                                 <input class="fx-range" id="fx-performance-instancethreshold" type="range" min="2" max="500" step="1" value="${deps.performanceSettings.maxInstanceBucketThreshold}">
                             </label>
                         </div>
-                        <div class="fx-note" id="fx-performance-note">Caps viewer frame rate and scales renderer/post-FX resolution to reduce GPU load. Splats off skips Spark. Headset sessions stay uncapped.</div>
+                        <div class="fx-note" id="fx-performance-note">Caps viewer frame rate and scales renderer/post-FX resolution to reduce GPU load. Headset sessions stay uncapped.</div>
                     </section>
                     <section class="fx-section collapsed" data-keep-on-shader-lab>
                         <div class="fx-section-header">
@@ -1305,7 +1301,6 @@ function createPostFxGlue(deps = {}) {
             const postFxScaleValue = document.getElementById('fx-performance-postfxscale-val');
             const optimizeInstancesCheck = document.getElementById('fx-performance-optimizeinstances');
             const flattenGroupsCheck = document.getElementById('fx-performance-flattengroups');
-            const splatsEnabledCheck = document.getElementById('fx-performance-splats');
             const instanceThresholdSlider = document.getElementById('fx-performance-instancethreshold');
             const instanceThresholdValue = document.getElementById('fx-performance-instancethreshold-val');
             fpsCapSelect.onchange = (e) => {
@@ -1368,22 +1363,6 @@ function createPostFxGlue(deps = {}) {
                     syncPostFxPanel(true);
                     // Merging needs a fresh full snapshot to (re)plan clusters.
                     if (deps.performanceSettings.flattenGroups) deps.bridge.send('scene_dirty');
-                };
-            }
-            if (splatsEnabledCheck) {
-                splatsEnabledCheck.onchange = () => {
-                    deps.performanceSettings.splatsEnabled = splatsEnabledCheck.checked;
-                    if (!deps.performanceSettings.splatsEnabled) {
-                        deps.splatsSystem.resetMutationQueue();
-                        void deps.shutdownSplatViewer().then(() => {
-                            savePostFxState();
-                            syncPostFxPanel(true);
-                        });
-                    } else {
-                        savePostFxState();
-                        syncPostFxPanel(true);
-                        deps.bridge.send('scene_dirty');
-                    }
                 };
             }
             instanceThresholdSlider.oninput = (e) => {
@@ -1906,7 +1885,6 @@ function createPostFxGlue(deps = {}) {
             const postFxScaleValue = document.getElementById('fx-performance-postfxscale-val');
             const optimizeInstancesCheck = document.getElementById('fx-performance-optimizeinstances');
             const flattenGroupsCheck = document.getElementById('fx-performance-flattengroups');
-            const splatsEnabledCheck = document.getElementById('fx-performance-splats');
             const instanceThresholdSlider = document.getElementById('fx-performance-instancethreshold');
             const instanceThresholdValue = document.getElementById('fx-performance-instancethreshold-val');
             const performanceNote = document.getElementById('fx-performance-note');
@@ -1954,12 +1932,11 @@ function createPostFxGlue(deps = {}) {
             if (postFxScaleValue) postFxScaleValue.textContent = `${deps.getEffectivePostFxResolutionScale().toFixed(2)}x`;
             if (canSyncInput(optimizeInstancesCheck)) optimizeInstancesCheck.checked = !!deps.performanceSettings.optimizeMaxInstances;
             if (canSyncInput(flattenGroupsCheck)) flattenGroupsCheck.checked = !!deps.performanceSettings.flattenGroups;
-            if (canSyncInput(splatsEnabledCheck)) splatsEnabledCheck.checked = deps.performanceSettings.splatsEnabled !== false;
             if (canSyncInput(instanceThresholdSlider)) instanceThresholdSlider.value = String(deps.performanceSettings.maxInstanceBucketThreshold);
             if (instanceThresholdValue) instanceThresholdValue.textContent = String(deps.performanceSettings.maxInstanceBucketThreshold);
             if (performanceNote) {
                 performanceNote.textContent =
-                    `Caps the viewer frame rate and scales device pixel ratio/post-FX targets to reduce GPU load. Effective DPR ${deps.getEffectivePixelRatio().toFixed(2)}. Post FX ${deps.getEffectivePostFxResolutionScale().toFixed(2)}x. Splats off skips Spark. Large plain Max instance groups can collapse into InstancedMesh buckets. Headset sessions stay uncapped.`;
+                    `Caps the viewer frame rate and scales device pixel ratio/post-FX targets to reduce GPU load. Effective DPR ${deps.getEffectivePixelRatio().toFixed(2)}. Post FX ${deps.getEffectivePostFxResolutionScale().toFixed(2)}x. Large plain Max instance groups can collapse into InstancedMesh buckets. Headset sessions stay uncapped.`;
             }
 
             const cameraNearInput = document.getElementById('fx-camera-near');
@@ -2222,13 +2199,6 @@ function createPostFxGlue(deps = {}) {
                     }
                     if (Number.isFinite(saved.performance.maxInstanceBucketThreshold)) {
                         deps.performanceSettings.maxInstanceBucketThreshold = Math.max(2, Math.round(saved.performance.maxInstanceBucketThreshold));
-                    }
-                    if (typeof saved.performance.splatsEnabled === 'boolean') {
-                        deps.performanceSettings.splatsEnabled = saved.performance.splatsEnabled;
-                        if (!deps.performanceSettings.splatsEnabled) {
-                            deps.splatsSystem.resetMutationQueue();
-                            void deps.shutdownSplatViewer();
-                        }
                     }
                     deps.applyRendererPerformanceSettings({ resizePostFx: true });
                 }

@@ -786,7 +786,7 @@
 
         std::unordered_set<ULONG> seen;
         seen.reserve(
-            geomHandles_.size() + lightHandles_.size() + splatHandles_.size() +
+            geomHandles_.size() + lightHandles_.size() +
             audioHandles_.size() + gltfHandles_.size() + webappHandles_.size() +
             hairHandles_.size() + helperHandles_.size());
         auto appendUnique = [&](const std::unordered_set<ULONG>& source) {
@@ -797,7 +797,6 @@
         appendUnique(helperHandles_);
         appendUnique(geomHandles_);
         appendUnique(lightHandles_);
-        appendUnique(splatHandles_);
         appendUnique(audioHandles_);
         appendUnique(gltfHandles_);
         appendUnique(webappHandles_);
@@ -871,7 +870,6 @@
     static constexpr ULONGLONG kFullSyncTransportRetryBackoffMs = 500;
     static constexpr size_t kMaxIdleMaterialHandlesPerTick = 16;
     static constexpr size_t kMaxIdleLightHandlesPerTick = 64;
-    static constexpr size_t kMaxIdleSplatHandlesPerTick = 64;
     static constexpr size_t kMaxIdleJsModHandlesPerTick = 64;
     static constexpr size_t kMaxIdlePluginInstanceHandlesPerTick = 16;
     static constexpr size_t kMaxIdlePropertyHandlesPerTick = 64;
@@ -1986,11 +1984,6 @@
                                 SetDirty();
                             }
                         }
-                    } else if (splatHandles_.find(handle) != splatHandles_.end()) {
-                        if (transformChanged || visibilityChanged) {
-                            playbackSnapshotFrame_.UpdateSplat(
-                                static_cast<std::uint32_t>(handle), xform, visible);
-                        }
                     } else if (audioHandles_.find(handle) != audioHandles_.end()) {
                         if (transformChanged || visibilityChanged) {
                             playbackSnapshotFrame_.UpdateAudio(
@@ -2332,7 +2325,6 @@
         mtlScalarHashMap_.clear();
         mtlFastScalarHashMap_.clear();
         lightHashMap_.clear();
-        splatHashMap_.clear();
         audioHashMap_.clear();
         gltfHashMap_.clear();
         webappHashMap_.clear();
@@ -2367,7 +2359,6 @@
 
         ObjectState os = node->EvalWorldState(t);
         if (!os.obj) return false;
-        if (IsThreeJSSplatClassID(os.obj->ClassID())) return true;
         if (IsThreeJSAudioClassID(os.obj->ClassID())) return true;
         if (IsThreeJSGLTFClassID(os.obj->ClassID())) return true;
         if (IsThreeJSWebAppClassID(os.obj->ClassID())) return true;
@@ -2667,109 +2658,6 @@
         if (changed) MarkInteractiveActivity();
     }
 
-    void MarkTrackedLightTransformsDirty() {
-        if (lightHandles_.empty()) return;
-
-        Interface* ip = GetCOREInterface();
-        if (!ip) return;
-
-        TimeValue t = ip->GetTime();
-        bool changed = false;
-
-        for (ULONG handle : lightHandles_) {
-            INode* node = ip->GetINodeByHandle(handle);
-            if (!node) continue;
-
-            float currentWorld[16];
-            if (HasTransformChangedForSync(handle, node, t, currentWorld)) {
-                if (fastDirtyHandles_.insert(handle).second) changed = true;
-            } else {
-                RememberSkippedParentedTransform(handle, node, currentWorld);
-            }
-        }
-
-        if (changed) QueueFastFlush();
-        if (changed) MarkInteractiveActivity();
-    }
-
-    void MarkTrackedSplatTransformsDirty() {
-        if (splatHandles_.empty()) return;
-
-        Interface* ip = GetCOREInterface();
-        if (!ip) return;
-
-        TimeValue t = ip->GetTime();
-        bool changed = false;
-
-        for (ULONG handle : splatHandles_) {
-            INode* node = ip->GetINodeByHandle(handle);
-            if (!node) continue;
-
-            float xform[16];
-            GetTransform16(node, t, xform);
-
-            auto it = lastSentTransforms_.find(handle);
-            if (it == lastSentTransforms_.end() || !TransformEquals16(xform, it->second.data())) {
-                if (fastDirtyHandles_.insert(handle).second) changed = true;
-            }
-        }
-
-        if (changed) QueueFastFlush();
-        if (changed) MarkInteractiveActivity();
-    }
-
-    void MarkTrackedAudioTransformsDirty() {
-        if (audioHandles_.empty()) return;
-
-        Interface* ip = GetCOREInterface();
-        if (!ip) return;
-
-        TimeValue t = ip->GetTime();
-        bool changed = false;
-
-        for (ULONG handle : audioHandles_) {
-            INode* node = ip->GetINodeByHandle(handle);
-            if (!node) continue;
-
-            float xform[16];
-            GetTransform16(node, t, xform);
-
-            auto it = lastSentTransforms_.find(handle);
-            if (it == lastSentTransforms_.end() || !TransformEquals16(xform, it->second.data())) {
-                if (fastDirtyHandles_.insert(handle).second) changed = true;
-            }
-        }
-
-        if (changed) QueueFastFlush();
-        if (changed) MarkInteractiveActivity();
-    }
-
-    void MarkTrackedGLTFTransformsDirty() {
-        if (gltfHandles_.empty()) return;
-
-        Interface* ip = GetCOREInterface();
-        if (!ip) return;
-
-        TimeValue t = ip->GetTime();
-        bool changed = false;
-
-        for (ULONG handle : gltfHandles_) {
-            INode* node = ip->GetINodeByHandle(handle);
-            if (!node) continue;
-
-            float xform[16];
-            GetTransform16(node, t, xform);
-
-            auto it = lastSentTransforms_.find(handle);
-            if (it == lastSentTransforms_.end() || !TransformEquals16(xform, it->second.data())) {
-                if (fastDirtyHandles_.insert(handle).second) changed = true;
-            }
-        }
-
-        if (changed) QueueFastFlush();
-        if (changed) MarkInteractiveActivity();
-    }
-
     void MarkVisibilityNodesDirty(const NodeEventNamespace::NodeKeyTab& nodes) {
         Interface* ip = GetCOREInterface();
         const TimeValue t = ip ? ip->GetTime() : 0;
@@ -2811,7 +2699,6 @@
         if (!HasTrackedNodes()) return;
         fastDirtyHandles_.insert(geomHandles_.begin(), geomHandles_.end());
         fastDirtyHandles_.insert(lightHandles_.begin(), lightHandles_.end());
-        fastDirtyHandles_.insert(splatHandles_.begin(), splatHandles_.end());
         fastDirtyHandles_.insert(audioHandles_.begin(), audioHandles_.end());
         fastDirtyHandles_.insert(gltfHandles_.begin(), gltfHandles_.end());
         fastDirtyHandles_.insert(webappHandles_.begin(), webappHandles_.end());
@@ -3232,7 +3119,6 @@
             ExtractJsonBool(msg, L"includeEnvironment", options.includeEnvironment);
             ExtractJsonBool(msg, L"includeFog", options.includeFog);
             ExtractJsonBool(msg, L"includeLights", options.includeLights);
-            ExtractJsonBool(msg, L"includeSplats", options.includeSplats);
             ExtractJsonBool(msg, L"includeAudios", options.includeAudios);
             ExtractJsonBool(msg, L"includeGLTFs", options.includeGLTFs);
             ExtractJsonBool(msg, L"includeInstances", options.includeInstances);
@@ -3450,7 +3336,6 @@
             mtlFastScalarHashMap_.clear();
             ClearMaterialEditHandleCache();
             lightHashMap_.clear();
-            splatHashMap_.clear();
             propHashMap_.clear();
             geoHashMap_.clear();  // force all geometry to be sent
             geoFastTriangleCountMap_.clear();
@@ -3460,7 +3345,6 @@
             lastSentTransforms_.clear();
             lastSentPlaybackAux_.clear();
             lightHandles_.clear();
-            splatHandles_.clear();
             audioHandles_.clear();
             gltfHandles_.clear();
             webappHandles_.clear();
@@ -3634,7 +3518,6 @@
             if (allowHeavyPolling && allowIdlePolling && lightPhase == 0) DetectPropertyChanges();
             if (allowTimelineAuxPolling && allowRealtimeAuxPolling && lightPhase == 1) {
                 DetectLightChanges();
-                DetectSplatChanges();
             }
             // Audio is cheap (few nodes, 7 params each) — poll every tick
             // and ignore the interactive gate so spinner drags propagate live.
@@ -4304,7 +4187,6 @@
         if (selectionRescanDirty) {
             selectionDirty.insert(geomHandles_.begin(), geomHandles_.end());
             selectionDirty.insert(lightHandles_.begin(), lightHandles_.end());
-            selectionDirty.insert(splatHandles_.begin(), splatHandles_.end());
             selectionDirty.insert(audioHandles_.begin(), audioHandles_.end());
             selectionDirty.insert(gltfHandles_.begin(), gltfHandles_.end());
             selectionDirty.insert(hairHandles_.begin(), hairHandles_.end());
@@ -4427,7 +4309,6 @@
                 mtlScalarHashMap_.erase(handle);
                 mtlFastScalarHashMap_.erase(handle);
                 lightHashMap_.erase(handle);
-                splatHashMap_.erase(handle);
                 audioHashMap_.erase(handle);
                 gltfHashMap_.erase(handle);
                 webappHashMap_.erase(handle);
@@ -4436,7 +4317,6 @@
                 EraseFastDeformState(handle);
                 geomHandles_.erase(handle);
                 lightHandles_.erase(handle);
-                splatHandles_.erase(handle);
                 audioHandles_.erase(handle);
                 gltfHandles_.erase(handle);
                 webappHandles_.erase(handle);
@@ -4462,7 +4342,7 @@
             GetTransform16(node, t, xform);
             const bool visible = IsMaxJsSyncDrawVisible(node);
 
-            // Use specialized commands for lights/splats/audios
+            // Use specialized commands for lights/audios
             if (lightHandles_.find(handle) != lightHandles_.end()) {
                 maxjs::sync::DeltaFrameBuilder::LightData ld = {};
                 ld.matrix16 = xform;
@@ -4476,12 +4356,6 @@
                 } else {
                     SetDirty();
                 }
-                continue;
-            }
-            if (splatHandles_.find(handle) != splatHandles_.end()) {
-                frame.UpdateSplat(static_cast<std::uint32_t>(handle), xform, visible);
-                stageTransform(handle, xform);
-                stagedVisibility.emplace_back(handle, visible);
                 continue;
             }
             if (audioHandles_.find(handle) != audioHandles_.end()) {
@@ -5126,27 +5000,6 @@
         return HashFNV1a(payload.data(), payload.size() * sizeof(wchar_t));
     }
 
-    uint64_t ComputeSplatStateHash(INode* node, TimeValue t) {
-        if (!node) return 0;
-
-        ObjectState os = node->EvalWorldState(t);
-        if (!os.obj || !IsThreeJSSplatClassID(os.obj->ClassID())) {
-            const std::wstring payload = L"null";
-            return HashFNV1a(payload.data(), payload.size() * sizeof(wchar_t));
-        }
-
-        IParamBlock2* pb = os.obj->GetParamBlockByID(threejs_splat_params);
-        const MCHAR* rawPath = pb ? pb->GetStr(ps_splat_file) : nullptr;
-        std::wstring mappedPath = rawPath ? MapTexturePath(rawPath) : std::wstring{};
-
-        std::wostringstream ss;
-        ss.imbue(std::locale::classic());
-        ss << L"{\"v\":" << (IsMaxJsSyncDrawVisible(node) ? L'1' : L'0');
-        ss << L",\"url\":\"" << EscapeJson(mappedPath.c_str()) << L"\"}";
-        const std::wstring payload = ss.str();
-        return HashFNV1a(payload.data(), payload.size() * sizeof(wchar_t));
-    }
-
     uint64_t ComputeAudioStateHash(INode* node, TimeValue t) {
         if (!node) return 0;
 
@@ -5383,33 +5236,6 @@
             auto it = lightHashMap_.find(handle);
             if (it == lightHashMap_.end()) {
                 lightHashMap_[handle] = hash;
-            } else if (it->second != hash) {
-                it->second = hash;
-                if (fastDirtyHandles_.insert(handle).second) changed = true;
-            }
-        });
-
-        if (changed) QueueFastFlush();
-    }
-
-    void DetectSplatChanges() {
-        Interface* ip = GetCOREInterface();
-        if (!ip || splatHandles_.empty()) return;
-
-        TimeValue t = ip->GetTime();
-        bool changed = false;
-        std::vector<ULONG> handles;
-        handles.reserve(splatHandles_.size());
-        for (ULONG handle : splatHandles_) handles.push_back(handle);
-
-        VisitBudgetedHandles(handles, splatScanCursor_, kMaxIdleSplatHandlesPerTick, [&](ULONG handle) {
-            INode* node = ip->GetINodeByHandle(handle);
-            if (!node) return;
-
-            const uint64_t hash = ComputeSplatStateHash(node, t);
-            auto it = splatHashMap_.find(handle);
-            if (it == splatHashMap_.end()) {
-                splatHashMap_[handle] = hash;
             } else if (it->second != hash) {
                 it->second = hash;
                 if (fastDirtyHandles_.insert(handle).second) changed = true;
@@ -6374,58 +6200,6 @@
         return true;
     }
 
-    bool WriteSplatJson(std::wostringstream& ss, INode* node, TimeValue t,
-                        bool includeHandle = false, bool includeVisibility = false,
-                        bool trackHandle = false) {
-        if (!node) return false;
-
-        ObjectState os = node->EvalWorldState(t);
-        if (!os.obj || !IsThreeJSSplatClassID(os.obj->ClassID())) return false;
-
-        IParamBlock2* pb = os.obj->GetParamBlockByID(threejs_splat_params);
-        if (!pb) return false;
-
-        const MCHAR* rawPath = pb->GetStr(ps_splat_file);
-        std::wstring url = rawPath ? MapTexturePath(rawPath) : std::wstring{};
-
-        const ULONG handle = node->GetHandle();
-        float xform[16];
-        GetTransform16(node, t, xform);
-        if (trackHandle) {
-            splatHandles_.insert(handle);
-            RememberSentTransform(handle, xform);
-        }
-
-        ss << L'{';
-        bool needsComma = false;
-        auto appendComma = [&]() {
-            if (needsComma) ss << L',';
-            needsComma = true;
-        };
-
-        if (includeHandle) {
-            appendComma();
-            ss << L"\"h\":" << handle;
-        }
-
-        appendComma();
-        ss << L"\"n\":\"" << EscapeJson(node->GetName()) << L'"';
-
-        if (includeVisibility) {
-            appendComma();
-            ss << L"\"v\":" << (IsMaxJsSyncDrawVisible(node) ? L'1' : L'0');
-        }
-
-        appendComma();
-        ss << L"\"t\":";
-        WriteFloats(ss, xform, 16);
-
-        appendComma();
-        ss << L"\"url\":\"" << EscapeJson(url.c_str()) << L"\"";
-        ss << L'}';
-        return true;
-    }
-
     bool WriteAudioJson(std::wostringstream& ss, INode* node, TimeValue t,
                         bool includeHandle = false, bool includeVisibility = false,
                         bool trackHandle = false) {
@@ -6711,38 +6485,6 @@
                 }
             };
             collectLights(root);
-        }
-        ss << L']';
-    }
-
-    void WriteSplatsJson(std::wostringstream& ss, Interface* ip, TimeValue t,
-                         bool includeHandle = false, bool includeVisibility = false,
-                         bool trackHandles = false) {
-        ss << L"\"splats\":[";
-        bool firstSplat = true;
-        INode* root = ip ? ip->GetRootNode() : nullptr;
-        if (root) {
-            std::function<void(INode*)> collectSplats = [&](INode* parent) {
-                for (int i = 0; i < parent->NumberOfChildren(); i++) {
-                    INode* node = parent->GetChildNode(i);
-                    if (!node) continue;
-                    if (node->IsNodeHidden(TRUE) && !includeVisibility) {
-                        collectSplats(node);
-                        continue;
-                    }
-
-                    std::wostringstream splatJson;
-                    splatJson.imbue(std::locale::classic());
-                    if (WriteSplatJson(splatJson, node, t, includeHandle, includeVisibility, trackHandles)) {
-                        if (!firstSplat) ss << L',';
-                        ss << splatJson.str();
-                        firstSplat = false;
-                    }
-
-                    collectSplats(node);
-                }
-            };
-            collectSplats(root);
         }
         ss << L']';
     }

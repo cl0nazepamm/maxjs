@@ -79,7 +79,7 @@ assert.match(deltaSend, /visited\s*<\s*kMaxTimelineSnapshotHandlesPerPass/,
 assert.match(deltaSend, /GetTickCount64\s*\(\s*\)\s*-\s*passStart[\s\S]*kTimelineSampleBudgetMs/,
     'each playback sampling turn also has a wall-clock budget');
 for (const setName of [
-    'helperHandles_', 'geomHandles_', 'lightHandles_', 'splatHandles_',
+    'helperHandles_', 'geomHandles_', 'lightHandles_',
     'audioHandles_', 'gltfHandles_', 'webappHandles_', 'hairHandles_',
 ]) {
     assert.doesNotMatch(deltaSend, new RegExp(`for\\s*\\([^)]*:\\s*${setName}`),

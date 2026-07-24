@@ -139,7 +139,6 @@
         geomHandles_.clear();
         skinnedHandles_.clear();
         lightHandles_.clear();
-        splatHandles_.clear();
         audioHandles_.clear();
         gltfHandles_.clear();
         webappHandles_.clear();
@@ -156,7 +155,6 @@
         mtlFastScalarHashMap_.clear();
         ClearMaterialEditHandleCache();
         lightHashMap_.clear();
-        splatHashMap_.clear();
         audioHashMap_.clear();
         gltfHashMap_.clear();
         webappHashMap_.clear();

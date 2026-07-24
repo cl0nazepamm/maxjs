@@ -208,10 +208,6 @@ function createRenderLoop(deps = {}) {
             } else if (deps.blobOverlayCtx) {
                 deps.blobOverlayCtx.clearRect(0, 0, deps.blobOverlayCvs.width, deps.blobOverlayCvs.height);
             }
-            if (deps.splatsSystem.overlay && deps.splatsSystem.count > 0) {
-                deps.updateSplatCamera();
-                deps.splatsSystem.overlay.renderer.render(deps.splatsSystem.overlay.scene, deps.splatsSystem.overlay.camera);
-            }
             if (deps.renderToImageActive && deps.pendingRenderToImage) {
                 const nowMs = performance.now();
                 const syncReady = deps.latestAppliedSyncSerial > deps.pendingRenderToImage.observedSyncSerial;

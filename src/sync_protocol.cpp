@@ -125,15 +125,6 @@ void DeltaFrameBuilder::UpdateLight(std::uint32_t handle, const LightData& d) {
     AppendF32(d.volContrib);
 }
 
-void DeltaFrameBuilder::UpdateSplat(std::uint32_t handle, const float* matrix16, bool visible) {
-    BeginCommand(CommandType::UpdateSplat, SplatLayout::size);
-    AppendU32(handle);
-    for (int i = 0; i < 16; ++i) {
-        AppendF32(matrix16[i]);
-    }
-    AppendU32(visible ? 1u : 0u);
-}
-
 void DeltaFrameBuilder::UpdateAudio(std::uint32_t handle, const float* matrix16, bool visible) {
     BeginCommand(CommandType::UpdateAudio, AudioLayout::size);
     AppendU32(handle);

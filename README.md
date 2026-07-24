@@ -31,7 +31,7 @@ It does not export the advanced post processing stack yet. But it is coming soon
 
 **Three.js Materials:** All three.js materials and nodes will be registered to Material Editor including TSL, Toon, HTML and other ones.
 
-**Three.js Objects:** In create menu you can find max.js objects like "Audio Origin" or "Splat Origin (spark)"
+**Three.js Objects:** In create menu you can find max.js objects like "Audio Origin"
 
 **ActiveShade:** Assign the **three.js** renderer in settings and start ActiveShade to embed the same WebView2 viewport in the Max viewport. This is a hack so expect it to go off view sometimes. Use the kill macroscript or restart via CTRL+SHIFT+R
 
@@ -52,7 +52,6 @@ max.js exposes three stable viewer pipelines:
 
 - Meshes, splines, and generated geometry with vertex color, normals and UV channels.
 - Automatic instancing, includes Forest Pack and RailClone generated output.
-- Gaussian splats through [Spark](https://github.com/sparkjsdev/spark).
 - HTML loading as a texture or scene object. You can load webpages to viewer. (uses in-canvas API)
 
 ### Materials
@@ -133,7 +132,7 @@ Exported snapshot folders can include:
 - `postfx.maxjs.json` for saved look state.
 - `vendor/` runtime dependencies.
 
-Snapshot export preserves scene hierarchy, transforms, materials, textures, lights, shadows, camera state, environment, sky, fog, animation, splats, runtime layers, and selected viewer UI state. PostFX coming later.
+Snapshot export preserves scene hierarchy, transforms, materials, textures, lights, shadows, camera state, environment, sky, fog, animation, runtime layers, and selected viewer UI state. PostFX coming later.
 
 max.js treats runtime files as plugin-owned and `index.html` as project-owned. Re-exporting should refresh the runtime and scene payload without destroying standalone edits.
 
@@ -204,7 +203,6 @@ maxjs_web/
 
 - [three.js](https://threejs.org/)
 - [WebView2](https://developer.microsoft.com/en-us/microsoft-edge/webview2/)
-- [Spark](https://github.com/sparkjsdev/spark)
 - [Shader Lab](https://github.com/basementstudio/shader-lab)
 - [Rapier](https://rapier.rs/)
 

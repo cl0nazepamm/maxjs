@@ -18,7 +18,7 @@ enum class CommandType : std::uint16_t {
     UpdateCamera = 6,
     EndFrame = 7,
     UpdateLight = 8,
-    UpdateSplat = 9,
+    // 9 retired (was UpdateSplat) — do not reuse, old snapshots may carry it
     UpdateAudio = 10,
     UpdateTime = 11,
     UpdateGLTF = 12,
@@ -74,10 +74,9 @@ using LightLayout          = Layout<Wire::U32, Wire::Mat16, Wire::BoolU32, Wire:
                                     Wire::Vec3, Wire::F32, Wire::F32, Wire::F32, Wire::F32,
                                     Wire::F32, Wire::F32, Wire::F32, Wire::Vec3, Wire::BoolU32,
                                     Wire::F32, Wire::F32, Wire::U32, Wire::F32>;
-using SplatLayout          = Layout<Wire::U32, Wire::Mat16, Wire::BoolU32>;
-using AudioLayout          = SplatLayout;
-using GLTFLayout           = SplatLayout;
-using WebAppLayout         = SplatLayout;
+using AudioLayout          = Layout<Wire::U32, Wire::Mat16, Wire::BoolU32>;
+using GLTFLayout           = AudioLayout;
+using WebAppLayout         = AudioLayout;
 using TimeLayout           = Layout<Wire::U32, Wire::U32, Wire::U8,
                                     Wire::PadU8, Wire::PadU8, Wire::PadU8>;
 using EndFrameLayout       = Layout<>;
@@ -92,7 +91,7 @@ static_assert(SelectionLayout::size == 8);
 static_assert(VisibilityLayout::size == 8);
 static_assert(CameraLayout::size == 64);
 static_assert(LightLayout::size == 148);
-static_assert(SplatLayout::size == 72);
+static_assert(AudioLayout::size == 72);
 static_assert(TimeLayout::size == 12);
 static_assert(EndFrameLayout::size == 0);
 
@@ -134,7 +133,6 @@ public:
         float volContrib;
     };
     void UpdateLight(std::uint32_t handle, const LightData& data);
-    void UpdateSplat(std::uint32_t handle, const float* matrix16, bool visible);
     void UpdateAudio(std::uint32_t handle, const float* matrix16, bool visible);
     void UpdateGLTF(std::uint32_t handle, const float* matrix16, bool visible);
     void UpdateWebApp(std::uint32_t handle, const float* matrix16, bool visible);

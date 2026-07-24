@@ -45,7 +45,7 @@
 //               8 runtimeScene (warns),
 //               TSL / MaterialX / VRay / OpenPBR / Toon material types
 //               (degrade to MeshStandardMaterial), instance buckets,
-//               vertex colors, fog, splats/gltf.
+//               vertex colors, fog, gltf.
 //
 // What WORKS today: snapshots with Max-authored meshes render with PBR
 // materials — color, roughness, metalness, opacity, emissive, plus the
@@ -56,7 +56,7 @@
 //
 // What's MISSING (visible regressions vs. live mode): TSL / MaterialX /
 // VRay / OpenPBR materials (degrade to MeshStandardMaterial), post-FX,
-// splats, instance bucket merging, vertex colors.
+// instance bucket merging, vertex colors.
 
 import * as THREE from 'three';
 
@@ -120,7 +120,6 @@ function detectFeaturesLegacy(meta) {
         renderer_pref: 'webgl',
         post_fx: ['ssgi'], // index.html wires MaxJS FX today
         audio: true,
-        splats: true,
         html_textures: true,
         volumes: true,
         physics: true,
@@ -148,7 +147,6 @@ function normalizeRuntimeFeatures(meta) {
         post_fx: arrayOrEmpty(raw.post_fx),
         three_addons: arrayOrEmpty(raw.three_addons),
         audio: !!raw.audio,
-        splats: !!raw.splats,
         html_textures: !!(raw.html_textures ?? raw.htmlTextures),
         volumes: !!raw.volumes,
         physics: !!raw.physics,
@@ -414,14 +412,13 @@ function buildLayerManager({
 // imports.
 async function registerOptionalModules(features, ctx) {
     const wanted = [];
-    if (features.splats)           wanted.push('splats');
     if (features.html_textures)    wanted.push('html_textures');
     if (features.volumes)          wanted.push('volumes');
     if (features.physics)          wanted.push('physics');
     if (wanted.length) {
         noteExtractionDeferred(
             'registerOptionalModules',
-            'index.html — MaxJS FX / audio / splat / html_texture / volume init',
+            'index.html — MaxJS FX / audio / html_texture / volume init',
             `(scene declares: ${wanted.join(', ')})`,
         );
     }

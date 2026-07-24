@@ -20,7 +20,6 @@
         geomHandles_.clear();
         skinnedHandles_.clear();
         lightHandles_.clear();
-        splatHandles_.clear();
         audioHandles_.clear();
         gltfHandles_.clear();
         webappHandles_.clear();
@@ -65,8 +64,6 @@
         WriteFogJson(ss, fogData);
         ss << L",";
         WriteLightsJson(ss, ip, t, true, false, true);
-        ss << L",";
-        WriteSplatsJson(ss, ip, t, true, false, true);
         ss << L",";
         WriteAudiosJson(ss, ip, t, true, false, true);
         ss << L",";
@@ -186,7 +183,7 @@
             INode* node = parent->GetChildNode(i);
             if (!node) continue;
             ObjectState os = node->EvalWorldState(t);
-            if (os.obj && (IsThreeJSSplatClassID(os.obj->ClassID()) || IsThreeJSAudioClassID(os.obj->ClassID()) || IsThreeJSGLTFClassID(os.obj->ClassID()) || IsThreeJSWebAppClassID(os.obj->ClassID()))) {
+            if (os.obj && (IsThreeJSAudioClassID(os.obj->ClassID()) || IsThreeJSGLTFClassID(os.obj->ClassID()) || IsThreeJSWebAppClassID(os.obj->ClassID()))) {
                 WriteSceneNodes(node, t, ss, first, prevGeom, materialLibrary);
                 continue;
             }
@@ -460,7 +457,6 @@
         geomHandles_.clear();
         skinnedHandles_.clear();
         lightHandles_.clear();
-        splatHandles_.clear();
         audioHandles_.clear();
         gltfHandles_.clear();
         webappHandles_.clear();
@@ -537,7 +533,7 @@
                 INode* node = parent->GetChildNode(i);
                 if (!node) continue;
                 ObjectState os = node->EvalWorldState(t);
-                if (os.obj && (IsThreeJSSplatClassID(os.obj->ClassID()) || IsThreeJSAudioClassID(os.obj->ClassID()) || IsThreeJSGLTFClassID(os.obj->ClassID()) || IsThreeJSWebAppClassID(os.obj->ClassID()))) {
+                if (os.obj && (IsThreeJSAudioClassID(os.obj->ClassID()) || IsThreeJSGLTFClassID(os.obj->ClassID()) || IsThreeJSWebAppClassID(os.obj->ClassID()))) {
                     collect(node);
                     continue;
                 }
@@ -758,10 +754,6 @@
             if (lightHandles_.find(it->first) == lightHandles_.end()) it = lightHashMap_.erase(it);
             else ++it;
         }
-        for (auto it = splatHashMap_.begin(); it != splatHashMap_.end(); ) {
-            if (splatHandles_.find(it->first) == splatHandles_.end()) it = splatHashMap_.erase(it);
-            else ++it;
-        }
         for (auto it = audioHashMap_.begin(); it != audioHashMap_.end(); ) {
             if (audioHandles_.find(it->first) == audioHandles_.end()) it = audioHashMap_.erase(it);
             else ++it;
@@ -930,8 +922,6 @@
         ss << L",";
         WriteLightsJson(ss, ip, t, true, false, true);
         ss << L",";
-        WriteSplatsJson(ss, ip, t, true, false, true);
-        ss << L",";
         WriteAudiosJson(ss, ip, t, true, false, true);
         ss << L",";
         WriteGLTFsJson(ss, ip, t, true, false, true);
@@ -1082,7 +1072,6 @@
                 mtlScalarHashMap_.erase(handle);
                 mtlFastScalarHashMap_.erase(handle);
                 lightHashMap_.erase(handle);
-                splatHashMap_.erase(handle);
                 audioHashMap_.erase(handle);
                 gltfHashMap_.erase(handle);
                 geoHashMap_.erase(handle);
@@ -1143,8 +1132,6 @@
         WriteCameraJson(ss);
         ss << L",";
         WriteLightsJson(ss, ip, t, true, true, true);
-        ss << L",";
-        WriteSplatsJson(ss, ip, t, true, true, true);
         ss << L",";
         WriteAudiosJson(ss, ip, t, true, true, true);
         ss << L",";

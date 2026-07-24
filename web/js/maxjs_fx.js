@@ -1209,6 +1209,8 @@ export function createMaxJSFxController({
             assignFinite(state.powershot, 'filmHalationRadius', options.filmHalationRadius);
             assignFinite(state.powershot, 'filmPrintExposure', options.filmPrintExposure);
             assignFinite(state.powershot, 'filmPrintWarmth', options.filmPrintWarmth);
+            assignFinite(state.powershot, 'filmHighlightBurn', options.filmHighlightBurn);
+            assignFinite(state.powershot, 'filmHueRestore', options.filmHueRestore);
             assignFinite(state.powershot, 'filmWeave', options.filmWeave);
             assignFinite(state.powershot, 'filmFlicker', options.filmFlicker);
             if (typeof options.filmNegative === 'boolean') state.powershot.filmNegative = options.filmNegative;

@@ -21,7 +21,6 @@
 #include "maxjs_material_sync.h"
 #include "threejs_audio.h"
 #include "threejs_lights.h"
-#include "threejs_splat.h"
 #include "threejs_fog.h"
 #include "threejs_sky.h"
 #include "threejs_deform.h"
@@ -223,7 +222,6 @@ static bool ExtractEvaluatedMeshForSnapshot(INode* node,
     const bool allowMapChannel1 = ShouldAllowVertexColorMapChannel1(node);
     ObjectState os = node->EvalWorldState(t);
     if (!os.obj || os.obj->SuperClassID() != GEOMOBJECT_CLASS_ID) return false;
-    if (IsThreeJSSplatClassID(os.obj->ClassID())) return false;
 
     if (os.obj->IsSubClassOf(polyObjectClassID)) {
         PolyObject* poly = static_cast<PolyObject*>(os.obj);

@@ -102,6 +102,40 @@
         fastDeformGuardMap_.erase(handle);
     }
 
+    // Deform replay has a stable payload size per topology epoch — reuse a
+    // persistent double-buffered SharedBuffer instead of paying a new file
+    // mapping every frame. Two slots alternate so the renderer can still be
+    // reading the previous post while this one is filled.
+    //
+    // Shared by the fused position gather (which maps the slot BEFORE
+    // extraction so the gather writes straight into it) and the ordinary copy
+    // path, so both agree on slot rotation and capacity growth.
+    bool AcquireFastDeformSharedBuffer(ULONG handle,
+                                       size_t totalBytes,
+                                       ICoreWebView2Environment12* env12,
+                                       ComPtr<ICoreWebView2SharedBuffer>& outBuf,
+                                       BYTE*& outPtr) {
+        outBuf.Reset();
+        outPtr = nullptr;
+        if (!env12 || totalBytes == 0) return false;
+
+        FastDeformSharedBufferPool& pool = fastDeformSharedBuffers_[handle];
+        FastDeformSharedBufferSlot& slot = pool.slots[pool.next & 1];
+        pool.next ^= 1;
+        if (!slot.buf || slot.capacity < totalBytes) {
+            if (slot.buf) slot.buf->Close();
+            slot.buf.Reset();
+            slot.capacity = 0;
+            if (FAILED(env12->CreateSharedBuffer(totalBytes, &slot.buf)) || !slot.buf) return false;
+            slot.capacity = totalBytes;
+        }
+        BYTE* ptr = nullptr;
+        if (FAILED(slot.buf->get_Buffer(&ptr)) || !ptr) return false;
+        outBuf = slot.buf;
+        outPtr = ptr;
+        return true;
+    }
+
     void CloseFastDeformSharedBuffers(ULONG handle) {
         auto it = fastDeformSharedBuffers_.find(handle);
         if (it == fastDeformSharedBuffers_.end()) return;
@@ -3992,6 +4026,12 @@
             // need the full ExtractMesh path so UV/topology changes are not
             // silently dropped.
             bool usedSkinnedFastPositions = false;
+            // Set when the position gather wrote straight into the mapped
+            // SharedBuffer slot. `verts` stays empty in that case, so the post
+            // path below must take its count from fusedVertFloats.
+            ComPtr<ICoreWebView2SharedBuffer> fusedBuf;
+            BYTE* fusedPtr = nullptr;
+            size_t fusedVertFloats = 0;
             const FastSparseState* sparsePayload = nullptr;
             // Never build/apply the CPU normal plan in the interactive
             // position-only lane. Oversized compact meshes may still stream
@@ -4012,9 +4052,43 @@
                     // settle cooldown instead of on Play/Scrub's critical path.
                     auto sourceIt = skinnedFastSourceCache_.find(handle);
                     if (sourceIt != skinnedFastSourceCache_.end()) {
-                        usedSkinnedFastPositions = ExtractSkinnedFastGeometry(
-                            node, t, sourceIt->second, guardIt->second,
-                            verts, streamLiveNormals ? &norms : nullptr);
+                        // Fused lane: position-only replay is the playback hot
+                        // path, its payload size is known before extraction
+                        // (sources × 3 floats, no indices/UVs/normals), and it
+                        // goes straight to the viewer untouched. Map the slot
+                        // first and gather into it — that removes the vector
+                        // fill plus the StreamCopyBytes over the same bytes,
+                        // two full passes per mesh per frame on Max's thread.
+                        //
+                        // Any lane that still needs normals, or that inspects
+                        // the positions afterwards, keeps the vector path.
+                        if (!streamLiveNormals) {
+                            const size_t fusedFloats = sourceIt->second.size() * 3;
+                            ComPtr<ICoreWebView2SharedBuffer> candidateBuf;
+                            BYTE* candidatePtr = nullptr;
+                            if (fusedFloats > 0 &&
+                                AcquireFastDeformSharedBuffer(
+                                    handle, fusedFloats * 4, env12.Get(),
+                                    candidateBuf, candidatePtr)) {
+                                usedSkinnedFastPositions = ExtractSkinnedFastGeometry(
+                                    node, t, sourceIt->second, guardIt->second,
+                                    FastPositionSink::ToBuffer(
+                                        reinterpret_cast<float*>(candidatePtr), fusedFloats),
+                                    nullptr);
+                                if (usedSkinnedFastPositions) {
+                                    // A failed gather may have written part of
+                                    // the slot; only a success publishes it.
+                                    fusedBuf = candidateBuf;
+                                    fusedPtr = candidatePtr;
+                                    fusedVertFloats = fusedFloats;
+                                }
+                            }
+                        }
+                        if (!usedSkinnedFastPositions) {
+                            usedSkinnedFastPositions = ExtractSkinnedFastGeometry(
+                                node, t, sourceIt->second, guardIt->second,
+                                verts, streamLiveNormals ? &norms : nullptr);
+                        }
                         if (usedSkinnedFastPositions &&
                             forceLiveNormalRefresh &&
                             (norms.empty() || norms.size() != verts.size())) {
@@ -4024,6 +4098,9 @@
                             usedSkinnedFastPositions = false;
                             verts.clear();
                             norms.clear();
+                            fusedBuf.Reset();
+                            fusedPtr = nullptr;
+                            fusedVertFloats = 0;
                         }
                     }
                     if (!usedSkinnedFastPositions && !forceLiveNormalRefresh) {
@@ -4129,9 +4206,13 @@
                     ? sparsePayload->renderNorms : norms;
             const bool requiresCpuNormalRefresh =
                 isDeforming && !isSpline && !gpuNormalsLive_;
+            // The fused gather leaves `verts` empty by design, so every size
+            // question below has to go through this and never payloadVerts.
+            const size_t payloadVertFloats =
+                fusedVertFloats ? fusedVertFloats : payloadVerts.size();
             const bool liveNormalsExtracted =
                 !payloadNormals.empty() &&
-                payloadNormals.size() == payloadVerts.size();
+                payloadNormals.size() == payloadVertFloats;
 
             // Arm before shared-buffer allocation/post. A transport failure
             // must not strand geometry after lastLiveGeomHash_ has advanced.
@@ -4146,7 +4227,7 @@
                 // buffers; every other path streams the locally extracted data.
                 const std::vector<float>& vertsBin = payloadVerts;
                 const std::vector<float>& normsBin = payloadNormals;
-                size_t totalBytes = vertsBin.size() * 4;
+                size_t totalBytes = payloadVertFloats * 4;
                 if (usedSkinnedFastPositions) {
                     totalBytes += normsBin.size() * 4;
                 } else {
@@ -4158,31 +4239,30 @@
                 if (totalBytes < 4) totalBytes = 4;
 
                 ComPtr<ICoreWebView2SharedBuffer> buf;
-                if (usedSkinnedFastPositions) {
-                    // Deform replay has a stable payload size per topology
-                    // epoch — reuse a persistent double-buffered SharedBuffer
-                    // instead of paying a new file mapping every frame. Two
-                    // slots alternate so the renderer can still be reading the
-                    // previous post while this one is filled.
-                    FastDeformSharedBufferPool& pool = fastDeformSharedBuffers_[handle];
-                    FastDeformSharedBufferSlot& slot = pool.slots[pool.next & 1];
-                    pool.next ^= 1;
-                    if (!slot.buf || slot.capacity < totalBytes) {
-                        if (slot.buf) slot.buf->Close();
-                        slot.buf.Reset();
-                        slot.capacity = 0;
-                        if (FAILED(env12->CreateSharedBuffer(totalBytes, &slot.buf)) || !slot.buf) continue;
-                        slot.capacity = totalBytes;
+                BYTE* ptr = nullptr;
+                if (fusedVertFloats) {
+                    // Already filled in place by the gather, and sized exactly
+                    // for it — no allocation, no copy, nothing left to write.
+                    buf = fusedBuf;
+                    ptr = fusedPtr;
+                } else if (usedSkinnedFastPositions) {
+                    if (!AcquireFastDeformSharedBuffer(handle, totalBytes, env12.Get(), buf, ptr)) {
+                        continue;
                     }
-                    buf = slot.buf;
                 } else if (FAILED(env12->CreateSharedBuffer(totalBytes, &buf)) || !buf) {
                     continue;
                 }
 
-                BYTE* ptr = nullptr;
-                buf->get_Buffer(&ptr);
+                if (!ptr && buf) buf->get_Buffer(&ptr);
+                if (!ptr) continue;
                 size_t off = 0;
-                StreamCopyBytes(ptr + off, vertsBin.data(), vertsBin.size() * 4); size_t vOff = off; off += vertsBin.size() * 4;
+                size_t vOff = off;
+                if (fusedVertFloats) {
+                    off += fusedVertFloats * 4;
+                } else {
+                    StreamCopyBytes(ptr + off, vertsBin.data(), vertsBin.size() * 4);
+                    off += vertsBin.size() * 4;
+                }
                 size_t iOff = 0;
                 size_t uvOff = 0;
                 size_t nOff = 0;
@@ -4210,7 +4290,7 @@
                 ss << L",\"jsmod\":" << (jmFast.found ? L"true" : L"false");
                 if (omitFastChannels) ss << L",\"compactChannels\":true";
                 if (isSpline) ss << L",\"spline\":true";
-                ss << L",\"vOff\":" << vOff << L",\"vN\":" << vertsBin.size();
+                ss << L",\"vOff\":" << vOff << L",\"vN\":" << payloadVertFloats;
                 if (usedSkinnedFastPositions) {
                     if (!normsBin.empty()) ss << L",\"nOff\":" << nOff << L",\"nN\":" << normsBin.size();
                     ss << L",\"skipBounds\":true";

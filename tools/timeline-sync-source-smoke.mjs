@@ -305,8 +305,20 @@ assert.match(geometrySend, /norms\.empty\s*\(\s*\)\s*\|\|\s*norms\.size\s*\(\s*\
     'an incomplete fast-normal extraction falls through to exact extraction');
 assert.match(geometrySend, /!usedSkinnedFastPositions\s*&&\s*!forceLiveNormalRefresh[\s\S]*ExtractSkinnedFastPositions/,
     'forced settle cannot fall back to a position-only replay');
-assert.match(geometrySend, /liveNormalsExtracted\s*=\s*!payloadNormals\.empty\s*\(\s*\)\s*&&\s*payloadNormals\.size\s*\(\s*\)\s*==\s*payloadVerts\.size\s*\(\s*\)/,
+assert.match(geometrySend, /liveNormalsExtracted\s*=\s*!payloadNormals\.empty\s*\(\s*\)\s*&&\s*payloadNormals\.size\s*\(\s*\)\s*==\s*payloadVertFloats/,
     'normal completion requires one nonempty normal per render vertex');
+// The fused gather writes positions straight into the mapped SharedBuffer and
+// leaves `verts` empty, so payloadVerts.size() is no longer the payload count.
+// Pin the fallback: without fusion it must still be exactly that vector's size,
+// or every size question in the post path silently reads zero.
+assert.match(geometrySend, /payloadVertFloats\s*=\s*fusedVertFloats\s*\?\s*fusedVertFloats\s*:\s*payloadVerts\.size\s*\(\s*\)/,
+    'payload vertex count falls back to the extracted vector when not fused');
+assert.match(geometrySend, /\\"vN\\":"\s*<<\s*payloadVertFloats/,
+    'the wire vertex count is the authoritative payload count');
+// A failed gather can leave a partially written slot; only a success may
+// publish it, otherwise the viewer receives torn positions.
+assert.match(geometrySend, /if\s*\(\s*usedSkinnedFastPositions\s*\)\s*\{[\s\S]{0,400}?fusedBuf\s*=\s*candidateBuf/,
+    'the fused slot is only published after a successful gather');
 assert.ok(
     geometrySend.indexOf('RecordDeformNormalPost(') < geometrySend.indexOf('CreateSharedBuffer('),
     'normal debt is armed before transport allocation can fail',

@@ -2892,17 +2892,59 @@ static void ApplyFastNormalPlan(Mesh& mesh,
     });
 }
 
+// Destination for a fast-deform position gather.
+//
+// The position-only playback lane used to gather into a std::vector and then
+// StreamCopyBytes the same bytes into the mapped SharedBuffer — two full
+// passes over the payload on Max's UI thread, per mesh, per frame. Handing the
+// gather the mapped pointer directly collapses that to one.
+//
+// Vector mode is retained for every caller that inspects or reuses the
+// positions after extraction (hashing, sparse replay, spline fallback), so
+// only the lane that posts straight to the viewer changes behaviour.
+struct FastPositionSink {
+    float* dst = nullptr;
+    size_t capacityFloats = 0;
+    std::vector<float>* owned = nullptr;
+
+    FastPositionSink() = default;
+    // Implicit by design: every pre-existing caller passes a vector and keeps
+    // working with no edit, so the fused lane is the only changed behaviour.
+    FastPositionSink(std::vector<float>& v) : owned(&v) {}
+
+    static FastPositionSink ToBuffer(float* buffer, size_t floats) {
+        FastPositionSink sink;
+        sink.dst = buffer;
+        sink.capacityFloats = floats;
+        return sink;
+    }
+
+    void Reset() {
+        if (owned) owned->clear();
+    }
+    // Null means the destination cannot hold this gather — the caller must
+    // treat that as extraction failure rather than writing a partial payload.
+    float* Prepare(size_t floats) {
+        if (owned) {
+            owned->resize(floats);
+            return owned->data();
+        }
+        if (!dst || floats > capacityFloats) return nullptr;
+        return dst;
+    }
+};
+
 static bool ExtractMNMeshFastGeometry(MNMesh& mn,
                                       const std::vector<FastVertexSource>& sources,
                                       FastDeformGuard& guard,
-                                      std::vector<float>& outVerts,
+                                      FastPositionSink outVerts,
                                       std::vector<float>* outNormals) {
-    outVerts.clear();
+    outVerts.Reset();
     if (outNormals) outNormals->clear();
     if (sources.empty() || !FastDeformEpochMatches(mn, guard.epoch)) return false;
 
-    outVerts.resize(sources.size() * 3);
-    float* dst = outVerts.data();
+    float* dst = outVerts.Prepare(sources.size() * 3);
+    if (!dst) return false;
     const FastVertexSource* src = sources.data();
     ParallelGatherBlocks(sources.size(), [&](size_t beg, size_t end) {
         for (size_t i = beg; i < end; ++i) {
@@ -2922,14 +2964,14 @@ static bool ExtractMNMeshFastGeometry(MNMesh& mn,
 static bool ExtractMeshFastGeometry(Mesh& mesh,
                                     const std::vector<FastVertexSource>& sources,
                                     FastDeformGuard& guard,
-                                    std::vector<float>& outVerts,
+                                    FastPositionSink outVerts,
                                     std::vector<float>* outNormals) {
-    outVerts.clear();
+    outVerts.Reset();
     if (outNormals) outNormals->clear();
     if (sources.empty() || !FastDeformEpochMatches(mesh, guard.epoch)) return false;
 
-    outVerts.resize(sources.size() * 3);
-    float* dst = outVerts.data();
+    float* dst = outVerts.Prepare(sources.size() * 3);
+    if (!dst) return false;
     const FastVertexSource* src = sources.data();
     ParallelGatherBlocks(sources.size(), [&](size_t beg, size_t end) {
         for (size_t i = beg; i < end; ++i) {
@@ -3259,7 +3301,7 @@ static bool ExtractSkinnedFastGeometry(INode* node,
                                        TimeValue t,
                                        const std::vector<FastVertexSource>& sources,
                                        FastDeformGuard& guard,
-                                       std::vector<float>& outVerts,
+                                       FastPositionSink outVerts,
                                        std::vector<float>* outNormals) {
     if (!node || sources.empty() || !guard.epoch.valid) return false;
 

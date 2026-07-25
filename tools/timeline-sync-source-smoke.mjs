@@ -76,8 +76,21 @@ assert.doesNotMatch(retryLaterBranch.slice(0, retryLaterBranch.indexOf('playback
 const deltaSend = functionBody(syncSource, 'PlaybackSyncResult SendPlaybackDeltaAtTime(TimeValue t, bool playing)');
 assert.match(deltaSend, /visited\s*<\s*kMaxTimelineSnapshotHandlesPerPass/,
     'each playback sampling turn has a hard handle cap');
-assert.match(deltaSend, /GetTickCount64\s*\(\s*\)\s*-\s*passStart[\s\S]*kTimelineSampleBudgetMs/,
+assert.match(deltaSend, /TimelineBudgetExpired\s*\(\s*passStart\s*\)/,
     'each playback sampling turn also has a wall-clock budget');
+// The budget constant now lives inside the shared helper, so pin the
+// guarantee there: it must be measured on QPC, not GetTickCount64. That
+// clock's granularity is the system timer tick (15.6ms by default), which
+// cannot resolve a 4ms budget — a turn measured with it runs until the tick
+// rolls over and the "bounded" sweep is not bounded at all.
+const budgetHelper = functionBody(syncSource, 'static bool TimelineBudgetExpired(double passStartMs)');
+assert.match(budgetHelper, /QpcNowMs\s*\(\s*\)\s*-\s*passStartMs[\s\S]*kTimelineSampleBudgetMs/,
+    'the shared timeline budget is measured against the high-resolution clock');
+const qpcHelper = functionBody(syncSource, 'static double QpcNowMs()');
+assert.match(qpcHelper, /QueryPerformanceCounter/,
+    'QpcNowMs is backed by QueryPerformanceCounter');
+assert.doesNotMatch(qpcHelper, /GetTickCount64/,
+    'QpcNowMs must not fall back to the coarse tick clock');
 for (const setName of [
     'helperHandles_', 'geomHandles_', 'lightHandles_',
     'audioHandles_', 'gltfHandles_', 'webappHandles_', 'hairHandles_',
@@ -230,7 +243,7 @@ assert.match(deformScan, /timelineDeformScanCursor_\+\+/,
     'timeline deformation owns a persistent fair cursor');
 assert.match(deformScan, /visited\s*<\s*kMaxDeformingGeometryHandlesPerTick/,
     'deformation pre-scan has a hard per-turn handle cap');
-assert.match(deformScan, /kTimelineSampleBudgetMs/,
+assert.match(deformScan, /TimelineBudgetExpired\s*\(\s*passStart\s*\)/,
     'deformation pre-scan shares the UI-thread time budget');
 assert.match(deformScan, /timelineDeformScanCursor_\s*<\s*timelineDeformHandles_\.size\s*\(\s*\)[\s\S]*pendingTimelineDeformScan_\s*=\s*true/,
     'an incomplete deformation sweep re-arms its pending request');

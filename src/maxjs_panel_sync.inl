@@ -140,6 +140,49 @@
         geometryFastFlushNotBeforeTick_ = 0;
     }
 
+    // Monotonic high-resolution clock. GetTickCount64's granularity is the
+    // system timer tick — 15.6ms unless something in the process has called
+    // timeBeginPeriod — so it cannot resolve the few-millisecond budgets the
+    // timeline lanes are written against. Measuring those with it means a
+    // "4ms" slice actually runs until the tick rolls over, which is the
+    // opposite of the bounded turn the code intends.
+    static double QpcNowMs() {
+        static const double kTickMs = [] {
+            LARGE_INTEGER f;
+            if (!QueryPerformanceFrequency(&f) || f.QuadPart == 0) return 0.0;
+            return 1000.0 / static_cast<double>(f.QuadPart);
+        }();
+        if (kTickMs == 0.0) return 0.0;
+        LARGE_INTEGER now;
+        if (!QueryPerformanceCounter(&now)) return 0.0;
+        return static_cast<double>(now.QuadPart) * kTickMs;
+    }
+
+    // Shared expiry check for the bounded UI-thread sweeps. The transport copy
+    // lane below already measured its budget this way; the sampling lanes were
+    // still on GetTickCount64 and so were not actually bounded at 4ms.
+    static bool TimelineBudgetExpired(double passStartMs) {
+        return (QpcNowMs() - passStartMs) >=
+               static_cast<double>(kTimelineSampleBudgetMs);
+    }
+
+    void SendFlowStatsIfDue() {
+        if (!flowMode_ || !webview_) return;
+        const ULONGLONG now = GetTickCount64();
+        if (lastFlowStatsTick_ != 0 && (now - lastFlowStatsTick_) < kFlowStatsIntervalMs) return;
+        lastFlowStatsTick_ = now;
+
+        std::wostringstream ss;
+        ss.imbue(std::locale::classic());
+        ss << L"{\"type\":\"flow_stats\""
+           << L",\"queued\":" << geoFastDirtyHandles_.size()
+           << L",\"swept\":" << playbackSnapshotHandles_.size()
+           << L",\"deform\":" << timelineDeformHandles_.size()
+           << L",\"parked\":" << flowStaticAuditHandles_.size()
+           << L",\"promoted\":" << flowForceAnimatedHandles_.size() << L"}";
+        webview_->PostWebMessageAsJson(ss.str().c_str());
+    }
+
     void EraseFastDeformState(ULONG handle) {
         EraseFastDeformReplayState(handle);
         CloseFastDeformSharedBuffers(handle);
@@ -473,15 +516,14 @@
             changed = true;
         };
 
-        const ULONGLONG passStart = GetTickCount64();
+        const double passStart = QpcNowMs();
         if (forceForCurrentTime) {
             size_t visited = 0;
             while (timelineDeformScanCursor_ < timelineDeformHandles_.size() &&
                    visited < kMaxDeformingGeometryHandlesPerTick) {
                 pollHandle(timelineDeformHandles_[timelineDeformScanCursor_++]);
                 ++visited;
-                if (visited > 0 &&
-                    (GetTickCount64() - passStart) >= kTimelineSampleBudgetMs) {
+                if (visited > 0 && TimelineBudgetExpired(passStart)) {
                     break;
                 }
             }
@@ -506,7 +548,7 @@
                 deformLiveScanCursor_ = (index + 1) % count;
                 pollHandle(timelineDeformHandles_[index]);
                 ++visited;
-                if ((GetTickCount64() - passStart) >= kTimelineSampleBudgetMs) break;
+                if (TimelineBudgetExpired(passStart)) break;
             }
         }
         if (changed) QueueFastFlush();
@@ -780,18 +822,182 @@
         return ready;
     }
 
+    // ── FLOW: animation gating ───────────────────────────────────────
+    // The playback sweeps walk every tracked node and every modifier-stack
+    // node on each tick, evaluating them purely to discover that almost none
+    // moved. On a heavy scene that discovery IS the cost, and it scales with
+    // scene size rather than with how much is animated.
+    //
+    // Classification is by validity interval, not by keyframe inspection:
+    // FOREVER means the value cannot vary with time, and it accounts for
+    // expression controllers, wiring and constraints that IsAnimated() misses.
+    //
+    // Every uncertain case resolves to "animated". A false animated costs the
+    // pre-FLOW sweep for that handle; a false static freezes an object.
+    bool NodeTransformIsStatic(INode* node, TimeValue t) const {
+        if (!node) return false;
+        if (flowForceAnimatedHandles_.find(node->GetHandle()) !=
+            flowForceAnimatedHandles_.end()) return false;
+        // An animated visibility track varies over time without touching the
+        // TM at all, and the playback sampler is what delivers it.
+        if (node->GetVisController()) return false;
+        Interval valid = FOREVER;
+        node->GetNodeTM(t, &valid);
+        if (valid != FOREVER) return false;
+        // GetNodeTM is a world TM and should already fold in the parent
+        // chain; walking it explicitly costs nothing at epoch rate and does
+        // not depend on every controller propagating validity correctly.
+        for (INode* parent = node->GetParentNode();
+             parent && !parent->IsRootNode();
+             parent = parent->GetParentNode()) {
+            Interval parentValid = FOREVER;
+            parent->GetNodeTM(t, &parentValid);
+            if (parentValid != FOREVER) return false;
+        }
+        return true;
+    }
+
+    bool NodeGeometryIsStatic(INode* node, TimeValue t, ULONG handle) const {
+        if (!node) return false;
+        if (flowForceAnimatedHandles_.find(handle) !=
+            flowForceAnimatedHandles_.end()) return false;
+        // Skinned meshes are never gated out. Their deformation comes from
+        // bone node TMs rather than from animated parameters on the stack, so
+        // the object's own validity interval is not something to bet a frozen
+        // character on. The skinned set is small — characters, not scenery —
+        // so keeping it always-live costs almost nothing and removes the
+        // failure mode entirely.
+        if (skinnedHandles_.find(handle) != skinnedHandles_.end()) return false;
+        ObjectState os = node->EvalWorldState(t);
+        if (!os.obj) return false;
+        return os.obj->ObjectValidity(t) == FOREVER;
+    }
+
+    // Cheap "did this actually move" probe for a parked handle: world TM
+    // folded together with the sampled-position hash the deform lane already
+    // uses. Same evidence the pre-FLOW sweep collected, just at audit rate
+    // instead of every tick.
+    std::uint64_t ComputeFlowAuditSignature(INode* node, TimeValue t, ULONG handle) {
+        std::uint64_t sig = 1469598103934665603ull;
+        auto mix = [&sig](std::uint64_t v) {
+            sig ^= v;
+            sig *= 1099511628211ull;
+        };
+        float xform[16];
+        GetTransform16(node, t, xform);
+        for (int i = 0; i < 16; ++i) {
+            std::uint32_t bits = 0;
+            std::memcpy(&bits, &xform[i], sizeof(bits));
+            mix(bits);
+        }
+        mix(IsMaxJsSyncDrawVisible(node) ? 0x9E3779B97F4A7C15ull : 0x517CC1B727220A95ull);
+        // Lights are not parked any more, but the audit must still be able to
+        // see non-transform state change or it silently certifies as static
+        // anything whose animation does not move the node.
+        if (lightHandles_.find(handle) != lightHandles_.end()) {
+            mix(ComputeLightStateHash(node, t));
+        }
+        if (deformHandles_.find(handle) != deformHandles_.end()) {
+            std::uint64_t geomHash = 0;
+            if (TryHashAdaptiveDeformPositions(node, t, geomHash)) mix(geomHash);
+        }
+        return sig;
+    }
+
+    void RunFlowStaticAudit() {
+        if (!flowMode_ || flowStaticAuditHandles_.empty()) return;
+        Interface* ip = GetCOREInterface();
+        if (!ip) return;
+        const TimeValue t = ip->GetTime();
+
+        const double auditStartMs = QpcNowMs();
+        std::vector<ULONG> promoted;
+        size_t visited = 0;
+        while (visited < flowStaticAuditHandles_.size()) {
+            const size_t index = flowStaticAuditCursor_ % flowStaticAuditHandles_.size();
+            flowStaticAuditCursor_ = index + 1;
+            const ULONG handle = flowStaticAuditHandles_[index];
+            ++visited;
+
+            INode* node = ip->GetINodeByHandle(handle);
+            if (!node) {
+                promoted.push_back(handle);  // dropped below with the rest
+            } else {
+                const std::uint64_t sig = ComputeFlowAuditSignature(node, t, handle);
+                auto it = flowStaticAuditSignature_.find(handle);
+                if (it == flowStaticAuditSignature_.end()) {
+                    flowStaticAuditSignature_.emplace(handle, sig);
+                } else if (it->second != sig) {
+                    // Claimed static, moved anyway. Trust the observation over
+                    // the interval, permanently for this session.
+                    flowForceAnimatedHandles_.insert(handle);
+                    promoted.push_back(handle);
+                }
+            }
+
+            if ((QpcNowMs() - auditStartMs) >= kFlowAuditBudgetMs) break;
+        }
+
+        if (promoted.empty()) return;
+        for (ULONG handle : promoted) {
+            flowStaticAuditSignature_.erase(handle);
+            auto it = std::find(flowStaticAuditHandles_.begin(),
+                                flowStaticAuditHandles_.end(), handle);
+            if (it != flowStaticAuditHandles_.end()) flowStaticAuditHandles_.erase(it);
+            if (!ip->GetINodeByHandle(handle)) continue;
+            if (std::find(playbackSnapshotHandles_.begin(), playbackSnapshotHandles_.end(),
+                          handle) == playbackSnapshotHandles_.end()) {
+                playbackSnapshotHandles_.push_back(handle);
+            }
+            if (deformHandles_.find(handle) != deformHandles_.end() &&
+                !std::binary_search(timelineDeformHandles_.begin(),
+                                    timelineDeformHandles_.end(), handle)) {
+                timelineDeformHandles_.push_back(handle);
+                std::sort(timelineDeformHandles_.begin(), timelineDeformHandles_.end());
+            }
+            // Deliver the state it missed while parked.
+            fastDirtyHandles_.insert(handle);
+            geoFastDirtyHandles_.insert(handle);
+        }
+        flowStaticAuditCursor_ = 0;
+        QueueFastFlush();
+    }
+
     void RebuildTimelineHandleCaches() {
         playbackSnapshotHandles_.clear();
         timelineDeformHandles_.clear();
+        flowStaticAuditHandles_.clear();
+        flowStaticAuditCursor_ = 0;
 
         std::unordered_set<ULONG> seen;
         seen.reserve(
             geomHandles_.size() + lightHandles_.size() +
             audioHandles_.size() + gltfHandles_.size() + webappHandles_.size() +
             hairHandles_.size() + helperHandles_.size());
+        Interface* gateIp = flowMode_ ? GetCOREInterface() : nullptr;
+        const TimeValue gateTime = gateIp ? gateIp->GetTime() : 0;
         auto appendUnique = [&](const std::unordered_set<ULONG>& source) {
             for (ULONG handle : source) {
-                if (seen.insert(handle).second) playbackSnapshotHandles_.push_back(handle);
+                if (!seen.insert(handle).second) continue;
+                // Lights are never parked. The playback sampler carries light
+                // STATE — intensity, colour, cone, shadow params — and none of
+                // that touches the transform, so a stationary light with an
+                // animated multiplier looks static to a TM validity test while
+                // its contribution changes every frame. Same reasoning as
+                // skinned meshes: the set is small and always-live costs
+                // nothing next to freezing scene lighting.
+                const bool neverPark = lightHandles_.find(handle) != lightHandles_.end();
+                if (gateIp && !neverPark) {
+                    INode* node = gateIp->GetINodeByHandle(handle);
+                    if (node && NodeTransformIsStatic(node, gateTime)) {
+                        // Parked, not dropped: the audit below re-checks it,
+                        // and every event callback can still mark it dirty
+                        // through the normal fast path.
+                        flowStaticAuditHandles_.push_back(handle);
+                        continue;
+                    }
+                }
+                playbackSnapshotHandles_.push_back(handle);
             }
         };
         appendUnique(helperHandles_);
@@ -815,14 +1021,41 @@
         EnsurePlaybackSharedBuffers(playbackSnapshotCapacity);
 
         timelineDeformHandles_.reserve(skinnedHandles_.size() + deformHandles_.size());
+        // Skinned handles go in unconditionally — see NodeGeometryIsStatic.
         timelineDeformHandles_.insert(
             timelineDeformHandles_.end(), skinnedHandles_.begin(), skinnedHandles_.end());
         for (ULONG handle : deformHandles_) {
-            if (skinnedHandles_.find(handle) == skinnedHandles_.end()) {
-                timelineDeformHandles_.push_back(handle);
+            if (skinnedHandles_.find(handle) != skinnedHandles_.end()) continue;
+            if (gateIp) {
+                INode* node = gateIp->GetINodeByHandle(handle);
+                // deformHandles_ is "has a modifier stack", not "deforms over
+                // time" — a static UVW-Map or Edit Poly mesh lands here and
+                // then pays EvalWorldState plus a position hash every tick.
+                if (node && NodeGeometryIsStatic(node, gateTime, handle)) {
+                    flowStaticAuditHandles_.push_back(handle);
+                    continue;
+                }
             }
+            timelineDeformHandles_.push_back(handle);
         }
         std::sort(timelineDeformHandles_.begin(), timelineDeformHandles_.end());
+        // Deduplicate: a node can be parked by both sweeps above.
+        std::sort(flowStaticAuditHandles_.begin(), flowStaticAuditHandles_.end());
+        flowStaticAuditHandles_.erase(
+            std::unique(flowStaticAuditHandles_.begin(), flowStaticAuditHandles_.end()),
+            flowStaticAuditHandles_.end());
+        // Audit deform candidates first. ObjectValidity is FOREVER for a
+        // modifier driven by another node's transform — Path Deform, an
+        // animated FFD lattice, a Bend gizmo, Skin Wrap — because nothing on
+        // the stack itself is keyed. Those are precisely the handles the gate
+        // mis-parks, and a frozen deforming mesh reads as broken where a
+        // frozen prop reads as scenery. Verifying them before the static bulk
+        // shrinks the visible window from "whole parked set" to "deform subset".
+        std::stable_partition(
+            flowStaticAuditHandles_.begin(), flowStaticAuditHandles_.end(),
+            [this](ULONG handle) {
+                return deformHandles_.find(handle) != deformHandles_.end();
+            });
 
         timelineTransformScanActive_ = false;
         timelineTransformScanCursor_ = 0;
@@ -868,6 +1101,12 @@
     static constexpr size_t kTimelineTransportCopyQuantumBytes = 16 * 1024;
     static constexpr ULONGLONG kTransportRetryBackoffMs = 100;
     static constexpr ULONGLONG kFullSyncTransportRetryBackoffMs = 500;
+    // ── FLOW mode tuning ──
+    static constexpr ULONGLONG kFlowStatsIntervalMs = 500;
+    // Fixed per-tick cost for re-checking parked handles, independent of scene
+    // size. Large scenes take longer to sweep, they do not cost more per tick.
+    static constexpr double kFlowAuditBudgetMs = 1.0;
+
     static constexpr size_t kMaxIdleMaterialHandlesPerTick = 16;
     static constexpr size_t kMaxIdleLightHandlesPerTick = 64;
     static constexpr size_t kMaxIdleJsModHandlesPerTick = 64;
@@ -1901,7 +2140,7 @@
         }
 
         if (!playbackSnapshotFinalized_) {
-            const ULONGLONG passStart = GetTickCount64();
+            const double passStart = QpcNowMs();
             size_t visited = 0;
             if (!playbackSnapshotTransformStageReady_) {
                 // A prior successful swap leaves the old acknowledged cache in
@@ -1918,14 +2157,14 @@
                         playbackSnapshotAux_.erase(playbackSnapshotAux_.begin());
                     }
                     ++visited;
-                    if ((GetTickCount64() - passStart) >= kTimelineSampleBudgetMs) break;
+                    if (TimelineBudgetExpired(passStart)) break;
                 }
                 if (!playbackSnapshotTransforms_.empty() ||
                     !playbackSnapshotAux_.empty()) {
                     return PlaybackSyncResult::NeedsSlice;
                 }
                 playbackSnapshotTransformStageReady_ = true;
-                if ((GetTickCount64() - passStart) >= kTimelineSampleBudgetMs) {
+                if (TimelineBudgetExpired(passStart)) {
                     return PlaybackSyncResult::NeedsSlice;
                 }
                 visited = 0;
@@ -2022,7 +2261,7 @@
                     playbackSnapshotAux_[handle] = currentAux;
                 }
 
-                if ((GetTickCount64() - passStart) >= kTimelineSampleBudgetMs) break;
+                if (TimelineBudgetExpired(passStart)) break;
             }
 
             if (playbackSnapshotCursor_ < playbackSnapshotHandles_.size()) {
@@ -2741,13 +2980,13 @@
 
         // JSON/debug fallback only.  Keep even this compatibility lane bounded
         // so a timer/posted turn can never evaluate the complete scene.
-        const ULONGLONG passStart = GetTickCount64();
+        const double passStart = QpcNowMs();
         size_t visited = 0;
         while (timelineTransformScanCursor_ < playbackSnapshotHandles_.size() &&
                visited < kMaxTimelineSnapshotHandlesPerPass) {
             markIfTransformChanged(playbackSnapshotHandles_[timelineTransformScanCursor_++]);
             ++visited;
-            if ((GetTickCount64() - passStart) >= kTimelineSampleBudgetMs) break;
+            if (TimelineBudgetExpired(passStart)) break;
         }
 
         if (timelineTransformScanCursor_ < playbackSnapshotHandles_.size()) {
@@ -2860,19 +3099,52 @@
 
     void SendLiveSyncSettings() {
         if (!webview_) return;
+        const wchar_t* modeName =
+            syncMode_ == SyncMode::SlowJson ? L"slow-json" :
+            syncMode_ == SyncMode::Flow     ? L"flow" :
+                                              L"live-fast";
         std::wostringstream ss;
+        // `disabled` stays on the wire verbatim: it is the pre-FLOW contract
+        // and a viewer that predates FLOW still reads it correctly.
         ss << L"{\"type\":\"live_sync_settings\",\"disabled\":"
            << (slowJsonSyncMode_ ? L"true" : L"false")
-           << L",\"mode\":\"" << (slowJsonSyncMode_ ? L"slow-json" : L"live-fast") << L"\"}";
+           << L",\"mode\":\"" << modeName << L"\"}";
         webview_->PostWebMessageAsJson(ss.str().c_str());
     }
 
-    void SetSlowJsonSyncMode(bool enabled) {
-        if (slowJsonSyncMode_ == enabled) {
+    void SetSyncMode(SyncMode mode) {
+        if (syncMode_ == mode) {
+            SendLiveSyncSettings();
+            return;
+        }
+        syncMode_ = mode;
+        flowMode_ = (mode == SyncMode::Flow);
+        lastFlowStatsTick_ = 0;
+        // Leaving FLOW must restore the ungated sweeps immediately, and
+        // entering it must classify against the current scene rather than a
+        // stale epoch — both need the handle caches rebuilt.
+        flowStaticAuditHandles_.clear();
+        flowStaticAuditSignature_.clear();
+        flowStaticAuditCursor_ = 0;
+        RebuildTimelineHandleCaches();
+
+        // LIVE ⇄ FLOW differ only in geometry batch selection — same
+        // callbacks, same transport, same extraction. Tearing down callbacks
+        // and forcing a full resync across that switch would be pure churn.
+        const bool nowSlow = (mode == SyncMode::SlowJson);
+        if (slowJsonSyncMode_ == nowSlow) {
             SendLiveSyncSettings();
             return;
         }
 
+        SetSlowJsonSyncModeInternal(nowSlow);
+    }
+
+    void SetSlowJsonSyncMode(bool enabled) {
+        SetSyncMode(enabled ? SyncMode::SlowJson : SyncMode::LiveFast);
+    }
+
+    void SetSlowJsonSyncModeInternal(bool enabled) {
         slowJsonSyncMode_ = enabled;
         lastSlowJsonSyncTick_ = 0;
         ResetFastPathState(true);
@@ -2989,6 +3261,15 @@
             return;
         }
         if (type == L"live_sync_settings") {
+            // Prefer the explicit mode; fall back to the boolean so a viewer
+            // that only knows LIVE/SLOW still drives this correctly.
+            std::wstring modeStr;
+            if (ExtractJsonString(msg, L"mode", modeStr) && !modeStr.empty()) {
+                SetSyncMode(modeStr == L"slow-json" ? SyncMode::SlowJson
+                          : modeStr == L"flow"      ? SyncMode::Flow
+                                                    : SyncMode::LiveFast);
+                return;
+            }
             bool disabled = false;
             ExtractJsonBool(msg, L"disabled", disabled);
             SetSlowJsonSyncMode(disabled);
@@ -4240,6 +4521,11 @@
         if (!geoDirty.empty()) {
             SendGeometryFastUpdate(geoDirty, &geoFullDirty);
         }
+
+        // Runs whether or not geometry was sent: a parked handle that starts
+        // moving must be caught even in an otherwise idle scene.
+        RunFlowStaticAudit();
+        SendFlowStatsIfDue();
 
         const bool hasAnyNodeUpdates = !combinedNodeHandles.empty();
         const bool hasSelectionUpdates = !selectionDirty.empty();

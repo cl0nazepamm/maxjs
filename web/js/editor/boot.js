@@ -621,7 +621,13 @@
         let buildMode = urlMode || (isStandalone ? 'release' : 'dev');
         var debugMode = false;
         // Session-only by design: sync always boots LIVE; SLOW is a per-session
-        // debugging escape hatch, never a restored state.
+        // debugging escape hatch, never a restored state. FLOW is likewise
+        // opt-in per session — it changes Max-side pacing, so it must never be
+        // a state a user finds themselves in without having chosen it.
+        const SYNC_MODES = ['live-fast', 'flow', 'slow-json'];
+        let syncMode = 'live-fast';
+        // Retained so every existing read keeps its exact meaning: FLOW is a
+        // live-fast variant, never a slow-JSON one.
         let slowJsonSyncMode = false;
 
         function setAudioMuted(nextMuted, { persist = true } = {}) {
@@ -1364,39 +1370,88 @@
         } = giVolumeGlue;
         if (skyActive) refreshSkyForSpectralView();
 
+        const SYNC_MODE_UI = {
+            'live-fast': {
+                label: 'LIVE',
+                title: 'Live fast sync enabled',
+                aria: 'Switch to FLOW paced sync',
+                status: 'live fast sync',
+            },
+            'flow': {
+                label: 'FLOW',
+                title: 'FLOW: paced geometry sync — even Max-side load, smoother 3ds Max viewport',
+                aria: 'Switch to slow JSON sync',
+                status: 'flow paced sync',
+            },
+            'slow-json': {
+                label: 'SLOW',
+                title: 'Slow JSON sync: fastsync callbacks disabled',
+                aria: 'Switch to live fast sync',
+                status: 'slow JSON sync',
+            },
+        };
+
         function syncLiveSyncButtonUi() {
             const button = document.getElementById('btnLiveSync');
             if (!button) return;
-            button.textContent = slowJsonSyncMode ? 'SLOW' : 'LIVE';
+            const ui = SYNC_MODE_UI[syncMode] || SYNC_MODE_UI['live-fast'];
+            button.textContent = ui.label;
             button.classList.toggle('active', !slowJsonSyncMode);
             button.classList.toggle('is-gated', slowJsonSyncMode);
             button.setAttribute('aria-pressed', slowJsonSyncMode ? 'false' : 'true');
-            button.title = slowJsonSyncMode
-                ? 'Slow JSON sync: fastsync callbacks disabled'
-                : 'Live fast sync enabled';
-            button.setAttribute('aria-label', slowJsonSyncMode ? 'Switch to live fast sync' : 'Switch to slow JSON sync');
+            button.title = ui.title;
+            button.setAttribute('aria-label', ui.aria);
         }
 
         function applyLiveSyncSettings(next = {}, { notify = false, sendHost = false } = {}) {
-            if (next.disabled != null) slowJsonSyncMode = next.disabled === true;
+            if (next.mode != null && SYNC_MODES.includes(next.mode)) {
+                syncMode = next.mode;
+            } else if (next.disabled != null) {
+                // Pre-FLOW payload: the boolean only distinguishes SLOW from
+                // live, so it must not silently knock FLOW back to LIVE.
+                const wantSlow = next.disabled === true;
+                if (wantSlow) syncMode = 'slow-json';
+                else if (syncMode === 'slow-json') syncMode = 'live-fast';
+            }
+            slowJsonSyncMode = syncMode === 'slow-json';
             syncLiveSyncButtonUi();
             if (sendHost && window.chrome?.webview) {
-                bridge.send('live_sync_settings', { disabled: slowJsonSyncMode });
+                bridge.send('live_sync_settings', { disabled: slowJsonSyncMode, mode: syncMode });
             }
             if (notify) {
-                perfHud.setStatus(`max.js - ${slowJsonSyncMode ? 'slow JSON sync' : 'live fast sync'}`);
+                const ui = SYNC_MODE_UI[syncMode] || SYNC_MODE_UI['live-fast'];
+                perfHud.setStatus(`max.js - ${ui.status}`);
             }
         }
 
         document.getElementById('btnLiveSync')?.addEventListener('click', () => {
-            applyLiveSyncSettings({ disabled: !slowJsonSyncMode }, { notify: true, sendHost: true });
+            const nextMode = SYNC_MODES[(SYNC_MODES.indexOf(syncMode) + 1) % SYNC_MODES.length];
+            applyLiveSyncSettings({ mode: nextMode }, { notify: true, sendHost: true });
         });
 
         bridge.on('live_sync_settings', msg => {
-            applyLiveSyncSettings({ disabled: msg.disabled === true }, { notify: true, sendHost: false });
+            applyLiveSyncSettings(
+                { mode: msg.mode, disabled: msg.disabled === true },
+                { notify: true, sendHost: false });
         });
 
-        applyLiveSyncSettings({ disabled: slowJsonSyncMode }, { sendHost: true });
+        // Animation-gate telemetry. swept/deform are what the playback sweeps
+        // still walk each tick; parked is what the gate removed from them.
+        // parked staying 0 on a heavy scene means the gate found nothing
+        // static and FLOW cannot help there. promoted climbing means validity
+        // intervals are lying and the audit is catching it.
+        bridge.on('flow_stats', msg => {
+            if (syncMode !== 'flow') return;
+            const swept = Number(msg.swept) || 0;
+            const deform = Number(msg.deform) || 0;
+            const parked = Number(msg.parked) || 0;
+            const promoted = Number(msg.promoted) || 0;
+            perfHud.setStatus(
+                `max.js - flow · sweep ${swept}+${deform} · parked ${parked}`
+                + (promoted ? ` · promoted ${promoted}` : ''));
+        });
+
+        applyLiveSyncSettings({ mode: syncMode }, { sendHost: true });
 
         bridge.on('render_output_settings', msg => {
             const width = Math.max(1, Math.round(Number(msg.width) || 0));

@@ -220,6 +220,35 @@
     int snapshotServeSerial_ = 0;
     bool slowJsonSyncMode_ = false;
     ULONGLONG lastSlowJsonSyncTick_ = 0;
+
+    // ── FLOW: opt-in third sync mode (LIVE → FLOW → SLOW) ────────────
+    // FLOW is a LIVE variant: identical callbacks, identical transport,
+    // identical extraction, identical geometry batching. The one difference is
+    // WHICH handles the playback sweeps walk at all.
+    //
+    // The pre-FLOW sweeps evaluate every tracked node and every modifier-stack
+    // node on each tick purely to discover that almost none of them moved, so
+    // their cost scales with scene size instead of with how much is animated.
+    // FLOW classifies once per epoch and walks only what can actually vary.
+    //
+    // Every FLOW code path is gated on flowMode_. With it false the sweeps are
+    // bit-for-bit the pre-FLOW logic.
+    enum class SyncMode : std::uint8_t { LiveFast = 0, Flow = 1, SlowJson = 2 };
+    SyncMode syncMode_ = SyncMode::LiveFast;
+    bool flowMode_ = false;
+    ULONGLONG lastFlowStatsTick_ = 0;
+
+    // Handles the animation gate parked as static, plus a round-robin cursor.
+    // Validity intervals are only as honest as the plugin reporting them, so
+    // the parked set is re-checked continuously at a low fixed cost. Anything
+    // that turns out to move is promoted for the rest of the session — a wrong
+    // FOREVER then costs a brief freeze instead of a broken scene.
+    std::vector<ULONG> flowStaticAuditHandles_;
+    size_t flowStaticAuditCursor_ = 0;
+    std::unordered_map<ULONG, std::uint64_t> flowStaticAuditSignature_;
+    // Session-sticky: consulted by the gate so a rebuild cannot re-park a
+    // handle the audit already caught moving.
+    std::unordered_set<ULONG> flowForceAnimatedHandles_;
     SceneEventNamespace::CallbackKey fastNodeEventCallbackKey_ = 0;
     bool callbacksRegistered_ = false;
     MaxJSFastNodeEventCallback fastNodeEvents_;

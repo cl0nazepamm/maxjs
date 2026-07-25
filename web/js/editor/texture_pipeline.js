@@ -550,22 +550,35 @@ async function createTexturePipeline(deps = {}) {
             }
             if (ext === 'exr' || ext === 'hdr') {
                 const loader = ext === 'exr' ? deps.exrLoader : deps.rgbeLoader;
-                const placeholder = fallbackTex || fallbackWhiteTexture;
+                const seed = fallbackTex || fallbackWhiteTexture;
+                // A dedicated placeholder, NOT the shared fallback texture: the
+                // loaded image is copied INTO this object, so every material that
+                // bound the slot during the async load picks the real texture up.
+                // Caching the shared fallback and swapping only the cache entry
+                // left every early binder stuck on white forever, and mutating
+                // the shared fallback would have smeared across every slot using
+                // it.
+                const placeholder = new THREE.Texture();
+                if (seed?.image) placeholder.image = seed.image;
+                placeholder.colorSpace = textureColorSpace;
+                applyTextureTransform(placeholder, normalizedXf);
+                placeholder.needsUpdate = true;
                 textureCache.set(cacheKey, placeholder);
                 deps.beginTextureLoad();
                 loader.load(url, loadedTex => {
                     deps.endTextureLoad();
+                    placeholder.copy(loadedTex);
                     // colorSpace first: channel selection needs it to decide
                     // whether Output LUTs run through sRGB decode/encode.
-                    loadedTex.colorSpace = textureColorSpace;
-                    applyTextureChannelSelection(loadedTex, normalizedXf);
-                    applyTextureTransform(loadedTex, normalizedXf);
-                    loadedTex.needsUpdate = true;
-                    textureCache.set(cacheKey, loadedTex);
+                    placeholder.colorSpace = textureColorSpace;
+                    applyTextureChannelSelection(placeholder, normalizedXf);
+                    applyTextureTransform(placeholder, normalizedXf);
+                    placeholder.needsUpdate = true;
                     if (deps.bakeOverrides.enabled) deps.reapplyBakeOverridesToScene?.();
                     deps.maxjsFx.markOutputChanged?.();
                 }, undefined, () => {
                     deps.endTextureLoad();
+                    applyFallbackImage(placeholder, seed, textureColorSpace, normalizedXf, url);
                 });
                 return placeholder;
             }

@@ -488,8 +488,8 @@ function sampleOutputLut(lut, x) {
     return lut[i0] + (lut[i1] - lut[i0]) * (pos - i0);
 }
 
-function outputFilterFingerprint(luts, alphaFromRGB, srgbEncoded) {
-    const payload = `${JSON.stringify(luts)}:${alphaFromRGB ? 1 : 0}:${srgbEncoded ? 1 : 0}`;
+function outputFilterFingerprint(luts, alphaFromRGB, srgbEncoded, manualGamma) {
+    const payload = `${JSON.stringify(luts)}:${alphaFromRGB ? 1 : 0}:${srgbEncoded ? 1 : 0}:${manualGamma}`;
     let hash = 0x811c9dc5;
     for (let i = 0; i < payload.length; i++) {
         hash ^= payload.charCodeAt(i);
@@ -502,7 +502,16 @@ export function buildOutputFilter(xf, srgbEncoded) {
     const mono = Array.isArray(xf?.outLut) && xf.outLut.length >= 2 ? xf.outLut : null;
     const lutR = Array.isArray(xf?.outLutR) && xf.outLutR.length >= 2 ? xf.outLutR : mono;
     const alphaFromRGB = !!xf?.alphaFromRGB;
-    if (!lutR && !alphaFromRGB) return null;
+    // Max's Bitmap "Manual Gamma" override REPLACES the file's decode: the
+    // stored value is read as stored^gamma rather than through the standard
+    // sRGB curve. It was emitted and normalized but never applied, so the
+    // control silently did nothing. Fold it into the same byte->byte table the
+    // Output rollout already uses.
+    const rawGamma = Number(xf?.manualGamma);
+    const manualGamma = Number.isFinite(rawGamma) && rawGamma > 0 && Math.abs(rawGamma - 1.0) > 1.0e-6
+        ? rawGamma
+        : 0;
+    if (!lutR && !alphaFromRGB && !manualGamma) return null;
     const lutG = Array.isArray(xf?.outLutG) && xf.outLutG.length >= 2 ? xf.outLutG : lutR;
     const lutB = Array.isArray(xf?.outLutB) && xf.outLutB.length >= 2 ? xf.outLutB : lutR;
 
@@ -514,7 +523,9 @@ export function buildOutputFilter(xf, srgbEncoded) {
     const luts = [lutR, lutG, lutB];
     for (let i = 0; i < 256; i++) {
         const stored = i / 255;
-        const x = srgbEncoded ? srgbByteToLinearUnit(stored) : stored;
+        const x = manualGamma
+            ? Math.pow(stored, manualGamma)
+            : (srgbEncoded ? srgbByteToLinearUnit(stored) : stored);
         for (let ch = 0; ch < 3; ch++) {
             const lut = luts[ch];
             let y = lut ? sampleOutputLut(lut, x) : x;
@@ -528,7 +539,7 @@ export function buildOutputFilter(xf, srgbEncoded) {
         tables,
         linTables,
         alphaFromRGB,
-        key: outputFilterFingerprint([lutR, lutG, lutB], alphaFromRGB, srgbEncoded),
+        key: outputFilterFingerprint([lutR, lutG, lutB], alphaFromRGB, srgbEncoded, manualGamma),
     };
 }
 

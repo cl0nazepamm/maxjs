@@ -417,6 +417,8 @@ function createMaterials(deps = {}) {
             }
             applyMap('matcapMap',  'matcap',                 THREE.SRGBColorSpace,         'matcapMapXf',  W);
             applyMap('specMap',    'specularMap',            THREE.LinearSRGBColorSpace,   'specMapXf',    W);
+            applyMap('sheenColMap',   'sheenColorMap',       THREE.SRGBColorSpace,         'sheenColMapXf',   W);
+            applyMap('sheenRoughMap', 'sheenRoughnessMap',   THREE.LinearSRGBColorSpace,   'sheenRoughMapXf', W);
             applyOpacityTextureSlot(material, loadMapSlot(md, 'opMap', THREE.LinearSRGBColorSpace, 'opMapXf', W, materialContext));
 
             rememberMaterialEmissiveBase(material);
@@ -725,6 +727,8 @@ function createMaterials(deps = {}) {
                         if (Array.isArray(md.sheenColor)) {
                             params.sheenColor = new THREE.Color(md.sheenColor[0], md.sheenColor[1], md.sheenColor[2]);
                         }
+                        if (md.sheenColMap) params.sheenColorMap = loadTexture(md.sheenColMap, THREE.SRGBColorSpace, md.sheenColMapXf, fallbackWhiteTexture);
+                        if (md.sheenRoughMap) params.sheenRoughnessMap = loadTexture(md.sheenRoughMap, THREE.LinearSRGBColorSpace, md.sheenRoughMapXf, fallbackWhiteTexture);
                         if (md.iridescence != null) params.iridescence = md.iridescence;
                         if (md.iridescenceIOR != null) params.iridescenceIOR = md.iridescenceIOR;
                         if (md.transmission != null) params.transmission = md.transmission;

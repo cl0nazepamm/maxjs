@@ -464,6 +464,22 @@ const PHYSICAL_TEXTURE_SLOTS = [
         fallback: 'flatNormal',
     },
     {
+        canonical: 'sheenColMap',
+        urlKeys: ['sheenColMap'],
+        xfKeys: ['sheenColMapXf'],
+        property: 'sheenColorMap',
+        colorSpace: () => THREE.SRGBColorSpace,
+        fallback: 'white',
+    },
+    {
+        canonical: 'sheenRoughMap',
+        urlKeys: ['sheenRoughMap'],
+        xfKeys: ['sheenRoughMapXf'],
+        property: 'sheenRoughnessMap',
+        colorSpace: () => THREE.LinearSRGBColorSpace,
+        fallback: 'white',
+    },
+    {
         canonical: 'transMap',
         urlKeys: ['transMap'],
         xfKeys: ['transMapXf'],
@@ -1397,9 +1413,15 @@ export function createMaterialBuilder({ rootUrl = '.', bakeState = null, rendere
         };
         applyCommonScalarParams(params, md);
 
+        // MeshSSSNodeMaterial derives from MeshPhysicalNodeMaterial, so it owns
+        // roughness/metalness/envMapIntensity like any other PBR model — and
+        // applySSSMaterialNodes reads roughness back for the SSS influence.
+        // Leaving it out of this branch pinned snapshot SSS materials to the
+        // three.js defaults instead of the values Max sent.
         if (
             info.runtimeModelName === 'MeshStandardMaterial' ||
-            info.runtimeModelName === 'MeshPhysicalMaterial'
+            info.runtimeModelName === 'MeshPhysicalMaterial' ||
+            info.runtimeModelName === 'MeshSSSNodeMaterial'
         ) {
             applyPbrScalarParams(params, md);
         }

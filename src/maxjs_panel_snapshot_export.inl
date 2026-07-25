@@ -714,6 +714,8 @@
         AccumulateTextureUvMask(mask, pbr.clearcoatNormalMap, pbr.clearcoatNormalMapTransform);
         AccumulateTextureUvMask(mask, pbr.specularIntensityMap, pbr.specularIntensityMapTransform);
         AccumulateTextureUvMask(mask, pbr.specularColorMap, pbr.specularColorMapTransform);
+        AccumulateTextureUvMask(mask, pbr.sheenColorMap, pbr.sheenColorMapTransform);
+        AccumulateTextureUvMask(mask, pbr.sheenRoughnessMap, pbr.sheenRoughnessMapTransform);
         for (const std::wstring& tslMap : pbr.tslMaps) {
             if (!tslMap.empty()) mask |= 1;
         }
@@ -809,7 +811,8 @@
                has(pbr.specularMapTransform) || has(pbr.transmissionMapTransform) ||
                has(pbr.clearcoatMapTransform) || has(pbr.clearcoatRoughnessMapTransform) ||
                has(pbr.clearcoatNormalMapTransform) ||
-               has(pbr.specularIntensityMapTransform) || has(pbr.specularColorMapTransform);
+               has(pbr.specularIntensityMapTransform) || has(pbr.specularColorMapTransform) ||
+               has(pbr.sheenColorMapTransform) || has(pbr.sheenRoughnessMapTransform);
     }
 
     static void AccumulateMaterialRuntimeFeatures(SnapshotRuntimeFeatures& features,

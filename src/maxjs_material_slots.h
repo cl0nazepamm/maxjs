@@ -84,7 +84,7 @@ struct MaterialSlot {
 // fields are emitted by WriteMaterialFull at their own fixed offsets). xfKey ==
 // nullptr reproduces gradMap's "no transform sibling" behavior.
 // ─────────────────────────────────────────────────────────────────────────────
-inline constexpr std::array<MaterialSlot, 21> kMaterialSlots = {{
+inline constexpr std::array<MaterialSlot, 23> kMaterialSlots = {{
     // kind                     jsonKey         xfKey             path member                     transform member                          strength          strengthKey     readByBuilder
     { SlotKind::Color,          L"map",         L"mapXf",         &MaxJSPBR::colorMap,             &MaxJSPBR::colorMapTransform,             StrengthSource::DedicatedField, L"mapS",       true  },
     { SlotKind::Gradient,       L"gradMap",     nullptr,          &MaxJSPBR::gradientMap,          &MaxJSPBR::gradientMapTransform,          StrengthSource::None,           nullptr,       true  }, // toon-only reader
@@ -107,6 +107,8 @@ inline constexpr std::array<MaterialSlot, 21> kMaterialSlots = {{
     { SlotKind::Scalar,         L"ccMap",       L"ccMapXf",       &MaxJSPBR::clearcoatMap,         &MaxJSPBR::clearcoatMapTransform,         StrengthSource::None,           nullptr,       true  },
     { SlotKind::Scalar,         L"ccRoughMap",  L"ccRoughMapXf",  &MaxJSPBR::clearcoatRoughnessMap,&MaxJSPBR::clearcoatRoughnessMapTransform,StrengthSource::None,           nullptr,       true  },
     { SlotKind::Normal,         L"ccNormMap",   L"ccNormMapXf",   &MaxJSPBR::clearcoatNormalMap,   &MaxJSPBR::clearcoatNormalMapTransform,   StrengthSource::None,           nullptr,       true  },
+    { SlotKind::Color,          L"sheenColMap", L"sheenColMapXf", &MaxJSPBR::sheenColorMap,        &MaxJSPBR::sheenColorMapTransform,        StrengthSource::None,           nullptr,       true  }, // KHR_materials_sheen sheenColorTexture
+    { SlotKind::Scalar,         L"sheenRoughMap",L"sheenRoughMapXf",&MaxJSPBR::sheenRoughnessMap,  &MaxJSPBR::sheenRoughnessMapTransform,    StrengthSource::None,           nullptr,       true  }, // KHR_materials_sheen sheenRoughnessTexture
 }};
 
 } // namespace maxjs

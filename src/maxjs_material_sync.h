@@ -287,12 +287,14 @@ struct MaxJSPBR {
     std::wstring transmissionMap;
     std::wstring clearcoatMap, clearcoatRoughnessMap, clearcoatNormalMap;
     std::wstring specularIntensityMap, specularColorMap;
+    std::wstring sheenColorMap, sheenRoughnessMap;
     TexTransform colorMapTransform, gradientMapTransform, roughnessMapTransform, metalnessMapTransform, normalMapTransform;
     TexTransform bumpMapTransform, displacementMapTransform, parallaxMapTransform, sssColorMapTransform;
     TexTransform aoMapTransform, emissionMapTransform, lightmapTransform, opacityMapTransform, matcapMapTransform, specularMapTransform;
     TexTransform transmissionMapTransform;
     TexTransform clearcoatMapTransform, clearcoatRoughnessMapTransform, clearcoatNormalMapTransform;
     TexTransform specularIntensityMapTransform, specularColorMapTransform;
+    TexTransform sheenColorMapTransform, sheenRoughnessMapTransform;
     std::wstring mtlName;
     std::wstring tslCode;
     std::wstring tslMaps[16];
@@ -1385,7 +1387,15 @@ static void ExtractThreeJSMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
     d.lightmapIntensity = pb->GetFloat(pb_lightmap_intensity, t);
     d.lightmapChannel = pb->GetInt(pb_lightmap_channel, t);
 
-    if (cid == THREEJS_ADV_MTL_CLASS_ID && d.materialModel == L"MeshPhysicalMaterial") {
+    // SSS mode is physical-plus-subsurface: MeshSSSNodeMaterial derives from
+    // MeshPhysicalNodeMaterial and feeds clearcoat/sheen/iridescence/anisotropy/
+    // transmission straight into SSSLightingModel. The physical rollout params
+    // live on the same paramblock in every mode, so read them for both — gating
+    // this on the Physical mode alone silently dropped sheen (and the rest of
+    // the physical block) for every SSS material.
+    const bool advPhysicalParams = cid == THREEJS_ADV_MTL_CLASS_ID &&
+        (d.materialModel == L"MeshPhysicalMaterial" || d.materialModel == L"MeshSSSNodeMaterial");
+    if (advPhysicalParams) {
         Color specColor = pb->GetColor(pb_phys_specular_color, t);
         d.physicalSpecularColor[0] = specColor.r; d.physicalSpecularColor[1] = specColor.g; d.physicalSpecularColor[2] = specColor.b;
         d.physicalSpecularIntensity = pb->GetFloat(pb_phys_specular_intensity, t);
@@ -1405,7 +1415,8 @@ static void ExtractThreeJSMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
         d.attenuationColor[0] = attenuationColor.r; d.attenuationColor[1] = attenuationColor.g; d.attenuationColor[2] = attenuationColor.b;
         d.attenuationDistance = pb->GetFloat(pb_phys_attenuation_distance, t);
         d.anisotropy = pb->GetFloat(pb_phys_anisotropy, t);
-    } else if (cid == THREEJS_ADV_MTL_CLASS_ID && d.materialModel == L"MeshSSSNodeMaterial") {
+    }
+    if (cid == THREEJS_ADV_MTL_CLASS_ID && d.materialModel == L"MeshSSSNodeMaterial") {
         Color sss = pb->GetColor(pb_sss_color, t);
         d.sssColor[0] = sss.r; d.sssColor[1] = sss.g; d.sssColor[2] = sss.b;
         d.sssDistortion = pb->GetFloat(pb_sss_distortion, t);
@@ -1507,14 +1518,15 @@ static void ExtractThreeJSMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
     readMap(pb_opacity_map, d.opacityMap, d.opacityMapTransform);
     readMap(pb_lightmap, d.lightmapFile, d.lightmapTransform);
     readMap(pb_ao_map, d.aoMap, d.aoMapTransform);
-    if (cid == THREEJS_ADV_MTL_CLASS_ID && d.materialModel == L"MeshPhysicalMaterial") {
+    if (advPhysicalParams) {
         readMap(pb_phys_specular_intensity_map, d.specularIntensityMap, d.specularIntensityMapTransform);
         readMap(pb_phys_specular_color_map, d.specularColorMap, d.specularColorMapTransform);
         readMap(pb_phys_clearcoat_map, d.clearcoatMap, d.clearcoatMapTransform);
         readMap(pb_phys_clearcoat_roughness_map, d.clearcoatRoughnessMap, d.clearcoatRoughnessMapTransform);
         readMap(pb_phys_clearcoat_normal_map, d.clearcoatNormalMap, d.clearcoatNormalMapTransform);
         readMap(pb_phys_transmission_map, d.transmissionMap, d.transmissionMapTransform);
-    } else if (cid == THREEJS_ADV_MTL_CLASS_ID && d.materialModel == L"MeshSSSNodeMaterial") {
+    }
+    if (cid == THREEJS_ADV_MTL_CLASS_ID && d.materialModel == L"MeshSSSNodeMaterial") {
         readMap(pb_sss_color_map, d.sssColorMap, d.sssColorMapTransform);
     } else if (cid == THREEJS_UTILITY_MTL_CLASS_ID) {
         readMap(pb_matcap_map, d.matcapMap, d.matcapMapTransform);
@@ -1688,10 +1700,11 @@ static void ExtractGltfMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
 
     const bool enableClearcoat = readBool(_T("enableClearcoat"), false);
     const bool enableSpecular = readBool(_T("enableSpecular"), false);
+    const bool enableSheen = readBool(_T("enableSheen"), false);
     const bool enableTransmission = readBool(_T("enableTransmission"), false);
     const bool enableVolume = readBool(_T("enableVolume"), false);
     const bool enableIor = readBool(_T("enableIndexOfRefraction"), false);
-    if (enableClearcoat || enableSpecular || enableTransmission || enableVolume || enableIor) {
+    if (enableClearcoat || enableSpecular || enableSheen || enableTransmission || enableVolume || enableIor) {
         d.materialModel = L"MeshPhysicalMaterial";
     }
     if (enableClearcoat) {
@@ -1706,6 +1719,16 @@ static void ExtractGltfMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
         readColor(_T("specularColor"), d.physicalSpecularColor);
         readMap(_T("specularMap"), d.specularIntensityMap, d.specularIntensityMapTransform);
         readMap(_T("specularColorMap"), d.specularColorMap, d.specularColorMapTransform);
+    }
+    if (enableSheen) {
+        // KHR_materials_sheen carries the weight in sheenColorFactor and has no
+        // scalar term, so mirror GLTFLoader: sheen = 1 and let the color drive
+        // the lobe. Max names the factor `sheenColor`/`sheenRoughness`.
+        d.sheen = 1.0f;
+        readColor(_T("sheenColor"), d.sheenColor);
+        d.sheenRoughness = std::clamp(readFloat(_T("sheenRoughness"), 0.0f), 0.0f, 1.0f);
+        readMap(_T("sheenColorMap"), d.sheenColorMap, d.sheenColorMapTransform);
+        readMap(_T("sheenRoughnessMap"), d.sheenRoughnessMap, d.sheenRoughnessMapTransform);
     }
     if (enableTransmission) {
         d.transmission = std::clamp(readFloat(_T("transmission"), 1.0f), 0.0f, 1.0f);

@@ -9,6 +9,7 @@ const MATERIAL_MAP_KEYS = [
     'map', 'normalMap', 'bumpMap', 'roughnessMap', 'metalnessMap',
     'emissiveMap', 'aoMap', 'displacementMap', 'alphaMap', 'envMap',
     'lightMap', 'clearcoatMap', 'clearcoatNormalMap', 'clearcoatRoughnessMap',
+    'sheenColorMap', 'sheenRoughnessMap',
 ];
 
 function setOwner(resource, owner) {

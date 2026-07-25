@@ -1874,6 +1874,19 @@ function createSceneSync(deps = {}) {
                     : (materialIndex === 0 ? mesh.material : null);
                 mats = selected ? [selected] : [];
             }
+            // three decides USE_SHEEN / USE_CLEARCOAT / USE_IRIDESCENCE /
+            // USE_ANISOTROPY (and the node-material equivalents) from `value > 0`
+            // when the program is built, and never re-checks them on a plain
+            // assignment — needsProgramChange has no branch for them. Crossing
+            // zero therefore has to bump the material version or the lobe is set
+            // but never compiled in, exactly as transmission already handles.
+            const assignGatedScalar = (m, key, value) => {
+                if (value == null || !(key in m)) return false;
+                const wasActive = (m[key] ?? 0) > 0;
+                m[key] = value;
+                return wasActive !== (value > 0);
+            };
+
             for (const m of mats) {
                 if (!m) continue;
                 if (m.userData?.maxjsHTMLTextureOverride) continue;
@@ -1914,17 +1927,15 @@ function createSceneSync(deps = {}) {
                 if (material?.aoMapIntensity != null || material?.aoI != null) {
                     if ('aoMapIntensity' in m) m.aoMapIntensity = material?.aoMapIntensity ?? material?.aoI;
                 }
-                if (material?.clearcoat != null && 'clearcoat' in m) m.clearcoat = material.clearcoat;
+                if (assignGatedScalar(m, 'clearcoat', material?.clearcoat)) materialNeedsUpdate = true;
                 if (material?.clearcoatRoughness != null && 'clearcoatRoughness' in m) {
                     m.clearcoatRoughness = material.clearcoatRoughness;
                 }
-                if (material?.sheen != null && 'sheen' in m) m.sheen = material.sheen;
+                if (assignGatedScalar(m, 'sheen', material?.sheen)) materialNeedsUpdate = true;
                 if (material?.sheenRoughness != null && 'sheenRoughness' in m) {
                     m.sheenRoughness = material.sheenRoughness;
                 }
-                if (material?.iridescence != null && 'iridescence' in m) {
-                    m.iridescence = material.iridescence;
-                }
+                if (assignGatedScalar(m, 'iridescence', material?.iridescence)) materialNeedsUpdate = true;
                 if (material?.iridescenceIOR != null && 'iridescenceIOR' in m) {
                     m.iridescenceIOR = material.iridescenceIOR;
                 }
@@ -1949,15 +1960,11 @@ function createSceneSync(deps = {}) {
                 if (material?.reflectivity != null && 'reflectivity' in m) {
                     m.reflectivity = material.reflectivity;
                 }
-                if (material?.dispersion != null && 'dispersion' in m) {
-                    m.dispersion = material.dispersion;
-                }
+                if (assignGatedScalar(m, 'dispersion', material?.dispersion)) materialNeedsUpdate = true;
                 if (material?.attenuationDistance != null && 'attenuationDistance' in m) {
                     m.attenuationDistance = material.attenuationDistance;
                 }
-                if (material?.anisotropy != null && 'anisotropy' in m) {
-                    m.anisotropy = material.anisotropy;
-                }
+                if (assignGatedScalar(m, 'anisotropy', material?.anisotropy)) materialNeedsUpdate = true;
                 deps.rememberMaterialEmissiveBase(m);
                 deps.applyMaterialSelectionState(m, !!mesh.userData.maxjsSelected);
                 if (m.transparent !== nextTransparent) {

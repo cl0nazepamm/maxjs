@@ -738,6 +738,7 @@ async function createTexturePipeline(deps = {}) {
             'gradMap', 'sssMap', 'matcapMap',
             'specMap', 'specIntMap', 'specColMap', 'transMap',
             'ccMap', 'ccRoughMap', 'ccNormMap',
+            'sheenColMap', 'sheenRoughMap',
         ];
         const HTML_TEXTURE_AUTO_FIT_MAX_TRIANGLES = 20000;
 

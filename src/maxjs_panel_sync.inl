@@ -5139,7 +5139,8 @@
                    has(p.specularMapTransform) || has(p.transmissionMapTransform) ||
                    has(p.clearcoatMapTransform) || has(p.clearcoatRoughnessMapTransform) ||
                    has(p.clearcoatNormalMapTransform) ||
-                   has(p.specularIntensityMapTransform) || has(p.specularColorMapTransform);
+                   has(p.specularIntensityMapTransform) || has(p.specularColorMapTransform) ||
+                   has(p.sheenColorMapTransform) || has(p.sheenRoughnessMapTransform);
         };
         if (hasHtmlSlot(pbr)) {
             MaxJSPBR stable = pbr;
@@ -5155,6 +5156,7 @@
             clear(stable.clearcoatMapTransform); clear(stable.clearcoatRoughnessMapTransform);
             clear(stable.clearcoatNormalMapTransform);
             clear(stable.specularIntensityMapTransform); clear(stable.specularColorMapTransform);
+            clear(stable.sheenColorMapTransform); clear(stable.sheenRoughnessMapTransform);
             state.structureHash = HashMaterialPBRState(stable);
             state.canFastSync = false;
             return state;
@@ -6144,7 +6146,14 @@
         WriteFloatValue(ss, pbr.aoIntensity, 1.0f);
         ss << L",\"envI\":";
         WriteFloatValue(ss, pbr.envIntensity, 1.0f);
-        if (pbr.materialModel == L"MeshPhysicalMaterial") {
+        // MeshSSSNodeMaterial is MeshPhysicalNodeMaterial plus a subsurface lobe,
+        // and the viewer feeds the physical block into it verbatim. Emit that
+        // block for both models — the old else-if chain dropped sheen/clearcoat/
+        // specular/transmission/iridescence from every SSS material on the wire.
+        const bool writePhysicalBlock =
+            pbr.materialModel == L"MeshPhysicalMaterial" ||
+            pbr.materialModel == L"MeshSSSNodeMaterial";
+        if (writePhysicalBlock) {
             ss << L",\"specularColor\":[";
             WriteFloatValue(ss, pbr.physicalSpecularColor[0], 1.0f); ss << L',';
             WriteFloatValue(ss, pbr.physicalSpecularColor[1], 1.0f); ss << L',';
@@ -6185,7 +6194,8 @@
             WriteFloatValue(ss, pbr.attenuationDistance, 0.0f);
             ss << L",\"anisotropy\":";
             WriteFloatValue(ss, pbr.anisotropy, 0.0f);
-        } else if (pbr.materialModel == L"MeshSSSNodeMaterial") {
+        }
+        if (pbr.materialModel == L"MeshSSSNodeMaterial") {
             ss << L",\"sssColor\":[";
             WriteFloatValue(ss, pbr.sssColor[0], 1.0f); ss << L',';
             WriteFloatValue(ss, pbr.sssColor[1], 1.0f); ss << L',';

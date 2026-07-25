@@ -14,7 +14,7 @@ import {
 import { gpuRecomputeNormals, gpuNormalsInvalidate, isGpuNormalsDisabled } from '../gpu_normals.js';
 import { maxTimeline } from '../maxjs_timeline.js';
 import { copyMaxComponentsToWorld } from '../scene_space.js';
-import { ensureGeometryUv0ForMaterial, markUv0AttributeAuthored } from '../material_contract.js';
+import { ensureGeometryUv0ForMaterial, markUv0AttributeAuthored, assignGatedMaterialScalar } from '../material_contract.js';
 import { ensureMaxOwned, markOwned, OWNER_MAX } from '../layer_ownership.js';
 
 function createSceneSync(deps = {}) {
@@ -1874,18 +1874,9 @@ function createSceneSync(deps = {}) {
                     : (materialIndex === 0 ? mesh.material : null);
                 mats = selected ? [selected] : [];
             }
-            // three decides USE_SHEEN / USE_CLEARCOAT / USE_IRIDESCENCE /
-            // USE_ANISOTROPY (and the node-material equivalents) from `value > 0`
-            // when the program is built, and never re-checks them on a plain
-            // assignment — needsProgramChange has no branch for them. Crossing
-            // zero therefore has to bump the material version or the lobe is set
-            // but never compiled in, exactly as transmission already handles.
-            const assignGatedScalar = (m, key, value) => {
-                if (value == null || !(key in m)) return false;
-                const wasActive = (m[key] ?? 0) > 0;
-                m[key] = value;
-                return wasActive !== (value > 0);
-            };
+            // Gated-scalar policy is shared with the snapshot player so both
+            // hosts recompile on the same boundaries — see material_contract.js.
+            const assignGatedScalar = assignGatedMaterialScalar;
 
             for (const m of mats) {
                 if (!m) continue;
@@ -1947,6 +1938,12 @@ function createSceneSync(deps = {}) {
                     if (hasTransmission) nextTransparent = true;
                 }
                 if (material?.thickness != null && 'thickness' in m) m.thickness = material.thickness;
+                // reflectivity is an alias setter onto ior, so it has to be applied
+                // BEFORE ior — otherwise it overwrites the authored value (and the
+                // specularIntensity==0 => ior 1.0 rule below).
+                if (material?.reflectivity != null && 'reflectivity' in m) {
+                    m.reflectivity = material.reflectivity;
+                }
                 if (material?.specularIntensity != null && 'specularIntensity' in m) {
                     m.specularIntensity = material.specularIntensity;
                     if (material.specularIntensity < 0.001) {
@@ -1956,9 +1953,6 @@ function createSceneSync(deps = {}) {
                 // IOR must be set AFTER specularIntensity — Three.js derives F0 from both
                 if (material?.ior != null && 'ior' in m) {
                     m.ior = (material.specularIntensity != null && material.specularIntensity < 0.001) ? 1.0 : material.ior;
-                }
-                if (material?.reflectivity != null && 'reflectivity' in m) {
-                    m.reflectivity = material.reflectivity;
                 }
                 if (assignGatedScalar(m, 'dispersion', material?.dispersion)) materialNeedsUpdate = true;
                 if (material?.attenuationDistance != null && 'attenuationDistance' in m) {

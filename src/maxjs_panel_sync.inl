@@ -6125,6 +6125,8 @@
         }
         ss << L",\"normScl\":";
         WriteFloatValue(ss, pbr.normalScale, 1.0f);
+        if (pbr.normalFlipGreen) ss << L",\"normFlipG\":true";
+        if (pbr.normalFlipRed) ss << L",\"normFlipR\":true";
         // Output rollout Bump Amount of the bump-slot bitmap scales the bump
         // strength in Max, so fold it into the emitted scalar.
         const float bumpScaleOut = pbr.bumpScale * pbr.bumpMapTransform.outBumpAmount;

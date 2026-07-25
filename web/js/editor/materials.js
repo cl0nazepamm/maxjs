@@ -12,6 +12,7 @@ import {
 } from 'three/tsl';
 import {
     ensureGeometryUv0ForMaterial,
+    normalScaleVectorFromDescriptor,
     shouldRouteBlackSpecularToLambert as shouldRouteBlackSpecularToLambertShared,
 } from '../material_contract.js';
 import { registerViewportNode } from '../fx/viewport_registry.js';
@@ -382,7 +383,7 @@ function createMaterials(deps = {}) {
                 material.depthPacking = depthPackingModes[md.depthPacking] ?? THREE.BasicDepthPacking;
             }
             if (md.normScl != null && 'normalScale' in material) {
-                material.normalScale = new THREE.Vector2(md.normScl, md.normScl);
+                material.normalScale = normalScaleVectorFromDescriptor(md, THREE) ?? material.normalScale;
             }
             if (md.bumpS != null && 'bumpScale' in material) material.bumpScale = md.bumpS;
             if (md.dispS != null && 'displacementScale' in material) material.displacementScale = md.dispS;
@@ -704,6 +705,12 @@ function createMaterials(deps = {}) {
                     if (md.depthTest != null) params.depthTest = !!md.depthTest;
 
                     if (wantsAdvancedMaterial || wantsSSSMaterial || wantsTSLMaterial || wantsMaterialXMaterial) {
+                        // `reflectivity` is not a stored field on MeshPhysicalMaterial —
+                        // it is an alias setter onto `ior`. Material.setValues applies
+                        // params in insertion order, so it MUST go in before ior or it
+                        // overwrites the authored IOR (reflectivity 0.5 => ior 1.5, which
+                        // silently pinned every glass/water/gem IOR to 1.5).
+                        if (md.reflectivity != null) params.reflectivity = md.reflectivity;
                         if (Array.isArray(md.specularColor)) {
                             params.specularColor = new THREE.Color(md.specularColor[0], md.specularColor[1], md.specularColor[2]);
                         }
@@ -734,7 +741,6 @@ function createMaterials(deps = {}) {
                         if (md.transmission != null) params.transmission = md.transmission;
                         if (md.transMap) params.transmissionMap = loadTexture(md.transMap, THREE.LinearSRGBColorSpace, md.transMapXf, fallbackWhiteTexture);
                         if (md.ior != null && !(md.specularIntensity != null && md.specularIntensity < 0.001)) params.ior = md.ior;
-                        if (md.reflectivity != null) params.reflectivity = md.reflectivity;
                         if (md.thickness != null) params.thickness = md.thickness;
                         if (md.dispersion != null) params.dispersion = md.dispersion;
                         if (Array.isArray(md.attenuationColor)) {
@@ -766,7 +772,7 @@ function createMaterials(deps = {}) {
                         }
                     }
 
-                    if (md.normScl != null) params.normalScale = new THREE.Vector2(md.normScl, md.normScl);
+                    if (md.normScl != null) params.normalScale = normalScaleVectorFromDescriptor(md, THREE);
                     if (md.bumpS != null) params.bumpScale = md.bumpS;
                     if (md.dispS != null) params.displacementScale = md.dispS;
                     if (md.dispB != null) params.displacementBias = md.dispB;

@@ -92,6 +92,47 @@ export function ensureGeometryUv0ForMaterial(geometry, material) {
     return true;
 }
 
+// three derives USE_SHEEN / USE_CLEARCOAT / USE_IRIDESCENCE / USE_ANISOTROPY /
+// USE_TRANSMISSION / USE_DISPERSION from `value > 0` when the program is built
+// (the HAS_* block in acquireProgram), and `needsProgramChange` has no branch
+// for any of them. Crossing zero therefore has to bump the material version or
+// the lobe is set but never compiled in. Shared so the live viewer and the
+// snapshot player make the identical decision — this is a parity rule, not a
+// per-host detail.
+export const PROGRAM_GATED_MATERIAL_SCALARS = Object.freeze([
+    'sheen', 'clearcoat', 'iridescence', 'anisotropy', 'transmission', 'dispersion',
+]);
+
+const PROGRAM_GATED_MATERIAL_SCALAR_SET = new Set(PROGRAM_GATED_MATERIAL_SCALARS);
+
+export function isProgramGatedMaterialScalar(key) {
+    return PROGRAM_GATED_MATERIAL_SCALAR_SET.has(key);
+}
+
+// Assigns a program-gated scalar and reports whether the material now needs a
+// rebuild. Returns false for no-ops so callers never recompile needlessly.
+export function assignGatedMaterialScalar(material, key, value) {
+    if (!material || value == null || !(key in material)) return false;
+    const next = Number(value);
+    if (!Number.isFinite(next)) return false;
+    const wasActive = (material[key] ?? 0) > 0;
+    material[key] = next;
+    return wasActive !== (next > 0);
+}
+
+// Max's Normal Bump exposes flipred/flipgreen/swap_rg for DirectX-vs-OpenGL
+// convention. The wire carries a scalar normScl, so the flips ride as flags and
+// become the sign of each normalScale component here — shared so the live viewer
+// and the snapshot player expand them identically.
+export function normalScaleVectorFromDescriptor(md, THREE_NS = THREE) {
+    const scale = Number(md?.normScl);
+    if (!Number.isFinite(scale)) return null;
+    return new THREE_NS.Vector2(
+        md?.normFlipR ? -scale : scale,
+        md?.normFlipG ? -scale : scale,
+    );
+}
+
 export function finiteNumberOr(value, fallback) {
     const n = Number(value);
     return Number.isFinite(n) ? n : fallback;

@@ -274,6 +274,11 @@ struct MaxJSPBR {
     float shininess = 30.0f;
     float reflectivity = 0.5f;
     float refractionRatio = 0.98f;
+    // Normal Bump green/red channel flips (DirectX vs OpenGL convention). The
+    // wire carries a scalar normalScale, so the sign lives here and the viewer
+    // expands it into the Vector2.
+    bool  normalFlipGreen = false;
+    bool  normalFlipRed = false;
     bool  flatShading = false;
     bool  wireframe = false;
     bool  fog = true;
@@ -1208,12 +1213,23 @@ static bool ExtractMaterialTexture(Texmap* map, std::wstring& filePath, MaxJSPBR
     return false;
 }
 
+// Strength/orientation carried by a Normal Bump (or VRayNormalMap) wrapper.
+// These were read by nobody before, so a normal map at strength 2.0 rendered at
+// 1.0 and a DirectX-convention map (flipgreen) lit inverted.
+struct NormalBumpWrapperState {
+    float normalStrength = 1.0f;
+    float bumpStrength = 1.0f;
+    bool flipGreen = false;
+    bool flipRed = false;
+};
+
 static void ExtractWrappedNormalBumpMaps(
     Texmap* map,
     std::wstring& normalPath,
     MaxJSPBR::TexTransform& normalXf,
     std::wstring& bumpPath,
-    MaxJSPBR::TexTransform& bumpXf)
+    MaxJSPBR::TexTransform& bumpXf,
+    NormalBumpWrapperState* outState = nullptr)
 {
     if (!map) return;
 
@@ -1268,6 +1284,19 @@ static void ExtractWrappedNormalBumpMaps(
             normalMap = map->GetSubTexmap(0);
         if (!bumpMap && map->NumSubTexmaps() > 1)
             bumpMap = map->GetSubTexmap(1);
+
+        if (outState) {
+            // Normal Bump: mult_spin scales the normal sub-map, bump_spin the
+            // bump sub-map. VRayNormalMap uses normal_map_multiplier /
+            // bump_map_multiplier; FindPBFloat falls back when a name is absent.
+            outState->normalStrength = FindPBFloat(map, _T("mult_spin"),
+                FindPBFloat(map, _T("normal_map_multiplier"), 1.0f));
+            outState->bumpStrength = FindPBFloat(map, _T("bump_spin"),
+                FindPBFloat(map, _T("bump_map_multiplier"), 1.0f));
+            const bool swapRG = FindPBInt(map, _T("swap_rg"), 0) != 0;
+            outState->flipRed = (FindPBInt(map, _T("flipred"), 0) != 0) != swapRG;
+            outState->flipGreen = (FindPBInt(map, _T("flipgreen"), 0) != 0) != swapRG;
+        }
 
         const int wrapperMapChannel = std::max(1, FindPBInt(map, _T("map_channel"), 1));
         if (normalEnabled && normalMap && ExtractMaterialTexture(normalMap, normalPath, normalXf)) {
@@ -1940,14 +1969,21 @@ static void ExtractLegacyStandardMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
     d.displacementScale = std::clamp(stdMtl->GetTexmapAmt(ID_DP, t), 0.0f, 1.0f);
 
     if (Texmap* bumpSlot = getStdMap(ID_BU)) {
+        NormalBumpWrapperState nb;
         ExtractWrappedNormalBumpMaps(
             bumpSlot,
             d.normalMap,
             d.normalMapTransform,
             d.bumpMap,
-            d.bumpMapTransform
+            d.bumpMapTransform,
+            &nb
         );
-        d.bumpScale = std::clamp(stdMtl->GetTexmapAmt(ID_BU, t), 0.0f, 1.0f);
+        // Legacy Standard never set normalScale at all, so a Normal Bump in the
+        // bump slot ignored its multiplier entirely.
+        d.normalScale = nb.normalStrength;
+        d.normalFlipGreen = nb.flipGreen;
+        d.normalFlipRed = nb.flipRed;
+        d.bumpScale = std::clamp(stdMtl->GetTexmapAmt(ID_BU, t), 0.0f, 1.0f) * nb.bumpStrength;
     }
 }
 
@@ -2021,35 +2057,56 @@ static void ExtractPhysicalMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
         }
     };
 
-    // Core PBR
+    // Core PBR. Physical Material's Roughness/Glossiness dropdown flips the
+    // meaning of the slider; without honouring roughness_inv every material
+    // authored in Glossiness mode rendered with inverted roughness.
     readColor(_T("base_color"), d.color);
     d.roughness  = readFloat(_T("roughness"), 0.0f);
+    if (readBool(_T("roughness_inv"), false)) d.roughness = 1.0f - d.roughness;
     d.metalness  = readFloat(_T("metalness"), 0.0f);
     d.opacity    = 1.0f - readFloat(_T("transparency"), 0.0f);
     d.ior        = readFloat(_T("trans_ior"), 1.52f);
     d.normalScale = readFloat(_T("bump_map_amt"), 0.3f);
     d.displacementScale = readFloat(_T("displacement_map_amt"), 1.0f);
 
-    // Transmission
+    // Specular. `reflectivity` is Physical Material's specular weight and
+    // `refl_color` its tint; leaving them unread meant a material dialled to
+    // zero reflectivity still rendered fully specular.
+    d.physicalSpecularIntensity = std::clamp(readFloat(_T("reflectivity"), 1.0f), 0.0f, 1.0f);
+    readColor(_T("refl_color"), d.physicalSpecularColor);
+
+    // Transmission. three needs an explicit thickness for volumetric
+    // refraction/absorption -- at thickness 0 the transmission ray is
+    // zero-length, so the attenuation colour/distance read below did nothing.
     d.transmission = readFloat(_T("transparency"), 0.0f);
     if (d.transmission > 0.0f) {
         readColor(_T("trans_color"), d.attenuationColor);
-        d.attenuationDistance = readFloat(_T("trans_depth"), 0.0f);
+        const float transDepth = readFloat(_T("trans_depth"), 0.0f);
+        d.attenuationDistance = transDepth;
+        if (!readBool(_T("thin_walled"), false)) {
+            d.thickness = transDepth > 0.0f ? transDepth : 1.0f;
+        }
+        d.dispersion = readFloat(_T("dispersion"), 0.0f);
     }
 
     // Clearcoat
     d.clearcoat = readFloat(_T("coating"), 0.0f);
     d.clearcoatRoughness = readFloat(_T("coat_roughness"), 0.0f);
+    if (readBool(_T("coat_roughness_inv"), false)) d.clearcoatRoughness = 1.0f - d.clearcoatRoughness;
 
     // Sheen
     d.sheen = readFloat(_T("sheen"), 0.0f);
     d.sheenRoughness = readFloat(_T("sheen_roughness"), 0.3f);
     readColor(_T("sheen_color"), d.sheenColor);
 
-    // Emission
+    // Emission. Same shape as the OpenPBR luminance fix above: emission is a
+    // 0..1 gate, so without folding emit_luminance in, emissiveIntensity could
+    // never exceed 1 and glow/bloom never triggered.
+    const float kPhysicalReferenceLuminance = 1500.0f; // Physical Material emit_luminance default (nits)
     float emWeight = readFloat(_T("emission"), 0.0f);
+    float emLuminance = readFloat(_T("emit_luminance"), kPhysicalReferenceLuminance);
     readColor(_T("emit_color"), d.emission);
-    d.emIntensity = emWeight;
+    d.emIntensity = emWeight * (emLuminance / kPhysicalReferenceLuminance);
 
     // Anisotropy
     d.anisotropy = readFloat(_T("anisotropy"), 0.0f);
@@ -2085,9 +2142,20 @@ static void ExtractPhysicalMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
     readMap(_T("emit_color_map"),    _T("emit_color_map_on"),    d.emissionMap,     d.emissionMapTransform);
     readMap(_T("coat_map"),          _T("coat_map_on"),          d.clearcoatMap,             d.clearcoatMapTransform);
     readMap(_T("coat_rough_map"),    _T("coat_rough_map_on"),    d.clearcoatRoughnessMap,    d.clearcoatRoughnessMapTransform);
+    readMap(_T("sheen_color_map"),   _T("sheen_color_map_on"),   d.sheenColorMap,            d.sheenColorMapTransform);
+    readMap(_T("sheen_rough_map"),   _T("sheen_rough_map_on"),   d.sheenRoughnessMap,        d.sheenRoughnessMapTransform);
+    readMap(_T("reflectivity_map"),  _T("reflectivity_map_on"),  d.specularIntensityMap,     d.specularIntensityMapTransform);
+    readMap(_T("refl_color_map"),    _T("refl_color_map_on"),    d.specularColorMap,         d.specularColorMapTransform);
     readMap(_T("displacement_map"), _T("displacement_map_on"),  d.displacementMap, d.displacementMapTransform);
-    readMap(_T("transparency_map"), _T("transparency_map_on"),  d.opacityMap,      d.opacityMapTransform);
+    // Both slots land on the same opacity target, and readMap clears its output
+    // before it checks the enable flag — so an unconnected cutout_map used to
+    // wipe a perfectly good transparency_map. Read cutout first (it wins when
+    // present, matching Max's cutout-over-transparency precedence) and only fall
+    // back to transparency when cutout left the slot empty.
     readMap(_T("cutout_map"),       _T("cutout_map_on"),        d.opacityMap,      d.opacityMapTransform);
+    if (d.opacityMap.empty()) {
+        readMap(_T("transparency_map"), _T("transparency_map_on"), d.opacityMap, d.opacityMapTransform);
+    }
 
     // Normal/Bump map — Physical Material "bump_map" slot can contain either:
     //   1) Normal Bump texmap (wrapper) → subtex 0 is normal map, subtex 1 is additional bump
@@ -2095,15 +2163,21 @@ static void ExtractPhysicalMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
     // Detect which one and route to the correct PBR field.
     Texmap* bumpSlot = getTexmap(_T("bump_map"), _T("bump_map_on"));
     if (bumpSlot) {
+        const float bumpAmt = d.normalScale;   // bump_map_amt, read above
+        NormalBumpWrapperState nb;
         ExtractWrappedNormalBumpMaps(
             bumpSlot,
             d.normalMap,
             d.normalMapTransform,
             d.bumpMap,
-            d.bumpMapTransform
+            d.bumpMapTransform,
+            &nb
         );
+        d.normalScale = bumpAmt * nb.normalStrength;
+        d.normalFlipGreen = nb.flipGreen;
+        d.normalFlipRed = nb.flipRed;
         if (!d.bumpMap.empty()) {
-            d.bumpScale = d.normalScale;
+            d.bumpScale = bumpAmt * nb.bumpStrength;
         }
     }
 
@@ -2286,6 +2360,8 @@ static void ExtractOpenPBRMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
     readMap(_T("emission_color_map"),     _T("emission_color_map_on"),     d.emissionMap,     d.emissionMapTransform);
     readMap(_T("geometry_opacity_map"),   _T("geometry_opacity_map_on"),   d.opacityMap,      d.opacityMapTransform);
     readMap(_T("transmission_weight_map"), _T("transmission_weight_map_on"), d.transmissionMap, d.transmissionMapTransform);
+    readMap(_T("fuzz_color_map"),         _T("fuzz_color_map_on"),         d.sheenColorMap,     d.sheenColorMapTransform);
+    readMap(_T("fuzz_roughness_map"),     _T("fuzz_roughness_map_on"),     d.sheenRoughnessMap, d.sheenRoughnessMapTransform);
     readMap(_T("displacement_map"),       _T("displacement_map_on"),       d.displacementMap, d.displacementMapTransform);
     readMap(_T("coat_weight_map"),        _T("coat_weight_map_on"),        d.clearcoatMap,    d.clearcoatMapTransform);
     readMap(_T("coat_roughness_map"),     _T("coat_roughness_map_on"),     d.clearcoatRoughnessMap, d.clearcoatRoughnessMapTransform);
@@ -2301,13 +2377,19 @@ static void ExtractOpenPBRMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
         MaxJSPBR::TexTransform wrappedNormalXf;
         std::wstring wrappedBumpPath;
         MaxJSPBR::TexTransform wrappedBumpXf;
+        NormalBumpWrapperState nb;
         ExtractWrappedNormalBumpMaps(
             bumpSlot,
             wrappedNormalPath,
             wrappedNormalXf,
             wrappedBumpPath,
-            wrappedBumpXf
+            wrappedBumpXf,
+            &nb
         );
+        const float openPbrBumpAmt = d.normalScale;   // bump_map_amt, read above
+        d.normalScale = openPbrBumpAmt * nb.normalStrength;
+        d.normalFlipGreen = nb.flipGreen;
+        d.normalFlipRed = nb.flipRed;
 
         if (d.normalMap.empty() && !wrappedNormalPath.empty()) {
             d.normalMap = wrappedNormalPath;
@@ -2321,7 +2403,7 @@ static void ExtractOpenPBRMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
             d.bumpMapTransform = wrappedNormalXf;
         }
         if (!d.bumpMap.empty()) {
-            d.bumpScale = d.normalScale;
+            d.bumpScale = openPbrBumpAmt * nb.bumpStrength;
         }
     }
 
@@ -2431,6 +2513,13 @@ static void ExtractVRayMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
     d.emIntensity = readFloat(_T("selfIllumination_multiplier"), 1.0f);
     if (d.emission[0] + d.emission[1] + d.emission[2] < 0.001f) d.emIntensity = 0.0f;
 
+    // Reflection. The Reflect swatch IS the reflectivity control in V-Ray's
+    // classic workflow -- a black Reflect is a matte surface. Leaving these
+    // unread pinned every VRayMtl to a fully specular white F0. (Metals are
+    // unaffected: three derives their F0 from base colour, not specularColor.)
+    readColor(_T("reflection"), d.physicalSpecularColor);
+    d.physicalSpecularIntensity = std::clamp(readFloat(_T("reflection_weight"), 1.0f), 0.0f, 1.0f);
+
     // Refraction → transmission
     float refr[3] = {0, 0, 0};
     readColor(_T("refraction"), refr);
@@ -2440,6 +2529,11 @@ static void ExtractVRayMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
         d.attenuationDistance = readFloat(_T("refraction_fogDepth"), readFloat(_T("refraction_fogMult"), 1.0f));
         if (readBool(_T("refraction_dispersion_on"), false))
             d.dispersion = readFloat(_T("refraction_dispersion"), 0.0f);
+        // VRayMtl has no thickness param; three needs one or the transmission
+        // ray is zero-length and the fog colour/depth above do nothing.
+        if (!readBool(_T("refraction_thinWalled"), false)) {
+            d.thickness = d.attenuationDistance > 0.0f ? d.attenuationDistance : 1.0f;
+        }
     }
 
     // Coat
@@ -2500,18 +2594,30 @@ static void ExtractVRayMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
     readMap(_T("texmap_coat_glossiness"),  _T("texmap_coat_glossiness_on"),  d.clearcoatRoughnessMap, d.clearcoatRoughnessMapTransform);
     if (!d.clearcoatRoughnessMap.empty())
         d.clearcoatRoughnessMapTransform.invert = true;
+    readMap(_T("texmap_reflection"),       _T("texmap_reflection_on"),       d.specularColorMap, d.specularColorMapTransform);
+    readMap(_T("texmap_sheen"),            _T("texmap_sheen_on"),            d.sheenColorMap, d.sheenColorMapTransform);
+    // Sheen glossiness is the inverse of three's sheenRoughness, same as coat.
+    readMap(_T("texmap_sheen_glossiness"), _T("texmap_sheen_glossiness_on"), d.sheenRoughnessMap, d.sheenRoughnessMapTransform);
+    if (!d.sheenRoughnessMap.empty())
+        d.sheenRoughnessMapTransform.invert = true;
 
     Texmap* bumpSlot = getTexmap(_T("texmap_bump"), _T("texmap_bump_on"));
     if (bumpSlot) {
+        const float vrayBumpAmt = d.normalScale;   // bump_multiplier/100, read above
+        NormalBumpWrapperState nb;
         ExtractWrappedNormalBumpMaps(
             bumpSlot,
             d.normalMap,
             d.normalMapTransform,
             d.bumpMap,
-            d.bumpMapTransform
+            d.bumpMapTransform,
+            &nb
         );
+        d.normalScale = vrayBumpAmt * nb.normalStrength;
+        d.normalFlipGreen = nb.flipGreen;
+        d.normalFlipRed = nb.flipRed;
         if (!d.bumpMap.empty())
-            d.bumpScale = d.normalScale;
+            d.bumpScale = vrayBumpAmt * nb.bumpStrength;
     }
 
     Texmap* coatBumpSlot = getTexmap(_T("texmap_coat_bump"), _T("texmap_coat_bump_on"));

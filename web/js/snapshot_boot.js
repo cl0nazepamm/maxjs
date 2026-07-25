@@ -70,6 +70,7 @@ import { applySceneBin } from './scene_applier.js';
 import { createSceneLights } from './scene_lights.js';
 import { createSnapshotEnvironment } from './snapshot_environment.js';
 import { createMaterialBuilder } from './material_builder.js';
+import { assignGatedMaterialScalar, isProgramGatedMaterialScalar } from './material_contract.js';
 import { copyMaxArrayToWorld, copyMaxComponentsToWorld } from './max_basis.js';
 import { binInRange, geometryFromNodeBinary, typedArrayCanStore } from './scene_binary.js';
 import { sceneSpace } from './max_basis.js';
@@ -1393,11 +1394,13 @@ function applySnapshotMaterialScalar(mesh, payload, materialIndex = null) {
         ? materials
         : [materials[Number(materialIndex)]];
     const colorKeys = ['color', 'emissive', 'specularColor', 'sheenColor', 'attenuationColor'];
+    // `reflectivity` is an alias setter onto `ior` in three's MeshPhysicalMaterial,
+    // so it MUST be applied before `ior` or it overwrites the authored value.
     const scalarKeys = [
         'roughness', 'metalness', 'opacity', 'emissiveIntensity', 'envMapIntensity',
         'aoMapIntensity', 'clearcoat', 'clearcoatRoughness', 'sheen',
         'sheenRoughness', 'iridescence', 'iridescenceIOR', 'transmission',
-        'thickness', 'specularIntensity', 'ior', 'reflectivity', 'dispersion',
+        'thickness', 'reflectivity', 'specularIntensity', 'ior', 'dispersion',
         'attenuationDistance', 'anisotropy', 'alphaTest',
     ];
     const booleanKeys = ['depthWrite', 'depthTest'];
@@ -1414,9 +1417,26 @@ function applySnapshotMaterialScalar(mesh, payload, materialIndex = null) {
         const metalness = payload.metalness ?? payload.metal;
         if (roughness != null && 'roughness' in material) material.roughness = Number(roughness);
         if (metalness != null && 'metalness' in material) material.metalness = Number(metalness);
+        let materialNeedsUpdate = false;
         for (const key of scalarKeys) {
             if (key === 'roughness' || key === 'metalness') continue;
+            // Program-gated lobes must bump the material version when they cross
+            // zero, or an animation track raising sheen/clearcoat/iridescence/
+            // anisotropy/transmission/dispersion off a zero export frame sets the
+            // value and never compiles the lobe. The live viewer already does
+            // this; the shared helper keeps both hosts on the same rule.
+            if (isProgramGatedMaterialScalar(key)) {
+                if (assignGatedMaterialScalar(material, key, payload[key])) materialNeedsUpdate = true;
+                continue;
+            }
             if (payload[key] != null && key in material) material[key] = Number(payload[key]);
+        }
+        // Mirror the live viewer's specular/IOR coupling: three derives F0 from
+        // both, so a specular weight of zero also kills env reflections and pins
+        // IOR to 1.0 (scene_sync.js applyMaterialScalar).
+        if (payload.specularIntensity != null && Number(payload.specularIntensity) < 0.001) {
+            if ('envMapIntensity' in material) material.envMapIntensity = 0;
+            if ('ior' in material) material.ior = 1.0;
         }
         for (const key of booleanKeys) {
             if (payload[key] != null && key in material) material[key] = !!payload[key];
@@ -1428,10 +1448,12 @@ function applySnapshotMaterialScalar(mesh, payload, materialIndex = null) {
         } else if (payload.transparent != null) {
             nextTransparent = payload.transparent === true;
         }
+        if (Number(payload.transmission) > 0) nextTransparent = true;
         if (material.transparent !== nextTransparent) {
             material.transparent = nextTransparent;
-            material.needsUpdate = true;
+            materialNeedsUpdate = true;
         }
+        if (materialNeedsUpdate) material.needsUpdate = true;
     }
 }
 

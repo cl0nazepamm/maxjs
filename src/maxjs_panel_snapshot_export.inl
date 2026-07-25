@@ -1512,12 +1512,11 @@
             }
         }
 
-        FogData fogData;
-        GetFogData(fogData);
-        if (options.includeFog) {
-            ss << L",";
-            WriteFogJson(ss, fogData);
-        }
+        // Scene fog is deliberately NOT exported. The standalone player has no
+        // reader for `meta.fog` (the live viewer's is scene_sync.js ->
+        // maxjsFx.setFogFromScene), so it only ever shipped as a dead key that
+        // read as supported. WebGPU snapshots keep their fog through the
+        // serialized post-FX state; WebGL snapshots render without it.
         if (options.includeLights) {
             ss << L",";
             WriteLightsJson(ss, ip, t, true, false, false);

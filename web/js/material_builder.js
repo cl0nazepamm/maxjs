@@ -21,6 +21,7 @@ import {
     getEmissiveIntensity,
     getTextureExtension,
     maxMapChannelFromMapName,
+    normalScaleVectorFromDescriptor,
     optimizedTextureTransformForSlot,
     pickMaterialSide,
     resolveTextureColorSpace,
@@ -507,7 +508,7 @@ function applyCommonScalarParams(params, md) {
         params.transparent = true;
         params.opacity = md.opacity;
     }
-    if (Number.isFinite(md?.normScl)) params.normalScale = new THREE.Vector2(md.normScl, md.normScl);
+    if (Number.isFinite(md?.normScl)) params.normalScale = normalScaleVectorFromDescriptor(md, THREE);
     setNumber(params, 'bumpScale', md?.bumpS);
     setNumber(params, 'displacementScale', md?.dispS);
     setNumber(params, 'displacementBias', md?.dispB);
@@ -522,6 +523,9 @@ function applyPbrScalarParams(params, md) {
 }
 
 function applyPhysicalScalarParams(params, md) {
+    // `reflectivity` is an alias setter onto `ior`, and setValues applies params
+    // in insertion order — it has to land before ior or it overwrites it.
+    setNumber(params, 'reflectivity', md?.reflectivity);
     setNumber(params, 'specularIntensity', md?.specularIntensity);
     if (Array.isArray(md?.specularColor)) params.specularColor = colorFromArray(md.specularColor, 0xffffff);
     setNumber(params, 'clearcoat', md?.clearcoat);
@@ -533,7 +537,6 @@ function applyPhysicalScalarParams(params, md) {
     setNumber(params, 'iridescenceIOR', md?.iridescenceIOR);
     setNumber(params, 'transmission', md?.transmission);
     setNumber(params, 'ior', md?.ior);
-    setNumber(params, 'reflectivity', md?.reflectivity);
     setNumber(params, 'thickness', md?.thickness);
     setNumber(params, 'dispersion', md?.dispersion);
     if (Array.isArray(md?.attenuationColor)) params.attenuationColor = colorFromArray(md.attenuationColor, 0xffffff);
@@ -582,7 +585,7 @@ function applyUtilityScalarParams(material, md) {
         material.normalMapType = md.normalMapType === 1 ? THREE.ObjectSpaceNormalMap : THREE.TangentSpaceNormalMap;
     }
     if ('depthPacking' in material && md?.depthPacking != null) material.depthPacking = depthPackingFromMax(md.depthPacking);
-    if (md?.normScl != null && 'normalScale' in material) material.normalScale = new THREE.Vector2(md.normScl, md.normScl);
+    if (md?.normScl != null && 'normalScale' in material) material.normalScale = normalScaleVectorFromDescriptor(md, THREE) ?? material.normalScale;
     if (md?.bumpS != null && 'bumpScale' in material) material.bumpScale = md.bumpS;
     if (md?.dispS != null && 'displacementScale' in material) material.displacementScale = md.dispS;
     if (md?.dispB != null && 'displacementBias' in material) material.displacementBias = md.dispB;

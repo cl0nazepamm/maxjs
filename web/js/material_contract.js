@@ -299,6 +299,15 @@ export function normalizeTextureTransform(xf) {
         colorSpace: typeof xf.colorSpace === 'string' ? xf.colorSpace : '',
         manualGamma: Number.isFinite(xf.manualGamma) ? xf.manualGamma : 1.0,
     };
+    // Video playback fields must survive normalization: the slot loaders
+    // normalize before they reach loadVideoTexture, so dropping these silently
+    // forced every video map to loop, mute and play at 1x.
+    if (xf.video) {
+        normalized.video = true;
+        normalized.loop = xf.loop !== false;
+        normalized.muted = xf.muted !== false;
+        normalized.rate = Number.isFinite(Number(xf.rate)) ? Number(xf.rate) : 1.0;
+    }
     // Max Output rollout data is attached only when present so cache keys and
     // material hashes stay byte-identical for the common no-output case.
     const outLut = normalizeOutputLut(xf.outLut);
@@ -383,6 +392,34 @@ export function maxMapChannelFromMapName(value, fallbackMaxChannel = 2) {
     const baseName = filename.replace(/\.[^./\\]+$/, '');
     const match = baseName.match(/(?:^|[_.\-\s])UV([12])(?:$|[_.\-\s])/i);
     return match ? Number(match[1]) : fallback;
+}
+
+// Lightmap UV channel resolution. The bake system names its output with a
+// _UV1/_UV2 token, so that token has to outrank lmCh -- lmCh defaults to 2 and
+// is emitted whenever lmI > 0 (the default), which would otherwise force uv1 on
+// a lightmap explicitly baked to uv0. Shared because the live viewer and the
+// snapshot builder must land on the SAME channel: they disagreed before, and a
+// bake-system-generated `*_UV1.png` sampled uv0 live and uv1 in the snapshot.
+export function explicitMaxMapChannelFromName(value) {
+    let filename = String(value ?? '');
+    try {
+        const base = typeof location !== 'undefined' ? location.href : 'http://maxjs.local/';
+        const parsed = new URL(filename, base);
+        filename = parsed.pathname || filename;
+    } catch {}
+    filename = filename.replace(/\\/g, '/').split('/').pop() || filename;
+    const baseName = filename.replace(/\.[^./\\]+$/, '');
+    const match = baseName.match(/(?:^|[_.\-\s])UV([12])(?:$|[_.\-\s])/i);
+    return match ? Number(match[1]) : null;
+}
+
+export function resolveLightMapMaxMapChannel(md) {
+    const explicit = explicitMaxMapChannelFromName(md?.lmMap ?? md?.lightMap ?? '');
+    if (explicit === 1 || explicit === 2) return explicit;
+    if (Number.isFinite(Number(md?.lmCh))) return Math.max(1, Math.round(Number(md.lmCh)));
+    const xf = normalizeTextureTransform(md?.lmMapXf ?? md?.lightMapXf);
+    if (Number.isFinite(Number(xf?.uvChannel))) return Math.max(1, Math.round(Number(xf.uvChannel)));
+    return 2;
 }
 
 export function applyTextureTransform(tex, xf) {

@@ -12,6 +12,7 @@ import {
     maxMapChannelToTextureChannel as maxMapChannelToTextureChannelShared,
     normalizeTextureTransform as normalizeTextureTransformShared,
     optimizedTextureTransformForSlot as optimizedTextureTransformForSlotShared,
+    resolveLightMapMaxMapChannel as resolveLightMapMaxMapChannelShared,
     resolveTextureColorSpace as resolveTextureColorSpaceShared,
 } from '../material_contract.js';
 
@@ -69,18 +70,6 @@ async function createTexturePipeline(deps = {}) {
             return applyTextureUvChannelShared(tex, maxMapChannel, fallbackMaxChannel);
         }
 
-        function explicitMaxMapChannelFromName(value) {
-            let filename = String(value ?? '');
-            try {
-                const parsed = new URL(filename, location.href);
-                filename = parsed.pathname || filename;
-            } catch {}
-            filename = filename.replace(/\\/g, '/').split('/').pop() || filename;
-            const baseName = filename.replace(/\.[^./\\]+$/, '');
-            const match = baseName.match(/(?:^|[_.\-\s])UV([12])(?:$|[_.\-\s])/i);
-            return match ? Number(match[1]) : null;
-        }
-
         const textureUvChannelViews = new WeakMap();
 
         function textureWithUvChannel(tex, maxMapChannel, fallbackMaxChannel = 1) {
@@ -104,14 +93,8 @@ async function createTexturePipeline(deps = {}) {
             return view;
         }
 
-        function resolveLightMapMaxMapChannel(md) {
-            const explicit = explicitMaxMapChannelFromName(md?.lmMap ?? md?.lightMap ?? '');
-            if (explicit === 1 || explicit === 2) return explicit;
-            if (Number.isFinite(Number(md?.lmCh))) return Math.max(1, Math.round(Number(md.lmCh)));
-            const xf = normalizeTextureTransform(md?.lmMapXf ?? md?.lightMapXf);
-            if (Number.isFinite(Number(xf?.uvChannel))) return Math.max(1, Math.round(Number(xf.uvChannel)));
-            return 2;
-        }
+        // Shared with the snapshot builder — see material_contract.js.
+        const resolveLightMapMaxMapChannel = resolveLightMapMaxMapChannelShared;
 
         function withMaxMapChannelOverride(xf, maxMapChannel) {
             if (!Number.isFinite(Number(maxMapChannel))) return xf;
@@ -509,7 +492,7 @@ async function createTexturePipeline(deps = {}) {
             onReady();
         }
 
-        function loadVideoTexture(url, xf) {
+        function loadVideoTexture(url, xf, colorSpace = THREE.SRGBColorSpace) {
             const normalizedXf = normalizeTextureTransform(xf);
             const playbackKey = JSON.stringify({
                 loop: xf?.loop !== false,
@@ -531,7 +514,9 @@ async function createTexturePipeline(deps = {}) {
             video.load?.();
             video.play().catch(() => {});
             const tex = new THREE.VideoTexture(video);
-            tex.colorSpace = THREE.SRGBColorSpace;
+            // Slot-driven, matching the snapshot builder: a video in a
+            // normal/roughness/opacity slot is data and must stay linear.
+            tex.colorSpace = colorSpace;
             tex.minFilter = THREE.LinearFilter;
             tex.magFilter = THREE.LinearFilter;
             installSafeVideoTexturePump(tex, video);
@@ -546,13 +531,13 @@ async function createTexturePipeline(deps = {}) {
 
         function loadTexture(url, colorSpace = THREE.LinearSRGBColorSpace, xf = null, fallbackTex = fallbackWhiteTexture) {
             if (!url) return null;
-            if (xf?.video) return loadVideoTexture(url, xf);
             colorSpace = resolveColorSpace(colorSpace, xf);
+            if (xf?.video) return loadVideoTexture(url, xf, colorSpace);
             const ext = deps.getTextureExtension(url);
             // A plain Max Bitmap can point straight at a video file (no custom
             // Video Texture map). Route those to the video loader instead of
             // rejecting them as an unsupported still-image format.
-            if (deps.isVideoTextureExtension(ext)) return loadVideoTexture(url, xf);
+            if (deps.isVideoTextureExtension(ext)) return loadVideoTexture(url, xf, colorSpace);
             const textureColorSpace = deps.colorSpaceForTextureExtension(ext, colorSpace);
             const normalizedXf = normalizeTextureTransform(xf);
             const cacheKey = JSON.stringify([url, String(textureColorSpace), normalizedXf]);

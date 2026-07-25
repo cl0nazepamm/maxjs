@@ -23,6 +23,7 @@ import {
     maxMapChannelFromMapName,
     normalScaleVectorFromDescriptor,
     optimizedTextureTransformForSlot,
+    resolveLightMapMaxMapChannel,
     pickMaterialSide,
     resolveTextureColorSpace,
     textureReadyForMaterialBinding,
@@ -487,9 +488,10 @@ const PHYSICAL_TEXTURE_SLOTS = [
         property: 'transmissionMap',
         colorSpace: () => THREE.LinearSRGBColorSpace,
         fallback: 'white',
-        onAssign: (material) => {
-            material.transparent = true;
-        },
+        // Transparency is driven by the transmission SCALAR, matching the live
+        // viewer. Forcing it from the map alone moved materials with a
+        // transmission map but a zero scalar into the transparent queue here
+        // and not live, which shows up as sorting artifacts.
     },
 ];
 
@@ -544,7 +546,6 @@ function applyPhysicalScalarParams(params, md) {
         params.attenuationDistance = Number(md.attenuationDistance);
     }
     setNumber(params, 'anisotropy', md?.anisotropy);
-    setNumber(params, 'anisotropyRotation', md?.anisotropyRotation);
     if ((md?.transmission ?? 0) > 0) params.transparent = true;
     if (md?.specularIntensity != null && Number(md.specularIntensity) < 0.001) {
         params.envMapIntensity = 0;

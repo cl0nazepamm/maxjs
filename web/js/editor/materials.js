@@ -194,8 +194,24 @@ function createMaterials(deps = {}) {
             const baseAttenuation = Number.isFinite(base.attenuation) ? base.attenuation : 0.1;
             const basePower = Number.isFinite(base.power) ? base.power : 2.0;
             const influence = getSSSRoughnessInfluence(roughness);
-            material.thicknessAttenuationNode = tslFloat(baseAttenuation * influence.attenuationScale);
-            material.thicknessPowerNode = tslFloat(Math.max(0.01, basePower * influence.powerScale));
+            const nextAttenuation = baseAttenuation * influence.attenuationScale;
+            const nextPower = Math.max(0.01, basePower * influence.powerScale);
+            // This is reached from applyMaterialScalar, which runs on every delta
+            // carrying nd.mat and on every frame of a material.roughness track.
+            // Rebuilding two TSL nodes and bumping the version unconditionally
+            // meant a node-graph recompile per delta on SSS materials — the
+            // pipeline-churn shape that has frozen this viewer before. Only
+            // touch the graph when the derived values actually move.
+            material.userData ??= {};
+            const applied = material.userData.maxjsSSSRoughnessApplied;
+            if (applied
+                && Math.abs(applied.attenuation - nextAttenuation) < 1e-6
+                && Math.abs(applied.power - nextPower) < 1e-6) {
+                return;
+            }
+            material.userData.maxjsSSSRoughnessApplied = { attenuation: nextAttenuation, power: nextPower };
+            material.thicknessAttenuationNode = tslFloat(nextAttenuation);
+            material.thicknessPowerNode = tslFloat(nextPower);
             material.needsUpdate = true;
         }
 

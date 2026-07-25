@@ -510,9 +510,6 @@ export function createMaxJSFxController({
         if (Array.isArray(fx.toonOutline?.color)) {
             state.toonOutline.color = [...fx.toonOutline.color];
         }
-        if (Array.isArray(fx.fog?.color)) {
-            state.fog.color = [...fx.fog.color];
-        }
         if (Array.isArray(fx.clone?.color)) {
             state.clone.color = [...fx.clone.color];
         }
@@ -1466,87 +1463,6 @@ export function createMaxJSFxController({
             return { ...state.volumetric };
         },
 
-        // ── Fog (scene.fogNode — independent of post-processing) ──
-
-        isFogEnabled() {
-            return state.fog.enabled;
-        },
-        setFogEnabled(enabled) {
-            if (enabled && !supportsScreenSpaceEffects) {
-                lastError = 'Fog requires WebGPU or TSL_GL';
-                onError(lastError);
-                if (state.fog.enabled !== true) {
-                    state.fog.enabled = true;
-                    core.applySceneFog();
-                    rebuildPipeline();
-                }
-                return false;
-            }
-            const next = !!enabled;
-            if (state.fog.enabled === next) return state.fog.enabled;
-            state.fog.enabled = next;
-            core.applySceneFog();
-            rebuildPipeline();
-            return state.fog.enabled;
-        },
-        setFogOptions(options = {}) {
-            const prevType = state.fog.type;
-            if (Number.isFinite(options.type)) state.fog.type = options.type;
-            if (Array.isArray(options.color)) state.fog.color = options.color;
-            assignFinite(state.fog, 'opacity', options.opacity);
-            assignFinite(state.fog, 'near', options.near);
-            assignFinite(state.fog, 'far', options.far);
-            assignFinite(state.fog, 'density', options.density);
-            assignFinite(state.fog, 'noiseScale', options.noiseScale);
-            assignFinite(state.fog, 'noiseSpeed', options.noiseSpeed);
-            assignFinite(state.fog, 'height', options.height);
-            core.applySceneFog();
-            if (Number.isFinite(options.type) && options.type !== prevType) {
-                rebuildPipeline();
-            }
-            return { ...state.fog };
-        },
-        setFogFromScene(fogData) {
-            if (!fogData) return;
-            const f = state.fog;
-            const nextEnabled = !!fogData.active;
-            const nextType = fogData.type ?? 0;
-            const nextColor = Array.isArray(fogData.color) ? fogData.color : f.color;
-            const nextOpacity = Number.isFinite(fogData.opacity) ? fogData.opacity : f.opacity;
-            const nextNear = Number.isFinite(fogData.near) ? fogData.near : f.near;
-            const nextFar = Number.isFinite(fogData.far) ? fogData.far : f.far;
-            const nextDensity = Number.isFinite(fogData.density) ? fogData.density : f.density;
-            const nextNoiseScale = Number.isFinite(fogData.noiseScale) ? fogData.noiseScale : f.noiseScale;
-            const nextNoiseSpeed = Number.isFinite(fogData.noiseSpeed) ? fogData.noiseSpeed : f.noiseSpeed;
-            const nextHeight = Number.isFinite(fogData.height) ? fogData.height : f.height;
-            const changed =
-                f.enabled !== nextEnabled ||
-                f.type !== nextType ||
-                f.opacity !== nextOpacity ||
-                f.near !== nextNear ||
-                f.far !== nextFar ||
-                f.density !== nextDensity ||
-                f.noiseScale !== nextNoiseScale ||
-                f.noiseSpeed !== nextNoiseSpeed ||
-                f.height !== nextHeight ||
-                f.color[0] !== nextColor[0] ||
-                f.color[1] !== nextColor[1] ||
-                f.color[2] !== nextColor[2];
-            if (!changed) return;
-            f.enabled = nextEnabled;
-            f.type = nextType;
-            f.color = nextColor;
-            f.opacity = nextOpacity;
-            f.near = nextNear;
-            f.far = nextFar;
-            f.density = nextDensity;
-            f.noiseScale = nextNoiseScale;
-            f.noiseSpeed = nextNoiseSpeed;
-            f.height = nextHeight;
-            core.applySceneFog();
-            rebuildPipeline();
-        },
-
         setHiddenBackgroundColor(color) {
             return setHiddenBackgroundColor(color);
         },
@@ -1623,7 +1539,7 @@ export function createMaxJSFxController({
         render() {
             flushPendingPipelineUpdates();
             syncCanvasColorGrading();
-            // Fog + pixel-grain timers (procedural animation)
+            // Pixel-grain timer (procedural animation)
             core.updateFrameTimers();
 
             const shaderLabActive = shaderLabFinal.hasPassEnabled();

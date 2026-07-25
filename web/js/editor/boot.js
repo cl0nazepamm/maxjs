@@ -1903,7 +1903,7 @@
             rebuildBakePanel,
         } = bakeSystem;
 
-        // ── Environment/Fog live update (standalone, change-only) ──
+        // ── Environment live update (standalone, change-only) ──
         bridge.on('env_update', msg => {
             let pathTraceSceneChanged = false;
             if (msg.env) {
@@ -1921,10 +1921,6 @@
                     pathTraceSceneChanged = true;
                 }
                 maxjsFx.markEnvironmentChanged?.();
-            }
-            if (msg.fog) {
-                maxjsFx.setFogFromScene(msg.fog);
-                pathTraceSceneChanged = true;
             }
             if (pathTraceSceneChanged) schedulePathTracingLiveRebuild();
         });

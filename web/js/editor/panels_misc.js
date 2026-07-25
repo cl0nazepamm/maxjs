@@ -62,7 +62,6 @@ function createPanelsMisc(deps = {}) {
                 contactShadow: deps.maxjsFx.isContactShadowEnabled(), retro: deps.maxjsFx.isRetroEnabled(),
                 volumetric: deps.maxjsFx.isVolumetricEnabled(), pixel: deps.maxjsFx.isPixelEnabled(),
                 powershot: deps.maxjsFx.isPowerShotEnabled(),
-                fog: deps.maxjsFx.isFogEnabled(),
             };
             deps.maxjsFx.setEnabled(false); deps.maxjsFx.setSSREnabled(false); deps.maxjsFx.setGTAOEnabled(false);
             deps.maxjsFx.setBloomEnabled(false); deps.maxjsFx.setToonOutlineEnabled(false);
@@ -70,7 +69,6 @@ function createPanelsMisc(deps = {}) {
             deps.maxjsFx.setContactShadowEnabled(false); deps.maxjsFx.setRetroEnabled(false);
             deps.maxjsFx.setVolumetricEnabled(false); deps.maxjsFx.setPixelEnabled(false);
             deps.maxjsFx.setPowerShotEnabled(false);
-            deps.maxjsFx.setFogEnabled(false);
             rebuildAsciiEffect();
             deps.asciiActive = true;
             deps.renderer.domElement.style.display = 'none';
@@ -92,7 +90,6 @@ function createPanelsMisc(deps = {}) {
                 deps.maxjsFx.setTRAAEnabled(s.traa); deps.maxjsFx.setContactShadowEnabled(s.contactShadow);
                 deps.maxjsFx.setRetroEnabled(s.retro); deps.maxjsFx.setVolumetricEnabled(s.volumetric);
                 deps.maxjsFx.setPixelEnabled(s.pixel); deps.maxjsFx.setPowerShotEnabled(s.powershot);
-                deps.maxjsFx.setFogEnabled(s.fog);
                 asciiPreFxSnapshot = null;
             }
             deps.syncPostFxPanel(true);
@@ -132,7 +129,6 @@ function createPanelsMisc(deps = {}) {
                     volumetric: deps.maxjsFx.isVolumetricEnabled(),
                     pixel: deps.maxjsFx.isPixelEnabled(),
                     powershot: deps.maxjsFx.isPowerShotEnabled(),
-                    fog: deps.maxjsFx.isFogEnabled(),
                     clone: deps.maxjsFx.isCloneEnabled(),
                 };
                 // Disable everything
@@ -148,7 +144,6 @@ function createPanelsMisc(deps = {}) {
                 deps.maxjsFx.setVolumetricEnabled(false);
                 deps.maxjsFx.setPixelEnabled(false);
                 deps.maxjsFx.setPowerShotEnabled(false);
-                deps.maxjsFx.setFogEnabled(false);
                 deps.maxjsFx.setGTAOEnabled(false);
             }
             if (deps.maxjsFx.setClayOverride) deps.maxjsFx.setClayOverride(true);
@@ -177,7 +172,6 @@ function createPanelsMisc(deps = {}) {
                 deps.maxjsFx.setVolumetricEnabled(clayPreFxSnapshot.volumetric);
                 deps.maxjsFx.setPixelEnabled(clayPreFxSnapshot.pixel);
                 deps.maxjsFx.setPowerShotEnabled(clayPreFxSnapshot.powershot);
-                deps.maxjsFx.setFogEnabled(clayPreFxSnapshot.fog);
                 deps.maxjsFx.setCloneEnabled(clayPreFxSnapshot.clone);
                 clayPreFxSnapshot = null;
             }
@@ -1253,6 +1247,12 @@ function createPanelsMisc(deps = {}) {
                 silent: !commit,
             });
             if (param) syncLayerParamControl(input.closest('.layer-param'), param);
+            if (param && commit) {
+                deps._projectRuntimeRef?.persistLayerParameterValue?.(layerId, name, param.value)
+                    ?.catch?.(error => {
+                        deps.reportBridgeError('save runtime layer parameter', error);
+                    });
+            }
         }
 
         function refreshLayersPanel() {

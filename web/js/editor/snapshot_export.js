@@ -6,7 +6,6 @@ function createSnapshotExport(deps = {}) {
         const SNAPSHOT_SETTINGS_DEFAULTS = Object.freeze({
             includeSceneNodes: true,
             includeEnvironment: true,
-            includeFog: true,
             includeLights: true,
             includeAudios: true,
             includeInstances: true,
@@ -137,7 +136,6 @@ function createSnapshotExport(deps = {}) {
                         <div class="snapshot-grid">
                             <label class="fx-check" for="snapshot-includeSceneNodes"><span>Scene Nodes</span><input id="snapshot-includeSceneNodes" type="checkbox"></label>
                             <label class="fx-check" for="snapshot-includeEnvironment"><span>Environment</span><input id="snapshot-includeEnvironment" type="checkbox"></label>
-                            <label class="fx-check" for="snapshot-includeFog"><span>Fog</span><input id="snapshot-includeFog" type="checkbox"></label>
                             <label class="fx-check" for="snapshot-includeLights"><span>Lights</span><input id="snapshot-includeLights" type="checkbox"></label>
                             <label class="fx-check" for="snapshot-includeAudios"><span>Audio</span><input id="snapshot-includeAudios" type="checkbox"></label>
                             <label class="fx-check" for="snapshot-includeInstances"><span>Instances</span><input id="snapshot-includeInstances" type="checkbox"></label>

@@ -12,7 +12,6 @@ const EFFECT_IMPORTS = {
     toonOutline: () => import('./effects/toonOutline.js'),
     contactShadow: () => import('./effects/contactShadow.js'),
     retro: () => import('./effects/retro.js'),
-    fog: () => import('./effects/fog.js'),
     volumetric: () => import('./effects/volumetric.js'),
     pixel: () => import('./effects/pixel.js'),
     dof: () => import('./effects/dof.js'),

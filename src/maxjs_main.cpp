@@ -757,7 +757,6 @@ public:
     struct SnapshotExportOptions {
         bool includeSceneNodes = true;
         bool includeEnvironment = true;
-        bool includeFog = true;
         bool includeLights = true;
         bool includeAudios = true;
         bool includeGLTFs = true;

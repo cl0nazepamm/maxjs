@@ -58,10 +58,6 @@
         ss << L",";
         WriteEnvJson(ss, envData, hdriUrl);
 
-        FogData fogData;
-        GetFogData(fogData);
-        ss << L",";
-        WriteFogJson(ss, fogData);
         ss << L",";
         WriteLightsJson(ss, ip, t, true, false, true);
         ss << L",";
@@ -916,10 +912,6 @@
 
         ss << L",";
         WriteEnvJson(ss, envData, hdriUrl);
-        FogData fogBin;
-        GetFogData(fogBin);
-        ss << L",";
-        WriteFogJson(ss, fogBin);
         ss << L",";
         WriteLightsJson(ss, ip, t, true, false, true);
         ss << L",";

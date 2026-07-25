@@ -7,9 +7,9 @@
 // Core-resident concerns (NOT descriptors, NOT dynamic modules):
 //   - shared pre-pass (depth/normal/velocity MRT union)
 //   - scene pass MRT + texture extraction + beauty-alpha coverage
-//   - env-backdrop compensation (depends on environmentVisible + ssr/fog)
+//   - env-backdrop compensation (depends on environmentVisible + ssr)
 //   - PS1 vertex snap (material-level, driven by retro.wiggle / shaderlab)
-//   - scene.fogNode fog (applySceneFog) + fog/pixel frame timers
+//   - pixel frame timer
 //   - forced contact-shadow light, toon-mesh cache, deep node disposal
 //
 // Shader Lab, PowerShot, the clone CPU overlay, and colorGrading (CSS canvas
@@ -19,10 +19,8 @@ import * as THREE from 'three';
 import {
     color,
     convertToTexture,
-    densityFogFactor,
     diffuseColor,
     float,
-    fog,
     max,
     metalness,
     mrt,
@@ -33,7 +31,6 @@ import {
     positionLocal,
     positionView,
     positionWorld,
-    rangeFogFactor,
     roughness,
     sample,
     screenSize,
@@ -52,7 +49,7 @@ import {
 import { purgeViewportCachesForTarget } from './viewport_registry.js';
 
 // Effects safe to run on a path-traced source: pure color-domain folds that
-// need no gbuffer. Everything else (SSGI/SSR/GTAO/DOF/fog/motionBlur/...)
+// need no gbuffer. Everything else (SSGI/SSR/GTAO/DOF/motionBlur/...)
 // reads depth/normal the PT has no gbuffer for — and PT already does GI/DOF —
 // so they are gated off whenever ctx.pathTracedColor is set.
 const PT_SAFE_EFFECTS = new Set(['bloom', 'pixel', 'retro']);
@@ -117,7 +114,6 @@ export function createFxCore({
         pixelBrightnessU: uniform(0),
         pixelContrastU: uniform(0),
         pixelSaturationU: uniform(0),
-        fogTimer: uniform(0),
         pixelTimer: uniform(0),
     };
 
@@ -585,45 +581,6 @@ export function createFxCore({
         ps1SceneDirty = false;
     }
 
-    // ── Fog — applied via scene.fogNode (independent of post-processing) ──
-
-    let fogAnimationActive = false;
-
-    function applySceneFog() {
-        const f = state.fog;
-        if (!supportsScreenSpaceEffects || !f?.enabled) {
-            scene.fogNode = null;
-            fogAnimationActive = false;
-            return;
-        }
-        const camera = getCamera();
-
-        const fogColor = color(f.color[0], f.color[1], f.color[2]);
-
-        if (f.type === 0) {
-            // Range fog (linear near/far)
-            const factor = rangeFogFactor(f.near, f.far);
-            scene.fogNode = fog(fogColor, factor.mul(float(f.opacity)));
-        } else if (f.type === 1) {
-            // Density fog (exponential)
-            const factor = densityFogFactor(f.density);
-            scene.fogNode = fog(fogColor, factor.mul(float(f.opacity)));
-        } else if (f.type === 2) {
-            // Custom procedural fog with triNoise3D
-            const groundColor = fogColor;
-            const fogDistance = positionView.z.negate().smoothstep(0, camera.far.sub ? camera.far : float(1000));
-            const distance = fogDistance.mul(float(f.height)).max(float(4));
-            const groundFogArea = distance.sub(positionWorld.y).div(distance).pow(3).saturate().mul(float(f.opacity));
-
-            const noiseA = triNoise3D(positionWorld.mul(float(f.noiseScale)), float(0.2), uniforms.fogTimer);
-            const noiseB = triNoise3D(positionWorld.mul(float(f.noiseScale * 2)), float(0.2), uniforms.fogTimer.mul(float(1.2)));
-            const fogNoise = noiseA.add(noiseB).mul(groundColor);
-
-            scene.fogNode = fog(fogDistance.oneMinus().mix(groundColor, fogNoise), groundFogArea);
-            fogAnimationActive = true;
-        }
-    }
-
     // ── Build / teardown ────────────────────────────────────────────────
 
     function prepareRebuild() {
@@ -658,7 +615,7 @@ export function createFxCore({
      *  2. context-stage descriptors (slot order) build ctx.sceneContext
      *  3. scene pass (scenePass-stage descriptor or default pass) + MRT
      *  4. beauty fold in slot order, env-backdrop compensation spliced
-     *     between slots 50 and 60 (early — before fog at 65) / >=130 fallback
+     *     between slots 50 and 60 (early) / >=130 fallback
      *  5. output node with coverage-derived beauty alpha
      *
      * The caller decides teardown-vs-build and owns error escalation; an
@@ -759,12 +716,12 @@ export function createFxCore({
 
             // When HDRI is loaded but not shown as the viewport background, the scene pass still
             // sees environment in reflections; far-depth pixels must be normalized to hidden fill + a=0
-            // so SSR and fog (isBg) behave. This was SSR-only before, which broke fog whenever SSR was off.
+            // so SSR (isBg) behaves.
             const hiddenEnvironmentBackdrop =
                 !!scene.environment && !getEnvironmentVisible();
             const useEnvironmentBackdropCompensation =
                 hiddenEnvironmentBackdrop
-                && (isEffectActive('ssr') || isEffectActive('fog'));
+                && isEffectActive('ssr');
             // Hidden environment/background means transparent scene input.
             // The CSS viewport backdrop may still be visible behind the canvas,
             // but it must never enter Bloom/SSGI/SSR source pixels.
@@ -856,8 +813,8 @@ export function createFxCore({
                     if (useEnvironmentBackdropCompensation) applyBackdropCompensation();
                 }
                 // Late fallback preserves older paths where the early
-                // compensation could not run (fog now sits at slot 65, inside
-                // the early splice; only slot>=130 descriptors reach this).
+                // compensation could not run (only slot>=130 descriptors
+                // reach this).
                 if ((d.slot ?? 0) >= 130
                     && useEnvironmentBackdropCompensation
                     && !environmentBackdropCompensated) {
@@ -908,10 +865,6 @@ export function createFxCore({
     }
 
     function updateFrameTimers() {
-        // Fog timer for procedural animation (scene.fogNode custom fog)
-        if (fogAnimationActive) {
-            uniforms.fogTimer.value = performance.now() * 0.001 * (state.fog?.noiseSpeed ?? 0.2);
-        }
         // Pixel grain timer
         if (isEffectActive('pixel') && state.pixel.grain) {
             uniforms.pixelTimer.value = performance.now() * 0.001;
@@ -937,8 +890,6 @@ export function createFxCore({
         cleanupUnsupportedRealtimeResources,
         updatePerFrame,
         updateFrameTimers,
-        applySceneFog,
-        isFogAnimationActive: () => fogAnimationActive,
         syncSharedSceneEffects,
         markPS1SceneDirty: () => { ps1SceneDirty = true; },
         refreshSceneCaches() {

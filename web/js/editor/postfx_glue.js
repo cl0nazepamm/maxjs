@@ -463,27 +463,6 @@ function createPostFxGlue(deps = {}) {
                     { key: 'bokehScale', label: 'Bokeh Scale', min: 0.5, max: 30, step: 0.5, realtime: true },
                 ],
             },
-            {
-                key: 'fog',
-                title: 'Fog',
-                copy: 'Distance fog, density fog, or animated procedural ground fog.',
-                note: 'Requires WebGPU or Force WebGL. Also controllable via Rendering > Environment > Atmosphere in Max.',
-                requiresWebGPU: true,
-                isEnabled: () => deps.maxjsFx.isFogEnabled(),
-                setEnabled: (enabled) => deps.maxjsFx.setFogEnabled(enabled),
-                getValues: (state) => state.fog,
-                setValues: (patch) => deps.maxjsFx.setFogOptions(patch),
-                controls: [
-                    { key: 'type', label: 'Type', min: 0, max: 2, step: 1, integer: true },
-                    { key: 'opacity', label: 'Opacity', min: 0, max: 1, step: 0.01, realtime: true },
-                    { key: 'near', label: 'Near', min: 0, max: 9999, step: 1, realtime: true },
-                    { key: 'far', label: 'Far', min: 1, max: 9999, step: 5, realtime: true },
-                    { key: 'density', label: 'Density', min: 0.0001, max: 0.5, step: 0.001, realtime: true },
-                    { key: 'noiseScale', label: 'Noise Scale', min: 0.0001, max: 0.1, step: 0.001, realtime: true },
-                    { key: 'noiseSpeed', label: 'Noise Speed', min: 0, max: 5, step: 0.05, realtime: true },
-                    { key: 'height', label: 'Height', min: 0, max: 9999, step: 1, realtime: true },
-                ],
-            },
         ];
 
         const LOG_SLIDER_STEPS = 1000;
@@ -649,7 +628,6 @@ function createPostFxGlue(deps = {}) {
             volumetric: { intensity: 1.0, steps: 12, density: 0.5, denoise: 0.6, resolution: 0.25 },
             pixel: { pixelate: false, pixelSize: 4, chromatic: false, chromaticIntensity: 0.005, sharpen: false, sharpenStrength: 0.5, grain: false, grainIntensity: 0.08, brightness: 0, contrast: 0, saturation: 0 },
             dof: { autoFromCamera: true, focusDistance: 100, focalLength: 50, bokehScale: 5 },
-            fog: { type: 0, opacity: 1.0, near: 10, far: 500, density: 0.01, noiseScale: 0.005, noiseSpeed: 0.2, height: 20 },
         });
 
         function getPostFxSectionDefaultValues(section) {
@@ -1139,7 +1117,7 @@ function createPostFxGlue(deps = {}) {
                     deps.setClayPreFxSnapshot?.({
                         ssgi: false, ssr: false, gtao: false, bloom: false,
                         toonOutline: false, motionBlur: false, traa: false, contactShadow: false,
-                        retro: false, volumetric: false, pixel: false, powershot: false, fog: false, clone: false,
+                        retro: false, volumetric: false, pixel: false, powershot: false, clone: false,
                     });
                     // Still push default values so they're ready when clay exits
                     for (const section of postFxSections) {

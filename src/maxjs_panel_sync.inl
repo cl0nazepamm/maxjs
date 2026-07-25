@@ -3432,7 +3432,6 @@
             ExtractJsonString(msg, L"localHdriFileName", localHdriFileName);
             ExtractJsonBool(msg, L"includeSceneNodes", options.includeSceneNodes);
             ExtractJsonBool(msg, L"includeEnvironment", options.includeEnvironment);
-            ExtractJsonBool(msg, L"includeFog", options.includeFog);
             ExtractJsonBool(msg, L"includeLights", options.includeLights);
             ExtractJsonBool(msg, L"includeAudios", options.includeAudios);
             ExtractJsonBool(msg, L"includeGLTFs", options.includeGLTFs);
@@ -4841,23 +4840,19 @@
     }
 
     EnvData cachedEnv_;
-    FogData cachedFog_;
     std::wstring cachedEnvJson_;   // pre-built JSON fragment
-    std::wstring cachedFogJson_;   // pre-built JSON fragment
     std::wstring cachedHdriPath_;  // last HDRI path we mapped
     std::wstring cachedHdriUrl_;   // cached MapTexturePath result
     static constexpr int ENV_FOG_POLL_TICKS = 6;  // ~200ms at 33ms tick
 
     std::wstring lastEnvFogSig_;   // change-detection signature
 
-    // Poll env+fog at reduced cadence; send standalone message ONLY when changed
+    // Poll env at reduced cadence; send standalone message ONLY when changed
     void PollEnvFog() {
         if (!webview_) return;
 
         EnvData env;
         GetEnvironment(env);
-        FogData fog;
-        GetFogData(fog);
 
         // Only re-map HDRI URL when path actually changes (avoids filesystem hit)
         std::wstring hdriUrl;
@@ -4872,13 +4867,11 @@
             cachedHdriUrl_.clear();
         }
 
-        // Build env+fog JSON
+        // Build env JSON
         std::wostringstream ss;
         ss.imbue(std::locale::classic());
         ss << L"{\"type\":\"env_update\",";
         WriteEnvJson(ss, env, hdriUrl);
-        ss << L",";
-        WriteFogJson(ss, fog);
         ss << L'}';
         std::wstring json = ss.str();
 
@@ -4886,7 +4879,6 @@
         if (json == lastEnvFogSig_) return;
         lastEnvFogSig_ = json;
         cachedEnv_ = env;
-        cachedFog_ = fog;
 
         webview_->PostWebMessageAsJson(json.c_str());
     }

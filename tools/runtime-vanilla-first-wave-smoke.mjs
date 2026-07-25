@@ -260,7 +260,6 @@ function functionBody(source, signature) {
         ['setPowerShotEnabled', 'state.powershot.enabled'],
         ['setDofEnabled', 'state.dof.enabled'],
         ['setVolumetricEnabled', 'state.volumetric.enabled'],
-        ['setFogEnabled', 'state.fog.enabled'],
     ]) {
         const body = functionBody(source, `${method}(enabled)`);
         assert.match(body, new RegExp(`${statePath.replaceAll('.', '\\.')}\\s*===\\s*next`),

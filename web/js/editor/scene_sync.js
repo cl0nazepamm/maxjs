@@ -967,7 +967,6 @@ function createSceneSync(deps = {}) {
             } else if (snapshotEnv?.enabled === false || snapshotEnv?.type === 'none') {
                 deps.removeAuthoredEnvironment();
             }
-            if (snapshot.fog) deps.maxjsFx.setFogFromScene(snapshot.fog);
             const lightsChanged = snapshot.lights ? deps.applyLights(snapshot.lights) : false;
             if (snapshot.sceneCameras) deps.updateSceneCameraList(snapshot.sceneCameras, snapshot.lockedCamera);
             deps.audioSystem?.applyAudios(snapshot.audios ?? []);

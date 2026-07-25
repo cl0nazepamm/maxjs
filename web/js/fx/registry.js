@@ -11,7 +11,6 @@ import bloom from './effects/bloom.js';
 import toonOutline from './effects/toonOutline.js';
 import contactShadow from './effects/contactShadow.js';
 import retro from './effects/retro.js';
-import fog from './effects/fog.js';
 import pixel from './effects/pixel.js';
 import volumetric from './effects/volumetric.js';
 import dof from './effects/dof.js';
@@ -30,7 +29,6 @@ export const ALL = [
     toonOutline,
     contactShadow,
     retro,
-    fog,
     volumetric,
     pixel,
     dof,

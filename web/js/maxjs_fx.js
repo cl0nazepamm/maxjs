@@ -101,10 +101,10 @@ export function createMaxJSFxController({
         filmWeave: 0.4,
         filmFlicker: 0.12,
         filmNegative: false,
-        // True-NIR white phosphor by default — the P45 (true NIR) preset carries
-        // the hot tube gain / ABC swing that gives the real close-range AGC feel.
-        infraredPreset: 'white_phosphor_nir',
-        ...powerShotInfraredPresetUiDefaults('white_phosphor_nir'),
+        // Modern Gen-3/P45 silver-blue is the default tube. The previous neutral
+        // look remains selectable as the Ethereal true-NIR profile.
+        infraredPreset: 'gen3_white_phosphor_nir',
+        ...powerShotInfraredPresetUiDefaults('gen3_white_phosphor_nir'),
         irElectronModel: false,
         irElectronsPerUnit: 1024,
         nsSmear: 0.9, // NightShot CCD interline vertical smear
@@ -507,19 +507,14 @@ export function createMaxJSFxController({
             if (!source || typeof source !== 'object') continue;
             state[key] = { ...state[key], ...source };
         }
+        state.powershot.infraredPreset = normalizePowerShotInfraredPreset(
+            state.powershot.infraredPreset,
+        );
         if (Array.isArray(fx.toonOutline?.color)) {
             state.toonOutline.color = [...fx.toonOutline.color];
         }
         if (Array.isArray(fx.clone?.color)) {
             state.clone.color = [...fx.clone.color];
-        }
-        // Legacy saves carry the pseudo-NIR 'white_phosphor' preset — the old
-        // default, never a deliberate choice (there is no preset selector in the
-        // UI). Fold them into the true-NIR default, trims included, so the tube
-        // gain / ABC behaviour matches current builds.
-        if (fx.powershot && state.powershot.infraredPreset === 'white_phosphor') {
-            state.powershot.infraredPreset = 'white_phosphor_nir';
-            Object.assign(state.powershot, powerShotInfraredPresetUiDefaults('white_phosphor_nir'));
         }
         syncHiddenBackgroundUniforms();
         colorGradingBrightnessU.value = state.colorGrading.brightness;

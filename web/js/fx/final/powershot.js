@@ -9,7 +9,7 @@ import * as THREE from 'three';
 import { Pipeline as PowerShotPipeline, applyPreset as applyPowerShotPreset, STAGE_DEFS as POWERSHOT_STAGE_DEFS } from 'powershot-threejs/pipeline';
 import { PRESETS as POWERSHOT_PRESETS, PRESET_KEYS as POWERSHOT_PRESET_KEYS } from 'powershot-threejs/presets';
 import { FilmPipeline as PowerShotFilmPipeline, applyFilmPreset as applyPowerShotFilmPreset, FILM_PRESETS as POWERSHOT_FILM_PRESETS, FILM_PRESET_KEYS as POWERSHOT_FILM_PRESET_KEYS } from 'powershot-threejs/film';
-import { InfraredPipeline as PowerShotInfraredPipeline, applyInfraredPreset as applyPowerShotInfraredPreset, INFRARED_PRESETS as POWERSHOT_INFRARED_PRESETS, INFRARED_PRESET_KEYS as POWERSHOT_INFRARED_PRESET_KEYS } from 'powershot-threejs/infrared';
+import { InfraredPipeline as PowerShotInfraredPipeline, applyInfraredProfile as applyPowerShotInfraredProfile, applyInfraredPreset as applyPowerShotInfraredPreset, INFRARED_PRESETS as POWERSHOT_INFRARED_PRESETS, INFRARED_PRESET_KEYS as POWERSHOT_INFRARED_PRESET_KEYS } from 'powershot-threejs/infrared';
 import { NightshotPipeline as PowerShotNightshotPipeline, applyNightshotPreset as applyPowerShotNightshotPreset, NIGHTSHOT_PRESETS as POWERSHOT_NIGHTSHOT_PRESETS } from 'powershot-threejs/nightshot';
 
 function finiteOr(value, fallback) {
@@ -93,9 +93,12 @@ export function listPowerShotFilmStocks() {
     }));
 }
 
+const POWERSHOT_DEFAULT_INFRARED_PRESET = 'gen3_white_phosphor_nir';
+
 export function normalizePowerShotInfraredPreset(value) {
-    const key = String(value || POWERSHOT_INFRARED_PRESET_KEYS[0]);
-    return POWERSHOT_INFRARED_PRESETS[key] ? key : POWERSHOT_INFRARED_PRESET_KEYS[0];
+    const fallback = POWERSHOT_INFRARED_PRESETS[POWERSHOT_DEFAULT_INFRARED_PRESET] ? POWERSHOT_DEFAULT_INFRARED_PRESET : POWERSHOT_INFRARED_PRESET_KEYS[0];
+    const key = String(value || fallback);
+    return POWERSHOT_INFRARED_PRESETS[key]?.input_mode === 'nir' ? key : fallback;
 }
 
 // Flat UI trims pulled from a preset; the full preset (phosphor colours, curves,
@@ -118,10 +121,13 @@ export function powerShotInfraredPresetUiDefaults(key) {
 }
 
 export function listPowerShotInfraredPresets() {
-    return POWERSHOT_INFRARED_PRESET_KEYS.map((key) => ({
-        key,
-        label: POWERSHOT_INFRARED_PRESETS[key]?.name || key,
-    }));
+    // max.js feeds the tube a scene-linear NIR response, not an ordinary RGB image.
+    return POWERSHOT_INFRARED_PRESET_KEYS
+        .filter((key) => POWERSHOT_INFRARED_PRESETS[key]?.input_mode === 'nir')
+        .map((key) => ({
+            key,
+            label: POWERSHOT_INFRARED_PRESETS[key]?.name || key,
+        }));
 }
 
 export function powerShotPresetUiDefaults(key) {
@@ -202,6 +208,7 @@ export function createPowerShotFinal({
     let powerShotPipeline = null;
     let filmPipeline = null;
     let infraredPipeline = null;
+    let infraredProfileKey = null;
     let nightshotPipeline = null;
     let powerShotFrame = 0;
     const drawBufferSize = new THREE.Vector2();
@@ -328,14 +335,22 @@ export function createPowerShotFinal({
         const presetKey = normalizePowerShotInfraredPreset(p.infraredPreset);
         const preset = POWERSHOT_INFRARED_PRESETS[presetKey];
         p.infraredPreset = presetKey;
-        // full preset first (phosphor colours, gain curve, noise character),
-        // then the user-facing trims from state on top
-        applyPowerShotInfraredPreset(infraredPipeline.ctx, preset);
+        // A profile change also updates input interpretation + halo topology and
+        // clears temporal history once. Ordinary frame sync must not clear it:
+        // persistence and ABC/autogating need their previous-frame buffers.
+        if (infraredProfileKey !== presetKey) {
+            applyPowerShotInfraredProfile(infraredPipeline, preset);
+            infraredProfileKey = presetKey;
+        } else {
+            // Full preset first (phosphor colours, gain curve, noise character),
+            // then the user-facing trims from state on top.
+            applyPowerShotInfraredPreset(infraredPipeline.ctx, preset);
+        }
         infraredPipeline.ctx.power.value = THREE.MathUtils.clamp(p.amount, 0, 1);
         const I = infraredPipeline.ctx.P;
         I.exposure.value = p.irExposure;
         I.inputGamma.value = p.irInputGamma;
-        I.nirInput.value = p.irResponse;
+        infraredPipeline.setInputResponse(p.irResponse, preset.flux_scale ?? 1.0);
         I.localGain.value = p.irLocalGain;
         I.glowStrength.value = p.irGlow;
         I.glowThreshold.value = p.irGlowThreshold;
@@ -361,7 +376,10 @@ export function createPowerShotFinal({
         const I = nightshotPipeline.ir.ctx.P;
         I.exposure.value = p.irExposure;
         I.inputGamma.value = p.irInputGamma;
-        I.nirInput.value = p.irResponse;
+        nightshotPipeline.ir.setInputResponse(
+            p.irResponse,
+            POWERSHOT_NIGHTSHOT_PRESETS.nightshot_plus.ir.flux_scale ?? 1.0,
+        );
         I.noiseAmount.value = p.irNoise;
         // PowerShot <=0.6.1 added the NightShot hotspot as constant green
         // emission, lifting black across most of the frame. Newer pipelines
@@ -588,6 +606,7 @@ export function createPowerShotFinal({
             filmPipeline = null;
             try { infraredPipeline?.dispose?.(); } catch (_) {}
             infraredPipeline = null;
+            infraredProfileKey = null;
             try { nightshotPipeline?.dispose?.(); } catch (_) {}
             nightshotPipeline = null;
         },

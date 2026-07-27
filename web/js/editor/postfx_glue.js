@@ -333,8 +333,8 @@ function createPostFxGlue(deps = {}) {
                     filmWeave: 0.4,
                     filmFlicker: 0.12,
                     filmNegative: false,
-                    infraredPreset: 'white_phosphor_nir',
-                    ...powerShotInfraredPresetUiDefaults('white_phosphor_nir'),
+                    infraredPreset: 'gen3_white_phosphor_nir',
+                    ...powerShotInfraredPresetUiDefaults('gen3_white_phosphor_nir'),
                     irIlluminator: 1,
                     irElectronModel: false,
                     irElectronsPerUnit: 1024,
@@ -364,6 +364,16 @@ function createPostFxGlue(deps = {}) {
                         options: deps.maxjsFx.getPowerShotFilmStocks().map((stock) => ({
                             value: stock.key,
                             label: stock.label,
+                        })),
+                    },
+                    {
+                        key: 'infraredPreset',
+                        label: 'Tube Profile',
+                        type: 'select',
+                        visibleWhen: isPowerShotInfraredMode,
+                        options: deps.maxjsFx.getPowerShotInfraredPresets().map((preset) => ({
+                            value: preset.key,
+                            label: preset.label,
                         })),
                     },
                     {
@@ -2034,7 +2044,6 @@ function createPostFxGlue(deps = {}) {
 
         // ── Post FX persistence ──
         const POSTFX_STORAGE_KEY = 'maxjs_postfx_state';
-        let postFxPersistTimer = 0;
         let lastProjectPostFxSignature = '';
         let suppressPostFxPersistenceDepth = 0;
 
@@ -2064,12 +2073,18 @@ function createPostFxGlue(deps = {}) {
                 const signature = JSON.stringify(payload);
                 if (signature === lastProjectPostFxSignature) return;
                 lastProjectPostFxSignature = signature;
-                clearTimeout(postFxPersistTimer);
-                postFxPersistTimer = setTimeout(() => {
-                    void projectRuntime.setPostFxState(payload).catch(error => {
-                        deps.reportBridgeError('post fx state save', error);
-                    });
-                }, 180);
+                // A committed control edit must reach WebView2's host queue before
+                // the panel can be restarted. Deferring this call in a page-local
+                // timer loses the latest values when that page is torn down.
+                // bridge.send() runs synchronously inside setPostFxState(); the
+                // returned promise only tracks the host acknowledgement.
+                void projectRuntime.setPostFxState(payload).catch(error => {
+                    // Permit an unchanged retry after a failed host write.
+                    if (lastProjectPostFxSignature === signature) {
+                        lastProjectPostFxSignature = '';
+                    }
+                    deps.reportBridgeError('post fx state save', error);
+                });
                 return;
             }
             try {

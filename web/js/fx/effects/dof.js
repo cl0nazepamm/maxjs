@@ -4,6 +4,30 @@
 import { vec4 } from 'three/tsl';
 import { dof } from 'three/addons/tsl/display/DepthOfFieldNode.js';
 
+// max.js compatibility patch for three r185.
+//
+// Upstream DepthOfFieldNode.setup() creates a new GaussianBlurNode every time
+// setup is revisited, replacing the material reference without disposing the
+// old blur's two full-resolution render targets. Keep setup idempotent for one
+// DOF instance. A normal max.js pipeline rebuild creates a new DOF instance,
+// so builder context changes still receive a fresh upstream setup.
+//
+// Remove this wrapper once upstream setup() reuses its internal blur graph.
+function stabilizeDofSetup(dofPass) {
+    const upstreamSetup = dofPass.setup;
+    let setupComplete = false;
+    let setupResult = null;
+
+    dofPass.setup = function stableSetup(builder) {
+        if (setupComplete) return setupResult;
+        setupResult = upstreamSetup.call(this, builder);
+        setupComplete = true;
+        return setupResult;
+    };
+
+    return dofPass;
+}
+
 export default {
     id: 'dof',
     stage: 'beauty',
@@ -31,6 +55,7 @@ export default {
             uniforms.dofFocalLengthU,
             uniforms.dofBokehScaleU
         );
+        stabilizeDofSetup(dofPass);
         ctx.applyNodeResolutionScale(dofPass);
         ctx.pushNode(dofPass);
         // Upstream r185 dispose() gap: DepthOfFieldNode wires a gaussianBlur()

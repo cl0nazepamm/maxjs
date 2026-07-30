@@ -3444,7 +3444,6 @@
             ExtractJsonBool(msg, L"includeDisabledLayers", options.includeDisabledLayers);
             ExtractJsonBool(msg, L"copyAssets", options.copyAssets);
             ExtractJsonBool(msg, L"includeRapierVendor", options.includeRapierVendor);
-            ExtractJsonBool(msg, L"includeGeospatialSky", options.includeGeospatialSky);
             ExtractJsonBool(msg, L"includeAnimations", options.includeAnimations);
             ExtractJsonBool(msg, L"includeTransformAnimation", options.includeTransformAnimation);
             ExtractJsonBool(msg, L"includeGeometryAnimation", options.includeGeometryAnimation);
@@ -3716,15 +3715,15 @@
             return;
         }
 
-        const int envPhase = tickCount_ % ENV_FOG_POLL_TICKS;
+        const int envPhase = tickCount_ % ENV_POLL_TICKS;
         const int lightPhase = tickCount_ % LIGHT_DETECT_TICKS;
         const int slowPhase = tickCount_ % 15;
 
         const bool pathTracingFreezePolling =
             IsPathTracingNativeFreezeActive() && pathTracingHasSceneSync_;
 
-        // Poll env+fog at reduced cadence (~200ms)
-        if (envPhase == 0) PollEnvFog();
+        // Poll env at reduced cadence (~200ms)
+        if (envPhase == 0) PollEnv();
 
         PumpDeferredIdlePollFullSync(now);
 
@@ -4843,12 +4842,12 @@
     std::wstring cachedEnvJson_;   // pre-built JSON fragment
     std::wstring cachedHdriPath_;  // last HDRI path we mapped
     std::wstring cachedHdriUrl_;   // cached MapTexturePath result
-    static constexpr int ENV_FOG_POLL_TICKS = 6;  // ~200ms at 33ms tick
+    static constexpr int ENV_POLL_TICKS = 6;  // ~200ms at 33ms tick
 
-    std::wstring lastEnvFogSig_;   // change-detection signature
+    std::wstring lastEnvSig_;   // change-detection signature
 
     // Poll env at reduced cadence; send standalone message ONLY when changed
-    void PollEnvFog() {
+    void PollEnv() {
         if (!webview_) return;
 
         EnvData env;
@@ -4876,8 +4875,8 @@
         std::wstring json = ss.str();
 
         // Only send if something changed
-        if (json == lastEnvFogSig_) return;
-        lastEnvFogSig_ = json;
+        if (json == lastEnvSig_) return;
+        lastEnvSig_ = json;
         cachedEnv_ = env;
 
         webview_->PostWebMessageAsJson(json.c_str());

@@ -168,7 +168,7 @@ function normalizeEnv(env, snapshotUi) {
     };
 }
 
-export function createSnapshotEnvironment({ scene, renderer, camera = null, rootUrl = '.', allowGeospatialSky = true } = {}) {
+export function createSnapshotEnvironment({ scene, renderer, rootUrl = '.' } = {}) {
     if (!scene) throw new Error('createSnapshotEnvironment: scene is required');
     if (!renderer) throw new Error('createSnapshotEnvironment: renderer is required');
 
@@ -186,7 +186,6 @@ export function createSnapshotEnvironment({ scene, renderer, camera = null, root
     let envMap = null;
     let lastSignature = '';
     let lastHdriRaw = null;
-    let lastCamera = camera;
     let current = {
         type: 'none',
         enabled: false,
@@ -303,8 +302,8 @@ export function createSnapshotEnvironment({ scene, renderer, camera = null, root
         const signature = JSON.stringify(['sky', params.raw?.sky, params.enabled, params.backgroundVisible]);
         if (!skyController || lastSignature !== signature) {
             const mod = await import('./scene_sky.js');
-            skyController ??= mod.createSky({ scene, renderer, allowGeospatialSky });
-            await skyController.apply(params.raw.sky, { camera: lastCamera });
+            skyController ??= mod.createSky({ scene, renderer });
+            await skyController.apply(params.raw.sky);
             lastSignature = signature;
         }
         skyController.setVisible?.(params.enabled);
@@ -428,14 +427,8 @@ export function createSnapshotEnvironment({ scene, renderer, camera = null, root
         try { pmremGenerator.dispose?.(); } catch {}
     }
 
-    function update(dt, elapsed, camera) {
-        lastCamera = camera || lastCamera;
-        skyController?.update?.(dt, elapsed, camera);
-    }
-
     return {
         apply,
-        update,
         setEnabled,
         setVisible: setEnabled,
         setBackgroundVisible,

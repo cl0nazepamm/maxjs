@@ -106,7 +106,6 @@
     bool CopySnapshotRuntimeSeed(const std::wstring& webDir,
                                  const std::wstring& outDir,
                                  bool copyRapierVendor,
-                                 bool copyGeospatialVendor,
                                  std::wstring& error) {
         const std::wstring snapshotHtml = webDir + L"\\snapshot.html";
         if (!FileExists(snapshotHtml)) {
@@ -177,75 +176,6 @@
             return false;
         }
 
-        // Geospatial / planetary atmosphere sky vendor (@takram + three/src node
-        // sources). Heavy (~6 MB) and only consumed by geospatial_sky.js when a
-        // scene runs the planetary sky model, so it is gated behind its own export
-        // toggle to keep ordinary snapshots lean.
-        if (copyGeospatialVendor) {
-            const std::wstring takramRoot = webDir + L"\\node_modules\\@takram";
-            const std::wstring takramOutRoot = outDir + L"\\node_modules\\@takram";
-            const std::wstring atmosphereRoot = takramRoot + L"\\three-atmosphere";
-            const std::wstring geospatialRoot = takramRoot + L"\\three-geospatial";
-            if (!DirectoryExists(atmosphereRoot + L"\\build")) {
-                error = L"Snapshot runtime dependency missing: @takram/three-atmosphere/build";
-                return false;
-            }
-            if (!DirectoryExists(atmosphereRoot + L"\\assets")) {
-                error = L"Snapshot runtime dependency missing: @takram/three-atmosphere/assets";
-                return false;
-            }
-            if (!DirectoryExists(geospatialRoot + L"\\build")) {
-                error = L"Snapshot runtime dependency missing: @takram/three-geospatial/build";
-                return false;
-            }
-            if (!CopyDirectoryRecursive(
-                    atmosphereRoot + L"\\build",
-                    takramOutRoot + L"\\three-atmosphere\\build")) {
-                error = L"Failed to copy snapshot runtime three-atmosphere build";
-                return false;
-            }
-            if (!CopyDirectoryRecursive(
-                    atmosphereRoot + L"\\assets",
-                    takramOutRoot + L"\\three-atmosphere\\assets")) {
-                error = L"Failed to copy snapshot runtime three-atmosphere assets";
-                return false;
-            }
-            if (!CopyDirectoryRecursive(
-                    geospatialRoot + L"\\build",
-                    takramOutRoot + L"\\three-geospatial\\build")) {
-                error = L"Failed to copy snapshot runtime three-geospatial build";
-                return false;
-            }
-
-            // The takram WebGPU builds (three-atmosphere/build/webgpu.js,
-            // three-geospatial/build/webgpu.js) deep-import three node sources such
-            // as `three/src/nodes/core/NodeUtils.js`. The bundled vendor three.js is
-            // a single-file build with no `src/` tree, so the importmap resolves
-            // `three/src/` to node_modules/three/src — which must ship alongside the
-            // takram builds, or the WebGPU sky fails with a 404 on NodeUtils.js.
-            const std::wstring threeSrc = webDir + L"\\node_modules\\three\\src";
-            if (!DirectoryExists(threeSrc)) {
-                error = L"Snapshot runtime dependency missing: node_modules/three/src";
-                return false;
-            }
-            if (!CopyDirectoryRecursive(threeSrc, outDir + L"\\node_modules\\three\\src")) {
-                error = L"Failed to copy snapshot runtime three.js node sources (three/src)";
-                return false;
-            }
-
-            const std::wstring postprocessingBuild = webDir + L"\\node_modules\\postprocessing\\build";
-            if (!DirectoryExists(postprocessingBuild)) {
-                error = L"Snapshot runtime dependency missing: postprocessing/build";
-                return false;
-            }
-            if (!CopyDirectoryRecursive(
-                    postprocessingBuild,
-                    outDir + L"\\node_modules\\postprocessing\\build")) {
-                error = L"Failed to copy snapshot runtime postprocessing build";
-                return false;
-            }
-        }
-
         const std::wstring outRapierVendor = outDir + L"\\vendor\\rapier";
         if (copyRapierVendor) {
             const std::wstring rapierVendor = webDir + L"\\vendor\\rapier";
@@ -288,7 +218,6 @@
         bool environment = false;
         bool hdri = false;
         bool sky = false;
-        bool geospatialSky = false;
         bool binaryInstances = false;
         std::wstring rendererPref = L"webgl";
         std::vector<std::wstring> postFx;
@@ -854,7 +783,6 @@
         addIfEnabled(L"toonOutline", L"toonOutline");
         addIfEnabled(L"contactShadow", L"contactShadow");
         addIfEnabled(L"retro", L"retro");
-        addIfEnabled(L"fog", L"fog");
         addIfEnabled(L"pixel", L"pixel");
         addIfEnabled(L"volumetric", L"volumetric");
         addIfEnabled(L"dof", L"dof");
@@ -931,7 +859,6 @@
         ss << L",\"environment\":" << (features.environment ? L"true" : L"false");
         ss << L",\"hdri\":" << (features.hdri ? L"true" : L"false");
         ss << L",\"sky\":" << (features.sky ? L"true" : L"false");
-        ss << L",\"geospatial_sky\":" << (features.geospatialSky ? L"true" : L"false");
         ss << L",\"binary_instances\":" << (features.binaryInstances ? L"true" : L"false");
         ss << L",\"post_fx\":";
         WriteStringVectorJson(ss, features.postFx);
@@ -1493,9 +1420,6 @@
         if (options.includeEnvironment && envData.isSky) {
             runtimeFeatures.environment = true;
             runtimeFeatures.sky = true;
-            runtimeFeatures.geospatialSky =
-                options.includeGeospatialSky &&
-                envData.skyModel == threejs_sky_model_planetary;
             AddUniqueRuntimeFeature(runtimeFeatures.threeAddons, L"Sky");
             AddUniqueRuntimeFeature(runtimeFeatures.threeAddons, L"SkyMesh");
         }
@@ -1512,11 +1436,6 @@
             }
         }
 
-        // Scene fog is deliberately NOT exported. The standalone player has no
-        // reader for `meta.fog` (the live viewer's is scene_sync.js ->
-        // maxjsFx.setFogFromScene), so it only ever shipped as a dead key that
-        // read as supported. WebGPU snapshots keep their fog through the
-        // serialized post-FX state; WebGL snapshots render without it.
         if (options.includeLights) {
             ss << L",";
             WriteLightsJson(ss, ip, t, true, false, false);
@@ -1664,7 +1583,6 @@
                 webDir,
                 outDir,
                 options.includeRapierVendor,
-                options.includeGeospatialSky,
                 error)) {
             cleanupOnFail();
             return false;

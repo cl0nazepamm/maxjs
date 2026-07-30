@@ -152,7 +152,6 @@ function normalizeRuntimeFeatures(meta) {
         gltf: !!(raw.gltf ?? raw.gltfs),
         animations: !!raw.animations,
         environment: !!(raw.environment ?? raw.hdri ?? raw.sky),
-        geospatial_sky: !!(raw.geospatial_sky ?? raw.geospatialSky),
         binary_instances: !!(raw.binary_instances ?? raw.binaryInstances),
         exports: raw.exports && typeof raw.exports === 'object' ? raw.exports : {},
         counts: raw.counts && typeof raw.counts === 'object' ? raw.counts : {},
@@ -1657,7 +1656,6 @@ function startRenderLoop({
         for (const module of Object.values(optionalModules ?? {})) {
             module?.update?.(dt, elapsed);
         }
-        snapshotEnvironment?.update?.(dt, elapsed, camera);
         studioLighting?.updateCameraConstraints?.();
 
         layerManager?.beforeRender?.(elapsed);
@@ -1758,9 +1756,7 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
     const snapshotEnvironment = createSnapshotEnvironment({
         scene,
         renderer,
-        camera,
         rootUrl: root,
-        allowGeospatialSky: !!features.geospatial_sky,
     });
     let authoredLightCount = 0;
     let studioLighting = null;

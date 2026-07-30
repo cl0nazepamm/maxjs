@@ -17,7 +17,6 @@ function createSnapshotExport(deps = {}) {
             includeDisabledLayers: false,
             copyAssets: true,
             includeRapierVendor: false,
-            includeGeospatialSky: false,
             includeAnimations: true,
             includeTransformAnimation: true,
             includeGeometryAnimation: true,
@@ -155,9 +154,8 @@ function createSnapshotExport(deps = {}) {
                         </div>
                         <div class="snapshot-grid">
                             <label class="fx-check" for="snapshot-includeRapierVendor"><span>Rapier Physics</span><input id="snapshot-includeRapierVendor" type="checkbox"></label>
-                            <label class="fx-check" for="snapshot-includeGeospatialSky" title="Bundle the @takram atmosphere packages + three/src node sources (~6 MB) needed by the planetary/geospatial sky. Off keeps exports lean; tick only for scenes using the planetary sky model."><span>Geospatial Sky</span><input id="snapshot-includeGeospatialSky" type="checkbox"></label>
                         </div>
-                        <div class="snapshot-note">Only needed for physics runtime layers (Rapier) or the planetary/geospatial sky model.</div>
+                        <div class="snapshot-note">Only needed for physics runtime layers (Rapier).</div>
                     </section>
                     <section class="fx-section">
                         <div class="fx-section-header">

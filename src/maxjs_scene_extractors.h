@@ -21,7 +21,6 @@
 #include "maxjs_material_sync.h"
 #include "threejs_audio.h"
 #include "threejs_lights.h"
-#include "threejs_fog.h"
 #include "threejs_sky.h"
 #include "threejs_deform.h"
 #include "threejs_gltf.h"
@@ -2166,9 +2165,7 @@ struct EnvData {
     float skyElevation  = 2.0f;
     float skyAzimuth    = 180.0f;
     float skyExposure   = 0.5f;
-    int   skyModel      = threejs_sky_model_classic;
     bool  skyShowSunDisc = true;
-    float skyPlanetAltitude = 1200.0f;
 };
 
 // Generic: find a named float/int/string in any paramblock of a map
@@ -2271,9 +2268,7 @@ static void GetEnvironment(EnvData& env) {
             env.skyElevation = pb->GetFloat(psky_elevation);
             env.skyAzimuth   = pb->GetFloat(psky_azimuth);
             env.skyExposure  = pb->GetFloat(psky_exposure);
-            env.skyModel     = pb->GetInt(psky_model);
             env.skyShowSunDisc = pb->GetInt(psky_show_sun_disc) != 0;
-            env.skyPlanetAltitude = pb->GetFloat(psky_planet_altitude);
         }
         return;
     }
@@ -2311,9 +2306,7 @@ static void WriteEnvJson(std::wostringstream& ss, const EnvData& env,
         ss << L",\"elevation\":" << env.skyElevation;
         ss << L",\"azimuth\":" << env.skyAzimuth;
         ss << L",\"exposure\":" << env.skyExposure;
-        ss << L",\"model\":" << env.skyModel;
         ss << L",\"showSunDisc\":" << (env.skyShowSunDisc ? L"true" : L"false");
-        ss << L",\"cameraAltitude\":" << env.skyPlanetAltitude;
         ss << L'}';
     } else if (hasHdriUrl) {
         ss << L",\"type\":\"hdri\"";

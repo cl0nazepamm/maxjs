@@ -101,14 +101,10 @@ static ParamBlockDesc2 skyPBDesc(
             IDC_SKY_EXPOSURE_EDIT, IDC_SKY_EXPOSURE_SPIN, 0.05f,
         p_end,
 
-    // Geospatial sky switch. Keep these appended so old .max files retain
-    // their saved parameter IDs.
-    psky_model, _T("skyModel"), TYPE_INT, 0, 0,
-        p_default, threejs_sky_model_classic,
-        p_ui, TYPE_INT_COMBOBOX, IDC_SKY_MODEL, 2,
-            IDS_SKY_MODEL_CLASSIC,
-            IDS_SKY_MODEL_PLANETARY,
-        p_vals, threejs_sky_model_classic, threejs_sky_model_planetary,
+    // Retired geospatial-sky slot (was skyModel). Kept so old .max files retain
+    // their saved parameter IDs, but not exposed or exported.
+    psky_reserved_legacy_model, _T("reservedSkyModel"), TYPE_INT, 0, 0,
+        p_default, 0,
         p_end,
 
     psky_show_sun_disc, _T("showSunDisc"), TYPE_BOOL, 0, 0,
@@ -143,11 +139,10 @@ static ParamBlockDesc2 skyPBDesc(
         p_range, 0.0f, 1.0f,
         p_end,
 
-    psky_planet_altitude, _T("planetAltitude"), TYPE_FLOAT, P_ANIMATABLE, 0,
+    // Retired geospatial-sky slot (was planetAltitude).
+    psky_reserved_legacy_altitude, _T("reservedSkyParam5"), TYPE_FLOAT, P_ANIMATABLE, 0,
         p_default, 1200.0f,
         p_range, 0.0f, 200000.0f,
-        p_ui, TYPE_SPINNER, EDITTYPE_FLOAT,
-            IDC_SKY_PLANET_ALTITUDE_EDIT, IDC_SKY_PLANET_ALTITUDE_SPIN, 100.0f,
         p_end,
 
     p_end  // end of param block

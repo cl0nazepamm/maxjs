@@ -94,7 +94,7 @@ Unsupported assignments fall back to the object wire color. TSL and MaterialX co
 | Hemisphere | No | sky color, ground color, intensity |
 | Ambient | No | color, intensity |
 
-Environment support includes HDRI, authored Three.js sky, geospatial atmosphere where supported, fog, camera clipping, and sky/sun linking.
+Environment support includes HDRI, authored Three.js sky, camera clipping, and sky/sun linking.
 
 ## PostFX
 
@@ -111,7 +111,7 @@ Stable viewer effects include:
 - Depth of field
 - Toon outline
 - Contact shadows
-- Volumetric/fog look controls
+- Volumetric look controls
 - Pixel, retro, CRT, film, color, exposure, and tone controls
 - Shader Lab
 
@@ -132,7 +132,7 @@ Exported snapshot folders can include:
 - `postfx.maxjs.json` for saved look state.
 - `vendor/` runtime dependencies.
 
-Snapshot export preserves scene hierarchy, transforms, materials, textures, lights, shadows, camera state, environment, sky, fog, animation, runtime layers, and selected viewer UI state. PostFX coming later.
+Snapshot export preserves scene hierarchy, transforms, materials, textures, lights, shadows, camera state, environment, sky, animation, runtime layers, and selected viewer UI state. PostFX coming later.
 
 max.js treats runtime files as plugin-owned and `index.html` as project-owned. Re-exporting should refresh the runtime and scene payload without destroying standalone edits.
 

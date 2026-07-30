@@ -683,7 +683,6 @@
             viewportBackgroundColor.setHex(hiddenBackgroundColor);
             syncViewportBackdrop();
             maxjsFx.setHiddenBackgroundColor(hiddenBackgroundColor);
-            geospatialSky?.setFallbackBackground?.(hiddenBackgroundColor);
             saveBackgroundColor();
             syncBackgroundColorSlot();
             savePostFxState();
@@ -1130,7 +1129,6 @@
 
         // ── Sky Environment ──────────────────────────────────
         let skyActive = false;
-        let geospatialSky = null;
         const sky = createSky({
             copyMaxComponentsToWorld,
             retainPMREMTexture,
@@ -1158,8 +1156,6 @@
             get currentEnvParams() { return currentEnvParams; },
             get skyActive() { return skyActive; },
             set skyActive(value) { skyActive = value; },
-            get geospatialSky() { return geospatialSky; },
-            set geospatialSky(value) { geospatialSky = value; },
             get lightProbeGrid() { return lightProbeGrid; },
             set lightProbeGrid(value) { lightProbeGrid = value; },
             get hasLightProbeData() { return hasLightProbeData; },
@@ -1190,10 +1186,8 @@
             getDirectionalLightSunVector,
             findSkyLinkedSunDirection,
             withLinkedSkySun,
-            updateSkyTime,
             refreshSkyFromLinkedSun,
             refreshSkyAmbientLightProbeFromCurrentSky,
-            removeClassicSkyObjects,
             applySky,
             removeSky,
             refreshSkyForSpectralView,
@@ -2503,7 +2497,6 @@
         const renderLoop = createRenderLoop({
             GI_VOLUME_CAMERA_DEBOUNCE_MS,
             flushMaterialDisposals: (...args) => flushMaterialDisposals(...args),
-            updateSkyTime: (...args) => updateSkyTime(...args),
             syncOrbitNavigationFeel: (...args) => syncOrbitNavigationFeel(...args),
             scheduleGiVolumeFromCurrentScene: (...args) => scheduleGiVolumeFromCurrentScene(...args),
             syncPathTracingDofFromPostFx: (...args) => syncPathTracingDofFromPostFx(...args),

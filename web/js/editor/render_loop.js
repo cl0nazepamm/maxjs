@@ -33,7 +33,6 @@ function createRenderLoop(deps = {}) {
                 : null;
             const frameDt = captureFrameTime == null ? liveFrameDt : 0;
             const frameElapsed = captureFrameTime ?? liveFrameElapsed;
-            deps.updateSkyTime(frameElapsed);
             deps.xrRuntime.update(frameDt);
             if (!deps.xrRuntime.active) deps.syncOrbitNavigationFeel();
             let controlsChanged = false;

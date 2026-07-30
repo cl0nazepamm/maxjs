@@ -7,11 +7,8 @@ import * as THREE from 'three';
 
 import { copyMaxComponentsToWorld } from './max_basis.js';
 
-const SKY_MODEL_PLANETARY = 1;
-
 let legacySkyModulePromise = null;
 let nodeSkyModulePromise = null;
-let geospatialSkyModulePromise = null;
 
 const SKY_FALLBACKS = Object.freeze({
     turbidity: 10,
@@ -21,9 +18,7 @@ const SKY_FALLBACKS = Object.freeze({
     elevation: 2,
     azimuth: 180,
     exposure: 0.5,
-    model: 0,
     showSunDisc: true,
-    cameraAltitude: 1200,
 });
 
 const SKY_PROBE_DIRECTIONS = [
@@ -48,14 +43,13 @@ function numberOr(value, fallback) {
     return Number.isFinite(n) ? n : fallback;
 }
 
-export function createSky({ scene, renderer, allowGeospatialSky = true } = {}) {
+export function createSky({ scene, renderer } = {}) {
     if (!scene) throw new Error('createSky: scene is required');
     if (!renderer) throw new Error('createSky: renderer is required');
 
     let mesh = null;
     let sun = null;
     let fill = null;
-    let geospatialSky = null;
     let lightProbe = null;
     let pmremGenerator = null;
     let skyEnvTarget = null;
@@ -65,13 +59,8 @@ export function createSky({ scene, renderer, allowGeospatialSky = true } = {}) {
     let lastRawParams = null;
     let visible = true;
     let backgroundVisible = true;
-    let planetaryActive = false;
     const isWebGpuRenderer = typeof THREE.WebGPURenderer === 'function' && renderer instanceof THREE.WebGPURenderer;
-    const rendererBackendLabel = String(renderer?.userData?.maxjsBackendLabel || '');
     const useLegacySky = !isWebGpuRenderer;
-    const allowGeospatialSkyRuntime = allowGeospatialSky && (rendererBackendLabel
-        ? rendererBackendLabel === 'WebGPU' || rendererBackendLabel === 'TSL_GL' || rendererBackendLabel.startsWith('WebGL')
-        : isWebGpuRenderer);
     const linkedSunDirection = new THREE.Vector3();
     const linkedSunPosition = new THREE.Vector3();
     const linkedSunTarget = new THREE.Vector3();
@@ -91,12 +80,6 @@ export function createSky({ scene, renderer, allowGeospatialSky = true } = {}) {
         nodeSkyModulePromise ??= import('three/addons/objects/SkyMesh.js');
         const mod = await nodeSkyModulePromise;
         return mod.SkyMesh;
-    }
-
-    async function loadGeospatialSkyController() {
-        geospatialSkyModulePromise ??= import('./geospatial_sky.js');
-        const mod = await geospatialSkyModulePromise;
-        return mod.createGeospatialSkyController;
     }
 
     async function ensureMesh() {
@@ -144,21 +127,12 @@ export function createSky({ scene, renderer, allowGeospatialSky = true } = {}) {
         if (sun) sun.visible = visible;
         if (fill) fill.visible = visible;
         if (lightProbe) lightProbe.visible = visible;
-        geospatialSky?.setVisible?.(visible);
-        geospatialSky?.setBackgroundVisible?.(visible && backgroundVisible);
         if (!visible) scene.background = new THREE.Color(0x353535);
     }
 
     function setBackgroundVisible(nextVisible) {
         backgroundVisible = !!nextVisible;
         if (mesh) mesh.visible = visible && backgroundVisible;
-        geospatialSky?.setBackgroundVisible?.(visible && backgroundVisible);
-    }
-
-    function removeClassicObjects() {
-        try { mesh?.parent?.remove(mesh); } catch {}
-        try { sun?.parent?.remove(sun); } catch {}
-        try { fill?.parent?.remove(fill); } catch {}
     }
 
     function removeLightProbe() {
@@ -284,11 +258,6 @@ export function createSky({ scene, renderer, allowGeospatialSky = true } = {}) {
     }
 
     function updateSkyEnvironment(params, sunDir) {
-        if (planetaryActive) {
-            disposeSkyEnvironment();
-            return;
-        }
-
         const nextEnvironment = buildProceduralSkyEnvironment(params, sunDir);
         const nextMap = nextEnvironment?.texture ?? null;
         if (!nextMap) {
@@ -340,14 +309,9 @@ export function createSky({ scene, renderer, allowGeospatialSky = true } = {}) {
         probe.visible = visible;
     }
 
-    function update(_dt, elapsed, camera) {
-        if (!planetaryActive) return;
-        geospatialSky?.update({ camera, elapsedSeconds: elapsed });
-    }
-
     function getDirectionalLightSunVector(light, target = linkedSunDirection) {
         if (!light?.isDirectionalLight || light.visible === false) return null;
-        if (light.name === '__maxjs_sky_sun__' || light.name === '__maxjs_geospatial_sky_sun__') return null;
+        if (light.name === '__maxjs_sky_sun__') return null;
         if (light.userData?.maxjsHandle == null) return null;
         light.updateMatrixWorld?.();
         light.target?.updateMatrixWorld?.();
@@ -385,7 +349,7 @@ export function createSky({ scene, renderer, allowGeospatialSky = true } = {}) {
         };
     }
 
-    async function apply(rawParams, { camera } = {}) {
+    async function apply(rawParams) {
         lastRawParams = rawParams;
         const params = { ...SKY_FALLBACKS, ...withLinkedSun(rawParams) };
         params.turbidity = numberOr(params.turbidity, SKY_FALLBACKS.turbidity);
@@ -395,42 +359,10 @@ export function createSky({ scene, renderer, allowGeospatialSky = true } = {}) {
         params.elevation = numberOr(params.elevation, SKY_FALLBACKS.elevation);
         params.azimuth = numberOr(params.azimuth, SKY_FALLBACKS.azimuth);
         params.exposure = numberOr(params.exposure, SKY_FALLBACKS.exposure);
-        params.model = Math.trunc(numberOr(params.model, SKY_FALLBACKS.model));
         params.showSunDisc = params.showSunDisc !== false && params.showSunDisc !== 0;
-        params.cameraAltitude = Math.max(0, numberOr(params.cameraAltitude, SKY_FALLBACKS.cameraAltitude));
 
         const sig = JSON.stringify(params);
         if (sig === lastSig) return { params, changed: false };
-
-        const planetary = params.model === SKY_MODEL_PLANETARY && allowGeospatialSkyRuntime;
-        if (planetary) {
-            removeClassicObjects();
-            removeLightProbe();
-            disposeSkyEnvironment();
-            try {
-                const createGeospatialSkyController = await loadGeospatialSkyController();
-                geospatialSky ??= createGeospatialSkyController({
-                    scene,
-                    renderer,
-                    backendLabel: renderer?.userData?.maxjsBackendLabel || '',
-                });
-                await geospatialSky.apply(params, { camera, throwOnError: true });
-                geospatialSky.setVisible(visible);
-                geospatialSky.setBackgroundVisible?.(visible && backgroundVisible);
-                planetaryActive = true;
-                lastSig = sig;
-                return { params, changed: true };
-            } catch (error) {
-                console.error('[snapshot sky] geospatial sky unavailable; using procedural sky fallback:', error);
-                try { geospatialSky?.dispose?.(); } catch {}
-                geospatialSky = null;
-                planetaryActive = false;
-            }
-        }
-
-        geospatialSky?.dispose();
-        geospatialSky = null;
-        planetaryActive = false;
 
         await ensureMesh();
         ensureLights();
@@ -487,7 +419,6 @@ export function createSky({ scene, renderer, allowGeospatialSky = true } = {}) {
         try { mesh?.parent?.remove(mesh); } catch {}
         try { sun?.parent?.remove(sun); } catch {}
         try { fill?.parent?.remove(fill); } catch {}
-        try { geospatialSky?.dispose?.(); } catch {}
         removeLightProbe();
         disposeSkyEnvironment();
         try { pmremGenerator?.dispose?.(); } catch {}
@@ -500,17 +431,14 @@ export function createSky({ scene, renderer, allowGeospatialSky = true } = {}) {
         mesh = null;
         sun = null;
         fill = null;
-        geospatialSky = null;
         lightProbe = null;
         pmremGenerator = null;
         skyEnvSourceTexture = null;
         lastSig = '';
-        planetaryActive = false;
     }
 
     return {
         apply,
-        update,
         setVisible,
         setBackgroundVisible,
         dispose,

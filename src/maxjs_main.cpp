@@ -43,7 +43,6 @@
 #include "threejs_audio.h"
 #include "threejs_toon.h"
 #include "threejs_renderer.h"
-#include "threejs_fog.h"
 #include "threejs_sky.h"
 #include "threejs_deform.h"
 #include "threejs_gltf.h"
@@ -769,7 +768,6 @@ public:
         bool includeDisabledLayers = false;
         bool copyAssets = true;
         bool includeRapierVendor = false;
-        bool includeGeospatialSky = false;  // bundle @takram atmosphere + three/src for the planetary sky; off keeps exports lean
         bool includeAnimations = true;
         bool includeTransformAnimation = true;
         bool includeGeometryAnimation = true;
@@ -1491,7 +1489,7 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, ULONG fdwReason, LPVOID) {
 }
 
 __declspec(dllexport) const TCHAR* LibDescription()   { return MAXJS_NAME; }
-__declspec(dllexport) int LibNumberClasses()           { return 23; }
+__declspec(dllexport) int LibNumberClasses()           { return 22; }
 __declspec(dllexport) ClassDesc* LibClassDesc(int i) {
     switch (i) {
         case 0: return &maxJSDesc;
@@ -1509,14 +1507,13 @@ __declspec(dllexport) ClassDesc* LibClassDesc(int i) {
         case 12: return GetThreeJSAmbientLightDesc();
         case 13: return GetThreeJSToonDesc();
         case 14: return GetThreeJSAudioDesc();
-        case 15: return GetThreeJSFogDesc();
-        case 16: return GetThreeJSSkyDesc();
-        case 17: return GetThreeJSDeformDesc();
-        case 18: return GetThreeJSTSLTexDesc();
-        case 19: return GetThreeJSHTMLTexDesc();
-        case 20: return GetThreeJSGLTFDesc();
-        case 21: return GetThreeJSWebAppDesc();
-        case 22: return GetThreeJSProbeGridDesc();
+        case 15: return GetThreeJSSkyDesc();
+        case 16: return GetThreeJSDeformDesc();
+        case 17: return GetThreeJSTSLTexDesc();
+        case 18: return GetThreeJSHTMLTexDesc();
+        case 19: return GetThreeJSGLTFDesc();
+        case 20: return GetThreeJSWebAppDesc();
+        case 21: return GetThreeJSProbeGridDesc();
         default: return nullptr;
     }
 }

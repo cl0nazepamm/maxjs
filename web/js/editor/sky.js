@@ -4,7 +4,6 @@ import * as THREE_STD from 'three-std';
 import { uniform, vec4 } from 'three/tsl';
 import { SkyMesh } from 'three/addons/objects/SkyMesh.js';
 import { Sky } from 'three/addons/objects/Sky.js';
-import { createGeospatialSkyController } from '../geospatial_sky.js';
 
 function createSky(deps = {}) {
         const skyProbeSH = new THREE.SphericalHarmonics3();
@@ -33,8 +32,8 @@ function createSky(deps = {}) {
         // SkyMesh (TSL/NodeMaterial) for WebGPU + WebGL2-fallback backends.
         // Legacy Sky (ShaderMaterial) for pure WebGLRenderer — NodeMaterial can't compile there.
         let skyMesh = null;
-        // PostFX owns renderer.toneMappingExposure, so the classic dome carries
-        // its own exposure multiplier (the planetary sky already does the same).
+        // PostFX owns renderer.toneMappingExposure, so the sky dome carries
+        // its own exposure multiplier.
         const skyDomeExposureUniform = uniform(1.0);
         let skySunLight = null;
         let skyFillLight = null;
@@ -42,13 +41,11 @@ function createSky(deps = {}) {
         let skyPathTraceTexture = null;
         let lastSkySig = '';
         let lastSkySourceParams = null;
-        let skyPlanetaryActive = false;
         const skyLinkedSunDirection = new THREE.Vector3();
         const skyLinkedSunPosition = new THREE.Vector3();
         const skyLinkedSunTarget = new THREE.Vector3();
         const skySunDirectionScratch = new THREE.Vector3();
         const skyGiSunDirectionScratch = new THREE.Vector3();
-        const SKY_MODEL_PLANETARY = 1;
         const SPECTRAL_GI_SKY_INTENSITY = 2.0;
         const SKY_DEFAULTS = Object.freeze({
             turbidity: 10,
@@ -58,16 +55,9 @@ function createSky(deps = {}) {
             elevation: 2,
             azimuth: 180,
             exposure: 0.5,
-            model: 0,
             showSunDisc: true,
-            cameraAltitude: 1200,
         });
-        // Geospatial sky supports native WebGPU, plain WebGL, and TSL_GL. The
-        // controller selects its compatible physical-atmosphere path per backend.
         const useLegacySky = !(deps.renderer instanceof THREE.WebGPURenderer);
-        const allowGeospatialSky = deps.rendererBackendLabel === 'WebGPU'
-            || deps.rendererBackendLabel === 'TSL_GL'
-            || String(deps.rendererBackendLabel || '').startsWith('WebGL');
 
         function addSkyProbeSample(direction, radiance, weight) {
             THREE.SphericalHarmonics3.getBasisAt(direction, skyProbeBasis);
@@ -236,9 +226,7 @@ function createSky(deps = {}) {
         }
 
         function updateSkyReflectionEnvironment(params, sunDir) {
-            const usesGeospatialSky = params?.model === SKY_MODEL_PLANETARY
-                && allowGeospatialSky;
-            if (deps.isPathTracingMode || usesGeospatialSky) {
+            if (deps.isPathTracingMode) {
                 disposeSkyReflectionEnvironment();
                 return;
             }
@@ -311,9 +299,7 @@ function createSky(deps = {}) {
             params.elevation = skyNumber(params.elevation, SKY_DEFAULTS.elevation);
             params.azimuth = skyNumber(params.azimuth, SKY_DEFAULTS.azimuth);
             params.exposure = skyNumber(params.exposure, SKY_DEFAULTS.exposure);
-            params.model = Math.trunc(skyNumber(params.model, SKY_DEFAULTS.model));
             params.showSunDisc = params.showSunDisc !== false && params.showSunDisc !== 0;
-            params.cameraAltitude = Math.max(0, skyNumber(params.cameraAltitude, SKY_DEFAULTS.cameraAltitude));
             return params;
         }
 
@@ -350,7 +336,7 @@ function createSky(deps = {}) {
 
         function syncSpectralGiSky(params) {
             if (!deps.isStudioMode || !deps.haloGi?.setSky) return false;
-            if (!params || params.model === SKY_MODEL_PLANETARY) {
+            if (!params) {
                 deps.haloGi.setSky(null);
                 return false;
             }
@@ -378,7 +364,7 @@ function createSky(deps = {}) {
 
         function isSkyLinkCandidateLight(light) {
             if (!light?.isDirectionalLight || light.userData?.maxjsVisible === false) return false;
-            if (light.name === '__maxjs_sky_sun__' || light.name === '__maxjs_geospatial_sky_sun__') return false;
+            if (light.name === '__maxjs_sky_sun__') return false;
             return light.userData?.maxjsHandle != null;
         }
 
@@ -420,11 +406,6 @@ function createSky(deps = {}) {
             };
         }
 
-        function updateSkyTime(elapsedSeconds) {
-            if (!deps.skyActive || !skyPlanetaryActive) return;
-            deps.geospatialSky?.update({ camera: deps.camera, elapsedSeconds });
-        }
-
         function refreshSkyFromLinkedSun() {
             if (!deps.skyActive || !lastSkySourceParams) return false;
             const beforeSig = lastSkySig;
@@ -436,42 +417,18 @@ function createSky(deps = {}) {
             if (!deps.skyActive || !lastSkySourceParams) return false;
             const params = normalizeSkyParams(withLinkedSkySun(lastSkySourceParams));
             const sunDir = getSkySunDirectionWorld(params, skySunDirectionScratch);
-            if (params.model === SKY_MODEL_PLANETARY && allowGeospatialSky) {
-                deps.clearLightProbe();
-                deps.hasLightProbeData = true;
-                disposeSkyReflectionEnvironment();
-                if (skyEnvMap && deps.scene.environment === skyEnvMap) deps.scene.environment = null;
-                deps.scene.environmentIntensity = 1.0;
-                deps.applyHdriReflectionOnlyState();
-                deps.currentHdriProbeSignature = JSON.stringify([
-                    'geospatial-probe',
-                    params.model,
-                    params.exposure,
-                    params.elevation,
-                    params.azimuth,
-                    params.sunDirectionWorld || null,
-                ]);
-                return true;
-            }
             updateSkyAmbientLightProbe(params, sunDir);
             if (!skyEnvMap || deps.scene.environment !== skyEnvMap) {
                 updateSkyReflectionEnvironment(params, sunDir);
             }
             deps.currentHdriProbeSignature = JSON.stringify([
                 'sky-probe',
-                params.model,
                 params.exposure,
                 params.elevation,
                 params.azimuth,
                 params.sunDirectionWorld || null,
             ]);
             return true;
-        }
-
-        function removeClassicSkyObjects() {
-            if (skyMesh?.parent) skyMesh.parent.remove(skyMesh);
-            if (skySunLight?.parent) skySunLight.parent.remove(skySunLight);
-            if (skyFillLight?.parent) skyFillLight.parent.remove(skyFillLight);
         }
 
         function applySky(skyParams) {
@@ -488,44 +445,6 @@ function createSky(deps = {}) {
             lastSkySig = sig;
 
             try {
-                const planetary = params.model === SKY_MODEL_PLANETARY && allowGeospatialSky;
-                if (planetary) {
-                    removeClassicSkyObjects();
-                    deps.geospatialSky ??= createGeospatialSkyController({
-                        scene: deps.scene,
-                        renderer: deps.renderer,
-                        backendLabel: deps.rendererBackendLabel,
-                        fallbackBackground: deps.hiddenBackgroundColor,
-                    });
-
-                    deps.clearCurrentHdriEnvMap();
-                    disposeSkyReflectionEnvironment();
-                    updateSkyPathTraceEnvironment(params, getSkySunDirectionWorld(params, skySunDirectionScratch));
-                    deps.scene.environment = null;
-                    deps.scene.environmentIntensity = 1.0;
-                    deps.syncMaterialEnvMaps();
-                    deps.scene.environmentRotation.set(0, 0, 0);
-                    deps.scene.backgroundRotation.set(0, 0, 0);
-
-                    deps.geospatialSky.apply(params, { camera: deps.camera });
-                    deps.applyCoreToneMappingState({ markOutput: false });
-                    deps.syncDefaultLightsVisibility();
-                    deps.clearLightProbe();
-                    deps.hasLightProbeData = true;
-                    deps.skyActive = true;
-                    skyPlanetaryActive = true;
-                    deps.applyHdriReflectionOnlyState();
-                    deps.currentHdriUrl = null;
-                    deps.currentHdriProbeSignature = '';
-                    deps.maxjsFx.markEnvironmentChanged?.();
-                    deps.syncHdriPanel();
-                    return;
-                }
-
-                deps.geospatialSky?.dispose();
-                deps.geospatialSky = null;
-                skyPlanetaryActive = false;
-
                 if (!skyMesh) {
                     skyMesh = useLegacySky ? new Sky() : new SkyMesh();
                     skyMesh.scale.setScalar(450000);
@@ -620,9 +539,6 @@ function createSky(deps = {}) {
         function removeSky() {
             lastSkySig = '';
             deps.skyActive = false;
-            skyPlanetaryActive = false;
-            deps.geospatialSky?.dispose();
-            deps.geospatialSky = null;
             if (skyMesh?.parent) skyMesh.parent.remove(skyMesh);
             if (skySunLight?.parent) skySunLight.parent.remove(skySunLight);
             if (skyFillLight?.parent) skyFillLight.parent.remove(skyFillLight);
@@ -665,10 +581,8 @@ function createSky(deps = {}) {
             getDirectionalLightSunVector,
             findSkyLinkedSunDirection,
             withLinkedSkySun,
-            updateSkyTime,
             refreshSkyFromLinkedSun,
             refreshSkyAmbientLightProbeFromCurrentSky,
-            removeClassicSkyObjects,
             applySky,
             removeSky,
             refreshSkyForSpectralView,

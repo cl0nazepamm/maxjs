@@ -168,6 +168,10 @@ canvas { display: block; }
 .dock-drag-handle { right: calc(var(--dock-right) + var(--dock-width)); }
 #rightRail.is-hidden ~ .rail-drag-handle { left: 12px; }
 #rightDock.is-hidden ~ .dock-drag-handle { right: 12px; }
+/* No right-side panel open → hide the dock grabber entirely */
+#rightDock:not(:has(.sidepanel.visible)) ~ .dock-drag-handle {
+    display: none;
+}
 .rail-drag-handle::after,
 .dock-drag-handle::after {
     content: '';

@@ -194,6 +194,11 @@ export function createProjectRuntime({
 }) {
     let projectDir = '';
     let projectRootUrl = '';
+    // Optional host-provided base URL for project files. When the host serves
+    // the project directory itself (e.g. the Blender add-on's same-origin
+    // /maxjs/project/files/ endpoint), it sends `rootUrl` in project_config
+    // and toProjectRootUrl() is bypassed. The 3ds Max host never sends it.
+    let projectRootUrlOverride = '';
     let manifestBaseUrl = '';
     let inlineDir = '';
     let pollMs = 0;
@@ -232,6 +237,21 @@ export function createProjectRuntime({
     const inlineLayerState = new Map();
     const listeners = new Set();
     const pendingHostActions = new Map();
+
+    function normalizeRootUrlOption(rootUrl) {
+        if (typeof rootUrl !== 'string' || !rootUrl.trim()) return '';
+        try {
+            const absolute = new URL(rootUrl.trim(), window.location.href).toString();
+            return absolute.endsWith('/') ? absolute : `${absolute}/`;
+        } catch {
+            return '';
+        }
+    }
+
+    function resolveProjectRootUrl(dir) {
+        if (!dir) return '';
+        return projectRootUrlOverride || toProjectRootUrl(dir);
+    }
 
     function emitChange() {
         for (const listener of listeners) {
@@ -991,9 +1011,12 @@ function stripSettingsFromPostFx(payload) {
         const result = await requestHostAction('project_release_manifest');
         sceneSaved = true;
         manifestExists = true;
+        if (typeof result?.rootUrl === 'string' && result.rootUrl.trim()) {
+            projectRootUrlOverride = normalizeRootUrlOption(result.rootUrl);
+        }
         if (result?.path) {
             projectDir = normalizeWindowsPath(result.path).trim();
-            projectRootUrl = projectDir ? toProjectRootUrl(projectDir) : '';
+            projectRootUrl = resolveProjectRootUrl(projectDir);
             inlineDir = projectDir ? ensureTrailingSlash(`${projectDir}\\inlines`) : '';
         }
         emitChange();
@@ -1114,7 +1137,10 @@ function stripSettingsFromPostFx(payload) {
         const normalized = normalizeWindowsPath(nextDir).trim();
         const projectChanged = normalized !== projectDir;
         projectDir = normalized;
-        projectRootUrl = normalized ? toProjectRootUrl(normalized) : '';
+        if ('rootUrl' in options) {
+            projectRootUrlOverride = normalizeRootUrlOption(options.rootUrl);
+        }
+        projectRootUrl = resolveProjectRootUrl(normalized);
         if (typeof options.inlineDir === 'string') {
             inlineDir = normalizeWindowsPath(options.inlineDir).trim();
         }
@@ -1159,6 +1185,7 @@ function stripSettingsFromPostFx(payload) {
                 inlineDir: msg.inlineDir || '',
                 sceneSaved: msg.sceneSaved === true,
                 manifestExists: msg.manifestExists === true,
+                rootUrl: typeof msg.rootUrl === 'string' ? msg.rootUrl : '',
             }),
             'project config load',
         );
@@ -1395,6 +1422,7 @@ function stripSettingsFromPostFx(payload) {
             transientRuntimeLayerParamsState = null;
             projectDir = '';
             projectRootUrl = '';
+            projectRootUrlOverride = '';
             manifestBaseUrl = '';
             inlineDir = '';
             sceneSaved = false;

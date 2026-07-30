@@ -13,6 +13,8 @@
 // retries once a second until the first scene payload arrives.
 // Full contract: web/HOST_CONTRACT.md.
 
+import { getHostProfile } from '../host_profile.js';
+
 const HOST_CONTRACT_VERSION = 1;
 
 function createHostBridge({ setInfoText, onFirstSync, onBeforeReady } = {}) {
@@ -54,7 +56,7 @@ function createHostBridge({ setInfoText, onFirstSync, onBeforeReady } = {}) {
 
     function requestHostAction(action, data = {}, timeoutMs = 60000) {
         if (!window.chrome?.webview) {
-            return Promise.reject(new Error(`${action} requires the 3ds Max host`));
+            return Promise.reject(new Error(`${action} requires the ${getHostProfile().appFull} host`));
         }
         const requestId = `host_${Date.now()}_${nextHostActionId++}`;
         return new Promise((resolve, reject) => {

@@ -1,6 +1,7 @@
 // postfx_glue.js - editor post-FX panel, tone mapping, and persistence glue.
 import * as THREE from 'three';
 import { powerShotInfraredPresetUiDefaults } from '../fx/final/powershot.js';
+import { getHostProfile } from '../host_profile.js';
 
 function createPostFxGlue(deps = {}) {
         let syncClonePanelFn = null;
@@ -929,7 +930,7 @@ function createPostFxGlue(deps = {}) {
                                 <input class="fx-range" id="fx-performance-postfxscale" type="range" min="0.25" max="1" step="0.05" value="${deps.getEffectivePostFxResolutionScale()}">
                             </label>
                             <label class="fx-check" for="fx-performance-optimizeinstances">
-                                <span>Optimize Max Instances</span>
+                                <span>Optimize ${getHostProfile().app} Instances</span>
                                 <input id="fx-performance-optimizeinstances" type="checkbox" ${deps.performanceSettings.optimizeMaxInstances ? 'checked' : ''}>
                             </label>
                             <label class="fx-check" for="fx-performance-flattengroups">

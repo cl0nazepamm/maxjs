@@ -26,6 +26,14 @@ runs (it redirects to the standalone snapshot viewer when absent), with:
 | `releaseBuffer(buf)` | called after every shared-buffer handler; may be a no-op |
 | `postMessageWithAdditionalObjects(...)` | may be a no-op |
 
+Optionally, a host may also define `window.MAXJS_HOST_PROFILE` (before the
+`<head>` bootstrap, same as `chrome.webview`) to rebrand host terminology in
+the UI: `{ app, appFull, sceneExt }` — e.g. the Blender shim sends
+`{ app: 'Blender', appFull: 'Blender', sceneExt: '.blend' }`. Every field is
+optional; defaults are the 3ds Max reference host (`Max` / `3ds Max` /
+`.max`), read via `web/js/host_profile.js`. Terminology only — never a
+behavior branch.
+
 ## Handshake
 
 1. Host loads `web/index.html` with the API above in place.
@@ -50,14 +58,26 @@ runs (it redirects to the standalone snapshot viewer when absent), with:
 
 `audio_update`, `cam`, `clay_mode`, `debug`, `env_update`, `geo_fast` (JSON
 variant), `gltf_update`, `hair_fast`, `host_action_result`,
-`live_sync_settings`, `pathtracing_settings`, `probeGrids`,
+`inline_layers_state`, `live_sync_settings`, `pathtracing_settings`,
+`probeGrids`, `project_config`, `project_reload`,
 `render_css3d_mask_begin`, `render_css3d_mask_end`, `render_output_settings`,
 `render_sequence_done`, `render_sequence_frame`, `render_to_image`,
 `render_to_image_done`, `scene`, `snapshot_export_request`, `webapp_update`,
 `xform`.
 
 A host only has to send what it supports — the viewer treats every type as
-optional. The Blender shim, for example, sends nothing but scene/delta buffers.
+optional.
+
+`project_config` configures the scene-local project runtime:
+`{dir, inlineDir, pollMs, sceneSaved, manifestExists, rootUrl?}`. `rootUrl`
+is optional: when present, the viewer fetches/imports project files
+(`project.maxjs.json`, `settings.maxjs.json`, `postfx.maxjs.json`,
+`inlines/*.js`) from that base URL (resolved against the page URL) instead of
+deriving `https://maxjs-assets.local/...` from `dir`. Hosts that serve the
+project directory over HTTP themselves (the Blender add-on) send it; the
+3ds Max WebView2 host omits it and keeps the virtual-host mapping.
+`inline_layers_state` is the host's full scan of `inlines/`:
+`{stamp, layers:[{key, id, name, folder, stamp, priority, enabled}]}`.
 
 ## JSON control messages, viewer → host (`postMessage`)
 
@@ -69,8 +89,11 @@ optional. The Blender shim, for example, sends nothing but scene/delta buffers.
 Hosts may ignore any of these. Request/response pairs use `requestHostAction`:
 the viewer sends `{type: action, requestId, ...}` and expects
 `{type:'host_action_result', requestId, action, ok, ...}` back within the
-timeout (60 s default). Currently used for `snapshot_analyze` and
-`bake_proxy_image_write`.
+timeout (60 s default; 10 s for the project runtime's own actions). Used for
+`snapshot_analyze`, `bake_proxy_image_write`, and the project runtime actions:
+`project_release_manifest` (result may carry `path` and optional `rootUrl`),
+`project_manifest_write`, `project_postfx_write`, `project_settings_write`,
+`inline_layer_remove`, `inline_layer_set_enabled`, `inline_layer_clear`.
 
 ## Rules
 

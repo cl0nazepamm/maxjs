@@ -26,6 +26,7 @@
         import { createEnvironment } from './environment.js';
         import { createSky } from './sky.js';
         import { createGiVolumeGlue } from './gi_volume_glue.js';
+        import { getHostProfile } from '../host_profile.js';
         import {
             materialEnvIntensity,
         } from 'three/tsl';
@@ -1373,7 +1374,7 @@
             },
             'flow': {
                 label: 'FLOW',
-                title: 'FLOW: paced geometry sync — even Max-side load, smoother 3ds Max viewport',
+                title: `FLOW: paced geometry sync — even ${getHostProfile().app}-side load, smoother ${getHostProfile().appFull} viewport`,
                 aria: 'Switch to slow JSON sync',
                 status: 'flow paced sync',
             },

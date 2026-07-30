@@ -4,6 +4,7 @@ import { AsciiEffect } from 'three/addons/effects/AsciiEffect.js';
 import { getReflectionPaintNode } from '../max_lights_node.js';
 import { createCanvasPanel } from '../canvas_panel.js';
 import { createShaderLabPanel } from '../shader_lab_panel.js';
+import { getHostProfile } from '../host_profile.js';
 import { COMPOSITION_GUIDES, COMPOSITION_ASPECTS } from '../composition_overlay.js';
 
 function createPanelsMisc(deps = {}) {
@@ -1261,10 +1262,11 @@ function createPanelsMisc(deps = {}) {
             const layers = getPanelLayers();
             const projectReady = projectState.manifestExists === true;
             const canReleaseProject = projectState.sceneSaved === true && !projectReady;
+            const sceneExt = getHostProfile().sceneExt;
             const emptyHtml = !projectState.sceneSaved
-                ? '<div class="layers-empty">Save the scene first. max.js creates <code>project.maxjs.json</code> and <code>inlines/</code> next to the <code>.max</code> file.</div>'
+                ? `<div class="layers-empty">Save the scene first. max.js creates <code>project.maxjs.json</code> and <code>inlines/</code> next to the <code>${sceneExt}</code> file.</div>`
                 : !projectReady
-                    ? `<div class="layers-empty">This scene has no max.js project yet. Create scene-local runtime files next to the <code>.max</code> file.<div style="margin-top:10px"><button id="layersReleaseBtn">Release Project Manifest</button></div></div>`
+                    ? `<div class="layers-empty">This scene has no max.js project yet. Create scene-local runtime files next to the <code>${sceneExt}</code> file.<div style="margin-top:10px"><button id="layersReleaseBtn">Release Project Manifest</button></div></div>`
                     : '<div class="layers-empty">No layers yet. Scene-local project files live in <code>project.maxjs.json</code> and <code>inlines/</code>.</div>';
 
             const renderLayerItem = (l) => `

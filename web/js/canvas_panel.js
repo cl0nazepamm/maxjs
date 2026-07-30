@@ -8,6 +8,8 @@
 //
 // Layer manager stays for game logic / FX; Canvas is the design-side UI.
 
+import { getHostProfile } from './host_profile.js';
+
 // React + ReactDOM are resolved via the importmap in index.html, so both
 // the Canvas panel and shader_lab_fx share the SAME React instance — no
 // "two copies of React" hook dispatcher mismatch.
@@ -625,7 +627,7 @@ function buildApp(React) {
                     }, error),
                     h('div', {
                         style: { fontSize: '11px', color: '#666', lineHeight: '1.4' },
-                    }, 'Place HTML next to .max files. Full React support!'),
+                    }, `Place HTML next to ${getHostProfile().sceneExt} files. Full React support!`),
                 ),
                 h('section', { className: 'fx-section' },
                     h('div', { className: 'fx-section-header' },

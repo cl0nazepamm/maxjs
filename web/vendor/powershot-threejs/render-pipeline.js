@@ -9,9 +9,11 @@ import {
 
 import { FilmPipeline } from "./film.js";
 import { InfraredPipeline } from "./infrared.js";
+import { NightshotPipeline } from "./nightshot.js";
 import { Pipeline } from "./pipeline.js";
+import { SolarFlarePipeline } from "./solar-flare.js";
 
-const DEFAULT_TARGET_OPTIONS = {
+export const DEFAULT_TARGET_OPTIONS = {
   type: THREE.HalfFloatType,
   minFilter: THREE.LinearFilter,
   magFilter: THREE.LinearFilter,
@@ -78,6 +80,21 @@ function normalizeEffectArgs(effectOrOptions, options) {
 function defaultRenderOptions(options, frame, node, effect) {
   if (typeof options === "function") return options(frame, node, effect) || {};
   return options || {};
+}
+
+function sourceDepthTexture(node) {
+  const passNode = node?.isPassNode ? node : node?.passNode;
+  if (!passNode || typeof passNode.getTexture !== "function") return null;
+  try {
+    return passNode.getTexture("depth");
+  } catch {
+    return null;
+  }
+}
+
+function resolveRenderValue(value, frame, node, effect) {
+  const resolved = typeof value === "function" ? value(frame, node, effect) : value;
+  return resolved?.value || resolved?.texture || resolved || null;
 }
 
 /**
@@ -279,6 +296,75 @@ export class InfraredPassNode extends EffectPassNode {
   }
 }
 
+export class NightshotPassNode extends EffectPassNode {
+  constructor(inputNode, pipeline = null, options = {}) {
+    super(inputNode, pipeline, {
+      createEffect: (renderer) => new NightshotPipeline(renderer),
+      ...options,
+    });
+  }
+}
+
+/**
+ * Scene-linear adapter for the physically based spectral lens flare.
+ *
+ * Unlike the generic texture effects, this pass also transports the camera,
+ * directional sun and scene depth required by the optical model. When the
+ * input is a direct `pass(scene, camera)`, its depth texture is inferred.
+ */
+export class SolarFlarePassNode extends EffectPassNode {
+  constructor(inputNode, flare = null, options = {}) {
+    super(inputNode, flare, {
+      createEffect: (renderer) => new SolarFlarePipeline(renderer, {
+        profile: options.profile,
+        ...(options.flareOptions || {}),
+      }),
+      ...options,
+    });
+
+    this.camera = options.camera || inputNode?.camera || inputNode?.passNode?.camera || null;
+    this.sun = options.sun || null;
+    this.depthTexture = options.depthTexture || sourceDepthTexture(inputNode);
+    this.visibility = options.visibility;
+    this.visibilityProvider = options.visibilityProvider || null;
+    this.sourceRadiance = options.sourceRadiance;
+    this.angularDiameterDeg = options.angularDiameterDeg;
+    const additionalRenderOptions = options.renderOptions || null;
+
+    this.renderOptions = (frame, node, effect) => ({
+      camera: resolveRenderValue(this.camera, frame, node, effect),
+      sun: resolveRenderValue(this.sun, frame, node, effect),
+      depthTexture: resolveRenderValue(this.depthTexture, frame, node, effect),
+      visibility: typeof this.visibility === "function"
+        ? this.visibility(frame, node, effect)
+        : this.visibility,
+      visibilityProvider: this.visibilityProvider,
+      sourceRadiance: typeof this.sourceRadiance === "function"
+        ? this.sourceRadiance(frame, node, effect)
+        : this.sourceRadiance,
+      angularDiameterDeg: typeof this.angularDiameterDeg === "function"
+        ? this.angularDiameterDeg(frame, node, effect)
+        : this.angularDiameterDeg,
+      ...defaultRenderOptions(additionalRenderOptions, frame, node, effect),
+    });
+  }
+
+  setCamera(camera) {
+    this.camera = camera;
+    return this;
+  }
+
+  setSun(sun) {
+    this.sun = sun;
+    return this;
+  }
+
+  setDepthTexture(depthTexture) {
+    this.depthTexture = depthTexture;
+    return this;
+  }
+}
+
 export function effectPass(inputNode, effectOrOptions = null, options = {}) {
   const normalized = normalizeEffectArgs(effectOrOptions, options);
   return new EffectPassNode(inputNode, normalized.effect, normalized.options);
@@ -297,4 +383,16 @@ export function filmPass(inputNode, pipelineOrOptions = null, options = {}) {
 export function infraredPass(inputNode, pipelineOrOptions = null, options = {}) {
   const normalized = normalizeEffectArgs(pipelineOrOptions, options);
   return new InfraredPassNode(inputNode, normalized.effect, normalized.options);
+}
+
+export function nightshotPass(inputNode, pipelineOrOptions = null, options = {}) {
+  if (pipelineOrOptions && typeof pipelineOrOptions === "object" && !pipelineOrOptions.renderTexture) {
+    return new NightshotPassNode(inputNode, null, pipelineOrOptions);
+  }
+  return new NightshotPassNode(inputNode, pipelineOrOptions, options);
+}
+
+export function solarFlarePass(inputNode, flareOrOptions = null, options = {}) {
+  const normalized = normalizeEffectArgs(flareOrOptions, options);
+  return new SolarFlarePassNode(inputNode, normalized.effect, normalized.options);
 }

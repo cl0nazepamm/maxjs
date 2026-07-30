@@ -58,6 +58,9 @@ function createPostFxGlue(deps = {}) {
         // modes whose output rides the analog tape path (VHS sliders apply):
         // Analog VHS itself, and NightShot's camcorder back end.
         const isPowerShotTapePathMode = (values) => isPowerShotAnalogMode(values) || isPowerShotNightshotMode(values);
+        // Solar Flares runs on the visible-band plate — hidden for the NIR tubes.
+        const isPowerShotOpticalMode = (values) => !isPowerShotNirMode(values);
+        const isPowerShotFlareActive = (values) => isPowerShotOpticalMode(values) && values.flareEnabled === true;
         const isPowerShotTapeActive = (values) => isPowerShotTapePathMode(values) && Number(values.analogStrength) > 1.0e-6;
         const isPowerShotTemporalNoiseActive = (values) =>
             (isPowerShotDigitalMode(values) && Number(values.noiseScale) > 1.0e-6)
@@ -417,6 +420,14 @@ function createPostFxGlue(deps = {}) {
                     // after every mode; mode-specific Exposure knobs stay separate.
                     { key: 'brightness', label: 'Brightness', min: -1, max: 1, step: 0.01, realtime: true },
                     { key: 'contrast', label: 'Contrast', min: -1, max: 1, step: 0.01, realtime: true },
+                    // Solar Flares — scene-linear optical sun flare rendered
+                    // onto the plate before the imager (fx/final/powershot.js).
+                    { key: 'flareEnabled', label: 'Solar Flares', type: 'checkbox', affectsVisibility: true, visibleWhen: isPowerShotOpticalMode },
+                    { key: 'flareRadiance', label: 'Flare Radiance', min: 0, max: 200, step: 0.5, realtime: true, visibleWhen: isPowerShotFlareActive },
+                    { key: 'flareStrength', label: 'Flare Strength', min: 0, max: 4, step: 0.01, realtime: true, visibleWhen: isPowerShotFlareActive },
+                    { key: 'flareFNumber', label: 'Flare f-number', min: 1, max: 22, step: 0.1, realtime: true, visibleWhen: isPowerShotFlareActive },
+                    { key: 'flareGhosts', label: 'Flare Ghosts', min: 0, max: 4, step: 0.01, realtime: true, visibleWhen: isPowerShotFlareActive },
+                    { key: 'flareVeiling', label: 'Veiling Glare', min: 0, max: 1, step: 0.005, realtime: true, visibleWhen: isPowerShotFlareActive },
                     { key: 'analogStrength', label: 'VHS Strength', min: 0, max: 3, step: 0.01, realtime: true, affectsVisibility: true, visibleWhen: isPowerShotTapePathMode },
                     { key: 'analogTracking', label: 'Tracking', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotTapeActive },
                     { key: 'analogTrackingChoppiness', label: 'Tracking Choppiness', min: 0, max: 1, step: 0.01, realtime: true, visibleWhen: isPowerShotTapeActive },
@@ -437,7 +448,6 @@ function createPostFxGlue(deps = {}) {
                     { key: 'irLocalGain', label: 'Local Gain', min: 0, max: 1.5, step: 0.01, realtime: true, visibleWhen: isPowerShotInfraredMode },
                     { key: 'irGlow', label: 'Halo Bloom', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotInfraredMode },
                     { key: 'irGlowThreshold', label: 'Bloom Threshold', min: 0, max: 1, step: 0.01, realtime: true, visibleWhen: isPowerShotInfraredMode },
-                    { key: 'irEyes', label: 'Eye Flare', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotInfraredMode },
                     { key: 'irElectronModel', label: 'Photoelectron Model', type: 'checkbox', affectsVisibility: true, visibleWhen: isPowerShotInfraredMode },
                     { key: 'irElectronsPerUnit', label: 'Electrons / Unit', min: 16, max: 4096, step: 16, integer: true, realtime: true, visibleWhen: isPowerShotElectronModelActive },
                     { key: 'irNoise', label: 'Sensor Noise', min: 0, max: 3, step: 0.01, realtime: true, affectsVisibility: true, visibleWhen: isPowerShotNirMode },

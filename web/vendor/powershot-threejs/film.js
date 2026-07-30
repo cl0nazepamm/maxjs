@@ -27,7 +27,11 @@ import {
   mix, clamp, max, min, dot, abs, floor, fract, sin, cos, sqrt, log, exp,
   step, smoothstep,
 } from "three/tsl";
-import { powershotLinearGrade } from "./pipeline.js";
+import {
+  autoRender,
+  powershotLinearGrade,
+  resolvePreset,
+} from "./pipeline.js";
 
 const LN10 = Math.LN10;
 const LUM709 = vec3(0.2126, 0.7152, 0.0722);
@@ -653,6 +657,13 @@ export class FilmPipeline {
     this.dirty = true;
   }
 
+  // Accepts a FILM_PRESETS key ("kodak_500t") or a preset object. The classic
+  // applyFilmPreset(film.ctx, preset) remains fully supported.
+  setPreset(preset) {
+    applyFilmPreset(this.ctx, resolvePreset(FILM_PRESETS, preset, "film stock"));
+    return this;
+  }
+
   setSource(tex) {
     if (this.source === tex) return;
     this.source = tex;
@@ -740,8 +751,9 @@ export class FilmPipeline {
     }
   }
 
-  async render(frame) {
-    this.renderTexture(this.source, frame);
+  // See autoRender for the legacy/friendly overload contract.
+  async render(input, options = {}) {
+    return autoRender(this, input, options, this.source);
   }
 
   dispose() {

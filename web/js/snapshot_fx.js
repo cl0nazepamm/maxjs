@@ -74,6 +74,24 @@ export async function createSnapshotFx({
     });
 
     // Final-stylize stages — same shared modules the editor facade uses.
+    // Solar Flares sun: tagged layer light first, then any lit directional,
+    // then the contact-shadow mainLight (same policy as the editor facade).
+    let flareSun = null;
+    let flareSunScanIn = 0;
+    function findFlareSun() {
+        if (--flareSunScanIn > 0 && flareSun?.parent) return flareSun;
+        flareSunScanIn = 30;
+        let tagged = null;
+        let lit = null;
+        scene.traverse((obj) => {
+            if (!obj.isDirectionalLight) return;
+            if (!tagged && obj.userData?.solarFlareSun === true) tagged = obj;
+            if (!lit && obj.intensity > 0) lit = obj;
+        });
+        flareSun = tagged || lit || mainLight;
+        return flareSun;
+    }
+
     if (wantsPowerShot && supportsScreenSpaceEffects) {
         try {
             const { createPowerShotFinal } = await import('./fx/final/powershot.js');
@@ -83,6 +101,11 @@ export async function createSnapshotFx({
                 getScaledPostFxSize: core.getScaledPostFxSize,
                 supportsScreenSpaceEffects,
                 isShaderLabEnabled,
+                getCamera: () => camera,
+                getSun: findFlareSun,
+                getDepthTexture: () => (pipelineReady
+                    ? core.ctx.scenePass?.getTexture?.('depth') || null
+                    : null),
             });
         } catch (error) {
             console.warn('[snapshot_fx] PowerShot module init failed', error);

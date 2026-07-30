@@ -108,6 +108,14 @@ export function createMaxJSFxController({
         irElectronModel: false,
         irElectronsPerUnit: 1024,
         nsSmear: 0.9, // NightShot CCD interline vertical smear
+        // Solar Flares — scene-linear optical sun flare on the plate before
+        // the imager (traced Heliar ghosts + aperture diffraction + veil).
+        flareEnabled: false,
+        flareStrength: 1.0,
+        flareFNumber: 8,
+        flareRadiance: 4.0,
+        flareGhosts: 1.0,
+        flareVeiling: 0.06,
         freezeNoise: false,
     };
     state.clone = {
@@ -167,12 +175,39 @@ export function createMaxJSFxController({
         getScaledPostFxSize: core.getScaledPostFxSize,
         supportsScreenSpaceEffects,
     });
+    // Solar Flares sun: prefer a light a layer tagged for the flare, then any
+    // directional light that actually contributes (the muted viewer rig sits
+    // at intensity 0), then the contact-shadow mainLight as a last resort.
+    let flareSun = null;
+    let flareSunScanIn = 0;
+    function findFlareSun() {
+        if (--flareSunScanIn > 0 && flareSun?.parent) return flareSun;
+        flareSunScanIn = 30;
+        let tagged = null;
+        let lit = null;
+        scene.traverse((obj) => {
+            if (!obj.isDirectionalLight) return;
+            if (!tagged && obj.userData?.solarFlareSun === true) tagged = obj;
+            if (!lit && obj.intensity > 0) lit = obj;
+        });
+        flareSun = tagged || lit || mainLight;
+        return flareSun;
+    }
+
     const powerShotFinal = createPowerShotFinal({
         renderer,
         getOptions: () => state.powershot,
         getScaledPostFxSize: core.getScaledPostFxSize,
         supportsScreenSpaceEffects,
         isShaderLabEnabled,
+        getCamera: () => camera,
+        getSun: findFlareSun,
+        // Scene-pass depth (post-FX resolution, GPU deforms included) for the
+        // flare's solar visibility taps. Null when the plain render path or
+        // path tracing bypasses the pass — the flare then skips depth testing.
+        getDepthTexture: () => (pipelineReady
+            ? core.ctx.scenePass?.getTexture?.('depth') || null
+            : null),
     });
 
     // Clone blob analysis (CPU side — tiny 64x64 readback + CCL)
@@ -1295,13 +1330,18 @@ export function createMaxJSFxController({
             assignFinite(state.powershot, 'irLocalGain', options.irLocalGain);
             assignFinite(state.powershot, 'irGlow', options.irGlow);
             assignFinite(state.powershot, 'irGlowThreshold', options.irGlowThreshold);
-            assignFinite(state.powershot, 'irEyes', options.irEyes);
             assignFinite(state.powershot, 'irNoise', options.irNoise);
             if (typeof options.irElectronModel === 'boolean') state.powershot.irElectronModel = options.irElectronModel;
             assignFinite(state.powershot, 'irElectronsPerUnit', options.irElectronsPerUnit);
             assignFinite(state.powershot, 'irVignette', options.irVignette);
             assignFinite(state.powershot, 'irHotspot', options.irHotspot);
             assignFinite(state.powershot, 'nsSmear', options.nsSmear);
+            if (typeof options.flareEnabled === 'boolean') state.powershot.flareEnabled = options.flareEnabled;
+            assignFinite(state.powershot, 'flareStrength', options.flareStrength);
+            assignFinite(state.powershot, 'flareFNumber', options.flareFNumber);
+            assignFinite(state.powershot, 'flareRadiance', options.flareRadiance);
+            assignFinite(state.powershot, 'flareGhosts', options.flareGhosts);
+            assignFinite(state.powershot, 'flareVeiling', options.flareVeiling);
             if (typeof options.freezeNoise === 'boolean') state.powershot.freezeNoise = options.freezeNoise;
             if (powerShotFinal.hasPipeline()) powerShotFinal.syncPipeline();
             if (state.powershot.enabled) queuePipelineUpdate({ output: true });

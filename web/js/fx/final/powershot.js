@@ -11,6 +11,8 @@ import { PRESETS as POWERSHOT_PRESETS, PRESET_KEYS as POWERSHOT_PRESET_KEYS } fr
 import { FilmPipeline as PowerShotFilmPipeline, applyFilmPreset as applyPowerShotFilmPreset, FILM_PRESETS as POWERSHOT_FILM_PRESETS, FILM_PRESET_KEYS as POWERSHOT_FILM_PRESET_KEYS } from 'powershot-threejs/film';
 import { InfraredPipeline as PowerShotInfraredPipeline, applyInfraredProfile as applyPowerShotInfraredProfile, applyInfraredPreset as applyPowerShotInfraredPreset, INFRARED_PRESETS as POWERSHOT_INFRARED_PRESETS, INFRARED_PRESET_KEYS as POWERSHOT_INFRARED_PRESET_KEYS } from 'powershot-threejs/infrared';
 import { NightshotPipeline as PowerShotNightshotPipeline, applyNightshotPreset as applyPowerShotNightshotPreset, NIGHTSHOT_PRESETS as POWERSHOT_NIGHTSHOT_PRESETS } from 'powershot-threejs/nightshot';
+import { SolarFlarePipeline } from 'powershot-threejs/solar-flare';
+import { HELIAR_TRONNIER_100MM, loadHeliarTronnierFlareProfile } from 'powershot-threejs/solar-flare-profile';
 
 function finiteOr(value, fallback) {
     return Number.isFinite(value) ? value : fallback;
@@ -113,7 +115,6 @@ export function powerShotInfraredPresetUiDefaults(key) {
         irLocalGain: preset.local_gain ?? 0.46,
         irGlow: preset.glow_strength ?? 0.34,
         irGlowThreshold: preset.glow_threshold ?? 0.44,
-        irEyes: preset.eye_strength ?? 0.78,
         irNoise: preset.noise_amount ?? 0.48,
         irVignette: preset.vignette ?? 0.26,
         irHotspot: preset.hotspot ?? 0.055,
@@ -203,6 +204,9 @@ export function createPowerShotFinal({
     getScaledPostFxSize,
     supportsScreenSpaceEffects = false,
     isShaderLabEnabled = () => false,
+    getCamera = () => null,
+    getSun = () => null,
+    getDepthTexture = () => null,
 }) {
     let powerShotInputTarget = null;
     let powerShotPipeline = null;
@@ -210,6 +214,11 @@ export function createPowerShotFinal({
     let infraredPipeline = null;
     let infraredProfileKey = null;
     let nightshotPipeline = null;
+    let flarePipeline = null;
+    let flareProfilePromise = null;
+    let flareTarget = null;
+    let flareFailed = false;
+    let flareLens = null;
     let powerShotFrame = 0;
     const drawBufferSize = new THREE.Vector2();
 
@@ -275,14 +284,111 @@ export function createPowerShotFinal({
         p.irLocalGain = THREE.MathUtils.clamp(finiteOr(p.irLocalGain, 0.46), 0, 1.5);
         p.irGlow = THREE.MathUtils.clamp(finiteOr(p.irGlow, 0.34), 0, 3);
         p.irGlowThreshold = THREE.MathUtils.clamp(finiteOr(p.irGlowThreshold, 0.44), 0, 1);
-        p.irEyes = THREE.MathUtils.clamp(finiteOr(p.irEyes, 0.78), 0, 3);
         p.irNoise = THREE.MathUtils.clamp(finiteOr(p.irNoise, 0.48), 0, 3);
         p.irElectronModel = p.irElectronModel === true;
         p.irElectronsPerUnit = THREE.MathUtils.clamp(finiteOr(p.irElectronsPerUnit, 1024), 1, 1.0e6);
         p.irVignette = THREE.MathUtils.clamp(finiteOr(p.irVignette, 0.26), 0, 1);
         p.irHotspot = THREE.MathUtils.clamp(finiteOr(p.irHotspot, 0.055), 0, 1);
         p.nsSmear = THREE.MathUtils.clamp(finiteOr(p.nsSmear, 0.9), 0, 2);
+        p.flareEnabled = p.flareEnabled === true;
+        p.flareStrength = THREE.MathUtils.clamp(finiteOr(p.flareStrength, 1.0), 0, 4);
+        p.flareFNumber = THREE.MathUtils.clamp(finiteOr(p.flareFNumber, 8), 1, 64);
+        p.flareRadiance = THREE.MathUtils.clamp(finiteOr(p.flareRadiance, 4.0), 0, 1000);
+        p.flareGhosts = THREE.MathUtils.clamp(finiteOr(p.flareGhosts, 1.0), 0, 4);
+        p.flareVeiling = THREE.MathUtils.clamp(finiteOr(p.flareVeiling, 0.06), 0, 1);
         return p;
+    }
+
+    // Solar Flares — scene-linear optical sun flare rendered onto the plate
+    // BEFORE the ISP/film/tube consumes it (a camera photographs the flare;
+    // it does not composite one on afterwards). The Heliar atlas loads async;
+    // frames pass through untouched until it is ready.
+    function flareActive() {
+        const p = normalizeOptions();
+        return supportsScreenSpaceEffects
+            && !!p.enabled
+            && p.flareEnabled
+            && p.flareStrength > 1.0e-6
+            && !!getSun()
+            && getCamera()?.isPerspectiveCamera === true;
+    }
+
+    function ensureFlarePipeline() {
+        if (flareFailed) return null;
+        if (!flareProfilePromise) {
+            flareProfilePromise = loadHeliarTronnierFlareProfile()
+                .then((profile) => {
+                    flareLens = { ...HELIAR_TRONNIER_100MM };
+                    flarePipeline = new SolarFlarePipeline(renderer, {
+                        profile,
+                        ownsProfile: true,
+                        lens: flareLens,
+                    });
+                })
+                .catch((error) => {
+                    flareFailed = true;
+                    console.warn('[powershot] Solar Flares atlas load failed', error);
+                });
+        }
+        return flarePipeline;
+    }
+
+    function renderFlareOntoPlate(target) {
+        const flare = ensureFlarePipeline();
+        if (!flare) return null;
+        const p = normalizeOptions();
+        flare.setEnabled(true);
+        flare.setStrength({
+            strength: p.flareStrength,
+            ghosts: p.flareGhosts,
+            veiling: p.flareVeiling,
+        });
+        // Angular fit: the Heliar profile is a 100 mm lens (24° FOV). On a
+        // wide viewer camera its flare pattern renders at true angular size —
+        // ghosts compressed near frame centre and a few-pixel starburst.
+        // Scale the virtual sensor gate and diffraction window so the pattern
+        // spans the frame the way it does on the profile's own 36×24 gate,
+        // while the aperture/housing optics stay in real Heliar millimetres.
+        const projectionY = Math.abs(getCamera()?.projectionMatrix?.elements?.[5]) || 1;
+        const fit = (2 * HELIAR_TRONNIER_100MM.focalLengthMm / HELIAR_TRONNIER_100MM.sensorHeightMm)
+            / projectionY;
+        flareLens.sensorWidthMm = HELIAR_TRONNIER_100MM.sensorWidthMm * fit;
+        flareLens.sensorHeightMm = HELIAR_TRONNIER_100MM.sensorHeightMm * fit;
+        flare.settings.diffractionScale = fit;
+        // setAperture re-derives the diffraction extent from diffractionScale.
+        flare.setAperture({ fNumber: p.flareFNumber });
+        if (!flareTarget
+            || flareTarget.width !== target.width
+            || flareTarget.height !== target.height) {
+            try { flareTarget?.dispose?.(); } catch (_) {}
+            flareTarget = new THREE.RenderTarget(target.width, target.height, {
+                type: THREE.HalfFloatType,
+                colorSpace: THREE.LinearSRGBColorSpace,
+                depthBuffer: false,
+                stencilBuffer: false,
+            });
+        }
+        try {
+            // Solar occlusion reads the scene pass depth (deformed cloth
+            // included), never the input target's own depth — that one holds
+            // the post pipeline's output quad and reads "occluded" everywhere.
+            let depthTexture = null;
+            try { depthTexture = getDepthTexture() || null; } catch (_) {}
+            const ok = flare.renderTexture(target.texture, powerShotFrame, {
+                camera: getCamera(),
+                sun: getSun(),
+                depthTexture,
+                sourceRadiance: p.flareRadiance,
+                width: target.width,
+                height: target.height,
+                outputTarget: flareTarget,
+            });
+            return ok === true ? flareTarget.texture : null;
+        } catch (error) {
+            flareFailed = true;
+            console.warn('[powershot] Solar Flares render failed; flare disabled', error);
+            return null;
+        }
     }
 
     function isActive() {
@@ -354,7 +460,6 @@ export function createPowerShotFinal({
         I.localGain.value = p.irLocalGain;
         I.glowStrength.value = p.irGlow;
         I.glowThreshold.value = p.irGlowThreshold;
-        I.eyeStrength.value = p.irEyes;
         I.noiseAmount.value = p.irNoise;
         infraredPipeline.setElectronModel?.(p.irElectronModel
             ? { electronsPerUnit: p.irElectronsPerUnit }
@@ -578,7 +683,12 @@ export function createPowerShotFinal({
             renderer.toneMappingExposure = 1.0;
             renderer.outputColorSpace = previousOutputColorSpace;
             renderer.setClearColor?.(0x000000, 0);
-            return pipeline.renderTexture(target.texture, powerShotFrame, {
+            // Optical flare joins the scene-linear plate before the imager.
+            let plateTexture = target.texture;
+            if (flareActive()) {
+                plateTexture = renderFlareOntoPlate(target) || target.texture;
+            }
+            return pipeline.renderTexture(plateTexture, powerShotFrame, {
                 outputTarget: previousTarget,
             }) === true;
         } finally {
@@ -609,6 +719,12 @@ export function createPowerShotFinal({
             infraredProfileKey = null;
             try { nightshotPipeline?.dispose?.(); } catch (_) {}
             nightshotPipeline = null;
+            try { flareTarget?.dispose?.(); } catch (_) {}
+            flareTarget = null;
+            try { flarePipeline?.dispose?.(); } catch (_) {}
+            flarePipeline = null;
+            flareProfilePromise = null;
+            flareFailed = false;
         },
     };
 }

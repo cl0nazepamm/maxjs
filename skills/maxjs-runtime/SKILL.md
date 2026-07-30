@@ -216,7 +216,7 @@ Do not replace whole synced objects or bypass the adapter for this pattern. Raw 
 - `ctx.input`: event helper with auto-cleanup.
 - `ctx.clock`: JS runtime time, `{ dt, elapsed }`.
 - `ctx.maxTime`: Max timeline, `{ seconds, frame, fps, playing, source }`.
-- `ctx.params`: layer-owned tweakable parameters shown in the Runtime Layers panel. Use `ctx.params.define({ speed: { type: 'slider', value: 1, min: 0, max: 4, step: 0.05 }, tint: { type: 'color', value: '#ff8844' }, mode: { type: 'string', value: 'orbit' } })`, then read the returned live values object or `ctx.params.values`. Supported UI types are `slider`, `float`, `color`, `bool`, and `string` (`text` is an alias); values are JSON-safe and exported in `runtimeScene` so snapshots replay tuned values before the layer factory runs. Always declare `type` for colors: a bare number is inferred as `float`, so `{ tint: { value: 0xff8844 } }` gives you a number field, not a swatch. Hex strings (`'#ff8844'`) infer as `color` on their own.
+- `ctx.params`: layer-owned tweakable parameters shown in the Runtime Layers panel. Use `ctx.params.define({ speed: { type: 'slider', value: 1, min: 0, max: 4, step: 0.05 }, tint: { type: 'color', value: '#ff8844' }, mode: { type: 'string', value: 'orbit' } })`, then read the returned live values object or `ctx.params.values`. Supported UI types are `slider`, `float`, `color`, `bool`, and `string` (`text` is an alias). Committed panel edits are stored scene-locally in `settings.maxjs.json` and hydrate the layer before its factory runs after a restart; live slider/input movement is not written on every event. Values are also exported in `runtimeScene`, so snapshots remain self-contained and replay the tuned values before the layer factory runs. Always declare `type` for colors: a bare number is inferred as `float`, so `{ tint: { value: 0xff8844 } }` gives you a number field, not a swatch. Hex strings (`'#ff8844'`) infer as `color` on their own.
 - `ctx.bus`: shared event bus, auto-unsubscribed on dispose. Max-driven events: `max:selection` `{ selected, added, removed }` (handle arrays), and `max:time:play` / `max:time:pause` / `max:time:seek` (timeline snapshot `{ seconds, frame, fps, playing }`).
 - `ctx.anim`: Max authored-animation playback — `list()` (`{ id, name, duration, time, playing, speed, loop }`), `play(id)`, `pause(id)`, `stop(id)`, `setTime(id, seconds)`, `setSpeed(id, factor)`, `setLoop(id, mode)`, `seekAll(seconds)`, `isPlaying(id)`. Empty list / no-op false when no animations are loaded.
 - `ctx.audio`: Max audio origins + layer SFX — `list()`, `play(handle)`, `stop(handle)`, `setVolume(handle, v)` (holds until Max re-syncs that origin), `muted`, and `playOneShot(url, { volume, position, refDistance, loop })` → `{ stop(), active }`. Positional when `position` (Vector3 or `[x,y,z]` world) is given; one-shots are silenced automatically on layer dispose. Audio requires a prior user gesture (browser autoplay policy) — one-shots fired before that are dropped.
@@ -225,6 +225,14 @@ Do not replace whole synced objects or bypass the adapter for this pattern. Raw 
 - `ctx.runtime`: runtime metadata and helpers; includes `ctx.runtime.gltf`.
 - `ctx.spectral`: authored spectral material overrides. `setNirAlbedo(selector, value)` assigns scalar NIR reflectance without requiring a TSL material and returns a disposable live handle.
 - `ctx.THREE`: same Three.js namespace passed as the second factory arg.
+
+After changing `ctx.params` persistence or snapshot transport, run:
+
+```powershell
+node tools/runtime-layer-param-persistence-smoke.mjs
+node tools/runtime-layer-lifecycle-smoke.mjs
+node tools/snapshot-runtime-parity-smoke.mjs
+```
 
 ## Spectral Material Tags
 

@@ -173,7 +173,24 @@ function buildSnapshotMeta() {
                 source: 'inline',
                 entry: 'inlines/probe.js',
                 active: true,
-                parameters: [],
+                parameters: [{
+                    name: 'turbidity',
+                    label: 'Turbidity',
+                    type: 'slider',
+                    value: 3.75,
+                    default: 2,
+                    min: 1,
+                    max: 10,
+                    step: 0.05,
+                    order: 0,
+                }, {
+                    name: 'numericLabel',
+                    label: 'Numeric Label',
+                    type: 'string',
+                    value: '007',
+                    default: 'default',
+                    order: 1,
+                }],
             }, {
                 id: 'broken',
                 name: 'Broken Snapshot Runtime Probe',
@@ -202,6 +219,10 @@ const LAYER_SOURCE = `
 export default function snapshotRuntimeProbe(ctx) {
     ctx.group.userData.fixtureOrigin = 'live-js';
     ctx.overlayGroup.userData.fixtureOrigin = 'live-overlay';
+    const params = ctx.params.define({
+        turbidity: { type: 'slider', value: 2, min: 1, max: 10, step: 0.05 },
+        numericLabel: { type: 'string', value: 'default' },
+    });
 
     const probe = {
         animationIds: ctx.anim.list().map(entry => entry.id),
@@ -212,6 +233,10 @@ export default function snapshotRuntimeProbe(ctx) {
         projectSetResult: null,
         projectReloadResult: null,
         projectErrors: [],
+        params: {
+            turbidity: params.turbidity,
+            numericLabel: params.numericLabel,
+        },
     };
     ctx.renderer.sceneRoot?.traverse?.((object) => {
         if (object?.userData?.fixtureOrigin === 'baked-probe-js'
@@ -538,6 +563,10 @@ async page => {
         expect(probe?.projectReloadResult === false, 'snapshot ctx.project.reload should be a no-op false');
         expect(probe?.projectState?.mode === 'snapshot', 'ctx.project state is not snapshot mode');
         expect(probe?.projectState?.readOnly === true, 'ctx.project state is not read-only');
+        expect(probe?.params?.turbidity === 3.75,
+            'runtimeScene numeric parameter value was not restored before the layer factory');
+        expect(probe?.params?.numericLabel === '007',
+            'runtimeScene string parameter value was not restored before the layer factory');
 
         const layer = player.layerManager.getLayerSnapshot('probe');
         expect(!!layer, 'probe layer is absent after replay');
@@ -560,6 +589,7 @@ async page => {
                 gltfHandles: probe?.gltfHandles ?? [],
                 bakedTwinSeenDuringInit: probe?.bakedTwinSeenDuringInit ?? null,
                 projectState: probe?.projectState ?? null,
+                params: probe?.params ?? null,
             },
         };
     });

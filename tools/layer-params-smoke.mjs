@@ -51,5 +51,10 @@ assert.match(panelSource, /param\?\.type === 'string'/,
     'layer panel preserves string display values');
 assert.match(panelSource, /layer-param-text/,
     'layer panel renders a text input for string parameters');
+assert.match(
+    panelSource,
+    /if \(param && commit\)[\s\S]*persistLayerParameterValue\?\.\(layerId, name, param\.value\)/,
+    'layer panel persists only committed parameter values',
+);
 
 console.log('layer-params-smoke: OK');

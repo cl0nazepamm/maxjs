@@ -50,8 +50,8 @@ function resolveStaticParameters(moduleNamespace) {
     return params && typeof params === 'object' ? params : null;
 }
 
-async function fetchText(url) {
-    const response = await fetch(url, { cache: 'no-store' });
+async function fetchText(url, fetchImpl) {
+    const response = await fetchImpl(url, { cache: 'no-store' });
     if (!response.ok) {
         throw new Error(`HTTP ${response.status} for ${url}`);
     }
@@ -88,8 +88,61 @@ function cloneJsonValue(value) {
 }
 
 const POSTFX_SETTINGS_KEY = '__maxjsSettings';
+const RUNTIME_LAYER_PARAMS_SETTINGS_KEY = 'runtimeLayerParams';
+const RUNTIME_LAYER_PARAMS_VERSION = 1;
+const BLOCKED_RUNTIME_PARAM_KEYS = new Set(['__proto__', 'prototype', 'constructor']);
 const LAYER_SOURCE_INLINE = 'inline';
 const LAYER_SOURCE_PROJECT = 'project';
+
+function normalizedRuntimeParamKey(raw) {
+    const key = String(raw ?? '').trim();
+    return key && !BLOCKED_RUNTIME_PARAM_KEYS.has(key) ? key : '';
+}
+
+function isPersistableRuntimeParamValue(value) {
+    return typeof value === 'string'
+        || typeof value === 'boolean'
+        || (typeof value === 'number' && Number.isFinite(value));
+}
+
+function normalizeRuntimeLayerParamValues(raw) {
+    const values = {};
+    const assign = (rawName, rawValue) => {
+        const name = normalizedRuntimeParamKey(rawName);
+        if (!name) return;
+        const value = rawValue && typeof rawValue === 'object'
+            && Object.prototype.hasOwnProperty.call(rawValue, 'value')
+            ? rawValue.value
+            : rawValue;
+        if (isPersistableRuntimeParamValue(value)) values[name] = value;
+    };
+
+    if (Array.isArray(raw)) {
+        for (const entry of raw) assign(entry?.name, entry);
+    } else if (raw && typeof raw === 'object') {
+        for (const [name, value] of Object.entries(raw)) assign(name, value);
+    }
+    return values;
+}
+
+function normalizeRuntimeLayerParamStore(raw) {
+    const rawLayers = raw && typeof raw === 'object' && !Array.isArray(raw)
+        ? (raw.layers && typeof raw.layers === 'object' && !Array.isArray(raw.layers)
+            ? raw.layers
+            : raw)
+        : {};
+    const layers = {};
+    for (const [rawLayerId, rawValues] of Object.entries(rawLayers)) {
+        const layerId = normalizedRuntimeParamKey(rawLayerId);
+        if (!layerId) continue;
+        const values = normalizeRuntimeLayerParamValues(rawValues);
+        if (Object.keys(values).length > 0) layers[layerId] = values;
+    }
+    return {
+        version: RUNTIME_LAYER_PARAMS_VERSION,
+        layers,
+    };
+}
 
 function manifest404(error) {
     return String(error?.message || error).includes('404');
@@ -130,7 +183,15 @@ function splitInlineLayerKey(key) {
     };
 }
 
-export function createProjectRuntime({ layerManager, bridge, perfHud, debugLog = () => {}, debugWarn = () => {} }) {
+export function createProjectRuntime({
+    layerManager,
+    bridge,
+    perfHud,
+    debugLog = () => {},
+    debugWarn = () => {},
+    fetchImpl = (...args) => fetch(...args),
+    importModule = url => import(url),
+}) {
     let projectDir = '';
     let projectRootUrl = '';
     let manifestBaseUrl = '';
@@ -141,6 +202,7 @@ export function createProjectRuntime({ layerManager, bridge, perfHud, debugLog =
     let transientPostFxState = null;
     let transientStudioState = null;
     let transientBakeState = null;
+    let transientRuntimeLayerParamsState = null;
     let postFxState = null;
     let settingsState = null;
     let lastManifestText = '';
@@ -163,6 +225,7 @@ export function createProjectRuntime({ layerManager, bridge, perfHud, debugLog =
     let manifestState = null;
     let nextRequestId = 1;
     let suppressProjectReloadCount = 0;
+    let projectLoadTask = Promise.resolve(false);
 
     const activeProjectLayerIds = new Set();
     const mountedProjectLayers = new Map();
@@ -203,6 +266,57 @@ function stripSettingsFromPostFx(payload) {
         return () => listeners.delete(listener);
     }
 
+    function getRuntimeLayerParamStore() {
+        return normalizeRuntimeLayerParamStore(
+            transientRuntimeLayerParamsState
+            ?? settingsState?.[RUNTIME_LAYER_PARAMS_SETTINGS_KEY]
+            ?? manifestState?.[RUNTIME_LAYER_PARAMS_SETTINGS_KEY]
+            ?? null,
+        );
+    }
+
+    function getLegacyManifestLayerParamValues(layerId) {
+        const identity = splitInlineLayerKey(layerId);
+        const entries = Array.isArray(manifestState?.layers) ? manifestState.layers : [];
+        for (const entry of entries) {
+            if (!entry || typeof entry !== 'object') continue;
+            const rawId = String(entry.id || entry.name || '');
+            const entryKey = String(entry.key || buildInlineLayerKey(rawId, entry.folder));
+            const matches = entryKey === layerId
+                || rawId === layerId
+                || (!identity.folder && rawId === identity.rawId);
+            if (!matches) continue;
+            return normalizeRuntimeLayerParamValues(
+                entry.paramValues ?? entry.parameters ?? entry.params,
+            );
+        }
+        return {};
+    }
+
+    function getLayerParameterValues(rawLayerId) {
+        const layerId = normalizedRuntimeParamKey(rawLayerId);
+        if (!layerId) return {};
+        const legacyValues = getLegacyManifestLayerParamValues(layerId);
+        const storedValues = getRuntimeLayerParamStore().layers[layerId] ?? {};
+        return cloneJsonValue({ ...legacyValues, ...storedValues });
+    }
+
+    async function persistLayerParameterValue(rawLayerId, rawName, value) {
+        const layerId = normalizedRuntimeParamKey(rawLayerId);
+        const name = normalizedRuntimeParamKey(rawName);
+        if (!layerId || !name) {
+            throw new TypeError('Runtime layer parameter persistence requires a valid layer id and parameter name');
+        }
+        if (!isPersistableRuntimeParamValue(value)) {
+            throw new TypeError(`Runtime layer parameter "${layerId}.${name}" is not JSON-safe`);
+        }
+
+        const store = getRuntimeLayerParamStore();
+        const currentValues = store.layers[layerId] ?? {};
+        store.layers[layerId] = { ...currentValues, [name]: value };
+        return setManifestSettingState(RUNTIME_LAYER_PARAMS_SETTINGS_KEY, store);
+    }
+
     function setStatus(message) {
         if (message === lastStatus) return;
         lastStatus = message;
@@ -213,6 +327,27 @@ function stripSettingsFromPostFx(payload) {
             perfHud?.setStatus?.(line);
         }
         emitChange();
+    }
+
+    function trackProjectLoad(load, label) {
+        const previous = projectLoadTask;
+        const tracked = previous
+            .catch(() => false)
+            .then(() => load())
+            .catch(error => {
+                debugWarn(`[ProjectRuntime] ${label} failed`, error);
+                return false;
+            });
+        projectLoadTask = tracked;
+        return tracked;
+    }
+
+    async function waitForLatestProjectLoad() {
+        let pending;
+        do {
+            pending = projectLoadTask;
+            await pending;
+        } while (pending !== projectLoadTask);
     }
 
     function clearTimer() {
@@ -340,7 +475,7 @@ function stripSettingsFromPostFx(payload) {
 
         const manifestUrl = projectUrl(projectRootUrl, 'project.maxjs.json', `${Date.now()}`);
         try {
-            const manifestText = await fetchText(manifestUrl);
+            const manifestText = await fetchText(manifestUrl, fetchImpl);
             if (!force && manifestText === lastManifestText) return null;
 
             const manifest = JSON.parse(manifestText);
@@ -367,7 +502,7 @@ function stripSettingsFromPostFx(payload) {
 
         const postFxUrl = projectUrl(projectRootUrl, 'postfx.maxjs.json', `${Date.now()}`);
         try {
-            const text = await fetchText(postFxUrl);
+            const text = await fetchText(postFxUrl, fetchImpl);
             if (!force && text === lastPostFxText) return false;
 
             lastPostFxText = text;
@@ -395,7 +530,7 @@ function stripSettingsFromPostFx(payload) {
 
         const settingsUrl = projectUrl(projectRootUrl, 'settings.maxjs.json', `${Date.now()}`);
         try {
-            const text = await fetchText(settingsUrl);
+            const text = await fetchText(settingsUrl, fetchImpl);
             if (!force && text === lastSettingsText) return false;
 
             lastSettingsText = text;
@@ -421,8 +556,15 @@ function stripSettingsFromPostFx(payload) {
             const fallback = {
                 studio: cloneJsonValue(manifestState?.studio ?? null),
                 bake: cloneJsonValue(manifestState?.bake ?? null),
+                [RUNTIME_LAYER_PARAMS_SETTINGS_KEY]: cloneJsonValue(
+                    manifestState?.[RUNTIME_LAYER_PARAMS_SETTINGS_KEY] ?? null,
+                ),
             };
-            const next = (fallback.studio || fallback.bake) ? fallback : null;
+            const next = (
+                fallback.studio
+                || fallback.bake
+                || fallback[RUNTIME_LAYER_PARAMS_SETTINGS_KEY]
+            ) ? fallback : null;
             const changed = stableStringify(settingsState) !== stableStringify(next);
             settingsState = next;
             if (changed) emitChange();
@@ -441,7 +583,7 @@ function stripSettingsFromPostFx(payload) {
 
         let moduleNamespace;
         try {
-            moduleNamespace = await import(moduleUrl);
+            moduleNamespace = await importModule(moduleUrl);
         } catch (error) {
             const detail = error?.message || String(error);
             throw new Error(`layer import failed: ${layerId} (${entryPath}) -> ${detail}`);
@@ -460,7 +602,7 @@ function stripSettingsFromPostFx(payload) {
                 code: moduleUrl,
                 source: LAYER_SOURCE_PROJECT,
                 entry: entryPath,
-                paramValues: entry.raw?.paramValues ?? entry.raw?.parameters ?? entry.raw?.params,
+                paramValues: getLayerParameterValues(layerId),
             },
         );
 
@@ -582,11 +724,17 @@ function stripSettingsFromPostFx(payload) {
     function setTransientManifestSetting(section, value) {
         if (section === 'studio') transientStudioState = cloneJsonValue(value);
         else if (section === 'bake') transientBakeState = cloneJsonValue(value);
+        else if (section === RUNTIME_LAYER_PARAMS_SETTINGS_KEY) {
+            transientRuntimeLayerParamsState = normalizeRuntimeLayerParamStore(value);
+        }
     }
 
     function clearTransientManifestSetting(section) {
         if (section === 'studio') transientStudioState = null;
         else if (section === 'bake') transientBakeState = null;
+        else if (section === RUNTIME_LAYER_PARAMS_SETTINGS_KEY) {
+            transientRuntimeLayerParamsState = null;
+        }
     }
 
     function resolveManifestSettingsWaiters(error, value) {
@@ -665,6 +813,7 @@ function stripSettingsFromPostFx(payload) {
         await requestHostAction('project_settings_write', {
             contentBase64: toBase64Utf8(text),
         });
+        lastSettingsText = text;
         settingsState = settingsToWrite;
 
         const currentPostFx = postFxState ?? transientPostFxState ?? manifestState?.postFx ?? null;
@@ -858,6 +1007,12 @@ function stripSettingsFromPostFx(payload) {
         if (transientBakeState != null) {
             await setBakeState(transientBakeState);
         }
+        if (transientRuntimeLayerParamsState != null) {
+            await setManifestSettingState(
+                RUNTIME_LAYER_PARAMS_SETTINGS_KEY,
+                transientRuntimeLayerParamsState,
+            );
+        }
         return true;
     }
 
@@ -984,6 +1139,7 @@ function stripSettingsFromPostFx(payload) {
         if (projectChanged) transientPostFxState = null;
         if (projectChanged) transientStudioState = null;
         if (projectChanged) transientBakeState = null;
+        if (projectChanged) transientRuntimeLayerParamsState = null;
         schedulePolling();
         emitChange();
 
@@ -997,12 +1153,15 @@ function stripSettingsFromPostFx(payload) {
     }
 
     bridge.on('project_config', msg => {
-        void setProjectDirectory(msg.dir || '', {
-            pollMs: msg.pollMs,
-            inlineDir: msg.inlineDir || '',
-            sceneSaved: msg.sceneSaved === true,
-            manifestExists: msg.manifestExists === true,
-        });
+        void trackProjectLoad(
+            () => setProjectDirectory(msg.dir || '', {
+                pollMs: msg.pollMs,
+                inlineDir: msg.inlineDir || '',
+                sceneSaved: msg.sceneSaved === true,
+                manifestExists: msg.manifestExists === true,
+            }),
+            'project config load',
+        );
     });
 
     bridge.on('project_reload', () => {
@@ -1010,7 +1169,7 @@ function stripSettingsFromPostFx(payload) {
             suppressProjectReloadCount -= 1;
             return;
         }
-        void reload(true);
+        void trackProjectLoad(() => reload(true), 'project reload');
     });
 
     // Auto-mount layers discovered by C++ scanning the inlines/ folder.
@@ -1050,7 +1209,7 @@ function stripSettingsFromPostFx(payload) {
 
         let moduleNamespace;
         try {
-            moduleNamespace = await import(moduleUrl);
+            moduleNamespace = await importModule(moduleUrl);
         } catch (error) {
             const detail = error?.message || String(error);
             throw new Error(`inline layer import failed: ${rawId} -> ${detail}`);
@@ -1079,6 +1238,7 @@ function stripSettingsFromPostFx(payload) {
                 entry: inlineEntryRelPath(rawId, folder),
                 folder,
                 priority,
+                paramValues: getLayerParameterValues(key),
             },
         );
         if (result?.error) throw new Error(result.error);
@@ -1093,6 +1253,10 @@ function stripSettingsFromPostFx(payload) {
     }
 
     bridge.on('inline_layers_state', async msg => {
+        // project_config and inline_layers_state are consecutive native messages.
+        // Wait for project settings before mounting so restart-time parameter
+        // values are available to the layer factory on its first invocation.
+        await waitForLatestProjectLoad();
         const layersRaw = Array.isArray(msg?.layers) ? msg.layers : [];
         const scanStamp = String(msg?.stamp || '');
         // Augment with folder/priority and sort. C++ scanner emits these; older builds
@@ -1214,6 +1378,8 @@ function stripSettingsFromPostFx(payload) {
         setStudioState,
         getBakeState,
         setBakeState,
+        getLayerParameterValues,
+        persistLayerParameterValue,
         releaseManifest,
         setProjectDirectory,
         reload,
@@ -1226,12 +1392,14 @@ function stripSettingsFromPostFx(payload) {
             lastManifestText = '';
             transientStudioState = null;
             transientBakeState = null;
+            transientRuntimeLayerParamsState = null;
             projectDir = '';
             projectRootUrl = '';
             manifestBaseUrl = '';
             inlineDir = '';
             sceneSaved = false;
             manifestExists = false;
+            projectLoadTask = Promise.resolve(false);
             emitChange();
             setStatus('project runtime cleared');
         },
@@ -1249,6 +1417,7 @@ function stripSettingsFromPostFx(payload) {
                 manifest: manifestState,
                 studio: getStudioState(),
                 bake: getBakeState(),
+                runtimeLayerParams: getRuntimeLayerParamStore(),
             };
         },
     };

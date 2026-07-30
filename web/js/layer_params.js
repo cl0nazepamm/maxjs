@@ -1,5 +1,6 @@
 // layer_params.js - declarative runtime-layer parameters.
-// Values are JSON-safe so they can ride the live UI, hot reloads, and snapshots.
+// Values are JSON-safe so they can ride the live UI, project persistence,
+// hot reloads, and snapshots.
 
 const BLOCKED_PARAM_NAMES = new Set(['__proto__', 'prototype', 'constructor']);
 

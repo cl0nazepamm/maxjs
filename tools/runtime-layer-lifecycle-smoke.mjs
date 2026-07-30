@@ -303,6 +303,38 @@ assert.equal(layerSnapshot.parameters.find(p => p.name === 'speed')?.value, 1.7,
 const runtimeSnapshot = manager.serializeSnapshot();
 assert.equal(runtimeSnapshot.layers[0].parameters.find(p => p.name === 'tint')?.value, '#ff8000', 'runtime snapshots include parameter values');
 
+let restartRestoredParams = null;
+const restartRestoredResult = await manager.mount('restart-restored-params', (ctx) => {
+    restartRestoredParams = ctx.params.define({
+        speed: { type: 'slider', value: 0.25, min: 0, max: 4, step: 0.05 },
+        numericLabel: { type: 'string', value: 'default' },
+    });
+    return {};
+}, {
+    source: 'inline',
+    entry: 'inlines/restart-restored-params.js',
+    paramValues: {
+        speed: 2.75,
+        numericLabel: '007',
+    },
+});
+assert.equal(restartRestoredResult.error, null, 'restart-restored parameter layer mounts');
+assert.equal(restartRestoredParams.speed, 2.75, 'restart-restored numeric value reaches the layer factory');
+assert.equal(restartRestoredParams.numericLabel, '007', 'restart-restored string value reaches the layer factory');
+const restartRestoredSnapshot = manager.serializeSnapshot();
+const restartRestoredLayer = restartRestoredSnapshot.layers.find(layer => layer.id === 'restart-restored-params');
+assert.equal(
+    restartRestoredLayer?.parameters.find(param => param.name === 'speed')?.value,
+    2.75,
+    'runtimeScene carries restart-restored numeric parameter values',
+);
+assert.equal(
+    restartRestoredLayer?.parameters.find(param => param.name === 'numericLabel')?.value,
+    '007',
+    'runtimeScene carries restart-restored string parameter values',
+);
+manager.remove('restart-restored-params');
+
 const remountResult = await manager.mount('runtime-smoke', (ctx) => {
     params = ctx.params.define({
         speed: { type: 'slider', value: 0.2, min: 0, max: 2, step: 0.1 },

@@ -16,11 +16,11 @@ import { maxTimeline } from '../maxjs_timeline.js';
 import { copyMaxComponentsToWorld } from '../scene_space.js';
 import { ensureGeometryUv0ForMaterial, markUv0AttributeAuthored, assignGatedMaterialScalar } from '../material_contract.js';
 import { ensureMaxOwned, markOwned, OWNER_MAX } from '../layer_ownership.js';
+import { createInstanceBuckets } from '../instance_buckets.js';
 
 function createSceneSync(deps = {}) {
         let gpuNormalsAnnounced = false;
         let firstSync = true;
-        let lastMaxInstanceBucketSignature = '';
         // Flatten Groups: Max group members merged into one mesh per material
         // under the group head. Keyed by head handle.
         const flattenedGroups = new Map();
@@ -41,6 +41,25 @@ function createSceneSync(deps = {}) {
         // renderable. Instance buckets / flattened groups may still optimize
         // every other object in the scene.
         const lightLinkTargetHandles = new Set();
+
+        // Shared instOf bucket engine (web/js/instance_buckets.js), operating
+        // on the editor-owned maps so HUD stats (boot.countInstances) and
+        // materials.js keep reading the same state. The wrappers below keep
+        // this factory's public API unchanged.
+        const maxInstanceBucketSystem = createInstanceBuckets({
+            nodeMap: deps.nodeMap,
+            root: deps.maxRoot,
+            buckets: deps.maxInstanceBuckets,
+            handleToBucket: deps.maxInstanceHandleToBucket,
+            materialKey: (nd) => (nd?.mat ? deps.materialIdentityKey(nd.mat) : '__default__'),
+            sourceSignature: (nd) => deps.sceneMaterialSignature(nd, false),
+            buildMaterial: ({ nd, geom }) => deps.createSceneRenderableMaterial(nd, false, geom ?? null, null),
+            disposeMaterial: (mat) => deps.disposeSceneMaterial(mat),
+            applyMaterialScalar: (mesh, mat) => applyMaterialScalar(mesh, mat),
+            enabled: () => !!deps.performanceSettings.optimizeMaxInstances,
+            threshold: () => deps.performanceSettings.maxInstanceBucketThreshold,
+            excludeNode: (nd) => lightLinkTargetHandles.has(String(nd.h)),
+        });
         let lastFlattenSignature = '';
         // Host wiring: binary shared-buffer routes (zero-copy geometry) are
         // registered per payload type here; the window/webview event listeners
@@ -327,31 +346,8 @@ function createSceneSync(deps = {}) {
             }
         }
 
-        function dissolveMaxInstanceBucket(bucketKey) {
-            const bucket = deps.maxInstanceBuckets.get(bucketKey);
-            if (!bucket) return false;
-            if (bucket.mesh?.parent) bucket.mesh.parent.remove(bucket.mesh);
-            // Geometry is shared with the source mesh. Materials are owned
-            // per bucket so sibling buckets cannot overwrite each other's
-            // assignments through a shared source material.
-            if (bucket.ownsMaterial) deps.disposeSceneMaterial(bucket.mesh?.material);
-            for (const handle of bucket.handles ?? []) {
-                deps.maxInstanceHandleToBucket.delete(handle);
-                const original = deps.nodeMap.get(handle);
-                if (original) original.visible = bucket.visible?.get(handle) !== false;
-            }
-            deps.maxInstanceBuckets.delete(bucketKey);
-            lastMaxInstanceBucketSignature = '';
-            return true;
-        }
-
         function disposeMaxInstanceBuckets() {
-            for (const bucketKey of [...deps.maxInstanceBuckets.keys()]) {
-                dissolveMaxInstanceBucket(bucketKey);
-            }
-            deps.maxInstanceBuckets.clear();
-            deps.maxInstanceHandleToBucket.clear();
-            lastMaxInstanceBucketSignature = '';
+            maxInstanceBucketSystem.dispose();
         }
 
         function setLightLinkTargetHandles(handles) {
@@ -365,15 +361,14 @@ function createSceneSync(deps = {}) {
             lightLinkTargetHandles.clear();
             for (const handle of next) lightLinkTargetHandles.add(handle);
 
-            const touchedBuckets = new Set();
+            let topologyChanged = false;
             for (const handle of next) {
                 const numeric = /^-?\d+$/.test(handle) ? Number(handle) : handle;
-                const bucketKey = deps.maxInstanceHandleToBucket.get(handle)
-                    ?? deps.maxInstanceHandleToBucket.get(numeric);
-                if (bucketKey != null) touchedBuckets.add(bucketKey);
+                if (maxInstanceBucketSystem.dissolveBucketFor(handle)
+                    || maxInstanceBucketSystem.dissolveBucketFor(numeric)) {
+                    topologyChanged = true;
+                }
             }
-            for (const bucketKey of touchedBuckets) dissolveMaxInstanceBucket(bucketKey);
-            let topologyChanged = touchedBuckets.size > 0;
             for (const handle of added) {
                 const numeric = /^-?\d+$/.test(handle) ? Number(handle) : handle;
                 topologyChanged = dissolveFlattenedGroupForHandle(numeric) || topologyChanged;
@@ -382,11 +377,8 @@ function createSceneSync(deps = {}) {
         }
 
         function getMaxInstanceBucketForHandle(handle) {
-            const bucketKey = deps.maxInstanceHandleToBucket.get(handle);
-            return bucketKey ? deps.maxInstanceBuckets.get(bucketKey) ?? null : null;
+            return maxInstanceBucketSystem.getBucketFor(handle);
         }
-
-        const maxInstanceMatrixScratch = new THREE.Matrix4();
 
         function matrixArraysAlmostEqual(a, b, eps = 1.0e-7) {
             if (!a || !b || a.length < 16 || b.length < 16) return false;
@@ -396,183 +388,20 @@ function createSceneSync(deps = {}) {
             return true;
         }
 
-        function updateMaxInstanceBucketVisibility(bucket) {
-            if (!bucket?.mesh) return;
-            // Compact: rebuild instance matrices with only visible entries
-            let slot = 0;
-            for (const handle of bucket.handles) {
-                bucket.handleToIndex.set(handle, -1);
-                if (bucket.visible.get(handle) === false) continue;
-                const xf = bucket.transforms.get(handle);
-                if (xf) maxInstanceMatrixScratch.fromArray(xf);
-                else maxInstanceMatrixScratch.identity();
-                bucket.handleToIndex.set(handle, slot);
-                bucket.mesh.setMatrixAt(slot, maxInstanceMatrixScratch);
-                slot++;
-            }
-            bucket.mesh.count = slot;
-            bucket.mesh.visible = slot > 0;
-            bucket.mesh.instanceMatrix.needsUpdate = true;
-        }
-
         function updateMaxInstanceBucketTransform(handle, matrixArray) {
-            const bucket = getMaxInstanceBucketForHandle(handle);
-            if (!bucket || !isFiniteArray(matrixArray, 16)) return false;
-            const idx = bucket.handleToIndex.get(handle);
-            if (idx == null) return false;
-            const previous = bucket.transforms.get(handle);
-            if (matrixArraysAlmostEqual(previous, matrixArray)) return false;
-            if (previous) {
-                for (let i = 0; i < 16; i++) previous[i] = matrixArray[i];
-            } else {
-                bucket.transforms.set(handle, Array.from(matrixArray));
-            }
-            if (bucket.visible.get(handle) === false || idx < 0) return false;
-            maxInstanceMatrixScratch.fromArray(matrixArray);
-            bucket.mesh.setMatrixAt(idx, maxInstanceMatrixScratch);
-            bucket.mesh.instanceMatrix.needsUpdate = true;
-            return true;
+            return maxInstanceBucketSystem.updateTransform(handle, matrixArray);
         }
 
         function updateMaxInstanceBucketNode(handle, nd) {
-            const bucket = getMaxInstanceBucketForHandle(handle);
-            if (!bucket) return false;
-            let changed = false;
-            if (nd.vis != null) {
-                const nextVisible = !!nd.vis;
-                if (bucket.visible.get(handle) !== nextVisible) {
-                    bucket.visible.set(handle, nextVisible);
-                    updateMaxInstanceBucketVisibility(bucket);
-                    changed = true;
-                }
-            }
-            if (isFiniteArray(nd.t, 16)) {
-                if (updateMaxInstanceBucketTransform(handle, nd.t)) changed = true;
-            }
-            if (nd.mat) {
-                const materialSignature = deps.materialIdentityKey(nd.mat);
-                if (bucket.lastMaterialScalarSignature !== materialSignature) {
-                    applyMaterialScalar(bucket.mesh, nd.mat);
-                    bucket.lastMaterialScalarSignature = materialSignature;
-                    bucket.materialKey = materialSignature;
-                    changed = true;
-                }
-            }
-            return changed;
-        }
-
-        function createMaxInstanceBucketMaterial(group, sourceMesh) {
-            const materialPayload = group?.nodes?.[0] ?? null;
-            return deps.createSceneRenderableMaterial(materialPayload, false, sourceMesh?.geometry ?? null, null);
-        }
-
-        function computeMaxInstanceBucketGroups(nodes) {
-            const groups = new Map();
-            if (!deps.performanceSettings.optimizeMaxInstances) return groups;
-            for (const nd of nodes) {
-                if (!Number.isFinite(nd?.instOf) || nd.instOf <= 0) continue;
-                if (lightLinkTargetHandles.has(String(nd.h))) continue;
-                if (nd.jsmod || nd.spline || nd.skin || nd.groups || nd.mats) continue;
-                const sourceHandle = nd.instOf;
-                const materialKey = nd.mat ? deps.materialIdentityKey(nd.mat) : '__default__';
-                const bucketKey = `${sourceHandle}|${materialKey}`;
-                if (!groups.has(bucketKey)) {
-                    groups.set(bucketKey, {
-                        key: bucketKey,
-                        sourceHandle,
-                        materialKey,
-                        nodes: [],
-                    });
-                }
-                groups.get(bucketKey).nodes.push(nd);
-            }
-            for (const [key, group] of [...groups.entries()]) {
-                if (group.nodes.length < Math.max(1, deps.performanceSettings.maxInstanceBucketThreshold)) {
-                    groups.delete(key);
-                }
-            }
-            return groups;
+            return maxInstanceBucketSystem.updateNode(handle, nd);
         }
 
         function planMaxInstanceBuckets(snapshotNodes) {
-            const bucketGroups = computeMaxInstanceBucketGroups(snapshotNodes);
-            const nodeByHandle = new Map();
-            for (const nd of snapshotNodes) nodeByHandle.set(nd.h, nd);
-            let signature = '';
-            const bucketHandles = new Set();
-            if (bucketGroups.size > 0) {
-                const parts = [];
-                for (const group of bucketGroups.values()) {
-                    const handles = group.nodes.map((nd) => nd.h).sort((a, b) => a - b);
-                    for (const handle of handles) bucketHandles.add(handle);
-                    const sourceMaterialSig = deps.sceneMaterialSignature(nodeByHandle.get(group.sourceHandle), false);
-                    parts.push(`${group.key}@${sourceMaterialSig}#${group.nodes.length}:${handles.join(',')}`);
-                }
-                parts.sort();
-                signature = parts.join('||');
-            }
-            return { groups: bucketGroups, signature, handles: bucketHandles };
+            return maxInstanceBucketSystem.plan(snapshotNodes);
         }
 
         function buildMaxInstanceBuckets(snapshotNodes, bucketPlan = null) {
-            const plan = bucketPlan ?? planMaxInstanceBuckets(snapshotNodes);
-            const bucketGroups = plan.groups;
-            const signature = plan.signature;
-
-            if (signature === lastMaxInstanceBucketSignature) {
-                // Composition unchanged — keep existing buckets, let per-handle
-                // transform / visibility / material updates flow through
-                // updateMaxInstanceBucketNode without reallocating meshes.
-                return false;
-            }
-
-            disposeMaxInstanceBuckets();
-            lastMaxInstanceBucketSignature = signature;
-            if (bucketGroups.size === 0) return true;
-
-            for (const group of bucketGroups.values()) {
-                const sourceMesh = deps.nodeMap.get(group.sourceHandle);
-                if (!sourceMesh?.geometry || sourceMesh.isLine || sourceMesh.isLineSegments || sourceMesh.isSkinnedMesh) continue;
-                const bucketMaterial = createMaxInstanceBucketMaterial(group, sourceMesh);
-                const mesh = new THREE.InstancedMesh(sourceMesh.geometry, bucketMaterial, group.nodes.length);
-                mesh.matrixAutoUpdate = false;
-                mesh.frustumCulled = false;
-                mesh.castShadow = !!sourceMesh.castShadow;
-                mesh.receiveShadow = !!sourceMesh.receiveShadow;
-                mesh.name = `max_instances_${group.sourceHandle}_x${group.nodes.length}`;
-
-                const bucket = {
-                    mesh,
-                    materialKey: group.materialKey,
-                    sourceHandle: group.sourceHandle,
-                    handles: new Set(),
-                    handleToIndex: new Map(),
-                    transforms: new Map(),
-                    visible: new Map(),
-                    lastMaterialScalarSignature: group.nodes[0]?.mat ? deps.materialIdentityKey(group.nodes[0].mat) : '',
-                    ownsMaterial: true,
-                };
-
-                group.nodes.forEach((nd, index) => {
-                    bucket.handles.add(nd.h);
-                    bucket.handleToIndex.set(nd.h, index);
-                    bucket.transforms.set(nd.h, isFiniteArray(nd.t, 16) ? Array.from(nd.t) : null);
-                    bucket.visible.set(nd.h, nd.vis == null ? true : !!nd.vis);
-                    const matrix = new THREE.Matrix4();
-                    if (isFiniteArray(nd.t, 16)) matrix.fromArray(nd.t);
-                    else matrix.identity();
-                    mesh.setMatrixAt(index, matrix);
-                    deps.maxInstanceHandleToBucket.set(nd.h, group.key);
-                    const original = deps.nodeMap.get(nd.h);
-                    if (original && original !== sourceMesh) original.visible = false;
-                });
-
-                updateMaxInstanceBucketVisibility(bucket);
-                markOwned(mesh, OWNER_MAX);
-                deps.maxRoot.add(mesh);
-                deps.maxInstanceBuckets.set(group.key, bucket);
-            }
-            return true;
+            return maxInstanceBucketSystem.build(snapshotNodes, bucketPlan);
         }
 
         // ── Flatten Groups ───────────────────────────────────────
@@ -1028,7 +857,7 @@ function createSceneSync(deps = {}) {
             const applyStart = performance.now();
             const incoming = new Set(msg.nodes.map(n => n.h));
             const bucketPlan = planMaxInstanceBuckets(msg.nodes);
-            const stableBucketHandles = bucketPlan.signature === lastMaxInstanceBucketSignature
+            const stableBucketHandles = bucketPlan.signature === maxInstanceBucketSystem.signature
                 ? bucketPlan.handles
                 : null;
             let sceneChanged = false;
@@ -1332,7 +1161,7 @@ function createSceneSync(deps = {}) {
             const applyStart = performance.now();
             const incoming = new Set(meta.nodes.map(n => n.h));
             const bucketPlan = planMaxInstanceBuckets(meta.nodes);
-            const stableBucketHandles = bucketPlan.signature === lastMaxInstanceBucketSignature
+            const stableBucketHandles = bucketPlan.signature === maxInstanceBucketSystem.signature
                 ? bucketPlan.handles
                 : null;
             let sceneChanged = false;
@@ -1696,7 +1525,8 @@ function createSceneSync(deps = {}) {
             const isLine = !!options.isLine;
             const geom = new THREE.BufferGeometry();
             geom.setAttribute('position', new THREE.Float32BufferAttribute(vertices, 3));
-            if (indices?.length) geom.setIndex(new THREE.BufferAttribute(indices, 1));
+            // BufferAttribute rejects plain arrays; setIndex(array) converts.
+            if (indices?.length) geom.setIndex(ArrayBuffer.isView(indices) ? new THREE.BufferAttribute(indices, 1) : indices);
             if (uvs?.length) geom.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
             if (options.uv2s?.length) {
                 const uv2Attr = new THREE.Float32BufferAttribute(options.uv2s, 2);
@@ -1985,11 +1815,8 @@ function createSceneSync(deps = {}) {
             disposeFlattenedGroups,
             getMaxInstanceBucketForHandle,
             matrixArraysAlmostEqual,
-            updateMaxInstanceBucketVisibility,
             updateMaxInstanceBucketTransform,
             updateMaxInstanceBucketNode,
-            createMaxInstanceBucketMaterial,
-            computeMaxInstanceBucketGroups,
             planMaxInstanceBuckets,
             buildMaxInstanceBuckets,
             profileSceneNodes,

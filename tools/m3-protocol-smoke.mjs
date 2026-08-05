@@ -1,0 +1,324 @@
+#!/usr/bin/env node
+
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import {
+    COMMAND_TYPES,
+    DELTA_FRAME_MAGIC,
+    DELTA_FRAME_VERSION,
+    applyDeltaFrame,
+} from '../web/js/protocol.js';
+import {
+    attachSkinAttributes,
+    binInRange,
+    geometryFromNodeBinary,
+    typedArrayCanStore,
+    updateFloatGeometryAttribute,
+} from '../web/js/scene_binary.js';
+import {
+    fetchSnapshotScenePayload,
+    snapshotScenePayloadCandidates,
+    validateM3Metadata,
+    validateSnapshotScenePayloadName,
+} from '../web/js/snapshot_boot.js';
+
+const FRAME_ID = 0x12345678;
+const IDENTITY = [1, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1];
+
+function setFloatArray(view, offset, values) {
+    values.forEach((value, index) => view.setFloat32(offset + index * 4, value, true));
+}
+
+function command(type, size, write = () => {}) {
+    return { type, size, write };
+}
+
+function buildFrame(commands, frameId = FRAME_ID) {
+    const byteLength = 16 + commands.reduce((sum, entry) => sum + entry.size, 0);
+    const buffer = new ArrayBuffer(byteLength);
+    const view = new DataView(buffer);
+    view.setUint32(0, DELTA_FRAME_MAGIC, true);
+    view.setUint16(4, DELTA_FRAME_VERSION, true);
+    view.setUint16(6, 0, true);
+    view.setUint32(8, frameId, true);
+    view.setUint32(12, commands.length, true);
+    const offsets = [];
+    let offset = 16;
+    for (const entry of commands) {
+        offsets.push(offset);
+        view.setUint16(offset, entry.type, true);
+        view.setUint16(offset + 2, entry.size, true);
+        entry.write(view, offset + 4);
+        offset += entry.size;
+    }
+    return { buffer, offsets };
+}
+
+function allOpcodeFrame() {
+    const commands = [
+        command(COMMAND_TYPES.BeginFrame, 8, (view, o) => view.setUint32(o, FRAME_ID, true)),
+        command(COMMAND_TYPES.UpdateTransform, 72, (view, o) => {
+            view.setUint32(o, 7, true);
+            setFloatArray(view, o + 4, IDENTITY);
+        }),
+        command(COMMAND_TYPES.UpdateMaterialScalar, 32, (view, o) => {
+            view.setUint32(o, 8, true);
+            setFloatArray(view, o + 4, [0.1, 0.2, 0.3]);
+            setFloatArray(view, o + 16, [0.4, 0.5, 0.6]);
+        }),
+        command(COMMAND_TYPES.UpdateSelection, 12, (view, o) => {
+            view.setUint32(o, 9, true);
+            view.setUint32(o + 4, 1, true);
+        }),
+        command(COMMAND_TYPES.UpdateVisibility, 12, (view, o) => {
+            view.setUint32(o, 10, true);
+            view.setUint32(o + 4, 0, true);
+        }),
+        command(COMMAND_TYPES.UpdateCamera, 68, (view, o) => {
+            setFloatArray(view, o, [1, 2, 3, 4, 5, 6, 0, 1, 0]);
+            view.setFloat32(o + 36, 55, true);
+            view.setUint32(o + 40, 1, true);
+            view.setFloat32(o + 44, 12, true);
+            view.setUint32(o + 48, 1, true);
+            setFloatArray(view, o + 52, [25, 50, 2]);
+        }),
+        command(COMMAND_TYPES.UpdateLight, 152, (view, o) => {
+            view.setUint32(o, 11, true);
+            setFloatArray(view, o + 4, IDENTITY);
+            view.setUint32(o + 68, 1, true);
+            view.setUint32(o + 72, 2, true);
+            setFloatArray(view, o + 76, [0.7, 0.8, 0.9, 100, 200, 2, 0.5, 0.25, 3, 4, 0.1, 0.2, 0.3]);
+            view.setUint32(o + 128, 1, true);
+            view.setFloat32(o + 132, -0.001, true);
+            view.setFloat32(o + 136, 2.5, true);
+            view.setUint32(o + 140, 2048, true);
+            view.setFloat32(o + 144, 0.75, true);
+        }),
+        command(COMMAND_TYPES.UpdateAudio, 76, (view, o) => {
+            view.setUint32(o, 12, true);
+            setFloatArray(view, o + 4, IDENTITY);
+            view.setUint32(o + 68, 1, true);
+        }),
+        command(COMMAND_TYPES.UpdateTime, 16, (view, o) => {
+            view.setInt32(o, -240, true);
+            view.setInt32(o + 4, 160, true);
+            view.setUint8(o + 8, 1);
+        }),
+        command(COMMAND_TYPES.UpdateGLTF, 76, (view, o) => {
+            view.setUint32(o, 13, true);
+            setFloatArray(view, o + 4, IDENTITY);
+            view.setUint32(o + 68, 0, true);
+        }),
+        command(COMMAND_TYPES.UpdateWebApp, 76, (view, o) => {
+            view.setUint32(o, 14, true);
+            setFloatArray(view, o + 4, IDENTITY);
+            view.setUint32(o + 68, 1, true);
+        }),
+        command(COMMAND_TYPES.EndFrame, 4),
+    ];
+    return { ...buildFrame(commands), commands };
+}
+
+function cloneWithExtraBytes(buffer, extraBytes) {
+    const out = new ArrayBuffer(buffer.byteLength + extraBytes);
+    new Uint8Array(out).set(new Uint8Array(buffer));
+    return out;
+}
+
+function protocolGoldenSmoke() {
+    const { buffer, offsets } = allOpcodeFrame();
+    const calls = [];
+    const result = applyDeltaFrame(buffer, {
+        onBeginFrame: id => calls.push(['begin', id]),
+        onTransform: (handle, matrix) => calls.push(['transform', handle, Array.from(matrix)]),
+        onMaterialScalar: (handle, data) => calls.push(['material', handle, Array.from(data.color), data]),
+        onSelection: (handle, selected) => calls.push(['selection', handle, selected]),
+        onVisibility: (handle, visible) => calls.push(['visibility', handle, visible]),
+        onCamera: data => calls.push(['camera', data]),
+        onLight: (handle, data) => calls.push(['light', handle, data]),
+        onAudio: (handle, matrix, visible) => calls.push(['audio', handle, Array.from(matrix), visible]),
+        onTime: data => calls.push(['time', data]),
+        onGLTF: (handle, matrix, visible) => calls.push(['gltf', handle, Array.from(matrix), visible]),
+        onWebApp: (handle, matrix, visible) => calls.push(['webapp', handle, Array.from(matrix), visible]),
+        onEndFrame: id => calls.push(['end', id]),
+    });
+
+    assert.equal(result.frameId, FRAME_ID);
+    assert.equal(result.commandCount, Object.keys(COMMAND_TYPES).length);
+    assert.equal(result.bytes, buffer.byteLength);
+    assert.deepEqual(calls.map(call => call[0]), [
+        'begin', 'transform', 'material', 'selection', 'visibility', 'camera',
+        'light', 'audio', 'time', 'gltf', 'webapp', 'end',
+    ]);
+    assert.deepEqual(calls.find(call => call[0] === 'transform').slice(1), [7, IDENTITY]);
+    assert.deepEqual(calls.find(call => call[0] === 'selection').slice(1), [9, true]);
+    assert.deepEqual(calls.find(call => call[0] === 'visibility').slice(1), [10, false]);
+    assert.equal(calls.find(call => call[0] === 'camera')[1].dofEnabled, true);
+    assert.equal(calls.find(call => call[0] === 'light')[2].shadowMapSize, 2048);
+    assert.deepEqual(calls.find(call => call[0] === 'time')[1], { ticks: -240, tpf: 160, stateFlags: 1 });
+    assert.deepEqual(calls.find(call => call[0] === 'gltf').slice(1, 2), [13]);
+
+    // Legacy v1 camera payload (without DOF) remains readable.
+    const legacyCamera = buildFrame([
+        command(COMMAND_TYPES.UpdateCamera, 52, (view, o) => {
+            setFloatArray(view, o, [1, 2, 3, 4, 5, 6, 0, 1, 0]);
+            view.setFloat32(o + 36, 45, true);
+            view.setUint32(o + 40, 1, true);
+            view.setFloat32(o + 44, 8, true);
+        }),
+    ]).buffer;
+    let legacyValue = null;
+    applyDeltaFrame(legacyCamera, { onCamera: value => { legacyValue = value; } });
+    assert.equal(legacyValue.dofEnabled, undefined);
+
+    assert.throws(() => applyDeltaFrame(new ArrayBuffer(15)), /Truncated delta frame header/);
+    assert.throws(() => applyDeltaFrame(new DataView(buffer)), /must be an ArrayBuffer/);
+    assert.throws(() => applyDeltaFrame(cloneWithExtraBytes(buffer, 4)), /length mismatch/);
+    assert.throws(() => applyDeltaFrame(buffer.slice(0, -1)), /Truncated|exceeds frame bounds/);
+
+    const badSize = buffer.slice(0);
+    new DataView(badSize).setUint16(offsets[0] + 2, 4, true);
+    assert.throws(() => applyDeltaFrame(badSize), /Unexpected command size for BeginFrame/);
+
+    const retiredOpcode = buffer.slice(0);
+    new DataView(retiredOpcode).setUint16(offsets[1], 9, true);
+    assert.throws(() => applyDeltaFrame(retiredOpcode), /Unknown delta command type: 9/);
+
+    const mismatchedBegin = buffer.slice(0);
+    new DataView(mismatchedBegin).setUint32(offsets[0] + 4, FRAME_ID + 1, true);
+    assert.throws(() => applyDeltaFrame(mismatchedBegin), /does not match frame header/);
+
+    const impossibleCount = buffer.slice(0);
+    new DataView(impossibleCount).setUint32(12, 0xffffffff, true);
+    assert.throws(() => applyDeltaFrame(impossibleCount), /command count .* exceeds available bytes/);
+
+    // A malformed command near the tail must be caught before an early handler runs.
+    const invalidTail = buffer.slice(0);
+    const webAppOffset = offsets[offsets.length - 2];
+    new DataView(invalidTail).setUint32(webAppOffset + 4 + 68, 2, true);
+    let applied = 0;
+    assert.throws(() => applyDeltaFrame(invalidTail, { onBeginFrame: () => applied++ }), /Invalid UpdateWebApp.visible/);
+    assert.equal(applied, 0);
+}
+
+function m3RangeSmoke() {
+    const buffer = new ArrayBuffer(48);
+    const view = new DataView(buffer);
+    [-1, -1, 0, 1, -1, 0, 0, 1, 0]
+        .forEach((value, index) => view.setFloat32(index * 4, value, true));
+    [0, 1, 2].forEach((value, index) => view.setInt32(36 + index * 4, value, true));
+
+    assert.equal(binInRange(buffer, 0, 9), true);
+    assert.equal(binInRange(buffer, 2, 1, 4), false, 'misaligned f32 offset rejected');
+    assert.equal(binInRange(buffer, Number.MAX_SAFE_INTEGER, 1), false);
+    assert.equal(binInRange(buffer, 0, Number.MAX_SAFE_INTEGER, 4), false);
+    assert.equal(binInRange({ byteLength: 48 }, 0, 1), false, 'forged buffer rejected');
+    assert.equal(typedArrayCanStore(new Float32Array(3), 3), true);
+    assert.equal(typedArrayCanStore(new Float32Array(3), Number.MAX_SAFE_INTEGER), false);
+
+    const descriptor = {
+        h: 1,
+        n: 'Triangle',
+        geo: { vOff: 0, vN: 9, iOff: 36, iN: 3, iType: 'u32' },
+    };
+    const geometry = geometryFromNodeBinary(descriptor, buffer);
+    assert.ok(geometry?.isBufferGeometry);
+    assert.equal(geometry.getAttribute('position').count, 3);
+    assert.deepEqual(Array.from(geometry.getIndex().array), [0, 1, 2]);
+
+    const warnings = [];
+    const originalWarn = console.warn;
+    console.warn = (...args) => warnings.push(args);
+    try {
+        assert.equal(geometryFromNodeBinary({ ...descriptor, geo: { ...descriptor.geo, vN: 8 } }, buffer), null);
+        assert.equal(geometryFromNodeBinary({ ...descriptor, geo: { ...descriptor.geo, iN: 2 } }, buffer), null);
+        assert.equal(geometryFromNodeBinary({
+            ...descriptor,
+            geo: { ...descriptor.geo, iType: 'mystery-index' },
+        }, buffer), null);
+        assert.equal(geometryFromNodeBinary({
+            ...descriptor,
+            geo: { ...descriptor.geo, uvOff: 0, uvN: 5 },
+        }, buffer), null);
+        assert.equal(geometryFromNodeBinary({
+            ...descriptor,
+            geo: { ...descriptor.geo, uvOff: 0, uvN: 6, uvType: 'mystery-uv' },
+        }, buffer), null);
+        const destination = geometry.clone();
+        assert.equal(updateFloatGeometryAttribute(destination, 'position', buffer, 0, 9, 0), false);
+        attachSkinAttributes(destination, {
+            ...descriptor,
+            skin: { wOff: 0, wN: 3, iOff: 0, iN: 3 },
+        }, buffer);
+        assert.equal(destination.getAttribute('skinWeight'), undefined);
+    } finally {
+        console.warn = originalWarn;
+        geometry.dispose();
+    }
+    assert.ok(warnings.length >= 7);
+}
+
+async function loaderCompatibilitySmoke() {
+    assert.equal(validateM3Metadata({ type: 'scene_bin' }).type, 'scene_bin');
+    assert.equal(validateM3Metadata({
+        type: 'scene_bin',
+        format: 'm3',
+        formatVersion: 1,
+        schemaVersion: 1,
+        units: { label: 'cm', metersPerUnit: 0.01 },
+    }).format, 'm3');
+    assert.throws(() => validateM3Metadata({ format: 'm3', formatVersion: 2 }), /format version/);
+    assert.throws(() => validateM3Metadata({ format: 'm3', units: { label: 'cm', metersPerUnit: 0 } }), /units/);
+    assert.deepEqual(snapshotScenePayloadCandidates({}), ['scene.m3', 'scene.bin']);
+    assert.deepEqual(snapshotScenePayloadCandidates({ bin: 'scene.bin' }), ['scene.bin']);
+    assert.deepEqual(snapshotScenePayloadCandidates({ bin: 'custom/level.m3' }), ['custom/level.m3']);
+    assert.equal(validateSnapshotScenePayloadName('custom/level.m3'), 'custom/level.m3');
+    for (const unsafe of [
+        '', '.', '../secret.m3', 'custom/../secret.m3', 'custom//scene.m3',
+        'custom\\scene.m3', '/scene.m3', 'C:/scene.m3', 'https://host/scene.m3',
+        'scene.m3?x=1', 'scene.m3#x', '%2e%2e/secret.m3', 'custom/%2fsecret.m3',
+    ]) {
+        assert.throws(() => validateSnapshotScenePayloadName(unsafe), /M3 scene payload name/);
+    }
+
+    const expected = new Uint8Array([1, 2, 3, 4]).buffer;
+    const requests = [];
+    const result = await fetchSnapshotScenePayload('/snapshot', {}, async (url) => {
+        requests.push(url);
+        if (url.endsWith('/scene.m3')) return { ok: false, status: 404 };
+        return { ok: true, status: 200, arrayBuffer: async () => expected };
+    });
+    assert.deepEqual(requests, ['/snapshot/scene.m3', '/snapshot/scene.bin']);
+    assert.equal(result.name, 'scene.bin');
+    assert.deepEqual(new Uint8Array(result.buffer), new Uint8Array(expected));
+
+    let customRequests = 0;
+    await assert.rejects(
+        fetchSnapshotScenePayload('/snapshot', { bin: 'custom.m3' }, async () => {
+            customRequests++;
+            return { ok: false, status: 404 };
+        }),
+        /custom\.m3/,
+    );
+    assert.equal(customRequests, 1, 'explicit custom filename must not silently fall back');
+}
+
+function sourceContractSmoke() {
+    const snapshotSource = readFileSync(new URL('../src/maxjs_panel_snapshot_export.inl', import.meta.url), 'utf8');
+    const fullSyncSource = readFileSync(new URL('../src/maxjs_panel_fullsync.inl', import.meta.url), 'utf8');
+    const mimeSource = readFileSync(new URL('../src/maxjs_core_utils.h', import.meta.url), 'utf8');
+    for (const source of [snapshotSource, fullSyncSource]) {
+        assert.match(source, /format\\\":\\\"m3/);
+        assert.match(source, /formatVersion\\\":1/);
+        assert.match(source, /schemaVersion\\\":1/);
+        assert.match(source, /metersPerUnit\\\":0\.01/);
+    }
+    assert.match(snapshotSource, /bin\\\":\\\"scene\.m3/);
+    assert.match(mimeSource, /L"\.m3"[\s\S]*application\/octet-stream/);
+}
+
+protocolGoldenSmoke();
+m3RangeSmoke();
+await loaderCompatibilitySmoke();
+sourceContractSmoke();
+console.log('M3 + MXJB protocol smoke: PASS');

@@ -20,6 +20,7 @@ const IDENTITY = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
 const SOURCE_MATRIX = [1, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 10, 0, 0, 1];
 
 const MIME = {
+    '.m3': 'application/octet-stream',
     '.bin': 'application/octet-stream',
     '.css': 'text/css; charset=utf-8',
     '.exr': 'application/octet-stream',
@@ -78,7 +79,7 @@ function buildRuntimeRoot(name, kind) {
     return root.toJSON();
 }
 
-function buildSceneBin() {
+function buildM3Payload() {
     const buffer = Buffer.alloc(48);
     const positions = [
         -1, -1, 0,
@@ -93,7 +94,11 @@ function buildSceneBin() {
 function buildSnapshotMeta() {
     return {
         type: 'scene_bin',
-        bin: 'scene.bin',
+        format: 'm3',
+        formatVersion: 1,
+        schemaVersion: 1,
+        units: { label: 'cm', metersPerUnit: 0.01 },
+        bin: 'scene.m3',
         nodes: [{
             h: 101,
             n: 'Runtime_Hide_Source',
@@ -291,9 +296,9 @@ function makeFixtureRoutes() {
             type: MIME['.json'],
             body: Buffer.from(JSON.stringify(snapshot), 'utf8'),
         }],
-        [`${FIXTURE_ROOT}/scene.bin`, {
-            type: MIME['.bin'],
-            body: buildSceneBin(),
+        [`${FIXTURE_ROOT}/scene.m3`, {
+            type: MIME['.m3'],
+            body: buildM3Payload(),
         }],
         [`${FIXTURE_ROOT}/project.maxjs.json`, {
             type: MIME['.json'],

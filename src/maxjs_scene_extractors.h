@@ -10,6 +10,7 @@
 #include <modstack.h>
 #include <Graphics/IViewportViewSetting.h>
 #include <Graphics/GraphicsEnums.h>
+#include <Rendering/RenderTimeInstancing.h>
 
 #include "itreesinterface.h"
 #include "ircinterface.h"
@@ -148,6 +149,32 @@ static Modifier* FindModifierOnNode(INode* node, Class_ID cid) {
     FindModifierOnStackEnum proc(cid);
     EnumGeomPipeline(&proc, node);
     return proc.mod;
+}
+
+// 3ds Max 2027.2 native point instancing: a Point Instance modifier whose
+// evaluated output ("Editable Point") rebuilds its instanced mesh on every
+// evaluation and never reports a FOREVER validity. Any per-tick lane that
+// samples such a node regenerates the mesh each poll — "generating mesh from
+// point instances" spams the prompt bar for as long as the panel is open.
+// These stacks are edit-driven, not time-driven: keep them out of every
+// polling lane and let node events drive their re-extraction.
+#define POINTINSTANCE_MOD_CLASS_ID Class_ID(1083403286, 853173979)
+
+static bool NodeHasPointInstanceStack(INode* node) {
+    if (!node) return false;
+    if (FindModifierOnNode(node, POINTINSTANCE_MOD_CLASS_ID)) return true;
+    // "Editable Point" base object (Class_ID 1147554007, 1405554402) — a
+    // collapsed point-instance stack carries no Point Instance modifier, and
+    // further modifiers on top of it can hide the instancing interface from
+    // the evaluated state while every evaluation still regenerates instances.
+    // Probe the un-evaluated base object instead: interface lookup only, no
+    // evaluation, so per-tick lanes can call this safely. Generic on purpose —
+    // any RenderTimeInstancing producer used as a base object joins for free.
+    Object* base = node->GetObjectRef();
+    while (base && base->SuperClassID() == GEN_DERIVOB_CLASS_ID) {
+        base = reinterpret_cast<IDerivedObject*>(base)->GetObjRef();
+    }
+    return base && MaxSDK::RenderTimeInstancing::GetRenderTimeInstancingInterface(base) != nullptr;
 }
 
 struct ModifierStackMatch {
@@ -987,63 +1014,6 @@ static uint64_t ComputeNodePropHash(INode* node, TimeValue t) {
     return h;
 }
 
-static uint64_t ComputeSyncRelevantNodeStateHash(INode* node, TimeValue t) {
-    if (!node) return 0;
-
-    uint64_t h = 1469598103934665603ULL;
-    const ULONG handle = node->GetHandle();
-    h = HashFNV1a(&handle, sizeof(handle), h);
-
-    float xform[16];
-    GetTransform16(node, t, xform);
-    h = HashFNV1a(xform, sizeof(xform), h);
-
-    const uint64_t props = ComputeNodePropHash(node, t);
-    h = HashFNV1a(&props, sizeof(props), h);
-
-    ObjectState os = node->EvalWorldState(t);
-    if (os.obj) {
-        const SClass_ID superClass = os.obj->SuperClassID();
-        const Class_ID classId = os.obj->ClassID();
-        h = HashFNV1a(&superClass, sizeof(superClass), h);
-        h = HashFNV1a(&classId, sizeof(classId), h);
-        h = HashIntervalState(os.obj->ChannelValidity(t, GEOM_CHAN_NUM), h);
-        h = HashIntervalState(os.obj->ChannelValidity(t, TOPO_CHAN_NUM), h);
-    }
-
-    if (Mtl* mtl = node->GetMtl()) {
-        const Class_ID mtlClass = mtl->ClassID();
-        h = HashFNV1a(&mtlClass, sizeof(mtlClass), h);
-        // Material validity can flap from editor-preview churn. Actual material changes
-        // are tracked through the dedicated material sync paths instead.
-    }
-
-    return h;
-}
-
-static void CollectReferencedNodeHandlesRecursive(ReferenceMaker* maker,
-                                                  ULONG ownerHandle,
-                                                  std::unordered_set<ULONG>& out,
-                                                  std::unordered_set<const void*>& visited,
-                                                  int depth = 0) {
-    if (!maker || depth > 8) return;
-    if (!visited.insert(maker).second) return;
-
-    if (maker->SuperClassID() == BASENODE_CLASS_ID) {
-        INode* depNode = static_cast<INode*>(maker);
-        const ULONG depHandle = depNode->GetHandle();
-        if (depHandle != ownerHandle) out.insert(depHandle);
-        return;
-    }
-
-    const int numRefs = maker->NumRefs();
-    for (int i = 0; i < numRefs; ++i) {
-        RefTargetHandle ref = maker->GetReference(i);
-        if (!ref) continue;
-        CollectReferencedNodeHandlesRecursive(ref, ownerHandle, out, visited, depth + 1);
-    }
-}
-
 static void CollectReferenceTargetsForNodeObjectGraph(INode* node,
                                                       std::unordered_set<ReferenceTarget*>& out) {
     if (!node) return;
@@ -1135,37 +1105,6 @@ static bool IsShapeConsumedByOtherRuntimeNode(INode* node, TimeValue t) {
         }
     }
     return false;
-}
-
-static uint64_t ComputePluginInstanceStateHash(INode* node, TimeValue t, Interface* ip) {
-    if (!node) return 0;
-
-    uint64_t h = ComputeSyncRelevantNodeStateHash(node, t);
-    std::unordered_set<ULONG> deps;
-    std::unordered_set<const void*> visited;
-
-    Object* base = node->GetObjectRef();
-    while (base && base->SuperClassID() == GEN_DERIVOB_CLASS_ID) {
-        base = reinterpret_cast<IDerivedObject*>(base)->GetObjRef();
-    }
-    ReferenceMaker* root = base
-        ? static_cast<ReferenceMaker*>(base)
-        : static_cast<ReferenceMaker*>(node->GetObjectRef());
-    CollectReferencedNodeHandlesRecursive(root, node->GetHandle(), deps, visited);
-
-    std::vector<ULONG> sortedDeps(deps.begin(), deps.end());
-    std::sort(sortedDeps.begin(), sortedDeps.end());
-    const size_t depCount = sortedDeps.size();
-    h = HashFNV1a(&depCount, sizeof(depCount), h);
-
-    for (ULONG depHandle : sortedDeps) {
-        h = HashFNV1a(&depHandle, sizeof(depHandle), h);
-        INode* depNode = ip ? ip->GetINodeByHandle(depHandle) : nullptr;
-        const uint64_t depHash = depNode ? ComputeSyncRelevantNodeStateHash(depNode, t) : 0;
-        h = HashFNV1a(&depHash, sizeof(depHash), h);
-    }
-
-    return h;
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -1609,13 +1548,15 @@ static bool IsForestPackAvailable() {
 enum class InstanceGroupKind {
     ForestPack,
     RailClone,
-    TyFlow
+    TyFlow,
+    RenderTime
 };
 
 static const wchar_t* InstanceGroupKindName(InstanceGroupKind kind) {
     switch (kind) {
     case InstanceGroupKind::RailClone: return L"railclone";
     case InstanceGroupKind::TyFlow: return L"tyflow";
+    case InstanceGroupKind::RenderTime: return L"rendertime";
     case InstanceGroupKind::ForestPack:
     default: return L"forestpack";
     }
@@ -2037,6 +1978,103 @@ static bool ExtractTyFlowInstances(INode* tyNode, TimeValue t,
 
     SafeTyReleaseInstances(tyObj, infos);
     return !outGroups.empty();
+}
+
+// ══════════════════════════════════════════════════════════════
+//  RenderTimeInstancing Extraction (SDK-native instancing contract)
+// ══════════════════════════════════════════════════════════════
+//
+// MaxSDK::RenderTimeInstancing (Rendering/RenderTimeInstancing.h — in the SDK
+// since ~2023, barely adopted) is the renderer-facing contract the 2027.2
+// Point Instance modifier implements: sources carry one Mesh*/INode* each,
+// targets carry per-instance TMs and material overrides. Objects implementing
+// it also serve an aggregate collapsed mesh through GetRenderMesh for
+// consumers that don't speak it — the path max.js fell back to before this
+// lane existed. Probed generically, so any future producer joins for free;
+// the dedicated Forest/RailClone/tyFlow lanes keep precedence.
+
+static bool SupportsRenderTimeInstancing(INode* node, TimeValue t) {
+    if (!node) return false;
+    ObjectState os = node->EvalWorldState(t);
+    if (!os.obj) return false;
+    return MaxSDK::RenderTimeInstancing::GetRenderTimeInstancingInterface(os.obj) != nullptr;
+}
+
+static bool ExtractRenderTimeInstances(INode* node, TimeValue t,
+                                       std::vector<ForestInstanceGroup>& outGroups) {
+    using namespace MaxSDK::RenderTimeInstancing;
+    if (!node) return false;
+    ObjectState os = node->EvalWorldState(t);
+    if (!os.obj) return false;
+    RenderTimeInstancingInterface* instancer =
+        GetRenderTimeInstancingInterface(os.obj);
+    if (!instancer) return false;
+
+    Interval valid = FOREVER;
+    // No motion blur: numberOfTMs = 0 tells the object a single TM per
+    // instance is all that will be read.
+    MotionBlurInfo mblur(NEVER, MotionBlurInfo::MBFlags::mb_none, 0);
+    MaxJSNullView view;
+    instancer->UpdateInstanceData(t, valid, mblur, view, _T("maxjs"));
+
+    const size_t sourceCount = instancer->GetNumInstanceSources();
+    const size_t firstGroup = outGroups.size();
+    for (size_t s = 0; s < sourceCount; ++s) {
+        const RenderInstanceSource* source = instancer->GetRenderInstanceSource(s);
+        if (!source) continue;
+        const DataFlags flags = source->GetFlags();
+        void* data = source->GetData();
+        if (!data) continue;
+
+        outGroups.emplace_back();
+        ForestInstanceGroup& grp = outGroups.back();
+        grp.kind = InstanceGroupKind::RenderTime;
+        grp.ownerKey = static_cast<uintptr_t>(node->GetHandle());
+
+        if (flags & DataFlags::df_mesh) {
+            Mesh* mesh = static_cast<Mesh*>(data);
+            grp.groupKey = reinterpret_cast<uintptr_t>(mesh);
+            ExtractMeshFromRawMesh(*mesh, grp.verts, grp.uvs, grp.indices, grp.groups, &grp.norms);
+            grp.mtl = node->GetMtl();
+            grp.mtlNode = node;
+        } else if (flags & DataFlags::df_inode) {
+            INode* src = static_cast<INode*>(data);
+            grp.groupKey = static_cast<uintptr_t>(src->GetHandle());
+            ExtractMesh(src, t, grp.verts, grp.uvs, grp.indices, grp.groups, &grp.norms);
+            grp.mtl = src->GetMtl() ? src->GetMtl() : node->GetMtl();
+            grp.mtlNode = src;
+        } else {
+            outGroups.pop_back();
+            continue;
+        }
+
+        // maxjs groups share one material; the first per-instance override
+        // found is promoted to the whole group rather than dropped.
+        Mtl* overrideMtl = nullptr;
+        const size_t targetCount = source->GetNumInstanceTargets();
+        grp.transforms.reserve(targetCount * 16);
+        for (size_t i = 0; i < targetCount; ++i) {
+            const RenderInstanceTarget* target = source->GetRenderInstanceTarget(i);
+            if (!target) continue;
+            if (!overrideMtl) overrideMtl = target->GetMtlOverride();
+            float xform[16];
+            Matrix3To16(target->GetTM(), xform);
+            grp.transforms.insert(grp.transforms.end(), xform, xform + 16);
+            grp.instanceCount++;
+        }
+        if (overrideMtl) grp.mtl = overrideMtl;
+
+        if ((flags & DataFlags::df_mesh) && (flags & DataFlags::df_pluginMustDelete)) {
+            delete static_cast<Mesh*>(data);
+        }
+
+        if (grp.instanceCount == 0 || grp.verts.empty() || grp.indices.empty()) {
+            outGroups.pop_back();
+        }
+    }
+
+    instancer->ReleaseInstanceData();
+    return outGroups.size() > firstGroup;
 }
 
 // ══════════════════════════════════════════════════════════════

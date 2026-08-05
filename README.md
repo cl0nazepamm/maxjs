@@ -16,6 +16,7 @@ It does not export the advanced post processing stack yet. But it is coming soon
 ## Features
 
 - **Fast Sync** using native callbacks, shared buffer binary deltas.
+- **Relay Mode** turns the DCC into a headless scene producer for a vanilla Three.js project, with one explicit Relay button and no duplicate local render loop.
 - **Three.js Renderer** with WGL2, WebGPU and WebGPU with forced WebGL.
 - **ActiveShade** can directly embed into 3ds Max viewport. Uses a custom workaround instead of Autodesk's API so it does not lag or choke 3ds Max down.
 - **Snapshot Builder** exports your scene to a deployable website in one click, with optimized packed geometry, copied assets, runtime layers, camera/look state, lighting, materials, animation, and standalone viewer files ready to host.
@@ -125,7 +126,7 @@ Exported snapshot folders can include:
 - `index.html` seeded only when missing, so user-authored standalone edits are not overwritten.
 - `snapshot.html` as the max.js-owned standalone runtime.
 - `snapshot.json` scene metadata.
-- `scene.bin` packed scene payload.
+- `scene.m3` packed M3 scene payload (`scene.bin` remains readable for older exports).
 - `scene_anim.bin` optional binary animation payload.
 - `assets/` copied texture/media files.
 - `project.maxjs.json` and `inlines/` for scene-local runtime replay.
@@ -135,6 +136,14 @@ Exported snapshot folders can include:
 Snapshot export preserves scene hierarchy, transforms, materials, textures, lights, shadows, camera state, environment, sky, animation, runtime layers, and selected viewer UI state. PostFX coming later.
 
 max.js treats runtime files as plugin-owned and `index.html` as project-owned. Re-exporting should refresh the runtime and scene payload without destroying standalone edits.
+
+The production binary contract, including units, channel encodings, MXJB deltas, and compatibility rules, is documented in [docs/M3_FORMAT.md](docs/M3_FORMAT.md).
+
+## Relay Mode
+
+Relay Mode streams the same M3 full-scene baseline and live updates into a normal Three.js/Vite project. The DCC remains the level editor and source of truth; the receiving project owns rendering, gameplay, Rapier, UI, and its normal application loop. Once a relay consumer has accepted its baseline, the Max viewer stops rendering; Blender's headless relay path opens no viewer at all, so neither host competes with the game for GPU time.
+
+Use the reusable `maxjsRelay` Vite plugin and `RelayClient`; no max.js editor page is required in the receiving project. The minimal setup, lifecycle, asset policy, and Max/headless-Blender notes are in [docs/RELAY_MODE.md](docs/RELAY_MODE.md).
 
 ## Runtime Layers
 

@@ -6,7 +6,7 @@
 // `npm run snapshot:serve`.
 //
 // The exporter still writes index.html + a copy of the runtime tree
-// alongside snapshot.json + scene.bin. That works for self-hosted
+// alongside snapshot.json + scene.m3. That works for self-hosted
 // snapshots, but when iterating against the wrapper at
 // web/snapshot.html?root=snapshots/iter-N the duplicates are dead
 // weight (~140 MB per iter). This script removes them.
@@ -48,6 +48,8 @@ const STRIP_PATHS = [
 // expected post-deploy contents of an iter folder.
 const KEEP_PATHS_DOC = [
     'snapshot.json',
+    'scene.m3',
+    // Kept when iterating an export made before the M3 filename migration.
     'scene.bin',
     'scene_anim.bin',
     'inlines',             // scene-local layer modules — Phase 9 imports these live

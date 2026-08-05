@@ -61,7 +61,6 @@
         }
 
         const std::wstring snapshotJsonPath = snapshotDir + L"\\snapshot.json";
-        const std::wstring sceneBinPath = snapshotDir + L"\\scene.bin";
         const std::wstring sceneAnimPath = snapshotDir + L"\\scene_anim.bin";
 
         std::string snapshotJsonUtf8;
@@ -72,9 +71,41 @@
         outSnapshotJsonBytes = static_cast<unsigned long long>(snapshotJsonUtf8.size());
         outSnapshotJson = Utf8ToWide(snapshotJsonUtf8);
 
-        if (!GetFileByteSize(sceneBinPath, outSceneBinBytes)) {
-            error = L"Snapshot folder is missing scene.bin";
+        std::wstring declaredPayloadName;
+        const bool hasDeclaredPayload =
+            ExtractJsonString(outSnapshotJson, L"bin", declaredPayloadName) &&
+            !declaredPayloadName.empty();
+        if (!hasDeclaredPayload) declaredPayloadName = L"scene.m3";
+
+        const std::filesystem::path relativePayload(declaredPayloadName);
+        bool safeRelativePayload = !relativePayload.empty() &&
+            !relativePayload.is_absolute() && !relativePayload.has_root_name() &&
+            declaredPayloadName.find(L'\\') == std::wstring::npos &&
+            declaredPayloadName.find(L"//") == std::wstring::npos &&
+            declaredPayloadName.find_first_of(L"?#") == std::wstring::npos;
+        for (const auto& part : relativePayload) {
+            if (part.empty() || part == L"." || part == L"..") safeRelativePayload = false;
+        }
+        if (!safeRelativePayload) {
+            error = L"Snapshot metadata contains an invalid scene payload path";
             return false;
+        }
+
+        std::filesystem::path scenePayloadPath =
+            std::filesystem::path(snapshotDir) / relativePayload;
+        if (!GetFileByteSize(scenePayloadPath.wstring(), outSceneBinBytes)) {
+            // Snapshots written before M3 named the same payload scene.bin.
+            // Only use that fallback for implicit/default M3 metadata; an
+            // explicit custom filename remains authoritative.
+            const bool mayUseLegacyFallback = !hasDeclaredPayload ||
+                _wcsicmp(declaredPayloadName.c_str(), L"scene.m3") == 0;
+            const std::filesystem::path legacyPath =
+                std::filesystem::path(snapshotDir) / L"scene.bin";
+            if (!mayUseLegacyFallback ||
+                !GetFileByteSize(legacyPath.wstring(), outSceneBinBytes)) {
+                error = L"Snapshot folder is missing its M3 scene payload";
+                return false;
+            }
         }
         if (FileExists(sceneAnimPath)) {
             GetFileByteSize(sceneAnimPath, outSceneAnimBytes);
@@ -960,7 +991,8 @@
                     runtimeFeatures.lights += 1;
                 }
                 if (IsForestPackNode(node) || IsRailCloneNode(node) ||
-                    (IsTyFlowAvailable() && IsTyFlowNode(node))) {
+                    (IsTyFlowAvailable() && IsTyFlowNode(node)) ||
+                    SupportsRenderTimeInstancing(node, t)) {
                     collect(node);
                     continue;
                 }
@@ -1158,6 +1190,8 @@
                             ExtractRailCloneInstances(node, t, snapshotInstanceGroups);
                         else if (IsTyFlowAvailable() && IsTyFlowNode(node))
                             ExtractTyFlowInstances(node, t, snapshotInstanceGroups);
+                        else if (SupportsRenderTimeInstancing(node, t))
+                            ExtractRenderTimeInstances(node, t, snapshotInstanceGroups);
                     }
                     collectInstances(node);
                 }
@@ -1207,7 +1241,9 @@
         std::wostringstream ss;
         ss.imbue(std::locale::classic());
         ss << L"{\"type\":\"scene_bin\",\"frame\":1";
-        ss << L",\"bin\":\"scene.bin\"";
+        ss << L",\"format\":\"m3\",\"formatVersion\":1,\"schemaVersion\":1";
+        ss << L",\"units\":{\"label\":\"cm\",\"metersPerUnit\":0.01}";
+        ss << L",\"bin\":\"scene.m3\"";
         ss << L",\"stats\":{\"producerBytes\":" << totalBytes;
         if (instanceBinaryBytes > 0) {
             ss << L",\"instanceBytes\":" << instanceBinaryBytes;
@@ -1574,6 +1610,8 @@
             std::error_code ec;
             std::filesystem::remove(std::filesystem::path(outDir) / L"snapshot.json", ec);
             ec.clear();
+            std::filesystem::remove(std::filesystem::path(outDir) / L"scene.m3", ec);
+            ec.clear();
             std::filesystem::remove(std::filesystem::path(outDir) / L"scene.bin", ec);
             ec.clear();
             std::filesystem::remove(std::filesystem::path(outDir) / L"scene_anim.bin", ec);
@@ -1646,10 +1684,15 @@
                 }
             }
         }
-        if (!WriteBinaryFile(outDir + L"\\scene.bin", binary)) {
-            error = L"Failed to write scene.bin";
+        if (!WriteBinaryFile(outDir + L"\\scene.m3", binary)) {
+            error = L"Failed to write scene.m3";
             cleanupOnFail();
             return false;
+        }
+        // Do not leave a stale pre-M3 payload beside a fresh descriptor.
+        {
+            std::error_code ec;
+            std::filesystem::remove(std::filesystem::path(outDir) / L"scene.bin", ec);
         }
         if (!animBinary.empty() && !WriteBinaryFile(outDir + L"\\scene_anim.bin", animBinary)) {
             error = L"Failed to write scene_anim.bin";

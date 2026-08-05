@@ -384,6 +384,9 @@
                 continue;
             }
             if (ShouldSuppressSelectedGeometryForTransform()) continue;
+            // A selected point-instance stack must not be hash-polled either —
+            // every sample regenerates its instanced mesh. Events cover edits.
+            if (pointInstanceHandles_.count(handle)) continue;
             const bool omitFastChannels = ShouldOmitGeometryFastChannels(node, t);
 
             // Match DetectGeometryChanges / geo_fast payload. For oversized
@@ -1144,7 +1147,6 @@
     static constexpr size_t kMaxIdleMaterialHandlesPerTick = 16;
     static constexpr size_t kMaxIdleLightHandlesPerTick = 64;
     static constexpr size_t kMaxIdleJsModHandlesPerTick = 64;
-    static constexpr size_t kMaxIdlePluginInstanceHandlesPerTick = 16;
     static constexpr size_t kMaxIdlePropertyHandlesPerTick = 64;
 
     template <typename Fn>
@@ -1183,7 +1185,6 @@
     void ClearIdlePollFullSyncCandidates() {
         idleMaterialFullSyncCandidateHash_.clear();
         idleJsModFullSyncCandidateHash_.clear();
-        idlePluginInstFullSyncCandidateHash_.clear();
         idlePropertyFullSyncCandidateHash_.clear();
     }
 
@@ -2603,7 +2604,6 @@
         webappHashMap_.clear();
         propHashMap_.clear();
         jsmodStateMap_.clear();
-        pluginInstHash_.clear();
         ClearMaterialEditHandleCache();
 
         playbackStateSentSerial_ = 0;
@@ -3326,13 +3326,9 @@
             return;
         }
         // Layer mount/remove or host-side sync repair — full resend without reloading WebView2
-        if (type == L"scene_dirty" || msg.find(L"\"scene_dirty\"") != std::wstring::npos) {
-            jsmodStateMap_.clear();
-            geoHashMap_.clear();
-            geoFastTriangleCountMap_.clear();
-            deformChannelHashMap_.clear();
-            lastLiveGeomHash_.clear();
-            SetDirtyImmediate();
+        if (type == L"scene_dirty" || type == L"relay_resync" ||
+            msg.find(L"\"scene_dirty\"") != std::wstring::npos) {
+            RequestFullSceneRepair();
             return;
         }
         if (type == L"project_manifest_write") {
@@ -3664,6 +3660,7 @@
             hairHandles_.clear();
             helperHandles_.clear();
             deformHandles_.clear();
+            pointInstanceHandles_.clear();
             audioHashMap_.clear();
             gltfHashMap_.clear();
             webappHashMap_.clear();
@@ -3844,7 +3841,6 @@
             DetectWebAppChanges();
             if (allowHeavyGeometryPolling && slowPhase == 6) DetectGeometryChanges();
             if (allowIdlePolling && slowPhase == 9) DetectJsModChanges();
-            if (allowIdlePolling && slowPhase == 12) DetectPluginInstanceChanges();
             if (allowRealtimeAuxPolling && lightPhase == 2) PollViewportModes();
             if (slowPhase == 1) ScanInlineLayers();
         }
@@ -4688,6 +4684,7 @@
                 hairHandles_.erase(handle);
                 helperHandles_.erase(handle);
                 deformHandles_.erase(handle);
+                pointInstanceHandles_.erase(handle);
                 lastSentTransforms_.erase(handle);
                 lastSentPlaybackAux_.erase(handle);
                 materialFastDirtyHandles_.erase(handle);
@@ -5769,7 +5766,10 @@
                 const bool handledByLivePoll =
                     geoFastDirtyHandles_.count(handle) ||
                     skinnedHandles_.count(handle) ||
-                    deformHandles_.count(handle);
+                    deformHandles_.count(handle) ||
+                    // Point-instance stacks are event-driven only: hashing them
+                    // here regenerates the instanced mesh every audit pass.
+                    pointInstanceHandles_.count(handle);
                 if (!handledByLivePoll) {
                     const bool omitFastChannels = ShouldOmitGeometryFastChannels(node, t);
                     uint64_t hash = 0;
@@ -5847,42 +5847,13 @@
         });
     }
 
-    void DetectPluginInstanceChanges() {
-        if (pluginInstHandles_.empty()) return;
-        Interface* ip = GetCOREInterface();
-        if (!ip) return;
-        TimeValue t = ip->GetTime();
-        bool requestedFullSync = false;
-        std::vector<ULONG> handles;
-        handles.reserve(pluginInstHandles_.size());
-        for (ULONG handle : pluginInstHandles_) handles.push_back(handle);
-
-        VisitBudgetedHandles(handles, pluginInstScanCursor_, kMaxIdlePluginInstanceHandlesPerTick, [&](ULONG handle) {
-            if (requestedFullSync) return;
-            INode* node = ip->GetINodeByHandle(handle);
-            if (!node) {
-                idlePluginInstFullSyncCandidateHash_.erase(handle);
-                return;
-            }
-            const uint64_t stateHash = ComputePluginInstanceStateHash(node, t, ip);
-
-            auto it = pluginInstHash_.find(handle);
-            if (it == pluginInstHash_.end()) {
-                pluginInstHash_[handle] = stateHash;
-                idlePluginInstFullSyncCandidateHash_.erase(handle);
-            } else if (it->second != stateHash) {
-                if (!ConfirmIdleFullSyncCandidate(idlePluginInstFullSyncCandidateHash_, handle, stateHash)) {
-                    return;
-                }
-                it->second = stateHash;
-                requestedFullSync = true;
-                RequestIdlePollFullSync();
-                return;
-            } else {
-                idlePluginInstFullSyncCandidateHash_.erase(handle);
-            }
-        });
-    }
+    // Plugin-instance producers (Forest Pack / RailClone / tyFlow / native
+    // RenderTimeInstancing, incl. 2027.2 Point Instance stacks) are NOT
+    // change-detected. Deliberate: hashing them means evaluating them, and a
+    // Point Instance stack regenerates its instanced mesh on every evaluation
+    // ("generating mesh from point instances" prompt spam). All instance
+    // kinds extract on full syncs only — the max.js menu's "Refresh Point
+    // Instances" action (RequestFullSceneRepair) is the manual pull.
 
     // Detect object property changes — triggers full sync (same pattern as DetectMaterialChanges)
     void DetectPropertyChanges() {

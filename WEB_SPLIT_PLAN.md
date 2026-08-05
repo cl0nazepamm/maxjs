@@ -198,7 +198,7 @@ one module out, editor verified, one commit (user commits — agents don't).
   misses missing exports). Run after every extraction.
 - Browser smoke: serve `web/` + a ~100-line test shim (crib from
   `maxjs-blender/maxjs_blender/webview2_shim.js`), load a golden
-  snapshot.json/scene.bin, assert zero console errors + a rendered frame.
+  snapshot.json/scene.m3 (or a legacy scene.bin fixture), assert zero console errors + a rendered frame.
   Automatable via playwright/chrome-devtools MCP. This is the per-step gate;
   launching Max is the per-wave gate.
 - Export a golden snapshot from a real Max scene now (pre-split) for parity

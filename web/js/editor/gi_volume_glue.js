@@ -11,6 +11,18 @@ function createGiVolumeGlue(deps = {}) {
         const probeGridData = new Map();
         let probeVolumeSig = '';
         let probeGridAutoEnabled = false; // auto-turn-on GI once when an enabled grid first appears
+
+        function serializeRelayProbeGrids() {
+            return {
+                type: 'probeGrids',
+                grids: Array.from(probeGridData, ([h, data]) => ({
+                    h,
+                    enabled: data?.enabled === false ? 0 : 1,
+                    size: Array.isArray(data?.size) ? [...data.size] : null,
+                    div: Array.isArray(data?.div) ? [...data.div] : null,
+                })),
+            };
+        }
         const HALO_GI_DEFAULTS = Object.freeze({
             // Speedball probes exist only in spectral, where they default ON
             // (the DDGI field IS the live view). window.MAXJS_HALO_GI = false
@@ -162,6 +174,8 @@ function createGiVolumeGlue(deps = {}) {
                 else gi.disable({ applySettings: false });
             }
             window.__maxjsSyncGiPanel?.();
+            // Mirror authored settings to relay consumers without a global hook.
+            deps.relayEmit?.({ type: 'haloGiSettings', settings: { ...haloGiSettings } });
             if (persist) deps.savePostFxState();
         }
         function setHaloGiSetting(key, value, { persist = false } = {}) {
@@ -1200,6 +1214,7 @@ function createGiVolumeGlue(deps = {}) {
         return {
             HALO_GI_NUMERIC_CONTROLS,
             GI_VOLUME_CAMERA_DEBOUNCE_MS,
+            serializeRelayProbeGrids,
             getHaloGiSettings,
             clampHaloGiNumber,
             formatHaloGiValue,

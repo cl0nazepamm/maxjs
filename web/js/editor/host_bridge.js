@@ -18,8 +18,9 @@ import { getHostProfile } from '../host_profile.js';
 const HOST_CONTRACT_VERSION = 1;
 
 function createHostBridge({ setInfoText, onFirstSync, onBeforeReady } = {}) {
+    const webview = window.chrome?.webview ?? null;
     const bridge = {
-        send(type, data = {}) { window.chrome?.webview?.postMessage({ type, ...data }); },
+        send(type, data = {}) { webview?.postMessage({ type, ...data }); },
         handlers: {},
         on(type, fn) { (this.handlers[type] ??= []).push(fn); },
         dispatch(msg) { (this.handlers[msg.type] || []).forEach(fn => fn(msg)); }
@@ -34,6 +35,7 @@ function createHostBridge({ setInfoText, onFirstSync, onBeforeReady } = {}) {
     let readyRetryTimer = 0;
     const sharedBufferHandlers = new Map(); // meta.type -> (buf, meta) => void
     let sharedBufferFallback = null;        // scene_bin & anything untyped
+    const transportObservers = new Set();  // synchronous host traffic taps
 
     function toBase64Utf8(text) {
         const bytes = new TextEncoder().encode(String(text ?? ''));
@@ -55,7 +57,7 @@ function createHostBridge({ setInfoText, onFirstSync, onBeforeReady } = {}) {
     }
 
     function requestHostAction(action, data = {}, timeoutMs = 60000) {
-        if (!window.chrome?.webview) {
+        if (!webview) {
             return Promise.reject(new Error(`${action} requires the ${getHostProfile().appFull} host`));
         }
         const requestId = `host_${Date.now()}_${nextHostActionId++}`;
@@ -82,7 +84,7 @@ function createHostBridge({ setInfoText, onFirstSync, onBeforeReady } = {}) {
     });
 
     function scheduleReadyRetry() {
-        if (!window.chrome?.webview || readyRetryTimer) return;
+        if (!webview || readyRetryTimer) return;
         readyRetryTimer = setInterval(() => {
             if (hasInitialSync) {
                 clearInterval(readyRetryTimer);
@@ -113,7 +115,7 @@ function createHostBridge({ setInfoText, onFirstSync, onBeforeReady } = {}) {
     }
 
     function startBridgeHandshake() {
-        if (!window.chrome?.webview) return;
+        if (!webview) return;
         setInfoText?.('max.js - connected, waiting for sync...');
         onBeforeReady?.();
         bridge.send('ready', { contractVersion: HOST_CONTRACT_VERSION });
@@ -134,6 +136,22 @@ function createHostBridge({ setInfoText, onFirstSync, onBeforeReady } = {}) {
         sharedBufferFallback = fn;
     }
 
+    // Relay and diagnostics observe the exact transport order through this
+    // seam. Observers run synchronously; for shared buffers this is before the
+    // editor handler and, critically, before WebView2 releases the buffer.
+    function observeTransport(fn) {
+        if (typeof fn !== 'function') throw new TypeError('transport observer must be a function');
+        transportObservers.add(fn);
+        return () => transportObservers.delete(fn);
+    }
+
+    function notifyTransportObservers(event) {
+        for (const observer of transportObservers) {
+            try { observer(event); }
+            catch (error) { console.warn('[max.js transport observer]', error); }
+        }
+    }
+
     // Installs the window/host event wiring. Returns true when a host is
     // present, false in standalone mode. Call once, after all bridge.on /
     // onSharedBuffer registrations.
@@ -145,29 +163,33 @@ function createHostBridge({ setInfoText, onFirstSync, onBeforeReady } = {}) {
             reportBridgeError('promise error', e.reason);
         });
 
-        if (!window.chrome?.webview) {
+        if (!webview) {
             setInfoText?.('max.js - no bridge (standalone mode)');
             return false;
         }
 
-        window.chrome.webview.addEventListener('message', e => {
-            try { bridge.dispatch(e.data); }
+        webview.addEventListener('message', e => {
+            try {
+                notifyTransportObservers({ kind: 'message', data: e.data });
+                bridge.dispatch(e.data);
+            }
             catch (err) { reportBridgeError('message error', err); }
         });
 
         // Binary shared buffer router (zero-copy geometry). The buffer is only
         // valid inside the handler — released in finally.
-        window.chrome.webview.addEventListener('sharedbufferreceived', e => {
+        webview.addEventListener('sharedbufferreceived', e => {
             let buf = null;
             try {
                 buf = e.getBuffer();
                 const meta = typeof e.additionalData === 'string'
                     ? JSON.parse(e.additionalData) : e.additionalData;
+                notifyTransportObservers({ kind: 'shared-buffer', buffer: buf, meta: meta ?? {} });
                 const handler = sharedBufferHandlers.get(meta?.type) || sharedBufferFallback;
                 if (handler) handler(buf, meta);
             } catch (err) { reportBridgeError('binary sync error', err); }
             finally {
-                if (buf) window.chrome.webview.releaseBuffer(buf);
+                if (buf) webview.releaseBuffer(buf);
             }
         });
         return true;
@@ -185,7 +207,9 @@ function createHostBridge({ setInfoText, onFirstSync, onBeforeReady } = {}) {
         reportBridgeError,
         onSharedBuffer,
         onSharedBufferFallback,
+        observeTransport,
         installHostWiring,
+        hasHost: () => !!webview,
         hasInitialSync: () => hasInitialSync,
         whenInitialSync,
     };

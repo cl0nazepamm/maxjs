@@ -39,8 +39,8 @@ behavior branch.
 1. Host loads `web/index.html` with the API above in place.
 2. Viewer finishes booting and posts `{type:'ready', contractVersion:1}`,
    retrying every 1 s until the first scene payload arrives.
-3. Host responds with a full scene: a `scene_bin` shared buffer (snapshot.json
-   meta + scene.bin payload) — this stops the retry loop.
+3. Host responds with a full scene: a `scene_bin` shared buffer (M3 descriptor
+   metadata + M3 payload) — this stops the retry loop.
 4. Thereafter the host streams deltas (`delta_bin`, `geo_fast`, `xform`,
    `cam`, ...) as the scene changes.
 
@@ -48,11 +48,34 @@ behavior branch.
 
 | type | Content |
 |---|---|
-| *(none / anything else)* | full scene: meta = snapshot.json object, buffer = scene.bin |
+| `scene_bin` *(or legacy untyped metadata)* | full scene: metadata descriptor + M3 baseline payload |
 | `delta_bin` | MXJB delta frame |
 | `geo_fast` | real-time vertex/topology update for one node (`meta.h` = handle; offsets `vOff/vN`, `iOff/iN`, `uvOff/uvN`, `nOff/nN`, vertex colors `vc`, `groups`, `skipBounds`, `compactChannels`, `jsmod`, `spline`) |
 | `gi_surface_bin` | native GI surface samples (`floatCount`, `sampleCount`, `boundsMin`, `boundsSize`) |
 | `gi_light_bin` | native GI light table (`floatCount`, `lightCount`) |
+
+Full-scene metadata schema v1 includes additive root fields:
+
+```json
+{
+  "type": "scene_bin",
+  "format": "m3",
+  "formatVersion": 1,
+  "schemaVersion": 1,
+  "units": { "label": "cm", "metersPerUnit": 0.01 }
+}
+```
+
+The 3ds Max host uses centimetres. Another host may use a different physical
+scale and must state it in `units`; consumers use `metersPerUnit` instead of
+assuming Max units. Snapshot metadata additionally names the payload with
+`bin: "scene.m3"`. Legacy `scene.bin` is the same binary format under its old
+filename. See [`docs/M3_FORMAT.md`](../docs/M3_FORMAT.md).
+
+Relay Mode preserves this host contract inside a broker envelope; it does not
+create a second scene format. The reusable client applies a full `scene_bin`
+baseline before any continuation frame and requests resync on a sequence gap.
+See [`docs/RELAY_MODE.md`](../docs/RELAY_MODE.md).
 
 ## JSON control messages, host → viewer (`bridge.on`)
 
@@ -83,8 +106,13 @@ project directory over HTTP themselves (the Blender add-on) send it; the
 
 `ready`, `gi_probe_refresh`, `gpu_normals`, `kill`, `live_sync_settings`,
 `lock_camera`, `pathtracing_settings`, `refresh`, `render_css3d_mask_ready`,
-`render_to_image_ready`, `scene_dirty`, `snapshot_export`, `snapshot_serve`,
+`render_to_image_ready`, `relay_resync`, `scene_dirty`, `snapshot_export`, `snapshot_serve`,
 `sync_lightmap_uvs`, `webapp_set`.
+
+`relay_resync` asks the active DCC host for an authoritative full scene for a
+relay baseline. It may carry `{reason, sceneRequestId, streamId, producerId,
+sessionId, sceneRevision}`. Hosts may route it through the same full-sync path
+as `scene_dirty`; the distinct name keeps relay recovery obvious in diagnostics.
 
 Hosts may ignore any of these. Request/response pairs use `requestHostAction`:
 the viewer sends `{type: action, requestId, ...}` and expects
@@ -97,9 +125,11 @@ timeout (60 s default; 10 s for the project runtime's own actions). Used for
 
 ## Rules
 
-- New host integrations must work by **providing this surface only** — never by
-  editing core `web/` files. (The Blender shim is the reference implementation
-  of a fake host; `tools/split_smoke_shim.js` is the minimal one.)
+- New host integrations implement this surface. Host-specific translation stays
+  with that host by default; genuinely host-neutral contract/runtime additions
+  may be promoted into shared `web/` only with a Max-side regression check.
+  (The Blender shim is the reference fake host; `tools/split_smoke_shim.js` is
+  the minimal one.)
 - Web-side, all host access goes through `createHostBridge()`; subsystems
   register `bridge.on(...)` / `hostBridge.onSharedBuffer(...)` handlers and
   never touch `window.chrome.webview` directly.

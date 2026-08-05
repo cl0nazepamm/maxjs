@@ -97,6 +97,7 @@ using namespace Microsoft::WRL;
 #define WM_EXPORT_SNAPSHOT        (WM_USER + 7)
 #define WM_RENDER_SEQUENCE_STEP   (WM_USER + 8)
 #define WM_RENDER_SEQUENCE_CAPTURE (WM_USER + 9)
+#define WM_REFRESH_INSTANCES      (WM_USER + 10)
 #define SETUP_TIMER_ID            2
 #define AS_TIMER_ID               3
 #define RENDER_SEQUENCE_TIMER_ID  4

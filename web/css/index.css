@@ -2000,6 +2000,25 @@ body.light-mode .vpmenu-row-cam .rail-cam-native option:focus {
     color: #f4f5f7;
 }
 
+/* Relay is deliberately louder than normal toggles: it stops this renderer
+ * once a ready external consumer connects, so its state must be unmistakable. */
+#btnRelay[data-relay-state="connecting"],
+#btnRelay[data-relay-state="recovering"] {
+    color: #ffd28a;
+    border-color: rgba(255, 180, 72, 0.5);
+    background: rgba(255, 160, 40, 0.12);
+}
+#btnRelay[data-relay-state="streaming"] {
+    color: #a9ffd1;
+    border-color: rgba(70, 225, 145, 0.55);
+    background: rgba(40, 190, 115, 0.14);
+}
+#btnRelay[data-relay-state="error"] {
+    color: #ffaaaa;
+    border-color: rgba(255, 85, 85, 0.58);
+    background: rgba(220, 45, 45, 0.14);
+}
+
 /* Light mode */
 body.light-mode #viewportMenu,
 body.light-mode .vpmenu-dropdown {

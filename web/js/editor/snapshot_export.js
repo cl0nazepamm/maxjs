@@ -344,8 +344,8 @@ function createSnapshotExport(deps = {}) {
             }).join('');
             const vertexColor = report.vertexColor || {};
             const warnings = [];
-            if (report.overlap > 0) warnings.push(`${formatBytes(report.overlap)} overlapping scene.bin ranges`);
-            if (report.gap > 0) warnings.push(`${formatBytes(report.gap)} unaccounted scene.bin gaps`);
+            if (report.overlap > 0) warnings.push(`${formatBytes(report.overlap)} overlapping M3 ranges`);
+            if (report.gap > 0) warnings.push(`${formatBytes(report.gap)} unaccounted M3 gaps`);
             if ((report.unknownTypes || []).length) warnings.push(`Unknown buffer types: ${report.unknownTypes.join(', ')}`);
             if (vertexColor.bytesStoredAsF32 > 0) warnings.push(`${formatBytes(vertexColor.bytesStoredAsF32)} vertex colors stored as f32`);
 
@@ -364,7 +364,7 @@ function createSnapshotExport(deps = {}) {
                             <div class="snapshot-diagnostics-card">
                                 <h3>Files</h3>
                                 ${snapshotDiagnosticRow('snapshot.json', formatBytes(report.files.snapshotJson))}
-                                ${snapshotDiagnosticRow('scene.bin', formatBytes(report.files.sceneBin))}
+                                ${snapshotDiagnosticRow('scene.m3', formatBytes(report.files.sceneBin))}
                                 ${snapshotDiagnosticRow('scene_anim.bin', report.files.sceneAnimBin ? formatBytes(report.files.sceneAnimBin) : 'none')}
                             </div>
                             <div class="snapshot-diagnostics-card">
@@ -392,7 +392,7 @@ function createSnapshotExport(deps = {}) {
                             </div>
                         </section>
                         <section class="snapshot-diagnostics-table">
-                            <h3>scene.bin Channels</h3>
+                            <h3>M3 Channels</h3>
                             <table><thead><tr><th>Channel</th><th>Bytes</th><th>Share</th></tr></thead><tbody>${channelRows || '<tr><td colspan="3">No binary channels found</td></tr>'}</tbody></table>
                         </section>
                         <section class="snapshot-diagnostics-table">

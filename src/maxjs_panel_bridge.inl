@@ -148,8 +148,8 @@ bool StartMaxJSRenderSequence(const std::wstring& outputPath,
 }
 
 static void RegisterMaxScript() {
-    wchar_t script[4096];
-    swprintf_s(script, 4096,
+    wchar_t script[8192];
+    swprintf_s(script, 8192,
         L"global MaxJS_HWND = %lld\r\n"
         L"fn MaxJS_KillPanel = ( windows.sendMessage MaxJS_HWND %d 0 0 )\r\n"
         L"fn MaxJS_ExportSnapshot = ( windows.sendMessage MaxJS_HWND %d 0 0 )\r\n"
@@ -162,25 +162,41 @@ static void RegisterMaxScript() {
         L"macroScript MaxJS_Snapshot category:\"max.js\" tooltip:\"Export max.js Snapshot\" buttonText:\"Snapshot\" (\r\n"
         L"    windows.sendMessage MaxJS_HWND %d 0 0\r\n"
         L")\r\n"
-        L"if menuMan != undefined and menuMan.findMenu \"max.js\" == undefined do (\r\n"
-        L"    local subMenu = menuMan.createMenu \"max.js\"\r\n"
-        L"    local toggleItem = menuMan.createActionItem \"MaxJS_Toggle\" \"max.js\"\r\n"
-        L"    local killItem = menuMan.createActionItem \"MaxJS_Kill\" \"max.js\"\r\n"
-        L"    local snapshotItem = menuMan.createActionItem \"MaxJS_Snapshot\" \"max.js\"\r\n"
-        L"    subMenu.addItem toggleItem -1\r\n"
-        L"    subMenu.addItem snapshotItem -1\r\n"
-        L"    subMenu.addItem killItem -1\r\n"
-        L"    local mainMenu = menuMan.getMainMenuBar()\r\n"
-        L"    local subMenuItem = menuMan.createSubMenuItem \"max.js\" subMenu\r\n"
-        L"    mainMenu.addItem subMenuItem 0\r\n"
-        L"    menuMan.updateMenuBar()\r\n"
-        L")\r\n",
+        L"macroScript MaxJS_RefreshInstances category:\"max.js\" tooltip:\"Refresh Point Instances\" buttonText:\"Refresh Point Instances\" (\r\n"
+        L"    windows.sendMessage MaxJS_HWND %d 0 0\r\n"
+        L")\r\n"
+        // Menu registration targets the 2025+ CUI menu system (legacy menuMan
+        // was removed there, so the pre-2026 path is gone on every supported
+        // target). Menus are rebuilt from the #cuiRegisterMenus callback on
+        // every configuration load; the GUIDs are stable so user
+        // customizations attached to the items survive rebuilds. The guarded
+        // LoadConfiguration covers the case where this GUP registers after
+        // the menu bar was already built (first install, no restart).
+        L"callbacks.removeScripts id:#maxjsMenus\r\n"
+        L"global maxjs_registerMenus\r\n"
+        L"fn maxjs_registerMenus = (\r\n"
+        L"    local menuMgr = callbacks.notificationParam()\r\n"
+        L"    local mainBar = menuMgr.mainMenuBar\r\n"
+        L"    local subMenu = mainBar.CreateSubMenu \"{80E4C769-A2CB-4862-9925-FF51611A3B0F}\" \"max.js\"\r\n"
+        L"    subMenu.CreateMacroScriptAction \"{792F423F-6E43-4C16-83E2-841C26556502}\" \"MaxJS_Toggle\" \"max.js\" title:\"max.js\"\r\n"
+        L"    subMenu.CreateMacroScriptAction \"{792A1612-3D6F-46C2-AE4B-224362BB1C13}\" \"MaxJS_Snapshot\" \"max.js\" title:\"Snapshot\"\r\n"
+        L"    subMenu.CreateMacroScriptAction \"{0DC622F5-7777-493C-B89C-909E0D5CBB49}\" \"MaxJS_RefreshInstances\" \"max.js\" title:\"Refresh Point Instances\"\r\n"
+        L"    subMenu.CreateMacroScriptAction \"{4B9D5C3D-1288-411A-9CCD-B156680171BE}\" \"MaxJS_Kill\" \"max.js\" title:\"Kill max.js\"\r\n"
+        L")\r\n"
+        L"callbacks.addScript #cuiRegisterMenus \"maxjs_registerMenus()\" id:#maxjsMenus\r\n"
+        L"try (\r\n"
+        L"    local mgr = maxOps.GetICuiMenuMgr()\r\n"
+        L"    if mgr.GetMenuById \"{80E4C769-A2CB-4862-9925-FF51611A3B0F}\" == undefined do (\r\n"
+        L"        mgr.LoadConfiguration (mgr.GetCurrentConfiguration())\r\n"
+        L"    )\r\n"
+        L") catch ()\r\n",
         (long long)(intptr_t)g_helperHwnd,
         (int)WM_KILL_PANEL,
         (int)WM_EXPORT_SNAPSHOT,
         (int)WM_TOGGLE_PANEL,
         (int)WM_KILL_PANEL,
-        (int)WM_EXPORT_SNAPSHOT);
+        (int)WM_EXPORT_SNAPSHOT,
+        (int)WM_REFRESH_INSTANCES);
     ExecuteMAXScriptScript(script, MAXScript::ScriptSource::NonEmbedded);
 }
 
@@ -189,6 +205,7 @@ static LRESULT CALLBACK HelperWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
     case WM_TOGGLE_PANEL: TogglePanel(); return 0;
     case WM_KILL_PANEL: KillPanel(); return 0;
     case WM_EXPORT_SNAPSHOT: ExportMaxJSSnapshot(); return 0;
+    case WM_REFRESH_INSTANCES: if (g_panel) g_panel->RequestFullSceneRepair(); return 0;
     case WM_TIMER:
         if (wParam == SETUP_TIMER_ID) { KillTimer(hwnd, SETUP_TIMER_ID); RegisterMaxScript(); }
         return 0;

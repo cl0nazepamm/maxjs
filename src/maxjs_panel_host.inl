@@ -13,7 +13,6 @@
     size_t materialScanCursor_ = 0;
     size_t lightScanCursor_ = 0;
     size_t jsmodScanCursor_ = 0;
-    size_t pluginInstScanCursor_ = 0;
     size_t propertyScanCursor_ = 0;
     size_t deformLiveScanCursor_ = 0;
     std::unordered_set<ULONG> geomHandles_;
@@ -28,6 +27,10 @@
     // Polled every redraw so animation playback catches deformation without
     // waiting for DetectGeometryChanges (~500ms) to run.
     std::unordered_set<ULONG> deformHandles_;
+    // Point Instance stacks (2027.2): every evaluation regenerates the
+    // instanced mesh, so these are excluded from ALL poll lanes and re-extract
+    // only on node events. See NodeHasPointInstanceStack.
+    std::unordered_set<ULONG> pointInstanceHandles_;
     std::unordered_set<ULONG> fastDirtyHandles_;
     std::unordered_set<ULONG> selectionDirtyHandles_;
     bool selectionRescanDirty_ = false;
@@ -89,8 +92,6 @@
     bool activeShadeTimerUsesWndTimer_ = false;
     volatile LONG syncTickPosted_ = 0;
     volatile LONG activeShadeTickPosted_ = 0;
-    std::unordered_set<ULONG> pluginInstHandles_;        // FP/RC/tyFlow node handles for change detection
-    std::unordered_map<ULONG, uint64_t> pluginInstHash_; // plugin node → generated-instance dependency hash
 
     std::map<std::wstring, std::wstring> texDirMap_;    // dir → host
     int texDirCount_ = 0;
@@ -178,7 +179,6 @@
     ULONGLONG nextIdlePollFullSyncTick_ = 0;
     std::unordered_map<ULONG, uint64_t> idleMaterialFullSyncCandidateHash_;
     std::unordered_map<ULONG, uint64_t> idleJsModFullSyncCandidateHash_;
-    std::unordered_map<ULONG, uint64_t> idlePluginInstFullSyncCandidateHash_;
     std::unordered_map<ULONG, uint64_t> idlePropertyFullSyncCandidateHash_;
     bool haveLastSentCamera_ = false;
     ULONGLONG dirtyStamp_ = 0;   // when dirty_ was last set (for debounce)

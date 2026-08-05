@@ -26,8 +26,7 @@
         hairHandles_.clear();
         helperHandles_.clear();
         deformHandles_.clear();
-        pluginInstHandles_.clear();
-        pluginInstHash_.clear();
+        pointInstanceHandles_.clear();
         ClearMaterialEditHandleCache();
         lastSentTransforms_.clear();
         lastProbeGridSig_.clear(); // resend probe grids on every full sync (covers viewer reload)
@@ -85,6 +84,8 @@
                             ExtractRailCloneInstances(node, t, allInstGroups);
                         else if (IsTyFlowAvailable() && IsTyFlowNode(node))
                             ExtractTyFlowInstances(node, t, allInstGroups);
+                        else if (SupportsRenderTimeInstancing(node, t))
+                            ExtractRenderTimeInstances(node, t, allInstGroups);
                     }
                     collectInstances(node);
                 }
@@ -183,10 +184,11 @@
                 WriteSceneNodes(node, t, ss, first, prevGeom, materialLibrary);
                 continue;
             }
-            // Skip Forest Pack / ForestIvy / RailClone / tyFlow — handled via GPU instancing
+            // Skip Forest Pack / ForestIvy / RailClone / tyFlow / native
+            // RenderTimeInstancing producers — handled via GPU instancing
             if (IsForestPackNode(node) || IsRailCloneNode(node) ||
-                (IsTyFlowAvailable() && IsTyFlowNode(node))) {
-                pluginInstHandles_.insert(node->GetHandle());
+                (IsTyFlowAvailable() && IsTyFlowNode(node)) ||
+                SupportsRenderTimeInstancing(node, t)) {
                 WriteSceneNodes(node, t, ss, first, prevGeom, materialLibrary);
                 continue;
             }
@@ -219,10 +221,6 @@
                 WriteSceneNodes(node, t, ss, first, prevGeom, materialLibrary);
                 continue;
             }
-            if (HasEnabledHairModifier(node)) {
-                pluginInstHandles_.insert(handle);
-            }
-
             // Skip expensive ExtractMesh for previously-tracked nodes with unchanged geometry
             bool skipExtract = false;
             if (prevGeom.count(handle) && geoHashMap_.count(handle)) {
@@ -293,7 +291,10 @@
                 first = false;
                 geomHandles_.insert(handle);
                 if (FindModifierOnNode(node, SKIN_CLASSID)) skinnedHandles_.insert(handle);
-                if (NodeHasModifierStack(node)) deformHandles_.insert(handle);
+                if (NodeHasPointInstanceStack(node)) pointInstanceHandles_.insert(handle);
+                else pointInstanceHandles_.erase(handle);
+                if (NodeHasModifierStack(node) && !pointInstanceHandles_.count(handle))
+                    deformHandles_.insert(handle);
                 else deformHandles_.erase(handle);
             } else {
                 std::vector<float> verts, uvs, uv2s, norms;
@@ -302,6 +303,9 @@
                 std::vector<MatGroup> groups;
                 const bool isSkinned = FindModifierOnNode(node, SKIN_CLASSID) != nullptr;
                 const bool hasModifierStack = NodeHasModifierStack(node);
+                const bool isPointInstanceStack = NodeHasPointInstanceStack(node);
+                if (isPointInstanceStack) pointInstanceHandles_.insert(handle);
+                else pointInstanceHandles_.erase(handle);
                 std::vector<int> controlIdx;
                 std::vector<FastVertexSource> fastSources;
                 // Always capture the control-vertex mapping — any topology-
@@ -354,7 +358,7 @@
                         // firing a node event (e.g. Path Deform driven by time).
                         // Mark it for per-frame polling so playback catches it
                         // without waiting for the idle geometry detector.
-                        if (hasModifierStack) {
+                        if (hasModifierStack && !isPointInstanceStack) {
                             deformHandles_.insert(handle);
                         } else {
                             deformHandles_.erase(handle);
@@ -459,8 +463,7 @@
         hairHandles_.clear();
         helperHandles_.clear();
         deformHandles_.clear();
-        pluginInstHandles_.clear();
-        pluginInstHash_.clear();
+        pointInstanceHandles_.clear();
         lastSentTransforms_.clear();
         lastProbeGridSig_.clear(); // resend probe grids on every (binary) full sync
 
@@ -533,9 +536,11 @@
                     collect(node);
                     continue;
                 }
-                // Skip Forest Pack / ForestIvy / RailClone / tyFlow — handled via GPU instancing
+                // Skip Forest Pack / ForestIvy / RailClone / tyFlow / native
+                // RenderTimeInstancing producers — handled via GPU instancing
                 if (IsForestPackNode(node) || IsRailCloneNode(node) ||
-                    (IsTyFlowAvailable() && IsTyFlowNode(node))) {
+                    (IsTyFlowAvailable() && IsTyFlowNode(node)) ||
+                    SupportsRenderTimeInstancing(node, t)) {
                     collect(node);
                     continue;
                 }
@@ -558,10 +563,6 @@
                 ng.parentHandle = GetMaxJSParentHandle(node);
                 ng.changed = false;
                 ng.visible = IsMaxJsSyncDrawVisible(node);
-                if (HasEnabledHairModifier(node)) {
-                    pluginInstHandles_.insert(ng.handle);
-                }
-
                 // Instance detection via IInstanceMgr
                 auto instIt = instanceSourceMap.find(ng.handle);
                 ULONG srcHandle = (instIt != instanceSourceMap.end()) ? instIt->second : 0;
@@ -623,11 +624,17 @@
                     geos.push_back(std::move(ng));
                     geomHandles_.insert(node->GetHandle());
                     if (FindModifierOnNode(node, SKIN_CLASSID)) skinnedHandles_.insert(node->GetHandle());
-                    if (NodeHasModifierStack(node)) deformHandles_.insert(node->GetHandle());
+                    if (NodeHasPointInstanceStack(node)) pointInstanceHandles_.insert(node->GetHandle());
+                    else pointInstanceHandles_.erase(node->GetHandle());
+                    if (NodeHasModifierStack(node) && !pointInstanceHandles_.count(node->GetHandle()))
+                        deformHandles_.insert(node->GetHandle());
                     else deformHandles_.erase(node->GetHandle());
                 } else {
                     const bool isSkinned = FindModifierOnNode(node, SKIN_CLASSID) != nullptr;
                     const bool hasModifierStack = NodeHasModifierStack(node);
+                    const bool isPointInstanceStack = NodeHasPointInstanceStack(node);
+                    if (isPointInstanceStack) pointInstanceHandles_.insert(node->GetHandle());
+                    else pointInstanceHandles_.erase(node->GetHandle());
                     std::vector<int> controlIdx;
                     std::vector<FastVertexSource> fastSources;
                     FastDeformTopoEpoch fastEpoch;
@@ -685,7 +692,7 @@
                         guard.plan = haveBuiltFastNormalPlan
                             ? std::move(fastNormalPlan)
                             : FastNormalPlan{};
-                        if (hasModifierStack) {
+                        if (hasModifierStack && !isPointInstanceStack) {
                             deformHandles_.insert(ng.handle);
                         } else {
                             deformHandles_.erase(ng.handle);
@@ -805,6 +812,8 @@
         ss.imbue(std::locale::classic());
         MaterialLibraryBuilder materialLibrary;
         ss << L"{\"type\":\"scene_bin\",\"frame\":" << frameId;
+        ss << L",\"format\":\"m3\",\"formatVersion\":1,\"schemaVersion\":1";
+        ss << L",\"units\":{\"label\":\"cm\",\"metersPerUnit\":0.01}";
         ss << L",\"stats\":{\"producerBytes\":" << totalBytes << L"}";
         ss << L",\"nodes\":[";
         bool first = true;
@@ -939,6 +948,8 @@
                             ExtractRailCloneInstances(node, t, allInstGroups);
                         else if (IsTyFlowAvailable() && IsTyFlowNode(node))
                             ExtractTyFlowInstances(node, t, allInstGroups);
+                        else if (SupportsRenderTimeInstancing(node, t))
+                            ExtractRenderTimeInstances(node, t, allInstGroups);
                     }
                     collectInstances(node);
                 }

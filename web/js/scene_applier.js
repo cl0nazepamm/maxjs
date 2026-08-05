@@ -1,5 +1,5 @@
 // scene_applier.js — minimal-viable applier for the maxjs binary scene
-// payload (`scene.bin`).
+// payload (`scene.m3`; legacy snapshots used `scene.bin`).
 //
 // Stage 3 deliverable from docs/SNAPSHOT_REFACTOR.md.
 //
@@ -10,13 +10,13 @@
 //
 // SCOPE — what's IN
 // -----------------
-//   - Mesh / line / SkinnedMesh construction from scene.bin via
+//   - Mesh / line / SkinnedMesh construction from the M3 payload via
 //     `js/scene_binary.js` helpers.
 //   - Transform from `nd.t` (16-float matrix).
 //   - Visibility from `nd.vis`.
 //   - Multi/sub material groups via `geom.addGroup`.
 //   - Forest Pack / RailClone / tyFlow instance groups from binary ranges
-//     in `scene.bin`, with legacy JSON-array fallback.
+//     in M3, with legacy JSON-array fallback.
 //   - Removal of stale nodes not present in the new payload.
 //   - Skeleton bind-pose calculation after the world matrix updates.
 //

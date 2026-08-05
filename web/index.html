@@ -52,7 +52,6 @@
             })();
         }
     </script>
-    <script src="./js/live_relay_tap.js"></script>
     <link rel="stylesheet" href="./css/index.css">
 </head>
 <body>
@@ -98,6 +97,12 @@
                         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13.5 4.5a6 6 0 1 0 1.5 4"/><path d="M14 2v3h-3"/></svg>
                     </button>
                     <span class="vpmenu-label">Refresh</span>
+                </div>
+                <div class="vpmenu-row maxonly devonly" data-vpmenu-close>
+                    <button id="btnRefreshInstances" class="rail-btn" title="Re-pull all instance groups (Point Instance / Forest / RailClone / tyFlow) from the host" aria-label="Refresh Point Instances">
+                        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="4.5" cy="4.5" r="1.6"/><circle cx="11.5" cy="4.5" r="1.6"/><circle cx="4.5" cy="11.5" r="1.6"/><circle cx="11.5" cy="11.5" r="1.6"/></svg>
+                    </button>
+                    <span class="vpmenu-label">Refresh Point Instances</span>
                 </div>
                 <div class="vpmenu-row maxonly devonly" data-vpmenu-close>
                     <button id="btnKill" class="rail-btn" title="Kill panel" aria-label="Kill panel">
@@ -273,6 +278,10 @@
                 <div class="vpmenu-row maxonly devonly">
                     <button id="btnLiveSync" class="rail-btn rail-btn-text active" title="Live fast sync enabled" aria-label="Toggle sync mode">LIVE</button>
                     <span class="vpmenu-label">Live Sync</span>
+                </div>
+                <div class="vpmenu-row maxonly devonly">
+                    <button id="btnRelay" class="rail-btn rail-btn-text" data-relay-state="off" title="Relay the live scene to a standalone Three.js project" aria-label="Toggle live scene relay" aria-pressed="false">RELAY</button>
+                    <span id="relayMenuLabel" class="vpmenu-label">Relay Off</span>
                 </div>
                 <div class="vpmenu-row vpmenu-row-debug">
                     <button id="btnDebug" class="rail-btn rail-btn-text" style="display:none" title="Debug">DBG</button>

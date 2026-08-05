@@ -230,7 +230,17 @@ function createSceneExtras(deps = {}) {
                 };
             }
             if (!grp?.v?.length || !grp?.i?.length) return null;
-            return { v: grp.v, i: grp.i, uv: grp.uv, uvAttr: null, norm: grp.norm, normalAttr: null };
+            // Inline JSON groups (live WebView metadata) carry plain arrays;
+            // BufferAttribute needs typed ones — same conversion the
+            // host-neutral applier does in vectorPayloadToFloat32/Uint32.
+            return {
+                v: ArrayBuffer.isView(grp.v) ? grp.v : new Float32Array(grp.v),
+                i: ArrayBuffer.isView(grp.i) ? grp.i : new Uint32Array(grp.i),
+                uv: !grp.uv?.length || ArrayBuffer.isView(grp.uv) ? grp.uv : new Float32Array(grp.uv),
+                uvAttr: null,
+                norm: !grp.norm?.length || ArrayBuffer.isView(grp.norm) ? grp.norm : new Float32Array(grp.norm),
+                normalAttr: null,
+            };
         }
 
         function getForestTransformPayload(grp, binaryBuffer) {
@@ -433,9 +443,17 @@ function createSceneExtras(deps = {}) {
             }
             deps.maxjsDebugLog('[ForestPack]', groups.length, 'groups, total instances:', groups.reduce((s, g) => s + (g.count || 0), 0));
 
+            // Groups from different owners can instance the same source mesh
+            // (two Point Instance stacks scattering one sphere). Share one
+            // BufferGeometry per (kind, src) within this apply pass — only for
+            // single-material groups, since multi-sub groups mutate geometry
+            // groups in place.
+            const sharedGeoms = new Map();
+
             const buildForestInstances = async () => {
                 for (const grp of groups) {
                     if (buildSerial !== forestBuildSerial) return;
+                    try {
                 const geoPayload = getForestGeometryPayload(grp, binaryBuffer);
                 const xformPayload = getForestTransformPayload(grp, binaryBuffer);
                 const count = grp.count || Math.floor((xformPayload?.values?.length || 0) / (xformPayload?.stride || 16));
@@ -444,11 +462,17 @@ function createSceneExtras(deps = {}) {
                     continue;
                 }
 
-                const geom = deps.buildGeometry(geoPayload.v, geoPayload.i, geoPayload.uv, geoPayload.norm, {
-                    skipNormalCompute: !!geoPayload.normalAttr,
-                });
-                if (geoPayload.uvAttr) geom.setAttribute('uv', geoPayload.uvAttr);
-                if (geoPayload.normalAttr) geom.setAttribute('normal', geoPayload.normalAttr);
+                const multiSub = !!(grp.mats && grp.groups);
+                const geomShareKey = multiSub || grp.src == null ? null : `${grp.kind ?? ''}:${grp.src}`;
+                let geom = geomShareKey ? sharedGeoms.get(geomShareKey) : null;
+                if (!geom) {
+                    geom = deps.buildGeometry(geoPayload.v, geoPayload.i, geoPayload.uv, geoPayload.norm, {
+                        skipNormalCompute: !!geoPayload.normalAttr,
+                    });
+                    if (geoPayload.uvAttr) geom.setAttribute('uv', geoPayload.uvAttr);
+                    if (geoPayload.normalAttr) geom.setAttribute('normal', geoPayload.normalAttr);
+                    if (geomShareKey) sharedGeoms.set(geomShareKey, geom);
+                }
 
                 // Material: use data from C++ (single or multi-sub), fallback to gray
                 let mat;
@@ -458,7 +482,7 @@ function createSceneExtras(deps = {}) {
                     mat = sourceMaterial
                         ? createForestInstanceMaterial(sourceMaterial, { geometry: geom, materialIndex: null })
                         : new THREE.MeshStandardMaterial({ color: 0x888888, roughness: 0.7, side: THREE.DoubleSide });
-                } else if (grp.mats && grp.groups) {
+                } else if (multiSub) {
                     // Multi/Sub material — create material array + geometry groups
                     for (const [start, count, idx] of grp.groups) {
                         geom.addGroup(start, count, idx);
@@ -518,6 +542,11 @@ function createSceneExtras(deps = {}) {
                     deps.forestMeshes.set(batchCount > 1 ? `${groupKey}:${batchIndex}` : groupKey, instMesh);
                     addedMeshes++;
                 }
+                    } catch (err) {
+                        // One malformed group must not blank every other
+                        // instance group in the scene.
+                        console.error('[ForestPack] instance group build failed', grp?.key ?? grp?.src, err);
+                    }
             }
             if (addedMeshes > 0 || removedMeshes > 0) markForestInstancesReady();
             };

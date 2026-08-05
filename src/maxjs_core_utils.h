@@ -819,6 +819,9 @@ static const wchar_t* GetMimeTypeForPath(const std::wstring& path) {
     if (_wcsicmp(ext, L".m4a") == 0 || _wcsicmp(ext, L".aac") == 0) return L"audio/aac";
     if (_wcsicmp(ext, L".flac") == 0) return L"audio/flac";
     if (_wcsicmp(ext, L".json") == 0) return L"application/json";
+    // M3 is selected by snapshot metadata / filename. It is opaque bytes on
+    // HTTP and must not rely on MIME sniffing.
+    if (_wcsicmp(ext, L".m3") == 0) return L"application/octet-stream";
     if (_wcsicmp(ext, L".bin") == 0) return L"application/octet-stream";
     // ES module dynamic import() requires a JavaScript MIME type (not octet-stream).
     if (_wcsicmp(ext, L".js") == 0 || _wcsicmp(ext, L".mjs") == 0 || _wcsicmp(ext, L".cjs") == 0) {

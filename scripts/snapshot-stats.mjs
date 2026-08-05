@@ -5,9 +5,9 @@
 // Answers "what is actually in this export and where do the megabytes go?" for a
 // snapshot folder (or a snapshot.json path). Pure Node, zero deps, offline — no
 // running 3ds Max needed. Reports:
-//   • file sizes (snapshot.json / scene.bin / scene_anim.bin)
+//   • file sizes (snapshot.json / scene.m3 / scene_anim.bin)
 //   • scene totals (nodes, materials, verts, tris, animation clips)
-//   • scene.bin per-channel byte breakdown (positions/normals/uv/uv2/vcolor/
+//   • M3 per-channel byte breakdown (positions/normals/uv/uv2/vcolor/
 //     indices/skin/morph) with correct per-channel data types
 //   • layout integrity: accounted bytes vs file size, gaps, overlaps
 //   • top-N nodes by bytes
@@ -62,6 +62,36 @@ Options:
 const MB = (x) => (x / 1048576).toFixed(2) + ' MB';
 const PCT = (x, total) => total > 0 ? (100 * x / total).toFixed(1) + '%' : '—';
 const fileSize = (p) => existsSync(p) ? statSync(p).size : 0;
+
+function validateScenePayloadName(value) {
+    if (typeof value !== 'string') throw new TypeError('M3 payload name must be a string');
+    const name = value.trim();
+    if (!name || name !== value || name.startsWith('/') || name.includes('\\') ||
+        name.includes('?') || name.includes('#') || /^[a-z][a-z0-9+.-]*:/i.test(name)) {
+        throw new Error('M3 payload name must be a clean relative URL path');
+    }
+    for (const encodedSegment of name.split('/')) {
+        let segment;
+        try { segment = decodeURIComponent(encodedSegment); }
+        catch { throw new Error('M3 payload name contains invalid URL encoding'); }
+        if (!segment || segment === '.' || segment === '..' || segment.includes('/') ||
+            segment.includes('\\') || segment.includes('\0') || segment.includes('?') || segment.includes('#')) {
+            throw new Error('M3 payload name contains an unsafe path segment');
+        }
+    }
+    return name;
+}
+
+function scenePayloadCandidates(root) {
+    if (root?.bin == null) return ['scene.m3', 'scene.bin'];
+    const declared = validateScenePayloadName(root.bin);
+    return declared.toLowerCase() === 'scene.m3' ? [declared, 'scene.bin'] : [declared];
+}
+
+function resolveScenePayloadName(root, dir) {
+    const candidates = scenePayloadCandidates(root);
+    return candidates.find(name => existsSync(path.join(dir, name))) ?? candidates[0];
+}
 
 // ── per-node range collection ────────────────────────────────────────────────
 // Returns { ranges:[{off,len,label}], channels:{...}, verts, tris, perNode:[],
@@ -148,7 +178,7 @@ async function main() {
     if (!existsSync(jsonPath)) { console.error(`error: snapshot.json not found at ${jsonPath}`); return 2; }
 
     const root = JSON.parse(await readFile(jsonPath, 'utf8'));
-    const binName = (typeof root.bin === 'string') ? root.bin : 'scene.bin';
+    const binName = resolveScenePayloadName(root, dir);
     const animName = (root.animations && typeof root.animations.bin === 'string') ? root.animations.bin
         : (existsSync(path.join(dir, 'scene_anim.bin')) ? 'scene_anim.bin' : null);
     const sceneBinSize = fileSize(path.join(dir, binName));

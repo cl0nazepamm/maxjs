@@ -2,7 +2,7 @@
 //
 // snapshot-verify.mjs — offline regression gate for MaxJS exports.
 //
-// Proves that snapshot.json + scene.bin did NOT change accidentally across a
+// Proves that snapshot.json + its M3 scene payload did NOT change accidentally across a
 // refactor, WITHOUT a running 3ds Max. Compares two already-exported snapshot
 // folders (an expected/golden folder and an actual/candidate folder).
 //
@@ -58,7 +58,7 @@ const HELP = `snapshot-verify.mjs — offline MaxJS snapshot regression gate
 
   node scripts/snapshot-verify.mjs <expectedDir> <actualDir> [options]
 
-  <expectedDir>   golden snapshot folder (snapshot.json [+ scene.bin])
+  <expectedDir>   golden snapshot folder (snapshot.json + scene.m3; scene.bin is accepted)
   <actualDir>     candidate snapshot folder to validate
 
 Options:
@@ -178,7 +178,7 @@ function canonicalize(value, ctx, where = 'top', keyName = null) {
         for (const k of Object.keys(value).sort()) {
             if (where === 'top' && DROP_TOP_KEYS.has(k)) continue;
             if (isNode && DROP_NODE_KEYS.has(k)) continue;
-            // scene.bin byte offsets (vOff/iOff/uvOff/nOff/wOff/bindOff/dOff …) carry no
+            // M3 byte offsets (vOff/iOff/uvOff/nOff/wOff/bindOff/dOff …) carry no
             // scene meaning: compareSceneBin slices the buffer by these from the RAW
             // root and aligns by node id, so a benign re-layout must not diff here.
             if (isNode && /Off$/.test(k)) continue;
@@ -257,6 +257,14 @@ function canonicalizeSnapshot(root) {
     if (Array.isArray(root && root.nodes)) {
         clone.nodes = root.nodes.map(n => canonicalize(n, ctx, 'node'));
     }
+    // `scene.bin` and `scene.m3` are names for the same descriptor-driven M3
+    // payload. Treat fields newly made explicit by schema v1 as their historic
+    // max.js defaults so old and new exports can still be compared semantically.
+    clone.bin = '@m3-payload';
+    clone.format = String(root?.format || 'm3').toLowerCase();
+    clone.formatVersion = root?.formatVersion ?? 1;
+    clone.schemaVersion = root?.schemaVersion ?? 1;
+    clone.units = root?.units ?? { label: 'cm', metersPerUnit: 0.01 };
     return clone;
 }
 
@@ -368,7 +376,7 @@ async function loadBuilderReaderKeys(builderPath) {
     return keys;
 }
 
-// ───────────────────────── scene.bin comparison ─────────────────────────────
+// ───────────────────────── M3 scene comparison ──────────────────────────────
 
 const TYPE_BYTES = { f32: 4, u32: 4, u16: 2, u8: 1, i32: 4, i16: 2 };
 function readTyped(buf, off, count, type) {
@@ -435,17 +443,17 @@ function compareSceneBin(expRoot, actRoot, expBin, actBin, relTol, diffs) {
 
     for (const [id, eNode] of idToExp) {
         const aNode = idToAct.get(id);
-        if (!aNode) { diffs.push({ path: `scene.bin/${id}`, kind: 'addkey', a: 'present', b: 'missing' }); continue; }
+        if (!aNode) { diffs.push({ path: `m3/${id}`, kind: 'addkey', a: 'present', b: 'missing' }); continue; }
         const eR = nodeBinRanges(eNode);
         const aR = nodeBinRanges(aNode);
         if (eR.length !== aR.length) {
-            diffs.push({ path: `scene.bin/${id}/ranges`, kind: 'arrlen', a: eR.length, b: aR.length });
+            diffs.push({ path: `m3/${id}/ranges`, kind: 'arrlen', a: eR.length, b: aR.length });
             continue;
         }
         for (let i = 0; i < eR.length; i++) {
             const er = eR[i], ar = aR[i];
             if (er.count !== ar.count) {
-                diffs.push({ path: `scene.bin/${id}/${er.label}`, kind: 'arrlen', a: er.count, b: ar.count });
+                diffs.push({ path: `m3/${id}/${er.label}`, kind: 'arrlen', a: er.count, b: ar.count });
                 continue;
             }
             const ea = readTyped(expBin, er.off, er.count, er.type);
@@ -453,7 +461,7 @@ function compareSceneBin(expRoot, actRoot, expBin, actBin, relTol, diffs) {
             for (let j = 0; j < ea.length; j++) {
                 const ok = er.exact ? ea[j] === aa[j] : floatsClose(ea[j], aa[j], relTol);
                 if (!ok) {
-                    diffs.push({ path: `scene.bin/${id}/${er.label}[${j}]`, kind: er.exact ? 'scalar' : 'number', a: ea[j], b: aa[j] });
+                    diffs.push({ path: `m3/${id}/${er.label}[${j}]`, kind: er.exact ? 'scalar' : 'number', a: ea[j], b: aa[j] });
                     break; // one sample per range is enough to flag
                 }
             }
@@ -462,7 +470,7 @@ function compareSceneBin(expRoot, actRoot, expBin, actBin, relTol, diffs) {
 }
 
 // scene_anim.bin comparison. Baked animation tracks (times + values) live in a
-// SEPARATE binary referenced by root.animations.bin; the scene.bin compare never
+// SEPARATE binary referenced by root.animations.bin; the M3 compare never
 // touches it, so a keyframe regression with stable JSON offsets would otherwise pass
 // as BYTE_IDENTICAL. Per-track typed decode via animations[].timesRef/valuesRef is a
 // follow-up tied to the deferred animation-codec work; for now we tolerant-sweep the
@@ -494,7 +502,7 @@ function compareAnimBin(expBin, actBin, relTol, diffs) {
 // ───────────────────────────── IO helpers ───────────────────────────────────
 
 // Resolve the optional separate animation-binary name. Baked keyframe times/values
-// live there (NOT in scene.bin). Be defensive about the JSON shape and fall back to
+// live there (NOT in M3). Be defensive about the JSON shape and fall back to
 // the conventional filename on disk so a schema guess can't reintroduce a blind spot.
 function resolveAnimBinName(root, dir) {
     const a = root && root.animations;
@@ -504,6 +512,36 @@ function resolveAnimBinName(root, dir) {
     return null;
 }
 
+function validateScenePayloadName(value) {
+    if (typeof value !== 'string') throw new TypeError('M3 payload name must be a string');
+    const name = value.trim();
+    if (!name || name !== value || name.startsWith('/') || name.includes('\\') ||
+        name.includes('?') || name.includes('#') || /^[a-z][a-z0-9+.-]*:/i.test(name)) {
+        throw new Error('M3 payload name must be a clean relative URL path');
+    }
+    for (const encodedSegment of name.split('/')) {
+        let segment;
+        try { segment = decodeURIComponent(encodedSegment); }
+        catch { throw new Error('M3 payload name contains invalid URL encoding'); }
+        if (!segment || segment === '.' || segment === '..' || segment.includes('/') ||
+            segment.includes('\\') || segment.includes('\0') || segment.includes('?') || segment.includes('#')) {
+            throw new Error('M3 payload name contains an unsafe path segment');
+        }
+    }
+    return name;
+}
+
+function scenePayloadCandidates(root) {
+    if (root?.bin == null) return ['scene.m3', 'scene.bin'];
+    const declared = validateScenePayloadName(root.bin);
+    return declared.toLowerCase() === 'scene.m3' ? [declared, 'scene.bin'] : [declared];
+}
+
+function resolveScenePayloadName(root, dir) {
+    const candidates = scenePayloadCandidates(root);
+    return candidates.find(name => existsSync(path.join(dir, name))) ?? candidates[0];
+}
+
 async function loadFolder(dir) {
     const jsonPath = path.join(dir, 'snapshot.json');
     if (!existsSync(jsonPath)) throw new Error(`missing snapshot.json in ${dir}`);
@@ -511,7 +549,7 @@ async function loadFolder(dir) {
     let root;
     try { root = JSON.parse(jsonBuf.toString('utf8')); }
     catch (e) { throw new Error(`snapshot.json in ${dir} is not valid JSON: ${e.message}`); }
-    const binName = (root && typeof root.bin === 'string') ? root.bin : 'scene.bin';
+    const binName = resolveScenePayloadName(root, dir);
     const binPath = path.join(dir, binName);
     const bin = existsSync(binPath) ? await readFile(binPath) : null;
     const animBinName = resolveAnimBinName(root, dir);
@@ -525,6 +563,7 @@ async function loadFolder(dir) {
 function selftest() {
     let fails = 0;
     const ok = (cond, msg) => { if (!cond) { console.error('  FAIL:', msg); fails++; } };
+    const throws = (fn) => { try { fn(); return false; } catch { return true; } };
     ok(floatsClose(1.0, 1.00005, 1e-4), 'sub-tol close');
     ok(!floatsClose(1.0, 1.5, 1e-4), 'far apart');
     ok(floatsClose(NaN, NaN, 1e-4), 'NaN equals NaN (unchanged buffer slot)');
@@ -546,6 +585,12 @@ function selftest() {
     const cgeo = canonicalizeSnapshot({ nodes: [{ h: 1, n: 'm', geo: { vOff: 50, vN: 3, iOff: 99, iN: 6 } }] });
     ok(cgeo.nodes[0].geo.vOff === undefined && cgeo.nodes[0].geo.iOff === undefined, 'geo offsets dropped');
     ok(cgeo.nodes[0].geo.vN === 3 && cgeo.nodes[0].geo.iN === 6, 'geo counts kept');
+    ok(scenePayloadCandidates({ bin: 'scene.m3' }).join(',') === 'scene.m3,scene.bin',
+        'M3 descriptor permits the legacy filename fallback');
+    ok(scenePayloadCandidates({ bin: 'custom.m3' }).join(',') === 'custom.m3',
+        'custom descriptor filename remains authoritative');
+    ok(throws(() => scenePayloadCandidates({ bin: '../secret.m3' })), 'unsafe M3 payload path rejected');
+    ok(throws(() => scenePayloadCandidates({ bin: '%2e%2e/secret.m3' })), 'encoded M3 traversal rejected');
     // clip-level current-time dropped; a deeper (real) keyframe time preserved.
     const canim = canonicalizeSnapshot({ animations: { time: 12, clips: [{ time: 5, tracks: [{ times: [0, 1], time: 9 }] }] } });
     ok(canim.animations.time === undefined, 'anim-root time dropped');
@@ -562,9 +607,9 @@ function selftest() {
     ok(d1.length === 0, 'tolerant number eq');
     const d2 = []; deepDiff({ x: 1 }, { y: 1 }, 1e-4, '$', d2);
     ok(d2.length === 2, 'key add/del detected');
-    // classifier: a numeric value past tolerance (e.g. a scene.bin vertex) is
+    // classifier: a numeric value past tolerance (e.g. an M3 vertex) is
     // structural -> MISMATCH, not benign drift.
-    ok(classifyDiffs([{ path: 'scene.bin//A#0/verts[0]', kind: 'number', a: 0, b: 99 }]).structural === 1,
+    ok(classifyDiffs([{ path: 'm3//A#0/verts[0]', kind: 'number', a: 0, b: 99 }]).structural === 1,
         'bin numeric diff is structural');
     ok(classifyDiffs([{ path: '$.nodes[0].t[3]', kind: 'number', a: 0, b: 5 }]).structural === 1,
         'transform numeric diff is structural');
@@ -605,7 +650,7 @@ async function main() {
 
     const report = { verdict: 'UNKNOWN', tol: args.tol, warnings: [], diffs: [], keyAudit: {} };
 
-    // Tier 1: byte-identical fast path (json + scene.bin + scene_anim.bin).
+    // Tier 1: byte-identical fast path (json + M3 + scene_anim.bin).
     const jsonByteEq = exp.jsonBuf.equals(act.jsonBuf);
     const binByteEq = (exp.bin && act.bin) ? exp.bin.equals(act.bin) : (exp.bin == null && act.bin == null);
     const animByteEq = (exp.animBin && act.animBin) ? exp.animBin.equals(act.animBin) : (exp.animBin == null && act.animBin == null);
@@ -620,12 +665,12 @@ async function main() {
     const jsonDiffs = [];
     deepDiff(expCanon, actCanon, args.tol, '$', jsonDiffs);
 
-    // scene.bin semantic compare (typed, aligned by node id).
+    // M3 semantic compare (typed, aligned by node id).
     const binDiffs = [];
     if (exp.bin && act.bin) {
         compareSceneBin(exp.root, act.root, exp.bin, act.bin, args.tol, binDiffs);
     } else if (Boolean(exp.bin) !== Boolean(act.bin)) {
-        binDiffs.push({ path: 'scene.bin', kind: 'addkey', a: Boolean(exp.bin), b: Boolean(act.bin) });
+        binDiffs.push({ path: 'm3', kind: 'addkey', a: Boolean(exp.bin), b: Boolean(act.bin) });
     }
 
     // scene_anim.bin semantic compare (separate baked-animation binary).

@@ -26,6 +26,12 @@
         import { createEnvironment } from './environment.js';
         import { createSky } from './sky.js';
         import { createGiVolumeGlue } from './gi_volume_glue.js';
+        import {
+            createLiveRelayController,
+            DEFAULT_RELAY_URL,
+            DEFAULT_STREAM_ID,
+            validateRelayEndpoint,
+        } from '../live_relay_tap.js';
         import { getHostProfile } from '../host_profile.js';
         import {
             materialEnvIntensity,
@@ -1264,11 +1270,66 @@
         ctx.hostBridge = hostBridge;
         ctx.bridge = bridge;
 
+        // Relay mode is explicit and session-local: every editor boot starts
+        // OFF. The endpoint override remains compatible with the proof of
+        // concept, but merely setting it never starts network traffic.
+        let relayEndpoint = DEFAULT_RELAY_URL;
+        let relayStreamId = DEFAULT_STREAM_ID;
+        let relayProducerId;
+        try {
+            const relayEndpointOverride = localStorage.getItem('maxjs.liveRelayUrl');
+            if (relayEndpointOverride) {
+                try {
+                    relayEndpoint = validateRelayEndpoint(relayEndpointOverride);
+                } catch (error) {
+                    // A stale proof-of-concept override must never prevent the
+                    // editor from booting. Drop it and retain the safe default.
+                    try { localStorage.removeItem('maxjs.liveRelayUrl'); } catch {}
+                    console.warn('[max.js relay] Ignoring unsafe endpoint override:', error);
+                }
+            }
+            relayStreamId = localStorage.getItem('maxjs.liveRelayStream') || relayStreamId;
+            relayProducerId = sessionStorage.getItem('maxjs.liveRelayProducerId') || undefined;
+            if (!relayProducerId) {
+                relayProducerId = `producer-${crypto.randomUUID()}`;
+                sessionStorage.setItem('maxjs.liveRelayProducerId', relayProducerId);
+            }
+        } catch {}
+        let relayRenderFrame = null;
+        let relayResetRenderTimer = () => { lastRenderTimestamp = 0; };
+        let relayRenderingSuspended = false;
+        function setRelayReadyConsumers(count) {
+            const shouldSuspend = Number(count) > 0;
+            if (shouldSuspend === relayRenderingSuspended) return;
+            relayRenderingSuspended = shouldSuspend;
+            if (!relayRenderFrame) return;
+            if (shouldSuspend) {
+                // Host ingestion is event-driven. Stop the GPU loop completely
+                // while an external consumer owns the view.
+                renderer.setAnimationLoop(null);
+            } else {
+                // Exactly one restoration on the 1 -> 0 transition; reset the
+                // simulation timer so headless time is not folded into one dt.
+                relayResetRenderTimer();
+                renderer.setAnimationLoop(relayRenderFrame);
+            }
+        }
+        const relayController = createLiveRelayController({
+            hostBridge,
+            endpoint: relayEndpoint,
+            streamId: relayStreamId,
+            producerId: relayProducerId,
+            requestScene: details => bridge.send('relay_resync', details),
+            onReadyConsumersChange: count => setRelayReadyConsumers(count),
+        });
+        try { sessionStorage.setItem('maxjs.liveRelayProducerId', relayController.getState().producerId); } catch {}
+
         const giVolumeGlue = createGiVolumeGlue({
             pageParams,
             maxTimeline,
             hostBridge,
             bridge,
+            relayEmit: data => relayController.emit(data),
             maxjsDebugWarn,
             savePostFxState: () => savePostFxState(),
             bakeStateSignature: () => bakeStateSignature(),
@@ -1315,6 +1376,7 @@
         const {
             HALO_GI_NUMERIC_CONTROLS,
             GI_VOLUME_CAMERA_DEBOUNCE_MS,
+            serializeRelayProbeGrids,
             getHaloGiSettings,
             clampHaloGiNumber,
             formatHaloGiValue,
@@ -1422,6 +1484,39 @@
         document.getElementById('btnLiveSync')?.addEventListener('click', () => {
             const nextMode = SYNC_MODES[(SYNC_MODES.indexOf(syncMode) + 1) % SYNC_MODES.length];
             applyLiveSyncSettings({ mode: nextMode }, { notify: true, sendHost: true });
+        });
+
+        const relayButton = document.getElementById('btnRelay');
+        const relayLabel = document.getElementById('relayMenuLabel');
+        const RELAY_UI = {
+            off: ['Relay Off', 'Relay the live scene to a standalone Three.js project'],
+            connecting: ['Relay Connecting', 'Connecting to the local max.js relay'],
+            streaming: ['Relay Streaming', 'Live scene relay is streaming'],
+            recovering: ['Relay Recovering', 'Relay is requesting a fresh scene baseline'],
+            error: ['Relay Error', 'Relay unavailable - click to turn relay off'],
+        };
+        relayController.subscribe(relayState => {
+            const [label, title] = RELAY_UI[relayState.state] || RELAY_UI.off;
+            if (relayLabel) relayLabel.textContent = label;
+            if (!relayButton) return;
+            relayButton.dataset.relayState = relayState.state;
+            relayButton.classList.toggle('active', relayState.enabled);
+            relayButton.setAttribute('aria-pressed', relayState.enabled ? 'true' : 'false');
+            const stateTitle = relayState.lastError ? `${title}: ${relayState.lastError}` : title;
+            relayButton.title = relayState.readyConsumers > 0
+                ? `${stateTitle} (${relayState.readyConsumers} ready consumer${relayState.readyConsumers === 1 ? '' : 's'}; local renderer stopped)`
+                : stateTitle;
+        });
+        relayButton?.addEventListener('click', () => {
+            const enabling = !relayController.enabled;
+            relayController.toggle();
+            if (enabling) {
+                relayController.emit({
+                    type: 'haloGiSettings',
+                    settings: { ...getHaloGiSettings() },
+                });
+                relayController.emit(serializeRelayProbeGrids());
+            }
         });
 
         bridge.on('live_sync_settings', msg => {
@@ -1641,11 +1736,8 @@
             disposeFlattenedGroups,
             getMaxInstanceBucketForHandle,
             matrixArraysAlmostEqual,
-            updateMaxInstanceBucketVisibility,
             updateMaxInstanceBucketTransform,
             updateMaxInstanceBucketNode,
-            createMaxInstanceBucketMaterial,
-            computeMaxInstanceBucketGroups,
             planMaxInstanceBuckets,
             buildMaxInstanceBuckets,
             profileSceneNodes,
@@ -1779,6 +1871,7 @@
 
         hostBridge.installHostWiring();
         window.maxJS = bridge;
+        window.maxJS.relay = relayController;
         bridge.materials = {
             getStats() {
                 return { ...getMaterialRegistryStats() };
@@ -2143,6 +2236,13 @@
             } else {
                 location.reload();
             }
+        };
+
+        // Instance producers (Point Instance / Forest / RailClone / tyFlow)
+        // are not change-detected host-side — this is their manual pull.
+        // scene_dirty asks the host for a full resend without a panel reload.
+        document.getElementById('btnRefreshInstances').onclick = () => {
+            bridge.send('scene_dirty');
         };
 
         document.getElementById('btnSafeFrame')?.addEventListener('click', () => {
@@ -2838,6 +2938,11 @@
 
         applyBuildMode();
 
-        renderer.setAnimationLoop(renderFrame);
+        relayRenderFrame = renderFrame;
+        relayResetRenderTimer = () => {
+            lastRenderTimestamp = 0;
+            inlineTimer.reset();
+        };
+        if (!relayRenderingSuspended) renderer.setAnimationLoop(renderFrame);
 
         startBridgeHandshake();

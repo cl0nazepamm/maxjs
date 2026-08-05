@@ -23,6 +23,7 @@ const MIME = {
     '.mjs': 'text/javascript; charset=utf-8',
     '.css': 'text/css; charset=utf-8',
     '.json': 'application/json',
+    '.m3': 'application/octet-stream',
     '.bin': 'application/octet-stream',
     '.wasm': 'application/wasm',
     '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',

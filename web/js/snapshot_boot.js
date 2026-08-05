@@ -11,7 +11,7 @@
 // --------
 //   const player = await boot({ root, canvas, options? });
 //
-//   root      string  — folder containing snapshot.json + scene.bin (e.g. '.')
+//   root      string  — folder containing snapshot.json + scene.m3 (e.g. '.')
 //   canvas    HTMLCanvasElement — render target
 //   options   object  — { rendererBackend?: 'webgpu' | 'tsl_gl' | 'webgl', debug?: boolean }
 //
@@ -27,7 +27,7 @@
 //   3. Core scene/camera/controls
 //   4. Layer manager core
 //   5. Conditional module registration (driven by runtimeFeatures)
-//   6. Apply scene.bin
+//   6. Apply scene.m3 (legacy scene.bin is still accepted)
 //   7. Apply snapshotUi block (tone mapping, exposure, env, fog, postfx/studio state)
 //   8. Apply runtimeScene block (baked Object3D JSON)
 //   9. Bind layer project (inlines/ + project.maxjs.json)
@@ -67,6 +67,7 @@ import {
     measureCanvasSize,
 } from './scene_init.js';
 import { applySceneBin } from './scene_applier.js';
+import { createInstanceBuckets } from './instance_buckets.js';
 import { createSceneLights } from './scene_lights.js';
 import { createSnapshotEnvironment } from './snapshot_environment.js';
 import { createMaterialBuilder } from './material_builder.js';
@@ -87,7 +88,7 @@ import { sceneSpace } from './max_basis.js';
 // ─── Stub helpers ──────────────────────────────────────────────────────
 // `requireExtraction` is reserved for paths that genuinely cannot proceed
 // without the extraction landing (e.g. trying to apply a non-empty
-// scene.bin without the applier). `noteExtractionDeferred` is the
+// scene.m3 without the applier). `noteExtractionDeferred` is the
 // debug-and-continue variant used by phases where skipping is acceptable
 // for the empty/minimal snapshot path that Stage 2 supports.
 function requireExtraction(name, sourceLocation) {
@@ -103,6 +104,89 @@ function noteExtractionDeferred(name, sourceLocation, detail = '') {
         `[snapshot_boot] '${name}' not yet extracted from index.html ` +
         `(${sourceLocation}); skipping in Stage 2.${tail}`,
     );
+}
+
+export const DEFAULT_M3_PAYLOAD = 'scene.m3';
+export const LEGACY_SCENE_BIN_PAYLOAD = 'scene.bin';
+export const M3_FORMAT_VERSION = 1;
+export const M3_SCHEMA_VERSION = 1;
+
+export function validateM3Metadata(meta) {
+    if (!meta || typeof meta !== 'object' || Array.isArray(meta)) {
+        throw new TypeError('snapshot.json must contain an object');
+    }
+    if (meta.format != null && String(meta.format).toLowerCase() !== 'm3') {
+        throw new Error(`Unsupported scene format: ${meta.format}`);
+    }
+    if (meta.formatVersion != null && meta.formatVersion !== M3_FORMAT_VERSION) {
+        throw new Error(`Unsupported M3 format version: ${meta.formatVersion}`);
+    }
+    if (meta.schemaVersion != null && meta.schemaVersion !== M3_SCHEMA_VERSION) {
+        throw new Error(`Unsupported M3 schema version: ${meta.schemaVersion}`);
+    }
+    if (meta.units != null) {
+        const units = meta.units;
+        if (!units || typeof units !== 'object' || Array.isArray(units) ||
+            typeof units.label !== 'string' || !units.label.trim() ||
+            !Number.isFinite(units.metersPerUnit) || units.metersPerUnit <= 0) {
+            throw new Error('Invalid M3 units descriptor');
+        }
+    }
+    return meta;
+}
+
+export function validateSnapshotScenePayloadName(value) {
+    if (typeof value !== 'string') {
+        throw new TypeError('M3 scene payload name must be a string');
+    }
+    const name = value.trim();
+    if (!name || name !== value || name.startsWith('/') || name.includes('\\') ||
+        name.includes('?') || name.includes('#') || /^[a-z][a-z0-9+.-]*:/i.test(name)) {
+        throw new Error('M3 scene payload name must be a clean relative URL path');
+    }
+    const segments = name.split('/');
+    for (const encodedSegment of segments) {
+        let segment;
+        try {
+            segment = decodeURIComponent(encodedSegment);
+        } catch {
+            throw new Error('M3 scene payload name contains invalid URL encoding');
+        }
+        if (!segment || segment === '.' || segment === '..' ||
+            segment.includes('/') || segment.includes('\\') ||
+            segment.includes('\0') || segment.includes('?') || segment.includes('#')) {
+            throw new Error('M3 scene payload name contains an unsafe path segment');
+        }
+    }
+    return name;
+}
+
+export function snapshotScenePayloadCandidates(meta = {}) {
+    if (meta?.bin == null) return [DEFAULT_M3_PAYLOAD, LEGACY_SCENE_BIN_PAYLOAD];
+    const declared = validateSnapshotScenePayloadName(meta.bin);
+    if (declared.toLowerCase() === DEFAULT_M3_PAYLOAD) {
+        return [declared, LEGACY_SCENE_BIN_PAYLOAD];
+    }
+    return [declared];
+}
+
+export async function fetchSnapshotScenePayload(root, meta, fetchImpl = globalThis.fetch) {
+    if (typeof fetchImpl !== 'function') throw new TypeError('Snapshot scene loader requires fetch()');
+    const rootUrl = String(root || '.').replace(/\/+$/, '');
+    const candidates = snapshotScenePayloadCandidates(meta);
+    for (let i = 0; i < candidates.length; i++) {
+        const name = candidates[i];
+        const url = `${rootUrl}/${name.replace(/^\/+/, '')}`;
+        const response = await fetchImpl(url, { cache: 'no-store' });
+        if (response.ok) {
+            return { buffer: await response.arrayBuffer(), name, url };
+        }
+        const canTryLegacy = i + 1 < candidates.length && response.status === 404;
+        if (!canTryLegacy) {
+            throw new Error(`M3 scene payload fetch failed (${name}): HTTP ${response.status}`);
+        }
+    }
+    throw new Error('M3 scene payload fetch failed');
 }
 
 // ─── Default features — used when runtimeFeatures block is absent ──────
@@ -295,7 +379,7 @@ async function loadMeta(root) {
     if (!response.ok) {
         throw new Error(`snapshot.json fetch failed: HTTP ${response.status}`);
     }
-    const meta = await response.json();
+    const meta = validateM3Metadata(await response.json());
     resolveSnapshotMaterialRefs(meta);
     return meta;
 }
@@ -795,12 +879,30 @@ function setGeometryVertexColorAttributes(geometry, vertexColors, buffer = null)
     }));
 }
 
-// ─── Phase 6: apply scene.bin ──────────────────────────────────────────
+// ─── Phase 6: apply scene.m3 ───────────────────────────────────────────
 // Stage 3: real applier landed. js/scene_applier.js does the geometry
 // build / mesh creation / transform / removal pass. Defaults give every
 // node a flat MeshStandardMaterial — visible but uncolored. Real material
 // fidelity (PBR maps, TSL, MaterialX, VRay/OpenPBR mapping) lives in
 // js/material_builder.js once it's extracted from index.html.
+// Stable per-node material identity for bucket grouping: the interned matRef
+// when the snapshot carries one, else an identity id for the inline payload.
+const snapshotMaterialKeyIds = new WeakMap();
+let snapshotNextMaterialKeyId = 1;
+function snapshotNodeMaterialKey(nd) {
+    if (nd?.matRef != null) return String(nd.matRef);
+    const mat = nd?.mat;
+    if (mat && typeof mat === 'object') {
+        let id = snapshotMaterialKeyIds.get(mat);
+        if (id === undefined) {
+            id = snapshotNextMaterialKeyId++;
+            snapshotMaterialKeyIds.set(mat, id);
+        }
+        return `obj${id}`;
+    }
+    return 'default';
+}
+
 async function applyDelta(buffer, ctx) {
     const meta = ctx?.meta;
     if (meta?.type !== 'scene_bin') {
@@ -808,10 +910,21 @@ async function applyDelta(buffer, ctx) {
         return;
     }
     if ((meta.nodes?.length ?? 0) === 0) {
-        console.info('[snapshot_boot] empty scene.bin (0 nodes) — applier no-op.');
+        console.info('[snapshot_boot] empty M3 scene payload (0 nodes) — applier no-op.');
         return;
     }
-    return applySceneBin({
+    // instOf families collapse into InstancedMesh buckets (shared engine, same
+    // as the editor's optimizeMaxInstances path). Originals stay hidden in the
+    // nodeMap, so raycasts, layer overrides and profiling keep working.
+    ctx.instanceBuckets ??= createInstanceBuckets({
+        nodeMap: ctx.nodeMap,
+        root: ctx.maxRoot,
+        materialKey: snapshotNodeMaterialKey,
+        buildMaterial: ({ nd, geom }) =>
+            ctx.materialBuilder.buildForNode({ nd: { mat: nd?.mat }, geom, wantsLine: false }),
+    });
+    const buckets = ctx.instanceBuckets;
+    const result = await applySceneBin({
         buffer,
         meta,
         ctx: {
@@ -821,9 +934,12 @@ async function applyDelta(buffer, ctx) {
             renderer: ctx.renderer,
             rendererBackendLabel: ctx.renderer?.userData?.maxjsBackendLabel,
             forestMeshes: ctx.forestMeshes,
-            lastInstanceBucketSignature: '',
+            lastInstanceBucketSignature: buckets.signature,
         },
         hooks: {
+            planInstanceBuckets: (nodes) => buckets.plan(nodes),
+            getInstanceBucketFor: (handle) => buckets.getBucketFor(handle),
+            updateInstanceBucketNode: (handle, nd) => buckets.updateNode(handle, nd),
             materialBuilder: ({ nd, geom, wantsLine }) =>
                 ctx.materialBuilder.buildForNode({ nd, geom, wantsLine }),
             instanceMaterialBuilder: ({ grp, geom, materialDescriptor, materialIndex }) => {
@@ -876,6 +992,15 @@ async function applyDelta(buffer, ctx) {
             },
         },
     });
+    if (buckets.build(meta.nodes)) {
+        const stats = buckets.stats();
+        if (stats.buckets > 0) {
+            console.info(
+                `[snapshot_boot] instance buckets: ${stats.instances} instances in ${stats.buckets} draws`,
+            );
+        }
+    }
+    return result;
 }
 
 const SNAPSHOT_TONE_MAPPING_MODES = Object.freeze({
@@ -994,7 +1119,7 @@ function applySnapshotCameraClip(camera, cameraClip) {
 //   - background: solid viewport color (Display → Background slot)
 //   - envVisible: show environment map on the viewport background (Environment btn)
 //   - basic camera position/target and user clip planes if present
-// Bake overrides are consumed by material_builder during scene.bin apply.
+// Bake overrides are consumed by material_builder during M3 scene apply.
 // The deeper live editor panels are intentionally out of the lightweight
 // snapshot boot path; portable Studio state is replayed after camera/env apply.
 export function applySnapshotSolidBackground(snapshotUi, scene) {
@@ -1806,10 +1931,9 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
         maxBasisRoot, jsRoot, overlayRoot, meta,
     });
 
-    // Phase 6: apply scene.bin
-    const binResp = await fetch(`${root}/${meta.bin || 'scene.bin'}`, { cache: 'no-store' });
-    if (!binResp.ok) throw new Error(`scene.bin fetch failed: HTTP ${binResp.status}`);
-    const buffer = await binResp.arrayBuffer();
+    // Phase 6: apply the metadata-declared M3 payload. Metadata-free exports
+    // prefer scene.m3 and fall back once to the pre-M3 scene.bin filename.
+    const { buffer } = await fetchSnapshotScenePayload(root, meta);
     const applierCtx = {
         scene, meta, nodeMap, lightHandleMap, maxRoot,
         layerManager, animationSystem, materialBuilder,

@@ -113,6 +113,9 @@ project directory over HTTP themselves (the Blender add-on) send it; the
 relay baseline. It may carry `{reason, sceneRequestId, streamId, producerId,
 sessionId, sceneRevision}`. Hosts may route it through the same full-sync path
 as `scene_dirty`; the distinct name keeps relay recovery obvious in diagnostics.
+It is re-issued every few seconds while the baseline is still missing, so hosts
+must treat it as idempotent, and must answer it in every sync mode (including
+SLOW) — an unanswered request leaves the relay recovering indefinitely.
 
 Hosts may ignore any of these. Request/response pairs use `requestHostAction`:
 the viewer sends `{type: action, requestId, ...}` and expects

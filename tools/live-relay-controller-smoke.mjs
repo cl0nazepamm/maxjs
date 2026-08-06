@@ -13,12 +13,21 @@ const delay = (ms = 0) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const relaySource = await readFile(new URL('../web/js/live_relay_tap.js', import.meta.url), 'utf8');
 const bootSource = await readFile(new URL('../web/js/editor/boot.js', import.meta.url), 'utf8');
+const syncEntrySource = await readFile(new URL('../src/maxjs_panel_sync_entry.inl', import.meta.url), 'utf8');
 assert.doesNotMatch(relaySource, /window\.chrome|chrome\.webview/);
 assert.doesNotMatch(relaySource, /window\.(?:requestAnimationFrame|cancelAnimationFrame)\s*=/);
 assert.doesNotMatch(relaySource, /maxjsRelayEmit/);
 assert.match(bootSource, /renderer\.setAnimationLoop\(null\)/);
 assert.match(bootSource, /inlineTimer\.reset\(\)/);
 assert.match(bootSource, /localStorage\.removeItem\('maxjs\.liveRelayUrl'\)/);
+assert.match(bootSource, /maxjs\.liveRelayEnabled/);
+assert.match(bootSource, /if \(relayEnabledPreference\) setRelayEnabled\(true\)/);
+
+const fullSceneRepairBody = /    void RequestFullSceneRepair\(\) \{([\s\S]*?)\n    \}/.exec(syncEntrySource)?.[1];
+assert.ok(fullSceneRepairBody, 'native full-scene repair handler must remain present');
+assert.match(fullSceneRepairBody,
+    /if \(slowJsonSyncMode_\) \{[\s\S]*?dirty_ = true;[\s\S]*?dirtyStamp_ = 0;/,
+    'relay_resync must schedule a full baseline even when SLOW mode gates SetDirtyImmediate');
 
 // Scene bytes may only be posted directly to an explicit loopback HTTP
 // endpoint. Reject remote hosts, URL credentials, fragments, and TLS URLs.
@@ -213,6 +222,25 @@ function fakeResponse(status) {
     assert.equal(resyncs.length, 1, 'first-ready acknowledgement must not request a second baseline');
     assert.equal(controller.state, RELAY_STATES.STREAMING);
 
+    // Every sync lane the viewer consumes is forwarded: native GI packets ride
+    // as ordered binary continuations, clay mode as an ordered JSON message.
+    host.shared(Uint8Array.from([9, 9]).buffer, { type: 'gi_surface_bin', probeCount: 1 });
+    host.shared(Uint8Array.from([9]).buffer, { type: 'gi_light_bin', lightCount: 1 });
+    host.message({ type: 'clay_mode', enabled: true });
+    const giSurface = await waitFor(
+        () => posts.find((entry) => entry.isBinary && entry.decoded.meta.type === 'gi_surface_bin')?.decoded,
+        'gi_surface_bin forwarded');
+    await waitFor(() => posts.some((entry) => entry.isBinary && entry.decoded.meta.type === 'gi_light_bin'),
+        'gi_light_bin forwarded');
+    const clay = await waitFor(
+        () => posts.find((entry) => entry.json?.data?.type === 'clay_mode')?.json,
+        'clay_mode forwarded');
+    assert.equal(giSurface.relay.sceneRevision, 1);
+    assert.ok(giSurface.relay.sequence > 0);
+    assert.deepEqual([...giSurface.payload], [9, 9]);
+    assert.equal(clay.data.enabled, true);
+    assert.equal(clay.relay.sceneRevision, 1);
+
     relayStatus.needScene = true;
     relayStatus.sceneRequestId = 1;
     relayStatus.readyConsumers = 0;
@@ -272,6 +300,96 @@ function fakeResponse(status) {
     host.shared(Uint8Array.from([1]).buffer, { type: 'scene_bin' });
     await waitFor(() => resyncs.some((entry) => entry.reason === 'queue-overflow'), 'queue overflow recovery');
     assert.equal(controller.state, RELAY_STATES.RECOVERING);
+    controller.dispose();
+}
+
+// A relay_resync the host drops must not park the relay in RECOVERING until a
+// manual reload: while the baseline is missing the request is re-issued on
+// resyncRetryMs, and the retries stop once a baseline streams.
+{
+    const host = fakeHostBridge();
+    const resyncs = [];
+    const status = {
+        kind: 'relay_status', version: 1, relayId: 'relay-retry', streamId: 'default',
+        producerId: '', sessionId: '', consumers: 1, readyConsumers: 0,
+        needScene: true, sceneRequestId: 3, sceneRevision: 0,
+    };
+    const controller = createLiveRelayController({
+        hostBridge: host,
+        producerId: 'producer-retry',
+        createSessionId: () => 'session-retry',
+        heartbeatMs: 15,
+        resyncRetryMs: 40,
+        requestScene: (details) => resyncs.push(details),
+        fetchImpl: async (_url, init) => {
+            if (init.headers['content-type'] === 'application/octet-stream') {
+                const decoded = decodeRelayFrame(init.body, { requireSceneRequestId: true });
+                if (decoded.relay.sequence === 0) {
+                    status.sceneRevision = decoded.relay.sceneRevision;
+                    status.needScene = false;
+                }
+            } else {
+                const json = JSON.parse(init.body);
+                if (json.kind === 'producer_hello') {
+                    status.producerId = json.producerId;
+                    status.sessionId = json.sessionId;
+                }
+            }
+            return fakeResponse(status);
+        },
+    });
+    controller.enable();
+    await waitFor(() => resyncs.length >= 3, 'host resync re-issued while the baseline is missing', 4000);
+    assert.equal(controller.state, RELAY_STATES.RECOVERING);
+    assert.ok(resyncs.every((entry) => entry.sceneRequestId === 3),
+        'retries must keep the broker\'s outstanding scene request id');
+
+    host.shared(Uint8Array.from([1, 2]).buffer, { type: 'scene_bin' });
+    await waitFor(() => controller.state === RELAY_STATES.STREAMING, 'baseline ends recovery');
+    const settled = resyncs.length;
+    await delay(150);
+    assert.equal(resyncs.length, settled, 'retries must stop once the baseline streamed');
+    assert.equal(controller.state, RELAY_STATES.STREAMING);
+    controller.dispose();
+}
+
+// Sync traffic arriving while the baseline is missing must itself re-arm the
+// rate-limited host resync: a host that is clearly alive (streaming deltas)
+// but missed the request gets nudged without waiting for a heartbeat.
+{
+    const host = fakeHostBridge();
+    const resyncs = [];
+    const status = {
+        kind: 'relay_status', version: 1, relayId: 'relay-nudge', streamId: 'default',
+        producerId: '', sessionId: '', consumers: 1, readyConsumers: 0,
+        needScene: true, sceneRequestId: 7, sceneRevision: 0,
+    };
+    const controller = createLiveRelayController({
+        hostBridge: host,
+        producerId: 'producer-nudge',
+        createSessionId: () => 'session-nudge',
+        heartbeatMs: 10000,
+        resyncRetryMs: 30,
+        requestScene: (details) => resyncs.push(details),
+        fetchImpl: async (_url, init) => {
+            const json = JSON.parse(init.body);
+            if (json.kind === 'producer_hello') {
+                status.producerId = json.producerId;
+                status.sessionId = json.sessionId;
+            }
+            return fakeResponse(status);
+        },
+    });
+    controller.enable();
+    await waitFor(() => resyncs.length === 1, 'nudge scenario handshake');
+    for (let index = 0; index < 20 && resyncs.length < 3; index++) {
+        host.shared(Uint8Array.from([index]).buffer, { type: 'delta_bin', frame: index });
+        host.message({ type: 'env_update', exposure: index });
+        await delay(10);
+    }
+    assert.ok(resyncs.length >= 3,
+        'host sync traffic while awaiting the baseline must re-arm the resync request');
+    assert.ok(resyncs.every((entry) => entry.sceneRequestId === 7));
     controller.dispose();
 }
 

@@ -1270,12 +1270,15 @@
         ctx.hostBridge = hostBridge;
         ctx.bridge = bridge;
 
-        // Relay mode is explicit and session-local: every editor boot starts
-        // OFF. The endpoint override remains compatible with the proof of
-        // concept, but merely setting it never starts network traffic.
+        // Relay endpoint/stream prefs persist across sessions. Enabled state
+        // also persists (`maxjs.liveRelayEnabled`) so a viewer restart resumes
+        // streaming when the user left relay on. Merely setting an endpoint
+        // override never starts network traffic on its own.
+        const RELAY_ENABLED_KEY = 'maxjs.liveRelayEnabled';
         let relayEndpoint = DEFAULT_RELAY_URL;
         let relayStreamId = DEFAULT_STREAM_ID;
         let relayProducerId;
+        let relayEnabledPreference = false;
         try {
             const relayEndpointOverride = localStorage.getItem('maxjs.liveRelayUrl');
             if (relayEndpointOverride) {
@@ -1289,6 +1292,7 @@
                 }
             }
             relayStreamId = localStorage.getItem('maxjs.liveRelayStream') || relayStreamId;
+            relayEnabledPreference = localStorage.getItem(RELAY_ENABLED_KEY) === 'true';
             relayProducerId = sessionStorage.getItem('maxjs.liveRelayProducerId') || undefined;
             if (!relayProducerId) {
                 relayProducerId = `producer-${crypto.randomUUID()}`;
@@ -1495,6 +1499,27 @@
             recovering: ['Relay Recovering', 'Relay is requesting a fresh scene baseline'],
             error: ['Relay Error', 'Relay unavailable - click to turn relay off'],
         };
+        function persistRelayEnabled(enabled) {
+            try { localStorage.setItem(RELAY_ENABLED_KEY, enabled ? 'true' : 'false'); } catch {}
+        }
+        function setRelayEnabled(enabled) {
+            const next = enabled === true;
+            if (next === relayController.enabled) {
+                persistRelayEnabled(next);
+                return;
+            }
+            if (next) {
+                relayController.enable();
+                relayController.emit({
+                    type: 'haloGiSettings',
+                    settings: { ...getHaloGiSettings() },
+                });
+                relayController.emit(serializeRelayProbeGrids());
+            } else {
+                relayController.disable();
+            }
+            persistRelayEnabled(next);
+        }
         relayController.subscribe(relayState => {
             const [label, title] = RELAY_UI[relayState.state] || RELAY_UI.off;
             if (relayLabel) relayLabel.textContent = label;
@@ -1508,16 +1533,9 @@
                 : stateTitle;
         });
         relayButton?.addEventListener('click', () => {
-            const enabling = !relayController.enabled;
-            relayController.toggle();
-            if (enabling) {
-                relayController.emit({
-                    type: 'haloGiSettings',
-                    settings: { ...getHaloGiSettings() },
-                });
-                relayController.emit(serializeRelayProbeGrids());
-            }
+            setRelayEnabled(!relayController.enabled);
         });
+        if (relayEnabledPreference) setRelayEnabled(true);
 
         bridge.on('live_sync_settings', msg => {
             applyLiveSyncSettings(

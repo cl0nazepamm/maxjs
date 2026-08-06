@@ -18,6 +18,10 @@ const DEFAULT_STREAM_ID = 'default';
 const DEFAULT_HEARTBEAT_MS = 1000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 3500;
 const DEFAULT_FRAME_TIMEOUT_MS = 15000;
+// A relay_resync the host dropped (busy main thread, viewer still booting,
+// transport hiccup) must not leave the relay recovering until a manual reload.
+// While the baseline is still missing the request is re-issued on this cadence.
+const DEFAULT_RESYNC_RETRY_MS = 4000;
 const DEFAULT_QUEUE_MAX_COUNT = 512;
 // A legal maximum-size relay frame must fit by itself. The cap remains finite,
 // and a backed-up stream trips recovery instead of growing without bound.
@@ -31,7 +35,13 @@ const RELAY_STATES = Object.freeze({
     ERROR: 'error',
 });
 
-const BINARY_FORWARD_TYPES = new Set(['scene_bin', 'delta_bin', 'geo_fast']);
+const BINARY_FORWARD_TYPES = new Set([
+    'scene_bin',
+    'delta_bin',
+    'geo_fast',
+    'gi_surface_bin',  // native HALO-GI surfel/surface packet
+    'gi_light_bin',    // native HALO-GI light packet
+]);
 const JSON_FORWARD_TYPES = new Set([
     'scene',       // SLOW/full JSON baseline
     'geo_fast',    // JSON geometry fallback
@@ -43,6 +53,7 @@ const JSON_FORWARD_TYPES = new Set([
     'webapp_update',
     'env_update',
     'probeGrids',
+    'clay_mode',
 ]);
 
 // Change-only host lanes observed during one resync are replayed after that
@@ -53,7 +64,7 @@ const KEYED_JSON_STATE = Object.freeze({
     gltf_update: 'gltfs',
     webapp_update: 'webapps',
 });
-const WHOLE_JSON_STATE = new Set(['cam', 'env_update', 'probeGrids', 'haloGiSettings']);
+const WHOLE_JSON_STATE = new Set(['cam', 'env_update', 'probeGrids', 'haloGiSettings', 'clay_mode']);
 const PANEL_JSON_TYPES = new Set(['haloGiSettings', 'probeGrids']);
 const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const textEncoder = new TextEncoder();
@@ -160,6 +171,12 @@ function createLiveRelayController(options = {}) {
         DEFAULT_FRAME_TIMEOUT_MS,
         'frameTimeoutMs',
     );
+    const resyncRetryMs = positiveLimit(
+        options.resyncRetryMs,
+        DEFAULT_RESYNC_RETRY_MS,
+        'resyncRetryMs',
+    );
+    const nowImpl = options.nowImpl ?? (() => Date.now());
     const queueMaxCount = positiveLimit(
         options.queueMaxCount,
         DEFAULT_QUEUE_MAX_COUNT,
@@ -201,6 +218,7 @@ function createLiveRelayController(options = {}) {
     let awaitingScene = false;
     let resyncCycle = 0;
     let resyncIssuedCycle = -1;
+    let resyncIssuedAtMs = 0;
     let resyncReason = '';
     let lastError = '';
     let transportGeneration = 0;
@@ -282,9 +300,19 @@ function createLiveRelayController(options = {}) {
         queueBytes = Math.max(0, queueBytes - item.byteLength);
     }
 
+    // Issued once per resync cycle, then re-issued on a timer while the
+    // baseline is still missing. The host request is a one-way postMessage
+    // with no ack; without the retry, a single dropped relay_resync would
+    // park the relay in RECOVERING until the viewer is reloaded.
     function issueHostResync() {
-        if (!enabled || !handshakeReady || resyncIssuedCycle === resyncCycle) return;
+        if (!enabled || !handshakeReady) return;
+        const now = nowImpl();
+        if (resyncIssuedCycle === resyncCycle
+            && (!awaitingScene || (now - resyncIssuedAtMs) < resyncRetryMs)) {
+            return;
+        }
         resyncIssuedCycle = resyncCycle;
+        resyncIssuedAtMs = now;
         try {
             requestScene({
                 reason: resyncReason || 'relay-resync',
@@ -426,7 +454,12 @@ function createLiveRelayController(options = {}) {
             resyncJsonStateCache.clear();
             return true;
         }
-        if (awaitingScene) return true;
+        if (awaitingScene) {
+            // Same nudge as the binary path: host traffic while the baseline
+            // is missing re-arms the (rate-limited) host resync request.
+            issueHostResync();
+            return true;
+        }
         return enqueue(makeJsonItem(dataJson));
     }
 
@@ -436,7 +469,13 @@ function createLiveRelayController(options = {}) {
         const type = meta.type || 'scene_bin';
         if (!BINARY_FORWARD_TYPES.has(type)) return false;
         const fullScene = type === 'scene_bin';
-        if (awaitingScene && !fullScene) return false;
+        if (awaitingScene && !fullScene) {
+            // Live sync traffic without the awaited baseline proves the host
+            // is up but missed (or has not yet answered) the resync request.
+            // Nudge it; issueHostResync rate-limits to resyncRetryMs.
+            issueHostResync();
+            return false;
+        }
 
         let relay;
         if (fullScene) {

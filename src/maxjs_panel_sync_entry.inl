@@ -121,6 +121,15 @@
         geoFastTriangleCountMap_.clear();
         deformChannelHashMap_.clear();
         lastLiveGeomHash_.clear();
+        if (slowJsonSyncMode_) {
+            // SetDirty*/SetDirtyImmediate are gated off in SLOW mode, but the
+            // slow tick honors dirty_ directly and answers with SendFullSync.
+            // A web-side repair (scene_dirty / relay_resync) must still produce
+            // a baseline here, or a relay stays stuck awaiting its scene.
+            dirty_ = true;
+            dirtyStamp_ = 0;
+            return;
+        }
         SetDirtyImmediate();
     }
 

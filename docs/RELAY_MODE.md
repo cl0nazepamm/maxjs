@@ -29,7 +29,9 @@ RelayClient -> the application's existing M3/MXJB/geo/JSON appliers
 
 Relay is an explicit mode, not a permanent mirror.
 
-- In 3ds Max, choose **Tools > RELAY**. It starts OFF on every boot.
+- In 3ds Max, choose **Tools > RELAY**. The choice persists per browser
+  profile (`maxjs.liveRelayEnabled`): a viewer restart resumes streaming when
+  the artist left Relay on. A fresh profile starts OFF.
 - The Max WebView remains the transport host, but its presentation loop fully
   suspends after the broker reports at least one ready consumer. It continues
   to ingest native scene messages and forwards them without rendering another
@@ -59,7 +61,23 @@ window.maxJS.relay.getState();
 
 Advanced integrations may also use `emit` and `subscribe`. Persisted
 `maxjs.liveRelayUrl` and `maxjs.liveRelayStream` values configure the producer;
-they never auto-enable Relay.
+they never auto-enable Relay. Only `maxjs.liveRelayEnabled` — written by the
+RELAY toggle itself — restores the enabled state on the next boot.
+
+## Forwarded lanes
+
+Every sync lane the local viewer consumes is forwarded once a baseline is
+established. Binary continuations: `delta_bin`, `geo_fast`, `gi_surface_bin`,
+`gi_light_bin` (native HALO-GI packets). JSON continuations: `scene` (SLOW
+JSON baseline), `geo_fast`, `xform`, `hair_fast`, `cam`, `audio_update`,
+`gltf_update`, `webapp_update`, `env_update`, `probeGrids`, `clay_mode`, plus
+the panel-owned `haloGiSettings` / `probeGrids` state replayed after every
+baseline.
+
+The lane set is additive over time. A consumer must ignore frame and message
+types it does not implement — throwing on an unknown lane makes `RelayClient`
+request a resync for every such packet and the stream degenerates into a
+baseline loop.
 
 ## Minimal standalone setup
 
@@ -373,7 +391,10 @@ const relay = new RelayClient({
       relay.requestResync('geometry_update_requires_baseline');
       return;
     }
-    throw new Error(`Unsupported relay frame: ${frame.meta.type}`);
+    // The lane set is additive (gi_surface_bin, gi_light_bin, ...). Ignore
+    // lanes this application does not implement; never throw on them, or the
+    // client resyncs on every such packet and loops on baselines.
+    console.debug('relay frame ignored', frame.meta.type);
   },
 
   async onMessage(data, envelope, { signal }) {
@@ -610,7 +631,13 @@ revision.
   merely `connected`; inspect `onStatus` and make sure `onScene` resolves.
 - **Repeated baseline loop:** let the real callback error surface. Common causes
   are an unsupported M3 version, bad byte range, missing units, or a consumer
-  that does not implement a fast lane and requests resync for every packet.
+  that throws on (instead of ignoring) a fast lane it does not implement and so
+  requests resync for every packet.
+- **Stuck on "Relay Recovering":** the producer re-asks its DCC host for a
+  baseline every few seconds while one is missing, so a dropped request heals
+  on its own. If recovering persists anyway, the host is not answering at all:
+  confirm the DCC is responsive and the max.js panel is open, and check the
+  Vite terminal for rejected ingest posts.
 - **Scene scale is wrong:** read `meta.units.metersPerUnit`; do not hard-code
   Max centimetres in a Blender-capable application.
 - **Scene is rotated twice:** create exactly one `-PI / 2` X basis boundary for

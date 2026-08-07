@@ -431,6 +431,10 @@ function snapshotNeedsTslTextures(meta) {
         if (valueReferencesTslTextures(nd?.mat)) return true;
         if (valueReferencesTslTextures(nd?.mats)) return true;
     }
+    for (const group of (meta?.forestInstances ?? [])) {
+        if (valueReferencesTslTextures(group?.mat)) return true;
+        if (valueReferencesTslTextures(group?.mats)) return true;
+    }
     return false;
 }
 

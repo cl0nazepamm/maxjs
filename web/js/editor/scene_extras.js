@@ -6,7 +6,13 @@ import {
     normalAttributeFromBinary,
     uvAttributeFromBinary,
 } from '../scene_binary.js';
-import { getInstancedMeshBatchSize, instanceGroupKey, isWebGpuInstancingPath } from '../instance_batching.js';
+import {
+    getInstancedMeshBatchSize,
+    instanceGroupHasExactMaterialDescriptor,
+    instanceGroupKey,
+    isExactInstanceMaterialDescriptor,
+    isWebGpuInstancingPath,
+} from '../instance_batching.js';
 import { markOwned, OWNER_MAX } from '../layer_ownership.js';
 
 function createSceneExtras(deps = {}) {
@@ -338,6 +344,7 @@ function createSceneExtras(deps = {}) {
 
         function webGpuSafeInstanceMaterialDescriptor(md) {
             if (!usingWebGpuInstanceMaterials() || !md || typeof md !== 'object') return md;
+            if (isExactInstanceMaterialDescriptor(md)) return md;
 
             const safe = {
                 model: 'MeshStandardMaterial',
@@ -392,6 +399,7 @@ function createSceneExtras(deps = {}) {
             if (!usingWebGpuInstanceMaterials()) return false;
             if (String(grp?.kind || '').toLowerCase() === 'railclone') return false;
             if (!Array.isArray(grp?.mats) || !Array.isArray(grp?.groups)) return false;
+            if (instanceGroupHasExactMaterialDescriptor(grp)) return false;
             const textureSlots = grp.mats.reduce((sum, material) => sum + deps.countMaterialTextureSlots(material), 0);
             return grp.groups.length > 8 || textureSlots > 4;
         }

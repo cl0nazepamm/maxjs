@@ -52,7 +52,13 @@ import {
     normalAttributeFromBinary,
     uvAttributeFromBinary,
 } from './scene_binary.js';
-import { getInstancedMeshBatchSize, instanceGroupKey, isWebGpuInstancingPath } from './instance_batching.js';
+import {
+    getInstancedMeshBatchSize,
+    instanceGroupHasExactMaterialDescriptor,
+    instanceGroupKey,
+    isExactInstanceMaterialDescriptor,
+    isWebGpuInstancingPath,
+} from './instance_batching.js';
 import { ensureGeometryUv0ForMaterial } from './material_contract.js';
 import { markOwned, OWNER_MAX } from './layer_ownership.js';
 
@@ -452,6 +458,7 @@ function copyInstanceTextureSlot(source, target, fromKey, toKey = fromKey) {
 
 function webGpuSafeInstanceMaterialDescriptor(md, ctx) {
     if (!usingWebGpuInstanceMaterials(ctx) || !md || typeof md !== 'object') return md;
+    if (isExactInstanceMaterialDescriptor(md)) return md;
 
     const safe = {
         model: 'MeshStandardMaterial',
@@ -506,6 +513,7 @@ function shouldCollapseForestMaterialsForWebGpu(grp, ctx) {
     if (!usingWebGpuInstanceMaterials(ctx)) return false;
     if (String(grp?.kind || '').toLowerCase() === 'railclone') return false;
     if (!Array.isArray(grp?.mats) || !Array.isArray(grp?.groups)) return false;
+    if (instanceGroupHasExactMaterialDescriptor(grp)) return false;
     const textureSlots = grp.mats.reduce((sum, material) => sum + countMaterialTextureSlots(material), 0);
     return grp.groups.length > 8 || textureSlots > 4;
 }

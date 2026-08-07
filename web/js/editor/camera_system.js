@@ -174,11 +174,48 @@ function createCameraSystem(deps = {}) {
             deps.syncPathTracingDofFromPostFx();
         }
 
+        const visibleNodeBounds = new THREE.Box3();
+
+        function isEffectivelyVisible(object) {
+            for (let current = object; current; current = current.parent) {
+                if (!current.visible || current.userData?.maxjsVisible === false) return false;
+            }
+            return true;
+        }
+
+        function expandByNodeGeometry(target, object) {
+            const geometry = object?.geometry;
+            if (!geometry) return;
+            object.updateWorldMatrix(true, false);
+
+            let source = null;
+            if (object.boundingBox !== undefined) {
+                if (object.boundingBox === null) object.computeBoundingBox?.();
+                source = object.boundingBox;
+            } else {
+                if (geometry.boundingBox === null) geometry.computeBoundingBox();
+                source = geometry.boundingBox;
+            }
+            if (!source || source.isEmpty()) return;
+            visibleNodeBounds.copy(source).applyMatrix4(object.matrixWorld);
+            target.union(visibleNodeBounds);
+        }
+
         function computeVisibleSceneBounds(target = new THREE.Box3()) {
             target.makeEmpty();
-            for (const [, mesh] of deps.nodeMap) {
-                if (mesh?.visible) target.expandByObject(mesh);
-            }
+            const visited = new Set();
+            const visit = (object) => {
+                if (!object || visited.has(object) || !isEffectivelyVisible(object)) return;
+                visited.add(object);
+                expandByNodeGeometry(target, object);
+                for (const child of object.children || []) visit(child);
+            };
+            // Producer visibility is applied through a render layer while
+            // mesh.visible intentionally stays true (scene_applier.js). Walk
+            // each object's own geometry so a visible parent cannot pull a
+            // host-hidden child into the camera bounds through Box3's recursive
+            // expandByObject implementation.
+            for (const [, mesh] of deps.nodeMap) visit(mesh);
             return target;
         }
 

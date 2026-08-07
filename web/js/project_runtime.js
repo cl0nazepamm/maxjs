@@ -1206,9 +1206,24 @@ function stripSettingsFromPostFx(payload) {
     // enabled flag as a runtime active state on what stays.
     const mountedInlineLayers = new Map(); // id -> { signature, moduleUrl }
 
-    function inlineLayerUrl(id, version) {
+    // Hosts that serve the project directory over HTTP announce it with
+    // project_config.rootUrl (the Blender add-on); the 3ds Max WebView2 host
+    // omits it and keeps the virtual-host mapping. The manifest, settings and
+    // postfx already honour it via projectUrl(), and per HOST_CONTRACT.md
+    // inlines/*.js must too — a maxjs-assets.local URL derived from the absolute
+    // inlineDir only resolves inside WebView2, so elsewhere the import 404s and
+    // the layer silently stays unmounted. With no override this returns exactly
+    // what toAssetUrl(inlineDir) always did, leaving the Max path untouched.
+    function inlineBaseUrl() {
         if (!inlineDir) return null;
-        const baseUrl = toAssetUrl(inlineDir);
+        return projectRootUrlOverride
+            ? projectUrl(projectRootUrl, 'inlines/')
+            : toAssetUrl(inlineDir);
+    }
+
+    function inlineLayerUrl(id, version) {
+        const baseUrl = inlineBaseUrl();
+        if (!baseUrl) return null;
         const sep = baseUrl.endsWith('/') ? '' : '/';
         return `${baseUrl}${sep}${encodeURIComponent(id)}.js?v=${version}`;
     }
@@ -1219,8 +1234,8 @@ function stripSettingsFromPostFx(payload) {
     }
 
     function inlineLayerUrlWithFolder(id, folder, version) {
-        if (!inlineDir) return null;
-        const baseUrl = toAssetUrl(inlineDir);
+        const baseUrl = inlineBaseUrl();
+        if (!baseUrl) return null;
         const sep = baseUrl.endsWith('/') ? '' : '/';
         const f = folder ? `${folder.replace(/\\/g, '/').replace(/^\/+|\/+$/g, '').split('/').map(encodeURIComponent).join('/')}/` : '';
         return `${baseUrl}${sep}${f}${encodeURIComponent(id)}.js?v=${version}`;

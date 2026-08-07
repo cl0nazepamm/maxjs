@@ -3055,6 +3055,14 @@
         GetActiveCamera(current);
         if (!haveLastSentCamera_ || !CameraEquals(lastSentCamera_, current)) {
             fastCameraDirty_ = true;
+            // Live scene cameras are transform-only hierarchy carriers. Mark
+            // the one already driving this camera frame so children (notably a
+            // parented light) inherit the same ordinary node transform. The
+            // light itself stays off the 152-byte UpdateLight lane.
+            if (!renderCameraOverrideActive_ && lockedCameraHandle_ != 0 &&
+                helperHandles_.find(lockedCameraHandle_) != helperHandles_.end()) {
+                fastDirtyHandles_.insert(lockedCameraHandle_);
+            }
             QueueFastFlush();
         }
     }

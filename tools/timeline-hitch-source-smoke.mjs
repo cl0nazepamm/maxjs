@@ -91,6 +91,14 @@ assert.match(sync, /const lightChanged = deps\.applyLightData/,
     'unchanged native light packets do not invalidate PT');
 assert.match(sync, /transformChanged = applyTransform\(mesh, nd\.t\)/,
     'identical transform packets do not invalidate GI/PT');
+assert.match(sync, /maxjsLightCarrier = nd\.lightCarrier === true/,
+    'camera-light hierarchy carriers retain their structural full-sync tag');
+assert.match(sync, /lightCarrierHasSurfaceDescendant[\s\S]*maxjsLightCarrierHasSurface/,
+    'a carrier pays the descendant classification cost only once per full-sync epoch');
+assert.match(sync, /hierarchyLightTransformsChanged[\s\S]*markLightProbeLightsDirty[\s\S]*pathTraceLightsChanged = true/,
+    'inherited light motion invalidates light state without a full light payload');
+assert.match(sync, /affectsSurface && change\.transformChanged/,
+    'a light-only camera carrier does not masquerade as moving geometry');
 
 const timeline = await read('../web/js/maxjs_timeline.js');
 assert.match(timeline, /emitChange\(\{ defer: true \}\);/,

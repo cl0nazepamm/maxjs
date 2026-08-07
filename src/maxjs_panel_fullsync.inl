@@ -1,4 +1,25 @@
     // ── Full scene sync ──────────────────────────────────────
+    void CollectLiveCameraLightCarriers(INode* parent, TimeValue t,
+                                        std::unordered_set<ULONG>& out) {
+        if (!parent) return;
+        for (int i = 0; i < parent->NumberOfChildren(); ++i) {
+            INode* node = parent->GetChildNode(i);
+            if (!node) continue;
+
+            ObjectState os = node->EvalWorldState(t);
+            if (os.obj && IsThreeJSLightClassID(os.obj->ClassID())) {
+                for (INode* ancestor = node->GetParentNode();
+                     ancestor && !ancestor->IsRootNode();
+                     ancestor = ancestor->GetParentNode()) {
+                    if (IsSceneCameraNode(ancestor)) {
+                        out.insert(ancestor->GetHandle());
+                    }
+                }
+            }
+            CollectLiveCameraLightCarriers(node, t, out);
+        }
+    }
+
     bool SendFullSync() {
         Interface* ip = GetCOREInterface();
         if (!ip || !webview_) {
@@ -36,7 +57,9 @@
         ss << L"{\"type\":\"scene\",\"frame\":" << frameId << L",\"nodes\":[";
         bool first = true;
         MaterialLibraryBuilder materialLibrary;
-        WriteSceneNodes(root, t, ss, first, prevGeom, materialLibrary);
+        std::unordered_set<ULONG> cameraLightCarriers;
+        CollectLiveCameraLightCarriers(root, t, cameraLightCarriers);
+        WriteSceneNodes(root, t, ss, first, prevGeom, cameraLightCarriers, materialLibrary);
         PruneFastDeformState();
         ss << L"],";
         WriteMaterialLibraryJson(ss, materialLibrary);
@@ -175,13 +198,14 @@
     void WriteSceneNodes(INode* parent, TimeValue t,
                          std::wostringstream& ss, bool& first,
                          const std::unordered_set<ULONG>& prevGeom,
+                         const std::unordered_set<ULONG>& cameraLightCarriers,
                          MaterialLibraryBuilder& materialLibrary) {
         for (int i = 0; i < parent->NumberOfChildren(); i++) {
             INode* node = parent->GetChildNode(i);
             if (!node) continue;
             ObjectState os = node->EvalWorldState(t);
             if (os.obj && (IsThreeJSAudioClassID(os.obj->ClassID()) || IsThreeJSGLTFClassID(os.obj->ClassID()) || IsThreeJSWebAppClassID(os.obj->ClassID()))) {
-                WriteSceneNodes(node, t, ss, first, prevGeom, materialLibrary);
+                WriteSceneNodes(node, t, ss, first, prevGeom, cameraLightCarriers, materialLibrary);
                 continue;
             }
             // Skip Forest Pack / ForestIvy / RailClone / tyFlow / native
@@ -189,12 +213,17 @@
             if (IsForestPackNode(node) || IsRailCloneNode(node) ||
                 (IsTyFlowAvailable() && IsTyFlowNode(node)) ||
                 SupportsRenderTimeInstancing(node, t)) {
-                WriteSceneNodes(node, t, ss, first, prevGeom, materialLibrary);
+                WriteSceneNodes(node, t, ss, first, prevGeom, cameraLightCarriers, materialLibrary);
                 continue;
             }
 
             ULONG handle = node->GetHandle();
-            if (IsMaxJSHierarchyNode(node, t)) {
+            const bool cameraLightCarrier =
+                cameraLightCarriers.find(handle) != cameraLightCarriers.end();
+            // Cameras normally ship as view metadata. Mirror only those that
+            // actually carry a max.js light, as transform-only Object3Ds, so
+            // the child rides its parent without adding work for other cameras.
+            if (IsMaxJSHierarchyNode(node, t) || cameraLightCarrier) {
                 float xform[16]; GetTransform16(node, t, xform);
                 if (!first) ss << L',';
                 ss << L"{\"h\":" << handle;
@@ -203,6 +232,7 @@
                 // Group heads are flagged so the viewer's Flatten Groups pass
                 // can target actual Max groups and not generic helper parents.
                 if (node->IsGroupHead()) ss << L",\"grp\":1";
+                if (cameraLightCarrier) ss << L",\"lightCarrier\":true";
                 ss << L",\"s\":" << (node->Selected() ? L'1' : L'0');
                 ss << L",\"vis\":" << (IsMaxJsSyncDrawVisible(node) ? L'1' : L'0');
                 WriteNodeParentJson(ss, node);
@@ -212,13 +242,13 @@
                 first = false;
                 helperHandles_.insert(handle);
                 RememberSentTransform(handle, xform);
-                WriteSceneNodes(node, t, ss, first, prevGeom, materialLibrary);
+                WriteSceneNodes(node, t, ss, first, prevGeom, cameraLightCarriers, materialLibrary);
                 continue;
             }
             // Hidden render nodes are skipped, but their helper/group parents
             // above still stay in sync as transform-only hierarchy carriers.
             if (node->IsNodeHidden(TRUE)) {
-                WriteSceneNodes(node, t, ss, first, prevGeom, materialLibrary);
+                WriteSceneNodes(node, t, ss, first, prevGeom, cameraLightCarriers, materialLibrary);
                 continue;
             }
             // Skip expensive ExtractMesh for previously-tracked nodes with unchanged geometry
@@ -423,7 +453,7 @@
                 }
             }
 
-            WriteSceneNodes(node, t, ss, first, prevGeom, materialLibrary);
+            WriteSceneNodes(node, t, ss, first, prevGeom, cameraLightCarriers, materialLibrary);
         }
     }
 
@@ -481,12 +511,15 @@
             bool spline = false;
             bool helper = false;
             bool groupHead = false;
+            bool cameraLightCarrier = false;
             size_t vOff, iOff, uvOff, uv2Off, nOff;
             uint64_t objId = 0;      // evaluated Object* — instances share this
             ULONG instOfHandle = 0;  // 0 = owns geometry, else = shares from this handle
         };
         std::vector<NodeGeo> geos;
         size_t totalBytes = 0;
+        std::unordered_set<ULONG> cameraLightCarriers;
+        CollectLiveCameraLightCarriers(root, t, cameraLightCarriers);
 
         // Build instance groups via IInstanceMgr — maps each node handle to a canonical "source" handle.
         // All instances of the same object get the same source; only the source extracts geometry.
@@ -544,7 +577,9 @@
                     collect(node);
                     continue;
                 }
-                if (IsMaxJSHierarchyNode(node, t)) {
+                const bool cameraLightCarrier =
+                    cameraLightCarriers.find(node->GetHandle()) != cameraLightCarriers.end();
+                if (IsMaxJSHierarchyNode(node, t) || cameraLightCarrier) {
                     NodeGeo helper = {};
                     helper.node = node;
                     helper.handle = node->GetHandle();
@@ -552,6 +587,7 @@
                     helper.visible = IsMaxJsSyncDrawVisible(node);
                     helper.helper = true;
                     helper.groupHead = node->IsGroupHead();
+                    helper.cameraLightCarrier = cameraLightCarrier;
                     geos.push_back(std::move(helper));
                     helperHandles_.insert(node->GetHandle());
                     collect(node);
@@ -830,6 +866,7 @@
             if (ng.helper) {
                 ss << L",\"helper\":true";
                 if (ng.groupHead) ss << L",\"grp\":1";
+                if (ng.cameraLightCarrier) ss << L",\"lightCarrier\":true";
                 WriteUserPropsJson(ss, ng.node);
                 ss << L",\"vis\":" << (ng.visible ? L'1' : L'0');
                 ss << L",\"t\":"; WriteFloats(ss, xform, 16);

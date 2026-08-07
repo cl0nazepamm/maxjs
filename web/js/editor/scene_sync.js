@@ -1096,15 +1096,19 @@ function createSceneSync(deps = {}) {
             let pathTraceTransformsChanged = false;
             let pathTraceStructuralChanged = false;
             let pathTraceLightsChanged = false;
+            let hierarchyLightTransformsChanged = false;
             for (const nd of msg.nodes) {
                 const mesh = deps.nodeMap.get(nd.h);
                 if (mesh) {
                     const change = applyIncrementalNodeUpdate(mesh, nd);
+                    const isLightCarrier = mesh.userData?.maxjsLightCarrier === true;
+                    const affectsSurface = !isLightCarrier || lightCarrierHasSurfaceDescendant(mesh);
                     runtimeOverridesChanged ||= change.transformChanged
                         || (nd.vis != null && change.structuralChanged);
-                    pathTraceTransformsChanged ||= change.transformChanged;
-                    pathTraceStructuralChanged ||= change.structuralChanged;
-                    giSurfaceChanged ||= change.transformChanged || change.structuralChanged;
+                    pathTraceTransformsChanged ||= affectsSurface && change.transformChanged;
+                    pathTraceStructuralChanged ||= affectsSurface && change.structuralChanged;
+                    giSurfaceChanged ||= affectsSurface && (change.transformChanged || change.structuralChanged);
+                    hierarchyLightTransformsChanged ||= isLightCarrier && change.transformChanged;
                     visibilityChanged ||= change.structuralChanged && nd.vis != null;
                 }
                 if (nd.t) {
@@ -1114,8 +1118,14 @@ function createSceneSync(deps = {}) {
                     deps.applyHairVisibility(nd.h, nd.vis);
                 }
             }
+            if (hierarchyLightTransformsChanged) {
+                deps.refreshSkyFromLinkedSun();
+                deps.markLightProbeLightsDirty();
+                deps.scheduleLightProbeFromCurrentScene({ delay: 350 });
+                pathTraceLightsChanged = true;
+            }
             if (msg.lights) {
-                pathTraceLightsChanged = deps.applyLightUpdates(msg.lights) === true;
+                pathTraceLightsChanged ||= deps.applyLightUpdates(msg.lights) === true;
                 // Deliberately broad: applyLightData's return value is the PATH
                 // TRACE payload signature, which excludes castShadow, the shadow
                 // params, map and visibility — all of which it writes anyway.
@@ -1321,15 +1331,19 @@ function createSceneSync(deps = {}) {
             let pathTraceTransformsChanged = false;
             let pathTraceStructuralChanged = false;
             let pathTraceLightsChanged = false;
+            let hierarchyLightTransformsChanged = false;
             const result = applyDeltaFrame(buffer, {
                 onTransform(nodeHandle, matrix) {
                     const mesh = deps.nodeMap.get(nodeHandle);
                     if (mesh) {
                         const change = applyIncrementalNodeUpdate(mesh, { t: matrix }, nodeHandle);
+                        const isLightCarrier = mesh.userData?.maxjsLightCarrier === true;
+                        const affectsSurface = !isLightCarrier || lightCarrierHasSurfaceDescendant(mesh);
                         runtimeOverridesChanged ||= change.transformChanged;
-                        giSurfaceChanged ||= change.transformChanged || change.structuralChanged;
-                        pathTraceTransformsChanged ||= change.transformChanged;
-                        pathTraceStructuralChanged ||= change.structuralChanged;
+                        giSurfaceChanged ||= affectsSurface && (change.transformChanged || change.structuralChanged);
+                        pathTraceTransformsChanged ||= affectsSurface && change.transformChanged;
+                        pathTraceStructuralChanged ||= affectsSurface && change.structuralChanged;
+                        hierarchyLightTransformsChanged ||= isLightCarrier && change.transformChanged;
                     }
                     deps.applyHairTransform(nodeHandle, matrix);
                 },
@@ -1404,6 +1418,12 @@ function createSceneSync(deps = {}) {
                     maxTimeline.onTime(td);
                 },
             });
+            if (hierarchyLightTransformsChanged) {
+                deps.refreshSkyFromLinkedSun();
+                deps.markLightProbeLightsDirty();
+                deps.scheduleLightProbeFromCurrentScene({ delay: 350 });
+                pathTraceLightsChanged = true;
+            }
             if (runtimeOverridesChanged) deps.layerManager.markRuntimeTransformsDirty?.();
             if (giSurfaceChanged) {
                 deps.markLightProbeSceneDirty();
@@ -1602,6 +1622,8 @@ function createSceneSync(deps = {}) {
             obj.userData ??= {};
             obj.userData.maxjsHandle = nd.h;
             obj.userData.maxjsHelper = true;
+            obj.userData.maxjsLightCarrier = nd.lightCarrier === true;
+            delete obj.userData.maxjsLightCarrierHasSurface;
             syncNodeParent(obj, nd);
             finalizeSceneNode(obj, nd);
             deps.nodeMap.set(nd.h, obj);
@@ -1641,6 +1663,19 @@ function createSceneSync(deps = {}) {
             mesh.matrix.copy(maxNodeParentScratch.raw);
             mesh.matrixWorldNeedsUpdate = true;
             return true;
+        }
+
+        function lightCarrierHasSurfaceDescendant(obj) {
+            if (obj?.userData?.maxjsLightCarrier !== true) return true;
+            const cached = obj.userData.maxjsLightCarrierHasSurface;
+            if (typeof cached === 'boolean') return cached;
+
+            let found = false;
+            obj.traverse(child => {
+                if (!found && child !== obj && child?.geometry) found = true;
+            });
+            obj.userData.maxjsLightCarrierHasSurface = found;
+            return found;
         }
 
         function applySelection(mesh, selected) {

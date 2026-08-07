@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 
 const syncSource = readFileSync(new URL('../src/maxjs_panel_sync.inl', import.meta.url), 'utf8');
+const callbacksSource = readFileSync(new URL('../src/maxjs_panel_callbacks.inl', import.meta.url), 'utf8');
 const hostSource = readFileSync(new URL('../src/maxjs_panel_host.inl', import.meta.url), 'utf8');
 const fullSyncSource = readFileSync(new URL('../src/maxjs_panel_fullsync.inl', import.meta.url), 'utf8');
 const syncEntrySource = readFileSync(new URL('../src/maxjs_panel_sync_entry.inl', import.meta.url), 'utf8');
@@ -182,6 +183,21 @@ assert.match(timer, /fullSyncRetryReady[\s\S]*fullSyncRetryNotBeforeTick_[\s\S]*
     'failed full syncs cannot rerun their complete extraction every timer tick');
 assert.match(timer, /slowJsonSyncMode_[\s\S]*dirty_[\s\S]*fullSyncRetryReady[\s\S]*SendFullSync\s*\(\s*\)/,
     'failed explicit JSON full syncs remain retryable in slow-json mode');
+
+const cameraDirty = functionBody(syncSource, 'void MarkCameraDirtyIfChanged(bool respectThrottle = true)');
+assert.match(cameraDirty, /lockedCameraHandle_[\s\S]*helperHandles_[\s\S]*fastDirtyHandles_\.insert\s*\(\s*lockedCameraHandle_\s*\)/,
+    'a live locked camera updates its transform-only hierarchy carrier in the camera frame');
+assert.doesNotMatch(cameraDirty, /lightHandles_|\.UpdateLight\s*\(/,
+    'camera motion never scans lights or emits light-state payloads');
+assert.doesNotMatch(callbacksSource, /PollHierarchyHoleLightsLive/,
+    'redraw callbacks cannot poll every parented light');
+assert.doesNotMatch(syncSource, /void\s+PollHierarchyHoleLightsLive\s*\(/,
+    'the native sync path has no redraw-time hierarchy-hole light scan');
+const collectCameraLightCarriers = functionBody(fullSyncSource, 'void CollectLiveCameraLightCarriers(INode* parent, TimeValue t,');
+assert.match(collectCameraLightCarriers, /IsThreeJSLightClassID[\s\S]*IsSceneCameraNode[\s\S]*out\.insert/,
+    'only cameras above an actual max.js light enter the live hierarchy');
+assert.equal((fullSyncSource.match(/\\\"lightCarrier\\\":true/g) || []).length, 2,
+    'JSON and binary live full syncs both tag camera-light hierarchy carriers');
 assert.doesNotMatch(hostSource, /playbackFlushTime_/,
     'no stale authored time is retained for a later playback post');
 assert.match(hostSource, /maxjs::sync::DeltaFrameBuilder playbackSnapshotFrame_\{0\}/,

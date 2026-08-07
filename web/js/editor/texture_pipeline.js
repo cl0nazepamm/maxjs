@@ -558,7 +558,10 @@ async function createTexturePipeline(deps = {}) {
                 // left every early binder stuck on white forever, and mutating
                 // the shared fallback would have smeared across every slot using
                 // it.
-                const placeholder = new THREE.Texture();
+                // EXR/RGBE loaders return DataTexture instances. Keep the
+                // placeholder in that class so WebGL/WebGPU select the typed-
+                // array upload path both before and after copy(loadedTex).
+                const placeholder = new THREE.DataTexture();
                 if (seed?.image) placeholder.image = seed.image;
                 placeholder.colorSpace = textureColorSpace;
                 applyTextureTransform(placeholder, normalizedXf);

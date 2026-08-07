@@ -99,6 +99,7 @@ export function createTSLCompiler({
     const tslCompatWarnings = new Set();
     let tslCompatNamespace = null;
     let fallbackTexture = null;
+    let fallbackImage = null;
 
     function coerceTSLFloat(value, fallback) {
         const n = Number(value);
@@ -187,13 +188,40 @@ export function createTSLCompiler({
         return fallbackTexture;
     }
 
+    function getFallbackImage() {
+        if (fallbackImage) return fallbackImage;
+        let canvas = null;
+        if (typeof OffscreenCanvas === 'function') {
+            canvas = new OffscreenCanvas(1, 1);
+        } else if (globalThis.document?.createElement) {
+            canvas = document.createElement('canvas');
+            canvas.width = 1;
+            canvas.height = 1;
+        }
+        if (!canvas) return null;
+        const context = canvas.getContext?.('2d');
+        if (context) {
+            context.fillStyle = '#fff';
+            context.fillRect(0, 0, 1, 1);
+        }
+        fallbackImage = canvas;
+        return fallbackImage;
+    }
+
     function ensureTextureBindingSafe(texture) {
         if (!texture?.isTexture) return getFallbackTexture();
         const image = texture.source?.data ?? texture.image;
         if (image == null) {
             const fallback = getFallbackTexture();
-            if (fallback?.image) {
-                texture.image = fallback.image;
+            const safeImage = texture.isDataTexture
+                ? fallback?.image
+                : getFallbackImage();
+            if (safeImage) {
+                // A regular Texture requires a TexImageSource (canvas/image),
+                // while DataTexture.image is a {data,width,height} record.
+                // Mixing those shapes makes WebGL choose the wrong upload
+                // overload while an async texture is still pending.
+                texture.image = safeImage;
                 texture.needsUpdate = true;
             }
         }

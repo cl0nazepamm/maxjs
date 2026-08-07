@@ -29,6 +29,10 @@ const testableSource = source
             irVignette: 0.25,
             irHotspot: 0.05,
         });`,
+    )
+    .replace(
+        "import { getHostProfile } from '../host_profile.js';",
+        "const getHostProfile = () => ({ app: 'Max' });",
     );
 const moduleUrl = `data:text/javascript;base64,${Buffer.from(testableSource).toString('base64')}`;
 
@@ -80,12 +84,49 @@ assert.doesNotMatch(
     'restore stays free of one-off legacy infrared migration branches',
 );
 
+const exposureHelpersSource = adapterSource.match(
+    /function exposureLinearToStops[\s\S]+?(?=\r?\nexport function normalizePowerShotPreset)/,
+)?.[0];
+assert.ok(exposureHelpersSource, 'PowerShot input-exposure helpers remain testable');
+const setInputExposure = new Function(
+    `${exposureHelpersSource}
+    return setPowerShotInputExposure;`,
+)();
+for (const mode of ['digital', 'analog']) {
+    let appliedStops = null;
+    setInputExposure({ setInputExposure: (stops) => { appliedStops = stops; } }, mode, 2, {
+        inputExposure: -0.25,
+    });
+    assert.equal(appliedStops, 0.75, `${mode} stacks its PowerShot exposure with viewer exposure`);
+}
+let infraredStops = null;
+setInputExposure({ setInputExposure: (stops) => { infraredStops = stops; } }, 'infrared', 2, {
+    inputExposure: -0.25,
+});
+assert.equal(infraredStops, 1, 'NIR modes keep their separate exposure control');
+assert.match(
+    source,
+    /key: 'inputExposure', label: 'Exposure \(stops\)', min: -12, max: 12,[^\n]+visibleWhen: isPowerShotIspMode/,
+    'the -12 to +12 Exposure (stops) slider stays visible in the digital and analog modes',
+);
+assert.match(
+    adapterSource,
+    /p\.inputExposure = THREE\.MathUtils\.clamp\(finiteOr\(p\.inputExposure, 0\), -12, 12\)/,
+    'PowerShot input exposure is normalized to the full slider range',
+);
+assert.match(
+    maxjsFxSource,
+    /assignFinite\(state\.powershot, 'inputExposure', options\.inputExposure\)/,
+    'PowerShot input exposure has a persisted state setter',
+);
+
 const powershot = {
     enabled: true,
     mode: 'infrared',
     preset: 'powershot',
     amount: 0.81,
     resolutionScale: 0.65,
+    inputExposure: -0.25,
     lensSoftness: 0.21,
     ccdBloom: 0.42,
     noiseScale: 0.63,

@@ -59,6 +59,9 @@ export function createMaxJSFxController({
         preset: 'powershot',
         amount: 1.0,
         resolutionScale: 0.75,
+        // Dedicated digital/analog plate gain in photographic stops. Viewer
+        // exposure remains a separate host gain and stacks with this value.
+        inputExposure: 0,
         lensSoftness: 0.32,
         ccdBloom: 0.35,
         noiseScale: 1.06,
@@ -1286,6 +1289,7 @@ export function createMaxJSFxController({
             assignFinite(state.powershot, 'amount', options.amount);
             assignFinite(state.powershot, 'irIlluminator', options.irIlluminator);
             assignFinite(state.powershot, 'resolutionScale', options.resolutionScale);
+            assignFinite(state.powershot, 'inputExposure', options.inputExposure);
             assignFinite(state.powershot, 'lensSoftness', options.lensSoftness);
             assignFinite(state.powershot, 'ccdBloom', options.ccdBloom);
             assignFinite(state.powershot, 'noiseScale', options.noiseScale);

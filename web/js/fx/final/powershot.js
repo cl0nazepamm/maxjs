@@ -47,7 +47,14 @@ function exposureLinearToStops(linear) {
 
 function setPowerShotInputExposure(pipeline, mode, linearExposure, options) {
     if (!pipeline || mode === 'film') return;
-    const stops = exposureLinearToStops(linearExposure);
+    // The PowerShot-native control belongs to the shared digital/analog
+    // Pipeline. Viewer exposure remains host-wide, so the two gains stack in
+    // the same photographic-stop domain before the imager.
+    const modeExposure = mode === 'digital' || mode === 'analog'
+        ? Number(options?.inputExposure)
+        : 0;
+    const stops = exposureLinearToStops(linearExposure)
+        + (Number.isFinite(modeExposure) ? modeExposure : 0);
     if (typeof pipeline.setInputExposure === 'function') {
         pipeline.setInputExposure(stops);
         return;
@@ -248,6 +255,7 @@ export function createPowerShotFinal({
         p.jpegChroma420 = THREE.MathUtils.clamp(finiteOr(p.jpegChroma420, 0.75), 0, 1);
         p.jpegMidtone = THREE.MathUtils.clamp(finiteOr(p.jpegMidtone, 0.45), 0, 1);
         p.jpegHighlight = THREE.MathUtils.clamp(finiteOr(p.jpegHighlight, 1.0), 0, 2);
+        p.inputExposure = THREE.MathUtils.clamp(finiteOr(p.inputExposure, 0), -12, 12);
         p.brightness = THREE.MathUtils.clamp(finiteOr(p.brightness, 0), -1, 1);
         p.contrast = THREE.MathUtils.clamp(finiteOr(p.contrast, 0), -1, 1);
         p.analogStrength = THREE.MathUtils.clamp(finiteOr(p.analogStrength, 0.72), 0, 3);
@@ -397,7 +405,10 @@ export function createPowerShotFinal({
             return supportsScreenSpaceEffects
                 && !!p.enabled
                 && p.amount > 1.0e-6
-                && (p.analogStrength > 1.0e-6 || Math.abs(p.brightness) > 1.0e-6 || Math.abs(p.contrast) > 1.0e-6)
+                && (p.analogStrength > 1.0e-6
+                    || Math.abs(p.inputExposure) > 1.0e-6
+                    || Math.abs(p.brightness) > 1.0e-6
+                    || Math.abs(p.contrast) > 1.0e-6)
                 && !isShaderLabEnabled();
         }
         return supportsScreenSpaceEffects

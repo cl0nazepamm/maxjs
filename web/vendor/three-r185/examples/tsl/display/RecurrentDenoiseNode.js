@@ -467,9 +467,15 @@ class RecurrentDenoiseNode extends TempNode {
 
 		const { renderer } = frame;
 
+		// Match the working resolution of the chain to the g-buffer source (see
+		// TemporalReprojectNode). This pass's output doubles as the temporal
+		// pass's external history and is textureLoad'ed on that pass's texel
+		// grid, so the two must agree even when the host renders the g-buffer
+		// at a reduced resolution scale (max.js).
 		const drawingBufferSize = renderer.getDrawingBufferSize( _size );
-		const width = drawingBufferSize.width;
-		const height = drawingBufferSize.height;
+		const depthImage = this.depthNode !== null && this.depthNode.value ? this.depthNode.value.image : null;
+		const width = ( depthImage && depthImage.width ) ? depthImage.width : drawingBufferSize.width;
+		const height = ( depthImage && depthImage.height ) ? depthImage.height : drawingBufferSize.height;
 
 		const needsRestart = this._renderTarget.width !== width || this._renderTarget.height !== height;
 		this.setSize( width, height );

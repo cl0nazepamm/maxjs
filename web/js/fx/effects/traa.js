@@ -21,6 +21,11 @@ export default {
         if (!ctx.prePass?.depth || !ctx.prePass?.velocity) return;
         const { state } = ctx;
         const traaInput = ctx.ownedTexture(ctx.beauty);
+        // TRAA assumes beauty/depth/velocity share one size (TRAANode resolves
+        // on the beauty texel grid and copies the pre-pass depth into its
+        // history). The pre-pass runs at the global post-FX scale, so the
+        // beauty RTT bridge must render at that scale too.
+        ctx.applyNodeResolutionScale(traaInput);
 
         const traaPass = traa(traaInput, ctx.prePass.depth, ctx.prePass.velocity, ctx.camera);
         traaPass.useSubpixelCorrection = state.traa.useSubpixelCorrection;

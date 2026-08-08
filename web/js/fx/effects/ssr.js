@@ -52,6 +52,7 @@ export default {
         maxDistance: 0.5,
         opacity: 0.9,
         thickness: 0.015,
+        resolutionScale: 1.0,
         denoise: false,
         stochastic: false,
         denoiseRadius: 5,
@@ -60,7 +61,7 @@ export default {
         denoiseAdaptiveTrust: 0.15,
     },
     build(ctx) {
-        const { state, derived, sceneTex } = ctx;
+        const { state, sceneTex } = ctx;
         const useDenoiser = !!state.ssr.denoise
             && !!ctx.prePass?.depth
             && !!ctx.prePass?.normalColor
@@ -84,14 +85,8 @@ export default {
                 camera: ctx.camera,
             }
         );
-        ssrPass.quality.value = state.ssr.quality;
-        ssrPass.blurQuality = Math.max(1, Math.min(3, Math.round(state.ssr.blurQuality)));
-        ssrPass.maxDistance.value = derived.effectiveSSRMaxDistance;
-        ssrPass.intensity.value = state.ssr.opacity;
-        ssrPass.thickness.value = derived.effectiveSSRThickness;
         ssrPass.screenEdgeFadeBlack = true;
         ssrPass.environmentIntensity.value = 0;
-        ctx.applyNodeResolutionScale(ssrPass);
         ctx.pushNode(ssrPass);
         ctx.setActivePass('ssr', ssrPass);
 
@@ -99,27 +94,61 @@ export default {
             ? buildDenoisedSSR(ctx, ssrPass)
             : ssrPass;
 
+        // All uniform-backed knobs (quality/opacity/resolution/denoise tuning)
+        // flow through applyLiveValues so slider changes never rebuild the
+        // pipeline — update() rewrites them onto the live passes each frame.
+        applyLiveValues(ctx);
+
         // SSRNode.a is ray length / temporal history, not opacity. Alpha-over
         // compositing treats long hits as full replacement and shifts color.
         return vec4(ctx.beauty.rgb.add(reflectionNode.rgb), ctx.beautyAlpha);
     },
     update(ctx) {
-        const ssrPass = ctx.getActivePass('ssr');
-        if (!ssrPass) return;
-        ssrPass.maxDistance.value = ctx.derived.effectiveSSRMaxDistance;
-        ssrPass.thickness.value = ctx.derived.effectiveSSRThickness;
+        applyLiveValues(ctx);
     },
 };
 
-function buildDenoisedSSR(ctx, ssrPass) {
-    const { state, sceneTex } = ctx;
+function applyLiveValues(ctx) {
+    const ssrPass = ctx.getActivePass('ssr');
+    if (!ssrPass) return;
+    const { state, derived } = ctx;
+
+    ssrPass.maxDistance.value = derived.effectiveSSRMaxDistance;
+    ssrPass.thickness.value = derived.effectiveSSRThickness;
+    ssrPass.quality.value = clampFinite(state.ssr.quality, 0, 1, 0.45);
+    ssrPass.intensity.value = clampFinite(state.ssr.opacity, 0, 4, 0.9);
+    // Guarded setter on SSRNode — recompiles only its blur material, and only
+    // when the value actually changes (non-stochastic path).
+    ssrPass.blurQuality = Math.round(clampFinite(state.ssr.blurQuality, 1, 3, 2));
+    // SSR's own resolution scale stacks on the global post-FX scale; SSRNode
+    // re-reads it in setSize() every frame, so this is rebuild-free too.
+    ctx.applyNodeResolutionScale(ssrPass, clampFinite(state.ssr.resolutionScale, 0.25, 1, 1));
+
     const maxFrames = Math.round(clampFinite(state.ssr.denoiseFrames, 1, 64, 32));
+    const temporalPass = ctx.getActivePass('ssrTemporal');
+    if (temporalPass) temporalPass.maxFrames.value = maxFrames;
+    const denoisePass = ctx.getActivePass('ssrDenoise');
+    if (denoisePass) {
+        denoisePass.radius.value = clampFinite(state.ssr.denoiseRadius, 0.25, 24, 5);
+        denoisePass.strength.value = clampFinite(state.ssr.denoiseStrength, 0.01, 1, 0.25);
+        denoisePass.maxFrames.value = maxFrames;
+        denoisePass.adaptiveTrust.value = clampFinite(state.ssr.denoiseAdaptiveTrust, 0, 1, 0.15);
+    }
+}
+
+function buildDenoisedSSR(ctx, ssrPass) {
+    const { sceneTex } = ctx;
 
     // ownedTexture: temporalReproject() convertToTexture's its input without
     // the getTextureNode dance recurrentDenoise does — the RTT it mints over
     // the raw SSRNode leaks its render target per rebuild (see fx/core).
+    // The RTT bridges SSR's (possibly further reduced) output up to the chain
+    // resolution, so scale it like the pre-pass — a full-res bridge wastes a
+    // screen-sized HalfFloat target when the post-FX scale is below 1.
+    const temporalInput = ctx.ownedTexture(ssrPass);
+    ctx.applyNodeResolutionScale(temporalInput);
     const temporalPass = temporalReproject(
-        ctx.ownedTexture(ssrPass),
+        temporalInput,
         ctx.prePass.depth,
         ctx.prePass.normalColor,
         ctx.prePass.velocity,
@@ -130,7 +159,6 @@ function buildDenoisedSSR(ctx, ssrPass) {
             accumulate: false,
         }
     );
-    temporalPass.maxFrames.value = maxFrames;
     temporalPass.clampIntensity.value = 1;
     temporalPass.flickerSuppression.value = 1;
     ctx.pushNode(temporalPass);
@@ -148,10 +176,6 @@ function buildDenoisedSSR(ctx, ssrPass) {
             accumulate: true,
         }
     );
-    denoisePass.radius.value = clampFinite(state.ssr.denoiseRadius, 0.25, 24, 5);
-    denoisePass.strength.value = clampFinite(state.ssr.denoiseStrength, 0.01, 1, 0.25);
-    denoisePass.maxFrames.value = maxFrames;
-    denoisePass.adaptiveTrust.value = clampFinite(state.ssr.denoiseAdaptiveTrust, 0, 1, 0.15);
     denoisePass.alphaSource = 'raylength';
     ctx.pushNode(denoisePass);
 

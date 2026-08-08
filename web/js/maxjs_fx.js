@@ -864,26 +864,29 @@ export function createMaxJSFxController({
         },
         setSSROptions(options = {}) {
             let rebuild = false;
-            // Scene-scaled uniforms (maxDistance/thickness here, and the
-            // equivalents in GTAO / contact shadows) need NO pipeline signal:
-            // core.updatePerFrame() recomputes ctx.derived and each effect's
-            // update() rewrites the .value every frame, so a new value lands
-            // on the next one. Flagging output would set
-            // postProcessing.needsUpdate, and r185's RenderPipeline._update()
-            // reassigns fragmentNode + material.needsUpdate — a NodeMaterial
-            // recompile of the output quad per call. A layer animating these
-            // would recompile per frame: D5 wearing a smaller hat.
+            // Uniform-backed values (maxDistance/thickness/quality/opacity/
+            // resolutionScale and the denoise tuning) need NO pipeline signal:
+            // core.updatePerFrame() recomputes ctx.derived and the ssr
+            // descriptor's update() rewrites them onto the live passes every
+            // frame, so a new value lands on the next one. Flagging output
+            // would set postProcessing.needsUpdate, and r185's
+            // RenderPipeline._update() reassigns fragmentNode +
+            // material.needsUpdate — a NodeMaterial recompile of the output
+            // quad per call. A layer animating these would recompile per
+            // frame: D5 wearing a smaller hat. Only denoise/stochastic wire a
+            // different node graph and genuinely rebuild.
             assignFinite(state.ssr, 'maxDistance', options.maxDistance);
             assignFinite(state.ssr, 'thickness', options.thickness);
+            assignFinite(state.ssr, 'quality', options.quality);
+            assignFinite(state.ssr, 'blurQuality', options.blurQuality);
+            assignFinite(state.ssr, 'opacity', options.opacity);
+            assignFinite(state.ssr, 'resolutionScale', options.resolutionScale);
+            assignFinite(state.ssr, 'denoiseRadius', options.denoiseRadius);
+            assignFinite(state.ssr, 'denoiseStrength', options.denoiseStrength);
+            assignFinite(state.ssr, 'denoiseFrames', options.denoiseFrames);
+            assignFinite(state.ssr, 'denoiseAdaptiveTrust', options.denoiseAdaptiveTrust);
             rebuild = assignBoolean(state.ssr, 'denoise', options.denoise) || rebuild;
             rebuild = assignBoolean(state.ssr, 'stochastic', options.stochastic) || rebuild;
-            rebuild = assignFinite(state.ssr, 'quality', options.quality) || rebuild;
-            rebuild = assignFinite(state.ssr, 'blurQuality', options.blurQuality) || rebuild;
-            rebuild = assignFinite(state.ssr, 'opacity', options.opacity) || rebuild;
-            rebuild = assignFinite(state.ssr, 'denoiseRadius', options.denoiseRadius) || rebuild;
-            rebuild = assignFinite(state.ssr, 'denoiseStrength', options.denoiseStrength) || rebuild;
-            rebuild = assignFinite(state.ssr, 'denoiseFrames', options.denoiseFrames) || rebuild;
-            rebuild = assignFinite(state.ssr, 'denoiseAdaptiveTrust', options.denoiseAdaptiveTrust) || rebuild;
             if (rebuild) rebuildPipeline();
             return { ...state.ssr };
         },

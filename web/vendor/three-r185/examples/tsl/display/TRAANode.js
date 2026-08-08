@@ -413,16 +413,20 @@ class TRAANode extends TempNode {
 
 		// Copy current depth to previous depth buffer
 
-		const size = renderer.getDrawingBufferSize( _size );
+		// Only allow the depth copy when the history target exactly matches the
+		// depth source itself (not the drawing buffer — the host may run the
+		// passes at a reduced resolution scale, and resizes can leave the passes
+		// one frame apart). WebGPU requires depth copies to cover the entire
+		// destination subresource, so a mismatched copy is a validation error;
+		// skipping just defers the previous-depth refresh a frame (max.js).
 
-		// only allow the depth copy if the dimensions of the history render target match with the drawing
-		// render buffer and thus the depth texture of the scene. For some reasons, there are timing issues
-		// with WebGPU resulting in different size of the drawing buffer and the beauty render target when
-		// resizing the browser window. This does not happen with the WebGL backend
+		const currentDepth = this.depthNode.value;
+		const depthImage = currentDepth ? currentDepth.image : null;
 
-		if ( this._historyRenderTarget.height === size.height && this._historyRenderTarget.width === size.width ) {
+		if ( depthImage
+			&& this._historyRenderTarget.width === depthImage.width
+			&& this._historyRenderTarget.height === depthImage.height ) {
 
-			const currentDepth = this.depthNode.value;
 			renderer.copyTextureToTexture( currentDepth, this._historyRenderTarget.depthTexture );
 			this._previousDepthNode.value = this._historyRenderTarget.depthTexture;
 

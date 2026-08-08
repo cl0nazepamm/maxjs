@@ -109,6 +109,7 @@ function createPostFxGlue(deps = {}) {
                     { key: 'maxDistance', label: 'Max Distance', min: 0.05, max: 2, step: 0.01 },
                     { key: 'opacity', label: 'Opacity', min: 0, max: 1, step: 0.01 },
                     { key: 'thickness', label: 'Thickness', min: 0.001, max: 0.05, step: 0.001 },
+                    { key: 'resolutionScale', label: 'Resolution', min: 0.25, max: 1, step: 0.05 },
                     { key: 'denoise', label: 'Denoiser', type: 'checkbox' },
                     { key: 'stochastic', label: 'Stochastic Rays', type: 'checkbox', visibleWhen: (values) => !values.denoise },
                     { key: 'denoiseRadius', label: 'Denoise Radius', min: 0.25, max: 24, step: 0.25, visibleWhen: (values) => values.denoise },
@@ -643,7 +644,7 @@ function createPostFxGlue(deps = {}) {
 
         const POSTFX_SECTION_DEFAULTS = Object.freeze({
             ssgi: { radius: 8, thickness: 1.5, aoIntensity: 1.0, giIntensity: 1.5, expFactor: 1.5, sliceCount: 2, stepCount: 8, temporal: false },
-            ssr: { quality: 0.45, blurQuality: 2, maxDistance: 0.5, opacity: 0.9, thickness: 0.015 },
+            ssr: { quality: 0.45, blurQuality: 2, maxDistance: 0.5, opacity: 0.9, thickness: 0.015, resolutionScale: 1.0 },
             gtao: { samples: 16, distanceExponent: 1.0, distanceFallOff: 1.0, radius: 0.5, scale: 2.0, thickness: 1.0, resolutionScale: 1.0 },
             bloom: { strength: 0.4, radius: 0.2, threshold: 0.75, resolutionScale: 0.5 },
             toonOutline: { thickness: 0.003, alpha: 1.0 },

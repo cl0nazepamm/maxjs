@@ -647,9 +647,16 @@ class TemporalReprojectNode extends TempNode {
 
 		this._cameraUniforms.updateFromCamera( this.camera );
 
+		// Size the whole temporal chain to the depth/normal/velocity source (the
+		// g-buffer pre-pass) rather than the drawing buffer. Hosts may render the
+		// pre-pass at a reduced resolution scale, and WebGPU requires depth
+		// copyTextureToTexture to cover the entire destination subresource — so the
+		// history depth target must match the source exactly. Deriving both sides
+		// from the same texture makes that true by construction (max.js).
 		const drawingBufferSize = renderer.getDrawingBufferSize( _size );
-		const width = drawingBufferSize.width;
-		const height = drawingBufferSize.height;
+		const depthImage = this.depthNode.value ? this.depthNode.value.image : null;
+		const width = ( depthImage && depthImage.width ) ? depthImage.width : drawingBufferSize.width;
+		const height = ( depthImage && depthImage.height ) ? depthImage.height : drawingBufferSize.height;
 
 		if ( this._needsPostProcessingSync === true ) {
 
@@ -712,7 +719,11 @@ class TemporalReprojectNode extends TempNode {
 		const srcW = currentDepth.image !== null && currentDepth.image !== undefined ? currentDepth.image.width : 0;
 		const srcH = currentDepth.image !== null && currentDepth.image !== undefined ? currentDepth.image.height : 0;
 
-		if ( srcW > 0 && srcH > 0 ) {
+		// Copy only on an exact size match — a mid-resize frame can leave the
+		// source pass one frame behind, and a partial depth copy is a WebGPU
+		// validation error. Skipping simply defers the history refresh a frame.
+		if ( srcW > 0 && srcH > 0
+			&& srcW === this._historyRenderTarget.width && srcH === this._historyRenderTarget.height ) {
 
 			renderer.copyTextureToTexture( currentDepth, this._historyRenderTarget.depthTexture );
 			renderer.copyTextureToTexture( this.normalNode.value, this._previousNormalTexture );

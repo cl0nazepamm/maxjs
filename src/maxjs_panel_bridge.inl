@@ -162,7 +162,7 @@ static void RegisterMaxScript() {
         L"macroScript MaxJS_Snapshot category:\"max.js\" tooltip:\"Export max.js Snapshot\" buttonText:\"Snapshot\" (\r\n"
         L"    windows.sendMessage MaxJS_HWND %d 0 0\r\n"
         L")\r\n"
-        L"macroScript MaxJS_RefreshInstances category:\"max.js\" tooltip:\"Refresh Point Instances\" buttonText:\"Refresh Point Instances\" (\r\n"
+        L"macroScript MaxJS_RefreshInstances category:\"max.js\" tooltip:\"Send Dirty Signal\" buttonText:\"Send Dirty Signal\" (\r\n"
         L"    windows.sendMessage MaxJS_HWND %d 0 0\r\n"
         L")\r\n"
         // Menu registration targets the 2025+ CUI menu system (legacy menuMan
@@ -180,7 +180,7 @@ static void RegisterMaxScript() {
         L"    local subMenu = mainBar.CreateSubMenu \"{80E4C769-A2CB-4862-9925-FF51611A3B0F}\" \"max.js\"\r\n"
         L"    subMenu.CreateMacroScriptAction \"{792F423F-6E43-4C16-83E2-841C26556502}\" \"MaxJS_Toggle\" \"max.js\" title:\"max.js\"\r\n"
         L"    subMenu.CreateMacroScriptAction \"{792A1612-3D6F-46C2-AE4B-224362BB1C13}\" \"MaxJS_Snapshot\" \"max.js\" title:\"Snapshot\"\r\n"
-        L"    subMenu.CreateMacroScriptAction \"{0DC622F5-7777-493C-B89C-909E0D5CBB49}\" \"MaxJS_RefreshInstances\" \"max.js\" title:\"Refresh Point Instances\"\r\n"
+        L"    subMenu.CreateMacroScriptAction \"{0DC622F5-7777-493C-B89C-909E0D5CBB49}\" \"MaxJS_RefreshInstances\" \"max.js\" title:\"Send Dirty Signal\"\r\n"
         L"    subMenu.CreateMacroScriptAction \"{4B9D5C3D-1288-411A-9CCD-B156680171BE}\" \"MaxJS_Kill\" \"max.js\" title:\"Kill max.js\"\r\n"
         L")\r\n"
         L"callbacks.addScript #cuiRegisterMenus \"maxjs_registerMenus()\" id:#maxjsMenus\r\n"

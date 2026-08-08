@@ -5893,8 +5893,8 @@
     // change-detected. Deliberate: hashing them means evaluating them, and a
     // Point Instance stack regenerates its instanced mesh on every evaluation
     // ("generating mesh from point instances" prompt spam). All instance
-    // kinds extract on full syncs only — the max.js menu's "Refresh Point
-    // Instances" action (RequestFullSceneRepair) is the manual pull.
+    // kinds extract on full syncs only — the max.js menu's "Send Dirty
+    // Signal" action (RequestFullSceneRepair) is the manual pull.
 
     // Detect object property changes — triggers full sync (same pattern as DetectMaterialChanges)
     void DetectPropertyChanges() {

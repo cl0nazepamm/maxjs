@@ -109,7 +109,7 @@ function validateCommandPayload(view, type, payloadOffset, commandSize, frameId)
     }
 }
 
-function preflightDeltaFrame(view, commandCount, frameId) {
+function preflightDeltaFrame(view, commandCount, frameId, requireExactLength = true) {
     const byteLength = view.byteLength;
     const maxCommandCount = Math.floor((byteLength - FRAME_HEADER_SIZE) / COMMAND_HEADER_SIZE);
     if (commandCount > maxCommandCount) {
@@ -134,18 +134,151 @@ function preflightDeltaFrame(view, commandCount, frameId) {
         validateCommandPayload(view, type, offset + COMMAND_HEADER_SIZE, commandSize, frameId);
         offset += commandSize;
     }
-    if (offset !== byteLength) {
+    if (requireExactLength && offset !== byteLength) {
         throw new Error(`Delta frame length mismatch: decoded ${offset} of ${byteLength} bytes`);
     }
+    return offset;
 }
 
-export function applyDeltaFrame(buffer, handlers = {}) {
-    let view;
+function readDeltaFrameHeader(view) {
+    if (view.byteLength < FRAME_HEADER_SIZE) {
+        throw new Error(`Truncated delta frame header: ${view.byteLength} < ${FRAME_HEADER_SIZE}`);
+    }
+    return {
+        magic: view.getUint32(0, true),
+        version: view.getUint16(4, true),
+        reserved: view.getUint16(6, true),
+        frameId: view.getUint32(8, true),
+        commandCount: view.getUint32(12, true),
+    };
+}
+
+function sameDeltaFrameHeader(a, b) {
+    return a.magic === b.magic
+        && a.version === b.version
+        && a.reserved === b.reserved
+        && a.frameId === b.frameId
+        && a.commandCount === b.commandCount;
+}
+
+// Playback reuses a pair of maximum-capacity WebView2 SharedBuffers. Each
+// PostSharedBufferToScript call creates a new JS view of the same mutable
+// memory, so a delayed event can carry metadata for frame N while the slot
+// already contains frame N+2. Capture the self-described current frame before
+// the host releases that view. Native clears the magic while overwriting a
+// retained slot; null means that an obsolete event raced the write and can be
+// dropped because the completed write posts its own newer event.
+export function captureRetainedDeltaFrame(buffer, claimedByteLength = undefined) {
+    let sourceView;
     try {
-        view = new DataView(buffer);
+        sourceView = new DataView(buffer);
     } catch {
         throw new TypeError('Delta frame must be an ArrayBuffer or SharedArrayBuffer');
     }
+
+    if (claimedByteLength !== undefined &&
+        (!Number.isSafeInteger(claimedByteLength) || claimedByteLength < 0)) {
+        throw new TypeError('Delta frame logical byte length must be a non-negative safe integer');
+    }
+
+    const initial = readDeltaFrameHeader(sourceView);
+    if (initial.magic === 0) return null;
+
+    // Exact one-shot buffers are immutable for the duration of this callback;
+    // retain the zero-copy path used by ordinary fast deltas.
+    if (claimedByteLength === undefined || claimedByteLength === sourceView.byteLength) {
+        return {
+            buffer,
+            byteLength: sourceView.byteLength,
+            frameId: initial.frameId,
+            commandCount: initial.commandCount,
+            copied: false,
+        };
+    }
+
+    if (initial.magic !== DELTA_FRAME_MAGIC) {
+        throw new Error(`Unexpected delta frame magic: 0x${initial.magic.toString(16)}`);
+    }
+    if (initial.version !== DELTA_FRAME_VERSION) {
+        throw new Error(`Unsupported delta frame version: ${initial.version}`);
+    }
+    if (initial.reserved !== 0) {
+        throw new Error(`Unsupported delta frame flags: 0x${initial.reserved.toString(16)}`);
+    }
+
+    let frameByteLength;
+    try {
+        frameByteLength = preflightDeltaFrame(
+            sourceView,
+            initial.commandCount,
+            initial.frameId,
+            false,
+        );
+    } catch (error) {
+        const current = readDeltaFrameHeader(sourceView);
+        if (!sameDeltaFrameHeader(initial, current)) return null;
+        throw error;
+    }
+
+    if (initial.commandCount < 2) {
+        throw new Error('Retained delta frame must begin with BeginFrame and end with EndFrame');
+    }
+    const firstType = sourceView.getUint16(FRAME_HEADER_SIZE, true);
+    const lastType = sourceView.getUint16(
+        frameByteLength - COMMAND_HEADER_SIZE,
+        true,
+    );
+    if (firstType !== COMMAND_TYPES.BeginFrame ||
+        lastType !== COMMAND_TYPES.EndFrame) {
+        throw new Error('Retained delta frame must begin with BeginFrame and end with EndFrame');
+    }
+
+    const captured = new Uint8Array(frameByteLength);
+    captured.set(new Uint8Array(buffer, 0, frameByteLength));
+    const current = readDeltaFrameHeader(sourceView);
+    if (!sameDeltaFrameHeader(initial, current)) return null;
+
+    const capturedBuffer = captured.buffer;
+    const capturedView = new DataView(capturedBuffer);
+    const capturedHeader = readDeltaFrameHeader(capturedView);
+    if (!sameDeltaFrameHeader(initial, capturedHeader)) return null;
+    preflightDeltaFrame(
+        capturedView,
+        capturedHeader.commandCount,
+        capturedHeader.frameId,
+    );
+
+    return {
+        buffer: capturedBuffer,
+        byteLength: frameByteLength,
+        frameId: capturedHeader.frameId,
+        commandCount: capturedHeader.commandCount,
+        copied: true,
+    };
+}
+
+export function applyDeltaFrame(buffer, handlers = {}, logicalByteLength = undefined) {
+    let fullView;
+    try {
+        fullView = new DataView(buffer);
+    } catch {
+        throw new TypeError('Delta frame must be an ArrayBuffer or SharedArrayBuffer');
+    }
+    const frameByteLength = logicalByteLength ?? fullView.byteLength;
+    if (!Number.isSafeInteger(frameByteLength) || frameByteLength < 0) {
+        throw new TypeError('Delta frame logical byte length must be a non-negative safe integer');
+    }
+    if (frameByteLength > fullView.byteLength) {
+        throw new RangeError(
+            `Delta frame logical byte length ${frameByteLength} exceeds buffer capacity ${fullView.byteLength}`,
+        );
+    }
+    // Playback buffers are retained at their maximum required capacity. Native
+    // reports the current frame's exact byte count in metadata, so validate and
+    // decode only that prefix without slicing/copying the shared buffer.
+    const view = frameByteLength === fullView.byteLength
+        ? fullView
+        : new DataView(buffer, 0, frameByteLength);
     if (view.byteLength < FRAME_HEADER_SIZE) {
         throw new Error(`Truncated delta frame header: ${view.byteLength} < ${FRAME_HEADER_SIZE}`);
     }
@@ -363,7 +496,7 @@ export function applyDeltaFrame(buffer, handlers = {}) {
     return {
         frameId,
         commandCount,
-        bytes: buffer.byteLength,
+        bytes: view.byteLength,
         decodeMs,
         applyMs,
     };

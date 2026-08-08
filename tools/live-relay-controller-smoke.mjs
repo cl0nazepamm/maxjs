@@ -100,12 +100,12 @@ function fakeResponse(status) {
         order.push('observer');
         copied = Uint8Array.from(new Uint8Array(event.buffer));
     });
-    bridge.onSharedBuffer('delta_bin', () => order.push('editor'));
+    bridge.onSharedBuffer('scene_bin', () => order.push('editor'));
     bridge.installHostWiring();
     const source = Uint8Array.from([7, 8, 9]).buffer;
     webviewListeners.get('sharedbufferreceived')({
         getBuffer: () => source,
-        additionalData: JSON.stringify({ type: 'delta_bin' }),
+        additionalData: JSON.stringify({ type: 'scene_bin' }),
     });
     assert.deepEqual(order, ['observer', 'editor', 'release']);
     assert.deepEqual([...copied], [7, 8, 9]);
@@ -216,8 +216,17 @@ function fakeResponse(status) {
     await waitFor(() => controller.state === RELAY_STATES.STREAMING, 'streaming state');
 
     reportFirstReady = true;
-    host.shared(Uint8Array.from([5]).buffer, { type: 'delta_bin', frame: 5 });
+    host.shared(Uint8Array.from([5, 0, 0, 0]).buffer, {
+        type: 'delta_bin',
+        frame: 5,
+        stats: { producerBytes: 1 },
+    });
     await waitFor(() => readyCounts.includes(1), 'first-ready consumer status');
+    const firstDelta = await waitFor(
+        () => posts.find((entry) => entry.isBinary && entry.decoded.meta.frame === 5)?.decoded,
+        'retained-buffer delta forwarded',
+    );
+    assert.deepEqual([...firstDelta.payload], [5]);
     assert.deepEqual(readyCounts, [1]);
     assert.equal(resyncs.length, 1, 'first-ready acknowledgement must not request a second baseline');
     assert.equal(controller.state, RELAY_STATES.STREAMING);

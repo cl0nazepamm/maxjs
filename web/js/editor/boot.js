@@ -2691,12 +2691,45 @@
         inlineTimer.connect?.(document);
         const inlineClock = inlineTimer;
         let lightLinkSceneRefreshQueued = false;
+        let runtimeTransformRefreshQueued = false;
+        let runtimeTransformLightsChanged = false;
+        let runtimeTransformSurfacesChanged = false;
         const queueLightLinkSceneRefresh = () => {
             if (lightLinkSceneRefreshQueued) return;
             lightLinkSceneRefreshQueued = true;
             queueMicrotask(() => {
                 lightLinkSceneRefreshQueued = false;
                 lightLinking.refreshSceneBindings?.();
+            });
+        };
+        const queueRuntimeTransformRefresh = (event) => {
+            if (lightHandleMap.has(event?.handle)) runtimeTransformLightsChanged = true;
+            else runtimeTransformSurfacesChanged = true;
+            if (runtimeTransformRefreshQueued) return;
+            runtimeTransformRefreshQueued = true;
+            queueMicrotask(() => {
+                runtimeTransformRefreshQueued = false;
+                const lightsChanged = runtimeTransformLightsChanged;
+                const surfacesChanged = runtimeTransformSurfacesChanged;
+                runtimeTransformLightsChanged = false;
+                runtimeTransformSurfacesChanged = false;
+
+                // Runtime pose writes do not change mesh/material topology. In
+                // particular, markSceneChanged() refreshes SSR's scene-derived
+                // caches, so calling it for every animated node made scripted
+                // rigs hitch only while SSR was enabled. Keep the pose-aware GI
+                // and PT invalidations, coalesced once per runtime update.
+                if (surfacesChanged) {
+                    markLightProbeSceneDirty();
+                    schedulePathTracingLiveRebuild('transform');
+                }
+                if (lightsChanged) {
+                    markLightProbeLightsDirty();
+                    schedulePathTracingLiveRebuild('light');
+                }
+                if (surfacesChanged || lightsChanged) {
+                    scheduleLightProbeFromCurrentScene({ delay: 350 });
+                }
             });
         };
         const layerManager = createLayerManager({
@@ -2721,7 +2754,11 @@
             whenSceneReady: () => hostBridge.whenInitialSync(),
             debugLog: maxjsDebugLog,
             debugWarn: maxjsDebugWarn,
-            onRuntimeSceneChanged: () => {
+            onRuntimeSceneChanged: (event) => {
+                if (event?.type === 'transform') {
+                    queueRuntimeTransformRefresh(event);
+                    return;
+                }
                 queueLightLinkSceneRefresh();
                 maxjsFx.markSceneChanged?.();
                 markLightProbeSceneDirty();
@@ -2856,7 +2893,9 @@
         // ── Build mode / Standalone / Debug ──
         // buildMode / isStandalone / urlMode are initialized near perfHud (early).
         // three.js r185 Inspector — lazily created, gated by debug mode.
+        const passiveRendererInspector = renderer.inspector;
         let threeInspector = null;
+        let inspectorSyncGeneration = 0;
         function placeThreeInspectorToggle() {
             const shell = threeInspector?.domElement;
             const toggle = shell?.querySelector?.('#profiler-toggle');
@@ -2875,20 +2914,44 @@
             }
         }
         function syncInspector() {
+            const syncGeneration = ++inspectorSyncGeneration;
             if (debugMode && buildMode !== 'release') {
                 if (!threeInspector) {
                     threeInspector = new Inspector();
-                    renderer.inspector = threeInspector;
                     const parent = renderer.domElement.parentElement;
                     if (parent && !threeInspector.domElement.parentElement) {
                         parent.appendChild(threeInspector.domElement);
                     }
                     placeThreeInspectorToggle();
                 }
+                if (renderer.inspector !== threeInspector) renderer.inspector = threeInspector;
                 threeInspector.domElement.style.display = '';
                 placeThreeInspectorToggle();
             } else if (threeInspector) {
                 threeInspector.domElement.style.display = 'none';
+                // Inspector.setRenderer() turns GPU timestamp tracking on. A
+                // hidden inspector used to remain attached forever, retaining
+                // its profiler work during ordinary playback and eventually
+                // exhausting WebGPU's query pool. Wait for its current async
+                // resolve before restoring the renderer's passive inspector.
+                const detachWhenIdle = () => {
+                    if (syncGeneration !== inspectorSyncGeneration ||
+                        (debugMode && buildMode !== 'release') ||
+                        renderer.inspector !== threeInspector) {
+                        return;
+                    }
+                    const pendingResolve = threeInspector._resolveTimestampPromise;
+                    if (pendingResolve?.then) {
+                        void pendingResolve.then(
+                            () => queueMicrotask(detachWhenIdle),
+                            () => queueMicrotask(detachWhenIdle),
+                        );
+                        return;
+                    }
+                    renderer.inspector = passiveRendererInspector;
+                    if (renderer.backend) renderer.backend.trackTimestamp = false;
+                };
+                queueMicrotask(detachWhenIdle);
             }
         }
 

@@ -1667,6 +1667,22 @@
         return SUCCEEDED(postResult);
     }
 
+    // Retained playback slots are shared memory, not immutable messages. Mark
+    // a slot unavailable before overwriting it and publish the MXJB magic only
+    // after every other byte is complete. A delayed WebView event can then
+    // either capture one committed frame or discard the obsolete event; it can
+    // never decode a half-written mixture of two frames.
+    void BeginPlaybackSharedBufferWrite(BYTE* buffer) {
+        static_assert(sizeof(LONG) == sizeof(std::uint32_t));
+        InterlockedExchange(reinterpret_cast<volatile LONG*>(buffer), 0);
+    }
+
+    void CommitPlaybackSharedBufferWrite(BYTE* buffer) {
+        InterlockedExchange(
+            reinterpret_cast<volatile LONG*>(buffer),
+            static_cast<LONG>(maxjs::sync::kDeltaFrameMagic));
+    }
+
     bool PostSharedDeltaBytes(const std::vector<std::uint8_t>& frameBytes,
                               std::uint32_t frameId,
                               std::uint32_t commandCount,
@@ -2002,7 +2018,13 @@
         BYTE* bufPtr = nullptr;
         const HRESULT bufferResult = slot.buf->get_Buffer(&bufPtr);
         if (FAILED(bufferResult) || !bufPtr) return false;
-        memcpy(bufPtr, frameBytes.data(), frameBytes.size());
+        if (frameBytes.size() < sizeof(std::uint32_t)) return false;
+        BeginPlaybackSharedBufferWrite(bufPtr);
+        memcpy(
+            bufPtr + sizeof(std::uint32_t),
+            frameBytes.data() + sizeof(std::uint32_t),
+            frameBytes.size() - sizeof(std::uint32_t));
+        CommitPlaybackSharedBufferWrite(bufPtr);
         if (!PostPreparedSharedDeltaBuffer(
                 slot.buf.Get(), frameId, playbackStateFrame_.command_count(), frameBytes.size())) {
             return false;
@@ -2063,6 +2085,16 @@
             return PlaybackSyncResult::RetryLater;
         }
 
+        if (frameBytes.size() < sizeof(std::uint32_t)) {
+            return PlaybackSyncResult::RetryLater;
+        }
+        if (playbackSnapshotCopyOffset_ == 0) {
+            BeginPlaybackSharedBufferWrite(bufPtr);
+            // The magic is the commit marker and is written last, never as
+            // part of the bounded payload copy below.
+            playbackSnapshotCopyOffset_ = sizeof(std::uint32_t);
+        }
+
         // Copy the already-finalized frame in small quanta. This combines a
         // fixed byte ceiling with the same <=4ms UI-thread wall-clock budget
         // used by scene sampling. A failed WebView post retains this completed
@@ -2105,6 +2137,7 @@
         if (playbackSnapshotCopyOffset_ < frameBytes.size()) {
             return PlaybackSyncResult::NeedsSlice;
         }
+        CommitPlaybackSharedBufferWrite(bufPtr);
         if (!PostPreparedSharedDeltaBuffer(
                 slot.buf.Get(),
                 playbackSnapshotFrame_.frame_id(),

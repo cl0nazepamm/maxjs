@@ -76,6 +76,13 @@ assert.match(glue, /mergePathTracingUpdateMasks\(/,
     'typed inactive invalidations preserve full-dominates semantics');
 
 const sync = await read('../web/js/editor/scene_sync.js');
+assert.match(sync, /applyDeltaFrame\(buffer,[\s\S]*meta\?\.stats\?\.producerBytes\)/,
+    'retained playback buffers decode only their native-reported logical prefix');
+const hostBridge = await read('../web/js/editor/host_bridge.js');
+assert.match(hostBridge, /captureRetainedDeltaFrame\([\s\S]*meta\?\.stats\?\.producerBytes/,
+    'retained playback slots are captured before editor and Relay consumers run');
+assert.match(hostBridge, /captured\.frameId\s*===\s*lastDeliveredDeltaFrameId/,
+    'multiple delayed views of the same overwritten slot are coalesced');
 assert.match(sync, /!flattenedGroupDissolved &&\s*!deferredFullReady && guardedDeform\s*\? 'deform'/,
     'only the native guarded deform lane may bypass a full PT build');
 assert.match(sync, /pathTraceUpdateReady = !guardedDeform \|\| hasExactIncomingNormals/,
@@ -106,6 +113,16 @@ assert.match(timeline, /emitChange\(\{ defer: true \}\);/,
 assert.doesNotMatch(timeline, /emitChange\(\{ defer: nextPlaying \}\)/);
 assert.match(timeline, /function lastUpdateMs\(\)/);
 assert.match(timeline, /function noteSceneSync\(\)/);
+
+const boot = await read('../web/js/editor/boot.js');
+assert.match(boot, /renderer\.inspector = passiveRendererInspector/,
+    'hiding Debug detaches the expensive Three inspector');
+assert.match(boot, /renderer\.backend\.trackTimestamp = false/,
+    'normal playback cannot retain hidden GPU timestamp tracking');
+assert.match(boot, /onRuntimeSceneChanged: \(event\) => \{[\s\S]*?event\?\.type === 'transform'[\s\S]*?queueRuntimeTransformRefresh\(event\);[\s\S]*?return;[\s\S]*?maxjsFx\.markSceneChanged/,
+    'runtime pose writes bypass the SSR scene-topology cache refresh');
+assert.match(boot, /queueRuntimeTransformRefresh[\s\S]*schedulePathTracingLiveRebuild\('transform'\)/,
+    'runtime surface motion keeps the cheap transform-aware tracer invalidation');
 
 const giGlue = await read('../web/js/editor/gi_volume_glue.js');
 assert.match(giGlue, /Math\.min\(nowMs - deps\.haloGiLastInteractionMs, timelineIdleMs\)/,

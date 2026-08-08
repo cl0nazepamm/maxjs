@@ -491,9 +491,23 @@ function createLiveRelayController(options = {}) {
         try {
             // encodeRelayFrame copies the shared payload synchronously. This
             // function is called by host_bridge before releaseBuffer().
-            body = encodeRelayFrame({ ...meta, relay }, new Uint8Array(buffer), {
-                requireSceneRequestId: fullScene,
-            });
+            const deltaByteLength = type === 'delta_bin'
+                ? (meta.stats?.producerBytes ?? buffer.byteLength)
+                : buffer.byteLength;
+            if (!Number.isSafeInteger(deltaByteLength) ||
+                deltaByteLength < 0 ||
+                deltaByteLength > buffer.byteLength) {
+                throw new RangeError(
+                    `delta_bin producerBytes ${deltaByteLength} exceeds shared buffer capacity ${buffer.byteLength}`,
+                );
+            }
+            body = encodeRelayFrame(
+                { ...meta, relay },
+                new Uint8Array(buffer, 0, deltaByteLength),
+                {
+                    requireSceneRequestId: fullScene,
+                },
+            );
         } catch (error) {
             beginResync('binary-frame-error', sceneRequestId, { force: true, abortActive: true });
             logger.warn?.('[max.js relay binary frame]', error);

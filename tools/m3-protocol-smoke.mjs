@@ -7,6 +7,7 @@ import {
     DELTA_FRAME_MAGIC,
     DELTA_FRAME_VERSION,
     applyDeltaFrame,
+    captureRetainedDeltaFrame,
 } from '../web/js/protocol.js';
 import {
     attachSkinAttributes,
@@ -174,6 +175,55 @@ function protocolGoldenSmoke() {
     assert.throws(() => applyDeltaFrame(new ArrayBuffer(15)), /Truncated delta frame header/);
     assert.throws(() => applyDeltaFrame(new DataView(buffer)), /must be an ArrayBuffer/);
     assert.throws(() => applyDeltaFrame(cloneWithExtraBytes(buffer, 4)), /length mismatch/);
+    const retainedPlaybackBuffer = cloneWithExtraBytes(buffer, 4096);
+    const retainedResult = applyDeltaFrame(retainedPlaybackBuffer, {}, buffer.byteLength);
+    assert.equal(retainedResult.bytes, buffer.byteLength);
+
+    // A retained slot can be overwritten before an older queued WebView event
+    // runs. Its producerBytes then describes the old frame while the shared
+    // memory contains a newer, shorter frame plus the old tail.
+    const olderRetainedFrame = buildFrame([
+        command(COMMAND_TYPES.BeginFrame, 8, (view, o) => view.setUint32(o, FRAME_ID, true)),
+        command(COMMAND_TYPES.UpdateTransform, 72, (view, o) => {
+            view.setUint32(o, 21, true);
+            setFloatArray(view, o + 4, IDENTITY);
+        }),
+        command(COMMAND_TYPES.UpdateTransform, 72, (view, o) => {
+            view.setUint32(o, 22, true);
+            setFloatArray(view, o + 4, IDENTITY);
+        }),
+        command(COMMAND_TYPES.EndFrame, 4),
+    ], FRAME_ID).buffer;
+    const currentFrameId = FRAME_ID + 1;
+    const currentRetainedFrame = buildFrame([
+        command(COMMAND_TYPES.BeginFrame, 8, (view, o) => view.setUint32(o, currentFrameId, true)),
+        command(COMMAND_TYPES.UpdateTransform, 72, (view, o) => {
+            view.setUint32(o, 23, true);
+            setFloatArray(view, o + 4, IDENTITY);
+        }),
+        command(COMMAND_TYPES.EndFrame, 4),
+    ], currentFrameId).buffer;
+    const reusedSlot = cloneWithExtraBytes(olderRetainedFrame, 256);
+    new Uint8Array(reusedSlot).set(new Uint8Array(currentRetainedFrame));
+    assert.throws(
+        () => applyDeltaFrame(reusedSlot, {}, olderRetainedFrame.byteLength),
+        /length mismatch/,
+        'stale per-post metadata reproduces the retained-slot failure',
+    );
+    const captured = captureRetainedDeltaFrame(reusedSlot, olderRetainedFrame.byteLength);
+    assert.equal(captured.copied, true);
+    assert.equal(captured.byteLength, currentRetainedFrame.byteLength);
+    assert.equal(captured.frameId, currentFrameId);
+    assert.equal(applyDeltaFrame(captured.buffer).bytes, currentRetainedFrame.byteLength);
+    const busySlot = reusedSlot.slice(0);
+    new DataView(busySlot).setUint32(0, 0, true);
+    assert.equal(captureRetainedDeltaFrame(busySlot, olderRetainedFrame.byteLength), null);
+
+    assert.throws(() => applyDeltaFrame(retainedPlaybackBuffer, {}, -1), /non-negative safe integer/);
+    assert.throws(
+        () => applyDeltaFrame(retainedPlaybackBuffer, {}, retainedPlaybackBuffer.byteLength + 1),
+        /exceeds buffer capacity/,
+    );
     assert.throws(() => applyDeltaFrame(buffer.slice(0, -1)), /Truncated|exceeds frame bounds/);
 
     const badSize = buffer.slice(0);

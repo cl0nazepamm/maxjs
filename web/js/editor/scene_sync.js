@@ -1417,7 +1417,7 @@ function createSceneSync(deps = {}) {
                 onTime(td) {
                     maxTimeline.onTime(td);
                 },
-            });
+            }, meta?.stats?.producerBytes);
             if (hierarchyLightTransformsChanged) {
                 deps.refreshSkyFromLinkedSun();
                 deps.markLightProbeLightsDirty();

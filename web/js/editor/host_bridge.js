@@ -14,6 +14,7 @@
 // Full contract: web/HOST_CONTRACT.md.
 
 import { getHostProfile } from '../host_profile.js';
+import { captureRetainedDeltaFrame } from '../protocol.js';
 
 const HOST_CONTRACT_VERSION = 1;
 
@@ -36,6 +37,7 @@ function createHostBridge({ setInfoText, onFirstSync, onBeforeReady } = {}) {
     const sharedBufferHandlers = new Map(); // meta.type -> (buf, meta) => void
     let sharedBufferFallback = null;        // scene_bin & anything untyped
     const transportObservers = new Set();  // synchronous host traffic taps
+    let lastDeliveredDeltaFrameId = null;
 
     function toBase64Utf8(text) {
         const bytes = new TextEncoder().encode(String(text ?? ''));
@@ -182,11 +184,34 @@ function createHostBridge({ setInfoText, onFirstSync, onBeforeReady } = {}) {
             let buf = null;
             try {
                 buf = e.getBuffer();
-                const meta = typeof e.additionalData === 'string'
+                let meta = typeof e.additionalData === 'string'
                     ? JSON.parse(e.additionalData) : e.additionalData;
-                notifyTransportObservers({ kind: 'shared-buffer', buffer: buf, meta: meta ?? {} });
+                let deliveryBuffer = buf;
+                if (meta?.type === 'delta_bin') {
+                    const captured = captureRetainedDeltaFrame(
+                        buf,
+                        meta?.stats?.producerBytes,
+                    );
+                    if (!captured) return;
+                    // An older queued event may observe the already-committed
+                    // contents of a newer retained slot. Deliver that current
+                    // frame once and suppress the later duplicate event.
+                    if (captured.frameId === lastDeliveredDeltaFrameId) return;
+                    lastDeliveredDeltaFrameId = captured.frameId;
+                    deliveryBuffer = captured.buffer;
+                    meta = {
+                        ...(meta ?? {}),
+                        frame: captured.frameId,
+                        stats: {
+                            ...(meta?.stats ?? {}),
+                            producerBytes: captured.byteLength,
+                            commandCount: captured.commandCount,
+                        },
+                    };
+                }
+                notifyTransportObservers({ kind: 'shared-buffer', buffer: deliveryBuffer, meta: meta ?? {} });
                 const handler = sharedBufferHandlers.get(meta?.type) || sharedBufferFallback;
-                if (handler) handler(buf, meta);
+                if (handler) handler(deliveryBuffer, meta);
             } catch (err) { reportBridgeError('binary sync error', err); }
             finally {
                 if (buf) webview.releaseBuffer(buf);

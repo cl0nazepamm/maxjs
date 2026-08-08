@@ -164,6 +164,12 @@ assert.match(preparedPost, /const HRESULT postResult\s*=\s*wv17->PostSharedBuffe
     'shared delta delivery observes WebView post failure');
 assert.match(preparedPost, /return\s+SUCCEEDED\s*\(\s*postResult\s*\)/,
     'shared delta delivery reports WebView acceptance');
+const beginRetainedWrite = functionBody(syncSource, 'void BeginPlaybackSharedBufferWrite(BYTE* buffer)');
+const commitRetainedWrite = functionBody(syncSource, 'void CommitPlaybackSharedBufferWrite(BYTE* buffer)');
+assert.match(beginRetainedWrite, /InterlockedExchange[\s\S]*,\s*0\s*\)/,
+    'retained playback memory is marked unavailable before overwrite');
+assert.match(commitRetainedWrite, /InterlockedExchange[\s\S]*kDeltaFrameMagic/,
+    'retained playback memory publishes MXJB magic only after the write');
 
 const timer = functionBody(syncSource, 'void OnTimer()');
 assert.match(timer, /haveLastPlaybackPollTime_[\s\S]*OnTimelineTimeChanged\s*\(/,
@@ -234,6 +240,8 @@ assert.match(copyPlaybackFrame, /GetTickCount64\s*\(\s*\)\s*-\s*passStart[\s\S]*
     'finalized pose copying also has the four-millisecond wall-clock budget');
 assert.match(copyPlaybackFrame, /playbackSnapshotCopyOffset_\s*<\s*frameBytes\.size\s*\(\s*\)[\s\S]*PlaybackSyncResult::NeedsSlice[\s\S]*PostPreparedSharedDeltaBuffer/,
     'the shared buffer is posted only after every finalized byte is copied');
+assert.match(copyPlaybackFrame, /BeginPlaybackSharedBufferWrite[\s\S]*playbackSnapshotCopyOffset_\s*=\s*sizeof\(std::uint32_t\)[\s\S]*CommitPlaybackSharedBufferWrite[\s\S]*PostPreparedSharedDeltaBuffer/,
+    'bounded retained copies keep the magic invalid until all payload bytes are complete');
 assert.match(copyPlaybackFrame, /playbackSnapshotPosted_[\s\S]*return\s+PlaybackSyncResult::Complete/,
     'a post retry reuses the retained completed buffer instead of copying again');
 assert.doesNotMatch(copyPlaybackFrame, /CreateSharedBuffer/,

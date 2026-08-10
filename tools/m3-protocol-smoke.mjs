@@ -357,6 +357,7 @@ function sourceContractSmoke() {
     const snapshotSource = readFileSync(new URL('../src/maxjs_panel_snapshot_export.inl', import.meta.url), 'utf8');
     const fullSyncSource = readFileSync(new URL('../src/maxjs_panel_fullsync.inl', import.meta.url), 'utf8');
     const mimeSource = readFileSync(new URL('../src/maxjs_core_utils.h', import.meta.url), 'utf8');
+    const extractorSource = readFileSync(new URL('../src/maxjs_scene_extractors.h', import.meta.url), 'utf8');
     for (const source of [snapshotSource, fullSyncSource]) {
         assert.match(source, /format\\\":\\\"m3/);
         assert.match(source, /formatVersion\\\":1/);
@@ -365,6 +366,12 @@ function sourceContractSmoke() {
     }
     assert.match(snapshotSource, /bin\\\":\\\"scene\.m3/);
     assert.match(mimeSource, /L"\.m3"[\s\S]*application\/octet-stream/);
+    assert.match(extractorSource, /GetSkinInitTM\(meshNode,\s*skinInitTM\)/,
+        'snapshot skin roots use the official Skin bind basis');
+    assert.match(extractorSource, /skin->GetRefFrame\(\)/,
+        'broken Skin init TMs are checked against the Skin reference frame');
+    assert.match(extractorSource, /referenceBasisMatches\s*>\s*skinBasisMatches/,
+        'the legacy Daz world-basis fallback is evidence-gated');
 }
 
 protocolGoldenSmoke();

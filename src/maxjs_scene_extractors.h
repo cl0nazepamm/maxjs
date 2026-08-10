@@ -537,12 +537,75 @@ static bool TryExtractSkinRigData(
             }
         }
 
-        // Root bones are parented to the exported SkinnedMesh. Use the node's
-        // actual object transform here: some Genesis/Daz split skin parts
-        // report an identity Skin init TM even though their mesh node has a
-        // non-zero origin, which offsets eyes/brows/mouth in snapshots.
+        // Root bones are parented to the exported SkinnedMesh, so their bind
+        // transforms must use the same basis Skin used when it captured the
+        // rig. Imported glTF rigs commonly keep that basis at the origin while
+        // placing the mesh node elsewhere; substituting the mesh's current
+        // world TM here conjugates every animated bone rotation by that world
+        // offset and visibly tears the skin.
+        //
+        // Some Genesis/Daz split skin parts do have a broken identity Skin init
+        // TM while their bone init TMs are world-space. Preserve that older
+        // compatibility path only when the reference-frame node transforms
+        // prove it: the reference basis must reproduce more root-bone local TMs
+        // than the official Skin basis.
+        const TimeValue skinReferenceTime =
+            static_cast<TimeValue>(skin->GetRefFrame()) * GetTicksPerFrame();
+        float meshReferenceWorld[16];
+        GetTransform16(meshNode, skinReferenceTime, meshReferenceWorld);
+
         float meshInitWorld[16];
-        GetTransform16(meshNode, t, meshInitWorld);
+        Matrix3 skinInitTM;
+        const bool haveSkinInit =
+            skin->GetSkinInitTM(meshNode, skinInitTM) == SKIN_OK;
+        if (haveSkinInit) {
+            MatrixToFloat16(skinInitTM, meshInitWorld);
+        } else {
+            memcpy(meshInitWorld, meshReferenceWorld, sizeof(meshInitWorld));
+        }
+
+        if (haveSkinInit &&
+            !TransformEquals16(meshInitWorld, meshReferenceWorld)) {
+            float invSkinInit[16];
+            float invReferenceWorld[16];
+            if (InvertMat4CM(meshInitWorld, invSkinInit) &&
+                InvertMat4CM(meshReferenceWorld, invReferenceWorld)) {
+                int skinBasisMatches = 0;
+                int referenceBasisMatches = 0;
+                for (int bi = 0; bi < numBones; bi++) {
+                    if (outBoneParents[static_cast<size_t>(bi)] >= 0) continue;
+                    INode* bn = boneNodes[static_cast<size_t>(bi)];
+                    if (!bn) continue;
+
+                    float boneReferenceWorld[16];
+                    GetTransform16(bn, skinReferenceTime, boneReferenceWorld);
+
+                    float liveReferenceLocal[16];
+                    float skinBasisLocal[16];
+                    float referenceBasisLocal[16];
+                    MulMat4CM(invReferenceWorld, boneReferenceWorld, liveReferenceLocal);
+                    MulMat4CM(
+                        invSkinInit,
+                        &boneWorld[static_cast<size_t>(bi) * 16u],
+                        skinBasisLocal);
+                    MulMat4CM(
+                        invReferenceWorld,
+                        &boneWorld[static_cast<size_t>(bi) * 16u],
+                        referenceBasisLocal);
+
+                    if (TransformEquals16(skinBasisLocal, liveReferenceLocal, 1.0e-3f)) {
+                        skinBasisMatches++;
+                    }
+                    if (TransformEquals16(referenceBasisLocal, liveReferenceLocal, 1.0e-3f)) {
+                        referenceBasisMatches++;
+                    }
+                }
+
+                if (referenceBasisMatches > skinBasisMatches) {
+                    memcpy(meshInitWorld, meshReferenceWorld, sizeof(meshInitWorld));
+                }
+            }
+        }
 
         outBoneBindLocal.resize(static_cast<size_t>(numBones) * 16u);
         for (int bi = 0; bi < numBones; bi++) {

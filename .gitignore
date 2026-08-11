@@ -22,7 +22,14 @@ projects/active/
 projects/
 projects/*/dist/node_modules/
 AGENTS.md
+# docs/ is local-only except the M3 wire-format spec, which is public API
+# surface. The 4-line dance is required: un-ignore the dir, re-ignore its
+# contents, then whitelist the file — a bare negation can't reach inside an
+# ignored directory.
 docs/
+!docs/
+docs/*
+!docs/M3_FORMAT.md
 figma-webapp-*.md
 dev.bat
 dev2027.bat

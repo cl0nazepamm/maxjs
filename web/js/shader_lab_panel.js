@@ -5,16 +5,16 @@
 // Visual style reuses MaxJS's existing .fx-control / .fx-range / .fx-check
 // classes so it matches the rest of the panels (no blue native sliders).
 
-const EFFECT_TYPES = [
-    'ascii', 'bloom', 'circuit-bent', 'directional-blur', 'chromatic-aberration',
-    'crt', 'displacement-map', 'dithering', 'edge-detect', 'fluted-glass',
-    'halftone', 'ink', 'particle-grid', 'pattern', 'pixelation',
-    'pixel-sorting', 'plotter', 'posterize', 'slice', 'smear', 'threshold',
-];
+import {
+    defaultParamsFor as schemaDefaultParamsFor,
+    EFFECT_TYPES,
+    LAYER_SCHEMA,
+    paramSchemaFor,
+    SHADER_LAB_VERSION,
+    SOURCE_TYPES,
+} from './shader_lab_schema.js';
 
-const SOURCE_TYPES = [
-    'custom-shader', 'gradient', 'image', 'live', 'text', 'video',
-];
+export { EFFECT_TYPES, SHADER_LAB_VERSION, SOURCE_TYPES };
 
 const BLEND_MODES = [
     'normal', 'multiply', 'screen', 'overlay', 'darken', 'lighten',
@@ -25,193 +25,16 @@ const BLEND_MODES = [
 const COMPOSITE_MODES = ['filter', 'mask'];
 const TONEMAP_MODES = ['aces', 'none', 'reinhard', 'totos', 'cinematic'];
 
-// Per-effect default params — matched to shader-lab 1.3.12's pass source
-// files. Users can tweak any value in the Params JSON editor. When the
-// user picks a new effect type, the params get reset to that type's defaults
-// so every layer starts with a working, editable config instead of an
-// empty {} that offers zero discoverability.
-const DEFAULT_PARAMS = {
-    'ascii': {
-        cellSize: 12, charset: 'light', customChars: ' .:-=+*#%@',
-        fontWeight: 'regular', colorMode: 'monochrome', monoColor: '#f5f5f0',
-        toneMapping: 'none', glyphSignalMode: 'luminance', colorSignalMode: 'luminance',
-        invert: false, bgOpacity: 0,
-        signalBlackPoint: 0, signalWhitePoint: 1, signalGamma: 1,
-        presenceThreshold: 0, presenceSoftness: 0,
-        shimmerAmount: 0, shimmerSpeed: 1, directionBias: 0,
-        bloomEnabled: false, bloomIntensity: 1.25, bloomRadius: 6,
-        bloomSoftness: 0.35, bloomThreshold: 0.6,
-    },
-    'bloom': {
-        bloomIntensity: 1.25, bloomRadius: 6, bloomSoftness: 0.35,
-        bloomThreshold: 0.6, bloomKnee: 0.2, highlightDrive: 1.5,
-    },
-    'circuit-bent': {
-        colorMode: 'source', invert: false,
-        lineAngle: 0, linePitch: 6.4, lineThickness: 0.5,
-        noiseMode: 'turbulence', noiseAmount: 1,
-        presenceSoftness: 0.64, presenceThreshold: 0.37,
-        scrollSpeed: 4,
-        signalBlackPoint: 0, signalGamma: 3.07, signalWhitePoint: 0.22,
-        monoColor: '#eba8f1',
-    },
-    'directional-blur': {
-        strength: 18, samples: 8, angle: 0, mode: 'linear',
-        centerX: 0.5, centerY: 0.5,
-    },
-    'chromatic-aberration': {
-        intensity: 5, center: [0.5, 0.5], angle: 0, direction: 'radial',
-    },
-    'crt': {
-        cellSize: 3, scanlineIntensity: 0.17, maskIntensity: 1,
-        barrelDistortion: 0.15, chromaticAberration: 2,
-        beamFocus: 0.58, brightness: 1.8,
-        highlightDrive: 1, highlightThreshold: 0.62,
-        shoulder: 0.25, chromaRetention: 1.15, shadowLift: 0.16,
-        persistence: 0.18, vignetteIntensity: 0.45,
-        flickerIntensity: 0.2, glitchIntensity: 0.13, glitchSpeed: 5,
-        signalArtifacts: 0.45,
-        bloomEnabled: true, bloomIntensity: 1.93, bloomRadius: 8,
-        bloomSoftness: 0.31, bloomThreshold: 0,
-    },
-    'displacement-map': {
-        strength: 20, midpoint: 0.5, directionMode: 0,
-        channelMode: 'luminance',
-    },
-    'dithering': {
-        levels: 4, pixelSize: 1, spread: 0.5, algorithm: 'bayer-4x4',
-        colorMode: 'source', monoColor: '#f5f5f0',
-        shadowColor: '#101010', highlightColor: '#f5f2e8',
-        dotScale: 1.0, animateDither: false, ditherSpeed: 1.0,
-        chromaticSplit: false,
-    },
-    'edge-detect': {
-        threshold: 0.1, strength: 1, invert: 0,
-        lineColorR: 1, lineColorG: 1, lineColorB: 1,
-        bgColorR: 0, bgColorG: 0, bgColorB: 0,
-        colorMode: 0,
-    },
-    'fluted-glass': {
-        preset: 'architectural', frequency: 20,
-        amplitude: 0.02, warp: 0.28, irregularity: 0.35, angle: 0,
-    },
-    'halftone': {
-        spacing: 5, dotSize: 1.0, dotMin: 0,
-        shape: 'circle', angle: 28,
-        contrast: 1.0, softness: 0.25, invertLuma: false,
-        ink: '#0d1014',
-        duotoneLight: '#f5f5f0', duotoneDark: '#1c1c1c',
-        customBgColor: '#F5F5F0', customColorCount: 4,
-        customColor1: '#161616', customColor2: '#595959',
-        customColor3: '#A0A0A0', customColor4: '#E8E8E8',
-        customLuminanceBias: 0,
-        cyanAngle: 15, magentaAngle: 75, yellowAngle: 0, keyAngle: 45,
-        paperColor: '#F5F5F0', paperGrain: 0.15,
-        gcr: 0.5, registration: 0,
-        inkCyan: '#00AEEF', inkMagenta: '#EC008C',
-        inkYellow: '#FFF200', inkKey: '#1a1a1a',
-        dotGain: 0, dotMorph: 0,
-        colorMode: 'cmyk', cmykBlend: 'subtractive',
-        bloomEnabled: false, bloomIntensity: 1.25, bloomRadius: 6,
-        bloomSoftness: 0.35, bloomThreshold: 0.6,
-    },
-    'ink': {
-        backgroundColor: '#0a0b0d',
-        coreColor: '#fffde8', midColor: '#c8f542', edgeColor: '#00c9a7',
-        blurStrength: 0.02, crispBlend: 0.75,
-        directionX: 0.3746, directionY: 0.9271,
-        dripLength: 7.1, dripWeight: 1.2,
-        fluidNoise: 0.2, noiseScale: 1,
-        smokeSpeed: 0.2, smokeTurbulence: 0.25,
-        blurSpread: 1.7, blurPasses: 12, crispPasses: 3,
-        grainEnabled: true, grainIntensity: 0.3, grainScale: 1.5,
-        bloomIntensity: 1.25, bloomRadius: 6,
-        bloomSoftness: 0.35, bloomThreshold: 0.6,
-    },
-    'particle-grid': {
-        gridResolution: 64, displacement: 0.5, pointSize: 3.0,
-        noiseAmount: 0, noiseScale: 3.0, noiseSpeed: 0.5,
-        backgroundColor: '#000000',
-        bloomEnabled: false, bloomIntensity: 1.25, bloomRadius: 6,
-        bloomSoftness: 0.35, bloomThreshold: 0.6,
-    },
-    'pattern': {
-        cellSize: 12, preset: 'bars', colorMode: 'source', invert: false,
-        bgOpacity: 0, monoColor: '#f5f5f0',
-        customColorCount: 4, customLuminanceBias: 0,
-        customBgColor: '#F5F5F0', customColor1: '#0d1014',
-        customColor2: '#4d5057', customColor3: '#969aa2',
-        customColor4: '#e1e2de',
-        bloomEnabled: false, bloomIntensity: 1.25, bloomRadius: 6,
-        bloomSoftness: 0.35, bloomThreshold: 0.6,
-    },
-    'pixelation': {
-        cellSize: 8, aspectRatio: 1,
-    },
-    'pixel-sorting': {
-        threshold: 0.25, upperThreshold: 1,
-        direction: 'horizontal', mode: 'luminance', reverse: false,
-        range: 0.5,
-    },
-    'plotter': {
-        colorMode: 'ink', gap: 12, weight: 1.5,
-        angle: 90, crossAngle: 135, crosshatch: true,
-        threshold: 0.5, wobble: 0.3,
-        paperColor: '#f5f0e8', inkColor: '#1a1a1a',
-    },
-    'posterize': {
-        levels: 5, gamma: 1, mode: 'rgb',
-    },
-    'slice': {
-        amount: 180, sliceHeight: 28, blockWidth: 120,
-        density: 0.58, dispersion: 0.18, speed: 0.2,
-        direction: 'right',
-    },
-    'smear': {
-        angle: 0, start: 0.25, end: 0.75,
-        strength: 24, samples: 12,
-    },
-    'threshold': {
-        threshold: 0.5, softness: 0.02, noise: 0.08, invert: false,
-    },
-    // Source layers
-    'gradient': {
-        activePoints: 5, animate: 1,
-        warpAmount: 0.18, warpBias: 0.5, warpDecay: 1, warpScale: 1.4,
-        vortexAmount: 0.12, motionAmount: 0.18, motionSpeed: 0.2,
-        falloff: 1.85,
-        glowStrength: 0.18, glowThreshold: 0.62,
-        grainAmount: 0.03,
-        vignetteStrength: 0.18, vignetteRadius: 0.9, vignetteSoftness: 0.32,
-        noiseSeed: 0, noiseType: 'simplex', tonemapMode: 'aces',
-        warpIterations: 1,
-        point1Color: '#ff4d00', point1Position: [0.18, 0.28], point1Weight: 1,
-        point2Color: '#00c9a7', point2Position: [0.82, 0.24], point2Weight: 1,
-        point3Color: '#fffde8', point3Position: [0.48, 0.72], point3Weight: 1,
-        point4Color: '#6236ff', point4Position: [0.25, 0.82], point4Weight: 1,
-        point5Color: '#c8f542', point5Position: [0.78, 0.78], point5Weight: 1,
-    },
-    'text': {
-        text: 'basement.studio',
-        fontSize: 280, fontWeight: 700,
-        letterSpacing: -0.02, fontFamily: 'display-serif',
-        textColor: '#ffffff', backgroundColor: '#000000',
-    },
-    'image': { fitMode: 'cover', scale: 1, offset: [0, 0] },
-    'video': { fitMode: 'cover', scale: 1, offset: [0, 0], playbackRate: 1 },
-    'live': { facingMode: 'user', fitMode: 'cover', scale: 1, offset: [0, 0], mirror: true },
-    'custom-shader': {
-        effectMode: false,
-        entryExport: 'sketch',
-        sourceFileName: 'custom-shader.ts',
-        sourceRevision: 0,
-        sourceCode: 'export function sketch() {\n  return vec4(vec3(1, 0.3, 0), 1)\n}',
-    },
-};
 
+// Defaults come straight from the shader-lab layer registry (see
+// shader_lab_schema.js) rather than a table maintained here. The old hand-copied
+// table had been transcribed from the pass constructors' `updateParams`
+// fallbacks instead of the shipped UI defaults, which is how the ink layer ended
+// up shipping `directionX`/`directionY` sliders the library never reads (it
+// wants `blurDirection`, in degrees) and no `bloomEnabled`/`colorMode` at all.
 function defaultParamsFor(type) {
     // Deep-clone to avoid sharing refs between layer instances
-    return DEFAULT_PARAMS[type] ? JSON.parse(JSON.stringify(DEFAULT_PARAMS[type])) : {};
+    return JSON.parse(JSON.stringify(schemaDefaultParamsFor(type)));
 }
 
 let _idCounter = 0;
@@ -279,6 +102,18 @@ function normalizeConfig(config) {
             delete params.directionMode;
             delete params.passCount;
             delete params.passOffset;
+            // Drop keys the library has no parameter for. Saved layers can carry
+            // params invented by an older panel build — ink's `directionX` /
+            // `directionY` are the standing example: the pass never read them, so
+            // they rendered as two sliders that quietly did nothing while the real
+            // `blurDirection` sat at its 68° fallback.
+            const known = LAYER_SCHEMA[layer.type];
+            if (known) {
+                const allowed = new Set(known.params.map(p => p.key));
+                for (const key of Object.keys(params)) {
+                    if (!allowed.has(key)) delete params[key];
+                }
+            }
             let asset = layer.asset;
             if ((layer.type === 'image' || layer.type === 'video')) {
                 const src = asset?.src || params.url || '';
@@ -946,14 +781,39 @@ function buildApp({ React, htm, shaderLabFx }) {
         wobble: { min: 0, max: 1, step: 0.01 },
     };
 
+    // The registry is authoritative for enums and slider bounds; PARAM_ENUMS /
+    // PARAM_RANGES below are kept only as a fallback for anything it does not
+    // describe, and for params the panel synthesises itself.
     function getParamEnum(layerType, paramKey) {
+        const schema = paramSchemaFor(layerType, paramKey);
+        if (schema?.options?.length) return schema.options;
         return PARAM_ENUMS[`${layerType}.${paramKey}`] || PARAM_ENUMS[paramKey] || null;
     }
 
     function getParamRange(layerType, paramKey, defaultValue, currentValue) {
+        const schema = paramSchemaFor(layerType, paramKey);
+        if (schema && typeof schema.min === 'number' && typeof schema.max === 'number') {
+            const step = typeof schema.step === 'number' ? schema.step : 0.01;
+            return {
+                min: schema.min,
+                max: Math.max(schema.max, Math.abs(currentValue ?? 0)),
+                step,
+                isInt: Number.isInteger(step) && step >= 1,
+            };
+        }
         return PARAM_RANGES[`${layerType}.${paramKey}`]
             || PARAM_RANGES[paramKey]
             || inferNumericRange(paramKey, defaultValue, currentValue);
+    }
+
+    // Registry params can declare `visibleWhen: { key, equals }` — bloom sliders
+    // only when bloomEnabled, gradient colours only in gradient colorMode, and a
+    // `__customShaderInternal` sentinel that means "never show this in a control
+    // grid" (source code, revision counters and friends).
+    function isParamVisible(layerType, paramKey, params) {
+        const rule = paramSchemaFor(layerType, paramKey)?.visibleWhen;
+        if (!rule) return true;
+        return params?.[rule.key] === rule.equals;
     }
 
     // Humanize camelCase / kebab-case param keys for display
@@ -1162,7 +1022,16 @@ function buildApp({ React, htm, shaderLabFx }) {
             }
         };
 
-        const paramKeys = Object.keys(value ?? {});
+        // Order by the registry so the controls read the way the shader-lab
+        // editor groups them, then append anything the schema does not know
+        // about so a stray key is still editable rather than invisible.
+        const present = value ?? {};
+        const schemaOrder = (LAYER_SCHEMA[layerType]?.params ?? [])
+            .map(p => p.key)
+            .filter(k => k in present);
+        const extras = Object.keys(present).filter(k => !schemaOrder.includes(k));
+        const paramKeys = [...schemaOrder, ...extras]
+            .filter(k => isParamVisible(layerType, k, present));
         return html`
             <div className="sl-params-block">
                 <div className="sl-params-head">
@@ -1265,7 +1134,7 @@ function buildApp({ React, htm, shaderLabFx }) {
                         <${FxSelect} label="Composite" value=${layer.compositeMode} options=${COMPOSITE_MODES}
                             onChange=${(v) => update({ compositeMode: v })} />
                         <${ParamsEditor} layerType=${layer.type} value=${layer.params}
-                            defaults=${DEFAULT_PARAMS[layer.type]}
+                            defaults=${schemaDefaultParamsFor(layer.type)}
                             onChange=${(v) => update({ params: v })} />
                         <div className="sl-row-actions">
                             <div style=${{ display: 'flex', gap: '4px' }}>
